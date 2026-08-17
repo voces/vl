@@ -41,6 +41,9 @@ The type arena (`compiler/typecheck.vl`) has **11 variants**: `TyPrim`, `TyErr`,
 `TyNeg`. A ladder over the arena that omits `TyUnion` or `TyNullable` is the
 single most common instance of this defect, because a DECLARED alias and an
 INLINE annotation do not intern to the same variant — see the open row below.
+(`TypeRef`/`TypeDecl` are AST nodes, NOT arena variants; counting them is the
+first mistake a re-derivation makes. "The ARENA half" below has the remeasured
+site counts and the classification ratio.)
 
 ## Method and denominator
 
@@ -73,12 +76,12 @@ counts.
 | ... open (1 ladder family, reached) | 1 |
 | check-clean SILENTLY WRONG output, reached | 0 |
 | spurious LOUD reject of a valid program, reached | 7 ladders |
-| DANGEROUS-UNPROVEN (no reaching program found) | 4 |
+| DANGEROUS-UNPROVEN (no reaching program found) | 5 |
 
 No silently-wrong cell was found anywhere in this sweep. Every remaining gap is
 either invalid wasm (one family, below) or loud.
 
-## CLOSED — three DANGEROUS ladders, 26 invalid-wasm cells
+## CLOSED — three DANGEROUS ladders (26 invalid-wasm cells) + two structural pins
 
 ### 1. The narrowed-nullable-collection recover knew ONE of four list wrappers
 
@@ -126,6 +129,18 @@ variant arm. Converted to an exhaustive `match` (see "Is a structural guard
 feasible" below). Behaviour-neutral: A/B of the emitted wasm bytes over every
 `.vl` under `tests/cases/` — 1860 records, 1538 byte-identical, 322 rejecting
 identically, **0 byte differences, 0 rc differences**.
+
+### 4. The same structural guard, applied to an ARENA ladder
+
+`repTyScalarMask`'s walk (row R11 below: no `TyLit` arm, fall-through leaves the
+mask 0 = "mentions no wide scalar", the direction that DROPS a `__print_*__`
+import) is an exhaustive `match` over `Ty` with no `_`. The three leaves it never
+descended through — `TyLit`, `TyErr`, `TyVar` — are spelled as empty arms carrying
+their reason. Behaviour-neutral: every `.vl` under `tests/cases/` built with both
+compilers, **1872 records, 1548 byte-identical modules, 324 rejecting identically,
+0 byte differences, 0 rc differences**. The guard is proven live by sabotage —
+deleting the `TyMap` arm makes `scripts/refresh-compiler.sh` exit 1 with the
+variant named at its source position. See "The ARENA half" below.
 
 ## OPEN — ranked
 
@@ -262,7 +277,7 @@ Two `$fnsig` producers over the same annotation disagree on exactly one rep, so 
 * Actual: LOUD — `emitProgram: field access but no struct type declared`. Oracle:
   annotate with the union alias (`(i32) => Shape`), which keys `>u`.
 
-### R10. DANGEROUS-UNPROVEN (4)
+### R10. DANGEROUS-UNPROVEN (5)
 
 No reaching program was found for these, which makes them lower-severity findings
 than every row above — recorded so the next sweep starts from the analysis:
@@ -273,6 +288,13 @@ than every row above — recorded so the next sweep starts from the analysis:
 * `collectTyReachCloSigs` / `collectTyReachRegister` fall through on `TyNeg`,
   which every sibling walker in `emit_rep.vl` handles. `intersectTy` consumes
   almost all negations.
+* `tyReachesHole` (`typecheck.vl:11555`) is the third member of that `TyNeg`
+  family: it descends `TyArray`/`TyMap`/`TyNullable`/`TyObj`/`TyUnion`/`TyFunc`
+  and answers `TyVar` true, but has no `TyNeg` arm, so `!(T[])` over a
+  hole-reaching `T` falls to `false` = "reaches no hole" — the direction that lets
+  a hole through the parameter-solve gate. Same guard as its siblings
+  (`intersectTy` consumes almost all negations), and `tyChildrenOf` — the shared
+  visitor recommendation (c) routes this family through — has the arm already.
 * `cloCallUnionMixUnrep` (the floor for the deferred value-union-closure-result
   family) sets neither `hasScalar` nor `hasComposite` for a `TyNullable` member or
   a nested non-literal `TyUnion` member, and "no composite" means "admit".
@@ -333,16 +355,193 @@ Where it applies and where it does not:
   correctness rests on the negative sentinel (`-1`/`null`/`""`) being tested by
   every caller, which is a caller-side invariant and is what the SAFE-LOUD rows
   above verify one by one.
-* **Does not apply** to the arena ladders at all — `Ty` is a struct union
-  discriminated with `is`, not a literal union, so there is no exhaustiveness
-  check to lean on. The arena rows (R1, R7) are exactly where the two
-  most-forgotten variants live (`TyUnion`, `TyNullable`), and the only mechanical
-  net available today is the scan this audit used. An `is`-chain exhaustiveness
-  check over a struct union would retire that half of the class; it is a language
-  feature request, not a compiler edit.
+* **Applies to the ARENA ladders too** — see the next section. The claim once
+  filed here, that `Ty` being an `is`-discriminated struct union leaves nothing to
+  lean on and needs a language feature, is FALSE and was never checked against the
+  corpus: `tests/cases/match/value-union-non-exhaustive-error.vl` and
+  `tests/cases/soundness/exhaustive-missing-is-case.vl` each pin a mechanism that
+  covers a struct union today.
 
 The cheap procedural half, usable now: the two mechanical scans that produced the
 denominator above take seconds and print, per ladder, exactly which of the 27
 members it omits. Re-running them after any rep addition is the difference between
 finding these by sweep and finding them by accident, which is how the last three
 were found.
+
+## The ARENA half — the guard exists, and it is already in the language twice
+
+### The vocabulary, remeasured
+
+`Ty` (`compiler/typecheck.vl:349`) has **11 variants and only 11**: `TyPrim`,
+`TyErr`, `TyObj`, `TyFunc`, `TyUnion`, `TyNullable`, `TyArray`, `TyMap`, `TyVar`,
+`TyLit`, `TyNeg`. Two traps for anyone re-deriving this by grep:
+
+* **`TypeRef` and `TypeDecl` are AST nodes, not arena variants** (`ast.vl:129`).
+  They contribute 83 + 24 textual `X is Ty*` hits and belong to a different
+  question entirely. A `TypeRef` row in an arena-variant table is a miscount.
+* A grep that keys on the variants people remember silently drops `TyErr`,
+  `TyVar`, `TyLit` and `TyNeg` — which are **exactly the four most-omitted**
+  (missing from 64 / 60 / 63 / 67 of the 81 multi-arm ladders below).
+
+Arena `X is Ty<variant>` dispatch sites, comment lines stripped: **993** across
+six files — `typecheck.vl` 736, `emit_classify.vl` 117, `emit_rep.vl` 104,
+`emit_collect.vl` 25, `check_query.vl` 6, `emit_base.vl` 5. (±8 depending on the
+in-line-comment heuristic; the count is not sensitive to it at this resolution.)
+
+### The classification ratio — why a LINT is not the answer
+
+Grouping those 993 sites by `(file, function, scrutinee text)` gives **564
+ladders**, distributed by DISTINCT variants tested:
+
+| distinct variants | ladders |
+|---|---|
+| 1 | 399 |
+| 2 | 84 |
+| 3–4 | 38 |
+| 5–8 | 38 |
+| 11 | 5 |
+
+**483 of 564 (86%) test one or two variants** — those are guards, not dispatches,
+and no lint should look at them. That leaves **81 ladders with ≥ 3 arms**, and
+their fall-throughs classify as:
+
+| | ladders |
+|---|---|
+| complete over all 11 | 5 |
+| complete over the 7 STRUCTURAL variants (missing only holes/exotics) | 11 |
+| missing ≥ 1 structural variant, fall-through is LOUD in the tail block | 7 |
+| **missing ≥ 1 structural variant, fall-through is a SILENT default** | **58** |
+
+A lint keyed on "≥ 3 arena arms, no `else`, silent default" therefore fires on
+**58 sites**, of which this audit's own read of all 276 candidates found ~10
+genuinely dangerous — an **~83% false-positive rate**, on the exact population
+where `isNumeric` legitimately cares only about `TyPrim`/`TyLit`/`TyUnion` and
+`tyAdmitsNull` only about `TyNullable`/`TyPrim`/`TyUnion`. Tightening the
+threshold does not rescue it: at ≥ 5 arms the population is 43 ladders and the
+partial-by-design ones (`repOfArray` over 4 element reps, `mvValNulRefNicheAt`
+over 5 niches) are still the majority. **Rule (a) is measured and rejected.**
+
+### What the language already checks
+
+Two independent mechanisms cover a struct union. Both are pinned by corpus
+fixtures, so neither is a proposal.
+
+**1. `match` over a VALUE union.** `checkMatchExprNode` takes member-TYPE
+patterns ("a pattern over a value union is a member type or the `_` wildcard"),
+banks each arm's narrowing into `isVarTyIx` so the body reads the narrowed
+member's fields, and reports `non-exhaustive match — missing <member> (add the
+arm or a `_`)`. No positional constraint, no rep change, no tag helper, and it
+fires under an inferred return type as well as an annotated one. Verified on the
+real `Ty`: deleting one arm of the converted ladder below makes
+`scripts/refresh-compiler.sh` exit 1 with the variant named at its source
+position. The one rough edge is cosmetic — the member renders STRUCTURALLY
+(`{mKey: i32, mVal: i32, mSet: i32}`), not as `TyMap`.
+
+A helper returning a litunion tag (`match tyTagOf(ix) { "prim" => … }`) is
+therefore **strictly worse than doing nothing new**: it adds an indirection, it
+LOSES the arm narrowing (`t.primName` no longer types inside the arm), and the
+helper itself is one more arena ladder that can drift.
+
+**2. `ifChainExhausts` (`typecheck.vl:14425`).** Computes uncovered-member
+coverage for an else-less `is`-chain over one place and names the missing members
+through `chainMissing`. It reaches a `Ty`-shaped union correctly — but only for a
+chain that is a function's **LAST statement**, under an **ANNOTATED** non-void,
+non-nullable, non-err return, with every arm a bare `<sameIdent> is T`. Arena
+ladders are early-`return` guard chains and independent-`if` walkers, so that
+gate never opens on them; an UN-annotated return skips the check outright
+(measured). This is the machinery `fmt_util.vl:70` relies on for `nodePos`, which
+is why that one AST ladder cannot drift.
+
+### The convertibility envelope, and the two emit gaps inside it
+
+Measured against `vl build`, not assumed. Three ladder shapes convert:
+
+* **The early-`return` guard ladder** — the dominant arena shape. Arms may be
+  arbitrarily long because each ends in `return`. The old trailing default stays,
+  but becomes provably dead, so it can no longer absorb a forgotten variant.
+* **The statement-position walker** — arms must end in a STATEMENT (an `if`, a
+  `while`, an assignment, a call) or be EMPTY `{ }`. An empty arm with a reason
+  comment is the readable spelling for "this variant is a leaf".
+* **The value-position `match`** — bound to a name or as the trailing expression.
+  Multi-statement arms are fine here; the arm's value is its last statement.
+
+Two shapes are `vl check`-clean and rejected by the EMITTER. **Neither is
+`match`-specific**: both reproduce identically with a hand-written `is`-chain, so
+the conversion's envelope is exactly the envelope the original ladder already had
+and no conversion can be blocked by anything new. Recorded because the messages
+mislead a converter into reading a shape nit as a language limit:
+
+* a **value-producing if-expression or `match` in STATEMENT position** (`if u is A
+  { 0 } else { 0 }` as a bare statement; every `match` arm a bare value) →
+  `emitProgram: unsupported statement in body`. Fix: end each arm in a statement,
+  or spell it `{ }`.
+* a **VOID-valued branch mixed with a value branch in VALUE position** (`const r =
+  if u is A { xs.push(u.a) } else { 0 }`) → `emitProgram: if-expression arm is not
+  a single value`, which misnames the cause: the branch IS a single expression, it
+  is a VOID one. Fix: take the statement-position or early-`return` shape.
+
+### The recommendation, ranked
+
+1. **Convert the TOTAL-DOMAIN arena ladders to `match`, one per PR.** These are
+   the ladders whose domain genuinely IS all of `Ty`, identified mechanically as
+   the ones already covering every one of the 7 structural variants — **16
+   (function, scrutinee) ladders across 14 functions**: `repCanonKeyGo`,
+   `repElemKeyGo`, `repMvValKeyGo`, `repOfTyFlat`, `repTyScalarMask`, `rtGo`
+   (`emit_rep.vl`); `tyToStrGo`, `tyEqGo` (×2 scrutinees),
+   `tyIsEmitRepresentable`, `tyToEmitNameGo`, `tyToNominalNameGo`, `flatWhyNot`,
+   `assignableGo` (×2), `vbUnionMemberName` (`typecheck.vl`). A natural second
+   tier is the five missing exactly ONE structural variant — `substTyDeep`,
+   `tyChildrenOf`, `tyReachesHole`, `tyPrintsAsRef` (all `TyPrim`) and
+   `nodeArrayElemName` (`TyArray`, audit row R7) — where the conversion forces a
+   real decision rather than pinning a settled one. Cost per ladder: reindent,
+   spell the deliberate leaves as empty/no-op arms WITH their reason, and (once,
+   done) export `TyErr`/`TyVar` from `typecheck.vl` so a file can name the two
+   holes it is deliberately skipping. `repTyScalarMask` is the worked instance.
+2. **Route the DESCENT walkers through `tyChildrenOf` — higher leverage per edit
+   than (1), and larger blast radius.** `tyChildrenOf` (`typecheck.vl:7717`)
+   already IS the shared "direct child type indices of arena entry `ix`" visitor,
+   with a `TyNeg` arm and a header naming its four leaves — and it has **exactly
+   one caller** (`tyReachesGo`). Meanwhile **20 of the 81 ladders are descent
+   walkers** by the mechanical proxy "≥ 3 distinct child-field reads, no
+   leaf-field read", the unambiguous members being the `tyReaches*` /
+   `collectTyReach*` family: `tyReachesHole`, `tyReachesUnion`,
+   `tyReachesEmptyHole`, `tyReachesBrand`, `tyReachesFuncD`, `tyDeeperThan`,
+   `collectTyReachRegister`, `collectTyReachCloSigs`, `collectTyMembersReach`,
+   `cloCallUnionMixUnrep`. Making `tyChildrenOf` one exhaustive `match` and
+   routing those through it retires ~10 ladders with ONE guarded arm-set instead
+   of pinning 10 separately, and it fixes gaps rather than freezing them: R10's
+   `TyNeg` omissions are all in this family, and **`tyReachesHole` has the same
+   one** — it descends every composite except `TyNeg`, so `!(T[])` over a
+   hole-reaching `T` answers "no hole" silently. `tyChildrenOf` handles `TyNeg`
+   already. Cost: it must be exported across `emit_rep.vl` / `emit_collect.vl` /
+   `emit_classify.vl`, and the walkers that ALSO read a leaf field
+   (`repTyScalarMask` needs `TyPrim.primName`) need a small leaf predicate
+   alongside the child list; `substTyDeep` REBUILDS rather than descends and
+   cannot use a child-list visitor at all. Ranked second only because it is a
+   bigger change than (1) for the same guarantee, and because it does nothing for
+   the renderers, key builders and classifiers that (1) covers.
+3. **Leave the 58 partial ladders alone, and do not lint them.** A `match` there
+   would demand 11 arms for a 3-member question, exactly as it would demand 27 for
+   `nulScalarListWrapHeap`. Their correctness rests on the caller-side sentinel
+   invariant, which the SAFE-LOUD rows above verify one at a time.
+4. **Extend `ifChainExhausts` to the early-`return` ladder shape** — a real
+   option, not taken here. It already knows how to compute arena coverage and name
+   the missing members; what it lacks is a second entry point for "a run of
+   consecutive `if <same place> is T { return … }` statements ending in a default".
+   That would cover convertible ladders WITHOUT rewriting them, which is a much
+   larger blast radius than 16 conversions and wants its own measured slice.
+5. **Ruled out**: a rep change to `Ty` (a tag discriminant buys nothing `match`
+   does not already give); a litunion tag helper (loses narrowing, adds a
+   driftable ladder); a lint rule (58 firings, ~83% false positives); a
+   test-side fixture grid per ladder-bearing entry point (the 993 sites do not
+   have 993 reachable entry points, and the audit rows above show the reaching
+   programs are per-ladder bespoke — it does not generalise into a harness).
+
+### Reproducing the numbers
+
+The scan is three mechanical passes over `compiler/*.vl` and takes seconds:
+group `X is Ty<variant>` hits by `(file, function, scrutinee)`; bucket the
+ladders by distinct-variant count; for each ladder with ≥ 3, print the missing
+variants split into structural vs hole/exotic plus the enclosing function's tail
+line. Re-run after any arena change — that is the difference between finding the
+next one by sweep and finding it by accident.
