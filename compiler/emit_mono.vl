@@ -1903,35 +1903,76 @@ function monoFnTypeAnnParamsName(name: string, out: string[]) {
 // this carries the value its concrete type INDEPENDENT of any call — so a binding that ESCAPES
 // (passed to a HOF / returned / stored) is `call_ref`'d at the type its annotation pinned.
 //
-// PARTIAL annotation is included, and the gate that admits it is the one that keeps it sound: an
-// ALREADY-ANNOTATED parameter must AGREE with the boundary's param name, so this path only ever
-// fills the un-annotated HOLES and never re-reads a written `a: i32` as the boundary's `f64`. A
-// disagreement declines exactly as before (the emit-time value floor then rejects). The gate that
-// used to sit here — every parameter un-annotated — disagreed with the value floor's own predicate
-// (`fnHasUnannotatedParam`, satisfied by ONE hole), and the whole gap between the two was the
-// partially-annotated function: strictly WORSE than the same function with no annotations at all,
-// which is the opposite of what an annotation should do.
-// An explicit `<T>` generic keeps the call-driven path: its params are annotated with the type
-// PARAMETER's name, which never equals a concrete boundary name, so the agreement gate declines it.
-// The guard is written out anyway rather than left implicit in that coincidence.
+// Every parameter is read, in one of three ways, and the reading is what keeps the path sound:
+//   - UN-ANNOTATED — a hole, filled from the boundary. This is the original case.
+//   - annotated with a TYPE PARAMETER (`x: T`, `xs: T[]`, `b: Box<T>`) — the boundary BINDS it,
+//     exactly as an argument type does on the call-driven path (`monoBindFromAnn`), and the
+//     binding also substitutes the return.
+//   - annotated CONCRETELY — it must AGREE with the boundary's param name, else decline. So a
+//     written `a: i32` is never re-read as a boundary's `f64`; the emit-time value floor then
+//     rejects, which is the verdict that spelling had before.
+// The gate that used to sit here — every parameter un-annotated — disagreed with the value floor's
+// own predicate (`fnHasUnannotatedParam`, satisfied by ONE hole), and the gap between the two was
+// the partially-annotated function: strictly WORSE as a value than the same function with no
+// annotations at all, which is the opposite of what an annotation should do. The `<T>` half of the
+// gap was worse still: `fnHasUnannotatedParam` is FALSE for `f<T>(x: T)`, so the floor never fired
+// and the value emitted at the UN-SUBSTITUTED shape — `vl check` clean, then `wasm trap: indirect
+// call type mismatch`. Binding the type parameter here is what makes that shape emit the instance
+// the checker already typed it as.
 // Returns 0, or -1 via `emitFail`.
 function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
     const params = fn.fnParams
     if params.length != pinnedNames.length { return 0 }
-    if fn.fnTyParams.length > 0 { return 0 }
+    const tvN: string[] = []
+    const tvV: string[] = []
     let i = 0
     while i < params.length {
       const p = P.nodes[params[i]]
       if p is Param {
         if p.parType >= 0 {
-          if normTypeAtom(tyNameOf(p.parType)) != normTypeAtom(pinnedNames[i]) {
+          // The declared spelling, so a parameter whose annotation names a type PARAMETER is read
+          // as that parameter rather than as whatever an alias of the same name canon'd to —
+          // `monoInstantiate`'s rule, for the same reason.
+          const ann = monoDeclAnnName(
+            p.parType,
+            tyNameOf(p.parType),
+            fn.fnTyParams,
+          )
+          if monoAnnHasTyParam(ann, fn.fnTyParams) {
+            monoBindFromAnn(ann, pinnedNames[i], fn.fnTyParams, tvN, tvV)
+          } else if normTypeAtom(ann) != normTypeAtom(pinnedNames[i]) {
             return 0
           }
         }
       }
       i = i + 1
+    }
+    // POST-CONDITION on the bindings, and it needs its own pass because `monoBindFromAnn` is
+    // FIRST-USE-WINS: substituting them back through every type-param-riding annotation must
+    // REPRODUCE the boundary. `pairT<T>(a: T, b: T)` reaching `(i32, string) => i32` binds T to
+    // i32 from `a` and then silently disagrees at `b`; without this it materialized an instance
+    // the second position contradicts. Declining hands it to the value floor, which is a
+    // diagnostic rather than a value emitted at a shape half the boundary denies.
+    let v = 0
+    while v < params.length {
+      const pv = P.nodes[params[v]]
+      if pv is Param {
+        if pv.parType >= 0 {
+          const annV = monoDeclAnnName(
+            pv.parType,
+            tyNameOf(pv.parType),
+            fn.fnTyParams,
+          )
+          if monoAnnHasTyParam(annV, fn.fnTyParams) {
+            const sub = monoSubstAnn(annV, fn.fnTyParams, tvN, tvV)
+            if sub == "" { return 0 }
+            if normTypeAtom(sub) != normTypeAtom(pinnedNames[v]) { return 0 }
+          }
+        }
+      }
+      v = v + 1
     }
     const pinned: string[] = []
     let j = 0
@@ -1939,8 +1980,6 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
       pinned.push(pinnedNames[j])
       j = j + 1
     }
-    const tvN: string[] = []
-    const tvV: string[] = []
     // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
     // value escapes its call sites, so its body keeps the `call_ref`. Empty → no key/body change.
     const noCb: string[] = []
