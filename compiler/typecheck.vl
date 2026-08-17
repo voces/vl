@@ -5080,7 +5080,7 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   // Only SCALAR/STRING returns — the categories the emitter default + `A20` classify
   // for an un-annotated function. Object / array / union / nullable returns can
   // mis-lower (the emitter re-derives them from the return expression), so keep those.
-  const rnm = tyToStr(ret)
+  const rnm = tyToStructStr(ret)
   if !isClassifiableRetName(rnm) { return 0 }
   // Skip GENERIC functions (an un-annotated param is a per-call-site hole; `A20` does
   // not elaborate them, so a removed string return could mis-lower).
@@ -7775,16 +7775,37 @@ function checkInferredMapKey(k: i32, isSet: i32, at: i32) {
 // ── type → string (for diagnostics) ──────────────────────────────────────────
 // Renders a type-arena index as a readable type name. Recurses through the arena
 // for object/function/union/nullable. Narrows the `Ty` union only — never `Node`.
-export function tyToStr(ix: i32) {
+//
+// THE DISPLAY ENTRY IS NOMINAL-FIRST, and the mode bit is what keeps it ONE renderer.
+// Every surface a person reads — hover, inlay, completion, the redundant-annotation
+// hint, every `tErr` message — must spell a type the way its source spells it, so a
+// declared struct is `Cat`, a generic application is `Box<i32>` and a declared union
+// alias is `U`. `tyToStructStr` is the SAME recursion with the nominal legs off: it
+// serves the checker's handful of NAME PRODUCERS, whose strings are emitter table
+// keys rather than prose, and which must keep the structural spelling those tables
+// already hold. One body, one arm set, one place to add a 12th arena variant.
+export function tyToStr(ix: i32) { tyToStrAt(ix, true) }
+
+// The STRUCTURAL render — `tyToStr`'s recursion with the nominal legs off. Read by the
+// checker's emitter-facing name producers (`nodeArrayElemName`, `nodeTyName`, the
+// inferred-return recorders, the resolved-list name a hole's shape is pinned under),
+// whose result is looked up in an emitter table keyed by a STRUCTURAL spelling
+// (`structIndexOfTypeName` matches a `{…}` shape by field set). A nominal name there is
+// a key those tables do not hold, and the corpus byte channel is what says so: with
+// these nine sites on the nominal entry the emitted modules move, and with them here
+// all 1,609 are byte-identical.
+export function tyToStructStr(ix: i32) { tyToStrAt(ix, false) }
+
+function tyToStrAt(ix: i32, nominal: boolean) {
   if ix < 0 { return "<none>" }
   if tyToStrDepth > 8 { return "…" }
   tyToStrDepth = tyToStrDepth + 1
-  const s = tyToStrGo(ix)
+  const s = tyToStrGo(ix, nominal)
   tyToStrDepth = tyToStrDepth - 1
   s
 }
 
-function tyToStrGo(ix: i32) {
+function tyToStrGo(ix: i32, nominal: boolean) {
   // A NOMINAL NEWTYPE renders as its NAME. This is the only renderer that must —
   // a diagnostic reading "cannot assign i32 to i32" for `const e: EntityId = n`
   // names the distinction the type exists to draw and then hides it. The EMIT
@@ -7793,6 +7814,27 @@ function tyToStrGo(ix: i32) {
   // (`docs/internals/newtype-design.md` §3).
   const nwn = nomNameOfTy(ix)
   if nwn != "" { return nwn }
+  // NOMINAL-FIRST, the same three legs and the same ORDER `tyToNominalNameGo` and
+  // `transparentMemberEmitName` ask them in — declared struct, generic application,
+  // declared union alias. An application has to precede the union leg for the reason
+  // it does there: it expands to a `TyObj`/`TyUnion` whose structural render is exactly
+  // the expansion the nominal answer exists to replace. Each leg declines with "" for a
+  // type it does not name (an anonymous shape, an uninstantiated or cyclic application),
+  // so every type with no source spelling still renders structurally.
+  //
+  // NO `numLitUnionBaseName` SOFTEN HERE, and that is the one place display and the
+  // emit-name renderer legitimately part. That soften exists because `Z` is not a name
+  // the EMITTER can classify (`type Z = 0 | 1` lowers as its base scalar); a reader's
+  // question is what the source calls the type, and `Z` is both the answer and a
+  // spelling that parses back to the same type.
+  if nominal {
+    const sdn = structNameOfTy(ix)
+    if sdn != "" { return sdn }
+    const gan = genAppNameOfTy(ix)
+    if gan != "" { return gan }
+    const udn = unionAliasDeclNameOfTy(ix)
+    if udn != "" { return udn }
+  }
   const t = T.tys[ix]
   // EXHAUSTIVE over `Ty` and deliberately `_`-less: the checker's match
   // exhaustiveness names any arena variant this renderer stops answering for, so a
@@ -7814,7 +7856,7 @@ function tyToStrGo(ix: i32) {
       let i = 0
       while i < names.length {
         if i > 0 { s = s + ", " }
-        s = s + names[i] + ": " + tyToStr(ftys[i])
+        s = s + names[i] + ": " + tyToStrAt(ftys[i], nominal)
         i = i + 1
       }
       return s + "}"
@@ -7825,10 +7867,10 @@ function tyToStrGo(ix: i32) {
       let i = 0
       while i < ptys.length {
         if i > 0 { s = s + ", " }
-        s = s + tyToStr(ptys[i])
+        s = s + tyToStrAt(ptys[i], nominal)
         i = i + 1
       }
-      return s + ") -> " + tyToStr(t.fnRet)
+      return s + ") -> " + tyToStrAt(t.fnRet, nominal)
     }
     TyUnion => {
       const members = t.uMembers
@@ -7836,19 +7878,23 @@ function tyToStrGo(ix: i32) {
       let i = 0
       while i < members.length {
         if i > 0 { s = s + " | " }
-        s = s + tyToStr(members[i])
+        s = s + tyToStrAt(members[i], nominal)
         i = i + 1
       }
       return s
     }
     TyNullable => {
-      return tyToStr(t.nInner) + "?"
+      return tyToStrAt(t.nInner, nominal) + "?"
     }
     TyArray => {
-      return tyToStr(t.aElem) + "[]"
+      return tyToStrAt(t.aElem, nominal) + "[]"
     }
     TyMap => {
-      return "{[" + tyToStr(t.mKey) + "]: " + tyToStr(t.mVal) + "}"
+      return "{[" +
+        tyToStrAt(t.mKey, nominal) +
+        "]: " +
+        tyToStrAt(t.mVal, nominal) +
+        "}"
     }
     TyVar => {
       // An inference hole (`?fn.N`) — an un-annotated, still-polymorphic param — is
@@ -7872,7 +7918,7 @@ function tyToStrGo(ix: i32) {
       return t.litText
     }
     TyNeg => {
-      return "!" + tyToStr(t.negTy)
+      return "!" + tyToStrAt(t.negTy, nominal)
     }
   }
   // UNREACHABLE by construction: every arena variant has an arm above and every
@@ -17057,7 +17103,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // analogue of the named loop in `checkProgram`; without it a non-i32 return reached
       // through a VARIABLE (`(n) => { const x: i64 = …; return x }`) — which the emitter's
       // expression-based fallback misses — emits invalid wasm.
-      const anm = tyToStr(inferred)
+      const anm = tyToStructStr(inferred)
       // A STRUCT-with-BOXED-FIELD contextual return (`{f: boolean | {w: i32}}`, `{f: i64 |
       // string}` — a struct whose field is a union/nullable) the checker adopted at the lambda
       // boundary (`objRetWidenAdopt`'s boxing-widen arm). Recorded under the CANONICAL emit name
@@ -18391,7 +18437,7 @@ function collectRetAtoms(er: i32, out: string[]) {
     collectRetAtoms(t.nInner, out)
     out.push("null")
   } else {
-    out.push(tyToStr(er))
+    out.push(tyToStructStr(er))
   }
   0
 }
@@ -20311,7 +20357,7 @@ export function checkProgram(rootIx: i32) {
             // the emitter's classifier. A structural object / union / array name
             // (`{x: i32}`, `A | B`, `Tok[]`) can mis-classify, and the emitter's
             // expression-based fallback already handles those, so leave them be.
-            const enm = tyToStr(er)
+            const enm = tyToStructStr(er)
             if isClassifiableRetName(enm) {
               // `isClassifiableRetName`'s admitted set is six scalar spellings plus
               // `i32[]`/`string[]` — every one of them a single atom (#1115).
@@ -21493,10 +21539,10 @@ export function nodeArrayElemName(ix: i32) {
     if t.aElem >= 0 {
       const el = T.tys[t.aElem]
       if el is TyVar { return "" }
-      if el is TyPrim { return tyToStr(t.aElem) }
+      if el is TyPrim { return tyToStructStr(t.aElem) }
       // A STRUCT element renders its inline shape name (`{v: i32}`), which
       // `structIndexOfTypeName` matches to the interned struct by field-set.
-      if el is TyObj { return tyToStr(t.aElem) }
+      if el is TyObj { return tyToStructStr(t.aElem) }
       // A MAP element (`{[string]: V}[]`, `{[i32]: V}[]`, a `Set()` element) renders the
       // EMIT name — `{[K]:V}`, spaceless, which is character-for-character the synthetic
       // name `parseType` builds for the annotated `{[K]: V}[]` spelling — so the inferred
@@ -21616,13 +21662,13 @@ export function nodeTyName(ix: i32) {
   const t = T.tys[ty]
   if t is TyPrim {
     if t.primName == "void" { return "" }
-    return tyToStr(ty)
+    return tyToStructStr(ty)
   }
   // A STRUCT type renders its inline shape (`{x: i32}`); the emitter's `synthParamAnnots`
   // resolves that to the declared struct's NOMINAL name (`structIndexOfTypeName` matches by
   // field-set), so an un-annotated struct-element callback param (`ps.map((p) => p.x)`) gets
   // the same `p: P` annotation the explicit form would.
-  if t is TyObj { return tyToStr(ty) }
+  if t is TyObj { return tyToStructStr(ty) }
   // A FUNCTION type renders its closure-annotation name (`(i32) => i32`) so an un-annotated
   // closure VALUE from a call result (`const g = f(4)`) recovers a sig-keyable name.
   if t is TyFunc { return tyToEmitName(ty) }
@@ -22566,7 +22612,7 @@ export function monoInferListElem(
     if ltt is TyArray {
       if ltt.aElem >= 0 {
         const el = T.tys[ltt.aElem]
-        if !(el is TyVar) { listName = tyToStr(lt) }
+        if !(el is TyVar) { listName = tyToStructStr(lt) }
       }
     }
   }
