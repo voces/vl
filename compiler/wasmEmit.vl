@@ -1870,14 +1870,15 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       if variantIndexOf(rsp) >= 0 { return -1 }
     }
     if exprUnion(nd.isObj, fnIx) { return -1 }
-    // A NULLABLE receiver is NEVER statically decided here, because the name this fold
-    // compares against is its NON-NULL base: `monoArgTyName`'s cascade classifies a
+    // A NULLABLE receiver is NEVER statically decided here, because the only name this fold
+    // has for it is its NON-NULL base: `monoArgTyName`'s cascade classifies a
     // `string | null` / `boolean | null` / `i32[] | null` / `K | null` value by the member
-    // it reps as (`string`, `boolean`, `i32[]`, `i32`), so `v is null` compared two names
-    // that can never be equal and folded to FALSE — a guard that never fires. Those reps
-    // are RUNTIME tests (`emitNulIsNullTest`), and this is the gate the STATEMENT emitter's
-    // dead-arm skip (`monoStaticIsGuardOf`) reads too, so the skip and the emitted
-    // condition cannot disagree about whether the guard is decided.
+    // it reps as (`string`, `boolean`, `i32[]`, `i32`), so `v is null` would compare two
+    // names that can never be equal and decide FALSE — a guard that never fires. Those reps
+    // are RUNTIME tests (`emitNulIsNullTest`). The gate lives HERE rather than at the `is`
+    // emitter because the STATEMENT emitter's dead-arm skip (`monoStaticIsGuardOf`) reads
+    // this same answer: split them and the skip could drop an arm whose guard the emitted
+    // condition still evaluates at runtime.
     if nodeTyIsNullable(nd.isObj) { return -1 }
     const sk = monoArgTyName(nd.isObj, fnIx)
     if sk == "" { return -1 }
@@ -2040,12 +2041,13 @@ function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
 // Returns 1 when the ladder CLAIMS the receiver's rep (bytes emitted), 0 when no arm
 // matches (nothing emitted — the caller keeps its own paths), -1 on an emit failure.
 //
-// A REP ANSWERED IN ONLY ONE OF THE TWO CALLERS IS A GUARD THAT NEVER FIRES. With the `is`
-// side carrying a nullable-STRUCT arm alone, every other niche fell through to
-// `monoStaticIsResult`, whose `monoArgTyName` names a receiver by its NON-NULL base
-// (`string`, `boolean`, `i32[]`, `K`) and so CONST-FOLDED the guard to FALSE: `vl check`
-// clean, the wrong branch taken in statement position and a `ref.as_non_null` trap wherever
-// the narrowed arm was the value.
+// A REP ANSWERED IN ONLY ONE OF THE TWO CALLERS IS A GUARD THAT NEVER FIRES, and the
+// failure is SILENT: an `is` receiver no arm here claims falls through to
+// `monoStaticIsResult`, whose `monoArgTyName` names a nullable value by its NON-NULL base
+// (`string`, `boolean`, `i32[]`, `K`) — so the fold compares two names that can never be
+// equal and decides FALSE. `vl check` clean, the wrong branch taken in statement position
+// and a `ref.as_non_null` trap wherever the narrowed arm is the value. Adding a rep to one
+// caller's ladder without the other re-opens exactly that.
 //
 // `nicheOnly` restricts the ladder to the SINGLE-non-null-member reps. A value-union BOX
 // and an optional chain can carry several non-null members, so "not null" does not identify
@@ -2578,15 +2580,18 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // (`emitNulIsNullTest` — its header carries why one home is required). `x is <member>`
   // inverts it: the checker already proved the tested shape is the sole non-null member.
   //
-  // THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT AND IT WAS MEASURED. Every rep this arm
-  // claims used to fall through to `monoStaticIsResult` DIRECTLY BELOW — that fold is the
-  // defect this arm exists to remove — so sitting immediately in front of it reaches
-  // exactly the receivers that were broken and preempts nothing that already worked. Ahead
-  // of the box paths it does preempt: a union BOX narrowed by an outer arm to a single
+  // THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT AND IT IS MEASURED, NOT REASONED. This
+  // arm belongs immediately in front of `monoStaticIsResult` and behind every box / atom /
+  // membership path above, because the set it claims is exactly the set that otherwise
+  // reaches that fold — which names a nullable receiver by its NON-NULL base and so decides
+  // a guard that has to run.
+  //
+  // Ahead of the box paths it MISCLAIMS: a union BOX narrowed by an outer arm to a single
   // nullable member (`else if x is boolean` at the end of an `A | B | i32 | … | null`
   // chain) reads `exprNulBool` TRUE on a value whose STORAGE is still a `(ref $uBox)`, and
   // the sentinel compare `i32.ne` over a box ref is invalid wasm
-  // (`functions/heterogeneous-union.vl`). Narrowing is a TYPE fact; the box is the storage.
+  // (`functions/heterogeneous-union.vl` is the live pin). Narrowing is a TYPE fact; the box
+  // is the STORAGE, and only the paths above read the storage.
   //
   // The litunion niche takes only the `is null` DIRECTION. `v is K2` over a `K | null` where
   // `K2` is a SUB-alias is a MEMBERSHIP question — one "not null" cannot express — and the
@@ -15640,8 +15645,8 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if nref >= 0 {
       // The ladder is shared with the `is null` guard — the two spellings ask the same
       // question of the same rep, and `emitNulIsNullTest`'s header carries why they must
-      // not be answered in only one place. `!=` is the INVERTED direction, so the sentinel
-      // arms keep emitting `i32.ne` rather than an `i32.eq` a caller then negates.
+      // not be answered in only one place. `!=` is the INVERTED direction, which the ladder
+      // emits directly (`i32.ne`) rather than leaving a caller to negate an `i32.eq`.
       const bnt = emitNulIsNullTest(body, nref, fnIx, e.binOp == "!=", false)
       if bnt < 0 { return -1 }
       if bnt > 0 { return 0 }
