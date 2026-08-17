@@ -14799,7 +14799,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // annotated `: {w: i32} | i32` spelling. Checked BEFORE the TyUnion/TyNullable arms
       // (it spans both) so the floor accepts EXACTLY the box the emitter registers; a
       // shape `variantBoxUnionRetName` still declines falls through to floor.
-      if variantBoxUnionRetName(inferred) != "" {
+      if litUnionAliasNameOfTy(inferred) != "" {
+        // A pure literal union with a DECLARED alias (`type K = "a" | "b"`) lowers
+        // un-annotated as the interned i32 ATOM: the A20 loop records the alias name and
+        // the emitter's return classification reads the same `nameIsLitUnionType` rep the
+        // annotated `: K` spelling reaches. An INLINE litunion (no alias to record) still
+        // floors below — it has no name for the emitter to key on.
+      } else if variantBoxUnionRetName(inferred) != "" {
         // lowers un-annotated — no floor
       } else if itt is TyUnion {
         // A pure STRUCT-union whose every member maps to a NAMED type (`Cat | Dog`) lowers
@@ -17643,6 +17649,15 @@ function variantBoxUnionRetName(er: i32) {
       psum = psum + 1
       i = i + 1
     }
+    // ONE ATOM IS NOT A UNION. The `members.length < 2` guard at the top counts ARENA
+    // members, which is the count BEFORE the litunion regroup above contracts a whole run
+    // of `TyLit` members into a single alias atom — so a PURE literal union (`type K = "A"
+    // | "B" | "C"`, every member a `TyLit`) reaches here having appended exactly one atom,
+    // `K`. That is the interned i32 ATOM rep (`nodeTyIsLitUnionAlias` -> `retLitUnion`),
+    // not the `{tag, payload}` box this name keys, and the two disagree at the seam: the
+    // callee boxed while every call site read the atom. `psum` is the post-contraction
+    // count, so it is the one that can see it.
+    if psum < 2 { return "" }
     if hasClo && !hasObj { return "" }
     if !hasComposite { return "" }
     return irAtoms(name, psum)
@@ -17926,6 +17941,14 @@ export function checkProgram(rootIx: i32) {
                 // so no argument-evaluation order is relied on.
                 const sun = structUnionRetName(er, gRootStmts)
                 recordInferRet(efn.fnName, sun, er, inferRetNameAtoms)
+              } else if litUnionAliasNameOfTy(er) != "" {
+                // A pure LITERAL-UNION inferred return (`function f(k: K) { return k }` over a
+                // `type K = "a" | "b"`) reps as the interned i32 ATOM, exactly like the annotated
+                // `: K` spelling — export the ALIAS name so the emitter's return classification
+                // reaches the atom rep (`nameIsLitUnionType` -> `retLitUnion`) instead of the
+                // value-union box. An alias name is ONE identifier, so one atom (#1115).
+                // The lambda ladder records the identical name at its own litunion rung.
+                recordInferRet(efn.fnName, litUnionAliasNameOfTy(er), er, 1)
               } else if variantBoxUnionRetName(er) != "" {
                 // A VARIANT-BOX union (`{w: i32} | i32`, `Cat | i32` — a struct arm beside a
                 // scalar) lowers un-annotated via the SAME `>u` box the annotated `: {w:
