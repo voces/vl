@@ -294,6 +294,7 @@ import {
   fnUsesF32Push,
   fnUsesF64Push,
   fnUsesI64Push,
+  fnUsesNulStrPush,
   fnUsesPush,
   fnUsesRefPush,
   fnUsesStrPush,
@@ -4307,6 +4308,11 @@ function pushKindBitsOf(objIx: i32, fnIx: i32) {
   if exprF64Array(objIx, fnIx) { bits = bits | 8 }
   if exprI64Array(objIx, fnIx) { bits = bits | 16 }
   if exprF32Array(objIx, fnIx) { bits = bits | 32 }
+  // Bit 64 is ADDITIVE to bit 4, not an alternative: a `(string | null)[]` push uses the
+  // STRING quad (one backing), and only its VALUE slot changes — to `(ref null $aTypeIdx)`,
+  // because the pushed value may be `null`. `exprNulStrArray` is the same predicate the
+  // element READ and the for-in loop var ask, so the frame cannot disagree with the value.
+  if exprNulStrArray(objIx, fnIx) { bits = bits | 4 | 64 }
   if bits == 0 { return 1 }
   bits
 }
@@ -4517,6 +4523,7 @@ export function applyPushPopBits(bits: i32) {
   if (bits & 1) != 0 { fnUsesPush = true }
   if (bits & 2) != 0 { fnUsesRefPush = true }
   if (bits & 4) != 0 { fnUsesStrPush = true }
+  if (bits & 64) != 0 { fnUsesNulStrPush = true }
   if (bits & 8) != 0 { fnUsesF64Push = true }
   if (bits & 16) != 0 { fnUsesI64Push = true }
   if (bits & 32) != 0 { fnUsesF32Push = true }
@@ -8975,6 +8982,15 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
     if mapShapeKeyI32(bk) { return "i32" }
     return "str"
   }
+  // A `(string | null)[]` — the string-ref NICHE list. Its backing IS a plain string list,
+  // but the element slot is `(ref null $aTypeIdx)`, so the loop var binds the NULLABLE
+  // string (kind 16), exactly as `const e = xs[i]` does through `emitIndex`'s dedicated
+  // nulstr arm. Checked BEFORE `exprStringArray`, which claims the same backing for a
+  // NON-null element and would hand the loop var a `(ref $aTypeIdx)` slot — the read then
+  // recovers non-null and TRAPS on a null element, and the loop var's `!= null` finds no
+  // nullable rep to test (`bare null needs a struct-typed context`). One `for` must bind
+  // what one index read yields.
+  if exprNulStrArray(iterIx, fnIx) { return "nulstr" }
   if exprStringArray(iterIx, fnIx) { return "str" }
   // A STRUCT-element ref list (`S[]`): the element is a struct ref, so bind the loop
   // var as a code-`1` struct local. (Union-box (`2`) / map-array ref lists are not
@@ -8997,7 +9013,16 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
     // 4/6/7/8 = the inner list wrapper): the loop var binds the INNER LIST — a list local of
     // kind 2/7/12/20 (i32/string/f64/i64 list). The element read is a ref (the inner wrapper,
     // recovered non-null), like the struct case; the `#l` temp is the outer ref-list wrapper.
-    if rlElemKindTbl[rslot] == 4 { return "list" }
+    if rlElemKindTbl[rslot] == 4 {
+      // A `(i32[] | null)[]` keeps the `| null` in its element SLOT (the interned
+      // `rlElemNullable` bit), so the loop var is the kind-15 NULLABLE list — the same rep
+      // `const e = xs[i]` binds through `exprNullableList`'s kind-4 Index arm. Without it the
+      // loop var claimed the non-null list: the element read recovered `ref.as_non_null` and
+      // TRAPPED on a null row, and `x != null` found no nullable rep to test. Mirrors the
+      // `nulstruct` / `nulstr` niches above.
+      if rlElemIsNulNiche(rslot) { return "nullist" }
+      return "list"
+    }
     if rlElemKindTbl[rslot] == 6 { return "strlist" }
     if rlElemKindTbl[rslot] == 7 { return "f64list" }
     if rlElemKindTbl[rslot] == 8 { return "i64list" }
