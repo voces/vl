@@ -2440,6 +2440,8 @@ export function initChecker() {
   weKeys = []
   weVals = []
   weOpen = []
+  weRoots = []
+  weCut = 0
   asgSrcStack = []
   asgDstStack = []
   tyToStrDepth = 0
@@ -2802,6 +2804,29 @@ let weKeys: string[] = []
 let weVals: string[] = []
 let weOpen: string[] = []
 
+// The function bodies currently being summarised, innermost last. A call inside a
+// callee body may name a function declared in that body — or in a sibling frame of it
+// — and `lookupFnDeclNode` reads the CALLER's scope chain, where neither is visible.
+// Answering "not a function" there is what made the whole nested-write route fail
+// OPEN: `function outer(x) { function inner(y) { y.v = null }  inner(x) }` summarised
+// as writing nothing.
+let weRoots: i32[] = []
+
+// Counts cycles CUT during the walk, so a provisional summary is not cached. Cutting
+// a cycle at ⊥ and iterating is the least fixpoint of a may-write analysis, and for
+// the key that was QUERIED the first pass already reaches it — `X = base ∪ X` has
+// least solution `base`. An inner key on the cycle does NOT: `g` computed while `f`
+// was open is missing `f`'s own writes, so caching it would answer a later
+// independent query with a summary that is too small.
+let weCut = 0
+
+// Answer a recursive cycle OPAQUE instead of ⊥ — the strictly-fail-closed reading.
+// It is sound but costs every read-only recursive callee: measured at 18 of 348 grid
+// cells newly rejecting CORRECT programs, all of them that one shape, against 0 for
+// the fixpoint. Kept as a switch because it is the conservative fallback if the
+// fixpoint argument above is ever found wanting.
+const ALIAS_CYCLE_OPAQUE = false
+
 // Set to make every statically-known callee answer OPAQUE — the BROAD rule ("any
 // call receiving the object invalidates every narrowing rooted at it"), kept as one
 // switch so the two candidate rules are one code path and one measurement harness.
@@ -2831,27 +2856,79 @@ function fnWriteEffects(fnIx: i32, paramIx: i32) {
     if weKeys[ci] == key { return weVals[ci] }
     ci = ci + 1
   }
-  let oi = 0
-  while oi < weOpen.length {
-    if weOpen[oi] == key { return "*" } // recursive cycle → fail closed
-    oi = oi + 1
-  }
+  if weIsOpen(key) { return weCycleAnswer() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     const ps = fd.fnParams
     if paramIx >= 0 && paramIx < ps.length {
       const p = P.nodes[ps[paramIx]]
       if p is Param {
+        const cutBefore = weCut
         weOpen.push(key)
+        weRoots.push(fd.fnBody)
         const acc = weScan(fd.fnBody, p.parName)
+        weRoots.pop()
         weOpen.pop()
-        weKeys.push(key)
-        weVals.push(acc)
+        weCache(key, acc, cutBefore)
         return acc
       }
     }
   }
   "*"
+}
+
+// Whether a summary for `key` is already being computed higher in the recursion.
+function weIsOpen(key: string) {
+  let i = 0
+  while i < weOpen.length {
+    if weOpen[i] == key { return true }
+    i = i + 1
+  }
+  false
+}
+
+// What a cut cycle answers: ⊥ for the fixpoint reading, opaque for the strict one.
+function weCycleAnswer() {
+  weCut = weCut + 1
+  if ALIAS_CYCLE_OPAQUE { return "*" }
+  ""
+}
+
+// Cache a summary unless it is PROVISIONAL — computed with a cycle cut while another
+// summary was still open, which is the one case the first pass leaves too small.
+function weCache(key: string, acc: string, cutBefore: i32) {
+  if weCut != cutBefore && weOpen.length > 0 { return 0 }
+  weKeys.push(key)
+  weVals.push(acc)
+  0
+}
+
+// The `FuncDecl` named `name` declared inside any body currently being summarised,
+// innermost frame first, or -1.
+function findFnDeclInRoots(name: string) {
+  let i = weRoots.length - 1
+  while i >= 0 {
+    const d = findFnDeclIn(weRoots[i], name)
+    if d >= 0 { return d }
+    i = i - 1
+  }
+  -1
+}
+
+function findFnDeclIn(rootIx: i32, name: string) {
+  if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
+  const n = P.nodes[rootIx]
+  if n is FuncDecl {
+    if n.fnName == name { return rootIx }
+  }
+  const kids = nodeChildren(rootIx)
+  let i = 0
+  while i < kids.length {
+    const d = findFnDeclIn(kids[i], name)
+    if d >= 0 { return d }
+    i = i + 1
+  }
+  -1
 }
 
 // Accumulate the field sub-paths a subtree may write through the parameter named
@@ -2973,12 +3050,16 @@ function callDeclFnIx(cn: Call) {
   if cf is Ident {
     const d = lookupFnDeclNode(cf.identName)
     if d >= 0 { return d }
+    const nd = findFnDeclInRoots(cf.identName)
+    if nd >= 0 { return nd }
     if lookup(cf.identName) >= 0 { return -1 } // a function VALUE: target unknown
     return -2 // an intrinsic named by a bare identifier
   }
   if cf is Member {
     const d = lookupFnDeclNode(cf.memProp)
     if d >= 0 { return d }
+    const nd = findFnDeclInRoots(cf.memProp)
+    if nd >= 0 { return nd }
     return memberCalleeKind(cf)
   }
   -1
@@ -3052,20 +3133,18 @@ function fnWriteFreePaths(fnIx: i32) {
     if weKeys[ci] == key { return weVals[ci] }
     ci = ci + 1
   }
-  let oi = 0
-  while oi < weOpen.length {
-    if weOpen[oi] == key { return "*" } // recursive cycle → fail closed
-    oi = oi + 1
-  }
+  if weIsOpen(key) { return weCycleAnswer() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     const bound: string[] = []
     fnBoundNames(fnIx, bound)
+    const cutBefore = weCut
     weOpen.push(key)
+    weRoots.push(fd.fnBody)
     const acc = weScanFree(fd.fnBody, bound)
+    weRoots.pop()
     weOpen.pop()
-    weKeys.push(key)
-    weVals.push(acc)
+    weCache(key, acc, cutBefore)
     return acc
   }
   "*"
