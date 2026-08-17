@@ -921,3 +921,241 @@ and the genuinely separate table (the reflist band) is the one place the defect 
 is the CORRECT column that named the mechanism, exactly as D1b's `K | i32` column did: `F[] | G[]`
 answering right is what proves the emitter holds the signature and that only the bare arm's tag
 discards it.*
+
+
+---
+
+## D10 is CLOSED — and the `| null` in the filing was a coincidence of the witness
+
+D10 was filed as *"a bound map read of a NICHE-NULLABLE value emits INVALID WASM"*, witnessed by
+`{[string]: F | null}` storing only `null`. Re-gridded on master's seed: **12 value types × nullable /
+plain × 3 read forms × 3 store states × called / uncalled = 300 cells.**
+
+**Three of the 300 are INVALID-WASM, and one of them has no `| null` and no store anywhere in it.**
+
+| cell | |
+|---|---|
+| `fn` · `F \| null` · bound read · null-only store · uncalled | INVALID-WASM |
+| `fn` · `F \| null` · bound read · **empty map** · uncalled | INVALID-WASM |
+| `fn` · **`F` (no `\| null`)** · bound read · **empty map** · uncalled | INVALID-WASM |
+
+Every other value type is clean at every cell: `struct`, `string`, `boolean`, `litunion` are 25/25
+RUN; `i32` / `f64` / `i64` fail only at the pre-existing *"bare null needs a struct-typed context"*;
+`i32[]` / `string[]` at *"unsupported map value type"*; `Set` is 25/25 CHECK-REJECT. **The nullability
+axis moves nothing** — it is the value being a CLOSURE that does, and the null-only store is simply
+one way to write a program that never constructs one.
+
+### The real trigger, from an 18-cell position grid
+
+`{[string]: F}` at a **local / module-global / struct-field / parameter** receiver, with an **i32 key**,
+and in the **inline `(i32) => i32` spelling**: all six INVALID-WASM. The `call` twin of each is the
+LOUD sibling — *"function-value call arity has no interned signature"*.
+
+The three value shapes that carry a closure DEEPER than the value cell are all CLEAN:
+`{[string]: F[]}`, `{[string]: {f: F}}`, `{[string]: {[string]: F}}`. So the population is exactly
+*"the map's VALUE CELL is a closure or nullable closure, and the program constructs no closure"*.
+
+### The mechanism, from the disassembly
+
+The module carries no closure fat-pointer struct at all — `fnValUsed` is false — while the bound
+local for the map read is declared `(ref null 7)`, the MAP struct's index. `wasm-tools print` also
+shows the duplicate the filing named: types 2 and 4 are both `(array (mut (ref null 0)))`, two
+distinct rec-group indices printing one name, which is why the validator's message reads
+`expected (ref null $type), found (ref null $type)`.
+
+`collectFnValUse`'s `TypeRef` scan flips `fnValUsed` for a function-type annotation, a closure ARRAY,
+a nullable closure, a shape with a closure FIELD, and each of those as a union ARM. **There was no arm
+for a map VALUE.** And the `$fnsig` rides the same gate from the other side: `collectCloSigs` already
+descends `TyMap.mVal` in its arena walk (`collectTyReachCloSigs`) and is itself gated on `fnValUsed`,
+so one flip closes the loud call cells as well as the invalid-wasm ones.
+
+`mapValIsClosure` asks the map-value cell the two predicates `shapeHasCloField`'s union-arm loop
+already asks of a struct FIELD cell, read at both the top-level annotation and the union-arm position.
+A closure-ARRAY or closure-FIELD map value is deliberately not claimed — those reach the machinery
+through their own branches, and claiming them would flip `fnValUsed` for programs that do not need it.
+
+**300 cells, 6 UP, 0 DOWN. 18-cell position grid, 8 UP (6 INVALID-WASM + 2 EMIT-REJECT), 0 DOWN, 10
+controls unchanged.** Pinned by `tests/cases/maps/closure-value-no-function-value.vl`, which is
+lambda-free by construction — the existing `maps/bare-read-nullable-value.vl` stores a real lambda in
+its closure-valued map, so a fix that only worked when a closure exists cannot pass both files.
+
+*Method note: **the axis a witness varies is not the axis a defect lives on.** The filing's witness
+varied nullability and store contents, so both entered the description; the 300-cell grid moved
+neither. What it did move was the axis the witness held constant — the VALUE TYPE — and the plain,
+never-stored `{[string]: F}` cell that fell out of it is a stricter repro than the filed one.*
+
+
+---
+
+## D11 is CLOSED — the degenerate UNION was the witness, the defect is ALIAS TRANSPARENCY
+
+D11 was filed as *"a degenerate one-member union (two aliases with the same structure) breaks `is`"*.
+The brief's question — does the structural-collapse rule make the correct answer TRUE rather than a
+reject? — is answered by the existing pins and the answer is **TRUE**:
+`types/struct-union-same-shape.vl` states it in its own header (*"two `type` aliases with the SAME
+shape are therefore the same variant — a `B` value genuinely IS an `A`"*), and the STRUCT and
+LITERAL-UNION spellings already answer it that way. So `x is A` over an `A | B` of twin aliases is
+soundly always true, and both a wrong answer and a reject are wrong.
+
+### The grid, and the control that relocated the defect
+
+**10 base types × 2 directions × 6 receivers = 120 cells, plus 8 controls.** On master:
+
+| base | 12 cells | |
+|---|---|---|
+| `i32` · `i64` · `f64` · `boolean` · `string` · `i32[]` · `{[string]: i32}` | **84 silent `no`** | wrong |
+| `(i32) => i32` | 12 EMIT-REJECT | loud (D6's `` `is` test but no union type declared ``) |
+| `{ v: i32 }` | 10 correct + 2 EMIT-REJECT at a call-result receiver | the pin's own shape |
+| `"a" \| "b"` | 12 correct | #1345's membership arms |
+
+**The receiver axis is FLAT** (param / local `const` / `let` / module global / struct field / call
+result all grade alike), which is what says the receiver is not the variable.
+
+The control that moved the defect off the union is one line: `type A = i32; function p(x: A) { if x
+is A … }` — **no union anywhere** — printed `no`. So did `x: i32` tested `is A`. And `x: A` tested
+`is i32` printed `yes`, as did `x: i32 | i32`. **The union is not in the mechanism at all.**
+
+### The mechanism
+
+`monoStaticIsResult` decides a non-union `is` by comparing `monoArgTyName`'s receiver name — a
+CANONICAL emit name, because canon rewrites every annotation before codegen — against
+`IsExpr.isVariant`, the **RAW source spelling**. `"i32" == "A"` is false, `repIsRowMatchTy` answers
+-1 for a pair that names no struct row, and the function returns the constant 0. A transparent alias
+never matches the type it denotes.
+
+The fix compares against `tyToEmitName` of the type the checker already banked at the node
+(`isVarTyIxOf` — the same bank `isArmTagOfTy` and the narrow push read), so no spelling is re-parsed
+and a NAMED struct renders as its own name, leaving the struct-row compare below untouched.
+
+**And it has to DECLINE a tested type carrying a literal**, which is measured rather than reasoned:
+`literal-unions/mixed-union-litunion-arm-is-membership.vl` went red on the first build. A literal
+union's `RC_ROOT` render SOFTENS to its base (`ctxKeepsLitUnion` is false there), so `("pp" | "qq")`
+and `string` render alike while only one of them holds `"zz"` — render-equality answers about the
+BASE, not about the type. `tyRenderSoftensLits` is that decline, and the membership lowerings that
+own those shapes all run above this fold.
+
+**128 cells, 77 UP, 0 DOWN.** Plus 11 trivial-`is` probes (4 UP) and 9 newtype / generic controls
+(2 UP). Pinned by `tests/cases/types/is-alias-transparent-degenerate-union.vl`.
+
+### What the controls hold shut
+
+Every cross-type NEWTYPE cell is CHECK-REJECT before and after — `N | i32` at the declaration
+(#1344), and `x: i32` tested `is N` / `x: N` tested `is i32` at the checker's `is` gate (#1343). The
+brand cells this moves are the two that are trivially true (`x: N` tested `is N`), which is the same
+alias-transparency answer one erasure down. A genuinely DISTINCT pair (`type A = i32; type B =
+string`) still discriminates by value, and a litunion alias over a plain `string` receiver still
+answers its filed constant FALSE rather than folding TRUE.
+
+The pairing worth keeping is the generic one: `g<T>(v: T) { v is A }` and `g<T>(v: T) { v is i32 }`
+are the SAME program in two spellings, and master decided them differently (`no|no` vs `yes|no`).
+They agree now, and both spellings are in the pin.
+
+### What is still open, measured on the same grid
+
+- **The map twin** (`type A = {[string]: i32}` twice) is still `no` at 10 of its 12 cells — only the
+  call-result receiver moved. `monoArgTyName` names no map type, so `sk` is the `"i32"` catch-all and
+  the compare is against the wrong name rather than against a raw spelling. Same family as D9 below.
+- **The function twin** is still 12 EMIT-REJECT. That is D6's loud arm and it wants D6's decision.
+- **A struct twin at a CALL-RESULT receiver** is 2 EMIT-REJECT, unchanged.
+
+*Method note: **the pins are the spec, and reading them first was the whole of the semantics question.**
+The filing offered "TRUE or reject" as an open choice; `types/struct-union-same-shape.vl` had already
+answered it, in prose, for the one spelling that worked. The remaining work was to find out why six
+other spellings disagreed with it — and the answer was in a control with no union in it.*
+
+
+---
+
+## D9 is FILED — the mechanism in the workboard is WRONG, and it is not #1380's remainder either
+
+D9: `s?.f is T` over an optional chain answers a constant FALSE where the field is a niche nullable
+or a ref-element array. Both of the mechanisms it was filed against are refuted by measurement.
+
+### The grid
+
+**13 field types × 2 builds × 4 receiver forms = 104 cells**, graded against a stated `want` per cell.
+
+| field type | `s?.f` | `s.f` (control) | `o?.g?.f` | `const r = s?.f` |
+|---|---|---|---|---|
+| `string \| null` | **WRONG** | ok | **WRONG** | EMIT-REJECT |
+| `i32[] \| null` | **WRONG** | ok | **WRONG** | EMIT-REJECT |
+| `F \| null` | **WRONG** | ok | **WRONG** | EMIT-REJECT |
+| `K \| null` (litunion) | **WRONG** | ok | **WRONG** | EMIT-REJECT |
+| `Q \| null` (struct) | **WRONG** | ok | **WRONG** | EMIT-REJECT |
+| `string[] \| i32[]` | **WRONG** | EMIT-REJECT | **WRONG** | EMIT-REJECT |
+| `i32 \| null` · `i64 \| null` · `f64 \| null` · `string \| i32` · `i32[] \| string` | ok | ok | ok | EMIT-REJECT |
+| `boolean \| null` · `{[string]: i32} \| null` | WRONG | **WRONG** | WRONG | EMIT-REJECT |
+
+**D9 proper is 12 cells** — the six field shapes whose PLAIN-MEMBER control is correct (or loudly
+rejects), at the two chain depths. **The chain-depth axis is flat.** The last row is NOT D9: those two
+field types are wrong at the plain member too, so the optional chain is not their variable. The
+`const r = s?.f` column is 26/26 a pre-existing loud limit with no `is` in it.
+
+### The CORRECT column is what names the mechanism
+
+`i32 | null`, `i64 | null`, `f64 | null`, `string | i32`, `i32[] | string` are the field types whose
+rep is a real union BOX, and every one of them discriminates through a chain at every depth. A boxed
+field makes `exprUnion` true for the chain receiver, so `monoArgTyName` returns `""` and
+`monoStaticIsResult` declines (-1), handing the guard to the box-tag compare that decides it exactly.
+
+**A niche field reaches no such classifier, so `monoArgTyName` falls all the way to its final line —
+a bare `"i32"` CATCH-ALL DEFAULT** — and `monoStaticIsResult` then compares `"i32"` against `string` /
+`F` / `K` and returns the constant 0. `wasm-tools print` shows the whole guard as `i32.const 0`.
+
+That default is not a bug on its own: it is how `v is i32` answers TRUE in a generic instance pinned
+to i32. The bug is a classifier that cannot say *"I could not name this"* being trusted by a fold that
+needs exactly that answer.
+
+**So the workboard's mechanism is wrong.** It names `emitIs`'s `OptMember` arm keying on
+`sFieldTypeAt(si, fi) == 16`. That code is in `isStrTagUnionNameOf`, which supplies a NAME for the
+box-tag soundness floor and emits nothing; the guard never reaches it. **And it is not #1380's
+remainder**: #1380 widened `unionEqOperandOk`, which gates the literal-union MEMBERSHIP arms, and a
+niche-nullable tested type reaches no membership arm at all — the same structural reason D6's receiver
+axis is flat.
+
+### Why it is filed rather than fixed, and what the blocker actually is
+
+The obvious lowering is the one the shape already has a name for: `s?.f is T` where the field is
+`T | null` is exactly `s?.f != null`. **That sibling is itself wrong for four of the six shapes**, and
+that is the measurement that decides this item:
+
+| control | result |
+|---|---|
+| `{f: Q \| null}` (nullable STRUCT), `s?.f != null` | `yes / no / no` — **correct** |
+| `{f: string \| null}`, `s?.f != null` with `f = null` | **`yes`** — wrong, it answers only about `s` |
+| `{f: K \| null}` (litunion), `s?.f != null` with `f = null` | **`yes`** — wrong, same way |
+| `{f: string \| null}`, plain `s.f != null` with `f = null` | `no` — correct, so it is the CHAIN read |
+
+So there is no working sibling lowering to route `is` into: the optional-chain READ of a
+niche-nullable leaf field is right for the struct-ref niche and wrong for the string and atom niches,
+and the `is` question sits downstream of it. Fixing D9 means fixing that read — a rep/lowering
+decision across five niche kinds, not a patch to the fold.
+
+The cheap alternative is the LOUD FLOOR — decline the fold for an optional-chain receiver, so the 8
+silent cells become emit rejects. Its corpus blast radius is **zero files** (`types/optional-chain.vl`
+is the only corpus file with an `is` over a chain, and its field is the boxed `string | i32`, which
+already declines). It is left unbuilt for the same reason D6's floor is: it costs the 7 MASKED cells
+their compile — each is a chain cell whose value happens to be `null`, so the constant FALSE is
+accidentally right — and that is a reject-parity decision rather than a ride-along.
+
+### Two adjacent defects the grid found, each with its own control
+
+- **A stored `null` answers TRUE for the non-null arm at the PLAIN member.** `{f: string | null}` with
+  `f = null`: `s.f is string` prints `yes`, while `s.f != null` on the identical program prints `no`.
+  Same for `i32[] | null`. Fails OPEN, `vl check` rc 0 — a different and worse class than D9's
+  fail-closed cells, and it has nothing to do with optional chains.
+- **`boolean | null` and `{[string]: i32} | null` FIELDS answer FALSE for their own non-null arm at
+  every receiver**, plain member included. Their controls (`i32 | null` at the same receivers) are
+  correct, so this is the field type and not the receiver.
+
+Pinned in the meantime by `tests/cases/types/is-optional-chain-boxed-field-discrimination.vl` — the
+boxed column at both chain depths plus the nullable-struct chain read that IS correct today, so a
+future fix cannot buy the niche cells by breaking the arms that already work.
+
+*Method note this filing adds: **before believing a filed mechanism, check that the code it names is
+on the emitting path at all.** `isStrTagUnionNameOf`'s `== 16` gate reads exactly like the cause and
+supplies only a name to a floor the guard never reaches; the disassembly (`i32.const 0`, no receiver
+evaluated) says the decision was made a hundred lines earlier by a function whose name has nothing to
+do with optional chains. And the second half: **when a fix would reuse a sibling lowering, run the
+sibling first.** Four of six shapes' `?. != null` is wrong, which turned a one-arm fix into a rep
+question in three commands.*
