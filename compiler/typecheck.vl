@@ -6201,6 +6201,34 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   mkUnionTy(flat)
 }
 
+// The WHOLE union type an `A | B | null` spelling denotes: `annUnionInnerTy` over the
+// non-`null` members, wrapped in the NICHE when a `null` member was present. -1 (a
+// poisoned annotation) propagates unwrapped — `mkNullableTy(-1)` would mint a nullable
+// over the sentinel and lose the failure.
+//
+// THE HOME OF THE `null` WRAP, read by both annotation routes (`tsToTyReal`'s `TS_UNION`
+// arm and `nameToTyReal`'s pipe arm), which had this pair of lines each. The DECLARATION
+// route (`checkProgram` pass 0b's `UnionDecl` arm) reproduces the rule through these two
+// halves rather than through this whole, because its wrap is GATED on the inner — see the
+// niche fold there for why, and for the six cells that say so.
+//
+// The declaration route had NEITHER line: it pushed every resolved variant into the
+// alias's member list, `null` among them. So `type T = string | null` interned as the
+// two-member union `TyUnion[string, null]` while the inline annotation `string | null`
+// interned as `TyNullable(string)`, and the PARENTHESIZED declaration
+// `type T = (string | null)` — one variant, resolved through the annotation route — got
+// the niche. Naming the type removed the niche, and with it every consumer keyed on it:
+// the `!= null` narrow (`nonNullTy` peels a `TyNullable`, not a `null` SIBLING), the
+// emitter's niche lowering against the union ROW the two-member arity minted
+// (`cVariantMemberTyIxs`, `collectU`), and the transparency predicate
+// (`singleAliasMemberTyIx` reads a ONE-member wrapper).
+function annUnionTy(members: i32[], hasNull: boolean): i32 {
+  const inner = annUnionInnerTy(members, hasNull)
+  if inner < 0 { return -1 }
+  if hasNull { return mkNullableTy(inner) }
+  inner
+}
+
 function tsToTyReal(ix: i32) {
   if ix < 0 { return -1 }
   const k = tsKind[ix]
@@ -6233,12 +6261,7 @@ function tsToTyReal(ix: i32) {
       }
       pi = pi + 1
     }
-    const inner = annUnionInnerTy(members, hasNull)
-    // A poisoned inner (an unseparable member pair) must NOT be wrapped: `mkNullableTy(-1)`
-    // would mint a nullable over the -1 sentinel and lose the failure.
-    if inner < 0 { return -1 }
-    if hasNull { return mkNullableTy(inner) }
-    return inner
+    return annUnionTy(members, hasNull)
   }
   // An INTERSECTION `A & B` (A3) — fold the operands through `intersectTy` so a
   // finite annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`).
@@ -6398,14 +6421,9 @@ function nameToTyReal(name: string) {
       }
       pi = pi + 1
     }
-    // The litunion FLATTEN at its shared home — the TREE route's mirror
-    // (`tsToTyReal`'s `TS_UNION` arm). Two annotation routes, one rule.
-    const inner = annUnionInnerTy(members, hasNull)
-    // A poisoned inner (an unseparable member pair) must NOT be wrapped: `mkNullableTy(-1)`
-    // would mint a nullable over the -1 sentinel and lose the failure.
-    if inner < 0 { return -1 }
-    if hasNull { return mkNullableTy(inner) }
-    return inner
+    // The litunion FLATTEN and the `null` NICHE wrap at their shared home — the TREE
+    // route's mirror (`tsToTyReal`'s `TS_UNION` arm). Three routes, one rule.
+    return annUnionTy(members, hasNull)
   }
   // An INTERSECTION `A & B` (A3) — fold the operands through `intersectTy` so a
   // finite annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`).
@@ -9180,12 +9198,25 @@ function unionAliasMembersFaithful(ty: i32) {
 // stay opaque.
 function nulAliasMemberFaithful(ty: i32) {
   if ty < 0 { return false }
-  if tyIsNullableLitUnion(ty) { return true }
   const t = T.tys[ty]
-  if t is TyNullable {
-    const it = T.tys[t.nInner]
-    if it is TyPrim { return true }
-  }
+  if t is TyNullable { return nulNicheInnerFaithful(t.nInner) }
+  // The UN-NORMALIZED shape — a `TyUnion` of literal members beside `null`, which is
+  // what a `type A = B` wrapper sees when `B`'s own `| null` declaration declined the
+  // niche fold (`nulDeclNicheTy`).
+  tyIsNullableLitUnion(ty)
+}
+
+// `nulAliasMemberFaithful` asked about the NICHE'S INNER, before the wrapper exists —
+// the two populations `tyToEmitNameGo`'s `TyNullable` arm spells position-free, read
+// one rung down. Two readers: that predicate, and the DECLARATION-route niche fold,
+// which has to answer the question before it mints the `TyNullable` (`mkNullableTy`
+// does not intern, so asking after minting would leave a dead arena entry behind for
+// every declaration that declines).
+function nulNicheInnerFaithful(inner: i32) {
+  if inner < 0 { return false }
+  if tyIsLitUnion(inner) { return true }
+  const it = T.tys[inner]
+  if it is TyPrim { return true }
   false
 }
 
@@ -16033,6 +16064,13 @@ function checkProgramNode(n: Program) {
             let vi = 0
             let resolvedAny = false
             const declMemberIxs: i32[] = []
+            // The surviving members, and the two lists the NICHE fold below needs:
+            // every non-`null` survivor, and whether a `null` variant was among them.
+            // Filled here instead of straight into `members` (the live arena array)
+            // because the fold replaces the whole list with one wrapped member.
+            const surviving: i32[] = []
+            const nonNull: i32[] = []
+            let sawNull = false
             while vi < variants.length {
               // D-UDVARTY: a union MEMBER is a parser spelling, banked on this
               // declaration node in member order by `setUdTs` — so resolve the
@@ -16054,7 +16092,10 @@ function checkProgramNode(n: Program) {
                 // (`0 | (1 & !1)` is `0`); a declaration with NO surviving
                 // member is the never-value HARD ERROR below (host PR #189:
                 // errors at the declaration even when unused).
-                if !isNeverTy(m) { members.push(m) }
+                if !isNeverTy(m) {
+                  surviving.push(m)
+                  if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
+                }
               } else {
                 tErr(
                   unknownTyText(variants[vi]) + " in union '" + sd.udName + "'",
@@ -16067,10 +16108,72 @@ function checkProgramNode(n: Program) {
             // rule: this loop builds its member list itself, so `type U = N | i32`
             // never reaches the shared annotation home. The union is still FILLED —
             // one diagnostic at the declaration is the whole report, and poisoning the
-            // arena entry would turn every use into a second, worse message.
-            const nwClash = nomUnionRepClashMsg(members)
+            // arena entry would turn every use into a second, worse message. Read off
+            // the SURVIVOR list, which is what the members used to be: `TY_NULL` never
+            // shares a nominal erasure with anything, so the answer is unchanged.
+            const nwClash = nomUnionRepClashMsg(surviving)
             if nwClash.length > 0 {
               tErr(nwClash + " in union '" + sd.udName + "'", stmts[ti])
+            }
+            // THE `null` NICHE FOLD — an un-parenthesized `type T = X | null` denotes
+            // `X?`, exactly as the inline annotation `X | null` and the parenthesized
+            // declaration `type T = (X | null)` already do (`annUnionTy`, the shared
+            // home). Without it the `null` stayed a SIBLING VARIANT of the alias's
+            // union: two-member arity, so the members registered as variant boxes
+            // (`cVariantMemberTyIxs`) and the wrapper stopped being the one-member
+            // shape `singleAliasMemberTyIx` reads — while every consumer of the value
+            // lowered the niche. `vl check` rc 0 and an INVALID MODULE for a `string` /
+            // litunion / `boolean` inner, and a loud narrow-first reject for an `i32` /
+            // `f64` / newtype one, at every position, for the spelling that names the
+            // type and not for the one that inlines it.
+            //
+            // The union WRAPPER stays — `cUserTypes[T]` is the index pass 0a minted and
+            // forward references already hold, so the alias denotes `TyUnion[X?]`, which
+            // is the parenthesized declaration's own arena shape, character for
+            // character. A poisoned fold (`annUnionTy` -1, the unseparable pair the
+            // clash diagnostic above just reported) keeps the raw survivor list, so that
+            // report is still the whole report.
+            //
+            // GATED ON THE INNER, exactly as every other transparency arm in this family
+            // is (`arrSpineIsScalar` on its element, `unionAliasMembersFaithful` on its
+            // members, `nulAliasMemberFaithful` on its niche) — and MEASURED, not
+            // reasoned. The niche is only reachable THROUGH the alias when the emitter can
+            // render the alias's member name-faithfully; for a member it renders
+            // structurally, the two-member union is the shape that works and the fold
+            // takes a capability away. A 224-cell use grid over seven inners × four
+            // spellings × eight uses says so in six cells: `type T = S | null` over a
+            // DECLARED STRUCT plus `v is S` runs on the two-member union (the test finds
+            // its variant row) and is `emitProgram: \`is\` receiver is not a union value`
+            // on the niche, because `collectU` still mints T's row from the parser's
+            // variant NAMES while the param now lowers from the ARENA as a niche — the two
+            // disagree. A NEWTYPE inner (`type NW = new i32`, itself a one-member union,
+            // so `nulNicheInnerFaithful` declines it too) is the same cell one kind over,
+            // and there the niche spelling is check-clean INVALID WASM — which is the
+            // INLINE spelling's own pre-existing hole, reached through the alias. So the
+            // ungated fold is 108 cells up and 6 down, two of them into the silent class;
+            // the gate keeps the 108 and none of the 6.
+            //
+            // `annUnionTy`'s two halves rather than the whole, because the GATE sits
+            // between them: the inner comes from the shared home (`annUnionInnerTy` — the
+            // litunion flatten and the unseparable-pair poison), the gate reads it, and
+            // only a claimed inner is wrapped. `mkNullableTy` does not intern, so asking
+            // after the wrap would leave a dead arena entry behind for every declaration
+            // that declines.
+            let folded = -1
+            if sawNull && nonNull.length > 0 {
+              const nicheInner = annUnionInnerTy(nonNull, true)
+              if nicheInner >= 0 && nulNicheInnerFaithful(nicheInner) {
+                folded = mkNullableTy(nicheInner)
+              }
+            }
+            if folded >= 0 {
+              members.push(folded)
+            } else {
+              let mi = 0
+              while mi < surviving.length {
+                members.push(surviving[mi])
+                mi = mi + 1
+              }
             }
             // Variant-member registration is ARITY-AWARE (Stage B b1, latent
             // irregularity (a) from the #920 shadow report): only a REAL
