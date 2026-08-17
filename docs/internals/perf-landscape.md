@@ -684,8 +684,18 @@ Full write-up: `bench/findings/bench-arrays-matmul.md`.
 > suite** — four of the fourteen losses, three of them PRIORITY, all four red alerts.
 > **P7's 4-wide `__str_hash__` unroll (#1342) landed after this sweep** and is not in these
 > numbers; it is worth 1.135x on hash-dominated work, so it moves these rows but does not close
-> them. **The hash CACHE — the item that would attack the length-proportionality measured
-> below — is still fully open** (§5, P7b).
+> them.
+>
+> **THE READING BELOW — "it is the hash being recomputed" — IS ONLY 62% RIGHT, and the part it
+> gets wrong is the part P7b would fix.** Re-measured post-P7a (`perf-program.md` §19), the
+> length slope of a lookup splits **0.82 ns per code point of hash** and **0.49 of `__str_eq__`
+> comparing content on the hit half**, and a cache touches only the first. An ideal zero-cost
+> cache, prototyped by clamping the FNV walk to 8 code points over a key set where that stays
+> injective, measures **1.88x at ~97-char keys and 1.00x at ~9**. **All four benchmarks in this
+> section key on strings of 9 characters or fewer** — `"key" + toString(i)`,
+> `"w" + toString(i)` — so the cache is worth nothing on the very rows it was filed to close.
+> The length-proportional cost these red alerts are actually made of is `__str_eq__` (P3's
+> ground) and the probe's fixed overhead, not the hash.
 
 **All four collections Python red alerts.** Normalised CPython is 1.33x **faster** than VL on
 `set-ops` (py/vl 0.75), and VL is only 1.21x / 1.78x / 1.36x ahead on the other three.
@@ -750,7 +760,7 @@ VL's own emitted module (or hand-written `.wat` assembled with `wasm-as`) was ru
 | ~~**P5**~~ | ~~hoist the list header's backing ref + `len`~~ **SHIPPED #1333** | `wasmEmit.vl emitListIdxGuard` | **reverse-inplace −20.6%, matmul −7.2%**, whole array family −4% to −21% at default opt | **DONE** | — |
 | **P6** | fuse `a / b` and `a % b` on the same operands — lower the remainder as `a − q*b` | i32 div/rem emit in `compiler/wasmEmit.vl` | **1.99x** intdivmod | measured A/B, **SOUNDNESS-GATED** | **S** |
 | ~~**P7a**~~ | ~~unroll `__str_hash__`'s FNV walk 4 wide~~ **SHIPPED #1342** | `emit_sections.vl emitStrHashFnCode` (+ `fbStrHashStep`) | **1.135x** measured on hash-dominated insertion (109 → 96 ms); 2.13 → **1.10 ns per code point** on the walk itself | **DONE** | — |
-| **P7b** | **cache** a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl emitStrHashFnCode`, `emitMapProbeFnCode`; requires a hash slot in the string rep | filed at up to **4.6x** on long keys; clears 3 of 4 Python red alerts — **both figures predate P7a and neither has been re-measured** | measured (pre-P7a), **site not pinned** | **L** |
+| **P7b** | **cache** a string's hash instead of recomputing it per probe | `compiler/emit_sections.vl emitStrHashFnCode`, `emitMapProbeFnCode`; requires a hash slot in the string rep, which `string` (a bare `(array (mut i32))`, the SAME heap type as every `i32[]`) has nowhere to put | **RE-PRICED AND REFUTED AT THE FILED SIZE (`perf-program.md` §19).** An ideal zero-cost cache measures **1.88x at ~97-char keys, 1.33x at ~33, and 1.00x — nothing — at ~9**, against a filed 4.6x that was `long-key / short-key` and charged the whole length slope to the hash; only 0.82 of the 1.31 ns per code point is the hash, the rest is `__str_eq__`. "Clears 3 of 4 Python red alerts" is refuted by construction: all four benchmarks key on ≤9-char strings, where the ceiling is 1.00x. Compile-time ceiling **1.042x** (`__str_hash__` is 4.06% of a self-compile) | **measured, DESIGN ESCALATION** | **L/XL** |
 | **P8** | `s = s + c` is O(n²) — `__str_concat__` allocates a fresh array and does 2 `array.copy` per append | `compiler/emit_sections.vl:1881 emitStrConcatFnCode`, `compiler/wasmEmit.vl:6647 emitStrConcat` | asymptotic: N-doubling costs VL 3.5x vs 1.6–1.9x elsewhere | measured | **L** |
 
 ### What #1328 changed, and what it did NOT
@@ -991,24 +1001,43 @@ the helper, so the added loop is unreachable from it. That is the **second** fal
 same counter (P3's unroll was the first); the tightening filed at
 `tests/selfhost_native_release_test.ts` is now twice-evidenced.
 
-#### P7b — the hash CACHE (site still not pinned; be honest about that) — **OPEN**
+#### P7b — the hash CACHE — **RE-PRICED, and the 4.6x does not survive it.** Full record: `perf-program.md` §19
 
-**Nothing about the cache shipped.** The witness is the key-length sweep in §4.6, which is
-unambiguous about the *behaviour*: VL scales linearly with key length (~2.6 ns per code point
-pre-P7a) where V8 and CPython are flat. The *implementation* was never traced to a line:
-`emitStrHashFnCode` computes a masked non-negative FNV-1a over the code-point array and
-`emitMapProbeFnCode` calls it per probe. Note `emitMapProbeI32FnCode` already has a **stored-hash**
-notion, so the map side may already be half-built; **what is missing is a place to cache the hash on
-the string itself.** That is a representation change (a mutable `hash` slot alongside the code-point
-array, or P12's linear-memory string), which is why this is L and not S.
+**Nothing about the cache has shipped, and after the re-pricing it should not be taken as filed.**
+The site is now pinned: `emitStrHashFnCode` computes a masked non-negative FNV-1a over the
+code-point array, and `emitMapProbeFnCode` took it per probe. `emitMapProbeI32FnCode` already has a
+**stored-hash** notion, so the map side is half-built; **what is missing is a place to cache the
+hash on the string itself**, and `string` IS `aTypeIdx` — a bare `(array (mut i32))`, the same
+WasmGC heap type as every `i32[]` backing and as the map's own `index`/`hashes`/`live` arrays. A
+side table cannot substitute: WasmGC has `ref.eq` and **no instruction that derives an integer from
+a reference identity**, so an identity-keyed table degenerates to an O(n) scan. That leaves a struct
+wrapper or an in-array header slot — both representation changes, which is why this is L/XL.
 
-**Re-price it before taking it.** The filed "up to 4.6x on long keys / clears 3 of 4 Python red
-alerts" was derived from the §4.6 sweep, which is **pre-P7a**: P7a already took the per-code-point
-walk roughly in half, so the length-proportionality P7b attacks is smaller than it was and the
-residual has not been measured. P7a's own instrumentation puts a further bound on it — **at short
-keys the whole walk is ~11 ns of a ~63 ns probe**, so a cache cannot be worth more than that on
-short-key workloads however perfect it is. The long-key case is where the item lives; that is the
-measurement to take first.
+**The re-priced number.** An ideal, zero-cost, always-hitting cache — prototyped by clamping the FNV
+walk to 8 code points over a digit-first key set where that stays injective, so the probe, the
+`hashes[]` gate and the full-length `__str_eq__` are untouched — measures, min-of-7 CPU ms, output
+asserted identical:
+
+| ~key length | as shipped | O(1) hash | ceiling |
+|---|--:|--:|--:|
+| 9 | 36.85 ns | 37.85 ns | **1.00x — none** |
+| 33 | 69.55 ns | 52.30 ns | **1.33x** |
+| 97 | 151.8 ns | 80.95 ns | **1.88x** |
+
+**Two things the filed 4.6x got wrong.** It is `3210 / 693` from the §4.6 table — a
+long-key-over-short-key ratio that charges the entire length slope to the hash. Measured, the slope
+is **0.82 ns per code point of hash and 0.49 of `__str_eq__`**, and a hash cache touches only the
+first. And "clears 3 of 4 Python red alerts" is refuted by construction: all four §4.6 benchmarks
+key on ≤9-char strings, exactly where the ceiling is 1.00x.
+
+**Compile-time**: `__str_hash__` is **4.06% self** of a self-compile (was 4.75%), 3.88 of it under
+`__map_probe__` — so 1.042x is the whole ceiling there too.
+
+**What came out of the re-pricing instead.** A map INSERT hashed its key twice — once inside
+`__map_probe__`, once again to fill `hashes[entry]` — and the fix needs no cache and no rep change:
+the hash is computed once at the call site and handed to the helper, leading its operand list so it
+is emitted on an empty operand stack. **`map-string` 1.09x, `set-ops` 1.07x, insert-dominated code
+1.55x at long keys / 1.14x at short**, `word-freq` and `map-i32` a wash.
 
 ### P11 — the `-O3` regressions. **NOT the release profile's fault, and the name is misleading.**
 
@@ -1198,8 +1227,11 @@ P1 `return_call` — have SHIPPED (#1326, #1324), along with P3, P4a (#1328), P5
    Deserves its own design note. **P5 shipped the 9.9% that was available above it; this is the
    3.41x underneath.**
 3. **P9 inlining in the default build** — `-O3` proves 2.9x is sitting there on `struct-field`.
-4. **P7b the hash cache** — the string-hashing family (§4.6) is now the largest untouched block of
-   compiler-fixable loss in the suite, and P7a's unroll did not dent it. Re-price before taking it.
+4. ~~**P7b the hash cache**~~ — **RE-PRICED AND DE-RANKED.** The string-hashing family (§4.6) is
+   still the largest untouched block of compiler-fixable loss, but the cache is not what closes it:
+   an ideal cache measures **1.00x** at the ≤9-char keys all four of those benchmarks use, and
+   1.88x only at 97 chars. The length-proportional cost in that family is `__str_eq__`, not the
+   hash. It stays open as a representation question (L/XL, subsumed by P12), not as a lever.
 5. **P6** — small and cheap, but **soundness-gated** (see above), not merely unscheduled.
    (**P10 has left this list**: measured, it buys nothing — binaryen folds the loop bound
    off the mutable cell, so the immutable declaration is a no-op.)

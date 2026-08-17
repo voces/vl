@@ -1799,7 +1799,9 @@ function fbStrHashStep(k: i32) {
 // the `i32.mul` latency floor. Widening to eight is measurably WORSE (more code,
 // same chain), and no further unroll can help — the loop is now
 // dependency-bound, not overhead-bound. That floor is also what bounds any
-// hash-CACHING scheme: at short keys the whole walk is ~11 ns of a ~63 ns probe.
+// hash-CACHING scheme, and the bound has been measured rather than argued: replacing
+// this walk with a constant-time one is worth 1.88x per lookup at ~97-char keys, 1.33x
+// at ~33, and NOTHING at ~9 — the length a real key usually is.
 function emitStrHashFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
@@ -2085,39 +2087,42 @@ function emitStrConcatFnCode(out: i32[]) {
 // did not preserve the invariant would silently corrupt every probe, so add one
 // only together with a `mask = cap - 1` that is still `cap - 1` for it.
 //
-// `__map_probe__(index, hashes, live, keysBacking, key) -> i32`: hash the key
-// (via `__str_hash__`) and linear-probe (wrapping) to the slot holding either the
-// matching key's entry or a free (0) slot — the shared core of every map op. The
-// stored per-entry hash gates the string compare, and a tombstoned entry
-// (`live[entry-1] == 0`) probes past (a marker, not a hit) — see `emitMapProbe`'s
-// caller-side contract. Returns the PROBE SLOT; the caller re-reads
-// `index[slot]` for the entry. Params: index(0), hashes(1), live(2),
-// keysBack(3), key(4). Locals: mask(5), keyHash(6), slot(7), entry(8).
+// `__map_probe__(keyHash, index, hashes, live, keysBacking, key) -> i32`: linear-probe
+// (wrapping) from the key's hash to the slot holding either the matching key's entry or
+// a free (0) slot — the shared core of every map op. The stored per-entry hash gates the
+// string compare, and a tombstoned entry (`live[entry-1] == 0`) probes past (a marker,
+// not a hit) — see `emitMapProbe`'s caller-side contract. Returns the PROBE SLOT; the
+// caller re-reads `index[slot]` for the entry.
+//
+// The hash arrives as a PARAM rather than being walked here, because an appending
+// `m[k] = v` has to store that same hash into `hashes[]` right after the probe: computing
+// it once at the call site is the difference between one `__str_hash__` walk per insert
+// and two. It leads the operand list so the call site can emit it FIRST, on an empty
+// operand stack — hashing after the four backing `struct.get`s would leave four GC refs
+// live across the `__str_hash__` call, which the engine must spill and reload per probe.
+// Params: keyHash(0), index(1), hashes(2), live(3), keysBack(4), key(5).
+// Locals: mask(6), slot(7), entry(8).
 function emitMapProbeFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
-  wULEB(4) // count 4
+  wULEB(3) // count 3
   wU8(127) // 0x7f i32
   // mask = array.len(index) - 1  (the index length is a power of two)
-  fbLocalGet(0)
+  fbLocalGet(1)
   fbArrayLen()
   fbI32Const(1)
   fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(5)
-  // keyHash = __str_hash__(key)
-  fbLocalGet(4)
-  fbCall(gHelpStrHash)
   fbLocalSet(6)
   // slot = keyHash & mask   (== keyHash % cap)
+  fbLocalGet(0)
   fbLocalGet(6)
-  fbLocalGet(5)
   fbI32Bin(113) // 0x71 i32.and
   fbLocalSet(7)
   fbBlock(64)   // block (probe break target), void
   fbLoop(64)    // loop, void
   // entry = index[slot] ; if entry == 0 { br out (miss) }
-  fbLocalGet(0)
+  fbLocalGet(1)
   fbLocalGet(7)
   fbArrayGet(aTypeIdx)
   fbLocalSet(8)
@@ -2126,14 +2131,14 @@ function emitMapProbeFnCode(out: i32[]) {
   fbBrIf(1) // → out of the probe block
   // hashes[entry-1] == keyHash && live[entry-1] != 0
   //   ? __str_eq__(keysBack[entry-1], key) : 0
-  fbLocalGet(1)
+  fbLocalGet(2)
   fbLocalGet(8)
   fbI32Const(1)
   fbI32Bin(107)        // i32.sub (entry - 1)
   fbArrayGet(aTypeIdx)
-  fbLocalGet(6)
+  fbLocalGet(0)
   fbI32Bin(70)         // 0x46 i32.eq
-  fbLocalGet(2)
+  fbLocalGet(3)
   fbLocalGet(8)
   fbI32Const(1)
   fbI32Bin(107)
@@ -2142,13 +2147,13 @@ function emitMapProbeFnCode(out: i32[]) {
   fbI32Bin(71)         // 0x47 i32.ne (live != 0)
   fbI32Bin(113)        // 0x71 i32.and — the expensive compare rides an `if`
   fbIf(127)            // if, i32 blocktype
-  fbLocalGet(3)
+  fbLocalGet(4)
   fbLocalGet(8)
   fbI32Const(1)
   fbI32Bin(107)
   fbArrayGet(mkArrIdx) // keysBack[entry-1] — (ref null $aTypeIdx)
   fbRefAsNonNull()     // a stored slot is populated
-  fbLocalGet(4)
+  fbLocalGet(5)
   fbCall(gHelpStrEq)
   fbElse()
   fbI32Const(0)        // hash/live mismatch → not a hit
@@ -2159,7 +2164,7 @@ function emitMapProbeFnCode(out: i32[]) {
   fbLocalGet(7)
   fbI32Const(1)
   fbI32Bin(106)
-  fbLocalGet(5)
+  fbLocalGet(6)
   fbI32Bin(113) // 0x71 i32.and
   fbLocalSet(7)
   fbBr(0)       // → loop header
@@ -2172,13 +2177,18 @@ function emitMapProbeFnCode(out: i32[]) {
 }
 
 // `__map_probe_i32__(index, hashes, live, keysBacking, key) -> i32`: the i32-KEYED
-// twin of `__map_probe__`, line for line, with two substitutions — the key is hashed
-// by the integer mix (`fbI32HashMix`) instead of `__str_hash__`, and the stored-hash
-// gate falls through to an `i32.eq` on the key instead of a call into `__str_eq__`.
-// Everything else (the wrapping linear probe, the free-slot break, the tombstone
-// skip, the entry+1 encoding) is IDENTICAL, which is what lets both key kinds share
-// `__map_resize__`, the rehash and the compaction. Params: index(0), hashes(1),
-// live(2), keysBack(3), key(4). Locals: mask(5), keyHash(6), slot(7), entry(8).
+// twin of `__map_probe__`, line for line, with three substitutions — the key is hashed
+// by the integer mix (`fbI32HashMix`) instead of `__str_hash__`, the stored-hash gate
+// falls through to an `i32.eq` on the key instead of a call into `__str_eq__`, and the
+// mix stays INSIDE this helper where the string hash is passed in. That last one is the
+// deliberate asymmetry: the string hash is a call over an O(len) walk, so hoisting it to
+// the call site saves a whole second walk on an appending insert, while the i32 mix is
+// eight inline instructions — hoisting it would copy them into every probe site to save
+// one insert-only mix. Everything else (the wrapping linear probe, the free-slot break,
+// the tombstone skip, the entry+1 encoding) is IDENTICAL, which is what lets both key
+// kinds share `__map_resize__`, the rehash and the compaction. Params: index(0),
+// hashes(1), live(2), keysBack(3), key(4). Locals: mask(5), keyHash(6), slot(7),
+// entry(8).
 function emitMapProbeI32FnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
@@ -3933,7 +3943,8 @@ function emitTypeSection(
     helpFuncType("aa", "a") // __str_concat__: (str, str) -> (ref str)
   }
   if gHelpMapProbe >= 0 {
-    helpFuncType("aaama", "i") // __map_probe__: (index, hashes, live, keysBacking, key) -> slot
+    // __map_probe__: (keyHash, index, hashes, live, keysBacking, key) -> slot
+    helpFuncType("iaaama", "i")
     helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
   }
   if gHelpMapProbeI32 >= 0 {

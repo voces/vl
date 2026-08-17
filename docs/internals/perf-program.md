@@ -3503,3 +3503,201 @@ this document does that yet.
 - **A tradeoff now on the record, §4**: the pump's collector costs
   `vl check compiler/entry.vl` ~2.7× wall (891 → 2,387 ms) to save ~2.4× peak. Right
   for the walk that forced it, wrong for the single-file editor path.
+
+---
+
+## 19. Item G1 / P7b — the hash CACHE, re-priced. The 4.6× is a 1.88×, and the cache is not what pays.
+
+G1 filed **P7b — cache a string's hash instead of recomputing it per probe** at
+**up to 4.6× on long keys**, "clears 3 of 4 Python red alerts", with the row
+itself marking both figures **pre-P7a and un-re-measured** and the site **not
+pinned**. Both figures are measured here, and both are wrong. The item closes as
+a **design escalation with a much smaller number**, and a different, unfiled
+defect found next to it — a map insert hashing its key twice — is what shipped.
+
+### 19.1 `__str_hash__`'s current share — 4.75% → **4.06%**
+
+Guest sampling profiler, the §2 recipe, `vl build compiler/entry.vl`, six warm
+runs, **7,568 samples**, `$mNN` stripped:
+
+| % self | % incl | fn |
+| ---: | ---: | --- |
+| 24.27 | 24.27 | `__str_eq__` |
+| 4.23 | 4.23 | `tyTopIndexOf` |
+| **4.06** | **4.06** | **`__str_hash__`** |
+| 2.93 | 2.93 | `modSrcLoad` |
+| 1.90 | 4.96 | `tokenize` |
+| 1.89 | 8.19 | `__map_probe__` |
+
+**4.06% is the ENTIRE compile-time ceiling for a perfect cache — 1.042×** — before
+charging anything for the cache's own load, its misses, or the allocation a slot
+costs. Split by caller: `__map_probe__` **3.88**, every other caller together
+**0.18**. That 0.18 is worth naming: it is the whole of the insert-side double
+hash §19.5 removes, as seen from a self-compile. The compiler looks keys up far
+more often than it inserts them.
+
+### 19.2 The key-length sweep, re-derived — the hash is 62% of the slope, not all of it
+
+Same shape as `perf-landscape.md` §4.6's sweep: 100k-entry `{[string]: i32}`, a 2N
+probe array (N hit, N miss) built as **distinct objects**, `r = 120` differenced
+against `r = 20` so construction and the map build subtract out — **20M lookups
+per cell**. Min-of-7 CPU ms, `scripts/p7-time.sh`, default rung.
+
+| ~key length | miss-only (hash + one index read) | hit+miss |
+| --- | ---: | ---: |
+| 9 | 26.05 ns | 32.10 ns |
+| 33 | 47.25 ns | 65.15 ns |
+| 97 | 102.9 ns | 148.2 ns |
+| **slope** | **0.873 ns / code point** | **1.319 ns / code point** |
+
+**The hash is 0.873 of the 1.319 ns per code point; the other 0.446 is
+`__str_eq__` walking content on the hit half, which a hash cache does not touch.**
+That is the arithmetic error inside the filed number: 4.6× is `3210 / 693` from
+§4.6's own table — the ratio of a 97-char lookup to a 9-char one — which charges
+the whole length slope to the hash.
+
+### 19.3 The ideal-cache ceiling, MEASURED — 1.88× at 97 chars, **1.00× at 9**
+
+§19.2 bounds it by arithmetic; this is a prototype. Keys are regenerated
+**digit-first** (`toString(i) + padding`) so that hashing only the first 8 code
+points stays **injective** over the key set and the bucket distribution is
+unchanged; then `__str_hash__`'s `n = array.len(s)` is clamped to 8 in the WAT of
+VL's own emitted module. Hashing becomes **O(1)** while the probe, the `hashes[]`
+gate and the full-length `__str_eq__` stay exactly as they are — an upper bound on
+any cache, since a cache cannot beat a constant-time hash. Output asserted
+identical at every length. Min-of-7 CPU ms at load 1.2–1.6.
+
+| ~key length | as shipped | O(1) hash | ceiling on a perfect cache |
+| --- | ---: | ---: | ---: |
+| 9 | 36.85 ns | 37.85 ns | **1.00× — none** |
+| 33 | 69.55 ns | 52.30 ns | **1.33×** |
+| 97 | 151.8 ns | 80.95 ns | **1.88×** |
+
+Linear fits: shipped `25.1 + 1.306·L`, prototype `33.4 + 0.49·L`. The prototype's
+residual slope is `__str_eq__` (0.49 ns/pt), so the hash's own slope is
+**0.816 ns/pt** — an independent corroboration of §19.2's 0.873, taken from a
+different channel on a different fixture family.
+
+**So the filed 4.6× is a 1.88×, and only at 97-char keys.** Two qualifications,
+both cutting the same way:
+
+- At **9 chars the ceiling is 1.00×** — the O(1) prototype is a hair SLOWER,
+  because at that length the walk is under one unrolled block and the clamp costs
+  more than it saves. P7a's own bound said as much (the whole walk is ~11 ns of a
+  ~63 ns probe at short keys); this measures it end to end.
+- **"Clears 3 of 4 Python red alerts" is refuted by construction.** Every
+  benchmark in the §4.6 family keys on SHORT strings — `map-string` on
+  `"key" + toString(i)` (≤ 9 chars), `set-ops` and `word-freq` on
+  `"w" + toString(i)` (≤ 6), and `map-i32` has no string key at all. The four red
+  alerts sit exactly where the measured ceiling is 1.00×. What is
+  length-proportional in them is `__str_eq__`, not the hash.
+
+### 19.4 Where the hash could live — and why none of the answers is a cache
+
+The row calls the site "not pinned"; it is pinned now. `emitStrHashFnCode`
+computes the hash and `emitMapProbeFnCode` called it per probe. The obstacle is
+that **`string` IS `aTypeIdx`** — `(array (mut i32))`, the same WasmGC heap type
+as every `i32[]` backing and as the map's own `index` / `hashes` / `live` arrays.
+There is nowhere on the value to put a slot.
+
+| option | cost | verdict |
+| --- | --- | --- |
+| **A. struct wrapper** `{hash, chars}` | splits `string` out of `aTypeIdx` (333 references across 9 compiler files), every literal / concat / slice / `indexOf` / compare / hash site, the host ABI (`cliCmdDataStore`, `modSrcPush`, `rbyteStore`), `string[]`'s `mkArrIdx` element type, the type-index oracle, and one extra allocation + indirection per string in an allocation-bound compiler | rep change, **XL** |
+| **B. side table keyed by the array ref** | **not implementable.** WasmGC has `ref.eq` and no instruction that derives an integer from a reference identity, so an identity-keyed table degenerates to an O(n) `ref.eq` scan | **dead** — a language fact, not an estimate |
+| **C. header slot inside the array** (element 0 = hash) | no new heap type, but nothing at the wasm level distinguishes a string from a plain `i32[]`, so every `array.len` / `array.get` / `array.copy` on a string shifts, and one missed site is a silent off-by-one rather than a validation error; +4 bytes per string | rep change, **L**, silent failure mode |
+| **D. reuse the probe's hash at the insert append** | none — it removes a call | **SHIPPED, §19.5** |
+| **E. 1-entry `ref.eq` memo in a module global** | a global load + `ref.eq` + branch on EVERY hash, to win only where the same OBJECT is hashed twice in a row | **not taken** — after D the only such site is `word-freq`'s `m[k] = (m[k] ?? 0) + 1`, and the right fix for that is a single-probe upsert, which removes a whole probe rather than one hash |
+
+A and C are representation changes and are not started here. **They are now sized
+against a 1.88×-at-97-chars / 1.00×-at-9-chars ceiling rather than a 4.6×, which
+is the number the decision to take one has to be made against.** P12 (UTF-8
+strings in linear memory) subsumes both.
+
+### 19.5 What DID ship — the insert that hashed its key twice
+
+Not filed anywhere, and found while pinning the site. `__map_probe__` walked the
+key internally, and an appending `m[k] = v` then walked the **same key object**
+again to fill `hashes[entry]`. Confirmed in the disassembly before it was
+believed: an insert emitted `call $__str_hash__` at the append site *and* a
+`call $__map_probe__` whose body called it too.
+
+The hash is now computed once at the call site and handed to the helper. Two
+placement rules, both measured rather than assumed:
+
+- **`keyHash` LEADS the operand list.** Emitted last — in operand position after
+  the four backing `struct.get`s — those four GC refs are live across the
+  `__str_hash__` call, and the engine spills and reloads them per probe.
+- **Only an appending set parks it** (map scratch slot +9), with a `local.tee`:
+  one instruction, not a `local.set`/`local.get` pair. Get / has / delete emit
+  exactly the instruction count they did before.
+
+Interleaved min-of-9 CPU ms, every module's stdout asserted identical first,
+default rung, load ≤ 6:
+
+| | base | shipped | |
+| --- | ---: | ---: | ---: |
+| `collections/map-string` | 1047 ms | **959 ms** | **1.09×** |
+| `collections/set-ops` | 775 ms | **724 ms** | **1.07×** |
+| `collections/word-freq` | 1143 ms | 1148 ms | wash |
+| `collections/map-i32` | 988 ms | 992 ms | wash (the i32 twin is untouched) |
+| insert-dominated, ~97-char keys | 299 ms | **193 ms** | **1.55×** |
+| insert-dominated, ~8-char keys | 97 ms | **85 ms** | **1.14×** |
+
+A second, independent min-of-7 at load 1.34 reproduces the three string rows —
+`map-string` 1045 → 966 (**1.082×**), `set-ops` 764 → 710 (**1.076×**),
+`word-freq` 1138 → 1141 (wash) — so the lookup-side win is not one lucky minimum.
+
+**The two rejected designs are the point of the section.** Both were built and
+timed, not reasoned away:
+
+| design | `collections/word-freq` | the lookup rows |
+| --- | ---: | --- |
+| hash emitted in LAST operand position | 1143 → 1212 ms (**−5.9%**) | wash |
+| hash hoisted ahead of the pushes, parked via `local.set` + `local.get` | 1151 → 1206 ms (**−4.8%**) | wash |
+| **hash LEADING, `local.tee`, set-only** | 1143 → 1148 ms (wash) | **+7 to +9%** |
+
+**The lookup-side win is the finding, and it is not the double hash.** Removing
+one call per *insert* cannot move a 30M-lookup benchmark. What moves it is that
+`__str_hash__` is no longer called from inside `__map_probe__`'s frame, which
+holds four array refs and a string ref live across it — a stack map on every
+probe. Called from the caller on an empty operand stack, that spill is gone.
+`__str_eq__` still runs inside the helper, but only when the stored-hash gate
+passes, which is a fraction of probes. The i32-keyed twin, which never called
+out, is the control: it reads a dead wash.
+
+**The SELF-COMPILE is a wash, and that is the predicted result, not a
+disappointment.** `vl build compiler/entry.vl`, same input both legs, min-of-11
+CPU ms at load ≈ 5: base **1303 ms** / median 1315, shipped **1300 ms** / median
+1320. §19.1 bounds the insert-side half at 0.18% of a self-compile, and the
+lookup-side half is a fixed per-probe saving on a workload whose keys are short
+identifiers and whose probes are a small share of total work. (The two legs emit
+DIFFERENT modules by construction — the new compiler emits the new probe
+sequence — so md5 equality is not the fence here; the battery in §19.6 is.)
+
+### 19.6 Gate
+
+`refresh-compiler.sh` **REFRESH_RC=0**, fixpoint holds byte-for-byte (1,163,097 B)
+· **seed-ladder leg 2** (`mv` then `fetch-seed.sh`, published `seed-latest`) →
+`next2 == next3`, no bootstrap split · `lint-self.sh` rc 0 ·
+`tests/cases_wasm_test.ts` **1,741 passed / 0 failed / 7 ignored** · release suite
+**35 passed / 0 failed** · full battery `SELFHOST_NATIVE_ALIGN=1`
+**3,870 passed / 0 failed / 7 ignored**, run on BOTH trees with the ignored NAME
+SET extracted from each (7 lines each, both non-empty) and `diff`ed clean — so the
+7 is the same 7, not a coincidence of counts.
+
+**SHAPE_TABLE, read directly rather than inferred from the pass.** Every EXACT
+column held — `fns`, `allocs`, `indirect` and, on `collections/map-string`, the
+`refEq` its own comment calls *"the row that would have caught the P7
+filed-vs-shipped split"*. Only the banded `bytes` column moved:
+
+| row | rung | pinned | measured | band |
+| --- | --- | ---: | ---: | ---: |
+| `collections/map-string` | `-O` / `-O3` | 1881 / 1849 | 1888 / 1856 | ±56 / ±55 |
+| `collections/word-freq` | `-O` / `-O3` | 2471 / 2404 | 2480 / 2423 | ±74 / ±72 |
+| `collections/map-i32` | `-O` / `-O3` | 1171 / 1104 | 1171 / 1104 | unmoved |
+| `strings/str-eq` | `-O` / `-O3` | 1491 / 1466 | 1491 / 1466 | unmoved |
+
++7 and +9/+19 bytes is a `local.tee` plus a reordered operand list — what a change
+that removes a call and adds one instruction should look like. `map-i32` and
+`str-eq` are dead-unmoved because neither path was touched, and that is the
+control saying the moved rows moved for the stated reason.
