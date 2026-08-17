@@ -65,6 +65,7 @@ import {
   fusedMapReadRecvIx,
   inferRetNameByNode,
   inferRetNameOf,
+  isBoolLitExpr,
   isInferLetNulBool,
   isInferLetNulStr,
   isTopLevelFuncTypeName,
@@ -6361,6 +6362,73 @@ function sScanLim() {
 // struct an `{ … }` literal constructs (the struct analogue of `objVariantName`).
 export function structIndexOfObj(objIx: i32) { structIndexOfObjCtx(objIx, -1) }
 
+// Can an object literal's field VALUE — coded `vc` by `anonFieldCode`, node `valIx` —
+// be STORED into struct `si`'s field `mfi`, coded `sc`? The fieldset scan in
+// `structIndexOfObjCtxGo` is name-only apart from its float and i64 arms, so any two
+// literals sharing a field-name SET merge onto ONE interned row and the loser's value
+// is written through the WINNER's valtype. Where the valtypes differ that is invalid
+// wasm (`{ v: 1 }` beside `{ v: "s" }` stores a string ref into an i32 field); where
+// they agree it is a SILENT confusion — `{ v: 6000000000 }` beside `{ v: 2147483647 }`
+// read the second literal's field at i64, so `+ 1` did not wrap, and a `{ v: 6 }`
+// beside a declared `{ v: boolean | null }` read 6 as that niche's null sentinel.
+//
+// REFUTATION ONLY, on three standing leniencies:
+//   * `vc < 0` is "the value says nothing" (an ident, a call, a map value), never a
+//     mismatch — the whole scan is a heuristic over what the value node can be read to
+//     mean, and a literal whose fields are all unclassifiable must keep matching by name.
+//   * a union BOX field (code 16) accepts every atom by construction, so `{ v: 5 }`
+//     still builds a `{ v: i32 | null }` shape.
+//   * a field code the value code EQUALS is always storable.
+// Everything past those is an explicit allowlist of WIDENING stores — an atom into its
+// own nullable niche, a value into the nullable list/closure spelling of its own
+// backing. A pair not listed is a genuine layout mismatch.
+function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
+  if vc < 0 { return true }
+  if sc == 16 { return true }
+  if vc == sc {
+    // A NESTED-STRUCT field (code 15) still has to agree on WHICH struct: two
+    // `{ n: … }` literals over different inner shapes are both code 15 by name, and
+    // merging them stores a `ref $inner2` into a `ref $inner1` field. Both target names
+    // must be known to refute — an un-interned inner literal records "" and keeps the
+    // lenient match.
+    if vc == 15 {
+      const vn = anonFieldElemName(valIx, 15)
+      const fn = sFieldElemNameAt(si, mfi)
+      if vn != "" && fn != "" && vn != fn { return false }
+    }
+    return true
+  }
+  if vc == 0 {
+    // An i32 / boolean / literal-union-atom / arithmetic value: the i32-BACKED slots
+    // only. A wider numeric slot (f64 17, i64 23, f32 24) is reachable solely through
+    // the checker's adoption, which `anonFieldCode` reports as that slot's own code.
+    // `boolean | null` (21) is an i32 sentinel niche a BOOLEAN value fills — an integer
+    // one collides with the sentinel, which is the silent read above.
+    // (`isBoolLitExpr` — `anonFieldCode` folds booleans and integers onto one code
+    // because both are i32 slots, so the niche test needs the distinction it erased.)
+    if sc == 21 { return isBoolLitExpr(valIx) }
+    if sc == 30 { return true } // `K | null` — the i32 atom niche, spare value -1
+    return false
+  }
+  if vc == 3 {
+    // A STRING value. A code-0 field is a plain i32/boolean slot UNLESS it is a
+    // literal-union ATOM slot, which records its union name in `sFieldElemName` — and a
+    // string literal is exactly how such a field is written (`{ v: "a" }` for
+    // `v: "a" | "b"`), so that one stays lenient.
+    if sc == 0 { return sFieldElemNameAt(si, mfi) != "" }
+    if sc == 20 { return true } // `string | null` — the same ref, nullable
+    if sc == 30 { return true } // `K | null` — a string literal names the atom
+    return false
+  }
+  if vc == 4 { return sc == 18 }  // an i32 list into `i32[] | null`
+  if vc == 14 { return sc == 22 } // a closure into `((…) => …) | null`
+  if vc == 24 { return sc == 17 } // an f32 value into the wider f64 slot
+  if vc == 25 { return sc == 32 } // an f64 list into `f64[] | null`
+  if vc == 26 { return sc == 33 } // an i64 list into `i64[] | null`
+  if vc == 15 { return false }    // a nested struct ref: code 15 or the box above
+  true
+}
+
 // PERF MEMO (the deep-composite compile wall, `resolveAnnot`-memo's emitter sibling):
 // `structIndexOfObjCtx` re-enters per candidate row × per parent literal query
 // (`anonFieldCode`'s nested-object arm recurses into child literals), so a deeply
@@ -6442,10 +6510,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
               // F64 DISCRIMINATION: an `{x}` literal matches the i32 `{x}` and
               // the f64 `{x}` shapes by NAME — split them on the value's float-
               // ness so `{x: 1.5}` builds the f64 shape and `{x: 1}` the i32
-              // one (monomorphized `addx` instances each pin their own). Only
-              // the f64 axis discriminates; every other code keeps the lenient
-              // name-only match (a `{v: 5}` literal still matches a
-              // `{v: i32|null}` union-field shape).
+              // one (monomorphized `addx` instances each pin their own).
               const sc = sFieldTypeAt(si, mfi)
               const vc = anonFieldCode(f.fiValue)
               let isFloat = vc == 17
@@ -6487,6 +6552,10 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                 }
               } else if sc == 17 {
                 if fnIx >= 0 || vc >= 0 { ok = false }
+              } else if !anonValueFitsField(vc, sc, f.fiValue, si, mfi) {
+                // THE REMAINING VALUE AXES (the general scalar/ref rule the f64 and
+                // i64 arms above are two special cases of).
+                ok = false
               }
               // NESTED-STRUCT tiebreak axis: a nested object-LITERAL field value
               // (`f: {a: false}`, a struct ref) aligns only with a nested-struct field
@@ -12934,11 +13003,15 @@ export function anonFieldCode(valIx: i32) {
     // shape already coded 23 via `fieldTypeCode`).
     if !numLexFitsI32(e.numText) { return 23 }
     // A SMALL int literal whose context adopted a wider slot — the checker recorded
-    // i64/f64 on the node (`objRetWidenAdopt`, a lambda returning `{f: 5}` against
+    // i64/f64/f32 on the node (`objRetWidenAdopt`, a lambda returning `{f: 5}` against
     // `() => {f: i64}`): code the wide slot; the literal re-encodes at the field store.
+    // The f32 rung is the same fact the float arm above already reads, one literal
+    // spelling over: an integer literal in an f32 field is an f32 VALUE, and leaving it
+    // coded 0 makes `anonValueFitsField` read it as a plain i32 against the f32 slot.
     const tk = tyKindOf(nodeTyIxOf(valIx))
     if tk == 10 { return 23 }
     if tk == 11 { return 17 }
+    if tk == 13 { return 24 }
     return 0
   }
   if e is BoolLit { return 0 }
