@@ -260,11 +260,8 @@ import {
   mvValKind,
   mvValName,
   mvValStructIdx,
-  narrowNames,
-  narrowSets,
   narrowStripNullOnly,
   narrowTop,
-  narrowTys,
   nulStrReadStaysRaw,
   pendingF32,
   pendingF64,
@@ -543,7 +540,6 @@ import {
   mfSrcLocalFor,
   msMemberAtomsOfSet,
   msSetOfText,
-  msSoleMemberTy,
   msSubNull,
   mvInnerMapShape,
   mvListValKind,
@@ -555,6 +551,9 @@ import {
   // (`monoIsRowMatch` was imported here — its ONE caller took the arena route
   // through `repIsRowMatchTy` at D-MONOISTY; see `monoStaticIsResult`. The
   // callerless function itself was deleted at D-SLOTARENA.)
+  narrowExcludesNull,
+  narrowSlotOf,
+  narrowSlotTyOf,
   narrowVariantFor,
   narrowedMapOf,
   narrowedRefArrayOf,
@@ -2029,20 +2028,16 @@ function isArmTagOfTy(ity: i32): i32 {
 // narrowed arm can read the STRUCTURE instead of re-classifying the rendered variant
 // the same push stored beside it. A complement push (`x != null`) carries a member SET
 // rather than a type, and its sole surviving member IS the bound type (`msSoleMemberTy`).
-// (A twin of `emit_classify`'s private `narrowSlotOf` + `narrowSlotTy` over the same
-// `emit_state` tables — see the hand-off in the destringify doc: those two want
-// exporting, and this twin then goes.)
+//
+// THE LOOKUP IS `narrowSlotOf`'S, not a second walk over the same tables. This was a
+// hand-copied twin of it, and the copy is what made the divergence possible: `narrowSlotOf`
+// skips a RETIRED entry (a write the narrowing does not admit ended it — see
+// `narrowRetired`) and a twin that only matched on the name would keep answering with the
+// dead arm's type for every read after the write.
 function narrowedArmTyOf(name: string): i32 {
-  let i = narrowTop - 1
-  while i >= 0 {
-    if narrowNames[i] == name {
-      const t = narrowTys[i]
-      if t >= 0 { return t }
-      return msSoleMemberTy(narrowSets[i])
-    }
-    i = i - 1
-  }
-  -1
+  const i = narrowSlotOf(name)
+  if i < 0 { return -1 }
+  narrowSlotTyOf(i)
 }
 
 // `recv == <numeric literal>` onto `body` — the scalar VALUE test shared by the
@@ -2155,6 +2150,39 @@ function emitNulIsNullTest(
   invert: boolean,
   nicheOnly: boolean,
 ) {
+  // A NARROWING THAT EXCLUDES NULL DECIDES THIS STATICALLY, and it is claimed FIRST because
+  // every arm below reads the receiver at the DECLARED nullable rep while `emitIdentNode`
+  // reads a narrowed binding at the ARM's rep. `let x: i32 | null = null` / `x = 5` / `if x
+  // != null` reached no arm at all (the receiver no longer classifies as a union) and fell
+  // out to the i32 compare, which emitted a bare `null` with nothing to type it: `bare null
+  // needs a struct-typed context`, `vl check` rc 0. The assignment kind is the reachable
+  // spelling — a redundant null test inside a live GUARD is a dead test the checker rejects,
+  // while the assignment kind's test is deliberately kept meaningful (it asks the DECLARED
+  // type), so the emitter is where the two views have to be reconciled.
+  //
+  // ONLY THE NULL QUESTION, AND THE MEASUREMENT IS WHY. `nicheOnly` callers are the `is`
+  // arms, which read a `true` from this ladder as "the value IS the tested variant" — a
+  // reading "not null" only supports when the tested variant IS the narrowed arm, and it
+  // need not be. `function tag(a: Cat | Dog) { if a is Cat { return a.meow }   if a is Dog
+  // { … } }` post-guard-narrows `a` to `Dog`, and folding its `is Dog` to `true` happens to
+  // be right while the same fold of an `is Cat` there would be a silently wrong branch.
+  // (13 of 1952 corpus modules took that fold, all of them correctly and none of them
+  // because the rule held.) So the PRESENT direction is claimed for the `==`/`!=` callers
+  // only, which ask this ladder's own question; `is null` is claimed either way, because a
+  // value proved non-null is not null under any caller's reading.
+  if !nicheOnly || !invert {
+    const nnRef = P.nodes[unwrapParen(refIx)]
+    if nnRef is Ident {
+      if narrowExcludesNull(nnRef.identName) {
+        if invert {
+          fbI32Const(1) // present, provably
+        } else {
+          fbI32Const(0) // not null, provably
+        }
+        return 1
+      }
+    }
+  }
   // The two SENTINEL niches: a `boolean | null` rides the i32 value 2 and a `K | null` the
   // value -1 (member ids are >= 0). The i32 never holds a ref, so both compare against the
   // sentinel rather than `ref.is_null` — checked before the ref niches below.
@@ -17489,6 +17517,21 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
         fnIx,
       )
     }
+  }
+  // A NARROWING THAT EXCLUDES NULL MAKES THE DEFAULT DEAD: `x ?? d` IS `x` there, and the
+  // read is the only lowering whose rep can be right. Every niche arm below evaluates its LHS
+  // at the DECLARED nullable rep — the box for a value union, the sentinel i32 for
+  // `boolean | null` / `K | null`, the nullable ref for the rest — while `emitIdentNode` reads
+  // a narrowed binding at the ARM's rep, so the operand and the arm disagreed:
+  // `if x != null { print(x ?? 0) }`, `if x is i32 { print(x ?? 0) }` and
+  // `x = 5   print(x ?? 0)` were all `vl check`-clean modules the engine rejects with
+  // `expected (ref null $type), found i32`.
+  //
+  // THE DEFAULT IS NOT EVALUATED, which is what `??` means. (Two sentinel arms below `select`
+  // instead, so they evaluate a side-effecting default even on the present path; that is
+  // their open ruling and this arm does not import it.)
+  if lhs is Ident {
+    if narrowExcludesNull(lhs.identName) { return emitExpr(body, lhsIx, fnIx) }
   }
   if lhs is Index {
     if exprMap(lhs.idxArr, fnIx) {
