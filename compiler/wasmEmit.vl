@@ -1870,6 +1870,16 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       if variantIndexOf(rsp) >= 0 { return -1 }
     }
     if exprUnion(nd.isObj, fnIx) { return -1 }
+    // A NULLABLE receiver is NEVER statically decided here, because the only name this fold
+    // has for it is its NON-NULL base: `monoArgTyName`'s cascade classifies a
+    // `string | null` / `boolean | null` / `i32[] | null` / `K | null` value by the member
+    // it reps as (`string`, `boolean`, `i32[]`, `i32`), so `v is null` would compare two
+    // names that can never be equal and decide FALSE — a guard that never fires. Those reps
+    // are RUNTIME tests (`emitNulIsNullTest`). The gate lives HERE rather than at the `is`
+    // emitter because the STATEMENT emitter's dead-arm skip (`monoStaticIsGuardOf`) reads
+    // this same answer: split them and the skip could drop an arm whose guard the emitted
+    // condition still evaluates at runtime.
+    if nodeTyIsNullable(nd.isObj) { return -1 }
     const sk = monoArgTyName(nd.isObj, fnIx)
     if sk == "" { return -1 }
     if sk == nd.isVariant { return 1 }
@@ -2025,32 +2035,137 @@ function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
   ""
 }
 
+// THE null test for a nullable value, and the ONE home for it: `x == null` / `x != null`
+// and the `x is null` / `x is <member>` guard ask the identical question of the identical
+// rep. Leaves a 0/1 i32 — 1 = NULL when `invert` is false, 1 = PRESENT when it is true.
+// Returns 1 when the ladder CLAIMS the receiver's rep (bytes emitted), 0 when no arm
+// matches (nothing emitted — the caller keeps its own paths), -1 on an emit failure.
+//
+// A REP ANSWERED IN ONLY ONE OF THE TWO CALLERS IS A GUARD THAT NEVER FIRES, and the
+// failure is SILENT: an `is` receiver no arm here claims falls through to
+// `monoStaticIsResult`, whose `monoArgTyName` names a nullable value by its NON-NULL base
+// (`string`, `boolean`, `i32[]`, `K`) — so the fold compares two names that can never be
+// equal and decides FALSE. `vl check` clean, the wrong branch taken in statement position
+// and a `ref.as_non_null` trap wherever the narrowed arm is the value. Adding a rep to one
+// caller's ladder without the other re-opens exactly that.
+//
+// `nicheOnly` restricts the ladder to the SINGLE-non-null-member reps. A value-union BOX
+// and an optional chain can carry several non-null members, so "not null" does not identify
+// one of them — those two arms answer only the `== null` question and are skipped for `is`.
+function emitNulIsNullTest(
+  body: i32[],
+  refIx: i32,
+  fnIx: i32,
+  invert: boolean,
+  nicheOnly: boolean,
+) {
+  // The two SENTINEL niches: a `boolean | null` rides the i32 value 2 and a `K | null` the
+  // value -1 (member ids are >= 0). The i32 never holds a ref, so both compare against the
+  // sentinel rather than `ref.is_null` — checked before the ref niches below.
+  if exprNulBool(refIx, fnIx) {
+    if emitExpr(body, refIx, fnIx) < 0 { return -1 }
+    fbI32Const(2)
+    if invert {
+      fbI32Bin(71) // 0x47 i32.ne
+    } else {
+      fbI32Bin(70) // 0x46 i32.eq
+    }
+    return 1
+  }
+  if exprNulLitUnion(refIx, fnIx) {
+    if emitExpr(body, refIx, fnIx) < 0 { return -1 }
+    fbI32Const(-1)
+    if invert {
+      fbI32Bin(71) // 0x47 i32.ne
+    } else {
+      fbI32Bin(70) // 0x46 i32.eq
+    }
+    return 1
+  }
+  if !nicheOnly {
+    // Any null LINK makes an optional chain's value null (the host's OptionalAccess folds
+    // null through), so the chain's own null test IS the answer.
+    const ncN = P.nodes[unwrapParen(refIx)]
+    if ncN is OptMember {
+      if emitOptChainIsNull(body, refIx, fnIx) < 0 { return -1 }
+      if invert {
+        fbI32Eqz() // 0x45 invert: the chain value is present
+      }
+      return 1
+    }
+    // A value-union BOX (`i32 | null`, `A | B | null`) is never itself null — the null
+    // variant rides the TAG — so compare the box tag against the global null tag (the
+    // host's `variantTag(info, null)` path), never `ref.is_null`.
+    if exprUnion(refIx, fnIx) {
+      if emitExpr(body, refIx, fnIx) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 0) // box field 0: tag
+      fbI32Const(nullBoxTag())
+      if invert {
+        fbI32Bin(71) // 0x47 i32.ne
+      } else {
+        fbI32Bin(70) // 0x46 i32.eq
+      }
+      return 1
+    }
+  }
+  // Every remaining nullable rep is a `(ref null …)` NICHE and tests `ref.is_null`: the
+  // struct ref, the map struct, the closure struct, the i32-list backing, a
+  // distinct-backing scalar list's wrapper (`string[]|null`, `f64[]|null`, `i64[]|null`,
+  // `f32[]|null`) and a ref array's inner wrapper.
+  if (
+    exprNullableStruct(refIx, fnIx) ||
+    exprNullableMap(refIx, fnIx) ||
+    exprNulClosure(refIx, fnIx) ||
+    exprNullableList(refIx, fnIx) ||
+    exprNulScalarListKind(refIx, fnIx) != null ||
+    exprNullableRefArray(refIx, fnIx)
+  ) {
+    if emitExpr(body, refIx, fnIx) < 0 { return -1 }
+    wU8(209) // 0xd1 ref.is_null
+    if invert {
+      fbI32Eqz() // 0x45 invert: non-null
+    }
+    return 1
+  }
+  // The `string | null` niche is the nullable raw array ref, and it is the one arm that
+  // must read the receiver RAW (`rawNullRead`): a kind-16 ident is otherwise RECOVERED to
+  // non-null, which makes `ref.is_null` a const 0.
+  if exprNullableString(refIx, fnIx) {
+    const nsCtx = expCtxHere()
+    nsCtx.rawNullRead = true
+    if emitExprExpect(body, refIx, fnIx, nsCtx) < 0 { return -1 }
+    wU8(209) // 0xd1 ref.is_null
+    if invert {
+      fbI32Eqz() // 0x45 invert: non-null
+    }
+    return 1
+  }
+  0
+}
+
 // Lower a type guard `recv is Variant` onto `body` as the box-tag compare (mirroring
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
 function emitIs(body: i32[], isIx: i32, fnIx: i32) {
-  // `p is null` over a NULLABLE struct ref — `ref.is_null` (no union needed).
+  // `p is null` over a NULLABLE struct ref — `ref.is_null` (no union needed), and
+  // `p is { x: i32 }` / `p is S` its inverse: over a NICHE nullable struct (`S | null` — one
+  // struct member, a nullable REF not a box) the checker already proved the tested shape
+  // matches the struct member, so the only runtime distinction is null vs non-null
+  // (`!ref.is_null`, the host's nullable non-null narrowing test). This is the ONE niche
+  // that must be claimed before the ladders below rather than beside them — see the general
+  // niche arm further down, which the box / atom / membership paths deliberately precede.
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
-    if nd0.isVariant == "null" {
-      if exprNullableStruct(nd0.isObj, fnIx) {
-        if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        return 0
-      }
-    }
-    // `p is { x: i32 }` / `p is S` over a NICHE nullable struct (`S | null` — one
-    // struct member, a nullable REF not a box): the checker already proved the
-    // tested shape matches the struct member, so the only runtime distinction is
-    // null vs non-null — the test lowers to `!ref.is_null` (host: the nullable's
-    // non-null narrowing test).
-    if nd0.isVariant != "null" {
-      if exprNullableStruct(nd0.isObj, fnIx) {
-        if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-        wU8(209)   // 0xd1 ref.is_null
-        fbI32Eqz() // 0x45 → non-null
-        return 0
-      }
+    if exprNullableStruct(nd0.isObj, fnIx) {
+      const nst = emitNulIsNullTest(
+        body,
+        nd0.isObj,
+        fnIx,
+        nd0.isVariant != "null",
+        true,
+      )
+      if nst < 0 { return -1 }
+      if nst > 0 { return 0 }
     }
   }
   // `k is K` / `k is "x"` over a LITERAL-UNION receiver — an interned i32 ATOM id, NOT a
@@ -2456,6 +2571,47 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
           }
         }
       }
+    }
+  }
+  // `x is null` / `x is <member>` over a NULLABLE value whose rep is a
+  // single-non-null-member NICHE (`string | null`, `boolean | null`, `K | null`, a list /
+  // ref-array / map / closure niche): the only runtime distinction IS null vs present, so
+  // the guard is the niche's own null test, shared with the `== null` compare
+  // (`emitNulIsNullTest` — its header carries why one home is required). `x is <member>`
+  // inverts it: the checker already proved the tested shape is the sole non-null member.
+  //
+  // THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT AND IT IS MEASURED, NOT REASONED. This
+  // arm belongs immediately in front of `monoStaticIsResult` and behind every box / atom /
+  // membership path above, because the set it claims is exactly the set that otherwise
+  // reaches that fold — which names a nullable receiver by its NON-NULL base and so decides
+  // a guard that has to run.
+  //
+  // Ahead of the box paths it MISCLAIMS: a union BOX narrowed by an outer arm to a single
+  // nullable member (`else if x is boolean` at the end of an `A | B | i32 | … | null`
+  // chain) reads `exprNulBool` TRUE on a value whose STORAGE is still a `(ref $uBox)`, and
+  // the sentinel compare `i32.ne` over a box ref is invalid wasm
+  // (`functions/heterogeneous-union.vl` is the live pin). Narrowing is a TYPE fact; the box
+  // is the STORAGE, and only the paths above read the storage.
+  //
+  // The litunion niche takes only the `is null` DIRECTION. `v is K2` over a `K | null` where
+  // `K2` is a SUB-alias is a MEMBERSHIP question — one "not null" cannot express — and the
+  // atom ladder above answers it exactly.
+  if nd0 is IsExpr {
+    let nulOk = true
+    if nd0.isVariant != "null" {
+      if exprNulLitUnion(nd0.isObj, fnIx) { nulOk = false }
+      if tyIsLitUnion(isVarTyIxOf(isIx)) { nulOk = false }
+    }
+    if nulOk {
+      const nt = emitNulIsNullTest(
+        body,
+        nd0.isObj,
+        fnIx,
+        nd0.isVariant != "null",
+        true,
+      )
+      if nt < 0 { return -1 }
+      if nt > 0 { return 0 }
     }
   }
   // STATIC `is` over a NON-union operand against a base TYPE NAME (`x is i32`,
@@ -15477,8 +15633,9 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     return 0
   }
-  // `p == null` / `p != null` over a NULLABLE struct ref: `ref.is_null`
-  // (inverted with `eqz` for `!=`) — never the i32 compare.
+  // `x == null` / `x != null` over any NULLABLE value — the rep's own null test, never the
+  // i32 compare. Checked before the structural string / struct / closure equality below,
+  // each of which would compare a value against the `null` literal.
   if e.binOp == "==" || e.binOp == "!=" {
     const nlhs = P.nodes[e.binLeft]
     const nrhs = P.nodes[e.binRight]
@@ -15486,133 +15643,13 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if nrhs is NullLit { nref = e.binLeft }
     if nlhs is NullLit { nref = e.binRight }
     if nref >= 0 {
-      // `x == null` over a `boolean|null` NICHE value is a SENTINEL compare
-      // (`x == 2`) — the i32 never holds a ref. Checked before the struct path.
-      if exprNulBool(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        fbI32Const(2)
-        if e.binOp == "!=" {
-          fbI32Bin(71) // 0x47 i32.ne
-        } else {
-          fbI32Bin(70) // 0x46 i32.eq
-        }
-        return 0
-      }
-      // `x == null` over a `K | null` NICHE value is a SENTINEL compare against `-1`
-      // (the atom ids are ≥ 0) — the i32 never holds a ref. Checked before the struct path.
-      if exprNulLitUnion(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        fbI32Const(-1)
-        if e.binOp == "!=" {
-          fbI32Bin(71) // 0x47 i32.ne
-        } else {
-          fbI32Bin(70) // 0x46 i32.eq
-        }
-        return 0
-      }
-      // `<opt-chain> == null` / `!= null` (`o?.y != null`): any null LINK makes
-      // the chain's value null (the host's OptionalAccess folds null through),
-      // so the compare IS the chain's null test (inverted for `!=`).
-      const ncN = P.nodes[unwrapParen(nref)]
-      if ncN is OptMember {
-        if emitOptChainIsNull(body, nref, fnIx) < 0 { return -1 }
-        if e.binOp == "!=" {
-          fbI32Eqz() // 0x45 invert: the chain value is present
-        }
-        return 0
-      }
-      // `x == null` / `x != null` over a BOXED union (`i32 | null`,
-      // `A | B | null`): the box itself is never null — the null VARIANT rides
-      // in the TAG — so compare the box tag against the global null tag (the
-      // host's `variantTag(info, null)` path), never `ref.is_null`.
-      if exprUnion(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0) // box field 0: tag
-        fbI32Const(nullBoxTag())
-        if e.binOp == "!=" {
-          fbI32Bin(71) // 0x47 i32.ne
-        } else {
-          fbI32Bin(70) // 0x46 i32.eq
-        }
-        return 0
-      }
-      if exprNullableStruct(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
-      // `t == null` / `t != null` over a NULLABLE map (`{[string]: V} | null`, kind `nulmap`): the
-      // `(ref null $mapStruct)` niche — the same `ref.is_null` lowering as the nullable struct. The
-      // ident emits RAW (a plain `local.get` — `emitExpr` never recovers a nulmap ident to non-null;
-      // the `ref.as_non_null` recover lives only at map-OP receiver sites), so `ref.is_null` sees the
-      // genuine nullable ref. Checked before `exprMap` (a nulmap ident IS a map) could route it away.
-      if exprNullableMap(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
-      // `c == null` / `c != null` over a NULLABLE function value (`fn | null`, kind 19):
-      // the same `ref.is_null` lowering as the nullable struct.
-      if exprNulClosure(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
-      // `xs == null` / `xs != null` over a NULLABLE i32 list (`i32[] | null`,
-      // kind 15): the same `ref.is_null` lowering as the nullable struct.
-      if exprNullableList(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
-      // `t == null` / `t != null` over a DISTINCT-backing nullable scalar list (`string[]|null`,
-      // `f64[]|null`, `i64[]|null`, `f32[]|null`) — same `ref.is_null` lowering over the
-      // `(ref null $wrapper)` niche.
-      if exprNulScalarListKind(nref, fnIx) != null {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
-      // `t == null` / `t != null` over a NULLABLE ref array (`i32[][] | null`, kind 18) — same
-      // `ref.is_null` lowering (the `(ref null $innerWrapper)` niche).
-      if exprNullableRefArray(nref, fnIx) {
-        if emitExpr(body, nref, fnIx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
-      // `s == null` / `s != null` over a `string | null` (kind 16): the nullable raw
-      // array ref — same `ref.is_null` lowering. Checked before the structural string
-      // equality below (which would element-compare a non-null string). The receiver
-      // is read RAW (`pendingRawNullRead`) so the kind-16 ident keeps its nullable ref
-      // instead of being recovered to non-null (which would make `ref.is_null` const 0).
-      if exprNullableString(nref, fnIx) {
-        const nsCtx = expCtxHere()
-        nsCtx.rawNullRead = true
-        if emitExprExpect(body, nref, fnIx, nsCtx) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
-        if e.binOp == "!=" {
-          fbI32Eqz() // invert: non-null
-        }
-        return 0
-      }
+      // The ladder is shared with the `is null` guard — the two spellings ask the same
+      // question of the same rep, and `emitNulIsNullTest`'s header carries why they must
+      // not be answered in only one place. `!=` is the INVERTED direction, which the ladder
+      // emits directly (`i32.ne`) rather than leaving a caller to negate an `i32.eq`.
+      const bnt = emitNulIsNullTest(body, nref, fnIx, e.binOp == "!=", false)
+      if bnt < 0 { return -1 }
+      if bnt > 0 { return 0 }
     }
     // STRUCTURAL struct equality: same-shape operands compare field-wise
     // (`emitStructEq` — scalars native, strings via the eq loop, `i32[]` via a
