@@ -115,6 +115,7 @@ import {
   nodeTyWidenedRepName,
   nodeUnionName,
   nominalStructNameOfTy,
+  numLitUnionBaseName,
   recordClonedNodeTy,
   recordNodePin,
   tyIsLitUnion,
@@ -17484,11 +17485,24 @@ function fnRetUnionSid(sid: i32) {
 }
 
 // True if the parameter `name` of function `fnIx` is the union type.
+//
+// BOTH LEGS ARE `vtKindOfType`'s TWO `"union"` ARMS, READ DIRECTLY. That function decides
+// the param's VALTYPE, so this classifier must claim exactly the slots it made boxes or the
+// two describe different values for one annotation — and the second arm is the live instance:
+// a NULLABLE NUMERIC litunion (`N | null` over `type N = 1 | 2`, and the inline `1 | 2 | null`)
+// interns as a `TyNullable` whose inner litunion `isValueUnionBox` rejects (all members one
+// `litKind`), so `nodeTyIsUnionAlias` answers NO for a slot `vtKindOfType` already gave the
+// box. `exprUnion` reads this, and every `is`/membership arm downstream reads `exprUnion` —
+// so the param position fell past the numeric-litunion membership arm to
+// ``emitProgram: `is` names a type that is not a union variant`` while the `let` spelling of
+// the identical program compiled. The ladder is read directly rather than through
+// `vtKindOfType` itself because this sits on `exprUnion`'s hot Ident path and the two
+// predicates ARE that ladder's union arms; a whole-ladder call would bill every ident read.
 function paramUnion(fnIx: i32, name: string) {
   const pt = paramTypeNode(fnIx, name)
   // STRUCTURAL fast-path (C1): a recorded declared value-union param, else the name test.
   if nodeTyIsUnionAlias(pt) { return true }
-  false
+  nodeTyIsNulNumLitUnion(pt)
 }
 
 // True if the already-collected declared local `name` is a union ref (code `4`).
@@ -18056,11 +18070,42 @@ export function narrowedValueAtomOf(name: string) {
     const tk = unMemAtomKind(ty)
     if tk == 6 { return "" }
     if tk < 0 {
+      // A NUMERIC litunion arm (`if p is N` where `type N = 1 | 2`, and the inline /
+      // single-literal spellings `is 1 | 2` / `is 1`) unboxes as its BASE SCALAR — the
+      // rep the box's payload actually holds, which is `numLitUnionBaseName`'s answer
+      // and the same one `emitUnionCoerce` boxed the member with. ASKED OF THE ARENA,
+      // not of the spelling, because there is no spelling that carries it: the narrow
+      // banks the tested name (`N`, or a bare `1`), and `valueAtomKind` of either is -1
+      // while `nameIsLitUnionType` — the STRING twin two lines down — is `litKind ==
+      // "str"` only. So this rep reached neither leg and the read stayed the raw
+      // `(ref $uBox)` where the arm's i32/i64/f64 was expected: `vl check`-clean INVALID
+      // WASM at every `is`-narrowed read of a `N | null`, while the `!= null` spelling of
+      // the identical program was correct (its complement push banks the base scalar's
+      // own name, so it lands on `valueAtomKind` below).
+      const nb = numLitUnionBaseName(ty)
+      if nb != "" { return nb }
       if !tyIsLitUnion(ty) { return "" }
     }
   }
   const k = valueAtomKind(v)
   if k >= 0 && k != 6 { return v }
+  // A TRANSPARENT ALIAS of a scalar/string atom (`type N = i32` then `if p is N` over a
+  // `p: i32 | null`) banks the ALIAS spelling, which `valueAtomKind` declines — while the
+  // ARENA type the SAME push banked is the `TyPrim` whose `primName` is the canonical atom
+  // spelling. That is not a second rule: it is exactly the string `unMemAtomKind` hands
+  // `valueAtomKind` two functions down, so the two legs cannot disagree about which atom
+  // an arm is. Without it the box-tag test was correct and the narrowed read stayed the raw
+  // `(ref $uBox)` — `vl check`-clean INVALID WASM at every non-capture storage class, while
+  // `is i32` (the same question spelled with the atom's own name) was correct beside it.
+  // `TyPrim` ONLY: a closure / list / map arm's SPELLING carries information its kind does
+  // not (its signature, its element type), and those consumers read the spelling.
+  if k < 0 && ty >= 0 {
+    const at = T.tys[ty]
+    if at is TyPrim {
+      const ak = valueAtomKind(at.primName)
+      if ak >= 0 && ak != 6 { return at.primName }
+    }
+  }
   // A litunion-alias narrow (`x is K0` where `type K0 = "a" | "b"`) unboxes as the
   // STRING ref the box stores its litunion member as (`emitUnionCoerce` boxes it so).
   if k < 0 && nameIsLitUnionType(v) { return "string" }
