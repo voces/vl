@@ -141,7 +141,6 @@ feasible" below). Behaviour-neutral: A/B of the emitted wasm bytes over every
 `.vl` under `tests/cases/` — 1860 records, 1538 byte-identical, 322 rejecting
 identically, **0 byte differences, 0 rc differences**.
 
-<<<<<<< HEAD
 ### 4. The same structural guard, applied to an ARENA ladder
 
 `repTyScalarMask`'s walk (row R11 below: no `TyLit` arm, fall-through leaves the
@@ -153,7 +152,6 @@ compilers, **1872 records, 1548 byte-identical modules, 324 rejecting identicall
 0 byte differences, 0 rc differences**. The guard is proven live by sabotage —
 deleting the `TyMap` arm makes `scripts/refresh-compiler.sh` exit 1 with the
 variant named at its source position. See "The ARENA half" below.
-=======
 ## CLOSED — C4. The USAGE DETECTOR, which is the shape this audit's scans cannot see
 
 `anyLitUnionUsed` (`compiler/typecheck.vl`) is the single `P.nodes` pass that sets
@@ -214,7 +212,6 @@ out of 198 and a reaching program in the same grid:
 * **`(string | null)[]` compared un-narrowed** — `for x in xs { if x == "p" … }`
   over a `(string | null)[]` TRAPS (`wasm trap`, 1 cell), while every litunion
   spelling of the same program now runs. The control is the broken one here.
->>>>>>> e1f74f7b (docs(vl): the per-rep ladder audit's scans cannot see a USAGE DETECTOR, which is where the silently-wrong cell was)
 
 ## OPEN — ranked
 
