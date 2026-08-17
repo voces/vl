@@ -2455,10 +2455,10 @@ export function initChecker() {
   npTys = []
   npInvBy = []
   npFrames = []
-  weKeys = []
-  weVals = []
+  weSums = Map()
   weOpen = []
   weRoots = []
+  weFnDecls = Map()
   weCut = 0
   asgSrcStack = []
   asgDstStack = []
@@ -2818,8 +2818,13 @@ function placeSubPath(ix: i32, root: string) {
 // `weOpen` is the in-progress stack. A recursive cycle answers `"*"`, not "writes
 // nothing": a summary that guesses must guess CLOSED, and a one-pass walk has no
 // fixpoint to fall back on.
-let weKeys: string[] = []
-let weVals: string[] = []
+//
+// A MAP, not parallel arrays, because the bank is read once per (live narrowing ×
+// call) while it grows one entry per summarised (callee, parameter): a scan makes the
+// predicate quadratic in the number of DISTINCT callees a guarded region calls, which
+// is the dominant term for property-path guards. `""` is a legitimate value ("writes
+// nothing"), so presence is asked with `has` and never inferred from the value.
+let weSums: {[string]: string} = Map()
 let weOpen: string[] = []
 
 // The function bodies currently being summarised, innermost last. A call inside a
@@ -2869,11 +2874,7 @@ function weSplit(s: string) {
 // The write-effect summary of parameter `paramIx` of the `FuncDecl` at `fnIx`.
 function fnWriteEffects(fnIx: i32, paramIx: i32) {
   const key = i32ToStr(fnIx) + "#" + i32ToStr(paramIx)
-  let ci = 0
-  while ci < weKeys.length {
-    if weKeys[ci] == key { return weVals[ci] }
-    ci = ci + 1
-  }
+  if weSums.has(key) { return weSums[key] ?? "*" }
   if weIsOpen(key) { return weCycleAnswer() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
@@ -2916,8 +2917,7 @@ function weCycleAnswer() {
 // summary was still open, which is the one case the first pass leaves too small.
 function weCache(key: string, acc: string, cutBefore: i32) {
   if weCut != cutBefore && weOpen.length > 0 { return 0 }
-  weKeys.push(key)
-  weVals.push(acc)
+  weSums[key] = acc
   0
 }
 
@@ -2933,7 +2933,36 @@ function findFnDeclInRoots(name: string) {
   -1
 }
 
+// The subtree walk, MEMOISED on `(rootIx, name)`. Every query inside one summary asks
+// the same root, and an INTRINSIC call (`print`) asks a name no root holds — so the
+// uncached walk is re-run per call in the body, making one summary quadratic in the
+// number of calls that body makes. The NEGATIVE answer is the one worth banking:
+// `-1` means "this subtree was walked and holds no such declaration".
+//
+// The memo is exact rather than approximate. `findFnDeclWalk` is a pure function of
+// `(P.nodes, rootIx, name)` and the checker appends no nodes, so a banked answer is
+// the answer the walk would give.
+//
+// KEYING ON THE ROOT IS LOAD-BEARING. The same name resolves to different
+// declarations under different enclosing bodies, so a name-only memo — or a flat
+// module-wide name→declaration map — can answer a declaration this walk would never
+// reach. That direction fails OPEN: `callDeclFnIx` would summarise an unrelated body
+// as writing nothing where it owes the caller the opaque answer.
 function findFnDeclIn(rootIx: i32, name: string) {
+  if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
+  const key = i32ToStr(rootIx) + "#" + name
+  if weFnDecls.has(key) { return weFnDecls[key] ?? -1 }
+  const d = findFnDeclWalk(rootIx, name)
+  weFnDecls[key] = d
+  d
+}
+
+// Memo bank for `findFnDeclIn`, keyed `"<subtree-root-node-ix>#<name>"`.
+let weFnDecls: {[string]: i32} = Map()
+
+// The uncached pre-order walk: the FIRST `FuncDecl` named `name` in the subtree, the
+// root itself included, or -1.
+function findFnDeclWalk(rootIx: i32, name: string) {
   if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
   const n = P.nodes[rootIx]
   if n is FuncDecl {
@@ -2942,7 +2971,7 @@ function findFnDeclIn(rootIx: i32, name: string) {
   const kids = nodeChildren(rootIx)
   let i = 0
   while i < kids.length {
-    const d = findFnDeclIn(kids[i], name)
+    const d = findFnDeclWalk(kids[i], name)
     if d >= 0 { return d }
     i = i + 1
   }
@@ -3152,11 +3181,7 @@ function nameIn(names: string[], name: string) {
 // mutation routes that reach a field with no argument at all.
 function fnWriteFreePaths(fnIx: i32) {
   const key = i32ToStr(fnIx) + "#free"
-  let ci = 0
-  while ci < weKeys.length {
-    if weKeys[ci] == key { return weVals[ci] }
-    ci = ci + 1
-  }
+  if weSums.has(key) { return weSums[key] ?? "*" }
   if weIsOpen(key) { return weCycleAnswer() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
