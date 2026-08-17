@@ -45,6 +45,7 @@ Nothing. The queue is empty; pick from the bands below.
 | item | PR | result |
 |---|---|---|
 | **B1** checker-side parse census | #1354 | **CLOSED, measured negative** — 17,832 of 17,834 are tree walks |
+| **B1a** `is` triple resolution | — | **SHIPPED** — the mint-free half is exactly the bare-NAME half, so it is separable; 12,931 of 12,931 taken on the compiler's own source, arena unmoved on 1,777 files |
 | **B2** TRANSP residue | #1373 | shipped; found a THIRD down-cell the filing lacked |
 | **B3** mint column | #1372 | **BLOCKED-REP behind B5** — 206 of 220 mint |
 | **B4** `recordMvValTyIx` | #1366 | shipped; 725 calls, 0 parses, 0 mints |
@@ -129,10 +130,24 @@ the shortcut programme has been harvesting exactly the safe parses, and what is
 left is by selection the parses that mint. **Any new row claiming arena-neutrality
 must name the mechanism; the base rate is 8.7% and falling.**
 
+**A FIFTH, from B1a: WHEN A ROW'S BLOCKED HALF IS DEFINED BY A RUNTIME PROPERTY,
+CHECK WHETHER A STATIC ONE PREDICTS IT EXACTLY — that is the difference between a
+row filed PARTLY TAKEABLE and a row shipped.** B1a's takeable half was defined as
+"the reads that mint nothing", which is only knowable after the call. It is the
+same set as "the spelling tree's ROOT KIND is `TS_NAME`" — 2,878 parses, 2,878
+mint-free, 0 minting, and 12,931 of 12,931 on the compiler's own source — one
+field of a node the caller already holds. **And a call whose measured `ΔT.tys` is
+0 needs no mint-ORDER argument at all**: it is not in the mint stream, so removing
+it cannot reorder what is. B3's hazard is real only for a population that mints,
+and its own is 206 of 220. The cheapest way to price the half you are refusing is
+to BUILD it: B1a's take-all control moves `T.tys.length` on **229 of 1,735 files
+while moving 0 wasm bytes**, which is both the gate confirmed and the proof the
+arena channel was awake.
+
 | id | item | anchor | measured | status | eff | risk |
 |---|---|---|---|---|---|---|
 | ~~**B1**~~ | ~~Checker-side parse census~~ | `destringify-types-program.md` D-CHECKPARSE | **CLOSED — measured negative.** 3,093 of 17,834; **17,832 of 17,834 are TREE walks**; `nameToTy` entered **54 times corpus-wide**, **0** over the compiler's own source | **CLOSED** | — | — |
-| **B1a** | **`is` triple resolution** — `collectThenNarrows` / `collectElseNarrows` / the if-chain scan each re-resolve what the `is` node already banks in `isVarTyIx` | family c9+c10+c11+c13 | **6,574 = 36.9%** of checker parsing (**87.9%** on the compiler's own source). Bank covers 4,427 of 4,429 readers; **2,530 of 2,530 index-identical, 0 disagreements** | **PARTLY TAKEABLE** — the other **1,897 MINT a duplicate arena entry**, so skipping renumbers (#1331's gate) | M | med |
+| ~~**B1a**~~ | ~~`is` triple resolution~~ | `destringify-types-program.md` D-ISBANK | **SHIPPED, and the takeable half was SEPARABLE.** Re-derived: family **7,187 = 37.9%** of checker parsing (**19,398 = 88.0%** on the compiler's own source); the three READERS are **4,851 CALLS = reaches = parses** (25.6% / 58.7%), bank covers **4,849**, **2,912 of 2,912 mint-free reads index-identical, 0 disagreements**, **1,937 of 1,937 minting reads disagree, 0 agreements**. The split is SYNTACTIC — `tsKind[root] == TS_NAME` is **2,878 parses, 2,878 mint-free, 0 minting** (12,931 of 12,931 on the compiler) — so the mint-free half is gated BEFORE the call. Corpus A/B **0 of 1,777 rows on wasm bytes, `T.tys.length` and diagnostics**; the TAKE-ALL control moves `T.tys.length` on **229 of 1,735** while moving **0** bytes. Reaches 18,972 → 16,096 corpus, **22,031 → 9,100** on the compiler. **+99 B** | **CLOSED** | — | — |
 | **B2** | **TRANSP residue** — add `genAppNameOfTy` under `structNameOfTy` so `type Y = Box<i32>` renders `Box<i32>` | `typecheck.vl:8945`; blocker `emit_classify.vl:11474 fieldTypeCode` | rung is **BUILT and MEASURED**: B2 20→11, B3 120→111, moves nothing on the six-channel corpus, costs ONE cell | OPEN — both halves of the old filing REFUTED | M+S | med |
 | ~~**B3**~~ | ~~1a-v `pushFieldRow` — per-field-CODE peel table~~ | `destringify-types-program.md` D-FIELDROWMINT | **MEASURED NEGATIVE.** Re-derived at **3,583 CALLS** (2,510 empty-name guard · 185 rung 1 · 215 rung 2 · **673** `resolveAnnot` reaches) / **220 parses** (11.5% of the emitter's 1,915) / **206 of the 220 MINT (93.6%)**, and on the subset `pushFieldRow` can actually reach, **83 of 84 (98.8%)**. The 14 mint-free are 6 generic re-applications + 8 `#anon` failures, 13 of them outside `pushFieldRow` | **BLOCKED-REP** — behind **B5** | — | — |
 | ~~**B4**~~ | ~~`recordMvValTyIx` routing~~ | `destringify-types-program.md` B4 | **SHIPPED.** Re-derived at **725 CALLS** (40 rung-1 · 274 rung-2 · **411** `resolveAnnot` reaches) / **0 parses** / **0 arena mints**; dual-write **725 of 725 index-identical**, corpus A/B 1,743 files × 7 channels **0 rows moved**, **+25 B**. The filed 685 reconciles as `725 − 40 − 274`: the row grew, the CHOKEPOINT moved | **CLOSED** | — | — |
