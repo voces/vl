@@ -799,12 +799,24 @@ let pgFrames: i32[] = []
 // / `x = 5` / `{ let x = "s"   x = null }` banked `i32 | null` for the outer `x`
 // and the inner write read it, so `null` went into a `string` binding and the
 // binding's type was overwritten with `i32?` — a check-clean wrong type.
+//
+// `asgDeclRetiredBy` is the bare-name twin of `npInvBy`: the arena index of the write
+// that ended the narrowing, or -1 while it is in force. A GUARD-kind narrowing that has
+// been retired makes the name UNREADABLE for the rest of the guarded region, and that is
+// not conservatism — the EMITTER's own narrow stack (`narrowStripNullOnly` in
+// `emit_state.vl`) is built on "writing null back inside a null guard is impossible", so
+// a read after such a write is emitted against the stale UNBOXED rep. Over `i32 | null`
+// that is a check-clean invalid module ("expected (ref null $type), found i32"); over a
+// REF rep it happens to work. The two must agree or a boxed read diverges, so the
+// checker refuses the read the emitter cannot lower. The property-path side has always
+// behaved this way (`pathInvalidatedErr`), so the two spellings match.
 const NAR_KIND_ASG = 0
 const NAR_KIND_GUARD = 1
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
 let asgDeclDepths: i32[] = []
 let asgDeclKinds: i32[] = []
+let asgDeclRetiredBy: i32[] = []
 let asgDeclFrames: i32[] = []
 
 // The scope-chain DEPTH of the innermost binding of `name`, or -1 when undeclared.
@@ -840,6 +852,29 @@ function narDeclaredTy(name: string, kind: i32) {
 // The DECLARED type of an assignment-narrowed name, or -1.
 function asgDeclaredTy(name: string) { narDeclaredTy(name, NAR_KIND_ASG) }
 
+// The bank SLOT of the live guard-kind narrowing of `name`, or -1. Retirement writes
+// through this slot, so it must find exactly the entry `narDeclaredTy` reads.
+function narGuardSlot(name: string) {
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclKeys[i] == name && asgDeclDepths[i] == d {
+      if asgDeclKinds[i] == NAR_KIND_GUARD { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// The write that retired `name`'s guard narrowing, or -1 when it is still in force or
+// there is none. Read at the bare-name READ arm.
+function narRetiredBy(name: string) {
+  const i = narGuardSlot(name)
+  if i < 0 { return -1 }
+  asgDeclRetiredBy[i]
+}
+
 // Bank `name`'s declared type before a narrowing shadows it, at the scope depth the
 // shadowing `declare` writes to. Idempotent per (name, depth, kind): a second
 // `x = e` must not re-bank the ALREADY-NARROWED type as the declaration.
@@ -860,6 +895,7 @@ function noteNarShadow(name: string, declTy: i32, kind: i32) {
   asgDeclTys.push(declTy)
   asgDeclDepths.push(d)
   asgDeclKinds.push(kind)
+  asgDeclRetiredBy.push(-1)
   0
 }
 
@@ -2511,6 +2547,7 @@ export function initChecker() {
   asgDeclTys = []
   asgDeclDepths = []
   asgDeclKinds = []
+  asgDeclRetiredBy = []
   asgDeclFrames = []
   reScopeBases = []
   reNpBases = []
@@ -3406,6 +3443,44 @@ function npInsideBarrier(npIx: i32) {
   npIx >= reNpBases[reNpBases.length - 1]
 }
 
+// Whether a live narrowing DOES overlay the write target but sits below the innermost
+// re-execution barrier — the one reason `writeStorageTy` answers -1 for a place a
+// narrowing covers. Asked only to choose the diagnostic: the write is refused either
+// way, but "cannot assign null to i32" says nothing about why the same write one block
+// out is fine.
+function writeBarredByLoop(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Ident {
+    if narDeclaredTy(n.identName, NAR_KIND_GUARD) < 0 { return false }
+    return !narInsideBarrier(lookupDepth(n.identName))
+  }
+  if n is Member {
+    const key = placeKeyOf(ix)
+    if key == "" { return false }
+    const slot = narrowedPathIx(key)
+    if slot < 0 || npInvBy[slot] >= 0 { return false }
+    return !npInsideBarrier(slot)
+  }
+  false
+}
+
+// The diagnostic for a write the re-execution barrier refuses. It names the loop rather
+// than the type, because the type is fine: the same write one block further out is
+// accepted, and so is this one under a guard the loop itself re-tests.
+function writeBarredErr(place: string, at: i32) {
+  tErr(
+    "'" +
+      place +
+      "' was narrowed by a guard OUTSIDE this loop, so this write would leave the " +
+      "reads before it reading null on the next iteration — move the write out of " +
+      "the loop, or make the guard on '" +
+      place +
+      "' the loop's own condition",
+    at,
+  )
+  0
+}
+
 // THE STORAGE TYPE OF AN ASSIGNMENT TARGET — what the place can HOLD, as against
 // what a narrowing currently proves it holds — or -1 when no live narrowing overlays
 // the place and the flow type IS the storage type. That -1 covers every place in a
@@ -3505,8 +3580,16 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     const dcl = narDeclaredTy(nm, -1)
     if dcl >= 0 {
       if writeRetiresNarrowing(nm, rt, nm, lookup(nm)) {
+        // The DECLARED type goes back into the scope the narrowing shadowed, so a
+        // LATER write to the same name is checked against the storage again.
         const d = lookupDepth(nm)
         if d >= 0 { T.scopes[d][nm] = dcl }
+        // A guard-kind narrowing additionally poisons READS for the rest of the
+        // guarded region — see `asgDeclRetiredBy`.
+        const gs = narGuardSlot(nm)
+        if gs >= 0 {
+          if asgDeclRetiredBy[gs] < 0 { asgDeclRetiredBy[gs] = atIx }
+        }
       }
     }
   }
@@ -3574,6 +3657,24 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
       key +
       "' after " +
       after,
+    at,
+  )
+  TY_ERR
+}
+
+// The same diagnostic for a BARE NAME whose guard narrowing an assignment retired. It
+// names the write and says where a read can go, because the narrowing is genuinely dead
+// for the rest of the guarded region and re-testing inside it does not revive it: the
+// emitter's narrow stack still holds the region's rep (see `asgDeclRetiredBy`).
+function nameRetiredErr(name: string, byIx: i32, at: i32) {
+  tErr(
+    "'" +
+      name +
+      "' was narrowed by a guard, but the assignment on line " +
+      i32ToStr(nodeLineOf(byIx)) +
+      " ended the narrowing — read '" +
+      name +
+      "' outside the guarded block, or under a fresh guard there",
     at,
   )
   TY_ERR
@@ -4627,6 +4728,7 @@ function popScope() {
       asgDeclTys.pop()
       asgDeclDepths.pop()
       asgDeclKinds.pop()
+      asgDeclRetiredBy.pop()
     }
   }
   if symEnabled != 0 {
@@ -18090,7 +18192,14 @@ function checkNodeReal(ix: i32) {
     // read (the `BinExpr` `=` arm marks it as `daWriteTarget` before evaluating
     // the target), so it is skipped here; a compound `x += …` desugars to
     // `x = x + (…)` whose RHS reads `x` and DOES reach this gate.
-    if ix != daWriteTarget { daCheckRead(n.identName, ix) }
+    if ix != daWriteTarget {
+      daCheckRead(n.identName, ix)
+      // A guard narrowing an assignment RETIRED makes the name unreadable for the rest
+      // of the guarded region. Skipped for the write target itself, which is the one
+      // position that asks about the storage rather than the value.
+      const retBy = narRetiredBy(n.identName)
+      if retBy >= 0 { return nameRetiredErr(n.identName, retBy, ix) }
+    }
     return ty
   } else if n is Paren {
     return checkNode(n.parInner)
@@ -23024,16 +23133,25 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     // target node, so re-pointing it at the storage would move the emitted store
     // rep for programs that already compile.
     let asgLt = lt
+    let asgBarred = false
     const rtN = T.tys[rt]
     let rhsNullBearing = isNullTy(rt)
     if rtN is TyNullable { rhsNullBearing = true }
     if rhsNullBearing {
       const asgDcl = writeStorageTy(n.binLeft)
-      if asgDcl >= 0 { asgLt = asgDcl }
+      if asgDcl >= 0 {
+        asgLt = asgDcl
+      } else {
+        asgBarred = writeBarredByLoop(n.binLeft)
+      }
     }
     const asgOk = assignableExpr(n.binRight, rt, asgLt)
     if !asgOk {
-      tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(asgLt), ix)
+      if asgBarred {
+        writeBarredErr(placeKeyOf(n.binLeft), ix)
+      } else {
+        tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(asgLt), ix)
+      }
     }
     // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
     // fills from the first non-null assignment (in place, so the binding
