@@ -1558,6 +1558,107 @@ export function computeRetInference() {
   0
 }
 
+// Declare the THREE locals a `for v in <iter>` needs, in the pre-order `emitForInStmt`
+// consumes them: the element var `v` (its rep is `forInElemKind`'s answer), a hidden i32
+// cursor `v#i`, and a hidden temp `v#l` holding the iterable (evaluated ONCE). The hidden
+// names carry `#` so they can never collide with a user identifier. Leaves `v` bound in the
+// current scope frame — the CALLER walks the body and `scopeUnbind`s, because the loop
+// variable's scope is the loop.
+//
+// ONE HOME, BECAUSE THE MODULE-SCOPE AND FUNCTION-SCOPE WALKS MUST DECLARE THE SAME SLOTS.
+// A top-level `for` lives in the START function and was collected by a hand-copied second
+// version of this arm that had only the struct / string / f64 / i64 kinds — so a
+// module-scope walk over any other ref-array element (a union box, a nullable-struct niche,
+// a nested array, a closure, an f32) declared the `#l` temp as a plain i32 list, which is a
+// different valtype than the one `emitForInStmt` reads it back at. The kind ladder and the
+// `#l`-slot resolution are one question about one loop; asking it in two places is how the
+// second copy silently lags every element kind the first one learns.
+export function declareForInLocals(s: ForIn, fnIx: i32) {
+  const fiEk = forInElemKind(s.fiIter, fnIx)
+  if fiEk == null { return emitFail("emitProgram: unsupported for-in iterable") }
+  // A struct element (`S[]`, code 1) binds the loop var as a struct local
+  // carrying the element struct table index; the `#l` temp holds the ref-list
+  // WRAPPER (code 5 + the ref-list slot). i32/string elements keep their slots.
+  let fiVarIdx = -1
+  let fiLk: VKind = "list"
+  if fiEk == "struct" {
+    fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
+    fiLk = "reflist"
+  } else if fiEk == "nulstruct" {
+    // A NULLABLE-struct element (`(P | null)[]`): the loop var is a kind-9 niche carrying
+    // the element struct index; the `#l` temp is the ref-list WRAPPER (code 5).
+    fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
+    fiLk = "reflist"
+  } else if fiEk == "union" {
+    // A union-box element list: the loop var is a kind-4 union box (no struct index);
+    // the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
+    fiLk = "reflist"
+  } else if (
+    fiEk == "list" ||
+    fiEk == "strlist" ||
+    fiEk == "f64list" ||
+    fiEk == "i64list" ||
+    fiEk == "f32list"
+  ) {
+    // A NESTED-ARRAY loop var — the inner LIST (kind 2/7/12/20). The `#l` temp is the
+    // OUTER ref-list WRAPPER (code 5); each element is the inner list wrapper ref.
+    fiLk = "reflist"
+  } else if fiEk == "closure" {
+    // A CLOSURE element (`((i32) => i32)[]`): the loop var is a kind-14 closure (no struct
+    // index); the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
+    fiLk = "reflist"
+  } else if fiEk == "reflist" {
+    // A NESTED REF array (`S[][]`): the loop var is the inner REF LIST (kind 5) carrying its
+    // ref-list slot; the `#l` temp is the OUTER ref-list wrapper (code 5).
+    const fiOuter = refListSlotOfExpr(s.fiIter, fnIx)
+    fiVarIdx = rlElemInnerSlot(fiOuter)
+    fiLk = "reflist"
+  } else if fiEk == "str" || fiEk == "nulstr" {
+    // A `(string | null)[]` iterable shares the string list's BACKING (`nulstr` is the
+    // string-ref niche — a `(ref null $aTypeIdx)` element slot), so the `#l` temp is the
+    // same string-list wrapper the non-null element uses. Only the loop VAR differs.
+    fiLk = "strlist"
+  } else if fiEk == "f64" {
+    fiLk = "f64list" // f64 element → f64-list `#l` temp
+  } else if fiEk == "i64" {
+    fiLk = "i64list" // i64 element → i64-list `#l` temp
+  } else if fiEk == "f32" {
+    fiLk = "f32list" // f32 element → f32-list `#l` temp
+  }
+  // A STRING iterable (`for ch in s`): the `#l` temp holds the string itself (code 3, the
+  // raw `(ref $aTypeIdx)` array), not an i32-list wrapper. The loop var stays code 0 (i32).
+  if fiEk == "i32" && forInStringSrc(s.fiIter, fnIx) { fiLk = "str" }
+  const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
+  // A literal-union array (`for k in xs`, `xs: K[]`): the loop var is an i32 atom (kind 0),
+  // but flag it so `k`-as-atom (print widening, `==`, member compare) is recognized.
+  if nodeArrayElemIsLitUnion(s.fiIter) { localLitUnion[fiSlot] = 1 }
+  markLoopVarSlot(fiSlot)
+  scopeBind(s.fiVar, fiSlot)
+  addLocalName(s.fiVar + "#i", "i32", -1)
+  let fiLs = -1
+  if (
+    fiEk == "struct" ||
+    fiEk == "union" ||
+    fiEk == "nulstruct" ||
+    fiEk == "list" ||
+    fiEk == "strlist" ||
+    fiEk == "f64list" ||
+    fiEk == "i64list" ||
+    fiEk == "f32list" ||
+    fiEk == "closure" ||
+    fiEk == "reflist"
+  ) {
+    const fiMvs = forInMapValsSlot(s.fiIter, fnIx)
+    if fiMvs >= 0 {
+      fiLs = mvRlSlot[fiMvs]
+    } else {
+      fiLs = refListSlotOfExpr(s.fiIter, fnIx)
+    }
+  }
+  addLocalName(s.fiVar + "#l", fiLk, fiLs)
+  return 0
+}
+
 // Recursively collect the declared-local names of the block at `blockIx` into
 // `localNames`, descending into `if` then/else branches (wasm locals span the whole
 // function, so a local declared inside a branch still needs a slot). Each declared
@@ -1892,92 +1993,10 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         // The loop variable's scope is the loop (see `scopeUnbind`).
         scopeUnbind()
       } else if s is ForIn {
-        // A `for v in <list>` introduces THREE slots in pre-order: the element var
-        // (i32, or a string ref for a string-list / `.keys()` iterable), a hidden
-        // i32 cursor, and a hidden list temp holding the iterable (evaluated ONCE).
-        // The hidden names carry `#` so they can never collide with user identifiers.
-        const fiEk = forInElemKind(s.fiIter, fnIx)
-        if fiEk == null {
+        if declareForInLocals(s, fnIx) < 0 {
           scopePop()
-          return emitFail("emitProgram: unsupported for-in iterable")
+          return -1
         }
-        // A struct element (`S[]`, code 1) binds the loop var as a struct local
-        // carrying the element struct table index; the `#l` temp holds the ref-list
-        // WRAPPER (code 5 + the ref-list slot). i32/string elements keep their slots.
-        let fiVarIdx = -1
-        let fiLk: VKind = "list"
-        if fiEk == "struct" {
-          fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
-          fiLk = "reflist"
-        } else if fiEk == "nulstruct" {
-          // A NULLABLE-struct element (`(P | null)[]`): the loop var is a kind-9 niche carrying
-          // the element struct index; the `#l` temp is the ref-list WRAPPER (code 5).
-          fiVarIdx = forInRefArrayStructIdx(s.fiIter, fnIx)
-          fiLk = "reflist"
-        } else if fiEk == "union" {
-          // A union-box element list: the loop var is a kind-4 union box (no struct index);
-          // the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
-          fiLk = "reflist"
-        } else if (
-          fiEk == "list" ||
-          fiEk == "strlist" ||
-          fiEk == "f64list" ||
-          fiEk == "i64list" ||
-          fiEk == "f32list"
-        ) {
-          // A NESTED-ARRAY loop var — the inner LIST (kind 2/7/12/20). The `#l` temp is the
-          // OUTER ref-list WRAPPER (code 5); each element is the inner list wrapper ref.
-          fiLk = "reflist"
-        } else if fiEk == "closure" {
-          // A CLOSURE element (`((i32) => i32)[]`): the loop var is a kind-14 closure (no struct
-          // index); the `#l` temp is the ref-list WRAPPER (code 5), like the struct case.
-          fiLk = "reflist"
-        } else if fiEk == "reflist" {
-          // A NESTED REF array (`S[][]`): the loop var is the inner REF LIST (kind 5) carrying its
-          // ref-list slot; the `#l` temp is the OUTER ref-list wrapper (code 5).
-          const fiOuter = refListSlotOfExpr(s.fiIter, fnIx)
-          fiVarIdx = rlElemInnerSlot(fiOuter)
-          fiLk = "reflist"
-        } else if fiEk == "str" {
-          fiLk = "strlist"
-        } else if fiEk == "f64" {
-          fiLk = "f64list" // f64 element → f64-list `#l` temp
-        } else if fiEk == "i64" {
-          fiLk = "i64list" // i64 element → i64-list `#l` temp
-        } else if fiEk == "f32" {
-          fiLk = "f32list" // f32 element → f32-list `#l` temp
-        }
-        // A STRING iterable (`for ch in s`): the `#l` temp holds the string itself (code 3, the
-        // raw `(ref $aTypeIdx)` array), not an i32-list wrapper. The loop var stays code 0 (i32).
-        if fiEk == "i32" && forInStringSrc(s.fiIter, fnIx) { fiLk = "str" }
-        const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
-        // A literal-union array (`for k in xs`, `xs: K[]`): the loop var is an i32 atom (kind 0),
-        // but flag it so `k`-as-atom (print widening, `==`, member compare) is recognized.
-        if nodeArrayElemIsLitUnion(s.fiIter) { localLitUnion[fiSlot] = 1 }
-        markLoopVarSlot(fiSlot)
-        scopeBind(s.fiVar, fiSlot)
-        addLocalName(s.fiVar + "#i", "i32", -1)
-        let fiLs = -1
-        if (
-          fiEk == "struct" ||
-          fiEk == "union" ||
-          fiEk == "nulstruct" ||
-          fiEk == "list" ||
-          fiEk == "strlist" ||
-          fiEk == "f64list" ||
-          fiEk == "i64list" ||
-          fiEk == "f32list" ||
-          fiEk == "closure" ||
-          fiEk == "reflist"
-        ) {
-          const fiMvs = forInMapValsSlot(s.fiIter, fnIx)
-          if fiMvs >= 0 {
-            fiLs = mvRlSlot[fiMvs]
-          } else {
-            fiLs = refListSlotOfExpr(s.fiIter, fnIx)
-          }
-        }
-        addLocalName(s.fiVar + "#l", fiLk, fiLs)
         if collectLocals(s.fiBody, fnIx) < 0 {
           scopePop()
           return -1
