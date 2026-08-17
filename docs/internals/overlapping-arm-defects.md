@@ -264,7 +264,7 @@ any program with no `new` declaration.
 |---|---:|---|---|
 | ~~**struct arms, same field NAMES, i32-vs-boolean field types**~~ | ~~3~~ | RUN-WRONG | **CLOSED — see the section at the end of this file. The filed mechanism was right and the filed SCOPE was too small.** |
 | **struct arms, same shape, width-subtype, or a named twin** | 3 | EMIT-REJECT | already loud; a clean checker diagnostic would be an improvement, not a defect closure |
-| **function-type arms** (arity / param / return differ) | 3 RUN-WRONG + 1 EMIT-REJECT | RUN-WRONG | unprobed mechanism; the closure fat-pointer's arm tag is a separate table from the value-atom tags this slice touched |
+| ~~**function-type arms** (arity / param / return differ)~~ | ~~3 RUN-WRONG + 1 EMIT-REJECT~~ | RUN-WRONG | **MEASURED — see the D6 section at the end of this file. The population is 72 of 380, and the "separate table" note is refuted by the disassembly: a function type is slot 11 of the shared value-atom band.** |
 | **literal-union shapes #1340 did not reach** | 5 | RUN-WRONG | `is K` answers FALSE where #1340's membership test should fire: a NUMERIC literal union beside `i32`/`f64`, two literal unions sharing a member, and the INLINE (unaliased) spelling beside `string`. The gate is `nameIsLitUnionArmValueUnion` on the union NAME — the closest thing to a ready template in the tree, and the population most likely to close with #1340's own shape |
 
 One grid oracle was corrected while measuring: three P5 cells were written expecting `is K` and
@@ -734,3 +734,189 @@ grep from `emitStrValue`, and finding a direction that already exists tells you 
 an arm and not a rep change. The alternative reading of the same symptom — "make the `A` slot hold a
 string" — is a rep change, and it is refuted by the destinations: a `K` parameter, field, element and
 return all have their rep fixed by a signature the binding cannot influence.*
+
+
+---
+
+## D6 (function-type union arms) is MEASURED — the population is 72, and the filed mechanism is refuted by the disassembly
+
+The "still open" table above files this as **4 cells** (*"3 RUN-WRONG + 1 EMIT-REJECT"*) with the
+note *"the closure fat-pointer's arm tag is a separate table from the value-atom tags this slice
+touched"*. Re-gridded from scratch on master @`dfd93627` with a seed refreshed from that source:
+**380 cells, 72 RUN-WRONG, 19 EMIT-REJECT, 2 INVALID-WASM, 287 RUN-OK**, plus a **36-cell control
+grid** that decides which of the non-RUN-OK cells are about functions at all.
+
+Both halves of the filing are wrong in the direction this document keeps recording. The population
+is **18x** the filed number, and the arm tag is **not a separate table** — it is slot 11 of the same
+`scalarTagOfKind` band every other value atom uses.
+
+### The defect, in one sentence
+
+**A union may carry any number of function-typed arms, and they all share ONE box tag**, so `x is F`
+answers TRUE for a value built through *any* function arm — including a closure whose signature the
+checker refuses to assign to `F` one line away.
+
+```vl
+type F = (i32) => i32
+type G = (string) => i32
+function probe(x: F | G) {
+  if x is F { const y: F = x }   // TAKEN for a G value. `vl check` rc 0, `vl build` rc 0
+  0
+}
+probe((s: string) => 7)
+```
+
+The inverted control is one line and it is the whole argument: `function m(g: G) { const y: F = g }`
+is `vl check` rc 1 — *`cannot assign (string) -> i32 to 'y' of type (i32) -> i32`*. The union + `is`
+route manufactures exactly the assignment the checker refuses, which is **ROOT B**, live, for a
+population ROOT B's own sweep never reached.
+
+### The population — measured on master's seed
+
+**Two function-typed arms: 158 cells, 72 RUN-WRONG, 86 masked.** The 86 are the constructions that
+happen to agree; every one of them has an inverted twin in the same row that is RUN-WRONG, so by this
+family's standing rule not one of them is a cell the shape decides correctly. `is F` over a union
+with a second function arm is a **constant TRUE**, in both directions (`is G` over the same union is
+also constant TRUE — its own 7 cells) and for every arm count.
+
+| union | tested | fn build | other build | cells |
+|---|---|---|---|---|
+| `F \| G` (param type differs) | `F` | ok | **WRONG** | 44 |
+| `F \| G` (param type differs) | `G` | **WRONG** | ok | 14 |
+| `F \| H` (**arity** differs) | `F` | ok | **WRONG** | 22 |
+| `F \| J` (**return** differs) | `F` | ok | **WRONG** | 22 |
+| `F \| K0` (**zero-arity**) | `F` | ok | **WRONG** | 14 |
+| `F \| G \| string` | `F` | ok | **WRONG** (string arm ok) | 21 |
+| `F \| G \| null` | `F` | ok | **WRONG** (null arm ok) | 21 |
+
+**Every partner arm that reps differently is CORRECT — 161 of 166 cells.** `F | string`, `F | i32`,
+`F | i64`, `F | f64`, `F | boolean`, `F | i32[]`, `F | string[]`, `F | {a: i32}`, `F | null`,
+`F | string | i32`: RUN-OK on both constructions, every receiver, both spellings. (The 5 that are
+not are all proven non-function-specific below.) `F | {[string]: i32}` is the known loud *"a map
+value is not a supported union member"*.
+
+**Closure ARRAYS discriminate, and that is the finding that identifies the mechanism.** `F[] | G[]`
+answers correctly at the local / param / call receivers — the element signature reaches the tag even
+though a bare closure arm's cannot.
+
+### Two axes that do NOT multiply this population, and one that does not exist
+
+- **Receiver: FLAT across all 11 forms** — local `const`, `let`, parameter, module global, struct
+  field, nested field `s.g.f`, array element, direct map read, bound map read, call result, optional
+  chain. Every one of them grades identically for every shape. This is the opposite of D1b, where the
+  receiver axis turned 1 filed cell into 16, and the reason is structural: D1b's receiver axis existed
+  because the litunion MEMBERSHIP arm carries a receiver bound (`unionEqOperandOk`). A function tested
+  type reaches no membership arm at all — `tyLitMemberTexts` and `numLitUnionBaseName` are both empty
+  for a `TyFunc` — so every receiver falls to the one tag compare and gets the same wrong constant.
+- **Spelling: FLAT.** The alias `type F = (i32) => i32` and the inline `(i32) => i32` grade identically
+  in all 66 paired cells. The one-member-`TyUnion` wrapper an arrow-bodied alias carries
+  (`tyDenotesFunc`'s subject) does not reach this answer.
+- **No `vl check` arm.** Not one cell in the whole 380 is CHECK-REJECT. The checker accepts every
+  union with two function arms and every `is` over one.
+
+### The mechanism, from the disassembly
+
+`vl build` + `wasm-tools print` on `F | G` at a parameter receiver, the value built through `G`:
+
+```wat
+(type (;0;) (struct (field i32) (field anyref)))          ;; the union box
+(type (;2;) (struct (field structref) (field i32)))       ;; the closure fat pointer: {env, table idx}
+
+;; the G closure, boxed:                    ;; `x is F`:
+ref.null struct                             local.get 1
+i32.const 11        ;; <- the box TAG       struct.get 0 0
+ref.null struct                             i32.const 11   ;; <- the SAME tag
+i32.const 5         ;; the table index      i32.eq
+struct.new 2
+struct.new 0
+```
+
+Both sides are `11`, and the source says why in one line: `unMemAtomKind`
+(`emit_classify.vl`) answers **`if t is TyFunc { return 11 }`** for every function type whatever its
+signature, and `scalarTagOfKind(k) = uVariants.length + k` (`emit_rep.vl`) is the tag. That is the
+value-atom band — the same table `string` (kind 2), `i32` (kind 0) and `null` (kind 6) take, which is
+why every non-function partner arm above is correct. **There is no separate closure table, and the
+fat pointer carries no signature discriminant**: it is `{env, table index}`, two fields, and the
+`$fnsig` interning that knows the signature is a compile-time key for `call_indirect`, not a stored
+value.
+
+**The one table that IS separate is the reflist band, and it works.** For `F[] | G[]` the same
+disassembly shows tag **13** vs tag **15** — `refArrSlotTag(slot) = uVariants.length + 13 + slot*2`,
+and *"a distinct element type interns a distinct reflist slot"*. So the emitter can and does
+distinguish two closure signatures when they arrive as ELEMENT types; the information exists at emit
+time and only the bare-arm tag throws it away.
+
+### What the wrong answer costs at run time — and where it stops being loud
+
+Calling the mis-narrowed value **traps**: `wasm trap: indirect call type mismatch`, because
+`call_indirect` re-checks the signature the table slot actually holds. That is the loud half.
+
+The silent half is everything short of a call, and it is unbounded:
+
+```vl
+if x is F {          // x is a (string) => i32
+  const y: F = x     // prints nothing, no diagnostic
+  const arr: F[] = [y]
+  print(arr.length)  // 1
+}
+```
+
+`vl check` rc 0, `vl run` rc 0, output `1`. The wrong-signature closure is now inside an `F[]`, and
+the fault surfaces at whatever later call reads it out — or never.
+
+### What is NOT D6 — each decided by a control, not by inspection
+
+The 36-cell control grid re-runs the two receiver forms that failed for a function union against nine
+**non-function** unions. It moves three findings out of this family:
+
+| symptom | function cells | the control that moves it out |
+|---|---:|---|
+| `s?.f is T` over an OPTIONAL CHAIN answers a constant FALSE | 5 | `s?.f is string` over `{f: string \| null}` with `f = "hi"` prints **no**. Same for `i32[] \| null` and `string[] \| i32[]`. `i32 \| null`, `f64 \| null`, `string \| i32`, `i32[] \| string` are fine — the failing column is the NICHE nullable and the ref-element array, not the function |
+| a bound map read `const r = mp[k]` | 2 INVALID-WASM | **the `is` is not involved.** Deleting the guard entirely still emits invalid wasm: `{[string]: F \| null}` with only `null` ever stored mints a duplicate array type (`expected (ref null $type), found (ref null $type)`, two distinct indices printing the same name). A map REP hole. Its non-function twins are EMIT-REJECT (`i32[] \| null`, `string[] \| i32[]`) and RUN-WRONG (`string \| null`) |
+| `F \| F2`, two aliases with the SAME signature | 12 EMIT-REJECT + 2 RUN-WRONG | `type A = i32; type B = i32; x: A \| B` → `x is A` prints **notA**, silently. VL is structurally typed, so both unions collapse to one member and `is` should be trivially TRUE. The degenerate one-member union is a general shape, and the FUNCTION spelling is the loud one (*``is` test but no union type declared`*) while the scalar spelling is the silent one |
+
+`F[] | G[]` at a struct-field / array-element / map-value receiver is 6 EMIT-REJECT, and the
+`string[] | i32[]` control rejects at the same receivers — the general ref-array-arm limit, not this
+family.
+
+### Did this cycle's sibling work move any cell? No, and the disassembly is why
+
+The two mechanisms to check were named up front: #1340's membership ladder in `emitIs`, and #1380's
+widening of `unionEqOperandOk` from *"is Ident"* to *"is a place"*. **Function arms share neither**,
+and the emitted bytes say so rather than the reasoning: the lowering for `x is F` is the bare
+`struct.get 0 0 / i32.const 11 / i32.eq`, so no membership arm fired. Both arms are gated on a tested
+type with literal MEMBERS (`tyLitMemberTexts`, `tyNumLitMemberTexts`), and a `TyFunc` has none — it
+is not that the arms decline this shape, it is that the shape is not a candidate. That is also the
+structural reason the receiver axis is flat here and was 16 cells wide for D1b: `unionEqOperandOk`
+only ever bounded the membership arms.
+
+### Why this is filed rather than fixed
+
+Two answers exist and neither is small:
+
+- **The real lowering** is membership over the fat pointer's TABLE INDEX — `idx == s0 || idx == s1 ||
+  …` over the slots whose function carries `F`'s signature, which is #1340's shape one layer out. The
+  emitter has the signature (the reflist band proves it) but the elem segment is not final when a body
+  is emitted, so this needs a deferred patch, not an arm.
+- **The rep answer** is a third fat-pointer field, or a `$fnsig` id in the box tag. That is a closure
+  struct layout change, which the agent playbook rules out by name.
+
+The **loud floor** — reject `is <function type>` when the union carries two function arms, the shape
+`unionStrArmCount > 1` already ships for the string side — is the cheap option and its blast radius is
+measured: **zero corpus files**. No file under `tests/cases` declares a union with two function-typed
+arms (checked by scanning every arrow-bearing type alias and every parenthesised union arm; the
+matches are all arrow types whose RETURN is a union). It is left unbuilt here because a census was the
+ask and because it costs the 86 masked-correct cells their compile, which is a reject-parity decision
+rather than a ride-along.
+
+Pinned in the meantime by `tests/cases/closures/is-function-arm-partner-discrimination.vl` — the 14
+rows of the CORRECT half, one per partner arm plus the two closure-array rows, so a future fix cannot
+buy the two-fn-arm case by breaking the arms that already discriminate.
+
+*Method note this census adds: **when a filing says "a separate table", read which table the tag comes
+from before believing either half of that sentence.** The note was right that a mechanism it had not
+probed was involved and wrong about which — the closure arm is in the SAME band as every other atom,
+and the genuinely separate table (the reflist band) is the one place the defect does NOT reproduce. It
+is the CORRECT column that named the mechanism, exactly as D1b's `K | i32` column did: `F[] | G[]`
+answering right is what proves the emitter holds the signature and that only the bare arm's tag
+discards it.*
