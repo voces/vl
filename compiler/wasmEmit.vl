@@ -2063,6 +2063,42 @@ function emitNumLitEq(body: i32[], recvIx: i32, lv: string, fnIx: i32) {
   return 0
 }
 
+// The base numeric scalar an `is` RECEIVER reps as IN THIS INSTANCE — `"i32"` / `"i64"` /
+// `"f64"`, or "" for anything else. THE ONE HOME for the receiver half of the
+// numeric-litunion membership test, because that half is what keeps a receiver off a member
+// set of a rep it does not share.
+//
+// TWO CHANNELS, BECAUSE ONE ORDINARY RECEIVER HAS NO BANKED TYPE AT ALL.
+// `nodeNumScalarBaseName` reads the type the CHECKER banked at the node, which answers for
+// every ANNOTATED receiver including the mixed `K | i32` / `K | f64` spellings that collapse
+// to one scalar. An UN-ANNOTATED parameter is pinned by `monoArgTyName`'s `"i32"` catch-all,
+// the one arm of the pin that deliberately mints NO annotation node — so the bank has
+// nothing to answer from, this predicate's first channel said "", the whole membership arm
+// declined, and the guard fell to `monoStaticIsResult`, which CONST-FOLDS a literal tested
+// type to FALSE. `function g(u) { if u is Z { … } }` took the wrong branch with `vl check`
+// rc 0 while the `u: i32` twin of the same program was correct one line away.
+//
+// The second channel is `monoArgTyName` — the emitter's own `fnIx`-SCOPED name for the
+// receiver, and the SAME function the fold reads. Sharing it is what makes this arm claim
+// exactly the receivers the fold would otherwise decide, per INSTANCE: one `v is Z` node in
+// a `g<T>(v: T)` body is emitted once per instance, and an instance pinned to `string` / a
+// struct / a list is named by its own rep and declines here. Gating on the node's banked
+// type alone cannot see an instance at all — the whole point of #1409/#1419's discipline.
+//
+// A NULLABLE receiver is refused on the same line and for the same reason
+// `monoStaticIsResult` refuses one: `monoArgTyName` names a nullable value by its NON-NULL
+// base, so a `K | null` numeric litunion would present as the plain `i32` its sentinel
+// encoding is not. Those keep the loud floor rather than a membership ladder emitted over a
+// sentinel this arm has no lowering for.
+function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
+  const nb = nodeNumScalarBaseName(recvIx)
+  if nb != "" { return nb }
+  if nodeTyIsNullable(recvIx) { return "" }
+  const mn = monoArgTyName(recvIx, fnIx)
+  if mn == "i32" || mn == "i64" || mn == "f64" { return mn }
+  ""
+}
+
 // The value-union NAME of an `is` RECEIVER, for the box-tag soundness floor in `emitIs`.
 // `unionNameOfExpr` covers every receiver form the tag compare has an arm for EXCEPT the
 // optional chain — `x?.y is i32` reads its field through `optChainStructIdxOf` rather than
@@ -2690,8 +2726,8 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   //
   // BOTH BASES ARE CHECKED AND THEY MUST AGREE. The tested type's base is
   // `numLitUnionBaseName` (all-`TyLit`, homogeneous); the RECEIVER's is
-  // `nodeNumScalarBaseName`, which also claims the mixed `K | i32` / `K | f64` spellings the
-  // tested side never carries. Without the receiver half a monomorphized `g<T>(v: T)`
+  // `isNumRecvBaseName`, whose header carries why the receiver half needs two channels and
+  // what each one claims. Without the receiver half a monomorphized `g<T>(v: T)`
   // instance pinned to `string` would take this arm and compare a string ref with
   // `i32.eq` — invalid wasm traded for a wrong answer, the trap the string sibling's
   // filing walked into by asserting a rep instead of reading it. It is also what keeps an
@@ -2707,7 +2743,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   if nd0 is IsExpr {
     if !exprUnion(nd0.isObj, fnIx) {
       const nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
-      if nlBase != "" && nodeNumScalarBaseName(nd0.isObj) == nlBase {
+      if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
         const nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
         // Two or more members RE-READ the receiver, so those need a re-readable place
         // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and
@@ -7949,9 +7985,14 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const isNe = e.binOp == "!="
-    // Eval both operands, then stash (B on top → set B first).
-    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+    // Eval both operands, then stash (B on top → set B first). A literal-union ATOM operand
+    // widens to its member string first (`emitStrValue`) — the same boundary handling
+    // `emitStrConcat` one function up already applies, and the reason `s == k` with `s:
+    // string` and `k: K` is a string compare rather than the atom `i32.eq` (see
+    // `eqAtomOperandOk`). The widen stages the id in the string-op scratch frame, which this
+    // compare's own `exprIsStrEq` already reserves through `exprHasStrOp`.
+    if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
     if emitStrEqCore(body) < 0 { return -1 }
     if isNe {
       fbI32Eqz() // 0x45 i32.eqz  (`!=` negates value-equality)
@@ -15150,6 +15191,27 @@ function strReppedLitUnionAt(ix: i32, fnIx: i32) {
   nodeTyIsLitUnion(av)
 }
 
+// True when `ix` can be lowered in ATOM context — as the interned i32 id the litunion atom
+// `==` needs on BOTH of its sides. The three atom-lowerable shapes are exactly the three
+// `emitExprExpect`'s `litUnion` context has an answer for: an atom-repped expression
+// (`exprIsLitAtom`), a member string LITERAL (whose id the `StrLit` arm folds at compile
+// time), and a string-repped litunion (`strReppedLitUnionAt` → `emitStrToAtom`).
+//
+// A PLAIN `string` IS NOT ONE OF THEM, AND THE MISSING DIRECTION IS UNSOUND RATHER THAN
+// UNIMPLEMENTED. `emitStrToAtom`'s tower makes the LAST member the unconditional default
+// because membership is checker-guaranteed for a litunion value — which is precisely what a
+// plain `string` does not carry. Narrowing `u: string` holding `"z"` would hand back the last
+// member's id and answer `u == kk` TRUE against that member: a silent wrong answer traded for
+// invalid wasm. So the mixed pair is refused here and lowered the other way round, by widening
+// the ATOM to its member string (`emitStrValue`), which is total in the direction it runs.
+function eqAtomOperandOk(ix: i32, fnIx: i32) {
+  if exprIsLitAtom(ix, fnIx) { return true }
+  const av = unwrapParen(ix)
+  const e = P.nodes[av]
+  if e is StrLit { return true }
+  nodeTyIsLitUnion(av)
+}
+
 function emitNumLitNode(_body: i32[], e: NumLit, exprIx: i32, fnIx: i32) {
   // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`pendingF32` — an `: f32`
   // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
@@ -15847,6 +15909,14 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // A literal-union ATOM compare (`k == "a"`, `k1 == k2`): both operands are i32 ids. Emit them as atoms
   // (a member StrLit -> its id; a litunion var -> its i32 value) and i32-compare. BEFORE the string-eq
   // path, which would otherwise treat the member literal as a string.
+  //
+  // ONE ATOM OPERAND IS NOT ENOUGH — BOTH SIDES HAVE TO BE ATOM-LOWERABLE
+  // (`eqAtomOperandOk`, whose header carries which shapes are and why the missing one cannot
+  // be narrowed into the set). `u == kk` with `u: string` and `kk: K` is an ordinary program
+  // the checker accepts, and forcing the atom context on it pushed a `(ref $array)` under
+  // this `i32.eq`. A mixed pair falls through to the string-eq path below, which widens the
+  // ATOM to its member string (`emitStrValue`) — the direction the `is` spelling of the same
+  // question already takes.
   if e.binOp == "==" || e.binOp == "!=" {
     // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
     // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
@@ -15856,15 +15926,19 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if P.nodes[unwrapParen(e.binRight)] is NullLit { atomNull = true }
     if !atomNull {
       if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-        const luCtx = expCtxHere()
-        luCtx.litUnion = 1
-        if emitExprExpect(body, e.binLeft, fnIx, luCtx) < 0 { return -1 }
-        if emitExprExpect(body, e.binRight, fnIx, luCtx) < 0 { return -1 }
-        fbI32Bin(70) // 0x46 i32.eq
-        if e.binOp == "!=" {
-          fbI32Eqz() // 0x45 i32.eqz -> `!=`
+        if (
+          eqAtomOperandOk(e.binLeft, fnIx) && eqAtomOperandOk(e.binRight, fnIx)
+        ) {
+          const luCtx = expCtxHere()
+          luCtx.litUnion = 1
+          if emitExprExpect(body, e.binLeft, fnIx, luCtx) < 0 { return -1 }
+          if emitExprExpect(body, e.binRight, fnIx, luCtx) < 0 { return -1 }
+          fbI32Bin(70) // 0x46 i32.eq
+          if e.binOp == "!=" {
+            fbI32Eqz() // 0x45 i32.eqz -> `!=`
+          }
+          return 0
         }
-        return 0
       }
     }
   }
