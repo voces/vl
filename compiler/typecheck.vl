@@ -639,6 +639,35 @@ let argCstrAt: i32[] = []
 let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
 
+// SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
+// its type. A hole is permissively assignable both ways, so a usage that requires a
+// concrete type (`const r: K = u`, `return u` under a declared return, `q(u)` into an
+// annotated parameter, a `K` field / element / map value) rejects nothing in the body
+// and leaves the parameter's REP to whatever the call site's argument happened to be.
+// The two are not interchangeable: a NAMED string litunion is an interned i32 ATOM
+// while a plain `string` is a `(ref $array)`, so the correct program `p("a")` through
+// `function p(u) { const r: K = u }` emitted a module the engine rejects, and the
+// non-member `p("zz")` — which the annotated spelling rejects — passed `vl check`.
+//
+// Both directions come from one answer: SOLVE the hole to what its usage demands and
+// the parameter becomes indistinguishable from the annotated spelling — the call site
+// checks the argument against it, and the emitter's synthesized annotation
+// (`synthParamAnnots`, off `nodeTyIx`) reps it identically.
+//
+// Keyed by the parameter's HOLE NAME, which is already its identity: the pass-1 hoist
+// and `checkFuncDeclNode` mint the same name for the same parameter, so both read one
+// answer out of `unannotParamTy`.
+let solvedParamTys: {[string]: i32} = Map()
+// Declarations whose solve has been ATTEMPTED, keyed by decl node index — a body is
+// probed at most once, whether or not the probe found anything to solve.
+let paramSolveTried: {[string]: boolean} = Map()
+// Hole → concrete destination, recorded ONLY while `paramSolveProbe` is set.
+// `assignableExpr` is the one seam every binding / argument / return / field /
+// element / store flows through, so a single hook there sees every such usage.
+let holeFlowSrc: i32[] = []
+let holeFlowDst: i32[] = []
+let paramSolveProbe = false
+
 // The const-binding chain, PARALLEL to `T.scopes`: each frame records which of
 // its names were bound `const` (immutable NAME, not immutable data — a field
 // write through a const stays legal). Kept module-level (not a `Checker` field)
@@ -2310,6 +2339,11 @@ export function initChecker() {
   argCstrAt = []
   argCstrExp = []
   argCstrWho = []
+  solvedParamTys = Map()
+  paramSolveTried = Map()
+  holeFlowSrc = []
+  holeFlowDst = []
+  paramSolveProbe = false
   fnDeclIx = Map()
   opIdxOps = []
   opIdxFns = []
@@ -4505,7 +4539,13 @@ function collapseDeferredJoin(tyIx: i32) {
 // Park the UNCOLLAPSED deferred join `tyIx` under call node `nodeIx` (last write
 // wins — the checker re-walks a body once per inference pass, and the pass whose
 // witnesses reach the call site is the last one).
+// PARK a call node's uncollapsed deferred join. Never from the parameter-solve probe:
+// that probe OBSERVES a body, and this table is keyed by CALL NODE, so a probe row is not
+// the idempotent re-record the hole-NAME-keyed tables give — the real pass finds the row
+// already present and declines to re-park, which silently dropped the escaped-join reject
+// `soundness/hole-join-two-level-chain-reject.vl` pins.
 function noteDeferredJoinNode(nodeIx: i32, tyIx: i32) {
+  if paramSolveProbe { return 0 }
   if nodeIx < 0 { return 0 }
   let k = 0
   while k < dJoinNode.length {
@@ -5068,6 +5108,13 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // (writes only `nodeRepTyIx`).
     recordRepTyAdopt(srcExpr, dstTy, 6)
   }
+  // THE FLOW HOOK for the un-annotated-parameter solve. It sits ABOVE the
+  // `assignable` short-circuit because a HOLE source always returns there
+  // (`assignable` answers true for a `TyVar` immediately), so this is the only point
+  // in the function a hole reaches — and every binding / argument / return / field /
+  // element / store position flows through here, which is what makes one hook enough.
+  // Inert unless the parameter-solve probe is running.
+  noteHoleFlow(srcTy, dstTy)
   if assignable(srcTy, dstTy) { return true }
   // NOMINAL NEWTYPE (P1.5): a SYNTACTIC literal is brand-polymorphic — it adopts the
   // destination's brand (`const e: EntityId = 1`, `xs: EntityId[] = [1, 2]`). A literal
@@ -11220,6 +11267,281 @@ function noteArgCstr(at: i32, exp: i32, who: string) {
   0
 }
 
+// True when `ty` reaches an inference HOLE (a `TyVar`) anywhere in its tree — through an
+// array element, a map key/value, a struct field, a nullable inner, a union member, or a
+// function type's params/return. The FULLY-CONCRETE test the parameter solve needs, and
+// `tyIsHole`'s composite twin: a DEMANDED SHAPE (`{bar: _}`, a `TyObj` whose field is a
+// derived hole) is not a bare `TyVar`, so `tyIsHole` says no about a type that carries no
+// answer at all. Depth-bounded — a recursive struct/array type is cyclic in the arena.
+function tyReachesHole(ty: i32, depth: i32): boolean {
+  if ty < 0 { return true }
+  if depth <= 0 { return true }
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyArray { return tyReachesHole(t.aElem, depth - 1) }
+  if t is TyMap {
+    if tyReachesHole(t.mKey, depth - 1) { return true }
+    return tyReachesHole(t.mVal, depth - 1)
+  }
+  if t is TyNullable { return tyReachesHole(t.nInner, depth - 1) }
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if tyReachesHole(t.objFieldTypes[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyUnion {
+    let m = 0
+    while m < t.uMembers.length {
+      if tyReachesHole(t.uMembers[m], depth - 1) { return true }
+      m = m + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    let p = 0
+    while p < t.fnParamTypes.length {
+      if tyReachesHole(t.fnParamTypes[p], depth - 1) { return true }
+      p = p + 1
+    }
+    if t.fnRet == -2 { return true }
+    return tyReachesHole(t.fnRet, depth - 1)
+  }
+  false
+}
+
+// Record a hole's FLOW into a concrete destination while the parameter-solve probe
+// runs (see `solvedParamTys`). The destination must be FULLY CONCRETE: a deferred join,
+// `never`, an error, or anything reaching a `TyVar` carries no answer to solve to, so it
+// is not recorded and the parameter stays a hole, behaving exactly as before.
+//
+// The composite case is the load-bearing half. A hole's DEMANDED SHAPE (`{bar: _}`,
+// accumulated from `v.bar` inside a relay body) is a `TyObj` — not a bare `TyVar` — so it
+// passes `tyIsHole`, and adopting it as the solution turned the working relay program
+// `relay({foo: "RF"})` into "expected {bar: _}, got {foo: string}". A demanded shape is a
+// LOWER BOUND collected from usage, never a type the parameter must equal.
+function noteHoleFlow(src: i32, dst: i32) {
+  if !paramSolveProbe { return 0 }
+  noteHoleFlowGo(src, dst, 6)
+}
+
+// The parallel src/dst walk `noteHoleFlow` records through. A BARE hole meeting a concrete
+// destination is the answer; a COMPOSITE source carrying the hole is descended into against
+// the SAME position of the destination, so `{f: u}` into a `{f: K}` field, `[u]` into a
+// `K[]` element and a `K`-valued map store each reach the hole they actually constrain.
+// Without the descent the composite source short-circuits `assignable` whole (an element
+// hole is assignable to anything) and the per-position flow is never asked.
+//
+// Only MATCHING shapes descend, and only by field NAME for a struct: a mismatch is a
+// diagnostic the caller is about to report, not a constraint to adopt.
+function noteHoleFlowGo(src: i32, dst: i32, depth: i32) {
+  if depth <= 0 { return 0 }
+  if src < 0 || dst < 0 { return 0 }
+  if tyIsHole(src) {
+    if tyIsDeferredJoin(dst) { return 0 }
+    if isNeverTy(dst) { return 0 }
+    if tyReachesHole(dst, 8) { return 0 }
+    const dt = T.tys[dst]
+    if dt is TyErr { return 0 }
+    holeFlowSrc.push(src)
+    holeFlowDst.push(dst)
+    return 0
+  }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray { return noteHoleFlowGo(s.aElem, d.aElem, depth - 1) }
+    return 0
+  }
+  if s is TyMap {
+    if d is TyMap { return noteHoleFlowGo(s.mVal, d.mVal, depth - 1) }
+    return 0
+  }
+  if s is TyNullable {
+    if d is TyNullable { return noteHoleFlowGo(s.nInner, d.nInner, depth - 1) }
+    return 0
+  }
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < s.objFieldNames.length {
+        let j = 0
+        while j < d.objFieldNames.length {
+          if d.objFieldNames[j] == s.objFieldNames[i] {
+            noteHoleFlowGo(s.objFieldTypes[i], d.objFieldTypes[j], depth - 1)
+          }
+          j = j + 1
+        }
+        i = i + 1
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// The HOLE NAME of parameter `pi` — the parameter's identity across the pass-1 hoist,
+// the body check and the solve table. A NAMED function keys on its name and position
+// (so the hoisted signature and the body bind the identical hole); an anonymous
+// lambda has no name and keys on its node index instead.
+function paramHoleName(fnName: string, fnIx: i32, pi: i32) {
+  if fnName != "" { return "?" + fnName + "." + i32ToStr(pi) }
+  "?#L" + i32ToStr(fnIx) + "." + i32ToStr(pi)
+}
+
+// THE type an un-annotated parameter takes — the SINGLE source of truth. A parameter
+// its own body pinned takes that type, exactly as if it had been annotated; one
+// nothing pinned takes a fresh inference hole. Every producer goes through here — the
+// pass-1 signature hoist, `checkFuncDeclNode`, and through the `nodeTyIx` the latter
+// records, the emitter's synthesized annotation — so no two of them can drift.
+function unannotParamTy(holeName: string) {
+  const s = solvedParamTys[holeName] ?? -1
+  if s >= 0 { return s }
+  mkTyVar(holeName)
+}
+
+// Is `name` the hole name of one of `fnIx`'s own parameters? A probe's body reaches
+// other functions' holes too (a callee's un-annotated parameter, a nested function's),
+// and those are not this declaration's to solve.
+function holeNameIsParamOf(
+  name: string,
+  fnName: string,
+  fnIx: i32,
+  nParams: i32,
+) {
+  let k = 0
+  while k < nParams {
+    if paramHoleName(fnName, fnIx, k) == name { return true }
+    k = k + 1
+  }
+  false
+}
+
+// Solve every un-annotated parameter of top-level function `fnIx` from its body's
+// usage: probe the body once with diagnostics, symbols and the redundant-type stream
+// suppressed, then read the flow constraints its holes accumulated and record the
+// FIRST concrete destination per parameter.
+//
+// A SECOND, DISAGREEING usage (`const r1: string = u   const r2: i32 = u`) is
+// deliberately not merged here. The real pass now checks the body against the solved
+// type, so the second usage rejects there — the same reject, at the same position,
+// that the annotated spelling has always produced.
+//
+// Attempted at most once per declaration and never re-entered from inside a probe.
+// Only a TOP-LEVEL `function` is probed, from pass 1.8, which is what makes the
+// answer independent of source order: it lands before any expression is checked, so a
+// call ABOVE the declaration sees the solved parameter too. (A top-level `function` is
+// a statement, never an expression, so it can carry no contextual callback type for
+// the solve to contradict — `cbExpectedFor` is keyed by a seeded lambda node.)
+function solveUnannotParams(fnIx: i32) {
+  if paramSolveProbe { return 0 }
+  const key = i32ToStr(fnIx)
+  if paramSolveTried[key] ?? false { return 0 }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    const ps = fd.fnParams
+    let anyHole = false
+    let pi = 0
+    while pi < ps.length {
+      const pn = P.nodes[ps[pi]]
+      if pn is Param {
+        if pn.parType < 0 {
+          if (solvedParamTys[paramHoleName(fd.fnName, fnIx, pi)] ?? -1) < 0 {
+            anyHole = true
+          }
+        }
+      }
+      pi = pi + 1
+    }
+    if !anyHole { return 0 }
+    paramSolveTried[key] = true
+    // The saves mirror `inferReturnsPrePass` — the established shape for a quiet body
+    // re-check — plus the two deferred-constraint tables, whose rows the real pass
+    // re-records for itself and which would otherwise be adjudicated twice.
+    const savedDiag = T.diags.length
+    const savedSym = symEnabled
+    const savedRedun = redunName.length
+    const savedQuiet = inferQuiet
+    const savedBinN = binCstrOp.length
+    const savedArgN = argCstrAt.length
+    const savedJoinN = dJoinNode.length
+    const nFlow = holeFlowSrc.length
+    symEnabled = 0
+    inferQuiet = true
+    paramSolveProbe = true
+    checkFuncDeclNode(fd, fnIx)
+    paramSolveProbe = false
+    inferQuiet = savedQuiet
+    symEnabled = savedSym
+    while T.diags.length > savedDiag { T.diags.pop() }
+    redunTruncate(savedRedun)
+    while binCstrOp.length > savedBinN {
+      binCstrLt.pop()
+      binCstrOp.pop()
+      binCstrRt.pop()
+    }
+    while argCstrAt.length > savedArgN {
+      argCstrAt.pop()
+      argCstrExp.pop()
+      argCstrWho.pop()
+    }
+    // The PARKED deferred joins too, and this one is keyed by CALL NODE rather than by
+    // hole name — so a probe's row is not the idempotent re-record the name-keyed tables
+    // give, it is a row the real pass then finds already present and declines to re-park.
+    // That silently dropped the escaped-join reject at `goUnion(1)` in
+    // `soundness/hole-join-two-level-chain-reject.vl`: a program that must reject, and did.
+    while dJoinNode.length > savedJoinN {
+      dJoinNode.pop()
+      dJoinTy.pop()
+    }
+    let fi = nFlow
+    while fi < holeFlowSrc.length {
+      const st = T.tys[holeFlowSrc[fi]]
+      if st is TyVar {
+        if (solvedParamTys[st.tvName] ?? -1) < 0 {
+          if holeNameIsParamOf(st.tvName, fd.fnName, fnIx, ps.length) {
+            solvedParamTys[st.tvName] = holeFlowDst[fi]
+          }
+        }
+      }
+      fi = fi + 1
+    }
+    while holeFlowSrc.length > nFlow {
+      holeFlowSrc.pop()
+      holeFlowDst.pop()
+    }
+    // Patch the hoisted TyFunc IN PLACE so a call checked before pass 2 reaches this
+    // declaration binds the solved parameter — the same in-place patch the inferred
+    // RETURN makes, for the same reason. Gated on this node BEING the registered
+    // top-level declaration (the same guard `bodyChecked` carries): a NESTED namesake
+    // is not hoisted, and `lookup` would hand it the OUTER function's signature to
+    // corrupt.
+    if fd.fnName != "" && (fnDeclIx[fd.fnName] ?? -1) == fnIx {
+      const bound = lookup(fd.fnName)
+      if bound >= 0 {
+        const bt = T.tys[bound]
+        if bt is TyFunc {
+          const bpt = bt.fnParamTypes
+          let k = 0
+          while k < ps.length {
+            if k < bpt.length {
+              const sv = solvedParamTys[paramHoleName(fd.fnName, fnIx, k)] ?? -1
+              if sv >= 0 {
+                bpt[k] = sv
+                tyMutEpoch = tyMutEpoch + 1 // solved parameter patched in place
+              }
+            }
+            k = k + 1
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
 // Record a DEFERRED JOIN that escaped call `ix` to callee `who` lossily (the collapse
 // kept one arm and dropped the rest because the join still named unpinned holes).
 // Idempotent per (ty, ix). Never recorded from a QUIET probe body — a probe's tables
@@ -13992,9 +14314,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       cycleBreakCount = cycleBreakCount + 1
       return TY_VOID
     }
-    if inferQuiet {
+    if inferQuiet && !paramSolveProbe {
       // Suppressed pre-pass: memoize a resolved return (a `-2` reset by the fixpoint
-      // forces a fresh re-inference).
+      // forces a fresh re-inference). The PARAMETER-solve probe never takes the memo:
+      // it needs the body walked for the flow constraints, not the return.
       const hoisted = lookup(n.fnName)
       if hoisted >= 0 {
         if (fnDeclIx[n.fnName] ?? -1) >= 0 {
@@ -14014,6 +14337,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       }
     }
   }
+  // Solve this declaration's un-annotated parameters from its body usage. A no-op for a
+  // TOP-LEVEL function (pass 1.6 already did it, order-independently) and inside a probe;
+  // this reach is the NESTED `function` and the value-bound lambda, neither of which is
+  // hoisted, so their first observer IS this call. A parameter the receiver already pinned
+  // contextually is not a hole when the probe runs, so it records no flow and the
+  // `cbExpect` branch below still wins — one answer, not two.
+  solveUnannotParams(fnIx)
   const params = n.fnParams
   // The contextual expected param types recorded for THIS lambda node (`seedExpected` at a
   // call arg, a `.map`/`.filter` receiver, or an annotated let/return/field/element). Keyed by
@@ -14056,14 +14386,15 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // per-call `bNames`/`bTys`), mirroring the host's per-callsite
         // `instantiateFunctionType`; the emitter then monomorphizes one wasm
         // instance per distinct shape. Inside the body the hole is opaque
-        // (assignable both ways), exactly like an explicit `<T>` param.
-        pt = mkTyVar("?" + n.fnName + "." + i32ToStr(pi))
+        // (assignable both ways), exactly like an explicit `<T>` param — UNLESS the
+        // body's own usage pinned it, which `unannotParamTy` is the one place to say.
+        pt = unannotParamTy(paramHoleName(n.fnName, fnIx, pi))
       } else if isValBindLambda(fnIx) {
         // A lambda bound to an UN-annotated `const`/`let` (`const add = (a, b) => a + b`): its
         // un-annotated param is a fresh inference HOLE, exactly like a named function's — the
         // emitter value-flow-monomorphizes one instance per call shape (env and all). Keyed by NODE
         // index (the lambda is anonymous), the dual of the named branch above.
-        pt = mkTyVar("?#L" + i32ToStr(fnIx) + "." + i32ToStr(pi))
+        pt = unannotParamTy(paramHoleName("", fnIx, pi))
       } else {
         // An ANONYMOUS literal with no annotation and no contextual type is genuinely uninferable —
         // its value-typed binding demands a concrete signature NOW (host parity).
@@ -14878,7 +15209,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     // Patch the hoisted TyFunc IN PLACE so existing references see the result;
     // a nested (un-hoisted) NAMED function declares fresh; an anonymous lambda
     // just carries its type as the expression value.
-    if n.fnName != "" {
+    // The parameter-solve probe OBSERVES this body; it must not DECIDE the return.
+    // Patching (or re-declaring) the hoisted signature here would hand pass 1.7's
+    // return inference an already-resolved return, so it would never re-derive it
+    // against the parameters pass 1.6 just solved.
+    if n.fnName != "" && !paramSolveProbe {
       const bound = lookup(n.fnName)
       let patched = false
       if bound >= 0 {
@@ -15598,8 +15933,12 @@ function checkProgramNode(n: Program) {
           } else {
             // An un-annotated param hoists as its inference HOLE (the same
             // declaration+position name `checkFuncDeclNode` mints, so a
-            // forward call site binds the identical hole by name).
-            t = mkTyVar("?" + s.fnName + "." + i32ToStr(k))
+            // forward call site binds the identical hole by name) — or as the type
+            // pass 1.8's solve pinned it to, which `unannotParamTy` decides for both
+            // this hoist and the body so they cannot disagree. (Pass 1.8 runs AFTER
+            // this hoist and patches the signature it builds here in place; the call
+            // through `unannotParamTy` is what keeps a RE-hoist consistent.)
+            t = unannotParamTy(paramHoleName(s.fnName, stmts[hi], k))
           }
         }
         hpt.push(t)
@@ -15714,6 +16053,16 @@ function checkProgramNode(n: Program) {
       }
     }
     mi = mi + 1
+  }
+  // Pass 1.6: solve every un-annotated PARAMETER from its body's usage, BEFORE any
+  // expression is checked — so a call site binds the solved parameter type whatever
+  // the source order, and before pass 1.7 infers returns against it. See
+  // `solvedParamTys`.
+  let sp = 0
+  while sp < stmts.length {
+    const sps = P.nodes[stmts[sp]]
+    if sps is FuncDecl { solveUnannotParams(stmts[sp]) }
+    sp = sp + 1
   }
   // Pass 1.7: return-inference pre-pass — resolve every un-annotated return (cycles
   // included, via the binding-group fixpoint) BEFORE checking bodies, so pass 2 sees

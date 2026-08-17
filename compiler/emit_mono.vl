@@ -18,8 +18,10 @@ import {
 import {
   flatConstOfNameProp,
   i32TyIx,
+  litUnionAliasNameOfTy,
   monoInferListElem,
   monoInferLocalScalar,
+  nodeTyIxOf,
   nodeTyName,
   recordClonedNodeTy,
 } from "./typecheck"
@@ -105,6 +107,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { paramTypeNode } from "./emit_query"
+import { recordedParamPinName } from "./emit_rewrite"
 import {
   fnDispNames,
   fnParent,
@@ -458,6 +461,18 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
       }
     }
   }
+  // A DECLARED LITUNION argument pins the parameter to the ALIAS, ahead of the string /
+  // scalar arms. For a litunion the spelling IS the rep: an alias is an interned i32 ATOM,
+  // an inline member set softens to the string ref (`litUnionAliasNameOfTy` is the one home
+  // of that distinction and answers "" for the inline form, which then falls through to
+  // `exprString` exactly as before). Without this arm a `K`-typed argument reached the
+  // `"i32"` catch-all at the bottom, and that arm mints NO annotation node by design — so
+  // the instance's parameter lost its type entirely (`paramTypeNode` → -1): the wasm
+  // parameter took the i32 default while every consumer in the body still classified the
+  // name as a string. A bare `print(u)` printed the raw atom id, and a `const r: K = u`
+  // lowered a string→atom widen over that i32 parameter — INVALID WASM.
+  const luAl = litUnionAliasNameOfTy(nodeTyIxOf(unwrapParen(ix)))
+  if luAl != "" { return luAl }
   if exprString(ix, fnIx) { return "string" }
   if exprStringArray(ix, fnIx) { return "string[]" }
   if exprF64Array(ix, fnIx) { return "f64[]" }
@@ -2244,7 +2259,14 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         const p = P.nodes[params[i]]
         if p is Param {
           if p.parType < 0 {
-            const an = monoArgTyName(args[i], ctx)
+            // A parameter the CHECKER already decided is not a hole, so the instance pins
+            // the PARAMETER's own type rather than re-deriving one from the argument.
+            // `recordedParamPinName` is that one answer, shared with `synthParamAnnots`
+            // (which runs after this pass and would otherwise mint a different name from
+            // the same recorded type). "" is the faithful "still an open hole", which keeps
+            // the argument-derived pin — and with it every byte of today's generic path.
+            let an = recordedParamPinName(params[i])
+            if an == "" { an = monoArgTyName(args[i], ctx) }
             if an == "" {
               return emitFail(
                 "emitProgram: monomorphize: unsupported argument type for `" +
