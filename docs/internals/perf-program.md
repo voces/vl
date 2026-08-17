@@ -2289,7 +2289,7 @@ rule against banking a zero from a vacuous run, that clean result is WEAK eviden
 not what this change rests on. The load-bearing instrument is the corpus A/B, whose reach
 IS demonstrated — 95 files changed emitted size, i.e. 95 files actually took the rewrite.
 
-### 12.10 What was dropped, and one refutation worth keeping
+### 12.10 What was dropped, one refutation worth keeping, and one measured negative
 
 **P6 (fuse `a/b` and `a%b`) — DROPPED, not attempted.** The fusion is only sound if it
 cannot move a trap. `i32.rem_s(INT32_MIN, -1)` returns 0 while `i32.div_s(INT32_MIN, -1)`
@@ -2300,9 +2300,12 @@ itself is exact, since `|q*b| <= |a|` cannot overflow and the subtraction wraps 
 the sign/edge grid that would prove it was not built, and a fused remainder that changes
 which case traps is a soundness bug, not a 1.99x.
 
-**P10 (`const` → immutable global) — DROPPED for lack of evidence, but the filed population
-is WRONG in the interesting direction.** The landscape asks whether #1321's start-local
-promotion has emptied it. It has NOT, and the surviving shape is specific:
+**P10 (`const` → immutable global) — CLOSED as a MEASURED NEGATIVE. The fold it was filed
+to enable already happens without it.** The filed population is real (below) and the patch
+is sound; the missing number was taken, and it reads zero. §12.10.1 is the experiment.
+
+The landscape asks whether #1321's start-local promotion has emptied the population. It has
+NOT, and the surviving shape is specific:
 
 > a top-level `const` is promoted to a start-function local only when nothing reads it from
 > inside a function body. **A `const` read from inside a function must stay a real wasm
@@ -2319,10 +2322,57 @@ constexpr arm) was implemented and reverted unshipped. It is sound by constructi
 writers are excluded, since the checker rejects assignment to a const name and the start
 function runs only the initializers `globalRunsInStartFn` claims (promoted or
 non-constexpr), which that arm is neither — and it verifiably emits immutable cells that
-still run. **What is missing is the only number that matters**: whether an immutable cell
+still run. **What was missing is the only number that matters**: whether an immutable cell
 actually lets binaryen fold the loop bound. P10's filed value was always "enables
-downstream folding", so shipping it without that measurement would prove nothing. The next
-attempt should measure the fold before writing the patch.
+downstream folding", so shipping it without that measurement would prove nothing.
+
+### 12.10.1 The fold experiment — the mutability bit buys nothing
+
+Run at the WAT level so the two modules differ in **exactly one byte**: the same module
+twice, `(global (;0;) (mut i32) i32.const N)` versus `(global (;0;) i32 i32.const N)`, the
+cell read as a `while` bound inside a function. `cmp -l` reports a single differing byte,
+the mutability flag. `wasm-opt` carries the host's own feature flags
+(`--enable-reference-types --enable-gc --enable-bulk-memory --enable-tail-call`; bare
+`wasm-opt` falsely rejects every VL module).
+
+| rung | mutable input | immutable input |
+| --- | --- | --- |
+| `-O` | 99 bytes | 99 bytes, **byte-identical** |
+| `-O3` | 99 bytes | 99 bytes, **byte-identical** |
+
+Both disassemble to the same body: the global section is **gone** and the bound is
+`i32.const N` inline in the loop. **Binaryen folds the loop bound off the MUTABLE cell.**
+It is not an inlining artifact — with the reading function `export`ed so it survives as its
+own function, the fold still happens inside it.
+
+**The mechanism, and why it generalises.** Binaryen's `simplify-globals` derives effective
+immutability from "no `global.set` anywhere in the module" rather than from the declared
+bit, and it acts on that derivation — feed it the real VL-emitted module for a program with
+a const `i32`, a const `string` and a const `i32[]`, and the `-O3` output has the two
+surviving ref cells declared **`(ref 0)` / `(ref 1)`, immutable, from a `(mut …)` input**.
+Binaryen strips the bit itself. The derivation is sound for VL because the whole-module view
+is always complete: `emitExportSection` exports functions and (when `memUsed`) `memory`, and
+**never a global**, so there is no external writer to fear.
+
+That real-module pair is not byte-identical — 301 vs 297 at both `-O` and `-O3` — and the
+4 bytes are worth naming so nobody reads them as the win. The diff is entirely local slot
+RENUMBERING plus one `i32.const 5 / local.set 0` that the mutable side hoists and the
+immutable side leaves inline, in the 5-iteration string-print loop. The hot loop is the same
+instruction sequence modulo local index on both sides, and both carry the same folded
+`i32.const 1000000` bound. It is optimizer shuffle downstream of a changed local numbering,
+not a fold the mutable form was denied.
+
+The control proves the fold is write-driven and not something else: give the same module a
+`global.set` from an opaque imported value and `-O` keeps both the `(mut i32)` cell and the
+`global.get` in the loop body.
+
+**The default rung is a wash too.** `p7-time.sh 25` over the one-byte-differing pair
+(bound `500_000_000`, output-equality asserted): mutable `cpu_min=127ms cpu_med=152ms`,
+immutable `cpu_min=139ms cpu_med=157ms` — the *mutable* side nominally faster, i.e. noise,
+on a box at load 20. wasmtime hoists the loop-invariant read regardless of the bit.
+
+So the change is an ABI-visible edit to every emitted module that provably changes no
+optimized output and no runtime. That is the whole case against shipping it.
 
 ## 13. PERF item P2 — a closure's code pointer stops being a `funcref`
 

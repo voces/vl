@@ -288,7 +288,7 @@ is the standing argument for G1/G3.
 | ~~**G2**~~ | ~~**P2 follow-on (a)** — hoist the closure unpack out of loops~~ | **re-derived 1.12×**, not 10.6× | **CLOSED, measured, not taken.** The 10.6× was the FUNCREF libcall, which P2 (#1326) already deleted — the ladder row and the shipped row are one saving counted twice. Residual is two ordinary field loads, **0.26 ns/call** measured against 0.29 predicted; `wasm-opt -O` already does the hoist wherever the closure is scalar-replaceable, and the `.map` variant is inside the noise floor. `perf-program.md §13.7` | M | low |
 | **G3** | **P12 — UTF-8 bytes for `string`** | **27.7×** on the compare; VL's `string` is 4 bytes/code point | OPEN | XL | high — `memory-gc-design.md §2.2` argues 4× denser but strictly *less* scannable under WasmGC |
 | **G4** | **P13 — linear-memory backing for scalar arrays** | **3.41×** on matmul's kernel | OPEN | XL | high |
-| **G5** | **P10 — `const` → immutable global** | one line; **measure whether an immutable cell lets binaryen fold the loop bound BEFORE writing the patch** | OPEN, correctly parked | XS | low |
+| ~~**G5**~~ | ~~**P10 — `const` → immutable global**~~ | **the fold happens WITHOUT it** — binaryen deletes the `(mut i32)` cell and inlines the bound anyway | **CLOSED, measured, not taken.** The mutability bit carries no information binaryen does not already derive: `simplify-globals` reads "no `global.set` anywhere" off the whole module — and VL exports functions and `memory`, never a global, so that view is always complete. Mutable-vs-immutable inputs optimize to **byte-identical** modules at `-O` and `-O3`; at the default rung the CPU A/B on a pair differing in that ONE byte is a wash. `perf-program.md §12.10` | XS | low |
 | **G6** | **P6 — fuse `a/b` and `a%b`** | **1.99×** | **BLOCKED on a sign/edge grid** — `rem_s(INT32_MIN,-1)` returns 0 while `div_s` **traps** | S + grid | high as filed |
 
 **REFUTED — do not re-file.** P4b BMH (refuted on three of its own numbers: table
@@ -299,7 +299,10 @@ default rung, **exactly zero at `-O` and above**; two supporting claims refuted
 in-file). `flat` records as a compiler perf lever (targets the wrong half). **G2**
 (the closure-unpack loop hoist: filed at 10.6×, re-derived at **1.12× / 0.26 ns per
 call**, because the 10.6× was P2's own funcref libcall read a second time —
-`perf-program.md §13.7`).
+`perf-program.md §13.7`). **P10** (`const` → immutable global: the fold it was
+filed to enable already happens on the MUTABLE cell, because binaryen infers
+immutability from the absence of writes and VL never exports a global —
+`perf-program.md §12.10`).
 
 ### 3e. Hygiene
 
