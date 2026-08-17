@@ -1417,10 +1417,15 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
     // A nulreflist PARAM (`p: i32[][] | null`) — its `!= null` narrow reads the `(ref null $wrapper)`
     // niche exactly like the local. (#877 wired the param signature but left this body-side arm.)
     if paramNulRefArray(fnIx, e.identName) { return true }
-    // A module-GLOBAL kind-18 cell (`const g: S[] | null = …`) — the third storage class, and
-    // the one arm this function never grew: every consumer (`g != null`, `g[i]`, an
-    // un-annotated `const t = g`) fell through to the non-nullable path and the bare `null`
-    // of the compare reached `emitNullLitNode` with no context, rejecting the module.
+    // A CAPTURED kind-18 cell — the FOURTH storage class, asked of the ladder that TYPED the
+    // env field (`capturedRefListSlot` gates on `captureValKind`), so the `!= null` compare
+    // reads the `(ref null $wrapper)` niche instead of falling through to the non-nullable
+    // path, where the compare's bare `null` reaches `emitNullLitNode` with no seed.
+    if capturedKindOf(fnIx, e.identName) == "nulreflist" { return true }
+    // A module-GLOBAL kind-18 cell (`const g: S[] | null = …`) — the third storage class.
+    // Without it every consumer (`g != null`, `g[i]`, an un-annotated `const t = g`) fell
+    // through to the non-nullable path and the bare `null` of the compare reached
+    // `emitNullLitNode` with no context, rejecting the module.
     //
     // Keyed on `globalCellKind` — the CELL's own answer — not on `letIsNulRefArray`, so the
     // read and the cell can never disagree. The distinction is load-bearing for an
@@ -1482,6 +1487,10 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
       // binding keep resolving the same row.
       return annNulRefArrSlot(paramTypeNode(fnIx, e.identName))
     }
+    // A CAPTURED kind-18 cell has no local slot either — its inner ref-list row is the one the
+    // env FIELD was typed with, so the read round-trips to the wrapper the field actually holds.
+    const cnris = capturedRefListSlot(fnIx, e.identName)
+    if cnris >= 0 { return cnris }
     // A kind-18 module GLOBAL has no local slot either — resolve its inner ref-list row from
     // the SAME place `emitGlobalSection` gives the cell its `(ref null …)` valtype and the
     // start fn seeds its null with (`letAnnRefListSlot`), so an un-annotated `const t = g`
@@ -3317,26 +3326,20 @@ export function captureValKind(fe: i32, name: string): VKind {
 }
 
 // The second `fbValtype` arg (struct table index) for a captured struct-ref variable.
+//
+// An ANNOTATED binding — a param, or a `let`/`const` with a type — resolves the pair
+// through `annValtypeSlotOf`, THE one home for "which interned table slot does this
+// annotation select". `captureValKind` types the env field by handing the very same
+// annotation node to `vtKindOfType`, so the kind and its companion index must come from
+// one ladder or the field is typed with a slot from the wrong index space (or, for a kind
+// this position never learned, no slot at all — `ref valtype with no interned shape`).
 export function captureValStructIdx(fe: i32, name: string) {
   const b = parentBindingOf(fe, name)
   if b < 0 { return -1 }
   const bn = P.nodes[b]
-  // A captured MAP binding's companion slot is its map SHAPE (mono ⇒ -1, or the value
-  // type's mv slot) — the SAME `mapAnnShape` the local/param/return valtypes resolve, so the
-  // env field's `$mapStruct` heap type matches the captured map value's exactly (a typed
-  // `{[string]: f32}` capture is `(ref $mvMapTypeIdx)`, not the mono `$mapStruct`). Mirrors
-  // `captureValKind`, whose annotation arm already yields "map"; without this the annotated
-  // arms fell through to `retStructIndex` (−1 for a map) and the env boxed a typed map into a
-  // mono field — invalid wasm at the closure `struct.new`.
-  if bn is Param {
-    if retMapFlag(bn.parType) == 1 { return mapAnnShape(bn.parType) }
-    return retStructIndex(bn.parType)
-  }
+  if bn is Param { return annValtypeSlotOf(bn.parType) }
   if bn is LetDecl {
-    if bn.letType >= 0 {
-      if retMapFlag(bn.letType) == 1 { return mapAnnShape(bn.letType) }
-      return retStructIndex(bn.letType)
-    }
+    if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
     if bn.letInit >= 0 {
       const pf = parentBindingFrameOf(fe, name)
       // The kind-specific companion index, mirroring `captureValKind`'s ladder:
@@ -11840,34 +11843,46 @@ export function vtKindOfParam(paramIx: i32): VKind {
   "i32"
 }
 
-// The second `fbValtype` arg for the parameter node at `paramIx` (from its annotation).
-// For a STRUCT param (kind 1) this is its struct table index (or -1); for a REF-ARRAY
-// param (kind 5) it is the ref-list TABLE SLOT for the element type (`B[]` → B's slot)
-// — `fbValtype`'s kind-5 arm now indexes `rlWrapIdx[slot]`, so it must NOT collapse to
-// -1/slot 0. Mirrors `tyAnnRefListSlot` (how `let`/return annotations resolve `T[]`).
+// The second `fbValtype` arg for the parameter node at `paramIx` — its annotation's
+// companion slot, through the shared ladder below. The PARAM storage class's name for
+// `annValtypeSlotOf`, kept so `emitTypeSection` and the `$fnsig` tokens read a
+// param-shaped question; every kind-to-table pairing lives in the one home.
 export function paramStructIdxOf(paramIx: i32) {
   const p = P.nodes[paramIx]
-  if p is Param {
-    if retRefArrFlag(p.parType) == 1 { return tyAnnRefListSlot(p.parType) }
-    // A NULLABLE ref-array param (kind 18) — its `(ref null $wrapper)` slot is the inner ref-list
-    // element wrapper (`tyAnnRefListSlot` is `| null`-aware), mirroring the non-null ref-array above.
-    if retNulRefArrFlag(p.parType) == 1 { return tyAnnRefListSlot(p.parType) }
-    // A string-keyed MAP param's second `fbValtype` arg is the map SHAPE (mono ⇒ -1, or the
-    // value type's mv slot for a `string`-valued map), so the param valtype selects THIS map's
-    // `$mapStruct`.
-    if retMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
-    // A NULLABLE map param (`{[string]: V} | null`, kind `nulmap`) — the SAME map SHAPE selects its
-    // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
-    if retNulMapFlag(p.parType) == 1 { return mapAnnShape(p.parType) }
-    // A concrete-VARIANT param (kind 8) — its `fbValtype` slot is the VARIANT index
-    // (`uVarHeap[vi]`), which `retStructIndex` (standalone structs) misses.
-    if retVariantFlag(p.parType) == 1 {
-      const ptv = P.nodes[p.parType]
-      if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
-    }
-    return retStructIndex(p.parType)
-  }
+  if p is Param { return annValtypeSlotOf(p.parType) }
   -1
+}
+
+// THE ONE HOME for "which interned table slot does this type ANNOTATION's `fbValtype`
+// select" — the companion index every ref-bearing `VKind` needs beside it. The kinds that
+// carry a slot each read a DIFFERENT table, and the pairing is what `fbValtype` /
+// `fbValtypeNullable` / `fbRefNullForKind` index with:
+//
+//   `reflist` / `nulreflist` → the ref-list TABLE SLOT (`rlWrapIdx[slot]`), so a `B[]`
+//       selects B's wrapper and does NOT collapse to -1 / slot 0
+//   `map` / `nulmap`         → the map SHAPE (mono ⇒ -1, else the value type's mv slot)
+//   `variant`                → the union-VARIANT index (`uVarHeap[vi]`), which
+//       `retStructIndex`'s standalone-struct ladder misses
+//   everything else          → `retStructIndex` (a struct row, an `S | null` base row, -1)
+//
+// Every annotation position resolves the pair through here, so a position cannot be taught
+// one kind's table and left ignorant of another's: a SHORTENED MIRROR of this ladder is a
+// `ref valtype with no interned shape` reject for exactly the kinds it never learned, and
+// the capture-env field position was that mirror for the ref-list kinds.
+export function annValtypeSlotOf(tyIx: i32) {
+  if retRefArrFlag(tyIx) == 1 { return tyAnnRefListSlot(tyIx) }
+  // A NULLABLE ref array (kind 18) — its `(ref null $wrapper)` slot is the inner ref-list
+  // element wrapper (`tyAnnRefListSlot` is `| null`-aware), mirroring the non-null one above.
+  if retNulRefArrFlag(tyIx) == 1 { return tyAnnRefListSlot(tyIx) }
+  if retMapFlag(tyIx) == 1 { return mapAnnShape(tyIx) }
+  // A NULLABLE map (`{[string]: V} | null`) — the SAME map SHAPE selects its
+  // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
+  if retNulMapFlag(tyIx) == 1 { return mapAnnShape(tyIx) }
+  if retVariantFlag(tyIx) == 1 {
+    const ptv = P.nodes[tyIx]
+    if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
+  }
+  retStructIndex(tyIx)
 }
 
 // The `pushVT` `kind` for a module global from its literal INITIALIZER at `initIx`:
@@ -17412,6 +17427,28 @@ function globalStructIndexSid(sid: i32) {
 // nullable value — produces a nonnegative slot, which is why the trap looked like a
 // string-VALUE defect and not a wrong-index-space defect.
 function capturedStructIndex(fnIx: i32, name: string) {
+  const ck = capturedKindOf(fnIx, name)
+  if ck != "struct" && ck != "nulstruct" { return -1 }
+  capturedCompanionSlot(fnIx, name)
+}
+
+// The REF-LIST TABLE SLOT of a captured ref-array variable (`xs: S[]`, `g: i32[][]`), or -1
+// when `name` is not such a capture. `capturedStructIndex`'s sibling on the OTHER index
+// space the companion slot ranges over — its header above is the contract both obey, and the
+// kind gate here is what keeps a ref-list slot out of `sFieldStart` and a struct row out of
+// `rlElemName`. THE capture channel for `refListSlotOfExpr` / `refListElemNameOfExpr`, so a
+// captured `S[]` read resolves the same wrapper the env FIELD was typed with.
+export function capturedRefListSlot(fnIx: i32, name: string) {
+  const ck = capturedKindOf(fnIx, name)
+  if ck != "reflist" && ck != "nulreflist" { return -1 }
+  capturedCompanionSlot(fnIx, name)
+}
+
+// The RAW `fbValtype` companion slot of a CAPTURED `name` of `fnIx` (`captureValStructIdx`
+// on the resolved parent frame), or -1 when `name` is not a capture. POLYMORPHIC IN THE
+// KIND — the number lives in whichever index space `capturedKindOf` names, so every consumer
+// goes through a kind-GATED reader above and never calls this directly.
+function capturedCompanionSlot(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   if !fnValUsed { return -1 }
   const fe = fnStmtsPosOf(fnIx)
@@ -17419,11 +17456,7 @@ function capturedStructIndex(fnIx: i32, name: string) {
   const caps = captureNamesOf(fe)
   let ci = 0
   while ci < caps.length {
-    if caps[ci] == name {
-      const ck = captureValKind(fe, name)
-      if ck != "struct" && ck != "nulstruct" { return -1 }
-      return captureValStructIdx(fe, name)
-    }
+    if caps[ci] == name { return captureValStructIdx(fe, name) }
     ci = ci + 1
   }
   -1
@@ -19865,6 +19898,13 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     if paramNulRefArray(fnIx, e.identName) { return true }
     if paramRefArray(fnIx, e.identName) { return true }
     if declaredRefArray(e.identName) { return true }
+    // A CAPTURED ref-array (`function inner() { print(xs[0][1]) }` over an enclosing
+    // `xs: i32[][]`) — the FOURTH storage class, asked of the function that TYPED the env
+    // field (`captureValKind`, through `capturedRefListSlot`'s gate) so the read cannot
+    // disagree with the field's `(ref $rlWrapIdx[slot])`. Ahead of the shadow test and the
+    // global arms: the capture's binding lives in an enclosing FRAME, so the local/param
+    // ladders above miss it and the global ones answer about a different variable.
+    if capturedRefListSlot(fnIx, e.identName) >= 0 { return true }
     if identShadowedByFrame(fnIx, e.identName) { return false }
     // A kind-18 nullable ref-array GLOBAL is a ref array too — the third storage
     // class, and the one this arm never grew (the local reads `declaredKind`, the
@@ -20082,6 +20122,12 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     if pn != "" { return pn }
     const dn = declaredRefArrayName(e.identName)
     if dn != "" { return dn }
+    // A CAPTURED ref-array — its element name is the `rlElemName` of the very slot the env
+    // FIELD was typed with, so `refListSlotOfExpr` round-trips back to that slot. The
+    // storage-class mirror of `exprRefArray`'s capture arm; without it a captured read
+    // resolved slot 0 (whatever row that happens to be) instead of its own.
+    const cn = capturedRefListSlot(fnIx, e.identName)
+    if cn >= 0 && cn < rlElemName.length { return rlElemName[cn] }
     // A kind-18 nullable ref-array GLOBAL keeps its inner ref-list ROW on the
     // ANNOTATION (there is no local slot to read) — the SAME place `emitGlobalSection`
     // takes the cell's `(ref null $wrapper)` from, so the read resolves the wrapper the
