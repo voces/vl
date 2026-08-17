@@ -12449,19 +12449,18 @@ function emitForInList(body: i32[], iterIx: i32, fnIx: i32) {
 // wasm validation.
 function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
   const fn = P.nodes[fnIx]
-  // `fnStmtsPosOf` IS AN O(functions) SCAN (see its header in `emit_classify`), and the
-  // INFERRED-return arms below asked it for the SAME `fnIx` four separate times — the variant
-  // seed, the variant index, the `fRetKind` widen and the atom-to-string widen. Measured on a
-  // self-compile at `1517c7f6` (12 warm guest profiles, 20,985 samples): `fnStmtsPosOf` is
-  // 5.54% self and **4.34 of that is reached from this one function** — i.e. this hoist, not
-  // the filed index, is where three quarters of that scan's cost lives.
+  // ONE READ, FOUR USES. The INFERRED-return arms below want the same `fnStmts` position four
+  // separate times — the variant seed, the variant index, the `fRetKind` widen and the
+  // atom-to-string widen — and taking it once is a HOIST, not a memo: nothing between the four
+  // reads writes `fnStmts` or `monoOrigNode`, both of which are written only by
+  // `emit_collect`'s collect passes and `emit_mono`'s replacement writers, all of which have
+  // run to completion before `emitCodeSection` begins. (That is a strictly weaker claim than a
+  // cross-call memo would need, which would have to hold across the whole emit; this one holds
+  // inside one call frame.) The read stays behind `fn.fnRet < 0` so an ANNOTATED return pays
+  // nothing.
   //
-  // Taking it once is a HOIST, not a memo: nothing between the four reads writes `fnStmts` or
-  // `monoOrigNode` — both are written only by `emit_collect`'s collect passes and `emit_mono`'s
-  // replacement writers, all of which have run to completion before `emitCodeSection` begins.
-  // (That is a strictly weaker claim than the cross-call memo `fnStmtsPosOf`'s header rejects,
-  // which would have to hold across the whole emit; this one holds inside one call frame.) The
-  // read stays behind `fn.fnRet < 0` so an ANNOTATED return pays nothing, exactly as before.
+  // This function was `fnStmtsPosOf`'s largest single caller by a wide margin at every
+  // measurement, which is why the hoist is worth stating rather than assuming.
   let fnPos = -1
   if fn is FuncDecl {
     if fn.fnRet < 0 { fnPos = fnStmtsPosOf(fnIx) }
@@ -12756,9 +12755,9 @@ function callBytes(fnIdx: i32) {
 // condition on the callee's results that the `return` being replaced already imposes
 // (see `fbReturnCall`). The one place that equivalence breaks is arity — `return`
 // tolerates leftover operands beneath the result, `return_call` does not — so a VOID
-// enclosing function is declined rather than reasoned about. `fnStmtsPosOf` is an
-// O(functions) scan and is asked only HERE, behind both cursor tests, so it is paid
-// once per tail call rather than once per return.
+// enclosing function is declined rather than reasoned about. The `fnStmtsPosOf` that
+// backs `fRetVoid`'s index is asked only HERE, behind both write-cursor tests, so it is
+// paid once per tail call rather than once per return.
 //
 // A union-box SINK function is declined outright: its exits are branches to a single
 // exit block whose emission is gated on `uSinkFired`, and a tail call is neither a

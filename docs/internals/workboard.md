@@ -263,8 +263,8 @@ speed one*: the profile has not moved across slices since `8d2471e`.
 |---|---|---|---|---|---|---|
 | **F1** | **Checker scope chain** — sid-indexed cell + undo log | `perf-program.md §9.7` | **2.83% self**; phase 3 gave **−4.5%** and 2,466,975 → 479,079 probes | **BLOCKED on coverage** | M | med-high — deleting the chain deletes the self-compile's only exerciser of two emitter arms. **Build `tests/cases` coverage FIRST** |
 | **F2** | **TOKKIND enumeration** — `kind: string` → i32 code | `perf-program.md §10.6` | **1.5–1.9% of a self-compile for ~570 sites over 7 files**; only 47 `.kind` READS; `tok.kind` never crosses the wasm boundary | OPEN | L | med — must mint the string FROM the code in `mkTok`, never both |
-| **F3** | **`modRenamed` sid-index** | `driver.vl:2622` | **1.82%**, went UP as a share | OPEN | M | med |
-| **F4** | **`fnStmtsPosOf` index at the writers** | `emit_classify.vl:9166` | **2.27% self** — three quarters of the original 5.54% was ONE un-hoisted call site, already removed | OPEN | M | med |
+| **F3** | **`modRenamed` sid-index** | `perf-program.md §16` | re-derived 1.80% self / **3.94% inclusive**, plus a SECOND reader (`modRwTsName`, 1.89% incl) the row never named; the merge rewrite **−81.3%**, 12.3M compares → 96K probes | **DONE** | M | med |
+| **F4** | ~~**`fnStmtsPosOf` index at the writers**~~ — **no index was built**: 80.3% of its calls ask for the function `emitCodeSection` is lowering, and the rest are classifiers whose callers already spell `fnStmts[fe]` | `perf-program.md §17` | re-derived **3.09% self → 0.01%**; a 1,600-frame ladder **48.9% → 3.7% self, −49.8%** of the compile | **DONE** | S | low |
 | **F5** | **`modScan` re-scan + `coalesceMixOp`** | `driver.vl:1798`, `parser.vl:1232` | 7.0 + 1.1 samples/run | OPEN, sized | S–M | low |
 | **F6** | **`vl check` allocates MORE than `vl build`** | — | **649.5 MB vs 510.8 MB**. ⚠️ this class of number was once wrong via cumulative `RUSAGE_CHILDREN` — **re-derive first** | OPEN | S | none |
 
