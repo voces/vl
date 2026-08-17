@@ -1063,3 +1063,66 @@ Stated plainly rather than reported as a silent zero.
 * **`wasm-tools validate` on each invalid module.** The engine's rejection was taken as the
   verdict (it is the same validator `vl run` uses); I spot-checked disassembly only through the
   reported offsets and messages, not per cell.
+
+---
+
+## Orchestrator's note at integration — the base, and what has since closed
+
+This sweep ran against master `61ea4def`. **Three PRs landed while it ran** (#1449 the
+aliased-write perf fix, #1450 the compiler-trap class, #1451 the narrowing-overlay leak), so its
+findings need re-deriving on the tip before any of them is briefed — the same staleness that
+retired fourteen rows from inventory #1.
+
+Re-derived on master `9907d711`:
+
+| row | filed | on the tip |
+|---|---|---|
+| **D3** silently wrong value | `gtake<T>(x)` printing `x[0][1]` over `boolean[][]` gives `0` | **LIVE** — prints `0` where the direct read prints `false` |
+| **D4** invalid wasm | `const y: string = "aa"; gid(y)` | **LIVE** — check-clean invalid wasm; deleting the annotation prints `aa`, so the annotation is the axis |
+| **D8** loud check, 46 cells | `if w.f != null { w.f = src() }` | **CLOSED by #1451** — now accepted, which is exactly what that slice widened |
+| **D1** compiler trap, 8 cells | a captured `{[i32]: string}` | **does not reproduce at my spelling** on the tip (`.length` on a captured i32-keyed string map checks clean). #1450 fixed the captured-map trap family; whether D1's exact shape survives needs the sweep's own program, not mine |
+
+**On D1 and the CHANGELOG:** the sweep says it "corrects a CHANGELOG correction", on the grounds
+that the earlier work measured the *for-in receiver* rather than the *capture*. That reading is
+fair about #1450's pre-merge state, but #1450 shipped a capture-position fix too, and my probe of
+the captured i32-keyed string map is clean on the tip. **Both claims are about different
+positions, and neither is simply wrong** — which is itself the lesson: a defect named by its
+*outcome* (a compiler trap) and its *value type* still needs its **position** stated, or two
+findings about different positions read as a contradiction.
+
+**Root A is the live, high-leverage item** and is now in flight: D3 + D4 + D5 + D6 plus two
+already-loud rows, all at `monoArgTyName`'s missing arm-set, with the loud floor **in the same
+function** that these spellings route around.
+
+## What this sweep measured as CLEAN — the part that stops agents being wasted
+
+- **Nullability inverted.** Nullable cells: **2,944 → 0 silent.** Plain cells: 2,236 → 76. That is
+  the exact inverse of inventory #1, where nullable reps held nearly every silent cell. The
+  nullable-rep programme has done its job; **the remaining silent class is in PLAIN types**, and
+  briefs should stop reaching for nullable axes first.
+- **Evaluation counts inside `is` / `match` / place-narrowing are clean** — 98 of 100 over 50
+  forms, **0 wrong counts**, including the documented `+=` counts of 2 and 4. I had flagged this as
+  the likeliest place another eval-count defect hid, after two were found nearby. It was not.
+- **Multi-module 230/230** across five import kinds, including `export flat type`, an exported
+  newtype, and a three-file re-export.
+- **`-O` and `-O3` both 4,118/4,118**, with the optimised module rebuilt and run.
+- **Capture depth beyond one level is not an axis** — identical vectors, so the earlier
+  "three-level chain" worry is settled.
+- Struct-field assignment, `flat` records including the fused-row idiom, and the brand rules all
+  hold.
+
+## Two process notes worth keeping
+
+**Its grader binned `vl check` dying inside `vl-compiler.wasm` as "just a hint"** — the exact
+failure direction the brief warned about, caught and fixed before any conclusion. A compiler trap
+is not a diagnostic, and a grader that classifies by exit code alone will merge the two.
+
+**It reported one prediction MISS of its own bookkeeping** (a sabotage predicted 96/0/2/2 and
+measured 98/0/0/2, because the prediction was written from a snapshot taken before its own probe
+fix). Nine other legs hit exactly. Reporting the miss is the standard.
+
+**A brief contradiction it resolved sensibly and flagged:** I asked it to commit its generator into
+`_scratch/`, while the gates require `git status` clean apart from the doc with `_scratch/`
+*untracked*, and the playbook forbids `git add`-ing it. It followed the gate, left the harness
+untracked, and made the doc self-contained instead — every repro and control pasted in full. The
+brief was wrong; future briefs should ask for a self-contained doc rather than a committed harness.
