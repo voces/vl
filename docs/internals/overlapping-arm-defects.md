@@ -743,8 +743,9 @@ return all have their rep fixed by a signature the binding cannot influence.*
 The "still open" table above files this as **4 cells** (*"3 RUN-WRONG + 1 EMIT-REJECT"*) with the
 note *"the closure fat-pointer's arm tag is a separate table from the value-atom tags this slice
 touched"*. Re-gridded from scratch on master @`dfd93627` with a seed refreshed from that source:
-**380 cells, 72 RUN-WRONG, 19 EMIT-REJECT, 2 INVALID-WASM, 287 RUN-OK**, plus a **36-cell control
-grid** that decides which of the non-RUN-OK cells are about functions at all.
+**380 cells, 77 RUN-WRONG, 19 EMIT-REJECT, 2 INVALID-WASM, 282 RUN-OK**, plus a **36-cell control
+grid** that decides which of the non-RUN-OK cells are about functions at all. **72 of the 77 wrong
+answers are this defect**; the controls move the other 5, and both loud classes, out of the family.
 
 Both halves of the filing are wrong in the direction this document keeps recording. The population
 is **18x** the filed number, and the arm tag is **not a separate table** — it is slot 11 of the same
@@ -791,9 +792,9 @@ also constant TRUE — its own 7 cells) and for every arm count.
 
 **Every partner arm that reps differently is CORRECT — 161 of 166 cells.** `F | string`, `F | i32`,
 `F | i64`, `F | f64`, `F | boolean`, `F | i32[]`, `F | string[]`, `F | {a: i32}`, `F | null`,
-`F | string | i32`: RUN-OK on both constructions, every receiver, both spellings. (The 5 that are
-not are all proven non-function-specific below.) `F | {[string]: i32}` is the known loud *"a map
-value is not a supported union member"*.
+`F | string | i32`: RUN-OK on both constructions, every receiver, both spellings. The 5 that are not
+are the two optional-chain cells and the two bound-map-read cells the controls move out, plus
+`F | {[string]: i32}`'s known loud *"a map value is not a supported union member"*.
 
 **Closure ARRAYS discriminate, and that is the finding that identifies the mechanism.** `F[] | G[]`
 answers correctly at the local / param / call receivers — the element signature reaches the tag even
