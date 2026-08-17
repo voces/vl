@@ -3944,9 +3944,7 @@ function emitUnionIfArm(
         return emitIfArmClose(emitUnionBoxArg(body, unionName, tv, fnIx))
       }
     }
-    return emitFail(
-      "emitProgram: union if-expression arm is not a single value",
-    )
+    return ifArmNoValueFail("union if-expression arm", blockIx, fnIx)
   }
   emitFail("emitProgram: union if-expression arm is not a block")
 }
@@ -4023,9 +4021,7 @@ function emitVariantIfArm(body: i32[], vi: i32, blockIx: i32, fnIx: i32) {
         return emitIfArmClose(emitVariantCoerce(body, vi, tv, fnIx))
       }
     }
-    return emitFail(
-      "emitProgram: variant if-expression arm is not a single value",
-    )
+    return ifArmNoValueFail("variant if-expression arm", blockIx, fnIx)
   }
   emitFail("emitProgram: variant if-expression arm is not a block")
 }
@@ -9188,6 +9184,40 @@ function emitIfArmClose(rc: i32) {
   rc
 }
 
+// The `emitFail` reason for an if-expression arm that leaves no value on the stack.
+// Every arm emitter reaches this through the same two-part gate — `ifArmValueExpr`
+// finding the arm's last statement, then that statement classifying as a value — and
+// the two halves fail for DIFFERENT reasons, so the message names which one fired:
+//
+//   • an EMPTY arm block has no value expression at all (`ifArmValueExpr` → -1);
+//   • an arm ending in a VOID call (`print(..)` / `recv.push(x)` / a void function /
+//     a store intrinsic) is a single, well-formed expression that yields nothing;
+//   • an arm ending in a real STATEMENT (`let` / `while` / an index-target assignment /
+//     a void `if`) likewise yields nothing.
+//
+// The middle case is why "not a single value" is the wrong thing to say: such an arm IS
+// a single expression, and the author's fix is to give the call a result or restructure
+// the `if` as a statement — not to collapse the arm. `what` names the arm flavour
+// ("if-expression arm" / "union if-expression arm" / "variant if-expression arm") so
+// the union and variant joins keep their own rep in the text.
+function ifArmNoValueFail(what: string, blockIx: i32, fnIx: i32) {
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 {
+    return emitFail(
+      "emitProgram: " + what + " is empty, so it yields no value",
+    )
+  }
+  const s = P.nodes[unwrapParen(tv)]
+  if s is Call {
+    return emitFail(
+      "emitProgram: " + what + " ends in a void call, which yields no value",
+    )
+  }
+  emitFail(
+    "emitProgram: " + what + " ends in a statement, which yields no value",
+  )
+}
+
 // One arm of a REF-typed if-expression: its prelude, then its tail-value statement
 // emitted in the join rep. Re-seeds `pendingStructIdx` (struct arms) /
 // `pendingListKind`+`pendingListSlot` (ref-list arms) after the prelude — the previous
@@ -9219,7 +9249,7 @@ function emitRefIfArm(
         return emitIfArmClose(emitExpr(body, tv, fnIx))
       }
     }
-    return emitFail("emitProgram: if-expression arm is not a single value")
+    return ifArmNoValueFail("if-expression arm", blockIx, fnIx)
   }
   emitFail("emitProgram: if-expression arm is not a block")
 }
@@ -9273,7 +9303,7 @@ function emitBlockValueAs(body: i32[], blockIx: i32, fnIx: i32, kind: i32) {
         return emitIfArmClose(emitExpr(body, tv, fnIx))
       }
     }
-    return emitFail("emitProgram: if-expression arm is not a single value")
+    return ifArmNoValueFail("if-expression arm", blockIx, fnIx)
   }
   emitFail("emitProgram: if-expression arm is not a block")
 }
@@ -13522,9 +13552,7 @@ function emitUnionRetIfArm(body: i32[], blockIx: i32, fnIx: i32) {
         return emitIfArmClose(emitReturnExit(body, tv, fnIx))
       }
     }
-    return emitFail(
-      "emitProgram: union if-expression arm is not a single value",
-    )
+    return ifArmNoValueFail("union if-expression arm", blockIx, fnIx)
   }
   emitFail("emitProgram: union if-expression arm is not a block")
 }
@@ -13647,10 +13675,11 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
     // Postfix `x++` / `x--` in STATEMENT position: the OLD-value result is discarded,
     // so emit just the inner increment assignment (`x = x ± 1`) — byte-identical to a
     // plain assignment statement, with no value left on the stack.
+    // A PREFIX unary (`-q` / `!q`) leaves a value instead, so it falls through to the
+    // shared discard below.
     if s.unOp == "p+" || s.unOp == "p-" {
       return emitAssign(body, s.unArg, fnIx)
     }
-    return emitFail("emitProgram: unsupported unary statement")
   }
   if s is Call { return emitCallStmt(body, s, stmtIx, fnIx) }
   if s is RetStmt {
@@ -13667,6 +13696,26 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
   if s is ForIn { return emitForInStmt(body, s, stmtIx, fnIx) }
   if s is BreakStmt { return emitBreakStmtStmt(body, s, stmtIx, fnIx) }
   if s is ContinueStmt { return emitContinueStmtStmt(body, s, stmtIx, fnIx) }
+  // A bare VALUE expression in NON-TAIL statement position is a DISCARDED value:
+  // evaluate it for effect, then `drop` what it leaves. This is the same rule the
+  // `BinExpr` arm above applies to `1 + 1` and `emitCallStmt` applies to a non-void
+  // call (pinned by `tests/cases/statements/discarded-call-return.vl`), reached here
+  // through the one shared classifier — `stmtIsTailValue`, which is exactly "this
+  // statement IS a value" — so every value-shaped node discards by the same rule
+  // instead of a hand-listed few.
+  //
+  // The TAIL statement of a body never arrives here: `emitFuncBody` and `emitStmtTail`
+  // both test `stmtIsTailValue` FIRST and route a tail value to `emitReturnExit`, so
+  // this cannot swallow an implicit return. The callers that do reach it are the
+  // non-tail loops (`emitStmts`, the `emitFuncBody` prefix) — including a VOID `if`'s
+  // arm blocks, which is how a value-producing `if`/`match` in statement position
+  // discards each arm's value (a `match` is desugared to an if-chain by
+  // `desugarMatchAt`, so the emitter sees only the chain).
+  if stmtIsTailValue(stmtIx, fnIx) {
+    if emitExpr(body, stmtIx, fnIx) < 0 { return -1 }
+    fbDrop() // 0x1a drop
+    return 0
+  }
   emitFail("emitProgram: unsupported statement in body")
 }
 
