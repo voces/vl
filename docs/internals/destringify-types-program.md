@@ -34871,7 +34871,7 @@ than establishes it:
 | the VARIANT field table, code 28 (`collect:3719`) | 2 | 2 | 0 | 0 | **0** |
 | `rlSlotByNameTy` rung 2 (all 14 callers) | 783 | 371 | 412 | 0 | **0** |
 | — | | | | | |
-| `collectA`'s `TypeRef` walk (`collect:3465`) — **NOT SHIPPED** | 1,335 | 1,328 | 7 | 0 | **59** |
+| `collectA`'s `TypeRef` walk (`collect:3465`) — **NOT SHIPPED** | 1,335 | 1,328 | 7 | 0 | **59** (re-derived off `494adc0d`: 1,407 / 1,400 / 7 / 0 / **61**; see 3a) |
 | `collectA`'s array LITERAL (`collect:3209`) — **NOT SHIPPED** | 1,218 | 1,218 | 0 | **21** | **616** |
 | `ensureRefElem`'s k==9 recursion — **NOT SHIPPED** | 187 | 96 | 91 | 0 | **2** |
 
@@ -34881,32 +34881,143 @@ than establishes it:
 single count would read 698 and say "abandon". Split, it says four rows are exact, and the other
 three fail for three unrelated reasons, each worth its own line.
 
-#### 3a. THE NODE-BANK ROUTE IS BLOCKED BY MONOMORPHIZATION, AND THE `@<index>` KEY IS THE TELL
+#### 3a. THE NODE-BANK ROUTE IS BLOCKED BY THE **CANON PASS**, NOT BY MONOMORPHIZATION — AND B5's FILED MECHANISM IS REFUTED
 
 `collect:3465` is the single largest site and it holds a `TypeRef` NODE, so
 `tyRefArrElemOf(nodeTyIxOf(i))` is `refArrElemName`'s exact structural dual — the very expression
-`annRefArrSlot` already ships. It disagrees on 59 of 1,328 covered entries. A *witness histogram*
-(distinct `(name, arenaKey, legacyKey)` triples with counts, aggregated per corpus directory)
-localizes 51 of the 59 to one shape: the arena key contains an `@<arena index>` token —
-`repElemKeyGo`'s final arm, which keys `TyVar` / `TyLit` / `TyErr` by identity so they never
-falsely merge.
+`annRefArrSlot` already ships. It disagrees, and the paragraph that used to stand here read the
+disagreement as *"the emitter's monomorphized clone: `nd.tyName` is the SUBSTITUTED spelling and
+the node's banked type is still the generic's"*. **That attribution is wrong. The monomorphizer
+writes none of these rows.**
+
+**RE-DERIVED (off `494adc0d`), with the denominators.** A probe at the arm itself
+(`emit_collect.vl`, immediately after `const ren = refArrElemName(ran)`) emits one record per
+reach carrying the status, the node's PROVENANCE (`pos < 0` ⇒ emitter-synthesized), the arena key,
+the name key, `tyToEmitName(nodeTyIxOf(i))`, and — from a second bank written inside
+`canonEmitTypeNames` — the node's PRE-CANON spelling. Records are flushed through `emitFail` at
+the `collectA#2` pass boundary (`print` is not available inside the compiler: the host provides no
+`__print_i32__` import, and a probe that reaches for it fails the self-compile).
+
+| | reaches | arena covered | uncovered | **DISAGREE** |
+| --- | ---: | ---: | ---: | ---: |
+| `tests/cases` + `std`, both `collectA` runs | **1,407** | **1,400** | **7** | **61** |
+
+(The old row's 1,335 / 1,328 / 7 / 59 was an older base. The uncovered 7 reproduce exactly.)
+
+**ALL 61 SIT IN FIVE FILES**, and none of the five involves a monomorphized function clone:
+
+| file | rows | canon-rewritten node? |
+| --- | ---: | --- |
+| `tests/cases/generics/type-param-shadows-alias-funcdecl-array-run.vl` | 37 | yes |
+| `tests/cases/types/numlitunion-alias-under-closure-type.vl` | 14 | yes |
+| `tests/cases/generics/type-param-shadows-alias-through-constructors.vl` | 4 | yes |
+| `tests/cases/generics/type-param-shadows-declared-struct.vl` | 4 | **no** |
+| `tests/cases/closures/is-function-arm-partner-discrimination.vl` | 2 | yes |
+
+**61 of 61 are PARSER nodes** (`pos >= 0`, provenance `P`); not one is `synthTypeRef`-minted.
+**57 of 61 carry a pre-canon spelling**, i.e. `canonEmitTypeNames` rewrote `TypeRef.tyName` in
+place on that very node. The witness histogram, now with the `OLD=` column that names the writer:
 
 ```
-14x  nm={a:i32}    A={a:(@32|@33),}  L={a:i32,}
-10x  nm=i32|null   A=@64?            L=i32?
-10x  nm={a:string} A={a:@76,}        L={a:string,}
-10x  nm=i32[]      A=@89[]           L=$rlI32L
- 7x  nm=i32|null   A=@102?           L=i32?
+14x  ran={a:i32}[]     A={a:(@32|@33),}  OLD={a:Z}[]        ARENA={a:i32}[]
+10x  ran={a:string}[]  A={a:@76,}        OLD={a:Nm}[]
+10x  ran=i32[][]       A=@89[]           OLD=Z[][]
+10x  ran=(i32|null)[]  A=@64?            OLD=(Id|null)[]
+ 7x  ran=(i32|null)[]  A=@102?           OLD=(Id|null)[]
+ 2x  ran={a:i32}[]     A={a:i64,}        OLD={a:One}[]      ARENA={a:i64}[]
+ 2x  ran=(i32|null)[]  A=string?         OLD=(Z|null)[]     ARENA=(string|null)[]
+ 2x  ran=<fn>[]|<fn>[] A=!               OLD=F[]|G[]
+ 2x  ran=S[][]         A=$rlI32L         OLD=(none)         ARENA=i32[][]
+ 2x  ran=S[]           A=string          OLD=(none)         ARENA=string[]
 ```
 
-That is the emitter's monomorphized clone: `nd.tyName` is the SUBSTITUTED spelling and the node's
-banked type is still the generic's. A `repElemKeyPortable` guard — a flag set by that one arm,
-read once, six lines, no duplicated walk — was built and measured: it cuts the 59 to **8** and
-costs 109 agreements. The residual 8 are all in `tests/cases/generics/` and all the same class one
-step further along (`nm=i32|null A=string?`, `nm={a:i32} A={a:i64,}`, `nm=S A=string` — a *concrete*
-type from the WRONG instantiation), so the guard does not close it and was not shipped. **This is
-the C1-endgame's mono-clone `nodeTyIx` item reached from the emitter's side, now carrying a
-measured population: 1,335 reaches wait on it at this one site.**
+`Z` is `type Z = 0 | 1`, `Nm` is `type Nm = string`, `Id` is `type Id = i32`, `F`/`G` are
+function-type aliases. **The `@<index>` tell is `repElemKeyGo`'s identity arm keying the
+UN-WIDENED `TyLit`s** — not a `TyVar` from a generic clone. (Under a *shadowed* type parameter it
+is a `TyVar`, but the writer is still canon: `numlitunion-alias-under-closure-type.vl` contributes
+14 rows and has no type parameter anywhere in it.)
+
+**THE MECHANISM, NAMED.** `canonEmitTypeNames` (`typecheck.vl`) is where the emitter's type
+vocabulary is minted: it resolves each annotation spelling to the emit form (a numeric literal
+union alias to its base scalar, a transparent one-member alias to its member, and — because it
+resolves names against the global alias registry — a type-parameter name that SHADOWS a global
+alias to that alias's body) and assigns `n.tyName = c`. It does not touch `nodeTyIx`, which still
+holds what `checkNode` recorded one pass earlier. So after canon,
+
+> **`tyName` is the EMITTER's vocabulary and `nodeTyIx` is the CHECKER's algebra, and at a
+> `TypeRef` node they are two answers to two different questions.**
+
+That is the general form of REFUTATION 2 (see "the canon pass makes `nodeTyIx` STALE TOO"),
+arriving at the rep layer. It also explains *why the four SHIPPED hint sources agree by
+construction and a node bank does not*: `sFieldElemTyIx` / `uFieldElemTyIx` are recorded by
+`fieldElemTyIxOfName(nm)` over the very canon'd NAME cell the caller passes, so both rungs are
+`repElemKey` of one index; the node bank is derived from the PRE-canon annotation and is a
+genuinely older answer.
+
+**THE INVERTED CONTROL, WHICH IS ALSO THE STRUCTURAL RECONCILIATION.** If canon is the writer,
+then making canon re-record the node in lockstep must close the population; if monomorphization
+were the writer it would move nothing. Measured — `const zzc = nameToTy(c)` beside `n.tyName = c`,
+writing `nodeTyIx[i]`:
+
+| | reaches | EQ | **NE** | UNC |
+| --- | ---: | ---: | ---: | ---: |
+| master `494adc0d` (`tests/cases`) | 1,401 | 1,333 | **61** | 7 |
+| + canon lockstep write | 1,401 | 1,388 | **6** | 7 |
+
+**55 of 61 close, and ZERO agreements are lost** (1,333 + 55 = 1,388 exactly). Contrast the
+`repElemKeyPortable` guard this section used to recommend against: 59 → 8 while costing 109
+agreements. The lockstep write is a different and strictly better shape, because it fixes the
+WRITER rather than teaching one reader to distrust the bank.
+
+**THE RESIDUE — 6 rows, 3 distinct nodes, 2 files, and neither is a `nodeTyIx` defect:**
+
+- `type-param-shadows-declared-struct.vl` nodes 6 and 9 (`type Arr<S> = {v: S[]}`,
+  `type Nest<S> = {v: S[][]}` — the DECLARATION's field annotations, shared by every
+  instantiation). The arena holds one instantiation's concrete type (`string[]`, `i32[][]`); the
+  name path answers the DECLARED struct `type S = {n:i32}` that the parameter `S` shadows. **Both
+  routes are wrong**; the node is shared and cannot carry a per-instantiation type. This is the
+  generic-ALIAS application population (`applyGenAliasArgs` / `gaeEnsure`), not `emit_mono`.
+- `is-function-arm-partner-discrimination.vl` node 69, a union of two function-type ARRAYS.
+  `refArrElemName` MIS-CUTS it (it drops the trailing `[]` of the second member);
+  `tyRefArrElemOf` correctly declines, because the annotation is a union, not an array. **Here the
+  NAME path is the broken one** and the arena is right — the only row in the whole population
+  where the disagreement favours the arena.
+
+**COST OF THE LOCKSTEP WRITE, ON EVERY CHANNEL** (clean seed `962804127b61` vs the lockstep build,
+`tests/cases`, one file per worker, four workers, well-formedness asserted: 1,805 lines == 1,805
+well-formed `path<TAB>sha` records on both sides):
+
+| channel | result |
+| --- | --- |
+| emitted-wasm sha256, per file | **4 of 1,805 move** — `generics/type-param-shadows-alias-funcdecl.vl`, `generics/type-param-shadows-transparent-alias.vl`, `literal-unions/union-of-litunions-flatten.vl`, `types/nullable-union-alias.vl`. All four `vl run` clean and match their `@log` oracle under BOTH compilers; 308 `@error` files fail to build on both sides, 0 new failures, 0 newly-building |
+| **`T.tys.length`, per program** | **61 of 1,528 move — THE ARENA MOVES.** Every delta is POSITIVE (+1 … +51, 0 negative), total 102,394 → 102,748 rows (**+0.35%**): `nameToTy(c)` APPENDS fresh rows for a spelling nothing had resolved before. `addTy` never interns, so no existing index is renumbered and no dedup rung collapses — this is growth, not a re-key |
+| `deno test -A tests/cases_wasm_test.ts` | **1,735 passed / 0 failed / 7 ignored** — identical to master, verified both ways |
+| `SELFHOST_NATIVE_ALIGN=1 deno test -A tests/selfhost_native_align_test.ts` | **1,742 passed / 0 failed / 0 ignored** — identical to master, verified both ways. (Ungated it is 0/0/1,742: the whole suite self-ignores without the env var, which is the vacuous pass the playbook warns about) |
+| `refresh-compiler.sh` · `lint-self.sh` | rc 0 · rc 0 |
+
+**NOT SHIPPED, AND THE REASON IS THE ARENA, NOT THE CORPUS.** The standing rule for this layer is
+*stop and report if the arena moves*, and it moves on 61 programs. The movement is benign in kind
+(monotone append, no renumber, no merge) and nothing observable moved with it — but the lockstep
+write REDEFINES `nodeTyIx` for canon-rewritten annotation nodes, which is a change to the checker's
+typed-IR contract read by every arena classifier in the emitter, and its blast radius is therefore
+much larger than the destringify row it unblocks. **That is an owner ruling, not an agent's.** The
+four moving files are exactly the alias/shadow family, which is the population most likely to be
+under-covered.
+
+**THE SAFER VARIANT TO RULE ON.** Bank the canon'd type in its OWN column (`canonTyIx`, written at
+the same instant as `n.tyName = c`) instead of overwriting `nodeTyIx`. No existing consumer reads
+it, so the byte channel cannot move by construction, and the destringify rows read the new column —
+which is what they actually want, since what they need is "the type the EMITTER's name denotes".
+The arena growth above is unchanged unless the column is filled lazily at first read. The naming is
+the point: this file's C1 endgame has been calling the sidecar "the typed IR", and there are TWO
+typed IRs at a `TypeRef` node, one per pass.
+
+**WHAT THIS MEANS FOR THE BOARD.** B5 as filed ("mono-clone `nodeTyIx`") does not exist: the
+monomorphizer's every annotation synthesis routes through `synthTypeRef` → `recordClonedNodeTy`,
+which banks the substituted spelling's OWN type, and TYPED-IR P1 already measured that coverage at
+729/729 with an inverted control. B3 and B6 were closed BLOCKED-REP behind a mechanism that is not
+there. What actually blocks them is the canon-pass vocabulary split above, and it has a named,
+measured fix awaiting a ruling on the arena.
 
 #### 3b. THE ARRAY LITERAL'S ELEMENT NAME IS NOT ITS ELEMENT TYPE — 637 of 1,218
 
@@ -35020,7 +35131,7 @@ parameter on three call paths, against nothing deleted.
 |---|---|---:|---|---|
 | 1a | `fieldElemTyIxOfName` | 7,770 | FILED (#1293 §6) | unchanged by this slice |
 | 1b | `repElemKeyOfNameTy` | **4,675 → 3,946** | **PARTLY SHIPPED** — 729 retired (15.6%) | see the three rows below |
-| 1b-i | `collect:3465` (the `TypeRef` walk) · `collect:3209` (the array literal) · the k==9 recursion | 2,740 (69% of the residue) | **BLOCKED, MEASURED** | §3a needs the mono-clone `nodeTyIx` fix (the `@<index>` guard closes 51 of 59 and is not enough); §3b needs `repSlotOfTyDecl` keyed structurally, or the literal's element name taken from the literal's TYPE; §3c is 2 disagreements at a mint |
+| 1b-i | `collect:3465` (the `TypeRef` walk) · `collect:3209` (the array literal) · the k==9 recursion | 2,740 (69% of the residue) | **BLOCKED, MEASURED** | §3a needs the CANON-PASS lockstep write, NOT a mono-clone fix — re-derived at 61/1,400, all 61 on parser nodes in five files, 57 of them canon-rewritten; the lockstep write closes 55 losing 0, and the arena grows on 61 of 1,528 programs (owner ruling); §3b needs `repSlotOfTyDecl` keyed structurally, or the literal's element name taken from the literal's TYPE; §3c is 2 disagreements at a mint |
 | 1b-ii | the ten name-only MINT sites (`forceCloResultListTypes` 204 · kind-6 list value 169 · the union-arm scan 157 · `mvShapeOfValNameK` ×3 = 255 · the rest 11) | 796 | **FILED** | these hold a spelling by construction. `mvShapeOfValNameK`'s three are the near ones: `recordMvValTyIx(valName)` banks the value type nine lines above `rlInternName(valName, 2)`, so the hint exists — but at `mvValTyIx.length - 1`, i.e. it needs the row index threaded, not a lookup |
 | 1b-iii | the FIND residue (`refListSlotOfExpr` 232 · `annRetKind` 84 · `variantFieldRefSlot` 72 · `mvValInnerRlSlot` 6 · `letRefListSlot` 6) | 400 | **FILED** | `refListSlotOfExpr` holds an EXPR node and is the largest — same §3a exposure, unmeasured. `variantFieldRefSlot` and `mvValInnerRlSlot` are `sFieldRefSlot`'s twins (an arena rung declined above them) and route the same way, but through `rlSlotByName`, whose `ty` parameter also DELETES the rendered rung 3 — so they need a key-only hint, not this one |
 | 1c | `unMemAtomTyIx` · `sTyIxOfName` | 2,085 + 1,064 | NOT ROUTABLE HERE | a `typecheck.vl` recorder |
@@ -35028,9 +35139,10 @@ parameter on three call paths, against nothing deleted.
 **NOTHING FILED FOR THE CHECKER PARTITION.** No route in this slice needed a `typecheck.vl`
 recorder, and the two that would unblock 1b-i are both emit-side: `repSlotOfTyDecl` keyed by
 `repCanonKey` rather than arena index (a behaviour change to struct-slot identity, not a routing
-move), and the mono-clone `nodeTyIx` population — `emit_mono`'s clone path calling
-`recordClonedNodeTy(clonedNodeIx, substitutedTyIx, kind)` for every `TypeRef` it rewrites, not
-only the pinned ones it does today (`emit_mono:1282`).
+move), and the CANON-PASS vocabulary split (§3a) — `canonEmitTypeNames` recording the type its
+rewritten spelling denotes, in lockstep with `n.tyName = c`. (The clause that stood here named
+`emit_mono`'s clone path instead; §3a measures that population at ZERO — every mono synthesis
+already routes through `synthTypeRef` → `recordClonedNodeTy`.)
 
 **Lsoft IS UNTOUCHED.** No shipped site's behaviour depends on the mixed-union litunion spelling:
 `repElemKeyGo`'s MIX-widening arm runs identically on both legs of every dual-write above, and the
@@ -35455,7 +35567,7 @@ name cannot bank the cut**, which is the structural reason this bucket does not 
 it is the same wall as D-REPELEMTY §3b one layer up (`arrLitElemName` vs the literal's type).
 
 Row 1's chain roots at `emit_collect:3762`, `if tn is TypeRef { internShapeDeep(tn.tyName) }` — a
-`TypeRef` NODE, i.e. the mono-clone `nodeTyIx` population D-REPELEMTY §3a refuted at 59/1,328,
+`TypeRef` NODE, i.e. the population D-REPELEMTY §3a re-derived at 61/1,400 and re-attributed to the CANON pass,
 here one peel further away AND feeding `slotCanonKey`'s dedup rung, where a wrong index is a merged
 heap type rather than a re-keyed row. Not attempted.
 
@@ -35705,7 +35817,7 @@ nothing deleted.
 | 1b-i | `collect:3465` · `collect:3209` · the k==9 recursion | 2,740 | BLOCKED, MEASURED (#1295 §3) | unchanged |
 | 1b-ii | the name-only MINT sites | 796 → **657** | **PARTLY SHIPPED** — kind 2 + kind 14 retired | kind 1 is **REFUTED**, §3 (two producers); kind 6 (169) is exact and blocked on the resolveAnnot ORDER; `forceCloResultListTypes` 204 / the union-arm scan 157 hold a spelling by construction |
 | 1b-iii | the FIND residue | 400 → **322** | **PARTLY SHIPPED** — both `sFieldRefSlot` twins retired | `refListSlotOfExpr` (232) holds an EXPR node — same §3a exposure, still unmeasured; `annRetKind` (84) is name-only |
-| 1c | `sTyIxOfName` | 1,064 → **1,050** | **CLOSED FOR THIS ROUTE**, §1a | the residue is 1,046 CUT spellings; 873 of them root at a `TypeRef` node, i.e. the mono-clone `nodeTyIx` item, feeding the struct DEDUP key |
+| 1c | `sTyIxOfName` | 1,064 → **1,050** | **CLOSED FOR THIS ROUTE**, §1a | the residue is 1,046 CUT spellings; 873 of them root at a `TypeRef` node, i.e. the canon-pass vocabulary split (§3a), feeding the struct DEDUP key |
 | 1c | `unMemAtomTyIx` | 2,085 | REFUTED (#1294 §8) | a recorder written by CANON, i.e. W9 |
 
 **NOTHING FILED FOR THE CHECKER PARTITION.** The one item that would unblock the largest remaining
@@ -41115,8 +41227,9 @@ no low-risk slice hiding inside this row.
 
 > **VERDICT: B3 IS BLOCKED, AND IT IS BLOCKED FOR THE REASON #1327 GAVE, ON A POPULATION #1327 NEVER
 > MEASURED.** Mark the row BLOCKED-REP rather than OPEN. It becomes takeable only behind B5 (the
-> mono-clone `nodeTyIx` bank), which is what would let the field's annotation NODE hand over an index
-> that is *already in the arena* instead of one the emitter has to mint.
+> canon-pass `nodeTyIx` reconciliation — NOT the mono-clone bank the row originally named, see §3a),
+> which is what would let the field's annotation NODE hand over an index that is *already in the
+> arena* instead of one the emitter has to mint.
 
 ### 4. THE FINDING THAT IS BIGGER THAN THE ROW: THE TWO RUNGS ATE THE MINT-FREE POPULATION
 
