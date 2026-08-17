@@ -20,11 +20,13 @@
 //
 // Directive semantics (the corpus's `// @directive` contract), with the wasm
 // tier's documented deltas:
-//   - The wasm compiler has NO lint tier and only the "error" severity, so a
-//     case whose ONLY directives are @warning/@info/@hint is SKIPPED here
-//     (lint stays TS-adjudicated until the .vl lint pass — LSP-on-wasm
-//     Stage 3). Lint directives on a case that ALSO has error/run directives
-//     are ignored; the error-tier + runtime contract is still enforced.
+//   - @warning/@info/@hint are adjudicated on SINGLE-FILE cases that carry no
+//     error-tier directive, against the union of the two streams the CLI itself
+//     reports from: the parse-only lint pass (`lintSrc`) and the TYPE-INFORMED
+//     redundant-annotation findings (`redun*`, populated by the check/compile
+//     run — invisible to `lintSrc`, so read separately; see `readRedun`).
+//     Strict per severity in both directions. An error-tier or multi-file case
+//     skips the lint tier — see the gate at the call site for why.
 //   - @error-at matches the LINE only. Column anchors diverge between the two
 //     checkers on ~80 corpus files (the checker-parity sweep) — column
 //     matching is residue for the span rungs (ROADMAP H-M "Spans").
@@ -289,7 +291,7 @@ const driveCase = (
   src: string,
   emit: boolean,
   isModule: boolean,
-): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array } => {
+): { rc: number; diags: WasmDiag[]; bytes?: Uint8Array; redun: LintDiag[] } => {
   exp.modReset();
   if (isModule || hasImports(src)) {
     const commit = (key: string, source: string | undefined) => {
@@ -318,6 +320,10 @@ const driveCase = (
   // and the instance is shared across cases, so don't trust `diagCount` on a
   // success: a stale emit failure could still be sitting in its store.
   const diags = rc === 0 ? [] : readDiags(exp);
+  // Read the redundant-annotation findings HERE, while this compile's token
+  // table is still standing: `redunModuleAt` resolves each finding's owner
+  // through `modOfTok`, and the later `lintSrc` re-parse resets that table.
+  const redun = readRedun(exp);
   let bytes: Uint8Array | undefined;
   if (emit && rc === 0) {
     const n = exp.rbyteLen();
@@ -333,7 +339,7 @@ const driveCase = (
     pushString(exp.srcPush, "print(1)\n");
     exp.compileSrc();
   }
-  return { rc, diags, bytes };
+  return { rc, diags, bytes, redun };
 };
 
 const fmtDiags = (diags: WasmDiag[]): string =>
@@ -489,6 +495,37 @@ const assertCase = async (
 // ── Lint tier (the .vl lint pass, via the driver's `lintSrc`) ──────────────────
 type LintDiag = { sev: string; line: number; col: number; msg: string };
 
+/**
+ * The redundant-annotation findings (`redun*`) as lint diagnostics.
+ *
+ * This stream is TYPE-INFORMED — the checker populates it during
+ * `checkSrc`/`compileSrc` — so it is NOT in the parse-only `lintSrc` stream, and
+ * an oracle that reads `lintSrc` alone cannot see a `redundant type annotation`
+ * hint the CLI reports for the very same file. `cli.vl` folds the two streams
+ * (plus the error tier) into one report; this is the harness's half of that fold,
+ * with `redunMsgAt`'s single spelling of the message read over the driver's
+ * `redunMsg*` byte ABI so the wording cannot drift from the CLI's.
+ *
+ * Entry module only (`redunModuleAt == 0`), mirroring `cli.vl`: a graph compile
+ * merges every module's AST and only the entry's findings carry positions that
+ * map onto the file being adjudicated. MUST be read while the compile that
+ * produced it still owns the token table — see the call in `driveCase`.
+ */
+const readRedun = (exp: Exports): LintDiag[] => {
+  const out: LintDiag[] = [];
+  const n = exp.redunCount();
+  for (let i = 0; i < n; i++) {
+    if (exp.redunModuleAt(i) !== 0) continue;
+    out.push({
+      sev: "hint",
+      line: exp.redunSLineAt(i),
+      col: exp.redunSColAt(i),
+      msg: readString(exp.redunMsgLen(i), (j) => exp.redunMsgByte(i, j)),
+    });
+  }
+  return out;
+};
+
 /** Run the self-hosted lint pass over `src` and read its diagnostics. */
 const driveLint = (exp: Exports, src: string): LintDiag[] => {
   exp.modReset();
@@ -587,7 +624,7 @@ for (const c of cases) {
         c.kind === "single" && d.errors.length === 0 &&
         d.errorsAt.length === 0 && d.emitErrors.length === 0
       ) {
-        assertLint(d, driveLint(exports!, src));
+        assertLint(d, [...driveLint(exports!, src), ...r.redun]);
       }
     },
   });
