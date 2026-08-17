@@ -2145,33 +2145,25 @@ function emitNulIsNullTest(
 // `toWasm.ts`): evaluate the receiver (a union box), `struct.get $box 0` (the tag), then
 // `i32.const tagOf(Variant)` and `i32.eq` — leaving a 0/1 i32 (an `if` condition).
 function emitIs(body: i32[], isIx: i32, fnIx: i32) {
-  // `x is null` / `x is <member>` over a NULLABLE value whose rep is a
-  // single-non-null-member NICHE (`P | null`, `string | null`, `boolean | null`, `K | null`,
-  // a list / ref-array / map / closure niche): the only runtime distinction IS null vs
-  // present, so the guard is the niche's own null test, shared with the `== null` compare
-  // (`emitNulIsNullTest` — its header carries why one home is required). `x is <member>`
-  // inverts it: the checker already proved the tested shape is the sole non-null member.
-  //
-  // The litunion niche takes only the `is null` DIRECTION here. `v is K2` over a `K | null`
-  // where `K2` is a SUB-alias is a MEMBERSHIP question, not a null test, and the atom
-  // ladder below answers it exactly.
+  // `p is null` over a NULLABLE struct ref — `ref.is_null` (no union needed), and
+  // `p is { x: i32 }` / `p is S` its inverse: over a NICHE nullable struct (`S | null` — one
+  // struct member, a nullable REF not a box) the checker already proved the tested shape
+  // matches the struct member, so the only runtime distinction is null vs non-null
+  // (`!ref.is_null`, the host's nullable non-null narrowing test). This is the ONE niche
+  // that must be claimed before the ladders below rather than beside them — see the general
+  // niche arm further down, which the box / atom / membership paths deliberately precede.
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
-    let nulOk = true
-    if nd0.isVariant != "null" {
-      if exprNulLitUnion(nd0.isObj, fnIx) { nulOk = false }
-      if tyIsLitUnion(isVarTyIxOf(isIx)) { nulOk = false }
-    }
-    if nulOk {
-      const nt = emitNulIsNullTest(
+    if exprNullableStruct(nd0.isObj, fnIx) {
+      const nst = emitNulIsNullTest(
         body,
         nd0.isObj,
         fnIx,
         nd0.isVariant != "null",
         true,
       )
-      if nt < 0 { return -1 }
-      if nt > 0 { return 0 }
+      if nst < 0 { return -1 }
+      if nst > 0 { return 0 }
     }
   }
   // `k is K` / `k is "x"` over a LITERAL-UNION receiver — an interned i32 ATOM id, NOT a
@@ -2577,6 +2569,44 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
           }
         }
       }
+    }
+  }
+  // `x is null` / `x is <member>` over a NULLABLE value whose rep is a
+  // single-non-null-member NICHE (`string | null`, `boolean | null`, `K | null`, a list /
+  // ref-array / map / closure niche): the only runtime distinction IS null vs present, so
+  // the guard is the niche's own null test, shared with the `== null` compare
+  // (`emitNulIsNullTest` — its header carries why one home is required). `x is <member>`
+  // inverts it: the checker already proved the tested shape is the sole non-null member.
+  //
+  // THE POSITION IS THE WHOLE CORRECTNESS ARGUMENT AND IT WAS MEASURED. Every rep this arm
+  // claims used to fall through to `monoStaticIsResult` DIRECTLY BELOW — that fold is the
+  // defect this arm exists to remove — so sitting immediately in front of it reaches
+  // exactly the receivers that were broken and preempts nothing that already worked. Ahead
+  // of the box paths it does preempt: a union BOX narrowed by an outer arm to a single
+  // nullable member (`else if x is boolean` at the end of an `A | B | i32 | … | null`
+  // chain) reads `exprNulBool` TRUE on a value whose STORAGE is still a `(ref $uBox)`, and
+  // the sentinel compare `i32.ne` over a box ref is invalid wasm
+  // (`functions/heterogeneous-union.vl`). Narrowing is a TYPE fact; the box is the storage.
+  //
+  // The litunion niche takes only the `is null` DIRECTION. `v is K2` over a `K | null` where
+  // `K2` is a SUB-alias is a MEMBERSHIP question — one "not null" cannot express — and the
+  // atom ladder above answers it exactly.
+  if nd0 is IsExpr {
+    let nulOk = true
+    if nd0.isVariant != "null" {
+      if exprNulLitUnion(nd0.isObj, fnIx) { nulOk = false }
+      if tyIsLitUnion(isVarTyIxOf(isIx)) { nulOk = false }
+    }
+    if nulOk {
+      const nt = emitNulIsNullTest(
+        body,
+        nd0.isObj,
+        fnIx,
+        nd0.isVariant != "null",
+        true,
+      )
+      if nt < 0 { return -1 }
+      if nt > 0 { return 0 }
     }
   }
   // STATIC `is` over a NON-union operand against a base TYPE NAME (`x is i32`,
