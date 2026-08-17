@@ -116,6 +116,7 @@ import {
   nodeUnionName,
   nominalStructNameOfTy,
   numLitUnionBaseName,
+  primTyOfName,
   recordClonedNodeTy,
   recordNodePin,
   tyIsLitUnion,
@@ -17485,24 +17486,11 @@ function fnRetUnionSid(sid: i32) {
 }
 
 // True if the parameter `name` of function `fnIx` is the union type.
-//
-// BOTH LEGS ARE `vtKindOfType`'s TWO `"union"` ARMS, READ DIRECTLY. That function decides
-// the param's VALTYPE, so this classifier must claim exactly the slots it made boxes or the
-// two describe different values for one annotation — and the second arm is the live instance:
-// a NULLABLE NUMERIC litunion (`N | null` over `type N = 1 | 2`, and the inline `1 | 2 | null`)
-// interns as a `TyNullable` whose inner litunion `isValueUnionBox` rejects (all members one
-// `litKind`), so `nodeTyIsUnionAlias` answers NO for a slot `vtKindOfType` already gave the
-// box. `exprUnion` reads this, and every `is`/membership arm downstream reads `exprUnion` —
-// so the param position fell past the numeric-litunion membership arm to
-// ``emitProgram: `is` names a type that is not a union variant`` while the `let` spelling of
-// the identical program compiled. The ladder is read directly rather than through
-// `vtKindOfType` itself because this sits on `exprUnion`'s hot Ident path and the two
-// predicates ARE that ladder's union arms; a whole-ladder call would bill every ident read.
 function paramUnion(fnIx: i32, name: string) {
   const pt = paramTypeNode(fnIx, name)
   // STRUCTURAL fast-path (C1): a recorded declared value-union param, else the name test.
   if nodeTyIsUnionAlias(pt) { return true }
-  nodeTyIsNulNumLitUnion(pt)
+  false
 }
 
 // True if the already-collected declared local `name` is a union ref (code `4`).
@@ -20432,6 +20420,29 @@ function tyKindOf(tyIx: i32) {
     }
     return -1 // struct / ref / nested-list element — needs the ref-list slot
   }
+  // A NUMERIC literal type or literal UNION (`1`, `1 | 2`, `1.5 | 2.5`) has NO rep of its own
+  // — it reps as its BASE SCALAR — so its kind is that scalar's, resolved through
+  // `numLitUnionBaseName` (the single home for that rule) and then through THIS function's own
+  // `TyPrim` arm, so the name→kind map is not written twice.
+  //
+  // Without it every typed-IR fast path built on this function answered -1 for an `is`-narrowed
+  // litunion arm and fell back to a syntactic derivation that has no litunion case either. The
+  // reaching shape: a struct FIELD typed `W | null` over `type W = 1.5 | 2.5`, narrowed by
+  // `if s.f is W` — the field read correctly unboxed to an f64 and `print` then routed it to
+  // `__print_i32__`, because `exprIsF64`'s fast path asks this function and its Member arm asks
+  // the field's DECLARED code (16, the box). `vl check` rc 0, `type mismatch: expected i32,
+  // found f64`. The `f64 | string` field one line away was correct, because the checker banks
+  // the bare `f64` there and this function has always answered for that.
+  //
+  // STRING literals answer "" at that home and stay -1 here, which is required, not incidental:
+  // a string litunion member is an interned i32 ATOM, not the `(ref $array)` kind 3 would name.
+  //
+  // The walk is GATED ON THE VARIANT rather than charged to every -1: only a literal or a union
+  // node can be a numeric litunion, and this function sits under every scalar classifier.
+  let litBase = ""
+  if t is TyLit { litBase = numLitUnionBaseName(tyIx) }
+  if t is TyUnion { litBase = numLitUnionBaseName(tyIx) }
+  if litBase != "" { return tyKindOf(primTyOfName(litBase)) }
   -1
 }
 
