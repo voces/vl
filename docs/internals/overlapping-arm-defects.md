@@ -422,10 +422,10 @@ membership lowering and no spill slot, so they take the **loud floor** the box r
 two floors now share one message. A one-member tested type evaluates the receiver exactly once and is
 unaffected.
 
-**Still open, and it is a RULING not a lowering:** a RAW `string | null` receiver (16 cells) stays a
-loud `vl check`-clean emit-reject. Its bare-literal twin `(string | null) is "x"` **traps on a null
-receiver** — measured — so membership cannot delegate to it, and making both answer FALSE for null
-changes shipped `is` semantics. Filed as D1c.
+A RAW `string | null` receiver was left as a RULING rather than a lowering: its bare-literal twin
+`(string | null) is "x"` **trapped on a null receiver**, so membership could not delegate to it, and
+making both answer FALSE for null changes shipped `is` semantics. Filed as D1c and now **CLOSED** by
+the ruling below.
 
 Pinned by `tests/cases/literal-unions/is-litunion-over-string-receiver.vl` (15 wrong lines without
 the cut) and `is-litunion-string-call-receiver-rejected.vl` (compiles and answers FALSE without it).
@@ -722,6 +722,86 @@ population.** D1b was filed at "struct field" because that is where it was found
 asked all nine receivers found the direct map read in the same fail-open class and found a whole
 column (`K | i32`) that is CORRECT — and it is that correct column, not the broken ones, that
 identifies the mechanism as tag-sharing rather than receiver-shape.*
+
+
+---
+
+## D1c is CLOSED — the OWNER RULED, and the ruling had to land at BOTH spellings or neither
+
+**The ruling: you can narrow a `string | null` to a specific string, and A NULL RECEIVER ANSWERS
+FALSE.** `null is "x"` is a well-formed question whose answer is no, not a program error. That is the
+semantics change D1b declined to make on its own authority.
+
+D1b filed 16 cells — a count taken inside its own grid, i.e. a lower bound. Re-gridded as its own
+population (**104 cells**: 5 receiver types × 4 tested-against spellings × 6 test forms × 9 receiver
+origins, each run at a MEMBER, a NON-MEMBER and a NULL input) the two spellings were failing two
+different ways, and the second one silently:
+
+| | n | correct | traps | check-clean INVALID WASM | check-clean silently wrong | loud reject |
+|---|---|---|---|---|---|---|
+| **bare literal** `s is "m"` | 22 | 6 | **11** | **3** | 0 | 2 |
+| **membership** `s is K` / inline / 1-member alias | 82 | 25 | 0 | 0 | 0 | 57 |
+| **after (both)** | 104 | **83** | **0** | **0** | 0 | 21 |
+
+- The bare literal reached the shared per-member compare and read its receiver as a VALUE. At a
+  param / local / field / global that read recovers itself with `ref.as_non_null`, so the null input
+  **TRAPPED**; at a **call result, a map read or a list element** nothing recovers it, so a
+  `(ref null $array)` reached `__str_eq__` directly — `vl check` clean, **INVALID WASM**. Those three
+  origins are why "the bare-literal spelling traps" was itself a lower bound.
+- The membership ladder never lowered at all, and its refusal was CORRECT while the compare it
+  delegates to still trapped: claiming the rep would have spread the trap across the whole member set.
+
+**So the guard belongs in `emitLitMemberEq` — the one compare both spellings share — and nowhere
+else.** `emitNulStrLitEq` is `br_on_null` over ONE raw read: the string compare on the non-null path,
+`i32.const 0` on the null one. `litMemberRecvIsNulString` is the single predicate that decides "this
+read is the nullable niche and is not narrowed" (`exprNullableString` — the emitter's
+declaration-scoped rep — AND `nodeTyIsNullable`, the checker's banked type for this node; the two
+DISAGREEING is the `!= null` narrowing signal), and `litMembershipRecvOk` now asks that same
+predicate instead of carrying its own answer. Both sabotages redden the fixture: removing the guard
+while the ladder claims the rep gives INVALID WASM, and restoring the ladder's exclusion while the
+guard stays gives master's emit-reject.
+
+**READ ONCE, not tested-then-re-read.** The `??` arms can spell their null test as `ref.is_null` plus
+a value `if` because a coalesce re-reads a PLACE. This compare also serves receivers that are not
+places — and `m["k"]`, which types `string | null`, is the *common* one — so a second read would
+re-probe the table. That is why the block shape mirrors `emitPrintNulString`'s and not the coalesce's.
+
+**The `??` receiver forced a second, smaller fix.** `(p ?? q) is "m"` reads the coalesce result raw,
+and the `string | null` coalesce arm declared `(ref $aTypeIdx)` unconditionally — so with a NULLABLE
+default its own then-arm was a legitimately-null value in a non-null block. Under a raw consumer the
+block type is now `(ref null $aTypeIdx)` and each arm reads under the type the lowering declared.
+`(p ?? q) != null` answered **TRUE for two nulls** for the same reason and is fixed by the same line.
+
+**The soundness the trap was providing is kept, and it was checked in both directions.** After
+`if s is "x"` the THEN branch is narrowed non-null (the fixture concatenates the receiver there); the
+ELSE branch is NOT, nor is a negated guard's then-branch, and a value use of the receiver in either is
+still a type error (`error-is-nullable-string-else-not-narrowed.vl` — a boundary pin, which passes on
+master too). An unguarded use is unchanged. **All 1838 pre-existing corpus modules build
+BYTE-IDENTICAL to the branch point**, so no `@error`/`@emit-error` case changed verdict and no other
+null-related shape moved.
+
+The 21 residual cells are LOUD and at parity with a NON-nullable receiver: 5 call / `??` receivers
+with a multi-member tested type keep the re-readable-receiver floor (a place is what a per-member
+re-read needs — the same floor `is-litunion-string-call-receiver-rejected.vl` pins for a plain
+`string`), 2 are the atom-repped `K | null` at a list element / call result — a different rep — and
+12 are the CHECKER's newtype-brand reject (`` `is` check type '"aa"' is not a variant of N? ``), which
+a newtype's opacity means and which is unchanged in both spellings.
+
+**Measured and NOT fixed, with its mechanism:** a `for x in xs` loop variable over a
+`(string | null)[]` still traps on a null element in BOTH spellings, identically before and after.
+The checker types `x` as `string?` (a `+` on it is a type error) but does not BANK a nullable node
+type for the reference, so `nodeTyIsNullable` reads false and the guard's narrowing signal
+false-positives. The fix is in the checker's for-in binding, not in the compare — and the narrowed
+oracle for that shape does not even compile (`emitProgram: bare null needs a struct-typed context`).
+A nullable string CAPTURED by a nested function is a loud pre-existing emit-reject on the same axis
+(`` `is` names a type that is not a union variant ``), unmoved.
+
+*Method note this closure adds: **when a fix is gated on a semantics ruling, the ruling's blast radius
+is every spelling of the question, and the cheapest way to find them is to ask what the BLOCKED
+spelling was blocked BY.** D1b's membership ladder refused the nullable rep because the bare-literal
+compare trapped. That sentence names the second half of the fix, and it also names the three receiver
+origins where the bare-literal spelling did something worse than trap — a trap needs a read that
+RECOVERS, so the origins with no recovery had to be doing something else.*
 
 
 ---

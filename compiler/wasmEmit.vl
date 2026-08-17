@@ -2191,16 +2191,71 @@ function emitNulIsNullTest(
   0
 }
 
+// True when `recvIx` is a receiver whose STORAGE is the `string | null` niche — a real
+// `(ref null $array)` the per-member string compare must null-test before comparing.
+//
+// BOTH HALVES ARE REQUIRED AND THEY MEAN DIFFERENT THINGS. `exprNullableString` is the
+// emitter's DECLARATION-scoped rep classifier (this slot holds a nullable string ref);
+// `nodeTyIsNullable` is the CHECKER's banked type for this very read. A receiver NARROWED to
+// non-null (`if s != null { s is "x" }`) keeps the first and loses the second, and its read
+// is already recovered — so the two DISAGREEING is exactly the narrowing signal, and the
+// guarded lowering must not claim it or it would null-test a value that cannot be null.
+function litMemberRecvIsNulString(recvIx: i32, fnIx: i32) {
+  exprNullableString(recvIx, fnIx) && nodeTyIsNullable(recvIx)
+}
+
+// `<string | null> is "<m>"` — the member compare with A NULL RECEIVER ANSWERING FALSE.
+// `null is "x"` is a well-formed question whose answer is no, so this is not a checked-program
+// impossibility to `ref.as_non_null` away: the receiver is read ONCE as the raw nullable ref
+// and `br_on_null` decides between the string compare and a const 0.
+//
+// READ ONCE, NOT TESTED-THEN-RE-READ. The `??` arms can spell their null test as
+// `ref.is_null` + a value `if` because both arms of a coalesce re-read a PLACE; this compare
+// also serves a receiver that is not a place (a call result, a map read — the map read is the
+// common shape, `m["k"]` typing `string | null`), where a second read would re-run it.
+// `br_on_null` consumes the one ref it was given, which is why the block shape here mirrors
+// `emitPrintNulString`'s rather than the coalesce's.
+function emitNulStrLitEq(body: i32[], recvIx: i32, lex: string, fnIx: i32) {
+  fbBlock(127) // block i32 — $out, the 0/1 answer
+  ctrlEnter()
+  fbBlock(64) // block void — $null
+  ctrlEnter()
+  // The RAW nullable ref: a kind-16 param/local/field/global read otherwise recovers itself
+  // with `ref.as_non_null` (0xd4), which TRAPS on the very value this arm answers FALSE for.
+  // A list-element / map / call receiver already yields the raw ref, so the flag is inert
+  // there — one read shape covers every origin.
+  const rawCtx = expCtxHere()
+  rawCtx.rawNullRead = true
+  if emitExprExpect(body, recvIx, fnIx, rawCtx) < 0 { return -1 }
+  wU8(213) // 0xd5 br_on_null — pops it; on non-null leaves (ref $array)
+  wULEB(0) // → $null
+  if emitExpr(body, mkStr(lex, -1), fnIx) < 0 { return -1 }
+  if emitStrEqCore(body) < 0 { return -1 }
+  fbBr(1) // → $out
+  fbEnd()
+  ctrlLeave()
+  fbI32Const(0) // a null receiver is no member
+  fbEnd()
+  ctrlLeave()
+  0
+}
+
 // ONE member-literal test `recv == <lex>`, in whichever shape the RECEIVER's rep demands:
-// the tag-gated payload compare over a value-union BOX, string value-equality over a
-// string ref, the numeric compare otherwise. `lex` is a RAW lexeme (quotes kept, escapes
-// unresolved — a `StrLit.strText`), which is what both callers hold.
+// the tag-gated payload compare over a value-union BOX, the null-guarded string compare over
+// a `string | null` niche, plain string value-equality over a string ref, the numeric compare
+// otherwise. `lex` is a RAW lexeme (quotes kept, escapes unresolved — a `StrLit.strText`),
+// which is what both callers hold.
 //
 // ONE HOME, BECAUSE THE TWO SPELLINGS MUST EMIT THE SAME BYTES. The bare-literal `is "m0"`
 // spelling and the litunion MEMBERSHIP ladder (`is K` → `m0 || m1 || …`) ask the same
 // question of the same value; splitting the per-member lowering is how a rep the membership
 // ladder cannot reach — but the bare literal can — becomes a wrong answer instead of a
 // shared one. Every rep the bare-literal spelling handles, membership handles for free.
+//
+// THE NULL GUARD LIVES HERE FOR THAT REASON. `(string | null) is "x"` and
+// `(string | null) is K` are one question; a guard added at either caller would leave the
+// other spelling trapping (or invalid) on the same value. This is the single source of truth
+// for "a null receiver answers FALSE".
 function emitLitMemberEq(body: i32[], recvIx: i32, lex: string, fnIx: i32) {
   if exprUnion(recvIx, fnIx) { return emitUnionLitIs(body, recvIx, lex, fnIx) }
   // The QUOTED-LEAF test at its home (`tyname.nameIsQuotedLeaf`, W3). A synthesized
@@ -2210,6 +2265,9 @@ function emitLitMemberEq(body: i32[], recvIx: i32, lex: string, fnIx: i32) {
       return emitFail(
         "emitProgram: string `is` test but array type not collected",
       )
+    }
+    if litMemberRecvIsNulString(recvIx, fnIx) {
+      return emitNulStrLitEq(body, recvIx, lex, fnIx)
     }
     if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
     if emitExpr(body, mkStr(lex, -1), fnIx) < 0 { return -1 }
@@ -2229,26 +2287,26 @@ function emitFailNoMembershipRecv() {
 
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to REPEATEDLY — i.e.
 // one whose rep that compare reaches. The reps a string literal union can meet: a
-// value-union BOX (payload compare), a string-repped litunion, and a plain `string`.
+// value-union BOX (payload compare), a string-repped litunion, a plain `string`, and the
+// `string | null` niche (the null-guarded compare, which answers FALSE for null).
 //
-// THE NULLABLE STRING IS EXCLUDED AND THAT IS DELIBERATE. `(string | null) is "x"` — the
-// bare-literal spelling this ladder delegates to — emits `ref.as_non_null` and TRAPS on a
-// null receiver; claiming that rep here would spread the trap across the whole member set
-// rather than answer FALSE for null, which is the answer a membership test owes. Those
-// receivers keep the loud `is` floor below until the null-guarded form lands at BOTH
-// spellings. A receiver NARROWED to non-null (`if s != null { s is K }`) is a different
-// value and IS claimed: `exprNullableString` is declaration-scoped and still calls it
+// THE NULLABLE STRING IS CLAIMED, AND ONLY BECAUSE THE GUARD IS IN THE SHARED COMPARE.
+// `(string | null) is K` and `(string | null) is "m0"` are one question; the membership
+// ladder is nothing but the bare-literal compare repeated, so this bound may only admit a
+// rep `emitLitMemberEq` answers correctly. It admits this one because that helper
+// null-tests the receiver itself (`emitNulStrLitEq`) — claiming the rep while the shared
+// compare still `ref.as_non_null`ed would have spread a TRAP across the whole member set.
+// A receiver NARROWED to non-null (`if s != null { s is K }`) is a different value and
+// reaches the plain compare: `exprNullableString` is declaration-scoped and still calls it
 // nullable, but the CHECKER's banked node type does not, and the read `emitExpr` yields is
-// already recovered — so the two classifiers DISAGREEING is exactly the narrowing signal.
+// already recovered — so the two classifiers DISAGREEING is exactly the narrowing signal
+// (`litMemberRecvIsNulString`, which is the same conjunction the guard keys on).
 //
 // A MONOMORPHIZED receiver is why this asks the emitter's REP classifiers (`exprUnion` /
 // `exprString`, both `fnIx`-scoped) and not the node's banked TYPE: one `v is K` node in a
 // `g<T>(v: T)` body is emitted once per instance, and the instance pinned to `i32` must not
 // take a string compare — invalid wasm traded for a wrong answer.
 function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
-  if exprNullableString(recvIx, fnIx) && nodeTyIsNullable(recvIx) {
-    return false
-  }
   // A BOX reaches the per-member compare through `emitUnionLitIs`, and BOTH of that
   // helper's own union-shape rejects are PRE-CHECKED here rather than let fire from inside.
   // A union it declines — one carrying a STRUCT arm — still has an EXACT box-tag compare
@@ -2263,10 +2321,10 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
   }
   if nodeTyIsLitUnion(recvIx) { return true }
   if exprString(recvIx, fnIx) { return true }
-  // Left over from the first line: the emitter's DECLARATION-scoped classifier still calls
-  // this a nullable string while the CHECKER's banked node type does not — i.e. an active
-  // `!= null` narrowing. The read `emitExpr` yields is already recovered to non-null, so the
-  // per-member compare is exact.
+  // The `string | null` niche, in BOTH of its states and by the same line. Still nullable at
+  // the read (`nodeTyIsNullable` agrees) — the guarded compare; NARROWED by an active
+  // `!= null` (only the declaration-scoped classifier still says nullable) — the plain
+  // compare over the already-recovered read. `emitLitMemberEq` picks between them.
   exprNullableString(recvIx, fnIx)
 }
 
@@ -16504,7 +16562,7 @@ function emitArrayCopyIntr(body: i32[], callIx: i32, fnIx: i32) {
 }
 
 // The fused map/list/struct nullish-coalescing lowering (`emitBinExprNode`'s `??` arm).
-function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
+function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized LHS so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
   // unwrapped place every structural branch below dispatches on and emits; the generic niche
@@ -16612,14 +16670,39 @@ function emitCoalesce(body: i32[], e: BinExpr, _exprIx: i32, fnIx: i32) {
     if emitExprExpect(body, e.binLeft, fnIx, rawCtx) < 0 { return -1 }
     wU8(209) // 0xd1 ref.is_null → 1 if null
     wU8(4)   // 0x04 if
-    wU8(100) // blocktype: (ref $aTypeIdx) — non-null string result
+    // THE RESULT TYPE IS THE DEFAULT'S NULL-NESS, NOT A CONSTANT. A NON-null default
+    // collapses the whole read to `string` (the 2026-07-23 user-semantics ruling
+    // `coalesceStaysNullable` states for the map-value dual), so `(ref $aTypeIdx)`; a
+    // NULLABLE default leaves the result `string | null` and the block must say so, or the
+    // then-arm's legitimately-null value meets a non-null block type. The consumer half of
+    // the condition matters too: only a consumer that asked for the RAW ref
+    // (`pendingRawNullRead` — a `!= null` test, the `is "m"` member compare) can take a
+    // nullable result; a VALUE consumer gets the non-null block and the recovering arms
+    // below, which is the shape every non-null-default program already had.
+    const coNul = pendingRawNullRead && nodeTyIsNullable(exprIx)
+    if coNul {
+      wU8(99) // blocktype: (ref null $aTypeIdx) — the result stays nullable
+    } else {
+      wU8(100) // blocktype: (ref $aTypeIdx) — non-null string result
+    }
     wSLEB(aTypeIdx)
     ctrlEnter()
-    if emitExpr(body, e.binRight, fnIx) < 0 {
-      return -1 // d (a string)
+    // EACH ARM READS UNDER THE BLOCK TYPE THIS LOWERING JUST DECLARED, EXPLICITLY. The arm
+    // reads otherwise run under whatever `pendingRawNullRead` the CONSUMER seeded, so a raw
+    // consumer over a NON-null default left a `(ref null $array)` in a `(ref $array)` block
+    // — the declared result type and the arm bytes disagreeing, which is invalid wasm rather
+    // than a wrong answer. The DEFAULT arm follows the block (raw only when the result is
+    // nullable); the LHS arm is non-null on every path, since it is reached only when
+    // `ref.is_null` said no.
+    const dCtx = expCtxHere()
+    dCtx.rawNullRead = coNul
+    if emitExprExpect(body, e.binRight, fnIx, dCtx) < 0 {
+      return -1 // d (a string, nullable only when the block is)
     }
     fbElse() // 0x05 else
-    if emitExpr(body, e.binLeft, fnIx) < 0 {
+    const valCtx = expCtxHere()
+    valCtx.rawNullRead = false
+    if emitExprExpect(body, e.binLeft, fnIx, valCtx) < 0 {
       return -1 // e recovered non-null
     }
     fbEnd() // 0x0b end
