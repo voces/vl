@@ -5,7 +5,7 @@ value** against an expectation computed independently of the compiler. Nothing h
 inherited from an earlier filing. Where an earlier filing is contradicted, the
 contradiction is stated in "Not a defect".
 
-The sweep is reproducible: `scratch-silent/gen.py` (main grid), `genorder.py`
+The sweep is reproducible: `scripts/silent-sweep/gen.py` (main grid), `genorder.py`
 (declaration-order grid), `sabotage.py` (grader proof), `sweep.sh` (bounded runner, four
 concurrent `vl` invocations), `grade.py` (classifier), `counts.py` / `pivot.py` (tallies).
 
