@@ -449,3 +449,40 @@ property a gate needs. Interleaving modules within a rep spreads any residual dr
 across both sides of an A/B rather than one.
 
 Sequence phase 1 first: it is cheaper, cannot flake, and its failures are exact.
+
+---
+
+## Band 3f — recovered from the stale-branch triage (2026-08-16)
+
+The repo carried **30 local + 11 remote** non-master branches, 289–1381 commits behind.
+All are now deleted; **`git branch --no-merged` was a false-positive machine** because this
+repo squash-merges, so 17 of them had already landed. Every branch was triaged against
+GitHub PR state and, where a defect was claimed, against a live repro. **None was
+finishable as code** — a branch 800 commits behind a moving compiler is an idea, not a
+patch — so what was worth keeping is recorded here and the branches are gone.
+
+| id | item | provenance | evidence | status | eff |
+|---|---|---|---|---|---|
+| **S1** | **`std/testing.vl`** — a general-purpose VL test framework (`describe`/`it`/`expect`/`assert*`) | PR **#313** was closed *specifically because* this was the intended direction instead of a bespoke Rust directive-scraper | **`std/testing.vl` does not exist, and the direction appears nowhere in `workboard.md` or `ROADMAP.md`.** The reason for closing #313 was recorded only in that PR's body, so the successor was never filed | OPEN, **unfiled gap** | L |
+| **S2** | **A guarded `UPDATE_GOLDENS` re-pin mode for the emit fixpoint** | branch `claude/maps-rep-align-host` (2026-06-11, 1 file) | **`UPDATE_GOLDENS` appears nowhere in `tests/` or `scripts/`.** Real ergonomics value: golden/shape tables moved in six PRs this cycle and each was re-pinned by hand | OPEN | S |
+| **S3** | **LSP interactive hover-verbosity stepping (3.18)** | PR **#84**, closed 2026-06-06 | **STILL BLOCKED, and the blocker is exact**: it needs LSP protocol 3.18, and `package.json` pins `vscode-languageserver: ^9.0.1` = protocol 3.17.5. Re-check when that dependency ships a 3.18-capable release | **BLOCKED on a dependency**, unblock condition recorded | M |
+| **S4** | **D-REFARRKIND — the ref-array ladder's three hand-written copies** | branch `recovery-refarrkind` (2026-07-26) | Claimed *"three exported entry points over the same ref-array grammar"* in `emit_classify.vl` (81 mentions there today). **NOT re-derived** — whether the duplication survives is unmeasured. Serves the standing DRY preference | OPEN, **re-derive first** | M |
+| **S5** | **Unify map-value ref-list interning via `ensureRefElem`** | branch `refactor/unify-map-value-reflists` (2026-06-24) | `ensureRefElem` spans 5 files / 37 mentions. **B6 (#1396) already shipped `ensureRefElemTy` in this exact area**, so this may be wholly or partly done. **NOT re-derived** | OPEN, **re-derive first**; may be closed by #1396 | S–M |
+| **S6** | **VKind → litunion conversion (central-web)** | branch `refactor/c2-vkind-litunion`, an abandoned WIP that *did not compile* (~36 checker errors) | The idea is band-1 destringify, and **F2 (#1402) proved the pattern**: a closed vocabulary becomes `type X = "A" \| "B" \| …` and every comparison becomes `i32.eq` with the source text unchanged. Worth redoing from scratch on that template rather than reviving the WIP | OPEN | M |
+
+**Verified-superseded and deleted, with the check that retired each:**
+
+| branch / PR | retired by |
+|---|---|
+| `feat/hoist-lambda-bindings` #628 | repro now prints `7` / `hi!` / `4` — an un-annotated `const add = (a,b) => a+b` monomorphizes per call today |
+| `feat/closure-union-return-factory` #651 | repro now prints `1` — the union-returning closure factory works |
+| `kill-ts-p3-vl-check-dir-exclude` #433 | `vl check <dir>` walks a directory today and `--exclude` is accepted |
+| `feat/rep-layer-fuzzer` #666 | **the rep fuzzer landed**: `scripts/rep-fuzz-check.sh` is a `ci-native` gate with a class-tagged baseline whose header forbids ever baselining a soundness class. The baseline is **14 lines, 13 of them comments — exactly ONE real pinned failure (a REJECT)**, i.e. effectively true zero |
+| `destringify-program` | the `sTyIx[]` arena-index sidecar is on master (`emit_collect.vl:4400`, `emit_sections.vl:3086`, 6 files) |
+| `claude/lsp-wasm-builtins` | `builtinCompletionsFromWasm` is live in `lsp/src/typeFeatures.ts`. The remaining TS imports in `lsp/` are the kill-TS programme's own residue, not this branch's |
+| `lane2-formatter-vl` #369 | explicitly *"NOT for merge"* — the deliverable was a gap inventory, not code |
+| `backup/destringify-typecheck-homes-preswquash` | a pre-squash backup; its D-PARENDOWN/D-ARRDOWN/D-SHAPEDOWN findings are in `destringify-types-program.md` (12 references) |
+| `probe/tcscan` | its own commit says *"never shipped"* — probe instrumentation |
+| 17 squash-merged branches | PR state MERGED; the squash is why `--no-merged` listed them |
+
+**The lesson for this board:** #313 and #369 were both closed *with a reason worth keeping*, and in both cases the reason lived only in a PR body. A closed PR whose rationale points at future work should leave a row here, or the successor is lost with the branch.
