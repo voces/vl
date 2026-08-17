@@ -406,6 +406,7 @@ import {
   calleeReturnsVoid,
   capComputeNamesOf,
   captureCountOf,
+  capturedIsUnionBox,
   captureNamesOf,
   captureValKind,
   cbRetVariantIdx,
@@ -3125,11 +3126,16 @@ function emitUnionBoxPush(_body: i32[], name: string, fnIx: i32) {
   if idx >= 0 {
     fbLocalGet(idx)
   } else {
+    // A CAPTURED union box: read the field RAW out of the env (`recover` false — the box IS
+    // the field's type, and the unbox every caller appends after this push is the recovery).
+    // The narrowing that makes such a read an unbox at all is the closure's
+    // DECLARATION-SITE narrowing, replayed onto the narrowing stack by `capNarrowSeed`;
+    // without that replay the arms that call this never fire inside a lifted body.
+    if emitCapturedRead(_body, name, fnIx, false) == 1 { return 0 }
     const gIdx = globalIndexOf(name)
     if gIdx < 0 {
-      // A captured VALUE-union (`i32 | string`) narrowed-atom read is not yet wired (the unbox
-      // would read off the env) — a clean reject, not invalid wasm. Captured STRUCT-unions,
-      // strings, and nullable structs DO work (their reads route through the ref env field).
+      // Neither a local, a capture of this frame, nor a global — nothing to read the box
+      // out of. A clean reject, not invalid wasm.
       return emitFail(
         "emitProgram: narrowed union binding is not a local or global",
       )
@@ -15875,12 +15881,15 @@ function emitCharLitNode(_body: i32[], e: CharLit, _exprIx: i32, _fnIx: i32) {
 // six lookups become array reads too.
 function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
   const isid = sidOfNode(exprIx)
-  // A CAPTURED variable (a free var of a capturing lifted function): read it from the
-  // env struct threaded as the leading param (local 0) —
-  // `struct.get $env <fieldIdx> (ref.cast (local.get 0) (ref $env))`. Checked FIRST so
-  // a capture shadows nothing (it is neither a param/local of this function nor a
-  // global). Only fires inside a capturing lifted function.
-  if emitCapturedRead(body, e.identName, fnIx, true) == 1 { return 0 }
+  // THE NARROWED-ARM UNBOXES COME FIRST, and a CAPTURE is read through them like any other
+  // storage class. Each of the three arms below sources its box through
+  // `emitUnionBoxPush`, whose own capture leg reads the env field raw — so a capture that
+  // is narrowed at the closure's declaration site (replayed by `capNarrowSeed`) unboxes
+  // exactly as a param/local/global does, and one that is NOT narrowed falls through to
+  // the plain env read below. Ordering these after the env read is what made a narrowed
+  // captured union push the raw box where the arm's rep was expected: `vl check`-clean
+  // invalid wasm, with `emitUnionBoxPush`'s own reject for it unreachable.
+  //
   // A VALUE-union binding narrowed to ONE scalar atom reads UNBOXED: push the
   // box, recover the `anyref` payload, cast it, and (for a scalar atom) read
   // the value-box field — `if u is i32 { print(u) }` yields the raw i32.
@@ -15890,6 +15899,12 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
     // below (master derived it inside the callee, i.e. once per read).
     const vak = valueAtomKind(vAtom)
     if unionNameOfIdentSid(isid, fnIx) != "" {
+      return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
+    }
+    // THE CAPTURE STORAGE CLASS's gate. The name question above resolves a binding in THIS
+    // frame; a capture's binding is in another one, so it answers "" while the read is
+    // narrowed. `capturedIsUnionBox` asks the rep instead — see its own comment.
+    if capturedIsUnionBox(fnIx, e.identName) {
       return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
     }
     // THE TYPED-IR NET behind the syntactic miss — all three narrowed-arm reads in this
@@ -15912,6 +15927,10 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
     if unionNameOfIdentSid(isid, fnIx) != "" {
       return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
     }
+    // The capture storage class's gate (see the value-atom arm above).
+    if capturedIsUnionBox(fnIx, e.identName) {
+      return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
+    }
     // The typed-IR net (see the value-atom arm above). This arm: `const t1 = t0(1,1,1)`
     // off a narrowed nullable-closure param — the box reached the list wrapper
     // (fuzz sweep4 declared leg, seed 462516905 case_00383).
@@ -15927,6 +15946,10 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
     if unionNameOfIdentSid(isid, fnIx) != "" {
       return emitMapUnionUnboxRead(body, e.identName, fnIx)
     }
+    // The capture storage class's gate (see the value-atom arm above).
+    if capturedIsUnionBox(fnIx, e.identName) {
+      return emitMapUnionUnboxRead(body, e.identName, fnIx)
+    }
     // The typed-IR net (see the value-atom arm above), over the MAP-arm chain. This arm:
     // the rebind `const t1 = t0(); const t2 = t1` off a narrowed nullable-closure VALUE
     // call — the box reached the map-struct frame (fuzz-nightly plain leg, seed
@@ -15935,6 +15958,12 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
       return emitMapUnionUnboxRead(body, e.identName, fnIx)
     }
   }
+  // A CAPTURED variable (a free var of a capturing lifted function): read it from the
+  // env struct threaded as the leading param (local 0) —
+  // `struct.get $env <fieldIdx> (ref.cast (local.get 0) (ref $env))`. Checked before the
+  // param/local/global paths so a capture shadows nothing (it is neither a param/local of
+  // this function nor a global). Only fires inside a capturing lifted function.
+  if emitCapturedRead(body, e.identName, fnIx, true) == 1 { return 0 }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
   const idx = localIndexOf(fnIx, e.identName)
   if idx < 0 {

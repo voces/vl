@@ -117,6 +117,27 @@ Two consequences worth stating:
   another agent's artefact is indistinguishable from a fix that does nothing.
 
 ## Trimmed gates (CI covers the full battery)
+- **`ci-native` runs SIX suite groups and my gate list covered only three.** A real
+  failure hid there: PR #1450's `ci-native` went red on
+  `tests/lsp_undisplayable_type_test.ts`, a corpus-wide sweep asserting the LSP's
+  undisplayable-type filter drops inlay hints **only** on files that carry an error
+  diagnostic — with its exceptions pinned **by name** *"so a second such file fails this
+  test instead of hiding in a count"*. It did exactly that. Run all of it:
+
+      SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel \
+        tests/selfhost_native_*_test.ts tests/vl_*_test.ts
+      deno test -A --no-check tests/lsp_inlay_hint_test.ts \
+        tests/lsp_semantic_tokens_test.ts tests/lsp_undisplayable_type_test.ts
+      deno test -A tests/cases_wasm_test.ts
+
+  **The env var is load-bearing on the first line**: without it that command reads
+  **62 passed / 2050 ignored**; with it, **2112 passed / 0 failed**. CI sets it in the
+  step's own `env:` block. The `--no-check` is also load-bearing locally — without it the
+  LSP suites die on an `npm:@types/node` resolution error before any test runs.
+  **A fix that makes an illegal program legal can redden an LSP suite**, because a
+  newly-clean file may carry a hint whose type has no spelling (`() -> <none>[]` for an
+  un-annotated empty-array lambda). That is the filter working, not a regression — pin the
+  file and derive the expected count from the set so name and count cannot drift.
 - **The `ci` job is NOT the native one, and its three cheap steps were missing from
   every agent gate list until #1444.** Agents ran the native battery
   (`refresh-compiler`, `lint-self`, the `.vl` corpus, align, release, rep-fuzz, the

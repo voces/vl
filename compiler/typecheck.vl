@@ -2300,10 +2300,15 @@ function unionArrayArmForLit(u: TyUnion, arrIx: i32) {
     while i < members.length {
       const m = members[i]
       const mt = T.tys[m]
-      if mt is TyArray {
-        const aet = T.tys[mt.aElem]
+      // The HOLE declines this ARM and the scan moves to the next member
+      // (`tyArrayElemIx`): an array arm whose element the arena has not resolved carries
+      // `aElem == -1`, and reading it is an out-of-bounds `array.get` in the compiler.
+      // Declining the arm is the same answer the seed already gives a scalar-element arm.
+      const aeIx = tyArrayElemIx(m)
+      if mt is TyArray && aeIx >= 0 {
+        const aet = T.tys[aeIx]
         if aet is TyFunc { return m }
-        if aet is TyObj && unionArmSeedSafe(mt.aElem) {
+        if aet is TyObj && unionArmSeedSafe(aeIx) {
           // Every literal element that is an ObjLit must field-check against the arm's struct
           // element (mirrors `unionObjArmForLit`), so a wrong-shaped arm is not seeded.
           let ok = true
@@ -2551,10 +2556,10 @@ export function initChecker() {
   npInvBy = []
   npEpochs = []
   npFrames = []
-  weKeys = []
-  weVals = []
+  weSums = Map()
   weOpen = []
   weRoots = []
+  weFnDecls = Map()
   weCut = 0
   asgSrcStack = []
   asgDstStack = []
@@ -2926,8 +2931,13 @@ function placeSubPath(ix: i32, root: string) {
 // `weOpen` is the in-progress stack. A recursive cycle answers `"*"`, not "writes
 // nothing": a summary that guesses must guess CLOSED, and a one-pass walk has no
 // fixpoint to fall back on.
-let weKeys: string[] = []
-let weVals: string[] = []
+//
+// A MAP, not parallel arrays, because the bank is read once per (live narrowing ×
+// call) while it grows one entry per summarised (callee, parameter): a scan makes the
+// predicate quadratic in the number of DISTINCT callees a guarded region calls, which
+// is the dominant term for property-path guards. `""` is a legitimate value ("writes
+// nothing"), so presence is asked with `has` and never inferred from the value.
+let weSums: {[string]: string} = Map()
 let weOpen: string[] = []
 
 // The function bodies currently being summarised, innermost last. A call inside a
@@ -2977,11 +2987,7 @@ function weSplit(s: string) {
 // The write-effect summary of parameter `paramIx` of the `FuncDecl` at `fnIx`.
 function fnWriteEffects(fnIx: i32, paramIx: i32) {
   const key = i32ToStr(fnIx) + "#" + i32ToStr(paramIx)
-  let ci = 0
-  while ci < weKeys.length {
-    if weKeys[ci] == key { return weVals[ci] }
-    ci = ci + 1
-  }
+  if weSums.has(key) { return weSums[key] ?? "*" }
   if weIsOpen(key) { return weCycleAnswer() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
@@ -3024,8 +3030,7 @@ function weCycleAnswer() {
 // summary was still open, which is the one case the first pass leaves too small.
 function weCache(key: string, acc: string, cutBefore: i32) {
   if weCut != cutBefore && weOpen.length > 0 { return 0 }
-  weKeys.push(key)
-  weVals.push(acc)
+  weSums[key] = acc
   0
 }
 
@@ -3041,7 +3046,36 @@ function findFnDeclInRoots(name: string) {
   -1
 }
 
+// The subtree walk, MEMOISED on `(rootIx, name)`. Every query inside one summary asks
+// the same root, and an INTRINSIC call (`print`) asks a name no root holds — so the
+// uncached walk is re-run per call in the body, making one summary quadratic in the
+// number of calls that body makes. The NEGATIVE answer is the one worth banking:
+// `-1` means "this subtree was walked and holds no such declaration".
+//
+// The memo is exact rather than approximate. `findFnDeclWalk` is a pure function of
+// `(P.nodes, rootIx, name)` and the checker appends no nodes, so a banked answer is
+// the answer the walk would give.
+//
+// KEYING ON THE ROOT IS LOAD-BEARING. The same name resolves to different
+// declarations under different enclosing bodies, so a name-only memo — or a flat
+// module-wide name→declaration map — can answer a declaration this walk would never
+// reach. That direction fails OPEN: `callDeclFnIx` would summarise an unrelated body
+// as writing nothing where it owes the caller the opaque answer.
 function findFnDeclIn(rootIx: i32, name: string) {
+  if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
+  const key = i32ToStr(rootIx) + "#" + name
+  if weFnDecls.has(key) { return weFnDecls[key] ?? -1 }
+  const d = findFnDeclWalk(rootIx, name)
+  weFnDecls[key] = d
+  d
+}
+
+// Memo bank for `findFnDeclIn`, keyed `"<subtree-root-node-ix>#<name>"`.
+let weFnDecls: {[string]: i32} = Map()
+
+// The uncached pre-order walk: the FIRST `FuncDecl` named `name` in the subtree, the
+// root itself included, or -1.
+function findFnDeclWalk(rootIx: i32, name: string) {
   if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
   const n = P.nodes[rootIx]
   if n is FuncDecl {
@@ -3050,7 +3084,7 @@ function findFnDeclIn(rootIx: i32, name: string) {
   const kids = nodeChildren(rootIx)
   let i = 0
   while i < kids.length {
-    const d = findFnDeclIn(kids[i], name)
+    const d = findFnDeclWalk(kids[i], name)
     if d >= 0 { return d }
     i = i + 1
   }
@@ -3260,11 +3294,7 @@ function nameIn(names: string[], name: string) {
 // mutation routes that reach a field with no argument at all.
 function fnWriteFreePaths(fnIx: i32) {
   const key = i32ToStr(fnIx) + "#free"
-  let ci = 0
-  while ci < weKeys.length {
-    if weKeys[ci] == key { return weVals[ci] }
-    ci = ci + 1
-  }
+  if weSums.has(key) { return weSums[key] ?? "*" }
   if weIsOpen(key) { return weCycleAnswer() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
@@ -7910,6 +7940,37 @@ function tyPrimNameOf(ix: i32): string {
 function tyIsPrimNamed(ix: i32, nm: string): boolean {
   if nm == "" { return false }
   tyPrimNameOf(ix) == nm
+}
+
+// ── the ELEMENT row of an array type, with the empty-`[]` hole answered ONCE ──
+// The element ARENA INDEX of `ix` when `ix` is a `TyArray` whose element names a real
+// arena row; `-1` when `ix` is not an array, or when its element is the HOLE.
+//
+// THE one home for `TyArray.aElem`'s hole. `aElem` is `-1` for an empty `[]` whose
+// element type is not yet known — that is the declared representation (see `TyArray`),
+// not a corruption — so `T.tys[t.aElem]` on such a type is an out-of-bounds `array.get`
+// INSIDE THE COMPILER: no diagnostic, no source location, no module, just a wasm
+// backtrace through `vl-compiler.wasm`. That is strictly the worst failure this file can
+// produce, and it is one missing comparison away from every element read.
+//
+// The census that motivates a named home: this file dereferences `aElem` at 22 sites and
+// EIGHTEEN of them spell `if x.aElem < 0 { return … }` inline immediately above the read.
+// The four that did not were a SHORTENED MIRROR of those eighteen — `nulElemListRetName`
+// was the only member of its own thirteen-function `*RetName` ladder without the guard,
+// and `structElemFieldsPlain` had the comparison ONE LINE BELOW the read it needed to
+// gate. A reader adding the next element read asks this function instead of copying a
+// sibling and losing the line.
+//
+// The UPPER bound is checked too: an index past the arena end traps identically, and no
+// inline guard had it.
+function tyArrayElemIx(ix: i32): i32 {
+  if ix < 0 || ix >= T.tys.length { return -1 }
+  const t = T.tys[ix]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return -1 }
+    return t.aElem
+  }
+  -1
 }
 
 // ── structural type equality ─────────────────────────────────────────────────
@@ -16850,6 +16911,46 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             objRetAdopted = true
           }
         }
+        // EMPTY-`[]` RESULT THAT NO ARM ABOVE ADOPTED — the LOUD FLOOR, and the LAST rung of
+        // this ladder. `const fq: () => string[] = () => { return [] }` infers the element
+        // HOLE (`TyArray.aElem == -1`): not a narrower version of the annotation's rep, the
+        // ABSENCE of one. When an arm above adopted, `inferred == expRet` and this cannot
+        // fire; when nothing did, the lambda's `fnRet` stays the hole while the value call
+        // casts the funcref to the annotation's `$fnsig` — `wasm trap: indirect call type
+        // mismatch`, check-clean, module written — or the body's list `struct.new` disagrees
+        // with the result slot (invalid wasm). Neither is a diagnostic a reader can act on.
+        //
+        // The exemption is the I32-BACKED elements (`i32`, `boolean`): they share the one
+        // i32-list backing, so the hole and the annotation name the SAME list rep and the
+        // un-adopted lowering is already correct (measured: 12 of 12 cells correct). Every
+        // rep that needs its own backing either adopts above (`i64`/`f64`/`f32` via
+        // `scalarLeafListRetName`, a struct element via `structElemListRetName`, a litunion
+        // element via `litUnionElemListRetName`) or lands here.
+        //
+        // The named-function spelling of the same program lowers, so the message names it:
+        // `scalarLeafListRetName`'s exclusion note ("`string[]` self-classifies identically
+        // to the annotation, so no adoption is ever needed") is true of a NON-EMPTY literal
+        // and false of an empty one, which is why this rep reached emit unpinned at all.
+        if inferred != expRet && unresolvedHole(inferred) {
+          const ehT = T.tys[expRet]
+          if ehT is TyArray {
+            if (
+              !tyIsPrimNamed(ehT.aElem, "i32") &&
+              !tyIsPrimNamed(ehT.aElem, "boolean")
+            ) {
+              tErrUnsupported(
+                "a lambda returning an empty `[]` cannot build the " +
+                  tyToStr(expRet) +
+                  " result its annotation asks for — type-valid, but the element type has no" +
+                  " rep to build from; return the literal from a named function" +
+                  " (`function f(): " +
+                  tyToStr(expRet) +
+                  " { return [] }`), which lowers this",
+                n.fnBody,
+              )
+            }
+          }
+        }
       }
     }
     // PERMISSIVE FALL-THROUGH (totality): an un-annotated function that can fall off the
@@ -19082,7 +19183,12 @@ function nulElemListRetName(er: i32) {
   if er < 0 { return "" }
   const t = T.tys[er]
   if t is TyArray {
-    const et = T.tys[t.aElem]
+    // The HOLE declines here (`tyArrayElemIx`): an un-annotated lambda returning a bare
+    // `[]` reaches this ladder with an element index of `-1`, and reading it was the
+    // compiler's own out-of-bounds `array.get` — check-stage, no diagnostic, no module.
+    const ei = tyArrayElemIx(er)
+    if ei < 0 { return "" }
+    const et = T.tys[ei]
     if et is TyNullable {
       // The inner's PRIMITIVE name, read off the arena (`tyPrimNameOf`) rather than
       // recovered from a `tyToStr` render — here the name is the emitted PAYLOAD, so
@@ -19378,13 +19484,18 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
       // INVALID-WASM (fuzz post-#996 sweep plain leg, seed 849016038 case_00056).
       // Scalar-element lists admit too (same rep argument); a deeper composite
       // element declines as before.
-      if fty >= 0 {
-        const aet = T.tys[ft.aElem]
+      // `tyArrayElemIx` decides the element row BEFORE it is read. The `>= 0` comparison
+      // used to sit one line BELOW the `T.tys[ft.aElem]` above it, so it gated the litunion
+      // and nested-struct probes while the read that actually needed it went unguarded — an
+      // inferred `{f: []}` field carries the `-1` hole and trapped the compiler.
+      const feIx = tyArrayElemIx(fty)
+      if feIx >= 0 {
+        const aet = T.tys[feIx]
         if aet is TyPrim { ok = true }
-        if !ok && ft.aElem >= 0 {
-          if tyIsLitUnion(ft.aElem) { ok = true }
+        if !ok {
+          if tyIsLitUnion(feIx) { ok = true }
           if aet is TyObj {
-            if structElemFieldsPlain(ft.aElem, depth - 1) { ok = true }
+            if structElemFieldsPlain(feIx, depth - 1) { ok = true }
           }
           // A BOX-ELEMENT-UNION LIST field (`f: (i64|string|{q:i64})[]` inside
           // `{f: (i64|string|{q:i64})[]}`): the field array's elements ride the union
@@ -19770,7 +19881,12 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
     while gi < members.length {
       const m = T.tys[members[gi]]
       if m is TyArray {
-        const et = T.tys[m.aElem]
+        // The HOLE declines with every other non-object element (`tyArrayElemIx`): an
+        // arm whose element the arena has not resolved carries `aElem == -1`, and
+        // reading it is the compiler's own out-of-bounds `array.get`.
+        const meIx = tyArrayElemIx(members[gi])
+        if meIx < 0 { return "" }
+        const et = T.tys[meIx]
         if !(et is TyObj) { return "" }
         hasList = true
       } else if m is TyObj {
