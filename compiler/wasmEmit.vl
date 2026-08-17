@@ -10436,12 +10436,7 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
               "emitProgram: print of a literal-union atom whose type carries no member texts",
             )
           }
-          const lpRc = emitPrintAtomMemberChain(
-            body,
-            c.callArgs[0],
-            lpTexts,
-            fnIx,
-          )
+          const lpRc = emitPrintAtomStr(body, c.callArgs[0], lpTexts, fnIx)
           return lpRc
         }
         // A NULLABLE-string value (`string | null` — a niche binding, a `(string|null)[]`
@@ -15230,56 +15225,70 @@ function emitPrintNulBool(body: i32[], argIx: i32, fnIx: i32) {
   0
 }
 
-// The per-member print chain for an ATOM-repped literal union: for each member, `if id == <that
-// member's interned id> { print "<member>" }`. Membership is total for a non-null atom, so exactly
-// one arm fires and no default is needed. The value is RE-READ per member rather than stashed,
-// which keeps this off the string-op scratch frame and therefore out of the reservation scan
-// (`exprHasStrOp`) — the same trade `emitStrToAtom` documents for its own tower.
+// `print(<literal-union atom>)` — widen the atom to its member STRING through the SAME tower
+// every other atom consumer uses (`emitAtomToStrChain`), then stream it.
 //
-// ONE HOME for the chain: the bare-atom print and the `K | null` niche print below emit the
-// identical member arms, and the niche only ADDS a sentinel arm after them.
-function emitPrintAtomMemberChain(
-  body: i32[],
-  argIx: i32,
-  texts: string[],
-  fnIx: i32,
-) {
-  let i = 0
-  while i < texts.length {
-    const q = quoteLex(texts[i])
-    if emitExpr(body, argIx, fnIx) < 0 { return -1 }
-    fbI32Const(internAtom(q))
-    fbI32Bin(70) // 0x46 i32.eq
-    fbIf(64)     // if (void)
-    ctrlEnter()
-    if emitPrintStrExpr(body, mkStr(q, -1), fnIx) < 0 { return -1 }
-    fbEnd()
-    ctrlLeave()
-    i = i + 1
-  }
-  0
+// ONE EVALUATION, AND THAT IS WHY THE TOWER IS SHARED RATHER THAN RE-SPELLED HERE. A per-member
+// `if id == <that member's id> { print "<member>" }` chain has to re-read the receiver once per
+// member; for a re-readable PLACE that is free, but for a CALL each re-read is another call, so
+// `print(f())` ran `f` once per member — twice for a 2-member alias, three times for a
+// 3-member one, and members+1 through the niche below, with `vl check` clean and the module
+// valid. Every other consumer of an atom (`+` concat, a `string` argument position, a `string`
+// return) already reached `emitAtomToStr` and was correct; the print chain was the second copy
+// of the tower, and the copy is what got the count wrong.
+//
+// The str-op scratch frame this rides is already reserved for exactly this shape — the
+// reservation scan's `print` arm asks `exprIsLitAtom`, the same question the print handler's
+// first arm asks — so sharing the tower needs no new reservation work.
+function emitPrintAtomStr(body: i32[], argIx: i32, texts: string[], fnIx: i32) {
+  if emitStashAtomId(body, argIx, fnIx) < 0 { return -1 }
+  emitPrintAtomFromStash(body, texts)
+}
+
+// The stashed-id half of the atom print: the shared widen tower over str-op scratch i32 slot 0,
+// then the streaming print of the string it yields. Split out so the `K | null` niche below
+// reaches it from INSIDE its sentinel guard without re-evaluating the receiver.
+function emitPrintAtomFromStash(body: i32[], texts: string[]) {
+  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  fbLocalSet(strScratchBase + 0)
+  emitPrintStrFromScratch(body)
 }
 
 // `print(<K | null>)` — the atom NICHE: an i32 member id with `-1` for null, the same sentinel
-// `emitNulIsNullTest`'s litunion arm compares against. The member chain, then the sentinel arm
-// that prints the word `null`, so the niche renders like the two nullable scalars beside it
-// (`emitPrintNulString`, `emitPrintNulBool`) — `p` / `null` / `q` for `["p", null, "q"]`.
+// `emitNulIsNullTest`'s litunion arm compares against. The sentinel arm prints the word `null`
+// and the member arm widens through the shared tower, so the niche renders like the two nullable
+// scalars beside it (`emitPrintNulString`, `emitPrintNulBool`) — `p` / `null` / `q` for
+// `["p", null, "q"]`.
 //
 // A `null` element is ORDINARY, so this must not be a reject: the members and the sentinel
 // partition the i32, and the value carries its own discriminator.
+//
+// BOTH ARMS READ THE STASH, NOT THE RECEIVER — one evaluation covers the sentinel test and the
+// widen, where a re-read spelling cost this niche members+1 evaluations of a call receiver. The
+// sentinel test is emitted FIRST because the member arm's streaming loop reuses slot 0 as its
+// cursor, so the sentinel has to have been decided by then; two `if`s rather than an `if/else`
+// because a second read of the stash is free.
 function emitPrintNulLitUnion(
   body: i32[],
   argIx: i32,
   texts: string[],
   fnIx: i32,
 ) {
-  if emitPrintAtomMemberChain(body, argIx, texts, fnIx) < 0 { return -1 }
-  if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+  if emitStashAtomId(body, argIx, fnIx) < 0 { return -1 }
+  pushStrScrI(body, 0)
   fbI32Const(-1)
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(64)     // if (void)
   ctrlEnter()
   emitPrintNullWord()
+  fbEnd()
+  ctrlLeave()
+  pushStrScrI(body, 0)
+  fbI32Const(-1)
+  fbI32Bin(71) // 0x47 i32.ne
+  fbIf(64)     // if (void)
+  ctrlEnter()
+  if emitPrintAtomFromStash(body, texts) < 0 { return -1 }
   fbEnd()
   ctrlLeave()
   0
@@ -15354,14 +15363,27 @@ export function emitAtomToStr(body: i32[], atomIx: i32, fnIx: i32) {
   //   · And it would make the SCAN have to agree with this handler on MEMBER COUNT — a second
   //     axis for the scan-vs-handler mismatch that is this repo's richest invalid-wasm vein,
   //     added to the target-shape axis the scan already has to get right.
-  // Evaluate the atom (its i32 id) once, stash in the str-op scratch i32 slot 0.
+  if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
+  const r = emitAtomToStrChain(body, texts, 0)
+  r
+}
+
+// Evaluate an atom-repped literal-union value ONCE and stash its interned i32 id in the
+// string-op scratch i32 slot 0 — the slot every widen tower (`emitAtomToStrChain`) re-reads
+// once per member.
+//
+// THE STASH IS THE WHOLE REASON THE EVALUATION COUNT IS RIGHT, so it is the one home for
+// "read the atom". A tower that re-read the RECEIVER per member instead would be correct only
+// for a re-readable PLACE and would re-run a CALL receiver once per member — a silent wrong
+// number of evaluations, not a wrong value. `pendingLitUnion` is raised for the read because
+// the id, not the member string, is what the tower compares.
+function emitStashAtomId(body: i32[], atomIx: i32, fnIx: i32) {
   const savedLU = pendingLitUnion
   pendingLitUnion = 1
   if emitExpr(body, atomIx, fnIx) < 0 { return -1 }
   pendingLitUnion = savedLU
   setStrScrI(body, 0)
-  const r = emitAtomToStrChain(body, texts, 0)
-  r
+  0
 }
 
 // The `select` tower for `emitAtomToStr`: member `i`'s string if its interned id matches the
