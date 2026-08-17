@@ -44,10 +44,17 @@ Re-run `bash scripts/refresh-compiler.sh` after every `compiler/*.vl` edit.
     scripts/vl-host/target/release/vl check <file> --compiler build/vl-compiler.wasm
     scripts/vl-host/target/release/vl run   <file> --compiler build/vl-compiler.wasm
 A file is PROMOTABLE only when check passes AND run stdout exactly equals
-`sed -n 's|^// @log ||p' <file>`. Promote by adding it to
+`sed -n 's|^// @log ||p' <file>`. ~~Promote by adding it to
 `tests/selfhost_native_align_test.ts` (both its `WHITELIST` and `RUN_CASES`
-lists). A file that advances to a
-later failure stage is progress to report, not promote.
+lists).~~ **STALE — neither list EXISTS** (`grep -rn 'WHITELIST\|RUN_CASES'
+tests/ scripts/` returns one comment saying so, and nothing else). That suite is
+**coverage BY DISCOVERY**: it walks every `.vl` under `tests/cases/` and routes
+each file into exactly one tier from its OWN directives (`tiersOf`), with
+tripwires that fail on a stale `EXCLUSIONS` entry, on a file claiming two tiers,
+and on an untiered file that carries any directive. So promotion is done by
+giving the fixture its directives — adding a name to a list promotes nothing,
+and looking for the list to add it to is the vacuous step. A file that advances
+to a later failure stage is progress to report, not promote.
 
 To diagnose invalid emitted wasm. **CHECK WHICH DISASSEMBLER YOU HAVE FIRST** —
 `wasm-tools` is the better tool (spec-grade, full WasmGC, byte-level `dump`; see
