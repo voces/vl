@@ -645,6 +645,15 @@ let argCstrWho: string[] = []
 // so the exported struct shape is unchanged.
 let constScopes: {[string]: boolean}[] = []
 
+// The function-DECLARATION chain, PARALLEL to `T.scopes`: each frame records the
+// arena node of every `FuncDecl` declared in it. `fnDeclIx` answers the same
+// question for TOP-LEVEL functions only; this answers it for a NESTED one too,
+// under the scope chain's own shadowing rule, which is what a call needs to
+// recover the callee's parameter list — and with it the DEFAULTS a call site may
+// omit. Kept module-level (not a `Checker` field) so the exported struct shape
+// is unchanged, exactly like `constScopes`.
+let fnDeclScopes: {[string]: i32}[] = []
+
 // UN-INFERRED EMPTY-COLLECTION FLOOR (mirrors the host's `reportUninferredBinding`
 // in `compiler/typecheck.ts`): an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream
@@ -2323,6 +2332,8 @@ export function initChecker() {
   T.scopes.push(Map())
   constScopes = []
   constScopes.push(Map())
+  fnDeclScopes = []
+  fnDeclScopes.push(Map())
   pendNames = []
   pendTys = []
   pendAts = []
@@ -3537,6 +3548,7 @@ function pushScopeSpan(owner: i32) {
 function pushScope(owner: i32) {
   T.scopes.push(Map())
   constScopes.push(Map())
+  fnDeclScopes.push(Map())
   npFrames.push(npKeys.length)
   pgFrames.push(pgKeys.length)
   asgDeclFrames.push(asgDeclKeys.length)
@@ -3554,6 +3566,7 @@ function popScope() {
   flushUninferred(T.scopes.length - 1)
   T.scopes.pop()
   constScopes.pop()
+  fnDeclScopes.pop()
   if npFrames.length > 0 {
     const base = npFrames[npFrames.length - 1]
     npFrames.pop()
@@ -4059,6 +4072,33 @@ export function declare(name: string, ty: i32) {
   const top = T.scopes.length - 1
   T.scopes[top][name] = ty
   0
+}
+
+// Record `nodeIx` as the `FuncDecl` that `name` declares in the CURRENT scope.
+function declareFnDeclNode(name: string, nodeIx: i32) {
+  const top = fnDeclScopes.length - 1
+  if top >= 0 { fnDeclScopes[top][name] = nodeIx }
+  0
+}
+
+// The `FuncDecl` node `name` currently resolves to, or -1 when it resolves to
+// something that is not a function declaration.
+//
+// The walk stops at the FIRST scope that binds `name` at all and asks only that
+// frame — the scope chain's own shadowing rule. So a local binding that shadows
+// a function name (`const parse = …` beside `function parse(…)`) answers -1
+// rather than reaching past itself to the function, and the call keeps the
+// exact-arity gate a function VALUE must have.
+function lookupFnDeclNode(name: string) {
+  let i = T.scopes.length - 1
+  while i >= 0 {
+    if T.scopes[i].has(name) {
+      if i < fnDeclScopes.length { return fnDeclScopes[i][name] ?? -1 }
+      return -1
+    }
+    i = i - 1
+  }
+  -1
 }
 
 // Look `name` up through the scope chain, innermost first. Returns its type-arena
@@ -11931,14 +11971,15 @@ function fnParamNamesOf(name: string) {
 }
 
 // The DECLARED parameter nodes behind a call's callee, when the call is DIRECT
-// — an `Ident` naming a top-level function. A closure-valued callee has no
-// declaration to read defaults from, so it answers the empty list and every
-// default-driven relaxation is off for it: a function VALUE keeps full arity.
+// — an `Ident` that the scope chain resolves to a `FuncDecl` (top-level or
+// nested). A closure-valued callee has no declaration to read defaults from, so
+// it answers the empty list and every default-driven relaxation is off for it:
+// a function VALUE keeps full arity.
 function calleeDeclParams(calleeIx: i32) {
   const none: i32[] = []
   const cf = P.nodes[calleeIx]
   if cf is Ident {
-    const dIx = fnDeclIx[cf.identName] ?? -1
+    const dIx = lookupFnDeclNode(cf.identName)
     if dIx >= 0 {
       const d = P.nodes[dIx]
       if d is FuncDecl { return d.fnParams }
@@ -13851,6 +13892,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // that silently means something else. Anchored on the decl node, so the pass-1 hoist
   // and this pass report the SAME (message, anchor) pair and `tErrCoded` dedups them.
   checkNotEmitterIntrinsic(n.fnName, fnIx)
+  // Bind the name to THIS declaration node in the ENCLOSING scope (the body's
+  // own scope is pushed further down), so a call inside that scope can recover
+  // the parameter list — and its DEFAULTS. A top-level function is already
+  // recorded by the pass-1 hoist under the same name; a NESTED one has no hoist
+  // and is recorded here, which is also the point it becomes callable.
+  if n.fnName != "" { declareFnDeclNode(n.fnName, fnIx) }
   const inferring = n.fnRet < 0
   // The infer-stack KEY: a named function uses its name (so self-recursion is detected); an
   // ANONYMOUS lambda has no name, so key it by NODE INDEX — else two nested anonymous lambdas
@@ -15489,6 +15536,7 @@ function checkProgramNode(n: Program) {
       }
       declare(s.fnName, mkFuncTy(hpt, hret))
       fnDeclIx[s.fnName] = stmts[hi]
+      declareFnDeclNode(s.fnName, stmts[hi])
       // REGISTER a free index operator (B14). Its ARITY is fixed by the operator
       // — `"[]"` is (self, index), `"[]="` is (self, index, value) — and checking
       // it here means a malformed declaration is reported once, at itself, rather
