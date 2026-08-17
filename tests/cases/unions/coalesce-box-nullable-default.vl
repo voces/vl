@@ -1,0 +1,177 @@
+// @run
+// @log A
+// @log B
+// @log 1
+// @log 2
+// @log 1
+// @log 2
+// @log 1
+// @log 2
+// @log 1
+// @log 2
+// @log 1
+// @log 2
+// @log 3
+// @log 1
+// @log 2
+// @log 1
+// @log 7
+// @log 1
+// @log 1
+// @log 7
+// @log 1.5
+// @log 2.5
+// @log 1
+// @log 2
+// @log 9
+// @hint redundant type annotation: `nv` is inferred as `i32?`
+// A `p ?? q` whose DEFAULT is itself nullable, over the reps that are NOT the
+// `string | null` niche: the value-union BOX (`i32 | null`, `f64 | null`) and the
+// nullable-STRUCT niche (`S | null`).
+//
+// Every one of those arms computed its result rep as the RESIDUAL non-null member — the
+// unboxed scalar for the box, `(ref $struct)` for the niche — which is right only for a
+// NON-null default. With a nullable default the result is still `T | null`, and `T | null`
+// has no unboxed rep, so:
+//   • an ANNOTATED / argument / return consumer already held the nullable cell and the
+//     lowering pushed the residual into it — `vl check` rc 0, INVALID WASM;
+//   • an INFERRED consumer (`const nv = p ?? q`, `let`, a top-level binding) took its cell
+//     from the same wrong answer, so its later `nv != null` found no nullable rep to test —
+//     a loud `bare null needs a struct-typed context` (box) / `struct equality is not
+//     supported yet` (niche).
+//
+// `coalesceDefaultNullable` is the one decision, asked by all four emit arms and by both
+// consumer-side classifiers (`unionNameOfExpr`'s `??` arm for the box, with `exprUnion`
+// DELEGATING to it; `exprNullableStruct`'s for the niche). It is STRUCTURAL in the chain,
+// never banked: `p ?? q ?? r` re-associates to `p ?? (q ?? r)` through `mkBinary(…, -1)`
+// and that synthesized node has NO banked checker type, so a banked test cannot see it at
+// all — the `??` arm recurses to the chain's LAST default, which is always a real node.
+//
+// The `string | null` rows are the NICHE control (green before and after — #1422's
+// `coalesceNulStrStaysNullable`), and the NON-null-default rows are the control for the
+// other direction: they must keep lowering to the residual rep, unboxed.
+//
+// A LOG mismatch is not reachable for this defect: on master every non-control row either
+// failed to validate or failed to emit, so the pin is the verdict plus the values.
+type S = { v: i32 }
+
+// ---- string | null — the NICHE control ----
+function gStr(p: string | null, q: string | null) {
+  const nv = p ?? q
+  if nv != null { print(nv) } else { print("Z") }
+  0
+}
+gStr(null, "A")
+gStr("B", "A")
+
+// ---- i32 | null: an INFERRED binding (the loud half on master) ----
+function gBind(p: i32 | null, q: i32 | null) {
+  const nv = p ?? q
+  if nv != null { print(nv) } else { print(0) }
+  0
+}
+gBind(null, 1)
+gBind(2, 1)
+
+// ---- i32 | null: an ANNOTATED binding (the invalid-wasm half on master) ----
+function gAnn(p: i32 | null, q: i32 | null) {
+  const nv: i32 | null = p ?? q
+  if nv != null { print(nv) } else { print(0) }
+  0
+}
+gAnn(null, 1)
+gAnn(2, 1)
+
+// ---- i32 | null: a `let` binding ----
+function gLet(p: i32 | null, q: i32 | null) {
+  let nv = p ?? q
+  nv = nv ?? q
+  if nv != null { print(nv) } else { print(0) }
+  0
+}
+gLet(null, 1)
+gLet(2, 1)
+
+// ---- i32 | null: an ARGUMENT position ----
+function takes(x: i32 | null) {
+  if x != null { print(x) } else { print(0) }
+  0
+}
+function gArg(p: i32 | null, q: i32 | null) {
+  takes(p ?? q)
+  0
+}
+gArg(null, 1)
+gArg(2, 1)
+
+// ---- i32 | null: a RETURN position ----
+function gRet(p: i32 | null, q: i32 | null): i32 | null { return p ?? q }
+const r0 = gRet(null, 1)
+if r0 != null { print(r0) } else { print(0) }
+const r1 = gRet(2, 1)
+if r1 != null { print(r1) } else { print(0) }
+
+// ---- i32 | null: a CHAINED `p ?? q ?? z`, the synthesized-node case ----
+function gChain(p: i32 | null, q: i32 | null, z: i32 | null) {
+  const nv = p ?? q ?? z
+  if nv != null { print(nv) } else { print(0) }
+  0
+}
+gChain(null, null, 3)
+gChain(1, null, 3)
+
+// ---- i32 | null: a struct FIELD lhs and a CALL lhs ----
+type F = { f: i32 | null }
+function gField(w: F, q: i32 | null) {
+  const nv = w.f ?? q
+  if nv != null { print(nv) } else { print(0) }
+  0
+}
+gField({ f: null }, 2)
+gField({ f: 1 }, 2)
+
+function mk(b: boolean): i32 | null {
+  if b { return null }
+  return 1
+}
+function gCall(q: i32 | null) {
+  const nv = mk(true) ?? q
+  if nv != null { print(nv) } else { print(0) }
+  const nw = mk(false) ?? q
+  if nw != null { print(nw) } else { print(0) }
+  0
+}
+gCall(7)
+
+// ---- the NON-null-default control: still the residual rep, unboxed ----
+function gDflt(p: i32 | null) { print(p ?? 7) }
+gDflt(1)
+gDflt(null)
+
+// ---- f64 | null — the other scalar box rep ----
+function gF64(p: f64 | null, q: f64 | null) {
+  const nv = p ?? q
+  if nv != null { print(nv) } else { print(0.0) }
+  0
+}
+gF64(null, 1.5)
+gF64(2.5, 1.5)
+
+// ---- S | null — the nullable-struct NICHE, same one decision ----
+function gStruct(p: S | null, q: S | null) {
+  const nv = p ?? q
+  if nv != null { print(nv.v) } else { print(0) }
+  0
+}
+gStruct(null, { v: 1 })
+gStruct({ v: 2 }, { v: 1 })
+
+// `xs[0] ?? q` over a `(S | null)[]`: the Index read is already nullable-struct, so the
+// generic arm carries it once its block type follows the default.
+const ss: (S | null)[] = [null]
+function gIdx(q: S | null) {
+  const nv = ss[0] ?? q
+  if nv != null { print(nv.v) } else { print(0) }
+  0
+}
+gIdx({ v: 9 })
