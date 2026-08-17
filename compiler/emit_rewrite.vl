@@ -54,6 +54,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  fillArgDefaults,
   hasNamedArgs,
   mkArrayLit,
   mkCall,
@@ -61,6 +62,8 @@ import {
   mkIndex,
   mkMember,
   mkNum,
+  orderArgsByParamNames,
+  paramDefaultOf,
   ufcsAliasOf,
 } from "./ast"
 import {
@@ -80,6 +83,7 @@ import {
   nullablePartOf,
   parenUnionArrElemName,
 } from "./emit_base"
+import { fnIndexOfInScopeChain } from "./emit_collect"
 import { fnStmts, fnValUsed, startStmts, unNames } from "./emit_state"
 import {
   drwFieldClosure,
@@ -132,6 +136,79 @@ function drwSelfFnOf(name: string, argc: i32) {
     }
   }
   -1
+}
+
+// Normalize a DIRECT call to its callee's FULL arity, appending the
+// declaration's DEFAULT expressions for the trailing arguments the call omitted.
+//
+// This is the whole emit-side of parameter defaults. It runs before
+// monomorphization and before signature collection, so mono, `collectCloSigs`
+// and the emitter's per-parameter argument coercion all see an ordinary
+// full-arity call and need to know nothing about defaults. That is also what
+// keeps the feature clear of the `$fnsig` value-call ABI: the callee's declared
+// signature never changes, no call site is reclassified, and no new signature
+// key is minted — `fnSigKeyOf` reads the DECLARATION's parameter list, which
+// this does not touch.
+//
+// The callee is resolved with `fnIndexOfInScopeChain` — the SAME classifier
+// `emitCall` uses to choose the direct/captured path over `call_ref`, so a call
+// is normalized here exactly when it will be emitted as a direct call. A call
+// through a function VALUE resolves no function and keeps its full arity, which
+// leaves an under-supplied value call as the arity error the checker reported.
+function drwFillDefaults(ix: i32, ctx: i32) {
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      const fe = fnIndexOfInScopeChain(cf.identName, ctx)
+      if fe < 0 { return 0 }
+      const fn = P.nodes[fnStmts[fe]]
+      if fn is FuncDecl {
+        const ps = fn.fnParams
+        const args = n.callArgs
+        if hasNamedArgs(n.callArgNames) {
+          // A NAMED call may skip a MIDDLE parameter (`f(1, c: 3)`), so the
+          // gap is found by binding names to slots rather than by counting.
+          // Binding it here — and dropping the name list once the arguments are
+          // in parameter order — is the only way the gap survives to emit: the
+          // emitter's own reorder (`orderedDirectArgs`) has no way to fill one.
+          const pNames: string[] = []
+          let pn = 0
+          while pn < ps.length {
+            const pnode = P.nodes[ps[pn]]
+            if pnode is Param { pNames.push(pnode.parName) }
+            pn = pn + 1
+          }
+          if pNames.length != ps.length { return 0 }
+          const ordered = orderArgsByParamNames(pNames, args, n.callArgNames)
+          if ordered.length != ps.length { return 0 }
+          let gap = false
+          let gi = 0
+          while gi < ordered.length {
+            if ordered[gi] < 0 { gap = true }
+            gi = gi + 1
+          }
+          // No gap: leave the call exactly as it was, so every named call that
+          // works today keeps taking the emitter's own reorder path.
+          if !gap { return 0 }
+          if fillArgDefaults(ordered, ps) >= 0 { return 0 }
+          const noNames: string[] = []
+          n.callArgs = ordered
+          n.callArgNames = noNames
+          return 0
+        }
+        if args.length >= ps.length { return 0 }
+        let i = args.length
+        while i < ps.length {
+          const d = paramDefaultOf(ps[i])
+          if d < 0 { return 0 }
+          args.push(d)
+          i = i + 1
+        }
+      }
+    }
+  }
+  0
 }
 
 // Post-order rewrite of the tree at `ix` (inside function `ctx`, -1 = top
@@ -207,9 +284,11 @@ function drwWalk(ix: i32, ctx: i32) {
         }
         n.callFn = mkIdent(uName, -1)
       }
+      drwFillDefaults(ix, ctx)
       return ix
     }
     n.callFn = drwWalk(n.callFn, ctx)
+    drwFillDefaults(ix, ctx)
     return ix
   }
   if n is Block {

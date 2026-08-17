@@ -11,7 +11,7 @@
 //   letDecl    := ("let" | "const") IDENT (":" type)? ("=" expr)?
 //   funcDecl   := "function" IDENT "(" params? ")" (":" type)? block
 //   params     := param ("," param)*
-//   param      := IDENT (":" type)?
+//   param      := IDENT "?"? (":" type)? ("=" expr)?
 //   ifStmt     := "if" expr block ("else" (ifStmt | block))?
 //   returnStmt := "return" expr?
 //   block      := "{" stmt* "}"
@@ -67,6 +67,7 @@ import {
   setAnnTs,
   setDeclGp,
   setUdTs,
+  tsKind,
   tsLeaf,
   tsMark,
   tsMk,
@@ -1588,7 +1589,55 @@ function flatNeedsRecord(name: string, nameTok: i32) {
   0
 }
 
-// `IDENT (":" type)?`
+// `"?" ":" type` — the OPTIONAL-parameter annotation, desugared here to the
+// union `T | null`. The `?` is pure surface: VL has real null unions, so one
+// mechanism (a default value) serves both spellings and nothing downstream of
+// this function needs to know which one was written.
+//
+// The synthetic NAME and the spelling TREE are built together, because
+// `tsToName(annTsOf(ix))` must reproduce `TypeRef.tyName` character for
+// character. `parseTypeName` leaves exactly one root on the spelling stack; it
+// is popped and re-parented under a `TS_UNION` beside a fresh `TS_NULL` leaf,
+// which is what `A | null` spelled by hand builds.
+function parseOptionalParamType(name: string) {
+  const p0 = peekTok().start
+  const nm = parseTypeName()
+  const inner = tsPop()
+  // A FUNCTION type would need grouping parens to survive the `| null` suffix
+  // (`((i32) => i32) | null` — bare, the trailing union binds into the RESULT),
+  // and `?` has no place to put them. Reject rather than mint a name whose
+  // spelling tree and text disagree.
+  if inner >= 0 && inner < tsKind.length {
+    if tsKind[inner] == TS_FUNC {
+      P.diags.push(
+        {
+          msg: "`?` does not apply to a function type — write `" + name +
+            ": ((…) => …) | null = null`",
+          at: P.pos,
+        },
+      )
+    }
+  }
+  const kids: i32[] = []
+  kids.push(inner)
+  kids.push(tsLeaf(TS_NULL, "null"))
+  const ix = mkTypeRef(nm + "|null", p0)
+  setAnnTs(ix, tsMkKids(TS_UNION, "", kids))
+  ix
+}
+
+// `IDENT "?"? (":" type)? ("=" expr)?`
+//
+// Two surface spellings, ONE mechanism. `a?: T` is sugar for `a: T | null =
+// null`, desugared right here — so `parType` already carries the `| null` and
+// `parDefault` already holds the `null` literal, and only `parOpt` (a
+// faithful-surface marker for the printer) remembers which was written.
+//
+// A DEFAULT is filled in at each DIRECT call site that omits the argument
+// (`emit_rewrite`'s call normalization), so the expression is emitted in the
+// CALLER's frame. That is why the checker restricts it to a literal: the
+// callee's parameters and locals do not exist where the default is evaluated,
+// and a bare name there would silently capture the caller's binding of it.
 function parseParam() {
   const p0 = peekTok().start // the parameter's name token
   let name = ""
@@ -1599,9 +1648,42 @@ function parseParam() {
   } else {
     expect("IDENT")
   }
+  const opt = accept("QUESTION")
   let ty = -1
-  if accept("COLON") { ty = parseType() }
-  const ix = mkParam(name, ty, p0)
+  let dflt = -1
+  if accept("COLON") {
+    if opt {
+      ty = parseOptionalParamType(name)
+      dflt = mkNull("null", p0)
+    } else {
+      ty = parseType()
+    }
+  } else if opt {
+    P.diags.push(
+      {
+        msg: "an optional parameter needs a type — write `" + name + "?: T`",
+        at: P.pos,
+      },
+    )
+  }
+  if accept("EQUAL") {
+    const d = parseExpr()
+    if opt {
+      // `a?: T = e` spells the same thing twice and disagrees about the value.
+      P.diags.push(
+        {
+          msg: "`?` already means `= null` — write `" + name +
+            ": T | null = e` for a different default",
+          at: P.pos,
+        },
+      )
+    } else {
+      dflt = d
+    }
+  }
+  let optMark = 0
+  if opt { optMark = 1 }
+  const ix = mkParam(name, ty, dflt, optMark, p0)
   mkDeclNameTok(ix, nameTok)
   ix
 }

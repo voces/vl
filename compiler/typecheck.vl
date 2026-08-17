@@ -97,10 +97,14 @@ import {
 import {
   P,
   declNameTokOf,
+  fillArgDefaults,
+  fnRequiredArity,
   hasNamedArgs,
   i32ToStr,
   nodeToks,
   orderArgsByParamNames,
+  paramDefaultOf,
+  tsMentionsAnyName,
   ufcsAliasOf,
 } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
@@ -11927,6 +11931,143 @@ function fnParamNamesOf(name: string) {
   out
 }
 
+// The DECLARED parameter nodes behind a call's callee, when the call is DIRECT
+// — an `Ident` naming a top-level function. A closure-valued callee has no
+// declaration to read defaults from, so it answers the empty list and every
+// default-driven relaxation is off for it: a function VALUE keeps full arity.
+function calleeDeclParams(calleeIx: i32) {
+  const none: i32[] = []
+  const cf = P.nodes[calleeIx]
+  if cf is Ident {
+    const dIx = fnDeclIx[cf.identName] ?? -1
+    if dIx >= 0 {
+      const d = P.nodes[dIx]
+      if d is FuncDecl { return d.fnParams }
+    }
+  }
+  none
+}
+
+// The "expected …" half of an arity diagnostic. A parameter list with no
+// defaults has `lo == hi` and renders exactly as it always did; a list with
+// defaults renders the accepted RANGE, so the reader sees which calls are legal
+// rather than only which one is not.
+function arityWantText(lo: i32, hi: i32) {
+  if lo >= hi { return i32ToStr(hi) }
+  i32ToStr(lo) + " to " + i32ToStr(hi)
+}
+
+// Is `dIx` a form allowed as a parameter DEFAULT — a LITERAL, optionally signed?
+//
+// A default is substituted into each DIRECT call site that omits the argument,
+// so its expression is emitted in the CALLER's frame. A literal is the exact
+// boundary that makes that hygienic: it has no free names, so it can neither
+// read the callee's parameters and locals (which do not exist at the call site)
+// nor be captured by a caller-local binding that happens to share a name with
+// something the default meant. Anything with a name in it — a reference to an
+// EARLIER parameter, a call, an allocation — would have to be evaluated inside
+// the callee, and a callee that evaluates its own defaults needs to know which
+// arguments were omitted: an ABI change, not sugar.
+function paramDefaultIsLiteral(dIx: i32) {
+  if dIx < 0 { return false }
+  const d = P.nodes[dIx]
+  if d is NumLit { return true }
+  if d is StrLit { return true }
+  if d is CharLit { return true }
+  if d is BoolLit { return true }
+  if d is NullLit { return true }
+  if d is Unary {
+    // A SIGNED numeric literal (`-1`): the sign is a `Unary` over the literal,
+    // and it is still name-free.
+    if d.unOp == "-" || d.unOp == "+" {
+      const inner = P.nodes[d.unArg]
+      if inner is NumLit { return true }
+    }
+  }
+  false
+}
+
+// Declaration-side validation of parameter DEFAULTS. `paramTys` aligns 1:1 with
+// `params` — the resolved annotation types.
+//
+// Defaults are DIRECT-CALL-SITE SUGAR: a call omitting a trailing argument has
+// the default substituted into it before emit, so the callee's ABI (full arity,
+// one wasm parameter per declared parameter) and the `$fnsig` closure signature
+// space are untouched, and a function VALUE keeps its full signature. The four
+// rules below are that decision made explicit at the places the design leaks:
+//
+//   TRAILING-ONLY  a parameter without a default may not follow one with a
+//                  default — otherwise omitting the earlier argument would have
+//                  to shift the later ones and positional omission stops being
+//                  decidable.
+//   ANNOTATED      a default needs a type annotation. An un-annotated parameter
+//                  is an inference HOLE that each call site pins independently
+//                  and the emitter monomorphizes per pinned shape; a hole with a
+//                  default would be pinned at some call sites and not others.
+//                  Requiring the annotation keeps defaults and holes DISJOINT,
+//                  so the monomorphizer's instance keying never sees a default.
+//   NON-GENERIC    the annotation may not mention one of this function's own
+//                  type parameters — a call that omits the argument would drop
+//                  one of that type parameter's binding sites.
+//   LITERAL        the default expression must be a literal (see
+//                  `paramDefaultIsLiteral`).
+function checkParamDefaults(n: FuncDecl, params: i32[], paramTys: i32[]) {
+  let sawDefault = false
+  let pi = 0
+  while pi < params.length {
+    const p = P.nodes[params[pi]]
+    if p is Param {
+      const dIx = p.parDefault
+      if dIx < 0 {
+        if sawDefault {
+          tErr(
+            "parameter `" + p.parName +
+              "` has no default but follows one that does — defaults must be the LAST parameters",
+            params[pi],
+          )
+        }
+      } else {
+        sawDefault = true
+        if p.parType < 0 {
+          tErr(
+            "a default value needs a type annotation — write `" + p.parName +
+              ": T = …`",
+            params[pi],
+          )
+        } else if tsMentionsAnyName(annTsOf(p.parType), n.fnTyParams) {
+          tErr(
+            "parameter `" + p.parName +
+              "` cannot have a default: its type names a type parameter of `" +
+              n.fnName + "`, which an omitted argument would leave unbound",
+            params[pi],
+          )
+        }
+        if !paramDefaultIsLiteral(dIx) {
+          tErr(
+            "a default value must be a literal — `" + p.parName +
+              "`'s default is substituted at each call site, so it cannot name a parameter, a local, or a call",
+            dIx,
+          )
+        } else {
+          let pt = TY_ERR
+          if pi < paramTys.length { pt = paramTys[pi] }
+          seedExpected(dIx, pt)
+          const dt = checkNode(dIx)
+          if pt >= 0 && !assignable(dt, pt) {
+            tErr(
+              "parameter `" + p.parName + "` default: expected " + tyToStr(pt) +
+                ", got " + tyToStr(dt),
+              dIx,
+            )
+          }
+        }
+      }
+    }
+    pi = pi + 1
+  }
+  0
+}
+
 // Bind a call's arguments into PARAMETER order when any is NAMED (`f(b: 1,
 // a: 2)`), mirroring the host's `orderArgumentsByParameters`: named args fill
 // their parameter's slot, positionals fill the remaining slots in order.
@@ -11934,14 +12075,20 @@ function fnParamNamesOf(name: string) {
 // binding failure (an unknown/duplicate name — diagnosed here). `paramNames`
 // must align 1:1 with the checked parameter types (the UFCS path passes the
 // names AFTER `self`, since the receiver fills slot 0 separately).
+// `declParams` is the callee's `FuncDecl.fnParams`, or empty when the callee has
+// no declaration: a slot left unfilled by both the named and the positional pass
+// is filled from its parameter's DEFAULT, which is what lets a named call skip a
+// MIDDLE parameter (`f(1, c: 3)` where `b` has a default). A slot with neither
+// an argument nor a default names the parameter it is missing.
 function orderNamedCallArgs(
   paramNames: string[],
   args: i32[],
   argNames: string[],
   ix: i32,
+  declParams: i32[],
 ) {
   const bad: i32[] = []
-  if paramNames.length != args.length {
+  if paramNames.length < args.length {
     // Arity is diagnosed by the caller; just refuse to reorder.
     tErr("named arguments require a declared function with matching arity", ix)
     return bad
@@ -11951,13 +12098,12 @@ function orderNamedCallArgs(
     tErr("named argument does not match a parameter", ix)
     return bad
   }
-  let i = 0
-  while i < ordered.length {
-    if ordered[i] < 0 {
-      tErr("named argument does not match a parameter", ix)
-      return bad
-    }
-    i = i + 1
+  const missing = fillArgDefaults(ordered, declParams)
+  if missing >= 0 {
+    let who = ""
+    if missing < paramNames.length { who = paramNames[missing] }
+    tErr("missing argument for parameter `" + who + "`", ix)
+    return bad
   }
   ordered
 }
@@ -12007,7 +12153,17 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         restNames.push(uNames[rn])
         rn = rn + 1
       }
-      args = orderNamedCallArgs(restNames, args, n.callArgNames, ix)
+      // UFCS keeps EXACT arity (the `params.length != args.length + 1` gate
+      // above), so no slot can be left for a default to fill — hence the empty
+      // declaration list.
+      const noDefaults: i32[] = []
+      args = orderNamedCallArgs(
+        restNames,
+        args,
+        n.callArgNames,
+        ix,
+        noDefaults,
+      )
       if args.length != restNames.length { return TY_ERR }
     }
     // Generic dispatch (host: UFCS reuses the call machinery, so `self`
@@ -13026,10 +13182,19 @@ function checkCallNode(n: Call, ix: i32) {
       }
     }
     const params = ft.fnParamTypes
-    if args.length != params.length {
+    // DEFAULTS are DIRECT-call-site sugar: a call that names a DECLARED function
+    // may omit trailing arguments whose parameters carry a default, so the
+    // accepted arity is the range [`fnRequiredArity`, `params.length`]. A call
+    // through a function VALUE has no declaration to read defaults from and
+    // keeps its exact-arity gate — which is what leaves the `$fnsig` closure ABI
+    // out of this feature entirely.
+    const dParams = calleeDeclParams(n.callFn)
+    let required = params.length
+    if dParams.length == params.length { required = fnRequiredArity(dParams) }
+    if args.length < required || args.length > params.length {
       tErr(
         "wrong number of arguments: expected " +
-          i32ToStr(params.length) +
+          arityWantText(required, params.length) +
           ", got " +
           i32ToStr(args.length),
         ix,
@@ -13048,8 +13213,21 @@ function checkCallNode(n: Call, ix: i32) {
         tErr("named arguments require a declared function", ix)
         return retTy
       }
-      args = orderNamedCallArgs(cNames, args, n.callArgNames, ix)
+      args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
       if args.length != params.length { return retTy }
+    } else if args.length < params.length {
+      // Trailing positional omission: check the defaults against their
+      // parameters alongside the supplied arguments, so one loop below covers
+      // the whole parameter list. (`args` is rebound to a COPY — `n.callArgs`
+      // stays the source list; the emit-side normalization is `emit_rewrite`'s.)
+      const padded: i32[] = []
+      let pj = 0
+      while pj < params.length {
+        if pj < args.length { padded.push(args[pj]) } else { padded.push(-1) }
+        pj = pj + 1
+      }
+      if fillArgDefaults(padded, dParams) >= 0 { return retTy }
+      args = padded
     }
     // Generic CALL-SITE inference: a TyVar param (or `T[]`) BINDS its type-param to
     // the argument's type (first use wins; later uses must agree), and the return
@@ -13785,6 +13963,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     paramTys.push(pt)
     pi = pi + 1
   }
+  // Parameter DEFAULTS (`a: i32 = 0`, and the `a?: T` spelling the parser
+  // desugars into one), checked once the annotations have resolved.
+  checkParamDefaults(n, params, paramTys)
   // Resolve the return-type annotation (or the pending sentinel when inferring).
   let ret = -2
   if !inferring {
