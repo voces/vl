@@ -40,13 +40,13 @@ a fix does.
 
 | item | state |
 |---|---|
-| **the emitter's narrow stack never retires** | **check-clean invalid wasm in FOUR lines with no guard at all**: `let x: i32 \| null = null; x = 5; print(x ?? 0)`. An *assignment* narrows the local and the emitter never retires it. #1451's explicitly-declined residue, and a **separate root** from what it fixed — that PR fixed the checker for guard-kind narrowings and refused the reads rather than lowering them |
-| **D9 — a nested array cannot be captured** | 360 cells, **loud** (`ref valtype with no interned shape`) at any capture position, with the uncaptured control correct. A feature gap, not a soundness hole; it earns a slot on volume and on being squarely in the newly-dominant plain-type class |
+| **the emitter's narrow stack never retires** | agent was **stopped mid-run** when the previous process exited; **two commits intact** on `agent/narrowed-read-rep` and **resumed**, not respawned. Its own commit messages report three findings: a narrowed read's rep had **two answers** (the `??` lowering and the null test read the DECLARED nullable rep while the read itself unboxed), no write ever retired the emitter's narrowing, an **`is <variant>` over-reach that the CORPUS caught**, and **#1451's retired-READ refusal becomes a lowering** now that the emitter retires. Byte movement is the stated risk — #1451 declined this work partly on those grounds — so the corpus byte ratio with a reason per moved module is required, not optional |
 
 ## Landed this cycle
 
 | item | PR | result |
 |---|---|---|
+| **a captured array with REFERENCE elements could not compile at all** | #1454 | shipped: **628 cells → correct, 0 regressions**, and `vl build` now writes a module on exactly the correct cells and no others (250 → 878 of 976). **My filed axis was too NARROW by three whole element families**: I said "nested arrays", but the axis is a **ref-ELEMENT** array — `S[]`, `U[]`, `((i32) => i32)[]` and `{[string]: i32}[]` all fail at depth **ONE**, while scalar lists are never affected. I verified the decisive pair myself: a flat `S[]` captured fails on master where `i32[]` prints `7`. Two more inversions: `global_ann` is **not a capture** (120/120 correct, so it belongs in the controls) and the **ANNOTATED** spelling was the broken one. Mechanism: a **shortened mirror** missing the ref-list companion table, and fixing only the write end leaves 4 cells at check-clean invalid wasm — **both ends are one mechanism, measured by sabotage**. It **proved a shared HOME by shared blast radius** (sabotaging it breaks the param and capture positions together, which is also what explains its one raw prediction miss — 240 cells' own controls went vacuous; restricted to the valid cells the prediction is cell-for-cell exact). It went **one better than the inventory on a grouping question**: where the sweep could only claim a shared OUTCOME for four capture rows, this proves one is the **same shape of defect in a different function**, so its fix is the exact mirror. A **green sabotage leg found a hole in its own generator** (no rebinding read form) and the shape is now in a fixture. Byte-identity **2040/2040 with a structural reason** — the change adds no intern call, only reads rows the intern pass already banked. It also fixed the **self-contradicting floor**, but only after verifying all five remaining positions genuinely lower |
 | **a `boolean`-element list printed `0` instead of `false` inside a generic** | #1453 | shipped: silent cells **48 → 0**, invalid wasm 19 → 4, correct 286 → 352, **0 newly rejected**, and the 66 byte-movers are **exactly** the 66 cells whose grade improved. **FOUR OF THE FIVE AXES I FILED WERE WRONG**, each verified by me afterwards: two roots not one, and the silent class in a different function; the **param** branch was fine and the axis is **storage class**; `const y: string = "aa"; gid(y)` is **correct at module scope** and fails only inside a function — *and my stated control (drop the annotation) also passes at module scope, so it discriminated nothing*; **flat `boolean[]` is broken too** while `i32[][]` is correct, so the axis is the **`boolean` leaf at any depth**; and the **value is right** (`x[0][1] == false` → `true`), only `print` is wrong, because `boolean[]` shares the i32 list rep exactly and nothing distinguishes it but a NAME. The root was separated by a **targeted probe-sabotage**: forcing the pin to `boolean[]` changed nothing while forcing it to `string[]` broke the program, proving the arm was reached and its answer irrelevant. It also **collapsed a shortened mirror whose duplication turned out to be load-bearing** — the grid found 8 forwarder cells still wrong when the direct call was already right — reported a sabotage leg that came back **GREEN** and *added the fixture line that reaches it* rather than dropping the leg, and found three defects in its own grader, one of which had mis-binned **81 cells** because `$(...)` strips trailing newlines |
 | **the second discovery sweep** — 5,180 cells | #1452 | **THE SILENT CLASS HAS INVERTED.** Nullable cells **2,944 → 0 silent**; plain cells 2,236 → **76**. The exact inverse of inventory #1, where nullable reps held nearly every silent cell — the nullable-rep programme has done its job, and briefs should stop reaching for nullable axes first. It also closed the axis I had flagged as likeliest to hide another eval-count defect: **evaluation counts inside `is`/`match`/place-narrowing are 98 of 100 with 0 wrong counts** over 50 forms. Further measured negatives: multi-module **230/230** across five import kinds, **`-O` and `-O3` both 4,118/4,118** with the optimised module rebuilt and run, capture depth beyond one level **not an axis**, no set literal exists, and struct-field assignment, `flat` records and the brand rules all hold. Nine sabotage legs, nine exact hits, plus one **reported miss** of its own bookkeeping. Its grader initially binned `vl check` dying *inside* `vl-compiler.wasm` as "just a hint" — the exact direction the brief warned about — caught before any conclusion. And it flagged a **contradiction in my brief** (commit the harness vs keep `_scratch/` untracked); it followed the gate and made the doc self-contained, which is what future briefs should ask for |
 | **the compiler-trap class** | #1450 | **172 cells → 0.** Three shapes, **TWO roots**, proven by building a **named** compiler and matching one shape's 13-frame backtrace against another's function-index for function-index. Both roots were the recurring **shortened-mirror** class: one read an array type's element row without declining the `-1` hole an empty `[]` leaves — the file guards that field at **18 of 22 sites** and the faulting function was **the only member of its own thirteen-function ladder without it** — and the other returned a map SHAPE slot where a STRUCT TABLE row was expected. It corrected the inventory's axis (the map's **VALUE**, not its key, and broader than "string-valued"), and **reported a sabotage leg that came back GREEN**, explaining the deliberate redundancy rather than hiding it. **Its real `ci-native` failure exposed that my gate list covered three of six suite groups** — see the playbook |
@@ -689,3 +689,35 @@ second inventory's six pieces of evidence. Its worktree branched before that doc
 file did not exist and the reference dangled. It re-derived from scratch — which is the only
 reason four of my five axes got corrected — but that was luck, not design. Either wait for the doc
 to land on master, or paste the evidence into the brief.
+
+## The combination, verified as one program (2026-08-17)
+
+Four slices landed in sequence (#1451, #1453, #1454, plus the perf and trap work before them), each
+gated green alone. Since two of them touch adjacent emitter territory, the combination is checked as
+its own step — one program exercising all of them:
+
+```
+captured S[] → 7 · captured i32[][] → 2 · boolean[] through a generic → false, direct → false
+· string local → aa · while q != null { … q = null } → 5
+```
+
+All correct, corpus **1888 / 0 / 7**. *Three slices green alone is a different claim from three green
+together*, and the earlier `wasmEmit.vl` collision between two individually-green slices is why this
+is now a standing step rather than a courtesy.
+
+## The filed-axis failure rate is now the dominant risk in my own briefs
+
+Across the recent slices, **my stated sub-axis was wrong more often than my cell counts were**:
+
+| slice | what I filed | what it measured |
+|---|---|---|
+| #1449 | `findFnDeclIn` is the quadratic | a linear **bank scan** was; the walk is quadratic on a *different* axis |
+| #1450 | the trap keys on the map's **key** type | the **value** type |
+| #1453 | one root, param branch, nesting, wrong **value** | two roots, **storage class**, the **`boolean` leaf**, and only `print` is wrong |
+| #1454 | **nested** arrays | **ref-ELEMENT** arrays — too narrow by three families |
+
+A wrong count costs an agent some grid cells. **A wrong sub-axis sends the agent to the wrong file.**
+The mitigations that have actually worked: state a control that **fails** in the broken
+configuration (and check that it does), ask for a **targeted probe-sabotage** when the brief names a
+suspect function, and say plainly that overturning the framing is the most valuable thing the report
+can contain.
