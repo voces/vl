@@ -2828,6 +2828,16 @@ function isNulBoolTy(ty: i32) {
 // (`{[string]: T | null}` → `mkNullableTy(T | null)`); a single peel there would
 // leave an inner `T?` that a narrowed member/field access rejects as non-object,
 // so a `!= null` narrow must strip EVERY layer to reach the non-null value.
+//
+// A ONE-MEMBER UNION AROUND A NULLABLE IS NOT THIS FUNCTION'S JOB, and teaching it to peel
+// one is a MISCOMPILE rather than a missing case. `type T = (S | null)` interns
+// `TyUnion[S?]`, and `declaredTyOfName` already resolves that wrapper to its member for
+// every inner (`singleAliasMemberTyIx` → `nulAliasMemberFaithful`), so an annotation of `T`
+// arrives here as a plain `S?`. A wrapper that reaches here is one the EMITTER also refused
+// to see through, and peeling it makes the checker narrow a value the emitter is still
+// lowering as a union box: measured at 47 loud emit rejects, 15 check-clean-invalid-wasm
+// cells and zero new running programs across the 1,020-cell alias grid. The peel belongs at
+// the transparency predicate, which is the one place both sides read.
 function nonNullTy(ty: i32) {
   if ty < 0 { return -1 }
   let cur = ty
@@ -9136,8 +9146,10 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       // niche, not kept as a sibling variant). Same defect, same witness: the alias's
       // union ROW claimed the slot for the box while the read lowered the niche.
       //
-      // Gated on the INNER, exactly as the array arm is gated on its ELEMENT — see
-      // `nulAliasMemberFaithful`.
+      // UNGATED IN THE INNER, unlike the array arm's `arrSpineIsScalar` and the union
+      // arm's `unionAliasMembersFaithful` — see `nulAliasMemberFaithful` for the grid
+      // that says an inner gate here costs 100 oracle-parity cells and protects one
+      // declared-struct residue that is loud on both sides.
       if nulAliasMemberFaithful(m0) { return m0 }
     }
   }
@@ -9184,34 +9196,59 @@ function unionAliasMembersFaithful(ty: i32) {
   false
 }
 
-// True when the emit render of NULLABLE type `ty` is NAME-FAITHFUL — the nullable
-// analogue of `arrSpineIsScalar`, and likewise a property of the INNER rather than of
-// the wrapper. Two populations, both of which `tyToEmitNameGo`'s `TyNullable` arm
-// spells position-free:
-//   - the LITUNION niche (`K | null`, `"a" | "b" | null`), which that arm preserves as
-//     the alias (or the member set) plus the `null` arm;
-//   - a PRIMITIVE inner (`string | null`, `i32 | null`, `boolean | null`), which
-//     renders as its own `primName`.
-// Every other inner — a declared struct, a generic application, a declared union, a
-// map, an array, a closure — is rendered STRUCTURALLY under the `| null`, so the
-// declared name the emitter's tables key on would be dropped and the member has to
-// stay opaque.
+// True when a ONE-MEMBER alias over NULLABLE member `ty` denotes that member — the
+// nullable arm of `singleAliasMemberTyIx`, and the arm with NO GATE ON THE INNER.
+//
+// `type T = (S | null)` interns `TyUnion[S?]`, so the wrapper is a NAME and not a type
+// constructor and the alias denotes `S?`. Both sides read that from here: the CHECKER
+// through `declaredTyOfName` (so `x: T` is a plain `S?`, which `nonNullTy` then peels
+// like any other niche) and the EMITTER through `singleMemberAliasTyIx`. Declining here
+// diverges them — the alias's union ROW claims the slot for the `{tag, anyref}` box
+// while every read of the value lowers the niche — which is what the two consumers'
+// notes describe and what `nonNullTy` must NEVER be taught to paper over: peeling the
+// wrapper in the narrow while this predicate still declines it is the CHECKER moving
+// alone, measured at 47 loud emit rejects and 15 check-clean-invalid-wasm cells and
+// **zero** new running programs.
+//
+// WHY NO INNER GATE, MEASURED. A 1,020-cell twin grid — 15 inners × (8 positions + 9
+// uses) × {3 alias spellings, the alias-free INLINE oracle}, graded on the RUN at both
+// runtime inputs — reads **+100 oracle-parity cells and 0 regressions** against an inner
+// gate of `nulNicheInnerFaithful` (a primitive or litunion inner only). Every inner that
+// note called structurally-rendered lands on the oracle cell for cell: an inline struct,
+// a list, a map, a generic application, a closure, a declared union, a numeric litunion,
+// a nested nullable. The `| null` DECLARATION fold keeps its own gate and is untouched
+// (`nulNicheInnerFaithful`, its sole reader now) — the un-parenthesized spellings are
+// unmoved in all 510 of their cells.
+//
+// A DECLARED STRUCT inner is the ONE residue and it is 3 axes of 17, both verdicts LOUD
+// and never a wrong answer: at a module `const` (`emitProgram: ref valtype with no
+// interned shape`), at a generic instantiation (`only i32, … parameters are supported`)
+// and as a list ELEMENT (`a nullable-{v:i32} list element has no rep`, where the inline
+// spelling rejects too). Gating it out costs 13 oracle-parity cells — including the
+// parameter-position field read this predicate exists to make work — to convert three
+// loud emit rejects into three loud check rejects, so the render's dropped struct name
+// is filed against the emitter rather than bought here.
 function nulAliasMemberFaithful(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyNullable { return nulNicheInnerFaithful(t.nInner) }
+  if t is TyNullable { return true }
   // The UN-NORMALIZED shape — a `TyUnion` of literal members beside `null`, which is
   // what a `type A = B` wrapper sees when `B`'s own `| null` declaration declined the
   // niche fold (`nulDeclNicheTy`).
   tyIsNullableLitUnion(ty)
 }
 
-// `nulAliasMemberFaithful` asked about the NICHE'S INNER, before the wrapper exists —
-// the two populations `tyToEmitNameGo`'s `TyNullable` arm spells position-free, read
-// one rung down. Two readers: that predicate, and the DECLARATION-route niche fold,
-// which has to answer the question before it mints the `TyNullable` (`mkNullableTy`
-// does not intern, so asking after minting would leave a dead arena entry behind for
-// every declaration that declines).
+// The two populations `tyToEmitNameGo`'s `TyNullable` arm spells position-free — a
+// litunion niche (`K | null`, `"a" | "b" | null`) and a PRIMITIVE inner (`string | null`,
+// `i32 | null`, `boolean | null`) — asked about the NICHE'S INNER, before the wrapper
+// exists.
+//
+// ONE READER: the DECLARATION-route `| null` niche fold, which has to answer the question
+// before it mints the `TyNullable` (`mkNullableTy` does not intern, so asking after
+// minting would leave a dead arena entry behind for every declaration that declines).
+// This is a gate on WHICH SHAPE A DECLARATION INTERNS, not on which shapes are
+// transparent — the ALIAS-transparency arm over an already-interned niche
+// (`nulAliasMemberFaithful`) takes every inner, and its note carries that measurement.
 function nulNicheInnerFaithful(inner: i32) {
   if inner < 0 { return false }
   if tyIsLitUnion(inner) { return true }
