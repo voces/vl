@@ -366,7 +366,7 @@ self-compile unless stated.
 | --- | --- | --- | --- | --- | --- |
 | 1 | ~~**Bulk host↔guest staging, IN**~~ — **SHIPPED, §6.** `srcLoad`/`modKeyLoad`/`modSrcLoad`/`cliResultLoad` + the memory the emitter exports; the host's batched path activates itself | predicted −4.6% self (`modSrcPush`); **got** `modSrcPush` 4.74 → 0.00 self, `modSrcLoad` 2.23 self, and the host's staging phase 192 → 135 ms | one host LINE (the memory probe) + 4 compiler-side exports; the fallback was already written | low — old seeds fall back, no seed split (**held**) | profile self-% of `modSrcPush` (target ≈0); the host's own `[profile] stage_program` phase; wall clock is too noisy alone |
 | 1b | ~~**…and OUT**~~ — **SHIPPED, §7.** `rbyteStore` (bytes, packed 4/word) + `cliCmdDataStore` (code points); the guest writes the same window and the host copies out | `[profile] readback` 17 → **1 ms**; `vl fmt compiler` 4,520,527 host calls → 290 and 520 → **453 ms** (−12.9%) | 2 compiler-side exports + 2 host structs; NO host probe change (`io_mem` was already there) | low — same 2×2 fallback, no seed split (**held**) | the `readback` phase; a `$VL_HOSTCOUNT` per-channel call counter; and the payload-free `vl fmt --check` as the control (run it to the same N) |
-| 2 | **Intern identifiers to i32 symbol IDs** — **THE TABLE AND PHASE 3 SHIPPED, §9.** `compiler/symbols.vl` + the arena-node carrier + the eight notifications; the three whole-program name→index maps are sym-indexed dense arrays. **Phases 4 (checker scope chain, now the largest single consumer at 2.83%) and 5 (`modRenamed`, 1.82%) remain**, and §9.7 records the coverage blocker phase 4 acquired | re-baseline confirmed the phase table (3 = 6.32% vs 6.2 predicted, 4 = 4.73% vs 4.4, 5 = 1.63% vs 1.6); phase 3 delivered **−4.5%** of a self-compile and **2,466,975 → 479,079 string-keyed probes** | large | medium-high — **the suite and the six-channel corpus are the witnesses; the ladder is BLIND to all eight name-writer poisons** (§9.6.1 corrects §9.6's filed column) | the consumer-class split per the design's §7 probes; the both-implementations count in §9.4 |
+| 2 | **Intern identifiers to i32 symbol IDs** — **THE TABLE AND PHASE 3 SHIPPED, §9.** `compiler/symbols.vl` + the arena-node carrier + the eight notifications; the three whole-program name→index maps are sym-indexed dense arrays. **Phases 4 (checker scope chain) and 5 (`modRenamed`, 1.82%) remain.** §9.7 re-derives phase 4 on the shipped base and CORRECTS it: `lookup` is 0.41% self / 2.60% inclusive, not 2.83% self, so the reclaimable probing is ~2.2% (~2.5% for the whole `T.scopes` family) — and its coverage blocker is now retired by two corpus cases | re-baseline confirmed the phase table (3 = 6.32% vs 6.2 predicted, 4 = 4.73% vs 4.4, 5 = 1.63% vs 1.6); phase 3 delivered **−4.5%** of a self-compile and **2,466,975 → 479,079 string-keyed probes** | large | medium-high — **the suite and the six-channel corpus are the witnesses; the ladder is BLIND to all eight name-writer poisons** (§9.6.1 corrects §9.6's filed column) | the consumer-class split per the design's §7 probes; the both-implementations count in §9.4 |
 | 2b | ~~**the four avoidable costs the re-baseline found**~~ — **SHIPPED, §8.** `retCapturedMapShape`'s per-return capture re-walk, `emitReturnValue`'s four un-hoisted `fnStmtsPosOf` calls, `nameNamesFunction`'s whole-arena rescan, `parentLetOf`'s double probe, `keywordKind`'s 19-way chain | **−10.7%** of a self-compile (interleaved min-of-15) | five local rewrites, no new data structure | low — all five are strict behaviour-preserving rewrites with the argument at the site | wall clock with `vl check`/`vl fmt` as flat controls at min-of-21; per-function samples PER RUN |
 | 3 | ~~**`nameNamesFunction`: index the arena once**~~ — **SHIPPED, §8.3.** Incremental fold with a high-water mark | 2.64% self → **0.07%** | small | the invalidation was the whole question and the answer is three facts pinned at their sites | as filed |
 | 4 | ~~**`fnStmtsPosOf`: an index at the writers**~~ — **SHIPPED, §17, and NOT as filed.** No index was built: every one of the scan's 22,612 calls re-derives a `fnStmts` position its own caller is standing on. `emitCurFnPos` carries `emitCodeSection`'s loop index; `mapRetExprShape`/`retCapturedMapShape` take the position their callers already spell `fnStmts[fe]` | 3.09% self → **0.01%**; a 1,600-frame ladder **48.9% → 3.7% self, −49.8% of the whole compile** | small — one global, one parameter, four call sites | low — no new table, no invalidation surface; the writers were never touched | 12 interleaved warm guest profiles per leg; a counting build for the call/step census; CPU-ms with emitted bytes asserted md5-identical first |
@@ -1465,18 +1465,61 @@ Three things follow, and the third is the one to carry forward.
 
 ### 9.7 What did NOT ship, and the blocker phase 4 acquired
 
-`lookup` is now the biggest single string consumer (2.83%) and the rewrite that would remove
-it is small — `T.scopes` has ten real use sites, all in `typecheck.vl`, and a sid-indexed value
-cell plus an undo log replaces an O(levels) chain walk at two probes per level with ONE array
-read. **It is not free, and the reason is coverage, not difficulty.**
+`lookup` is the row, and the rewrite that would remove it is small — `T.scopes` has ten real
+use sites, all in `typecheck.vl`, and a sid-indexed value cell plus an undo log replaces an
+O(levels) chain walk at two probes per level with ONE array read.
 
-`emit_classify.vl` ~19500 and `emit_sections.vl` ~611/625/813 name `T.scopes[top][name] = v`
-and `T.scopes.pop()` as the shapes their arms exist for — a write to an element of a GLOBAL
-struct-field map-array, and a Member-receiver ref-list `.pop`. **Deleting the scope chain
-deletes the self-compile's exerciser of both.** That is DELETE-THE-BYSTANDER in reverse, and
-it has to be answered first: establish whether `tests/cases` covers those two shapes, add the
-cases if it does not, and only then take the chain. Filed so the next slice starts at the
-obstacle instead of rediscovering it after the diff is written.
+**THE COVERAGE BLOCKER IS RETIRED.** `emit_classify.vl`'s `exprHasMapOp` (reached via
+`fnHasGlobalMapOp`) and `emit_sections.vl`'s four `collectMemberPopRefSlots*` call sites name
+`T.scopes[top][name] = v` and `T.scopes.pop()` as the shapes their arms exist for — a map op on
+an element of a GLOBAL struct-field map-array, and a Member-receiver ref-list `.pop`. Neither
+shape appeared anywhere in `tests/cases`, so the compiler compiling itself was their sole
+exerciser and deleting the chain would have deleted it: DELETE-THE-BYSTANDER in reverse. Two
+corpus cases now pin them independently of the chain:
+
+| case (`tests/cases/globals/`) | arm it holds | proof |
+| --- | --- | --- |
+| `struct-field-map-array-global-map-ops.vl` | `fnHasGlobalMapOp` — the map SET, `.has`, and both the index and `.get` spellings of the fused get-with-default, each in a function owning no map local or param | neutralize the `if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }` reserve → `bind` fails wasm translation |
+| `struct-field-reflist-member-pop.vl` | `collectMemberPopRefSlots` per function (pop-only functions, statement and value position) | neutralize the `emitFuncCode` call → `popFrame` fails |
+| — same case | `startFnDetectScratch`'s pair over global INITS and top-level STATEMENTS | neutralize both `collectMemberPopRefSlotsExpr` calls → the start function fails |
+| — same case | `startScanBlock`, the top-level COMPOUND-statement body | neutralize its `collectMemberPopRefSlots` → the start function fails |
+
+The `while` in the second case pops the MAP-element list rather than the struct-element one on
+purpose: popping `rows` there would ride the slot the two top-level statements above it already
+reserved, and the arm would be covered only in appearance. Each sabotage was compiled with the
+SAVED good seed, never with a rebuilt one, and the two cases are insensitive to each other's
+arms — the map case stays green under both pop sabotages and vice versa.
+
+**And the filed share is wrong by 7×.** Re-derived on `2c4a6d06` over six warm runs,
+**10,512 samples**, `$mNN` stripped: `lookup` is **0.41% self / 2.60% inclusive** — the 2.83%
+in the row header is an INCLUSIVE figure read as a self figure. The whole `T.scopes` family
+(`lookup` + `declare` 0.17/0.41 + `pushScope` 0.35 + `flushUninferred` 0.20 + `popScope`
+0.09/0.29 + `isConstName` 0.01/0.11) is **1.23% self**. What the conversion can actually
+reclaim is the probing *under* `lookup`, and the subtree names it exactly:
+
+| leaf inside `lookup`'s 273 samples | % of self-compile | % of subtree |
+| --- | ---: | ---: |
+| `__str_hash__` | 0.92 | 35.5 |
+| `__map_probe__` | 0.78 | 30.0 |
+| `__str_eq__` | 0.49 | 18.7 |
+| `lookup` itself | 0.41 | 15.8 |
+
+So the ceiling is **~2.2% for `lookup` and ~2.5% for the family**, before charging anything for
+the replacement — not 2.83% of self on top of whatever the walk costs.
+
+**The information IS already held by the caller, for three quarters of the traffic.** 75.5% of
+`lookup`'s subtree arrives from ONE site, `checkNodeReal`'s `Ident` arm, which holds the node
+index `ix` and already threads it to `symUse(ix, …)` and `daCheckRead(…, ix)` on the next two
+lines — so `sidOfNode(ix)` is in hand there and a sid-keyed cell needs no new string→sid map on
+the hot path. The remaining callers are a long tail (`flatMemberFold` 9.5%, `checkFuncDeclNode`
+5.5%, `checkBinExprNode` 2.9%, then singles), and roughly half of the 24 call sites pass a
+derived string with no node behind it — those still need a name→sid step, and `sidOfNode` is
+itself 1.55% self / 2.47% inclusive. That split, not the chain walk, is what sizes the slice.
+
+Left for that slice: `constScopes`, `symDeclScope` and the open-scope span stack are PARALLEL
+chains pushed and popped in lockstep, and the same-frame redeclare check
+(`T.scopes[dtop].has(n.letName)`) needs frame IDENTITY rather than a resolved value — a value
+cell alone does not answer it.
 
 Also sized here: `modRenamed` (phase 5) reads **1.82% / 27.1 samples per run** on the converted
 profile — it went UP as a share, because it is 87% reached from `modRwExpr` and this phase did
