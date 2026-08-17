@@ -2098,6 +2098,27 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
   0
 }
 
+// Is `name` ever the TARGET of an assignment (`name = …`) anywhere in the arena? An arena scan
+// rather than a scope walk, so it is coarse by NAME: a homonym in another frame answers true for
+// both. That direction is the safe one — it declines a callee fold and leaves the `call_ref` the
+// annotation already guarantees a signature for, where the opposite error silently drops a write.
+function monoNameIsAssigned(name: string) {
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is BinExpr {
+      if nd.binOp == "=" {
+        const tg = P.nodes[nd.binLeft]
+        if tg is Ident {
+          if tg.identName == name { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // `monoCoerceFnValueName` keyed on an expected TYPE-annotation node (`-1` / a non-function type is a
 // no-op). `ctx` is the enclosing function (-1 = top level), for resolving a value binding.
 function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32, ctx: i32) {
@@ -2574,7 +2595,15 @@ function monoWalk(ix: i32, ctx: i32) {
         const afe = identClosureFeSid(sidOfNode(n.callFn), ctx)
         if afe >= 0 {
           if !criFnIsAnonLambda(afe) {
-            fe = afe
+            // The fold below REWRITES `f(x)` into a by-name call to the INITIALIZER's instance,
+            // which is only faithful while the binding still holds that initializer. A binding
+            // that is ASSIGNED does not, and the fold made every later assignment invisible —
+            // `let f: (i32,i32)=>i32 = sub; f = mul; f(3,4)` answered `sub`'s result at rc 0 from
+            // both `vl check` and the emitter. Restricted to an ANNOTATED binding, whose
+            // annotation guarantees the `$fnsig` the surviving `call_ref` resolves through; an
+            // un-annotated one has no such guarantee and keeps the fold.
+            if identFnTypeAnnName(callee.identName, ctx) == "" { fe = afe }
+            else if !monoNameIsAssigned(callee.identName) { fe = afe }
           } else if identFnTypeAnnName(callee.identName, ctx) == "" {
             // A lambda bound to an UN-annotated `const` (`const add = (a, b) => a + b`): its params
             // are inference holes — monomorphize it per call exactly like a named generic function.
