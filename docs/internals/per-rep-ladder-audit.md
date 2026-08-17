@@ -92,7 +92,7 @@ downstream arm rather than mis-answering one; the next sweep needs a third scan
 shape for it (`while i < P.nodes.length` + `return true` on a `nodeTy*`/`node*Is*`
 predicate run).
 
-## CLOSED — three DANGEROUS ladders (26 invalid-wasm cells) + two structural pins
+## CLOSED — three DANGEROUS ladders (26 invalid-wasm cells) + three structural pins
 
 ### 1. The narrowed-nullable-collection recover knew ONE of four list wrappers
 
@@ -212,6 +212,22 @@ out of 198 and a reaching program in the same grid:
 * **`(string | null)[]` compared un-narrowed** — `for x in xs { if x == "p" … }`
   over a `(string | null)[]` TRAPS (`wasm trap`, 1 cell), while every litunion
   spelling of the same program now runs. The control is the broken one here.
+
+### 5. The structural guard, applied to the WHOLE total-domain set
+
+Recommendation (1) below, carried out: every arena ladder whose domain is all of
+`Ty` and that is ONE dispatch — 14 of the 16 mechanically-identified (function,
+scrutinee) rows — is an `_`-less exhaustive `match`. `repCanonKeyGo`,
+`repElemKeyGo`, `repMvValKeyGo`, `repOfTyFlat`, `rtGo` (`emit_rep.vl`);
+`tyToStrGo`, `tyEqGo`'s `ta`, `tyIsEmitRepresentable`, `tyToEmitNameGo`,
+`tyToNominalNameGo`, `flatWhyNot`, `assignableGo`'s structural tail,
+`vbUnionMemberName`'s field ladder (`typecheck.vl`), beside #1428's
+`repTyScalarMask`. Behaviour-neutral PER LADDER: every `.vl` under `tests/cases/`
+built with both compilers — **1,874 records, 1,550 byte-identical modules, 324
+rejecting identically, 0 byte differences, 0 rc differences, 0 diagnostic-text
+differences** — measured once per conversion, not once for the set. Four of the
+converted ladders (`tyToStrGo`, `tyEqGo`, `assignableGo`, `vbUnionMemberName`)
+have a trailing default that is now UNREACHABLE by construction and says so.
 
 ## OPEN — ranked
 
@@ -559,18 +575,53 @@ mislead a converter into reading a shape nit as a language limit:
 
 ### The recommendation, ranked
 
-1. **Convert the TOTAL-DOMAIN arena ladders to `match`, one per PR.** These are
-   the ladders whose domain genuinely IS all of `Ty`, identified mechanically as
-   the ones already covering every one of the 7 structural variants — **16
-   (function, scrutinee) ladders across 14 functions**: `repCanonKeyGo`,
-   `repElemKeyGo`, `repMvValKeyGo`, `repOfTyFlat`, `repTyScalarMask`, `rtGo`
-   (`emit_rep.vl`); `tyToStrGo`, `tyEqGo` (×2 scrutinees),
-   `tyIsEmitRepresentable`, `tyToEmitNameGo`, `tyToNominalNameGo`, `flatWhyNot`,
-   `assignableGo` (×2), `vbUnionMemberName` (`typecheck.vl`). A natural second
-   tier is the five missing exactly ONE structural variant — `substTyDeep`,
-   `tyChildrenOf`, `tyReachesHole`, `tyPrintsAsRef` (all `TyPrim`) and
-   `nodeArrayElemName` (`TyArray`, audit row R7) — where the conversion forces a
-   real decision rather than pinning a settled one. Cost per ladder: reindent,
+1. **Convert the TOTAL-DOMAIN arena ladders to `match`. DONE — 14 of the 16
+   convertible, and the other 2 are a MISCOUNT, not a remainder.** The set is the
+   ladders whose domain genuinely IS all of `Ty`, identified mechanically as the
+   ones already covering every one of the 7 structural variants — **16 (function,
+   scrutinee) ladders across 14 functions**, a set the scan reproduces exactly:
+   `repCanonKeyGo`, `repElemKeyGo`, `repMvValKeyGo`, `repOfTyFlat`,
+   `repTyScalarMask`, `rtGo` (`emit_rep.vl`); `tyToStrGo`, `tyEqGo` (×2
+   scrutinees), `tyIsEmitRepresentable`, `tyToEmitNameGo`, `tyToNominalNameGo`,
+   `flatWhyNot`, `assignableGo` (×2), `vbUnionMemberName` (`typecheck.vl`). All 14
+   single-dispatch rows are now `_`-less `match` statements, each proven
+   byte-neutral over the corpus on its own (1,874 records; 1,550 byte-identical,
+   324 identically-rejecting, 0 byte diffs, 0 rc diffs, 0 diagnostic-text diffs,
+   per ladder).
+
+   **The 2 non-conversions are the grouping's artefact.** A `(function,
+   scrutinee)` row is not necessarily one dispatch: `tyEqGo`'s `tb` is a top-level
+   union pre-test plus **10 SAME-VARIANT guards, one inside each `ta` arm**, and
+   `assignableGo`'s `d` is **6 order-sensitive TARGET-shape tests interleaved with
+   the `s` tests** (its own header says PLACEMENT IS LOAD-BEARING) plus 5
+   same-variant guards inside the `s` arms. Neither is a ladder that can become
+   one `match` — `tb` would need 11 arms per `ta` arm (121 total, 110 of them
+   empty), and re-ordering `d` ahead of or behind `s` changes what the checker
+   accepts. Their drift is already covered: a 12th arena variant breaks the
+   self-compile at the `ta` / `s` match, and the author of that new arm writes its
+   `tb` / `d` guard with it. **So the real denominator for "ladders convertible to
+   one exhaustive `match`" is 14, not 16.**
+
+   Two mechanics worth knowing before the next conversion:
+
+   * **Exhaustiveness is checked against the FLOW-NARROWED scrutinee, so an arm
+     for an already-excluded variant is a TYPE ERROR.** `assignableGo`'s tail
+     rejected a `TyErr` arm — `if s is TyErr { return true }` earlier in the
+     function removes `TyErr` from `s`'s type, and the compiler says `match
+     pattern TyErr is not a member of …`. The guard is undiminished (a 12th
+     variant joins the narrowed set too); the arm set is simply the narrowed one.
+     Asymmetrically, the neighbouring `if s is TyVar { return true }` does NOT
+     narrow, and its arm is required — so the arm set has to be read off the
+     compiler, not off the source.
+   * A ladder whose fall-through does WORK (`vbUnionMemberName`'s field ladder
+     ends `} else { return "" }`) converts by spelling that work in each
+     deliberate arm, not by leaving the arm empty: an empty arm there would fall
+     past the decline and append a field with an empty render.
+
+   A natural second tier is the five missing exactly ONE structural variant —
+   `substTyDeep`, `tyChildrenOf`, `tyReachesHole`, `tyPrintsAsRef` (all `TyPrim`)
+   and `nodeArrayElemName` (`TyArray`, audit row R7) — where the conversion forces
+   a real decision rather than pinning a settled one. Cost per ladder: reindent,
    spell the deliberate leaves as empty/no-op arms WITH their reason, and (once,
    done) export `TyErr`/`TyVar` from `typecheck.vl` so a file can name the two
    holes it is deliberately skipping. `repTyScalarMask` is the worked instance.
