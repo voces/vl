@@ -1376,6 +1376,15 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nullist"
     }
   }
+  // `p ?? d` over the SAME niche stays `i32[] | null` exactly when the default can still be
+  // null — the CONSUMER half of `emitCoalesce`'s nullable-collection arm. (`exprArray` claims
+  // the rep in BOTH halves; only the NULLABILITY is this classifier's question.)
+  const nlLhs = coalesceNicheLhs(exprIx)
+  if nlLhs >= 0 {
+    if exprNullableList(nlLhs, fnIx) {
+      return coalesceNicheStaysNullable(exprIx, fnIx)
+    }
+  }
   false
 }
 
@@ -1424,6 +1433,15 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if fnRetNulRefArrayNameSid(sidOfNode(e.callFn)) != "" { return true }
+    }
+  }
+  // `p ?? d` over the SAME niche stays `<ref-array> | null` exactly when the default can still
+  // be null — the CONSUMER half of `emitCoalesce`'s nullable-collection arm for the REF-array
+  // family. (`exprRefArray` claims the rep in both halves.)
+  const nraLhs = coalesceNicheLhs(exprIx)
+  if nraLhs >= 0 {
+    if exprNullableRefArray(nraLhs, fnIx) {
+      return coalesceNicheStaysNullable(exprIx, fnIx)
     }
   }
   false
@@ -1479,6 +1497,12 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
       if rn != "" { return rlSlotByName(rn) }
     }
   }
+  // `p ?? d` over the SAME niche yields the LHS place's inner ref list — so an INFERRED
+  // `const v = p ?? q` stores the very row `emitCoalesce` declared its block type from.
+  // Without it the binding took slot -1 and `fbValtypeNullable` had no shape to name
+  // (`emitProgram: ref valtype with no interned shape`).
+  const nriLhs = coalesceNicheLhs(exprIx)
+  if nriLhs >= 0 { return nulRefArrayInnerSlot(nriLhs, fnIx) }
   -1
 }
 
@@ -1593,6 +1617,16 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
           if k == 10 { return "nulf32list" }
         }
       }
+    }
+  }
+  // `p ?? d` over the SAME niche stays the nullable leaf list exactly when the default can
+  // still be null — the CONSUMER half of `emitCoalesce`'s nullable-collection arm for the
+  // DISTINCT-backing family. (The non-null half is the leaf list, which `exprStringArray` /
+  // `exprF64Array` / … claim.)
+  const nskLhs = coalesceNicheLhs(exprIx)
+  if nskLhs >= 0 {
+    if coalesceNicheStaysNullable(exprIx, fnIx) {
+      return exprNulScalarListKind(nskLhs, fnIx)
     }
   }
   null
@@ -9306,6 +9340,37 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   false
 }
 
+// The LHS PLACE of a non-map `??`, or -1 when `exprIx` is not a `??` — the CONSUMER-side hook
+// of every nullable-niche `??` arm, and the counterpart of `coalesceMvSlot` (which is the same
+// hook for the FUSED map-get spellings).
+//
+// `p ?? d` carries the LHS's REP in both halves — an `i32[] | null` coalesced with a list is
+// still the i32-list wrapper, a `K | null` coalesced with a member is still the atom i32 — and
+// `coalesceDefaultNullable` alone decides WHICH HALF. So a classifier for the rep asks this and
+// ignores the half; one for the NULLABLE half asks this and then `coalesceDefaultNullable`.
+// Getting the rep question and the half question from two homes is how a consumer bound a plain
+// i32 cell for a `K | null ?? "a"` result and PRINTED THE INTERNED ID.
+export function coalesceNicheLhs(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" { return e.binLeft }
+  }
+  -1
+}
+
+// The HALF a non-map `??` result lands in — `true` the NULLABLE half, `false` the non-null one
+// (and `false` for a node that is not a `??`, which no caller asks). `coalesceDefaultNullable`
+// stays THE nullability decision; this is only its `??`-node accessor, so a consumer classifier
+// reaches the default without re-deriving its arena index beside `coalesceNicheLhs`.
+export function coalesceNicheStaysNullable(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" { return coalesceDefaultNullable(e.binRight, fnIx) }
+  }
+  false
+}
+
 // The list-element rep (2/7/12/20 — see `mvListValKind`) of a bare `m[k]` or `m[k] ?? d`
 // read over a list-VALUED map, else -1. The single classifier hook each `expr*Array` uses to
 // claim a list-valued-map read of its own element type.
@@ -10392,6 +10457,14 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       const nblRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
       if nblRecv >= 0 {
         if nodeTyMapValIsNulLitUnion(nblRecv) { return true }
+      }
+      // The NON-map `p ?? d` over the SAME niche keeps it `K | null` exactly when the default
+      // can still be null — the CONSUMER half of `emitCoalesce`'s litunion arm, in the shape
+      // `exprNulBool` / `exprNullableString` / `exprNullableStruct` state for their own reps.
+      // Without it an inferred `const nv = p ?? q` bound a cell that answered no niche arm and
+      // its `nv != null` emitted a bare null: `bare null needs a struct-typed context`.
+      if exprNulLitUnion(e.binLeft, fnIx) {
+        return coalesceDefaultNullable(e.binRight, fnIx)
       }
     }
   }
@@ -14494,6 +14567,15 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   // widen, a litunion-param arg, a member compare — the checker has narrowed it non-null, so it is a
   // valid atom. The narrowed member texts come from the node's narrowed type (`nodeLitUnionMemberTexts`).
   if exprNulLitUnion(exprIx, fnIx) { return true }
+  // `p ?? d` over the `K | null` niche is an ATOM in BOTH halves — the line above already
+  // claims the nullable one, and a NON-null default coalesces the sentinel away to leave the
+  // plain atom id. The half is irrelevant here, so this asks only the rep. Without it an
+  // inferred `const v = p ?? "a"` bound a bare i32 and every atom consumer (the `print` widen,
+  // a litunion arg, a member compare) saw a NUMBER: `vl check` rc 0, `0` printed for `"a"`.
+  const claLhs = coalesceNicheLhs(exprIx)
+  if claLhs >= 0 {
+    if exprNulLitUnion(claLhs, fnIx) { return true }
+  }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Ident {
     // A CAPTURED variable, resolved against the enclosing frame's binding — the same node
@@ -19123,6 +19205,10 @@ export function exprArray(exprIx: i32, fnIx: i32) {
     // `m[k] ?? d` over an i32-LIST-valued map (`{[string]: i32[]}`) yields the value i32 list.
     if e.binOp == "??" {
       if mvListValKind(coalesceMvSlot(exprIx, fnIx)) == "list" { return true }
+      // The NON-map `p ?? d` over the i32-list niche is the i32-list wrapper in BOTH halves —
+      // the rep does not change, only its nullability (`exprNullableList`'s own `??` arm), the
+      // same reason the nullable-list Ident arms above claim unconditionally.
+      if exprNullableList(e.binLeft, fnIx) { return true }
     }
     return false
   }
@@ -19289,6 +19375,13 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
         return rlElemKindTbl[slot] == 9
       }
     }
+  }
+  // `p ?? d` over the `<ref-array> | null` niche is the ref-list wrapper in BOTH halves — the
+  // rep is unchanged, only its nullability (`exprNullableRefArray`'s own `??` arm), the same
+  // reason the kind-18 local / param / global Ident arms above claim unconditionally.
+  const raLhs = coalesceNicheLhs(exprIx)
+  if raLhs >= 0 {
+    if exprNullableRefArray(raLhs, fnIx) { return true }
   }
   false
 }
@@ -19508,6 +19601,21 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   if e is Index {
     const outer = refListElemNameOfExpr(e.idxArr, fnIx)
     if outer != "" && nameIsArray(outer) { return refArrElemName(outer) }
+  }
+  // `p ?? d` over a `<ref-array> | null` niche yields the SAME inner ref list, so its element
+  // name is the LHS place's — `refListSlotOfExpr` then round-trips the `??` result back to the
+  // very row `emitCoalesce` declared its block type from.
+  //
+  // THE NICHE'S OWN INNER-SLOT RESOLVER ANSWERS FIRST, because the recursion below cannot for
+  // every LHS: an `Index` over a `(<ref-array> | null)[]` names its element `i32[][] | null`,
+  // which the arm above declines (`nameIsArray` says no to a `| null` suffix) while
+  // `nulRefArrayInnerSlot`'s kind-9 arm resolves the row directly. Asking only the recursion
+  // left the NON-null half of that LHS (`xs[i] ?? [[7]]`) with no shape to name.
+  const rlnLhs = coalesceNicheLhs(exprIx)
+  if rlnLhs >= 0 {
+    const rlnIn = nulRefArrayInnerSlot(rlnLhs, fnIx)
+    if rlnIn >= 0 && rlnIn < rlElemName.length { return rlElemName[rlnIn] }
+    return refListElemNameOfExpr(rlnLhs, fnIx)
   }
   ""
 }
@@ -19830,6 +19938,12 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   // yields a `string[]`, so `g[i][j]` reads the string element.
   if e is Index {
     if nestedRefListElemIs(e.idxArr, fnIx, 6) { return true }
+  }
+  // `p ?? d` over the `string[] | null` niche is the string-list wrapper in BOTH halves — the
+  // rep is unchanged, only its nullability (`exprNulScalarListKind`'s own `??` arm).
+  const salLhs = coalesceNicheLhs(exprIx)
+  if salLhs >= 0 {
+    if exprNulScalarListKind(salLhs, fnIx) == "nulstrlist" { return true }
   }
   false
 }
