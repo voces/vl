@@ -2374,6 +2374,13 @@ on a box at load 20. wasmtime hoists the loop-invariant read regardless of the b
 So the change is an ABI-visible edit to every emitted module that provably changes no
 optimized output and no runtime. That is the whole case against shipping it.
 
+**The one condition that would re-open it** is named here so a re-filer does not have to
+rediscover it: the verdict rests on binaryen's whole-module view being complete, which rests
+on `emitExportSection` never exporting a global. If VL ever exports one — a `--export-globals`
+flag, a host-visible config cell, anything on the P0.2 memory-export precedent — the
+inference breaks for exactly the exported cells and the declared bit becomes the only thing
+that can carry immutability across the boundary. Nothing else in this measurement changes.
+
 ## 13. PERF item P2 — a closure's code pointer stops being a `funcref`
 
 VL's closure fat-pointer was `{ code: funcref, env: structref, id: i32 }` and every call
