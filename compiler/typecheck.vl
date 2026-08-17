@@ -9729,7 +9729,7 @@ let cgpFieldRaw: string[] = []
 // the litunion identity and mis-routing the type to the `string | null` ref box (kind 16) instead of
 // the i32 ATOM NICHE (`-1` = null). Reconstructs as `<litunion-core>|null` (alias preserved, literals
 // kept quoted), which `nameIsNulLitUnion` recognizes and `vtKindOfType` maps to the i32 kind 0.
-function nulLitUnionPreserve(parts: string[]) {
+function nulLitUnionPreserve(parts: string[], ctx: i32) {
   let hasNull = false
   const rest: string[] = []
   let i = 0
@@ -9786,6 +9786,22 @@ function nulLitUnionPreserve(parts: string[]) {
       // otherwise); the `null` arm adds one, exactly as the ungrouped path above.
       nluAtoms = lupAtoms + 1
       return lup + "|null"
+    }
+  }
+  // …AND THROUGH ONE TRANSPARENT ALIAS, which is the THIRD spelling of the same question.
+  // `type K2 = K` and `type NK = new K` DENOTE the litunion, but `nameIsLitUnionType` reads the
+  // alias's OWN `cUserTypes` entry — the one-member wrapper, not a litunion — so both rungs above
+  // decline and canon SOFTENED `K2 | null` to `string | null`. The non-null spelling never hits
+  // this: canon resolves a transparent alias at the LEAF, and only a top-level `|` split reaches
+  // here with the alias still spelled. Softened, a `{[string]: K2 | null}` map built its vals slot
+  // `(ref null $aTypeIdx)` while every read lowered the i32 atom — check-clean INVALID WASM. One
+  // canon hop on the core is exactly the resolution the leaf arm would have given it, and the
+  // `isTransparentAlias` gate keeps every ordinary `T | null` off the extra call.
+  if isTransparentAlias(core) {
+    const cCore = canonEmitNameAt(core, ctx)
+    if nameIsLitUnionType(cCore) {
+      nluAtoms = canonAtoms + 1
+      return cCore + "|null"
     }
   }
   // A NULLABLE UNION OF LITERAL UNIONS (`K | K2 | null`) DELIBERATELY DOES NOT FLATTEN
@@ -10247,7 +10263,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     const parts: string[] = []
     tyTopLevelSplit(name, '|', false, parts)
     // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
-    const nlu = nulLitUnionPreserve(parts)
+    const nlu = nulLitUnionPreserve(parts, ctx)
     if nlu != "" {
       canonAtoms = nluAtoms
       return nlu
@@ -20167,17 +20183,13 @@ export function anyLitUnionUsed() {
   while i < P.nodes.length {
     const n = P.nodes[i]
     if n is TypeRef {
-      if nodeTyIsLitUnion(i) { return true }
-      // A `K | null` annotation USES the litunion K too — without this, a program whose ONLY litunion
-      // mention is nullable (`K | null` everywhere, no bare `K`) leaves `gLitUnionUsed` at 0 and the
-      // emitter's atom-widening (`exprIsLitAtom`) short-circuits, printing the raw id instead of the member.
-      if nodeTyIsNulLitUnion(i) { return true }
       // A litunion used ONLY as a MAP VALUE (`{[string]: K0}`, nested
       // `{[string]: {[string]: K0}}` — no bare `K0` annotation anywhere) counts too:
       // the mv-slot layer interns the value as i32 ATOM ids regardless of this flag,
       // so with detection off the compare/print classifiers treated the atom read as
       // a string — `m[k] == "bbpt"` called strEq with the raw i32 id: INVALID-WASM
-      // (the r4 residual of the nullable-nested-map family).
+      // (the r4 residual of the nullable-nested-map family). Nullable-value maps are
+      // covered by the same probe, which peels one nullable wrapper per map level.
       if tyMapValIsLitUnion(nodeTyIxOf(i), 4) { return true }
     }
     // A litunion used ONLY as an ARRAY element (`K[]`, no bare `K` annotation anywhere) — or any
@@ -20185,7 +20197,25 @@ export function anyLitUnionUsed() {
     // also counts. A direct Ty check over the recorded node type (not the annotation name, which for
     // `K[]` is not a bare litunion name). Without it `gLitUnionUsed` stays 0 and atom detection is off,
     // so `const sk = xs[i]` lowers as a `string` ref — the i32 atom into a `(ref $array)` cell.
+    //
+    // THE NULLABLE NICHE IS ASKED AT EVERY NODE, NOT ONLY AT AN ANNOTATION, and asking it only of a
+    // TypeRef is what made a `(K | null)[]` read print the RAW ATOM ID: the annotation of a
+    // `(K | null)[]` is a TypeRef whose own type is the TyArray, so NO node in such a program carries
+    // a bare nullable-litunion ANNOTATION type and nothing else here mentioned the niche. So
+    // `gLitUnionUsed` stayed 0 for the whole module, `exprIsLitAtom` short-circuited on its first
+    // line, and `print` fell past every atom arm to `__print_i32__`: `0`, `-1`, `1` for
+    // `["p", null, "q"]`, with `vl check` rc 0.
+    //
+    // WHY THERE IS NO `nodeArrayElemIsNulLitUnion` PROBE BESIDE ITS NON-NULL TWIN. The non-null one
+    // is needed because a `K[]` program can mention the litunion nowhere else — `K[]` is not a bare
+    // litunion NAME and the ELEMENT reads record the bare litunion. The nullable twin has no such
+    // gap: every read of a `(K | null)[]` element records the NICHE on the reading node (a loop var,
+    // an index read, a binding), and a CONSTRUCTION-ONLY program does not need the flag at all — the
+    // `null`-to-`-1` element seed comes from `nodeArrayElemIsNulLitUnion` at the ARRAY LITERAL, which
+    // never consults `gLitUnionUsed`. Adding it was measured to move no cell of the 198-cell grid and
+    // to be reachable by no program, so it stays out of a scan that pays per node on every program.
     if nodeTyIsLitUnion(i) { return true }
+    if nodeTyIsNulLitUnion(i) { return true }
     if nodeArrayElemIsLitUnion(i) { return true }
     i = i + 1
   }
@@ -20490,6 +20520,41 @@ export function nodeLitUnionMemberTexts(ix: i32) {
   const t = T.tys[ty]
   if t is TyUnion { return tyLitMemberTexts(ty) }
   emptyTextList()
+}
+
+// The member literal TEXTS of node `ix`'s NULLABLE literal-union type — both spellings
+// (`K | null`, a TyNullable over the litunion; and the expanded `"a" | "b" | null` an alias
+// carrying its own null arm interns as). The null arm contributes NO text, so the list is
+// exactly the widenable members and the caller emits the `-1` sentinel arm itself.
+//
+// Empty when `ix` is not the nullable niche, which is how `print`'s dispatch tells the two
+// widening chains apart: a NARROWED read records the bare litunion and takes
+// `nodeLitUnionMemberTexts`' member-only chain, which needs no null arm. Asked FIRST, because
+// the expanded spelling satisfies both queries and only this one knows a null can arrive.
+export function nodeNulLitUnionMemberTexts(ix: i32) {
+  const ty = nulLitUnionPeelTy(nodeTyIxOf(ix))
+  if ty < 0 { return emptyTextList() }
+  tyLitMemberTexts(ty)
+}
+
+// Peel every NULLABLE wrapper off `ty` and answer the arena index of the LITUNION underneath, or
+// -1 when `ty` is not the nullable niche at all (a BARE litunion included — its print needs no
+// sentinel arm, so it must decline here).
+//
+// DEPTH MATTERS. A bare read over a `{[string]: K | null}` map types `K | null | null` — the
+// read's own missing-key nullability wrapping the stored value's — so a one-wrapper peel answers
+// "not a niche" about a value that is exactly the niche, and the print chain then had no member
+// texts to widen with. The EXPANDED spelling (`type K = "a" | "b" | null`) carries its null as a
+// UNION MEMBER instead of a wrapper and needs no peel, which is the second arm.
+function nulLitUnionPeelTy(ty: i32): i32 {
+  if ty < 0 { return 0 - 1 }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if tyIsLitUnion(t.nInner) { return t.nInner }
+    return nulLitUnionPeelTy(t.nInner)
+  }
+  if tyIsNullableLitUnion(ty) { return ty }
+  0 - 1
 }
 
 // A fresh empty `string[]` — `nodeLitUnionMemberTexts`'s two decline arms, which must each hand back a

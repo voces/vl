@@ -14,6 +14,7 @@ import {
   nodeArrayElemIsNulStr,
   nodeLitMembersWithin,
   nodeLitUnionMemberTexts,
+  nodeNulLitUnionMemberTexts,
   nodeNumScalarBaseName,
   nodeTyIsLitUnion,
   nodeTyIsLitUnionAlias,
@@ -10367,33 +10368,31 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         // module failed to parse as WebAssembly. The two classifiers disagree only where the value
         // IS an atom, and there the atom answer is the REP; `exprString` is a rendering.
         if exprIsLitAtom(c.callArgs[0], fnIx) {
+          // An UN-NARROWED `K | null` niche is the SAME i32 with `-1` for null, so it prints its
+          // member OR the word `null` — exactly what the two niches beside it do
+          // (`emitPrintNulString`, `emitPrintNulBool`). Asked FIRST: the expanded spelling
+          // (`type K = "a" | "b" | null`) satisfies the member-only query below as well, and only
+          // this one emits the sentinel arm.
+          const lpNul = nodeNulLitUnionMemberTexts(c.callArgs[0])
+          if lpNul.length > 0 {
+            return emitPrintNulLitUnion(body, c.callArgs[0], lpNul, fnIx)
+          }
           const lpTexts = nodeLitUnionMemberTexts(c.callArgs[0])
-          // An UN-NARROWED `K | null` niche: `exprIsLitAtom` claims it on the standing assumption
-          // that a consuming position has narrowed it non-null (its own comment says so), and the
-          // member texts come from the NARROWED type — so an un-narrowed one yields NO texts and
-          // master emitted an empty chain: rc=0 and NO OUTPUT for a local/param, the quietest
-          // possible wrong answer. There is no member text for the null arm to print, so this is
-          // the same rule the nullable STRING below carries: narrow it first.
+          // `exprIsLitAtom` claims a value whose REP is the atom; the member texts come from the
+          // recorded TYPE. A claim with no texts on either query means the two disagree, and the
+          // chain would match nothing: rc=0 and NO OUTPUT, the quietest possible wrong answer.
           if lpTexts.length == 0 {
             return emitFail(
-              "emitProgram: print of a nullable literal union — narrow it first (`if v != null { print(v) }`)",
+              "emitProgram: print of a literal-union atom whose type carries no member texts",
             )
           }
-          let lpi = 0
-          while lpi < lpTexts.length {
-            const lpQ = quoteLex(lpTexts[lpi])
-            if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-            fbI32Const(internAtom(lpQ))
-            fbI32Bin(70) // 0x46 i32.eq
-            fbIf(64)     // if (void)
-            ctrlEnter()
-            const lpSyn = mkStr(lpQ, -1)
-            if emitPrintStrExpr(body, lpSyn, fnIx) < 0 { return -1 }
-            fbEnd()
-            ctrlLeave()
-            lpi = lpi + 1
-          }
-          return 0
+          const lpRc = emitPrintAtomMemberChain(
+            body,
+            c.callArgs[0],
+            lpTexts,
+            fnIx,
+          )
+          return lpRc
         }
         // A NULLABLE-string value (`string | null` — a niche binding, a `(string|null)[]`
         // element, a fused read over a `{[string]: string | null}` map, which PRESERVES a
@@ -15081,6 +15080,61 @@ function emitPrintNulBool(body: i32[], argIx: i32, fnIx: i32) {
   fbBr(1)     // → $out
   fbEnd()
   ctrlLeave()
+  emitPrintNullWord()
+  fbEnd()
+  ctrlLeave()
+  0
+}
+
+// The per-member print chain for an ATOM-repped literal union: for each member, `if id == <that
+// member's interned id> { print "<member>" }`. Membership is total for a non-null atom, so exactly
+// one arm fires and no default is needed. The value is RE-READ per member rather than stashed,
+// which keeps this off the string-op scratch frame and therefore out of the reservation scan
+// (`exprHasStrOp`) — the same trade `emitStrToAtom` documents for its own tower.
+//
+// ONE HOME for the chain: the bare-atom print and the `K | null` niche print below emit the
+// identical member arms, and the niche only ADDS a sentinel arm after them.
+function emitPrintAtomMemberChain(
+  body: i32[],
+  argIx: i32,
+  texts: string[],
+  fnIx: i32,
+) {
+  let i = 0
+  while i < texts.length {
+    const q = quoteLex(texts[i])
+    if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+    fbI32Const(internAtom(q))
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)     // if (void)
+    ctrlEnter()
+    if emitPrintStrExpr(body, mkStr(q, -1), fnIx) < 0 { return -1 }
+    fbEnd()
+    ctrlLeave()
+    i = i + 1
+  }
+  0
+}
+
+// `print(<K | null>)` — the atom NICHE: an i32 member id with `-1` for null, the same sentinel
+// `emitNulIsNullTest`'s litunion arm compares against. The member chain, then the sentinel arm
+// that prints the word `null`, so the niche renders like the two nullable scalars beside it
+// (`emitPrintNulString`, `emitPrintNulBool`) — `p` / `null` / `q` for `["p", null, "q"]`.
+//
+// A `null` element is ORDINARY, so this must not be a reject: the members and the sentinel
+// partition the i32, and the value carries its own discriminator.
+function emitPrintNulLitUnion(
+  body: i32[],
+  argIx: i32,
+  texts: string[],
+  fnIx: i32,
+) {
+  if emitPrintAtomMemberChain(body, argIx, texts, fnIx) < 0 { return -1 }
+  if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)     // if (void)
+  ctrlEnter()
   emitPrintNullWord()
   fbEnd()
   ctrlLeave()

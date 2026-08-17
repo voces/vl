@@ -59,8 +59,10 @@ import {
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nodeArrayElemIsLitUnion,
+  nodeArrayElemIsNulLitUnion,
   nodeArrayElemName,
   nodeTyIsLitUnionAlias,
+  nodeTyIsNulLitUnion,
   nodeTyIxOf,
   nodeTyMapKeyIsI32,
   nodeTyName,
@@ -1634,7 +1636,18 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   const fiSlot = addLocalName(s.fiVar, fiEk, fiVarIdx)
   // A literal-union array (`for k in xs`, `xs: K[]`): the loop var is an i32 atom (kind 0),
   // but flag it so `k`-as-atom (print widening, `==`, member compare) is recognized.
-  if nodeArrayElemIsLitUnion(s.fiIter) { localLitUnion[fiSlot] = 1 }
+  //
+  // THE NULLABLE ELEMENT NEEDS THE SAME FLAG. `xs: (K | null)[]` is the same i32 slot with `-1`
+  // for null, and a loop var is the ONE storage class `exprNulLitUnion` cannot reach (it resolves
+  // captures, params, `let`s and globals — a loop var is none of those, and has no LetDecl). With
+  // only the non-null half asked here, nothing claimed the loop var as an atom and `print(k)` fell
+  // through to `__print_i32__`: the raw interned id.
+  if (
+    nodeArrayElemIsLitUnion(s.fiIter) ||
+    nodeArrayElemIsNulLitUnion(s.fiIter)
+  ) {
+    localLitUnion[fiSlot] = 1
+  }
   markLoopVarSlot(fiSlot)
   scopeBind(s.fiVar, fiSlot)
   addLocalName(s.fiVar + "#i", "i32", -1)
@@ -3758,9 +3771,15 @@ export function collectA(_stmts: i32[]) {
         if nsk == "nulf64list" { fa64Used = true }
         if nsk == "nuli64list" { ia64Used = true }
         if nsk == "nulf32list" { fa32Used = true }
-      } else if nodeTyIsLitUnionAlias(i) {
+      } else if nodeTyIsLitUnionAlias(i) || nodeTyIsNulLitUnion(i) {
         // A literal-union annotation (`: K`): an atom WIDENS to its member `string` (`print(k)` etc.), so
         // force the string backing even when the module has no other string literal.
+        //
+        // The NULLABLE niche (`: K | null`) widens the same way and needs the same forcing — and it
+        // cannot lean on the alias arm, because the INLINE spelling `("a" | "b") | null` has no alias
+        // DECLARATION whose own TypeRef would force it. A `const g: ("a" | "b") | null = null` (no
+        // string literal anywhere in the module) reached the widening chain with `$aTypeIdx`
+        // unallocated. Same reason the `string | null` arm above forces it.
         aUsed = true
       }
       // A MAP reached only as a CLOSURE RESULT inside this annotation — a union arm
