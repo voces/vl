@@ -490,6 +490,14 @@ let holeShapeTys: i32[] = []
 // rejects a non-indexable scalar argument bound to such a param (`head(5)` where the body
 // read `self[0]`), the indexing analogue of the demanded-shape check above.
 let holeArrayDemand: string[] = []
+// Hole NAMES whose body used the MAP/SET SURFACE (`self.set(k, v)`, `.get`, `.has`,
+// `.delete`, `.add`, `.keys()`, `.values()`) — so the hole demands a map, and the parallel
+// `holeMapTys` entry IS that map: an open `{[?]: ?}` the body's own operations pin in place.
+// The MAP dual of `holeArrayDemand`, carrying a type rather than only a flag, because a map's
+// demand has two halves to pin and an argument's `Map()` may need either of them
+// (`holeMapDemandTy`).
+let holeMapNames: string[] = []
+let holeMapTys: i32[] = []
 
 // ALTERNATIVE hole constraints contributed by an `is` GUARD over the hole itself:
 //
@@ -2311,6 +2319,8 @@ export function initChecker() {
   holeShapeNames = []
   holeShapeTys = []
   holeArrayDemand = []
+  holeMapNames = []
+  holeMapTys = []
   holeAltNames = []
   holeAltTys = []
   holeAltPreN = []
@@ -11035,6 +11045,28 @@ function holeAssignOk(srcExpr: i32, at: i32, dst: i32) {
 // still-reachable demanded fields (`holeAltResidualTy`) are satisfied too. True
 // when the hole demands nothing.
 function holeDemandOk(name: string, srcExpr: i32, at: i32) {
+  // A MAP demand is checked FIRST and it is a hard requirement, not one arm of a
+  // disjunction: a hole the body used the map surface on is a map, so `put(5)` where the
+  // body did `q.set("a", 1)` stays the reject it is today (the `{set: _}` struct shape it
+  // used to grow refused the i32 for the same reason, in worse words).
+  //
+  // BOTH PINS run on the way through, and they are what make the position inferable rather
+  // than merely accepted. `constrainEmpty(at, hm)` pins an argument still open at the call
+  // (`const m = Map(); put(m)` — otherwise `cannot infer a type for 'm'`); the reverse pins
+  // a demand the callee left open from a concrete argument (`const m = Map(); m["a"] = 1;
+  // take(m)`, where the callee only READS), so the emitter's param pin has a type to name.
+  const hm = holeMapOf(name)
+  if hm >= 0 {
+    if !holeAssignOk(srcExpr, at, hm) { return false }
+    constrainEmpty(at, hm)
+    // A demand the callee's own operations left OPEN is not satisfiable here, and the
+    // reason is ORDER, not assignability. The body has ALREADY been checked against the
+    // open type, so its recorded node types are stale — a `.get` on an unpinned value
+    // recorded `V | null` with no `V` — and pinning the demand from this argument now
+    // would emit against those. That is bidirectional inference (ROADMAP E5), not a pin;
+    // refuse, which is exactly the verdict the `{get: _}` struct shape reached before.
+    if holeMapDemandOpen(hm) { return false }
+  }
   const shape = holeShapeOf(name)
   if shape < 0 { return true }
   if holeAssignOk(srcExpr, at, shape) { return true }
@@ -11117,6 +11149,10 @@ function holeAltRenderTy(shape: i32, k: i32) {
 // still-required residual folded in (`holeAltRenderTy`), so every printed arm is
 // one an argument could actually satisfy. -1 when the hole demands nothing.
 function holeDemandTy(name: string) {
+  // A MAP demand is the whole expectation on its own — `holeDemandOk` requires it
+  // unconditionally, so it is not one arm of the disjunction below.
+  const hmd = holeMapOf(name)
+  if hmd >= 0 { return hmd }
   const shape = holeShapeOf(name)
   const members: i32[] = []
   let k = 0
@@ -11159,6 +11195,125 @@ function noteArrayDemand(name: string) {
 // on a hole can't hijack a genuine map/struct use.
 function holeArrMethod(name: string) {
   name == "map" || name == "filter" || name == "push" || name == "pop"
+}
+
+// The MAP/SET builtin methods that constrain an un-annotated-param hole RECEIVER to a map —
+// the exact dual of `holeArrMethod`, and the set its header already names. Disjoint from the
+// array methods and from every string method, so recognizing them on a hole cannot hijack an
+// array / string / struct use; `length` / `size` are NOT here because they are member READS
+// shared by all three collections and already special-cased at the member arm.
+function holeMapMethod(name: string) {
+  name == "set" ||
+    name == "get" ||
+    name == "has" ||
+    name == "delete" ||
+    name == "add" ||
+    name == "keys" ||
+    name == "values"
+}
+
+// The demanded MAP type of hole `name` (the arena index of a `TyMap` whose key/value the
+// callee's own map operations pin IN PLACE, exactly as `.push` pins an empty `[]`'s element),
+// or -1 when the hole has no map demand. Parallel columns, like `holeShape*`.
+function holeMapOf(name: string) {
+  let i = 0
+  while i < holeMapNames.length {
+    if holeMapNames[i] == name { return holeMapTys[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// GET-OR-CREATE hole `name`'s demanded map: an OPEN `{[?]: ?}` on first use, then the same
+// arena entry for every later map operation in the body, so `q.set("a", 1)` followed by
+// `q.has("b")` accumulates onto ONE type instead of two that agree. `isSet` mints the Set
+// flavor — `boolean`-valued and `mSet == 1` — which is what `.add`'s own arm requires, and
+// is the only thing `.add` on a hole can mean.
+//
+// The demand is created DURING the body check and read at the CALL SITE, and both directions
+// of the pin matter: the callee's operations pin the demand, which then pins an argument
+// whose `Map()` is still open (`const m = Map(); put(m)`), and a call whose argument is
+// already concrete pins the demand for the emitter. `holeDemandOk` runs both.
+// True if map-demand `ty` still has an open half — the callee only READ the map, so neither
+// its key nor its value was pinned by anything in the body. The demand is then a shape no
+// argument can be checked against (see `holeDemandOk`).
+function holeMapDemandOpen(ty: i32) {
+  if ty < 0 { return true }
+  const t = T.tys[ty]
+  if t is TyMap { return t.mKey < 0 || t.mVal < 0 }
+  true
+}
+
+// Report a failed hole-ARGUMENT demand — ONE home for the wording, shared by the general
+// call path and the UFCS one. An OPEN map demand gets its own sentence: the generic
+// `expected …, got …` would render the unpinned demand `{[<none>]: <none>}` and read as a
+// mismatch, when the actual problem is that nothing decided the parameter's type.
+function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
+  const hmE = holeMapOf(name)
+  if hmE >= 0 {
+    if holeMapDemandOpen(hmE) {
+      tErr(
+        "argument " +
+          i32ToStr(argN) +
+          ": parameter is used as a map but nothing in the body pins its key or value" +
+          " — add a type annotation",
+        ix,
+      )
+      return 0
+    }
+  }
+  tErr(
+    "argument " +
+      i32ToStr(argN) +
+      ": expected " +
+      holeDemandStr(name) +
+      ", got " +
+      tyToStr(at),
+    ix,
+  )
+  0
+}
+
+// Report an argument an INDEXED hole cannot take (`tyRefusesArrayDemand`) — ONE home for the
+// wording, shared by the general call path and the UFCS one. A MAP argument gets its own
+// sentence: `q[i]` with an i32 index is ambiguous between an array and an i32-keyed map, the
+// body was checked as the array, and "expected an array" alone would send the reader to
+// change the ARGUMENT when the fix is to annotate the PARAMETER — the more so because an
+// argument still open (`const m = Map()`) renders `{[<none>]: <none>}`.
+function holeArgArrayErr(argN: i32, at: i32, ix: i32) {
+  if at >= 0 {
+    const t = T.tys[at]
+    if t is TyMap {
+      tErr(
+        "argument " +
+          i32ToStr(argN) +
+          ": parameter is indexed with an i32, which is ambiguous between an array and" +
+          " an i32-keyed map — add a type annotation",
+        ix,
+      )
+      return 0
+    }
+  }
+  tErr(
+    "argument " + i32ToStr(argN) + ": expected an array, got " + tyToStr(at),
+    ix,
+  )
+  0
+}
+
+function holeMapDemandTy(name: string, isSet: boolean) {
+  const have = holeMapOf(name)
+  if have >= 0 { return have }
+  let mv = -1
+  let ms = 0
+  if isSet {
+    mv = TY_BOOL
+    ms = 1
+  }
+  const ty = mkMapTy(-1, mv, ms)
+  holeMapNames.push(name)
+  holeMapTys.push(ty)
+  ty
 }
 
 function holeIsArrayDemanded(name: string) {
@@ -11706,6 +11861,22 @@ function tyIsNonIndexableScalar(tyIx: i32) {
   const t = T.tys[tyIx]
   if t is TyPrim { return t.primName != "string" }
   false
+}
+
+// A type an INDEXED hole (`self[i]`, an i32 index — so the body demanded an ARRAY) cannot
+// take. A non-indexable scalar cannot be indexed at all; a MAP can, but by its KEY and to a
+// NULLABLE value, which is a different read discipline from an array's — and the body was
+// ALREADY checked against the array one (its element is an `HD_ELEM` hole, resolved through
+// `TyArray`), so every type the body derived from the read is an array's. Accepting the map
+// here emits an array read over a map ref, or — measured — prints a `boolean` map value
+// through the i32 formatter the array reading chose: `vl check`-clean SILENTLY WRONG output.
+// `q[1]` on a hole is genuinely ambiguous between `i32[]` and `{[i32]: V}` and only the
+// ARGUMENT decides, which is backward flow (ROADMAP E5): reject rather than pick.
+function tyRefusesArrayDemand(tyIx: i32) {
+  if tyIsNonIndexableScalar(tyIx) { return true }
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  t is TyMap
 }
 
 // Member access on an inference hole (host `getChildType` on `Infer<Unknown>`):
@@ -12624,26 +12795,10 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
       const pHole = T.tys[params[i + 1]]
       if pHole is TyVar {
         if !holeDemandOk(pHole.tvName, args[i], at) {
-          tErr(
-            "argument " +
-              i32ToStr(i + 1) +
-              ": expected " +
-              holeDemandStr(pHole.tvName) +
-              ", got " +
-              tyToStr(at),
-            ix,
-          )
+          holeArgDemandErr(pHole.tvName, i + 1, at, ix)
         }
         if holeIsArrayDemanded(pHole.tvName) {
-          if tyIsNonIndexableScalar(at) {
-            tErr(
-              "argument " +
-                i32ToStr(i + 1) +
-                ": expected an array, got " +
-                tyToStr(at),
-              ix,
-            )
-          }
+          if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, ix) }
         }
       }
       constrainEmpty(at, expected)
@@ -12963,6 +13118,16 @@ function checkCallNode(n: Call, ix: i32) {
         noteArrayDemand(rt.tvName)
         const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
         recvTy = mkArrayTy(elemHole)
+      } else if holeMapMethod(cfn.memProp) {
+        // An un-annotated-param HOLE receiving a MAP/SET method — the exact dual of the
+        // array arm above. Become the hole's DEMANDED map (`{[?]: ?}`, one arena entry per
+        // hole) and fall into the map-method arm below, which pins the open key/value from
+        // the method's own arguments in place, exactly as `.push` pins an empty `[]`'s
+        // element. `.add` mints the Set flavor, the only thing `.add` on a hole can mean.
+        // Without this the hole grew a `{set: any}` STRUCT shape no map argument can
+        // satisfy — `argument 1: expected {set: _}, got {[string]: i32}`, a diagnostic that
+        // names a method the argument has.
+        recvTy = holeMapDemandTy(rt.tvName, cfn.memProp == "add")
       }
     }
     rt = T.tys[recvTy]
@@ -13726,28 +13891,12 @@ function checkCallNode(n: Call, ix: i32) {
       const pHole = T.tys[params[i]]
       if pHole is TyVar {
         if !holeDemandOk(pHole.tvName, args[i], at) {
-          tErr(
-            "argument " +
-              i32ToStr(i + 1) +
-              ": expected " +
-              holeDemandStr(pHole.tvName) +
-              ", got " +
-              tyToStr(at),
-            ix,
-          )
+          holeArgDemandErr(pHole.tvName, i + 1, at, ix)
         }
         // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
         // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
         if holeIsArrayDemanded(pHole.tvName) {
-          if tyIsNonIndexableScalar(at) {
-            tErr(
-              "argument " +
-                i32ToStr(i + 1) +
-                ": expected an array, got " +
-                tyToStr(at),
-              ix,
-            )
-          }
+          if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, ix) }
         }
       }
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
@@ -20141,6 +20290,21 @@ export function nodeTyMapValName(ix: i32) {
   ""
 }
 
+// The WHOLE map spelling of node `ix`'s recorded map type — `{[K]:V}`, the emit render,
+// which is character-for-character the synthetic name `parseType` builds for an annotated
+// `{[K]: V}`. "" when `ix` is not a map, or when either half is still a hole (an unpinned
+// `Map()` renders ""), so a caller reading this gets a name it can synthesize an
+// ANNOTATION from or nothing at all. The KEY-and-VALUE twin of `nodeTyMapValName`, for the
+// consumers that need the map's own identity rather than its value's:
+// `emit_mono.monoArgTyName` pins an un-annotated PARAM from it.
+export function nodeTyMapName(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyMap { return tyToEmitName(ty) }
+  ""
+}
+
 // True if node `ix`'s recorded type is an i32-KEYED map (`{[i32]: V}`), one `| null`
 // wrapper tolerated — the KEY twin of `nodeTyMapValName`, and a NO-RENDER variant-tag
 // walk. The emitter's shape resolvers (`mapShapeOfExpr`'s arena fall-through) ask it to
@@ -20355,6 +20519,7 @@ export function monoInferListElem(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
+  const sHoleMap = holeMapNames.length
   const sHoleAlt = holeAltNames.length
   const sBinC = binCstrOp.length
   const sILet = inferLetIx.length
@@ -20408,6 +20573,10 @@ export function monoInferListElem(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while holeMapNames.length > sHoleMap {
+    holeMapNames.pop()
+    holeMapTys.pop()
+  }
   while holeAltNames.length > sHoleAlt {
     holeAltNames.pop()
     holeAltTys.pop()
@@ -20463,6 +20632,7 @@ export function monoInferLocalScalar(
   const sHoleN = holeShapeNames.length
   const sHoleT = holeShapeTys.length
   const sHoleArr = holeArrayDemand.length
+  const sHoleMap = holeMapNames.length
   const sHoleAlt = holeAltNames.length
   const sBinC = binCstrOp.length
   const sILet = inferLetIx.length
@@ -20512,6 +20682,10 @@ export function monoInferLocalScalar(
   while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
   while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
   while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
+  while holeMapNames.length > sHoleMap {
+    holeMapNames.pop()
+    holeMapTys.pop()
+  }
   while holeAltNames.length > sHoleAlt {
     holeAltNames.pop()
     holeAltTys.pop()
@@ -20893,6 +21067,16 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
       // fallback re-check only fires for a node the table doesn't cover.
       let arrTy0 = nodeTyIxOf(tgt.idxArr)
       if arrTy0 < 0 { arrTy0 = checkNode(tgt.idxArr) }
+      // An un-annotated-param HOLE receiver stands for its DEMANDED map (`checkIndexNode`
+      // minted it when the index turned out not to be an i32), so the map pin below is the
+      // SAME arm the concrete receiver takes rather than a second copy of it: `q["a"] = 1`
+      // in a callee's body pins the demand's key and value, and the call site then pins an
+      // argument still open (`const m = Map(); put(m)`).
+      const arrH0 = T.tys[arrTy0]
+      if arrH0 is TyVar {
+        const hmw = holeMapOf(arrH0.tvName)
+        if hmw >= 0 { arrTy0 = hmw }
+      }
       const arrT0 = T.tys[arrTy0]
       if arrT0 is TyArray {
         if arrT0.aElem < 0 {
@@ -22757,6 +22941,23 @@ function checkIndexNode(n: Index, ix: i32) {
   // for `self.x`, so an un-annotated `function head(self) { return self[0] }` infers.
   if at is TyVar {
     if !assignable(idxTy, TY_I32) {
+      // A NON-i32 index can only be a MAP — an array is i32-indexed, and that is the whole
+      // disambiguation — so constrain the hole to its demanded map and pin the KEY from the
+      // index, the index-spelling twin of the `.set` arm's pin. `q["a"] = 1` used to report
+      // `array index must be i32, got string` about a parameter nothing said was an array.
+      // (The i32 index below stays the ARRAY demand: `q[1]` is genuinely ambiguous between
+      // `i32[]` and `{[i32]: V}`, and only the ARGUMENT can decide, which is backward flow.)
+      if mapKeyTySupported(idxTy) {
+        const hmi = holeMapDemandTy(at.tvName, false)
+        const hmt = T.tys[hmi]
+        if hmt is TyMap {
+          if hmt.mKey < 0 {
+            hmt.mKey = idxTy
+            tyMutEpoch = tyMutEpoch + 1 // hole index-read pinned the demanded key in place
+          }
+          return mkNullableTy(hmt.mVal)
+        }
+      }
       tErr("array index must be i32, got " + tyToStr(idxTy), ix)
     }
     noteArrayDemand(at.tvName)
