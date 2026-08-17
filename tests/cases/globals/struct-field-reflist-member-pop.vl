@@ -1,0 +1,98 @@
+// @run
+// @log 2
+// @log 1
+// @log 3
+// @log 3
+// @log 5
+// @log 1
+// @log 0
+// @log 1
+// @log 4
+// A Member-receiver ref-list `.pop()` on a GLOBAL STRUCT FIELD, in functions that never
+// `.push` onto that list.
+//
+// A Member receiver must be materialized into the push frame's `recvRef` scratch slot
+// (a bare LOCAL pop references the local in place and needs none), so a pop-only
+// function still owes the same typed 4-slot frame a pushing one does. That frame is
+// keyed by the receiver's ref-list ELEMENT slot and comes from `fnRefPushSlots`, which
+// `collectRefPushSlots` fills from `.push` sites — so with no push in the function the
+// slot is recorded by `collectMemberPopRefSlots` alone. Without it the pop emits
+// against a local the vector never declared: `vl check` rc 0, `vl build` rc 1
+// "unknown local".
+//
+// Two distinct ref-list element types are popped (a struct element and a MAP element)
+// so the per-slot keying is exercised, in both STATEMENT position (`popFrame`,
+// `dropRow`) and VALUE position (`takeRow`). The top-level `.pop()` at the bottom is
+// the start function's own copy of the same reservation (`startFnDetectScratch` →
+// `exprPopBits`), which no per-function walk covers.
+type Row = {
+  w: i32,
+}
+
+type Holder = {
+  rows: Row[],
+  scopes: {[string]: i32}[],
+}
+
+const H: Holder = { rows: [], scopes: [] }
+
+// EVERY `.push` in the module lives here, module scope included: the start function
+// must reach its own pops with no push of its own to have recorded the slot, or the
+// module-level arm is covered only by accident.
+function fill() {
+  H.rows.push({ w: 5 })
+  H.rows.push({ w: 9 })
+  H.rows.push({ w: 5 })
+  H.rows.push({ w: 3 })
+  H.scopes.push(Map())
+  H.scopes.push(Map())
+  0
+}
+
+// STATEMENT-position pop of the MAP-element ref list, pop-only function.
+function popFrame() {
+  H.scopes.pop()
+  0
+}
+
+// STATEMENT-position pop of the STRUCT-element ref list, pop-only function.
+function dropRow() {
+  H.rows.pop()
+  0
+}
+
+// VALUE-position pop of the struct-element ref list, pop-only function.
+function takeRow() {
+  const r = H.rows.pop()
+  if r == null { return -1 }
+  r.w
+}
+
+fill()
+print(H.scopes.length)
+popFrame()
+print(H.scopes.length)
+print(takeRow())
+print(H.rows.length)
+// MODULE level from here down: these are lowered into the start function, whose
+// scratch frames come from `startFnDetectScratch` rather than from `emitFuncCode`.
+// A global INITIALIZER that pops (value position, the `exprPopBits` /
+// `collectMemberPopRefSlotsExpr` pair over the non-const global inits) —
+const gone = H.rows.pop()
+if gone == null { print(-1) } else { print(gone.w) }
+// — and a bare top-level pop STATEMENT, the same pair over `startStmts`.
+H.rows.pop()
+print(H.rows.length)
+dropRow()
+print(H.rows.length)
+// A top-level COMPOUND statement is not scanned by that per-statement pair at all:
+// its body goes through `startScanBlock` instead. The pop below is on the OTHER
+// ref-list (the map-element one), whose slot no other start-function pop records —
+// popping `rows` here would ride the reservation the two statements above already
+// made and the arm would be covered only in appearance.
+fill()
+while H.scopes.length > 1 {
+  H.scopes.pop()
+}
+print(H.scopes.length)
+print(H.rows.length)
