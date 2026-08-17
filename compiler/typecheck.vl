@@ -11324,15 +11324,61 @@ function tyReachesHole(ty: i32, depth: i32): boolean {
 // LOWER BOUND collected from usage, never a type the parameter must equal.
 function noteHoleFlow(src: i32, dst: i32) {
   if !paramSolveProbe { return 0 }
-  if !tyIsHole(src) { return 0 }
-  if dst < 0 { return 0 }
-  if tyIsDeferredJoin(dst) { return 0 }
-  if isNeverTy(dst) { return 0 }
-  if tyReachesHole(dst, 8) { return 0 }
-  const dt = T.tys[dst]
-  if dt is TyErr { return 0 }
-  holeFlowSrc.push(src)
-  holeFlowDst.push(dst)
+  noteHoleFlowGo(src, dst, 6)
+}
+
+// The parallel src/dst walk `noteHoleFlow` records through. A BARE hole meeting a concrete
+// destination is the answer; a COMPOSITE source carrying the hole is descended into against
+// the SAME position of the destination, so `{f: u}` into a `{f: K}` field, `[u]` into a
+// `K[]` element and a `K`-valued map store each reach the hole they actually constrain.
+// Without the descent the composite source short-circuits `assignable` whole (an element
+// hole is assignable to anything) and the per-position flow is never asked.
+//
+// Only MATCHING shapes descend, and only by field NAME for a struct: a mismatch is a
+// diagnostic the caller is about to report, not a constraint to adopt.
+function noteHoleFlowGo(src: i32, dst: i32, depth: i32) {
+  if depth <= 0 { return 0 }
+  if src < 0 || dst < 0 { return 0 }
+  if tyIsHole(src) {
+    if tyIsDeferredJoin(dst) { return 0 }
+    if isNeverTy(dst) { return 0 }
+    if tyReachesHole(dst, 8) { return 0 }
+    const dt = T.tys[dst]
+    if dt is TyErr { return 0 }
+    holeFlowSrc.push(src)
+    holeFlowDst.push(dst)
+    return 0
+  }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray { return noteHoleFlowGo(s.aElem, d.aElem, depth - 1) }
+    return 0
+  }
+  if s is TyMap {
+    if d is TyMap { return noteHoleFlowGo(s.mVal, d.mVal, depth - 1) }
+    return 0
+  }
+  if s is TyNullable {
+    if d is TyNullable { return noteHoleFlowGo(s.nInner, d.nInner, depth - 1) }
+    return 0
+  }
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < s.objFieldNames.length {
+        let j = 0
+        while j < d.objFieldNames.length {
+          if d.objFieldNames[j] == s.objFieldNames[i] {
+            noteHoleFlowGo(s.objFieldTypes[i], d.objFieldTypes[j], depth - 1)
+          }
+          j = j + 1
+        }
+        i = i + 1
+      }
+    }
+    return 0
+  }
   0
 }
 
@@ -11468,8 +11514,11 @@ function solveUnannotParams(fnIx: i32) {
     }
     // Patch the hoisted TyFunc IN PLACE so a call checked before pass 2 reaches this
     // declaration binds the solved parameter — the same in-place patch the inferred
-    // RETURN makes, for the same reason.
-    if fd.fnName != "" {
+    // RETURN makes, for the same reason. Gated on this node BEING the registered
+    // top-level declaration (the same guard `bodyChecked` carries): a NESTED namesake
+    // is not hoisted, and `lookup` would hand it the OUTER function's signature to
+    // corrupt.
+    if fd.fnName != "" && (fnDeclIx[fd.fnName] ?? -1) == fnIx {
       const bound = lookup(fd.fnName)
       if bound >= 0 {
         const bt = T.tys[bound]
@@ -14288,6 +14337,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       }
     }
   }
+  // Solve this declaration's un-annotated parameters from its body usage. A no-op for a
+  // TOP-LEVEL function (pass 1.6 already did it, order-independently) and inside a probe;
+  // this reach is the NESTED `function` and the value-bound lambda, neither of which is
+  // hoisted, so their first observer IS this call. A parameter the receiver already pinned
+  // contextually is not a hole when the probe runs, so it records no flow and the
+  // `cbExpect` branch below still wins — one answer, not two.
+  solveUnannotParams(fnIx)
   const params = n.fnParams
   // The contextual expected param types recorded for THIS lambda node (`seedExpected` at a
   // call arg, a `.map`/`.filter` receiver, or an annotated let/return/field/element). Keyed by
