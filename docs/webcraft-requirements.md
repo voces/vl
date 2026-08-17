@@ -924,7 +924,9 @@ and needs nothing from vl beyond scalar exports.
 - **Readonly fields / A9 variance**: would let kernel expose read-only views
   of component data to wc3 systems, enforcing the "renderer/systems read,
   commands write" direction in the type system.
-- **Default/optional params** (B15a): API ergonomics only.
+- ~~**Default/optional params** (B15a): API ergonomics only.~~ **SHIPPED** — `p: T = <literal>`
+  and `p?: T` (sugar for `p: T | null = null`). Direct calls only: a function VALUE keeps its full
+  arity, and UFCS (`o.f(a)`) still matches a `self`-function by exact arity.
 - **SIMD over Buffer**: explicitly unlocked by the P0 tier (v128 only
   addresses linear memory — the WasmGC ceiling). Future pathing/hash kernels;
   not requested now. Same for engine-level threads/atomics: webcraft's

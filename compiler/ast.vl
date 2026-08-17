@@ -111,9 +111,21 @@ export type LetDecl = { // let/const x: T = e
   letInit: i32,  // initializer node, -1 if none
   pos: i32,
 }
-export type Param = { parName: string, parType: i32, pos: i32 } // a: i32
-export type TypeRef = { tyName: string, pos: i32 }              // i32 (annotation)
-export type FuncDecl = {                                        // function f<T?>(..): T {..}
+// A parameter `a: i32`, optionally carrying a DEFAULT VALUE (`a: i32 = 0`).
+// `parDefault` is the default expression's arena index (-1 = none); `parOpt` is
+// 1 for the surface spelling `a?: i32`, which is sugar for `a: i32 | null =
+// null` — a faithful-surface marker the printer reads to reprint `?`, exactly
+// as `IsExpr.isNeg` marks a surface `!is`. Everything downstream of the parser
+// reads the desugared `parType` + `parDefault` and ignores `parOpt`.
+export type Param = {
+  parName: string,
+  parType: i32,
+  parDefault: i32,
+  parOpt: i32,
+  pos: i32,
+} // a: i32,  a: i32 = 0,  a?: i32
+export type TypeRef = { tyName: string, pos: i32 } // i32 (annotation)
+export type FuncDecl = {                           // function f<T?>(..): T {..}
   fnName: string,
   fnTyParams: string[], // generic type-parameter names (`<T, U>`), empty if none
   fnParams: i32[],
@@ -871,6 +883,32 @@ export function tsToName(ix: i32): string {
   out
 }
 
+// Does the spelling tree rooted at `ix` NAME any of `names`? Walks the same
+// structure `resolveAnnotTs` resolves against, so it answers about the
+// annotation the author wrote rather than about a synthetic name string:
+// `T`, `T[]`, `Box<T>` and `{a: T}` all mention `T`, while `Trace` does not
+// (a leaf is compared whole, never as a substring). The `TS_APP` head is
+// compared too, so a type parameter used as an application head counts.
+export function tsMentionsAnyName(ix: i32, names: string[]) {
+  if ix < 0 || ix >= tsKind.length || names.length == 0 { return false }
+  const k = tsKind[ix]
+  if k == TS_NAME || k == TS_APP {
+    let i = 0
+    while i < names.length {
+      if names[i] == tsText[ix] { return true }
+      i = i + 1
+    }
+  }
+  const start = tsKidStart[ix]
+  const cnt = tsKidCount[ix]
+  let j = 0
+  while j < cnt {
+    if tsMentionsAnyName(tsKids[start + j], names) { return true }
+    j = j + 1
+  }
+  false
+}
+
 // ── Arena constructors ───────────────────────────────────────────────────────
 // Each appends its variant to `P.nodes` and returns the new node's index. Every
 // constructor takes `pos` — the CHAR OFFSET of the construct's START token (the
@@ -1203,9 +1241,63 @@ export function mkLet(kw: string, name: string, ty: i32, init: i32, pos: i32) {
   addNode(n)
 }
 
-export function mkParam(name: string, ty: i32, pos: i32) {
-  const n: Node = { parName: name, parType: ty, pos: pos }
+export function mkParam(name: string, ty: i32, dflt: i32, opt: i32, pos: i32) {
+  const n: Node = {
+    parName: name,
+    parType: ty,
+    parDefault: dflt,
+    parOpt: opt,
+    pos: pos,
+  }
   addNode(n)
+}
+
+// The default-value expression of the parameter node `pIx`, or -1 when it has
+// none (or `pIx` is not a `Param`). The ONE reader of `parDefault` outside the
+// parser/printer, so a caller never re-narrows the node itself.
+export function paramDefaultOf(pIx: i32) {
+  if pIx < 0 || pIx >= P.nodes.length { return -1 }
+  const p = P.nodes[pIx]
+  if p is Param { return p.parDefault }
+  -1
+}
+
+// How many LEADING arguments a DIRECT call to a function with these parameters
+// must supply: every parameter up to the first one carrying a default. Defaults
+// are trailing-only (the checker rejects a non-defaulted parameter after a
+// defaulted one), so this is the low end of the accepted arity range and
+// `params.length` is the high end. A list with no defaults answers its own
+// length, which is the exact-arity gate every call site had before.
+// Fill every UNFILLED slot of a PARAMETER-ORDERED argument list with that
+// parameter's DEFAULT expression, in place. Returns the position of the first
+// slot that stays unfilled (no argument supplied and no default declared), or
+// -1 when the list came out complete.
+//
+// The default's arena node is SHARED by every call site that omits the argument
+// rather than cloned. Defaults are literals (the checker's rule), so they carry
+// no per-occurrence state: their emitted valtype comes from the parameter they
+// land on and their walk is idempotent.
+export function fillArgDefaults(slots: i32[], dParams: i32[]) {
+  let i = 0
+  while i < slots.length {
+    if slots[i] < 0 {
+      let d = -1
+      if i < dParams.length { d = paramDefaultOf(dParams[i]) }
+      if d < 0 { return i }
+      slots[i] = d
+    }
+    i = i + 1
+  }
+  -1
+}
+
+export function fnRequiredArity(params: i32[]) {
+  let i = 0
+  while i < params.length {
+    if paramDefaultOf(params[i]) >= 0 { return i }
+    i = i + 1
+  }
+  params.length
 }
 
 export function mkTypeRef(name: string, pos: i32) {
