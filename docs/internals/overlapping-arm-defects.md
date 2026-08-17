@@ -1257,3 +1257,89 @@ evaluated) says the decision was made a hundred lines earlier by a function whos
 do with optional chains. And the second half: **when a fix would reuse a sibling lowering, run the
 sibling first.** Four of six shapes' `?. != null` is wrong, which turned a one-arm fix into a rep
 question in three commands.*
+
+## D14 is CLOSED — the fieldset interner had TWO axes where it needed a rule, and the "unparseable" filing was a host message
+
+D14: two anonymous object literals sharing a field-name SET collapse onto one interned shape.
+`{ v: 1 }` beside `{ v: "s" }` is `vl check`-clean and emits a module the engine refuses.
+
+### First, the filing's severity claim is wrong, and it matters for how these get triaged
+
+The filing called the emitted module **unparseable** — worse than the invalid-wasm cells this
+family keeps producing. It is not. `wasm-tools print` reads the module fine (311 lines of WAT) and
+`wasm-tools validate` gives `type mismatch: expected i32, found (ref $type) (at offset 0xc3)` — a
+VALIDATION failure. The word "unparseable" came from the wasmtime host, which prefixes every
+module rejection with `failed to parse WebAssembly module` and puts the real cause under
+`Caused by:`. **Across 151 measured cells the UNPARSEABLE count is 0.** Read the `Caused by:` line,
+not the headline, before grading a module rejection.
+
+### The grid
+
+**132 generated cells** (7 value types × ordered pairs, 5 field-set shapes, 6 placements) plus **19
+hand-built specials** (declared struct vs anonymous literal, litunion, union box, niche, newtype,
+map, struct-list, and three same-valtype confusion probes). Each cell is a colliding program and a
+differently-named ORACLE twin.
+
+| | before | after |
+|---|---|---|
+| correct | 52 + 4 | 130 + 12 |
+| `vl check`-clean, UNPARSEABLE module | **0** | **0** |
+| `vl check`-clean, invalid wasm (parseable, engine-rejected) | **63 + 6** | 0 |
+| `vl check`-clean, SILENTLY WRONG | **0 + 2** | 0 |
+| loud reject (emit or check) | 15 + 7 | 0 + 7 |
+| oracle itself broken (excluded) | 2 + 4 | 2 + 4 |
+
+The two silent cells are the ones worth the filing, and both are TYPE CONFUSIONS — one literal's
+field read at the other's type:
+
+- `{ v: 6000000000 }` beside `{ v: 2147483647 }`: the second field is read at **i64**, so
+  `v + 1` printed 2147483648 instead of wrapping to -2147483648.
+- a declared `{ v: boolean | null }` beside `{ v: 6 }`: 6 lands on the niche's i32 **null
+  sentinel**, so the field printed `null`.
+
+### Which axes the interner discriminated — code reading and measurement AGREED
+
+`structIndexOfObjCtxGo` had exactly two arms: the float axis (17/24) and the i64 axis (23). The
+measured matrix says the same thing — every `f64`-first and every `i64`-value pair was correct,
+and every i32 / string / boolean / list / nested-struct pair merged. No third axis existed, and no
+axis in the code failed to show up in the measurement.
+
+### The rule, and why it has two tiers
+
+`anonValueFitsField` is the general (value code, field code) refutation the float and i64 arms are
+special cases of. Refuting every mismatch on every row **broke 15 corpus cases**, and the measured
+reason is what a row's codes are EVIDENCE of. A DECLARED row's codes come from an annotation the
+checker reaches with values the code does not spell — a bare `{f: 663810583}` types against an
+`f: i64` field and the store re-encodes; a scalar-element array literal feeds a
+`(i64|string|{q:i64})[]` field and the elements box on the way in. An ANONYMOUS row's codes were
+read off a literal by `collectAnonShapes`, which is never an annotation target, so they are exact.
+So the composite codes and the integer-widening pairs refute against anon rows only; the pairs no
+adoption can bridge (an integer into a string field, a string into a plain i32 one, a non-boolean
+into a `boolean | null` sentinel) refute against every row.
+
+### A second defect the strictness EXPOSED, which had been silent under the leniency
+
+`anonFieldCode` read a `+` one level down, so `"expected " + kindDesc(k) + " but found " + f(t)` —
+whose outermost `+` has a BinExpr on the left and a Call on the right, neither of them a string
+LITERAL — coded the field **i32**. Harmless while the scan was name-only (the mis-coded field
+matched a string field anyway); the moment the scan believed the code, the compiler's own
+`{ msg: … , at: P.pos }` diagnostics stopped compiling. *A classifier nothing consults is not a
+classifier that is right.*
+
+### Cost
+
++2 interned struct types and +18 emitted bytes across **1830 corpus files** (1514 that build); 1828
+of them byte-identical. The two that grew are the anon-shape twin cases, which is the split doing
+its job. Seed 1167636 → 1168328 bytes (+0.06%), which is the new code, not shape growth.
+
+### What is still open
+
+Three LOUD cells (unchanged by this cut, and pre-existing): a declared `{ v: K }` litunion-atom
+field beside an unrelated `{ v: 5 }` or `{ v: "a" }` merges, because a string literal is exactly how
+a litunion field IS written and the field-code axis cannot separate the two — it needs the checker's
+recorded node type, which the AMBIGUITY arm consults only at 2+ matches and this is 1. Loud, so it
+is the cheapest class; the fix shape is to let a single match consult the node too.
+
+Pinned by `tests/cases/structs/anon-fieldset-collision-scalar-axis.vl` (unannotated throughout, so
+no minted slot can carry it) and `anon-fieldset-collision-silent-reads.vl` (which RUNS on the
+reverted compiler and prints the two wrong values).
