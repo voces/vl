@@ -2749,6 +2749,76 @@ function isVoidTy(ty: i32) {
   false
 }
 
+// Whether `ty` CARRIES a `void` — the primitive itself, or a `void` MEMBER of a union /
+// nullable. No value has such a type: `void | i32` is what an if-expression with one void
+// arm and one value arm joins to, and it reaches a value slot exactly where a plain `void`
+// does (`print(if c { f() } else { 1 })` emitted a module that fails to validate).
+//
+// Depth-bounded like the other structural walks. Composites (array / map / struct / fn)
+// are deliberately NOT descended: a `void` inside one is refused at the element or field
+// slot that built it, which names the position the author wrote.
+function tyMentionsVoid(ty: i32, depth: i32) {
+  if ty < 0 { return false }
+  if depth <= 0 { return false }
+  if isVoidTy(ty) { return true }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    let mi = 0
+    while mi < ms.length {
+      if tyMentionsVoid(ms[mi], depth - 1) { return true }
+      mi = mi + 1
+    }
+    return false
+  }
+  if t is TyNullable { return tyMentionsVoid(t.nInner, depth - 1) }
+  false
+}
+
+// Whether the expression at `exprIx` (peeled through parens) is an if-EXPRESSION or a
+// `match` — the two void-typed expression FORMS every void-in-value-slot gate exempts,
+// and the one predicate all of them ask.
+//
+// A statement-`if` and a void-armed `match` type context-free `void`, but that `void` is
+// PROVISIONAL: the `let`/`const` initializer position resolves an else-less if-expression
+// to `T | null` instead (`checkIfStmtNode`'s tail, gated on `letInitIfIx`), so a gate that
+// fired here would refuse a program that path types correctly. In the positions the
+// emitter genuinely cannot lower, it names the real defect — `emitProgram: if-expression
+// requires an else arm` names the missing `else`, which a "got void" wording cannot — so
+// those keep the emitter's message rather than trading it for a vaguer one.
+function voidSlotExemptExpr(exprIx: i32) {
+  if exprIx < 0 { return false }
+  let vi = exprIx
+  const vp = P.nodes[vi]
+  if vp is Paren { vi = vp.parInner }
+  const vn = P.nodes[vi]
+  if vn is IfStmt { return true }
+  if vn is MatchExpr { return true }
+  false
+}
+
+// A `void` expression HAS no value, so a slot that DEMANDS one is a type error. This is
+// the one home for that verdict on the positions whose demanded type comes from
+// INFERENCE: with no written type there is nothing for `assignable` to compare against,
+// so the "cannot assign void to … of type T" / "expected T, got void" messages that cover
+// the ANNOTATED positions never fire, and the void reached codegen — which has no value to
+// put on the stack and emitted a module that fails to validate.
+//
+// `slot` names the demanding position, in the `<slot> expects …, got <ty>` shape the
+// checker's other slot messages already use. Answers whether the slot was refused, so the
+// caller can substitute `TY_ERR` and keep one mistake to one diagnostic.
+function voidValueSlotErr(ty: i32, exprIx: i32, slot: string, at: i32) {
+  if !tyMentionsVoid(ty, 8) { return false }
+  // The provisional-void exemption covers a WHOLLY void if/match only: a union that
+  // MENTIONS void is a MIXED arm join (`if c { f() } else { 1 }`), where the void is one
+  // arm's real type and no position resolves it away.
+  if isVoidTy(ty) {
+    if voidSlotExemptExpr(exprIx) { return false }
+  }
+  tErr(slot + " expects a value, got " + tyToStr(ty), at)
+  true
+}
+
 // Whether `ty` is exactly `string | null` — a `TyNullable` wrapping the `string`
 // primitive. Cheap (no `tyToStr`); used to record an inferred niche if-binding.
 function isNulStringTy(ty: i32) {
@@ -13900,6 +13970,9 @@ function checkCallNode(n: Call, ix: i32) {
       let pj = 0
       while pj < pargs.length {
         const pt = checkNode(pargs[pj])
+        // `print` demands a value to render, and a `void` call has none — the emitter's
+        // print ladder ends in `call __print_i32__` with nothing on the stack.
+        voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
         // `print` renders ONE scalar/string rep at runtime; a BOXED value-union (`i32 |
         // string` — `≥2` distinct value atoms) has no fixed rep, so emit cannot lower
         // `print(<union>)` (it produced invalid wasm). An emitter-capability rejection,
@@ -21560,6 +21633,14 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   // an uninferable-param reject. Mirrors the `=` seeding; the LHS non-null shape drives the lambda.
   if op == "??" { seedExpected(n.binRight, lt) }
   let rt = checkNode(n.binRight)
+  // The `??` DEFAULT is the value the expression yields when the LHS is null, so a `void`
+  // default leaves the coalesce with nothing to produce. The other operators reject a
+  // `void` operand through their own arms below (`operator '+' is not defined for void and
+  // i32`, `cannot compare void with i32`, …) — `??` has none, because it type-joins its
+  // operands rather than demanding a shape of them.
+  if op == "??" {
+    if voidValueSlotErr(rt, n.binRight, "`??` default", ix) { rt = TY_ERR }
+  }
   // A binary op with a HOLE operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
   if op != "=" && op != "&&" && op != "||" { noteBinCstr(lt, op, rt) }
@@ -22253,17 +22334,14 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // un-annotated binding had no assignability check, and `assignableExpr(void, T)` is
   // lenient — so a void binding slipped past `vl check` and CRASHED codegen. Reject it
   // here with a clear, source-located message, poisoning `initTy` to suppress cascades.
+  // EXCEPT an if-EXPRESSION init (`const x = if c then 5`), the provisional-void form
+  // `voidSlotExemptExpr` names: a statement-if is context-free `void`, but the if-binding
+  // inference below resolves it to `T | null` (the else-less false path is the implicit
+  // `null`) — that path owns it. The exemption lives in that one predicate, shared with
+  // `voidValueSlotErr`'s slots; the MESSAGE stays this position's own, because it can name
+  // the binding the author wrote.
   if n.letInit >= 0 && isVoidTy(initTy) {
-    // EXCEPT an if-EXPRESSION init (`const x = if c then 5`): a statement-if is
-    // context-free `void`, but the if-binding inference below resolves it to `T | null`
-    // (the else-less false path is the implicit `null`) — that path owns it.
-    let vini = n.letInit
-    const vip = P.nodes[vini]
-    if vip is Paren { vini = vip.parInner }
-    const viNode = P.nodes[vini]
-    let voidOk = false
-    if viNode is IfStmt { voidOk = true }
-    if !voidOk {
+    if !voidSlotExemptExpr(n.letInit) {
       tErr(
         "cannot bind the void result of '" +
           n.letName +
@@ -23444,10 +23522,19 @@ function checkMemberNode(n: Member, ix: i32) {
 function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   const elems = n.arrElems
   if elems.length < 1 { return mkArrayTy(-1) }
+  // A `void` element has no value to store. Poisoned to `TY_ERR` rather than joined, so
+  // an ANNOTATED literal (`const xs: i32[] = [f()]`) keeps its single "cannot assign"
+  // message instead of gaining a second one for the same mistake.
   let elemTy = checkNode(elems[0])
+  if voidValueSlotErr(elemTy, elems[0], "list element", elems[0]) {
+    elemTy = TY_ERR
+  }
   let ei = 1
   while ei < elems.length {
-    const et = checkNode(elems[ei])
+    let et = checkNode(elems[ei])
+    if voidValueSlotErr(et, elems[ei], "list element", elems[ei]) {
+      et = TY_ERR
+    }
     // Host parity: the element type is the UNION of every element's type
     // (flattened/deduped) — `[a, b, c]` over mixed struct variants types as
     // `(A | B | C)[]`; an annotation then checks each member structurally.
@@ -23606,7 +23693,16 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
     const fnode = P.nodes[fields[i]]
     if fnode is FieldInit {
       fnames.push(fnode.fiName)
-      ftys.push(checkNode(fnode.fiValue))
+      // A `void` field initializer has no value to store; poisoned to `TY_ERR` so an
+      // annotated literal keeps one message for the mistake. Without this the shape
+      // carried a `void` member all the way to `emitProgram: ref valtype with no
+      // interned shape`, which names nothing the author wrote.
+      let fty = checkNode(fnode.fiValue)
+      const fslot = "field '" + fnode.fiName + "'"
+      if voidValueSlotErr(fty, fnode.fiValue, fslot, fnode.fiValue) {
+        fty = TY_ERR
+      }
+      ftys.push(fty)
     }
     i = i + 1
   }
@@ -23846,6 +23942,12 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
     // A returned CALL whose deferred join this site could not decide contributes the
     // WHOLE join, not the lossy collapse the emitter gets (`inferRetTyOf`).
     const rArgTy = checkNode(n.retArg)
+    // `return <void call>` names a value to return and has none. Reported here rather
+    // than left to the mismatch check below, which never sees this path (the return type
+    // is still being inferred) — and which passes even when it does, because
+    // `assignable(void, void)` holds under an explicit `: void`. A void body still
+    // returns from a BARE `return`, or by ending in the call as a statement.
+    if voidValueSlotErr(rArgTy, n.retArg, "return", ix) { return TY_VOID }
     noteInferredRet(inferRetTyOf(n.retArg, rArgTy))
     return TY_VOID
   }
@@ -23853,6 +23955,14 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   // lambda's param from the declared return type (also through a composite return shape).
   if want >= 0 { seedExpected(n.retArg, want) }
   const got = checkNode(n.retArg)
+  // The same gate under an explicit `: void`, the one RESOLVED return type the mismatch
+  // check below cannot catch it with: `assignable(void, void)` holds, so the void flowed
+  // into a module with nothing on the stack to return. Every other declared return type
+  // already reports it as its own mismatch ("expected i32, got void"), naming what the
+  // annotation asked for — a strictly better message, so this gate stays out of its way.
+  if isVoidTy(want) {
+    if voidValueSlotErr(got, n.retArg, "return", ix) { return TY_VOID }
+  }
   // Redundant-return rule: witness the explicit return's NATURAL type (before
   // constrainEmpty); an annotation-influenced return disqualifies the function.
   if retInfluencedByAnnot(n.retArg) { retNaturalErr = true }
