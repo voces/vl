@@ -343,8 +343,29 @@ Second control (the same capture with a niche payload instead of a box — corre
 
 ---
 
-### D4 — an i32-keyed map captured by a nested function TRAPS INSIDE THE COMPILER
+### D4 — a map captured by a closure TRAPS INSIDE THE COMPILER — **FIXED, and the filed axis was wrong**
 **COMPILER TRAP · 4 cells · check-clean, no diagnostic, no module**
+
+**RESOLVED.** The axis filed below as "the map's KEY rep only" is the map's **VALUE** type.
+Measured over 220 cells (11 value types × 2 keys × 4 capture routes + an uncaptured control ×
+2 runtime inputs): the KEY is FLAT — 48 string-keyed and 48 i32-keyed cells trapped — while
+the VALUE decides. `string`, `f64`, `i32[]`, `string | null`, `i32 | null` and `f64 | null`
+trapped; `i32`, `boolean`, `boolean | null`, a litunion and a struct value did not. The
+mechanism is why: `mapAnnShape` answers the MONO sentinel (`-1` string-keyed, `-4` i32-keyed)
+for an `i32`/`boolean` value, and those were already declined by `sFieldIndex`'s `si < 0` arm;
+only a value needing its own `$mapStruct` produces a nonnegative `mv` SLOT, and that slot was
+returned where a STRUCT TABLE row was expected (`capturedStructIndex` →
+`captureValStructIdx`, whose companion index is polymorphic in the capture's kind). Both
+controls below still hold; the second one ("an i32-keyed map read WITHOUT the capture") is the
+real discriminator, not the first.
+
+The nearby loud floor named at the bottom of this entry is NOT the mechanism either: the trap
+is an index-space confusion in the classifier, not the i32-key emit floor being reached late.
+The 220-cell grid now reads 220 correct, and the fix also cleared 48 cells that this sweep had
+recorded as check-clean INVALID WASM in the same population (`mapShapeOfExpr`'s captured-map
+arm covered only the `LetDecl` binding, so a captured map PARAM read the mono shape against a
+typed env field). Pinned by `tests/cases/closures/capture-map-i32-key-typed-value.vl` (this
+entry's own program) and `tests/cases/closures/capture-map-typed-value-shape.vl`.
 
 Repro:
 
@@ -374,8 +395,11 @@ Control (a string-keyed map in the same shape — correct):
 Second control (an i32-keyed map read WITHOUT the capture — correct).
 
 * **Triggered by**: both inputs; there is no runtime, so the input is irrelevant.
-* **Flat on**: the capture being a parameter or a local (both trap).
-* **Varies on**: the map's KEY rep only. String-keyed is clean at the same position.
+* **Flat on**: the capture being a parameter or a local (both trap); the capture ROUTE (a
+  nested `function`, an arrow lambda, a lambda passed as an argument, two levels deep — all
+  four trap, 24 of 44 cells each); and the map's KEY (48 traps each spelling).
+* ~~**Varies on**: the map's KEY rep only. String-keyed is clean at the same position.~~
+  **WRONG — see the RESOLVED note at the top of this entry.** Varies on the map's VALUE type.
 * **Why it ranks above the remaining invalid-wasm rows**: it is the only outcome in the
   whole sweep with **no diagnostic of any kind** — not a reject, not a bad module, just an
   out-of-bounds `array.get` in the compiler. Everything else at least produces a message or
@@ -690,6 +714,45 @@ Control: make the operand nullable (`function mk2(): i32 | null`) — correct.
 
 ---
 
+### D16 — an UN-ANNOTATED function returning an empty `[]`, passed on or returned, emits invalid wasm
+**check-clean INVALID WASM · 28 cells of a 384-cell grid · UNFIXED, filed by the D4/Shape-A slice**
+
+This entry was not in the original sweep's population. It was found by the grid that fixed D4
+and the empty-`[]` compiler trap, where it is the residual: 16 of its cells are red on master
+untouched by that fix, and the other 12 were previously masked BY the compiler trap (they were
+`compiler_trap` cells whose un-annotated NAMED-function twins were already this).
+
+Repro (`string` element; the same holds for `f32`, `f64`, `i64`, `i32[]` and a struct element,
+and for the un-annotated LAMBDA spelling of the producer):
+
+    function sink(xs: string[]) { print(xs.length) }
+    function fq() { return [] }
+    function main() { sink(fq()) }
+    main()
+    // vl check rc 0, no diagnostic. Module written (789 bytes); the engine rejects it:
+    //   type mismatch: expected (ref $type), found (ref $type) (at offset 0xe8)
+
+Controls, both correct:
+
+* the SAME producer consumed by `.length` / an index / a `for`-in (`print(fq().length)` → `0`),
+  so the hole return is not itself unlowerable — only its flow into a slot that demands a
+  concrete element rep;
+* the producer ANNOTATED (`function fq(): string[] { return [] }`), which lowers.
+
+* **Flat on**: the producer spelling (an un-annotated named function and an un-annotated lambda
+  behave identically — that equality is an invariant the D4 slice established and it holds
+  across all 8 element types × 6 consumers).
+* **Varies on**: the CONSUMER (only `passon` and `ret`, 0 of the other four) and the element rep
+  (the i32/boolean shared list backing is clean; every rep with its own backing is not).
+* **Why it is not fixed here**: an empty `[]` passed DIRECTLY (`sink([])`) must stay legal and
+  gets its element rep contextually from the parameter. A call RESULT cannot, so the fix is
+  either a contextual seed at the argument boundary or a reject scoped to a call-result hole —
+  a reject-parity change with its own evidence to gather. The annotated-lambda sibling of this
+  shape ships as a loud floor instead (`tests/cases/arrays/
+  lambda-empty-array-ref-element-rejected.vl`).
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
@@ -860,6 +923,14 @@ the harness:
 `compiler_trap` fires 4 times and was separated from `trap` by a measurement, not a guess:
 the third `vl build` stage records whether a module was written (0 bytes → the compiler
 trapped; >0 bytes → the program trapped).
+
+That separation is the only reason D4 exists as an entry, and it was later re-proved LIVE
+rather than merely reachable: on a 608-cell grid built for the class, a deliberate
+out-of-bounds arena read injected into `checkFuncDeclNode` and gated on a function NAME
+appearing in exactly 44 of those cells moved **44 cells** into `compiler_trap` and **0** into
+`program_trap` or `invalid_wasm` (predicted 44 before the run), and the grid returned to its
+pre-sabotage classification on all 608 cells after restoring the compiler from a saved,
+`md5sum -c`-verified artefact.
 
 ### Structural guarantees
 * **One result file per cell.** `runcell.sh` writes `<cell>.res` and never appends to a
