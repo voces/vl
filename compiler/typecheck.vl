@@ -1664,6 +1664,24 @@ let gaAppFinite: i32[] = []
 // its alias NAME (the emitter interns it as a named struct via `unionStructAliasShape`);
 // a plain alias-reference must be TRANSPARENT instead (see `aliasRefIsPlainRoot`).
 let cPlainAliasNames: string[] = []
+
+// ── the declaration FILL registry (pass 0a / 0b) ─────────────────────────────
+// `cUserTypes` gets a declaration's PLACEHOLDER in pass 0a and its SHAPE in pass 0b, so a
+// name resolved between the two answers from an EMPTY arena entry. That is not a missing
+// diagnostic, it is a WRONG TYPE: `declaredTyOfName`'s transparency collapse
+// (`singleAliasMemberTyIx`) needs the alias's one member to be present, so an unfilled
+// `type Flag = boolean` hands back the union WRAPPER, and the struct field that named it
+// keeps a one-member `TyUnion` where the declaration denotes `boolean`.
+//
+// These three columns make the fill DEMAND-ORDERED. `cFillStmtIx` maps a declared type
+// name to its declaration statement (LAST wins, exactly as `cUserTypes` does for a
+// redeclared name); `cFillDoneIx` is the set of arena entries already filled, keyed by
+// ARENA INDEX so two declarations sharing one placeholder still fill it once;
+// `cFillActive` is true only while pass 0b runs, so no later pass — and not the emitter,
+// which re-resolves names long afterwards — can re-enter the fill.
+let cFillStmtIx: {[string]: i32} = Map()
+let cFillDoneIx: i32[] = []
+let cFillActive = false
 // NOMINAL NEWTYPE sidecar (webcraft P1.5 / A14) — the fourth member of the
 // `cStructTyIxs` / `cUnionTyIxs` / `gaAppTyIxs` family, and built to the same rule:
 // the arena stays STRUCTURAL and nominal-ness is a column beside it.
@@ -6581,6 +6599,12 @@ function tpEnvTyOfName(name: string) {
 // `i32`, usable with `+`; before this it was the box → "operator + not defined" / invalid wasm).
 function declaredTyOfName(name: string) {
   if cUserTypes.has(name) {
+    // ORDER-INDEPENDENCE, at the one entry point every route to a declared type comes
+    // through (`tsLeafTy` and `nameToTyReal`'s last rung both bottom out here). Pass 0a
+    // minted this entry as an EMPTY placeholder and pass 0b fills it; a name resolved in
+    // between reads the placeholder, which is a different TYPE and not merely a missing
+    // one — see `forceDeclFill`. Inert outside pass 0b.
+    forceDeclFill(name)
     const ut = cUserTypes[name] ?? -1
     if ut >= 0 {
       const utt = T.tys[ut]
@@ -16876,6 +16900,361 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   mkFuncTy(paramTys, ret)
 }
 
+// Resolve declaration statement `sx`'s fields / union variants and fill them into the
+// placeholder pass 0a minted for it, pushing into the SAME arrays its arena entry holds.
+// A name redeclared later overwrote `cUserTypes` in pass 0a, so both declarations resolve
+// into the LAST placeholder; `cFillDoneIx` keeps each arena entry filled exactly once.
+//
+// TWO CALLERS, and the second is what makes the fill ORDER-INDEPENDENT: pass 0b's
+// source-order driver, and `declaredTyOfName` on demand (`forceDeclFill`) the moment a
+// body resolved here names a declaration the driver has not reached yet. Without the
+// second, a name resolved between 0a and its own fill answers from an EMPTY arena entry,
+// `singleAliasMemberTyIx`'s transparency collapse declines for want of its one member,
+// and the field keeps the union WRAPPER the alias is not.
+//
+// The done-marking happens BEFORE the body resolves, so a self- or mutually-recursive
+// declaration still lands on its own empty placeholder — the cyclic arena shape such a
+// declaration MEANS, and the reason `type List = { rest: List[] }` already worked.
+function fillTypeDeclAt(sx: i32) {
+  const sd = P.nodes[sx]
+  if sd is TypeDecl {
+    const declIx = cUserTypes[sd.tdName] ?? -1
+    if declIx >= 0 && !fillDone(declIx) {
+      cFillDoneIx.push(declIx)
+      const pt = T.tys[declIx]
+      if pt is TyObj {
+        const fnames = pt.objFieldNames
+        const ftys = pt.objFieldTypes
+        const dfields = sd.tdFields
+        let fi = 0
+        while fi < dfields.length {
+          const fd = P.nodes[dfields[fi]]
+          if fd is FieldDef {
+            fnames.push(fd.fdName)
+            let fty = TY_ERR
+            if fd.fdType >= 0 {
+              const ftn = P.nodes[fd.fdType]
+              if ftn is TypeRef {
+                // The diagnostic anchors on the FIELD (`dfields[fi]`); the
+                // spelling tree is banked on its `TypeRef` child.
+                const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)
+                if r >= 0 {
+                  fty = r
+                  // Record the resolved type on the field's annotation node so the emitter
+                  // classifies a struct field structurally from the arena, not the name (C1).
+                  if !inferQuiet && fd.fdType < nodeTyIx.length {
+                    nodeTyIx[fd.fdType] = r
+                  }
+                } else {
+                  tErr(
+                    unknownTyText(ftn.tyName) + " for field '" + fd.fdName + "'",
+                    dfields[fi],
+                  )
+                }
+              }
+            }
+            ftys.push(fty)
+          }
+          fi = fi + 1
+        }
+        // The 0a placeholder was just FILLED in place (its field arrays are
+        // the ones pushed above) — an existing arena entry changed shape.
+        tyMutEpoch = tyMutEpoch + 1
+      }
+    }
+  } else if sd is UnionDecl {
+    // A union's variants are type NAMES; resolve each into the member
+    // type-arena indices (forward references hit the 0a placeholders).
+    const declIx = cUserTypes[sd.udName] ?? -1
+    if declIx >= 0 && !fillDone(declIx) {
+      cFillDoneIx.push(declIx)
+      const pt = T.tys[declIx]
+      if pt is TyUnion {
+        const members = pt.uMembers
+        const variants = sd.udVariants
+        // A DEGENERATE self-cycle — `type D = D`, a body that is nothing but
+        // the alias itself — has no base case, so nothing can inhabit it.
+        // Reported at the DECLARATION (host parser parity), so an UNUSED
+        // `type D = D` still flags; the members stay empty (host: `Never`).
+        if variants.length == 1 && variants[0] == sd.udName {
+          tErr(
+            "Type `" +
+              sd.udName +
+              "` is defined in terms of itself " +
+              "with no base type, so it can never have a value",
+            sx,
+          )
+        } else {
+          let vi = 0
+          let resolvedAny = false
+          const declMemberIxs: i32[] = []
+          // The surviving members, and the two lists the NICHE fold below needs:
+          // every non-`null` survivor, and whether a `null` variant was among them.
+          // Filled here instead of straight into `members` (the live arena array)
+          // because the fold replaces the whole list with one wrapped member.
+          const surviving: i32[] = []
+          const nonNull: i32[] = []
+          let sawNull = false
+          while vi < variants.length {
+            // D-UDVARTY: a union MEMBER is a parser spelling, banked on this
+            // declaration node in member order by `setUdTs` — so resolve the
+            // TREE, not the concatenated name. `annotResolve` is the shared
+            // ladder (`tsToTy` when a root is present, `nameToTy` when it is
+            // not), the same one every positioned annotation and the `is`
+            // test already climb. Measured over the 1,314-file corpus swept
+            // with `vl check --codegen`: 548 of 548 reads carry a root (0
+            // misses), 547 rows answer on both sides with 224 distinct
+            // rendered types per side, and the STRICT structural walk finds 0
+            // disagreements — while `tyEq` finds 0 under a sabotage the strict
+            // walk catches 547 times, which is why the walk is the comparator.
+            const m = annotResolve(variants[vi], udTsRootAt(sx, vi))
+            if m >= 0 {
+              declMemberIxs.push(m)
+              resolvedAny = true
+              // A member that folds to `never` (an empty intersection —
+              // `A & B` over disjoint operands) DROPS from the union
+              // (`0 | (1 & !1)` is `0`); a declaration with NO surviving
+              // member is the never-value HARD ERROR below (host PR #189:
+              // errors at the declaration even when unused).
+              if !isNeverTy(m) {
+                surviving.push(m)
+                if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
+              }
+            } else {
+              tErr(
+                unknownTyText(variants[vi]) + " in union '" + sd.udName + "'",
+                sx,
+              )
+            }
+            vi = vi + 1
+          }
+          // The DECLARATION route's copy of `annUnionInnerTy`'s unseparable-member
+          // rule: this loop builds its member list itself, so `type U = N | i32`
+          // never reaches the shared annotation home. The union is still FILLED —
+          // one diagnostic at the declaration is the whole report, and poisoning the
+          // arena entry would turn every use into a second, worse message. Read off
+          // the SURVIVOR list, which is what the members used to be: `TY_NULL` never
+          // shares a nominal erasure with anything, so the answer is unchanged.
+          const nwClash = nomUnionRepClashMsg(surviving)
+          if nwClash.length > 0 {
+            tErr(nwClash + " in union '" + sd.udName + "'", sx)
+          }
+          // THE `null` NICHE FOLD — an un-parenthesized `type T = X | null` denotes
+          // `X?`, exactly as the inline annotation `X | null` and the parenthesized
+          // declaration `type T = (X | null)` already do (`annUnionTy`, the shared
+          // home). Without it the `null` stayed a SIBLING VARIANT of the alias's
+          // union: two-member arity, so the members registered as variant boxes
+          // (`cVariantMemberTyIxs`) and the wrapper stopped being the one-member
+          // shape `singleAliasMemberTyIx` reads — while every consumer of the value
+          // lowered the niche. The failure is `vl check` rc 0 and an INVALID MODULE for
+          // an inner whose rep the niche folds into a sentinel, and a loud
+          // narrow-first reject for one it does not, at every position, for the
+          // spelling that names the type and not for the one that inlines it.
+          //
+          // The union WRAPPER stays — `cUserTypes[T]` is the index pass 0a minted and
+          // forward references already hold, so the alias denotes `TyUnion[X?]`, which
+          // is the parenthesized declaration's own arena shape, character for
+          // character. A poisoned fold (`annUnionTy` -1, the unseparable pair the
+          // clash diagnostic above just reported) keeps the raw survivor list, so that
+          // report is still the whole report.
+          //
+          // UNGATED ON THE INNER, so this is `annUnionTy` — the SHARED ANNOTATION HOME —
+          // and not a second copy of it. The niche is reachable through the alias for
+          // every inner because `singleAliasMemberTyIx`'s nullable arm claims it for
+          // every inner (`nulAliasMemberFaithful`): the checker resolves `T` to `X?`
+          // and `collectU` SKIPS the alias's row, so `v is X` resolves against the
+          // declared member instead of finding a variant row the param no longer
+          // lowers as. While that arm was gated, an inner it declined kept a
+          // capability on the two-member union that the niche did not have, and the
+          // fold had to decline the same inners or the two disagreed — a declared
+          // struct plus `v is S` ran on the union row and was `emitProgram: \`is\`
+          // receiver is not a union value` on the niche.
+          //
+          // MEASURED, not reasoned, and the measurement is what rules out an inner gate
+          // rather than an argument about which inners render faithfully. A 1,020-cell
+          // twin grid — 15 inners × (8 positions + 9 uses) × {`(X | null)`,
+          // `X | null`, `(X) | null`, the alias-free INLINE oracle}, every program run
+          // at BOTH runtime inputs and graded against the analytically-known stdout —
+          // reads, for each un-parenthesized spelling: **CORRECT 135 → 211 of 255**,
+          // oracle parity **62/120 → 117/120** on positions and **69/135 → 135/135** on
+          // uses, **0 silently-wrong cells before or after** (0 of 1,020), and the
+          // parenthesized spelling and the oracle immobile in all 510 of theirs. Both
+          // un-parenthesized spellings land on the parenthesized one's distribution
+          // EXACTLY, and the emitted module is byte-identical across all four spellings
+          // on 107/107 buildable use groups and 102/104 buildable position groups (the
+          // two outliers are oracle-vs-parenthesized and predate the fold).
+          //
+          // THE RESIDUE IS 18 CELLS THAT LOSE A RUNNING PROGRAM, all of them the
+          // NUMERIC LITUNION inner (`type KN = 1 | 2`), 9 axes × 2 spellings — and every
+          // one lands on the INLINE spelling's OWN verdict, message for message
+          // (`emitProgram: bare null needs a struct-typed context`, and
+          // `emitProgram: \`is\` names a type that is not a union variant` for the `is`
+          // axis). A numeric-litunion NICHE carries 6 of 17 axes where the two-member
+          // union carried 15, so folding it is a pure loss ON THAT INNER — but gating it
+          // back out is the WORSE trade and that is measured too: 220 correct against the
+          // parenthesized spelling's 211, bought with parity 115/120 and 127/135, i.e. a
+          // PARENTHESIZATION DIALECT in 10 of that inner's 17 axes. `type T = (KN | null)`
+          // is already `KN?` on the transparency arm, so an inner gate here can only make
+          // the two declaration spellings disagree, which is the defect this fold exists
+          // to close. The hole is the emitter's numeric-litunion niche, loud at every
+          // reach, and it is the inline spelling's hole first.
+          //
+          // A further 18 cells move from a loud check reject onto the inline spelling's
+          // own CHECK-CLEAN-INVALID-WASM hole — a nested-nullable inner at six positions,
+          // and a list / map / closure inner passed onward to a non-null parameter —
+          // reaching the identical function, byte offset and validator message as the
+          // alias-free twin. Loud, never a wrong answer, and filed against the emitter.
+          //
+          // `mkNullableTy` does not intern, so the wrap must happen exactly once, which
+          // is what routing through `annUnionTy` (rather than its two halves) gives.
+          let folded = -1
+          if sawNull && nonNull.length > 0 {
+            folded = annUnionTy(nonNull, true)
+          }
+          if folded >= 0 {
+            members.push(folded)
+          } else {
+            let mi = 0
+            while mi < surviving.length {
+              members.push(surviving[mi])
+              mi = mi + 1
+            }
+          }
+          // Variant-member registration is ARITY-AWARE (Stage B b1, latent
+          // irregularity (a) from the #920 shadow report): only a REAL
+          // (2+ surviving member) union registers its members as variants.
+          // The emitter lowers a single-member union as the member ITSELF
+          // (a `{a} & {b}` struct alias, a transparent `type Id = i32`),
+          // never as a variant box — the old arity-blind push made such a
+          // member's index classify "variant" through the flat TyObj arm
+          // while the union's own index classified "struct".
+          if members.length >= 2 {
+            let ri = 0
+            while ri < declMemberIxs.length {
+              cVariantMemberTyIxs.push(declMemberIxs[ri])
+              ri = ri + 1
+            }
+          }
+          // The 0a placeholder union was just FILLED in place (`members` is
+          // its `uMembers` array) — an existing arena entry changed shape.
+          tyMutEpoch = tyMutEpoch + 1
+          if resolvedAny && members.length == 0 {
+            // Explain the empty intersection in SOURCE terms (matching the TS
+            // host): name the two operands and their kinds (`A & B`, an object
+            // and a string literal), or call out a self-reference
+            // (`type E = A & E`). Falls back to the generic wording for a
+            // non-binary / non-intersection never (e.g. `type C = NeverAlias`).
+            // D-UDNEVER: the intersection's OPERANDS are the kids of the
+            // member's `TS_ISECT` spelling node. Read them; do not re-split the
+            // name the parser concatenated. `splitTopAmp` — a depth-aware
+            // top-level `&` scanner over a rendered type, `<>`-aware since
+            // D-CLASSANG — had this as its ONLY call site and is deleted with it.
+            //
+            // Behaviour is preserved at the two gates that matter. `ops.length
+            // == 2` selected a BINARY top-level intersection, and the kid count
+            // of a `TS_ISECT` is exactly that count; a member with no top-level
+            // `&` has a non-`TS_ISECT` root and yields 0 kids, where the old
+            // scanner yielded the 1-element whole name — both miss `== 2` and
+            // fall to the generic wording. A member with no recorded root does
+            // the same. `tsToName` reproduces the spelling character for
+            // character (it is what `driver.vl`'s module merge itself pushes
+            // into `udVariants`), so `expr` and the self-reference NAME test are
+            // unchanged.
+            const opRoots: i32[] = []
+            const ops: string[] = []
+            const isectRoot = udTsRootAt(sx, 0)
+            if isectRoot >= 0 {
+              if tsKind[isectRoot] == TS_ISECT {
+                const opStart = tsKidStart[isectRoot]
+                let opk = 0
+                while opk < tsKidCount[isectRoot] {
+                  opRoots.push(tsKids[opStart + opk])
+                  ops.push(tsToName(tsKids[opStart + opk]))
+                  opk = opk + 1
+                }
+              }
+            }
+            let didDetail = false
+            if variants.length == 1 && ops.length == 2 {
+              const expr = ops[0] + " & " + ops[1]
+              const selfRef = ops[0] == sd.udName || ops[1] == sd.udName
+              if selfRef {
+                tErr(
+                  "Type `" +
+                    sd.udName +
+                    "` refers to itself inside an intersection (`" +
+                    expr +
+                    "`), so it reduces to `never`",
+                  sx,
+                )
+              } else {
+                tErr(
+                  "Type `" +
+                    sd.udName +
+                    "` is `never` (an empty type — `" +
+                    expr +
+                    "`, " +
+                    operandKind(tsToTy(opRoots[0])) +
+                    " and " +
+                    operandKind(tsToTy(opRoots[1])) +
+                    ", have no common values), so it has no values",
+                  sx,
+                )
+              }
+              didDetail = true
+            }
+            if !didDetail {
+              tErr(
+                "Type `" +
+                  sd.udName +
+                  "` is `never` (an empty type — " +
+                  "its operands have no common values), so it has no values",
+                sx,
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// Is the arena entry `declIx` already filled? Keyed by ARENA INDEX, not by name, so two
+// declarations sharing one placeholder (a redeclaration) fill it exactly once.
+function fillDone(declIx: i32) {
+  let i = 0
+  while i < cFillDoneIx.length {
+    if cFillDoneIx[i] == declIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Fill declaration `name` NOW, when pass 0b is running and has not reached it. Inert
+// outside pass 0b (`cFillActive`), which is what keeps every later re-resolution — pass
+// 1/2, and the emitter's own name bridges — a plain lookup.
+//
+// The UNKNOWN-TYPE BANK is saved across the nested fill. This runs inside an enclosing
+// `tsToTy` / `nameToTy` frame whose `unkTyPart` belongs to the annotation the caller is
+// resolving; the nested fill raises its own diagnostics at its own declaration, so it
+// gets a fresh outermost frame (`unkTyDepth = 0`) and hands the caller's bank back
+// untouched. Sharing the bank would let a nested failure rename the caller's diagnostic.
+function forceDeclFill(name: string) {
+  if !cFillActive { return 0 }
+  const sx = cFillStmtIx[name] ?? (-1)
+  if sx < 0 { return 0 }
+  const svDepth = unkTyDepth
+  const svPart = unkTyPart
+  const svClash = unkTyClash
+  unkTyDepth = 0
+  fillTypeDeclAt(sx)
+  unkTyDepth = svDepth
+  unkTyPart = svPart
+  unkTyClash = svClash
+  0
+}
+
 // The program root: pass 0 registers `type` declarations (structs, then unions over
 // them), pass 1 hoists function signatures (call-before-decl + mutual recursion),
 // pass 2 checks every top-level statement.
@@ -16893,6 +17272,9 @@ function checkProgramNode(n: Program) {
   gaAppArgFlat = []
   gaAppFinite = []
   cPlainAliasNames = []
+  cFillStmtIx = Map()
+  cFillDoneIx = []
+  cFillActive = false
   nwDeclNames = []
   nwTyIxs = []
   nwNames = []
@@ -16970,6 +17352,11 @@ function checkProgramNode(n: Program) {
         // error type — the parser already reported it, and the error type
         // suppresses use-site cascades. A real (possibly empty `{}`) body builds
         // an object placeholder that pass 0b fills.
+        // The FILL registry entry, so a forward reference to this name can demand its
+        // shape before pass 0b's walk reaches it. A GENERIC alias is deliberately absent
+        // — it has no `cUserTypes` entry to fill, and each application resolves the body
+        // itself under its own parameter bindings (`applyGenAlias`).
+        cFillStmtIx[sd0.tdName] = stmts[t0]
         const df0 = sd0.tdFields
         const bodyless0 = df0.length == 1 && df0[0] == (-1)
         if bodyless0 {
@@ -17004,6 +17391,7 @@ function checkProgramNode(n: Program) {
           cPlainAliasNames.push(sd0.udName)
         }
       }
+      cFillStmtIx[sd0.udName] = stmts[t0]
       const members0: i32[] = []
       const uIx0 = mkUnionTy(members0)
       cUserTypes[sd0.udName] = uIx0
@@ -17015,327 +17403,21 @@ function checkProgramNode(n: Program) {
     t0 = t0 + 1
   }
   // Pass 0b: resolve each declaration's fields/variants and fill them into the
-  // placeholder (pushing into the SAME arrays its arena entry holds). A name
-  // redeclared later overwrote the map in 0a, so both decls resolve into the
-  // LAST placeholder; `tdDone` keeps each arena entry filled exactly once.
-  const tdDone: i32[] = []
+  // placeholder, in DEMAND order rather than source order. The driver below still walks
+  // source order, but `fillTypeDeclAt` is re-entered from `declaredTyOfName` whenever a
+  // body names a declaration the walk has not reached, so a FORWARD reference resolves
+  // against the filled shape and a field's arena type no longer depends on which
+  // declaration came first. Nothing else in the language orders declarations, and the
+  // spelling channel never did: `canonEmitTypeNames` runs after this pass and rewrote a
+  // transparent alias to its member either way, so the two channels used to disagree.
+  cFillDoneIx = []
+  cFillActive = true
   let ti = 0
   while ti < stmts.length {
-    const sd = P.nodes[stmts[ti]]
-    if sd is TypeDecl {
-      const declIx = cUserTypes[sd.tdName] ?? -1
-      let dseen = false
-      let dj = 0
-      while dj < tdDone.length {
-        if tdDone[dj] == declIx { dseen = true }
-        dj = dj + 1
-      }
-      if declIx >= 0 && !dseen {
-        tdDone.push(declIx)
-        const pt = T.tys[declIx]
-        if pt is TyObj {
-          const fnames = pt.objFieldNames
-          const ftys = pt.objFieldTypes
-          const dfields = sd.tdFields
-          let fi = 0
-          while fi < dfields.length {
-            const fd = P.nodes[dfields[fi]]
-            if fd is FieldDef {
-              fnames.push(fd.fdName)
-              let fty = TY_ERR
-              if fd.fdType >= 0 {
-                const ftn = P.nodes[fd.fdType]
-                if ftn is TypeRef {
-                  // The diagnostic anchors on the FIELD (`dfields[fi]`); the
-                  // spelling tree is banked on its `TypeRef` child.
-                  const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)
-                  if r >= 0 {
-                    fty = r
-                    // Record the resolved type on the field's annotation node so the emitter
-                    // classifies a struct field structurally from the arena, not the name (C1).
-                    if !inferQuiet && fd.fdType < nodeTyIx.length {
-                      nodeTyIx[fd.fdType] = r
-                    }
-                  } else {
-                    tErr(
-                      unknownTyText(ftn.tyName) + " for field '" + fd.fdName + "'",
-                      dfields[fi],
-                    )
-                  }
-                }
-              }
-              ftys.push(fty)
-            }
-            fi = fi + 1
-          }
-          // The 0a placeholder was just FILLED in place (its field arrays are
-          // the ones pushed above) — an existing arena entry changed shape.
-          tyMutEpoch = tyMutEpoch + 1
-        }
-      }
-    } else if sd is UnionDecl {
-      // A union's variants are type NAMES; resolve each into the member
-      // type-arena indices (forward references hit the 0a placeholders).
-      const declIx = cUserTypes[sd.udName] ?? -1
-      let useen = false
-      let uj = 0
-      while uj < tdDone.length {
-        if tdDone[uj] == declIx { useen = true }
-        uj = uj + 1
-      }
-      if declIx >= 0 && !useen {
-        tdDone.push(declIx)
-        const pt = T.tys[declIx]
-        if pt is TyUnion {
-          const members = pt.uMembers
-          const variants = sd.udVariants
-          // A DEGENERATE self-cycle — `type D = D`, a body that is nothing but
-          // the alias itself — has no base case, so nothing can inhabit it.
-          // Reported at the DECLARATION (host parser parity), so an UNUSED
-          // `type D = D` still flags; the members stay empty (host: `Never`).
-          if variants.length == 1 && variants[0] == sd.udName {
-            tErr(
-              "Type `" +
-                sd.udName +
-                "` is defined in terms of itself " +
-                "with no base type, so it can never have a value",
-              stmts[ti],
-            )
-          } else {
-            let vi = 0
-            let resolvedAny = false
-            const declMemberIxs: i32[] = []
-            // The surviving members, and the two lists the NICHE fold below needs:
-            // every non-`null` survivor, and whether a `null` variant was among them.
-            // Filled here instead of straight into `members` (the live arena array)
-            // because the fold replaces the whole list with one wrapped member.
-            const surviving: i32[] = []
-            const nonNull: i32[] = []
-            let sawNull = false
-            while vi < variants.length {
-              // D-UDVARTY: a union MEMBER is a parser spelling, banked on this
-              // declaration node in member order by `setUdTs` — so resolve the
-              // TREE, not the concatenated name. `annotResolve` is the shared
-              // ladder (`tsToTy` when a root is present, `nameToTy` when it is
-              // not), the same one every positioned annotation and the `is`
-              // test already climb. Measured over the 1,314-file corpus swept
-              // with `vl check --codegen`: 548 of 548 reads carry a root (0
-              // misses), 547 rows answer on both sides with 224 distinct
-              // rendered types per side, and the STRICT structural walk finds 0
-              // disagreements — while `tyEq` finds 0 under a sabotage the strict
-              // walk catches 547 times, which is why the walk is the comparator.
-              const m = annotResolve(variants[vi], udTsRootAt(stmts[ti], vi))
-              if m >= 0 {
-                declMemberIxs.push(m)
-                resolvedAny = true
-                // A member that folds to `never` (an empty intersection —
-                // `A & B` over disjoint operands) DROPS from the union
-                // (`0 | (1 & !1)` is `0`); a declaration with NO surviving
-                // member is the never-value HARD ERROR below (host PR #189:
-                // errors at the declaration even when unused).
-                if !isNeverTy(m) {
-                  surviving.push(m)
-                  if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
-                }
-              } else {
-                tErr(
-                  unknownTyText(variants[vi]) + " in union '" + sd.udName + "'",
-                  stmts[ti],
-                )
-              }
-              vi = vi + 1
-            }
-            // The DECLARATION route's copy of `annUnionInnerTy`'s unseparable-member
-            // rule: this loop builds its member list itself, so `type U = N | i32`
-            // never reaches the shared annotation home. The union is still FILLED —
-            // one diagnostic at the declaration is the whole report, and poisoning the
-            // arena entry would turn every use into a second, worse message. Read off
-            // the SURVIVOR list, which is what the members used to be: `TY_NULL` never
-            // shares a nominal erasure with anything, so the answer is unchanged.
-            const nwClash = nomUnionRepClashMsg(surviving)
-            if nwClash.length > 0 {
-              tErr(nwClash + " in union '" + sd.udName + "'", stmts[ti])
-            }
-            // THE `null` NICHE FOLD — an un-parenthesized `type T = X | null` denotes
-            // `X?`, exactly as the inline annotation `X | null` and the parenthesized
-            // declaration `type T = (X | null)` already do (`annUnionTy`, the shared
-            // home). Without it the `null` stayed a SIBLING VARIANT of the alias's
-            // union: two-member arity, so the members registered as variant boxes
-            // (`cVariantMemberTyIxs`) and the wrapper stopped being the one-member
-            // shape `singleAliasMemberTyIx` reads — while every consumer of the value
-            // lowered the niche. The failure is `vl check` rc 0 and an INVALID MODULE for
-            // an inner whose rep the niche folds into a sentinel, and a loud
-            // narrow-first reject for one it does not, at every position, for the
-            // spelling that names the type and not for the one that inlines it.
-            //
-            // The union WRAPPER stays — `cUserTypes[T]` is the index pass 0a minted and
-            // forward references already hold, so the alias denotes `TyUnion[X?]`, which
-            // is the parenthesized declaration's own arena shape, character for
-            // character. A poisoned fold (`annUnionTy` -1, the unseparable pair the
-            // clash diagnostic above just reported) keeps the raw survivor list, so that
-            // report is still the whole report.
-            //
-            // UNGATED ON THE INNER, so this is `annUnionTy` — the SHARED ANNOTATION HOME —
-            // and not a second copy of it. The niche is reachable through the alias for
-            // every inner because `singleAliasMemberTyIx`'s nullable arm claims it for
-            // every inner (`nulAliasMemberFaithful`): the checker resolves `T` to `X?`
-            // and `collectU` SKIPS the alias's row, so `v is X` resolves against the
-            // declared member instead of finding a variant row the param no longer
-            // lowers as. While that arm was gated, an inner it declined kept a
-            // capability on the two-member union that the niche did not have, and the
-            // fold had to decline the same inners or the two disagreed — a declared
-            // struct plus `v is S` ran on the union row and was `emitProgram: \`is\`
-            // receiver is not a union value` on the niche.
-            //
-            // MEASURED, not reasoned, and the measurement is what rules out an inner gate
-            // rather than an argument about which inners render faithfully. A 1,020-cell
-            // twin grid — 15 inners × (8 positions + 9 uses) × {`(X | null)`,
-            // `X | null`, `(X) | null`, the alias-free INLINE oracle}, every program run
-            // at BOTH runtime inputs and graded against the analytically-known stdout —
-            // reads, for each un-parenthesized spelling: **CORRECT 135 → 211 of 255**,
-            // oracle parity **62/120 → 117/120** on positions and **69/135 → 135/135** on
-            // uses, **0 silently-wrong cells before or after** (0 of 1,020), and the
-            // parenthesized spelling and the oracle immobile in all 510 of theirs. Both
-            // un-parenthesized spellings land on the parenthesized one's distribution
-            // EXACTLY, and the emitted module is byte-identical across all four spellings
-            // on 107/107 buildable use groups and 102/104 buildable position groups (the
-            // two outliers are oracle-vs-parenthesized and predate the fold).
-            //
-            // THE RESIDUE IS 18 CELLS THAT LOSE A RUNNING PROGRAM, all of them the
-            // NUMERIC LITUNION inner (`type KN = 1 | 2`), 9 axes × 2 spellings — and every
-            // one lands on the INLINE spelling's OWN verdict, message for message
-            // (`emitProgram: bare null needs a struct-typed context`, and
-            // `emitProgram: \`is\` names a type that is not a union variant` for the `is`
-            // axis). A numeric-litunion NICHE carries 6 of 17 axes where the two-member
-            // union carried 15, so folding it is a pure loss ON THAT INNER — but gating it
-            // back out is the WORSE trade and that is measured too: 220 correct against the
-            // parenthesized spelling's 211, bought with parity 115/120 and 127/135, i.e. a
-            // PARENTHESIZATION DIALECT in 10 of that inner's 17 axes. `type T = (KN | null)`
-            // is already `KN?` on the transparency arm, so an inner gate here can only make
-            // the two declaration spellings disagree, which is the defect this fold exists
-            // to close. The hole is the emitter's numeric-litunion niche, loud at every
-            // reach, and it is the inline spelling's hole first.
-            //
-            // A further 18 cells move from a loud check reject onto the inline spelling's
-            // own CHECK-CLEAN-INVALID-WASM hole — a nested-nullable inner at six positions,
-            // and a list / map / closure inner passed onward to a non-null parameter —
-            // reaching the identical function, byte offset and validator message as the
-            // alias-free twin. Loud, never a wrong answer, and filed against the emitter.
-            //
-            // `mkNullableTy` does not intern, so the wrap must happen exactly once, which
-            // is what routing through `annUnionTy` (rather than its two halves) gives.
-            let folded = -1
-            if sawNull && nonNull.length > 0 {
-              folded = annUnionTy(nonNull, true)
-            }
-            if folded >= 0 {
-              members.push(folded)
-            } else {
-              let mi = 0
-              while mi < surviving.length {
-                members.push(surviving[mi])
-                mi = mi + 1
-              }
-            }
-            // Variant-member registration is ARITY-AWARE (Stage B b1, latent
-            // irregularity (a) from the #920 shadow report): only a REAL
-            // (2+ surviving member) union registers its members as variants.
-            // The emitter lowers a single-member union as the member ITSELF
-            // (a `{a} & {b}` struct alias, a transparent `type Id = i32`),
-            // never as a variant box — the old arity-blind push made such a
-            // member's index classify "variant" through the flat TyObj arm
-            // while the union's own index classified "struct".
-            if members.length >= 2 {
-              let ri = 0
-              while ri < declMemberIxs.length {
-                cVariantMemberTyIxs.push(declMemberIxs[ri])
-                ri = ri + 1
-              }
-            }
-            // The 0a placeholder union was just FILLED in place (`members` is
-            // its `uMembers` array) — an existing arena entry changed shape.
-            tyMutEpoch = tyMutEpoch + 1
-            if resolvedAny && members.length == 0 {
-              // Explain the empty intersection in SOURCE terms (matching the TS
-              // host): name the two operands and their kinds (`A & B`, an object
-              // and a string literal), or call out a self-reference
-              // (`type E = A & E`). Falls back to the generic wording for a
-              // non-binary / non-intersection never (e.g. `type C = NeverAlias`).
-              // D-UDNEVER: the intersection's OPERANDS are the kids of the
-              // member's `TS_ISECT` spelling node. Read them; do not re-split the
-              // name the parser concatenated. `splitTopAmp` — a depth-aware
-              // top-level `&` scanner over a rendered type, `<>`-aware since
-              // D-CLASSANG — had this as its ONLY call site and is deleted with it.
-              //
-              // Behaviour is preserved at the two gates that matter. `ops.length
-              // == 2` selected a BINARY top-level intersection, and the kid count
-              // of a `TS_ISECT` is exactly that count; a member with no top-level
-              // `&` has a non-`TS_ISECT` root and yields 0 kids, where the old
-              // scanner yielded the 1-element whole name — both miss `== 2` and
-              // fall to the generic wording. A member with no recorded root does
-              // the same. `tsToName` reproduces the spelling character for
-              // character (it is what `driver.vl`'s module merge itself pushes
-              // into `udVariants`), so `expr` and the self-reference NAME test are
-              // unchanged.
-              const opRoots: i32[] = []
-              const ops: string[] = []
-              const isectRoot = udTsRootAt(stmts[ti], 0)
-              if isectRoot >= 0 {
-                if tsKind[isectRoot] == TS_ISECT {
-                  const opStart = tsKidStart[isectRoot]
-                  let opk = 0
-                  while opk < tsKidCount[isectRoot] {
-                    opRoots.push(tsKids[opStart + opk])
-                    ops.push(tsToName(tsKids[opStart + opk]))
-                    opk = opk + 1
-                  }
-                }
-              }
-              let didDetail = false
-              if variants.length == 1 && ops.length == 2 {
-                const expr = ops[0] + " & " + ops[1]
-                const selfRef = ops[0] == sd.udName || ops[1] == sd.udName
-                if selfRef {
-                  tErr(
-                    "Type `" +
-                      sd.udName +
-                      "` refers to itself inside an intersection (`" +
-                      expr +
-                      "`), so it reduces to `never`",
-                    stmts[ti],
-                  )
-                } else {
-                  tErr(
-                    "Type `" +
-                      sd.udName +
-                      "` is `never` (an empty type — `" +
-                      expr +
-                      "`, " +
-                      operandKind(tsToTy(opRoots[0])) +
-                      " and " +
-                      operandKind(tsToTy(opRoots[1])) +
-                      ", have no common values), so it has no values",
-                    stmts[ti],
-                  )
-                }
-                didDetail = true
-              }
-              if !didDetail {
-                tErr(
-                  "Type `" +
-                    sd.udName +
-                    "` is `never` (an empty type — " +
-                    "its operands have no common values), so it has no values",
-                  stmts[ti],
-                )
-              }
-            }
-          }
-        }
-      }
-    }
+    fillTypeDeclAt(stmts[ti])
     ti = ti + 1
   }
+  cFillActive = false
   // Pass 0c: MEASURE every `flat type` (webcraft P1.2). Runs here because it needs
   // pass 0b's resolved field types (a scalar's width is read off the arena, which
   // is what makes a newtype over a scalar work for free) and must precede any
