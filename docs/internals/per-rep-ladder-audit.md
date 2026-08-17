@@ -490,17 +490,40 @@ mislead a converter into reading a shape nit as a language limit:
    spell the deliberate leaves as empty/no-op arms WITH their reason, and (once,
    done) export `TyErr`/`TyVar` from `typecheck.vl` so a file can name the two
    holes it is deliberately skipping. `repTyScalarMask` is the worked instance.
-2. **Leave the 58 partial ladders alone, and do not lint them.** A `match` there
+2. **Route the DESCENT walkers through `tyChildrenOf` — higher leverage per edit
+   than (1), and larger blast radius.** `tyChildrenOf` (`typecheck.vl:7717`)
+   already IS the shared "direct child type indices of arena entry `ix`" visitor,
+   with a `TyNeg` arm and a header naming its four leaves — and it has **exactly
+   one caller** (`tyReachesGo`). Meanwhile **20 of the 81 ladders are descent
+   walkers** by the mechanical proxy "≥ 3 distinct child-field reads, no
+   leaf-field read", the unambiguous members being the `tyReaches*` /
+   `collectTyReach*` family: `tyReachesHole`, `tyReachesUnion`,
+   `tyReachesEmptyHole`, `tyReachesBrand`, `tyReachesFuncD`, `tyDeeperThan`,
+   `collectTyReachRegister`, `collectTyReachCloSigs`, `collectTyMembersReach`,
+   `cloCallUnionMixUnrep`. Making `tyChildrenOf` one exhaustive `match` and
+   routing those through it retires ~10 ladders with ONE guarded arm-set instead
+   of pinning 10 separately, and it fixes gaps rather than freezing them: R10's
+   `TyNeg` omissions are all in this family, and **`tyReachesHole` has the same
+   one** — it descends every composite except `TyNeg`, so `!(T[])` over a
+   hole-reaching `T` answers "no hole" silently. `tyChildrenOf` handles `TyNeg`
+   already. Cost: it must be exported across `emit_rep.vl` / `emit_collect.vl` /
+   `emit_classify.vl`, and the walkers that ALSO read a leaf field
+   (`repTyScalarMask` needs `TyPrim.primName`) need a small leaf predicate
+   alongside the child list; `substTyDeep` REBUILDS rather than descends and
+   cannot use a child-list visitor at all. Ranked second only because it is a
+   bigger change than (1) for the same guarantee, and because it does nothing for
+   the renderers, key builders and classifiers that (1) covers.
+3. **Leave the 58 partial ladders alone, and do not lint them.** A `match` there
    would demand 11 arms for a 3-member question, exactly as it would demand 27 for
    `nulScalarListWrapHeap`. Their correctness rests on the caller-side sentinel
    invariant, which the SAFE-LOUD rows above verify one at a time.
-3. **Extend `ifChainExhausts` to the early-`return` ladder shape** — a real
+4. **Extend `ifChainExhausts` to the early-`return` ladder shape** — a real
    option, not taken here. It already knows how to compute arena coverage and name
    the missing members; what it lacks is a second entry point for "a run of
    consecutive `if <same place> is T { return … }` statements ending in a default".
    That would cover convertible ladders WITHOUT rewriting them, which is a much
    larger blast radius than 16 conversions and wants its own measured slice.
-4. **Ruled out**: a rep change to `Ty` (a tag discriminant buys nothing `match`
+5. **Ruled out**: a rep change to `Ty` (a tag discriminant buys nothing `match`
    does not already give); a litunion tag helper (loses narrowing, adds a
    driftable ladder); a lint rule (58 firings, ~83% false positives); a
    test-side fixture grid per ladder-bearing entry point (the 993 sites do not
