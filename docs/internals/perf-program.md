@@ -1807,6 +1807,14 @@ are byte-identical. Nothing else in the emitter moved.
 
 ### 10.6 What did NOT ship — the enumeration, re-sized
 
+> **SUPERSEDED by §10.9, which SHIPPED it.** The sizing below re-derives well
+> (1.47% here, 1.61% there). The COSTING does not: this section prices the
+> enumeration at "~570 sites" because it assumes an i32 code needs a named
+> constant at each site. It does not — VL's literal unions are already
+> represented as i32 atoms, so declaring the vocabulary as one leaves all ~570
+> sites spelled exactly as they are. Point 3 below still holds, and is what
+> §10.9 implements; points 1 and 2 are answered rather than followed.
+
 After this branch the TOKKIND residue is `parser.vl` 16.9 + `lexer.vl` 3.9 = **20.8 samples/run
 = 1.47%**, plus `modScan`'s kind-compare share of 7.0. An enumeration would take most of it —
 call it **1.5–1.9% of a self-compile for ~570 sites across 7 files**, 376 of them in
@@ -1931,6 +1939,165 @@ Every rc read BARE (a pipe reports `tail`'s status, not the command's).
 **Seed-bootstrap: NO SPLIT.** The freshly fetched `seed-latest` (1,113,727, i.e. `fb31405d`)
 compiles this branch's source directly; `ref.eq` is an opcode the emitter already writes
 elsewhere (`wasmEmit.vl`'s closure equality) and nothing here is new language surface.
+
+### 10.9 The enumeration, shipped — the vocabulary was already a type the language has
+
+§10.6 filed the enumeration as L effort over ~570 sites and left it. It is **S effort over
+FOUR type annotations and one function**, because the cost model behind "570 sites" is wrong:
+it assumes an i32 code needs a named constant spelled at each use. **VL literal unions are
+already represented as i32 ATOMS** (`emit_state.vl`'s `VKind`, `emit_classify.vl`'s
+`PushKind`, and the `sFieldIsLitUnion` field path are the existing users), so declaring
+
+```
+export type TokKind = "" | "IDENT" | "NUMBER" | … | "USHR"     // 67 kinds + the sentinel
+```
+
+and writing `kind: TokKind` on both `Tok` types makes `tok.kind` an i32 field and every
+`tok.kind == "IDENT"` an `i32.eq` **with the ~570 use sites unchanged** — they were already
+spelled as the union's members. The design-(a)-vs-(b) question §10.3 agonised over does not
+arise: there is no second field to drift.
+
+**Every one of §10.6's three carried-forward facts survives, two of them answered rather than
+followed.**
+
+1. *"It is design (b), and `vl check` is the conversion oracle"* — **stronger than filed.** The
+   oracle is not "the i32 will not compare against a string"; it is that comparing a `TokKind`
+   against a spelling that is **not a member** is a hard type error (*"cannot compare … with
+   "ZZZ" — not a member of the union"*). That catches a typo, not merely an unconverted site.
+2. *"47 `.kind` READS, and `tok.kind` never crosses the wasm boundary"* — **44 reads**: there
+   are 49 `.kind` occurrences in `compiler/*.vl` and 5 of them are inside COMMENTS. (The WRITE
+   surface is 5 sites — `mkTok`, `driver.vl`'s two lexer→parser token bridges, its token-cache
+   replay, and `scripts/lint-harness.vl`'s — plus the 84 producer sites in the lexer's four
+   `*CharKind`/`keywordKind` tables.) The boundary claim needs splitting. As a VALUE it is
+   true and load-bearing: no export carries a kind (the LSP's `lexClassAt` hands out an i32
+   CLASS from `lexClassOf`, not a tag). As a SPELLING it is **false** — the tag reaches the host
+   inside diagnostic TEXT, via `kindDesc`'s fallback and `parsePrimary`'s *"expected an
+   expression but found <TAG>"*. That is exactly why the change is testable at all.
+3. *"Mint the string FROM the code; never mint both"* — **implemented, and by the compiler.** A
+   `TokKind` in a `string` position materialises its pooled literal from the atom. `kindTag`
+   is the single renderer every diagnostic goes through, so the module holds **one** such chain
+   (`select (result (ref …))` 26 → 93 = +67, one per member).
+
+**The census, re-derived with a denominator.** Every kind-literal occurrence over the 67-member
+vocabulary, code only (comments excluded and counted separately):
+
+| file | sites | `==`/`!=` | helper ARG | producer | comments (excluded) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `parser.vl` | 374 | 323 | 51 | 0 | 4 |
+| `lexer.vl` | 85 | 1 | 0 | 84 | 4 |
+| `driver.vl` | 76 | 76 | 0 | 0 | 0 |
+| `typecheck.vl` | 15 | 15 | 0 | 0 | 1 |
+| `format.vl` | 8 | 8 | 0 | 0 | 0 |
+| `check_query.vl` / `fmt_util.vl` / `lint.vl` | 3 | 3 | 0 | 0 | 0 |
+| **total** | **561** | **426** | **51** | **84** | **9** |
+
+**561 over 8 files, not 570 over 7.** The filing's `fuzzgen.vl` row is a false positive twice
+over — its two hits are `"NULL"` inside GENERATED PROGRAM TEXT, not a kind — and `ast.vl` /
+`emit_sections.vl` contribute comments only. The direction of the error is the usual one, but
+small: the filed number was within 1.6%.
+
+**The cost, re-derived on the current base**, structurally (walk each string-primitive sample to
+its first non-primitive consumer, attribute to the file that DEFINES it — §10.1's instrument),
+8 interleaved guest profiles per leg, same input both legs, 24-core box:
+
+| `__str_eq__` self, reached from | samples/run | % of 1,300.8 |
+| --- | ---: | ---: |
+| `parser.vl`, all consumers | 17.8 | 1.37 |
+| — its kind share (323 of 363 string-compare SITES are kind compares; the rest are `opText`, `!= ""`, `"as"`/`"from"`) | 15.8 | 1.21 |
+| `driver.vl` `modScan`, all consumers | 6.8 | 0.52 |
+| — its kind share (20 of 24 compare sites) | 5.6 | 0.43 |
+| `lexer.vl` `tokenize` | 0.4 | 0.03 |
+| **TOKKIND** | **≈21.8** | **≈1.68%** |
+| *(excluded)* `keywordKind` — compares IDENT TEXT; an enumeration changes what it RETURNS | 1.5 | 0.12 |
+| *(excluded)* `driver.vl`'s `modIndexOfKey`/`modExportsHas`/`modBuildRename` — MODULE KEYS | 11.3 | 0.87 |
+
+**1.68% against the filed 1.5–1.9% — the filing re-derives.** That makes this the one item in
+this programme whose perf number was right, and it is worth saying so plainly. The A/B confirms
+the static share without needing it: the `__str_eq__` samples the change actually removed are
+concentrated in exactly those three files (`parser.vl` −119, `driver.vl` −48, `lexer.vl` −4 over
+8 runs) = **−21.4 samples/run = −1.64% of the base total**, which is the same number derived
+from the other direction.
+
+**Measured.** Two compilers, ONE fixed input (the parent commit's `compiler/entry.vl`), so the
+legs differ only in the compiler. Both emit **byte-identical** output (1,162,474 bytes), which
+is the correctness control for a change that touched the parser: nothing in the emitter moved.
+CPU milliseconds (user+sys), interleaved within each rep, 11 reps per leg, median of each leg,
+**every channel run twice or more because a single sample is not a measurement**:
+
+| channel | A → B (run 1) | | A → B (run 2) | | A → B (run 3) | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `vl build compiler/entry.vl` | 1,363 → 1,339 | −1.76% | 1,372 → 1,357 | −1.09% | 1,446 → 1,412 | **−2.35%** |
+| `vl check compiler/entry.vl` | 2,117 → 1,896 | **−10.4%** | 2,148 → 1,968 | −8.4% | | |
+| `vl fmt --check compiler/typecheck.vl` | 382 → 356 | −6.8% | 387 → 374 | −3.4% | | |
+| `vl check` of a one-line file (the floor) | 5 → 4 | ~0 (1 ms timer granularity) | | | | |
+
+**Quote −1.76% for the self-compile (median of three, range −1.09 to −2.35) and −9.4% for
+`vl check` (range −8.4 to −10.4).** The spread on the build channel is the honest picture of a
+~1.6% effect on a shared box; the `check` channel is where the parser's share of the work is
+large enough to read cleanly, and it is also the channel the LSP lives on.
+
+The STRUCTURAL deltas are the robust measurement (§10.5's lesson), and they are not marginal:
+
+| | A | B | |
+| --- | ---: | ---: | ---: |
+| `__str_eq__` reached from `parser.vl` | 17.8 | 2.9 | **−83.8%** |
+| `__str_eq__` reached from `driver.vl` | 18.9 | 12.9 | −31.8% |
+| all string primitives reached from `parser.vl` | 18.1 | 3.3 | **−82.1%** |
+| `parseProgram`, INCLUSIVE | 40.1 | 26.9 | **−33.0%** |
+| `__str_eq__` total | 323.8 | 299.8 | −7.4% |
+| all samples/run | 1,300.8 | 1,281.8 | −1.46% |
+
+Untouched files move ±10–20% at this sample count (`emit_base.vl` +19%, `emit_rep.vl` +12%),
+which is the noise floor for a ~150-sample bucket and the reason the parser's −84% is the
+finding and the whole-compile −1.46% is the noisy one. It agrees with the CPU-ms median.
+
+**`binPrec` goes back to a flat ladder.** §10.4's first-character dispatch existed to avoid
+`__str_eq__` CALLS; on atoms there are none, and `kind.length`/`kind[0]` are not even spellable
+on a `TokKind` (the checker rejects a field read that is not on every member). The frequent
+non-operators are rejected up front so the common `0` still exits early. A static differential
+oracle checks it: the kind→precedence MAP extracted from `HEAD`'s dispatch body and from the new
+ladder — **25 arms both sides, zero disagreements** — plus a check that no early-reject member is
+an operator. Measured, `binPrec` inclusive goes 6 → 3 samples over 8 runs, i.e. it did not
+regress into the noise it already sat in.
+
+**What only the new case can see.** `tests/cases/parser/token-kind-tags-in-diagnostics.vl`
+provokes *"expected an expression but found <TAG>"* 46 times over **45 distinct members**. Every
+other corpus case exercises kinds through COMPARISONS, which are atom-vs-atom and therefore
+blind to a wrong atom→spelling map: a compiler with one shifted mapping parses, typechecks,
+emits identical bytes, self-compiles to a fixpoint, and only misnames tokens in its own
+messages — §8.4's shape again. Sabotage-measured: `kindTag` given one wrong arm
+(`if k == "USHR" { return "SHR" }`) builds a working compiler at rc 0 whose corpus run is
+**1,741 passed / 1 failed**, the single failure being this case, on the single perturbed line.
+Restored from the SAVED artifact (§9.6.1's rule), the compiler is md5-identical to the
+pre-sabotage one and the corpus is 1,742 / 0 again.
+
+**Gate.** Every rc read BARE.
+
+| gate | result |
+| --- | --- |
+| `scripts/refresh-compiler.sh --prove-fixpoint` (self-built ladder) | rc 0 — fixpoint in **2 compiles** at **1,164,195** |
+| `rm build/vl-compiler.wasm*` → `scripts/fetch-seed.sh` → `--prove-fixpoint` | rc 0 — published seed **1,162,521** → fixpoint in **3 compiles** at **1,164,195**, byte-identical to the self-built one |
+| `deno test -A tests/cases_wasm_test.ts` | **1,742 passed / 0 failed / 7 ignored** (parent's 1,741 + the new case) |
+| `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_align_test.ts` | **1,749 passed / 0 failed / 0 ignored** |
+| `scripts/lint-self.sh` | rc 0, clean |
+| emitted compiler, `call $__str_eq__` sites | 2,815 → **2,385 (−430)** |
+| emitted compiler, atom→string chains | `select (result (ref …))` 26 → 93 — exactly **one** new chain |
+| **byte delta** | 1,162,474 → **1,164,195 (+1,721)** — the 68-member vocabulary's pooled literals and the one materialisation chain |
+
+**Seed-bootstrap: NO SPLIT.** Literal unions are not new language surface; the published seed
+compiles this source directly. The ladder needs 3 compiles from the published seed only because
+`seed-latest` is a LATER master than this branch's parent — the self-built ladder converges in 2.
+
+**One defect found and filed, not fixed** (workboard D12): an atom→string materialisation in a
+function's TAIL EXPRESSION emits an out-of-range local and the module will not instantiate
+(*"unknown local N"*). It reproduces on master's seed with a four-member union and no compiler
+source involved, so it is not this change's doing; `kindTag` spells the working
+explicit-`return` form with the reason recorded at the site.
+
+**Still open after this**, and now the largest named residue of the class: `driver.vl`'s
+`modScan` keeps 12.9 samples/run of `__str_eq__` — its kind compares are gone, its module-key
+and lexeme compares are not — and `coalesceMixOp`'s operator LEXEMES (workboard F5) are a second
+closed vocabulary that the same instrument would enumerate.
 
 ---
 
