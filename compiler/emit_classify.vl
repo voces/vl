@@ -274,6 +274,8 @@ import {
   cloSigKeys,
   criChanged,
   ctrlDepth,
+  emitCurFnIx,
+  emitCurFnPos,
   fRetBool,
   fRetKind,
   fRetRArrElem,
@@ -805,7 +807,7 @@ export function cloRetValSlot(fe: i32) {
     // returned map value's typed `$mapStruct`.
     if srk == "map" {
       const mrx = fnRetExprOf(fnStmts[fe])
-      if mrx >= 0 { return mapRetExprShape(mrx, fnStmts[fe]) }
+      if mrx >= 0 { return mapRetExprShape(mrx, fe) }
     }
     // An inferred ref-list return (`() => [{…}]` / `() => [(x) => …]`, kind 5) — its element
     // NAME (`fRetRArrElem`, set by the return-classify scan) resolves the ref-list slot.
@@ -1805,7 +1807,13 @@ export function fnRetExprOf(fnIx: i32) {
 // its annotation (`paramMapShape`); a returned map LOCAL its `let` annotation (`mapAnnShape`); a
 // `Map()`/`Set()` is the mono map (-1); a call to another map fn recurses (`fnRetMapShape`).
 // -1 (mono) for anything else.
-export function mapRetExprShape(rx: i32, fnIx: i32) {
+//
+// `fe` is the enclosing function's `fnStmts` POSITION, not its arena index. Every caller
+// holds the position already (each spelled its argument `fnStmts[fe]`), and the capture
+// arm below needs the position — taking it directly is what keeps `fnStmtsPosOf` from
+// scanning `fnStmts` to recover a number the caller was standing on.
+export function mapRetExprShape(rx: i32, fe: i32) {
+  const fnIx = fnStmts[fe]
   let u = rx
   let done = false
   while !done {
@@ -1837,13 +1845,14 @@ export function mapRetExprShape(rx: i32, fnIx: i32) {
   // neither a param nor a local of THIS function, so the arms above miss it. Resolve its
   // shape from the capture — the SAME `captureValStructIdx` the env field uses — so the
   // functype result `$mapStruct` heap type matches the env field AND the captured value.
-  const cap = retCapturedMapShape(fnIx, rx)
+  const cap = retCapturedMapShape(fe, rx)
   if cap != -3 { return cap }
   -1
 }
 
-// The map SHAPE of a return expression that is a CAPTURED map variable — an ident lifted
-// function `fnIx` closes over whose enclosing binding is a `{[string]: V}` map — as the mv
+// The map SHAPE of a return expression that is a CAPTURED map variable — an ident the lifted
+// function at `fnStmts` position `fe` closes over whose enclosing binding is a `{[string]: V}`
+// map — as the mv
 // slot (>= -1; mono = -1), or -3 when the return is NOT a captured map. The capture SET
 // (`captureNamesOf`) is the source of truth: only a name that is an actual env field is
 // resolved here (a same-named local/param shadowing a capture stays with the local arms).
@@ -1866,7 +1875,13 @@ export function mapRetExprShape(rx: i32, fnIx: i32) {
 // with no parent (`parentBindingFrameOf` returns -1 on `fnParent[fe] < 0`) — which is every
 // top-level function, i.e. the overwhelming majority of reaches. Only a returned identifier
 // that a genuinely ENCLOSING frame binds now pays for the walk.
-function retCapturedMapShape(fnIx: i32, rx: i32): i32 {
+//
+// The frame arrives as its `fnStmts` POSITION because every caller already has one — see
+// `mapRetExprShape`'s header — and because everything below indexes by position anyway
+// (`parentBindingOf`, `captureNamesOf`, `captureValKind`). An arena index here would be
+// converted straight back by `fnStmtsPosOf`, which is an O(functions) scan outside the
+// code-section emit.
+function retCapturedMapShape(fe: i32, rx: i32): i32 {
   let u = rx
   let done = false
   while !done {
@@ -1875,7 +1890,6 @@ function retCapturedMapShape(fnIx: i32, rx: i32): i32 {
   }
   const e = P.nodes[u]
   if e is Ident {
-    const fe = fnStmtsPosOf(fnIx)
     if fe >= 0 && parentBindingOf(fe, e.identName) >= 0 {
       const caps = captureNamesOf(fe)
       let ci = 0
@@ -2457,7 +2471,7 @@ export function criClassify(rx0: i32, i: i32) {
     if (
       exprMap(rx, fnStmts[i]) ||
       retIsMapLocalAnnot(rx, fnStmts[i]) ||
-      retCapturedMapShape(fnStmts[i], rx) != -3
+      retCapturedMapShape(i, rx) != -3
     ) {
       criSetRetKind(i, "map")
     }
@@ -9251,31 +9265,36 @@ function mapValuesResultKind(exprIx: i32, fnIx: i32) {
 
 // The fnStmts POSITION of the FuncDecl at arena index `fnIx`, or -1.
 //
-// THE COMPILER'S LAST SUPER-LINEAR TERM ON THE SCOPE-CHAIN WALK LIVES HERE, AND THE FIX
-// THIS FILE WAS NAMED FOR CANNOT BE WRITTEN FROM THIS FILE. `emit_collect`'s
-// `fnIndexOfInScopeChain` files it against this function ("the fix belongs in
-// `fnStmtsPosOf`'s own file, as a per-program node -> position index built where `fnStmts`
-// is"), and the diagnosis is right: the scan below is O(functions) and runs once per gated
-// call, so a frame ladder of N functions that each call their own nested function pays
-// O(N^2). Re-measured at this commit on a generated ladder (best of 3, whole `vl build`
-// wall time): **N = 100 / 200 / 400 / 800 → 31 / 36 / 83 / 227 ms** — the 400→800 step
-// costs 2.7x for 2x the input, which is the quadratic term and not measurement noise.
+// THE CURSOR TEST IS THE WHOLE FUNCTION IN PRACTICE, AND THE SCAN BELOW IT IS THE
+// FALLBACK. Counted over one self-compile (22,612 calls, 32,859,699 scan steps, 1,453 per
+// call before the test existed): **18,164 of them — 80.3% — ask for the function
+// `emitCodeSection` is lowering**, whose `fnStmts` index is that loop's own variable.
+// `emitCurFnPos` carries it, so those calls are a compare and a read. The other 4,448 were
+// the return-shape classifiers, and their callers already held the position too — they
+// spell their argument `fnStmts[fe]` — so `mapRetExprShape` and `retCapturedMapShape` take
+// the position by parameter and never reach here at all.
 //
-// **But `fnStmts` is not written here.** Re-enumerated structurally at this commit, the
-// writer set is SEVEN, not the five recorded above it: `emit_collect` 433 (the reset),
-// 446 (`collectFns`) and 967 (`collectLifted`); `emit_mono` 547, 1422 and 1910 (three
-// `.push`) plus the two IN-PLACE writes 1409 (`fnStmts[origFe] = nfn`, the count-0
-// instance) and 2190. Every one of them is outside this partition, so the conclusion is
-// unchanged and the undercount never mattered — but the number was wrong, and a stale
-// summand is how this program has hidden a wrong answer inside a right total before. A memo that merely caches the last answer is only equal to the scan if no
-// LOWER position can ever come to hold an already-memoized node, which is a property of
-// `emit_mono`'s replacement writer (its `nfn` is a fresh clone, so its arena index is new)
-// — true today, unpinnable from here, and a silent miscompile the day it stops being true.
-// The honest form of the fix is an index built AT the writers, or an invalidation signal
-// minted by them; both are a SOURCES problem, not a site problem. FILED with a witness,
-// not attempted. (The `monoOrigNode` fall-through below is a second reason no index of
-// `fnStmts` alone can answer — it deliberately resolves nodes `fnStmts` no longer holds.)
+// **This is not a MEMO, and the difference is the whole safety argument.** A memo caches an
+// ANSWER and is only equal to the scan if no LOWER position can ever come to hold an
+// already-memoized node — a property of `emit_mono`'s replacement writer (its `nfn` is a
+// fresh clone, so its arena index is new) that is true today, unpinnable from here, and a
+// silent miscompile the day it stops being true. `emitCurFnPos` caches nothing: it is the
+// caller's own INPUT, written as one pair with `emitCurFnIx` from the loop index. Its two
+// exactness clauses live at its declaration in `emit_state`.
+//
+// **`fnStmts` is not written here**, and the fix deliberately did not go near its writers.
+// Re-enumerated structurally: `emit_collect` (the reset, `collectFns`, `collectLifted`);
+// `emit_mono` (three `.push` plus two IN-PLACE writes, `fnStmts[origFe] = nfn` for the
+// count-0 instance being one). Every one is outside this partition, and all of them
+// complete before `emitCodeSection` starts — which is what makes the pair above sound.
+//
+// THE SCAN'S REMAINING REACHES ARE THE PASSES THAT RUN BEFORE `emitCodeSection`, where
+// there is no cursor to answer from: 0.01% of a self-compile, and 3.7% of a 1,600-frame
+// ladder (all of it `capturedStructIndex`). The `monoOrigNode` fall-through below is
+// reached **0 times** in a self-compile — it exists for the replaced-slot case and is
+// measured, not assumed, to be cold.
 export function fnStmtsPosOf(fnIx: i32) {
+  if fnIx >= 0 && fnIx == emitCurFnIx { return emitCurFnPos }
   let i = 0
   while i < fnStmts.length {
     if fnStmts[i] == fnIx { return i }
@@ -10735,7 +10754,7 @@ function fnRetMapShapeSid(sid: i32) {
       // the returned expression (a map param/local/`Map()`), so a caller of a `string`-valued
       // map factory resolves the value type.
       const rx = fnRetExprOf(fnStmts[fe])
-      if rx >= 0 { return mapRetExprShape(rx, fnStmts[fe]) }
+      if rx >= 0 { return mapRetExprShape(rx, fe) }
     }
   }
   -1

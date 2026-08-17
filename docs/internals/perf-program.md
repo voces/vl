@@ -369,7 +369,7 @@ self-compile unless stated.
 | 2 | **Intern identifiers to i32 symbol IDs** — **THE TABLE AND PHASE 3 SHIPPED, §9.** `compiler/symbols.vl` + the arena-node carrier + the eight notifications; the three whole-program name→index maps are sym-indexed dense arrays. **Phases 4 (checker scope chain, now the largest single consumer at 2.83%) and 5 (`modRenamed`, 1.82%) remain**, and §9.7 records the coverage blocker phase 4 acquired | re-baseline confirmed the phase table (3 = 6.32% vs 6.2 predicted, 4 = 4.73% vs 4.4, 5 = 1.63% vs 1.6); phase 3 delivered **−4.5%** of a self-compile and **2,466,975 → 479,079 string-keyed probes** | large | medium-high — **the suite and the six-channel corpus are the witnesses; the ladder is BLIND to all eight name-writer poisons** (§9.6.1 corrects §9.6's filed column) | the consumer-class split per the design's §7 probes; the both-implementations count in §9.4 |
 | 2b | ~~**the four avoidable costs the re-baseline found**~~ — **SHIPPED, §8.** `retCapturedMapShape`'s per-return capture re-walk, `emitReturnValue`'s four un-hoisted `fnStmtsPosOf` calls, `nameNamesFunction`'s whole-arena rescan, `parentLetOf`'s double probe, `keywordKind`'s 19-way chain | **−10.7%** of a self-compile (interleaved min-of-15) | five local rewrites, no new data structure | low — all five are strict behaviour-preserving rewrites with the argument at the site | wall clock with `vl check`/`vl fmt` as flat controls at min-of-21; per-function samples PER RUN |
 | 3 | ~~**`nameNamesFunction`: index the arena once**~~ — **SHIPPED, §8.3.** Incremental fold with a high-water mark | 2.64% self → **0.07%** | small | the invalidation was the whole question and the answer is three facts pinned at their sites | as filed |
-| 4 | **`fnStmtsPosOf`: an index at the writers** — **STILL FILED**, but §8.2 removed the three quarters of it that were one un-hoisted call site (5.54% → 2.27% self) | 2.27% self remains | medium | medium — the header's argument about the writers is untouched | as filed |
+| 4 | ~~**`fnStmtsPosOf`: an index at the writers**~~ — **SHIPPED, §17, and NOT as filed.** No index was built: every one of the scan's 22,612 calls re-derives a `fnStmts` position its own caller is standing on. `emitCurFnPos` carries `emitCodeSection`'s loop index; `mapRetExprShape`/`retCapturedMapShape` take the position their callers already spell `fnStmts[fe]` | 3.09% self → **0.01%**; a 1,600-frame ladder **48.9% → 3.7% self, −49.8% of the whole compile** | small — one global, one parameter, four call sites | low — no new table, no invalidation surface; the writers were never touched | 12 interleaved warm guest profiles per leg; a counting build for the call/step census; CPU-ms with emitted bytes asserted md5-identical first |
 | 5 | **Native-align: batch the `vl check` legs** the way RUN/TRAP is batched | the pooled version (shipped) took 27 → 19 s on CI; a `vl check` batch mode would take the remaining ~1,600 process spawns to a handful, and the 4-core cap stops applying | medium: a host `check --batch` mode + per-case verdict files | medium — the per-case verdict is the gate; a batch that blurs verdicts weakens it | the interleaved A/B in §1.5, plus the memo-key sabotage |
 | 6 | **`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less | unquantified; a 138 MB gap in the LSP's own path | investigation first | none (a measurement) | peak RSS per §2.1; then bisect by pass |
 | 7 | **Editor latency**: `vl check` on one compiler file is 231 ms | the LSP path; see §4 | unquantified | — | the §4 table |
@@ -3038,3 +3038,204 @@ Every rc read BARE.
 
 **Seed-bootstrap: NO SPLIT.** The change uses only `symbols.vl` exports the published seed
 already ships.
+
+---
+
+## 17. Item F4 — `fnStmtsPosOf`, and the index that never had to be built
+
+§3 item 4 filed this as *"an index at the writers"*, with a header in
+`emit_classify.vl` arguing that a memo cannot be made safe and that the honest fix is a
+per-program node → position index minted where `fnStmts` is written. **The row re-derives
+high (2.27% filed, 3.09% measured) and the header's argument is sound — but the fix it
+points at is unnecessary, because every call in the profile is asking for a number its own
+caller is standing on.** No index was built. Nothing about the writers changed.
+
+### 17.1 The re-derived profile
+
+Master `dfd93627`, **12 warm guest runs, 17,621 samples (1,468.4 per run)**, `--names`
+seed, `$mNN` stripped — §2's recipe, and the A leg of the interleaved A/B in §17.5.
+
+| | % self | self /run | % incl | incl /run |
+| --- | ---: | ---: | ---: | ---: |
+| `fnStmtsPosOf` | **3.09** | **45.4** | 3.09 | 45.4 |
+
+**Self and inclusive are the same number and that is a fact about the function, not a
+rounding**: it is a pair of array scans with no calls in it, so no callee is ever sampled
+beneath it. Every point it costs is its own.
+
+Its callers are five, and they are 100% of it:
+
+| caller | share of its inclusive | /run |
+| --- | ---: | ---: |
+| `emitReturnValue` | 43.67% | 19.8 |
+| `retWidensAtomToStr` | 16.88% | 7.7 |
+| `retCapturedMapShape` | 15.41% | 7.0 |
+| `emitFuncCode` | 12.11% | 5.5 |
+| `emitTailCallRet` | 11.93% | 5.4 |
+
+### 17.2 The DETERMINISTIC counts
+
+A counting build of `fnStmtsPosOf`, one self-compile of `compiler/entry.vl` (**27 modules,
+arena 257,475 nodes, 2,955 `fnStmts` slots**):
+
+| | count |
+| --- | ---: |
+| `fnStmtsPosOf` calls | **22,612** |
+| `fnStmts` scan steps | **32,859,699** (1,453 per call) |
+| `monoOrigNode` fall-through steps | **0** |
+| resolved in `fnStmts` / fell through / returned -1 | 22,612 / 0 / 0 |
+| distinct `fnIx` ever asked | **2,955** — every function, 7.65 times each |
+| calls where `fnIx == emitCurFnIx` | **18,164 (80.3%)** |
+| duplicate entries in `fnStmts` | **0** |
+
+### 17.3 Both questions, and both answers are yes
+
+**Was the information already banked? Yes, and by the two loops that dominate the row.**
+
+1. `emitCodeSection` walks `fnStmts` and calls `emitFuncCode(codePayload, fnStmts[ci])`.
+   Its loop variable `ci` IS the position, and four of the five callers above
+   (`emitFuncCode` itself plus the three return-path classifiers it reaches) run inside
+   that call. **80.3% of the calls hand the scan a node the caller converted from the very
+   number the scan then spends 1,453 steps recovering.**
+2. `mapRetExprShape` and `retCapturedMapShape` took an arena index and immediately
+   converted it back with `fnStmtsPosOf` — and **all four of their call sites spell the
+   argument `fnStmts[fe]`** (`emit_classify` 810 and 10751, `emit_sections` 3409,
+   `emit_classify` 2473). Everything past the conversion (`parentBindingOf`,
+   `captureNamesOf`, `captureValKind`) is position-keyed anyway.
+
+**Is there a second reader of the same structure?** Not of `fnStmts` — `fnStmtsPosOf` is
+the only node → position scan over it (`nestedFnDeclaredInFrame`, `exportSlotOfTarget` and
+`monoExportedFe` all key on the NAME). The second reader here is the second CALL FAMILY,
+which the row does not mention and which converting only the emit-side cursor would have
+left scanning: 4,448 calls, 19.7% of the total.
+
+**And the two reasons the header gives for why an index is hard both evaporate under
+measurement.** The `monoOrigNode` fall-through — *"a second reason no index of `fnStmts`
+alone can answer"* — is reached **0 times** in a self-compile. The writer set, which the
+header is right to call a sources problem, never has to be touched at all.
+
+### 17.4 What shipped
+
+`emitCurFnPos` is written as one pair with `emitCurFnIx`, from `emitCodeSection`'s own loop
+index, and `fnStmtsPosOf` returns it when asked about the function being lowered.
+`mapRetExprShape`/`retCapturedMapShape` take the `fnStmts` POSITION instead of the arena
+index.
+
+**This is not the memo the header rejects, and the difference is the whole argument.** A
+memo caches an ANSWER and has to be invalidated; this carries the caller's own INPUT, and
+its two exactness clauses are pinned at `emitCurFnPos` in `emit_state.vl`:
+
+- nothing writes `fnStmts` between the pair being set and the body finishing — every
+  writer is a collect pass or a monomorphization writer, all complete before
+  `emitCodeSection` starts (the same invariant §8.2's hoist already rests on);
+- `fnStmts` holds each arena node at most once, so the loop's position IS the first-match
+  position a scan returns. `collectFns` appends each top-level `FuncDecl` once, lifting
+  appends each lambda once, and every monomorphization writer appends or substitutes a
+  FRESH clone with a new arena index. **Measured, not asserted: 0 duplicate slots in the
+  self-compile's 2,955, and 0 in each of the 1,487 corpus programs that reach emit** (of
+  1,783 files; the other 296 stop at parse/check or emit no code).
+
+Were a duplicate ever to appear, `emitCodeSection` would ALREADY be lowering the second
+body against the first's position-keyed metadata (`fRetVoid`, `fnEnvIdx`, `capStartTbl`),
+so the pair is the self-consistent reading of a state that is broken either way.
+
+### 17.5 Measured
+
+**Guest profile, interleaved A/B/A/B, 12 runs per leg, same input both legs, `$mNN`
+stripped.** Absolute samples PER RUN:
+
+| | A /run | B /run | |
+| --- | ---: | ---: | ---: |
+| `fnStmtsPosOf` | 45.4 | **0.1** | **−99.8%** |
+| all samples | 1,468.4 | 1,463.2 | −0.4% |
+
+**The all-samples row is reported and is NOT the win, and the reason is a trap worth
+naming**: the guest profiler samples on a wall-clock timer, so a leg that runs on a busier
+slice of the box collects the same number of samples for less work. The per-function row is
+a share of that leg's own samples and is robust to it; the total is not. **The timing
+channel is CPU milliseconds, not the sample count.**
+
+**Self-compile CPU milliseconds** (user+sys, interleaved, `taskset -c 2-5`, **emitted bytes
+asserted md5-identical between the two compilers before timing** — `b8cefca1…`, 1,153,427 B
+both). This box was carrying other agents throughout, so both runs are reported with the
+load they ran at:
+
+| reps | load | A min → B min | A med → B med |
+| ---: | ---: | --- | --- |
+| 15 | 13–21 | **1,444 → 1,415 ms (−2.0%)** | **1,484 → 1,434 ms (−3.4%)** |
+| 21 | 7–34 | 1,430 → 1,416 ms (−1.0%) | 1,500 → 1,468 ms (−2.1%) |
+| 25 | 9–18 | 1,424 → 1,382 ms (−2.9%) | 1,531 → 1,504 ms (−1.8%) |
+
+**Three runs, one direction, −1.0% to −3.4%** — and no single one of them is quotable
+alone, which is the point of running three on a box whose 1-minute load moved between 7 and
+34 while they ran. **Quote the profile's 3.09 → 0.01 points as the structural result and
+this table's spread as the timing**; the gap between "3.09 points of samples gone" and "≈2%
+of CPU" is what the fast path itself costs plus the difference between a sample share and a
+second.
+
+**The population where the row's own header lives is the frame ladder, and there the
+change is half the compile.** `fnStmtsPosOf`'s header measures itself on N functions that
+each declare and call their own nested function; the compiler's own source is nearly the
+worst case for showing that off (few capturing nested functions), so the ladder is where
+the quadratic is visible. CPU-min of 5, interleaved, emitted bytes `cmp`-identical at every
+N:
+
+| N | A cpu_min | B cpu_min | |
+| ---: | ---: | ---: | ---: |
+| 100 | 8 ms | 9 ms | |
+| 200 | 16 ms | 14 ms | |
+| 400 | 36 ms | 29 ms | |
+| 800 | 89 ms | 53 ms | −40% |
+| 1,600 | **252 ms** | **123 ms** | **−51%** |
+
+A's step ratio climbs 2.00 → 2.25 → 2.47 → 2.83 as N doubles — that is the quadratic, and
+it is not noise. B's is 1.56 → 2.07 → 1.83 → 2.32.
+
+Profiled at N = 1,600 (8 warm runs per leg): **`fnStmtsPosOf` 169.8 → 6.4 samples per run,
+48.92% → 3.66% self, total 347.0 → 174.4 per run (−49.8%)**. In that population its top
+caller is `capturedKindOf` (85.4%), which this change does not mention and which the cursor
+pair catches anyway — the fix is keyed on the QUESTION, not on the call site.
+
+**What is left, and where.** 100% of the ladder's residual 6.4 samples per run is
+`capturedStructIndex`, and the reason is exact: the classify passes run before
+`emitCodeSection`, so `emitCurFnIx` is -1 there and the cursor cannot answer. On the
+compiler itself the residual is 0.1 samples per run — 0.01%, one sample in twelve runs.
+Taking that last sliver means giving the classify passes a cursor of their own, which is a
+new invariant for a hundredth of a point. **Priced and declined.**
+
+### 17.6 Gate
+
+Every rc read BARE.
+
+| gate | result |
+| --- | --- |
+| `scripts/refresh-compiler.sh` | rc 0, **1,153,427 B** (from 1,153,473 — the removed scan and its now-unused import) |
+| **seed ladder leg 2** (`mv` the seed out, `fetch-seed.sh`, `refresh --prove-fixpoint`) | rc 0 |
+| `scripts/lint-self.sh` | rc 0 (one unused-import removal it caught: `emit_sections`' `fnStmtsPosOf`) |
+| `deno test -A tests/cases_wasm_test.ts` | **1,713 passed / 0 failed / 7 ignored** |
+| `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_align_test.ts` | **1,720 passed / 0 failed / 0 ignored**, verified BOTH ways — without the env var the same file reads 0 / 0 / **1,720 ignored**, so the count is the suite and not a self-ignore |
+| `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_release_test.ts` | **35 passed / 0 failed / 0 ignored**, with `node_modules/.bin/wasm-opt` present (so the six `-O` tests ran rather than self-ignoring). No SHAPE_TABLE row moved |
+| **emitted-BYTES A/B** (build rc, normalized build stderr, emitted sha256) over the WHOLE corpus + `compiler/entry.vl` | **1,784 / 1,784 same, 0 differing, 0 malformed**; **1,488 of the records carry a real sha256** (the other 296 are reject cases that never emit, and their build rc + diagnostic text is the compared field). Each file goes through BOTH compilers in the same worker so the two sides cannot drift apart by scope; one result file per worker, concatenated, record count asserted against the input count and every line asserted well-formed |
+| **six-channel A/B** (check rc, check stderr, build rc, build stderr, emitted BYTES, run rc, run stdout) | **28 of a scoped 1,156 same, 0 differing** — a PARTIAL sweep, reported as partial: the box was carrying other agents at load 22–33 throughout and one `vl` invocation cost 3.5 s wall against 0.34 s earlier in the same session. See the note below on which of its channels could have moved |
+
+**Two of the six channels cannot move here, and saying so is worth more than banking a
+green from them.** `checkSrc` in `driver.vl` never runs `emitProgram` — its own comment
+says *"`check` never emits"* — and no file on the check path imports `emit_classify`, so
+the CHECK rc and CHECK stderr channels are structurally unreachable from a change confined
+to the emit passes. The RUN channel is not independent either: it compiles and then
+executes, and the byte channel already says all 1,784 modules are identical, so an
+identical module cannot run differently. **The byte channel is the one that carries the
+verdict, and it is the one that was run to completion.**
+
+**Corpus case added: `tests/cases/closures/nested-capture-frame-ladder.vl`** — six frames
+that each declare their own nested function capturing a DIFFERENT kind (i32, string, list,
+map, the map RETURNED as the closure's result, struct field). This is the population
+`fnStmtsPosOf`'s header is measured on and the corpus otherwise reaches thinly, and it is
+what separates "the capture resolved against THIS frame" from "against whichever frame
+answered last". Nested names are distinct on purpose (capture analysis is name-keyed
+module-wide). It emits `cmp`-identical bytes under both compilers.
+
+**Seed-bootstrap: NO SPLIT.** Nothing here is a new language feature; the published seed
+compiles the change directly — leg 2 fetched `seed-latest` (1,153,685 B) and reached the
+fixpoint in 2 compiles, and its md5 `b8cefca1…` is the same artifact the A/B timed and the
+corpus sweep ran against.
