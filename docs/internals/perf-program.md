@@ -381,7 +381,7 @@ self-compile unless stated.
 | 3 | ~~**`nameNamesFunction`: index the arena once**~~ — **SHIPPED, §8.3.** Incremental fold with a high-water mark | 2.64% self → **0.07%** | small | the invalidation was the whole question and the answer is three facts pinned at their sites | as filed |
 | 4 | ~~**`fnStmtsPosOf`: an index at the writers**~~ — **SHIPPED, §17, and NOT as filed.** No index was built: every one of the scan's 22,612 calls re-derives a `fnStmts` position its own caller is standing on. `emitCurFnPos` carries `emitCodeSection`'s loop index; `mapRetExprShape`/`retCapturedMapShape` take the position their callers already spell `fnStmts[fe]` | 3.09% self → **0.01%**; a 1,600-frame ladder **48.9% → 3.7% self, −49.8% of the whole compile** | small — one global, one parameter, four call sites | low — no new table, no invalidation surface; the writers were never touched | 12 interleaved warm guest profiles per leg; a counting build for the call/step census; CPU-ms with emitted bytes asserted md5-identical first |
 | 5 | **Native-align: batch the `vl check` legs** the way RUN/TRAP is batched | the pooled version (shipped) took 27 → 19 s on CI; a `vl check` batch mode would take the remaining ~1,600 process spawns to a handful, and the 4-core cap stops applying | medium: a host `check --batch` mode + per-case verdict files | medium — the per-case verdict is the gate; a batch that blurs verdicts weakens it | the interleaved A/B in §1.5, plus the memo-key sabotage |
-| 6 | ~~**`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less~~ — **CLOSED, §18: the gap is GONE and its SIGN is inverted.** `vl check compiler/entry.vl` peaks at **282.8 MB** against `vl build`'s **504.6 MB**. The filed row was measured while `cli_pump` still used `Collector::Null`; the pump took a collecting collector four days later for an unrelated reason and closed this incidentally. The premise "in the LSP's own path" was also wrong — the LSP instantiates the seed in V8, never through the Rust host. **The excess allocation is real and still there** (`VL_PUMP_GC=null vl check` = 680.0 MB, +175 MB over `build`), it is simply no longer RESIDENT | filed 138 MB; **measured −221.8 MB** (check is 56% of build) | one measurement, no patch | none | fresh-child `wait4` per §2.1 — **with one seed COPY per collector class**, or the sidecar thrash of §18.2 fabricates ~610 MB for a five-line file |
+| 6 | ~~**`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less~~ — **CLOSED, §18: the gap is GONE and its SIGN is inverted.** `vl check compiler/entry.vl` peaks at **282.8 MB** against `vl build`'s **504.6 MB**. The filed row was measured while `cli_pump` still used `Collector::Null`; the pump took a collecting collector four days later for an unrelated reason and closed this incidentally. The premise "in the LSP's own path" was also wrong — the LSP instantiates the seed in V8, never through the Rust host. **The excess allocation is real and still there** (`VL_PUMP_GC=null vl check` = 680.0 MB, +175 MB over `build`), it is simply no longer RESIDENT | filed 138 MB; **measured −221.8 MB** (check is 56% of build) | one measurement, no patch | none | fresh-child `wait4` per §2.1 — **with each collector class's sidecar warmed first**, or the cold-compile of §18.2 fabricates ~610 MB for a five-line file |
 | 7 | **Editor latency**: `vl check` on one compiler file is 231 ms | the LSP path; see §4 | unquantified | — | the §4 table |
 | 8 | **`ci-embed-seed` recompiles the whole crate every push** — `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates the crate fingerprint by construction | ~17 s off a job that is NOT the critical path (42–74 s against `ci-native`'s 42–50 s) — so this is a "when it is free" item, not a lever | small: compute the key at startup instead — but read `build.rs`'s header first, it is baked in to avoid hashing ~1 MB per invocation | low, but it trades a CI second for a runtime millisecond, which is the wrong direction if done naively | several samples of `Finished \`release\` profile in Xs` — three readings were 48 s, 16 s and 19 s, so ONE sample cannot size this |
 
@@ -458,7 +458,7 @@ above, so read the A-vs-B columns in §7.3 rather than differencing across
 sections.
 
 **COLD vs WARM, measured — and the "~10×" I first wrote is wrong for the case that
-matters.** Deleting `build/vl-compiler.wasm.cwasm` and re-running the same command:
+matters.** Deleting `build/vl-compiler.wasm.*.cwasm` and re-running the same command:
 
 | task | cold | warm | ratio |
 | --- | ---: | ---: | ---: |
@@ -484,10 +484,10 @@ for a one-function file.
 | the memo is not cross-contaminating | collapse the memo key to drop `rel`; the suite must fail (260/1,646). Dropping the `--codegen` half stays green **for a stated reason** — read the comment before concluding it is untested |
 | profile top-20 | the `VL_PROFILE_GUEST` recipe in §2; ≥5 warm runs, strip `$mNN`, and **re-baseline before targeting** — shares move as work lands |
 | `__str_eq__` consumer split | walk each `__str_eq__` sample one frame up (two, through `__map_probe__`) and classify the caller |
-| ~0.5 GB per self-compile | `wait4` rusage `ru_maxrss` on a FRESH child per measurement. `getrusage(RUSAGE_CHILDREN)` is a cumulative high-water mark and will report the max over every child so far. **Two further hazards, both of which manufacture a ~600 MB reading for a FIVE-LINE file, so measure `tiny.vl` in the same harness as the CONTROL and require it to stay at the ~20 MB floor** (§18.2): (a) `vl check`/`vl fmt`/`vl test` and `vl build`/`vl run` compile the seed with DIFFERENT engine configs but publish to the SAME `<seed>.cwasm` path, which is keyed by mtime freshness and not by config, so alternating them recompiles the ~1.2 MB seed through Cranelift every single invocation — give each collector class its own COPY of the seed; (b) `vl check`'s peak is collector-dependent and is NOT its total allocation — use `VL_PUMP_GC=null` if total allocation is what you meant |
+| ~0.5 GB per self-compile | `wait4` rusage `ru_maxrss` on a FRESH child per measurement. `getrusage(RUSAGE_CHILDREN)` is a cumulative high-water mark and will report the max over every child so far. **Two further hazards, both of which manufacture a ~600 MB reading for a FIVE-LINE file, so measure `tiny.vl` in the same harness as the CONTROL and require it to stay at the ~20 MB floor** (§18.2): (a) `vl check`/`vl fmt`/`vl test` and `vl build`/`vl run` compile the seed with DIFFERENT engine configs. Each config has its OWN `<seed>.<engine tag>.cwasm`, so alternating them is warm — but a config whose sidecar has never been written still pays one Cranelift compile of the ~1.2 MB seed, and that lands on whichever row runs first. Warm every command you are about to measure before taking the first reading, and treat a ~600 MB five-line file as the tell that one was not; (b) `vl check`'s peak is collector-dependent and is NOT its total allocation — use `VL_PUMP_GC=null` if total allocation is what you meant |
 | `vl check` peaks at 282.8 MB, not 649.5 | that is the pump's COLLECTING collector, live since `36eb2e15`. `git show feac41f0:scripts/vl-host/src/main.rs` — the commit that filed 649.5 — shows `cli_pump` on `gc_engine(Collector::Null)`; re-running that exact config today (`VL_PUMP_GC=null`) reads 680.0 MB, so the filed number was never a RUSAGE artifact |
 | `string` is `(array (mut i32))` | `wasm-tools print build/vl-compiler.wasm` and read the type section; `array.new_fixed` of it is a string literal |
-| cold vs warm sidecar | delete `build/vl-compiler.wasm.cwasm` and re-run the SAME command. The cost is a constant ~1.85 s, so quote it as a constant, never as a ratio — the ratio is 290× on a one-function file and 8.9× on a 22 K-line one |
+| cold vs warm sidecar | delete `build/vl-compiler.wasm.*.cwasm` and re-run the SAME command. The cost is a constant ~1.85 s, so quote it as a constant, never as a ratio — the ratio is 290× on a one-function file and 8.9× on a 22 K-line one |
 | compiler byte-identity of a CI-only change | `git diff master --name-only -- compiler/ std/ scripts/` is empty, and `vl build compiler/entry.vl` `cmp`s equal to the seed |
 | §6's staging cut | `VL_PROFILE=1 vl build compiler/entry.vl --compiler <seed>` and read the `[profile] stage_program` line; interleave the two seeds, min of 9, state the load |
 | §6's fallback matrix | the same phase timer across the 2×2 of {old,new} host × {old,new} seed — exactly one cell is fast, and all four outputs `md5` equal |
@@ -3417,14 +3417,22 @@ Spread across the 5 rounds is under 0.2% on every RSS row.
 
 ### 18.2 Wrong way #1 — the shared `.cwasm`, which fabricates 610 MB for five lines
 
+**The mechanism below is FIXED (workboard F6b): the sidecar path now carries an
+engine tag — `<compiler>.<engine tag>.cwasm` — so the two commands hold separate
+entries and alternating them is warm.** The section stays because the SHAPE of the
+artifact is the lesson: a per-invocation fixed cost inside the host reads as
+workload, and it survives a min-of-N taken the wrong way round. What remains live is
+the first touch of a config whose sidecar has never been written — one cold compile,
+landing on whichever row runs first.
+
 `vl check`/`fmt`/`test` go through `cli_pump`, whose engine is
 `gc_engine(Collector::Auto)`; `vl build`/`run` use `gc_engine(Collector::Null)`.
 Two engine configs, therefore two different Cranelift compilations of the same
-seed — **published to the same path**, `<compiler>.cwasm`, whose cache key is mtime
-freshness and nothing else. So each command rejects the other's sidecar, recompiles
-the ~1.2 MB seed, and rewrites it. The sidecar ping-pongs between two fixed sizes,
-and `VL_PUMP_GC=null` moves `check` onto `build`'s file, which is the control that
-proves the artifact is the COLLECTOR and not the command:
+seed — and they were **published to the same path**, `<compiler>.cwasm`, whose cache
+key was mtime freshness and nothing else. So each command rejected the other's
+sidecar, recompiled the ~1.2 MB seed, and rewrote it. The sidecar ping-ponged
+between two fixed sizes, and `VL_PUMP_GC=null` moved `check` onto `build`'s file,
+which is the control that proves the artifact is the COLLECTOR and not the command:
 
 | invocation | resulting `<seed>.cwasm` |
 | --- | ---: |
@@ -3446,10 +3454,10 @@ and in the same minute as §18.1:
 
 **A five-line file reading 610 MB is the whole tell**: the number does not scale
 with the workload because it is not the workload — it is the host's Cranelift
-compile of the seed. Give each collector class its own COPY of the seed and every
-row drops to §18.1's. A min-of-N *per row* also escapes it, since a row's repeats
-warm their own config — which is why the filed table's `tiny` rows read 15.1/16.3 MB
-and this is NOT what produced 649.5.
+compile of the seed. Once each collector class has its own warm sidecar, every row
+drops to §18.1's. A min-of-N *per row* also escapes it, since a row's repeats warm
+their own config — which is why the filed table's `tiny` rows read 15.1/16.3 MB and
+this is NOT what produced 649.5.
 
 ### 18.3 Wrong way #2 — the premise, which the pump retired four days later
 
