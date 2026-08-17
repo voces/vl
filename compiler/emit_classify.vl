@@ -1327,6 +1327,9 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulList(fnIx, e.identName) { return true }
     if declaredNulList(e.identName) { return true }
+    // A CAPTURED `i32[] | null`: the env field is the same `(ref null $lTypeIdx)` cell — the
+    // list twin of the `nulstr` capture arm, and the fourth storage class this arm lacked.
+    if capturedKindOf(fnIx, e.identName) == "nullist" { return true }
     return globalIsNulListSid(sidOfNode(exprIx))
   }
   if e is Member { return memberFieldCode(exprIx, fnIx) == 18 }
@@ -1647,6 +1650,11 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulString(fnIx, e.identName) { return true }
     if declaredNulString(e.identName) { return true }
+    // A CAPTURED `string | null`: the env field is the same `(ref null $array)` cell, so it
+    // classifies like the param/local — the arm that reconciles this classifier with
+    // `emitCapturedReadRecover`, which recovers the non-null ref off that field under exactly
+    // the `pendingRawNullRead` / `pendingNulString` gates the local read uses.
+    if capturedKindOf(fnIx, e.identName) == "nulstr" { return true }
     return globalIsNulStringSid(sidOfNode(unwrapParen(exprIx)))
   }
   // A `string | null` struct FIELD read (`a.v`, code 20) yields a nullable string ref.
@@ -16225,6 +16233,14 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramStruct(fnIx, e.identName) { return true }
     if declaredStruct(e.identName) { return true }
+    // A CAPTURED struct: the env field IS the struct ref (`captureValKind` sized it that
+    // way), so classify it like a struct param/local — the fourth storage class, and the one
+    // this arm never grew. `capturedStructIndex` already supplies the HEAP TYPE to
+    // `structIndexOfExpr`, so the layout resolved while the boolean question answered no: a
+    // lambda whose body is a bare captured struct had its `$fnsig` result minted i32
+    // (`fRetKind` fell through) over a body returning `(ref $S)`, and the two functypes for
+    // one function are invalid wasm.
+    if capturedKindOf(fnIx, e.identName) == "struct" { return true }
     return globalIsStructSid(sidOfNode(exprIx))
   }
   // `xs[i]` over a STRUCT-element ref list yields the struct (G7-ref). Per-slot: the
@@ -16603,12 +16619,20 @@ function globalStructIndexSid(sid: i32) {
 // captured `{ … }` in an enclosing frame) resolves to its struct type exactly as a
 // param/local/global receiver would — the value itself is read from the env by
 // `emitCapturedRead`; this only supplies the heap type so `emitMem` can pick the field.
+//
+// IT CARRIES NO `fnEnvIdxOf` GUARD, for the reason spelled out on `capturedKindOf`: that
+// index is minted by `mAssignTypeIndices`, which runs AFTER every classification pass, so
+// gating on it makes this answer -1 for the whole of `computeRetInference`. A lambda whose
+// body is a bare captured struct then had its kind classified `"struct"` (via `exprStruct`'s
+// capture arm) while its `fRetStructIdx` stayed -1 — `emitProgram: ref valtype with no
+// interned shape`, with everything in sight annotated. The guard is redundant besides:
+// `fnEnvIdxOf(fe) >= 0` holds exactly when `captureCountOf(fe) > 0`, which the scan below
+// decides for itself.
 function capturedStructIndex(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   if !fnValUsed { return -1 }
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return -1 }
-  if fnEnvIdxOf(fe) < 0 { return -1 }
   const caps = captureNamesOf(fe)
   let ci = 0
   while ci < caps.length {
