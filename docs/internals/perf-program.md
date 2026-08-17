@@ -2955,7 +2955,8 @@ the count is the quadratic the conversion removes.
 
 `modRenamePush` appends a row and indexes it under `sidOf(from)`. Readers are `sidLookup` plus
 one `sidArrGet`. `sidLookup` never mints, which is exact here by R6: every key was interned at
-the build point, so a name with no id cannot be one.
+the build point, so a name with no id cannot be one. The parallel `modRenameFrom: string[]`
+goes with the scan that was its only reader — the row carries the identity now.
 
 **TWO sid views, not one.** The readers disagree about a duplicate key and the disagreement is
 pre-existing: `modRenamed` returns at the FIRST matching row; `modRwTsName` and
@@ -2991,10 +2992,19 @@ Absolute samples PER RUN:
 | `__str_hash__` (the price) | 46.9 | 50.6 | +7.9% |
 | **all samples** | **1,452.2** | **1,378.1** | **−5.1%** |
 
-**Self-compile CPU milliseconds** (user+sys, interleaved, 13 reps, `taskset -c 2-5`, emitted
-bytes asserted md5-identical before timing): **min 1,421 → 1,344 ms (−5.4%)**, median 1,479 →
-1,424 ms (−3.7%). CPU rather than wall because this box swings up to 2.5× under contention
-(§15.3); the run was taken at load 8–14.
+**Self-compile CPU milliseconds** (user+sys, interleaved, `taskset -c 2-5`, emitted bytes
+asserted md5-identical before timing). CPU rather than wall because this box swings up to 2.5×
+under contention (§15.3) — and this session was the contention, so **both runs are reported
+with the load they ran at**:
+
+| reps | load | A min → B min | A med → B med |
+| ---: | ---: | --- | --- |
+| 13 | 8–14 | **1,421 → 1,344 ms (−5.4%)** | 1,479 → 1,424 ms (−3.7%) |
+| 11 | 50–73 | 1,666 → 1,607 ms (−3.5%) | 1,875 → 1,712 ms (−8.7%) |
+
+**Quote the profile's −5.1% and the quiet run's −5.4% min.** The load-70 row is the pair of
+numbers that shows why: its two channels straddle the answer by ±3 points because at three
+times the core count every rep is measuring a different machine.
 
 **What is left, and why it is the floor.** `modRenamed`'s remaining 8.6 samples per run are
 3.4 `__str_hash__` + 2.1 `__str_eq__` + 0.8 `__map_probe__` (the `sidLookup`) + 1.1
@@ -3011,12 +3021,13 @@ Every rc read BARE.
 
 | gate | result |
 | --- | --- |
-| `scripts/refresh-compiler.sh` | rc 0, 1,151,336 B |
-| **seed ladder leg 2** (`mv` the seed out, `fetch-seed.sh`, `refresh --prove-fixpoint`) | rc 0 — **fixpoint in 2 compiles**, and it is the same artifact the A/B timed |
+| `scripts/refresh-compiler.sh` | rc 0, **1,151,180 B** |
+| **seed ladder leg 2** (`mv` the seed out, `fetch-seed.sh`, `refresh --prove-fixpoint`) | rc 0 — **fixpoint in 2 compiles**, and its md5 is the artifact the A/B timed |
 | `scripts/lint-self.sh` | rc 0 (`vl fmt -w compiler/driver.vl` once) |
 | `deno test -A tests/cases_wasm_test.ts` | **1,706 passed / 0 failed / 7 ignored** |
 | `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check tests/selfhost_native_align_test.ts` | **1,713 passed / 0 failed / 0 ignored** — and verified BOTH ways: without the env var the same file reads 0 / 0 / **1,713 ignored**, so the count is the suite and not a self-ignore |
-| **six-channel A/B** (check rc, check stderr, build rc, emitted BYTES, run rc, run stdout) over the 57 multi-module corpus cases + `compiler/entry.vl` | **58 / 58 same**, one result file per worker |
+| **six-channel A/B** (check rc, check stderr, build rc, emitted BYTES, run rc, run stdout) over the 57 multi-module corpus cases + `compiler/entry.vl` | **58 / 58 same**, one result file per worker, run against the shipped artifact |
+| the same six channels over single-module corpus files | **304 of 1,655 same, 0 differing** — a PARTIAL sweep, cut off at a 24-core box sitting at load 90–175 under other agents. It is the module bucket, not this, that is the population the row is about |
 
 **Seed-bootstrap: NO SPLIT.** The change uses only `symbols.vl` exports the published seed
 already ships.
