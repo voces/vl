@@ -96,6 +96,28 @@ WAT of the value's write path vs read path. Don't debug codegen blind against th
 validator message alone — the disassembly is the debugging view of `vl build` output.
 
 ## Trimmed gates (CI covers the full battery)
+- **The `ci` job is NOT the native one, and its three cheap steps were missing from
+  every agent gate list until #1444.** Agents ran the native battery
+  (`refresh-compiler`, `lint-self`, the `.vl` corpus, align, release, rep-fuzz, the
+  seed ladder) and none of the `ci` job. Run these too — they are seconds each:
+
+      deno check compiler/*.ts        # the TS side of the compiler still type-checks
+      deno lint                       # repo-wide; separate from scripts/lint-self.sh
+      (cd lsp && deno task build)     # the LSP bundle compiles
+
+  The last one is the **dual-runtime constraint** made executable: `compiler/` is
+  bundled into both the Deno CLI and the **Node** LSP server, so an unguarded
+  `Deno`/`process` global or a top-level side effect breaks the server while every
+  native gate stays green. **Note the `working-directory: lsp`** — `deno task build`
+  from the repo root matches no task, so Deno prints the task list and exits 1. That
+  is not a failing gate, it is the wrong directory; the root has `lsp:build` instead.
+  Two separate mistakes of mine live in that sentence, so read it before concluding a
+  CI step is vacuous.
+- **A red `ci` with a green `ci-native` is often infrastructural.** #1444's `ci` died
+  in *Set up job*, before a single test ran: GitHub codeload returned 503, then 502,
+  then 429 fetching the `setup-deno` action. Read the failure log before touching the
+  code — `gh run view <id> --log-failed` — and `gh run rerun <id> --failed` if the
+  failure is in setup.
 - **The seed ladder has TWO legs, and a self-built seed only satisfies one.**
   `scripts/refresh-compiler.sh` rebuilds from your own sources, which proves the
   seed matches the source and catches a STALE seed. It cannot catch a seed too
