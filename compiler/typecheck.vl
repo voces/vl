@@ -11152,72 +11152,104 @@ function assignableGo(src: i32, dst: i32) {
   if nomLitRelax == 0 {
     if nomNameOfTy(src) != nomNameOfTy(dst) { return false }
   }
-  if s is TyPrim {
-    if d is TyPrim {
-      // Lossless numeric WIDENING (B2): a narrower numeric value flows into a wider
-      // slot — annotation, argument, return — along the lattice i32→{i64,f32,f64},
-      // i64→f64, f32→f64. The reverse (any narrowing, e.g. i64→i32, f64→f32, f64→i32)
-      // is NOT assignable: it is lossy and must be made explicit. Codegen inserts the
-      // matching wasm convert at the boundary. f32 literals reach an f32 slot via the
-      // float-literal exception at the binding/arg/return sites (a float literal types
-      // f64 by default but re-encodes exactly at f32). The binding takes the WIDER type.
-      if numWidensName(s.primName, d.primName) { return true }
-      return s.primName == d.primName
-    }
-    return false
-  }
-  if s is TyObj {
-    if d is TyObj {
-      const dnames = d.objFieldNames
-      const dtys = d.objFieldTypes
-      let i = 0
-      let ok = true
-      while i < dnames.length {
-        const srcIx = objFieldType(s, dnames[i])
-        if srcIx < 0 { ok = false }
-        else if !assignable(srcIx, dtys[i]) { ok = false }
-        i = i + 1
+  // The STRUCTURAL tail, EXHAUSTIVE over `Ty` and deliberately `_`-less: a 12th
+  // arena variant breaks the self-compile here instead of silently answering
+  // `false` = "not assignable", which is a spurious LOUD reject of a valid
+  // program. Only the arms above this point are order-sensitive (see the
+  // placement note); by here every `s` variant is either destructured already or
+  // decided structurally, so the claimed variants are spelled as empty arms naming
+  // the earlier test that returns for them.
+  //
+  // `TyErr` has NO ARM because it cannot: the early `s is TyErr { return true }`
+  // NARROWS `s`, so `TyErr` is not a member of the scrutinee's type here and an arm
+  // for it is a type error. The guard is unaffected — exhaustiveness is checked
+  // against the narrowed member set, which a 12th variant joins too.
+  match s {
+    TyPrim => {
+      if d is TyPrim {
+        // Lossless numeric WIDENING (B2): a narrower numeric value flows into a wider
+        // slot — annotation, argument, return — along the lattice i32→{i64,f32,f64},
+        // i64→f64, f32→f64. The reverse (any narrowing, e.g. i64→i32, f64→f32, f64→i32)
+        // is NOT assignable: it is lossy and must be made explicit. Codegen inserts the
+        // matching wasm convert at the boundary. f32 literals reach an f32 slot via the
+        // float-literal exception at the binding/arg/return sites (a float literal types
+        // f64 by default but re-encodes exactly at f32). The binding takes the WIDER type.
+        if numWidensName(s.primName, d.primName) { return true }
+        return s.primName == d.primName
       }
-      return ok
+      return false
     }
-    return false
-  }
-  if s is TyArray {
-    if d is TyArray {
-      // An empty `[]` (element `-1`) is assignable to any array; otherwise the
-      // element types must be assignable.
-      return assignable(s.aElem, d.aElem)
-    }
-    return false
-  }
-  if s is TyMap {
-    if d is TyMap {
-      // A bare `Map()`/`Set()` (key/value holes, `-1`) is assignable to any map.
-      return assignable(s.mKey, d.mKey) && assignable(s.mVal, d.mVal)
-    }
-    return false
-  }
-  if s is TyFunc {
-    if d is TyFunc {
-      // A GENERIC function value (hole params/return) is assignable to a CONCRETE function type only
-      // by INSTANTIATION — its body's capability must hold at the target's param types and yield the
-      // target's return — NOT the structural rule below, which a hole passes unconditionally. This
-      // type-level check reaches every nested position (an ARRAY element, a field) that the
-      // expression-level `assignableExpr` interception does not.
-      if fnTyHasHole(src) { return genericFnAssignable(src, dst) }
-      const sp = s.fnParamTypes
-      const dp = d.fnParamTypes
-      if sp.length != dp.length { return false }
-      let i = 0
-      let ok = fnSlotAssignable(s.fnRet, d.fnRet)
-      while i < sp.length {
-        if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
-        i = i + 1
+    TyObj => {
+      if d is TyObj {
+        const dnames = d.objFieldNames
+        const dtys = d.objFieldTypes
+        let i = 0
+        let ok = true
+        while i < dnames.length {
+          const srcIx = objFieldType(s, dnames[i])
+          if srcIx < 0 { ok = false }
+          else if !assignable(srcIx, dtys[i]) { ok = false }
+          i = i + 1
+        }
+        return ok
       }
-      return ok
+      return false
     }
-    return false
+    TyArray => {
+      if d is TyArray {
+        // An empty `[]` (element `-1`) is assignable to any array; otherwise the
+        // element types must be assignable.
+        return assignable(s.aElem, d.aElem)
+      }
+      return false
+    }
+    TyMap => {
+      if d is TyMap {
+        // A bare `Map()`/`Set()` (key/value holes, `-1`) is assignable to any map.
+        return assignable(s.mKey, d.mKey) && assignable(s.mVal, d.mVal)
+      }
+      return false
+    }
+    TyFunc => {
+      if d is TyFunc {
+        // A GENERIC function value (hole params/return) is assignable to a CONCRETE function type only
+        // by INSTANTIATION — its body's capability must hold at the target's param types and yield the
+        // target's return — NOT the structural rule below, which a hole passes unconditionally. This
+        // type-level check reaches every nested position (an ARRAY element, a field) that the
+        // expression-level `assignableExpr` interception does not.
+        if fnTyHasHole(src) { return genericFnAssignable(src, dst) }
+        const sp = s.fnParamTypes
+        const dp = d.fnParamTypes
+        if sp.length != dp.length { return false }
+        let i = 0
+        let ok = fnSlotAssignable(s.fnRet, d.fnRet)
+        while i < sp.length {
+          if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
+          i = i + 1
+        }
+        return ok
+      }
+      return false
+    }
+    TyVar => {
+      // Claimed by `s is TyVar` at the top, which returns true.
+    }
+    TyNullable => {
+      // Claimed by the nullable pair above: the `d is TyNullable` arm peels both
+      // sides, and the bare `s is TyNullable` guard right after it returns false.
+    }
+    TyUnion => {
+      // Claimed by the union-SOURCE arm above, which returns its `ok`.
+    }
+    TyLit => {
+      // Claimed by the literal-SOURCE arm above, which returns on both legs.
+    }
+    TyNeg => {
+      // Claimed by `s is TyNeg` above, which returns false.
+    }
   }
+  // UNREACHABLE by construction: the six empty arms above are each claimed by an
+  // earlier `s`-test that returns, and the five real arms return on every leg.
   false
 }
 
