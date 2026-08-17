@@ -76,7 +76,7 @@ counts.
 | ... open (1 ladder family, reached) | 1 |
 | check-clean SILENTLY WRONG output, reached | 0 |
 | spurious LOUD reject of a valid program, reached | 7 ladders |
-| DANGEROUS-UNPROVEN (no reaching program found) | 4 |
+| DANGEROUS-UNPROVEN (no reaching program found) | 5 |
 
 No silently-wrong cell was found anywhere in this sweep. Every remaining gap is
 either invalid wasm (one family, below) or loud.
@@ -277,7 +277,7 @@ Two `$fnsig` producers over the same annotation disagree on exactly one rep, so 
 * Actual: LOUD — `emitProgram: field access but no struct type declared`. Oracle:
   annotate with the union alias (`(i32) => Shape`), which keys `>u`.
 
-### R10. DANGEROUS-UNPROVEN (4)
+### R10. DANGEROUS-UNPROVEN (5)
 
 No reaching program was found for these, which makes them lower-severity findings
 than every row above — recorded so the next sweep starts from the analysis:
@@ -288,6 +288,13 @@ than every row above — recorded so the next sweep starts from the analysis:
 * `collectTyReachCloSigs` / `collectTyReachRegister` fall through on `TyNeg`,
   which every sibling walker in `emit_rep.vl` handles. `intersectTy` consumes
   almost all negations.
+* `tyReachesHole` (`typecheck.vl:11555`) is the third member of that `TyNeg`
+  family: it descends `TyArray`/`TyMap`/`TyNullable`/`TyObj`/`TyUnion`/`TyFunc`
+  and answers `TyVar` true, but has no `TyNeg` arm, so `!(T[])` over a
+  hole-reaching `T` falls to `false` = "reaches no hole" — the direction that lets
+  a hole through the parameter-solve gate. Same guard as its siblings
+  (`intersectTy` consumes almost all negations), and `tyChildrenOf` — the shared
+  visitor recommendation (c) routes this family through — has the arm already.
 * `cloCallUnionMixUnrep` (the floor for the deferred value-union-closure-result
   family) sets neither `hasScalar` nor `hasComposite` for a `TyNullable` member or
   a nested non-literal `TyUnion` member, and "no composite" means "admit".
