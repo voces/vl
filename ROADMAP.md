@@ -1038,12 +1038,47 @@ in-language GC knobs.
   field ROW recorded the map's VALUE name and VALUE type with the KEY ERASED (`sFieldElemName` /
   `sFieldElemTyIx`) while an mv slot's identity is the (KEY, VALUE) pair (B6b), so both field
   tables grew a key column (`sFieldElemKeyI32` / `uFieldElemKeyI32`, written by the ONE row
-  recorder and read at the ONE shape home `sFieldMapShape` / `uFieldMapShape`). REMAINING, all
+  recorder and read at the ONE shape home `sFieldMapShape` / `uFieldMapShape`).
+  **The LIST-TYPED field element (`{m: {[i32]: V}[]}`) is DONE TOO, and its mechanism was NOT the
+  field row's** — the residue `i32MapSpellingLowerable`'s note predicted, re-verified as `vl check`
+  rc 0 + invalid wasm, turned out to be one arm short in `ensureRefElemTy`'s `k == 3` (map
+  ELEMENT) arm. That arm is the one place EVERY map-typed ref-list element passes through, at any
+  nesting and in any position; it forced `mUsed`/`lUsed`/`aUsed` and interned the element map's mv
+  VALUE slot but not `mI32Used`, and a missing flag arm falls through to the flag's own `false`.
+  `mI32Used` gates the i32-keyed map STRUCT, `__map_probe_i32__` and the per-function 5-slot
+  i32-KEY scratch frame, so `mapI32Base` landed on the next frame's base and the store's KEY
+  temporary aliased the map-REF temporary at the same local index (`type mismatch: expected (ref
+  $type), found i32`, with `call 4294967295` — the -1 probe index — beside it) for an mv-slot
+  value, and `mapTypeIdxOf`'s guarded `-4` arm rejected loudly for a mono one. The key was NOT
+  erased on the way in: the inline-shape field row's own KEY column WAS written `false` by hand for
+  codes 5/28 (the one of five row recorders that did not ask `nameIsI32KeyedMap` of the field's own
+  text) and is now uniform, but no consumer reads that column outside codes 19/29, so the erasure
+  was latent and not the cause. Measured over a 72-cell key × position × value-rep × op grid: 12
+  check-clean-invalid-wasm and 12 loud cells fixed, 0 silently-wrong outputs before or after, and
+  the three spellings `{m: {[i32]: V}[]}` / `{m: M[]}` / `type S = {m: {[i32]: V}[]}` emit ONE
+  byte-identical module (the third already did, unchanged). Corpus build A/B: 0 of 1858 files
+  differ, so 0 new interned types. Pinned by `maps/i32-keyed-list-field-{collect,mono-value,
+  alias-element}.vl`, each alone with its key because `mI32Used` is module-wide and a DECLARED
+  `type S` spelling covers it. The map-ARRAY annotation arm's hand-written copy of the same
+  forcing went with it.
+  REMAINING, all
   loud rejects with pinned fixtures: **a UNION MEMBER** (`{[i32]: V} | i32` — the box carries no
   map shape, `maps/error-i32-keyed-position-union-member.vl`); **a list of LISTS of maps**
   (`{[i32]: V}[][]`, one `[]` deeper than the peel, on both the bare and the field spelling —
   `maps/error-i32-keyed-position-array.vl`); and an ARRAY OF CLOSURES returning one
-  (`(() => {[i32]: V})[]`). Also filed, on both key reps: a struct that is a MEMBER of a declared
+  (`(() => {[i32]: V})[]`). **And the MAP-VALUE position, which the list above and the gate's own
+  reject MESSAGE both claim is done and which is in fact a loud reject**:
+  `{[string]: {[i32]: V}}` is `emitProgram: an i32-keyed Map/Set is supported as … / a map value —
+  not inside '{[string]:{[i32]:f64}}'`, because `i32MapSpellingLowerable` peels a function RETURN,
+  ONE `[]` and a `| null` and has no arm for a map VALUE. (`{[i32]: {[i32]: V}}` passes the gate —
+  the OUTER key satisfies it before the value is looked at.) MEASURED, not guessed: adding
+  `if nameIsMapSpanEnds(bare) { return i32MapSpellingLowerable(mapValNameOf(bare)) }` after the
+  leaf test makes the construct + `.size`/`.has`/`.delete` forms run and leaves the corpus at
+  1790/0/7 and the grid unmoved — but it opens a position whose VALUE can never be READ back
+  (`const g = m[k]; if g != null` over a map-valued map is `bare null needs a struct-typed
+  context` on BOTH key reps, the separate loud item below), and a one-line widening of a soundness
+  gate wants its own map-value × value-rep × nesting grid, so it is filed rather than landed.
+  Also filed, on both key reps: a struct that is a MEMBER of a declared
   union cannot be a map VALUE (`mvValKindOfName`'s last arm asks `structIndexByValName`, which a
   variant is not in — `tests/cases/maps/error-map-value-struct-in-union.vl`).
   (The filed "a SET-typed FIELD has no `.add`" row is STALE — `.add` gates on the VALUE TYPE as
