@@ -71,15 +71,26 @@ counts.
 
 | | cells |
 |---|---|
-| check-clean INVALID WASM, reached with a program | 27 |
-| ... closed here | 26 |
-| ... open (1 ladder family, reached) | 1 |
-| check-clean SILENTLY WRONG output, reached | 0 |
-| spurious LOUD reject of a valid program, reached | 7 ladders |
+| check-clean INVALID WASM, reached with a program | 27 + 20 (C4) |
+| ... closed | 26 + 9 (C4) |
+| ... open (1 ladder family, reached) | 1 + 11 (C4, all outside the target family) |
+| check-clean SILENTLY WRONG output, reached | 0 + 26 (C4) |
+| ... closed | 26 (C4) |
+| spurious LOUD reject of a valid program, reached | 7 ladders + 47 cells (C4) |
 | DANGEROUS-UNPROVEN (no reaching program found) | 5 |
 
-No silently-wrong cell was found anywhere in this sweep. Every remaining gap is
-either invalid wasm (one family, below) or loud.
+No silently-wrong cell was found *by this sweep*, and the reason is a blind spot
+in its own denominator, not an absence: **the sweep's two mechanical scans key on
+`VKind` string literals and `is Ty*` tests**, so they see the valtype / locals /
+arena ladders and not the **USAGE-DETECTION** ladder — a `while` over `P.nodes`
+asking a fixed list of "is this node a use of feature X?" questions, whose
+fallthrough is `false` = *"the program does not use X"*, which turns off a whole
+family of classifiers at once. `anyLitUnionUsed` is one of those, and it held the
+silently-wrong cell this audit missed (row C4 below, 26 cells). A usage detector
+is the highest-leverage shape in the family, because its default disables every
+downstream arm rather than mis-answering one; the next sweep needs a third scan
+shape for it (`while i < P.nodes.length` + `return true` on a `nodeTy*`/`node*Is*`
+predicate run).
 
 ## CLOSED — three DANGEROUS ladders (26 invalid-wasm cells) + two structural pins
 
@@ -130,6 +141,7 @@ feasible" below). Behaviour-neutral: A/B of the emitted wasm bytes over every
 `.vl` under `tests/cases/` — 1860 records, 1538 byte-identical, 322 rejecting
 identically, **0 byte differences, 0 rc differences**.
 
+<<<<<<< HEAD
 ### 4. The same structural guard, applied to an ARENA ladder
 
 `repTyScalarMask`'s walk (row R11 below: no `TyLit` arm, fall-through leaves the
@@ -141,6 +153,68 @@ compilers, **1872 records, 1548 byte-identical modules, 324 rejecting identicall
 0 byte differences, 0 rc differences**. The guard is proven live by sabotage —
 deleting the `TyMap` arm makes `scripts/refresh-compiler.sh` exit 1 with the
 variant named at its source position. See "The ARENA half" below.
+=======
+## CLOSED — C4. The USAGE DETECTOR, which is the shape this audit's scans cannot see
+
+`anyLitUnionUsed` (`compiler/typecheck.vl`) is the single `P.nodes` pass that sets
+`gLitUnionUsed`, and `exprIsLitAtom` — the classifier every atom consumer asks —
+returns `false` on its FIRST LINE when that flag is 0. The pass asked four
+questions per node and **only the non-null half of two of them**, so a program
+whose only litunion mention is a NULLABLE ARRAY ELEMENT answered "this program
+uses no literal union": the `: K | null` annotation probe was there, but the
+annotation of `(K | null)[]` is a TypeRef whose own type is the `TyArray`, so no
+node in such a program carries a bare nullable-litunion annotation type at all.
+
+* Reached by: `type K = "p" | "q"` ; `const xs: (K | null)[] = ["p", null, "q"]` ;
+  `for x in xs { print(x) }`.
+* Actual: `vl check` **rc 0**, prints **`0` / `-1` / `1`** — the raw interned atom
+  ids and the `-1` null sentinel. Oracles, both working: the `(string | null)[]`
+  element (prints `p` / `null` / `q`) and the non-nullable `K[]` element.
+* Measured: 6 element spellings (named / inline / alias-with-its-own-null /
+  numeric / newtype / `string` control) x 33 container-read-consumer shapes, both
+  runtime inputs, each cell against its own expected stdout = **198 cells**.
+  **silently-wrong 26 -> 0**, invalid wasm 20 -> 11, OK 52 -> 134, **0 cells worse
+  in any direction**.
+* FIVE ladders, each missing the nullable dual of a question it already asked:
+  `anyLitUnionUsed` (the root), `declareForInLocals`' `localLitUnion` flag,
+  `exprNulLitUnion`'s Ident arm (the for-in LOOP VAR storage class — R10's fourth
+  bullet, same shape, different classifier), the collect scan's `aUsed` forcing
+  for a `: K | null` annotation, and canon's `nulLitUnionPreserve` for a
+  TRANSPARENT ALIAS core (`type K2 = K` / `type NK = new K`, which it SOFTENED to
+  `string | null`, giving a `{[string]: K2 | null}` map a `(ref null $aTypeIdx)`
+  vals slot while every read lowered the i32 atom).
+* `print` of the niche also stopped REJECTING. The old ruling ("narrow it first")
+  rested on a false parity with `print(<string | null>)`, which does not require
+  narrowing — it prints `null`, and so does `print(<boolean | null>)`. The
+  members and the `-1` sentinel partition the i32, so the value carries its own
+  discriminator. `emitPrintAtomMemberChain` is now the one home for the member
+  arms, shared by the bare-atom and niche prints.
+* Pinned by `tests/cases/literal-unions/nullable-litunion-element-read.vl` (a LOG
+  mismatch on master — it built and ran) and
+  `…/nullable-litunion-element-consumers.vl` (a build-verdict pin).
+
+Residues the grid measured and this slice did NOT close, each with its cell count
+out of 198 and a reaching program in the same grid:
+
+* **the alias that carries its own `| null` arm, used as a CONTAINER element** —
+  `type K = "p" | "q" | null` ; `const xs: K[] = ["p", null]` is
+  `emitProgram: array literal but list type not collected`, and its struct-field
+  and map-value twins are check-clean invalid wasm. 18 cells, unchanged by this
+  slice in either direction. This is R1's family one spelling further in: the
+  expanded union interns differently from `TyNullable`, and the LIST/FIELD/MAP
+  construction ladders key on the latter.
+* **`??` over a LIST index** — `xs[1] ?? "q"` is `emitProgram: `??` is only
+  supported on a map index get` for every litunion spelling (4 cells) and
+  check-clean INVALID WASM for the `(string | null)[]` control (1 cell), which is
+  the worse verdict and is pre-existing.
+* **`print(<numeric litunion | null>)`** — `type N = 1 | 2` ; `N | null` is a
+  clean checker reject at 19 of its 33 shapes ("print of a union value (1 | 2?) is
+  type-valid but not yet supported by codegen") and check-clean invalid wasm at 3
+  (`list-forin-narrowed`, `list-forin-topar`, `struct-field-narrowed`).
+* **`(string | null)[]` compared un-narrowed** — `for x in xs { if x == "p" … }`
+  over a `(string | null)[]` TRAPS (`wasm trap`, 1 cell), while every litunion
+  spelling of the same program now runs. The control is the broken one here.
+>>>>>>> e1f74f7b (docs(vl): the per-rep ladder audit's scans cannot see a USAGE DETECTOR, which is where the silently-wrong cell was)
 
 ## OPEN — ranked
 
@@ -301,6 +375,12 @@ than every row above — recorded so the next sweep starts from the analysis:
 * `exprNulScalarListKind`'s Ident arm covers param / declared local / global but
   **not the CAPTURE storage class**, which every sibling niche classifier carries.
   A missing storage class, not a missing rep, but the same silent-`null` shape.
+  **This bullet's sibling was reached and closed by C4**: `exprNulLitUnion`'s Ident
+  arm was missing the for-in LOOP VAR — a storage class with no declaration node
+  at all, so it cannot be resolved the way the other four are; the fix reads the
+  checker's recorded type for that read instead. Every niche classifier with an
+  Ident arm should be re-read against the FULL storage-class list (capture, param,
+  `let`, global, **for-in loop var**), which is five, not four.
 
 ### R11. UNREACHABLE, with the guard named
 

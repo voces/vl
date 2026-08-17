@@ -14778,9 +14778,12 @@ Three hunks, `typecheck.vl` + `wasmEmit.vl`:
    A ONE-member tested type is ONE compare, so any receiver expression is safe; two or more re-read
    the receiver, so those require an IDENT. That restriction is what keeps a map read or a call from
    being silently duplicated, and it is measured below.
-3. **`print`'s dispatch** (`wasmEmit.vl`) — the atom question is asked FIRST, and an empty member-text
-   list is a loud `emitFail` ("print of a nullable literal union — narrow it first"), the rule the
-   nullable STRING three lines below already carried.
+3. **`print`'s dispatch** (`wasmEmit.vl`) — the atom question is asked FIRST. An empty member-text
+   list is a loud `emitFail` ("print of a literal-union atom whose type carries no member texts"),
+   which is now the FLOOR for a rep/type disagreement rather than a rule about nullability: the
+   `K | null` niche gets its own chain (member arms + the `-1` sentinel arm) and prints `null`,
+   exactly as the nullable STRING three lines below does. The claim that the nullable string
+   "carried the narrow-it-first rule" was never true of it — `emitPrintNulString` prints `null`.
 
 ### The rep space, enumerated and RUN — 160 + 60 cells, not a sample
 
