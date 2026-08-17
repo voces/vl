@@ -556,3 +556,40 @@ and its *attribution* unreliably. Three of these five were filed against the wro
 receiver and the `string | null` operand were both innocent, and the real defect (N2) is one
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
+
+## Retired by re-derivation, round 2 (2026-08-17, on master `c64f254a`)
+
+The re-derivation rule keeps emptying the queue faster than I can brief it. Eight PRs merged in
+quick succession (#1436–#1443), and these queued rows — each filed with a real cell count — are
+**already working on the tip**. Verified with my own probes, on both runtime inputs where the cell
+is runtime behaviour.
+
+| filed row | filed as | tip verdict |
+|---|---|---|
+| box for-in loop-var narrow | 8 cells (#1436) | prints `1 / -1 / 2` — closed by #1437 |
+| `1 \| 2 \| null` with `if p != null` | 41 cells (#1438) | prints `2 / -1` — closed by #1439 |
+| `.map`/`.filter` over `i32[]\|null`, `boolean\|null`, `f64\|null` | part of 140 (#1436) | run |
+| a litunion **ATOM** captured by a nested fn, no narrowing | filed broken in D1d | prints `C:a` |
+| `let` + null-initialiser + later `p = null` reassignment | 22 cells (#1443) | prints `2 / -1` |
+| `mapkeys` over `boolean\|null` and `K\|null` map values | 84 cells (#1439/#1443) | print `true` / `a` |
+| map-value read with `is` / `!= null` | part of the same 84 | print `a` / `5` |
+| `exprIsF32` / `exprIsBool` member-union reads | an untested inconsistency (#1443) | **measured clean** at three shapes |
+
+**Two of my own probes read as compiler defects when they were MY lint errors.** `vl check` returns
+**rc 1 on a HINT** — `never reassigned; use const` and `redundant type annotation` (the #1412
+type-informed stream) both do it. A hint-only rc 1 is its own outcome and must never be recorded
+as a reject.
+
+**And `1.5f` is not the f32 literal syntax — there isn't one.** An f32 literal is a bare `1.5` with
+an `f32` annotation, which is just VL's bare-literals-adopt-the-destination-type rule. #1443
+reported f32 as unprobeable and declined to add an `exprIsF32` arm on that basis; the decision was
+right but the reason was wrong, and the arm is now measured unnecessary rather than untested.
+
+Two other queued rows are **correct behaviour, not defects**, and should not be re-filed:
+`print` of an un-narrowed union or nullable is the documented *"narrow it first"* reject, and
+`p ?? null` consumed by `print` hits that same floor because its result is still nullable.
+
+**Consequence:** the queue is now rebuilt from measurement rather than history — a discovery sweep
+is in flight to produce `docs/internals/silent-class-inventory.md`, a ranked inventory of what is
+actually live on the tip, each entry carrying a minimal repro AND a working control, plus an
+explicit not-a-defect section so no future agent is spent on a closed row.
