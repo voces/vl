@@ -656,3 +656,19 @@ no overlay entry — and real code has few. Absolute cost is still small at n=3,
 by callee name, or build a name→declaration map once per module instead of walking per query. Not
 started — three agents are live and one is in `typecheck.vl` territory, so this waits for a free
 slot rather than risking a conflict.
+
+## Timing measurements need a quiet box (2026-08-17)
+
+I re-measured the aliased-write perf fix twice and got contradictory numbers, then checked
+`uptime`: **load average 85.7**, with two agents each running up to 4 concurrent `vl`
+invocations. The second run was noise — it even showed the fix 2x *slower* on one input where
+the first run showed the two identical.
+
+**Rule: do not take timing measurements while agents are running, and check `uptime` before
+believing any timing table.** A pass/fail gate survives load; a wall-clock comparison does not.
+The agent's own numbers were taken with only itself running, which is why they are the
+authoritative ones — and it is also why a timing fixture must never be committed (a wall-clock
+assertion in CI is flaky by construction, which is why this slice pins invariants instead).
+
+Corollary for the 3-agent cap: the cap protects *stability* and *measurement quality*, and this
+is the measurement-quality half. A bounded complete measurement beats a fast noisy one.
