@@ -399,6 +399,7 @@ import {
   capComputeNamesOf,
   captureCountOf,
   captureNamesOf,
+  captureValKind,
   cbRetVariantIdx,
   cloCallParamLitUnion,
   cloCallParamUnionName,
@@ -1504,6 +1505,30 @@ export function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
   0
 }
 
+// The rep recovery an env-field READ owes after its `struct.get` — the capture twin of the
+// param/local and module-global read rules, and decided by `captureValKind`, THE function that
+// chose the field's type, so the recovery cannot disagree with the field it recovers from.
+//
+// A `string | null` (kind 16) field is a `(ref null $array)` cell whose read must recover the
+// non-null value type the rest of codegen expects — exactly what `paramNulString` /
+// `declaredNulString` buy a local and `globalCellKind == "nulstr"` buys a global. Without it a
+// `!= null`-narrowed capture returned `(ref null $array)` where the closure's own `(ref
+// $array)` result was declared: invalid wasm with `vl check` rc 0. The
+// `pendingRawNullRead` / `pendingNulString` gates are those two sites' verbatim, so the
+// `!= null` test itself and a genuinely-nullable read still see the raw cell.
+//
+// The other nullable cells deliberately recover NOTHING here, because they recover nothing on
+// the local and global paths either: a nullable LIST (kind 15/18) and a nullable STRUCT (kind
+// 9) keep nullable reads and the USE site (`emitMem`, the index path) recovers.
+function emitCapturedReadRecover(fe: i32, name: string) {
+  if captureValKind(fe, name) == "nulstr" {
+    if !pendingRawNullRead && !pendingNulString {
+      fbRefAsNonNull() // 0xd4 ref.as_non_null
+    }
+  }
+  0
+}
+
 // If `name` is a CAPTURED variable of the capturing lifted function currently being
 // emitted (`fnIx`), emit a read of it from the env struct and return 1; else return 0
 // (the caller falls through to the normal param/local/global path). The env rides as
@@ -1529,6 +1554,7 @@ function emitCapturedRead(_body: i32[], name: string, fnIx: i32) {
         fbLocalGet(0)     // the leading env param (structref)
         fbRefCast(envIdx) // 0xfb 0x16 <env heap> ref.cast — narrow to this env
         fbStructGet(envIdx, fi)
+        emitCapturedReadRecover(fe, name)
         return 1
       }
       fi = fi + 1
@@ -1543,6 +1569,7 @@ function emitCapturedRead(_body: i32[], name: string, fnIx: i32) {
       fbLocalGet(0)     // the leading env param (structref)
       fbRefCast(envIdx) // 0xfb 0x16 <env heap> ref.cast — narrow to this env
       fbStructGet(envIdx, ci)
+      emitCapturedReadRecover(fe, name)
       return 1
     }
     ci = ci + 1
