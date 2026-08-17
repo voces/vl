@@ -3325,7 +3325,7 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
     if cond.isVariant == "null" {
       pushNarrowFact(cond.isObj, TY_NULL, names, tys)
     } else {
-      const tIdx = isTypeTy(cond.isVariant, condIx)
+      const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 { pushNarrowFact(cond.isObj, tIdx, names, tys) }
     }
     return 0
@@ -3389,7 +3389,7 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
         pushNarrowFact(cond.isObj, inner, names, tys)
       }
     } else {
-      const tIdx = isTypeTy(cond.isVariant, condIx)
+      const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 {
         pushNarrowFact(cond.isObj, subtractTy(cur, tIdx), names, tys)
       }
@@ -5497,9 +5497,10 @@ function nameToTyAt(name: string, at: i32) { nameToTyAnn(name, at, at) }
 // D-PARSETY P2 banks on the `IsExpr` node ITSELF (`parseIsType` → `setAnnTs`,
 // and `driver.vl`'s module merge rewrites that tree rather than the rendering).
 //
-// Five callers, one home: the two narrowing collectors, the if-chain
-// exhaustiveness scan, the `match` arm checker and `checkIsExprNode`. All five
-// already hold the node index, so this is a plain read, not a new sidecar.
+// Five callers, one home: `checkIsExprNode`, the `match` arm checker, and — via
+// the banked-read wrapper `isTypeTyRead` below — the two narrowing collectors and
+// the if-chain exhaustiveness scan. All five already hold the node index, so this
+// is a plain read, not a new sidecar.
 //
 // Diagnostics anchoring is deliberately NOT `nameToTyAt`'s: an `is` type has
 // never set `annotDiagAt`, so a generic-arity error raised inside resolution
@@ -5515,6 +5516,34 @@ function nameToTyAt(name: string, at: i32) { nameToTyAnn(name, at, at) }
 // programs. The fall-through is not deleted because it is `annotResolve`'s shared
 // body, serving the UNpositioned population — not a rung private to this site.
 function isTypeTy(name: string, isIx: i32) { annotResolve(name, annTsOf(isIx)) }
+
+// The same type, for the three READERS of an `is` node that has already been checked —
+// the two narrowing collectors and the if-chain exhaustiveness scan. All three run inside
+// the `if` whose condition `checkIsExprNode` has just resolved and BANKED (`isVarTyIx`,
+// read here through `isVarTyIxOf`), on the same node, in the same type-parameter frame.
+//
+// Where the spelling is a bare NAME the bank IS the answer: `tsLeafTy` is three nominal
+// lookups (`primTyOfName`, the type-param environment, the declaration) and allocates
+// nothing for a name the node's own check already resolved, so re-entering the grammar
+// returns the identical arena index.
+//
+// A COMPOSITE spelling (`{w: i32}`, `i32[]`, `()=>i64`, `("pp"|"qq")`) resolves instead,
+// and the reason is the ARENA rather than the answer: `T.tys` is not hash-consed, so
+// `tsToTyReal` mints a fresh row per structural spelling and the reader's index differs
+// from the banked one BY CONSTRUCTION. Reading the bank there would delete that row and
+// renumber every index after it, and `repElemKeyGo`'s identity arm keys `TyVar`/`TyLit`/
+// `TyErr` by arena INDEX. The bare-name half is separable from the composite half exactly
+// because it mints nothing to delete: skipping it removes no entry from the arena.
+function isTypeTyRead(name: string, isIx: i32) {
+  const banked = isVarTyIxOf(isIx)
+  if banked >= 0 {
+    const root = annTsOf(isIx)
+    if root >= 0 {
+      if tsKind[root] == TS_NAME { return banked }
+    }
+  }
+  isTypeTy(name, isIx)
+}
 
 // Apply a generic alias (`Box<i32>`, `Pair<i32,string>`, `Box<T>` under a live
 // type-param env): resolve the arguments in the CURRENT environment, check the
@@ -13531,7 +13560,7 @@ function ifChainExhausts(ifIx: i32) {
             } else if placeName != obj.identName {
               allIsArms = false
             }
-            const tIx = isTypeTy(cond.isVariant, condIx)
+            const tIx = isTypeTyRead(cond.isVariant, condIx)
             if tIx < 0 { allIsArms = false } else { testedTys.push(tIx) }
           } else {
             allIsArms = false
