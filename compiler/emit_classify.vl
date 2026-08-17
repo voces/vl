@@ -1787,6 +1787,17 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     if cns >= 0 {
       return mvValKind[cns] == 1 && coalesceStaysNullable(exprIx, cns, fnIx)
     }
+    // The NON-map `??` over the same niche (`p ?? q` over two `S | null` places) obeys the
+    // identical rule — the CONSUMER half of the decision `emitCoalesce`'s nullable-struct
+    // arm makes. Without it an un-annotated `const nv = p ?? q` bound a NON-null struct
+    // cell, and its `nv != null` lowered as struct equality (a loud reject) while an
+    // ANNOTATED consumer took the `(ref null $S)` cell and the emit's non-null block type
+    // disagreed with it (invalid wasm).
+    if e.binOp == "??" {
+      if exprNullableStruct(e.binLeft, fnIx) {
+        return coalesceDefaultNullable(e.binRight, fnIx)
+      }
+    }
   }
   false
 }
@@ -9232,6 +9243,41 @@ export function coalesceStaysNullable(exprIx: i32, cns: i32, _fnIx: i32) {
       return nodeTyIsNullable(e.binRight)
     }
   }
+  false
+}
+
+// THE ONE NULLABILITY DECISION for the NON-map `??` reps — the value-union BOX
+// (`i32 | null`, `f64 | null`) and the nullable-STRUCT niche (`S | null`) — and the same
+// user-semantics ruling `coalesceStaysNullable` states for the map-value dual: `??` coalesces
+// on the LHS being null, so a NON-null default collapses the read to the residual non-null rep
+// (the unboxed scalar / the `(ref $S)`), while a NULLABLE default leaves the result `T | null`.
+// Every one of those arms hard-coded the residual rep, so a nullable default met a non-null
+// block type — `vl check`-clean invalid wasm where the consumer declared the nullable rep, and
+// a loud "bare null needs a struct-typed context" / "struct equality is not supported yet"
+// where the consumer INFERRED its cell from the same wrong answer.
+//
+// STRUCTURAL IN THE CHAIN, NEVER BANKED. A chained `p ?? q ?? r` re-associates to
+// `p ?? (q ?? r)` through `mkBinary(…, -1)`, and that synthesized inner node has NO banked
+// type — so `nodeTyIsNullable` of the DEFAULT answers "non-null" for every chain and declares
+// a non-null block around a nullable one. The `??` arm recurses to the chain's LAST default,
+// which is always a real source node, so both spellings are covered by construction. This is
+// the discipline `coalesceNulStrStaysNullable`'s header states for the `string | null` rep,
+// which asks `exprNullableString` of the `??` NODE for exactly the same reason.
+//
+// The rep-side dual (`unionSetHasNull`) is asked BESIDE the banked type, not instead of it: a
+// nullable default the checker banked no `TyNullable` for (a declared union alias, whose arena
+// entry is `TyUnion[T, null]`) still has `null` in its member set.
+export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
+  if defIx < 0 { return false }
+  const dix = unwrapParen(defIx)
+  const d = P.nodes[dix]
+  if d is NullLit { return true }
+  if d is BinExpr {
+    if d.binOp == "??" { return coalesceDefaultNullable(d.binRight, fnIx) }
+  }
+  if nodeTyIsNullable(dix) { return true }
+  const un = unionNameOfExpr(dix, fnIx)
+  if un != "" { return unionSetHasNull(un) }
   false
 }
 
@@ -17175,6 +17221,17 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cmu = coalesceMvSlot(exprIx, fnIx)
     if cmu >= 0 { return mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) }
+    // A non-map `p ?? q` over a nullable value-union BOX keeps the BOX when the DEFAULT is
+    // itself nullable — the result is still `T | null`, and `T | null` has no unboxed rep.
+    // This is the CONSUMER half of the same decision the `??` lowering makes: without it an
+    // un-annotated `const nv = p ?? q` inferred the residual scalar cell and its later
+    // `nv != null` found no nullable rep to test. DELEGATED to the name-typed mirror so the
+    // two producers cannot disagree about which `??` spellings keep the box — a boolean
+    // that claims a box the name resolver cannot name leaves the narrowed read with no
+    // member set, which is the same defect one classifier over.
+    if e.binOp == "??" {
+      if unionNameOfExpr(exprIx, fnIx) != "" { return true }
+    }
   }
   // A plain read of a VALUE-UNION struct field (`o.y`, code 16) yields the field's
   // union BOX — a union value usable wherever a union is expected (`return o.y`, a
@@ -17268,22 +17325,23 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
       if li >= 0 { return letUnionNameOf(li, fnIx) }
       // A `for <name> in <(C|S)[]>` loop variable is a kind-4 union box but is NOT a
       // `LetDecl`, so `parentLetOf` misses it — resolve its member set from the iterable's
-      // union-box element type so `x is C` narrows inside the loop body. GUARDED on the slot
-      // already being a kind-4 union box, so a non-union loop var (an f32 `for v in
-      // m.values()`, a struct `for s in ss`) never reaches the ref-array reclassification
-      // below (which could mis-name it and corrupt its codegen).
-      if declaredKind(name) == "union" {
-        const iter = forInIterBlock(body, name)
-        if iter >= 0 {
-          if exprRefArray(iter, fnIx) {
-            const slot = refListSlotOfExpr(iter, fnIx)
-            if slot >= 0 && slot < rlElemKindTbl.length {
-              if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
-            }
-          }
-        }
-      }
+      // union-box element type so `x is C` narrows inside the loop body.
+      const flv = forInLoopVarUnionName(forInIterBlock(body, name), name, fnIx)
+      if flv != "" { return flv }
     }
+  }
+  // THE MODULE-SCOPE DUAL of the loop-var arm above, and the same relation
+  // `startBlockLetOfSid` has to `parentLetOfSid`: a TOP-LEVEL `for x in <(i32|null)[]>`
+  // runs in the START function, where there is no `FuncDecl` body to scan, so the arm
+  // above is unreachable at `fnIx < 0` and the box loop var resolved to NO union. The
+  // slot is still declared as the kind-4 box (`declareForInLocals` is shared), so the
+  // narrowed read found no member set to unbox through and pushed the raw `(ref $uBox)`
+  // where the loop var's own valtype said the unboxed scalar — `vl check`-clean invalid
+  // wasm, in every module-scope read shape (`for`, `.slice`, `.filter`, a nested `for`,
+  // a `w.xs` field iterable, a `mk()` return iterable, a `let` iterable).
+  if fnIx < 0 {
+    const slv = forInLoopVarUnionName(forInIterIn(startStmts, name), name, -1)
+    if slv != "" { return slv }
   }
   // A CAPTURED union box — resolve its member set from the parent frame's binding.
   const cun = capturedUnionName(fnIx, name)
@@ -17338,6 +17396,28 @@ function startBlockLetOfSid(sid: i32) {
   sidArrPut(sblGen, sid, sblEpoch)
   sidArrPut(sblVal, sid, found)
   found
+}
+
+// THE ONE HOME for "which value union does a `for <name> in <iter>` LOOP VARIABLE flow as",
+// given the iterable node the enclosing loop iterates (-1 = no enclosing loop found). A loop
+// var is the storage class with NO declaration node at all — no `Param`, no `LetDecl` — so
+// its member set can only come from the iterable's union-box ELEMENT type, and both walks
+// that reach it (`unionNameOfIdentSid`'s function-scope arm over the `FuncDecl` body, and its
+// module-scope dual over `startStmts`) must answer identically: the slot `declareForInLocals`
+// declares is the same kind-4 box either way, and a walk that answers "" leaves the narrowed
+// read with no member set to unbox through.
+//
+// GUARDED on the slot ALREADY being a kind-4 union box, so a non-union loop var (an f32
+// `for v in m.values()`, a struct `for s in ss`) never reaches the ref-array
+// reclassification below — which could mis-name it and corrupt its codegen.
+function forInLoopVarUnionName(iterIx: i32, name: string, fnIx: i32) {
+  if iterIx < 0 { return "" }
+  if declaredKind(name) != "union" { return "" }
+  if !exprRefArray(iterIx, fnIx) { return "" }
+  const slot = refListSlotOfExpr(iterIx, fnIx)
+  if slot < 0 || slot >= rlElemKindTbl.length { return "" }
+  if rlElemKindTbl[slot] != 2 { return "" }
+  rlElemName[slot]
 }
 
 // The ITERABLE expression node of an enclosing `for <name> in <iter>` loop within the
@@ -17560,6 +17640,24 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // `scalar | null` peels to a raw scalar (not a union), so it has no union name here.
       if mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) {
         return mvValName[cmu]
+      }
+    }
+    // The name-typed mirror of `exprUnion`'s non-map `??` arm: `p ?? q` over a nullable
+    // value-union BOX keeps the box when the default is nullable, so an un-annotated
+    // `const nv = p ?? q` needs the resulting MEMBER SET to narrow and unbox through —
+    // without it the cell was the box and the narrowed read pushed the raw box where the
+    // consumer wanted the unboxed scalar.
+    //
+    // ONLY when both operands carry the SAME member set (or the default is a bare `null`,
+    // which adds none). A default of a DIFFERENT union widens the result set, and there is
+    // no set-merge here to render it — inventing the LHS's set would give the narrow a
+    // discriminator the box does not actually satisfy, so that spelling keeps declining
+    // exactly as it does today.
+    if e.binOp == "??" {
+      const cln = unionNameOfExpr(e.binLeft, fnIx)
+      if cln != "" && coalesceDefaultNullable(e.binRight, fnIx) {
+        const crn = unionNameOfExpr(e.binRight, fnIx)
+        if crn == "" || crn == cln { return cln }
       }
     }
   }

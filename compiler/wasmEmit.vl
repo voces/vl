@@ -348,6 +348,7 @@ import {
   fbI64TruncF32S,
   fbI64TruncF64S,
   fbIf,
+  fbIfRef,
   fbLocalGet,
   fbLocalSet,
   fbLocalTee,
@@ -411,6 +412,7 @@ import {
   cloRetIsString,
   cloSigKeyExt,
   cloSigPosOfKey,
+  coalesceDefaultNullable,
   criFnIsAnonLambda,
   ctrlEnter,
   ctrlLeave,
@@ -17120,6 +17122,29 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
               "emitProgram: `??` over a string|null union is not supported yet",
             )
           }
+          // A NULLABLE default keeps the result boxed — see `coalesceDefaultNullable`.
+          // Both arms are already `(ref $uBoxIdx)`: the default is a box, and the LHS
+          // re-read is the same box with a non-null tag, so neither arm unboxes and the
+          // block type is the box itself. (The lowering shape is otherwise identical, so
+          // the tag test above is shared.)
+          if coalesceDefaultNullable(e.binRight, fnIx) {
+            if emitExpr(body, e.binLeft, fnIx) < 0 {
+              return -1 // the box
+            }
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(nullBoxTag())
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
+            ctrlEnter()
+            if emitExpr(body, e.binRight, fnIx) < 0 {
+              return -1 // d, its own box
+            }
+            fbElse() // 0x05 else — present → the LHS box, re-read
+            if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+            fbEnd()  // 0x0b end
+            ctrlLeave()
+            return 0
+          }
           if emitExpr(body, e.binLeft, fnIx) < 0 {
             return -1 // the box
           }
@@ -17177,6 +17202,27 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             return -1 // the box, evaluated ONCE
           }
           fbLocalSet(coalesceCallSlot)
+          // A NULLABLE default keeps the result boxed — the SAME decision the
+          // re-evaluating ident arm makes (`coalesceDefaultNullable`), taken here too
+          // because both arms are one lowering over one rep and must declare the same
+          // block type. Neither arm unboxes: the default is a box, and the stash already
+          // holds the LHS box.
+          if coalesceDefaultNullable(e.binRight, fnIx) {
+            fbLocalGet(coalesceCallSlot)
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(nullBoxTag())
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
+            ctrlEnter()
+            if emitExpr(body, e.binRight, fnIx) < 0 {
+              return -1 // d, its own box
+            }
+            fbElse() // 0x05 else — present → the stashed box
+            fbLocalGet(coalesceCallSlot)
+            fbEnd()  // 0x0b end
+            ctrlLeave()
+            return 0
+          }
           fbLocalGet(coalesceCallSlot)
           fbStructGet(uBoxIdx, 0)       // field 0: tag
           fbI32Const(nullBoxTag())
@@ -17285,6 +17331,27 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
                 return emitFail(
                   "emitProgram: `??` over a string|null union field is not supported yet",
                 )
+              }
+              // A NULLABLE default keeps the result boxed — the SAME decision the ident
+              // and call arms make (`coalesceDefaultNullable`); the else arm re-reads the
+              // field's own box rather than unboxing it.
+              if coalesceDefaultNullable(e.binRight, fnIx) {
+                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
+                fbStructGet(sHeapIdx[msi], mfi) // the union box
+                fbStructGet(uBoxIdx, 0)         // field 0: tag
+                fbI32Const(nullBoxTag())
+                fbI32Bin(70)                    // 0x46 i32.eq → null?
+                fbIfRef(uBoxIdx)                // 0x04 if, (ref $uBoxIdx) blocktype
+                ctrlEnter()
+                if emitExpr(body, e.binRight, fnIx) < 0 {
+                  return -1 // d, its own box
+                }
+                fbElse() // 0x05 else — present → re-read the field
+                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
+                fbStructGet(sHeapIdx[msi], mfi)
+                fbEnd()  // 0x0b end
+                ctrlLeave()
+                return 0
               }
               if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
               fbStructGet(sHeapIdx[msi], mfi) // the union box
@@ -17502,8 +17569,17 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if exprNullableStruct(e.binLeft, fnIx) {
     const csi = structIndexOfExpr(e.binLeft, fnIx)
     if csi >= 0 && csi < sHeapIdx.length {
-      wU8(2)   // 0x02 block
-      wU8(100) // blocktype: (ref $struct) — the non-null result
+      wU8(2) // 0x02 block
+      // THE RESULT TYPE IS THE DEFAULT'S NULL-NESS (`coalesceDefaultNullable`), not a
+      // constant: a NON-null default collapses the read to `(ref $struct)`, while a
+      // NULLABLE default leaves the result `S | null` and the block must say so — else the
+      // default arm's legitimately-null ref meets a non-null block type. `br_on_non_null`
+      // works under either: it branches with `(ref $struct)`, a subtype of both.
+      if coalesceDefaultNullable(e.binRight, fnIx) {
+        wU8(99) // blocktype: (ref null $struct) — the result stays nullable
+      } else {
+        wU8(100) // blocktype: (ref $struct) — the non-null result
+      }
       wSLEB(sHeapIdx[csi])
       ctrlEnter()
       if emitExpr(body, e.binLeft, fnIx) < 0 {
