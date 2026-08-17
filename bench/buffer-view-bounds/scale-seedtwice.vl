@@ -1,0 +1,66 @@
+// SHAPE `scale`, spelling `seedtwice` — THE CONTROL THAT NAMES THE AXIS.
+//
+// Byte-identical to `scale-view` except that the idempotent seed helper is
+// called TWICE instead of once. One buffer, one view, one hot kernel, one
+// column: nothing about the VIEW POPULATION changes, and the kernel's source
+// does not change a character.
+//
+// It runs 3.0x slower, because the axis is not how many views a module holds.
+// It is whether binaryen's inlining budget collapses `f32view` into the function
+// that owns the loop: when it does, Heap2Local melts the descriptor and there is
+// nothing left to read per element (`scale-view`: 1 `struct.new` in the whole
+// module, the Buffer's, and 0 field reads inside any loop); when a second call
+// site keeps a callee alive, the descriptor is built in that callee and returned,
+// which no rung can melt, and every access reloads `base`/`length` from it.
+//
+// That is what makes the fenced spelling's cost a WHOLE-PROGRAM property in the
+// literal sense — an edit somewhere else in the file, to code the kernel never
+// calls, decides it. See `docs/internals/buffer-design.md` §M4.
+import { Buffer, F32View, byteAddrF32, f32view, storeI32 } from "std:buffer"
+
+const N = 1048576
+const R = 501
+
+const pages = __memory_size__()
+const one: f32 = (pages as f32) / (pages as f32)
+const two: f32 = one + one
+const half: f32 = one / two
+
+function seed(v: F32View, x: f32) {
+  const a = v.byteAddrF32(0)
+  const n = v.length
+  let i = 0
+  while i < n {
+    __store_f32__(a + (i << 2), x)
+    i = i + 1
+  }
+}
+
+function scale(v: F32View, k: f32) {
+  let i = 0
+  while i < v.length {
+    v[i] = v[i] * k
+    i = i + 1
+  }
+}
+
+function main(): f32 {
+  const buf = Buffer(N * 4)
+  const hdr = Buffer(64)
+  const v = buf.f32view(0, N)
+  // The ONLY difference from `scale-view`. Seeding to the same value twice is
+  // idempotent, so both files compute the same column and print the same value.
+  seed(v, one)
+  seed(v, one)
+  let t = 0
+  let k = two
+  while t < R {
+    scale(v, k)
+    if k == two { k = half } else { k = two }
+    t = t + 1
+  }
+  hdr.storeI32(0, t)
+  return v[N - 1]
+}
+
+print(main())

@@ -115,13 +115,18 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // for a read-only one (`reduce`), 6 for the three-access `axpy`. That column is
 // P1.4's answer, and no rung reduces it.
 //
-// The `sget` column is why the four `-O3` rows do not cost the same. `scale`,
-// `reduce` and `rows` each hold ONE view, so every `struct.new` of the view
-// shape agrees on both field values and GUFA folds `length` to a constant and
-// sinks `base` into a local: 0 per-element field reads, and the check measures
-// free. `axpy` holds TWO views whose `base` differs, nothing folds, and binaryen
-// does not hoist the (immutable!) field loads out of the loop — 7 per element,
-// which is the 3.7x in §M's table.
+// The `sget` column is why the four `-O3` rows do not cost the same, and the
+// axis is the INLINING BUDGET, not the view count. `scale`, `reduce` and `rows`
+// collapse entirely into their driver — `f32view` is inlined, so Heap2Local
+// melts the descriptor and the whole module is left with ONE `struct.new` (the
+// Buffer's) and 0 per-element field reads. `axpy` does not collapse: `f32view`
+// survives as a callee, so the descriptor is built there and returned, which no
+// rung can melt, and every access reloads `base`/`length` — 7 per element.
+// Binaryen does not hoist those loads either, even though the fields are
+// IMMUTABLE in the emitted type and the loop contains no allocation; its LICM
+// pass is not in the release pipeline and, run explicitly, only moves TOP-LEVEL
+// loop-body statements, never a `struct.get` nested inside the fence's `if`.
+// `scale-seedtwice` is the control that separates the two candidate axes.
 //
 // The `hoist` rows are the control: 0 traps and 0 calls at every rung, because
 // the base and the count left the loop and the body is the bare intrinsic (their
@@ -133,6 +138,14 @@ const TABLE: Record<string, Row> = {
   // extra frame is one level DOWN (`"[]"` calls `getF32`), so a loop-level count
   // cannot see it. It shows up only in the call TARGET and on the clock (§M3(4)).
   "scale-accessor": { none: c(0, 3, 1), O: c(2, 1, 3), O3: c(4, 0, 0) },
+  // `scale-view` with its IDEMPOTENT seed helper called twice, and no other
+  // difference: one buffer, one view, one column, the same kernel source. The
+  // second call site keeps `seed` alive, the module stops collapsing into its
+  // driver, `f32view` stops being inlined, and the descriptor that `scale-view`
+  // melts away survives — so the `-O3` cell that reads 0 there reads non-zero
+  // here, and the kernel runs 3.0x slower (0.445 -> 1.36 ns/element). This row
+  // is the evidence that the reload is NOT a "two views of one width" property.
+  "scale-seedtwice": { none: c(0, 3, 1), O: c(2, 1, 3), O3: c(4, 0, 5) },
   "scale-buf": { none: c(0, 3, 0), O: c(0, 1, 1), O3: c(0, 0, 1) },
   "scale-hoist": { none: c(0, 1, 0), O: c(0, 0, 0), O3: c(0, 0, 0) },
   "reduce-view": { none: c(0, 2, 1), O: c(2, 0, 0), O3: c(2, 0, 0) },

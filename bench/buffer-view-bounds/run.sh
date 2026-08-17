@@ -89,7 +89,13 @@ mkdir -p "$WORK" || exit 1
 # write: the same six per-access compares as `axpy-view`, written by hand over a
 # base and an extent hoisted into locals. It separates the check from the field
 # reload, which is the whole question §M4 turns on.
-KERNELS="scale-view scale-accessor scale-buf scale-hoist
+#
+# `scale-seedtwice` is the control that NAMES the axis: `scale-view` with its
+# idempotent seed helper called twice. Same one view, same one column, same
+# kernel source — and 3.0x slower, because the reload is decided by whether
+# binaryen's inlining budget lets Heap2Local melt the descriptor, not by how many
+# views the module holds (§M4).
+KERNELS="scale-view scale-accessor scale-buf scale-hoist scale-seedtwice
 reduce-view reduce-buf reduce-hoist
 axpy-view axpy-fencedhoist axpy-buf axpy-hoist
 rows-view rows-buf rows-hoist"
