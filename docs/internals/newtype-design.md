@@ -209,6 +209,65 @@ implementation. What must be preserved is that the checker's
 answering about the same member — they now differ only by a brand, which is
 invisible to every structural question either side asks.
 
+### 3.0 The erasure is exactly as complete as the transparency arm's COVERAGE
+
+Inheriting the erasure means inheriting its *limits*, and that is the one thing
+this section has to say out loud, because the failure is silent in both
+directions.
+
+`singleAliasMemberTyIx` dispatches on the MEMBER's arena variant, and a member
+kind it has no arm for is answered **opaque** — the same answer a genuinely
+opaque alias gets. For a newtype that answer is not conservative, it is wrong:
+the declared name then survives canon, `collectU` mints it a one-variant union
+ROW, `isUName` claims every annotated slot for the shared `{tag, anyref}` BOX,
+and every READ still classifies from the arena and lowers the base's own rep.
+The two halves disagree with `vl check` rc 0 — `call __print_i32__` on a
+`global.get` of a `(ref $box)` for a litunion base — at every position and for
+every use.
+
+So a `new` over a base whose kind the arm does not claim is not a newtype that
+costs a little; it is a program that does not compile to valid wasm. The arm's
+claimed kinds are therefore the real support matrix for `new`, and each is
+claimed under the condition that the member's EMIT RENDER substitutes for the
+alias name faithfully: unconditionally for a primitive, a function type and a
+declared union; under `arrSpineIsScalar` for an array; under
+`unionAliasMembersFaithful` for an inline union; under `nulAliasMemberFaithful`
+for a nullable; under `isPlainAliasRef` for an object.
+
+The standing check when a new base kind becomes spellable is therefore ONE
+question in two directions: does the arm claim it, and does
+`transparentMemberEmitName` spell it the way canon spells the base written
+directly? Byte-identity of the two programs is the cheapest way to ask — the
+branded, the aliased and the bare spellings of one type must build one module.
+
+**The one base kind the arm does NOT claim, and cannot as written:
+`type T = X | null` UN-parenthesized.** The parens decide the arena shape: a
+`type T = (X | null)` body is ONE variant, so it interns as a one-member wrapper
+over a `TyNullable` and the nullable arm claims it. Without them the parser
+splits on the top-level `|` and the declaration is a TWO-variant `UnionDecl`,
+which no arm here can reach — `singleAliasMemberTyIx` returns a member INDEX and
+there is no `TyNullable` index for it to return. Closing it is a NORMALIZATION
+change (a two-variant `UnionDecl` whose second variant is `null` should intern
+as its inner's nullable, the way the inline annotation already does), with a
+blast radius over every nullable alias in the tree, so it is not this arm's
+extension.
+
+Its population, measured on a 4-inner × 3-position × {`new`, `alias`, `direct`}
+grid (36 cells) graded on the RUN VALUE: **all 12 `direct` cells correct, and all
+24 alias-spelled cells wrong** — 12 check-clean invalid wasm (a litunion or
+`string` inner) and 12 loud checker rejects (`print of a union value (T1)` for an
+`i32` inner, `field 'n' is not on every member of T1` for a struct inner).
+
+**Six of those 24 changed CLASS when the `null`-operand brand exemption landed,
+from a loud checker reject to check-clean invalid wasm, and that is a mask
+lifting rather than a defect appearing**: the `cannot compare T1 and null`
+message was firing before the value was ever built, and the un-branded `alias`
+twin of every one of those six cells is already check-clean invalid wasm without
+it. The alternative — restricting the exemption to a `TyNullable` so the message
+keeps firing — was considered and rejected: it would tie a checker predicate to
+an emitter gap, and `tyAdmitsNull` is the question the exemption actually means
+to ask.
+
 ### 3.1 Where the brand lives
 
 The arena is deliberately structural — `typecheck.vl:1475`: *"The arena stays
