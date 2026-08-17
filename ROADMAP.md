@@ -1117,16 +1117,15 @@ in-language GC knobs.
   un-annotated (`function apply(g, x, y) { return g(x, y) }`) — nothing declares a type to
   materialize against, so it needs the callback's type inferred from the HOF's own BODY. The
   reject names the function, the un-annotated parameters, and the signatures the program's own
-  call sites already pin (`error-generic-fn-value-inferred-hof.vl`). Also REMAINING, live and
-  measured: **an un-annotated nested function that CAPTURES.** `function o(n) { function k(x) x
-  + n; k(1.5) }` — the capture path lowers `k` through the function-VALUE ABI, where an
-  un-annotated param defaults to i32. The i32 instantiation hits the loud reject above
-  (`wasmEmit.vl:1404`) even though `k` is only ever called directly by name; the f64
-  instantiation does NOT — it checks clean and emits invalid wasm. 44-cell grid (4 operand types
-  × 11 operators): f64 11/11 invalid wasm, i32 11/11 loud reject, and the ANNOTATED twin is
-  clean in all 22. Workboard D8. Also open: an inline object shape that COINCIDES with a
-  declared alias's shape is a separate emitter limit ("binding's inline-shape type has an
-  unsupported field"), unrelated to generics.
+  call sites already pin (`error-generic-fn-value-inferred-hof.vl`). What a nested CAPTURING
+  function still owes this entry is exactly ONE arm and it is loud: a nested function whose OWN
+  parameter is un-annotated is lowered through the value ABI at the i32 default and hits that
+  reject even though it is only ever called directly by name (`function o(n) { function k(x) x +
+  n; k(1) }`). The f64/string half of that family was NEVER this ABI — it was the env FIELD and
+  the READ out of it being typed by different answers, closed under workboard D8; the tell is that
+  annotating `k`'s parameter does not move it while annotating `o`'s does. Also open: an inline
+  object shape that COINCIDES with a declared alias's shape is a separate emitter limit
+  ("binding's inline-shape type has an unsupported field"), unrelated to generics.
 - ⬜ **B15a. Optional params + default values.** Wanted (owner, 2026-07); neither parses today
   (`p?: T` and `p: T = e` are both parse errors — verified). Design intent: **defaults subsume
   optionals** — VL has real `null` unions, so `p?: T` is sugar for `p: T | null = null`; one
