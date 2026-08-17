@@ -3643,6 +3643,10 @@ default rung, load ≤ 6:
 | insert-dominated, ~97-char keys | 299 ms | **193 ms** | **1.55×** |
 | insert-dominated, ~8-char keys | 97 ms | **85 ms** | **1.14×** |
 
+A second, independent min-of-7 at load 1.34 reproduces the three string rows —
+`map-string` 1045 → 966 (**1.082×**), `set-ops` 764 → 710 (**1.076×**),
+`word-freq` 1138 → 1141 (wash) — so the lookup-side win is not one lucky minimum.
+
 **The two rejected designs are the point of the section.** Both were built and
 timed, not reasoned away:
 
