@@ -108,10 +108,11 @@ if (GATED && !ENABLED) {
 
 // Allocation SITES surviving each rung, per fixture. `-O` is open-world binaryen
 // and melts only what a single function already dominates; `-O3` is the release
-// profile. The two non-zero `-O3` rows are the characterized non-melts — the
-// union box reached through a ref-typed local with two definitions, and the
-// BACKING ARRAY of a grown list (its `{backing,len,cap}` wrapper does melt; only
-// the array survives). See `opt-profile-design.md` §3.
+// profile. The non-zero `-O3` rows are the characterized non-melts — the union box
+// reached through a ref-typed local with two definitions, the surviving PAYLOAD
+// value boxes of a union whose payload is read, and the BACKING ARRAY of a grown
+// list (its `{backing,len,cap}` wrapper does melt; only the array survives). See
+// `opt-profile-design.md` §3 and `unboxed-union-rep-design.md` §13.
 const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }> = [
   { fixture: "struct-scratch-call", none: 3, O: 0, O3: 0 },
   { fixture: "list-wrapper-literal", none: 3, O: 0, O3: 0 },
@@ -133,6 +134,20 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // to hold the tag/payload pair across a liveness window, which is a rep question and not
   // a sink (`unboxed-union-rep-design.md` §12.4).
   { fixture: "union-box-branch-local", none: 4, O: 4, O3: 2 },
+  // The SAME shape with the payload READ, and the row that actually states the limit.
+  // The `-O3` fall to 2 above is NOT the box melting: with the payload discarded,
+  // closed-world field removal deletes the box's anyref field outright and the two
+  // survivors are the now-single-field boxes. Read the payload and the field cannot go,
+  // so the shape reads 4/4/4 — nothing melts at any rung, release profile included.
+  //
+  // Measured against a hand-built WAT A/B of this exact function: two `struct.new` sites
+  // reaching one `(ref $uBox)` local reproduce 4/4/4, and the identical function holding
+  // tag and payload in two scalar locals across the branch with ONE `struct.new` after it
+  // reads 3/2/2 — the same as the three sinkable spellings. Nothing escapes either way,
+  // so the blocker is Heap2Local's per-SITE, single-definition requirement, and routing
+  // around it is local scalarization across a liveness window: a rep change
+  // (`unboxed-union-rep-design.md` §12.4), not a sink.
+  { fixture: "union-box-branch-local-read", none: 4, O: 4, O3: 4 },
   { fixture: "list-wrapper-push", none: 6, O: 3, O3: 2 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the

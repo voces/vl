@@ -181,6 +181,14 @@ const SINK_SITES: Array<{ fixture: string; sites: number; why: string }> = [
     sites: 2,
     why: "an init and a later assignment have no merge point, so neither sink sees them",
   },
+  {
+    fixture: "union-box-branch-local-read",
+    sites: 2,
+    // The payload READ is what makes this row say something the one above cannot: with the
+    // payload discarded, `-O3` deletes the box's anyref field and the count falls for a
+    // reason that is not a melt. Read, it is 4/4/4 at every rung.
+    why: "the same two writes with the payload CONSUMED — still no merge point",
+  },
   { fixture: "union-box-payload-read", sites: 1, why: "two returns merge onto one exit" },
 ];
 

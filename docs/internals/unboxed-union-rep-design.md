@@ -1114,6 +1114,10 @@ is a representation question and not a peephole. **A measured "this is bigger th
 is the result for this row**, and `tests/vl_union_return_sink_test.ts` keeps it pinned at 2
 so a future attempt has its before-number.
 
+§13 is the independent re-derivation of that verdict on the disassembly, and it corrects
+the number quoted here: 4/4/2 is measured with the payload DISCARDED, and its `-O3` fall is
+field removal rather than a melt. Read with the payload, the shape is 4/4/4.
+
 ### 12.5 The melt, and the rung — this one is NOT a wash at plain `vl build`
 
 `tests/fixtures/opt-melt/union-sink-let-if.vl` is `union-box-payload-read`'s program in the
@@ -1178,3 +1182,107 @@ is a 3 → 1.
 the new lowering: the module's union-box construction sites are **52 → 52** and its total
 allocation sites **4,826 → 4,826**. The compiler writes no union-box `let … = if …` binding
 at all, which is the same reading §11.4 records for the if-expression split.
+
+---
+
+## 13. THE REMAINDER, RE-DERIVED — the `let` on two branches is a Heap2Local limit
+
+§12.4 filed the last shape as needing a rep change. This section is the independent
+re-derivation of that verdict, because the filing rested on reasoning and the number it
+quoted (4/4/2) turns out to be measuring something other than the box.
+
+### 13.1 The `-O3` column of `union-box-branch-local` is not the box melting
+
+`union-box-branch-local` DISCARDS the payload — it tests the tag and never reads field 1 —
+so at `-O3` closed-world field removal deletes the anyref field from the box type outright
+and the module's allocation count falls 4 → 2 for a reason that has nothing to do with
+escape analysis. The `-O3` disassembly is explicit: the surviving type is
+`(struct (field i32))`, a one-field, entirely frame-local, never-escaping struct, allocated
+at two sites, and Heap2Local still declines it.
+
+Pinned with the payload READ instead — `union-box-branch-local-read`, the same program as
+the three sinkable spellings — the field cannot be removed and the shape reads **4/4/4**:
+nothing melts at any rung, release profile included. **That is the row that states the
+limit**, and it is the one to read; the older row's `-O3` fall is an artifact of DCE.
+
+### 13.2 Which of the three candidate causes it is, settled on the disassembly
+
+A hand-built WAT A/B of this exact function, run through the same binaryen and the same two
+flag sets the host uses, isolates the variable to the number of allocation SITES reaching
+the `(ref $uBox)` local. Every module is otherwise identical; `C` is the control that proves
+Heap2Local is working at all here.
+
+| module | uBox sites | payload read | none | `-O` | `-O3` |
+|---|---:|---|---:|---:|---:|
+| `C` control — one site, no branch | 1 | no | 2 | **0** | **0** |
+| `A` — two sites (what VL emits) | 2 | no | 4 | 4 | 2 |
+| `B` — one site, tag+payload in scalars across the branch | 1 | no | 3 | **0** | **0** |
+| `A2` — two sites | 2 | **yes** | 4 | 4 | **4** |
+| `B2` — one site, scalars across the branch | 1 | **yes** | 3 | **2** | **2** |
+
+`A`/`A2` reproduce the VL fixtures' counts exactly (4/4/2 and 4/4/4), so the hand modules
+are a faithful model. `B2` lands on 3/2/2 — the same numbers `union-box-payload-read`,
+`union-sink-if-expression` and `union-sink-let-if` already read — with the two survivors
+being the payload value boxes, the data.
+
+That rules out the two other explanations and leaves one:
+
+- **Not an escape.** The value never leaves the frame in any of the five modules; `B`/`B2`
+  differ from `A`/`A2` only in site count and melt completely.
+- **Not a missing control-flow marker in the emitter.** `ctrlEnter`/`ctrlLeave` count wasm
+  frame DEPTH so a `br` operand can be computed (§10.6); they emit no bytes and binaryen
+  cannot observe them. They are also, as of §10.6's closure, present at all four of
+  `emitIfTail`, `emitUnionIfValue`, `emitVariantIfValue` and `emitNullableIfBinding` — so
+  the omission the workboard filed as this item's anchor no longer exists in the tree.
+- **It is Heap2Local's per-SITE, single-definition requirement.** An allocation is
+  scalarized only when every local it flows into provably holds that one allocation. Two
+  `struct.new` writing one local defeats that for both, and no marker or annotation the
+  emitter can add changes it.
+
+### 13.3 What routing around it would cost, and why it is not done here
+
+`B`/`B2` is what the emitter would have to produce: hold the tag and the payload in two
+scalar locals from the declaration to the first read of the binding, prove every write in
+that window constructs and no read occurs inside it, and materialise the box at the
+window's end. That is a LIVENESS WINDOW over a union-typed local — §6's candidate (c),
+local scalarization — and it changes what a union-typed local IS between two program
+points. It is Heap2Local's job done in the emitter, which is the thing this project's
+standing rule says not to do, so it is escalated rather than attempted.
+
+### 13.4 What the limit costs, per rung
+
+The two spellings of one program, 100 M trips, interleaved A/B, **CPU milliseconds**
+(`scripts/p7-time.sh`, min and median of 7, load 3.4–4.4). `A` is the two-statement
+spelling, `B` the if-expression binding spelling. The optimizer's having run is asserted
+structurally in each timed artifact per §10.7: `A` 4/4/4 allocation sites, `B` 3/2/2.
+
+| build | A min/med | B min/med | ratio (min) |
+|---|---:|---:|---:|
+| plain `vl build` | 453 / 461 ms | **299 / 309 ms** | **1.52×** |
+| `vl build -O` | 442 / 452 ms | **174 / 177 ms** | **2.54×** |
+| `vl build -O3` | 420 / 423 ms | **168 / 173 ms** | **2.50×** |
+
+The distributions do not overlap at any rung. **Quote either number with its rung.** The
+`-O` ratio is the larger one precisely because `A` melts nothing: it is the only shape in
+this document that the optimizer cannot help, so the optimizer's gains all accrue to `B`.
+
+Module bytes on the same pair: `A` 311 / 175 / 161 B, `B` 324 / 158 / 137 B at
+(none)/`-O`/`-O3`. The sinkable spelling is 13 B LARGER unoptimized and 17–24 B smaller at
+both optimized rungs.
+
+### 13.5 The population is small, and the corpus is the wrong denominator for it
+
+A union-ANNOTATED `let` that is assigned again later occurs in **21 of 1,925** corpus files
+(`tests/cases` + `std` + `bench` + `compiler`), out of 82 union-annotated `let` bindings
+total. That is a syntactic lower bound — an inferred-union `let` is invisible to the scan —
+and it badly over-counts in the other direction: **10 of the 18 buildable hits emit ZERO
+union boxes**, because they are `T | null` nullable shapes on a different rep. Measured on
+the emitted module, three files still hold union boxes past `-O`
+(`literal-unions/atom-store-into-mixed-union` 24 → 17, `literal-unions/mixed-union-litunion-arm-floor`
+25 → 4, `statements/tail-assign-if-arms` 6 → 4), and their survivors are not attributed to
+this cause.
+
+**The corpus does not size this item.** It is a compiler test corpus; the shape's home is a
+per-tick simulation loop, which the corpus contains none of. The honest statement is that
+the shape is cheap to AVOID — the if-expression spelling of the same program is available,
+already melts, and is 2.5× faster at `-O` — and expensive to hit.
