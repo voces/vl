@@ -1486,21 +1486,23 @@ emitter renders STRUCTURALLY under the `| null` keeps a capability on the two-me
 niche does not have: `type T = S | null` over a declared struct plus `v is S` RUNS on the union row
 (the test finds its variant) and is `emitProgram: `is` receiver is not a union value` on the niche,
 because `collectU` still mints T's row from the parser's variant NAMES while the param now lowers
-from the ARENA as a niche — the two disagree. A NEWTYPE inner is the same cell one kind over
-(`type NW = new i32` is itself a one-member union, so it declines too), and there the niche spelling
-is check-clean INVALID WASM — the INLINE spelling's own pre-existing hole, reached through the
-alias.
+from the ARENA as a niche — the two disagree. A NEWTYPE inner is the same cell one kind over, and
+there the niche spelling is check-clean INVALID WASM — the INLINE spelling's own pre-existing hole,
+reached through the alias. (**That newtype reading was WRONG about the mechanism and the render tell
+disproves it**: `type NW = new i32` mints a SECOND arena index over the SAME `Ty` value, so its entry
+is a `TyPrim` and the gate always TOOK it. `type T = NW | null` rendered `NW?` for all four spellings
+on the gated compiler. The claim "it is itself a one-member union, so it declines too" was reasoned,
+not measured.)
 
-So the fold is gated on `nulNicheInnerFaithful`, factored out of `nulAliasMemberFaithful`: the same
-"which niche inners does `tyToEmitNameGo` spell position-free" question, one rung down. Folded:
-`string`, `i32`, `f64`, `boolean`, a STRING litunion (named or inline). Declined: a declared struct,
-a list, a map, a NUMERIC litunion, a newtype, a nested nullable — each keeping master's shape
-exactly.
+So the fold was gated on a predicate factored out of `nulAliasMemberFaithful`: the same "which niche
+inners does `tyToEmitNameGo` spell position-free" question, one rung down. Folded: `string`, `i32`,
+`f64`, `boolean`, a newtype over a primitive, a STRING litunion (named or inline). Declined: a
+declared struct, an inline struct, a list, a map, a generic application, a closure, a declared union,
+a NUMERIC litunion, a nested nullable.
 
-**The single source of truth afterwards** is `annUnionInnerTy` (the member list: litunion flatten,
-unseparable-pair poison) plus `annUnionTy` (the `null` wrap) for the two annotation routes, and the
-same `annUnionInnerTy` + `nulNicheInnerFaithful` + `mkNullableTy` for the declaration route, which
-takes the two halves rather than the whole because the gate sits between them.
+**BOTH GATES ARE GONE — see "The declaration fold is ungated" below.** The single source of truth is
+`annUnionTy` (`annUnionInnerTy` for the member list: litunion flatten, unseparable-pair poison; then
+the `null` wrap) for all four spellings, annotation and declaration alike.
 
 ### What is still open, measured on the same grid
 
@@ -1562,11 +1564,14 @@ emitter's `singleMemberAliasTyIx` agreeing (or the reverse) diverges the two"* �
 
 `singleAliasMemberTyIx` is the one ruling, read by the CHECKER through `declaredTyOfName` and by
 the EMITTER through `singleMemberAliasTyIx`. Its nullable arm (`nulAliasMemberFaithful`) was gated
-on the inner via `nulNicheInnerFaithful` — a primitive or a litunion — so a declared struct, an
-inline struct, a list, a map, a generic application, a closure, a declared union, a numeric litunion
-and a nested nullable were opaque on BOTH sides. **That arm now takes every inner.**
-`nulNicheInnerFaithful` keeps its other reader, the `| null` DECLARATION fold, unchanged: this is a
-gate on which shapes are TRANSPARENT, not on which shape a declaration INTERNS.
+on the inner being a primitive or a litunion, so a declared struct, an inline struct, a list, a map,
+a generic application, a closure, a declared union, a numeric litunion and a nested nullable were
+opaque on BOTH sides. **That arm now takes every inner.**
+
+The `| null` DECLARATION fold's own gate survived this cut for one release and then came off too,
+because the two questions turned out to be ONE question — an inner this arm calls transparent while
+the declaration keeps the two-member union leaves the alias a `collectU` union ROW that no read of
+the value lowers as. The measurement is the section at the end of this chapter.
 
 ### The grid — 1,020 cells, 15 inners, both runtime inputs, the inline spelling as oracle
 
@@ -1633,25 +1638,73 @@ the INLINE spelling on master — which is what "the alias stopped being a diale
 broken in both. `types/nullable-alias-opaque-inner-narrow.vl` and
 `types/nullable-alias-opaque-inner-is-and-return.vl` are split along that line.
 
-### #1427's DECLARATION-fold gate can now be widened, measured but NOT shipped here
+## The declaration fold is ungated, and the render tell is how you check
 
-#1427 gated the `type T = X | null` fold on `nulNicheInnerFaithful` because an ungated fold was 6
-cells down, the largest of them `type T = S | null` plus `v is S`: that RAN on the two-member union
-because the test found its variant ROW, and became `emitProgram: \`is\` receiver is not a union
-value` on the niche, since `collectU` still minted T's row while the param lowered from the arena.
-**That down-cell is gone**, because the transparency arm above now claims the niche, so `collectU`
-SKIPS the alias's row and `v is S` resolves against the declared struct — which is exactly what the
-parenthesized spelling already does (`is` on the alias runs for a struct, list and map inner).
+The `type T = X | null` fold was gated on the inner because an ungated fold measured 6 cells down,
+the largest of them `type T = S | null` plus `v is S`: that RAN on the two-member union because the
+test found its variant ROW, and became `emitProgram: \`is\` receiver is not a union value` on the
+niche, since `collectU` still minted T's row while the param lowered from the arena. **That down-cell
+is gone**, because the transparency arm above claims the niche, so `collectU` SKIPS the alias's row
+and `v is S` resolves against the declared struct.
 
-Measured on the same 1,020-cell grid, with the fold ungated ON TOP of this cut: **226 more cells up**
-(the `X | null` and `(X) | null` columns reach 135/135 in the use grid and 103/120 in the position
-grid, matching the parenthesized spelling exactly), **byte identity across ALL FOUR spellings on
-94/94** buildable use groups, corpus 1805/1805, and **0 moves into a silent class**. The residue is
-4 running programs lost, every one of them landing on the INLINE oracle's own loud verdict rather
-than on a new one: a declared-union inner under a NESTED `!= null` guard (`cannot compare
-{a: i32} | {b: i32} with null` — the inline spelling's message) and a nested-nullable inner under
-`is` (`emitProgram: bare null needs a struct-typed context`, likewise).
+**A RUNTIME PROBE CANNOT TELL YOU WHETHER THE FOLD HAPPENED.** With the transparency arm ungated,
+`type T = Inner | null` under a `!= null` guard RUNS for every inner either way. The cheap tell is
+the RENDER in a diagnostic — `function f(x: T) { return x + 1 }` and read the operator error, with
+the parenthesized declaration and the inline annotation beside it as controls:
 
-So the recommendation is: widen it, in its own slice, with those 4 cells as the thing to argue
-about — they are parity gains and capability losses at the same time, which is the one judgement
-call the grid cannot make.
+| spelling | gated | ungated |
+|---|---|---|
+| `type T = (i32 \| null)` | `i32?` | `i32?` |
+| `type T = i32 \| null` | `i32?` | `i32?` |
+| `type T = {v: i32} \| null` | `{v: i32} \| null` | `{v: i32}?` |
+| `type T = i32[] \| null` | `i32[] \| null` | `i32[]?` |
+| `type T = 1 \| 2 \| null` | `1 \| 2 \| null` | `1 \| 2?` |
+
+Gated, 9 of 15 inners rendered two-variant for the two un-parenthesized spellings and the niche for
+the other two. Ungated, all 15 render the niche for all four spellings.
+
+### The measurement, on the 1,020-cell grid above
+
+Graded on the RUN at both runtime inputs against the ANALYTICALLY-KNOWN stdout (not only against the
+oracle column, so "silently wrong" is a semantic verdict and not a comparison):
+
+| spelling | CORRECT of 255 | parity POS (120) | parity USE (135) | silently wrong |
+|---|---|---|---|---|
+| `(X \| null)` | 211 → 211 | 117 → 117 | 135 → 135 | 0 → 0 |
+| `X \| null` | 135 → **211** | 62 → **117** | 69 → **135** | 0 → 0 |
+| `(X) \| null` | 135 → **211** | 62 → **117** | 69 → **135** | 0 → 0 |
+| INLINE oracle | 214 → 214 | 120 → 120 | 135 → 135 | 0 → 0 |
+
+**+152 correct cells, +242 oracle-parity cells, 0 of 1,020 silently wrong before or after.** The
+parenthesized spelling and the oracle are immobile in all 510 of their cells; both un-parenthesized
+spellings land on the parenthesized one's distribution EXACTLY, inner by inner. Byte identity of the
+emitted module across ALL FOUR spellings: **107/107** buildable use groups and **102/104** buildable
+position groups, the two outliers being oracle-vs-parenthesized differences that predate this.
+
+### The residue, and why the numeric litunion is NOT gated back out
+
+**18 cells lose a running program, every one of them the NUMERIC LITUNION inner** (9 axes × 2
+spellings), and every one lands on the INLINE spelling's own verdict message for message:
+`emitProgram: bare null needs a struct-typed context` at 8 axes, `emitProgram: \`is\` names a type
+that is not a union variant` at the `is` axis. A numeric-litunion NICHE carries 6 of 17 axes where
+the two-member union carried 15, so folding it is a pure loss ON THAT INNER.
+
+Gating it back out was measured rather than argued, and it is the WORSE trade: **220 correct against
+the parenthesized spelling's 211, bought with parity 115/120 and 127/135** — a PARENTHESIZATION
+DIALECT in 10 of that inner's 17 axes. `type T = (KN | null)` is already `KN?` on the transparency
+arm, so an inner gate on the declaration can only make the two declaration spellings disagree, which
+is the defect the fold exists to close. **The open defect is the emitter's numeric-litunion niche**
+(`1 | 2 | null` inline is 6 of 17 on master), loud at every reach, and it is the inline spelling's
+hole first.
+
+**A further 18 cells move from a loud check reject onto the inline spelling's own
+check-clean-invalid-wasm hole** — a nested-nullable inner at six positions (`type mismatch: expected
+(ref null $type), found i32`) and a list / map / closure inner passed onward to a non-null parameter
+(`type mismatch: expected (ref $type), found (ref null $type)`) — reaching the identical function,
+byte offset and validator message as the alias-free twin. Loud, never a wrong answer.
+
+**0 moves into either silent class.** Corpus 1807/1807 with 7 ignored; the native `// @run` sweep is
+1450 PASS of 1452, the two non-PASS being the soundness files that mention `// @run` in prose.
+
+`types/nullable-alias-unparenthesized-structural-inner.vl` and
+`types/nullable-alias-map-inner-unparenthesized.vl` are the pins, both reddening on a log mismatch.
