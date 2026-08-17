@@ -6404,10 +6404,11 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     // the checker's adoption, which `anonFieldCode` reports as that slot's own code.
     // `boolean | null` (21) is an i32 sentinel niche a BOOLEAN value fills — an integer
     // one collides with the sentinel, which is the silent read above.
-    // (`isBoolLitExpr` — `anonFieldCode` folds booleans and integers onto one code
-    // because both are i32 slots, so the niche test needs the distinction it erased.)
+    // (`isBoolLitExpr` — the code folds booleans and integers together, so the niche
+    // test has to ask the node for the distinction the code erased.)
     if sc == 21 { return isBoolLitExpr(valIx) }
-    if sc == 30 { return true } // `K | null` — the i32 atom niche, spare value -1
+    // `K | null` — the i32 atom niche, spare value -1.
+    if sc == 30 { return true }
     return false
   }
   if vc == 3 {
@@ -6416,16 +6417,22 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     // string literal is exactly how such a field is written (`{ v: "a" }` for
     // `v: "a" | "b"`), so that one stays lenient.
     if sc == 0 { return sFieldElemNameAt(si, mfi) != "" }
-    if sc == 20 { return true } // `string | null` — the same ref, nullable
-    if sc == 30 { return true } // `K | null` — a string literal names the atom
+    // `string | null` (the same ref, nullable) and `K | null` (a string literal names
+    // the atom) are the two niches a string value fills.
+    if sc == 20 { return true }
+    if sc == 30 { return true }
     return false
   }
-  if vc == 4 { return sc == 18 }  // an i32 list into `i32[] | null`
-  if vc == 14 { return sc == 22 } // a closure into `((…) => …) | null`
-  if vc == 24 { return sc == 17 } // an f32 value into the wider f64 slot
-  if vc == 25 { return sc == 32 } // an f64 list into `f64[] | null`
-  if vc == 26 { return sc == 33 } // an i64 list into `i64[] | null`
-  if vc == 15 { return false }    // a nested struct ref: code 15 or the box above
+  // The remaining value codes each widen into exactly one nullable spelling of their
+  // own backing: `i32[] | null`, `((…) => …) | null`, the wider f64 slot for an f32
+  // value, `f64[] | null`, `i64[] | null`. A nested struct ref (15) has only code 15
+  // and the box above.
+  if vc == 4 { return sc == 18 }
+  if vc == 14 { return sc == 22 }
+  if vc == 24 { return sc == 17 }
+  if vc == 25 { return sc == 32 }
+  if vc == 26 { return sc == 33 }
+  if vc == 15 { return false }
   true
 }
 
@@ -12979,6 +12986,23 @@ export function mvCanonRepOf(slot: i32): i32 {
   slot
 }
 
+// True if a `+` expression has a string LITERAL anywhere in its chain — the syntactic
+// concat test `anonFieldCode` can run, standing where `exprIsStrConcat` cannot: a field
+// value is classified during `collectS`, before the locals a typed operand test reads
+// exist, so there is no `fnIx` to ask. Whole chain, because `+` associates left and a
+// concat's outermost operands are then a BinExpr and whatever the last operand is.
+function plusChainHasStrLit(ix: i32) {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is StrLit { return true }
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if plusChainHasStrLit(e.binLeft) { return true }
+      return plusChainHasStrLit(e.binRight)
+    }
+  }
+  false
+}
+
 // The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
 // (an anonymous literal has no `type` annotation to read): a number/boolean is i32
 // (`0`), a string literal is a string ref (`3`), a function VALUE is a closure
@@ -13028,13 +13052,12 @@ export function anonFieldCode(valIx: i32) {
     const bop = e.binOp
     if bop == "-" || bop == "*" || bop == "/" || bop == "%" { return 0 }
     if bop == "+" {
-      const bl = P.nodes[unwrapParen(e.binLeft)]
-      const br = P.nodes[unwrapParen(e.binRight)]
-      let strSide = false
-      if bl is StrLit { strSide = true }
-      if br is StrLit { strSide = true }
-      if !strSide { return 0 }
-      return -1
+      // WHOLE CHAIN, not one level: `"a" + f(x) + g(y)` associates left, so its
+      // OUTERMOST `+` has a BinExpr on the left and a Call on the right and neither
+      // operand is a string LITERAL. Reading that as arithmetic coded the field i32 and
+      // then stored a string ref into it.
+      if plusChainHasStrLit(valIx) { return -1 }
+      return 0
     }
     return -1
   }
