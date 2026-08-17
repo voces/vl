@@ -9092,29 +9092,101 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       if mt is TyObj {
         if isPlainAliasRef(name) { return m0 }
       }
-      // D-ALIASLU: a LITERAL-UNION member (`type A = K`, and the `new` form
-      // `type NK = new K`, plus the parenthesized inline `type A = ("a" | "b")`).
-      // The degenerate wrapper once more, and the LAST rep whose alias spelling was
-      // a dialect of its own: a litunion reps as an interned i32 ATOM, so the union
-      // ROW this alias minted made `isUName` claim every `A`-annotated slot for the
-      // `{tag, anyref}` BOX while every READ classified from the arena and lowered
-      // the atom — `call __print_i32__` on a `(ref $box)`, i.e. INVALID WASM with
-      // `vl check` rc 0, at every position and for every use.
+      // D-ALIASLU: a UNION member (`type A = K` over a litunion, `type A = U` over a
+      // declared value union, and the `new` form of either — `type NK = new K`). The
+      // degenerate wrapper once more, and for a litunion it was the LAST rep whose
+      // alias spelling was a dialect of its own: a litunion reps as an interned i32
+      // ATOM, so the union ROW this alias minted made `isUName` claim every
+      // `A`-annotated slot for the `{tag, anyref}` BOX while every READ classified
+      // from the arena and lowered the atom — `call __print_i32__` on a `(ref $box)`,
+      // i.e. INVALID WASM with `vl check` rc 0, at every position and for every use.
       //
-      // The gate is `tyIsLitUnion` — the STRING litunion, the one whose emit
-      // vocabulary is name-faithful (`transparentMemberEmitName` renders the
-      // registered ALIAS, and an un-aliased inline set renders exactly what canon's
-      // own `litUnionPreserve` spells at that position). A NUMERIC litunion is
-      // excluded because its alias name is NOT its emit name — `numLitUnionAliasName`
-      // rewrites `type Z = 0 | 1` to the base scalar `i32`, and that arm sits BELOW
-      // the transparent one in `canonEmitNameTs`, so claiming the member here would
-      // shadow it. A VALUE union (`type A = i32 | string`) is excluded for the
-      // `Cat[]` reason: the emitter DOES have a nominal route for a union name
-      // (`unNames`), and the structural render drops it.
-      if tyIsLitUnion(m0) { return m0 }
+      // TWO GATES, which are `transparentMemberEmitName`'s two legs read backwards:
+      //   - a DECLARED union renders as its own NAME, so nothing nominal is dropped
+      //     and the render is what canon leaves the direct spelling as. This includes
+      //     a NUMERIC litunion, whose nominal leg declines ON PURPOSE so that both
+      //     spellings get `numLitUnionAliasName`'s base scalar (`type Z = 0 | 1` is
+      //     `i32` to the emitter, never `Z`).
+      //   - an INLINE union has no declared name to drop, but its MEMBERS may — see
+      //     `unionAliasMembersFaithful`, which is #1137's `Cat[]` caution landing on
+      //     the one member kind that really does have it.
+      if unionAliasDeclNameOfTy(m0) != "" { return m0 }
+      if unionAliasMembersFaithful(m0) { return m0 }
+      // D-ALIASNUL: a NULLABLE member — `type A = (K | null)`, `type A = (string | null)`,
+      // and the un-parenthesized `type A = K | null`, which interns as the SAME
+      // one-member wrapper over a `TyNullable` (the `null` arm is normalized into the
+      // niche, not kept as a sibling variant). Same defect, same witness: the alias's
+      // union ROW claimed the slot for the box while the read lowered the niche.
+      //
+      // Gated on the INNER, exactly as the array arm is gated on its ELEMENT — see
+      // `nulAliasMemberFaithful`.
+      if nulAliasMemberFaithful(m0) { return m0 }
     }
   }
   -1
+}
+
+// True when the emit render of UN-NAMED UNION type `ty` is NAME-FAITHFUL — the union
+// analogue of `arrSpineIsScalar`, and likewise a property of the MEMBERS rather than of
+// the wrapper. `tyToEmitNameGo`'s union arm re-renders every member, so the render
+// substitutes for the alias exactly when each member's own render is name-faithful: a
+// `TyLit` renders as its base scalar (or, for a run matching a registered alias, as that
+// litunion ALIAS) and a `TyPrim` as its own `primName`. So `("a" | "b")` and `(K | f64)`
+// qualify, and `(i32 | string)` does too.
+//
+// A DECLARED STRUCT member is the exception #1137's `Cat[]` caution predicted, and it is
+// MEASURED here rather than reasoned: with this gate absent, a one-member alias over
+// `(Cat | Dog)` renders `{n:i32}|{m:i32}`, the variant names `emitIs` dispatches on are
+// dropped, and `x is Cat` becomes `emitProgram: \`is\` receiver is not a union` — at the
+// module cell and inside a function alike, where the alias-free spelling runs. The
+// DECLARED union of the same structs is unaffected: it is claimed by the nominal leg
+// above and renders as its name.
+function unionAliasMembersFaithful(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    if ms.length < 1 { return false }
+    let i = 0
+    while i < ms.length {
+      const mt = T.tys[ms[i]]
+      let ok = false
+      if mt is TyLit { ok = true }
+      if mt is TyPrim { ok = true }
+      // A LITUNION member of a MIXED union (`(K | f64)`, where the arena keeps `K` as a
+      // nested union rather than flattening it) is rendered by its ALIAS on the union arm
+      // (`litUnionAliasNameOfTy(members[i])`, and the `rgAlias` regroup for the flattened
+      // shape) — so it is faithful for exactly the reason a `TyLit` is.
+      if tyIsLitUnion(ms[i]) { ok = true }
+      if !ok { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// True when the emit render of NULLABLE type `ty` is NAME-FAITHFUL — the nullable
+// analogue of `arrSpineIsScalar`, and likewise a property of the INNER rather than of
+// the wrapper. Two populations, both of which `tyToEmitNameGo`'s `TyNullable` arm
+// spells position-free:
+//   - the LITUNION niche (`K | null`, `"a" | "b" | null`), which that arm preserves as
+//     the alias (or the member set) plus the `null` arm;
+//   - a PRIMITIVE inner (`string | null`, `i32 | null`, `boolean | null`), which
+//     renders as its own `primName`.
+// Every other inner — a declared struct, a generic application, a declared union, a
+// map, an array, a closure — is rendered STRUCTURALLY under the `| null`, so the
+// declared name the emitter's tables key on would be dropped and the member has to
+// stay opaque.
+function nulAliasMemberFaithful(ty: i32) {
+  if ty < 0 { return false }
+  if tyIsNullableLitUnion(ty) { return true }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const it = T.tys[t.nInner]
+    if it is TyPrim { return true }
+  }
+  false
 }
 
 // True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a primitive — the
@@ -9299,19 +9371,29 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
       return gan
     }
   }
-  // A LITUNION member that is a REGISTERED ALIAS renders as that alias, at EVERY
-  // position — the same nominal-first rule the object arm above applies, and the one
-  // that makes `type A = K` spell byte-identically to `K`. It cannot be left to the
-  // structural render below: `tyToEmitNameGo`'s litunion leg is `ctxKeepsLitUnion`-gated,
-  // so at `RC_ROOT` / `RC_FN_PARAM` it softens to `string` while the ALIAS spelling
-  // canon leaves untouched stays `K` — one type, two names, and the atom/string rep
-  // split that follows. The gate belongs to the INLINE member list (a name the emitter
-  // has no root/param ladder arm for), never to an alias identifier.
-  const lal = litUnionAliasNameOfTy(smt)
-  if lal != "" {
-    // An alias name is ONE identifier — one atom, as on the two arms above.
-    emitNameAtoms = 1
-    return lal
+  // A DECLARED UNION member renders as its own ALIAS NAME, at EVERY position — the
+  // same nominal-first rule the object arm above applies, and the one that makes
+  // `type A = K` spell byte-identically to `K`. It cannot be left to the structural
+  // render below, for the same reason the object arm cannot: that render drops the
+  // declared name the emitter's tables key on. For a LITUNION the loss is a
+  // position-dependent one — `tyToEmitNameGo`'s litunion leg is
+  // `ctxKeepsLitUnion`-gated, so at `RC_ROOT` / `RC_FN_PARAM` it softens to `string`
+  // while the ALIAS spelling canon leaves untouched stays `K`: one type, two names,
+  // and the atom/string rep split that follows. That gate belongs to the INLINE member
+  // list (a name the emitter has no root/param ladder arm for), never to an identifier.
+  //
+  // A NUMERIC litunion alias is DELIBERATELY NOT NOMINAL, and the guard is the one
+  // home that owns the rule: `numLitUnionAliasName` rewrites `type Z = 0 | 1` to its
+  // BASE SCALAR, so `Z` is not the emitter's name for it and the structural render
+  // (`i32`, via `tyLitBaseName`) is. Rendering the alias here would spell a union name
+  // for a plain i32 slot — the very shape this arm exists to remove.
+  const uan = unionAliasDeclNameOfTy(smt)
+  if uan != "" {
+    if numLitUnionAliasName(uan) == "" {
+      // An alias name is ONE identifier — one atom, as on the two arms above.
+      emitNameAtoms = 1
+      return uan
+    }
   }
   tyToEmitNameAt(smt, ctx)
 }
@@ -20995,6 +21077,21 @@ export function isValueUnionName(name: string) {
 // are compatible. A syntactic LITERAL on the un-branded side adopts, so only a
 // branded operand meeting a base-typed or differently-branded VALUE reports.
 function nomBinMixes(lt: i32, rt: i32, lx: i32, rx: i32) {
+  // A `null` OPERAND AGAINST NULLABLE STORAGE IS NOT A BRAND MIX. `null` carries no
+  // brand and adopts none, and a null test asks about the STORAGE — which for a
+  // newtype over a nullable (`type T1 = new (string | null)`, `new (K | null)`)
+  // genuinely admits it. This was the ONE shape a brand made unwritable: `v != null`
+  // read `cannot compare T1 and null`, so such a value could be neither tested nor
+  // narrowed, and there is no other spelling of the test.
+  //
+  // GATED ON `tyAdmitsNull`, and the gate is load-bearing rather than defensive. This
+  // predicate is read TWICE — here, and as the `nomEqLit` escape in the equality arm —
+  // so answering "not a mix" for a NON-nullable brand does not merely soften this
+  // message, it suppresses the general `cannot compare … with null` reject too:
+  // `type Id = new i32` + `if v != null` walked past the checker and became an
+  // `emitProgram: bare null needs a struct-typed context` emit reject instead.
+  if isNullTy(lt) && tyAdmitsNull(rt) { return false }
+  if isNullTy(rt) && tyAdmitsNull(lt) { return false }
   const ln = nomNameOfTy(lt)
   const rn = nomNameOfTy(rt)
   if ln == rn { return false }
