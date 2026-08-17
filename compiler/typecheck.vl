@@ -298,6 +298,11 @@ import {
   tyTopLevelSplit,
   unionMemberCount,
 } from "./tyname"
+// The generic AST child walker. Shared with the lint pass rather than duplicated:
+// the write-effect summary behind the aliased-write invalidation needs the same
+// total traversal the lint rules do, and a second copy is a second thing to keep in
+// step with the node roster.
+import { nodeChildren } from "./lint"
 
 // ── Type-arena variants ──────────────────────────────────────────────────────
 // One struct per type KIND, prefixed field names so `is` discriminates the union
@@ -713,8 +718,25 @@ let pendDepths: i32[] = []
 // branch body is checked, plus per-scope frame marks so `popScope` unwinds the
 // entries pushed inside that scope. Bare-NAME narrowings keep riding the scope
 // chain (a shadowing `declare`); only dotted paths land here.
+//
+// `npInvBy` is the INVALIDATION side table, one slot per entry: the arena index of
+// the call that may have written the path's field through an alias, or -1 while the
+// narrowing is still in force. A narrowing over a property path is a fact about
+// HEAP state, so unlike a bare local it can be falsified by a write the guarded
+// scope never spells — `clr(o)` where `clr` assigns `o.v = null` left `o.v` narrowed
+// and both the checker and the emitter believed it (a trap for a ref rep, a printed
+// `null` for a boxed one). `callWritesPlace` decides, per call, which entries stop
+// being in force.
+//
+// INVALIDATION IS WRITTEN IN PLACE, NOT PUSHED. A shadowing push would unwind at
+// the end of whatever inner block held the call, resurrecting the narrowing for the
+// statements after it — `if o.v != null { if c { clr(o) } print(o.v.length) }` must
+// stay rejected, because the write MAY have happened. Overwriting the entry the
+// guard pushed keeps the invalidation alive exactly as long as the narrowing it
+// kills, and `popScope` retires both together.
 let npKeys: string[] = []
 let npTys: i32[] = []
+let npInvBy: i32[] = []
 let npFrames: i32[] = []
 
 // CYCLE GUARD stacks for `assignable` over recursive named types (A11): a
@@ -2413,7 +2435,11 @@ export function initChecker() {
   pendDepths = []
   npKeys = []
   npTys = []
+  npInvBy = []
   npFrames = []
+  weKeys = []
+  weVals = []
+  weOpen = []
   asgSrcStack = []
   asgDstStack = []
   tyToStrDepth = 0
@@ -2708,14 +2734,358 @@ function placeKeyOf(ix: i32) {
   ""
 }
 
-// The innermost narrowed-path overlay entry for `key`, or -1 (not narrowed).
+// The innermost narrowed-path overlay entry for `key`, or -1 — which now means
+// EITHER "never narrowed" OR "narrowed and since invalidated by an aliasing write".
+// One function answers "is this narrowing in force", so the two readers that matter
+// — the member/optional-member read arms and `placeCurTy`'s fact collection — cannot
+// disagree. Fact collection wants exactly this reading too: after `clr(o)` a fresh
+// `if o.v != null` must re-derive the narrowing from the DECLARED field type, not
+// from the stale non-null one.
 function narrowedPathTy(key: string) {
   let i = npKeys.length - 1
   while i >= 0 {
-    if npKeys[i] == key { return npTys[i] }
+    if npKeys[i] == key {
+      if npInvBy[i] >= 0 { return -1 }
+      return npTys[i]
+    }
     i = i - 1
   }
   -1
+}
+
+// The call that invalidated the innermost narrowing of `key`, or -1 when `key` is
+// narrowed-and-in-force or was never narrowed. The two states `narrowedPathTy`
+// folds into -1 are told apart here, and only for the diagnostic: an unguarded
+// nullable read keeps its existing message, an invalidated one names the call.
+function narrowedPathInvBy(key: string) {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if npKeys[i] == key { return npInvBy[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether `s` begins with `pfx`. (The slice is bound before it is compared: a bare
+// member call in TAIL position is not a lowerable statement — see format.vl's note.)
+function keyHasPrefix(s: string, pfx: string) {
+  if pfx.length > s.length { return false }
+  const head = s.slice(0, pfx.length)
+  head == pfx
+}
+
+// The sub-path of the place at `ix` below root name `root` — `o.v` under `o` is
+// `"v"`, `o.a.v` under `o` is `"a.v"`. `""` when the place is not rooted at `root`,
+// is `root` itself (rebinding the parameter is not a field write), or is not a
+// keyable place at all (an index target keys nothing, and no narrowing key can name
+// one either, so the two sides stay consistent).
+function placeSubPath(ix: i32, root: string) {
+  const k = placeKeyOf(ix)
+  if k == "" || k == root { return "" }
+  const pfx = root + "."
+  if !keyHasPrefix(k, pfx) { return "" }
+  const sub = k.slice(pfx.length, k.length)
+  sub
+}
+
+// WRITE-EFFECT SUMMARIES for the effect-based invalidation rule, keyed
+// `"<fn-node-ix>#<param-ix>"`. A value is either the OPAQUE token `"*"` — assume the
+// callee writes everything reachable through that parameter — or a `,`-TERMINATED
+// list of the field sub-paths it may write (`"v,a.v,"`). Keyed by the callee's arena
+// index rather than its name, so two nested functions sharing a name (which capture
+// analysis is already name-confused about) cannot share a summary.
+//
+// `weOpen` is the in-progress stack. A recursive cycle answers `"*"`, not "writes
+// nothing": a summary that guesses must guess CLOSED, and a one-pass walk has no
+// fixpoint to fall back on.
+let weKeys: string[] = []
+let weVals: string[] = []
+let weOpen: string[] = []
+
+// Set to make every statically-known callee answer OPAQUE — the BROAD rule ("any
+// call receiving the object invalidates every narrowing rooted at it"), kept as one
+// switch so the two candidate rules are one code path and one measurement harness.
+// The effect-based rule is what ships; see docs/internals/open-rulings.md.
+const ALIAS_RULE_BROAD = false
+
+// Split a `,`-terminated effect summary into its sub-paths.
+function weSplit(s: string) {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    if s[i] == ',' {
+      if i > start { out.push(s.slice(start, i)) }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The write-effect summary of parameter `paramIx` of the `FuncDecl` at `fnIx`.
+function fnWriteEffects(fnIx: i32, paramIx: i32) {
+  const key = i32ToStr(fnIx) + "#" + i32ToStr(paramIx)
+  let ci = 0
+  while ci < weKeys.length {
+    if weKeys[ci] == key { return weVals[ci] }
+    ci = ci + 1
+  }
+  let oi = 0
+  while oi < weOpen.length {
+    if weOpen[oi] == key { return "*" } // recursive cycle → fail closed
+    oi = oi + 1
+  }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    const ps = fd.fnParams
+    if paramIx >= 0 && paramIx < ps.length {
+      const p = P.nodes[ps[paramIx]]
+      if p is Param {
+        weOpen.push(key)
+        const acc = weScan(fd.fnBody, p.parName)
+        weOpen.pop()
+        weKeys.push(key)
+        weVals.push(acc)
+        return acc
+      }
+    }
+  }
+  "*"
+}
+
+// Accumulate the field sub-paths a subtree may write through the parameter named
+// `pname`, or `"*"` for opaque. Three things make it opaque, each a construct whose
+// later effect this walk cannot bound:
+//   * the parameter ESCAPES — stored into a field, an element, or returned. Whoever
+//     holds it afterwards can write any field through it.
+//   * it reaches an INDIRECT call (a function-typed value, a struct field holding a
+//     function, a first-class callee) whose target is not statically one `FuncDecl`.
+//   * it reaches a call whose declaration cannot be resolved at all.
+// Nested `FuncDecl`s ARE descended: a capturing inner function writing `pname.v` is
+// a write through the parameter. An inner function that shadows `pname` with its own
+// binding of the same name over-approximates, which is the safe direction.
+function weScan(ix: i32, pname: string) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  let acc = ""
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const sub = placeSubPath(n.binLeft, pname)
+      if sub != "" { acc = acc + sub + "," }
+      // the parameter itself stored into the heap — it escapes
+      if placeKeyOf(n.binRight) == pname { return "*" }
+    }
+  } else if n is RetStmt {
+    if n.retArg >= 0 {
+      if placeKeyOf(n.retArg) == pname { return "*" }
+    }
+  } else if n is Call {
+    const inner = callEffectsOn(ix, pname)
+    if inner == "*" { return "*" }
+    acc = acc + inner
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    const sub = weScan(kids[i], pname)
+    if sub == "*" { return "*" }
+    acc = acc + sub
+    i = i + 1
+  }
+  acc
+}
+
+// The field sub-paths a CALL inside a callee body may write through `pname`, by
+// composing the nested callee's own summary: passing `pname.a` where the nested
+// callee writes `v` through that parameter is a write of `a.v` here.
+function callEffectsOn(callIx: i32, pname: string) {
+  const cn = P.nodes[callIx]
+  if cn is Call { return callEffectsOnReal(cn, pname) }
+  ""
+}
+
+function callEffectsOnReal(cn: Call, pname: string) {
+  const declIx = callDeclFnIx(cn)
+  // An intrinsic cannot write a field of anything handed to it, so a body whose only
+  // use of the parameter is `print(p.v)` has NO write effect. Distinguishing this from
+  // the opaque `-1` is what keeps a read-only callee from invalidating its caller's
+  // narrowings — the false positive that decides whether the rule is usable at all.
+  if declIx == -2 { return "" }
+  const args = callArgPlaces(cn)
+  let acc = ""
+  let i = 0
+  while i < args.length {
+    const ak = placeKeyOf(args[i])
+    let rooted = ak == pname
+    let below = ""
+    if !rooted {
+      const s = placeSubPath(args[i], pname)
+      if s != "" {
+        rooted = true
+        below = s + "."
+      }
+    }
+    if rooted {
+      if declIx < 0 { return "*" } // indirect / unresolvable callee
+      const sum = fnWriteEffects(declIx, i)
+      if sum == "*" { return "*" }
+      const parts = weSplit(sum)
+      let j = 0
+      while j < parts.length {
+        acc = acc + below + parts[j] + ","
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  acc
+}
+
+// A call's argument places in CALLEE-PARAMETER order. A UFCS/method callee
+// (`o.m(a)`) puts the receiver at parameter 0, which is how `m(o, a)` declares it;
+// every other shape is the written argument list.
+function callArgPlaces(cn: Call) {
+  const out: i32[] = []
+  const cf = P.nodes[cn.callFn]
+  if cf is Member {
+    if lookupFnDeclNode(cf.memProp) >= 0 { out.push(cf.memObj) }
+  }
+  let i = 0
+  while i < cn.callArgs.length {
+    out.push(cn.callArgs[i])
+    i = i + 1
+  }
+  out
+}
+
+// The `FuncDecl` arena index a call resolves to STATICALLY, or -1 for a callee this
+// analysis must treat as opaque. `-2` marks a callee that cannot write an object
+// field at all — a builtin (`print`, a string/array/map method), which is neither a
+// declared function nor a function-typed binding in scope.
+function callDeclFnIx(cn: Call) {
+  const cf = P.nodes[cn.callFn]
+  if cf is Ident {
+    const d = lookupFnDeclNode(cf.identName)
+    if d >= 0 { return d }
+    if lookup(cf.identName) >= 0 { return -1 } // a function VALUE: target unknown
+    return -2 // an intrinsic named by a bare identifier
+  }
+  if cf is Member {
+    const d = lookupFnDeclNode(cf.memProp)
+    if d >= 0 { return d }
+    return -1 // a struct field holding a function, or a builtin method
+  }
+  -1
+}
+
+// THE ONE PLACE that decides whether the call at `callIx` invalidates the path
+// narrowing keyed `key`. Everything else about aliased writes is bookkeeping around
+// this answer.
+//
+// The rule is EFFECT-BASED: `key` dies only when some argument place `ak` of the call
+// is a prefix of `key` AND the callee may write, through that parameter, a sub-path
+// that is a prefix of the rest of `key`. Writing `o.a` kills `o.a.v` (the sub-object
+// is replaced), writing `o.w` leaves `o.v` alone, and a callee that only READS keeps
+// every narrowing — which is what makes the rule usable rather than merely sound.
+//
+// It fails CLOSED at every edge: an unresolvable or first-class callee, a recursive
+// cycle, and a parameter that escapes all answer "writes everything".
+//
+// THE HOLE IT DOES NOT CLOSE, stated so the next reader does not read the rule as
+// total: invalidation is keyed on the SYNTACTIC argument. `const p = o` then `clr(p)`
+// leaves a narrowing on `o.v` in force, because nothing connects the two names. That
+// is an aliasing question this checker has no machinery for; the measured grid marks
+// the cell, and closing it needs a may-alias relation, not a wider write rule.
+function callInvalidatesNarrowedPath(callIx: i32, key: string) {
+  const cn = P.nodes[callIx]
+  if cn is Call { return callInvalidatesReal(cn, key) }
+  false
+}
+
+function callInvalidatesReal(cn: Call, key: string) {
+  const declIx = callDeclFnIx(cn)
+  if declIx == -2 { return false } // an intrinsic writes no object field
+  const args = callArgPlaces(cn)
+  let i = 0
+  while i < args.length {
+    const ak = placeKeyOf(args[i])
+    if ak != "" {
+      if key == ak { return true }
+      const pfx = ak + "."
+      if keyHasPrefix(key, pfx) {
+        if declIx < 0 || ALIAS_RULE_BROAD { return true }
+        const sum = fnWriteEffects(declIx, i)
+        if sum == "*" { return true }
+        const rest = key.slice(pfx.length, key.length)
+        const parts = weSplit(sum)
+        let j = 0
+        while j < parts.length {
+          const w = parts[j]
+          if rest == w || keyHasPrefix(rest, w + ".") { return true }
+          j = j + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Mark every live narrowing the call at `callIx` invalidates. Runs AFTER the call's
+// own arguments are checked, so `f(o.v.length, o)` still reads `o.v` under the
+// narrowing that held when the argument was evaluated.
+function noteCallInvalidations(callIx: i32) {
+  if npKeys.length == 0 { return 0 }
+  let i = 0
+  while i < npKeys.length {
+    if npInvBy[i] < 0 {
+      if callInvalidatesNarrowedPath(callIx, npKeys[i]) { npInvBy[i] = callIx }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The source line of a node, or 0 when it has no anchor token.
+function nodeLineOf(at: i32) {
+  if at >= 0 && at < nodeToks.length {
+    const tk = nodeToks[at]
+    if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
+  }
+  0
+}
+
+// The callee's written name, for the diagnostic. `"?"` when the callee is neither a
+// bare name nor a member access (a parenthesised or computed callee).
+function calleeNameOf(callIx: i32) {
+  const cn = P.nodes[callIx]
+  if cn is Call {
+    const cf = P.nodes[cn.callFn]
+    if cf is Ident { return cf.identName }
+    if cf is Member { return cf.memProp }
+  }
+  "?"
+}
+
+// The diagnostic for reading a path whose narrowing an aliasing write retired. It
+// names the CALL, not merely the nullness, because the call is what the reader has to
+// act on — the guard above is correct and the read below is correct, and only their
+// separation by that call is wrong.
+function pathInvalidatedErr(key: string, callIx: i32, at: i32) {
+  tErr(
+    "'" +
+      key +
+      "' was narrowed by a guard, but the call to '" +
+      calleeNameOf(callIx) +
+      "' on line " +
+      i32ToStr(nodeLineOf(callIx)) +
+      " can write it — re-test '" +
+      key +
+      "' after the call",
+    at,
+  )
+  TY_ERR
 }
 
 // The node index of the place compared against `null` in a `x == null` /
@@ -3622,6 +3992,7 @@ function applyNarrows(names: string[], tys: i32[]) {
     if isPathKey(names[i]) {
       npKeys.push(names[i])
       npTys.push(tys[i])
+      npInvBy.push(-1)
     } else {
       declare(names[i], tys[i])
     }
@@ -3726,6 +4097,7 @@ function popScope() {
     while npKeys.length > base {
       npKeys.pop()
       npTys.pop()
+      npInvBy.pop()
     }
   }
   if pgFrames.length > 0 {
@@ -17151,7 +17523,12 @@ function checkNodeReal(ix: i32) {
   } else if n is BinExpr {
     return checkBinExprNode(n, ix)
   } else if n is Call {
-    return checkCallNode(n, ix)
+    const callTy = checkCallNode(n, ix)
+    // A call is where a path narrowing can be falsified by a write the guarded
+    // scope never spells. Asked AFTER the arguments are checked so the call's own
+    // operands still read under the narrowing that held when they were evaluated.
+    noteCallInvalidations(ix)
+    return callTy
     // ── member access ───────────────────────────────────────────────────────────
   } else if n is Member {
     return checkMemberNode(n, ix)
@@ -23538,6 +23915,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
             if isPathKey(gKey) {
               npKeys.push(gKey)
               npTys.push(gTy)
+              npInvBy.push(-1)
             } else if gTy == nonNullTy(lookup(gKey)) {
               declare(gKey, gTy)
             } else {
@@ -23683,6 +24061,8 @@ function checkMemberNode(n: Member, ix: i32) {
   if mKey != "" {
     const mOv = narrowedPathTy(mKey)
     if mOv >= 0 { return symMem(ix, mOv) }
+    const mInv = narrowedPathInvBy(mKey)
+    if mInv >= 0 { return pathInvalidatedErr(mKey, mInv, ix) }
   }
   const objTy = checkNode(n.memObj)
   // A NEGATIVE receiver type is an unpinned inference hole (the `-1` element
@@ -24034,6 +24414,8 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
   if omKey != "" {
     const omOv = narrowedPathTy(omKey)
     if omOv >= 0 { return symMem(ix, omOv) }
+    const omInv = narrowedPathInvBy(omKey)
+    if omInv >= 0 { return pathInvalidatedErr(omKey, omInv, ix) }
   }
   const recv = checkNode(n.omObj)
   // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
