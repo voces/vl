@@ -595,3 +595,59 @@ Two other queued rows are **correct behaviour, not defects**, and should not be 
 is in flight to produce `docs/internals/silent-class-inventory.md`, a ranked inventory of what is
 actually live on the tip, each entry carrying a minimal repro AND a working control, plus an
 explicit not-a-defect section so no future agent is spent on a closed row.
+
+## Compile-time cost of #1443 and #1444 — measured (2026-08-17)
+
+Both PRs shipped with an unmeasured hot-path addition and said so. I measured them myself while
+GitHub was down, on a 7-point compiler series (`#1439` → `#1444`, saved wasm artefacts), timing
+identical inputs with a **discarded warm-up rep and 9 interleaved reps**.
+
+**Startup was isolated first and ruled out as a confound**: a trivial 2-line program costs **5.0 ms
+on all three** compilers, despite #1444's wasm being **9,059 bytes larger**. So every delta below is
+analysis, not instantiate.
+
+### #1443 — negligible
+
+Stress input: 3,000 numeric-litunion types with 3,000 `is`-narrowed reads (6,002 lines), which is
+what its `tyKindOf` / `narrowedValueAtomOf` arena walks are gated on.
+
+| | analysis | min–max |
+|---|---|---|
+| #1442 (before) | 182.0 ms | 174–235 |
+| #1443 | 184.0 ms | 176–208 |
+
+**+2.0 ms (+1.1%), or +0.67 µs per construct, with overlapping ranges.** No action.
+
+Note the whole-compiler workload could *not* have found this: #1443's own agent observed that
+`compiler/*.vl` declares **no numeric literal union anywhere**, so the gated walk is never entered.
+**A null result on a workload that does not exercise the addition is not evidence** — the stress
+input had to be constructed.
+
+### #1444 — real, and QUADRATIC
+
+Stress input: n guarded property paths (`if o.v != null { rd_i(o) … }`) against n in-scope callees.
+
+| guards | #1443 | #1444 | delta | per guard | delta ratio |
+|---|---|---|---|---|---|
+| 750 | 25 ms | 40 ms | +15 ms | 20.0 µs | — |
+| 1,500 | 56 ms | 117 ms | **+61 ms** | 40.7 µs | **4.07x** |
+| 3,000 | 102 ms | 329 ms | **+227 ms** | 75.7 µs | **3.72x** |
+
+A 2x input increase multiplies the delta by ~4x, and the **per-guard** cost itself doubles each
+step. Linear would be 2x. **This is O(n²)** in the number of guarded property paths, and the
+min/max ranges do not overlap at any size (e.g. 59–66 vs 115–126 ms at n=1,500), so it is not noise.
+
+The mechanism matches what #1444's own report flagged and declined to profile: **`findFnDeclIn` is
+an uncached subtree walk per unresolved callee**, invoked per (live narrowing × call). Its report
+called it *"correct and bounded by body size"* — true of one call, but the **call count** is what
+scales, and that is the half that was not measured.
+
+**Why the whole-compiler run missed it, and why this is not urgent:** on `compiler/entry.vl`
+(110k lines) #1444 measured **faster** than #1443 (0.714 s vs 0.757 s median), because the
+`npKeys.length == 0` early-out means only **property-path** guards pay — bare-name narrowings create
+no overlay entry — and real code has few. Absolute cost is still small at n=3,000.
+
+**Filed as the top compile-time item.** The fix is cheap and well-understood: memoise `findFnDeclIn`
+by callee name, or build a name→declaration map once per module instead of walking per query. Not
+started — three agents are live and one is in `typecheck.vl` territory, so this waits for a free
+slot rather than risking a conflict.
