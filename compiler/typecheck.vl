@@ -1222,12 +1222,41 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
   addTy(t)
 }
 
-// THE ONE HOME of "which key types does a `Map`/`Set` support" — `string` (hashed
-// element-wise, `__str_hash__`) and `i32` (hashed by the integer mix). Both annotation
-// gates (`tsToTy`'s `TS_MAP`, `nameToTyReal`'s map arm) ask it, so a third key type is
-// admitted in one place; any other key resolves to -1 and the caller reports the
-// unsupported-key diagnostic (`checkLetDeclNode`).
-export function mapKeyTySupported(k: i32) { k == TY_STR || k == TY_I32 }
+// THE ONE HOME of "which HASH does a `Map`/`Set` key take" — the map rep has exactly
+// two, `string` (hashed element-wise, `__str_hash__`) and `i32` (hashed by the integer
+// mix). Answers the arena type the keys are hashed AS (`TY_I32` / `TY_STR`), or -1 for
+// a key the rep cannot hold. Every gate — the two annotation gates (`tsToTy`'s `TS_MAP`,
+// `nameToTyReal`'s map arm), the usage-driven pin (`checkInferredMapKey`) and the two
+// emitter key-rep predicates (`nodeTyMapKeyIsI32`, `emit_rep.tyMapKeyIsI32`) — projects
+// this one answer, so the checker and the emitter cannot disagree about which hash a
+// map takes.
+//
+// THE TEST IS THE LOWERING, NOT THE SPELLING. Index equality against `TY_I32`/`TY_STR`
+// read the spelling: a nominal newtype is minted as a SECOND arena index over the SAME
+// `Ty` value (`newtype-design.md` §3) and is erased before the emitter runs, so
+// `{[Id]: V}` over `type Id = new i32` hashes byte-for-byte as `{[i32]: V}` — yet the
+// index compare refused it, and refused it in BOTH spellings (the annotation and the
+// `m[k] = v` pin), which made an annotation that restates what inference already knows a
+// reject. `tyPrimNameOf` is structural and peels a one-member union wrapper, so the
+// brand, the transparent alias and the alias-of-an-alias all reach their base here.
+//
+// A LITERAL UNION is deliberately NOT admitted, and it is not an oversight: a NAMED
+// string litunion reps as an interned i32 ATOM while its own spelling stays `K` at emit
+// (`numLitUnionBaseName` excludes the string base for exactly this reason), so the two
+// halves of a `{[K]: V}` map would disagree about the hash — the key expression lowers
+// as an atom and the map struct resolves string-keyed. That is a silent wrong answer,
+// strictly worse than the reject; admitting it needs the key RENDER and `.keys()`'s
+// element type to move together.
+export function mapKeyRepTy(k: i32) {
+  if tyIsPrimNamed(k, "i32") { return TY_I32 }
+  if tyIsPrimNamed(k, "string") { return TY_STR }
+  -1
+}
+
+// The DECISION form of `mapKeyRepTy` — "can the map rep hash this key at all". The
+// caller that says no resolves the annotation to -1 and reports the unsupported-key
+// diagnostic (`checkLetDeclNode`, `checkInferredMapKey`).
+export function mapKeyTySupported(k: i32) { mapKeyRepTy(k) >= 0 }
 
 function mkTyVar(name: string) {
   const t: Ty = { tvName: name }
@@ -19757,16 +19786,21 @@ export function nodeTyMapValName(ix: i32) {
 // wrapper tolerated — the KEY twin of `nodeTyMapValName`, and a NO-RENDER variant-tag
 // walk. The emitter's shape resolvers (`mapShapeOfExpr`'s arena fall-through) ask it to
 // pick the i32-keyed map struct for a receiver whose syntactic arms carry no type NAME.
+//
+// The KEY question is `mapKeyRepTy`'s, not an index compare: a nominal newtype key is a
+// distinct arena index over the same `Ty`, so `mKey == TY_I32` answered FALSE for a
+// `{[Id]: V}` whose emit name canons to `{[i32]: V}` — the checker and the emitter would
+// have picked different map structs for one type.
 export function nodeTyMapKeyIsI32(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable {
     const it = T.tys[t.nInner]
-    if it is TyMap { return it.mKey == TY_I32 }
+    if it is TyMap { return mapKeyRepTy(it.mKey) == TY_I32 }
     return false
   }
-  if t is TyMap { return t.mKey == TY_I32 }
+  if t is TyMap { return mapKeyRepTy(t.mKey) == TY_I32 }
   false
 }
 
