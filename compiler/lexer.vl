@@ -18,10 +18,94 @@
 // past the last) so a token span measures source extent.
 
 // ---- token kinds ---------------------------------------------------------
-// Token KINDS are plain string tags ("IDENT", "NUMBER", ...) rather than a real
-// enum / closed literal-union: VL has no enum tag representation yet, and a wide
-// literal-union is awkward to thread. A bare `string` compares with `==` and
-// prints directly, which is all a token stream needs.
+// The CLOSED token vocabulary, as a literal union. This is the token-kind
+// ENUMERATION: a literal-union value is represented as an i32 ATOM, so `kind`
+// costs one i32 field, every `kind == "IDENT"` lowers to `i32.eq` against a
+// constant, and no `__str_eq__` call is made anywhere on the token path.
+//
+// The SPELLING is minted FROM the atom, never carried beside it: a `TokKind` in
+// a `string` position (the `kindDesc`/`foundDesc` fallbacks that render a kind
+// tag into an `expected …` message) materialises the pooled literal from the
+// atom. A token therefore never holds both representations, and the two cannot
+// drift apart.
+//
+// The checker is a COMPLETE ORACLE over this vocabulary: comparing a `TokKind`
+// against a spelling that is not a member is a hard type error ("not a member of
+// the union"), so a typo'd or dropped kind cannot compile. That is what makes a
+// vocabulary this wide safe to thread through ~570 use sites.
+//
+// `""` is the NO-MATCH sentinel `oneCharKind`/`twoCharKind`/`threeCharKind`
+// return; it is a member so those functions stay total. Members are grouped
+// open-class / structural / keyword / punctuation / operator for reading only —
+// nothing depends on the ORDER (the atom numbering is the emitter's business).
+export type TokKind = ""
+  | "IDENT"
+  | "NUMBER"
+  | "STRING"
+  | "CHAR"
+  | "NEWLINE"
+  | "EOF"
+  | "ERROR"
+  | "IF"
+  | "IS"
+  | "IMPORT"
+  | "FUNCTION"
+  | "FOR"
+  | "FALSE"
+  | "CONST"
+  | "CONTINUE"
+  | "ELSE"
+  | "EXPORT"
+  | "TYPE"
+  | "TRUE"
+  | "RETURN"
+  | "LET"
+  | "WHILE"
+  | "AWAIT"
+  | "BREAK"
+  | "MATCH"
+  | "NULL"
+  | "LPAREN"
+  | "RPAREN"
+  | "LBRACE"
+  | "RBRACE"
+  | "LBRACK"
+  | "RBRACK"
+  | "COMMA"
+  | "SEMI"
+  | "DOT"
+  | "COLON"
+  | "QUESTION"
+  | "TILDE"
+  | "PLUS"
+  | "MINUS"
+  | "STAR"
+  | "SLASH"
+  | "PERCENT"
+  | "CARET"
+  | "EQUAL"
+  | "BANG"
+  | "GT"
+  | "LT"
+  | "PIPE"
+  | "AMPERSAND"
+  | "PLUSPLUS"
+  | "MINUSMINUS"
+  | "PLUSEQ"
+  | "MINUSEQ"
+  | "STAREQ"
+  | "SLASHEQ"
+  | "SHL"
+  | "AND"
+  | "OR"
+  | "QUESTION_DOT"
+  | "QUESTION_QUESTION"
+  | "EQ"
+  | "NE"
+  | "GE"
+  | "LE"
+  | "SHR"
+  | "USHR"
 
 // A lexer diagnostic: a message plus the 1-based line / 0-based column where it
 // was raised. Positions are kept numeric and rendered (with `toString`) at the
@@ -33,7 +117,8 @@ type Diag = {
 }
 
 // A lexed token.
-//   kind  — the string tag (keyword/literal/operator/structural name).
+//   kind  — the closed `TokKind` tag (keyword/literal/operator/structural name),
+//           an i32 atom.
 //   text  — the raw source lexeme (quotes + backslashes kept for STRING/CHAR).
 //   value — for STRING/CHAR: the decoded literal with escapes resolved
 //           (including `\xXX` / `\uXXXX` / `\u{…}` via `fromCodePoint`); ""
@@ -41,7 +126,7 @@ type Diag = {
 //   start/stop — char offsets [first, one-past-last).
 //   line/col   — 1-based line, 0-based column of the first char.
 type Tok = {
-  kind: string,
+  kind: TokKind,
   text: string,
   value: string,
   start: i32,
@@ -217,7 +302,7 @@ function diagAt(msg: string, line: i32, col: i32) {
 // Byte-for-byte the same function: the keyword set, the spellings and the "IDENT" default are
 // unchanged, and the self-compile is the exhaustive test — the compiler's own source uses every
 // one of these 19 keywords, so a mis-bucketed entry cannot survive the fixpoint ladder.
-function keywordKind(text: string) {
+function keywordKind(text: string): TokKind {
   const n = text.length
   if n < 2 || n > 8 { return "IDENT" }
   const c = text[0]
@@ -286,7 +371,7 @@ function keywordKind(text: string) {
 // `;` lexes as `SEMI`, an OPTIONAL statement separator the block / top-level loops
 // treat exactly like a NEWLINE (so `a(); b()` works) — a standalone `?` is still not
 // a token and falls through to the unexpected-character path.
-function oneCharKind(c: i32) {
+function oneCharKind(c: i32): TokKind {
   if c == '+' { return "PLUS" }
   if c == '-' { return "MINUS" }
   if c == '*' { return "STAR" }
@@ -317,7 +402,7 @@ function oneCharKind(c: i32) {
 }
 
 // Two-char operator kind for the pair (a, b), or "" if none. Mirrors TWO_CHAR.
-function twoCharKind(a: i32, b: i32) {
+function twoCharKind(a: i32, b: i32): TokKind {
   if a == '+' && b == '+' { return "PLUSPLUS" }
   if a == '-' && b == '-' { return "MINUSMINUS" }
   // Compound assignment (`a += b` desugars to `a = a + (b)` in the parser).
@@ -347,7 +432,7 @@ function twoCharKind(a: i32, b: i32) {
 // Three-char operator kind for the triple (a, b, c), or "" if none. Checked
 // before `twoCharKind` (longest match first). Only `>>>` (unsigned/logical
 // right shift) lives here — the `>>>` of the LEB encoders' byte extraction.
-function threeCharKind(a: i32, b: i32, c: i32) {
+function threeCharKind(a: i32, b: i32, c: i32): TokKind {
   if a == '>' && b == '>' && c == '>' { return "USHR" }
   ""
 }
@@ -376,7 +461,7 @@ function decodeSimpleEscape(e: i32) {
 // ---- token builder -------------------------------------------------------
 
 export function mkTok(
-  kind: string,
+  kind: TokKind,
   value: string,
   start: i32,
   startLine: i32,
@@ -759,14 +844,13 @@ export function tokenize(source: string): LexResult {
 
     // Three-char operator (`>>>`) — longest match first.
     //
-    // `x.length != 0` and NOT `x != ""`: the three no-match tests below run for
-    // EVERY token in the input and `x != ""` is a `__str_eq__` CALL each time —
-    // three calls per token, ~all of them misses, to ask a question `array.len`
-    // answers inline. The two are exactly equivalent: a string is `""` iff its
-    // length is 0, and `*CharKind`'s no-match sentinel IS `""`. Same shape as
-    // §8.2's `keywordKind` dispatch — the cost was the call, not the compare.
+    // The three no-match tests below run for EVERY token in the input. A
+    // `TokKind` is an i32 atom, so `x != ""` is one `i32.ne` against a constant
+    // — nothing is called and nothing is measured. (`.length` is not even
+    // spellable on a `TokKind`: the checker rejects a field read that is not on
+    // every member of the union.)
     const three = threeCharKind(c, peek2(), peekN(2))
-    if three.length != 0 {
+    if three != "" {
       advance()
       advance()
       advance()
@@ -776,7 +860,7 @@ export function tokenize(source: string): LexResult {
 
     // Two-char operator (longest match first).
     const two = twoCharKind(c, peek2())
-    if two.length != 0 {
+    if two != "" {
       advance()
       advance()
       toks.push(mkTok(two, "", startPos, startLine, startCol))
@@ -785,7 +869,7 @@ export function tokenize(source: string): LexResult {
 
     // One-char operator / punctuation.
     const one = oneCharKind(c)
-    if one.length != 0 {
+    if one != "" {
       advance()
       toks.push(mkTok(one, "", startPos, startLine, startCol))
       continue

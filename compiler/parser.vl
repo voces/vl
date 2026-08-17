@@ -41,6 +41,7 @@
 // The AST data layer (`compiler/ast.vl`): the token type, the global parser state
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay PRIVATE to this module.
+import { TokKind } from "./lexer"
 import { mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14) — the parser is where
@@ -127,11 +128,11 @@ export function peekTok(): Tok {
 }
 
 // The current token's kind — the common discriminating `==` compare.
-function peekKind() { peekTok().kind }
+function peekKind(): TokKind { peekTok().kind }
 
 // The kind of the token AFTER the current one (one-token lookahead) — used to spot a
 // two-token sequence like `=>` (`EQUAL` `GT`) without consuming. EOF past the end.
-function peek2Kind() {
+function peek2Kind(): TokKind {
   if P.pos + 1 >= P.toks.length { return P.toks[P.toks.length - 1].kind }
   P.toks[P.pos + 1].kind
 }
@@ -149,7 +150,7 @@ function advance(): Tok {
 // cursor — the multi-token lookaheads (`looksLikeObject`, the newline-tolerant
 // `else` scan in `parseIf`) scan ahead with raw indices. Mirrors the host's
 // `kind(j)` closure.
-function kindAt(i: i32) {
+function kindAt(i: i32): TokKind {
   let j = i
   if j >= P.toks.length { j = P.toks.length - 1 }
   P.toks[j].kind
@@ -157,7 +158,7 @@ function kindAt(i: i32) {
 
 // If the current token has `kind`, consume it and return true; else leave the
 // cursor put and return false. (The "match" combinator.)
-export function accept(kind: string) {
+export function accept(kind: TokKind) {
   if peekKind() == kind {
     P.pos = P.pos + 1
     return true
@@ -184,14 +185,26 @@ function skipNewlines() {
 // statement, `}` closes an enclosing block, EOF ends the input. The enclosing
 // statement loops recover at these, so the `expect` error paths must never
 // consume them — eating a closer is how one mis-parse cascades.
-function isSyncKind(k: string) {
+function isSyncKind(k: TokKind) {
   k == "NEWLINE" || k == "SEMI" || k == "RBRACE" || k == "EOF"
 }
+
+// The kind TAG as text — the ONE place a `TokKind` atom is turned back into its
+// spelling. Every renderer goes through here so the atom→string materialisation
+// (a chain over the whole 68-member vocabulary) is emitted ONCE, in a function
+// only the diagnostic paths call, instead of inlined into the hot parser bodies
+// that name a kind in a message.
+//
+// The `return` is LOAD-BEARING: an atom→string materialisation reached as a
+// function's tail EXPRESSION emits an out-of-range local and the module fails to
+// instantiate (`unknown local N`); the explicit-return spelling is correct. Same
+// defect, same shape, for `{ const s = k \n s }`.
+function kindTag(k: TokKind): string { return k }
 
 // The display form of a token KIND in an `expected …` message: the concrete
 // lexeme for punctuation, a noun for the open classes, the raw kind tag as the
 // fallback for the rest.
-function kindDesc(k: string) {
+function kindDesc(k: TokKind): string {
   if k == "RPAREN" { return "`)`" }
   if k == "RBRACK" { return "`]`" }
   if k == "RBRACE" { return "`}`" }
@@ -205,7 +218,7 @@ function kindDesc(k: string) {
   if k == "IDENT" { return "an identifier" }
   if k == "NEWLINE" { return "end of line" }
   if k == "EOF" { return "end of input" }
-  k
+  kindTag(k)
 }
 
 // The display form of the OFFENDING token: its source lexeme, backticked
@@ -213,14 +226,14 @@ function kindDesc(k: string) {
 function foundDesc(t: Tok) {
   if t.kind == "NEWLINE" { return "end of line" }
   if t.kind == "EOF" { return "end of input" }
-  if t.text == "" { return t.kind }
+  if t.text == "" { return kindTag(t.kind) }
   "`" + t.text + "`"
 }
 
 // Consume a token of the expected `kind`; on mismatch record a diagnostic and
 // advance PAST the offender — unless it is a sync token (or a `{` opening a
 // nested construct), which is left for the enclosing recovery to handle.
-function expect(kind: string) {
+function expect(kind: TokKind) {
   if peekKind() == kind {
     P.pos = P.pos + 1
     return true
@@ -242,7 +255,7 @@ function expect(kind: string) {
 // bounded by the sync tokens, a statement-start keyword, and `{` (a nested
 // construct), so a genuinely MISSING closer abandons at the boundary instead
 // of swallowing following code.
-function expectClose(kind: string) {
+function expectClose(kind: TokKind) {
   if peekKind() == kind {
     P.pos = P.pos + 1
     return true
@@ -280,109 +293,78 @@ function expectClose(kind: string) {
 // `a & (b == c)`), and the shifts sit BETWEEN relational and additive (so
 // `a + b >> c` is `(a + b) >> c` — shifts looser than `+`).
 //
-// DISPATCHED ON THE FIRST CHARACTER, for the reason `keywordKind` is
-// (perf-program.md §8.2, item 5): the expression climber asks this of EVERY
-// token that could follow an operand, and the overwhelmingly common answer is
-// `0` — which a straight `==` ladder charged **25 `__str_eq__` CALLS** to
-// reach. A closed 25-element vocabulary buckets to at most SIX members per
-// first character (the `S` bucket), so a non-operator now costs one character
-// read plus a run of i32 compares, and an operator at most six string compares.
-//
-// The buckets keep FULL string compares inside them on purpose. `(first char,
-// length)` is NOT a unique key over this vocabulary — `STAREQ`/`STRING` both
-// hash to (S,6) and `STAR`/`SEMI` to (S,4) — so a cheaper in-bucket test would
-// be an identity COLLISION, the defect class §8.4 records as invisible to every
-// standing instrument. The dispatch narrows; it never decides.
-//
-// `kind.length < 2` is the bounds guard for `kind[0]`, and it is also a real
-// filter: every binary-operator kind is at least two characters.
-function binPrec(kind: string) {
-  if kind.length < 2 { return 0 }
-  const c0 = kind[0]
-  if c0 == 'E' {
-    if kind == "EQUAL" {
-      return 1 // assignment (right-associative)
-    }
-    if kind == "EQ" { return 7 }
+// A FLAT `==` LADDER over the atoms. The climber asks this of EVERY token that
+// could follow an operand and the overwhelmingly common answer is `0`, so the
+// tokens that most often END an operand chain (a statement terminator, an
+// argument/element separator, a closer) are rejected up front and the 25
+// operator arms follow. A `TokKind` compare is `i32.eq` against a constant — the
+// ladder costs one register compare per arm, nothing is called, and the
+// no-longer-needed first-character bucketing (which existed only to avoid
+// `__str_eq__` CALLS, and had to keep full string compares inside each bucket
+// because `(first char, length)` collides over this vocabulary) is gone with it.
+function binPrec(kind: TokKind): i32 {
+  // The frequent non-operators, so the common `0` exits early.
+  if (
+    kind == "NEWLINE" ||
+    kind == "COMMA" ||
+    kind == "RPAREN" ||
+    kind == "RBRACE" ||
+    kind == "RBRACK" ||
+    kind == "SEMI" ||
+    kind == "COLON" ||
+    kind == "LBRACE" ||
+    kind == "EOF"
+  ) {
     return 0
   }
-  if c0 == 'P' {
-    // Compound assignment (`+=` etc.) sits WITH assignment; the climber desugars it.
-    if kind == "PLUSEQ" { return 1 }
-    if kind == "PIPE" {
-      return 4 // bitwise OR  (`|`  -> i32.or)
-    }
-    if kind == "PLUS" { return 10 }
-    if kind == "PERCENT" { return 11 }
-    return 0
+  if kind == "PLUS" { return 10 }
+  if kind == "MINUS" { return 10 }
+  if kind == "STAR" { return 11 }
+  if kind == "SLASH" { return 11 }
+  if kind == "PERCENT" { return 11 }
+  if kind == "EQ" { return 7 }
+  if kind == "NE" { return 7 }
+  if kind == "LT" { return 8 }
+  if kind == "GT" { return 8 }
+  if kind == "LE" { return 8 }
+  if kind == "GE" { return 8 }
+  if kind == "AND" { return 3 }
+  if kind == "OR" { return 2 }
+  if kind == "QUESTION_QUESTION" {
+    return 2 // `a ?? b` nullish-coalescing (QUESTION_DOT is postfix, not binary)
   }
-  if c0 == 'M' {
-    if kind == "MINUSEQ" { return 1 }
-    if kind == "MINUS" { return 10 }
-    return 0
+  if kind == "EQUAL" {
+    return 1 // assignment (right-associative)
   }
-  if c0 == 'S' {
-    if kind == "STAREQ" { return 1 }
-    if kind == "SLASHEQ" { return 1 }
-    if kind == "SHL" {
-      return 9 // left shift           (`<<` -> i32.shl)
-    }
-    if kind == "SHR" {
-      return 9 // signed right shift   (`>>` -> i32.shr_s)
-    }
-    if kind == "STAR" { return 11 }
-    if kind == "SLASH" { return 11 }
-    return 0
+  // Compound assignment (`+=` etc.) sits WITH assignment; the climber desugars it.
+  if kind == "PLUSEQ" { return 1 }
+  if kind == "MINUSEQ" { return 1 }
+  if kind == "STAREQ" { return 1 }
+  if kind == "SLASHEQ" { return 1 }
+  if kind == "PIPE" {
+    return 4 // bitwise OR  (`|`  -> i32.or)
   }
-  if c0 == 'Q' {
-    if kind == "QUESTION_QUESTION" {
-      return 2 // `a ?? b` nullish-coalescing
-    }
-    return 0 // QUESTION_DOT is postfix, not binary
+  if kind == "CARET" {
+    return 5 // bitwise XOR (`^`  -> i32.xor) — between | and &
   }
-  if c0 == 'O' {
-    if kind == "OR" { return 2 }
-    return 0
+  if kind == "AMPERSAND" {
+    return 6 // bitwise AND (`&`  -> i32.and)
   }
-  if c0 == 'A' {
-    if kind == "AND" { return 3 }
-    if kind == "AMPERSAND" {
-      return 6 // bitwise AND (`&`  -> i32.and)
-    }
-    return 0
+  if kind == "SHL" {
+    return 9 // left shift           (`<<`  -> i32.shl)
   }
-  if c0 == 'C' {
-    if kind == "CARET" {
-      return 5 // bitwise XOR (`^`  -> i32.xor) — between | and &
-    }
-    return 0
+  if kind == "SHR" {
+    return 9 // signed right shift   (`>>`  -> i32.shr_s)
   }
-  if c0 == 'N' {
-    if kind == "NE" { return 7 }
-    return 0 // NEWLINE / NULL / NUMBER
-  }
-  if c0 == 'L' {
-    if kind == "LT" { return 8 }
-    if kind == "LE" { return 8 }
-    return 0 // LPAREN / LBRACE / LBRACK / LET
-  }
-  if c0 == 'G' {
-    if kind == "GT" { return 8 }
-    if kind == "GE" { return 8 }
-    return 0
-  }
-  if c0 == 'U' {
-    if kind == "USHR" {
-      return 9 // unsigned right shift (`>>>` -> i32.shr_u)
-    }
-    return 0
+  if kind == "USHR" {
+    return 9 // unsigned right shift (`>>>` -> i32.shr_u)
   }
   0
 }
 
 // The right-associative operators (assignment): their RHS parses at the SAME
 // precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
-function rightAssoc(kind: string) {
+function rightAssoc(kind: TokKind) {
   kind == "EQUAL" ||
     kind == "PLUSEQ" ||
     kind == "MINUSEQ" ||
@@ -755,7 +737,9 @@ function parsePrimary() {
     // a literal.)
     return parseArrayLit()
   }
-  P.diags.push({ msg: "expected an expression but found " + k, at: P.pos })
+  P.diags.push(
+    { msg: "expected an expression but found " + kindTag(k), at: P.pos },
+  )
   advance()
   mkErr("expr", P.pos, p0)
 }
@@ -1890,7 +1874,7 @@ function parseArrowLambda(p0: i32) {
 // The operator tokens a FUNCTION NAME may be (`function +(self, b)` — a free
 // operator function; `a + b` on user objects dispatches to it). Mirrors the
 // host's `OPERATOR_FUNC_NAMES` set (DIV/MOD/comparisons under this lexer's kinds).
-function isOpFuncName(kind: string) {
+function isOpFuncName(kind: TokKind) {
   kind == "PLUS" ||
     kind == "MINUS" ||
     kind == "STAR" ||
@@ -2333,7 +2317,7 @@ function parseBlock() {
 // The statement-leading keywords: a `{` whose first token (after newlines) is
 // one of these is a BLOCK, never an object literal (mirrors the host's
 // `STATEMENT_KEYWORDS` set, consulted by `looksLikeObject`).
-function isStmtKeyword(kind: string) {
+function isStmtKeyword(kind: TokKind) {
   kind == "LET" ||
     kind == "CONST" ||
     kind == "RETURN" ||
