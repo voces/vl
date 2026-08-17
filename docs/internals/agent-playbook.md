@@ -95,6 +95,27 @@ For a trap, disassemble and trace the faulting function; for a mismatch, diff th
 WAT of the value's write path vs read path. Don't debug codegen blind against the
 validator message alone — the disassembly is the debugging view of `vl build` output.
 
+## Scratch space — use YOUR OWN WORKTREE, never the shared session scratchpad
+
+**Agents share the session scratchpad directory.** One agent overwrote another's generator
+mid-run, and 273 of the other agent's files polluted its first sweep before it noticed. The
+first generator was unrecoverable and the sweep had to be re-run.
+
+Put every temporary file in a `_scratch/` directory **at the root of your own worktree**, and
+leave it untracked (confirm with `git status` before you commit; never `git add` it). Your
+worktree is private to you for the life of the task, so nothing else can write into it.
+
+Do **not** use the orchestrator's session scratchpad path, even though it is writable and even
+though a brief may hand it to you — that path is shared by every concurrent agent.
+
+Two consequences worth stating:
+- **Assert `records == cells` on every sweep**, and assert it against a count you computed from
+  the generator's own axes rather than from the number of files present. A polluted directory
+  inflates the file count, which reads as a *complete* sweep.
+- Keep the saved compiler artefacts you restore from (`art/`, `*.wasm`) inside the same private
+  directory, and `md5sum -c` after every restore. A sabotage restore that silently picks up
+  another agent's artefact is indistinguishable from a fix that does nothing.
+
 ## Trimmed gates (CI covers the full battery)
 - **The `ci` job is NOT the native one, and its three cheap steps were missing from
   every agent gate list until #1444.** Agents ran the native battery
