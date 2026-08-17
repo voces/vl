@@ -737,6 +737,7 @@ let pendDepths: i32[] = []
 let npKeys: string[] = []
 let npTys: i32[] = []
 let npInvBy: i32[] = []
+let npEpochs: i32[] = []
 let npFrames: i32[] = []
 
 // CYCLE GUARD stacks for `assignable` over recursive named types (A11): a
@@ -763,9 +764,11 @@ let tyToStrDepth = 0
 let pgKeys: string[] = []
 let pgFrames: i32[] = []
 
-// ASSIGNMENT-NARROWED bindings: name → the type it was DECLARED with, before a
-// straight-line `x = e` narrowed it. Per-scope frame marks like the two overlays
-// above, so `popScope` unwinds a scope's entries with the narrowings themselves.
+// NARROWED bare-name bindings: name → the type it was DECLARED with, before a
+// narrowing shadowed it. Per-scope frame marks like the two overlays above, so
+// `popScope` unwinds a scope's entries with the narrowings themselves. Two entry
+// KINDS ride one bank (`NAR_KIND_ASG` / `NAR_KIND_GUARD`) because one question is
+// asked of both — what the storage can hold — and the answers must not disagree.
 //
 // WHY THIS EXISTS AT ALL (#1225's defect, re-derived). A bare-NAME narrowing in
 // this checker is a shadowing `declare` into a scope the caller PUSHED for the
@@ -773,51 +776,143 @@ let pgFrames: i32[] = []
 // narrowing uses the same `declare` with NO scope of its own — so it does not
 // shadow the declaration, it OVERWRITES it, in the very scope that holds it. The
 // narrowing is a correct FLOW fact and the overwrite is what is wrong with it:
-// the declared type is the binding's STORAGE contract, and two questions must
+// the declared type is the binding's STORAGE contract, and three questions must
 // keep asking it after a narrowing, or a legal program stops compiling —
 //
 //   * what the binding ACCEPTS. `let xs: S[] | null = []` / `xs = [{n:1}]` /
 //     `xs = null` rejected "cannot assign null to {n: i32}[]", and a FUNCTION
 //     declared afterwards could not assign null to the global either: the
-//     narrowed type was what its body's `lookup` found.
+//     narrowed type was what its body's `lookup` found. A GUARD narrowing leaks
+//     into the same question — `while q != null { … q = null }` rejected "cannot
+//     assign null to i32" — which is why guard entries are banked here too.
 //   * whether a null TEST is meaningful. `if xs != null` rejected "cannot
-//     compare {n: i32}[] with null", which is how the defect was filed.
+//     compare {n: i32}[] with null", which is how the defect was filed. This one
+//     is ASSIGNMENT-KIND ONLY: a redundant `if q != null` nested inside a live
+//     guard is a genuinely dead test and keeps its diagnostic.
+//   * whether a write RETIRES the narrowing (`writeRetiresNarrowing`).
 //
 // Reads keep the narrowed type — that is the whole point of narrowing, and the
 // straight-line `let x: T | null = null` / `x = mk()` / `x.f` pattern depends on
-// it. Only the two questions above are re-pointed at the declaration.
+// it. Only the questions above are re-pointed at the declaration.
+//
+// THE DEPTH IS LOAD-BEARING, not bookkeeping. An entry answers only while its own
+// `declare` is still the INNERMOST binding of the name: `let x: i32 | null = null`
+// / `x = 5` / `{ let x = "s"   x = null }` banked `i32 | null` for the outer `x`
+// and the inner write read it, so `null` went into a `string` binding and the
+// binding's type was overwritten with `i32?` — a check-clean wrong type.
+//
+// `asgDeclRetiredBy` is the bare-name twin of `npInvBy`: the arena index of the write
+// that ended the narrowing, or -1 while it is in force. A GUARD-kind narrowing that has
+// been retired makes the name UNREADABLE for the rest of the guarded region, and that is
+// not conservatism — the EMITTER's own narrow stack (`narrowStripNullOnly` in
+// `emit_state.vl`) is built on "writing null back inside a null guard is impossible", so
+// a read after such a write is emitted against the stale UNBOXED rep. Over `i32 | null`
+// that is a check-clean invalid module ("expected (ref null $type), found i32"); over a
+// REF rep it happens to work. The two must agree or a boxed read diverges, so the
+// checker refuses the read the emitter cannot lower. The property-path side has always
+// behaved this way (`pathInvalidatedErr`), so the two spellings match.
+//
+// `narFnEpoch` counts FUNCTION BODIES CHECKED, and every narrowing — bank entry or path
+// overlay slot — records the count at install. A closure created inside a guarded region
+// reads its capture at the region's NARROWED rep and runs later, so a write that retires
+// the narrowing behind it is observed through the capture: `if v != null { const w = () =>
+// { print(v + 1) }   v = null   w() }` is check-clean and emits an invalid module without
+// this. A mismatch between the recorded epoch and the current one means "a body that may
+// have captured this narrowing has been checked since it was installed", and the write
+// keeps master's verdict AND master's message — a captured narrowing is exactly the case
+// where refusing the write is the sound answer, not an accident.
+//
+// A closure created BEFORE the guard captured the binding un-narrowed, and its epoch is
+// already spent when the narrowing installs, so it does not block the write.
+const NAR_KIND_ASG = 0
+const NAR_KIND_GUARD = 1
+let narFnEpoch = 0
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
+let asgDeclDepths: i32[] = []
+let asgDeclKinds: i32[] = []
+let asgDeclRetiredBy: i32[] = []
+let asgDeclEpochs: i32[] = []
 let asgDeclFrames: i32[] = []
 
-// The DECLARED type of an assignment-narrowed name, or -1 when the name has not
-// been narrowed by an assignment in any live scope (innermost-last wins, matching
-// the scope chain the narrowing itself rides).
-function asgDeclaredTy(name: string) {
-  let i = asgDeclKeys.length - 1
+// The scope-chain DEPTH of the innermost binding of `name`, or -1 when undeclared.
+// `lookup` is the same walk reading the type out; this one reads the frame it came
+// from, which is what the narrowing bank validates its entries against.
+function lookupDepth(name: string) {
+  let i = T.scopes.length - 1
   while i >= 0 {
-    if asgDeclKeys[i] == name { return asgDeclTys[i] }
+    if T.scopes[i].has(name) { return i }
     i = i - 1
   }
   -1
 }
 
-// Bank `name`'s declared type before an assignment narrowing shadows it. Idempotent
-// within a scope: a second `x = e` must not re-bank the ALREADY-NARROWED type as
-// the declaration.
-//
-// THE GUARD IS DEFENSIVE AND MEASURED INERT — 0 corpus rows and 0 fixture movement
-// when it is removed — and the reason is worth stating so the next reader does not
-// take the zero for coverage. The only caller runs under `asgCt is TyNullable`, and
-// the narrowing it is banking for makes the binding NON-nullable, so a second
-// straight-line assignment cannot re-enter. The one path that can is a null write
-// restoring the declaration and another `x = e` after it, and there the value
-// re-banked would be identical to the one already held. Both readings agree today;
-// the guard is what keeps them agreeing if that gate ever widens.
-function noteAsgNarrow(name: string, declTy: i32) {
-  if asgDeclaredTy(name) >= 0 { return 0 }
+// The DECLARED type banked for narrowed `name`, or -1 when no live entry of a
+// matching kind still shadows the name. `kind` is `NAR_KIND_ASG` /
+// `NAR_KIND_GUARD`, or -1 for "either". Entries of the WRONG kind are skipped
+// rather than stopping the walk, so a guard narrowing layered over an assignment
+// narrowing does not hide it from the assignment-kind question.
+function narDeclaredTy(name: string, kind: i32) {
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclKeys[i] == name && asgDeclDepths[i] == d {
+      if kind < 0 || asgDeclKinds[i] == kind { return asgDeclTys[i] }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// The DECLARED type of an assignment-narrowed name, or -1.
+function asgDeclaredTy(name: string) { narDeclaredTy(name, NAR_KIND_ASG) }
+
+// The bank SLOT of the live guard-kind narrowing of `name`, or -1. Retirement writes
+// through this slot, so it must find exactly the entry `narDeclaredTy` reads.
+function narGuardSlot(name: string) {
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclKeys[i] == name && asgDeclDepths[i] == d {
+      if asgDeclKinds[i] == NAR_KIND_GUARD { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// The write that retired `name`'s guard narrowing, or -1 when it is still in force or
+// there is none. Read at the bare-name READ arm.
+function narRetiredBy(name: string) {
+  const i = narGuardSlot(name)
+  if i < 0 { return -1 }
+  asgDeclRetiredBy[i]
+}
+
+// Bank `name`'s declared type before a narrowing shadows it, at the scope depth the
+// shadowing `declare` writes to. Idempotent per (name, depth, kind): a second
+// `x = e` must not re-bank the ALREADY-NARROWED type as the declaration.
+function noteNarShadow(name: string, declTy: i32, kind: i32) {
+  const d = T.scopes.length - 1
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if (
+      asgDeclKeys[i] == name &&
+      asgDeclDepths[i] == d &&
+      asgDeclKinds[i] == kind
+    ) {
+      return 0
+    }
+    i = i - 1
+  }
   asgDeclKeys.push(name)
   asgDeclTys.push(declTy)
+  asgDeclDepths.push(d)
+  asgDeclKinds.push(kind)
+  asgDeclRetiredBy.push(-1)
+  asgDeclEpochs.push(narFnEpoch)
   0
 }
 
@@ -2459,6 +2554,7 @@ export function initChecker() {
   npKeys = []
   npTys = []
   npInvBy = []
+  npEpochs = []
   npFrames = []
   weSums = Map()
   weOpen = []
@@ -2472,7 +2568,14 @@ export function initChecker() {
   pgFrames = []
   asgDeclKeys = []
   asgDeclTys = []
+  asgDeclDepths = []
+  asgDeclKinds = []
+  asgDeclRetiredBy = []
+  asgDeclEpochs = []
   asgDeclFrames = []
+  narFnEpoch = 0
+  reScopeBases = []
+  reNpBases = []
   guardNames = []
   guardParamIdxs = []
   guardThens = []
@@ -2759,36 +2862,41 @@ function placeKeyOf(ix: i32) {
   ""
 }
 
-// The innermost narrowed-path overlay entry for `key`, or -1 — which now means
-// EITHER "never narrowed" OR "narrowed and since invalidated by an aliasing write".
-// One function answers "is this narrowing in force", so the two readers that matter
-// — the member/optional-member read arms and `placeCurTy`'s fact collection — cannot
-// disagree. Fact collection wants exactly this reading too: after `clr(o)` a fresh
-// `if o.v != null` must re-derive the narrowing from the DECLARED field type, not
-// from the stale non-null one.
-function narrowedPathTy(key: string) {
+// The overlay SLOT of the innermost narrowing of `key`, or -1 when `key` was never
+// narrowed in a live scope. The single walk the three overlay questions share — the
+// type, the invalidator, and how the slot sits relative to a loop barrier.
+function narrowedPathIx(key: string) {
   let i = npKeys.length - 1
   while i >= 0 {
-    if npKeys[i] == key {
-      if npInvBy[i] >= 0 { return -1 }
-      return npTys[i]
-    }
+    if npKeys[i] == key { return i }
     i = i - 1
   }
   -1
 }
 
-// The call that invalidated the innermost narrowing of `key`, or -1 when `key` is
+// The innermost narrowed-path overlay entry for `key`, or -1 — which means EITHER
+// "never narrowed" OR "narrowed and since invalidated by an aliasing write or a
+// falsifying assignment". One function answers "is this narrowing in force", so the
+// two readers that matter — the member/optional-member read arms and `placeCurTy`'s
+// fact collection — cannot disagree. Fact collection wants exactly this reading too:
+// after `clr(o)` a fresh `if o.v != null` must re-derive the narrowing from the
+// DECLARED field type, not from the stale non-null one.
+function narrowedPathTy(key: string) {
+  const i = narrowedPathIx(key)
+  if i < 0 { return -1 }
+  if npInvBy[i] >= 0 { return -1 }
+  npTys[i]
+}
+
+// The node that invalidated the innermost narrowing of `key`, or -1 when `key` is
 // narrowed-and-in-force or was never narrowed. The two states `narrowedPathTy`
 // folds into -1 are told apart here, and only for the diagnostic: an unguarded
-// nullable read keeps its existing message, an invalidated one names the call.
+// nullable read keeps its existing message, an invalidated one names the call or
+// the write.
 function narrowedPathInvBy(key: string) {
-  let i = npKeys.length - 1
-  while i >= 0 {
-    if npKeys[i] == key { return npInvBy[i] }
-    i = i - 1
-  }
-  -1
+  const i = narrowedPathIx(key)
+  if i < 0 { return -1 }
+  npInvBy[i]
 }
 
 // Whether `s` begins with `pfx`. (The slice is bound before it is compared: a bare
@@ -3333,6 +3441,213 @@ function pathHitsAny(path: string, sum: string, under: string) {
   false
 }
 
+// RE-EXECUTION BARRIERS: the scope depth and overlay height at entry to each open
+// loop body and nested-function body, innermost last.
+//
+// A narrowing retires at a falsifying write because the statements AFTER the write
+// run with the narrowing gone — a statement-order fact. A loop body breaks that
+// reading: it is checked once and executed many times, so the reads textually BEFORE
+// the write run again after it. `if q != null { while c { use(q)   q = null } }` is
+// exactly that shape and `use(q)` sees a null on the second iteration.
+//
+// The narrowing a loop's OWN condition establishes is different: the condition is
+// re-tested on every back edge, so it holds on entry to every iteration whatever the
+// body wrote. `while q != null { use(q)   q = null }` — the idiom the retirement
+// rule exists to allow — is therefore sound with no back-edge analysis, and so is a
+// guard INSIDE the body. Both sit at or above the barrier mark; a narrowing from an
+// enclosing guard sits below it. A nested FUNCTION body carries the same hazard for
+// the same reason (the body may run any number of times, at any point), and takes the
+// same mark.
+//
+// A write that would retire a narrowing BELOW the innermost mark keeps its reject.
+// That is master's verdict for every such program, so the barrier bounds the
+// widening rather than trading one unsound acceptance for another.
+let reScopeBases: i32[] = []
+let reNpBases: i32[] = []
+
+// Enter / leave a re-execution barrier. Call BEFORE the body's narrowing scope is
+// pushed, so a narrowing the loop's own condition contributes counts as inside.
+function pushReBarrier() {
+  reScopeBases.push(T.scopes.length)
+  reNpBases.push(npKeys.length)
+  0
+}
+function popReBarrier() {
+  if reScopeBases.length > 0 {
+    reScopeBases.pop()
+    reNpBases.pop()
+  }
+  0
+}
+
+// Whether a bare-name narrowing shadowing at scope depth `depth` was established
+// inside the innermost open barrier — i.e. re-established every time the write runs.
+function narInsideBarrier(depth: i32) {
+  if reScopeBases.length == 0 { return true }
+  depth >= reScopeBases[reScopeBases.length - 1]
+}
+
+// The same question for a property-path narrowing, by overlay slot.
+function npInsideBarrier(npIx: i32) {
+  if reNpBases.length == 0 { return true }
+  npIx >= reNpBases[reNpBases.length - 1]
+}
+
+// Whether a live narrowing DOES overlay the write target but sits below the innermost
+// re-execution barrier — the one reason `writeStorageTy` answers -1 for a place a
+// narrowing covers. Asked only to choose the diagnostic: the write is refused either
+// way, but "cannot assign null to i32" says nothing about why the same write one block
+// out is fine.
+function writeBarredByLoop(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Ident {
+    if narDeclaredTy(n.identName, NAR_KIND_GUARD) < 0 { return false }
+    return !narInsideBarrier(lookupDepth(n.identName))
+  }
+  if n is Member {
+    const key = placeKeyOf(ix)
+    if key == "" { return false }
+    const slot = narrowedPathIx(key)
+    if slot < 0 || npInvBy[slot] >= 0 { return false }
+    return !npInsideBarrier(slot)
+  }
+  false
+}
+
+// The diagnostic for a write the re-execution barrier refuses. It names the loop rather
+// than the type, because the type is fine: the same write one block further out is
+// accepted, and so is this one under a guard the loop itself re-tests.
+function writeBarredErr(place: string, at: i32) {
+  tErr(
+    "'" +
+      place +
+      "' was narrowed by a guard OUTSIDE this loop, so this write would leave the " +
+      "reads before it reading null on the next iteration — move the write out of " +
+      "the loop, or make the guard on '" +
+      place +
+      "' the loop's own condition",
+    at,
+  )
+  0
+}
+
+// THE STORAGE TYPE OF AN ASSIGNMENT TARGET — what the place can HOLD, as against
+// what a narrowing currently proves it holds — or -1 when no live narrowing overlays
+// the place and the flow type IS the storage type. That -1 covers every place in a
+// program with no narrowing, so this is exactly the set of writes a narrowing used to
+// shrink.
+//
+// A bare NAME reads the narrowing bank, because the guard's shadowing `declare` hid
+// the declaration in an outer scope. A property PATH reads the field off the
+// RECEIVER's own type, because the overlay keys the path string and never touches the
+// struct's field types; the receiver keeps its own narrowing, since a non-null
+// receiver is what makes the field reachable at all.
+//
+// Returns -1 across a re-execution barrier (see `narInsideBarrier`): the write stays
+// rejected there, which is master's verdict.
+function writeStorageTy(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Ident {
+    // An ASSIGNMENT narrowing's null write is accepted today, barrier or not — and
+    // `let x: i32 | null = null` / `x = 5` / `while c { use(x)   x = null }` is a
+    // CORRECT program for a single-iteration loop, so barring it would newly reject
+    // working code. Only the guard-kind acceptance is new, so only it is bounded.
+    const gSlot = narGuardSlot(n.identName)
+    if gSlot >= 0 {
+      if asgDeclEpochs[gSlot] != narFnEpoch { return -1 }
+      if !narInsideBarrier(lookupDepth(n.identName)) { return -1 }
+      return asgDeclTys[gSlot]
+    }
+    return narDeclaredTy(n.identName, NAR_KIND_ASG)
+  }
+  if n is Member {
+    const key = placeKeyOf(ix)
+    if key == "" { return -1 }
+    const slot = narrowedPathIx(key)
+    if slot < 0 || npInvBy[slot] >= 0 { return -1 }
+    if npEpochs[slot] != narFnEpoch { return -1 }
+    if !npInsideBarrier(slot) { return -1 }
+    const noNames: string[] = []
+    const noTys: i32[] = []
+    return placeFieldTy(placeCurTy(n.memObj, noNames, noTys), n.memProp, false)
+  }
+  -1
+}
+
+// DOES A WRITE TO `tgtKey` OF A VALUE TYPED `rt` RETIRE THE NARROWING `(key, npTy)`?
+// The one home for that question — both the bare-name and the property-path
+// retirement sides ask it, so they cannot disagree, and the read arms' "is this
+// narrowing in force" reading stays the complement of it.
+//
+// Three ordered legs:
+//   * PLACE. The write must name the narrowed place or a PREFIX of it. `o.v = …`
+//     retires `o.v` and also `o.v.w` (the sub-object is a different object now),
+//     while `o.w = …` retires neither. An unkeyable target (`xs[i] = …`) names no
+//     place and retires nothing — and no narrowing can key one either, so both sides
+//     stay consistent.
+//   * VALUE, for an EXACT place match: a write the narrowing still admits keeps it.
+//     `if q != null { q = 5   use(q) }` must keep reading `q` as non-null, and
+//     `assignable` is the same relation every other reader of a narrowed type uses.
+//   * A PREFIX match retires UNCONDITIONALLY, whatever the value's type: the place
+//     now holds a different object, and nothing is known about its fields. Without
+//     this leg the widening is unsound on its own terms — `if o != null && o.v !=
+//     null { o = null   use(o.v) }` reads `o.v` off a null receiver, because the
+//     member arm answers from the overlay before it ever checks the receiver.
+function writeRetiresNarrowing(
+  tgtKey: string,
+  rt: i32,
+  key: string,
+  npTy: i32,
+) {
+  if tgtKey == "" { return false }
+  if key == tgtKey { return !assignable(rt, npTy) }
+  keyHasPrefix(key, tgtKey + ".")
+}
+
+// Retire every narrowing the accepted write at `atIx` falsifies, IN PLACE — never by
+// pushing a shadowing entry. A push unwinds at the end of whatever inner block holds
+// the write and resurrects the narrowing for the statements after it
+// (`if q != null { if c { q = null }   use(q) }` must stay rejected), which is the
+// same reason `npInvBy` overwrites rather than pushes.
+//
+// The in-place form differs by spelling and the difference is only mechanical: a
+// property path is marked in `npInvBy`, and a bare name's narrowing is a shadowing
+// `declare`, so retiring it means writing the declared type back into THE SCOPE THE
+// GUARD PUSHED. Both then retire for good when that scope pops.
+function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
+  const tgtKey = placeKeyOf(tgtIx)
+  if tgtKey == "" { return 0 }
+  let i = 0
+  while i < npKeys.length {
+    if npInvBy[i] < 0 {
+      if writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i]) {
+        npInvBy[i] = atIx
+      }
+    }
+    i = i + 1
+  }
+  const tn = P.nodes[tgtIx]
+  if tn is Ident {
+    const nm = tn.identName
+    const dcl = narDeclaredTy(nm, -1)
+    if dcl >= 0 {
+      if writeRetiresNarrowing(nm, rt, nm, lookup(nm)) {
+        // The DECLARED type goes back into the scope the narrowing shadowed, so a
+        // LATER write to the same name is checked against the storage again.
+        const d = lookupDepth(nm)
+        if d >= 0 { T.scopes[d][nm] = dcl }
+        // A guard-kind narrowing additionally poisons READS for the rest of the
+        // guarded region — see `asgDeclRetiredBy`.
+        const gs = narGuardSlot(nm)
+        if gs >= 0 {
+          if asgDeclRetiredBy[gs] < 0 { asgDeclRetiredBy[gs] = atIx }
+        }
+      }
+    }
+  }
+  0
+}
+
 // Mark every live narrowing the call at `callIx` invalidates. Runs AFTER the call's
 // own arguments are checked, so `f(o.v.length, o)` still reads `o.v` under the
 // narrowing that held when the argument was evaluated.
@@ -3369,21 +3684,49 @@ function calleeNameOf(callIx: i32) {
   "?"
 }
 
-// The diagnostic for reading a path whose narrowing an aliasing write retired. It
-// names the CALL, not merely the nullness, because the call is what the reader has to
-// act on — the guard above is correct and the read below is correct, and only their
-// separation by that call is wrong.
-function pathInvalidatedErr(key: string, callIx: i32, at: i32) {
+// The diagnostic for reading a path whose narrowing a write retired. It names the
+// WRITE, not merely the nullness, because the write is what the reader has to act on —
+// the guard above is correct and the read below is correct, and only their separation
+// by that write is wrong. An ALIASING CALL and a direct ASSIGNMENT are the two ways a
+// path narrowing dies, and the message says which, because "the call to '?'" for a
+// plain `o.v = null` sends the reader looking for a call there is none of.
+function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
+  const by = P.nodes[byIx]
+  let what = "the assignment"
+  let after = "the assignment"
+  if by is Call {
+    what = "the call to '" + calleeNameOf(byIx) + "'"
+    after = "the call"
+  }
   tErr(
     "'" +
       key +
-      "' was narrowed by a guard, but the call to '" +
-      calleeNameOf(callIx) +
-      "' on line " +
-      i32ToStr(nodeLineOf(callIx)) +
+      "' was narrowed by a guard, but " +
+      what +
+      " on line " +
+      i32ToStr(nodeLineOf(byIx)) +
       " can write it — re-test '" +
       key +
-      "' after the call",
+      "' after " +
+      after,
+    at,
+  )
+  TY_ERR
+}
+
+// The same diagnostic for a BARE NAME whose guard narrowing an assignment retired. It
+// names the write and says where a read can go, because the narrowing is genuinely dead
+// for the rest of the guarded region and re-testing inside it does not revive it: the
+// emitter's narrow stack still holds the region's rep (see `asgDeclRetiredBy`).
+function nameRetiredErr(name: string, byIx: i32, at: i32) {
+  tErr(
+    "'" +
+      name +
+      "' was narrowed by a guard, but the assignment on line " +
+      i32ToStr(nodeLineOf(byIx)) +
+      " ended the narrowing — read '" +
+      name +
+      "' outside the guarded block, or under a fresh guard there",
     at,
   )
   TY_ERR
@@ -4287,6 +4630,20 @@ function isPathKey(s: string) {
 // Apply collected narrowings around a branch: a bare name shadows via the
 // scope chain (the caller pushes a scope first), a property path rides the
 // `npKeys`/`npTys` overlay — whose entries the matching `popScope` unwinds.
+//
+// A bare name's shadow carries TWO things across with it, both because the shadow is
+// a full binding in a scope of its own and every question the scope chain answers
+// reads it instead of the declaration:
+//
+//   * ITS DECLARED TYPE, banked so the write side can still ask what the storage
+//     holds (`writeStorageTy`). Banked only when the narrowing actually CHANGES the
+//     type — a fact identical to the current type shadows nothing, and banking it
+//     would put a guard-kind entry in front of an assignment-kind one for no gain.
+//   * ITS CONSTNESS. `isConstName` stops at the first scope that BINDS the name and
+//     asks that frame alone — the scope-chain shadowing rule, which a `let` shadowing
+//     an outer `const` depends on. A narrowing shadow is not a new binding, so
+//     without this mirror the `const` reject silently disappears inside every guard:
+//     `const q = mk(true)` / `if q != null { q = 5 }` compiled and ran on master.
 function applyNarrows(names: string[], tys: i32[]) {
   let i = 0
   while i < names.length {
@@ -4294,8 +4651,18 @@ function applyNarrows(names: string[], tys: i32[]) {
       npKeys.push(names[i])
       npTys.push(tys[i])
       npInvBy.push(-1)
+      npEpochs.push(narFnEpoch)
     } else {
+      const wasConst = isConstName(names[i])
+      const declTy = lookup(names[i])
+      if declTy >= 0 && declTy != tys[i] {
+        noteNarShadow(names[i], declTy, NAR_KIND_GUARD)
+      }
       declare(names[i], tys[i])
+      if wasConst {
+        const ctop = constScopes.length - 1
+        if ctop >= 0 { constScopes[ctop][names[i]] = true }
+      }
     }
     i = i + 1
   }
@@ -4399,6 +4766,7 @@ function popScope() {
       npKeys.pop()
       npTys.pop()
       npInvBy.pop()
+      npEpochs.pop()
     }
   }
   if pgFrames.length > 0 {
@@ -4412,6 +4780,10 @@ function popScope() {
     while asgDeclKeys.length > abase {
       asgDeclKeys.pop()
       asgDeclTys.pop()
+      asgDeclDepths.pop()
+      asgDeclKinds.pop()
+      asgDeclRetiredBy.pop()
+      asgDeclEpochs.pop()
     }
   }
   if symEnabled != 0 {
@@ -15889,6 +16261,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     inferSawErr = false
     fnSawValueRet = false
   }
+  // A FUNCTION BODY CHECKED HERE CAN CAPTURE whatever narrowings are live around it, and
+  // it runs LATER — so a narrowing installed BEFORE this point and retired AFTER it would
+  // be retired behind the capture's back. `narFnEpoch` is how the write side tells the two
+  // apart; see `writeStorageTy`.
+  narFnEpoch = narFnEpoch + 1
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
   // Keep the function's TYPE PARAMETERS in scope for the WHOLE body, so a body
@@ -17946,7 +18323,14 @@ function checkNodeReal(ix: i32) {
     // read (the `BinExpr` `=` arm marks it as `daWriteTarget` before evaluating
     // the target), so it is skipped here; a compound `x += …` desugars to
     // `x = x + (…)` whose RHS reads `x` and DOES reach this gate.
-    if ix != daWriteTarget { daCheckRead(n.identName, ix) }
+    if ix != daWriteTarget {
+      daCheckRead(n.identName, ix)
+      // A guard narrowing an assignment RETIRED makes the name unreadable for the rest
+      // of the guarded region. Skipped for the write target itself, which is the one
+      // position that asks about the storage rather than the value.
+      const retBy = narRetiredBy(n.identName)
+      if retBy >= 0 { return nameRetiredErr(n.identName, retBy, ix) }
+    }
     return ty
   } else if n is Paren {
     return checkNode(n.parInner)
@@ -22862,39 +23246,58 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         }
       }
     }
-    // WHAT A BINDING ACCEPTS IS ITS DECLARED TYPE, NOT ITS CURRENT FLOW TYPE.
-    // An earlier assignment may have NARROWED this name (the block below), and a
-    // narrowing must never shrink what the storage can hold — `let xs: S[] | null`
-    // / `xs = [{n:1}]` / `xs = null` rejected the third line as "cannot assign null
-    // to {n: i32}[]", and a function declared after the narrowing could not assign
-    // null to the global either. `asgDeclaredTy` is -1 for every binding no
-    // assignment narrowed, which is every binding on master, so this is exactly the
-    // set of programs that used to be rejected for a narrowing's sake.
-    //
-    // A MEMBER / INDEX target is unaffected: only a bare name can be narrowed.
+    // WHAT A PLACE ACCEPTS IS ITS STORAGE TYPE, NOT ITS CURRENT FLOW TYPE.
+    // A narrowing must never shrink what the storage can hold, and BOTH kinds leaked
+    // into this question. An earlier assignment narrowing made `let xs: S[] | null`
+    // / `xs = [{n:1}]` / `xs = null` reject the third line as "cannot assign null to
+    // {n: i32}[]", and a function declared after the narrowing could not assign null
+    // to the global either. A GUARD narrowing did the same to the write inside the
+    // guard, in both spellings — `while q != null { … q = null }` rejected "cannot
+    // assign null to i32" and `if o.v != null { … o.v = null }` rejected "cannot
+    // assign null to string" — which killed the natural way to walk a nullable chain
+    // to exhaustion. Neither reject was a soundness rule: the storage admits null,
+    // the same write outside the guard is accepted, and the fix is to accept the
+    // write and RETIRE the narrowing (`retireNarrowingsForWrite`, below).
+    // `writeStorageTy` is -1 for every place no narrowing overlays, which is every
+    // place on master, so this is exactly the set of writes a narrowing shrank.
     //
     // GATED ON A NULL-BEARING RIGHT-HAND SIDE, and the gate is not cosmetic. The
-    // narrowed type is `nonNullTy(declared)`, so the ONLY writes it refuses that
-    // the declaration allows are the ones carrying null — and gating on that keeps
-    // every assignment that type-checks today on its EXACT current path, including
+    // narrowed type is `nonNullTy(storage)`, so the ONLY writes it refuses that the
+    // storage allows are the ones carrying null — and gating on that keeps every
+    // assignment that type-checks today on its EXACT current path, including
     // whatever contextual coercion `assignableExpr` performs against the target
     // (an object literal coerces field-wise, a bare lambda infers its params). The
-    // un-gated form — always ask the declaration — is strictly wider, still accepts
+    // un-gated form — always ask the storage — is strictly wider, still accepts
     // everything, and MOVED CODEGEN: it re-compiled the compiler's own frozen
     // source 12 bytes smaller. Same verdicts, different coercions; the fixpoint is
-    // what noticed.
+    // what noticed. An `is T` variant pin is left alone by the same gate: the write
+    // that FLIPS a variant carries no null, and rejecting it is how a loop over a
+    // union terminates (see `checkWhileStmtNode`).
+    //
+    // `lt` ITSELF STAYS THE FLOW TYPE. It is what `seedExpected` contextually types
+    // the right-hand side with and what `nodeTyIxOf` hands the emitter for the
+    // target node, so re-pointing it at the storage would move the emitted store
+    // rep for programs that already compile.
     let asgLt = lt
-    if tgt is Ident {
-      const rtN = T.tys[rt]
-      let rhsNullBearing = isNullTy(rt)
-      if rtN is TyNullable { rhsNullBearing = true }
-      if rhsNullBearing {
-        const asgDcl = asgDeclaredTy(tgt.identName)
-        if asgDcl >= 0 { asgLt = asgDcl }
+    let asgBarred = false
+    const rtN = T.tys[rt]
+    let rhsNullBearing = isNullTy(rt)
+    if rtN is TyNullable { rhsNullBearing = true }
+    if rhsNullBearing {
+      const asgDcl = writeStorageTy(n.binLeft)
+      if asgDcl >= 0 {
+        asgLt = asgDcl
+      } else {
+        asgBarred = writeBarredByLoop(n.binLeft)
       }
     }
-    if !assignableExpr(n.binRight, rt, asgLt) {
-      tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(asgLt), ix)
+    const asgOk = assignableExpr(n.binRight, rt, asgLt)
+    if !asgOk {
+      if asgBarred {
+        writeBarredErr(placeKeyOf(n.binLeft), ix)
+      } else {
+        tErr("cannot assign " + tyToStr(rt) + " to " + tyToStr(asgLt), ix)
+      }
     }
     // A-infer-null: a nullable binding's open inner HOLE (`let x = null`)
     // fills from the first non-null assignment (in place, so the binding
@@ -22920,19 +23323,18 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
             // Bank the DECLARED type before shadowing it. The narrowing itself is
             // unchanged — reads still see the non-null type, which is what the
             // `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
-            noteAsgNarrow(asgTgt.identName, asgCur)
+            noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
             declare(asgTgt.identName, nonNullTy(asgCur))
           }
-        } else if !rhsNonNull {
-          // THE NARROWING IS A PATH FACT, AND THIS WRITE ENDS THE PATH. Storing
-          // null (or a nullable) back into a name an earlier assignment narrowed
-          // restores its declared type for the rest of the scope — otherwise the
-          // binding would stay non-null for reads that can now see a null.
-          const asgDcl2 = asgDeclaredTy(asgTgt.identName)
-          if asgDcl2 >= 0 { declare(asgTgt.identName, asgDcl2) }
         }
       }
     }
+    // THE NARROWING IS A PATH FACT, AND A FALSIFYING WRITE ENDS THE PATH. One driver
+    // retires both kinds of bare-name narrowing and the property-path overlay, so the
+    // write side cannot disagree with itself across the three spellings. Only an
+    // ACCEPTED write retires anything: a rejected one did not happen, and letting it
+    // retire would cascade a second diagnostic onto every read after it.
+    if asgOk { retireNarrowingsForWrite(n.binLeft, rt, ix) }
     // Assignment is an expression yielding its RIGHT-HAND SIDE (host parity;
     // DECISIONS: assignment-as-expression).
     return rt
@@ -24367,6 +24769,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
               npKeys.push(gKey)
               npTys.push(gTy)
               npInvBy.push(-1)
+              npEpochs.push(narFnEpoch)
             } else if gTy == nonNullTy(lookup(gKey)) {
               declare(gKey, gTy)
             } else {
@@ -24924,15 +25327,17 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   // is re-tested before every iteration, so whatever it proves holds on entry to
   // each one (`while e != null { e + 1 }` reads the unboxed `i32`).
   //
-  // WHY A BODY THAT REASSIGNS THE GUARDED BINDING NEEDS NO INVALIDATION PASS.
-  // A bare-name narrowing here is a shadowing `declare` into a scope pushed for
-  // the body, so the narrowed type is the binding's ACCEPT contract inside it
-  // too — a null write is a type error, not a silently-invalidated fact. The
-  // `if` arm has always worked that way (`if e != null { e = null }` is "cannot
-  // assign null to i32"), and matching it is what makes the loop sound with no
-  // flow analysis: every way of putting a null back — a literal, a nullable
-  // call's result — is rejected inside the body, and a non-null write keeps the
-  // fact true. The `while` spelling inherits that rule verbatim.
+  // WHY A BODY THAT REASSIGNS THE GUARDED BINDING NEEDS NO BACK-EDGE PASS. The
+  // condition's re-test on every back edge is the whole argument: the fact holds on
+  // entry to each iteration whatever the previous one wrote, so a write inside the
+  // body only has to retire the fact for the statements AFTER it — which is what
+  // `retireNarrowingsForWrite` does for a write anywhere, loop or not.
+  // `while q != null { use(q)   q = null }` walks a nullable chain to exhaustion,
+  // and `while q != null { q = null   use(q) }` is rejected at the `use`.
+  //
+  // The BARRIER below is for the other direction: a narrowing established OUTSIDE
+  // this loop gets no re-test, so a write in the body would leave the reads before
+  // it reading a stale fact on the next iteration. Those writes keep their reject.
   //
   // TWO KINDS OF FACT ARE FILTERED OUT, and each has its own reason.
   //
@@ -24967,12 +25372,14 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
     }
     wi = wi + 1
   }
+  pushReBarrier()
   if wbNames.length > 0 {
     pushScope(-1)
     applyNarrows(wbNames, wbTys)
   }
   checkNode(n.whileBody)
   if wbNames.length > 0 { popScope() }
+  popReBarrier()
   daRestore(daLoopEntry)
   return TY_VOID
 }
@@ -25004,6 +25411,9 @@ function checkForRangeNode(n: ForRange, ix: i32) {
       if stepNode.numText == "0" { tErr("`for` step is 0", n.frStep) }
     }
   }
+  // A `for` body re-executes with no condition to re-establish anything, so every
+  // narrowing live here predates it — see `pushReBarrier`.
+  pushReBarrier()
   pushScope(ix)
   declare(n.frVar, TY_I32)
   if symEnabled != 0 { symDecl(n.frVar, ix, TY_I32, 0) }
@@ -25017,6 +25427,7 @@ function checkForRangeNode(n: ForRange, ix: i32) {
   checkNode(n.frBody)
   daRestore(daFrEntry)
   popScope()
+  popReBarrier()
   return TY_VOID
 }
 // ── for v in iterable ───────────────────────────────────────────────────────
@@ -25043,6 +25454,8 @@ function checkForInNode(n: ForIn, ix: i32) {
   } else {
     tErr("for-in expects an array or map, got " + tyToStr(iterTy), ix)
   }
+  // See ForRange: a `for` body re-executes with nothing to re-establish a narrowing.
+  pushReBarrier()
   pushScope(ix)
   declare(n.fiVar, elemTy)
   if symEnabled != 0 { symDecl(n.fiVar, ix, elemTy, 0) }
@@ -25054,6 +25467,7 @@ function checkForInNode(n: ForIn, ix: i32) {
   checkNode(n.fiBody)
   daRestore(daFiEntry)
   popScope()
+  popReBarrier()
   return TY_VOID
 }
 // ── return ─────────────────────────────────────────────────────────────────
