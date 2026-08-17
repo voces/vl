@@ -367,6 +367,10 @@ rebinds to `K`, whose slot is an ATOM, while the value is a string ref. That is 
 hole, not an `is` hole, and it is the same inline-spelling PARAM/FIELD work
 `docs/internals/destringify-types-program.md` files.
 
+**That filing is CLOSED — see "D1a is CLOSED" and "the narrowed-consumption re-grid" below. The
+classification held exactly; the re-grid's finding is that everything still failing on that path
+fails with the `is` deleted.**
+
 Adjacent and separately unmeasured until now: a plain `string` receiver tested against a literal
 union (`function f(s: string) { if s is A … }`) is `vl check`-clean and also answers a constant
 FALSE. The receiver is the same string rep and the same lowering would serve it; it is a different
@@ -776,10 +780,11 @@ is the same six sites over an already-atom receiver.
 ### What bounds it, and what the checker bounds for us
 
 `emitStrToAtom` floors loudly on a non-place receiver, and that floor is **unreachable from source
-today**: the checker does not narrow a member-path or element receiver down to a litunion alias
-(`if s.f is A { const r: A = s.f }` is `cannot assign "x"|"y"|"z"|"w" to 'r'`), so every reachable
-D1a cell has an IDENT receiver. The bound is stated because it is the lowering's real precondition,
-not because a program can reach it.
+today**, because the receivers that reach it are places. What the checker narrows is measured rather
+than assumed: a FIELD path narrows and consumes correctly at all six destinations (`if so.g is A
+{ const r: A = so.g }`, and the nested `so.o.h`), a module GLOBAL does, and an ELEMENT place does
+NOT (`if xs[0] is A { … }` is `cannot assign "x"|"y"|"z"|"w" to 'r'` — workboard D1f). The bound is
+stated because it is the lowering's real precondition, not because a program can reach it.
 
 *Method note: **the D1 report's own classification was the load-bearing part of this fix.** It said
 valtype ladder, not `is`, and the vocabulary to look for followed directly — `emitAtomToStr` is one
@@ -787,6 +792,46 @@ grep from `emitStrValue`, and finding a direction that already exists tells you 
 an arm and not a rep change. The alternative reading of the same symptom — "make the `A` slot hold a
 string" — is a rep change, and it is refuted by the destinations: a `K` parameter, field, element and
 return all have their rep fixed by a signature the binding cannot influence.*
+
+### The narrowed-consumption re-grid — 1,156 cells, and the defect that was left is not the narrowing
+
+The 18-cell grid above is the DESTINATION axis at one guard shape and three spellings. Re-gridded
+across every axis the row named: **10 receiver reps × 6 guard forms × 8 consumption sites** (450
+cells, re-run at a 3-member alias for another 450), a **20-origin × 10-destination** grid (200), and
+**56 shapes** the first three cannot reach — seven place receivers narrowed IN SITU, subset and
+alias-identity narrowing over an atom, a nullable litunion, a closure body, a generic callee, a
+global destination, an else-if chain, a `for`-loop binding and a re-narrowing.
+
+**0 silently wrong. 0 invalid wasm attributable to the narrowing.** Every invalid-wasm cell in the
+grid reproduces with the `is` guard **DELETED** — which is the test that separates this row's
+population from its neighbours', and it moved four filings out of D1a entirely (D1d, D1e, D1g in the
+workboard, plus the leak below). The check-rejects are D1f and the `newtype` / `match` boundaries.
+
+The one live defect ON the consumption path is the ARGUMENT boundary, and its sign is the opposite
+of D1a's: where D1a was a value that failed to become an atom, this is a value that became one it
+should not have. All three argument spines read the pending seeds through `expCtxHere()`, which
+SNAPSHOTS the ambient, so every atom-typed destination holding a call — including `"s" + f(a)`,
+which reaches the call through `emitAtomToStr`'s own seed — pushed its atom context down into `f`'s
+arguments. **216-cell spine grid (5 call spines × 5 argument kinds × 8 destinations, plus a `K | null`
+parameter's null/member arguments): 137 invalid-wasm → 0.**
+
+It took two commits because the two halves are opposite directions of one invariant — *an argument's
+rep belongs to the callee's parameter*:
+
+- **Do not inherit.** Clear `pendingLitUnion` / `pendingNulLitUnion` for the arg spine in all three
+  call emitters; the positions that really want an atom re-seed from the CALLEE (`cParamLitUnion`,
+  `cloCallParamLitUnion`, `cpLit`). 105 cells.
+- **Do widen.** A `K` ATOM argument into a `string` parameter existed on the DIRECT spine only
+  (`cParamStr`); the value and captured spines pushed the raw i32 into a `(ref $array)` slot. 32
+  cells. Its second half is the RESERVATION SCAN — `callWidensAtomToStr` resolved a direct callee
+  only, so the handler alone traded a type mismatch for `unknown local N` on 3 of the 32. Scan and
+  handler now read the SAME `$fnsig` parameter byte, which is what keeps them from disagreeing.
+
+*Method note: **the confound test is the cheap one and it should come first.** Four of the five
+invalid-wasm families this grid turned up were still invalid with the guard deleted, and two of them
+(`ret`, `nested`) were 49 of the 54 baseline cells — a grid that had stopped at "D1a is 54 cells"
+would have reported a population five times its real size and then "fixed" defects that were never
+in the row.*
 
 
 ---
