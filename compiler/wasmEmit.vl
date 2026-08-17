@@ -4066,6 +4066,10 @@ function emitUnionPayloadUnbox(_body: i32[], k: i32) {
 function emitUnionEqOther(body: i32[], otherIx: i32, k: i32, fnIx: i32) {
   if k == 3 { return emitExprAsI64(body, otherIx, fnIx) }
   if k == 4 { return emitExprAsF64(body, otherIx, fnIx) }
+  // The STRING arm's widening twin of the three numeric ones: a literal-union ATOM operand
+  // becomes its member string (`emitStrValue`), which is the rep the box's string payload is
+  // compared against. `emitStrValue` is `emitExpr` for everything that is already a string.
+  if k == 2 { return emitStrValue(body, otherIx, fnIx) }
   if k == 5 {
     const savedF32 = pendingF32
     pendingF32 = true
@@ -4118,12 +4122,22 @@ function emitUnionConcreteEq(
   // value-union gate below reads its banked member codes instead of re-splitting the
   // rendering.
   const usid = msSetOfText(uname)
-  if uname == "" || !isValueUnionOfSet(usid, uname) {
+  // The arm SPELLINGS with a declared ALIAS resolved, and the litunion-ARM shape admitted
+  // beside the plain value union — the same two lines `emitUnionLitIs` carries, for the same
+  // reason: a `K | i32` box is a value-union box with the litunion arm riding it as its
+  // member STRING, and both the gate (`isValueUnionName`, whose `valueAtomKind("K")` is -1)
+  // and the arm-membership test read a name, so an alias or a litunion arm made them report
+  // a box that cannot hold what it holds.
+  const unmArms = unionMemberSetOf(uname)
+  if (
+    uname == "" ||
+    (!isValueUnionOfSet(usid, uname) && !unionCarriesLitUnionArm(uname))
+  ) {
     return emitFail(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  const atom = unionEqAtomOf(otherIx, uname, fnIx)
+  const atom = unionEqAtomOf(otherIx, unmArms, fnIx)
   // D-UNION-ATOM-KIND / D-EQOPCODE / D-VALKIND: the other operand's rep CODE, derived
   // ONCE. The box tag, the `string` special-cases, the payload unbox, the widened operand
   // emit, the payload-compare opcode and the membership test below are all projections of
@@ -4131,7 +4145,14 @@ function emitUnionConcreteEq(
   // outside the seven scalar keywords (a LIST / closure atom) keeps the exact
   // `TyPrim.primName` path, which is what those need.
   const eak = valueAtomKind(atom)
-  if !unionHasAtomK(usid, uname, atom, eak) {
+  // A `string`-repped other operand has an arm whenever the box can carry it as a string ref
+  // — a plain `string` arm OR a literal-union arm, `unionTakesAtomAsStr`'s question and
+  // `emitUnionLitIs`'s same second leg. Without it a `K | i32` box statically answers
+  // `u == k` FALSE: the banked member kinds carry only `i32` (`valueAtomKind("K")` is -1), so
+  // the arm that actually holds the value looks absent.
+  let eqHasArm = unionHasAtomK(usid, unmArms, atom, eak)
+  if !eqHasArm && eak == 2 && unionTakesAtomAsStr(unmArms) { eqHasArm = true }
+  if !eqHasArm {
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
@@ -15249,11 +15270,21 @@ function strReppedLitUnionAt(ix: i32, fnIx: i32) {
 // member's id and answer `u == kk` TRUE against that member: a silent wrong answer traded for
 // invalid wasm. So the mixed pair is refused here and lowered the other way round, by widening
 // the ATOM to its member string (`emitStrValue`), which is total in the direction it runs.
+// A union BOX is refused on the `exprUnion` line, and that line is the emitter's REP
+// classifier standing in front of a banked-TYPE test on purpose. The checker banks a PURE
+// litunion type at a `K | i32` operand of this very compare, so `nodeTyIsLitUnion` below
+// answers TRUE for a value whose STORAGE is a `{tag, anyref}` box — `i32.eq` over a box ref,
+// `vl check` rc 0. The box's own lowering is the tag-gated payload compare
+// (`emitUnionConcreteEq`), which the arm above this one claims through the same predicate.
+// The order matters: an atom-repped or member-literal operand is claimed BEFORE the box test,
+// because `unionNameOfIdent` claims a `K`-annotated binding too (`K` is a registered union
+// NAME while the value is a bare id).
 function eqAtomOperandOk(ix: i32, fnIx: i32) {
   if exprIsLitAtom(ix, fnIx) { return true }
   const av = unwrapParen(ix)
   const e = P.nodes[av]
   if e is StrLit { return true }
+  if exprUnion(ix, fnIx) { return false }
   nodeTyIsLitUnion(av)
 }
 
@@ -15917,11 +15948,18 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     let uqNull = false
     if uql is NullLit { uqNull = true }
     if uqr is NullLit { uqNull = true }
-    const uqLit = exprIsLitAtom(e.binLeft, fnIx) ||
-      exprIsLitAtom(e.binRight, fnIx)
-    if !uqNull && !uqLit {
-      const uqL = exprUnion(e.binLeft, fnIx)
-      const uqR = exprUnion(e.binRight, fnIx)
+    // THE LITUNION EXCLUSION IS PER-OPERAND, NOT PER-COMPARE. `exprUnion` claims a
+    // `K`-annotated binding too — `K` is a registered union NAME while the value is a bare
+    // interned id — so this arm has to disqualify the litunion OPERAND rather than the whole
+    // compare. Disqualifying the compare made `boxU == k` skip the union path entirely
+    // because ONE side was an atom, and the atom compare below then pushed the BOX ref under
+    // an `i32.eq`: `vl check` rc 0, invalid wasm. `eqAtomOperandOk` is the same bound that
+    // arm keys on, so exactly one of the two claims any given pair.
+    if !uqNull {
+      const uqL = exprUnion(e.binLeft, fnIx) &&
+        !eqAtomOperandOk(e.binLeft, fnIx)
+      const uqR = exprUnion(e.binRight, fnIx) &&
+        !eqAtomOperandOk(e.binRight, fnIx)
       if uqL && uqR {
         return emitUnionUnionEq(
           body,
@@ -15972,7 +16010,8 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if !atomNull {
       if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
         if (
-          eqAtomOperandOk(e.binLeft, fnIx) && eqAtomOperandOk(e.binRight, fnIx)
+          eqAtomOperandOk(e.binLeft, fnIx) &&
+          eqAtomOperandOk(e.binRight, fnIx)
         ) {
           const luCtx = expCtxHere()
           luCtx.litUnion = 1
