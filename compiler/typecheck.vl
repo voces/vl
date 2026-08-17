@@ -23904,7 +23904,59 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   // with the live state (so a read AFTER an in-body assignment is fine), then
   // RESTORE the pre-loop state for the fall-through.
   const daLoopEntry = daSnapshot()
+  // THE BODY IS A NARROWING SCOPE, exactly like an `if` THEN-arm: the condition
+  // is re-tested before every iteration, so whatever it proves holds on entry to
+  // each one (`while e != null { e + 1 }` reads the unboxed `i32`).
+  //
+  // WHY A BODY THAT REASSIGNS THE GUARDED BINDING NEEDS NO INVALIDATION PASS.
+  // A bare-name narrowing here is a shadowing `declare` into a scope pushed for
+  // the body, so the narrowed type is the binding's ACCEPT contract inside it
+  // too — a null write is a type error, not a silently-invalidated fact. The
+  // `if` arm has always worked that way (`if e != null { e = null }` is "cannot
+  // assign null to i32"), and matching it is what makes the loop sound with no
+  // flow analysis: every way of putting a null back — a literal, a nullable
+  // call's result — is rejected inside the body, and a non-null write keeps the
+  // fact true. The `while` spelling inherits that rule verbatim.
+  //
+  // TWO KINDS OF FACT ARE FILTERED OUT, and each has its own reason.
+  //
+  // ONLY A NULL STRIP, never an `is T` variant pin. The write contract above is what
+  // makes a strip free: the one assignment it forbids is the one that would falsify it.
+  // A variant pin costs something real — it would reject the assignment that FLIPS the
+  // variant, and that is how a loop over a union terminates
+  // (`while x is i64 { … x = true }`, `unions/paren-is-narrow.vl`, which this rejected
+  // until the filter went in). The test is the same one the post-guard narrowing already
+  // uses: the fact equals the place's type with `null` peeled off.
+  //
+  // PROPERTY PATHS (`o.v`) ARE EXCLUDED. They are not a scope-shadowed binding
+  // but an overlay keyed by path string, and nothing re-points the WRITE side at
+  // the declaration for them, so a path fact can be falsified inside the body
+  // through any alias of the object — a call taking the struct clears the field
+  // and the fact survives. That hole is reachable in an `if` arm today (a
+  // narrowed `o.v` read after such a call is check-clean and traps or reads a
+  // stale value), so extending path narrowing to a loop body would only widen
+  // it. Bare names have no aliasing: a local is the only name for its slot.
+  const wnNames: string[] = []
+  const wnTys: i32[] = []
+  collectThenNarrows(n.whileCond, wnNames, wnTys)
+  const wbNames: string[] = []
+  const wbTys: i32[] = []
+  let wi = 0
+  while wi < wnNames.length {
+    if !isPathKey(wnNames[wi]) {
+      if wnTys[wi] == nonNullTy(lookup(wnNames[wi])) {
+        wbNames.push(wnNames[wi])
+        wbTys.push(wnTys[wi])
+      }
+    }
+    wi = wi + 1
+  }
+  if wbNames.length > 0 {
+    pushScope(-1)
+    applyNarrows(wbNames, wbTys)
+  }
   checkNode(n.whileBody)
+  if wbNames.length > 0 { popScope() }
   daRestore(daLoopEntry)
   return TY_VOID
 }
