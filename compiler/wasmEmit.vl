@@ -485,6 +485,7 @@ import {
   forInElemKind,
   forInMapRecv,
   forInMapValsSlot,
+  forInMapWalksVals,
   forInStringSrc,
   globalCellKind,
   globalCellStructIdx,
@@ -526,7 +527,6 @@ import {
   listOpKindOfBin,
   localIndexOf,
   mapAnnShape,
-  mapIsSetExpr,
   mapRetExprShape,
   mapShapeOfExpr,
   mapSlotTag,
@@ -5393,6 +5393,32 @@ function cmValsBkLocal() {
   fnMvValsBkLocal(cmSlot)
 }
 
+// Evaluate the map receiver `recvIx` ONCE and leave its `(ref $mapStruct)` on the
+// operand stack, ready for the mapRef store.
+//
+// ONE HOME FOR EVALUATING A MAP RECEIVER. Every consumer that parks a map in the
+// mapRef local — the indexed-read/set/`??`/`.has`/`delete` probe path
+// (`emitMapRecvKey`) and the tombstone-aware `for`-in walk (`emitForInStmt`) — goes
+// through here, because the two properties this owns are exactly the two that a
+// second hand-written copy loses:
+//   · the receiver expression is emitted EXACTLY ONCE, so its side effects run once
+//     and every later read (the walked list, `live[]`, the probe) sees the SAME
+//     object. A receiver re-emitted for a second read is a fresh evaluation, so a
+//     factory returning a new map per call leaves the two reads on DIFFERENT maps.
+//   · a NULLABLE map receiver (`{[string]: V} | null`, kind `nulmap`) is a
+//     `(ref null $mapStruct)`, so it is recovered before the `(ref $mapStruct)`
+//     mapRef store. The checker proved every narrowed map op guarded, so the cast
+//     never traps. Omitting it is `vl check`-clean INVALID WASM (`type mismatch:
+//     expected (ref $type), found (ref null $type)`), never a diagnostic — the map
+//     twin of the nulstruct field-read `ref.as_non_null` (`emitMemberNode`).
+function pushMapRecvRef(body: i32[], recvIx: i32, fnIx: i32) {
+  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  if exprNullableMap(recvIx, fnIx) {
+    wU8(212) // 0xd4 ref.as_non_null
+  }
+  0
+}
+
 // `local.get` / `local.set` of the current op's mapRef.
 function pushMapRef(_body: i32[]) {
   fbLocalGet(cmMapRefLocal()) // 0x20 local.get
@@ -5657,14 +5683,7 @@ function emitMapRecvKey(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   }
   // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
   // construction — an Ident/global/constructor).
-  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
-  // A NULLABLE map receiver (`{[string]: V} | null`, kind `nulmap`) is a `(ref null $mapStruct)` —
-  // recover its non-null ref before the `(ref $mapStruct)` mapRef store (the checker proved every
-  // narrowed map op guarded, so the cast never traps). The map twin of the nulstruct field-read
-  // `ref.as_non_null` (`emitMemberNode`).
-  if exprNullableMap(recvIx, fnIx) {
-    wU8(212) // 0xd4 ref.as_non_null
-  }
+  if pushMapRecvRef(body, recvIx, fnIx) < 0 { return -1 }
   // A STRING-keyed map's KEY is a string ref — shield it from an ambient atom context
   // (an atom-typed binding init `const x: K = m["k"] ?? "a"` seeds `pendingLitUnion`
   // around the whole init, which would lower the key literal as an i32 atom id). An
@@ -13270,51 +13289,39 @@ function pushListBacking(_body: i32[], lIdx: i32, lTy: i32) {
   0
 }
 
-// Push the LIST ref a `for v in <iter>` iterates: a map `.keys()`/`.values()`
-// reads the map struct's ordered list field (0 = keys, 1 = vals); any other
-// supported iterable is the list value itself.
+// Push the LIST ref a `for v in <iter>` iterates.
+//
+// A MAP iterable — `m.keys()`, `m.values()` and the bare `for k in m` alike — reads the
+// ordered list field off the map ref the CALLER already stashed (`mapRecv >= 0`,
+// `mwShape` its pinned shape): field 1 for a vals walk, field 0 for a keys walk. Any
+// other supported iterable is the list value itself, emitted here.
+//
+// THE RECEIVER IS NOT RE-EMITTED. Its ONE evaluation is the caller's stash
+// (`pushMapRecvRef`), and reading the stash is what keeps the walked list, the
+// tombstone `live[]` and the loop bound on ONE object: a second emission of the
+// receiver expression is a second evaluation, so a factory receiver would hand the
+// walk a different map than the skip consults — and re-run the receiver's side
+// effects. `forInMapRecv` and `forInMapWalksVals` are the paired classifiers that
+// decide "is this a map walk" and "which field", and the caller's stash is gated on
+// the same `forInMapRecv`, so the two can never disagree about whether a stash exists.
 //
 // DELETE-AWARE ITERATION: the keys/vals LIST WRAPPER is decoupled from the map struct
 // (its `len` counts appended entries == `count`), so a straight len-walk would VISIT
-// tombstoned entries. The for-in loop therefore stashes the MAP ref in the map scratch
-// frame (slot 0) and, per entry `i`, SKIPS when `M.live[i] == 0` — a map-struct-aware
-// walk over `[0, count)` matching the host's iteration semantics (order + skipping).
-// For a delete-free map `live` is all-1s, so the skip never fires (behavior-preserving).
-function emitForInList(body: i32[], iterIx: i32, fnIx: i32) {
-  const e = P.nodes[iterIx]
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Member {
-      if exprMap(callee.memObj, fnIx) {
-        let fsl = mapShapeOfExpr(callee.memObj, fnIx)
-        fsl = mapShapeFoldSet(fsl)
-        if callee.memProp == "keys" {
-          if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-          fbStructGet(mapTypeIdxOf(fsl), 0) // field 0: ordered keys list
-          return 0
-        }
-        if callee.memProp == "values" {
-          if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-          // A SET's `.values()` walks the ordered KEYS (its elements); a map's
-          // walks the ordered vals.
-          if mapIsSetExpr(callee.memObj, fnIx) {
-            fbStructGet(mapTypeIdxOf(fsl), 0) // field 0: ordered keys list
-          } else {
-            fbStructGet(mapTypeIdxOf(fsl), 1) // field 1: ordered vals list
-          }
-          return 0
-        }
-      }
-    }
-  }
-  // A bare map iterable (`for k in m`) walks its ordered keys list (field 0) — the same
-  // tombstone-aware loop as `m.keys()`, no intermediate key list built.
-  if exprMap(iterIx, fnIx) {
-    let bsl = mapShapeOfExpr(iterIx, fnIx)
-    bsl = mapShapeFoldSet(bsl)
-    if emitExpr(body, iterIx, fnIx) < 0 { return -1 }
-    fbStructGet(mapTypeIdxOf(bsl), 0) // field 0: ordered keys list
-    return 0
+// tombstoned entries. The for-in loop therefore consults `M.live[i]` per entry off the
+// stashed map ref and SKIPS a tombstone — a map-struct-aware walk over `[0, count)`
+// matching the host's iteration semantics (order + skipping). For a delete-free map
+// `live` is all-1s, so the skip never fires.
+function emitForInList(
+  body: i32[],
+  iterIx: i32,
+  fnIx: i32,
+  mapRecv: i32,
+  mwShape: i32,
+) {
+  if mapRecv >= 0 {
+    cmSlot = mwShape
+    if forInMapWalksVals(iterIx, fnIx) { return pushMapVals(body) }
+    return pushMapKeys(body)
   }
   emitExpr(body, iterIx, fnIx)
 }
@@ -14831,22 +14838,24 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     wrapTy = scalarListWrap(ek)
     backTy = scalarListBack(ek)
   }
-  // For a map `.keys()`/`.values()` walk, stash the MAP ref (mono scratch slot 0,
-  // or the mv frame's typed mapRef) so the loop can consult `M.live[cursor]` and
-  // SKIP tombstoned entries (host-matching tombstone-aware iteration).
-  // `mapRecv >= 0` iff this is a map iteration. The pinned `cmSlot` drives both
-  // the stash and the skip's `pushMapLive` struct.get type.
+  // For a map iteration (`m.keys()`, `m.values()`, or the bare `for k in m` —
+  // `mapRecv >= 0` iff so), evaluate the receiver ONCE and stash the MAP ref (mono
+  // scratch slot 0, the i32-keyed frame's twin, or the mv frame's typed mapRef). THE
+  // STASH IS THE RECEIVER'S ONLY EVALUATION: the walked list below, the loop bound and
+  // the skip's `M.live[cursor]` all read it, so all three see one object and the
+  // receiver's side effects run once. The pinned `cmSlot` drives the stash local, the
+  // list field and the skip's `pushMapLive` struct.get type alike.
   const mapRecv = forInMapRecv(s.fiIter, fnIx)
   let mwShape = -1
   if mapRecv >= 0 {
     mwShape = mapShapeOfExpr(mapRecv, fnIx)
     mwShape = mapShapeFoldSet(mwShape)
-    if emitExpr(body, mapRecv, fnIx) < 0 { return -1 }
+    if pushMapRecvRef(body, mapRecv, fnIx) < 0 { return -1 }
     cmSlot = mwShape
     setMapRef(body) // mapRef
   }
   // list = <iter> (evaluated once); cursor = 0
-  if emitForInList(body, s.fiIter, fnIx) < 0 { return -1 }
+  if emitForInList(body, s.fiIter, fnIx, mapRecv, mwShape) < 0 { return -1 }
   // A NARROWED nullable-list iterable keeps its nullable slot at EVERY element kind — the
   // i32-list niche, a distinct-backing scalar list and a ref array alike; the `#l` temp is
   // non-null, so recover first (checker-guarded). See `nulRecvNeedsRecover`.
