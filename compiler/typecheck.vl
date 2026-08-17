@@ -6535,6 +6535,42 @@ function initMapCtorName(initIx: i32) {
   return "Map"
 }
 
+// THE ONE WORDING for a key the map rep cannot hash — the rep has exactly two hashes
+// (`mapKeyTySupported`). Both the ANNOTATION gate (`checkLetDeclNode`, which names the
+// key by its SPELLING) and the USAGE-DRIVEN pin (`checkInferredMapKey`, which names it
+// by the type the first write inferred) raise it, so the two spellings of one program
+// reject in the SAME channel with the SAME words.
+function mapKeyUnsupportedErr(keyText: string, ctor: string, at: i32) {
+  tErrUnsupported(
+    "A " +
+      keyText +
+      "-keyed " +
+      ctor +
+      " isn't supported yet — `Map`/`Set` keys must be `string` or `i32`",
+    at,
+  )
+}
+
+// Adjudicate the key a USAGE-DRIVEN pin (`m.set(k, v)`, `s.add(k)`, `m[k] = v`) just
+// wrote into an open `mKey` hole. A bare `Map()` has no annotation for the gate above
+// to read, so WITHOUT this the annotated `{[f64]: V}` is a clean type error while its
+// inferred twin checks clean and dies in codegen as `emitProgram: map key is not a
+// string` — the same program refused in two channels, one of them past `vl check`.
+// A HOLE key (an un-annotated parameter reaching `m.set(k, v)`) is not adjudicated
+// here: it is still unsolved, and the call-site re-validation owns it. An error key is
+// a cascade and stays silent.
+function checkInferredMapKey(k: i32, isSet: i32, at: i32) {
+  if k < 0 { return 0 }
+  if mapKeyTySupported(k) { return 0 }
+  const kt = T.tys[k]
+  if kt is TyVar { return 0 }
+  if kt is TyErr { return 0 }
+  let ctor = "Map"
+  if isSet == 1 { ctor = "Set" }
+  mapKeyUnsupportedErr(tyToStr(k), ctor, at)
+  0
+}
+
 // ── type → string (for diagnostics) ──────────────────────────────────────────
 // Renders a type-arena index as a readable type name. Recurses through the arena
 // for object/function/union/nullable. Narrows the `Ty` union only — never `Node`.
@@ -12755,6 +12791,7 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.mKey < 0 {
             rt.mKey = k0
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
+            checkInferredMapKey(k0, rt.mSet, ix)
           } else if (
             !assignable(k0, rt.mKey) &&
             !nomSlotAccepts(margs2[0], k0, rt.mKey)
@@ -12826,6 +12863,7 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.mKey < 0 {
             rt.mKey = ka
             tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
+            checkInferredMapKey(ka, rt.mSet, ix)
           } else if !assignable(ka, rt.mKey) {
             tErr(
               "add: expected " + tyToStr(rt.mKey) + ", got " + tyToStr(ka),
@@ -20434,6 +20472,28 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
         }
       }
+      // An index-set into a bare `Map()` (`m[k] = v`) pins its key and value holes the
+      // SAME way `m.set(k, v)` pins them one arm over — the two WRITE spellings of one
+      // program have to infer identically, and the array element above is the same rule
+      // for the other collection. Without it the index spelling fell to the "cannot
+      // infer" floor while both its `.set` twin and its annotated twin ran.
+      // The key type is READ off the recorded table (`checkIndexNode` already checked
+      // the whole target), so a diagnostic inside the key expression is not raised twice.
+      if arrT0 is TyMap {
+        if arrT0.mKey < 0 {
+          let kt0 = nodeTyIxOf(tgt.idxIndex)
+          if kt0 < 0 { kt0 = checkNode(tgt.idxIndex) }
+          if kt0 >= 0 {
+            arrT0.mKey = kt0
+            tyMutEpoch = tyMutEpoch + 1 // index-write pinned the key in place
+            checkInferredMapKey(kt0, arrT0.mSet, ix)
+          }
+        }
+        if arrT0.mVal < 0 {
+          arrT0.mVal = rt
+          tyMutEpoch = tyMutEpoch + 1 // index-write pinned the value in place
+        }
+      }
       // FREE INDEX-WRITE OPERATOR (B14): `x[i] = v` resolves to a
       // `function "[]="(self: T, i: I, v: V)` by the receiver's TYPE. Banked on
       // THIS assignment node, not on the target `Index` — the target keeps the
@@ -20999,15 +21059,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         let badKey = ""
         if mapKeyIx >= 0 { badKey = tsText[mapKeyIx] }
         if badKey != "" && !mapKeyTySupported(tsLeafTy(badKey)) {
-          tErrUnsupported(
-            "A " +
-              badKey +
-              "-keyed " +
-              initMapCtorName(n.letInit) +
-              " isn't supported yet — `Map`/`Set` keys must be " +
-              "`string` or `i32`",
-            n.letType,
-          )
+          mapKeyUnsupportedErr(badKey, initMapCtorName(n.letInit), n.letType)
         } else {
           tErr(unknownTyText(tn.tyName), n.letType)
         }
