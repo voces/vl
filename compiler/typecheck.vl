@@ -6216,7 +6216,24 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // element / store position flows through here, which is what makes one hook enough.
   // Inert unless the parameter-solve probe is running.
   noteHoleFlow(srcTy, dstTy)
-  if assignable(srcTy, dstTy) { return true }
+  if assignable(srcTy, dstTy) {
+    // THE OBJECT-SHAPE FLOOR. `assignable` accepts structural subtyping between two
+    // object shapes and the emitter has no adapter for it (`objShapeAdapterless`), so the
+    // pair used to reach codegen and fail there while `vl check` reported the file clean.
+    // It belongs at THIS seam — the one every binding / argument / return / field /
+    // element / store flows through — for the reason `assignable`'s own placement note
+    // gives: no position can be taught half the rule.
+    //
+    // Reported here and answered TRUE: the program IS type-valid, so a second
+    // "cannot assign" from the caller would contradict this one. The error already
+    // recorded is what fails the check.
+    if !inferQuiet && srcExpr >= 0 {
+      if objShapeAdapterless(srcExpr, srcTy, dstTy, 12) {
+        objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
+      }
+    }
+    return true
+  }
   // NOMINAL NEWTYPE (P1.5): a SYNTACTIC literal is brand-polymorphic — it adopts the
   // destination's brand (`const e: EntityId = 1`, `xs: EntityId[] = [1, 2]`). A literal
   // has no prior identity, so it cannot be the confusion a newtype exists to catch:
@@ -12331,6 +12348,296 @@ function objNumWidens(src: i32, dst: i32) {
     }
   }
   false
+}
+
+// The OBJECT pair the last `objShapeAdapterless` walk stopped on. The walk is entered
+// with the pair the author wrote (`Cat[]` into `Animal[]`) while the reason lives at a
+// nested pair (`Cat` into `Animal`); the diagnostic names both, so the container that
+// carried the pair is never mistaken for the thing that is unsupported.
+let shapeAdaptSrcTy = -1
+let shapeAdaptDstTy = -1
+
+// The expression at `ix` with `(…)` peeled — the syntactic form, for the constructor
+// exemption in `objShapeAdapterless`. -1 stays -1.
+function ctorExprOf(ix: i32) {
+  let cur = ix
+  let peel = true
+  while peel {
+    if cur < 0 { return -1 }
+    const e = P.nodes[cur]
+    if e is Paren { cur = e.parInner } else { peel = false }
+  }
+  cur
+}
+
+// Whether every field NAME of `dst` is a field name of `src` AND the two have the same
+// field count — i.e. the shapes agree on WHICH fields exist, whatever their order or
+// their field types. The emitter can rebuild a value field-by-field exactly when this
+// holds; a field it would have to DROP has no rebuild.
+function objFieldNameSetsEq(src: i32, dst: i32): boolean {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyObj {
+    if d is TyObj {
+      if s.objFieldNames.length != d.objFieldNames.length { return false }
+      let i = 0
+      while i < d.objFieldNames.length {
+        if objFieldType(s, d.objFieldNames[i]) < 0 { return false }
+        i = i + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// Does reaching `dst` from `src` need an object-shape ADAPTER that codegen does not
+// have? `assignable`'s `TyObj` arm is structural WIDTH + DEPTH subtyping — it walks the
+// DESTINATION's field names only, so a source carrying EXTRA fields is accepted. The
+// emitter interns a struct's wasm heap type from its own field list, so the two shapes
+// are unrelated wasm types: the reference does not fit the slot and there is no
+// conversion to insert. Such a pair reached codegen and failed there — as invalid wasm at
+// a direct store/call, and as an `indirect call type mismatch` TRAP when it sat in a
+// function value's signature.
+//
+// SCOPE, and it is measured rather than assumed. The axis is the SOURCE's shape
+// PROVENANCE, not the container and not the width-vs-depth relation:
+//   - A field the destination LACKS has no lowering under ANY source form — an annotated
+//     binding, a parameter, a call result, and an UN-annotated binding of a literal all
+//     emit invalid wasm. That is what this answers true for.
+//   - Every OTHER difference between two shapes that agree on their field names — a
+//     reordered field list, a field whose own type widens, a nested shape that differs —
+//     is broken for a PINNED source and CORRECT for an un-annotated binding of an object
+//     literal, because the emitter re-interns that literal at the destination row. The
+//     two are indistinguishable from the types alone, so this declines both: rejecting
+//     them would reject working programs. They remain a `vl check`-clean emit hole, and
+//     closing them needs the emitter to grow the adapter (the variance work), not a
+//     wider rule here.
+//
+// The recursion mirrors the containers `assignable` itself recurses through — nullable
+// inner, union member, array element, map key/value, function slot (parameters swapped,
+// as `assignable` compares them) — so wherever `assignable` can reach an object pair,
+// this can too. A bare binding breaks exactly as an array element does.
+//
+// An object LITERAL is exempt, and that exemption is the workaround the diagnostic names:
+// it is BUILT at the destination shape, so the value reaching the slot already has the
+// slot's rep. Its FIELD VALUES are not exempt — each is judged against the destination
+// field's type on its own — which is how `{ p: someCat }` into `{ p: Animal }` is caught
+// while `{ p: { legs: 4, purr: true } }` is not. An array literal is exempt element-wise
+// the same way.
+//
+// A pair reaching an inference HOLE is never claimed: `{x: _, y: _}` is not a shape yet,
+// and `tyEq` calls it different from every concrete shape.
+//
+// Answers only for pairs `assignable` already ACCEPTED; a rejected pair keeps its own
+// diagnostic and never reaches here.
+function objShapeAdapterless(
+  srcExpr: i32,
+  src: i32,
+  dst: i32,
+  depth: i32,
+): boolean {
+  if src < 0 || dst < 0 || depth <= 0 { return false }
+  if src == dst { return false }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  // Nullable pairs peel exactly as `assignableGo`'s nullable arm does, and in its order.
+  if d is TyNullable {
+    if s is TyNullable {
+      return objShapeAdapterless(-1, s.nInner, d.nInner, depth - 1)
+    }
+    return objShapeAdapterless(srcExpr, src, d.nInner, depth - 1)
+  }
+  // A union SOURCE is assignable when EVERY member is, so any member needing an adapter
+  // makes the whole flow one.
+  if s is TyUnion {
+    const sms = s.uMembers
+    let si = 0
+    while si < sms.length {
+      if objShapeAdapterless(-1, sms[si], dst, depth - 1) { return true }
+      si = si + 1
+    }
+    return false
+  }
+  // A union TARGET accepts the source at SOME member. It is adapterless only when no
+  // accepting member is: one clean member is a lowering.
+  if d is TyUnion {
+    const dms = d.uMembers
+    let di = 0
+    let anyClean = false
+    let anyAdapts = false
+    while di < dms.length {
+      if assignable(src, dms[di]) {
+        if objShapeAdapterless(srcExpr, src, dms[di], depth - 1) {
+          anyAdapts = true
+        } else {
+          anyClean = true
+        }
+      }
+      di = di + 1
+    }
+    if anyClean { return false }
+    return anyAdapts
+  }
+  const cx = ctorExprOf(srcExpr)
+  if s is TyObj {
+    if d is TyObj {
+      // `tyEq` is render-equality, which is exactly the emitter's interning key: ordered
+      // field names, each field type compared the same way. Two aliases of one shape are
+      // equal here, and that is the accepted neighbour the rule must not touch.
+      if tyEq(src, dst) { return false }
+      if tyReachesHole(src, 8) || tyReachesHole(dst, 8) { return false }
+      if cx >= 0 {
+        const ce = P.nodes[cx]
+        if ce is ObjLit {
+          // The literal itself is rebuilt at `dst`; its field VALUES still have to fit
+          // the destination field types, judged with their own expressions.
+          const dnames = d.objFieldNames
+          const dtys = d.objFieldTypes
+          let li = 0
+          while li < dnames.length {
+            const sft = objFieldType(s, dnames[li])
+            if sft >= 0 {
+              let fexpr = -1
+              const fl = ce.objFields
+              let fi = 0
+              while fi < fl.length {
+                const fn = P.nodes[fl[fi]]
+                if fn is FieldInit {
+                  if fn.fiName == dnames[li] { fexpr = fn.fiValue }
+                }
+                fi = fi + 1
+              }
+              if objShapeAdapterless(fexpr, sft, dtys[li], depth - 1) {
+                return true
+              }
+            }
+            li = li + 1
+          }
+          return false
+        }
+      }
+      if objFieldNameSetsEq(src, dst) { return false }
+      shapeAdaptSrcTy = src
+      shapeAdaptDstTy = dst
+      return true
+    }
+    return false
+  }
+  if s is TyArray {
+    if d is TyArray {
+      if cx >= 0 {
+        const ae = P.nodes[cx]
+        if ae is ArrayLit {
+          const els = ae.arrElems
+          let ei = 0
+          while ei < els.length {
+            if (
+              objShapeAdapterless(
+                els[ei],
+                nodeTyIxOf(els[ei]),
+                d.aElem,
+                depth - 1,
+              )
+            ) {
+              return true
+            }
+            ei = ei + 1
+          }
+          return false
+        }
+      }
+      return objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1)
+    }
+    return false
+  }
+  if s is TyMap {
+    if d is TyMap {
+      if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1) { return true }
+      return objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1)
+    }
+    return false
+  }
+  if s is TyFunc {
+    if d is TyFunc {
+      const sp = s.fnParamTypes
+      const dp = d.fnParamTypes
+      if sp.length != dp.length { return false }
+      if objShapeAdapterless(-1, s.fnRet, d.fnRet, depth - 1) { return true }
+      let pi = 0
+      while pi < sp.length {
+        // Parameters compare contravariantly in `assignable`'s `TyFunc` arm; keep the
+        // same operand order so the pair examined is the pair it accepted.
+        if objShapeAdapterless(-1, dp[pi], sp[pi], depth - 1) { return true }
+        pi = pi + 1
+      }
+      return false
+    }
+    return false
+  }
+  false
+}
+
+// The field names `src` carries that `dst` does not, rendered `` `a`, `b` ``.
+function objDroppedFieldList(src: i32, dst: i32) {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  let out = ""
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < s.objFieldNames.length {
+        if objFieldType(d, s.objFieldNames[i]) < 0 {
+          if out != "" { out = out + ", " }
+          out = out + "`" + s.objFieldNames[i] + "`"
+        }
+        i = i + 1
+      }
+    }
+  }
+  out
+}
+
+// The message for an `objShapeAdapterless` pair. It names the OBJECT pair that has no
+// lowering and the fields that make it one — not the container that carried it, which is
+// reported separately so a reader of `Cat[]` into `Animal[]` is not left thinking arrays
+// are the unsupported thing — then the two ways out. Neither way out claims a position:
+// the literal clause states what a constructor DOES (it is built at the shape it flows
+// into) and holds at every position this fires from, and spelling the source at the
+// target's shape holds everywhere.
+function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
+  let sT = shapeAdaptSrcTy
+  let dT = shapeAdaptDstTy
+  if sT < 0 || dT < 0 {
+    sT = src
+    dT = dst
+  }
+  let through = ""
+  if !tyEq(sT, src) || !tyEq(dT, dst) {
+    through = " (reached through " +
+      tyToStr(src) +
+      " into " +
+      tyToStr(dst) +
+      ")"
+  }
+  tErrUnsupported(
+    "an object value of shape " +
+      tyToStr(sT) +
+      " flowing into " +
+      tyToStr(dT) +
+      through +
+      " drops the field " +
+      objDroppedFieldList(sT, dT) +
+      ": type-valid (structural width subtyping) but not yet supported by codegen — a " +
+      "struct's wasm type is its own field list, so these are unrelated types and no " +
+      "field-dropping conversion exists. Construct the value at " +
+      tyToStr(dT) +
+      " (an object literal is built at the shape it flows into), or declare the source " +
+      "with exactly " +
+      tyToStr(dT) +
+      "'s fields",
+    srcExpr,
+  )
 }
 
 function assignable(src: i32, dst: i32) {
