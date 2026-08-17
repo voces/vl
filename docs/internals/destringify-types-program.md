@@ -41590,3 +41590,240 @@ The cheapest test of any "stale cache" filing is to build the invalidation and s
 moves. Here it moved nothing, and the build cost less than the census did.
 
 <!-- APPEND-MARKER-NWBRANDKEY-END -->
+
+<!-- APPEND-MARKER-ISBANK-BEGIN -->
+
+## D-ISBANK — B1a taken, and the column that separated it was SYNTACTIC. The mint-free half of the `is` triple resolution is exactly the bare-NAME half — one field of the node the reader already holds — so 2,876 of the corpus's 4,851 reader parses and **12,931 of 12,931 on the compiler's own source** now read the bank, with `T.tys` byte-identical on every file. The blocked half is measured by building it: it moves the arena on **229 of 1,735**
+
+D-CHECKPARSE filed B1a **PARTLY TAKEABLE**: the two narrowing collectors and the if-chain
+exhaustiveness scan each re-resolve the spelling `checkIsExprNode` has already resolved and banked
+(`isVarTyIx`), the bank covers 4,427 of 4,429 reader parses, **2,530 of 2,530 covered-and-mint-free
+are index-identical with 0 disagreements**, and the other **1,897 MINT a duplicate arena entry**, so
+skipping those renumbers — #1331's gate.
+
+It filed the open question precisely: *can the 2,530 be taken WITHOUT the 1,897?* The hazard named
+was B3's — that skipping some calls changes the mint ORDER even when it does not change the mint
+COUNT, which would make this BLOCKED-REP behind B5 rather than takeable.
+
+**IT IS TAKEABLE, THE ORDER HAZARD CANNOT ARISE, AND THE SPLIT IS DECIDED BY A FIELD THE FILING
+NEVER READ.**
+
+### 1. PROBE ZZB, AND ITS FOUR CONTROLS
+
+```
+base:   master 5d4294ef; build/vl-compiler.wasm from a freshly fetched seed-latest,
+        1,153,748 B, refresh-compiler.sh rc 0 self-compiling to the SAME 1,153,748 B
+        (master is its own fixpoint, so the census base IS master's published compiler)
+probe:  compiler/typecheck.vl only — one record per resolution at each of the FIVE `is`
+        sites (c9/c10/c11 the readers, c12 the `match` TYPE pattern, c13 the node itself),
+        plus arm-visit records at the two collectors and a per-program counter set on
+        `annotResolve` itself
+build:  vl build compiler/entry.vl -o C-probe2.wasm --compiler build/vl-compiler.wasm
+run:    vl check tests/cases       --compiler C-probe2.wasm    # rc 1, the probe raises
+        vl check compiler/entry.vl --compiler C-probe2.wasm
+```
+
+`ZZB|<seq>|c<site>|b<isVarTyIx bank, read BEFORE the call>|a<answer>|m<ΔT.tys across the call>|k<the
+spelling tree's ROOT KIND>|L<len>|<spelling>`, plus one `ZZT|<T.tys.length>|<records>|ar<depth-0
+annotResolve reaches>|ts<tree leg>|nm<string leg>|am<arena entries minted across those reaches>` per
+program. Records are BANKED into a `string[]` and pushed onto `T.diags` at the end of `checkProgram`
+— past the three speculative regions that pop it and the fourth that gates `validateEscJoins` on its
+LENGTH, which is D-CHECKPARSE's own landmine.
+
+| control | reading |
+|---|---|
+| **the records reconstruct the run** | 13,849 `ZZ` lines = 1,735 `ZZT` + 4,782 arm visits + 18 `is null` visits + **7,314 `ZZB`**, exactly. |
+| **the instrument is not deduping** | the `ZZB` sequence numbers are **contiguous in all 444 files that carry any** — no gaps, no repeats. The `T.diags` push bypasses `tErrCoded`'s exact-repeat dedup and the sequence is the check that it did. |
+| **no torn record** | `L − len(spelling)` takes exactly two values corpus-wide: **0** (7,296 records) and **3** (18). The 3 is a module-merge RENAMED name whose three leading code units the host's diagnostic reader drops (`char::from_u32`) — the same render artifact D-FIELDROWMINT named; on the compiler's own source, which IS a module merge, it is 3 on all 19,398. A tear would produce arbitrary deltas and orphan fragments; there are none. |
+| **no reader resolution fails** | the answer is `< 0` on **0 of 4,851** reader parses, so the substitution below never stands in for a failure. |
+
+Denominators: **1,777 `.vl` files** under `tests/cases`, **1,735 `checkProgram` invocations** (a
+module directory merges its files into one check; 42 files stop before the checker), 444 of them
+reaching a reader at all.
+
+### 2. THE FILED SPLIT, RE-DERIVED — in CALLS as well as reaches
+
+Every reader site is on the DIRECT route (no memo), so at each of them CALLS = `annotResolve`
+reaches = PARSES. The unit that is not equal to those is the ARM VISIT: a collector reaches its
+`IsExpr` arm and then declines to call, for `is null` (which pins the null type without resolving)
+or, at the else-collector, for a place behind an optional hop.
+
+| site | arm VISITS | `is null` | opt-hop return | **CALLS = reaches = parses** | bank covers | **index-identical** | **disagree** | **mint-free** | **minting** | ΔT.tys |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| c9 `collectThenNarrows` | 2,395 | 9 | — | **2,386** | 2,385 | 1,423 | 962 | 1,424 | 962 | 1,735 |
+| c10 `collectElseNarrows` | 2,387 | 9 | 4 | **2,374** | 2,373 | 1,411 | 962 | 1,412 | 962 | 1,735 |
+| c11 `ifChainExhausts` | — | — | — | **91** | 91 | 78 | 13 | 78 | 13 | 13 |
+| **the three READERS** | | | | **4,851** | **4,849** | **2,912** | **1,937** | **2,914** | **1,937** | **3,483** |
+| c13 `checkIsExprNode` (the WRITER) | — | — | — | 2,336 | 999 | 557 | 442 | 1,374 | 962 | 1,735 |
+| c12 `match` TYPE pattern | — | — | — | 127 | 32 | 32 | **0** | 127 | **0** | 0 |
+
+**THE PARTITION IS EXACT, AND IT IS THE FILED ONE.** Of the 4,849 bank-covered reader parses,
+**2,912 of 2,912 mint-free reads are index-identical (0 disagreements)** and **1,937 of 1,937
+minting reads disagree (0 agreements)**. There is no third case. The two uncovered reads are
+mint-free and fall through to a resolution.
+
+Against the filing (`1fa7eca7`): 4,429 → **4,851**, 4,427 → **4,849**, 2,530 → **2,912**, 1,897 →
+**1,937**. Same shape, ~55 master PRs of corpus growth later.
+
+And the denominator, from the same run's `ZZT` counters:
+
+| | depth-0 `annotResolve` reaches = PARSES | tree leg | string leg | arena entries minted |
+|---|---:|---:|---:|---:|
+| corpus, 1,735 programs | **18,972** | 18,970 | **2** | 18,177 |
+| — the `is` family (c9+c10+c11+c13) | **7,187 — 37.9%** | | | |
+| — the three READERS | **4,851 — 25.6%** | | | |
+| `compiler/entry.vl`, one program | **22,031** | 22,031 | **0** | 2,220 |
+| — the `is` family | **19,398 — 88.0%** | | | |
+| — the three READERS | **12,931 — 58.7%** | | | |
+
+D-CHECKPARSE's headline figures re-derive to within the corpus's growth: the family at 36.9% → 37.9%
+of checker parsing, 87.9% → 88.0% on the compiler's own source, and the checker still parses **2**
+type strings in 1,777 files and **0** in its own 39k lines.
+
+**On the compiler's own source the readers are 12,931 parses, 12,931 bank-covered, 12,931
+index-identical, 0 disagreements, 0 mints** — the filed 12,661-of-12,661 at the same perfect reading.
+
+### 3. THE COLUMN THE FILING NEVER READ — the split is SYNTACTIC
+
+The probe carries one field D-CHECKPARSE's did not: `tsKind[annTsOf(isIx)]`, the ROOT KIND of the
+spelling tree the reader is about to walk. It separates the population completely.
+
+| root kind | reader parses | **mint-free** | **minting** |
+|---|---:|---:|---:|
+| **`TS_NAME`** — a bare identifier | **2,878** | **2,878** | **0** |
+| `TS_APP` — `Box<i32>` | 40 | 36 | 4 |
+| `TS_OBJ` | 920 | 0 | 920 |
+| `TS_ARR` | 450 | 0 | 450 |
+| `TS_MAP` | 216 | 0 | 216 |
+| `TS_FUNC` | 188 | 0 | 188 |
+| `TS_LITSTR` | 62 | 0 | 62 |
+| `TS_PAREN` | 50 | 0 | 50 |
+| `TS_LITNUM` | 43 | 0 | 43 |
+| `TS_UNION` | 4 | 0 | 4 |
+| **total** | **4,851** | **2,914** | **1,937** |
+
+On `compiler/entry.vl`: **`TS_NAME` 12,931 of 12,931**. A self-hosting compiler's `is` tests are all
+against declared node types.
+
+**ONE KIND IS MIXED AND IT IS THE ONLY ONE**: a generic APPLICATION is mint-free when the arena
+already holds that instantiation (`applyGenAliasArgs` memoizes under a RESOLVED key) and minting when
+it does not. The shipped predicate excludes it, at a cost of 36 of the 2,914.
+
+And `TS_NAME`-plus-a-bank is mint-free by CONSTRUCTION, not by census. `tsToTyReal`'s `TS_NAME` arm is
+`tsLeafTy` — `primTyOfName` (a seeded index), then `tpEnvTyOfName` (a scan of live bindings), then
+`declaredTyOfName`. The only allocation anywhere below it is `declaredTyOfName` → **`nwBrand`**, which
+mints one entry per `(name, base)` and is memoized on that pair; and `banked >= 0` says
+`checkIsExprNode` has already resolved THIS name at THIS node in THIS frame, so the brand exists
+before the reader asks. *The newtype is the one bare name whose resolution can mint, and the bank's
+own precondition is what pays for it.*
+
+### 4. THE ANSWER TO THE QUESTION THE ROW WAS OPEN ON
+
+**THE 2,912 ARE SEPARABLE FROM THE 1,937, AND THE ORDER HAZARD CANNOT ARISE.** A call whose measured
+`ΔT.tys` is **0** contributes nothing to the mint STREAM: removing it can neither delete an entry nor
+move one, because there was no entry. The 1,937 minting reads keep running, in the same order,
+minting the same rows. That is the whole difference from B3, whose population minted on **206 of
+220** and therefore had no arena-neutral subset to take.
+
+The shipped shape is a wrapper at the one home the five `is` sites already share:
+
+```vl
+function isTypeTyRead(name: string, isIx: i32) {
+  const banked = isVarTyIxOf(isIx)
+  if banked >= 0 {
+    const root = annTsOf(isIx)
+    if root >= 0 {
+      if tsKind[root] == TS_NAME { return banked }
+    }
+  }
+  isTypeTy(name, isIx)
+}
+```
+
+`checkIsExprNode` (which WRITES the bank) and the `match` pattern checker (which writes its own) keep
+calling `isTypeTy` directly: c13 finds a bank already present on 999 of its 2,336 reaches and
+disagrees on the 442 that mint, so routing the writer through the same wrapper would delete exactly
+the rows this slice refuses to delete.
+
+### 5. THE A/B — three channels per file, and a TAKE-ALL control that moves the arena
+
+The shipped change and a deliberately over-reaching variant (the same wrapper with the `TS_NAME`
+guard removed, i.e. B1a's blocked half taken as well) were built and swept identically: one worker
+file per xargs slot, concatenated, **1,777 of 1,777 records well-formed at 4 fields**.
+
+| channel | population | **shipped** | **TAKE-ALL control** |
+|---|---:|---:|---:|
+| emitted-wasm sha256, per file | 1,483 that build | **0 differ** | **0 differ** |
+| **`T.tys.length` per `checkProgram`, per file** | 1,735 | **0 differ** | **229 differ** |
+| full `vl check` diagnostics, per file | 1,777 | **0 differ** | 0 differ |
+
+**THE CONTROL IS THE SENSITIVITY PROOF AND THE MEASUREMENT OF THE BLOCKED HALF AT ONCE.** Taking the
+1,937 minting reads moves the arena on **229 of 1,735 files** — B1a's filed gate, confirmed by
+building it rather than by argument. And it reproduces D-NWBRANDKEY's instrument finding
+independently and in the same direction: **the byte channel reads 0 while the arena channel reads
+229**, so an A/B that had only looked at bytes would have graded a rep change as free.
+
+The same channels on the compiler's own source, checked by both probe compilers on the IDENTICAL
+input program: `T.tys.length` **23,645 on both**, mints **2,220 on both**.
+
+Hand-built fixtures for the shapes the fuzzer's grammar cannot emit (it emits no `new` type): a
+newtype over a primitive, a transparent single-member alias, an if-chain, the two minting shapes, a
+generic application, a bare generic alias in an `is` (whose resolution RAISES and answers the error
+type, so the bank is `>= 0`), and an unknown name (which banks nothing). All channels identical on
+all of them, and every fixture non-vacuous — `annotResolve` reaches drop 11→7, 23→11, 13→9, 18→14 on
+the bare-name fixtures and **14→14 on the composite one**. The corpus case
+`types/is-bank-reader-spellings.vl` pins the population.
+
+### 6. WHAT IT REMOVES
+
+| | base | shipped | Δ |
+|---|---:|---:|---:|
+| depth-0 `annotResolve` reaches, corpus | 18,972 | **16,096** | **−2,876 (−15.2%)** |
+| depth-0 `annotResolve` reaches, `compiler/entry.vl` | 22,031 | **9,100** | **−12,931 (−58.7%)** |
+| `T.tys` entries minted, corpus | 18,177 | 18,177 | **0** |
+| summed `T.tys.length`, corpus | 106,292 | 106,292 | **0** |
+
+2,876 rather than 2,878 because two of the corpus's bare-name reader parses have no bank at all (an
+`is` node the checker never resolved) and fall through.
+
+**WALL CLOCK IS WITHIN NOISE** — `vl check compiler/entry.vl` reads 1.68s → 1.65s over three warm
+pairs. What each removed call cost is a one-node tree walk plus a nominal lookup, not a string parse;
+this is a redundancy result on the arena's own ledger, not a perf one, and it is reported as such.
+
+### 7. GATE
+
+| leg | rc | reading |
+| --- | ---: | --- |
+| `scripts/refresh-compiler.sh` | 0 | 1,153,748 B seed → **1,153,847 B** |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| `deno test -A tests/cases_wasm_test.ts` | 0 | **1,710 passed · 0 failed · 7 ignored** |
+| `SELFHOST_NATIVE_ALIGN=1 … selfhost_native_align_test.ts` | 0 | **1,717 passed · 0 failed · 0 ignored** (ungated the same file reads **0 passed · 1,716 ignored** — verified both ways) |
+| `SELFHOST_NATIVE_ALIGN=1 … selfhost_native_release_test.ts` | 0 | **35 passed · 0 failed** — the `MELT_TABLE` / loop-shape goldens hold |
+| seed ladder leg 2 (`mv`, `fetch-seed.sh`, `--prove-fixpoint`) | 0 | master's published seed → **fixpoint in 2 compiles, byte-for-byte**, and the result is `cmp`-identical to the self-built one |
+| corpus A/B, three channels, per file | — | **0 of 1,777 rows moved on any channel** |
+
+**BYTE DELTA: +99 B** (1,153,748 → 1,153,847).
+
+### METHOD NOTES
+
+* **WHEN A CENSUS'S BLOCKED HALF IS DEFINED BY A RUNTIME PROPERTY, LOOK FOR A STATIC ONE THAT
+  PREDICTS IT EXACTLY.** D-CHECKPARSE split these 4,429 reads by whether the call MINTED, because
+  minting is what the rep gate is about — and a mint is only knowable after the call, which is what
+  made the row look unshippable in halves. The same split is `tsKind[root] == TS_NAME`, one field of
+  a node the reader already holds, evaluable before the call. *A gate you can evaluate before the
+  call is a gate you can ship; the census that filed the row had the field in hand and did not print
+  it.*
+* **A ZERO-MINT CALL NEEDS NO ORDER ARGUMENT.** The hazard that closed B3 — removing calls reorders
+  the mints that remain — cannot arise from a call whose measured `ΔT.tys` is 0. *"Does the mint
+  COUNT stay equal" is the wrong question; "is the removed call in the mint stream at all" is the
+  right one, and it is the same two lines of instrument.*
+* **THE ARENA CHANNEL IS THE INSTRUMENT AND THE BYTE CHANNEL IS NOT — DEMONSTRATED BY BUILDING THE
+  BAD VARIANT.** A take-all control moved **0 of 1,483 files on the emitted wasm and 229 of 1,735 on
+  `T.tys.length`**. Building the change you are refusing costs one compile and turns a filed gate
+  into a measurement; it also proves the channel that read 0 for the shipped change was awake.
+* **THE ONE BARE NAME WHOSE RESOLUTION CAN MINT IS THE NEWTYPE, AND THE FUZZER CANNOT SEE IT.** The
+  grammar emits no `new` type, so the `nwBrand` witness has to be hand-built — and it is the exact
+  shape whose safety argument is not "leaves do not allocate" but "the bank's own precondition
+  already paid for the allocation".
+
+<!-- APPEND-MARKER-ISBANK-END -->
