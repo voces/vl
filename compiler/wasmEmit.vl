@@ -259,6 +259,7 @@ import {
   narrowSets,
   narrowTop,
   narrowTys,
+  nulStrReadStaysRaw,
   pendingF32,
   pendingF64,
   pendingI64,
@@ -1522,7 +1523,7 @@ export function emitClosureValueCore(body: i32[], fe: i32, fnIx: i32) {
 // 9) keep nullable reads and the USE site (`emitMem`, the index path) recovers.
 function emitCapturedReadRecover(fe: i32, name: string) {
   if captureValKind(fe, name) == "nulstr" {
-    if !pendingRawNullRead && !pendingNulString {
+    if !nulStrReadStaysRaw() {
       fbRefAsNonNull() // 0xd4 ref.as_non_null
     }
   }
@@ -4486,7 +4487,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
     // `ref.as_non_null` a legitimately-null value and TRAP. A `boolean | null` field (code
     // 21) needs no recovery at all: its i32 sentinel reads as-is.
     if sFieldTypeAt(si, idx) == 20 {
-      if !pendingRawNullRead && !pendingNulString {
+      if !nulStrReadStaysRaw() {
         wU8(212) // 0xd4 ref.as_non_null
       }
     }
@@ -15305,7 +15306,7 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
       // value read (`x ?? d`, `!= null`) left a `(ref null $array)` where a `(ref $array)`
       // is expected (a function-scope local already recovers via the local path below).
       if gck0 == "nulstr" {
-        if !pendingRawNullRead && !pendingNulString {
+        if !nulStrReadStaysRaw() {
           wU8(212) // 0xd4 ref.as_non_null
         }
         return 0
@@ -15357,7 +15358,7 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
   fbLocalGet(idx)
   // The `string | null` (kind 16) READ RULE for a param/local — stated at `emitMem`'s
   // field read. Mirrors the kind-15 list read, which never eagerly recovers.
-  if !pendingRawNullRead && !pendingNulString {
+  if !nulStrReadStaysRaw() {
     if paramNulString(fnIx, e.identName) || declaredNulString(e.identName) {
       fbRefAsNonNull() // 0xd4
     }
@@ -16570,6 +16571,54 @@ function emitArrayCopyIntr(body: i32[], callIx: i32, fnIx: i32) {
 }
 
 // The fused map/list/struct nullish-coalescing lowering (`emitBinExprNode`'s `??` arm).
+// Whether the `string | null` `??` node at `exprIx` lowers with a NULLABLE result — i.e.
+// whether its value `if` declares `(ref null $aTypeIdx)` rather than `(ref $aTypeIdx)`.
+//
+// THE RESULT TYPE IS THE DEFAULT'S NULL-NESS, NOT A CONSTANT. A NON-null default collapses
+// the whole read to `string` (the 2026-07-23 user-semantics ruling `coalesceStaysNullable`
+// states for the map-value dual), so `(ref $aTypeIdx)`; a NULLABLE default leaves the result
+// `string | null` and the block must say so, or the then-arm's legitimately-null value meets
+// a non-null block type.
+//
+// IT ASKS `exprNullableString` OF THE `??` NODE ITSELF, which is the ONE place that already
+// answers "does this expression yield a `string | null`" — and whose own `??` arm is exactly
+// `nullable lhs && nullable default`. Reading the CHECKER's banked node type instead answers
+// the same question for a source-spelled `??` and answers it WRONG for a synthesized one: a
+// chained `p ?? q ?? r` re-associates to `p ?? (q ?? r)` through `mkBinary(…, -1)`, and that
+// inner node has no banked type, so the chain declared a non-null block around a nullable
+// default. The classifier is structural, so it covers both spellings by construction.
+//
+// The CONSUMER half matters too, and it is the whole read gate, not half of it: a consumer
+// that takes the raw nullable ref (`nulStrReadStaysRaw` — a `!= null` test, OR a
+// `string | null` BINDING / arg / return target) can be handed a nullable result; any other
+// consumer gets the non-null block and the recovering arms, which is the shape every
+// non-null-default program already had. Asking only `pendingRawNullRead` left the BINDING
+// consumer (`const nv = p ?? q`) declaring a non-null block around a default arm that stayed
+// raw — invalid wasm with `vl check` rc 0.
+//
+// ONE HOME FOR BOTH SPELLINGS. The re-evaluating (ident / struct-field lhs) arm and the
+// stash-based CALL arm are the same lowering over the same rep, so they must declare the same
+// block type; the call arm hard-coded the non-null one, which is how `f() ?? g()` stayed
+// invalid after the ident arm was taught.
+function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
+  nulStrReadStaysRaw() && exprNullableString(exprIx, fnIx)
+}
+
+// The context ONE ARM of a `string | null` `??` emits under: `raw` iff the arm's value may be
+// left as `(ref null $aTypeIdx)`, which is exactly the block type the lowering just declared.
+//
+// BOTH HALVES OF THE READ GATE ARE OVERRIDDEN, not just `rawNullRead`. The arms otherwise
+// inherit the ambient `pendingNulString` from the CONSUMER, and a nullable-string BINDING
+// consumer with a NON-null default (`const nv: string | null = p ?? "d"`) then read its arms
+// raw inside a `(ref $aTypeIdx)` block. `nulStrReadStaysRaw` is the disjunction, so an arm
+// that means "recover" has to clear both flags and one that means "stay raw" has to set both.
+function coalesceNulStrArmCtx(raw: boolean): ExpCtx {
+  const c = expCtxHere()
+  c.rawNullRead = raw
+  c.nulString = raw
+  return c
+}
+
 function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized LHS so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -16678,16 +16727,7 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if emitExprExpect(body, e.binLeft, fnIx, rawCtx) < 0 { return -1 }
     wU8(209) // 0xd1 ref.is_null → 1 if null
     wU8(4)   // 0x04 if
-    // THE RESULT TYPE IS THE DEFAULT'S NULL-NESS, NOT A CONSTANT. A NON-null default
-    // collapses the whole read to `string` (the 2026-07-23 user-semantics ruling
-    // `coalesceStaysNullable` states for the map-value dual), so `(ref $aTypeIdx)`; a
-    // NULLABLE default leaves the result `string | null` and the block must say so, or the
-    // then-arm's legitimately-null value meets a non-null block type. The consumer half of
-    // the condition matters too: only a consumer that asked for the RAW ref
-    // (`pendingRawNullRead` — a `!= null` test, the `is "m"` member compare) can take a
-    // nullable result; a VALUE consumer gets the non-null block and the recovering arms
-    // below, which is the shape every non-null-default program already had.
-    const coNul = pendingRawNullRead && nodeTyIsNullable(exprIx)
+    const coNul = coalesceNulStrStaysNullable(exprIx, fnIx)
     if coNul {
       wU8(99) // blocktype: (ref null $aTypeIdx) — the result stays nullable
     } else {
@@ -16695,22 +16735,18 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     wSLEB(aTypeIdx)
     ctrlEnter()
-    // EACH ARM READS UNDER THE BLOCK TYPE THIS LOWERING JUST DECLARED, EXPLICITLY. The arm
-    // reads otherwise run under whatever `pendingRawNullRead` the CONSUMER seeded, so a raw
-    // consumer over a NON-null default left a `(ref null $array)` in a `(ref $array)` block
-    // — the declared result type and the arm bytes disagreeing, which is invalid wasm rather
-    // than a wrong answer. The DEFAULT arm follows the block (raw only when the result is
-    // nullable); the LHS arm is non-null on every path, since it is reached only when
-    // `ref.is_null` said no.
-    const dCtx = expCtxHere()
-    dCtx.rawNullRead = coNul
-    if emitExprExpect(body, e.binRight, fnIx, dCtx) < 0 {
+    // EACH ARM READS UNDER THE BLOCK TYPE THIS LOWERING JUST DECLARED, EXPLICITLY
+    // (`coalesceNulStrArmCtx`). The arm reads otherwise run under whatever the CONSUMER
+    // seeded, so a raw consumer over a NON-null default left a `(ref null $array)` in a
+    // `(ref $array)` block — the declared result type and the arm bytes disagreeing, which is
+    // invalid wasm rather than a wrong answer. The DEFAULT arm follows the block (raw only
+    // when the result is nullable); the LHS arm is non-null on every path, since it is
+    // reached only when `ref.is_null` said no, and a `(ref $a)` fits a nullable block too.
+    if emitExprExpect(body, e.binRight, fnIx, coalesceNulStrArmCtx(coNul)) < 0 {
       return -1 // d (a string, nullable only when the block is)
     }
     fbElse() // 0x05 else
-    const valCtx = expCtxHere()
-    valCtx.rawNullRead = false
-    if emitExprExpect(body, e.binLeft, fnIx, valCtx) < 0 {
+    if emitExprExpect(body, e.binLeft, fnIx, coalesceNulStrArmCtx(false)) < 0 {
       return -1 // e recovered non-null
     }
     fbEnd() // 0x0b end
@@ -16892,11 +16928,21 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       fbLocalGet(coalesceCallStrSlot)
       wU8(209) // 0xd1 ref.is_null → 1 if null
       wU8(4)   // 0x04 if
-      wU8(100) // blocktype: (ref $aTypeIdx) — non-null string result
+      // The SAME result-nullability question the re-evaluating arm asks — see
+      // `coalesceNulStrStaysNullable`. A nullable default keeps the result nullable here too.
+      const coNulC = coalesceNulStrStaysNullable(exprIx, fnIx)
+      if coNulC {
+        wU8(99) // blocktype: (ref null $aTypeIdx) — the result stays nullable
+      } else {
+        wU8(100) // blocktype: (ref $aTypeIdx) — non-null string result
+      }
       wSLEB(aTypeIdx)
       ctrlEnter()
-      if emitExpr(body, e.binRight, fnIx) < 0 {
-        return -1 // d (a string)
+      // Each arm reads UNDER the block type just declared (the re-evaluating arm's
+      // discipline): the default is raw only when the result is nullable, and the stashed
+      // LHS is non-null on every path that reaches the else (`ref.is_null` said no).
+      if emitExprExpect(body, e.binRight, fnIx, coalesceNulStrArmCtx(coNulC)) < 0 {
+        return -1 // d (a string, nullable only when the block is)
       }
       fbElse()         // 0x05 else
       fbLocalGet(coalesceCallStrSlot)
