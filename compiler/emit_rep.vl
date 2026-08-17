@@ -2344,62 +2344,83 @@ export function repOfTy(ty: i32): RepDesc {
 function repOfTyFlat(ty: i32): RepDesc {
   if ty < 0 { return repUncovered() }
   const t = T.tys[ty]
-  if t is TyPrim { return repOfPrim(t.primName) }
-  // A function type is the closure fat-pointer. (A nullable closure is a
-  // `TyNullable`, a closure ARRAY a `TyArray` — each classified by its own arm,
-  // so the bare-arrow ambiguity of the name-based test cannot arise.)
-  if t is TyFunc { return repMk("closure", 0, "") }
-  if t is TyObj {
-    // A union-VARIANT member is the concrete variant struct ref (its slot is a
-    // variant index, not a struct-table index); any other object shape is a
-    // standalone struct ref.
-    if tyIxIsVariantMember(ty) { return repMk("variant", 0, "") }
-    const d = repMk("struct", 0, "")
-    d.rdSlot = repSlotOfTy(ty)
-    return d
-  }
-  if t is TyUnion {
-    // A homogeneous string-literal union: a DECLARED alias (`type K = "a"|"b"`)
-    // — or a checker-minted COPY of one, recognized through the b1 alias
-    // PROVENANCE (`tyLitUnionAliasIx`; narrowing/join/subtraction re-mint the
-    // alias at a fresh index) — reps as the interned i32 atom. An INLINE one
-    // is name-softened to `string` by the canon pass, and its rep questions
-    // route through the name ladder — uncovered here (the atom-vs-string
-    // split is the alias-ness, which is checker metadata, not structure).
-    if tyIsLitUnion(ty) {
-      if tyLitUnionAliasIx(ty) >= 0 { return repMk("i32", 0, "") }
+  // EXHAUSTIVE over `Ty` and deliberately `_`-less: a 12th arena variant breaks
+  // the self-compile here rather than silently answering `repUncovered()`, which
+  // reads as "this shape's rep is not derivable" and hands the consumer back to
+  // its legacy name ladder — a valid-looking answer for the wrong reason.
+  match t {
+    TyPrim => { return repOfPrim(t.primName) }
+    // A function type is the closure fat-pointer. (A nullable closure is a
+    // `TyNullable`, a closure ARRAY a `TyArray` — each classified by its own arm,
+    // so the bare-arrow ambiguity of the name-based test cannot arise.)
+    TyFunc => { return repMk("closure", 0, "") }
+    TyObj => {
+      // A union-VARIANT member is the concrete variant struct ref (its slot is a
+      // variant index, not a struct-table index); any other object shape is a
+      // standalone struct ref.
+      if tyIxIsVariantMember(ty) { return repMk("variant", 0, "") }
+      const d = repMk("struct", 0, "")
+      d.rdSlot = repSlotOfTy(ty)
+      return d
+    }
+    TyUnion => {
+      // A homogeneous string-literal union: a DECLARED alias (`type K = "a"|"b"`)
+      // — or a checker-minted COPY of one, recognized through the b1 alias
+      // PROVENANCE (`tyLitUnionAliasIx`; narrowing/join/subtraction re-mint the
+      // alias at a fresh index) — reps as the interned i32 atom. An INLINE one
+      // is name-softened to `string` by the canon pass, and its rep questions
+      // route through the name ladder — uncovered here (the atom-vs-string
+      // split is the alias-ness, which is checker metadata, not structure).
+      if tyIsLitUnion(ty) {
+        if tyLitUnionAliasIx(ty) >= 0 { return repMk("i32", 0, "") }
+        return repUncovered()
+      }
+      // The EXPANDED nullable-litunion `"a" | "b" | null` — a null member plus an
+      // all-quoted-literal remainder. It is the SAME TYPE as the two-part `K | null`
+      // spelling `repOfNullable` gives the i32 atom + `-1` sentinel niche (`rdNul` 3)
+      // fifty lines below, so it must get the SAME rep; without this arm it fell to
+      // `tyIsValueUnionBox` and reps'd as the union BOX, while every read classified
+      // from the arena — where the two spellings are one type — and lowered the atom.
+      // `type K = "ab" | "zz" | null` interns as exactly this shape, so its cell was
+      // built as a box and `print(v)` handed that `(ref $box)` to `__print_i32__`:
+      // INVALID WASM. No alias gate here, matching `repOfNullable`: canon PRESERVES a
+      // nullable litunion's members (`nulLitUnionPreserve`), so the inline and aliased
+      // spellings both rep as the atom.
+      if tyIsNullableLitUnion(ty) { return repMk("i32", 3, "") }
+      // A single-member object union is the canonicalized `{a} & {b}` struct
+      // alias — reps as the struct itself.
+      if t.uMembers.length == 1 {
+        const m = T.tys[t.uMembers[0]]
+        if m is TyObj { return repMk("struct", 0, "") }
+        return repUncovered()
+      }
+      // A `{tag, value}` value/struct union box. (Numeric literal unions —
+      // `0 | 1` — are neither litunion-atoms nor boxes; they canon-collapse to
+      // their base scalar and stay with the name ladder.)
+      if tyIsValueUnionBox(ty) { return repMk("union", 0, "") }
       return repUncovered()
     }
-    // The EXPANDED nullable-litunion `"a" | "b" | null` — a null member plus an
-    // all-quoted-literal remainder. It is the SAME TYPE as the two-part `K | null`
-    // spelling `repOfNullable` gives the i32 atom + `-1` sentinel niche (`rdNul` 3)
-    // fifty lines below, so it must get the SAME rep; without this arm it fell to
-    // `tyIsValueUnionBox` and reps'd as the union BOX, while every read classified
-    // from the arena — where the two spellings are one type — and lowered the atom.
-    // `type K = "ab" | "zz" | null` interns as exactly this shape, so its cell was
-    // built as a box and `print(v)` handed that `(ref $box)` to `__print_i32__`:
-    // INVALID WASM. No alias gate here, matching `repOfNullable`: canon PRESERVES a
-    // nullable litunion's members (`nulLitUnionPreserve`), so the inline and aliased
-    // spellings both rep as the atom.
-    if tyIsNullableLitUnion(ty) { return repMk("i32", 3, "") }
-    // A single-member object union is the canonicalized `{a} & {b}` struct
-    // alias — reps as the struct itself.
-    if t.uMembers.length == 1 {
-      const m = T.tys[t.uMembers[0]]
-      if m is TyObj { return repMk("struct", 0, "") }
-      return repUncovered()
+    TyNullable => { return repOfNullable(t.nInner) }
+    TyArray => { return repOfArray(t.aElem) }
+    TyMap => { return repOfMap(t.mKey, t.mVal, t.mSet) }
+    TyVar => {
+      // A generic type PARAMETER — the monomorphizer instantiates it, and the
+      // INSTANCE is what this query is asked about.
     }
-    // A `{tag, value}` value/struct union box. (Numeric literal unions —
-    // `0 | 1` — are neither litunion-atoms nor boxes; they canon-collapse to
-    // their base scalar and stay with the name ladder.)
-    if tyIsValueUnionBox(ty) { return repMk("union", 0, "") }
-    return repUncovered()
+    TyLit => {
+      // A bare literal type — canon widens it to its base scalar (or folds it
+      // into its enclosing litunion), so no rep is decided here.
+    }
+    TyErr => {
+      // The error/unknown hole — a rejected program never reaches emit.
+    }
+    TyNeg => {
+      // A negation — `intersectTy` consumes it during checking; nothing
+      // structural survives to carry a rep.
+    }
   }
-  if t is TyNullable { return repOfNullable(t.nInner) }
-  if t is TyArray { return repOfArray(t.aElem) }
-  if t is TyMap { return repOfMap(t.mKey, t.mVal, t.mSet) }
-  // TyVar / TyLit / TyErr / TyNeg — no wasm rep of their own (a generic
-  // instantiates, a literal widens, an error never reaches emit).
+  // The four empty arms above land here: no wasm rep of their own, so the
+  // consumer keeps its legacy name-based path (`rdCovered == 0`).
   repUncovered()
 }
 
