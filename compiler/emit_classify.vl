@@ -279,6 +279,13 @@ import {
   capCacheOn,
   capCountTbl,
   capNamesFlat,
+  cnFe,
+  cnName,
+  cnRecording,
+  cnScanFnIx,
+  cnSet,
+  cnTy,
+  cnVariant,
   capStartTbl,
   cloSigBase,
   cloSigKeys,
@@ -2882,6 +2889,9 @@ export function capComputeNamesOf(fe: i32) {
       if p is Param { bound.push(p.parName) }
       pi = pi + 1
     }
+    // `capScan` resolves a narrowing condition against the frame whose body it is in;
+    // this is that frame. Set only while recording, so an ordinary scan is unchanged.
+    if cnRecording { cnScanFnIx = fnStmts[fe] }
     capScan(fn.fnBody, bound, caps)
   }
   caps
@@ -2996,7 +3006,15 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     }
     if n.fnName != "" { ibound.push(n.fnName) }
     const ifree: string[] = []
+    // `ifree` is the nested body's free-name set BEFORE the global / function-name
+    // filter, which is exactly the population `capNarrowRecord` may record: it excludes
+    // every name the nested function shadows with a param or a local of its own, so a
+    // replayed narrowing can never land on a binding that is not the capture.
+    const savedScanFn = cnScanFnIx
+    if cnRecording { cnScanFnIx = ix }
     capScan(n.fnBody, ibound, ifree)
+    cnScanFnIx = savedScanFn
+    if cnRecording { capNarrowRecord(ix, ifree) }
     let ifi = 0
     while ifi < ifree.length {
       capRecord(ifree[ifi], bound, caps)
@@ -3007,10 +3025,16 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
   if n is Block {
     const stmts = n.blkStmts
     let i = 0
+    const savedBlkTop = narrowTop
     while i < stmts.length {
       capScan(stmts[i], bound, caps)
+      // A GUARD `if` with no else whose then-branch always leaves narrows the REST of
+      // the block (the flow narrowing after an early return), so a closure written below
+      // the guard is inside that narrowing exactly as one written in an else-arm is.
+      if cnRecording { pushPostGuardNarrow(stmts[i], cnScanFnIx) }
       i = i + 1
     }
+    if cnRecording { restoreNarrow(savedBlkTop) }
     return 0
   }
   if n is LetDecl {
@@ -3024,6 +3048,22 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
   }
   if n is IfStmt {
     capScan(n.ifCond, bound, caps)
+    // While RECORDING, each arm is scanned under the narrowing that arm sees — the same
+    // `setNarrowFromCond` / `setNarrowFromCondElse` pair the emit and classify loops use,
+    // so a closure's recorded narrowing is the one the rest of the compiler would compute
+    // for a read written in its place.
+    if cnRecording {
+      const savedIfTop = narrowTop
+      setNarrowFromCond(n.ifCond, cnScanFnIx)
+      capScan(n.ifThen, bound, caps)
+      restoreNarrow(savedIfTop)
+      if n.ifElse >= 0 {
+        setNarrowFromCondElse(n.ifCond, cnScanFnIx)
+        capScan(n.ifElse, bound, caps)
+        restoreNarrow(savedIfTop)
+      }
+      return 0
+    }
     capScan(n.ifThen, bound, caps)
     if n.ifElse >= 0 { capScan(n.ifElse, bound, caps) }
     return 0
@@ -3310,6 +3350,122 @@ export function captureValStructIdx(fe: i32, name: string) {
     }
   }
   -1
+}
+
+// ── the declaration-site narrowing of a capture: record, look up, replay ──────
+// The three functions below are the whole of it. `capNarrowRecord` banks the narrowing
+// stack at a nested function's declaration site (called only from `capScan`, only while
+// `capNarrowBuild` walks); `capNarrowSlotOf` finds a banked record; `capNarrowSeed`
+// replays it onto the stack for the walk of that frame's body. The state comment lives
+// on `cnFe` in `emit_state.vl`.
+
+// Bank the narrowing active at the declaration site of the nested function at ARENA index
+// `fnIx`, for each of its free names. One record per (frame, name); when a name is
+// narrowed twice over (nested guards on the same binding) the INNERMOST slot is appended
+// last and `capNarrowSlotOf` reads backward, so the innermost wins — the same rule
+// `narrowSlotOf` applies to the live stack.
+function capNarrowRecord(fnIx: i32, ifree: string[]) {
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return 0 }
+  let i = 0
+  while i < narrowTop {
+    const nm = narrowNames[i]
+    if capHas(ifree, nm) {
+      cnFe.push(fe)
+      cnName.push(nm)
+      cnVariant.push(narrowVariants[i])
+      cnTy.push(narrowTys[i])
+      cnSet.push(narrowSets[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The record index of the declaration-site narrowing of `name` in frame `fe`, or -1.
+// Scanned BACKWARD so the innermost banked narrowing answers (see `capNarrowRecord`).
+function capNarrowSlotOf(fe: i32, name: string) {
+  let i = cnFe.length - 1
+  while i >= 0 {
+    if cnFe[i] == fe {
+      if cnName[i] == name { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// Rebuild the declaration-site narrowing table from the current arena. Runs before each
+// `computeRetInference` (the classifier needs it to type a closure whose return is a
+// narrowed captured read) and again after monomorphization, which renumbers `fnStmts`
+// and therefore every recorded frame position.
+//
+// Only the OUTERMOST frames are scanned, because `capScan` descends into every nested
+// function body: one scan per parentless frame reaches a two-levels-deep lambda with the
+// outer guard still on the stack, which is the narrowing lexically in force there.
+// Scanning a nested frame directly would reach the same lambda with an EMPTY stack and
+// bank the guard away.
+export function capNarrowBuild() {
+  cnFe = []
+  cnName = []
+  cnVariant = []
+  cnTy = []
+  cnSet = []
+  const savedTop = narrowTop
+  cnRecording = true
+  let fe = 0
+  while fe < fnStmts.length {
+    if fe >= fnParent.length || fnParent[fe] < 0 { capComputeNamesOf(fe) }
+    fe = fe + 1
+  }
+  // Module-level statements are the START function's body. A closure written there has no
+  // enclosing frame to capture from, but a top-level `if` still narrows a module GLOBAL,
+  // and the frames declared under it are frames like any other.
+  cnScanFnIx = -1
+  const sbound: string[] = []
+  const scaps: string[] = []
+  let si = 0
+  while si < startStmts.length {
+    capScan(startStmts[si], sbound, scaps)
+    si = si + 1
+  }
+  cnRecording = false
+  cnScanFnIx = -1
+  restoreNarrow(savedTop)
+  0
+}
+
+// Replay frame `fe`'s declaration-site narrowing onto the narrowing stack, so a walk over
+// `fe`'s BODY answers every rep question about a captured read under the narrowing the
+// closure was written inside. Returns the depth to `restoreNarrow` to when that walk ends.
+//
+// GATED ON THE CAPTURE'S REP BEING THE VALUE-UNION BOX. That is the only rep whose read
+// needs a narrowing in order to pick an unboxing: a nullable NICHE recovers at its own use
+// site (the rule stated on `emitCapturedReadRecover`) and a non-union capture has nothing
+// to narrow, so gating here is what keeps every capture that already lowers correctly
+// byte-identical. `captureValKind` is asked because it is the function that TYPED the env
+// field — the gate and the field cannot disagree about what rides in the env.
+//
+// The `cnFe.length == 0` early-out is what makes this free for the overwhelming majority
+// of programs (no narrowed capture anywhere ⇒ no capture-name walk at all), which matters
+// because `computeRetInference` is a fixpoint loop.
+export function capNarrowSeed(fe: i32) {
+  const saved = narrowTop
+  if fe < 0 { return saved }
+  if cnFe.length == 0 { return saved }
+  const caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    const nm = caps[ci]
+    const si = capNarrowSlotOf(fe, nm)
+    if si >= 0 {
+      if captureValKind(fe, nm) == "union" {
+        pushNarrowRep(nm, cnVariant[si], cnTy[si], cnSet[si])
+      }
+    }
+    ci = ci + 1
+  }
+  saved
 }
 
 // Enter a new lexical block: remember the current binding count as this frame's
@@ -17688,6 +17844,14 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
       // union-box element type so `x is C` narrows inside the loop body.
       const flv = forInLoopVarUnionName(name, fnIx)
       if flv != "" { return flv }
+      // A CAPTURED union binding: the member set lives at the binding in the OWNING frame,
+      // which `capturedUnionName` already resolves off the very node `captureValKind`
+      // types the env field from. Without this arm the name is neither a param nor a body
+      // `let` of the capturing function, so this answered "" and the narrowed-atom unbox
+      // in `emitIdentNode` stayed gated shut for every capture — the box flowed where the
+      // arm's rep was expected.
+      const cun = capturedUnionName(fnIx, name)
+      if cun != "" { return cun }
     }
   }
   // THE MODULE-SCOPE DUAL of the loop-var arm above: a TOP-LEVEL `for x in <(i32|null)[]>`

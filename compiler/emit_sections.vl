@@ -313,6 +313,8 @@ import {
   blockHasVariantRebox,
   blockPushPopBits,
   bodyEndsInReturn,
+  capNarrowBuild,
+  capNarrowSeed,
   captureNamesOf,
   captureValKind,
   captureValStructIdx,
@@ -623,6 +625,13 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     // (see `emitCurFnPos`).
     emitCurFnIx = fnIx
     emitCurFnPos = fnPos
+    // Replay the narrowing this frame's closure was WRITTEN inside, for the whole body —
+    // locals collection included, because a `const t = <captured narrowed read>` is typed
+    // from it. Only a value-union-box capture is seeded (`capNarrowSeed`), so a function
+    // that captures nothing narrowed pushes nothing and emits identical bytes. The depth
+    // is restored on the success path; a `-1` below fails the entire module, so a leaked
+    // depth cannot be observed.
+    const savedCapNarrow = capNarrowSeed(fnPos)
     // Collect + validate declared locals BEFORE lowering, so identifier resolution
     // and the locals vector both see the full per-function set.
     if buildLocals(fnIx) < 0 { return -1 }
@@ -790,6 +799,7 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     wULEB(body.length)
     wBytes(body)
     wTarget(outPrev)
+    restoreNarrow(savedCapNarrow)
     return 0
   }
   emitFail("emitProgram: not a function declaration")
@@ -3010,6 +3020,8 @@ function runEmitPass(name: string, stmts: i32[]) {
   if name == "scanPrintUse" { return scanPrintUse() }
   if name == "checkFnParams" { return checkFnParams() }
   if name == "capCacheBuild" { return capCacheBuild() }
+  if name == "capNarrowBuild" { return capNarrowBuild() }
+  if name == "capNarrowBuild#2" { return capNarrowBuild() }
   emitFail("emitProgram: unknown pass in the pass table: " + name)
 }
 
@@ -3142,6 +3154,11 @@ export function emitProgram(rootIx: i32) {
     //  · scanPrintUse / checkFnParams read the FINAL arena; capCacheBuild
     //    snapshots capture lists only once the AST and `fnStmts` are final —
     //    after every mutating pass.
+    //  · capNarrowBuild banks the narrowing active at each closure's DECLARATION
+    //    site and must precede computeRetInference, which types a closure whose
+    //    return is a narrowed captured read; its `#2` row re-banks because
+    //    monomorphization renumbers `fnStmts` and every record is keyed by
+    //    position.
     const passTable = [
       "collectU",
       "collectS > collectU",
@@ -3150,7 +3167,8 @@ export function emitProgram(rootIx: i32) {
       "checkTopLevel > collectFns",
       "buildFnMap > collectFns",
       "computeVoidFns > buildFnMap",
-      "computeRetInference > buildFnMap computeVoidFns",
+      "capNarrowBuild > buildFnMap",
+      "computeRetInference > buildFnMap computeVoidFns capNarrowBuild",
       "dispatchRewrite > buildFnMap computeRetInference",
       "captureBoxRewrite > collectFns",
       "synthRetAnnots > collectU buildFnMap",
@@ -3161,7 +3179,8 @@ export function emitProgram(rootIx: i32) {
       "buildFnMap#2 > monomorphize collectA#2",
       "synthParamAnnots > monomorphize buildFnMap#2",
       "computeVoidFns#2 > synthParamAnnots",
-      "computeRetInference#2 > synthParamAnnots computeVoidFns#2",
+      "capNarrowBuild#2 > synthParamAnnots",
+      "computeRetInference#2 > synthParamAnnots computeVoidFns#2 capNarrowBuild#2",
       "collectMapFilterUse > synthParamAnnots computeRetInference#2",
       "collectFnValUse > synthParamAnnots computeRetInference#2",
       "collectCloSigs > collectMapFilterUse collectFnValUse",
