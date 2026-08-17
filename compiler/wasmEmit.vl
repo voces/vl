@@ -2063,6 +2063,42 @@ function emitNumLitEq(body: i32[], recvIx: i32, lv: string, fnIx: i32) {
   return 0
 }
 
+// The base numeric scalar an `is` RECEIVER reps as IN THIS INSTANCE — `"i32"` / `"i64"` /
+// `"f64"`, or "" for anything else. THE ONE HOME for the receiver half of the
+// numeric-litunion membership test, because that half is what keeps a receiver off a member
+// set of a rep it does not share.
+//
+// TWO CHANNELS, BECAUSE ONE ORDINARY RECEIVER HAS NO BANKED TYPE AT ALL.
+// `nodeNumScalarBaseName` reads the type the CHECKER banked at the node, which answers for
+// every ANNOTATED receiver including the mixed `K | i32` / `K | f64` spellings that collapse
+// to one scalar. An UN-ANNOTATED parameter is pinned by `monoArgTyName`'s `"i32"` catch-all,
+// the one arm of the pin that deliberately mints NO annotation node — so the bank has
+// nothing to answer from, this predicate's first channel said "", the whole membership arm
+// declined, and the guard fell to `monoStaticIsResult`, which CONST-FOLDS a literal tested
+// type to FALSE. `function g(u) { if u is Z { … } }` took the wrong branch with `vl check`
+// rc 0 while the `u: i32` twin of the same program was correct one line away.
+//
+// The second channel is `monoArgTyName` — the emitter's own `fnIx`-SCOPED name for the
+// receiver, and the SAME function the fold reads. Sharing it is what makes this arm claim
+// exactly the receivers the fold would otherwise decide, per INSTANCE: one `v is Z` node in
+// a `g<T>(v: T)` body is emitted once per instance, and an instance pinned to `string` / a
+// struct / a list is named by its own rep and declines here. Gating on the node's banked
+// type alone cannot see an instance at all — the whole point of #1409/#1419's discipline.
+//
+// A NULLABLE receiver is refused on the same line and for the same reason
+// `monoStaticIsResult` refuses one: `monoArgTyName` names a nullable value by its NON-NULL
+// base, so a `K | null` numeric litunion would present as the plain `i32` its sentinel
+// encoding is not. Those keep the loud floor rather than a membership ladder emitted over a
+// sentinel this arm has no lowering for.
+function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
+  const nb = nodeNumScalarBaseName(recvIx)
+  if nb != "" { return nb }
+  if nodeTyIsNullable(recvIx) { return "" }
+  const mn = monoArgTyName(recvIx, fnIx)
+  if mn == "i32" || mn == "i64" || mn == "f64" { return mn }
+  ""
+}
+
 // The value-union NAME of an `is` RECEIVER, for the box-tag soundness floor in `emitIs`.
 // `unionNameOfExpr` covers every receiver form the tag compare has an arm for EXCEPT the
 // optional chain — `x?.y is i32` reads its field through `optChainStructIdxOf` rather than
@@ -2286,6 +2322,42 @@ function emitFailNoMembershipRecv() {
   )
 }
 
+// True when the union named `nm` carries a literal-union ARM beside another value arm — the
+// BOX shape whose litunion arm rides the box as its member STRING, so `x is K` over it is a
+// MEMBERSHIP question over the payload and can never be a tag compare.
+//
+// AN ALIAS NAME IS RESOLVED TO ITS MEMBER SET FIRST, AND THAT IS THE WHOLE REASON THIS
+// FUNCTION EXISTS. `nameIsLitUnionArmValueUnion` decides on the SPELLING it is handed by
+// splitting it at top-level `|`, so a declared `type W = K | i32` splits to the single atom
+// `"W"` and answers FALSE while the INLINE `K | i32` spelling of the identical box answers
+// TRUE. `unionNameOfExpr` hands out whichever spelling the annotation carried, so the two
+// spellings of one program took different lowerings: the alias fell past the membership arm
+// into the box-tag compare, whose `tag == 2` answers `w is KS` TRUE for EVERY string the box
+// holds — members and non-members alike, `vl check` rc 0 and `vl build` clean, while the
+// inline twin one line away was correct. `unionMemberSetOf` is the registered expansion
+// (`type W = K | i32` → `"K|i32"`), which is what makes the two spellings ask one question.
+//
+// The unresolved name is asked FIRST and the expansion only on its miss: an already-joined
+// member set is the common case and resolves to itself, and `unionMemberSetOf` is a linear
+// scan of every registered union row.
+function unionCarriesLitUnionArm(nm: string) {
+  if nm == "" { return false }
+  if nameIsLitUnionArmValueUnion(nm) { return true }
+  const setNm = unionMemberSetOf(nm)
+  if setNm == nm { return false }
+  nameIsLitUnionArmValueUnion(setNm)
+}
+
+// `unionStrArmCount` over a union name that may be a declared ALIAS. The count is what
+// decides whether kind 2's box tag discriminates an arm at all (1 arm: exactly; 2+: not at
+// all), and it is read off the TOP-LEVEL arms — so an alias has to be expanded for the same
+// reason `unionCarriesLitUnionArm` expands one, and the soundness FLOOR that reads this count
+// has to see the same arms the membership arm above it does or the two disagree about which
+// shapes have a correct lowering.
+function unionStrArmCountOf(nm: string) {
+  unionStrArmCount(unionMemberSetOf(nm))
+}
+
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to REPEATEDLY — i.e.
 // one whose rep that compare reaches. The reps a string literal union can meet: a
 // value-union BOX (payload compare), a string-repped litunion, a plain `string`, and the
@@ -2318,7 +2390,7 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
     const bxNm = unionNameOfExpr(recvIx, fnIx)
     if bxNm == "" { return false }
     if isValueUnionOfSet(msSetOfText(bxNm), bxNm) { return true }
-    return nameIsLitUnionArmValueUnion(bxNm)
+    return unionCarriesLitUnionArm(bxNm)
   }
   if nodeTyIsLitUnion(recvIx) { return true }
   if exprString(recvIx, fnIx) { return true }
@@ -2425,7 +2497,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // binding: each member re-reads it (twice — tag, then payload).
   if nd0 is IsExpr {
     const luNm = unionNameOfExpr(nd0.isObj, fnIx)
-    if luNm != "" && nameIsLitUnionArmValueUnion(luNm) {
+    if unionCarriesLitUnionArm(luNm) {
       const luTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
       if luTexts.length > 0 && unionEqOperandOk(nd0.isObj) {
         let luI = 0
@@ -2477,7 +2549,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         if (
           nbNm != "" &&
           (isValueUnionOfSet(msSetOfText(nbNm), nbNm) ||
-            nameIsLitUnionArmValueUnion(nbNm))
+            unionCarriesLitUnionArm(nbNm))
         ) {
           let nbI = 0
           while nbI < nbTexts.length {
@@ -2582,7 +2654,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
     // only through `K`, so the tag decides it exactly.
     if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
       const amNm = isStrTagUnionNameOf(ndv.isObj, fnIx)
-      if amNm != "" && unionStrArmCount(amNm) > 1 {
+      if amNm != "" && unionStrArmCountOf(amNm) > 1 {
         return emitFailNoMembershipRecv()
       }
     }
@@ -2690,8 +2762,8 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   //
   // BOTH BASES ARE CHECKED AND THEY MUST AGREE. The tested type's base is
   // `numLitUnionBaseName` (all-`TyLit`, homogeneous); the RECEIVER's is
-  // `nodeNumScalarBaseName`, which also claims the mixed `K | i32` / `K | f64` spellings the
-  // tested side never carries. Without the receiver half a monomorphized `g<T>(v: T)`
+  // `isNumRecvBaseName`, whose header carries why the receiver half needs two channels and
+  // what each one claims. Without the receiver half a monomorphized `g<T>(v: T)`
   // instance pinned to `string` would take this arm and compare a string ref with
   // `i32.eq` — invalid wasm traded for a wrong answer, the trap the string sibling's
   // filing walked into by asserting a rep instead of reading it. It is also what keeps an
@@ -2707,7 +2779,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   if nd0 is IsExpr {
     if !exprUnion(nd0.isObj, fnIx) {
       const nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
-      if nlBase != "" && nodeNumScalarBaseName(nd0.isObj) == nlBase {
+      if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
         const nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
         // Two or more members RE-READ the receiver, so those need a re-readable place
         // (`unionEqOperandOk`); a one-member tested type evaluates it exactly once and
@@ -3119,10 +3191,18 @@ function unionResidualSoloKindOfSet(s: i32) {
 //     (`inferRetNameByNode`); the pool covers **0** of its 643 reaches.
 // One producer — the inferred-return render — retired by the `inferRetTyByNode` hand-off,
 // not by a consumer-side ladder.
+// THE NAME FALLBACK RESOLVES A DECLARED ALIAS FIRST. `isValueUnionName` decides by splitting
+// the name at top-level `|` and asking `valueAtomKind` of each atom, so an alias splits to ONE
+// atom whose kind is -1 and the answer is a flat NO for every union the bank does not cover —
+// while the INLINE spelling of the identical box answers YES. `type WN = N | string` over a
+// numeric litunion `N` is the live instance: the inline `N | string` receiver took the `is`
+// membership arm and the alias fell past every arm to the loud ``is` names a type that is not
+// a union variant`. `unionMemberSetOf` returns a non-alias name unchanged, so this only ever
+// hands the fallback the arms the working spelling already gave it.
 function isValueUnionOfSet(s: i32, nm: string): boolean {
   const v = msIsValueUnion(s)
   if v >= 0 { return v == 1 }
-  isValueUnionName(nm)
+  isValueUnionName(unionMemberSetOf(nm))
 }
 
 // True if a value-union atom of KIND `k` is a REF that rides the box's anyref `value`
@@ -3994,6 +4074,10 @@ function emitUnionPayloadUnbox(_body: i32[], k: i32) {
 function emitUnionEqOther(body: i32[], otherIx: i32, k: i32, fnIx: i32) {
   if k == 3 { return emitExprAsI64(body, otherIx, fnIx) }
   if k == 4 { return emitExprAsF64(body, otherIx, fnIx) }
+  // The STRING arm's widening twin of the three numeric ones: a literal-union ATOM operand
+  // becomes its member string (`emitStrValue`), which is the rep the box's string payload is
+  // compared against. `emitStrValue` is `emitExpr` for everything that is already a string.
+  if k == 2 { return emitStrValue(body, otherIx, fnIx) }
   if k == 5 {
     const savedF32 = pendingF32
     pendingF32 = true
@@ -4046,12 +4130,22 @@ function emitUnionConcreteEq(
   // value-union gate below reads its banked member codes instead of re-splitting the
   // rendering.
   const usid = msSetOfText(uname)
-  if uname == "" || !isValueUnionOfSet(usid, uname) {
+  // The arm SPELLINGS with a declared ALIAS resolved, and the litunion-ARM shape admitted
+  // beside the plain value union — the same two lines `emitUnionLitIs` carries, for the same
+  // reason: a `K | i32` box is a value-union box with the litunion arm riding it as its
+  // member STRING, and both the gate (`isValueUnionName`, whose `valueAtomKind("K")` is -1)
+  // and the arm-membership test read a name, so an alias or a litunion arm made them report
+  // a box that cannot hold what it holds.
+  const unmArms = unionMemberSetOf(uname)
+  if (
+    uname == "" ||
+    (!isValueUnionOfSet(usid, uname) && !unionCarriesLitUnionArm(uname))
+  ) {
     return emitFail(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  const atom = unionEqAtomOf(otherIx, uname, fnIx)
+  const atom = unionEqAtomOf(otherIx, unmArms, fnIx)
   // D-UNION-ATOM-KIND / D-EQOPCODE / D-VALKIND: the other operand's rep CODE, derived
   // ONCE. The box tag, the `string` special-cases, the payload unbox, the widened operand
   // emit, the payload-compare opcode and the membership test below are all projections of
@@ -4059,7 +4153,14 @@ function emitUnionConcreteEq(
   // outside the seven scalar keywords (a LIST / closure atom) keeps the exact
   // `TyPrim.primName` path, which is what those need.
   const eak = valueAtomKind(atom)
-  if !unionHasAtomK(usid, uname, atom, eak) {
+  // A `string`-repped other operand has an arm whenever the box can carry it as a string ref
+  // — a plain `string` arm OR a literal-union arm, `unionTakesAtomAsStr`'s question and
+  // `emitUnionLitIs`'s same second leg. Without it a `K | i32` box statically answers
+  // `u == k` FALSE: the banked member kinds carry only `i32` (`valueAtomKind("K")` is -1), so
+  // the arm that actually holds the value looks absent.
+  let eqHasArm = unionHasAtomK(usid, unmArms, atom, eak)
+  if !eqHasArm && eak == 2 && unionTakesAtomAsStr(unmArms) { eqHasArm = true }
+  if !eqHasArm {
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
@@ -4258,13 +4359,22 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfText(uname)
+  // THE ARM SPELLINGS, WITH A DECLARED ALIAS RESOLVED — every predicate below that reads a
+  // NAME reads this one, while the interned SET stays keyed on the name the receiver carries.
+  // `unionHasAtomTy` / `unionTakesAtomAsStr` answer by splitting the spelling at top-level
+  // `|`, so `type W = K | i32` split to the single atom `"W"`: no arm could hold a quoted
+  // literal, `litHasArm` was false and the whole compare CONST-FOLDED TO 0 — while the
+  // INLINE `K | i32` spelling of the identical box, whose arms those same predicates can
+  // see, was correct. `unionMemberSetOf` returns a non-alias name unchanged, so this is the
+  // string the working spelling already passed.
+  const unmArms = unionMemberSetOf(uname)
   // A union carrying a literal-union ALIAS arm (`K | string`, `K | f64`) is a BOX like any
   // value union — the arm rides it as its member string — but `isValueUnionName` declines it
   // because `valueAtomKind("K")` is -1. It is the same box with the same tags, so the
   // lowering below is unchanged; only the gate had to learn the second spelling.
   if (
     uname == "" ||
-    (!isValueUnionOfSet(usid, uname) && !nameIsLitUnionArmValueUnion(uname))
+    (!isValueUnionOfSet(usid, uname) && !unionCarriesLitUnionArm(uname))
   ) {
     return emitFail(
       "emitProgram: literal `is` over a struct union is not supported",
@@ -4295,8 +4405,8 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
     atom = "i64"
     lak = 3
   } else if (
-    !unionHasAtomK(usid, uname, "i32", 0) &&
-    unionHasAtomK(usid, uname, "i64", 3)
+    !unionHasAtomK(usid, unmArms, "i32", 0) &&
+    unionHasAtomK(usid, unmArms, "i64", 3)
   ) {
     atom = "i64"
     lak = 3
@@ -4306,8 +4416,8 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   // Without its second leg a `K | f64` box statically answers `is "aa"` FALSE: the member
   // kinds bank only `f64` (`valueAtomKind("K")` is -1), so the arm that actually holds the
   // value looks absent.
-  let litHasArm = unionHasAtomK(usid, uname, atom, lak)
-  if !litHasArm && lak == 2 && unionTakesAtomAsStr(uname) { litHasArm = true }
+  let litHasArm = unionHasAtomK(usid, unmArms, atom, lak)
+  if !litHasArm && lak == 2 && unionTakesAtomAsStr(unmArms) { litHasArm = true }
   if !litHasArm {
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
     fbDrop() // 0x1a drop
@@ -7949,9 +8059,14 @@ function emitStrEq(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const isNe = e.binOp == "!="
-    // Eval both operands, then stash (B on top → set B first).
-    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+    // Eval both operands, then stash (B on top → set B first). A literal-union ATOM operand
+    // widens to its member string first (`emitStrValue`) — the same boundary handling
+    // `emitStrConcat` one function up already applies, and the reason `s == k` with `s:
+    // string` and `k: K` is a string compare rather than the atom `i32.eq` (see
+    // `eqAtomOperandOk`). The widen stages the id in the string-op scratch frame, which this
+    // compare's own `exprIsStrEq` already reserves through `exprHasStrOp`.
+    if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
     if emitStrEqCore(body) < 0 { return -1 }
     if isNe {
       fbI32Eqz() // 0x45 i32.eqz  (`!=` negates value-equality)
@@ -15150,6 +15265,37 @@ function strReppedLitUnionAt(ix: i32, fnIx: i32) {
   nodeTyIsLitUnion(av)
 }
 
+// True when `ix` can be lowered in ATOM context — as the interned i32 id the litunion atom
+// `==` needs on BOTH of its sides. The three atom-lowerable shapes are exactly the three
+// `emitExprExpect`'s `litUnion` context has an answer for: an atom-repped expression
+// (`exprIsLitAtom`), a member string LITERAL (whose id the `StrLit` arm folds at compile
+// time), and a string-repped litunion (`strReppedLitUnionAt` → `emitStrToAtom`).
+//
+// A PLAIN `string` IS NOT ONE OF THEM, AND THE MISSING DIRECTION IS UNSOUND RATHER THAN
+// UNIMPLEMENTED. `emitStrToAtom`'s tower makes the LAST member the unconditional default
+// because membership is checker-guaranteed for a litunion value — which is precisely what a
+// plain `string` does not carry. Narrowing `u: string` holding `"z"` would hand back the last
+// member's id and answer `u == kk` TRUE against that member: a silent wrong answer traded for
+// invalid wasm. So the mixed pair is refused here and lowered the other way round, by widening
+// the ATOM to its member string (`emitStrValue`), which is total in the direction it runs.
+// A union BOX is refused on the `exprUnion` line, and that line is the emitter's REP
+// classifier standing in front of a banked-TYPE test on purpose. The checker banks a PURE
+// litunion type at a `K | i32` operand of this very compare, so `nodeTyIsLitUnion` below
+// answers TRUE for a value whose STORAGE is a `{tag, anyref}` box — `i32.eq` over a box ref,
+// `vl check` rc 0. The box's own lowering is the tag-gated payload compare
+// (`emitUnionConcreteEq`), which the arm above this one claims through the same predicate.
+// The order matters: an atom-repped or member-literal operand is claimed BEFORE the box test,
+// because `unionNameOfIdent` claims a `K`-annotated binding too (`K` is a registered union
+// NAME while the value is a bare id).
+function eqAtomOperandOk(ix: i32, fnIx: i32) {
+  if exprIsLitAtom(ix, fnIx) { return true }
+  const av = unwrapParen(ix)
+  const e = P.nodes[av]
+  if e is StrLit { return true }
+  if exprUnion(ix, fnIx) { return false }
+  nodeTyIsLitUnion(av)
+}
+
 function emitNumLitNode(_body: i32[], e: NumLit, exprIx: i32, fnIx: i32) {
   // A FLOAT literal (lexeme carries a `.`) in f32 CONTEXT (`pendingF32` — an `: f32`
   // binding/param/return) lowers as `f32.const`. Checked before the default f64 path
@@ -15810,11 +15956,18 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     let uqNull = false
     if uql is NullLit { uqNull = true }
     if uqr is NullLit { uqNull = true }
-    const uqLit = exprIsLitAtom(e.binLeft, fnIx) ||
-      exprIsLitAtom(e.binRight, fnIx)
-    if !uqNull && !uqLit {
-      const uqL = exprUnion(e.binLeft, fnIx)
-      const uqR = exprUnion(e.binRight, fnIx)
+    // THE LITUNION EXCLUSION IS PER-OPERAND, NOT PER-COMPARE. `exprUnion` claims a
+    // `K`-annotated binding too — `K` is a registered union NAME while the value is a bare
+    // interned id — so this arm has to disqualify the litunion OPERAND rather than the whole
+    // compare. Disqualifying the compare made `boxU == k` skip the union path entirely
+    // because ONE side was an atom, and the atom compare below then pushed the BOX ref under
+    // an `i32.eq`: `vl check` rc 0, invalid wasm. `eqAtomOperandOk` is the same bound that
+    // arm keys on, so exactly one of the two claims any given pair.
+    if !uqNull {
+      const uqL = exprUnion(e.binLeft, fnIx) &&
+        !eqAtomOperandOk(e.binLeft, fnIx)
+      const uqR = exprUnion(e.binRight, fnIx) &&
+        !eqAtomOperandOk(e.binRight, fnIx)
       if uqL && uqR {
         return emitUnionUnionEq(
           body,
@@ -15847,6 +16000,14 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // A literal-union ATOM compare (`k == "a"`, `k1 == k2`): both operands are i32 ids. Emit them as atoms
   // (a member StrLit -> its id; a litunion var -> its i32 value) and i32-compare. BEFORE the string-eq
   // path, which would otherwise treat the member literal as a string.
+  //
+  // ONE ATOM OPERAND IS NOT ENOUGH — BOTH SIDES HAVE TO BE ATOM-LOWERABLE
+  // (`eqAtomOperandOk`, whose header carries which shapes are and why the missing one cannot
+  // be narrowed into the set). `u == kk` with `u: string` and `kk: K` is an ordinary program
+  // the checker accepts, and forcing the atom context on it pushed a `(ref $array)` under
+  // this `i32.eq`. A mixed pair falls through to the string-eq path below, which widens the
+  // ATOM to its member string (`emitStrValue`) — the direction the `is` spelling of the same
+  // question already takes.
   if e.binOp == "==" || e.binOp == "!=" {
     // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
     // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
@@ -15856,15 +16017,20 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if P.nodes[unwrapParen(e.binRight)] is NullLit { atomNull = true }
     if !atomNull {
       if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-        const luCtx = expCtxHere()
-        luCtx.litUnion = 1
-        if emitExprExpect(body, e.binLeft, fnIx, luCtx) < 0 { return -1 }
-        if emitExprExpect(body, e.binRight, fnIx, luCtx) < 0 { return -1 }
-        fbI32Bin(70) // 0x46 i32.eq
-        if e.binOp == "!=" {
-          fbI32Eqz() // 0x45 i32.eqz -> `!=`
+        if (
+          eqAtomOperandOk(e.binLeft, fnIx) &&
+          eqAtomOperandOk(e.binRight, fnIx)
+        ) {
+          const luCtx = expCtxHere()
+          luCtx.litUnion = 1
+          if emitExprExpect(body, e.binLeft, fnIx, luCtx) < 0 { return -1 }
+          if emitExprExpect(body, e.binRight, fnIx, luCtx) < 0 { return -1 }
+          fbI32Bin(70) // 0x46 i32.eq
+          if e.binOp == "!=" {
+            fbI32Eqz() // 0x45 i32.eqz -> `!=`
+          }
+          return 0
         }
-        return 0
       }
     }
   }
