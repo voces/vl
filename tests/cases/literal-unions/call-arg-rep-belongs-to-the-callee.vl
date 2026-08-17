@@ -1,0 +1,174 @@
+// @run
+// CONTRACT: an ARGUMENT's literal-union rep is decided by the CALLEE's parameter and by
+// nothing else. A call sitting in an atom-typed destination — `const r: K = f(a)`, a `K`
+// field / element / map value, a `K` parameter of an outer call, an assignment to a `K`
+// local, and `"s" + f(a)` (which reaches the call through `emitAtomToStr`) — must not push
+// its own atom context down into `f`'s arguments.
+//
+// WHY IT IS A FIXTURE. The three argument spines read the pending seeds through
+// `expCtxHere()`, which SNAPSHOTS the ambient context, so every one of those destinations
+// leaked `pendingLitUnion` into the arg spine: a member-literal argument lowered as its
+// interned i32 ATOM id and a string-repped litunion argument took `emitStrToAtom`, both into
+// the `(ref $array)` slot the callee's `string` parameter declares. Invalid wasm with
+// `vl check` clean — and the destination is what decided it, so the SAME callee called from
+// a plain `const r = f(a)` was fine while `const r: K = f(a)` was not.
+//
+// The scalar seeds (`pendingF32`/`pendingF64`/`pendingI64`) already carry this rule at all
+// three spines; the litunion seeds pick a whole different valtype rather than a widening,
+// which is why they fail louder. The two positions that legitimately want an atom argument
+// restore it from the CALLEE's own parameter (`cParamLitUnion` / `cParamNulLitUnion` for a
+// declared callee, `cloCallParamLitUnion` for a function value).
+//
+// EVERY GROUP SPELLS DISJOINT LEXEMES (#1304's method note) so no alias registration can
+// answer a lookup it was not asked.
+
+// ── the DIRECT spine: eight atom-typed destinations around one `string`-param call ──
+// @log C:da
+// @log C:da
+// @log C:da
+// @log C:da
+// @log R:da
+// @log C:da
+// @log C:da
+// @log C:da
+type DA = "da" | "db"
+function takesDa(k: DA) { print("R:" + k) }
+function dcal(v: string): DA {
+  if v == "da" { return "da" }
+  return "db"
+}
+function directDests() {
+  const r0: DA = dcal("da")
+  print("C:" + r0)
+  print("C:" + dcal("da"))
+  const s0: { f: DA } = { f: dcal("da") }
+  print("C:" + s0.f)
+  const xs0: DA[] = [dcal("da")]
+  print("C:" + xs0[0])
+  takesDa(dcal("da"))
+  let m0: DA = "db"
+  m0 = dcal("da")
+  print("C:" + m0)
+  const mp0: {[string]: DA} = Map()
+  mp0["k"] = dcal("da")
+  const mv0 = mp0["k"]
+  if mv0 != null { print("C:" + mv0) } else { print("C:?") }
+  const r1 = dcal("da")
+  print("C:" + r1)
+  0
+}
+directDests()
+
+// ── the ARGUMENT kinds, all into the same `string` parameter ────────────────────
+// A member LITERAL is the one the seed rewrote outright; a string-repped literal-union
+// value (the flattened `EA | EB`, which is a `(ref $array)` at `RC_ROOT`) is the one that
+// took `emitStrToAtom`; a plain `string` and a concat were already immune.
+// @log C:ea
+// @log C:ea
+// @log C:ea
+// @log C:ea
+type EA = "ea" | "eb"
+type EB = "ec" | "ed"
+function ecal(v: string): EA {
+  if v == "ea" { return "ea" }
+  return "eb"
+}
+function argKinds() {
+  const r0: EA = ecal("ea")
+  print("C:" + r0)
+  const av1 = "ea"
+  const r1: EA = ecal(av1)
+  print("C:" + r1)
+  const av2: EA | EB = "ea"
+  const r2: EA = ecal(av2)
+  print("C:" + r2)
+  const r3: EA = ecal("e" + "a")
+  print("C:" + r3)
+  0
+}
+argKinds()
+
+// ── the INDIRECT spine (`emitCallRef`): an annotated function value, a lambda, and a
+//    HOF parameter — the same leak through the `call_ref` arg spine.
+// @log C:fa
+// @log C:fa
+// @log C:fa
+// @log C:fa
+// @log C:fa
+// @log C:fa
+type FA = "fa" | "fb"
+function fcal(v: string): FA {
+  if v == "fa" { return "fa" }
+  return "fb"
+}
+const fv: (string) => FA = fcal
+function viaValue() {
+  const r0: FA = fv("fa")
+  print("C:" + r0)
+  const xs0: FA[] = [fv("fa")]
+  print("C:" + xs0[0])
+  const lam: (string) => FA = (v: string) => {
+    if v == "fa" { return "fa" }
+    return "fb"
+  }
+  const r1: FA = lam("fa")
+  print("C:" + r1)
+  print("C:" + lam("fa"))
+  0
+}
+viaValue()
+function viaHof(g: (string) => FA) {
+  const r0: FA = g("fa")
+  print("C:" + r0)
+  print("C:" + g("fa"))
+  0
+}
+viaHof(fcal)
+
+// ── the CAPTURED spine (`emitCapturedCall`): a nested function that captures ─────
+// @log C:ga
+// @log C:ga
+// @log C:ga
+type GA = "ga" | "gb"
+function viaCaptured() {
+  const capv = 1
+  function gcal(v: string): GA {
+    if v == "ga" && capv == 1 { return "ga" }
+    return "gb"
+  }
+  const r0: GA = gcal("ga")
+  print("C:" + r0)
+  const s0: { f: GA } = { f: gcal("ga") }
+  print("C:" + s0.f)
+  print("C:" + gcal("ga"))
+  0
+}
+viaCaptured()
+
+// ── CONTROLS: the two parameter positions that DO want the atom ─────────────────
+// A `K` parameter and a `K | null` parameter re-seed the atom context from the CALLEE, so a
+// member-literal argument still lowers as its interned id and a `null` argument as the `-1`
+// sentinel — under exactly the atom-typed destinations that used to supply the seed by leak.
+// @log C:ha
+// @log C:ha
+// @log C:hb
+// @log C:ha
+// @log C:hb
+type HA = "ha" | "hb"
+function hlit(k: HA): HA { return k }
+function hnul(k: HA | null): HA {
+  if k == null { return "hb" }
+  return k
+}
+function controls() {
+  const r0: HA = hlit("ha")
+  print("C:" + r0)
+  const xs0: HA[] = [hnul("ha")]
+  print("C:" + xs0[0])
+  const r1: HA = hnul(null)
+  print("C:" + r1)
+  print("C:" + hlit("ha"))
+  print("C:" + hnul(null))
+  0
+}
+controls()
