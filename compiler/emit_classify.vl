@@ -8784,20 +8784,29 @@ export function cloCallReflistElemTwin(callIx: i32, fnIx: i32): boolean {
   false
 }
 
-// True if the list at `arrIx` carries BOOLEAN elements: a `[true, ...]` literal, a
-// `boolean[]` annotation, a name tracing to either (local let or module global), or
-// a `.map`/`.filter` result whose callback returns boolean (`mfArrElemIsBool`).
-// Boolean elements ride the i32 list rep (0/1), with the spare value 2 encoding the
-// `boolean | null` of a checked `.pop()` — the niche sentinel, mirroring the host.
-export function listElemIsBool(arrIx: i32, fnIx: i32) {
-  if arrIx < 0 { return false }
-  const inner = unwrapParen(arrIx)
-  const e = P.nodes[inner]
-  if e is ArrayLit {
-    if e.arrElems.length > 0 { return exprIsBool(e.arrElems[0], fnIx) }
-    return false
-  }
+// The DECLARED list type-name of the expression at `ix`, or "" — an annotation, not a
+// rep. All FOUR storage classes a list binding can have inside a function body, in the
+// order the shadowing rules demand (a parameter shadows nothing, but a same-named local
+// shadows the global): PARAM annotation, function-scoped `let`/`const` annotation, module
+// GLOBAL annotation, and one level of INDEX (`g[i]` over a `T[][]` is a `T[]` — its own
+// element cut).
+//
+// It exists because the classifiers that need an ELEMENT NAME cannot get one from the
+// node-type bank in every context: inside a MONOMORPHIZED INSTANCE the body is a CLONE
+// the checker never typed, so the bank is empty and the substituted ANNOTATION is the only
+// truth left. Sibling classifiers (`exprStringArray` and its rep family) carry the param
+// storage class and a nested-list arm for exactly that reason; a member of that family
+// missing them answers "not a boolean list" for a `boolean[]` PARAM, which is silent in
+// every context where the bank does answer and wrong in the one where it does not.
+function listAnnNameOf(ix: i32, fnIx: i32) {
+  if ix < 0 { return "" }
+  const e = P.nodes[unwrapParen(ix)]
   if e is Ident {
+    const ptn = paramTypeNode(fnIx, e.identName)
+    if ptn >= 0 {
+      const pt = P.nodes[ptn]
+      if pt is TypeRef { return pt.tyName }
+    }
     let li = -1
     if fnIx >= 0 {
       const fn = P.nodes[fnIx]
@@ -8809,18 +8818,52 @@ export function listElemIsBool(arrIx: i32, fnIx: i32) {
       if d is LetDecl {
         if d.letType >= 0 {
           const lt = P.nodes[d.letType]
-          if lt is TypeRef {
-            // The ARRAY grammar's ONE CUT (`emit_base.arrElemNameRaw`) plus the bare
-            // LEAF name, which is what the whole-spelling compare `== "boolean[]"` was
-            // saying — the D-WHOLESPELL pattern, no new helper. Deliberately NOT
-            // `nameIsI32Array`: that home is REP-wide (it also accepts `i32[]`, a
-            // litunion `K[]`, `(boolean|null)[]` and `(K|null)[]`, all of which share the
-            // one i32 backing), and this site is about the element's PRINT formatting,
-            // which only a genuine `boolean` leaf recovers. Same file, same family, and
-            // the right home differs per arm.
-            if arrElemNameRaw(lt.tyName) == "boolean" { return true }
-          }
+          if lt is TypeRef { return lt.tyName }
         }
+      }
+    }
+    return ""
+  }
+  if e is Index {
+    const outer = listAnnNameOf(e.idxArr, fnIx)
+    if outer != "" { return arrElemNameRaw(outer) }
+  }
+  ""
+}
+
+// True if the list at `arrIx` carries BOOLEAN elements: a `[true, ...]` literal, a
+// `boolean[]` annotation on any storage class (`listAnnNameOf`), a name tracing to
+// either through its initializer, or a `.map`/`.filter` result whose callback returns
+// boolean (`mfArrElemIsBool`).
+// Boolean elements ride the i32 list rep (0/1), with the spare value 2 encoding the
+// `boolean | null` of a checked `.pop()` — the niche sentinel, mirroring the host.
+export function listElemIsBool(arrIx: i32, fnIx: i32) {
+  if arrIx < 0 { return false }
+  const inner = unwrapParen(arrIx)
+  const e = P.nodes[inner]
+  if e is ArrayLit {
+    if e.arrElems.length > 0 { return exprIsBool(e.arrElems[0], fnIx) }
+    return false
+  }
+  // The ARRAY grammar's ONE CUT (`emit_base.arrElemNameRaw`) plus the bare
+  // LEAF name, which is what the whole-spelling compare `== "boolean[]"` was
+  // saying — the D-WHOLESPELL pattern, no new helper. Deliberately NOT
+  // `nameIsI32Array`: that home is REP-wide (it also accepts `i32[]`, a
+  // litunion `K[]`, `(boolean|null)[]` and `(K|null)[]`, all of which share the
+  // one i32 backing), and this site is about the element's PRINT formatting,
+  // which only a genuine `boolean` leaf recovers. Same file, same family, and
+  // the right home differs per arm.
+  if arrElemNameRaw(listAnnNameOf(inner, fnIx)) == "boolean" { return true }
+  if e is Ident {
+    let li = -1
+    if fnIx >= 0 {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOf(e.identName) }
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
         if d.letInit >= 0 {
           if unwrapParen(d.letInit) != inner {
             return listElemIsBool(d.letInit, fnIx)

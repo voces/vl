@@ -21,6 +21,7 @@ import {
   litUnionAliasNameOfTy,
   monoInferListElem,
   monoInferLocalScalar,
+  nodeArrayElemName,
   nodeTyIxOf,
   nodeTyMapName,
   nodeTyName,
@@ -141,7 +142,6 @@ import {
   exprIsF32,
   exprIsF64,
   exprIsI64,
-  exprMap,
   exprNullableStruct,
   exprRefArray,
   exprString,
@@ -302,6 +302,32 @@ function monoGlobalLetOf(name: string, fnIx: i32) {
   -1
 }
 
+// THE ONE HOME for "which annotation NAME can serve as a monomorphization pin". The
+// annotated-LOCAL and PARAM arms of `monoArgTyName` each carried this ladder verbatim, so a
+// spelling added to one and not the other silently answered for a local and not for the
+// parameter a generic FORWARDER hands on — which is how a `boolean[]` argument reached the
+// inner instance as `i32[]` while the direct call was correct.
+//
+// Both callers exist because mid-mono the `expr*` rep cascade cannot classify a binding at
+// all (`buildLocals` is post-mono), so the ANNOTATION is the only truth; both sit behind
+// `fnIx >= 0`. "" means "no pin from the annotation" and the cascade answers instead.
+function monoAnnPinName(name: string) {
+  const r = monoStructAnnName(name)
+  if r != "" { return r }
+  // A UNION-typed annotation (`a: Cat | Dog`, or an alias): bind `T` to the union NAME so
+  // the instance's param/return ride the union box. `isUName` covers a registered inline
+  // union and a `type … = … | …` alias (both in `unNames`).
+  if isUName(name) { return name }
+  const rl = monoCompositeListAnnName(name)
+  if rl != "" { return rl }
+  // A `boolean[]` annotation. Its REP is the i32 list exactly (`nameIsI32Array`), so the
+  // cascade cannot spell it and the pin is a NAME — the same reason the `exprArray` arm
+  // reads the checker's element name. Only a genuine `boolean` LEAF is claimed; the other
+  // i32-backed list spellings keep the cascade's answer (see that arm).
+  if arrElemNameRaw(name) == "boolean" { return name }
+  ""
+}
+
 function monoCompositeListAnnName(name: string) {
   if !nameIsArray(name) { return "" }
   const elem = arrElemNameRaw(name)
@@ -379,19 +405,13 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
             // receiver is not a struct"; `first(xs)` → "expected an array argument"). The
             // annotation is the reliable source — the struct DECL table (`sNames`) IS built here.
             if ld.letType >= 0 {
-              const ltn = tyNameOf(ld.letType)
-              const r = monoStructAnnName(ltn)
+              // A COMPOSITE-ELEMENT list local (`xs: i32[][]`, `(i32|null)[]`, `{a:i32}[]`)
+              // is among the spellings `monoAnnPinName` claims: the same
+              // annotation-is-the-truth rule, for the list spellings the cascade below
+              // either declines (`exprRefArray`, literal-only) or answers one dimension
+              // short (`exprArray`'s `i32[]` catch-all).
+              const r = monoAnnPinName(tyNameOf(ld.letType))
               if r != "" { return r }
-              // A UNION-typed annotated local (`a: Cat | Dog`, or an alias): bind `T` to the
-              // union NAME so the instance's param/return ride the union box. `isUName` covers a
-              // registered inline union and a `type … = … | …` alias (both in `unNames`).
-              if isUName(ltn) { return ltn }
-              // A COMPOSITE-ELEMENT list local (`xs: i32[][]`, `(i32|null)[]`, `{a:i32}[]`):
-              // the same annotation-is-the-truth rule, for the list spellings the cascade
-              // below either declines (`exprRefArray`, literal-only) or answers one
-              // dimension short (`exprArray`'s `i32[]` catch-all).
-              const rl = monoCompositeListAnnName(ltn)
-              if rl != "" { return rl }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
               const innerTy = monoArgTyName(ld.letInit, fnIx)
@@ -406,13 +426,11 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
       if ptn >= 0 {
         const pt = P.nodes[ptn]
         if pt is TypeRef {
-          const r = monoStructAnnName(pt.tyName)
+          // The annotated-local arm's PARAM twin — a generic body passing its own
+          // `xs: i32[][]` / `boolean[]` / `P` parameter on to a second generic call, which
+          // is the shape a generic FORWARDER is. One home, so the two cannot drift.
+          const r = monoAnnPinName(pt.tyName)
           if r != "" { return r }
-          if isUName(pt.tyName) { return pt.tyName }
-          // The composite-element list arm's PARAM twin — a generic body passing its own
-          // `xs: i32[][]` / `(i32|null)[]` parameter on to a second generic call.
-          const rl2 = monoCompositeListAnnName(pt.tyName)
-          if rl2 != "" { return rl2 }
         }
       }
     }
@@ -482,15 +500,30 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   // body doing map work: `emitProgram: field access but no struct type declared` for
   // `q.length`, and the wrong rep wherever the checker let the call through.
   //
-  // BEFORE the collection arms below, because `exprMap` and they are disjoint but the
+  // BEFORE the collection arms below, because the map arm and they are disjoint but the
   // `exprArray` catch-all is not: a map is not an array, yet `exprArray`'s default claim
   // would name one. Reads the CHECKER's recorded type (`nodeTyMapName`) rather than
   // `exprMap`, because the pin is a NAME and the rep classifier answers a boolean — an
-  // unpinned `Map()` renders "" and keeps master's answer.
-  if exprMap(ix, fnIx) {
-    const mn = nodeTyMapName(ix)
-    if mn != "" { return mn }
-  }
+  // unpinned `Map()` renders "" and keeps master's answer. The recorded type is asked
+  // UNGATED, and that is the point: `exprMap`'s own Ident arm resolves a declared local
+  // through `declaredMap`, a table `buildLocals` fills POST-mono, so the gate answered
+  // "not a map" for exactly the spellings the annotation arms above also decline — a
+  // `const m: {[string]: i32}` local and a map-typed FIELD / `??` read reached the `"i32"`
+  // catch-all and the instance declared an i32 parameter over a map body (check-clean
+  // INVALID WASM). Nothing the gate admitted loses its answer: every node it claimed with
+  // a recorded map type is claimed here too.
+  const mn = nodeTyMapName(unwrapParen(ix))
+  if mn != "" { return mn }
+  // The STRING twin of the arm above, and blind in the same place for the same reason:
+  // `exprString`'s Ident arm reads `declaredString`, another POST-mono locals table, so a
+  // `const s: string` LOCAL / a `string` FIELD read / a `s ?? d` result fell to the `"i32"`
+  // catch-all while a `string` PARAM (`paramString`, an annotation) and a bare literal
+  // both resolved — the SAME program with the binding un-annotated worked, because the
+  // un-annotated arm above recurses into the string-literal INIT. The checker typed the
+  // read before the mono pass ran; `nodeTyName` renders a `TyPrim` string as `"string"`,
+  // which is the identical pin the classifier below produces for the spellings it does
+  // claim, so those cells are unaffected.
+  if nodeTyName(unwrapParen(ix)) == "string" { return "string" }
   if exprString(ix, fnIx) { return "string" }
   if exprStringArray(ix, fnIx) { return "string[]" }
   if exprF64Array(ix, fnIx) { return "f64[]" }
@@ -504,10 +537,36 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
     // A struct/union-element array: only a LITERAL argument names its element
     // type cheaply; other shapes are out of scope for now.
     const nd = P.nodes[ix]
-    if nd is ArrayLit { return arrLitElemName(ix) + "[]" }
+    if nd is ArrayLit {
+      // A NESTED list literal over a `boolean` LEAF. `arrLitElemName`'s nested-list rung
+      // names the inner list by its leaf (`string[]` / `f64[]` / `i64[]`, else `i32[]`) and
+      // has no boolean member, so `[[true]]` pinned `i32[][]` and the instance printed its
+      // elements as 0/1. `nodeTyName` renders the checker's whole array type (its `TyArray`
+      // arm) and that IS the pin this site wants. Deliberately NOT fixed in
+      // `arrLitElemName`: that name is a ref-list INTERNING key, and renaming a row is a rep
+      // decision, while the pin is not.
+      const nlt = nodeTyName(ix)
+      if arrElemNameRaw(arrElemNameRaw(nlt)) == "boolean" { return nlt }
+      return arrLitElemName(ix) + "[]"
+    }
     return ""
   }
-  if exprArray(ix, fnIx) { return "i32[]" }
+  if exprArray(ix, fnIx) {
+    // A `boolean[]` shares the i32 list REP exactly (`nameIsI32Array`'s own note), so the
+    // rep cascade cannot SPELL it — and a pin is a NAME, not a rep. The instance's
+    // parameter annotation is the only boolean-ness left in a monomorphized body (the
+    // clone carries no recorded node type), and it is what `listElemIsBool` recovers the
+    // element's PRINT formatting from; pinned `i32[]`, a `boolean[]` argument printed its
+    // elements as 0/1. The CHECKER's element name is the source, exactly as the map arm
+    // above reads `nodeTyMapName` rather than asking the rep classifier.
+    //
+    // Only a genuine `boolean` LEAF is claimed. The other i32-backed spellings
+    // (`nameIsI32Array` also accepts a litunion `K[]`, `(boolean|null)[]`, `(K|null)[]`)
+    // keep the `i32[]` answer: their divergence was NOT measured here, and per the
+    // D-SHAPEFIELD precedent an unreached widening is not licenced.
+    if nodeArrayElemName(ix) == "boolean" { return "boolean[]" }
+    return "i32[]"
+  }
   if exprUnion(ix, fnIx) { return "" }
   if exprNullableStruct(ix, fnIx) { return "" }
   if exprStruct(ix, fnIx) {
