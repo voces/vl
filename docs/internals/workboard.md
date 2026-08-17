@@ -577,10 +577,16 @@ is runtime behaviour.
 | map-value read with `is` / `!= null` | part of the same 84 | print `a` / `5` |
 | `exprIsF32` / `exprIsBool` member-union reads | an untested inconsistency (#1443) | **measured clean** at three shapes |
 
-**Two of my own probes read as compiler defects when they were MY lint errors.** `vl check` returns
-**rc 1 on a HINT** — `never reassigned; use const` and `redundant type annotation` (the #1412
-type-informed stream) both do it. A hint-only rc 1 is its own outcome and must never be recorded
-as a reject.
+**Two of my own probes read as compiler defects when they were MY lint errors** — but I then
+**mis-diagnosed WHY, and the correction matters more than the original point.** I claimed
+`vl check` returns **rc 1 on a HINT**. It does not: measured directly, a hint-only file and an
+info-only file both exit **0** with *"Checked 1 file, no errors."* My probes exited 1 because they
+also contained a real `[ERROR]` — `print` of an un-narrowed nullable — further down the output,
+and the `[HINT]` line merely printed first. The discovery sweep measured this correctly and
+contradicted me, and it was right. **The failure mode to guard against is the opposite of what I
+wrote: never dismiss an rc 1 as "just a hint" — read to the end of the diagnostics.** The lesson
+that survives is narrower: read the whole message before attributing an exit code, and remember
+that a `[HINT]`/`[INFO]` line can precede a real error.
 
 **And `1.5f` is not the f32 literal syntax — there isn't one.** An f32 literal is a bare `1.5` with
 an `f32` annotation, which is just VL's bare-literals-adopt-the-destination-type rule. #1443
