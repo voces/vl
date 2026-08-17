@@ -10667,11 +10667,21 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
     // call (`return v[0](1)` inside an `: f32` function) would else lower a bare i32 argument
     // literal as `f32.const` (invalid: the functype's i32 param). Clear the pending flags for
     // the arg spine and restore after, mirroring the index-receiver discipline.
+    //
+    // The LITERAL-UNION seeds obey the same rule and pick a whole different valtype rather
+    // than a widening; `clu` below restores them from the CALLEE's own parameter for the two
+    // positions that want an atom. Without the clear, an atom-typed destination holding the
+    // call (`const r: K = f(a)`, a `K` element, `"s" + f(a)`) pushed its context into `f`'s
+    // arguments and a member-literal argument lowered as an i32 id into a `(ref $array)` slot.
     const savedArgF32 = pendingF32
     const savedArgF64 = pendingF64
     const savedArgI64 = pendingI64
+    const savedArgLU = pendingLitUnion
+    const savedArgNulLU = pendingNulLitUnion
     pendingF32 = false
     pendingF64 = false
+    pendingLitUnion = 0
+    pendingNulLitUnion = false
     pendingI64 = false
     let i = 0
     while i < args.length {
@@ -10729,6 +10739,17 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
         }
         if cuNm != "" {
           if emitUnionBoxArg(body, cuNm, args[i], fnIx) < 0 { return -1 }
+        } else if (
+          sigParamKindAt(ckey, i) == "str" &&
+          exprIsLitAtom(args[i], fnIx)
+        ) {
+          // The MIRROR of `clu`: a literal-union ATOM argument flowing into a `string`
+          // parameter widens to its member string, because the functype declares
+          // `(ref $array)` there and the atom local holds an i32 id. Same edge the direct
+          // twin takes (`cParamStr`), and the same `$fnsig` byte decides it as for the box
+          // above — a `string` token is a ref, so unlike the litunion token it is not
+          // confusable with i32.
+          if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
         } else if clu == 0 {
           if emitExpr(body, args[i], fnIx) < 0 { return -1 }
         } else {
@@ -10743,6 +10764,8 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
     pendingF32 = savedArgF32
     pendingF64 = savedArgF64
     pendingI64 = savedArgI64
+    pendingLitUnion = savedArgLU
+    pendingNulLitUnion = savedArgNulLU
     // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
     // the concrete `$fnsig` (the engine signature-checks the callee against it).
     let sig = -1
@@ -15916,10 +15939,25 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   // `pendingF64` is cleared for the same reason; it has no seeding site today (the f64
   // let/return arms call `emitExprAsF64` without setting it), which is exactly why f64
   // escaped the defect, and the clear keeps that true if one is ever added.
+  //
+  // THE LITERAL-UNION SEEDS ARE THE SAME RULE, and the rep they pick is not a widening but
+  // a whole different valtype (an interned i32 ATOM vs a `(ref $array)` member string). The
+  // arg spine reads them through `expCtxHere()`, which SNAPSHOTS the ambient — so every
+  // atom-typed destination holding a call (`const r: K = f(a)`, a `K` field/element/map
+  // value, a `K` param of an outer call, `"s" + f(a)` through `emitAtomToStr`) pushed its
+  // own atom context down into `f`'s ARGUMENTS, where it belongs to `f`'s parameters alone:
+  // a member-literal argument lowered as an i32 id and a string-repped litunion argument
+  // took `emitStrToAtom`, both into `(ref $array)` param slots. Invalid wasm, `vl check`
+  // clean. The two positions that legitimately want an atom argument set it back below
+  // from the CALLEE's own parameter (`cParamLitUnion` / `cParamNulLitUnion`).
   const savedArgF32 = pendingF32
   const savedArgF64 = pendingF64
+  const savedArgLU = pendingLitUnion
+  const savedArgNulLU = pendingNulLitUnion
   pendingF32 = false
   pendingF64 = false
+  pendingLitUnion = 0
+  pendingNulLitUnion = false
   let i = 0
   while i < args.length {
     // If this argument position is a struct-typed parameter, hint `emitObj` with the
@@ -16129,6 +16167,8 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   }
   pendingF32 = savedArgF32
   pendingF64 = savedArgF64
+  pendingLitUnion = savedArgLU
+  pendingNulLitUnion = savedArgNulLU
   fbCall(gImports + target) // 0x10 call (imports occupy indices 0..gImports-1)
   // Arm the tail-call cursor: if this call is still the last thing written when the
   // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
@@ -16172,9 +16212,18 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
   // the raw push was already the wrong valtype. A union argument that already HOLDS the
   // box passes through (`emitUnionCoerce`'s first act), an i64-typed variable through
   // `emitExprAsI64` is the same load, and a litunion ATOM variable already holds its id.
+  //
+  // The LITERAL-UNION seeds are cleared for the arg spine for the reason the direct twin
+  // states in full: an argument's rep belongs to the callee's PARAMETER, and an atom-typed
+  // destination holding the call would otherwise push its own atom context down into the
+  // arguments (`cpLit` below restores it where the parameter really is an atom).
   const cfn = P.nodes[fnStmts[target]]
   let cps: i32[] = []
   if cfn is FuncDecl { cps = cfn.fnParams }
+  const savedCapLU = pendingLitUnion
+  const savedCapNulLU = pendingNulLitUnion
+  pendingLitUnion = 0
+  pendingNulLitUnion = false
   let cai = 0
   while cai < cargs.length {
     let cuNm = ""
@@ -16201,11 +16250,17 @@ function emitCapturedCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
       const cluCtx = expCtxHere()
       cluCtx.litUnion = 1
       if emitExprExpect(body, cargs[cai], fnIx, cluCtx) < 0 { return -1 }
+    } else if cpKind == "str" && exprIsLitAtom(cargs[cai], fnIx) {
+      // The MIRROR of `cpLit`: a literal-union ATOM argument into a `string` parameter
+      // widens to its member string, the edge the direct twin takes as `cParamStr`.
+      if emitAtomToStr(body, cargs[cai], fnIx) < 0 { return -1 }
     } else {
       if emitExpr(body, cargs[cai], fnIx) < 0 { return -1 }
     }
     cai = cai + 1
   }
+  pendingLitUnion = savedCapLU
+  pendingNulLitUnion = savedCapNulLU
   // The TARGET's OWN interned `$fnsig` — the functype the target is actually declared
   // with (`emitFunctionSection` declares a sig-eligible function WITH that `$fnsig`), so
   // the `call_indirect` below passes the engine's signature check and its result is the
