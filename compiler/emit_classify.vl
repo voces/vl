@@ -5824,6 +5824,15 @@ export function sFieldIndex(si: i32, name: string) {
   if si < 0 {
     return -1 // unresolved struct (e.g. an inferred ref with no interned shape)
   }
+  // THE FLOOR for the whole family: an `si` past the struct table names no struct, which
+  // is the same answer `si < 0` already gets. Without it, a caller that hands over an
+  // index from ANOTHER table (`capturedStructIndex` handed over an `mv` map-shape slot)
+  // turns a classifier probe into an out-of-bounds `array.get` inside the compiler — a
+  // wasm trap with no diagnostic, no source location and no module written, which is the
+  // worst outcome this file can produce and the hardest to act on. Every downstream
+  // accessor (`sFieldTypeAt`, `sFieldElemNameAt`, `sFieldTgtStructIdx`) is reached only
+  // after this returns `>= 0`, so bounding the index here bounds all of them.
+  if si >= sFieldStart.length { return -1 }
   const start = sFieldStart[si]
   const cnt = sFieldCount[si]
   let j = 0
@@ -17385,6 +17394,23 @@ function globalStructIndexSid(sid: i32) {
 // interned shape`, with everything in sight annotated. The guard is redundant besides:
 // `fnEnvIdxOf(fe) >= 0` holds exactly when `captureCountOf(fe) > 0`, which the scan below
 // decides for itself.
+// IT IS GATED ON THE CAPTURE'S KIND, and that gate is load-bearing rather than
+// defensive. `captureValStructIdx` is the `fbValtype` COMPANION slot, which is
+// POLYMORPHIC IN THE KIND: for a struct capture it is a struct-table row, but for a MAP
+// capture it is the value type's `mv` SHAPE slot and for a ref-list capture it is the
+// ref-list slot — two different index spaces reached through one return value. Handing an
+// mv slot back as a struct index put it into `sFieldStart[si]` (`sFieldIndex`, via
+// `structIndexOfExpr`'s Ident arm), which is an out-of-bounds `array.get` INSIDE THE
+// COMPILER as soon as the slot number exceeds the struct table's length — no diagnostic,
+// no source location, no module. The gate is the same one `localStructIndex` applies to
+// `localIsRef[slot]`, and a captured receiver answering the struct question has to answer
+// it under the same discipline as a local one.
+//
+// A MONO map (`{[string]: i32}` / `{[string]: boolean}`) hid this: `mapAnnShape` answers
+// `-1` / `-4` for the mono value reps, which `sFieldIndex`'s own `si < 0` arm already
+// declined. Only a map whose VALUE needs its own `$mapStruct` — a string / f64 / list /
+// nullable value — produces a nonnegative slot, which is why the trap looked like a
+// string-VALUE defect and not a wrong-index-space defect.
 function capturedStructIndex(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
   if !fnValUsed { return -1 }
@@ -17393,7 +17419,11 @@ function capturedStructIndex(fnIx: i32, name: string) {
   const caps = captureNamesOf(fe)
   let ci = 0
   while ci < caps.length {
-    if caps[ci] == name { return captureValStructIdx(fe, name) }
+    if caps[ci] == name {
+      const ck = captureValKind(fe, name)
+      if ck != "struct" && ck != "nulstruct" { return -1 }
+      return captureValStructIdx(fe, name)
+    }
     ci = ci + 1
   }
   -1
@@ -21658,12 +21688,22 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     // A CAPTURED map variable of a lifted lambda: resolve its shape from the PARENT
     // frame's binding, the map dual of `capturedUnionName` — so a captured typed-value
     // map boxes/reads with its own mv slot rather than the mono -1.
+    //
+    // BOTH BINDING FORMS, because `captureValStructIdx` — the producer that mints the env
+    // FIELD's `$mapStruct` heap type — answers for both. Covering only `LetDecl` left a
+    // captured map PARAM reading the mono `-1` against a typed env field, i.e. the read
+    // and the field named two different structs: `(ref $mapStruct)` stored,
+    // `(ref null $mapStruct)` expected — check-clean INVALID WASM at the captured read.
+    // The `Param` arm computes what `captureValStructIdx`'s `Param` arm computes
+    // (`mapAnnShape` of the annotation, which strips a `| null` wrapper itself), so the
+    // two sides cannot disagree about which map struct a captured map param is.
     if capturedKindOf(fnIx, e.identName) == "map" {
       const cfe = fnStmtsPosOf(fnIx)
       if cfe >= 0 {
         const cb = parentBindingOf(cfe, e.identName)
         if cb >= 0 {
           const cbn = P.nodes[cb]
+          if cbn is Param { return mapAnnShape(cbn.parType) }
           if cbn is LetDecl {
             const cpar = parentBindingFrameOf(cfe, e.identName)
             if cpar >= 0 { return letMapShapeOf(cb, fnStmts[cpar]) }
