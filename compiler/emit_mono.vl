@@ -104,6 +104,7 @@ import {
   nameIsF64Array,
   nodeIsTypeDecl,
   normTypeAtom,
+  nullablePartOf,
   parentLetOf,
   pushUniqueAtom,
   tyNameOf,
@@ -340,7 +341,37 @@ function monoAnnPinName(name: string) {
   // to the `"i32"` catch-all and the instance declared an i32 parameter over a body doing
   // string / f64-list / map work (check-clean INVALID WASM). The annotation is the only
   // truth there, which is the same rule the four arms above already stand on.
-  monoScalarAnnName(name)
+  const rs = monoScalarAnnName(name)
+  if rs != "" { return rs }
+  // A NULLABLE spelling, whose `| null` the pin has to CARRY.
+  monoNulAnnName(name)
+}
+
+// A nullable annotation (`string | null`, `{[K]: V} | null`, `S[] | null`) whose NON-NULL
+// base is a spelling `monoAnnPinName` already claims, echoed back WHOLE — else "".
+//
+// The nullability has to ride the pin because the pin IS the instance's parameter
+// annotation. Every OTHER channel `monoArgTyName` consults answers about the REP, and a
+// nullable's rep is its non-null base by design: `paramString` claims a `string | null`
+// parameter on purpose (a `(ref null $s)` takes the string ops after narrowing), so the
+// cascade named the argument `string`, the instance declared a NON-NULL parameter, and
+// the caller handed it the nullable ref — `expected (ref $type), found (ref null $type)`,
+// `vl check` clean and INVALID WASM. The i32-list niche loses the same information one
+// column over: pinned `i32[]`, an actual `null` argument TRAPS inside the instance.
+//
+// Delegating the base to `monoAnnPinName` keeps ONE membership list — a spelling that
+// ladder declines (an alias, a closure, a litunion) declines nullable too, and the
+// EXACT-NAME rule that makes a pin safe (`monoScalarAnnName`'s header) is inherited rather
+// than restated. The base must echo back UNCHANGED for the same reason: a base the ladder
+// would RENAME could only produce a nullable spelling naming a different rep.
+//
+// `nullablePartOf` is `emit_base`'s home for the two-part `| null` split (depth-aware, so
+// the bar inside `{y: string | i32} | null` does not split it).
+function monoNulAnnName(name: string) {
+  const base = nullablePartOf(name)
+  if base == "" { return "" }
+  if monoAnnPinName(base) == base { return name }
+  ""
 }
 
 // A canonical SCALAR-rep annotation spelling (`i32` / `i64` / `f32` / `f64` / `boolean` /
@@ -486,18 +517,28 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
       }
     }
   }
-  // An INDEXED struct-array element argument (`id(xs[0])` where `xs: P[]`): resolve the array's
-  // ELEMENT struct from its annotation (the dual of the struct-array-argument case). The array's
-  // own type resolves to `P[]` above; strip the `[]` to the element struct. The locals table is
-  // unbuilt mid-mono, so `structIndexOfExpr(xs[0])` below can't classify it (→ i32 default).
-  // The `[]` test + cut are `emit_base`'s homes (`nameIsArray` / `arrElemNameRaw`, #1175);
-  // `an >= 3` stays in front, excluding the degenerate `"[]"` exactly as before.
+  // An INDEXED ELEMENT argument (`id(xs[0])` where `xs: P[]` / `{[K]:V}[]` / `i64[]`): the
+  // array's own name resolves above (through the annotation arms), and the ELEMENT is that
+  // name minus one `[]`. The locals table is unbuilt mid-mono, so the `expr*` cascade below
+  // cannot classify the element read (→ the `"i32"` catch-all).
+  //
+  // The element goes through `monoAnnPinName`, the SAME home the array itself is named
+  // through, and that shared home is the invariant: the two ends of one cut must claim the
+  // same spelling set. A narrower element test than the array's own ladder — `isSName`,
+  // say — resolves a struct element while the map, Set and scalar elements the array arm
+  // ALREADY named fall to the catch-all, and the instance declares an i32 parameter over a
+  // map / i64 / list body (check-clean INVALID WASM).
+  //
+  // The `[]` test is `emit_base`'s home (`nameIsArray`) and the peel is `listElemNameOf` —
+  // the cut PLUS one grouping-paren layer, because a composite element carries its own
+  // parens in the array's name (`(string|null)[]`) while `monoAnnPinName` reads bare
+  // spellings. `an >= 3` stays in front, excluding the degenerate `"[]"`.
   if argN is Index {
     const arrTy = monoArgTyName(argN.idxArr, fnIx)
     const an = arrTy.length
     if an >= 3 && nameIsArray(arrTy) {
-      const elem = arrElemNameRaw(arrTy)
-      if isSName(elem) { return elem }
+      const r = monoAnnPinName(listElemNameOf(arrTy))
+      if r != "" { return r }
     }
   }
   // A struct-FIELD argument (`id(o.inner)` where `o: Outer` and `inner: Inner`): resolve the
