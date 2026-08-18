@@ -117,7 +117,15 @@ Two consequences worth stating:
   another agent's artefact is indistinguishable from a fix that does nothing.
 
 ## Trimmed gates (CI covers the full battery)
-- **`ci-native` runs SIX suite groups and my gate list covered only three.** A real
+- **STOP ENUMERATING SUITES — run `SELFHOST_NATIVE_ALIGN=1 deno task test`.** That is
+  `deno test -A --no-check --parallel tests/`, i.e. the **whole** `tests/` tree: **4,181 tests**,
+  against the ~2,100 my hand-listed groups covered. I expanded that list twice and it was still
+  incomplete both times — the second miss let a real defect through `lsp_wasm_checker_test.ts`,
+  a suite no enumeration of mine included, and the suite's own comment already stated the contract
+  the change broke. An enumerated list of suites is a list that goes stale; the directory does not.
+  Keep the three `ci` steps alongside it (`deno check compiler/*.ts`, `deno lint`,
+  `(cd lsp && deno task build)`), plus rep-fuzz and both seed-ladder legs.
+- ~~**`ci-native` runs SIX suite groups and my gate list covered only three.**~~ A real
   failure hid there: PR #1450's `ci-native` went red on
   `tests/lsp_undisplayable_type_test.ts`, a corpus-wide sweep asserting the LSP's
   undisplayable-type filter drops inlay hints **only** on files that carry an error
