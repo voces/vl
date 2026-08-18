@@ -143,9 +143,16 @@ Two consequences worth stating:
   step's own `env:` block. The `--no-check` is also load-bearing locally — without it the
   LSP suites die on an `npm:@types/node` resolution error before any test runs.
   **A fix that makes an illegal program legal can redden an LSP suite**, because a
-  newly-clean file may carry a hint whose type has no spelling (`() -> <none>[]` for an
-  un-annotated empty-array lambda). That is the filter working, not a regression — pin the
-  file and derive the expected count from the set so name and count cannot drift.
+  newly-clean file may carry a hint whose type has no spelling. That is the filter working,
+  not a regression — pin the file and derive the expected count from the set so name and
+  count cannot drift.
+  **Updated by #1472**: the example this used to give (`() -> <none>[]` for an un-annotated
+  empty-array lambda) no longer exists. `<none>` now renders `_`, so `() => _[]` IS
+  displayable, both `KNOWN_CLEAN_DROPS` exceptions are gone, and the clean side of that
+  sweep is an absolute zero — a diagnostic-free file that loses a hint is now always a
+  regression. `ABSENT_TYPE_MARKERS` is down to `<error>` and `<?>`, and note `_` can never
+  join it: the filter is a SUBSTRING test and `_` occurs inside ordinary identifiers
+  (`{foo_bar: i32}`). The arrow also spells `=>` now, per #1463 and #1468.
 - **The `ci` job is NOT the native one, and its three cheap steps were missing from
   every agent gate list until #1444.** Agents ran the native battery
   (`refresh-compiler`, `lint-self`, the `.vl` corpus, align, release, rep-fuzz, the
