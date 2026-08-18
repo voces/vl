@@ -660,6 +660,36 @@ re-derived before anyone briefs it — not that every cell was re-measured. The 
 litunion/nullable-rep run #1439–#1455. `docs/webcraft-requirements.md`'s A16 paragraph still states
 the stale population and should be corrected when C9's doc-staleness pass runs.
 
+## B8 re-derived — the last open Band-1 row, and it is much smaller than filed (2026-08-17, `ad47fc5f`)
+
+B8 (`nameToTyReal`, the checker's second descent) is filed **L / high risk** with a "~150 ops"
+headline the row itself flags as predating the #1327 unit correction. Measured on the tip:
+
+* **`nameToTyReal` is 236 lines** (`typecheck.vl:7511-7746`) and has **exactly ONE caller** — its
+  own wrapper `nameToTy` at `:7194`.
+* **`nameToTy` has 15 call sites, all inside `typecheck.vl`. Eleven of them are RECURSIVE**, inside
+  `nameToTyReal` itself, re-parsing sub-spellings back out of the string: union parts, intersection
+  parts, negation, a parenthesised group, function parameter types, the return type, the array
+  element name, the map key and value names, and a field's type text. The support cast those rungs
+  call — `arrElemNameRaw`, `mapSpellKeyName`, `mapSpellValName`, `groupInnerOf`, `parenEnclosesWhole`,
+  `fieldTypeTextOf` — is a **type-spelling parser written against strings**, which is the destringify
+  thesis's core target rather than an incidental helper.
+* **So the real surface is FOUR external callers**, not ~150 ops:
+
+| caller | what hands it a string |
+|---|---|
+| `annotResolve(name, root)` `:6716` | **already a ladder** — `if root >= 0 { return tsToTy(root) }` first. #1129's D-ASCANON measurement found the tree present on **333,073 of 333,073** reads at the two POSITIONED funnels, so the string route survives only for UNpositioned entries (`emit_rep`'s post-canon re-resolutions) |
+| `:6844` | splits a function-type spelling's argument list and resolves each part |
+| `unionMemberGenAppShape(member)` `:10976` | takes a union member SPELLING |
+| `recordClonedNodeTy(nodeIx, name, pin)` `:21236` | the monomorphizer's clone recorder — and the **only** producer of the indices `monoInferListElem`/`monoInferLocalScalar` consume, which is why those take no names |
+
+**Re-sized: the risk is concentrated in four sources, and one of them is already 100% tree-fed at its
+positioned funnels.** The row's "L / high" grading should be re-read as "four sources to convert,
+then a 236-line string parser and its six-function support cast delete". Treat "~150 ops" as retired.
+Whoever briefs this should start from `annotResolve`, because its ladder already proves the
+tree-first shape works and its remaining string traffic is a *named, bounded* population
+(unpositioned entries) rather than an open-ended one.
+
 ## Queue re-derivation, round 5 — six more rows retire (2026-08-17, `ad47fc5f`)
 
 Probed on the tip, each against the shape its own row names:
