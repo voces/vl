@@ -663,6 +663,36 @@ re-derived before anyone briefs it — not that every cell was re-measured. The 
 litunion/nullable-rep run #1439–#1455. `docs/webcraft-requirements.md`'s A16 paragraph still states
 the stale population and should be corrected when C9's doc-staleness pass runs.
 
+## #1462's face-2 pin states the WRONG axis — re-rooted and re-briefed (2026-08-17)
+
+#1462 landed a verdict pin for the defect it could not fix in scope,
+`tests/cases/unions/error-struct-typed-variant-field-read.vl`, whose header states the axis as
+**"a union ARM that is a struct carrying a STRUCT-TYPED field"**. Measured on the tip, that is wrong,
+and the fixture as merged will mis-teach the next reader:
+
+| shape | result |
+|---|---|
+| `Outer = { v: Inner }`, `Inner = { v: i32 }` — outer field name **collides** with inner's | **emit error** |
+| `Outer = { w: Inner }`, `Inner = { v: i32 }` — the *same* struct-typed-field shape, names differ | **works, prints 5** |
+| `Outer = { w: Inner }`, `Inner = { w: i32 }` — collision on a different NAME | **emit error** — so it is the collision, not the identifier `v` |
+| the colliding shape **outside any union** | **works, prints 5** |
+| three levels all named `v` | **emit error** |
+| collision, in a union, reading only ONE level (`const g = u.v`) | a **DIFFERENT** message: `ref valtype with no interned shape` |
+
+**Two conditions are required at once: a union arm AND a field-name collision between the outer
+struct and its struct-typed field's own type.** Drop the union and it works; rename either field and
+it works. The fixture's exemplar inherited `v` at both levels from `Box<T> = { v: T }`, so the field
+NAMES were the one variable never moved — which is how a careful cell-by-cell staging still landed on
+the wrong axis.
+
+**This is the sixth consecutive slice whose filed axis was wrong while its cells were right**, and
+the third where the wrong axis came from an exemplar that held a variable fixed rather than from
+too little data. The habit that catches it is cheap: **vary every identifier in the exemplar, not
+just its types and shapes.**
+
+Briefed with the re-rooting stated as a hypothesis to confirm or refute, plus an instruction to
+correct the fixture header — a fixture that mis-teaches is worse than none.
+
 ## B8 re-derived — the last open Band-1 row, and it is much smaller than filed (2026-08-17, `ad47fc5f`)
 
 B8 (`nameToTyReal`, the checker's second descent) is filed **L / high risk** with a "~150 ops"
