@@ -42312,6 +42312,17 @@ post-canon or emitter-computed names for which no spelling tree exists by constr
 terminal condition is a 32-site producer conversion in `emit_mono`/`emit_rewrite`, not a 236-line
 descent deletion.
 
+### 7. GATE
+
+| leg | rc | reading |
+|---|---:|---|
+| `SELFHOST_NATIVE_ALIGN=1 deno task test` | 0 | **4,229 passed / 0 failed / 7 ignored** — the ignored SET is the seven documented names (`lint/exhaustive-is-chain-dead-else` · `lint/generic-intersection-no-warn` · `loops/empty-range` · `soundness/literal-is-union-param-dispatch` · `soundness/README` · `soundness/xfail-false-reject-seq-guard-residual` · `types/struct-union-same-shape`); 7 and not 13 is the tell that `wasm-opt` is present, 7 and not ~615 the tell that the env var took |
+| `deno check compiler/*.ts` · `deno lint` · `(cd lsp && deno task build)` | 0 · 0 · 0 | 116 files linted; the LSP bundle builds |
+| `scripts/lint-self.sh` | 0 | self-lint + fmt-check clean |
+| seed ladder leg 1 — `scripts/refresh-compiler.sh` from the branch's own seed | 0 | 1,222,726 B |
+| seed ladder leg 2 — `rm -f build/vl-seed.wasm build/vl-compiler.wasm dist/vl`, then `fetch-seed.sh`, then `refresh-compiler.sh --prove-fixpoint` | 0 | a REAL download: published `seed-latest` **1,222,868 B** (master has moved past this branch's base, so the size differs from it), compiling this source to **1,222,726 B**, *"compile(next) == next (2 compiles)"*, *"NATIVE FIXPOINT HOLDS"* |
+| `scripts/rep-fuzz-check.sh` (run LAST and alone) | 0 | *"exact ✅ (1 baselined failures — 0 unsound, 1 reject; 0 new, 0 stale)"* |
+
 **BYTE DELTA: 1,222,774 → 1,222,726 = −48 B.**
 
 ### METHOD NOTES
