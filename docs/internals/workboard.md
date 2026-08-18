@@ -768,6 +768,34 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## NEW silent cells, filed by #1467's measured negatives (2026-08-17)
+
+Inventory-2's 76 silent cells are now **zero** — but that is a statement about *its* families, not
+about the compiler. #1467 surfaced three more while fixing D5/D6, and all three are pre-existing and
+unmoved by it. **I reproduced the first two on master myself.**
+
+| cell | grade | note |
+|---|---|---|
+| a forwarder passing an **element read of its own `T[]` param** — `gid(xs[0])` | **10 invalid-wasm + 8 loud of 26 reps** | `monoArgTyName`'s `Index` arm claims a struct element only (`isSName`). **The same shape of hole D5 was, one arm along** — so this is a strong candidate for a shortened mirror of the fix just shipped |
+| `function wrapc(x: string \| null): string \| null { return gid(x) }` | **SILENT**, `vl check` rc 0 then `expected (ref $type), found (ref null $type)` | outside both D5 and D6. The generic-FORWARDER spelling of the same program is a LOUD reject, so the two spellings disagree on outcome column. **No corpus fixture pins either** |
+| an un-annotated local bound to a generic call returning `i64[]` inside a generic body | 1 cell of 234 | concrete-outer and module-scope controls both correct |
+
+## A mistake I have now made THREE times this session — standing rule
+
+**Never report a grep count as a call count.** Every call-graph surface I have filed this session was
+wrong in the same direction, and each one aimed an agent at the wrong starting point:
+
+* **B8**: I filed `nameToTy` at 15 call sites with 4 external callers. Measured: **14 sites, 3
+  external** — the "fourth" was an eleventh recursion. And my advice to start from `annotResolve`
+  was refuted by the population: the descent is 99.3% emit-time, so that route was already at its floor.
+* **`tyToStructStr`**: I filed "14 call sites in `typecheck.vl` and 2 in `emit_base.vl`". Measured:
+  **9 calls** (14 mentions = 9 calls + the definition + 4 comments) and **0** in `emit_base.vl`, whose
+  two hits are both prose.
+
+The fix costs one command — filter comments and the definition, or count the population in the unit
+that decides the work (parses at the outermost entry, cells in a grid) rather than lines in an editor.
+A grep count is a **hypothesis about** a call graph, and it must be labelled as one when briefed.
+
 ## The silent class is down to TEN cells — inventory #2 re-derived end to end (2026-08-17)
 
 `silent-class-inventory-2.md` graded 5,180 cells and found **76 silent**. Every silent family
