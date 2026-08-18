@@ -1610,9 +1610,11 @@ function monoMakeInstance(
                 const hpp = P.nodes[hps[hp]]
                 if hpp is Param {
                   if hpp.parType < 0 {
-                    const hnt = synthTypeRef(pinned[hp], -1)
-                    recordClonedNodeTy(hnt, pinned[hp], pinKinds[hp])
-                    hpp.parType = hnt
+                    // The synthesis IS the whole write: `synthTypeRef` records the new
+                    // node's type under the same pin this column holds (`monoBuildPinCol`
+                    // is `pinKinds`' only producer and computes it with `pinKindOfName`),
+                    // and this arm needs no index of its own.
+                    hpp.parType = synthTypeRef(pinned[hp], -1)
                   }
                 }
                 hp = hp + 1
@@ -1644,6 +1646,9 @@ function monoMakeInstance(
       const p3 = P.nodes[params[pj]]
       if p3 is Param {
         let nt = -1
+        // Whether `nt` is a node this loop SYNTHESIZED (and which therefore already
+        // carries its recorded type) or the original declaration's own annotation node.
+        let synthed = false
         if p3.parType >= 0 {
           // The pinned name differs from the written annotation exactly when
           // a type param substituted through it (bare `T`, `T[]`, or a
@@ -1652,15 +1657,36 @@ function monoMakeInstance(
             nt = p3.parType
           } else {
             nt = synthTypeRef(pinned[pj], -1)
+            synthed = true
           }
         } else if annotateI32 || pinned[pj] != "i32" {
           nt = synthTypeRef(pinned[pj], -1)
+          synthed = true
         }
-        // C1 endgame: record the pinned CONCRETE param type on the instance's annotation node so the
-        // emitter's structural classifiers cover this monomorphized param (not just the name fallback).
-        // Its return IS the resolved index — banked, because the inference windows below need it.
+        // C1 endgame: the pinned CONCRETE param type is recorded on the instance's annotation
+        // node so the emitter's structural classifiers cover this monomorphized param (not just
+        // the name fallback), and `pinTy` is that index — banked, because the speculative
+        // inference windows below are index-fed from exactly here and re-resolve nothing.
+        //
+        // A SYNTHESIZED node ALREADY CARRIES IT. `synthTypeRef` calls
+        // `recordClonedNodeTy(n, name, pinKindOfName(name))` on the way out, and
+        // `pinKindOfName(pinned[pj])` IS `pinKinds[pj]` — `monoBuildPinCol` is the pin
+        // column's only producer and computes it with that same call — so a recorder call
+        // here would be the identical (node, name, pin) triple resolved twice. `nameToTy`
+        // does not hash-cons: the second resolution of a COMPOSITE spelling appends a
+        // structurally identical `T.tys` row and answers with ITS index, so the duplicate
+        // costs an arena row and buys nothing. The node is the one home.
+        //
+        // The ORIGINAL declaration's node (`nt = p3.parType`, the pinned name matching the
+        // written annotation) is a different case: what it carries is the CHECKER's
+        // resolution, taken in the generic body's type-param frame, so the pin the instance
+        // needs is recorded here.
         if nt >= 0 {
-          pinTy = recordClonedNodeTy(nt, pinned[pj], pinKinds[pj])
+          if synthed {
+            pinTy = nodeTyIxOf(nt)
+          } else {
+            pinTy = recordClonedNodeTy(nt, pinned[pj], pinKinds[pj])
+          }
         } else {
           // The one arm that mints no annotation node: an un-annotated param pinned at plain
           // i32 (`nt` stays -1 by design, so the all-i32 path adds zero arena nodes).

@@ -42171,3 +42171,168 @@ stated rather than reported as a zero.
   `zzQuiet` flag and immediately before the call it shadows, so the memo state, the mint order and
   the counters are the same as the unprobed run — confirmed by row 2 reading exactly 1,050, the
   figure D-INLINESHAPETY published, on the probed master build.
+
+<!-- APPEND-MARKER-B6THREAD-END -->
+
+## B8 / D-MONODUP — `nameToTyReal` re-derived on the WHOLE pipeline: the row's four filed callers are THREE, the checker side is 34 parses in 1,988 files, and 599 of the emitter's 4,540 were the SAME (node, name, pin) triple resolved twice, one line apart
+
+Board row B8 files `nameToTyReal` — the checker's string-route type parser — as "L / high risk,
+~150 ops", with four external callers. The row is re-derived here on `c1b4991d`, in the unit that
+decides it (an OUTERMOST `nameToTy` entry), over the whole pipeline rather than the checker alone.
+
+### 1. THE CALL GRAPH, CONFIRMED AND CORRECTED
+
+`nameToTyReal` is `typecheck.vl:7545-7780`, 236 lines, ONE caller — its wrapper `nameToTy` at
+`:7228`. `nameToTy` has **14** call sites (not 15), and **10** are the recursion inside
+`nameToTyReal` (union parts, intersection parts, negation, a parenthesised group, function parameter
+types, the return type, the array element name, the map key, the map value, a field's type text).
+
+The filed FOURTH external caller is not external: `applyGenAliasArgs`'s `appIx < 0` argument-split
+(`:6878`) is reachable only from `applyGenAlias`, whose ONE caller is `nameToTyReal`'s own
+generic-application arm (`:7777`). It is an eleventh recursion. **The external surface is THREE:**
+
+| caller | route |
+|---|---|
+| `annotResolve(name, root)` `:6748` | the ladder's NAME leg — `tsToTy(root)` first |
+| `unionMemberGenAppShape(member)` `:11105` | a union member SPELLING |
+| `recordClonedNodeTy(nodeIx, name, pin)` `:21366` | the emitter's clone/synthesis recorder |
+
+### 2. PROBE ZZB8 — the population, in the unit that decides it
+
+A caller id threaded through `annotResolve` (7 sites) and set at the other two, read at `nameToTy`'s
+depth-0 frame with `T.tys.length` bracketed around the call. Reported at `emitProgram`'s tail
+(`emitFail`), cumulative across the run, the LAST record being the corpus total.
+
+**`vl check --codegen tests/cases` — 1,988 files, 1,943 `checkProgram` invocations, 1,625 programs
+reaching `emitProgram`'s tail:**
+
+| id | source | **parses** | minted | negative |
+|---|---|---:|---:|---:|
+| c40 | `recordClonedNodeTy` | **2,407** | 1,335 | 144 |
+| c6 | `resolveAnnot` (exported; `emit_rep`'s 4 sites, `root = -1` by construction) | **2,099** | 3,446 | 46 |
+| c30 | `unionMemberGenAppShape` | **32** | 0 | 0 |
+| c4 | canon's `&`-fold, through `annotResolve`'s name leg | **2** | 6 | 0 |
+| | **total** | **4,540** | 4,787 | 190 |
+
+* **THE CHECKER'S OWN ROUTES READ ZERO.** c1/c2/c3/c5/c7 — `nameToTyAnn`, `isTypeTy`, the union
+  registration, `resolveAnnotAt`'s two funnels — are **0 of 4,540**. D-ASCANON's *"the tree is
+  present on 333,073 of 333,073 reads"* holds unchanged.
+* **`vl check` WITHOUT `--codegen` IS 34.** c4=2 + c30=32, over the same 1,988 files. D-CHECKPARSE
+  published 23 on a smaller corpus; the shape re-derives (its `unionMemberGenAppShape` 21 → 32, its
+  `&`-fold 2 → 2). **The descent's traffic is 99.3% EMIT-TIME.**
+* **THE COMPILER'S OWN SOURCE READS 6**, all c6. `recordClonedNodeTy` is reached **0** times by
+  `compiler/entry.vl` — the largest single program in the tree is a coverage ZERO for the biggest
+  bucket, which is why the corpus is the only instrument here.
+
+### 3. THE BUCKET NOBODY HAD OPENED IS THE LARGEST, AND HALF OF IT IS A DUPLICATE
+
+`synthTypeRef` (`emit_classify.vl:11463`) — the ONE funnel every emitter type-annotation synthesis
+routes through — itself calls `recordClonedNodeTy(n, name, pinKindOfName(name))`. Two `emit_mono`
+sites then call `recordClonedNodeTy` AGAIN, on the node `synthTypeRef` just returned, with the same
+name and the same pin, one line later. Split by which caller, with the node's banked index read
+BEFORE the call:
+
+| id | site | parses | minted | **bank covers** | **index-identical** | **disagree** |
+|---|---|---:|---:|---:|---:|---:|
+| c41 | `synthTypeRef`'s own record | 1,697 | 1,081 | — | — | — |
+| c42 | `monoMakeInstance`, the `annotateI32` value-use arm | 5 | 0 | 5 | **5** | **0** |
+| c43 | the clone param loop, `nt = p3.parType` (the ORIGINAL node) | 111 | 20 | 111 | 71 | 40 |
+| c44 | the clone param loop, `nt = synthTypeRef(…)`, annotated param | 299 | 188 | 299 | 124 | 175 |
+| c45 | the clone param loop, `nt = synthTypeRef(…)`, un-annotated param | 295 | 46 | 295 | 250 | 45 |
+| | **the four re-record sites** | **710** | 254 | **710 of 710** | **450** | **260** |
+
+and the mint column partitions it **exactly**, as it did at D-CHECKPARSE §6:
+
+| the 710 covered re-records | count | verdict |
+|---|---:|---|
+| index-identical AND mint-free | **450 of 450 — 0 minted** | the two resolutions are one answer |
+| disagreeing AND minting | 239 of 260 | `T.tys` is not hash-consed: the second parse APPENDS a structurally identical row and returns ITS index |
+| disagreeing, mint-free | 21 of 260 — **all in c43** | the ORIGINAL node banks the CHECKER's resolution, taken in the generic body's type-param frame |
+
+**AND THE PIN ARGUMENT IS IDENTICAL BY CONSTRUCTION.** `pinKinds` has ONE producer,
+`monoBuildPinCol`, whose body is `kinds.push(pinKindOfName(pinned[i]))` — the same call
+`synthTypeRef` makes internally. Measured as well as read: `pinKindOfName(pinned[pj])` vs
+`pinKinds[pj]`, **705 comparisons, 0 disagreements**.
+
+### 4. WHAT SHIPPED — one source converted, in its separable half
+
+For a node this loop SYNTHESIZED, the pinned index is READ off the node (`nodeTyIxOf`) instead of
+re-resolved; the `annotateI32` arm drops its re-record entirely (its value is unused). The ORIGINAL
+declaration's node keeps the recorder.
+
+```
+emit_mono.monoMakeInstance
+  hpp.parType = synthTypeRef(pinned[hp], -1)              # the synthesis IS the whole write
+  if synthed { pinTy = nodeTyIxOf(nt) }
+  else { pinTy = recordClonedNodeTy(nt, pinned[pj], pinKinds[pj]) }
+```
+
+Same instrument, both sides:
+
+```
+BEFORE: ZZB8|c4=2,m6|c6=2099,m3446|c30=32,m0|c40=2407,m1335,n144
+AFTER : ZZB8|c4=2,m6|c6=2099,m3446|c30=32,m0|c40=1808,m1101,n73
+```
+
+**599 STRING PARSES DELETED — 4,540 → 3,941, −13.2% of `nameToTyReal`'s whole pipeline traffic and
+−24.9% of the recorder's — and 234 duplicate `T.tys` rows with them.** Predicted 5 + 299 + 295 = 599
+from §3 and read 599.
+
+### 5. EQUIVALENCE, AND THE TWO INVERTED CONTROLS
+
+| leg | reading |
+|---|---|
+| corpus A/B, **1,988 files**, four live fields per file (`vl build` rc · **sha256 of the emitted wasm** · build stderr · `vl run` stdout+stderr) | **0 rows moved** |
+| head is its own fixpoint | `compile(head-source, head) == head`, byte-for-byte, 1,222,726 B |
+| **SAB-A** — `pinTy = -1` in the converted branch (the pin dropped) | **3 of the 339 reaching files move**, rc 0→1: `generics/nested-generic-call-spine`, `inference/unannotated-build-expr`, `inference/unannotated-param-scalar-return` — D-MONOPINIX's three SAB-NOPIN witnesses, reproduced |
+| **SAB-B** — the bank read extended to the ORIGINAL node (`nt = p3.parType`) too, i.e. the recorder deleted outright | **1 of 339 moves**: `modules/generic-shadow/lib.vl` emits an INVALID MODULE — *"type mismatch: expected (ref $type), found i32"* |
+
+**THE 0-ROW A/B IS A MEASURED ZERO ON A LIVE HARNESS**, and SAB-B is the reason the conversion is
+gated on `synthed` rather than applied to all 710: the 21 mint-free disagreements in c43 are the
+checker's answer for the same spelling under a live type-param frame, and one of them is load-bearing
+with a named witness. *The half that is separable is the half whose bank the SAME call wrote.*
+
+(The reaching population is **339 of the 1,988 corpus files** — derived from per-file deltas of the
+ZZB8 counters, not from a guess at which directories are generic. `compiler/entry.vl` and the fuzz
+grammar are both at zero, so this list is the whole instrument.)
+
+### 6. THE FRONTIER AFTER THIS SLICE — and what B8's terminal condition now costs
+
+| # | source | parses (of 3,941) | verdict |
+|---|---|---:|---|
+| 1 | `recordClonedNodeTy`, via `synthTypeRef`'s 32 emitter call sites | **1,697** | OPEN — each site computes a NAME (`pinned[pj]`, a substituted spelling; `ctx`, a contextual render; `srcElem + "[]"`). Converting it means giving `synthTypeRef` an INDEX, i.e. 32 producer sites, not one consumer. |
+| 2 | `resolveAnnot` — `emit_rep`'s 4 sites | **2,099** | AT ITS FLOOR (D-ROWS12 §5). Post-canon names, `root = -1` by construction — canon INVALIDATES the spelling tree (`clearAnnTs`), so there is no tree to hand them. |
+| 3 | `recordClonedNodeTy`, the ORIGINAL-node arm | **111** | REFUTED — SAB-B above. |
+| 4 | `unionMemberGenAppShape` | **32** | REFUTED AS FILED — its three call sites are inside `canonEmitTypeNames`, the pass that REWRITES the very names it passes. The `IsExpr` arm calls it twice around two rewrites (`typecheck.vl:12256`, `:12274`); at the second the node's `annTsOf` root describes the PRE-rewrite spelling, so a root-fed resolution would claim an application the name no longer is. A tree is live at one of the three sites and only when canon was a no-op. |
+| 5 | canon's `&`-fold | **2** | filed at D-CANONFOLD, unchanged |
+
+**`nameToTyReal` CANNOT BE DELETED FROM THE CHECKER SIDE, BECAUSE IT IS NOT A CHECKER-SIDE FUNCTION
+ANY MORE.** 3,941 of 3,941 remaining parses are EMIT-TIME, and 3,796 of them (rows 1 and 2) are
+post-canon or emitter-computed names for which no spelling tree exists by construction. The row's
+terminal condition is a 32-site producer conversion in `emit_mono`/`emit_rewrite`, not a 236-line
+descent deletion.
+
+**BYTE DELTA: 1,222,774 → 1,222,726 = −48 B.**
+
+### METHOD NOTES
+
+* **A FUNNEL THAT RECORDS CAN MAKE ITS CALLER'S RECORD A DUPLICATE, AND THE CALLER CANNOT SEE IT.**
+  `synthTypeRef` was given the recording job so *"every synthesis site routes through here and
+  coverage stays uniform"* — and that is exactly why two of its callers then repeated the call: the
+  recorder's return is the value they need, and nothing at the call site says the funnel already
+  computed it. *When a constructor acquires a side effect, grep its callers for the same side
+  effect spelled out.*
+* **A ROW'S "EXTERNAL CALLERS" ARE ONLY EXTERNAL IF YOU FOLLOW THEM UP ONE MORE LEVEL.** The filed
+  fourth caller is a recursion through two hops (`applyGenAliasArgs` ← `applyGenAlias` ←
+  `nameToTyReal`). One `grep` for the intermediate's own callers is the whole check, and a surface
+  of 4 versus 3 is a 25% error in the thing the row is graded on.
+* **A CENSUS RUN UNDER `vl check` MEASURES THE CHECKER — WHICH IS THE WRONG DENOMINATOR FOR A
+  FUNCTION THE EMITTER DOMINATES.** 34 versus 4,540. And the first attempt at the `--codegen` census
+  read 34 too, because the probe raised a diagnostic per program and `vl check --codegen` does not
+  emit for a file that has errors: *the instrument turned off the half it was measuring.* The tell
+  was the line count of the two runs being equal to the digit. *Diff the two channels' output SIZE
+  before believing a `--codegen` number.*
+* **AN INVERTED CONTROL THAT IS ALSO THE OBVIOUS EXTENSION PAYS TWICE.** SAB-B is "apply the same
+  conversion to the remaining arm". It moves one file to an invalid module, which simultaneously
+  proves the harness is live and settles whether the containment is arbitrary. *Pick the sabotage
+  that a reviewer would propose as the next slice.*
