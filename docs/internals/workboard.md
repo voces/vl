@@ -573,6 +573,48 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## An owner ruling resolved by measurement, not by asking (2026-08-17, on master `fed8693b`)
+
+**`does ?? short-circuit` was on the board as an OWNER RULING with my recommendation "yes". It does
+not need a ruling.** The compiler already answers yes on three of four scalar reps, and `boolean` is
+simply inconsistent with them:
+
+| rep | `p ?? side()` with `p` non-null |
+|---|---|
+| `i32` | short-circuits — `side()` never runs |
+| `f64` | short-circuits |
+| `string` | short-circuits |
+| **`boolean`** | **`side()` RUNS** — prints `RHS RAN` before the value |
+
+Grade on both inputs, as the standing rule requires: with a null actually present, `side()` runs in
+every rep, which is correct and is the control that keeps this from being a "`??` never evaluates
+its RHS" misreading. So this is not a design question about what `??` should mean — the semantics
+are already chosen and implemented, and one rep is missing the arm. **Re-file as a defect, brief it
+as a shortened mirror, and take the ruling off the board.** #1437's finding that `??` over
+`boolean|null` evaluates both operands was the same cell seen from the other side.
+
+### `boolean` is now the rep with the least-complete ladder coverage — three independent hits
+
+Worth stating as a briefing heuristic, because it has now paid out three times from unrelated
+directions:
+
+* #1453 — the silent `print` defect's axis was **the `boolean` leaf at any depth**, because
+  `boolean[]` shares the i32 list rep exactly and nothing distinguishes it but a NAME.
+* today — **`boolean` is silently assignable to `i32`** in every non-literal position, while
+  `f64←bool`, `i32←f64`, `string←bool` and `bool←i32` are all correctly rejected.
+* today — **`??` fails to short-circuit for `boolean` alone.**
+
+When a per-rep ladder is the suspect, **probe `boolean` first**. It shares i32's representation
+without sharing its name, which is exactly the condition under which an arm gets omitted and the
+fallthrough still looks plausible.
+
+## Also retired by re-derivation (same pass)
+
+* **the checker not narrowing a `while` BODY from its condition guard** (#1437, filed LOUD) —
+  `let p = f(); while p != null { print(p + 1); p = null }` prints `4` on the tip. Note the body
+  must terminate the loop by assigning, not by re-binding, or the probe hits a deliberate reject
+  instead — that mis-shape cost me a reading earlier this cycle.
+
 ## Retired by re-derivation, round 3 — the whole COMPILER TRAP column (2026-08-17, on master `fed8693b`)
 
 `silent-class-inventory-2.md` opened a ninth outcome column, **COMPILER TRAP (no diagnostic, no
