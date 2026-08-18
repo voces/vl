@@ -52,6 +52,7 @@ live slice. All three were re-derived on the tip before briefing.
 
 | item | PR | result |
 |---|---|---|
+| **a generic call's argument pin had two shortened ends** | #1469 | shipped, closing both cells #1467 filed. Each root confirmed by an **in-compiler probe**, not a reading (`monoArgTyName` wrapped to log its answer beside the annotation and the recorded type, gated on a `zz`-prefixed enclosing name so it stayed inert during the self-compile). **The two roots point in OPPOSITE directions**: the `Index` arm cut the `[]` off an array pin that was already CORRECT and then re-guessed the element, accepting it only when `isSName` claimed a struct; while the nullable arm's annotation ladder correctly DECLINED and the rep cascade answered anyway, so the pin — which becomes the instance's parameter annotation — dropped its own `| null`. **Not a shared root, proven by a cross-product rather than a reading**: the Index peel moves 73 element cells and **0** nullable; `monoNulAnnName` moves 0 element and **40** nullable. Against D5 they land on opposite sides and each names its BRANCH: cell 2 shares D5's root AND its branch (D5's fix could not close it because that ladder declines nullables BY DESIGN), cell 1 shares only the decision SITE and reaches a branch `monoAnnPinName` was never wired into. Grids **119→192 of 260** and **64→104 of 144**, both **0 backward**; byte-identity **1,999/1,999**; sabotage predicted 2, measured 2 off a saved artifact. **Two controls relocated the axis** — a concrete forwarder and the no-forwarder spelling both moved, so it was never about generic forwarding — and 2 of the moved cells were runtime TRAPS that were correct on a value and trapped on `null`, the same dropped `| null` in a rep that survives it |
 | **`tyToStructStr` source-spells — and the `->` WAS the classifier** | #1468 | shipped, closing Band 1's last follow-on. **The dependency ran BACKWARDS from the filing.** Four sites asked `strContains(elem, "=>")` to mean *"the element is a closure"*, and the unparseable `->` was the only thing keeping a closure FIELD invisible to them — a coarse substring test giving the right answer for the wrong reason. `emit_base` already carried this exact repair TWICE; the bare-ELEMENT corner had four hand-written copies. Re-keyed to one `nameIsClosureElem`, so the `srcSpell` bit is DELETED and `tyToAliasBodyStr` retires. **The hazard was one site, not four**: of 9 per-site cells, eight move **0 of 1,990** and only `nodeArrayElemName`'s TyObj element moves anything — three of #1463's four filed hazards are free, and per-leg it is the **arrow leg alone**. Round-trip **42.4% → 73.2%**, residual 117 with **0 carrying `->` and 0 carrying `?`** (~100 are the canon pass's unquoted literal-union vocabulary, a different language). Byte-identity **0 of 1,990**. Two grader-is-live legs predicted before running, both exact — one of them proving **the corpus channel is blind to the cell its fixture witnesses**. Fixed a master-side defect on the way (an inferred array of closure-valued MAPS, where the `=>` belonged to the map's VALUE) |
 | **the last two silent families** | #1467 | shipped. **The silent class of inventory-2 is now ZERO of its 76.** D5: `monoArgTyName`'s ANNOTATION channel had no map/Set arm, while the recorded-type channel is **structurally blind inside a generic body** (the recorded type of `x` IS the type parameter, and `buildLocals` is post-mono so every fallback table is empty) — the substituted annotation was sitting there unread. **D5 DOES share D4's root and the inventory was RIGHT** — what was wrong was my assumption that D4's fix closed it: D4 landed in the recorded-type branch, which by construction cannot answer there. So **"shared root" does not imply "one fix"**, and the inventory's other shared-root claims are not impeached. D6: `arrLitIsF32` **did not exist anywhere in the tree**, and it bites with NO generic in sight — `const a: f32 = 1.5; const xs = [a]` was check-clean invalid wasm, which I verified on master. **Two of the five dimensions I held fixed were hiding cells**: a `const y: T = x` forwarder fails for EVERY non-i32 rep (8 extra cells, I re-verified with `string`), and the rep is 6 map/Set spellings not 4. Grids 146→198/234 and 56→65/65, **0 backward**; byte-identity 1,990/1,990; sabotage predicted 3, measured 3. A **refuted prediction changed the fix**: the f32 arm alone turned the cell silent→LOUD, exposing that the family was missing from three sites, not one |
 | **a union variant's INLINE-shape field had no collector floor** | #1466 | shipped, and **my briefed hypothesis was refuted on both counts — which is exactly what briefing it AS a hypothesis was for.** (1) **Shared root REFUTED by a decisive measurement**: the path-A fix moves all 9 of path B's cells ZERO, message for message, and #1464's own CHANGELOG had already recorded path B as a separate leftover. (2) **My axis was wrong, and the inverted control was inside my own repro**: a struct-typed variant field is NOT unsupported — the DECLARED-NAME spelling has always lowered, at 1 and 3 fields, depth 2 and depth 3. I verified that on master myself. The real axis is the field type's **SPELLING**: `collectU` is the first emit pass, so the struct table does not exist yet — an inline shape's only resolution needs it, a declared name resolves off the arena. The inline-ARM recorder never had the floor; only `collectVariantFields` lacked it. **My two original probes used different spellings and I folded their distinct failures into one root.** **Path B is TWO floors, neither about field types** — depth 1 with a flat i32 field reproduces both: an un-annotated literal fieldset-twinning a variant (`collectAnonShapes` skips it), and a **module GLOBAL** annotated with a variant name (storage class is the axis — local and param lower; I re-verified). Both left unfixed **on measurement**: deleting path B's guard lowers every cell but reddens **7 of 1,524** `@run` rows including one that PINS a variant as a first-class value. **It also found and repaired a pre-existing defect**: `collectA`'s deferred code-15 intern discarded its own return, and the intern DEDUPS by wasm code while the consumer looks up BY NAME, so `{b: boolean}` landed on a `{b: i32}` row. Byte-identity **1,522/1,522**; two sabotage legs, both exact (3/2 and 1/4) |
@@ -767,6 +768,40 @@ then a 236-line string parser and its six-function support cast delete". Treat "
 Whoever briefs this should start from `annotResolve`, because its ladder already proves the
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
+
+## The last known silent cell — i64 element, literal index, ARGUMENT position (2026-08-17)
+
+#1467's and #1469's cells are all shipped. This is the only silent defect I currently know of, and
+it needs **no generic at all**:
+
+    function idi(x: i64) { print(x) }
+    const a: i64[] = [7]
+    idi(a[0])          // vl check rc 0, then invalid wasm
+
+#1469 diagnosed it from the disassembly: the pin is CORRECT (`i64`) and **`i64.const 0` is emitted as
+the ARRAY INDEX** into an i32 bounds check — a pending i64-literal state leaking into the index
+emission. Its named fix shape was "clear `pendingI64`/`pendingF32`/`pendingF64` around the ~10
+`nd.idxIndex` emissions".
+
+**My grid says that shape is too wide, which is why it is briefed as a hypothesis:**
+
+| variation | result |
+|---|---|
+| `i64` element, literal index, **call-argument** position | **check-clean, invalid wasm** |
+| `f32`, `f64`, `i32` element, same shape | all work — **so the f32/f64 half of the named fix has no cell** |
+| literal index `1` instead of `0` | fails — not index-0-specific |
+| the **second** argument slot | fails — not slot-specific |
+| **variable** index `a[k]` | works |
+| `print(a[0])`, or bound first as `const v: i64 = a[0]` | both work — **argument position is part of the axis** |
+| a bare `i64` literal, or an `i64` variable, as the argument | both work |
+
+**Dimensions I held FIXED and did not test**: array length 1–2; one-dimensional only; a plain concrete
+callee (no generic, lambda, method or UFCS); module scope; a `const`-bound annotated array; single
+index depth. Specifically untried: `a[0][0]`, a map or struct element yielding i64, a lambda callee,
+and an i64 element in RETURN position.
+
+**Measured negative kept separate**: an `i64` MAP value as an argument fails with a *different*
+message and a **loud** `emit error` — different column, likely different site, not this defect.
 
 ## NEW silent cells, filed by #1467's measured negatives (2026-08-17)
 
