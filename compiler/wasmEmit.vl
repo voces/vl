@@ -17527,9 +17527,8 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `x = 5   print(x ?? 0)` were all `vl check`-clean modules the engine rejects with
   // `expected (ref null $type), found i32`.
   //
-  // THE DEFAULT IS NOT EVALUATED, which is what `??` means. (Two sentinel arms below `select`
-  // instead, so they evaluate a side-effecting default even on the present path; that is
-  // their open ruling and this arm does not import it.)
+  // THE DEFAULT IS NOT EVALUATED, which is what `??` means — the rule EVERY arm below holds,
+  // over every rep and every LHS source.
   if lhs is Ident {
     if narrowExcludesNull(lhs.identName) { return emitExpr(body, lhsIx, fnIx) }
   }
@@ -17588,20 +17587,31 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // and is handled by the stash-based call path in the `lhs is Call` block below.
   let lhsReEval = true
   if lhs is Call { lhsReEval = false }
-  // `<e> ?? d` over a `boolean | null` NICHE (an ident binding OR a `boolean | null`
-  // struct FIELD, code 21) — the i32 cell holds 0/1 or the sentinel 2 (`null`); select
-  // the default on 2. Generic in `e.binLeft`, so it covers a member field read too.
+  // `<e> ?? d` over a `boolean | null` NICHE (an ident binding, a `boolean | null` struct
+  // FIELD (code 21), or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the
+  // sentinel 2 (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers
+  // every re-readable place.
+  //
+  // A BRANCHING `if` OVER THE `0x7f` BLOCKTYPE, which is what `??` MEANS: the default is
+  // evaluated ONLY when the LHS is null. `select` is one opcode but evaluates both of its
+  // value operands unconditionally, so a side-effecting default ran on the PRESENT path —
+  // the same lowering the `K | null` niche below, the `string | null` niche, the boxed
+  // `i32 | null` union and every nullable-ref rep already use.
   if lhsReEval && exprNulBool(e.binLeft, fnIx) {
-    if emitExpr(body, e.binRight, fnIx) < 0 {
-      return -1 // d   [a]
-    }
     if emitExpr(body, e.binLeft, fnIx) < 0 {
-      return -1 // x   [b]
+      return -1 // the niche i32
     }
-    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
     fbI32Const(2)
-    fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
-    wU8(27)      // 0x1b select → d if null else x
+    fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)
+    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
+    ctrlEnter()
+    if emitExpr(body, e.binRight, fnIx) < 0 {
+      return -1 // d, reached only on the null path
+    }
+    fbElse() // 0x05 else — present → the 0/1 cell, re-read
+    if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+    fbEnd()  // 0x0b end
+    ctrlLeave()
     return 0
   }
   // `<e> ?? d` over a `K | null` NICHE — an ident / param / global binding, a `K | null`
@@ -17616,13 +17626,12 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `string` — declines here and keeps its loud reject instead of putting a heap string in an i32
   // blocktype.
   //
-  // A BRANCHING `if`, NOT THE `select` ITS `boolean | null` TWIN USES. `select` is one opcode and
-  // evaluates BOTH operands unconditionally; the `if`/`else`/`end` framing over the `0x7f`
-  // blocktype is THREE BYTES MORE PER SITE (measured: 1351 vs 1342 over three `??` sites) and
-  // evaluates the default ONLY when the LHS is null — the semantics `??` states. The
-  // `boolean | null` and bool-`pop` arms above still `select`, so a side-effecting default runs
-  // there even when the LHS is present; that is an open ruling, and this arm deliberately does
-  // not import it into a new rep for three bytes.
+  // A BRANCHING `if`, NOT A `select` — the same framing its `boolean | null` twin above uses,
+  // and for the same reason. `select` is one opcode but evaluates BOTH value operands
+  // unconditionally, so a side-effecting default would run on the PRESENT path; the
+  // `if`/`else`/`end` framing over the `0x7f` blocktype costs THREE BYTES MORE PER SITE
+  // (measured: 1351 vs 1342 over three `??` sites) and evaluates the default ONLY when the LHS
+  // is null — the semantics `??` states, which no sentinel rep is exempt from.
   //
   // A CALL LHS cannot be re-read, so it is STASHED once in the i32 coalesce-call slot — the
   // same slot the `boolean | null` call arm uses, and reserved by the same
@@ -17707,20 +17716,25 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     ctrlLeave()
     return 0
   }
-  // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell
-  // holds 0/1 or the niche sentinel 2 (`null`) — select the default on 2.
+  // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell holds 0/1 or the
+  // niche sentinel 2 (`null`) — the same branching `if` the `boolean | null` arm above uses,
+  // so the default runs only on the null path here too.
   if lhs is Ident {
     if identNullableBoolPop(lhs.identName, fnIx) {
-      if emitExpr(body, e.binRight, fnIx) < 0 {
-        return -1 // d   [a]
-      }
       if emitExpr(body, e.binLeft, fnIx) < 0 {
-        return -1 // x   [b]
+        return -1 // the niche i32
       }
-      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
       fbI32Const(2)
-      fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)      [cond]
-      wU8(27)      // 0x1b select → d if null else x
+      fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)
+      fbIf(127)    // 0x04 if, 0x7f i32 blocktype
+      ctrlEnter()
+      if emitExpr(body, e.binRight, fnIx) < 0 {
+        return -1 // d, reached only on the null path
+      }
+      fbElse() // 0x05 else — present → the 0/1 cell, re-read
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      fbEnd()  // 0x0b end
+      ctrlLeave()
       return 0
     }
     // `x ?? d` over a BOXED value union containing `null` (`i32 | null`):
@@ -17895,22 +17909,27 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
         }
       }
     }
-    // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call
-    // cannot be re-read, so STASH the single evaluation in the bool slot, then select
-    // `d` on the sentinel 2 — the call analogue of the `boolean | null` ident path.
+    // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call cannot be
+    // re-read, so STASH the single evaluation in the bool slot, then branch on the sentinel
+    // 2 — the call analogue of the `boolean | null` ident path, and the default runs only on
+    // the null path for the same reason.
     if exprNulBool(e.binLeft, fnIx) {
       if emitExpr(body, e.binLeft, fnIx) < 0 {
         return -1 // the niche i32, evaluated ONCE
       }
       fbLocalSet(coalesceCallBoolSlot)
-      if emitExpr(body, e.binRight, fnIx) < 0 {
-        return -1 // d                                       [val1]
-      }
-      fbLocalGet(coalesceCallBoolSlot) // x                  [val2]
       fbLocalGet(coalesceCallBoolSlot)
       fbI32Const(2)
-      fbI32Bin(70)                     // 0x46 i32.eq → x == 2 (null)            [cond]
-      wU8(27)                          // 0x1b select → d if null else x
+      fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)
+      fbIf(127)    // 0x04 if, 0x7f i32 blocktype
+      ctrlEnter()
+      if emitExpr(body, e.binRight, fnIx) < 0 {
+        return -1 // d, reached only on the null path
+      }
+      fbElse() // 0x05 else — present → the stashed 0/1 cell
+      fbLocalGet(coalesceCallBoolSlot)
+      fbEnd()  // 0x0b end
+      ctrlLeave()
       return 0
     }
     // `f() ?? d` over a CALL returning `string | null` (kind 16): STASH the nullable
