@@ -573,6 +573,40 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## C5 / A16 — the correctness population that BLOCKED it is substantially gone (2026-08-17, `fed8693b`)
+
+C5 sits on the board as **BLOCKED, 2 owner rulings**, carrying **"81 of 244 grid cells broken, 42
+silent wrong answers, all `vl check`-clean"**. That population is what made the row frightening. It
+does not reproduce.
+
+`webcraft-requirements.md` names three exemplar shapes. **All three are correct on the tip:**
+
+| doc's claim | tip |
+|---|---|
+| `const k: K = "aa"; const x: K \| f64 = k` **converts the atom ID to a float** | prints `aa` |
+| `if x is K { const y: K = x }` is **invalid wasm** | prints `aa` |
+| `K \| string` answers `x is K` **TRUE for a plain string** | correctly answers **false** |
+
+I widened past the three exemplars rather than stopping at them: `K \| i32`, `K \| boolean`, the
+`K \| f64` union actually **holding** its f64 arm (correctly takes the f64 branch — the negative
+direction, which is the one a broken tag test fails), and a mixed union **as a struct field** are
+all correct too. **Nine of nine probed cells are in a correct outcome column.** The ninth is a loud
+reject with guidance — `match over a union with literal members is not supported — compare them
+with == in an if-chain` — which is a documented limitation, not a silent cell.
+
+**What this does to the row.** The two owner rulings gated the *representation feature*, and
+measurement had already concluded that feature "should not be scheduled as a memory feature" —
+a standalone litunion and all four keep positions already rep as an interned i32 atom, and the
+mixed-union store already costs exactly one `struct.new` against an interned global, so no encoding
+allocates less. With the correctness half gone too, **C5 no longer has an unblocked half worth
+briefing** and should stop being counted as a blocked correctness risk.
+
+**Caveat kept honest:** nine probes is not a 244-cell grid. The claim is that the shapes the doc
+itself nominates as the defect are fixed, so **81/42 is refuted as a live number** and must be
+re-derived before anyone briefs it — not that every cell was re-measured. The likely closers are the
+litunion/nullable-rep run #1439–#1455. `docs/webcraft-requirements.md`'s A16 paragraph still states
+the stale population and should be corrected when C9's doc-staleness pass runs.
+
 ## Queue re-derivation, round 4 — litunion rows (2026-08-17, `fed8693b`)
 
 Probed on the tip, each against the shape its own row names:
