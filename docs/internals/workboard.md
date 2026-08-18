@@ -713,8 +713,7 @@ simply inconsistent with them:
 Grade on both inputs, as the standing rule requires: with a null actually present, `side()` runs in
 every rep, which is correct and is the control that keeps this from being a "`??` never evaluates
 its RHS" misreading. So this is not a design question about what `??` should mean — the semantics
-are already chosen and implemented, and one rep is missing the arm. **Re-file as a defect, brief it
-as a shortened mirror, and take the ruling off the board.** #1437's finding that `??` over
+are already chosen and implemented, and one rep is missing the arm. **Re-filed as a defect and BRIEFED 2026-08-17; the ruling is OFF the board.** Isolated further before briefing: the sibling OPERATORS are fine for boolean (`false && side()` and `true || side()` both short-circuit), so it is not a general boolean short-circuit-lowering problem but `??` specifically; and the ANNOTATED spelling `const p: boolean | null = true` fails identically while annotated `i32 | null` short-circuits, so it is not the inference path either. Checked for a pinning fixture first, per the #1459 lesson: none pins `??` as evaluating both operands, and `arrays/loop-cond-hoist-nullable-list.vl:17` already describes a "short-circuit violation" in `&&` as a DEFECT, so the contract is established. #1437's finding that `??` over
 `boolean|null` evaluates both operands was the same cell seen from the other side.
 
 ### `boolean` is now the rep with the least-complete ladder coverage — three independent hits
