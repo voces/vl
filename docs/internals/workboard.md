@@ -772,6 +772,46 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## BAND 1 — `TyPrim.primName` was a comment over a `string`; it is now a declaration (2026-08-18)
+
+The type arena held its primitive vocabulary as a raw `string`, with the closed set written
+out **in a comment above the field**: *"`primName` is one of \"i32\" | \"i64\" | … | \"never\""*.
+That is F2/#1402's template exactly — a closed vocabulary IS a literal union, and every
+comparison becomes an `i32.eq` against an interned atom **with the source text unchanged**.
+
+**Census, in the unit that decides the work.** 176 `.primName` sites over 5 files
+(typecheck 97, emit_rep 48, emit_classify 29, check_query 1, wasmEmit 1); **154 are
+comparisons against a literal**; **9 producers, every one a literal `mkPrim("…")` call** at
+arena init; and — the number that made the absence marker a non-question — **0 sites
+compare the readers to `""`**. So `primNameOf`/`tyPrimNameOf` return `PrimName | null`, the
+idiom the language already commits to, and the empty marker that was never tested for is
+gone. Four consumers spell the name rather than decide on it (two rep-KEY builders, the
+`as`-target spelling canon writes back, one niche render); they route through an exported
+`primNameStr`, which is the only new surface.
+
+**Result: 0 verdict changes and 0 emitted-byte changes across 2,005 corpus files**, full
+suite 2,157/0, fixpoint holds, self-lint + fmt clean.
+
+**PERF: MEASURED NEUTRAL, and that is the finding.** Interleaved min-of-5 against the
+immediately preceding seed:
+
+| workload | before | after |
+|---|---|---|
+| `vl check compiler/` | 4,692 ms | 4,710 ms (**−0.4%**) |
+| self-compile | 1,548 ms | 1,566 ms (**−1.2%**) |
+
+Both inside noise — an earlier run of the same pair read **+1.6%** on the self-compile, in
+the other direction. **Do not quote F2's −9.4% as the expected shape for this class.** F2's
+`tok.kind` is compared once per TOKEN in the lexer and parser; `primName` is compared once
+per TYPE DECISION, which is orders of magnitude rarer, and the site count (154 vs 561) was
+never the axis. A closed-vocabulary conversion is worth what its site FREQUENCY is worth,
+not what its site COUNT is.
+
+**Kept anyway, on the other axis.** It is band 1's thesis executed on the type arena itself,
+and it buys a real property the string could not: **the checker is now a COMPLETE ORACLE for
+the vocabulary** — a mistyped primitive name is a hard type error at all 176 sites instead of
+a silently-false comparison. The comment became a declaration.
+
 ## PERF — the shipped seed is UNOPTIMISED, and it is worth 3.3% (2026-08-18)
 
 Fell out of the `O-release-rung-default` ruling: `build/vl-compiler.wasm` is **1,224,039 B** while

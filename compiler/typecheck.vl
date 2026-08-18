@@ -308,9 +308,24 @@ import { nodeChildren } from "./lint"
 // One struct per type KIND, prefixed field names so `is` discriminates the union
 // (the AST's convention). A nested type is always an `i32` index into `T.tys`.
 
-// A primitive: `primName` is one of "i32" | "i64" | "f32" | "f64" | "boolean" |
-// "string" | "void" | "null" | "never".
-export type TyPrim = { primName: string }
+// The primitive VOCABULARY. It was a comment over a `string` field until it became a
+// declaration: a closed set spelled in the source is a literal union, and every
+// `primName == "i32"` in the compiler is then an `i32.eq` against an interned atom with
+// its source text unchanged (F2/#1402's template, applied to the type arena itself).
+// The checker is a COMPLETE ORACLE for the conversion — a name outside this set is a hard
+// type error, not a silently false comparison, which is what a `string` field allowed.
+export type PrimName = "i32"
+  | "i64"
+  | "f32"
+  | "f64"
+  | "boolean"
+  | "string"
+  | "void"
+  | "null"
+  | "never"
+
+// A primitive.
+export type TyPrim = { primName: PrimName }
 // The error/unknown type — produced on a type failure so checking continues
 // without cascading (akin to TS `Never`/`Unknown`); assignable to/from anything.
 export type TyErr = { errKind: string }
@@ -1342,7 +1357,7 @@ function addTy(t: Ty) {
   T.tys.length - 1
 }
 
-function mkPrim(name: string) {
+function mkPrim(name: PrimName) {
   const t: Ty = { primName: name }
   addTy(t)
 }
@@ -5373,11 +5388,22 @@ function isNumeric(ix: i32) {
 }
 
 // The bare primitive name of type-arena index `ix`, or "" if it is not a primitive.
-function primNameOf(ix: i32) {
-  if ix < 0 { return "" }
+// ABSENCE IS `null`, NOT `""`. The old empty-string marker was never TESTED for anywhere
+// — 0 sites compared this to `""` — it only had to lose every `== "i32"` comparison, which
+// `null` does identically. `T | null` is the absence idiom the language already commits to.
+function primNameOf(ix: i32): PrimName | null {
+  if ix < 0 { return null }
   const t = T.tys[ix]
   if t is TyPrim { return t.primName }
-  ""
+  null
+}
+
+// The primitive name as TEXT, for the few consumers that spell it into a string rather
+// than decide on it — a rep KEY builder, and the `as`-target spelling the canon pass
+// writes back onto the node. Absence renders empty, which is what those sites read before.
+export function primNameStr(p: PrimName | null): string {
+  if p == null { return "" }
+  p
 }
 
 // Numeric WIDENING lattice (B2): may a value of primitive type `sn` implicitly
@@ -5391,7 +5417,7 @@ function primNameOf(ix: i32) {
 //   i32 → f32  (above 2^24 the i32 rounds to the nearest f32 — lossy)
 //   i64 → f64  (above 2^53 the i64 rounds to the nearest f64 — lossy)
 // plus every narrowing (i64→i32, f64→f32, …) and any float→integer (truncation).
-function numWidensName(sn: string, dn: string) {
+function numWidensName(sn: PrimName | null, dn: PrimName | null) {
   if sn == dn { return false }
   if sn == "i32" {
     if dn == "i64" || dn == "f64" { return true }
@@ -8102,21 +8128,20 @@ function tyToStrGo(ix: i32, nominal: boolean) {
 // collapse, so such an entry is constructible) and the render-comparing sites this
 // replaces did accept it. The returned name is `TyPrim.primName`, the primitive's
 // own IDENTITY — the same thing `tyEq` compares — not a rendering of a structure.
-function tyPrimNameOf(ix: i32): string {
-  if ix < 0 { return "" }
+function tyPrimNameOf(ix: i32): PrimName | null {
+  if ix < 0 { return null }
   const t = T.tys[ix]
   if t is TyPrim { return t.primName }
   if t is TyUnion {
     if t.uMembers.length == 1 { return tyPrimNameOf(t.uMembers[0]) }
   }
-  ""
+  null
 }
 
 // Whether arena type `ix` IS the primitive `nm` — the decision form of
 // `tyPrimNameOf`, replacing `tyToStr(ix) == "i32"` at the sites that were asking a
 // STRUCTURAL question ("is the inner the string primitive?") by rendering.
-function tyIsPrimNamed(ix: i32, nm: string): boolean {
-  if nm == "" { return false }
+function tyIsPrimNamed(ix: i32, nm: PrimName): boolean {
   tyPrimNameOf(ix) == nm
 }
 
@@ -12300,7 +12325,10 @@ export function canonEmitTypeNames() {
       // the diagnostic that already quotes it.
       const at = primNameOf(nodeTyIxOf(i))
       if at == "i32" || at == "i64" || at == "f32" || at == "f64" {
-        if at != n.asTy { n.asTy = at }
+        // `n.asTy` is the author's SPELLING, a plain string on the node, so the atom is
+        // materialized here rather than the node's field changing type.
+        const ats = primNameStr(at)
+        if ats != n.asTy { n.asTy = ats }
       }
     }
     annUnionAtoms.push(atoms)
@@ -19878,14 +19906,14 @@ function nulElemListRetName(er: i32) {
       // it is still spelled into the result, but the DECISION is structural.
       const inner = tyPrimNameOf(et.nInner)
       if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
-        return irAtoms("(" + inner + "|null)[]", 1)
+        return irAtoms("(" + primNameStr(inner) + "|null)[]", 1)
       }
       // The NICHE leaves: `(boolean|null)[]` (i32 sentinel-2 list), `(string|null)[]`
       // (string-ref list with `ref.null` elements), `(K|null)[]` (i32 atom list with the
       // `-1` sentinel, rendered by its ALIAS). Each rides an existing non-box list rep the
       // annotated return already lowers; the pin routes the anonymous lambda through it.
       if inner == "boolean" || inner == "string" {
-        return irAtoms("(" + inner + "|null)[]", 1)
+        return irAtoms("(" + primNameStr(inner) + "|null)[]", 1)
       }
       const alias = litUnionAliasNameOfTy(et.nInner)
       if alias != "" { return irAtoms("(" + alias + "|null)[]", 1) }
