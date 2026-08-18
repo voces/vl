@@ -52,6 +52,7 @@ live slice. All three were re-derived on the tip before briefing.
 
 | item | PR | result |
 |---|---|---|
+| **a union-annotated global's struct layout came from its object literal** | #1464 | shipped, settling #1462's leftover face-2 pin. **Two filings were wrong before this one** — the board's ("a union arm carrying a struct-typed field") and mine ("a field-name collision"). The axis is a **FIELDSET TWIN** plus a **storage class**: the field-name SET identical to some other struct's — order irrelevant, field types irrelevant, and the twin need not be the field's own type — AND a module global annotated with a union alias and initialized by an object literal. Param, local, and global-from-a-call all work. Root: `structIndexOfLet` fell through to the INITIALIZER when the annotation named no struct, and an object literal answers that query BY FIELD-NAME SET, so it returned the twin's row. `paramStructIndex` already held the annotation-only discipline, which is why params were fine — the storage axis falls out of the root. **One root at two depths**, confirmed: `field access receiver is not a struct` for `u.v.v`, `ref valtype with no interned shape` for `const g = u.v`; one guard clears both, and I verified both. Byte-identity **2,075 of 2,078** with the 3 movers being exactly the fixtures (rc 1 → rc 0); sabotage predicted 6, measured 6 by name off a SAVED artifact. The mis-teaching fixture was **corrected and converted to `@run`/`@log 5`**, its false "the spelling is not the axis" claim deleted after re-measuring all three spellings |
 | **the display renderer emitted three spellings VL cannot parse** | #1463 | shipped, closing **B2e** and with it the last in-flight Band-1 row. Round-trip **1,596 → 2,085 of 2,089** hints over 1,905 corpus files, re-derived because the filed counts predated #1457. `arrElemRender` **confirmed** as the shared home exactly as filed — called from both EMIT renderers' `TyArray` arms and nowhere else, while the display arm was a bare `elem + "[]"`; three sibling groupings (TyFunc-result, union-function-member, nullable-function-inner) were in the same state. **The grouping leg was under-filed by me and is not cosmetic**: `A | B[]` parses successfully to a DIFFERENT type, so master emitted `cannot assign A | B[] to 'bad' of type A | B[]` — a type unassignable to itself. It now reads `cannot assign (A | B)[] to 'bad' of type A | B[]`, which is true. **It caused a regression and fixed it**: reaching the shared home made `T.tys[-1]` reachable — the hole an empty `[]`'s element carries — and TRAPPED the compiler on `lambda-empty-array-literal-return.vl`; `arrElemRender` is now total. Found a **second home**: 25 hand-written completion `detail` strings spelled `->` into the same column, so half a popup disagreed with the other half. Sabotage predicted from directive text before any sabotage existed: 196/121/106 vs **193/119/99**, every over-count explained, **zero unpredicted reds**. Byte-identity **1,618/1,618**. **503 corpus directives across 262 files** moved, each gated on canon-equivalence, 26 flagged and left untouched. `tyToStructStr` deliberately byte-frozen — source-spelling it moves 5 modules' bytes and turns 3 into loud emit rejects, so it is its own slice |
 | **a fused `>>` banked a `>` credit three type loops did not consult** | #1462 | shipped. **Both filed axes were wrong, mine included.** The board said "generic alias application as a union member"; I re-filed it as "nesting depth"; it is **the lexer's fused `>>` token**. `Box<Box<i32>> | i32` parsed as `Box<Box<i32>|i32>` — the compiler prints it, and I read it off the diagnostic myself before and after. Genericity and depth are only the conditions under which a `>>` gets WRITTEN. `expectTypeGt` banks extra `>`s in `pendingGt`; while a credit is outstanding the argument list is still open, but `|`, `&` and `[]` read the raw next token. The `,` loop **already consulted the credit**, which is exactly why multi-ARGUMENT applications never showed this. **Why one face was silent and eleven loud**: with both arms folded into one type there is no union, so the value takes a plain-struct rep and `is` const-folds to FALSE (`i32.const 0` in the disassembly, no `{tag,value}` box). **The new control names the axis**: `Box<Box<i32> | i32>` closed with a PLAIN `>` banks nothing, so its `|` must still extend the argument — the credit discriminates, not the token. A **second, independent root** stands (`wasmEmit.vl:4625`, a union variant's struct-typed field has no emitted read), proven separate by staying green under the sabotage. Sabotage predicted 6, measured 6 by name; byte-identity 11/11 of every file that can bank a credit |
 | **`??` over `boolean | null` lowered to a wasm `select`** | #1461 | shipped. The niche is an i32 cell (`0`/`1`, `2` for null) and an i32 sentinel has no `br_on_null`, so all three arms lowered as `select` — **one opcode that evaluates BOTH operands unconditionally**, so the default always ran. The **sibling ladder sat immediately below in the same file**: the `K|null` litunion arm, same rep, same blocktype, same call-stash slot, already branching, its comment already pricing the trade at "three bytes more per site" — measured at **exactly +3/site**. Axis is the **LHS source, not the position**: `emitCoalesce` has exactly one call site, so position cannot select the arm. 8 sources, **7 broken → 0**; the 8th (fused `m[k] ?? d`) already branched and is the unmoved control. Positions 14/14 → 0, reps 1 of 9 → 0. **Other-construct sweep came back EMPTY and is reported anyway**: 12 short-circuit constructs, 12/12 correct, byte-identical output — backed statically by 10 remaining `select` sites, all over already-materialized locals and constants. Byte-identity 1967/1978, and **all 11 movers contain a `boolean|null` `??` site**. Two stale comments calling the divergence "deliberate"/"an open ruling" corrected |
@@ -663,7 +664,7 @@ re-derived before anyone briefs it — not that every cell was re-measured. The 
 litunion/nullable-rep run #1439–#1455. `docs/webcraft-requirements.md`'s A16 paragraph still states
 the stale population and should be corrected when C9's doc-staleness pass runs.
 
-## #1462's face-2 pin states the WRONG axis — re-rooted and re-briefed (2026-08-17)
+## #1462's face-2 pin — I re-rooted it and was ALSO wrong. Settled by #1464 (2026-08-17)
 
 #1462 landed a verdict pin for the defect it could not fix in scope,
 `tests/cases/unions/error-struct-typed-variant-field-read.vl`, whose header states the axis as
@@ -692,6 +693,28 @@ just its types and shapes.**
 
 Briefed with the re-rooting stated as a hypothesis to confirm or refute, plus an instruction to
 correct the fixture header — a fixture that mis-teaches is worse than none.
+
+**OUTCOME: my hypothesis was REFUTED IN BOTH HALVES, and briefing it as a hypothesis is the only
+reason that was cheap.** #1464 measured the real axis:
+
+* Not membership — a **FIELDSET TWIN**, the field-name SET being identical. My two decisive cells
+  (`{v}` outer vs `{v,k}` inner, and `{a,b}` outer vs `{a}` inner) hold membership but differ as
+  sets, and **both work**. I confirmed them myself. The twin need not even be the field's own type:
+  an UNRELATED `Other = {n: string}` twinning the arm `Outer = {n: Leaf}` reproduces it exactly.
+* **A storage class I never varied.** The identical shape works as a param, as a local, and as a
+  global initialized from a CALL. Only a **module global annotated with a union alias and
+  initialized by an object literal** reproduces.
+
+Root: `structIndexOfLet` fell through to the INITIALIZER when the annotation was not a struct, and
+an object literal answers that query **by field-name set**. `paramStructIndex` already held the
+annotation-only discipline — which is exactly why params worked, and why the storage-class axis
+falls out of the root rather than needing to be discovered separately. A shortened mirror again.
+
+**The lesson I drew last round was right but too narrow.** I said "vary every identifier, not just
+types and shapes" — and I did vary the identifiers, which is how I got a real grid. What I did not
+vary was the **storage class** and the **cardinality** of the field sets. The durable form:
+**a grid proves an axis only over the dimensions it moves, so name the dimensions you held fixed.**
+Every one of my six wrong axes was a dimension I never listed.
 
 ## B8 re-derived — the last open Band-1 row, and it is much smaller than filed (2026-08-17, `ad47fc5f`)
 
