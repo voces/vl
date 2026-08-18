@@ -1,0 +1,60 @@
+// @run
+// @log 3
+// @log true
+// @log 5
+// @log false
+// TWO inline shapes that share a field NAME and a wasm CODE but not a TYPE TEXT
+// (`{b: i32}` and `{b: boolean}` — both code 0, i32 storage), reached as nested fields of
+// union variants. Both the NAMED-variant spelling and the INLINE-ARM spelling are here, and
+// before this repair BOTH reported `emitProgram: nested-struct field element type is not
+// interned` — the arm spelling has floored this way for as long as it has had the code-15
+// deferral, so this is a pre-existing defect, not a new one.
+//
+// THE AXIS IS CODE EQUALITY WITHOUT TEXT EQUALITY, AT THE SAME FIELD NAME. Measured cell by
+// cell, each its own program:
+//   - `{b: i32}` beside `{b: boolean}` — floored (one code, two texts);
+//   - `{b: i32}` beside `{c: i32}` — different field NAME, no dedup, always worked;
+//   - `{b: i32}` beside `{b: i32}` — identical, dedups onto itself, always worked;
+//   - `{b: i32}` beside `{b: string}` — different CODE, no dedup, always worked.
+// Storage class, nesting depth, arm count and the OUTER field's name are all free: the
+// collision is entirely between the two INNER shapes.
+//
+// THE MECHANISM: `annShapeIndexOf` treats one wasm code as one layout, deliberately, so
+// `{b: boolean}` resolves to the existing `{b: i32}` row (field name equal, code 0 equal, no
+// element name to part on) and no row spelled `{b: boolean}` is ever minted. The variant
+// field's one code-15 consumer looks its element up BY NAME (`structIndexByName`), so the
+// recorded spelling read -1 for a shape whose LAYOUT was interned, under its twin's name.
+// `collectA`'s deferred code-15 intern now re-keys the row to `sNames[<interned index>]` —
+// the discipline `internInlineShapeTy`'s own nested-field arm already applied to its field
+// texts, applied to the one recorder that discarded the index. Storage-correct by
+// construction: the two spellings dedup precisely because they store identically, which is
+// also why the re-key is inert wherever the names already agreed — 1,522 of 1,522
+// pre-existing `@run` corpus modules stay byte-identical.
+//
+// THE ORDER DEPENDENCE IS PART OF WHAT THIS PINS. The corpus oracle drives many programs
+// through ONE compiler instance, and the floor reproduced ACROSS that boundary as well as
+// within a single program — a `{b: i32}` shape in one case file and a `{b: boolean}` shape in
+// the next reddened the second. A fixture that only held the single-program form would go
+// green on a repair that left the cross-program one standing.
+type P1 = { x: { b: i32 } }
+type UP = P1 | i32
+
+type P2 = { y: { b: boolean } }
+type UQ = P2 | i32
+
+const p: UP = { x: { b: 3 } }
+if p is P1 { print(p.x.b) } else { print(0) }
+
+const q: UQ = { y: { b: true } }
+if q is P2 { print(q.y.b) } else { print(0) }
+
+// The same collision in the INLINE-ARM spelling, whose recorder has always had the
+// deferral and so has always had the floor.
+type UR = { z: { d: i32 } } | i32
+type US = { e: { d: boolean } } | i32
+
+const r: UR = { z: { d: 5 } }
+if r is { z: { d: i32 } } { print(r.z.d) } else { print(0) }
+
+const s: US = { e: { d: false } }
+if s is { e: { d: boolean } } { print(s.e.d) } else { print(0) }
