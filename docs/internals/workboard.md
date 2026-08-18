@@ -770,6 +770,30 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## Round 6 re-derivation — the D-row survey, and D6 is the last live silent population (2026-08-17)
+
+With both silent inventories closed I swept the board's own still-OPEN D/E rows:
+
+| row | filed | tip |
+|---|---|---|
+| **D6** — function-type union arms share ONE box tag, so `x is F` is constant TRUE | 3 RUN-WRONG + 1 EMIT-REJECT | **LIVE AND SILENT — BRIEFED.** Reproduces on all three sub-shapes I moved: the arms differing by RETURN, by PARAM, and by ARITY. `vl check` rc 0, valid module, wrong branch |
+| the **litunion remainder** `#1340` did not reach (`overlapping-arm-defects.md`) | 5 RUN-WRONG, `is K` answers FALSE | **RETIRED** — disjoint aliases, shared-member aliases and both directions all answer correctly |
+| **D12** — a litunion → `string` materialisation in a TAIL EXPRESSION emits invalid wasm | silent | **RETIRED** — `function f(k: K): string { k }` prints `a` |
+| **D9** — `s?.f is T` over an optional-chain receiver answers a constant FALSE | silent | **no longer silent** — now a LOUD `emitProgram:` emit reject. Correct column; re-file as loud if anyone wants it |
+| **D3** — `emitIs` compares ONE tag, 49 of 64 | already flagged "not re-derived since #1343" | **refuted as a live number** in round 4 above |
+| **D4** | generic alias application as a union member | **CLOSED by #1462** — the axis was the lexer's `>>` credit |
+| **D5** | struct arms sharing a storage code | **confirmed DELIBERATE** — pinned by `unions/same-field-names-i32-vs-boolean-reject.vl` |
+| **B8** | the checker's second descent | **shipped as #1465**; the row text above is superseded |
+
+**Dimensions I held fixed on D6, stated so the agent can check them**: exactly 2 arms, both
+function-typed; arity ≤ 2; the value always a lambda literal; a module-scope `const`; `is` in an `if`
+condition; and **I always built through arm 2 and tested arm 1 — never inverted.** That last one is
+the one I would bet on hiding something, because `overlapping-arm-defects.md`'s own method note says
+an inverted twin is what tells a masked cell from a correct one.
+
+**Measured negative kept separate**: a function arm beside a NON-function arm (`F | i32`) fails with
+`failed to parse WebAssembly` — a different column and probably a different site.
+
 ## ~~The last known silent cell — i64 element, literal index~~ — MY AXIS WAS ONE MEMBER OF A FAMILY. Closed by #1470
 
 #1467's and #1469's cells are all shipped. This is the only silent defect I currently know of, and
