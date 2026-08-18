@@ -475,9 +475,32 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > rep is REFUSED by that measurement, and A16 remains irrelevant to this row (it
 > changes what the box holds, not whether it is allocated).
 >
-> **There is no source workaround to adopt in the meantime** — an `if`-expression
+> ~~**There is no source workaround to adopt in the meantime** — an `if`-expression
 > and a local-assigned-on-two-branches both still emit two sites and still do not
-> melt. Do not restructure sim code hoping to hit the fast shape; wait for the sink.
+> melt. Do not restructure sim code hoping to hit the fast shape; wait for the sink.~~
+>
+> **UPDATE — that advice is now WRONG in two of its three claims, and this row is
+> CLOSED as a measured negative. THREE of the four spellings sink; do restructure.**
+> The sink shipped in three parts and each was measured separately:
+>
+> - **one site per FUNCTION, not per ARM (#1322)** — 78 sites over 76 functions; a
+>   wash at plain `vl build`, **1.76× at `-O`**.
+> - **the `if`-EXPRESSION arm (#1337)** — **1.67× at `-O`**. The old note said this
+>   one "still emits two sites"; it does not.
+> - **the BINDING sink** — `const u: A | B = if c { a } else { b }` — **1.36×
+>   default / 1.68× at `-O`**, and this is the one worth something *without*
+>   `wasm-opt` at all.
+>
+> **What is still not delivered, stated narrowly:** a `let` ASSIGNED on two
+> branches (declared first, then written in each arm) re-derives at **4/4/4
+> allocations with the payload READ** — unchanged at every rung. The blocker is
+> **Heap2Local's single-definition requirement, not the emitter**, so unlike the
+> other three it needs a REPRESENTATION change rather than an emitter shape fix.
+> That is escalated and not done.
+>
+> So the practical guidance inverts: **prefer `const u = if c { … } else { … }` over
+> a `let` written on two branches** in per-tick scratch code. The first sinks, the
+> second does not.
 > `unboxed-union-rep-design.md` is the design record.
 >
 > ```
@@ -919,9 +942,29 @@ and needs nothing from vl beyond scalar exports.
   > atom id) would allocate MORE. **So there is no memory to win here, and the
   > feature should not be scheduled as a memory feature.**
   >
-  > What measurement DID find is a correctness population: **81 of 244 grid cells
+  > What measurement DID find was a correctness population: **81 of 244 grid cells
   > across the mixed-union spellings are broken today, 42 of them silent wrong
-  > answers**, all `vl check`-clean. `const k: K = "aa"; const x: K | f64 = k`
+  > answers**, all `vl check`-clean.
+  >
+  > **UPDATE 2026-08-17 — that population does not reproduce, and it was the only
+  > reason this row read as risky.** All three shapes named just below are correct
+  > on the tip: the `K | f64` store prints `aa` rather than converting the atom ID
+  > to a float, the `is`-narrowed read prints `aa` rather than emitting invalid
+  > wasm, and `K | string` correctly answers `x is K` FALSE for a plain string. I
+  > widened past those three exemplars rather than stopping at them — `K | i32`,
+  > `K | boolean`, the `K | f64` union actually HOLDING its f64 arm (the negative
+  > direction, which a broken tag test fails), and a mixed union as a struct FIELD
+  > are all correct too: **nine of nine probed cells in a correct outcome column.**
+  > The ninth is a loud reject carrying its own guidance — `match over a union with
+  > literal members is not supported — compare them with == in an if-chain` — which
+  > is a documented limitation, not a silent cell. The likely closers are the
+  > litunion/nullable-rep run #1439–#1455.
+  >
+  > **Caveat kept honest: nine probes is not a 244-cell grid.** The claim is that
+  > the shapes this document itself nominates as the defect are fixed, so treat
+  > 81/42 as refuted as a LIVE number and re-derive before anyone schedules work
+  > against it — not that every cell was re-measured. Combined with the memory
+  > finding above, this row now has no half worth scheduling. `const k: K = "aa"; const x: K | f64 = k`
   > converts the atom ID to a float; `if x is K { const y: K = x }` is invalid wasm;
   > `K | string` answers `x is K` TRUE for a plain string. If webcraft's order/state
   > enums ever sit in a union beside a non-enum arm, those are the shapes to avoid —
