@@ -25,6 +25,7 @@ import {
   nodeTyIsNullable,
   nodeTyIsNullableStruct,
   nodeTyIsUnion,
+  nodeTyIxOf,
   nodeTyMapValIsBool,
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulBool,
@@ -408,6 +409,7 @@ import {
   captureNamesOf,
   captureValKind,
   cbRetVariantIdx,
+  cloArmTagOfTy,
   cloCallParamLitUnion,
   cloCallParamUnionName,
   cloCallReflistElemTwin,
@@ -600,7 +602,6 @@ import {
   sFieldTgtStructIdx,
   sFieldTypeAt,
   scalarListElemKind,
-  scalarTagOf,
   scopeBind,
   scopePop,
   scopePush,
@@ -620,11 +621,13 @@ import {
   uFieldMapShape,
   uFieldTgtStructIdx,
   unMemAtomKind,
+  unMemIsFunc,
   unMemIsMap,
   unMemIsRefElemArray,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
   unionClosureArmName,
+  unionClosureArmTy,
   unionEqAtomOf,
   unionHasAtomTy,
   unionHasCollapsedStringMapArm,
@@ -2006,6 +2009,11 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
 function isArmTagOfTy(ity: i32): i32 {
   if ity < 0 { return -1 }
   let ak = unMemAtomKind(ity)
+  // A BARE FUNCTION-TYPE arm tags on its interned SIGNATURE slot, not on the flat
+  // value-atom kind: a union may carry any number of function-typed arms and kind 11 is
+  // ONE tag, so `x is F` answered TRUE for a value built through any of them. The box
+  // side derives the same tag from the same render (`cloArmTagOfTy`).
+  if ak == 11 { return cloArmTagOfTy(ity) }
   if ak < 0 {
     if tyIsLitUnion(ity) { ak = 2 }
   }
@@ -3464,6 +3472,27 @@ function emitUnionNestedListLit(
   0
 }
 
+// The FUNCTION TYPE a closure carrier boxed into `unionName` tags as — the box side of
+// `cloArmTagOfTy`, whose test side is `isArmTagOfTy`.
+//
+// THE VALUE'S OWN CHECKED TYPE IS THE ANSWER, NOT THE UNION'S ARM. A union may carry
+// several function-typed arms; taking the arm made every one of them box under the first
+// arm's tag, which is the whole of D6 — `x is F` answered TRUE for a value built through
+// `G`. The checker banks the carrier's resolved type at the node (`nodeTyIxOf`), and for
+// a lambda literal, a named-function reference and a closure-typed binding alike that is
+// the `TyFunc` the value actually has.
+//
+// The union's own arm is the FALLBACK, for a carrier the checker banked no function type
+// for; a union with ONE function arm then tags exactly as it did before, since the sole
+// arm is the only type the value can have.
+function cloBoxArmTy(exprIx: i32, unionName: string): i32 {
+  const vt = nodeTyIxOf(exprIx)
+  if unMemIsFunc(vt) { return vt }
+  const bt = nodeTyIxOf(unwrapParen(exprIx))
+  if unMemIsFunc(bt) { return bt }
+  unionClosureArmTy(unionName)
+}
+
 // Lower the expression at `exprIx` COERCED into the boxed union `unionName`'s
 // representation (the host's `coerceToUnion` at a flow boundary — a binding init, an
 // assignment, an argument, a return). Pass-through when the value already IS the box (a
@@ -3685,7 +3714,7 @@ export function emitUnionCoerce(
   if unionName != "" && exprIsClosure(exprIx, fnIx) {
     const clArm = unionClosureArmName(unionName)
     if clArm != "" {
-      fbI32Const(scalarTagOf(clArm))
+      fbI32Const(cloArmTagOfTy(cloBoxArmTy(exprIx, unionName)))
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
       return 0
