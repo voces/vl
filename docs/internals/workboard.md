@@ -765,6 +765,35 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## The silent class is down to TEN cells — inventory #2 re-derived end to end (2026-08-17)
+
+`silent-class-inventory-2.md` graded 5,180 cells and found **76 silent**. Every silent family
+re-derived on the tip today. **66 of the 76 are retired:**
+
+| family | cells | tip |
+|---|---|---|
+| **COMPILER TRAP column** (D1, D2) | 8 | **RETIRED** — see round 3 above |
+| **SILENTLY WRONG VALUE** (D3, `print` of a boolean array element in a generic body) | 2 | **RETIRED** — `boolean[][]` in a generic prints `false`/`true` correctly, matching its concrete-parameter control, and the 1-D `boolean[]` widening too |
+| **D4** — a generic call whose argument is an annotated local / field read / element read | **34, the largest family** | **RETIRED** — all three argument forms print `aa` |
+| **D7** — an i32-keyed SET as a parameter, captured by a nested function | 2 | **RETIRED** — prints `1` |
+| **D5** — a generic forwarding its own type-parameter-typed parameter to a second generic call | **8** | **STILL SILENT** — `vl check` rc 0, then invalid wasm |
+| **D6** — a generic `T[]` parameter given an array literal of f32 elements | **2** | **STILL SILENT** — `vl check` rc 0, then invalid wasm |
+
+The likely closers are #1453 (the boolean-leaf print defect, whose own summary named D4's exact
+`const y: string = "aa"; gid(y)` shape) and #1450/#1454.
+
+**Both survivors are SINGLE-REP holes** — one missing arm on a per-rep ladder, this compiler's
+dominant defect class. D5 fails only for the **map** rep (string, `i32[]`, `i32` forwarded through
+the same two generic levels all work); D6 fails only for **f32** (f64 works).
+
+**A shared-root claim in the inventory is now suspect, and it is the best lead in the item.**
+`silent-class-inventory-2.md` describes D5 as *"same root as D4, different branch, DIFFERENT
+MESSAGE"*. **D4 is fixed and D5 is not.** Either that claim was wrong, or D4's fix covered one
+branch of a shared root and left the other — and which it is also tells us whether the inventory's
+other shared-root claims can be trusted. Briefed as the headline question.
+
+D8–D12 are loud emit/check rejects — the correct outcome column, so they rank below anything silent.
+
 ## Queue re-derivation, round 5 — six more rows retire (2026-08-17, `ad47fc5f`)
 
 Probed on the tip, each against the shape its own row names:
