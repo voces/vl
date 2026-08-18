@@ -283,6 +283,7 @@ import {
   capStartTbl,
   cloSigBase,
   cloSigKeys,
+  cloSigTagNames,
   cnFe,
   cnName,
   cnRecording,
@@ -15611,21 +15612,26 @@ export function scalarTagOf(atom: string) {
 
 // The globally-stable tag of the REF-ELEMENT-ARRAY arm whose interned reflist slot is `slot`.
 // Value-atom tags fill the fixed band `uVariants.length + 0..12` (the `valueAtomKind` codes —
-// scalar/string/null/scalar-list/closure), so ref-array arms claim the band ABOVE it. Ref-array
-// and MAP arms can coexist in one union (`S[] | {[string]: i32}`) with INDEPENDENT intern-slot
-// tables, so the two bands interleave by PARITY to stay collision-free: ref-arrays take the
-// offsets `uVariants.length + 13 + 2*slot`, maps the opposite-parity offsets (`mapSlotTag`). A
-// distinct element type interns a distinct reflist slot (`rlSlotByName`), so it gets a distinct,
+// scalar/string/null/scalar-list/closure), so ref-array arms claim the band ABOVE it.
+//
+// THREE SLOT-KEYED BANDS SHARE THAT SPACE AND THEY INTERLEAVE BY RESIDUE MOD 3. Ref-array,
+// MAP and bare-CLOSURE arms can coexist in one union (`S[] | {[string]: i32} | ((i32) => i32)`)
+// with INDEPENDENT intern-slot tables, so each band claims one residue class of
+// `uVariants.length + 13 …` and none of them can collide however deep its own table runs:
+// ref-arrays `+13 + 3*slot` (residue 1), maps `+17 + 3*slot` (residue 2 — `mapSlotTag`, whose
+// mono `-1` slot lands on `+14`), closure signatures `+15 + 3*(slot-1)` (residue 0 —
+// `cloSigSlotTag`, whose FIRST slot keeps the value-atom band's kind-11 offset). A distinct
+// element type interns a distinct reflist slot (`rlSlotByName`), so it gets a distinct,
 // deterministic tag stable across every sub-union (mirroring `scalarTagOf`). The `+ 13` clears
 // the value-atom band.
-export function refArrSlotTag(slot: i32) { uVariants.length + 13 + slot * 2 }
+export function refArrSlotTag(slot: i32) { uVariants.length + 13 + slot * 3 }
 
 // The globally-stable tag of the MAP arm whose interned map value-slot is `slot` (the mono i32 /
-// atom map rides slot `-1`, its shared `$mStructIdx`). Maps claim the offsets of the band above
-// the value-atom band — `uVariants.length + 16 + 2*slot` — parity-interleaved with the ref-array
-// band (`refArrSlotTag`) so a union carrying BOTH a ref-array and a map arm never collides. The
-// `slot+1` shift (folded into `16 = 13 + 3`) maps the mono `-1` slot to the first offset (`+14`),
-// typed value slots to `+16`, `+18`, … A distinct map VALUE type interns a distinct mv slot
+// atom map rides slot `-1`, its shared `$mStructIdx`). Maps take residue 2 of the mod-3
+// interleave `refArrSlotTag`'s header describes — `uVariants.length + 17 + 3*slot` — so a union
+// carrying a ref-array, a map AND a bare-closure arm never collides. The `slot+1` shift (folded
+// into `17 = 14 + 3`) maps the mono `-1` slot to the first offset (`+14`), typed value slots to
+// `+17`, `+20`, … A distinct map VALUE type interns a distinct mv slot
 // (`mvShapeOfValName`), so it gets a distinct, deterministic, sub-union-stable tag.
 // The slot canonicalizes through `mvCanonRepOf` first: layout-TWIN value spellings
 // (`{[string]: A}` boxed, `is {[string]: {v: i32}}` tested) share one map-struct heap
@@ -15634,7 +15640,51 @@ export function refArrSlotTag(slot: i32) { uVariants.length + 13 + slot * 2 }
 export function mapSlotTag(slot: i32) {
   let s = slot
   if s >= 0 { s = mvCanonRepOf(s) }
-  uVariants.length + 16 + s * 2
+  uVariants.length + 17 + s * 3
+}
+
+// The SLOT the function type rendered `nm` claims in the closure-signature tag table,
+// interning it on a miss. -1 for "" — a type the renderer cannot name, which
+// `cloSigSlotTag` folds onto the value-atom band's kind-11 offset exactly as an
+// un-nameable closure has always tagged.
+//
+// THE KEY IS THE CANONICAL STRUCTURAL RENDER (`tyToEmitName`), which is what makes the
+// alias and the inline spelling of one signature share a slot: `type F = (i32) => i32`
+// and a bare `(i32) => i32` both render `(i32)=>i32`, so a value boxed through one and
+// an `is` test written with the other meet on the same tag.
+export function cloSigTagSlot(nm: string): i32 {
+  if nm == "" { return -1 }
+  let i = 0
+  while i < cloSigTagNames.length {
+    if cloSigTagNames[i] == nm { return i }
+    i = i + 1
+  }
+  cloSigTagNames.push(nm)
+  cloSigTagNames.length - 1
+}
+
+// The globally-stable tag of the BARE-CLOSURE arm whose interned signature slot is `slot`
+// — residue 0 of the mod-3 interleave `refArrSlotTag`'s header describes.
+//
+// THE FIRST SLOT KEEPS THE VALUE-ATOM BAND'S KIND-11 OFFSET, and that is a deliberate
+// pin rather than an off-by-one: a program with ONE closure signature is what the flat
+// kind-11 tag was designed for and is the shape every existing closure-armed union has,
+// so it keeps tagging exactly as it did. Each FURTHER signature — the shape one tag
+// cannot separate — claims the band above. An un-nameable closure (`slot < 0`) shares
+// the first slot's tag, which is the tag it already had.
+export function cloSigSlotTag(slot: i32): i32 {
+  if slot <= 0 { return scalarTagOfKind(11) }
+  uVariants.length + 15 + (slot - 1) * 3
+}
+
+// The union box TAG a bare function-typed arm of arena type `ty` claims — THE ONE HOME of
+// the function-type→tag composition, read by both the BOX site (`emitUnionCoerce`'s
+// closure carrier) and the TEST site (`isArmTagOfTy`). The two must derive the tag from
+// the same render of the same arena, or a value boxed through one arm answers an `is`
+// against another.
+export function cloArmTagOfTy(ty: i32): i32 {
+  if ty < 0 { return scalarTagOfKind(11) }
+  cloSigSlotTag(cloSigTagSlot(tyToEmitName(ty)))
 }
 
 // The interned VALUE-BOX heap-type index for a scalar atom (`boolean` shares the
@@ -16491,10 +16541,11 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
 
 // True if the union member-set `name` has a BARE-CLOSURE arm (`(() => i64) | {w:i32}`,
 // `(() => i64) | i32`). A closure is value-atom KIND 11 (a REF atom riding the box anyref as
-// the `$cloStructIdx` fat-pointer), so — unlike the ref-array / map arms — it needs no new tag
-// band: its `scalarTagOf` (`uVariants.length + 11`) already discriminates. Resolves an alias to
-// its member set first, mirroring `unionHasClosureArrayArm` (which tests the closure-ELEMENT
-// array arm, a distinct shape whose arrow is nested inside `[]`).
+// the `$cloStructIdx` fat-pointer), and — like the ref-array / map arms — it tags on an
+// interned SLOT, its signature's (`cloSigSlotTag`), because kind 11 alone cannot separate two
+// function-typed arms of one union. Resolves an alias to its member set first, mirroring
+// `unionHasClosureArrayArm` (which tests the closure-ELEMENT array arm, a distinct shape whose
+// arrow is nested inside `[]`).
 export function unionHasClosureArm(name: string) {
   const atoms: string[] = []
   // D-UNION: value-atom kind 11 IS "the member is a function type" — ask the arena
@@ -16517,14 +16568,14 @@ export function unionHasClosureArm(name: string) {
 }
 
 // The BARE-CLOSURE arm NAME of the union member-set `name` (`(() => i64)` in `(() => i64) | i32`),
-// or "" when it has none. `emitUnionCoerce` boxes a closure carrier with this arm's `scalarTagOf`.
-// (A union with two distinct closure arms shares one kind-11 tag — a pre-existing value-atom-scheme
-// limitation, not exercised by the supported single-closure-arm shapes; returns the FIRST here.)
+// or "" when it has none — the PRESENCE question `emitUnionCoerce` gates its closure-carrier
+// box on. The returned name does NOT decide the box tag: a union may carry several
+// function-typed arms and only the arm's SIGNATURE separates them, so the tag comes from the
+// arena type (`unionClosureArmTy` → `cloArmTagOfTy`). Returns the FIRST such arm.
 export function unionClosureArmName(name: string) {
   const atoms: string[] = []
   // D-UNION: the arm SELECTION is structural (`unMemIsFunc`); the returned NAME stays
-  // the member's stored spelling, which `emitUnionCoerce` feeds to the still-name-keyed
-  // `scalarTagOf` (a D5 residual, not this slice).
+  // the member's stored spelling.
   const mems: i32[] = []
   if unionArmTys(name, atoms, mems) {
     let m = 0
@@ -16540,6 +16591,26 @@ export function unionClosureArmName(name: string) {
     i = i + 1
   }
   ""
+}
+
+// The ARENA TYPE of the union member-set `name`'s first bare-closure arm, or -1 when it has
+// none — `unionClosureArmName`'s structural twin, for the tag composition (`cloArmTagOfTy`),
+// which needs the SIGNATURE and not the spelling. There is deliberately no NAME path beside
+// the arena one here: a stored arm spelling is exactly what cannot answer this question once
+// a union carries two function arms, because a top-level `=>` absorbs the `|` that follows it
+// (`(i32) => i32 | (i32) => string` splits to ONE atom), so a member set that has lost the
+// split cannot be re-split. The arena member column kept it.
+export function unionClosureArmTy(name: string): i32 {
+  const atoms: string[] = []
+  const mems: i32[] = []
+  if unionArmTys(name, atoms, mems) {
+    let m = 0
+    while m < mems.length {
+      if unMemIsFunc(mems[m]) { return mems[m] }
+      m = m + 1
+    }
+  }
+  -1
 }
 
 // The ELEMENT value-union of union member-set `name`'s REF-ARRAY arm whose element is itself a
