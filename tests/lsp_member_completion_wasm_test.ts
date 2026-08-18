@@ -87,7 +87,7 @@ Deno.test({
   const slice = methods.find((m) => m.name === "slice");
   if (slice === undefined) throw new Error("expected a `slice` method");
   assertEquals(slice.isMethod, true, "a builtin method is a method");
-  assertEquals(slice.detail, "(i32, i32) -> string", "method detail is its signature");
+  assertEquals(slice.detail, "(i32, i32) => string", "method detail is its signature");
 });
 
 Deno.test({
@@ -149,7 +149,7 @@ Deno.test({
   // both the LSP and the playground show.
   assertEquals(
     byName.get("print")?.detail,
-    "(i32 | i64 | f32 | f64 | boolean | string) -> void",
+    "(i32 | i64 | f32 | f64 | boolean | string) => void",
     "print signature",
   );
 });
@@ -157,14 +157,14 @@ Deno.test({
 Deno.test("builtinCompletionsFromWasm: maps 0/1 kinds to type/function", () => {
   const out = builtinCompletionsFromWasm([
     { name: "i32", kind: 0, detail: "i32" },
-    { name: "print", kind: 1, detail: "(i32 | boolean) -> void" },
+    { name: "print", kind: 1, detail: "(i32 | boolean) => void" },
     { name: "bare", kind: 0, detail: "" },
   ]);
   assertEquals(out[0], { name: "i32", kind: "type", detail: "i32" });
   assertEquals(out[1], {
     name: "print",
     kind: "function",
-    detail: "(i32 | boolean) -> void",
+    detail: "(i32 | boolean) => void",
   });
   assertEquals(out[2], { name: "bare", kind: "type", detail: undefined });
 });
@@ -172,12 +172,12 @@ Deno.test("builtinCompletionsFromWasm: maps 0/1 kinds to type/function", () => {
 Deno.test("memberCompletionsFromWasm: maps method/field kinds and drops empty detail", () => {
   const out = memberCompletionsFromWasm([
     { name: "x", detail: "i32", isMethod: false },
-    { name: "dist", detail: "() -> f64", isMethod: true },
+    { name: "dist", detail: "() => f64", isMethod: true },
     { name: "bare", detail: "", isMethod: false },
     { name: "x", detail: "dup", isMethod: false }, // de-dup: first wins
   ]);
   assertEquals(out.length, 3, "duplicate name dropped");
   assertEquals(out[0], { name: "x", kind: "variable", detail: "i32" });
-  assertEquals(out[1], { name: "dist", kind: "function", detail: "() -> f64" });
+  assertEquals(out[1], { name: "dist", kind: "function", detail: "() => f64" });
   assertEquals(out[2], { name: "bare", kind: "variable", detail: undefined });
 });

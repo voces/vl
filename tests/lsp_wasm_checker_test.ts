@@ -265,7 +265,7 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   }
   // The `add` function declaration on line 1 — its name starts at column 9.
   const addTy = await checker.hoverTypeAt(SYM_FIXTURE, "/tmp/x.vl", noSiblings, 1, 9);
-  if (addTy !== "(i32, i32) -> i32") {
+  if (addTy !== "(i32, i32) => i32") {
     throw new Error(`expected the function type for add, got ${JSON.stringify(addTy)}`);
   }
   // A cursor off any binding (column 0 of a blank-ish position) yields undefined.
@@ -349,10 +349,10 @@ Deno.test({ name: "wasm-symbols: hover containment is end-inclusive at a name's 
 Deno.test({ name: "wasm-symbols: an unannotated function's inferred return is retained (hover)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // No return annotation — the checker now writes the demand-inferred return back
-  // into the function's retained type, so hover renders `-> i32`, not `-> <none>`.
+  // into the function's retained type, so hover renders `=> i32`, not `=> <none>`.
   const src = "function add(a: i32, b: i32) {\n  a + b\n}\n";
   const ty = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
-  if (ty !== "(i32, i32) -> i32") {
+  if (ty !== "(i32, i32) => i32") {
     throw new Error(`expected the inferred return retained, got ${JSON.stringify(ty)}`);
   }
 });
@@ -364,8 +364,8 @@ Deno.test({ name: "wasm-symbols: an un-annotated polymorphic param hovers as the
   // not leak the internal hole name.
   const fixture = 'function describe(x): string {\n  if x is i32 { return "num" }\n  return "str"\n}\n';
   const ty = await checker.hoverTypeAt(fixture, "/tmp/x.vl", noSiblings, 0, 9);
-  if (ty !== "(_) -> string") {
-    throw new Error(`expected (_) -> string for a polymorphic param, got ${JSON.stringify(ty)}`);
+  if (ty !== "(_) => string") {
+    throw new Error(`expected (_) => string for a polymorphic param, got ${JSON.stringify(ty)}`);
   }
 });
 

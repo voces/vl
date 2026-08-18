@@ -124,7 +124,7 @@ Deno.test({ name: "playground-lsp: cross-file hover resolves imported names + de
     initFromSeed();
     // `add` use on line 1 (`let r = add(...)`), 'add' at col 8 → its function type.
     const addHover = await lsp.hover(main, { line: 1, character: 8 }, "main.vl");
-    if (!addHover || !addHover.contents.includes("add: (i32, i32) -> i32")) {
+    if (!addHover || !addHover.contents.includes("add: (i32, i32) => i32")) {
       throw new Error(`add hover (cross-file): ${JSON.stringify(addHover)}`);
     }
     // `r` decl on line 1, col 4 → i32 — inferred only when add/square resolve.
