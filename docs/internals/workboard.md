@@ -573,6 +573,34 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## Retired by re-derivation, round 3 — the whole COMPILER TRAP column (2026-08-17, on master `fed8693b`)
+
+`silent-class-inventory-2.md` opened a ninth outcome column, **COMPILER TRAP (no diagnostic, no
+module written)**, and scored it at **8 cells of 8 reachable**. Both of its documented shapes are
+**retired on the tip**, verified with my own probes against the inventory's own stated controls:
+
+| filed shape | inventory said | tip says |
+|---|---|---|
+| an **i32-keyed map captured by an inner function** (`const m: {[i32]: string}` … `function inner() { print(m.length) }`) | `vl check` rc 0, then `wasm trap: out of bounds array access`, **no module written** | `vl check` rc 0, **`vl run` prints `1`** — identical to the inventory's own string-keyed control |
+| an **empty `[]` returned from an annotated lambda** (`const fq: () => i32[] = () => { return [] }`) | `vl check` **rc 1 with NO diagnostic at all**, a bare wasm backtrace inside the CHECKER (`nulElemListRetName ← checkFuncDeclNode ← …`), no module written | `vl check` rc 0, **`vl run` prints `0`**; the non-empty control still prints `1` |
+
+I widened past the two exact spellings before believing it, because a non-reproducing probe is the
+wrong shape and not a refutation. The i32-keyed capture is correct through `.length`, `m[1]`,
+`m.keys()` in a for-in, and the boolean-valued (set-shaped) form; the empty-lambda return is correct
+at module scope as well as nested.
+
+**The most likely closer is #1450**, whose root was described as reading *"an array type's element
+row without declining the `-1` hole an empty `[]` leaves"* — which is exactly
+`nulElemListRetName`'s empty-literal shape — with #1454's ref-element widening covering the rest.
+Neither PR claimed these cells, so the column was never scored again after they landed.
+
+**One measured negative, recorded so it is not re-filed as a defect.** Widening the empty-lambda
+probe to `() => string[]` and `() => i32[][]` gives rc 1, but that is **not** a trap and not a
+regression — it is the deliberate loud floor, *"a lambda returning an empty `[]` cannot build the
+string[] result its annotation asks for — type-valid, but the element type has no rep"*, already
+pinned as `arrays/lambda-empty-array-literal-return.vl` in `KNOWN_CLEAN_DROPS`. The plain
+`function f(): string[] { return [] }` spelling is clean. Loud floor, correct column, nothing owed.
+
 ## Retired by re-derivation, round 2 (2026-08-17, on master `c64f254a`)
 
 The re-derivation rule keeps emptying the queue faster than I can brief it. Eight PRs merged in
