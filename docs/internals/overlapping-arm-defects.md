@@ -264,7 +264,7 @@ any program with no `new` declaration.
 |---|---:|---|---|
 | ~~**struct arms, same field NAMES, i32-vs-boolean field types**~~ | ~~3~~ | RUN-WRONG | **CLOSED — see the section at the end of this file. The filed mechanism was right and the filed SCOPE was too small.** |
 | **struct arms, same shape, width-subtype, or a named twin** | 3 | EMIT-REJECT | already loud; a clean checker diagnostic would be an improvement, not a defect closure |
-| ~~**function-type arms** (arity / param / return differ)~~ | ~~3 RUN-WRONG + 1 EMIT-REJECT~~ | RUN-WRONG | **MEASURED — see the D6 section at the end of this file. The population is 72 of 380, and the "separate table" note is refuted by the disassembly: a function type is slot 11 of the shared value-atom band.** |
+| ~~**function-type arms** (arity / param / return differ)~~ | ~~3 RUN-WRONG + 1 EMIT-REJECT~~ | RUN-WRONG | **CLOSED — see the D6 sections at the end of this file. The filing was wrong twice: the population is 72 of 380 rather than 3, and the "separate table" note is refuted by the disassembly (a function type is slot 11 of the shared value-atom band). A bare function arm now tags on its interned SIGNATURE slot, the reflist band's shape one layer in. The 1 EMIT-REJECT is a map-VALUE union member and is untouched.** |
 | **literal-union shapes #1340 did not reach** | 5 | RUN-WRONG | `is K` answers FALSE where #1340's membership test should fire: a NUMERIC literal union beside `i32`/`f64`, two literal unions sharing a member, and the INLINE (unaliased) spelling beside `string`. The gate is `nameIsLitUnionArmValueUnion` on the union NAME — the closest thing to a ready template in the tree, and the population most likely to close with #1340's own shape |
 
 One grid oracle was corrected while measuring: three P5 cells were written expecting `is K` and
@@ -1099,6 +1099,101 @@ and the genuinely separate table (the reflist band) is the one place the defect 
 is the CORRECT column that named the mechanism, exactly as D1b's `K | i32` column did: `F[] | G[]`
 answering right is what proves the emitter holds the signature and that only the bare arm's tag
 discards it.*
+
+
+---
+
+## D6 is CLOSED — the CORRECT column named the fix too, and the "rep change" half of the filing was wrong
+
+The census above ends by naming two possible answers and declining both: membership over the fat
+pointer's TABLE INDEX (needs a deferred patch, because the elem segment is not final when a body is
+emitted) and *"a third fat-pointer field, or a `$fnsig` id in the box tag"*, dismissed as **"a closure
+struct layout change, which the agent playbook rules out by name."**
+
+**That dismissal conflates two different things and only one of them is a layout change.** The box
+tag is field 0 of the union box — an `i32` the emitter chooses at the box site and compares at the
+`is` site. Putting a signature discriminant *there* changes no struct layout at all; it is the same
+kind of edit `refArrSlotTag` and `mapSlotTag` already are. The census's own CORRECT column said so:
+`F[] | G[]` discriminates because a ref-array arm tags on its interned reflist SLOT, and *"the
+emitter can and does distinguish two closure signatures when they arrive as ELEMENT types"*. The fix
+is that shape one layer in.
+
+### The fix
+
+A bare function-typed arm tags on the slot its **canonical structural render** (`tyToEmitName`)
+interns at — `cloSigTagSlot` → `cloSigSlotTag` — with the BOX side reading the value's own checked
+type (`nodeTyIxOf`, which the checker banks as the exact `TyFunc` for a lambda literal, a
+named-function reference and a closure-typed binding alike) and the TEST side reading the tested
+type, through one composition (`cloArmTagOfTy`) so the two cannot drift.
+
+The tag space above the value-atom band now interleaves **three** slot-keyed tables by residue mod 3
+instead of two by parity: ref-arrays `+13 + 3s`, maps `+17 + 3s`, closure signatures `+15 + 3(s-1)`.
+The FIRST closure signature keeps kind 11's offset, so a program with one closure signature — every
+closure-armed union that existed before this — emits the bytes it always did.
+
+**Membership does NOT transfer from #1340, and the reason is structural rather than a gate.** `K ⊆
+string` gives a literal union a runtime-observable member SET, so `x is K` has a value test. A
+closure's signature is not in the value at all: the fat pointer is `{env, table index}` and carries
+no discriminant. The two defects share ROOT A and reach different branches of it — #1340's arms are
+gated on `tyLitMemberTexts` / `tyNumLitMemberTexts`, both empty for a `TyFunc`, so the function shape
+was never a candidate for them.
+
+### The measurement
+
+**112 constructed cells over four grids: 51 RUN-WRONG + 1 wrong-branch `indirect call type
+mismatch` trap → 0.** Dimensions MOVED: what differs between the arms (return / param / arity /
+zero-arity / both); which arm the value is BUILT through and which is TESTED, **every cell in both
+directions**; the receiver (module global / local / parameter / struct field / call result); the
+carrier (lambda literal / named-function reference / a box passed through a second union position
+without re-boxing); the arm count (2 and 3); the partner arm (`string`, `i32`, `null`, a struct,
+`{[string]: i32}`, `i32[]`, `F[]`); the spelling (alias / inline / an alias-typed param). Dimensions
+HELD FIXED: the guard is always an `if` condition (one `const r = u is A` control agrees), and no
+union carries two non-function arms.
+
+The wrong answer was CONSTANT TRUE in both directions and at every receiver — all 51 failing cells
+are cells whose correct answer is `no`, and the other 61 were masked-correct, exactly as the census
+predicted.
+
+### What this does NOT reach — each moved out by its own control, each unchanged
+
+- **The family's 1 EMIT-REJECT cell.** It is `{[string]: i32}` boxed INTO a closure-armed union, and
+  it is the loud `a map value is not a supported union member — use a struct member instead`. A
+  union-member restriction, not an `is` lowering; loud before and after.
+- **`F | i32` boxing the i32** — `failed to parse WebAssembly: expected anyref, found i32`. The
+  control that moves it out is the ONE-function-arm twin, which fails identically and at the same
+  offset, and fails for `is i32` as well as `is F`. Not about two function arms.
+- **`==` over a closure-armed union** is already the loud `` `==` over a struct union is not
+  supported yet ``, so the union-equality tag sites (`emitUnionEq`, `emitUnionUnionEq`) cannot see a
+  closure arm and the tag change cannot reach them.
+- **Two aliases with the SAME signature** (`type A = (i32) => i32`, `type B = (i32) => i32`) now
+  share one slot and answer TRUE for both, which is what structural typing requires. That shape's
+  loud/silent split is D11's alias transparency, not this.
+- The checker's inferred-return union namers (`variantBoxUnionRetName`, `structUnionRetName`) still
+  decline a second closure member. That decline was justified by the shared tag and is now merely
+  conservative; widening it is an accept-more change needing its own measurement, and it is not done
+  here.
+
+### Byte identity, and the prediction that was wrong
+
+**1966 of 2002 corpus modules byte-identical; 36 moved; all 36 still build rc 0.** The attribution
+was measured rather than argued, with a third build carrying ONLY the band restride: **34 of the 36
+move under the restride alone** (a union arm at reflist slot ≥ 1, or a typed map-value slot) and **3
+under the closure-signature band** (2 of them exclusively) — the corpus files that intern two or more
+closure signatures. The prediction going in was *"the same 36 either way, and 0 between them"*; it
+was wrong in exactly the way that identified those three files
+(`closures/closure-and-struct-arm-union-result.vl`, `closures/paren-classify-homes.vl`,
+`closures/is-function-arm-partner-discrimination.vl`).
+
+*Method note this adds: **when a filing dismisses an option by naming a rule it would break, check
+that the option is the thing the rule names.** "A `$fnsig` id in the box tag" and "a third
+fat-pointer field" were listed as one option and only the second is a struct layout change; the
+first is the fix, and it had been sitting inside a sentence that ruled it out.*
+
+Pinned by `tests/cases/closures/is-two-function-arms-both-directions.vl` (the two-arm axis, every row
+in both directions, plus a `(i32) => boolean` / `(i32) => i32` pair whose wasm functypes are
+structurally identical — the one shape where a wrong answer never traps) and
+`is-function-arm-signature-tag-receivers.vl` (receiver / carrier / arm count / partner / spelling).
+`is-function-arm-partner-discrimination.vl` stays the half a fix must not buy its answer by breaking.
 
 
 ---
