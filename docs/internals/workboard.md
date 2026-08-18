@@ -43,7 +43,7 @@ live slice. All three were re-derived on the tip before briefing.
 
 | band | item | verified on the tip |
 |---|---|---|
-| **3 — soundness** | **`boolean` is silently assignable to `i32`** | `const t = true; const b: i32 = t; print(b + 41)` → check-clean, valid module, prints **42**. The SILENT WRONG VALUE column. The guard exists but **only on the literal path**: `const b: i32 = true` is rejected, which is the control proving this is a defect and not a deliberate C-style interop stance. Reaches annotation, **parameter**, **return**, and field-through-transparent-alias positions. Not general laxity — `f64←bool`, `i32←f64`, `string←bool`, `bool←i32` are all correctly rejected, so it is exactly the ordered pair (boolean → i32) |
+| **3 — soundness** | ~~**`boolean` is silently assignable to `i32`**~~ **REFUTED — MY CONTROL WAS INVERTED** | It is **spec'd feature A7b**, pinned by `tests/cases/types/boolean-to-i32.vl` (five `@log` oracles over binding, argument and return) and named at `CHANGELOG.md:107`. I read "the bare literal `const b: i32 = true` is rejected" as proof the coercion was accidental; `boolean-literal-to-i32-reject.vl` says the opposite in prose — *"`let x: i32 = true` is far more likely a mistake than an intended coercion — write `1`/`0` — so the literal form stays rejected"*. **The literal rejection is the deliberate guard that makes the feature safe, not evidence against it.** Removal was measured anyway so the number is on record: **1 of 1970** corpus files (the pinning fixture) and **0 of 27** `compiler/*.vl`, a 6-line deletion at `typecheck.vl:6268` if the design ever changes. **A real defect was underneath it** and shipped as #1459 — see below |
 | **3 — object literals** | two defects, possibly one root | **(A) silent wrong evaluation count**: an excess field in an *annotated* object literal has its initializer **never evaluated** — `const a: Animal = { legs: 4, purr: side("purr") }` is check-clean, runs, and `side` is never called. Control discriminates: the same call on a *known* field does run. **(B) loud emit reject**: an *un-annotated* object literal with any non-constant field initializer → `emitProgram: ref valtype with no interned shape`. `{purr: 1+1}` works, `{purr: v}` and `{purr: s()}` do not, and an annotation rescues it. `{ legs: 4, purr: v }` is completely ordinary code |
 
 **A prediction of mine that was REFUTED, recorded so it is not re-run.** I hypothesised the boolean→i32 hole was rep-equality leaking into assignability, since `boolean` and `i32` share a rep. That predicts `i32[] ← boolean[]` is also accepted. **It is not** — both the literal and variable forms are correctly rejected. So the array path already carries the arm the scalar path lacks, which makes it the likely reference sibling rather than a second victim. Also refuted: "inferred vs annotated" is *not* the axis — `function g(x: boolean): i32 { return x }` has an explicit annotation and is still accepted. The axis is **literal vs non-literal**.
@@ -573,6 +573,29 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## A control can be INVERTED, not just weak — the sharpest lesson of this cycle (2026-08-17)
+
+The board's standing rule was *"state a control that FAILS in the broken configuration, and check
+that it does."* #1459 found the failure mode that rule does not cover: **a control that discriminates
+perfectly and that I read backwards.**
+
+I filed `boolean` → `i32` as a silent soundness hole. My control was that the bare literal
+`const b: i32 = true` is REJECTED while every non-literal boolean is accepted. That control is real,
+it discriminates, and it is reproducible. I concluded "the guard exists on the literal path only,
+therefore the general path is missing it." The actual design is the exact inverse: the coercion is
+the **feature** (A7b) and the literal rejection is the **guard**, because `let x: i32 = true` is
+likelier a typo than an intent. Same observation, opposite conclusion.
+
+**What would have caught it in one step, and is now the rule:** before filing an acceptance as a
+defect, *grep the corpus for a fixture that pins it*. `tests/cases/types/boolean-to-i32.vl` is an
+`@run` fixture with five `@log` oracles covering the exact three positions I listed in the brief, and
+`CHANGELOG.md:107` names the feature. **A behaviour with its own pinning fixture is a decision, not
+an accident** — and searching for one costs a single grep against the hours a wrong brief costs.
+
+This is the fourth consecutive slice where the AXIS I filed was wrong while the cells I counted were
+right, and the first where the axis was wrong because the *evidence pointed the other way* rather
+than because I had too little of it.
+
 ## Newtypes measured for the first time — 10 cells, 10 correct (2026-08-17, `fed8693b`)
 
 The board carried newtypes as **0 cells measured**. They are now measured, and the brand holds
@@ -700,8 +723,13 @@ directions:
 
 * #1453 — the silent `print` defect's axis was **the `boolean` leaf at any depth**, because
   `boolean[]` shares the i32 list rep exactly and nothing distinguishes it but a NAME.
-* today — **`boolean` is silently assignable to `i32`** in every non-literal position, while
-  `f64←bool`, `i32←f64`, `string←bool` and `bool←i32` are all correctly rejected.
+* ~~today — `boolean` is silently assignable to `i32`~~ **— THIS PILLAR IS REFUTED.** That is
+  spec'd feature A7b, not a defect, and my control was inverted (see the In-flight row). The
+  heuristic survives because the slice it triggered found a **different** boolean-rep defect in its
+  place: #1459's `listElemIsBool` consulted the declared element name only as a POSITIVE claim and
+  then let the initializer walk outvote the annotation, so `const e: i32[] = [t]` printed `e[0]` as
+  `true` while `e[0] + 0` printed `1` — one expression, two formats, `vl check` clean. A shortened
+  mirror: one arm of a two-way decision, spelled with only the true half.
 * today — **`??` fails to short-circuit for `boolean` alone.**
 
 When a per-rep ladder is the suspect, **probe `boolean` first**. It shares i32's representation
