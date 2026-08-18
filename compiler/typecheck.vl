@@ -4961,11 +4961,14 @@ function symUse(useNode: i32, name: string) {
 // `…` depth-cap rendering is deliberately kept for exactly that reason). That is
 // why this is an ALL-members test and not an any-member one.
 //
-// Deliberately NOT extended to `TyNullable`: `let x = null` renders `<none>?`,
+// Deliberately NOT extended to `TyNullable`: `let x = null` renders `_ | null`,
 // and that type IS determined (VL spells it `null`) — see
 // `tests/cases/types/infer-null-unconstrained.vl`, whose whole point is that the
-// lone null is fully resolved. Suppressing it is a separate question about the
-// RENDERER, not about holes.
+// lone null is fully resolved. Its remedy belongs at the INFERENCE site, not at the
+// renderer: a `TyNullable` over an absent inner is NOT always the lone null —
+// `function mk() { return [] }` makes `mk().pop()` one too, and there the blank is
+// honest (the element really is unknown), so a renderer arm answering `null` for
+// every absent inner would misreport it.
 //
 // Depth-bounded at the arena's established budget (`tyDeeperThan`'s 16): a
 // recursive type is CYCLIC in the arena (`type L = {next: L | null}` reaches its
@@ -6646,7 +6649,7 @@ function arrElemRender(el: string, elTy: i32, elAtoms: i32): string {
 // (`tests/cases/arrays/lambda-empty-array-literal-return.vl` states that failure shape).
 // The two EMIT renderers never meet the hole because they decline the whole name ("")
 // before the test; the DISPLAY renderer must render every type it is handed, holes
-// included (`<none>`), so it reaches the test with `-1` in hand. Asking here keeps the
+// included (the blank `_`), so it reaches the test with `-1` in hand. Asking here keeps the
 // hole answered once rather than at each `is TyFunc` grouping site.
 function tyIxIsFunc(ix: i32): boolean {
   if ix < 0 || ix >= T.tys.length { return false }
@@ -7886,7 +7889,21 @@ function tyToStrAt(ix: i32, nominal: boolean) {
   // Both bail-outs below are single tokens — one atom, like every arm that does not
   // write a top-level `|`.
   tyStrAtoms = 1
-  if ix < 0 { return "<none>" }
+  // NO ARENA ENTRY (`ix < 0`) — an empty `[]` whose element nothing constrained, an
+  // empty `Map()`/`Set()` whose key or value nothing constrained. The USER-FACING
+  // question these answer is the SAME one the `TyVar` hole arm answers ("no type was
+  // determined here; say what it is"), so they answer it in the SAME token: `_`. The
+  // arena distinction — an unsolved entry vs no entry at all — is the checker's
+  // bookkeeping and buys a reader nothing; two blanks for one sentence just made the
+  // second one look like a different, internal condition.
+  //
+  // ANGLE BRACKETS ARE THE VOCABULARY OF AN ERROR THAT ALREADY HAPPENED, and after
+  // this only `<error>` (`TyErr`) and the unreachable `<?>` wear them. That split is
+  // the contract `soundness/absence-markers-render-reject.vl` pins: `_` says the
+  // checker never learned the type, `<error>` says the reader's own annotation was
+  // rejected above — collapsing them would send a reader who has an `unknown type`
+  // error to look for a missing annotation instead.
+  if ix < 0 { return "_" }
   if tyToStrDepth > 8 { return "…" }
   tyToStrDepth = tyToStrDepth + 1
   const s = tyToStrGo(ix, nominal)
@@ -8043,11 +8060,15 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       // identifier-shaped word: VL has no dynamic top type
       // (`docs/guide/soundness.md`), and every bareword spelling reads as a type
       // NAME the reader will then try to write. `_` reads as an unfilled slot, which
-      // is what a hole is. It joins the renderer's other non-name tokens — `<none>`
-      // (no arena entry), `<error>` (`TyErr`), `<?>` (the unreachable tail), `…` (depth
-      // cap) — but is the only one meaning PRESENT-and-unsolved rather than absent,
-      // so it must never be added to the LSP's absence filter (`ABSENT_TYPE_MARKERS`
-      // in lsp/src/typeFeatures.ts): a hole-bearing type is informative and shows.
+      // is what a hole is. It is the renderer's ONE blank: `tyToStrAt`'s absent-arena
+      // bail-out writes the same `_`, because "un-annotated param" and "element of an
+      // empty `[]`" are one sentence to a reader. The remaining non-name tokens all
+      // mean something else — `<error>` (`TyErr`, an annotation the reader wrote and
+      // the checker rejected), `<?>` (the unreachable tail), `…` (depth cap).
+      // `_` must never be added to the LSP's absence filter (`ABSENT_TYPE_MARKERS` in
+      // lsp/src/typeFeatures.ts): a blank-bearing type is informative and shows — and
+      // as a bare underscore it is a SUBSTRING of ordinary identifiers, so a sentinel
+      // list that matched it would delete hints from healthy code (`{foo_bar: i32}`).
       // A declared type param (`T`) carries a real source name and keeps it.
       if t.tvName[0] == '?' { return "_" }
       return t.tvName
@@ -13336,7 +13357,10 @@ function holeDemandTy(name: string) {
 // `holeDemandTy` rendered — the `expected …` half of a failed hole-demand check.
 function holeDemandStr(name: string) {
   const d = holeDemandTy(name)
-  if d < 0 { return "<none>" }
+  // "Demands nothing" is the same blank `tyToStrAt` writes for an absent arena entry,
+  // and it must stay the same token: this string lands in the `expected …` half of a
+  // message whose `got …` half comes from that renderer.
+  if d < 0 { return "_" }
   tyToStr(d)
 }
 
@@ -13416,7 +13440,7 @@ function holeMapDemandOpen(ty: i32) {
 
 // Report a failed hole-ARGUMENT demand — ONE home for the wording, shared by the general
 // call path and the UFCS one. An OPEN map demand gets its own sentence: the generic
-// `expected …, got …` would render the unpinned demand `{[<none>]: <none>}` and read as a
+// `expected …, got …` would render the unpinned demand `{[_]: _}` and read as a
 // mismatch, when the actual problem is that nothing decided the parameter's type.
 function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
   const hmE = holeMapOf(name)
@@ -13449,7 +13473,7 @@ function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
 // sentence: `q[i]` with an i32 index is ambiguous between an array and an i32-keyed map, the
 // body was checked as the array, and "expected an array" alone would send the reader to
 // change the ARGUMENT when the fix is to annotate the PARAMETER — the more so because an
-// argument still open (`const m = Map()`) renders `{[<none>]: <none>}`.
+// argument still open (`const m = Map()`) renders `{[_]: _}`.
 function holeArgArrayErr(argN: i32, at: i32, ix: i32) {
   if at >= 0 {
     const t = T.tys[at]
@@ -17596,7 +17620,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // stamped while checking the signature (`symDeclInOuter`, above) carried the
       // `-2` infer-later sentinel, and the in-place patch above only touches the
       // scope-bound copy (a distinct arena entry). Without this, hover / inlay on
-      // an unannotated function render `-> <none>`. `symRetainType` overwrites the
+      // an unannotated function render `-> _`. `symRetainType` overwrites the
       // existing `fnIx` entry in place.
       if symEnabled != 0 {
         symRetainType(fnIx, mkFuncTy(paramTys, inferred), 2)
