@@ -248,13 +248,13 @@ small and concentrated.
 |---|---|---|---|---|---|---|
 | **C1** | **P1.3 — union box must melt when the payload is READ** | `unboxed-union-rep-design.md` §12.4 / §12.7 | phase 1 **#1322** (78 sites over 76 functions; **wash** at plain `vl build`, **1.76× at `-O`**); if-expr **#1337** (1.67× at `-O`); binding sink (1.36× default / 1.68× `-O`). The `let`-on-two-branches remainder re-derived: **4/4/4 with the payload READ**, and the blocker is Heap2Local's single-definition requirement, not the emitter | **CLOSED — measured negative.** Three sinkable spellings ship; the fourth needs a REP change (escalated, not done) | M | med |
 | **C2** | **P1.4 follow-on — backing-pointer LICM** for view descriptor fields | ROADMAP `:409` (the filed `:949` was STALE — it points into `A-infer-map-value`); `buffer-design.md` §M4 | re-derived: `axpy-view` **1.725 ns/elem at `-O3`** vs a byte-identical hand-hoisted twin **0.573** = **3.01×**; split re-derived on one-axis-apart modules as reload **90.3%** / fence **9.7%** | **REFUTED — measured negative.** Emitter can reach 1 of 7 reads (**2.9%**); binaryen's `licm` moves only TOP-LEVEL loop-body statements; the axis is the INLINING BUDGET, not the view count (`scale-seedtwice`: one view, one column, **3.05×**). Route around = `--always-inline-max-function-size=60` (0 reads, 1.736→0.636 ns) at **+82% size / +127% opt time** on the compiler → belongs to **C3** | L | med |
-| **C3** | **P1.3 — optimization defaults** | ROADMAP `:353` | three-rung sweep separates `OPT-LOSES` (7 rows) from `O3-WORSE-THAN-O` (`sort-heap` 854/**648**/837). **C2 (#1403) adds a SECOND knob to the same ruling**: `--always-inline-max-function-size=60` melts the view descriptor outright — `axpy-view` **1.736 → 0.636 ns/elem** with the kernel module 113 B *smaller* — but costs the 1.16 MB compiler module **+82% bytes (955,265 → 1,740,871)** and **+127% wasm-opt time (22 s → 50 s)**. `flexible=60` is the cheap half: 1.199 ns, +28% compiler size. So the rung default and the inline budget trade the same way — a big runtime win for consumer kernels against build cost on large modules — and should be ruled on together, not separately | **OWNER RULING** `O-release-rung-default` | S in code | moves published guidance |
+| **C3** | **P1.3 — optimization defaults** | ROADMAP `:353` | three-rung sweep separates `OPT-LOSES` (7 rows) from `O3-WORSE-THAN-O` (`sort-heap` 854/**648**/837). **C2 (#1403) adds a SECOND knob to the same ruling**: `--always-inline-max-function-size=60` melts the view descriptor outright — `axpy-view` **1.736 → 0.636 ns/elem** with the kernel module 113 B *smaller* — but costs the 1.16 MB compiler module **+82% bytes (955,265 → 1,740,871)** and **+127% wasm-opt time (22 s → 50 s)**. `flexible=60` is the cheap half: 1.199 ns, +28% compiler size. So the rung default and the inline budget trade the same way — a big runtime win for consumer kernels against build cost on large modules — and should be ruled on together, not separately | **RULED 2026-08-18 — DONE as a ruling, doc work remains.** Both knobs answered the same way: `-O3` STAYS the release rung (12 of 46 rows materially better vs 4 worse; `sort-heap` is the named exception, not the default-setter), and the inline budget is a **build flag, never a default** (same shape as C10 — a fixed tax on every module for a win only some want). Residual work is documentation, not code: the `-O` column into `bench/results/summary.md` (`grep -c 'vl -O \|'` → still 0) and `sort-heap`'s shape into `cli-design.md` | S in code | moves published guidance |
 | **C9** | **webcraft doc staleness** — P1.2, the `wasm-opt` soft-no-op clause, `match` phase 2 | `webcraft-requirements.md` :309/:371-396, :446, :806 | the three blocks it named were already corrected; what was still live was **P1.3's advice**, which told the consumer *"there is no source workaround… do not restructure sim code"* while **three of the four spellings now sink** (#1322 one-site-per-function 1.76x at `-O`; #1337 the if-EXPRESSION arm 1.67x; the BINDING sink 1.36x default / 1.68x `-O`). Only a `let` ASSIGNED on two branches still reads 4/4/4. Corrected, and the guidance INVERTED: prefer a `const` bound to an if-expression over a `let` written on two branches. A16's stale 81/42 population corrected in the same pass | **DONE** | S | none |
 | **C10** | **Names section** — the ask says "keep emitting"; it is **opt-in and off by default** | `emit_sections.vl` `gEmitNames`; `--names` | default build **167 B, no names**; `--names` **258 B**. Flipping the default costs the seed **+60,297 B (+5.3%)**: 1,137,213 → 1,197,510 | **Resolution: consumer passes `--names`.** Do NOT flip the default | S (doc) | none |
 | **C5** | **A16 — litunion correctness in MIXED unions** | `webcraft-requirements.md:823` | ~~81 of 244 grid cells broken, 42 silent wrong answers~~ — **REFUTED as a live number**: all three exemplar shapes the requirements doc nominates are correct on the tip, plus six more, **9 of 9 in a correct outcome column** | **CLOSED — no half worth scheduling.** The two owner rulings gated the REPRESENTATION feature, and measurement had already concluded it should not be scheduled as a memory feature (a standalone litunion and all four keep positions already rep as an interned i32 atom; the mixed-union store already costs exactly one `struct.new` against an interned global, so no encoding allocates less). With the correctness half gone too, nothing remains. **Caveat: 9 probes is not a 244-cell grid** — re-derive before anyone schedules against it | M | — |
 | **C6** | **`match` residuals** — a binding arm cannot be a `const` INITIALIZER | ROADMAP `:1196` | was `emitProgram: if-expression arm is not a single value`; the grid says the BINDING broke value position, not `match` (statement + tail already lowered it, the `if` twin failed identically) | **DONE** — the if-expression arm gained a PRELUDE, so `match` AND `if` both lower in binding-init and `return` position; argument position + a TOP-LEVEL binding stay loud rejects | S–M | low |
 | **C7** | **B15a — default / optional params** | ROADMAP `:991` | **the `$fnsig` sequencing constraint was NOT live** — `fnSigKeyOf` keys off the DECLARATION's parameter list, never a call site's arg count; the call normalization runs before mono/collect and classifies its callee with `emitCall`'s own `fnIndexOfInScopeChain` | **DONE** — `p: T = <literal>` and `p?: T` (sugar for `p: T \| null = null`) parse/check/lower; a function VALUE keeps full arity. Literal-only, annotated-only, trailing-only, no type-param mention. UFCS stays exact-arity by ruling | M | none |
-| **C8** | **Readonly fields / A9 variance** | ROADMAP `:780`, `:782` | **the SILENT half is CLOSED and the boundary is pinned in both directions (#pending).** My filed axis was wrong **twice over**: not the array element — a **BARE binding breaks identically, no container involved** — and not width-vs-depth, but the source's shape **PROVENANCE**. A PINNED value (parameter, callee return, field read, annotated binding) cannot reach any different shape; an **UN-ANNOTATED binding of an object literal is re-interned at the destination row**, so reorder, a widened field type and even a **NESTED dropped field all WORK there** — same type pair, opposite verdicts. Only a **top-level dropped field** is unconditional, and that is exactly what now rejects. **My stated discriminating control was itself broken** (`const a: Animal = someCat` never worked), so "must keep working" was vacuous — the second slice running where my control did not discriminate. 337 cells: check-clean invalid wasm **124 → 79**, program traps **17 → 5**, **63 moved, 0 regressions**; width at a direct container boundary **100% closed** (54 → 0). Corpus **0 verdict changes** and **1,609/1,609 modules byte-identical** — nothing in the corpus exercised the hole, corroborating "not even pinned as xfail". **It hit the stop-and-report condition on its first cut and did not ship it**: that version rejected two correct working corpus files, which is what forced the provenance measurement. The full variance feature remains **BLOCKED** and untouched — no emitter file, no adapter, no WasmGC subtype declaration. 55 residual cells (43 depth, 10 field-nested width) are left check-clean invalid wasm **on purpose**, because the identical program with an un-annotated literal source works, so rejecting them would reject working code | **SILENT HALF CLOSED**; feature still BLOCKED | L | high |
+| **C8** | **Readonly fields / A9 variance** | ROADMAP `:780`, `:782` | **the SILENT half is CLOSED and the boundary is pinned in both directions (#pending).** My filed axis was wrong **twice over**: not the array element — a **BARE binding breaks identically, no container involved** — and not width-vs-depth, but the source's shape **PROVENANCE**. A PINNED value (parameter, callee return, field read, annotated binding) cannot reach any different shape; an **UN-ANNOTATED binding of an object literal is re-interned at the destination row**, so reorder, a widened field type and even a **NESTED dropped field all WORK there** — same type pair, opposite verdicts. Only a **top-level dropped field** is unconditional, and that is exactly what now rejects. **My stated discriminating control was itself broken** (`const a: Animal = someCat` never worked), so "must keep working" was vacuous — the second slice running where my control did not discriminate. 337 cells: check-clean invalid wasm **124 → 79**, program traps **17 → 5**, **63 moved, 0 regressions**; width at a direct container boundary **100% closed** (54 → 0). Corpus **0 verdict changes** and **1,609/1,609 modules byte-identical** — nothing in the corpus exercised the hole, corroborating "not even pinned as xfail". **It hit the stop-and-report condition on its first cut and did not ship it**: that version rejected two correct working corpus files, which is what forced the provenance measurement. The full variance feature remains **BLOCKED** and untouched — no emitter file, no adapter, no WasmGC subtype declaration. 55 residual cells (43 depth, 10 field-nested width) are left check-clean invalid wasm **on purpose**, because the identical program with an un-annotated literal source works, so rejecting them would reject working code | **SILENT HALF CLOSED** (objects, #1456) **+ the CONTAINER-ELEMENT half closed 2026-08-18**; **RULED 2026-08-18** — inferred surface, no annotation in v1, and the filing's "which programs start failing" framing is REFUTED by measurement: that population is empty of *working* programs (all six subtype-container shapes already reject loudly or already emit invalid wasm). The feature splits — the **Writable** half is a free win (check-clean invalid wasm → loud reject), the **Readable** half was never blocked on the ruling at all but on REPRESENTATION (`i32[]` → `(i32\|null)[]` is sound, the checker agrees, the emitter has no conversion between two WasmGC array types) | L | high |
 
 **Open question for the consumer, not for us.** A16 asks webcraft directly whether
 the mixed-union enum pattern is real or hypothetical; it is unanswered and is the
@@ -772,7 +772,116 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## C8's Writable half, shipped: the container-ELEMENT storage class (2026-08-18)
+
+The A9 ruling said the Writable half is a free win — check-clean invalid wasm becoming a loud
+reject, with no working program to protect. Built and measured; it is.
+
+**The filed axis would have been wrong again.** `objShapeAdapterless` walks containers looking for
+an OBJECT pair, so `i32[]` into `(i32 | null)[]` reached its nullable peel and came out as two equal
+`i32`s. The peel is right for a scalar POSITION and wrong under a container, because an array's wasm
+type is fixed by how its element is STORED. So the rule is a storage-CLASS test, and a
+type-identity test — the obvious first cut — rejects working code on its first line:
+
+| widening | verdict | why |
+|---|---|---|
+| `C[]` → `(C | null)[]`, `string[]` → `(string | null)[]`, `i32[][]` → `(i32[] | null)[]` | **RUNS** | a nullable ref is the same wasm reftype |
+| `boolean[]` → `(boolean | null)[]`, `K[]` → `(K | null)[]` | **RUNS** | niche: the sentinel lives in the element's own value space (i32 `2`, atom `-1`) |
+| `i32[]`/`i64[]`/`f64[]` → their `| null` twins | **no lowering** | the destination BOXES the element |
+| `K[]` → `string[]` | **no lowering** | an interned i32 atom for a ref |
+| `i32[]` → `f64[]` | **no lowering** | element width |
+
+`ESC_UNKNOWN` always declines — a hole, a type variable or any unnamed shape is never claimed on a
+guess, which is what keeps `first<T>(ys: T[])` over an `i32[]` working. The nested pair is tried
+FIRST, so `i32[][]` → `(i32 | null)[][]` reports the INNER array pair and names the outer as what it
+was reached through.
+
+**Corpus A/B over 2,005 files: 2 verdict changes, and 1,640 of 1,640 emitted modules
+BYTE-IDENTICAL.** Both movers are `@emit-error` closure fixtures whose own headers describe this
+exact defect — a lambda self-inferring the bare list arm where the annotation's element is the union
+box — so both are emit-reject → CHECK-reject tier moves with the verdict unchanged. Gate green:
+`deno task test` 2,157/0, `cases_wasm` 1,937/0, native fixpoint holds, self-lint + fmt clean, LSP
+bundle rebuilt.
+
+**Method note worth keeping: a seed resolved relative to CWD is a silent no-op.** The first
+post-patch grid run reported the fix doing NOTHING, because `vl` resolves
+`--compiler` → `$VL_COMPILER_WASM` → `./build/vl-compiler.wasm` → EMBEDDED, and the grid ran from a
+scratch directory with no `./build`, so every probe silently used the binary's embedded (master)
+seed. Any measurement run outside the repo root must set `VL_COMPILER_WASM` explicitly, or it is
+measuring master and reporting it as the patched result.
+
+**Left measured and unfixed**, so the boundary is on the record: the OBJECT-element widening class
+(`{v: i32}[]` → `{v: i32 | null}[]`) is still declined, and correctly — it is #1456's documented
+provenance residue, where a PINNED source emits invalid wasm and the identical program with an
+un-annotated literal source RUNS. Rejecting it would reject working code. Also declined by
+construction: a ref-element pair whose two sides are different unions (`C[]` → `(C | D)[]`), which
+this ladder classes as ref-to-ref. Both are misses, not regressions.
+
+## ALL FOUR OWNER RULINGS TAKEN — and two of them moved under measurement (2026-08-18)
+
+The four rows that had been the board's only real blockers are ruled. Recorded in `DECISIONS.md`
+and in `open-rulings.md`'s Ruled section. Two were ruled as briefed; two changed shape when I
+re-derived them on the tip instead of quoting the filing, and those two are the ones worth reading.
+
+| ruling | outcome |
+|---|---|
+| **C3** — the inline budget | **build flag, never a default.** Had been ruled in conversation before and never written down — the exact failure mode `open-rulings.md` exists to catch, which is why it resurfaced as a live blocker. Precedent it matches: **C10** |
+| **O-release-rung-default** | **`-O3` stays.** Closed by PUBLISHING the split, not flipping the rung |
+| **C8** — A8/A9 variance | **inferred, no annotation surface in v1** — and the filing's central worry is refuted |
+| **`return voidCall()`** | **allowed** — and it was not the pure design question the board filed it as |
+
+### The two that moved
+
+**C8's filed framing was stale and the measurement inverts it.** The entry says the ruling "decides
+which programs that type-check TODAY start failing." I constructed that population; it is **empty of
+working programs**. There is no spelling in which a subtype container reaches a supertype parameter
+and the program runs — the struct-width family is a loud reject behind #1456's gate (including the
+read-only body, and including an un-annotated source), and the union-widening family
+(`i32[]` → `(i32|null)[]`, `K[]` → `string[]`) is check-clean invalid wasm in BOTH directions. So A9's
+**Writable** half only moves cells UP a column and harms nothing, while its **Readable** half was
+never blocked on the ruling at all: `peek(xs)` is sound, the checker already says "type-valid … but
+not yet supported by codegen", and the blocker is that the two are different WasmGC array types with
+no conversion. *A ruling entry can go stale the same way a ROADMAP row does — #1456 landed after the
+filing and silently answered half of it.*
+
+**The void question was carrying an unpinned check-clean-invalid-wasm cell.** Filed as "a design
+change request, not a defect". It is both — the surface question is a design change, and underneath
+it sits a live cell with no fixture and no doc mention anywhere:
+
+```vl
+function side() { print("hi") }
+function call<T>(f: () => T): T { return f() }
+call(side)     // vl check rc 0; vl run -> Invalid input WebAssembly code at offset 305:
+               // type mismatch: current function requires result type [i32] but callee returns []
+```
+
+`T = i32` is a clean control. Both the lambda spelling and the named-function spelling fail. **So
+"the defect queue is empty" was wrong by one**, and the miss is instructive: the cell was invisible
+because the row above it was classified as a design preference, so nothing probed underneath it. A
+row filed as "needs a ruling, not a brief" still deserves one probe.
+
+### Two rows this opens
+
+| row | item | measured | status | eff | risk |
+|---|---|---|---|---|---|
+| **D15** | **`T` instantiated at `void` in a generic emits invalid wasm** | `vl check` rc 0, module fails to validate: `requires result type [i32] but callee returns []`. Reproduces on `call(side)` and `call(() => side())`; `T = i32` control is clean. No fixture anywhere in `tests/cases/`, no mention in any design doc | **OPEN — check-clean invalid wasm.** The fix is consequence (c) of the void ruling: the monomorphizer emits an EMPTY result for a void instance. Same lowering the surface change needs, so brief them together | S–M | low |
+| **P9** | **emitter-side inlining — schedule it or drop it, do not park it** | filed as un-schedulable because it is "worth ~5.6% at the default rung and exactly zero at `-O` and above". **That framing assumed the compiler is an optimized artifact and it is not**: `build/vl-compiler.wasm` is **1,224,039 B** against 918,258 B at `-O` / 919,547 B at `-O3` for the same module — the shipped seed has never had `wasm-opt` run on it, so the compiler sits at exactly the rung where P9 is worth 5.6% | **DECIDABLE NOW.** The `O-release-rung-default` ruling sets the bar — internalized optimization is judged on OVERALL self-compile time, not per-function wins — and 5.6% of self-compile is the number. Take it or drop the row; parking is no longer an option | M | med |
+
+### What the void ruling also retires
+
+Consequence (b), void-return covariance on function values, closes the **`done()` wart** without any
+separate work: `beforeEach(() => { hits = hits + 1 })` fails today with
+`argument 1: expected () => void, got () => i32`, and `std:test` ships a void no-op `done()` purely
+as the documented workaround (`vl-test-design.md:166`, filed at `ROADMAP.md:746`). Verified still
+live on the tip, along with the bare form `take(() => 7)` — there is no void covariance at all
+today. The assignment-is-an-expression rule that produces the `i32` is untouched.
+
 ## FINAL SURVEY — the defect queue is empty (2026-08-17, master `86703919`)
+
+> **Superseded by one row, 2026-08-18.** This survey was accurate for everything it probed, and it
+> did not probe underneath a row it had classified as a design preference. `D15` (a type parameter
+> instantiated at `void`) is check-clean invalid wasm and was sitting under the `return voidCall()`
+> ruling. See the round above.
 
 Every remaining OPEN row was probed on the tip. **Nothing silent is left.**
 
@@ -800,11 +909,15 @@ user-facing render leak.
   user is told why. Ranked below silent work throughout this cycle and still are.
 * **Features** (D2, G3, G4). Each is a multi-slice change to the representation or the runtime, and
   **each wants a priority call rather than an agent** — G3 in particular changes what `string` IS.
-* **Four owner rulings**, unchanged and now the actual blockers: **C3** (recommendation: a build flag,
-  not a default flip — always-inline gives ZERO self-compile speedup for +789 KB and +33 s of
-  `wasm-opt`), **C8**, **O-release-rung-default**, and whether `function g() { return voidCall() }`
-  should compile (#1435 took the reject deliberately under a reject-more mandate, so reversing it is a
-  design change, not a defect fix).
+* ~~**Four owner rulings**, unchanged and now the actual blockers~~ — **ALL FOUR RULED 2026-08-18.**
+  Recorded in `DECISIONS.md` and in `open-rulings.md`'s Ruled section; each is summarised in the
+  round below. **C3** → the inline budget is a build flag, never a default (same shape as C10).
+  **O-release-rung-default** → `-O3` stays, and the ask closes by publishing the per-program split
+  rather than flipping the rung; the standing direction is to internalize optimization so it can be
+  applied selectively, gated on OVERALL self-compile time. **C8** → A8/A9 defaults as written in
+  `language-todo.md:15-20`, inferred with no annotation surface in v1, nothing to migrate.
+  **`function g() { return voidCall() }`** → allowed, as one consequence of `void` becoming a real
+  unit type in the lattice. Two of the four moved under measurement — see below.
 
 ## E8 re-derived and briefed — 4 occurrences, 3 shapes (2026-08-17)
 

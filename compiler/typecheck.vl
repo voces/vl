@@ -12560,6 +12560,12 @@ let shapeAdaptDstTy = -1
 // `Animal[]` is an array literal whose claimed pair IS an object literal — reading the
 // outer expression gets both backwards. -1 when the walk had no expression there.
 let shapeAdaptSrcExpr = -1
+// Which RULE claimed the stopped-on pair: the object-shape one (false) or the
+// container-element storage-class one (true). They need different wordings — one names a
+// dropped field, the other names an element whose storage changed — and the pair banked
+// above does not say which, since both bank a pair. Set on every claim, beside the pair,
+// so the two can never disagree.
+let shapeAdaptElemPair = false
 
 // The expression at `ix` with `(…)` peeled — the syntactic form, for the constructor
 // exemption in `objShapeAdapterless`. -1 stays -1.
@@ -12593,6 +12599,86 @@ function objFieldNameSetsEq(src: i32, dst: i32): boolean {
     }
   }
   false
+}
+
+// The wasm ELEMENT storage class a container's element (or map key/value) type lowers
+// to. Two element types in DIFFERENT classes make two unrelated CONTAINER wasm types, so
+// there is no element-converting copy to insert and the flow has no lowering — the
+// container twin of the object-shape rule below.
+//
+// MEASURED, and the measurement is why this is a CLASS test and not a type-identity one.
+// Widening an element is FREE whenever the class holds: a REF element takes `| null` for
+// nothing (`C[]` -> `(C | null)[]`, `string[]` -> `(string | null)[]` and
+// `i32[][]` -> `(i32[] | null)[]` all RUN, because a nullable ref is the same wasm reftype),
+// and so does a NICHE-nullable scalar (`boolean[]` -> `(boolean | null)[]` and
+// `K[]` -> `(K | null)[]` RUN, because the sentinel lives inside the element's own value
+// space). What has NO lowering is a class CHANGE: `i32[]` -> `(i32 | null)[]` boxes the
+// element, `i64[]` and `f64[]` the same, `K[]` -> `string[]` swaps an interned atom for a
+// ref, and `i32[]` -> `f64[]` changes the element width. Every one of those is
+// `vl check`-clean invalid wasm on the base this shipped against.
+//
+// `ESC_UNKNOWN` always DECLINES. An inference hole, a type variable, or any shape this
+// ladder does not name must never be claimed on a guess — a generic `first<T>(y: T[])`
+// applied to an `i32[]` reaches here with a hole on one side.
+const ESC_UNKNOWN = 0
+const ESC_I32 = 1
+const ESC_I64 = 2
+const ESC_F32 = 3
+const ESC_F64 = 4
+const ESC_BOOL = 5
+const ESC_STRING = 6
+const ESC_REF = 7  // object / array / map / function, and any nullable or union of them
+const ESC_BOX = 8  // a value union the emitter boxes — a scalar beside another atom
+const ESC_ATOM = 9 // a literal union: one interned i32 id
+
+function elemStoreClassOf(ty: i32, depth: i32): i32 {
+  if ty < 0 { return ESC_UNKNOWN }
+  if depth <= 0 { return ESC_UNKNOWN }
+  if tyReachesHole(ty, 8) { return ESC_UNKNOWN }
+  // A niche-nullable scalar reps exactly as its base does: the `| null` is a sentinel
+  // inside the element, not a second element type.
+  if tyIsNicheNulScalarElem(ty) {
+    if tyIsNullableLitUnion(ty) { return ESC_ATOM }
+    const n = T.tys[ty]
+    if n is TyNullable { return elemStoreClassOf(n.nInner, depth - 1) }
+    return ESC_UNKNOWN
+  }
+  if tyIsLitUnion(ty) { return ESC_ATOM }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const p = t.primName
+    if p == "i32" { return ESC_I32 }
+    if p == "i64" { return ESC_I64 }
+    if p == "f32" { return ESC_F32 }
+    if p == "f64" { return ESC_F64 }
+    if p == "boolean" { return ESC_BOOL }
+    if p == "string" { return ESC_STRING }
+    return ESC_UNKNOWN
+  }
+  if t is TyObj { return ESC_REF }
+  if t is TyArray { return ESC_REF }
+  if t is TyMap { return ESC_REF }
+  if t is TyFunc { return ESC_REF }
+  if t is TyNullable {
+    if tyPrintsAsRef(t.nInner, 8) { return ESC_REF }
+    return ESC_BOX
+  }
+  if t is TyUnion {
+    if tyPrintsAsRef(ty, 8) { return ESC_REF }
+    return ESC_BOX
+  }
+  ESC_UNKNOWN
+}
+
+// Do a container's source and destination element types land in different storage
+// classes? Neither side may be UNKNOWN — declining on an unclassified pair is what keeps
+// a generic element from being claimed on a guess.
+function containerElemClassDiffers(se: i32, de: i32): boolean {
+  const sc = elemStoreClassOf(se, 8)
+  if sc == ESC_UNKNOWN { return false }
+  const dc = elemStoreClassOf(de, 8)
+  if dc == ESC_UNKNOWN { return false }
+  sc != dc
 }
 
 // Does reaching `dst` from `src` need an object-shape ADAPTER that codegen does not
@@ -12752,6 +12838,7 @@ function objShapeAdapterless(
       shapeAdaptSrcTy = src
       shapeAdaptDstTy = dst
       shapeAdaptSrcExpr = cx
+      shapeAdaptElemPair = false
       return true
     }
     return false
@@ -12779,14 +12866,41 @@ function objShapeAdapterless(
           return false
         }
       }
-      return objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1)
+      // The nested pair FIRST, so a container carrying an object pair keeps the precise
+      // object wording; only then the element's own storage class. A nested container
+      // resolves through this same arm one level in, which is what makes
+      // `i32[][]` -> `(i32 | null)[][]` report the INNER array pair rather than the outer.
+      if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1) { return true }
+      if containerElemClassDiffers(s.aElem, d.aElem) {
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        return true
+      }
+      return false
     }
     return false
   }
   if s is TyMap {
     if d is TyMap {
       if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1) { return true }
-      return objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1)
+      if objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1) { return true }
+      if containerElemClassDiffers(s.mKey, d.mKey) {
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        return true
+      }
+      if containerElemClassDiffers(s.mVal, d.mVal) {
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        return true
+      }
+      return false
     }
     return false
   }
@@ -12860,6 +12974,28 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   // does not take. What the literal takes is SILENT — it builds at the destination shape,
   // which drops the excess field's initializer unevaluated — so the message names the
   // evaluation that would not happen, and the one way out (drop the field or declare it).
+  // THE CONTAINER-ELEMENT WORDING. The object message's whole vocabulary is wrong here:
+  // no field is dropped, the two shapes may be the same shape, and "construct the value at
+  // the destination shape" points at an object that is not what changed. What changed is
+  // how the ELEMENT is stored, so the message names that and the container it fixes.
+  if shapeAdaptElemPair {
+    tErrUnsupported(
+      "a value of type " +
+        tyToStr(sT) +
+        " flowing into " +
+        tyToStr(dT) +
+        through +
+        " changes how the ELEMENT is stored: type-valid (the element type widens) but " +
+        "not yet supported by codegen — a container's wasm type is fixed by its element's " +
+        "storage, so these are unrelated types and no element-converting copy exists. " +
+        "Build the container at " +
+        tyToStr(dT) +
+        " (a literal is built at the type it flows into), or declare the source as " +
+        tyToStr(dT),
+      srcExpr,
+    )
+    return 0
+  }
   if litShapeDropSrcExpr(sX) {
     tErr(
       "this object literal sets " +
