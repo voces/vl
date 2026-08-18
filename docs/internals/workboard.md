@@ -772,6 +772,43 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## A bare `return` in a void function had NO LOWERING — found while implementing the void ruling (2026-08-18)
+
+`function g(c: boolean) { if c { return } print("after") }` — the ordinary guard clause —
+was `vl check`-clean and then `emitProgram: bare return is not supported`. **An early return
+from a void function could not be written in VL at all.** Found by probing underneath the
+void ruling rather than from any filed row.
+
+**It was completely unpinned, and that is why it survived**: the corpus A/B that shipped the
+fix moved **0 verdicts and 0 bytes over 2,005 files**, because not one fixture used the
+construct. A hole with no fixture and no filed row is invisible to every sweep this board
+runs — the same shape as `D15`, one ruling over.
+
+The lowering is the wasm `return` opcode with nothing pushed, and it needed no arity
+reasoning of its own because **the checker is already the gate**: a bare `return` in a
+value-returning function is refused there by NAME of the type it owes (`return needs a
+value of type i32`), so an EMPTY result type is the whole population the emitter arm can
+see. `fRetVoid` is read position-keyed via `fnStmtsPosOf`, the same way `emitFuncBody`'s
+fall-through reads it, rather than re-derived from the annotation; anything that channel
+cannot answer for keeps the old loud reject rather than guessing an arity, since a `return`
+that leaves the stack wrong is invalid wasm and strictly worse than the message it
+replaces.
+
+Both sides are pinned now (`statements/bare-return-void-early-exit.vl` over four shapes —
+guard clause, inside a loop's block structure, a lambda body, and TAIL position where the
+terminator still has to be written — plus `error-bare-return-in-value-fn.vl` for the
+checker's half).
+
+**Still open in this family, and now the void ruling's implementation queue:**
+
+| | shape | column |
+|---|---|---|
+| **D15** | `call<T>` at `T = void` | check-clean **invalid wasm** |
+| (a) | `return <void expr>` in a void function | check reject; the ruling says allow |
+| (b) | `() => i32` into `() => void` (the `done()` wart) | check reject; the ruling says allow |
+
+(a) and D15 share the lowering — this slice built the terminator half of it.
+
 ## BAND 1 — `TyPrim.primName` was a comment over a `string`; it is now a declaration (2026-08-18)
 
 The type arena held its primitive vocabulary as a raw `string`, with the closed set written
