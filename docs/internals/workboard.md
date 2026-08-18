@@ -573,6 +573,17 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## Queue re-derivation, round 4 — litunion rows (2026-08-17, `fed8693b`)
+
+Probed on the tip, each against the shape its own row names:
+
+| row | filed | tip |
+|---|---|---|
+| **a `K\|null` NUMERIC litunion `is`** (12 cells, LOUD, "`is` names a type that is not a union variant") | queued as unblocked | **RETIRED** — `type Z = 0 \| 1; function f(): Z \| null …; if u is Z` prints `1`. The hole-parameter spelling (D1j) also prints `1`, and the named-litunion twin prints `a` |
+| **D3 — `emitIs` compares ONE tag**, 49 of 64 cells | flagged *"not re-derived since #1343/#1341 — treat as an upper bound"* | **DOES NOT REPRODUCE**, and the probes that matter are the negatives. A one-tag comparison must answer TRUE for all three of: a value **not** in `A` (`"d"` against `"a"\|"b"`), an **overlapping first tag** (`"z"` against `A = "x"\|"y"`, `B = "x"\|"z"`), and a **subset** union (`"r"` against `KS = "p"\|"q"`, D1k's shape). **All three answer correctly**, as do a 3-member union's last member and the 2-member case. Treat 49/64 as refuted; re-derive the full grid if anyone briefs it |
+| **D1f — a `while` GUARD's body and an ELEMENT place** | LOUD, both | **CONFIRMED OPEN, still LOUD, both.** Correct outcome column, so it ranks below any silent row |
+| **D5 — struct arms sharing a STORAGE code** (`{a:i32} \| {a:boolean}`) | filed as a defect | **CONFIRMED OPEN and LOUD** — `emitProgram: union \`U\` cannot be discriminated`. Correct column. Note the *cause* is the same boolean/i32 storage-code collision named above, so it is a sibling of the boolean rows, not an independent item |
+
 ## D4 is filed on the wrong axis — re-derived, re-filed, ready to brief (2026-08-17, `fed8693b`)
 
 D4 is on the board as **"Generic alias application as a union member"**. Genericity is not the axis.
