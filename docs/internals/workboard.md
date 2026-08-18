@@ -573,6 +573,35 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## Newtypes measured for the first time — 10 cells, 10 correct (2026-08-17, `fed8693b`)
+
+The board carried newtypes as **0 cells measured**. They are now measured, and the brand holds
+everywhere I could reach it. Spelling is `type A = new { v: i32 }` (not a `newtype` keyword — my
+first four probes used one and were rejected for that reason alone).
+
+**Brand enforced (correctly rejected)** in every position, each paired with a positive control that
+PASSES, so the rejection is the brand and not a dead position:
+
+| position | cross-nominal `A` → `B` | control `B` → `B` |
+|---|---|---|
+| binding | rejected | prints `5` |
+| parameter | rejected | prints `5` |
+| return | rejected | prints `5` |
+| array element | rejected | prints `5` |
+| map value | rejected | prints `5` |
+| struct field | rejected | prints `5` |
+
+Also correct: `nominal ← structural` and `structural ← nominal` both rejected, so the brand does not
+decay in either direction.
+
+**The controls earned their keep, and one reading was vacuous until they ran.** My first map-value
+pair showed the cross-nominal case rejected — which looked like brand enforcement — but the *control
+also failed*, so that position was rejecting everything and proved nothing. The cause was my probe,
+not the compiler: a map read is nullable (`B?`) and I printed it un-narrowed, giving
+`member access '.v' on non-object B?`. Guarding the read makes the control print `5` and leaves the
+cross-nominal case correctly rejected. **A rejection is only evidence of a brand when the same-type
+flow through the same position succeeds.**
+
 ## C5 / A16 — the correctness population that BLOCKED it is substantially gone (2026-08-17, `fed8693b`)
 
 C5 sits on the board as **BLOCKED, 2 owner rulings**, carrying **"81 of 244 grid cells broken, 42
