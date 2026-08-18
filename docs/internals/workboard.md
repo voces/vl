@@ -660,6 +660,27 @@ re-derived before anyone briefs it — not that every cell was re-measured. The 
 litunion/nullable-rep run #1439–#1455. `docs/webcraft-requirements.md`'s A16 paragraph still states
 the stale population and should be corrected when C9's doc-staleness pass runs.
 
+## Queue re-derivation, round 5 — six more rows retire (2026-08-17, `ad47fc5f`)
+
+Probed on the tip, each against the shape its own row names:
+
+| row | filed | tip |
+|---|---|---|
+| the remaining **`.map`/`.filter` niches** (#1436 filed 140 cells) | only the map-valued one still loud at last check | **RETIRED** — `.map` over `i32[]\|null` under a guard, `.map` over `m.keys()` (the map-valued one), and `.filter` over `boolean[]` all run |
+| the **box for-in loop-var narrow** defect (8 cells) | #1436 located the root, out of its area | **RETIRED** — `for x in xs` over `(A\|B)[]` with `if x is A` prints `A B` |
+| the **alias carrying its own null arm** as a container element (18 cells, #1430) | queued | **RETIRED** — `type N = i32 \| null; const xs: N[] = [1, null]` reads correctly under a guard |
+| the **nested-ref-list** row (11 cells, LOUD) | queued | **RETIRED** — `i32[][]` indexes to `2` |
+| the **anon-field-ref-list** row (11 cells, LOUD) | queued | **RETIRED** — `{ xs: [1,2,3] }.xs[1]` prints `2` |
+| a **void-armed `match` whose message says "if-expression arm"** (wording, #1435) | wording defect | **RETIRED** — the message no longer occurs because the construct compiles (C6's if-expression-arm prelude). Statement form is clean; the value form binds a void `r` with only an unused-variable warning, and **using** it is a correct loud `print expects a value, got void`. Sound, not a hole — I checked, because a silent void binding would have been the more interesting answer |
+
+**Confirmed OPEN and LOUD** (correct outcome column, so all rank below any silent row):
+
+* **`==` between two boxes under a litunion-arm alias** (20 cells) — `emitProgram: \`==\` over a struct union …`
+* **`function g() { return voidCall() }`** — still a type error. This is a **design change request**, not a defect: #1435 took the reject deliberately under a reject-more mandate. Needs an owner ruling, not a brief.
+* **D1f** — a `while` GUARD's body and an ELEMENT place, both still loud.
+
+**Probe note, since it cost me a reading:** `match` over an `i32` scrutinee rejects with *"match scrutinee must be a union, got i32"* — a mis-shape, not the wording defect. The scrutinee must be a union.
+
 ## Queue re-derivation, round 4 — litunion rows (2026-08-17, `fed8693b`)
 
 Probed on the tip, each against the shape its own row names:
