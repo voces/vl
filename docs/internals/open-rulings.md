@@ -18,9 +18,9 @@ sentence that produced it, and several filings were found to overstate their own
 ---
 ## A. Something is BROKEN while these wait
 
-These two are not preferences. In each case the language today accepts or miscompiles a program it should not, and the defect is reproduced in the entry.
+This is not a preference. The language today accepts or miscompiles a program it should not, and the defect is reproduced in the entry.
 
-Both were re-run by hand at `a36c91e3` rather than taken from the filings:
+Re-run by hand at `a36c91e3` rather than taken from the filing:
 
 ```vl
 // A16 tag collision — SILENT. vl check rc 0, vl run rc 0, prints the WRONG branch.
@@ -30,18 +30,12 @@ if x is K { print("WRONG: zz claimed to be K") } else { print("ok: not K") }
 //        -> WRONG: zz claimed to be K
 ```
 
-```vl
-// N5 variance — the CHECKER accepts writing a non-Cat into a Cat[]. vl check rc 0.
-type Animal = { name: string }
-type Cat = { name: string, meow: i32 }
-function stash(xs: Animal[], a: Animal) { xs.push(a) }
-const cats: Cat[] = [{ name: "c", meow: 1 }]
-stash(cats, { name: "dog" })   // accepted; `cats` now holds an element with no `meow`
-```
+A silent wrong answer at rc 0 on both commands — the worst outcome column there is.
 
-The first is the worse of the two: a silent wrong answer at rc 0 on both commands. The second is
-caught by the emitter in the shape above (`vl run` fails to build), but the CHECKER accepting it is
-the soundness hole, and a shape that emits cleanly would be silent too.
+**N5 (mutable-container variance) used to sit here and is now RULED (2026-08-18)** — see the Ruled
+section. Its witness above no longer reproduces: `stash(cats, …)` is a loud reject at HEAD behind
+#1456's width gate. What survives it is the union-widening family, which is check-clean invalid wasm
+and is a REPRESENTATION gap, not a variance one.
 
 ### A16-tag-scheme-kind-vs-band
 
@@ -63,29 +57,6 @@ the soundness hole, and a shape that emits cleanly would be silent too.
 <details><summary>verification</summary>
 
 No ruling exists anywhere. `grep -n "RULED\|SHIPPED\|owner" docs/internals/litunion-compact-rep-design.md` → the only SHIPPED/ruled blocks are :476 (§7.3 → slice C #1306), :530 (slice A #1307) and :645; §7.1 at :446 carries no ruling. `git log --oneline -- docs/internals/litunion-compact-rep-design.md` → 1f7b4fc7 (#1305 filing), b7566067 (#1306), 8970dea6 (#1307) — nothing after touches §7. `grep -n "A16" DECISIONS.md` → only :26 and :65, both type-level literal-union entries, no tag-band decision. `git log --oneline -60 | grep -i 'owner\|ruling'` → the last recorded owner ruling in this area is 369c5a6d (#1300 preserve, 2026-07-29), which PRE-dates the filing. The newest doc in the family re-affirms it is live: unboxed-union-rep-design.md:522-525 (shipped #1320) says its phase 3 "re-opens the type-index questions `litunion-compact-rep-design.md` §7.1 hands to the owner". The defects it gates are live at HEAD: F2 witness (`type K = "aa"|"bb"; const x: K|f64 = "aa"; if x is K { const y: K = x }`) → `vl check` rc 0, `vl build` rc 1 `type mismatch: expected i32, found (ref $type) (at offset 0x117)`; F3 witness (`const x: K|string = "zz"; x is K`) → runs rc 0 and prints `K`. Cost claim verified: `grep -rn "refArrSlotTag(\|mapSlotTag(" compiler/*.vl` → exactly 5 + 3 real call sites (wasmEmit.vl:1842,1846,2585,2620,2729,2746,2769,2816) plus the two definitions at emit_classify.vl:14042/14055 — the doc's "two constants, 5 and 3 call sites" is accurate.
-
-</details>
-
-### N5-variance-defaults-and-surface
-
-**N5 — mutable-container variance: what the A8/A9 defaults are, and how much of it is user-visible surface**  
-`docs/internals/compiler-code-review.md:55 (section heading :53)`
-
-**The question.** The DEFAULTS half is narrower than filed, because the owner has already written them down: docs/guide/language-todo.md:15-20 (the owner's own language TODO, which is what ROADMAP:780/:782 cites as '(TODO.md)') states 'Parameters should be Inexact by default and values Exact' and 'Readable and Writable … should be applied automatically during parameter inference'. So the live owner call is not 'what are the defaults' but: (i) is the Readable/Writable inference SILENT (no surface) as that note says, or does an author get a spelling to annotate around a rejection; and (ii) what is the policy for the programs that type-check today and would start failing — reject them, or grandfather with a warning? Also note collections-design.md:758-762 and :996-1013 require A9 to be co-designed with the List/Array representation work, so the ruling has a second consumer.
-
-**Options.** The fix is designed, the defaults are the call: ROADMAP.md:780 sketches A8 as "Params Inexact by default (accept excess properties), values Exact" and :782 has A9 "applied automatically during parameter inference" — i.e. no new surface, at the cost of rejections the author cannot see coming or annotate around; the alternative is an explicit readable/writable (or exact) annotation surface the author writes, which is teachable and localizable but adds type-level syntax to the language. Either way the choice decides which programs that type-check TODAY start failing. Note this repo uses "maintainer" and "owner" interchangeably (ROADMAP.md:739 files error-handling-design.md's "Open questions for the owner" as "flagged for the maintainer").
-
-**Blocked while unruled.** The "fully statically sound" claim, and the A8/A9 implementation itself. The hole is live and verified: `Cat[]` → `Animal[]` passes the write checks clean and emits invalid wasm.
-
-**Reversible?** Poorly. Variance defaults are load-bearing for every program that type-checks today; tightening them later rejects previously accepted code, and loosening them later re-opens the soundness hole. The annotation-surface half is additive and therefore cheaper to revisit than the default.
-
-**Cost if taken.** Unpriced — no line/file/PR estimate exists in ROADMAP, DECISIONS, compiler-code-review.md or collections-design.md; every reference is a design sketch. The only sizing signal is negative: it is checker work with no existing scaffolding (zero variance code in compiler/).
-
-**Cost of waiting.** The `Cat[]` → `Animal[]` write hole stays silently accepted and emits invalid wasm (verified above), and it is not even pinned as an xfail — no fixture in `tests/cases/soundness/` is about container variance. It is now the ONLY entry in docs/guide/soundness.md's 'Known-unsound corners' section, the arithmetic/equality hole-operand rule having been closed and re-pinned as ordinary `@error` cases. So the gap is live, unpinned in the soundness corpus, and the 'fully statically sound' claim stays unearned. Readonly-field exports (modules-design §5 point 4, webcraft-requirements:834) stay blocked on it too.
-
-<details><summary>verification</summary>
-
-The hole is live and I reproduced it at HEAD. Witness (`type Cat = {name: string, lives: i32}` / `type Animal = {name: string}` / `function widen(a: Animal[]) { a[0] = {name:"dog"} }` / `widen(cats)`): `vl check` rc 0 (one HINT, no error), `vl build` rc 1 — `type mismatch: expected (ref $type), found (ref $type) (at offset 0x14d)`, i.e. `vl check`-clean invalid wasm exactly as filed. No machinery exists: `grep -rni "inexact\|variance" compiler/*.vl` → zero hits (only 're-readable' false positives). ROADMAP:780/:782 both still ⬜ for A8 and A9. `grep -n "A8\|A9" DECISIONS.md` → only :116 and :250, both of which point AT the open A9 question rather than answering it. Adversarial check on the containing file: docs/internals/compiler-code-review.md IS stale in its neighbors — its 'In flight' N18 wasmEmit split has shipped (compiler/emit_base.vl, emit_classify.vl, emit_rep.vl, emit_sections.vl … all exist) — but N5 itself is not stale; the behavior still reproduces.
 
 </details>
 
@@ -141,29 +112,6 @@ Repro: `const d: f64 = 100000000000.0; const i = d as i32` → `vl run` rc 1, `E
 
 </details>
 
-### O-release-rung-default
-
-**Which optimizer rung IS the release profile — `-O3`, `-O`, or per-program**  
-`docs/internals/p9-inlining-notes.md:64 (corroborated at docs/internals/perf-landscape.md:166-172 and :804-808)`
-
-**The question.** Genuinely open as asked, minus one clause: the 'cheap fix that should precede any further -O3-based recommendation' (the -O column + the two distinct flags) already shipped in bench/run.sh, so the question is now 'given a three-rung harness that exists but has not yet produced an authoritative recorded sweep, does -O3 stay the single named release profile, does -O take it, or is the answer per-program?' The melt evidence for keeping -O3 is one fixture (union-box-branch-local 4/4/2), not two.
-
-**Options.** (a) KEEP `-O3` as the release profile — retains its large wins (`lambda-hot` 2.2x better than `-O`, `dispatch-table` 1.43x, `mandelbrot` 1.28x) and keeps the shipped `RELEASE_PASSES`/melt goldens untouched; cost: `arrays/sort-heap` stays 1.32x (landscape §2.4a) to 1.43x (p9) slower than `-O` and a dead heat with the UNOPTIMISED build, and the rung is ~50% slower to produce and ~1.3 KB bigger than `-O` on the 1.1 MB compiler (19.5s/919,547 B vs 13.1s/918,258 B, opt-profile §5). (b) MAKE `-O` THE RELEASE RUNG — recovers sort-heap, cheaper and smaller on large modules; cost: forfeits `-O3`'s wins where they are biggest and loses the melt rows that only the closed-world/repeat rung reaches (`union-box-branch-local` 4→2 and `list-wrapper-push` 4→2 are `-O3`-only, opt-profile §2/§3). (c) SHIP BOTH AND MAKE THE BEST RUNG DISCOVERABLE (add the `-O` column to `run.sh`, publish per-program guidance) — honest to the measurement, but pushes a per-program measurement onto every user and leaves 'the release profile' unnamed. NOTE opt-profile §7.6's ruling does NOT cover this: it adopted (d) report-upstream for the loop-rotation class, and the landscape explicitly separates sort-heap as 'a profile question rather than an upstream one'.
-
-**Blocked while unruled.** Every `-O3` multiple quoted in perf-landscape §3/§4 has to be read as 'versus unoptimised, never versus the best we can do', so no further `-O3`-based recommendation can be made; and P9 (emitter-side inlining) cannot be scheduled or dropped, since it is worth ~5.6% at the default rung and exactly zero at `-O` and above.
-
-**Reversible?** Yes, cheaply in code — the rung is `RELEASE_PASSES` in `scripts/vl-host/src/main.rs` plus goldens in `tests/selfhost_native_release_test.ts`. What does not reverse is guidance already published and artifacts already shipped at the previous rung, and each flip costs a re-pin of the melt and loop-shape tables.
-
-**Cost if taken.** One line: `RELEASE_PASSES` at scripts/vl-host/src/main.rs:1493 (`OPT_PASSES` at :1471 is the other rung). Goldens do NOT need re-measuring — MELT_TABLE (8 fixtures) and LOOP_TABLE (3 fixtures) in tests/selfhost_native_release_test.ts:102-175 already carry none/-O/-O3 columns, so a flip re-labels which column is authoritative. Published guidance would move in docs/internals/cli-design.md:311, opt-profile-design.md (title + §5), webcraft-requirements.md:502-505 and P1.4's 'ship at vl build -O3' decision order. Measured rung deltas on the 1.1 MB compiler (opt-profile §5): -O 918,258 B / 13.1 s vs -O3 919,547 B / 19.5 s.
-
-**Cost of waiting.** sort-heap keeps handing back a 1.32x (perf-landscape §2.4a: 854/648/837) to 1.37x (bench/findings/three-rung-sweep.tsv: 858/602/827) win, and the latest post-P5 sweep still records it only as default 904.0 / -O3 918.9 with no -O column, so the best rung is unrecorded suite-wide. Every -O3 multiple in perf-landscape §3/§4 must be read as 'versus unoptimised'. P9 cannot be scheduled or dropped (5.6% at the default rung, exactly zero at -O and above).
-
-<details><summary>verification</summary>
-
-(1) `git log --oneline -S'RELEASE_PASSES' -- scripts/vl-host/src/main.rs` -> ONE commit, ad9734ac (#1318); `sed -n '1493p' scripts/vl-host/src/main.rs` -> `const RELEASE_PASSES: &[&str] = &["--closed-world","-O3","--gufa","-O3"];` — never changed, so no commit closed it. (2) `grep -rn -i 'ruling' docs/internals/opt-profile-design.md` -> only §7.6, whose text is 'The profile is not wrong as shipped... RELEASE_PASSES and OPT_PASSES are unchanged' for the LOOP-ROTATION class, where both rungs are equally bad; perf-landscape.md:806 separates the sort-heap class explicitly ('That one IS a profile question rather than an upstream one'). (3) `sed -n '352,365p' ROADMAP.md` -> 'Do not answer this ask with a single recommended flag until the per-program split is either fixed or documented as the answer.' — a live instruction, not a ruling. (4) BUT one third of option (c) HAS SHIPPED: `sed -n '318,325p;612,624p' bench/run.sh` -> the harness now builds `vl-build-O` and raises `OPT-LOSES` / `O3-WORSE-THAN-O` as distinct flags (landed in 7f457f27), so perf-landscape §2.4a's headline 'THE HARNESS HAS NEVER BUILT -O' and p9-inlining-notes.md:94 'Adding the -O column is the fix' are STALE against HEAD. (5) The recorded sweep still predates it: `grep -c 'vl -O |' bench/results/summary.md` -> 0; header is `| benchmark | rust | vl | vl -O3 | deno |`. (6) Two filed melt quotes are wrong: MELT_TABLE (tests/selfhost_native_release_test.ts:102-131) reads `list-wrapper-push` none/O/O3 = 6/3/2, not '4 -> 2'; only `union-box-branch-local` (4/4/2) is genuinely -O3-only.
-
-</details>
-
 ### O-default-build-optimizes
 
 **Whether the DEFAULT build path optimizes at all (and whether `vl run` gets a rung flag)**  
@@ -178,6 +126,8 @@ Repro: `const d: f64 = 100000000000.0; const i = d as i32` → `vl run` rc 1, `E
 **Reversible?** Yes — it is a CLI default in `scripts/vl-host/src/main.rs:1355-1372`. But it moves every build's wall clock including CI and the self-compile, so a flip in either direction is felt project-wide immediately, and artifacts already distributed under the old default are not retroactively changed.
 
 **Cost if taken.** (b) is the 4-line dispatch at scripts/vl-host/src/main.rs:2399-2404 plus the soft-no-op path at :1507-1521 becoming load-bearing; (c) is one arm in run_cmd's arg loop (:1637-1651). Wall-clock cost is measured: +220 to +395 ms per build (summary.md compile-time table). No line-level estimate is recorded in any doc; the docs price it only as 'a CLI default'.
+
+**New evidence (2026-08-18), not in the filing: the shipped compiler is itself an unoptimised artifact.** `build/vl-compiler.wasm` is **1,224,039 B**, against 918,258 B at `-O` and 919,547 B at `-O3` for the same module — so the seed every self-compile runs through has never had `wasm-opt` applied to it. This cuts both ways and should be weighed rather than quoted: it is the strongest single argument that option (a) is already the de-facto answer and nothing has caught fire, AND it is where option (d)'s emitter work actually lands (P9's 5.6% applies to the compiler precisely because the compiler sits at the default rung — see the `O-release-rung-default` ruling).
 
 **Cost of waiting.** Every default build and every `vl run` (which has no rung flag at all) keeps paying collections/struct-field 2.92x and algorithms/lambda-hot 3.01x, filed at perf-landscape §6 as a DEFECT against the project's own 'users must not need hacks' law. P9's disposition stays undecided, since 'a default-rung ergonomics fix' is only quotable once the default rung is settled.
 
@@ -441,3 +391,146 @@ must learn — colliding with the project's own rule that users must not need ha
 performance. The principled fix is ROADMAP B6b's backing-pointer LICM, which webcraft P1.4's
 measurement has now PRICED at 89% of the view-kernel excess. See the `buffer-scalar-arg-accessors`
 entry above for the full trade-off.
+
+### `O-release-rung-default` — RULED 2026-08-18: `-O3` stays
+
+**Ruling: keep `-O3` as the named release profile. Close the ask by PUBLISHING the split, not by
+flipping the rung.** `RELEASE_PASSES` is untouched.
+
+The three-rung sweep decides it once the rows are read at a materiality floor instead of counted.
+Computed from `bench/findings/three-rung-sweep.tsv` (46 rows, columns none / `-O` / `-O3`):
+
+| | rows | extremes |
+|---|---|---|
+| `-O3` materially better (>5%) | **12** | `lambda-hot` **2.23x**, `dispatch-table` 1.43x, `mandelbrot` 1.28x |
+| `-O3` materially worse (>5%) | **4** | `sort-heap` **1.37x**, then 1.06x / 1.06x / 1.05x |
+| inside ±5% | 30 | — |
+
+The nominal 23/23 win/loss split that the filing leans on is noise: `-O3` wins materially three
+times as often as it loses, its largest win exceeds its largest loss, and three of its four losses
+are ~5%. One row, `sort-heap`, carries the entire case against, so it is documented as the named
+exception rather than being allowed to set the default.
+
+This satisfies ROADMAP `:353`'s standing instruction — *"Do not answer this ask with a single
+recommended flag until the per-program split is either fixed or documented as the answer"* — by
+taking the second branch. Remaining work is documentation, not code: add the `-O` column to
+`bench/results/summary.md` (still absent, `grep -c 'vl -O |'` → 0, so every `-O3` multiple in
+perf-landscape §3/§4 still reads as *versus unoptimised*), and record `sort-heap`'s shape in
+`cli-design.md`.
+
+**Direction, recorded because it changes how later perf work is graded:** optimization should
+eventually be internalized so it can be applied selectively — keeping wins where they are, avoiding
+regressions where they are not. That work is gated on whether it meaningfully improves **overall
+self-compile time**; per-function wins do not qualify. See the P9 note below, which is the first
+item this criterion decides.
+
+**Consequence for P9, which this ruling was blocking.** The filing parks P9 as un-schedulable
+because it is "worth ~5.6% at the default rung and exactly zero at `-O` and above". That framing
+assumed the compiler is an optimized artifact. It is not: `build/vl-compiler.wasm` is **1,224,039 B**,
+and the same module measures 918,258 B at `-O` / 919,547 B at `-O3` — the shipped seed is
+UNOPTIMISED, so the compiler runs at exactly the rung where P9 is worth 5.6%. P9 is therefore the
+first concrete instance of the internalization direction above, and 5.6% of self-compile is the
+number to judge against the "meaningfully" bar. Schedule it or drop it on that number; do not leave
+it parked.
+
+### The binaryen inline budget (C3's second knob) — RULED 2026-08-18: a flag, never a default
+
+**Ruling: expose the inline budget as a build flag; do not put it in `RELEASE_PASSES`.**
+
+`--always-inline-max-function-size=60` melts the view descriptor outright — `axpy-view`
+1.736 → 0.636 ns/elem in a kernel module 113 B *smaller* — but costs the 1.16 MB compiler module
+**+82% bytes** (955,265 → 1,740,871) and **+127% `wasm-opt` time** (22 s → 50 s) for no self-compile
+speedup at all. `--flexible-inline-max-function-size=60` is the shippable half: 1.45x for +28%
+compiler size.
+
+Same shape and same answer as **C10** (the names section): a large fixed tax on every module to buy
+a win only some modules want, so the consumer passes the flag. Worth keeping next to the flag when
+it is documented: the hand-written spelling needs no flag and beats both budgets — hoist
+`byteAddrF32(0)` and `.length`, then bare `__load_f32__`/`__store_f32__`, 0.296–0.500 ns/element at
+all three rungs — so the flag is a convenience over an existing route, not the only one.
+
+**Filing note.** This had been ruled in conversation before and never written down, which is the
+exact failure mode this index exists to catch; it resurfaced as an open blocker on the workboard.
+Recorded here and in `DECISIONS.md`.
+
+### `N5-variance-defaults-and-surface` (workboard C8) — RULED 2026-08-18: inferred, no surface
+
+**Ruling: the A8/A9 defaults are as the owner already wrote them; the surface is NONE in v1; there
+is nothing to migrate.** Parameters Inexact by default and values Exact (A8); `Readable`/`Writable`
+applied automatically during parameter inference (A9), with no spelling an author writes — i.e.
+`docs/guide/language-todo.md:15-20` is promoted from a TODO note to the decision.
+
+**The filing's framing is STALE and is corrected here.** It says the choice "decides which programs
+that type-check TODAY start failing". Measured at HEAD (2026-08-18), that population is empty of
+*working* programs — there is no spelling in which a subtype container reaches a supertype parameter
+and the program runs:
+
+| shape | at HEAD |
+|---|---|
+| `Cat[]` → `Animal[]`, writing body | loud reject (#1456's width gate) |
+| `Cat[]` → `Animal[]`, read-only body | loud reject — same gate |
+| same, un-annotated source | loud reject — same gate |
+| `i32[]` → `(i32\|null)[]`, writing body | `vl check` **rc 0**, then invalid wasm |
+| `i32[]` → `(i32\|null)[]`, read-only body | `vl check` **rc 0**, then invalid wasm |
+| `K[]` → `string[]` | `vl check` rc 0, then invalid wasm |
+
+So the feature splits, and only one half was ever this ruling's business:
+
+* **The Writable half is a free win.** `poke(xs)` pushing `null` into an `i32[]` is check-clean
+  invalid wasm today; Writable inference makes it a loud reject. Cells move UP a column, nothing
+  that works breaks.
+* **The Readable half is not blocked on this ruling at all** — it is blocked on REPRESENTATION.
+  `peek(xs)` reading an `i32[]` as `(i32|null)[]` is sound and the checker already agrees ("type-valid
+  … but not yet supported by codegen"); the emitter cannot express it, because the two are different
+  WasmGC array types with no conversion. Readable inference would accept more programs than the
+  emitter can build.
+
+**Why an annotation is wanted later, recorded so the reason survives the deferral:** with inference
+alone, variance becomes a property of a function's BODY, so adding a `.push` to a body silently
+breaks every caller and the error lands at the call site rather than at the change. That is an
+API-stability argument that only bites once there are cross-module consumers, and the annotation is
+additive — so it waits rather than being designed now.
+
+Unchanged by this ruling: the 55 residual cells (43 depth, 10 field-nested width) stay check-clean
+invalid wasm on purpose. Re-verified at HEAD — a field-nested width case with an annotated source
+emits an invalid module while the identical program with an un-annotated literal source **prints
+`c`**, so rejecting them would reject working code. That is a representation question, not a
+variance one.
+
+### `function g() { return voidCall() }` — RULED 2026-08-18: allowed; `void` becomes a unit type
+
+**Ruling: allow it, as one of four consequences of making `void` a real type in the lattice.** Full
+rationale in `DECISIONS.md` (Types & semantics). In brief: keep the `void` spelling, treat it as a
+unit type, and therefore (a) `return <void expr>` in a void function lowers to `expr; return`;
+(b) function values are covariant in a void return, so `() => i32` is assignable to `() => void`;
+(c) a type parameter may instantiate at void and the monomorphizer emits an empty result;
+(d) void stays non-storable — no `void[]`, no `void | i32`, no void map value.
+
+**This was NOT purely a design-change request, which is why it is ruled rather than declined.**
+Probing it turned up a live check-clean-invalid-wasm cell with no pin and no doc mention:
+
+```vl
+function side() { print("hi") }
+function call<T>(f: () => T): T { return f() }
+call(side)          // vl check: clean
+                    // vl run:  Invalid input WebAssembly code at offset 305:
+                    //          type mismatch: current function requires result type [i32]
+                    //          but callee returns []
+```
+
+The `T = i32` control runs fine. So "keep rejecting" was never the free option: it would still
+require a check-time rejection at instantiation, which costs the ability to use any generic
+combinator with a void callback. Consequence (c) is the fix, and it is the same lowering (a) needs.
+
+Two things the ruling deliberately does NOT do. It does not unify `void` with `null` — `T | null` is
+the absence idiom in the errors-as-values design, so a void function returning `null` would make
+`if writeFile(p) == null` read as a failure check that is unconditionally true; no such
+void≡null decision was ever recorded, so this is a fresh call, not a reversal. And it does not
+weaken #1435's `void | i32` join gate: (d) keeps it, and re-justifies it as "unit has no
+representation" rather than an ad-hoc refusal.
+
+**Bonus closed by (b): the `done()` wart.** `beforeEach(() => { hits = hits + 1 })` fails today with
+`argument 1: expected () => void, got () => i32`, and `std:test` ships a void no-op `done()` purely
+as the documented workaround (`vl-test-design.md:166`, filed as a follow-up at `ROADMAP.md:746`).
+Void-return covariance retires both, without disturbing the assignment-is-an-expression rule that
+produces the `i32`.

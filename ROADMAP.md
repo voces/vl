@@ -351,6 +351,18 @@ which is why they closed in order rather than in parallel.
 - 🟡 **P1.3 Optimization defaults** — the PROFILE ships (#1318): `vl build -O3` runs
   `wasm-opt --closed-world -O3 --gufa -O3`, `-O` is unchanged, and a missing `wasm-opt` stays a soft
   no-op.
+  **RULED 2026-08-18 — both knobs, see `DECISIONS.md` and `open-rulings.md`'s Ruled section.**
+  `-O3` STAYS the release rung: at a 5% materiality floor the 46-row three-rung sweep has `-O3`
+  better on **12** rows and worse on **4** (`sort-heap` 1.37x, then three at ~1.05x), so the nominal
+  23/23 split is noise and one row is not allowed to set the default. The standing instruction below
+  — *do not answer with a single recommended flag until the split is fixed or documented as the
+  answer* — is satisfied by **documenting it**: `sort-heap` becomes the named exception in
+  `cli-design.md`, and `bench/results/summary.md` gains the `-O` column it still lacks. The binaryen
+  inline budget is a **build flag, never a default** (+82% bytes / +127% `wasm-opt` time on the
+  compiler for zero self-compile gain; same shape as C10). **Direction:** internalize optimization so
+  it can be applied selectively, gated on OVERALL self-compile time — which makes P9 decidable, since
+  the shipped seed `build/vl-compiler.wasm` is 1,224,039 B, i.e. UNOPTIMISED, exactly the rung where
+  P9 is worth 5.6%.
   **THE ASK IS "OPTIMIZATION DEFAULTS" AND THE HONEST ANSWER IS THAT THE BEST RUNG IS PER-PROGRAM.**
   `bench/run.sh` built the default and `-O3` and **never plain `-O`**, so every "`-O3` recovers Nx"
   figure in `perf-landscape.md` means *versus unoptimized*, not *versus the best rung available* — a
@@ -743,7 +755,9 @@ in-language GC knobs.
   three divergences from the charter (brain in `compiler/cli.vl` not `std/test/runner.vl`;
   compilation stays VL-side and only EXECUTION crosses; `.only` is not spellable in VL, so
   runner-side `-t` + `itSkip` are the selection story). Chartered follow-ups below still stand,
-  plus: void-return covariance on function values (the `done()` wart), f64 failure rendering,
+  plus: ~~void-return covariance on function values (the `done()` wart)~~ **RULED 2026-08-18** —
+  covariance is consequence (b) of `void` becoming a unit type, which retires `done()` outright
+  (`DECISIONS.md`, Types & semantics); f64 failure rendering,
   per-test timings/timeouts, `--no-capture`, `dot`/`json` reporters.
   Original charter entry: `docs/internals/test-runner-design.md` (jest-shaped `describe`/`it`/`expect`
   over `std:testing`; two-phase registration, host-driven `vlt*` protocol; `*.test.vl` discovery
@@ -829,7 +843,19 @@ in-language GC knobs.
   types (the forward direction of the same correlation).
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
+  **Defaults + surface RULED 2026-08-18** — see A9.
 - ⬜ **A9. Readable / Writable variance.** Applied automatically during parameter inference. (TODO.md)
+  **RULED 2026-08-18: inferred, with NO annotation surface in v1, and nothing to migrate.** The
+  migration half was settled by measurement, not preference — the population an A9 tightening could
+  break is empty of *working* programs: every subtype-container shape already either rejects loudly
+  (struct width, behind #1456's gate, including read-only bodies and un-annotated sources) or is
+  already check-clean invalid wasm (`i32[]` → `(i32|null)[]`, `K[]` → `string[]`, in BOTH directions).
+  So the **Writable** half only moves cells up a column, while the **Readable** half is blocked on
+  REPRESENTATION rather than on this ruling (the two array types are distinct WasmGC types with no
+  conversion; the checker already says "type-valid … but not yet supported by codegen"). An
+  annotation is wanted later and is additive: with inference alone, variance is a property of a
+  function BODY, so adding a `.push` silently breaks callers with the error at the call site — an
+  API-stability argument that only bites once there are cross-module consumers.
 - 🟡 **A10. Parametric types / generics.** REMAINING: same `map`/`filter` generics for `Map`/`Set`
   (B6a); **const generics** (numeric/value type parameters, e.g. `Decimal<10, 8>` /
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized
