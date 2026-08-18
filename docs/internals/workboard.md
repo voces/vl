@@ -772,6 +772,40 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## PERF — the shipped seed is UNOPTIMISED, and it is worth 3.3% (2026-08-18)
+
+Fell out of the `O-release-rung-default` ruling: `build/vl-compiler.wasm` is **1,224,039 B** while
+the same module measures 918,258 B at `-O`, so the compiler every `vl` invocation runs through has
+never had `wasm-opt` applied to it. Measured rather than assumed, because the size gap invites a
+much larger claim than the timing supports.
+
+| rung on the SEED | size | self-compile | delta |
+|---|---|---|---|
+| none (shipped) | 1,225,945 B | **1,521 ms** | — |
+| `-O` | 1,004,649 B | **1,471 ms** | **−3.3%** |
+| `-O3` (RELEASE_PASSES) | 1,004,825 B | **1,479 ms** | **−2.8%** |
+
+Interleaved min-of-5, all three seeds alternating within each round, after a warm run each — the
+first uninterleaved pass reported **−9.4%** and that was warm-up drift, not signal. **Behaviour is
+identical and verified, not assumed**: all three seeds self-compile to a BYTE-IDENTICAL module
+(sha256 `38efab35dec8d442`), and `cases_wasm` is 1,937/0 under the `-O3` seed. `-O` beating `-O3` on
+this workload is the `sort-heap` shape again — the compiler is array- and string-heavy.
+
+**Two things worth carrying:**
+
+* **It is not a free pipeline change, and that is why this is filed rather than taken.** Publishing
+  an OPTIMISED seed puts it out of byte-agreement with what `refresh-compiler.sh` produces from
+  source, so the fixpoint gate — which is a BYTE equality, `stage3 == stage4` — would need to be
+  re-stated as behaviour-equality or the optimizer would have to run inside the refresh. The
+  distributed `vl` binary would also shrink by ~220 KB, since the seed is embedded. Owner call, with
+  the numbers now attached.
+* **A CROSS-CHECK ON P9 that the P9 row should carry.** Binaryen's ENTIRE pipeline over the whole
+  compiler is worth 2.8–3.3% on the self-compile. P9 is filed at ~5.6% "at the default rung". Those
+  are different workloads — P9's number is generated-program runtime on the bench suite, not
+  compile time — but a single emitter-side pass claiming nearly twice what all of `wasm-opt` buys
+  on this workload should be re-derived on the self-compile before it is scheduled against the
+  ruling's "overall self-compile time" bar.
+
 ## C8's Writable half, shipped: the container-ELEMENT storage class (2026-08-18)
 
 The A9 ruling said the Writable half is a free win — check-clean invalid wasm becoming a loud
@@ -865,7 +899,7 @@ row filed as "needs a ruling, not a brief" still deserves one probe.
 | row | item | measured | status | eff | risk |
 |---|---|---|---|---|---|
 | **D15** | **`T` instantiated at `void` in a generic emits invalid wasm** | `vl check` rc 0, module fails to validate: `requires result type [i32] but callee returns []`. Reproduces on `call(side)` and `call(() => side())`; `T = i32` control is clean. No fixture anywhere in `tests/cases/`, no mention in any design doc | **OPEN — check-clean invalid wasm.** The fix is consequence (c) of the void ruling: the monomorphizer emits an EMPTY result for a void instance. Same lowering the surface change needs, so brief them together | S–M | low |
-| **P9** | **emitter-side inlining — schedule it or drop it, do not park it** | filed as un-schedulable because it is "worth ~5.6% at the default rung and exactly zero at `-O` and above". **That framing assumed the compiler is an optimized artifact and it is not**: `build/vl-compiler.wasm` is **1,224,039 B** against 918,258 B at `-O` / 919,547 B at `-O3` for the same module — the shipped seed has never had `wasm-opt` run on it, so the compiler sits at exactly the rung where P9 is worth 5.6% | **DECIDABLE NOW.** The `O-release-rung-default` ruling sets the bar — internalized optimization is judged on OVERALL self-compile time, not per-function wins — and 5.6% of self-compile is the number. Take it or drop the row; parking is no longer an option | M | med |
+| **P9** | **emitter-side inlining — schedule it or drop it, do not park it** | filed as un-schedulable because it is "worth ~5.6% at the default rung and exactly zero at `-O` and above". **That framing assumed the compiler is an optimized artifact and it is not**: `build/vl-compiler.wasm` is **1,224,039 B** against 918,258 B at `-O` / 919,547 B at `-O3` for the same module — the shipped seed has never had `wasm-opt` run on it, so the compiler sits at exactly the rung where P9 is worth 5.6% | **DECIDABLE NOW.** The `O-release-rung-default` ruling sets the bar — internalized optimization is judged on OVERALL self-compile time, not per-function wins — and 5.6% of self-compile is the number. **RE-DERIVE IT FIRST** — the perf round above measures all of `wasm-opt` over the whole compiler at 2.8–3.3% on the self-compile, so a single emitter pass filed at 5.6% is quoting a different workload (generated-program runtime on the bench suite) and has never been measured on this one | M | med |
 
 ### What the void ruling also retires
 
