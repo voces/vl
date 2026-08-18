@@ -772,6 +772,40 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## FINAL SURVEY — the defect queue is empty (2026-08-17, master `86703919`)
+
+Every remaining OPEN row was probed on the tip. **Nothing silent is left.**
+
+| row | tip |
+|---|---|
+| **D1d** — a nested fn capturing a narrowed union binding, or a litunion ATOM | **RETIRED** — both shapes print correctly |
+| **D1g** — a monomorphized instance pinned to the ATOM rep given a string-repped litunion arg | **RETIRED** — prints `x` |
+| **D1h** — a hole parameter with no constraining usage | **LOUD** emit reject — correct column |
+| **D1f**, **D9**, `==` over two boxes, the struct-arm rows | **LOUD** — correct column, and `==` is pinned "not supported YET" by three fixtures |
+| **D2** (numeric litunions), **G3** (UTF-8 `string`), **G4** (linear-memory scalar arrays) | **FEATURES**, not defects — large, and each wants an owner priority call |
+| **F5**, **H1**, **H2**, **H3** | process/infra |
+| **B8**, **D3**, **D4**, **D5**, **D6**, **E7**, **E8** | shipped or closed above |
+
+### What this cycle closed
+
+Both silent inventories are at **zero**. `silent-class-inventory.md` and `-2.md` between them graded
+5,180 cells across nine outcome columns; every silent family in the second, and the compiler-trap
+column of both, is now retired or fixed. The last four silent populations shipped as **#1467** (D5/D6
+of the inventory), **#1469**, **#1470** and **#1471** (board D6), with **#1472** closing the last
+user-facing render leak.
+
+### What remains, and why I am not briefing it
+
+* **Loud-column limitations.** Correct outcome column by construction: the program is rejected and the
+  user is told why. Ranked below silent work throughout this cycle and still are.
+* **Features** (D2, G3, G4). Each is a multi-slice change to the representation or the runtime, and
+  **each wants a priority call rather than an agent** — G3 in particular changes what `string` IS.
+* **Four owner rulings**, unchanged and now the actual blockers: **C3** (recommendation: a build flag,
+  not a default flip — always-inline gives ZERO self-compile speedup for +789 KB and +33 s of
+  `wasm-opt`), **C8**, **O-release-rung-default**, and whether `function g() { return voidCall() }`
+  should compile (#1435 took the reject deliberately under a reject-more mandate, so reversing it is a
+  design change, not a defect fix).
+
 ## E8 re-derived and briefed — 4 occurrences, 3 shapes (2026-08-17)
 
 Scanned the whole corpus on the tip (`vl check tests/cases`, 13,510 diagnostic lines). The board
