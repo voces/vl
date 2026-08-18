@@ -81,7 +81,7 @@ const noSiblings = () => undefined;
 
 Deno.test("displayable-type: absence markers are filtered, elision is not", () => {
   // ABSENT — never displayable.
-  for (const s of ["<error>", "<none>", "<?>", "(<error>) -> string", "<none>?"]) {
+  for (const s of ["<error>", "<none>", "<?>", "(<error>) => string", "<none> | null"]) {
     assertEquals(isDisplayableType(s), false, `absent marker ${s}`);
   }
   // Empty is not a type either.
@@ -93,13 +93,13 @@ Deno.test("displayable-type: absence markers are filtered, elision is not", () =
       "string | i32",
       "{head: i32, tail: {head: …, tail: …}[]}", // depth cap: a REAL type, elided
       "_ | _", // an inference hole: present + polymorphic, not our business
-      "(_) -> _",
+      "(_) => _",
     ]
   ) {
     assertEquals(isDisplayableType(s), true, `present ${s}`);
   }
   // The hover-chain filter maps undisplayable → undefined so the caller falls through.
-  assertEquals(displayableType("(<error>) -> string"), undefined, "chain drops");
+  assertEquals(displayableType("(<error>) => string"), undefined, "chain drops");
   assertEquals(displayableType("i32"), "i32", "chain keeps");
   assertEquals(displayableType(undefined), undefined, "chain passes undefined");
 });
@@ -137,7 +137,7 @@ Deno.test({
 print(foobar({ bar: "okie" }))
 `;
   // The annotation does not resolve (`any` is not a VL type), so the checker
-  // types the parameter `TyErr`. Hover used to read `(<error>) -> string`; it is
+  // types the parameter `TyErr`. Hover used to read `(<error>) => string`; it is
   // now suppressed rather than printing a type VL does not have.
   assertEquals(await hoverAtFnName(checker, src), undefined, "hover suppressed");
 
@@ -237,7 +237,7 @@ Deno.test({
   );
   assertEquals(
     await hoverAtFnName(checker, unionSrc),
-    "(boolean) -> string | i32",
+    "(boolean) => string | i32",
     "resolvable union hover survives",
   );
 
@@ -258,7 +258,7 @@ Deno.test({
   assertEquals(await inlayLabels(checker, addSrc), [": i32"], "all-resolving params");
   assertEquals(
     await hoverAtFnName(checker, addSrc),
-    "(i32, i32) -> i32",
+    "(i32, i32) => i32",
     "all-resolving hover",
   );
 });
@@ -338,14 +338,14 @@ Deno.test({
   const checker = loadWasmChecker(SEED, () => {})!;
   const root = new URL("./cases/", import.meta.url).pathname;
 
-  // The single measured exception: `let _x = null` renders `: <none>?` on a file
+  // The single measured exception: `let _x = null` renders `: <none> | null` on a file
   // with no error diagnostic. The hint it loses was itself unspellable (VL spells
   // that type `null`), so dropping it is the fix, not a regression. Pinned by
   // NAME so a second such file fails this test instead of hiding in a count.
   // Second measured exception: an un-annotated `const fu = () => { return [] }`
-  // renders `() -> <none>[]`. The empty literal's element type is never
+  // renders `() => <none>[]`. The empty literal's element type is never
   // constrained, so the array has no element type to name — and VL has no
-  // spelling for one, exactly as it has none for the `<none>?` above. The
+  // spelling for one, exactly as it has none for the `<none> | null` above. The
   // program is legal (that is what A-compiler-trap fixed; it used to kill the
   // compiler outright), so the file is diagnostic-free and the hint is dropped
   // on a clean file. Dropping an unspellable hint is the filter working.
@@ -421,5 +421,5 @@ Deno.test({
   const okSrc = `function g(a: i32) {\n  return a\n}\nprint(1)\n`;
   const okBinds = await checker.scopeAt(okSrc, "/tmp/x.vl", noSiblings, 3, 0);
   const gEntry = scopeCompletionsFromBindings(okBinds).find((c) => c.name === "g");
-  assertEquals(gEntry?.detail, "(i32) -> i32", "healthy detail survives");
+  assertEquals(gEntry?.detail, "(i32) => i32", "healthy detail survives");
 });
