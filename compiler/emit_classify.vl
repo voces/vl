@@ -13934,15 +13934,76 @@ function plusChainHasStrLit(ix: i32) {
   false
 }
 
-// The struct field-type CODE for an ANONYMOUS-shape field, from its literal VALUE
-// (an anonymous literal has no `type` annotation to read): a number/boolean is i32
-// (`0`), a string literal is a string ref (`3`), a function VALUE is a closure
-// fat-pointer (`14` — a `(ref $cloStruct)`, the same kind #306 uses for a closure
-// cell). A function value is either a FuncDecl literal (an inline lambda) or a bare
-// Ident naming a function. Anything else (a nested literal, a call, …) returns -1 —
-// the whole shape is then left un-interned and the literal fails loudly downstream.
+// The struct field-type CODE for an ANONYMOUS-shape field — TWO LADDERS, asked in this
+// order, and the order is the whole design:
+//
+//   1. the field value's SYNTAX (`anonFieldCodeSyn` below). A literal knows its own rep,
+//      including the CONTEXT-ADOPTED reps the type alone cannot name — a small integer
+//      literal in an f32 field re-encodes exactly and codes 24, not 0.
+//   2. the type the CHECKER RECORDED on the value node, resolved through `nameFieldCode`,
+//      which is the ONE HOME every ANNOTATED field position already resolves through.
+//
+// Rung 2 is what makes an ordinary un-annotated literal compile. `const a = { legs: 4,
+// purr: v }` — a bare variable in a field — had no syntactic rep, so the whole shape went
+// un-interned and the binding reported `emitProgram: ref valtype with no interned shape`,
+// while `{ legs: 4, purr: 1 + 1 }` (the same shape, a constant-foldable field) lowered
+// fine. The axis was never the field COUNT or the field TYPE: it was whether the ladder
+// could read the value's rep off its syntax, so an ANNOTATION anywhere rescued the program
+// by interning the shape on the other pass (`collectAnnShapes`) and leaving this one
+// nothing to do.
+//
+// A GENERIC's structural-return literal (`{ first: b, second: a }`) still declines, and it
+// declines for the right reason rather than by accident: `collectAnonShapes` runs in
+// `collectS`, BEFORE `monomorphize`, so `b`'s recorded type is the unsolved type PARAMETER
+// and the checker has no name for it (`nodeTyName` answers "" for a `TyVar`). Such a
+// literal keeps matching its instance-pinned ANNOTATION shape, which is what it must do.
+// A field whose type neither ladder can name still leaves the whole shape un-interned and
+// the literal still fails loudly downstream — never a trap.
 export function anonFieldCode(valIx: i32) {
   if valIx < 0 { return -1 }
+  const syn = anonFieldCodeSyn(valIx)
+  if syn >= 0 { return syn }
+  // The recorded type's EMIT NAME, or "" for a type the checker cannot spell here (an
+  // unsolved parameter, a hole, a union, a map — the shapes `nodeTyName` deliberately
+  // keeps to their own paths). `nameFieldCode` returns -1 for a name it cannot code, so a
+  // miss on either half is the same -1 the syntax ladder alone used to give.
+  const tn = nodeTyName(valIx)
+  if tn == "" { return -1 }
+  const c = nameFieldCode(tn)
+  if !anonCodeIsSelfContained(c) { return -1 }
+  c
+}
+
+// Is field code `c`'s wasm slot decided by the CODE ALONE, with no COMPANION column beside
+// it? That is the admission rule for the recorded-type rung of `anonFieldCode`, and it is a
+// property of this PATH rather than of the code: a shape interned here fills
+// `sFieldElemName` from `anonFieldElemName`, which has an answer for a MAP field (its value
+// name) and a NESTED-STRUCT field (the inner shape's table name) and "" for everything
+// else. A code that needs a name and is minted with "" interns a field the emitter cannot
+// resolve an element heap type for — `emitProgram: ref-list field element type is not
+// interned`, which is what admitting code 5 (`S[]`) from this rung measured as, on 24 grid
+// cells and 2 corpus files.
+//
+// So the list below is the codes whose slot is a module-global heap type or a raw valtype:
+// the scalars (0 i32/boolean, 17 f64, 23 i64, 24 f32), the string ref (3), the five
+// scalar-backed list wrappers (4 i32-list, 6 string-list, 25 f64-list, 26 i64-list,
+// 27 f32-list), and the closure fat pointer (14, the mono `$cloStruct` — the code the
+// SYNTAX rung already mints for a bare function name, with the same empty companion).
+// Every other code — the ref list, the nested struct, the union box, the map, and every
+// nullable niche over them — declines here and keeps failing loudly, exactly as it did
+// before this rung existed. Widening the set means widening `anonFieldElemName` in the
+// same change, not relaxing this gate.
+function anonCodeIsSelfContained(c: i32) {
+  if c == 0 || c == 3 || c == 17 || c == 23 || c == 24 { return true }
+  if c == 4 || c == 6 || c == 25 || c == 26 || c == 27 { return true }
+  c == 14
+}
+
+// The SYNTAX half of `anonFieldCode` — the field value's own literal form. Kept separate
+// so the recorded-type fallback above cannot shadow a context-adopted literal rep: every
+// arm here is a fact about the LITERAL that the checker's recorded type either does not
+// carry or carries less exactly.
+function anonFieldCodeSyn(valIx: i32) {
   const e = P.nodes[valIx]
   if e is NumLit {
     // A float `.` literal field (`x: 1.5`) is an f64 slot (code 17) — UNLESS the context
