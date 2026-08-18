@@ -758,6 +758,20 @@ let stSeenStack: i32[] = []
 // shape would otherwise render forever — past a fixed depth it prints `…`.
 let tyToStrDepth = 0
 
+// The TOP-LEVEL atom width of the render the LAST `tyToStrAt` returned — the DISPLAY
+// renderer's `emitNameAtoms`/`nomNameAtoms`, produced BY the renderer instead of
+// re-derived by scanning the finished string. Same invariant as its two siblings: a
+// render gains a top-level `|` at exactly two places (the union arm's join and the
+// nullable arm's ` | null` suffix), and every other arm builds a name whose separators
+// sit inside a grouper or behind a top-level `=>` — ONE atom.
+//
+// It exists so this renderer can reach `arrElemRender` — the ONE array-grouping home the
+// two emit renderers already share — which needs the element's width (D-ARRWIDTH).
+//
+// Not an arena-lifetime sidecar (method note 7): a scalar written on the way out of every
+// return and read by the immediate caller, never carried between programs.
+let tyStrAtoms = 1
+
 // Places already union-SUBTRACTED by a post-guard fall-through in the current
 // scope (one subtraction per place per block — see the guard-clause comment in
 // the IfStmt arm), with per-scope frame marks like the path overlay's.
@@ -6578,8 +6592,12 @@ function nameHasSep(name: string, sep: i32) {
 
 function nameHasPipe(name: string) { nameHasSep(name, '|') }
 
-// D-ARRGROUP — THE ONE HOME of the array-ELEMENT grouping rule, shared by the two
-// renderers. Render the array whose element rendered as `el` and whose element ARENA type
+// D-ARRGROUP — THE ONE HOME of the array-ELEMENT grouping rule, shared by all THREE
+// renderers (the two emit renderers and the DISPLAY renderer `tyToStrGo`, whose own
+// `TyArray` arm was the shortened mirror: no grouping at all, so `(A | B)[]` rendered
+// `A | B[]` — a spelling that parses successfully to `A | (B[])`, a DIFFERENT type, and
+// makes the checker report that a type cannot be assigned to itself).
+// Render the array whose element rendered as `el` and whose element ARENA type
 // is `elTy`: the element is wrapped in grouping parens before the `[]` exactly when the
 // suffix would otherwise re-bind — a FUNCTION element (`((i32) => i32)[]` is an array of
 // functions, whereas bare the trailing `[]` binds into the closure's RESULT, spelling
@@ -6609,9 +6627,25 @@ function nameHasPipe(name: string) { nameHasSep(name, '|') }
 // reaches it. Measured at this site on both channels: see the D-ARRWIDTH section of
 // `docs/internals/destringify-types-program.md`.
 function arrElemRender(el: string, elTy: i32, elAtoms: i32): string {
-  if T.tys[elTy] is TyFunc { return "(" + el + ")[]" }
+  if tyIxIsFunc(elTy) { return "(" + el + ")[]" }
   if elAtoms > 1 { return "(" + el + ")[]" }
   el + "[]"
+}
+
+// Is arena index `ix` a FUNCTION type? TOTAL in `ix`, and that is the whole reason it
+// exists: `-1` is the DECLARED HOLE an empty `[]` element or an unresolved lambda result
+// carries (`tyArrayElemIx`'s note), and `T.tys[-1]` is an out-of-bounds `array.get` that
+// TRAPS the compiler — no diagnostic, no location, just a wasm backtrace
+// (`tests/cases/arrays/lambda-empty-array-literal-return.vl` states that failure shape).
+// The two EMIT renderers never meet the hole because they decline the whole name ("")
+// before the test; the DISPLAY renderer must render every type it is handed, holes
+// included (`<none>`), so it reaches the test with `-1` in hand. Asking here keeps the
+// hole answered once rather than at each `is TyFunc` grouping site.
+function tyIxIsFunc(ix: i32): boolean {
+  if ix < 0 || ix >= T.tys.length { return false }
+  const t = T.tys[ix]
+  if t is TyFunc { return true }
+  false
 }
 
 // The index of a TOP-LEVEL `=>` in `name`, or -1 — the FUNCTION-TYPE marker the parser
@@ -7793,15 +7827,24 @@ function checkInferredMapKey(k: i32, isSet: i32, at: i32) {
 // Renders a type-arena index as a readable type name. Recurses through the arena
 // for object/function/union/nullable. Narrows the `Ty` union only — never `Node`.
 //
-// THE DISPLAY ENTRY IS NOMINAL-FIRST, and the mode bit is what keeps it ONE renderer.
-// Every surface a person reads — hover, inlay, completion, the redundant-annotation
-// hint, every `tErr` message — must spell a type the way its source spells it, so a
-// declared struct is `Cat`, a generic application is `Box<i32>` and a declared union
-// alias is `U`. `tyToStructStr` is the SAME recursion with the nominal legs off: it
-// serves the checker's handful of NAME PRODUCERS, whose strings are emitter table
-// keys rather than prose, and which must keep the structural spelling those tables
-// already hold. One body, one arm set, one place to add a 12th arena variant.
-export function tyToStr(ix: i32) { tyToStrAt(ix, true) }
+// TWO MODE BITS, THREE ENTRIES, ONE RECURSION — and each bit answers a different
+// question about the caller, which is why neither collapses into the other:
+//
+//   `nominal`  — may a type that HAS a declared name render as that name? Yes for every
+//                surface a person reads (a declared struct is `Cat`, an application is
+//                `Box<i32>`, a declared union alias is `U`); no for the checker's
+//                emitter-facing NAME PRODUCERS, whose strings are table keys the
+//                emitter holds under the STRUCTURAL spelling.
+//   `srcSpell` — must a COMPOSITE be spelled the way VL source spells it (`=>`, not
+//                `->`; `T | null`, not `T?`; `(A | B)[]`, not `A | B[]`)? Yes for every
+//                surface a person reads, because a render they cannot write is a render
+//                that lies; no for the emitter-key producers, whose consumers already
+//                hold master's spelling and whose bytes move if it changes.
+//
+// The two are INDEPENDENT and the alias-body hover is the witness: it wants the
+// structural expansion (that is the whole content of its answer) in a spelling the
+// reader can write. One body, one arm set, one place to add a 12th arena variant.
+export function tyToStr(ix: i32) { tyToStrAt(ix, true, true) }
 
 // The STRUCTURAL render — `tyToStr`'s recursion with the nominal legs off. Read by the
 // checker's emitter-facing name producers (`nodeArrayElemName`, `nodeTyName`, the
@@ -7819,18 +7862,37 @@ export function tyToStr(ix: i32) { tyToStrAt(ix, true) }
 // from `Cat` back to the interned inline shape. A near-inert wrong answer with one
 // witness is exactly the shape that survives a suite and dies in a user's program, so
 // the split is stated here rather than left to the one corpus file that notices.
-export function tyToStructStr(ix: i32) { tyToStrAt(ix, false) }
+//
+// IT IS ALSO WHY `srcSpell` IS OFF HERE, AND THAT PRICE IS MEASURED TOO. Four of these
+// producers can be handed a COMPOSITE — `collectRetAtoms`'s leaf push, the lambda
+// inferred-return `anm`, the resolved-list `listName`, `nodeArrayElemName`'s element —
+// and their consumers hold the spelling this renderer has always emitted. Giving them
+// the source spelling moves the emitted bytes of FIVE corpus modules and turns THREE
+// more into loud emit rejects (`closures/struct-array-union-arm-nulclosure-field.vl`,
+// `closures/union-elem-field-closure-call.vl`,
+// `unions/union-array-arm-elem-closure-field-map-call.vl` — "array value does not match
+// any array member of the union"). Re-keying those tables is its own slice; until then
+// this entry is byte-frozen and the reader-facing entries carry the fix.
+export function tyToStructStr(ix: i32) { tyToStrAt(ix, false, false) }
 
-function tyToStrAt(ix: i32, nominal: boolean) {
+// The ALIAS-BODY render — structural like `tyToStructStr` (a hover over `Pt` must answer
+// with the alias's BODY, not with `Pt`), source-spelled like `tyToStr` because a person
+// reads it. The third corner of the two-bit square, and the reason the bits are two.
+export function tyToAliasBodyStr(ix: i32) { tyToStrAt(ix, false, true) }
+
+function tyToStrAt(ix: i32, nominal: boolean, srcSpell: boolean) {
+  // Both bail-outs below are single tokens — one atom, like every arm that does not
+  // write a top-level `|`.
+  tyStrAtoms = 1
   if ix < 0 { return "<none>" }
   if tyToStrDepth > 8 { return "…" }
   tyToStrDepth = tyToStrDepth + 1
-  const s = tyToStrGo(ix, nominal)
+  const s = tyToStrGo(ix, nominal, srcSpell)
   tyToStrDepth = tyToStrDepth - 1
   s
 }
 
-function tyToStrGo(ix: i32, nominal: boolean) {
+function tyToStrGo(ix: i32, nominal: boolean, srcSpell: boolean) {
   // A NOMINAL NEWTYPE renders as its NAME. This is the only renderer that must —
   // a diagnostic reading "cannot assign i32 to i32" for `const e: EntityId = n`
   // names the distinction the type exists to draw and then hides it. The EMIT
@@ -7881,9 +7943,12 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       let i = 0
       while i < names.length {
         if i > 0 { s = s + ", " }
-        s = s + names[i] + ": " + tyToStrAt(ftys[i], nominal)
+        s = s + names[i] + ": " + tyToStrAt(ftys[i], nominal, srcSpell)
         i = i + 1
       }
+      // Every field separator sits inside the braces — ONE atom. Set rather than
+      // inherited: the field renders above left the last field's width behind.
+      tyStrAtoms = 1
       return s + "}"
     }
     TyFunc => {
@@ -7892,34 +7957,95 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       let i = 0
       while i < ptys.length {
         if i > 0 { s = s + ", " }
-        s = s + tyToStrAt(ptys[i], nominal)
+        s = s + tyToStrAt(ptys[i], nominal, srcSpell)
         i = i + 1
       }
-      return s + ") -> " + tyToStrAt(t.fnRet, nominal)
+      let rs = tyToStrAt(t.fnRet, nominal, srcSpell)
+      // A function type is ONE atom: the params are parenthesized and everything after
+      // the top-level arrow belongs to the RESULT. Set rather than inherited — the
+      // param/result renders above left their own widths behind.
+      tyStrAtoms = 1
+      // The emitter-key spelling, frozen at what its tables hold (see `tyToStructStr`).
+      if !srcSpell { return s + ") -> " + rs }
+      // SOURCE SPELLING: VL writes a function type `(params) => ret`. `->` is a spelling
+      // no VL program can contain, so the hint's "remove the annotation" instruction
+      // handed the reader a parse error.
+      //
+      // A FUNCTION RESULT that is itself a function keeps grouping parens — the
+      // TyFunc-result leg of the same rule `arrElemRender` carries for elements, and the
+      // arm both emit renderers already hold.
+      if tyIxIsFunc(t.fnRet) { rs = "(" + rs + ")" }
+      return s + ") => " + rs
     }
     TyUnion => {
       const members = t.uMembers
       let s = ""
+      // The render's atom count, accumulated as the members are joined: the join writes
+      // exactly one top-level `|` per member boundary, so the whole render is as wide as
+      // its members together. A member is not always ONE atom (a nullable member renders
+      // `X | null`), which is why this is summed rather than read off `members.length`.
+      let psum = 0
       let i = 0
       while i < members.length {
         if i > 0 { s = s + " | " }
-        s = s + tyToStrAt(members[i], nominal)
+        let ms = tyToStrAt(members[i], nominal, srcSpell)
+        let mw = tyStrAtoms
+        // A FUNCTION-TYPE member renders PARENTHESIZED (`((i32) => f64) | string`). Bare,
+        // the closure's result swallows the union's sibling members — `(i32) => f64 |
+        // string` is a function RETURNING `f64 | string`, a different type. The grouping
+        // parens put every separator inside a grouper — one atom again.
+        if srcSpell && tyIxIsFunc(members[i]) {
+          ms = "(" + ms + ")"
+          mw = 1
+        }
+        s = s + ms
+        psum = psum + mw
         i = i + 1
       }
+      tyStrAtoms = psum
       return s
     }
     TyNullable => {
-      return tyToStrAt(t.nInner, nominal) + "?"
+      const inner = tyToStrAt(t.nInner, nominal, srcSpell)
+      const innerAtoms = tyStrAtoms
+      // The emitter-key spelling, frozen at what its tables hold; a `?` suffix writes no
+      // top-level `|`, so the render stays one atom.
+      if !srcSpell {
+        tyStrAtoms = 1
+        return inner + "?"
+      }
+      // SOURCE SPELLING: VL has no `T?` suffix — a nullable is written `T | null`.
+      //
+      // A NULLABLE FUNCTION type keeps grouping parens (`((i32) => string) | null`) —
+      // bare, the ` | null` binds into the closure's RESULT and the render spells a
+      // function returning `string | null` instead.
+      if tyIxIsFunc(t.nInner) {
+        // The grouped closure is one atom; `null` is the second.
+        tyStrAtoms = 2
+        return "(" + inner + ") | null"
+      }
+      // A union INNER keeps its own top-level `|`s (`A | B | null`), so the `null` arm
+      // ADDS to the inner render's width rather than making the whole render two atoms.
+      tyStrAtoms = innerAtoms + 1
+      return inner + " | null"
     }
     TyArray => {
-      return tyToStrAt(t.aElem, nominal) + "[]"
+      const el = tyToStrAt(t.aElem, nominal, srcSpell)
+      const elw = tyStrAtoms
+      // A list render is ONE atom in every form — a wide element is parenthesized
+      // precisely so its `|`s stop being top-level. Set rather than inherited: the
+      // element render left the ELEMENT's width behind.
+      tyStrAtoms = 1
+      // The emitter-key spelling, frozen at what its tables hold (see `tyToStructStr`).
+      if !srcSpell { return el + "[]" }
+      return arrElemRender(el, t.aElem, elw)
     }
     TyMap => {
-      return "{[" +
-        tyToStrAt(t.mKey, nominal) +
-        "]: " +
-        tyToStrAt(t.mVal, nominal) +
-        "}"
+      const mk = tyToStrAt(t.mKey, nominal, srcSpell)
+      const mv = tyToStrAt(t.mVal, nominal, srcSpell)
+      // The key/value separators sit inside the braces — one atom.
+      tyStrAtoms = 1
+      return "{[" + mk + "]: " + mv + "}"
     }
     TyVar => {
       // An inference hole (`?fn.N`) — an un-annotated, still-polymorphic param — is
@@ -7943,7 +8069,11 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       return t.litText
     }
     TyNeg => {
-      return "!" + tyToStrAt(t.negTy, nominal)
+      const ns = tyToStrAt(t.negTy, nominal, srcSpell)
+      // A RESIDUAL negation has no source spelling at all, so its width is nominal:
+      // one atom, like every other non-`|`-writing arm.
+      tyStrAtoms = 1
+      return "!" + ns
     }
   }
   // UNREACHABLE by construction: every arena variant has an arm above and every
@@ -9134,8 +9264,9 @@ export function genAppNameOfTy(ty: i32): string {
 // `|null` suffix), and every other arm builds a name whose separators sit inside a grouper
 // or behind a top-level `=>` — ONE atom.
 //
-// It exists so `arrElemRender` — the ONE array-grouping home BOTH renderers share — can be
-// told the element's width instead of scanning the element name for a top-level `|`. That
+// It exists so `arrElemRender` — the ONE array-grouping home all three renderers share —
+// can be told the element's width instead of scanning the element name for a top-level
+// `|` (the display renderer's bank is `tyStrAtoms`, the third of the set). That
 // site could not convert while only ONE of the two renderers banked a width (#1191's
 // hand-off names exactly this gap: "only one of them covers `tyToNominalName`, which has no
 // bank at all").
