@@ -9937,16 +9937,45 @@ function widenClassifyExpr(exprIx: i32) {
   exprIx
 }
 
-// Emit the expression at `exprIx` as an i64 value (Slice 2). If it already yields
-// i64 (`exprIsI64`) it is emitted as-is. Otherwise it is an i32 expression flowing
-// into an i64 op: a bare integer LITERAL is lowered directly as `i64.const` (set
-// `pendingI64` so the NumLit path takes the 64-bit form), and any other i32 source
-// is emitted then sign-extended with `i64.extend_i32_s` (0xac). This is the i32→i64
-// widening for mixed-width operands.
+// Emit `ix` with the three WIDE-SCALAR literal hints cleared, restoring them after —
+// the one home for "this emit's width is decided HERE, not by the position above it".
+//
+// `pendingI64` / `pendingF32` / `pendingF64` say what a bare integer LITERAL standing in
+// an i64 / f32 / f64 slot lowers as. They are a property of that ONE literal position, not
+// of the expression tree around it, so any emit that produces its own width must run with
+// them off. Left on, EVERY integer literal anywhere in the subtree takes the wide form
+// while its own slot is still i32 — an ARRAY INDEX, an i32-keyed map KEY, a `.slice`
+// bound, the i32 operand of the arithmetic that produces the wide value, the operand of a
+// unary minus. `vl check` stays rc 0 and the module does not validate
+// (`type mismatch: expected i32, found i64`).
+//
+// `emitNumIntrArg` and `emitMemIntrinArg` state the same rule for their own operands; this
+// is that rule at the WIDENING boundary, which is where the seeds are set.
+function emitExprWideCleared(body: i32[], ix: i32, fnIx: i32) {
+  const savedI64 = pendingI64
+  const savedF32 = pendingF32
+  const savedF64 = pendingF64
+  pendingI64 = false
+  pendingF32 = false
+  pendingF64 = false
+  const r = emitExpr(body, ix, fnIx)
+  pendingI64 = savedI64
+  pendingF32 = savedF32
+  pendingF64 = savedF64
+  r
+}
+
+// Emit the expression at `exprIx` as an i64 value (Slice 2). A bare integer LITERAL is
+// lowered directly as `i64.const` (set `pendingI64` so the NumLit path takes the 64-bit
+// form). An expression that already yields i64 (`exprIsI64`) is emitted as-is; any other
+// i32 source is emitted then sign-extended with `i64.extend_i32_s` (0xac). This is the
+// i32→i64 widening for mixed-width operands.
+//
+// The LITERAL peel is checked FIRST so the other two arms can own their own width
+// (`emitExprWideCleared`): a bare literal is the only shape an ambient `pendingI64` is
+// about, and the check is width-identical either way — `emitNumLitNode` reaches the same
+// `parseI64Pair` + `fbI64Const` pair through its own `exprIsI64` / out-of-i32-range arms.
 export function emitExprAsI64(body: i32[], exprIx: i32, fnIx: i32) {
-  if exprIsI64(widenClassifyExpr(exprIx), fnIx) {
-    return emitExpr(body, exprIx, fnIx)
-  }
   // Peel parens to find a bare literal we can emit directly as i64.const.
   const inner = unwrapParen(exprIx)
   const innerNode = P.nodes[inner]
@@ -9957,8 +9986,11 @@ export function emitExprAsI64(body: i32[], exprIx: i32, fnIx: i32) {
     pendingI64 = saved
     return r
   }
+  if exprIsI64(widenClassifyExpr(exprIx), fnIx) {
+    return emitExprWideCleared(body, exprIx, fnIx)
+  }
   // Non-literal i32: evaluate, then sign-extend to i64.
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  if emitExprWideCleared(body, exprIx, fnIx) < 0 { return -1 }
   fbI64ExtendI32S()
   0
 }
@@ -10093,12 +10125,14 @@ export function emitExprAsF32(body: i32[], exprIx: i32, fnIx: i32) {
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
   // directly; only a bare numeric literal needed the direct-`f32.const` handling above.
   // An ASSIGNMENT classifies by its TARGET cell (`widenClassifyExpr`), as the i64/f64
-  // widenings do.
+  // widenings do. Both arms own their own width (`emitExprWideCleared`) — the literal is
+  // already handled above, so an f32 seed reaching here belongs to the position that set
+  // it and not to the i32 sub-positions inside this subtree.
   if exprIsF32(widenClassifyExpr(exprIx), fnIx) {
-    return emitExpr(body, exprIx, fnIx)
+    return emitExprWideCleared(body, exprIx, fnIx)
   }
   // Non-literal i32: evaluate, then convert to f32.
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  if emitExprWideCleared(body, exprIx, fnIx) < 0 { return -1 }
   fbF32ConvertI32S()
   0
 }
@@ -10617,17 +10651,7 @@ function emitIntIntr(body: i32[], callIx: i32, fnIx: i32, name: string) {
 // FILL operand takes the element's own valtype, so clearing the context there would
 // break an f64/i64 fill. Their address-free operands have their own coercion.
 function emitMemIntrinArg(body: i32[], ix: i32, fnIx: i32) {
-  const savedF32 = pendingF32
-  const savedF64 = pendingF64
-  const savedI64 = pendingI64
-  pendingF32 = false
-  pendingF64 = false
-  pendingI64 = false
-  const r = emitExpr(body, ix, fnIx)
-  pendingF32 = savedF32
-  pendingF64 = savedF64
-  pendingI64 = savedI64
-  r
+  emitExprWideCleared(body, ix, fnIx)
 }
 
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
