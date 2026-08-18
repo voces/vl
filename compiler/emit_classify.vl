@@ -12030,6 +12030,9 @@ function globalKind(initIx: i32): VKind {
     if arrLitIsStr(initIx, -1) { return "strlist" }
     if arrLitIsF64(initIx, -1) { return "f64list" }
     if arrLitIsI64(initIx, -1) { return "i64list" }
+    // An f32-element literal is the f32 list — the arm this ladder was missing. AFTER the
+    // f64/i64 arms, so every literal either of them claims keeps its answer.
+    if arrLitIsF32(initIx, -1) { return "f32list" }
     return "list"
   }
   if e is StrLit { return "str" }
@@ -21130,6 +21133,18 @@ export function letIsF32Array(letIx: i32, fnIx: i32) {
       if k != null {
         if k == "f32list" { return true }
         if k == "reflist" { return false }
+        // A SETTLED annotation naming a DIFFERENT scalar/ref list is authoritative, and the
+        // initialiser below must not overrule it: `const xs: f64[] = [fv]` is an f64 list
+        // whose f32 element PROMOTES at the store (`emitArrLit`'s threaded-kind rule says
+        // the same thing on the emit side). Without this the binding classified f32 while
+        // the literal built f64 and the two wrapper types met at the store — invalid wasm.
+        // The nullable niches are deliberately NOT listed: their own classifiers answer for
+        // them and the initialiser fall-through is how a `f32[] | null` binding still reads
+        // an f32-list-returning call.
+        if k == "f64list" { return false }
+        if k == "i64list" { return false }
+        if k == "strlist" { return false }
+        if k == "list" { return false }
       } else {
         const lt = P.nodes[d.letType]
         if lt is TypeRef {
@@ -21145,6 +21160,32 @@ export function letIsF32Array(letIx: i32, fnIx: i32) {
   false
 }
 
+// True if the array literal at `arrIx` has f32 ELEMENTS — the f32 member of the
+// `arrLitIsF64` / `arrLitIsI64` family, and the one the family was missing.
+//
+// EVERY element must be `exprIsF32`, where the two siblings claim on ANY element of their
+// leaf. The asymmetry is the checker's: a MIXED literal is not an f32 list at all but a
+// checker-level UNION (`[fv, 1]` types `(f32 | i32)[]`, `[fv, 1.5]` an `(f32 | f64)[]`),
+// and an ANNOTATED `f32[]` binding drives those through the annotation
+// (`letIsF32Array` answers off `nameIsF32Array` without consulting the initialiser). So
+// the homogeneous literal is the whole population this can claim, and claiming only it
+// leaves every mixed spelling exactly where it is. A bare `[1.5]` stays f64: a float
+// LITERAL is deliberately not `exprIsF32` (`tyIsF32Array`'s note), so an f32 list is only
+// ever built from values whose own type says f32.
+export function arrLitIsF32(arrIx: i32, fnIx: i32) {
+  const a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return false }
+    let i = 0
+    while i < a.arrElems.length {
+      if !exprIsF32(a.arrElems[i], fnIx) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
 export function exprF32Array(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   if tyIsF32Array(nodeTyIxOf(exprIx)) { return true }
@@ -21152,6 +21193,14 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
   // f32 list (`mvListValKind` → 21), the f32 dual of the f64-list (12) case above.
   if mapReadListKind(exprIx, fnIx) == "f32list" { return true }
   const e = P.nodes[exprIx]
+  // An f32-element LITERAL, the arm the f64 and i64 siblings carry and this one did not.
+  // Without it `[fv]` fell past every scalar-list arm to the i32-list catch-all at the
+  // bottom of each cascade, so an INFERRED binding (`const xs = [fv]`) and a generic
+  // `T[]` argument (`gfirst([fv])`) built an i32 backing over f32 elements — check-clean
+  // INVALID WASM. `tyIsF32Array` above cannot answer for it: the checker carries no
+  // f32-array KIND (a float literal types f64), which is exactly why the syntactic arm
+  // is the one that has to.
+  if e is ArrayLit { return arrLitIsF32(exprIx, fnIx) }
   if e is Paren { return exprF32Array(e.parInner, fnIx) }
   if e is Ident {
     // A VALUE-union ident narrowed to the `f32[]` LIST arm (value-atom kind 12) reads
