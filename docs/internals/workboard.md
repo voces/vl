@@ -573,6 +573,32 @@ receiver and the `string | null` operand were both innocent, and the real defect
 function away from a residue another PR had already named. **Re-derive the shape, not just the
 count**, before spending an agent.
 
+## D4 is filed on the wrong axis — re-derived, re-filed, ready to brief (2026-08-17, `fed8693b`)
+
+D4 is on the board as **"Generic alias application as a union member"**. Genericity is not the axis.
+**Nesting depth is**, and the same root produces a SILENT cell and a LOUD one depending on which
+spelling reaches it:
+
+| union arm | depth | generic? | result |
+|---|---|---|---|
+| `Box<i32>` | 1 | yes | **correct** — `is` answers true, prints `5` |
+| `P = { v: i32 }` | 1 | no | **correct** — prints `5` |
+| `Box<Box<i32>>` | 2 | yes | **SILENTLY WRONG BRANCH** — `u = { v: { v: 5 } }` is a well-typed member and `u is Box<Box<i32>>` answers **false**, taking the `i32` arm |
+| `Outer = { v: Inner }` | 2 | no | **LOUD** — `is` answers true, then the narrowed read fails with `emitProgram: field access receiver is not …` |
+
+So the axis is **a union arm that is a struct with a STRUCT-TYPED FIELD**, and the generic spelling
+is merely one way to write one. Depth 1 is correct either way, which is the control.
+
+D4's original claim — `const u: U = { v: 5 }` ACCEPTED for `U = Box<Box<i32>> | i32` — is the same
+root seen from the assignment side, and it has its own discriminating control that I verified:
+**the non-union annotation `const u: Box<Box<i32>> = { v: 5 }` is correctly REJECTED**, so the
+union-member path is specifically what skips the deep structural check. Reading `u.v.v` off the
+wrongly-accepted value then fails at emit, so the acceptance is silent but not harmless.
+
+**How this was found is the point.** The nested-generic cell was not the item — it was the CONTROL I
+wrote to validate D4's filed claim, and the control is what came back wrong. A control that only
+ever confirms is not doing any work; this one discriminated and re-rooted the item.
+
 ## An owner ruling resolved by measurement, not by asking (2026-08-17, on master `fed8693b`)
 
 **`does ?? short-circuit` was on the board as an OWNER RULING with my recommendation "yes". It does
