@@ -1,0 +1,152 @@
+// @run
+// @log 7
+// @log 8
+// @log 1
+// @log 7
+// @log 3
+// @log -7
+// @log 7
+// @log 9
+// @log 11
+// @log 13
+// @log 7
+// @log 22
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 9000000000
+// @log -9000000000
+// @log 2.5
+// @log 3.5
+// @log 3.5
+// @log 5.5
+// @log 3
+// @log 7
+// @info `mut1` is never reassigned; use `const` instead of `let`
+// @hint redundant type annotation: `zRet` is inferred as `i64`
+// A wide-scalar PARAMETER decides the width of the argument VALUE — and of nothing
+// INSIDE it. `pendingI64` / `pendingF32` / `pendingF64` say what a bare integer
+// LITERAL standing in an i64 / f32 / f64 slot lowers as; they belong to that one
+// literal position, not to the expression tree around it. The direct-call argument
+// spine seeded the flag from the callee's parameter and let it ride the WHOLE
+// argument subtree, so every integer literal anywhere inside lowered at the wide
+// width while its own slot was still i32 — `vl check` rc 0 and a module that does
+// not validate (`type mismatch: expected i32, found i64`).
+//
+// THE AXIS IS THE i32 SUB-POSITION, NOT THE ARRAY INDEX. The array index is one
+// member of the family; `zi64(1 + 2)` and `zi64(-7)` carry no index at all, and a
+// `.slice` bound and an i32-keyed map KEY are two more. Every widening now owns its
+// own width (`emitExprWideCleared` inside `emitExprAsI64` / `emitExprAsF32`), which
+// is the one home all of them share.
+//
+// Dimensions MOVED, each covered below: the i32 sub-position (array index at one and
+// two depths, index through a struct element, i32-keyed map key, `.slice` bound, an
+// i32 operand of the arithmetic producing the wide value, a unary minus operand); the
+// index literal's value (0 and 1) and its form (bare, `k - 1`); the argument slot (1
+// and 2); where the array lives (module `const`, module `let`, function local,
+// parameter); where the call sits (module scope, function body, `while` body, lambda
+// body); the callee's shape (void-returning, i64-returning); and the FLAG (i64, f32).
+//
+// Dimensions held FIXED: one module, no UFCS / method callee, no union-typed
+// parameter, arity <= 2.
+//
+// CONTROLS, correct before and after: an f32 ARRAY INDEX — `emitIndex`'s arms already
+// clear `pendingF32` per arm, which is exactly why f32 reproduced at the map key and
+// at the slice bound but never at the index; f64 at every sub-position, having no
+// seeding site at a call boundary at all; a LAMBDA callee, whose `call_ref` argument
+// spine already clears all three; and a bare literal argument, the one shape the seed
+// exists for, at both i32 and i64 magnitude.
+function zi64(x: i64) { print(x) }
+function zi64two(p: i32, x: i64) {
+  print(p)
+  print(x)
+}
+function zRet(x: i64): i64 { return x }
+function zf32(x: f32) { print(x) }
+function zf64(x: f64) { print(x) }
+
+const a: i64[] = [7, 8]
+
+// The filed cell: an ELEMENT read with a literal index, in argument position.
+zi64(a[0])
+// Index 1 — the defect was never about index 0.
+zi64(a[1])
+// The SECOND argument slot.
+zi64two(1, a[0])
+// NO ARRAY AT ALL: an i32 sum widening into the i64 parameter. Both operands are
+// i32 and `i32.add` consumes them; only the widened RESULT is i64.
+zi64(1 + 2)
+// The operand of a unary minus — `i32.const 0 ; i32.const 7 ; i32.sub`, then the
+// extend. The wide-magnitude twin below stays a single `i64.const`.
+zi64(-7)
+// An index EXPRESSION that carries a literal without BEING one.
+const k = 1
+zi64(a[k - 1])
+// Two index depths: the outer read is still in flight while the inner one emits.
+const g: i64[][] = [[9]]
+zi64(g[0][0])
+// The index of a STRUCT-element array, whose i64 comes from the field.
+type SW = { f: i64 }
+const sw: SW[] = [{ f: 11 }]
+zi64(sw[0].f)
+// An i32-keyed map KEY — an i32 sub-position with no array in sight.
+const mi: {[i32]: i64} = Map()
+mi[0] = 13
+zi64(mi[0] ?? 0)
+// A method's i32 BOUNDS.
+zi64(a.slice(0, 1)[0])
+// The element inside i64 arithmetic: the `2` here is a genuine i64 operand and stays
+// one, while the two indices beside it are i32.
+zi64(a[0] * 2 + a[1])
+// An i64-RETURNING callee, so the argument's width is not the statement's.
+print(zRet(a[0]))
+
+// Where the ARRAY lives — a module `let`, a function local, a parameter.
+let mut1: i64[] = [7]
+zi64(mut1[0])
+function zLocalArr() {
+  const loc: i64[] = [7]
+  zi64(loc[0])
+}
+zLocalArr()
+function zParamArr(b: i64[]) { zi64(b[0]) }
+zParamArr([7])
+
+// Where the CALL sits — a `while` body and a lambda body.
+let n = 0
+while n < 1 {
+  zi64(a[0])
+  n = n + 1
+}
+const zInLam = () => {
+  zi64(a[0])
+}
+zInLam()
+
+// A bare literal argument: the one shape the parameter's seed is for, at both
+// magnitudes. `9000000000` is past the i32 range and stays a single `i64.const`.
+zi64(9000000000)
+zi64(-9000000000)
+
+// The f32 half of the same root. The INDEX is a control (already clear); the map KEY
+// and the slice BOUNDS are where it reproduced.
+const mf: {[i32]: f32} = Map()
+mf[0] = 2.5
+zf32(mf[0] ?? 0.0)
+const fs: f32[] = [3.5, 4.5]
+zf32(fs.slice(0, 1)[0])
+zf32(fs[0])
+
+// f64 controls: no seeding site reaches a call boundary, so no cell reproduced.
+const dd = [5.5]
+zf64(dd[0])
+zf64(1 + 2)
+
+// A LAMBDA callee: `call_ref`'s argument spine already cleared all three seeds.
+const zlam = (x: i64) => {
+  print(x)
+}
+zlam(a[0])
