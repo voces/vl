@@ -771,6 +771,35 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## E8 re-derived and briefed — 4 occurrences, 3 shapes (2026-08-17)
+
+Scanned the whole corpus on the tip (`vl check tests/cases`, 13,510 diagnostic lines). The board
+filed E8 as **"3 named files of 240 diagnostic-producing"; it is 4 files now**, in three distinct
+shapes:
+
+| shape | diagnostic |
+|---|---|
+| an empty `Map()` whose key and value were never inferred | `unknown property \`add\` on {[<none>]: <none>}` |
+| an empty array whose element was never inferred | `argument 1: expected string, got <none>[]` |
+| a function whose return type errored (×2 files) | `print of () => <error> is type-valid but not yet supported by codegen …` |
+
+**The design question is briefed as a real question rather than a rename**, because it is probably not
+one answer for all three. `<none>` means "nothing was inferred here", and E7's shipped `_` is likely
+right. `<error>` means "an error already happened here" — rendering *that* as `_` could actively
+mislead, since the user's real problem is the earlier error and `() => _` invites them to fix the
+wrong thing. Suppressing the second diagnostic may beat rewording it; the agent decides on evidence.
+
+**A caveat I put in the brief and want on the record here**: my 4 sites are where the marker
+*surfaced in the corpus*, not the set of shapes that can produce one. A leak's observation site is a
+sub-position, not the axis — the same error that mis-filed #1470. The brief asks for a **constructed**
+count with its own denominator alongside the corpus count.
+
+## Board status after this round
+
+Bands 1 and 2 are exhausted of unblocked work; both silent inventories are closed; D6 was the last
+live silent population and shipped as #1471. **After E8 lands, what remains is loud-column work and
+owner rulings** — nothing silent, nothing unblocked-and-high-value that I can find.
+
 ## Round 6 re-derivation — the D-row survey, and D6 is the last live silent population (2026-08-17)
 
 With both silent inventories closed I swept the board's own still-OPEN D/E rows:
