@@ -17323,6 +17323,26 @@ export function letAnnIsUninternedShape(letIx: i32) {
   false
 }
 
+// True if the `LetDecl` at `letIx` carries a VALUE-UNION ANNOTATION — the declared-spelling
+// half of `letIsUnion`, asked without looking at the initializer at all. A literal union
+// (`type K = "a" | "b"`) is excluded: it reps as an interned i32 ATOM, not the box.
+//
+// The initializer-free reading is what makes it usable from `structIndexOfLet`, which is
+// itself on the path `exprUnion` reaches — and it is the RIGHT reading there besides: an
+// annotation that pins the cell to the box settles the cell's rep on its own.
+export function letAnnIsUnion(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        return isUName(lt.tyName) && !nodeTyIsLitUnionAlias(d.letType)
+      }
+    }
+  }
+  false
+}
+
 export function letIsStruct(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -17906,6 +17926,16 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
 export function structIndexOfLet(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
+    // A VALUE-UNION annotation pins the cell to the `{tag, value}` BOX, which has no
+    // struct-table layout — so the answer is -1 and the initializer must NOT be
+    // consulted. The init of such a binding is the ARM's object literal, and the
+    // fall-through below resolves an object literal by FIELD-NAME SET
+    // (`structIndexOfObjCtx`), so it handed back whichever interned struct row happens
+    // to share those names: `structIndexOfExpr`'s Ident arm then reported that row for
+    // the union global and its `msi >= 0` branch short-circuited the narrowed-variant
+    // resolution the read actually needs. Same discipline as `paramStructIndex`, which
+    // answers from the annotation ALONE and never falls through to a value.
+    if letAnnIsUnion(letIx) { return -1 }
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
@@ -18072,16 +18102,9 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
 export function letIsUnion(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if lt is TypeRef {
-        // A literal union (`type K = "a" | "b"`, or an inline `"a" | "b"`) is an interned-i32
-        // ATOM, not a value-union box — never classify it kind 4.
-        if isUName(lt.tyName) && !nodeTyIsLitUnionAlias(d.letType) {
-          return true
-        }
-      }
-    }
+    // The annotation half (`letAnnIsUnion`) — a literal union (`type K = "a" | "b"`, or an
+    // inline `"a" | "b"`) is an interned-i32 ATOM, not a value-union box, and it declines.
+    if letAnnIsUnion(letIx) { return true }
     // The init's union-ness applies ONLY when no annotation pinned the cell: an explicit
     // NON-union annotation (`const x: i32 = r` where `r` is a value-union narrowed to `i32`)
     // makes `x` that concrete type — the init UNBOXES the narrowed atom into it, it does NOT
