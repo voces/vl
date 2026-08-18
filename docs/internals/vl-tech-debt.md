@@ -116,11 +116,14 @@ in order of safety:
   are annotation-shaped: an inlay hint is formatted `: T` (a suggestion of the
   annotation to write) and a hover is fenced as a `vital` code block (a claim the text
   is VL). So the renderer's give-up markers and internal names leak into positions that
-  imply the user could type them. The host now filters the three ABSENCE markers
-  (`<error>`/`<none>`/`<?>`, via `isDisplayableType` in `lsp/src/typeFeatures.ts`) —
+  imply the user could type them. The host filters the ABSENCE markers
+  (`<error>`/`<?>`, via `isDisplayableType` in `lsp/src/typeFeatures.ts`) —
   measured 0 sightings on diagnostic-free corpus files, so the filter is confined to
   broken code. **`…` is deliberately NOT filtered** (45 clean sightings — the depth cap
-  on legitimately deep recursive types; it means a type is PRESENT but elided).
+  on legitimately deep recursive types; it means a type is PRESENT but elided). Neither
+  is the blank `_`, which answers for an absent arena entry (`_[]`, `{[_]: _}`) as well
+  as for an inference hole: it names the SHAPE around what is unknown, and being a
+  substring of ordinary identifiers it could not join a substring sentinel list anyway.
   Remaining: the HOLE marker still reaches the editor. It renders a `?fn.N` inference
   hole and cannot be filtered host-side without deleting informative hints from healthy
   code (`: _[]`, `: {x: _, y: _}`, 88 clean corpus labels). It is spelled `_` rather than

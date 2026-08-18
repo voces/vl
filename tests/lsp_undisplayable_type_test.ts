@@ -12,9 +12,12 @@
 // Every rendered type the editor shows comes from ONE native producer, `tyToStr`
 // (compiler/typecheck.vl), whose own header calls it "type → string (for
 // diagnostics)". It emits two tokens VL cannot spell:
-//   `_`       — a `?fn.N` INFERENCE HOLE (an un-annotated, still-polymorphic param)
+//   `_`       — NO TYPE WAS DETERMINED HERE: a `?fn.N` inference hole (an
+//               un-annotated, still-polymorphic param) and, in the same token, an
+//               absent arena entry (the element of an empty `[]`, the key/value of
+//               an empty `Map()`, the inner of a lone `null`)
 //   `<error>` — `TyErr`, e.g. an annotation that did not resolve
-// plus `<none>` (no arena entry) and `<?>` (an unhandled arm).
+// plus `<?>` (an unhandled arm).
 //
 // The hole is spelled `_` and not `any` BECAUSE OF this file's own report: the owner
 // read a rendered type off the playground and then wrote it as an annotation. A
@@ -22,11 +25,11 @@
 //
 // These need OPPOSITE treatments, and the split is the point of this file:
 //
-//   * `<error>`/`<none>`/`<?>` say a type is ABSENT. An editor surface may not
+//   * `<error>`/`<?>` say a type is ABSENT. An editor surface may not
 //     show them — an inlay hint is formatted `: T` (a suggestion of the
 //     annotation to write) and a hover is fenced as `vital` (a claim the text is
 //     VL). They are filtered by `isDisplayableType`.
-//   * `_` says a type is PRESENT and polymorphic. It appears on healthy,
+//   * `_` says a type is UNKNOWN but its surrounding SHAPE is not. It appears on healthy,
 //     diagnostic-free code that VL deliberately supports (see
 //     `tests/cases/inference/hole-is-guard-return-join.vl`, PRs #1073/#1076), so
 //     it is NOT filtered here — collapsing `_ | _` to `_` would still print
@@ -80,13 +83,21 @@ const noSiblings = () => undefined;
 // No seed needed: the absence/presence split stated as a table.
 
 Deno.test("displayable-type: absence markers are filtered, elision is not", () => {
-  // ABSENT — never displayable.
-  for (const s of ["<error>", "<none>", "<?>", "(<error>) => string", "<none> | null"]) {
+  // ABSENT — never displayable. The angle brackets are the whole vocabulary: they
+  // are the shape no writable VL type rendering wears, which is what lets this stay
+  // a substring test.
+  for (const s of ["<error>", "<?>", "(<error>) => string", "<error> | null"]) {
     assertEquals(isDisplayableType(s), false, `absent marker ${s}`);
   }
   // Empty is not a type either.
   assertEquals(isDisplayableType(""), false, "empty");
-  // PRESENT — displayable, including the elided and the polymorphic renderings.
+  // PRESENT — displayable, including the elided and the blank-bearing renderings.
+  // The blank rows are the producer's ONE token for "no type was determined here",
+  // whatever produced it: an un-annotated param, an empty `[]`'s element, an empty
+  // `Map()`'s key/value, a lone `null`'s inner. Each still names the SHAPE around
+  // the blank, which is the information an editor surface exists to carry — and a
+  // bare `_` could not be listed above in any case, being a substring of ordinary
+  // identifiers (`{foo_bar: i32}`).
   for (
     const s of [
       "i32",
@@ -94,6 +105,10 @@ Deno.test("displayable-type: absence markers are filtered, elision is not", () =
       "{head: i32, tail: {head: …, tail: …}[]}", // depth cap: a REAL type, elided
       "_ | _", // an inference hole: present + polymorphic, not our business
       "(_) => _",
+      "_[]", // an empty literal's element
+      "{[_]: _}", // an empty `Map()`
+      "_ | null", // a lone `null`
+      "{foo_bar: i32}", // a real type whose NAME contains the blank's character
     ]
   ) {
     assertEquals(isDisplayableType(s), true, `present ${s}`);
@@ -141,7 +156,7 @@ print(foobar({ bar: "okie" }))
   // now suppressed rather than printing a type VL does not have.
   assertEquals(await hoverAtFnName(checker, src), undefined, "hover suppressed");
 
-  // Whatever labels DO survive must be spellable — no `<error>`/`<none>`/`<?>`.
+  // Whatever labels DO survive must be spellable — no `<error>`/`<?>`.
   for (const label of await inlayLabels(checker, src)) {
     assertEquals(isDisplayableType(label.slice(2)), true, `inlay label ${label}`);
   }
@@ -338,21 +353,19 @@ Deno.test({
   const checker = loadWasmChecker(SEED, () => {})!;
   const root = new URL("./cases/", import.meta.url).pathname;
 
-  // The single measured exception: `let _x = null` renders `: <none> | null` on a file
-  // with no error diagnostic. The hint it loses was itself unspellable (VL spells
-  // that type `null`), so dropping it is the fix, not a regression. Pinned by
-  // NAME so a second such file fails this test instead of hiding in a count.
-  // Second measured exception: an un-annotated `const fu = () => { return [] }`
-  // renders `() => <none>[]`. The empty literal's element type is never
-  // constrained, so the array has no element type to name — and VL has no
-  // spelling for one, exactly as it has none for the `<none> | null` above. The
-  // program is legal (that is what A-compiler-trap fixed; it used to kill the
-  // compiler outright), so the file is diagnostic-free and the hint is dropped
-  // on a clean file. Dropping an unspellable hint is the filter working.
-  const KNOWN_CLEAN_DROPS = new Set([
-    "types/infer-null-unconstrained.vl",
-    "arrays/lambda-empty-array-literal-return.vl",
-  ]);
+  // NO EXCEPTIONS, and the empty set is the assertion. The filter drops a hint only
+  // on a file that carries an error diagnostic; a diagnostic-free file keeps every
+  // hint it has. The two files that used to sit here — `types/infer-null-
+  // unconstrained.vl` (`let _x = null`) and `arrays/lambda-empty-array-literal-
+  // return.vl` (`const fu = () => { return [] }`) — are clean programs whose
+  // inferred types have an UNDETERMINED component, and the producer now renders that
+  // component as the blank `_` (`: _ | null`, `: () => _[]`) instead of an
+  // angle-bracket absence token. A blank-bearing rendering still names the shape
+  // around the blank, so it is displayable and the hints survive, which is why this
+  // list is empty rather than why the filter got weaker. Keep it empty: a name
+  // appearing here again means a producer started emitting an absence token on
+  // correct code, and that is the defect, not the exception.
+  const KNOWN_CLEAN_DROPS = new Set<string>([]);
 
   const files: string[] = [];
   for await (const dir of Deno.readDir(root)) {
@@ -393,9 +406,10 @@ Deno.test({
     throw new Error(`only ${scanned} files checked out — harness bug`);
   }
   assertEquals(unexpected, [], "hints removed from diagnostic-free files");
-  // Assert the sweep actually SAW the behaviour it is guarding, so a harness that
-  // silently stops finding drops fails instead of passing vacuously.
   assertEquals(dropsOnClean, KNOWN_CLEAN_DROPS.size, "exactly the known clean drops");
+  // With the clean side at zero, the ERRORED side is what keeps this sweep from
+  // passing vacuously: a harness that silently stops producing candidates, or a
+  // filter that stops filtering, fails here instead of reporting a clean zero.
   if (dropsOnErrored < 1) {
     throw new Error("the filter dropped nothing on any errored file — harness bug");
   }

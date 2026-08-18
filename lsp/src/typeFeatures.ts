@@ -374,24 +374,32 @@ const toLsp = (pos: Position): { line: number; char: number } => ({
 //
 //   ABSENCE of a type — safe to suppress on:
 //     `<error>`  TyErr, the unresolved annotation   clean 0 · errored 23
-//     `<none>`   no arena entry (index < 0)         clean 1 · errored 10
 //     `<?>`      an arm `tyToStrGo` doesn't handle  clean 0 · errored  0
-//   PRESENCE of a type, elided — must NOT suppress on:
+//   PRESENCE of a type, elided or unknown — must NOT suppress on:
 //     `…`        the depth cap (`tyToStrDepth > 8`) clean 45 · errored 0
+//     `_`        no type was determined here
 //
-// That last row is why this list is a measurement and not a guess: `…` is the
-// ONLY marker that fires at volume on healthy code (deep recursive types, e.g.
-// `generics/recursive-generic-alias-array.vl`). Suppressing on it would delete 45
-// informative hints from correct programs — a worse defect than the one this
-// fixes. The three absence markers carry no information the user can act on: the
-// single clean `<none>` sighting is `types/infer-null-unconstrained.vl` rendering
-// `let _x = null` as `: <none>?`, itself unspellable (VL spells that type `null`).
+// The `…` row is why this list is a measurement and not a guess: it is the ONLY
+// bracket-free marker that fires at volume on healthy code (deep recursive types,
+// e.g. `generics/recursive-generic-alias-array.vl`). Suppressing on it would
+// delete 45 informative hints from correct programs — a worse defect than the one
+// this fixes. `<error>` and `<?>` carry no information the user can act on.
+//
+// `_` IS THE PRODUCER'S ONE BLANK and is deliberately absent from this list. It
+// covers an inference hole and an absent arena entry alike (`_[]` for an empty
+// literal's element, `{[_]: _}` for an empty `Map()`, `_ | null` for a lone
+// `null`) — a rendering that still says what SHAPE the type has, which is what the
+// `_`-bearing hints this file's suite pins are for. Nor COULD it join the list:
+// this is a SUBSTRING test and `_` occurs inside ordinary identifiers
+// (`{foo_bar: i32}`), so listing it would delete hints from healthy code.
 //
 // NOTE this is a SENTINEL test, not type-string parsing: these are fixed literals
 // `tyToStr` emits in place of a type, and no writable VL type rendering contains
 // `<` (a generic application renders structurally — `Box<i32>` prints as
-// `{v: i32}`). Nothing here inspects a type's STRUCTURE.
-const ABSENT_TYPE_MARKERS = ["<error>", "<none>", "<?>"];
+// `{v: i32}`). That bracket shape is the whole reason the list can stay a
+// substring test, and it is why `_` cannot be added to it. Nothing here inspects
+// a type's STRUCTURE.
+const ABSENT_TYPE_MARKERS = ["<error>", "<?>"];
 
 /**
  * Whether a native rendered type is fit to show in an annotation-shaped editor
