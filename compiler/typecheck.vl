@@ -12417,6 +12417,14 @@ function objNumWidens(src: i32, dst: i32) {
 // carried the pair is never mistaken for the thing that is unsupported.
 let shapeAdaptSrcTy = -1
 let shapeAdaptDstTy = -1
+// The SOURCE EXPRESSION of that same stopped-on pair, `(…)`-peeled — banked beside the two
+// types for the same reason they are: the walk is entered on the expression the author
+// wrote and the pair lives one or more containers in, so the outer expression does not say
+// what the claimed source form is. `{ pet: aCat }` into `{pet: Animal}` is an object
+// literal whose CLAIMED pair is a pinned `Cat` field value, and `[{legs, purr}]` into
+// `Animal[]` is an array literal whose claimed pair IS an object literal — reading the
+// outer expression gets both backwards. -1 when the walk had no expression there.
+let shapeAdaptSrcExpr = -1
 
 // The expression at `ix` with `(…)` peeled — the syntactic form, for the constructor
 // exemption in `objShapeAdapterless`. -1 stays -1.
@@ -12480,12 +12488,20 @@ function objFieldNameSetsEq(src: i32, dst: i32): boolean {
 // as `assignable` compares them) — so wherever `assignable` can reach an object pair,
 // this can too. A bare binding breaks exactly as an array element does.
 //
-// An object LITERAL is exempt, and that exemption is the workaround the diagnostic names:
-// it is BUILT at the destination shape, so the value reaching the slot already has the
-// slot's rep. Its FIELD VALUES are not exempt — each is judged against the destination
-// field's type on its own — which is how `{ p: someCat }` into `{ p: Animal }` is caught
-// while `{ p: { legs: 4, purr: true } }` is not. An array literal is exempt element-wise
-// the same way.
+// An object LITERAL is exempt from the SHAPE mismatch, and that exemption is the
+// workaround the diagnostic names: it is BUILT at the destination shape, so the value
+// reaching the slot already has the slot's rep. Its FIELD VALUES are not exempt — each is
+// judged against the destination field's type on its own — which is how `{ p: someCat }`
+// into `{ p: Animal }` is caught while `{ p: { legs: 4, purr: true } }` is not. An array
+// literal is exempt element-wise the same way.
+//
+// THE EXEMPTION IS SCOPED TO WHAT "BUILT AT THE DESTINATION SHAPE" BUYS, and a field the
+// destination does not declare is outside it: building at the destination shape is
+// precisely what DISCARDS such a field, initializer and all. So an EXCESS field is claimed
+// for a literal exactly as for every other source form — a `{ legs: 4, purr: side() }`
+// against `{ legs: i32 }` never called `side`, with no diagnostic and a valid module. The
+// verdict is one clause, the failure MODE differs by source form (a wrong evaluation count
+// for the literal, invalid wasm for a pinned source), and the diagnostic says which.
 //
 // A pair reaching an inference HOLE is never claimed: `{x: _, y: _}` is not a shape yet,
 // and `tyEq` calls it different from every concrete shape.
@@ -12582,12 +12598,25 @@ function objShapeAdapterless(
             }
             li = li + 1
           }
-          return false
+          // FALLS THROUGH to the dropped-FIELD decision below — the exemption covers what
+          // "built at the destination shape" actually buys, and a field the destination
+          // does not declare is not in it. `emitObj` walks the DESTINATION struct's field
+          // list and looks each name up in the literal, so a field the destination lacks is
+          // never visited: its initializer is never lowered, never evaluated, and its
+          // side effects never happen — a silently WRONG EVALUATION COUNT rather than the
+          // invalid wasm the non-literal source forms take. Both verdicts are this
+          // function's, and both are the same clause of the header above ("a field the
+          // destination LACKS has no lowering under ANY source form"); an arm that
+          // returned here carried the field-VALUE leg of the rule and not the
+          // dropped-FIELD leg. `objShapeAdapterlessErr` words the literal case for what it
+          // is, since "construct the value at the destination shape" is what the author
+          // already did.
         }
       }
       if objFieldNameSetsEq(src, dst) { return false }
       shapeAdaptSrcTy = src
       shapeAdaptDstTy = dst
+      shapeAdaptSrcExpr = cx
       return true
     }
     return false
@@ -12676,9 +12705,11 @@ function objDroppedFieldList(src: i32, dst: i32) {
 function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   let sT = shapeAdaptSrcTy
   let dT = shapeAdaptDstTy
+  let sX = shapeAdaptSrcExpr
   if sT < 0 || dT < 0 {
     sT = src
     dT = dst
+    sX = srcExpr
   }
   let through = ""
   if !tyEq(sT, src) || !tyEq(dT, dst) {
@@ -12688,24 +12719,58 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
       tyToStr(dst) +
       ")"
   }
-  tErrUnsupported(
-    "an object value of shape " +
-      tyToStr(sT) +
-      " flowing into " +
-      tyToStr(dT) +
-      through +
-      " drops the field " +
-      objDroppedFieldList(sT, dT) +
-      ": type-valid (structural width subtyping) but not yet supported by codegen — a " +
-      "struct's wasm type is its own field list, so these are unrelated types and no " +
-      "field-dropping conversion exists. Construct the value at " +
-      tyToStr(dT) +
-      " (an object literal is built at the shape it flows into), or declare the source " +
-      "with exactly " +
-      tyToStr(dT) +
-      "'s fields",
-    srcExpr,
-  )
+  // AN OBJECT LITERAL GETS ITS OWN WORDING, because the other message's two ways out are
+  // both wrong here: "construct the value at the destination shape" is what the author
+  // already did, and "not yet supported by codegen" describes a build failure the literal
+  // does not take. What the literal takes is SILENT — it builds at the destination shape,
+  // which drops the excess field's initializer unevaluated — so the message names the
+  // evaluation that would not happen, and the one way out (drop the field or declare it).
+  if litShapeDropSrcExpr(sX) {
+    tErr(
+      "this object literal sets " +
+        objDroppedFieldList(sT, dT) +
+        ", which " +
+        tyToStr(dT) +
+        " does not declare" +
+        through +
+        ": a literal is built at the shape it flows into, so the extra field would be " +
+        "dropped and its initializer never evaluated — a call there would never run. " +
+        "Remove the field, or declare it on " +
+        tyToStr(dT),
+      srcExpr,
+    )
+  } else {
+    tErrUnsupported(
+      "an object value of shape " +
+        tyToStr(sT) +
+        " flowing into " +
+        tyToStr(dT) +
+        through +
+        " drops the field " +
+        objDroppedFieldList(sT, dT) +
+        ": type-valid (structural width subtyping) but not yet supported by codegen — a " +
+        "struct's wasm type is its own field list, so these are unrelated types and no " +
+        "field-dropping conversion exists. Construct the value at " +
+        tyToStr(dT) +
+        " (an object literal is built at the shape it flows into), or declare the source " +
+        "with exactly " +
+        tyToStr(dT) +
+        "'s fields",
+      srcExpr,
+    )
+  }
+}
+
+// Is the CLAIMED pair's source (`shapeAdaptSrcExpr`, already `(…)`-peeled) an object
+// literal? That is the whole difference between the two wordings, and it must be asked of
+// the pair the walk stopped on: `{ pet: aCat }` is an object literal whose claimed source
+// is the pinned `Cat` in `pet`, and `[{ legs, purr }]` is an array literal whose claimed
+// source IS an object literal. Asking the outer expression answers both the wrong way.
+function litShapeDropSrcExpr(claimedExpr: i32) {
+  if claimedExpr < 0 { return false }
+  const ce = P.nodes[claimedExpr]
+  if ce is ObjLit { return true }
+  false
 }
 
 function assignable(src: i32, dst: i32) {
