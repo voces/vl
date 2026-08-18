@@ -1762,12 +1762,19 @@ let cPlainAliasNames: string[] = []
 //
 // These three columns make the fill DEMAND-ORDERED. `cFillStmtIx` maps a declared type
 // name to its declaration statement (LAST wins, exactly as `cUserTypes` does for a
-// redeclared name); `cFillDoneIx` is the set of arena entries already filled, keyed by
+// redeclared name); `cFillDoneAt` is the set of arena entries already filled, keyed by
 // ARENA INDEX so two declarations sharing one placeholder still fill it once;
 // `cFillActive` is true only while pass 0b runs, so no later pass — and not the emitter,
 // which re-resolves names long afterwards — can re-enter the fill.
+//
+// `cFillDoneAt` is a FLAG COLUMN INDEXED BY the arena index (1 == filled), not a list of
+// the filled indices: the membership question is asked once per declaration and the list
+// grows once per declaration, so a scan would be O(#typedecls²) over the whole pass.
+// Indexing is available because `addTy` appends without interning, so a placeholder's
+// arena index is dense and unique to it. The KEY is unchanged — arena index, never name —
+// which is what keeps a redeclaration filling one placeholder exactly once.
 let cFillStmtIx: {[string]: i32} = Map()
-let cFillDoneIx: i32[] = []
+let cFillDoneAt: i32[] = []
 let cFillActive = false
 // NOMINAL NEWTYPE sidecar (webcraft P1.5 / A14) — the fourth member of the
 // `cStructTyIxs` / `cUnionTyIxs` / `gaAppTyIxs` family, and built to the same rule:
@@ -17715,7 +17722,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
 // Resolve declaration statement `sx`'s fields / union variants and fill them into the
 // placeholder pass 0a minted for it, pushing into the SAME arrays its arena entry holds.
 // A name redeclared later overwrote `cUserTypes` in pass 0a, so both declarations resolve
-// into the LAST placeholder; `cFillDoneIx` keeps each arena entry filled exactly once.
+// into the LAST placeholder; `cFillDoneAt` keeps each arena entry filled exactly once.
 //
 // TWO CALLERS, and the second is what makes the fill ORDER-INDEPENDENT: pass 0b's
 // source-order driver, and `declaredTyOfName` on demand (`forceDeclFill`) the moment a
@@ -17732,7 +17739,7 @@ function fillTypeDeclAt(sx: i32) {
   if sd is TypeDecl {
     const declIx = cUserTypes[sd.tdName] ?? -1
     if declIx >= 0 && !fillDone(declIx) {
-      cFillDoneIx.push(declIx)
+      markFillDone(declIx)
       const pt = T.tys[declIx]
       if pt is TyObj {
         const fnames = pt.objFieldNames
@@ -17779,7 +17786,7 @@ function fillTypeDeclAt(sx: i32) {
     // type-arena indices (forward references hit the 0a placeholders).
     const declIx = cUserTypes[sd.udName] ?? -1
     if declIx >= 0 && !fillDone(declIx) {
-      cFillDoneIx.push(declIx)
+      markFillDone(declIx)
       const pt = T.tys[declIx]
       if pt is TyUnion {
         const members = pt.uMembers
@@ -18033,14 +18040,20 @@ function fillTypeDeclAt(sx: i32) {
 }
 
 // Is the arena entry `declIx` already filled? Keyed by ARENA INDEX, not by name, so two
-// declarations sharing one placeholder (a redeclaration) fill it exactly once.
+// declarations sharing one placeholder (a redeclaration) fill it exactly once. One
+// bounds-checked read of the flag column; an index past its end is simply not yet marked.
 function fillDone(declIx: i32) {
-  let i = 0
-  while i < cFillDoneIx.length {
-    if cFillDoneIx[i] == declIx { return true }
-    i = i + 1
-  }
-  false
+  if declIx < 0 || declIx >= cFillDoneAt.length { return false }
+  cFillDoneAt[declIx] == 1
+}
+
+// Mark arena entry `declIx` filled, extending the flag column to cover it. The column only
+// ever grows, so the extension costs O(highest arena index marked) across the whole pass.
+function markFillDone(declIx: i32) {
+  if declIx < 0 { return 0 }
+  while cFillDoneAt.length <= declIx { cFillDoneAt.push(0) }
+  cFillDoneAt[declIx] = 1
+  0
 }
 
 // Fill declaration `name` NOW, when pass 0b is running and has not reached it. Inert
@@ -18085,7 +18098,7 @@ function checkProgramNode(n: Program) {
   gaAppFinite = []
   cPlainAliasNames = []
   cFillStmtIx = Map()
-  cFillDoneIx = []
+  cFillDoneAt = []
   cFillActive = false
   nwDeclNames = []
   nwTyIxs = []
@@ -18222,7 +18235,7 @@ function checkProgramNode(n: Program) {
   // declaration came first. Nothing else in the language orders declarations, and the
   // spelling channel never did: `canonEmitTypeNames` runs after this pass and rewrote a
   // transparent alias to its member either way, so the two channels used to disagree.
-  cFillDoneIx = []
+  cFillDoneAt = []
   cFillActive = true
   let ti = 0
   while ti < stmts.length {
