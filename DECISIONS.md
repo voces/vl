@@ -10,6 +10,31 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **Structural identity ignores FIELD ORDER — except for flat types** (owner ruling
+  2026-08-19). `{a: i32, b: i32}` and `{b: i32, a: i32}` are the same type, and the
+  emitter's shape dedup keys on a sid-SORTED `(field name, field code, element, map-key
+  bit, atom bit)` multiset so that order cannot change the identity. Until this ruling the
+  property was EMERGENT — it fell out of matching each queried field by name — rather than
+  stated, which is why the sort is now deliberate and commented as the rule it enforces.
+  **The exception is FLAT types, where field order IS the byte layout**, so a permuted twin
+  is a different layout and must not dedup. *(Open: confirm "flat" means the buffer/view
+  family, and pin a fixture proving a flat type does not dedup with a field-permuted twin —
+  nothing enforces the exception today.)*
+
+- **A declared alias and its inline spelling are the SAME TYPE; the DIAGNOSTIC shows the
+  LOCAL spelling** (owner ruling 2026-08-19). `type A = {v: i32}` and a bare `{v: i32}`
+  denote one type, and the compiler may merge their rows freely — this is what licenses the
+  emitter's arena-keyed row lookups, where two structurally identical rows interned under
+  different spellings resolve to whichever comes first. **But a message must render the
+  spelling the user WROTE at that position**, not whichever spelling the merged row happens
+  to carry: being told about `A` when you wrote `{v: i32}` is confusing, and the merge is an
+  implementation fact the reader has no way to know. Owner direction is additionally that a
+  reader should be able to DIVE into a spelling's depth — `A` by default, expanded to
+  `{v: i32}` on demand — rather than the compiler choosing one level for them. *(The
+  local-spelling renderer and the depth affordance are both unbuilt; the merge itself is
+  live.)*
+
+
 - **Fully typed, no `dynamic`.** Types are hidden by aggressive inference, but
   `Unknown`/`Infer` are inference _holes that resolve_ to concrete types — there
   is no gradual/untyped escape hatch. Blueprint: Elixir v1.20 set-theoretic
