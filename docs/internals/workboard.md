@@ -317,9 +317,30 @@ through the twin layer.
 
 **So `sNames` is not a lookup key that survived by inertia.** It is the row's declared-ness marker,
 and there is no structural test standing in for it: "declared" is a fact about where the row's
-spelling CAME FROM, not about its type. Removing the spelling means giving rows an explicit
-declared-ness column first — a different change, cheap to make and orthogonal to everything in this
-programme.
+spelling CAME FROM, not about its type.
+
+**I then said the fix was "an explicit declared-ness column, cheap to make". I built it, and it is
+not.** Two attempts, both measured against `cUserTypes[sNames[si]] >= 0` over 2,185 corpus rows:
+
+| attempt | agree | name-only | column-only |
+|---|---|---|---|
+| label each of the 5 mint sites by WHAT IT INTERNS | 597 | **5** | **3** |
+| bank the NAME's own `cUserTypes` answer AT THE MINT | 597 | **5** | **3** |
+
+**Identical disagreement, which is the whole finding.** If labelling by provenance and banking the
+name's own answer are wrong in exactly the same 8 cells, the answer is not a property of the mint at
+all — **it CHANGES after the row is minted.** And it does: `cUserTypes` is add-only during emit
+(`resolveAnnot` memoizes new spellings mid-pass), which is precisely why `repSlotCacheSync` carries
+`cUserTypesVer` in its generation stamp. `AB` and `PairA` become declared after their rows exist;
+`{d:i32}` and `{g:f64}` were in the table when their rows were minted and are not what the query
+means later.
+
+**So the name resolution there is not a re-derivation to be cached — it is a RE-READ, and it is
+re-read because the answer moves.** That is the end of this line, and it is an explanation rather
+than a shrug: `sNames` persists because the row layer has to ask a question whose answer depends on
+state that grows after the row does.
+
+Reverted (both attempts); 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
 
 Reverted; 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
 
