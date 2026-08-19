@@ -639,6 +639,22 @@ irreducible cost of a test corpus written almost entirely in inline annotations*
 that measures the programme is the self-compile's **6**, on a body of real code where types are
 declared and therefore have somewhere to be resolved FROM.
 
+**AND THAT IS THE FLOOR, PROVEN RATHER THAN ARGUED.** Counting each resolution as FIRST or REPEAT for
+its spelling:
+
+| | resolutions | first time for that spelling | **repeat** |
+|---|---|---|---|
+| the compiler compiling itself | 6 | 6 | **0** |
+| the corpus (2,010 files) | 1,855 | **1,854 (99.9%)** | **1** |
+
+**One repeat in 2,010 files.** Every remaining name resolution is the first and only time that
+spelling is resolved. A distinct inline annotation cannot be typed in fewer than one resolution, so
+this is not "how much parsing is left" — it is the count of distinct annotations that have no
+declaration to be resolved through, which is a property of the SOURCE, not of the compiler.
+
+**The programme is at its floor on both bodies of code.** Six on the self-compile, one-per-spelling
+on the corpus. There is no re-derivation left to remove.
+
 **Where this leaves band 1.** Every table the programme set out to convert has been measured, and
 each is either converted or measured to zero available gain:
 
