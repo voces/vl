@@ -421,6 +421,36 @@ programme, and it is now the only thing between `sNames` and deletion.
 that asked by name, three ARE the name lookup, one is a syntactic test, one is a documented
 fallback, one is the mint recorder. None re-derives a type from a string.
 
+## THE NEXT PROGRAMME, SIZED — the three identity columns one layer up (2026-08-19)
+
+`sNames` cannot go until the tables it supplies stop being name-keyed. Those tables are three
+identity columns, and here is the census that sizes the work rather than asserting it:
+
+| column | readers | of which RE-PARSE the spelling |
+|---|---|---|
+| `rlElemName` — the ref-list element table | **32** | **9** (`nonNulBaseOf` ×5, `nullablePartOf`, `rlSlotOfArrName`, `mvSlotOfMapName`, a `nameIs*` test) |
+| `mvValName` — the map-value table | **15** | **2** |
+| `uFieldElemName` — the union field-element column | **16** | **0** |
+| **total** | **63** | **11** |
+
+**It is the same two halves as this programme, one layer up.** 52 readers treat the spelling as an
+IDENTITY (return it, compare it, hand it on) — the "stop representing types as strings" half. 11
+re-PARSE it — `nonNulBaseOf`, `nullablePartOf`, `rlSlotOfArrName`, `mvSlotOfMapName` — the "stop
+parsing strings to represent types" half, and the smaller of the two, exactly as it was here.
+
+**The blocking capability is an arena-keyed MINT.** Three sites feed `rlInternName` / the
+`uFieldElemName` write with a struct row's spelling; an intern MINTS a row keyed by the name it is
+handed, so it cannot take a type unless the table's identity column stops being a name. That is the
+first slice of the next programme, not a precondition for starting it: `rlElemTyIx` already exists
+beside `rlElemName`, so the sidecar is in place and only the KEY has to move — which is precisely the
+shape the rep-column rewrite took here (identity first, consumers after, each with a dual-run).
+
+**Tools that carry over, all built and proven this session**: the hash-consed structural identity
+(`repCanonId` / `repElemId`) with its `hcLen` shape check; the `repShadowSweep` harness slot for an
+equivalence assertion; the per-table incremental index with an explicit per-program reset (three of
+them now, each with a sabotage proving the reset load-bearing); and `scripts/rep-fuzz-check.sh` as
+the gate that corpus byte-identity cannot replace.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
