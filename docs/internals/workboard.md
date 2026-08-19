@@ -668,6 +668,48 @@ each is either converted or measured to zero available gain:
 | the interner's row LOOKUP | indexed, aliased, and no reader parses or types the spelling |
 | `rlElemName` / `mvValName` / `uFieldElemName` | ladder complete · 100.0% · declines are fields with no element |
 
+## BAND 1 IS THE DESTRINGIFY PROGRAMME IN FULL — not a stage of one (2026-08-19)
+
+Stated plainly because the record now contains a long chain of per-layer completions and it would be
+easy to read them as stages of something larger. The bands are defined at the top of this file, by
+the owner:
+
+> 1. **Destringify types** — stop representing types as raw strings; stop parsing or building strings
+>    to represent them. Efficient, type-safe data structures instead.
+> 2. **Webcraft asks** — the consumer-driven requirements.
+> 3. **Everything else.**
+
+**Bands 2 and 3 are different work, not further destringify work.** There is no band 1a/1b. So "band
+1 is at its floor" is the completion statement for the whole programme, and the two clauses of its
+definition are each measured rather than asserted:
+
+**"stop representing types as raw strings"** —
+
+| representation | state |
+|---|---|
+| a type's structure or kind in the arena | `PrimName` / `LitKind` / `errKind: i32` — no strings |
+| a rep table's key | a hash-consed structural id; **0 characters** built on a real compile |
+| a struct row's identity | an enumerated five-dimension id, complete at 2,360/0 |
+| a struct row's declared-ness | a column banked at the mint, 602/0 and 1,029/0 |
+| the ref-list / map-value / union-field element columns | ladder complete · 100.0% covered · declines are fields with no element |
+
+**"stop parsing strings to represent them"** —
+
+| | resolutions from a SPELLING | first for that spelling | repeat |
+|---|---|---|---|
+| the compiler compiling itself | **6** | 6 | **0** |
+| the corpus (2,010 files) | 1,855 | 1,854 | **1** |
+
+**One repeat in 2,010 files, none in the self-compile.** Every remaining resolution is the first and
+only reading of a distinct inline annotation — a property of the source, since an annotation with no
+declaration behind it cannot be typed in fewer than one resolution.
+
+**What is NOT claimed.** Names have not been removed from the compiler and were never the target:
+`sNames`, `rlElemName`, `mvValName` and `uFieldElemName` still store the spelling a consumer asking
+BY NAME gets back, because source code has names and the emitter's tables are addressed by them. What
+was removed is every place a type's structure lived in a string, and every re-derivation of a type
+from one. Those are the two clauses, and both now carry a number.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
