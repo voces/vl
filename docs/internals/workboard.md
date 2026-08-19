@@ -1778,22 +1778,48 @@ Instrumented at the comparison over the corpus:
 | …with an arena type on BOTH sides | 1,471 |
 | **…where the arena types nevertheless AGREE (the coarsening)** | **0** |
 
-**Zero.** On this corpus, element spellings that differ always denote different types, and equal
-spellings trivially denote the same one. So the arena comparison and the text comparison partition
-identically — the refinement is **not** a semantic question and does not wait on the twin-merge
-ruling.
+**Zero — AND THAT ZERO IS AN ARTIFACT. THE MEASUREMENT WAS BROKEN AND THE CONCLUSION BELOW IS
+RETRACTED.** The probe compared RAW ARENA INDICES, and arena indices are not canonical for structural
+identity: the checker mints fresh entries in many places and only `resolveAnnot`'s memo dedups per
+spelling, so two entries for the same type routinely carry different indices. Instrumented properly —
+comparing the row's banked `sFieldElemTyIx` against a query-side peel of the same element, by
+`repCanonId` — the picture inverts:
 
-**What it does wait on is mechanical**: the ROW side is 98.7% covered by the existing `sFieldElemTyIx`
-sidecar, but the QUERY side has no type — `annShapeIndexOf` receives field TEXTS. Supplying it means
-the caller peeling each field's element type out of `fldTy` with a per-code ladder mirroring the
-mint's own element extraction (the long per-code arm in `internInlineShapeTy`'s push loop). That is
-a "one home for the element peel" refactor, of the B9 family, not a design call. Population: 1,471
-cells corpus-wide and **0 on the compiler's own source**, so it is small and it is not urgent — but
-it is unblocked, which is the point of measuring it.
+| comparator | agree | **disagree with the text verdict** |
+|---|---|---|
+| raw arena index | 710 | **1,233** |
+| `repCanonId`, code-15 nullable peel wrong | 828 | **1,115** |
+| `repCanonId`, code-15 peel fixed | 900 | **1,043** |
 
-**So the pending-ruling list is now exactly ONE item, not two:** may a struct ROW's identity be its
-TYPE, collapsing spelling twins (15 of 8,201 cells, 0 of 2,010 files move)? The element refinement is
-off that list.
+The residue is **codes 16 and 19, and it is a real coarsening**. For those codes the row banks a
+DIFFERENT VOCABULARY from the field text: a map field (19) banks its VALUE name while the text is the
+whole `{[string]: V}` spelling, and a union field (16) banks the recorded union name (`K|f64`) while
+the text is the softened render (`string|f64`). So the text comparison answers "distinct" for
+essentially every map-field shape, and an arena comparison answers "same" — merging shapes the
+interner deliberately keeps apart. **The byte channel agrees: taking it breaks 2 of 2,010 files**, one
+of them loudly (`emitProgram: binding's inline-shape type has an unsupported field`).
+
+**So the element refinement DOES carry a semantic question after all, and it is not the same one as
+the row identity — it is narrower and uglier**: the refinement compares a banked element name against
+a field TEXT that, for two codes, is not the same kind of string. Converting it means first making
+those two vocabularies agree, which is the "one home for the per-code element extraction" refactor,
+and only then is there an equivalence to measure.
+
+**Three tries, three wrong answers, and the third one is the finding.** The lesson is the same one
+this board keeps recording in different clothes: *an equality test is only as good as the identity it
+compares.* Raw arena indices are not an identity; `repCanonId` is, which is why it had to be built
+first — and even with it, the two sides must be speaking about the same thing before agreement means
+anything.
+
+**The row side is well covered** — 2,423 of 2,454 (98.7%) carry `sFieldElemTyIx` — so the sidecar is
+not the problem. The problem is stated above: the query side must peel the element out of `fldTy`
+with a ladder mirroring the mint's per-code extraction, and for codes 16 and 19 the mint banks a
+different vocabulary from the text the query holds. Population: 1,943 comparisons corpus-wide and
+**0 on the compiler's own source**.
+
+**So the pending list is TWO items after all**, and I put it at one prematurely:
+1. may a struct ROW's identity be its TYPE, collapsing spelling twins? (15 of 8,201 cells, 0 of 2,010 files move — priced, an owner call)
+2. should the map- and union-field element vocabularies be unified with the field text, so the refinement HAS an equivalence to measure? (a refactor first, then a measurement — not yet an owner call)
 
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
