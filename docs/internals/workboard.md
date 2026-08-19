@@ -935,6 +935,53 @@ none of them encodes a type's shape or kind. **On the programme's own terminal c
 0 verdict changes and 0 emitted-byte changes over 2,005 corpus files; full suite 2,159/0;
 fixpoint holds; the seed shrank 68 bytes.
 
+### THE EMITTER HALF: BUILT, MEASURED, AND NOT SHIPPED — the number is 2 of 413
+
+The terminal item below says the interner's leaves are names CUT from a larger spelling, so no
+caller can bank an index for them. That is true of the CALLERS and it is not the end of the
+argument: **the ROOT has a node.** `collectAnnShapes` walks every node and holds `ti`, so the
+descent can be given an arena type at the top and PEEL IT IN LOCKSTEP with the name.
+
+I built it. `internShapeDeepTy(nm, ty)` threads the type through the descent — paren peel keeps
+`ty`, `nullablePartOf` takes `t.nInner`, `arrElemNameRaw` takes `t.aElem`, `mapValNameOf` takes
+`t.mVal`, and union arms / functype interiors drop to -1 rather than guess. The name peel is
+untouched and stays authoritative for every key, dedup and stored spelling; the type rides
+alongside and reaches only `internInlineShapeTy`'s `sTyIx` hint. Three `tyStep*` helpers, named
+apart from the existing `tyPeelNul` because that one answers `ty` itself on a miss while these
+must DECLINE (the B9b precedent).
+
+**It works, and the coverage is real: 1,156 of 3,145 leaf calls (36.8%) carry the hand-over**,
+where the descent previously had none. Corpus A/B was 0 verdict and 0 byte changes, suite green,
+fixpoint held.
+
+**And it is still wrong, which only a dual-run could show.** `sTyIxOfNameTy` short-circuits on
+the hint, so the handed index must EQUAL `cUserTypes[nm] ?? resolveAnnot(nm)`. Measured:
+
+| | agree | **disagree** |
+|---|---|---|
+| ungated | 447 | **11** |
+| gated on `annTsOf(ti) >= 0` | 411 | **2** |
+
+The gate is the canon invariant itself — `clearAnnTs` drops the spelling tree on exactly the
+nodes canon rewrote in place, so a surviving tree says the name still describes the recorded
+type. It removes 9 of the 11. **Two survive, and two is not zero.**
+
+**NOT SHIPPED, and the reason is the corpus could not have caught it.** The byte A/B was clean
+because `sTyIx` is weakly consumed — a deliberate sabotage handing arena index 0 at every leaf
+also passed the whole suite. So a wrong hand-over here is invisible to every channel this board
+runs and waits for a future consumer: exactly the silent-wrong-slot failure `rlInternNameTy`'s
+header forbids (*a hint that disagrees re-keys the row*).
+
+**What this settles.** The emitter half cannot be destringified by hand-over, and the blocker is
+not "no caller holds a bank" — it is that the bank a caller holds *disagrees with the name* on a
+small, stubborn residue. That residue is B5's class (canon-time arena identity), now measured
+from a second, independent direction: **B5 was 61 of 1,400 at its own site; this route is 2 of
+413 after the canon gate.** The rep-column rewrite is not optional and B5 is its first step.
+
+The mechanism is described precisely enough to rebuild in an afternoon if B5 lands; what it
+needs from B5 is the guarantee that a node's recorded type and its post-canon spelling name the
+same type.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
