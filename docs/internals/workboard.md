@@ -867,6 +867,43 @@ converted, so this removes the PARSE and not yet the SPELLING. That is the mecha
 remaining 2,814 need; each further site is a question of whether its producer holds an index,
 not of whether the route exists.
 
+### THE `annotResolve` HALF, MEASURED PER SITE — and BLOCKED-REP is now a number
+
+The filing calls this half blocked at the rep layer. That is inherited, not measured, so I
+instrumented each of `emit_rep`'s `resolveAnnot` call sites — counting CALLS and, separately,
+the calls that reach a parse (a memo miss at the outermost entry) — over the corpus:
+
+| site | calls | **parses** |
+|---|---|---|
+| 1 · `repElemKeyOfNameTy`, hand-over absent (`ty < 0`) | 8,478 | **553** |
+| 2 · `slotCanonKey`, shape-span arm | 1,084 | **417** |
+| 3 · `declTyIxOfName`, composite fall-through | 9,882 | **1,138** |
+| 4 · `repRowOfName`, shape-span arm | **0** | **0** |
+| total | 19,444 | **2,108** |
+
+Cross-validates the independent census above (which read 2,110 for this whole half through a
+different probe), so both instruments agree to within 2.
+
+**Site 3 is the biggest single site in the programme's remaining population — and it is at its
+FLOOR for a name-keyed design.** `declTyIxOfName` already runs two rungs (`cUserTypes`, then
+`primTyOfName`) and `resolveAnnot` memoizes per spelling, so **9,882 calls collapse to 1,138
+parses — the memo already absorbs 88.5%**. What remains is one parse per DISTINCT composite
+spelling per program, roughly 0.7 per corpus file. No further rung can go below that: a rung
+answers a name faster, and the floor is the number of distinct names.
+
+**So "BLOCKED-REP" is confirmed rather than inherited, and now says something specific**: the
+only way under 1,138 is to stop keying by NAME at all — the rep tables carrying an arena index
+beside (or instead of) their name column, which is what the `sTyIx[]` sidecar started. Its
+callers are the rep tables' name-keyed entry points (`fieldElemTyIxOfName` at intern time,
+`unMemAtomTyIx` at union-member registration), so the conversion is per-column, not per-call.
+
+**Site 4 is measured at ZERO calls and is NOT deleted.** Its own header records rung 1
+declining 32 times corpus-wide; my probe adds that **0 of those 32 take the shape-span arm** —
+they are `#anon` rows and unresolvable spellings, for which `nameIsShapeSpanEnds` is false.
+That is corpus COVERAGE, not a reachability proof, and this programme's own D-TOTALITY rule is
+that a fall-through is deleted with an argument or kept with its measurement. Kept, with the
+measurement.
+
 ### THE MONO HALF'S ROOT, sized: `monoSubstAnn` ALREADY HAS AN ARENA TWIN IN THE TREE
 
 The three remaining `synthTypeRef` sites in `emit_mono` (`:687`, `:739`, `:831`) do not hold
