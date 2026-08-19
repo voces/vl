@@ -1537,6 +1537,49 @@ specifically: **their key no longer has to be a spelling at all, and the replace
 partition identically over 283,052 pairs.** What remains is wiring, one consumer at a time, each
 gated on byte-identity — ordinary work rather than a design question.
 
+### THE INTERNER, MEASURED — and its cost is NOT the parse (2026-08-19)
+
+With the rep tables done, I sized the interner before converting it, and the census re-ranked it:
+
+| interner population | corpus (2,010 files) | **self-compile** |
+|---|---|---|
+| `structIndexByName` — the row lookup BY SPELLING | 207,375 calls | **258,112 calls · 2,394,078 row comparisons** |
+| `nameFieldCode` — the field-code classifier | 12,414 calls · 100,214 chars | 1,267 · 6,917 |
+| `shapeInnerFieldSplit` — THE PARSE | 5,237 calls · 82,106 chars | **0** |
+| `annShapeIndexOf` — the dedup scan | 3,116 calls · 12,048 rows | **0** |
+
+**The shape interner's field split runs ZERO times on the compiler's own source, and so does the
+dedup scan.** Every annotation the compiler writes about itself is nominal, so the parse the terminal
+item is named for is not what the interner costs there. What it costs is the **name-keyed row LOOKUP**
+— 258,112 calls, each a linear walk over `sNames` with a string compare per row.
+
+**So the slice is the lookup, not the parse**, and it is the same shape as everything else this
+session: `structIndexByName` is now an incremental index rather than a scan. Incremental and not
+rebuilt-on-demand because `sNames` grows THROUGHOUT collect — a rebuild-on-length-change index is
+O(n) per growth and puts the same O(n²) back. `sNames` is push-only within a program (four push
+sites, no in-place rename), so the index only ever needs the rows past its watermark; first match
+wins, preserving the scan's duplicate-spelling semantics exactly.
+
+**The per-program reset is load-bearing and that is MEASURED, not argued.** A watermark cannot see
+`collectS`'s `sNames = []`: program B pushing as many rows as A leaves the watermark satisfied with
+A's spellings still in the map. Removing the explicit `structNameIxReset()` fails **438 of 1,939** in
+the shared-instance wasm harness — the same harness, and the same hazard, that
+`sidKeyedTablesReset`'s header describes for its own tables.
+
+**PERF: NOT A MEASURED SPEEDUP, and I am shipping it anyway.** Min-of-8 self-compiles: **1.55 s
+before, 1.54 s after.** The corpus channel is pure noise (2,010 tiny files, dominated by
+instantiation: two alternating rounds gave 13.10/12.66 indexed against 15.18/12.30 scanned). So
+removing 2.4 million string comparisons is **invisible — the eighth time this session that deleting a
+large string-shaped population moved the clock by nothing.** The justification is complexity, not
+time: an O(rows)-per-query scan on the emitter's hottest name query is worth removing on a program
+larger than anything in this corpus, and the byte gate is exact (0 of 2,010 on wasm sha256, exit code
+and diagnostic text).
+
+**A method note that cost a run.** Sabotaging the reset and testing with `VL_COMPILER_WASM` set
+showed 1,939/0 — the Deno harness loads `build/vl-compiler.wasm` directly and does not read that
+variable. The sabotage only reddened once the seed was actually swapped on disk. Same family as the
+CWD lesson earlier in this programme: **verify the probe reached the thing you think it reached.**
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and

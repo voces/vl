@@ -6766,13 +6766,50 @@ export function variantFieldIsLitUnion(vi: i32, fj: i32) {
 
 // The struct table index whose name is `name`, or -1 if `name` is not a declared
 // struct type.
-export function structIndexByName(name: string) {
-  let i = 0
-  while i < sNames.length {
-    if sNames[i] == name { return i }
-    i = i + 1
+// ── the struct-row NAME index ────────────────────────────────────────────────
+// `structIndexByName` was a LINEAR SCAN of `sNames` with a string compare per row, and
+// it is the hottest name-keyed query in the emitter by an order of magnitude: **258,112
+// calls and 2,394,078 row comparisons on the compiler's own source**, 207,375 calls over
+// the corpus. (For contrast, on the self-compile the shape interner's field SPLIT runs 0
+// times and `annShapeIndexOf` 0 — the compiler's own annotations are all nominal. The
+// scan is the interner's cost there, not the parse.)
+//
+// INCREMENTAL, not rebuilt-on-demand, because `sNames` grows THROUGHOUT collect: a
+// rebuild-on-length-change index would be O(n) per growth and turn the same O(n²) back on.
+// `sNames` is push-only within a program (four push sites, no in-place rename), so the
+// index only ever needs the rows past its watermark.
+//
+// FIRST MATCH WINS, preserving the scan's semantics exactly: a duplicate spelling keeps
+// the earliest row, so the insert is guarded rather than overwriting.
+//
+// THE RESET IS EXPLICIT AND IT HAS TO BE. A watermark alone cannot see the per-program
+// `sNames = []` in `collectS`: program B pushing as many rows as A had leaves
+// `sNameIxLen == sNames.length` with A's spellings still in the map. So `collectS` calls
+// `structNameIxReset()` beside the table reset it belongs to.
+let sNameIx: {[string]: i32} = Map()
+let sNameIxLen = 0
+
+export function structNameIxReset() {
+  sNameIx = Map()
+  sNameIxLen = 0
+  0
+}
+
+function sNameIxSync() {
+  // Defensive, and free: a table that SHRANK without the explicit reset would otherwise
+  // answer from a longer past. Never observed; costs one compare per query.
+  if sNameIxLen > sNames.length { structNameIxReset() }
+  while sNameIxLen < sNames.length {
+    const nm = sNames[sNameIxLen]
+    if (sNameIx[nm] ?? -1) < 0 { sNameIx[nm] = sNameIxLen }
+    sNameIxLen = sNameIxLen + 1
   }
-  -1
+  0
+}
+
+export function structIndexByName(name: string) {
+  sNameIxSync()
+  sNameIx[name] ?? -1
 }
 
 // The number of FULLY-collected struct entries — the scan bound for any matcher that
