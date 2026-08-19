@@ -1136,6 +1136,63 @@ after, on every measurement** — so none of it is a speed result, for the fourt
 | `gaeApplyFieldTy` | 4 | a name BUILT by substitution — no node exists to hold |
 | value union | 4 | `registerValueUnionName` is a box registration, not a shape intern |
 
+### THE FUNCTYPE DESCENT GETS THE SAME LOCKSTEP — the terminal item is now 92.8% closed (2026-08-19)
+
+`internFuncTypeShapes` is `internShapeDeep`'s twin for closure spellings and it took **no type
+parameter at all** — 109 of the 209 leaves still unhinted after the arm slice, plus the 21 under
+`internNonLowerableFieldShapes`, which is reachable only through it. The conversion is the same
+shape as the other two, one grammar deeper:
+
+| name step | arena step |
+|---|---|
+| `annFnDecompose` param texts | `TyFunc.fnParamTypes[i]`, **only** when the arity matches |
+| `annFnDecompose` result text | `TyFunc.fnRet` |
+| `nullablePartOf` | `t.nInner` |
+| `arrElemNameRaw` | `t.aElem` |
+| `arrLeafNameOf`'s `[]` RUN | `tyStepArrRun` — the layer count is the length delta halved |
+| a field name | `tyFieldTyOf` |
+
+The pairing is positional, so an arity mismatch **declines rather than tolerates**: a function of a
+different arity is a different function, not a near miss. Three callers gained a root along the way —
+the descent's own functype branch, `internShapeArms`' closure arm (which now holds `armTy` from the
+previous slice), and the value-union closure-arm descent, paired by the same `unionMemberTysOf` seam.
+
+Every new helper is LIVE, measured rather than assumed: `tyStepParam` answers **1,784**, `tyStepRet`
+**1,895**, `tyStepArrRun` peels a real run **16** times, `internShapeFieldElemsTy` is hinted on
+**224 of 273** calls and `internNonLowerableFieldShapesTy` on **37 of 49**.
+
+| | after arms | after functype |
+|---|---|---|
+| leaf resolutions with a hint | 888 of 1,097 (80.9%) | **1,018 (92.8%)** |
+| `sTyIxOfNameTy` reaching `resolveAnnot` | 342 | **212** |
+
+**Dual-run 1,018 agree / 0 disagree**; sabotage (params fed the RESULT type and the result fed
+param 0) reddens **18** and strands 241 more hints downstream. Corpus A/B **0 of 2,010** on
+emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint
+byte-exact at 1,231,083; self-lint + fmt clean; LSP rebuilt.
+
+### WHERE THE DESTRINGIFY EMITTER HALF STANDS AFTER THREE SLICES
+
+| | at session start | now |
+|---|---|---|
+| leaf `sTyIxOfNameTy` resolutions carrying an arena hint | 409 of 1,097 (37.3%) | **1,018 (92.8%)** |
+| `sTyIxOfNameTy` reaching `resolveAnnot` (corpus) | 816 | **212 (−74.0%)** |
+| the same, on the compiler's own source | **0** | **0** |
+
+The interner header's original claim — *"the other four callers are not hintable and that is the
+measurement, not an omission"* — is now false for three of the four, and the fourth
+(`internShapeFieldElems`) is hinted too. What was true of the CALLERS was never true of the tree:
+a cut substring has no bank, but every cut has a parent that does, and the parent chain reaches a
+node at the root.
+
+**Residual 79 leaves.** Not yet attributed — the next probe, and the honest statement is that I have
+not run it. `gaeApplyFieldTy` (a name BUILT by substitution, so no node can exist) and the two
+collect-site gates are the known members; the rest is unmeasured.
+
+**This does NOT touch the terminal item's other half.** The interner's KEYS are still names, so the
+rep-column rewrite is unaffected by any of this — what these three slices removed is the RE-RESOLUTION
+of a name whose type the caller already held, not the name-keying itself.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and

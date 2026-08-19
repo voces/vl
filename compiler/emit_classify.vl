@@ -14247,7 +14247,7 @@ function internShapeArms(set: string, arms: string[]) {
       // no interned struct ("field access but no struct type declared"). Route through
       // the soundness-gated functype interner (`funcTypeShapeLowerable` keeps an
       // unsupported-field shape un-interned — a clean reject, never invalid wasm).
-      internFuncTypeShapes(arms[uai])
+      internFuncTypeShapesTy(arms[uai], armTy)
     }
     uai = uai + 1
   }
@@ -14280,6 +14280,51 @@ function tyStepMapVal(ty: i32): i32 {
   -1
 }
 
+// The `TyFunc` arms of the same family. `annFnDecompose` hands back the param TEXTS and
+// the result TEXT; these hand back the matching arena entries, declining unless the arena
+// really is a function of exactly that arity — the pairing is positional, so an arity
+// mismatch is not a near miss to be tolerated, it is a different function.
+function tyStepParam(ty: i32, i: i32, n: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc {
+    if t.fnParamTypes.length != n { return -1 }
+    return t.fnParamTypes[i]
+  }
+  -1
+}
+
+function tyStepRet(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// Peel the arena twin of a trailing-`[]` RUN, sized by how much the name shortened —
+// `arrLeafNameOf` shortens by exactly two characters per layer, so the layer count is the
+// length delta halved. An odd delta, or a layer the arena does not have, declines.
+function tyStepArrRun(ty: i32, full: string, leaf: string): i32 {
+  if ty < 0 { return -1 }
+  let t = ty
+  let n = full.length - leaf.length
+  while n >= 2 {
+    t = tyStepElem(t)
+    if t < 0 { return -1 }
+    n = n - 2
+  }
+  if n != 0 { return -1 }
+  t
+}
+
+// `tyStepNullable`, but only when the name actually lost its `| null` — a non-nullable
+// spelling keeps its own type rather than declining.
+function tyStepNulIf(ty: i32, full: string, base: string): i32 {
+  if ty < 0 { return -1 }
+  if base.length == full.length { return ty }
+  tyStepNullable(ty)
+}
+
 export function internShapeDeep(nm: string) { internShapeDeepTy(nm, -1) }
 
 export function internShapeDeepTy(nm: string, ty: i32) {
@@ -14304,10 +14349,19 @@ export function internShapeDeepTy(nm: string, ty: i32) {
     if strContains(nm, "=>") {
       const vArms: string[] = []
       splitUnionAtoms(nm, vArms)
+      // Paired with the row's arena members by the same D-UNION seam the composite-arm
+      // branch uses — see `internShapeArms` for why the two splits are the same split.
+      const vTys: i32[] = []
+      let vCov = unionMemberTysOf(nm, vTys)
+      if vTys.length != vArms.length { vCov = false }
       let va = 0
       while va < vArms.length {
         const vc = normTypeAtom(vArms[va])
-        if annArrowAt(vc) >= 0 { internFuncTypeShapes(vc) }
+        if annArrowAt(vc) >= 0 {
+          let vTy = -1
+          if vCov { vTy = vTys[va] }
+          internFuncTypeShapesTy(vc, vTy)
+        }
         va = va + 1
       }
     }
@@ -14374,7 +14428,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
   // group closes before the `=>`, not at the last character, and `annArrowAt(nm) >= 1`
   // both supplies the home's length bound and stands in for it.)
   if annArrowAt(nm) >= 1 && nameIsParenOpen(nm) {
-    return internFuncTypeShapes(nm)
+    return internFuncTypeShapesTy(nm, ty)
   }
   // A GENERIC-APPLICATION leaf (`Pair<i32,string>`): `collectGenAliasShapes` interns an
   // application only where a TypeRef spells it BARE (behind `| null` / `[]`), so one
@@ -14615,7 +14669,18 @@ export function variantNestedShapeOk(nm: string): boolean {
 // (never invalid wasm). Idempotent (`annShapeIndexOf`); registers no value union
 // and interns no map, so a functype over unsupported reps is byte-identical to the
 // pre-slice behavior.
-function internFuncTypeShapes(nm: string): i32 {
+export function internFuncTypeShapes(nm: string): i32 {
+  internFuncTypeShapesTy(nm, -1)
+}
+
+// `internFuncTypeShapes` with the caller's recorded arena type for `nm` — the functype
+// twin of `internShapeDeepTy`, peeled in lockstep with the same name grammar
+// (`annFnDecompose` <-> `fnParamTypes`/`fnRet`, `nullablePartOf` <-> `t.nInner`,
+// `arrElemNameRaw` <-> `t.aElem`). The name walk is untouched and stays authoritative for
+// every key and stored spelling; the type rides alongside and reaches only the `sTyIx`
+// hint at the leaf. A value-union leaf declines — `registerValueUnionName` is a box
+// registration, not a shape intern, so there is no leaf to hint.
+function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
   if nm.length < 2 { return 0 }
   // Peel ONLY a grouping pair that wraps the WHOLE name (`(()=>{f:i32})` → `()=>{f:i32}`).
   // A functype whose leading `(` is its own PARAM LIST (`(i32)=>(()=>{f:i32})`) must NOT be
@@ -14623,7 +14688,7 @@ function internFuncTypeShapes(nm: string): i32 {
   // NESTED functype result never intern (a chained value call's struct read then finds no
   // interned shape).
   const uw = normTypeAtom(nm)
-  if uw.length != nm.length { return internFuncTypeShapes(uw) }
+  if uw.length != nm.length { return internFuncTypeShapesTy(uw, ty) }
   // A VALUE-UNION leaf (`f64 | null` as a closure RESULT, `i64 | boolean` as a param) —
   // register its box reps, exactly as `internShapeDeep`'s value-union arm does (and
   // BEFORE the `| null` peel: the null is a union ATOM here, not a nullable wrapper).
@@ -14650,18 +14715,20 @@ function internFuncTypeShapes(nm: string): i32 {
   if fRet != "" {
     let pi = 0
     while pi < fParts.length {
-      internFuncTypeShapes(fParts[pi])
+      internFuncTypeShapesTy(fParts[pi], tyStepParam(ty, pi, fParts.length))
       pi = pi + 1
     }
-    return internFuncTypeShapes(fRet)
+    return internFuncTypeShapesTy(fRet, tyStepRet(ty))
   }
   const np = nullablePartOf(nm)
-  if np != "" { return internFuncTypeShapes(np) }
-  if nameIsElemArray(nm) { return internFuncTypeShapes(arrElemNameRaw(nm)) }
+  if np != "" { return internFuncTypeShapesTy(np, tyStepNullable(ty)) }
+  if nameIsElemArray(nm) {
+    return internFuncTypeShapesTy(arrElemNameRaw(nm), tyStepElem(ty))
+  }
   if nameIsShapeSpanEnds(nm) {
     if funcTypeShapeLowerable(nm) {
-      internShapeFieldElems(nm)
-      internInlineShape(nm)
+      internShapeFieldElemsTy(nm, ty)
+      internInlineShapeTy(nm, ty)
     } else {
       // The result struct is NOT lowerable as a whole (`funcTypeShapeLowerable`
       // false — e.g. it carries a plain CLOSURE field, code 14): the outer shape
@@ -14673,7 +14740,7 @@ function internFuncTypeShapes(nm: string): i32 {
       // interned twin drives invalid wasm at the nested struct.new. With both rows
       // present the `collectAnonShapes` ambiguity resolver (`structIndexOfObjCtx`
       // matches>=2 → the checker's recorded node type) disambiguates the nested literal.
-      internNonLowerableFieldShapes(nm)
+      internNonLowerableFieldShapesTy(nm, ty)
     }
   }
   0
@@ -14685,7 +14752,7 @@ function internFuncTypeShapes(nm: string): i32 {
 // map / value-union field is left untouched, preserving the closure's clean-reject
 // semantics for genuinely-unsupported reps. The depth-0 field split mirrors
 // `internShapeFieldElems`.
-function internNonLowerableFieldShapes(nm: string) {
+function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
@@ -14695,13 +14762,20 @@ function internNonLowerableFieldShapes(nm: string) {
       const ftxt = ftexts[fi]
       // A closure field (`() => {f: i64}`) — intern its result shape. Depth-aware:
       // an inner arrow makes the field a closure regardless of wrappers.
+      const fldTy = tyFieldTyOf(ty, fnames[fi])
       if annArrowAt(ftxt) >= 0 {
-        internShapeDeep(ftxt)
+        internShapeDeepTy(ftxt, fldTy)
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
-        const base = arrLeafNameOf(nonNulBaseOf(ftxt))
-        if nameIsShapeOpen(base) { internShapeDeep(base) }
+        const nul = nonNulBaseOf(ftxt)
+        const base = arrLeafNameOf(nul)
+        if nameIsShapeOpen(base) {
+          internShapeDeepTy(
+            base,
+            tyStepArrRun(tyStepNulIf(fldTy, ftxt, nul), nul, base),
+          )
+        }
       }
     }
     fi = fi + 1
@@ -14716,7 +14790,7 @@ function internNonLowerableFieldShapes(nm: string) {
 // `collectNestedFieldShapes`' leaf strip: peel every trailing `[]` pair and intern a
 // `{…}` leaf (`internInlineShape` no-ops on any other text). Runs only on a shape
 // `funcTypeShapeLowerable` accepted, BEFORE the shape itself interns.
-function internShapeFieldElems(nm: string) {
+function internShapeFieldElemsTy(nm: string, ty: i32) {
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
@@ -14727,7 +14801,12 @@ function internShapeFieldElems(nm: string) {
       // `peeled` — "the loop ran at least once" — IS `leaf != name`: every iteration
       // shortens by exactly two characters, so the peel is the identity iff nothing peeled.
       const peeled = ftxt != ftexts[fi]
-      if peeled && nameIsShapeOpen(ftxt) { internInlineShape(ftxt) }
+      if peeled && nameIsShapeOpen(ftxt) {
+        internInlineShapeTy(
+          ftxt,
+          tyStepArrRun(tyFieldTyOf(ty, fnames[fi]), ftexts[fi], ftxt),
+        )
+      }
     }
     fi = fi + 1
   }
@@ -14829,9 +14908,7 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
         const base = nonNulBaseOf(ftxt)
         // The `| null` the name peel just dropped is peeled off the hint too — and only
         // when the name actually shortened, so a non-nullable field keeps its own type.
-        let baseTy = fldTy
-        if base.length != ftxt.length { baseTy = tyStepNullable(fldTy) }
-        const iidx = internInlineShapeTy(base, baseTy)
+        const iidx = internInlineShapeTy(base, tyStepNulIf(fldTy, ftxt, base))
         if iidx >= 0 {
           fc = 15
           ftxt = sNames[iidx]
