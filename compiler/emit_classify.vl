@@ -119,6 +119,7 @@ import {
   primTyOfName,
   recordClonedNodeTyKnown,
   recordNodePin,
+  tyFieldTyOf,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsNullableLitUnion,
@@ -14736,13 +14737,27 @@ export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
 // The only spelling where they part is the >4096-character runaway cap, which the
 // recorder answers -1 for — and a -1 hint takes the name leg unchanged.
 //
-// **THE OTHER FOUR CALLERS ARE NOT HINTABLE AND THAT IS THE MEASUREMENT, NOT AN
-// OMISSION.** 1,046 of the 1,064 `sTyIxOfName` resolutions arrive from
-// `internShapeDeep`'s peeled leaf (873), `internFuncTypeShapes` (116), this function's
-// own nested-field recursion (56) and `internShapeFieldElems` (5) — each of which
-// composed `nm` by CUTTING a larger spelling, so no caller holds a bank for the cut.
-// The largest chain roots at a `TypeRef` node, i.e. the mono-clone `nodeTyIx`
-// population D-REPELEMTY §3a refuted, one peel further away.
+// THE "CUT SUBSTRING HAS NO BANK" ARGUMENT IS TRUE OF THE CALLERS AND IS NOT THE END OF
+// IT. It once read here as "the other four callers are not hintable and that is the
+// measurement" — 1,046 of 1,064 resolutions arriving from `internShapeDeep`'s peeled leaf
+// (873), `internFuncTypeShapes` (116), this function's own nested-field recursion (56)
+// and `internShapeFieldElems` (5), each having composed `nm` by CUTTING a larger spelling.
+// A cut has no bank of its own; what it has is a PARENT that does. `collectAnnShapes`
+// holds the root's node, and the two steps below carry that type inward — the descent
+// peels it in lockstep with the name (`tyStep*`), and this function steps it by FIELD
+// NAME (`tyFieldTyOf`) into each field text. Measured over the corpus: entries hinted
+// 975 -> 1,407 of 3,136, leaf resolutions hinted 409 -> 526 of 1,097, and
+// `sTyIxOfNameTy`'s `resolveAnnot` parses 816 -> 699. The hand-over is exact at
+// 526 agree / 0 disagree by render, with a sabotage (the PARENT's type handed as every
+// field's) reddening 77 — so the comparator is live, which the byte channel cannot show
+// because `sTyIx` is weakly consumed.
+//
+// Still unhinted, and each for its own reason: `internFuncTypeShapes` takes no type
+// parameter at all (the arena's `TyFunc` params/result would have to be threaded the
+// same way — a further slice), union arms and functype interiors DECLINE inside the
+// descent rather than guess, and a root whose node the two collect-site gates reject
+// (canon rewrote the spelling, or the name mentions a generic-alias parameter) starts
+// at -1 by design.
 export function internInlineShapeTy(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
@@ -14769,7 +14784,15 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
       // interns/registers it; a no-op for a scalar / nominal / map field. MUST run BEFORE any row is
       // pushed (the outer shape is pushed to `sNames` only after this loop, so the flat `sField*`
       // arrays aren't corrupted by the re-entrant intern).
-      internShapeDeep(ftxt)
+      //
+      // ARENA HAND-OVER, RECURSIVE (D-INLINESHAPETY). `ftxt` is a CUT of `nm`, so it has no node
+      // of its own — but this shape's own recorded type does hold the field, so `tyFieldTyOf`
+      // steps to it by NAME exactly as `tyStep*` steps through a nullable / element / map value.
+      // That makes the descent's hand-over recursive rather than root-only: a hinted shape hints
+      // its fields, whose nested shapes are then hinted in turn. Declines to -1 on a non-`TyObj`
+      // or a field the recorded type lacks, and a -1 hint is the unhinted call unchanged.
+      const fldTy = tyFieldTyOf(tyIx, rawNames[fi])
+      internShapeDeepTy(ftxt, fldTy)
       let fc = nameFieldCode(ftxt)
       if fc < 0 {
         // A NESTED inline-shape field: intern the nested shape (its `|null`
@@ -14782,7 +14805,11 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
         // UNRESOLVABLE at type-section emit (a -1 `sHeapIdx` read). Store the
         // interned struct's own `sNames` entry so both agree with the literal path.
         const base = nonNulBaseOf(ftxt)
-        const iidx = internInlineShape(base)
+        // The `| null` the name peel just dropped is peeled off the hint too — and only
+        // when the name actually shortened, so a non-nullable field keeps its own type.
+        let baseTy = fldTy
+        if base.length != ftxt.length { baseTy = tyStepNullable(fldTy) }
+        const iidx = internInlineShapeTy(base, baseTy)
         if iidx >= 0 {
           fc = 15
           ftxt = sNames[iidx]

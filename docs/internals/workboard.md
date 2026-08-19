@@ -1007,6 +1007,70 @@ this section replaces (*"the rep-column rewrite is not optional and B5 is its fi
 wrong, and it was wrong because I stopped at a count instead of asking what the two cases WERE.
 **A residue of two is not a residue; it is two cases with names on them.**
 
+### THE HAND-OVER IS NOW RECURSIVE: a hinted shape hints its own FIELDS (2026-08-19)
+
+The slice above gave the descent an arena ROOT. It stopped at the shape boundary: the moment
+`internShapeDeepTy` reached an inline struct, `internInlineShapeTy` split it into field texts and
+called `internShapeDeep(ftxt)` — **unhinted**, because a field text is a cut of the parent's
+spelling and a cut has no node. Same argument as the root case, and it fails the same way: the
+cut has no bank, but its PARENT does. A `TyObj`'s fields are in the arena, keyed by name.
+
+So `tyFieldTyOf(ty, name)` — the `tyStep*` family's object arm, exported from `typecheck.vl` over
+the existing `objFieldType` so the field scan keeps one home — steps the hint into each field, and
+the nested-shape arm peels `| null` off the hint exactly when `nonNulBaseOf` shortened the name.
+**The hand-over becomes recursive:** a hinted shape hints its fields, whose nested shapes are hinted
+in turn, all the way down.
+
+| population (corpus, 1,559 emitting files) | before | after |
+|---|---|---|
+| `internInlineShapeTy` entries with a hint | 975 of 3,136 (31.1%) | **1,407 (44.9%)** |
+| field pre-interns with a hint | 1,357 of 4,510 (30.1%) | **2,017 (44.7%)** |
+| leaf `sTyIxOfNameTy` resolutions with a hint | 409 of 1,097 (37.3%) | **526 (47.9%)** |
+| `sTyIxOfNameTy` reaching `resolveAnnot` | 816 | **699 (−117, −14.3%)** |
+
+The field-hintable count rising 1,357 → 2,017 is the compounding, and it is the whole point: the
+extra 660 are fields of shapes that only got a hint BECAUSE their own parent was hinted.
+
+**The gate is the dual-run, and the sabotage proves it is live.** `sTyIxOfNameTy` short-circuits on
+the hint, so the handed index must equal `cUserTypes[nm] ?? resolveAnnot(nm)`. Compared by render at
+every hinted leaf: **526 agree / 0 disagree** — up from the previous slice's 411/0 on the same
+comparator. A sabotage handing the PARENT's type as every field's type reddens **77**, with
+witnesses naming themselves (`hint={a: () => …, f: string, z: {…}}` against
+`unhinted={a: f64, f: f32, z: i64}`). This matters because the byte channel **cannot** see a wrong
+hint here: `sTyIx` is weakly consumed, and an earlier sabotage handing arena index 0 at every leaf
+passed the entire suite. The dual-run is the gate; the corpus is the control.
+
+**No new gates were needed.** The two collect-site gates (canon's `annTsOf(ti) >= 0`, and
+`nameMentionsGenAliasParam`) are applied at the ROOT and are monotone inward — a field text is cut
+from the root spelling, so if the root mentions no alias parameter neither does any field of it,
+and a surviving spelling tree covers the whole subtree. That is why the disagreement count stayed
+at zero without a third gate.
+
+**PERF: neutral on the self-compile, for the FOURTH time, and this time it is exactly zero.**
+`sTyIxOfNameTy` reaches `resolveAnnot` **0 times** compiling the compiler's own source — measured
+on both sides, before and after — so the 117 saved parses are a corpus-only number. This is B1's
+finding again (`nameToTy` entered 54 times corpus-wide, 0 on the compiler) at a different site, and
+it is the fourth independent confirmation of the board's own `:337` framing: **destringify is a
+correctness programme, not a speed one.** Rank its slices by what they make impossible.
+
+**No fixture, and that is deliberate.** The change moves 0 bytes and 0 diagnostics by construction,
+so there is no behaviour a `tests/cases` file could pin — the same reason the root slice shipped
+without one. The pin is the dual-run plus its sabotage, recorded here and in the function header.
+
+Verified: corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code AND diagnostic text; suite
+2,159/0; `cases_wasm` 1,939/0; native fixpoint byte-exact at 1,230,214; self-lint + fmt clean; LSP
+bundle rebuilt.
+
+**What is still unhinted, each for its own reason** — the next slices, sized:
+
+| population | why it is -1 today |
+|---|---|
+| `internFuncTypeShapes` (116 resolutions) | takes **no type parameter at all**; the arena's `TyFunc` params/result would have to be threaded the same way |
+| union arms | the descent DECLINES rather than guess which arm a name belongs to |
+| functype interiors | same decline, one layer in |
+| roots the collect-site gates reject | canon rewrote the spelling, or the name mentions a generic-alias parameter — by design |
+| `internShapeFieldElems` (5) | measured, negligible |
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
