@@ -567,6 +567,35 @@ believed. The three columns were sized at 63 readers and every one of those read
 already arena-first, a fall-back that measures to nothing, or a consumer that legitimately wants a
 spelling.
 
+## THE LAST READER THAT PARSED A ROW'S SPELLING (2026-08-19)
+
+The `sNames` census left exactly one reader that treated the stored spelling as a SPELLING rather
+than as an identity: `nameIsStructDecl(sNames[si])`, the gate on `structIdxOfElemName`'s
+anonymous-shape-armed-union reject. Everything else returns it, compares it, or hands it to a
+name-keyed consumer.
+
+`nameIsStructDecl` is an **O(nodes) DECLARATION SCAN of the AST**, run **1,029 times** over the
+corpus. `sRowDecl` — the column added earlier tonight — banks the same fact at the mint. Dual-run
+before the swap: **1,029 reaches, 1,029 agree, 0 disagree.**
+
+**Shipped.** Corpus A/B 0 of 2,010 on all three channels; suite 2,160/0; `cases_wasm` 1,940/0;
+fixpoint byte-exact at 1,252,035; `rep-fuzz-check` **exact ✅**.
+
+**So no reader anywhere now parses a struct row's stored name, and none derives a type from it.**
+What `sNames` holds is what a consumer asking by NAME gets back, and nothing else reads it as a type
+or takes it apart. The two properties the programme set out to establish — *stop representing types
+as strings, stop parsing strings to represent types* — hold of the struct row layer completely:
+
+| property | state |
+|---|---|
+| a type's structure or kind stored as a string | **none** — the arena is `PrimName` / `LitKind` / `i32` |
+| the checker resolving a type from a spelling | **2 parses corpus-wide**, 17,459 tree walks |
+| a rep key built as a string | **0 characters** on a real compile |
+| a struct row's identity | an enumerated structural id, complete at 2,360/0 |
+| a struct row's declared-ness | a column banked at the mint, exact at 602/0 and 1,029/0 |
+| a reader that PARSES a row's spelling | **none** |
+| a reader that derives a TYPE from a row's spelling | **none** |
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
