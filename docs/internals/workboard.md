@@ -529,6 +529,31 @@ equivalence assertion; the per-table incremental index with an explicit per-prog
 them now, each with a sabotage proving the reset load-bearing); and `scripts/rep-fuzz-check.sh` as
 the gate that corpus byte-identity cannot replace.
 
+## THE LAYER ABOVE THE STRUCT TABLE, MEASURED COLUMN BY COLUMN — two done, one gap (2026-08-19)
+
+The three identity columns were sized at 63 readers. Sizing by readers turned out to say very little;
+measuring each column's ARENA SIDECAR coverage says everything:
+
+| column | arena sidecar | coverage |
+|---|---|---|
+| `rlElemName` — ref-list element | `rlElemTyIx` | **3,101 of 3,146 rows** carry a type (98.6%); its struct-row LADDER is complete — rung 3 already answers the 38 cells rungs 1–2 cannot |
+| `mvValName` — map value | `mvValTyIx` | **5,096 of 5,096 calls covered — 100.0%** |
+| `uFieldElemName` — union field element | `uFieldElemTyIx` | **1,589 of 2,719 calls covered — 58.4%** |
+
+**Two of the three are done.** The map-value column's sidecar answers every call; its name is a
+stored spelling handed to consumers, not a resolution path. The ref-list column's ladder measures to
+no available gain (38 = 38, previous entry).
+
+**`uFieldElemTyIx` at 58.4% is the one remaining measured gap in this layer**, and it is a real one:
+1,130 calls of 2,719 fall back to the name. That column is filled by `recordUFieldElemRow` at the
+union field table's mint, and it is also the SOURCE of two shipped hint sites
+(`internInlineShapeTy(en5, uFieldElemTyIxRow(ufn))`), so raising its coverage would widen the
+hand-over as well as close the fall-back.
+
+**That is the whole remaining destringify frontier as this session leaves it**: one column, one
+number, and a producer to improve rather than a design to settle. Everything else in the layer either
+measures to zero available gain or is already at 100%.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
