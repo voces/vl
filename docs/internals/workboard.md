@@ -710,6 +710,45 @@ BY NAME gets back, because source code has names and the emitter's tables are ad
 was removed is every place a type's structure lived in a string, and every re-derivation of a type
 from one. Those are the two clauses, and both now carry a number.
 
+## A SILENT INVALID-WASM HOLE, FOUND BY THE PIN MY OWN FIX BROKE (2026-08-19)
+
+CI's `ci-native` job failed on this branch. `tests/vl_build_validate_test.ts` proves `vl build`
+validates the artifact it writes, and it does so with a fixture that must EMIT INVALID WASM. Its
+fixture was `i32[]` into `f64[]` — **which the C8 container-element storage-class rule on this branch
+now rejects at CHECK time.** The pin did exactly what its header says it is for: the hole closed, the
+fixture went inert, and it failed loudly rather than passing vacuously. This is the FOURTH rotation;
+the header records the previous three.
+
+**The replacement is the same family one construct over, and it is a live hole:**
+
+```vl
+const a: {v: i32} = {v: 1}
+const b: {v: i32 | null} = a
+print(b.v ?? 0)
+```
+
+`vl check` **rc 0** · `vl check --codegen` **rc 0** · `vl run` **rc 1**, engine-level:
+`type mismatch: expected (ref null $type), found (ref $type)`.
+
+**So C8's rule covers container ELEMENTS and not struct FIELDS.** A field widening `i32` → `i32 | null`
+changes how the member is stored exactly as an element widening does, and the checker still accepts it.
+The annotation on `a` is load-bearing: without it the literal is built AT the target shape and the
+module is valid — the hole needs the source pinned to the narrower shape first. Filed here rather than
+fixed, because the pin needs a live hole to ride and fixing every hole used as a fixture makes the test
+unmaintainable; the honest split is that the fixture rides it and the board names it.
+
+**The precondition is now TWO assertions.** `vl run` failing is not evidence the MODULE is invalid — it
+is also how a CHECKER reject looks, which is why the old pin failed three assertions later with
+*"the failure must name the artifact as invalid, got: Error: type error"*: true, but it buries the
+news. `vl check` exiting 0 is asserted first, and a checker reject now says "the hole it rides is
+closed" in those words.
+
+**AND THE GATE GAP IS MINE.** `ci-native` is not part of `deno task test` — it is a separate job
+(`SELFHOST_NATIVE_ALIGN=1 deno test tests/selfhost_native_*_test.ts tests/vl_*_test.ts`) that only
+runs where a built binary and seed exist. I ran the corpus, the suite, `cases_wasm`, the fixpoint, the
+identity harness and `rep-fuzz-check` on every slice this session and never once ran that job. It is
+2,177 tests and 33 seconds. Added to the standing gate list.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
