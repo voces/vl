@@ -1026,7 +1026,7 @@ in turn, all the way down.
 | `internInlineShapeTy` entries with a hint | 975 of 3,136 (31.1%) | **1,407 (44.9%)** |
 | field pre-interns with a hint | 1,357 of 4,510 (30.1%) | **2,017 (44.7%)** |
 | leaf `sTyIxOfNameTy` resolutions with a hint | 409 of 1,097 (37.3%) | **526 (47.9%)** |
-| `sTyIxOfNameTy` reaching `resolveAnnot` | 816 | **699 (−117, −14.3%)** |
+| `sTyIxOfNameTy` **reaches past the nominal rung** (NOT parses — see the unit correction below) | 816 | **699** |
 
 The field-hintable count rising 1,357 → 2,017 is the compounding, and it is the whole point: the
 extra 660 are fields of shapes that only got a hint BECAUSE their own parent was hinted.
@@ -1114,15 +1114,15 @@ second conjunct, asked over the atoms the caller already has.
 | | before this slice | after |
 |---|---|---|
 | leaf resolutions with a hint | 526 of 1,097 (47.9%) | **888 (80.9%)** |
-| `sTyIxOfNameTy` reaching `resolveAnnot` | 699 | **342** |
+| `sTyIxOfNameTy` reaches past the nominal rung (NOT parses) | 699 | **342** |
 
 **Dual-run 888 agree / 0 disagree**, sabotage (arm pairing rotated by one) reddens **270** with
 witnesses that name themselves (`hint=i64` against `unhinted={a: () => …, z: f64}`). Corpus A/B
 **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
 1,939/0; fixpoint byte-exact at 1,230,368; self-lint + fmt clean; LSP rebuilt.
 
-**Across the two slices this session: `sTyIxOfNameTy`'s parses 816 → 342 (−58.1%), leaf hint
-coverage 37.3% → 80.9%.** And on the compiler's own source the site parses **0 times, before and
+**Across the two slices this session: `sTyIxOfNameTy`'s reaches past the nominal rung 816 → 342
+(NOT parses — see the unit correction below), leaf hint coverage 37.3% → 80.9%.** And on the compiler's own source the site parses **0 times, before and
 after, on every measurement** — so none of it is a speed result, for the fourth and fifth time.
 
 **What is left, re-derived on this base rather than carried forward:**
@@ -1164,7 +1164,7 @@ Every new helper is LIVE, measured rather than assumed: `tyStepParam` answers **
 | | after arms | after functype |
 |---|---|---|
 | leaf resolutions with a hint | 888 of 1,097 (80.9%) | **1,018 (92.8%)** |
-| `sTyIxOfNameTy` reaching `resolveAnnot` | 342 | **212** |
+| `sTyIxOfNameTy` reaches past the nominal rung (NOT parses) | 342 | **212** |
 
 **Dual-run 1,018 agree / 0 disagree**; sabotage (params fed the RESULT type and the result fed
 param 0) reddens **18** and strands 241 more hints downstream. Corpus A/B **0 of 2,010** on
@@ -1176,7 +1176,7 @@ byte-exact at 1,231,083; self-lint + fmt clean; LSP rebuilt.
 | | at session start | now |
 |---|---|---|
 | leaf `sTyIxOfNameTy` resolutions carrying an arena hint | 409 of 1,097 (37.3%) | **1,018 (92.8%)** |
-| `sTyIxOfNameTy` reaching `resolveAnnot` (corpus) | 816 | **212 (−74.0%)** |
+| `sTyIxOfNameTy` reaches past the nominal rung (NOT parses) | 816 | **212** |
 | the same, on the compiler's own source | **0** | **0** |
 
 The interner header's original claim — *"the other four callers are not hintable and that is the
@@ -1221,7 +1221,7 @@ asks that instead of reading the tree:
 
 Strictly better: +26 hints, still exact, and the sabotage row proves the gate is load-bearing rather
 than ceremonial — its witnesses are the alias transparency canon performs (`hint={a: Id}` against
-`unhinted={a: string}`). Parses **212 → 181**.
+`unhinted={a: string}`). Reaches past the nominal rung **212 → 181** — and see the unit correction below: these are NOT parses.
 
 **What that leaves for B5: 27 leaves, of which only 10 actually disagree.** I wrote two commits ago
 that the emitter half was "NOT blocked on B5" and that stands — every slice landed without it. The
@@ -1234,6 +1234,51 @@ themselves have overtaken.
 **This does NOT touch the terminal item's other half.** The interner's KEYS are still names, so the
 rep-column rewrite is unaffected by any of this — what these three slices removed is the RE-RESOLUTION
 of a name whose type the caller already held, not the name-keying itself.
+
+### MY UNIT WAS WRONG AGAIN — "parses" were REACHES, and half the saving RELOCATES (2026-08-19)
+
+I reported all four slices above in a number I called *"`sTyIxOfNameTy` reaching `resolveAnnot`"*,
+816 → 181. **It is not that.** The counter sat after the `cUserTypes` rung and before the
+`nameIsShapeSpanEnds` test, so it counted reaches PAST THE NOMINAL RUNG — most of which return -1
+without resolving anything. Re-instrumented at `annotResolve` itself, which is the actual parse:
+
+| emit-side site | at session start | now |
+|---|---|---|
+| `declTyIxOfName` | 1,175 | 1,248 |
+| `repElemKeyOfNameTy` | 576 | 590 |
+| **`sTyIxOfNameTy`** | **207** | **40** |
+| **emitter total** | **1,958** | **1,878** |
+
+(The checker is 17,459 parses in BOTH builds — the identical figure is the control that says the
+attribution is stable, and it is B1's "17,832 of 17,834 are tree walks" holding on this tip.)
+
+**AND THE TWO NEIGHBOURS WENT UP.** `annotNameMemo` is keyed on the SPELLING and shared by every
+site: a name `sTyIxOfNameTy` used to resolve was a memo entry `declTyIxOfName` and
+`repElemKeyOfNameTy` then rode for free. Take the resolution away and the neighbours pay the miss.
+Of the 167 parses this session removed at `sTyIxOfNameTy`, **87 (52%) RELOCATED and 80 (48%) were
+genuinely removed** — a net **−4.1%**, not the −77.8% I wrote in three commit messages.
+
+The same-tip A/B says it again in the other direction. Ignoring the hint on the CURRENT tip:
+
+| | s1 | s2 | s3 | emitter total |
+|---|---|---|---|---|
+| hint OFF (control) | 556 | 416 | 1,137 | **2,109** |
+| hint ON (shipped) | 590 | 40 | 1,248 | **1,878** |
+
+So the hand-over mechanism as a whole is worth **231 parses (−11.0%)**, with 145 of `sTyIxOfNameTy`'s
+own 376 relocating. Both A/Bs agree on the mechanism and roughly on the split.
+
+**THE STANDING LESSON, and it is bigger than this slice: PER-SITE PARSE COUNTS IN THIS PROGRAMME ARE
+NOT ADDITIVE.** Every "site X does N parses" figure on this board is an upper bound on what removing
+site X saves, because the shared spelling memo means one site's resolution is another site's free
+hit. A slice must be priced by an A/B on the EMITTER TOTAL, on one tip, with the hand-over toggled —
+never by the site's own counter falling.
+
+**None of this touches correctness, which is what the slices were for.** The dual-runs are unchanged
+and still exact: 526/0, then 888/0, then 1,018/0, then 1,044/0, with a live sabotage at each step.
+Leaf hint coverage 37.3% → 95.2% is a coverage measurement, not a parse measurement, and it stands.
+The board already says destringify is a correctness programme, not a speed one — this is the fifth
+confirmation, and the first one that caught me quoting a speed number for it anyway.
 
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
