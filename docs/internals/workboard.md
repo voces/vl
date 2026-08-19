@@ -904,6 +904,49 @@ That is corpus COVERAGE, not a reachability proof, and this programme's own D-TO
 that a fall-through is deleted with an argument or kept with its measurement. Kept, with the
 measurement.
 
+### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
+
+Following site 3 past its name-keyed floor reaches the root of the whole programme, and
+`internInlineShapeTy`'s own header states it as a measurement rather than a gap:
+
+> **"THE OTHER FOUR CALLERS ARE NOT HINTABLE AND THAT IS THE MEASUREMENT, NOT AN OMISSION."**
+> 1,046 of the 1,064 `sTyIxOfName` resolutions arrive from `internShapeDeep`'s peeled leaf
+> (873), `internFuncTypeShapes` (116), the nested-field recursion (56) and
+> `internShapeFieldElems` (5) — **each of which composed `nm` by CUTTING a larger spelling, so
+> no caller holds a bank for the cut.**
+
+That is the terminal blocker, and it is architectural rather than per-site. **A cut substring
+was never a node**, so there is no arena index to hand over — the hand-over pattern that
+closed the two slices above cannot reach it by construction.
+
+`internShapeDeep` (102 lines, 12 call sites) is the machine: every branch is a spelling
+grammar — peel a whole-name group, split union atoms, peel `| null`, find an arrow, peel `[]`,
+slice a map's value. Its whole job is to walk a type by cutting its name.
+
+**Two of its three external entry points DO hold a node** (`emit_collect:4045`
+`if tn is TypeRef`, and `:4378` `tyNameOf(fnode.fdType)`), so an arena-fed root is available —
+and that is the shape a fix would take. **But it does not close, for a reason the tree already
+records**: the interners it drives are keyed by NAME (`internInlineShapeTy(nm, tyIx)` takes a
+name; `registerValueUnionName`, `internFuncTypeShapes` likewise), so an arena descent must
+render a name at every leaf, through `tyToEmitName` — and **`canonEmitName` is NOT
+`tyToEmitName ∘ nameToTy`** (`ast.vl:780`, measured three times in the programme doc). A
+re-render moves spellings, and spellings move emitted bytes.
+
+**So destringifying the interner requires destringifying its KEYS first.** The rep tables must
+key on arena identity instead of spelling — the rep-column rewrite. That is the terminal work
+item of this programme, it is multi-slice, and its first step is the **B5/`canonTyIx` owner
+ruling** (arena identity after canon), which is exactly why B5 gates band 1.
+
+**Everything below the interner is now closed or accounted for:**
+
+| population | state |
+|---|---|
+| bare-name leaf resolutions (6,161) | **CLOSED** — the rung |
+| the `synthTypeRef` hand-over | **mechanism shipped**, first site converted |
+| `monoSubstAnn` at `monoSubstLetType` | **REFUTED** — 28 sites, half of them holes |
+| site 3 · `declTyIxOfName` (1,138) | at its **name-keyed floor** |
+| sites 1+2 · the interner (970) | **not hintable by measurement**; needs the rep-column rewrite |
+
 ### SITE 1 TRACED TO THE END — it is the INTERNER, and its hint route is already refuted
 
 Site 1's 553 parses are `repElemKeyOfNameTy` reached with no hand-over (`ty < 0`). I tagged
