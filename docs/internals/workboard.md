@@ -1624,10 +1624,35 @@ Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2
 **The honest residue.** `sNames` is still the row's stored identity and `structIndexByName` is still
 how most callers ask for a row — the index made it O(1), not name-free. Removing the NAME as the
 row's identity means every caller holding a spelling must hold a type instead, which is the
-hand-over programme at 95.2% and is exactly what would have to reach ~100% first. And
-`nameFieldCode` is a classifier over spellings — 12,414 calls and 100,214 characters on the corpus,
-**1,267 on the self-compile** — which is the last real parse population in the emitter, and its own
-item.
+hand-over programme at 95.2% and is exactly what would have to reach ~100% first.
+
+### THE FIELD-CODE CLASSIFIER TAKES AN ARENA RUNG — 59.2% at 0 disagreements
+
+`nameFieldCode` was the last real parse population in the emitter (12,414 calls / 100,214 characters
+over the corpus, 1,267 on the self-compile), and its ladder OPENS with six string-equality tests
+against the primitive keywords. A caller holding the field's recorded type already knows that answer:
+since the arena went string-free, `TyPrim.primName` is a `PrimName` litunion and the test is an
+`i32.eq`. The litunion and litunion-array arms are structural queries for the same reason.
+
+So `nameFieldCodeTy(t, ty)` puts the arena in front of the ladder — the same hand-over the interner's
+descent takes, one layer down, and the interner's field loop already holds `fldTy` from the recursive
+slice. **CONFIRM-ONLY, and the decline is the point**: it answers only where the arena decides the
+code exactly and returns to the name ladder everywhere else, because composites, closures, maps, the
+nullable niches and the whole union family turn on emitter INTERNING STATE the arena does not carry.
+
+| | |
+|---|---|
+| corpus field classifications covered | **2,669 of 4,510 (59.2%)** |
+| agreement with the name ladder | **2,669 / 0** |
+| sabotage (f64 and i64 codes swapped) | **805 disagreements** |
+
+Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,247,869.
+
+**What is left of the classifier is not leaf work.** The remaining 40.8% are the codes that depend on
+what the emitter has interned — a ref-list's element slot, a map's value kind, a union's box, a
+nullable niche's backing. Those are not "parse the spelling better"; they are the same question the
+interner's own name-keying asks, so they move when it does, not before.
 
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
