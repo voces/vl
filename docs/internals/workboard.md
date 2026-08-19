@@ -440,10 +440,22 @@ parsing strings to represent types" half, and the smaller of the two, exactly as
 
 **The blocking capability is an arena-keyed MINT.** Three sites feed `rlInternName` / the
 `uFieldElemName` write with a struct row's spelling; an intern MINTS a row keyed by the name it is
-handed, so it cannot take a type unless the table's identity column stops being a name. That is the
-first slice of the next programme, not a precondition for starting it: `rlElemTyIx` already exists
-beside `rlElemName`, so the sidecar is in place and only the KEY has to move — which is precisely the
-shape the rep-column rewrite took here (identity first, consumers after, each with a dual-run).
+handed, so it cannot take a type unless the table's identity column stops being a name.
+
+**AND THE CHEAP WAY ROUND IT IS REFUTED, MEASURED.** `rlInternNameTy(name, kind, ty)` already exists
+— the hand-over form, whose header states the rule an interner hint must satisfy: *a hint that
+disagrees re-keys the row, which is the same silent-wrong-slot failure by another route.* So the
+obvious slice is to hand `sTyIx[rsi]` at those sites and skip the name resolution, with no new
+capability needed. Checked before building it: over the corpus the hint is available on **199 of 203**
+reaches and computes the SAME key on **157** — **42 differ**. Witnesses `#anon0`, `CView`, `DView`.
+
+**42 of 199 is a refutation, not a residue.** A struct row's recorded type is not the ref-list
+element key's type at these sites: the interner keys the ELEMENT, and the row's `sTyIx` is the
+STRUCT. So the three supplier sites cannot be converted by hinting, and the identity column really
+does have to move first — which is what makes the next programme a rewrite rather than a sweep.
+`rlElemTyIx` already exists beside `rlElemName`, so the sidecar is in place and only the KEY has to
+move — precisely the shape the rep-column rewrite took here (identity first, consumers after, each
+with a dual-run).
 
 **Tools that carry over, all built and proven this session**: the hash-consed structural identity
 (`repCanonId` / `repElemId`) with its `hcLen` shape check; the `repShadowSweep` harness slot for an
