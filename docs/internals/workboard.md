@@ -1334,6 +1334,63 @@ What it changes is the rewrite's price: the argument for hash-consing these keys
 longer be "we rebuild 1.1M characters", because we no longer do — it has to be made on what integer
 identity makes impossible, which is the same standard every other slice in this programme is held to.
 
+### "SPELLINGS MOVE EMITTED BYTES" IS FALSE — no type spelling reaches the output at all (2026-08-19)
+
+The terminal item below rests its blocker on one sentence, repeated in three places in this
+programme: *"A re-render moves spellings, and spellings move emitted bytes."* Before designing the
+rep-column rewrite around it I tested it, because every other load-bearing claim I checked today was
+stronger than its measurement.
+
+**A four-line program and a `grep`:**
+
+```vl
+type ZzUniqueSpelling = { zzFieldAlpha: i32, zzFieldBeta: string }
+function zzNamedFunction(p: ZzUniqueSpelling): i32 { p.zzFieldAlpha }
+const v: ZzUniqueSpelling = { zzFieldAlpha: 1, zzFieldBeta: "zzLiteralString" }
+print(zzNamedFunction(v))
+```
+
+| token | in `vl build` bytes | in `vl build --names` bytes |
+|---|---|---|
+| `zzNamedFunction` (a FUNCTION name) | absent | **PRESENT** |
+| `ZzUniqueSpelling` (the type name) | absent | absent |
+| `zzFieldAlpha` / `zzFieldBeta` (field names) | absent | absent |
+| `zzLiteralString` (a string literal) | absent | absent |
+
+**The function name is the positive control** — it proves the probe is live, and it is the only
+source token that reaches the module at all. The reason is structural, not incidental:
+`emitNameSection` writes exactly two subsections, the module name (`"vl"`) and the FUNCTION namemap.
+WasmGC struct types carry no names in the binary, so there is nowhere for a type or field spelling to
+go. (String literals are absent because they are emitted as code-point data, not raw UTF-8.)
+
+**So the sentence is false, and what is true instead is more useful.** A spelling moves bytes only
+through a DECISION keyed on it:
+
+- **dedup** — `annShapeIndexOf`, `repSlotKeySi`/`repSlotKeyN`, `structIndexByName`
+- **classification** — `isUName`, `nameFieldCode`, `nameIsShapeSpanEnds`
+- **order** — interning order fixes type-section indices
+
+**Why that changes the rewrite.** The obligation was read as *preserve every spelling*, which is what
+made `canonEmitName ≠ tyToEmitName ∘ nameToTy` (`ast.vl:780`) look terminal. The real obligation is
+**preserve the partition and the order** — and byte-identity over the corpus is exactly the test for
+that, which every slice in this programme already runs. A rewrite that keys the rep tables on a
+structural identity is allowed to spell things differently, or not to spell them at all, provided two
+types that merged still merge and the interning order is unchanged.
+
+**`canonEmitName ≠ tyToEmitName ∘ nameToTy` is still true and still matters** — a differing spelling
+still reaches those decisions, so a re-render can still move a merge. What it does not do is reach
+the output. The distinction is the whole difference between "the keys cannot be replaced" and "the
+keys can be replaced by anything that partitions identically."
+
+**Not scheduled, and I am not starting it on my own.** It is multi-slice, it needs a structural
+identity (hash-consing on the arena, i.e. an integer table rather than a rendered string), and its
+first correctness question — does `annShapeIndexOf`'s partition even coincide with a type-identity
+partition — has a **known negative** the code already states: `{f: K0}` and `{f: boolean}` are
+layout-equal and encoding-different and must NOT merge, while two distinct arena types with equal
+field codes MUST. So the target is not arena identity; it is a purpose-built structural key over the
+wasm layout+encoding lattice. That is the design work, and it is an owner-schedulable item, not a
+measurement.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
@@ -1366,6 +1423,15 @@ re-render moves spellings, and spellings move emitted bytes.
 key on arena identity instead of spelling — the rep-column rewrite. That is the terminal work
 item of this programme, it is multi-slice, and its first step is the **B5/`canonTyIx` owner
 ruling** (arena identity after canon), which is exactly why B5 gates band 1.
+
+> **SUPERSEDED 2026-08-19 ON TWO COUNTS.** (1) B5 does NOT gate band 1 — four hand-over slices
+> shipped without it, and it now owns 27 of the 53 leaves still unhinted. (2) The "spellings move
+> emitted bytes" premise above is **false**: no type, struct or field spelling reaches the output in
+> either emit mode, proven by a probe with a live positive control (see the section above). The
+> rewrite's obligation is to preserve the PARTITION and the ORDER, not the spellings — and the
+> target is a structural key over the wasm layout+encoding lattice, not arena identity, because
+> `annShapeIndexOf` deliberately splits `{f: K0}` from `{f: boolean}` while merging distinct arena
+> types with equal field codes.
 
 **Everything below the interner is now closed or accounted for:**
 
