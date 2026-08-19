@@ -297,6 +297,36 @@ arena, one refused with its number, one shown unnecessary with its number. What 
 `sNames` as the row's stored spelling — is not a caller problem; it is the row layer, and its
 identity is already structural.
 
+## WHY `sNames` PERSISTS — it is not a lookup key, it is the DECLARED-ROW filter (2026-08-19)
+
+The one thing left name-shaped after the caller census is `sNames[si]`, the row's stored spelling.
+Its last structural reader is `repSlotCacheSync`, which opens `cUserTypes[sNames[si]] ?? -1` — a
+name→type resolution at the row layer, and the obvious next thing to remove.
+
+**The sidecar strictly dominates it.** Measured over the corpus before touching anything: of 2,185
+rows, `sTyIx[si]` and `cUserTypes[sNames[si]]` agree on **602**, **0 differ**, **0** resolve by NAME
+where the sidecar is empty, and the sidecar covers **1,446 more** rows the name cannot resolve at all
+(inline shapes, `#anon` literal rows). On those numbers the swap looks free.
+
+**It is not. It breaks 8 of 2,010 files, one of them into a hard failure.** And the reason is the
+whole point: those 1,446 extra rows are exactly the ones `cUserTypes[sNames[si]]` was EXCLUDING.
+The line reads as "resolve this row's name to its type"; what it actually computes is **"is this row
+a DECLARED type"** — and the slot cache it feeds (`repSlotByDecl`, the twin tables) is built on that
+distinction. Widen it to every typed row and inline shapes start merging with declared structs
+through the twin layer.
+
+**So `sNames` is not a lookup key that survived by inertia.** It is the row's declared-ness marker,
+and there is no structural test standing in for it: "declared" is a fact about where the row's
+spelling CAME FROM, not about its type. Removing the spelling means giving rows an explicit
+declared-ness column first — a different change, cheap to make and orthogonal to everything in this
+programme.
+
+Reverted; 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
+
+**That closes the destringify question I could answer by measurement.** The type spelling is gone
+from the arena, the checker, the rep keys and four of the five hot callers; where it remains, it
+remains because it carries a fact the type does not — provenance, not structure.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
