@@ -904,6 +904,41 @@ That is corpus COVERAGE, not a reachability proof, and this programme's own D-TO
 that a fall-through is deleted with an argument or kept with its measurement. Kept, with the
 measurement.
 
+### SITE 1 TRACED TO THE END — it is the INTERNER, and its hint route is already refuted
+
+Site 1's 553 parses are `repElemKeyOfNameTy` reached with no hand-over (`ty < 0`). I tagged
+the three no-hint `rlSlotByName` callers — `emit_collect:1757` (annotated ref-list),
+`emit_sections:3424` (inferred ref-list return) and `wasmEmit:5096` (array literal) — and all
+three measure **0 parses**. So they are not the source, and the guess I would otherwise have
+converted (the array-literal site, whose node carries a recorded type) would have been a
+no-op.
+
+They come through `rlInternName` — **the INTERNER** — which has 7 no-hint call sites across
+`emit_collect` and `emit_classify`. And that route is not open: `rlInternNameTy`'s own header
+states the rule (*the arena leg can front a FIND; it must NOT front a MINT*) and records that
+`repElemKeyOfNameTy`'s construction covers **two shipped hint sites and REFUTES the two
+node-bank ones** — which is B6's measurement, where threading the node bank MIXES VOCABULARIES
+at **215 of 299 on index and 13 of 299 on `repCanonKey`**.
+
+**So the annotResolve half is now traced end to end, and both halves are genuinely blocked —
+for two different, measured reasons:**
+
+| site | parses | why it does not move |
+|---|---|---|
+| 3 · `declTyIxOfName` | 1,138 | at its **name-keyed floor** — two rungs plus an 88.5% memo; the floor is the count of distinct spellings |
+| 1 · `rlInternName` | 553 | the hint must not front a MINT; the node-bank route is **B6-refuted**, and B6's residue is **BLOCKED behind B5** |
+| 2 · `slotCanonKey` | 417 | same interner family |
+| 4 | 0 | not exercised; kept with its measurement |
+
+**THIS PROMOTES B5 FROM A PARKED ROW TO THE THING GATING BAND 1.** `B5`/`canonTyIx` is filed
+**ANSWERED — awaiting owner ruling**: the lockstep `nodeTyIx` write at canon closes 55 of 61
+disagreements losing 0 agreements, suites identical, but **`T.tys.length` moves on 61 of 1,528
+programs** (monotone append, +0.35%, 0 shrink), and the safer variant is a separate `canonTyIx`
+column instead of overwriting `nodeTyIx`. With today's measurements attached, the ruling now
+has a concrete population behind it rather than a principle: **B5 → B6's node-bank residue →
+site 1's 553 + site 2's 417 = 970 of the 2,108 remaining `annotResolve` parses**, which is the
+last tractable destringify population that is not the rep-column rewrite.
+
 ### THE MONO HALF'S ROOT, sized: `monoSubstAnn` ALREADY HAS AN ARENA TWIN IN THE TREE
 
 The three remaining `synthTypeRef` sites in `emit_mono` (`:687`, `:739`, `:831`) do not hold
