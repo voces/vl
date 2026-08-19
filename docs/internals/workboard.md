@@ -402,6 +402,21 @@ layer up, with the same tools (an arena sidecar per row, a dual-run per conversi
 the gate). Until then the struct row must be able to hand a spelling to its consumers, which is
 exactly what `sNames` is.
 
+**AND THE FIRST SITE OF THAT PROGRAMME IS DONE, as a demonstration that the layer converts the same
+way.** Two of the five supplier sites handed a struct row's SPELLING to the ref-list element table.
+The row already carries its type in `sTyIx`, and `rlSlotOfTy` is that table's arena-input twin
+(itself converted to `repElemId` earlier this session) — so the spelling need not be produced at all.
+Dual-run: the arena answers **20 of 20** corpus reaches, agrees on **20**, disagrees on **0**, and
+there is no reach the NAME answers and it does not. Exact, on the 0-disagreement standard rather than
+a twin tolerance. Corpus A/B **0 of 2,010**; suite 2,160/0; `cases_wasm` 1,940/0; fixpoint byte-exact
+at 1,252,008; `rep-fuzz-check` **exact ✅**.
+
+**Three supplier sites remain** — `rlInternName(sNames[rsi], 1)`, `mvRlSlot.push(rlInternName(sNames[vsi], 1))`
+and `uFieldElemName[ufn] = sNames[si15]`. All three feed an INTERN rather than a lookup, which is the
+harder direction: an intern MINTS a row keyed by the name it is given, so converting it means giving
+those tables an arena-keyed mint, not just an arena-keyed find. That is the real content of the next
+programme, and it is now the only thing between `sNames` and deletion.
+
 **And the other 13 readers are not obstacles**: seven hand the canonical spelling back to a caller
 that asked by name, three ARE the name lookup, one is a syntactic test, one is a documented
 fallback, one is the mint recorder. None re-derives a type from a string.
