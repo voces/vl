@@ -375,6 +375,37 @@ Reverted; 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
 from the arena, the checker, the rep keys and four of the five hot callers; where it remains, it
 remains because it carries a fact the type does not — provenance, not structure.
 
+## WHAT `sNames` IS STILL FOR — the census, classified (2026-08-19)
+
+With the row layer's name→type resolution retired, `sNames[si]` has 18 live readers left. Classified
+rather than counted:
+
+| class | count | what it does |
+|---|---|---|
+| **supplies a name-keyed table ABOVE the struct table** | **5** | `rlInternName(sNames[rsi], 1)`, `rlSlotByName(sNames[si])` ×2, `uFieldElemName[ufn] = sNames[si15]`, `mvRlSlot.push(rlInternName(sNames[vsi], 1))` |
+| returns the row's canonical spelling to a name-consumer | 7 | `structNameOf`-style accessors, the code-15 field's `ftxt = sNames[iidx]` |
+| a name LOOKUP or scan | 3 | `repStructRowByName`, the name-index sync, `structIndexOfName`'s scan |
+| a syntactic predicate on the spelling | 1 | `nameIsStructDecl(sNames[si])` |
+| `slotCanonId` rung 2 | 1 | the uncovered-row fallback |
+| the declared-ness recorder | 1 | banks `cUserTypes.has(nm)` at the mint |
+
+**The first class is the answer, and it is a LAYER, not a leftover.** `sNames` persists because the
+tables ABOVE the struct table — the ref-list element table (`rlElemName`), the union field-element
+column (`uFieldElemName`), the map-value table (`mvValName`) — are keyed by SPELLING, and the struct
+row is their supplier. Their KEYS were destringified this session (`rlElemKey` is a hash-consed id
+now, `mvValCanonId` likewise), but their IDENTITY column is still a name: a ref-list element is
+*named*, not *typed*.
+
+**So the next programme is nameable and it is not this one.** Destringifying `sNames` means
+destringifying `rlElemName` / `uFieldElemName` / `mvValName` first — the same shape of work, one
+layer up, with the same tools (an arena sidecar per row, a dual-run per conversion, the rep fuzzer as
+the gate). Until then the struct row must be able to hand a spelling to its consumers, which is
+exactly what `sNames` is.
+
+**And the other 13 readers are not obstacles**: seven hand the canonical spelling back to a caller
+that asked by name, three ARE the name lookup, one is a syntactic test, one is a documented
+fallback, one is the mint recorder. None re-derives a type from a string.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
