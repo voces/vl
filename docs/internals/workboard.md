@@ -438,6 +438,28 @@ IDENTITY (return it, compare it, hand it on) — the "stop representing types as
 re-PARSE it — `nonNulBaseOf`, `nullablePartOf`, `rlSlotOfArrName`, `mvSlotOfMapName` — the "stop
 parsing strings to represent types" half, and the smaller of the two, exactly as it was here.
 
+**AND THE PARSE HALF IS FURTHER ALONG THAN THE COUNT SUGGESTS — those 11 are mostly FALL-THROUGHS
+behind arena rungs that already exist** (the D5-final work). Measured, so the next person does not
+re-derive it:
+
+| site | calls | fell through to the NAME |
+|---|---|---|
+| `rlElemIsNulNiche` | 386 | **11 (2.8%)** |
+| `rlElemCloSigKey` | 1,047 | **27 (2.6%)** |
+| `rlElemLitStructRow` | 342 | **116 (33.9%)** |
+| `rlElemStructRow` | 1,036 | **444 (42.9%)** |
+
+Two of the four are effectively done at 97%+. The other two share one rung — `rlElemStructIdxAt`,
+the struct-row-by-element-type lookup — and it answers on 57% and 66%. **That rung is the next
+slice**, and its ceiling is `rlElemTyIx`'s own coverage, which is filled at the intern by
+`fieldElemTyIxOfName(stored)` — a NAME resolution, and therefore exactly the hand-over shape this
+session used four times.
+
+**Note the two columns are separable, which the refutation above does NOT close.** `rlElemKey` (the
+dedup key) and `rlElemTyIx` (the recorded type) are different columns; the 42-of-199 refutation is
+about handing a struct row's type to the KEY. Handing it to the TY column only — improving
+`rlElemTyIx` coverage without touching the key — is untested and is the obvious first probe.
+
 **The blocking capability is an arena-keyed MINT.** Three sites feed `rlInternName` / the
 `uFieldElemName` write with a struct row's spelling; an intern MINTS a row keyed by the name it is
 handed, so it cannot take a type unless the table's identity column stops being a name.
