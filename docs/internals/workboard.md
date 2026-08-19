@@ -1807,7 +1807,21 @@ does not consult.
 row's identity be its TYPE, collapsing spelling twins?* — 65% of the emitter's hottest name query
 moves to the arena if yes; 15 of 8,201 corpus cells choose a different (structurally identical) row;
 0 of 2,010 files change in any channel; and the untested case is a twin pair that is not
-layout-equal. If the answer is yes, the rung is four lines and the gate above is already run.
+layout-equal.
+
+**TAKEN, after the untested case was tested.** I wrote "the gate above is already run" and that was
+wrong in exactly the way that mattered: I had never run **`rep-fuzz-check.sh`** on it, and that is
+the harness whose generator reaches shapes the corpus does not — which is precisely where I said the
+residual risk lived. The same harness then caught the OTHER merge-enabling change on this branch as
+REJECT → MISMATCH, so it demonstrably has power against this class.
+
+Run on the rung: **`rep-fuzz-check` exact ✅**, alongside corpus A/B 0 of 2,010 on all three
+channels, suite 2,160/0, `cases_wasm` 1,940/0, native fixpoint byte-exact at 1,251,227.
+
+**It ships on evidence rather than on a proof of sameness — the one place in this programme that is
+true, and it is stated at the call site.** `sTwin` already merges these rows at the heap-type layer,
+which is why picking either emits the same module; if a layout-divergent twin pair ever surfaces,
+`structFieldCodesEq` is the predicate that names it and this rung is the two lines to revert.
 
 **What IS shipped: `structIndexOfTy` is now an index** rather than a linear scan of `sTyIx` — the
 arena-input twin of the name index, same incremental pattern over a push-only column, same explicit
