@@ -346,13 +346,26 @@ declared) where my column said declared; `PairA` reads 31 (declared) where my co
 are my COLUMN being wrong about rows whose membership is perfectly stable — an alignment or
 placement error in the experiment, not a property of the design.
 
-**So the retraction is: I refuted my own implementation, not the idea.** "An explicit declared-ness
-column" remains un-refuted and may well be as cheap as I first said; what is established is only
-that my two attempts at it were buggy, and that the reason I gave for their failure was invented
-from a coincidence of counts. The 8 cells are unexplained.
+**So the retraction was: I refuted my own implementation, not the idea. THEN I FIXED THE
+IMPLEMENTATION, AND THE IDEA WORKS.** The bug was a missing per-program reset — `sRowDecl` kept
+growing across programs while `sNames` was emptied, so every row after the first program read a
+stale neighbour's flag. Exactly the hazard `structNameIxReset` and `structTyIxReset` already carry,
+and I had not carried it here.
 
-The pattern this session keeps producing: **two numbers agreeing is not a mechanism.** It took a
-probe that watched the actual value to see that.
+With `sRowDecl = []` beside `sNames = []` in `collectS`, and the column banking the NAME's own
+`cUserTypes` answer at the mint: **602 agree / 0 disagree** over 2,185 corpus rows. The 8 cells are
+explained and gone.
+
+**SHIPPED — the row layer's last name→type resolution is retired.** `repSlotCacheSync` opened
+`cUserTypes[sNames[si]] ?? -1`, one line deciding two things: IS this row declared, and WHICH arena
+type is it. Both are banked now — declared-ness by `sRowDecl` (asked once, at the mint), the type by
+the `sTyIx` sidecar. Corpus A/B **0 of 2,010** on all three channels; suite 2,160/0; `cases_wasm`
+1,940/0; fixpoint byte-exact at 1,251,856; **`rep-fuzz-check` exact ✅**. Removing the reset fails
+the shared-instance harness, so it is load-bearing and measured.
+
+The pattern this session keeps producing: **two numbers agreeing is not a mechanism** — and the
+corollary, learned one commit later: **a failed experiment is not a refuted design.** I published
+both errors and then the fix.
 
 Reverted (both attempts); 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
 
