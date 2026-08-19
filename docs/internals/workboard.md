@@ -2045,15 +2045,25 @@ grammar now orders arrow → nullable → union → array → map → shape, whi
 With the three mis-orders fixed, the residue is 10 of 753 and every one is now attributed to its
 source rather than left as a count:
 
-| source | count | why it cannot be hinted |
-|---|---|---|
-| `gaeApplyFieldTy` — a name BUILT by substitution | **4** | the spelling is CONSTRUCTED from a generic alias's field template; no node ever held it, so there is no `nodeTyIx` to hand over. Impossible by construction, not missing. |
-| collect `TypeRef` root, gates rejected | **5** | two are the generic-alias-PARAMETER gate (`{a:Sx}`, `{a:K[]}`) — deliberate, and proven necessary: removing it reintroduces disagreements. Three are nodes the checker recorded no type for at all. |
-| collect `fdType` root | **1** | same, one field-definition node |
+**CORRECTED — the first cut of this table said "3 are nodes the checker recorded no type for at all",
+and that was a guess I then went and checked.** A probe at the collect root, counting shape-spelled
+`TypeRef` nodes whose `nodeTyIx` is -1, finds **ZERO**. The checker records a type for every one. I
+also guessed the alias-parameter gate might be over-rejecting on FIELD names (a program declaring
+`type Foo<d>` would make the identifier `d` gate any name mentioning it, including the field `d` in
+`{d:i32}`) — dumping the gate's actual firings shows it hits **only** `{a:Sx}` and `{a:K[]}`, where
+`Sx` and `K` are genuine alias parameters. Both guesses wrong; here is what the residue actually is,
+by LOSS POINT:
 
-**So the hand-over is at its structural ceiling: 4 impossible, 2 deliberate, 4 with no recorded type.**
-98.7% is not a coverage shortfall with 1.3% of work left in it — it is the whole population minus the
-part that cannot exist.
+| loss point | count | witnesses |
+|---|---|---|
+| **no root — a name BUILT by substitution** (`gaeApplyFieldTy`) | **4** | `{x:i32,y:i32}`, `{a:string[]}`, `{a:i64}`, `{a:f64}` |
+| **the generic-alias-PARAMETER gate** | **2** | `{a:Sx}`, `{a:K[]}` — verified genuine |
+| **a value-union arrival** | **1** | `{a:Sx}` — `registerValueUnionName` is a box registration, not a shape intern |
+| **an untagged decline inside the arm / functype paths** | **3** | `{d:i32}` ×2, `{g:f64}`, `{a:i32,b:i32}` — the union-arm coverage flag declining, or a functype interior |
+
+**So the hand-over is at its structural ceiling: 4 impossible by construction, 2 deliberate and
+verified, 4 declines by design.** 98.7% is not a coverage shortfall with 1.3% of work left in it — it
+is the whole population minus the part that cannot exist.
 
 **Where the session's descent numbers ended up**, and the shape of the change matters more than the
 percentage:
