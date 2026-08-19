@@ -1391,6 +1391,64 @@ field codes MUST. So the target is not arena identity; it is a purpose-built str
 wasm layout+encoding lattice. That is the design work, and it is an owner-schedulable item, not a
 measurement.
 
+### THE REP-COLUMN REWRITE, STEP 1: the structural identity exists and is PROVEN (2026-08-19)
+
+`repCanonKey` / `repElemKey` render a structural string from an arena type, and every consumer uses
+it for one thing: **equality**. So the string is a REPRESENTATION of a structural identity, not the
+identity — the thesis's second half in its purest instance.
+
+`repCanonId` / `repElemId` build the identity directly. Every node interns `(tag, args…)` into a
+hash-consed table (FNV-1a → bucket chain, intrusive `hcNext`, rehash at 3/4 load) and returns its
+INDEX, so two structurally-equal types get the same i32 and **no type spelling is ever composed**.
+The recursion mirrors the string builders arm for arm — same mix-widening (the one rule now written
+ONCE, in a shared `hcUnionId`, rather than the string builders' two copies), same de Bruijn
+back-edge, same sentinels, same order.
+
+**`hcLen` is the sharp part.** It carries what the string builder's answer WOULD be, in characters,
+computed by the same arithmetic without rendering. It is not decoration: it reproduces the 262,144
+runaway cap exactly, and it is a far tighter equivalence than partition agreement — a length matching
+at every node says the two recursions have the same SHAPE, which two different recursions cannot fake.
+It also caught the only real bug in the first draft: the functype arm started its length at 2 (`(` and
+`)`) while the string's closer rides inside `")=>"`, an off-by-one on **19,260 of 53,622** keys that
+the partition check could not see, because every functype was off by the same one.
+
+**The proof runs inside the harness built for exactly this** — `repShadowSweep`, armed by
+`$VL_REP_SHADOW`, off by default, one boolean test when unarmed. It walks the whole arena after the
+bytes are final and asserts three things per key, in both vocabularies:
+
+| | self-compile | corpus |
+|---|---|---|
+| (spelling, id) pairs compared | 53,622 | 229,430 |
+| **false MERGE** (two spellings, one id — fuses layouts) | **0** | **0** |
+| **false SPLIT** (one spelling, two ids) | **0** | **0** |
+| **rendered-length mismatch** | **0** | **0** |
+
+283,052 pairs, zero disagreements. **Sabotage** (drop the nullable wrapper from the identity):
+**606 merges and 693 length mismatches**, witnesses naming the class outright
+(`a=(@192|…|@200) b=(@192|…|@200)?`). The harness is live in both directions.
+
+**Two design points worth keeping.** (1) The id→spelling assertion is PER VOCABULARY, because the two
+builders share one hash-cons table and an id reached from both is *correct* — `i32` is `i32` under
+either rendering, and the arms where they genuinely differ (`HC_SLOT`, `HC_RLI32`, `HC_RLSTR`) carry
+their own tags. Asserting across vocabularies produced 14,355 false "merges" in the first run, every
+one of them the harness being wrong. (2) The table is sid-keyed (`HC_PRIM` holds the primitive
+keyword's sid, `HC_OBJ` its field names'), so `hcReset` goes in `sidKeyedTablesReset` — the function
+whose header says it exists to be the one home for that pairing.
+
+**NOT WIRED TO ANY CONSUMER, deliberately.** This slice adds the identity and the proof; switching
+`repSlotKeySi` / `repSlotKeyN` / `slotCanonKey` and the rest onto it is the next one, and it will have
+this harness already in place to catch drift. Byte-identical by construction until then, and verified
+so: corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,245,228. The compiler grows **+13.4 KB (1.1%)** for
+the identity plus its harness — the honest price of a foundation that is not yet load-bearing.
+
+**What is now true of the terminal item.** Its blocker was stated as *"the interner keys are names,
+and a re-render moves spellings, and spellings move bytes"*. The third clause is false (measured
+above — no type spelling reaches the output). The second is now beside the point for the rep tables
+specifically: **their key no longer has to be a spelling at all, and the replacement is proven to
+partition identically over 283,052 pairs.** What remains is wiring, one consumer at a time, each
+gated on byte-identity — ordinary work rather than a design question.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and

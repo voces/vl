@@ -1142,6 +1142,18 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
         let total = stat.call(&mut *store, 0)?;
         let real = stat.call(&mut *store, 1)?;
         eprintln!("rep-shadow[{path}]: types={total} real={real}");
+        // The structural-identity equivalence tallies (the rep-column rewrite's proof):
+        // how many (spelling, id) pairs were compared, and the three ways they can part —
+        // a false MERGE (two spellings, one id: the dangerous one, it fuses layouts), a
+        // false SPLIT (one spelling, two ids), and a rendered-length mismatch (the two
+        // recursions have different shapes even where they agree on the partition).
+        let hc_checked = stat.call(&mut *store, 2)?;
+        let hc_merge = stat.call(&mut *store, 3)?;
+        let hc_split = stat.call(&mut *store, 4)?;
+        let hc_len = stat.call(&mut *store, 5)?;
+        eprintln!(
+            "rep-shadow[{path}]: hc checked={hc_checked} merge={hc_merge} split={hc_split} len={hc_len}"
+        );
         for i in 0..rcount.call(&mut *store, ())? {
             let name = read_str(&mut *store, &rlen, &rat, i)?;
             let n = rn.call(&mut *store, i)?;
