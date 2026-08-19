@@ -1944,6 +1944,49 @@ IDENTITY, which is the change that matters. Callers hold spellings because they 
 moving them to types is the hand-over programme at 97.6%, and its residue is 26 leaves that are
 declines by design rather than coverage gaps.
 
+### THE ARENA HINT CAUGHT A NAME-GRAMMAR MIS-ORDER — 31% of the descent's leaves were SPURIOUS (2026-08-19)
+
+Chasing the last 25 unhinted leaves, the step-miss witnesses named themselves the moment I printed
+the arena type beside the name:
+
+```
+ELEMMISS nm=()=>(f64|null)[]                    ty=() => (f64 | null)[]
+ELEMMISS nm=()=>((i32|boolean)[]|null)[]        ty=() => ((i32 | boolean)[] | null)[]
+ELEMMISS nm=((i32)=>i32)[]|((string)=>i32)[]    ty=((i32) => i32)[] | ((string) => i32)[]
+```
+
+**The arena is right and the NAME PEEL is wrong.** `nameIsElemArray` only asks whether a name ENDS
+in `[]`, so it claimed a FUNCTYPE whose result is a list — `() => (f64 | null)[]` — and peeled the
+whole name as an array, descending a type the name does not denote. `internShapeDeepTy` ordered its
+grammar array-before-arrow; `internFuncTypeShapes`, its own twin, has always ordered it
+arrow-before-array.
+
+**It had no detector until the hint arrived.** The mis-peel interns extra shapes rather than wrong
+ones, so nothing reddened: not the corpus, not the suites, not the fixpoint. What surfaced it was a
+LOST HINT — the arena declining a step the name had taken.
+
+**Fixed by moving the functype arm above the array arm**, and the effect is larger than the residue
+it was chasing:
+
+| | before | after |
+|---|---|---|
+| leaf resolutions in the descent | 1,097 | **753 (−344, −31%)** |
+| carrying an arena hint | 1,071 (97.6%) | **737 (97.9%)** |
+| dual-run agreement | 1,071 / 0 | **737 / 0** |
+
+**344 of the descent's 1,097 leaf resolutions were spurious** — work done on names the descent had
+mis-parsed. Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text confirms they
+were no-ops, which is why nothing had ever caught them.
+
+**This is the hand-over paying for itself in a way the programme did not predict.** The arena hint
+was built to remove parses; what it did here was act as a CHECK on the name grammar — two independent
+derivations of the same structure, disagreeing exactly where one of them is wrong. That is the same
+shape as every dual-run in this session, except the subject is the compiler's own name-parsing rather
+than a value.
+
+Residue now **16 leaves of 753**, suite 2,159/0, `cases_wasm` 1,939/0, fixpoint byte-exact at
+1,251,331.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
