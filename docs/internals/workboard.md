@@ -225,6 +225,22 @@ CLASS is.** 0.26% and 11.2% would have sorted the same way as 0.18%, and both ti
 from asking what the disagreeing cells WERE — twins at one site, two different sidecars at the
 other. Ranking by the rate would have shipped neither or both.
 
+**A FOURTH CALLER, AND THIS ONE IS EXACT.** `emit_classify:7383` resolves a union ARM's struct row
+by spelling. The arms there are CUT from a union set name, so no node holds one — but
+`unionMemberTysOf` appends the row's member types in exactly `splitUnionAtoms` order, the same
+pairing `internShapeArms` uses, so the arm can be asked for by TYPE through the D-UNION seam.
+Dual-run: the arena answers **63 of 76** corpus reaches with **63 agree / 0 disagree** and no
+arena-only answers. **That is the 0-disagreement standard the rest of the programme ships on** — no
+twin tolerance needed, because the seam pairs arm to member rather than resolving a spelling twice.
+Gated on `rep-fuzz-check` **exact ✅**, corpus A/B 0 of 2,010, suite 2,160/0, `cases_wasm` 1,940/0,
+fixpoint byte-exact at 1,251,362.
+
+**So the caller hand-over is three sites in and the pattern is legible**: a caller converts when its
+question IS "what type does this denote" — an annotation's node (`structIndexOfLet`, the Param type)
+or a union member the arena already pairs (`:7383`). It does not convert when the question is
+something narrower that the declared type cannot answer (`:11391`'s rep sidecar). That is a rule you
+can apply to the next site without re-deriving it.
+
 **So the conversion that worked was SPECIAL, and saying so is the result.** `structIndexOfLet` asks
 "what struct does this binding's annotation name", where the annotation IS the node whose type the
 checker recorded — the two derivations are the same question by construction, and the 15 residual
