@@ -904,6 +904,37 @@ That is corpus COVERAGE, not a reachability proof, and this programme's own D-TO
 that a fall-through is deleted with an argument or kept with its measurement. Kept, with the
 measurement.
 
+### THE TYPE ARENA ITSELF IS NOW STRING-FREE FOR STRUCTURE AND KIND
+
+Three raw `string` fields in `T.tys`'s own variants encoded type STRUCTURE or KIND, each with
+its closed set written out in a comment over the field. All three are now declarations:
+
+| field | was | now |
+|---|---|---|
+| `TyPrim.primName` | `string`, 9-member set in a comment | `PrimName` literal union |
+| `TyLit.litKind` | `string`, `"str" \| "int" \| "flt"` in a comment | `LitKind` literal union |
+| `TyErr.errKind` | `string`, always `"error"` | `i32` |
+
+**`errKind` was WRITE-ONLY.** `grep -rn errKind compiler/*.vl` is two lines — the declaration
+and one construction — and *nothing reads it*. It existed because `is` discriminates the arena
+union on field NAMES, so the variant needs one field to be distinguishable; it never needed
+that field to be a heap string. Every `TyErr` in every program was carrying a string reference
+for nothing.
+
+`litKind`: 34 occurrences over 4 files, **25 comparisons whose source text is unchanged**, 9
+producers all passing literals through one minter. Its one string-sentinel local
+(`let litKind = ""`, "no member seen yet") becomes `LitKind | null` — the same absence idiom
+`primNameOf` took.
+
+**What remains in the arena is TEXT, not structure**: `TyObj.objFieldNames` (field
+identifiers), `TyVar.tvName` (a type parameter's identifier) and `TyLit.litText` (the
+literal's own lexeme). Those are user-authored characters that a type legitimately carries —
+none of them encodes a type's shape or kind. **On the programme's own terminal condition —
+*stop representing types as raw strings* — the type arena is done.**
+
+0 verdict changes and 0 emitted-byte changes over 2,005 corpus files; full suite 2,159/0;
+fixpoint holds; the seed shrank 68 bytes.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
