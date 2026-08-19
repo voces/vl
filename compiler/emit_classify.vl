@@ -6836,6 +6836,15 @@ function sNameIxSync() {
   0
 }
 
+// Point `name` at an existing row without minting one — the interner's merge path (see
+// its call site). Sync FIRST so the alias is not overwritten by the watermark catch-up,
+// and never displace a real row: first match wins here exactly as it does in the scan.
+export function structNameAlias(name: string, row: i32) {
+  sNameIxSync()
+  if (sNameIx[name] ?? -1) < 0 { sNameIx[name] = row }
+  0
+}
+
 export function structIndexByName(name: string) {
   sNameIxSync()
   sNameIx[name] ?? -1
@@ -15033,7 +15042,18 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   }
   if !ok || names.length == 0 { return -1 }
   const existing = annShapeIndexOf(names, codes, texts)
-  if existing >= 0 { return existing }
+  if existing >= 0 {
+    // THE MERGED ROW IS KEYED UNDER ITS OWN SPELLING, NOT THIS ONE. With the vocabulary
+    // unified above, an inline annotation now matches a DECLARED struct row of the same
+    // shape (`{by:{[i32]:string}}` onto `type Names = …`) — correct, and exactly what the
+    // dedup is for — but the row's `sNames` entry says `Names`, so a later
+    // `structIndexByName("{by:{[i32]:string}}")` found nothing and the binding failed with
+    // "inline-shape type has an unsupported field". The row is shared; the NAME has to be
+    // too. Aliased in the name index rather than by a second `sNames` entry, because that
+    // column is parallel to the field arrays and cannot hold two names for one row.
+    structNameAlias(nm, existing)
+    return existing
+  }
   sDeclared = true
   // Interned under the ANNOTATION TEXT itself (`{v:i32}`) — a real key, so
   // `structIndexByName` on the annotation (or on a ref-list element name
@@ -15340,9 +15360,23 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
           // element text (code 15 strips the `|null` wrapper exactly as the interner stores it).
           const en = sFieldElemNameAt(si, fi)
           if en != "" {
-            let bi = texts[i]
+            // SPEAK THE ROW'S VOCABULARY. `en` is what `shapeFieldElemName` derived from
+            // the field's text at the MINT, so the query asks the same question of its own
+            // text rather than comparing the raw spelling. Without this, five codes could
+            // never match — the two sides were different KINDS of string (a map field banks
+            // its VALUE name against a whole `{[K]: V}` text, a ref list its ELEMENT name
+            // against `X[]`) — and codes 5/19/28/29/30 scored **0 matches in 1,365
+            // comparisons**, so any shape carrying one of those fields never deduped.
+            let bi = shapeFieldElemName(texts[i], codes[i])
+            if bi == "" { bi = texts[i] }
             if codes[i] == 15 { bi = nonNulBaseOf(bi) }
             if en != bi { allIn = false }
+            // The KEY half of a map field's identity — `recordSFieldElemRow`'s own header
+            // states it ("an mv slot's identity is the (KEY, VALUE) pair"), and
+            // `shapeFieldElemName` answers only the VALUE.
+            if sFieldElemKeyI32At(si, fi) != nameIsI32KeyedMap(texts[i]) {
+              allIn = false
+            }
           } else if codes[i] == 0 && nameIsLitUnionType(texts[i]) {
             // ATOM-IDENTITY split (code 0 is layout-shared): a litunion-ATOM field
             // (`{f: K0}` — interned member ids, `sFieldIsLitUnion` keys off the

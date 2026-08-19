@@ -1856,17 +1856,52 @@ raw spelling. All five codes came alive — 5 → 109/28, 19 → 192/4, 28 → 8
 an unsupported field`. Adding the map KEY half — the dimension `recordSFieldElemRow`'s own header
 names ("an mv slot's identity is the (KEY, VALUE) pair") — **does not fix them**: still 5.
 
-**So the finding is not a fix, it is a fact about the table.** The interner's rows carry MORE identity
-than the (field name, field code, element name) triple expresses, and "always distinct" on those five
-codes is what has been standing in for the rest. The witnesses point at the missing dimensions —
-`literal-unions/inline-nested-atom-array.vl` at atom identity, `types/declared-vs-inline-mixed-
-union-field-twin.vl` at the declared-vs-inline union vocabulary — but nowhere in the tree is a row's
-identity enumerated in one place.
+**I said this was "a fact about the table, not a fix" and that the missing dimension was unknowable
+without a design ruling. WRONG AGAIN — one more probe named it, and it is not a hidden identity
+attribute at all.** Dumping every merge the unified comparison would create shows what the merged
+rows ARE:
 
-**That folds item 2 back into item 1.** Both are the same question after all, and it is bigger than
-"may twins merge": **what IS a struct row's identity?** Until that is written down, the dedup's
-conservative constant-false is load-bearing, and every attempt to replace a spelling comparison with
-a structural one is guessing at a list nobody has made. Reverted; nothing shipped.
+```
+MERGE row=1 f=by  code=19 rowElem=string qText={[i32]:string}    rowName=Names
+MERGE row=2 f=f   code=19 rowElem=i32    qText={[string]:i32}    rowName=T0
+MERGE row=0 f=xs  code=5  rowElem=K[]    qText=K[][]             rowName=SInline
+```
+
+**Every one is an INLINE annotation matching a DECLARED struct row of the same shape.** That merge is
+correct — it is exactly what the dedup is for. What broke is downstream: the shared row's `sNames`
+entry says `Names`, so a later `structIndexByName("{by:{[i32]:string}}")` found nothing, and the
+binding failed with "inline-shape type has an unsupported field". **The row is shared; the NAME had
+to be too.**
+
+So the missing dimension was the name-keying itself, and the causation runs the OPPOSITE way from
+what I wrote: the dedup is not crippled because a row's identity is unknown — **it is crippled
+BECAUSE the lookup is name-keyed**, and the constant-false was compensating.
+
+**SHIPPED**, in three parts:
+
+1. **The vocabulary is unified** — both sides ask `shapeFieldElemName(text, code)`, the ONE HOME the
+   mint already uses, instead of comparing a banked element name against a raw composite text.
+2. **The map KEY half is compared** — `recordSFieldElemRow`'s own header states it ("an mv slot's
+   identity is the (KEY, VALUE) pair") and `shapeFieldElemName` answers only the VALUE.
+3. **A merged spelling is ALIASED onto the row it matched** (`structNameAlias`), in the name index
+   rather than by a second `sNames` entry, because that column is parallel to the field arrays.
+
+Five previously-dead codes come alive: 5 → 109/28, 19 → 192/4, 28 → 8/6, 29 → 10/8, 30 → 30/2.
+
+**And it retires a loud REJECT.** `closures/error-nullable-elem-closure-field-array-lambda-sig-twin.vl`
+pinned *"a nullable-{…} list element has no rep; use a non-null element type"* for
+`() => ({f: () => string} | null)[]`. That element's shape now dedups onto the row that already
+carries its rep instead of minting a second, un-repped one, so the composition resolves — **and it
+runs, printing `frb`**. Verified by RUNNING it, not by the absence of a diagnostic; the fixture is
+converted from `@emit-error` to `@run` + `@log`, with its header rewritten to say what changed.
+
+Corpus A/B **1 of 2,010** on wasm sha256 and 1 on diagnostics — that same fixture, in the direction
+of MORE programs compiling; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact at 1,249,541;
+identity harness 0/0/0.
+
+**Four wrong answers, then the finding.** Raw arena indices are not an identity. `repCanonId` is, but
+both sides must speak the same vocabulary. And when they finally do, what surfaces is not a missing
+attribute — it is the name-keying, standing where a structural identity should be.
 
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
