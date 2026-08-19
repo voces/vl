@@ -867,6 +867,42 @@ converted, so this removes the PARSE and not yet the SPELLING. That is the mecha
 remaining 2,814 need; each further site is a question of whether its producer holds an index,
 not of whether the route exists.
 
+### THE MONO HALF'S ROOT, sized: `monoSubstAnn` ALREADY HAS AN ARENA TWIN IN THE TREE
+
+The three remaining `synthTypeRef` sites in `emit_mono` (`:687`, `:739`, `:831`) do not hold
+an index, because the monomorphizer substitutes on the SPELLING:
+`emit_base.monoSubstAnn` splits a union on `|`, decomposes a generic application, splits
+object fields and REBUILDS the type with `+`. That is the thesis's second half — *building*
+strings to represent types — in its purest form.
+
+**It is written twice, in two representations.** `typecheck.substTyDeep` (`:14570`) is the
+same operation on the arena: deep substitution of bindings into a type, rebuilding a
+composite only when a child actually changed so a concrete type keeps its arena identity. It
+has 10+ callers in the checker. The emitter substitutes on the spelling; the checker
+substitutes on the type; neither knows about the other.
+
+**The naive conversion is a trap, and the tree already records why.** Routing
+`monoSubstAnn`'s callers to `substTyDeep` and re-rendering means going through
+`tyToEmitName`, and **`canonEmitName` is NOT `tyToEmitName ∘ nameToTy`** — stated at
+`ast.vl:780` and measured three times in `destringify-types-program.md` (`:16050`, `:24205`,
+`:25210`). A re-render moves spellings, and spellings move emitted bytes.
+
+**The SAFE shape is additive, and the hand-over form above is what makes it available.**
+Keep `monoSubstAnn` producing the name exactly as today — so no spelling moves and no byte
+can — and compute the TYPE with `substTyDeep`, handing it to `synthTypeRefTy`. The parse
+disappears; the spelling is untouched. The equivalence to measure before shipping is then a
+clean one, and it is a dual-run of the kind that has now worked twice today:
+
+> `substTyDeep(nodeTyIxOf(letType), tvN, resolve(tvV))` ≡ `nameToTy(monoSubstAnn(ann, …))`,
+> compared by RENDER, over the corpus.
+
+**Open question that dual-run must answer first**: what the checker recorded for a generic
+annotation's node — a `TyVar` (which `substTyDeep`'s first arm handles) or an inference hole
+(which it does not). That is the one fact the conversion turns on, and it is cheap to
+instrument at the same time.
+
+
+
 ## A bare `return` in a void function had NO LOWERING — found while implementing the void ruling (2026-08-18)
 
 `function g(c: boolean) { if c { return } print("after") }` — the ordinary guard clause —
