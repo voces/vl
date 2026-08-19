@@ -179,6 +179,33 @@ the shape-descent grammar three times and moved the arena hand-over from 37.3% t
 2,159/0, `cases_wasm` **1,940/0** (the new pin), fixpoint byte-exact at 1,251,198,
 `rep-fuzz-check` **exact ✅**.
 
+## THE CALLER HAND-OVER DOES NOT GENERALISE — measured on the next two sites (2026-08-19)
+
+`structIndexOfLet` took the arena rung at 15 disagreements in 8,201 corpus cells (0.18%), 0 on the
+self-compile, and a clean rep-fuzz run. The obvious next move is the other node-holding callers from
+the census — `emit_classify:11391` (`structIndexOfType`'s TypeRef arm, 9,474 self-compile calls) and
+`:18066` (a Param's declared type, 13,724). Both hold a node. Both were dual-run before conversion:
+
+| site | corpus: arena answers | agree | **disagree** | rate |
+|---|---|---|---|---|
+| `structIndexOfLet` (SHIPPED) | 8,201 | 8,186 | **15** | **0.18%** |
+| `:18066` Param type | 15,922 | 15,881 | **41** | 0.26% |
+| `:11391` TypeRef arm | 528 | 469 | **59** | **11.2%** |
+
+**NEITHER IS SHIPPED.** `:11391` disagrees on more than one call in nine — two orders of magnitude
+worse than the site that worked — and it sits directly below an arena rung that already ran and
+declined (`repSlotOfTy(nodeRepTyIxOf(tyIx))`, the REP sidecar, where mine would read the DECLARED
+one). Two different sidecars answering two different questions is not a rung, it is a coin flip with
+a byte channel that cannot see it.
+
+**So the conversion that worked was SPECIAL, and saying so is the result.** `structIndexOfLet` asks
+"what struct does this binding's annotation name", where the annotation IS the node whose type the
+checker recorded — the two derivations are the same question by construction, and the 15 residual
+cells are structural twins. The other callers ask narrower questions (a rep slot, a param's variant
+eligibility) that the declared type does not answer. **One caller converting cleanly is not evidence
+that callers convert cleanly**, and after the rep-fuzzer caught the interner merge on this same
+branch, a 11.2% disagreement rate is nowhere near shippable on byte-identity alone.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
