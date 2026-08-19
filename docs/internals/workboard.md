@@ -772,6 +772,78 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## BAND 1 — the string parser's population RE-DERIVED, and it has TWO feeders, not one (2026-08-18)
+
+The board's state-of-the-programme paragraph reads the emit side as one population at its
+floor ("**1,846 `annotResolve` parses** … there is no fourth rung to add"). Instrumented on
+the tip — a throwaway probe counting entries at the OUTERMOST `nameToTy`, attributed to the
+three external callers, then bucketed by name SHAPE — that is half the picture.
+
+**Corpus, 1,673 files reporting. 4,134 outermost parses:**
+
+| feeder | parses | share |
+|---|---|---|
+| `annotResolve` (root < 0) | **2,110** | 51.0% |
+| `recordClonedNodeTy` (the monomorphizer, via `synthTypeRef`) | **1,993** | 48.2% |
+| `unionMemberGenAppShape` | 31 | 0.7% |
+
+**So `annotResolve` is not the population — it is half of it**, and the filed 1,846
+re-derives at 2,110 (+14%). The second feeder is the emitter minting a `TypeRef` from a name
+it COMPUTED and then immediately re-parsing that name; `emit_rewrite.vl:1095` is the shape in
+its purest form — `synthTypeRef(lt.tyName + "[]", -1)` builds a string by appending `[]` and
+`recordClonedNodeTy` parses it straight back.
+
+**Shape × feeder, which is what decides where to start:**
+
+| shape | `annotResolve` | monomorphizer |
+|---|---|---|
+| **bare identifier** | 174 | **1,146** |
+| object `{` | 728 | 124 |
+| union `\|` | 564 | 288 |
+| array `[` | 255 | 336 |
+| function `=>` | 369 | 66 |
+| generic `<` | 51 | 33 |
+
+The single largest cell in the whole table is the monomorphizer re-parsing a BARE
+IDENTIFIER — 1,146 of 4,134 (27.7%) — and `recordClonedNodeTy` had no rung at all.
+
+### Shipped: the bare-name rung, at the shared leaf
+
+A bare identifier cannot enter any composite arm of `nameToTyReal`, so its answer IS the
+shared leaf ladder — and `tsLeafTy` (prim → type-parameter binding → declared name) already
+IS that ladder on the TREE route, so the rung routes to an existing home instead of adding a
+second copy. `nameIsBareIdent` is one scan in `tyname.vl` beside the other name grammars: the
+NEGATIVE of every composite arm at once.
+
+**Dual-run before shipping, the programme's own method** — both answers computed and their
+renders compared, on every bare name: **6,161 runs, 0 disagreements** on the corpus, 8 more
+on the self-compile, also 0. Arena-neutral by construction (all three leaf rungs are lookups
+of an index somebody else minted). Corpus A/B: **0 verdict changes, 0 emitted-byte changes.**
+
+**The rung fires at RECURSIVE entries too**, which the outermost census does not show: a
+union's members, an array's element and a field's type are each a bare name in the common
+case, so **6,161 leaf resolutions** now answer without entering the 236-line string parser —
+not the 1,320 outermost ones alone.
+
+### PERF: neutral, for the third time, and the board's own framing is now measured
+
+Interleaved min-of-5: `vl check compiler/` −0.9%, self-compile +1.3% — inside noise, and the
+between-run drift on this machine (4,692 → 5,054 ms for the same binary) is larger than the
+effect. That is the **third** independent neutral result today, after the `primName` litunion
+and the optimized-seed measurement. The board already says *"destringify is a correctness
+programme, not a speed one"* (`:337`, from the `__str_eq__` split — 19.10% identifiers vs
+6.08% type names); these three measurements are the direct confirmation, on the work itself
+rather than on a profile. **Rank destringify slices by what they make impossible, not by what
+they make faster.**
+
+### Left, and now sized
+
+2,814 structural parses remain (852 object, 852 union, 591 array, 435 function, 84 generic).
+The two biggest — `annotResolve`'s 728 object and 564 union spellings — are the UNPOSITIONED
+entries, which is the population `annotResolve`'s own header names: emitter-synthesized
+`TypeRef`s and `emit_rep`'s post-canon re-resolutions. Both want the producer to hand over a
+TREE or an arena INDEX rather than a name, which is the `synthTypeRef` signature question.
+
 ## A bare `return` in a void function had NO LOWERING — found while implementing the void ruling (2026-08-18)
 
 `function g(c: boolean) { if c { return } print("after") }` — the ordinary guard clause —
