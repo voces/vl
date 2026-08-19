@@ -1725,13 +1725,33 @@ denoting this TYPE — which may be a structurally identical TWIN interned under
 The 15 witnesses are all inline shapes resolving one row earlier than their name does
 (`nm={a:string,f:K0|null,z:f32} arena=10 name=8`).
 
-**So the rung is NOT shipped, and that is the result.** Substituting type-identity for name-identity
-is not a refactor; it MERGES structural twins, which is a semantic change with byte consequences —
-0.18% of corpus cells, and 0 on the compiler's own source. The design decision is therefore precisely:
-*should a struct row's identity be its type, collapsing spelling twins?* — and it now comes with its
-population instead of a shrug. `sTwin` already merges those twins at the HEAP-TYPE layer, which is why
-the change is plausible; the row layer is where `sNames`, field codes and element names live, and they
-are not all functions of the type.
+**So the rung is NOT shipped — but I then measured what shipping it would COST, because "it is a
+semantic change" is a claim and this programme prices claims.** Built the rung (arena first, name
+fallback) and ran the whole gate:
+
+| channel | result |
+|---|---|
+| emitted-wasm sha256 | **0 of 2,010 moved** |
+| exit code + diagnostic text | **0 of 2,010 moved** |
+| `deno task test` | 2,159 / 0 |
+| `cases_wasm` (shared instance) | 1,939 / 0 |
+
+**The 15 different row choices are behaviourally INVISIBLE on everything available.** That is the
+hypothesis confirmed: `sTwin` merges those rows at the heap-type layer, so picking either one emits
+the same module. The design question therefore does not cost what I said it might.
+
+**It is still not shipped, and the reason is the standard rather than the risk.** Every other slice
+in this session shipped on a 0-disagreement gate — a proof that the two answers ARE the same. This
+one would ship on downstream inertness measured over one corpus, which is a weaker warrant, and the
+residual surface is exactly the case the corpus does not contain: two rows with the same arena type
+whose emitted field layouts DIFFER, which `structFieldCodesEq` exists to catch and which this rung
+does not consult.
+
+**So the owner ruling is now a one-line question with all four numbers attached:** *may a struct
+row's identity be its TYPE, collapsing spelling twins?* — 65% of the emitter's hottest name query
+moves to the arena if yes; 15 of 8,201 corpus cells choose a different (structurally identical) row;
+0 of 2,010 files change in any channel; and the untested case is a twin pair that is not
+layout-equal. If the answer is yes, the rung is four lines and the gate above is already run.
 
 **What IS shipped: `structIndexOfTy` is now an index** rather than a linear scan of `sTyIx` — the
 arena-input twin of the name index, same incremental pattern over a push-only column, same explicit
