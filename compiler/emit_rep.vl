@@ -1165,9 +1165,17 @@ export function nodeMapValTyIx(nodeIx: i32): i32 {
 //     `di` (the loop's nominal early-return, exact-match-wins order preserved:
 //     the scan only early-returned on the QUERIED index, which structural
 //     matches never preempt);
-//   · `repSlotKeySi[key]` / `repSlotKeyN[key]` — A matching slot per canonical
+//   · `repSlotKeySi[id]` / `repSlotKeyN[id]` — A matching slot per canonical
 //     key + the match COUNT (the unique-twin gate needs `n == 1`, and with
 //     exactly one match the recorded slot IS the scan's `found`).
+//
+// KEYED ON THE STRUCTURAL IDENTITY, NOT ON THE RENDERED KEY (the rep-column rewrite,
+// step 2). `repCanonId` is proven to partition exactly as `repCanonKey` does — 283,052
+// (spelling, id) pairs over the corpus and the compiler's own source with 0 false merges,
+// 0 false splits and 0 rendered-length mismatches, asserted by `repShadowSweep` and
+// sabotage-checked. So this is a change of REPRESENTATION with the partition held fixed,
+// which is why it cannot move a byte and does not. Ids are dense from 0, so the two
+// string maps become two plain arrays; the rendered key is no longer built here at all.
 // Rebuilt whenever anything the scan reads can have changed: an arena mutation
 // (`tyMutEpoch` — keys), a `cUserTypes` write (`cUserTypesVer` — which arena
 // index a name resolves to, incl. `resolveAnnot` memoizing a NEW spelling
@@ -1178,8 +1186,8 @@ let repSlotCacheEpoch = -1
 let repSlotCacheUserVer = -1
 let repSlotCacheLen = -1
 let repSlotByDecl: i32[] = []
-let repSlotKeySi: {[string]: i32} = Map()
-let repSlotKeyN: {[string]: i32} = Map()
+let repSlotKeySi: i32[] = []
+let repSlotKeyN: i32[] = []
 
 function repSlotCacheSync() {
   if (
@@ -1190,8 +1198,8 @@ function repSlotCacheSync() {
     return 0
   }
   repSlotByDecl = []
-  repSlotKeySi = Map()
-  repSlotKeyN = Map()
+  repSlotKeySi = []
+  repSlotKeyN = []
   let si = 0
   while si < sNames.length {
     const di = cUserTypes[sNames[si]] ?? -1
@@ -1200,11 +1208,13 @@ function repSlotCacheSync() {
       if dt is TyObj {
         while repSlotByDecl.length <= di { repSlotByDecl.push(-1) }
         if repSlotByDecl[di] < 0 { repSlotByDecl[di] = si }
-        const k = repCanonKey(di)
+        const k = repCanonId(di)
+        while repSlotKeySi.length <= k {
+          repSlotKeySi.push(-1)
+          repSlotKeyN.push(0)
+        }
         repSlotKeySi[k] = si
-        // Fused missing-key RMW — safe since the published seed contains #918's
-        // map-SET lowering (value evaluated before the probe); B-chore-maprmw-fuse.
-        repSlotKeyN[k] = (repSlotKeyN[k] ?? 0) + 1
+        repSlotKeyN[k] = repSlotKeyN[k] + 1
       }
     }
     si = si + 1
@@ -1247,8 +1257,9 @@ export function repSlotOfTy(ty: i32): i32 {
   if !(t is TyObj) { return -1 }
   // The structural→nominal bridge: the UNIQUE declared twin, else -1. (No slot
   // has the queried arena index here, so the count is exactly the scan's `n`.)
-  const key = repCanonKey(ty)
-  if (repSlotKeyN[key] ?? 0) == 1 { return repSlotKeySi[key] ?? -1 }
+  const key = repCanonId(ty)
+  if key < 0 || key >= repSlotKeyN.length { return -1 }
+  if repSlotKeyN[key] == 1 { return repSlotKeySi[key] }
   -1
 }
 
@@ -1308,6 +1319,15 @@ let hcMask = -1
 // `HC_PRIM` and `HC_OBJ` carry `sidOf` ids for the primitive keyword and the field names,
 // so an id minted against one program's symbol space means nothing against the next one's.
 export function hcReset() {
+  // EVERYTHING KEYED ON AN HC ID DIES WITH THE ID SPACE, and this is not a per-program
+  // courtesy: `sidKeyedTablesReset` runs INSIDE the module-parse loop (driver.vl, "the
+  // sharpest edge the carrier has"), so the space restarts mid-compile. The two ty->id
+  // memos hold ids as VALUES and the slot cache holds them as INDICES; both would index
+  // the previous space's rows. The slot cache is invalidated by stamp rather than
+  // cleared, so its own sync stays the single place that rebuilds it.
+  hcCanonMemo = []
+  hcElemMemo = []
+  repSlotCacheEpoch = -1
   hcTag = []
   hcArgStart = []
   hcArgCount = []
@@ -3308,8 +3328,8 @@ export function repReset() {
   repKeyMemo = []
   repKeyMemoEpoch = -1
   repSlotByDecl = []
-  repSlotKeySi = Map()
-  repSlotKeyN = Map()
+  repSlotKeySi = []
+  repSlotKeyN = []
   repSlotCacheEpoch = -1
   repSlotCacheUserVer = -1
   repSlotCacheLen = -1

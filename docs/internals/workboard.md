@@ -1435,12 +1435,39 @@ one of them the harness being wrong. (2) The table is sid-keyed (`HC_PRIM` holds
 keyword's sid, `HC_OBJ` its field names'), so `hcReset` goes in `sidKeyedTablesReset` — the function
 whose header says it exists to be the one home for that pairing.
 
-**NOT WIRED TO ANY CONSUMER, deliberately.** This slice adds the identity and the proof; switching
-`repSlotKeySi` / `repSlotKeyN` / `slotCanonKey` and the rest onto it is the next one, and it will have
-this harness already in place to catch drift. Byte-identical by construction until then, and verified
-so: corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0;
-`cases_wasm` 1,939/0; fixpoint byte-exact at 1,245,228. The compiler grows **+13.4 KB (1.1%)** for
-the identity plus its harness — the honest price of a foundation that is not yet load-bearing.
+Byte-identical by construction, and verified so: corpus A/B **0 of 2,010** on emitted-wasm sha256,
+exit code and diagnostic text; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact.
+
+### STEP 2: the first consumer is switched — `repSlotKeySi` / `repSlotKeyN`
+
+The slot cache's twin index keyed on `repCanonKey(di)`, a rendered string, in two
+`{[string]: i32}` maps. It now keys on `repCanonId(di)`, and because ids are dense from 0 the two
+maps become two plain arrays. **The rendered key is no longer built at that site at all.** This is a
+change of REPRESENTATION with the partition held fixed — which is exactly why it cannot move a byte,
+and does not.
+
+**One hazard had to be closed first, and it was not hypothetical.** `hcReset` lives in
+`sidKeyedTablesReset`, which the driver calls **inside the module-parse LOOP** (its own header calls
+that "the sharpest edge the carrier has"). So the id space restarts MID-COMPILE, and everything keyed
+on an id must die with it: the two `ty -> id` memos hold ids as VALUES, the slot cache holds them as
+INDICES. `hcReset` now clears the memos and stamps the slot cache stale, so its own sync stays the
+one place that rebuilds it.
+
+**AND THE BYTE CHANNEL IS BLIND HERE — measured, not assumed.** Flipping the unique-twin gate from
+`== 1` to `== 2`, which turns every structural-bridge answer into a decline and invents new ones,
+moves **0 of 2,010** files. The bridge is nevertheless LIVE: instrumented, it is reached **664** times
+and answers **223** on the corpus. So those 223 answers are byte-inert on every corpus file, and the
+byte gate proves nothing about this conversion. What proves it is the identity equivalence — 283,052
+pairs, 0 disagreements — and that is the whole reason the equivalence was built before the wiring.
+
+Corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,243,947; harness still 0/0/0. Net size after both
+steps: **+12.1 KB (1.0%)** over the pre-identity tip — the harness and the identity, less the two
+string maps the wiring retired.
+
+**Remaining consumers, for whoever takes step 3:** `slotCanonKey` (returns a canon key string),
+`repElemKeyOfNameTy` (an elem key, stored in name-keyed tables), `emit_classify:6001` and `:6670`,
+and `repShadowNote`'s dedup key. Each is a separate slice with the same shape and the same gate.
 
 **What is now true of the terminal item.** Its blocker was stated as *"the interner keys are names,
 and a re-render moves spellings, and spellings move bytes"*. The third clause is false (measured
