@@ -1486,11 +1486,49 @@ byte-identity gate is a real proof and not a vacuous one — and it holds at **0
 emitted-wasm sha256, exit code and diagnostic text. Suite 2,159/0; `cases_wasm` 1,939/0; fixpoint
 byte-exact at 1,243,966; harness still 0/0/0.
 
-**What is left of the string keys after three steps.** Exactly three call sites:
-`repNameCanonKey`'s own body, `mvValCanonKey` (which mixes the arena key with the name key), and
-`repShadowNote` — where the spelling is genuinely wanted, because the message is for a human. Convert
-the first two and `repCanonKey` / `repElemKey` become **debug-only**: built by nothing but the
-harness that proves the identity equals them.
+### STEP 4: the last two consumers — and the rep key is now NEVER a string on a real compile
+
+`repNameCanonKey → repNameCanonId` (the name-input twin, for slot layers whose intern keys are not
+struct-table indices) and `mvValCanonKey → mvValCanonId` (the one place the arena vocabulary and the
+name vocabulary met — both legs were rendered keys, both are now ids). Their dependants follow:
+`nestedStructNamesCompat`, `mvSlotsTwin`, and `buildVariantTwins`, whose `keys: string[]` is `i32[]`.
+The runaway cap in `repNameCanonId` is unchanged and still needed — it guards `resolveAnnot`, i.e.
+arena MINTING, not the render.
+
+Byte channel live again: sabotaging both paths (break the mv-canon equality, make the variant keys
+unique) moves **86 of 2,010**. The gate holds at **0 of 2,010** on wasm sha256, exit code and
+diagnostic text; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact at 1,243,906; harness
+0/0/0.
+
+### THE MEASUREMENT THE WHOLE PROGRAMME WAS FOR
+
+`repCanonKey` and `repElemKey` are now reached from **four call sites, all inside the shadow
+harness** — `repShadowNote`'s human-readable message and `hcCheckKey`'s equivalence assertion — and
+the harness is off by default. Instrumented on a NORMAL compile:
+
+| rep-key strings built | at session start | now |
+|---|---|---|
+| corpus (2,010 files) | 165,312 builds · **1,267,256 characters** | **0 · 0** |
+| self-compile | 24,647 builds · **193,328 characters** | **0 · 0** |
+
+**On a real compile the emitter no longer builds a single character of type spelling to key a rep
+table.** That is the terminal item's core, and it is a measurement rather than a claim.
+
+**PERF: still nothing, for the seventh time.** Warmed alternating self-compiles, session-start seed
+against now: 1.49/1.50/1.52/1.51 against 1.52/1.51/1.54. Deleting 193 KB of string construction from
+a 1.5 s compile is invisible. The board's framing has now survived seven independent tests and one
+attempt by me to quote a speed number for it anyway.
+
+**A consequence worth stating plainly**: the `repElemKey` memo shipped earlier this session is now
+exercised only by the harness, because its function is. It stays — the harness is the equivalence
+proof and wants to be cheap — but its 94% figure is a historical measurement, not a live saving.
+
+**What remains, honestly.** The rep tables are destringified. The INTERNER above them
+(`internInlineShapeTy`, `registerValueUnionName`, `internFuncTypeShapes`, `structIndexByName`,
+`annShapeIndexOf`) is still name-keyed, and that is a different table family with a different
+partition — `annShapeIndexOf` keys on wasm field CODES and element TEXTS, deliberately splitting
+`{f: K0}` from `{f: boolean}` (layout-equal, encoding-different). Converting it needs its own
+structural key over that lattice, and the identity built here is the template, not the answer.
 
 **What is now true of the terminal item.** Its blocker was stated as *"the interner keys are names,
 and a re-render moves spellings, and spellings move bytes"*. The third clause is false (measured
