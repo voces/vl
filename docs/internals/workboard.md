@@ -1691,6 +1691,54 @@ the 24 the descent loses deeper (union/step/value-union declines), the 2 generic
 cases, and the `gaeApplyFieldTy` names that no node can hold. That is the honest ceiling of this
 approach — the rest is not a coverage problem but a design one.
 
+### THE ROW-IDENTITY DESIGN QUESTION, ANSWERED WITH NUMBERS (2026-08-19)
+
+I kept writing that removing the NAME as a struct row's identity "needs a design decision" and that
+its callers "would have to hold a type instead". Both halves were assumptions. I censused all 29
+`structIndexByName` call sites on the self-compile:
+
+| site | calls | share |
+|---|---|---|
+| **`structIndexOfLet` — `structIndexByName(lt.tyName)`** | **168,665** | **65%** |
+| `isSName` | 38,115 | 15% |
+| `emit_classify:7346` | 14,795 | 6% |
+| `emit_classify:17917` — `ty.tyName` | 13,724 | 5% |
+| `emit_classify:11354` — `ty.tyName` | 9,474 | 4% |
+
+**The dominant caller HOLDS A NODE**, and so do the fourth and fifth. `lt` is the `LetDecl`'s
+`letType` TypeRef, so `nodeTyIxOf(d.letType)` is right there. So "the callers do not have a type" was
+simply wrong — three of the top five do.
+
+**The real blocker is that the two lookups are DIFFERENT QUESTIONS, and here is the number.** Dual-run
+at the dominant site, arena rung against the name:
+
+| | self-compile | corpus |
+|---|---|---|
+| calls | 168,648 | 18,265 |
+| arena answers | 151,321 (89.7%) | 8,201 |
+| agree | **151,321** | 8,186 |
+| **disagree** | **0** | **15** |
+| arena-only / name-only | 0 / 0 | 0 / 2,384 |
+
+`structIndexByName` finds the row interned under THIS SPELLING; `structIndexOfTy` finds the first row
+denoting this TYPE — which may be a structurally identical TWIN interned under a different spelling.
+The 15 witnesses are all inline shapes resolving one row earlier than their name does
+(`nm={a:string,f:K0|null,z:f32} arena=10 name=8`).
+
+**So the rung is NOT shipped, and that is the result.** Substituting type-identity for name-identity
+is not a refactor; it MERGES structural twins, which is a semantic change with byte consequences —
+0.18% of corpus cells, and 0 on the compiler's own source. The design decision is therefore precisely:
+*should a struct row's identity be its type, collapsing spelling twins?* — and it now comes with its
+population instead of a shrug. `sTwin` already merges those twins at the HEAP-TYPE layer, which is why
+the change is plausible; the row layer is where `sNames`, field codes and element names live, and they
+are not all functions of the type.
+
+**What IS shipped: `structIndexOfTy` is now an index** rather than a linear scan of `sTyIx` — the
+arena-input twin of the name index, same incremental pattern over a push-only column, same explicit
+per-program reset. The reset is load-bearing and measured: removing it fails the shared-instance wasm
+harness. Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,248,598.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
