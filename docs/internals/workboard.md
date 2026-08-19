@@ -896,10 +896,26 @@ clean one, and it is a dual-run of the kind that has now worked twice today:
 > `substTyDeep(nodeTyIxOf(letType), tvN, resolve(tvV))` ≡ `nameToTy(monoSubstAnn(ann, …))`,
 > compared by RENDER, over the corpus.
 
-**Open question that dual-run must answer first**: what the checker recorded for a generic
-annotation's node — a `TyVar` (which `substTyDeep`'s first arm handles) or an inference hole
-(which it does not). That is the one fact the conversion turns on, and it is cheap to
-instrument at the same time.
+**MEASURED, AND IT REFUTES THE SLICE — do not take it.** The open fact was what the checker
+recorded for a generic annotation's node. Instrumented at `monoSubstLetType`'s substituting
+branch over the whole corpus:
+
+| what `nodeTyIxOf(letType)` holds | count |
+|---|---|
+| `TyVar` — `substTyDeep`'s first arm handles it | **14** |
+| an inference HOLE — it does not | **14** |
+| negative / concrete | 0 / 0 |
+
+**28 occurrences corpus-wide, split exactly half.** So this site is not worth a conversion at
+any risk: the population is negligible, and half of it would need a hole story
+`substTyDeep` does not have. **My own "root of the mono half" framing above was too strong** —
+`monoSubstLetType` is one of `monoSubstAnn`'s 13 call sites, and the mono half's 1,993 parses
+came overwhelmingly from elsewhere (1,146 of them bare names, already closed by the rung).
+
+What survives the refutation is the OBSERVATION, which is still worth carrying: the same
+substitution is written twice in two representations, and if the mono half is ever converted
+wholesale, `substTyDeep` is the existing arena home to converge on rather than a thing to
+build. Size the target by CALL SITE first — this one cost a probe to learn.
 
 
 
