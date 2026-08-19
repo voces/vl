@@ -596,6 +596,41 @@ as strings, stop parsing strings to represent types* — hold of the struct row 
 | a reader that PARSES a row's spelling | **none** |
 | a reader that derives a TYPE from a row's spelling | **none** |
 
+## THE PROGRAMME'S HEADLINE NUMBER, MEASURED GLOBALLY (2026-08-19)
+
+Every layer has been measured on its own terms. This is the one number that answers the question the
+band is named for — **how often does the compiler resolve a type from a SPELLING?** — counted at
+`annotResolve` (the one funnel every resolution passes through) and at `nameToTy` (the string type
+parser itself), across the whole compiler:
+
+| | TREE walks | **NAME parses** | `nameToTy` entries | of which COMPOSITE |
+|---|---|---|---|---|
+| **the compiler compiling itself** | 9,811 | **6** | **10** | **2** |
+| the corpus (2,010 files) | 18,386 | 1,855 | 11,942 | 5,446 |
+
+**Six.** On its own source — 27 modules, a 1.2 MB module, the largest real program available — the
+whole compiler resolves a type from a spelling **six times**, and enters the string type-parser
+**ten** times, **two** of them on a composite name. Everything else walks the parser's spelling TREE,
+which is structure, not text.
+
+The corpus figure is higher and that is expected rather than a caveat: `tests/cases` is a test corpus
+built to exercise exotic inline annotations — `{a:f32,f:(()=>i32)[]|null,z:{[i32]:K0}}` and its
+relatives — which is exactly the population that has no declared name to resolve through. It is the
+adversarial number, not the representative one, and both are recorded so neither can be quoted alone.
+
+**Where this leaves band 1.** Every table the programme set out to convert has been measured, and
+each is either converted or measured to zero available gain:
+
+| layer | state |
+|---|---|
+| the type ARENA | string-free for structure and kind |
+| the CHECKER's resolution | **6** name parses on the self-compile |
+| the emitter's arena HAND-OVER | 98.7%, all 10 residual leaves attributed |
+| the REP tables | **0 characters** of type spelling built on a real compile |
+| the interner's row IDENTITY | an enumerated structural id, complete at 2,360/0 |
+| the interner's row LOOKUP | indexed, aliased, and no reader parses or types the spelling |
+| `rlElemName` / `mvValName` / `uFieldElemName` | ladder complete · 100.0% · declines are fields with no element |
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
