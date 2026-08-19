@@ -1280,6 +1280,60 @@ Leaf hint coverage 37.3% → 95.2% is a coverage measurement, not a parse measur
 The board already says destringify is a correctness programme, not a speed one — this is the fifth
 confirmation, and the first one that caught me quoting a speed number for it anyway.
 
+### THE TERMINAL ITEM'S OTHER HALF — the KEYS. And `repElemKey` had no memo at all (2026-08-19)
+
+The item below says the interner is keyed by NAME, so destringifying it needs the rep-column
+rewrite. Before designing that, I measured what the rep KEYS actually cost, since "building strings
+to represent types" is the thesis's second half and `repCanonKey` / `repElemKey` are its purest
+instance — both take an arena type and RENDER a structural string from it.
+
+`repCanonKey` is memoized per arena index. **`repElemKey` was not, and nothing recorded a reason.**
+
+| | calls | memo hits | builds | characters built |
+|---|---|---|---|---|
+| `repCanonKey`, corpus | 51,393 | 38,145 (74.2%) | 13,222 | 127,396 |
+| **`repElemKey`, corpus** | **152,090** | **0** | **152,090** | **1,139,860** |
+| `repCanonKey`, self-compile | 977 | 114 | 863 | 18,764 |
+| **`repElemKey`, self-compile** | **23,784** | **0** | **23,784** | **174,564** |
+
+The twin cache now exists. It needs one more generation than `repKeyMemo`: `repCanonKeyGo` reads the
+arena alone, while `repElemKeyGo`'s `TyObj` arm also asks `repSlotOfTyDecl`, so the sync compares
+exactly the triple `repSlotCacheSync` does — `tyMutEpoch`, `cUserTypesVer`, `sNames.length`. Banked
+at the TOP of the recursion only, because the de Bruijn back-edge `#n` is a function of the caller's
+DEPTH rather than of `ty`.
+
+| | builds | characters |
+|---|---|---|
+| corpus | 152,090 → **7,989** | 1,139,860 → **65,644 (−94.2%)** |
+| self-compile | 23,784 → **346** | 174,564 → **5,774 (−96.7%)** |
+
+**The gate is a dual-run**: every memo HIT recomputed from scratch and compared — **54,906 agree /
+0 disagree** on the corpus, **15,445 / 0** on the self-compile. The comparator is live, proven by
+banking `s + "X"`: 0 / 15,445, witnesses `memo=S0X fresh=S0`.
+
+**NEITHER GENERATION CONJUNCT IS LOAD-BEARING ON ANY INPUT MEASURED, and I am recording that rather
+than banking it as safety.** Dropping `sNames.length` from the sync leaves 0 disagreements; dropping
+`tyMutEpoch` as well ALSO leaves 0. So on everything available, nothing this key depends on moves
+inside the window `repElemKey` runs in. The triple is kept anyway — the alternative is an unguarded
+cache resting on an emit-window invariant nobody has stated, and syncing on exactly what
+`repSlotCacheSync` compares makes "the two caches are in the same generation" a one-line argument.
+If that invariant is ever written down, the guard is deletable.
+
+**PERF: UNMEASURABLE, and that is the answer.** Five warmed alternating self-compiles per side —
+1.48/1.52/1.49/1.53/1.48 against 1.50/1.49/1.50/1.49/1.53. 169 KB of string building is microseconds
+against a 1.5 s compile. **Sixth confirmation of the board's own framing**, and this one is the
+sharpest: a change that deletes 94% of a string population moves the clock by nothing. Rank
+destringify slices by what they make impossible.
+
+Corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,231,848.
+
+**What this does and does not do for the terminal item.** It removes 94% of the *building*; the keys
+are still STRINGS and the interner is still keyed by NAME, so the rep-column rewrite is untouched.
+What it changes is the rewrite's price: the argument for hash-consing these keys into integers can no
+longer be "we rebuild 1.1M characters", because we no longer do — it has to be made on what integer
+identity makes impossible, which is the same standard every other slice in this programme is held to.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and

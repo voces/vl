@@ -512,10 +512,24 @@ export function repElemKey(ty: i32): string {
     }
     si = si - 1
   }
+  const top = repElemKeyStack.length == 0
+  if top {
+    repElemMemoSync()
+    if ty < repElemMemo.length {
+      if repElemMemo[ty] != "" { return repElemMemo[ty] }
+    }
+  }
   repElemKeyStack.push(ty)
   let s = repElemKeyGo(ty)
   repElemKeyStack.pop()
   if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
+  if top {
+    // `repElemKeyGo` only READS (the arena, and the slot cache through
+    // `repSlotOfTyDecl`), so the generations synced above still hold and the write
+    // cannot stamp a stale key — `repKeyMemo`'s note, one cache over.
+    while repElemMemo.length <= ty { repElemMemo.push("") }
+    repElemMemo[ty] = s
+  }
   s
 }
 
@@ -523,6 +537,64 @@ export function repElemKey(ty: i32): string {
 // reaches `repElemKey` through a declared struct (keyed nominally, which already
 // bottoms out) or, defensively, a union/map that could self-refer.
 const repElemKeyStack: i32[] = []
+
+// THE `repElemKey` MEMO — `repKeyMemo`'s twin, with one more generation to compare.
+// `repCanonKeyGo` reads the ARENA ALONE, so its memo syncs on `tyMutEpoch`; this key's
+// `TyObj` arm additionally asks `repSlotOfTyDecl`, whose answer belongs to the slot
+// cache — so this memo syncs on exactly the TRIPLE `repSlotCacheSync` compares
+// (`tyMutEpoch`, `cUserTypesVer`, `sNames.length`). Anything that can change a key
+// changes one of the three, and stamping the same triple keeps the two caches from
+// disagreeing about which generation they are in.
+//
+// TOP OF RECURSION ONLY, exactly as `repKeyMemo`, and for a reason that is not
+// caution: the de Bruijn back-edge (`#n`) is a function of the caller's DEPTH, not of
+// `ty`, so an INNER answer is not a pure function of its type and must never be banked.
+//
+// EXACT, AND THE GATE IS A DUAL-RUN: every memo HIT recomputed from scratch and compared
+// with the banked answer — **54,906 agree / 0 disagree** over the corpus and **15,445 / 0**
+// on the compiler's own source. The comparator is live, proven by banking `s + "X"`, which
+// turns it into 0 / 15,445 with witnesses (`memo=S0X fresh=S0`).
+//
+// NEITHER GENERATION CONJUNCT IS LOAD-BEARING ON ANY INPUT MEASURED, and that is recorded
+// rather than banked as safety: dropping `sNames.length` from the sync leaves 0
+// disagreements, and dropping `tyMutEpoch` as well ALSO leaves 0 — so on everything
+// available, nothing this key depends on moves inside the window `repElemKey` runs in. The
+// triple is kept anyway, because the alternative is an unguarded cache resting on an
+// emit-window invariant nobody has stated, and because syncing on exactly what
+// `repSlotCacheSync` compares is what makes "the two caches are in the same generation" a
+// one-line argument. If that invariant is ever written down, this guard is deletable.
+//
+// WHY IT DID NOT EXIST: nothing recorded a reason — `repCanonKey` was memoized and this
+// twin was not, and the cost is the whole gap between the two. Measured before adding
+// it: `repCanonKey` takes 38,145 of 51,393 corpus calls on the memo (74.2%) while
+// `repElemKey` took 0 of 152,090 and rebuilt **1,139,860 characters** of type spelling;
+// on the compiler's own source, 0 of 23,784 calls and 174,564 characters. After: corpus
+// builds **152,090 -> 7,989** and characters **1,139,860 -> 65,644** (-94.2%); self-compile
+// builds **23,784 -> 346** and characters **174,564 -> 5,774** (-96.7%).
+//
+// PERF: UNMEASURABLE, and that is the honest answer. Five warmed alternating self-compiles
+// per side: 1.48/1.52/1.49/1.53/1.48 against 1.50/1.49/1.50/1.49/1.53 — the 169 KB of
+// string building removed is microseconds against a 1.5 s compile. It ships as a
+// destringify result (94% of a string-building population the programme exists to remove,
+// at zero risk and zero byte movement), NOT as a speed one.
+let repElemMemo: string[] = []
+let repElemMemoEpoch = -1
+let repElemMemoUserVer = -1
+let repElemMemoLen = -1
+
+function repElemMemoSync() {
+  if (
+    repElemMemoEpoch != tyMutEpoch ||
+    repElemMemoUserVer != cUserTypesVer ||
+    repElemMemoLen != sNames.length
+  ) {
+    repElemMemo = []
+    repElemMemoEpoch = tyMutEpoch
+    repElemMemoUserVer = cUserTypesVer
+    repElemMemoLen = sNames.length
+  }
+  0
+}
 
 function repElemKeyGo(ty: i32): string {
   const t = T.tys[ty]
