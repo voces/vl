@@ -1987,6 +1987,28 @@ than a value.
 Residue now **16 leaves of 753**, suite 2,159/0, `cases_wasm` 1,939/0, fixpoint byte-exact at
 1,251,331.
 
+**AND THE ORACLE FOUND A SECOND ONE IMMEDIATELY.** Re-running it on the new residue:
+
+```
+NULMISS nm=(i32)=>string|null   ty=(i32) => string | null
+NULMISS nm=(i32)=>P|null        ty=(i32) => P | null
+```
+
+`nullablePartOf` claimed a name whose top-level ARROW binds the `| null` to its RESULT. That is not
+a subtle case — it is a rule `internFuncTypeShapes`' own header states, **with a fuzz-found
+invalid-wasm consequence attached**: *"the naive peel treated it as a nullable CLOSURE and the
+`f64 | null` result never surfaced"*. The twin had the fix; the descent did not.
+
+So the functype arm moved once more, above the `| null` peel as well as the `[]` one — the order
+`internFuncTypeShapes` has always used. Coverage **737 → 743 of 753 (97.9% → 98.7%)**, dual-run
+**743 / 0**, corpus A/B **0 of 2,010** on all three channels, residue **10 leaves**.
+
+**Two name-grammar mis-orders in one sitting, both found the same way, neither visible to any
+existing channel.** The pattern is now explicit and reusable: **where the arena declines a step the
+name took, the name grammar is wrong.** That is a standing diagnostic, not a one-off — and it is the
+strongest argument this programme has produced for carrying the type alongside the spelling, better
+than any parse count.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
