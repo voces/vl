@@ -168,16 +168,28 @@ fails in the corpus first.
 standing between a name-keyed row table and an unsound merge. The measurement that found it (5 codes,
 1,365 comparisons, 0 matches) stands; the conclusion that it was safe to fix does not.
 
-**After the revert, the branch moves ONE row of 2,010 against master:**
+**FINAL STATE OF THE BRANCH AGAINST MASTER, both channels, every row accounted for:**
 
-- `statements/bare-return-void-early-exit.vl` — master has no lowering for a bare `return` in a void
-  function; that is the void ruling's terminator half.
+| channel | rows moved | what they are |
+|---|---|---|
+| emitted-wasm sha256 + exit code | **1 of 2,010** | `statements/bare-return-void-early-exit.vl` — master has no lowering for a bare `return` in a void function; the void ruling's terminator half |
+| diagnostic text | **5 of 2,010** | three are FIXTURES THIS BRANCH ADDS (the two container-element storage-class pins and the bare-return one); the other two are **reject-tier MOVES** |
 
-**2,009 of 2,010 byte-identical to master** on emitted wasm, exit code and diagnostic text, across a
-branch that rewrote the rep key layer end to end, added a hash-consed structural identity, re-ordered
-the shape-descent grammar three times and moved the arena hand-over from 37.3% to 98.7%. Suite
-2,159/0, `cases_wasm` **1,940/0** (the new pin), fixpoint byte-exact at 1,251,198,
-`rep-fuzz-check` **exact ✅**.
+The two moved rejects are the C8 container-element rule doing its job. Master refuses them late and
+vaguely — `emitProgram: value-union closure RESULT is not yet representable` — while the branch
+refuses them at CHECK time with a source-located message naming the actual cause:
+
+> *a value of type `string[]` flowing into `(f32 | string)[]` … changes how the ELEMENT is stored:
+> type-valid (the element type widens) but not yet supported by codegen … Build the container at
+> `(f32 | string)[]`, or declare the source as `(f32 | string)[]`*
+
+Same verdict, earlier and legible. **Every other row of 2,010 is byte-identical to master on both
+channels**, across a branch that rewrote the rep key layer end to end, added a hash-consed structural
+identity, enumerated a struct row's identity, re-ordered the shape-descent grammar three times, and
+moved the arena hand-over from 37.3% to 98.7%.
+
+Gates: suite **2,160/0**, `cases_wasm` **1,940/0**, native fixpoint byte-exact at 1,251,256,
+self-lint + fmt clean, structural-identity harness **0/0/0**, `rep-fuzz-check` **exact ✅**.
 
 ## THE CALLER HAND-OVER DOES NOT GENERALISE — measured on the next two sites (2026-08-19)
 
