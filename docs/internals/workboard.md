@@ -1465,9 +1465,32 @@ Corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text;
 steps: **+12.1 KB (1.0%)** over the pre-identity tip — the harness and the identity, less the two
 string maps the wiring retired.
 
-**Remaining consumers, for whoever takes step 3:** `slotCanonKey` (returns a canon key string),
-`repElemKeyOfNameTy` (an elem key, stored in name-keyed tables), `emit_classify:6001` and `:6670`,
-and `repShadowNote`'s dedup key. Each is a separate slice with the same shape and the same gate.
+### STEP 3: `slotCanonKey` and the ref-list element column
+
+Three more consumers, all the same move:
+
+- **`slotCanonKey` → `slotCanonId`.** Every answer was a rendered key whose only use is equality, so
+  it becomes the id — and the `""` "never participates in dedup" sentinel becomes `-1`. Its three
+  rungs are untouched. Its dependants follow: `repStructSlotsTwin`, `repStructSlotRep`,
+  `repRowOfTyStruct`, and `buildStructTwins` (whose `keys: string[]` is now `i32[]`).
+- **`repElemKeyOfNameTy` → `repElemIdOfNameTy`**, and `rlElemKey: string[]` → `i32[]`. Its
+  unresolvable-spelling answer `"name:<nm>"` becomes an `HC_NAME` id carrying the name's SID rather
+  than the spelling — still the one place a name reaches this table, and it can never collide with a
+  structural key because its tag is its own.
+- **`rlSlotOfTy`** keys on `repElemId`.
+
+**AND HERE THE BYTE CHANNEL IS LIVE, which step 2's was not.** Two sabotages, both on the shipped
+tip: breaking the `rlElemKey` equality moves **21 of 2,010**; making `slotCanonId` answer a unique
+value per slot (so nothing ever merges) moves **168 of 2,010**. So for step 3, unlike step 2, the
+byte-identity gate is a real proof and not a vacuous one — and it holds at **0 of 2,010** on
+emitted-wasm sha256, exit code and diagnostic text. Suite 2,159/0; `cases_wasm` 1,939/0; fixpoint
+byte-exact at 1,243,966; harness still 0/0/0.
+
+**What is left of the string keys after three steps.** Exactly three call sites:
+`repNameCanonKey`'s own body, `mvValCanonKey` (which mixes the arena key with the name key), and
+`repShadowNote` — where the spelling is genuinely wanted, because the message is for a human. Convert
+the first two and `repCanonKey` / `repElemKey` become **debug-only**: built by nothing but the
+harness that proves the identity equals them.
 
 **What is now true of the terminal item.** Its blocker was stated as *"the interner keys are names,
 and a re-render moves spellings, and spellings move bytes"*. The third clause is false (measured

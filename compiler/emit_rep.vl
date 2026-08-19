@@ -809,13 +809,13 @@ export function tyIsStrLeafElem(e: i32): boolean {
 //
 // The `name == ""` early-out stays ABOVE the hint: an unnamed element has no row,
 // and the empty key is what makes both interner and resolver decline together.
-export function repElemKeyOfNameTy(name: string, ty: i32): string {
-  if name == "" { return "" }
-  if ty >= 0 { return repElemKey(ty) }
-  if name.length > 4096 { return "name:" + name }
+export function repElemIdOfNameTy(name: string, ty: i32): i32 {
+  if name == "" { return -1 }
+  if ty >= 0 { return repElemId(ty) }
+  if name.length > 4096 { return hcNameId(name) }
   const di = resolveAnnot(name, repNoTyparams)
-  if di < 0 { return "name:" + name }
-  repElemKey(di)
+  if di < 0 { return hcNameId(name) }
+  repElemId(di)
 }
 
 // ── repMvValKey — the map-VALUE slot rep key ──────────────────────────────────
@@ -1304,6 +1304,7 @@ const HC_BIG = 12 // the runaway cap `"@big:<ix>"`
 const HC_SLOT = 13 // a DECLARED slot `"S<n>"` — elem key only
 const HC_RLI32 = 14 // `"$rlI32L"` — elem key only
 const HC_RLSTR = 15 // `"$rlStrL"` — elem key only
+const HC_NAME = 16 // the unresolvable-spelling key `"name:<nm>"`, arg = the name's sid
 
 let hcTag: i32[] = []
 let hcArgStart: i32[] = []
@@ -1432,6 +1433,16 @@ export function hcLenOf(i: i32): i32 {
 }
 
 const hcNoArgs: i32[] = []
+
+// The `"name:<nm>"` key — a NAME-derived identity, not a structural one, minted where a
+// spelling resolves to no type. It carries the name's sid rather than the spelling, so it
+// is still the one place a name reaches this table and it can never collide with a
+// structural key (its tag is its own).
+function hcNameId(name: string): i32 {
+  const a: i32[] = []
+  a.push(sidOf(name))
+  hcIntern(HC_NAME, a, 5 + name.length)
+}
 
 function hcPrimId(name: string): i32 {
   const a: i32[] = []
@@ -2382,8 +2393,12 @@ export function recordUnMemTys(set: string) {
   0
 }
 
-function slotCanonKey(si: i32): string {
-  if si < 0 || si >= sNames.length { return "" }
+// KEYED ON THE STRUCTURAL IDENTITY (the rep-column rewrite, step 3). Every answer was a
+// RENDERED key whose only use is equality, so it is now the hash-consed id — and the
+// `""` "does not participate in dedup, never merged" sentinel becomes `-1`. Same
+// partition, proven; same three rungs, untouched.
+function slotCanonId(si: i32): i32 {
+  if si < 0 || si >= sNames.length { return -1 }
   // RUNG 1 — the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0),
   // consulted FIRST (destringify D-SLOTARENA). This row's type is known
   // structurally, so there is nothing to re-derive from its name; the rung the
@@ -2414,7 +2429,7 @@ function slotCanonKey(si: i32): string {
     const dix = sTyIx[si]
     if dix >= 0 {
       const dt = T.tys[dix]
-      if dt is TyObj { return repCanonKey(dix) }
+      if dt is TyObj { return repCanonId(dix) }
     }
   }
   // RUNG 2 — the NAME ladder, for a row the sidecar does not cover: a mint site that
@@ -2441,12 +2456,12 @@ function slotCanonKey(si: i32): string {
   }
   if di >= 0 {
     const t = T.tys[di]
-    if !(t is TyObj) { return "" }
-    return repCanonKey(di)
+    if !(t is TyObj) { return -1 }
+    return repCanonId(di)
   }
   // Neither rung: a synthetic `#anon` row the D0 recorder could not type, or an
-  // unresolvable spelling. "" is the legacy never-merged behaviour.
-  ""
+  // unresolvable spelling. -1 is the legacy never-merged behaviour ("" before step 3).
+  -1
 }
 
 // The arena type index to record for an anonymous object-literal shape row (phase
@@ -2604,9 +2619,9 @@ function structFieldCodesEq(a: i32, b: i32): i32 {
 export function repStructSlotsTwin(a: i32, b: i32): i32 {
   if a == b { return 1 }
   if a < 0 || b < 0 { return 0 }
-  const ka = slotCanonKey(a)
-  if ka == "" { return 0 }
-  if ka != slotCanonKey(b) { return 0 }
+  const ka = slotCanonId(a)
+  if ka < 0 { return 0 }
+  if ka != slotCanonId(b) { return 0 }
   structFieldCodesEq(a, b)
 }
 
@@ -2640,12 +2655,12 @@ export function repStructSlotRep(si: i32): i32 {
   if si < repSlotRepMemo.length {
     if repSlotRepMemo[si] >= 0 { return repSlotRepMemo[si] }
   }
-  const key = slotCanonKey(si)
+  const key = slotCanonId(si)
   let rep = si
-  if key != "" {
+  if key >= 0 {
     let j = 0
     while j < si {
-      if slotCanonKey(j) == key && structFieldCodesEq(j, si) == 1 {
+      if slotCanonId(j) == key && structFieldCodesEq(j, si) == 1 {
         rep = j
         j = si // stop at the first (smallest) twin
       }
@@ -2674,12 +2689,12 @@ export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   if repTyIx < 0 { return -1 }
   const t = T.tys[repTyIx]
   if !(t is TyObj) { return -1 }
-  const key = repCanonKey(repTyIx)
-  if key == "" { return -1 }
+  const key = repCanonId(repTyIx)
+  if key < 0 { return -1 }
   let best = -1
   let si = 0
   while si < lim && si < sNames.length {
-    if slotCanonKey(si) == key {
+    if slotCanonId(si) == key {
       if best < 0 {
         best = si
       } else if structFieldCodesEq(best, si) == 0 {
@@ -2875,21 +2890,21 @@ export function repScanLim(): i32 {
 // Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
 // slot for slot `i`'s WasmGC heap type — the smallest earlier slot with the same
 // canonical key AND field-code layout, or `i` itself when `i` is the first of its
-// structure. Keys are computed ONCE up front (`repCanonKey` per slot), then matched
-// pairwise; a non-participating slot ("" key) is always its own representative.
+// structure. Keys are computed ONCE up front (`slotCanonId` per slot), then matched
+// pairwise; a non-participating slot (-1 key) is always its own representative.
 // Called from `mAssignTypeIndices` before `sHeapIdx` allocation.
 export function buildStructTwins() {
-  const keys: string[] = []
+  const keys: i32[] = []
   let i = 0
   while i < sNames.length {
-    keys.push(slotCanonKey(i))
+    keys.push(slotCanonId(i))
     i = i + 1
   }
   sTwin = []
   i = 0
   while i < sNames.length {
     let rep = i
-    if keys[i] != "" {
+    if keys[i] >= 0 {
       let j = 0
       while j < i {
         if keys[j] == keys[i] && structFieldCodesEq(j, i) == 1 {
