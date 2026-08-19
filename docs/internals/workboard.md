@@ -1821,6 +1821,53 @@ different vocabulary from the text the query holds. Population: 1,943 comparison
 1. may a struct ROW's identity be its TYPE, collapsing spelling twins? (15 of 8,201 cells, 0 of 2,010 files move — priced, an owner call)
 2. should the map- and union-field element vocabularies be unified with the field text, so the refinement HAS an equivalence to measure? (a refactor first, then a measurement — not yet an owner call)
 
+### THE ELEMENT REFINEMENT IS A CONSTANT FALSE ON FIVE OF NINE CODES (2026-08-19)
+
+Item 2 of the pending list — "unify the map/union element vocabularies with the field text" — was
+mine to do, not the owner's, so I did it. It did not land, and what it turned up is better than the
+change would have been.
+
+**First, the measurement that names the problem.** Per field CODE, how the refinement's element
+comparison actually answers over the corpus:
+
+| code | `en == bi` | `en != bi` | |
+|---|---|---|---|
+| 0 scalar / litunion atom | 249 | 32 | works |
+| 4 litunion array | 57 | 4 | works |
+| **5 ref list** | **0** | **399** | **never matches** |
+| 15 nested struct | 371 | 80 | works |
+| 16 value union | 276 | 20 | works |
+| **19 map** | **0** | **750** | **never matches** |
+| **28 nullable ref list** | **0** | **31** | **never matches** |
+| **29 nullable map** | **0** | **54** | **never matches** |
+| **30 nullable litunion** | **0** | **131** | **never matches** |
+
+**Five codes, 1,365 comparisons, zero matches.** For those the two sides are different KINDS of
+string by construction — a map field banks its VALUE name against a whole `{[K]: V}` text, a ref list
+its ELEMENT name against `X[]` — so the comparison is a constant false and **any shape carrying one
+of those fields never dedups at all.** (This also corrects the previous entry's guess that code 16
+was a vocabulary mismatch: it matches 276 of 296.)
+
+**The fix looked trivial and DRY**: `shapeFieldElemName(text, code)` is already the ONE HOME the mint
+uses to derive the element name, so ask the query's text the same question instead of comparing the
+raw spelling. All five codes came alive — 5 → 109/28, 19 → 192/4, 28 → 8/6, 29 → 10/8, 30 → 30/2.
+
+**And it breaks 5 of 2,010 files**, four with the loud `emitProgram: binding's inline-shape type has
+an unsupported field`. Adding the map KEY half — the dimension `recordSFieldElemRow`'s own header
+names ("an mv slot's identity is the (KEY, VALUE) pair") — **does not fix them**: still 5.
+
+**So the finding is not a fix, it is a fact about the table.** The interner's rows carry MORE identity
+than the (field name, field code, element name) triple expresses, and "always distinct" on those five
+codes is what has been standing in for the rest. The witnesses point at the missing dimensions —
+`literal-unions/inline-nested-atom-array.vl` at atom identity, `types/declared-vs-inline-mixed-
+union-field-twin.vl` at the declared-vs-inline union vocabulary — but nowhere in the tree is a row's
+identity enumerated in one place.
+
+**That folds item 2 back into item 1.** Both are the same question after all, and it is bigger than
+"may twins merge": **what IS a struct row's identity?** Until that is written down, the dedup's
+conservative constant-false is load-bearing, and every attempt to replace a spelling comparison with
+a structural one is guessing at a list nobody has made. Reverted; nothing shipped.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
