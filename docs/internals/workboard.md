@@ -2009,6 +2009,37 @@ name took, the name grammar is wrong.** That is a standing diagnostic, not a one
 strongest argument this programme has produced for carrying the type alongside the spelling, better
 than any parse count.
 
+### A THIRD MIS-ORDER, SAME ORACLE — and this one moves NO coverage, which is the honest part (2026-08-19)
+
+Pointed at the last 10 leaves, the diagnostic named a third class, and every remaining witness is one
+name shape:
+
+```
+MAPMISS  nm={[string]:()=>i32}|{w:i32}|null   ty={[string]: () => i32} | {w: i32} | null
+ELEMMISS nm=(boolean|string)[]|(i32|f64)[]    ty=(boolean | string)[] | (i32 | f64)[]
+FLDMISS  f=z in {a: boolean, f: () => {…}, z: i32} | {w: i32}
+```
+
+**A name with a TOP-LEVEL `|` reaching the composite arms.** The paren-carrying union branch interned
+its arms and then FELL THROUGH — deliberately, per its comment ("closure unions etc. keep their
+existing path") — into the `[]`, map and inline-shape peels, each of which then claimed the whole
+union as though it were the composite its FIRST arm happens to be. The arena says `TyUnion` and
+declines the step; that is how it surfaced, exactly as the other two did.
+
+The fall-through now returns, as the paren-free branch always did. The path its comment protected
+runs ABOVE this point since the functype arm moved, so nothing depends on it.
+
+**AND IT MOVES NO COVERAGE — still 743 of 753 (98.7%), residue still 10.** The mis-peels were not
+producing hinted leaves; they were producing WORK on names the descent had mis-parsed. So this one is
+a hygiene fix in the same family, not a coverage win, and saying otherwise would be the kind of claim
+this board exists to catch. Corpus A/B **0 of 2,010** on all three channels, suite 2,159/0,
+`cases_wasm` 1,939/0, fixpoint byte-exact at 1,251,334.
+
+**THREE MIS-ORDERS, ONE DIAGNOSTIC, AND THE RESIDUE IS NOW THE POINT.** The last 10 leaves are what
+the descent genuinely cannot type — not mis-parses. The family is closed: `internShapeDeepTy`'s
+grammar now orders arrow → nullable → union → array → map → shape, which is
+`internFuncTypeShapes`' order, and the two twins agree for the first time.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
