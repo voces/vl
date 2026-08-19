@@ -123,6 +123,34 @@ descriptor") and a stale anchor.
 
 ---
 
+## THE BRANCH, GATED AS A WHOLE AGAINST MASTER (2026-08-19)
+
+43 commits. The full battery run once from a clean tree, as the PR gate:
+
+| gate | result |
+|---|---|
+| working tree | clean |
+| native fixpoint | byte-exact, 1,251,334 |
+| self-lint + fmt | clean |
+| `deno task test` | **2,159 / 0** |
+| `cases_wasm` (shared instance) | **1,939 / 0** |
+| LSP bundle | rebuilt |
+| structural-identity harness | **0 merges / 0 splits / 0 length mismatches** |
+| **corpus A/B vs MASTER, 2,010 files** | **2 rows moved** |
+
+**Both moved rows are programs that now COMPILE where master rejects them:**
+
+- `closures/error-nullable-elem-closure-field-array-lambda-sig-twin.vl` — master emits *"a
+  nullable-{…} list element has no rep"*; the interner's dedup fix resolves the composition and it
+  runs, printing `frb`.
+- `statements/bare-return-void-early-exit.vl` — master has no lowering for a bare `return` in a void
+  function; that is the void ruling's terminator half, shipped early in this branch.
+
+Everything else — 2,008 of 2,010 files — is byte-identical to master on emitted wasm, exit code and
+diagnostic text, across a branch that rewrote the rep key layer end to end, added a hash-consed
+structural identity, re-ordered the shape-descent grammar three times and moved the arena hand-over
+from 37.3% to 98.7%.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
