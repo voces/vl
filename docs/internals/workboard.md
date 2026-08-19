@@ -478,10 +478,31 @@ twins, in reverse."* Two disagreements at a store/push index is the shape that p
 one unsound ship, which only `rep-fuzz-check` caught. It needs the twin gate
 (`repStructSlotsTwin` / `structFieldCodesEq`) before it can be considered, not a byte A/B.
 
-**So the next slice is named, sized and gated**: give `structIndexOfTy` a canon-id rung behind the
-twin gate — 250 of 444 fall-throughs available, 38 of them rows the name cannot reach at all, 2 cells
-needing the gate. That is a real slice with a real number, and it is the first thing this layer
-actually needs.
+**AND THAT SLICE IS ALREADY IN THE TREE.** Before building it I traced what `rlElemStructRow`
+actually does after the name declines — and its THIRD rung is
+`repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())`, which is a canon-key scan **with the
+`structFieldCodesEq` twin gate already on it**. Exactly the thing I had just specified.
+
+Instrumented over the corpus, the ladder's three rungs:
+
+| rung | reached | answered |
+|---|---|---|
+| 1 · `rlElemStructIdxAt` (arena, exact index) | 1,036 | 592 |
+| 2 · `structIndexByName` (the NAME) | 444 | **276** |
+| 3 · `repRowOfTyStruct` (canon key + twin gate) | 168 | **38** |
+
+**38 is exactly the CANON-ONLY count from the probe above**, and that is the proof rather than a
+coincidence: my 250 decomposes as 210 the NAME also answers (rung 2 reaches them first, same answer,
+no gain) + 2 disagreements (which rung 3's twin gate exists to filter) + **38 already answered by
+rung 3**. There is no gain available. The ladder is complete, and the "next slice" was a
+re-derivation of work already shipped.
+
+**Third time in this sequence that measuring a proposed slice showed it was already done or not
+needed** — the param reject ladder (0 cases), the TY-column hint (0 overlap), and now this. The
+lesson is not that the measurements were wasted: each one converted "there is remaining work here"
+into a number, and the number was zero. **A programme is finished when its next slice measures to
+nothing, not when someone declares it finished** — and that is now true of the ref-list element
+layer's struct-row lookup.
 
 **The blocking capability is an arena-keyed MINT.** Three sites feed `rlInternName` / the
 `uFieldElemName` write with a struct row's spelling; an intern MINTS a row keyed by the name it is
