@@ -266,6 +266,37 @@ eligibility) that the declared type does not answer. **One caller converting cle
 that callers convert cleanly**, and after the rep-fuzzer caught the interner merge on this same
 branch, a 11.2% disagreement rate is nowhere near shippable on byte-identity alone.
 
+## THE CALLER CENSUS IS CLOSED — every site judged by the rule, with its number (2026-08-19)
+
+The rule the conversions produced — *a caller converts when its question IS "what type does this
+denote"* — has now been applied to every site the `structIndexByName` / `isSName` census turned up.
+Six sites, four converted, one refused, one measured away:
+
+| site | traffic | verdict | evidence |
+|---|---|---|---|
+| `structIndexOfLet` | 168,665 (65%) | **converted** | 15 of 8,201 disagree, all structural twins (`repStructSlotsTwin` = 1) |
+| Param declared type `:18066` | 13,724 (5%) | **converted** | 41 of 15,922 disagree, all ONE class, all twins |
+| union ARM `:7383` | 14,795 (6%) | **converted** | 63 of 76 answered, **0 disagree** — the seam pairs arm to member |
+| `letIsStruct` | — | **converted** | strict superset: 24 arena-only, **0 name-only** |
+| `:11391` rep sidecar | 9,474 (4%) | **REFUSED** | 59 of 528 disagree (11.2%); it sits below an arena rung that already declined, reading a DIFFERENT sidecar |
+| param reject ladder `emit_sections:574` | — | **NO CONVERSION NEEDED** | **0** — see below |
+
+**The last row is the one worth having.** `emit_sections:574` is a REJECT ladder, and converting a
+reject ladder to accept more is the riskiest change shape in this codebase — it is exactly where the
+rep fuzzer caught me earlier this session. So it was measured before being touched: **of every param
+the ladder REJECTS, zero have an arena type `nodeTyIsStruct` claims.** The name ladder is already
+complete for that site. No rung, no risk, and the reason is a number rather than caution.
+
+(The first attempt at that measurement counted 292 and was WRONG — the counter sat before the
+`!isSName` test, so it tallied every arena-true param including the ones the name already accepts,
+with `#anon0`…`#anon5` as its witnesses. Moved to the reject point it reads 0. A probe in the wrong
+place answers a question you did not ask.)
+
+**So the caller half of the hand-over is DONE as far as the census reaches**: four sites moved to the
+arena, one refused with its number, one shown unnecessary with its number. What remains name-keyed —
+`sNames` as the row's stored spelling — is not a caller problem; it is the row layer, and its
+identity is already structural.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
