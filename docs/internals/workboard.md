@@ -2040,6 +2040,35 @@ the descent genuinely cannot type — not mis-parses. The family is closed: `int
 grammar now orders arrow → nullable → union → array → map → shape, which is
 `internFuncTypeShapes`' order, and the two twins agree for the first time.
 
+### THE HAND-OVER'S STRUCTURAL CEILING — all 10 residual leaves attributed (2026-08-19)
+
+With the three mis-orders fixed, the residue is 10 of 753 and every one is now attributed to its
+source rather than left as a count:
+
+| source | count | why it cannot be hinted |
+|---|---|---|
+| `gaeApplyFieldTy` — a name BUILT by substitution | **4** | the spelling is CONSTRUCTED from a generic alias's field template; no node ever held it, so there is no `nodeTyIx` to hand over. Impossible by construction, not missing. |
+| collect `TypeRef` root, gates rejected | **5** | two are the generic-alias-PARAMETER gate (`{a:Sx}`, `{a:K[]}`) — deliberate, and proven necessary: removing it reintroduces disagreements. Three are nodes the checker recorded no type for at all. |
+| collect `fdType` root | **1** | same, one field-definition node |
+
+**So the hand-over is at its structural ceiling: 4 impossible, 2 deliberate, 4 with no recorded type.**
+98.7% is not a coverage shortfall with 1.3% of work left in it — it is the whole population minus the
+part that cannot exist.
+
+**Where the session's descent numbers ended up**, and the shape of the change matters more than the
+percentage:
+
+| | at session start | now |
+|---|---|---|
+| leaf resolutions in the descent | 1,097 | **753** (344 were spurious mis-parses) |
+| carrying an arena hint | 409 (37.3%) | **743 (98.7%)** |
+| dual-run agreement | 411 / 0 | **743 / 0** |
+| residue | 688, unattributed | **10, every one named** |
+
+The first row is the one worth reading twice: a third of the descent's work was on names it had
+mis-parsed, and no channel in this project could see it until the arena was carried alongside to
+disagree.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
