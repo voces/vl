@@ -138,18 +138,46 @@ descriptor") and a stale anchor.
 | structural-identity harness | **0 merges / 0 splits / 0 length mismatches** |
 | **corpus A/B vs MASTER, 2,010 files** | **2 rows moved** |
 
-**Both moved rows are programs that now COMPILE where master rejects them:**
+**REVISED — THE REP FUZZER CAUGHT ONE OF THEM, AND IT WAS MINE.** The gate above was run before
+`scripts/rep-fuzz-check.sh`, which is the harness this project built for exactly this class. It
+failed:
 
-- `closures/error-nullable-elem-closure-field-array-lambda-sig-twin.vl` — master emits *"a
-  nullable-{…} list element has no rep"*; the interner's dedup fix resolves the composition and it
-  runs, printing `frb`.
+```
+✗ NEW / WORSE   + MISMATCH  p2r ((i32) => {f: boolean}[] | {w: i32}) | f64
+✗ STALE         - REJECT    p2r ((i32) => {f: boolean}[] | {w: i32}) | f64
+```
+
+**REJECT → MISMATCH is the "silently worsen" transition the harness exists to refuse**, and MISMATCH
+is never baselineable. The shape compiles on my branch and gives the WRONG ANSWER: in
+`if t1 is {f: boolean}[]` the narrowing takes the else branch and prints `OTHER` where `false` is
+correct.
+
+The cause is the interner's element-dedup enabling — unifying the refinement's two vocabularies
+through `shapeFieldElemName` so five dead codes could match. It makes previously-un-repped
+compositions resolve, and for this shape the resolution is unsound.
+
+**NOTHING ELSE SAW IT.** 2,010 corpus files byte-identical, 2,159 suite cases green, 1,939 wasm cases
+green, native fixpoint byte-exact, the structural-identity harness 0/0/0. The rep fuzzer alone.
+
+**Reverted** — the element comparison stays on the raw field text, the merge-alias with it. The
+`@emit-error` fixture it had retired goes back to `@emit-error`, and the fuzz shape is pinned as
+`closures/error-narrow-reflist-arm-of-closure-result-union.vl` so the next attempt at that merge
+fails in the corpus first.
+
+**What the constant-false actually is, then.** Not an oversight to be tidied away: it is the thing
+standing between a name-keyed row table and an unsound merge. The measurement that found it (5 codes,
+1,365 comparisons, 0 matches) stands; the conclusion that it was safe to fix does not.
+
+**After the revert, the branch moves ONE row of 2,010 against master:**
+
 - `statements/bare-return-void-early-exit.vl` — master has no lowering for a bare `return` in a void
-  function; that is the void ruling's terminator half, shipped early in this branch.
+  function; that is the void ruling's terminator half.
 
-Everything else — 2,008 of 2,010 files — is byte-identical to master on emitted wasm, exit code and
-diagnostic text, across a branch that rewrote the rep key layer end to end, added a hash-consed
-structural identity, re-ordered the shape-descent grammar three times and moved the arena hand-over
-from 37.3% to 98.7%.
+**2,009 of 2,010 byte-identical to master** on emitted wasm, exit code and diagnostic text, across a
+branch that rewrote the rep key layer end to end, added a hash-consed structural identity, re-ordered
+the shape-descent grammar three times and moved the arena hand-over from 37.3% to 98.7%. Suite
+2,159/0, `cases_wasm` **1,940/0** (the new pin), fixpoint byte-exact at 1,251,198,
+`rep-fuzz-check` **exact ✅**.
 
 ## Band 1 — destringify types
 
