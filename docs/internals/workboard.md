@@ -1759,6 +1759,42 @@ per-program reset. The reset is load-bearing and measured: removing it fails the
 harness. Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0;
 `cases_wasm` 1,939/0; fixpoint byte-exact at 1,248,598.
 
+### THE ELEMENT-TEXT REFINEMENT IS **NOT** THE TWIN-MERGE QUESTION — measured (2026-08-19)
+
+The interner's dedup has two halves: the fieldset key (now a structural id) and the per-candidate
+ELEMENT-TEXT refinement, which compares the stored `sFieldElemName` against the query's field text.
+I assumed the refinement reduced to the same pending ruling as the row identity — that switching it
+to arena types would COARSEN it, merging spelling-distinct-but-type-identical elements. **It does
+not, and the guess was wrong.**
+
+Instrumented at the comparison over the corpus:
+
+| | |
+|---|---|
+| refinement reached | 5,058 |
+| row carries an element NAME | 2,454 |
+| …and an element ARENA TYPE (`sFieldElemTyIx`) | **2,423 (98.7%)** |
+| comparisons where the two TEXTS differ | 1,501 |
+| …with an arena type on BOTH sides | 1,471 |
+| **…where the arena types nevertheless AGREE (the coarsening)** | **0** |
+
+**Zero.** On this corpus, element spellings that differ always denote different types, and equal
+spellings trivially denote the same one. So the arena comparison and the text comparison partition
+identically — the refinement is **not** a semantic question and does not wait on the twin-merge
+ruling.
+
+**What it does wait on is mechanical**: the ROW side is 98.7% covered by the existing `sFieldElemTyIx`
+sidecar, but the QUERY side has no type — `annShapeIndexOf` receives field TEXTS. Supplying it means
+the caller peeling each field's element type out of `fldTy` with a per-code ladder mirroring the
+mint's own element extraction (the long per-code arm in `internInlineShapeTy`'s push loop). That is
+a "one home for the element peel" refactor, of the B9 family, not a design call. Population: 1,471
+cells corpus-wide and **0 on the compiler's own source**, so it is small and it is not urgent — but
+it is unblocked, which is the point of measuring it.
+
+**So the pending-ruling list is now exactly ONE item, not two:** may a struct ROW's identity be its
+TYPE, collapsing spelling twins (15 of 8,201 cells, 0 of 2,010 files move)? The element refinement is
+off that list.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
