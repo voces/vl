@@ -544,15 +544,28 @@ measuring each column's ARENA SIDECAR coverage says everything:
 stored spelling handed to consumers, not a resolution path. The ref-list column's ladder measures to
 no available gain (38 = 38, previous entry).
 
-**`uFieldElemTyIx` at 58.4% is the one remaining measured gap in this layer**, and it is a real one:
-1,130 calls of 2,719 fall back to the name. That column is filled by `recordUFieldElemRow` at the
-union field table's mint, and it is also the SOURCE of two shipped hint sites
-(`internInlineShapeTy(en5, uFieldElemTyIxRow(ufn))`), so raising its coverage would widen the
-hand-over as well as close the fall-back.
+**AND THE 58.4% IS NOT A GAP EITHER — I asked what the declines ARE.** `recordUFieldElemRow` banks
+`fieldElemTyIxOfName(nm)` at the union field table's mint. Instrumented there: of **790** rows
+minted, **667 (84.4%)** record -1, and **all 667 of them are because the element name is EMPTY**.
 
-**That is the whole remaining destringify frontier as this session leaves it**: one column, one
-number, and a producer to improve rather than a design to settle. Everything else in the layer either
-measures to zero available gain or is already at 100%.
+A field with no element has no element TYPE. The uncovered rows are scalar fields — `{f: i32}`,
+`{f: boolean}` — which record `""` for the element name by design and can therefore record nothing
+for its type. There is no spelling being resolved and failing; there is nothing to resolve.
+
+**So all three identity columns in this layer are done:**
+
+| column | verdict |
+|---|---|
+| `rlElemName` | ladder complete — rung 3 already answers the 38 cells rungs 1–2 cannot (38 = 38) |
+| `mvValName` | sidecar 5,096 of 5,096 — **100.0%** |
+| `uFieldElemName` | the 41.6% shortfall is entirely fields with NO ELEMENT |
+
+**FOURTH consecutive "next slice" to measure to zero** — the param reject ladder (0 cases), the
+TY-column hint (0 overlap), the canon-id rung (already rung 3), and now this. That is not a run of
+luck; it is what the end of a programme looks like when every remaining item is checked before it is
+believed. The three columns were sized at 63 readers and every one of those readers is either
+already arena-first, a fall-back that measures to nothing, or a consumer that legitimately wants a
+spelling.
 
 ## Band 1 — destringify types
 
