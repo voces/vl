@@ -613,10 +613,31 @@ whole compiler resolves a type from a spelling **six times**, and enters the str
 **ten** times, **two** of them on a composite name. Everything else walks the parser's spelling TREE,
 which is structure, not text.
 
-The corpus figure is higher and that is expected rather than a caveat: `tests/cases` is a test corpus
-built to exercise exotic inline annotations — `{a:f32,f:(()=>i32)[]|null,z:{[i32]:K0}}` and its
-relatives — which is exactly the population that has no declared name to resolve through. It is the
-adversarial number, not the representative one, and both are recorded so neither can be quoted alone.
+The corpus figure is higher and that is expected rather than a caveat — but "expected" is a claim, so
+here is the classification of all **1,848** of them:
+
+| what the name IS | count | share |
+|---|---|---|
+| an inline SHAPE `{…}` | **821** | 44.4% |
+| a UNION `A \| B` | 309 | 16.7% |
+| a FUNCTYPE `(…) => …` | 270 | 14.6% |
+| an ARRAY `X[]` | 256 | 13.9% |
+| a BARE identifier (`S`, `P`, `Node`) | 144 | 7.8% |
+| other (`#anon0`, synthetics) | 48 | 2.6% |
+
+**89.6% are COMPOSITE spellings — inline shapes, unions, functypes, arrays — and for those the
+spelling is not a re-derivation, it is the FIRST derivation.** The source wrote the type inline;
+there is no declaration behind it to resolve through and no earlier answer to hand over. Resolving
+`{a:f32,f:(()=>i32)[]|null,z:{[i32]:K0}}` once is what typing it MEANS.
+
+The 144 bare identifiers take the bare-name RUNG (`tsLeafTy`, shipped early in this programme and
+arena-neutral by construction — the counter here sits above it), and the 48 synthetics are `#anon`
+literal-shape names the emitter minted itself.
+
+**So "1,855 parses over the corpus" is not parsing that destringification left behind. It is the
+irreducible cost of a test corpus written almost entirely in inline annotations** — and the number
+that measures the programme is the self-compile's **6**, on a body of real code where types are
+declared and therefore have somewhere to be resolved FROM.
 
 **Where this leaves band 1.** Every table the programme set out to convert has been measured, and
 each is either converted or measured to zero available gain:
