@@ -1580,6 +1580,55 @@ showed 1,939/0 — the Deno harness loads `build/vl-compiler.wasm` directly and 
 variable. The sabotage only reddened once the seed was actually swapped on disk. Same family as the
 CWD lesson earlier in this programme: **verify the probe reached the thing you think it reached.**
 
+### THE SHAPE DEDUP'S PRIMARY KEY IS NOW A STRUCTURAL ID (2026-08-19)
+
+`annShapeIndexOf` walked the WHOLE struct table and re-derived the same three conditions on every
+row: the field COUNT, every queried name being present, and the codes matching. Those three ARE a
+key — "the row has the same multiset of (field name, field code)", and a struct's field names are
+unique — so they are now computed once as a hash-consed id over `(sid(name), code)` pairs in a
+canonical order. **Integers; no spelling composed.** The scan becomes a walk of one bucket.
+
+**Exactly equivalent BY CONSTRUCTION, not merely measured.** A row in a different bucket fails
+conditions 1–3 and the old scan rejected it; a row in the same bucket passes them and reaches the
+element / atom-identity refinement, which is untouched. That refinement stays per-candidate because
+it compares stored element SPELLINGS and its atom-identity split reads the QUERY's text — the part
+of this dedup that is genuinely name-shaped, and deliberately left alone.
+
+**Verified by dual-run, because the byte channel could be blind**: both answers computed on every
+call over the corpus, **3,112 agree / 0 disagree**. The chain walk is load-bearing — stopping at the
+bucket head disagrees on **75** of 3,112, so buckets really do hold several rows that only the
+refinement separates.
+
+**The SORT is not exercised by the corpus, and I am recording that rather than banking it.** Keying
+the multiset in written order instead of sorted order gives **0 disagreements** — no two rows here
+share a field-name set in a different ORDER at a point where dedup matters. It stays sorted, and the
+reason is an argument rather than a measurement: the scan it replaces looked each queried name up
+via `sFieldIndex`, so it was order-insensitive BY CONSTRUCTION, and an order-sensitive key would
+silently mint a duplicate row for `{a: i32, b: i32}` against `{b: i32, a: i32}`.
+
+Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,247,601.
+
+### WHERE THE PROGRAMME STANDS
+
+| layer | state |
+|---|---|
+| the type ARENA | string-free for structure and kind (`PrimName`, `LitKind`, `errKind: i32`) |
+| the CHECKER's resolution | **2** name parses corpus-wide; 17,459 tree walks |
+| the emitter's arena HAND-OVER | **95.2%** of interner leaf resolutions carry the recorded type |
+| the REP tables | **0 characters** of type spelling built on a real compile |
+| the interner's row LOOKUP | indexed; was 258,112 scans / 2,394,078 comparisons on the self-compile |
+| the interner's DEDUP key | a structural id over `(name sid, code)` |
+| **what is still a spelling** | the interner's STORED name (`sNames`), the element-text refinement, and `nameFieldCode`'s classifier ladder |
+
+**The honest residue.** `sNames` is still the row's stored identity and `structIndexByName` is still
+how most callers ask for a row — the index made it O(1), not name-free. Removing the NAME as the
+row's identity means every caller holding a spelling must hold a type instead, which is the
+hand-over programme at 95.2% and is exactly what would have to reach ~100% first. And
+`nameFieldCode` is a classifier over spellings — 12,414 calls and 100,214 characters on the corpus,
+**1,267 on the self-compile** — which is the last real parse population in the emitter, and its own
+item.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
