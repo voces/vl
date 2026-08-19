@@ -450,15 +450,38 @@ re-derive it:
 | `rlElemStructRow` | 1,036 | **444 (42.9%)** |
 
 Two of the four are effectively done at 97%+. The other two share one rung — `rlElemStructIdxAt`,
-the struct-row-by-element-type lookup — and it answers on 57% and 66%. **That rung is the next
-slice**, and its ceiling is `rlElemTyIx`'s own coverage, which is filled at the intern by
-`fieldElemTyIxOfName(stored)` — a NAME resolution, and therefore exactly the hand-over shape this
-session used four times.
+the struct-row-by-element-type lookup — and it answers on 57% and 66%.
 
-**Note the two columns are separable, which the refutation above does NOT close.** `rlElemKey` (the
-dedup key) and `rlElemTyIx` (the recorded type) are different columns; the 42-of-199 refutation is
-about handing a struct row's type to the KEY. Handing it to the TY column only — improving
-`rlElemTyIx` coverage without touching the key — is untested and is the obvious first probe.
+**I SAID ITS CEILING WAS `rlElemTyIx` COVERAGE. IT IS NOT, AND BOTH PROBES SAY SO.**
+
+*Probe 1 — can the TY column take the hint the KEY cannot?* Of **3,146** ref-list element mints,
+only **45** have an empty name leg, **396** are hinted, and the hint would fill **0** of the empty
+ones (with 392 same / 4 different). **The hint and the gap do not overlap at all** — so the TY column
+is not the ceiling, and the separable-columns idea is closed with a number.
+
+*Probe 2 — then what IS the fall-through?* `rlElemStructIdxAt` is
+`structIndexOfTy(peelNul(rlElemTyIxAt(slot)))`, and `structIndexOfTy` matches on the RAW ARENA
+INDEX. The element's recorded type is routinely a DIFFERENT index from the struct row's, even when
+structurally identical — the same non-canonical-index fact that broke an earlier comparator this
+session. Replacing the match with a `repCanonId` one, over the 444 fall-throughs:
+
+| | |
+|---|---|
+| canon-id answers | **250 of 444 (56%)** |
+| agrees with the name answer | **210** |
+| **disagrees** | **2** |
+| answers where the NAME finds nothing | **38** |
+
+**NOT TAKEN, and the site's own header says why**: *"this row is a store/push struct index, where a
+leniently-matched row is a wrong heap type — the same asymmetry method note 27 draws around layout
+twins, in reverse."* Two disagreements at a store/push index is the shape that produced tonight's
+one unsound ship, which only `rep-fuzz-check` caught. It needs the twin gate
+(`repStructSlotsTwin` / `structFieldCodesEq`) before it can be considered, not a byte A/B.
+
+**So the next slice is named, sized and gated**: give `structIndexOfTy` a canon-id rung behind the
+twin gate — 250 of 444 fall-throughs available, 38 of them rows the name cannot reach at all, 2 cells
+needing the gate. That is a real slice with a real number, and it is the first thing this layer
+actually needs.
 
 **The blocking capability is an arena-keyed MINT.** Three sites feed `rlInternName` / the
 `uFieldElemName` write with a struct row's spelling; an intern MINTS a row keyed by the name it is
