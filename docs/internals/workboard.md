@@ -1071,6 +1071,71 @@ bundle rebuilt.
 | roots the collect-site gates reject | canon rewrote the spelling, or the name mentions a generic-alias parameter — by design |
 | `internShapeFieldElems` (5) | measured, negligible |
 
+### THE UNION ARMS — and the census that RANKED THEM LAST was reading the wrong unit (2026-08-19)
+
+With the field hand-over in, 571 of 1,097 leaf resolutions were still unhinted. I attributed every
+one of them by instrumenting the DROP POINT — the branch that last held a type and passed -1 down:
+
+| where the hint was dropped | count | share |
+|---|---|---|
+| no root (`internShapeDeep`, the -1 wrapper) | **404** | 70.8% |
+| functype (`internFuncTypeShapes`) | 109 | 19.1% |
+| unattributed | 43 | 7.5% |
+| element / nullable / map step miss | 10 | 1.8% |
+| value union | 4 | 0.7% |
+| **union arms** | **1** | **0.2%** |
+
+**That table ranks the union arms LAST and it is wrong.** `internShapeArms` reaches the descent
+through the -1 WRAPPER, and the wrapper re-attributes everything below it to "no root". A second
+probe tagging the wrapper's five CALL SITES splits the 404:
+
+| call site | count | share of the 404 |
+|---|---|---|
+| **`internShapeArms`** | **357** | **88.4%** |
+| `emit_classify:15895` union ref-array arm | 22 | 5.4% |
+| `internNonLowerableFieldShapes` (nested / closure) | 21 | 5.2% |
+| `emit_collect:4338` `gaeApplyFieldTy` | 4 | 1.0% |
+
+So the union arms are **358 of 571 (62.7%)**, not 1 of 571 — the largest remaining population by a
+factor of three. This is the board's standing rule reproduced exactly: *ranking by the wrong unit
+inverted the order* (#1327's 15,901 reaches were 3,031 parses). A drop-point census answers "which
+branch let go of the type"; the question was "which CALLER feeds the unhinted leaves", and the two
+differ by one wrapper frame.
+
+**The seam already existed.** `unionMemberTysOf(set, out)` appends a union row's member types in
+`splitUnionAtoms` order — the D-UNION query seam, with a coverage flag of its own — and
+`emit_classify:15895` was already calling its bundled form `unionSetArmTys` for its own atoms and
+then throwing the types away at the `internShapeDeep(a)` line. Both sites now hand the arm's type
+down. The order correspondence holds **by construction, not by convention**: a multi-arm `set`
+matches its row through the `unMemberSet[v] == name` leg, i.e. the row whose recorded set spelling
+IS this string, so the two splits are the same split; the length equality is `unionSetArmTys`'
+second conjunct, asked over the atoms the caller already has.
+
+| | before this slice | after |
+|---|---|---|
+| leaf resolutions with a hint | 526 of 1,097 (47.9%) | **888 (80.9%)** |
+| `sTyIxOfNameTy` reaching `resolveAnnot` | 699 | **342** |
+
+**Dual-run 888 agree / 0 disagree**, sabotage (arm pairing rotated by one) reddens **270** with
+witnesses that name themselves (`hint=i64` against `unhinted={a: () => …, z: f64}`). Corpus A/B
+**0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,230,368; self-lint + fmt clean; LSP rebuilt.
+
+**Across the two slices this session: `sTyIxOfNameTy`'s parses 816 → 342 (−58.1%), leaf hint
+coverage 37.3% → 80.9%.** And on the compiler's own source the site parses **0 times, before and
+after, on every measurement** — so none of it is a speed result, for the fourth and fifth time.
+
+**What is left, re-derived on this base rather than carried forward:**
+
+| population | count | why |
+|---|---|---|
+| functype (`internFuncTypeShapes`) | 109 | takes no type parameter; the arena's `TyFunc` params/result would thread the same way — **the next slice** |
+| unattributed | 43 | needs its own probe |
+| `internNonLowerableFieldShapes` | 21 | reached only under `internFuncTypeShapes`' gate; rides on that slice |
+| step misses (elem / nullable / map) | 10 | the lockstep declining on a genuine name/arena mismatch |
+| `gaeApplyFieldTy` | 4 | a name BUILT by substitution — no node exists to hold |
+| value union | 4 | `registerValueUnionName` is a box registration, not a shape intern |
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
