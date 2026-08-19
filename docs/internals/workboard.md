@@ -935,7 +935,7 @@ none of them encodes a type's shape or kind. **On the programme's own terminal c
 0 verdict changes and 0 emitted-byte changes over 2,005 corpus files; full suite 2,159/0;
 fixpoint holds; the seed shrank 68 bytes.
 
-### THE EMITTER HALF: BUILT, MEASURED, AND NOT SHIPPED — the number is 2 of 413
+### THE EMITTER HALF: SHIPPED, after the last two disagreements were NAMED and gated
 
 The terminal item below says the interner's leaves are names CUT from a larger spelling, so no
 caller can bank an index for them. That is true of the CALLERS and it is not the end of the
@@ -966,21 +966,46 @@ The gate is the canon invariant itself — `clearAnnTs` drops the spelling tree 
 nodes canon rewrote in place, so a surviving tree says the name still describes the recorded
 type. It removes 9 of the 11. **Two survive, and two is not zero.**
 
-**NOT SHIPPED, and the reason is the corpus could not have caught it.** The byte A/B was clean
-because `sTyIx` is weakly consumed — a deliberate sabotage handing arena index 0 at every leaf
-also passed the whole suite. So a wrong hand-over here is invisible to every channel this board
-runs and waits for a future consumer: exactly the silent-wrong-slot failure `rlInternNameTy`'s
-header forbids (*a hint that disagrees re-keys the row*).
+**Two was not a residue — it was a NAMED CLASS, and finding out cost one probe.** The byte A/B
+could never have told me: a deliberate sabotage handing arena index 0 at EVERY leaf also passed
+the whole suite, because `sTyIx` is weakly consumed. Only the dual-run sees this, which is why
+it is the gate rather than the corpus.
 
-**What this settles.** The emitter half cannot be destringified by hand-over, and the blocker is
-not "no caller holds a bank" — it is that the bank a caller holds *disagrees with the name* on a
-small, stubborn residue. That residue is B5's class (canon-time arena identity), now measured
-from a second, independent direction: **B5 was 61 of 1,400 at its own site; this route is 2 of
-413 after the canon gate.** The rep-column rewrite is not optional and B5 is its first step.
+Both disagreements were in ONE file, and the witness names the class outright:
 
-The mechanism is described precisely enough to rebuild in an afternoon if B5 lands; what it
-needs from B5 is the guarantee that a node's recorded type and its post-canon spelling name the
-same type.
+```
+name={a:K[]}  hint={a: string[]}  unhinted={a: K[]}
+name={a:Sx}   hint={a: i64}       unhinted={a: Sx}
+```
+
+`generics/type-param-shadows-alias-through-constructors.vl` — a **generic-alias type PARAMETER
+shadowing a module-level alias of the same name**. Inside `type ShapeInArrK<K> = {v: {a: K[]}}`
+the checker binds `K` to the argument, so the node's recorded type is instantiated
+(`{a: string[]}`); the emitter re-resolving the same spelling with no binding in scope reaches
+the module-level `type K = "a" | "b"`. Same spelling, two answers — and the interner's key
+vocabulary is the second.
+
+**So the second gate is `nameMentionsGenAliasParam`**, over `gaParamNames` (the flat column of
+every alias's declared parameters) with a whole-identifier boundary test that now has its one
+home in `tyname.nameMentionsIdent` — `K` is mentioned by `{a: K[]}` and NOT by `Kind`.
+FUNCTION type parameters need no arm and that is measured, not assumed: the monomorphizer
+substitutes them into the spelling before collect runs, which is why the disagreement class was
+alias parameters alone.
+
+| gates | agree | disagree |
+|---|---|---|
+| none | 447 | 11 |
+| canon (`annTsOf >= 0`) | 411 | 2 |
+| **canon + alias-parameter** | **411** | **0** |
+
+**SHIPPED at 0 of 411.** Corpus A/B 0 verdict and 0 byte changes, full suite 2,159/0, fixpoint
+holds, self-lint + fmt clean.
+
+**What it settles.** The emitter half is NOT blocked on B5 after all — that was my reading of
+the ungated 11, and the gated residue turned out to be a different, nameable class. The claim
+this section replaces (*"the rep-column rewrite is not optional and B5 is its first step"*) was
+wrong, and it was wrong because I stopped at a count instead of asking what the two cases WERE.
+**A residue of two is not a residue; it is two cases with names on them.**
 
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 

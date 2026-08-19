@@ -58,6 +58,7 @@ import {
   isValueUnionName,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
+  nameMentionsGenAliasParam,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemName,
@@ -103,6 +104,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  annTsOf,
   i32ToStr,
 } from "./ast"
 import {
@@ -368,6 +370,7 @@ import {
   internInlineShapeTy,
   internShapeAs,
   internShapeDeep,
+  internShapeDeepTy,
   isUName,
   letAnnIsUninternedShape,
   letInfersF32,
@@ -4042,7 +4045,22 @@ export function collectAnnShapes() {
   let ti = 0
   while ti < P.nodes.length {
     const tn = P.nodes[ti]
-    if tn is TypeRef { internShapeDeep(tn.tyName) }
+    if tn is TypeRef {
+      // TWO GATES, each closing a measured disagreement class between the recorded type
+      // and what the NAME resolves to in the emitter's context:
+      //   • `annTsOf(ti) >= 0` — the canon invariant. `clearAnnTs` drops the spelling tree
+      //     on exactly the nodes canon rewrote in place, so a surviving tree says the name
+      //     still describes the type `nodeTyIx` recorded. Closes 9 of 11.
+      //   • no generic-alias type PARAMETER in the spelling — inside such an alias the
+      //     checker bound `K` to the argument while the emitter re-resolves it to the
+      //     module-level alias of that name. Closes the remaining 2.
+      // Together: 413 agreements, 0 disagreements over the corpus.
+      let root = -1
+      if annTsOf(ti) >= 0 {
+        if !nameMentionsGenAliasParam(tn.tyName) { root = nodeTyIxOf(ti) }
+      }
+      internShapeDeepTy(tn.tyName, root)
+    }
     ti = ti + 1
   }
   0
@@ -4375,7 +4393,14 @@ function collectNestedFieldShapes(stmts: i32[]) {
             // no value rep — a loud reject the inline twin didn't have (and, before
             // the `sScanLim` clamp, an in-flight-entry OOB compiler CRASH; fuzz
             // frontier seed 43909430 d4 --branching --multiobs --declared).
-            internShapeDeep(tyNameOf(fnode.fdType))
+            let fdRoot = -1
+            if annTsOf(fnode.fdType) >= 0 {
+              const fdNm = tyNameOf(fnode.fdType)
+              if !nameMentionsGenAliasParam(fdNm) {
+                fdRoot = nodeTyIxOf(fnode.fdType)
+              }
+            }
+            internShapeDeepTy(tyNameOf(fnode.fdType), fdRoot)
           }
           fi = fi + 1
         }

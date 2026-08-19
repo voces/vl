@@ -14236,14 +14236,37 @@ function internShapeArms(arms: string[]) {
 // bottom (`internInlineShape` then recurses into the shape's own fields). Reaches a shape however deeply it
 // is nested under arrays / nullables / groupings: `({g:i32}[] | null)[]` -> `{g:i32}`, `{f:i32}[][]` ->
 // `{f:i32}`. A non-shape leaf (`i32`, a named type, a map) interns as a no-op.
-export function internShapeDeep(nm: string) {
+function tyStepNullable(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
+}
+
+function tyStepElem(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
+function tyStepMapVal(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyMap { return t.mVal }
+  -1
+}
+
+export function internShapeDeep(nm: string) { internShapeDeepTy(nm, -1) }
+
+export function internShapeDeepTy(nm: string, ty: i32) {
   if nm.length < 2 { return 0 }
   // Peel ONLY a grouping pair that wraps the WHOLE name. A functype whose leading `(` is its
   // own PARAM LIST (`(i32)=>(()=>{a:i64,f:i32,z:f64})`) must NOT be blind-peeled — the garbled
   // remainder (`i32)=>…`) dead-ends every case below, so the shapes buried in its RESULT spine
   // never intern (and a chained value call's struct read then finds no interned shape).
   const uw = normTypeAtom(nm)
-  if uw.length != nm.length { return internShapeDeep(uw) }
+  if uw.length != nm.length { return internShapeDeepTy(uw, ty) }
   // A VALUE UNION leaf (`i32 | null`, `string | i32`) — register its box reps. Do NOT peel its `| null`:
   // here the null is a union ATOM (a tag in a non-null box), NOT a nullable-niche wrapper. Checked AFTER
   // the parens peel (so `(i32|null)` reaches here) but BEFORE the `| null` peel (which would lose the atom).
@@ -14268,7 +14291,7 @@ export function internShapeDeep(nm: string) {
     return 0
   }
   const np = nullablePartOf(nm)
-  if np != "" { return internShapeDeep(np) }
+  if np != "" { return internShapeDeepTy(np, tyStepNullable(ty)) }
   // A MIXED / composite UNION (`{f:i64}[] | f64`, `{[string]: K}[] | string`, `{f:i64}[] | {w:i32}`):
   // the all-scalar case was handled by the `isValueUnionName` branch above, so a top-level `|` here
   // means at least one arm is a COMPOSITE. Intern an arm whose CORE (trailing `[]`s peeled) is an
@@ -14300,7 +14323,9 @@ export function internShapeDeep(nm: string) {
     splitUnionAtoms(nm, pArms)
     if pArms.length > 1 { internShapeArms(pArms) }
   }
-  if nameIsElemArray(nm) { return internShapeDeep(arrElemNameRaw(nm)) }
+  if nameIsElemArray(nm) {
+    return internShapeDeepTy(arrElemNameRaw(nm), tyStepElem(ty))
+  }
   // A MAP name (`{[string]: V}`): the inline shapes buried in the VALUE position are
   // otherwise unreachable — the whole map is ONE TypeRef name, so a struct-valued map
   // (`{[string]: {f:f32}}`), a nested-map value (`{[string]: {[string]: i64}}`), a
@@ -14310,7 +14335,9 @@ export function internShapeDeep(nm: string) {
   // `mvShapeOfValName`) then finds the struct via `structIndexByValName` (position-
   // INDEPENDENT map-value resolution, the #837 template). A NAMED-alias value already
   // interned via its own TypeRef; this is the inline dual, idempotent for either.
-  if nameIsMap(nm) { return internShapeDeep(mapValNameOf(nm)) }
+  if nameIsMap(nm) {
+    return internShapeDeepTy(mapValNameOf(nm), tyStepMapVal(ty))
+  }
   // A FUNCTION-TYPE name (`(p1,p2)=>ret`): the inline shapes buried in a PARAM or
   // the RESULT position are otherwise unreachable — the whole functype is ONE
   // TypeRef name, so a composite closure result (`(i32)=>{f:i32}`, `()=>{a:i32,b:i32}`,
@@ -14335,7 +14362,7 @@ export function internShapeDeep(nm: string) {
   // already does for the same reason. `gaeEnsure` no-ops on anything that is not a
   // registered base's application, and is idempotent (`structIndexByName` guard).
   gaeEnsure(nm)
-  internInlineShape(nm) // no-op for any non-shape leaf
+  internInlineShapeTy(nm, ty) // no-op for any non-shape leaf
   0
 }
 
