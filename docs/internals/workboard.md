@@ -842,7 +842,30 @@ they make faster.**
 The two biggest — `annotResolve`'s 728 object and 564 union spellings — are the UNPOSITIONED
 entries, which is the population `annotResolve`'s own header names: emitter-synthesized
 `TypeRef`s and `emit_rep`'s post-canon re-resolutions. Both want the producer to hand over a
-TREE or an arena INDEX rather than a name, which is the `synthTypeRef` signature question.
+TREE or an arena INDEX rather than a name.
+
+### Also shipped: the HAND-OVER form, and its first site
+
+`synthTypeRefTy(name, pos, tyIx)` / `recordClonedNodeTyKnown(nodeIx, name, pin, tyIn)` — the
+producer passes the arena index it already holds, and the parse does not happen at all
+rather than being shortcut. `-1` is exactly the old route, so the other 33 `synthTypeRef`
+callers are untouched.
+
+First site converted is the programme's own headline shape, `emit_rewrite.vl`'s captured-box
+rewrite: it appended `"[]"` to a name and `recordClonedNodeTy` parsed the result straight
+back off — **a string built and taken apart in two adjacent statements.** The element's arena
+index is on the annotation node the checker already recorded, so the array type is one
+`mkArrayTy` over it.
+
+**Proven LIVE by sabotage, not by reading**: handing over `i32TyIx()` instead of
+`mkArrayTy(elemTy)` reddens the exercising program with `emitProgram: indexed assignment but
+list type not collected`, so the handed-over index is genuinely consumed. Correct version is
+byte-identical on that program and **0 verdict / 0 byte changes** corpus-wide.
+
+The name is still recorded as the node's `tyName` for consumers that have not been
+converted, so this removes the PARSE and not yet the SPELLING. That is the mechanism the
+remaining 2,814 need; each further site is a question of whether its producer holds an index,
+not of whether the route exists.
 
 ## A bare `return` in a void function had NO LOWERING — found while implementing the void ruling (2026-08-18)
 
