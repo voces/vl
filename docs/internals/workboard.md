@@ -241,6 +241,23 @@ or a union member the arena already pairs (`:7383`). It does not convert when th
 something narrower that the declared type cannot answer (`:11391`'s rep sidecar). That is a rule you
 can apply to the next site without re-deriving it.
 
+**FOURTH SITE, and the rule picked it out without a new derivation.** `letIsStruct` asks "does this
+annotation denote a struct" — the rule's shape exactly — and `typecheck.nodeTyIsStruct` is the
+checker-side twin already written for it, whose own header says it *"under-approximates … so callers
+keep the name test as the fallback"*. This is a caller taking it up on that.
+
+Dual-run over the corpus: the two agree on **1,871 of 6,437** reaches, the arena answers true where
+`isSName` does not on **24**, and `isSName` answers true where the arena does not on **0** — a strict
+superset. The 24 are spellings `isSName` structurally cannot claim: a generic APPLICATION
+(`Box<Box<i32>|i32>`), a canonicalized INTERSECTION (`Node&{v:i32}`), an inline SHAPE
+(`{a:{k:i32},b:{k:i32}}`, `{f:(boolean|null)[]|null}`), a field holding an application
+(`{v:Pair<i32,string>}`). Every one is a struct, so the arena is right and the NAME under-reports.
+
+Corpus A/B **0 of 2,010** — the fall-through (`exprStruct` on the initializer) was already answering
+those 24 — so this is the same answer reached from the type instead of from a spelling plus an
+initializer walk. `rep-fuzz-check` **exact ✅**, suite 2,160/0, `cases_wasm` 1,940/0, fixpoint
+byte-exact at 1,251,384.
+
 **So the conversion that worked was SPECIAL, and saying so is the result.** `structIndexOfLet` asks
 "what struct does this binding's annotation name", where the annotation IS the node whose type the
 checker recorded — the two derivations are the same question by construction, and the 15 residual
