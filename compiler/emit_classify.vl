@@ -15264,23 +15264,52 @@ export function shapeSetIxReset() {
 // fields were written in cannot change the key — the old scan matched by name lookup, so
 // it was order-insensitive and this must be too. Insertion sort: a struct's field count
 // is small, and the alternative is a comparator allocation per row.
-function shapeFieldSetId(fnames: string[], fcodes: i32[]): i32 {
+// The sid of an element name, with "" mapped to a value no real name can take. An empty
+// element name means "this field has NO element", which is a different fact from "its
+// element is the empty spelling", and `sidOf("")` would conflate them.
+function elemSid(nm: string): i32 {
+  if nm == "" { return -1 }
+  sidOf(nm)
+}
+
+// THE ROW IDENTITY, WRITTEN DOWN IN ONE PLACE. Per field, in a canonical (sid-sorted)
+// order:
+//
+//   field-name sid · field code · element-name sid · map-KEY bit · litunion-ATOM bit
+//
+// Those five ARE the dimensions `annShapeIndexOf` compares — the count and name set, the
+// codes, the element name, the map's key half (`recordSFieldElemRow`: "an mv slot's
+// identity is the (KEY, VALUE) pair"), and the atom-identity split that keeps `{f: K0}`
+// off a `{f: boolean}` row. The board kept calling this "the design question" because a
+// row's identity was enumerated NOWHERE, so every attempt to replace a spelling comparison
+// was guessing at a list nobody had made. This is the list.
+//
+// It is asserted nowhere and CHECKED everywhere: the refinement below still runs and still
+// decides, so this key only narrows the candidates. If the enumeration were incomplete the
+// refinement would reject inside the bucket, which is a miss, not a wrong answer.
+function shapeFieldSetIdOf(
+  fnames: string[],
+  fcodes: i32[],
+  felems: string[],
+  fkeys: i32[],
+  fatoms: i32[],
+): i32 {
   const sids: i32[] = []
-  const cds: i32[] = []
+  const ord: i32[] = []
   let i = 0
   while i < fnames.length {
     const sd = sidOf(fnames[i])
     let j = sids.length
     sids.push(sd)
-    cds.push(fcodes[i])
+    ord.push(i)
     while j > 0 {
       if sids[j - 1] <= sd {
         j = 0
       } else {
         sids[j] = sids[j - 1]
-        cds[j] = cds[j - 1]
+        ord[j] = ord[j - 1]
         sids[j - 1] = sd
-        cds[j - 1] = fcodes[i]
+        ord[j - 1] = i
         j = j - 1
       }
     }
@@ -15290,8 +15319,12 @@ function shapeFieldSetId(fnames: string[], fcodes: i32[]): i32 {
   a.push(fnames.length)
   let k = 0
   while k < sids.length {
+    const o = ord[k]
     a.push(sids[k])
-    a.push(cds[k])
+    a.push(fcodes[o])
+    a.push(elemSid(felems[o]))
+    a.push(fkeys[o])
+    a.push(fatoms[o])
     k = k + 1
   }
   hcShapeSetId(a)
@@ -15301,15 +15334,29 @@ function shapeFieldSetId(fnames: string[], fcodes: i32[]): i32 {
 function shapeRowSetId(si: i32): i32 {
   const fn: string[] = []
   const fc: i32[] = []
+  const fe: string[] = []
+  const fk: i32[] = []
+  const fa: i32[] = []
   const st = sFieldStart[si]
   const n = sFieldCount[si]
   let i = 0
   while i < n {
     fn.push(sFieldNames[st + i])
     fc.push(sFieldTypes[st + i])
+    const en = sFieldElemNameAt(si, i)
+    fe.push(en)
+    let kb = 0
+    if en != "" {
+      if sFieldElemKeyI32At(si, i) { kb = 1 }
+    }
+    fk.push(kb)
+    // A row whose field records NO element name is a plain scalar there — a litunion
+    // field records its union name — so its atom bit is 0, and the query's is its own
+    // text's litunion-ness. That is exactly the split the refinement's two atom arms make.
+    fa.push(0)
     i = i + 1
   }
-  shapeFieldSetId(fn, fc)
+  shapeFieldSetIdOf(fn, fc, fe, fk, fa)
 }
 
 function sSetSync() {
@@ -15336,7 +15383,36 @@ function sSetSync() {
 function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
   const sLimC = sScanLim()
   sSetSync()
-  const qk = shapeFieldSetId(names, codes)
+  const qElems: string[] = []
+  const qKeys: i32[] = []
+  const qAtoms: i32[] = []
+  let qi = 0
+  while qi < names.length {
+    // The same derivation the refinement makes, hoisted: `shapeFieldElemName` is the
+    // mint's one home for "what element does this (text, code) record", and "" means the
+    // field records none — in which case the atom bit carries the split instead.
+    let qb = shapeFieldElemName(texts[qi], codes[qi])
+    if qb != "" {
+      if codes[qi] == 15 { qb = nonNulBaseOf(qb) }
+    }
+    qElems.push(qb)
+    let kb = 0
+    if qb != "" {
+      if nameIsI32KeyedMap(texts[qi]) { kb = 1 }
+    }
+    qKeys.push(kb)
+    let ab = 0
+    if qb == "" {
+      if codes[qi] == 0 {
+        if nameIsLitUnionType(texts[qi]) { ab = 1 }
+      } else if codes[qi] == 4 {
+        if nameIsLitUnionArray(texts[qi]) { ab = 1 }
+      }
+    }
+    qAtoms.push(ab)
+    qi = qi + 1
+  }
+  const qk = shapeFieldSetIdOf(names, codes, qElems, qKeys, qAtoms)
   if qk < 0 || qk >= sSetHead.length { return -1 }
   let si = sSetHead[qk]
   while si >= 0 && si < sLimC {

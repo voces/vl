@@ -1903,6 +1903,47 @@ identity harness 0/0/0.
 both sides must speak the same vocabulary. And when they finally do, what surfaces is not a missing
 attribute — it is the name-keying, standing where a structural identity should be.
 
+### "WHAT IS A STRUCT ROW'S IDENTITY?" — ENUMERATED, AND THE ENUMERATION IS COMPLETE (2026-08-19)
+
+I closed the last round saying a row's identity "is enumerated NOWHERE, so every attempt to replace a
+spelling comparison guesses at a list nobody has made", and called that the blocking design question.
+**The list is derivable — from the comparison that was already making it, one dimension at a time.**
+`annShapeIndexOf`'s own body names all five:
+
+| dimension | where it came from |
+|---|---|
+| field-name sid | the count + name-set conditions |
+| field code | the code condition |
+| element-name sid (`-1` for none) | the element comparison, now speaking one vocabulary |
+| map-KEY bit | `recordSFieldElemRow`: *"an mv slot's identity is the (KEY, VALUE) pair"* |
+| litunion-ATOM bit | the two atom-identity arms that keep `{f: K0}` off a `{f: boolean}` row |
+
+`shapeFieldSetIdOf` now hash-conses exactly that tuple per field, sid-sorted so field ORDER cannot
+change the key, and the interner's bucket is keyed on it. **The identity is a written-down list in
+one function, which is what did not exist.**
+
+**AND IT IS COMPLETE, checked rather than asserted.** The refinement still runs and still decides, so
+the key only narrows candidates — an incomplete enumeration would show up as a candidate the
+refinement rejects. Measured over the corpus: **2,360 bucket candidates accepted, 0 rejected.** Every
+row the identity selects is the row the full comparison would have chosen. The refinement is
+therefore provably redundant on everything available, and it stays anyway — because "checked
+everywhere, asserted nowhere" is what makes the claim worth having.
+
+Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,251,331.
+
+**What this settles.** The question was never a language or ABI ruling. It was a list that nobody had
+written down, and the reason nobody had is that four of its five dimensions were only expressible as
+string comparisons — so the list could not be stated until the vocabularies agreed and the sids
+existed. It reads as a design question right up to the moment the enumeration is possible, and then
+it is just a function.
+
+**What is still name-shaped, honestly.** `sNames` remains the row's STORED spelling and
+`structIndexByName` remains how callers ask — now indexed, aliased on merge, and no longer the row's
+IDENTITY, which is the change that matters. Callers hold spellings because they read annotations;
+moving them to types is the hand-over programme at 97.6%, and its residue is 26 leaves that are
+declines by design rather than coverage gaps.
+
 ### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
 
 Following site 3 past its name-keyed floor reaches the root of the whole programme, and
