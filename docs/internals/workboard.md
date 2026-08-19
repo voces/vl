@@ -192,11 +192,26 @@ the census — `emit_classify:11391` (`structIndexOfType`'s TypeRef arm, 9,474 s
 | `:18066` Param type | 15,922 | 15,881 | **41** | 0.26% |
 | `:11391` TypeRef arm | 528 | 469 | **59** | **11.2%** |
 
-**NEITHER IS SHIPPED.** `:11391` disagrees on more than one call in nine — two orders of magnitude
+**`:11391` IS NOT SHIPPED.** It disagrees on more than one call in nine — two orders of magnitude
 worse than the site that worked — and it sits directly below an arena rung that already ran and
 declined (`repSlotOfTy(nodeRepTyIxOf(tyIx))`, the REP sidecar, where mine would read the DECLARED
 one). Two different sidecars answering two different questions is not a rung, it is a coin flip with
 a byte channel that cannot see it.
+
+**`:18066` IS SHIPPED, because its 41 disagreements were one NAMED class.** I nearly filed it with
+`:11391` on the rate alone; dumping the witnesses instead shows all 41 are
+`nm={f:K0|null} arena=7({f:K0|null}) name=1` — a DUPLICATE row carrying the same spelling — and
+`repStructSlotsTwin(7, 1)` answers **1** on every one. Twins share a heap type and a field-code
+layout, so either row emits the same module, and the project's own predicate says so rather than my
+reading of it. On the compiler's own source the arena answers 294 times with **0** disagreements.
+
+Gated on **`rep-fuzz-check` exact ✅** as well as corpus A/B 0 of 2,010, suite 2,160/0, `cases_wasm`
+1,940/0, fixpoint byte-exact at 1,251,256.
+
+**Which sharpens the lesson rather than softening it: a disagreement RATE is not the decision, the
+CLASS is.** 0.26% and 11.2% would have sorted the same way as 0.18%, and both times the answer came
+from asking what the disagreeing cells WERE — twins at one site, two different sidecars at the
+other. Ranking by the rate would have shipped neither or both.
 
 **So the conversion that worked was SPECIAL, and saying so is the result.** `structIndexOfLet` asks
 "what struct does this binding's annotation name", where the annotation IS the node whose type the
