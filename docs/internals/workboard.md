@@ -327,18 +327,32 @@ not.** Two attempts, both measured against `cUserTypes[sNames[si]] >= 0` over 2,
 | label each of the 5 mint sites by WHAT IT INTERNS | 597 | **5** | **3** |
 | bank the NAME's own `cUserTypes` answer AT THE MINT | 597 | **5** | **3** |
 
-**Identical disagreement, which is the whole finding.** If labelling by provenance and banking the
-name's own answer are wrong in exactly the same 8 cells, the answer is not a property of the mint at
-all — **it CHANGES after the row is minted.** And it does: `cUserTypes` is add-only during emit
-(`resolveAnnot` memoizes new spellings mid-pass), which is precisely why `repSlotCacheSync` carries
-`cUserTypesVer` in its generation stamp. `AB` and `PairA` become declared after their rows exist;
-`{d:i32}` and `{g:f64}` were in the table when their rows were minted and are not what the query
-means later.
+**I READ "IDENTICAL DISAGREEMENT" AS A FINDING AND PUBLISHED AN EXPLANATION. IT IS WRONG, AND THE
+DIRECT PROBE REFUTES IT.** The story was: if labelling by provenance and banking the name's own
+answer are wrong in the same 8 cells, the answer must CHANGE after the mint — `cUserTypes` being
+add-only during emit, which is why `repSlotCacheSync` carries `cUserTypesVer`. Plausible, and
+inferred from two counts matching rather than from watching the value.
 
-**So the name resolution there is not a re-derivation to be cached — it is a RE-READ, and it is
-re-read because the answer moves.** That is the end of this line, and it is an explanation rather
-than a shrug: `sNames` persists because the row layer has to ask a question whose answer depends on
-state that grows after the row does.
+Watched directly — printing `cUserTypes[nm]` at the mint and again at the cache rebuild:
+
+```
+MINT  nm=AB   has=31        CACHE row=0 nm=AB      has=31
+                            CACHE row=0 nm={g:f64} has=-1
+                            CACHE row=3 nm=PairA   has=31
+```
+
+**`AB` is 31 at both points. The answer does not move.** `{g:f64}` reads -1 at the cache (not
+declared) where my column said declared; `PairA` reads 31 (declared) where my column said not. Both
+are my COLUMN being wrong about rows whose membership is perfectly stable — an alignment or
+placement error in the experiment, not a property of the design.
+
+**So the retraction is: I refuted my own implementation, not the idea.** "An explicit declared-ness
+column" remains un-refuted and may well be as cheap as I first said; what is established is only
+that my two attempts at it were buggy, and that the reason I gave for their failure was invented
+from a coincidence of counts. The 8 cells are unexplained.
+
+The pattern this session keeps producing: **two numbers agreeing is not a mechanism.** It took a
+probe that watched the actual value to see that.
 
 Reverted (both attempts); 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
 
