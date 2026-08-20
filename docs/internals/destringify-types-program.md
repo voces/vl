@@ -44193,3 +44193,82 @@ rather than a refactor.
 * **A discriminator that has to predict a render is a discriminator that has to model the
   renderer.** If the renderer is context-sensitive, the model is the renderer, and there is nothing
   left to win.
+
+## B36 / D-PRESERVE — the property that blocked two slices is PRICED, and it is three emitter ladders, not a design change
+
+B35 ended by saying the position-dependence of `tyToEmitName` for literal unions is "a design change
+rather than a refactor" and needs the owner. **Both halves of that are wrong**, and measuring it took
+one probe.
+
+### 1. THE OWNER ALREADY RULED, AND THE RULING IS HALF-LANDED
+
+The tree records a 2026-07-29 ruling verbatim:
+
+> *"I'm reverting the softening. `K | f64` should be preserved as `K | f64` (or flattened to the
+> constituent parts of `K | f64`). Softening to a string is just wrong as I see it."*
+
+That ruling landed for MIXED unions — `ctxKeepsLitUnion`'s own header says "THE MIXED-UNION SPELLING
+HAS NO POSITION GATE". What still has one is the **inline PURE litunion**: `("a" | "b")` keeps its
+members at `RC_ELEM` / `RC_FIELD` / `RC_MAP_VAL` / `RC_FN_RES` and softens to `string` elsewhere. An
+ALIASED litunion always keeps. So the residue is one construct in two positions.
+
+### 2. IT IS NOT LANGUAGE-VISIBLE, SO IT IS NOT A RULING
+
+The obvious worry is that softening WIDENS what a litunion parameter accepts. It does not — the
+CHECKER is unaffected:
+
+```
+function f(v: "a" | "b"): i32 { … }
+const s = "zzz"
+f(s)   // argument 1: expected "a" | "b", got string
+```
+
+and the aliased form rejects identically. **The soften is an emitter REPRESENTATION choice with no
+observable language semantics**, so there is nothing here for an owner to rule on. B35 filed it as a
+question for the wrong reason: it read "the render disagrees with itself" as "the language is
+undecided".
+
+### 3. THE PRICE, MEASURED
+
+`ctxKeepsLitUnion` forced to `true` (preserve everywhere), corpus A/B against master:
+
+| | |
+|---|---|
+| rows moved | 21 |
+| **rc 0 -> 1** | **17** |
+| silent wrong answers | **0** |
+| invalid wasm | **0** |
+
+Every one of the 17 is a LOUD emit reject, and they fall into **three** ladders:
+
+| ladder | files |
+|---|---|
+| `only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are supported` | 14 |
+| `only i32 / boolean / string / array struct fields are supported` | 2 |
+| `ref valtype with no interned shape` | 1 |
+
+**The best possible failure mode.** The change can only turn a working program into a loud reject —
+never into a wrong answer — so it can be attempted incrementally and each ladder fixed as it
+surfaces. That is the opposite of the risk profile B35 assumed.
+
+### 4. WHAT IT UNBLOCKS
+
+Retiring the gate makes `tyToEmitName` a function of the type alone for litunions, which is the
+precondition BOTH terminated slices needed:
+
+* **B24** — the closure-signature tag table's key swap, which failed because the render's
+  equivalence classes vary with position while an arena id's do not;
+* **B35** — `synthRetAnnots`' struct arms 10, 12, 13 and slice 4's `r17` split, which failed
+  because a producer cannot predict whether its own render will keep a litunion's members.
+
+Two independent slices, one root cause, and the root cause costs three emitter legs.
+
+### METHOD NOTES
+
+* **Price a blocker before classifying it.** B35 called this a design change on the strength of
+  the property being deep. One probe — force the gate, run the sweep — turned "needs a ruling" into
+  "17 loud rejects across three ladders".
+* **Check whether an internal disagreement is language-VISIBLE before escalating it.** The
+  checker's answer was identical on both sides, which settles that this is the compiler's business.
+* **A tree that records its own rulings verbatim is worth grepping before asking.** The ruling that
+  governs this was already in the file that documents the gate.
