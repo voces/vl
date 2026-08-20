@@ -43792,3 +43792,69 @@ column reads, and all wait on the same thing.
   skipped `retAtomsCheap` and would have published a refutation of a claim it had not tested.
 * **When two measurements agree but one was invalid, say so.** The temptation is to report the
   second number and drop the first; the sequence is what shows the number was earned.
+
+## B31 / D-PROCBLIND — the corpus sweep cannot see cross-program state, and it reported a clean run on a build with 20 failing tests
+
+The rung column (B26/B27's specification, now shipping) leaked between programs on its first
+build, and the way that surfaced is a standing limitation of this programme's main instrument.
+
+### 1. THE DEFECT
+
+`inferRetRung` was declared `const`, which in VL makes the BINDING immutable — so it was the one
+`inferRet*` column that survived `initChecker`'s reset block while its siblings
+(`inferRetFn`, `inferRetTy`, `inferRetTyIx`, `inferRetAtomCount`, `inferRetIdx`) were all
+re-emptied per program. Rows from a previous program therefore stayed in the column, and every
+row index shifted.
+
+### 2. THE THREE SIGNALS DISAGREED, AND THE MOST-USED ONE WAS WRONG
+
+| signal | verdict on the broken build |
+|---|---|
+| **corpus A/B sweep, 2,032 files** | **0 rows moved** |
+| a failing case run in isolation | **passes** |
+| the full TS suite | **20 failures** |
+
+The sweep is not merely insensitive here — it is **structurally incapable**. Each corpus file is
+compiled by its own `vl build` process, so no program ever sees another program's state. A defect
+that requires two programs in one instance is invisible to it BY CONSTRUCTION, at any corpus size.
+
+Running one failing case alone is equally blind, and for the same reason: it is one program.
+
+The TS suite caught it because it reuses ONE compiler instance across the whole corpus, which is
+also why the failures looked so strange — twenty tests failing together, each passing alone.
+
+### 3. WHAT THIS MEANS FOR THE PROGRAMME'S EVIDENCE
+
+Nearly every claim in these entries rests on the corpus A/B, and this entry does not undermine
+that: for the questions it is used on — does a conversion change the emitted module for a given
+program — it is exactly right. But its population is *programs compiled independently*, and the
+class it cannot contain is:
+
+* module-level state not reset per program (the sidecar bug this branch already had once);
+* order-dependence between programs;
+* anything about the LSP path, which compiles repeatedly on one instance.
+
+**A `const` module-level column is the specific smell.** In VL a `const` array can still be
+mutated (`push`), so it reads as "this is a fixed table" while behaving as an accumulator that
+nothing can clear. Every per-program column in the checker is `let` for exactly this reason, and
+the reset block is where that is enforced.
+
+### 4. THE CHECK THAT WOULD HAVE CAUGHT IT
+
+`deno task test` already does — it is the only gate that compiles many programs on one instance.
+It ran and it failed, which is the system working. The lesson is not to add an instrument but to
+STOP TREATING THE SWEEP'S ZERO AS THE HEADLINE: it answers one question well, and this defect was
+not that question.
+
+### METHOD NOTES
+
+* **Know your instrument's population, including its PROCESS boundary.** B24 recorded that a
+  clean measurement over a population that cannot contain the failure is not evidence. This is the
+  same rule at the level of the harness rather than the corpus: 2,032 files and one process each
+  is one program, 2,032 times.
+* **When one gate fails and another passes, the disagreement IS the finding.** The instinct is to
+  re-run the failing one; the useful move is to ask what the passing one cannot see.
+* **"Passes in isolation" is a diagnosis, not a reprieve.** It localises the defect to shared
+  state immediately, and it did.
+* **Add a new per-program column to the reset block in the same commit that adds the column.**
+  Not as a follow-up — the window between is exactly where this defect lives.
