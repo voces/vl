@@ -42828,3 +42828,75 @@ oversight: both are deterministic, and the rule is that findings are entombed as
   23% and needs eight times the churn. The distribution matters more than the ranking.
 * **A gate that is not written down is a habit, not a gate.** Both of these were being run
   because one agent happened to know about them.
+
+## B16 / D-CENSUSCLOSE — the original 68-site concat census, closed: the largest bucket is RENDERERS, and the one hot re-derivation buys nothing
+
+The programme opened with a census of every site that BUILDS a type spelling by
+concatenation — 68, across `typecheck` 26, `emit_classify` 19, `emit_rep` 14, `emit_base` 11,
+`parser` 5, `emit_mono` 5, `emit_rewrite` 3, `ast` 3, `emit_collect` 2, `tyname` 1. The
+`emit_base` / `emit_mono` / `emit_rewrite` buckets were worked (re-parses -89%). This closes
+the rest.
+
+### 1. `typecheck`'s 23 LIVE SITES ARE ALL RENDERERS — the bucket is not a target
+
+Classified by enclosing function rather than counted:
+
+* `tyToEmitNameGo`, `tyToNominalNameGo`, `genAppNameOfTy`, `arrElemRender`, `canonEmitNameTs`
+  — type -> name. Building a spelling IS their job.
+* the eleven `*RetName(er)` producers (`valueUnionRetName`, `structUnionRetName`,
+  `nullableRetName`, `refArmUnionRetName`, …) — these look like name-BUILDERS from an
+  expression, and the parameter name `er` invites that reading. They take a **TYPE index**:
+  `valueUnionRetName` opens with `tyIsValueUnion(er)` and `collectRetAtoms(er, atoms)`. They
+  are renderers too, and their answer is recorded beside the type it was rendered from
+  (`recordInferRet(name, ty, tyIx, atoms)` banks both).
+
+**A renderer is the legitimate direction.** Destringify is about not RE-DERIVING a type from
+a spelling; producing a spelling for display, for a diagnostic, or as the name a node carries
+is what the 2026-08 ruling asks for — *show the local spelling*. The largest bucket in the
+census was never a target, and reading it as one is what a raw concat count invites.
+
+### 2. `emit_rep` — ONE HOT RE-DERIVATION, MEMOISABLE, AND WORTH NOTHING
+
+`repMvValKey` has no memo, only a cycle guard, so `repMvValKeyGo` rebuilds the whole key
+string every call. Measured: **94,635 calls for 1,211 distinct types over the corpus (98.7%
+repeats), and 866 calls for 3 distinct types on the compiler's OWN source** — the first hot
+re-derivation this programme has found that the self-compile pays for.
+
+A memo keyed on `ty`, **at depth 0 only** (a nested call runs under a non-empty cycle stack
+and may answer with a de Bruijn back-edge that depends on the stack, not the type), was
+implemented and verified: banking the first answer and comparing every later one gives
+**45,714 agreements / 0 disagreements** over the corpus and 863/0 on the self-compile. It
+also has to ride `hcReset`, because the key reads the SID-KEYED `repSlotOfTyDecl` and
+`sidKeyedTablesReset` runs INSIDE the module-parse loop.
+
+**Not shipped.** Corpus A/B 0 of 2,024, every gate green — and the compile time is FLAT:
+1.72/1.65/1.71s before, 1.72/1.72/1.71s after on the compiler itself, and 0.01s either way on
+a deliberately map-heavy program (40 distinct map value types). The repeat RATE is 98.7% and
+the absolute VOLUME is ~57 calls per corpus file. A high percentage of a small number is a
+small number.
+
+The change is recorded here rather than in the tree so it can be re-applied if the path ever
+becomes hot — the verification is the expensive part and it is done.
+
+### 3. THE DEAD-CODE HYPOTHESIS, REFUTED
+
+`repElemKeyGo` and `repCanonKeyGo` are **0 calls** on the corpus AND the self-compile, which
+looks exactly like dead code in the highest-risk layer. It is not: both have live
+NON-RECURSIVE callers — `repShadowCheckTy`, `rlSlotOfArrNameTy`, `tyIsStrLeafElem` for one,
+`repShadowCheckTy`, `repShadowNote`, `repStructSlotRep` for the other. All the callers inside
+`emit_rep` that a first grep shows are the functions' own recursion, which is what makes the
+misreading easy. **Unreached in these runs is not unreachable**, and deleting on that evidence
+would have been the most dangerous edit of the programme.
+
+### METHOD NOTES
+
+* **Classify a census by what each site DOES, not by counting matches.** 26 concat sites in
+  `typecheck` read as the largest remaining opportunity for the whole programme; every live
+  one is a renderer. The count was right and the inference from it was wrong.
+* **A parameter named `er` is not evidence.** Eleven functions taking `er: i32` looked like
+  expression consumers; the first line of each says otherwise. Open the body.
+* **Separate the RATE from the VOLUME before shipping a cache.** 98.7% redundancy sounds
+  decisive and describes ~57 calls per file. Both numbers are needed and only one of them
+  was in the first measurement.
+* **"0 calls" refutes hotness, never reachability.** Check for non-recursive callers before
+  calling anything dead.
