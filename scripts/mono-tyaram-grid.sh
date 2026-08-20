@@ -69,6 +69,14 @@ ctors = {
  "shapefn":  ("",                                   "{ f: (T) => T }",     "{ f: (x: T) => x }", "1"),
  "deepshape":("",                                   "{ a: { b: { c: T } } }","{ a: { b: { c: %V% } } }","1"),
  "arrnulapp":("type CX<X> = { v: X }\n",           "(CX<T> | null)[]",    "[{ v: %V% }]",       "r.length"),
+ # Added after the deep-composition sweep. The map-value hole showed that a constructor the
+ # grid does not spell is a constructor it cannot clear, and every one of these nests a map
+ # or a union one level further than anything above.
+ "maparr":   ("",                                   "{[string]: T}[]",     "[Map()]",            "r.length"),
+ "arrmap":   ("",                                   "{[string]: T[]}",     "Map()",              "1"),
+ "mapmap":   ("",                                   "{[string]: {[string]: T}}","Map()",         "1"),
+ "arr2un":   ("",                                   "(T | null)[][]",      "[[%V%]]",            "r.length"),
+ "mapapp":   ("type CM<X> = { v: X }\n",           "{[string]: CM<T>}",   "Map()",              "1"),
 }
 n = 0
 for rname, lit in reps.items():
