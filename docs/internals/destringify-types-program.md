@@ -44456,3 +44456,61 @@ preconditions — the same shape of miss B33's plan made about the struct arms, 
   verdict for an earlier attempt without saying why; this one says why, and the why is a missing
   call with exactly one existing caller.
 * **When the fix for a 0-answer measurement moves 90 rows, the measurement was not the problem.**
+
+## B40 / D-RLROUND — the ref-list round trip measured: 70 files, 0 divergences, and an obligation I could not discharge
+
+`refListSlotOfExpr` is `rlSlotByName(refListElemNameOfExpr(...))` — and NINE of the producer's
+rungs already hold the slot, returning `rlElemName[slot]` purely so the consumer can scan the
+spelling back to a slot. 59 call sites. The census rated it the second-best remaining conversion
+and attached a condition: **it is an equivalence claim, so it needs a constructed collision pair,
+not an agreement rate.**
+
+### 1. THE MEASUREMENT
+
+Each held-slot rung banks its slot; `refListSlotOfExpr` compares the banked slot against the
+scanned one. **70 corpus files reach a held-slot rung. 0 divergences.**
+
+### 2. THE FIRST NUMBER WAS MY PROBE, NOT THE COMPILER — the fourth time this session
+
+The first run reported **7 divergences**, all of the shape `held=[S[]] scan=[S]`. That is a STALE
+BANK: `refListElemNameOfExpr` reaches other resolvers that can themselves run a held-slot rung, so
+the module global held a NESTED call's slot when the outer call returned from a rung that banks
+nothing.
+
+Guarding on "the banked slot's spelling is the spelling THIS call returned" took it to 0 over 70.
+B32 tabulated three probes that dropped their predicate's context; this is a fourth, and the
+context it dropped was RECURSION. Worth adding to that list: a module global read by an outer
+frame is only valid if no inner frame can write it.
+
+### 3. THE COLLISION IS REAL IN THE CONTRACT AND I COULD NOT BUILD IT
+
+`rlInternName` dedups on `repElemIdOfNameTy(name, ty)`, which **ignores the name entirely when
+`ty >= 0`** — so two rows with different structural ids and the same rendered spelling are
+constructible in principle, and `rlSlotByName` first-matches over the stored spelling. If that pair
+exists, the held slot is RIGHT and the scan is wrong, so the conversion would be a FIX, not merely
+a collapse.
+
+The natural construction is a litunion that SOFTENS: `("a"|"b")[]` renders its element `string` at
+a softening position, colliding with a genuine `string[]`. Two attempts did not reach a held-slot
+rung with that shape.
+
+### 4. SO IT IS NOT SHIPPED
+
+Inert on 70 files, more-correct by construction, and an un-built collision — which is the exact
+shape of the argument that was refuted at #1507 (a clean 45-file measurement beside a false
+by-construction claim). The lesson of this branch is that "probably right plus a clean sweep" is
+where its wrong answers came from, and applying that lesson means recording this rather than
+landing it.
+
+**What would discharge it:** a program that reaches one of the nine rungs with two same-spelling
+different-id rows interned. The litunion soften is the most promising route and is itself gated by
+B37's prerequisite programme — so this conversion and the ladder's last six arms are waiting on the
+same property, which was not previously known to connect them.
+
+### METHOD NOTES
+
+* **A module global as a probe channel needs a re-entrancy argument.** Three earlier probe failures
+  were about a predicate's static context (gate, ladder, aggregation); this one is dynamic.
+* **When the corpus cannot produce the discriminating case, say which shape would and why it is
+  hard.** "0 divergences" plus "I could not build the counterexample" is a materially different
+  report from "0 divergences", and only the first tells the next person where to start.
