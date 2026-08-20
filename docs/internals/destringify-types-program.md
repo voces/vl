@@ -43396,3 +43396,95 @@ The two channels that produced everything here:
 * **The pre-existing defect a reviewer trips over is worth as much as the one they were looking
   for.** The permuted-closure-arm miscompile is now pinned
   (`xfail-miscompile-permuted-object-closure-arms.vl`) and would otherwise still be unknown.
+
+## B26 / D-RUNGMAP — the census's biggest item, MEASURED: the rung→arm map, its one ambiguity, and why the map is not yet shippable
+
+The 2026-08 census ranked `recordInferRet`'s consumer arc the largest remaining concentration —
+one producer, fifteen consumers, and a decision the producer knows and throws away. Its proposal:
+bank the cascade RUNG as an i32 code, then replace the consumers' character predicates with a
+switch on it. The biggest consumer is `synthRetAnnots` (`emit_rewrite`), whose 12-arm cascade
+runs **25 predicate calls** over a spelling the compiler itself rendered.
+
+This entry measures the proposal instead of attempting it, and the measurement is the deliverable:
+it turns "probably convertible" into a specification with a named exception.
+
+### 1. THE MAP, COMPLETE
+
+A probe wrapped all 27 cascade rungs (`irRung(n, <producer>(…))`, preserving laziness — the
+producers have side effects and must stay short-circuited), banked the rung beside the existing
+`inferRetTy`/`inferRetTyIx`/`inferRetAtomCount` columns, and recorded which of
+`synthRetAnnots`' 12 arms fired for each row.
+
+```
+r1a11 r2a12 r3a1  r4a1  r5a1  r6a2  r7a2  r8a0 r8a4 r9a4  r10a4
+r11a4 r12a4 r13a4 r14a4 r15a4 r16a5 r17a0 r18a0 r19a4 r20a1 r21a1
+r22a1 r23a1 r24a6 r25a8 r26a7 r27a1
+```
+
+**27 of 27 rungs observed. 28 distinct (rung, arm) pairs. Exactly ONE rung maps to two arms:
+`r8` = `nulElemListRetName`, which yields both arm 0 (no pin) and arm 4 (`parenUnionArrElemName`).**
+
+Arms 3, 9 and 10 (`nameIsMapMemberUnion`, `nameIsStructWithLitUnionField`,
+`nameIsStructWithUnionField`) are **never reached from a cascade rung** — they serve rows recorded
+by the `recordable` fall-through instead.
+
+### 2. THE FALL-THROUGH IS NOT A RUNG, AND CONFLATING IT COSTS THE FIRST ANSWER
+
+The first run reported **4 conflicting files**, which read as a refutation of the whole proposal.
+Every one was at **rung 0** — the `recordable` path, which is not a cascade producer at all: it
+admits a scalar name, a list name OR a `{…}` shape through one gate (`isClassifiableRetName` /
+`isScalarListRetName` / `isObjShapeName`), so it necessarily maps to several arms. Excluding it,
+conflicts went to 0.
+
+**A fall-through is not a case.** Numbering it 0 and treating it like the others turned "the
+proposal holds with one exception" into "the proposal is refuted", and the difference was
+entirely bookkeeping.
+
+### 3. THE PER-FILE PROBE COULD NOT ANSWER THE QUESTION IT LOOKED LIKE IT ANSWERED
+
+With rung 0 excluded the probe reported **133 files reaching, 0 conflicts** — and that number is
+nearly worthless, for a reason that took a second measurement to see: **121 of the 133 files
+observe only ONE distinct rung.** The probe table is per-process, so a per-file "no conflict"
+cannot see two DIFFERENT files mapping one rung to different arms, which is exactly the failure
+being looked for.
+
+Aggregating the (rung, arm) pairs ACROSS files is what produced §1 — and it is what found `r8`.
+The per-file run had reported r8 clean.
+
+This is B24's lesson at one more remove. There the population could not contain the failure; here
+the population could, and **the aggregation boundary threw it away**. Both look like a clean
+number.
+
+### 4. WHY IT IS NOT SHIPPED
+
+The map above is **empirical**. Shipping a switch on it would be trading a decision derived from
+a render for a decision derived from a corpus — and #1507 (B24) is what that costs.
+
+The conversion becomes sound when each rung's mapping is argued from its PRODUCER'S CONTRACT
+rather than from the table: `valueUnionRetName` answers only for a value union, so `r3 → a1`
+holds by construction, and the measurement then CONFIRMS the argument instead of substituting for
+it. That is 27 contracts to read, and `r8` is proof they are not all crisp — one producer really
+does emit two shapes.
+
+**So the specification is:**
+
+* rungs 1-27 except 8 — argue the contract, then convert against this table.
+* rung 8 (`nulElemListRetName`) — needs its own discrimination; it is the only producer whose
+  output does not determine the consumer's arm.
+* rung 0 (`recordable`) — keep the predicates, or split the gate into three so each shape gets a
+  code of its own.
+* arms 3, 9, 10 — reachable only from rung 0; they are the fall-through's problem, not the
+  cascade's.
+
+### METHOD NOTES
+
+* **Aggregate at the level the claim is made at.** The claim was "rung determines arm" over the
+  whole compiler; the probe measured it per compilation unit. Same predicate, different question,
+  and the weaker one answered clean.
+* **Count the distinct KEYS, not the rows.** "133 files, 0 conflicts" and "121 of them see one
+  rung" are the same run. Only the second says whether a conflict was ever possible.
+* **A measurement that specifies the next slice is a finished piece of work.** This entry ships no
+  code and leaves the conversion better defined than any amount of attempting it would have: the
+  exception is named, the unreachable arms are named, and the soundness bar is stated.
+* **Numbering a fall-through as case 0 is a bug in the instrument.** It cost the first answer, and
+  the instrument is where it had to be fixed.
