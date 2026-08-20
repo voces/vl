@@ -42573,3 +42573,71 @@ than the risk of recording a wrong return type**, and the slice stays unshipped.
   populations with opposite implications — a majority that is harmless BY CONSTRUCTION (the
   name is kept) and a residue that is a wrong answer. A single agreement rate would have
   hidden the second inside the first.
+
+## B12 / D-HANDOVER — the rule the four conversions and the one regression all obey: HAND OVER A RECORDED TYPE, BE WARY OF A CONSTRUCTED ONE
+
+Five hand-overs shipped on this programme. Four were correct and one was a regression
+(#1483 fixed it). After the fact they look alike — each replaces `synthTypeRef(name, -1)`,
+whose `-1` re-parses the name, with a type supplied at the call site. They are not alike,
+and the difference predicts the outcome exactly.
+
+### 1. THE DIVIDING LINE
+
+| slice | the handed type comes from | result |
+|---|---|---|
+| #1478 lambda-return ladder | `inferRetTyIx` — **recorded by the checker** | safe |
+| #1479 param pin | `nodeTyIxOf(ps[pi])` — **recorded by the checker** | safe |
+| #1482 instance param pin | the node's own recorded type | safe |
+| #1481 instance RETURN | `substTyDeep(...)` — **CONSTRUCTED here** | REGRESSED |
+
+A type the CHECKER recorded has already been through the checker's own normalisation. A
+type CONSTRUCTED by walking the arena has not, and `substTyDeep` is missing one specific
+step the annotation path performs: it rebuilds a union member-wise and does not FOLD a
+degenerate one. `nameToTy("string|string")` collapses to `string`; `substTyDeep` over
+`T | string` at `T := string` does not. Handing the un-collapsed union over recorded a union
+BOX where the instance returns a bare ref — check-clean invalid wasm.
+
+### 2. THE AUDIT
+
+Having extracted the rule from one failure, the three survivors were re-tested against it
+rather than assumed safe. Both grids compare against the PRE-slice compiler, so a move is a
+behaviour change either way.
+
+* **#1478's union arms** — the ladder has four explicit union arms (`isUName`,
+  `isValueUnionName`, `nameIsLitUnionType`, `nameIsLitUnionArmValueUnion`) plus a nullable
+  arm, so it hands over union types constantly and was the obvious suspect. 10 cells:
+  litunion alias return, litunion-arm value union, plain value union, **two degenerate
+  unions** (`string | string`, `i32 | i32`), nullable struct, nullable string, element-value
+  union list, struct-variant union, map-member union. **0 moved.**
+* **#1479 / #1482 param pins** — 10 cells across litunion, value union, nullable, nominal
+  struct, inline shape, list, map and closure parameter types, plus the two instance-pin
+  shapes. **0 moved.**
+
+**20 of 20 clean**, and the reason is the rule rather than luck: none of those three
+constructs a type. They forward one the checker already folded.
+
+### 3. WHAT IS STILL OPEN, AND IT IS NOT A GATE
+
+The gate added by #1483 (decline a union) closes the observed failure and is the narrowest
+thing that does. But the underlying fact is an **inconsistency between the two type paths**:
+`nameToTy` folds a degenerate union and `substTyDeep` does not, so the same type has two
+representations depending on which door it came through. That is worth fixing at
+`substTyDeep` — after which the union exclusion can be dropped and the return hand-over
+widened back — and it is not a gate-tightening question.
+
+### METHOD NOTES
+
+* **A render-comparison dual-run is not valid where the recorded TYPE is load-bearing at
+  codegen.** #1481's dual-run counted the union cells among its 22 "differs only nominally".
+  For a nominal alias that reading is right — the name is kept, the spelling survives. For a
+  union it is wrong, because the recorded type is what selects the box. *Before treating a
+  render difference as cosmetic, ask what reads the type rather than the name.*
+* **When a rule is extracted from a failure, re-test the things that already shipped under
+  it.** The rule cost nothing to apply — two grids, twenty cells — and turned "the other
+  three are probably fine" into a measurement. It is also the only way the rule earns the
+  word *rule* rather than *story about one bug*.
+* **The corpus was blind here for the fourth time on this programme**, and the pattern is now
+  specific enough to state: it contains no program whose generic return union COLLAPSES under
+  its binding, just as it contains no shadowed type parameter (#1483's sibling), no
+  struct-alias union beside an inline spelling, and no annotated-result generic callback. The
+  corpus samples programs people wrote; the type grammar's corners are not among them.
