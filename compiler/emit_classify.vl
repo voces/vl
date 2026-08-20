@@ -176,6 +176,7 @@ import {
   capHas,
   capIsBound,
   gaeApplyFieldTy,
+  gaeParamShadowed,
   gaeSplitArgs,
   inferNicheNullByName,
   isBuiltinFnName,
@@ -15689,6 +15690,48 @@ function gaeIndexOf(name: string) {
 // Intern the application `name` ("Box<i32>") as a struct shape, once. A field
 // the emitter cannot type (an unbound param, an unsupported shape) leaves the
 // application un-interned — its use then fails loudly downstream, never a trap.
+// True when a generic-application ARGUMENT is a FuncDecl type PARAMETER rather than a real
+// type — i.e. the application belongs to a GENERIC ORIGINAL (`function len<T>(b: Box<T>)`)
+// and denotes no concrete struct.
+//
+// The SHADOW ruling is carried here exactly as `genTyParamArr` carries it, and asked of the
+// ARRAY spelling so the two halves cannot drift: a parameter that also names a real type
+// binds nothing, and then the application IS concrete and must intern
+// (`error-genapp-tyaram-arg-elem-array.vl` pins both directions).
+function gaeArgIsTyParam(arg: string) {
+  if genTyParamNames.length == 0 { return false }
+  // THE LEAF, peeled exactly as `genTyParamArr` peels it and for the same reason its
+  // header gives ("`T[][]` is as much a type-parameter array as `T[]` is"). Asked of the
+  // RAW argument this missed `Box<T[]>`, whose substituted field text is BYTE-IDENTICAL to
+  // the case below it: a scalar-bodied `type Box<X> = { v: X }` at `X := T[]` gives `v: T[]`,
+  // exactly what an array-bodied `{ v: X[] }` at `X := T` gives. One was skipped and the
+  // other was `vl check --codegen` rc 0 with `vl run` "expected (ref null $type), found i32".
+  let base = arg
+  if nameIsArray(arg) { base = arrLeafNameOf(arg) }
+  if !fnTyParamName(base) { return false }
+  // TWO shadow sets, and the UNION of them is the answer — neither alone is.
+  //
+  // `gaeParamShadowed` is the binding question's OWN bound: a parameter named for a
+  // PRIMITIVE binds nothing (`monoTyParamOf` carries the same guard, and
+  // `type-param-name-shadows-builtin-arg-axis.vl` pins it). Without it, `Box<f64>` beside
+  // `function idF64<f64>(…)` — a CONCRETE application — was skipped, and the parameter
+  // position that needs the interned row failed with "only i32, i64, f64, f32, boolean,
+  // struct, union, array, or string parameters are supported" on a program master runs.
+  //
+  // The array accept set below is `genTyParamArr`'s, and it is NOT a substitute: it works
+  // only INSIDE `collectA`'s cascade, whose earlier arms already claimed the `string[]` /
+  // `f64[]` / `i64[]` / `f32[]` spellings — its own header says so. Lifted out of that
+  // cascade it silently drops exactly those arms, which is how the regression arose. It is
+  // still needed for what `gaeParamShadowed` does not cover: a parameter shadowing a
+  // DECLARED type (`type T = { x: i32 }`), which is not primitive and must also bind
+  // nothing.
+  if gaeParamShadowed(base) { return false }
+  const a = base + "[]"
+  if nameIsI32Array(a) { return false }
+  if nameIsRefArray(a) { return false }
+  true
+}
+
 export function gaeEnsure(name: string) {
   // The GENERIC-APPLICATION SPAN test at its home (`emit_base.annGenAppSpanEnds`), whose
   // own header names this function as the third caller it wants: the home IS the `length <
@@ -15712,6 +15755,22 @@ export function gaeEnsure(name: string) {
   const args: string[] = []
   gaeSplitArgs(gaeArgsTextOf(name, ltAt), args)
   if args.length != pnames.length { return 0 }
+  // A GENERIC ORIGINAL's application (`Box<T>` at a FuncDecl type parameter) interns
+  // nothing, for the same reason its inline twin `{ v: T[] }` does not (`internInlineShapeTy`,
+  // #1473): the original is replaced by its instances and never emitted, and each instance
+  // re-runs this pass over its PINNED name (`Box<i32>`), which is concrete.
+  //
+  // Without the skip, `gaeApplyFieldTy` substituted the parameter FOR ITSELF — `T[]` at
+  // `T := T` is `T[]` — and the row interned with the type parameter read as a NOMINAL
+  // element name. `vl check --codegen` exited 0 and `vl run` reported
+  // "expected (ref null $type), found i32". #1473 closed the inline half of exactly this
+  // and left the alias-application half open, which is the asymmetry `genTyParamArr`'s own
+  // header warns about one layer up.
+  let gp = 0
+  while gp < args.length {
+    if gaeArgIsTyParam(args[gp]) { return 0 }
+    gp = gp + 1
+  }
   const names: string[] = []
   const codes: i32[] = []
   const elems: string[] = []
