@@ -18,8 +18,6 @@
 // THE INVARIANT IS GENERAL, deliberately: compiling B after A must produce byte-identical
 // output to compiling B first. It does not encode any particular column, so it keeps
 // working for leaks nobody has thought of yet.
-import { assertEquals } from "jsr:@std/assert";
-
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
 
 const seedExists = (() => {
@@ -155,10 +153,16 @@ Deno.test({
     for (let i = 0; i < 8; i++) compile(shared, A);
     const after = compile(shared, B);
 
-    assertEquals(
-      Array.from(after),
-      Array.from(alone),
-      "compiling B after A differs from compiling B first — per-program state leaked",
-    );
+    // A plain comparison and a plain throw — this file adds no dependency, matching the
+    // other `vl_*` tests (the repo's import map carries no assert library, and CI's
+    // `no-import-prefix` lint rejects an inline `jsr:` specifier).
+    const same = after.length === alone.length &&
+      after.every((b, i) => b === alone[i]);
+    if (!same) {
+      throw new Error(
+        "compiling B after A differs from compiling B first — per-program checker " +
+          `state leaked (alone ${alone.length} bytes, after ${after.length} bytes)`,
+      );
+    }
   },
 });
