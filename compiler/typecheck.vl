@@ -14721,7 +14721,33 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if isJoinHoleUnion(tyIx) {
       res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
     } else if changed3 {
-      res = mkUnionTy(out3)
+      // DEDUPE, THEN COLLAPSE — the fold the ANNOTATION path performs and this walk did
+      // not, which is the whole of #1483's regression. Substitution can make two members
+      // the SAME type (`T | string` at `T := string`), and `annUnionInnerTy` answers that
+      // with `members[0]` while this arm rebuilt a two-member union of identical members.
+      // One type then had two representations depending which door it came through, and a
+      // consumer handed the un-folded one recorded a union BOX where the value is a bare
+      // ref: check-clean invalid wasm.
+      //
+      // ARENA-INDEX identity only, NOT `sameVariantTy`. The annotation path's dedup is
+      // structural, and matching it here would merge members this walk has no business
+      // merging — the mixed-union arena SHAPE is load-bearing (`annUnionInnerTy`'s own
+      // header records that flattening a litunion RUN buys zero cells and costs `==` two).
+      // Two members that are literally the same row are the same type by construction, and
+      // that is the case substitution creates; anything subtler is left alone.
+      const uniq: i32[] = []
+      let q = 0
+      while q < out3.length {
+        let seen = false
+        let w = 0
+        while w < uniq.length {
+          if uniq[w] == out3[q] { seen = true }
+          w = w + 1
+        }
+        if !seen { uniq.push(out3[q]) }
+        q = q + 1
+      }
+      if uniq.length == 1 { res = uniq[0] } else { res = mkUnionTy(uniq) }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
@@ -22655,17 +22681,6 @@ export function nodeTyIsUnion(ix: i32) {
 // an unknown is treated as incomplete and the caller keeps its name path. A predicate that
 // gates a hand-over must fail toward the OLD behaviour.
 export function tyHasTyVar(ty: i32) { tyHasTyVarGo(ty, 12) }
-
-// Is `ty` a UNION? Asked by the monomorphizer's return hand-over, which must decline one:
-// `substTyDeep` rebuilds a union WITHOUT the degenerate-member fold the annotation path
-// applies, so a substituted `T | string` at `T := string` stays a two-member union of
-// identical members where `nameToTy` would have collapsed it to `string`.
-export function tyIsUnionTy(ty: i32) {
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyUnion { return true }
-  false
-}
 
 function tyHasTyVarGo(ty: i32, depth: i32) {
   if ty < 0 { return false }
