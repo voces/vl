@@ -43730,3 +43730,65 @@ mechanical. That question was not in B26's specification and should be.
 * **Print the value, not the verdict.** `nMap != aMap` is a boolean; `name=[{[string]: i32}]` is
   the finding. The probe was changed to report the spelling only after the boolean count came
   back at 1, and the spelling is the entire content of this entry.
+
+## B30 / D-MULTIPROD — a name COLUMN fed by many producers has no single arena dual, and that is why the union arms resist conversion
+
+`buildFnMap`'s value-union arm is `isValueUnionName(inm)`. It looks like the most convertible
+predicate left, because the tree already contains its documented arena dual: `tyIsValueUnion`'s
+header says it is *"the structural dual of `isValueUnionName(<er's joined atom render>)`, decided
+from the arena BEFORE anything is rendered"*, and `valueUnionRetName` uses it as its VERDICT —
+building the name only for unions the arena has already confirmed.
+
+**It is not convertible, and the measurement says so: 27 corpus files reach the arm, 5 disagree.**
+
+```
+(()=>string)|i64                    ((i32)=>f32)|i32|null
+((i32)=>{f:K0})|i32                 (()=>{a:i64,f:{…},z:f32})|i64
+```
+
+Every one is a CLOSURE-ARMED union.
+
+### 1. THE FIRST MEASUREMENT WAS MY OWN ERROR, AND THE SECOND CONFIRMED THE FINDING ANYWAY
+
+`valueUnionRetName` gates on `retAtomsCheap(er)` before calling `tyIsValueUnion`, and the duality
+is claimed only under that gate. The first probe called `tyIsValueUnion` UNGATED — so its 5
+disagreements proved nothing about the documented claim.
+
+Re-run with the gate applied: **the same 5.** The gate does not explain them, so the disagreement
+is real. Recording the sequence because "I measured the wrong thing and then measured the right
+thing and got the same answer" is a different (and much weaker) result than "I measured the right
+thing", and only the second licenses a conclusion.
+
+### 2. THE REASON IS THAT THE COLUMN IS MULTI-PRODUCER
+
+`tyIsValueUnion` is the dual of ONE producer's verdict — `valueUnionRetName`'s. But `inferRetTy`
+is a COLUMN, written by 28 producers (B27), and several of them also emit names that
+`isValueUnionName` accepts. The closure-armed names above come from `cloArmValueUnionRetName`
+(rung 20), whose contract admits a closure arm; `tyIsValueUnion` rejects one, because a closure is
+not a value atom.
+
+So the arm reads a column, and the column's contents are the UNION of many producers' outputs.
+An arena predicate matching any single producer's verdict cannot match the column.
+
+**This is the general reason the remaining arms resist conversion**, and it is the same shape B27
+found from the other end: the rung determines the arm, but no single predicate determines the
+rung.
+
+### 3. WHAT WOULD ACTUALLY WORK
+
+Not a better predicate — a banked DECISION. The producer knows which it is; that is B26/B27's
+rung column, and this entry is independent evidence for it. Convert the consumer to read what the
+producer decided, or do not convert it.
+
+The three arms this leaves in `buildFnMap` (map / nullable-string / the two union arms) are all
+column reads, and all wait on the same thing.
+
+### METHOD NOTES
+
+* **A documented dual is a dual of a PRODUCER, not of a column.** `tyIsValueUnion`'s header is
+  accurate and the conversion built on it is still wrong, because the consumer does not read that
+  producer's output — it reads everyone's.
+* **Check the producer's own gating before claiming a dual disagrees.** The first probe here
+  skipped `retAtomsCheap` and would have published a refutation of a claim it had not tested.
+* **When two measurements agree but one was invalid, say so.** The temptation is to report the
+  second number and drop the first; the sequence is what shows the number was earned.
