@@ -42496,3 +42496,80 @@ flatten/dedupe for what that looks like when it is measured honestly.
 * **Check the generator before the results.** A naive `replace` on a one-letter identifier hit
   the field name as well as the value, and the symptom — a third of the grid rejecting — looks
   exactly like a compiler being conservative. Read one generated cell.
+
+## B11 / D-MONORET — the remaining re-parse frontier, sited; the type-level return substitution EXISTS, agrees 72%, and is not safely convertible yet
+
+After #1478 and #1479 the corpus re-parse count is **452**, down from 1,318 (-66%), and the
+rows those parses MINT are **210**, down from 955 (-78%). This is where the rest of it lives
+and why it did not move.
+
+### 1. THE FRONTIER, SITED
+
+Per-site census over 1,646 corpus files, every `synthTypeRef` call counted separately:
+
+| site | calls | note |
+|---|---|---|
+| `emit_mono` m4 — `nret = synthTypeRef(rs, -1)` | **239** | the instance RETURN annotation |
+| `emit_mono` m0 — `monoSubstLetType` | 28 | a body `LetDecl` annotation |
+| `emit_mono` m1 / m12 / m6 / m10 / m11 | 12 / 10 / 8 / 6 / 6 | inferred list + scalar return pins |
+| `emit_mono` m3 / m2 / m7 / m8 / m5 / m9 | 5 / 3 / 2 / 1 / 1 / 1 | |
+| `recordClonedNodeTy` (all callers) | 118 | |
+| `emit_collect` — the re-formed array name | 10 | |
+
+**m4 alone mints 117 of the 210 remaining rows** — 56% of what is left is one call site.
+
+### 2. THE TYPE-LEVEL PATH IS AVAILABLE, AND #1474 IS WHAT MADE IT AVAILABLE
+
+The emitter's `monoBindFromAnn` + `monoSubstAnn` are hand-written STRING twins of two
+checker functions that already work on types: `bindGenWalk` (bind type parameters by walking
+declared against actual) and `substTyDeep` (substitute into a type, rebuilding only where a
+child changed, so a concrete subtree keeps its arena identity).
+
+The missing input was the ARGUMENT types, and `monoMakeInstance` has them: the `pinTys`
+column added by #1474 for an unrelated reason. So the whole probe is:
+
+    bindGenWalk(nodeTyIxOf(param.parType), pinTys[i], bN, bT)   // per parameter
+    substTyDeep(nodeTyIxOf(fn.fnRet), bN, bT)                   // the answer
+
+### 3. IT AGREES 172 OF 239 — AND THE 67 ARE NOT ALL THE HARMLESS KIND
+
+| | count |
+|---|---|
+| renders identically to the string answer | **172** |
+| renders differently | 56 |
+| substitution left the type UNCHANGED | 11 |
+
+Most of the 56 are the alias-vs-expansion class this programme has met repeatedly — `P`
+against `{x:i32}`, `Pair<i32>` against `{a:i32,b:i32}`, map spellings. Those are HARMLESS to
+a hand-over, for the reason #1478 turns on: the hand-over changes the recorded TYPE and keeps
+the recorded NAME, so the local spelling survives and only the arena answer moves.
+
+**The blocker is the residue.** A handful render EMPTY — the type-level path produced
+something with no rendering at all, which means it did not fully resolve. Excluding the
+"substitution changed nothing" cases (`tyc == orig`) accounts for 11 of them and NOT the
+rest: 2 `{string|}` cells survive that guard. So there is no cheap structural test that
+separates "the type path answered" from "the type path failed", and handing over a failed
+answer records a wrong type on the instance's return — the exact shape of the three defects
+this branch has already had to revert.
+
+### 4. WHAT WOULD MAKE IT CONVERTIBLE
+
+A completeness predicate on the substituted type — "does this contain an unresolved `TyVar`"
+— which the arena can answer structurally and which nothing currently exposes. With it, the
+rule is the one #1478 already uses: hand over when the substitution is complete, keep the
+name path when it is not. Without it, the honest position is that **117 rows are worth less
+than the risk of recording a wrong return type**, and the slice stays unshipped.
+
+### METHOD NOTES
+
+* **Site the frontier before converting any of it.** Numbering all 13 `emit_mono` call sites
+  and counting each separately turned "324 re-parses in emit_mono" into "239 of them are one
+  line" — and the rows measurement then said that one line owns 56% of the remaining cost.
+  Twelve of the thirteen sites are not worth a design.
+* **A column added for one reason is the input another slice was missing.** `pinTys` exists
+  because #1474 needed the argument type for a `$fnsig` pin. It is also exactly what
+  `bindGenWalk` needs. Check what the file already carries before adding a parameter.
+* **"Agrees 72%" is not a licence, and the 28% is not one number.** Splitting it showed two
+  populations with opposite implications — a majority that is harmless BY CONSTRUCTION (the
+  name is kept) and a residue that is a wrong answer. A single agreement rate would have
+  hidden the second inside the first.
