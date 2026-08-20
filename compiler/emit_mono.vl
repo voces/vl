@@ -673,6 +673,33 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   "i32"
 }
 
+// Build the TYPE-LEVEL binding column (`T` ⇒ this instance's concrete type) the way the
+// CHECKER does: `bindGenWalk` over each parameter's DECLARED type against the concrete type
+// the instance pinned that position at. `monoBindFromAnn` is the hand-written STRING twin of
+// this and fills `tvN`/`tvV`; this fills the arena-index pair `substTyDeep` consumes, so a
+// substitution can HAND the type over instead of re-parsing the substituted spelling back
+// through `nameToTy` (which does not hash-cons, so every re-parse of a composite mints a
+// duplicate row).
+//
+// `tyCol` is POSITIONAL over `params`, and -1 means "nothing known at this position".
+// `bindGenWalk` declines a -1 outright, so an all -1 column binds nothing, `substTyDeep`
+// returns its input unchanged, and every caller falls back to the name path it uses today.
+// That is what keeps the annotation-driven entry (`monoInstanceFor`, whose column is all -1
+// by construction) byte-identical.
+function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
+  let bi = 0
+  while bi < params.length {
+    const pp = P.nodes[params[bi]]
+    if pp is Param {
+      let at = -1
+      if bi < tyCol.length { at = tyCol[bi] }
+      bindGenWalk(nodeTyIxOf(pp.parType), at, bN, bT)
+    }
+    bi = bi + 1
+  }
+  0
+}
+
 // Substitute a `LetDecl` annotation `letType` (a `TypeRef`) through the instance binding,
 // returning a fresh `TypeRef` node when a type param substitutes (`T[]` → `f64[]`), else
 // the original node index. So a generic body's `const out: T[] = []` / `const x: T` lowers
@@ -683,13 +710,36 @@ function monoSubstLetType(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  bN: string[],
+  bT: i32[],
 ) {
   if letType < 0 { return letType }
   const tn = P.nodes[letType]
   if tn is TypeRef {
     if monoAnnHasTyParam(tn.tyName, typarams) {
       const sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
-      if sub != "" && sub != tn.tyName { return synthTypeRef(sub, tn.pos) }
+      if sub != "" && sub != tn.tyName {
+        // THE SUBSTITUTED TYPE, not a re-parse of the substituted NAME — the return site's
+        // hand-over (see `substTyDeep` there) applied to the body's annotated locals. The NAME
+        // handed to the synthesis is unchanged (`sub`), so every name-consumer downstream reads
+        // exactly the spelling it reads today; only the recorded TYPE improves.
+        //
+        // GATED ON COMPLETENESS, for the reason the return site records: `substTyDeep` rebuilds
+        // only what CHANGED, so a type param it could not bind is left in place and is
+        // indistinguishable at the result from a full substitution. A partly-substituted type
+        // recorded on a local's annotation is simply wrong. `tyHasTyVar` separates the two and
+        // fails toward the name path (its depth bound answers TRUE), so an unknown keeps
+        // today's behaviour rather than guessing.
+        let sty = -1
+        const origLet = nodeTyIxOf(letType)
+        if origLet >= 0 {
+          const s2 = substTyDeep(origLet, bN, bT)
+          if s2 >= 0 && s2 != origLet {
+            if !tyHasTyVar(s2) { sty = s2 }
+          }
+        }
+        return synthTypeRefTy(sub, tn.pos, sty)
+      }
     }
   }
   letType
@@ -711,6 +761,8 @@ function monoCloneBody(
   tvV: string[],
   outName: string,
   outType: string,
+  bN: string[],
+  bT: i32[],
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
@@ -726,6 +778,8 @@ function monoCloneBody(
         tvV,
         outName,
         outType,
+        bN,
+        bT,
       )
       ns.push(cs)
       if cs != n.blkStmts[i] { changed = true }
@@ -735,7 +789,7 @@ function monoCloneBody(
     return mkBlock(ns, n.pos)
   }
   if n is LetDecl {
-    let nt = monoSubstLetType(n.letType, typarams, tvN, tvV)
+    let nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
     // The inferred-list-return local (`const out = []`, element a hole so #543's synthesis is
     // skipped): annotate its empty build with the pinned element type, per instance. Clones
     // ONLY this `LetDecl` (and its enclosing Block), never the shared original.
@@ -748,34 +802,97 @@ function monoCloneBody(
     return mkLet(n.letKw, n.letName, nt, n.letInit, n.pos)
   }
   if n is WhileStmt {
-    const cb = monoCloneBody(n.whileBody, typarams, tvN, tvV, outName, outType)
+    const cb = monoCloneBody(
+      n.whileBody,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
     if cb == n.whileBody { return ix }
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoCloneBody(n.ifThen, typarams, tvN, tvV, outName, outType)
-    const ce = monoCloneBody(n.ifElse, typarams, tvN, tvV, outName, outType)
+    const ct = monoCloneBody(
+      n.ifThen,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
+    const ce = monoCloneBody(
+      n.ifElse,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
     if ct == n.ifThen && ce == n.ifElse { return ix }
     return mkIf(n.ifCond, ct, ce, n.pos)
   }
   if n is ForRange {
-    const cb = monoCloneBody(n.frBody, typarams, tvN, tvV, outName, outType)
+    const cb = monoCloneBody(
+      n.frBody,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
     if cb == n.frBody { return ix }
     return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
   }
   if n is ForIn {
-    const cb = monoCloneBody(n.fiBody, typarams, tvN, tvV, outName, outType)
+    const cb = monoCloneBody(
+      n.fiBody,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
     if cb == n.fiBody { return ix }
     return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
   }
   if n is RetStmt {
     // The return value may be a block / `if`-EXPRESSION carrying its own `LetDecl`s.
-    const ca = monoCloneBody(n.retArg, typarams, tvN, tvV, outName, outType)
+    const ca = monoCloneBody(
+      n.retArg,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
     if ca == n.retArg { return ix }
     return mkReturn(ca, n.pos)
   }
   if n is Paren {
-    const ci = monoCloneBody(n.parInner, typarams, tvN, tvV, outName, outType)
+    const ci = monoCloneBody(
+      n.parInner,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      bN,
+      bT,
+    )
     if ci == n.parInner { return ix }
     return mkParen(ci, n.pos)
   }
@@ -1817,6 +1934,16 @@ function monoMakeInstance(
       pinnedTyIx.push(pinTy)
       pj = pj + 1
     }
+    // THE BODY'S binding column, built from `pinnedTyIx` — the column the clone loop above
+    // just resolved — rather than from the raw `pinTys` the return site takes. The two differ
+    // in coverage, not in meaning: `pinTys` is the ARGUMENT type and is -1 wherever no
+    // argument node exists, while `pinnedTyIx` is "the pin, resolved once, never re-resolved
+    // from its spelling" and so also covers a position pinned from a NAME. Kept as a separate
+    // build rather than unifying the two: widening the return site's column changes what IT
+    // substitutes, which is a different population and wants its own measurement.
+    const letBN: string[] = []
+    const letBT: i32[] = []
+    monoBindCols(params, pinnedTyIx, letBN, letBT)
     // Substitute a type-param-riding RETURN annotation through the binding —
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
     // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
@@ -1870,16 +1997,7 @@ function monoMakeInstance(
         if origRet >= 0 {
           const bN: string[] = []
           const bT: i32[] = []
-          let bi = 0
-          while bi < params.length {
-            const pp = P.nodes[params[bi]]
-            if pp is Param {
-              let at = -1
-              if bi < pinTys.length { at = pinTys[bi] }
-              bindGenWalk(nodeTyIxOf(pp.parType), at, bN, bT)
-            }
-            bi = bi + 1
-          }
+          monoBindCols(params, pinTys, bN, bT)
           const sub2 = substTyDeep(origRet, bN, bT)
           if sub2 >= 0 {
             if sub2 != origRet {
@@ -2106,6 +2224,8 @@ function monoMakeInstance(
       tvV,
       monoOutName,
       monoOutType,
+      letBN,
+      letBT,
     )
     // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to a
     // NON-i32 element (`self: f64[]` ⇒ the `(x) => …` callback's `x` is f64): the shared
