@@ -17158,6 +17158,25 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       } else {
         retTailPos = false
       }
+      // THE IMPLICIT RETURN IS SEEDED WITH THE DECLARED TYPE, exactly as the explicit
+      // one is (`checkRetStmtNode`: `if want >= 0 { seedExpected(n.retArg, want) }`).
+      // Without it the trailing expression is checked with no expectation, so a narrower
+      // literal types at its DEFAULT — which is why the bare-expression coercion had to be
+      // done later, in the emitter, and why nothing compared the tail to the annotation.
+      // A tail that is UNREACHABLE is not the implicit return. `function early(): i32 {
+      // return 1 print(9) }` is two statements on one line — the `return` supplies the
+      // value and `print(9)` is dead code — so neither seeding nor checking may treat it
+      // as the returned expression. `functions/return-then-statement-same-line.vl` pins
+      // exactly this and records that it "previously surfaced a spurious `expected i32,
+      // got null`"; re-introducing that is what a tail-position test without a divergence
+      // guard does.
+      let tailIsReturn = s == stmts.length - 1
+      if tailIsReturn && s > 0 {
+        if daBranchDiverges(stmts[s - 1]) { tailIsReturn = false }
+      }
+      if tailIsReturn && !inferring && ret >= 0 && !isStmtNode(stmts[s]) {
+        seedExpected(stmts[s], ret)
+      }
       const stTy = checkNode(stmts[s])
       retTailPos = savedRTPbody
       // The trailing expression is the implicit return; under inference it is a
@@ -17165,6 +17184,33 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // collection (`mk(): i32[] { … inner }`) pins its element from the return
       // type here — before the body scope is popped (and `inner`'s floor checked).
       if s == stmts.length - 1 {
+        // …and then CHECKED against it — through `assignableExpr`, NOT `assignable`. The
+        // coercions the language grants a value meeting a declared type live there
+        // (`boolean-to-i32.vl`: "the coercion sits at `assignableExpr`, which every field /
+        // element / store / push also flows through"), and the bare-expression return is
+        // one more such position. Checking with plain `assignable` reddens 13 corpus files
+        // that are pinning legitimate coercions — a narrower numeric literal widening to
+        // the declared `i64`/`f32`, a boolean meeting an `i32`, a litunion adoption.
+        //
+        // An explicit `return <expr>` has been checked all along; the bare trailing
+        // expression — which IS the implicit return — was not, so
+        // `function h(): i32 { "s" }` type-checked clean and emitted invalid wasm, and
+        // `function h(): boolean { 5 }` ran and printed `true` (the coercion is
+        // ONE-directional: boolean meets i32, an arbitrary i32 is not a boolean).
+        if !inferring && tailIsReturn {
+          if ret >= 0 {
+            if !isStmtNode(stmts[s]) {
+              if !isVoidTy(ret) {
+                if !assignableExpr(stmts[s], stTy, ret) {
+                  tErr(
+                    "expected " + tyToStr(ret) + ", got " + tyToStr(stTy),
+                    stmts[s],
+                  )
+                }
+              }
+            }
+          }
+        }
         if inferring {
           // A value-producing trailing expression is a value return POSITION (vs a
           // bare trailing statement); the redundant-return fixpoint defers only these.
