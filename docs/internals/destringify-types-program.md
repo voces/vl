@@ -42427,6 +42427,12 @@ directory has no slot for. Inventing a fourth prefix unilaterally is worse than 
   there, "byte-neutral" was wrong because the CORPUS could not contain the shape, and building the
   shape by hand turned it into a check-clean-invalid-wasm fix. So the discipline is: build the shape
   the change should fix BEFORE deciding it is neutral. Here that was done, and it stayed neutral.
+* **SUPERSEDED (see B13): the flatten/dedupe rejoin WAS half the fix.** It measured 0 outcomes
+  moved because the CHECKER half was missing — `substTyDeep` was rebuilding the same degenerate
+  union without folding it, so fixing the emitter's spelling alone changed nothing observable.
+  With both halves in, B9 closes. The measurement below was right; the conclusion drawn from it
+  — that these spellings are "not the cause" — was wrong. *A change that moves nothing may be
+  one half of a pair.*
 * **A malformed intermediate is not evidence of the bug beside it.** `string|string` looks exactly
   like the cause of §3 and is not. The table of two conditions is what settled it — one axis
   (annotated vs inferred) is orthogonal to the spelling entirely.
@@ -42641,3 +42647,70 @@ widened back — and it is not a gate-tightening question.
   its binding, just as it contains no shadowed type parameter (#1483's sibling), no
   struct-alias union beside an inline spelling, and no annotated-result generic callback. The
   corpus samples programs people wrote; the type grammar's corners are not among them.
+
+## B13 / D-UNIONREJOIN — B9 closes, and it needed BOTH halves; neither moved anything alone
+
+B9 filed a check-clean invalid wasm — a generic whose return union COLLAPSES under its
+binding, read into an INFERRED binding — and recorded three refuted hypotheses. It stayed
+open through four more slices. It is now closed, by two changes that were each measured at
+**zero effect** when tried alone.
+
+    function f<T>(v: T): T | string { v }
+    const r = f("a")
+    print(r)
+
+    before:  vl check --codegen rc 0;  vl run -> "expected (ref null $type), found (ref $type)"
+    after:   a
+
+### 1. THE TWO HALVES
+
+**The CHECKER half** — `substTyDeep` rebuilt `T | string` at `T := string` as a two-member
+union of identical members where the annotation path folds it to plain `string`. Shipped as
+its own fix once B12 identified it as an inconsistency between the two type paths rather
+than a gate to tighten.
+
+**The EMITTER half** — `monoSubstAnn`'s union rejoin is a blind concat, so the instance's
+return NAME was still the spelling `string|string`: a name no source program can produce and
+no interner has seen. Every consumer reading the NAME still saw a union even once the
+checker was right. It now flattens each substituted atom (one may itself be a union,
+`T := string | null`), dedupes by FIRST OCCURRENCE so a union whose arms do not collapse
+re-renders byte-identically and never becomes a second intern key, and returns the BARE atom
+when one survives.
+
+### 2. WHY EACH MEASURED ZERO
+
+The emitter half was implemented at B9 and measured over a 16-cell grid: **0 outcomes
+moved**. That measurement was correct. The conclusion — "the bug those spellings look like
+they should cause is real, but it is NOT caused by them" — was wrong. With the checker still
+producing an unfolded union, fixing the spelling changed nothing observable, because the
+consumer was reading a type that was independently wrong.
+
+The checker half likewise closed no defect on its own: shipped alone, B9 was re-tested and
+still failed.
+
+**The rule this yields is uncomfortable and worth keeping**: a 0-effect measurement rules out
+"this change ALONE fixes it", not "this change is not part of the fix". B9's own method note
+said *a malformed intermediate is not evidence of the bug beside it* — true, and it does not
+follow that the intermediate is innocent.
+
+### 3. MEASURED
+
+* Grid, 20 union-return cells against the pre-#1481 build: **2 moved, both from INVALID WASM
+  to correct output** — the two B9 shapes. The other 18 unchanged.
+* The B12 audit grids (10 lambda-union, 10 param-pin): **0 moved**.
+* Corpus A/B: **2 of 2,023** — the new fixture, and
+  `closures/generic-nulclosure-return-sig-skip.vl`, whose output and diagnostics are
+  byte-identical and whose module GREW by 6 bytes at the same 2 type rows (a folded name
+  re-orders a slot). Stated rather than rounded off: this slice costs 6 bytes on one corpus
+  file and buys two invalid-wasm cells.
+
+### METHOD NOTES
+
+* **Re-test the filed defects after every adjacent slice.** B9 was closed by a change made
+  for an unrelated reason (a consistency fix between two type paths), and nothing would have
+  connected them except running the old repro again. The regression in #1481 was found the
+  same way — by re-testing B9 against a new build.
+* **A filed negative is a hypothesis with a date on it.** Both B9's "not the cause" and B11's
+  "not safely convertible" were overturned by later work, and both were overturned quickly
+  once the missing piece existed. File them with the measurement so the next reader can see
+  what would change the answer.
