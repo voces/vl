@@ -42714,3 +42714,59 @@ follow that the intermediate is innocent.
   "not safely convertible" were overturned by later work, and both were overturned quickly
   once the missing piece existed. File them with the measurement so the next reader can see
   what would change the answer.
+
+## B14 / D-AXES — three more axes swept, no new holes; and the map-KEY assumption checked rather than trusted
+
+After the map-value hole (found by widening the constructor grid), the same widening was
+applied to three axes the grid does not model at all. All three came back clean. Recorded
+so the next hunt starts somewhere else.
+
+### 1. GENERIC COMPOSITION — 36 cells, 0 BAD
+
+Generics calling generics, which the constructor grid never exercises because every cell
+there is a single generic. Twelve shapes x three reps: one-hop and two-hop forwarding, an
+array forwarded, a return forwarded, the same generic instantiated at two types in one
+program, two-parameter generics returning either side, a callback forwarded, an alias
+application forwarded, an element read forwarded, a nullable forwarded, and a map forwarded.
+
+**30 OK, 6 REJECT, 0 BAD.** The six are two capability limits, both loud and positioned: an
+object literal as a generic argument (`monomorphize: unsupported argument type`) and a
+closure parameter of a generic (`only … parameters are supported`).
+
+### 2. FLAT TYPES AND NEWTYPES x GENERICS — 15 cells, 0 BAD
+
+The axis the 2026-08 ruling singles out (*"the one exception is flat types, which do
+guarantee structural ordering"*). Generics over a `new i32` and a `new { … }` at identity,
+array, return, shape-field, alias-application, nullable and map positions; generics beside a
+`flat type` reading `.size` and a field offset; a newtype as a generic-alias argument; and one
+generic instantiated at both a newtype and a string. **12 OK, 3 REJECT, 0 BAD.**
+
+**The flat-ORDER ruling is already pinned** — `tests/cases/memory/flat-layout-grid.vl` carries
+it explicitly (*"The same widths in the REVERSE order lay out differently — order is layout,
+and nothing is reordered to pack better"*), with a `Rev` type beside its `Wide`. An earlier
+note on this branch said nothing enforced the exception; that was wrong.
+
+### 3. SET, AND THE MAP-KEY ASSUMPTION
+
+`Set<T>` is not a spelling — a set is `{[K]: boolean}`, so the map arm added for the
+map-value hole covers it, confirmed by a generic returning `{[string]: boolean}` built with
+`Set()`.
+
+That arm was written with an explicit assumption in its header: *the VALUE only, because a
+map KEY is `string` or `i32` by construction and a parameter cannot reach that position.*
+**Checked rather than trusted**: `{[T]: i32}` and `{[T]: T}` are both `unknown type` at the
+CHECKER, in return and parameter position alike — a loud reject before monomorphization ever
+runs. The assumption holds and the arm is right to be one-sided.
+
+### METHOD NOTES
+
+* **State an assumption in a header, then go and test it.** The map arm's one-sidedness was
+  argued from `mkMapTy`'s rule; two probes turned the argument into a measurement, and the
+  cost was one `vl` run. An assumption written into a comment is a claim the next reader will
+  rely on.
+* **A clean sweep is worth recording with its CELL LIST, not its verdict.** "No holes on the
+  composition axis" is only useful to the next hunt if the twelve shapes are named — otherwise
+  it will be swept again.
+* **Check whether the ruling is already pinned before writing the fixture.** The flat-order
+  exception had a fixture the whole time, two directories away from where this branch was
+  working.
