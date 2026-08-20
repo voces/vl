@@ -43132,14 +43132,31 @@ B15's frontier table listed one site outside `emit_mono`: `collectLocals`' re-fo
 name, 10 calls. It is now a hand-over — `nodeArrayElemName(synInit)` reads `nodeTyIxOf(synInit)`
 to get the element in the first place, so the ARRAY type was in hand the whole time.
 
-**The NAME is deliberately untouched**, and that is the entire care in the change: the two
-lines above the mint swap a struct element's structural render for its DECLARED name (the
-ref-list tables key on that spelling) and re-wrap a union element (`Cat|Dog[]` binds `[]` to
-the last member — a different type). Both are name-side rules, both still run, and the two
-spellings denote one type under the 2026-08 ruling.
+**It shipped first with a FALSE justification, and review caught the argument rather than the
+behaviour.** The claim was that the two lines above the mint — which swap a struct element's
+structural render (`{v: i32}`) for its DECLARED name (`P`), because the ref-list tables key on
+that spelling — are name-side only, "and the two spellings denote one type under the 2026-08
+ruling, so handing it over changes no name-keyed lookup".
 
-Population, by the same sabotage: **2 files**, struct and union element kinds, both already
-covered by committed fixtures.
+They are one TYPE and they are not one ROW, and the rep layer keeps them apart **on purpose**:
+`repSlotOfTyDecl` is a nominal arena-index lookup with no structural bridge, and
+`rlInternNameTy` records the consequence outright — *"declared struct twins stay apart"*. The
+handed row keys `HC_OBJ(fields…)`; the name-resolved row keys `HC_SLOT(si)`.
+
+Instrumenting the site to compare `repElemId(handed)` against `repElemId(name-resolved)` over
+the corpus finds them **disagreeing on exactly one file** — `arrays/infer-build-struct.vl`,
+`arr=[P[]] elem=[{v: i32}]` — and agreeing everywhere else. One disagreement is one too many
+for an ungated hand-over.
+
+**The rule it now follows is `emit_rewrite`'s, stated there as absolute: hand the type over only
+where the SPELLING DENOTES THE TYPE BEING HANDED.** `synName != synElem` IS the struct arm, so
+the gate is `synName == synElem` and the struct case falls back to the name path. Re-measured
+under the gate: **0 disagreements**. A union element still hands over — its paren re-wrap
+changes the array's GROUPING (`Cat|Dog[]` binds `[]` to the last member) without touching the
+element spelling, so the re-wrapped name denotes exactly the handed array.
+
+Population, by the same sabotage: **2 files before the gate, 1 after** — the union kind. That is
+the honest size of the win, and it is half what the first commit claimed.
 
 ### THE HOLE THAT TURNED UP WHILE TRYING TO WIDEN THAT COVER
 
@@ -43189,6 +43206,44 @@ and `@log` assertions do not).
 * **Ask the arena, not the render, when adding a classifier.** `arrLitNestedElemName` gates on
   `T.tys[elem] is TyArray`; the `nameIsArray` form would also have matched the kind-5 closure
   element and the union arm's `(Cat | Dog)[]`, both of which have their own producer and kind.
+* **"Structurally equal" is not "interchangeable" — ask the layer that consumes it.** The
+  2026-08 ruling makes two field-permuted shapes one TYPE. It says nothing about whether a
+  layer that keys NOMINALLY may treat a declared row and an inline row as one, and the rep
+  layer's own headers say it may not. Citing a language ruling to license a representation
+  change is a category error.
+
+## B23 / D-GATEPOP — a green gate is only evidence for the sites its population reaches
+
+Review of the B21 slice asked a question the programme had not thought to ask: the change cited
+`scripts/rep-fuzz-check.sh` as green, but *does the fuzz population reach that synthesis at all*?
+
+Tested the only way that answers it — install the SABOTAGE build (the one that records the
+element type where the array type belongs, and sends two corpus files to invalid wasm) as the
+seed and run the gate:
+
+> **`rep-fuzz-check: exact ✅`.**
+
+**The gate is VACUOUS for that site.** It cannot see the synthesis, so the green result reported
+on the first commit was worth exactly nothing there, and quoting it was the same error as
+quoting a clean corpus over a population of two — the error this programme has already recorded
+twice (B-DUALPOP, B20) and had not thought to apply to its own GATES.
+
+This generalises past one site. The project's gates are `deno task test`, the native suites,
+`native-fixpoint.sh`, `lint-self.sh`, `rep-fuzz-check.sh` and `mono-tyaram-grid.sh`, and each has
+a population. A change lands inside some of those populations and outside others, and a report
+that lists six green gates without saying which ones could have failed is a list of six
+reassurances, not six measurements.
+
+### METHOD NOTES
+
+* **Sabotage the change, then run the GATE.** The same one-edit build that sizes a corpus
+  population also tells you whether a gate is potent for the change in front of you. It costs
+  one extra run and it is the difference between citing a gate and relying on one.
+* **Report gates with their potency, not just their verdict.** "rep-fuzz exact" and "rep-fuzz
+  exact, and its population does not reach this site" are opposite claims wearing the same words.
+* **`mono-tyaram-grid.sh` has a written sabotage contract for exactly this reason** (13 cells
+  MUST go BAD against a pre-#1475 seed). That contract is what makes its green meaningful, and
+  no other gate in the project has one. The grid was right and the habit did not spread.
 
 ## B22 / D-CENSUS2 — a fresh census, and its one TRIVIAL rating that the source refutes
 
