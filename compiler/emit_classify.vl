@@ -18767,7 +18767,32 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       // scan can't classify — it leniently matched the plain same-name-set twin row
       // (INVALID-WASM at the boxed-field read; fuzz sweep3 declared leg, seed
       // 128787380 case_00189).
+      // THE INDEX ARM'S ORDERING, EXACTLY — exact spelling, then the arena row, then the lenient
+      // field-set scan. A first version of this put the arena rung FIRST and claimed that was
+      // "the same precedence the Index arm uses". It is not: that arm runs `structIndexByName`
+      // ahead of its arena rung, deliberately (#1061's "AFTER-not-FIRST"), and review caught the
+      // claim.
+      //
+      // THE ORDER IS LOAD-BEARING, not cosmetic. An inline shape is interned UNDER ITS RENDER
+      // (`sNames.push(nm)`), so the exact-spelling rung returns whichever row carries that
+      // spelling, while the arena rung returns the SMALLEST row sharing the canon key. Those
+      // differ whenever an earlier canon-twin exists — and one can, because the mint-side dedup
+      // (`annShapeIndexOf`) keys on strictly MORE than `slotCanonId` + `structFieldCodesEq`
+      // (stored elem names, the i32-key bit, the litunion-atom bit). Arena-first would silently
+      // graduate such a row to its earlier twin, and the row INDEX leaks into identity consumers
+      // — `exprIsStructEq`, `cloEqNoteBin`, `exprIsMultiFieldReboxCall` — where a graduated index
+      // flips a struct `==` to "not a struct eq" rather than merely changing a layout lookup.
+      //
+      // With the exact rung in front, the arena rung answers only where the spelling did NOT
+      // resolve — which is where the render was being fed to a field-set scan that re-parses it,
+      // and is the whole point of the change.
       const snc = nodeTyCanonObjName(exprIx)
+      if snc != "" {
+        const sbn = structIndexByName(snc)
+        if sbn >= 0 { return sbn }
+      }
+      const cr = repRowOfTyStruct(nodeRepTyIxOf(exprIx), sScanLim())
+      if cr >= 0 { return cr }
       if snc != "" {
         const sic = structIndexOfTypeName(snc)
         if sic >= 0 { return sic }
@@ -18777,7 +18802,33 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     }
     // The NULLABLE-struct dual: a `S | null`-returning closure value call (`arr[i](x)` over a
     // `((i32) => P | null)[]`) resolves to its INNER struct's layout index, so the kind-9 binding's
-    // `!= null` narrow and field read find `P`. `nodeNulStructInnerName` renders only the inner shape.
+    // `!= null` narrow and field read find `P`.
+    //
+    // ARENA FIRST HERE, and the descent is `nulBaseStructRow`'s, one screen up in this file: peel
+    // the `TyNullable` and ask the row of its inner.
+    //
+    // THIS RUNG IS WIDER THAN THE NAME RUNG IT FRONTS, and an earlier draft of this comment
+    // claimed the opposite ("the two ask one question and only one of them parses"). Review
+    // refuted it: `nodeNulStructInnerName` needs `TyNullable` + `TyObj` inner AND a NON-EMPTY
+    // render, while this needs only the first two. `tyToEmitName` returns "" on a CYCLE — its
+    // guard is an ancestor stack — so a RECURSIVE inner collapses the whole render, and
+    // `repCanonId` does not: it mints a real key through its de Bruijn back-edge.
+    //
+    // So `type L = { v: i32, n: L | null }` returned from a closure value call answers a row here
+    // where master answered -1. Probed: both still REJECT, with different messages
+    // (`ref valtype with no interned shape` -> `function-value call arity has no interned
+    // signature`), so nothing silently changes — but the widening is real, it is very likely the
+    // RIGHT answer, and it is stated rather than denied. `structIndexOfExpr` returning >= 0 where
+    // it returned -1 is not inert in general: the Member arm's `msi >= 0` leg short-circuits a
+    // narrowed-variant fallback, which is a documented pathology of exactly this shape.
+    const nnTy = nodeRepTyIxOf(exprIx)
+    if nnTy >= 0 {
+      const nnT = T.tys[nnTy]
+      if nnT is TyNullable {
+        const nr = repRowOfTyStruct(nnT.nInner, sScanLim())
+        if nr >= 0 { return nr }
+      }
+    }
     const nn = nodeNulStructInnerName(exprIx)
     if nn != "" { return structIndexOfTypeName(nn) }
     return -1
