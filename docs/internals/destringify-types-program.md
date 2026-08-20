@@ -44574,3 +44574,100 @@ softening, and at that moment it becomes necessary.
   measures clean.
 * **Measure the halves of a step before believing its price.** B37 measured two ladders together
   after a third change and got a number that belongs to neither of them alone.
+
+## B42 / D-FIELDARENA — steps 1 and 2 land together, because neither is correct alone (#1536)
+
+B41 laid out a three-step programme and predicted the shape of the first two: teach the field
+ladder, and move the construction sites onto the atom rep. It had the ORDER right and the
+INDEPENDENCE wrong. They are not two slices. They are two halves of one, and each half alone
+produces invalid wasm.
+
+### 1. THE REGISTRY HALF WAS NEVER A PROPERTY OF THE TYPE
+
+`fieldCodeOfSpelling` asked `nodeTyIsLitUnionAlias`, which is two questions welded together:
+
+```
+nodeTyIsLitUnionAlias(ix) = cTyIxListHas(cUnionTyIxs, ty)   // was it WRITTEN as a registered alias?
+                          && tyIsLitUnion(ty)               // IS it a literal union?
+```
+
+Only the second is a question about the type. The first is a question about the SPELLING that
+produced it — which is the programme's whole subject, wearing an arena-shaped mask. Three shapes
+live in the difference, and all three are literal unions the ladder declared as string refs:
+
+| shape | why the registry misses it |
+| --- | --- |
+| `f: "ia" \| "ib"` | a bare inline union is never registered |
+| `f: K & !"kb"` | narrowing REBUILDS the union at a fresh arena index; the index compare misses |
+| `{ a: K, b: "ma" \| "mb" }` | the inline field inherits the miss beside a registered one |
+
+`nodeTyIsLitUnionStructural` drops the registry half.
+
+### 2. AND THAT ALONE MISCOMPILES ALL THREE
+
+The ladder DECLARES. Construction asks `sFieldIsLitUnion`, which reads what `fieldRecElemName`
+recorded — and that recorded a name only when `nameIsLitUnionType(tyNameOf(tyIx))` said yes.
+`tyNameOf` is position-dependent for a litunion (`ctxKeepsLitUnion`), so for exactly these three
+it renders `string`, the name test declines, and the field is recorded with an EMPTY elem name.
+Declaration says atom, construction builds a string, and the store is a `(ref $type)` into an i32
+slot.
+
+The fix is the same move one level down: when the RENDER declines, ask the ARENA.
+`litUnionAliasNameOfTy` / `litUnionInlineNameOfTy` produce the spelling from the TYPE, so they
+answer where the positional render will not.
+
+**This is the pattern to expect for every remaining site.** A ladder that reads a spelling has a
+recording twin that also reads a spelling, and converting the ladder without the twin converts a
+silent agreement into a loud disagreement. B41 called step 1 "unobservable"; it is unobservable
+because its twin is what makes it observable, and the two must move together.
+
+### 3. THE RESULT IS A REP CHANGE, NOT A REFACTOR
+
+```wat
+;; before                                 ;; after
+(struct (field (mut (ref 1))))            (struct (field (mut i32)))
+```
+
+### 4. THE POPULATION WAS TWO FILES, SO THE FIXTURE HAD TO CARRY THE EVIDENCE
+
+The corpus moves **2 of 2038 rows**, both wasm-sha only — no exit code, diagnostic or runtime
+output changes anywhere. And a build-differential (ladder-only vs master) shows those SAME two
+files are the entire population the widened arm reaches.
+
+Two files is not enough to license a widening, per B23 and the dual-run population rule. So the
+evidence is a written one: `structs/inline-litunion-field-atom-rep.vl` exercises all three widened
+shapes through construction, read, assign, compare and a call, plus a CONTROL — the inline
+nullable union, which takes the code-30 niche arm and is genuinely untouched. Built against the
+ladder-only compiler, **three of its four arms emit invalid wasm**. That is the B41 method note
+applied to my own change: it separates a load-bearing arm from an inert one, and it is the reason
+this slice is believable where a 2-row corpus number would not be.
+
+### 5. A DEFECT FOUND BY SIZING, NOT BY CHECKING
+
+`soundness/xfail-miscompile-narrowed-litunion-param-string-return.vl`. A narrowed litunion in a
+PARAMETER position returned through a `string` annotation lowers the return slot wrong — it
+reproduces identically on master, so it is pre-existing and independent. Both neighbouring
+spellings are fine:
+
+```vl
+function takesK(v: K): string { v }                 // OK  — registered alias
+function takesInline(v: "ia" | "ib"): string { v }  // OK  — bare inline union
+function takesN(v: K & !"kb"): string { v }         // MISCOMPILES
+```
+
+Same fresh-arena-index property as the field ladder's second row, one position over. It is the
+FIFTH member of the `xfail-miscompile-` kind, and the first found by a sweep rather than a
+reviewer — but a sweep of a particular kind, and that is the transferable part:
+
+### METHOD NOTES
+
+* **Sizing a change's population is a better bug-finder than checking the change.** Every previous
+  member of this kind came from review. This one came from asking "what else reaches this arm?",
+  finding the honest answer was "almost nothing", and WRITING the programs that would. The
+  fixtures built to enlarge a population are new programs the corpus never contained — which is
+  exactly where defects that no sweep can reach are sitting.
+* **A small population is a reason to write programs, not a reason to relax.** The temptation on
+  reading "2 of 2038 rows move" is to call the change cheap. The correct reading is that the
+  corpus cannot evaluate it.
+* **A ladder and its recording twin are one change.** Landing half of a spelling-to-arena
+  conversion is worse than landing neither.
