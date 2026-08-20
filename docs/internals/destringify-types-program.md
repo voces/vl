@@ -44272,3 +44272,73 @@ Two independent slices, one root cause, and the root cause costs three emitter l
   checker's answer was identical on both sides, which settles that this is the compiler's business.
 * **A tree that records its own rulings verbatim is worth grepping before asking.** The ruling that
   governs this was already in the file that documents the gate.
+
+## B37 / D-LITUNIONREP — B36 under-priced it: the two ladders CAN be taught structurally, and the residue is invalid wasm, not a reject
+
+B36 priced retiring `ctxKeepsLitUnion` at "three emitter ladders, 17 loud rejects, best possible
+failure mode". Building it corrects that. The ladders are real and teachable; the residue is not a
+reject.
+
+### 1. THE LADDERS ARE TEACHABLE, AND TEACHING THEM IS ITSELF A DESTRINGIFY WIN
+
+Both blocking arms asked `nodeTyIsLitUnionAlias`, which is
+`cTyIxListHas(cUnionTyIxs, ty) && tyIsLitUnion(ty)` — a REGISTRY half and a STRUCTURAL half. The
+registry half is what has no arm for an un-aliased inline litunion, and it is why the renderer
+softens one to `string` at those positions: **the ladder had no arm, so the render lied to keep the
+type lowerable.**
+
+Dropping the registry half (`nodeTyIsLitUnionStructural`) gives both ladders the arm. The field
+ladder's own neighbouring comment already says the softened spelling is a lie it has to read past
+("its SPELLING cannot say so"), so this removes the need for the lie rather than compensating for
+it. Both reps are the same bytes — `internAtom` is keyed by member TEXT and is module-global.
+
+### 2. THE MEASURED PROGRESSION
+
+| build | rc 0 -> non-zero | worst failure mode |
+|---|---|---|
+| preserve everywhere, ladders untouched (B36) | 17 | loud reject |
+| the ALIAS-ONLY fix (gate on shape, not position) | 4 | loud reject |
+| + param ladder taught structurally | 1 | loud reject |
+| + field ladder taught structurally | **2** | **INVALID WASM** |
+
+**The last row is the finding.** Teaching the second ladder took the count from 1 to 2 and changed
+the CLASS: `narrowed-litunion-consumption-forms.vl` stops being a reject and starts emitting a
+module that does not instantiate. Something downstream still builds the string form for a position
+the ladder now declares an atom.
+
+So B36's "the change can only turn a working program into a loud reject" is **false**, and it was
+false for the reason B36 itself should have anticipated: a valtype ladder does not lower anything,
+it only DECLARES. The construction, read and assign sites for those positions are separate, and
+moving the declaration without them is what produces a mismatch rather than a refusal.
+
+### 3. WHAT THIS ACTUALLY IS
+
+A multi-slice programme with a strict order:
+
+1. teach the two valtype ladders structurally — done above, and independently correct;
+2. move the CONSTRUCTION/READ/ASSIGN sites for a param- and field-position litunion onto the atom
+   rep, which is what the two residual files are asking for;
+3. only then flip `ctxKeepsLitUnion`, and delete it.
+
+Steps 1 and 2 are invisible to the render — they are pure rep work — and step 3 is the one that
+unblocks B24 and B35. **Nothing before step 3 pays a destringify dividend**, which is worth stating
+plainly: this is a prerequisite programme, not a slice of the current one.
+
+### 4. THE ALIAS-ONLY FIX IS SEPARABLE, AND STILL BLOCKED
+
+Gating the two renderers on the answer's SHAPE rather than the ctx (`|| !nameHasPipe(luiN)`) is
+what this file's own header asks for — "that gate belongs to the INLINE member list, never to an
+identifier" — and it closes a documented one-type-two-names defect. On its own it costs 4 files;
+with step 1 it costs 1. It is the smallest coherent piece and it still needs step 2.
+
+### METHOD NOTES
+
+* **A valtype ladder DECLARES; it does not lower.** Teaching one is half a rep change, and the
+  other half is every site that builds or reads that position. Pricing a rep change by counting
+  ladder rejects measures the declaration half only.
+* **Watch the failure CLASS across iterations, not just the count.** 17 -> 4 -> 1 -> 2 reads like
+  convergence; the class going reject -> invalid-wasm on the last step is the actual signal, and a
+  count alone would have hidden it.
+* **B36's "best possible failure mode" was a real observation about an incomplete change.** Loud
+  rejects are what an INCOMPLETE declaration produces; completing the declaration is what exposes
+  the missing lowering. The reassuring number came from the change being half-done.
