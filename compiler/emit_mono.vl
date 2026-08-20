@@ -29,6 +29,7 @@ import {
   recordClonedNodeTy,
   substTyDeep,
   tyHasTyVar,
+  tyIsUnionTy,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -1883,7 +1884,29 @@ function monoMakeInstance(
           const sub2 = substTyDeep(origRet, bN, bT)
           if sub2 >= 0 {
             if sub2 != origRet {
-              if !tyHasTyVar(sub2) { retTy = sub2 }
+              // NOT A UNION, and this exclusion is a REGRESSION FOUND AFTER SHIPPING, kept
+              // as the narrowest thing that closes it. `substTyDeep` does not NORMALISE the
+              // union it rebuilds, and the annotation path does: `T | string` at
+              // `T := string` substitutes to a two-member union of identical members, while
+              // `nameToTy("string|string")` collapses to plain `string` — the parser folds a
+              // degenerate union and the arena walk does not. Handing the un-collapsed union
+              // over recorded a union box on a binding whose instance returns a bare ref:
+              // `const r: string = f("a")` over `function f<T>(v: T): T | string` went from
+              // running to `vl check --codegen` rc 0 plus invalid wasm.
+              //
+              // The dual-run that licensed this hand-over compared RENDERS and counted the
+              // union cells among its 22 "differs only nominally" — which was the wrong
+              // reading: for a union the recorded TYPE is what picks the box, so a render
+              // that differs is not cosmetic there. The corpus could not correct me either
+              // (0 of 2,021 rows moved); no corpus program has a generic whose return union
+              // COLLAPSES under its binding.
+              //
+              // Unions are the only constructor with this folding step, so excluding them
+              // keeps every other shape converted. Re-widening this needs `substTyDeep` to
+              // fold a degenerate union the way `nameToTy` does, not a looser gate here.
+              if !tyIsUnionTy(sub2) {
+                if !tyHasTyVar(sub2) { retTy = sub2 }
+              }
             }
           }
         }
