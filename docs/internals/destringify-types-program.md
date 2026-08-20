@@ -43589,3 +43589,72 @@ that exists.
   r8's split was already implemented, inverted, in the arm predicate that reads it.
 * **A `""` that means both "absent" and "declined" is a defect generator.** It is the root of both
   UNSOUND rungs here.
+
+## B28 / D-PRIMNAME — the largest apparent target in the tree is not one: VL's own literal-union rep already made it an integer compare
+
+A sweep for whole-spelling scalar comparisons (`== "f64"`, `== "string"`, …) over the emitter
+returns dozens of sites, and they read exactly like the pattern #1511 converted. Most of them are
+**not targets**, and the reason bounds what is left of this programme.
+
+### 1. `PrimName` IS A LITERAL-UNION ALIAS, AND VL REPS THOSE AS INTERNED i32 ATOMS
+
+```
+export type PrimName = "i32" | "i64" | "f32" | "f64" | "boolean"
+  | "string" | "void" | "null" | "never"
+export type TyPrim = { primName: PrimName }
+```
+
+`vtKindOfType` (`emit_classify`) answers `"i32"` for a litunion alias, and the tree says so in a
+dozen places — *"its rep is the interned i32 ATOM, which is the default kind"*, *"its functype
+result reps as an i32 atom"*, *"the member literals build the i32 ATOM list"*.
+
+So `t.primName == "string"` **emits an integer comparison**. The spelling exists in the source
+and nowhere in the module. There is no string to eliminate.
+
+This is the compiler's own feature applied to itself: the destringify programme's goal is that the
+type system not do functional work on type SPELLINGS, and for this family VL's literal-union rep
+already achieved it — silently, years before the programme.
+
+### 2. THE DISTINCTION THAT DECIDES A SITE
+
+A site is a target when the compiler RENDERS a type to a spelling and then asks a question of the
+CHARACTERS: a substring scan, a `[]`-cut, a depth-aware `|` split, a re-parse. It is not a target
+when it compares an ATOM drawn from a fixed vocabulary, however string-shaped that atom looks in
+the source.
+
+By that test:
+
+| shape | target? | why |
+|---|---|---|
+| `t.primName == "f64"` | **no** | a `PrimName` atom — an i32 compare |
+| `vtKindOfType(ty) == "nulstr"` | **no** | `VKind` is a literal union too |
+| `fRetKind[li] == "struct"` | **no** | a string ENUM, already excluded at B16 |
+| `inm == "f64"` where `inm = inferRetNameOf(...)` | **YES** | a rendered composite spelling, compared whole (**this is what #1511 converted**) |
+| `arrElemNameRaw(nm) == "f64"` | **YES** | a `[]`-cut on a rendered name |
+| `strContains(nm, "=>")` | **YES** | a character scan |
+
+The `nodeScalarName` / `arrElemRep` family (`emit_base`) sits on the near side: both read the
+ARENA (`nodeTyWidenedRepName` / `nodeTyArrayElemRepName`) and compare the atom that comes back.
+The arena is the classifier and the atom is the answer — nothing is parsed.
+
+### 3. WHAT THIS LEAVES
+
+The remaining genuine targets are the ones the B22/B26/B27 census work already named, and they are
+composite-spelling consumers rather than scalar-atom ones: `synthRetAnnots`' 15-arm predicate
+ladder (specified in B26/B27, blocked on three unsound rungs), `buildFnMap`'s remaining
+array/map/union arms, `resolveShapeToNominal`'s render→struct-row bridge, and the
+`nameIsClosureElem` third arm whose narrowing B22 priced at 2 corpus modules.
+
+**The scalar tier is closed**, and it was mostly closed before the programme started.
+
+### METHOD NOTES
+
+* **Ask what the emitted MODULE does, not what the source looks like.** A comparison against a
+  quoted literal in VL source may be an integer compare in the wasm; `vtKindOfType` is where that
+  question is answered.
+* **A grep for `== "f64"` over-reports by roughly its whole result set.** The sweep that motivated
+  this entry returned dozens of sites and one of them (already converted) was a target.
+* **Evidence, honestly labelled**: this entry rests on the source (`PrimName`'s declaration,
+  `vtKindOfType`'s litunion arm, and the tree's own repeated statements of the rep), not on a
+  byte-level experiment — a size comparison of two toy modules was attempted and came back
+  inconclusive, because the toy's comparison const-folds and symbol names are stripped.
