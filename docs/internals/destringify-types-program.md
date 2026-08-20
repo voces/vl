@@ -44342,3 +44342,50 @@ with step 1 it costs 1. It is the smallest coherent piece and it still needs ste
 * **B36's "best possible failure mode" was a real observation about an incomplete change.** Loud
   rejects are what an INCOMPLETE declaration produces; completing the declaration is what exposes
   the missing lowering. The reassuring number came from the change being half-done.
+
+## B38 / D-CLOELEM — `nameIsClosureElem`'s consumers, measured: the arena and the name disagree on 7 files, and the arena is RIGHT — which makes it a behaviour change, not a conversion
+
+B22 named the three `arrLit*` consumers of `nameIsClosureElem` as the best sites-per-unit-of-work
+in its census and rated them TRIVIAL. B22 was then corrected (the predicate's third arm is a coarse
+`strContains(name, "=>")` that deliberately over-matches) and the slice was deferred. This measures
+it.
+
+### THE NUMBERS
+
+An arena-side sibling — `nodeTyArrayElemIsFunc`, `T.tys[elem] is TyFunc` plus the nullable-closure
+niche — probed against `nameIsClosureElem(nodeArrayElemName(arrIx))` at all three sites:
+
+**60 corpus files reach the predicate; 7 disagree.** The shapes are nested closure arrays:
+`((i32)=>f32)[]` standing as an ELEMENT, i.e. an array of arrays of closures. The name's third arm
+sees the `=>` and answers "closure cell"; the arena sees a `TyArray` element and answers "no".
+
+### THE ARENA IS RIGHT, AND THAT IS THE PROBLEM
+
+An array whose element is `((i32)=>f32)[]` is a nested LIST, not a closure cell — the arena's
+answer. So this is not a case where the two spellings of one question agree and the string one can
+be retired; **it is a case where the string answer is WRONG on 7 files and the conversion would
+change behaviour.**
+
+B22 recorded the same thing from the other side and phrased it exactly right: *"a wrong answer
+swapped for a differently-wrong answer is not this slice's business"* — because `arrLitElemKind`
+asks its nested-array rung BEFORE its union rung, so an un-claimed literal keys `i32[]` (kind 4)
+and forces a dead i32-list wrapper pair rather than reaching kind 2.
+
+So the slice needs a measurement of WHICH ANSWER IS CORRECT per site, not of whether the two agree —
+and the two consumers downstream of it (`arrLitElemKind`'s rung order, and the kind-2 union box)
+have to move together with it.
+
+### WHY THIS IS WORTH RECORDING RATHER THAN ATTEMPTING
+
+Every conversion this programme has shipped had the property that the arena and the name AGREE, so
+the change was provably inert and the argument could be about soundness rather than about
+correctness. This one does not have that property. It is a genuine defect report — 7 files
+classify a nested closure array as a closure cell — wearing the shape of a conversion, and it
+should be fixed as a defect with its own fixtures, not landed as a destringify slice.
+
+### METHOD NOTE
+
+* **A disagreement is not automatically a blocker OR a finding — check which side is right.** Nine
+  conversions in this programme rested on "0 disagreements". The first one that disagrees turns out
+  to be the string side being wrong, which is a better outcome than a blocker and a worse one than
+  a conversion: it is a bug with a known repro count and no owner.
