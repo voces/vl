@@ -16,6 +16,7 @@ import {
   nameIsParenSpanEnds,
 } from "./tyname"
 import {
+  bindGenWalk,
   flatConstOfNameProp,
   i32TyIx,
   litUnionAliasNameOfTy,
@@ -26,6 +27,8 @@ import {
   nodeTyMapName,
   nodeTyName,
   recordClonedNodeTy,
+  substTyDeep,
+  tyHasTyVar,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -172,6 +175,7 @@ import {
   structIndexOfExpr,
   synthTypeRef,
   synthTypeRefFb,
+  synthTypeRefTy,
 } from "./emit_classify"
 import {
   buildFnMap,
@@ -1815,7 +1819,54 @@ function monoMakeInstance(
               "` is not bound by any parameter",
           )
         }
-        nret = synthTypeRef(rs, -1)
+        // THE SUBSTITUTED TYPE, not a re-parse of the substituted NAME. `synthTypeRef` is
+        // `synthTypeRefTy(…, -1)` and -1 resolves the name — which mints a structurally
+        // identical `Ty` row, `nameToTy` not being hash-consed. This one site was 239 of the
+        // 452 remaining corpus re-parses and 117 of the 210 rows they minted: over half of
+        // the whole remaining cost, on one line.
+        //
+        // The answer is computed the way the CHECKER would. `monoBindFromAnn` and
+        // `monoSubstAnn` are hand-written STRING twins of `bindGenWalk` and `substTyDeep`,
+        // which already work on types; the input those needed was the ARGUMENT types, and
+        // `pinTys` (added by #1474 for a `$fnsig` pin) already carries them.
+        //
+        // GATED ON COMPLETENESS, and the gate is what makes it safe rather than merely
+        // agreeable. `substTyDeep` rebuilds only what CHANGED, so a parameter it could not
+        // bind is left in place and not reported — indistinguishable, at the result, from a
+        // full substitution. Ungated, the dual-run left a residue whose type RENDERS EMPTY:
+        // partly-substituted answers, which recorded as an instance's return type are simply
+        // wrong. `tyHasTyVar` separates them, and it fails toward the name path (its depth
+        // bound returns TRUE), so an unknown keeps master's behaviour.
+        //
+        // Measured over the corpus: 172 of 239 render IDENTICALLY to the string answer, 22
+        // differ, 45 are skipped by the gate. All 22 are the nominal-vs-structural class this
+        // programme keeps meeting — `P` against `{x:i32}`, `Pair<i32>` against
+        // `{a:i32,b:i32}` — and they are harmless here for the same reason as #1478: the
+        // hand-over changes the recorded TYPE and keeps the recorded NAME, so the local
+        // spelling every name-consumer reads is untouched.
+        let retTy = -1
+        const origRet = nodeTyIxOf(fn.fnRet)
+        if origRet >= 0 {
+          const bN: string[] = []
+          const bT: i32[] = []
+          let bi = 0
+          while bi < params.length {
+            const pp = P.nodes[params[bi]]
+            if pp is Param {
+              let at = -1
+              if bi < pinTys.length { at = pinTys[bi] }
+              bindGenWalk(nodeTyIxOf(pp.parType), at, bN, bT)
+            }
+            bi = bi + 1
+          }
+          const sub2 = substTyDeep(origRet, bN, bT)
+          if sub2 >= 0 {
+            if sub2 != origRet {
+              if !tyHasTyVar(sub2) { retTy = sub2 }
+            }
+          }
+        }
+        nret = synthTypeRefTy(rs, -1, retTy)
       }
     }
     // An UN-ANNOTATED return whose return expression is a value-call THROUGH a
