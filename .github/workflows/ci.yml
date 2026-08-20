@@ -267,7 +267,17 @@ jobs:
           # .cwasm sidecar publishes atomically, but the poll below is unbounded)
           # exits 124 into the .rc, so "Self-lint (result)" fails FAST with the log
           # instead of the whole job stalling until the workflow-level limit.
-          ( timeout 420 ./scripts/lint-self.sh > /tmp/lint-self.log 2>&1
+          #
+          # `set +e` FIRST, and it is the whole reason this reports anything useful.
+          # The step shell is `bash -e`, and a subshell INHERITS errexit — so on the
+          # one outcome this harness exists to report, a FAILING lint, the subshell
+          # aborted at the non-zero `timeout` and never reached the `echo`. The result
+          # step then polled a file that would never appear and blamed a "died without
+          # writing its rc" it had itself caused, burning the full 450s poll and hiding
+          # the diagnostics in an uncollected log. A real `prefer-const` finding was
+          # reported this way as an infrastructure hang.
+          ( set +e
+            timeout 420 ./scripts/lint-self.sh > /tmp/lint-self.log 2>&1
             echo $? > /tmp/lint-self.rc ) < /dev/null > /dev/null 2>&1 &
 
       # Fuzzing is NOT part of CI (2026-07-22): the pinned-seed rep-fuzz check is
@@ -342,10 +352,11 @@ jobs:
             sleep 1
           done
           if [ ! -f /tmp/lint-self.rc ]; then
-            echo "self-lint result never arrived after 450s — the backgrounded" >&2
-            echo "scripts/lint-self.sh subshell likely died without writing its" >&2
-            echo "rc file (it should have hit its own 'timeout 420' well before" >&2
-            echo "now)." >&2
+            echo "self-lint result never arrived after 450s. The subshell wraps" >&2
+            echo "lint-self.sh in 'timeout 420' and runs under 'set +e', so a" >&2
+            echo "failing OR hanging lint still writes its rc — reaching here" >&2
+            echo "means the subshell itself was killed. Partial log, if any:" >&2
+            cat /tmp/lint-self.log >&2 || true
             exit 1
           fi
           cat /tmp/lint-self.log

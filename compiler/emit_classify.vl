@@ -13104,6 +13104,46 @@ export function checkArrName(name: string) {
 // wrongly reject, so any name that call would ACCEPT must stay with it (it is the arm that
 // forces the list's heap types). Earlier arms already claimed the `string[]` / ref-array /
 // `f64[]` / `i64[]` / `f32[]` spellings, so those need no mention here.
+// True when `base` IS a declared type PARAMETER name. The membership test `genTyParamArr`
+// has always carried, lifted out so the SHAPE-field classifier can ask the same question
+// of a field's element — the asymmetry that predicate's own header names (#1218: "one
+// classifier taught half of a set its sibling already had whole") reproduced one layer
+// down, where the ARRAY annotation classifier knew type parameters and the SHAPE FIELD
+// one did not.
+//
+// Both declaration kinds, exactly as `genTyParamArr` documents them: a FuncDecl's names
+// (`genTyParamNames`, gathered by `collectA`'s pre-pass) and a generic type ALIAS's
+// (`gaeParams`, split back out by `gaeCollectDecls`).
+export function fnTyParamName(base: string) {
+  let i = 0
+  while i < genTyParamNames.length {
+    if genTyParamNames[i] == base { return true }
+    i = i + 1
+  }
+  false
+}
+
+export function genTyParamLeaf(base: string) {
+  if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
+  if fnTyParamName(base) { return true }
+  // The generic-ALIAS half. `gaeParams` stores the RAW parameter text per declaration
+  // ("T", "A,B"), so the split is `gaeSplitArgs` — the same cut `gaeEnsure` makes on the
+  // same column, not a second grammar. A program with no generic alias has an empty
+  // registry and this loop never runs.
+  let gi = 0
+  while gi < gaeBases.length {
+    const pnames: string[] = []
+    gaeSplitArgs(gaeParams[gi], pnames)
+    let pj = 0
+    while pj < pnames.length {
+      if pnames[pj] == base { return true }
+      pj = pj + 1
+    }
+    gi = gi + 1
+  }
+  false
+}
+
 export function genTyParamArr(name: string) {
   if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   // The array-name grammar at its two homes. The TEST stays in front of the CUT exactly as
@@ -13124,28 +13164,7 @@ export function genTyParamArr(name: string) {
   // documented one-level `[]` scope for the FuncDecl). What it removes is this arm
   // ANSWERING WRONG about a name that is plainly a type-parameter array. Every name the
   // peel newly claims was a hard emit error before it, so no working program moves.
-  const base = arrLeafNameOf(name)
-  let i = 0
-  while i < genTyParamNames.length {
-    if genTyParamNames[i] == base { return true }
-    i = i + 1
-  }
-  // The generic-ALIAS half. `gaeParams` stores the RAW parameter text per declaration
-  // ("T", "A,B"), so the split is `gaeSplitArgs` — the same cut `gaeEnsure` makes on the
-  // same column, not a second grammar. A program with no generic alias has an empty
-  // registry and this loop never runs.
-  let gi = 0
-  while gi < gaeBases.length {
-    const pnames: string[] = []
-    gaeSplitArgs(gaeParams[gi], pnames)
-    let pj = 0
-    while pj < pnames.length {
-      if pnames[pj] == base { return true }
-      pj = pj + 1
-    }
-    gi = gi + 1
-  }
-  false
+  genTyParamLeaf(arrLeafNameOf(name))
 }
 
 // The registered UNION the checker typed this array literal's ELEMENT as, or "" —
@@ -15026,6 +15045,37 @@ export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
 // descent rather than guess, and a root whose node the two collect-site gates reject
 // (canon rewrote the spelling, or the name mentions a generic-alias parameter) starts
 // at -1 by design.
+// True when any of a shape's field TEXTS is a FuncDecl type-parameter ARRAY — i.e. the
+// shape belongs to a GENERIC ORIGINAL and denotes no concrete struct.
+//
+// The ARRAY form ONLY, and the restriction is the SHADOW RULING, not caution. A parameter
+// that also names a real type binds nothing (`type Id = i32` beside `type ShapeId<Id>`
+// resolves the field to the BUILTIN — `genTyParamArr`'s header states the rule and
+// `generics/type-param-shadows-alias-through-constructors.vl` pins it at eight
+// constructors). `genTyParamArr` carries that guard as its `nameIsI32Array` /
+// `nameIsRefArray` arms; a BARE-name membership test has no such guard, and using one here
+// skipped `{a: Id}` — a shape whose field is a genuine `i32` — leaving the alias
+// application with no interned row.
+//
+// The bare form needs no arm regardless: `{g: T}` has never reached the type section, since
+// `monoArgTyName` declines a bare parameter and monomorphization rejects the call loudly.
+// The `T[]` form is the one that got through to a struct row.
+//
+// Shared by the two interners because they are the two roots that mint a struct row from a
+// shape spelling, and a row minted from either is equally un-substituted.
+function shapeFieldsRideTyParam(rawTexts: string[]) {
+  if genTyParamNames.length == 0 { return false }
+  let gp = 0
+  while gp < rawTexts.length {
+    const t = rawTexts[gp]
+    if nameIsArray(t) && !nameIsI32Array(t) && !nameIsRefArray(t) {
+      if fnTyParamName(arrLeafNameOf(t)) { return true }
+    }
+    gp = gp + 1
+  }
+  false
+}
+
 export function internInlineShapeTy(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
@@ -15035,6 +15085,30 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   const rawNames: string[] = []
   const rawTexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(nm), rawNames, rawTexts)
+  // A GENERIC ORIGINAL's inline shape (`function f<T>(v: { g: T[] })`) declares no
+  // concrete struct, exactly as a generic ALIAS declares none — so it must not be
+  // interned. The ARRAY annotation classifier has skipped the bare `T[]` form since
+  // #1218 (`collectA`'s `genTyParamArr` arm); the SHAPE FIELD one did not, and the
+  // element it resolved for `g` was the type PARAMETER read as a nominal name:
+  //
+  //   ·  no type named `T` in scope — the element resolved to "", leaving the field's
+  //      ref-list slot un-interned. `pushFieldStorage` then reads `rlWrapIdx[-1]`: an
+  //      out-of-bounds CRASH of the compiler (under `vl check --codegen` too), not the
+  //      loud reject that read is written to be.
+  //   ·  a REAL `type T` also in scope — the element resolved to THAT UNRELATED TYPE
+  //      and the field got a wrapper. `vl check --codegen` exits 0 and `vl run` reports
+  //      invalid wasm.
+  //
+  // Skipping is right for the same reason the alias half's is, and the reason is about
+  // WHO EMITS: the generic original is replaced by its instances and never emitted, and
+  // each instance re-runs this pass over its PINNED concrete names (`monomorphize`'s
+  // re-collect). So the shape that reaches the type section is the SUBSTITUTED one,
+  // interned from a spelling whose fields are all real types.
+  //
+  // Asked of the RAW split, ahead of the classifying loop, because that loop's first act
+  // on a field is to intern whatever is nested inside it — a row minted there could not
+  // be taken back by a later return.
+  if shapeFieldsRideTyParam(rawTexts) { return -1 }
   const names: string[] = []
   const codes: i32[] = []
   const texts: string[] = []
@@ -15400,7 +15474,7 @@ function shapeFieldSetIdOf(
 // the window is unreachable — the guard is structural rather than observed, which is
 // exactly when a watermark index needs one.
 function sSetLim(): i32 {
-  let n = sScanLim()
+  const n = sScanLim()
   let i = 0
   while i < n {
     if sFieldStart[i] + sFieldCount[i] > sFieldElemName.length { return i }
