@@ -44574,3 +44574,85 @@ softening, and at that moment it becomes necessary.
   measures clean.
 * **Measure the halves of a step before believing its price.** B37 measured two ladders together
   after a third change and got a number that belongs to neither of them alone.
+
+## B43 / D-SINKFIRST — B42 had the order backwards: the atom rep is broken at its sinks, so widening into it is a net loss (#1536, closed unmerged)
+
+B42 landed a matched ladder/recorder pair and argued it carefully: three shapes in the widened
+set, a build-differential proving the arm was load-bearing, a fixture whose arms failed three of
+four against the ladder-only build. Every one of those arguments survived adversarial review.
+The change was still a **net regression**, and it should not have been proposed.
+
+### 1. THE ONE PROGRAM THAT SETTLES IT
+
+```vl
+type R = { f: "ia" | "ib" }
+function main() {
+  const r: R = { f: "ia" }
+  const xs: string[] = []
+  xs.push(r.f)          // master: prints `ia`.  B42: invalid wasm, `check --codegen` exits 0.
+  print(xs[0])
+}
+```
+
+### 2. THE REP I WAS WIDENING INTO IS BROKEN AT ITS SINKS
+
+A literal union that reaches the field atom rep is **never widened back to a string** at some
+value sinks. This is visible on master today through the alias spelling, which is the one
+spelling that already reaches the atom rep:
+
+| sink, given `type K = "ka" \| "kb"` and `type R = { f: K }` | master |
+| --- | --- |
+| `xs.push(r.f)` into `string[]` | **check-clean invalid wasm** |
+| return through `string \| null` | **check-clean invalid wasm** |
+| store into `{[string]: string}` | loud type error |
+| return through `string` | works |
+| `"v=" + r.f` | works |
+
+The same value as a LOCAL or a PARAMETER pushes fine. So it is not a missing conversion in
+general — it is **per-sink plumbing at the field boundary**, and the engine says so in as many
+words: `local.set expected type (ref 2), found struct.get of type i32`.
+
+Widening the ladder recruits three more spellings into that rep. Zero programs are fixed; at
+least seven break. Pinned now as three `xfail-miscompile-` fixtures.
+
+### 3. I HAD THE EVIDENCE AND READ IT AS UNRELATED
+
+B42 §5 filed `xfail-miscompile-narrowed-litunion-param-string-return.vl` and called it
+"pre-existing **and independent**". Pre-existing, yes. Independent, no: it is *the same missing
+atom→string widening*, one position over. I found the prerequisite, wrote it down, labelled it a
+neighbour, and shipped the change it blocks.
+
+**The tell was in the sentence itself.** A defect one position over from the site you are
+changing, in the same rep, is a boundary of that rep — not a coincidence. "Independent" needs the
+same standard of proof as any other claim here, and I asserted it.
+
+### 4. THREE INSTRUMENTS, NONE OF WHICH COULD SEE THE POPULATION
+
+* **The fixture is green on master.** Reverting B42 entirely leaves it passing — it discriminates
+  the *intermediate* ladder-only build, not master-vs-branch. Its header asserts "AGREEMENT PLUS
+  REP" and nothing in the harness checks a rep.
+* **`rep-fuzz-check` cannot generate the set.** `scripts/fuzzgen.vl` emits literal unions only as
+  `type K<n> = "w1" | "w2"` and always refers to them by alias name. No bare inline union, no
+  narrowed one, ever. Citing it was vacuous — the `vl-rep-fuzz-gate` rule, applied to the wrong
+  question.
+* **"2 of 2038 rows" was corpus coverage, not change size.** I *measured* that those 2 files were
+  the entire reachable population and still reported the number as reassurance.
+
+B42 §4 said "a small population is a reason to write programs, not a reason to relax", and I then
+wrote programs that exercised the widened set's **construction and reads** — the sites I had
+changed — and none that exercised where its values FLOW. That is the refinement:
+
+### METHOD NOTES
+
+* **When you change a value's REPRESENTATION, the test population is its SINKS, not its sources.**
+  I enumerated shapes that reach the new rep. The defects were all in what consumes it. A rep
+  change is an edge, and I only tested one end of it.
+* **A neighbouring defect in the same rep is a PREREQUISITE until proven otherwise.** Calling one
+  "independent" is a load-bearing claim about a boundary, and it needs a constructed witness like
+  any other.
+* **"My argument survived review" and "my change is correct" are different findings.** Every
+  structural claim in B42 held up. The change was still wrong, because the claims were about the
+  half of the problem I had looked at.
+* **The order is: fix the sinks, THEN widen the ladder.** At that point the ladder change becomes
+  a strict improvement instead of a net loss. That is the next slice, and it is a rep-plumbing
+  slice, not a destringify one — the destringify step is blocked behind it.
