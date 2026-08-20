@@ -35,6 +35,12 @@
 //     rejects (shapes the checker accepts but the emitter has no rep for),
 //     which the checker-tier @error cannot pin. Exclusive with @run/@trap and
 //     with @error/@error-at (a checker reject never reaches emit).
+//   - @no-instantiate asserts the emitted module FAILS TO INSTANTIATE (the engine
+//     refuses it — a CompileError, not a VLRuntimeError). This is the MISCOMPILE
+//     tier: a well-typed program the checker is right to accept and the emitter
+//     lowers wrong, which `vl check` (even `--codegen`) cannot see and `@trap`
+//     explicitly rejects. An optional TEXT matches the engine's message.
+//     See tests/cases/soundness/README.vl, `xfail-miscompile-*`.
 //   - @trap asserts a runtime trap (a `VLRuntimeError` from `runWasm`) and
 //     matches MESSAGE substrings only. `line:col` trap substrings are skipped:
 //     they assert the source-map-located message, and the wasm pipeline does
@@ -131,6 +137,7 @@ type Directives = {
   hints: string[];
   logs: string[];
   trap: string[];
+  noInstantiate: string[];
   unknown: string[];
   skip: string | null;
 };
@@ -146,6 +153,7 @@ const parseDirectives = (src: string): Directives => {
     hints: [],
     logs: [],
     trap: [],
+    noInstantiate: [],
     unknown: [],
     skip: null,
   };
@@ -194,6 +202,10 @@ const parseDirectives = (src: string): Directives => {
       case "trap":
         d.mode = "run";
         d.trap.push(rest);
+        break;
+      case "no-instantiate":
+        d.mode = "run";
+        d.noInstantiate.push(rest);
         break;
       case "skip":
         d.skip = rest || "no reason given";
@@ -454,6 +466,44 @@ const assertCase = async (
       throw new Error(
         `@run but compileSrc rc=${r.rc}; diagnostics: ${fmtDiags(r.diags)}`,
       );
+    }
+    if (d.noInstantiate.length) {
+      // The MISCOMPILE tier. A well-typed program the checker is right to accept, whose
+      // emitted module the engine refuses to instantiate — `vl check --codegen` exits 0 and
+      // nothing below the runner can see it. `@trap` cannot pin this: it asserts a
+      // VLRuntimeError from a module that DID load, and rejects the CompileError this
+      // produces. See tests/cases/soundness/README.vl, `xfail-miscompile-*`.
+      let thrownNI: unknown;
+      try {
+        await runWasm(r.bytes);
+      } catch (err) {
+        thrownNI = err;
+      }
+      if (thrownNI === undefined) {
+        throw new Error(
+          "@no-instantiate expected the module to fail instantiation, but it ran",
+        );
+      }
+      if (thrownNI instanceof VLRuntimeError) {
+        throw new Error(
+          "@no-instantiate expected an instantiation failure, but the module " +
+            `loaded and trapped at runtime: ${(thrownNI as Error).message} ` +
+            "(use @trap for a runtime trap)",
+        );
+      }
+      for (const want of d.noInstantiate) {
+        if (!want) continue;
+        if (!matches((thrownNI as Error).message, want)) {
+          throw new Error(
+            `@no-instantiate message mismatch\n  expected to contain: ${
+              JSON.stringify(want)
+            }\n  actual:              ${
+              JSON.stringify((thrownNI as Error).message)
+            }`,
+          );
+        }
+      }
+      return;
     }
     if (d.trap.length) {
       let thrown: unknown;
