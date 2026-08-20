@@ -17,6 +17,12 @@
 # alias-application cells used a SCALAR-bodied alias (`{ v: X }`) where the hole needs an
 # ARRAY-bodied one (`{ v: X[] }`), so it was blind to the very bug it was written for.
 #
+# The constructor list GREW once, and should grow again the same way: the original twelve
+# reported 0 BAD while `{[string]: T}` — a map whose VALUE is a type parameter — was
+# check-clean invalid wasm and had been since long before the programme. A grid is only ever
+# evidence about the cells it contains. When a new hole is found by hand, add its constructor
+# here so the next run covers it.
+#
 # Usage:  scripts/mono-tyaram-grid.sh [OUTDIR] [COMPILER_WASM]
 #   OUTDIR         defaults to a mktemp dir
 #   COMPILER_WASM  defaults to build/vl-compiler.wasm; pass an older seed to sabotage
@@ -49,6 +55,20 @@ ctors = {
  "gaarr":    ("type BoxA<X> = { v: X[] }\n",      "BoxA<T>",             "{ v: [%V%] }","r.v.length"),
  "gaargarr": ("type BoxG<X> = { v: X }\n",        "BoxG<T[]>",           "{ v: [%V%] }","r.v.length"),
  "gapnul":   ("type BoxN<X> = { v: X | null }\n", "BoxN<T>",             "{ v: %V% }",  "1"),
+ # Added after the widened sweep that found the map-value hole: every one of these is a
+ # constructor the original twelve did not reach, and `mapval` is the cell that was BAD.
+ "twoparam": ("type Pr<A, B> = { a: A, b: B }\n",  "Pr<T, i32>",          "{ a: %V%, b: 1 }",   "1"),
+ "appofapp": ("type C<X> = { v: X }\n",            "C<C<T>>",             "{ v: { v: %V% } }",  "1"),
+ "apparr":   ("type C<X> = { v: X }\n",            "C<T>[]",              "[{ v: %V% }]",       "r.length"),
+ "arrapp":   ("type CA<X> = { v: X[] }\n",         "CA<T>",               "{ v: [%V%] }",       "r.v.length"),
+ "mapval":   ("",                                   "{[string]: T}",       "Map()",              "1"),
+ "unionpar": ("",                                   "T | i32",             "%V%",                "1"),
+ "nulapp":   ("type CN<X> = { v: X }\n",           "CN<T> | null",        "{ v: %V% }",         "1"),
+ "fnret":    ("",                                   "() => T",             "() => %V%",          "1"),
+ "arrfn":    ("",                                   "((T) => T)[]",        "[(x: T) => x]",      "r.length"),
+ "shapefn":  ("",                                   "{ f: (T) => T }",     "{ f: (x: T) => x }", "1"),
+ "deepshape":("",                                   "{ a: { b: { c: T } } }","{ a: { b: { c: %V% } } }","1"),
+ "arrnulapp":("type CX<X> = { v: X }\n",           "(CX<T> | null)[]",    "[{ v: %V% }]",       "r.length"),
 }
 n = 0
 for rname, lit in reps.items():
