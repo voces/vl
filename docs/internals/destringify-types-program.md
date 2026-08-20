@@ -42347,3 +42347,88 @@ descent deletion.
   conversion to the remaining arm". It moves one file to an invalid module, which simultaneously
   proves the harness is live and settles whether the containment is arbitrary. *Pick the sabotage
   that a reviewer would propose as the next slice.*
+
+## B9 / D-UNIONARM — the union-rejoin arm probed to a NEGATIVE, and a check-clean INVALID WASM found beside it
+
+The census shipped with #1474 ranked the remaining `monoSubstAnn` constructed-spelling arms:
+generic application 72, **union rejoin 43**, type-param array 39, function type 33, object shape
+23, `[]` run 8, grouping paren 6. #1475 took the generic-application arm. This is the union arm,
+and it is the first slice on this programme to come back **empty** — recorded because a negative
+that cost this much is worth exactly as much as a fix to whoever picks up the arm next.
+
+### 1. THE ARM IS SOUND AT EVERY SHAPE PROBED
+
+~25 shapes across param, return, local and alias-body positions, each `vl check --codegen` and
+`vl run` against master. Every union-typed generic PARAMETER is a loud reject
+(`monomorphize: unsupported argument type`, or `a nullable …` for `(T | null)[]`). Every RETURN
+and LOCAL position is correct: `T | null`, `T | string`, `A | B` over two parameters, a
+three-arm alias body `{ v: X | string | null }`, `T[] | null`, and an alias-applied union return
+`Opt<T>` all compile and run.
+
+### 2. THE REJOIN DOES BUILD MALFORMED SPELLINGS — AND FIXING THAT MOVES NOTHING
+
+Substitution can COLLAPSE a union, and the rejoin is a blind `a + "|" + b`:
+
+    `T | string` at `T := string`        ->  "string|string"
+    `T | i32`    at `T := i32`           ->  "i32|i32"
+    `T | null`   at `T := string | null` ->  "string|null|null"
+
+The SOURCE spelling of the first is legal and runs (`const v: string | string = "z"` prints `z`)
+because the parser/checker collapses it before anything interns it. A REBUILT spelling gets no
+such pass — this layer's documented hazard in its purest form, where the second key is not merely
+a second one but one nothing can read.
+
+A flatten-and-dedupe rejoin was implemented (split each substituted atom, dedupe by first
+occurrence so a non-collapsing union re-renders byte-identically, return the BARE atom when one
+survives). It changes emitted bytes — `847 -> 841` on the repro — and over a **16-cell grid**
+(4 union arms x 2 bindings x {return position, alias-body position}) it changed **0 outcomes**.
+**Not shipped.** Byte churn with no observable benefit is pure risk, and the fixture that would
+have justified it does not exist: the bug those spellings look like they should cause is real,
+but it is NOT caused by them (§3).
+
+### 3. THE REAL DEFECT NEXT DOOR — FILED, NOT FIXED
+
+    function f<T>(v: T): T | string { v }
+    const r = f("a")
+    print(r)
+
+`vl check --codegen` rc 0; `vl run` -> `type mismatch: expected (ref null $type), found (ref $type)`.
+
+**It needs BOTH conditions**, which is what makes it narrow and what refutes the obvious cause:
+
+| | inferred binding | annotated binding |
+|---|---|---|
+| union COLLAPSES (`T := string`) | **INVALID WASM** | correct |
+| arms stay DISTINCT (`T := i32`) | correct | correct |
+
+A non-generic `string \| string` binding is also correct, so it is not about the degenerate
+spelling as such. At the wasm level the global is declared `(mut (ref null 0))` where type 0 is
+the shared VALUE-UNION BOX `(struct (field i32) (field anyref))`, while the instance is
+`(param (ref 1)) (result (ref 1))` — a bare string. The binding was typed as a union box before
+monomorphization collapsed the union, and nothing re-typed it.
+
+**Three hypotheses tested and REFUTED**, each by building the compiler and re-running:
+the flatten/dedupe rejoin (§2) — changes the instance annotation, global unchanged; a
+generic-original guard on `emit_classify`'s binding classifier at the
+`tyNameOf(fn.fnRet)` / `isUName(rn)` arm — no change; and `registerInlineUnion`'s value-union
+arm, which does not admit `T | string` in the first place. The deciding site is none of these.
+
+**Not pinned as a fixture, deliberately.** `tests/cases/soundness/README.vl` is explicit that the
+`xfail-` kinds are load-bearing names, and this fits NEITHER: the program is well-typed and should
+run, so it is not `xfail-unsound-` (accepts too much), and it is not refused, so it is not
+`xfail-false-reject-` (rejects too much). It is a codegen bug on a valid program, a kind that
+directory has no slot for. Inventing a fourth prefix unilaterally is worse than filing it here.
+
+### METHOD NOTES
+
+* **A "0 outcomes moved" grid is the result, not a reason to ship anyway.** The flatten/dedupe fix
+  is *correct on its own terms* — a rebuilt spelling should be one the language can express — and
+  that is not sufficient. #1474 is the counter-case that makes this a judgement rather than a rule:
+  there, "byte-neutral" was wrong because the CORPUS could not contain the shape, and building the
+  shape by hand turned it into a check-clean-invalid-wasm fix. So the discipline is: build the shape
+  the change should fix BEFORE deciding it is neutral. Here that was done, and it stayed neutral.
+* **A malformed intermediate is not evidence of the bug beside it.** `string|string` looks exactly
+  like the cause of §3 and is not. The table of two conditions is what settled it — one axis
+  (annotated vs inferred) is orthogonal to the spelling entirely.
+* **Refuting three hypotheses is a report, not a failure.** Each one cost a compiler rebuild and a
+  re-run; naming them is what stops the next agent paying again.
