@@ -20936,6 +20936,13 @@ function nestedLeafListRetName(er: i32) {
 // union with a non-map/non-object member (an unrepresentable arm the box path rejects downstream).
 function mapUnionRetName(er: i32) {
   if er < 0 { return "" }
+  // THE MAP-SECOND CLAIM BELOW IS NOT IMPLEMENTED, and is left as a note rather than silently
+  // deleted: the body requires only `hasMap`, with no POSITION check, so `{w:i32}|{[string]:f32}`
+  // does render. That was invisible while `nameIsMapMemberUnion` (which does require map-first)
+  // stood between this producer and the pin; it does not any more, so the discrepancy is recorded
+  // here. It is behaviour-neutral — such a name registers and was already pinned through
+  // `isUName` — but the header should not be read as a guarantee.
+  //
   // A NULLABLE map-member union (`{[string]: boolean} | i32 | null`) normalizes to
   // TyNullable over the union — unwrap it for the member gate; the render keeps the
   // full `…|null` spelling (`tyToEmitName(er)`), which `synthRetAnnots`'s nullable
@@ -20954,9 +20961,13 @@ function mapUnionRetName(er: i32) {
     // as its value atom, exactly as in the variant-box unions). A litunion /
     // array / closure / nullable member declines — those stay on their own paths.
     let hasMap = false
+    // NON-NULL COUNT — `TY_NULL` is a `TyPrim`; see the gate after the loop.
+    let muNonNull = 0
     let i = 0
     while i < members.length {
       const m = T.tys[members[i]]
+      // The NON-NULL count, taken before the shape arms so it narrows nothing.
+      if !tyIsPrimNamed(members[i], "null") { muNonNull = muNonNull + 1 }
       if m is TyMap {
         hasMap = true
       } else if !(m is TyObj) {
@@ -20965,6 +20976,11 @@ function mapUnionRetName(er: i32) {
       i = i + 1
     }
     if !hasMap { return "" }
+    // AT LEAST TWO NON-NULL MEMBERS — the `refArmUnionRetName` guard's twin, for the same reason
+    // and the same shape. `null|{[string]:f32}` reached here with one real member, and
+    // `registerInlineUnion` diverts such a name to `registerMapValUnion` on its non-null part
+    // rather than pushing the composite, so nothing registers it.
+    if muNonNull < 2 { return "" }
     return irRendered(tyToEmitName(er))
   }
   ""
@@ -20992,10 +21008,16 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
     // Structural pre-gate BEFORE any render (the #494 discipline): every member an
     // object or an array-of-object, at least one array.
     let hasList = false
+    // NON-NULL COUNT, because `TY_NULL` is a `TyPrim` and the scalar-sibling arm below admits
+    // one. See the `>= 2` gate after the loop.
+    let rauNonNull = 0
     let hasObjSibling = false
     let gi = 0
     while gi < members.length {
       const m = T.tys[members[gi]]
+      // The NON-NULL count, taken before the shape arms so it cannot narrow `m` out from under
+      // the `!(m is TyPrim)` scalar-sibling arm below.
+      if !tyIsPrimNamed(members[gi], "null") { rauNonNull = rauNonNull + 1 }
       if m is TyArray {
         // The HOLE declines with every other non-object element (`tyArrayElemIx`): an
         // arm whose element the arena has not resolved carries `aElem == -1`, and
@@ -21018,6 +21040,19 @@ function refArmUnionRetName(er: i32, stmts: i32[]) {
       gi = gi + 1
     }
     if !hasList { return "" }
+    // AT LEAST TWO NON-NULL MEMBERS, which the `members.length >= 2` gate above does NOT imply:
+    // `TY_NULL` is a `TyPrim`, so the scalar-sibling arm admits it and `S[] | null` reached here
+    // with one real member. That name is NOT registrable — `registerInlineUnion` diverts a
+    // `<refarray>|null` to its non-null part and never pushes the composite, and
+    // `isVariantBoxUnionAtoms` would decline it at `nonNull >= 2` anyway — so a consumer that
+    // pins off THIS producer's rung would pin against a union with no box.
+    //
+    // The sibling `variantBoxUnionRetName` already carries the equivalent guard, added when the
+    // same shape was traced there: `flattenVariantsInto` re-materialises `null` as a SIBLING
+    // member and `joinRetTys` mints `mkUnionTy` with no `hasNull` fold, so the arena really does
+    // hold `TyUnion[X, null]` post-substitution. This is that guard, at the producer that was
+    // missing it.
+    if rauNonNull < 2 { return "" }
     let name = ""
     let i = 0
     while i < members.length {
@@ -21832,6 +21867,46 @@ export function inferRetRungIsParenUnionElemList(i: i32): boolean {
   if r == IR_RUNG_ELEM_MAP_UNION_LIST { return true }
   if r == IR_RUNG_ELEM_REFARM_VU_LIST { return true }
   if r == IR_RUNG_NUL_CLOSURE_ELEM_LIST { return true }
+  false
+}
+
+// ARM 1's set — every producer whose render is a UNION the emitter boxes, by any of the four
+// routes that arm's disjunction covered. Eight rungs.
+//
+// THIS ONE REMOVES A CROSS-PASS DEPENDENCE, which the others do not. For rungs 5, 21 and 22 the
+// old disjunction reduced to `isUName(ctx)` ALONE — a lookup in the module's union REGISTRY, so
+// the pin depended on a chain that runs in a LATER pass: `collectU`'s inferred-return loop ->
+// `registerInferRetNominalUnion` (gated on the banked atom width >= 2) -> `registerInlineUnion`
+// -> `isVariantBoxUnionAtoms`, which needs >= 1 struct/ref-array/map atom AND >= 2 NON-NULL
+// members. (Rung 23 is NOT in that group: its litunion-regroup outputs — `K0|i64` — are claimed
+// by `nameIsLitUnionArmValueUnion`, for which `isValueUnionName` and `isUName` are both false.
+// An earlier draft of this comment credited that predicate to rung 4, which is wrong: rung 4 is
+// gated by `isValueUnionName` and never needed it.)
+//
+// THE CHAIN DID NOT CLOSE FOR 21 AND 22 UNTIL THIS SLICE, and saying it did was the error a
+// review caught. `mapUnionRetName` and `refArmUnionRetName` gated on `members.length >= 2` and
+// `hasMap`/`hasList` and counted NO non-null members — and `TY_NULL` is a `TyPrim`, so both
+// admitted it. `S[] | null` and `null | {[string]:f32}` therefore reached those producers with
+// ONE real member, are not registrable (`registerInlineUnion` diverts such a name to its non-null
+// part and never pushes the composite), and would have been pinned here against a union with no
+// box. Both producers now carry the `>= 2 non-null` gate their sibling `variantBoxUnionRetName`
+// already had, so the chain closes BY CONSTRUCTION rather than by survey.
+//
+// AND IT REMOVES A SAFETY NET, which is the honest cost. `isUName` doubled as an INTERLOCK: "pin
+// only a union the emitter actually registered". Where the chain declines, the row reaches no arm
+// and stays un-pinned; after this it is pinned against a union with no `uBox`. Not observable
+// today — the four contracts and `isVariantBoxUnionAtoms` agree — but the failure mode on the
+// first divergence changes from "silently un-pinned" to "pinned at a shape with no box".
+export function inferRetRungIsBoxedUnion(i: i32): boolean {
+  const r = inferRetRungAt(i)
+  if r == IR_RUNG_VALUE_UNION { return true }
+  if r == IR_RUNG_LITUNION_ARR_VU { return true }
+  if r == IR_RUNG_STRUCT_UNION { return true }
+  if r == IR_RUNG_CLO_ARM_VU { return true }
+  if r == IR_RUNG_MAP_UNION { return true }
+  if r == IR_RUNG_REFARM_UNION { return true }
+  if r == IR_RUNG_VARIANT_BOX { return true }
+  if r == IR_RUNG_LITUNION_ALIAS { return true }
   false
 }
 

@@ -16,6 +16,7 @@ import {
 import {
   inferRetNameByNode,
   inferRetRowByNode,
+  inferRetRungIsBoxedUnion,
   inferRetRungIsLitUnionElemList,
   inferRetRungIsMapElemList,
   inferRetRungIsNestedElemUnionList,
@@ -23,10 +24,8 @@ import {
   inferRetRungIsNullable,
   inferRetRungIsParenUnionElemList,
   inferRetTyIxByNode,
-  isValueUnionName,
   litUnionAliasNameOfTy,
   mkArrayTy,
-  nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nodeTyIsLitUnionAlias,
   nodeTyIsNullable,
@@ -87,7 +86,6 @@ import {
   nameIsF32Array,
   nameIsF64Array,
   nameIsI64Array,
-  nameIsMapMemberUnion,
   nameIsStructWithLitUnionField,
   nameIsStructWithMapField,
   nameIsStructWithUnionField,
@@ -100,7 +98,6 @@ import {
   drwFieldClosure,
   exprIsClosure,
   fnIndexOf,
-  isUName,
   nameIsWholeSpanShape,
   resolveShapeToNominal,
   sFieldIndex,
@@ -535,16 +532,23 @@ export function synthRetAnnots() {
           // answer from the name that producer built. See the nullable arm below for the first
           // arm converted; the rest are specified in the destringify programme's B26/B27.
           const ctxRow = inferRetRowByNode(lamIx)
-          // `nameIsLitUnionArmValueUnion`: a value union with a litunion-ALIAS arm
-          // (`K0 | i64`) never registers as a union alias (`isUName` false — the box
-          // is the value box, its alias arm the string atom), but the pinned TypeRef
-          // lowers exactly like the annotated named-function spelling, so pin it too.
-          if (
-            isUName(ctx) ||
-            isValueUnionName(ctx) ||
-            nameIsLitUnionType(ctx) ||
-            nameIsLitUnionArmValueUnion(ctx)
-          ) {
+          // ASKED OF THE RUNG. This four-way disjunction was the ladder's largest name test, and
+          // for four of its eight rungs it reduced to `isUName(ctx)` ALONE — a lookup in the
+          // module's union REGISTRY, filled by a LATER pass. So the pin depended on
+          // `collectU`'s inferred-return loop reaching `registerInlineUnion`, and asking the
+          // producer instead removes that cross-pass dependence entirely. See
+          // `inferRetRungIsBoxedUnion` for the chain, and for the safety net this trades away.
+          //
+          // MEASURED: 73 corpus files reach this arm, ALL EIGHT rungs exercised (3:27 · 4:4 ·
+          // 5:10 · 20:5 · 21:15 · 22:6 · 23:59 · 27:31 rows), no ninth rung reaches it, 0
+          // disagreements against the ladder position computed both ways.
+          //
+          // The `nameIsLitUnionArmValueUnion` disjunct it replaces was there because a value
+          // union with a litunion-ALIAS arm (`K0 | i64`) never registers as a union alias — the
+          // box is the value box, its alias arm the string atom — yet the pinned TypeRef lowers
+          // exactly like the annotated spelling. That case is rung 4, and it needs no special
+          // clause once the question is which producer answered.
+          if inferRetRungIsBoxedUnion(ctxRow) {
             // A litunion ALIAS return (`(i32) => K = (x) => "b"`, recorded by the checker's
             // return adoption): pin `fnRet` to the alias so the lambda's `$fnsig` result keys
             // the i32 atom (`vtKindOfType` → `>i`) matching the value call, and `emitReturnValue`
@@ -574,11 +578,20 @@ export function synthRetAnnots() {
             // for the annotated form; this routes the anonymous lambda through it. (Nullable dual of
             // the union pin.)
             fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
-          } else if nameIsMapMemberUnion(ctx) {
-            // A MAP-MEMBER-UNION return (`{[string]:f32} | {w:i32}`): the `$fnsig` result keys the
-            // union box (`>u`) and `emitReturnValue` boxes the struct/map arm through the #865/#868
-            // map-union rep, matching the value call's key. (Map-union dual of the value-union pin.)
-            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
+            // THE MAP-MEMBER-UNION ARM IS GONE, and its deletion is load-bearing rather than tidy.
+            // It read `nameIsMapMemberUnion(ctx)` and pinned `{[string]:f32} | {w:i32}` with a body
+            // IDENTICAL to arm 1's. Only `mapUnionRetName` (rung 21) can render such a name — no
+            // other producer emits a `{[`-leading name with >= 2 top-level atoms, and the
+            // `recordable` fall-through cannot (`isObjShapeName` rejects a top-level `|`) — and
+            // rung 21 is in arm 1's set above.
+            //
+            // KEEPING IT WOULD MASK A DEFECT. Since the bodies are identical, this arm can only
+            // ever fire when arm 1's rung set MISSED a row it should have claimed — and it would
+            // paper over that silently by pinning anyway. Deleted so that a gap in arm 1's set
+            // shows up as an un-pinned row rather than as nothing at all.
+            //
+            // Measured before deleting: 0 corpus files reach it.
+          } else if inferRetRungIsParenUnionElemList(ctxRow) {
             // MEASURED THE WAY ARM 2's CONVERSION IS, because nine rungs at once is where a bare
             // agreement count stops meaning anything: 16 corpus files reach this arm; ALL NINE
             // contributing rungs are exercised (8:2 · 9:5 · 10:3 · 11:14 · 12:3 · 13:11 · 14:2 ·
@@ -586,11 +599,10 @@ export function synthRetAnnots() {
             // position computed both ways. The middle two clauses are what make the last one
             // mean something.
             //
-            // ARM 3 IS THE LAST UNCONVERTED NAME TEST ABOVE THIS ONE. Every rung here declines it
-            // (`nameIsMapMemberUnion` needs a leading `{[`, and all nine render a `(`-leading
-            // array), but converting arm 3 changes which rungs can REACH arm 4, so every
-            // equivalence above has to be re-argued at that point rather than assumed.
-          } else if inferRetRungIsParenUnionElemList(ctxRow) {
+            // EVERY ARM ABOVE THIS ONE IS NOW A RUNG TEST. Arm 3 (`nameIsMapMemberUnion`) used to
+            // sit here and was deleted with arm 1's conversion — every rung in this set declined
+            // it anyway (it needs a leading `{[`, and all nine render a `(`-leading array), so
+            // nothing in this set moved when it went.
             // An ELEMENT-VALUE-UNION list return (`(f64|null)[]`, `(i32|null)[]`, `(i64|boolean)[]`,
             // `(i64|string)[]`): `emitReturnValue` seeds each element through the value-union-box
             // list rep (`refArrElemKind == 2`). `parenUnionArrElemName` extracts the box element (a
