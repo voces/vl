@@ -42432,3 +42432,67 @@ directory has no slot for. Inventing a fourth prefix unilaterally is worse than 
   (annotated vs inferred) is orthogonal to the spelling entirely.
 * **Refuting three hypotheses is a report, not a failure.** Each one cost a compiler rebuild and a
   re-run; naming them is what stops the next agent paying again.
+
+## B10 / D-TPGRID — the four remaining arms probe CLEAN across a 108-cell grid, and the grid's first version was BLIND
+
+After #1475 the census's remaining arms were type-param array 39, function type 33, object
+shape 23, `[]` run 8, grouping paren 6 — 109 constructed spellings. All four probe clean.
+The result worth keeping is not that number; it is what it took to make the number mean
+anything.
+
+### 1. THE GRID
+
+`scripts/mono-tyaram-grid.sh` — 12 constructors a type parameter can sit behind x 3 reps
+(i32 / string / f64) x 3 positions (return, local, parameter) = **108 cells**. Constructors:
+bare `T`, `T[]`, `T[][]`, `{ a: T }`, `{ g: T[] }`, `{ g: (T | null)[] }`, `T | null`,
+`(T) => T`, `BoxS<T>` (scalar-bodied alias), `BoxA<T>` (array-bodied alias), `BoxG<T[]>`
+(array ARGUMENT), `BoxN<T>` (nullable-bodied alias).
+
+Buckets: OK, REJECT (a loud diagnostic — acceptable, the feature simply is not supported),
+BAD (check-clean invalid wasm, or an out-of-bounds compiler crash). **Only BAD is a defect.**
+
+Current master: **75 OK, 33 REJECT, 0 BAD.**
+
+### 2. THE FIRST GRID REPORTED 0 BAD AGAINST A COMPILER THAT HAD THE BUG
+
+This is the finding. The first version ran against the pre-#1475 seed — which contains the
+alias-application hole that PR closed — and returned **51 OK / 21 REJECT / 0 BAD**, identical
+to its run against fixed master. It was blind, and it was blind for a reason that reads as a
+detail: its alias-application cell used a **scalar**-bodied alias `type Box<X> = { v: X }`,
+while the hole needs an **array**-bodied one `type Box<X> = { v: X[] }`. One constructor
+character apart.
+
+A second defect compounded it: the parameter column was generated with
+`build.replace("v", literal)`, which also rewrote the FIELD NAME — every parameter cell was
+`print(f({ 1: [1] }))`, malformed source that rejects for a reason having nothing to do with
+the compiler. 36 of 108 cells were measuring the generator.
+
+With both fixed the sabotage fires: **6 BAD** under the pre-#1475 seed, exactly
+`par_gaarr_*` and `par_gaargarr_*` across all three reps — precisely the two spellings #1475
+closed, recovered independently by a tool that knew nothing about them.
+
+### 3. WHAT THIS SAYS ABOUT THE LAYER
+
+The monomorphization layer, after #1473 / #1474 / #1475, has **no remaining check-clean
+invalid-wasm hole reachable by this grid**. The 33 REJECT cells are capability limits, not
+soundness ones — a generic over a struct argument, a bare `T` parameter, a grouped
+`(T | null)` parameter — each a loud, positioned diagnostic.
+
+That does not mean the arms are converted. It means the remaining conversion work is
+REFACTORING (carry an arena type instead of rebuilding a spelling) with no soundness payoff
+attached, which is a different and much weaker case for spending bytes — see B9's rejected
+flatten/dedupe for what that looks like when it is measured honestly.
+
+### METHOD NOTES
+
+* **A grid that reports 0 BAD has said nothing until it has reported BAD.** The sabotage is
+  not a footnote on the tool, it is the tool's precondition, and it belongs IN the script —
+  `mono-tyaram-grid.sh` takes an older seed as `$2` and documents which six cells must come
+  back BAD. A grid whose sabotage stops firing has drifted off its class and is worth less
+  than no grid, because it reads as evidence.
+* **The blindness was one character of the constructor.** `{ v: X }` versus `{ v: X[] }`. When
+  a grid is built to cover a class of bug ALREADY FIXED, generate the cells from the fixed
+  bugs' own spellings rather than from a mental model of the class.
+* **Check the generator before the results.** A naive `replace` on a one-letter identifier hit
+  the field name as well as the value, and the symptom — a third of the grid rejecting — looks
+  exactly like a compiler being conservative. Read one generated cell.
