@@ -70,6 +70,7 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyIsI32,
   nodeTyName,
+  tyArrayElemPrimName,
   tyIsLitUnion,
   tyNomNameCycled,
   tyToNominalName,
@@ -1317,32 +1318,53 @@ export function buildFnMap(_stmts: i32[]) {
         // `nameIsStringArray`, because those are REP-wide — they also accept `boolean[]`, a
         // litunion `K[]`, `(boolean|null)[]`, `(K|null)[]` — and those share a BACKING, not a
         // `fRetKind`. So this accepts exactly the five element names the cut admits and nothing
-        // else. A `boolean` element is a `TyPrim` too and deliberately has NO arm (boolean rides
-        // i32, so it belongs to the default); admitting it would be #1511's i32 trap repeated
-        // one constructor out, and the guard here is what stops that.
+        // else.
+        //
+        // A `boolean` ELEMENT IS THE TRAP — #1511's i32 trap one constructor out. `boolean[]` is a
+        // `TyArray` of `TyPrim`, so an arena test written the obvious way claims it, while the
+        // cascade deliberately gives it NO arm (boolean rides i32, so it belongs to the default).
+        // The first version of the probe here did exactly that.
+        //
+        // THE WHITELIST IS NOT WHAT MAKES TODAY'S CONVERSION SOUND, and saying otherwise would
+        // overstate it: the `boolean[]` population is currently EMPTY. No recorder rung banks such
+        // a row — `isClassifiableRetName` cuts to `"boolean"` and rejects, `isScalarListRetName`
+        // admits only i64/f32/f64, and no `unm` rung takes a bare `TyPrim` element — so `retTyIx`
+        // is -1 and `retElem` is "" with or without it. The whitelist protects against a future
+        // widening of a gate 20k lines away, and is kept for exactly that.
+        //
+        // THE BRANDED-ELEMENT HAZARD, the array form of #1511's FALSE #2: `type NF = new f64` used
+        // as `NF[]` IS a `TyArray` of `TyPrim f64` in the arena, while `tyToStrGo` renders it
+        // `NF[]` and the cut declines. Inert for the same reason — no rung banks it. Add an array
+        // rung that banks a bare `TyArray(TyPrim)`, or widen either gate, and these arms begin
+        // firing where the name arms did not.
+        //
+        // AND FALSE #1 one constructor out: a one-member `TyUnion` element renders BARE, so
+        // `type S = f64` used as `S[]` renders `f64[]`. Closed twice over — `singleAliasMemberTyIx`
+        // collapses a `TyPrim` member unconditionally, and every residue it declines (a `TyLit`
+        // member, a canonicalised intersection `TyObj`, a non-scalar-spine `TyArray`) renders as
+        // something that is not a bare prim name.
         //
         // The recorded ARRAY type is read off the same row the name came from, so the two cannot
         // select different rows — see the `inRow` note above.
         //
         // Measured: 13 corpus files reach these arms, all five element kinds exercised, 0
-        // disagreements. 13 is a THIN population and is reported as such — what makes the
-        // conversion safe is the narrowness above, not the count.
+        // disagreements — AND THE CORPUS COULD NOT HAVE CONTAINED ONE, for the same reason
+        // #1511's 0/177 could not: the only shapes that disagree (branded element, one-member
+        // union element) are never banked, so they are absent from both columns regardless. What
+        // makes the conversion safe is the argument above, not the count.
+        //
+        // The population also splits: `i32[]`/`string[]` reach these arms from BOTH the named and
+        // the lambda recorder, while `f64[]`/`i64[]`/`f32[]` reach them ONLY through the anonymous
+        // lambda's `isScalarListRetName` rung — `isClassifiableRetName` gates named functions out,
+        // which `wasmEmit`'s f32 reject already relies on.
         let retElem = ""
-        if retTyIx >= 0 {
-          const rat = T.tys[retTyIx]
-          if rat is TyArray {
-            if rat.aElem >= 0 {
-              const rae = T.tys[rat.aElem]
-              if rae is TyPrim {
-                if rae.primName == "i32" { retElem = "i32" }
-                if rae.primName == "string" { retElem = "string" }
-                if rae.primName == "f64" { retElem = "f64" }
-                if rae.primName == "i64" { retElem = "i64" }
-                if rae.primName == "f32" { retElem = "f32" }
-              }
-            }
-          }
-        }
+        const raePrim = tyArrayElemPrimName(retTyIx)
+        const raeOk = raePrim == "i32" ||
+          raePrim == "string" ||
+          raePrim == "f64" ||
+          raePrim == "i64" ||
+          raePrim == "f32"
+        if raeOk { retElem = raePrim }
         if retPrim == "string" {
           fRetKind[li] = "str"
         } else if retPrim == "i64" {
