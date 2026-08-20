@@ -34,6 +34,21 @@ file; the lexer/parser are the grammar.
   - After a `compiler/*.vl` change: `scripts/refresh-compiler.sh` (rebuild the seed),
     `scripts/native-fixpoint.sh` (byte-exact self-compile), `scripts/lint-self.sh`
     (self-lint + fmt-check) — the CI `ci-native` job runs all three.
+  - **Two gates CI does NOT run, because both are deterministic and the project entombs
+    findings as `tests/cases/` fixtures rather than re-proving them per PR.** They are the
+    local pre-push gate and they are not optional for the changes they cover:
+    - `bash scripts/rep-fuzz-check.sh` — **after any rep / interner change.** Corpus
+      byte-identity, the suites and the fixpoint are ALL blind to the transition it exists
+      for (a program that was REJECTED starting to MISMATCH). It is the only channel that
+      has ever caught that, and it caught a shipped one.
+    - `scripts/mono-tyaram-grid.sh` — **after any change to generics, monomorphization or
+      type-parameter classification.** 216 cells (24 constructors x 3 reps x 3 positions);
+      only a `BAD` cell is a defect (`REJECT` is an unsupported feature failing loudly).
+      Pass an older seed as `$2` to sabotage it — 13 cells MUST come back BAD against a
+      pre-#1475 seed, and a grid whose sabotage stops firing is worth less than no grid.
+      Its constructor list is meant to GROW: when a hole is found by hand, add its
+      constructor (that is how the `{[string]: T}` map-value hole was closed — the previous
+      twelve constructors reported 0 BAD while it was live).
 - **Run / build / check / fmt a file:** the native `vl` binary (`scripts/vl-host`, built with
   `cd scripts/vl-host && cargo build --release`): `vl run <file.vl>` (also `-e "<src>"` / stdin /
   a prebuilt `.wasm`) · `vl build <file> [-o out.wasm]` · `vl check <path>` · `vl fmt <file> [-w|--check]`.
