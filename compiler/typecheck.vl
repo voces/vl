@@ -1673,6 +1673,18 @@ const IR_RUNG_STRUCT_UNION = 5
 const IR_RUNG_NULLABLE = 6
 const IR_RUNG_NUL_LITUNION = 7
 const IR_RUNG_NUL_ELEM_LIST = 8
+// `nulElemListRetName` IS TWO PRODUCERS IN ONE BODY, and this is the second. Its numeric leg
+// (`(f64|null)[]` &c) renders a value-union box and is claimed by `synthRetAnnots`' arm 4; its
+// NICHE legs (`(boolean|null)[]`, `(string|null)[]`, `(K|null)[]`) render shapes that arm's
+// predicate deliberately REJECTS — `parenUnionArrElemName` carries the same three-way split,
+// inverted, in its `nameIsNulBool` / `nameIsNulString` / `nameIsNulLitUnion` guards — so they
+// reach no arm at all and stay unpinned.
+//
+// B26 called this "the one producer whose output does not determine the consumer's arm" and said
+// it needed its own discrimination. B27 corrected that: the discrimination already exists, in the
+// consumer, and all this needs is for the two legs to say which they are. Splitting the code is
+// the whole fix.
+const IR_RUNG_NUL_ELEM_LIST_NICHE = 29
 const IR_RUNG_NUL_STRUCT_ELEM_LIST = 9
 const IR_RUNG_NUL_MAP_ELEM_LIST = 10
 const IR_RUNG_NUL_LIST_ELEM_LIST = 11
@@ -1710,6 +1722,15 @@ let inferRetRung: i32[] = []
 // the producers have side effects (several register unions) and must not be called eagerly.
 function irRung(rung: i32, nm: string): string {
   if nm != "" { inferRetNameRung = rung }
+  nm
+}
+
+// `irAtoms` for a producer that reports its own RUNG — used where one function body is really two
+// producers and the cascade's single `irRung` wrap cannot tell them apart. The cascade must NOT
+// also wrap such a producer, or its code would overwrite the leg's.
+function irAtomsRung(nm: string, atoms: i32, rung: i32): string {
+  inferRetNameAtoms = atoms
+  inferRetNameRung = rung
   nm
 }
 
@@ -18137,9 +18158,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // above) — record its emitter name so `synthRetAnnots` pins the lambda's `fnRet` as
         // the value-union-box list, whose `[null]` element seeding `emitReturnValue` already
         // performs for the annotated form.
-        if unm == "" {
-          unm = irRung(IR_RUNG_NUL_ELEM_LIST, nulElemListRetName(inferred))
-        }
+        if unm == "" { unm = nulElemListRetName(inferred) }
         // An ELEMENT-NULLABLE-STRUCT list contextual return (`() => (S | null)[]`, adopted
         // just above) — record its canonical emit name so `synthRetAnnots` pins the lambda's
         // `fnRet` as the nullable-struct-element list (its `parenUnionArrElemName` arm), whose
@@ -20264,17 +20283,35 @@ function nulElemListRetName(er: i32) {
       // it is still spelled into the result, but the DECISION is structural.
       const inner = tyPrimNameOf(et.nInner)
       if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
-        return irAtoms("(" + primNameStr(inner) + "|null)[]", 1)
+        // THE BOX LEG — a value union, claimed by `synthRetAnnots`' arm 4.
+        return irAtomsRung(
+          "(" + primNameStr(inner) + "|null)[]",
+          1,
+          IR_RUNG_NUL_ELEM_LIST,
+        )
       }
       // The NICHE leaves: `(boolean|null)[]` (i32 sentinel-2 list), `(string|null)[]`
       // (string-ref list with `ref.null` elements), `(K|null)[]` (i32 atom list with the
       // `-1` sentinel, rendered by its ALIAS). Each rides an existing non-box list rep the
       // annotated return already lowers; the pin routes the anonymous lambda through it.
       if inner == "boolean" || inner == "string" {
-        return irAtoms("(" + primNameStr(inner) + "|null)[]", 1)
+        // A NICHE LEG — arm 4's `nameIsNulBool` / `nameIsNulString` guards reject these, and no
+        // later arm claims them, so they are recorded and left UNPINNED.
+        return irAtomsRung(
+          "(" + primNameStr(inner) + "|null)[]",
+          1,
+          IR_RUNG_NUL_ELEM_LIST_NICHE,
+        )
       }
       const alias = litUnionAliasNameOfTy(et.nInner)
-      if alias != "" { return irAtoms("(" + alias + "|null)[]", 1) }
+      if alias != "" {
+        // The third leg, and a niche for the same reason (`nameIsNulLitUnion`).
+        return irAtomsRung(
+          "(" + alias + "|null)[]",
+          1,
+          IR_RUNG_NUL_ELEM_LIST_NICHE,
+        )
+      }
     }
   }
   ""
@@ -21752,6 +21789,22 @@ export function inferRetRungIsLitUnionElemList(i: i32): boolean {
 // Rung 25 — `mapElemListRetName`.
 export function inferRetRungIsMapElemList(i: i32): boolean {
   inferRetRungAt(i) == IR_RUNG_MAP_ELEM_LIST
+}
+
+// ARM 4's set — every producer whose render is a paren-grouped value-union array. Nine rungs,
+// including `nulElemListRetName`'s BOX leg but not its niche legs (see `IR_RUNG_NUL_ELEM_LIST_NICHE`).
+export function inferRetRungIsParenUnionElemList(i: i32): boolean {
+  const r = inferRetRungAt(i)
+  if r == IR_RUNG_NUL_ELEM_LIST { return true }
+  if r == IR_RUNG_NUL_STRUCT_ELEM_LIST { return true }
+  if r == IR_RUNG_NUL_MAP_ELEM_LIST { return true }
+  if r == IR_RUNG_NUL_LIST_ELEM_LIST { return true }
+  if r == IR_RUNG_ELEM_VU_LIST { return true }
+  if r == IR_RUNG_ELEM_VARIANT_BOX_LIST { return true }
+  if r == IR_RUNG_ELEM_MAP_UNION_LIST { return true }
+  if r == IR_RUNG_ELEM_REFARM_VU_LIST { return true }
+  if r == IR_RUNG_NUL_CLOSURE_ELEM_LIST { return true }
+  false
 }
 
 // Rungs 6 and 7 — `nullableRetName` and `nulLitUnionRetName`, the only producers that mint a
