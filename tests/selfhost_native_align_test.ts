@@ -178,14 +178,20 @@ const tiersOf = (s: string): Tier[] => {
   // `@error\b` covers `@error-at` too — both are reject-verdict directives.
   if (directive(s, "error")) t.push("reject");
   if (directive(s, "trap")) t.push("trap");
-  if (directive(s, "run") || logsOf(s).length > 0) t.push("run");
   // `@no-instantiate` (the `xfail-miscompile-` kind) is an ACCEPT case here, and that is the
   // point of the directive rather than a convenience: the program is well-typed and `vl check`
   // — even `--codegen` — exits 0 on it. The failure is that the module it writes does not
   // instantiate, which only `vl build`/`vl run` can see. So what native alignment has to assert
   // is exactly that the native tool ACCEPTS it too; asserting a run tier would demand the
   // module load, which is the very thing the case pins as broken.
-  if (t.length === 0 && directive(s, "no-instantiate")) t.push("accept");
+  //
+  // Pushed BEFORE the run tier and with no `t.length` guard, so a file carrying BOTH
+  // `@no-instantiate` and `@run`/`@log` claims two tiers and lands in AMBIGUOUS. That
+  // combination is a corpus bug — the file says the module does not load and then asserts its
+  // output — and this suite's own contract is that a well-formed case claims exactly one tier,
+  // so it should be reported as the contradiction it is rather than mis-asserted as a run.
+  if (directive(s, "no-instantiate")) t.push("accept");
+  if (directive(s, "run") || logsOf(s).length > 0) t.push("run");
   if (t.length === 0) {
     for (const d of ["check", "warning", "hint", "info"]) {
       if (directive(s, d)) {
