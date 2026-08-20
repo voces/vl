@@ -43488,3 +43488,104 @@ does emit two shapes.
   exception is named, the unreachable arms are named, and the soundness bar is stated.
 * **Numbering a fall-through as case 0 is a bug in the instrument.** It cost the first answer, and
   the instrument is where it had to be fixed.
+
+## B27 / D-RUNGCONTRACT — B26 corrected: its arm list was short, its rung 0 was three things, and the "needs new discrimination" exception needs none
+
+B26 measured the rung→arm map and declined to ship a conversion on it, asking instead that each
+rung be argued from its PRODUCER'S CONTRACT. That argument has now been made, and it corrects
+B26 itself in three ways before it adds anything. All three are instrument errors in B26's probe,
+and all three produced clean-looking output.
+
+### 1. THE ARM LIST WAS SHORT — 15, NOT 12 — AND TWO "NO-PIN" RESULTS WERE ARTIFACTS
+
+`synthRetAnnots`' ladder has **15** arms. B26's probe re-implemented the chain by hand to number
+it, and the hand copy dropped three, because each is a multi-line `} else if (` block that the
+enumerating grep did not match:
+
+* `nameIsI64Array || nameIsF64Array || nameIsF32Array` (S9)
+* `nameIsArray && nameIsStructWithUnionField(arrElemNameRaw(ctx))` (S11)
+* `nameIsArray && nameIsWholeSpanShape(arrElemNameRaw(ctx))` (S12)
+
+Verified at head: the ladder has 14 `} else if` plus the opening `if` = 15.
+
+**So B26's `r17a0` and `r18a0` are not no-pins.** S11's header names `structFieldBoxElemListRetName`
+(r17) as its recorder and S12's names `structElemListRetName` (r18); both rungs DO pin, through
+arms the probe never numbered. Only **r8's a0 is a genuine no-pin**.
+
+The probe's "arm 0" therefore meant *"no arm I enumerated"*, not *"no arm"* — and those are
+different claims. This is B26 §2's own lesson (a fall-through is not a case) repeated on the other
+side of the same measurement: there the INPUT space had a bucket that was not a case, here the
+OUTPUT space had cases that were not buckets.
+
+### 2. RUNG 0 WAS THREE THINGS, AND B26 §4 ATTRIBUTED TWO ARMS TO THE WRONG ONE
+
+The cascade's INITIALIZER is `unm = sfbNm` — `structFieldBoxRetName(inferred)` — which is not an
+`if unm == ""` rung, so the probe never wrapped it and its rows banked at 0 alongside
+`recordable`. Rung 0 is really **three** producers: `recordable`, `sfbNm`, and the genuine
+fall-through.
+
+B26 §4 said arms 9 and 10 "serve rows recorded by the `recordable` fall-through". That is **wrong**:
+`recordable` records `anm = tyToStructStr(inferred)`, the SPACED render, and those arms sit behind
+`nameIsSpaceFree`, which no spaced name can pass — arm S15's own comment says so. Arms a9/a10 are
+`structFieldBoxRetName`'s, and it has a crisp contract. Likewise a3 is not a rung-0 arm at all:
+`isObjShapeName` rejects any top-level `|`, so a3 is reachable only as **r21's fallback**.
+
+### 3. THE EXCEPTION NEEDS NO NEW DISCRIMINATION — IT IS TWO PRODUCERS IN ONE BODY
+
+B26 called r8 (`nulElemListRetName`) the one producer whose output does not determine the arm, and
+said it "needs its own discrimination". It does not. The function has three return sites and the
+consumer's arm predicate carries **the same three-way split, inverted**:
+
+| leg | r8 emits | `parenUnionArrElemName` | arm |
+|---|---|---|---|
+| numeric inner (`f64`/`i32`/`i64`/`f32`) | `(f64\|null)[]` | admits (value-union box) | **a4** |
+| niche inner (`boolean`/`string`) | `(string\|null)[]` | `nameIsNulString` guard → `""` | **a0** |
+| litunion inner | `(K0\|null)[]` | `nameIsNulLitUnion` guard → `""` | **a0** |
+
+So r8 is **two producers sharing one function body**, discriminated by exactly the predicate the
+consumer uses. The fix is mechanical — emit two rung codes from the two return groups, or hoist
+the niche legs into their own producer. No invention required.
+
+### 4. THE VERDICTS
+
+Of 27 rungs: **15 SOUND by construction**, **3 UNSOUND** (r1, r2, r8), **5 UNCLEAR**, **2
+mis-measured** (r17, r18 — see §1).
+
+**r1 `structMapFieldRetName` → a11 and r2 `structPlainRetName` → a12 are UNSOUND, and they share
+one root cause.** Both are guarded only by `sfbNm == ""`, and `structFieldBoxRetName` returns ""
+for **two different reasons** — "no box" and "declined as unlowerable" (four decline sites). On a
+DECLINE the struct still carries the union/nullable field, so an earlier name-side arm claims it:
+
+```
+{a: {[string]: i32}, f: (() => i64) | f64}   // sfbNm declines → r1 fires → S13 (a10), not a11
+{z: {[string]: f32}[]}                        // r2 fires → S14 (a11), not a12
+```
+
+The second is a plain scope mismatch: the arena gate `tyObjHasMapField` descends only direct
+`TyMap` and nested `TyObj` fields, while `nameIsStructWithMapField` scans for `{[` **anywhere in
+the string**.
+
+**Conflating "declined" with "absent" is the root cause of both**, and it is worth naming because
+it is a shape this programme keeps meeting: a producer whose `""` means two things forces every
+downstream guard to guess which.
+
+**The four `isUName` rungs (r5, r21, r22, r23) are the ones the conversion most IMPROVES.** Arm 1
+reduces to `isUName(ctx)` alone for them — a lookup in the module's union REGISTRY, not a property
+of the string — so the pin currently depends on a cross-pass registration chain
+(`collectU`'s inferred-return loop → `registerInferRetNominalUnion`, gated on the banked atom
+width ≥ 2). The chain closes today; a rung switch would make the pin independent of it. The
+empirical table could not have shown this, and it is the strongest argument for the conversion
+that exists.
+
+### METHOD NOTES
+
+* **A hand-copied predicate chain is an instrument, and instruments need their own review.** B26's
+  probe duplicated a 15-arm ladder to number it and dropped three arms; the output looked clean
+  and named two rungs as no-pins that pin. Enumerate by parsing the source, or assert the count.
+* **"No case matched" and "no case I know of matched" are different results.** Both print 0.
+* **An initializer is a case.** `unm = sfbNm` sits above the cascade and does the same job; not
+  being spelled `if unm == ""` is a syntactic accident, and the probe's numbering inherited it.
+* **When a measurement says "needs new work", check whether the consumer already does that work.**
+  r8's split was already implemented, inverted, in the arm predicate that reads it.
+* **A `""` that means both "absent" and "declined" is a defect generator.** It is the root of both
+  UNSOUND rungs here.
