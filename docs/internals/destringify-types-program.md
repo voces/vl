@@ -42770,3 +42770,61 @@ runs. The assumption holds and the arm is right to be one-sided.
 * **Check whether the ruling is already pinned before writing the fixture.** The flat-order
   exception had a fixture the whole time, two directories away from where this branch was
   working.
+
+## B15 / D-FRONTIER — the final frontier, sited and priced; and why the last 149 are not worth a design
+
+The re-parse programme is at **149** from 1,318 (-89%), and the rows those parses MINT are
+**99** from 955 (-90%). This records what is left, what each piece costs, and the one trade
+that was declined.
+
+### 1. WHAT REMAINS
+
+| site | calls | rows minted |
+|---|---|---|
+| `emit_mono` m0 — `monoSubstLetType` | 28 | **23** |
+| the other ten `emit_mono` sites | 1-12 each | the rest |
+| `emit_collect` — the re-formed array name | 10 | |
+
+No single remaining site is the shape m4 was (239 calls / 117 rows, over half the cost on
+one line). The largest is m0 at 28 calls and 23 rows — **23% of the remaining rows for the
+biggest remaining site**, where m4 was 56%.
+
+### 2. THE TRADE DECLINED, AND WHY
+
+m0 is `monoSubstLetType`, and converting it needs the same bind-and-substitute the return
+site uses: `bindGenWalk` over the parameters into `bN`/`bT`, then `substTyDeep` on the
+`LetDecl` annotation's recorded type, gated on `tyHasTyVar`. The machinery all exists.
+
+What does not exist is a way to GET `bN`/`bT` there. `monoSubstLetType` is reached through
+`monoCloneBody`, a RECURSIVE walk with eight-plus call sites, and threading two more arrays
+through all of them is the only clean route — module-level state for a re-entrant walk being
+exactly the shape of the sidecar-not-reset-per-program bug this branch already had.
+
+**Eight call sites of churn on a recursive walk, for 23 arena rows.** Declined. The branch
+has already shipped one regression from a conversion whose measurement looked fine (#1481,
+fixed by #1483), and the expected value of more churn at this size is negative.
+
+### 3. WHAT WAS DONE INSTEAD
+
+The two gates that catch this family are now written into `AGENTS.md` beside the three CI
+already runs, because a tool nobody knows to run is not a gate:
+
+* `scripts/rep-fuzz-check.sh` after any rep/interner change — the only channel that has ever
+  caught a REJECT -> MISMATCH, and it caught a shipped one.
+* `scripts/mono-tyaram-grid.sh` after any generics / monomorphization / type-parameter
+  change — with its sabotage contract (13 cells MUST be BAD against a pre-#1475 seed) and
+  the instruction that its constructor list is meant to GROW.
+
+Neither goes in CI, and that is the project's own standing decision rather than an
+oversight: both are deterministic, and the rule is that findings are entombed as
+`tests/cases/` fixtures rather than re-proved per PR.
+
+### METHOD NOTES
+
+* **Price the site before designing the conversion.** m0 was measured (28 calls, 23 rows)
+  BEFORE the threading was attempted, and the number is what settled it. The same
+  measurement is what made m4 obviously worth doing.
+* **"Largest remaining" is not "worth doing".** m4 was 56% of the cost on one line; m0 is
+  23% and needs eight times the churn. The distribution matters more than the ranking.
+* **A gate that is not written down is a habit, not a gate.** Both of these were being run
+  because one agent happened to know about them.
