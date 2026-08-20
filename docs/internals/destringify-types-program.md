@@ -44118,3 +44118,78 @@ the ARM, not the bytes.**
 * **When a conversion's safety depends on a LATER arm still being a name test, say so in the
   ordering.** B33 got the order right and did not record why, which is how a co-landing would have
   looked safe.
+
+## B35 / D-POSDEP — the remaining struct arms are blocked by the RENDERER, not by the ladder: a producer cannot predict what its own render will contain
+
+Slice 2 was implemented, measured, and **reverted**. The reason is the terminal finding for this
+ladder, and it is deeper than any of the arm-by-arm blockers B27/B33/B34 recorded.
+
+### 1. WHAT WAS BUILT
+
+The rung-28 split B34 specified: `structFieldBoxRetName` reports whether the box it found SURVIVES
+into the render (`IR_RUNG_SFB`) or is softened away (`IR_RUNG_SFB_SOFT`), so arms 10 and 13 can ask
+the producer instead of scanning the spelling. The discriminator has to answer, structurally, "will
+the rendered field text carry a depth-0 `|` or a litunion alias".
+
+### 2. IT CANNOT BE ANSWERED STRUCTURALLY
+
+Two probes, each measuring the LADDER POSITION with the BODY recorded (B32/B34), each reporting
+exactly ONE body crossing — and a **different** one:
+
+| discriminator | crossing | the field's render |
+|---|---|---|
+| admit an inline str-litunion (`litUnionInlineNameOfTy` answers for it) | `{v:string}` | SOFTENED — the members are gone |
+| decline every all-literal union | `{v:"c"` … | KEPT — the members are there |
+
+**Both crossings are the same construct — an inline `("a" \| "b")` litunion field — and both are in
+the SAME FIXTURE**, `literal-unions/inline-atom-shape-field.vl`:
+
+```
+const bInline: { v: ("a" | "b") } = { v: "a" }        // renders {v:string}
+const s: { v: ("c" | "d"), n: i32 } = { v: "c", n: 3 } // renders {v:"c"|"d",n:i32}
+```
+
+The types are the same shape. The renders differ because `tyToEmitName` is **POSITION-DEPENDENT**:
+`ctxKeepsLitUnion` is true at some `RC_*` contexts and false at others (B24 §1 recorded the same
+property from the closure-tag side). So the answer depends on the context the render is REACHED
+THROUGH, which the producer does not know and cannot know — it is called on a type, not on a
+position.
+
+### 3. WHY THE OBVIOUS ESCAPE IS NOT ONE
+
+`structFieldBoxRetName` ends with `irRendered(tyToEmitName(er))`, so the render IS in hand, and
+`hasRenderedBox` could simply be read off it. That would work, and it is exactly what this
+programme exists to remove: it moves the character predicate from the consumer to the producer
+without eliminating it. Declined on the goal, not on difficulty.
+
+### 4. WHAT THIS BLOCKS, AND WHAT IT DOES NOT
+
+**Blocked: arms 10 and 13** (`nameIsStructWithLitUnionField`, `nameIsStructWithUnionField`), and by
+the same argument **arm 12** and the `r17` split of slice 4 — every one of them reads a field text
+out of a struct render whose litunion behaviour is position-decided.
+
+**Not blocked and already shipped:** every arm whose question is about the type's SHAPE rather than
+about what the render kept — the nullable arm, the four single-rung arms, arm 4's nine-rung set,
+arm 1's eight-rung set, arm 9's gate. Those are nine of fifteen, and they are the ones where
+producer identity and render content coincide.
+
+### 5. WHAT WOULD UNBLOCK IT
+
+Making the render position-INDEPENDENT for litunions, i.e. retiring `ctxKeepsLitUnion`. That is a
+change to what the emitter's name-keyed tables are keyed BY, not a conversion — and B24 already
+recorded that the same position-dependence is what defeats a hash-cons key swap at the closure-tag
+table. **Two independent slices of this programme have now terminated at the same property**, which
+is the strongest signal available that it is the next real target and that it is a design change
+rather than a refactor.
+
+### METHOD NOTES
+
+* **Implement, measure, revert is a legitimate outcome, and cheaper than arguing.** Two probe
+  iterations located a property that three prior design passes (B27, B33, B34) had each stepped
+  around without naming.
+* **When a corrected plan is corrected AGAIN by the same class of defect, stop patching the plan
+  and look for the shared cause.** B33 §5.2 was wrong, B34 fixed it, and the fix was wrong the same
+  way — because both were reasoning about renders as if they were functions of types alone.
+* **A discriminator that has to predict a render is a discriminator that has to model the
+  renderer.** If the renderer is context-sensitive, the model is the renderer, and there is nothing
+  left to win.
