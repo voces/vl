@@ -13111,9 +13111,12 @@ export function checkArrName(name: string) {
 // down, where the ARRAY annotation classifier knew type parameters and the SHAPE FIELD
 // one did not.
 //
-// Both declaration kinds, exactly as `genTyParamArr` documents them: a FuncDecl's names
-// (`genTyParamNames`, gathered by `collectA`'s pre-pass) and a generic type ALIAS's
-// (`gaeParams`, split back out by `gaeCollectDecls`).
+// The FuncDecl HALF ALONE, and asking for exactly that half is the point rather than an
+// oversight: `shapeFieldsRideTyParam` must NOT see generic-ALIAS parameters, because
+// `collectGenAliasShapes` already interns each application's substituted shape and routing
+// the alias half through the skip reddens
+// `generics/type-param-shadows-alias-through-constructors.vl`. Do not collapse this into
+// `genTyParamLeaf` below — that is the both-halves question, and it has a different caller.
 export function fnTyParamName(base: string) {
   let i = 0
   while i < genTyParamNames.length {
@@ -13123,6 +13126,9 @@ export function fnTyParamName(base: string) {
   false
 }
 
+// BOTH declaration kinds, exactly as `genTyParamArr` documents them: a FuncDecl's names
+// (`genTyParamNames`, gathered by the `collectTyParams` pass) and a generic type ALIAS's
+// (`gaeParams`, split back out by `gaeCollectDecls`). `genTyParamArr` is its one caller.
 export function genTyParamLeaf(base: string) {
   if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   if fnTyParamName(base) { return true }
@@ -15061,8 +15067,11 @@ export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
 // `monoArgTyName` declines a bare parameter and monomorphization rejects the call loudly.
 // The `T[]` form is the one that got through to a struct row.
 //
-// Shared by the two interners because they are the two roots that mint a struct row from a
-// shape spelling, and a row minted from either is equally un-substituted.
+// ONE caller — `internInlineShapeTy`. The file names three roots that mint a struct row
+// from a shape spelling (`sSetLim`'s header: this one, `internShapeAs`, `gaeEnsure`), and
+// the other two need no arm: both mint from a TOP-LEVEL `type` declaration, where no
+// FuncDecl type parameter is in scope. Kept a named predicate rather than inlined so the
+// question has somewhere to be asked from if that ever stops being true.
 function shapeFieldsRideTyParam(rawTexts: string[]) {
   if genTyParamNames.length == 0 { return false }
   let gp = 0
@@ -15475,7 +15484,13 @@ function shapeFieldSetIdOf(
 // exactly when a watermark index needs one.
 function sSetLim(): i32 {
   const n = sScanLim()
-  let i = 0
+  // From `sSetLen`, NOT from 0 — otherwise this guard is O(rows) on every
+  // `annShapeIndexOf` query and puts back the O(rows^2) the watermark index exists to
+  // remove (`sNameIxSync`'s header states the rule). Answer-identical: `sSetSync` consumes
+  // from `sSetLen` upward, so a limit at or below it produces no work either way, and no
+  // row below `sSetLen` can be short — it was complete when the index consumed it, and the
+  // detail columns only grow within a program.
+  let i = sSetLen
   while i < n {
     if sFieldStart[i] + sFieldCount[i] > sFieldElemName.length { return i }
     if sFieldStart[i] + sFieldCount[i] > sFieldNames.length { return i }
@@ -18215,24 +18230,38 @@ function paramStructIndex(fnIx: i32, name: string) {
               // A plain struct name, or the `S | null` nullable BASE. (NOT a union
               // variant — a variant-typed param rides the gap-#2 path, and its
               // VARIANT index must not leak into the struct tables.)
-              // ARENA RUNG, the `structIndexOfLet` conversion's sibling — and it is a
-              // sibling because it asks the SAME question: "what struct does this
-              // annotation name", where the annotation IS the node whose type the checker
-              // recorded. (The two callers that do NOT ask that — `emit_classify:11391`'s
-              // rep-sidecar arm at 11.2% disagreement — are measured and NOT converted.)
+              // NAME, NOT THE ARENA — and this is a RETRACTION, so the reason is recorded
+              // here rather than in the history alone.
               //
-              // Dual-run over the corpus: the arena answers **15,922** calls, agreeing on
-              // **15,881** and disagreeing on **41 (0.26%)** — and all 41 are ONE class,
-              // `{f:K0|null}` resolving to a duplicate row with the same spelling, with
-              // `repStructSlotsTwin` answering **1** on every one. Twins share a heap type
-              // and a field-code layout, so either row emits the same module. On the
-              // compiler's own source the arena answers 294 times with 0 disagreements.
+              // An arena rung sat in front of this line for part of this branch
+              // (`structIndexOfTy(nodeTyIxOf(p.parType))`, falling back to the name). It
+              // shipped on a dual-run reading 15,922 corpus calls, 41 disagreements
+              // (0.26%), every one of them a `{f:K0|null}` duplicate row that
+              // `repStructSlotsTwin` called a twin — twins share a heap type and a field
+              // layout, so either row emits the same module — plus 294 answers with 0
+              // disagreements on the compiler's own source.
               //
-              // Gated on `rep-fuzz-check` as well as byte-identity, because the corpus
-              // cannot contain the case that would break this and that harness caught the
-              // other merge-enabling change on this branch.
-              let psi = structIndexOfTy(nodeTyIxOf(p.parType))
-              if psi < 0 { psi = structIndexByName(ty.tyName) }
+              // THE MEASUREMENT WAS CLEAN AND THE POPULATION WAS WRONG. No corpus file
+              // declares a type whose name a FuncDecl type PARAMETER also uses, so no
+              // corpus file could disagree for the reason that matters:
+              //
+              //   type T = { x: i32 }
+              //   function f<T>(v: { g: (T | null)[] }): i32 { v.g.length }
+              //   print(f({ g: [{ x: 1 }, null] }))
+              //
+              // The shadow ruling says the parameter binds NOTHING and the real `T` wins
+              // (`genTyParamArr`'s header; `type-param-shadows-alias-through-constructors.vl`
+              // pins it at eight constructors), so the NAME's answer is the correct one. The
+              // arena's recorded type for a GENERIC ORIGINAL's param is the un-substituted
+              // shape, which is not that struct — it fronted the find and won with the wrong
+              // row: `vl check --codegen` rc 0, `vl run` invalid wasm.
+              //
+              // That is the same root as the inline-shape crash this branch fixes one layer
+              // up — a generic original's shape leaking into concrete struct resolution — and
+              // the rung can be reconsidered once generic originals are excluded at the
+              // source. Until then the name answers, and `error-param-shadow-tyaram-nullable-elem.vl`
+              // reddens if the rung returns.
+              const psi = structIndexByName(ty.tyName)
               if psi >= 0 { return psi }
               const pnb = nulBaseStructRow(p.parType, ty.tyName)
               if pnb >= 0 { return pnb }

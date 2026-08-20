@@ -50,14 +50,22 @@ GRAPH_PID=$!
 # fmt gate: the source tree must be `vl fmt`-clean. `--check` exits non-zero on
 # any drift, naming the offending file on stderr; xargs propagates any failure
 # (exit 123) and set -e fails the run. tests/ is NOT passed in.
+# The fmt result is CAPTURED rather than allowed to propagate, so `set -e` cannot exit
+# before the lint log below is replayed. It used to: the log lives under `$WORK`, which the
+# EXIT trap deletes, so any formatting drift silently discarded every lint finding the
+# backgrounded graph check had already produced. The job then reported "fmt drift" alone
+# and the prefer-const/unused findings surfaced only on the next run. Both gates still fail
+# the script; only the order of reporting changed.
 echo "== fmt-check: compiler/ std/ scripts/ (parallel per file) =="
+FMT_RC=0
 find compiler std scripts -name '*.vl' -print0 \
-  | xargs -0 -n 1 -P "$(nproc)" "$VL" fmt --check
+  | xargs -0 -n 1 -P "$(nproc)" "$VL" fmt --check || FMT_RC=$?
 
 echo "== self-lint: the compiler module graph (result) =="
 GRAPH_RC=0
 wait "$GRAPH_PID" || GRAPH_RC=$?
 cat "$WORK/graph.log"
 [ "$GRAPH_RC" = 0 ] || exit "$GRAPH_RC"
+[ "$FMT_RC" = 0 ] || exit "$FMT_RC"
 
 echo "self-lint + fmt-check clean ✅"
