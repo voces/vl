@@ -43046,3 +43046,228 @@ was reaching for and got to by the wrong route.
 * **"Latent inconsistency" is a claim that something is WRONG.** It should not be filed
   without the same evidence a live defect would need — otherwise it is a rumour with a
   file path.
+
+## B20 / D-LETTYPE — B15's declined m0 was declined on a wrong price, and the SABOTAGE CONTROL is what made the conversion checkable
+
+B15 priced `monoSubstLetType` at 28 calls / 23 rows, judged it the largest remaining site,
+and **declined it**: the binding it needed had to be threaded through `monoCloneBody`'s eight
+recursive call sites, and "eight call sites of churn for 23 arena rows" was negative expected
+value. The threading estimate was right. The **source** estimate was wrong.
+
+### 1. THE COLUMN WAS ALREADY BUILT, ONE SCREEN ABOVE
+
+`monoMakeInstance` resolves `pinnedTyIx` in its clone loop and documents it as *"the pin,
+resolved ONCE, here at the clone, and never re-resolved from its spelling"*. That is exactly
+the input `bindGenWalk` wants. So the binding is built once from what is in hand, and the
+open-coded loop the RETURN site carried became `monoBindCols`, shared by both.
+
+B15 costed the conversion by looking at what `monoSubstLetType` could reach and never asked
+what its CALLER already had. **Price a conversion at the function that owns the data, not at
+the function that needs it.**
+
+### 2. THE CORPUS CANNOT SEE THIS SITE, AND TWO SABOTAGE BUILDS SAY SO EXACTLY
+
+Corpus A/B: **0 of 2,027**. This programme has already shipped a regression behind that
+number (#1481), so it was treated as a question rather than an answer, and the question —
+*could the corpus contain the disagreement?* — was answered by deliberately breaking the site
+and re-running the same sweep:
+
+| sabotage | rows moved |
+|---|---|
+| a wrong type recorded at EVERY substitution | 2 |
+| a wrong type recorded ONLY in the new hand-over branch | the same 2 |
+
+Two files, both emitting INVALID WASM under sabotage: `generics/body-type-param.vl` and
+`modules/std-array-building/entry.vl`. So the branch fires, the recorded type genuinely drives
+emission, and the observable population is **two**.
+
+This is the method B-DUALPOP asked for, made cheap. A dual-run needs an oracle and a
+comparison harness; a sabotage build needs one edit and the sweep that already exists, and it
+answers the population question **directly** rather than by inference from an agreement rate.
+
+### 3. THE REVIEW FOUND THE AXIS THE FIXTURE MISSED, AND THE ANSWER WAS A GRID
+
+The fixture added `T[][]`, `{item: T}` and `T | null` — a widening of the CONSTRUCTOR axis.
+Review pointed out that the PIN axis was untouched, and that this matters specifically here:
+`pinnedTyIx` covers a position pinned from a NAME, so for an interned anonymous shape it
+carries the emitter's **placeholder `TyObj`** — which is not a `TyVar` and therefore passes
+the `tyHasTyVar` gate. The fixture's pins were all primitive or declared-nominal, i.e. exactly
+the population where the hand-over is trivially safe.
+
+5 constructors x 6 pins = **30 cells**. Identical to master on all 30; the sabotage build
+moves **11**, including both anonymous-pin array cells. The second number is what makes the
+first reportable.
+
+The two non-array constructors cannot be pinned at an anonymous shape at all — `boxed({w: 1})`
+and `firstOrNull([{w: 1}])` both reject with `ref valtype with no interned shape`, on master
+and after the change alike. That is a language limit, and the fixture header says so rather
+than leaving the gap looking like an oversight.
+
+### 4. A COMMENT THAT DESCRIBED CODE THAT IS NOT THERE
+
+The return site carried a long paragraph claiming a union EXCLUSION — *"NOT A UNION … excluding
+them keeps every other shape converted"*. #1483 added that exclusion; #1485 fixed the fold at
+the root (`substTyDeep`'s union arm collapses a degenerate union) and REMOVED it. The comment
+survived, and this slice's new comment then pointed at it for its reasoning — so a stale
+paragraph was being propagated into new code.
+
+**A comment that outlives its code is worse than no comment**, because the next slice cites it.
+The two hand-over sites now both say the fold lives in `substTyDeep`.
+
+### METHOD NOTES
+
+* **Sabotage the site, then re-run the sweep you already have.** It converts "0 rows moved"
+  from a reassurance into a measurement, at the cost of one edit and one build.
+* **Sabotage the BRANCH, not just the site.** Breaking every substitution proves the site is
+  reached; breaking only the new arm proves the NEW CODE is reached. The second is the one
+  that says the conversion is live rather than dead.
+* **A fixture widens one axis at a time, and reviewers see the other one.** Constructor was
+  widened, pin was not, and the pin axis was where the new column differed from the measured one.
+* **Price at the data's owner.** B15's decline followed from asking the wrong function what
+  was available.
+
+## B21 / D-NESTARR — the last un-taken re-parse, and the check-clean invalid wasm found by trying to widen a fixture
+
+B15's frontier table listed one site outside `emit_mono`: `collectLocals`' re-formed array
+name, 10 calls. It is now a hand-over — `nodeArrayElemName(synInit)` reads `nodeTyIxOf(synInit)`
+to get the element in the first place, so the ARRAY type was in hand the whole time.
+
+**It shipped first with a FALSE justification, and review caught the argument rather than the
+behaviour.** The claim was that the two lines above the mint — which swap a struct element's
+structural render (`{v: i32}`) for its DECLARED name (`P`), because the ref-list tables key on
+that spelling — are name-side only, "and the two spellings denote one type under the 2026-08
+ruling, so handing it over changes no name-keyed lookup".
+
+They are one TYPE and they are not one ROW, and the rep layer keeps them apart **on purpose**:
+`repSlotOfTyDecl` is a nominal arena-index lookup with no structural bridge, and
+`rlInternNameTy` records the consequence outright — *"declared struct twins stay apart"*. The
+handed row keys `HC_OBJ(fields…)`; the name-resolved row keys `HC_SLOT(si)`.
+
+Instrumenting the site to compare `repElemId(handed)` against `repElemId(name-resolved)` over
+the corpus finds them **disagreeing on exactly one file** — `arrays/infer-build-struct.vl`,
+`arr=[P[]] elem=[{v: i32}]` — and agreeing everywhere else. One disagreement is one too many
+for an ungated hand-over.
+
+**The rule it now follows is `emit_rewrite`'s, stated there as absolute: hand the type over only
+where the SPELLING DENOTES THE TYPE BEING HANDED.** `synName != synElem` IS the struct arm, so
+the gate is `synName == synElem` and the struct case falls back to the name path. Re-measured
+under the gate: **0 disagreements**. A union element still hands over — its paren re-wrap
+changes the array's GROUPING (`Cat|Dog[]` binds `[]` to the last member) without touching the
+element spelling, so the re-wrapped name denotes exactly the handed array.
+
+Population, by the same sabotage: **2 files before the gate, 1 after** — the union kind. That is
+the honest size of the win, and it is half what the first commit claimed.
+
+### THE HOLE THAT TURNED UP WHILE TRYING TO WIDEN THAT COVER
+
+Attempting to add f64, map and NESTED-ARRAY element kinds to the fixture found all three
+failing **at master**. Two fail cleanly. The third does not:
+
+```
+function f() {
+  const outer = []
+  const inner = [1, 2, 3]
+  outer.push(inner)
+  print(outer[0][2])     // vl check rc 0, then: expected i32, found (ref $type)
+}
+```
+
+Two halves, and the first was tried ALONE and moved nothing — which is what located the second:
+
+1. **`nodeArrayElemName` had no `TyArray` arm.** Scalar, struct, map, union, closure and
+   nullable-closure all had one. A nested array fell through to `""`, so no annotation was
+   synthesized and the binding took the i32-list default.
+2. **The ref-list ROW did not exist.** The synthesis postdates `collectA` and can only RESOLVE
+   a row. `arrLitIsRef` declines an empty literal by construction, and the nested arms of
+   `arrLitElemKind`/`arrLitElemName` key off the FIRST ELEMENT'S NODE — which an empty literal
+   has none of. `collectA` now interns it from the same query on the empty literal, exactly as
+   it does for the union kind.
+
+Fixed at all three leaf kinds. The **top-level** form is not fixed: `collectLocals` types wasm
+LOCALS and a global never reaches it. It is pinned as
+`xfail-miscompile-toplevel-nested-array-inferred-empty.vl` — the kind's only member, its first
+having been closed by #1501 — and the residue is narrow rather than general, because the other
+element kinds at top level REJECT cleanly and only this one miscompiles.
+
+**Blast radius was measured, not assumed**: `nodeArrayElemName` has eight consumers, and the
+new arm moves exactly one corpus row (`closures/nested-closure-array-union-arm-call.vl`, a 2-D
+closure array whose element now renders where it previously did not — bytes change, exit code
+and `@log` assertions do not).
+
+### METHOD NOTES
+
+* **Trying to widen a fixture is a defect-finding technique.** Three element kinds were added
+  to a fixture; all three failed at master, and one of them was a check-clean invalid-wasm hole
+  nothing in the corpus reached. The cover was the goal and the defect was the yield.
+* **A half-fix that changes nothing is a LOCATOR.** Adding the render arm alone left the
+  program failing identically, which said the failure was downstream of the render — the row.
+  A half-fix that silently improves things is much harder to reason about than one that does not
+  move at all.
+* **Ask the arena, not the render, when adding a classifier.** `arrLitNestedElemName` gates on
+  `T.tys[elem] is TyArray`; the `nameIsArray` form would also have matched the kind-5 closure
+  element and the union arm's `(Cat | Dog)[]`, both of which have their own producer and kind.
+* **"Structurally equal" is not "interchangeable" — ask the layer that consumes it.** The
+  2026-08 ruling makes two field-permuted shapes one TYPE. It says nothing about whether a
+  layer that keys NOMINALLY may treat a declared row and an inline row as one, and the rep
+  layer's own headers say it may not. Citing a language ruling to license a representation
+  change is a category error.
+
+## B23 / D-GATEPOP — a green gate is only evidence for the sites its population reaches
+
+Review of the B21 slice asked a question the programme had not thought to ask: the change cited
+`scripts/rep-fuzz-check.sh` as green, but *does the fuzz population reach that synthesis at all*?
+
+Tested the only way that answers it — install the SABOTAGE build (the one that records the
+element type where the array type belongs, and sends two corpus files to invalid wasm) as the
+seed and run the gate:
+
+> **`rep-fuzz-check: exact ✅`.**
+
+**The gate is VACUOUS for that site.** It cannot see the synthesis, so the green result reported
+on the first commit was worth exactly nothing there, and quoting it was the same error as
+quoting a clean corpus over a population of two — the error this programme has already recorded
+twice (B-DUALPOP, B20) and had not thought to apply to its own GATES.
+
+This generalises past one site. The project's gates are `deno task test`, the native suites,
+`native-fixpoint.sh`, `lint-self.sh`, `rep-fuzz-check.sh` and `mono-tyaram-grid.sh`, and each has
+a population. A change lands inside some of those populations and outside others, and a report
+that lists six green gates without saying which ones could have failed is a list of six
+reassurances, not six measurements.
+
+### METHOD NOTES
+
+* **Sabotage the change, then run the GATE.** The same one-edit build that sizes a corpus
+  population also tells you whether a gate is potent for the change in front of you. It costs
+  one extra run and it is the difference between citing a gate and relying on one.
+* **Report gates with their potency, not just their verdict.** "rep-fuzz exact" and "rep-fuzz
+  exact, and its population does not reach this site" are opposite claims wearing the same words.
+* **`mono-tyaram-grid.sh` has a written sabotage contract for exactly this reason** (13 cells
+  MUST go BAD against a pre-#1475 seed). That contract is what makes its green meaningful, and
+  no other gate in the project has one. The grid was right and the habit did not spread.
+
+## B22 / D-CENSUS2 — a fresh census, and its one TRIVIAL rating that the source refutes
+
+A second full census of "renders a type, then does functional work on the render" was taken at
+this head. Its ranked queue is recorded in the tracking issue; two entries need correcting here
+because the correction is the reusable part.
+
+**`nodeArrayElemName`'s five `nameIsClosureElem` consumers were rated TRIVIAL — "a one-line
+arena test, is the element a `TyFunc`".** They are not. `nameIsClosureElem` (`emit_base.vl`) is
+a THREE-ARM cascade at three declared confidences, and its own header records that arm 3 —
+the coarse `strContains(name, "=>")` — deliberately over-matches a UNION with a closure member,
+that narrowing it is "a SEPARATE slice with its own measurement", and that dropping it **moves
+2 corpus modules** because `arrLitElemKind` asks its nested-array rung before its union rung.
+An arena predicate for "the element is a `TyFunc`" IS that narrowing. The conversion is a
+behaviour change with a measured cost, not a swap.
+
+**`funcRetUnrepresentable` and `nullableRetName` were rated TRIVIAL and are partials.** Both
+guards do reduce to `render != ""` given the enclosing `is TyObj` — but the render is then
+handed ONWARD (`funcTypeShapeLowerable(nm)`, `irAtoms(inm + "|null", …)`), so converting the
+guard leaves the string in the data flow and buys one predicate call.
+
+### METHOD NOTE
+
+* **A census rates from the call site; the cost lives in the callee.** Every one of these
+  reads as a one-line swap at the point of use, and the header of the function being swapped
+  out is where the price is written down. Open the callee before assigning a difficulty —
+  the same error B15 made in the other direction.

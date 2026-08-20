@@ -22522,6 +22522,49 @@ export function tyLitUnionAliasIx(ty: i32): i32 {
 // A `{tag, value}` value/struct union BOX at arena level — `isValueUnionBox`,
 // exposed under the `ty*` naming for the emitter's descriptor arms.
 export function tyIsValueUnionBox(ty: i32) { isValueUnionBox(ty) }
+// The nested-array LEAF kinds the inferred-empty synthesis can type CORRECTLY — and nothing
+// wider, because the wider set is a MISCOMPILE rather than a missing feature.
+//
+// `arrLitNestedElemKind` maps a leaf to a ref-list kind from the arena, and the authority it has
+// to agree with is `refArrElemKind(<elem> + "[]")`: the annotation `collectLocals` synthesizes is
+// resolved BY NAME, and `rlInternName` keeps the FIRST kind banked against a rep key. The two
+// agree on exactly this set. Outside it they diverge — an `f32[]` leaf is 4 here and 10 there, a
+// nested `i32[][]` leaf is 4 here and 9 there — and the outer list's backing is then typed as the
+// i32-list wrapper while a different wrapper is stored into it: `vl check` rc 0 and a module that
+// does not instantiate.
+//
+// SO THE UNCOVERED LEAVES DECLINE, and that is the point. Declining keeps the LOUD reject master
+// gives (`index receiver is not an array or string`); the alternative is trading a loud reject for
+// a silent miscompile, which is the exact failure class this synthesis exists to CLOSE. Widening
+// the set means answering from `refArrElemKind` and extending the flag block (kind 10 needs
+// `fa32Used`; kind 9 needs the inner row interned at a strictly lower slot, since the wrapper is
+// read during the same forward pass) — a real design step, and it wants a fixture per leaf.
+//
+// BOTH HALVES MOVE TOGETHER. This is asked by `nodeArrayElemName` below, which decides whether an
+// annotation is synthesized at all, AND by `arrLitNestedElemName`, which decides whether the row
+// is interned. Declining in only one leaves "a spelling with no row stays uncovered", which
+// reaches the same invalid module by the other route.
+export function tyNestedArrLeafSupported(elemTy: i32): boolean {
+  if elemTy < 0 { return false }
+  const el = T.tys[elemTy]
+  if el is TyArray {
+    const leaf = el.aElem
+    if leaf < 0 { return false }
+    // A literal-union leaf (`K[]`) is an i32-ATOM array riding the i32-list wrapper — kind 4,
+    // which is what both sides answer for it.
+    if tyIsLitUnion(leaf) { return true }
+    const lt = T.tys[leaf]
+    if lt is TyPrim {
+      if lt.primName == "i32" { return true }
+      if lt.primName == "boolean" { return true }
+      if lt.primName == "string" { return true }
+      if lt.primName == "f64" { return true }
+      if lt.primName == "i64" { return true }
+    }
+  }
+  false
+}
+
 // TYPED-IR query: the element type NAME of the array the checker recorded for node `ix`
 // (e.g. "f64", "string", an inline `{v: i32}` shape), or "" when `ix` has no recorded
 // concrete array type. A GENERIC element (a `TyVar`) returns "" — a generic build's
@@ -22614,6 +22657,25 @@ export function nodeArrayElemName(ix: i32) {
           const stmts: i32[] = []
           return nullableRetName(t.aElem, stmts)
         }
+      }
+      // A NESTED ARRAY element (`i32[][]`, `string[][]`) renders the inner array's emit
+      // name. Without this arm the cascade fell through to "", no annotation was
+      // synthesized for the binding, and the list took the i32-list default — so pushing an
+      // ARRAY into an inferred empty `[]` stored a ref into an i32 element and emitted a
+      // module that CHECKS CLEAN and does not instantiate (`expected i32, found (ref
+      // $type)`), which is the same failure the union arm above this one exists to close.
+      //
+      // The machinery it feeds already covers the shape from both other directions: the
+      // ANNOTATED `const outer: i32[][] = []` and the nested LITERAL `[[1, 2, 3]]` both run
+      // at master. Only this synthesis was missing, so the arm hands the same spelling those
+      // two paths already intern their row under.
+      //
+      // "" for a generic or otherwise unpinned inner element, via `tyToEmitName` — the same
+      // decline protocol the `TyFunc` arm above uses, so an unresolved nested element keeps
+      // falling through rather than claiming a row that was never interned.
+      if el is TyArray {
+        if !tyNestedArrLeafSupported(t.aElem) { return "" }
+        return tyToEmitName(t.aElem)
       }
     }
   }
