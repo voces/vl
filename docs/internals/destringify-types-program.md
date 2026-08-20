@@ -42878,6 +42878,14 @@ small number.
 The change is recorded here rather than in the tree so it can be re-applied if the path ever
 becomes hot — the verification is the expensive part and it is done.
 
+### 2b. CORRECTION TO THIS ENTRY — four buckets were called closed without being opened
+
+B16 as first written said the census was "closed — worked, or classified as renderers". It
+classified `typecheck`, `emit_rep` and `emit_classify` and did NOT open `parser` (5),
+`ast` (3), `emit_collect` (2) or `tyname` (1). Eleven sites were declared closed on the
+strength of the three that had been read. B17 below opens them; the claim happened to hold
+for ten of the eleven, which is not the same as having checked.
+
 ### 3. THE DEAD-CODE HYPOTHESIS, REFUTED
 
 `repElemKeyGo` and `repCanonKeyGo` are **0 calls** on the corpus AND the self-compile, which
@@ -42951,3 +42959,49 @@ useful than another clean table.
   of this record.
 * **Say when a method is spent.** The widening method found half the holes on this programme.
   Five clean sweeps in a row is evidence about the METHOD, not just about the cells.
+
+## B18 / D-CENSUSREST — the four buckets B16 skipped, and the one join-then-split it hid
+
+B16 declared the concat census closed having read three of its seven remaining buckets. This
+opens the other four.
+
+* **`parser` (5 sites)** — `parseTypeName`, `parseTypeAtom` x3, `parseTypeDecl`. These build
+  the annotation spelling from SOURCE TOKENS. That is the ORIGINAL construction, not a
+  re-derivation: there is no earlier form of the type to hand over. Legitimate.
+* **`ast` (3 sites)** — all `tsToName(ix)`, a type-SYNTAX node to name renderer. Legitimate.
+* **`tyname` (1)** — a comment, not code. Zero live sites.
+* **`emit_collect` (2)** — one is the re-formed array name already sited and priced at B15
+  (10 calls, left unconverted). The other is a JOIN-THEN-SPLIT round trip.
+
+### THE ROUND TRIP
+
+`collectU` joins a union alias's member list `vs` into `udSet` with `|`, pushes it to
+`unMemberSet` (which needs the string), and then hands the STRING to `recordUnMemTys(udSet)`
+— whose first act is `splitUnionAtoms(set, atoms)`. The list is rebuilt from the string the
+caller just built from the list. Two of `recordUnMemTys`'s three callers pass a name they did
+not construct; only this one round-trips.
+
+**Measured, and it is not lossless.** Over the corpus: **463 agree, 1 DISAGREES** (9/0 on the
+compiler's own source). The disagreement is a member COUNT mismatch — `vs` and the re-split
+`atoms` differ in length — and the file is
+`tests/cases/types/union-alias-transparent-and-its-gate.vl` at `type AS = (Sc | Dg)`, whose
+own header is about union-alias member faithfulness. The join drops an empty member: the loop
+skips the separator while `udSet == ""`, so a leading empty entry vanishes and
+`unMemTyCount.push(atoms.length)` banks a count one short of what the caller had.
+
+**Not converted, and the reason is the one case rather than the volume.** Passing `vs`
+directly would be trivial and would make the count faithful — but that CHANGES the recorded
+member count for exactly the file that exists to pin union-alias member faithfulness, and
+whether that is a fix or a regression needs the union-alias work read properly, not a
+one-line edit. The file passes today, so the inconsistency is LATENT rather than live. Volume
+is 464 calls corpus-wide and 9 on the self-compile, so nothing rides on the performance.
+
+### METHOD NOTES
+
+* **"Closed" is a claim about what was opened.** B16 read three buckets and wrote a sentence
+  covering seven. It was right about ten of the eleven unread sites and wrong about one, and
+  the one it was wrong about is the only round trip in the census.
+* **A round trip is worth probing even when the volume is trivial.** 464 calls is nothing;
+  the reason to look was that a join-then-split can LOSE information, and it does — once.
+* **A single disagreement in 464 is a finding, not noise.** The instinct to round it to "0"
+  is exactly what the population lesson on this branch has been about, in miniature.
