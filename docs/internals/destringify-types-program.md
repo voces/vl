@@ -44020,3 +44020,101 @@ Two populations to confirm are non-empty BEFORE believing a zero:
   live arm is wrong, and then it hides that.
 * **Read all the decline sites before believing a decline is load-bearing.** Five sites, five cited
   fixtures, and every fixture belongs to the neighbouring ADMIT leg.
+
+## B34 / D-SLICE2 — B33's own population claim is wrong in BOTH directions, and slice 2 as specified would introduce the bug slice 4 exists to avoid
+
+B33 §5 ordered the remaining conversions and put "merge arms 10 + 13 + 14 into one rung test
+(`{SFB, STRUCT_MAP_FIELD}`)" second, calling it "lowest risk of the remaining set". Designing it
+refuted its population claim twice over. This entry supersedes B33 §5.2.
+
+### 1. THE CLAIMED SET IS TOO SMALL — rung 2 leaks into arm 14
+
+`structPlainRetName` (rung 2) can render a name containing `{[` while the arena gate
+`tyObjHasMapField` — which decides rung 1 — is false, because the two descend different things:
+
+| field shape | `structElemFieldsPlain` (rung 2) | `tyObjHasMapField` (rung 1) |
+|---|---|---|
+| direct `TyMap` | admits | **descends** -> rung 1 wins |
+| nested `TyObj` | admits | **descends** -> rung 1 wins |
+| `TyFunc` whose param/result is a map | admits | no |
+| `TyArray` of `TyMap` | admits | no |
+| `TyArray` of a map-carrying `TyObj` | admits | no |
+
+**Three channels, not the one B27 gave.** Witness, which compiles and runs:
+
+```
+type R = { f: i64, z: {[string]: f32}[] }
+function use(g: () => R): i64 { const r = g(); r.f }
+```
+
+The render is `{f:i64,z:{[string]:f32}[]}`, `nameIsStructWithMapField` finds `{[` at index 5, and
+the row takes ARM 14 — body A. Under a bare `{28, 1}` rung test it falls to arm 15, which is body
+B: it would pick up `resolveShapeToNominal` and re-key the pin to a declared twin's name.
+
+### 2. THE CLAIMED SET IS ALSO TOO BIG — rung 28 has a SOFT-RENDER leg
+
+`structFieldBoxRetName` sets `hasBox` for any `TyUnion` field whose members are all
+`TyPrim`/`TyLit`/`TyObj` — including a union of NON-STRING literals. But `tyIsLitUnion` requires
+every member be a `str` literal, so `litUnionAliasNameOfTy` declines; `litUnionInlineNameOfTy`
+declines on the first non-`str`; and the per-member path renders each numeric `TyLit` as its base
+`i32` and dedupes the run to ONE atom.
+
+**So `{f: 0|1}` renders `{f:i32}`** — no depth-0 `|`, no litunion alias, no `{[`. Arms 10, 13 and
+14 all decline it and it lands on ARM 15, body B. Witness, which compiles and runs:
+
+```
+type Z = 0 | 1
+type S = { f: Z, g: i64 }
+function use(h: () => S): i64 { const s = h(); s.g }
+```
+
+**A rung-28 row is therefore NOT always in arms 10/13/14**, and the merge as specified would pull
+it in — from body B to body A, DROPPING `resolveShapeToNominal`. That is precisely the failure
+B33 §3 identifies for `r17` and warns must not happen. Slice 2 as written reproduces it on rung 28.
+
+### 3. WHY B33's "SAME BODY SO IT IS INERT" ARGUMENT DOES NOT COVER EITHER
+
+B33 §1 is right that a row sliding BETWEEN arms 10, 13 and 14 is unobservable. Both defects here
+are rows sliding ACROSS the A/B boundary — one into body A, one out of it — which is exactly the
+case that argument excludes. The argument was sound and was applied to the wrong rows.
+
+### 4. THE CORRECTED PLAN
+
+Slice 2 needs a rung-28 SPLIT first (a third instance of the `r8`/`r17` pattern), discriminated by
+whether the box SURVIVES the render:
+
+* `IR_RUNG_SFB` — a box visible in the render (a depth-0 `|`, or a litunion alias)
+* `IR_RUNG_SFB_SOFT` — every box leg softened away
+
+and it converts arms 10 and 13 only, leaving arm 14 as a RESIDUAL name test whose population is
+exactly rung 2. Arm 14 retires at slice 5, which owns arm 15 and must dispose of the rung-2 leak
+and the `{}` row together.
+
+**The ordering in B33 §5 is load-bearing for a reason it did not state:** every
+`tyToEmitName(TyObj)` render passes arm 15's guard, so any row the merged predicate DROPS is still
+pinned — just at body B. Nothing becomes un-pinned. That safety net is entirely a consequence of
+arm 15 still being a name test, so slice 5 must not be co-landed with slice 2.
+
+### 5. THE POPULATIONS A MEASUREMENT MUST CONTAIN
+
+Seven, and two of them have no fixture anywhere in the tree today — the two witnesses above are
+the fixtures this slice has to add. Also: the corpus is likely to report the arm-10 and arm-13
+populations EMPTY while `tests/cases/` exercises both, so the probe must run over the fixture
+corpus as well.
+
+**And the A/B crossing is invisible to a byte comparison in most programs**:
+`resolveShapeToNominal` resolves an inline shape by field-name SET, and with no declared twin in
+scope it returns the shape unchanged — so body B is byte-identical to body A wherever no twin
+exists. A sweep can be clean on every file and still have moved rows across the boundary. **Measure
+the ARM, not the bytes.**
+
+### METHOD NOTES
+
+* **A plan's population claim is a hypothesis, and designing the slice is what tests it.** B33 §5.2
+  was derived carefully and is wrong in both directions; neither error is visible without reading
+  the two producers' field-admission sets side by side.
+* **"Same body, therefore inert" needs the rows to actually BE in those arms.** Both defects here
+  are rows that are not, and the argument silently assumed they were.
+* **When a conversion's safety depends on a LATER arm still being a name test, say so in the
+  ordering.** B33 got the order right and did not record why, which is how a co-landing would have
+  looked safe.
