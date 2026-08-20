@@ -43910,3 +43910,113 @@ you write the probe; the use is one screen away.
   incapable of observing before believing it.
 * **Three of twelve is a rate, not an accident.** The rate is worth reporting alongside the
   results the other nine produced — it is the calibration for how much a clean probe is worth.
+
+## B33 / D-LADDERPLAN — the ladder has TWO BODIES, which turns three of B27's blockers inert; and the remaining conversions, ordered
+
+B26 specified the `synthRetAnnots` conversion and B27 corrected its arm list and its rung 0. This
+entry records the finding that reframes the rest of the work, and the ordered plan that follows
+from it.
+
+### 1. TWO BODIES, NOT ONE
+
+The ladder's fifteen arms have exactly **two** bodies:
+
+* **body A** — `fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)` — arms 1-11, 13, 14
+* **body B** — `fn.fnRet = synthTypeRefTy(resolveShapeToNominal(ctx), -1, ctxTy)` — arms **12 and 15**
+
+So only three things are observable: a row that starts pinning, a row that stops pinning, and a row
+that crosses the A/B boundary. **A row sliding between two body-A arms is a no-op.**
+
+That changes the verdicts. B27 rated `r1 -> a11` UNSOUND because a `structFieldBoxRetName` DECLINE
+lets an earlier name arm claim the row — but arms 10, 13 and 14 all share body A, so under a joint
+conversion the mis-claim is unobservable. **B27's headline blocker for the struct arms is inert**,
+and what is genuinely observable shrinks to two things: `r2`'s leak into arm 14, and `r17`
+straddling the boundary (below).
+
+This also settles why the conversions so far have been safe to measure by ladder POSITION rather
+than by effect: position implies effect only when the bodies differ, and for arms 1-11/13/14 they
+do not.
+
+### 2. ARM 3 WAS DEAD BY CONTRACT, NOT BY MEASUREMENT
+
+`nameIsMapMemberUnion` needs a `{[`-leading name with >= 2 top-level atoms. Only `mapUnionRetName`
+(rung 21) renders one — the `recordable` fall-through cannot (`isObjShapeName` rejects a top-level
+`|`), and every list producer's `|` sits inside a grouper (one atom). Rung 21 is in arm 1's set, so
+arm 1 takes every row arm 3 could have.
+
+B26 measured arm 3 as never-reached; that is now an argument. Deleted with arm 1's conversion —
+**and the reason to delete rather than keep is that its body is IDENTICAL to arm 1's**, so it could
+only ever fire when arm 1's rung set MISSED a row, and it would paper over that by pinning anyway.
+A dead arm with a duplicate body is a defect-masker, not a safety net.
+
+### 3. `r17` IS A SECOND `nulElemListRetName`
+
+`structFieldBoxRetName` sets `hasBox` for a `TyUnion` field whose members are ALL `TyLit` — a
+litunion-alias field — so `r17` can render `{f:K0}[]`. Then `nameIsStructWithUnionField("{f:K0}")`
+is false (no top-level `|` in the field text) while `nameIsWholeSpanShape("{f:K0}")` is true:
+
+| leg | element's box source | arm |
+|---|---|---|
+| union/nullable | a `TyUnion` with a non-`TyLit` member, or a `TyNullable`, at any depth | **11** (body A) |
+| litunion-only | every box field is a `TyUnion` of `TyLit`s only | **12** (body B) |
+
+So `r17` STRADDLES THE A/B BOUNDARY, and converting arm 11 alone would drag its litunion leg from
+body B to body A, dropping `resolveShapeToNominal`. The fix is `r8`'s — two codes, discriminated by
+a `hasNonLitBox` flag threaded out of `structFieldBoxRetName` — and as with `r8` the consumer
+already implements the split, inverted.
+
+### 4. `structFieldBoxRetName`'s DECLINES ARE UNMEASURED CONSERVATISM
+
+B27 named the decline-vs-absent conflation as the root cause of two UNSOUND rungs. Reading all
+FIVE decline sites (B27's count of four is stale — the nullable one is newer): **not one cites a
+fixture showing that pinning that shape produces invalid wasm.** Every seed they cite is the
+fixture of the neighbouring ADMIT leg. The justification is prospective and stated in the header:
+"the annotated form itself rejects those, so pinning would turn a working shape into a NEW loud
+reject."
+
+So the declines are conservatism, not repair — and the distinction turns out to be **unnecessary**
+for arms 10/13/14 anyway: on a decline, `r2` provably cannot fire (`structElemFieldsPlain` has no
+`TyUnion` or `TyNullable` arm, and a declined struct necessarily carries one), so the row can only
+be `r1` or the fall-through. The conflation is inert at this consumer.
+
+**A latent bug found while reading, worth its own slice:** the nested-struct recursion inside
+`structFieldBoxRetName` commits the same conflation INTERNALLY — `if structFieldBoxRetName(field)
+!= "" { hasBox = true }` — while its comment asserts the opposite ("the `""` is a plain no-box, not
+a decline"). A nested struct that DECLINES as unlowerable is read as "no box", so the outer struct
+can return a name carrying an unlowerable nested union.
+
+### 5. THE ORDER, AND ITS DEPENDENCIES
+
+1. **Arm 1 -> the eight-rung set; delete arm 3.** Independent. Removes the ladder's largest name
+   test AND a cross-pass dependence. **Shipped.**
+2. **Merge arms 10 + 13 + 14 into one rung test** (`{SFB, STRUCT_MAP_FIELD}`). Three predicates
+   retired, `structFieldBoxRetName` untouched, B27's `r1` unsoundness inert (§1).
+3. **Split rung 0 into three codes; convert arm 9.** Independent. Arm 9's predicate and
+   `isScalarListRetName`'s admitted set are CHARACTER-IDENTICAL three-way sets, so this is the
+   cleanest remaining conversion.
+4. **Split `r17`; convert arms 11 and 12 TOGETHER.** After 2. Must land as one change or the
+   litunion leg crosses bodies.
+5. **Arm 15.** After 2. Needs evidence the others do not: a fixture for the `r2` renders containing
+   `{[` outside `tyObjHasMapField`'s reach, and a disposition for the `{}` row — the ONE space-free
+   rung-0 obj-shape render, which arm 15 pins today and a rung set would drop.
+6. **Do not convert** the `r29` niche legs into anything. They reach no arm today and must keep
+   reaching none.
+
+### 6. WHAT MUST BE MEASURED, AND WHAT A CLEAN NUMBER WOULD NOT MEAN
+
+Per B32 the probe must compute the LADDER POSITION, and per B26 it must aggregate across files.
+Two populations to confirm are non-empty BEFORE believing a zero:
+
+* slice 5 — an `r2` row carrying `{[` outside the arena gate's reach. Without one, the corpus
+  cannot witness the only observable delta.
+* slice 4 — a `{f:K0}[]`-shaped `r17` row. Without one, the split is still right by construction,
+  but the measurement says nothing.
+
+### METHOD NOTES
+
+* **Find the distinct BODIES before arguing about the arms.** Fifteen arms and two behaviours means
+  most of the equivalence obligations are vacuous, and the ones that are not become obvious.
+* **A dead arm whose body duplicates a live arm's is a defect-masker.** It cannot fire unless the
+  live arm is wrong, and then it hides that.
+* **Read all the decline sites before believing a decline is load-bearing.** Five sites, five cited
+  fixtures, and every fixture belongs to the neighbouring ADMIT leg.
