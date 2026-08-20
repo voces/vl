@@ -16,30 +16,47 @@
 // `vl check --codegen` exits 0 and `vl run` reports
 // `type mismatch: expected (ref $type), found (ref $type)`. Pre-existing on master.
 //
-// IT IS ONLY THE **NAMED** DECLARATION THAT FAILS, AND THAT IS THE WHOLE LEAD. The identical
-// permutation written INLINE works:
+// IT IS ONLY THE **NAMED** DECLARATION THAT FAILS. The identical permutation written INLINE
+// works — `const q: { b: string, a: i32 } = …` passed to `f(x: P)` runs, and the module
+// carries ONE struct row rather than two.
 //
-//   const q: { b: string, a: i32 } = { b: "s", a: 7 }
-//   print(f(q))          // f(x: P) — runs, prints 7
+// THE MECHANISM, PRECISELY (an earlier note in this file said named declarations "bypass a
+// lookup"; they do not consult one, and neither does the same-order case — the two are saved
+// by different things):
 //
-// and the module carries ONE struct row, not two: the inline annotation is looked up by its
-// FIELD SET and lands on `P`'s existing row. A `type Q = …` declaration goes through
-// `internShapeAs`, which mints a row keyed by the ALIAS NAME without that lookup. So the
-// canonicalisation this needs is not missing — it already exists and named declarations
-// bypass it.
+//   · An INLINE annotation resolves through `annShapeIndexOf`, which is ORDER-INSENSITIVE:
+//     it buckets on `shapeFieldSetIdOf` (which SORTS the field sids) and then matches with
+//     `sFieldIndex(si, names[i])` — a lookup BY FIELD NAME, not by position. So a permuted
+//     inline spelling finds `P`'s existing row and no second row is ever minted.
+//   · A NAMED declaration mints unconditionally — `sNames.push(s.tdName)` for a `TypeDecl`,
+//     `internShapeAs` for the struct-alias union form. Neither consults `annShapeIndexOf`.
+//     So `P` and `Q` are always two ROWS.
+//   · Two rows collapse to one wasm HEAP TYPE only when their field SEQUENCE is identical.
+//     That is why three same-order aliases emit ONE struct type and run, and why the
+//     permuted pair emits two and fails validation. The merge is positional; the row lookup
+//     is not.
+//
+// So the order-insensitive machinery exists and is proven by the inline path; the named path
+// simply never reaches it.
 //
 // Measured across 14 positions: param, binding, return, array element, struct field, map
 // value, generic argument, nullable, `.push`, closure parameter and an all-i32 permutation
 // are ALL check-clean invalid wasm. Only three work — the same-order inline, the PERMUTED
 // inline, and boxing into a union.
 //
-// STILL PINNED RATHER THAN FIXED, because the remaining question is semantic and not
-// mechanical: making the two aliases share a row makes them share an `is` verdict. `x is P`
-// and `x is Q` become indistinguishable, which FOLLOWS from the ruling (they are one type,
-// so nothing may tell them apart) but is a visible change to narrowing that the ruling did
-// not explicitly cover. The alternative — a field-reordering copy at the boundary — keeps
-// them distinguishable at a per-assignment cost, and makes two "identical" types observably
-// different in performance.
+// THE `is` QUESTION IS ALREADY ANSWERED BY EXISTING BEHAVIOUR, which an earlier note here
+// treated as open. Two aliases with the SAME field order already share a row and already
+// share an `is` verdict — `type P = {a:i32}` / `type Q = {a:i32}`, a `Q` value boxed into
+// `P | i32`, and `u is P` is TRUE. So "structurally identical named aliases are
+// indistinguishable by `is`" is not a new semantic this fix would introduce; it is what the
+// compiler already does, and extending it to permuted twins is the consistent completion.
+//
+// What remains is therefore a straightforward choice of SITE, not of semantics:
+//   (a) make the named declaration consult `annShapeIndexOf` before minting, so the twins
+//       become one ROW — smallest change, reuses the order-insensitive path the inline
+//       spelling already proves, and the heap-type merge then follows for free;
+//   (b) make the heap-type merge itself order-insensitive — larger, and it would have to
+//       carve out the FLAT types, whose offsets ARE their layout.
 //
 // The FLAT-type exception is not at risk either way: `flat type` layout is pinned by
 // `tests/cases/memory/flat-layout-grid.vl` ("order is layout, and nothing is reordered to
