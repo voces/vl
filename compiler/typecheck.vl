@@ -21649,6 +21649,67 @@ export function recordClonedNodeTy(nodeIx: i32, name: string, pin: i32) {
   recordClonedNodeTyKnown(nodeIx, name, pin, -1)
 }
 
+// `recordClonedNodeTyKnown` with the handed type as a FALLBACK instead of an override: the
+// NAME is resolved first and wins wherever it resolves, and `tyFb` is consulted only where
+// it does NOT — the position that otherwise records a COARSE PLACEHOLDER
+// (`funcPinTyIx` / `objPinTyIx`).
+//
+// WHAT READS THIS, so the next slice checks the right thing: for a monomorphized param the
+// recorded type is banked into `emit_mono`'s `pinnedTyIx` column and handed to
+// `monoInferListElem` / `monoInferLocalScalar`, which `declare` it and RE-CHECK the generic
+// body — and that check's result becomes the instance's synthesized RETURN annotation. So a
+// changed answer here can move emitted bytes; it is not confined to one node's sidecar.
+// Measured for this change: 0 of 2,017 corpus rows move.
+//
+// The precedence is the whole point, and it is measured rather than chosen. Over the corpus
+// the monomorphizer's pinned names resolve and AGREE with the argument's recorded type 838
+// times; they resolve and DISAGREE 119 times (dominated by an argument type that renders
+// empty, plus the genuine `i64` pin over an `i32` literal, where the NAME is the correct
+// answer and an override would be a wrong pin); and they FAIL TO RESOLVE 77 times. Those 77
+// are the emitter's own synthetic spellings — `#anon0` for an interned anonymous shape,
+// `=>ii>i` for a `$fnsig` key — names that exist ONLY as strings and that `nameToTy` was
+// never able to parse back. A placeholder is all the name path can offer there; the handed
+// arena type is the real one.
+export function recordClonedNodeTyFb(
+  nodeIx: i32,
+  name: string,
+  pin: i32,
+  tyFb: i32,
+) {
+  if nodeIx < 0 { return -1 }
+  let ty = nameToTy(name)
+  if ty < 0 {
+    // `PIN_SIGKEY` ONLY — one pin, not both, and excluding `PIN_ANON` is a MEASURED RESULT
+    // rather than caution. DO NOT "complete" this by adding the ANON arm.
+    //
+    // The two look identical from here: both spellings (`=>ii>i`, `#anon0`) are ones the
+    // EMITTER minted for itself, `nameToTy` can parse neither, and both fall through to a
+    // coarse placeholder below. They are not identical.
+    //
+    // A `$fnsig` key is a pure ENCODING of a function type and carries no identity of its
+    // own, so the argument's arena `TyFunc` is strictly more information about the same
+    // type. `#anonN` is THE NAME OF A SPECIFIC INTERNED ROW in the emitter's shape table,
+    // and that row identity is not something the checker's arena carries — a structurally
+    // EQUAL argument type is a DIFFERENT row. Recording it for an ANON pin turned five
+    // `tests/cases/inference/hole-*` chains from running into
+    // `struct.get expected (ref null 0), found local.get of type i32`: a derived hole
+    // marker is deliberately left unresolved here for the inference to re-base later, and
+    // the concrete type pinned shut a slot that had to stay open.
+    //
+    // Isolated by enabling the two arms separately — SIGKEY alone is green everywhere,
+    // SIGKEY+ANON reddens exactly those five. So of the 77 unresolvable sites the header
+    // counts, the ANON majority is NOT convertible by this route.
+    if pin == PIN_SIGKEY { ty = tyFb }
+  }
+  if ty < 0 {
+    if pin == PIN_SIGKEY { ty = funcPinTyIx() }
+    else if pin == PIN_ANON { ty = objPinTyIx() }
+  }
+  while nodeTyIx.length <= nodeIx { nodeTyIx.push(-1) }
+  nodeTyIx[nodeIx] = ty
+  ty
+}
+
 // THE HAND-OVER FORM. `recordClonedNodeTy` above resolves the synthesized NAME by parsing
 // it — which is the shape the destringify programme exists to remove, at its purest where
 // the producer BUILT that name out of parts it already held (`emit_rewrite`'s
@@ -21660,6 +21721,10 @@ export function recordClonedNodeTy(nodeIx: i32, name: string, pin: i32) {
 //
 // The name is still recorded on the node — it is the node's `tyName`, read by consumers
 // that have not been converted — so this removes the PARSE, not yet the spelling.
+//
+// SIBLING WARNING: `recordClonedNodeTyFb` above has the IDENTICAL signature and the
+// OPPOSITE precedence — there the NAME wins and the handed index only fills a gap.
+// Passing one where the other is meant compiles silently and inverts the resolution order.
 export function recordClonedNodeTyKnown(
   nodeIx: i32,
   name: string,
