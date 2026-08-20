@@ -595,6 +595,7 @@ function repElemMemoSync() {
   ) {
     repElemMemo = []
     hcElemMemo = [] // the identity twin's memo, on the same generation
+    hcMvMemo = [] // the map-value twin's, on that same generation for the same reason
     repElemMemoEpoch = tyMutEpoch
     repElemMemoUserVer = cUserTypesVer
     repElemMemoLen = sNames.length
@@ -1012,12 +1013,23 @@ export function mvSlotOfTy(ty: i32): i32 { mvSlotOfTyK(ty, false) }
 // read as an i32 list: invalid wasm that `vl check` cannot see).
 export function mvSlotOfTyK(ty: i32, keyI32: boolean): i32 {
   if ty < 0 { return -1 }
-  const k = repMvValKey(ty)
+  // THE INTERNED ID, not a rebuilt spelling. Both sides of this comparison are ARENA
+  // INDICES; master rendered each to a full structural STRING and compared the strings —
+  // and did it inside the scan, so `repMvValKey` was re-run for every occupied row on every
+  // query. Measured over the corpus at the head of this programme: 94,635 calls for 1,211
+  // distinct types, 98.7% of them repeats.
+  //
+  // The id form is the same move `repCanonKey` -> `repCanonId` and `repElemKey` ->
+  // `repElemId` already made; this was the one of the three that was never converted, and
+  // the last string hash-cons key in the compiler whose two sides are both arena types.
+  // It also retires the memo B16 built and declined: an interned id needs no memo to stop
+  // re-deriving, because the id IS the derivation.
+  const k = repMvValId(ty)
   let i = 0
   while i < mvValTyIx.length {
     if mvValTyIx[i] >= 0 {
       if mvSlotKeyI32(i) == keyI32 {
-        if repMvValKey(mvValTyIx[i]) == k { return i }
+        if repMvValId(mvValTyIx[i]) == k { return i }
       }
     }
     i = i + 1
@@ -1354,6 +1366,7 @@ export function hcReset() {
   // cleared, so its own sync stays the single place that rebuilds it.
   hcCanonMemo = []
   hcElemMemo = []
+  hcMvMemo = []
   repSlotCacheEpoch = -1
   hcTag = []
   hcArgStart = []
@@ -1603,7 +1616,7 @@ function repCanonIdGo(ty: i32): i32 {
       return hcIntern(HC_NUL, a, hcLen[c] + 1)
     }
     TyUnion => {
-      return hcUnionId(t.uMembers, true)
+      return hcUnionId(t.uMembers, 0)
     }
     TyFunc => {
       // `"(" + join(",", params) + ")=>" + ret` — ONE for the open paren; the closer is
@@ -1661,7 +1674,10 @@ function repCanonIdGo(ty: i32): i32 {
 // The union arm, shared by both identities because the MIX-WIDENING rule is one rule
 // written twice in the string builders and must not become three. `canon` selects which
 // child identity to recurse with — the two differ only in that.
-function hcUnionId(mems: i32[], canon: boolean): i32 {
+// `mode`: 0 = canon, 1 = ref-list ELEM, 2 = map-VALUE. The three id walks share this arm
+// because the litunion-collapse it implements is identical in all three — only the RECURSION
+// differs, and that is what `mode` picks.
+function hcUnionId(mems: i32[], mode: i32): i32 {
   let mixHasOther = false
   let mi = 0
   while mi < mems.length {
@@ -1683,7 +1699,9 @@ function hcUnionId(mems: i32[], canon: boolean): i32 {
   let i = 0
   while i < mems.length {
     let r = -1
-    if canon { r = repCanonId(mems[i]) } else { r = repElemId(mems[i]) }
+    if mode == 0 { r = repCanonId(mems[i]) }
+    else if mode == 2 { r = repMvValId(mems[i]) }
+    else { r = repElemId(mems[i]) }
     let skip = false
     if mixHasOther {
       let iLit = tyIsLitUnion(mems[i])
@@ -1730,7 +1748,7 @@ export function repElemId(ty: i32): i32 {
     }
   }
   hcElemStack.push(ty)
-  let r = repElemIdGo(ty)
+  let r = repElemIdGo(ty, false)
   hcElemStack.pop()
   if hcLen[r] > 262144 {
     const a: i32[] = []
@@ -1744,13 +1762,76 @@ export function repElemId(ty: i32): i32 {
   r
 }
 
-function repElemIdGo(ty: i32): i32 {
+// The mode dispatch for the shared walk's recursion. Each entry point owns its own cycle stack
+// and its own depth-0 memo, so a nested call has to re-enter through the RIGHT one — recursing
+// straight into `repElemIdGo` would share `repElemId`'s stack with an mv walk and let a cycle in
+// one be reported as a back-edge in the other.
+function repIdOf(ty: i32, mv: boolean): i32 {
+  if mv { return repMvValId(ty) }
+  repElemId(ty)
+}
+
+// The identity twin of `repMvValKey` — the MAP-VALUE slot key as an interned id. Its memo
+// carries the same triple as `repElemMemo` because it shares that walk's `repSlotOfTyDecl` read,
+// which is SID-KEYED: `sidKeyedTablesReset` runs INSIDE the module-parse loop, so a memo that did
+// not ride the same generation would answer out of the previous space's rows.
+let hcMvMemo: i32[] = []
+const hcMvStack: i32[] = []
+
+export function repMvValId(ty: i32): i32 {
+  if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
+  let si = hcMvStack.length - 1
+  while si >= 0 {
+    if hcMvStack[si] == ty {
+      const d = hcMvStack.length - si
+      const a: i32[] = []
+      a.push(d)
+      return hcIntern(HC_BACK, a, 1 + hcDigits(d))
+    }
+    si = si - 1
+  }
+  const top = hcMvStack.length == 0
+  if top {
+    repElemMemoSync()
+    if ty < hcMvMemo.length {
+      if hcMvMemo[ty] >= 0 { return hcMvMemo[ty] }
+    }
+  }
+  hcMvStack.push(ty)
+  let r = repElemIdGo(ty, true)
+  hcMvStack.pop()
+  if hcLen[r] > 262144 {
+    const a: i32[] = []
+    a.push(ty)
+    r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
+  }
+  if top {
+    while hcMvMemo.length <= ty { hcMvMemo.push(-1) }
+    hcMvMemo[ty] = r
+  }
+  r
+}
+
+// The MAP-VALUE id is this same walk with the ref-list leaf folds switched OFF, which is the
+// only place the two structural keys ever differed (`repMvValKey`'s header: "No leaf-list fold:
+// `i32[]` / `boolean[]` / `K[]` are DISTINCT mv rows"). Shared rather than copied so the two
+// cannot drift arm for arm — the property `repElemKey`/`repCanonKey` state about each other and
+// which a hand-written third copy would have quietly given up.
+function repElemIdGo(ty: i32, mv: boolean): i32 {
+  let mvMode = 1
+  if mv { mvMode = 2 }
   const t = T.tys[ty]
   match t {
     TyArray => {
-      if tyIsI32LeafElem(t.aElem) { return hcIntern(HC_RLI32, hcNoArgs, 7) }
-      if tyIsStrLeafElem(t.aElem) { return hcIntern(HC_RLSTR, hcNoArgs, 7) }
-      const c = repElemId(t.aElem)
+      // THE ONE DIVERGENCE between the two walks. The ref-list elem key folds an i32/string
+      // LEAF array to a single shared row; the map-value key must not, because `i32[]`,
+      // `boolean[]` and `K[]` are distinct mv rows and folding them would make a `{[K]: i32[]}`
+      // resolve a `{[K]: boolean[]}`'s slot.
+      if !mv {
+        if tyIsI32LeafElem(t.aElem) { return hcIntern(HC_RLI32, hcNoArgs, 7) }
+        if tyIsStrLeafElem(t.aElem) { return hcIntern(HC_RLSTR, hcNoArgs, 7) }
+      }
+      const c = repIdOf(t.aElem, mv)
       const a: i32[] = []
       a.push(c)
       return hcIntern(HC_ARRAY, a, hcLen[c] + 2)
@@ -1766,7 +1847,7 @@ function repElemIdGo(ty: i32): i32 {
       let len = 2
       let i = 0
       while i < t.objFieldNames.length {
-        const c = repElemId(t.objFieldTypes[i])
+        const c = repIdOf(t.objFieldTypes[i], mv)
         a2.push(sidOf(t.objFieldNames[i]))
         a2.push(c)
         len = len + t.objFieldNames[i].length + 1 + hcLen[c] + 1
@@ -1778,13 +1859,13 @@ function repElemIdGo(ty: i32): i32 {
       return hcPrimId(t.primName)
     }
     TyNullable => {
-      const c = repElemId(t.nInner)
+      const c = repIdOf(t.nInner, mv)
       const a: i32[] = []
       a.push(c)
       return hcIntern(HC_NUL, a, hcLen[c] + 1)
     }
     TyUnion => {
-      return hcUnionId(t.uMembers, false)
+      return hcUnionId(t.uMembers, mvMode)
     }
     TyFunc => {
       // See the canon twin: 1 for the open paren, the closer rides in `")=>"`.
@@ -1793,19 +1874,19 @@ function repElemIdGo(ty: i32): i32 {
       let i = 0
       while i < t.fnParamTypes.length {
         if i > 0 { len = len + 1 }
-        const c = repElemId(t.fnParamTypes[i])
+        const c = repIdOf(t.fnParamTypes[i], mv)
         a.push(c)
         len = len + hcLen[c]
         i = i + 1
       }
-      const rc = repElemId(t.fnRet)
+      const rc = repIdOf(t.fnRet, mv)
       a.push(rc)
       len = len + 3 + hcLen[rc]
       return hcIntern(HC_FUNC, a, len)
     }
     TyMap => {
-      const kc = repElemId(t.mKey)
-      const vc = repElemId(t.mVal)
+      const kc = repIdOf(t.mKey, mv)
+      const vc = repIdOf(t.mVal, mv)
       const a: i32[] = []
       a.push(kc)
       a.push(vc)
@@ -1818,7 +1899,7 @@ function repElemIdGo(ty: i32): i32 {
       return hcIntern(tag, a, head + 1 + hcLen[kc] + 1 + hcLen[vc] + 1)
     }
     TyNeg => {
-      const c = repElemId(t.negTy)
+      const c = repIdOf(t.negTy, mv)
       const a: i32[] = []
       a.push(c)
       return hcIntern(HC_NEG, a, 1 + hcLen[c])
@@ -4453,6 +4534,12 @@ function repShadowNoteRaw(msg: string) {
 function repShadowCheckTy(ty: i32) {
   hcCheckKey("canon", repCanonKey(ty), repCanonId(ty))
   hcCheckKey("elem", repElemKey(ty), repElemId(ty))
+  // The MAP-VALUE leg. `repMvValKey` has no functional caller any more — `mvSlotOfTyK` compares
+  // ids — and this is where it earns its keep, as the SHADOW of the id it was replaced by. The
+  // other two keys are kept for exactly this reason; leaving mv out would have made it the one
+  // key with no oracle at the moment it stopped being load-bearing, which is when drift stops
+  // being visible.
+  hcCheckKey("mv", repMvValKey(ty), repMvValId(ty))
   const tix = repTreeOfTy(ty)
   repShadowTys = repShadowTys + 1
   const reason = repTreeUnsupReason(tix)
