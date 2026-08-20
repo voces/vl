@@ -43271,3 +43271,128 @@ guard leaves the string in the data flow and buys one predicate call.
   reads as a one-line swap at the point of use, and the header of the function being swapped
   out is where the price is written down. Open the callee before assigning a difficulty —
   the same error B15 made in the other direction.
+
+## B24 / D-CLOTAG — a render that stands in for a hash-cons is NOT always replaceable by one, and the measurement that said otherwise could not have seen it
+
+`cloArmTagOfTy` picks the union-box TAG a bare function-typed arm claims — read by the BOX site
+and the TEST site, so the two must agree or a value boxed through one arm answers an `is` against
+another. It derived that tag by rendering the arena type and interning the SPELLING.
+
+The census ranked this the cleanest single-line demonstration in the tree that a render is
+standing in for a hash-cons, and the reading looked airtight: the arena is not hash-consed, so
+`type F = (i32) => i32` and a bare `(i32) => i32` are two rows denoting one signature, and
+rendering both to `(i32)=>i32` is exactly what makes them meet. `repCanonId` is that
+canonicalisation on the arena. Swap the key.
+
+**It was shipped to a PR and it is wrong.** Reproduced by a reviewer, then by me:
+
+```
+type K0 = "a" | "b"
+type K1 = "c" | "d"
+type MA = (K0 | f64) => i32
+type MB = (K1 | f64) => i32
+```
+
+| cell | master | id-keyed |
+|---|---|---|
+| `MA is-MA` | yes | yes |
+| `MA is-MB` | **no** | **yes** |
+| `MB is-MA` | **no** | **yes** |
+| `MB is-MB` | yes | yes |
+
+`rc 0`, valid module, no diagnostic — a silent wrong `is`, the class the tag table was built to
+close, reintroduced on a narrower shape.
+
+### 1. TWO VOCABULARIES, DELIBERATELY DIFFERENT
+
+`hcUnionId` **mix-widens**: with any non-lit member present, every litunion member is rewritten to
+`hcPrimId("string")` and deduped. `tyToEmitName` does the **opposite** — it regroups the flattened
+literals back into their registered ALIAS name. So `(K0|f64)=>i32` and `(K1|f64)=>i32` render to
+two spellings and intern to one id.
+
+And the render is **POSITION-DEPENDENT** (`ctxKeepsLitUnion` is true at `RC_ELEM` / `RC_FIELD` /
+`RC_MAP_VAL` / `RC_FN_RES`, false at `RC_ROOT` / `RC_FN_PARAM`) while `repCanonId`'s classes are
+not. "The same canonicalisation, performed on the arena" assumed that asymmetry away.
+
+`repCanonId` also does not canonicalise `TyLit` at all — it falls to the arena-index sentinel —
+and unlike `TyVar`/`TyErr` that is NOT caught by a render-declines guard, because a `TyLit`
+renders non-empty.
+
+### 2. THE MEASUREMENT WAS CLEAN AND COULD NOT HAVE SEEN IT
+
+The probe kept both tables side by side and compared the SLOT each assigned: 45 corpus files
+reach the table, 0 disagreements. No corpus file carries a mixed litunion-alias closure arm.
+
+This is the third clean number this branch has taken over a population that could not hold the
+failure — and it is the first where the tool to check was in hand and aimed at the wrong axis. A
+sabotage build was run and it confirmed the SITE IS REACHED (45 files, 74 fuzz shapes). It says
+nothing about whether the DISTINGUISHING SHAPES are present, and those are different questions:
+
+* **reach** — does anything execute this code? (a sabotage build answers this)
+* **discrimination** — does anything execute it with inputs whose answers must DIFFER? (only a
+  constructed grid answers this)
+
+A key swap is a claim about an EQUIVALENCE RELATION, so only the second question is relevant, and
+only the first was asked.
+
+### 3. THE PERF THESIS DID NOT SURVIVE EITHER
+
+`tyToEmitName` is still built in full on every call, as the decline guard. The only saving is a
+per-row `string ==` in a table with 1-3 rows in 45 of ~2,000 modules — near nil against a real
+semantic surface, and no emitter-TOTAL A/B was ever produced, which this project's own rule
+requires for a perf slice (B-PARSECOUNT). Two independent reasons to close rather than iterate.
+
+### METHOD NOTES
+
+* **A render standing in for a hash-cons is a HYPOTHESIS about an equivalence relation.** Test it
+  by CONSTRUCTING the pairs the two vocabularies could disagree on — litunion aliases, permuted
+  fields, nullable-vs-union, position-sensitive renders — not by observing agreement where the
+  corpus happens to go.
+* **Reach is not discrimination.** A sabotage build sizes the population that EXECUTES a site.
+  For an equivalence claim you need the population that DISTINGUISHES, and no sweep of existing
+  code produces it.
+* **Two vocabularies that agree on every observed case can be built to disagree on purpose.**
+  `hcUnionId` widens litunions because its consumers want that; `tyToEmitName` preserves aliases
+  because ITS consumers want that. Neither is wrong, and neither is a canonicalisation of the
+  other.
+* **The census rated this TRIVIAL-to-MODERATE and it was neither.** B22 already recorded that a
+  census rates from the call site while the cost lives in the callee; this adds that the cost can
+  live in a callee's callee — `repCanonId` looked like the right primitive until `hcUnionId`'s
+  widening was read.
+
+## B25 / D-REVFIND — three of this run's findings came from REVIEW, and none of them from a sweep
+
+Worth counting, because it changes where the next hour should go.
+
+| finding | severity | found by |
+|---|---|---|
+| f32 / 3-D nested-array leaves: loud reject -> check-clean invalid wasm | CRITICAL | review |
+| litunion-alias closure arms merge onto one tag: silent wrong `is` | CRITICAL | review |
+| field-permuted object params in closure arms: check-clean invalid wasm (PRE-EXISTING) | — | review |
+| a false justification: declared vs inline `TyObj` rows "are one type" | MAJOR | review |
+| `rep-fuzz-check.sh` vacuous for the `collectLocals` synthesis | process | review |
+| nested-array inferred-empty push: check-clean invalid wasm | — | trying to WIDEN a fixture |
+
+**Zero came from a sweep.** B17 recorded five sweeps over 85 constructible cells, all clean, and
+concluded the defect hunt was exhausted on constructible axes. That conclusion holds and is
+almost beside the point: the sweeps enumerate shapes someone already thought of, while a reviewer
+reading a diff asks "what does this change ASSUME", which reaches shapes no enumeration contains.
+
+The two channels that produced everything here:
+
+1. **Adversarial review of a specific change**, with the reviewer told what the change assumes and
+   asked to break exactly that. Every CRITICAL came from this.
+2. **Trying to widen a fixture's cover.** Adding three element kinds to a fixture found all three
+   failing at master, one of them a hole nothing in the corpus reached. The cover was the goal;
+   the defect was the yield.
+
+### METHOD NOTES
+
+* **Budget review time per change, not per programme.** The reviews that found CRITICALs were the
+  ones handed a specific hypothesis to attack ("is this key the same equivalence?"), not a general
+  "review this PR".
+* **A clean sweep bounds what you enumerated, not what exists.** B17's five sweeps were sound and
+  found nothing; six defects were found anyway, by other means, in the same tree.
+* **The pre-existing defect a reviewer trips over is worth as much as the one they were looking
+  for.** The permuted-closure-arm miscompile is now pinned
+  (`xfail-miscompile-permuted-object-closure-arms.vl`) and would otherwise still be unknown.
