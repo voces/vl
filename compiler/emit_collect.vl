@@ -70,6 +70,7 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyIsI32,
   nodeTyName,
+  tyArrayElemPrimName,
   tyIsLitUnion,
   tyNomNameCycled,
   tyToNominalName,
@@ -1258,7 +1259,6 @@ export function buildFnMap(_stmts: i32[]) {
         // `(K|null)[]`, and `nameIsStringArray` also accepts `(string|null)[]`. Those share a
         // BACKING, not a `fRetKind`, so routing to them would WIDEN what this stores — the
         // faithful cut ships (the D-SHAPEFIELD precedent: unreached is not licensed).
-        const ielem = arrElemNameRaw(inm)
         const li = fRetKind.length - 1
         // THE FIVE SCALAR ARMS ASK THE ARENA, not the render. Each was a WHOLE-SPELLING
         // equality against a name the compiler had just rendered from a type it held — the
@@ -1309,6 +1309,62 @@ export function buildFnMap(_stmts: i32[]) {
           const rpt = T.tys[retTyIx]
           if rpt is TyPrim { retPrim = rpt.primName }
         }
+        // THE FIVE ARRAY ARMS, likewise from the arena. Each was a `[]`-CUT on the rendered name
+        // (`arrElemNameRaw(inm) == "f64"`, and `nameIsF64Array` is literally that) — the same
+        // render-then-parse the scalar arms were, one constructor out.
+        //
+        // NARROW BY CONSTRUCTION, which is the whole care here. The arms' own header explains
+        // that they take the cut DIRECTLY rather than routing to `nameIsI32Array` /
+        // `nameIsStringArray`, because those are REP-wide — they also accept `boolean[]`, a
+        // litunion `K[]`, `(boolean|null)[]`, `(K|null)[]` — and those share a BACKING, not a
+        // `fRetKind`. So this accepts exactly the five element names the cut admits and nothing
+        // else.
+        //
+        // A `boolean` ELEMENT IS THE TRAP — #1511's i32 trap one constructor out. `boolean[]` is a
+        // `TyArray` of `TyPrim`, so an arena test written the obvious way claims it, while the
+        // cascade deliberately gives it NO arm (boolean rides i32, so it belongs to the default).
+        // The first version of the probe here did exactly that.
+        //
+        // THE WHITELIST IS NOT WHAT MAKES TODAY'S CONVERSION SOUND, and saying otherwise would
+        // overstate it: the `boolean[]` population is currently EMPTY. No recorder rung banks such
+        // a row — `isClassifiableRetName` cuts to `"boolean"` and rejects, `isScalarListRetName`
+        // admits only i64/f32/f64, and no `unm` rung takes a bare `TyPrim` element — so `retTyIx`
+        // is -1 and `retElem` is "" with or without it. The whitelist protects against a future
+        // widening of a gate 20k lines away, and is kept for exactly that.
+        //
+        // THE BRANDED-ELEMENT HAZARD, the array form of #1511's FALSE #2: `type NF = new f64` used
+        // as `NF[]` IS a `TyArray` of `TyPrim f64` in the arena, while `tyToStrGo` renders it
+        // `NF[]` and the cut declines. Inert for the same reason — no rung banks it. Add an array
+        // rung that banks a bare `TyArray(TyPrim)`, or widen either gate, and these arms begin
+        // firing where the name arms did not.
+        //
+        // AND FALSE #1 one constructor out: a one-member `TyUnion` element renders BARE, so
+        // `type S = f64` used as `S[]` renders `f64[]`. Closed twice over — `singleAliasMemberTyIx`
+        // collapses a `TyPrim` member unconditionally, and every residue it declines (a `TyLit`
+        // member, a canonicalised intersection `TyObj`, a non-scalar-spine `TyArray`) renders as
+        // something that is not a bare prim name.
+        //
+        // The recorded ARRAY type is read off the same row the name came from, so the two cannot
+        // select different rows — see the `inRow` note above.
+        //
+        // Measured: 13 corpus files reach these arms, all five element kinds exercised, 0
+        // disagreements — AND THE CORPUS COULD NOT HAVE CONTAINED ONE, for the same reason
+        // #1511's 0/177 could not: the only shapes that disagree (branded element, one-member
+        // union element) are never banked, so they are absent from both columns regardless. What
+        // makes the conversion safe is the argument above, not the count.
+        //
+        // The population also splits: `i32[]`/`string[]` reach these arms from BOTH the named and
+        // the lambda recorder, while `f64[]`/`i64[]`/`f32[]` reach them ONLY through the anonymous
+        // lambda's `isScalarListRetName` rung — `isClassifiableRetName` gates named functions out,
+        // which `wasmEmit`'s f32 reject already relies on.
+        let retElem = ""
+        const raePrim = tyArrayElemPrimName(retTyIx)
+        const raeOk = raePrim == "i32" ||
+          raePrim == "string" ||
+          raePrim == "f64" ||
+          raePrim == "i64" ||
+          raePrim == "f32"
+        if raeOk { retElem = raePrim }
         if retPrim == "string" {
           fRetKind[li] = "str"
         } else if retPrim == "i64" {
@@ -1319,15 +1375,15 @@ export function buildFnMap(_stmts: i32[]) {
           fRetKind[li] = "f32"
         } else if retPrim == "boolean" {
           fRetBool[li] = 1
-        } else if ielem == "i32" {
+        } else if retElem == "i32" {
           fRetKind[li] = "list"
-        } else if ielem == "string" {
+        } else if retElem == "string" {
           fRetKind[li] = "strlist"
-        } else if nameIsF64Array(inm) {
+        } else if retElem == "f64" {
           fRetKind[li] = "f64list"
-        } else if nameIsI64Array(inm) {
+        } else if retElem == "i64" {
           fRetKind[li] = "i64list"
-        } else if nameIsF32Array(inm) {
+        } else if retElem == "f32" {
           fRetKind[li] = "f32list"
         } else if nameIsMap(inm) && mapValNameOf(inm) == "i32" {
           // A mono `{[string]: i32}` map inferred return (a returned map local). `criClassify`'s
