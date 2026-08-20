@@ -16,19 +16,34 @@
 // `vl check --codegen` exits 0 and `vl run` reports
 // `type mismatch: expected (ref $type), found (ref $type)`. Pre-existing on master.
 //
-// THE FIX IS A LANGUAGE-DESIGN CALL, WHICH IS WHY THIS IS PINNED RATHER THAN FIXED. Two
-// readings of the ruling, with different costs:
-//   (a) CANONICAL LAYOUT — sort a row's fields at intern time so the twins become one row.
-//       Assignment is then free, but field order changes globally: every `struct.get` index,
-//       every literal construction order, every field table. And the FLAT-type exception
-//       ("flat types do guarantee structural ordering") must be carved out, since their
-//       offsets are their layout.
-//   (b) COERCION AT THE BOUNDARY — keep both reps and emit a field-reordering copy where one
-//       flows into the other. Local change, but a per-assignment runtime cost, and it makes
-//       two "identical" types observably different in performance.
+// IT IS ONLY THE **NAMED** DECLARATION THAT FAILS, AND THAT IS THE WHOLE LEAD. The identical
+// permutation written INLINE works:
 //
-// The ruling settles that they are the SAME TYPE; it does not settle which of these the
-// emitter should do about it.
+//   const q: { b: string, a: i32 } = { b: "s", a: 7 }
+//   print(f(q))          // f(x: P) — runs, prints 7
+//
+// and the module carries ONE struct row, not two: the inline annotation is looked up by its
+// FIELD SET and lands on `P`'s existing row. A `type Q = …` declaration goes through
+// `internShapeAs`, which mints a row keyed by the ALIAS NAME without that lookup. So the
+// canonicalisation this needs is not missing — it already exists and named declarations
+// bypass it.
+//
+// Measured across 14 positions: param, binding, return, array element, struct field, map
+// value, generic argument, nullable, `.push`, closure parameter and an all-i32 permutation
+// are ALL check-clean invalid wasm. Only three work — the same-order inline, the PERMUTED
+// inline, and boxing into a union.
+//
+// STILL PINNED RATHER THAN FIXED, because the remaining question is semantic and not
+// mechanical: making the two aliases share a row makes them share an `is` verdict. `x is P`
+// and `x is Q` become indistinguishable, which FOLLOWS from the ruling (they are one type,
+// so nothing may tell them apart) but is a visible change to narrowing that the ruling did
+// not explicitly cover. The alternative — a field-reordering copy at the boundary — keeps
+// them distinguishable at a per-assignment cost, and makes two "identical" types observably
+// different in performance.
+//
+// The FLAT-type exception is not at risk either way: `flat type` layout is pinned by
+// `tests/cases/memory/flat-layout-grid.vl` ("order is layout, and nothing is reordered to
+// pack better") and is a separate declaration form from the object types this is about.
 // THE SECOND HINT IS THE BUG SAYING ITS OWN NAME: the checker reports `q` as inferred
 // `{b: string, a: i32}` — the PERMUTED spelling — and still accepts it where `P` is asked
 // for, because to the checker they are one type. The emitter reads the same two spellings
