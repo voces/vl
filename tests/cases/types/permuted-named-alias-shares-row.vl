@@ -1,0 +1,58 @@
+// @run
+// @log 7
+// @hint redundant type annotation: `q` is inferred as `{b: string, a: i32}` — remove it to lean on inference
+// FIELD-PERMUTED NAMED ALIASES ARE ONE TYPE, ALL THE WAY DOWN. This file was
+// `soundness/xfail-miscompile-permuted-struct-fields.vl` — the `xfail-miscompile-` kind's
+// first and only member — and it is flipped to `@run` under that kind's own rule: when the
+// compiler stops being wrong, drop the prefix and pin the right behaviour instead.
+//
+// The 2026-08 ruling is that `{a: i32, b: string}` and `{b: string, a: i32}` are THE SAME
+// TYPE. The checker always agreed; the emitter minted two rows, gave them two wasm struct
+// types, and the assignment was check-clean INVALID WASM.
+//
+// IT TOOK TWO COORDINATED CHANGES, and the diagnosis that found them came from printing the
+// tables rather than reading the code — four readings of this area were each wrong.
+// `sNames` beside `sHeapIdx` showed `[P/0, Q/1]` for the permuted pair against `[P/0, Q/0]`
+// for a same-order one, which located the merge at heap-type assignment; instrumenting
+// `repStructSlotsTwin` showed it never fired for the pair at all, which located the block at
+// the FIRST of `buildStructTwins`' two gates:
+//
+//   keys[i] = slotCanonId(i)
+//   if keys[j] == keys[i] && structFieldCodesEq(j, i) == 1 { rep = j }
+//
+//   · `repCanonId`'s `TyObj` arm walked `objFieldNames` in DECLARATION order, so the twins
+//     keyed differently and were never candidates. It now SORTS the (name-sid, child-id)
+//     pairs — safe by construction, not by measurement: an object's field names are unique,
+//     so ordering by sid is a bijection on the field set, and sorting can merge twins but
+//     can never collide two distinct types.
+//   · `structFieldCodesEq` compares `sFieldTypes[sFieldStart[x] + i]` POSITIONALLY, and that
+//     is a real guard — two rows may share a heap type only if their emitted field SEQUENCE
+//     matches. So a named declaration is now laid out in the order of an existing row with
+//     the same field-name set, when one exists.
+//
+// NEITHER ALONE DOES ANYTHING. Sorting the key without the layout leaves the pair failing
+// the second gate; canonicalising the layout without the key leaves them never compared. An
+// earlier note called the layout half "refuted" on exactly that evidence, which was the
+// wrong word for necessary-but-not-sufficient.
+//
+// `tdFlat == 0` GUARDS THE RULING'S OWN EXCEPTION: a `flat type`'s field order IS its
+// layout (`memory/flat-layout-grid.vl` — "order is layout, and nothing is reordered to pack
+// better"), so a flat record is never reordered. It is one condition because the AST already
+// carries the distinction.
+//
+// Measured across 14 positions — param, binding, return, array element, struct field, map
+// value, generic argument, nullable, `.push`, closure parameter, an all-i32 permutation, and
+// the three that always worked (same-order inline, permuted inline, union boxing): all 14
+// now run. `types/permuted-inline-shape-shares-row.vl` is the control for the half that was
+// already correct.
+type P = { a: i32, b: string }
+
+type Q = { b: string, a: i32 }
+
+function f(x: P) {
+  x.a
+}
+
+const q: Q = { b: "s", a: 7 }
+
+print(f(q))

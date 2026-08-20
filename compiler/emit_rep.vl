@@ -1532,14 +1532,60 @@ function repCanonIdGo(ty: i32): i32 {
     }
     TyObj => {
       // `"{" + Σ(name + ":" + child + ",") + "}"`
+      // FIELD ORDER IS SORTED OUT OF THE KEY. The 2026-08 ruling is that
+      // `{a: i32, b: string}` and `{b: string, a: i32}` are THE SAME TYPE, and the checker
+      // already agrees — `assignable` takes one where the other is asked for. This descent
+      // walked `objFieldNames` in DECLARATION order, so the twins keyed differently, and
+      // `buildStructTwins` gates on exactly this id: `keys[j] == keys[i]` is tested BEFORE
+      // `structFieldCodesEq`, so the pair was never even compared and the two rows each
+      // allocated a heap type. `vl check --codegen` rc 0, `vl run` invalid wasm
+      // (`soundness/xfail-miscompile-permuted-struct-fields.vl`).
+      //
+      // SORTING IS SAFE BY CONSTRUCTION RATHER THAN BY MEASUREMENT, which is the only
+      // acceptable argument for touching this key: an object's field NAMES are unique, so
+      // ordering the (name-sid, child-id) pairs by sid is a BIJECTION on the field set. Two
+      // objects with the same sorted list have the same fields with the same types — they
+      // ARE the same type. Sorting can therefore merge twins and can never collide two
+      // distinct types, which is the property a hash-cons key has to keep.
+      //
+      // The sort is `shapeFieldSetIdOf`'s, in the same insertion form, on the same sid
+      // column — that function has keyed the shape-row bucket order-insensitively all along,
+      // which is why the INLINE spelling of a permuted shape has always resolved correctly
+      // (`types/permuted-inline-shape-shares-row.vl`). This is the arena key catching up.
+      //
+      // `len` is accumulated over the SORTED walk so the byte-length estimate matches the
+      // key it describes; it is a size hint for `hcIntern`, and feeding it the declaration
+      // order while the args are sorted would desynchronise the two.
+      const sortedSid: i32[] = []
+      const sortedIx: i32[] = []
+      let si2 = 0
+      while si2 < t.objFieldNames.length {
+        const sd = sidOf(t.objFieldNames[si2])
+        let j2 = sortedSid.length
+        sortedSid.push(sd)
+        sortedIx.push(si2)
+        while j2 > 0 {
+          if sortedSid[j2 - 1] <= sd {
+            j2 = 0
+          } else {
+            sortedSid[j2] = sortedSid[j2 - 1]
+            sortedIx[j2] = sortedIx[j2 - 1]
+            sortedSid[j2 - 1] = sd
+            sortedIx[j2 - 1] = si2
+            j2 = j2 - 1
+          }
+        }
+        si2 = si2 + 1
+      }
       const a: i32[] = []
       let len = 2
       let i = 0
-      while i < t.objFieldNames.length {
-        const c = repCanonId(t.objFieldTypes[i])
-        a.push(sidOf(t.objFieldNames[i]))
+      while i < sortedIx.length {
+        const fx = sortedIx[i]
+        const c = repCanonId(t.objFieldTypes[fx])
+        a.push(sortedSid[i])
         a.push(c)
-        len = len + t.objFieldNames[i].length + 1 + hcLen[c] + 1
+        len = len + t.objFieldNames[fx].length + 1 + hcLen[c] + 1
         i = i + 1
       }
       return hcIntern(HC_OBJ, a, len)
