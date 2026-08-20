@@ -42900,3 +42900,54 @@ would have been the most dangerous edit of the programme.
   was in the first measurement.
 * **"0 calls" refutes hotness, never reachability.** Check for non-recursive callers before
   calling anything dead.
+
+## B17 / D-HUNTEND — five sweeps, 85 cells, no holes: the defect hunt is exhausted on constructible axes
+
+After the map-value hole (B-map, found by widening the constructor grid), five further axes
+were swept. All five came back clean. Recorded with their cell lists, because the value of a
+clean sweep is that the next hunt does not repeat it.
+
+| axis | cells | result |
+|---|---|---|
+| generic COMPOSITION (generics calling generics) | 36 | 0 BAD |
+| FLAT types and NEWTYPES x generics | 15 | 0 BAD |
+| CROSS-MODULE generics (lib defines, entry uses) | 10 | 0 BAD |
+| NARROWING x generics (`is` / `!= null` over a generic result) | 12 | 0 BAD |
+| DEEP composition (maps of arrays, arrays of maps, 3-level shapes) | 12 | 0 BAD |
+
+The cross-module set is worth naming because it is structurally different from the rest: a
+generic DEFINED in a lib and instantiated in the entry at two types, the same for arrays,
+returns, shapes, maps and unions; a generic ALIAS exported and applied in the entry; a
+lib-internal generic forwarding to another; and a struct exported and used as a generic
+ARGUMENT. All ten run.
+
+### WHAT WENT BACK INTO THE TOOL
+
+Five of the deep-composition constructors fit the grid's constructor x rep x position model
+and were added: `{[string]: T}[]`, `{[string]: T[]}`, `{[string]: {[string]: T}}`,
+`(T | null)[][]`, `{[string]: CM<T>}`. The grid is now **29 constructors / 261 cells**, and
+its sabotage against the pre-#1475 seed fires on **16** cells (was 13, was 6). The rest of the
+sweeps are whole-PROGRAM shapes that the grid's model cannot express, and they stay in this
+record rather than being forced into it.
+
+### THE HONEST READ
+
+Six check-clean invalid-wasm holes and one compiler crash were found on this programme, and
+**three of the six came from widening a measurement rather than from reading code** — the
+paren-union spelling, the alias-application half, and the map value. Each time the previous
+sweep had reported clean. That is the method that worked.
+
+It has now stopped working: 85 cells across five axes, no holes. That is not proof there are
+none — a sixth axis nobody has thought of is exactly what the map-value hole was — but it is
+the point at which constructing more cells has a poor expected return, and saying so is more
+useful than another clean table.
+
+### METHOD NOTES
+
+* **A clean sweep is a deliverable when it is recorded with its cells.** Five axes and 85
+  cells is a map of where NOT to look next. Without the cell lists it is an opinion.
+* **Fold back only what the tool can express.** Five of the twelve deep-composition shapes fit
+  the grid's model; forcing the other seven in would have made the script a second, worse copy
+  of this record.
+* **Say when a method is spent.** The widening method found half the holes on this programme.
+  Five clean sweeps in a row is evidence about the METHOD, not just about the cells.
