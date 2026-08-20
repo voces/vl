@@ -43858,3 +43858,55 @@ not that question.
   state immediately, and it did.
 * **Add a new per-program column to the reset block in the same commit that adds the column.**
   Not as a follow-up — the window between is exactly where this defect lives.
+
+## B32 / D-PROBECTX — three probes in a row measured the wrong thing, the same way: the predicate under test was embedded in a context and the probe dropped it
+
+This branch has now built a dozen measurement probes, and three of them reported a number that
+was not the number being asked for. All three failed identically, which makes the failure a
+pattern rather than three mistakes.
+
+| probe | context dropped | wrong answer | corrected answer |
+|---|---|---|---|
+| `tyIsValueUnion` vs `isValueUnionName` (B30) | the producer's `retAtomsCheap` **gate** | 5 disagreements | the same 5 — the gate was not the cause, but the first run had not TESTED the documented claim |
+| rung → arm map (B26) | the **aggregation** boundary — the table is per-process | 0 conflicts over 133 files | 1 rung ambiguous, found only by aggregating pairs ACROSS files |
+| four single-rung arms (#1520) | the **ladder** — an arm fires only if every earlier arm declines | 1 disagreement | 0; the name was claimed by an earlier arm |
+
+### 1. THE SHAPE
+
+A predicate in this compiler is almost never asked in isolation. It sits behind a gate, inside a
+short-circuiting ladder, or its answers are accumulated in a table with a lifetime. **The probe
+must reproduce that context, or it measures a predicate that does not exist.**
+
+The failures are asymmetric in a way worth noting: two of the three produced a **false
+disagreement** (safe — it stops a conversion that was fine), and one produced a **false
+agreement** (dangerous — it licensed a claim that was not true). The per-file aggregation is the
+dangerous shape, because dropping context usually makes a probe see LESS, and seeing less looks
+like agreement.
+
+### 2. THE CHECK THAT CATCHES ALL THREE
+
+Before running a probe, write down the exact expression the CONSUMER evaluates, then confirm the
+probe evaluates that expression and nothing else:
+
+* consumer: `if <arms 1..N-1 decline> && armN(ctx)` → probe must compute the LADDER POSITION, not
+  `armN(ctx)`.
+* consumer: `if gate(ty) { verdict(ty) }` → probe must apply `gate`.
+* consumer asks a question about the WHOLE COMPILER → the probe's table must span the whole
+  compiler, not one process.
+
+### 3. WHY THIS KEEPS HAPPENING
+
+Because the probe is written from the DEFINITION of the predicate ("does `nameIsMapArray` agree
+with rung 25?") while the claim is about its USE ("does arm 8 fire on the same rows?"). Those read
+the same in English and are different measurements. The definition is what is in front of you when
+you write the probe; the use is one screen away.
+
+### METHOD NOTES
+
+* **Name the consumer's expression before writing the probe.** Not the predicate's — the
+  consumer's, including everything that guards it.
+* **A false agreement and a false disagreement are not equally bad.** A dropped context usually
+  narrows what the probe can see; when the answer is "0 disagreements", ask what the probe was
+  incapable of observing before believing it.
+* **Three of twelve is a rate, not an accident.** The rate is worth reporting alongside the
+  results the other nine produced — it is the calibration for how much a clean probe is worth.
