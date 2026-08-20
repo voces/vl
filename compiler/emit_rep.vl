@@ -1007,6 +1007,15 @@ export function mapShapeKeyI32(sh: i32): boolean {
 }
 
 export function mvSlotOfTy(ty: i32): i32 { mvSlotOfTyK(ty, false) }
+// THE D1 HAZARD, RESTATED FOR THE MEMO. The note below says both sides compute the key at QUERY
+// time from the recorded arena INDEX, never a key frozen at intern time, so an in-place arena
+// mutation moves both together. That is still true of the WALK and no longer the whole story of
+// the CACHE: `repMvValId` banks a depth-0 answer per arena index, so between generation bumps the
+// answer IS frozen. What discharges D1 is the generation triple it syncs on — `tyMutEpoch`,
+// `cUserTypesVer`, `sNames.length` — and every in-place arena patch bumps `tyMutEpoch`. The
+// precedent is already shipped and looser: `mvValCanonId` carries the same "computed at QUERY
+// time" language over `repCanonId`, which memoises on `tyMutEpoch` ALONE.
+//
 // The KEY-paired form. A slot's identity is (key rep, value type) — the map struct's
 // `keys` field differs between the two reps — so the scan must agree on BOTH halves or
 // a `{[i32]: S}` would resolve its `{[string]: S}` twin's struct (a string-ref keys list
@@ -1022,8 +1031,11 @@ export function mvSlotOfTyK(ty: i32, keyI32: boolean): i32 {
   // The id form is the same move `repCanonKey` -> `repCanonId` and `repElemKey` ->
   // `repElemId` already made; this was the one of the three that was never converted, and
   // the last string hash-cons key in the compiler whose two sides are both arena types.
-  // It also retires the memo B16 built and declined: an interned id needs no memo to stop
-  // re-deriving, because the id IS the derivation.
+  // It retires the STRING memo B16 built and declined — but not memoisation as such, and the
+  // first version of this comment claimed otherwise while the change was adding `hcMvMemo` forty
+  // lines away. What the id buys is that a repeat is an i32 compare instead of a rebuilt
+  // spelling; the depth-0 memo still exists, rides `repElemMemo`'s generation triple, and is
+  // what stops the walk re-descending at all.
   const k = repMvValId(ty)
   let i = 0
   while i < mvValTyIx.length {
@@ -1338,7 +1350,7 @@ const HC_NEG = 9
 const HC_BACK = 10 // de Bruijn back-edge, arg = depth
 const HC_IDX = 11 // the arena-index sentinel `"@<ix>"` (TyVar / TyLit / TyErr)
 const HC_BIG = 12 // the runaway cap `"@big:<ix>"`
-const HC_SLOT = 13 // a DECLARED slot `"S<n>"` — elem key only
+const HC_SLOT = 13 // a DECLARED slot `"S<n>"` — elem and mv keys
 const HC_RLI32 = 14 // `"$rlI32L"` — elem key only
 const HC_RLSTR = 15 // `"$rlStrL"` — elem key only
 const HC_NAME = 16 // the unresolvable-spelling key `"name:<nm>"`, arg = the name's sid
@@ -1699,9 +1711,24 @@ function hcUnionId(mems: i32[], mode: i32): i32 {
   let i = 0
   while i < mems.length {
     let r = -1
-    if mode == 0 { r = repCanonId(mems[i]) }
-    else if mode == 2 { r = repMvValId(mems[i]) }
-    else { r = repElemId(mems[i]) }
+    // EXPLICIT PER MODE, no catch-all. The elem walk used to be the `else`, so a mode this
+    // function does not know — a future fourth, or a miscomputed `mvMode` — would silently mint
+    // ELEM ids inside an mv union: a wrong slot with no diagnostic. That is the failure policy
+    // `repElemIdGo`'s own match rejects a few lines on ("deliberately `_`-less: a 12th arena
+    // variant breaks the self-compile here rather than silently taking the index sentinel").
+    if mode == 0 {
+      r = repCanonId(mems[i])
+    } else if mode == 1 {
+      r = repElemId(mems[i])
+    } else if mode == 2 {
+      r = repMvValId(mems[i])
+    } else {
+      // Unreachable: those three are the only modes minted, at the three entry points. Keyed by
+      // ARENA INDEX so an impossible mode can only ever SPLIT, never merge two distinct types.
+      const bad: i32[] = []
+      bad.push(mems[i])
+      r = hcIntern(HC_IDX, bad, 1 + hcDigits(mems[i]))
+    }
     let skip = false
     if mixHasOther {
       let iLit = tyIsLitUnion(mems[i])
@@ -1778,7 +1805,7 @@ function repIdOf(ty: i32, mv: boolean): i32 {
 let hcMvMemo: i32[] = []
 const hcMvStack: i32[] = []
 
-export function repMvValId(ty: i32): i32 {
+function repMvValId(ty: i32): i32 {
   if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
   let si = hcMvStack.length - 1
   while si >= 0 {
@@ -4375,6 +4402,8 @@ export function setRepShadow(v: i32) {
   0
 }
 
+// Banked memo entries that do not reproduce when recomputed — see `repMemoCheck`.
+let hcMemoBad = 0
 let repShadowMsgs: string[] = []
 let repShadowSeen: {[string]: i32} = Map()
 let repShadowTys = 0
@@ -4403,6 +4432,51 @@ export let hcLenBad = 0
 // bytes are final (the arena is complete then; monomorphization and the
 // collect passes have minted every late type). Restarts its tallies each run,
 // so an instance that compiles more than one program reports the last sweep.
+// THE MEMO'S OWN ORACLE — every banked depth-0 answer recomputed from scratch and compared.
+// Run BEFORE the sweep touches anything, because the sweep's first `repElemKey` call runs
+// `repElemMemoSync`, which CLEARS both id memos if the generation moved: check afterwards and you
+// validate a memo you just rebuilt, which is a tautology rather than a test.
+//
+// This is the check the three id walks did not have. `hcCheckKey` compares the WALKS against
+// their string twins and says nothing about the CACHE in front of them, and `repElemMemo`'s own
+// header cites a "every memo HIT recomputed and compared — 54,906 agree / 0 disagree" harness
+// that exists nowhere in the tree: it was one-off instrumentation, and the promise outlived it.
+// A stale entry here is a wrong slot, so the walk that resolves slots should not inherit a
+// guarantee on trust.
+//
+// Recomputation is done with the memo column SWAPPED OUT rather than cleared, so a disagreement
+// is reported instead of silently repaired, and the banked column is restored either way.
+function repMemoCheck() {
+  const bankedMv = hcMvMemo
+  const bankedElem = hcElemMemo
+  hcMvMemo = []
+  hcElemMemo = []
+  let i = 0
+  while i < bankedMv.length {
+    if bankedMv[i] >= 0 {
+      if repMvValId(i) != bankedMv[i] {
+        hcMemoBad = hcMemoBad + 1
+        repShadowNoteRaw("hc-memo mv ty=" + i32ToStr(i))
+      }
+    }
+    i = i + 1
+  }
+  hcMvMemo = []
+  let j = 0
+  while j < bankedElem.length {
+    if bankedElem[j] >= 0 {
+      if repElemId(j) != bankedElem[j] {
+        hcMemoBad = hcMemoBad + 1
+        repShadowNoteRaw("hc-memo elem ty=" + i32ToStr(j))
+      }
+    }
+    j = j + 1
+  }
+  hcMvMemo = bankedMv
+  hcElemMemo = bankedElem
+  0
+}
+
 export function repShadowSweep() {
   if !repShadowOn { return 0 }
   // Force a FRESH tree: the normal-compile tree deliberately survives slot
@@ -4425,6 +4499,13 @@ export function repShadowSweep() {
   hcMergeBad = 0
   hcSplitBad = 0
   hcLenBad = 0
+  hcMemoBad = 0
+  // AFTER the message/tally reset above (which would otherwise discard what this reports) and
+  // BEFORE the loop below, whose first `repElemKey` runs `repElemMemoSync` and CLEARS both id
+  // memos if the generation moved during emit. Check after that and you validate a memo you just
+  // rebuilt — a tautology, not a test. Ordering is the whole correctness of this check, and the
+  // first version of it sat above the reset and reported nothing at all.
+  repMemoCheck()
   // `T.tys.length` is re-read each pass: a slot query inside the sweep can
   // itself memoize a new annotation spelling (`resolveAnnot`), growing the
   // arena — those late types are swept too, and the growth terminates because
@@ -4520,8 +4601,19 @@ function hcCheckKey(which: string, key: string, id: i32) {
   } else if hcSeenIdStrE[id] != key {
     hcMergeBad = hcMergeBad + 1
     repShadowNoteRaw(
-      "hc-merge elem id=" + i32ToStr(id) + " a=" + hcSeenIdStrE[id] + " b=" + key,
+      "hc-merge " +
+        which +
+        " id=" +
+        i32ToStr(id) +
+        " a=" +
+        hcSeenIdStrE[id] +
+        " b=" +
+        key,
     )
+    // `which`, not a hardcoded "elem". An MV false merge is the one direction that fuses two
+    // map-value slots into one — the invalid wasm this layer exists to prevent — and it was
+    // being reported as an elem merge, sending the reader into the wrong walk.
+
   }
   0
 }
@@ -4622,6 +4714,9 @@ export function repShadowStat(k: i32): i32 {
   if k == 3 { return hcMergeBad }
   if k == 4 { return hcSplitBad }
   if k == 5 { return hcLenBad }
+  // The MEMO's tally, distinct from the three walk tallies above it: those compare a walk
+  // against its string twin, this one compares a BANKED answer against a recomputation.
+  if k == 6 { return hcMemoBad }
   0
 }
 
