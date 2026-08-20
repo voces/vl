@@ -44514,3 +44514,63 @@ same property, which was not previously known to connect them.
 * **When the corpus cannot produce the discriminating case, say which shape would and why it is
   hard.** "0 divergences" plus "I could not build the counterexample" is a materially different
   report from "0 divergences", and only the first tells the next person where to start.
+
+## B41 / D-STEP1NULL — B37's step 1 is not merely undividend, it is UNOBSERVABLE; and its two ladders are not one step
+
+B37 laid out a three-step programme for retiring `ctxKeepsLitUnion` and said "nothing before step 3
+pays a destringify dividend". Building step 1 on its own sharpens that in two ways, one of which
+changes the plan.
+
+### 1. THE TWO LADDERS ARE NOT ONE STEP — one half is free and the other is not
+
+B37 measured "teach the two valtype ladders structurally" as a unit, after an alias-render change.
+Measured separately, from master, with no render change:
+
+| change | corpus rows moved | rc changes |
+|---|---|---|
+| PARAM ladder alone (`nodeTyIsLitUnionAlias` -> `nodeTyIsLitUnionStructural`) | **0** | **0** |
+| + FIELD ladder | **2** | 2 (one degrading a loud reject to invalid wasm) |
+
+So the cost B37 attributed to "the ladders" is entirely the FIELD ladder's. Anything that treats
+them as one step over-prices the param half and under-isolates the field half.
+
+### 2. AND THE PARAM HALF IS UNOBSERVABLE, WHICH IS WHY IT IS FREE
+
+Removing the param arm ENTIRELY — `} else if false {` — moves 0 corpus rows, and a
+litunion-alias param still compiles:
+
+```
+type K = "a" | "b"
+function f(v: K): i32 { … }     // builds fine with the arm deleted
+```
+
+The reason is that **a litunion alias also registers as a union NAME**, so the ladder's `isUName`
+arm accepts it two rungs down. The `nodeTyIsLitUnionAlias` arm is redundant for the aliased form,
+and the INLINE form never arrives — it has already softened to `string`, which the string arm
+accepts. **The arm has no live population at all.**
+
+So converting it is a no-op in the strongest sense: not "inert on this corpus", but "the predicate
+it replaces is never the deciding rung". A measurement of 0 rows there is not evidence of a safe
+conversion — it is evidence of an unreached arm, and B23's rule applies to my own change.
+
+### 3. WHAT THIS MEANS FOR THE PLAN
+
+B37's step 1 cannot be landed as an independent slice with independent value, because its
+observable half is the field ladder and that half is not free. The programme is really:
+
+1. move the CONSTRUCTION/READ/ASSIGN sites for a field-position litunion onto the atom rep
+   (B37's step 2 — the 2 files above are what ask for it);
+2. teach the field ladder, which then stops costing anything;
+3. flip `ctxKeepsLitUnion`, which is where the param ladder's arm finally acquires a population.
+
+The param-ladder change belongs in step 3, not step 1 — it is a no-op until the render stops
+softening, and at that moment it becomes necessary.
+
+### METHOD NOTES
+
+* **"Inert" and "unreached" produce the same number and are opposite findings.** The first says a
+  conversion is safe; the second says nothing was converted. Deleting the arm outright is the
+  cheap test that separates them, and it should be the FIRST probe on any arm whose conversion
+  measures clean.
+* **Measure the halves of a step before believing its price.** B37 measured two ladders together
+  after a third change and got a number that belongs to neither of them alone.
