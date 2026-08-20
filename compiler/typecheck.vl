@@ -284,6 +284,7 @@ import {
   mapSpellKeyName,
   mapSpellValName,
   nameIsArray,
+  nameIsBareIdent,
   nameIsBraceSpanEnds,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
@@ -292,6 +293,7 @@ import {
   nameIsParenSpanEnds,
   nameIsQuotedLeaf,
   nameIsShapeOpen,
+  nameMentionsIdent,
   parenEnclosesWhole,
   splitUnionAtoms,
   tyTopIndexOf,
@@ -308,12 +310,33 @@ import { nodeChildren } from "./lint"
 // One struct per type KIND, prefixed field names so `is` discriminates the union
 // (the AST's convention). A nested type is always an `i32` index into `T.tys`.
 
-// A primitive: `primName` is one of "i32" | "i64" | "f32" | "f64" | "boolean" |
-// "string" | "void" | "null" | "never".
-export type TyPrim = { primName: string }
+// The primitive VOCABULARY. It was a comment over a `string` field until it became a
+// declaration: a closed set spelled in the source is a literal union, and every
+// `primName == "i32"` in the compiler is then an `i32.eq` against an interned atom with
+// its source text unchanged (F2/#1402's template, applied to the type arena itself).
+// The checker is a COMPLETE ORACLE for the conversion — a name outside this set is a hard
+// type error, not a silently false comparison, which is what a `string` field allowed.
+export type PrimName = "i32"
+  | "i64"
+  | "f32"
+  | "f64"
+  | "boolean"
+  | "string"
+  | "void"
+  | "null"
+  | "never"
+
+// A primitive.
+export type TyPrim = { primName: PrimName }
 // The error/unknown type — produced on a type failure so checking continues
 // without cascading (akin to TS `Never`/`Unknown`); assignable to/from anything.
-export type TyErr = { errKind: string }
+//
+// `errKind` is WRITE-ONLY and always the same value: the whole compiler contains one
+// construction and no read at all (`grep -rn errKind compiler/*.vl` is two lines, this
+// declaration and that construction). It exists because `is` discriminates the arena union
+// on field NAMES, so the variant needs one field to be distinguishable — it does not need
+// that field to be a heap string. An `i32` carries the same nothing for no allocation.
+export type TyErr = { errKind: i32 }
 // A structural object: parallel arrays of field names and their type-arena
 // indices. (Constructed by the harness to seed object-typed bindings; the parser
 // subset has no object-type literal syntax yet, so it is not built from source.)
@@ -337,13 +360,18 @@ export type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
 // generic body (assignable both ways, like the err hole); at a CALL site each
 // TyVar param BINDS to its argument's type and the return substitutes through.
 export type TyVar = { tvName: string }
+// The literal-member VOCABULARY — the same conversion `PrimName` records above, on the
+// other closed set the arena held as a raw `string` with its members written out in a
+// comment. Nine producers, every one a literal `mkLitTy("str"/"int"/"flt", …)`.
+export type LitKind = "str" | "int" | "flt"
+
 // A LITERAL type — the host's `StringLiteral`/`IntegerLiteral`/`RealLiteral`:
 // a single-inhabitant type (`"a"`, `0`, `1.5`), the member unit of a literal
-// union. `litKind` is "str" | "int" | "flt"; `litText` is the member's text —
+// union. `litText` is the member's text —
 // the RAW characters between the quotes for "str" (escapes unresolved; both
 // the annotation and the literal expression carry the same raw lexeme, so
 // membership compares consistently), the numeric lexeme for "int"/"flt".
-export type TyLit = { litKind: string, litText: string }
+export type TyLit = { litKind: LitKind, litText: string }
 // A NEGATION `!T` (A4) — "anything but `T`". Almost always consumed by
 // `intersectTy` (`A & !B` subtracts); a residual standalone negation accepts
 // any source NOT assignable to its inner type.
@@ -1342,13 +1370,13 @@ function addTy(t: Ty) {
   T.tys.length - 1
 }
 
-function mkPrim(name: string) {
+function mkPrim(name: PrimName) {
   const t: Ty = { primName: name }
   addTy(t)
 }
 
 function mkErrTy() {
-  const t: Ty = { errKind: "error" }
+  const t: Ty = { errKind: 0 }
   addTy(t)
 }
 
@@ -1372,7 +1400,7 @@ function mkNullableTy(inner: i32) {
   addTy(t)
 }
 
-function mkArrayTy(elem: i32) {
+export function mkArrayTy(elem: i32) {
   const t: Ty = { aElem: elem }
   addTy(t)
 }
@@ -1461,7 +1489,7 @@ function canonIntLexeme(t: string) {
   i32ToStr(v)
 }
 
-function mkLitTy(kind: string, text: string) {
+function mkLitTy(kind: LitKind, text: string) {
   let canon = text
   if kind == "int" { canon = canonIntLexeme(text) }
   const t: Ty = { litKind: kind, litText: canon }
@@ -5373,11 +5401,22 @@ function isNumeric(ix: i32) {
 }
 
 // The bare primitive name of type-arena index `ix`, or "" if it is not a primitive.
-function primNameOf(ix: i32) {
-  if ix < 0 { return "" }
+// ABSENCE IS `null`, NOT `""`. The old empty-string marker was never TESTED for anywhere
+// — 0 sites compared this to `""` — it only had to lose every `== "i32"` comparison, which
+// `null` does identically. `T | null` is the absence idiom the language already commits to.
+function primNameOf(ix: i32): PrimName | null {
+  if ix < 0 { return null }
   const t = T.tys[ix]
   if t is TyPrim { return t.primName }
-  ""
+  null
+}
+
+// The primitive name as TEXT, for the few consumers that spell it into a string rather
+// than decide on it — a rep KEY builder, and the `as`-target spelling the canon pass
+// writes back onto the node. Absence renders empty, which is what those sites read before.
+export function primNameStr(p: PrimName | null): string {
+  if p == null { return "" }
+  p
 }
 
 // Numeric WIDENING lattice (B2): may a value of primitive type `sn` implicitly
@@ -5391,7 +5430,7 @@ function primNameOf(ix: i32) {
 //   i32 → f32  (above 2^24 the i32 rounds to the nearest f32 — lossy)
 //   i64 → f64  (above 2^53 the i64 rounds to the nearest f64 — lossy)
 // plus every narrowing (i64→i32, f64→f32, …) and any float→integer (truncation).
-function numWidensName(sn: string, dn: string) {
+function numWidensName(sn: PrimName | null, dn: PrimName | null) {
   if sn == dn { return false }
   if sn == "i32" {
     if dn == "i64" || dn == "f64" { return true }
@@ -7234,7 +7273,28 @@ function nameToTy(name: string) {
     unkTyPart = ""
     unkTyClash = ""
   }
-  const r = nameToTyReal(name)
+  // THE BARE-NAME RUNG. A name that is a bare identifier cannot enter any composite arm
+  // of `nameToTyReal`, so its answer IS the shared leaf ladder — and `tsLeafTy` is that
+  // ladder, already the TREE route's leaf, so this routes to an existing home rather than
+  // adding a second copy of prim/type-parameter/declared.
+  //
+  // MEASURED, not argued. Instrumented over `tests/cases` (1,673 files reporting) and the
+  // compiler's own self-compile, running BOTH answers and comparing their renders:
+  // **6,161 bare runs, 0 disagreements**, and 8 more on the self-compile, also 0. The
+  // population is large because this fires at RECURSIVE entries too — a union's members,
+  // an array's element, a field's type are each a bare name in the common case — so it
+  // short-circuits the leaf resolutions, not only the 1,320 outermost ones the parse
+  // census counts.
+  //
+  // Arena-neutral BY CONSTRUCTION, which is the gate the programme's own rung rule sets:
+  // all three leaf rungs are LOOKUPS of an index somebody else minted, so skipping the
+  // ladder above them cannot change what is minted or the order it is minted in.
+  let r = -1
+  if nameIsBareIdent(name) {
+    r = tsLeafTy(name)
+  } else {
+    r = nameToTyReal(name)
+  }
   if r < 0 {
     if unkTyPart.length == 0 { unkTyPart = name }
   }
@@ -8102,21 +8162,20 @@ function tyToStrGo(ix: i32, nominal: boolean) {
 // collapse, so such an entry is constructible) and the render-comparing sites this
 // replaces did accept it. The returned name is `TyPrim.primName`, the primitive's
 // own IDENTITY — the same thing `tyEq` compares — not a rendering of a structure.
-function tyPrimNameOf(ix: i32): string {
-  if ix < 0 { return "" }
+function tyPrimNameOf(ix: i32): PrimName | null {
+  if ix < 0 { return null }
   const t = T.tys[ix]
   if t is TyPrim { return t.primName }
   if t is TyUnion {
     if t.uMembers.length == 1 { return tyPrimNameOf(t.uMembers[0]) }
   }
-  ""
+  null
 }
 
 // Whether arena type `ix` IS the primitive `nm` — the decision form of
 // `tyPrimNameOf`, replacing `tyToStr(ix) == "i32"` at the sites that were asking a
 // STRUCTURAL question ("is the inner the string primitive?") by rendering.
-function tyIsPrimNamed(ix: i32, nm: string): boolean {
-  if nm == "" { return false }
+function tyIsPrimNamed(ix: i32, nm: PrimName): boolean {
   tyPrimNameOf(ix) == nm
 }
 
@@ -8320,6 +8379,17 @@ function tyEqGo(a: i32, b: i32) {
 
 // The type-arena index of object `o`'s field `name`, or `-1` if absent. Takes a
 // concrete `TyObj` (already narrowed by the caller) — `Ty`-union only.
+// Arena step by FIELD NAME — index in, index out. The `tyStep*` peel family's
+// object arm, exported because the shape interner's descent peels a shape's FIELD
+// TEXTS and needs the matching arena field. Declines (-1) on a non-`TyObj` and on a
+// name the object lacks; the caller then takes the name leg unchanged.
+export function tyFieldTyOf(ty: i32, name: string): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyObj { return objFieldType(t, name) }
+  -1
+}
+
 function objFieldType(o: TyObj, name: string) {
   const names = o.objFieldNames
   const ftys = o.objFieldTypes
@@ -12148,7 +12218,57 @@ export function declAnnRawTyName(nodeIx: i32) {
 // `UnionDecl` variant name in the arena. Runs once at the end of
 // `checkProgram` — `compileSrc` hands this SAME arena to `emitProgram`, so the
 // emitter only ever sees its own vocabulary.
+// The node indices `canonEmitTypeNames` REWROTE, ascending (the pass walks nodes in
+// order, so the column is sorted and `canonRewroteNode` can binary-search it).
+//
+// WHY THIS EXISTS RATHER THAN ASKING `annTsOf`. The emitter's arena hand-over needs to
+// know whether a node's recorded type still describes its spelling, and canon is the one
+// pass that can break that: it is not a rename, so a name it rewrote may denote a
+// different TYPE (`type Z = 0 | 1` canons to `i32`). The first gate asked `annTsOf(ti) >=
+// 0` and read a surviving spelling tree as the answer — sound in one direction only.
+// `clearAnnTs` does drop the tree on exactly the rewritten nodes, but it is not the ONLY
+// reason a node has no tree: an emitter-SYNTHESIZED `TypeRef` never had one, and its
+// `nodeTyIx` is perfectly good. Measured at the collect root: of 2,518 nodes the tree
+// test rejected, **1,258 were rewritten by canon and 1,260 were not** — the converse the
+// gate relied on is false half the time. So the question is asked directly instead.
+export let canonCleared: i32[] = []
+
+// MEASUREMENT (B5, the separate-column variant the owner ruling asks about): the arena
+// type each REWRITTEN node's NEW spelling denotes, parallel to `canonCleared`.
+// `nodeTyIx` is untouched, so no existing consumer changes; the only reader is the
+// emitter's collect-site gate.
+export let canonTyIxCol: i32[] = []
+
+export function canonTyIxOf(ix: i32): i32 {
+  let lo = 0
+  let hi = canonCleared.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = canonCleared[mid]
+    if at == ix { return canonTyIxCol[mid] }
+    if at < ix { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  -1
+}
+
+// Did `canonEmitTypeNames` rewrite node `ix` in place (and drop its spelling tree)?
+export function canonRewroteNode(ix: i32): boolean {
+  let lo = 0
+  let hi = canonCleared.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = canonCleared[mid]
+    if at == ix { return true }
+    if at < ix { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  false
+}
+
 export function canonEmitTypeNames() {
+  // Reset with `annUnionAtoms` and for the same reason its note gives: a second program
+  // on this instance must not inherit the first one's node indices.
+  canonCleared = []
+  canonTyIxCol = []
   annUnionAtoms = []
   // BEFORE the rewrite loop — the bank holds the declared spellings, which is the whole
   // point of it.
@@ -12181,6 +12301,8 @@ export function canonEmitTypeNames() {
       // measurement). Dropped BEFORE the assignment so the two never disagree.
       if c != n.tyName {
         clearAnnTs(i)
+        canonCleared.push(i)
+        canonTyIxCol.push(nameToTy(c))
         n.tyName = c
       }
       atoms = canonAtoms
@@ -12300,7 +12422,10 @@ export function canonEmitTypeNames() {
       // the diagnostic that already quotes it.
       const at = primNameOf(nodeTyIxOf(i))
       if at == "i32" || at == "i64" || at == "f32" || at == "f64" {
-        if at != n.asTy { n.asTy = at }
+        // `n.asTy` is the author's SPELLING, a plain string on the node, so the atom is
+        // materialized here rather than the node's field changing type.
+        const ats = primNameStr(at)
+        if ats != n.asTy { n.asTy = ats }
       }
     }
     annUnionAtoms.push(atoms)
@@ -12560,6 +12685,12 @@ let shapeAdaptDstTy = -1
 // `Animal[]` is an array literal whose claimed pair IS an object literal — reading the
 // outer expression gets both backwards. -1 when the walk had no expression there.
 let shapeAdaptSrcExpr = -1
+// Which RULE claimed the stopped-on pair: the object-shape one (false) or the
+// container-element storage-class one (true). They need different wordings — one names a
+// dropped field, the other names an element whose storage changed — and the pair banked
+// above does not say which, since both bank a pair. Set on every claim, beside the pair,
+// so the two can never disagree.
+let shapeAdaptElemPair = false
 
 // The expression at `ix` with `(…)` peeled — the syntactic form, for the constructor
 // exemption in `objShapeAdapterless`. -1 stays -1.
@@ -12593,6 +12724,86 @@ function objFieldNameSetsEq(src: i32, dst: i32): boolean {
     }
   }
   false
+}
+
+// The wasm ELEMENT storage class a container's element (or map key/value) type lowers
+// to. Two element types in DIFFERENT classes make two unrelated CONTAINER wasm types, so
+// there is no element-converting copy to insert and the flow has no lowering — the
+// container twin of the object-shape rule below.
+//
+// MEASURED, and the measurement is why this is a CLASS test and not a type-identity one.
+// Widening an element is FREE whenever the class holds: a REF element takes `| null` for
+// nothing (`C[]` -> `(C | null)[]`, `string[]` -> `(string | null)[]` and
+// `i32[][]` -> `(i32[] | null)[]` all RUN, because a nullable ref is the same wasm reftype),
+// and so does a NICHE-nullable scalar (`boolean[]` -> `(boolean | null)[]` and
+// `K[]` -> `(K | null)[]` RUN, because the sentinel lives inside the element's own value
+// space). What has NO lowering is a class CHANGE: `i32[]` -> `(i32 | null)[]` boxes the
+// element, `i64[]` and `f64[]` the same, `K[]` -> `string[]` swaps an interned atom for a
+// ref, and `i32[]` -> `f64[]` changes the element width. Every one of those is
+// `vl check`-clean invalid wasm on the base this shipped against.
+//
+// `ESC_UNKNOWN` always DECLINES. An inference hole, a type variable, or any shape this
+// ladder does not name must never be claimed on a guess — a generic `first<T>(y: T[])`
+// applied to an `i32[]` reaches here with a hole on one side.
+const ESC_UNKNOWN = 0
+const ESC_I32 = 1
+const ESC_I64 = 2
+const ESC_F32 = 3
+const ESC_F64 = 4
+const ESC_BOOL = 5
+const ESC_STRING = 6
+const ESC_REF = 7  // object / array / map / function, and any nullable or union of them
+const ESC_BOX = 8  // a value union the emitter boxes — a scalar beside another atom
+const ESC_ATOM = 9 // a literal union: one interned i32 id
+
+function elemStoreClassOf(ty: i32, depth: i32): i32 {
+  if ty < 0 { return ESC_UNKNOWN }
+  if depth <= 0 { return ESC_UNKNOWN }
+  if tyReachesHole(ty, 8) { return ESC_UNKNOWN }
+  // A niche-nullable scalar reps exactly as its base does: the `| null` is a sentinel
+  // inside the element, not a second element type.
+  if tyIsNicheNulScalarElem(ty) {
+    if tyIsNullableLitUnion(ty) { return ESC_ATOM }
+    const n = T.tys[ty]
+    if n is TyNullable { return elemStoreClassOf(n.nInner, depth - 1) }
+    return ESC_UNKNOWN
+  }
+  if tyIsLitUnion(ty) { return ESC_ATOM }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const p = t.primName
+    if p == "i32" { return ESC_I32 }
+    if p == "i64" { return ESC_I64 }
+    if p == "f32" { return ESC_F32 }
+    if p == "f64" { return ESC_F64 }
+    if p == "boolean" { return ESC_BOOL }
+    if p == "string" { return ESC_STRING }
+    return ESC_UNKNOWN
+  }
+  if t is TyObj { return ESC_REF }
+  if t is TyArray { return ESC_REF }
+  if t is TyMap { return ESC_REF }
+  if t is TyFunc { return ESC_REF }
+  if t is TyNullable {
+    if tyPrintsAsRef(t.nInner, 8) { return ESC_REF }
+    return ESC_BOX
+  }
+  if t is TyUnion {
+    if tyPrintsAsRef(ty, 8) { return ESC_REF }
+    return ESC_BOX
+  }
+  ESC_UNKNOWN
+}
+
+// Do a container's source and destination element types land in different storage
+// classes? Neither side may be UNKNOWN — declining on an unclassified pair is what keeps
+// a generic element from being claimed on a guess.
+function containerElemClassDiffers(se: i32, de: i32): boolean {
+  const sc = elemStoreClassOf(se, 8)
+  if sc == ESC_UNKNOWN { return false }
+  const dc = elemStoreClassOf(de, 8)
+  if dc == ESC_UNKNOWN { return false }
+  sc != dc
 }
 
 // Does reaching `dst` from `src` need an object-shape ADAPTER that codegen does not
@@ -12752,6 +12963,7 @@ function objShapeAdapterless(
       shapeAdaptSrcTy = src
       shapeAdaptDstTy = dst
       shapeAdaptSrcExpr = cx
+      shapeAdaptElemPair = false
       return true
     }
     return false
@@ -12779,14 +12991,41 @@ function objShapeAdapterless(
           return false
         }
       }
-      return objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1)
+      // The nested pair FIRST, so a container carrying an object pair keeps the precise
+      // object wording; only then the element's own storage class. A nested container
+      // resolves through this same arm one level in, which is what makes
+      // `i32[][]` -> `(i32 | null)[][]` report the INNER array pair rather than the outer.
+      if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1) { return true }
+      if containerElemClassDiffers(s.aElem, d.aElem) {
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        return true
+      }
+      return false
     }
     return false
   }
   if s is TyMap {
     if d is TyMap {
       if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1) { return true }
-      return objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1)
+      if objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1) { return true }
+      if containerElemClassDiffers(s.mKey, d.mKey) {
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        return true
+      }
+      if containerElemClassDiffers(s.mVal, d.mVal) {
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        return true
+      }
+      return false
     }
     return false
   }
@@ -12860,6 +13099,28 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   // does not take. What the literal takes is SILENT — it builds at the destination shape,
   // which drops the excess field's initializer unevaluated — so the message names the
   // evaluation that would not happen, and the one way out (drop the field or declare it).
+  // THE CONTAINER-ELEMENT WORDING. The object message's whole vocabulary is wrong here:
+  // no field is dropped, the two shapes may be the same shape, and "construct the value at
+  // the destination shape" points at an object that is not what changed. What changed is
+  // how the ELEMENT is stored, so the message names that and the container it fixes.
+  if shapeAdaptElemPair {
+    tErrUnsupported(
+      "a value of type " +
+        tyToStr(sT) +
+        " flowing into " +
+        tyToStr(dT) +
+        through +
+        " changes how the ELEMENT is stored: type-valid (the element type widens) but " +
+        "not yet supported by codegen — a container's wasm type is fixed by its element's " +
+        "storage, so these are unrelated types and no element-converting copy exists. " +
+        "Build the container at " +
+        tyToStr(dT) +
+        " (a literal is built at the type it flows into), or declare the source as " +
+        tyToStr(dT),
+      srcExpr,
+    )
+    return 0
+  }
   if litShapeDropSrcExpr(sX) {
     tErr(
       "this object literal sets " +
@@ -16172,7 +16433,7 @@ function checkCallNode(n: Call, ix: i32) {
 // resolve through the one name grammar with the params substituted.
 // MEMOIZED for the env-free case (no typarams, no live type-param environment):
 // `nameToTy` MINTS fresh arena types per call for an inline spelling, so the
-// emitter's per-probe resolutions (`repNameCanonKey`'s dedup keys, the compat
+// emitter's per-probe resolutions (`repNameCanonId`'s dedup keys, the compat
 // probes' nested-name checks) re-minted the SAME structural types thousands of
 // times — on a deep same-fieldset composite the arena grew past 300K types and a
 // table allocation crossed the engine limit: a compiler CRASH ("allocation size
@@ -19742,14 +20003,14 @@ function nulElemListRetName(er: i32) {
       // it is still spelled into the result, but the DECISION is structural.
       const inner = tyPrimNameOf(et.nInner)
       if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
-        return irAtoms("(" + inner + "|null)[]", 1)
+        return irAtoms("(" + primNameStr(inner) + "|null)[]", 1)
       }
       // The NICHE leaves: `(boolean|null)[]` (i32 sentinel-2 list), `(string|null)[]`
       // (string-ref list with `ref.null` elements), `(K|null)[]` (i32 atom list with the
       // `-1` sentinel, rendered by its ALIAS). Each rides an existing non-box list rep the
       // annotated return already lowers; the pin routes the anonymous lambda through it.
       if inner == "boolean" || inner == "string" {
-        return irAtoms("(" + inner + "|null)[]", 1)
+        return irAtoms("(" + primNameStr(inner) + "|null)[]", 1)
       }
       const alias = litUnionAliasNameOfTy(et.nInner)
       if alias != "" { return irAtoms("(" + alias + "|null)[]", 1) }
@@ -21375,9 +21636,39 @@ export function nodePinPayloadOf(ix: i32) {
 // same spelling later. The monomorphizer's speculative-inference windows
 // (`monoInferListElem` / `monoInferLocalScalar`) are index-fed from exactly this
 // return — the only producer of those indices, and the reason they take no names.
+export function nameMentionsGenAliasParam(nm: string): boolean {
+  let i = 0
+  while i < gaParamNames.length {
+    if nameMentionsIdent(nm, gaParamNames[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
 export function recordClonedNodeTy(nodeIx: i32, name: string, pin: i32) {
+  recordClonedNodeTyKnown(nodeIx, name, pin, -1)
+}
+
+// THE HAND-OVER FORM. `recordClonedNodeTy` above resolves the synthesized NAME by parsing
+// it — which is the shape the destringify programme exists to remove, at its purest where
+// the producer BUILT that name out of parts it already held (`emit_rewrite`'s
+// `lt.tyName + "[]"` appends a suffix and this parses it straight back off).
+//
+// `tyIn >= 0` means the caller already holds the arena index and hands it over; the parse
+// is then not skipped by a shortcut, it never happens. `-1` keeps the old route for the
+// callers that genuinely only have a name.
+//
+// The name is still recorded on the node — it is the node's `tyName`, read by consumers
+// that have not been converted — so this removes the PARSE, not yet the spelling.
+export function recordClonedNodeTyKnown(
+  nodeIx: i32,
+  name: string,
+  pin: i32,
+  tyIn: i32,
+) {
   if nodeIx < 0 { return -1 }
-  let ty = nameToTy(name)
+  let ty = tyIn
+  if ty < 0 { ty = nameToTy(name) }
   if ty < 0 {
     if pin == PIN_SIGKEY { ty = funcPinTyIx() }
     else if pin == PIN_ANON { ty = objPinTyIx() }
@@ -22004,12 +22295,14 @@ function isValueUnionBox(tyix: i32) {
     // NOT a box: all-`str` (`"a"|"b"`) or all-numeric (`0|1|2`). A MIXED-kind literal union (`"x"|7`,
     // a string lit + a numeric lit) can't share one atom rep, so it boxes as a value union.
     let allSameLit = true
-    let litKind = ""
+    // `null` is "no member seen yet" — the vocabulary is a literal union now, so the
+    // empty-string sentinel it used has no spelling in the type.
+    let litKind: LitKind | null = null
     let i = 0
     while i < t.uMembers.length {
       const m = T.tys[t.uMembers[i]]
       if m is TyLit {
-        if litKind == "" { litKind = m.litKind }
+        if litKind == null { litKind = m.litKind }
         else if litKind != m.litKind { allSameLit = false }
       } else {
         allSameLit = false

@@ -20,6 +20,7 @@ import {
   REP_SCAL_F32,
   REP_SCAL_F64,
   REP_SCAL_I64,
+  hcReset,
   msPoolReset,
   mvSlotKeyI32,
   repKindOfSigTok,
@@ -164,6 +165,7 @@ import {
   gPromoSlot,
   gStrPoolIx,
   gStrPoolTexts,
+  genTyParamNames,
   globalIndexBySid,
   globalStmts,
   ia64TypeIdx,
@@ -229,6 +231,7 @@ import {
   sFieldElemKeyI32,
   sFieldElemTyIx,
   sNames,
+  sRowDecl,
   sTwin,
   sTyIx,
   scopeFrames,
@@ -410,6 +413,7 @@ import {
   collectMemberPopRefSlotsExpr,
   collectRefPushSlots,
   collectS,
+  collectTyParamNames,
   collectU,
   computeRetInference,
   computeVoidFns,
@@ -2999,6 +3003,7 @@ function checkFnParams() {
 // failed emit). The `#2` rows are the explicit re-run stage — each branch calls
 // the same pass function a second time, post-monomorphization.
 function runEmitPass(name: string, stmts: i32[]) {
+  if name == "collectTyParams" { return collectTyParamNames() }
   if name == "collectU" { return collectU(stmts) }
   if name == "collectS" { return collectS(stmts) }
   if name == "collectA" { return collectA(stmts) }
@@ -3038,7 +3043,7 @@ function runEmitPass(name: string, stmts: i32[]) {
 // ── the SID-KEYED TABLE reset — paired with `symbols.sidReset` at every site ────
 // The driver calls this beside every `sidReset()`, i.e. at every `P.nodes = []`.
 // It exists as ONE function so the pairing is one line at each of the seven sites
-// rather than five, and so the enumeration of sid-keyed tables has a single home.
+// rather than six, and so the enumeration of sid-keyed tables has a single home.
 //
 // **WHY IT IS NOT ENOUGH TO RESET THESE WHERE THEIR STRING PREDECESSORS WERE.**
 // `globalIndexBySid` is rebuilt by `collectFns`, `fnIndexBySid` by `buildFnMap`,
@@ -3054,6 +3059,10 @@ function runEmitPass(name: string, stmts: i32[]) {
 // (a stale `globalIndexBySid` row indexing an emptied `globalStmts`), and every one
 // of those cases passed in isolation. That harness is this hazard's witness.
 export function sidKeyedTablesReset() {
+  // The hash-consed structural-identity table is sid-keyed too — `HC_PRIM` holds the
+  // primitive keyword's sid and `HC_OBJ` its field names' — so it resets here, which is
+  // what this function exists to be: the one home for that pairing.
+  hcReset()
   globalIndexBySid = []
   fnIndexBySid = []
   nestedNameBySid = []
@@ -3068,7 +3077,7 @@ export function emitProgram(rootIx: i32) {
   // program rebuilds from scratch. Each ALSO has its own reset inside the collect
   // pass that clears the NAME column it parallels — but those passes run in order
   // (collectU, collectS, collectA), so a query issued by an EARLIER pass would read
-  // program N-1's rows. `slotCanonKey` then dereferences one into program N's
+  // program N-1's rows. `slotCanonId` then dereferences one into program N's
   // re-minted arena and TRAPS ("array element access out of bounds"): a stale index
   // traps where a stale NAME is merely wrong text. Only reachable when one compiler
   // instance lowers several programs — the test/batch drivers.
@@ -3080,11 +3089,16 @@ export function emitProgram(rootIx: i32) {
   // row makes `unionMemberTysOf` false, so its consumer falls back to the member-NAME
   // scan; and a member SET id names a union ROW plus a mask over that row's members,
   // so `msPoolReset`'s generation bump is what retires an id outliving its program.
-  mvValTyIx = []        // map-VALUE type per mv slot        [collectA]
-  rlElemTyIx = []       // ref-list ELEMENT type per slot    [collectA]
-  annRlSlot = []        // ref-list ROW per annotation node  [collectA] — node ixs are
-  annRlNul = []         // ...and that row's `| null` flag              stable, ROWS are not
-  sTyIx = []            // arena type a struct ROW came from [collectS]
+  mvValTyIx = []  // map-VALUE type per mv slot        [collectA]
+  rlElemTyIx = [] // ref-list ELEMENT type per slot    [collectA]
+  annRlSlot = []  // ref-list ROW per annotation node  [collectA] — node ixs are
+  annRlNul = []   // ...and that row's `| null` flag              stable, ROWS are not
+  sTyIx = []      // arena type a struct ROW came from [collectS]
+  sRowDecl = []   // was the row DECLARED, banked at its mint [collectS]
+  // Ordering already covers this one (`collectTyParams` is pass-table row 0), but the
+  // column belongs with the other per-program sidecars for the reason this block's header
+  // gives: the safety should be structural, not a property of the pass order.
+  genTyParamNames = []  // FuncDecl type-parameter names  [collectTyParams]
   sFieldElemTyIx = []   // a struct FIELD's element type     [collectS]
   uFieldElemTyIx = []   // a VARIANT field's element type    [collectU]
   sFieldElemKeyI32 = [] // a struct FIELD's map KEY rep    [collectS]
@@ -3171,9 +3185,10 @@ export function emitProgram(rootIx: i32) {
     //    monomorphization renumbers `fnStmts` and every record is keyed by
     //    position.
     const passTable = [
-      "collectU",
-      "collectS > collectU",
-      "collectA > collectS",
+      "collectTyParams",
+      "collectU > collectTyParams",
+      "collectS > collectU collectTyParams",
+      "collectA > collectS collectTyParams",
       "collectFns > collectU collectS",
       "checkTopLevel > collectFns",
       "buildFnMap > collectFns",

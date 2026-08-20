@@ -71,6 +71,7 @@ import {
   sFieldStart,
   sFieldTypes,
   sNames,
+  sRowDecl,
   sTwin,
   sTyIx,
   uFieldElemKeyI32,
@@ -90,6 +91,7 @@ import {
   vbI64Idx,
 } from "./emit_state"
 import {
+  PrimName,
   T,
   TY_I32,
   TyArray,
@@ -110,6 +112,7 @@ import {
   nodeRepTyIxOf,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
+  primNameStr,
   primTyOfName,
   resolveAnnot,
   tyIsLitUnion,
@@ -120,6 +123,7 @@ import {
   tyMutEpoch,
   valueAtomKind,
 } from "./typecheck"
+import { sidOf } from "./symbols"
 
 // ── The descriptor ────────────────────────────────────────────────────────────
 // One struct per classified type. Field semantics:
@@ -218,14 +222,14 @@ export function repSigTokHasSlot(kind: VKind | null): boolean {
 // slot digit renders its `sTwin`-canonical representative (`repStructSlotRep`), not
 // the raw row. Two spelling-twin struct rows (`type A={v:i32}` vs an inline `{v:i32}`
 // annotation, or a closure-field / nullable-litunion twin) are `structFieldCodesEq`
-// under one `slotCanonKey`, so they emit BYTE-IDENTICAL functypes (`fbValtype` reads
+// under one `slotCanonId`, so they emit BYTE-IDENTICAL functypes (`fbValtype` reads
 // `sHeapIdx[slot]`, and `sHeapIdx` collapses twins) — but their raw digits made the
 // three `$fnsig` producers key structurally-identical shapes under DIFFERENT sig
 // keys (the #980 KEY-vs-ROW divergence that blocks the phase-1 bridge leg + phase-2
 // authoritative swap). Rendering the canonical rep makes the sig KEY twin-invariant:
 // whichever row a resolver lands on, the digit — hence the interned functype key —
 // is the same, so structurally-identical shapes dedup to ONE `$fnsig`. The rep is
-// computed TIMING-INDEPENDENTLY (from `slotCanonKey`, never the `sTwin[]` array,
+// computed TIMING-INDEPENDENTLY (from `slotCanonId`, never the `sTwin[]` array,
 // which `buildStructTwins` fills AFTER `collectCloSigs` has already interned the sig
 // set) so intern-time and emit-time renders agree. Other slot kinds (reflist /
 // variant / map) index their OWN tables and pass through unchanged.
@@ -328,6 +332,9 @@ let repKeyMemoEpoch = -1
 function repKeyMemoSync() {
   if repKeyMemoEpoch != tyMutEpoch {
     repKeyMemo = []
+    // The identity twin's memo shares this generation exactly — one sync, two columns,
+    // so the two can never disagree about which generation they are in.
+    hcCanonMemo = []
     repKeyMemoEpoch = tyMutEpoch
   }
   0
@@ -350,7 +357,7 @@ export function repCanonKey(ty: i32): string {
   repKeyStack.push(ty)
   let s = repCanonKeyGo(ty)
   repKeyStack.pop()
-  // RUNAWAY CAP (same crash family as `repNameCanonKey`'s): a render past any sane
+  // RUNAWAY CAP (same crash family as `repNameCanonId`'s): a render past any sane
   // structural-key size collapses to an ARENA-INDEX-unique sentinel — never equal to
   // another type's key, so it can only DECLINE a merge (loud fall-through), never
   // create one. Capped here (not per-arm) so one bound covers every composition arm.
@@ -510,10 +517,24 @@ export function repElemKey(ty: i32): string {
     }
     si = si - 1
   }
+  const top = repElemKeyStack.length == 0
+  if top {
+    repElemMemoSync()
+    if ty < repElemMemo.length {
+      if repElemMemo[ty] != "" { return repElemMemo[ty] }
+    }
+  }
   repElemKeyStack.push(ty)
   let s = repElemKeyGo(ty)
   repElemKeyStack.pop()
   if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
+  if top {
+    // `repElemKeyGo` only READS (the arena, and the slot cache through
+    // `repSlotOfTyDecl`), so the generations synced above still hold and the write
+    // cannot stamp a stale key — `repKeyMemo`'s note, one cache over.
+    while repElemMemo.length <= ty { repElemMemo.push("") }
+    repElemMemo[ty] = s
+  }
   s
 }
 
@@ -521,6 +542,65 @@ export function repElemKey(ty: i32): string {
 // reaches `repElemKey` through a declared struct (keyed nominally, which already
 // bottoms out) or, defensively, a union/map that could self-refer.
 const repElemKeyStack: i32[] = []
+
+// THE `repElemKey` MEMO — `repKeyMemo`'s twin, with one more generation to compare.
+// `repCanonKeyGo` reads the ARENA ALONE, so its memo syncs on `tyMutEpoch`; this key's
+// `TyObj` arm additionally asks `repSlotOfTyDecl`, whose answer belongs to the slot
+// cache — so this memo syncs on exactly the TRIPLE `repSlotCacheSync` compares
+// (`tyMutEpoch`, `cUserTypesVer`, `sNames.length`). Anything that can change a key
+// changes one of the three, and stamping the same triple keeps the two caches from
+// disagreeing about which generation they are in.
+//
+// TOP OF RECURSION ONLY, exactly as `repKeyMemo`, and for a reason that is not
+// caution: the de Bruijn back-edge (`#n`) is a function of the caller's DEPTH, not of
+// `ty`, so an INNER answer is not a pure function of its type and must never be banked.
+//
+// EXACT, AND THE GATE IS A DUAL-RUN: every memo HIT recomputed from scratch and compared
+// with the banked answer — **54,906 agree / 0 disagree** over the corpus and **15,445 / 0**
+// on the compiler's own source. The comparator is live, proven by banking `s + "X"`, which
+// turns it into 0 / 15,445 with witnesses (`memo=S0X fresh=S0`).
+//
+// NEITHER GENERATION CONJUNCT IS LOAD-BEARING ON ANY INPUT MEASURED, and that is recorded
+// rather than banked as safety: dropping `sNames.length` from the sync leaves 0
+// disagreements, and dropping `tyMutEpoch` as well ALSO leaves 0 — so on everything
+// available, nothing this key depends on moves inside the window `repElemKey` runs in. The
+// triple is kept anyway, because the alternative is an unguarded cache resting on an
+// emit-window invariant nobody has stated, and because syncing on exactly what
+// `repSlotCacheSync` compares is what makes "the two caches are in the same generation" a
+// one-line argument. If that invariant is ever written down, this guard is deletable.
+//
+// WHY IT DID NOT EXIST: nothing recorded a reason — `repCanonKey` was memoized and this
+// twin was not, and the cost is the whole gap between the two. Measured before adding
+// it: `repCanonKey` takes 38,145 of 51,393 corpus calls on the memo (74.2%) while
+// `repElemKey` took 0 of 152,090 and rebuilt **1,139,860 characters** of type spelling;
+// on the compiler's own source, 0 of 23,784 calls and 174,564 characters. After: corpus
+// builds **152,090 -> 7,989** and characters **1,139,860 -> 65,644** (-94.2%); self-compile
+// builds **23,784 -> 346** and characters **174,564 -> 5,774** (-96.7%).
+//
+// PERF: UNMEASURABLE, and that is the honest answer. Five warmed alternating self-compiles
+// per side: 1.48/1.52/1.49/1.53/1.48 against 1.50/1.49/1.50/1.49/1.53 — the 169 KB of
+// string building removed is microseconds against a 1.5 s compile. It ships as a
+// destringify result (94% of a string-building population the programme exists to remove,
+// at zero risk and zero byte movement), NOT as a speed one.
+let repElemMemo: string[] = []
+let repElemMemoEpoch = -1
+let repElemMemoUserVer = -1
+let repElemMemoLen = -1
+
+function repElemMemoSync() {
+  if (
+    repElemMemoEpoch != tyMutEpoch ||
+    repElemMemoUserVer != cUserTypesVer ||
+    repElemMemoLen != sNames.length
+  ) {
+    repElemMemo = []
+    hcElemMemo = [] // the identity twin's memo, on the same generation
+    repElemMemoEpoch = tyMutEpoch
+    repElemMemoUserVer = cUserTypesVer
+    repElemMemoLen = sNames.length
+  }
+  0
+}
 
 function repElemKeyGo(ty: i32): string {
   const t = T.tys[ty]
@@ -694,7 +774,7 @@ export function tyIsStrLeafElem(e: i32): boolean {
 //
 // A spelling that does not resolve
 // keys on the name itself (nominal — matches only an identical spelling), and
-// the runaway cap mirrors `repNameCanonKey`'s (a name this long is never a legit
+// the runaway cap mirrors `repNameCanonId`'s (a name this long is never a legit
 // slot key — feeding it to `resolveAnnot` mints fresh arena types per probe).
 //
 // `ty` IS THE CALLER'S RECORDED ARENA TYPE FOR THIS VERY NAME (destringify
@@ -728,15 +808,16 @@ export function tyIsStrLeafElem(e: i32): boolean {
 // residue and the lockstep experiment that closes 55 of the 61 are in
 // `docs/internals/destringify-types-program.md` (D-REPELEMTY §3a).
 //
-// The `name == ""` early-out stays ABOVE the hint: an unnamed element has no row,
-// and the empty key is what makes both interner and resolver decline together.
-export function repElemKeyOfNameTy(name: string, ty: i32): string {
-  if name == "" { return "" }
-  if ty >= 0 { return repElemKey(ty) }
-  if name.length > 4096 { return "name:" + name }
+// The `name == ""` early-out stays ABOVE the hint: an unnamed element has no row, and the
+// -1 identity it answers (the key is an id now, not a rendered string) is what makes both
+// interner and resolver decline together.
+export function repElemIdOfNameTy(name: string, ty: i32): i32 {
+  if name == "" { return -1 }
+  if ty >= 0 { return repElemId(ty) }
+  if name.length > 4096 { return hcNameId(name) }
   const di = resolveAnnot(name, repNoTyparams)
-  if di < 0 { return "name:" + name }
-  repElemKey(di)
+  if di < 0 { return hcNameId(name) }
+  repElemId(di)
 }
 
 // ── repMvValKey — the map-VALUE slot rep key ──────────────────────────────────
@@ -1086,9 +1167,17 @@ export function nodeMapValTyIx(nodeIx: i32): i32 {
 //     `di` (the loop's nominal early-return, exact-match-wins order preserved:
 //     the scan only early-returned on the QUERIED index, which structural
 //     matches never preempt);
-//   · `repSlotKeySi[key]` / `repSlotKeyN[key]` — A matching slot per canonical
+//   · `repSlotKeySi[id]` / `repSlotKeyN[id]` — A matching slot per canonical
 //     key + the match COUNT (the unique-twin gate needs `n == 1`, and with
 //     exactly one match the recorded slot IS the scan's `found`).
+//
+// KEYED ON THE STRUCTURAL IDENTITY, NOT ON THE RENDERED KEY (the rep-column rewrite,
+// step 2). `repCanonId` is proven to partition exactly as `repCanonKey` does — 283,052
+// (spelling, id) pairs over the corpus and the compiler's own source with 0 false merges,
+// 0 false splits and 0 rendered-length mismatches, asserted by `repShadowSweep` and
+// sabotage-checked. So this is a change of REPRESENTATION with the partition held fixed,
+// which is why it cannot move a byte and does not. Ids are dense from 0, so the two
+// string maps become two plain arrays; the rendered key is no longer built here at all.
 // Rebuilt whenever anything the scan reads can have changed: an arena mutation
 // (`tyMutEpoch` — keys), a `cUserTypes` write (`cUserTypesVer` — which arena
 // index a name resolves to, incl. `resolveAnnot` memoizing a NEW spelling
@@ -1099,8 +1188,8 @@ let repSlotCacheEpoch = -1
 let repSlotCacheUserVer = -1
 let repSlotCacheLen = -1
 let repSlotByDecl: i32[] = []
-let repSlotKeySi: {[string]: i32} = Map()
-let repSlotKeyN: {[string]: i32} = Map()
+let repSlotKeySi: i32[] = []
+let repSlotKeyN: i32[] = []
 
 function repSlotCacheSync() {
   if (
@@ -1111,21 +1200,44 @@ function repSlotCacheSync() {
     return 0
   }
   repSlotByDecl = []
-  repSlotKeySi = Map()
-  repSlotKeyN = Map()
+  repSlotKeySi = []
+  repSlotKeyN = []
   let si = 0
   while si < sNames.length {
-    const di = cUserTypes[sNames[si]] ?? -1
+    // THE ROW LAYER'S LAST NAME->TYPE RESOLUTION, RETIRED. This opened
+    // `cUserTypes[sNames[si]] ?? -1`, which reads as "resolve this row's name" and decides
+    // two separate things: IS the row declared, and WHICH arena type it is. Both are
+    // banked now — declared-ness by `sRowDecl` at the mint (the name's own `cUserTypes`
+    // answer, asked once), the type by the `sTyIx` sidecar (D0).
+    //
+    // EXACT ON BOTH HALVES, measured before the swap. Declared-ness: **602 agree / 0
+    // disagree** over 2,185 corpus rows. Type: of the same rows the two agree on **602**,
+    // **0 differ**, and **0** resolve by NAME where the sidecar is empty.
+    //
+    // THE COLUMN MUST BE RESET WITH `sNames`, and that is not decoration — the first
+    // version of it omitted the reset and disagreed on 8 cells, which I then explained by
+    // inventing a mechanism ("the answer moves after the mint") that a direct probe
+    // refuted: `cUserTypes["AB"]` reads 31 at the mint and 31 at the cache. The bug was
+    // mine; the design was fine. Same hazard `structNameIxReset` and `structTyIxReset`
+    // carry, and the same fix.
+    let di = -1
+    if si < sRowDecl.length {
+      if sRowDecl[si] == 1 {
+        if si < sTyIx.length { di = sTyIx[si] }
+      }
+    }
     if di >= 0 {
       const dt = T.tys[di]
       if dt is TyObj {
         while repSlotByDecl.length <= di { repSlotByDecl.push(-1) }
         if repSlotByDecl[di] < 0 { repSlotByDecl[di] = si }
-        const k = repCanonKey(di)
+        const k = repCanonId(di)
+        while repSlotKeySi.length <= k {
+          repSlotKeySi.push(-1)
+          repSlotKeyN.push(0)
+        }
         repSlotKeySi[k] = si
-        // Fused missing-key RMW — safe since the published seed contains #918's
-        // map-SET lowering (value evaluated before the probe); B-chore-maprmw-fuse.
-        repSlotKeyN[k] = (repSlotKeyN[k] ?? 0) + 1
+        repSlotKeyN[k] = repSlotKeyN[k] + 1
       }
     }
     si = si + 1
@@ -1168,9 +1280,516 @@ export function repSlotOfTy(ty: i32): i32 {
   if !(t is TyObj) { return -1 }
   // The structural→nominal bridge: the UNIQUE declared twin, else -1. (No slot
   // has the queried arena index here, so the count is exactly the scan's `n`.)
-  const key = repCanonKey(ty)
-  if (repSlotKeyN[key] ?? 0) == 1 { return repSlotKeySi[key] ?? -1 }
+  const key = repCanonId(ty)
+  if key < 0 || key >= repSlotKeyN.length { return -1 }
+  if repSlotKeyN[key] == 1 { return repSlotKeySi[key] }
   -1
+}
+
+// ── STRUCTURAL IDENTITY, HASH-CONSED — the rep key without a spelling ─────────
+// (band 1, the terminal item's first step)
+//
+// `repCanonKey` / `repElemKey` RENDER a structural string from an arena type, and every
+// consumer uses it for ONE thing: equality. So the string is a REPRESENTATION of a
+// structural identity, not the identity itself — which is the thesis's second half
+// ("stop BUILDING strings to represent types") in its purest instance.
+//
+// These build the identity directly. Every node interns `(tag, args…)` into a hash-consed
+// table and returns its INDEX, so two structurally-equal types get the same i32 and no
+// type spelling is ever composed. The recursion mirrors the string builders ARM FOR ARM —
+// same mix-widening, same de Bruijn back-edge, same sentinels, same order — because the
+// partition must be IDENTICAL, not merely similar.
+//
+// `hcLen` carries what the string builder's answer WOULD be, in characters. It is not
+// decoration and it is not a debug aid: it reproduces the runaway cap exactly (a key past
+// 262,144 characters collapses to an arena-index sentinel that can only DECLINE a merge),
+// and it is a far tighter equivalence check than partition agreement — a length that
+// matches at every node says the two recursions have the same SHAPE, which two different
+// recursions could not fake by accident.
+//
+// WIRED, IN FOUR STEPS, ALL ON THIS BRANCH — this note used to say "not yet wired to any
+// consumer, deliberately", which was true of the commit that added the identity and of
+// nothing since. `repSlotKeySi` / `repSlotKeyN` key on it (step 2), then `slotCanonId` and
+// the ref-list element column (step 3), then `repNameCanonId` / `mvValCanonId` (step 4).
+// After those, `repCanonKey` / `repElemKey` are reached from four call sites, all inside
+// the shadow harness — so on a real compile no rep key is built as a string at all.
+const HC_ERRTY = 0 // the `ty < 0` key, `"!"`
+const HC_PRIM = 1
+const HC_OBJ = 2
+const HC_ARRAY = 3
+const HC_NUL = 4
+const HC_UNION = 5
+const HC_FUNC = 6
+const HC_MAP = 7
+const HC_SET = 8
+const HC_NEG = 9
+const HC_BACK = 10 // de Bruijn back-edge, arg = depth
+const HC_IDX = 11 // the arena-index sentinel `"@<ix>"` (TyVar / TyLit / TyErr)
+const HC_BIG = 12 // the runaway cap `"@big:<ix>"`
+const HC_SLOT = 13 // a DECLARED slot `"S<n>"` — elem key only
+const HC_RLI32 = 14 // `"$rlI32L"` — elem key only
+const HC_RLSTR = 15 // `"$rlStrL"` — elem key only
+const HC_NAME = 16 // the unresolvable-spelling key `"name:<nm>"`, arg = the name's sid
+const HC_FIELDSET = 17 // a shape row's (field name sid, field code) multiset, name-sorted
+
+let hcTag: i32[] = []
+let hcArgStart: i32[] = []
+let hcArgCount: i32[] = []
+let hcArgs: i32[] = []
+let hcHashV: i32[] = []
+let hcLen: i32[] = []
+let hcNext: i32[] = []
+let hcBucket: i32[] = []
+let hcMask = -1
+
+// Reset the identity table. Called where `sidReset` is called and for the same reason:
+// `HC_PRIM` and `HC_OBJ` carry `sidOf` ids for the primitive keyword and the field names,
+// so an id minted against one program's symbol space means nothing against the next one's.
+export function hcReset() {
+  // EVERYTHING KEYED ON AN HC ID DIES WITH THE ID SPACE, and this is not a per-program
+  // courtesy: `sidKeyedTablesReset` runs INSIDE the module-parse loop (driver.vl, "the
+  // sharpest edge the carrier has"), so the space restarts mid-compile. The two ty->id
+  // memos hold ids as VALUES and the slot cache holds them as INDICES; both would index
+  // the previous space's rows. The slot cache is invalidated by stamp rather than
+  // cleared, so its own sync stays the single place that rebuilds it.
+  hcCanonMemo = []
+  hcElemMemo = []
+  repSlotCacheEpoch = -1
+  hcTag = []
+  hcArgStart = []
+  hcArgCount = []
+  hcArgs = []
+  hcHashV = []
+  hcLen = []
+  hcNext = []
+  hcBucket = []
+  hcMask = -1
+  0
+}
+
+// The character count `i32ToStr` would produce — WITHOUT producing it. The whole point of
+// `hcLen` is to know the rendered length without rendering, so asking `i32ToStr(n).length`
+// here would defeat the exercise at the one place it is easiest to get wrong.
+function hcDigits(n: i32): i32 {
+  if n < 0 { return 1 + hcDigits(0 - n) }
+  if n < 10 { return 1 }
+  1 + hcDigits(n / 10)
+}
+
+// FNV-1a over the tag and the argument ids, with the offset basis reduced to fit an i32
+// literal (the constant's VALUE is irrelevant to correctness — it only spreads buckets).
+// Masked to 30 bits so the bucket index is non-negative without depending on how the host
+// lowers a shifted sign bit.
+function hcHash(tag: i32, args: i32[]): i32 {
+  let h = 0x1c9dc5 ^ tag
+  h = h * 16777619
+  let i = 0
+  while i < args.length {
+    h = (h ^ args[i]) * 16777619
+    i = i + 1
+  }
+  h & 0x3fffffff
+}
+
+function hcGrow() {
+  let cap = 16
+  while cap < hcTag.length * 2 { cap = cap * 2 }
+  hcBucket = []
+  let i = 0
+  while i < cap {
+    hcBucket.push(-1)
+    i = i + 1
+  }
+  hcMask = cap - 1
+  let id = 0
+  while id < hcTag.length {
+    const b = hcHashV[id] & hcMask
+    hcNext[id] = hcBucket[b]
+    hcBucket[b] = id
+    id = id + 1
+  }
+  0
+}
+
+function hcIntern(tag: i32, args: i32[], len: i32): i32 {
+  if hcMask < 0 { hcGrow() }
+  const h = hcHash(tag, args)
+  let b = hcBucket[h & hcMask]
+  while b >= 0 {
+    if hcHashV[b] == h && hcTag[b] == tag && hcArgCount[b] == args.length {
+      let ok = true
+      const st = hcArgStart[b]
+      let i = 0
+      while i < args.length {
+        if hcArgs[st + i] != args[i] { ok = false }
+        i = i + 1
+      }
+      if ok { return b }
+    }
+    b = hcNext[b]
+  }
+  const id = hcTag.length
+  hcTag.push(tag)
+  hcArgStart.push(hcArgs.length)
+  hcArgCount.push(args.length)
+  hcHashV.push(h)
+  hcLen.push(len)
+  hcNext.push(-1)
+  let j = 0
+  while j < args.length {
+    hcArgs.push(args[j])
+    j = j + 1
+  }
+  // Grow AFTER the push so the rebuild chains the new entry too; otherwise insert it.
+  if hcTag.length * 4 > (hcMask + 1) * 3 {
+    hcGrow()
+  } else {
+    const bi = h & hcMask
+    hcNext[id] = hcBucket[bi]
+    hcBucket[bi] = id
+  }
+  id
+}
+
+// The rendered length of id `i` — `hcLen`'s accessor, and the one place that knows the
+// column is parallel to the id space.
+export function hcLenOf(i: i32): i32 {
+  if i < 0 || i >= hcLen.length { return -1 }
+  hcLen[i]
+}
+
+const hcNoArgs: i32[] = []
+
+// The `"name:<nm>"` key — a NAME-derived identity, not a structural one, minted where a
+// spelling resolves to no type. It carries the name's sid rather than the spelling, so it
+// is still the one place a name reaches this table and it can never collide with a
+// structural key (its tag is its own).
+function hcNameId(name: string): i32 {
+  const a: i32[] = []
+  a.push(sidOf(name))
+  hcIntern(HC_NAME, a, 5 + name.length)
+}
+
+// The shape interner's FIELDSET key — the (field-name sid, field code) multiset a row is
+// deduped by, canonically ordered by the caller. Interned here so the shape layer's
+// identity shares one table with the rep layer's and can never collide with it: the tag
+// is its own. No length is meaningful (nothing renders this key), so it carries 0.
+export function hcShapeSetId(args: i32[]): i32 {
+  hcIntern(HC_FIELDSET, args, 0)
+}
+
+function hcPrimId(name: string): i32 {
+  const a: i32[] = []
+  a.push(sidOf(name))
+  hcIntern(HC_PRIM, a, name.length)
+}
+
+// The identity twin of `repCanonKey`. Same stack, same cap, same memo discipline — the
+// memo is per arena index and top-of-recursion only, because the back-edge is a function
+// of the caller's DEPTH rather than of `ty`.
+let hcCanonMemo: i32[] = []
+const hcCanonStack: i32[] = []
+
+export function repCanonId(ty: i32): i32 {
+  if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
+  let si = hcCanonStack.length - 1
+  while si >= 0 {
+    if hcCanonStack[si] == ty {
+      const d = hcCanonStack.length - si
+      const a: i32[] = []
+      a.push(d)
+      return hcIntern(HC_BACK, a, 1 + hcDigits(d))
+    }
+    si = si - 1
+  }
+  const top = hcCanonStack.length == 0
+  if top {
+    repKeyMemoSync()
+    if ty < hcCanonMemo.length {
+      if hcCanonMemo[ty] >= 0 { return hcCanonMemo[ty] }
+    }
+  }
+  hcCanonStack.push(ty)
+  let r = repCanonIdGo(ty)
+  hcCanonStack.pop()
+  if hcLen[r] > 262144 {
+    const a: i32[] = []
+    a.push(ty)
+    r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
+  }
+  if top {
+    while hcCanonMemo.length <= ty { hcCanonMemo.push(-1) }
+    hcCanonMemo[ty] = r
+  }
+  r
+}
+
+function repCanonIdGo(ty: i32): i32 {
+  const t = T.tys[ty]
+  match t {
+    TyPrim => {
+      return hcPrimId(t.primName)
+    }
+    TyObj => {
+      // `"{" + Σ(name + ":" + child + ",") + "}"`
+      const a: i32[] = []
+      let len = 2
+      let i = 0
+      while i < t.objFieldNames.length {
+        const c = repCanonId(t.objFieldTypes[i])
+        a.push(sidOf(t.objFieldNames[i]))
+        a.push(c)
+        len = len + t.objFieldNames[i].length + 1 + hcLen[c] + 1
+        i = i + 1
+      }
+      return hcIntern(HC_OBJ, a, len)
+    }
+    TyArray => {
+      const c = repCanonId(t.aElem)
+      const a: i32[] = []
+      a.push(c)
+      return hcIntern(HC_ARRAY, a, hcLen[c] + 2)
+    }
+    TyNullable => {
+      const c = repCanonId(t.nInner)
+      const a: i32[] = []
+      a.push(c)
+      return hcIntern(HC_NUL, a, hcLen[c] + 1)
+    }
+    TyUnion => {
+      return hcUnionId(t.uMembers, true)
+    }
+    TyFunc => {
+      // `"(" + join(",", params) + ")=>" + ret` — ONE for the open paren; the closer is
+      // inside the `")=>"` added below, so starting at 2 double-counts it.
+      const a: i32[] = []
+      let len = 1
+      let i = 0
+      while i < t.fnParamTypes.length {
+        if i > 0 { len = len + 1 }
+        const c = repCanonId(t.fnParamTypes[i])
+        a.push(c)
+        len = len + hcLen[c]
+        i = i + 1
+      }
+      const rc = repCanonId(t.fnRet)
+      a.push(rc)
+      len = len + 3 + hcLen[rc]
+      return hcIntern(HC_FUNC, a, len)
+    }
+    TyMap => {
+      const kc = repCanonId(t.mKey)
+      const vc = repCanonId(t.mVal)
+      const a: i32[] = []
+      a.push(kc)
+      a.push(vc)
+      let head = 1
+      let tag = HC_MAP
+      if t.mSet == 1 {
+        head = 2
+        tag = HC_SET
+      }
+      return hcIntern(tag, a, head + 1 + hcLen[kc] + 1 + hcLen[vc] + 1)
+    }
+    TyNeg => {
+      const c = repCanonId(t.negTy)
+      const a: i32[] = []
+      a.push(c)
+      return hcIntern(HC_NEG, a, 1 + hcLen[c])
+    }
+    TyVar => {
+
+    }
+    TyLit => {
+
+    }
+    TyErr => {
+
+    }
+  }
+  const a: i32[] = []
+  a.push(ty)
+  hcIntern(HC_IDX, a, 1 + hcDigits(ty))
+}
+
+// The union arm, shared by both identities because the MIX-WIDENING rule is one rule
+// written twice in the string builders and must not become three. `canon` selects which
+// child identity to recurse with — the two differ only in that.
+function hcUnionId(mems: i32[], canon: boolean): i32 {
+  let mixHasOther = false
+  let mi = 0
+  while mi < mems.length {
+    const mt = T.tys[mems[mi]]
+    let mLit = tyIsLitUnion(mems[mi])
+    if mt is TyLit { mLit = true }
+    let mNull = false
+    if mt is TyPrim {
+      if mt.primName == "null" { mNull = true }
+    }
+    if !mLit && !mNull { mixHasOther = true }
+    mi = mi + 1
+  }
+  const strId = hcPrimId("string")
+  const a: i32[] = []
+  let len = 2
+  let emitted = 0
+  let sawWideStr = false
+  let i = 0
+  while i < mems.length {
+    let r = -1
+    if canon { r = repCanonId(mems[i]) } else { r = repElemId(mems[i]) }
+    let skip = false
+    if mixHasOther {
+      let iLit = tyIsLitUnion(mems[i])
+      const it = T.tys[mems[i]]
+      if it is TyLit { iLit = true }
+      if iLit { r = strId }
+      if r == strId {
+        if sawWideStr { skip = true }
+        sawWideStr = true
+      }
+    }
+    if !skip {
+      if emitted > 0 { len = len + 1 }
+      a.push(r)
+      len = len + hcLen[r]
+      emitted = emitted + 1
+    }
+    i = i + 1
+  }
+  hcIntern(HC_UNION, a, len)
+}
+
+// The identity twin of `repElemKey`. Its memo carries the same triple as `repElemMemo`.
+let hcElemMemo: i32[] = []
+const hcElemStack: i32[] = []
+
+export function repElemId(ty: i32): i32 {
+  if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
+  let si = hcElemStack.length - 1
+  while si >= 0 {
+    if hcElemStack[si] == ty {
+      const d = hcElemStack.length - si
+      const a: i32[] = []
+      a.push(d)
+      return hcIntern(HC_BACK, a, 1 + hcDigits(d))
+    }
+    si = si - 1
+  }
+  const top = hcElemStack.length == 0
+  if top {
+    repElemMemoSync()
+    if ty < hcElemMemo.length {
+      if hcElemMemo[ty] >= 0 { return hcElemMemo[ty] }
+    }
+  }
+  hcElemStack.push(ty)
+  let r = repElemIdGo(ty)
+  hcElemStack.pop()
+  if hcLen[r] > 262144 {
+    const a: i32[] = []
+    a.push(ty)
+    r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
+  }
+  if top {
+    while hcElemMemo.length <= ty { hcElemMemo.push(-1) }
+    hcElemMemo[ty] = r
+  }
+  r
+}
+
+function repElemIdGo(ty: i32): i32 {
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      if tyIsI32LeafElem(t.aElem) { return hcIntern(HC_RLI32, hcNoArgs, 7) }
+      if tyIsStrLeafElem(t.aElem) { return hcIntern(HC_RLSTR, hcNoArgs, 7) }
+      const c = repElemId(t.aElem)
+      const a: i32[] = []
+      a.push(c)
+      return hcIntern(HC_ARRAY, a, hcLen[c] + 2)
+    }
+    TyObj => {
+      const ds = repSlotOfTyDecl(ty)
+      if ds >= 0 {
+        const a: i32[] = []
+        a.push(ds)
+        return hcIntern(HC_SLOT, a, 1 + hcDigits(ds))
+      }
+      const a2: i32[] = []
+      let len = 2
+      let i = 0
+      while i < t.objFieldNames.length {
+        const c = repElemId(t.objFieldTypes[i])
+        a2.push(sidOf(t.objFieldNames[i]))
+        a2.push(c)
+        len = len + t.objFieldNames[i].length + 1 + hcLen[c] + 1
+        i = i + 1
+      }
+      return hcIntern(HC_OBJ, a2, len)
+    }
+    TyPrim => {
+      return hcPrimId(t.primName)
+    }
+    TyNullable => {
+      const c = repElemId(t.nInner)
+      const a: i32[] = []
+      a.push(c)
+      return hcIntern(HC_NUL, a, hcLen[c] + 1)
+    }
+    TyUnion => {
+      return hcUnionId(t.uMembers, false)
+    }
+    TyFunc => {
+      // See the canon twin: 1 for the open paren, the closer rides in `")=>"`.
+      const a: i32[] = []
+      let len = 1
+      let i = 0
+      while i < t.fnParamTypes.length {
+        if i > 0 { len = len + 1 }
+        const c = repElemId(t.fnParamTypes[i])
+        a.push(c)
+        len = len + hcLen[c]
+        i = i + 1
+      }
+      const rc = repElemId(t.fnRet)
+      a.push(rc)
+      len = len + 3 + hcLen[rc]
+      return hcIntern(HC_FUNC, a, len)
+    }
+    TyMap => {
+      const kc = repElemId(t.mKey)
+      const vc = repElemId(t.mVal)
+      const a: i32[] = []
+      a.push(kc)
+      a.push(vc)
+      let head = 1
+      let tag = HC_MAP
+      if t.mSet == 1 {
+        head = 2
+        tag = HC_SET
+      }
+      return hcIntern(tag, a, head + 1 + hcLen[kc] + 1 + hcLen[vc] + 1)
+    }
+    TyNeg => {
+      const c = repElemId(t.negTy)
+      const a: i32[] = []
+      a.push(c)
+      return hcIntern(HC_NEG, a, 1 + hcLen[c])
+    }
+    TyVar => {
+
+    }
+    TyLit => {
+
+    }
+    TyErr => {
+
+    }
+  }
+  const a: i32[] = []
+  a.push(ty)
+  hcIntern(HC_IDX, a, 1 + hcDigits(ty))
 }
 
 // ── Structural heap-type dedup (roadmap Next#1, the slot layer) ───────────────
@@ -1196,7 +1815,7 @@ export function repSlotOfTy(ty: i32): i32 {
 const repNoTyparams: string[] = []
 
 // The arena type index a struct-row NAME denotes, or -1 — the resolution
-// `slotCanonKey` used to inline. Exported so the row MINT sites can record it into
+// `slotCanonId` used to inline. Exported so the row MINT sites can record it into
 // the `sTyIx` sidecar (phase D0) at the moment the annotation is in scope.
 export function sTyIxOfName(nm: string): i32 { sTyIxOfNameTy(nm, -1) }
 
@@ -1218,7 +1837,7 @@ export function sTyIxOfNameTy(nm: string, tyIx: i32): i32 {
   // `resolveAnnot` mints arena types per call — the #961 runaway shape — so the
   // cost was MEASURED, not assumed: self-compile 11.8s with this fallback vs 13.2s
   // without (noise — the annotation-name memo #961 added is doing its job). A name
-  // that resolves through neither path stays -1 and `slotCanonKey` falls through to
+  // that resolves through neither path stays -1 and `slotCanonId` falls through to
   // its existing name behaviour.
   if nameIsShapeSpanEnds(nm) { return resolveAnnot(nm, repNoTyparams) }
   -1
@@ -1226,8 +1845,27 @@ export function sTyIxOfNameTy(nm: string, tyIx: i32): i32 {
 
 // Record `v` as the arena type index of the struct row JUST pushed onto `sNames`
 // (phase D0). Pads with -1 so a mint site that does not call this self-heals to
-// "uncovered" — `slotCanonKey` then falls through to the legacy name path rather
+// "uncovered" — `slotCanonId` then falls through to the legacy name path rather
 // than reading a mis-aligned entry.
+// (The header below belongs to `recordSTyIx`, which follows this function.)
+//
+// Whether the struct row JUST pushed came from a DECLARED type name, decided from its own
+// spelling at the MINT — the one moment it is in scope. Pads with 0 so a mint site that
+// does not call this reads "not declared", the conservative answer.
+//
+// THIS IS `cUserTypes` MEMBERSHIP, WHICH INCLUDES UNION DECLARATIONS. It is the right
+// predicate for `repSlotCacheSync` ("is this row's name a declared TYPE" — measured 602/0
+// there) and the WRONG one for `structIdxOfElemName`, which needs "is it a declared
+// STRUCT" and must keep `nameIsStructDecl`. See the note at that gate: a swap was tried,
+// and a struct-alias union opened it.
+export function recordSRowDeclOfName(nm: string) {
+  let v = 0
+  if cUserTypes.has(nm) { v = 1 }
+  while sRowDecl.length + 1 < sNames.length { sRowDecl.push(0) }
+  sRowDecl.push(v)
+  0
+}
+
 export function recordSTyIx(v: i32) {
   while sTyIx.length + 1 < sNames.length { sTyIx.push(-1) }
   sTyIx.push(v)
@@ -1246,7 +1884,7 @@ export function recordSTyIx(v: i32) {
 // Runs ONCE per struct field at intern time, so the #961 runaway does not apply.
 export function fieldElemTyIxOfName(nm: string): i32 {
   if nm == "" { return -1 }
-  // The runaway cap, mirroring `repNameCanonKey` / `repElemKeyOfNameTy`: a spelling this
+  // The runaway cap, mirroring `repNameCanonId` / `repElemIdOfNameTy`: a spelling this
   // long is never a legit slot key, and feeding it to `resolveAnnot` mints fresh arena
   // types per probe. -1 is the documented safe degenerate (the name path is kept).
   if nm.length > 4096 { return -1 }
@@ -1264,7 +1902,7 @@ export function fieldElemTyIxOfName(nm: string): i32 {
 // **THE RUNGS ARE PARSE ELIMINATORS, NOT CACHES.** `resolveAnnot` memoizes per
 // spelling, so a repeat query is already a map lookup either way; what a rung removes
 // is the FIRST resolution of a spelling — the one call that actually reads the
-// annotation grammar. Measured over the corpus, rung 1 is 219 of `repNameCanonKey`'s
+// annotation grammar. Measured over the corpus, rung 1 is 219 of `repNameCanonId`'s
 // 228 annotation-grammar reads and 12 of `repRowOfName`'s 180; rung 2 is 803 of
 // `unMemAtomTyIx`'s 1,229 and 151 more across this function's other callers.
 //
@@ -1275,7 +1913,7 @@ export function fieldElemTyIxOfName(nm: string): i32 {
 // spellings are exactly the closed leaf vocabulary: `string` 259 · `i32` 152 ·
 // `null` 125 · `i64` 87 · `f64` 82 · `boolean` 76 · `f32` 22.
 //
-// **IT IS NOT SOUND EVERYWHERE, AND THE PLACE IT IS NOT IS `repElemKeyOfNameTy`.**
+// **IT IS NOT SOUND EVERYWHERE, AND THE PLACE IT IS NOT IS `repElemIdOfNameTy`.**
 // A `new` NEWTYPE over a struct has TWO LIVE ARENA INDICES OVER ONE `Ty`: pass 0a
 // registers the BASE in `cUserTypes`, and the annotation grammar bottoms out at
 // `declaredTyOfName`, which returns `nwBrand(name, base)` — a second `addTy` of that
@@ -1284,7 +1922,7 @@ export function fieldElemTyIxOfName(nm: string): i32 {
 // brand a memoized one does. But only the BASE owns an `sNames` row, so `repElemKey`
 // keys it NOMINALLY (`S0`) and keys the brand STRUCTURALLY (`{base:i32,length:i32,}`)
 // — one spelling, two reps. Measured over the 1,773 corpus programs, dual-written on
-// the raw index: 0 disagreements in 294 covered `repNameCanonKey` reaches and 0 in 66
+// the raw index: 0 disagreements in 294 covered `repNameCanonId` reaches and 0 in 66
 // `repRowOfName` reaches, against 28 in 1,034 here, every one of them a `new` struct
 // newtype. That site therefore keeps asking the grammar; see
 // `docs/internals/destringify-types-program.md` (D-DECLRUNG, D-NWBRANDKEY).
@@ -1295,7 +1933,7 @@ export function fieldElemTyIxOfName(nm: string): i32 {
 // ladder's own answer on the RAW arena index — the tightest tolerance there is, since
 // equal indices make every consumer projection equal — over the corpus: **0 disagreements
 // in 1,481 covered `unMemAtomTyIx` reaches and 2,447 covered reaches here**, on the
-// memo-HIT path as well as the parse path. `repElemKeyOfNameTy` is measured too and
+// memo-HIT path as well as the parse path. `repElemIdOfNameTy` is measured too and
 // its coverage is **0 of 3,660** — a ref-list element is never spelled as a bare
 // primitive — so the rung is not offered there.
 export function declTyIxOfName(nm: string): i32 {
@@ -1306,7 +1944,7 @@ export function declTyIxOfName(nm: string): i32 {
   // a leaf: the grammar below takes it apart into nothing and arrives at this very
   // function. Asking it here is the same lookup one call earlier, not a second copy
   // of a rule — and it answers a SEEDED arena index that no second entry shadows
-  // (the base/brand skew that refuses rung 1 at `repElemKeyOfNameTy` needs a
+  // (the base/brand skew that refuses rung 1 at `repElemIdOfNameTy` needs a
   // DECLARED name, and no declaration can be spelled with a primitive keyword).
   const pi = primTyOfName(nm)
   if pi >= 0 { return pi }
@@ -1808,8 +2446,12 @@ export function recordUnMemTys(set: string) {
   0
 }
 
-function slotCanonKey(si: i32): string {
-  if si < 0 || si >= sNames.length { return "" }
+// KEYED ON THE STRUCTURAL IDENTITY (the rep-column rewrite, step 3). Every answer was a
+// RENDERED key whose only use is equality, so it is now the hash-consed id — and the
+// `""` "does not participate in dedup, never merged" sentinel becomes `-1`. Same
+// partition, proven; same two rungs and neither-rung fall-through, untouched.
+function slotCanonId(si: i32): i32 {
+  if si < 0 || si >= sNames.length { return -1 }
   // RUNG 1 — the ARENA-INDEX sidecar (`sTyIx`, recorded at every row mint in D0),
   // consulted FIRST (destringify D-SLOTARENA). This row's type is known
   // structurally, so there is nothing to re-derive from its name; the rung the
@@ -1830,7 +2472,7 @@ function slotCanonKey(si: i32): string {
   //
   // WHAT MOVING IT BUYS is not tidiness: the name ladder's inline-shape fallback is
   // a `resolveAnnot` RE-PARSE of a spelling whose answer this table already banked,
-  // and `slotCanonKey` is the hottest of `emit_rep`'s seven `resolveAnnot` callers
+  // and `slotCanonId` is the hottest of `emit_rep`'s seven `resolveAnnot` callers
   // (`repRowOfTyStruct` and `buildStructTwins` both scan it over every row). The
   // re-parse count over `tests/cases` falls **8,811 -> 54**, and with it 30.5% of
   // this module's whole emit-time name-resolution traffic (28,719 -> 19,962 calls
@@ -1840,7 +2482,7 @@ function slotCanonKey(si: i32): string {
     const dix = sTyIx[si]
     if dix >= 0 {
       const dt = T.tys[dix]
-      if dt is TyObj { return repCanonKey(dix) }
+      if dt is TyObj { return repCanonId(dix) }
     }
   }
   // RUNG 2 — the NAME ladder, for a row the sidecar does not cover: a mint site that
@@ -1867,12 +2509,12 @@ function slotCanonKey(si: i32): string {
   }
   if di >= 0 {
     const t = T.tys[di]
-    if !(t is TyObj) { return "" }
-    return repCanonKey(di)
+    if !(t is TyObj) { return -1 }
+    return repCanonId(di)
   }
   // Neither rung: a synthetic `#anon` row the D0 recorder could not type, or an
-  // unresolvable spelling. "" is the legacy never-merged behaviour.
-  ""
+  // unresolvable spelling. -1 is the legacy never-merged behaviour ("" before step 3).
+  -1
 }
 
 // The arena type index to record for an anonymous object-literal shape row (phase
@@ -1887,27 +2529,31 @@ export function anonRowTyIx(objIx: i32): i32 {
   rix
 }
 
-// The canonical structural key of an arbitrary type-NAME spelling, resolved
+// The canonical structural IDENTITY of an arbitrary type-NAME spelling, resolved
 // through the checker's annotation grammar (`resolveAnnot`) into the ONE
-// `repCanonKey` vocabulary — the name-input twin of `slotCanonKey`, for slot
+// `repCanonId` vocabulary — the name-input twin of `slotCanonId`, for slot
 // layers whose intern keys are not struct-table indices (the map-VALUE table's
-// `mvValName` spellings, the variant table's `uVariants` names). "" when the
+// `mvValName` spellings, the variant table's `uVariants` names). -1 when the
 // spelling does not resolve (such a slot never participates in dedup — never
 // merged). Every caller feeds names that already passed annotation checking,
 // so a miss is the safe degenerate case, not an error path.
-export function repNameCanonKey(nm: string): string {
-  if nm == "" { return "" }
+//
+// The rep-column rewrite, step 4: the answer was a rendered key and is now the id.
+// The runaway cap below is unchanged and still needed — it guards `resolveAnnot`, not
+// the render, and that hazard is about minting arena types, not about building strings.
+export function repNameCanonId(nm: string): i32 {
+  if nm == "" { return -1 }
   // RUNAWAY CAP: a spelling this long is never a legit dedup key — feeding it to
   // `resolveAnnot` MINTS fresh arena types per probe (epoch bump → cache rebuild →
   // longer renders → longer spellings), the multiplicative cascade that grew a deep
   // same-fieldset composite's compat probes into a >1GB string allocation — a compiler
   // CRASH ("allocation size too large"; fuzz seed 459979688 d6 bm, the {a,f,z}
-  // quadruple-nest). "" is the documented safe degenerate: the slot just never
+  // quadruple-nest). -1 is the documented safe degenerate: the slot just never
   // participates in dedup (never merged) and the resolver falls through LOUDLY.
-  if nm.length > 4096 { return "" }
+  if nm.length > 4096 { return -1 }
   const di = declTyIxOfName(nm)
-  if di < 0 { return "" }
-  repCanonKey(di)
+  if di < 0 { return -1 }
+  repCanonId(di)
 }
 
 // The struct-table row whose sNames key is `nm`, or -1 — a local scan (the
@@ -2030,21 +2676,21 @@ function structFieldCodesEq(a: i32, b: i32): i32 {
 export function repStructSlotsTwin(a: i32, b: i32): i32 {
   if a == b { return 1 }
   if a < 0 || b < 0 { return 0 }
-  const ka = slotCanonKey(a)
-  if ka == "" { return 0 }
-  if ka != slotCanonKey(b) { return 0 }
+  const ka = slotCanonId(a)
+  if ka < 0 { return 0 }
+  if ka != slotCanonId(b) { return 0 }
   structFieldCodesEq(a, b)
 }
 
 // The canonical (smallest `sTwin`-equivalent) representative of struct slot `si` —
-// the smallest slot `j <= si` sharing `si`'s `slotCanonKey` under the
+// the smallest slot `j <= si` sharing `si`'s `slotCanonId` under the
 // `structFieldCodesEq` layout guard, or `si` itself when `si` is the first (or only)
 // of its structure / does not participate in dedup (`""` key). This is the SAME
 // equivalence `buildStructTwins` records in `sTwin[]`, computed on demand and
 // TIMING-INDEPENDENTLY: `repSigSlotTokOfKind` renders it into `$fnsig` struct tokens
 // during `collectCloSigs` (sig interning) — BEFORE `mAssignTypeIndices` has built
 // `sTwin[]` — and again at emit time, and the two must agree. Reads only
-// `slotCanonKey` (memoized per arena index) so a spelling-twin row keys the SAME sig
+// `slotCanonId` (memoized per arena index) so a spelling-twin row keys the SAME sig
 // digit as its representative, making structurally-identical shapes intern one
 // functype key. Memoized per `tyMutEpoch` (canon keys drop on any arena mutation;
 // `sNames` only APPENDS later slots, which never change an existing slot's rep, so
@@ -2066,12 +2712,12 @@ export function repStructSlotRep(si: i32): i32 {
   if si < repSlotRepMemo.length {
     if repSlotRepMemo[si] >= 0 { return repSlotRepMemo[si] }
   }
-  const key = slotCanonKey(si)
+  const key = slotCanonId(si)
   let rep = si
-  if key != "" {
+  if key >= 0 {
     let j = 0
     while j < si {
-      if slotCanonKey(j) == key && structFieldCodesEq(j, si) == 1 {
+      if slotCanonId(j) == key && structFieldCodesEq(j, si) == 1 {
         rep = j
         j = si // stop at the first (smallest) twin
       }
@@ -2093,19 +2739,19 @@ export function repStructSlotRep(si: i32): i32 {
 // `TyObj`, the key is empty (a shape that never participates in dedup), no row
 // matches, or two matched rows differ in emitted layout (a genuinely AMBIGUOUS
 // atom-vs-plain collision this resolver must NOT guess through — the caller
-// falls back to its name path). The scan mirrors `slotCanonKey`'s own cost
+// falls back to its name path). The scan mirrors `slotCanonId`'s own cost
 // discipline (declared rows read a memoized arena key; inline `{…}` spellings
 // resolve through the checker's memoized `resolveAnnot`).
 export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   if repTyIx < 0 { return -1 }
   const t = T.tys[repTyIx]
   if !(t is TyObj) { return -1 }
-  const key = repCanonKey(repTyIx)
-  if key == "" { return -1 }
+  const key = repCanonId(repTyIx)
+  if key < 0 { return -1 }
   let best = -1
   let si = 0
   while si < lim && si < sNames.length {
-    if slotCanonKey(si) == key {
+    if slotCanonId(si) == key {
       if best < 0 {
         best = si
       } else if structFieldCodesEq(best, si) == 0 {
@@ -2246,7 +2892,7 @@ function renderFaithful(nm: string): string {
 // there.
 export function repRowOfName(nm: string, lim: i32): i32 {
   if nm == "" { return -2 }
-  // The `repNameCanonKey` runaway cap (a render this long is never a legit key and
+  // The `repNameCanonId` runaway cap (a render this long is never a legit key and
   // MINTS fresh arena types per probe — the >1GB crash family): decline it.
   if nm.length > 4096 { return -2 }
   const di = declTyIxOfName(renderFaithful(nm))
@@ -2301,21 +2947,21 @@ export function repScanLim(): i32 {
 // Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
 // slot for slot `i`'s WasmGC heap type — the smallest earlier slot with the same
 // canonical key AND field-code layout, or `i` itself when `i` is the first of its
-// structure. Keys are computed ONCE up front (`repCanonKey` per slot), then matched
-// pairwise; a non-participating slot ("" key) is always its own representative.
+// structure. Keys are computed ONCE up front (`slotCanonId` per slot), then matched
+// pairwise; a non-participating slot (-1 key) is always its own representative.
 // Called from `mAssignTypeIndices` before `sHeapIdx` allocation.
 export function buildStructTwins() {
-  const keys: string[] = []
+  const keys: i32[] = []
   let i = 0
   while i < sNames.length {
-    keys.push(slotCanonKey(i))
+    keys.push(slotCanonId(i))
     i = i + 1
   }
   sTwin = []
   i = 0
   while i < sNames.length {
     let rep = i
-    if keys[i] != "" {
+    if keys[i] >= 0 {
       let j = 0
       while j < i {
         if keys[j] == keys[i] && structFieldCodesEq(j, i) == 1 {
@@ -2458,7 +3104,7 @@ function repOfTyFlat(ty: i32): RepDesc {
   repUncovered()
 }
 
-function repOfPrim(pn: string): RepDesc {
+function repOfPrim(pn: PrimName): RepDesc {
   // boolean shares the i32 rep; `void` follows the ladder's fallthrough ("i32")
   // — the void-ness of a RESULT is a separate axis (`fRetVoid`), not a valtype.
   if pn == "i32" || pn == "boolean" { return repMk("i32", 0, "") }
@@ -2754,8 +3400,8 @@ export function repReset() {
   repKeyMemo = []
   repKeyMemoEpoch = -1
   repSlotByDecl = []
-  repSlotKeySi = Map()
-  repSlotKeyN = Map()
+  repSlotKeySi = []
+  repSlotKeyN = []
   repSlotCacheEpoch = -1
   repSlotCacheUserVer = -1
   repSlotCacheLen = -1
@@ -3174,7 +3820,7 @@ function rtGo(ty: i32): i32 {
   rtLeafOf("unsup", 0, "leaf:unnarrowable", ty)
 }
 
-function rtOfPrim(pn: string, ty: i32): i32 {
+function rtOfPrim(pn: PrimName, ty: i32): i32 {
   // `boolean` keeps its OWN leaf even though its valtype is i32: the flat slot
   // layer's canonical key distinguishes `{f:boolean}` from `{f:i32}` (pinned by
   // structural-non-twin-distinct.vl — the shadow harness caught the merged
@@ -3188,7 +3834,7 @@ function rtOfPrim(pn: string, ty: i32): i32 {
   if pn == "string" { return rtLeafOf("str", 0, "", ty) }
   if pn == "void" { return rtLeafOf("i32", 0, "", ty) }
   // `null` (and any future prim) — no standalone rep policy.
-  rtLeafOf("unsup", 0, "prim:" + pn, ty)
+  rtLeafOf("unsup", 0, "prim:" + primNameStr(pn), ty)
 }
 
 function rtOfFunc(ty: i32, paramTys: i32[], retTy: i32): i32 {
@@ -3610,6 +4256,22 @@ let repShadowReasonNames: string[] = []
 let repShadowReasonCounts: i32[] = []
 let repShadowReasonIx: {[string]: i32} = Map()
 
+// The identity↔spelling equivalence tallies. Two directions, because a partition
+// agreement needs BOTH: no two distinct spellings may share an id (a false MERGE, the
+// dangerous direction — it would fuse two layouts), and no spelling may reach two ids (a
+// false SPLIT, which only declines a merge but still means the recursions disagree).
+let hcSeenStrId: {[string]: i32} = Map()
+// PER VOCABULARY, because the two key builders share ONE hash-cons table and an id
+// reached from both is CORRECT — `i32` is `i32` under either rendering, and the arms
+// where they genuinely differ (`HC_SLOT`, `HC_RLI32`, `HC_RLSTR`) carry their own tags.
+// Only same-vocabulary agreement is required, so only that is asserted.
+let hcSeenIdStrC: string[] = []
+let hcSeenIdStrE: string[] = []
+export let hcChecked = 0
+export let hcMergeBad = 0
+export let hcSplitBad = 0
+export let hcLenBad = 0
+
 // The sweep — called once per program from `emitProgram` AFTER the module
 // bytes are final (the arena is complete then; monomorphization and the
 // collect passes have minted every late type). Restarts its tallies each run,
@@ -3629,6 +4291,13 @@ export function repShadowSweep() {
   repShadowReasonNames = []
   repShadowReasonCounts = []
   repShadowReasonIx = Map()
+  hcSeenStrId = Map()
+  hcSeenIdStrC = []
+  hcSeenIdStrE = []
+  hcChecked = 0
+  hcMergeBad = 0
+  hcSplitBad = 0
+  hcLenBad = 0
   // `T.tys.length` is re-read each pass: a slot query inside the sweep can
   // itself memoize a new annotation spelling (`resolveAnnot`), growing the
   // arena — those late types are swept too, and the growth terminates because
@@ -3668,7 +4337,76 @@ function repShadowNote(tag: string, ty: i32, detail: string) {
   0
 }
 
+// THE IDENTITY EQUIVALENCE CHECK — one spelling, one id, one length.
+//
+// `which` distinguishes the two key vocabularies so a canon key and an elem key that
+// happen to render the same text are not asked to share an id (they need not: they are
+// different functions, and only same-vocabulary agreement is required).
+function hcCheckKey(which: string, key: string, id: i32) {
+  hcChecked = hcChecked + 1
+  // The "" sentinel below means "unset", and no key builder can answer "" — every arm
+  // emits at least one character. Stated because the sentinel would silently skip it.
+  if key == "" { return 0 }
+  if hcLenOf(id) != key.length {
+    hcLenBad = hcLenBad + 1
+    repShadowNoteRaw(
+      "hc-len " +
+        which +
+        " key=" +
+        key +
+        " len=" +
+        i32ToStr(key.length) +
+        " hcLen=" +
+        i32ToStr(hcLenOf(id)),
+    )
+  }
+  const tagged = which + "|" + key
+  const prev = hcSeenStrId[tagged] ?? -1
+  if prev < 0 {
+    hcSeenStrId[tagged] = id
+  } else if prev != id {
+    // One spelling, two ids — a false SPLIT.
+    hcSplitBad = hcSplitBad + 1
+    repShadowNoteRaw("hc-split " + which + " key=" + key)
+  }
+  if which == "canon" {
+    while hcSeenIdStrC.length <= id { hcSeenIdStrC.push("") }
+    if hcSeenIdStrC[id] == "" {
+      hcSeenIdStrC[id] = key
+    } else if hcSeenIdStrC[id] != key {
+      // Two spellings, one id — a false MERGE, the direction that fuses layouts.
+      hcMergeBad = hcMergeBad + 1
+      repShadowNoteRaw(
+        "hc-merge canon id=" +
+          i32ToStr(id) +
+          " a=" +
+          hcSeenIdStrC[id] +
+          " b=" +
+          key,
+      )
+    }
+    return 0
+  }
+  while hcSeenIdStrE.length <= id { hcSeenIdStrE.push("") }
+  if hcSeenIdStrE[id] == "" {
+    hcSeenIdStrE[id] = key
+  } else if hcSeenIdStrE[id] != key {
+    hcMergeBad = hcMergeBad + 1
+    repShadowNoteRaw(
+      "hc-merge elem id=" + i32ToStr(id) + " a=" + hcSeenIdStrE[id] + " b=" + key,
+    )
+  }
+  0
+}
+
+function repShadowNoteRaw(msg: string) {
+  if repShadowMsgs.length < 200 { repShadowMsgs.push(msg) }
+  0
+}
+
 function repShadowCheckTy(ty: i32) {
+  hcCheckKey("canon", repCanonKey(ty), repCanonId(ty))
+  hcCheckKey("elem", repElemKey(ty), repElemId(ty))
   const tix = repTreeOfTy(ty)
   repShadowTys = repShadowTys + 1
   const reason = repTreeUnsupReason(tix)
@@ -3746,6 +4484,11 @@ export function repShadowMsgAt(i: i32, j: i32) { repShadowMsgs[i][j] }
 export function repShadowStat(k: i32): i32 {
   if k == 0 { return repShadowTys }
   if k == 1 { return repShadowReal }
+  // The identity↔spelling equivalence tallies (the rep-column rewrite's proof).
+  if k == 2 { return hcChecked }
+  if k == 3 { return hcMergeBad }
+  if k == 4 { return hcSplitBad }
+  if k == 5 { return hcLenBad }
   0
 }
 

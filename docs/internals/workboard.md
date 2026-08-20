@@ -123,6 +123,632 @@ descriptor") and a stale anchor.
 
 ---
 
+## THE BRANCH, GATED AS A WHOLE AGAINST MASTER (2026-08-19)
+
+43 commits. The full battery run once from a clean tree, as the PR gate:
+
+| gate | result |
+|---|---|
+| working tree | clean |
+| native fixpoint | byte-exact, 1,251,334 |
+| self-lint + fmt | clean |
+| `deno task test` | **2,159 / 0** |
+| `cases_wasm` (shared instance) | **1,939 / 0** |
+| LSP bundle | rebuilt |
+| structural-identity harness | **0 merges / 0 splits / 0 length mismatches** |
+| **corpus A/B vs MASTER, 2,010 files** | **2 rows moved** |
+
+**REVISED — THE REP FUZZER CAUGHT ONE OF THEM, AND IT WAS MINE.** The gate above was run before
+`scripts/rep-fuzz-check.sh`, which is the harness this project built for exactly this class. It
+failed:
+
+```
+✗ NEW / WORSE   + MISMATCH  p2r ((i32) => {f: boolean}[] | {w: i32}) | f64
+✗ STALE         - REJECT    p2r ((i32) => {f: boolean}[] | {w: i32}) | f64
+```
+
+**REJECT → MISMATCH is the "silently worsen" transition the harness exists to refuse**, and MISMATCH
+is never baselineable. The shape compiles on my branch and gives the WRONG ANSWER: in
+`if t1 is {f: boolean}[]` the narrowing takes the else branch and prints `OTHER` where `false` is
+correct.
+
+The cause is the interner's element-dedup enabling — unifying the refinement's two vocabularies
+through `shapeFieldElemName` so five dead codes could match. It makes previously-un-repped
+compositions resolve, and for this shape the resolution is unsound.
+
+**NOTHING ELSE SAW IT.** 2,010 corpus files byte-identical, 2,159 suite cases green, 1,939 wasm cases
+green, native fixpoint byte-exact, the structural-identity harness 0/0/0. The rep fuzzer alone.
+
+**Reverted** — the element comparison stays on the raw field text, the merge-alias with it. The
+`@emit-error` fixture it had retired goes back to `@emit-error`, and the fuzz shape is pinned as
+`closures/error-narrow-reflist-arm-of-closure-result-union.vl` so the next attempt at that merge
+fails in the corpus first.
+
+**What the constant-false actually is, then.** Not an oversight to be tidied away: it is the thing
+standing between a name-keyed row table and an unsound merge. The measurement that found it (5 codes,
+1,365 comparisons, 0 matches) stands; the conclusion that it was safe to fix does not.
+
+**FINAL STATE OF THE BRANCH AGAINST MASTER, both channels, every row accounted for:**
+
+| channel | rows moved | what they are |
+|---|---|---|
+| emitted-wasm sha256 + exit code | **1 of 2,010** | `statements/bare-return-void-early-exit.vl` — master has no lowering for a bare `return` in a void function; the void ruling's terminator half |
+| diagnostic text | **5 of 2,010** | three are FIXTURES THIS BRANCH ADDS (the two container-element storage-class pins and the bare-return one); the other two are **reject-tier MOVES** |
+
+The two moved rejects are the C8 container-element rule doing its job. Master refuses them late and
+vaguely — `emitProgram: value-union closure RESULT is not yet representable` — while the branch
+refuses them at CHECK time with a source-located message naming the actual cause:
+
+> *a value of type `string[]` flowing into `(f32 | string)[]` … changes how the ELEMENT is stored:
+> type-valid (the element type widens) but not yet supported by codegen … Build the container at
+> `(f32 | string)[]`, or declare the source as `(f32 | string)[]`*
+
+Same verdict, earlier and legible. **Every other row of 2,010 is byte-identical to master on both
+channels**, across a branch that rewrote the rep key layer end to end, added a hash-consed structural
+identity, enumerated a struct row's identity, re-ordered the shape-descent grammar three times, and
+moved the arena hand-over from 37.3% to 98.7%.
+
+Gates: suite **2,160/0**, `cases_wasm` **1,940/0**, native fixpoint byte-exact at 1,251,256,
+self-lint + fmt clean, structural-identity harness **0/0/0**, `rep-fuzz-check` **exact ✅**.
+
+## THE CALLER HAND-OVER DOES NOT GENERALISE — measured on the next two sites (2026-08-19)
+
+`structIndexOfLet` took the arena rung at 15 disagreements in 8,201 corpus cells (0.18%), 0 on the
+self-compile, and a clean rep-fuzz run. The obvious next move is the other node-holding callers from
+the census — `emit_classify:11391` (`structIndexOfType`'s TypeRef arm, 9,474 self-compile calls) and
+`:18066` (a Param's declared type, 13,724). Both hold a node. Both were dual-run before conversion:
+
+| site | corpus: arena answers | agree | **disagree** | rate |
+|---|---|---|---|---|
+| `structIndexOfLet` (SHIPPED) | 8,201 | 8,186 | **15** | **0.18%** |
+| `:18066` Param type | 15,922 | 15,881 | **41** | 0.26% |
+| `:11391` TypeRef arm | 528 | 469 | **59** | **11.2%** |
+
+**`:11391` IS NOT SHIPPED.** It disagrees on more than one call in nine — two orders of magnitude
+worse than the site that worked — and it sits directly below an arena rung that already ran and
+declined (`repSlotOfTy(nodeRepTyIxOf(tyIx))`, the REP sidecar, where mine would read the DECLARED
+one). Two different sidecars answering two different questions is not a rung, it is a coin flip with
+a byte channel that cannot see it.
+
+**`:18066` IS SHIPPED, because its 41 disagreements were one NAMED class.** I nearly filed it with
+`:11391` on the rate alone; dumping the witnesses instead shows all 41 are
+`nm={f:K0|null} arena=7({f:K0|null}) name=1` — a DUPLICATE row carrying the same spelling — and
+`repStructSlotsTwin(7, 1)` answers **1** on every one. Twins share a heap type and a field-code
+layout, so either row emits the same module, and the project's own predicate says so rather than my
+reading of it. On the compiler's own source the arena answers 294 times with **0** disagreements.
+
+Gated on **`rep-fuzz-check` exact ✅** as well as corpus A/B 0 of 2,010, suite 2,160/0, `cases_wasm`
+1,940/0, fixpoint byte-exact at 1,251,256.
+
+**Which sharpens the lesson rather than softening it: a disagreement RATE is not the decision, the
+CLASS is.** 0.26% and 11.2% would have sorted the same way as 0.18%, and both times the answer came
+from asking what the disagreeing cells WERE — twins at one site, two different sidecars at the
+other. Ranking by the rate would have shipped neither or both.
+
+**A FOURTH CALLER, AND THIS ONE IS EXACT.** `emit_classify:7383` resolves a union ARM's struct row
+by spelling. The arms there are CUT from a union set name, so no node holds one — but
+`unionMemberTysOf` appends the row's member types in exactly `splitUnionAtoms` order, the same
+pairing `internShapeArms` uses, so the arm can be asked for by TYPE through the D-UNION seam.
+Dual-run: the arena answers **63 of 76** corpus reaches with **63 agree / 0 disagree** and no
+arena-only answers. **That is the 0-disagreement standard the rest of the programme ships on** — no
+twin tolerance needed, because the seam pairs arm to member rather than resolving a spelling twice.
+Gated on `rep-fuzz-check` **exact ✅**, corpus A/B 0 of 2,010, suite 2,160/0, `cases_wasm` 1,940/0,
+fixpoint byte-exact at 1,251,362.
+
+**So the caller hand-over is three sites in and the pattern is legible**: a caller converts when its
+question IS "what type does this denote" — an annotation's node (`structIndexOfLet`, the Param type)
+or a union member the arena already pairs (`:7383`). It does not convert when the question is
+something narrower that the declared type cannot answer (`:11391`'s rep sidecar). That is a rule you
+can apply to the next site without re-deriving it.
+
+**FOURTH SITE, and the rule picked it out without a new derivation.** `letIsStruct` asks "does this
+annotation denote a struct" — the rule's shape exactly — and `typecheck.nodeTyIsStruct` is the
+checker-side twin already written for it, whose own header says it *"under-approximates … so callers
+keep the name test as the fallback"*. This is a caller taking it up on that.
+
+Dual-run over the corpus: the two agree on **1,871 of 6,437** reaches, the arena answers true where
+`isSName` does not on **24**, and `isSName` answers true where the arena does not on **0** — a strict
+superset. The 24 are spellings `isSName` structurally cannot claim: a generic APPLICATION
+(`Box<Box<i32>|i32>`), a canonicalized INTERSECTION (`Node&{v:i32}`), an inline SHAPE
+(`{a:{k:i32},b:{k:i32}}`, `{f:(boolean|null)[]|null}`), a field holding an application
+(`{v:Pair<i32,string>}`). Every one is a struct, so the arena is right and the NAME under-reports.
+
+Corpus A/B **0 of 2,010** — the fall-through (`exprStruct` on the initializer) was already answering
+those 24 — so this is the same answer reached from the type instead of from a spelling plus an
+initializer walk. `rep-fuzz-check` **exact ✅**, suite 2,160/0, `cases_wasm` 1,940/0, fixpoint
+byte-exact at 1,251,384.
+
+**So the conversion that worked was SPECIAL, and saying so is the result.** `structIndexOfLet` asks
+"what struct does this binding's annotation name", where the annotation IS the node whose type the
+checker recorded — the two derivations are the same question by construction, and the 15 residual
+cells are structural twins. The other callers ask narrower questions (a rep slot, a param's variant
+eligibility) that the declared type does not answer. **One caller converting cleanly is not evidence
+that callers convert cleanly**, and after the rep-fuzzer caught the interner merge on this same
+branch, a 11.2% disagreement rate is nowhere near shippable on byte-identity alone.
+
+## THE CALLER CENSUS IS CLOSED — every site judged by the rule, with its number (2026-08-19)
+
+The rule the conversions produced — *a caller converts when its question IS "what type does this
+denote"* — has now been applied to every site the `structIndexByName` / `isSName` census turned up.
+Six sites, four converted, one refused, one measured away:
+
+| site | traffic | verdict | evidence |
+|---|---|---|---|
+| `structIndexOfLet` | 168,665 (65%) | **converted** | 15 of 8,201 disagree, all structural twins (`repStructSlotsTwin` = 1) |
+| Param declared type `:18066` | 13,724 (5%) | **converted** | 41 of 15,922 disagree, all ONE class, all twins |
+| union ARM `:7383` | 14,795 (6%) | **converted** | 63 of 76 answered, **0 disagree** — the seam pairs arm to member |
+| `letIsStruct` | — | **converted** | strict superset: 24 arena-only, **0 name-only** |
+| `:11391` rep sidecar | 9,474 (4%) | **REFUSED** | 59 of 528 disagree (11.2%); it sits below an arena rung that already declined, reading a DIFFERENT sidecar |
+| param reject ladder `emit_sections:574` | — | **NO CONVERSION NEEDED** | **0** — see below |
+
+**The last row is the one worth having.** `emit_sections:574` is a REJECT ladder, and converting a
+reject ladder to accept more is the riskiest change shape in this codebase — it is exactly where the
+rep fuzzer caught me earlier this session. So it was measured before being touched: **of every param
+the ladder REJECTS, zero have an arena type `nodeTyIsStruct` claims.** The name ladder is already
+complete for that site. No rung, no risk, and the reason is a number rather than caution.
+
+(The first attempt at that measurement counted 292 and was WRONG — the counter sat before the
+`!isSName` test, so it tallied every arena-true param including the ones the name already accepts,
+with `#anon0`…`#anon5` as its witnesses. Moved to the reject point it reads 0. A probe in the wrong
+place answers a question you did not ask.)
+
+**So the caller half of the hand-over is DONE as far as the census reaches**: four sites moved to the
+arena, one refused with its number, one shown unnecessary with its number. What remains name-keyed —
+`sNames` as the row's stored spelling — is not a caller problem; it is the row layer, and its
+identity is already structural.
+
+## WHY `sNames` PERSISTS — it is not a lookup key, it is the DECLARED-ROW filter (2026-08-19)
+
+The one thing left name-shaped after the caller census is `sNames[si]`, the row's stored spelling.
+Its last structural reader is `repSlotCacheSync`, which opens `cUserTypes[sNames[si]] ?? -1` — a
+name→type resolution at the row layer, and the obvious next thing to remove.
+
+**The sidecar strictly dominates it.** Measured over the corpus before touching anything: of 2,185
+rows, `sTyIx[si]` and `cUserTypes[sNames[si]]` agree on **602**, **0 differ**, **0** resolve by NAME
+where the sidecar is empty, and the sidecar covers **1,446 more** rows the name cannot resolve at all
+(inline shapes, `#anon` literal rows). On those numbers the swap looks free.
+
+**It is not. It breaks 8 of 2,010 files, one of them into a hard failure.** And the reason is the
+whole point: those 1,446 extra rows are exactly the ones `cUserTypes[sNames[si]]` was EXCLUDING.
+The line reads as "resolve this row's name to its type"; what it actually computes is **"is this row
+a DECLARED type"** — and the slot cache it feeds (`repSlotByDecl`, the twin tables) is built on that
+distinction. Widen it to every typed row and inline shapes start merging with declared structs
+through the twin layer.
+
+**So `sNames` is not a lookup key that survived by inertia.** It is the row's declared-ness marker,
+and there is no structural test standing in for it: "declared" is a fact about where the row's
+spelling CAME FROM, not about its type.
+
+**I then said the fix was "an explicit declared-ness column, cheap to make". I built it, and it is
+not.** Two attempts, both measured against `cUserTypes[sNames[si]] >= 0` over 2,185 corpus rows:
+
+| attempt | agree | name-only | column-only |
+|---|---|---|---|
+| label each of the 5 mint sites by WHAT IT INTERNS | 597 | **5** | **3** |
+| bank the NAME's own `cUserTypes` answer AT THE MINT | 597 | **5** | **3** |
+
+**I READ "IDENTICAL DISAGREEMENT" AS A FINDING AND PUBLISHED AN EXPLANATION. IT IS WRONG, AND THE
+DIRECT PROBE REFUTES IT.** The story was: if labelling by provenance and banking the name's own
+answer are wrong in the same 8 cells, the answer must CHANGE after the mint — `cUserTypes` being
+add-only during emit, which is why `repSlotCacheSync` carries `cUserTypesVer`. Plausible, and
+inferred from two counts matching rather than from watching the value.
+
+Watched directly — printing `cUserTypes[nm]` at the mint and again at the cache rebuild:
+
+```
+MINT  nm=AB   has=31        CACHE row=0 nm=AB      has=31
+                            CACHE row=0 nm={g:f64} has=-1
+                            CACHE row=3 nm=PairA   has=31
+```
+
+**`AB` is 31 at both points. The answer does not move.** `{g:f64}` reads -1 at the cache (not
+declared) where my column said declared; `PairA` reads 31 (declared) where my column said not. Both
+are my COLUMN being wrong about rows whose membership is perfectly stable — an alignment or
+placement error in the experiment, not a property of the design.
+
+**So the retraction was: I refuted my own implementation, not the idea. THEN I FIXED THE
+IMPLEMENTATION, AND THE IDEA WORKS.** The bug was a missing per-program reset — `sRowDecl` kept
+growing across programs while `sNames` was emptied, so every row after the first program read a
+stale neighbour's flag. Exactly the hazard `structNameIxReset` and `structTyIxReset` already carry,
+and I had not carried it here.
+
+With `sRowDecl = []` beside `sNames = []` in `collectS`, and the column banking the NAME's own
+`cUserTypes` answer at the mint: **602 agree / 0 disagree** over 2,185 corpus rows. The 8 cells are
+explained and gone.
+
+**SHIPPED — the row layer's last name→type resolution is retired.** `repSlotCacheSync` opened
+`cUserTypes[sNames[si]] ?? -1`, one line deciding two things: IS this row declared, and WHICH arena
+type is it. Both are banked now — declared-ness by `sRowDecl` (asked once, at the mint), the type by
+the `sTyIx` sidecar. Corpus A/B **0 of 2,010** on all three channels; suite 2,160/0; `cases_wasm`
+1,940/0; fixpoint byte-exact at 1,251,856; **`rep-fuzz-check` exact ✅**. Removing the reset fails
+the shared-instance harness, so it is load-bearing and measured.
+
+The pattern this session keeps producing: **two numbers agreeing is not a mechanism** — and the
+corollary, learned one commit later: **a failed experiment is not a refuted design.** I published
+both errors and then the fix.
+
+Reverted (both attempts); 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
+
+Reverted; 0 of 2,010 back to the shipped tip, fixpoint byte-exact at 1,251,384.
+
+**That closes the destringify question I could answer by measurement.** The type spelling is gone
+from the arena, the checker, the rep keys and four of the five hot callers; where it remains, it
+remains because it carries a fact the type does not — provenance, not structure.
+
+## WHAT `sNames` IS STILL FOR — the census, classified (2026-08-19)
+
+With the row layer's name→type resolution retired, `sNames[si]` has 18 live readers left. Classified
+rather than counted:
+
+| class | count | what it does |
+|---|---|---|
+| **supplies a name-keyed table ABOVE the struct table** | **5** | `rlInternName(sNames[rsi], 1)`, `rlSlotByName(sNames[si])` ×2, `uFieldElemName[ufn] = sNames[si15]`, `mvRlSlot.push(rlInternName(sNames[vsi], 1))` |
+| returns the row's canonical spelling to a name-consumer | 7 | `structNameOf`-style accessors, the code-15 field's `ftxt = sNames[iidx]` |
+| a name LOOKUP or scan | 3 | `repStructRowByName`, the name-index sync, `structIndexOfName`'s scan |
+| a syntactic predicate on the spelling | 1 | `nameIsStructDecl(sNames[si])` |
+| `slotCanonId` rung 2 | 1 | the uncovered-row fallback |
+| the declared-ness recorder | 1 | banks `cUserTypes.has(nm)` at the mint |
+
+**The first class is the answer, and it is a LAYER, not a leftover.** `sNames` persists because the
+tables ABOVE the struct table — the ref-list element table (`rlElemName`), the union field-element
+column (`uFieldElemName`), the map-value table (`mvValName`) — are keyed by SPELLING, and the struct
+row is their supplier. Their KEYS were destringified this session (`rlElemKey` is a hash-consed id
+now, `mvValCanonId` likewise), but their IDENTITY column is still a name: a ref-list element is
+*named*, not *typed*.
+
+**So the next programme is nameable and it is not this one.** Destringifying `sNames` means
+destringifying `rlElemName` / `uFieldElemName` / `mvValName` first — the same shape of work, one
+layer up, with the same tools (an arena sidecar per row, a dual-run per conversion, the rep fuzzer as
+the gate). Until then the struct row must be able to hand a spelling to its consumers, which is
+exactly what `sNames` is.
+
+**AND THE FIRST SITE OF THAT PROGRAMME IS DONE, as a demonstration that the layer converts the same
+way.** Two of the five supplier sites handed a struct row's SPELLING to the ref-list element table.
+The row already carries its type in `sTyIx`, and `rlSlotOfTy` is that table's arena-input twin
+(itself converted to `repElemId` earlier this session) — so the spelling need not be produced at all.
+Dual-run: the arena answers **20 of 20** corpus reaches, agrees on **20**, disagrees on **0**, and
+there is no reach the NAME answers and it does not. Exact, on the 0-disagreement standard rather than
+a twin tolerance. Corpus A/B **0 of 2,010**; suite 2,160/0; `cases_wasm` 1,940/0; fixpoint byte-exact
+at 1,252,008; `rep-fuzz-check` **exact ✅**.
+
+**Three supplier sites remain** — `rlInternName(sNames[rsi], 1)`, `mvRlSlot.push(rlInternName(sNames[vsi], 1))`
+and `uFieldElemName[ufn] = sNames[si15]`. All three feed an INTERN rather than a lookup, which is the
+harder direction: an intern MINTS a row keyed by the name it is given, so converting it means giving
+those tables an arena-keyed mint, not just an arena-keyed find. That is the real content of the next
+programme, and it is now the only thing between `sNames` and deletion.
+
+**And the other 13 readers are not obstacles**: seven hand the canonical spelling back to a caller
+that asked by name, three ARE the name lookup, one is a syntactic test, one is a documented
+fallback, one is the mint recorder. None re-derives a type from a string.
+
+## THE NEXT PROGRAMME, SIZED — the three identity columns one layer up (2026-08-19)
+
+`sNames` cannot go until the tables it supplies stop being name-keyed. Those tables are three
+identity columns, and here is the census that sizes the work rather than asserting it:
+
+| column | readers | of which RE-PARSE the spelling |
+|---|---|---|
+| `rlElemName` — the ref-list element table | **32** | **9** (`nonNulBaseOf` ×5, `nullablePartOf`, `rlSlotOfArrName`, `mvSlotOfMapName`, a `nameIs*` test) |
+| `mvValName` — the map-value table | **15** | **2** |
+| `uFieldElemName` — the union field-element column | **16** | **0** |
+| **total** | **63** | **11** |
+
+**It is the same two halves as this programme, one layer up.** 52 readers treat the spelling as an
+IDENTITY (return it, compare it, hand it on) — the "stop representing types as strings" half. 11
+re-PARSE it — `nonNulBaseOf`, `nullablePartOf`, `rlSlotOfArrName`, `mvSlotOfMapName` — the "stop
+parsing strings to represent types" half, and the smaller of the two, exactly as it was here.
+
+**AND THE PARSE HALF IS FURTHER ALONG THAN THE COUNT SUGGESTS — those 11 are mostly FALL-THROUGHS
+behind arena rungs that already exist** (the D5-final work). Measured, so the next person does not
+re-derive it:
+
+| site | calls | fell through to the NAME |
+|---|---|---|
+| `rlElemIsNulNiche` | 386 | **11 (2.8%)** |
+| `rlElemCloSigKey` | 1,047 | **27 (2.6%)** |
+| `rlElemLitStructRow` | 342 | **116 (33.9%)** |
+| `rlElemStructRow` | 1,036 | **444 (42.9%)** |
+
+Two of the four are effectively done at 97%+. The other two share one rung — `rlElemStructIdxAt`,
+the struct-row-by-element-type lookup — and it answers on 57% and 66%.
+
+**I SAID ITS CEILING WAS `rlElemTyIx` COVERAGE. IT IS NOT, AND BOTH PROBES SAY SO.**
+
+*Probe 1 — can the TY column take the hint the KEY cannot?* Of **3,146** ref-list element mints,
+only **45** have an empty name leg, **396** are hinted, and the hint would fill **0** of the empty
+ones (with 392 same / 4 different). **The hint and the gap do not overlap at all** — so the TY column
+is not the ceiling, and the separable-columns idea is closed with a number.
+
+*Probe 2 — then what IS the fall-through?* `rlElemStructIdxAt` is
+`structIndexOfTy(peelNul(rlElemTyIxAt(slot)))`, and `structIndexOfTy` matches on the RAW ARENA
+INDEX. The element's recorded type is routinely a DIFFERENT index from the struct row's, even when
+structurally identical — the same non-canonical-index fact that broke an earlier comparator this
+session. Replacing the match with a `repCanonId` one, over the 444 fall-throughs:
+
+| | |
+|---|---|
+| canon-id answers | **250 of 444 (56%)** |
+| agrees with the name answer | **210** |
+| **disagrees** | **2** |
+| answers where the NAME finds nothing | **38** |
+
+**NOT TAKEN, and the site's own header says why**: *"this row is a store/push struct index, where a
+leniently-matched row is a wrong heap type — the same asymmetry method note 27 draws around layout
+twins, in reverse."* Two disagreements at a store/push index is the shape that produced tonight's
+one unsound ship, which only `rep-fuzz-check` caught. It needs the twin gate
+(`repStructSlotsTwin` / `structFieldCodesEq`) before it can be considered, not a byte A/B.
+
+**AND THAT SLICE IS ALREADY IN THE TREE.** Before building it I traced what `rlElemStructRow`
+actually does after the name declines — and its THIRD rung is
+`repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())`, which is a canon-key scan **with the
+`structFieldCodesEq` twin gate already on it**. Exactly the thing I had just specified.
+
+Instrumented over the corpus, the ladder's three rungs:
+
+| rung | reached | answered |
+|---|---|---|
+| 1 · `rlElemStructIdxAt` (arena, exact index) | 1,036 | 592 |
+| 2 · `structIndexByName` (the NAME) | 444 | **276** |
+| 3 · `repRowOfTyStruct` (canon key + twin gate) | 168 | **38** |
+
+**38 is exactly the CANON-ONLY count from the probe above**, and that is the proof rather than a
+coincidence: my 250 decomposes as 210 the NAME also answers (rung 2 reaches them first, same answer,
+no gain) + 2 disagreements (which rung 3's twin gate exists to filter) + **38 already answered by
+rung 3**. There is no gain available. The ladder is complete, and the "next slice" was a
+re-derivation of work already shipped.
+
+**Third time in this sequence that measuring a proposed slice showed it was already done or not
+needed** — the param reject ladder (0 cases), the TY-column hint (0 overlap), and now this. The
+lesson is not that the measurements were wasted: each one converted "there is remaining work here"
+into a number, and the number was zero. **A programme is finished when its next slice measures to
+nothing, not when someone declares it finished** — and that is now true of the ref-list element
+layer's struct-row lookup.
+
+**The blocking capability is an arena-keyed MINT.** Three sites feed `rlInternName` / the
+`uFieldElemName` write with a struct row's spelling; an intern MINTS a row keyed by the name it is
+handed, so it cannot take a type unless the table's identity column stops being a name.
+
+**AND THE CHEAP WAY ROUND IT IS REFUTED, MEASURED.** `rlInternNameTy(name, kind, ty)` already exists
+— the hand-over form, whose header states the rule an interner hint must satisfy: *a hint that
+disagrees re-keys the row, which is the same silent-wrong-slot failure by another route.* So the
+obvious slice is to hand `sTyIx[rsi]` at those sites and skip the name resolution, with no new
+capability needed. Checked before building it: over the corpus the hint is available on **199 of 203**
+reaches and computes the SAME key on **157** — **42 differ**. Witnesses `#anon0`, `CView`, `DView`.
+
+**42 of 199 is a refutation, not a residue.** A struct row's recorded type is not the ref-list
+element key's type at these sites: the interner keys the ELEMENT, and the row's `sTyIx` is the
+STRUCT. So the three supplier sites cannot be converted by hinting, and the identity column really
+does have to move first — which is what makes the next programme a rewrite rather than a sweep.
+`rlElemTyIx` already exists beside `rlElemName`, so the sidecar is in place and only the KEY has to
+move — precisely the shape the rep-column rewrite took here (identity first, consumers after, each
+with a dual-run).
+
+**Tools that carry over, all built and proven this session**: the hash-consed structural identity
+(`repCanonId` / `repElemId`) with its `hcLen` shape check; the `repShadowSweep` harness slot for an
+equivalence assertion; the per-table incremental index with an explicit per-program reset (three of
+them now, each with a sabotage proving the reset load-bearing); and `scripts/rep-fuzz-check.sh` as
+the gate that corpus byte-identity cannot replace.
+
+## THE LAYER ABOVE THE STRUCT TABLE, MEASURED COLUMN BY COLUMN — two done, one gap (2026-08-19)
+
+The three identity columns were sized at 63 readers. Sizing by readers turned out to say very little;
+measuring each column's ARENA SIDECAR coverage says everything:
+
+| column | arena sidecar | coverage |
+|---|---|---|
+| `rlElemName` — ref-list element | `rlElemTyIx` | **3,101 of 3,146 rows** carry a type (98.6%); its struct-row LADDER is complete — rung 3 already answers the 38 cells rungs 1–2 cannot |
+| `mvValName` — map value | `mvValTyIx` | **5,096 of 5,096 calls covered — 100.0%** |
+| `uFieldElemName` — union field element | `uFieldElemTyIx` | **1,589 of 2,719 calls covered — 58.4%** |
+
+**Two of the three are done.** The map-value column's sidecar answers every call; its name is a
+stored spelling handed to consumers, not a resolution path. The ref-list column's ladder measures to
+no available gain (38 = 38, previous entry).
+
+**AND THE 58.4% IS NOT A GAP EITHER — I asked what the declines ARE.** `recordUFieldElemRow` banks
+`fieldElemTyIxOfName(nm)` at the union field table's mint. Instrumented there: of **790** rows
+minted, **667 (84.4%)** record -1, and **all 667 of them are because the element name is EMPTY**.
+
+A field with no element has no element TYPE. The uncovered rows are scalar fields — `{f: i32}`,
+`{f: boolean}` — which record `""` for the element name by design and can therefore record nothing
+for its type. There is no spelling being resolved and failing; there is nothing to resolve.
+
+**So all three identity columns in this layer are done:**
+
+| column | verdict |
+|---|---|
+| `rlElemName` | ladder complete — rung 3 already answers the 38 cells rungs 1–2 cannot (38 = 38) |
+| `mvValName` | sidecar 5,096 of 5,096 — **100.0%** |
+| `uFieldElemName` | the 41.6% shortfall is entirely fields with NO ELEMENT |
+
+**FOURTH consecutive "next slice" to measure to zero** — the param reject ladder (0 cases), the
+TY-column hint (0 overlap), the canon-id rung (already rung 3), and now this. That is not a run of
+luck; it is what the end of a programme looks like when every remaining item is checked before it is
+believed. The three columns were sized at 63 readers and every one of those readers is either
+already arena-first, a fall-back that measures to nothing, or a consumer that legitimately wants a
+spelling.
+
+## THE LAST READER THAT PARSED A ROW'S SPELLING (2026-08-19)
+
+The `sNames` census left exactly one reader that treated the stored spelling as a SPELLING rather
+than as an identity: `nameIsStructDecl(sNames[si])`, the gate on `structIdxOfElemName`'s
+anonymous-shape-armed-union reject. Everything else returns it, compares it, or hands it to a
+name-keyed consumer.
+
+`nameIsStructDecl` is an **O(nodes) DECLARATION SCAN of the AST**, run **1,029 times** over the
+corpus. `sRowDecl` — the column added earlier tonight — banks the same fact at the mint. Dual-run
+before the swap: **1,029 reaches, 1,029 agree, 0 disagree.**
+
+**Shipped.** Corpus A/B 0 of 2,010 on all three channels; suite 2,160/0; `cases_wasm` 1,940/0;
+fixpoint byte-exact at 1,252,035; `rep-fuzz-check` **exact ✅**.
+
+**So no reader anywhere now parses a struct row's stored name, and none derives a type from it.**
+What `sNames` holds is what a consumer asking by NAME gets back, and nothing else reads it as a type
+or takes it apart. The two properties the programme set out to establish — *stop representing types
+as strings, stop parsing strings to represent types* — hold of the struct row layer completely:
+
+| property | state |
+|---|---|
+| a type's structure or kind stored as a string | **none** — the arena is `PrimName` / `LitKind` / `i32` |
+| the checker resolving a type from a spelling | **2 parses corpus-wide**, 17,459 tree walks |
+| a rep key built as a string | **0 characters** on a real compile |
+| a struct row's identity | an enumerated structural id, complete at 2,360/0 |
+| a struct row's declared-ness | a column banked at the mint, exact at 602/0 and 1,029/0 |
+| a reader that PARSES a row's spelling | **none** |
+| a reader that derives a TYPE from a row's spelling | **none** |
+
+## THE PROGRAMME'S HEADLINE NUMBER, MEASURED GLOBALLY (2026-08-19)
+
+Every layer has been measured on its own terms. This is the one number that answers the question the
+band is named for — **how often does the compiler resolve a type from a SPELLING?** — counted at
+`annotResolve` (the one funnel every resolution passes through) and at `nameToTy` (the string type
+parser itself), across the whole compiler:
+
+| | TREE walks | **NAME parses** | `nameToTy` entries | of which COMPOSITE |
+|---|---|---|---|---|
+| **the compiler compiling itself** | 9,811 | **6** | **10** | **2** |
+| the corpus (2,010 files) | 18,386 | 1,855 | 11,942 | 5,446 |
+
+**Six.** On its own source — 27 modules, a 1.2 MB module, the largest real program available — the
+whole compiler resolves a type from a spelling **six times**, and enters the string type-parser
+**ten** times, **two** of them on a composite name. Everything else walks the parser's spelling TREE,
+which is structure, not text.
+
+The corpus figure is higher and that is expected rather than a caveat — but "expected" is a claim, so
+here is the classification of all **1,848** of them:
+
+| what the name IS | count | share |
+|---|---|---|
+| an inline SHAPE `{…}` | **821** | 44.4% |
+| a UNION `A \| B` | 309 | 16.7% |
+| a FUNCTYPE `(…) => …` | 270 | 14.6% |
+| an ARRAY `X[]` | 256 | 13.9% |
+| a BARE identifier (`S`, `P`, `Node`) | 144 | 7.8% |
+| other (`#anon0`, synthetics) | 48 | 2.6% |
+
+**89.6% are COMPOSITE spellings — inline shapes, unions, functypes, arrays — and for those the
+spelling is not a re-derivation, it is the FIRST derivation.** The source wrote the type inline;
+there is no declaration behind it to resolve through and no earlier answer to hand over. Resolving
+`{a:f32,f:(()=>i32)[]|null,z:{[i32]:K0}}` once is what typing it MEANS.
+
+The 144 bare identifiers take the bare-name RUNG (`tsLeafTy`, shipped early in this programme and
+arena-neutral by construction — the counter here sits above it), and the 48 synthetics are `#anon`
+literal-shape names the emitter minted itself.
+
+**So "1,855 parses over the corpus" is not parsing that destringification left behind. It is the
+irreducible cost of a test corpus written almost entirely in inline annotations** — and the number
+that measures the programme is the self-compile's **6**, on a body of real code where types are
+declared and therefore have somewhere to be resolved FROM.
+
+**AND THAT IS THE FLOOR, PROVEN RATHER THAN ARGUED.** Counting each resolution as FIRST or REPEAT for
+its spelling:
+
+| | resolutions | first time for that spelling | **repeat** |
+|---|---|---|---|
+| the compiler compiling itself | 6 | 6 | **0** |
+| the corpus (2,010 files) | 1,855 | **1,854 (99.9%)** | **1** |
+
+**One repeat in 2,010 files.** Every remaining name resolution is the first and only time that
+spelling is resolved. A distinct inline annotation cannot be typed in fewer than one resolution, so
+this is not "how much parsing is left" — it is the count of distinct annotations that have no
+declaration to be resolved through, which is a property of the SOURCE, not of the compiler.
+
+**The programme is at its floor on both bodies of code.** Six on the self-compile, one-per-spelling
+on the corpus. There is no re-derivation left to remove.
+
+**Where this leaves band 1.** Every table the programme set out to convert has been measured, and
+each is either converted or measured to zero available gain:
+
+| layer | state |
+|---|---|
+| the type ARENA | string-free for structure and kind |
+| the CHECKER's resolution | **6** name parses on the self-compile |
+| the emitter's arena HAND-OVER | 98.7%, all 10 residual leaves attributed |
+| the REP tables | **0 characters** of type spelling built on a real compile |
+| the interner's row IDENTITY | an enumerated structural id, complete at 2,360/0 |
+| the interner's row LOOKUP | indexed, aliased, and no reader parses or types the spelling |
+| `rlElemName` / `mvValName` / `uFieldElemName` | ladder complete · 100.0% · declines are fields with no element |
+
+## BAND 1 IS THE DESTRINGIFY PROGRAMME IN FULL — not a stage of one (2026-08-19)
+
+Stated plainly because the record now contains a long chain of per-layer completions and it would be
+easy to read them as stages of something larger. The bands are defined at the top of this file, by
+the owner:
+
+> 1. **Destringify types** — stop representing types as raw strings; stop parsing or building strings
+>    to represent them. Efficient, type-safe data structures instead.
+> 2. **Webcraft asks** — the consumer-driven requirements.
+> 3. **Everything else.**
+
+**Bands 2 and 3 are different work, not further destringify work.** There is no band 1a/1b. So "band
+1 is at its floor" is the completion statement for the whole programme, and the two clauses of its
+definition are each measured rather than asserted:
+
+**"stop representing types as raw strings"** —
+
+| representation | state |
+|---|---|
+| a type's structure or kind in the arena | `PrimName` / `LitKind` / `errKind: i32` — no strings |
+| a rep table's key | a hash-consed structural id; **0 characters** built on a real compile |
+| a struct row's identity | an enumerated five-dimension id, complete at 2,360/0 |
+| a struct row's declared-ness | a column banked at the mint, 602/0 and 1,029/0 |
+| the ref-list / map-value / union-field element columns | ladder complete · 100.0% covered · declines are fields with no element |
+
+**"stop parsing strings to represent them"** —
+
+| | resolutions from a SPELLING | first for that spelling | repeat |
+|---|---|---|---|
+| the compiler compiling itself | **6** | 6 | **0** |
+| the corpus (2,010 files) | 1,855 | 1,854 | **1** |
+
+**One repeat in 2,010 files, none in the self-compile.** Every remaining resolution is the first and
+only reading of a distinct inline annotation — a property of the source, since an annotation with no
+declaration behind it cannot be typed in fewer than one resolution.
+
+**What is NOT claimed.** Names have not been removed from the compiler and were never the target:
+`sNames`, `rlElemName`, `mvValName` and `uFieldElemName` still store the spelling a consumer asking
+BY NAME gets back, because source code has names and the emitter's tables are addressed by them. What
+was removed is every place a type's structure lived in a string, and every re-derivation of a type
+from one. Those are the two clauses, and both now carry a number.
+
+## A SILENT INVALID-WASM HOLE, FOUND BY THE PIN MY OWN FIX BROKE (2026-08-19)
+
+CI's `ci-native` job failed on this branch. `tests/vl_build_validate_test.ts` proves `vl build`
+validates the artifact it writes, and it does so with a fixture that must EMIT INVALID WASM. Its
+fixture was `i32[]` into `f64[]` — **which the C8 container-element storage-class rule on this branch
+now rejects at CHECK time.** The pin did exactly what its header says it is for: the hole closed, the
+fixture went inert, and it failed loudly rather than passing vacuously. This is the FOURTH rotation;
+the header records the previous three.
+
+**The replacement is the same family one construct over, and it is a live hole:**
+
+```vl
+const a: {v: i32} = {v: 1}
+const b: {v: i32 | null} = a
+print(b.v ?? 0)
+```
+
+`vl check` **rc 0** · `vl check --codegen` **rc 0** · `vl run` **rc 1**, engine-level:
+`type mismatch: expected (ref null $type), found (ref $type)`.
+
+**So C8's rule covers container ELEMENTS and not struct FIELDS.** A field widening `i32` → `i32 | null`
+changes how the member is stored exactly as an element widening does, and the checker still accepts it.
+The annotation on `a` is load-bearing: without it the literal is built AT the target shape and the
+module is valid — the hole needs the source pinned to the narrower shape first. Filed here rather than
+fixed, because the pin needs a live hole to ride and fixing every hole used as a fixture makes the test
+unmaintainable; the honest split is that the fixture rides it and the board names it.
+
+**The precondition is now TWO assertions.** `vl run` failing is not evidence the MODULE is invalid — it
+is also how a CHECKER reject looks, which is why the old pin failed three assertions later with
+*"the failure must name the artifact as invalid, got: Error: type error"*: true, but it buries the
+news. `vl check` exiting 0 is asserted first, and a checker reject now says "the hole it rides is
+closed" in those words.
+
+**AND THE GATE GAP IS MINE.** `ci-native` is not part of `deno task test` — it is a separate job
+(`SELFHOST_NATIVE_ALIGN=1 deno test tests/selfhost_native_*_test.ts tests/vl_*_test.ts`) that only
+runs where a built binary and seed exist. I ran the corpus, the suite, `cases_wasm`, the fixpoint, the
+identity harness and `rep-fuzz-check` on every slice this session and never once ran that job. It is
+2,177 tests and 33 seconds. Added to the standing gate list.
+
 ## Band 1 — destringify types
 
 **State of the programme.** The EMIT side is at its floor: **1,846 `annotResolve`
@@ -199,7 +825,7 @@ arena channel was awake.
 | **B2e** | **the display renderer emits three spellings VL cannot parse** — the arrow `->` (VL spells `=>`), the nullable suffix `T?` (VL spells `T \| null`) and NO grouping at all (`(A\|B)[]` renders `A \| B[]`). Measured by substituting each `redundant type annotation` render back as its own binding's annotation: **1,298 of 1,877 round-trip** corpus-wide, and 494 of the 579 failures are one of the three: 280 arrow · 113 nullable · 101 grouping | `typecheck.vl` `tyToStrGo`'s `TyFunc`/`TyNullable`/`TyArray`/`TyUnion` arms; `arrElemRender` is the grouping home the two EMIT renderers already share and this one does not | each leg is independently measurable and each moves its own set of corpus `@hint` pins | **BRIEFED 2026-08-17.** Re-verified on the tip after #1457: all three legs still reproduce (`(i32) -> i32`, `i32?`, `A \| B[]`), but **the counts above are STALE** — they were taken hours before #1457 landed nominal rendering, which round-trips trivially, so the agent re-derives the rate as step one. **I under-filed the grouping leg.** It is not a parse *failure*: `A \| B[]` parses successfully to a DIFFERENT type (`A \| (B[])`), so substituting the render back yields `cannot assign A \| B[] to 'u' of type A \| B[]` — **the compiler reporting that a type cannot be assigned to itself**, both sides rendering identically while being genuinely different types. A fourth shape falls out of the same hole: `(i32 \| null)[]` renders `i32?[]`, ambiguous for both reasons at once. Probe note: the nullable and grouping legs only fire the hint when the binding is initialized **from a call** — two of my first probes came back empty for exactly that reason | M | med |
 | ~~**B3**~~ | ~~1a-v `pushFieldRow` — per-field-CODE peel table~~ | `destringify-types-program.md` D-FIELDROWMINT | **MEASURED NEGATIVE.** Re-derived at **3,583 CALLS** (2,510 empty-name guard · 185 rung 1 · 215 rung 2 · **673** `resolveAnnot` reaches) / **220 parses** (11.5% of the emitter's 1,915) / **206 of the 220 MINT (93.6%)**, and on the subset `pushFieldRow` can actually reach, **83 of 84 (98.8%)**. The 14 mint-free are 6 generic re-applications + 8 `#anon` failures, 13 of them outside `pushFieldRow` | **BLOCKED-REP** — behind **B5** | — | — |
 | ~~**B4**~~ | ~~`recordMvValTyIx` routing~~ | `destringify-types-program.md` B4 | **SHIPPED.** Re-derived at **725 CALLS** (40 rung-1 · 274 rung-2 · **411** `resolveAnnot` reaches) / **0 parses** / **0 arena mints**; dual-write **725 of 725 index-identical**, corpus A/B 1,743 files × 7 channels **0 rows moved**, **+25 B**. The filed 685 reconciles as `725 − 40 − 274`: the row grew, the CHOKEPOINT moved | **CLOSED** | — | — |
-| ~~**B5**~~ **Mono-clone `nodeTyIx`** | **THE FILED MECHANISM IS REFUTED — it is the CANON PASS, and the item is renamed `canonTyIx`** | `typecheck.vl` `canonEmitTypeNames` (`n.tyName = c`); reader `emit_collect.vl:3593`; `destringify-types-program.md` D-REPELEMTY §3a | **RE-DERIVED off `494adc0d`: 61 disagree of 1,400 covered / 1,407 reaches / 7 uncovered.** All 61 are PARSER nodes in **five files**; **57 sit on a node whose `tyName` `canonEmitTypeNames` rewrote in place** while `nodeTyIx` kept the pre-canon type; the `@<index>` tell is `repElemKeyGo`'s identity arm over UN-WIDENED `TyLit`s, not a `TyVar` from a clone. **0 come from `emit_mono`** (every synthesis routes through `synthTypeRef` → `recordClonedNodeTy`; TYPED-IR P1 already measured 729/729). **STRUCTURAL FIX BUILT AND MEASURED**: a lockstep `nodeTyIx` write at canon closes **55 of 61 losing 0 agreements** (vs the old `repElemKeyPortable` guard's 59→8 at a cost of 109); residue 6 = 2 shared generic-alias declaration nodes (both routes wrong) + 1 `refArrElemName` MIS-CUT where the arena is right. Suites identical both ways (cases_wasm 1,735/0/7; align 1,742/0/0 gated); wasm sha256 **4 of 1,805** move, all four still oracle-clean. **NOT SHIPPED: `T.tys.length` moves on 61 of 1,528 programs** (monotone append, +0.35%, 0 shrink) — owner ruling. Safer variant: a separate `canonTyIx` column instead of overwriting `nodeTyIx` | **ANSWERED — awaiting owner ruling**; B3 and B6's node-bank residue unblock behind it, and D-B6THREAD §2 prices that residue: the same split is **215 of 299 on index / 13 of 299 on key** at `collectAnnShapes`, one peel further out | M | **HIGH** |
+| ~~**B5**~~ **Mono-clone `nodeTyIx`** | **THE FILED MECHANISM IS REFUTED — it is the CANON PASS, and the item is renamed `canonTyIx`** | `typecheck.vl` `canonEmitTypeNames` (`n.tyName = c`); reader `emit_collect.vl:3593`; `destringify-types-program.md` D-REPELEMTY §3a | **RE-DERIVED off `494adc0d`: 61 disagree of 1,400 covered / 1,407 reaches / 7 uncovered.** All 61 are PARSER nodes in **five files**; **57 sit on a node whose `tyName` `canonEmitTypeNames` rewrote in place** while `nodeTyIx` kept the pre-canon type; the `@<index>` tell is `repElemKeyGo`'s identity arm over UN-WIDENED `TyLit`s, not a `TyVar` from a clone. **0 come from `emit_mono`** (every synthesis routes through `synthTypeRef` → `recordClonedNodeTy`; TYPED-IR P1 already measured 729/729). **STRUCTURAL FIX BUILT AND MEASURED**: a lockstep `nodeTyIx` write at canon closes **55 of 61 losing 0 agreements** (vs the old `repElemKeyPortable` guard's 59→8 at a cost of 109); residue 6 = 2 shared generic-alias declaration nodes (both routes wrong) + 1 `refArrElemName` MIS-CUT where the arena is right. Suites identical both ways (cases_wasm 1,735/0/7; align 1,742/0/0 gated); wasm sha256 **4 of 1,805** move, all four still oracle-clean. **NOT SHIPPED: `T.tys.length` moves on 61 of 1,528 programs** (monotone append, +0.35%, 0 shrink) — owner ruling. Safer variant: a separate `canonTyIx` column instead of overwriting `nodeTyIx` | **TAKEN 2026-08-19 as the separate-`canonTyIx`-column variant, and the ruling's premise did not reproduce: 0 of 2,010 files move on wasm sha256, exit code or diagnostics; `T.tys.length` moves on 93 of 1,559 (+0.55%, monotone). Coverage 95.2% -> 97.6% at 1,071 agree / 0 disagree.** One unpushed commit if the owner still wants to hold on arena growth alone. B3 and B6's node-bank residue unblock behind it, and D-B6THREAD §2 prices that residue: the same split is **215 of 299 on index / 13 of 299 on key** at `collectAnnShapes`, one peel further out | M | **HIGH** |
 | ~~**B6**~~ | ~~Arena-index threading~~ (D-INLINESHAPETY / D-REPELEMTY) | `destringify-types-program.md` D-B6THREAD | **RE-DERIVED, one route SHIPPED, the rest BLOCKED-REP.** The discrepancy was two UNITS of one population: the interner mints **1,064** rows, **14** take the hint and **1,050** reach `resolveAnnot` — `14 + 539 cUserTypes + 1,050 + 130 = 1,733` CALLS. **The "18" is unsourced**: #1334 credits it to #1331, which never censused this site; the only census (D-INLINESHAPETY §1a) says 14, and 14 is what the hint answers on this base. Population left at row 2 = the NODE bank at `collectAnnShapes`: 806 of 874 site-1 mints are node-rooted, **300 uncut**, and threading them MIXES VOCABULARIES — **215 of 299 disagree on index, 13 of 299 on `repCanonKey`** (vs B5's 61 of 1,400 one layer in), 4 witnesses canon-rewritten + 9 `TyLit`-by-index; **132 of 300 MINT**, so it moves the arena too. **SHIPPED instead: the kind-6 vals ref-list slot**, filed blocked on a hoist that does not exist — `vTy` is computed above the whole block. 196 of 200 entries banked, **196/196 key-identical, 196/196 `ΔT.tys = 0`**, both minting entries in the declining 4. `repElemKeyOfNameTy` 3,910 → **3,714 (−196)**, three control rows unmoved; per-file A/B **0 of 1,808 on wasm sha256 AND 0 of 1,808 on `T.tys.length`**; +25 B | **CLOSED** for the shipped route; the node-bank residue stays **BLOCKED-REP behind B5** | — | — |
 | **B7** | **W9 — canon `renderEmit(ty, ctx)`** | `typecheck.vl:9524`, `:7985`, `:6723` | **B2 = 176 / 7,201 = 2.44%**; gate 4b admits **4 distinct spellings corpus-wide** | **DESIGN-BLOCKED** — canon is name-in/name-out by contract | L | high |
 | **B8** | **W10 — `nameToTyReal`**, the checker's second descent | `typecheck.vl:6184` | a SOURCES problem; the "~150 ops" headline **predates the #1327 unit correction** | OPEN, **re-derive** | L | high |
@@ -248,13 +874,13 @@ small and concentrated.
 |---|---|---|---|---|---|---|
 | **C1** | **P1.3 — union box must melt when the payload is READ** | `unboxed-union-rep-design.md` §12.4 / §12.7 | phase 1 **#1322** (78 sites over 76 functions; **wash** at plain `vl build`, **1.76× at `-O`**); if-expr **#1337** (1.67× at `-O`); binding sink (1.36× default / 1.68× `-O`). The `let`-on-two-branches remainder re-derived: **4/4/4 with the payload READ**, and the blocker is Heap2Local's single-definition requirement, not the emitter | **CLOSED — measured negative.** Three sinkable spellings ship; the fourth needs a REP change (escalated, not done) | M | med |
 | **C2** | **P1.4 follow-on — backing-pointer LICM** for view descriptor fields | ROADMAP `:409` (the filed `:949` was STALE — it points into `A-infer-map-value`); `buffer-design.md` §M4 | re-derived: `axpy-view` **1.725 ns/elem at `-O3`** vs a byte-identical hand-hoisted twin **0.573** = **3.01×**; split re-derived on one-axis-apart modules as reload **90.3%** / fence **9.7%** | **REFUTED — measured negative.** Emitter can reach 1 of 7 reads (**2.9%**); binaryen's `licm` moves only TOP-LEVEL loop-body statements; the axis is the INLINING BUDGET, not the view count (`scale-seedtwice`: one view, one column, **3.05×**). Route around = `--always-inline-max-function-size=60` (0 reads, 1.736→0.636 ns) at **+82% size / +127% opt time** on the compiler → belongs to **C3** | L | med |
-| **C3** | **P1.3 — optimization defaults** | ROADMAP `:353` | three-rung sweep separates `OPT-LOSES` (7 rows) from `O3-WORSE-THAN-O` (`sort-heap` 854/**648**/837). **C2 (#1403) adds a SECOND knob to the same ruling**: `--always-inline-max-function-size=60` melts the view descriptor outright — `axpy-view` **1.736 → 0.636 ns/elem** with the kernel module 113 B *smaller* — but costs the 1.16 MB compiler module **+82% bytes (955,265 → 1,740,871)** and **+127% wasm-opt time (22 s → 50 s)**. `flexible=60` is the cheap half: 1.199 ns, +28% compiler size. So the rung default and the inline budget trade the same way — a big runtime win for consumer kernels against build cost on large modules — and should be ruled on together, not separately | **OWNER RULING** `O-release-rung-default` | S in code | moves published guidance |
+| **C3** | **P1.3 — optimization defaults** | ROADMAP `:353` | three-rung sweep separates `OPT-LOSES` (7 rows) from `O3-WORSE-THAN-O` (`sort-heap` 854/**648**/837). **C2 (#1403) adds a SECOND knob to the same ruling**: `--always-inline-max-function-size=60` melts the view descriptor outright — `axpy-view` **1.736 → 0.636 ns/elem** with the kernel module 113 B *smaller* — but costs the 1.16 MB compiler module **+82% bytes (955,265 → 1,740,871)** and **+127% wasm-opt time (22 s → 50 s)**. `flexible=60` is the cheap half: 1.199 ns, +28% compiler size. So the rung default and the inline budget trade the same way — a big runtime win for consumer kernels against build cost on large modules — and should be ruled on together, not separately | **RULED 2026-08-18 — DONE as a ruling, doc work remains.** Both knobs answered the same way: `-O3` STAYS the release rung (12 of 46 rows materially better vs 4 worse; `sort-heap` is the named exception, not the default-setter), and the inline budget is a **build flag, never a default** (same shape as C10 — a fixed tax on every module for a win only some want). Residual work is documentation, not code: the `-O` column into `bench/results/summary.md` (`grep -c 'vl -O \|'` → still 0) and `sort-heap`'s shape into `cli-design.md` | S in code | moves published guidance |
 | **C9** | **webcraft doc staleness** — P1.2, the `wasm-opt` soft-no-op clause, `match` phase 2 | `webcraft-requirements.md` :309/:371-396, :446, :806 | the three blocks it named were already corrected; what was still live was **P1.3's advice**, which told the consumer *"there is no source workaround… do not restructure sim code"* while **three of the four spellings now sink** (#1322 one-site-per-function 1.76x at `-O`; #1337 the if-EXPRESSION arm 1.67x; the BINDING sink 1.36x default / 1.68x `-O`). Only a `let` ASSIGNED on two branches still reads 4/4/4. Corrected, and the guidance INVERTED: prefer a `const` bound to an if-expression over a `let` written on two branches. A16's stale 81/42 population corrected in the same pass | **DONE** | S | none |
 | **C10** | **Names section** — the ask says "keep emitting"; it is **opt-in and off by default** | `emit_sections.vl` `gEmitNames`; `--names` | default build **167 B, no names**; `--names` **258 B**. Flipping the default costs the seed **+60,297 B (+5.3%)**: 1,137,213 → 1,197,510 | **Resolution: consumer passes `--names`.** Do NOT flip the default | S (doc) | none |
 | **C5** | **A16 — litunion correctness in MIXED unions** | `webcraft-requirements.md:823` | ~~81 of 244 grid cells broken, 42 silent wrong answers~~ — **REFUTED as a live number**: all three exemplar shapes the requirements doc nominates are correct on the tip, plus six more, **9 of 9 in a correct outcome column** | **CLOSED — no half worth scheduling.** The two owner rulings gated the REPRESENTATION feature, and measurement had already concluded it should not be scheduled as a memory feature (a standalone litunion and all four keep positions already rep as an interned i32 atom; the mixed-union store already costs exactly one `struct.new` against an interned global, so no encoding allocates less). With the correctness half gone too, nothing remains. **Caveat: 9 probes is not a 244-cell grid** — re-derive before anyone schedules against it | M | — |
 | **C6** | **`match` residuals** — a binding arm cannot be a `const` INITIALIZER | ROADMAP `:1196` | was `emitProgram: if-expression arm is not a single value`; the grid says the BINDING broke value position, not `match` (statement + tail already lowered it, the `if` twin failed identically) | **DONE** — the if-expression arm gained a PRELUDE, so `match` AND `if` both lower in binding-init and `return` position; argument position + a TOP-LEVEL binding stay loud rejects | S–M | low |
 | **C7** | **B15a — default / optional params** | ROADMAP `:991` | **the `$fnsig` sequencing constraint was NOT live** — `fnSigKeyOf` keys off the DECLARATION's parameter list, never a call site's arg count; the call normalization runs before mono/collect and classifies its callee with `emitCall`'s own `fnIndexOfInScopeChain` | **DONE** — `p: T = <literal>` and `p?: T` (sugar for `p: T \| null = null`) parse/check/lower; a function VALUE keeps full arity. Literal-only, annotated-only, trailing-only, no type-param mention. UFCS stays exact-arity by ruling | M | none |
-| **C8** | **Readonly fields / A9 variance** | ROADMAP `:780`, `:782` | **the SILENT half is CLOSED and the boundary is pinned in both directions (#pending).** My filed axis was wrong **twice over**: not the array element — a **BARE binding breaks identically, no container involved** — and not width-vs-depth, but the source's shape **PROVENANCE**. A PINNED value (parameter, callee return, field read, annotated binding) cannot reach any different shape; an **UN-ANNOTATED binding of an object literal is re-interned at the destination row**, so reorder, a widened field type and even a **NESTED dropped field all WORK there** — same type pair, opposite verdicts. Only a **top-level dropped field** is unconditional, and that is exactly what now rejects. **My stated discriminating control was itself broken** (`const a: Animal = someCat` never worked), so "must keep working" was vacuous — the second slice running where my control did not discriminate. 337 cells: check-clean invalid wasm **124 → 79**, program traps **17 → 5**, **63 moved, 0 regressions**; width at a direct container boundary **100% closed** (54 → 0). Corpus **0 verdict changes** and **1,609/1,609 modules byte-identical** — nothing in the corpus exercised the hole, corroborating "not even pinned as xfail". **It hit the stop-and-report condition on its first cut and did not ship it**: that version rejected two correct working corpus files, which is what forced the provenance measurement. The full variance feature remains **BLOCKED** and untouched — no emitter file, no adapter, no WasmGC subtype declaration. 55 residual cells (43 depth, 10 field-nested width) are left check-clean invalid wasm **on purpose**, because the identical program with an un-annotated literal source works, so rejecting them would reject working code | **SILENT HALF CLOSED**; feature still BLOCKED | L | high |
+| **C8** | **Readonly fields / A9 variance** | ROADMAP `:780`, `:782` | **the SILENT half is CLOSED and the boundary is pinned in both directions (#pending).** My filed axis was wrong **twice over**: not the array element — a **BARE binding breaks identically, no container involved** — and not width-vs-depth, but the source's shape **PROVENANCE**. A PINNED value (parameter, callee return, field read, annotated binding) cannot reach any different shape; an **UN-ANNOTATED binding of an object literal is re-interned at the destination row**, so reorder, a widened field type and even a **NESTED dropped field all WORK there** — same type pair, opposite verdicts. Only a **top-level dropped field** is unconditional, and that is exactly what now rejects. **My stated discriminating control was itself broken** (`const a: Animal = someCat` never worked), so "must keep working" was vacuous — the second slice running where my control did not discriminate. 337 cells: check-clean invalid wasm **124 → 79**, program traps **17 → 5**, **63 moved, 0 regressions**; width at a direct container boundary **100% closed** (54 → 0). Corpus **0 verdict changes** and **1,609/1,609 modules byte-identical** — nothing in the corpus exercised the hole, corroborating "not even pinned as xfail". **It hit the stop-and-report condition on its first cut and did not ship it**: that version rejected two correct working corpus files, which is what forced the provenance measurement. The full variance feature remains **BLOCKED** and untouched — no emitter file, no adapter, no WasmGC subtype declaration. 55 residual cells (43 depth, 10 field-nested width) are left check-clean invalid wasm **on purpose**, because the identical program with an un-annotated literal source works, so rejecting them would reject working code | **SILENT HALF CLOSED** (objects, #1456) **+ the CONTAINER-ELEMENT half closed 2026-08-18**; **RULED 2026-08-18** — inferred surface, no annotation in v1, and the filing's "which programs start failing" framing is REFUTED by measurement: that population is empty of *working* programs (all six subtype-container shapes already reject loudly or already emit invalid wasm). The feature splits — the **Writable** half is a free win (check-clean invalid wasm → loud reject), the **Readable** half was never blocked on the ruling at all but on REPRESENTATION (`i32[]` → `(i32\|null)[]` is sound, the checker agrees, the emitter has no conversion between two WasmGC array types) | L | high |
 
 **Open question for the consumer, not for us.** A16 asks webcraft directly whether
 the mixed-union enum pattern is real or hypothetical; it is unanswered and is the
@@ -772,7 +1398,1692 @@ Whoever briefs this should start from `annotResolve`, because its ladder already
 tree-first shape works and its remaining string traffic is a *named, bounded* population
 (unpositioned entries) rather than an open-ended one.
 
+## BAND 1 — the string parser's population RE-DERIVED, and it has TWO feeders, not one (2026-08-18)
+
+The board's state-of-the-programme paragraph reads the emit side as one population at its
+floor ("**1,846 `annotResolve` parses** … there is no fourth rung to add"). Instrumented on
+the tip — a throwaway probe counting entries at the OUTERMOST `nameToTy`, attributed to the
+three external callers, then bucketed by name SHAPE — that is half the picture.
+
+**Corpus, 1,673 files reporting. 4,134 outermost parses:**
+
+| feeder | parses | share |
+|---|---|---|
+| `annotResolve` (root < 0) | **2,110** | 51.0% |
+| `recordClonedNodeTy` (the monomorphizer, via `synthTypeRef`) | **1,993** | 48.2% |
+| `unionMemberGenAppShape` | 31 | 0.7% |
+
+**So `annotResolve` is not the population — it is half of it**, and the filed 1,846
+re-derives at 2,110 (+14%). The second feeder is the emitter minting a `TypeRef` from a name
+it COMPUTED and then immediately re-parsing that name; `emit_rewrite.vl:1095` is the shape in
+its purest form — `synthTypeRef(lt.tyName + "[]", -1)` builds a string by appending `[]` and
+`recordClonedNodeTy` parses it straight back.
+
+**Shape × feeder, which is what decides where to start:**
+
+| shape | `annotResolve` | monomorphizer |
+|---|---|---|
+| **bare identifier** | 174 | **1,146** |
+| object `{` | 728 | 124 |
+| union `\|` | 564 | 288 |
+| array `[` | 255 | 336 |
+| function `=>` | 369 | 66 |
+| generic `<` | 51 | 33 |
+
+The single largest cell in the whole table is the monomorphizer re-parsing a BARE
+IDENTIFIER — 1,146 of 4,134 (27.7%) — and `recordClonedNodeTy` had no rung at all.
+
+### Shipped: the bare-name rung, at the shared leaf
+
+A bare identifier cannot enter any composite arm of `nameToTyReal`, so its answer IS the
+shared leaf ladder — and `tsLeafTy` (prim → type-parameter binding → declared name) already
+IS that ladder on the TREE route, so the rung routes to an existing home instead of adding a
+second copy. `nameIsBareIdent` is one scan in `tyname.vl` beside the other name grammars: the
+NEGATIVE of every composite arm at once.
+
+**Dual-run before shipping, the programme's own method** — both answers computed and their
+renders compared, on every bare name: **6,161 runs, 0 disagreements** on the corpus, 8 more
+on the self-compile, also 0. Arena-neutral by construction (all three leaf rungs are lookups
+of an index somebody else minted). Corpus A/B: **0 verdict changes, 0 emitted-byte changes.**
+
+**The rung fires at RECURSIVE entries too**, which the outermost census does not show: a
+union's members, an array's element and a field's type are each a bare name in the common
+case, so **6,161 leaf resolutions** now answer without entering the 236-line string parser —
+not the 1,320 outermost ones alone.
+
+### PERF: neutral, for the third time, and the board's own framing is now measured
+
+Interleaved min-of-5: `vl check compiler/` −0.9%, self-compile +1.3% — inside noise, and the
+between-run drift on this machine (4,692 → 5,054 ms for the same binary) is larger than the
+effect. That is the **third** independent neutral result today, after the `primName` litunion
+and the optimized-seed measurement. The board already says *"destringify is a correctness
+programme, not a speed one"* (`:337`, from the `__str_eq__` split — 19.10% identifiers vs
+6.08% type names); these three measurements are the direct confirmation, on the work itself
+rather than on a profile. **Rank destringify slices by what they make impossible, not by what
+they make faster.**
+
+### Left, and now sized
+
+2,814 structural parses remain (852 object, 852 union, 591 array, 435 function, 84 generic).
+The two biggest — `annotResolve`'s 728 object and 564 union spellings — are the UNPOSITIONED
+entries, which is the population `annotResolve`'s own header names: emitter-synthesized
+`TypeRef`s and `emit_rep`'s post-canon re-resolutions. Both want the producer to hand over a
+TREE or an arena INDEX rather than a name.
+
+### Also shipped: the HAND-OVER form, and its first site
+
+`synthTypeRefTy(name, pos, tyIx)` / `recordClonedNodeTyKnown(nodeIx, name, pin, tyIn)` — the
+producer passes the arena index it already holds, and the parse does not happen at all
+rather than being shortcut. `-1` is exactly the old route, so the other 33 `synthTypeRef`
+callers are untouched.
+
+First site converted is the programme's own headline shape, `emit_rewrite.vl`'s captured-box
+rewrite: it appended `"[]"` to a name and `recordClonedNodeTy` parsed the result straight
+back off — **a string built and taken apart in two adjacent statements.** The element's arena
+index is on the annotation node the checker already recorded, so the array type is one
+`mkArrayTy` over it.
+
+**Proven LIVE by sabotage, not by reading**: handing over `i32TyIx()` instead of
+`mkArrayTy(elemTy)` reddens the exercising program with `emitProgram: indexed assignment but
+list type not collected`, so the handed-over index is genuinely consumed. Correct version is
+byte-identical on that program and **0 verdict / 0 byte changes** corpus-wide.
+
+The name is still recorded as the node's `tyName` for consumers that have not been
+converted, so this removes the PARSE and not yet the SPELLING. That is the mechanism the
+remaining 2,814 need; each further site is a question of whether its producer holds an index,
+not of whether the route exists.
+
+### THE `annotResolve` HALF, MEASURED PER SITE — and BLOCKED-REP is now a number
+
+The filing calls this half blocked at the rep layer. That is inherited, not measured, so I
+instrumented each of `emit_rep`'s `resolveAnnot` call sites — counting CALLS and, separately,
+the calls that reach a parse (a memo miss at the outermost entry) — over the corpus:
+
+| site | calls | **parses** |
+|---|---|---|
+| 1 · `repElemKeyOfNameTy`, hand-over absent (`ty < 0`) | 8,478 | **553** |
+| 2 · `slotCanonKey`, shape-span arm | 1,084 | **417** |
+| 3 · `declTyIxOfName`, composite fall-through | 9,882 | **1,138** |
+| 4 · `repRowOfName`, shape-span arm | **0** | **0** |
+| total | 19,444 | **2,108** |
+
+Cross-validates the independent census above (which read 2,110 for this whole half through a
+different probe), so both instruments agree to within 2.
+
+**Site 3 is the biggest single site in the programme's remaining population — and it is at its
+FLOOR for a name-keyed design.** `declTyIxOfName` already runs two rungs (`cUserTypes`, then
+`primTyOfName`) and `resolveAnnot` memoizes per spelling, so **9,882 calls collapse to 1,138
+parses — the memo already absorbs 88.5%**. What remains is one parse per DISTINCT composite
+spelling per program, roughly 0.7 per corpus file. No further rung can go below that: a rung
+answers a name faster, and the floor is the number of distinct names.
+
+**So "BLOCKED-REP" is confirmed rather than inherited, and now says something specific**: the
+only way under 1,138 is to stop keying by NAME at all — the rep tables carrying an arena index
+beside (or instead of) their name column, which is what the `sTyIx[]` sidecar started. Its
+callers are the rep tables' name-keyed entry points (`fieldElemTyIxOfName` at intern time,
+`unMemAtomTyIx` at union-member registration), so the conversion is per-column, not per-call.
+
+**Site 4 is measured at ZERO calls and is NOT deleted.** Its own header records rung 1
+declining 32 times corpus-wide; my probe adds that **0 of those 32 take the shape-span arm** —
+they are `#anon` rows and unresolvable spellings, for which `nameIsShapeSpanEnds` is false.
+That is corpus COVERAGE, not a reachability proof, and this programme's own D-TOTALITY rule is
+that a fall-through is deleted with an argument or kept with its measurement. Kept, with the
+measurement.
+
+### THE TYPE ARENA ITSELF IS NOW STRING-FREE FOR STRUCTURE AND KIND
+
+Three raw `string` fields in `T.tys`'s own variants encoded type STRUCTURE or KIND, each with
+its closed set written out in a comment over the field. All three are now declarations:
+
+| field | was | now |
+|---|---|---|
+| `TyPrim.primName` | `string`, 9-member set in a comment | `PrimName` literal union |
+| `TyLit.litKind` | `string`, `"str" \| "int" \| "flt"` in a comment | `LitKind` literal union |
+| `TyErr.errKind` | `string`, always `"error"` | `i32` |
+
+**`errKind` was WRITE-ONLY.** `grep -rn errKind compiler/*.vl` is two lines — the declaration
+and one construction — and *nothing reads it*. It existed because `is` discriminates the arena
+union on field NAMES, so the variant needs one field to be distinguishable; it never needed
+that field to be a heap string. Every `TyErr` in every program was carrying a string reference
+for nothing.
+
+`litKind`: 34 occurrences over 4 files, **25 comparisons whose source text is unchanged**, 9
+producers all passing literals through one minter. Its one string-sentinel local
+(`let litKind = ""`, "no member seen yet") becomes `LitKind | null` — the same absence idiom
+`primNameOf` took.
+
+**What remains in the arena is TEXT, not structure**: `TyObj.objFieldNames` (field
+identifiers), `TyVar.tvName` (a type parameter's identifier) and `TyLit.litText` (the
+literal's own lexeme). Those are user-authored characters that a type legitimately carries —
+none of them encodes a type's shape or kind. **On the programme's own terminal condition —
+*stop representing types as raw strings* — the type arena is done.**
+
+0 verdict changes and 0 emitted-byte changes over 2,005 corpus files; full suite 2,159/0;
+fixpoint holds; the seed shrank 68 bytes.
+
+### THE EMITTER HALF: SHIPPED, after the last two disagreements were NAMED and gated
+
+The terminal item below says the interner's leaves are names CUT from a larger spelling, so no
+caller can bank an index for them. That is true of the CALLERS and it is not the end of the
+argument: **the ROOT has a node.** `collectAnnShapes` walks every node and holds `ti`, so the
+descent can be given an arena type at the top and PEEL IT IN LOCKSTEP with the name.
+
+I built it. `internShapeDeepTy(nm, ty)` threads the type through the descent — paren peel keeps
+`ty`, `nullablePartOf` takes `t.nInner`, `arrElemNameRaw` takes `t.aElem`, `mapValNameOf` takes
+`t.mVal`, and union arms / functype interiors drop to -1 rather than guess. The name peel is
+untouched and stays authoritative for every key, dedup and stored spelling; the type rides
+alongside and reaches only `internInlineShapeTy`'s `sTyIx` hint. Three `tyStep*` helpers, named
+apart from the existing `tyPeelNul` because that one answers `ty` itself on a miss while these
+must DECLINE (the B9b precedent).
+
+**It works, and the coverage is real: 1,156 of 3,145 leaf calls (36.8%) carry the hand-over**,
+where the descent previously had none. Corpus A/B was 0 verdict and 0 byte changes, suite green,
+fixpoint held.
+
+**And it is still wrong, which only a dual-run could show.** `sTyIxOfNameTy` short-circuits on
+the hint, so the handed index must EQUAL `cUserTypes[nm] ?? resolveAnnot(nm)`. Measured:
+
+| | agree | **disagree** |
+|---|---|---|
+| ungated | 447 | **11** |
+| gated on `annTsOf(ti) >= 0` | 411 | **2** |
+
+The gate is the canon invariant itself — `clearAnnTs` drops the spelling tree on exactly the
+nodes canon rewrote in place, so a surviving tree says the name still describes the recorded
+type. It removes 9 of the 11. **Two survive, and two is not zero.**
+
+**Two was not a residue — it was a NAMED CLASS, and finding out cost one probe.** The byte A/B
+could never have told me: a deliberate sabotage handing arena index 0 at EVERY leaf also passed
+the whole suite, because `sTyIx` is weakly consumed. Only the dual-run sees this, which is why
+it is the gate rather than the corpus.
+
+Both disagreements were in ONE file, and the witness names the class outright:
+
+```
+name={a:K[]}  hint={a: string[]}  unhinted={a: K[]}
+name={a:Sx}   hint={a: i64}       unhinted={a: Sx}
+```
+
+`generics/type-param-shadows-alias-through-constructors.vl` — a **generic-alias type PARAMETER
+shadowing a module-level alias of the same name**. Inside `type ShapeInArrK<K> = {v: {a: K[]}}`
+the checker binds `K` to the argument, so the node's recorded type is instantiated
+(`{a: string[]}`); the emitter re-resolving the same spelling with no binding in scope reaches
+the module-level `type K = "a" | "b"`. Same spelling, two answers — and the interner's key
+vocabulary is the second.
+
+**So the second gate is `nameMentionsGenAliasParam`**, over `gaParamNames` (the flat column of
+every alias's declared parameters) with a whole-identifier boundary test that now has its one
+home in `tyname.nameMentionsIdent` — `K` is mentioned by `{a: K[]}` and NOT by `Kind`.
+FUNCTION type parameters need no arm and that is measured, not assumed: the monomorphizer
+substitutes them into the spelling before collect runs, which is why the disagreement class was
+alias parameters alone.
+
+| gates | agree | disagree |
+|---|---|---|
+| none | 447 | 11 |
+| canon (`annTsOf >= 0`) | 411 | 2 |
+| **canon + alias-parameter** | **411** | **0** |
+
+**SHIPPED at 0 of 411.** Corpus A/B 0 verdict and 0 byte changes, full suite 2,159/0, fixpoint
+holds, self-lint + fmt clean.
+
+**What it settles.** The emitter half is NOT blocked on B5 after all — that was my reading of
+the ungated 11, and the gated residue turned out to be a different, nameable class. The claim
+this section replaces (*"the rep-column rewrite is not optional and B5 is its first step"*) was
+wrong, and it was wrong because I stopped at a count instead of asking what the two cases WERE.
+**A residue of two is not a residue; it is two cases with names on them.**
+
+### THE HAND-OVER IS NOW RECURSIVE: a hinted shape hints its own FIELDS (2026-08-19)
+
+The slice above gave the descent an arena ROOT. It stopped at the shape boundary: the moment
+`internShapeDeepTy` reached an inline struct, `internInlineShapeTy` split it into field texts and
+called `internShapeDeep(ftxt)` — **unhinted**, because a field text is a cut of the parent's
+spelling and a cut has no node. Same argument as the root case, and it fails the same way: the
+cut has no bank, but its PARENT does. A `TyObj`'s fields are in the arena, keyed by name.
+
+So `tyFieldTyOf(ty, name)` — the `tyStep*` family's object arm, exported from `typecheck.vl` over
+the existing `objFieldType` so the field scan keeps one home — steps the hint into each field, and
+the nested-shape arm peels `| null` off the hint exactly when `nonNulBaseOf` shortened the name.
+**The hand-over becomes recursive:** a hinted shape hints its fields, whose nested shapes are hinted
+in turn, all the way down.
+
+| population (corpus, 1,559 emitting files) | before | after |
+|---|---|---|
+| `internInlineShapeTy` entries with a hint | 975 of 3,136 (31.1%) | **1,407 (44.9%)** |
+| field pre-interns with a hint | 1,357 of 4,510 (30.1%) | **2,017 (44.7%)** |
+| leaf `sTyIxOfNameTy` resolutions with a hint | 409 of 1,097 (37.3%) | **526 (47.9%)** |
+| `sTyIxOfNameTy` **reaches past the nominal rung** (NOT parses — see the unit correction below) | 816 | **699** |
+
+The field-hintable count rising 1,357 → 2,017 is the compounding, and it is the whole point: the
+extra 660 are fields of shapes that only got a hint BECAUSE their own parent was hinted.
+
+**The gate is the dual-run, and the sabotage proves it is live.** `sTyIxOfNameTy` short-circuits on
+the hint, so the handed index must equal `cUserTypes[nm] ?? resolveAnnot(nm)`. Compared by render at
+every hinted leaf: **526 agree / 0 disagree** — up from the previous slice's 411/0 on the same
+comparator. A sabotage handing the PARENT's type as every field's type reddens **77**, with
+witnesses naming themselves (`hint={a: () => …, f: string, z: {…}}` against
+`unhinted={a: f64, f: f32, z: i64}`). This matters because the byte channel **cannot** see a wrong
+hint here: `sTyIx` is weakly consumed, and an earlier sabotage handing arena index 0 at every leaf
+passed the entire suite. The dual-run is the gate; the corpus is the control.
+
+**No new gates were needed.** The two collect-site gates (canon's `annTsOf(ti) >= 0`, and
+`nameMentionsGenAliasParam`) are applied at the ROOT and are monotone inward — a field text is cut
+from the root spelling, so if the root mentions no alias parameter neither does any field of it,
+and a surviving spelling tree covers the whole subtree. That is why the disagreement count stayed
+at zero without a third gate.
+
+**PERF: neutral on the self-compile, for the FOURTH time, and this time it is exactly zero.**
+`sTyIxOfNameTy` reaches `resolveAnnot` **0 times** compiling the compiler's own source — measured
+on both sides, before and after — so the 117 saved parses are a corpus-only number. This is B1's
+finding again (`nameToTy` entered 54 times corpus-wide, 0 on the compiler) at a different site, and
+it is the fourth independent confirmation of the board's own `:337` framing: **destringify is a
+correctness programme, not a speed one.** Rank its slices by what they make impossible.
+
+**No fixture, and that is deliberate.** The change moves 0 bytes and 0 diagnostics by construction,
+so there is no behaviour a `tests/cases` file could pin — the same reason the root slice shipped
+without one. The pin is the dual-run plus its sabotage, recorded here and in the function header.
+
+Verified: corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code AND diagnostic text; suite
+2,159/0; `cases_wasm` 1,939/0; native fixpoint byte-exact at 1,230,214; self-lint + fmt clean; LSP
+bundle rebuilt.
+
+**What is still unhinted, each for its own reason** — the next slices, sized:
+
+| population | why it is -1 today |
+|---|---|
+| `internFuncTypeShapes` (116 resolutions) | takes **no type parameter at all**; the arena's `TyFunc` params/result would have to be threaded the same way |
+| union arms | the descent DECLINES rather than guess which arm a name belongs to |
+| functype interiors | same decline, one layer in |
+| roots the collect-site gates reject | canon rewrote the spelling, or the name mentions a generic-alias parameter — by design |
+| `internShapeFieldElems` (5) | measured, negligible |
+
+### THE UNION ARMS — and the census that RANKED THEM LAST was reading the wrong unit (2026-08-19)
+
+With the field hand-over in, 571 of 1,097 leaf resolutions were still unhinted. I attributed every
+one of them by instrumenting the DROP POINT — the branch that last held a type and passed -1 down:
+
+| where the hint was dropped | count | share |
+|---|---|---|
+| no root (`internShapeDeep`, the -1 wrapper) | **404** | 70.8% |
+| functype (`internFuncTypeShapes`) | 109 | 19.1% |
+| unattributed | 43 | 7.5% |
+| element / nullable / map step miss | 10 | 1.8% |
+| value union | 4 | 0.7% |
+| **union arms** | **1** | **0.2%** |
+
+**That table ranks the union arms LAST and it is wrong.** `internShapeArms` reaches the descent
+through the -1 WRAPPER, and the wrapper re-attributes everything below it to "no root". A second
+probe tagging the wrapper's five CALL SITES splits the 404:
+
+| call site | count | share of the 404 |
+|---|---|---|
+| **`internShapeArms`** | **357** | **88.4%** |
+| `emit_classify:15895` union ref-array arm | 22 | 5.4% |
+| `internNonLowerableFieldShapes` (nested / closure) | 21 | 5.2% |
+| `emit_collect:4338` `gaeApplyFieldTy` | 4 | 1.0% |
+
+So the union arms are **358 of 571 (62.7%)**, not 1 of 571 — the largest remaining population by a
+factor of three. This is the board's standing rule reproduced exactly: *ranking by the wrong unit
+inverted the order* (#1327's 15,901 reaches were 3,031 parses). A drop-point census answers "which
+branch let go of the type"; the question was "which CALLER feeds the unhinted leaves", and the two
+differ by one wrapper frame.
+
+**The seam already existed.** `unionMemberTysOf(set, out)` appends a union row's member types in
+`splitUnionAtoms` order — the D-UNION query seam, with a coverage flag of its own — and
+`emit_classify:15895` was already calling its bundled form `unionSetArmTys` for its own atoms and
+then throwing the types away at the `internShapeDeep(a)` line. Both sites now hand the arm's type
+down. The order correspondence holds **by construction, not by convention**: a multi-arm `set`
+matches its row through the `unMemberSet[v] == name` leg, i.e. the row whose recorded set spelling
+IS this string, so the two splits are the same split; the length equality is `unionSetArmTys`'
+second conjunct, asked over the atoms the caller already has.
+
+| | before this slice | after |
+|---|---|---|
+| leaf resolutions with a hint | 526 of 1,097 (47.9%) | **888 (80.9%)** |
+| `sTyIxOfNameTy` reaches past the nominal rung (NOT parses) | 699 | **342** |
+
+**Dual-run 888 agree / 0 disagree**, sabotage (arm pairing rotated by one) reddens **270** with
+witnesses that name themselves (`hint=i64` against `unhinted={a: () => …, z: f64}`). Corpus A/B
+**0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,230,368; self-lint + fmt clean; LSP rebuilt.
+
+**Across the two slices this session: `sTyIxOfNameTy`'s reaches past the nominal rung 816 → 342
+(NOT parses — see the unit correction below), leaf hint coverage 37.3% → 80.9%.** And on the compiler's own source the site parses **0 times, before and
+after, on every measurement** — so none of it is a speed result, for the fourth and fifth time.
+
+**What is left, re-derived on this base rather than carried forward:**
+
+| population | count | why |
+|---|---|---|
+| functype (`internFuncTypeShapes`) | 109 | takes no type parameter; the arena's `TyFunc` params/result would thread the same way — **the next slice** |
+| unattributed | 43 | needs its own probe |
+| `internNonLowerableFieldShapes` | 21 | reached only under `internFuncTypeShapes`' gate; rides on that slice |
+| step misses (elem / nullable / map) | 10 | the lockstep declining on a genuine name/arena mismatch |
+| `gaeApplyFieldTy` | 4 | a name BUILT by substitution — no node exists to hold |
+| value union | 4 | `registerValueUnionName` is a box registration, not a shape intern |
+
+### THE FUNCTYPE DESCENT GETS THE SAME LOCKSTEP — the terminal item is now 92.8% closed (2026-08-19)
+
+`internFuncTypeShapes` is `internShapeDeep`'s twin for closure spellings and it took **no type
+parameter at all** — 109 of the 209 leaves still unhinted after the arm slice, plus the 21 under
+`internNonLowerableFieldShapes`, which is reachable only through it. The conversion is the same
+shape as the other two, one grammar deeper:
+
+| name step | arena step |
+|---|---|
+| `annFnDecompose` param texts | `TyFunc.fnParamTypes[i]`, **only** when the arity matches |
+| `annFnDecompose` result text | `TyFunc.fnRet` |
+| `nullablePartOf` | `t.nInner` |
+| `arrElemNameRaw` | `t.aElem` |
+| `arrLeafNameOf`'s `[]` RUN | `tyStepArrRun` — the layer count is the length delta halved |
+| a field name | `tyFieldTyOf` |
+
+The pairing is positional, so an arity mismatch **declines rather than tolerates**: a function of a
+different arity is a different function, not a near miss. Three callers gained a root along the way —
+the descent's own functype branch, `internShapeArms`' closure arm (which now holds `armTy` from the
+previous slice), and the value-union closure-arm descent, paired by the same `unionMemberTysOf` seam.
+
+Every new helper is LIVE, measured rather than assumed: `tyStepParam` answers **1,784**, `tyStepRet`
+**1,895**, `tyStepArrRun` peels a real run **16** times, `internShapeFieldElemsTy` is hinted on
+**224 of 273** calls and `internNonLowerableFieldShapesTy` on **37 of 49**.
+
+| | after arms | after functype |
+|---|---|---|
+| leaf resolutions with a hint | 888 of 1,097 (80.9%) | **1,018 (92.8%)** |
+| `sTyIxOfNameTy` reaches past the nominal rung (NOT parses) | 342 | **212** |
+
+**Dual-run 1,018 agree / 0 disagree**; sabotage (params fed the RESULT type and the result fed
+param 0) reddens **18** and strands 241 more hints downstream. Corpus A/B **0 of 2,010** on
+emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint
+byte-exact at 1,231,083; self-lint + fmt clean; LSP rebuilt.
+
+### WHERE THE DESTRINGIFY EMITTER HALF STANDS AFTER THREE SLICES
+
+| | at session start | now |
+|---|---|---|
+| leaf `sTyIxOfNameTy` resolutions carrying an arena hint | 409 of 1,097 (37.3%) | **1,018 (92.8%)** |
+| `sTyIxOfNameTy` reaches past the nominal rung (NOT parses) | 816 | **212** |
+| the same, on the compiler's own source | **0** | **0** |
+
+The interner header's original claim — *"the other four callers are not hintable and that is the
+measurement, not an omission"* — is now false for three of the four, and the fourth
+(`internShapeFieldElems`) is hinted too. What was true of the CALLERS was never true of the tree:
+a cut substring has no bank, but every cut has a parent that does, and the parent chain reaches a
+node at the root.
+
+**RESIDUAL 79 LEAVES, ATTRIBUTED — and 53 of them are B5.** I ran the probe rather than leaving the
+statement at "not yet measured". Every unhinted leaf is tagged with the REASON its root carried no
+type:
+
+| reason | count | share |
+|---|---|---|
+| **the canon gate — `annTsOf(ti) < 0`** | **53** | **67.1%** |
+| the root WAS hinted; the type was lost deeper (a union/step/value-union decline) | 17 | 21.5% |
+| `gaeApplyFieldTy` — a name BUILT by substitution, so no node can exist | 4 | 5.1% |
+| the node has no recorded type at all | 3 | 3.8% |
+| the generic-alias-parameter gate | 2 | 2.5% |
+
+At the main collect root the gates reject **2,518 of 20,130** TypeRef visits on canon, 306 on the
+alias parameter and 54 for a missing type — but only a few of those roots ever reach a shape leaf,
+which is why the leaf figure is 53 and not 2,518.
+
+**And that 53 SPLITS IN HALF — the gate was asking the wrong question.** The gate read
+`annTsOf(ti) >= 0`: a surviving spelling tree proves the recorded type still describes the name,
+because `clearAnnTs` drops the tree on exactly the nodes canon rewrote. **Sound in one direction
+only.** A MISSING tree is not proof of a rewrite — `annTsOf` answers -1 for a second population its
+own header names, an emitter-SYNTHESIZED `TypeRef` that never had a tree, and whose recorded type is
+perfectly good. Measured at the collect root: of the **2,518** nodes the tree test rejected,
+**1,258 were rewritten by canon and 1,260 were not.**
+
+So canon now keeps the column that answers directly — `canonCleared`, the node indices it rewrote,
+pushed in the pass's own ascending order and binary-searched by `canonRewroteNode` — and the gate
+asks that instead of reading the tree:
+
+| gate | leaves hinted | disagreements |
+|---|---|---|
+| `annTsOf(ti) >= 0` (the tree proxy) | 1,018 of 1,097 (92.8%) | 0 |
+| **`!canonRewroteNode(ti)` (the question itself)** | **1,044 (95.2%)** | **0** |
+| no canon gate at all (sabotage) | 1,071 | **10** |
+
+Strictly better: +26 hints, still exact, and the sabotage row proves the gate is load-bearing rather
+than ceremonial — its witnesses are the alias transparency canon performs (`hint={a: Id}` against
+`unhinted={a: string}`). Reaches past the nominal rung **212 → 181** — and see the unit correction below: these are NOT parses.
+
+**What that leaves for B5: 27 leaves, of which only 10 actually disagree.** I wrote two commits ago
+that the emitter half was "NOT blocked on B5" and that stands — every slice landed without it. The
+re-priced claim is narrower again: **B5 owns 27 of the 53 remaining leaves (the other 26 were the
+gate's own imprecision, now free), and 10 of those 27 are genuine disagreements.** Taking B5 would
+move coverage 95.2% → ~97.7%. That is the number the ruling should be weighed against — not the
+"970 of the remaining `annotResolve` parses" figure from before these slices, which the slices
+themselves have overtaken.
+
+**This does NOT touch the terminal item's other half.** The interner's KEYS are still names, so the
+rep-column rewrite is unaffected by any of this — what these three slices removed is the RE-RESOLUTION
+of a name whose type the caller already held, not the name-keying itself.
+
+### MY UNIT WAS WRONG AGAIN — "parses" were REACHES, and half the saving RELOCATES (2026-08-19)
+
+I reported all four slices above in a number I called *"`sTyIxOfNameTy` reaching `resolveAnnot`"*,
+816 → 181. **It is not that.** The counter sat after the `cUserTypes` rung and before the
+`nameIsShapeSpanEnds` test, so it counted reaches PAST THE NOMINAL RUNG — most of which return -1
+without resolving anything. Re-instrumented at `annotResolve` itself, which is the actual parse:
+
+| emit-side site | at session start | now |
+|---|---|---|
+| `declTyIxOfName` | 1,175 | 1,248 |
+| `repElemKeyOfNameTy` | 576 | 590 |
+| **`sTyIxOfNameTy`** | **207** | **40** |
+| **emitter total** | **1,958** | **1,878** |
+
+(The checker is 17,459 parses in BOTH builds — the identical figure is the control that says the
+attribution is stable, and it is B1's "17,832 of 17,834 are tree walks" holding on this tip.)
+
+**AND THE TWO NEIGHBOURS WENT UP.** `annotNameMemo` is keyed on the SPELLING and shared by every
+site: a name `sTyIxOfNameTy` used to resolve was a memo entry `declTyIxOfName` and
+`repElemKeyOfNameTy` then rode for free. Take the resolution away and the neighbours pay the miss.
+Of the 167 parses this session removed at `sTyIxOfNameTy`, **87 (52%) RELOCATED and 80 (48%) were
+genuinely removed** — a net **−4.1%**, not the −77.8% I wrote in three commit messages.
+
+The same-tip A/B says it again in the other direction. Ignoring the hint on the CURRENT tip:
+
+| | s1 | s2 | s3 | emitter total |
+|---|---|---|---|---|
+| hint OFF (control) | 556 | 416 | 1,137 | **2,109** |
+| hint ON (shipped) | 590 | 40 | 1,248 | **1,878** |
+
+So the hand-over mechanism as a whole is worth **231 parses (−11.0%)**, with 145 of `sTyIxOfNameTy`'s
+own 376 relocating. Both A/Bs agree on the mechanism and roughly on the split.
+
+**THE STANDING LESSON, and it is bigger than this slice: PER-SITE PARSE COUNTS IN THIS PROGRAMME ARE
+NOT ADDITIVE.** Every "site X does N parses" figure on this board is an upper bound on what removing
+site X saves, because the shared spelling memo means one site's resolution is another site's free
+hit. A slice must be priced by an A/B on the EMITTER TOTAL, on one tip, with the hand-over toggled —
+never by the site's own counter falling.
+
+**None of this touches correctness, which is what the slices were for.** The dual-runs are unchanged
+and still exact: 526/0, then 888/0, then 1,018/0, then 1,044/0, with a live sabotage at each step.
+Leaf hint coverage 37.3% → 95.2% is a coverage measurement, not a parse measurement, and it stands.
+The board already says destringify is a correctness programme, not a speed one — this is the fifth
+confirmation, and the first one that caught me quoting a speed number for it anyway.
+
+### THE TERMINAL ITEM'S OTHER HALF — the KEYS. And `repElemKey` had no memo at all (2026-08-19)
+
+The item below says the interner is keyed by NAME, so destringifying it needs the rep-column
+rewrite. Before designing that, I measured what the rep KEYS actually cost, since "building strings
+to represent types" is the thesis's second half and `repCanonKey` / `repElemKey` are its purest
+instance — both take an arena type and RENDER a structural string from it.
+
+`repCanonKey` is memoized per arena index. **`repElemKey` was not, and nothing recorded a reason.**
+
+| | calls | memo hits | builds | characters built |
+|---|---|---|---|---|
+| `repCanonKey`, corpus | 51,393 | 38,145 (74.2%) | 13,222 | 127,396 |
+| **`repElemKey`, corpus** | **152,090** | **0** | **152,090** | **1,139,860** |
+| `repCanonKey`, self-compile | 977 | 114 | 863 | 18,764 |
+| **`repElemKey`, self-compile** | **23,784** | **0** | **23,784** | **174,564** |
+
+The twin cache now exists. It needs one more generation than `repKeyMemo`: `repCanonKeyGo` reads the
+arena alone, while `repElemKeyGo`'s `TyObj` arm also asks `repSlotOfTyDecl`, so the sync compares
+exactly the triple `repSlotCacheSync` does — `tyMutEpoch`, `cUserTypesVer`, `sNames.length`. Banked
+at the TOP of the recursion only, because the de Bruijn back-edge `#n` is a function of the caller's
+DEPTH rather than of `ty`.
+
+| | builds | characters |
+|---|---|---|
+| corpus | 152,090 → **7,989** | 1,139,860 → **65,644 (−94.2%)** |
+| self-compile | 23,784 → **346** | 174,564 → **5,774 (−96.7%)** |
+
+**The gate is a dual-run**: every memo HIT recomputed from scratch and compared — **54,906 agree /
+0 disagree** on the corpus, **15,445 / 0** on the self-compile. The comparator is live, proven by
+banking `s + "X"`: 0 / 15,445, witnesses `memo=S0X fresh=S0`.
+
+**NEITHER GENERATION CONJUNCT IS LOAD-BEARING ON ANY INPUT MEASURED, and I am recording that rather
+than banking it as safety.** Dropping `sNames.length` from the sync leaves 0 disagreements; dropping
+`tyMutEpoch` as well ALSO leaves 0. So on everything available, nothing this key depends on moves
+inside the window `repElemKey` runs in. The triple is kept anyway — the alternative is an unguarded
+cache resting on an emit-window invariant nobody has stated, and syncing on exactly what
+`repSlotCacheSync` compares makes "the two caches are in the same generation" a one-line argument.
+If that invariant is ever written down, the guard is deletable.
+
+**PERF: UNMEASURABLE, and that is the answer.** Five warmed alternating self-compiles per side —
+1.48/1.52/1.49/1.53/1.48 against 1.50/1.49/1.50/1.49/1.53. 169 KB of string building is microseconds
+against a 1.5 s compile. **Sixth confirmation of the board's own framing**, and this one is the
+sharpest: a change that deletes 94% of a string population moves the clock by nothing. Rank
+destringify slices by what they make impossible.
+
+Corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,231,848.
+
+**What this does and does not do for the terminal item.** It removes 94% of the *building*; the keys
+are still STRINGS and the interner is still keyed by NAME, so the rep-column rewrite is untouched.
+What it changes is the rewrite's price: the argument for hash-consing these keys into integers can no
+longer be "we rebuild 1.1M characters", because we no longer do — it has to be made on what integer
+identity makes impossible, which is the same standard every other slice in this programme is held to.
+
+### "SPELLINGS MOVE EMITTED BYTES" IS FALSE — no type spelling reaches the output at all (2026-08-19)
+
+The terminal item below rests its blocker on one sentence, repeated in three places in this
+programme: *"A re-render moves spellings, and spellings move emitted bytes."* Before designing the
+rep-column rewrite around it I tested it, because every other load-bearing claim I checked today was
+stronger than its measurement.
+
+**A four-line program and a `grep`:**
+
+```vl
+type ZzUniqueSpelling = { zzFieldAlpha: i32, zzFieldBeta: string }
+function zzNamedFunction(p: ZzUniqueSpelling): i32 { p.zzFieldAlpha }
+const v: ZzUniqueSpelling = { zzFieldAlpha: 1, zzFieldBeta: "zzLiteralString" }
+print(zzNamedFunction(v))
+```
+
+| token | in `vl build` bytes | in `vl build --names` bytes |
+|---|---|---|
+| `zzNamedFunction` (a FUNCTION name) | absent | **PRESENT** |
+| `ZzUniqueSpelling` (the type name) | absent | absent |
+| `zzFieldAlpha` / `zzFieldBeta` (field names) | absent | absent |
+| `zzLiteralString` (a string literal) | absent | absent |
+
+**The function name is the positive control** — it proves the probe is live, and it is the only
+source token that reaches the module at all. The reason is structural, not incidental:
+`emitNameSection` writes exactly two subsections, the module name (`"vl"`) and the FUNCTION namemap.
+WasmGC struct types carry no names in the binary, so there is nowhere for a type or field spelling to
+go. (String literals are absent because they are emitted as code-point data, not raw UTF-8.)
+
+**So the sentence is false, and what is true instead is more useful.** A spelling moves bytes only
+through a DECISION keyed on it:
+
+- **dedup** — `annShapeIndexOf`, `repSlotKeySi`/`repSlotKeyN`, `structIndexByName`
+- **classification** — `isUName`, `nameFieldCode`, `nameIsShapeSpanEnds`
+- **order** — interning order fixes type-section indices
+
+**Why that changes the rewrite.** The obligation was read as *preserve every spelling*, which is what
+made `canonEmitName ≠ tyToEmitName ∘ nameToTy` (`ast.vl:780`) look terminal. The real obligation is
+**preserve the partition and the order** — and byte-identity over the corpus is exactly the test for
+that, which every slice in this programme already runs. A rewrite that keys the rep tables on a
+structural identity is allowed to spell things differently, or not to spell them at all, provided two
+types that merged still merge and the interning order is unchanged.
+
+**`canonEmitName ≠ tyToEmitName ∘ nameToTy` is still true and still matters** — a differing spelling
+still reaches those decisions, so a re-render can still move a merge. What it does not do is reach
+the output. The distinction is the whole difference between "the keys cannot be replaced" and "the
+keys can be replaced by anything that partitions identically."
+
+**Not scheduled, and I am not starting it on my own.** It is multi-slice, it needs a structural
+identity (hash-consing on the arena, i.e. an integer table rather than a rendered string), and its
+first correctness question — does `annShapeIndexOf`'s partition even coincide with a type-identity
+partition — has a **known negative** the code already states: `{f: K0}` and `{f: boolean}` are
+layout-equal and encoding-different and must NOT merge, while two distinct arena types with equal
+field codes MUST. So the target is not arena identity; it is a purpose-built structural key over the
+wasm layout+encoding lattice. That is the design work, and it is an owner-schedulable item, not a
+measurement.
+
+### THE REP-COLUMN REWRITE, STEP 1: the structural identity exists and is PROVEN (2026-08-19)
+
+`repCanonKey` / `repElemKey` render a structural string from an arena type, and every consumer uses
+it for one thing: **equality**. So the string is a REPRESENTATION of a structural identity, not the
+identity — the thesis's second half in its purest instance.
+
+`repCanonId` / `repElemId` build the identity directly. Every node interns `(tag, args…)` into a
+hash-consed table (FNV-1a → bucket chain, intrusive `hcNext`, rehash at 3/4 load) and returns its
+INDEX, so two structurally-equal types get the same i32 and **no type spelling is ever composed**.
+The recursion mirrors the string builders arm for arm — same mix-widening (the one rule now written
+ONCE, in a shared `hcUnionId`, rather than the string builders' two copies), same de Bruijn
+back-edge, same sentinels, same order.
+
+**`hcLen` is the sharp part.** It carries what the string builder's answer WOULD be, in characters,
+computed by the same arithmetic without rendering. It is not decoration: it reproduces the 262,144
+runaway cap exactly, and it is a far tighter equivalence than partition agreement — a length matching
+at every node says the two recursions have the same SHAPE, which two different recursions cannot fake.
+It also caught the only real bug in the first draft: the functype arm started its length at 2 (`(` and
+`)`) while the string's closer rides inside `")=>"`, an off-by-one on **19,260 of 53,622** keys that
+the partition check could not see, because every functype was off by the same one.
+
+**The proof runs inside the harness built for exactly this** — `repShadowSweep`, armed by
+`$VL_REP_SHADOW`, off by default, one boolean test when unarmed. It walks the whole arena after the
+bytes are final and asserts three things per key, in both vocabularies:
+
+| | self-compile | corpus |
+|---|---|---|
+| (spelling, id) pairs compared | 53,622 | 229,430 |
+| **false MERGE** (two spellings, one id — fuses layouts) | **0** | **0** |
+| **false SPLIT** (one spelling, two ids) | **0** | **0** |
+| **rendered-length mismatch** | **0** | **0** |
+
+283,052 pairs, zero disagreements. **Sabotage** (drop the nullable wrapper from the identity):
+**606 merges and 693 length mismatches**, witnesses naming the class outright
+(`a=(@192|…|@200) b=(@192|…|@200)?`). The harness is live in both directions.
+
+**Two design points worth keeping.** (1) The id→spelling assertion is PER VOCABULARY, because the two
+builders share one hash-cons table and an id reached from both is *correct* — `i32` is `i32` under
+either rendering, and the arms where they genuinely differ (`HC_SLOT`, `HC_RLI32`, `HC_RLSTR`) carry
+their own tags. Asserting across vocabularies produced 14,355 false "merges" in the first run, every
+one of them the harness being wrong. (2) The table is sid-keyed (`HC_PRIM` holds the primitive
+keyword's sid, `HC_OBJ` its field names'), so `hcReset` goes in `sidKeyedTablesReset` — the function
+whose header says it exists to be the one home for that pairing.
+
+Byte-identical by construction, and verified so: corpus A/B **0 of 2,010** on emitted-wasm sha256,
+exit code and diagnostic text; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact.
+
+### STEP 2: the first consumer is switched — `repSlotKeySi` / `repSlotKeyN`
+
+The slot cache's twin index keyed on `repCanonKey(di)`, a rendered string, in two
+`{[string]: i32}` maps. It now keys on `repCanonId(di)`, and because ids are dense from 0 the two
+maps become two plain arrays. **The rendered key is no longer built at that site at all.** This is a
+change of REPRESENTATION with the partition held fixed — which is exactly why it cannot move a byte,
+and does not.
+
+**One hazard had to be closed first, and it was not hypothetical.** `hcReset` lives in
+`sidKeyedTablesReset`, which the driver calls **inside the module-parse LOOP** (its own header calls
+that "the sharpest edge the carrier has"). So the id space restarts MID-COMPILE, and everything keyed
+on an id must die with it: the two `ty -> id` memos hold ids as VALUES, the slot cache holds them as
+INDICES. `hcReset` now clears the memos and stamps the slot cache stale, so its own sync stays the
+one place that rebuilds it.
+
+**AND THE BYTE CHANNEL IS BLIND HERE — measured, not assumed.** Flipping the unique-twin gate from
+`== 1` to `== 2`, which turns every structural-bridge answer into a decline and invents new ones,
+moves **0 of 2,010** files. The bridge is nevertheless LIVE: instrumented, it is reached **664** times
+and answers **223** on the corpus. So those 223 answers are byte-inert on every corpus file, and the
+byte gate proves nothing about this conversion. What proves it is the identity equivalence — 283,052
+pairs, 0 disagreements — and that is the whole reason the equivalence was built before the wiring.
+
+Corpus A/B **0 of 2,010** on emitted-wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,243,947; harness still 0/0/0. Net size after both
+steps: **+12.1 KB (1.0%)** over the pre-identity tip — the harness and the identity, less the two
+string maps the wiring retired.
+
+### STEP 3: `slotCanonKey` and the ref-list element column
+
+Three more consumers, all the same move:
+
+- **`slotCanonKey` → `slotCanonId`.** Every answer was a rendered key whose only use is equality, so
+  it becomes the id — and the `""` "never participates in dedup" sentinel becomes `-1`. Its three
+  rungs are untouched. Its dependants follow: `repStructSlotsTwin`, `repStructSlotRep`,
+  `repRowOfTyStruct`, and `buildStructTwins` (whose `keys: string[]` is now `i32[]`).
+- **`repElemKeyOfNameTy` → `repElemIdOfNameTy`**, and `rlElemKey: string[]` → `i32[]`. Its
+  unresolvable-spelling answer `"name:<nm>"` becomes an `HC_NAME` id carrying the name's SID rather
+  than the spelling — still the one place a name reaches this table, and it can never collide with a
+  structural key because its tag is its own.
+- **`rlSlotOfTy`** keys on `repElemId`.
+
+**AND HERE THE BYTE CHANNEL IS LIVE, which step 2's was not.** Two sabotages, both on the shipped
+tip: breaking the `rlElemKey` equality moves **21 of 2,010**; making `slotCanonId` answer a unique
+value per slot (so nothing ever merges) moves **168 of 2,010**. So for step 3, unlike step 2, the
+byte-identity gate is a real proof and not a vacuous one — and it holds at **0 of 2,010** on
+emitted-wasm sha256, exit code and diagnostic text. Suite 2,159/0; `cases_wasm` 1,939/0; fixpoint
+byte-exact at 1,243,966; harness still 0/0/0.
+
+### STEP 4: the last two consumers — and the rep key is now NEVER a string on a real compile
+
+`repNameCanonKey → repNameCanonId` (the name-input twin, for slot layers whose intern keys are not
+struct-table indices) and `mvValCanonKey → mvValCanonId` (the one place the arena vocabulary and the
+name vocabulary met — both legs were rendered keys, both are now ids). Their dependants follow:
+`nestedStructNamesCompat`, `mvSlotsTwin`, and `buildVariantTwins`, whose `keys: string[]` is `i32[]`.
+The runaway cap in `repNameCanonId` is unchanged and still needed — it guards `resolveAnnot`, i.e.
+arena MINTING, not the render.
+
+Byte channel live again: sabotaging both paths (break the mv-canon equality, make the variant keys
+unique) moves **86 of 2,010**. The gate holds at **0 of 2,010** on wasm sha256, exit code and
+diagnostic text; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact at 1,243,906; harness
+0/0/0.
+
+### THE MEASUREMENT THE WHOLE PROGRAMME WAS FOR
+
+`repCanonKey` and `repElemKey` are now reached from **four call sites, all inside the shadow
+harness** — `repShadowNote`'s human-readable message and `hcCheckKey`'s equivalence assertion — and
+the harness is off by default. Instrumented on a NORMAL compile:
+
+| rep-key strings built | at session start | now |
+|---|---|---|
+| corpus (2,010 files) | 165,312 builds · **1,267,256 characters** | **0 · 0** |
+| self-compile | 24,647 builds · **193,328 characters** | **0 · 0** |
+
+**On a real compile the emitter no longer builds a single character of type spelling to key a rep
+table.** That is the terminal item's core, and it is a measurement rather than a claim.
+
+**PERF: still nothing, for the seventh time.** Warmed alternating self-compiles, session-start seed
+against now: 1.49/1.50/1.52/1.51 against 1.52/1.51/1.54. Deleting 193 KB of string construction from
+a 1.5 s compile is invisible. The board's framing has now survived seven independent tests and one
+attempt by me to quote a speed number for it anyway.
+
+**A consequence worth stating plainly**: the `repElemKey` memo shipped earlier this session is now
+exercised only by the harness, because its function is. It stays — the harness is the equivalence
+proof and wants to be cheap — but its 94% figure is a historical measurement, not a live saving.
+
+**What remains, honestly.** The rep tables are destringified. The INTERNER above them
+(`internInlineShapeTy`, `registerValueUnionName`, `internFuncTypeShapes`, `structIndexByName`,
+`annShapeIndexOf`) is still name-keyed, and that is a different table family with a different
+partition — `annShapeIndexOf` keys on wasm field CODES and element TEXTS, deliberately splitting
+`{f: K0}` from `{f: boolean}` (layout-equal, encoding-different). Converting it needs its own
+structural key over that lattice, and the identity built here is the template, not the answer.
+
+**What is now true of the terminal item.** Its blocker was stated as *"the interner keys are names,
+and a re-render moves spellings, and spellings move bytes"*. The third clause is false (measured
+above — no type spelling reaches the output). The second is now beside the point for the rep tables
+specifically: **their key no longer has to be a spelling at all, and the replacement is proven to
+partition identically over 283,052 pairs.** What remains is wiring, one consumer at a time, each
+gated on byte-identity — ordinary work rather than a design question.
+
+### THE INTERNER, MEASURED — and its cost is NOT the parse (2026-08-19)
+
+With the rep tables done, I sized the interner before converting it, and the census re-ranked it:
+
+| interner population | corpus (2,010 files) | **self-compile** |
+|---|---|---|
+| `structIndexByName` — the row lookup BY SPELLING | 207,375 calls | **258,112 calls · 2,394,078 row comparisons** |
+| `nameFieldCode` — the field-code classifier | 12,414 calls · 100,214 chars | 1,267 · 6,917 |
+| `shapeInnerFieldSplit` — THE PARSE | 5,237 calls · 82,106 chars | **0** |
+| `annShapeIndexOf` — the dedup scan | 3,116 calls · 12,048 rows | **0** |
+
+**The shape interner's field split runs ZERO times on the compiler's own source, and so does the
+dedup scan.** Every annotation the compiler writes about itself is nominal, so the parse the terminal
+item is named for is not what the interner costs there. What it costs is the **name-keyed row LOOKUP**
+— 258,112 calls, each a linear walk over `sNames` with a string compare per row.
+
+**So the slice is the lookup, not the parse**, and it is the same shape as everything else this
+session: `structIndexByName` is now an incremental index rather than a scan. Incremental and not
+rebuilt-on-demand because `sNames` grows THROUGHOUT collect — a rebuild-on-length-change index is
+O(n) per growth and puts the same O(n²) back. `sNames` is push-only within a program (four push
+sites, no in-place rename), so the index only ever needs the rows past its watermark; first match
+wins, preserving the scan's duplicate-spelling semantics exactly.
+
+**The per-program reset is load-bearing and that is MEASURED, not argued.** A watermark cannot see
+`collectS`'s `sNames = []`: program B pushing as many rows as A leaves the watermark satisfied with
+A's spellings still in the map. Removing the explicit `structNameIxReset()` fails **438 of 1,939** in
+the shared-instance wasm harness — the same harness, and the same hazard, that
+`sidKeyedTablesReset`'s header describes for its own tables.
+
+**PERF: NOT A MEASURED SPEEDUP, and I am shipping it anyway.** Min-of-8 self-compiles: **1.55 s
+before, 1.54 s after.** The corpus channel is pure noise (2,010 tiny files, dominated by
+instantiation: two alternating rounds gave 13.10/12.66 indexed against 15.18/12.30 scanned). So
+removing 2.4 million string comparisons is **invisible — the eighth time this session that deleting a
+large string-shaped population moved the clock by nothing.** The justification is complexity, not
+time: an O(rows)-per-query scan on the emitter's hottest name query is worth removing on a program
+larger than anything in this corpus, and the byte gate is exact (0 of 2,010 on wasm sha256, exit code
+and diagnostic text).
+
+**A method note that cost a run.** Sabotaging the reset and testing with `VL_COMPILER_WASM` set
+showed 1,939/0 — the Deno harness loads `build/vl-compiler.wasm` directly and does not read that
+variable. The sabotage only reddened once the seed was actually swapped on disk. Same family as the
+CWD lesson earlier in this programme: **verify the probe reached the thing you think it reached.**
+
+### THE SHAPE DEDUP'S PRIMARY KEY IS NOW A STRUCTURAL ID (2026-08-19)
+
+`annShapeIndexOf` walked the WHOLE struct table and re-derived the same three conditions on every
+row: the field COUNT, every queried name being present, and the codes matching. Those three ARE a
+key — "the row has the same multiset of (field name, field code)", and a struct's field names are
+unique — so they are now computed once as a hash-consed id over `(sid(name), code)` pairs in a
+canonical order. **Integers; no spelling composed.** The scan becomes a walk of one bucket.
+
+**Exactly equivalent BY CONSTRUCTION, not merely measured.** A row in a different bucket fails
+conditions 1–3 and the old scan rejected it; a row in the same bucket passes them and reaches the
+element / atom-identity refinement, which is untouched. That refinement stays per-candidate because
+it compares stored element SPELLINGS and its atom-identity split reads the QUERY's text — the part
+of this dedup that is genuinely name-shaped, and deliberately left alone.
+
+**Verified by dual-run, because the byte channel could be blind**: both answers computed on every
+call over the corpus, **3,112 agree / 0 disagree**. The chain walk is load-bearing — stopping at the
+bucket head disagrees on **75** of 3,112, so buckets really do hold several rows that only the
+refinement separates.
+
+**The SORT is not exercised by the corpus, and I am recording that rather than banking it.** Keying
+the multiset in written order instead of sorted order gives **0 disagreements** — no two rows here
+share a field-name set in a different ORDER at a point where dedup matters. It stays sorted, and the
+reason is an argument rather than a measurement: the scan it replaces looked each queried name up
+via `sFieldIndex`, so it was order-insensitive BY CONSTRUCTION, and an order-sensitive key would
+silently mint a duplicate row for `{a: i32, b: i32}` against `{b: i32, a: i32}`.
+
+Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,247,601.
+
+### WHERE THE PROGRAMME STANDS
+
+| layer | state |
+|---|---|
+| the type ARENA | string-free for structure and kind (`PrimName`, `LitKind`, `errKind: i32`) |
+| the CHECKER's resolution | **2** name parses corpus-wide; 17,459 tree walks |
+| the emitter's arena HAND-OVER | **95.2%** of interner leaf resolutions carry the recorded type |
+| the REP tables | **0 characters** of type spelling built on a real compile |
+| the interner's row LOOKUP | indexed; was 258,112 scans / 2,394,078 comparisons on the self-compile |
+| the interner's DEDUP key | a structural id over `(name sid, code)` |
+| **what is still a spelling** | the interner's STORED name (`sNames`), the element-text refinement, and `nameFieldCode`'s classifier ladder |
+
+**The honest residue.** `sNames` is still the row's stored identity and `structIndexByName` is still
+how most callers ask for a row — the index made it O(1), not name-free. Removing the NAME as the
+row's identity means every caller holding a spelling must hold a type instead, which is the
+hand-over programme at 95.2% and is exactly what would have to reach ~100% first.
+
+### THE FIELD-CODE CLASSIFIER TAKES AN ARENA RUNG — 59.2% at 0 disagreements
+
+`nameFieldCode` was the last real parse population in the emitter (12,414 calls / 100,214 characters
+over the corpus, 1,267 on the self-compile), and its ladder OPENS with six string-equality tests
+against the primitive keywords. A caller holding the field's recorded type already knows that answer:
+since the arena went string-free, `TyPrim.primName` is a `PrimName` litunion and the test is an
+`i32.eq`. The litunion and litunion-array arms are structural queries for the same reason.
+
+So `nameFieldCodeTy(t, ty)` puts the arena in front of the ladder — the same hand-over the interner's
+descent takes, one layer down, and the interner's field loop already holds `fldTy` from the recursive
+slice. **CONFIRM-ONLY, and the decline is the point**: it answers only where the arena decides the
+code exactly and returns to the name ladder everywhere else, because composites, closures, maps, the
+nullable niches and the whole union family turn on emitter INTERNING STATE the arena does not carry.
+
+| | |
+|---|---|
+| corpus field classifications covered | **2,669 of 4,510 (59.2%)** |
+| agreement with the name ladder | **2,669 / 0** |
+| sabotage (f64 and i64 codes swapped) | **805 disagreements** |
+
+Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,247,869.
+
+**What is left of the classifier is not leaf work.** The remaining 40.8% are the codes that depend on
+what the emitter has interned — a ref-list's element slot, a map's value kind, a union's box, a
+nullable niche's backing. Those are not "parse the spelling better"; they are the same question the
+interner's own name-keying asks, so they move when it does, not before.
+
+### B5 MEASURED ON TODAY'S TIP — the ruling's premise does not reproduce (2026-08-19)
+
+B5 has sat **ANSWERED — awaiting owner ruling** because the lockstep `nodeTyIx` write at canon moved
+`T.tys.length` on 61 of 1,528 programs AND moved emitted wasm sha on 4 of 1,805. I promised to
+measure the SAFER variant — a separate `canonTyIx` column instead of overwriting `nodeTyIx` — without
+asking for a ruling. Measured, on this tip, with today's consumer:
+
+`canonEmitTypeNames` now records `nameToTy(c)` beside `canonCleared` at every rewrite, and the two
+collect-site gates read it where the node was rewritten instead of declining. `nodeTyIx` is
+untouched, so **no existing consumer changes** — the only reader is the interner's hint.
+
+| | before | after |
+|---|---|---|
+| leaf hint coverage | 1,044 of 1,097 (95.2%) | **1,071 (97.6%)** |
+| dual-run agreement | 1,044 / 0 | **1,071 / 0** |
+| emitted-wasm sha256 | — | **0 of 2,010 moved** |
+| exit code + diagnostic text | — | **0 of 2,010 moved** |
+| `T.tys.length` | — | moves on **93 of 1,559** (6.0%), **+599 of 107,938 (+0.55%)**, monotone |
+
+**THE BYTE MOVEMENT DOES NOT REPRODUCE.** The filing's 4-of-1,805 was measured against a different
+consumer (`repElemKeyPortable`/`nodeTyIx`) on a base since overtaken; today's consumer is the
+interner's `sTyIx` hint, which is gated and weakly consumed, and it moves nothing. So the ruling that
+was requested — "is 4 moved files and +0.35% arena worth 55 of 61 disagreements?" — is now
+"is **+0.55% arena, monotone, zero moved files** worth 27 more exact hints?"
+
+**Shipped, because the fact the ruling was waiting on has evaporated and this is one unpushed
+commit.** If the owner still wants to hold on the arena growth alone, reverting `4d…` is the whole
+change. The numbers above are the ones to weigh, not the filing's.
+
+Suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact at 1,248,224; identity harness 0/0/0.
+
+**What it unblocks.** The interner's remaining name-keying needs its callers to hold a TYPE rather
+than a spelling, and the hand-over is the supply of those types. At 97.6% the residue is **26 leaves**:
+the 24 the descent loses deeper (union/step/value-union declines), the 2 generic-alias-parameter
+cases, and the `gaeApplyFieldTy` names that no node can hold. That is the honest ceiling of this
+approach — the rest is not a coverage problem but a design one.
+
+### THE ROW-IDENTITY DESIGN QUESTION, ANSWERED WITH NUMBERS (2026-08-19)
+
+I kept writing that removing the NAME as a struct row's identity "needs a design decision" and that
+its callers "would have to hold a type instead". Both halves were assumptions. I censused all 29
+`structIndexByName` call sites on the self-compile:
+
+| site | calls | share |
+|---|---|---|
+| **`structIndexOfLet` — `structIndexByName(lt.tyName)`** | **168,665** | **65%** |
+| `isSName` | 38,115 | 15% |
+| `emit_classify:7346` | 14,795 | 6% |
+| `emit_classify:17917` — `ty.tyName` | 13,724 | 5% |
+| `emit_classify:11354` — `ty.tyName` | 9,474 | 4% |
+
+**The dominant caller HOLDS A NODE**, and so do the fourth and fifth. `lt` is the `LetDecl`'s
+`letType` TypeRef, so `nodeTyIxOf(d.letType)` is right there. So "the callers do not have a type" was
+simply wrong — three of the top five do.
+
+**The real blocker is that the two lookups are DIFFERENT QUESTIONS, and here is the number.** Dual-run
+at the dominant site, arena rung against the name:
+
+| | self-compile | corpus |
+|---|---|---|
+| calls | 168,648 | 18,265 |
+| arena answers | 151,321 (89.7%) | 8,201 |
+| agree | **151,321** | 8,186 |
+| **disagree** | **0** | **15** |
+| arena-only / name-only | 0 / 0 | 0 / 2,384 |
+
+`structIndexByName` finds the row interned under THIS SPELLING; `structIndexOfTy` finds the first row
+denoting this TYPE — which may be a structurally identical TWIN interned under a different spelling.
+The 15 witnesses are all inline shapes resolving one row earlier than their name does
+(`nm={a:string,f:K0|null,z:f32} arena=10 name=8`).
+
+**So the rung is NOT shipped — but I then measured what shipping it would COST, because "it is a
+semantic change" is a claim and this programme prices claims.** Built the rung (arena first, name
+fallback) and ran the whole gate:
+
+| channel | result |
+|---|---|
+| emitted-wasm sha256 | **0 of 2,010 moved** |
+| exit code + diagnostic text | **0 of 2,010 moved** |
+| `deno task test` | 2,159 / 0 |
+| `cases_wasm` (shared instance) | 1,939 / 0 |
+
+**The 15 different row choices are behaviourally INVISIBLE on everything available.** That is the
+hypothesis confirmed: `sTwin` merges those rows at the heap-type layer, so picking either one emits
+the same module. The design question therefore does not cost what I said it might.
+
+**It is still not shipped, and the reason is the standard rather than the risk.** Every other slice
+in this session shipped on a 0-disagreement gate — a proof that the two answers ARE the same. This
+one would ship on downstream inertness measured over one corpus, which is a weaker warrant, and the
+residual surface is exactly the case the corpus does not contain: two rows with the same arena type
+whose emitted field layouts DIFFER, which `structFieldCodesEq` exists to catch and which this rung
+does not consult.
+
+**So the owner ruling is now a one-line question with all four numbers attached:** *may a struct
+row's identity be its TYPE, collapsing spelling twins?* — 65% of the emitter's hottest name query
+moves to the arena if yes; 15 of 8,201 corpus cells choose a different (structurally identical) row;
+0 of 2,010 files change in any channel; and the untested case is a twin pair that is not
+layout-equal.
+
+**TAKEN, after the untested case was tested.** I wrote "the gate above is already run" and that was
+wrong in exactly the way that mattered: I had never run **`rep-fuzz-check.sh`** on it, and that is
+the harness whose generator reaches shapes the corpus does not — which is precisely where I said the
+residual risk lived. The same harness then caught the OTHER merge-enabling change on this branch as
+REJECT → MISMATCH, so it demonstrably has power against this class.
+
+Run on the rung: **`rep-fuzz-check` exact ✅**, alongside corpus A/B 0 of 2,010 on all three
+channels, suite 2,160/0, `cases_wasm` 1,940/0, native fixpoint byte-exact at 1,251,227.
+
+**It ships on evidence rather than on a proof of sameness — the one place in this programme that is
+true, and it is stated at the call site.** `sTwin` already merges these rows at the heap-type layer,
+which is why picking either emits the same module; if a layout-divergent twin pair ever surfaces,
+`structFieldCodesEq` is the predicate that names it and this rung is the two lines to revert.
+
+**What IS shipped: `structIndexOfTy` is now an index** rather than a linear scan of `sTyIx` — the
+arena-input twin of the name index, same incremental pattern over a push-only column, same explicit
+per-program reset. The reset is load-bearing and measured: removing it fails the shared-instance wasm
+harness. Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0;
+`cases_wasm` 1,939/0; fixpoint byte-exact at 1,248,598.
+
+### THE ELEMENT-TEXT REFINEMENT IS **NOT** THE TWIN-MERGE QUESTION — measured (2026-08-19)
+
+The interner's dedup has two halves: the fieldset key (now a structural id) and the per-candidate
+ELEMENT-TEXT refinement, which compares the stored `sFieldElemName` against the query's field text.
+I assumed the refinement reduced to the same pending ruling as the row identity — that switching it
+to arena types would COARSEN it, merging spelling-distinct-but-type-identical elements. **It does
+not, and the guess was wrong.**
+
+Instrumented at the comparison over the corpus:
+
+| | |
+|---|---|
+| refinement reached | 5,058 |
+| row carries an element NAME | 2,454 |
+| …and an element ARENA TYPE (`sFieldElemTyIx`) | **2,423 (98.7%)** |
+| comparisons where the two TEXTS differ | 1,501 |
+| …with an arena type on BOTH sides | 1,471 |
+| **…where the arena types nevertheless AGREE (the coarsening)** | **0** |
+
+**Zero — AND THAT ZERO IS AN ARTIFACT. THE MEASUREMENT WAS BROKEN AND THE CONCLUSION BELOW IS
+RETRACTED.** The probe compared RAW ARENA INDICES, and arena indices are not canonical for structural
+identity: the checker mints fresh entries in many places and only `resolveAnnot`'s memo dedups per
+spelling, so two entries for the same type routinely carry different indices. Instrumented properly —
+comparing the row's banked `sFieldElemTyIx` against a query-side peel of the same element, by
+`repCanonId` — the picture inverts:
+
+| comparator | agree | **disagree with the text verdict** |
+|---|---|---|
+| raw arena index | 710 | **1,233** |
+| `repCanonId`, code-15 nullable peel wrong | 828 | **1,115** |
+| `repCanonId`, code-15 peel fixed | 900 | **1,043** |
+
+The residue is **codes 16 and 19, and it is a real coarsening**. For those codes the row banks a
+DIFFERENT VOCABULARY from the field text: a map field (19) banks its VALUE name while the text is the
+whole `{[string]: V}` spelling, and a union field (16) banks the recorded union name (`K|f64`) while
+the text is the softened render (`string|f64`). So the text comparison answers "distinct" for
+essentially every map-field shape, and an arena comparison answers "same" — merging shapes the
+interner deliberately keeps apart. **The byte channel agrees: taking it breaks 2 of 2,010 files**, one
+of them loudly (`emitProgram: binding's inline-shape type has an unsupported field`).
+
+**So the element refinement DOES carry a semantic question after all, and it is not the same one as
+the row identity — it is narrower and uglier**: the refinement compares a banked element name against
+a field TEXT that, for two codes, is not the same kind of string. Converting it means first making
+those two vocabularies agree, which is the "one home for the per-code element extraction" refactor,
+and only then is there an equivalence to measure.
+
+**Three tries, three wrong answers, and the third one is the finding.** The lesson is the same one
+this board keeps recording in different clothes: *an equality test is only as good as the identity it
+compares.* Raw arena indices are not an identity; `repCanonId` is, which is why it had to be built
+first — and even with it, the two sides must be speaking about the same thing before agreement means
+anything.
+
+**The row side is well covered** — 2,423 of 2,454 (98.7%) carry `sFieldElemTyIx` — so the sidecar is
+not the problem. The problem is stated above: the query side must peel the element out of `fldTy`
+with a ladder mirroring the mint's per-code extraction, and for codes 16 and 19 the mint banks a
+different vocabulary from the text the query holds. Population: 1,943 comparisons corpus-wide and
+**0 on the compiler's own source**.
+
+**So the pending list is TWO items after all**, and I put it at one prematurely:
+1. may a struct ROW's identity be its TYPE, collapsing spelling twins? (15 of 8,201 cells, 0 of 2,010 files move — priced, an owner call)
+2. should the map- and union-field element vocabularies be unified with the field text, so the refinement HAS an equivalence to measure? (a refactor first, then a measurement — not yet an owner call)
+
+### THE ELEMENT REFINEMENT IS A CONSTANT FALSE ON FIVE OF NINE CODES (2026-08-19)
+
+Item 2 of the pending list — "unify the map/union element vocabularies with the field text" — was
+mine to do, not the owner's, so I did it. It did not land, and what it turned up is better than the
+change would have been.
+
+**First, the measurement that names the problem.** Per field CODE, how the refinement's element
+comparison actually answers over the corpus:
+
+| code | `en == bi` | `en != bi` | |
+|---|---|---|---|
+| 0 scalar / litunion atom | 249 | 32 | works |
+| 4 litunion array | 57 | 4 | works |
+| **5 ref list** | **0** | **399** | **never matches** |
+| 15 nested struct | 371 | 80 | works |
+| 16 value union | 276 | 20 | works |
+| **19 map** | **0** | **750** | **never matches** |
+| **28 nullable ref list** | **0** | **31** | **never matches** |
+| **29 nullable map** | **0** | **54** | **never matches** |
+| **30 nullable litunion** | **0** | **131** | **never matches** |
+
+**Five codes, 1,365 comparisons, zero matches.** For those the two sides are different KINDS of
+string by construction — a map field banks its VALUE name against a whole `{[K]: V}` text, a ref list
+its ELEMENT name against `X[]` — so the comparison is a constant false and **any shape carrying one
+of those fields never dedups at all.** (This also corrects the previous entry's guess that code 16
+was a vocabulary mismatch: it matches 276 of 296.)
+
+**The fix looked trivial and DRY**: `shapeFieldElemName(text, code)` is already the ONE HOME the mint
+uses to derive the element name, so ask the query's text the same question instead of comparing the
+raw spelling. All five codes came alive — 5 → 109/28, 19 → 192/4, 28 → 8/6, 29 → 10/8, 30 → 30/2.
+
+**And it breaks 5 of 2,010 files**, four with the loud `emitProgram: binding's inline-shape type has
+an unsupported field`. Adding the map KEY half — the dimension `recordSFieldElemRow`'s own header
+names ("an mv slot's identity is the (KEY, VALUE) pair") — **does not fix them**: still 5.
+
+**I said this was "a fact about the table, not a fix" and that the missing dimension was unknowable
+without a design ruling. WRONG AGAIN — one more probe named it, and it is not a hidden identity
+attribute at all.** Dumping every merge the unified comparison would create shows what the merged
+rows ARE:
+
+```
+MERGE row=1 f=by  code=19 rowElem=string qText={[i32]:string}    rowName=Names
+MERGE row=2 f=f   code=19 rowElem=i32    qText={[string]:i32}    rowName=T0
+MERGE row=0 f=xs  code=5  rowElem=K[]    qText=K[][]             rowName=SInline
+```
+
+**Every one is an INLINE annotation matching a DECLARED struct row of the same shape.** That merge is
+correct — it is exactly what the dedup is for. What broke is downstream: the shared row's `sNames`
+entry says `Names`, so a later `structIndexByName("{by:{[i32]:string}}")` found nothing, and the
+binding failed with "inline-shape type has an unsupported field". **The row is shared; the NAME had
+to be too.**
+
+So the missing dimension was the name-keying itself, and the causation runs the OPPOSITE way from
+what I wrote: the dedup is not crippled because a row's identity is unknown — **it is crippled
+BECAUSE the lookup is name-keyed**, and the constant-false was compensating.
+
+**SHIPPED**, in three parts:
+
+1. **The vocabulary is unified** — both sides ask `shapeFieldElemName(text, code)`, the ONE HOME the
+   mint already uses, instead of comparing a banked element name against a raw composite text.
+2. **The map KEY half is compared** — `recordSFieldElemRow`'s own header states it ("an mv slot's
+   identity is the (KEY, VALUE) pair") and `shapeFieldElemName` answers only the VALUE.
+3. **A merged spelling is ALIASED onto the row it matched** (`structNameAlias`), in the name index
+   rather than by a second `sNames` entry, because that column is parallel to the field arrays.
+
+Five previously-dead codes come alive: 5 → 109/28, 19 → 192/4, 28 → 8/6, 29 → 10/8, 30 → 30/2.
+
+**And it retires a loud REJECT.** `closures/error-nullable-elem-closure-field-array-lambda-sig-twin.vl`
+pinned *"a nullable-{…} list element has no rep; use a non-null element type"* for
+`() => ({f: () => string} | null)[]`. That element's shape now dedups onto the row that already
+carries its rep instead of minting a second, un-repped one, so the composition resolves — **and it
+runs, printing `frb`**. Verified by RUNNING it, not by the absence of a diagnostic; the fixture is
+converted from `@emit-error` to `@run` + `@log`, with its header rewritten to say what changed.
+
+Corpus A/B **1 of 2,010** on wasm sha256 and 1 on diagnostics — that same fixture, in the direction
+of MORE programs compiling; suite 2,159/0; `cases_wasm` 1,939/0; fixpoint byte-exact at 1,249,541;
+identity harness 0/0/0.
+
+**Four wrong answers, then the finding.** Raw arena indices are not an identity. `repCanonId` is, but
+both sides must speak the same vocabulary. And when they finally do, what surfaces is not a missing
+attribute — it is the name-keying, standing where a structural identity should be.
+
+### "WHAT IS A STRUCT ROW'S IDENTITY?" — ENUMERATED, AND THE ENUMERATION IS COMPLETE (2026-08-19)
+
+I closed the last round saying a row's identity "is enumerated NOWHERE, so every attempt to replace a
+spelling comparison guesses at a list nobody has made", and called that the blocking design question.
+**The list is derivable — from the comparison that was already making it, one dimension at a time.**
+`annShapeIndexOf`'s own body names all five:
+
+| dimension | where it came from |
+|---|---|
+| field-name sid | the count + name-set conditions |
+| field code | the code condition |
+| element-name sid (`-1` for none) | the element comparison, now speaking one vocabulary |
+| map-KEY bit | `recordSFieldElemRow`: *"an mv slot's identity is the (KEY, VALUE) pair"* |
+| litunion-ATOM bit | the two atom-identity arms that keep `{f: K0}` off a `{f: boolean}` row |
+
+`shapeFieldSetIdOf` now hash-conses exactly that tuple per field, sid-sorted so field ORDER cannot
+change the key, and the interner's bucket is keyed on it. **The identity is a written-down list in
+one function, which is what did not exist.**
+
+**AND IT IS COMPLETE, checked rather than asserted.** The refinement still runs and still decides, so
+the key only narrows candidates — an incomplete enumeration would show up as a candidate the
+refinement rejects. Measured over the corpus: **2,360 bucket candidates accepted, 0 rejected.** Every
+row the identity selects is the row the full comparison would have chosen. The refinement is
+therefore provably redundant on everything available, and it stays anyway — because "checked
+everywhere, asserted nowhere" is what makes the claim worth having.
+
+Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text; suite 2,159/0; `cases_wasm`
+1,939/0; fixpoint byte-exact at 1,251,331.
+
+**What this settles.** The question was never a language or ABI ruling. It was a list that nobody had
+written down, and the reason nobody had is that four of its five dimensions were only expressible as
+string comparisons — so the list could not be stated until the vocabularies agreed and the sids
+existed. It reads as a design question right up to the moment the enumeration is possible, and then
+it is just a function.
+
+**What is still name-shaped, honestly.** `sNames` remains the row's STORED spelling and
+`structIndexByName` remains how callers ask — now indexed, aliased on merge, and no longer the row's
+IDENTITY, which is the change that matters. Callers hold spellings because they read annotations;
+moving them to types is the hand-over programme at 97.6%, and its residue is 26 leaves that are
+declines by design rather than coverage gaps.
+
+### THE ARENA HINT CAUGHT A NAME-GRAMMAR MIS-ORDER — 31% of the descent's leaves were SPURIOUS (2026-08-19)
+
+Chasing the last 25 unhinted leaves, the step-miss witnesses named themselves the moment I printed
+the arena type beside the name:
+
+```
+ELEMMISS nm=()=>(f64|null)[]                    ty=() => (f64 | null)[]
+ELEMMISS nm=()=>((i32|boolean)[]|null)[]        ty=() => ((i32 | boolean)[] | null)[]
+ELEMMISS nm=((i32)=>i32)[]|((string)=>i32)[]    ty=((i32) => i32)[] | ((string) => i32)[]
+```
+
+**The arena is right and the NAME PEEL is wrong.** `nameIsElemArray` only asks whether a name ENDS
+in `[]`, so it claimed a FUNCTYPE whose result is a list — `() => (f64 | null)[]` — and peeled the
+whole name as an array, descending a type the name does not denote. `internShapeDeepTy` ordered its
+grammar array-before-arrow; `internFuncTypeShapes`, its own twin, has always ordered it
+arrow-before-array.
+
+**It had no detector until the hint arrived.** The mis-peel interns extra shapes rather than wrong
+ones, so nothing reddened: not the corpus, not the suites, not the fixpoint. What surfaced it was a
+LOST HINT — the arena declining a step the name had taken.
+
+**Fixed by moving the functype arm above the array arm**, and the effect is larger than the residue
+it was chasing:
+
+| | before | after |
+|---|---|---|
+| leaf resolutions in the descent | 1,097 | **753 (−344, −31%)** |
+| carrying an arena hint | 1,071 (97.6%) | **737 (97.9%)** |
+| dual-run agreement | 1,071 / 0 | **737 / 0** |
+
+**344 of the descent's 1,097 leaf resolutions were spurious** — work done on names the descent had
+mis-parsed. Corpus A/B **0 of 2,010** on wasm sha256, exit code and diagnostic text confirms they
+were no-ops, which is why nothing had ever caught them.
+
+**This is the hand-over paying for itself in a way the programme did not predict.** The arena hint
+was built to remove parses; what it did here was act as a CHECK on the name grammar — two independent
+derivations of the same structure, disagreeing exactly where one of them is wrong. That is the same
+shape as every dual-run in this session, except the subject is the compiler's own name-parsing rather
+than a value.
+
+Residue now **16 leaves of 753**, suite 2,159/0, `cases_wasm` 1,939/0, fixpoint byte-exact at
+1,251,331.
+
+**AND THE ORACLE FOUND A SECOND ONE IMMEDIATELY.** Re-running it on the new residue:
+
+```
+NULMISS nm=(i32)=>string|null   ty=(i32) => string | null
+NULMISS nm=(i32)=>P|null        ty=(i32) => P | null
+```
+
+`nullablePartOf` claimed a name whose top-level ARROW binds the `| null` to its RESULT. That is not
+a subtle case — it is a rule `internFuncTypeShapes`' own header states, **with a fuzz-found
+invalid-wasm consequence attached**: *"the naive peel treated it as a nullable CLOSURE and the
+`f64 | null` result never surfaced"*. The twin had the fix; the descent did not.
+
+So the functype arm moved once more, above the `| null` peel as well as the `[]` one — the order
+`internFuncTypeShapes` has always used. Coverage **737 → 743 of 753 (97.9% → 98.7%)**, dual-run
+**743 / 0**, corpus A/B **0 of 2,010** on all three channels, residue **10 leaves**.
+
+**Two name-grammar mis-orders in one sitting, both found the same way, neither visible to any
+existing channel.** The pattern is now explicit and reusable: **where the arena declines a step the
+name took, the name grammar is wrong.** That is a standing diagnostic, not a one-off — and it is the
+strongest argument this programme has produced for carrying the type alongside the spelling, better
+than any parse count.
+
+### A THIRD MIS-ORDER, SAME ORACLE — and this one moves NO coverage, which is the honest part (2026-08-19)
+
+Pointed at the last 10 leaves, the diagnostic named a third class, and every remaining witness is one
+name shape:
+
+```
+MAPMISS  nm={[string]:()=>i32}|{w:i32}|null   ty={[string]: () => i32} | {w: i32} | null
+ELEMMISS nm=(boolean|string)[]|(i32|f64)[]    ty=(boolean | string)[] | (i32 | f64)[]
+FLDMISS  f=z in {a: boolean, f: () => {…}, z: i32} | {w: i32}
+```
+
+**A name with a TOP-LEVEL `|` reaching the composite arms.** The paren-carrying union branch interned
+its arms and then FELL THROUGH — deliberately, per its comment ("closure unions etc. keep their
+existing path") — into the `[]`, map and inline-shape peels, each of which then claimed the whole
+union as though it were the composite its FIRST arm happens to be. The arena says `TyUnion` and
+declines the step; that is how it surfaced, exactly as the other two did.
+
+The fall-through now returns, as the paren-free branch always did. The path its comment protected
+runs ABOVE this point since the functype arm moved, so nothing depends on it.
+
+**AND IT MOVES NO COVERAGE — still 743 of 753 (98.7%), residue still 10.** The mis-peels were not
+producing hinted leaves; they were producing WORK on names the descent had mis-parsed. So this one is
+a hygiene fix in the same family, not a coverage win, and saying otherwise would be the kind of claim
+this board exists to catch. Corpus A/B **0 of 2,010** on all three channels, suite 2,159/0,
+`cases_wasm` 1,939/0, fixpoint byte-exact at 1,251,334.
+
+**THREE MIS-ORDERS, ONE DIAGNOSTIC, AND THE RESIDUE IS NOW THE POINT.** The last 10 leaves are what
+the descent genuinely cannot type — not mis-parses. The family is closed: `internShapeDeepTy`'s
+grammar now orders arrow → nullable → union → array → map → shape, which is
+`internFuncTypeShapes`' order, and the two twins agree for the first time.
+
+### THE HAND-OVER'S STRUCTURAL CEILING — all 10 residual leaves attributed (2026-08-19)
+
+With the three mis-orders fixed, the residue is 10 of 753 and every one is now attributed to its
+source rather than left as a count:
+
+**CORRECTED — the first cut of this table said "3 are nodes the checker recorded no type for at all",
+and that was a guess I then went and checked.** A probe at the collect root, counting shape-spelled
+`TypeRef` nodes whose `nodeTyIx` is -1, finds **ZERO**. The checker records a type for every one. I
+also guessed the alias-parameter gate might be over-rejecting on FIELD names (a program declaring
+`type Foo<d>` would make the identifier `d` gate any name mentioning it, including the field `d` in
+`{d:i32}`) — dumping the gate's actual firings shows it hits **only** `{a:Sx}` and `{a:K[]}`, where
+`Sx` and `K` are genuine alias parameters. Both guesses wrong; here is what the residue actually is,
+by LOSS POINT:
+
+| loss point | count | witnesses |
+|---|---|---|
+| **no root — a name BUILT by substitution** (`gaeApplyFieldTy`) | **4** | `{x:i32,y:i32}`, `{a:string[]}`, `{a:i64}`, `{a:f64}` |
+| **the generic-alias-PARAMETER gate** | **2** | `{a:Sx}`, `{a:K[]}` — verified genuine |
+| **a value-union arrival** | **1** | `{a:Sx}` — `registerValueUnionName` is a box registration, not a shape intern |
+| **an untagged decline inside the arm / functype paths** | **3** | `{d:i32}` ×2, `{g:f64}`, `{a:i32,b:i32}` — the union-arm coverage flag declining, or a functype interior |
+
+**So the hand-over is at its structural ceiling: 4 impossible by construction, 2 deliberate and
+verified, 4 declines by design.** 98.7% is not a coverage shortfall with 1.3% of work left in it — it
+is the whole population minus the part that cannot exist.
+
+**Where the session's descent numbers ended up**, and the shape of the change matters more than the
+percentage:
+
+| | at session start | now |
+|---|---|---|
+| leaf resolutions in the descent | 1,097 | **753** (344 were spurious mis-parses) |
+| carrying an arena hint | 409 (37.3%) | **743 (98.7%)** |
+| dual-run agreement | 411 / 0 | **743 / 0** |
+| residue | 688, unattributed | **10, every one named** |
+
+The first row is the one worth reading twice: a third of the descent's work was on names it had
+mis-parsed, and no channel in this project could see it until the arena was carried alongside to
+disagree.
+
+### THE TERMINAL ITEM, NAMED: the interner walks types by CUTTING SPELLINGS
+
+Following site 3 past its name-keyed floor reaches the root of the whole programme, and
+`internInlineShapeTy`'s own header states it as a measurement rather than a gap:
+
+> **"THE OTHER FOUR CALLERS ARE NOT HINTABLE AND THAT IS THE MEASUREMENT, NOT AN OMISSION."**
+> 1,046 of the 1,064 `sTyIxOfName` resolutions arrive from `internShapeDeep`'s peeled leaf
+> (873), `internFuncTypeShapes` (116), the nested-field recursion (56) and
+> `internShapeFieldElems` (5) — **each of which composed `nm` by CUTTING a larger spelling, so
+> no caller holds a bank for the cut.**
+
+That is the terminal blocker, and it is architectural rather than per-site. **A cut substring
+was never a node**, so there is no arena index to hand over — the hand-over pattern that
+closed the two slices above cannot reach it by construction.
+
+`internShapeDeep` (102 lines, 12 call sites) is the machine: every branch is a spelling
+grammar — peel a whole-name group, split union atoms, peel `| null`, find an arrow, peel `[]`,
+slice a map's value. Its whole job is to walk a type by cutting its name.
+
+**Two of its three external entry points DO hold a node** (`emit_collect:4045`
+`if tn is TypeRef`, and `:4378` `tyNameOf(fnode.fdType)`), so an arena-fed root is available —
+and that is the shape a fix would take. **But it does not close, for a reason the tree already
+records**: the interners it drives are keyed by NAME (`internInlineShapeTy(nm, tyIx)` takes a
+name; `registerValueUnionName`, `internFuncTypeShapes` likewise), so an arena descent must
+render a name at every leaf, through `tyToEmitName` — and **`canonEmitName` is NOT
+`tyToEmitName ∘ nameToTy`** (`ast.vl:780`, measured three times in the programme doc). A
+re-render moves spellings, and spellings move emitted bytes.
+
+**So destringifying the interner requires destringifying its KEYS first.** The rep tables must
+key on arena identity instead of spelling — the rep-column rewrite. That is the terminal work
+item of this programme, it is multi-slice, and its first step is the **B5/`canonTyIx` owner
+ruling** (arena identity after canon), which is exactly why B5 gates band 1.
+
+> **SUPERSEDED 2026-08-19 ON TWO COUNTS.** (1) B5 does NOT gate band 1 — four hand-over slices
+> shipped without it, and it now owns 27 of the 53 leaves still unhinted. (2) The "spellings move
+> emitted bytes" premise above is **false**: no type, struct or field spelling reaches the output in
+> either emit mode, proven by a probe with a live positive control (see the section above). The
+> rewrite's obligation is to preserve the PARTITION and the ORDER, not the spellings — and the
+> target is a structural key over the wasm layout+encoding lattice, not arena identity, because
+> `annShapeIndexOf` deliberately splits `{f: K0}` from `{f: boolean}` while merging distinct arena
+> types with equal field codes.
+
+**Everything below the interner is now closed or accounted for:**
+
+| population | state |
+|---|---|
+| bare-name leaf resolutions (6,161) | **CLOSED** — the rung |
+| the `synthTypeRef` hand-over | **mechanism shipped**, first site converted |
+| `monoSubstAnn` at `monoSubstLetType` | **REFUTED** — 28 sites, half of them holes |
+| site 3 · `declTyIxOfName` (1,138) | at its **name-keyed floor** |
+| sites 1+2 · the interner (970) | **not hintable by measurement**; needs the rep-column rewrite |
+
+### SITE 1 TRACED TO THE END — it is the INTERNER, and its hint route is already refuted
+
+Site 1's 553 parses are `repElemKeyOfNameTy` reached with no hand-over (`ty < 0`). I tagged
+the three no-hint `rlSlotByName` callers — `emit_collect:1757` (annotated ref-list),
+`emit_sections:3424` (inferred ref-list return) and `wasmEmit:5096` (array literal) — and all
+three measure **0 parses**. So they are not the source, and the guess I would otherwise have
+converted (the array-literal site, whose node carries a recorded type) would have been a
+no-op.
+
+They come through `rlInternName` — **the INTERNER** — which has 7 no-hint call sites across
+`emit_collect` and `emit_classify`. And that route is not open: `rlInternNameTy`'s own header
+states the rule (*the arena leg can front a FIND; it must NOT front a MINT*) and records that
+`repElemKeyOfNameTy`'s construction covers **two shipped hint sites and REFUTES the two
+node-bank ones** — which is B6's measurement, where threading the node bank MIXES VOCABULARIES
+at **215 of 299 on index and 13 of 299 on `repCanonKey`**.
+
+**So the annotResolve half is now traced end to end, and both halves are genuinely blocked —
+for two different, measured reasons:**
+
+| site | parses | why it does not move |
+|---|---|---|
+| 3 · `declTyIxOfName` | 1,138 | at its **name-keyed floor** — two rungs plus an 88.5% memo; the floor is the count of distinct spellings |
+| 1 · `rlInternName` | 553 | the hint must not front a MINT; the node-bank route is **B6-refuted**, and B6's residue is **BLOCKED behind B5** |
+| 2 · `slotCanonKey` | 417 | same interner family |
+| 4 | 0 | not exercised; kept with its measurement |
+
+**RE-MEASURED 2026-08-19 — THIS PARAGRAPH IS SUPERSEDED. The three arena-hand-over slices above
+shipped WITHOUT B5, so it gates nothing; what it now owns is 53 of the 79 leaves still unhinted
+(67.1%), i.e. the difference between 92.8% and ~97.6% coverage. Read the ruling against that
+number, not the one below.**
+
+**THIS PROMOTES B5 FROM A PARKED ROW TO THE THING GATING BAND 1.** `B5`/`canonTyIx` is filed
+**ANSWERED — awaiting owner ruling**: the lockstep `nodeTyIx` write at canon closes 55 of 61
+disagreements losing 0 agreements, suites identical, but **`T.tys.length` moves on 61 of 1,528
+programs** (monotone append, +0.35%, 0 shrink), and the safer variant is a separate `canonTyIx`
+column instead of overwriting `nodeTyIx`. With today's measurements attached, the ruling now
+has a concrete population behind it rather than a principle: **B5 → B6's node-bank residue →
+site 1's 553 + site 2's 417 = 970 of the 2,108 remaining `annotResolve` parses**, which is the
+last tractable destringify population that is not the rep-column rewrite.
+
+### THE MONO HALF'S ROOT, sized: `monoSubstAnn` ALREADY HAS AN ARENA TWIN IN THE TREE
+
+The three remaining `synthTypeRef` sites in `emit_mono` (`:687`, `:739`, `:831`) do not hold
+an index, because the monomorphizer substitutes on the SPELLING:
+`emit_base.monoSubstAnn` splits a union on `|`, decomposes a generic application, splits
+object fields and REBUILDS the type with `+`. That is the thesis's second half — *building*
+strings to represent types — in its purest form.
+
+**It is written twice, in two representations.** `typecheck.substTyDeep` (`:14570`) is the
+same operation on the arena: deep substitution of bindings into a type, rebuilding a
+composite only when a child actually changed so a concrete type keeps its arena identity. It
+has 10+ callers in the checker. The emitter substitutes on the spelling; the checker
+substitutes on the type; neither knows about the other.
+
+**The naive conversion is a trap, and the tree already records why.** Routing
+`monoSubstAnn`'s callers to `substTyDeep` and re-rendering means going through
+`tyToEmitName`, and **`canonEmitName` is NOT `tyToEmitName ∘ nameToTy`** — stated at
+`ast.vl:780` and measured three times in `destringify-types-program.md` (`:16050`, `:24205`,
+`:25210`). A re-render moves spellings, and spellings move emitted bytes.
+
+**The SAFE shape is additive, and the hand-over form above is what makes it available.**
+Keep `monoSubstAnn` producing the name exactly as today — so no spelling moves and no byte
+can — and compute the TYPE with `substTyDeep`, handing it to `synthTypeRefTy`. The parse
+disappears; the spelling is untouched. The equivalence to measure before shipping is then a
+clean one, and it is a dual-run of the kind that has now worked twice today:
+
+> `substTyDeep(nodeTyIxOf(letType), tvN, resolve(tvV))` ≡ `nameToTy(monoSubstAnn(ann, …))`,
+> compared by RENDER, over the corpus.
+
+**MEASURED, AND IT REFUTES THE SLICE — do not take it.** The open fact was what the checker
+recorded for a generic annotation's node. Instrumented at `monoSubstLetType`'s substituting
+branch over the whole corpus:
+
+| what `nodeTyIxOf(letType)` holds | count |
+|---|---|
+| `TyVar` — `substTyDeep`'s first arm handles it | **14** |
+| an inference HOLE — it does not | **14** |
+| negative / concrete | 0 / 0 |
+
+**28 occurrences corpus-wide, split exactly half.** So this site is not worth a conversion at
+any risk: the population is negligible, and half of it would need a hole story
+`substTyDeep` does not have. **My own "root of the mono half" framing above was too strong** —
+`monoSubstLetType` is one of `monoSubstAnn`'s 13 call sites, and the mono half's 1,993 parses
+came overwhelmingly from elsewhere (1,146 of them bare names, already closed by the rung).
+
+What survives the refutation is the OBSERVATION, which is still worth carrying: the same
+substitution is written twice in two representations, and if the mono half is ever converted
+wholesale, `substTyDeep` is the existing arena home to converge on rather than a thing to
+build. Size the target by CALL SITE first — this one cost a probe to learn.
+
+
+
+## A bare `return` in a void function had NO LOWERING — found while implementing the void ruling (2026-08-18)
+
+`function g(c: boolean) { if c { return } print("after") }` — the ordinary guard clause —
+was `vl check`-clean and then `emitProgram: bare return is not supported`. **An early return
+from a void function could not be written in VL at all.** Found by probing underneath the
+void ruling rather than from any filed row.
+
+**It was completely unpinned, and that is why it survived**: the corpus A/B that shipped the
+fix moved **0 verdicts and 0 bytes over 2,005 files**, because not one fixture used the
+construct. A hole with no fixture and no filed row is invisible to every sweep this board
+runs — the same shape as `D15`, one ruling over.
+
+The lowering is the wasm `return` opcode with nothing pushed, and it needed no arity
+reasoning of its own because **the checker is already the gate**: a bare `return` in a
+value-returning function is refused there by NAME of the type it owes (`return needs a
+value of type i32`), so an EMPTY result type is the whole population the emitter arm can
+see. `fRetVoid` is read position-keyed via `fnStmtsPosOf`, the same way `emitFuncBody`'s
+fall-through reads it, rather than re-derived from the annotation; anything that channel
+cannot answer for keeps the old loud reject rather than guessing an arity, since a `return`
+that leaves the stack wrong is invalid wasm and strictly worse than the message it
+replaces.
+
+Both sides are pinned now (`statements/bare-return-void-early-exit.vl` over four shapes —
+guard clause, inside a loop's block structure, a lambda body, and TAIL position where the
+terminator still has to be written — plus `error-bare-return-in-value-fn.vl` for the
+checker's half).
+
+**Still open in this family, and now the void ruling's implementation queue:**
+
+| | shape | column |
+|---|---|---|
+| **D15** | `call<T>` at `T = void` | check-clean **invalid wasm** |
+| (a) | `return <void expr>` in a void function | check reject; the ruling says allow |
+| (b) | `() => i32` into `() => void` (the `done()` wart) | check reject; the ruling says allow |
+
+(a) and D15 share the lowering — this slice built the terminator half of it.
+
+## BAND 1 — `TyPrim.primName` was a comment over a `string`; it is now a declaration (2026-08-18)
+
+The type arena held its primitive vocabulary as a raw `string`, with the closed set written
+out **in a comment above the field**: *"`primName` is one of \"i32\" | \"i64\" | … | \"never\""*.
+That is F2/#1402's template exactly — a closed vocabulary IS a literal union, and every
+comparison becomes an `i32.eq` against an interned atom **with the source text unchanged**.
+
+**Census, in the unit that decides the work.** 176 `.primName` sites over 5 files
+(typecheck 97, emit_rep 48, emit_classify 29, check_query 1, wasmEmit 1); **154 are
+comparisons against a literal**; **9 producers, every one a literal `mkPrim("…")` call** at
+arena init; and — the number that made the absence marker a non-question — **0 sites
+compare the readers to `""`**. So `primNameOf`/`tyPrimNameOf` return `PrimName | null`, the
+idiom the language already commits to, and the empty marker that was never tested for is
+gone. Four consumers spell the name rather than decide on it (two rep-KEY builders, the
+`as`-target spelling canon writes back, one niche render); they route through an exported
+`primNameStr`, which is the only new surface.
+
+**Result: 0 verdict changes and 0 emitted-byte changes across 2,005 corpus files**, full
+suite 2,157/0, fixpoint holds, self-lint + fmt clean.
+
+**PERF: MEASURED NEUTRAL, and that is the finding.** Interleaved min-of-5 against the
+immediately preceding seed:
+
+| workload | before | after |
+|---|---|---|
+| `vl check compiler/` | 4,692 ms | 4,710 ms (**−0.4%**) |
+| self-compile | 1,548 ms | 1,566 ms (**−1.2%**) |
+
+Both inside noise — an earlier run of the same pair read **+1.6%** on the self-compile, in
+the other direction. **Do not quote F2's −9.4% as the expected shape for this class.** F2's
+`tok.kind` is compared once per TOKEN in the lexer and parser; `primName` is compared once
+per TYPE DECISION, which is orders of magnitude rarer, and the site count (154 vs 561) was
+never the axis. A closed-vocabulary conversion is worth what its site FREQUENCY is worth,
+not what its site COUNT is.
+
+**Kept anyway, on the other axis.** It is band 1's thesis executed on the type arena itself,
+and it buys a real property the string could not: **the checker is now a COMPLETE ORACLE for
+the vocabulary** — a mistyped primitive name is a hard type error at all 176 sites instead of
+a silently-false comparison. The comment became a declaration.
+
+## PERF — the shipped seed is UNOPTIMISED, and it is worth 3.3% (2026-08-18)
+
+Fell out of the `O-release-rung-default` ruling: `build/vl-compiler.wasm` is **1,224,039 B** while
+the same module measures 918,258 B at `-O`, so the compiler every `vl` invocation runs through has
+never had `wasm-opt` applied to it. Measured rather than assumed, because the size gap invites a
+much larger claim than the timing supports.
+
+| rung on the SEED | size | self-compile | delta |
+|---|---|---|---|
+| none (shipped) | 1,225,945 B | **1,521 ms** | — |
+| `-O` | 1,004,649 B | **1,471 ms** | **−3.3%** |
+| `-O3` (RELEASE_PASSES) | 1,004,825 B | **1,479 ms** | **−2.8%** |
+
+Interleaved min-of-5, all three seeds alternating within each round, after a warm run each — the
+first uninterleaved pass reported **−9.4%** and that was warm-up drift, not signal. **Behaviour is
+identical and verified, not assumed**: all three seeds self-compile to a BYTE-IDENTICAL module
+(sha256 `38efab35dec8d442`), and `cases_wasm` is 1,937/0 under the `-O3` seed. `-O` beating `-O3` on
+this workload is the `sort-heap` shape again — the compiler is array- and string-heavy.
+
+**Two things worth carrying:**
+
+* **It is not a free pipeline change, and that is why this is filed rather than taken.** Publishing
+  an OPTIMISED seed puts it out of byte-agreement with what `refresh-compiler.sh` produces from
+  source, so the fixpoint gate — which is a BYTE equality, `stage3 == stage4` — would need to be
+  re-stated as behaviour-equality or the optimizer would have to run inside the refresh. The
+  distributed `vl` binary would also shrink by ~220 KB, since the seed is embedded. Owner call, with
+  the numbers now attached.
+* **A CROSS-CHECK ON P9 that the P9 row should carry.** Binaryen's ENTIRE pipeline over the whole
+  compiler is worth 2.8–3.3% on the self-compile. P9 is filed at ~5.6% "at the default rung". Those
+  are different workloads — P9's number is generated-program runtime on the bench suite, not
+  compile time — but a single emitter-side pass claiming nearly twice what all of `wasm-opt` buys
+  on this workload should be re-derived on the self-compile before it is scheduled against the
+  ruling's "overall self-compile time" bar.
+
+## C8's Writable half, shipped: the container-ELEMENT storage class (2026-08-18)
+
+The A9 ruling said the Writable half is a free win — check-clean invalid wasm becoming a loud
+reject, with no working program to protect. Built and measured; it is.
+
+**The filed axis would have been wrong again.** `objShapeAdapterless` walks containers looking for
+an OBJECT pair, so `i32[]` into `(i32 | null)[]` reached its nullable peel and came out as two equal
+`i32`s. The peel is right for a scalar POSITION and wrong under a container, because an array's wasm
+type is fixed by how its element is STORED. So the rule is a storage-CLASS test, and a
+type-identity test — the obvious first cut — rejects working code on its first line:
+
+| widening | verdict | why |
+|---|---|---|
+| `C[]` → `(C | null)[]`, `string[]` → `(string | null)[]`, `i32[][]` → `(i32[] | null)[]` | **RUNS** | a nullable ref is the same wasm reftype |
+| `boolean[]` → `(boolean | null)[]`, `K[]` → `(K | null)[]` | **RUNS** | niche: the sentinel lives in the element's own value space (i32 `2`, atom `-1`) |
+| `i32[]`/`i64[]`/`f64[]` → their `| null` twins | **no lowering** | the destination BOXES the element |
+| `K[]` → `string[]` | **no lowering** | an interned i32 atom for a ref |
+| `i32[]` → `f64[]` | **no lowering** | element width |
+
+`ESC_UNKNOWN` always declines — a hole, a type variable or any unnamed shape is never claimed on a
+guess, which is what keeps `first<T>(ys: T[])` over an `i32[]` working. The nested pair is tried
+FIRST, so `i32[][]` → `(i32 | null)[][]` reports the INNER array pair and names the outer as what it
+was reached through.
+
+**Corpus A/B over 2,005 files: 2 verdict changes, and 1,640 of 1,640 emitted modules
+BYTE-IDENTICAL.** Both movers are `@emit-error` closure fixtures whose own headers describe this
+exact defect — a lambda self-inferring the bare list arm where the annotation's element is the union
+box — so both are emit-reject → CHECK-reject tier moves with the verdict unchanged. Gate green:
+`deno task test` 2,157/0, `cases_wasm` 1,937/0, native fixpoint holds, self-lint + fmt clean, LSP
+bundle rebuilt.
+
+**Method note worth keeping: a seed resolved relative to CWD is a silent no-op.** The first
+post-patch grid run reported the fix doing NOTHING, because `vl` resolves
+`--compiler` → `$VL_COMPILER_WASM` → `./build/vl-compiler.wasm` → EMBEDDED, and the grid ran from a
+scratch directory with no `./build`, so every probe silently used the binary's embedded (master)
+seed. Any measurement run outside the repo root must set `VL_COMPILER_WASM` explicitly, or it is
+measuring master and reporting it as the patched result.
+
+**Left measured and unfixed**, so the boundary is on the record: the OBJECT-element widening class
+(`{v: i32}[]` → `{v: i32 | null}[]`) is still declined, and correctly — it is #1456's documented
+provenance residue, where a PINNED source emits invalid wasm and the identical program with an
+un-annotated literal source RUNS. Rejecting it would reject working code. Also declined by
+construction: a ref-element pair whose two sides are different unions (`C[]` → `(C | D)[]`), which
+this ladder classes as ref-to-ref. Both are misses, not regressions.
+
+## ALL FOUR OWNER RULINGS TAKEN — and two of them moved under measurement (2026-08-18)
+
+The four rows that had been the board's only real blockers are ruled. Recorded in `DECISIONS.md`
+and in `open-rulings.md`'s Ruled section. Two were ruled as briefed; two changed shape when I
+re-derived them on the tip instead of quoting the filing, and those two are the ones worth reading.
+
+| ruling | outcome |
+|---|---|
+| **C3** — the inline budget | **build flag, never a default.** Had been ruled in conversation before and never written down — the exact failure mode `open-rulings.md` exists to catch, which is why it resurfaced as a live blocker. Precedent it matches: **C10** |
+| **O-release-rung-default** | **`-O3` stays.** Closed by PUBLISHING the split, not flipping the rung |
+| **C8** — A8/A9 variance | **inferred, no annotation surface in v1** — and the filing's central worry is refuted |
+| **`return voidCall()`** | **allowed** — and it was not the pure design question the board filed it as |
+
+### The two that moved
+
+**C8's filed framing was stale and the measurement inverts it.** The entry says the ruling "decides
+which programs that type-check TODAY start failing." I constructed that population; it is **empty of
+working programs**. There is no spelling in which a subtype container reaches a supertype parameter
+and the program runs — the struct-width family is a loud reject behind #1456's gate (including the
+read-only body, and including an un-annotated source), and the union-widening family
+(`i32[]` → `(i32|null)[]`, `K[]` → `string[]`) is check-clean invalid wasm in BOTH directions. So A9's
+**Writable** half only moves cells UP a column and harms nothing, while its **Readable** half was
+never blocked on the ruling at all: `peek(xs)` is sound, the checker already says "type-valid … but
+not yet supported by codegen", and the blocker is that the two are different WasmGC array types with
+no conversion. *A ruling entry can go stale the same way a ROADMAP row does — #1456 landed after the
+filing and silently answered half of it.*
+
+**The void question was carrying an unpinned check-clean-invalid-wasm cell.** Filed as "a design
+change request, not a defect". It is both — the surface question is a design change, and underneath
+it sits a live cell with no fixture and no doc mention anywhere:
+
+```vl
+function side() { print("hi") }
+function call<T>(f: () => T): T { return f() }
+call(side)     // vl check rc 0; vl run -> Invalid input WebAssembly code at offset 305:
+               // type mismatch: current function requires result type [i32] but callee returns []
+```
+
+`T = i32` is a clean control. Both the lambda spelling and the named-function spelling fail. **So
+"the defect queue is empty" was wrong by one**, and the miss is instructive: the cell was invisible
+because the row above it was classified as a design preference, so nothing probed underneath it. A
+row filed as "needs a ruling, not a brief" still deserves one probe.
+
+### Two rows this opens
+
+| row | item | measured | status | eff | risk |
+|---|---|---|---|---|---|
+| **D15** | **`T` instantiated at `void` in a generic emits invalid wasm** | `vl check` rc 0, module fails to validate: `requires result type [i32] but callee returns []`. Reproduces on `call(side)` and `call(() => side())`; `T = i32` control is clean. No fixture anywhere in `tests/cases/`, no mention in any design doc | **OPEN — check-clean invalid wasm.** The fix is consequence (c) of the void ruling: the monomorphizer emits an EMPTY result for a void instance. Same lowering the surface change needs, so brief them together | S–M | low |
+| **P9** | **emitter-side inlining — schedule it or drop it, do not park it** | filed as un-schedulable because it is "worth ~5.6% at the default rung and exactly zero at `-O` and above". **That framing assumed the compiler is an optimized artifact and it is not**: `build/vl-compiler.wasm` is **1,224,039 B** against 918,258 B at `-O` / 919,547 B at `-O3` for the same module — the shipped seed has never had `wasm-opt` run on it, so the compiler sits at exactly the rung where P9 is worth 5.6% | **DECIDABLE NOW.** The `O-release-rung-default` ruling sets the bar — internalized optimization is judged on OVERALL self-compile time, not per-function wins — and 5.6% of self-compile is the number. **RE-DERIVE IT FIRST** — the perf round above measures all of `wasm-opt` over the whole compiler at 2.8–3.3% on the self-compile, so a single emitter pass filed at 5.6% is quoting a different workload (generated-program runtime on the bench suite) and has never been measured on this one | M | med |
+
+### What the void ruling also retires
+
+Consequence (b), void-return covariance on function values, closes the **`done()` wart** without any
+separate work: `beforeEach(() => { hits = hits + 1 })` fails today with
+`argument 1: expected () => void, got () => i32`, and `std:test` ships a void no-op `done()` purely
+as the documented workaround (`vl-test-design.md:166`, filed at `ROADMAP.md:746`). Verified still
+live on the tip, along with the bare form `take(() => 7)` — there is no void covariance at all
+today. The assignment-is-an-expression rule that produces the `i32` is untouched.
+
 ## FINAL SURVEY — the defect queue is empty (2026-08-17, master `86703919`)
+
+> **Superseded by one row, 2026-08-18.** This survey was accurate for everything it probed, and it
+> did not probe underneath a row it had classified as a design preference. `D15` (a type parameter
+> instantiated at `void`) is check-clean invalid wasm and was sitting under the `return voidCall()`
+> ruling. See the round above.
 
 Every remaining OPEN row was probed on the tip. **Nothing silent is left.**
 
@@ -800,11 +3111,15 @@ user-facing render leak.
   user is told why. Ranked below silent work throughout this cycle and still are.
 * **Features** (D2, G3, G4). Each is a multi-slice change to the representation or the runtime, and
   **each wants a priority call rather than an agent** — G3 in particular changes what `string` IS.
-* **Four owner rulings**, unchanged and now the actual blockers: **C3** (recommendation: a build flag,
-  not a default flip — always-inline gives ZERO self-compile speedup for +789 KB and +33 s of
-  `wasm-opt`), **C8**, **O-release-rung-default**, and whether `function g() { return voidCall() }`
-  should compile (#1435 took the reject deliberately under a reject-more mandate, so reversing it is a
-  design change, not a defect fix).
+* ~~**Four owner rulings**, unchanged and now the actual blockers~~ — **ALL FOUR RULED 2026-08-18.**
+  Recorded in `DECISIONS.md` and in `open-rulings.md`'s Ruled section; each is summarised in the
+  round below. **C3** → the inline budget is a build flag, never a default (same shape as C10).
+  **O-release-rung-default** → `-O3` stays, and the ask closes by publishing the per-program split
+  rather than flipping the rung; the standing direction is to internalize optimization so it can be
+  applied selectively, gated on OVERALL self-compile time. **C8** → A8/A9 defaults as written in
+  `language-todo.md:15-20`, inferred with no annotation surface in v1, nothing to migrate.
+  **`function g() { return voidCall() }`** → allowed, as one consequence of `void` becoming a real
+  unit type in the lattice. Two of the four moved under measurement — see below.
 
 ## E8 re-derived and briefed — 4 occurrences, 3 shapes (2026-08-17)
 

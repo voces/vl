@@ -10,6 +10,31 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **Structural identity ignores FIELD ORDER — except for flat types** (owner ruling
+  2026-08-19). `{a: i32, b: i32}` and `{b: i32, a: i32}` are the same type, and the
+  emitter's shape dedup keys on a sid-SORTED `(field name, field code, element, map-key
+  bit, atom bit)` multiset so that order cannot change the identity. Until this ruling the
+  property was EMERGENT — it fell out of matching each queried field by name — rather than
+  stated, which is why the sort is now deliberate and commented as the rule it enforces.
+  **The exception is FLAT types, where field order IS the byte layout**, so a permuted twin
+  is a different layout and must not dedup. *(Open: confirm "flat" means the buffer/view
+  family, and pin a fixture proving a flat type does not dedup with a field-permuted twin —
+  nothing enforces the exception today.)*
+
+- **A declared alias and its inline spelling are the SAME TYPE; the DIAGNOSTIC shows the
+  LOCAL spelling** (owner ruling 2026-08-19). `type A = {v: i32}` and a bare `{v: i32}`
+  denote one type, and the compiler may merge their rows freely — this is what licenses the
+  emitter's arena-keyed row lookups, where two structurally identical rows interned under
+  different spellings resolve to whichever comes first. **But a message must render the
+  spelling the user WROTE at that position**, not whichever spelling the merged row happens
+  to carry: being told about `A` when you wrote `{v: i32}` is confusing, and the merge is an
+  implementation fact the reader has no way to know. Owner direction is additionally that a
+  reader should be able to DIVE into a spelling's depth — `A` by default, expanded to
+  `{v: i32}` on demand — rather than the compiler choosing one level for them. *(The
+  local-spelling renderer and the depth affordance are both unbuilt; the merge itself is
+  live.)*
+
+
 - **Fully typed, no `dynamic`.** Types are hidden by aggressive inference, but
   `Unknown`/`Infer` are inference _holes that resolve_ to concrete types — there
   is no gradual/untyped escape hatch. Blueprint: Elixir v1.20 set-theoretic
@@ -117,6 +142,58 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   types like strings), not the binding keyword. Follow-up: the `prefer-const`
   lint (PR #75) must be re-pointed to flag an unmutated `let` (suggest `const`)
   once both land.
+
+- **`void` is a real type in the lattice — a unit type wearing the `void`
+  spelling — and it is NOT `null`.** The keyword stays (no churn, and it reads
+  as every C-family author expects), but the checker treats it as a type with a
+  single value rather than a marker for "no type". Four consequences, ruled
+  together because they are one root: (a) `return <void expr>` is legal in a
+  void function and lowers to `expr; return`; (b) a function value is
+  **covariant in a void return** — `() => i32` is assignable to `() => void`,
+  i.e. a caller may discard a result; (c) a type parameter may instantiate at
+  void, and the monomorphizer emits an empty result for that instance; (d) void
+  stays **non-storable** — no `void[]`, no `void | i32`, no void map value.
+  Chosen because languages that make void a keyword instead of a type (Java,
+  C#, C++) all grow the same hole at generics and then need a `Void`/`Unit`
+  patch, while the ones that made it a real unit type (Rust `()`, Kotlin/Scala
+  `Unit`, Swift `Void`) need no special case anywhere — and VL had already hit
+  the Java hole (`function call<T>(f: () => T): T { return f() }` at `T = void`
+  was `vl check`-clean invalid wasm). Explicitly NOT unified with `null`:
+  `T | null` is the absence idiom in the errors-as-values design, so a void
+  function returning `null` would make `if writeFile(p) == null` look like a
+  failure check that is unconditionally true. (d) is what #1435's `void | i32`
+  join gate was already enforcing; it stays, and its justification becomes
+  "unit has no representation" rather than an ad-hoc refusal. Point (b)
+  retires the `done()` wart — `beforeEach(() => { hits = hits + 1 })` failing
+  with `expected () => void, got () => i32` — without disturbing the
+  assignment-is-an-expression rule below, which is what produces the `i32`.
+  (#1435, ROADMAP `:746`)
+
+
+- **Variance and exactness: inferred, with no annotation surface in v1.**
+  Parameters are Inexact by default and values Exact (A8); `Readable`/
+  `Writable` are applied automatically during parameter inference (A9), with no
+  spelling an author writes. The defaults are the owner's own, from
+  `docs/guide/language-todo.md:15-20`; what is decided here is the **surface**
+  (none) and the **migration** (nothing to migrate). The migration half was
+  settled by measurement rather than preference: the population of programs an
+  A9 tightening could break is empty of *working* programs. Every container
+  subtype→supertype passing shape is already in a failing column — the struct
+  width family (`Cat[]` → `Animal[]`, writing body, read-only body, or an
+  un-annotated source) is a loud reject behind #1456's width gate, and the
+  union-widening family (`i32[]` → `(i32|null)[]`, `K[]` → `string[]`) is
+  `vl check`-clean invalid wasm in BOTH directions. So A9's Writable half only
+  moves cells up a column (check-clean invalid wasm → loud reject) and harms
+  nothing, while its Readable half is blocked on **representation**, not on
+  this ruling: `peek(xs)` reading an `i32[]` as `(i32|null)[]` is sound, the
+  checker already agrees, and the emitter cannot express it (different WasmGC
+  array types, no conversion). An annotation is wanted later, for one reason
+  worth recording so it survives: with inference alone, variance is a property
+  of a function's BODY, so adding a `.push` to a body silently breaks every
+  caller and the error lands at the call site rather than at the change. That
+  is an API-stability argument that only bites once there are cross-module
+  consumers, and the annotation is additive, so it waits. (A8, A9)
+
 
 ## Memory, runtime & object model
 
@@ -464,6 +541,36 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   linear-memory ↔ libbinaryen byte handoff (**H4.5**); the `wasm-opt` subprocess
   sidesteps it (bytes go out a pipe, not across FFI). Target runtime:
   **wasmtime** (stable WasmGC, ≈v27+). (H4.5)
+- **`-O3` stays the named release profile, and the emitter is the long-term
+  route.** A three-rung sweep over all 46 benchmarks
+  (`bench/findings/three-rung-sweep.tsv`) settles the per-program split as the
+  answer rather than leaving it open: at a 5% materiality floor `-O3` beats
+  `-O` on **12 rows** (`lambda-hot` 2.23x, `dispatch-table` 1.43x, `mandelbrot`
+  1.28x) and loses on **4** (`sort-heap` 1.37x, then three at ~1.05x) — it wins
+  materially three times as often as it loses, and its largest win exceeds its
+  largest loss. The nominal 23/23 split is noise. `sort-heap`'s shape is
+  written down as the named exception instead of flipping the rung for it.
+  Costs accepted: ~50% more wall time and ~1.3 KB on the 1.1 MB compiler
+  (19.5 s / 919,547 B vs 13.1 s / 918,258 B). Reversal stays one line
+  (`RELEASE_PASSES`, `scripts/vl-host/src/main.rs:1493`) and the melt/loop
+  goldens already carry all three columns, so a later flip re-labels rather
+  than re-measures. **Direction:** optimization should eventually be
+  internalized so it can be applied selectively — keeping the wins where they
+  are and avoiding the regressions where they are not — but that work is gated
+  on whether it meaningfully improves OVERALL self-compile time; individual
+  function wins do not qualify. (P1.3, `O-release-rung-default`)
+- **The binaryen inline budget is a build flag, never a default.**
+  `--always-inline-max-function-size=60` melts the view descriptor outright
+  (`axpy-view` 1.736 -> 0.636 ns/elem, in a kernel module 113 B smaller), but on
+  the 1.16 MB compiler module it costs **+82% bytes** (955,265 -> 1,740,871) and
+  **+127% `wasm-opt` time** (22 s -> 50 s) for no self-compile speedup at all.
+  `--flexible-inline-max-function-size=60` is the shippable half: 1.45x for
+  +28% compiler size. Same shape and same answer as the names section (C10) —
+  a large fixed tax on every module to buy a win only some modules want, so the
+  consumer passes the flag. Note the hand-written spelling needs no flag and is
+  faster than either (hoist `byteAddrF32(0)` and `.length`, then bare
+  `__load_f32__`/`__store_f32__`: 0.296-0.500 ns at all three rungs), so the
+  flag is a convenience over an existing route, not the only one. (P1.3, C3)
 - **Versioning (when needed): rustup/Volta model, not nvm.** A launcher that
   resolves a committed project pin and auto-installs the right toolchain — not
   manual `use`/shims. Deferred until multiple releases warrant it. (H5)

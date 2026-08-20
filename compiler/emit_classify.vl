@@ -117,8 +117,9 @@ import {
   nominalStructNameOfTy,
   numLitUnionBaseName,
   primTyOfName,
-  recordClonedNodeTy,
+  recordClonedNodeTyKnown,
   recordNodePin,
+  tyFieldTyOf,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsNullableLitUnion,
@@ -435,6 +436,7 @@ import {
 import { emitFail } from "./emit_bytes"
 import {
   fieldElemTyIxOfName,
+  hcShapeSetId,
   mapShapeKeyI32,
   msAtomIdOf,
   mvSlotKeyI32,
@@ -444,13 +446,14 @@ import {
   nodeMapValTyIx,
   recordMvValTyIx,
   recordSFieldElemRow,
+  recordSRowDeclOfName,
   recordSTyIx,
   recordUnMemTys,
-  repCanonKey,
-  repElemKey,
-  repElemKeyOfNameTy,
+  repCanonId,
+  repElemId,
+  repElemIdOfNameTy,
   repKindOfSigTok,
-  repNameCanonKey,
+  repNameCanonId,
   repOfNode,
   repRowOfName,
   repRowOfTyStruct,
@@ -3922,7 +3925,7 @@ export function mvValKindOfName(valName: string): i32 {
 // checker producers spell it that way and this table is queried with what they spell. A
 // non-union / alias-free name passes through unchanged.
 export function mvCanonValName(valName: string) {
-  // RUNAWAY CAP (the `repNameCanonKey` crash family): a value spelling this long is
+  // RUNAWAY CAP (the `repNameCanonId` crash family): a value spelling this long is
   // never a legit mv key — pass it through untouched so the kind classifier's -3
   // unsupported path fails LOUDLY instead of splitting/rendering a runaway name.
   if valName.length > 4096 { return valName }
@@ -5989,7 +5992,7 @@ export function uFieldMapShape(vi: i32, fj: i32): i32 {
 // arena-input entry point to the layer `repElemKey` ALREADY keys: `rlInternName`
 // interns each slot on `repElemKey` and `rlSlotByName` scans the same column, so this
 // is a lookup, not new design. It answers `rlSlotByName`'s first two rungs (the
-// exact-stored-name fast path and the `repElemKeyOfNameTy` rescan, which resolves the
+// exact-stored-name fast path and the `repElemIdOfNameTy` rescan, which resolves the
 // name back to an arena type to compute exactly this key) directly from the type. The
 // THIRD rung — the struct-twin name FALLBACK — has no arena input and is deliberately
 // NOT reproduced here: a caller keeps its name path for the -1 answer, the
@@ -5997,8 +6000,8 @@ export function uFieldMapShape(vi: i32, fj: i32): i32 {
 // place; the fall-through is untouched).
 export function rlSlotOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
-  const key = repElemKey(ty)
-  if key == "" { return -1 }
+  const key = repElemId(ty)
+  if key < 0 { return -1 }
   let i = 0
   while i < rlElemKey.length {
     if rlElemKey[i] == key { return i }
@@ -6660,14 +6663,16 @@ export function mvValUnionHasNull(slot: i32): boolean {
   unionHasAtomTy(mvValName[slot], "null", false)
 }
 
-// The canonical structural key of a map-VALUE slot (destringify D5-final (b)) — the
-// `mvTwin` comparator's input. ARENA first (`repCanonKey` over the recorded index,
+// The canonical structural IDENTITY of a map-VALUE slot (destringify D5-final (b)) —
+// the `mvTwin` comparator's input. ARENA first (`repCanonId` over the recorded index,
 // computed at QUERY time so an in-place arena mutation moves both sides together),
-// the render-and-re-resolve `repNameCanonKey` for an uncovered row.
-export function mvValCanonKey(slot: i32): string {
+// the resolve-by-name `repNameCanonId` for an uncovered row. Step 4 of the rep-column
+// rewrite: both legs were rendered keys and are now ids, so this function — the one
+// place the two vocabularies met — no longer builds a spelling on either path.
+export function mvValCanonId(slot: i32): i32 {
   const ty = mvValTyIxAt(slot)
-  if ty >= 0 { return repCanonKey(ty) }
-  repNameCanonKey(mvValName[slot])
+  if ty >= 0 { return repCanonId(ty) }
+  repNameCanonId(mvValName[slot])
 }
 
 // The struct-table ROW for an ARENA type (destringify D5) — `structIndexByName`'s
@@ -6675,14 +6680,42 @@ export function mvValCanonKey(slot: i32): string {
 // denotes, recorded at the row's mint) instead of the name column. Same
 // first-match-wins order as the name scan. A row the D0 sidecar does not cover is -1
 // there and never matches a real type, so the caller falls through to its name path.
+// ── the struct-row ARENA index ───────────────────────────────────────────────
+// `structIndexOfTy` was a linear scan of the `sTyIx` sidecar, the arena-input twin of
+// `structIndexByName`'s scan. Indexed for the same reason and on the same pattern:
+// incremental over a push-only column (`recordSTyIx` pads with -1 and pushes; nothing
+// rewrites an entry), first match wins, explicit per-program reset because a watermark
+// alone cannot see `collectS`'s `sTyIx = []`.
+//
+// Keyed by ARENA INDEX directly — a dense i32 space, so a plain array beats a map — with
+// -1 entries (the pad-on-push "uncovered" self-heal) skipped.
+let sTyRow: i32[] = []
+let sTyRowLen = 0
+
+export function structTyIxReset() {
+  sTyRow = []
+  sTyRowLen = 0
+  0
+}
+
+function sTyRowSync() {
+  if sTyRowLen > sTyIx.length { structTyIxReset() }
+  while sTyRowLen < sTyIx.length {
+    const ty = sTyIx[sTyRowLen]
+    if ty >= 0 {
+      while sTyRow.length <= ty { sTyRow.push(-1) }
+      if sTyRow[ty] < 0 { sTyRow[ty] = sTyRowLen }
+    }
+    sTyRowLen = sTyRowLen + 1
+  }
+  0
+}
+
 export function structIndexOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
-  let i = 0
-  while i < sTyIx.length {
-    if sTyIx[i] == ty { return i }
-    i = i + 1
-  }
-  -1
+  sTyRowSync()
+  if ty >= sTyRow.length { return -1 }
+  sTyRow[ty]
 }
 
 // The struct-table row a NESTED-STRUCT field (code 15) targets — the chokepoint every
@@ -6763,13 +6796,50 @@ export function variantFieldIsLitUnion(vi: i32, fj: i32) {
 
 // The struct table index whose name is `name`, or -1 if `name` is not a declared
 // struct type.
-export function structIndexByName(name: string) {
-  let i = 0
-  while i < sNames.length {
-    if sNames[i] == name { return i }
-    i = i + 1
+// ── the struct-row NAME index ────────────────────────────────────────────────
+// `structIndexByName` was a LINEAR SCAN of `sNames` with a string compare per row, and
+// it is the hottest name-keyed query in the emitter by an order of magnitude: **258,112
+// calls and 2,394,078 row comparisons on the compiler's own source**, 207,375 calls over
+// the corpus. (For contrast, on the self-compile the shape interner's field SPLIT runs 0
+// times and `annShapeIndexOf` 0 — the compiler's own annotations are all nominal. The
+// scan is the interner's cost there, not the parse.)
+//
+// INCREMENTAL, not rebuilt-on-demand, because `sNames` grows THROUGHOUT collect: a
+// rebuild-on-length-change index would be O(n) per growth and turn the same O(n²) back on.
+// `sNames` is push-only within a program (five push sites, no in-place rename), so the
+// index only ever needs the rows past its watermark.
+//
+// FIRST MATCH WINS, preserving the scan's semantics exactly: a duplicate spelling keeps
+// the earliest row, so the insert is guarded rather than overwriting.
+//
+// THE RESET IS EXPLICIT AND IT HAS TO BE. A watermark alone cannot see the per-program
+// `sNames = []` in `collectS`: program B pushing as many rows as A had leaves
+// `sNameIxLen == sNames.length` with A's spellings still in the map. So `collectS` calls
+// `structNameIxReset()` beside the table reset it belongs to.
+let sNameIx: {[string]: i32} = Map()
+let sNameIxLen = 0
+
+export function structNameIxReset() {
+  sNameIx = Map()
+  sNameIxLen = 0
+  0
+}
+
+function sNameIxSync() {
+  // Defensive, and free: a table that SHRANK without the explicit reset would otherwise
+  // answer from a longer past. Never observed; costs one compare per query.
+  if sNameIxLen > sNames.length { structNameIxReset() }
+  while sNameIxLen < sNames.length {
+    const nm = sNames[sNameIxLen]
+    if (sNameIx[nm] ?? -1) < 0 { sNameIx[nm] = sNameIxLen }
+    sNameIxLen = sNameIxLen + 1
   }
-  -1
+  0
+}
+
+export function structIndexByName(name: string) {
+  sNameIxSync()
+  sNameIx[name] ?? -1
 }
 
 // The number of FULLY-collected struct entries — the scan bound for any matcher that
@@ -7101,7 +7171,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
           if tsi >= 0 { return tsi }
         }
         // The SPACED render can spell a nullable field `i64?` — a spelling the
-        // canon-key resolver (`repNameCanonKey` → `resolveAnnot`) reads as a
+        // canon-key resolver (`repNameCanonId` → `resolveAnnot`) reads as a
         // proven mismatch against the `i64|null`-keyed row, rejecting EVERY
         // candidate. Retry with the CANONICAL render (`tyToEmitName` — the
         // spelling the intern keys use), the scoped consult #979 introduced for
@@ -7298,11 +7368,25 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
       if mun != "" {
         const mAtoms: string[] = []
         unionArmsOf(mun, mAtoms)
+        // ARENA RUNG over the D-UNION seam. The arms here are CUT from a union set
+        // spelling, so no node holds one — but `unionMemberTysOf` appends the row's member
+        // types in exactly `splitUnionAtoms` order, which is the same pairing
+        // `internShapeArms` uses. So the arm's struct row can be asked for by TYPE.
+        //
+        // EXACT, not twin-tolerant: dual-run over the corpus, the arena answers 63 of 76
+        // reaches with **63 agree / 0 disagree** and no arena-only answers. That is the
+        // 0-disagreement standard the rest of this programme ships on — unlike the two
+        // caller conversions before it, whose residues were structural twins.
+        const mTys: i32[] = []
+        let mCov = unionMemberTysOf(mun, mTys)
+        if mTys.length != mAtoms.length { mCov = false }
         let mi = 0
         while mi < mAtoms.length {
           const ma = mAtoms[mi]
           if ma != "null" {
-            const msi = structIndexByName(ma)
+            let msi = -1
+            if mCov { msi = structIndexOfTy(mTys[mi]) }
+            if msi < 0 { msi = structIndexByName(ma) }
             if msi >= 0 {
               const mfi = sFieldIndex(msi, m.memProp)
               if mfi >= 0 {
@@ -10770,15 +10854,15 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
 
 // True unless the two nested-struct TYPE spellings `ta` / `elem` are PROVEN to denote
 // distinct structures: both resolve through the checker's canonical structural key
-// (`repNameCanonKey`, the variant/map slot-layer vocabulary) and the keys differ.
-// Either side unresolvable ("" key) stays lenient — never a false reject of a twin
+// (`repNameCanonId`, the variant/map slot-layer vocabulary) and the keys differ.
+// Either side unresolvable (-1 key) stays lenient — never a false reject of a twin
 // the canon layer does not cover.
 function nestedStructNamesCompat(ta: string, elem: string): boolean {
   if ta == elem { return true }
-  const ka = repNameCanonKey(ta)
-  if ka == "" { return true }
-  const ke = repNameCanonKey(elem)
-  if ke == "" { return true }
+  const ka = repNameCanonId(ta)
+  if ka < 0 { return true }
+  const ke = repNameCanonId(elem)
+  if ke < 0 { return true }
   ka == ke
 }
 
@@ -11466,10 +11550,16 @@ export function retRefArrElemName(tyIx: i32) {
 // miss but a duplicate: `nameToTy` does not hash-cons, so re-parsing a composite spelling
 // MINTS a structurally identical arena row and hands back its index instead.
 export function synthTypeRef(name: string, pos: i32) {
+  synthTypeRefTy(name, pos, -1)
+}
+
+// `synthTypeRef` with the type HANDED OVER instead of parsed back out of `name`. See
+// `recordClonedNodeTyKnown`. `tyIx` of -1 is exactly `synthTypeRef`.
+export function synthTypeRefTy(name: string, pos: i32, tyIx: i32) {
   const n = mkTypeRef(name, pos)
   const pin = pinKindOfName(name)
   recordNodePin(n, pin, synthPinPayloadOf(name, pin))
-  recordClonedNodeTy(n, name, pin)
+  recordClonedNodeTyKnown(n, name, pin, tyIx)
   n
 }
 
@@ -12419,6 +12509,24 @@ function shapeElemDeclaredStructIdx(base: string) {
   let si = repRowOfName(base, sScanLim())
   if si < 0 { si = structIndexOfTypeName(base) }
   if si < 0 { return -1 }
+  // NOT `sRowDecl`, AND THE ATTEMPT IS RECORDED BECAUSE THE MEASUREMENT LOOKED CLEAN.
+  // `sRowDecl` banks `cUserTypes.has(nm)` at the mint, and `cUserTypes` holds UNION
+  // declarations too (`typecheck.vl` `cUserTypes[sd0.udName] = uIx0`), while
+  // `nameIsStructDecl` answers true only for a name with a `TypeDecl` NODE. A
+  // struct-alias union — the canonicalized `type S = {a:i32} & {b:i32}`, interned here by
+  // `internShapeAs(s.udName, …)` — is therefore a row whose name IS in `cUserTypes` and is
+  // NOT a `TypeDecl`, so the column opens this gate where the scan closed it.
+  //
+  // Measured on the swap: `type S = {a:i32} & {b:i32}` beside an inline `{a:i32,b:i32}[]`
+  // goes from master's loud `only i32[] arrays and struct/union element arrays are
+  // supported` to accepted — the exact loud-reject conversion the note above forbids. The
+  // dual-run that licensed the swap read 1,029 agree / 0 disagree, and was simply blind:
+  // no corpus file pairs a struct-alias union with an inline spelling of its shape.
+  //
+  // The two predicates cannot share one column, and that is the point rather than an
+  // inconvenience: `repSlotCacheSync` wants "is this row's name a declared TYPE" (unions
+  // included — measured 602/0 there) and this gate wants "is it a declared STRUCT". One
+  // fact each, and `sRowDecl` is the first.
   if nameIsStructDecl(sNames[si]) { return si }
   -1
 }
@@ -12996,6 +13104,52 @@ export function checkArrName(name: string) {
 // wrongly reject, so any name that call would ACCEPT must stay with it (it is the arm that
 // forces the list's heap types). Earlier arms already claimed the `string[]` / ref-array /
 // `f64[]` / `i64[]` / `f32[]` spellings, so those need no mention here.
+// True when `base` IS a declared type PARAMETER name. The membership test `genTyParamArr`
+// has always carried, lifted out so the SHAPE-field classifier can ask the same question
+// of a field's element — the asymmetry that predicate's own header names (#1218: "one
+// classifier taught half of a set its sibling already had whole") reproduced one layer
+// down, where the ARRAY annotation classifier knew type parameters and the SHAPE FIELD
+// one did not.
+//
+// The FuncDecl HALF ALONE, and asking for exactly that half is the point rather than an
+// oversight: `shapeFieldsRideTyParam` must NOT see generic-ALIAS parameters, because
+// `collectGenAliasShapes` already interns each application's substituted shape and routing
+// the alias half through the skip reddens
+// `generics/type-param-shadows-alias-through-constructors.vl`. Do not collapse this into
+// `genTyParamLeaf` below — that is the both-halves question, and it has a different caller.
+export function fnTyParamName(base: string) {
+  let i = 0
+  while i < genTyParamNames.length {
+    if genTyParamNames[i] == base { return true }
+    i = i + 1
+  }
+  false
+}
+
+// BOTH declaration kinds, exactly as `genTyParamArr` documents them: a FuncDecl's names
+// (`genTyParamNames`, gathered by the `collectTyParams` pass) and a generic type ALIAS's
+// (`gaeParams`, split back out by `gaeCollectDecls`). `genTyParamArr` is its one caller.
+export function genTyParamLeaf(base: string) {
+  if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
+  if fnTyParamName(base) { return true }
+  // The generic-ALIAS half. `gaeParams` stores the RAW parameter text per declaration
+  // ("T", "A,B"), so the split is `gaeSplitArgs` — the same cut `gaeEnsure` makes on the
+  // same column, not a second grammar. A program with no generic alias has an empty
+  // registry and this loop never runs.
+  let gi = 0
+  while gi < gaeBases.length {
+    const pnames: string[] = []
+    gaeSplitArgs(gaeParams[gi], pnames)
+    let pj = 0
+    while pj < pnames.length {
+      if pnames[pj] == base { return true }
+      pj = pj + 1
+    }
+    gi = gi + 1
+  }
+  false
+}
+
 export function genTyParamArr(name: string) {
   if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   // The array-name grammar at its two homes. The TEST stays in front of the CUT exactly as
@@ -13016,28 +13170,7 @@ export function genTyParamArr(name: string) {
   // documented one-level `[]` scope for the FuncDecl). What it removes is this arm
   // ANSWERING WRONG about a name that is plainly a type-parameter array. Every name the
   // peel newly claims was a hard emit error before it, so no working program moves.
-  const base = arrLeafNameOf(name)
-  let i = 0
-  while i < genTyParamNames.length {
-    if genTyParamNames[i] == base { return true }
-    i = i + 1
-  }
-  // The generic-ALIAS half. `gaeParams` stores the RAW parameter text per declaration
-  // ("T", "A,B"), so the split is `gaeSplitArgs` — the same cut `gaeEnsure` makes on the
-  // same column, not a second grammar. A program with no generic alias has an empty
-  // registry and this loop never runs.
-  let gi = 0
-  while gi < gaeBases.length {
-    const pnames: string[] = []
-    gaeSplitArgs(gaeParams[gi], pnames)
-    let pj = 0
-    while pj < pnames.length {
-      if pnames[pj] == base { return true }
-      pj = pj + 1
-    }
-    gi = gi + 1
-  }
-  false
+  genTyParamLeaf(arrLeafNameOf(name))
 }
 
 // The registered UNION the checker typed this array literal's ELEMENT as, or "" —
@@ -13537,7 +13670,7 @@ export function rlInternName(name: string, kind: i32) {
 // arena leg can front a FIND; it must NOT front a MINT* — is about a rung that RETURNS
 // where the mint would have run; this is not one. What it does require instead is that
 // the hint compute the SAME key: a hint that disagrees re-keys the row, which is the
-// same silent-wrong-slot failure by another route. `repElemKeyOfNameTy`'s header states
+// same silent-wrong-slot failure by another route. `repElemIdOfNameTy`'s header states
 // the construction that makes the two shipped hint sites equal, and the two node-bank
 // sites it refutes.
 export function rlInternNameTy(name: string, kind: i32, ty: i32) {
@@ -13556,7 +13689,7 @@ export function rlInternNameTy(name: string, kind: i32, ty: i32) {
   // that the NAME preserves the alias — the two layers are deliberately separate here.
   // Declared struct twins stay apart (`repElemKey` keys a struct nominally). The stored
   // name is the canonical spelling for downstream name-consumers (`rlElemStoredName`).
-  const key = repElemKeyOfNameTy(name, ty)
+  const key = repElemIdOfNameTy(name, ty)
   let i = 0
   while i < rlElemName.length {
     if rlElemKey[i] == key { return i }
@@ -13643,7 +13776,7 @@ function rlSlotOfArrNameTy(arrName: string, elemTy: i32): i32 {
 // dual.
 //
 // RUNG 2 IS THE SAME KEY EITHER WAY, AND FOR A HINTED CALLER IT IS PROVABLY A REPEAT.
-// The rung computes `repElemKey` of what `name` resolves to; `repElemKeyOfNameTy` reads
+// The rung computes `repElemKey` of what `name` resolves to; `repElemIdOfNameTy` reads
 // the hint instead of re-resolving. `sFieldRefSlot`, the only hinted caller, has ALREADY
 // run `rlSlotOfTy(ty)` — `repElemKey(ty)` against this very column — and reached here
 // because it declined, so the hinted rung 2 can only decline again. It is kept rather
@@ -13677,7 +13810,7 @@ function rlSlotByNameTyK(name: string, ty: i32, keyTy: i32): i32 {
     if rlElemName[i] == name { return i }
     i = i + 1
   }
-  const key = repElemKeyOfNameTy(name, keyTy)
+  const key = repElemIdOfNameTy(name, keyTy)
   let ci = 0
   while ci < rlElemName.length {
     if rlElemKey[ci] == key { return ci }
@@ -13829,7 +13962,7 @@ export function rlSlotOfTyTwin(ty: i32): i32 {
 // TIMING-INDEPENDENT (no heap index is consulted, so it is queryable before
 // `mAssignTypeIndices` assigns anything): the struct template's two-layer
 // discipline, with the structural key resolved through the checker
-// (`repNameCanonKey`) and the layout guard delegated per value KIND to the
+// (`repNameCanonId`) and the layout guard delegated per value KIND to the
 // layer that owns the rep.
 
 // True when ref-list slots `a` and `b` resolve the SAME element heap type — the
@@ -13910,9 +14043,9 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   if mvSlotKeyI32(a) != mvSlotKeyI32(b) { return 0 }
   const k = mvValKind[a]
   if k != mvValKind[b] { return 0 }
-  const ka = mvValCanonKey(a)
-  if ka == "" { return 0 }
-  if ka != mvValCanonKey(b) { return 0 }
+  const ka = mvValCanonId(a)
+  if ka < 0 { return 0 }
+  if ka != mvValCanonId(b) { return 0 }
   if k == 3 || k == 10 || k == 11 || k == 13 { return 1 }
   if k == 2 || k == 14 { return 1 }
   if k == 1 { return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b]) }
@@ -14155,6 +14288,48 @@ export function anonFieldElemKeyI32(valIx: i32, code: i32) {
 // (`x:i32` → 0, `name:string` → 3, `tags:i32[]` → 4, …) — the SPELLING entry point
 // into the shared field-code table (`fieldCodeOfSpelling`); `fieldTypeCode` is the
 // AST-node one.
+// ── the field-CODE classifier's ARENA rung ───────────────────────────────────
+// The ladder below opens with six STRING EQUALITY tests against the primitive keywords,
+// and a caller that holds the field's RECORDED type already knows the answer: since the
+// arena went string-free, `TyPrim.primName` is a `PrimName` litunion and the test is an
+// `i32.eq`. The litunion and litunion-array arms are structural queries for the same
+// reason. So this is the same hand-over the interner's descent takes, one layer down —
+// the producer passes the type instead of the consumer re-deriving it from a spelling.
+//
+// CONFIRM-ONLY, and the decline is the point: it answers only where the arena decides the
+// code EXACTLY, and returns -2 to the name ladder everywhere else. Composites, closures,
+// maps, the nullable niches and the whole union family keep their spelling path unchanged,
+// because their codes turn on emitter interning state the arena does not carry.
+//
+// MEASURED, not argued: **2,669 of 4,510 corpus field classifications (59.2%) covered, 0
+// disagreements** against the name ladder, with a sabotage (the f64 and i64 codes swapped)
+// reddening **805** — so the comparator is live and the agreement is not vacuous.
+function fieldCodeOfTy(ty: i32): i32 {
+  if ty < 0 { return -2 }
+  if tyIsLitUnion(ty) { return 0 }
+  if tyIsLitUnionArray(ty) { return 4 }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const p = t.primName
+    if p == "i32" { return 0 }
+    if p == "boolean" { return 0 }
+    if p == "f64" { return 17 }
+    if p == "i64" { return 23 }
+    if p == "f32" { return 24 }
+    if p == "string" { return 3 }
+    return -2
+  }
+  -2
+}
+
+// `nameFieldCode` with the caller's recorded arena type for the field — arena rung first,
+// the spelling ladder unchanged behind it.
+export function nameFieldCodeTy(t: string, ty: i32): i32 {
+  const a = fieldCodeOfTy(ty)
+  if a != -2 { return a }
+  nameFieldCode(t)
+}
+
 export function nameFieldCode(t: string) {
   // A NULLABLE function field text (`((i32) => i32) | null`) is the nullable closure
   // fat-pointer, code 22 — the text reading of `fieldTypeCode`'s `nulCloFlag` arm.
@@ -14205,12 +14380,34 @@ export function nameFieldCode(t: string) {
 //
 // The move this site actually wants is a `nameIsBraceOpen` home beside its four siblings in
 // `emit_base.vl`, which is not this slice's file. A SOURCES problem, not a site problem.
-function internShapeArms(arms: string[]) {
+function internShapeArms(set: string, arms: string[]) {
+  // ARENA HAND-OVER (D-INLINESHAPETY). `arms` is `splitUnionAtoms(set)`, and
+  // `unionMemberTysOf` appends the row's member types in exactly that order — its own
+  // header states the correspondence, and it holds here BY CONSTRUCTION rather than by
+  // convention: a multi-arm `set` reaches `unionRowOf` through the `unMemberSet[v] ==
+  // name` leg, i.e. the row whose recorded set spelling IS this string, so the two
+  // splits are the same split. The length equality is `unionSetArmTys`' second
+  // conjunct, asked here over the atoms the caller already split rather than re-splitting
+  // them. An uncovered row (unregistered union, or a member spelling that did not
+  // resolve) leaves every arm at -1 — the unhinted call unchanged.
+  //
+  // THIS IS THE LARGEST REMAINING SOURCE OF UNHINTED LEAVES and it took two probes to
+  // see: the drop-point census scored "union arms" at 1 of 571, because `internShapeArms`
+  // reached the descent through the -1 WRAPPER, which re-attributed every one of its
+  // leaves to "no root". Tagging the five wrapper CALL SITES put 357 of those 404 back
+  // here — 358 of 571 (62.7%) once its own single direct loss is added. Ranking by the
+  // drop point rather than by the SITE inverted the order, exactly as the board's
+  // standing rule warns.
+  const armTys: i32[] = []
+  let cov = unionMemberTysOf(set, armTys)
+  if armTys.length != arms.length { cov = false }
   let uai = 0
   while uai < arms.length {
+    let armTy = -1
+    if cov { armTy = armTys[uai] }
     const uCore = arrLeafNameOf(arms[uai])
     if uCore.length >= 1 && uCore[0] == '{' {
-      internShapeDeep(arms[uai])
+      internShapeDeepTy(arms[uai], armTy)
     } else if annArrowAt(normTypeAtom(uCore)) >= 0 {
       // A CLOSURE arm (`((i32) => {a: f64, f: K0, z: string}[]) | f64`): the inline
       // shapes buried in its params/result are otherwise unreachable — the arm is ONE
@@ -14218,7 +14415,7 @@ function internShapeArms(arms: string[]) {
       // no interned struct ("field access but no struct type declared"). Route through
       // the soundness-gated functype interner (`funcTypeShapeLowerable` keeps an
       // unsupported-field shape un-interned — a clean reject, never invalid wasm).
-      internFuncTypeShapes(arms[uai])
+      internFuncTypeShapesTy(arms[uai], armTy)
     }
     uai = uai + 1
   }
@@ -14230,14 +14427,82 @@ function internShapeArms(arms: string[]) {
 // bottom (`internInlineShape` then recurses into the shape's own fields). Reaches a shape however deeply it
 // is nested under arrays / nullables / groupings: `({g:i32}[] | null)[]` -> `{g:i32}`, `{f:i32}[][]` ->
 // `{f:i32}`. A non-shape leaf (`i32`, a named type, a map) interns as a no-op.
-export function internShapeDeep(nm: string) {
+function tyStepNullable(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
+}
+
+function tyStepElem(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
+function tyStepMapVal(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyMap { return t.mVal }
+  -1
+}
+
+// The `TyFunc` arms of the same family. `annFnDecompose` hands back the param TEXTS and
+// the result TEXT; these hand back the matching arena entries, declining unless the arena
+// really is a function of exactly that arity — the pairing is positional, so an arity
+// mismatch is not a near miss to be tolerated, it is a different function.
+function tyStepParam(ty: i32, i: i32, n: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc {
+    if t.fnParamTypes.length != n { return -1 }
+    return t.fnParamTypes[i]
+  }
+  -1
+}
+
+function tyStepRet(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// Peel the arena twin of a trailing-`[]` RUN, sized by how much the name shortened —
+// `arrLeafNameOf` shortens by exactly two characters per layer, so the layer count is the
+// length delta halved. An odd delta, or a layer the arena does not have, declines.
+function tyStepArrRun(ty: i32, full: string, leaf: string): i32 {
+  if ty < 0 { return -1 }
+  let t = ty
+  let n = full.length - leaf.length
+  while n >= 2 {
+    t = tyStepElem(t)
+    if t < 0 { return -1 }
+    n = n - 2
+  }
+  if n != 0 { return -1 }
+  t
+}
+
+// `tyStepNullable`, but only when the name actually lost its `| null` — a non-nullable
+// spelling keeps its own type rather than declining.
+function tyStepNulIf(ty: i32, full: string, base: string): i32 {
+  if ty < 0 { return -1 }
+  if base.length == full.length { return ty }
+  tyStepNullable(ty)
+}
+
+export function internShapeDeep(nm: string) { internShapeDeepTy(nm, -1) }
+
+export function internShapeDeepTy(nm: string, ty: i32) {
   if nm.length < 2 { return 0 }
   // Peel ONLY a grouping pair that wraps the WHOLE name. A functype whose leading `(` is its
   // own PARAM LIST (`(i32)=>(()=>{a:i64,f:i32,z:f64})`) must NOT be blind-peeled — the garbled
   // remainder (`i32)=>…`) dead-ends every case below, so the shapes buried in its RESULT spine
   // never intern (and a chained value call's struct read then finds no interned shape).
   const uw = normTypeAtom(nm)
-  if uw.length != nm.length { return internShapeDeep(uw) }
+  if uw.length != nm.length { return internShapeDeepTy(uw, ty) }
   // A VALUE UNION leaf (`i32 | null`, `string | i32`) — register its box reps. Do NOT peel its `| null`:
   // here the null is a union ATOM (a tag in a non-null box), NOT a nullable-niche wrapper. Checked AFTER
   // the parens peel (so `(i32|null)` reaches here) but BEFORE the `| null` peel (which would lose the atom).
@@ -14252,17 +14517,44 @@ export function internShapeDeep(nm: string) {
     if strContains(nm, "=>") {
       const vArms: string[] = []
       splitUnionAtoms(nm, vArms)
+      // Paired with the row's arena members by the same D-UNION seam the composite-arm
+      // branch uses — see `internShapeArms` for why the two splits are the same split.
+      const vTys: i32[] = []
+      let vCov = unionMemberTysOf(nm, vTys)
+      if vTys.length != vArms.length { vCov = false }
       let va = 0
       while va < vArms.length {
         const vc = normTypeAtom(vArms[va])
-        if annArrowAt(vc) >= 0 { internFuncTypeShapes(vc) }
+        if annArrowAt(vc) >= 0 {
+          let vTy = -1
+          if vCov { vTy = vTys[va] }
+          internFuncTypeShapesTy(vc, vTy)
+        }
         va = va + 1
       }
     }
     return 0
   }
+  // THE ARROW BEFORE THE `| null` AND THE `[]`, AND THE ARENA CAUGHT BOTH. This arm used
+  // to sit at the BOTTOM of the grammar, so two peels above it claimed functype names
+  // first:
+  //   · `nameIsElemArray` asks only whether the name ENDS in `[]`, so it claimed
+  //     `() => (f64 | null)[]` and peeled the whole name as an array;
+  //   · `nullablePartOf` claimed `(i32) => string | null`, where a TOP-LEVEL arrow binds
+  //     the `| null` to its RESULT — the rule `internFuncTypeShapes`' own header states,
+  //     with a fuzz-found invalid-wasm consequence attached ("the naive peel treated it as
+  //     a nullable CLOSURE and the `f64 | null` result never surfaced").
+  // Both descended a type the name does not denote, and neither had a detector: the
+  // mis-peel interns EXTRA shapes rather than wrong ones, so no corpus, suite or fixpoint
+  // channel could see it. What surfaced them was a LOST HINT — the arena declining a step
+  // the name had taken. `internFuncTypeShapes` has always ordered its grammar this way;
+  // this is its twin catching up. A genuinely nullable closure (`(()=>i32)|null`) nests
+  // its arrow in parens, so the depth-aware `annArrowAt` leaves it to the peel below.
+  if annArrowAt(nm) >= 1 && nameIsParenOpen(nm) {
+    return internFuncTypeShapesTy(nm, ty)
+  }
   const np = nullablePartOf(nm)
-  if np != "" { return internShapeDeep(np) }
+  if np != "" { return internShapeDeepTy(np, tyStepNullable(ty)) }
   // A MIXED / composite UNION (`{f:i64}[] | f64`, `{[string]: K}[] | string`, `{f:i64}[] | {w:i32}`):
   // the all-scalar case was handled by the `isValueUnionName` branch above, so a top-level `|` here
   // means at least one arm is a COMPOSITE. Intern an arm whose CORE (trailing `[]`s peeled) is an
@@ -14273,11 +14565,12 @@ export function internShapeDeep(nm: string) {
   // fall-through to scalar-boxing, invalid wasm). BOTH branches split with the ONE home
   // `splitUnionAtoms` — it tracks parens, brackets, braces AND `<>` (the D-REFARRKIND-era
   // "paren-blind" reading of it is stale; its own header now spells the paren rule out). The
-  // PAREN-FREE branch RETURNS after interning — the descent below is for non-union names — while
-  // a PAREN-CARRYING name (`{f: (boolean | string)[]} | f64`, a struct arm whose FIELD groups a
-  // union element) interns its `{`-cored arms and then FALLS THROUGH to the paren descent
-  // (closure unions etc. keep their existing path). That control-flow difference is the whole
-  // difference; the SPLIT is the same query. Before parens were understood, a grouped arm
+  // BOTH branches RETURN after interning — the descent below is for non-union names. The
+  // paren-carrying one used to FALL THROUGH ("closure unions etc. keep their existing path"),
+  // and the arm below records why that stopped: a name with a top-level `|` is not an array, a
+  // map or an inline shape, so every peel it fell into claimed the union as the composite its
+  // FIRST arm happens to be. The SPLIT is the same query on both branches, and there is no
+  // longer a control-flow difference between them. Before parens were understood, a grouped arm
   // mis-split here and its `{`-cored arm interned only LAZILY at emit, AFTER `collectA`'s
   // type-index assignment, so the arm's ref-list FIELD element (`boolean|string`) had no interned
   // slot and `pushFieldStorage` read `rlWrapIdx` out of bounds — a compiler CRASH (empty table)
@@ -14286,15 +14579,32 @@ export function internShapeDeep(nm: string) {
     const uArms: string[] = []
     splitUnionAtoms(nm, uArms)
     if uArms.length > 1 {
-      internShapeArms(uArms)
+      internShapeArms(nm, uArms)
       return 0
     }
   } else {
     const pArms: string[] = []
     splitUnionAtoms(nm, pArms)
-    if pArms.length > 1 { internShapeArms(pArms) }
+    if pArms.length > 1 {
+      internShapeArms(nm, pArms)
+      // AND RETURN, exactly as the paren-free branch does. The fall-through used to be
+      // deliberate — "closure unions etc. keep their existing path" — but the arms below
+      // it are `[]`, map and inline-shape peels, and a name with a TOP-LEVEL `|` is none
+      // of those: `{[string]:()=>i32}|{w:i32}|null` was claimed by `nameIsMap`, and
+      // `(boolean|string)[]|(i32|f64)[]` by `nameIsElemArray`, each peeling a union as
+      // though it were the composite its FIRST arm happens to be. The arms were already
+      // interned one line up, so the descent below has nothing left to reach. The
+      // closure-union path the comment protected now runs ABOVE this point (the functype
+      // arm moved there), so nothing depends on the fall-through any more.
+      //
+      // Found the same way as the other two mis-orders in this family: the arena declines
+      // the step (`tyStepMapVal` / `tyStepElem` on a `TyUnion`) and the hint is lost.
+      return 0
+    }
   }
-  if nameIsElemArray(nm) { return internShapeDeep(arrElemNameRaw(nm)) }
+  if nameIsElemArray(nm) {
+    return internShapeDeepTy(arrElemNameRaw(nm), tyStepElem(ty))
+  }
   // A MAP name (`{[string]: V}`): the inline shapes buried in the VALUE position are
   // otherwise unreachable — the whole map is ONE TypeRef name, so a struct-valued map
   // (`{[string]: {f:f32}}`), a nested-map value (`{[string]: {[string]: i64}}`), a
@@ -14304,32 +14614,11 @@ export function internShapeDeep(nm: string) {
   // `mvShapeOfValName`) then finds the struct via `structIndexByValName` (position-
   // INDEPENDENT map-value resolution, the #837 template). A NAMED-alias value already
   // interned via its own TypeRef; this is the inline dual, idempotent for either.
-  if nameIsMap(nm) { return internShapeDeep(mapValNameOf(nm)) }
-  // A FUNCTION-TYPE name (`(p1,p2)=>ret`): the inline shapes buried in a PARAM or
-  // the RESULT position are otherwise unreachable — the whole functype is ONE
-  // TypeRef name, so a composite closure result (`(i32)=>{f:i32}`, `()=>{a:i32,b:i32}`,
-  // `(i32)=>{f:{g:i32}}`) or a composite param hides its shape from
-  // `internInlineShape`. A lambda's inferred return literal (`{f:x}` with a param
-  // field value `anonFieldCode` codes -1) then has no interned shape to name-set
-  // match, and the closure functype result fails loudly ("ref valtype with no
-  // interned shape"). `internFuncTypeShapes` interns each PLAINLY-LOWERABLE shape
-  // reached — see the soundness note there.
-  // (`emit_base.nameIsParenOpen` — the OPEN half only. There is no close test here: the
-  // group closes before the `=>`, not at the last character, and `annArrowAt(nm) >= 1`
-  // both supplies the home's length bound and stands in for it.)
-  if annArrowAt(nm) >= 1 && nameIsParenOpen(nm) {
-    return internFuncTypeShapes(nm)
+  if nameIsMap(nm) {
+    return internShapeDeepTy(mapValNameOf(nm), tyStepMapVal(ty))
   }
-  // A GENERIC-APPLICATION leaf (`Pair<i32,string>`): `collectGenAliasShapes` interns an
-  // application only where a TypeRef spells it BARE (behind `| null` / `[]`), so one
-  // buried INSIDE another annotation's field text — the list element of
-  // `{v: Pair<i32,string>[]}` — reached no interner at all, and the code-5 field's
-  // element lookup then failed loudly ("ref-list field element type is not interned").
-  // This is the shape-descent dual of the map-VALUE `gaeEnsure` `collectGenAliasShapes`
-  // already does for the same reason. `gaeEnsure` no-ops on anything that is not a
-  // registered base's application, and is idempotent (`structIndexByName` guard).
   gaeEnsure(nm)
-  internInlineShape(nm) // no-op for any non-shape leaf
+  internInlineShapeTy(nm, ty) // no-op for any non-shape leaf
   0
 }
 
@@ -14559,7 +14848,18 @@ export function variantNestedShapeOk(nm: string): boolean {
 // (never invalid wasm). Idempotent (`annShapeIndexOf`); registers no value union
 // and interns no map, so a functype over unsupported reps is byte-identical to the
 // pre-slice behavior.
-function internFuncTypeShapes(nm: string): i32 {
+export function internFuncTypeShapes(nm: string): i32 {
+  internFuncTypeShapesTy(nm, -1)
+}
+
+// `internFuncTypeShapes` with the caller's recorded arena type for `nm` — the functype
+// twin of `internShapeDeepTy`, peeled in lockstep with the same name grammar
+// (`annFnDecompose` <-> `fnParamTypes`/`fnRet`, `nullablePartOf` <-> `t.nInner`,
+// `arrElemNameRaw` <-> `t.aElem`). The name walk is untouched and stays authoritative for
+// every key and stored spelling; the type rides alongside and reaches only the `sTyIx`
+// hint at the leaf. A value-union leaf declines — `registerValueUnionName` is a box
+// registration, not a shape intern, so there is no leaf to hint.
+function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
   if nm.length < 2 { return 0 }
   // Peel ONLY a grouping pair that wraps the WHOLE name (`(()=>{f:i32})` → `()=>{f:i32}`).
   // A functype whose leading `(` is its own PARAM LIST (`(i32)=>(()=>{f:i32})`) must NOT be
@@ -14567,7 +14867,7 @@ function internFuncTypeShapes(nm: string): i32 {
   // NESTED functype result never intern (a chained value call's struct read then finds no
   // interned shape).
   const uw = normTypeAtom(nm)
-  if uw.length != nm.length { return internFuncTypeShapes(uw) }
+  if uw.length != nm.length { return internFuncTypeShapesTy(uw, ty) }
   // A VALUE-UNION leaf (`f64 | null` as a closure RESULT, `i64 | boolean` as a param) —
   // register its box reps, exactly as `internShapeDeep`'s value-union arm does (and
   // BEFORE the `| null` peel: the null is a union ATOM here, not a nullable wrapper).
@@ -14594,18 +14894,20 @@ function internFuncTypeShapes(nm: string): i32 {
   if fRet != "" {
     let pi = 0
     while pi < fParts.length {
-      internFuncTypeShapes(fParts[pi])
+      internFuncTypeShapesTy(fParts[pi], tyStepParam(ty, pi, fParts.length))
       pi = pi + 1
     }
-    return internFuncTypeShapes(fRet)
+    return internFuncTypeShapesTy(fRet, tyStepRet(ty))
   }
   const np = nullablePartOf(nm)
-  if np != "" { return internFuncTypeShapes(np) }
-  if nameIsElemArray(nm) { return internFuncTypeShapes(arrElemNameRaw(nm)) }
+  if np != "" { return internFuncTypeShapesTy(np, tyStepNullable(ty)) }
+  if nameIsElemArray(nm) {
+    return internFuncTypeShapesTy(arrElemNameRaw(nm), tyStepElem(ty))
+  }
   if nameIsShapeSpanEnds(nm) {
     if funcTypeShapeLowerable(nm) {
-      internShapeFieldElems(nm)
-      internInlineShape(nm)
+      internShapeFieldElemsTy(nm, ty)
+      internInlineShapeTy(nm, ty)
     } else {
       // The result struct is NOT lowerable as a whole (`funcTypeShapeLowerable`
       // false — e.g. it carries a plain CLOSURE field, code 14): the outer shape
@@ -14617,7 +14919,7 @@ function internFuncTypeShapes(nm: string): i32 {
       // interned twin drives invalid wasm at the nested struct.new. With both rows
       // present the `collectAnonShapes` ambiguity resolver (`structIndexOfObjCtx`
       // matches>=2 → the checker's recorded node type) disambiguates the nested literal.
-      internNonLowerableFieldShapes(nm)
+      internNonLowerableFieldShapesTy(nm, ty)
     }
   }
   0
@@ -14629,7 +14931,7 @@ function internFuncTypeShapes(nm: string): i32 {
 // map / value-union field is left untouched, preserving the closure's clean-reject
 // semantics for genuinely-unsupported reps. The depth-0 field split mirrors
 // `internShapeFieldElems`.
-function internNonLowerableFieldShapes(nm: string) {
+function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
@@ -14639,13 +14941,20 @@ function internNonLowerableFieldShapes(nm: string) {
       const ftxt = ftexts[fi]
       // A closure field (`() => {f: i64}`) — intern its result shape. Depth-aware:
       // an inner arrow makes the field a closure regardless of wrappers.
+      const fldTy = tyFieldTyOf(ty, fnames[fi])
       if annArrowAt(ftxt) >= 0 {
-        internShapeDeep(ftxt)
+        internShapeDeepTy(ftxt, fldTy)
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
         // wrapped) — peel the wrappers to the `{…}` (non-map) leaf and intern it.
-        const base = arrLeafNameOf(nonNulBaseOf(ftxt))
-        if nameIsShapeOpen(base) { internShapeDeep(base) }
+        const nul = nonNulBaseOf(ftxt)
+        const base = arrLeafNameOf(nul)
+        if nameIsShapeOpen(base) {
+          internShapeDeepTy(
+            base,
+            tyStepArrRun(tyStepNulIf(fldTy, ftxt, nul), nul, base),
+          )
+        }
       }
     }
     fi = fi + 1
@@ -14660,7 +14969,7 @@ function internNonLowerableFieldShapes(nm: string) {
 // `collectNestedFieldShapes`' leaf strip: peel every trailing `[]` pair and intern a
 // `{…}` leaf (`internInlineShape` no-ops on any other text). Runs only on a shape
 // `funcTypeShapeLowerable` accepted, BEFORE the shape itself interns.
-function internShapeFieldElems(nm: string) {
+function internShapeFieldElemsTy(nm: string, ty: i32) {
   const fnames: string[] = []
   const ftexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
@@ -14671,7 +14980,12 @@ function internShapeFieldElems(nm: string) {
       // `peeled` — "the loop ran at least once" — IS `leaf != name`: every iteration
       // shortens by exactly two characters, so the peel is the identity iff nothing peeled.
       const peeled = ftxt != ftexts[fi]
-      if peeled && nameIsShapeOpen(ftxt) { internInlineShape(ftxt) }
+      if peeled && nameIsShapeOpen(ftxt) {
+        internInlineShapeTy(
+          ftxt,
+          tyStepArrRun(tyFieldTyOf(ty, fnames[fi]), ftexts[fi], ftxt),
+        )
+      }
     }
     fi = fi + 1
   }
@@ -14689,27 +15003,113 @@ function internShapeFieldElems(nm: string) {
 export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
 
 // `internInlineShape` with the caller's RECORDED arena type for `nm` (destringify
-// D-INLINESHAPETY). The hint reaches the row's D0 `sTyIx` cell and NOTHING else: the
-// field split, every code classification, the `annShapeIndexOf` dedup and the stored
-// spelling are untouched, and an unhinted call records exactly what it recorded before.
+// D-INLINESHAPETY).
 //
-// EQUAL BY CONSTRUCTION, and the construction is the reason this is allowed at a MINT
-// at all (`rlInternNameTy`'s header states the rule). Inside this function
-// `nameIsShapeSpanEnds(nm)` is TRUE — the early return above is what makes it so — and
-// on that branch `sTyIxOfName(nm)` IS `cUserTypes[nm] ?? resolveAnnot(nm)`, which is
-// `fieldElemTyIxOfName(nm)`'s whole body. The two shipped hints are
-// `uFieldElemTyIxRow(ufn)`, recorded by `recordUFieldElemRow` from the SAME
-// `uFieldElemName` cell the caller passes here, so the two legs read one arena index.
-// The only spelling where they part is the >4096-character runaway cap, which the
-// recorder answers -1 for — and a -1 hint takes the name leg unchanged.
+// THE HINT REACHES MORE THAN THE `sTyIx` CELL, AND THE SAFETY ARGUMENT HAS TO SAY SO.
+// This header used to read "the hint reaches the row's D0 `sTyIx` cell and NOTHING else:
+// the field split, every code classification, the `annShapeIndexOf` dedup and the stored
+// spelling are untouched" — and rested the whole MINT-time permission on that sentence.
+// It stopped being true in this same programme: the field loop below calls
+// `nameFieldCodeTy(ftxt, fldTy)`, whose arena rung answers the CODE from the hint, and
+// `codes` is an input to `annShapeIndexOf`'s key. So the hint does reach the dedup.
 //
-// **THE OTHER FOUR CALLERS ARE NOT HINTABLE AND THAT IS THE MEASUREMENT, NOT AN
-// OMISSION.** 1,046 of the 1,064 `sTyIxOfName` resolutions arrive from
-// `internShapeDeep`'s peeled leaf (873), `internFuncTypeShapes` (116), this function's
-// own nested-field recursion (56) and `internShapeFieldElems` (5) — each of which
-// composed `nm` by CUTTING a larger spelling, so no caller holds a bank for the cut.
-// The largest chain roots at a `TypeRef` node, i.e. the mono-clone `nodeTyIx`
-// population D-REPELEMTY §3a refuted, one peel further away.
+// `rlInternNameTy`'s rule is the one that governs, and it is not "the hint must not reach
+// the key" — it is *the hint must compute the SAME key*. That is what is measured, per
+// leg: the code rung agrees with the name ladder on **2,669 of 2,669** covered corpus
+// classifications and declines elsewhere; the row identity agrees at **2,360 / 0**; and
+// the `sTyIx` leg is equal BY CONSTRUCTION, because inside this function
+// `nameIsShapeSpanEnds(nm)` is TRUE — the early return above is what makes it so — and on
+// that branch `sTyIxOfName(nm)` IS `cUserTypes[nm] ?? resolveAnnot(nm)`, which is
+// `fieldElemTyIxOfName(nm)`'s whole body. The only spelling where the last pair parts is
+// the >4096-character runaway cap, which the recorder answers -1 for, and a -1 hint takes
+// the name leg unchanged.
+//
+// SIX CALL SITES HINT NOW, not the two this header used to name (`emit_collect:3865, 3895`
+// plus `emit_classify`'s descent leaf, the functype leaf, the nested-field arm and the
+// code-15 recursion). The by-construction proof above covers the `uFieldElemTyIxRow` pair;
+// the other four are covered by the dual-runs, which is a weaker warrant honestly stated
+// rather than the same warrant silently stretched.
+//
+// THE "CUT SUBSTRING HAS NO BANK" ARGUMENT IS TRUE OF THE CALLERS AND IS NOT THE END OF
+// IT. It once read here as "the other four callers are not hintable and that is the
+// measurement" — 1,050 of 1,064 resolutions arriving from `internShapeDeep`'s peeled leaf
+// (873), `internFuncTypeShapes` (116), this function's own nested-field recursion (56)
+// and `internShapeFieldElems` (5), each having composed `nm` by CUTTING a larger spelling.
+// A cut has no bank of its own; what it has is a PARENT that does. `collectAnnShapes`
+// holds the root's node, and the two steps below carry that type inward — the descent
+// peels it in lockstep with the name (`tyStep*`), and this function steps it by FIELD
+// NAME (`tyFieldTyOf`) into each field text. Measured over the corpus: entries hinted
+// 975 -> 1,407 of 3,136, leaf resolutions hinted 409 -> 526 of 1,097, and
+// `sTyIxOfNameTy`'s `resolveAnnot` parses 816 -> 699. The hand-over is exact at
+// 526 agree / 0 disagree by render, with a sabotage (the PARENT's type handed as every
+// field's) reddening 77 — so the comparator is live, which the byte channel cannot show
+// because `sTyIx` is weakly consumed.
+//
+// Still unhinted, and each for its own reason: `internFuncTypeShapes` takes no type
+// parameter at all (the arena's `TyFunc` params/result would have to be threaded the
+// same way — a further slice), union arms and functype interiors DECLINE inside the
+// descent rather than guess, and a root whose node the two collect-site gates reject
+// (canon rewrote the spelling, or the name mentions a generic-alias parameter) starts
+// at -1 by design.
+// True when any of a shape's field TEXTS is a FuncDecl type-parameter ARRAY — i.e. the
+// shape belongs to a GENERIC ORIGINAL and denotes no concrete struct.
+//
+// The ARRAY form ONLY, and the restriction is the SHADOW RULING, not caution. A parameter
+// that also names a real type binds nothing (`type Id = i32` beside `type ShapeId<Id>`
+// resolves the field to the BUILTIN — `genTyParamArr`'s header states the rule and
+// `generics/type-param-shadows-alias-through-constructors.vl` pins it at eight
+// constructors). `genTyParamArr` carries that guard as its `nameIsI32Array` /
+// `nameIsRefArray` arms; a BARE-name membership test has no such guard, and using one here
+// skipped `{a: Id}` — a shape whose field is a genuine `i32` — leaving the alias
+// application with no interned row.
+//
+// The bare form needs no arm regardless: `{g: T}` has never reached the type section, since
+// `monoArgTyName` declines a bare parameter and monomorphization rejects the call loudly.
+// The `T[]` form is the one that got through to a struct row.
+//
+// ONE caller — `internInlineShapeTy`. The file names three roots that mint a struct row
+// from a shape spelling (`sSetLim`'s header: this one, `internShapeAs`, `gaeEnsure`), and
+// the other two need no arm: both mint from a TOP-LEVEL `type` declaration, where no
+// FuncDecl type parameter is in scope. Kept a named predicate rather than inlined so the
+// question has somewhere to be asked from if that ever stops being true.
+function shapeFieldsRideTyParam(rawTexts: string[]) {
+  if genTyParamNames.length == 0 { return false }
+  let gp = 0
+  while gp < rawTexts.length {
+    const t = rawTexts[gp]
+    if nameIsArray(t) && !nameIsI32Array(t) && !nameIsRefArray(t) {
+      if fnTyParamName(arrLeafNameOf(t)) { return true }
+    }
+    // The PAREN-GROUPED element `(T | null)[]`, which the clause above cannot reach:
+    // `refArrShapeKind`'s paren-union fall-through is UNCONDITIONAL (`return 2` for any
+    // `( … | … )[]` whatever its arms name), so `nameIsRefArray` is true and the guard
+    // steps aside — then `rlInternName` resolves the unregistered `T | null` onto struct
+    // row 0 and the field's element becomes the shape ITSELF. `vl check --codegen` rc 0,
+    // `vl run` "expected (ref null $type), found i32". Pre-existing on master, and the
+    // same worst class as the `T[]` crash one clause up.
+    //
+    // THE KIND IS WHAT SEPARATES THIS FROM THE SHADOW CASE, and it must: with a real
+    // `type T` in scope the ruling says the parameter binds nothing and the shape is
+    // CONCRETE, so it must still intern (`error-param-shadow-tyaram-nullable-elem.vl`
+    // reddens otherwise). `refArrShapeKind` already tells the two apart — it answers 1
+    // for a resolved nullable-STRUCT element and only falls through to 2 when nothing
+    // claimed it. So skip on kind 2 alone; every resolved kind keeps its row.
+    if nameIsArray(t) && !nameIsI32Array(t) {
+      const pu = parenUnionArrElemName(t)
+      if pu != "" {
+        const nn = nullablePartOf(pu)
+        if nn != "" {
+          if fnTyParamName(nn) {
+            if refArrShapeKind(t) == 2 { return true }
+          }
+        }
+      }
+    }
+    gp = gp + 1
+  }
+  false
+}
+
 export function internInlineShapeTy(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
@@ -14719,6 +15119,30 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   const rawNames: string[] = []
   const rawTexts: string[] = []
   shapeInnerFieldSplit(groupInnerOf(nm), rawNames, rawTexts)
+  // A GENERIC ORIGINAL's inline shape (`function f<T>(v: { g: T[] })`) declares no
+  // concrete struct, exactly as a generic ALIAS declares none — so it must not be
+  // interned. The ARRAY annotation classifier has skipped the bare `T[]` form since
+  // #1218 (`collectA`'s `genTyParamArr` arm); the SHAPE FIELD one did not, and the
+  // element it resolved for `g` was the type PARAMETER read as a nominal name:
+  //
+  //   ·  no type named `T` in scope — the element resolved to "", leaving the field's
+  //      ref-list slot un-interned. `pushFieldStorage` then reads `rlWrapIdx[-1]`: an
+  //      out-of-bounds CRASH of the compiler (under `vl check --codegen` too), not the
+  //      loud reject that read is written to be.
+  //   ·  a REAL `type T` also in scope — the element resolved to THAT UNRELATED TYPE
+  //      and the field got a wrapper. `vl check --codegen` exits 0 and `vl run` reports
+  //      invalid wasm.
+  //
+  // Skipping is right for the same reason the alias half's is, and the reason is about
+  // WHO EMITS: the generic original is replaced by its instances and never emitted, and
+  // each instance re-runs this pass over its PINNED concrete names (`monomorphize`'s
+  // re-collect). So the shape that reaches the type section is the SUBSTITUTED one,
+  // interned from a spelling whose fields are all real types.
+  //
+  // Asked of the RAW split, ahead of the classifying loop, because that loop's first act
+  // on a field is to intern whatever is nested inside it — a row minted there could not
+  // be taken back by a later return.
+  if shapeFieldsRideTyParam(rawTexts) { return -1 }
   const names: string[] = []
   const codes: i32[] = []
   const texts: string[] = []
@@ -14736,8 +15160,16 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
       // interns/registers it; a no-op for a scalar / nominal / map field. MUST run BEFORE any row is
       // pushed (the outer shape is pushed to `sNames` only after this loop, so the flat `sField*`
       // arrays aren't corrupted by the re-entrant intern).
-      internShapeDeep(ftxt)
-      let fc = nameFieldCode(ftxt)
+      //
+      // ARENA HAND-OVER, RECURSIVE (D-INLINESHAPETY). `ftxt` is a CUT of `nm`, so it has no node
+      // of its own — but this shape's own recorded type does hold the field, so `tyFieldTyOf`
+      // steps to it by NAME exactly as `tyStep*` steps through a nullable / element / map value.
+      // That makes the descent's hand-over recursive rather than root-only: a hinted shape hints
+      // its fields, whose nested shapes are then hinted in turn. Declines to -1 on a non-`TyObj`
+      // or a field the recorded type lacks, and a -1 hint is the unhinted call unchanged.
+      const fldTy = tyFieldTyOf(tyIx, rawNames[fi])
+      internShapeDeepTy(ftxt, fldTy)
+      let fc = nameFieldCodeTy(ftxt, fldTy)
       if fc < 0 {
         // A NESTED inline-shape field: intern the nested shape (its `|null`
         // wrapper stripped) and store a struct ref on it under the CANONICAL
@@ -14749,7 +15181,9 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
         // UNRESOLVABLE at type-section emit (a -1 `sHeapIdx` read). Store the
         // interned struct's own `sNames` entry so both agree with the literal path.
         const base = nonNulBaseOf(ftxt)
-        const iidx = internInlineShape(base)
+        // The `| null` the name peel just dropped is peeled off the hint too — and only
+        // when the name actually shortened, so a non-nullable field keeps its own type.
+        const iidx = internInlineShapeTy(base, tyStepNulIf(fldTy, ftxt, base))
         if iidx >= 0 {
           fc = 15
           ftxt = sNames[iidx]
@@ -14770,6 +15204,7 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   // `structIndexByName` on the annotation (or on a ref-list element name
   // `{v:i32}[]` → `{v:i32}`) resolves directly.
   sNames.push(nm)
+  recordSRowDeclOfName(nm)
   recordSTyIx(sTyIxOfNameTy(nm, tyIx)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
@@ -14906,6 +15341,7 @@ export function internShapeAs(key: string, nm: string) {
   }
   sDeclared = true
   sNames.push(key)
+  recordSRowDeclOfName(key)
   recordSTyIx(sTyIxOfName(key)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
@@ -14925,10 +15361,255 @@ export function internShapeAs(key: string, nm: string) {
 }
 
 // The struct table index whose field-name SET matches `names` exactly, or -1.
+// ── the shape-row FIELDSET index ─────────────────────────────────────────────
+// `annShapeIndexOf` walked the WHOLE struct table and re-derived the same three
+// conditions per row — the field COUNT, every queried name being present, and the codes
+// matching. Those three are exactly "the row has the same multiset of (field name, field
+// code)", and a struct's field names are unique, so they are a KEY. It is computed here
+// as a hash-consed structural id — integers, no spelling composed — and the scan becomes a
+// walk of one bucket. The key is the FIVE-tuple `shapeFieldSetIdOf` documents, not the
+// `(sid(name), code)` pair this comment first claimed: the element sid, the map-key bit and
+// the atom bit are in it too.
+//
+// WHICH MAKES THE KEY A REFINEMENT OF THE REFINEMENT, and that is the honest form of the
+// argument. "A row in a different bucket fails conditions 1-3" is FALSE as stated — a row
+// can pass the count, the names and the codes and still land in a different bucket on the
+// element sid alone. What holds is the direction that matters: the bucket admits a SUBSET
+// of what conditions 1-3 admit, and every member still faces the unchanged refinement, so
+// nothing is accepted that the old scan rejected. The cost of the extra strictness is a
+// duplicate row, never a wrong one — and it is measured at zero (3,112 agree / 0 disagree). The refinement is what stays a per-candidate test, because it compares
+// stored element SPELLINGS and the atom-identity split reads the QUERY's text.
+//
+// Chains are appended at the TAIL so rows stay in increasing index order — first match
+// wins, as the scan's `si + 1` walk did — and that also makes the `sScanLim` bound a
+// BREAK rather than a filter. The chain walk is LOAD-BEARING and measured: stopping at
+// the head disagrees with the old scan on **75** of 3,112 corpus calls, so buckets really
+// do hold several rows that only the element / atom refinement separates.
+//
+// VERIFIED BY DUAL-RUN, not by the byte channel: both answers computed on every call over
+// the corpus, **3,112 agree / 0 disagree**.
+//
+// THE SORT IS NOT EXERCISED BY THE CORPUS, and that is recorded rather than banked.
+// Keying the multiset in written order instead of sorted order gives 0 disagreements —
+// no two rows on this corpus share a field-name set in a different ORDER at a point where
+// dedup matters. It stays sorted anyway, and the reason is an argument rather than a
+// measurement: the scan it replaces looked each queried name up (`sFieldIndex`), so it was
+// order-insensitive BY CONSTRUCTION, and an order-sensitive key would silently mint a
+// duplicate row for `{a: i32, b: i32}` against `{b: i32, a: i32}`.
+//
+// Watermark-incremental with an explicit per-program reset, exactly as the name index
+// above: same table, same growth pattern, same hazard.
+let sSetHead: i32[] = []
+let sSetTail: i32[] = []
+let sSetNext: i32[] = []
+let sSetLen = 0
+
+export function shapeSetIxReset() {
+  sSetHead = []
+  sSetTail = []
+  sSetNext = []
+  sSetLen = 0
+  0
+}
+
+// The canonical id of a (field name, field code) multiset. Sorted by SID so the order the
+// fields were written in cannot change the key — the old scan matched by name lookup, so
+// it was order-insensitive and this must be too. Insertion sort: a struct's field count
+// is small, and the alternative is a comparator allocation per row.
+// The sid of an element name, with "" mapped to a value no real name can take. An empty
+// element name means "this field has NO element", which is a different fact from "its
+// element is the empty spelling", and `sidOf("")` would conflate them.
+function elemSid(nm: string): i32 {
+  if nm == "" { return -1 }
+  sidOf(nm)
+}
+
+// THE ROW IDENTITY, WRITTEN DOWN IN ONE PLACE. Per field, in a canonical (sid-sorted)
+// order:
+//
+//   field-name sid · field code · element-name sid · map-KEY bit · litunion-ATOM bit
+//
+// Those five are the dimensions `annShapeIndexOf` compares — the count and name set, the
+// codes, the element name, the map's key half (`recordSFieldElemRow`: "an mv slot's
+// identity is the (KEY, VALUE) pair"), and the atom-identity split that keeps `{f: K0}`
+// off a `{f: boolean}` row.
+//
+// FOUR OF THE FIVE ARE LIVE; THE ATOM BIT IS INERT, AND SAYING SO COSTS NOTHING WHILE
+// LETTING IT READ AS LOAD-BEARING WOULD. Measured: the bit is computed **4,442** times over
+// the corpus and is **never 1**. It cannot be — it is set only under `qb == ""`, and for the
+// two codes it guards (`0` with a litunion text, `4` with a litunion-array text)
+// `shapeFieldElemName` answers the text itself, so `qb != ""` on exactly those. The split it
+// was meant to make is already carried by `elemSid`: a litunion field banks its union NAME
+// in the element column while a plain scalar banks `""`, so the two differ one field
+// earlier. The arm stays as a backstop against `shapeFieldElemName` changing, not as a
+// dimension that does work today. The board kept calling this "the design question" because a
+// row's identity was enumerated NOWHERE, so every attempt to replace a spelling comparison
+// was guessing at a list nobody had made. This is the list.
+//
+// It is asserted nowhere and CHECKED everywhere: the refinement below still runs and still
+// decides, so this key only narrows the candidates. If the enumeration were incomplete the
+// refinement would reject inside the bucket, which is a miss, not a wrong answer.
+function shapeFieldSetIdOf(
+  fnames: string[],
+  fcodes: i32[],
+  felems: string[],
+  fkeys: i32[],
+  fatoms: i32[],
+): i32 {
+  const sids: i32[] = []
+  const ord: i32[] = []
+  let i = 0
+  while i < fnames.length {
+    const sd = sidOf(fnames[i])
+    let j = sids.length
+    sids.push(sd)
+    ord.push(i)
+    while j > 0 {
+      if sids[j - 1] <= sd {
+        j = 0
+      } else {
+        sids[j] = sids[j - 1]
+        ord[j] = ord[j - 1]
+        sids[j - 1] = sd
+        ord[j - 1] = i
+        j = j - 1
+      }
+    }
+    i = i + 1
+  }
+  const a: i32[] = []
+  a.push(fnames.length)
+  let k = 0
+  while k < sids.length {
+    const o = ord[k]
+    a.push(sids[k])
+    a.push(fcodes[o])
+    a.push(elemSid(felems[o]))
+    a.push(fkeys[o])
+    a.push(fatoms[o])
+    k = k + 1
+  }
+  hcShapeSetId(a)
+}
+
+// The stored row's own key, read off the flat field columns.
+// `sScanLim` bounds by `sNames` / `sFieldCount` / `sFieldStart` — NOT by the three DETAIL
+// arrays `shapeRowSetId` reads (`sFieldNames`, `sFieldTypes`, `sFieldElemName`). Three mint
+// sites push the header columns BEFORE the loop that fills the details
+// (`internInlineShapeTy`, `internShapeAs`, `gaeEnsure`), so inside those windows
+// `sScanLim()` includes a row whose details are short.
+//
+// That matters more here than at an ordinary scanner: this index is watermark-incremental
+// and never re-keys a row, so a row bucketed mid-construction would keep the wrong key for
+// the rest of the program rather than being re-read. `structIndexOfObjCtx`'s scanner
+// carries the same guard for the same reason and records it as a fuzz-found OOB crash.
+//
+// Today `annShapeIndexOf` is the only caller and it runs before the outer row's push, so
+// the window is unreachable — the guard is structural rather than observed, which is
+// exactly when a watermark index needs one.
+function sSetLim(): i32 {
+  const n = sScanLim()
+  // From `sSetLen`, NOT from 0 — otherwise this guard is O(rows) on every
+  // `annShapeIndexOf` query and puts back the O(rows^2) the watermark index exists to
+  // remove (`sNameIxSync`'s header states the rule). Answer-identical: `sSetSync` consumes
+  // from `sSetLen` upward, so a limit at or below it produces no work either way, and no
+  // row below `sSetLen` can be short — it was complete when the index consumed it, and the
+  // detail columns only grow within a program.
+  let i = sSetLen
+  while i < n {
+    if sFieldStart[i] + sFieldCount[i] > sFieldElemName.length { return i }
+    if sFieldStart[i] + sFieldCount[i] > sFieldNames.length { return i }
+    if sFieldStart[i] + sFieldCount[i] > sFieldTypes.length { return i }
+    i = i + 1
+  }
+  n
+}
+
+function shapeRowSetId(si: i32): i32 {
+  const fn: string[] = []
+  const fc: i32[] = []
+  const fe: string[] = []
+  const fk: i32[] = []
+  const fa: i32[] = []
+  const st = sFieldStart[si]
+  const n = sFieldCount[si]
+  let i = 0
+  while i < n {
+    fn.push(sFieldNames[st + i])
+    fc.push(sFieldTypes[st + i])
+    const en = sFieldElemNameAt(si, i)
+    fe.push(en)
+    let kb = 0
+    if en != "" {
+      if sFieldElemKeyI32At(si, i) { kb = 1 }
+    }
+    fk.push(kb)
+    // A row whose field records NO element name is a plain scalar there — a litunion
+    // field records its union name — so its atom bit is 0, and the query's is its own
+    // text's litunion-ness. That is exactly the split the refinement's two atom arms make.
+    fa.push(0)
+    i = i + 1
+  }
+  shapeFieldSetIdOf(fn, fc, fe, fk, fa)
+}
+
+function sSetSync() {
+  if sSetLen > sNames.length { shapeSetIxReset() }
+  const lim = sSetLim()
+  while sSetLen < lim {
+    const k = shapeRowSetId(sSetLen)
+    while sSetHead.length <= k {
+      sSetHead.push(-1)
+      sSetTail.push(-1)
+    }
+    while sSetNext.length <= sSetLen { sSetNext.push(-1) }
+    if sSetHead[k] < 0 {
+      sSetHead[k] = sSetLen
+    } else {
+      sSetNext[sSetTail[k]] = sSetLen
+    }
+    sSetTail[k] = sSetLen
+    sSetLen = sSetLen + 1
+  }
+  0
+}
+
 function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
-  let si = 0
   const sLimC = sScanLim()
-  while si < sLimC {
+  sSetSync()
+  const qElems: string[] = []
+  const qKeys: i32[] = []
+  const qAtoms: i32[] = []
+  let qi = 0
+  while qi < names.length {
+    // The same derivation the refinement makes, hoisted: `shapeFieldElemName` is the
+    // mint's one home for "what element does this (text, code) record", and "" means the
+    // field records none — in which case the atom bit carries the split instead.
+    let qb = shapeFieldElemName(texts[qi], codes[qi])
+    if qb != "" {
+      if codes[qi] == 15 { qb = nonNulBaseOf(qb) }
+    }
+    qElems.push(qb)
+    let kb = 0
+    if qb != "" {
+      if nameIsI32KeyedMap(texts[qi]) { kb = 1 }
+    }
+    qKeys.push(kb)
+    let ab = 0
+    if qb == "" {
+      if codes[qi] == 0 {
+        if nameIsLitUnionType(texts[qi]) { ab = 1 }
+      } else if codes[qi] == 4 {
+        if nameIsLitUnionArray(texts[qi]) { ab = 1 }
+      }
+    }
+    qAtoms.push(ab)
+    qi = qi + 1
+  }
+  const qk = shapeFieldSetIdOf(names, codes, qElems, qKeys, qAtoms)
+  if qk < 0 || qk >= sSetHead.length { return -1 }
+  let si = sSetHead[qk]
+  while si >= 0 && si < sLimC {
     if sFieldCount[si] == names.length {
       let allIn = true
       let i = 0
@@ -14949,6 +15630,12 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
           // element text (code 15 strips the `|null` wrapper exactly as the interner stores it).
           const en = sFieldElemNameAt(si, fi)
           if en != "" {
+            // REVERTED — see the header note on this function. Unifying this comparison
+            // with `shapeFieldElemName` (so the query asks the same question of its text
+            // that the mint asked of the row's) enables merges the rep FUZZER proves
+            // unsound: `p2r ((i32) => {f: boolean}[] | {w: i32}) | f64` goes REJECT ->
+            // MISMATCH, a narrowing test taking the wrong branch. The constant-false on
+            // five codes is conservative and stays until the merge is understood.
             let bi = texts[i]
             if codes[i] == 15 { bi = nonNulBaseOf(bi) }
             if en != bi { allIn = false }
@@ -14972,7 +15659,7 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
       }
       if allIn { return si }
     }
-    si = si + 1
+    si = sSetNext[si]
   }
   -1
 }
@@ -15077,6 +15764,7 @@ export function gaeEnsure(name: string) {
   if names.length == 0 { return 0 }
   sDeclared = true
   sNames.push(name)
+  recordSRowDeclOfName(name)
   recordSTyIx(sTyIxOfName(name)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
@@ -15470,7 +16158,7 @@ export function variantFieldElemName(vi: i32, fi: i32) {
 // Two union-variant slots share ONE variant-struct WasmGC heap type under the
 // struct template's two-layer discipline: the canonical structural key of the
 // variant's TYPE (its name — a declared alias or an inline `{…}` shape —
-// resolved through the checker, `repNameCanonKey`), then a layout guard over
+// resolved through the checker, `repNameCanonId`), then a layout guard over
 // the emitted field storage (`variantFieldLayoutEq`): per-field CODE equality
 // plus, for the codes whose storage references another interned heap type, twin
 // equivalence of the referenced layer — a ref-list field (5) via
@@ -15513,7 +16201,7 @@ function variantFieldLayoutEq(a: i32, b: i32): i32 {
       // field and a `{[string]: V}` field DO store different map structs, and the value
       // comparison below cannot see the difference (both rows record the same VALUE
       // name) — but this guard never runs on such a pair: `buildVariantTwins` only calls
-      // it when `repNameCanonKey` already matched, and that key comes off the ARENA,
+      // it when `repNameCanonId` already matched, and that key comes off the ARENA,
       // where the two spellings are `TyMap`s with different key types. The witness is
       // `tests/cases/maps/i32-keyed-variant-field.vl`'s `mixedUnion` plus a two-UNION
       // probe (`{f:{[i32]:string}}` in one, `{f:{[string]:string}}` in another, the only
@@ -15551,21 +16239,21 @@ function variantFieldLayoutEq(a: i32, b: i32): i32 {
 // earlier layout twin, or `i` itself when `i` is the first of its layout. Keys
 // are computed ONCE up front (`buildStructTwins` discipline — the compiler's own
 // unions carry hundreds of variants, so a per-pair key recomputation is the
-// audit's hot-path anti-pattern); a non-participating slot ("" key — an
+// audit's hot-path anti-pattern); a non-participating slot (-1 key — an
 // unresolvable spelling) is always its own representative. Called from
 // `mAssignTypeIndices` before the variant heap indices allocate.
 export function buildVariantTwins() {
-  const keys: string[] = []
+  const keys: i32[] = []
   let i = 0
   while i < uVariants.length {
-    keys.push(repNameCanonKey(uVariants[i]))
+    keys.push(repNameCanonId(uVariants[i]))
     i = i + 1
   }
   uVarTwin = []
   i = 0
   while i < uVariants.length {
     let rep = i
-    if keys[i] != "" {
+    if keys[i] >= 0 {
       let j = 0
       while j < i {
         if keys[j] == keys[i] && variantFieldLayoutEq(j, i) == 1 {
@@ -15812,7 +16500,11 @@ export function markRefArrayArms(name: string) {
       isRefArr = a != "null" && valueAtomKind(a) < 0 && nameIsArray(a)
     }
     if isRefArr {
-      internShapeDeep(a)
+      // ARENA HAND-OVER: `mems` is this very seam's answer for these very atoms, so a
+      // covered row hands the arm's type straight down instead of resolving `a` again.
+      let aTy = -1
+      if cov { aTy = mems[i] }
+      internShapeDeepTy(a, aTy)
       const elem = refArrElemName(a)
       if elem != "" {
         ensureRefElem(elem)
@@ -17429,6 +18121,22 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
+        // ARENA RUNG. The question here IS "does this annotation denote a struct", and
+        // `nodeTyIsStruct` is the checker-side twin `typecheck.vl` already provides for
+        // exactly it — the arena-index sets instead of an O(nodes) `nameIsStructDecl` scan.
+        //
+        // A STRICT SUPERSET, measured: over the corpus the two agree on 1,871 of 6,437
+        // reaches, the arena answers true where the NAME does not on **24**, and the name
+        // answers true where the arena does not on **0**. The 24 are spellings `isSName`
+        // structurally cannot claim — a generic APPLICATION (`Box<Box<i32>|i32>`), a
+        // canonicalized INTERSECTION (`Node&{v:i32}`), an inline SHAPE
+        // (`{a:{k:i32},b:{k:i32}}`) — every one of which is a struct, so the arena is right
+        // and `isSName` under-reports. The "under-approximates … so callers keep the name
+        // test as the fallback" note belongs to `nodeTyIsStruct` — the ARENA side — and
+        // names IT as the approximation with the NAME as fallback. At this site the
+        // approximation runs the other way, which is the finding rather than a detail: the
+        // arena is the WIDER answer here, and the name test is the one that misses.
+        if nodeTyIsStruct(d.letType) { return true }
         if isSName(lt.tyName) { return true }
       }
     }
@@ -17547,6 +18255,37 @@ function paramStructIndex(fnIx: i32, name: string) {
               // A plain struct name, or the `S | null` nullable BASE. (NOT a union
               // variant — a variant-typed param rides the gap-#2 path, and its
               // VARIANT index must not leak into the struct tables.)
+              // NAME, NOT THE ARENA — and this is a RETRACTION, so the reason is recorded
+              // here rather than in the history alone.
+              //
+              // An arena rung sat in front of this line for part of this branch
+              // (`structIndexOfTy(nodeTyIxOf(p.parType))`, falling back to the name). It
+              // shipped on a dual-run reading 15,922 corpus calls, 41 disagreements
+              // (0.26%), every one of them a `{f:K0|null}` duplicate row that
+              // `repStructSlotsTwin` called a twin — twins share a heap type and a field
+              // layout, so either row emits the same module — plus 294 answers with 0
+              // disagreements on the compiler's own source.
+              //
+              // THE MEASUREMENT WAS CLEAN AND THE POPULATION WAS WRONG. No corpus file
+              // declares a type whose name a FuncDecl type PARAMETER also uses, so no
+              // corpus file could disagree for the reason that matters:
+              //
+              //   type T = { x: i32 }
+              //   function f<T>(v: { g: (T | null)[] }): i32 { v.g.length }
+              //   print(f({ g: [{ x: 1 }, null] }))
+              //
+              // The shadow ruling says the parameter binds NOTHING and the real `T` wins
+              // (`genTyParamArr`'s header; `type-param-shadows-alias-through-constructors.vl`
+              // pins it at eight constructors), so the NAME's answer is the correct one. The
+              // arena's recorded type for a GENERIC ORIGINAL's param is the un-substituted
+              // shape, which is not that struct — it fronted the find and won with the wrong
+              // row: `vl check --codegen` rc 0, `vl run` invalid wasm.
+              //
+              // That is the same root as the inline-shape crash this branch fixes one layer
+              // up — a generic original's shape leaking into concrete struct resolution — and
+              // the rung can be reconsidered once generic originals are excluded at the
+              // source. Until then the name answers, and `error-param-shadow-tyaram-nullable-elem.vl`
+              // reddens if the rung returns.
               const psi = structIndexByName(ty.tyName)
               if psi >= 0 { return psi }
               const pnb = nulBaseStructRow(p.parType, ty.tyName)
@@ -18019,7 +18758,38 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
       if lt is TypeRef {
-        const si = structIndexByName(lt.tyName)
+        // ARENA RUNG (destringify). This is the emitter's hottest name query by an order
+        // of magnitude — ~168.7k of 258,112 `structIndexByName` calls on the compiler's
+        // own source, 65% of all of them — and it HOLDS A NODE, so it can ask by TYPE.
+        //
+        // THE TWO LOOKUPS ARE NOT THE SAME QUESTION, and that is the whole content of the
+        // change: `structIndexByName` finds the row interned under THIS SPELLING, while
+        // `structIndexOfTy` finds the first row denoting this TYPE, which may be a
+        // structurally identical TWIN interned under a different one. Dual-run: the arena
+        // answers 151,321 of 168,648 self-compile calls with **0 disagreements**, and
+        // 8,201 of 18,265 corpus calls with **15** — all inline shapes resolving one row
+        // earlier than their name does (`nm={a:string,f:K0|null,z:f32} arena=10 name=8`).
+        //
+        // SO IT IS A CHOICE, NOT AN IDENTITY, and it shipped on evidence rather than on a
+        // proof of sameness — the one place in this programme that is true. The evidence:
+        // 0 of 2,010 corpus files move on emitted-wasm sha256, exit code or diagnostics;
+        // suite 2,160/0; `cases_wasm` 1,940/0; native fixpoint byte-exact; and
+        // **`rep-fuzz-check` exact** — which is the gate that matters here, because the
+        // corpus cannot contain the case that would break this (two rows with the same
+        // arena type whose emitted field LAYOUTS differ) and the fuzzer generates shapes
+        // the corpus does not. That harness caught the OTHER merge-enabling change on this
+        // branch as REJECT -> MISMATCH; this one survives it.
+        //
+        // `sTwin` already merges these rows at the heap-type layer, which is why picking
+        // either emits the same module — and `buildStructTwins` merges only when
+        // `slotCanonId` matches AND `structFieldCodesEq == 1`, so a pair sharing an arena
+        // type but differing in field codes would NOT be merged and picking the wrong one
+        // would be a wrong layout. That is covered rather than assumed: the measurement
+        // asked `repStructSlotsTwin`, which is the conjunction. **Revert this rung if a pair
+        // ever surfaces with `repStructSlotsTwin == 0`** — the conjunction, not
+        // `structFieldCodesEq` alone, which is the predicate actually measured.
+        let si = structIndexOfTy(nodeTyIxOf(d.letType))
+        if si < 0 { si = structIndexByName(lt.tyName) }
         if si >= 0 { return si }
         // A NULLABLE annotation (`{n:i32} | null`, `Config | null`) resolves its
         // NON-NULL part — `collectAnnShapes` interns an inline shape under the
@@ -24061,7 +24831,22 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe >= 0 && cloRetValKind(fe) == "struct" {
           const si = cloRetValSlot(fe)
-          if si >= 0 && si < sNames.length { return rlSlotByName(sNames[si]) }
+          if si >= 0 && si < sNames.length {
+            // ARENA ROUTE, one layer up from the rep tables. This handed the struct row's
+            // SPELLING to the ref-list element table — the first of the five sites where
+            // `sNames` survives as a supplier to a name-keyed layer above it. The row
+            // already carries its type in `sTyIx`, and `rlSlotOfTy` is that table's
+            // arena-input twin, so the spelling need not be produced at all.
+            //
+            // Dual-run over the corpus: the arena answers **20 of 20** reaches, agrees on
+            // **20**, disagrees on **0**, and there is no reach the NAME answers and it
+            // does not. Exact — the 0-disagreement standard, not a twin tolerance.
+            let elemTy = -1
+            if si < sTyIx.length { elemTy = sTyIx[si] }
+            const aRow = rlSlotOfTy(elemTy)
+            if aRow >= 0 { return aRow }
+            return rlSlotByName(sNames[si])
+          }
         }
         // A struct-returning CLOSURE-VALUE callback (`xs.map(f)`, `f: (i32) => P`): no lifted fe, so the
         // result struct index comes from the closure's `>s<idx>;` sig-return token. Its ref-list slot
@@ -24071,6 +24856,10 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
           if ck != "" && sigKeyRetKind(ck) == "struct" {
             const csi = sigKeyRetSlot(ck)
             if csi >= 0 && csi < sNames.length {
+              let cElemTy = -1
+              if csi < sTyIx.length { cElemTy = sTyIx[csi] }
+              const cRow = rlSlotOfTy(cElemTy)
+              if cRow >= 0 { return cRow }
               return rlSlotByName(sNames[csi])
             }
           }

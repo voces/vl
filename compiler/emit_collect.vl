@@ -44,6 +44,8 @@ import {
   annUnionAtomsOf,
   cUserTypes,
   canonEmitName,
+  canonRewroteNode,
+  canonTyIxOf,
   declAnnRawTyName,
   inferLetCount,
   inferLetNameOf,
@@ -58,6 +60,7 @@ import {
   isValueUnionName,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
+  nameMentionsGenAliasParam,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemName,
@@ -268,6 +271,7 @@ import {
   sFieldTypes,
   sHeapIdx,
   sNames,
+  sRowDecl,
   sTwin,
   sTyIx,
   slUsed,
@@ -309,6 +313,7 @@ import {
   buildStructTwins,
   mvSlotOfValNameTyK,
   recordSFieldElemRow,
+  recordSRowDeclOfName,
   recordSTyIx,
   recordUFieldElemRow,
   recordUnMemTys,
@@ -368,6 +373,7 @@ import {
   internInlineShapeTy,
   internShapeAs,
   internShapeDeep,
+  internShapeDeepTy,
   isUName,
   letAnnIsUninternedShape,
   letInfersF32,
@@ -460,12 +466,15 @@ import {
   setNarrowFromCond,
   setNarrowFromCondElse,
   shapeFieldElemName,
+  shapeSetIxReset,
   sioMemoReset,
   stmtIsPushKind,
   stmtIsTailValue,
   structIndexOfLet,
   structIndexOfObj,
   structIndexOfTypeName,
+  structNameIxReset,
+  structTyIxReset,
   synthTypeRef,
   uFieldElemKeyI32At,
   uFieldElemTyIxRow,
@@ -3345,12 +3354,23 @@ function forceGenAppArgTypes(name: string): i32 {
 // section is emitted. An array annotation no earlier arm claimed is validated by
 // `checkArrName`, so an unsupported element type fails loudly up-front. Returns 0, or -1 (via
 // `emitFail`).
-export function collectA(_stmts: i32[]) {
-  // Gather every FuncDecl TYPE-PARAMETER name first (a separate cheap pass — a
-  // `T[]` annotation node precedes its FuncDecl in the arena, so the main walk
-  // below would see it too early). Consulted by `genTyParamArr` to skip a
-  // generic original's `T[]` annotation. Empty for any program without `<T>`
-  // declarations — zero behavior change.
+// Gather every FuncDecl TYPE-PARAMETER name (a cheap standalone scan — a `T[]`
+// annotation node precedes its FuncDecl in the arena, so a walk that gathered as it went
+// would see the annotation too early). Consulted by `genTyParamArr` / `genTyParamLeaf` to
+// skip a generic original's annotations. Empty for any program without `<T>` declarations.
+//
+// ITS OWN PASS, ahead of `collectS`, because the SHAPE interner is a consumer too and
+// `collectS` runs first. While this gather lived inside `collectA`, an inline shape over a
+// type parameter (`function f<T>(v: { g: T[] })`) was interned against an EMPTY registry:
+// `genTyParamLeaf` short-circuits to false on one, so the field's element resolved through
+// the nominal name path — "" (an un-interned ref-list slot, read out of bounds at
+// `pushFieldStorage`: a compiler CRASH) or, with a real `type T` in scope, that unrelated
+// type (check-clean INVALID WASM). Ordering was the whole of the bug; the classifier arms
+// were already written.
+//
+// `collectA` still calls it, so the `collectA#2` re-run re-gathers over the instances
+// monomorphization minted. Idempotent — it rebuilds the list from the arena each time.
+export function collectTyParamNames() {
   genTyParamNames = []
   let gtp = 0
   while gtp < P.nodes.length {
@@ -3365,6 +3385,11 @@ export function collectA(_stmts: i32[]) {
     }
     gtp = gtp + 1
   }
+  0
+}
+
+export function collectA(_stmts: i32[]) {
+  collectTyParamNames()
   aUsed = false
   lUsed = false
   raUsed = false
@@ -4042,7 +4067,37 @@ export function collectAnnShapes() {
   let ti = 0
   while ti < P.nodes.length {
     const tn = P.nodes[ti]
-    if tn is TypeRef { internShapeDeep(tn.tyName) }
+    if tn is TypeRef {
+      // ONE GATE AND ONE SWITCH, each closing a measured disagreement class between the
+      // recorded type and what the NAME resolves to in the emitter's context:
+      //   • the GATE — no generic-alias type PARAMETER in the spelling. Inside such an
+      //     alias the checker bound `K` to the argument while the emitter re-resolves it
+      //     to the module-level alias of that name. This is the only leg that can leave
+      //     `root` at -1 here.
+      //   • the SWITCH — `canonRewroteNode(ti)` picks WHICH column to read, not whether
+      //     to read one. Canon is not a rename, so a name it rewrote may denote a
+      //     different TYPE than `nodeTyIx` holds; `canonTyIxOf` is the type of the
+      //     REWRITTEN spelling, banked at the rewrite. Before that column existed this
+      //     was a second gate and declined instead, which is why the sibling site in
+      //     `collectNestedFieldShapes` still does — it has no `canonTyIx` to switch to.
+      //
+      // THE FIRST GATE USED TO ASK `annTsOf(ti) >= 0` AND THAT WAS SOUND IN ONE DIRECTION
+      // ONLY. `clearAnnTs` does drop the spelling tree on exactly the rewritten nodes, so
+      // a SURVIVING tree is proof; but a MISSING tree is not proof of a rewrite — an
+      // emitter-synthesized `TypeRef` never had one and its recorded type is good.
+      // Measured here: of 2,518 nodes the tree test rejected, **1,258 were rewritten by
+      // canon and 1,260 were not**. Asking the question directly (`canonCleared`, the
+      // column canon now keeps) recovers that half.
+      let root = -1
+      if !nameMentionsGenAliasParam(tn.tyName) {
+        if canonRewroteNode(ti) {
+          root = canonTyIxOf(ti)
+        } else {
+          root = nodeTyIxOf(ti)
+        }
+      }
+      internShapeDeepTy(tn.tyName, root)
+    }
     ti = ti + 1
   }
   0
@@ -4119,11 +4174,12 @@ function collectAnonShapes() {
           // identifier or annotation) — a real key, so a ref LIST of this element
           // shape interns a per-element-type slot (`rlInternName` treats the empty
           // string as its "not a ref element" sentinel). An `#anon` name never resolves
-          // through the checker's annotation grammar, so `slotCanonKey` cannot key it
+          // through the checker's annotation grammar, so `slotCanonId` cannot key it
           // off the name: the D0 arena-index sidecar records the literal's
           // CONTEXT-RESOLVED type index instead, and the key is derived at QUERY time so
           // it follows later arena mutation rather than freezing a render at intern time.
           sNames.push("#anon" + i32ToStr(sNames.length))
+          recordSRowDeclOfName(sNames[sNames.length - 1])
           recordSTyIx(anonRowTyIx(ai))
           sFieldStart.push(sFieldNames.length)
           sFieldCount.push(codes.length)
@@ -4375,7 +4431,16 @@ function collectNestedFieldShapes(stmts: i32[]) {
             // no value rep — a loud reject the inline twin didn't have (and, before
             // the `sScanLim` clamp, an in-flight-entry OOB compiler CRASH; fuzz
             // frontier seed 43909430 d4 --branching --multiobs --declared).
-            internShapeDeep(tyNameOf(fnode.fdType))
+            // The same two gates `collectAnnShapes` states — see its note for why the
+            // canon question is asked directly rather than through a surviving tree.
+            let fdRoot = -1
+            if !canonRewroteNode(fnode.fdType) {
+              const fdNm = tyNameOf(fnode.fdType)
+              if !nameMentionsGenAliasParam(fdNm) {
+                fdRoot = nodeTyIxOf(fnode.fdType)
+              }
+            }
+            internShapeDeepTy(tyNameOf(fnode.fdType), fdRoot)
           }
           fi = fi + 1
         }
@@ -4495,7 +4560,14 @@ export function collectS(stmts: i32[]) {
   // The per-program literal-resolution memo keys node indices against THIS table —
   // both are program-scoped, so it resets with the table.
   sioMemoReset()
+  // The struct-row NAME index keys THIS table's spellings — reset it with the table, or
+  // the next program's rows answer with this one's names (see its header). MEASURED, not
+  // defensive: without this line the shared-instance wasm harness fails 438 of 1,939.
+  structNameIxReset()
+  shapeSetIxReset()
+  structTyIxReset()
   sNames = []
+  sRowDecl = []
   sTyIx = []
   sFieldNames = []
   sFieldStart = []
@@ -4529,6 +4601,7 @@ export function collectS(stmts: i32[]) {
       if variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0 {
         sDeclared = true
         sNames.push(s.tdName)
+        recordSRowDeclOfName(s.tdName)
         recordSTyIx(sTyIxOfName(s.tdName)) // D0
         sFieldStart.push(sFieldNames.length)
         const fields = s.tdFields

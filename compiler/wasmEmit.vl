@@ -14109,6 +14109,37 @@ export function emitStmt(body: i32[], stmtIx: i32, fnIx: i32) {
   if s is Call { return emitCallStmt(body, s, stmtIx, fnIx) }
   if s is RetStmt {
     if s.retArg < 0 {
+      // A BARE `return` — the ordinary early exit from a void function, which had no
+      // lowering at all: `vl check` reported the file clean and the emitter refused it, so
+      // `if c { return }` as a guard clause could not be written in VL.
+      //
+      // The population is the functions with an EMPTY result type, and the checker is the
+      // gate on the ANNOTATED half: a bare return in a function whose result type is
+      // written is refused there with "return needs a value of type T", naming the type.
+      //
+      // IT IS NOT THE GATE ON THE INFERRED HALF, and this comment used to say it was
+      // ("so reaching here means the result is void"). `checkRetStmtNode` errors only when
+      // the wanted type is known; under a PENDING return (`want == -2`) a bare return is
+      // accepted, so `function f(c: boolean) { if c { return }  return 5 }` checks clean
+      // with 0 errors and arrives here with `fRetVoid == 0`. The code was always right —
+      // it tests the flag and falls to the loud reject — but the invariant the comment
+      // asserted does not hold, and a reader who believed it would delete the test.
+      //
+      // The lowering is the `return` opcode with nothing pushed. `fRetVoid` is read
+      // position-keyed via `fnStmtsPosOf`, the same channel `emitFuncCode`'s void
+      // fall-through reads (`emit_sections.vl`, where the position is a parameter rather
+      // than a lookup), not re-derived from the annotation.
+      //
+      // Anything the position channel cannot answer for keeps the old loud reject rather
+      // than guessing an arity — a `return` that leaves the stack wrong is invalid wasm,
+      // which is strictly worse than the message it replaces.
+      const rPos = fnStmtsPosOf(fnIx)
+      if rPos >= 0 {
+        if fRetVoid[rPos] == 1 {
+          fbReturn() // 0x0f return
+          return 0
+        }
+      }
       return emitFail("emitProgram: bare return is not supported")
     }
     // Seed the return context + emit the value (struct / list / union / nullable /

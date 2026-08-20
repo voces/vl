@@ -20,13 +20,22 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (container variance — an `i32[]`
-// assigned into an `f64[]`). If that hole is closed the fixture stops producing an
-// invalid module and this pin would silently go inert — so the first assertion checks
-// the PRECONDITION (`vl run` on the source still fails) and fails loudly with a swap
-// instruction rather than passing vacuously. Swap in any other source that emits an
-// invalid module; the whole corpus had none (1,411 files swept, 0 divergences), which
-// is why the fixture must be constructed.
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (member variance — a `{v: i32}`
+// assigned into a `{v: i32 | null}` binding). If that hole is closed the fixture stops
+// producing an invalid module and this pin would silently go inert — so the first
+// assertions check the PRECONDITION and fail loudly with a swap instruction rather than
+// passing vacuously. Swap in any other source that emits an invalid module; the whole
+// corpus had none (1,411 files swept, 0 divergences), which is why the fixture must be
+// constructed.
+//
+// THE PRECONDITION IS TWO ASSERTIONS, NOT ONE, AND THE SECOND WAS ADDED THE FOURTH TIME
+// THIS FIXTURE ROTATED. `vl run` failing is not evidence the MODULE is invalid — it is
+// also how a CHECKER reject looks. When the container-element storage-class rule landed
+// and started rejecting the old `i32[]`-into-`f64[]` fixture at check time, `vl run`
+// still exited 1, the precondition still passed, and the pin failed three assertions
+// later with "the failure must name the artifact as invalid, got: Error: type error" —
+// true, but it buries the actual news. So `vl check` exiting 0 is now asserted first: a
+// fixture the CHECKER rejects is a closed hole, and it says so in those words.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 
@@ -48,14 +57,18 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: an `i32[]` flowing into an `f64[]` binding.
-// The checker accepts the assignment while the two lists have DIFFERENT heap types, so
-// the store is `(ref $i32list)` into a `(ref null $f64list)` slot —
+// Type-checks clean, emits invalid wasm: a `{v: i32}` flowing into a `{v: i32 | null}`
+// binding. The checker accepts the assignment while the two shapes have DIFFERENT heap
+// types, so the store is `(ref $shape)` into a `(ref null $shape')` slot —
 // `type mismatch: expected (ref null $type), found (ref $type)`. This is the N5/A8/A9
-// CONTAINER VARIANCE ruling in `docs/internals/open-rulings.md`, an open checker hole
+// MEMBER VARIANCE ruling in `docs/internals/open-rulings.md`, an open checker hole
 // rather than an emitter one, which is what makes the fixture stable: closing it is a
-// `vl check` reject, and a `vl check` reject would be caught by the precondition
-// assertion below rather than silently blessing this pin.
+// `vl check` reject, and a `vl check` reject is caught by the precondition assertions
+// below rather than silently blessing this pin.
+//
+// The ANNOTATION on `a` is load-bearing and the hint the linter prints for it is
+// expected: without it the literal is built AT the type it flows into (`{v: i32 | null}`)
+// and the module is valid. The hole needs the source pinned to the narrower shape first.
 //
 // It REPLACES the narrowed-litunion-arm fixture — `const x: K | f64 = "aa"; if x is K {
 // const y: K = x }` — which stopped emitting an invalid module once `emitStrToAtom`
@@ -63,9 +76,9 @@ if (GATED && !ENABLED) {
 // `.map` callback PARAMETER spelled as the inline member union, and that one an unread
 // global binding of a generic function's nullable-closure return. The precondition
 // assertion below is what caught all three, exactly as designed.
-const INVALID_SRC = `const a = [1, 2]\n` +
-  `const b: f64[] = a\n` +
-  `print(b[0])\n`;
+const INVALID_SRC = `const a: {v: i32} = {v: 1}\n` +
+  `const b: {v: i32 | null} = a\n` +
+  `print(b.v ?? 0)\n`;
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
@@ -115,6 +128,19 @@ Deno.test({
           "the fixture no longer emits an invalid module (vl run exited 0) — the underlying " +
             "emitter bug was fixed. Swap INVALID_SRC for another source that emits invalid wasm; " +
             "do NOT delete this pin.",
+        );
+      }
+      // ...and it must fail at the ENGINE, not at the CHECKER. `vl run` exits 1 for both,
+      // so without this the pin reports a confusing downstream assertion instead of the
+      // news. A checker reject means the hole closed — same swap instruction, said plainly.
+      const checked = await vl(["check", srcPath]);
+      if (checked.code !== 0) {
+        throw new Error(
+          "the fixture is now REJECTED BY THE CHECKER (vl check exited " + checked.code +
+            ") — the hole it rides is closed, so it no longer reaches the emitter at all. " +
+            "Swap INVALID_SRC for another source that type-checks clean and emits invalid " +
+            "wasm; do NOT delete this pin.\n  vl check said: " +
+            checked.err.trim().split("\n").slice(0, 2).join(" | "),
         );
       }
 

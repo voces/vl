@@ -7,11 +7,17 @@
 // (`emit_classify.vl`); writes no bytes. Carved out of `wasmEmit.vl`
 // (review N18).
 
-import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
+import {
+  arrElemNameRaw,
+  nameIsArray,
+  nameIsSpaceFree,
+  splitUnionAtoms,
+} from "./tyname"
 import {
   inferRetNameByNode,
   isValueUnionName,
   litUnionAliasNameOfTy,
+  mkArrayTy,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nodeTyIsLitUnionAlias,
@@ -67,6 +73,7 @@ import {
   ufcsAliasOf,
 } from "./ast"
 import {
+  annArrowAt,
   capHas,
   drwDispatchOp,
   nameIsF32Array,
@@ -96,6 +103,7 @@ import {
   sFieldIndex,
   structIndexOfExpr,
   synthTypeRef,
+  synthTypeRefTy,
 } from "./emit_classify"
 
 // ── self-method / operator / index-trap dispatch REWRITE (B13 + B14) ─────────
@@ -1092,7 +1100,44 @@ function cboxWalk(ix: i32, boxed: string[]) {
       // the `[init]` literal infers its element type (`let c = 0` → i32[], `= 0.0` → f64[]).
       if n.letType >= 0 {
         const lt = P.nodes[n.letType]
-        if lt is TypeRef { n.letType = synthTypeRef(lt.tyName + "[]", -1) }
+        if lt is TypeRef {
+          // THE ARRAY TYPE IS CONSTRUCTED, NOT RE-PARSED. This site appends `[]` to a name
+          // and `recordClonedNodeTy` used to parse the result straight back — a string
+          // built and taken apart in two adjacent statements, the destringify programme's
+          // own headline shape. The element's arena index is on the annotation node the
+          // checker already recorded, so the array type is one `mkArrayTy` over it and the
+          // name is left as the node's spelling for the consumers that still read it.
+          //
+          // GATED ON THE NAME BEING A SINGLE TOP-LEVEL ATOM, AND THAT GATE IS THE WHOLE
+          // CORRECTNESS OF THE HUNK. `nm + "[]"` is an array spelling only when `nm` is an
+          // atom: `"i32 | string" + "[]"` is `"i32 | string[]"`, which denotes
+          // `i32 | (string[])` — a union whose second arm is a list, not a list of the
+          // union. That concat has always been malformed, and it was HARMLESS because both
+          // halves were wrong together: the name parsed back to the union, `nodeTyIx` held
+          // the union, the indexed-assignment lowering saw a non-array and rejected loudly.
+          //
+          // Handing the type over UNGATED fixes one half and leaves the other, which is
+          // worse than fixing neither: the arena says `(i32 | string)[]` so every
+          // array-shaped check passes, the name-keyed lowering still reads
+          // `"i32 | string[]"`, and the disagreement lands in codegen —
+          // `let u: i32 | string` captured by a closure went from a loud
+          // `indexed-assignment target is not an array` to check-clean INVALID WASM.
+          //
+          // So the hand-over runs only where the SPELLING denotes the type it is handed. A
+          // composite keeps the name path and master's loud reject; widening that reject
+          // into working code is a capability change (a parenthesized `(i32 | string)[]`
+          // does compile and run) and belongs to its own slice with its own fuzz gate.
+          const atoms: string[] = []
+          splitUnionAtoms(lt.tyName, atoms)
+          let boxedTy = -1
+          if atoms.length == 1 {
+            if annArrowAt(lt.tyName) < 0 {
+              const elemTy = nodeTyIxOf(n.letType)
+              if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
+            }
+          }
+          n.letType = synthTypeRefTy(lt.tyName + "[]", -1, boxedTy)
+        }
       }
       const els: i32[] = []
       els.push(n.letInit)
