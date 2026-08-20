@@ -42981,20 +42981,14 @@ opens the other four.
 caller just built from the list. Two of `recordUnMemTys`'s three callers pass a name they did
 not construct; only this one round-trips.
 
-**Measured, and it is not lossless.** Over the corpus: **463 agree, 1 DISAGREES** (9/0 on the
-compiler's own source). The disagreement is a member COUNT mismatch — `vs` and the re-split
-`atoms` differ in length — and the file is
-`tests/cases/types/union-alias-transparent-and-its-gate.vl` at `type AS = (Sc | Dg)`, whose
-own header is about union-alias member faithfulness. The join drops an empty member: the loop
-skips the separator while `udSet == ""`, so a leading empty entry vanishes and
-`unMemTyCount.push(atoms.length)` banks a count one short of what the caller had.
+**Measured: 463 agree, 1 DISAGREES** over the corpus (9/0 on the compiler's own source), in
+`tests/cases/types/union-alias-transparent-and-its-gate.vl` at `type AS = (Sc | Dg)`.
 
-**Not converted, and the reason is the one case rather than the volume.** Passing `vs`
-directly would be trivial and would make the count faithful — but that CHANGES the recorded
-member count for exactly the file that exists to pin union-alias member faithfulness, and
-whether that is a fix or a regression needs the union-alias work read properly, not a
-one-line edit. The file passes today, so the inconsistency is LATENT rather than live. Volume
-is 464 calls corpus-wide and 9 on the self-compile, so nothing rides on the performance.
+**AND THE FIRST EXPLANATION OF THAT ONE CASE WAS WRONG — see B19.** It was read as the join
+DROPPING an empty member and filed as a latent inconsistency. Dumping the actual values shows
+the opposite: `vs` is a SINGLE variant whose name is `Sc|Dg`, and the re-split EXPANDS it to
+two atoms. Nothing is lost; the split is the flattening step, and it is load-bearing. The
+inference was made from a length mismatch without printing either side.
 
 ### METHOD NOTES
 
@@ -43005,3 +42999,50 @@ is 464 calls corpus-wide and 9 on the self-compile, so nothing rides on the perf
   the reason to look was that a join-then-split can LOSE information, and it does — once.
 * **A single disagreement in 464 is a finding, not noise.** The instinct to round it to "0"
   is exactly what the population lesson on this branch has been about, in miniature.
+
+## B19 / D-UNIONFLAT — the census's only round trip is not one, and B18's explanation of it was invented from a length
+
+B18 found the concat census's one join-then-split — `collectU` joins a union alias's variant
+list into `udSet`, `recordUnMemTys` splits it straight back — measured it at 463 agree / 1
+disagree, and explained the one disagreement as *the join dropping an empty member*. That
+explanation was never checked against the data. It is wrong, and so is the "latent
+inconsistency" it implied.
+
+### WHAT THE VALUES ACTUALLY ARE
+
+One probe, printing both sides at the disagreeing site:
+
+    AS   vs=[<Sc|Dg>]   set=<Sc|Dg>   back=[<Sc>,<Dg>]
+
+`type AS = (Sc | Dg)` parses to **ONE** variant whose NAME is the whole spelling `Sc|Dg`. The
+join of a one-element list is that element; the split then EXPANDS it into two atoms. The
+count goes 1 -> 2 and nothing is dropped — the opposite of what B18 recorded.
+
+### AND THE EXPANSION IS LOAD-BEARING
+
+`recordUnMemTys` banks `unMemTyCount.push(atoms.length)`, read at four sites in `emit_rep` to
+iterate a union's MEMBER TYPES. `(Sc | Dg)` has two member types. Passing `vs` directly —
+B18's proposed conversion — would bank a count of **1**, with a single "member" whose name is
+a union spelling, and break that iteration.
+
+So the site is not a redundant round trip at all. `recordUnMemTys` takes a NAME by design,
+because its job is to record the member types OF a spelling, and a parenthesized alias's lone
+variant IS a spelling that has to be flattened. It only looks like join-then-split in the
+degenerate case where every variant is already an atom — which is 463 of 464.
+
+**The census therefore closes with no redundant round trip in it**, which is the answer B18
+was reaching for and got to by the wrong route.
+
+### METHOD NOTES
+
+* **A length mismatch is a prompt to PRINT, not to explain.** "Lengths differ, so something
+  was dropped" is one of two possible directions and B18 picked the wrong one, then wrote a
+  mechanism (`the loop skips the separator while udSet == ""`) that reads plausibly and
+  describes nothing that happens. One probe dumping both sides settled it.
+* **The declined conversion was right for the wrong reason.** B18 declined it because the one
+  case was ambiguous; the real reason is that the conversion is a REGRESSION. Being right by
+  caution is not the same as being right, and the difference shows up the next time someone
+  reads the note and thinks the caution has been discharged.
+* **"Latent inconsistency" is a claim that something is WRONG.** It should not be filed
+  without the same evidence a live defect would need — otherwise it is a rumour with a
+  file path.
