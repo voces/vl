@@ -682,10 +682,21 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
 // duplicate row).
 //
 // `tyCol` is POSITIONAL over `params`, and -1 means "nothing known at this position".
-// `bindGenWalk` declines a -1 outright, so an all -1 column binds nothing, `substTyDeep`
-// returns its input unchanged, and every caller falls back to the name path it uses today.
-// That is what keeps the annotation-driven entry (`monoInstanceFor`, whose column is all -1
-// by construction) byte-identical.
+// `bindGenWalk` declines a -1 outright, so an all -1 column binds nothing and the caller falls
+// back to the name path it uses today.
+//
+// THAT FALLBACK IS THE `pinTys` CALLER'S, NOT BOTH CALLERS'. `monoInstanceFor`'s column is all
+// -1 by construction, so the RETURN site it feeds is unchanged on that entry — but
+// `pinnedTyIx` is essentially never -1 (the clone loop sets it from the node's recorded type,
+// or from `i32TyIx()` in the un-annotated arm), so the `LetDecl` site DOES substitute on every
+// entry including the annotation-driven one. What keeps that safe is the `tyHasTyVar` gate at
+// the substitution, not an empty column here.
+//
+// The bounds guard below is belt-and-braces rather than the contract: both callers' columns are
+// length-guaranteed — `pinTys` by the loud lockstep check at the top of `monoMakeInstance`, and
+// `pinnedTyIx` by being built in that same function, one push per iteration over `params`.
+// A SHORT-BUT-NONEMPTY column would silently bind nothing here, which is the failure policy that
+// lockstep check exists to reject; it is guarded there so it cannot arrive here.
 function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
   let bi = 0
   while bi < params.length {
@@ -2001,15 +2012,21 @@ function monoMakeInstance(
           const sub2 = substTyDeep(origRet, bN, bT)
           if sub2 >= 0 {
             if sub2 != origRet {
-              // NOT A UNION, and this exclusion is a REGRESSION FOUND AFTER SHIPPING, kept
-              // as the narrowest thing that closes it. `substTyDeep` does not NORMALISE the
-              // union it rebuilds, and the annotation path does: `T | string` at
-              // `T := string` substitutes to a two-member union of identical members, while
-              // `nameToTy("string|string")` collapses to plain `string` — the parser folds a
-              // degenerate union and the arena walk does not. Handing the un-collapsed union
-              // over recorded a union box on a binding whose instance returns a bare ref:
-              // `const r: string = f("a")` over `function f<T>(v: T): T | string` went from
-              // running to `vl check --codegen` rc 0 plus invalid wasm.
+              // THE DEGENERATE-UNION FOLD IS UPSTREAM NOW, and this comment used to claim a
+              // union EXCLUSION that no longer exists at this site — read the code, not this
+              // paragraph's history. #1481 shipped a regression here: `substTyDeep` did not
+              // NORMALISE the union it rebuilt while the annotation path did, so `T | string`
+              // at `T := string` substituted to a two-member union of identical members while
+              // `nameToTy("string|string")` collapsed to plain `string`. Handing the
+              // un-collapsed union over recorded a union box on a binding whose instance
+              // returns a bare ref: `const r: string = f("a")` over
+              // `function f<T>(v: T): T | string` went from running to `vl check --codegen`
+              // rc 0 plus invalid wasm.
+              //
+              // #1483 excluded unions here; #1485 then fixed it at the ROOT — `substTyDeep`'s
+              // union arm (`typecheck.vl`) dedupes the substituted members and collapses a
+              // single survivor — and REMOVED the exclusion. Both hand-over sites inherit the
+              // fold from there, so the only gate left at either is `tyHasTyVar`.
               //
               // The dual-run that licensed this hand-over compared RENDERS and counted the
               // union cells among its 22 "differs only nominally" — which was the wrong
@@ -2018,9 +2035,6 @@ function monoMakeInstance(
               // (0 of 2,021 rows moved); no corpus program has a generic whose return union
               // COLLAPSES under its binding.
               //
-              // Unions are the only constructor with this folding step, so excluding them
-              // keeps every other shape converted. Re-widening this needs `substTyDeep` to
-              // fold a degenerate union the way `nameToTy` does, not a looser gate here.
               if !tyHasTyVar(sub2) { retTy = sub2 }
             }
           }
