@@ -179,6 +179,13 @@ const tiersOf = (s: string): Tier[] => {
   if (directive(s, "error")) t.push("reject");
   if (directive(s, "trap")) t.push("trap");
   if (directive(s, "run") || logsOf(s).length > 0) t.push("run");
+  // `@no-instantiate` (the `xfail-miscompile-` kind) is an ACCEPT case here, and that is the
+  // point of the directive rather than a convenience: the program is well-typed and `vl check`
+  // — even `--codegen` — exits 0 on it. The failure is that the module it writes does not
+  // instantiate, which only `vl build`/`vl run` can see. So what native alignment has to assert
+  // is exactly that the native tool ACCEPTS it too; asserting a run tier would demand the
+  // module load, which is the very thing the case pins as broken.
+  if (t.length === 0 && directive(s, "no-instantiate")) t.push("accept");
   if (t.length === 0) {
     for (const d of ["check", "warning", "hint", "info"]) {
       if (directive(s, d)) {
