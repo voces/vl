@@ -171,6 +171,7 @@ import {
   structIndexByName,
   structIndexOfExpr,
   synthTypeRef,
+  synthTypeRefFb,
 } from "./emit_classify"
 import {
   buildFnMap,
@@ -1611,12 +1612,24 @@ function monoMakeInstance(
   pinned: string[],
   pinKinds: i32[],
   pinPays: string[],
+  pinTys: i32[],
   tvN: string[],
   tvV: string[],
   calleeIx: i32,
   annotateI32: boolean,
   cbFnNames: string[],
 ) {
+  // The pin columns are positional and nothing downstream can tell a MISALIGNED one from a
+  // correct one — param j would silently read param k's type. Checked once, loudly, here,
+  // rather than bounds-guarding each read: a guard on the read turns misalignment into a
+  // silently WRONG type, while the sibling `pinned[pj]` on the same line traps. Two reads
+  // off one index must not have opposite failure policies, and a SHORT-BUT-NONEMPTY column
+  // is exactly the case a bounds guard cannot see.
+  if pinTys.length != pinned.length {
+    return emitFail(
+      "emitProgram: monomorphize: pin type column is not parallel to the pins",
+    )
+  }
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -1689,6 +1702,13 @@ function monoMakeInstance(
                     // node's type under the same pin this column holds (`monoBuildPinCol`
                     // is `pinKinds`' only producer and computes it with `pinKindOfName`),
                     // and this arm needs no index of its own.
+                    // The NAME path, not the fallback the clone arm below takes. Equivalent
+                    // today rather than by construction: this arm is gated on `annotateI32`,
+                    // which only `monoInstanceFor` passes true, and that caller's column is
+                    // all -1. If a call-driven path ever sets it, route this through
+                    // `synthTypeRefFb` too — otherwise the recorded type would depend on
+                    // which call site materialized the instance first, which is the
+                    // ORDER-INDEPENDENCE this block exists to keep.
                     hpp.parType = synthTypeRef(pinned[hp], -1)
                   }
                 }
@@ -1731,11 +1751,11 @@ function monoMakeInstance(
           if pinned[pj] == tyNameOf(p3.parType) {
             nt = p3.parType
           } else {
-            nt = synthTypeRef(pinned[pj], -1)
+            nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
             synthed = true
           }
         } else if annotateI32 || pinned[pj] != "i32" {
-          nt = synthTypeRef(pinned[pj], -1)
+          nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
           synthed = true
         }
         // C1 endgame: the pinned CONCRETE param type is recorded on the instance's annotation
@@ -2168,9 +2188,13 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
       v = v + 1
     }
     const pinned: string[] = []
+    // No argument node on this path (an annotation-driven binding), so nothing is known —
+    // an all -1 column is exactly today's behaviour.
+    const pinTys: i32[] = []
     let j = 0
     while j < pinnedNames.length {
       pinned.push(pinnedNames[j])
+      pinTys.push(-1)
       j = j + 1
     }
     // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
@@ -2184,6 +2208,7 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
       pinned,
       pinKinds,
       pinPays,
+      pinTys,
       tvN,
       tvV,
       letInitIx,
@@ -2432,6 +2457,11 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       const tvN: string[] = []
       const tvV: string[] = []
       const pinned: string[] = []
+      // The ARENA TYPE each pinned param denotes, parallel to `pinned` — a per-parameter
+      // FACT beside the parameters, the same shape `pinKinds` / `cbFnNames` take. Sourced
+      // from the ARGUMENT's recorded type, and consumed only as a FALLBACK where the pinned
+      // NAME does not resolve (`recordClonedNodeTyFb`). -1 = nothing known.
+      const pinTys: i32[] = []
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]
@@ -2455,6 +2485,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
               )
             }
             pinned.push(an)
+            pinTys.push(nodeTyIxOf(args[i]))
           } else {
             // The DECLARED spelling where the annotation IS a type parameter
             // (`monoDeclAnnName`), the arena's canon'd one everywhere else. Without it a
@@ -2505,8 +2536,10 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                   )
                 }
                 pinned.push(pinC)
+                pinTys.push(nodeTyIxOf(args[i]))
               } else {
                 pinned.push(ann)
+                pinTys.push(nodeTyIxOf(args[i]))
               }
             } else {
               const an2 = monoArgTyName(args[i], ctx)
@@ -2550,8 +2583,10 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
               }
               if ann != tp {
                 pinned.push(bind + "[]")
+                pinTys.push(nodeTyIxOf(args[i]))
               } else {
                 pinned.push(bind)
+                pinTys.push(nodeTyIxOf(args[i]))
               }
             }
           }
@@ -2578,6 +2613,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         pinned,
         pinKinds,
         pinPays,
+        pinTys,
         tvN,
         tvV,
         c.callFn,
