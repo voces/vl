@@ -43658,3 +43658,75 @@ array/map/union arms, `resolveShapeToNominal`'s render→struct-row bridge, and 
   `vtKindOfType`'s litunion arm, and the tree's own repeated statements of the rep), not on a
   byte-level experiment — a size comparison of two toy modules was attempted and came back
   inconclusive, because the toy's comparison const-folds and symbol names are stripped.
+
+## B29 / D-SPACEDREN — the recorder banks a SPACED render and the emit-side predicates are written for the spaceless one; one arm has been dead for it all along
+
+Converting `buildFnMap`'s remaining name arms (after #1511's scalars and #1515's arrays) turned up
+a systematic mismatch that is worth more than the conversion was.
+
+### 1. THE FINDING
+
+The map arm is `nameIsMap(inm) && mapValNameOf(inm) == "i32"`. Probing it against its arena
+equivalent (`TyMap`, not a Set, value `TyPrim i32`) over the corpus: **11 files reach, 1
+disagrees.** The disagreeing name is
+
+```
+{[string]: i32}
+```
+
+— with a **space** after the colon. `mapValNameOf` slices from immediately after `]:`, so it
+returns `" i32"`, which is not `"i32"`, and the arm declines. The arena says map-of-i32.
+
+The space is not an accident of that one program. `tyToStr`'s map arm is literally
+`"{[" + mk + "]: " + mv + "}"` and its object arm is `names[i] + ": " + …`, while
+`tyToEmitName` renders the same types SPACELESS. The lambda cascade's `recordable` path banks
+`anm = tyToStructStr(inferred)` — the SPACED one — and every emit-side name predicate in the
+tree is written for the spaceless one.
+
+**So the map arm cannot fire for any `recordable` row, and never could.**
+
+### 2. IT IS NOT A VISIBLE DEFECT, WHICH IS WHY IT SURVIVED
+
+The arm's own header says it exists because *"`criClassify`'s `exprMap` can miss it (a returned
+LOCAL's kind isn't collected during the global return pass), so set it reliably from the
+checker's inferred return NAME"* — a SAFETY NET. Probed directly:
+
+```
+function mk() { const m = Map(); m["k"] = 7; return m }
+print(mk()["k"] ?? 0)      // 7 — works
+```
+
+The expression path covers the shape, so the net's hole is not currently exposed. Converting the
+arm to the arena would therefore be a **WIDENING with no demonstrated benefit** — it would make
+the arm start firing on rows it has never fired on, which is precisely what this file's own
+D-SHAPEFIELD precedent forbids ("unreached is not licensed", "would WIDEN what this stores").
+
+**Declined, and recorded rather than attempted.**
+
+### 3. WHY THIS IS AN ARGUMENT FOR THE PROGRAMME, NOT AGAINST IT
+
+An arena type has no spacing. Every predicate that slices after `]: ` or `: ` is carrying a
+dependence on which of two renderers produced its input — a dependence nothing declares, nothing
+tests, and which silently disables an arm rather than failing. The scalar and array arms
+(#1511/#1515) do not have it because a bare scalar name has no separator to space.
+
+The general shape to look for: **a name-side predicate whose input can come from EITHER renderer**.
+`tyToStructStr` and `tyToEmitName` are not interchangeable, and the recorder funnels both into one
+column.
+
+### 4. WHAT THIS SUGGESTS FOR THE REST
+
+Before converting any remaining name arm, ask which renderer produced the name it reads. If both
+can, the arm has a silent branch and the conversion is a behaviour change — measurable, but not
+mechanical. That question was not in B26's specification and should be.
+
+### METHOD NOTES
+
+* **A single disagreement in 11 files is worth chasing to its spelling.** The count said "almost
+  agrees"; the NAME said "one renderer disagrees with the other, systematically".
+* **A dead safety net looks exactly like a live one until something else stops covering for it.**
+  The map arm has presumably never fired for a spaced row, and nothing noticed because the
+  expression path did the work.
+* **Print the value, not the verdict.** `nMap != aMap` is a boolean; `name=[{[string]: i32}]` is
+  the finding. The probe was changed to report the spelling only after the boolean count came
+  back at 1, and the spelling is the entire content of this entry.
