@@ -44389,3 +44389,70 @@ should be fixed as a defect with its own fixtures, not landed as a destringify s
   conversions in this programme rested on "0 disagreements". The first one that disagrees turns out
   to be the string side being wrong, which is a better outcome than a blocker and a worse one than
   a conversion: it is a bug with a known repro count and no owner.
+
+## B39 / D-VARSIDE — the variant table's missing sidecar, diagnosed: DECLARED unions have no arena member column at all, and giving them one moves 90 corpus rows
+
+The 2026-08 census named the variant table as the clearest remaining conversion: `sTyIx`,
+`rlElemTyIx`, `mvValTyIx` and `uFieldElemTyIx` all exist, `uVarTyIx` does not, `emit_collect`'s own
+header records the gap ("the variant table has no arena sidecar yet"), there are only two mint
+sites, and `emitReturnValue` puts an arena gate and a string scan on CONSECUTIVE LINES:
+
+```
+if retVariantFlag(fn.fnRet) == 1 {                     // pure arena
+  pendingVariantIdx = variantIndexOf(tyNameOf(fn.fnRet))  // render + linear scan over spellings
+}
+```
+
+It was built. The result is the same one the tree already recorded for an earlier attempt at this
+table — **MEASURED UNVERIFIABLE** — and this entry says why.
+
+### 1. THE SIDECAR FILLS, AND THE TWIN NEVER ANSWERS
+
+`uVarTyIx` parallel to `uVariants`, filled at both mint sites, plus `variantIndexOfTy` — an index
+compare where the name twin is a linear scan. Dual-run at the consecutive-lines site:
+
+**2 corpus files reach it. The arena twin answers on 0 of them.**
+
+### 2. THE REASON: ONE OF THE TWO MINT SITES HAS NO MEMBER COLUMN TO READ
+
+Mint site 1 (INLINE unions) is preceded by `recordUnMemTys(name)`, so `unMemAtoms` and `unMemTys`
+are appended in lock-step and the member type is one parallel read away.
+
+Mint site 2 (DECLARED unions, `type U = Cat | Dog`) has **no `recordUnMemTys` call at all** —
+`recordUnMemTys` has exactly one caller tree-wide, and it is site 1's. So a declared union's row
+has no `unMemTys` slice, and the sidecar can only pad -1 there.
+
+**The D-UNION foundation column is populated for INLINE unions only.** That is a wider fact than
+the variant table, and it was not previously written down: every arena consumer of a declared
+union's members falls through to a name path today, not by choice but by absence.
+
+### 3. AND SUPPLYING IT IS NOT A SIDECAR CHANGE
+
+Adding `recordUnMemTys(udSet)` at site 2 makes the twin answer immediately — 2 files, 0
+divergences — and moves **90 corpus rows**, with suite failures. The column is read by consumers
+that today get the "recorder missed this row entirely" marker and take a documented fallback;
+filling it changes which path they take.
+
+So the variant sidecar is blocked behind a much larger question — *should a declared union carry an
+arena member column at all, and what do the consumers that currently fall through do when it
+appears?* — and that question is worth its own slice with its own measurement, not a paragraph in
+this one.
+
+### 4. WHAT THE CENSUS GOT RIGHT AND WRONG
+
+Right: the gap is real, the two mint sites are the whole surface, and the consecutive-lines site is
+the clearest illustration in the compiler of an arena gate feeding a string scan.
+
+Wrong: "**only two mint sites** to instrument". Both mint sites are trivially instrumentable; the
+one that matters has nothing to instrument FROM. The census read the sites and not their
+preconditions — the same shape of miss B33's plan made about the struct arms, and B34 corrected.
+
+### METHOD NOTES
+
+* **A sidecar is only as good as the column it copies from.** Two mint sites, one source, and the
+  half with no source is the half that carries the declared unions — i.e. the ones the consumers
+  actually query.
+* **"MEASURED UNVERIFIABLE" is a reproducible diagnosis, not a shrug.** The tree recorded that
+  verdict for an earlier attempt without saying why; this one says why, and the why is a missing
+  call with exactly one existing caller.
+* **When the fix for a 0-answer measurement moves 90 rows, the measurement was not the problem.**
