@@ -14577,7 +14577,12 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
 // (`{value: T}`) pins `T` from the argument's field, a callback param's
 // signature from the argument function. Recursion over a cyclic arena (a
 // recursive named type) is cut by the visited-pair stack.
-function bindGenWalk(expIx: i32, atIx: i32, bNames: string[], bTys: i32[]) {
+export function bindGenWalk(
+  expIx: i32,
+  atIx: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
   if expIx < 0 || atIx < 0 { return 0 }
   const e = T.tys[expIx]
   if e is TyVar {
@@ -14642,7 +14647,7 @@ function bindGenWalk(expIx: i32, atIx: i32, bNames: string[], bTys: i32[]) {
 // rebuild ONLY when a child actually changed, so a concrete type keeps its
 // arena identity (and the in-place pinning semantics that ride on it).
 // Cyclic arenas (recursive named types) return themselves unchanged.
-function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
+export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   if tyIx < 0 || bNames.length == 0 { return tyIx }
   const t = T.tys[tyIx]
   if t is TyVar {
@@ -22634,6 +22639,65 @@ export function nodeTyIsUnion(ix: i32) {
 // membership lowerings (`emitIs`'s atom / string / numeric arms) are what answer for it.
 // Depth-capped for the recursive arena; a one-member `TyUnion` wrapper is peeled by the
 // same recursion that walks a real member set.
+// COMPLETENESS of a substitution (destringify D-MONORET): does `ty` still contain an
+// unresolved `TyVar` anywhere inside it?
+//
+// `substTyDeep` rebuilds only the children that CHANGED, so a type parameter it could not
+// bind is left in place rather than reported. A consumer that hands the result onward as a
+// concrete type therefore cannot tell "substituted fully" from "substituted partly", and
+// the difference is not cosmetic: recording a partly-substituted return type on a
+// monomorphized instance is a WRONG type, the shape three hand-overs on this branch had to
+// be reverted for. This is the predicate that separates them.
+//
+// DEPTH-BOUNDED rather than seen-stack'd, matching `tyRenderSoftensLitsGo` beside it: a
+// recursive named type is cyclic in the arena, and the bound both terminates and is the
+// conservative answer — running out of depth returns TRUE (assume a variable may lurk), so
+// an unknown is treated as incomplete and the caller keeps its name path. A predicate that
+// gates a hand-over must fail toward the OLD behaviour.
+export function tyHasTyVar(ty: i32) { tyHasTyVarGo(ty, 12) }
+
+function tyHasTyVarGo(ty: i32, depth: i32) {
+  if ty < 0 { return false }
+  if depth <= 0 { return true }
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyArray { return tyHasTyVarGo(t.aElem, depth - 1) }
+  if t is TyNullable { return tyHasTyVarGo(t.nInner, depth - 1) }
+  if t is TyNeg { return tyHasTyVarGo(t.negTy, depth - 1) }
+  if t is TyMap {
+    if tyHasTyVarGo(t.mKey, depth - 1) { return true }
+    return tyHasTyVarGo(t.mVal, depth - 1)
+  }
+  if t is TyObj {
+    const fs = t.objFieldTypes
+    let i = 0
+    while i < fs.length {
+      if tyHasTyVarGo(fs[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let k = 0
+    while k < ps.length {
+      if tyHasTyVarGo(ps[k], depth - 1) { return true }
+      k = k + 1
+    }
+    return tyHasTyVarGo(t.fnRet, depth - 1)
+  }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let u = 0
+    while u < ms.length {
+      if tyHasTyVarGo(ms[u], depth - 1) { return true }
+      u = u + 1
+    }
+    return false
+  }
+  false
+}
+
 export function tyRenderSoftensLits(ty: i32) { tyRenderSoftensLitsGo(ty, 8) }
 
 function tyRenderSoftensLitsGo(ty: i32, depth: i32) {
