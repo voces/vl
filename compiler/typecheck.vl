@@ -1653,7 +1653,8 @@ let inferRetNameAtoms = 1
 // THE FALL-THROUGH IS NOT A PRODUCER and gets its own code rather than 0-by-omission — B26
 // numbered it 0 and spent a measurement discovering that "no rung" and "rung 0" are different
 // claims. `IR_RUNG_NONE` means the `recordable` path (`anm`, the SPACED `tyToStructStr` render),
-// which admits three unrelated shapes through one gate and therefore determines nothing.
+// which admits three unrelated shapes through one `||`. Those three now carry their own codes
+// (the `IR_REC_*` band below), so a fall-through row says WHICH gate admitted it.
 //
 // The cascade's INITIALIZER (`unm = sfbNm`) is a producer despite not being spelled
 // `if unm == ""`, and B27 found it banked at 0 with the fall-through, which is what made an
@@ -1688,6 +1689,26 @@ const IR_RUNG_NUL_ELEM_LIST = 8
 // consumer, and all this needs is for the two legs to say which they are. Splitting the code is
 // the whole fix.
 const IR_RUNG_NUL_ELEM_LIST_NICHE = 29
+// ── THE FALL-THROUGH'S THREE GATES ───────────────────────────────────────────────────────────
+// NOT PRODUCERS, which is why they are not rungs. `recordable` admits three unrelated shapes
+// through one `||`, so banking 0 for all three said only "not a producer" — the conflation B26
+// spent a measurement discovering. These name WHICH GATE admitted the row.
+//
+// THEIR OWN BAND (>= 40), so the in-band cascade numbering (1..27) and the out-of-band
+// producer/leg numbering (28 initializer, 29 second leg, next leg 30) never have to step over
+// them. A future gate takes 43; a future leg still takes 30.
+//
+// THE THREE ADMITTED SETS ARE PAIRWISE DISJOINT ON EVERY INPUT, not merely on reached ones:
+//   · scalar-list vs classifiable — `arrElemNameRaw` is a function, and {i32,string} is disjoint
+//     from {i64,f32,f64}; the six bare-leaf spellings fail `nameIsArray` so the cut yields "".
+//   · obj-shape vs either array leg — one requires a final `]`, the other a final `}`.
+//   · obj-shape vs the bare leaves — none of them opens with `{`.
+// So no tie-break rule is needed and the `||` order is NOT load-bearing. It is preserved anyway,
+// so this split asserts nothing about it. If a future change WIDENS any gate, disjointness must
+// be re-argued rather than assumed.
+const IR_REC_SCALAR = 40 // `isClassifiableRetName`
+const IR_REC_OBJ_SHAPE = 41 // `isObjShapeName`
+const IR_REC_SCALAR_LIST = 42 // `isScalarListRetName`
 const IR_RUNG_NUL_STRUCT_ELEM_LIST = 9
 const IR_RUNG_NUL_MAP_ELEM_LIST = 10
 const IR_RUNG_NUL_LIST_ELEM_LIST = 11
@@ -18104,12 +18125,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // that COLLAPSES to one union variant (`(a) => if a is Cat { a } else { catShape }`)
       // types as that variant's shape; the emitter resolves it to the concrete variant
       // (`variantIndexOfTypeName`) so a `.map` result is the variant ref list, not the box.
-      const recordable = sfbNm == "" &&
-        smfNm == "" &&
-        spfNm == "" &&
-        (isClassifiableRetName(anm) ||
-        isObjShapeName(anm) ||
-        isScalarListRetName(anm))
+      // WHICH GATE admitted the fall-through row, asked in the SAME short-circuit the `||` had:
+      // the gates run only when all three canonical recorders declined, each runs at most once,
+      // and they run in the source order they were written in. `recordable` is bit-identical to
+      // the disjunction it replaces.
+      let recCode = IR_RUNG_NONE
+      if sfbNm == "" && smfNm == "" && spfNm == "" {
+        if isClassifiableRetName(anm) { recCode = IR_REC_SCALAR }
+        else if isObjShapeName(anm) { recCode = IR_REC_OBJ_SHAPE }
+        else if isScalarListRetName(anm) { recCode = IR_REC_SCALAR_LIST }
+      }
+      const recordable = recCode != IR_RUNG_NONE
       // A UNION inferred/contextual return (`i32 | string`, `Cat | Dog`) — export its emitter-format
       // name (value-union or struct-union) under the same node sentinel, mirroring the named-function
       // A20 loop. This is the CONTEXTUAL return the checker proved for the lambda at ITS boundary
@@ -18368,7 +18394,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // THE RUNG, on the identical footing as the width above it: read from the cascade only on
       // the path that RAN the cascade. A `recordable` row is structurally incapable of carrying
       // a rung, which is what it means for the fall-through not to be a producer.
-      let rRung = IR_RUNG_NONE
+      // THE GATE CODE ON THE `recordable` PATH, the producer's rung otherwise. A recordable row
+      // is still structurally incapable of carrying a PRODUCER rung — it never runs the cascade —
+      // but it now carries the identity of the gate that admitted it, which is what the arm-9
+      // conversion reads. The gate codes are never written to `inferRetNameRung`, so they cannot
+      // leak into a later row through the producer channel.
+      let rRung = recCode
       if !recordable { rRung = inferRetNameRung }
       // A DEFERRED JOIN is a per-call-site placeholder, not a shape the emitter can
       // classify a return by — see the named-function twin in `elaborateInferRets`.
@@ -21527,7 +21558,7 @@ export function checkProgram(rootIx: i32) {
             if isClassifiableRetName(enm) {
               // `isClassifiableRetName`'s admitted set is six scalar spellings plus
               // `i32[]`/`string[]` — every one of them a single atom (#1115).
-              recordInferRet(efn.fnName, enm, er, 1, IR_RUNG_NONE)
+              recordInferRet(efn.fnName, enm, er, 1, IR_REC_SCALAR)
             } else {
               // A VALUE union/nullable inferred return (`i32 | string`, `i32 | null`)
               // lowers through the same `uBoxIdx` machinery as an annotation — export
@@ -21807,11 +21838,10 @@ export function inferRetRowByNode(nodeIx: i32): i32 {
   inferRetRowOf("#" + i32ToStr(nodeIx))
 }
 
-// The rung banked for row `i`, or -1 out of range. `IR_RUNG_NONE` means NO PRODUCER ANSWERED, and
-// that covers two distinct shapes rather than one: the lambda cascade's `recordable`
-// fall-through (which records the SPACED `tyToStructStr` render), and the named loop's `enm`
-// twin of it. It never means "a producer answered and was not banked" — every producer in both
-// cascades carries a code.
+// The rung banked for row `i`, or -1 out of range. NO RECORDED ROW BANKS `IR_RUNG_NONE` any
+// more: every producer in both cascades carries a code, and the `recordable` fall-through now
+// carries the identity of the GATE that admitted it (the `IR_REC_*` band). 0 survives only as
+// the unbanked sentinel — the producer global's initial value and its pre-cascade reset.
 export function inferRetRungAt(i: i32): i32 {
   if i < 0 || i >= inferRetRung.length { return -1 }
   inferRetRung[i]
@@ -21908,6 +21938,14 @@ export function inferRetRungIsBoxedUnion(i: i32): boolean {
   if r == IR_RUNG_VARIANT_BOX { return true }
   if r == IR_RUNG_LITUNION_ALIAS { return true }
   false
+}
+
+// The fall-through's SCALAR-LIST leg. `isScalarListRetName`'s admitted set is exactly
+// {"i64[]", "f32[]", "f64[]"} — `arrElemNameRaw` rejects anything not ending `[]` and otherwise
+// drops exactly those two characters, so `arrElemNameRaw(nm) == "f64"` IFF `nm == "f64[]"`. Arm
+// 9's own three-way predicate is the same three strings, from the same single home for the cut.
+export function inferRetRungIsScalarListRet(i: i32): boolean {
+  inferRetRungAt(i) == IR_REC_SCALAR_LIST
 }
 
 // Rungs 6 and 7 — `nullableRetName` and `nulLitUnionRetName`, the only producers that mint a
