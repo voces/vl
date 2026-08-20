@@ -458,6 +458,7 @@ import {
   rlInternName,
   rlSlotByName,
   sFieldElemTyIxRow,
+  sFieldIndex,
   sFieldRowKeyI32,
   scopeBind,
   scopePop,
@@ -4555,6 +4556,26 @@ function pushFieldRow(
 // a field whose type has no code fails loudly. Then the shape passes, in order: nested inline
 // field shapes, generic-alias applications, inline object-TYPE annotations, and anonymous
 // object literals. Returns 0, or -1 (via `emitFail`).
+// The struct row whose field-NAME set matches `fnames` exactly, or -1. Bounded by
+// `sFieldCount.length` rather than `sNames.length`: the row being built has already had its
+// NAME pushed and has no field data yet, so the name column runs one ahead here.
+function rowWithFieldNameSet(fnames: string[]): i32 {
+  let si = 0
+  while si < sFieldCount.length {
+    if sFieldCount[si] == fnames.length {
+      let all = true
+      let k = 0
+      while k < fnames.length {
+        if sFieldIndex(si, fnames[k]) < 0 { all = false }
+        k = k + 1
+      }
+      if all { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
 export function collectS(stmts: i32[]) {
   sDeclared = false
   // The per-program literal-resolution memo keys node indices against THIS table —
@@ -4605,10 +4626,74 @@ export function collectS(stmts: i32[]) {
         recordSTyIx(sTyIxOfName(s.tdName)) // D0
         sFieldStart.push(sFieldNames.length)
         const fields = s.tdFields
+        // FIELD ORDER IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET.
+        // The 2026-08 ruling is that `{a: i32, b: string}` and `{b: string, a: i32}` are the
+        // SAME TYPE, and the checker agrees — `assignable` takes one where the other is
+        // asked for. The emitter did not: two named declarations always mint two ROWS, and
+        // two rows collapse to one wasm HEAP TYPE only when their field SEQUENCE matches. So
+        // the permuted pair emitted two struct types and the assignment was check-clean
+        // INVALID WASM (`xfail-miscompile-permuted-struct-fields.vl`).
+        //
+        // Laying the second declaration out in the first's order makes the sequences match,
+        // and the heap-type merge that already unifies same-order aliases does the rest —
+        // no new dedup, no alias table, no change to `sNames`. The INLINE spelling has
+        // always resolved this way (`annShapeIndexOf` buckets on a SORTED field-set id and
+        // matches BY FIELD NAME), so this is the named path reaching the answer the inline
+        // path already gives; `types/permuted-inline-shape-shares-row.vl` is that control.
+        //
+        // `tdFlat` IS THE RULING'S OWN EXCEPTION and the reason this is one condition rather
+        // than a judgement: a `flat type`'s field order IS its layout (`memory/
+        // flat-layout-grid.vl`: "order is layout, and nothing is reordered to pack better"),
+        // so a flat record is never reordered.
+        //
+        // Reordering does not change WHICH fields a row has or their types — only the
+        // sequence — and it is applied only when a prototype with the identical field-name
+        // set already exists, so a shape with no twin lays out exactly as declared.
+        const fOrder: i32[] = []
+        let fq = 0
+        while fq < fields.length {
+          fOrder.push(fields[fq])
+          fq = fq + 1
+        }
+        if s.tdFlat == 0 {
+          const fnames: string[] = []
+          let fp = 0
+          while fp < fields.length {
+            const fpn = P.nodes[fields[fp]]
+            if fpn is FieldDef { fnames.push(fpn.fdName) }
+            fp = fp + 1
+          }
+          if fnames.length == fields.length {
+            const proto = rowWithFieldNameSet(fnames)
+            if proto >= 0 {
+              const reord: i32[] = []
+              let rp = 0
+              while rp < sFieldCount[proto] {
+                const want = sFieldNames[sFieldStart[proto] + rp]
+                let rq = 0
+                while rq < fields.length {
+                  const rqn = P.nodes[fields[rq]]
+                  if rqn is FieldDef {
+                    if rqn.fdName == want { reord.push(fields[rq]) }
+                  }
+                  rq = rq + 1
+                }
+                rp = rp + 1
+              }
+              if reord.length == fields.length {
+                let rw = 0
+                while rw < reord.length {
+                  fOrder[rw] = reord[rw]
+                  rw = rw + 1
+                }
+              }
+            }
+          }
+        }
         let cnt = 0
         let fi = 0
-        while fi < fields.length {
-          const fnode = P.nodes[fields[fi]]
+        while fi < fOrder.length {
+          const fnode = P.nodes[fOrder[fi]]
           if fnode is FieldDef {
             const code = fieldTypeCode(fnode.fdType)
             if code < 0 {
