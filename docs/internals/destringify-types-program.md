@@ -48193,3 +48193,61 @@ measured against the corpus. The string is doing work no available structure can
 * **For a membership test, measure the FALSE path.** Every reader shape in this programme has been
   judged on whether it agrees; this one agrees perfectly and is still worthless, because agreement
   says nothing about which branch does the work. 12 short-circuits out of 2,464.
+
+## B99 — the union question, answered with no spelling at all
+
+Three shapes were built and measured and all three failed: interning (133 broken rows, B96),
+index-authoritative (2 broken, B98), index-with-name-fallback (0 broken and 99.5% of queries still
+running the name scan, B98). This one works, and it works because it stops trying to give the
+registry ONE identity.
+
+```vl
+export function isUnionOfTy(ty: i32): boolean {
+  // DECLARED: identity is the declaration. Match by arena index — stable because
+  // `declTyIxOfName` LOOKS the declaration UP rather than constructing it.
+  // INLINE: no declaration, so identity is STRUCTURAL. Match with `tySame` against the member
+  // types the registry already banks in `unMemTys`.
+}
+```
+
+**Corpus A/B: 0 rows. No spelling is consulted.** `nameIsArray(nd.tyName) && !isUName(nd.tyName)`
+is now `nameIsArray(nd.tyName) && !isUnionOfTy(nodeTyIxOf(i))` — the union half asks the arena
+only.
+
+### WHY THE OTHER THREE FAILED, IN ONE SENTENCE EACH
+
+* **Interning** forced structural identity onto declarations, which are nominal — `type Kf` and
+  `type Ki` must not merge.
+* **Index-authoritative** forced nominal identity onto inline spellings, which have no declaration
+  to be nominal about.
+* **Name-fallback** was correct for both and removed nothing, because a membership test that mostly
+  answers NO never reaches the short-circuit.
+
+**Each was a single mechanism applied to a heterogeneous table.** The registry holds two kinds of
+row and they do not have the same kind of identity; the reader has to say so.
+
+### `tySame` — structural equality, depth-bounded
+
+Handles `TyPrim`, `TyArray`, `TyNullable`, `TyUnion`, `TyObj` (field NAMES and types — an object
+type IS its field set) and `TyMap`. Depth 24. It exists because the arena is an append log, so
+index equality is CONSTRUCTION identity; `tySame` is the comparison that does not care.
+
+It is deliberately NOT used for declared unions. Their sameness is nominal, and B96 measured what
+structural comparison does to them.
+
+Building it out took two attempts: the first version omitted `TyObj` and left exactly one corpus
+file failing (a `{w:i32} | (i32|string)[]` member). Adding the struct and map arms closed it.
+
+### WHAT THIS OPENS
+
+Three more sites ask the same question — `emit_collect`'s ref-array rung (168 rows),
+`emit_sections`' param reject ladder, and `letIsStringArray`'s rung — and each can now be measured
+against `isUnionOfTy` rather than against a wall. The `structIndexByName` and `variantIndexOf`
+registries are the same shape and admit the same treatment.
+
+### METHOD NOTE
+
+* **When several single-mechanism attempts fail in opposite directions, the table is
+  heterogeneous.** Interning failed by over-merging, index-authority by under-matching, the
+  fallback by not removing anything — three failures pointing at one cause, which is that the rows
+  were never the same kind of thing.
