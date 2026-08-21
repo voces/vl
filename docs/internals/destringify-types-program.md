@@ -51061,3 +51061,58 @@ error.**
 
 The check that would have caught all three costs one build: print WHICH caller reached the
 probe, not just what it saw.
+
+## B155 — bucket 4's core chain, traced to a root that is already declined
+
+B154 restored bucket 4's path to "thread nodes to the callers that hold strings". Tracing the
+largest such chain to its root shows the threading model does not fit it.
+
+`nameFieldCode(ftxt)` has six callers. The two in `emit_collect` take their `ftxt` from
+`shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)` — a routine that **splits a rendered
+shape spelling into per-field texts**. There is no node to thread because the fields themselves
+were manufactured from a string: the caller holds a NAME of an inline shape, not the shape's AST
+field nodes.
+
+So destringifying that chain is not "add a node parameter". It is replacing a traversal —
+iterate the `TyObj`'s `objFieldNames`/`objFieldTypes` instead of splitting the rendering — which
+is what "the emitter's internal currency is the rendered name" (B128) actually costs when you
+try to pay it.
+
+And the chain's root is already measured and declined, in a note as careful as any in this log:
+
+> "An additive probe over the 1,269-file corpus disagreed on 15 files, EVERY one in that
+> direction … `fnValUsed` is MONOTONE, so the arena's extra `true`s would intern closure
+> machinery this compiler does not intern today — a behavior change, not a destringification.
+> This site retires with the alias-blindness, not before."
+
+The arena resolves an alias the name test cannot see, so it answers TRUE more often; the flag it
+feeds is monotone; more trues means interning machinery the compiler does not intern today. That
+is a capability change wearing a refactor's clothes, and the site says so.
+
+### What bucket 4 actually contains
+
+Not one kind of work, three:
+
+| kind | example | what it needs |
+| --- | --- | --- |
+| a caller that holds a node but passes a name | `fieldCodeOfSpelling(ty.tyName, tyIx)` | nothing — already threaded, converts when the question matches (B143) |
+| a caller that holds only a string | `nameFieldCode(ftxt)` | replace the TRAVERSAL, not the signature |
+| a root that is declined on behaviour | `collectFnValUse`'s shape entry | a capability decision, separate from destringification |
+
+The ~258 count is real and the "one interface change" framing is not. Threading signatures
+reaches the first kind, which is largely converted; the second kind needs its producer rewritten;
+and the third is not a destringify question at all.
+
+### The programme's honest end state
+
+Every category has now been enumerated and each has a named disposition:
+
+- **bucket 1** — 2 of 3 converted; the survivor's cause (type-parameter binding, shadowed alias)
+  has no receipt in any of the five sources
+- **bucket 2** — dissolved; the interning tables were dual-keyed all along
+- **bucket 3** — exhausted; 17 conversions, every decline causally recorded
+- **bucket 4** — three kinds of work, only one of which is the signature sweep, and at least one
+  root declined on behaviour rather than on representation
+
+What is left is not a list of sites this method can grind through. It is a traversal rewrite and
+a capability decision, and both are choices about the compiler rather than repairs to it.
