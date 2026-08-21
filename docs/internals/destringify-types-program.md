@@ -45590,3 +45590,65 @@ through the callers, which nobody has costed.
   already known.
 * **"N askers, one convertible" is now the expected shape.** The next inventory pass should
   record the convertible count, not the asker count, or the queue keeps overstating what is left.
+
+## B55 / D-SIZING — the remaining work is 129 sites, not five, and B52's own count was wrong
+
+An inventory keyed on CONVERTIBILITY rather than on predicate names changes the picture of this
+programme completely, and it corrects three of its recent entries.
+
+### 1. THE NUMBER
+
+| bucket | count |
+| --- | --- |
+| **A1 — convertible now** (a node or type index is in scope at the decision) | **129** |
+| A2 — a name arm sitting BEHIND an arena rung (deleting it is a behaviour change, not a swap) | 22 |
+| B — blocked on threading, grouped into **8 prerequisites** | ~1,016 asker calls |
+| C — not a violation (diagnostics, name-as-output, litunion i32 compares) | ~430 |
+
+B50–B54 each reported "N askers, ONE convertible" and B54 concluded that *"the remaining surface
+is dominated by predicates whose callers hold a name and not a node"*. **That conclusion was
+wrong.** 129 sites have a node in scope right now.
+
+### 2. WHY THE SIZING WAS WRONG, MECHANICALLY
+
+Sizing by PREDICATE and then eyeballing the argument's surface form fails in BOTH directions:
+
+* it **over-counts**, by listing the 15 `nameIsI32KeyedMap` askers that hold only a string as
+  though they were pending work;
+* it **under-counts**, and this is the one that matters — `emit_collect.vl:4898` passes
+  `tyNameOf(fnode.fdType)` with the node *right there as the renderer's argument*, and `:5029`
+  passes `ftxt`, rendered from `fnode.fdType` 33 lines up with `fnode` still live. B52 filed both
+  as string-only. **That item is 17/4, not 17/2**, and this entry converts the two it missed.
+
+The reliable query is not about the argument. It is: **what is the nearest preceding
+`P.nodes[…]` binding, and is it still live here?** That is mechanical, reproducible in one `awk`,
+and it is what produced 129.
+
+### 3. THE INVERSION RULE HELD AGAIN
+
+Both converted sites feed the field row's `keyI32` column → `mvSlotByValNameK` → mv slot
+identity. That is mint-adjacent: under-answering picks a wrong slot or leaves one unminted.
+So they take `nodeTyMapKeyIsI32Span`, not the exact twin — the same direction B52 established and
+the opposite of the default hazard everywhere else in this programme.
+
+Separator: corpus 0 rows; both columns forced FALSE moves **5** (`maps/i32-keyed-struct-field.vl`,
+`maps/i32-keyed-variant-field.vl`, `maps/i32-keyed-field-scratch-frame-reservation.vl`,
+`maps/error-variant-field-values-frame.vl`, +1). Reached, load-bearing, arena agrees.
+
+### 4. ONE SUSPECTED BUG, CHECKED AND NOT REPRODUCED
+
+The inventory flagged `letI32KeyedMap` (`emit_classify.vl:23120`) as a live over-answer: the name
+rung runs ahead of the exact arena twin and answers TRUE for `{[i32]: V}[]`, an ARRAY of i32-keyed
+maps, which would select the wrong `$mapStruct`. **It does not reproduce.** `const xs: {[i32]:
+i32}[] = [m]` compiles and runs correctly, `check --codegen` rc 0, as does the string-keyed twin.
+Recorded as refuted-at-this-shape rather than passed on.
+
+### METHOD NOTES
+
+* **Size by what is IN SCOPE, not by what is in the argument.** The argument's surface form is a
+  property of how someone wrote the call; the enclosing binding is a property of the code.
+* **A conclusion drawn from three same-shaped samples is a hypothesis.** B54 generalised "N
+  askers, one convertible" from three items that happened to share a shape, and stated it as the
+  programme's remaining size. Three is not a sample.
+* **Check a handed-over finding before repeating it.** The `letI32KeyedMap` over-answer was the
+  inventory's headline latent bug and it is not one at the shape given.
