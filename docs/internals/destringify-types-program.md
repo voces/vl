@@ -52798,3 +52798,36 @@ regresses.
 The site's own header recorded "the arena decides 70 and the name 126". It is now 123/73 —
 widenings shipped for OTHER consumers (B162 closure arms, B164/B165 list arms) moved 53 files
 here without anyone measuring it. **A measurement in a comment ages.**
+
+## B195 — the render that was only a gate, and what the census says the rest of them are
+
+`nodeTyName`'s ten call sites sort into three kinds, and only after the B194 census was it
+possible to say which is which:
+
+| kind | sites | files | what the render is for |
+| --- | ---: | ---: | --- |
+| **gate-only** | 1 | 43 | tested for emptiness; the ANSWER is already arena-side |
+| **deferred-render** | 1 | 232 | the answer was arena-decided; the string built an argument nothing read (B194) |
+| **name-production** | 2 | ~215 | the name IS the product — a synthesized annotation, an interner key |
+| other/small | 6 | ~43 | mixed |
+
+**This pass takes the gate-only site.** `const tn = nodeTyName(exprIx); return tn != "" &&
+nodeTyIsFunc(exprIx)` — the answer is `nodeTyIsFunc`, which never needed a string; the render
+existed to be compared against `""`. Replacing that comparison with `anonTySpellable` (B194's
+copy of `nodeTyName`'s own partition) preserves the gate and builds nothing. 0 diffs.
+
+### The honest size of what is left
+
+533 files reach a `nodeTyName` render, and that number should not be read as 533 files of
+convertible work. **Roughly 215 of them are name PRODUCTION** — `synthParamAnnots` writes the
+name back as a synthesized annotation, `internCloResultChain` uses it as an interner key. In
+both, a name is the artefact being produced, not an intermediate the code then re-derives a type
+from.
+
+Converting those means changing what the emitter's tables are keyed by, which is the
+interface-level question this programme has deliberately not swept (B189, item 3). The remaining
+CLASSIFY-shaped sites are small: 3 files at the `structIndexOfTypeName` twin of the consumer
+B191 retired, 13 at a render that is produced only to be returned.
+
+**A count of renders is not a count of conversions.** The census that found the 533 is the same
+one that says which two thirds of it are a different question.
