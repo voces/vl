@@ -52671,3 +52671,40 @@ differ on a case the corpus does not contain — which is exactly the situation 
 only way forward.** The difference is whether the refusal is reproduced FAITHFULLY or approximated:
 B171 and B184 approximated one and emitted invalid wasm; this one copies its exact predicate onto
 the arena's own key.
+
+## B192 — the map gate's own refusals, ported faithfully
+
+B188 called the remainder at this gate "the set whose rejections would have to be
+reconstructed" and stopped there. B191 then showed that a refusal CAN be reproduced when its
+exact predicate is available on the arena's own data — the difference between faithful and
+approximate. Both of this gate's exclusions turn out to be the faithful kind.
+
+**Any prim inner, not just `string`.** B188 restricted the nullable arm out of caution. The
+guard's shape says more: a non-ref inner leaves `nulRefMapValInnerOf` empty and falls to the atom
+counting, where a PRIM is a value atom — so `refMember` is false, and the only remaining -3 there
+needs `!isValueUnionName`, which `prim | null` is not.
+
+**A closure inner**, which rejects only when its RESULT is a literal union. B188 excluded `TyFunc`
+entirely rather than reconstruct that; the predicate is `tyIsLitUnion` of the function's return
+type — the SAME question the ladder asks of the rendered return spelling, not an approximation.
+
+0 diffs; the gate answers **88 of 106**, up from 87.
+
+### The gate, and what "floor" turned out to mean
+
+| | answers |
+| --- | ---: |
+| B174 | 64 |
+| B175 | 72 |
+| B186 | 79 |
+| B187 | 85 |
+| B188 | 87 |
+| **B192** | **88** |
+
+B188 described its remainder as the honest floor. It was not — it was the set B188 had declined
+to reproduce, which is a different thing, and the same mistake in miniature that B189/B190/B191
+made about the struct site.
+
+**Three times now a "floor" has turned out to be a description of the last attempt.** The pattern
+is stable enough to state as a rule: a remainder is only a floor once you have named the
+predicate that cannot be written, not merely the one you did not write.
