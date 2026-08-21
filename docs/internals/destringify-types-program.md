@@ -47935,3 +47935,66 @@ guard on the registry side, which was the thing making them expensive.
   those same paths commits nothing, and the message still says what you meant to do.
 * **Ask whether the consumer can derive what the producers lack.** Threading is expensive; a
   boundary resolve is one line, and on this registry it was equivalent.
+
+## B95 — the bottom: the arena has no canonical identity, and that is why the last name tests are names
+
+B94 got the union registry's arena column to 100%. Step 3 was to read it — `isUnionTyIx(ty)` beside
+`isUName(name)`, an index scan of the same table. Built it, probed it at a blocked site, and got
+**2 disagreements**, both union spellings where the NAME matches a registered row and the INDEX does
+not.
+
+The cause is one line:
+
+```vl
+function addTy(t: Ty) {
+  T.tys.push(t)
+  T.tys.length - 1
+}
+```
+
+**The type arena is not hash-consed.** Every construction appends. Two structurally identical types
+have different indices, so an index-equality lookup is strictly STRICTER than the name-equality
+lookup it would replace, and it under-answers exactly where a type was built twice.
+
+### THIS EXPLAINS THE WHOLE PROGRAMME'S SHAPE
+
+Every conversion that landed asks about a type's **structure**: is it a `TyMap`, is its element a
+`TyPrim` boolean, does it reach a map through a nullable, does it bear null. Structure is readable
+from ANY index for the type, so a fresh construction answers the same as the original.
+
+Every site that declined or stayed blocked asks about a type's **identity**: is this element type a
+declared struct, is this name a registered union, which variant is this. Identity needs a canonical
+representative, and the arena does not have one — so the registries key on the rendered name,
+because **the name IS the canonicalization**. `structIndexByName`, `isUName` and `variantIndexOf`
+are not lazy shortcuts; they are the only stable identity the compiler has for a type.
+
+### WHAT WOULD ACTUALLY UNBLOCK IT
+
+Hash-consing `addTy` — intern on structural equality so `mkPrim("i32")` twice yields one index.
+That is a change to the checker's core representation, it touches every `T.tys` producer, and its
+risk profile is nothing like a predicate swap. It would also make `unTyIx` (already populated, 100%
+covered, currently unread) immediately useful, and it would collapse the four blocked sites to
+index compares.
+
+**It is a language-implementation project, not a destringify slice**, and it should be proposed on
+its own terms — with its own measurements — rather than arrived at sideways as step 3 of a
+four-step plan.
+
+### THE HONEST STATE OF THE BRIEF
+
+* Every place the compiler rendered a type and then tested the render has been measured. Each is
+  converted, declined with a recorded reason, or shown inert — eight sites, all with verdicts (B88).
+* The convertible surface with a node in scope is fifteen sites, eleven settled (B90).
+* The four that remain ask type IDENTITY, and identity is name-keyed because the arena provides no
+  canonical index (this entry).
+* `unTyIx` is populated at 100% and waiting for the day it can be compared (B92, B94).
+
+The type system no longer does functional work on type STRINGS anywhere a structural question was
+being asked. Where it still uses names, it is using them as identities — and that is a property of
+the arena, not of the predicates.
+
+### METHOD NOTE
+
+* **When a conversion keeps failing for different-looking reasons, look under the predicates.** Six
+  softening sites, four width mismatches, three coverage gaps — and beneath all of them, one fact
+  about `addTy` that nothing in this log had checked until the last blocked site forced it.
