@@ -1215,6 +1215,12 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
       } else if scode == 24 {
         // An f32 field re-encodes its float value at the construction boundary.
         if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
+      } else if scode == 20 && exprIsLitAtom(valIx, fnIx) {
+        // A literal-union ATOM stored into a `string | null` field widens to its member string,
+        // exactly as the code-3 plain-`string` field below does. "Pass a non-null value through
+        // untouched" (the arm just after) holds for a value that is ALREADY a string reference;
+        // an atom's rep is an i32 id, so it is the one non-null value that needs converting.
+        if emitStrValue(body, valIx, fnIx) < 0 { return -1 }
       } else if scode == 20 {
         // The NICHE `X | null` fields (20 string, 21 boolean, 30 `K`, 22 closure) seed the
         // null rep their kind demands — the table at `emitNullLitNode` — and pass a non-null
@@ -14483,6 +14489,17 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   } else if letAnnNm == "string" && exprIsLitAtom(s.letInit, fnIx) {
     // A literal-union atom initializing a `string` local widens to its member string.
     if emitAtomToStr(body, s.letInit, fnIx) < 0 { return -1 }
+  } else if letIsNulString(stmtIx, fnIx) && exprIsLitAtom(s.letInit, fnIx) {
+    // A literal-union ATOM initializing a `string | null` binding WIDENS to its member string.
+    // The slot is the nullable string reference and the atom's rep is an i32 id, so without
+    // this the store was `expected (ref null $type), found i32` — check-clean invalid wasm.
+    //
+    // The NON-nullable form needs no arm and takes none: `collectLocals` classifies
+    // `const s: string = <atom>` as an ATOM SLOT (`letInitIsLitAtom` fires ahead of
+    // `letIsString`), so nothing widens at the init and the widen happens at each READ. Only
+    // the nullable annotation reaches a reference slot here, which is why this arm is keyed on
+    // `letIsNulString` and not on "the annotation is stringy".
+    if emitStrValue(body, s.letInit, fnIx) < 0 { return -1 }
   } else {
     // A NICHE `X | null` binding seeds its null rep for a bare `null` init (the table at
     // `emitNullLitNode`). Keyed on `letNulBool`/`letIsNulString` rather than the annotation
@@ -17111,8 +17128,11 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
       pendingI64 = false
       i = i + 1
     } else {
-      if cParamStr && exprIsLitAtom(args[i], fnIx) {
-        // A literal-union atom flowing into a `string` param widens to its member string.
+      if (cParamStr || cParamNulString) && exprIsLitAtom(args[i], fnIx) {
+        // A literal-union atom flowing into a `string` param widens to its member string — and
+        // into a `string | null` param for the same reason, the slot being that same reference
+        // with a null permitted and a widened member string being non-null. A `null` argument is
+        // not a lit atom and still takes the `nulString`-seeded context below.
         // (Shared tail below resets the `pending*` hints and advances `i`.)
         if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
       } else if cUNm != "" {

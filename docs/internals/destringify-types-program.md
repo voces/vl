@@ -45086,3 +45086,61 @@ byte-identical, so moving one alone changes nothing. Pinned as
   program WORK, leaving a green file asserting nothing. Second confirmed instance; the check is
   now routine — when a diagnostic asks to delete something from a test, verify the test still
   fails without it.
+
+## B48 / D-NULPOS — six positions measured, three broken, and the obvious fourth fix was inert
+
+The nullable-string sinks were finished by MEASURING the positions rather than reasoning about
+them, and the measurement is the entry: **reading the code would have got the split wrong.**
+
+Six positions built and run before anything was touched:
+
+| position | before |
+| --- | --- |
+| `const s: string \| null = r.f` | broken |
+| `take(r.f)` into a `string \| null` param | broken |
+| `{ v: r.f }` into a `string \| null` field | broken |
+| an if-arm joining into `string \| null` | broken |
+| assignment to a `string \| null` binding | **already worked** |
+| a `string \| null` global initializer | **already worked** |
+
+The two that already worked are the surprise, and they are pinned as controls for that reason.
+
+### 1. THE NON-NULLABLE LET IS A DIFFERENT MECHANISM, NOT A NARROWER CASE
+
+`const s: string = <atom>` needs no widen at all, and the reason matters for the arm's shape:
+`collectLocals` classifies it as an ATOM SLOT — `letInitIsLitAtom` fires ahead of `letIsString` —
+so nothing widens at the init and the widen happens at each READ. Only the nullable annotation
+reaches a reference slot at the init.
+
+That is why the new arm keys on `letIsNulString` and not on "the annotation is stringy". Had it
+been written as the general stringy case, it would have fought the atom-slot classification for
+the non-nullable half.
+
+### 2. THE FOURTH POSITION'S OBVIOUS FIX MEASURED INERT
+
+`emitIfArm` widens an atom when the join kind is `str`. Admitting `nulstr` beside it — the
+one-word fix, and the one the other three arms make plausible — changes **nothing**: 0 corpus
+rows, 0 of the constructed shapes, the pinned repro included. So the join kind for a
+nullable-string if-expression is neither `str` nor `nulstr`, and the deciding site is
+unidentified.
+
+**Dropped rather than shipped.** An arm that measures zero is not a cheap win; it is an
+unverified claim about where the code goes. Pinned as
+`xfail-miscompile-litunion-atom-if-arm-nullable-join.vl`, whose two neighbours both work — a
+plain-`string` join with an atom arm, and a nullable join with no atom — so the defect is the
+two together.
+
+### 3. THE CORPUS MOVED ZERO ROWS FOR ALL THREE FIXES
+
+Which is now the expected result rather than a surprise, and the fixture carries the evidence:
+it fails on master and passes here, with the two already-working positions inside it as
+controls.
+
+### METHOD NOTES
+
+* **Measure the positions before fixing any of them.** Six were built; the two that already
+  worked could not have been predicted from the code, and they bound the change — without them
+  the arms might have been written to cover cases that were never broken.
+* **A one-word fix that measures zero is a hypothesis, not a fix.** Three sibling arms landing
+  successfully is exactly the situation in which the fourth's inert result is easiest to
+  rationalize away.
