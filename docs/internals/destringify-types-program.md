@@ -52892,3 +52892,42 @@ everywhere else in the emitter. The renderers are `tyToEmitName`, `tyToStructStr
 `tyToStr` alone has 150 call sites, none of them censused, most presumably diagnostics. Whether
 any are gates or unread arguments is not something reading will answer reliably; it took a
 labelled sweep to answer it here.
+
+## B198 — every renderer triaged, and the surface that is actually left
+
+B197 said a programme organised around "which path decides" would miss work elsewhere, and named
+`tyToStr`'s 150 uncensused sites. All three renderers are now triaged. **The uncertainty closed
+cheaply, and mostly in the direction of "not a target".**
+
+| renderer | sites | where | verdict |
+| --- | ---: | --- | --- |
+| `tyToStr` | 151 | 145 checker, 5 query, 1 parser | **diagnostics.** 68 visibly feed a message, and ZERO are bound to a variable — nothing captures a render to classify it later |
+| `tyToStructStr` | 12 | all checker | diagnostics, same shape |
+| `tyToEmitName` | 64 | 53 checker, **11 emit-side** | the checker ones build the `node*Name` helpers; the 11 are the only unexamined surface |
+
+**Rendering a type into an error message is what a renderer is for.** That is not the goal's
+"functional type work on a string", and 163 of the 227 renderer call sites are exactly that.
+
+### The one interesting site, and why it is not being taken
+
+`wasmEmit`'s `is`-fold compares `sk == tyToEmitName(cmpTy)` — type identity decided on TEXT, with
+one side rendered on the spot. Its own header already documents the render as LOSSY there:
+literal-carrying types are declined via `tyRenderSoftensLits`, because `("pp" | "qq")` and
+`string` render alike while only one holds `"zz"`.
+
+Measured: **13 corpus files.** The other side of that comparison, `sk`, is a NAME produced by
+`monoArgTyName`, so converting the compare means threading a type through the monomorphisation
+layer's name production — the interface-level change B189 item 3 declined to sweep, for 13 files.
+
+**Ratio, stated rather than felt:** the two consumers taken to zero cost ~14 PRs and covered 138
+files between them. This one costs an interface change and covers 13.
+
+### What remains, with its kind
+
+1. **Name PRODUCTION** — `synthParamAnnots` (151 files), `internCloResultChain` (64), the mono
+   layer's `monoArgTyName`. A name is the artefact; converting means re-keying the emitter's
+   tables.
+2. **One `TyVar` floor** at the map gate — a predicate that cannot be written (B193).
+3. **The union lowering family** — #1611 / #1678 / #1684, not destringify work.
+
+Nothing in that list is a reader waiting to be written.
