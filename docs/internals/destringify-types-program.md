@@ -48762,3 +48762,67 @@ because it was a stated next step rather than code, but the general lesson stand
 measurement establishes what IS, and the fix it seems to imply is a separate claim that
 deserves its own test. Here one build refuted it, and the same build strengthened the
 finding the prescription was attached to.
+
+## B110 — the param reject ladder is a representation question, and the rep answer is TOTAL
+
+B109 gave the programme a test it did not have: before converting a rung, ask whether it
+poses a TYPE question or a REPRESENTATION one. Applied to the param reject ladder
+(`emit_sections.vl`) — the family that has resisted longest, and the one B102 left open —
+the answer is immediate and it is the whole ladder, not five stubborn rungs.
+
+Every accepted rung is named by its lowering, not by its type: `(ref null $S)`, kind 15,
+kind 16, kind 18, "i64 rides the 0x7e valtype", "the i32 sentinel 0/1/2", "an i32-backed
+interned atom". The reject says "only … parameters are **supported**". The ladder asks
+"does the emitter have a cell for this?" — it never asks what the type is.
+
+That retroactively explains every result this family produced. B102's five scalar rungs
+wanted canon's SOFTENED name because a numeric litunion param IS lowered as its base
+scalar — a lowering fact. The same verdict at `paramString` and `letIsF64` was the same
+fact reached three times. None of these were the arena falling short; they were the arena
+being asked the wrong kind of question.
+
+### The concrete blocker
+
+The emitter already has a structural rep mechanism, and `vtKindOfType`'s header describes
+exactly the right architecture — a "repOf-FIRST strangler seam" where `annRepKindOf`
+decides the kind wherever the arena covers the shape, with the name ladder as "the
+fallback for the uncovered remainder" that "shrinks as coverage widens".
+
+The reject ladder cannot use it, for one reason:
+
+```vl
+  if retF32Flag(tyIx) == 1 { return "f32" }
+  "i32"          // <- vtKindOfType is TOTAL
+}
+```
+
+`vtKindOfType` always answers. It has no "none". Anything it does not recognise silently
+becomes `"i32"`, so it cannot decide a REJECT — and the reject ladder must therefore
+enumerate the supported set independently, which it does by spelling. The ladder is not
+lagging behind the strangler seam; it is the one consumer the seam cannot serve.
+
+`annRepKindOf` already returns `VKind | null`, so the "none" answer exists one layer down
+and is discarded at this boundary. That makes the repair small and well-aimed: let the
+reject ladder consult the nullable answer directly, and the spellings have nothing left to
+decide.
+
+### A stale claim in the ladder, corrected by measurement
+
+The map rung's comment states that a struct/f64/i64-valued map param "is NOT yet
+supported — `retMapFlag` returns 0, so it falls through to the reject below". Measured
+today, all three of the shapes its neighbourhood calls uncovered compile and run
+correctly:
+
+```
+function f(m: {[string]: S})                  => 1
+function g(xs: f64[][])                       => 1
+function h(m: {[string]: {[string]: i32}})    => 1
+```
+
+Coverage widened underneath the comment, exactly as `vtKindOfType`'s header predicted it
+would. Which rung now accepts them is not established here — only that the reject does not
+fire — so the mechanism claim is left for the repair above rather than guessed at.
+
+**Queued:** thread the nullable rep answer through to the param reject, then re-measure the
+ladder. This is the first item in the programme with a named blocker, a named fix, and no
+open question in front of it.
