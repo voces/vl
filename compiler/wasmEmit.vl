@@ -38,6 +38,7 @@ import {
   tyLitUnionAliasIx,
   tyNumLitMemberTexts,
   tyRenderSoftensLits,
+  tySame,
   tyToEmitName,
   valueAtomKind,
 } from "./typecheck"
@@ -650,6 +651,7 @@ import {
   isVariantSpelling,
   variantIndexOf,
   vtKindOfParam,
+  isUnionOfTy,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
 import {
@@ -2975,6 +2977,43 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
         wU8(209)   // 0xd1 ref.is_null
         fbI32Eqz() // invert: non-null
         return 0
+      }
+    }
+  }
+  // A COLLAPSED same-shape union: `pick(xs: A[] | B[])` where `A` and `B` are structurally
+  // identical. The checker dedupes union members structurally, so the two arms are ONE member
+  // and the annotation records a plain type, not a union — and `xs is A[]` then reaches this
+  // rung with nothing declared and is rejected, though the program is sound.
+  //
+  // It needs no union and no box: if the operand's OWN type is the tested type, the test is a
+  // TAUTOLOGY. That is precisely what the collapse means — the arms became one member BECAUSE
+  // they denote the same type, so every value of the operand IS the tested type. Emit the
+  // operand for its effects, drop it, answer a constant true.
+  //
+  // The two fixes this fixture recorded both tried to restore the UNION — re-label the collapse
+  // (which only MOVED the error), or extend `registerCollapsedUnionName` to `TyArray` (which
+  // produced a check-clean INVALID module, because registering the spelling restores the
+  // classification but not the BOX, and the collapsed type never takes the union path that
+  // interns its ref-array arms). This arm sidesteps the box instead of reconstructing it: a
+  // tautology has no arms to intern.
+  //
+  // A test that is NOT the operand's type (`xs is C[]`) fails `tySame` and falls through to the
+  // reject below, which stays loud.
+  if nd0 is IsExpr {
+    if !uDeclared {
+      const isOpTy = nodeTyIxOf(nd0.isObj)
+      const isTsTy = isVarTyIxOf(isIx)
+      if isOpTy >= 0 {
+        if isTsTy >= 0 {
+          if !isUnionOfTy(isOpTy) {
+            if tySame(isOpTy, isTsTy) {
+              if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+              fbDrop()
+              fbI32Const(1)
+              return 0
+            }
+          }
+        }
       }
     }
   }
