@@ -52162,3 +52162,42 @@ consistently refused to reproduce — every arm that guessed produced invalid wa
 
 **Render path at the site: 32 -> 2**, across nine measured arms, three of which were refuted and
 two of which were inert.
+
+## B179 — the collapsed-union false reject, fixed by not restoring the union
+
+`xfail-false-reject-inline-same-shape-array-union.vl` had been open through two measured fixes,
+and its own header prescribed a third: "the collapse must preserve the emitter's boxing shape".
+That prescription was wrong — or rather, it was the third way to answer a question that did not
+need answering.
+
+The program:
+
+```vl
+type A = { v: i32 }
+type B = { v: i32 }
+function pick(xs: A[] | B[]) { if xs is A[] { return 1 } return 2 }
+```
+
+The checker dedupes union members structurally, so `A[] | B[]` is ONE member and the annotation
+records a plain `TyArray`. `xs is A[]` then reaches the emitter with no union declared and is
+refused, though the program is sound.
+
+Both prior fixes tried to restore the union — re-label the collapse (which only MOVED the error
+to the `is` rung), or extend the registrar to `TyArray` (which produced a **check-clean invalid
+module**, because registering the spelling restores the classification but not the BOX).
+
+**The union does not need restoring.** The arms collapsed BECAUSE they denote the same type, so
+`xs is A[]` is statically TRUE of every value `xs` can hold. The emitter answers a constant. A
+tautology has no arms to intern, so there is no box to reconstruct and nothing for the spelling
+to have carried.
+
+Corpus A/B: **one diff, and it is the fixture** — rc=1 -> rc=0. Everything else byte-identical.
+The case is promoted out of `xfail-`, and both dead ends are kept in its header, because what
+they rule out is the part that took three attempts to see.
+
+### Scope, honestly
+
+This does NOT fix issue #1611, the same-shape union CRASH — that repro still traps, on a path
+this arm never reaches. Same root cause (structural dedup erasing a spelled distinction),
+different consumer. One of the three declines the boxing-record idea would have dissolved is now
+closed on its own terms; the other two are untouched.
