@@ -48296,3 +48296,52 @@ with a wall.
 * **A residue of "simple" cases is a signal, not a rounding error.** 18 of 20 remaining
   disagreements were the SIMPLEST spellings on the list, which is what said the problem was not
   identity — hard cases fail at identity, trivial ones fail at representation.
+
+## B101 — the representation gap is closable, and it is not "re-implementing the renderer"
+
+B100 named the third gap — `A | null` is a SPELLING whose type is `TyNullable(A)`, not
+`TyUnion[A, null]` — and left open whether teaching a structural matcher that correspondence counts
+as destringification or as writing the renderer again in another form.
+
+**It counts, and the distinction is checkable rather than aesthetic.** The arm added here compares
+`unMemTys[stn]` (an arena index) against `t.nInner` (an arena index) via `tySame`. **Nothing is
+rendered, nothing is parsed, and no string is compared.** What it encodes is that two arena
+REPRESENTATIONS denote one type — which is a fact about the arena, not about the spelling that
+happens to render both the same way.
+
+The renderer's job is type → text. This is type ↔ type. They are not the same work, and the test is
+whether a string appears anywhere in the comparison. It does not.
+
+### THE MEASUREMENT
+
+Disagreements at the param reject ladder, against `isUName`:
+
+| | |
+| --- | --- |
+| B99, index + structural | 20 |
+| B100, `+ TyFunc` arm | 18 |
+| **B101, `+ nullable-shape` arm** | **15** |
+
+Corpus A/B **0 rows** at each step, all six gates.
+
+### WHAT THE 15 ARE
+
+* `((i32)=>i32)|((i32)=>string)|null` and `i32|string|null` — a `TyNullable` over a UNION, where the
+  row has three members and the wrapper has one inner. The arm added here handles the two-member
+  case (`TyNullable(A)` vs `[A, null]`); the general case is a wrapper over an n-member union
+  against an (n+1)-member row.
+* `string|i32` — a plain value union that should match structurally and does not, which means its
+  row's `unMemTys` slice is not what the query's members are. That one is a coverage question
+  about the ROW, not a shape question about the query, and it wants its own probe.
+
+### AND A GUARD THAT WAS MISSING
+
+`tyIsNullPrim` indexed `T.tys[ty]` with no negative check, and `unMemTys` documents `-1` for a
+member spelling that did not resolve. The new arm reads that column directly, so the guard is
+load-bearing rather than defensive — added with the call site that needed it.
+
+### METHOD NOTE
+
+* **"Is this still destringification?" has a test.** Look for a string in the comparison. Encoding
+  a correspondence between two arena shapes is type-to-type work; re-deriving a spelling to compare
+  it is not. The question felt philosophical and was decidable in one reading of the code.
