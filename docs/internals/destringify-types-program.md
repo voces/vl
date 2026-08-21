@@ -48251,3 +48251,48 @@ registries are the same shape and admit the same treatment.
   heterogeneous.** Interning failed by over-merging, index-authority by under-matching, the
   fallback by not removing anything — three failures pointing at one cause, which is that the rows
   were never the same kind of thing.
+
+## B100 — the next site measured, and the gap is a REPRESENTATION mismatch, not an identity one
+
+B99's `isUnionOfTy` answers the union question with no spelling, and three more sites ask it. The
+next one — `emit_sections`' param reject ladder, `if !isUName(ty.tyName)` — was probed against it.
+
+**20 disagreements**, all `name=1`: the spelling says registered union, the arena reader says no.
+
+Adding a `TyFunc` arm to `tySame` (parameter list and result, recursively) closes 2 — unions of
+closures like `((i32)=>i32) | ((i32)=>string)` were falling out of a comparison that had no arm for
+them. Shipped: 0 corpus rows, all six gates.
+
+### THE REMAINING 18 ARE A DIFFERENT KIND OF GAP
+
+The residue is `f32|null`, `i32|string|null`, `string|i32` — spellings so plain that a structural
+match should be trivial. It is not, and the reason is not identity:
+
+**`f32 | null` is a NAME whose type is `TyNullable(f32)`, not `TyUnion[f32, null]`.**
+
+The registry holds rows keyed on the spelling, and the spelling's `| null` is a union ATOM; the
+checker's representation puts nullability in a wrapper instead. So the query type and the registry
+row are not the same SHAPE, and no amount of structural comparison between a `TyNullable` and a
+`TyUnion` will match them — they are different types that the naming convention renders the same.
+
+That is a third category, distinct from both of B98's:
+
+| gap | what fails |
+| --- | --- |
+| nominal identity (declared unions) | index equality — solved, B99 |
+| structural identity (inline unions) | index equality — solved by `tySame`, B99 |
+| **representation mismatch** (`A\|null` vs `TyNullable(A)`) | **the shapes differ; neither identity applies** |
+
+Closing it means teaching the reader the naming convention structurally — when the query is a
+`TyNullable`, try the member list `[inner, null]` against the row. That is encoding a SPELLING
+convention into a structural matcher, and whether that is destringification or a re-implementation
+of the renderer in another form is a real question, not a rhetorical one.
+
+**It is where this line stops for now**, and it stops with the gap named and measured rather than
+with a wall.
+
+### METHOD NOTE
+
+* **A residue of "simple" cases is a signal, not a rounding error.** 18 of 20 remaining
+  disagreements were the SIMPLEST spellings on the list, which is what said the problem was not
+  identity — hard cases fail at identity, trivial ones fail at representation.
