@@ -46189,3 +46189,39 @@ carry at this binding form. What changes is that the next reader starts from a n
 * **A word in a comment is not a measurement.** "Documented residue" appears at a dozen sites in
   this compiler, several written by this programme, and until now none of them carried a number.
   The eleven remaining are a queue item with a known method and a two-build cost each.
+
+## B67 / D-RESIDUE2 — the family is four name tests, not a dozen, and two of them answer oppositely
+
+Completing B66's queue item, and correcting its size on the way.
+
+### THE COUNT WAS INHERITED AND WRONG
+
+B65 and B66 both said "a dozen sites shaped `if <arena> { … } else { <name> }`". That figure came
+from the screening pass and was repeated twice without checking. The three `annRepKindOf` guards'
+else-branches contain **1, 0 and 3** name tests — **four**, not a dozen. And
+`letIsRefList`'s fallback (`annBareRefArrSlot(d.letType) >= 0`) is **another arena call**: that
+site has no string residue at all.
+
+Repeating an inherited count is the same error this programme has now made with "~123
+convertible", "17/2", and "a dozen residues". **A number that arrived from somewhere else is a
+claim, not a fact**, and the check is usually one `grep`.
+
+### THE TWO MEASURED RESIDUES DISAGREE
+
+| site | arena leg off | name fallback off |
+| --- | --- | --- |
+| `letIsI32List` | 1 row | **0 rows** |
+| `letIsStrList` | — | **1 row** (`literal-unions/litunion-field-nullable-string-sinks.vl`) |
+
+Same shape, same file, adjacent in the same family — and one fallback rescues nothing while the
+other uniquely rescues a file. That is B66's method note confirmed by its first two data points
+rather than argued: a two-leg site can be 1-and-0 or 0-and-1, and the shape does not tell you
+which.
+
+Both are kept and both now carry their number.
+
+### METHOD NOTE
+
+* **Verify an inherited count before building on it.** Three separate size claims in this
+  programme have been repeated from a previous pass and been wrong — each time in the direction
+  that made the remaining work look more uniform than it is.
