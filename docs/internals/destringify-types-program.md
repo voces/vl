@@ -52708,3 +52708,42 @@ made about the struct site.
 **Three times now a "floor" has turned out to be a description of the last attempt.** The pattern
 is stable enough to state as a rule: a remainder is only a floor once you have named the
 predicate that cannot be written, not merely the one you did not write.
+
+## B193 — the value-union arm, and the difference between copying and paraphrasing
+
+B192's remainder was censused rather than assumed, and it is **4 files**, not the 18 that
+`106 - 88` suggests — the gate is not REACHED on every file, so the difference between "answers"
+and "remains" is not subtraction.
+
+| the map gate's actual remainder | files |
+| --- | ---: |
+| nullable of a UNION | 3 |
+| a bare TYPE PARAMETER | 1 |
+
+**The nullable-union took two attempts, and the first was inert.** It required "at least one REF
+member", partitioning `TyArray` as a ref — which `valueAtomKind` does not: a LIST member of a
+value union rides the box's value field directly and IS an atom. The paraphrase matched nothing:
+0 diffs AND 0 reach change, caught by the liveness probe before it could be written up.
+
+The second copies `isValueUnionName`'s own shape — every member has a `valueAtomKind` (prims,
+`null`, litunions, lists), at least two non-null — and fires. 0 diffs; the gate answers **89 of
+106**.
+
+### The rule, refined once more
+
+B191 separated FAITHFUL reproduction of a refusal from APPROXIMATE. This pass shows the failure
+mode of approximation is not always invalid wasm — sometimes it is silence. A paraphrase that
+partitions the world slightly differently from the original simply never matches, and looks
+exactly like a clean conversion on an A/B.
+
+**Copying a predicate means copying its partition, not its intent.** The intent of
+`isValueUnionName` is "a union whose members box in the shared value box"; its PARTITION includes
+arrays. Reasoning from the intent produced the inert arm; reading the partition produced the
+working one.
+
+### The floor, this time with a name
+
+One file remains, and it is a map whose VALUE is a bare type parameter. That has no lowering
+because the generic ORIGINAL is never emitted — its instances are (#1473). **That is a predicate
+that cannot be written, not one that has not been written yet** — the first remainder in this
+programme to meet the bar B192 set.
