@@ -51158,3 +51158,56 @@ split is the conversion.
 
 Eighteen conversions now. The first kind is closed; the second and third are not this method's
 work, and B155 states why for each.
+
+## B157 — the inline-shape variant HAS its type; the missing piece is a ty-keyed field coder
+
+B155 put "caller holds only a string" in bucket 4 and said it "needs the producer rewritten",
+implying the type is unavailable. Measured at the largest instance, that is wrong.
+
+`collectVariantFields(stmts, name)` routes an inline-shape variant (`{x:i32}` inside
+`{x:i32}|{y:i32}`) to `collectShapeVariantFields(name)`, which splits the rendered spelling with
+a depth-aware `,`/`:` grammar. Its caller pushes the variant's arena type one line earlier:
+
+```vl
+uVariants.push(atoms[vi])
+uVarTyIx.push(declTyIxOfName(atoms[vi]))
+if collectVariantFields(stmts, atoms[vi]) < 0 { return -1 }
+```
+
+Measured: **160 of 160** corpus files reaching the inline-shape path have
+`declTyIxOfName(name)` resolving to a **`TyObj`**. The shape's fields are in the arena —
+`objFieldNames` and `objFieldTypes`, in declaration order, which is the order this table wants.
+
+### So why is it still not converted
+
+The traversal is only half the job. `collectShapeVariantFields` does two things per field:
+
+1. take the field's NAME — the arena has it (`objFieldNames`)
+2. take the field's CODE — via `nameFieldCode(ftxt)`, a NAME-keyed classifier
+
+There is no ty-keyed field coder. `fieldTypeCode(tyIx)` takes an annotation NODE, not an arena
+type, and the inline-shape variant has no per-field nodes — its fields were never parsed as AST
+`FieldDef`s, only as text inside a spelling.
+
+So the precise remaining work at this site is not "rewrite the producer" but:
+
+> **add a `fieldCodeOfTy(ty: i32)` — the arena-keyed sibling of `fieldTypeCode(tyIx)` — then walk
+> `objFieldTypes` instead of splitting the rendering.**
+
+That is a bounded, nameable piece of work with a clear gate (the codes it produces must match
+the name path's on all 160 files), and it is the first thing in this log that is genuinely
+missing rather than merely unfound. Every other blocker turned out to be a table nobody read;
+this one is a function nobody wrote.
+
+### The corrected end state
+
+| remaining work | what it is |
+| --- | --- |
+| `fieldCodeOfTy` + the variant-shape walk | a new classifier keyed on the arena; bounded, gateable |
+| `collectFnValUse`'s shape entry | declined on BEHAVIOUR — the arena's alias resolution flips a monotone flag |
+| the array rung (B133/B147) | no receipt in any of the five sources |
+| the `nameFieldCode` family | callers hold strings produced by the above; unblocks when it does |
+
+One piece of missing code, one capability decision, one genuine dead end. That is a materially
+smaller and more specific statement than "~258 classifiers", and it is what the count actually
+reduces to once the chains are traced instead of counted.
