@@ -50456,3 +50456,49 @@ the same family and have not been re-tested against this source:
 Each was measured against `nodeTyIxOf` and declined. None was measured against `canonTyIxOf`,
 because until B140 named it the column had one consumer and was not on the list of sources.
 That is the next work, and it is decision-free.
+
+## B143 — `paramString` converts, and the "softened name is RIGHT" family opens
+
+B142 separated canon's ANSWER from canon's STRING and overturned one decline. `paramString`
+is the second, and it was the most explicitly argued of the four:
+
+> "**Here the softened name is RIGHT**: this decides whether an Ident READS as a string, and a
+> litunion param does read as one at a string sink — the atom widens on the way in. The
+> arena's structural truth is a different question than the one being asked."
+
+Every word of that stands. The disagreeing population was 10 corpus files, all literal-union
+params, and the softened answer is the one the site needs. What was wrong was only the
+inference that needing canon's answer means reading canon's name.
+
+Measured with `canonTyIxOf` where canon rewrote and `nodeTyIxOf` where it did not:
+
+| | files |
+| --- | ---: |
+| `nodeTy`, false | 435 |
+| `nodeTy`, true | 45 |
+| `canonTy`, false | 21 |
+| `canonTy`, true | 11 |
+| **disagreements** | **0** |
+
+512 reaching files, both sources and both answers represented. The ten litunion params that
+made this a decline are among the `canonTy` rows and now agree. Corpus A/B 0 of 1947; six
+gates green.
+
+### Two of four, and the pattern is now clear
+
+| decline | reason recorded | outcome under `canonTyIxOf` |
+| --- | --- | --- |
+| B129's local-i32 rung | mixed litunion wants the softening | **converted** (B142) |
+| `paramString` | litunion reads as a string at a sink | **converted** (B143) |
+| `letIsF64` | 3 files | not yet re-tested |
+| B102's five scalar rungs | 20 rows | already arena; only the unrecorded-node fallback remains |
+
+The site's own comment closed with a warning that turns out to be the exact lesson:
+
+> "**'The name records a canon decision' is not by itself a reason to convert OR to decline**
+> — ask which answer the consumer needs."
+
+Right, and incomplete by one step. Once you know the consumer needs canon's answer, ask
+*where canon put it*. It is in two places, and only one of them is a string.
+
+`nameIsString` now has 4 remaining uses in `emit_classify.vl`, down from 5.
