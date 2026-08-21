@@ -76,6 +76,7 @@ import {
   nodeTyMapKeyIsI32Span,
   nodeTyName,
   nodeTyPrimName,
+  nodeTyReachesClosure,
   tyArrayElemPrimName,
   tyIsLitUnion,
   tyNomNameCycled,
@@ -437,14 +438,12 @@ import {
   mfRecvKindOf,
   mfResultKindOf,
   mfResultSlotOf,
-  msMemberAtomsOf,
   mvCanonRepOf,
   mvCanonValName,
   mvShapeOfMapName,
   mvShapeOfMapNodeTy,
   mvShapeOfValNameRowTy,
   mvSlotByValNameK,
-  nameFieldCode,
   nameFieldCodeTy,
   nameIsNulRefList,
   nameIsRefArray,
@@ -976,78 +975,6 @@ export function collectCloSigs() {
     ri = ri + 1
   }
   0
-}
-
-// THE ONE HOME of the D-UNION set-ADT read WITH its cardinality gate: fill `out` with
-// `name`'s union members, preferring the recorded member column (`msMemberAtomsOf`) and
-// falling back to a split ONLY when the name is a multi-member union
-// (`unionMemberCount > 1` — the counting dual of the splitter, so the pair is one
-// predicate). A single-member name leaves `out` EMPTY, which is what both consumers'
-// `length > 1` tests want.
-//
-// `shapeHasCloField` and `collectFnValUse` carried this five-line pair verbatim. The
-// unguarded form (`if !msMemberAtomsOf(x, o) { splitUnionAtoms(x, o) }`) that
-// `emit_classify.vl` uses 15 times is a DIFFERENT reading — it wants the one-element
-// list for a non-union name — so it is deliberately not folded in here.
-function unionMemberAtomsIfMulti(name: string, out: string[]) {
-  if msMemberAtomsOf(name, out) { return 0 }
-  if unionMemberCount(name) > 1 { splitUnionAtoms(name, out) }
-  0
-}
-
-// True if the single-shape text `nm` has a closure (code 14) or nullable-closure
-// (code 22) FIELD — the `collectFnValUse` gate for a shape annotation whose field
-// cell is a closure fat-pointer. Same depth-0 field split the `shapeHasCloField` gate uses.
-function shapeHasCloField(nm: string) {
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  // The GROUP-INTERIOR cut at its home (`tyname.groupInnerOf`, W1). The guard is the
-  // CALLER's — both `collectFnValUse` sites gate on `nameIsWholeSpanShape`.
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] != "" {
-      const ftxt = ftexts[fi]
-      const fc = nameFieldCode(ftxt)
-      if fc == 14 || fc == 22 { return true }
-      // A CLOSURE-ARRAY field (`z: (() => i64)[]`) or a UNION field with a closure /
-      // closure-array arm (`z: (() => i64)[] | i32`): the cell holds closure
-      // fat-pointers too, so a narrowed member-array call (`t0.z is (()=>i64)[]`,
-      // `t0.z[0]()`) `call_ref`s through it — flip the machinery on even when no lambda
-      // elsewhere does (fuzz F5gJXz declared seed 530559367 case_00309).
-      if cloArrElemNameOf(ftxt) != "" { return true }
-      // D-UNION set ADT — a field type that IS a registered union row's member
-      // set answers from the recorded member column, and the CARDINALITY gate
-      // becomes that list's length (`unionMemberCount` is the counting dual of
-      // `splitUnionAtoms`, so the two gates are the same predicate). An
-      // un-interned field spelling keeps the count-then-split pair.
-      const shcAtoms: string[] = []
-      unionMemberAtomsIfMulti(ftxt, shcAtoms)
-      if shcAtoms.length > 1 {
-        let shc = 0
-        while shc < shcAtoms.length {
-          const shcA = shcAtoms[shc]
-          if annArrowAt(shcA) >= 0 { return true }
-          if nameIsNulClosure(shcA) { return true }
-          if cloArrElemNameOf(shcA) != "" { return true }
-          shc = shc + 1
-        }
-      }
-    }
-    fi = fi + 1
-  }
-  false
-}
-
-// True if the annotation text `nm` is a MAP whose VALUE cell holds a closure fat-pointer —
-// a closure (`{[string]: (i32) => i32}`) or a nullable closure (`{[string]: F | null}`).
-// The map twin of `shapeHasCloField`'s field test, asked with the same two predicates the
-// union-arm loop there uses. A closure-ARRAY or closure-FIELD map value is NOT claimed: it
-// reaches the function-value machinery through its own annotation branch.
-function mapValIsClosure(nm: string) {
-  const mv = mapValNameOf(nm)
-  if mv == "" { return false }
-  annArrowAt(mv) >= 0 || nameIsNulClosure(mv)
 }
 
 // Recursively walk the node at `ix` (a statement or expression subtree) and append
@@ -6770,74 +6697,17 @@ export function collectFnValUse() {
       // the arena's extra `true`s would intern closure machinery this compiler does not
       // intern today — a behavior change, not a destringification. This site retires with
       // the alias-blindness, not before.
-      const fvSb = nonNulBaseOf(tyNameOf(i))
-      // A NULLABLE closure ARRAY (`((i32, i32) => f32)[] | null`) — the CROSS of the two
-      // cases above, and the hole neither covers: the annotation node is a `TyNullable`,
-      // not a closure array, so `nameIsClosureArrayTy` declines; and its non-null part is
-      // an ARRAY, not a closure, so `nameIsNulClosure` declines. The narrowed indexed call
-      // (`if p != null { p[0](1, 1, 1) }`) still `call_ref`s through an element
-      // fat-pointer, so the element signature must intern — without it the call finds no
-      // `$fnsig` and the program is rejected ("function-value call arity has no interned
-      // signature") even though every part of it is representable. This is the union-ARM
-      // loop's own closure-array test applied to the `| null`-peeled WHOLE: one rule, the
-      // arm position and the top-level position.
+      // THE ARENA. This whole block was a name walk: render the annotation, peel `| null`,
+      // split union atoms, and ask a shape/array/map grammar about each. `tyReachesClosure`
+      // asks the one question all of it was asking — does this type REACH a closure, through a
+      // nullable, an array element, an object field, a union arm or a map value.
       //
-      // THE CHEAP REJECT IS PART OF THE CALL. Both of `cloArrElemNameOf`'s legs demand a
-      // trailing `[]` before they can answer, but each opens with a depth SCAN
-      // (`parenUnionArrElemName`'s and `nameIsClosureArray`'s `annArrowAt` guard) — so
-      // without this one-character test every non-array annotation in the program would pay
-      // two whole scans to be told what its last character already said.
-      //
-      // It is the ARRAY-NAME grammar's TEST half, so it is asked at its home rather than by
-      // hand — and the home is the STRICTER reading, which is what makes the reject
-      // answer-exact rather than merely close. The hand-written version accepted any name
-      // ending in `]`; `nameIsArray` demands the `[]` PAIR. Both of `cloArrElemNameOf`'s legs
-      // (`nullClosureArrElem` → `parenUnionArrElemName`, and `nameIsClosureArray`) open with
-      // `nameIsArray` themselves, so every name the narrower gate now skips is one the call
-      // would have answered `""` for. Strictly fewer scans, identical answers.
-      if nameIsArray(fvSb) {
-        if cloArrElemNameOf(fvSb) != "" { fnValUsed = true }
-      }
-      // D-UNION set ADT — the arms come from the recorded member column when the
-      // annotation IS a registered row's member set, and the cardinality gate is
-      // that list's length (the counting dual identity, see `shapeHasCloField`).
-      const fvAtoms: string[] = []
-      const fvIsShape = nameIsWholeSpanShape(fvSb)
-      if !fvIsShape { unionMemberAtomsIfMulti(fvSb, fvAtoms) }
-      if fvIsShape {
-        if shapeHasCloField(fvSb) { fnValUsed = true }
-      } else if fvAtoms.length > 1 {
-        // A UNION whose ARM is a single-shape struct carrying a closure / closure-array
-        // field (`{…, z: (() => i64)[] | i32} | {w: i32} | {q: i64}`): the arm's field
-        // cell is a closure fat-pointer whose narrowed member-array call `call_ref`s
-        // through it, so flip the machinery on even when the value is only ever a
-        // non-closure arm (no lambda elsewhere) — the union-arm sibling of the
-        // single-shape case above (fuzz F5gJXz declared seed 530559367 case_00309).
-        let fva = 0
-        while fva < fvAtoms.length {
-          if nameIsWholeSpanShape(fvAtoms[fva]) {
-            if shapeHasCloField(fvAtoms[fva]) { fnValUsed = true }
-          }
-          // A union ARM that is DIRECTLY a closure array (`((i32,i32,i32) => boolean)[] | i32`),
-          // plain or nullable-element: the arm's elements are closure fat-pointers whose narrowed
-          // indexed call (`t0[0](1,1,1)`) `call_ref`s through them, so flip the machinery on even
-          // when the value is only ever the non-closure (scalar) arm — the union-arm sibling of the
-          // top-level closure-array annotation case (`nameIsClosureArrayTy`) above.
-          if cloArrElemNameOf(fvAtoms[fva]) != "" { fnValUsed = true }
-          // A union ARM that is a MAP with a closure VALUE — the map sibling of the
-          // closure-array arm above, decided by the one map-value test.
-          if mapValIsClosure(fvAtoms[fva]) { fnValUsed = true }
-          fva = fva + 1
-        }
-      }
-      // A MAP annotation whose VALUE cell is a closure (`{[string]: (i32) => i32}`) or a
-      // nullable closure: a bare map read (`const r = mp[k]`) binds that cell to a local
-      // typed as the closure fat-pointer, and its narrowed call `call_ref`s through it —
-      // so the closure rec-group types and the value's `$fnsig` must intern even when the
-      // program never CONSTRUCTS a closure (an empty or null-only map). Without the flip
-      // the bound local claims a heap-type index no closure struct occupies: invalid wasm,
-      // `vl check` rc 0, with no `is` and no lambda anywhere in the program.
-      if mapValIsClosure(fvSb) { fnValUsed = true }
+      // The decline that kept it (B155/B161/B162/B163) rested on the arena being WIDER: it
+      // resolves aliases the inline-`{…}` name test cannot see, answering TRUE on 15 more
+      // files. Measured, removing the name walk entirely leaves all 1947 corpus modules
+      // BYTE-IDENTICAL — `fnValUsed` is monotone and already true on those 15 from another
+      // path. The wider reader was never a behaviour change; it was a redundant one.
+      if nodeTyReachesClosure(i) { fnValUsed = true }
     }
     // An inferred CLOSURE-element array LITERAL (`const fs = [add, mul]`, no annotation): the
     // checker typed its ELEMENT as a function type, so its elements are closures stored /

@@ -51508,3 +51508,48 @@ against every reader available to it, and each has its measurement recorded:
 The programme's method reached its limit here, and the limit is legible: what is left is a
 wider name grammar, a genuine dead end, and a lookup table. None of the three is the defect this
 programme was built to remove, and each says so with a number.
+
+## B164 — the behaviour decline falls: 152 lines of name walking deleted
+
+B155, B161, B162 and B163 each recorded `collectFnValUse`'s closure scan as declined — the last
+one having measured that the arena rung adds **0 output diff** and concluded it was merely
+redundant, with the name walk kept because it was WIDER. That conclusion was right about the
+measurement and wrong about the remedy: if the arena is narrower, widen the arena.
+
+`tyReachesClosure(ty, depth)` asks the one question the whole 152-line block was asking — does
+this type REACH a closure, through a nullable wrapper, an array element, an object FIELD, a
+union ARM, or a map VALUE. Each of those descents replaces a named grammar test the block ran
+against a rendering: `shapeHasCloField`, `cloArrElemNameOf`, `mapValIsClosure`,
+`unionMemberAtomsIfMulti`.
+
+**Removing the name walk entirely leaves all 1947 corpus modules byte-identical.**
+
+The removal cascaded: `mapValIsClosure`, `shapeHasCloField` and `unionMemberAtomsIfMulti` all
+became unreachable and are deleted, along with the `nameFieldCode` and `msMemberAtomsOf` imports
+they were the last users of. Net **-141 lines in `emit_collect.vl`**, +41 in `typecheck.vl`.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### What the four declines got wrong, in order
+
+| entry | said | actually |
+| --- | --- | --- |
+| B155 | "declined on behaviour — a capability change" | the arena's extra trues never reach the output |
+| B161 | "not waiting on a decision" | true, but for the wrong reason |
+| B162 | "the tree asks the right question but is absent on 43 of 217" | the tree was never needed |
+| B163 | "the name walk is WIDER — keep it" | so widen the arena; the width was the gap, not the verdict |
+
+Every one measured something real. What none did was ask whether the arena reading could be
+made to cover what the name covers — because each accepted the ARENA READING IT WAS HANDED as
+the only arena reading available. The predicate under test was `nodeTyIsStructish` plus a direct
+field scan; nobody wrote the recursive one until the fourth attempt.
+
+That is a distinct failure mode from the seven this log already records, and the sharpest one:
+**a decline against "the arena" is only ever a decline against the specific arena predicate
+someone tried.** The five sources were enumerated; the readings OVER those sources never were.
+
+### Twenty-one conversions
+
+Two of the three "final" categories have now fallen — `paramVariantIndex` to a banked column
+(B146), this one to a wider predicate. The array rung remains, and it is the only site in this
+log where both directions disagree and no reading of any source resolves them.
