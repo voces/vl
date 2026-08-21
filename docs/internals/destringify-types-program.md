@@ -52747,3 +52747,54 @@ One file remains, and it is a map whose VALUE is a bare type parameter. That has
 because the generic ORIGINAL is never emitted — its instances are (#1473). **That is a predicate
 that cannot be written, not one that has not been written yet** — the first remainder in this
 programme to meet the bar B192 set.
+
+## B194 — the render that was never read, and the guard hidden inside it
+
+A reach census over EVERY `nodeTyName` call site — one build, ten labelled probes, one sweep —
+put the remaining render volume where no amount of reading had:
+
+| call site | files reaching it |
+| --- | ---: |
+| `emit_classify:14936` (`anonFieldCode`) | **232** |
+| `emit_rewrite:984` | 151 |
+| `emit_collect:825` | 64 |
+| `emit_classify:24833` | 43 |
+| six others | 43 |
+
+**533 files reach a `nodeTyName` render** — an order of magnitude past the two consumers this log
+has spent its length on (32 and 106).
+
+### A different kind of conversion
+
+At the top site the arena rung ALREADY existed and already decided most cases: `nameFieldCodeTy`
+consults `fieldCodeOfTy` before its name ladder. The render ran anyway, unconditionally, to build
+the argument. Censused: of 196 files reaching the rung, **the arena decides 123** — each one
+building a string nothing then read.
+
+So this changes no answers at all. It stops the work. Every arm before it widened what the arena
+could answer; this one removes a render whose result was already unused.
+
+### The guard hidden in the render
+
+A naive hoist — arena first, render after — is NOT equivalent, and the corpus said so
+immediately: `generics/genalias-field-reresolved-after-canon` rc=0 -> rc=1, plus three
+literal-union files moved.
+
+`nodeTyName` returns "" for a type it will not spell, and `anonFieldCode` uses that emptiness as
+a GATE on BOTH paths. **The site's own comment says exactly this** — "the `tn == ""` guard is
+what keeps a type the checker cannot spell here out of both paths" — and this attempt read that
+sentence and then wrote a replacement comment asserting it guarded only the name ladder.
+
+The fix copies `nodeTyName`'s partition (a non-void `TyPrim`, `TyObj`, `TyFunc`, `TyArray`
+spell; everything else does not), so the gate survives without a string. 0 diffs.
+
+**B193's rule generalises: copy the partition, not the intent — of guards as well as
+classifiers.** And the sharper version of it: when a function's comment states what a line is
+for, that is evidence about the partition, and disagreeing with it silently is how a conversion
+regresses.
+
+### Also measured, and now known to be stale
+
+The site's own header recorded "the arena decides 70 and the name 126". It is now 123/73 —
+widenings shipped for OTHER consumers (B162 closure arms, B164/B165 list arms) moved 53 files
+here without anyone measuring it. **A measurement in a comment ages.**
