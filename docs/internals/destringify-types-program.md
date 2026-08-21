@@ -50795,3 +50795,52 @@ were correct against a three-source model and wrong against a five-source one.
 
 The remaining small modules (`driver.vl`, `lint.vl`, `emit_mono.vl`'s producers) have not been
 re-read under the current source list.
+
+## B150 — the small modules re-read, and they are clean
+
+B149 undercut two exhaustiveness claims by finding a conversion in a module both surveys had
+already read. The obvious follow-through is to re-read the rest under the current five-source
+list rather than assert anything further. Three modules remained: `driver.vl`, `lint.vl`, and
+`emit_mono.vl`'s producers.
+
+All three are clean, for three different reasons — none of them "we already looked".
+
+**`driver.vl`** is already tree-first, and better instrumented than most of this programme:
+
+```vl
+const root = annTsOf(tyIx)
+if root >= 0 { modRwTsName(root); t.tyName = tsToName(root); return 0 }
+// ... the character scanner stays as the fall-through so the pass is total either way
+t.tyName = modTypeRenamed(t.tyName)
+```
+
+Its comment records that a sabotage build poisoning the fall-through is "corpus byte-, message-
+and run-identical over 1,282 files". That is the same inverted-control discipline this log
+arrived at independently, applied earlier and to a wider corpus.
+
+**`lint.vl`** asks a NAME question. `typeNamesAddSegments(n.tyName)` feeds unused-type
+detection — "is this type name mentioned anywhere" — which is about identifiers in source, not
+about types. Converting it would answer a different question.
+
+**`emit_mono.vl`**'s remaining reads all feed `monoAnnPinName` / `monoDeclAnnName` /
+`monoCompositeListAnnName`, which produce monomorphization PIN names. A pin name is an instance
+key: bucket 2, where the name is the identity rather than a description of it.
+
+### The position, verified rather than asserted
+
+With B149's find and this re-read, every module in the compiler has now been examined against
+all five sources (arena, spelling tree, canon's columns, the pin column, the name):
+
+| module | state |
+| --- | --- |
+| `emit_sections.vl` | renders no types, scans no spellings |
+| `emit_rewrite.vl` | parses no spellings |
+| `emit_mono.vl` | predicate converted; producers are pin keys |
+| `typecheck.vl` | `.tyName` is resolution or diagnostics throughout |
+| `driver.vl` | tree-first with a measured-dead fall-through |
+| `lint.vl` | name questions, correctly |
+| `emit_classify.vl` / `emit_collect.vl` | the remainder: bucket 2 keys, bucket 4 classifiers, 2 bucket-1 declines |
+
+That is a verified statement rather than the two I had to retract. What remains is what B148
+described, unchanged by this pass: two bucket-1 declines whose missing per-node column is named,
+bucket 2 where the name is the key by definition, and bucket 4's ~258 classifiers.
