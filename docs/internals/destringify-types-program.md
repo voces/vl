@@ -45312,3 +45312,25 @@ Two files, because two causes:
 * **A `@hint` can be evidence.** The redundant-annotation hint named the checker's inferred type,
   which is what proved the checker was right and moved the diagnosis. The lint output is a probe
   that is already running.
+
+### ADDENDUM — and I shipped the emit without its reservation twin, again
+
+The first version of this slice changed the element emit and stopped. B45 established the rule,
+B49's addendum restated it, and B49 had ALREADY established that `exprHasStrOp`'s ArrayLit arm
+only recurses ITSELF and never asks `exprIsLitAtom` — the exact fact that makes this arm's
+reservation missing. I had that written down, in this file, and did not apply it.
+
+A function whose ONLY string work is such a literal — `const ys = ["plain", v]` returning
+`ys.length`, never printing — allocated no frame and the widen wrote to a local the vector never
+declared: master `type mismatch`, branch `unknown local 5`. Same severity class, but a defect I
+introduced.
+
+The fixture now discriminates THREE states — master, emit-only, and both halves — and its
+`isolated` arm exists solely to have no other string work.
+
+* **The twin rule has cost four slices now.** It is not that the rule is unknown; it is that the
+  emit change is the interesting one and the reservation is bookkeeping, so attention runs out
+  first. The mechanical form: after writing an `emitAtomToStr`/`emitStrValue` call, grep
+  `exprHasStrOp` for the node kind you just changed BEFORE running anything.
+* **A fact recorded in the programme doc is not a fact applied.** B49 named this exact ArrayLit
+  gap as out-of-scope-but-real, and the next slice walked into it.
