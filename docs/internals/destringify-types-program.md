@@ -48345,3 +48345,57 @@ load-bearing rather than defensive — added with the call site that needed it.
 * **"Is this still destringification?" has a test.** Look for a string in the comparison. Encoding
   a correspondence between two arena shapes is type-to-type work; re-deriving a spelling to compare
   it is not. The question felt philosophical and was decidable in one reading of the code.
+
+## B102 — the param ladder declines, and the softening has a POSITION rule
+
+The param reject ladder was the next site for `isUnionOfTy`. Probing its union rung left 15
+disagreements (B101). Before chasing those, a cheaper question: **the ladder's other rungs**.
+
+Five of them are `ty.tyName != "i32"` / `"i64"` / `"f64"` / `"f32"` / `"boolean"` — raw spelling
+comparisons with an obvious twin in `nodeTyPrimName`. Substituting it moves **20 corpus rows**, all
+failing:
+
+```
+closures/closure-numeric-litunion-param-pin.vl
+  emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or string
+  parameters are supported
+```
+
+A NUMERIC literal-union param renders as `f64` after canon softening, so the spelling accepts it;
+the arena sees a `TyUnion` of `TyLit`s and rejects. **The softened name is the right answer**: a
+numeric litunion param IS lowered as its base scalar.
+
+### THE POSITION RULE
+
+That is the third PARAM-position rung to want canon's answer rather than the type's:
+
+| site | position | verdict |
+| --- | --- | --- |
+| `paramString` | param | decline — arena broke 2 files |
+| `letIsF64` | let | decline — arena broke 3 files |
+| **the five scalar rungs here** | **param** | **decline — arena breaks 20** |
+
+against the conversions, which were `cloRetIsString` (a callback RESULT), `letIsString` (a let whose
+slot another rung already claimed) and the return-widen rung (a RETURN whose litunion case another
+rung already claimed).
+
+**The pattern is not "params decline and returns convert".** It is that canon softens for the
+LOWERING, so wherever a rung's answer feeds the lowering directly — a param's valtype, a let's slot
+with nothing else claiming it — the softened name is what the emitter needs; and wherever another
+rung has already claimed the litunion case, the softened answer was never load-bearing and the
+structural one is safe.
+
+That is checkable per site, and it is what the measurement has been finding each time.
+
+### AND THE LADDER WOULD NOT HAVE BEEN SPELLING-FREE ANYWAY
+
+Its remaining rungs are `isSName`, `variantIndexOf`, `nameIsArray`, `nameIsString` — all name-based.
+Converting the five scalars would have removed five comparisons from a ladder that consults the
+spelling at every other rung. **Worth knowing before doing the work, not after**: the site's value
+was lower than its rung count suggested.
+
+### METHOD NOTE
+
+* **Cost the SITE, not the rung.** A ladder is spelling-free only when every rung is, and this one
+  has four more name-based rungs behind the five that looked convertible. Counting the rungs
+  overestimated the prize by the number of rungs left over.
