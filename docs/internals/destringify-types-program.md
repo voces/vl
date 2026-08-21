@@ -51011,3 +51011,53 @@ It also explains, retroactively, several things this log noticed without connect
 Step 1 is a bounded, measurable change with an obvious gate (corpus A/B must stay identical —
 recording a type changes nothing until something reads it). Step 3 is the ~258-function sweep,
 and it is the LAST step, not the first.
+
+## B154 — correcting B153: field annotations ARE stamped
+
+B153 concluded that "the arena has no recorded type on field annotation nodes" and made that
+the root cause of bucket 4, with a checker change as the corrected first step. **Both are
+wrong**, and the error is one this log has now made three times: measuring at a site without
+establishing which caller reached it.
+
+Two measurements settle it:
+
+```
+files where the field-annotation stamp is dropped:   0 of 1947
+files reaching fieldTypeCode with an unstamped node: 0        (both call sites)
+```
+
+`fillTypeDeclAt` stamps every declared field's `TypeRef` (`nodeTyIx[fd.fdType] = r`, with a
+comment saying exactly why), and neither `collectS` nor `collectVariantFields` ever reaches
+`fieldTypeCode` with an unstamped node.
+
+The 86 rows B153 measured come from a THIRD caller:
+
+```vl
+fieldCodeOfSpelling(t, -1)      // emit_classify.vl:14815, inside nameFieldCode(t: string)
+```
+
+`nameFieldCode` takes a string and has no node to pass, so it hands `-1` — and `-1` is what
+the probe read as "no recorded type". The nodes were never unstamped; **the call site had no
+node at all.**
+
+### What that restores
+
+B128's original diagnosis, which B153 had demoted to "a symptom", is correct as written: the
+classifier layer takes strings because its callers hold strings. `nameFieldCode` is exactly
+that shape, and its `-1` is honest — it is not losing a type, it never had one to lose.
+
+So the first step for bucket 4 is NOT a checker change. There is nothing to record; the
+recording already happens wherever a node exists. The first step is the one B134 described and
+B152 narrowed: thread nodes to the callers that currently hold only strings, leaf-ward, each
+step byte-checkable.
+
+### The error, named
+
+Three entries in this log have now measured a value at a site and attributed it to the site's
+subject rather than to its caller — B106 (the query passed the wrong node), B137 (a probe shape
+that sampled the first call), and this one. The shape is identical each time: **a site with more
+than one caller reports a mixture, and reading it as a property of the site is a category
+error.**
+
+The check that would have caught all three costs one build: print WHICH caller reached the
+probe, not just what it saw.
