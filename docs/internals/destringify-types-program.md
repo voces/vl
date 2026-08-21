@@ -49682,3 +49682,57 @@ scans cannot keep them apart:
 Four different structural readings, all of which the spelling renders as facts about
 substrings. Every conversion in this family has turned on picking the right one, and three
 of the four were reached only after a first guess failed a dual-run.
+
+## B127 — the inline-shape guard, and the arena being WRONG for a spelled question
+
+`letAnnIsUninternedShape` is a soundness guard: an inline object shape whose struct could not
+be interned must reject cleanly rather than mis-emit its object literal. It asked the
+question three times over a rendering — render, peel `| null`, test `name[0] == '{' &&
+name[1] != '['`, then look the name up in the struct table.
+
+The arena reading looks obvious, and B126's rule says to check which question is being asked
+before believing it. Dual-run of "peel to a `TyObj`, then `structIndexOfTy < 0`": **20
+disagreements**, all `name=F arena=T`, and the spellings say why:
+
+```
+Box<i32>   Stack   Pair<i32[],…>   {a:()=>{a:f32,f:i32[]}…}
+```
+
+Named aliases and generic applications. **The arena sees THROUGH them to the object they
+denote; this test deliberately declines anything not spelled as a literal `{…}`.** Converting
+to the arena would have turned those 20 into rejects — the false side of this guard is a
+reject, so an over-answering twin is not a benign widening here.
+
+The right twin is the TREE, exactly as B126 predicts for a spelled-shape question:
+`tsKind[root] == TS_OBJ`. Dual-run: **0** disagreements over 146 reaching files, both answers
+well represented (71 true, 75 false). Five have no tree, so the character test stays for
+them.
+
+The struct-table lookup stays name-keyed and is left alone: `sTyRow` is not populated for
+every shape `sNames` knows, and the row's identity IS the name. That is bucket 2, the
+interning layer, not a type decision.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### Unmeasured, and said so
+
+A nullable inline shape (`{a:i32} | null`) would root at `TS_UNION` where the peeled NAME
+still reads `{…}`. No corpus file reaches this guard with one — the nullable-struct
+classification above claims it first — so that arm is unmeasured rather than handled, and the
+comment says which of the two it is.
+
+### The count that matters
+
+Three sites in this family now, and the twin was different at each:
+
+| site | question | twin |
+| --- | --- | --- |
+| `paramCloSigKey` | an arrow ANYWHERE | `tsHasKind(root, TS_FUNC)` |
+| `calleeCloRetName` | a TOP-LEVEL function type | `tsKind[root] == TS_FUNC` |
+| `letAnnIsUninternedShape` | spelled as an inline shape | `tsKind[root] == TS_OBJ` |
+
+And at this one the ARENA — the instrument this whole programme is named after — was the
+wrong answer. That is worth stating plainly: "destringify" does not mean "route everything
+through the type arena". Some sites ask what the author WROTE, and for those the parser's
+tree is the destringified source and the arena is a different question wearing the same
+clothes.
