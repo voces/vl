@@ -47603,3 +47603,45 @@ declines and not one verdict was derivable from the shape.
 * **Count the shape you are chartered against, directly.** Two greps replaced an inventory number
   that had been quoted from entry to entry since B60. The remaining literal-shape surface was eight
   sites, five of which already had verdicts.
+
+## B89 — width is part of a predicate's identity
+
+`fnHasMapParam`'s rung asked `nameIsMap(ty.tyName)` of a param annotation. The obvious twin is
+`nodeTyIsMap`, it already exists, and the site is live at 16 rows. Substituting it **moves 4 corpus
+rows** — because `nameIsMap` cuts a `{[` out of ANYWHERE in a rendering, so it accepts
+`{[string]:i32} | null` and `{[string]:V} | i64` as readily as a bare map, and `t is TyMap` accepts
+neither. Sixteen corpus params are wrapped that way.
+
+**The exact twin was the wrong twin.** Not because the arena is wrong about the type, but because
+the predicate being replaced was WIDER than its name suggests. This log has now been bitten by
+width twice — B56's `tyAnnRefListKind` f64/i64 rungs and this one — and the rule is worth stating
+flatly: **an arena form has to match the WIDTH of the name form it replaces, not merely its
+subject.** `nameIsX` says what it is about; it does not say how much of a type it will look
+through.
+
+`nodeTyReachesMap` is the span twin: a `TyMap`, or one reached through a `TyNullable` hop or as a
+`TyUnion` member. With it, the corpus A/B is **0 rows**.
+
+### AND THE TWO REMAINING DISAGREEMENTS RUN THE OTHER WAY
+
+`unions/inline-shape-open-span-homes.vl` and `unions/map-member-shapes.vl` reach the rung with
+`MapTwin` and `NamedU` — ALIAS-named params, where the arena finds the map and the spelling cannot,
+because a param annotation renders a union alias as its identifier.
+
+That is worth noting against B72, which established that annotation `TypeRef`s carry the
+alias-EXPANDED spelling. **It is not universal.** A one-member alias is expanded in place; a UNION
+alias keeps its identifier, because the union registry is name-keyed and the name is the key. So
+"annotation names are expanded" holds for the case B72 measured and not for this one — and the
+conversion quietly closes an alias blindness the name form has.
+
+Both are inert (A/B 0 rows), and the widening is the safe direction here: this gates a scratch-frame
+RESERVATION, where over-answering costs an unused frame and under-answering costs a wrong one.
+
+A constructed union-member-map param emits 47 bytes more under the span form, both modules valid,
+both printing the same. `maps/union-member-map-param-reservation.vl` pins both halves of the width.
+
+### METHOD NOTE
+
+* **Measure the twin's WIDTH before adopting it, not just its subject.** The cheap test is the one
+  used here: substitute, sweep, and read the row count as a statement about width. 4 rows said
+  "too narrow" in one build, and the span twin was 20 lines.
