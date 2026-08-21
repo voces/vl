@@ -48068,3 +48068,55 @@ applied to an architectural claim rather than a predicate.
   B95 as "a language-implementation project" worth proposing. One build showed it is not a project
   to propose at all — it contradicts the type system's semantics. The measurement cost one build;
   the proposal would have cost a great deal more.
+
+## B97 — B96 corrected: nominal identity is not the same thing as a STRING identity
+
+B96 refuted hash-consing and concluded the four remaining sites are "not applicable" — the question
+*is this the declared type X* is a question about a name by construction. **The first half is right
+and the conclusion is too strong**, and one probe separates them.
+
+### THE SPLIT
+
+`isUName(name)` versus an arena-index lookup over `unTyIx`, at a blocked site, over the whole
+corpus — **partitioned by whether the matching registry row came from a DECLARATION**:
+
+| row kind | disagreements |
+| --- | --- |
+| DECLARED (`type X = A \| B`) | **0** |
+| INLINE (a spelling with no declaration) | **2** |
+
+B95 measured "2 disagreements" and read it as *the arena has no canonical identity*. B96 measured
+interning and read it as *identity is nominal, so the name is the identity*. Both were looking at
+the same two files, and both were INLINE unions.
+
+**For a DECLARED union the arena index tracks the declaration faithfully.** `declTyIxOfName` looks
+the declaration up rather than constructing it, so the index is stable — which is why interning was
+unnecessary for this case and destructive for it.
+
+### WHAT B96 GOT RIGHT, AND WHAT IT OVERSHOT
+
+Right: union identity IS nominal. `type Kf = 1.5 | 2.5` and `type Ki = …` must not share an index,
+and interning collapsed them.
+
+Overshot: **a nominal identity does not have to be a STRING.** A declaration already has a stable
+non-string identity — its AST node. `unDeclIx`, added here, is that column: the `UnionDecl` node
+index per row, `-1` for inline and value-union rows that have no declaration. Two declarations with
+identical members get different node indices, which is precisely the distinction interning
+destroyed and precisely what a nominal key needs.
+
+### SO THE FOUR SITES ARE NOT "NOT APPLICABLE"
+
+They are applicable for declared unions — the case they are actually about — and the residue is
+inline spellings, whose identity genuinely IS the spelling because there is no declaration to point
+at. An `arena-first, name for the inline residue` reader is the B78 shape and is now measurable at
+2 known files.
+
+That is a smaller and sharper remainder than either B95 or B96 stated: not "the arena cannot express
+this" and not "the name is the identity", but **"declared unions have a non-string identity and
+inline ones do not"**.
+
+### METHOD NOTE
+
+* **Partition a disagreement before theorising about it.** Two files carried the entire argument
+  through two entries and two opposite conclusions. Splitting them by declared-ness took one probe
+  and showed both readings were generalising from the same unrepresentative pair.
