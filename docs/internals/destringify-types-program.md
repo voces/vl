@@ -51269,3 +51269,46 @@ That last row is now ordinary work rather than a design question, and it is ordi
 classifier it needs was already written. The recurring lesson of this log applies to itself:
 **before concluding something must be built, try to build it** — the compile error is a faster
 and more reliable search than reading.
+
+## B159 — `anonFieldCode`, a render-then-test with the node in hand
+
+B158 left "the rest of the `nameFieldCode` family" as ordinary plumbing. Working through it
+found one site that is not plumbing at all but the programme's original target shape, unnoticed
+until now:
+
+```vl
+export function anonFieldCode(valIx: i32) {
+  …
+  const tn = nodeTyName(valIx)   // RENDER the recorded type
+  const c = nameFieldCode(tn)    // CLASSIFY the rendering
+```
+
+A node in scope, its recorded type rendered to a name, and the name classified — the exact
+pattern this programme exists to remove, in a function whose parameter is already the node.
+
+`nameFieldCodeTy(tn, nodeTyIxOf(valIx))` takes the CONFIRM-ONLY arena rung first and falls back
+to the same ladder. Measured: **196** corpus files reach it, the arena decides **70**, the name
+the remaining 126, **0** disagreements. Corpus A/B 0 of 1947; six gates green.
+
+The render STAYS, and deliberately: it is the fallback's input, and the `tn == ""` guard above
+it is what keeps a type the checker cannot spell here — an unsolved parameter, a hole — out of
+both paths. Removing the render would remove that guard with it.
+
+### Why it was missed
+
+Every survey in this log searched for `.tyName` reads and `tyNameOf(` calls. This site uses
+`nodeTyName(valIx)` — a different renderer, on a value node rather than an annotation node — so
+it matched none of the greps that produced B121's tables or B128's count. It was found by
+walking the `nameFieldCode` call graph from B158's conversion, not by searching for renders.
+
+That is the fourth distinct way a site escaped a survey in this log:
+
+| how it escaped | example |
+| --- | --- |
+| the twin had one consumer | `canonTyIxOf`, `annUnionAtomsOf`, `nwTyIxs` |
+| the module was read but the source list was short | B149's `emit_rewrite` |
+| the probe measured a mixture of callers | B153/B154 |
+| **the renderer had a different name** | **this** |
+
+Twenty conversions. Searching for a PATTERN finds what the pattern's spelling covers; walking a
+call graph finds what the pattern missed.
