@@ -51845,3 +51845,52 @@ array arm carries no such dependency, which is why the same gate passed it and f
 Remaining at the site: 19 files. Uncoded kinds behind them — `TyObj` 9, `TyArray` 10 (the
 non-prim elements this arm declines), `TyMap` 1, other 2 — all now with a named reason rather
 than a count.
+
+## B170 — the struct arm, refuted three ways, and a measurement that nearly lied
+
+B169 shipped the array arm and refuted the struct arm against `isStructOfTy`, blaming the
+choice of scan: the spelling ladder resolves code 15 through the DECLARATION scan, "not the
+incrementally-built struct table". That diagnosis predicted a fix. It was wrong.
+
+| predicate for "this `TyObj` field is code 15" | corpus A/B |
+| --- | --- |
+| `isStructOfTy` — the struct TABLE | 2 files rc=0 -> rc=1 |
+| `tyIsStructDecl` — the DECLARATION scan, `cUserTypes` + `tySame` | **1** file rc=0 -> rc=1 |
+| both, conjoined — declared AND interned | **1** file rc=0 -> rc=1 |
+
+Every survivor is the same fixture, `types/recursive-type-emit-render-cycle.vl`, failing the
+same way:
+
+```
+emitProgram: nested-struct field element type is not interned
+```
+
+The precondition for code 15 is not "is this a declared struct" and not "does the registry know
+it". It is **"is this field's element resolvable YET"** — and a recursive or forward declaration
+is declared, is registered, and is still not resolvable at the moment `fieldCodeOfTy` is asked.
+The spelling ladder never trips on this because it is reached through a spelling the interner
+has already processed; the type is available strictly earlier than the answer is.
+
+So B169's rule sharpens. It is not that two predicates can disagree about WHEN a type is known —
+it is that **no predicate over the type can express this precondition at all**, because the
+precondition is about the interner's progress, not about the type.
+
+### The measurement that nearly lied
+
+The first declaration-scan build reported **0 A/B diffs and 0 reach change**. Read alone, the
+zero looks like "safe"; it meant INERT — it resolved a `TypeDecl`'s type with `nodeTyIxOf`,
+which those nodes do not carry, so the arm never fired. Shipping on that zero would have landed
+a no-op under a confident comment.
+
+Worse, the reach numbers around it were briefly unreadable: the same sweep script had been
+started three times concurrently, and concurrent instances share one output file, so each
+truncation corrupts the others' counts (one run read 19, another 26, from the SAME probe
+binary). A clean serial re-measurement put master at exactly 19, confirming the numbers B168 and
+B169 published — but only after the artifact was found and removed.
+
+**Two rules, both paid for:** a zero that could mean "agrees" or "never ran" is not a result
+until the arm is shown to fire; and a sweep that shares an output file with another instance of
+itself is not a measurement.
+
+Remaining at the site: **19 files**, uncoded kinds `TyArray` (non-prim elements) 10, `TyObj` 9,
+`TyMap` 1, other 2 — the `TyObj` bucket now closed with a cause rather than a plan.
