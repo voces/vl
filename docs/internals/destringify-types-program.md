@@ -45541,3 +45541,52 @@ corpus numbers, opposite evidential value** — and only the sabotage distinguis
   because the name half was WRONG for a case that mattered. That is evidence the name half is
   wrong in general, and the remaining half is worth finishing rather than leaving as "the part
   that works".
+
+## B54 / D-RETNULL — the trap was recorded before the code was written, and it was real
+
+`fnRetNullBearing`'s union arm was `unionSetHasNull(tyNameOf(r))` — render the return type, split
+the render on `|`, look for `null`. It now asks `nodeTyBearsNull(r)`.
+
+### THE TRAP, RECORDED IN ADVANCE
+
+This item sat in the queue with its failure mode attached: **`retUnionFlag(r)` answers 1 for a
+`TyNullable` over a scalar as well as for a `TyUnion`**, so the obvious arena conversion — walk
+`uMembers` for a `TyPrim "null"` — answers FALSE for `i32 | null`. And a false answer there leaves
+a `return null` UNBOXED.
+
+The name form gets both shapes for free, because `"i32 | null"` splits to an atom list containing
+`null`. That is the whole reason this looked like a two-line conversion and was not: the render
+flattens two arena shapes into one spelling, and the predicate has to re-separate them.
+
+`nodeTyBearsNull` handles both: a `TyNullable` bears null by construction; a `TyUnion` bears it if
+some member is the `null` prim.
+
+### THE SEPARATOR
+
+Corpus **0 rows**; arm forced FALSE moves **3** — `functions/if-else-null-tail.vl`,
+`literal-unions/nullable-numeric-litunion-return.vl`, `soundness/missing-return-nullable-ok.vl`.
+Reached, load-bearing, and the arena agrees with the render on all three.
+
+Three consecutive slices now report "0 rows" with completely different meanings: B52 unreachable,
+B53 reached on 1 file, B54 reached on 3. **The corpus number has said nothing in all three
+cases**; the sabotage said everything.
+
+### AND THE SIZING, AGAIN
+
+`unionSetHasNull` has **11 askers**. Ten take a bare NAME with no node — `valName`, `vn`, `nm`,
+`uset`, `un`, `im`, `inferRetNameOf(fn.fnName)`. One takes a node-derived render, and it is the
+one converted here.
+
+That is the third item in a row where the inventory's one-line entry expanded to "N askers, one
+convertible": `nameIsI32KeyedMap` 17/2, `annIsNulStrListDeep` 4/1, `unionSetHasNull` 11/1. **The
+remaining destringify surface is dominated by predicates whose callers hold a NAME and not a
+node**, and converting those is not a predicate change at all — it is threading a type index
+through the callers, which nobody has costed.
+
+### METHOD NOTES
+
+* **A queued trap is worth more than a queued item.** This one was written down when the item was
+  found and it was exactly right; the conversion took minutes because the failure mode was
+  already known.
+* **"N askers, one convertible" is now the expected shape.** The next inventory pass should
+  record the convertible count, not the asker count, or the queue keeps overstating what is left.
