@@ -48689,7 +48689,76 @@ the witness was written directly from the cause. That is the first time on this 
 defect was found by reasoning forward from a measured mechanism instead of by differential
 testing — cheaper, and it names the fix rather than just the symptom.
 
-**The fix, when it comes:** the union question needs an arm count that survives dedup (or
-the rung must consult the ANNOTATION's arm structure rather than the collapsed type). Both
-B107 and B108 dissolve the moment a union of same-shape arms keeps its arity, which makes
-that the single highest-value repair left in the arena's representation.
+**The fix, when it comes:** see B109 — the prescription first written here ("give the
+union an arity that survives dedup") was wrong, and the experiment that corrected it also
+confirmed B107's decline.
+
+## B109 — the decline confirmed, the prescription corrected
+
+B107 and B108 both ended with the same proposed repair: make a union of same-shape arms
+keep its arity. Before queueing that work I checked the premise it rests on, and the
+premise is false.
+
+**VL is structurally typed.** `union-same-shape-discriminant-sound.vl` says so in its own
+header — "structural typing: Dog IS a Cat". So `Cat | Dog` where both are
+`{kind:i32,name:string}` genuinely IS `{kind:i32,name:string}`, and the annotation path's
+structural dedup (`sameVariantTy`, `typecheck.vl:7518`) is not a bug to be repaired — it
+is the type system agreeing with itself. Nothing is being erased that the CHECKER needs.
+
+That raised the opposite possibility: if the arena is right, the NAME is the stale party,
+and B107's decline was the mistake. So I built the converted rung —
+`paramVariantIndex` = `variantRowOfTy(nodeTyIxOf(paramTypeNode(..)))` — and ran the two
+files the census had named:
+
+```
+$ vl run union-same-shape-discriminant-sound.vl          # master, the NAME answer
+cat
+dog
+
+$ vl run ... --compiler ARENA.wasm                       # the arena answer
+Invalid input WebAssembly code at offset 281:
+  type mismatch: expected (ref null $type), found (ref $type)
+
+$ vl check --codegen ... --compiler ARENA.wasm
+check rc=0
+```
+
+A check-clean invalid module — the defect class this branch exists to hunt. **B107's
+decline is correct, now by experiment rather than by inference.**
+
+### What actually diverges
+
+Not the checker's type. The checker collapses `Cat | Dog` to one shape, correctly. The
+EMITTER still represents that parameter as a boxed union (`ref null $type`), because union
+boxing is decided from the annotation's SPELLING. So:
+
+| | says |
+| --- | --- |
+| checker's arena type | `Cat` — the collapse, and it is sound |
+| emitter's representation | a union box — decided from the spelling |
+
+The spelling is the only carrier of a **representation** decision, not of a type
+distinction. That is why every arena reader loses here and no amount of arena precision
+would win: the question at this rung was never "what type is this?" but "what did the
+emitter BOX this as?", and the arena does not record lowering choices.
+
+### The real fix, and why it is bigger than it looked
+
+Record the boxing decision as a queryable fact on the node when the annotation is
+resolved, so a rung can ask "is this union-boxed?" without the spelling. That dissolves
+B108 for free — its false reject is the same rung asking a representation question and
+getting a type answer.
+
+This also reclassifies an unknown number of the programme's remaining declines. Some of
+what has been filed as "the arena is narrower than the name" may be this instead: a
+representation question wearing a type question's clothes. The two are worth separating
+before any further conversion work, because they want opposite fixes — the first wants
+richer types, the second wants the lowering to write its decisions down.
+
+### Method note
+
+The prescription was shipped in two PRs before it was checked. It cost nothing to correct
+because it was a stated next step rather than code, but the general lesson stands: a
+measurement establishes what IS, and the fix it seems to imply is a separate claim that
+deserves its own test. Here one build refuted it, and the same build strengthened the
+finding the prescription was attached to.
