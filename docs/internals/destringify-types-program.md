@@ -51959,3 +51959,47 @@ consumer after the interner completes), which is a different risk class from any
 programme so far and should be its own piece of work rather than a coda to this one.
 
 Twenty-six conversions. The render path at the last site: **32 -> 12**.
+
+## B173 — the site, fully characterised: what the render still does that the arena refuses to
+
+Three measurements close this site's account.
+
+**Which rung answers.** `structIndexOfTypeName` has two: a NOMINAL `structIndexByName`, then the
+field-set scan over the render. Probed across the corpus, of the 12 files still reaching it,
+**12 answer at the field-set rung and 0 at the nominal one**. The remaining render work is not
+"look this name up"; it is entirely "match this shape", which is the question
+`structRowOfObjFieldSet` already asks of the arena.
+
+**What blocks the arena reader.** Precisely one thing: a field whose type `fieldCodeOfTy` does
+not code, because a declining field fails the ROW rather than matching loosely. The census:
+
+| uncoded field kind | files | status |
+| --- | ---: | --- |
+| `TyObj` | 9 | the interner-progress wall (B170) — three predicates tried, all refuted |
+| `TyVar` | 2 | a bare TYPE PARAMETER; no coder codes one, and the spelling ladder declines too |
+| `TyMap` | 1 | code 19 behind a lowerability gate |
+
+**Why the render still answers where the reader declines.** The two are not the same test. The
+render path checks each field with `shapeFieldTypeCompat` — a COMPATIBILITY predicate over
+(text, stored code, element name) — which can match a field whose type nothing codes. The arena
+reader compares CODE to CODE and declines on -2. So the render's remaining advantage is not
+information the arena lacks; it is LENIENCY the arena reader deliberately refuses.
+
+That refusal is not fastidiousness. Every arm that guessed in this pass produced invalid wasm or
+a trap — the blanket `return 5` (B171), the struct arm three ways (B170) — and each was caught
+only because the reader had been written to fail the row rather than approximate it.
+
+### The floor
+
+**32 -> 12**, by porting positive coder arms and nothing else. The remaining twelve need one of:
+
+1. a pass-scheduling change so the interner's progress is not a precondition (the nine), or
+2. `mvValKindOfName` ported to types (the one) — a large grammar ladder whose real prize is not
+   this file but `mapNodeValKindLowerable`, which RENDERS on every map node, or
+3. reproducing `shapeFieldTypeCompat`'s leniency in the arena reader (the two, and arguably all
+   twelve) — which is exactly the guess the fixtures punish.
+
+Only (2) is ordinary work. (1) is a different risk class. (3) is a bad trade and should stay
+undone.
+
+Twenty-six conversions, 103 PRs, six gates green on every one.
