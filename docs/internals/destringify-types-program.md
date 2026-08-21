@@ -49807,3 +49807,51 @@ not reachable by continuing this method, and the reason is now measured rather t
 Buckets 1 and 2 are closed for cause. Bucket 3's node-bearing sites are the remaining
 tractable work and are worth continuing. Bucket 4 is a design change to the emitter, and
 should be decided deliberately rather than arrived at one signature at a time.
+
+## B129 — the f32 rung joins its siblings; the local-i32 rung declines for the fourth time
+
+Two `emit_collect.vl` sites from the B121 shortlist, and they land on opposite sides.
+
+**The f32 array rung, converted.** Its f64 and i64 siblings both lead with
+`nodeTyArrayElemRepName(i) == "<base>"` and keep the name as a documented second opinion;
+f32 carried only the name test. Measured: **1387** corpus files reach this rung, both answers
+strongly represented (1375 false, 12 true), **0** disagreements — so the arena never WIDENS
+here, which is the property that matters in a minting chain where an over-answering rung
+suppresses every rung below it. The name stays for the four element families the arena
+cannot describe, exactly as the siblings' note records.
+
+**The local-i32 rung, declined.** A bare `nodeTyPrimName` shows five disagreements;
+`nodeScalarBaseName` (B113's kind-agnostic base-scalar reader) closes four of them — the
+numeric-litunion locals. One survives:
+
+```vl
+const kMix: K | i32 = 2     // literal-unions/is-numeric-litunion-membership.vl
+```
+
+A litunion ALIAS mixed with its own base is a `TyUnion` whose members are not all `TyLit`, so
+the structural reading declines it, while canon softens the spelling to `i32` — which is how
+it lowers.
+
+That is the **fourth** binding-position rung to want canon's softened answer rather than the
+type's, after B102's five scalar rungs, `paramString`, and `letIsF64`. The reason is identical
+every time: **the softening states the LOWERING, and a rung choosing a slot is asking about
+the lowering, not about the type.** Four independent measurements have now found the same
+thing, which is enough to call it a rule rather than a series of exceptions.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### The rule, stated once
+
+A rung in the emitter is asking one of four questions, and the right source differs for each:
+
+| the question | the source |
+| --- | --- |
+| what TYPE is this | the arena |
+| what did the author WRITE | the parser's spelling tree |
+| what CELL does this take | canon's softened name — the lowering |
+| which interned ROW is this | the name, which is the key |
+
+Only the first two are "destringified" in the sense the programme set out to achieve. The
+third and fourth are name-shaped because the answer itself is a name: a lowering decision the
+arena does not record, and an identity the table keys by. Every decline in this log is one of
+those two, and every conversion was one of the first two mistaken for them — or the reverse.
