@@ -45176,3 +45176,92 @@ function-local plain string literal with no literal union in it at all, standing
 * **A control must be able to fail for the reason it is a control.** Two here could only detect
   invalid wasm. Print the value, and check the control exercises the mechanism it is controlling
   for.
+
+## B49 / D-SHADOWRES — the shadowing hole closes for all six sinks, and a much quieter bug was underneath it
+
+B45's addendum found that the reservation scan and the emit can answer the SAME question
+differently, because `exprIsLitAtom` reads mutable phase state. That hole belonged to all six
+atom-widening sinks. It is closed.
+
+### 1. THE FIX IS SCAN-SIDE ONLY, AND THAT IS THE DESIGN
+
+`declaredSlotOf` falls back to a linear FIRST-MATCH scan over `localNames`. The reservation scan
+runs before the body is emitted, so the lexical scope stack is empty and an OUTER binding wins;
+by emit time `scopeBind` has bound the shadowing INNER one.
+
+`identShadowMayBeLitAtom` asks the question the scan can actually answer — **does ANY local of
+this name hold an atom?** — and only when the name has more than one declared local.
+Over-reserving costs a few locals; under-reserving is invalid wasm.
+
+**`exprIsLitAtom` itself must NOT be widened this way.** The emit shares it, and an emit that
+over-answers would widen a value that is really a string. The two halves need DIFFERENT
+PRECISION because they answer under different information, which is why this is a separate
+predicate rather than a flag on the shared one. That is the general shape for a scan/emit pair:
+when they disagree because of phase, the scan may over-approximate and the emit may not.
+
+### 2. AND UNDERNEATH IT, A WRONG ANSWER IN ORDINARY CODE
+
+Testing whether the SILENT spellings of the shadowing bug were also fixed turned up something
+unrelated to this programme and worse than anything in it:
+
+```vl
+function f(v: i32, n: i32) { if n > 0 { const v = 99  print(v) }  print(v) }
+// prints 7 7 — the parameter, twice. Correct is 99 7.
+```
+
+**A local declaration that shadows a PARAMETER is silently ignored.** No literal unions, no
+niches, no generics, no annotation. `vl check --codegen` exits 0, the module validates, it runs,
+and it computes the wrong value. A local shadowing another LOCAL resolves correctly, which
+localizes it to the parameter case.
+
+It contradicts the stated rule: ROADMAP B16 records "nested shadowing allowed (uniquified in
+codegen)". Shadowing a parameter is not uniquified — so either the uniquifier misses it or the
+checker should reject the declaration, and it does neither. Pinned with the WRONG answers as its
+`@log` lines so that fixing it is loud:
+`tests/cases/soundness/xfail-miscompile-local-shadowing-param-ignored.vl`.
+
+### METHOD NOTES
+
+* **A scan/emit pair may need different precision, not the same predicate.** The twin rule says
+  they must agree; it does not say they must be identical. Where they disagree because of PHASE,
+  the safe resolution is to let the conservative side over-approximate.
+* **Checking whether the SILENT form of a bug is also fixed is worth doing on its own.** The
+  reservation fix closed the loud spelling. Asking "and the quiet one?" found a defect in
+  ordinary parameter shadowing that no part of this programme would have reached.
+
+### ADDENDUM — I enumerated the predicates instead of the question, and missed three askers
+
+The first version of this fix patched the six `*WidensAtomToStr` predicates and shipped "the hole
+is closed". Review found three more scan-side askers of the SAME question about the SAME shadowed
+Ident, each still emitting invalid wasm at `vl check` rc 0: **`print(v)`**, an object-literal
+**field value**, and an **if-arm join**.
+
+**ENUMERATE THE QUESTION, NOT THE PREDICATES THAT ASK IT.** Grepping `*WidensAtomToStr` finds the
+sinks someone already named and grouped; grepping `exprIsLitAtom` on the scan side finds the ones
+they did not. The blind spot is visible in my own fixture header, which reasons carefully that
+`print` would reserve the frame *incidentally* and steers around it — without once asking whether
+`print` of a SHADOWED atom reserves it. It does not.
+
+Three further corrections from the same review:
+
+* The `assignWidensAtomToStr` call sat OUTSIDE the guard proving the assignment TARGET widens,
+  unlike all five siblings — reserving a 7-slot frame for any assignment whose RHS is an Ident
+  with a litunion homonym, whatever the LHS type. Moved inside.
+* The PR deleted a fixture that two surviving comments still cited as live, one of them the block
+  immediately above the new code, so two adjacent comments contradicted each other in shipped
+  source.
+* The param-shadow pin's symptom taxonomy was wrong. There are THREE symptoms, not two, and the
+  third is the worst: where the types simply differ with no literal union anywhere, it is
+  `check --codegen` rc 0 plus an invalid module. And the CHECKER is right while codegen is wrong
+  — `localIndexOf` resolves PARAM-first while `exprIsLitAtom`'s Ident arm resolves
+  DECLARED-LOCAL-first — which makes it a checker/codegen TYPE CONFUSION rather than only a wrong
+  number.
+
+**The over-reservation cost, measured rather than asserted.** The first version was byte-identical
+on the compiler's own source and across the corpus. With the three added positions the compiler's
+self-build grows 690 bytes of 1,265,070 — 0.05%, and 0 rows move on the corpus. "A few locals"
+was a guess; this is the number.
+
+* **A grep over a NAMING CONVENTION enumerates what someone already classified.** A grep over the
+  CALL enumerates what is actually there. When the fix is "everyone who asks X must also ask Y",
+  the search term is X.

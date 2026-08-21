@@ -4918,11 +4918,60 @@ export function exprIsStrConcat(binIx: i32, fnIx: i32) {
 // every program that reaches it is already invalid wasm, because the `(string | null)[]` push is
 // the NEXT sink in this family and is still open.
 //
-// It is NOT a superset in the direction that matters, and one gap is known: a SHADOWED binding
-// resolves through `declaredSlotOf`'s first-match fallback, which sees the OUTER name during the
-// scan and the INNER one at emit — so the predicate declines while the emit fires. That hole
-// belongs to all six sinks in this family and predates this one; see
-// tests/cases/soundness/xfail-miscompile-shadowed-atom-widen-unreserved-frame.vl.
+// The SHADOWED-binding gap this once carried is closed: `identShadowMayBeLitAtom` below is
+// consulted by EVERY scan-side asker of `exprIsLitAtom` about an Ident, not just by the
+// `*WidensAtomToStr` family — `print`, an object-literal field value and an if-arm join ask it
+// too, and enumerating the six named predicates instead of the question left those three
+// emitting invalid wasm at `vl check` rc 0. See
+// tests/cases/literal-unions/shadowed-atom-widen-reserves-frame.vl.
+// THE RESERVATION SCAN'S OVER-APPROXIMATION for a SHADOWED name.
+//
+// The six `*WidensAtomToStr` predicates and their emit arms both ask `exprIsLitAtom`, and they
+// can still disagree — because the answer depends on WHEN it is asked. `exprIsLitAtom`'s `Ident`
+// arm resolves through `declaredSlotOf`, whose fallback is a linear FIRST-MATCH scan over
+// `localNames`. The reservation scan runs before the body is emitted, so the lexical scope stack
+// is empty and an OUTER binding wins; by emit time `scopeBind` has bound the shadowing INNER
+// one. A shadowed atom therefore reserved nothing and widened anyway, writing to a local the
+// vector never declared.
+//
+// This answers the question the scan can actually answer: does ANY local of this name hold an
+// atom? Over-reserving costs a few locals in a function that may not need them; UNDER-reserving
+// is invalid wasm, so the asymmetry is deliberate and is the safe direction.
+//
+// SCAN-SIDE ONLY, and that is the whole design. `exprIsLitAtom` itself must NOT be widened this
+// way — the EMIT shares it, and an emit that over-answers would widen a value that is really a
+// string. The two halves need different precision because they are answering under different
+// information, which is why this is a separate function rather than a flag on the shared one.
+//
+// `localNames` / `localLitUnion` are populated by `buildLocals` before the scan runs
+// (`emit_sections`: `buildLocals(fnIx)` precedes `fnUsesStrOp = fnHasStrOp(fnIx)`), so the
+// column is readable here — and it is the CURRENT function's, which is why `_fnIx` is unused.
+// The parameter is kept so the call shape matches the five sibling predicates it sits beside.
+function identShadowMayBeLitAtom(exprIx: i32, _fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    // Only a name with MORE THAN ONE declared local can be resolved differently by the two
+    // phases; a unique name gets the same answer from both, and claiming it here would reserve
+    // frames for every ordinary string local in the program.
+    let seen = 0
+    let hit = false
+    let i = 0
+    while i < localNames.length {
+      if localNames[i] == e.identName {
+        seen = seen + 1
+        if i < localLitUnion.length {
+          if localLitUnion[i] == 1 { hit = true }
+        }
+      }
+      i = i + 1
+    }
+    if seen > 1 { return hit }
+  }
+  false
+}
+
 function pushWidensAtomToStr(callIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const c = P.nodes[callIx]
@@ -4933,6 +4982,7 @@ function pushWidensAtomToStr(callIx: i32, fnIx: i32) {
         if c.callArgs.length == 1 {
           if exprStringArray(callee.memObj, fnIx) {
             if exprIsLitAtom(c.callArgs[0], fnIx) { return true }
+            if identShadowMayBeLitAtom(c.callArgs[0], fnIx) { return true }
           }
         }
       }
@@ -4955,6 +5005,7 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
           let ai = 0
           while ai < c.callArgs.length {
             if exprIsLitAtom(c.callArgs[ai], fnIx) { anyAtom = true }
+            if identShadowMayBeLitAtom(c.callArgs[ai], fnIx) { anyAtom = true }
             ai = ai + 1
           }
           if anyAtom {
@@ -4984,6 +5035,7 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
       let vi = 0
       while vi < c.callArgs.length {
         if exprIsLitAtom(c.callArgs[vi], fnIx) { vAtom = true }
+        if identShadowMayBeLitAtom(c.callArgs[vi], fnIx) { vAtom = true }
         vi = vi + 1
       }
       if vAtom {
@@ -5012,7 +5064,10 @@ function assignWidensAtomToStr(binIx: i32, fnIx: i32) {
   const a = P.nodes[binIx]
   if a is BinExpr {
     if a.binOp == "=" {
-      if exprIsLitAtom(a.binRight, fnIx) {
+      if (
+        exprIsLitAtom(a.binRight, fnIx) ||
+        identShadowMayBeLitAtom(a.binRight, fnIx)
+      ) {
         if exprString(a.binLeft, fnIx) { return true }
         if unionTakesAtomAsStr(unionNameOfExpr(a.binLeft, fnIx)) { return true }
       }
@@ -5090,6 +5145,7 @@ function letWidensAtomToStr(letIx: i32, fnIx: i32) {
       const tn = tyNameOf(d.letType)
       if unionTakesAtomAsStr(tn) {
         if exprIsLitAtom(d.letInit, fnIx) { return true }
+        if identShadowMayBeLitAtom(d.letInit, fnIx) { return true }
       }
       const el = parenUnionArrElemName(tn)
       if el != "" && unionTakesAtomAsStr(el) {
@@ -5110,6 +5166,7 @@ function arrLitHasAtomElem(ix: i32, fnIx: i32) {
     let i = 0
     while i < elems.length {
       if exprIsLitAtom(elems[i], fnIx) { return true }
+      if identShadowMayBeLitAtom(elems[i], fnIx) { return true }
       i = i + 1
     }
   }
@@ -5128,12 +5185,14 @@ function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
   if fn is FuncDecl {
     if unionTakesAtomAsStr(tyNameOf(fn.fnRet)) {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
     }
     // The INFERRED-string dual (mirrors `emitReturnValue`'s widen): an UN-annotated
     // function whose A20 return is `string` (one path returns a member literal,
     // another the atom) widens an atom return too — reserve the frame.
     if fn.fnRet < 0 && cloRetIsString(fnStmtsPosOf(fnIx)) {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
     }
   }
   false
@@ -5507,6 +5566,7 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
           // `print(<literal-union atom>)` widens to its member string — its per-member print chain rides
           // the same string-op scratch frame.
           if exprIsLitAtom(e.callArgs[0], fnIx) { return true }
+          if identShadowMayBeLitAtom(e.callArgs[0], fnIx) { return true }
           // `print(<string | null>)` streams through `emitPrintNulString`, which `local.set`s
           // the ref it recovers from `br_on_null` into `strScratchBase + 0` — the SAME frame.
           //
@@ -5598,6 +5658,7 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
         // string-op frame. (Any atom field value is destined for a `string` field; a literal-
         // union FIELD is not yet a rep, so this is a safe over-approximation.)
         if exprIsLitAtom(f.fiValue, fnIx) { return true }
+        if identShadowMayBeLitAtom(f.fiValue, fnIx) { return true }
       }
       i = i + 1
     }
@@ -5624,13 +5685,17 @@ function ifChainHasAtomArm(ifIx: i32, fnIx: i32) {
     const tv = ifThenValueIx(ifIx)
     if tv >= 0 {
       if exprIsLitAtom(tv, fnIx) { return true }
+      if identShadowMayBeLitAtom(tv, fnIx) { return true }
     }
     if s.ifElse >= 0 {
       const els = P.nodes[s.ifElse]
       if els is IfStmt { return ifChainHasAtomArm(s.ifElse, fnIx) }
       if els is Block {
         const ev = ifArmValueExpr(s.ifElse)
-        if ev >= 0 { return exprIsLitAtom(ev, fnIx) }
+        if ev >= 0 {
+          if exprIsLitAtom(ev, fnIx) { return true }
+          return identShadowMayBeLitAtom(ev, fnIx)
+        }
       }
     }
   }
