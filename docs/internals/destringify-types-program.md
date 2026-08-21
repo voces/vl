@@ -50356,3 +50356,53 @@ was written (a mention of `T`, an arrow anywhere, a top-level arrow, a spelled i
 A site asking what the annotation denotes post-canon needs the arena or canon's own banked
 columns (`canonRewroteNode` / `canonTyIxOf`, which `collectAnnShapes` already uses two lines
 below this gate) — never the tree.
+
+## B141 — canon's banked type, and a sibling that had stopped declining without noticing
+
+B140 named a third source alongside the arena and the spelling tree: canon's own columns.
+`canonRewroteNode(ix)` says whether canon rewrote a node's name, and `canonTyIxOf(ix)` gives
+the arena type OF THE REWRITTEN SPELLING — the answer to "what does this denote now", which is
+the question the tree provably cannot answer.
+
+`canonTyIxOf` had exactly **one** consumer. `collectAnnShapes` uses it as a SWITCH — canon
+rewrote, so read the canon column instead of `nodeTyIx` — and its comment explains why the
+sibling does not:
+
+> "Before that column existed this was a second gate and declined instead, which is why the
+> sibling site in `collectNestedFieldShapes` still does — it has no `canonTyIx` to switch to."
+
+That is no longer true. `canonTyIxOf` is keyed by node index and general. Measured at the
+sibling: **28** corpus files reach it with a canon-rewritten nested field annotation, and
+**all 28 have a valid banked type**. The site was declining (`fdRoot = -1`, falling to the
+name-only intern path) where an arena type was available the whole time.
+
+Switched, so both sites now read the same way:
+
+```vl
+if !nameMentionsGenAliasParam(fdNm) {
+  if canonRewroteNode(fnode.fdType) { fdRoot = canonTyIxOf(fnode.fdType) }
+  else                              { fdRoot = nodeTyIxOf(fnode.fdType) }
+}
+```
+
+Corpus A/B 0 of 1947; six gates green. Inert by the B130 category — reached, both branches
+exercised, and no corpus file's bytes move — so the claim is that the structural reading is
+now correct and consistent with its sibling, not that a behaviour was fixed.
+
+### The third source, stated
+
+The programme has spent most of its length treating this as arena-versus-name. It is four
+sources, and B140/B141 complete the set:
+
+| source | answers |
+| --- | --- |
+| the arena (`nodeTyIxOf`) | what type the checker recorded |
+| the spelling tree (`annTsOf`) | what the author WROTE — pre-canon, checker-time |
+| canon's columns (`canonTyIxOf`) | what the rewritten spelling DENOTES — post-canon |
+| the rendered name | the lowering, and interning keys |
+
+A site reading a name is only a defect if one of the first three answers its actual question.
+`canonTyIxOf` is the least-used of them by an order of magnitude — one consumer before this
+entry, two after — and it is the only one that survives canon, which is where the interesting
+annotations end up. That makes it the most promising unexplored source left, and unlike the
+interface sweep it needs no design decision: the column already exists and is already banked.
