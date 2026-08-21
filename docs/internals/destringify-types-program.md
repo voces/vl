@@ -52241,3 +52241,44 @@ Three wrong sites before the right one, each eliminated in a minute by running t
 Two neighbouring spellings still crash, and they ARE same-shape-specific: `A | B` over identical
 shapes bound through a `const`. Different path, same class. #1611's repro is fixed; #1611's
 TITLE is still live.
+
+## B181 — the crash family's real cause: `emitFail` does not stop the pass
+
+B180 fixed one trap and left two spellings still crashing. Chasing the second found the cause of
+both, and it is not in either site.
+
+**`emitFail` RECORDS and RETURNS. It does not halt.** It sets `emitFailed`/`emitErr` on the FIRST
+failure, clears the output buffer, and returns -1 for the caller to propagate. When a caller does
+not, the pass keeps emitting with state the failure has already invalidated — and an unguarded
+parallel-table read then goes out of bounds. A read out of bounds in the compiler is a wasm
+TRAP: the process dies and the diagnostic it had already recorded never prints.
+
+That is why every repro in this family showed a backtrace and no message, and why guarding a read
+"fixed" it by letting the recorded message finally reach the user.
+
+The trapping read was `structIdxMatchesVariantIdx`, which checked `ssi < 0` and neither upper
+bound. Guarding it turns **all ten** repros — argument spelling, binding spelling, same-shape,
+different-shape, with and without `is` — into the diagnostic they had already produced.
+
+### How it was found
+
+Four wrong sites first, each eliminated by running the repro rather than by reasoning:
+
+| hypothesis | result |
+| --- | --- |
+| the valtype guard lists `variant` but omits `uVarHeap`'s bound | still crashed |
+| all 29 `uVarHeap`/`uTags` reads in `wasmEmit` | still crashed |
+| all `sHeapIdx` reads in `wasmEmit` | still crashed |
+| 4 tables x 2 emitters | still crashed |
+| 16 tables x 3 emitters, guard message forced to WIN | **`sFieldCount`**, then line 21731 |
+
+The last step is the one that mattered: because `emitFail` keeps the FIRST message, every probe
+was reporting the pre-existing reject rather than itself. Clearing `emitFailed` inside the probe
+so the guard's own message wins turned a silent bisect into a one-shot answer.
+
+### What is now true, and what is not
+
+No program in this family crashes the compiler. **None of them compiles either** — the false
+reject underneath is untouched, and both spellings are pinned as xfails. The deeper fix is the
+one `emitFail`'s own shape suggests: a recorded failure should stop emission rather than rely on
+every caller to propagate -1.
