@@ -52201,3 +52201,43 @@ This does NOT fix issue #1611, the same-shape union CRASH — that repro still t
 this arm never reaches. Same root cause (structural dedup erasing a spelled distinction),
 different consumer. One of the three declines the boxing-record idea would have dissolved is now
 closed on its own terms; the other two are untouched.
+
+## B180 — a compiler CRASH, and what the bisect said about its bug report
+
+Issue #1611 reports `vl check` clean and `vl build` **crashing the compiler** — a wasm trap, no
+diagnostic — on a same-shape union with an `is` test. Bisecting the repro, neither of those is
+required:
+
+| program | result |
+| --- | --- |
+| `A \| B` same shape, `x is A` (the filed repro) | crash |
+| same, WITHOUT the `is` | crash |
+| DIFFERENT shapes, with `is` | crash |
+| `f(x: A \| i32)` called `f(mkA())` — 4 lines, no `is`, no twin | **crash** |
+| the same value bound to a const first | loud reject |
+| an inline literal `f({...})` | compiles |
+
+So the trigger is a **CALL RESULT in a union argument position**, not same-shape unions.
+
+The trap: `emitUnionBoxArg` compares `sHeapIdx[bssi]` where `bssi` is a struct TABLE row, and
+`sHeapIdx` is only as long as the rows that reached heap-type assignment. A row that never
+interned a shape indexes past it. Every sibling reader carries that bound — `fbValtype`'s guard
+rejects "ref valtype with no interned shape" on exactly it — and this one did not.
+
+A row with no heap index cannot be a layout twin of anything, so the comparison now declines
+instead of indexing. Corpus A/B **0 diffs**; the crash becomes the loud reject its const-bound
+twin already got. That makes the two spellings agree. **It does not make either compile** — the
+false reject underneath is untouched, and is pinned as an xfail.
+
+### Found by testing the fix, not by the fix
+
+A first hypothesis — the valtype guard lists `variant` but never bounds-checks `uVarHeap` —
+looked right, was patched, and **the repro still crashed**. So did a build routing all 29
+`uVarHeap`/`uTags` reads through guarded accessors. The trap was somewhere neither touched.
+Three wrong sites before the right one, each eliminated in a minute by running the repro.
+
+### Still open
+
+Two neighbouring spellings still crash, and they ARE same-shape-specific: `A | B` over identical
+shapes bound through a `const`. Different path, same class. #1611's repro is fixed; #1611's
+TITLE is still live.
