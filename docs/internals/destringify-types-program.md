@@ -46225,3 +46225,36 @@ Both are kept and both now carry their number.
 * **Verify an inherited count before building on it.** Three separate size claims in this
   programme have been repeated from a previous pass and been wrong — each time in the direction
   that made the remaining work look more uniform than it is.
+
+## B68 / D-RESIDUE3 — the family, measured out
+
+The four name tests behind an `annRepKindOf` arena guard now all carry numbers. This closes the
+queue item B66 opened.
+
+| site | arm | arena leg off | this arm off |
+| --- | --- | --- | --- |
+| `letIsI32List` | `nameIsI32Array` | 1 row | **0** |
+| `letIsRefList` | — (fallback is `annBareRefArrSlot`, an ARENA call) | — | n/a |
+| `letIsStrList` | `nameIsStringArray` | — | **1** (`litunion-field-nullable-string-sinks.vl`) |
+| `letIsStrList` | `nameIsNulLitUnionList` | — | **0** |
+
+Three name arms, two of which rescue nothing on this corpus and one of which rescues exactly one
+file. **The shape predicted none of it** — same guard, same file, adjacent lines, three different
+answers.
+
+All three kept, for the standing reason: 0 rows proves corpus-unreachable, not dead, and the
+shapes these arms name (an inline litunion element, an aliased `(K | null)[]`) are exactly the
+kind a fixture corpus can lack while real programs carry them.
+
+### WHAT THE WHOLE EXERCISE PRODUCED
+
+Not a deletion. Four sites that carried the word "residue" now carry a measurement, and the
+measurement is what makes a future deletion decidable — a witness program for either 0-row arm
+would settle it in one build. Before this, deleting any of them would have been a guess in the
+same shape as the four reverts earlier in this programme.
+
+### METHOD NOTE
+
+* **Finish the family.** Measuring one member of a group and generalising is what produced the
+  "a dozen residues" error in the first place. Four arms, four builds, and the answers were 0, 1,
+  0, and not-applicable — no two the same.
