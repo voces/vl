@@ -47712,3 +47712,63 @@ the surface is fifteen sites, eleven are settled, and four wait on a named prere
 * **A count is a claim.** "354 remain" survived a dozen entries because nobody classified it. Five
   greps reduced it to fifteen, and the four that are left share a single cause — which is a
   roadmap, where 354 was only a number.
+
+## B91 — B-1 scoped: do for the union registry what D-SLOTARENA already did for structs
+
+B90 found the four remaining node-in-scope sites all blocked on the same thing — `isUName`,
+`structIndexByName` and `variantIndexOf` are keyed by rendered name. This entry scopes that work,
+because "a separate, large piece of work" is not a plan.
+
+### THE STRUCT SIDE IS ALREADY DONE, AND IT IS THE TEMPLATE
+
+`sTyIx` (`emit_state.vl:721`) is an arena-index sidecar to the struct registry, `recordSTyIx(
+sTyIxOfName(s.tdName))` populates it at every row mint (`emit_collect.vl:4916`, marked D0), and
+`slotCanonId` reads it FIRST — *"this row's type is known structurally, so there is nothing to
+re-derive from its name."*
+
+**The union registry has no equivalent. `grep -c '\bunTyIx\b'` returns 0.**
+
+So B-1 is not novel work. It is the same slice the struct registry already had, applied to the
+union one — and the struct version is the worked example, including its coverage discipline.
+
+### WHY IT IS BIGGER THAN "ADD A COLUMN"
+
+The union registry has three push sites and one of them **receives only a name**:
+
+| site | has a type in scope? |
+| --- | --- |
+| `registerInlineUnion` (`emit_collect.vl:5562`) | the declaration is in scope |
+| the `UnionDecl` arm (`emit_collect.vl:6485`) | `s.udName`'s declared type is reachable |
+| **`registerValueUnionName(name: string)`** (`emit_classify.vl:16878`) | **no — a bare string** |
+
+That third entry point has **12 callers**, every one passing a name computed by other name work —
+element-name cuts, `inferLetTyAt`, field-code element names — and `registerInlineUnion` is itself
+recursive over names (`aa`, `pun`, `rnp`).
+
+And the registry's existing arena column is derived FROM the name: `recordUnMemTys(set: string)`
+does `splitUnionAtoms(set, atoms)` and resolves each atom with `unMemAtomTyIx(a)` =
+`declTyIxOfName(a)`. **The arena data is downstream of the string.** A sidecar populated at the two
+declaration-driven sites would be -1 at the third, and every reader would still need the name leg —
+which is the coverage-guard shape this programme now knows how to measure, but it means the payoff
+comes only after the third entry point is inverted.
+
+### THE ORDERED PLAN
+
+1. **`unTyIx` sidecar**, mirroring `sTyIx`: pushed at all three sites, `-1` at the name-only one.
+   Measurable immediately — the coverage rate over the corpus is the number that says whether step 2
+   is worth doing.
+2. **Thread a type into `registerValueUnionName`**, caller by caller. Twelve callers; each needs its
+   own liveness + disagreement measurement, one build per site (B87).
+3. **`isUNameTy(tyIx)` / `variantIndexOfTy(tyIx)`** beside the name forms, arena-first with the name
+   as the uncovered bridge (B78's shape).
+4. Only then do B90's four sites convert, and each still needs its own width check (B89).
+
+Steps 1 and 3 are small. Step 2 is the work, and its size is 12 callers x the measurement discipline
+this log has settled on — which is the honest reason it is not being done as "one more site" at the
+end of a long session.
+
+### WHAT IS TRUE TODAY
+
+Every place this compiler rendered a type and then tested the render has been measured, and each is
+converted, declined with a recorded reason, or shown inert. What remains is one subsystem whose KEY
+is a name — and the plan above is what turning it into an index costs.
