@@ -49596,3 +49596,53 @@ The remaining surface sorts by CAUSE rather than by count, and only one bucket i
    this session (#1610, #1613, #1614) used it; `emit_classify` has not.
 
 Bucket 3 is the last one with unmeasured headroom.
+
+## B125 — `emit_classify`'s first spelling-tree reader, and a twin that looked right and wasn't
+
+B124 left one open bucket: `emit_classify.vl` answers "what shape was this annotated as" by
+character surgery while reading the parser's spelling tree ZERO times. `paramCloSigKey`'s
+`strContains(nm, "=>")` is the module's most explicit instance.
+
+### The obvious twin is wrong, and the corpus said so
+
+The arena reading looks immediate: a function type is a `TyFunc`, a nullable closure a
+`TyNullable` over one, so `nodeTyIsFunc(ix) || nulCloFlagAnn(ix) == 1`. Dual-run: **14
+disagreements**, every one `name=T arena=F`, and the spellings name the cause —
+
+```
+((i32)=>i32)|((i32)=>string)
+((i32)=>K0|{w:i32})|boolean
+(()=>i32)|i32
+```
+
+— unions with a closure MEMBER. The site's own comment had already said what it asks ("an
+arrow ANYWHERE"), and a whole-type predicate cannot answer a whole-tree question. The narrow
+twin would have silently stopped deriving sig keys for closure-in-union params, which is the
+class the site's header records as a prior invalid-wasm fix.
+
+### The tree answers it exactly
+
+`tsHasKind(root, TS_FUNC)` — a new whole-tree walk in `ast.vl`, the structural sibling of
+`tsMentionsAnyName`'s whole-LEAF question. Dual-run: **0** disagreements over 123 reaching
+files, both answers present (121 true, 2 false).
+
+Ten of the 123 have no tree (`annTsOf` answers -1 once canon rewrites a name in place), so
+the arrow scan stays for them — measured, not assumed. The PAYLOAD stays on the name too:
+`cloNameSigKey` builds an ABI `$fnsig` key, where the spelling IS the identity, which is
+bucket 2 and not this conversion's business.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### Why this one matters beyond its site
+
+It is `emit_classify.vl`'s first spelling-tree reader. The module's remaining spelled-shape
+questions — `annArrowAt` scans, `annRetNameOf`, `unionRetOfFnType`, the `nameIsShapeSpanEnds`
+family — are the same question in different clothes, and they now have a precedent and an
+import edge to follow.
+
+It also sharpens the method one more turn. Three of this session's conversions failed on
+their first structural guess and succeeded on the second (B113's litunion, B119's population
+count, this one's `TyFunc`). The pattern: **an arena predicate answers about the TYPE, and
+some sites ask about the ANNOTATION** — what the author wrote, arrows and all. Those two
+questions coincide often enough to be mistaken for each other, and the corpus tells them
+apart in a single dual-run.
