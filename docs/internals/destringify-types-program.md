@@ -47442,3 +47442,48 @@ over-answer direction into a `(ref $aTypeIdx)` slot. Converting it needs the nar
 * **Screen by liveness before writing the conversion.** Three candidates, three builds, one
   conversion. The two that failed the screen would each have cost a twin, a slice and a review to
   arrive at a number that could not mean anything.
+
+## B86 — the same softening, the same narrowing, and the opposite outcome from its own sibling
+
+B85 deferred `letIsString` rather than converting it: live at 4 rows, but its inventory-named twin
+`nodeTyWidenedRepName` is WIDER by design — it carries a `tyIsLitUnion` arm answering `"string"`,
+which would reproduce the canon softening exactly. Converting to that twin would be a rename.
+
+The NARROW twin (`nodeTyPrimName`) converts.
+
+| step | result |
+| --- | --- |
+| liveness — rung forced off | 4 rows |
+| disagreement — narrow arena vs spelling | **11**, every one a litunion local (`name=1 prim=""`) |
+| corpus A/B | **0 rows** |
+| five constructed litunion-local-at-a-string-sink witnesses | all byte-identical |
+
+The witnesses were built because 11 disagreements at a live rung is exactly when a 0-row sweep
+should not be trusted: a `string` param, `+` concat, `==`, `print`, and an element of a `string[]`
+literal. All identical.
+
+### WHY, AND WHY ITS SIBLING WENT THE OTHER WAY
+
+`letIsLitUnion(letIx)` claims the local first and answers `"i32"` for the slot, so by the time
+`letIsString` is consulted the rep is already settled. The name form's TRUE was never the deciding
+answer for those 11 files.
+
+**`paramString` has the identical shape and DECLINED** (B79 addendum 2). Its narrowing turned two
+corpus files into check-clean invalid wasm, because a litunion PARAM's slot has no other decider
+and the softened answer is the one the emitter needs.
+
+Same softening. Same predicate family. Same direction of narrowing. **Opposite outcomes, and the
+difference is whether anything else claims the binding first.** Nothing about either site's
+spelling, twin, or population predicts which — only running it does.
+
+That is now **six softening sites**: two conversions (`cloRetIsString`, this one) and four declines
+(`paramString`, `tyAnnRefListKind` rung 1, `synthRetAnnots` arm 14, and arm 11's two inert
+disagreements). The verdict has never been derivable from the shape.
+
+### METHOD NOTE
+
+* **A sibling's verdict is not evidence.** `paramString` and `letIsString` are the same question
+  asked of a param and a local, by predicates two hundred lines apart with the same name pattern
+  and the same twin. One breaks two files; the other moves nothing. Copying the first verdict onto
+  the second would have declined a sound conversion — and copying the second onto the first would
+  have shipped invalid wasm.
