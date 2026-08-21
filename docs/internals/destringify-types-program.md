@@ -52388,3 +52388,45 @@ build the variant — never merely what it is CALLED. Renaming a rep is how this
 invalid wasm; four fixtures now record it.
 
 **Nothing shipped from this attempt.** Both xfails carry the four dead ends.
+
+## B185 — the struct row works and is still wrong, and a worse bug found beside it
+
+B184 left "change what the value IS" as the remaining direction. Both halves of it were tried.
+
+**Give the arm a struct row.** All ten repros compile AND RUN CORRECTLY — every printed value
+matches. It also turns `types/variant-as-value.vl` into an INVALID MODULE, and that fixture pins
+the opposite design deliberately: a concrete variant used as a first-class value "rides the
+variant struct directly (kind 8)". A struct row makes the same value ride the plain struct, and
+the two heap types are distinct.
+
+Lifting the skip outright is worse: **49 files move, three regress, one invalid.** Narrowing the
+row to arms that appear as a FuncDecl RETURN type leaves exactly the one conflict — which is not
+a tuning problem. It is the design stating that a union arm's values belong to the variant table.
+
+**So the answer is not a new row and not a new rep.** It is that the existing variant-as-value
+path should cover this spelling. Measured: it already does for the DECLARED union in ARGUMENT
+position — `type U = A | i32` with `f(mkA())` compiles and runs on master today. The gap is the
+INLINE-union arm.
+
+### And a worse bug, found beside it
+
+The BINDING spelling of that same working declared union is broken, independently:
+
+```vl
+type U = A | B
+const b: U = mkB()      // vl check --codegen: no errors
+                        // vl run: expected (ref null $type), found (ref $type)
+```
+
+A **check-clean invalid module** — the class this programme treats as the worst outcome, and
+higher severity than the rejects that led here. Filed as **#1678**. Not part of the #1611 family:
+those fail loudly, this one passes the gate that promises lowering.
+
+| spelling | today |
+| --- | --- |
+| declared union, call in ARGUMENT position | compiles and runs |
+| declared union, call bound to a `const` | **check-clean invalid module (#1678)** |
+| inline union, either position | loud reject (the two xfails) |
+
+**Nothing shipped.** Five dead ends now sit in both xfail headers; the sixth attempt should start
+from the working declared-argument path and ask why the inline arm misses it.
