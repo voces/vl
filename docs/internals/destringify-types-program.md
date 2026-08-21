@@ -46065,3 +46065,42 @@ corpus-unreachable, not dead.
 * **An UNKNOWN is a question, and questions have cheap answers.** The screen flagged this as
   needing a body read it had not done. The body was four lines. Nine UNKNOWNs are nine specific
   questions, not nine open problems — and each one answered narrows the surface permanently.
+
+## B64 / D-NULCLO — the paren question did not need answering, and the site is live
+
+Second of B62's nine UNKNOWNs, and the one it flagged hardest. The screen could not decide
+`emit_collect`'s `nameIsNulClosure(tyNameOf(i))` because the answer turned on ONE PAREN:
+
+> For `type F = (i32) => i32; let x: F | null`, `canonEmitNameTs` splits on `|` and substitutes
+> the transparent alias's member. If it rejoins as `(i32) => i32 | null` the name form silently
+> answers FALSE today (`nameIsNulClosure` rejects any top-level arrow) and the arena form is a
+> FIX; if it rejoins as `((i32) => i32) | null` the two agree and the conversion is inert. Those
+> are opposite conclusions and the difference is one paren.
+
+**Neither conclusion needed deriving.** Two experiments settled it in one build each:
+
+* **Is the site reached?** Force it false: the corpus moves **4 rows**. Live and load-bearing.
+  (Two constructed nullable-closure-alias programs — via alias and inline — still ran, because
+  another path interns the machinery for them. The corpus is what found the 4.)
+* **Do the two forms agree?** Convert: **0 rows**. So the widening the screen worried about does
+  not manifest on any file that reaches the site, and the paren question is moot.
+
+`nodeTyIsNulClosure(i)` — one positive arm, `TyNullable` over `TyFunc`.
+
+### THE SIBLING RULING DOES NOT TRANSFER
+
+Twenty lines below sits `emit_collect.vl:6595`, carrying a measured refusal: *"An additive probe
+over the 1,269-file corpus disagreed on 15 files, EVERY one in that direction … `fnValUsed` is
+MONOTONE, so the arena's extra `true`s would intern closure machinery this compiler does not
+intern today — a behavior change, not a destringification."*
+
+Same file, same flag, twenty lines apart, opposite outcome — because that ruling is about the
+SHAPE-FIELD scan and this is the annotation scan, and the measurement that produced it was run
+against the other site. **A neighbouring refusal is evidence about its own site, not about the
+question.** Checking cost one build; assuming would have cost the conversion.
+
+### METHOD NOTE
+
+* **When a question has two opposite answers and both are cheap to test, test — do not derive.**
+  The screen spent its budget trying to read the paren out of `transparentMemberEmitName` and
+  stopped, correctly, at UNKNOWN. Two builds answered it without reading that function at all.
