@@ -45454,3 +45454,57 @@ pin it — the behaviour was already correct — so the fix is preventive and sa
   branches, one edited, and the other two were a screen away in the same function.
 * **"Benign by evaluation order" is a defect, not a non-defect.** The write was real, the slot
   was aliased, and the only thing making it safe was that someone else overwrote it first.
+
+## B52 / D-MAPKEY — 17 askers, 2 convertible, and both are unreachable
+
+The first slice back on the destringify goal proper, after the atom-widening prerequisite closed.
+It converts two sites and its real output is a measurement.
+
+### 1. THE ENUMERATION, DONE FIRST THIS TIME
+
+The inventory named ONE site: `nameIsI32KeyedMap(tyNameOf(fnode.fdType))` in `emit_collect`.
+Grepping the question rather than the site finds **17 callers**. Fifteen take a bare STRING with
+no node in hand (`ftxt`, `texts[pi]`, `rawTexts[pi]`, `mn`, `en`, `mve`, `bare`) — those cannot
+be converted at all until their callers thread a type index, which is a different change.
+
+Two hold a node and are convertible. That is the honest size of this item, and the previous four
+slices each mis-sized exactly this step.
+
+### 2. THE EXACT ARENA TWIN WOULD HAVE NARROWED THEM
+
+`nameIsI32KeyedMap` is `mapSpellKeyName(name) == "i32"`, which cuts the `{[K]:` span from
+ANYWHERE in the spelling — so it answers TRUE for `{[i32]: V}[]`, an ARRAY of i32-keyed maps.
+`nodeTyMapKeyIsI32` peels only a `| null` hop and declines there.
+
+**The direction matters because the callers MINT A WASM TYPE.** `mI32Used` is monotone:
+over-answering mints a type that goes unused, under-answering leaves a needed type unminted and
+the module invalid. So the conversion needed `nodeTyMapKeyIsI32Span`, which peels `TyArray` and
+`TyNullable` recursively — kept separate from the exact twin, whose eight callers ask a different
+question about one type.
+
+### 3. AND BOTH SITES ARE UNREACHABLE
+
+Corpus: **0 rows**. Two constructed probes (an aliased i32-map, an array of i32-maps) identical
+on both builds. Then the separator, per B41: forcing the new predicate to return FALSE moves
+**0 rows too**.
+
+So the flag is not set by these two sites for any corpus program — the sibling arena site at
+`emit_collect.vl:3738`, the `Map()` CONSTRUCTOR path, already sets it. Any program with an
+i32-keyed map must construct one somewhere, so the `TypeRef`-walk sites are redundant with it.
+
+**This ships as a source-level removal of two string-based decisions, not as a behaviour change,
+and the commit says so.** The alternative reading — that the sites are dead and should be deleted
+— is not established: a map that arrives without a local constructor (a host import, an
+annotation-only path) would reach them, and no such program was built.
+
+### METHOD NOTES
+
+* **Grep the question, then count what is actually convertible.** 17 askers, 15 of them
+  string-only. "Convert `nameIsI32KeyedMap`" is not one item; it is two conversions and a
+  prerequisite (thread a node to thirteen callers) that nobody has costed.
+* **When a predicate's callers MINT something, the safe direction reverses.** Everywhere else in
+  this programme over-answering was the risk; here under-answering is, and the exact arena twin
+  is the narrower one.
+* **An unreachable conversion is still worth making, and must be labelled.** It removes a string
+  decision from the source. It does not remove one from any run, and a commit claiming otherwise
+  would be the same overreach this programme keeps recording.
