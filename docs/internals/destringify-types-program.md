@@ -50648,3 +50648,63 @@ destroyed when it had merely been written down somewhere unfashionable.
 The remaining bucket-1 declines — B123's ref-list slot (newtype brand/base) and B133's array
 rung (type-parameter binding) — have NOT been re-tested against this receipt. They are the next
 work, and the prior is now that the receipt exists until proven otherwise.
+
+## B147 — the array rung against every receipt, and a label B137 got wrong
+
+B146 flipped the prior: assume a receipt exists until proven otherwise. Applying that to
+B133/B137's array rung means testing it against the banked columns rather than the arena alone.
+The per-node columns that are independently RECORDED (rather than derived from `nodeTyIxOf`)
+are three:
+
+- `canonTyIxOf` / `canonRewroteNode` — canon's rewrite record (unblocked B142–B144)
+- `annUnionAtomsOf` — the spelled atom count (unblocked B146)
+- `nodePinKindOf` / `nodePinPayloadOf` — monomorphization provenance, used by `paramCloSigKey`
+  to read a `$fnsig` key "where it lives instead of prefix-testing the node's name"
+
+Measured at the rung, on all six disagreements:
+
+```
+name=T arena=F pin=0 atoms=1 tyIx=70 [i32[]]
+name=T arena=F pin=0 atoms=1 tyIx=3  [i32[]]
+name=F arena=T pin=0 atoms=1 tyIx=70 [A]
+name=F arena=T pin=0 atoms=1 tyIx=65 [T]
+name=F arena=T pin=0 atoms=1 tyIx=48 [X]
+name=F arena=T pin=0 atoms=1 tyIx=37 [X]
+```
+
+**Every row is `pin=0`, `atoms=1`.** Neither receipt distinguishes any of them, so the decline
+stands — now tested against all three banked columns and the arena, rather than the arena
+alone.
+
+### The label B137 got wrong
+
+B137 described the two `name=T arena=F` rows as "arena SILENCE on a shadowed-alias generic
+original". They are not silent: `tyIx=70` and `tyIx=3` are recorded types. The arena HAS a type
+for those nodes and it simply is not an array, while the spelling reads `i32[]`.
+
+That makes both directions genuine disagreements rather than one disagreement and one coverage
+hole:
+
+| direction | cause |
+| --- | --- |
+| `name=F arena=T` | a bare type PARAMETER — the arena reads through to its binding |
+| `name=T arena=F` | a shadowed alias — the recorded type is not the array the spelling names |
+
+The correction matters for the queue, not just the record: a coverage hole is fixed by widening
+coverage, and a disagreement is not. B137 filed this under the first and it belongs under the
+second.
+
+### Where the receipt prior now stands
+
+Three columns, six declines tested:
+
+| decline | receipt that unblocked it |
+| --- | --- |
+| local-i32, `paramString`, `letIsF64`, `letIsI64` | `canonTyIxOf` |
+| `paramVariantIndex` (B107/B109) | `annUnionAtomsOf` |
+| the array rung (B133/B137) | **none — holds** |
+| B123's ref-list slot | not yet tested |
+
+The prior was worth flipping — it turned five declines into conversions — and it is not a
+guarantee. This is the first site where the enumeration came back empty, and the decline is
+stronger for it.
