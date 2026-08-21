@@ -49736,3 +49736,74 @@ wrong answer. That is worth stating plainly: "destringify" does not mean "route 
 through the type arena". Some sites ask what the author WROTE, and for those the parser's
 tree is the destringified source and the arena is a different question wearing the same
 clothes.
+
+## B128 — the remainder is a LAYER, not a list
+
+After eight conversions in `emit_classify.vl` and its neighbours, I went looking for the next
+batch of `annArrowAt` sites — 21 of them in that module alone — and found that almost none
+can be converted at all. Not because of an erased distinction (bucket 1) or a name-keyed
+identity (bucket 2), but because **there is no node at the site to ask about**.
+
+Every one of these takes a string:
+
+```vl
+export function nameIsRefArray(name: string)
+export function nameFieldCode(t: string)
+function annParamKind(t: string)
+export function unionArmSigKey(arm: string)
+export function mvValKindOfName(valName: string)
+```
+
+The caller already reduced the type to a rendering before calling. Converting the predicate
+means changing its SIGNATURE, which means changing every caller, many of which hold only a
+string themselves.
+
+### The measurement
+
+Functions whose first parameter is a type-name string, versus those taking a node or arena
+index:
+
+| module | name-first | node/type-first |
+| --- | ---: | ---: |
+| `tyname.vl` | **31** | **0** |
+| `emit_base.vl` | 58 | 24 |
+| `emit_classify.vl` | 169 | 112 |
+
+`tyname.vl` is the extreme case and the clearest statement of the situation: it is a module
+of 31 functions that take a rendered type and answer questions about it, with no other kind
+of input. It IS the name-classifier layer.
+
+### What this means for the goal
+
+The programme's model so far has been a list of sites, each with a twin to find. That model
+was right for everything converted: the param ladder, the scalar rungs, the map value, the
+closure sig key, the inline-shape guard — each had a node in hand and needed only the right
+structural question.
+
+The tail is a different thing. **The emitter's internal currency is the rendered type name.**
+Types are rendered early, then passed function-to-function as strings, and the classifiers
+are the natural consumers of that currency. The remaining ~258 name-first functions are not
+258 defects; they are one design, and the sites that read `.tyName` are its symptoms.
+
+Converting the tail means changing what the emitter passes around — nodes or arena indices
+instead of names — which is a refactor of the emitter's interfaces rather than a sequence of
+local substitutions. Every conversion in this log that succeeded did so because a node
+happened to be in scope; that supply is now largely exhausted in the modules surveyed.
+
+### The honest position on the goal
+
+"The type system no longer does any functional work with string representation of types" is
+not reachable by continuing this method, and the reason is now measured rather than guessed:
+
+1. **Bucket 1** — the spelling is the only carrier of a distinction the arena erased
+   (same-shape unions, newtype brand/base, representation-vs-type). Converting is a
+   miscompile, demonstrated in each case.
+2. **Bucket 2** — the spelling IS the interning key (`ensureRefElem`, mv slots,
+   `internShapeDeepTy`, `sNames`). Converting changes what gets interned.
+3. **Bucket 3 with a node in scope** — convertible, and eight are done.
+4. **Bucket 3 without one** — the name-classifier layer, ~258 functions, requiring an
+   interface refactor.
+
+Buckets 1 and 2 are closed for cause. Bucket 3's node-bearing sites are the remaining
+tractable work and are worth continuing. Bucket 4 is a design change to the emitter, and
+should be decided deliberately rather than arrived at one signature at a time.
