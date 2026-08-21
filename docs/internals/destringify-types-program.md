@@ -49199,3 +49199,73 @@ Three separate lessons, each of which had to overturn the previous plan:
 What survives is exactly B107's boundary and nothing else: a union of structurally identical
 arms, where the spelling is the only carrier of a distinction the type system has already
 soundly collapsed.
+
+## B117 — the ladder finishes, and the parser had the answer all along
+
+Two rungs were left, both "declined": `isUName`'s 2-file remainder and `variantIndexOf`.
+Neither decline survived contact with the right question.
+
+### `isUName` — the parser already recorded the structure
+
+B107/B109 established why the arena cannot answer for `Cat | Dog`: the union of two
+structurally identical arms collapses soundly, the emitter still boxes it, and only the
+spelling carried that. True — but "the spelling" was the wrong place to have looked, because
+the fact was never only in the string.
+
+`parser.vl`'s union loop counts its members and mints a `TS_UNION` node in the **spelling
+tree**, a per-annotation structure `parseType` records with `setAnnTs` and `annTsOf` reads
+back. Its own header says so: *"recorded on the annotation node it becomes, so a later pass
+can read the STRUCTURE instead of re-deriving it from `tyName`."* The ladder was re-deriving
+from `tyName` a fact the parser had already structured, three lines after the parser built
+the string by concatenating with `"|"`.
+
+```vl
+function annSpelledUnion(ix: i32): boolean {
+  const root = annTsOf(ix)
+  if root < 0 { return false }
+  tsKind[root] == TS_UNION
+}
+```
+
+`annTsOf` answers -1 once `canonEmitTypeNames` rewrites a node's name in place, so this is
+false for most annotations — which costs nothing, because everything it declines the ARENA
+rung ahead of it already claimed. It answers for exactly the two files that needed it.
+
+### `variantIndexOf` — dissolved by a different conversion
+
+Declined twice (B107, B109) as unconvertible. It did not need converting. A variant's
+recorded type is a `TyObj`, so once the STRUCT rung read the arena (#1608) it claimed every
+variant param before this point was reached. Neutralising the rung breaks **zero** corpus
+files. The last `variantIndexOf` on a rendered name in this ladder was dead before anyone
+tried to convert it.
+
+That is the third time a rung dissolved from upstream rather than yielding to direct attack
+(`nameIsArray`'s double duty was the second). **A cascade's rungs are not independent, and a
+"hard" one is often just downstream of an unconverted one.**
+
+### The ladder
+
+```
+five scalar comparisons   the arena          (#1605)
+nameIsString              the arena          (#1606)   import dropped
+isSName                   the arena          (#1608)   import dropped, no remainder
+nameIsArray               the arena          (#1609)   import dropped, no remainder
+isUName                   arena + parse tree (#1610)   import dropped, no remainder
+variantIndexOf            REMOVED — dead     (#1610)
+```
+
+**The param reject ladder reads no rendered type.** What began as B102's "the ladder is
+string-based at every rung anyway" is a ladder with none.
+
+One spelling remains in the file's param path: `paramScalarName`'s fallback for an
+annotation node the checker never recorded. Measured at **zero** corpus uses. Removing it
+also breaks zero corpus files — and it stays anyway, because what it does for that
+unmeasured class is turn a lowerable param into a hard reject rather than into an arena
+answer. A coverage escape hatch is not the same defect as a type decision taken on a
+rendering, and deleting it would trade an honest one for a silent one.
+
+### Next
+
+`emit_sections.vl:3581` — `retSlot = variantIndexOf(tyNameOf(fn.fnRet))`, the RETURN-slot
+variant rung (B104's second live site). The same question one position over, and now with a
+known answer shape: check whether the return path's struct rung already claims it.
