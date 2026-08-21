@@ -52430,3 +52430,31 @@ those fail loudly, this one passes the gate that promises lowering.
 
 **Nothing shipped.** Five dead ends now sit in both xfail headers; the sixth attempt should start
 from the working declared-argument path and ask why the inline arm misses it.
+
+## B186 — the map gate's struct arm, picked by census
+
+B175 left the map-lowerability gate answering 72 of the 106 files that reach it, with the
+remainder recorded as "unions, nullables, and struct values". Which of those is largest was
+never measured, so this pass measured it before porting anything:
+
+| map VALUE kind at the still-rendering sites | files |
+| --- | ---: |
+| **`TyObj`** | **11** |
+| `TyUnion` | 8 |
+| `TyNullable` | 7 |
+| `TyVar` | 1 |
+
+**The largest bucket is the simplest case, which is the opposite of what the ladder's shape
+suggests.** The union arms are the intricate ones — the `-3` guard above the kind dispatch, the
+nullable-ref inner, the atom niches — so reading the code makes unions look like the work. The
+census says a struct-valued map is, and the ladder lowers that by looking the RENDERED value
+name up in the struct table (`structIndexByValName`). That is a registry question the arena
+answers directly with `isStructOfTy`.
+
+0 diffs across 1,947 files; the gate now answers **79 of 106**, up from 72.
+
+### The rule this pass is worth keeping for
+
+**Census the remainder before porting.** Every arm in this programme was chosen by reading the
+ladder until this one, and reading would have sent the effort at unions — eight files behind the
+most delicate guard in the function — while eleven sat behind a registry lookup already written.
