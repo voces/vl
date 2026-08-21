@@ -49546,3 +49546,53 @@ already flagged that its mint legs (`ensureRefElem`, `rlInternName`, `fRetRArrEl
 keep a name. B123 extends that to the READ side: where a newtype is in play the arena cannot
 key this layer at all, so the family is blocked as a whole until `repElemKey` keys brands
 and bases the same way.
+
+## B124 — the checker's value-union test, and a dual that had been waiting for its caller
+
+B121 found `typecheck.vl` effectively clean on the `.tyName` channel — all twenty reads are
+name→type resolution or diagnostics, which is the right answer for the module that BUILDS
+types. Its whole render-then-test surface is `isValueUnionName` over a `tyToEmitName`
+render, at four sites.
+
+`elemValueUnionListRetName` was the cleanest, and the dual was already sitting in the file:
+
+```vl
+// Whether the inferred return `er` IS a value union the emitter boxes — the structural
+// dual of `isValueUnionName(<er's joined atom render>)`, decided from the arena BEFORE
+// anything is rendered.
+function tyIsValueUnion(er: i32)
+```
+
+Written for exactly this, and it had **one** caller. The site was rendering the element and
+pattern-matching the render two functions away from the structural answer.
+
+The `en != ""` guard went with it: `collectRetAtomKinds` declines an element it cannot
+describe, so an unrepresentable one cannot answer true. The conversion also deletes the
+element render entirely on the decline path, which is the common one — 35 of 38.
+
+**Measured:** 38 corpus files reach the test, both answers present (35 false, 3 true), 0
+disagreements. **Inverted control:** forcing the site false changes exactly 3 files, the
+three that answered true. Corpus A/B 0 of 1947; six gates green.
+
+The RESULT still renders (`irRendered(tyToEmitName(er))`) and should: there the name is the
+answer being produced, not a fact being recovered. That distinction — product vs. predicate
+— is what separates the sites worth converting in this module from the `*RetName` family
+the survey correctly ranked out, whose renders ARE their return values and whose gates had
+already been moved to the arena.
+
+### Where the programme stands
+
+The remaining surface sorts by CAUSE rather than by count, and only one bucket is open:
+
+1. **Blocked — a distinction the arena has erased.** Same-shape unions (B107), newtype
+   brand/base (B123), representation-vs-type (B109). The spelling is the only carrier; no
+   arena precision closes these, and each is now pinned by a fixture or an issue.
+2. **Blocked — name-keyed identity.** The mv slot layer, `ensureRefElem`,
+   `internShapeDeepTy`. The spelling IS the key, so converting it would change what gets
+   interned rather than how it is decided.
+3. **Open — spelled-shape questions in `emit_classify.vl`.** That module reads the parser's
+   spelling tree ZERO times while answering "what shape was this annotated as" by character
+   surgery, and `ast.vl` has had the structured accessor the whole time. Three conversions
+   this session (#1610, #1613, #1614) used it; `emit_classify` has not.
+
+Bucket 3 is the last one with unmeasured headroom.
