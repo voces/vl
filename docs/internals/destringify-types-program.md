@@ -49937,3 +49937,57 @@ It is the arena twin of "which variant DECLARATION is this node's annotation", w
 coincides with the registry lookup only under a guard.
 
 Declined, with the cause recorded on the sites rather than left for a fourth attempt.
+
+## B132 — the nullable-scalar-list minting rung, and what bucket 4 actually costs
+
+B128 described the remainder as a LAYER fed by pre-extracted strings. This entry measures the
+one thing that description left open: **how many entry points into that layer still hold a
+node**, and therefore can be converted without changing any signature.
+
+Counting call sites that pass a rendered annotation straight into a classifier — `X(nd.tyName)`,
+`X(ty.tyName)`, `X(tyNameOf(node))` — across the whole emitter:
+
+| classifier | node-bearing calls | status |
+| --- | ---: | --- |
+| `variantIndexOf` | 13 | declined — B131, the twin answers about a DECLARATION |
+| `structIndexByName` | 4 | bucket 2, the row's identity IS the name |
+| `nameIsF32Array` | 4 | one converted (#1622) |
+| `isUName` | 4 | declined — registry identity, `nodeTyIsUnionAlias` reddens 6 tests |
+| `nulScalarListKind` | 3 | **converted here** |
+| `refArrElemNameIf` / `nullablePartOf` | 6 | declined — B123, the ref-list layer is name-keyed |
+
+That is the whole node-bearing surface, and most of it is already adjudicated. `tyname.vl`'s
+31 functions have **2** node-bearing callers between them, which is the sharpest confirmation
+of B128 available: the layer is not reachable from nodes because nothing calls it with one.
+
+### The conversion
+
+`nulScalarListKind(nd.tyName)` in `mAssignTypeIndices`, a MINTING rung, replaced by the
+pre-existing `nulScalarListKindOfNode(i)`. That twin leads with `annRepKindOf` and falls back
+to this same name ladder only where the rep layer does not cover the annotation, so the
+minting flags cannot under-answer — the hazard this module's own history warns about.
+
+It is also strictly MORE correct, per its header: `canonEmitName` softens a bare inline
+literal union to its base scalar, so `("a" | "b")[] | null` arrives rendered `string[] | null`
+and the name ladder codes it `nulstrlist` — a `(ref null $strListWrapper)` — while every
+construct and read path builds the interned-atom i32 list the `K[] | null` alias spelling
+gets.
+
+Measured: 1319 corpus files reach the rung with four distinct answers represented (`null`,
+`nulstrlist`, `nuli64list`, `nulf64list`), 0 disagreements. Corpus A/B 0 of 1947; six gates
+green.
+
+### What bucket 4 would cost, now quantified
+
+The node-bearing entry points are exhausted or adjudicated. Everything remaining in the
+name-classifier layer is called with a string that some caller already extracted, so
+converting it means changing signatures outward from the leaves until the callers hold nodes
+— roughly 258 functions across `tyname.vl`, `emit_base.vl` and `emit_classify.vl`, with the
+call graph rewired to pass node indices instead of renderings.
+
+That is not this programme's method applied harder; it is a different change, with a
+different risk profile: no dual-run can validate a signature change, because there is no
+second reader to disagree with. The corpus A/B would be the only instrument, and B111 already
+established that A/B is blind to any rung that emits no bytes.
+
+Recorded here so the decision is made on numbers rather than on momentum.
