@@ -46554,10 +46554,13 @@ whose messages each assert "removes a string decision from the SOURCE, none from
 The survey also found the rule was already written down **four times before B70** — D-UNION batch 1,
 method note 90 (*"only a TWO-VARIABLE sabotage separates them"*), notes 114/115, and D-GLOBALNICHE
 (*"a one-variable sabotage cannot distinguish a leg that nothing reaches from a leg that something
-reaches first"*). The regression is confined to the B41–B69 window, where the cheap one-leg test
-displaced the reach/ANSWERS probes the earlier half used. B60's recipe is corrected accordingly,
-and B41's "evidence of an unreached arm" — the phrase the confusion propagated from — now reads
-REDUNDANT, which is what its own paragraph had already explained.
+reaches first"*). ~~The regression is confined to the B41–B69 window~~ — **that sentence is
+FALSE and B75 refutes it**: six of the nine surveyed rows sit BEFORE B41, and D-COLLHOME's two
+"DEAD — measured" hand-offs, which carry standing DELETION diffs, predate method note 90 itself —
+the note that names the error. The earlier half wrote the rule and then broke it in the next slice.
+B41–B69 is where the mistake became systematic, not where it started. B60's recipe is corrected
+accordingly, and B41's "evidence of an unreached arm" — the phrase the confusion propagated from —
+now reads REDUNDANT, which is what its own paragraph had already explained.
 
 ### B52 / D-MAPKEY (#1546) — SHIPPED AND WRONG
 
@@ -46682,3 +46685,61 @@ That is the same fact read from both sides.
 * **Name the seed explicitly.** `git stash && refresh-compiler.sh && … && git stash pop` leaves the
   SEED PATH holding the stashed build and restores the source without the binary. Six measurements
   here compared no-fix against no-fix and agreed perfectly, which is what that comparison does.
+
+
+## B75 — the queue closed out, and the fixture written to pin an arm found a miscompile instead
+
+The nine remaining SUSPECT rows, re-measured **census-first and with zero compiler builds**. That
+is the headline: the corrected recipe's cheapest step settles most of a queue that looked like it
+needed a build each.
+
+| row | site | verdict |
+| --- | --- | --- |
+| D-COLLHOME 2 — `raKind == 4/6/7/8/10` | `emit_collect.vl:3986` | **SOUND**, and its deletion diff is safe *by construction* |
+| D-COLLHOME 3 — `wideShape` | `emit_collect.vl:698`, `:713` | **SUSPECT — DO NOT DELETE** |
+| D-CLASSHOME S5 — `nameIsNulStrListDeep` peel | `emit_classify.vl:22065` | mislabelled; arm kept, nothing rests on it |
+| B41 §2 — `nodeTyIsLitUnionAlias(p.parType)` | `emit_sections.vl:565` | **SOUND** — redundant arm, live population (51 files) |
+| B56 §3 — `nameIsNulLitUnionList` | `emit_classify.vl:22229` | **SUSPECT — DO NOT DELETE** |
+| B66 — `nameIsI32Array` in `letIsArray` | `emit_classify.vl:21335` | mislabelled — and see below |
+| D-LITKEEP / P2 | `emit_rep.vl:3412`, `:4262` | **SOUND** — the arms are in SERIES, so the never-run "both off" build is moot |
+| renderEmit P1 reversal | `typecheck.vl:8655` | suspect on REACH, not population; nothing rests on it |
+| LINSOFT SAB-NOM | `typecheck.vl:9627` | already correctly labelled; ships on a contract, deletes nothing |
+
+**Nothing on master is wrong.** Two rows are live traps for the next reader, and both are #1563's
+exact class — a coverage-blind arena sibling (`if ty < 0 { return false }`, silence returned as a
+NEGATIVE) masking a name leg, over a corpus with zero uncovered instances. Deleting either on the
+inert reading would ship the same defect again. Their comments now say so.
+
+### THE FIXTURE WRITTEN TO PIN A REDUNDANT ARM WAS A LIVE MISCOMPILE
+
+B66's row wanted one cheap fixture: `letIsArray`'s `nameIsI32Array` rung is dominated by
+`exprArray` on the next line, which claims every array-LITERAL init — so a let with a CALL init
+would pin the name arm. The census found the corpus carries `(boolean|null)[]` and `(K|null)[]`
+annotations in quantity (14 files and 41 files) and **every one initializes from a literal**.
+
+The shape does not pin the arm. It does not compile:
+
+```vl
+function mk() { const ys = [true, null]; return ys }
+const xs: (boolean | null)[] = mk()      // check --codegen rc 0; module does not validate
+```
+
+`type mismatch: expected i32, found (ref $type)`. The OUTER annotation is load-bearing — dropping
+it gives a different, loud failure; a direct-literal init works; a non-nullable element works. The
+litunion spelling fails identically, so it is the nullable-element rep.
+
+**And the compiler hints you to delete the annotation that breaks it.** The linter calls `xs`'s
+annotation redundant, and taking that advice makes the program compile — so the hint is
+accidentally a workaround for a codegen bug, and writing the type you meant is what costs you a
+valid module. A "redundant" annotation that changes codegen is not redundant.
+
+Filed as `soundness/xfail-miscompile-nullable-elem-list-call-init.vl` with both controls in the
+passing corpus.
+
+### METHOD NOTE
+
+* **Census-first is not just cheaper, it is more productive.** Nine rows, zero builds, three
+  closed by argument, two upgraded to DO-NOT-DELETE warnings — and the one fixture the census
+  asked for turned up a live miscompile no sweep could have surfaced, because the corpus contained
+  the annotation 55 times and the construction never. **Asking what a population is missing finds
+  bugs; asking what it agrees on finds nothing.**
