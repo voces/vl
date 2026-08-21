@@ -46964,3 +46964,45 @@ eventually convert one of them.
 * **Rank by cost, then check the top item can be done at all.** The scout's ranking was sound on
   every axis it measured — twin exists, site live, census non-empty. None of those catch "the arena
   does not know". Ask what the ARENA's coverage is at the site before ranking the site.
+
+
+## B78 — the map annotation's two halves now read from the same place
+
+`mapAnnShape` decides a map annotation's rep from two halves: the KEY (`nameIsI32KeyedMap(mn)`) and
+the VALUE. The value half has been arena-first-with-a-name-bridge for a while and carries the
+sentence *"an UNCOVERED node (-1) keeps the name bridge, unchanged and in its old position"*. The
+key half was still reading the spelling. **One annotation, two halves, two sources.** The key half
+now takes the same shape as its neighbour.
+
+### MEASURED, INCLUDING THE PART B77 SAID TO MEASURE FIRST
+
+B77's lesson was to ask what the ARENA's coverage is at a site *before* ranking it, because a
+scout can verify twin-exists, site-live and census-non-empty and still be pointed at a decline. So
+this slice probed both candidates the scout ranked 2nd and 3rd in ONE build, emitting only where
+the two spellings disagree:
+
+| site | disagreements | inverted control fires on |
+| --- | --- | --- |
+| `cloRetIsString` (`nameIsString(tyNameOf(fn.fnRet))`) | 0 | **4 files** |
+| `mapAnnShape` key rung | 0 | **100 files** |
+
+The inverted control is what makes those zeros readable — and it also prices the two sites very
+differently. `cloRetIsString` is reached with an annotated callback return on **four** corpus
+files; its interesting shape (a `: "lit"` callback) has a census of ZERO. **That one waits for a
+fixture**, and is not converted here. The map key rung is exercised by 100.
+
+### THE GUARD IS NOT DECORATION
+
+`nodeTyMapKeyIsI32Span` answers FALSE both for "not an i32-keyed map" and for "no type recorded",
+and this feeds a REP selection where the two halves must agree. That is the shape that made #1563
+a compile-time regression at the collect rungs. `nodeTyIxOf(tyIx) >= 0` splits coverage from
+content, and the name answers where the arena has nothing — the same sentence the value half has
+carried all along.
+
+0 corpus rows. Gates all six.
+
+### METHOD NOTE
+
+* **Probe several candidates in one build.** A disagreement probe emitting only on disagreement
+  costs one build and one sweep no matter how many sites it carries, and the inverted control that
+  makes its zeros readable comes in the same pair. Ranking three sites cost two builds total.
