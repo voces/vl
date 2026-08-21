@@ -44858,3 +44858,114 @@ so it is queued rather than folded in.
 * **Name the qualifier in the taxonomy, not just in the commit.** The README said this sink was
   "already CLOSED"; it is closed FOR UNSHADOWED BINDINGS. A README that overstates a closure is
   how a fixed-looking defect stops being looked for.
+
+## B46 / D-SINK23 — two more sinks close, and the fourth turns out not to be a sink at all
+
+B45 closed the `string[]` push and said two remained. Two more close here, and the survivor is a
+different kind of defect from the three it was filed with — which is the finding.
+
+### 1. THE TWO NULLABLE SLOTS
+
+```vl
+function pick(b: boolean, r: R): string | null { if b { return r.f } null }  // sink 2
+const xs: (string | null)[] = []; xs.push(r.f)                               // sink 3
+```
+
+Both lowered the raw i32 atom id into a reference slot. Both are one arm, because the slot is
+the SAME string reference with a null permitted and a widened member string is non-null — a
+subtype of the slot, needing no null seed. `emitStrValue` already widens; the missing part was
+asking for it.
+
+Neither non-nullable sibling was broken: a plain `string` return widens, and a `string[]` push
+widens as of B45. **The gates were not wrong about their own case; they were silent about the
+nullable one.** The return's gate asked `tyNameOf(fn.fnRet) == "string"` — a SPELLING compare
+that `"string | null"` does not match — so the new leg is asked of the ARENA
+(`retNulStringFlag` → `nodeTyIsNulString`) rather than by growing the spelling test a second
+case.
+
+No reservation twin was needed, and that was CHECKED rather than assumed: `retWidensAtomToStr`
+already fires, because it gates on `unionTakesAtomAsStr("string | null")`, whose atom split
+finds the `string` member. B45's twin was necessary; this one's absence is a measurement, not an
+omission.
+
+### 2. THE FOURTH IS A REP DISAGREEMENT, NOT A MISSING WIDEN
+
+The narrowed-parameter return was filed alongside the other three and looks identical. It is
+not, and the attempt to close it the same way failed in an instructive direction.
+
+`exprIsLitAtom`'s `Ident` arm asks `nodeTyIsLitUnionAlias(paramTypeNode(...))` — the registry
+test. Replacing it with the structural one made the callee read correctly and immediately broke
+the CALLER: `expected i32, found (ref $type)`. The reason is that the three spellings do not
+share a rep:
+
+| parameter spelling | wasm param type |
+| --- | --- |
+| `v: K` (registered alias) | `i32` — atom |
+| `v: K & !"kb"` (narrowed) | `i32` — atom |
+| `v: "ia" \| "ib"` (bare inline) | **`(ref 1)` — string** |
+
+The registry predicate matches ONE of the two atom cases. The structural predicate matches all
+three — including the string-repped one — so it swaps one miscompile for another. **This is
+#1536's failure mode reached from the opposite side**, and `emit_rewrite.vl`'s pin comment had
+already written the trap down: *"an INLINE `"a"|"b"` pins to `string` and its arena index is NOT
+a registered alias, so `nodeTyIsLitUnionAlias` still answers no — the name and the arena agree."*
+
+Reverted. Closing it needs the parameter valtype ladder characterized first — specifically, what
+makes a NARROWED alias an atom when the predicate that is supposed to decide that says no.
+
+### 3. TWO CORRECTIONS FROM REVIEW
+
+**The `K | null` NICHE reaches both new arms, and the safety argument was wrong about why it
+does not.** The arms say "a `null` value is not a lit atom and still takes the `nulString`
+path". True of the literal `null`; false of the gate. `exprIsLitAtom`'s FIRST line is
+`if exprNulLitUnion(exprIx, fnIx) { return true }` — it deliberately claims the nullable niche,
+because in a NARROWED position the niche really does hold a plain atom. The arms inherit that
+claim in a position where it does not hold, and `emitAtomToStr` — a `select` tower over the
+member constants with no `-1` arm — refuses.
+
+Measured against master, this is an UPGRADE and the direction is the point: master accepts those
+programs (`check --codegen` rc 0) and emits invalid wasm; the branch rejects them at emit (rc 1).
+Gating the arms on `!exprNulLitUnion` was considered and rejected — it trades a loud failure for
+the silent one. Pinned as `error-nulLitUnion-niche-into-nullable-string.vl`, with its control in
+the runnable fixture because an `@emit-error` file cannot exercise one. The NARROWED niche is
+newly FIXED here, which is what says the defect is the sentinel and not the niche.
+
+**The shadowed-binding hole gains two positions.** B45's addendum found the reservation scan and
+the emit resolve a shadowed name to different bindings; these two sinks inherit it, so the
+"FIXED FOR UNSHADOWED BINDINGS" qualifier is carried onto them in the taxonomy rather than left
+to be rediscovered.
+
+### 4. AND SINK 4 IS NOT BLOCKED AFTER ALL
+
+§2 said closing the narrowed-parameter case "needs the parameter valtype ladder characterized
+first". Review characterized it, and the discriminating predicate already exists —
+`tyLitUnionAliasIx` (`typecheck.vl`), which the REP LAYER itself uses to assign these very
+valtypes (`emit_rep.vl`'s `TyUnion` arm: alias index → `repMk("i32")`, else `repUncovered()`).
+It has TWO legs where `nodeTyIsLitUnionAlias` has one: the registry, AND a copy-provenance table
+(`cLitUnionCopyTyIxs`) recording checker-minted copies from narrowing, join and subtraction.
+
+That second leg is exactly what makes a narrowed alias an atom, and it matches the rep table
+row-for-row: registry → i32, copy → i32, bare inline (canon-softens to `string`, `repUncovered`)
+→ string ref. So "the structural predicate matches all three including the string-repped one" was
+a property of the predicate I reached for, not of the problem.
+
+The remaining work is the CALLER's member-literal argument lowering, which asks the same
+registry-only test at `wasmEmit.vl:17013` / `:17263` and `emit_sections.vl:565` — a bounded,
+named next step.
+
+### METHOD NOTES
+
+* **"Blocked" deserves the same scepticism as "safe".** I declared a whole class unfixable after
+  one predicate failed, and the right predicate was already load-bearing in the rep layer three
+  files away. A failed attempt tells you the attempt was wrong, not that the problem is hard.
+* **Check the DIRECTION of a failure-class change before calling it a regression.** These arms
+  turn a check-clean miscompile into a loud emit refusal. Both are broken; only one is silent.
+* **A defect filed with others is not necessarily their kind.** Four positions, one symptom
+  (`found i32` where a reference was wanted), and three of them were VALUE sinks fixable by
+  asking for an existing widen while the fourth is a REP boundary. The symptom was shared; the
+  cause was not, and grouping them by symptom is what made the fourth look easy.
+* **When a predicate and a rep disagree, find out which one is right BEFORE aligning them.**
+  Here the predicate is right for inline and wrong for narrowed, so "align the predicate to the
+  arena" breaks the case it currently gets right.
+* **Check whether the twin is needed; do not add one reflexively.** B45's rule is that the pair
+  moves together, not that every sink needs a new predicate.

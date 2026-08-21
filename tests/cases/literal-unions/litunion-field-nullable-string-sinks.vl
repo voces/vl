@@ -1,0 +1,79 @@
+// @run
+// @log kb
+// @log got
+// @log 3
+// @log kb
+// @log null-ok
+// @log plain
+// @log ka
+// TWO SINKS where a literal-union atom flows into a NULLABLE string slot, both of which used to
+// lower the raw i32 id into a reference and produce check-clean invalid wasm.
+//
+//   1. a return through `string | null`  — `expected (ref null $type), found i32`
+//   2. a push into `(string | null)[]`   — the same, at the list's backing slot
+//
+// BOTH SLOTS ARE THE SAME STRING REFERENCE with a null permitted, and a widened member string is
+// non-null, so it is a subtype of the slot and needs no null seed. That is why each fix is one
+// arm and not a new rep: `emitStrValue` already widens, and the missing part was asking for it.
+//
+// The `null` and plain-`string` values in arm 3 are the coexistence check — they are not lit
+// atoms, so they still take the `nulString` path, and the two must share one list.
+//
+// WHY THE NULLABLE FORMS WERE MISSED. The non-nullable siblings BOTH work already: a plain
+// `string` return widens, and a `string[]` push widens (as of the sink closed just before this
+// one). The return gate asked `tyNameOf(fn.fnRet) == "string"` — a SPELLING compare, which
+// `"string | null"` does not match — and the push gate asked the receiver's element type
+// through a chain that routes a `(string | null)[]` to an earlier arm. Neither gate was wrong
+// about its own case; both were silent about the nullable one.
+//
+// The return's new leg is asked of the ARENA (`retNulStringFlag` -> `nodeTyIsNulString`) rather
+// than by growing the spelling compare a second case, which is the whole point of the exercise
+// this file belongs to.
+//
+// NO RESERVATION TWIN WAS NEEDED HERE, and that was checked rather than assumed. `emitAtomToStr`
+// stages the atom id in the string-op scratch frame, and the sibling sink closed just before
+// this one needed a new predicate to reserve it. This one does not: `retWidensAtomToStr` already
+// fires, because it gates on `unionTakesAtomAsStr(tyNameOf(fn.fnRet))` whose atom split over
+// `"string | null"` finds the `string` member. Verified with a `pick` that does no other string
+// work — no print, no concatenation, and `main` only tests the result for null — which would
+// fail on an undeclared local if the frame were missing.
+type K = "ka" | "kb"
+type R = { f: K }
+
+function pick(b: boolean, r: R): string | null {
+  if b { return r.f }
+  null
+}
+
+// A `K | null` NICHE, NARROWED non-null, returned through `string | null`. The niche's rep is
+// the atom id or the `-1` sentinel in one i32; narrowing proves the sentinel impossible, so the
+// value here IS a plain atom and widens like any other. The UN-narrowed form cannot widen — the
+// tower has no `-1` arm — and is pinned as `error-nulLitUnion-niche-into-nullable-string.vl`.
+// This arm is that file's control, and it lives here because an `@emit-error` file cannot run
+// one.
+function fromNiche(k: K | null): string | null {
+  if k != null { return k }
+  null
+}
+
+function main() {
+  const r: R = { f: "kb" }
+
+  const p = pick(true, r)
+  if p != null { print(p) }
+  const q = pick(true, r)
+  if q != null { print("got") } else { print("none") }
+
+  const xs: (string | null)[] = []
+  xs.push(r.f)
+  xs.push(null)
+  xs.push("plain")
+  print(xs.length)
+  if xs[0] != null { print(xs[0]) }
+  if xs[1] == null { print("null-ok") }
+  if xs[2] != null { print(xs[2]) }
+
+  const n = fromNiche("ka")
+  if n != null { print(n) }
+}
+main()
