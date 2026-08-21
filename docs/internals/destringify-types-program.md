@@ -49389,3 +49389,64 @@ dressed in their evidence. Corpus A/B 0 of 1947; six gates green.
 **Nine `.tyName` reads remain in `emit_sections.vl`**, all of them `paramScalarName`'s
 coverage fallback and the comments describing what was removed. The module renders no types
 and now scans no type spellings.
+
+## B120 — monomorphization's "does this mention T" stops re-parsing the rendering
+
+`monoAnnHasTyParam(ann, typarams)` is a hand-rolled recursive parser over a RENDERED
+annotation: a quote- and depth-aware `splitUnionAtoms`, then a separate arm per shape —
+map, function, array, object. Every shape needs its own arm and a missing one is silent.
+Its own header records what one cost: with no map arm the substitution was never attempted,
+a generic returning a map kept its type parameter as a nominal name, and the result was
+`vl check --codegen` rc 0 with `vl run` reporting "expected i32, found (ref $type)".
+
+`ast.tsMentionsAnyName` answers the same question by walking the parser's spelling tree. It
+visits every kid of every node, so it cannot have a missing arm, and it compares each leaf
+WHOLE — its header: "`T`, `T[]`, `Box<T>` and `{a: T}` all mention `T`, while `Trace` does
+not".
+
+The site had the node index in hand already (`letType`), so the swap is direct. The name
+form stays for nodes with no tree: `annTsOf` answers -1 once `canonEmitTypeNames` rewrites a
+name in place, and answering FALSE there would skip the substitution and let the type
+parameter survive into the instance — the exact defect above.
+
+### Measured
+
+Six corpus files reach the site, all with a spelling tree, both answers represented (4 T/T,
+2 F/F). Five constructed witnesses — `{a: T}`, `T[][]`, `(T) => i32`, `{[string]: T}`,
+`T | null` — all agree too, so the string parser's arms are complete for the shapes tried.
+
+Inverted control: forcing the tree path to answer FALSE changes exactly **4** files, the
+four that answered T/T. Load-bearing, not vacuous.
+
+Corpus A/B 0 of 1947; six gates green.
+
+`monoSubstAnn`, which PRODUCES the substituted spelling, is untouched. That is construction
+rather than render-then-test, and the site's own comment records that the name handed to
+synthesis stays byte-identical by design while the recorded type improves via `substTyDeep`.
+
+## B121 — the three-module survey
+
+Three parallel read-only surveys covered the remaining `.tyName` surface. The headline is
+that the modules differ in kind, not just in count.
+
+**`typecheck.vl` — effectively clean.** Twenty `.tyName` reads, and *all twenty* are either
+name→type resolution or a diagnostic string. Zero `tyNameOf` calls; every occurrence is a
+comment explaining that the checker deliberately does not render. That is the right result
+for the module that BUILDS types, and it means the programme's remaining surface is entirely
+in the emitter. The one real cluster is `isValueUnionName` over a render at four sites, where
+the structural dual `tyIsValueUnion` already exists in the same file with a single caller.
+
+**`emit_collect.vl` — dominated by MINTING rungs.** Of 32 reads, most create or reserve a
+type, shape or slot, and several are name-KEYED by construction (`ensureRefElem`,
+`internShapeDeepTy`, the mv slot table): the spelling is the key's identity, so converting
+the key would change what is interned. The survey separates the TEST half from the KEY half
+at each such site, which is the only safe decomposition.
+
+**`emit_classify.vl` — the largest surface and the one real discovery: it reads the spelling
+tree ZERO times.** Every "what shape is this annotation spelled as" question in that module
+is answered by character surgery on a rendered name, while `emit_sections.vl` and `ast.vl`
+have had the structured accessor all along. That is the single biggest untapped axis left.
+
+Roughly half of `emit_classify`'s sites are already the lower rung of an arena-first ladder
+and carry measured DO-NOT-DELETE notes; the surveys correctly ranked those out rather than
+proposing to re-litigate them.
