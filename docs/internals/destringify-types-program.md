@@ -51800,3 +51800,48 @@ Six gates green, corpus byte-identical, fixpoint holds.
 `structIndexOfTypeName` is still reached — this does not retire it. What it retires is the claim
 that it COULDN'T be: B166 said ordering, B167 said an unfillable key, and both were true of the
 readers they described. The field columns were a third reader, and they answer.
+
+## B169 — porting the coder's arms, one gate at a time
+
+B168 measured the residue at the last site as the CODER's coverage rather than anything
+structural, and queued the arms. Two were tried; the gate kept one.
+
+### The array arm — shipped
+
+`fieldCodeOfSpelling` sends an array field to `scalarListKindOfName` and maps its five kinds to
+codes 4 / 6 / 25 / 26 / 27, ending `return 5` for any other `X[]`. The arena twin reads
+`TyArray.aElem` and answers the same five for a `TyPrim` element.
+
+It stops there deliberately. Code 5 is for struct/union/closure elements ONLY, and returning it
+for an element needing a different backing is the invalid-wasm hole that arm's own comment
+records. An unrecognised element stays UNCODED, which fails the row and falls to the render —
+safe, because the render still answers.
+
+Corpus A/B **0 diffs**; the render path drops **22 → 19**.
+
+### The struct arm — refuted
+
+The obvious next arm: a `TyObj` field is a `(ref null $S)`, code 15. The spelling ladder gets
+there via `nameIsStructDecl`, and the arena has `isStructOfTy`, whose header argues structural
+identity is right for structs. Both true, and the arm is still wrong:
+
+```
+tests/cases/types/recursive-type-emit-render-cycle.vl          rc=0 -> rc=1
+tests/cases/unions/closure-result-union-nested-struct-arm.vl   rc=0 -> rc=1
+emitProgram: nested-struct field element type is not interned
+```
+
+The reason was already written in the arm being copied — "Resolved via the DECLARATION scan (not
+the incrementally-built struct table) so a forward / mutually-recursive reference ties in the
+shared rec group" — and `isStructOfTy` scans exactly that incrementally-built table. The two
+scans are not twins: one sees a declaration before its shape is interned, the other cannot.
+
+### The rule this pass earns
+
+**Two predicates that agree about what a type IS can still disagree about WHEN it is known.**
+The struct arm was sound as a question about types and wrong as a question asked mid-intern. The
+array arm carries no such dependency, which is why the same gate passed it and failed the other.
+
+Remaining at the site: 19 files. Uncoded kinds behind them — `TyObj` 9, `TyArray` 10 (the
+non-prim elements this arm declines), `TyMap` 1, other 2 — all now with a named reason rather
+than a count.
