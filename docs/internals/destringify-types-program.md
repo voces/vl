@@ -47090,3 +47090,35 @@ on every shape that arrives, so there is nothing to take over.
 Worth separating, because only the first two are boundaries of the programme. This one is just a
 site where the conversion has no content — and the honest record is a measurement, not an
 argument.
+
+### B79 addendum 2 — the same softening, the opposite verdict
+
+`paramString` (`exprString`'s Ident arm) was the scout's revised #3, with the same twin as
+`cloRetIsString` and the same "census of the disagreeing shape is zero" note. So the same move:
+build the shape first.
+
+It did not need building. **The corpus already disagrees on 10 files, every one a literal-union
+param** — canon softens the litunion to `string`, the spelling reads `string`, the arena keeps the
+`TyUnion` of `TyLit`s and `nodeTyPrimName` answers `""`. The scout's zero census was for a
+constructed `: "lit"` param; the real population was the alias form, already present and already
+disagreeing.
+
+Substituting the twin turns **two corpus files from valid modules into check-clean invalid wasm**
+(`literal-unions/inline-atom.vl`, `soundness/ordering-hole-string-operand-sound.vl`).
+
+**So `cloRetIsString` and `paramString` read the SAME softened spelling and want OPPOSITE
+treatment**, sixty lines apart in one file:
+
+| | consumer decides | softened name is | verdict |
+| --- | --- | --- | --- |
+| `cloRetIsString` | the `.map` RESULT list rep — atoms and string refs are different backings | **wrong** → invalid module | **convert** |
+| `paramString` | whether an Ident READS as a string — a litunion atom widens at a string sink | **right** | **decline** |
+
+**"The name records a canon decision" is not by itself a reason to convert or to decline.** It only
+says the two encodings differ; which one is correct depends on what the consumer does with the
+answer, and nothing but a measurement settles it. B79's first draft treated the softening as
+evidence for conversion. Half of it was.
+
+That is now three distinct decline causes on record — uncovered node (B77), narrower-than-the-name
+(D3), and softened-name-is-correct (here) — against one softening-based conversion. The programme
+needs all four written down, because they are indistinguishable from the call site.
