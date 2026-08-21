@@ -48826,3 +48826,61 @@ fire — so the mechanism claim is left for the repair above rather than guessed
 **Queued:** thread the nullable rep answer through to the param reject, then re-measure the
 ladder. This is the first item in the programme with a named blocker, a named fix, and no
 open question in front of it.
+
+## B111 — the cascade is live, and 94% of what reaches it already has a structural answer
+
+B110 named the repair (thread the rep layer's nullable answer into the param reject) but
+not its size. Two measurements, and the first one was mine to throw away.
+
+**The discarded measurement.** A probe placed just after `const ty = P.nodes[p.parType]`
+reported 107 of ~2050 files carrying a param the rep layer does not cover, across 53
+distinct shapes. That is a true fact about rep COVERAGE and a false answer to the question
+asked: roughly twenty arena-driven rungs accept before the name cascade is reached, so
+"uncovered by the rep layer" and "forced onto a spelling" are different sets. The probe
+had to move to the cascade's own entry — a rung whose predicate always returns false, so
+control falls through to the real ladder.
+
+**The measurement that counts**, at the cascade entry over the whole corpus:
+
+| | files |
+| --- | ---: |
+| reach the name cascade at all | **964** of ~2050 |
+| …whose param the rep layer COVERS | **907** |
+| …whose param it does not | **57** |
+
+So the cascade is not vestigial — nearly half of all corpus files put a param through it —
+and **94% of what arrives already has a structural rep answer**. What arrives is
+overwhelmingly ordinary: `i32` (423), `string` (59), `boolean` (56), `f64` (22), `f32`
+(13), `i64` (9), then struct names and arrays. These are exactly B102's five scalar rungs,
+now with a size attached.
+
+The projected repair: accept when `annRepKindOf` answers, keep the name ladder for the
+remainder it does not. That is the strangler pattern `vtKindOfType`'s own header
+prescribes, and it would move ~94% of the cascade's traffic off the spelling. Stated as a
+projection, not a result — it has not been built.
+
+### Why the usual gate cannot license it
+
+`checkParams` accepts or rejects; it emits no bytes. **A corpus A/B is byte-identical for
+any change to this ladder, including a wrong one.** The instrument this branch has leaned
+on hardest is blind here by construction — not through a population gap (the trap of
+[[vl-dual-run-population]]) but because the code under test has no output channel the
+instrument reads.
+
+What must be tested instead is the set of programs REJECTED, and the corpus contains
+almost none: every fixture compiles, so the ladder's reject arm is exercised by nearly
+nothing. Any conversion here has to come with constructed witnesses on both sides — a
+program that must still be rejected, and one that must still be accepted — because
+neither the corpus nor the suites will notice if it silently stops rejecting. A ladder
+that accepts everything passes every gate this repository has.
+
+That is the third distinct blind spot the programme has catalogued, after the unreached
+site and the absent population: **an instrument that cannot see the code because the code
+does not emit.**
+
+### Open
+
+Several map-shaped spellings (`{[string]…`) reach the cascade and their files compile, but
+which rung accepts them is not established — the probe truncates the spelling and the
+answer was not measured. Left open rather than guessed; it matters because a typed-value
+map is precisely the shape `retMapFlag` declines.
