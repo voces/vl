@@ -48546,3 +48546,47 @@ entries not doing.
 * **An inference that travels across registries needs re-measuring at each one.** "Structs are
   structural" was measured. "Therefore variants are" was not, and it was false. The two registries
   hold different kinds of thing and the fixture that says so was already in the corpus.
+
+## B106 — the disagreement was in the QUERY, not the reader
+
+B105 shipped `variantRowOfTy` with no caller because index-only still disagreed with
+`variantIndexOf` on two same-shape fixtures and the reason was unknown. It is known now, and it is
+not in the reader.
+
+A probe printing every value at the site:
+
+```
+ZDY row0=[A]ty=31  row1=[B]ty=32  paramTy=31  nm=[A|B]
+```
+
+The variant rows are `A`→31 and `B`→32. For a parameter annotated **`A | B`**,
+`nodeTyIxOf(paramTypeNode(fnIx, name))` returns **31** — A's type, not the union's.
+
+So `variantRowOfTy` was handed A and correctly answered row 0. `variantIndexOf("A|B")` correctly
+answered -1. **Both were right about different questions**, because the query passed the wrong
+node's type.
+
+### THE HAZARD THIS NAMES
+
+**An arena reader given `nodeTyIxOf(paramTypeNode(...))` for a union-annotated param does not get
+the union.** Any conversion at a param site must establish which node carries the union's type
+before trusting the index — and the NAME form never noticed, because it reads the spelling off that
+same node and the spelling is `A|B`.
+
+That is a new failure mode for this log's list: not the twin's width (B89), not the arena's
+coverage (B78), not identity (B96–B105), but **the query handing over a node whose recorded type is
+not the type being asked about**. The name and the arena disagree because they are reading
+different things from the same node, and only one of them is reading the annotation.
+
+### AND IT EXPLAINS THE SHAPE OF THE WHOLE VARIANT FAMILY
+
+Three of the five `variantIndexOf(tyNameOf(…))` sites are inert; the two live ones are param and
+return positions. The param one cannot convert until the node question is settled. That is a
+smaller and more precise remainder than "the variant registry is name-keyed".
+
+### METHOD NOTE
+
+* **When two readers disagree, check that they were asked the same question.** Five entries treated
+  this as a registry problem — interning, nominal identity, structural fallback, column desync —
+  and it was the argument. Printing every value at the site took one build and settled what four
+  hypotheses had not.
