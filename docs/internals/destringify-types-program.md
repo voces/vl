@@ -52858,3 +52858,37 @@ and adversarial witness included.
 retired at 30 of 32 files is a reader the next caller cannot reuse: the two that remained were
 exactly the cases (an uncoded field, a nested-layout twin) a second caller would also hit. Taking
 them to 0 is what turned the next site from a project into an insertion.
+
+## B197 — three shapes of render-removal that a reach probe cannot see
+
+`cloNameOfBinding`'s two arms rendered the init's type and then tested
+`itn != "" && nodeTyIsFunc(d.letInit)`. The conditions are ANDed, so testing the arena first is
+exactly equivalent — and the name, which IS the product at this site, is then built only for an
+init the arena has already agreed is a function. Before, every Call-initialised binding rendered
+its type to discover the arena would reject it. 0 diffs.
+
+### The three shapes, none of which widen the arena
+
+| shape | site | what the string was for |
+| --- | --- | --- |
+| deferred ARGUMENT | `anonFieldCode` (B194) | fed a parameter 123 of 196 callers never read |
+| GATE-only | the func test (B195) | compared against `""`, nothing else |
+| premature PRODUCTION | here (B197) | it IS the product, but built before the test deciding whether it is wanted |
+
+Every arm before these widened what the arena could ANSWER. **These three change no answers at
+all — they remove work.** And none is visible to the two instruments this log has relied on: an
+A/B compares outputs, a reach probe compares which path answers. Both are blind to a string that
+gets built and then ignored.
+
+**The census is what found them**, because it asked a different question: not "who answers" but
+"who is called". Ten labelled probes in one build over `nodeTyName`'s call sites turned an
+unordered grep into a ranked list, and the top entry had never been looked at in 190 entries of
+this log.
+
+### What that suggests about the rest
+
+A programme organised around "which path decides" will systematically miss work of this kind
+everywhere else in the emitter. The renderers are `tyToEmitName`, `tyToStructStr`, `tyToStr` —
+`tyToStr` alone has 150 call sites, none of them censused, most presumably diagnostics. Whether
+any are gates or unread arguments is not something reading will answer reliably; it took a
+labelled sweep to answer it here.
