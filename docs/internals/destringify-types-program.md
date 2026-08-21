@@ -49892,3 +49892,48 @@ here is that the arena reading is right and agrees everywhere it is asked, not t
 corpus would have caught it being wrong.
 
 Corpus A/B 0 of 1947; six gates green.
+
+## B131 — `variantRowOfTy` answers about a DECLARATION, not a type
+
+`variantIndexOfLet` and `letIsVariant` both open with `variantIndexOf(lt.tyName)`, unguarded
+— no prior flag establishes the annotation is a variant. I expected B106's hazard (a
+union-annotated node handing over arm 0's type) and measured to confirm it. The corpus gave
+one disagreement, in the OPPOSITE direction:
+
+```
+ZVL name=0 arena=-1 [{f:K0}]
+```
+
+The NAME finds variant row 0 for the inline shape `{f:K0}`; the arena finds nothing.
+
+The cause is in `variantRowOfTy`'s own header, written in B105:
+
+> "NO STRUCTURAL RUNG. Two variants with the SAME FIELD SET are different variants … The
+> index rung is the whole function: `declTyIxOfName` resolves each arm's DECLARATION, so the
+> index is that declaration's identity."
+
+Index equality against `uVarTyIx`. The arena is an append log, so a SECOND node spelling the
+same inline shape mints its own row and never equals the declaration's index. The registry
+finds it because the registry is keyed by the spelling, and every node spelling `{f:K0}`
+renders to the same string.
+
+### What this settles
+
+`variantRowOfTy` is usable exactly where the site has already established that the node
+RESOLVES TO a variant declaration, and nowhere else:
+
+- **#1612, the return slot** — `retVariantFlag` had already established the return is a
+  concrete variant, so the node is the declaration's own annotation and the index matches.
+  0 disagreements, and the conversion shipped.
+- **`variantIndexOfLet` / `letIsVariant`** — no such guard. Any node whose spelling happens
+  to name a variant reaches the test, and only the registry can answer for a node that is
+  not the declaration.
+- **`paramVariantIndex`** — B106/B109, declined for a third reason again (the node hands
+  over arm 0's type, and the emitter's boxing is a lowering fact the arena does not record).
+
+Three sites, three different reasons, one function. That is worth stating plainly because
+the obvious reading — "`variantRowOfTy` is the arena twin of `variantIndexOf`" — is false.
+It is the arena twin of "which variant DECLARATION is this node's annotation", which
+coincides with the registry lookup only under a guard.
+
+Declined, with the cause recorded on the sites rather than left for a fourth attempt.
