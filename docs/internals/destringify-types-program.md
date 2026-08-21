@@ -52931,3 +52931,67 @@ files between them. This one costs an interface change and covers 13.
 3. **The union lowering family** — #1611 / #1678 / #1684, not destringify work.
 
 Nothing in that list is a reader waiting to be written.
+
+## B199 — "architectural" was a claim about what I had not looked up
+
+B198 closed with a list of what remains, and item 1 was **name PRODUCTION**: `synthParamAnnots`
+(151 files), `internCloResultChain` (64), the mono layer's `monoArgTyName` — with the reason
+given as *"a name is the artefact; converting means re-keying the emitter's tables."*
+
+That reason was false for the second entry, and one `grep` was enough to show it.
+
+### The site
+
+`collectCloSigs` seeds one `$fnsig` per closure result level:
+
+```vl
+if cloRetValKind(fe) == "closure" {
+  internCloResultChain(nodeTyName(fnStmts[fe]))     // ← a RENDER
+}
+```
+
+and the spine it feeds then recovered, by string slicing, the structure that render had just
+flattened — `annRetNameOf` is "the `annArrowAt`-then-slice", one level per iteration. The arena
+holds that descent directly as `TyFunc.fnRet`.
+
+**The key was already written.** `sigKeyOfTy(funcTyIx)` sits in `emit_classify.vl` immediately
+below `annSigKey`, with three live callers. The "re-keying" the entry above was declined for did
+not need doing; the type-taking twin had been there the whole time.
+
+### The render was also WRONG, which the plan did not predict
+
+A lockstep build — both walks running, keys compared, mismatch reported — over all 1947 corpus
+files found the two disagree on **two**:
+
+| file | name walk | arena walk |
+| --- | --- | --- |
+| `literal-unions/fn-value-litunion-arg.vl` | `\|>c\|S>i` | `\|>c\|i>i` |
+| `structs/nullable-recursive-inner-closure-call-row.vl` | `[]` | `[""]` |
+
+`nodeTyName` print-widens a litunion **alias** param to `string`, so the seeder keyed `S>i` for a
+callee that interns `i>i`. The witness file's OWN header names that softening as the bug the other
+three `$fnsig` producers were already fixed for — **this seeder was the fourth**, still reading the
+widened spelling. And the failure is silent: `wasmEmit`'s `call_ref` answers a missing key with
+`fnSigIdxForArity`, the arity-only functype, which is the documented route to "invalid wasm, `vl
+check` clean".
+
+The second row is the render returning EMPTY where the arena has a `TyFunc`. The old walk took
+zero levels there and no channel had ever said so.
+
+### Why 0 corpus diffs would have been the wrong reading
+
+Corpus A/B: **one** file changes bytes. Its type section is the SAME 35-type multiset with one
+functype rotated later — the base had pre-seeded the wrong key early. Run output identical, 20/20.
+Reach probe: **69 files fire**. Byte-identity alone would have called this inert; reach alone would
+have called it live but unexamined. The lockstep is what named the defect, and it is the only one
+of the three that could have.
+
+### The rule
+
+**Before recording that a conversion is architectural, grep for the type-taking twin.** Twelve
+verdicts in this programme have now been overturned by measurement, and every one was a claim
+about what information could not do that was really a claim about what the attempt had not tried.
+"It would need X built" is a checkable statement. Check it.
+
+Item 1 of B198's list is therefore down to `synthParamAnnots` (151) and `monoArgTyName` — and
+neither has been grepped for its twin yet.
