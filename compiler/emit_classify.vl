@@ -18383,6 +18383,11 @@ function unionOfVariant(vi: i32) {
 //
 // Named `variantRowOfTy` rather than `variantIndexOfTy` because `variantIndexOfTypeName` already
 // exists and the two would read as a pair they are not: that one takes a spelling.
+// B107 settled why this has no caller, and it is NOT the query-node confusion B106
+// suspected: for a union of structurally identical arms the arena legitimately holds arm
+// 0's type (member dedup is structural), so this answers "arm 0" where the truth is "the
+// union". See the corpus census on `paramVariantIndex`. Correct as written; unsafe at
+// exactly the sites that would want it.
 export function variantRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   let i = 0
@@ -18967,6 +18972,41 @@ function paramStructIndex(fnIx: i32, name: string) {
 // A variant-struct param's value IS the concrete variant struct ref `(ref
 // $(uVarHeap[vi]))` — already narrowed/unboxed by the caller — so a field read on it reads the
 // variant struct directly (no box unwrap), the gap-#2 boundary.
+// MEASURED DECLINE (B107) — NAME, NOT THE ARENA, and the cause is neither coverage nor
+// registry keying. Both earlier suspects were wrong; this is the one question a
+// structural arena provably cannot answer.
+//
+// An unconditional print at this rung over 700 corpus files gave 391 distinct rows:
+//   300  `paramTypeNode` returned -1 (unannotated param, or `name` is not a param).
+//        Both readers answer "nothing" — the rung is inert for them.
+//    78  the arena recorded a FAITHFUL type: `AB` -> `{a:i32}|{b:i32}`, and
+//        `A|B|i32|f64|boolean|string|null` -> every arm intact. Unions survive fine.
+//    13  the arena is silent (real spelling, no recorded type); 11 of the 13 name a
+//        type PARAMETER (`T[]`, `T[][]`, `Pair<X,string>`).
+//
+// The 78 look convertible and a coverage guard would fence off the 13. What kills it is
+// a case in neither group. A whole-corpus dual-run of `variantIndexOf(tyNameOf(..))`
+// against `variantRowOfTy(nodeTyIxOf(..))` found EXACTLY TWO disagreements, both:
+//
+//   name=[Cat|Dog] byName=-1 byTy=0 tyIx=31 rows=2
+//   name=[A|B]     byName=-1 byTy=0 tyIx=31 rows=2
+//
+// A union whose arms are all STRUCTURALLY IDENTICAL degenerates. Member dedup is
+// structural, so `Cat | Dog` (both `{kind:i32,name:string}`) dedupes to one member and
+// collapses to that member's type — `tyIx=31` is arm 0's OWN row type (B106 measured
+// `row0=[A]ty=31 row1=[B]ty=32`; the arena is an append log, so the two identical shapes
+// really do occupy distinct rows). Different-shape unions keep every arm, which is why
+// the other 78 are clean.
+//
+// So the arena says "arm 0" and the name says -1, and THE NAME IS RIGHT: the param is the
+// union, not the arm. Trusting the arena here would tell emit the value is a concrete
+// unboxed variant ref when it is a boxed union — a miscompile straight through the gap-#2
+// boundary this function exists to police. Pinned by
+// `tests/cases/soundness/union-same-shape-discriminant-sound.vl` and
+// `tests/cases/types/struct-union-same-shape.vl`; both reach this rung.
+//
+// `variantRowOfTy` is correct as written and deliberately has NO CALLER: its only
+// consumers would be param sites, and this is the param site.
 function paramVariantIndex(fnIx: i32, name: string) {
   variantIndexOf(tyNameOf(paramTypeNode(fnIx, name)))
 }
