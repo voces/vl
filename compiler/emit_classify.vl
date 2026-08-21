@@ -4899,6 +4899,47 @@ export function exprIsStrConcat(binIx: i32, fnIx: i32) {
 // passed to a `K | f64` param from a function holding NOTHING else. Delete the
 // `unionTakesAtomAsStr` call below and that fixture is INVALID WASM ("expected i32, found …"
 // at a local the vector never declared) while every other position keeps running.
+// A literal-union ATOM pushed into a `string[]` widens to its member string
+// (`emitPush`'s `isStr` + `exprIsLitAtom` arm -> `emitStrValue` -> `emitAtomToStr`), which
+// stages the atom id in the string-op scratch frame. THE EMIT'S RESERVATION SIDE: without this
+// the frame goes unreserved and the widen writes to a local the vector never declared, which is
+// a DIFFERENT invalid wasm from the one the emit arm fixes — a function whose only string work
+// IS the push reproduces it (`fill` returning `xs.length` with no other string op).
+//
+// The receiver test is the LIST's element type and the value test is the VALUE's rep, which is
+// the pairing `emitPush`'s other seeds do not make: they are all keyed on the receiver alone,
+// so none of them asks whether the pushed value is an atom.
+//
+// DELIBERATELY A SUPERSET, not an exact mirror. `exprStringArray` also answers true for a
+// `(string | null)[]`, whose push takes `emitPush`'s EARLIER `isNsArr` arm and does not widen —
+// so this reserves a frame that goes unused there. Over-reserving costs locals; UNDER-reserving
+// is invalid wasm, so the asymmetry is the safe direction. It is also currently unobservable:
+// every program that reaches it is already invalid wasm, because the `(string | null)[]` push is
+// the NEXT sink in this family and is still open.
+//
+// It is NOT a superset in the direction that matters, and one gap is known: a SHADOWED binding
+// resolves through `declaredSlotOf`'s first-match fallback, which sees the OUTER name during the
+// scan and the INNER one at emit — so the predicate declines while the emit fires. That hole
+// belongs to all six sinks in this family and predates this one; see
+// tests/cases/soundness/xfail-miscompile-shadowed-atom-widen-unreserved-frame.vl.
+function pushWidensAtomToStr(callIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        if c.callArgs.length == 1 {
+          if exprStringArray(callee.memObj, fnIx) {
+            if exprIsLitAtom(c.callArgs[0], fnIx) { return true }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
 function callWidensAtomToStr(callIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const c = P.nodes[callIx]
@@ -5448,6 +5489,9 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     // A literal-union atom argument flowing into a `string` param widens (`emitAtomToStr`),
     // which stages the atom id in the string-op scratch frame.
     if callWidensAtomToStr(exprIx, fnIx) { return true }
+    // `xs.push(atom)` into a `string[]` widens the same way — its twin emit arm is in
+    // `emitPush`.
+    if pushWidensAtomToStr(exprIx, fnIx) { return true }
     // `s.indexOf(sub)` / `s.includes(sub)` stage their receiver + needle + loop
     // counters in the same string scratch frame. (`charCodeAt` is a bare
     // `array.get` — no frame needed; its operands recurse below.)
