@@ -49269,3 +49269,61 @@ rendering, and deleting it would trade an honest one for a silent one.
 `emit_sections.vl:3581` — `retSlot = variantIndexOf(tyNameOf(fn.fnRet))`, the RETURN-slot
 variant rung (B104's second live site). The same question one position over, and now with a
 known answer shape: check whether the return path's struct rung already claims it.
+
+## B118 — the return-slot variant rung, and `emit_sections.vl` stops rendering types
+
+`retSlot = variantIndexOf(tyNameOf(fn.fnRet))` was B104's second live variant site and the
+last render-then-test in this module. Converting it gives `variantRowOfTy` its **first
+caller** — the function has been correct and callerless since B105, kept that way by B106
+and B107.
+
+The reason it was callerless does not apply here. At a PARAM site a union-annotated node
+hands over arm 0's type, so the reader answers about the wrong thing (B106). At this site
+`retVariantFlag` has already established the return is a CONCRETE variant, so the node is
+never a union.
+
+### The hazard that would remain, and why it cannot occur
+
+Two variants of the SAME shape: matching structurally could pick the other row. The corpus
+contains no such case, and per the population rule that is not evidence — so I tried to
+build one, and could not. Every attempt fails before reaching the site, and the reason is a
+compiler bug found on the way:
+
+```vl
+type A = { tag: i32, v: i32 }
+type B = { tag: i32, v: i32 }
+function f(x: A | B) { if x is A { return 1 } return 2 }
+function mkB(): B { return { tag: 2, v: 200 } }
+print(f(mkB()))
+```
+
+`vl check` passes; `vl build` **crashes the compiler** with a wasm trap (it reproduces under
+`check --codegen`, which never runs the output, so the trap is in the compiler). Reproduced
+on five generations including one built at `08647012^` — long-standing, filed as **#1611**.
+Drop the return annotation and it becomes a clean `emitProgram: ref valtype with no interned
+shape` instead.
+
+So the disagreeing case is not merely absent from the corpus: it is not constructible. That
+is a stronger licence than an agreement rate, and a weaker one than a fixture — recorded as
+such rather than dressed up.
+
+No xfail was filed for the crash. A file that kills the compiler is a fourth kind the corpus
+taxonomy (`xfail-unsound-`, `xfail-false-reject-`, `xfail-miscompile-`) does not cover, and
+adding one risks the harness erroring instead of reporting an expected failure.
+
+### The module stops rendering
+
+Removing this call left `tyNameOf` AND `variantIndexOf` both unused in
+`emit_sections.vl`. **The module no longer renders a type to a string anywhere** — the only
+remaining occurrence of `tyNameOf` in the file is inside the comment explaining what used to
+be there.
+
+Twelve `.tyName` reads remain, in two clusters:
+
+1. `paramScalarName(p.parType, ty.tyName)` ×5 — the coverage fallback, measured at zero
+   corpus uses (B117).
+2. `strContains(pn.tyName, "i64")` / `"f64"` / `"f32"` ×3 — **substring searches on a
+   rendered annotation**, the most literal form of the thing this programme exists to
+   remove. Next.
+
+Corpus A/B 0 of 1947; six gates green.
