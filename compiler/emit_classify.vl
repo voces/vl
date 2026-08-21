@@ -125,6 +125,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsNullableLitUnion,
+  tyLitUnionAliasIx,
   tyNestedArrLeafSupported,
   tyToEmitName,
   tyToNominalName,
@@ -8790,7 +8791,10 @@ export function cloCallParamLitUnion(callIx: i32, idx: i32) {
       // `litUnionAliasNameOfTy` — the latter falls back to a member-literal SET match and so
       // names the inline spelling "K" in any program that also declares `type K = "a" | "b"`.
       if tyIsLitUnion(pty) {
-        if unionAliasDeclNameOfTy(pty) != "" { return 1 }
+        // `tyLitUnionAliasIx` rather than `unionAliasDeclNameOfTy`: both exclude the bare
+        // INLINE spelling (which really is a string), but the name form also misses a NARROWED
+        // copy, whose rep IS the atom. The index form is what the rep layer itself asks.
+        if tyLitUnionAliasIx(pty) >= 0 { return 1 }
         return 0
       }
       // The NICHE claims BOTH spellings, exactly as `nodeTyIsNulLitUnion` does:
@@ -16054,7 +16058,12 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
 export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
   if bindIx < 0 { return false }
   const bn = P.nodes[bindIx]
-  if bn is Param { return nodeTyIsLitUnionAlias(bn.parType) }
+  if bn is Param {
+    // The ALIAS-INDEX question, matching the rep. See `exprIsLitAtom`'s param arm: a NARROWED
+    // alias is a copy at a fresh index, so the registry misses while the rep layer — which
+    // assigns the valtype through this same `tyLitUnionAliasIx` — says `i32`.
+    return tyLitUnionAliasIx(nodeTyIxOf(bn.parType)) >= 0
+  }
   if bn is LetDecl {
     return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
   }
@@ -16123,7 +16132,19 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
     const pt = paramTypeNode(fnIx, e.identName)
     if pt >= 0 {
-      const r = nodeTyIsLitUnionAlias(pt)
+      // The ALIAS-INDEX question, not the REGISTRY one. `nodeTyIsLitUnionAlias` asks whether
+      // the arena type is a REGISTERED alias index; `tyLitUnionAliasIx` also consults the
+      // checker's COPY-PROVENANCE table (`cLitUnionCopyTyIxs`), which records the copies
+      // narrowing / join / subtraction mint at fresh indices. A NARROWED alias (`K & !"kb"`)
+      // is one of those copies.
+      //
+      // This is the predicate the REP LAYER uses to assign the valtype in the first place
+      // (`emit_rep`'s `TyUnion` arm: an alias index reps `i32`, anything else is uncovered),
+      // so asking it here makes the consumer agree with the rep by construction rather than
+      // by coincidence. The registry test agreed for a registered alias and disagreed for a
+      // narrowed one, which is exactly the observed split: `K` and `K & !"kb"` are both
+      // declared `i32` while a bare inline `"ia" | "ib"` canon-softens to `string`.
+      const r = tyLitUnionAliasIx(nodeTyIxOf(pt)) >= 0
       return r
     }
     const gli = globalLetOf(e.identName)

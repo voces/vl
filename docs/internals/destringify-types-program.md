@@ -44969,3 +44969,120 @@ named next step.
   arena" breaks the case it currently gets right.
 * **Check whether the twin is needed; do not add one reflexively.** B45's rule is that the pair
   moves together, not that every sink needs a new predicate.
+
+## B47 / D-SINK4 — the predicate that decides a rep is the predicate its consumers must ask
+
+B46 §2 declared this one blocked. Review refuted that, and the refutation is the entry.
+
+### 1. NOT A MISSING WIDEN — A WRONG QUESTION, ASKED TWICE
+
+A NARROWED literal-union parameter (`K & !"kb"`) is ALREADY declared `i32`. Three symptoms
+followed from one cause: `print(v)` emitted the raw atom id, a `: string` return lowered the id
+into a reference, and the CALLER lowered its member literal as a string into the i32 slot.
+
+`nodeTyIsLitUnionAlias` asks whether the arena type is a REGISTERED alias index. Narrowing does
+not preserve the index — `K & !"kb"` is a fresh copy — so the registry misses even though `K` is
+registered.
+
+`tyLitUnionAliasIx` asks the same question through the checker's COPY-PROVENANCE table
+(`cLitUnionCopyTyIxs`) as well, which records exactly the copies narrowing, join and subtraction
+mint. **It is the predicate `emit_rep`'s `TyUnion` arm already uses to ASSIGN this valtype** — an
+alias index reps `i32`, anything else is uncovered. So the consumers now agree with the rep by
+construction rather than by coincidence:
+
+| spelling | valtype | registry | `tyLitUnionAliasIx` |
+| --- | --- | --- | --- |
+| `v: K` | `i32` | yes | yes |
+| `v: K & !"kb"` | `i32` | **no** | yes |
+| `v: "ia" \| "ib"` | `(ref 1)` | no | no |
+
+### 2. WHY THE STRUCTURAL TEST WAS WRONG, AND WHAT THAT GENERALIZES TO
+
+B46 tried `tyIsLitUnion` and it broke the caller. That is not evidence the problem is hard; it
+is evidence the predicate was wrong. `tyIsLitUnion` is true for ALL THREE rows, including the
+string-repped one, so it swaps one miscompile for another.
+
+**The rule the table states: when a consumer must agree with a rep, ask the predicate that
+ASSIGNED the rep.** Not a structural test that looks equivalent, and not the registry test that
+happens to be nearby. Both were available and both are wrong — one too wide, one too narrow.
+
+### 3. BOTH SIDES MOVED TOGETHER, AGAIN
+
+The callee reads through `exprIsLitAtom`; the caller lowers its argument through
+`cParamLitUnion` (`wasmEmit.vl`). A callee-only build was constructed and it fails in `main` —
+the caller's string literal landing in a now-atom slot. Same twin rule as the widening sinks, a
+different pair, verified rather than assumed.
+
+Corpus: **1 of 2038 rows moves**, the xfail flipping to pass. The family that held four
+`xfail-miscompile-` members is now closed except for the shadowed-binding hole.
+
+### METHOD NOTES
+
+* **"Blocked" needs the same evidence as "safe".** I closed a class after one failed predicate
+  while the right one was load-bearing three files away, in the layer that assigns the very
+  valtype in question. A failed attempt bounds the attempt, not the problem.
+* **`tail -1` on a gate hides its exit code.** `lint-self` failed rc 123 on an unformatted file
+  and printed a success-looking last line from a DIFFERENT stage; the failure was invisible until
+  the rc was read. This is the second time in this programme that a gate's exit code was taken
+  from the wrong place. Read `$?`, not the last line.
+
+### B47 ADDENDUM — four readers, not two; and the intermediate build was the dangerous one
+
+B47 shipped two of them and called the twin rule satisfied. There are FOUR readers of "is this
+parameter an atom", and review found the miss in the worst possible form.
+
+| reader | channel |
+| --- | --- |
+| `exprIsLitAtom`'s `Param` arm | the callee's direct read |
+| `cParamLitUnion` | the direct caller's argument |
+| **`bindingIsLitAtom`'s `Param` arm** | a CAPTURED read |
+| **`emitCapturedCall`'s `cpLit`** | a captured CALL's argument |
+
+Moving the first two and not the last two produced a **silent wrong answer**:
+
+```vl
+function outer(v: N) { const g = () => { print(v) }  g() }
+```
+
+master rejected it loudly; the intermediate build VALIDATED and printed `0` and `1` — the raw
+interned atom ids. The caller now pushed a real atom while the capture channel still expected a
+string, and nothing in the pipeline objected.
+
+**The intermediate state was strictly worse than either endpoint.** That is the sharpened form of
+the twin rule: a partial move is not "less of the fix", it is a NEW defect, and it can be worse
+than the bug being fixed. The function-value path showed the same thing in a milder key — direct
+call fixed, indirect not, and a load-time rejection became a validating module that trapped at
+runtime.
+
+### THE FIXTURE NOW DISCRIMINATES THREE STATES
+
+| build | result |
+| --- | --- |
+| master | fails to compile |
+| direct-call readers only | compiles, prints `0 2` — WRONG |
+| all four readers | `ka kc kc` |
+
+A fixture covering only the direct call passes while the capture channel is broken, which is why
+the file states its reader count instead of assuming it.
+
+### WHAT WAS NOT SHIPPED
+
+A fifth reader — the `$fnsig` producer chain behind a function-VALUE call — is still on the
+rendered spelling. The projection fix was written (`sigKeyOfTy` falling back through
+`tyLitUnionAliasIx` to the source alias's declared name), measured at **0 corpus rows and 0 of
+the constructed shapes**, and DROPPED. At least one more producer in the chain still keys the
+softened spelling, and the three (`cloParamTok`, `annSigKey`, `sigKeyOfTy`) must stay
+byte-identical, so moving one alone changes nothing. Pinned as
+`xfail-miscompile-narrowed-litunion-fn-value-arg.vl` at the same severity master has.
+
+### METHOD NOTES
+
+* **Count the readers before claiming the pair moved.** "Both sides" assumed there were two
+  sides. The question "who else asks this?" is a grep, and it was not run.
+* **An inert arm does not ship, even when the reasoning is good.** The projection fix looked
+  right and measured at zero. Zero is not a licence.
+* **A lint hint gutted a fixture again, and this time it was proven.** The `@hint`-declared
+  annotation in the fn-value pin is load-bearing: removing it as the linter suggests makes the
+  program WORK, leaving a green file asserting nothing. Second confirmed instance; the check is
+  now routine — when a diagnostic asks to delete something from a test, verify the test still
+  fails without it.

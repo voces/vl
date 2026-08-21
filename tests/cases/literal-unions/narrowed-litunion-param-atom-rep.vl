@@ -1,0 +1,95 @@
+// @run
+// @log ka
+// @log ka
+// @log kc
+// @log ia
+// @log a
+// @log n
+// @log i
+// @log ka
+// @log kc
+// @log kc
+// A NARROWED literal-union PARAMETER (`K & !"kb"`) and every consumer of it. This was
+// `xfail-miscompile-narrowed-litunion-param-string-return.vl` and makes that kind's documented
+// trip to `@run`.
+//
+// IT WAS NEVER A MISSING WIDEN. The three sibling defects it was filed with were VALUE sinks —
+// an atom reaching a string slot that had no widening arm. This one is a REP DISAGREEMENT: the
+// parameter is ALREADY declared `i32`, and the predicates that decide whether to treat it as an
+// atom said no. `print(v)` emitted the raw id, a `: string` return lowered the id into a
+// reference, and the CALLER lowered the member literal as a string into the i32 slot — three
+// symptoms, one wrong question.
+//
+// THE QUESTION. `nodeTyIsLitUnionAlias` asks whether the arena type is a REGISTERED alias
+// index. Narrowing does not preserve the index: `K & !"kb"` is a fresh copy, so the registry
+// misses even though `K` is registered. `tyLitUnionAliasIx` asks the same question through the
+// checker's COPY-PROVENANCE table as well, which records exactly those minted copies — and it
+// is the predicate the REP LAYER already uses to assign the valtype (`emit_rep`'s `TyUnion`
+// arm: an alias index reps `i32`, anything else is uncovered). Asking it makes the consumers
+// agree with the rep by construction instead of by coincidence.
+//
+// THE BARE INLINE SPELLING IS THE CONTROL, and it is the whole reason a STRUCTURAL test is
+// wrong here. A first attempt used `tyIsLitUnion`, which is true for all three spellings — but
+// they do not share a rep:
+//
+//   v: K                 -> (param i32)      registered alias
+//   v: K & !"kb"         -> (param i32)      copy-provenance
+//   v: "ia" | "ib"       -> (param (ref 1))  canon-softens to `string`
+//
+// A structural predicate claims the atom rep for that third row too, swapping one miscompile
+// for another. `pInline` and `takesInline` below pin that it stays a string reference.
+//
+// THERE ARE FOUR READERS, NOT TWO, and finding that out cost a silent miscompile. The callee
+// reads through `exprIsLitAtom`; the direct caller lowers through `cParamLitUnion`; a CAPTURED
+// read goes through `bindingIsLitAtom`; and a captured CALL lowers through `emitCapturedCall`'s
+// `cpLit`. Moving only the first two left the capture channel on the registry test, and because
+// the caller now pushed a real atom while the capture read still expected a string, the module
+// VALIDATED and printed the raw interned ids `0` and `1` instead of `ka` and `kc` — a silent
+// wrong answer where master had failed loudly. The last two arms below are that case, and they
+// are why the arm count is stated rather than assumed: a fixture covering only the direct call
+// passes while the capture channel is still broken.
+//
+// A FIFTH READER IS NOT MOVED, DELIBERATELY. A function-VALUE call to a narrowed-param callee
+// (`const f: (N) => string = takesN`) resolves its `$fnsig` through a producer chain that keys
+// off a rendered spelling, and it remains broken — identically to master, as a LOAD-time
+// rejection. It is pinned as `error-narrowed-litunion-fn-value-arg.vl`. The projection fix for
+// it was written, measured at 0 corpus rows and 0 constructed shapes, and dropped rather than
+// shipped unmeasurable.
+type K = "ka" | "kb" | "kc"
+type N = K & !"kb"
+
+function takesN(v: N): string { v }
+function takesK(v: K): string { v }
+function takesInline(v: "ia" | "ib"): string { v }
+
+function pAlias(v: K) { if v == "ka" { print("a") } }
+function pNarrow(v: N) { if v == "ka" { print("n") } }
+function pInline(v: "ia" | "ib") { if v == "ia" { print("i") } }
+
+// The CAPTURE channel: a narrowed param read from inside a closure, and called from inside one.
+function captures(v: N) {
+  const g = () => { print(v) }
+  g()
+}
+
+function capturedCall(v: N) {
+  const h = (w: N) => { print(w) }
+  h(v)
+}
+
+function main() {
+  print(takesN("ka"))
+  const n: N = "ka"
+  print(n)
+  print(takesK("kc"))
+  print(takesInline("ia"))
+
+  pAlias("ka")
+  pNarrow("ka")
+  pInline("ia")
+
+  captures("ka")
+  captures("kc")
+  capturedCall("kc")
+}
+main()
