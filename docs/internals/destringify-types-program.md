@@ -48952,3 +48952,76 @@ nesting) compiles, so the emitter's coverage has grown to meet the checker's. Th
 arm is reachable only by breaking the ladder, which is how the inverted control exercised
 it. That is a real gap and not one this change closes: the ladder's safety net remains
 unwitnessed by any fixture.
+
+## B113 — the string rung converted, and the other three diagnosed
+
+With the scalar rungs on the arena (B112), the ladder's remaining name readers are
+`isSName`, `isUName`, `variantIndexOf`, `nameIsArray`, `nameIsString`. A census of which
+rung accepts each param (first param per file):
+
+| rung | files |
+| --- | ---: |
+| `isUName` | 159 |
+| `isSName` | 142 |
+| `nameIsArray` | 124 |
+| `nameIsString` | 113 |
+| `variantIndexOf` | 2 |
+| reject | 0 |
+
+All five are live. A four-way dual-run against arena twins then gave **64 disagreements,
+every one in the direction `name=T arena=F`** — never the reverse. That looked like arena
+silence, and it was not: re-probing showed **all 64 have a recorded arena type**. The arena
+holds the right type and the twins fail to match it.
+
+Rendering the arena's answer separated the classes:
+
+| rung | spelled | arena renders | diagnosis |
+| --- | --- | --- | --- |
+| STRING (18) | `string` | `string` | not a `TyPrim` — see below |
+| SNAME (13) | `#anon0` | `{}` | an UNFILLED placeholder shape |
+| SNAME (15) | `Box<i32>`, `Pair<i32,string>` | `{v:i32}`, `{a:i32,b:string}` | correct shape; the struct registry does not match generic INSTANCES |
+| UNAME (15) | `string\|i32` | `string\|i32` | identical rendering; the union registry does not match INLINE rows |
+| ARRAY (3) | — | — | not yet diagnosed |
+
+### The string rung, converted
+
+`nameIsString` was reading canon's SOFTENED rendering, which reports `string` for three
+different arena shapes. Peeling the parser's one-member-union alias wrapper changed
+nothing (18 → 18), which ruled out the obvious suspect. Adding literal unions took it to
+2, and the last two were `single-literal-type.vl`'s bare `TyLit` — a SINGLE-member literal
+type (`"world"`, no `|`), which the fixture documents reps as its base scalar.
+
+So the question the rung actually asks is neither "is it a prim" nor "is it a litunion"
+but **which base scalar does this lower as**, over three shapes at once. That is now one
+function, `tyScalarBaseName` — `TyPrim`, a bare `TyLit`, and a `TyUnion` of `TyLit`s over
+one base, peeling the alias wrapper on the same bound the numeric extractors use. It is
+the kind-agnostic sibling of `tyNumScalarBaseName`, which answered only for the numeric
+bases, and it is the one home for the collapse `canonEmitTypeNames` performs on the
+rendering side.
+
+`nameIsString` is now an unused import in `emit_sections.vl` — the spelling reader is gone
+from the rung, not merely bypassed.
+
+Inverted control: substituting the naive `nodeTyPrimName(..) == "string"` rejects
+`single-literal-type.vl`, `inline-atom.vl` and `ordering-hole-string-operand-sound.vl`, so
+the literal handling is load-bearing and the conversion is not vacuous.
+
+Corpus A/B 0 of 1947. Six gates green, rep-fuzz exact with 0 new rejects.
+
+### Queued, with the diagnosis attached
+
+The other three rungs are NOT B107-class. Nothing here is a representation question the
+arena cannot answer, and nothing is a type the arena lacks — each is a registry that fails
+to match a type it already holds:
+
+1. **`isSName`** — the struct registry does not match a generic INSTANCE (`Box<i32>` whose
+   arena shape is exactly `{v:i32}`), and `#anon0` resolves to an empty `{}`, which is the
+   unfilled-placeholder hazard `cUserTypes`' own header documents. Two separate repairs.
+2. **`isUName`** — `isUnionOfTy` matches declared unions by index and inline ones
+   structurally, yet 15 inline rows whose arena type renders identically to the spelling
+   do not match. The structural rung is not reaching them.
+3. **`nameIsArray`** — 3 rows, undiagnosed. Note this rung is doing double duty: it also
+   claims a union whose LAST arm is an array (B108), so a strict `TyArray` test is not its
+   twin.
+
+`variantIndexOf` (2 rows) stays declined on B107/B109.
