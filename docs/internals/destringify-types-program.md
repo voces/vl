@@ -46146,3 +46146,46 @@ number any of them has.
 * **"No arena twin exists" is a fact about a TABLE, not about a site.** The struct table is keyed
   by arena index and the variant table is keyed by name, so nine sites are blocked by one missing
   sidecar and no amount of per-site analysis will unblock them.
+
+## B66 / D-RESIDUE — the first residue numbers, and they run opposite to the assumption
+
+B65 introduced the fallback sabotage and observed that a dozen sites shaped
+`if <arena> { … } else { <name> }` had been filed as "already arena-first, name is documented
+residue" **without any of them having its residue measured**. This takes the first numbers.
+
+### THE ARENA LEGS CARRY ALMOST NOTHING THE NAMES DO NOT
+
+Forcing the arena leg to decline at all NINE `annRepKindOf(d.letType)` guards — so only the name
+fallbacks answer — moves **1 corpus row**
+(`arrays/f32-array-literal-self-classifies.vl`).
+
+That is not "the arena is useless": the arena leg is the CORRECT one and the name is the
+approximation. It is a statement about the CORPUS — the two agree on 2,037 of 2,038 files, and
+the arena-first structure earns its place on exactly one.
+
+### AND AT THE ONE SITE MEASURED BOTH WAYS, THE RESIDUE IS EMPTY
+
+`letIsI32List`'s fallback:
+
+| leg forced off | rows |
+| --- | --- |
+| arena leg (name answers alone) | **1** |
+| name fallback (arena answers alone) | **0** |
+
+So the arena uniquely answers one file and the fallback uniquely answers none. **The word
+"residue" at that site described an expectation, not a measurement**, and the expectation is not
+corroborated on this corpus.
+
+**Kept anyway.** 0 rows proves corpus-UNREACHABLE, not dead — the rule that has governed four
+prior decisions here — and the site's own comment names the shapes it exists for (an INLINE
+litunion element, the `(boolean|null)[]` and `(K|null)[]` niches), which the corpus may simply not
+carry at this binding form. What changes is that the next reader starts from a number.
+
+### METHOD NOTES
+
+* **Measure both directions of a two-leg site.** Each sabotage answers a different question —
+  "what does the arena uniquely decide" and "what does the name uniquely rescue" — and a site can
+  be 1-and-0, 0-and-1, or 0-and-0, which are three different situations sharing one shape.
+* **A word in a comment is not a measurement.** "Documented residue" appears at a dozen sites in
+  this compiler, several written by this programme, and until now none of them carried a number.
+  The eleven remaining are a queue item with a known method and a two-build cost each.
