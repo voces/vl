@@ -46104,3 +46104,45 @@ question.** Checking cost one build; assuming would have cost the conversion.
 * **When a question has two opposite answers and both are cheap to test, test — do not derive.**
   The screen spent its budget trying to read the paren out of `transparentMemberEmitName` and
   stopped, correctly, at UNKNOWN. Two builds answered it without reading that function at all.
+
+## B65 / D-STRUCTIDX — the nominal-index family splits, and the fallback sabotage is the informative one
+
+Third of B62's nine UNKNOWNs. The screen could not tell whether an INDEX-returning arena twin
+exists for the `variantIndexOf` / `structIndexByName` family — it found `structIndexOfTy` used
+once but did not read it, and no `variantIndexOfTy` at all.
+
+### THE FAMILY SPLITS, AND NOT BY CALL SITE
+
+* **`structIndexOfTy(ty)` is a real arena lookup** — `sTyRow[ty]`, a table keyed by arena type
+  index. Struct-side sites are convertible.
+* **`variantIndexOf` has no arena analogue whatsoever**, only `variantIndexOfTypeName`. The
+  declared-union member column that would give it one is the sidecar B39 measured at 90 corpus
+  rows to supply.
+
+Counted over sites holding a node: **2 struct-side, 9 variant-side.** One of the two is already
+arena-first. So the family's "9 UNKNOWN" is really 1 conversion and 9 blocked-on-a-known-sidecar —
+and the split is a property of **which table has an arena key**, not of the call sites.
+
+### THE FALLBACK SABOTAGE
+
+`letAnnStructIdx` becomes arena-first with the name as fallback. The usual separator — force the
+ARENA leg off — moved **0 rows**, and that reading is worthless here: with the name fallback still
+present, "arena leg unreachable" and "arena leg agrees with the name" both produce 0.
+
+**For an arena-first-with-fallback shape, sabotage the FALLBACK.** Forcing the NAME leg to `-1`
+moves **2 rows** — `generics/body-type-param-composite-locals.vl` and
+`literal-unions/union-of-litunions-flatten.vl`. So the arena leg answers everything except those
+two, and the fallback is a live residue rather than dead code.
+
+That is a new instrument reading, and it generalises: this programme has a dozen sites shaped
+`if <arena> { … } else { <name> }` that earlier passes classified as "already arena-first, name is
+documented residue". **None of them has had its residue measured.** Two rows here is the first
+number any of them has.
+
+### METHOD NOTES
+
+* **Sabotage the leg whose absence is observable.** On a single-leg site that is the leg itself;
+  on a fallback chain it is the LAST leg, because every earlier one is masked by it.
+* **"No arena twin exists" is a fact about a TABLE, not about a site.** The struct table is keyed
+  by arena index and the variant table is keyed by name, so nine sites are blocked by one missing
+  sidecar and no amount of per-site analysis will unblock them.
