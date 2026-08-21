@@ -49327,3 +49327,65 @@ Twelve `.tyName` reads remain, in two clusters:
    remove. Next.
 
 Corpus A/B 0 of 1947; six gates green.
+
+## B119 — the substring scan, and two of my own measurements were wrong
+
+`strContains(pn.tyName, "i64" | "f64" | "f32")` is the most literal instance of the thing
+this programme removes: a rendered annotation scanned for a substring. It sits behind a
+coverage guard — `repNodeScalarMask` answers from the arena and this is the fallback for a
+node with no recorded type.
+
+The replacement was already in the codebase. `ast.tsMentionsAnyName` walks the parser's
+spelling tree, and its header states the exact principle:
+
+> "it answers about the annotation the author wrote rather than about a synthetic name
+> string: `T`, `T[]`, `Box<T>` and `{a: T}` all mention `T`, while `Trace` does not (**a leaf
+> is compared whole, never as a substring**)."
+
+Every node reaching the fallback has a spelling tree (20 corpus files, 20 with a tree), so
+the walk replaces the scan directly. Where neither a recorded type nor a tree exists — no
+corpus file — all three flags are set rather than none: the scan over-approximates by design
+(a spare import is harmless, a missed flag is invalid wasm), so the conservative direction is
+the safe one.
+
+### Two measurement errors, both mine, both caught by the other
+
+This one produced a contradiction that took two corrections to resolve, and the pair is
+worth recording because each error is a different failure of the same discipline.
+
+**First**, the population count. The census printed `sort | uniq -c | sort -rn | head -10`
+and I summed the visible rows to "20 files" — but `head -10` showed only the ten most common
+SPELLINGS, and the total was never displayed. The number happened to be right; the reasoning
+that produced it was not, and it would have been wrong for any wider population.
+
+**Second**, the control. Neutering the branch appeared to change **1589 of 1947** files,
+which contradicted a 20-file population and would have meant the fallback was load-bearing
+almost everywhere. The loop was broken:
+
+```sh
+a=$($V build "$f" -o /tmp/a.wasm 2>/dev/null; sha256sum /tmp/a.wasm | cut -c1-16)
+b=$($V build "$f" -o /tmp/b.wasm --compiler CTRL   ; sha256sum /tmp/b.wasm | cut -c1-16)
+```
+
+`vl build` prints `wrote /tmp/a.wasm (156 bytes)` to STDOUT, so each captured string carried
+its own output PATH. `a` and `b` could never be equal, and the "diff" was every file that
+compiled. Comparing one file by hand showed all three builds byte-identical, which is what
+exposed it.
+
+The corrected control: neutering the branch changes **zero** files.
+
+### What that leaves
+
+The fallback is REACHED by 20 files and INERT in all of them — for every one, the flags it
+would set are already implied by another node in the same program. So the corpus cannot
+distinguish the substring scan from the tree walk, and this conversion is licensed by the
+whole-leaf/substring difference being correct, not by a measured signal. The substring's
+false positives were harmless anyway (`{f64mode: i32}` would match, and an extra import is
+by-design tolerable).
+
+That is a smaller claim than the ladder's conversions, and it is recorded as one rather than
+dressed in their evidence. Corpus A/B 0 of 1947; six gates green.
+
+**Nine `.tyName` reads remain in `emit_sections.vl`**, all of them `paramScalarName`'s
+coverage fallback and the comments describing what was removed. The module renders no types
+and now scans no type spellings.
