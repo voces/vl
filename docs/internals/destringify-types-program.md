@@ -52058,3 +52058,42 @@ The 34 that still render are unions, nullables, and struct values — the first 
 guard above, the third by the interner-progress wall (B170) that `structIndexByValName` sits
 behind. Same three causes as the struct site, which is the point: the two consumers are
 different code with the same remainder.
+
+## B176 — B170 was right about the symptom and wrong about the cause
+
+B170 tried a `TyObj` arm in `fieldCodeOfTy` three ways — the struct TABLE, the DECLARATION scan,
+and both conjoined — watched all three fail on the same fixture, and concluded:
+
+> no predicate over the type can express this precondition at all, because the precondition is
+> about the interner's progress, not about the type.
+
+The three failures were real. The conclusion was wrong, and the tell was in the error itself:
+`refSlot < 0` at `wasmEmit:867`, where `refSlot` is the field's ELEMENT NAME resolved to a row.
+Code 15 is a **two-part answer** — the code, plus an element name `fieldRefElemName` derives
+from the annotation NODE's spelling. `fieldCodeOfTy` can produce the first half and not the
+second.
+
+And `fieldCodeOfTy` has **two consumers**:
+
+| consumer | what it does with the code |
+| --- | --- |
+| `structRowOfObjFieldSet` | COMPARES it against `sFieldTypeAt` — needs no element name |
+| `nameFieldCodeTy` | feeds the path that RECORDS `sFieldTypes` — needs both halves |
+
+Widening the shared helper changed what got RECORDED. That is what broke
+`types/recursive-type-emit-render-cycle.vl`, not the predicate, and it is why swapping registry
+for declaration scan moved the count from 2 files to 1 without ever fixing anything.
+
+`fieldCodeForMatch` puts the same `isStructOfTy` arm where only the matcher hears it. Corpus A/B
+**0 diffs across 1,947 files** — the identical predicate that broke two files inside
+`fieldCodeOfTy` is byte-clean here — and the render path drops **12 -> 9**.
+
+### The rule
+
+**When a predicate fails, check how many consumers it has before concluding anything about the
+predicate.** Three refutations agreed with each other and all three were measuring the same
+irrelevant thing. What separated them was not a better type question but a narrower CALLER.
+
+The nine that remain: 7 need `fieldCodeForMatch` widened further (type parameters, unions), and
+2 are the shadowed-application cases. The interner-progress wall, which this log has cited as
+closed since B170, is not a wall — it was a shared helper.
