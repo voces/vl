@@ -52316,3 +52316,38 @@ Three PRs, each honest about its scope, and the third only visible because the f
 
 None of the three makes any of these programs COMPILE. The false rejects underneath are pinned
 as xfails and are the next work.
+
+## B183 — the false reject under the crash family, three layers down and not fixed
+
+The crashes are gone (B180-B182); the programs still do not compile. Chasing the reject
+("ref valtype with no interned shape") got three layers in and stopped, and the layers are
+recorded in both xfail headers because each one cost a build to learn.
+
+**The failing valtype is `kind=struct` with an index no struct row backs.** Instrumented:
+`idx=0 rows=0 heap=0 vars=1` — the struct table is EMPTY, the variant table has the arm.
+
+**That is by design.** `collectS` skips a `TypeDecl` when `variantIndexOf` claims it — "owned by
+the variant table, NOT a standalone struct". A declared struct used as a union arm has no struct
+row, so its values must take the VARIANT heap type.
+
+**The kind ladder already tries variant first** — `retVariantFlag` before `retTRFlag` — but that
+flag reads the CHECKER's `cVariantMemberTyIxs`, which does not cover this shape.
+
+**And the emitter's own variant table does not either.** An arm consulting `variantRowOfTy` (the
+type-keyed `uVarTyIx` column) ahead of the struct arm was built and MEASURED TO NEVER FIRE. The
+variant row exists by NAME while both type-keyed indexes miss it.
+
+### Which is the session's own finding, again
+
+B167 measured the struct table's D0 TYPE column unset for a whole population of rows while the
+NAME column covered them. This is that same asymmetry in the variant table. Two tables, two
+consumers, one shape of gap: **the name column is populated for rows the type column is not**, and
+every reader that asks "which row is this TYPE" falls into it while the render path — asking
+"which row is this NAME" — sails past.
+
+That is the destringify programme's own thesis running in reverse, and it is why the render path
+keeps winning at exactly these sites. The remaining renders are not doing something smarter;
+they are keyed on the column that happens to be filled.
+
+**So the next attempt is not another predicate at the kind ladder — all three have been tried.**
+It is the variant table's type column.
