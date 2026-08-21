@@ -51605,3 +51605,53 @@ that points at the first place the defect was noticed, and the fixture now pins 
 Every site this log ever declined has now been converted except the one whose contract is to
 take a name. Three of the four "permanent" declines fell within the last six entries, all to the
 same correction: **the reader that was tried is not the only reader that could exist.**
+
+## B166 — the last site, and the reader that would have to exist
+
+B165 converted the array rung and left `structIndexOfTypeName` as the only declined site, on the
+grounds that "its INPUT is a name". B164's rule says that is not a reason — it describes the
+function, not the caller. So: what reader would have to exist at the CALLER?
+
+The caller (`emit_classify:7365`) leads with an arena rung and reaches the name path only when
+that declines — measured, **32 corpus files**. Every name it resolves there is an inline SHAPE
+spelling (`{v: string}`, `{base: i32, count: i32, brand: i32}`), so the name path is performing
+a STRUCTURAL match through a rendering. The reader that would replace it is a structural scan of
+the struct table's own type column:
+
+```vl
+export function structRowOfShapeTy(ty: i32): i32   // tySame(sTyIx[r], ty) over the table
+```
+
+Structural comparison is correct for structs and not for variants (B105), so the reader is
+sound in principle. Measured, it answers **-1 on all 32**, and the cause splits:
+
+| rows | `sTyIx[row]` | why the scan fails |
+| ---: | --- | --- |
+| 17 | **-1** | the table's TYPE column is not populated for that row at this point in the pass |
+| 15 | a real index | the recorded type is not `tySame` to the node's |
+
+So the name path is not doing something a type reader could do more directly. It is doing
+something a type reader **cannot do yet**: the struct table is name-populated before it is
+type-populated, and this consumer runs in between.
+
+### The reader that would have to exist
+
+Not a predicate — an ORDERING. Either the type column is filled before this consumer runs, or
+the consumer moves after it. That is a pass-scheduling change in the emitter's collection
+order, with a real risk surface (the table is built incrementally *because* forward and
+mutually-recursive references tie in the shared rec group), and it is the first thing in this
+log whose blocker is when code runs rather than what it reads.
+
+### Where the programme ends
+
+Twenty-two conversions across 96 PRs. Every site this log declined has been converted except
+this one, and this one now has a cause that names its own fix:
+
+| site | blocker |
+| --- | --- |
+| `structIndexOfTypeName`'s caller | the struct table's type column is unpopulated at this point; 17 of 32 rows |
+
+The eight wrong verdicts this log corrected all shared a shape — a decline stated as a property
+of the information ("the arena cannot see it", "no receipt exists", "the name is wider") when it
+was a property of the attempt. This last one is different in kind: the information genuinely is
+not there yet, and the measurement says so with a row count rather than an argument.
