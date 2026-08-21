@@ -50595,3 +50595,56 @@ the second family the receipt the first already has.
 `nameIsString`'s two remaining uses in `emit_classify.vl` are both inside string-taking
 functions (`fieldCodeOfSpelling(t: string)`, `annParamKind(t: string)`) — bucket 4, no node to
 convert from, exactly as B128 predicted.
+
+## B146 — the boxing receipt already existed, and B107 falls
+
+B145 concluded that bucket 1's declines differ from the softened-name family because a rewrite
+keeps a record and a resolution does not — and that the repair was to give the second family
+"the receipt the first already has". That was right about the shape and wrong about the work:
+**the receipt already exists.**
+
+`annUnionAtomsOf(ix)` is the top-level `|`-atom count of the annotation's emit-time spelling,
+banked by `canonEmitTypeNames` (#1055). `registerCollapsedUnionName` has used it since the
+same-shape collapse was first handled — `annUnionAtomsOf(node) >= 2` is precisely "the source
+spelled a union", and it survives the collapse because it is recorded BEFORE it, as an integer.
+
+Guarding `paramVariantIndex`'s arena reading with it:
+
+```vl
+const pv = paramTypeNode(fnIx, name)
+if annUnionAtomsOf(pv) >= 2 { return -1 }
+variantRowOfTy(nodeTyIxOf(pv))
+```
+
+**0 disagreements.** B107's two files — `Cat|Dog` and `A|B` — are the ones the guard catches,
+and B109's unguarded experiment produced check-clean invalid wasm on exactly those. Both now
+run correctly (`cat dog`, `1 1`). Corpus A/B 0 of 1947; six gates green.
+
+### What was actually wrong for eight entries
+
+This site was declined three times, each with a correct local measurement:
+
+| entry | finding | verdict |
+| --- | --- | --- |
+| B106 | the query hands over arm 0's type | blocked |
+| B107 | same-shape arms collapse; the name is the only carrier | blocked |
+| B109 | converting yields a check-clean invalid module | blocked, "no arena precision closes it" |
+
+Every one of those is TRUE. B109's invalid module is real and reproducible. What none of them
+asked is whether some OTHER column already recorded the fact the collapse destroyed — and one
+did, in the same file, used by a function 2,000 lines away for the same purpose.
+
+`variantRowOfTy` now has its second caller. It was written in B105 and called callerless
+through B106, B107, B109, B131 and B133.
+
+### The lesson, stated once
+
+Three times this programme concluded "the spelling is the only carrier" and three times a
+column existed that carried it too — `canonTyIxOf` for the softened family (B142–B144),
+`annUnionAtomsOf` here. Both had one consumer. **A fact with one consumer is invisible to a
+survey that reads call sites**, which is how this log kept concluding that information was
+destroyed when it had merely been written down somewhere unfashionable.
+
+The remaining bucket-1 declines — B123's ref-list slot (newtype brand/base) and B133's array
+rung (type-parameter binding) — have NOT been re-tested against this receipt. They are the next
+work, and the prior is now that the receipt exists until proven otherwise.
