@@ -46373,3 +46373,93 @@ broad finding or to ignore it.
 * **A recorded refutation deserves a re-measurement, not a ruling.** #1120's warning was correct
   about its site and wrong about this one; deferring to it would have declined a sound conversion,
   and ignoring it would have shipped an unmeasured one.
+
+## B71 — the conversion was WRONG, and the corpus could not have told me
+
+Review found a real defect in B69's conversion, the tenth in this programme's run of
+reviewer-caught defects. It is worth reading beside B70, because B70 measured 0 disagreements
+and B70 was right about its own measurement — the population was the thing that was wrong.
+
+### THE DEFECT
+
+`tyBearsNull` scanned only a `TyUnion`'s DIRECT members for a `TyPrim` named `"null"`. The name
+it replaces is built by `collectRetAtoms`, which RECURSES through both `TyUnion` and `TyNullable`
+and pushes `"null"` for every nullable it passes. So the two are not the same question wherever
+the null sits below a direct member.
+
+The arena genuinely keeps that nesting — `annUnionInnerTy` flattens members only when EVERY member
+is a litunion — and the checker already says so one file over: *"kept NESTED in the arena …
+`tyToStr` flattens it for display, the entry does not."*
+
+Three lines, no alias needed:
+
+```vl
+function gp(x: i32 | (string | null), c: boolean) {
+  if c { return x } else { return x }
+}
+```
+
+Arena: `TyUnion[i32, TyNullable(string)]`. Recorded name: `i32|string|null`. Arena leg says NOT
+null-bearing; name leg says null-bearing. The consumer is the function-end padding, and the two
+builds emit different bytes for it.
+
+### WHY 1,449 LIVE ROWS AND 0 DISAGREEMENTS WAS STILL A TRUE ANSWER TO THE WRONG QUESTION
+
+`tests/cases` carries 128 nullable-alias declarations and **not one union alias with a
+nullable-alias member**, nor a single inline `A | (B | null)` return. The shape is absent. B70's
+instrument is sound and its number is correct; it was computed over a population that could not
+contain the disagreement. That is this repo's own standing note — *agreement rate is not evidence
+unless the corpus could contain the disagreement* — and B70 walked into it while congratulating
+itself on a sharper instrument.
+
+**So the liveness fix in B70 was necessary and not sufficient.** The full question is three
+questions, and B70 answered two:
+
+1. is the site LIVE? — constant-forcing pair
+2. do the columns DISAGREE where it runs? — disagreement indicator
+3. **could this population contain a disagreement at all?** — a census of the shape, or a
+   fixture that manufactures it
+
+Question 3 has no instrument in this programme's recipe. It is the one that catches this class,
+and it is cheap: ask what shape would disagree, then grep the corpus for that shape BEFORE
+reading the 0.
+
+### THE FIX, AND A SECOND SITE IT REPAIRS
+
+`tyBearsNull` now mirrors `collectRetAtoms`'s walk: descend through UNION and NULLABLE members,
+stop at a `TyArray` / `TyObj` leaf exactly as that walk does, so a nullable FIELD or ELEMENT still
+does not make the union null-bearing. That also repairs the PRE-EXISTING annotated call site
+`if retUnionFlag(r) == 1 { return nodeTyBearsNull(r) }`, wrong today for `: i32 | (string | null)`
+and reached without any of this slice's changes.
+
+`tests/cases/inference/inferred-return-nested-null-union.vl` is the population fix — the three
+spellings (inline parens, alias member, nullable-LIST alias member) that the corpus lacked.
+
+### AND THE FALLBACK IS NOT A LEG
+
+B69's comment presented `return unionSetHasNull(im)` as the fallback half of a two-leg site. It
+never answers: `isValueUnionName(im)` is true only if a row exists, and every `recordInferRet`
+call that keys a row by a FUNCTION NAME passes a real `er` (the seven in `elaborateInferRets` all
+gate on `er >= 0 && er != TY_VOID && er != TY_ERR`; the eighth keys `"#" + nodeIx`). So `irTy >= 0`
+always holds. The line stays as a total-function guard and the comment now says so. **B69's own
+two-direction measurement should have caught this** — a leg that never answers is exactly what
+"sabotage it and nothing moves" means, and I read that as the arm being unreachable instead.
+
+### A DEFECT LEFT UNFIXED, FILED
+
+The checker's TOTALITY gate is a separate non-recursive reader of the same shape:
+`function ga(c: boolean): U { if c { return 5 } }` with `type U = i32 | N`, `type N = string | null`
+is REJECTED — *"annotate the return type `| null` to fall through"* — advice already satisfied one
+level in. The flat spelling `i32 | string | null` is accepted; the two denote the same type.
+`tests/cases/soundness/xfail-miscompile-totality-gate-blind-to-nested-null.vl`, with the flat
+control. Not fixed here: it changes which programs are ACCEPTED, which is a language-behaviour
+change and not part of a destringify slice.
+
+### METHOD NOTES
+
+* **Census the population before reading a 0.** Name the shape that would disagree, then grep
+  the corpus for it. A 0 over a population that cannot contain the shape is not evidence.
+* **A conversion between two encodings is only sound if the two WALKS match.** Compare the
+  producer of the thing being replaced — here `collectRetAtoms` — not just the values it produced.
+* **Manufacture the missing shape as a fixture.** The corpus is a population you can extend, and
+  extending it is cheaper than any instrument.
