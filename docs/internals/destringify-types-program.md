@@ -50089,3 +50089,47 @@ about the emitter's shape, and it belongs to whoever owns that shape.
 
 Recorded as a correction rather than an edit, because the wrong claim shipped in #1625 and the
 log's value depends on its errors being visible.
+
+## B135 — the obvious fix for B108 makes it worse, measured
+
+B133 established that B108's false reject surfaces at the array rung but does not live
+there: reading the tree correctly declines `A[]|B[]` as an array, and the program then fails
+at `xs is A[]` with "no union type declared". So the defect is the missing union
+registration.
+
+`emit_collect.registerCollapsedUnionName` exists for exactly this destruction — its header
+describes the same-shape collapse in detail and registers the SPELLING when the resolved type
+is a plain struct. Its guard is `if t is TyObj`. A same-shape ARRAY union collapses to a plain
+`TyArray` instead (the dedup runs on the ELEMENTS, so the arms become identical arrays and the
+union degenerates one level down), so the guard misses it. Extending it to `TyArray` is a
+three-line change and looks like the fix.
+
+**It is not.** Measured:
+
+```
+vl check --codegen   rc 0
+vl run               Invalid input WebAssembly code at offset 197:
+                     type mismatch: expected (ref null $type), found (ref $type)
+```
+
+A loud reject becomes a check-clean invalid module — strictly worse, and the same error
+signature B109 measured when trusting the arena at the variant param rung. Registering the
+spelling restores the CLASSIFICATION but not the BOX: the union's ref-array arms are interned
+by `markRefArrayArms` on the union path, which the collapsed type never takes, so the box's
+nullable ref never exists and the non-null array ref is handed to a consumer expecting it.
+
+Recorded on the fixture as well as here, so a third attempt starts from the measurement
+rather than from the same idea.
+
+### What this says about the programme's boundary
+
+Three separate declines — B107's variant rung, B108's array reject, B123's ref-list slot —
+all reduce to one thing: **the collapse is sound as a type operation and destructive as a
+representation one.** B109 named that split; B135 is the first attempt to repair it, and it
+fails in the direction B109 predicted, at the same wasm error.
+
+The repair is not "make the arena keep the distinction" (the checker is right to collapse)
+and not "re-label afterwards" (this entry). It is to record the emitter's boxing decision at
+the point the annotation is resolved, so the lowering survives a collapse the type does not.
+That is a change to what the emitter stores, which is the same conclusion B128 reached from
+the opposite direction.
