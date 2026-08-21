@@ -46912,3 +46912,97 @@ unannotated-build-expr.vl`'s f64 leg types only via `monoInferListElem`.
 * **Price the hardening.** Defence-in-depth against an unreachable path is worth something, but not
   arbitrarily much. When a fix costs a kilobyte of binary, ask whether the same money buys more
   somewhere the code actually runs.
+
+## B77 — the top-ranked conversion was a DECLINE, and the corpus already held the proof
+
+A scout pass ranked the remaining convertible sites and put `listElemIsBool`'s annotation rung
+first: an exact arena twin exists, the site is live, the shape looked routine. It is a decline, and
+the fixture that proves it has been in the corpus since the bug it pins was fixed.
+
+### THE MEASUREMENT
+
+A probe emitting BOTH answers at the site, over the whole corpus — 157 reaches with a non-empty
+answer:
+
+| name says | arena says | reaches |
+| --- | --- | --- |
+| `boolean` | `""` | **1** |
+| `""` | `boolean` | 1 |
+| `i32` | `""` | 6 |
+| `T` / `K` | `""` | 6 |
+| `""` | `i32` | 106 |
+
+**The arena is silent on every shape this site was extended to cover**, and answers where the name
+does not on shapes the site does not test. Substituting it makes
+`generics/bool-list-arg-print.vl` print `1 0 1 0 …` where it must print `true false true false …`
+— sixteen assertions, and the fixture fails.
+
+### WHY, AND IT IS WRITTEN AT THE FIXTURE
+
+Inside a MONOMORPHIZED INSTANCE the body is a clone the checker never typed, so `nodeTyIxOf` has
+nothing for the node and the substituted parameter ANNOTATION is the only boolean-ness left. That
+file's header says exactly this — it was written for this gap, when `listElemIsBool` had no param
+arm and printed `boolean[]` generic arguments as `0`/`1`.
+
+Outside a generic the node-type bank answers first and masks it. **So a corpus sweep looks harmless
+until the one generic file runs** — 2,061 files, and the whole result turns on one of them.
+
+### WHAT THIS SAYS ABOUT THE REMAINING SURFACE
+
+This programme's premise is that a type question asked of a rendered name should be asked of the
+type. That premise has a boundary, and this is it: **where the checker never typed the node, the
+name is not a rendering of the type — it is the only surviving record of it.** Monomorphized clones
+are the standing case. A name test there is not a legacy to remove; it is load-bearing, and the
+arena has nothing to say.
+
+Three sites now carry a measured DECLINE for this reason (`nameIsStringArray`'s chain position, the
+f32 rung, and this one), and the count matters: a programme that only records conversions will
+eventually convert one of them.
+
+### METHOD NOTE
+
+* **Rank by cost, then check the top item can be done at all.** The scout's ranking was sound on
+  every axis it measured — twin exists, site live, census non-empty. None of those catch "the arena
+  does not know". Ask what the ARENA's coverage is at the site before ranking the site.
+
+
+## B78 — the map annotation's two halves now read from the same place
+
+`mapAnnShape` decides a map annotation's rep from two halves: the KEY (`nameIsI32KeyedMap(mn)`) and
+the VALUE. The value half has been arena-first-with-a-name-bridge for a while and carries the
+sentence *"an UNCOVERED node (-1) keeps the name bridge, unchanged and in its old position"*. The
+key half was still reading the spelling. **One annotation, two halves, two sources.** The key half
+now takes the same shape as its neighbour.
+
+### MEASURED, INCLUDING THE PART B77 SAID TO MEASURE FIRST
+
+B77's lesson was to ask what the ARENA's coverage is at a site *before* ranking it, because a
+scout can verify twin-exists, site-live and census-non-empty and still be pointed at a decline. So
+this slice probed both candidates the scout ranked 2nd and 3rd in ONE build, emitting only where
+the two spellings disagree:
+
+| site | disagreements | inverted control fires on |
+| --- | --- | --- |
+| `cloRetIsString` (`nameIsString(tyNameOf(fn.fnRet))`) | 0 | **4 files** |
+| `mapAnnShape` key rung | 0 | **100 files** |
+
+The inverted control is what makes those zeros readable — and it also prices the two sites very
+differently. `cloRetIsString` is reached with an annotated callback return on **four** corpus
+files; its interesting shape (a `: "lit"` callback) has a census of ZERO. **That one waits for a
+fixture**, and is not converted here. The map key rung is exercised by 100.
+
+### THE GUARD IS NOT DECORATION
+
+`nodeTyMapKeyIsI32Span` answers FALSE both for "not an i32-keyed map" and for "no type recorded",
+and this feeds a REP selection where the two halves must agree. That is the shape that made #1563
+a compile-time regression at the collect rungs. `nodeTyIxOf(tyIx) >= 0` splits coverage from
+content, and the name answers where the arena has nothing — the same sentence the value half has
+carried all along.
+
+0 corpus rows. Gates all six.
+
+### METHOD NOTE
+
+* **Probe several candidates in one build.** A disagreement probe emitting only on disagreement
+  costs one build and one sweep no matter how many sites it carries, and the inverted control that
+  makes its zeros readable comes in the same pair. Ranking three sites cost two builds total.
