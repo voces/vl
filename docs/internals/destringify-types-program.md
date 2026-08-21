@@ -4770,7 +4770,7 @@ its arithmetic has to be auditable.)
 ### D-ARROWTY — three consumers stop asking a render whether it has an arrow
 
 `annArrowAt(nodeTyName(ix)) >= 0` asks "did the checker type this node as a FUNCTION". The
-renderer had the type. The arena dual is `nodeTyIsFuncTy(ix)` = `T.tys[nodeTyIxOf(ix)] is
+renderer had the type. The arena dual is `nodeTyIsFunc(ix)` = `T.tys[nodeTyIxOf(ix)] is
 TyFunc`, and it is **exact by construction**, which the site comment records: `tyToStr`
 spells a function with `->` and never `=>` and wraps an object in `{…}`; `tyToEmitName`'s
 `TyArray` arm PARENTHESIZES a `TyFunc` element (`(()=>i32)[]`) precisely so the trailing
@@ -4855,8 +4855,8 @@ Both pieces are behaviour-preserving, so neither can have a fails-on-master test
 
 | sabotage | corpus byte | msg files | run-tree lines | files that stop emitting |
 |---|---|---|---|---|
-| S1 `nodeTyIsFuncTy` always FALSE | **10** | 10 | **70** | 10 |
-| S2 `nodeTyIsFuncTy` always TRUE (over-accept) | **28** | 19 | **129** | 25 |
+| S1 `nodeTyIsFunc` always FALSE | **10** | 10 | **70** | 10 |
+| S2 `nodeTyIsFunc` always TRUE (over-accept) | **28** | 19 | **129** | 25 |
 | S3 master records a WRONG ref-list row + flipped nul at `synthParamAnnots` | **0** | 0 | **0** | 0 |
 
 (Each row re-measured on the rebase base; S1/S2 identical to the #1117-base run.)
@@ -44656,3 +44656,100 @@ changed — and none that exercised where its values FLOW. That is the refinemen
 * **The order is: fix the sinks, THEN widen the ladder.** At that point the ladder change becomes
   a strict improvement instead of a net loss. That is the next slice, and it is a rep-plumbing
   slice, not a destringify one — the destringify step is blocked behind it.
+
+## B44 / D-HOFGATE — delete-the-arm is a ONE-DIRECTIONAL probe, and it hid a widening (#1538)
+
+B41 established delete-the-arm as the cheap separator between an INERT conversion and an
+UNREACHED one, and B42 used it. It is a good probe and it is half a probe, in a way neither
+entry noticed:
+
+> **Deleting an arm can only change output where the OLD predicate returned TRUE.** It is
+> structurally blind to every site where the old predicate returned FALSE and the new one
+> returns TRUE — which is the entire WIDENING direction.
+
+So on a conversion that widens, delete-the-arm reports on exactly the population that cannot
+contain the change. I ran it on the mono pass's concrete-HOF gate, got "4 corpus rows move,
+therefore the arm is live on 4 files, therefore the conversion agrees on its whole population",
+and wrote that in a PR body. Two of those three clauses are false.
+
+### 1. WHAT THE PROBE COULD NOT SEE
+
+`feHasClosureParam` asked `annArrowAt(tyNameOf(p.parType)) >= 0` — a TOP-LEVEL arrow scan. A
+union of function types that COLLAPSES to one member leaves a bare `TyFunc` in the arena, while
+`canonEmitTypeNames` keeps the union-atom parens, so the render is `((i32)=>i32)` with its `=>`
+at depth 1. The name scan says no; the arena says yes.
+
+```vl
+function apply(f: ((i32) => i32) | ((i32) => i32), x: i32): i32 { f(x) }
+```
+
+251 bytes before, 270 after: the mono pass now runs on a class where it was skipped entirely —
+a cloned function, an extra functype, an extra `elem` entry, a repointed call site.
+
+### 2. AND THE CORPUS NUMBER WAS THREE DIFFERENT NUMBERS
+
+* the arm is EVALUATED on **99** corpus files;
+* deleting it moves **4** — those are the files where it answered TRUE and that mattered;
+* converting it moves **0**, because the corpus holds exactly ONE instance of the diverging
+  shape and that instance is a byte-frozen `@no-instantiate` pin
+  (`soundness/xfail-miscompile-permuted-object-closure-arms.vl`, whose `FA | FB` over
+  field-permuted records collapses under the 2026-08 ruling).
+
+"Live on 4" understated the evaluated population by 25×. Three statistics, one of which I
+reported as though it were the other two.
+
+### 3. THE MECHANISM I ASSERTED WAS INVERTED
+
+I claimed a declared alias `type F = (i32) => i32` "arrives as `TyUnion[TyFunc]`, so both
+predicates decline". Both in fact ACCEPT: `canonEmitTypeNames` rewrites the `TypeRef`'s spelling
+from `F` to `(i32) => i32` before the emitter reads it, so the arrow is top-level and the name
+scan finds it. The predicates coincide there for the OPPOSITE reason to the one I gave — and
+that same inverted model ("a union arrives, so both decline") is precisely what hid the
+collapsing-union case, where a union arrives and the two predicates SPLIT.
+
+### 4. THE CHANGE ITSELF IS RIGHT, AND IS NOT A REFACTOR
+
+A union of identical function types IS a function type; the name scan missed it through a
+rendering artifact. The widening turns callback specialization ON for that class, and every
+constructed program in it answers correctly — including the two-makers-one-`inner` shape whose
+`monoBakeCallback` duplicate guard was previously UNREACHABLE from this gate and is now
+load-bearing on a path it had never been exercised from. But it changes emitted code, so it
+ships as a fix with a pinned fixture, not as a `refactor(vl):` no-op.
+
+### 5. AND THEN I DID IT AGAIN, ONE LEVEL DOWN
+
+Writing the fixture for the widened class, I produced eleven candidate shapes and reasoned about
+which ones exercised it. **Eight of the eleven move no bytes at all** — a three-arm collapsing
+union, a struct-typed callback param, a capturing lambda, a collapsing union beside a `<T>`
+generic, a struct-returning callback, a nullable collapsing union, a callback reassigned through
+a local, and two makers each declaring a nested `inner` passed as CALL RESULTS. That last shape
+had already been written into the fixture header as its sharpest arm, on the strength of an
+argument about which guard it would newly reach. It reaches nothing.
+
+**A shape that REACHES the gate is not a shape the gate's ANSWER MOVES**, and no amount of
+reasoning about the shape separates the two — only building it both ways and comparing bytes.
+I had just written B44's method note about probe direction and still shipped eight inert arms
+into a fixture whose whole job was to exercise a direction.
+
+Worse, the linter nearly closed the file. `: i32` return annotations are what keep the program in
+the widened set (251 → 270 with them, 251 → 251 without), and the redundant-annotation hint asked
+for exactly those. Removing them to get a green run silently emptied the fixture; the `@hint`
+lines that now excuse them are load-bearing, and the header says so.
+
+### METHOD NOTES
+
+* **Verify a fixture is in the population it claims to pin, by BYTES, before believing its
+  header.** This is the same discipline as B42's build-differential, applied to the fixture
+  rather than to the compiler — and the fixture is where it is easier to skip, because the file
+  passes either way.
+* **A lint hint can empty a fixture.** When a diagnostic asks you to remove an annotation from a
+  test, check whether the annotation is what makes the test discriminate.
+* **Every probe has a direction. Name it before trusting the number.** Delete-the-arm measures
+  the old predicate's TRUE set. A conversion that widens lives entirely outside it. The
+  two-sided instrument is a build that evaluates BOTH predicates at the site and reports
+  disagreement — that is what should have run here, and it is what found this.
+* **"Live on N files" and "N files move when I break it" are different quantities.** The second
+  is a lower bound on the first, and on this site it was 25× low.
+* **This is B43's lesson at one more remove.** There the untested half was the sinks; here it is
+  a direction. Both times the measurement was real, correctly executed, and answered a question
+  adjacent to the one that mattered.
