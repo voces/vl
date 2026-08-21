@@ -52097,3 +52097,38 @@ irrelevant thing. What separated them was not a better type question but a narro
 The nine that remain: 7 need `fieldCodeForMatch` widened further (type parameters, unions), and
 2 are the shadowed-application cases. The interner-progress wall, which this log has cited as
 closed since B170, is not a wall — it was a shared helper.
+
+## B177 — three arms, two inert, one that took six files
+
+B176 opened the `TyObj` bucket by moving the predicate to a MATCH-only coder. Three widenings
+followed, and the liveness probe earned its keep twice.
+
+| arm | A/B | reach | verdict |
+| --- | --- | --- | --- |
+| `TyUnion` -> 16 (box union) | 0 diffs | 9 -> 9 | **INERT** — no remaining file has a union field blocking it |
+| declaration scan for `TyObj` | 0 diffs | 9 -> 9 | **INERT** — the blocked fields are not declared types either |
+| `tyHasStructRowShallow` | 1 benign diff | **9 -> 3** | ships |
+
+Both inert arms were byte-clean and would have read as successes on the A/B alone. The reach
+number is what separated them from the third, and it is the same distinction B174 nearly missed
+from the other direction.
+
+### Why matching field NAMES and ignoring field TYPES is sound here
+
+`isStructOfTy` asks the D0 TYPE column, unset for a whole population of rows (B167). The FIELD
+columns are populated for every row — a row without its fields is not a row — so a shallow
+field-NAME match answers where the type column cannot.
+
+Ignoring the types is sound at THIS site and would not be elsewhere: the test decides only the
+CODE (15 = "a nested struct"), never WHICH row. Two shapes sharing a field-name set but differing
+in a field's type both code 15, so the choice cannot go wrong.
+
+That argument is the kind this log has been wrong about before, so it was tested.
+`structs/twin-fieldnames-nested-application.vl` carries `{v: {v: i32}}` and `{v: {v: string}}` in
+one program and pins their agreement.
+
+**And the first two witnesses were thrown away.** They agreed — and they did not REACH the
+consumer, which makes their agreement worth nothing. The shipped fixture was verified to reach
+the site (its build aborts at the instrumented rung) BEFORE its agreement was believed.
+
+Render path at the site: **32 -> 3**.
