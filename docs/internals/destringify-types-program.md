@@ -45806,3 +45806,36 @@ programme gave it a caller two slices ago.
 * **A predicate whose neighbours warn against its shape is a landmine, not dead code.** The
   danger is not that it runs; it is that the name looks like the default and the next caller
   reaches for it.
+
+## B59 / D-HEADERBODY — a header describes intent; the arms describe behaviour
+
+`emit_classify.letAnnIsUnion` ends in `isUName(lt.tyName) && !nodeTyIsLitUnionAlias(d.letType)` —
+a name test minus an arena test, and an obvious candidate to collapse into the one predicate whose
+header reads as exactly that conjunction:
+
+> A value/struct union box (`i32 | string`, `Cat | Dog`) — inline OR declared … Excluded: a
+> nullable niche (a `TyNullable`, not a `TyUnion`), and a LITERAL union … which reps as an
+> interned atom, not a `{tag, value}` box.
+
+Substituting `nodeTyIsUnionAlias(d.letType)` breaks **six passing tests**, rc 0 → 1.
+
+The header states what the function EXCLUDES and lists no extra inclusions. The BODY has two more
+positive arms after the first: a same-shape-collapsed `TyObj` claimed through
+`annUnionAtomsOf(ix) >= 2`, and a nullable NUMERIC literal union through `nulNumLitUnionBaseName`.
+Both are wider than `isUName`, and the call site needs the narrower set.
+
+**This is the third time in this programme that a doc comment was read instead of the body**, and
+the previous two cost more: B56 concluded "the arena cannot answer f32" from one dead candidate,
+and B57's `else if` widening was argued from a flag's monotonicity rather than the cascade's
+exclusivity. The comment is not the contract. The arms are.
+
+The corpus A/B caught this one immediately — 7 rows, 6 of them rc changes — which is the case
+FOR keeping a full A/B on every slice even when the sabotage separator has become the more
+informative instrument. The separator answers "is this reached"; the A/B answers "did I break
+something", and those are different questions.
+
+### METHOD NOTE
+
+* **Before substituting predicate B for expression A, read every `return true` in B.** A header
+  that enumerates exclusions is not a claim about inclusions, and a predicate assembled from arms
+  accretes them.
