@@ -51655,3 +51655,74 @@ The eight wrong verdicts this log corrected all shared a shape — a decline sta
 of the information ("the arena cannot see it", "no receipt exists", "the name is wider") when it
 was a property of the attempt. This last one is different in kind: the information genuinely is
 not there yet, and the measurement says so with a row count rather than an argument.
+
+## B167 — the last site, measured to its actual cause: an unsound hint, caught by the gate
+
+B166 said the blocker at `structIndexOfTypeName`'s caller was pass ORDERING — "the struct
+table's type column is not populated when this consumer runs". That framing was wrong in two
+ways, and reading the code rather than the symptom fixed both.
+
+**All four D0 recorders write at row creation.** `recordSTyIx` is called by every site that
+pushes an `sNames` row. The column is not unpopulated; it holds -1 because the RESOLVER
+answered -1 at intern time. And `repStructRowByTy` already documents the consequence: "A row
+the D0 sidecar does not cover holds -1 there and never matches a real type, so the caller
+falls through to its name path."
+
+**The earlier scan compared the wrong domain.** B166's `structRowOfShapeTy` used `tySame` over
+`nodeTyIxOf`; `sTyIx` holds what `sTyIxOfName` banks and is matched by INDEX EQUALITY. The "15
+rows failed tySame" reading is void — it measured a domain mismatch, not a structural one.
+
+### Which recorder produces the uncovered rows
+
+Probe: abort at any `recordSTyIx` call whose value is -1, labelled by site; sweep the corpus.
+
+| site | files |
+| --- | ---: |
+| **D — `gaeEnsure`** (`emit_classify:16319`) | **57** |
+| A `#anon`, B annotation-text, C alias-key | **0** |
+
+One site, and a precise reason: `gaeEnsure`'s rows are keyed by a generic APPLICATION name
+(`Box<i32>`). `sTyIxOfName` resolves a DECLARATION through `cUserTypes` and a bare `{...}`
+through the inline fallback; an application is neither.
+
+### The conversion, attempted
+
+The hint mechanism already existed — `sTyIxOfNameTy(nm, tyIx)`, the D-INLINESHAPETY bridge — and
+both real callers hold a type: `internShapeDeepTy(nm, ty)` threads name and type in lockstep,
+and `collectGenAliasShapes` walks `P.nodes` with `nodeTyIxOf(ti)` for its `TypeRef`. Passing it
+through (guarding the walker so a PEELED spelling never hands the array's type to the element's
+row) builds clean and self-compiles.
+
+Corpus A/B: **7 files move**, and one is not a byte move —
+`type-param-shadows-alias-through-constructors.vl` goes rc=0 → rc=1, emitting invalid wasm from
+a check-clean program:
+
+```
+type mismatch: expected (ref null $type), found f64
+```
+
+That is the #1473 signature, and four of the seven are the `type-param-shadows-*` fixtures
+pinned to catch exactly it.
+
+### Why no guard rescues it
+
+The row is keyed by an application NAME, and under type-parameter shadowing that name is not
+scope-unique: two `TypeRef` nodes spelling `Box<i32>` in different scopes carry different types,
+and whichever reaches the recorder first banks its own onto the row they SHARE. A hint is a
+single value on a shared row; the ambiguity is in the key. Narrowing which caller hints, or to
+which types, changes who wins the race — not that there is one.
+
+Measured, not assumed: dropping the lockstep caller's hint entirely and keeping ONLY the guarded
+walker reproduces **all seven diffs, byte for byte, including the invalid wasm**. The hint that
+matters is the one the node walker banks, and there is no version of it that is not a race.
+
+So this site's name path is not a render-then-test the arena could take over. It is the
+resolution of a key the arena cannot disambiguate, and the four pinned fixtures are the corpus
+already knowing that.
+
+### Standing
+
+Twenty-two conversions, 97 PRs, and one site that declines with a reason its own fixtures
+enforce. The decline is now backed by a measurement (57 files, one recorder) and a REFUTATION
+(the conversion built, ran, and produced invalid wasm) rather than by an argument about what the
+arena can see.
