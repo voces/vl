@@ -52831,3 +52831,30 @@ B191 retired, 13 at a render that is produced only to be returned.
 
 **A count of renders is not a count of conversions.** The census that found the 533 is the same
 one that says which two thirds of it are a different question.
+
+## B196 — the second `structIndexOfTypeName` consumer, in three lines
+
+`structIndexOfObjExpr`'s ladder ended the same way B165's did: RENDER the type, hand the string
+to `structIndexOfTypeName`, let it match the render's field set against the table. Inserting
+`structRowOfObjFieldSet` ahead of it is three lines. 0 diffs, and the render below now answers on
+**0 corpus files**.
+
+Both consumers of that classifier are now render-free.
+
+### What the first one cost, and what the second did not
+
+| | first consumer (B165 -> B191) | second (here) |
+| --- | --- | --- |
+| PRs | ~12 | 1 |
+| new readers written | `structRowOfObjFieldSet`, `fieldCodeForMatch`, `anonTySpellable`, six coder arms | none |
+| refuted attempts | 5 | 0 |
+| fixtures added | `twin-fieldnames-nested-application` + 2 xfails | none |
+
+The second consumer needed no new reader, no new fixture, and no measurement beyond the standard
+pair — because the first one had already been made to answer the general question, tightening
+and adversarial witness included.
+
+**That is the argument for finishing a conversion rather than stopping at "mostly".** A reader
+retired at 30 of 32 files is a reader the next caller cannot reuse: the two that remained were
+exactly the cases (an uncoded field, a nested-layout twin) a second caller would also hit. Taking
+them to 0 is what turned the next site from a project into an insertion.
