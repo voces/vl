@@ -52632,3 +52632,42 @@ breaks. That is a coherent piece of work with a known hazard, not a wall.
 **Nothing shipped.** The lenient build, its 0-diff A/B, its 2 -> 0 reach, and the three
 non-reaching witnesses are recorded so the next attempt starts at the tightening rather than at
 the leniency.
+
+## B191 — the render at `structIndexOfTypeName`'s caller: 32 -> 0
+
+B190 found the mechanism and named the work: reproduce the ONE tightening inside
+`shapeFieldTypeCompat`'s leniency, and the lenient matcher becomes an equal of the render rather
+than a looser version of it.
+
+The matcher now does what the render does, in two halves:
+
+- **lenient on an uncoded field** — refute on PROVEN mismatches only, which is the rule the
+  render has always applied and the reason its last two files were still on it
+- **tightened at code 15** by CANONICAL REP — `repCanonId` of the field's TYPE against
+  `repNameCanonId` of the row's own recorded element key, lenient unless both resolve and
+  differ. That is `nestedStructNamesCompat`'s shape, and without it two arms sharing a
+  field-name set but differing in nested layout collide onto the first arm's variant (invalid
+  wasm at the construct; four `nested-*-twin` fixtures pin it).
+
+**0 diffs across 1,947 files. The render path at this consumer answers on 0.**
+
+| | render answered |
+| --- | ---: |
+| B165 (the site as found) | 32 |
+| B168 field-set matcher | 24 |
+| B169–B172 coder arms | 12 |
+| B176–B177 match-only coder | 3 |
+| B178 map field | 2 |
+| **B191** | **0** |
+
+### What made the difference
+
+B190's blanket version had the same 0 diffs and the same 2 -> 0. It was refused because it
+DROPPED a tightening; this one carries it. The two builds are indistinguishable on the corpus and
+differ on a case the corpus does not contain — which is exactly the situation the four
+`nested-*-twin` fixtures were written for, by someone who had already been bitten.
+
+**Reproducing a refusal is where this compiler breaks (B188) — and it is also, sometimes, the
+only way forward.** The difference is whether the refusal is reproduced FAITHFULLY or approximated:
+B171 and B184 approximated one and emitted invalid wasm; this one copies its exact predicate onto
+the arena's own key.
