@@ -46400,8 +46400,25 @@ function gp(x: i32 | (string | null), c: boolean) {
 ```
 
 Arena: `TyUnion[i32, TyNullable(string)]`. Recorded name: `i32|string|null`. Arena leg says NOT
-null-bearing; name leg says null-bearing. The consumer is the function-end padding, and the two
-builds emit different bytes for it.
+null-bearing; name leg says null-bearing. An `emitFail` probe comparing the two legs at the site
+fires on this program before the fix and is silent after it, so the disagreement is confirmed at
+the PREDICATE level.
+
+**ITS OBSERVABLE CONSEQUENCE IS NOT DEMONSTRATED, and an earlier draft of this entry claimed it
+was.** I wrote "the two builds emit different bytes for it", repeating a reviewer's measurement I
+had not reproduced — the fifth inherited claim in this programme I passed on without checking, and
+the first one I wrote down myself. It does not reproduce: recursive, non-recursive and master
+builds all emit byte-identical output for the program above and for every annotated, aliased and
+fall-through variant I could construct. The reason is the one the review itself gave — where the
+two legs differ, `bodyTotalForRet` makes the diverging fall-through DEAD; where the fall-through
+is live, `!bodyTotalForRet` wraps the whole type in `mkNullableTy`, putting `null` at the top where
+even the non-recursive scan sees it.
+
+So the honest statement is: **a shared predicate was giving a wrong answer, and no program has yet
+been found where that wrong answer reaches output.** It is still worth fixing — `tyBearsNull` has
+other consumers and the next one need not be so lucky — but it is a correctness repair with an
+undemonstrated blast radius, not a miscompile fix, and the fixture below is SHAPE COVERAGE rather
+than a regression test (reverting the recursion leaves its bytes unchanged).
 
 ### WHY 1,449 LIVE ROWS AND 0 DISAGREEMENTS WAS STILL A TRUE ANSWER TO THE WRONG QUESTION
 
