@@ -49450,3 +49450,43 @@ have had the structured accessor all along. That is the single biggest untapped 
 Roughly half of `emit_classify`'s sites are already the lower rung of an arena-first ladder
 and carry measured DO-NOT-DELETE notes; the surveys correctly ranked those out rather than
 proposing to re-litigate them.
+
+## B122 — the map-value question reads the arena, and a render that was never read
+
+Three sites from the B121 survey, the most mechanical of its shortlists.
+
+**`retMapFlag` (6 callers, every map param/return/functype valtype).** The map-value
+lowerability test read `ty.tyName` — the ANNOTATION's spelling — while sitting behind an
+arena gate (`nodeTyIsMap`). `mapNodeValKindLowerable` reaches the value through
+`nodeTyMapValName(tyIx)` instead, so an alias, a softened literal union, or any other
+difference between what was WRITTEN and what was RECORDED cannot change the answer.
+
+Measured: **87** corpus files reach the test, both answers represented (85 true, 2 false),
+**0** disagreements.
+
+**`retIsMapLocal`.** Same swap, and this one was an ordering artifact rather than a
+decision: the UN-ANNOTATED leg eleven lines below has always called
+`mapNodeValKindLowerable(u)`. One function was asking one question two ways. Four files
+reach the annotated leg, all agreeing — thin on its own, which is why it rides the same
+predicate `retMapFlag` measured across 87.
+
+**A dead render in `emit_collect`.** `pushFieldRow(false, …, tyNameOf(fnode.fdType))` passes
+the rendered annotation as `tyText`, and the `toVariant == false` branch never reads it —
+only the VARIANT branch has a text column (`uFieldTyText`); the struct side has no
+`sFieldTyText` at all. Every struct field was rendering its annotation and discarding it.
+Verified by reading `pushFieldRow`'s two branches, and `tyNameOf` is a pure field read, so
+deleting the call is safe. Now passes `""`.
+
+### Not fully spelling-free, and the log should say so
+
+`mapNodeValKindLowerable` still ends at `mvValKindOfName`, which tests a NAME. What changed
+is where that name comes from: the ARENA's value type rather than the annotation's spelling.
+That removes the class of bugs this programme keeps finding — softening, alias blindness, a
+spelling that outlived a rewrite — but it is a step, not the destination. Making the value
+classifier structural is the deeper item, and it is queued rather than claimed.
+
+The distinction matters for how these entries should be read. "Reads the arena" and "does no
+string work" are different achievements, and several of the emitter's remaining sites can
+only reach the first while the mv slot layer stays name-keyed.
+
+Corpus A/B 0 of 1947; six gates green.
