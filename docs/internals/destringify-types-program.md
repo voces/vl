@@ -47391,3 +47391,54 @@ is why `tyArrayElemPrimName`'s own header refuses to fold a caller's whitelist i
 * **Count what the conversion actually removes.** Three rungs in one function, and only two lose a
   render; the third loses a compare and keeps the render because a downstream consumer needs the
   string. Reporting all three as "destringified" would overstate it by one.
+
+## B85 — liveness-first, applied as a filter: three candidates screened, one converted
+
+B82 established that a site's *reaches* and its *effect* are different measurements, and that only
+the second licenses a conversion. This entry applies that as the FIRST step rather than the last,
+across the inventory's remaining ranked candidates. It is much cheaper than it sounds — one build
+per site, no conversion written until the site earns one.
+
+| candidate | rung forced off | verdict |
+| --- | --- | --- |
+| `nameIsNulBoolList` in `tyAnnRefListKind` (ranked row 6, "13-file population") | **0 rows** | **inert — not convertible by measurement** |
+| `nameIsString` in `letIsString` (row 5) | 4 rows | live, deferred — see below |
+| `lt.tyName == "f32"` in `letIsF32` | **48 rows** | live — **converted** |
+
+Row 6 is the point of the exercise. It was ranked on a 13-file population and its twin did not yet
+exist, so the slice would have been: write an eight-line predicate, convert, measure 0, ship. **The
+0 would have measured nothing**, exactly as B81's would have. One build answered that before any
+code was written.
+
+### `letIsF32` CONVERTS
+
+`lt.tyName == "f32"` is a raw string equality against an annotation spelling, picking the f32 slot
+(valtype `0x7d`, kind 13). It now asks `nodeTyPrimName`, guarded by coverage — the B78 shape,
+because the predicate answers `""` both for "not an f32" and for "no type recorded" and
+under-answering drops an f32 local into the f64 slot.
+
+| step | result |
+| --- | --- |
+| liveness | **48 rows** |
+| disagreement — arena vs spelling | **0** |
+| control — the same probe INVERTED | fires on **667 files** |
+| conversion vs master | **0 rows** |
+
+667 files is the largest control this programme has run, and it makes the 0 the strongest agreement
+result in the log. The disagreement shape would be an f32 ALIAS, and it cannot arise:
+`canonEmitTypeNames` rewrites a one-member alias to its body in the `TypeRef` itself, so the
+spelling reads `f32` before this ever sees it — the same mechanism B72 measured, and the reason
+this is equal by construction rather than by luck.
+
+### `letIsString` DEFERRED, NOT DECLINED
+
+Live at 4 rows, but its twin `nodeTyWidenedRepName` is WIDER by design — it has a `tyIsLitUnion`
+arm answering `"string"`, and the litunion-annotated-local population is 40 files. That is the
+over-answer direction into a `(ref $aTypeIdx)` slot. Converting it needs the narrow twin
+(`nodeTyPrimName`), not the widened one, and a separate measurement; queued rather than guessed.
+
+### METHOD NOTE
+
+* **Screen by liveness before writing the conversion.** Three candidates, three builds, one
+  conversion. The two that failed the screen would each have cost a twin, a slice and a review to
+  arrive at a number that could not mean anything.
