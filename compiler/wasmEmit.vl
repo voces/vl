@@ -6826,6 +6826,16 @@ function emitMapSetValExpr(
   // CONTEXT, not the global: `emitExprExpect` writes the whole context over the pending
   // seeds, so a global written after `expCtxHere()` is overwritten by the snapshot.
   if mvValIsMap(mslot) { svCtx.mapSlot = mvInnerMapShape(mslot) }
+  // A literal-union ATOM stored into a STRING-valued map widens to its member string. The vals
+  // element is `(ref null $aTypeIdx)` and the atom's rep is an i32 id, so without this the store
+  // was `expected (ref null $type), found i32` — check-clean invalid wasm.
+  //
+  // Placed after every seed and gated on `!atomVal`, because an ATOM-VALUED map (`{[string]: K}`)
+  // wants the id stored raw and set `svCtx.litUnion` above to say so. The two are the same value
+  // going to slots with different reps, and only the string-valued one converts.
+  if !atomVal {
+    if exprIsLitAtom(valIx, fnIx) { return emitStrValue(body, valIx, fnIx) }
+  }
   emitExprExpect(body, valIx, fnIx, svCtx)
 }
 
@@ -11902,6 +11912,14 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         nluCtx.litUnion = 1
         nluCtx.nulLitUnion = true
         if emitExprExpect(body, a.binRight, fnIx, nluCtx) < 0 { return -1 }
+      } else if exprIsLitAtom(a.binRight, fnIx) {
+        // A literal-union ATOM stored into a string-backed list element widens to its member
+        // string. Reached only after the atom-ELEMENT arms above have declined, so the list is
+        // genuinely string-backed (`string[]` or the `(string | null)[]` niche, both of which
+        // hold `(ref null $aTypeIdx)`) and the atom's i32 id cannot go in raw.
+        //
+        // The READ side of this position already widened; only the STORE did not.
+        if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
       } else {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
       }
@@ -12054,6 +12072,16 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       } else if fscode == 3 && exprIsLitAtom(a.binRight, fnIx) {
         // A literal-union atom assigned to a `string` field (code 3) widens to its member string.
         if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
+      } else if fscode == 20 && exprIsLitAtom(a.binRight, fnIx) {
+        // The `string | null` field takes the SAME widen: its slot is that same string reference
+        // with a null permitted, and a widened member string is non-null. A `null` RHS is not a
+        // lit atom and still takes the `nulString`-seeded arm below.
+        //
+        // The CONSTRUCT half of this pair was closed earlier (`emitObj`'s code-20 arm); the
+        // ASSIGN was not, so the fix moved the failure from one to the other rather than closing
+        // it. `emitObj` and `emitAssign` are the two halves of every field code and have to be
+        // checked together.
+        if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
       } else if sFieldIsLitUnion(si, fieldIdx) {
         // A literal-union atom field assign (`b.kind = "a"`): the member RHS lowers as its atom id.
         const wluCtx = expCtxHere()
