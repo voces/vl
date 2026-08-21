@@ -45144,3 +45144,35 @@ controls.
 * **A one-word fix that measures zero is a hypothesis, not a fix.** Three sibling arms landing
   successfully is exactly the situation in which the fourth's inert result is easiest to
   rationalize away.
+
+### ADDENDUM — the inert measurement meant "this code never runs here", and the census was too coarse
+
+Review corrected two things, and both are failures of the same kind: I described a boundary I
+had not looked at.
+
+**The if-expression site was 60 lines away, not unidentified.** I wrote that the join kind "is
+neither `str` nor `nulstr` and the deciding site has not been identified". The slot kind IS
+`nulstr` — and a binding-init if-expression never reaches the if-ARM join at all.
+`emitLetDeclStmt` routes it early into `emitNulArmToLocal`, whose `rep == 1` branch emits each
+arm under a `nulString` expectation and passes a non-null value through untouched. An ATOM is
+the one non-null value that cannot pass through untouched. **An inert result usually means the
+code never runs there**, and that is the first hypothesis to test — not the last. One line, and
+a pinned xfail became a passing fixture.
+
+**"Assignment already works" was true of a simple LOCAL and of nothing else.** A `b.v = r.f`
+into a nullable-string FIELD, an `xs[0] = r.f` into a list element and an `m["k"] = r.f` into a
+map value are all still broken — and the code-20 arm written for the field CONSTRUCT does not
+cover the field ASSIGN, so that fix moved the failure rather than closing it. The census counted
+six POSITIONS and treated "assign" as one; it is at least four, and only the easiest was tested.
+Pinned as `xfail-miscompile-litunion-atom-nullable-assign-targets.vl`.
+
+**And the two controls asserted nothing.** One printed the same string on both branches of its
+own `if`, so it could only ever catch invalid wasm, never a wrong value; the other was a
+function-local plain string literal with no literal union in it at all, standing in for a
+"global initializer" control. Both now assert their value, and the global one is a global.
+
+* **"Position" is not a unit.** A position with a destination — assign, store, push — is as many
+  cases as it has destination SHAPES, and the census must enumerate those, not the syntax.
+* **A control must be able to fail for the reason it is a control.** Two here could only detect
+  invalid wasm. Print the value, and check the control exercises the mechanism it is controlling
+  for.

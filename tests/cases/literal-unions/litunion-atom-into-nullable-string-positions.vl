@@ -3,20 +3,29 @@
 // @log kb
 // @log kb
 // @log none
-// @log null-ok
-// @log plain
+// @log kb
+// @log kb
+// @log ka
 // THREE MORE POSITIONS where a literal-union atom reaches a NULLABLE string slot. Each lowered
 // the raw i32 atom id into a `(ref null $type)` and was check-clean invalid wasm:
 //
-//   const s: string | null = r.f        a LET with a nullable-string annotation
-//   take(r.f)  where take(s: string|null)   a CALL ARGUMENT
-//   const b: Box = { v: r.f }           a FIELD store (code 20)
+//   const s: string | null = r.f              a LET with a nullable-string annotation
+//   take(r.f)  where take(s: string|null)     a CALL ARGUMENT
+//   const b: Box = { v: r.f }                 a FIELD CONSTRUCT (code 20)
+//   const s: string | null = if b { r.f } …   an if-expression BINDING INIT
 //
-// THE POSITIONS WERE MEASURED, NOT DEDUCED. Six nullable positions were built and run before any
-// of them was touched: these three failed, and an ASSIGNMENT to a `string | null` binding and a
-// GLOBAL initializer already worked. Reading the code would not have predicted the split — the
-// two that work reach the widen by routes the three broken ones do not — and the two working
-// ones are pinned here as controls precisely because they are the surprise.
+// THE POSITIONS WERE MEASURED, NOT DEDUCED, and the census was still too coarse the first time.
+// Six were built and run before anything was touched: four failed, while an ASSIGNMENT to a
+// `string | null` LOCAL and a GLOBAL initializer already worked. Reading the code would not have
+// predicted that split, and the two that work are controls here because they are the surprise.
+//
+// "ASSIGNMENT ALREADY WORKS" IS TRUE ONLY OF A SIMPLE LOCAL, which is what makes the coarse
+// census worth recording. A `b.v = r.f` into a `string | null` FIELD, an `xs[0] = r.f` into a
+// nullable-string list and an `m["k"] = r.f` into a map value are all still broken, on both
+// sides of this change — the code-20 arm below covers the object-literal CONSTRUCT and not the
+// assign. Those are pinned separately as
+// `tests/cases/soundness/xfail-miscompile-litunion-atom-nullable-assign-targets.vl`; naming the
+// destination shape is the part the first census got wrong.
 //
 // THE NON-NULLABLE LET NEEDS NO ARM, for a reason worth recording: `collectLocals` classifies
 // `const s: string = <atom>` as an ATOM SLOT (`letInitIsLitAtom` fires ahead of `letIsString`),
@@ -25,15 +34,22 @@
 // `letIsNulString` rather than on "the annotation is stringy" — the stringy non-nullable case is
 // not a narrower version of this one, it is a different mechanism.
 //
-// A FOURTH POSITION IS STILL OPEN and is pinned separately: an ATOM ARM of an if-expression
-// joining into `string | null`
-// (`tests/cases/soundness/xfail-miscompile-litunion-atom-if-arm-nullable-join.vl`). The obvious
-// one-word fix — admitting the `nulstr` join kind beside `str` at the if-arm widen — was written
-// and measured INERT (0 corpus rows, 0 of the constructed shapes) and dropped rather than
-// shipped, so the join kind for that shape is something else and the site is unidentified.
+// THE IF-EXPRESSION ARM took two attempts and the first one taught the lesson. Admitting a
+// `nulstr` join kind beside `str` at the if-ARM widen measured INERT — 0 corpus rows, 0
+// constructed shapes — and the reason is that a binding-init if-expression never reaches that
+// join at all: `emitLetDeclStmt` routes it early into `emitNulArmToLocal`, whose `rep == 1`
+// branch emits each arm under a `nulString` expectation and passed a non-null value through
+// untouched. An ATOM is the one non-null value that cannot pass through untouched. So the inert
+// measurement was not "the kind is exotic", it was "this code never runs here" — which is what
+// an inert result usually means and what it should have been read as.
 type K = "ka" | "kb"
 type R = { f: K }
 type Box = { v: string | null }
+
+const gR: R = { f: "ka" }
+// A GLOBAL initialized from an atom — the second already-working control, and a global rather
+// than the function-local a plain string literal would have made it.
+const gAtom: string | null = gR.f
 
 function take(s: string | null) {
   if s != null { print(s) } else { print("none") }
@@ -52,11 +68,16 @@ function main() {
 
   take(null)
 
+  const j: string | null = if r.f == "kb" { r.f } else { "z" }
+  if j != null { print(j) }
+
   // The two positions that ALREADY worked — controls, and the reason the set was measured.
+  // Each asserts its VALUE: a control that prints the same string on both branches can only
+  // ever catch invalid wasm, never a wrong answer, which is what the first draft of this file
+  // did.
   let a: string | null = null
   a = r.f
-  if a == null { print("null-ok") } else { print("null-ok") }
-  const p: string | null = "plain"
-  if p != null { print(p) }
+  if a != null { print(a) } else { print("assign-LOST") }
+  if gAtom != null { print(gAtom) } else { print("global-LOST") }
 }
 main()
