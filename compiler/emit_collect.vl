@@ -74,7 +74,6 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyIsI32,
   nodeTyMapKeyIsI32Span,
-  nodeTyName,
   nodeTyPrimName,
   nodeTyReachesClosure,
   tyArrayElemPrimName,
@@ -488,6 +487,7 @@ import {
   setNarrowFromCondElse,
   shapeFieldElemName,
   shapeSetIxReset,
+  sigKeyOfTy,
   sioMemoReset,
   stmtIsPushKind,
   stmtIsTailValue,
@@ -692,18 +692,76 @@ function internCloSigOfAtom(atom: string) {
 // when its RESULT is a nested closure (the shared fat-pointer, always valid) or a plain
 // numeric/boolean SCALAR — `cloResultIsPlainScalar`, whose header carries the reason a
 // composite result must stay a clean REJECT instead.
-function internCloResultChain(tn: string) { internCloResultSpine(tn, false) }
-// THE ONE HOME of the closure RESULT-SPINE walk. `internCloResultChain` (the CHECKER-type
-// entry, off a closure-returning lambda's `nodeTyName`) and `internNulCloResultSpine` (the
-// nulclosure-ANNOTATION entry, off the annotation's `| null` inner) were the SAME loop with
-// the SAME guard, the SAME `unionArmSigKey`/`cloSigPosOfKey` intern and the SAME
-// descend-only-through-a-closure-result rule; they differed in ONE disjunct.
+// THE CHECKER ENTRY, walked on the TYPE. Its caller had `nodeTyName(fnStmts[fe])` — a RENDER —
+// and the spine below then recovered the structure by slicing that string apart again:
+// `annRetNameOf` is "the `annArrowAt`-then-slice", one level per iteration. The arena holds that
+// descent directly as `TyFunc.fnRet`.
 //
-// `wideShape` is that disjunct: the ANNOTATION entry also interns a level whose result is a
+// The intern KEY is not re-derived either: `sigKeyOfTy` is `annSigKey`'s type-taking twin and
+// already live at three call sites, so each level's key comes off the type rather than off a
+// name cut from the render.
+//
+// `cloResultIsPlainScalar` is copied by PARTITION (B193), not by intent: it is exactly
+// i32/boolean/f64/f32/i64 — NOT string, which a paraphrase of "plain scalar" would have let in
+// and which would have interned a level this walk has always refused.
+function internCloResultChainTy(ty: i32) { internCloResultSpineTy(ty) }
+
+function internCloResultSpineTy(ty: i32) {
+  if ty < 0 { return 0 }
+  let curTy = ty
+  let guard = 0
+  while guard < 64 {
+    guard = guard + 1
+    const ct = T.tys[curTy]
+    if !(ct is TyFunc) { return 0 }
+    const retTy = ct.fnRet
+    if retTy < 0 { return 0 }
+    const rt = T.tys[retTy]
+    let retIsClosure = false
+    if rt is TyFunc { retIsClosure = true }
+    let takes = retIsClosure
+    if !takes {
+      if rt is TyPrim {
+        const rp = rt.primName
+        if (
+          rp == "i32" ||
+          rp == "boolean" ||
+          rp == "f64" ||
+          rp == "f32" ||
+          rp == "i64"
+        ) {
+          takes = true
+        }
+      }
+    }
+    if takes { internCloSigKey(sigKeyOfTy(curTy), -1) }
+    if !retIsClosure { return 0 }
+    curTy = retTy
+  }
+  0
+}
+
+// THE ONE HOME of the closure RESULT-SPINE walk on a NAME — now with ONE caller, the
+// nulclosure-ANNOTATION entry (`internNulCloResultSpine`, off the annotation's `| null` inner).
+//
+// The CHECKER-type entry that used to share it walks the ARENA instead (`internCloResultSpineTy`
+// above). The two entries were the SAME loop with the SAME guard, the SAME
+// `unionArmSigKey`/`cloSigPosOfKey` intern and the SAME descend-only-through-a-closure-result
+// rule, differing in ONE disjunct — but they never had the same INPUT, and that is why only one
+// of them moved. This one is fed an author's SPELLING, where a litunion alias is written and
+// preserved. The checker entry was fed a `nodeTyName` RENDER, which print-widens that alias to
+// `string`: measured in lockstep over the corpus, it keyed `S>i` for a callee that interns
+// `i>i` (`literal-unions/fn-value-litunion-arg.vl`, whose header names that exact softening as
+// the bug the other three `$fnsig` producers were already fixed for). A missing key is not
+// loud — `wasmEmit`'s `call_ref` falls back to `fnSigIdxForArity`, the arity-only functype —
+// so the render fed this seeder a key nothing would ever look up.
+//
+// `wideShape` is the disjunct: the ANNOTATION entry also interns a level whose result is a
 // single-shape STRUCT (`>sN;` round-trips through a chained value call — the struct is a
 // plain ref read off the `call_ref` result, and `unionArmSigKey` keys "" for a shape that
-// never interned, so that level stays a clean reject). The CHECKER entry does not, and the
-// difference is load-bearing rather than incidental — sabotage S4 measures it.
+// never interned, so that level stays a clean reject). The checker entry did not, and the
+// difference is load-bearing rather than incidental — sabotage S4 measures it. The arena twin
+// therefore carries NO `wideShape` leg: nothing would exercise it.
 function internCloResultSpine(tn: string, wideShape: boolean) {
   if tn == "" { return 0 }
   let cur = normTypeAtom(tn)
@@ -822,7 +880,7 @@ export function collectCloSigs() {
     // reads) and synthesize each result closure's `$fnsig` from its key (rep -1). Recurses
     // through arbitrary nesting; idempotent via `cloSigPosOfKey`.
     if cloRetValKind(fe) == "closure" {
-      internCloResultChain(nodeTyName(fnStmts[fe]))
+      internCloResultChainTy(nodeTyIxOf(fnStmts[fe]))
     }
     fe = fe + 1
   }
