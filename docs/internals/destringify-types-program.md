@@ -45364,3 +45364,93 @@ neither the push sink's atom arm nor its reservation predicate and controlled fo
 * **When a fix spans two walkers, the fixture needs an arm per WALKER, not per position.** The
   `let` and tail arms look like two positions and are two dispatchers; only the second catches a
   missing statement-level arm.
+
+## B51 / D-ASSIGN — four targets, one cause, and the error text said so before any code was written
+
+The four assignment destinations pinned during B48 are closed. The slice is short; what is worth
+keeping is that B50's method note was applied BEFORE writing anything and it paid immediately.
+
+| destination | error |
+| --- | --- |
+| `b.v = r.f` — a `string \| null` FIELD | `expected (ref null $type), found i32` |
+| `xs[0] = r.f` — a `string[]` ELEMENT | same |
+| `ns[0] = r.f` — a `(string \| null)[]` ELEMENT | same |
+| `m["k"] = r.f` — a STRING-VALUED MAP | same |
+
+All four **ref-vs-i32**: the value was never converted. The array-literal defect closed
+immediately before read `expected (ref $type), found (ref $type)` — **ref-vs-ref**, the value WAS
+converted and put in the wrong container — and needed two fixes for two causes. Reading which
+types the error names is what said "one slice, four arms" instead of "find the second cause".
+
+### THE CONSTRUCT/ASSIGN PAIR
+
+The field CONSTRUCT (`{ v: r.f }`, code 20) was closed in B48. The field ASSIGN was not, so that
+fix **moved the failure from one to the other** rather than closing it — which is what the
+reviewer found and what the B48 addendum recorded as "position is not a unit".
+
+`emitObj` and `emitAssign` are the two halves of every field code. A fixture exercising only
+construction passes while assignment is broken, and vice versa.
+
+### THE SHARP CONTROL
+
+An ATOM-VALUED map (`{[string]: K}`) must store the id **raw**. It is the same value reaching a
+slot with a different rep, and widening both would have swapped this defect for its mirror image
+— so the map arm is gated on `!atomVal`, the flag the caller already sets to say which rep the
+slot wants. Three more controls (plain-string RHS into a list and a map, and an atom into a plain
+`string` field) pin that nothing else moved.
+
+Corpus: 1 row, the xfail flipping to `@run`.
+
+### A CORRECTION TO B48's CENSUS
+
+B48 recorded `m["k"] = r.f` as broken on the strength of a test written with `{}` instead of
+`Map()` — which is a checker error about object literals, not the defect. The conclusion was
+right and the evidence was not. **A test that fails for the wrong reason is not evidence**, and
+the way to catch it is to read the failure rather than the exit code — the same discipline as
+reading the error's types.
+
+### METHOD NOTES
+
+* **Read which TYPES the error names before deciding how many defects you have.** ref-vs-i32 and
+  ref-vs-ref are different diagnoses in the same sentence shape. This slice cost four arms; the
+  previous one cost two fixes and a pin because the same question was asked afterwards.
+* **A construct arm and an assign arm are one change.** Every field code has both.
+
+### ADDENDUM — "four destinations" was seven, and the two missing ones were 100 lines up
+
+Review found the census short again, and this time inside the very function that was edited.
+**`emitAssign` has THREE `target is Member` branches**, not one: a plain-struct receiver, a
+NARROWED-union receiver (`if t is A { t.s = … }`), and a VARIANT-TYPED-PARAM receiver
+(`function put(o: A) { o.s = … }`). The fix edited the first. The other two share
+`emitScalarFieldStoreVal`, which handled the scalar codes 17/23/24 and fell through to a bare
+`emitExpr` for the string codes — so both stored the raw id into a reference slot.
+
+And for a variant receiver the CONSTRUCT half was broken too. So the entry above — "a construct
+arm and an assign arm are one change, every field code has both" — was written from a fix applied
+to ONE of three receiver shapes, while a shape existed with NEITHER half working.
+
+**The enumeration is where four of the last five slices went wrong**, each in a different
+disguise: predicates instead of the question (B49), positions instead of destination shapes
+(B48), the expression walker instead of both walkers (B50), and now one receiver branch instead
+of three. The generalisable form is that the unit of enumeration is never the one that first
+comes to mind, and the cheap check is to read the enclosing dispatch to its end before believing
+a count.
+
+**And the map arm shipped without its reservation — the fourth consecutive time.**
+`assignWidensAtomToStr` gates on `exprString(binLeft)`, whose `Index` arm asks
+`exprStringArray(idxArr)` and declines for a map receiver, so `fnUsesStrOp` stayed false.
+`fbBeginFunc` assigns `strScratchBase = fbScratchCur` unconditionally BEFORE the reservation, so
+with no frame the base aliases `mapScratchBase` and the widen wrote `mapScratchBase + 3` — the
+map probe's `slot`. It was dead only because `emitMapSetV` evaluates the value before
+`emitMapProbe` overwrites that slot.
+
+That is worth stating precisely: **a latent scan/emit disagreement held safe by an evaluation
+order is not a safe scan/emit agreement.** It is fixed rather than noted, and the fixture cannot
+pin it — the behaviour was already correct — so the fix is preventive and says so.
+
+### METHOD NOTES
+
+* **Read the enclosing dispatch to its end before believing a census.** Three `target is Member`
+  branches, one edited, and the other two were a screen away in the same function.
+* **"Benign by evaluation order" is a defect, not a non-defect.** The write was real, the slot
+  was aliased, and the only thing making it safe was that someone else overwrote it first.
