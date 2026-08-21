@@ -50133,3 +50133,43 @@ and not "re-label afterwards" (this entry). It is to record the emitter's boxing
 the point the annotation is resolved, so the lowering survives a collapse the type does not.
 That is a change to what the emitter stores, which is the same conclusion B128 reached from
 the opposite direction.
+
+## B136 — the param ladder's last remainder dissolved itself
+
+#1607 converted the union rung to `nodeTyIsUnionish` and kept a spelling read for a measured
+two-file remainder: `Cat | Dog` and `A | B`, the same-shape unions the arena collapses.
+#1610 moved that read from the registry to the parser's spelling tree. Both entries described
+it as the boundary no arena precision closes.
+
+It is gone, and nothing was done to this rung to remove it.
+
+**#1608 put the STRUCT rung above on the arena.** A same-shape union collapses to a `TyObj`,
+so `nodeTyIsStructish` now claims both files before the union rung is reached. Measured:
+`annSpelledUnion` answers TRUE on **zero** corpus files, and deleting it outright leaves both
+fixtures running correctly (`cat dog`, `1 1`) with **0 of 1947** rows moved.
+
+The rung is now `if !nodeTyIsUnionish(p.parType)` — no registry, no spelling, no tree. The
+helper and its `TS_UNION` / `tsKind` imports are deleted.
+
+That makes **four** rungs in this one ladder that dissolved from upstream rather than
+yielding to direct attack:
+
+| rung | dissolved by |
+| --- | --- |
+| `nameIsArray`'s double duty | the union rung reading the type (#1607) |
+| `variantIndexOf` | the struct rung reading the type (#1608) |
+| the scalar rungs' litunion case | stating the lowering once from the arena (#1605) |
+| `isUName`'s two-file remainder | the struct rung reading the type (#1608) |
+
+### The pattern, now with four instances
+
+A cascade's rungs are not independent, and a remainder measured at one rung may belong to a
+rung above it. Three times this programme recorded a boundary — "the spelling is the only
+carrier here" — that a later, unrelated conversion made vacuous. Each of those records was
+TRUE when written and measured correctly; what changed was which rung the case reached.
+
+The practical consequence is a habit worth keeping: **after converting any rung in a cascade,
+re-measure the rungs below it before trusting their recorded declines.** The declines are
+snapshots of a control flow that the conversion just changed. B133's array rung and B131's
+variant lets are the two remaining declines in this ladder's neighbourhood that have not been
+re-measured since #1608, and they are the obvious next check rather than any new site.
