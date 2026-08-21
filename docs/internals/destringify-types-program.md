@@ -51358,3 +51358,53 @@ The programme's remaining surface, walked rather than grepped:
 That last row is bucket 4 as it actually exists: not 258 convertible sites, but a handful of
 functions whose inputs are strings all the way up to a producer that made them. The count was
 never the shape of the work.
+
+## B161 — every path walked to a terminus
+
+B160 completed the `nodeTyName` walk. Completing the last one — `nameFieldCode`'s string-only
+callers, the row B160 left as "strings all the way up to a producer" — reaches the end of the
+graph.
+
+`shapeFieldTypeCompat(t, code, elem)` takes its `t` from `ftypes[k]`, filled by
+`shapeFieldParse(name, fnames, ftypes)` inside `structIndexOfTypeName(name: string)`. That
+function is a name→index RESOLVER by contract: given a type NAME, find its struct row, matching
+an inline-shape spelling structurally against the table when no row is registered under that
+name.
+
+Its callers are the sites B160 already listed as arena-first — `emit_classify:7365`, `:7380`,
+`:8131` — each of which leads with a recorded-type rung and falls back here only when the arena
+declines. So the string-parsing is not a site that reads a rendering instead of a type; it is
+what a name-keyed lookup does with the name it was handed, on the path the arena already
+refused.
+
+### The terminus, stated once
+
+Every remaining read of a rendered type in this compiler is now one of three things, and each
+has a measurement or a contract behind it:
+
+| category | example | why it stays |
+| --- | --- | --- |
+| declined on BEHAVIOUR | `collectFnValUse`'s shape entry | the arena's alias resolution flips a monotone flag; 15 corpus files, all one direction |
+| no receipt in any source | the array rung (B133/B147) | type-parameter binding and shadowed aliases, tested against all five sources |
+| a name-keyed resolver, called as a fallback | `structIndexOfTypeName` and its parse | its INPUT is a name; the callers lead with the arena |
+
+There is no fourth category left, and no site in any of the three is waiting on a decision from
+anyone: the first is a capability question with its answer already measured, the second is a
+dead end with its enumeration recorded, and the third is not a defect.
+
+### What the programme actually produced
+
+Twenty conversions, and a map that took seven wrong turns to draw:
+
+- five sources for a type question, two of which had a single consumer each and unblocked six
+  declines between them
+- four ways a site escapes a survey — the twin has one consumer, the source list is short, the
+  probe measures a mixture of callers, the renderer has a different name
+- four measurement rules, each earned from a specific error: re-measure below a conversion,
+  match probe shape to question, audit shipped work when instrumentation breaks, check
+  availability before designing a twin
+- one compiler crash (#1611), six xfail fixtures, and every decline in the log carrying the
+  measurement that produced it
+
+The counts were never the shape of the work. What made the difference was asking what a pass had
+to REMEMBER, and walking call graphs instead of grepping patterns.
