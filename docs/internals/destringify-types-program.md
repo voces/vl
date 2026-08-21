@@ -47239,3 +47239,54 @@ carry a consistent verdict. **Four sites, four different right answers.**
 * **Add a liveness control before believing a conversion's clean sweep, not only before believing
   an inert one.** B70 established that for 0-means-unreached. The same control turns a passing
   A/B into a meaningless one.
+
+## B82 — the arm-liveness map, and the one conversion in the family that could be measured
+
+B81 declined `synthRetAnnots`' arm 14 after finding it inert. That raised the obvious question about
+its five siblings, and the answer reprices the whole family the scout ranked first.
+
+**Forcing each remaining arm off in turn, corpus rows moved:**
+
+| arm | name test | rows |
+| --- | --- | --- |
+| 9 | `nameIsStructWithLitUnionField(ctx)` | **0** |
+| 10 | `…nameIsStructWithUnionField(arrElemNameRaw(ctx))` | **0** |
+| **11** | `…nameIsWholeSpanShape(arrElemNameRaw(ctx))` | **5** |
+| 12 | `nameIsStructWithUnionField(ctx)` | **0** |
+| 13 | `nameIsStructWithMapField(ctx)` | **0** |
+| 14 | `nameIsWholeSpanShape(ctx) && nameIsSpaceFree(ctx)` | **0** (B81) |
+
+**Five of six are inert.** Their pins were earned on fuzz seeds — the arms' own comments cite
+`sweep3 multiobs` seeds 784841544 and 369283890 — and no corpus fixture exercises them. A clean A/B
+at any of those five would measure a site with no observable effect, which is exactly the empty
+result B81 refused to ship on.
+
+The scout ranked this family first on an "81-file population". **That counted reaches, not effect.**
+Reaching an arm and being changed by it are different measurements, and only the second licenses a
+conversion.
+
+### ARM 11 CONVERTS
+
+`ctx.length > 2 && nameIsArray(ctx) && nameIsWholeSpanShape(arrElemNameRaw(ctx))` re-derives from
+the render what `recordInferRet` already banked: the row was recorded by `structElemListRetName`,
+and `inferRetRungAt` says so. Three name predicates and two `[]` cuts retire.
+
+**Two disagreements, both narrowings, both measured inert.**
+`closures/closure-array-result-composed-reads.vl` and `closures/lambda-array-result-adopt.vl` arrive
+with `{a:f64,f:K0,z:string}[]` and `{a:f32,f:K0,z:i64}[]` — element structs with a LITUNION-alias
+field, which the name accepts and the rung column does not. **The canon softening, for the fifth
+time and in a fifth shape.**
+
+Both files are byte-identical across the two builds, and so are three CONSTRUCTED witnesses: a
+litunion-field element list with a same-fieldset twin row in scope — the exact shape this arm exists
+to protect — the same without a twin, and a plain-element control.
+
+So: **0 corpus rows at a LIVE arm, with the narrowing exercised on purpose and still invisible.**
+That is as much evidence as this site can produce, and it is strictly more than the other five can.
+
+### METHOD NOTE
+
+* **Rank by EFFECT, not by reaches.** "81 files reach this cascade" ranked six arms as one prize;
+  measuring them individually found five inert and one live. The liveness pair is cheap — one build
+  per arm — and it should run BEFORE a conversion is written, not after, because for five of these
+  six the answer is that no conversion is measurable at all.
