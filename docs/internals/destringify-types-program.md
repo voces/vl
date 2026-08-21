@@ -50953,3 +50953,61 @@ work is a single interface change, applied leaf-ward through the call graph, wit
 byte-checkable (B134). Its cost is the count, not the risk, and the one judgement it needs is
 whether the emitter SHOULD pass nodes — which B129's four questions answer with "for three of
 the four, yes".
+
+## B153 — why bucket 4 exists: field annotations carry no recorded type
+
+B152 left bucket 4 as "~258 classifiers that take a `string` because their callers hold one",
+and implied the first step is threading signatures. Starting that sweep at its most favourable
+site says otherwise.
+
+`fieldTypeCode(tyIx)` calls `fieldCodeOfSpelling(ty.tyName, tyIx)` — the node is passed
+ALREADY, and two arms inside read it (`annRepKindOf(litNode)`,
+`annIsNulLitUnionArray(litNode)`). So `nameIsString(t)` there needs no signature change at all;
+it is the easiest conversion bucket 4 has to offer.
+
+It does not convert. Dual-run against canon's banked type and the arena:
+
+```
+86 files:  name=T canon=F  [string]
+86 files:  tyIx=NONE  base=[]
+```
+
+**The arena has no recorded type for these nodes.** Not a collapse, not a rewrite, not a
+disagreement — `nodeTyIxOf` answers -1 on the field annotation node in 86 of 86 sampled files.
+(Checked explicitly rather than inferred: B147 mislabelled a disagreement as silence, so the
+tyIx is now printed instead of assumed.)
+
+### What that reframes
+
+The classifier layer does not take strings because of an interface style. It takes strings
+**because at a field annotation there is nothing else to take.** The node exists, the spelling
+exists, and the type does not — so a classifier reached from there cannot be given a type no
+matter how its signature is written.
+
+That makes bucket 4's first step a CHECKER change, not an emitter one: record types on field
+annotation nodes the way they are recorded on param, let and return annotations. Every
+signature threaded before that would arrive holding -1.
+
+It also explains, retroactively, several things this log noticed without connecting:
+
+- `fieldCodeOfSpelling` reads the node for exactly the two arms that have their own banked
+  columns (`annRepKindOf`, `annIsNulLitUnionArray`) and the name for everything else — that is
+  not inconsistency, it is the only shape available.
+- `internShapeDeepTy(name, root)` takes both and its callers pass `-1` at the nested-field site
+  (B141 fixed one such caller by finding canon's column; the OTHER reason a root is -1 there is
+  this).
+- B128's count of ~258 name-first functions is right, and its diagnosis — "the emitter's
+  internal currency is the rendered name" — is a symptom. The currency is a name because the
+  checker did not mint a type at that position.
+
+### The corrected first step
+
+| step | what it is |
+| --- | --- |
+| 1 | record arena types on field annotation nodes (checker) |
+| 2 | re-measure the field-site classifiers, which then have a type to read |
+| 3 | thread signatures for whatever remains |
+
+Step 1 is a bounded, measurable change with an obvious gate (corpus A/B must stay identical —
+recording a type changes nothing until something reads it). Step 3 is the ~258-function sweep,
+and it is the LAST step, not the first.
