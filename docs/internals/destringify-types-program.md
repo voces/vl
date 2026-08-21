@@ -46606,16 +46606,43 @@ variant both compile and validate.
 its two arms were folded — so `collectA` was writing 29 rows it never read back, the exact state
 the note beside it forbids. The nullable field's flags had been arriving only by accident, from the
 orphaned annotation `TypeRef`. Adding the 29 arm fixes every repro on its own, at 0 corpus rows.
-Both land: the 29 arm is local to the pass whose invariant was violated, the coverage guard covers
-populations no field table sees — including the rungs below.
+Both land, but not for the reason a first draft gave. **The 29 arm has NO pinning witness and no
+pre-existing population**: every nullable-map field in the corpus sits in a STRUCT position, whose
+table already had its 29 arm, and the only union-variant one is the fixture added here. So its 0
+corpus rows means *unreached*, not *redundant* — and the map fixture is green on the guard alone
+AND on the 29 arm alone, pinning the pair rather than either half. That is the same situation
+`maps/i32-keyed-variant-field.vl` already documents for the code-19 pair: sabotage either alone and
+no fixture fails, because the covering row belongs to another pass and not to this table's
+invariant. The 29 arm is kept on that ground — a table must be collectable from its own column —
+and not on a claim that the tests separate the two.
 
-**A SECOND SHIPPED REGRESSION, worse, from #1551 not #1546.** `collectA`'s f64 and i64 rungs took
-`nodeTyArrayElemRepName(i) == "f64"` / `"i64"` in the same conversion family. On an orphan those
-answer `""`, and the `else if` chain carries the node down into `nameIsArray(nd.tyName)` where
-`checkArrName("f64[]")` REJECTS. `type B = { g: f64[] } | f64` fails on master today. This one
-cannot be masked: a module-wide MINTING flag can be set by any other declaration in the file, but a
-CHAIN MIS-ROUTE is about the node itself. Both rungs now carry the name as a coverage fallback.
-(The f32 rung was never converted and needs nothing — #1551 deliberately left it on the name.)
+**FOUR MORE SHIPPED REGRESSIONS, worse, from #1551 not #1546 — and only ONE of them is an orphan.**
+`collectA`'s f64 and i64 rungs took `nodeTyArrayElemRepName(i) == "f64"` / `"i64"` in the same
+conversion family. The chain carries a silent node down into `nameIsArray(nd.tyName)` where
+`checkArrName("f64[]")` REJECTS, so the failure is a MIS-ROUTE rather than an under-mint — and
+nothing can mask it, where a module-wide minting flag can be set by any other declaration in the
+file. All four of these fail on master today:
+
+| shape | why the accessor is silent |
+| --- | --- |
+| `type B = { g: f64[] } \| f64` | orphaned field `TypeRef`, no arena type |
+| `type K = 1.5 \| 2.5` + `const xs: K[]` | **covered**; element is a `TyUnion` of numeric `TyLit`s and `tyIsLitUnion` demands `litKind == "str"` |
+| `type K = 5000000000 \| …` + `const xs: K[]` | same, i64 literals |
+| `type T = f64` + `function at<T>(xs: T[])` | **covered**; element is a `TyParam`, handled nowhere — and scope-blind `canonEmitTypeNames` rewrites `T[]` to `f64[]`, which is what lets the name answer |
+
+**So the fix here is an `||`, not the coverage guard the map rungs take, and the difference is
+load-bearing.** `nodeTyArrayElemRepName` answers only for a `TyPrim` element, so `nodeTyIxOf(i) >= 0`
+is TRUE for three of the four rows above — a coverage guard would route them straight back into the
+silent accessor and fix exactly one. The map rungs can use a guard because `mapKeyRepTy` does answer
+for the nominal keys they see. Two rungs, two accessors, two shapes.
+
+An earlier draft of this entry and of the comment at the site both called the name a "coverage
+fallback, NOT a second opinion". That is backwards, and backwards in the direction that invites the
+next reader to tighten it into the form that re-breaks three of the four. Recorded here because this
+log has now been burned three times by a claim that read well and described something else.
+
+(The f32 rung was never converted and needs nothing — #1551 deliberately left it on the name. The
+rungs below are name-only and cannot suffer arena silence.)
 
 **AND A FENCE CAME DOWN.** CONSTRUCTING the arm — `const v: Box = { g: Map() }` — now emits a
 module that does not validate, where before it failed loudly at emit. The loud error was never a
