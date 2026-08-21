@@ -46018,3 +46018,50 @@ decisions out of the SOURCE, none out of any RUN.
   contact.
 * **The best-looking batch is worth screening first, not converting first.** `nameIsString` had
   the highest site-count-per-twin on the surface and the worst semantics under it.
+
+## B63 / D-KEYEDSPAN — an UNKNOWN resolved by reading, and the width matched rather than widened
+
+B62's screen left nine UNKNOWNs — questions it could not settle without reading further. This
+closes one of them, and the resolution took a single `sed`.
+
+### THE QUESTION
+
+`letI32KeyedMap` runs a name rung ahead of an arena rung:
+
+```vl
+if lt is TypeRef { if nameIsI32KeyedMap(lt.tyName) { return true } }
+if nodeTyMapKeyIsI32(d.letType) { return true }
+```
+
+The screen could not tell whether the name form covers a spelling the arena form misses — and
+noted that if it does, deleting it NARROWS a decision, which is the unsafe direction.
+
+**It does.** `nameIsI32KeyedMap` is `mapSpellKeyName(name) == "i32"`, which cuts the `{[K]:` span
+from ANYWHERE in a spelling, so it answers for `{[i32]: V}[]`. The arena rung beside it peels one
+`| null` hop only. The site's own header says as much — *"`| null` tolerated by the KEY CUT's
+width"* — without saying the width also spans `[]`.
+
+So the answer was not "delete it" and not "swap it for the neighbouring twin". It was **swap it
+for the arena predicate at the SAME width**: `nodeTyMapKeyIsI32Span`, which recurses `TyNullable`
+and `TyArray`.
+
+### AND THE DIRECTION MATTERS HERE IN THE OTHER SENSE
+
+`letI32KeyedMap`'s only consumer is `letMapShapeOf`'s `letIsSet` branch, picking the `-5`
+i32-keyed Set rep over `-2` — a REP SELECTION, where over-answering is the hazard, not the
+minting case where under-answering is. Matching the width rather than widening is what keeps that
+safe.
+
+(Inside `letIsSet` the annotation is a Set, so the array-wrapper case the two widths differ on
+cannot arise at all. The width is matched on principle, not on need — which is the right habit
+when the same predicate pair appears at a minting site next time.)
+
+Corpus 0 rows; the span rung forced false, 0 rows. Another source-level removal, not a run-level
+change. The subsumed exact rung is KEPT rather than deleted, for B56's reason: 0 rows proves
+corpus-unreachable, not dead.
+
+### METHOD NOTE
+
+* **An UNKNOWN is a question, and questions have cheap answers.** The screen flagged this as
+  needing a body read it had not done. The body was four lines. Nine UNKNOWNs are nine specific
+  questions, not nine open problems — and each one answered narrows the surface permanently.
