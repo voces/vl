@@ -45025,3 +45025,64 @@ Corpus: **1 of 2038 rows moves**, the xfail flipping to pass. The family that he
   and printed a success-looking last line from a DIFFERENT stage; the failure was invisible until
   the rc was read. This is the second time in this programme that a gate's exit code was taken
   from the wrong place. Read `$?`, not the last line.
+
+### B47 ADDENDUM — four readers, not two; and the intermediate build was the dangerous one
+
+B47 shipped two of them and called the twin rule satisfied. There are FOUR readers of "is this
+parameter an atom", and review found the miss in the worst possible form.
+
+| reader | channel |
+| --- | --- |
+| `exprIsLitAtom`'s `Param` arm | the callee's direct read |
+| `cParamLitUnion` | the direct caller's argument |
+| **`bindingIsLitAtom`'s `Param` arm** | a CAPTURED read |
+| **`emitCapturedCall`'s `cpLit`** | a captured CALL's argument |
+
+Moving the first two and not the last two produced a **silent wrong answer**:
+
+```vl
+function outer(v: N) { const g = () => { print(v) }  g() }
+```
+
+master rejected it loudly; the intermediate build VALIDATED and printed `0` and `1` — the raw
+interned atom ids. The caller now pushed a real atom while the capture channel still expected a
+string, and nothing in the pipeline objected.
+
+**The intermediate state was strictly worse than either endpoint.** That is the sharpened form of
+the twin rule: a partial move is not "less of the fix", it is a NEW defect, and it can be worse
+than the bug being fixed. The function-value path showed the same thing in a milder key — direct
+call fixed, indirect not, and a load-time rejection became a validating module that trapped at
+runtime.
+
+### THE FIXTURE NOW DISCRIMINATES THREE STATES
+
+| build | result |
+| --- | --- |
+| master | fails to compile |
+| direct-call readers only | compiles, prints `0 2` — WRONG |
+| all four readers | `ka kc kc` |
+
+A fixture covering only the direct call passes while the capture channel is broken, which is why
+the file states its reader count instead of assuming it.
+
+### WHAT WAS NOT SHIPPED
+
+A fifth reader — the `$fnsig` producer chain behind a function-VALUE call — is still on the
+rendered spelling. The projection fix was written (`sigKeyOfTy` falling back through
+`tyLitUnionAliasIx` to the source alias's declared name), measured at **0 corpus rows and 0 of
+the constructed shapes**, and DROPPED. At least one more producer in the chain still keys the
+softened spelling, and the three (`cloParamTok`, `annSigKey`, `sigKeyOfTy`) must stay
+byte-identical, so moving one alone changes nothing. Pinned as
+`xfail-miscompile-narrowed-litunion-fn-value-arg.vl` at the same severity master has.
+
+### METHOD NOTES
+
+* **Count the readers before claiming the pair moved.** "Both sides" assumed there were two
+  sides. The question "who else asks this?" is a grep, and it was not run.
+* **An inert arm does not ship, even when the reasoning is good.** The projection fix looked
+  right and measured at zero. Zero is not a licence.
+* **A lint hint gutted a fixture again, and this time it was proven.** The `@hint`-declared
+  annotation in the fn-value pin is load-bearing: removing it as the linter suggests makes the
+  program WORK, leaving a green file asserting nothing. Second confirmed instance; the check is
+  now routine — when a diagnostic asks to delete something from a test, verify the test still
+  fails without it.
