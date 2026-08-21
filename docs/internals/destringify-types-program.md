@@ -52458,3 +52458,45 @@ answers directly with `isStructOfTy`.
 **Census the remainder before porting.** Every arm in this programme was chosen by reading the
 ladder until this one, and reading would have sent the effort at unions — eight files behind the
 most delicate guard in the function — while eleven sat behind a registry lookup already written.
+
+## B187 — the map gate's union arm, and the guard that was never in the way
+
+B186's census left 15 sites. Censused again before porting:
+
+| remaining map VALUE shape | files |
+| --- | ---: |
+| plain union, 3 members | 4 |
+| plain union, 2 members | 4 |
+| nullable of a union | 3 |
+| nullable of a prim | 2 |
+| nullable of a struct | 1 |
+| nullable of an array | 1 |
+
+**The 8 plain unions never reach the guard that makes unions look hard.** `mvValKindOfName`'s
+-3 producer sits under `unionSetHasNull(valName)`, so a union with no null member falls straight
+to the kind dispatch: a literal union is the i32 ATOM (the early -1), any other multi-member
+union is the shared BOX (kind 2). Both lower.
+
+So the delicate part — the nullable-ref inner, the atom niches, the two -3 shapes — guards
+exactly the 7 files that carry a null, and none of the 8 that do not.
+
+The null test is written EXPLICITLY over the members rather than inferred from the arena's
+shape, because a null member can arrive as `TyNullable` or as the `null` primitive, and either
+one puts the value back under the guard. That is the same distinction that made B172's
+array-element arm right and B171's blanket fall-through wrong.
+
+0 diffs across 1,947 files; the gate answers **85 of 106**, up from 79.
+
+### Two censuses, two arms, one lesson
+
+B186 and B187 were both picked by counting instead of reading, and both times the count pointed
+somewhere the code's shape did not:
+
+| | reading says | census said |
+| --- | --- | --- |
+| B186 | unions are the work | `TyObj` is the biggest bucket (11) |
+| B187 | unions need the -3 guard ported | 8 of them never reach it |
+
+The remaining 21 at this gate are the 7 nullables plus the type-parameter case and whatever the
+struct/array arms still decline — and those DO need the guard, which is the first time in this
+programme that the intricate-looking work is also the actual work.
