@@ -44547,7 +44547,9 @@ function f(v: K): i32 { … }     // builds fine with the arm deleted
 The reason is that **a litunion alias also registers as a union NAME**, so the ladder's `isUName`
 arm accepts it two rungs down. The `nodeTyIsLitUnionAlias` arm is redundant for the aliased form,
 and the INLINE form never arrives — it has already softened to `string`, which the string arm
-accepts. **The arm has no live population at all.**
+accepts. **The arm is never the deciding rung.** (This
+said "has no live population at all", which is the same error in another phrasing — a redundant arm
+can have a perfectly live population and simply never decide anything.)
 
 So converting it is a no-op in the strongest sense: not "inert on this corpus", but "the predicate
 it replaces is never the deciding rung". A measurement of 0 rows there is not evidence of a safe
@@ -46584,11 +46586,14 @@ alias annotation to its body before collect ever runs — verified independently
 printing `tyName` at a different site, which returned the EXPANDED spelling for an alias-annotated
 declaration. There was no alias blindness to fix.
 
-**Why no instrument caught it.** The corpus has exactly one inline-object union arm with a map
-field and its map is string-keyed; the only `{[i32]: V} | null` field is on a DECLARED struct, whose
-`TypeRef` the checker does record. **The population could not contain the disagreement** — B71's
-hole, now for the third time. Forcing the new predicate FALSE was also structurally blind to it,
-since the defect IS the false answer.
+**Why no instrument caught it.** Only the `type X = { … } | …` DECLARATION path orphans — an
+inline annotation, an `is`-pattern and a declared struct's members all record their field nodes.
+The corpus has exactly one orphan-producing union arm with a map field and its map is string-keyed;
+the only `{[i32]: V} | null` field anywhere is on a declared struct. (Under the looser reading
+"union arm with a map field" the corpus has several, including an i32-keyed one in ANNOTATION
+position — which is precisely why the distinction has to be spelled out in a census.) **The
+population could not contain the disagreement** — B71's hole, now for the third time. Forcing the
+new predicate FALSE was also structurally blind to it, since the defect IS the false answer.
 
 **The fix** guards both rungs by arena COVERAGE rather than reverting them: the arena decides
 wherever it has a type for the node, the spelling answers only where it does not. That keeps the
@@ -46596,10 +46601,30 @@ destringification on every covered node — which is all of them but the orphans
 flag on the orphans. 0 corpus rows against a clean baseline; the repro and a dead-declaration
 variant both compile and validate.
 
-A second live disagreement in the same family (a type parameter SHADOWING a map alias) changed
-output benignly and is fixed by the same guard. A third (non-nullable field) is masked only because
-the union field pass has a code-19 arm and no code-29 one — worth adding, and noted here rather
-than bundled.
+**AND THE ROOT FIX IS ONE TOKEN, NEXT DOOR.** The union variant field pass had a code-19 arm
+(map field) and no code-29 one (NULLABLE map field), while its struct twin has carried both since
+its two arms were folded — so `collectA` was writing 29 rows it never read back, the exact state
+the note beside it forbids. The nullable field's flags had been arriving only by accident, from the
+orphaned annotation `TypeRef`. Adding the 29 arm fixes every repro on its own, at 0 corpus rows.
+Both land: the 29 arm is local to the pass whose invariant was violated, the coverage guard covers
+populations no field table sees — including the rungs below.
+
+**A SECOND SHIPPED REGRESSION, worse, from #1551 not #1546.** `collectA`'s f64 and i64 rungs took
+`nodeTyArrayElemRepName(i) == "f64"` / `"i64"` in the same conversion family. On an orphan those
+answer `""`, and the `else if` chain carries the node down into `nameIsArray(nd.tyName)` where
+`checkArrName("f64[]")` REJECTS. `type B = { g: f64[] } | f64` fails on master today. This one
+cannot be masked: a module-wide MINTING flag can be set by any other declaration in the file, but a
+CHAIN MIS-ROUTE is about the node itself. Both rungs now carry the name as a coverage fallback.
+(The f32 rung was never converted and needs nothing — #1551 deliberately left it on the name.)
+
+**AND A FENCE CAME DOWN.** CONSTRUCTING the arm — `const v: Box = { g: Map() }` — now emits a
+module that does not validate, where before it failed loudly at emit. The loud error was never a
+decision about that shape: it was the same missing mint, failing early enough that lowering could
+not reach the bad instruction. Measured independent of the route — a build carrying ONLY the code-29
+arm emits the byte-identical invalid module — so the defect is in the LOWERING and predates all of
+this. Filed as `soundness/xfail-miscompile-union-arm-constructed-map-field.vl` rather than hidden.
+A fence that works by failing to allocate a type is not a fence, and this one was breaking valid
+programs to stand up.
 
 ### B63 / D-KEYEDSPAN, B61 / D-BOOLRET, B62 / D-BOOLANN — SOUND
 
@@ -46618,6 +46643,13 @@ That is the same fact read from both sides.
 
 * **A predicate that can answer FALSE for "I don't know" is not a predicate.** Split coverage from
   content before converting a MINTING flag, and let the name answer where the arena has nothing.
+  In an `else if` CHAIN the same silence is worse than a missing mint — the node falls through to a
+  rung that rejects it, and no other declaration can mask that.
+* **A module-wide flag makes co-resident fixtures useless.** The first draft of the map fixture
+  kept a non-nullable control beside the broken case; the control set `mI32Used` and the file was
+  byte-identical on both builds, testing nothing. `emit_collect.vl` and
+  `maps/i32-keyed-variant-field.vl` both already say this, one of them ten lines from the code I was
+  changing. **A witness for a module-wide flag needs a module with nothing else in it.**
 * **Prove the witness REACHES the site.** Invert the site and check the witness responds; an
   agreement measured at an unreached site is the same worthless 0.
 * **Name the seed explicitly.** `git stash && refresh-compiler.sh && … && git stash pop` leaves the
