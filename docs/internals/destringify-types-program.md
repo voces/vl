@@ -46258,3 +46258,245 @@ same shape as the four reverts earlier in this programme.
 * **Finish the family.** Measuring one member of a group and generalising is what produced the
   "a dozen residues" error in the first place. Four arms, four builds, and the answers were 0, 1,
   0, and not-applicable — no two the same.
+
+## B69 / D-INFERRET — a "threading prerequisite" that was already threaded, and the first 0-and-0
+
+The inventory's eight blocked groups were ranked by (sites unblocked ÷ cost) and **B-8 came
+first**: the inferred-return NAME table, ~12 sites, *"`recordInferRet` ALREADY takes `er`, the
+arena index, alongside the name — so the table has the type and the readers do not read it.
+Prerequisite: expose the `er` column on the read side."*
+
+**The column was already exposed.** `inferRetTyIxOf(name)` sits in `typecheck.vl`, exported,
+doing exactly the `inferRetIdx[name]` → `inferRetTyIx[i]` lookup the prerequisite describes, and
+`inferRetTyIxByNode` wraps it. One caller already uses it.
+
+So B-8's ~12 sites were never Bucket B. **The cheapest of eight named prerequisites did not
+exist.** That is the fourth inherited claim in this programme to dissolve on inspection, after
+"~123 convertible", "17 askers / 2 convertible", and "a dozen residues" — and, like the others,
+it made the remaining work look more blocked than it is.
+
+### THE CONVERSION
+
+`fnRetNullBearing`'s inferred arm asked `unionSetHasNull(inferRetNameOf(fn.fnName))` — split a
+rendered member set on `|`, look for `null`. It now asks `tyBearsNull(inferRetTyIxOf(fn.fnName))`,
+the same question of the type the table banked beside that name. `nodeTyBearsNull` (B54) is
+refactored into `tyBearsNull` over an arena index plus a one-line node wrapper, so a caller
+holding a `Ty` rather than a node can ask.
+
+The `isValueUnionName(im)` GUARD stays a name test: the union registry is name-keyed, and that is
+B-1, a genuinely separate prerequisite.
+
+### AND THE FIRST 0-AND-0 — **WRONG, see B70**
+
+Both legs measured, per B66:
+
+| leg forced off | rows |
+| --- | --- |
+| arena leg (name fallback answers) | 0 |
+| name fallback (arena answers) | 0 |
+
+I read this as "neither leg uniquely answers, so the arm is corpus-unreachable". **That reading is
+false and B70 measures it false**: the arm drives 1,449 of 2,050 corpus rows. Two legs that AGREE
+produce the same 0-and-0 as an arm that never runs, and the sabotage separator cannot tell them
+apart. The correct result is better than the one recorded here, and the method defect is the more
+valuable half.
+
+### METHOD NOTE
+
+* **Check whether a prerequisite exists before building it.** Four of this programme's inherited
+  claims have now dissolved on a one-command check, and this one would have cost a sidecar
+  implementation to satisfy a requirement already satisfied.
+
+
+## B70 — the sabotage separator cannot see liveness, and #1120's non-duality does NOT reach this question
+
+Two findings, and the second is only trustworthy because the first was caught.
+
+### THE METHOD DEFECT: 0-and-0 is two situations, not one
+
+B66 named three outcomes for a two-leg site — 1-and-0, 0-and-1, 0-and-0 — and B69 reported the
+first 0-and-0 and read it as "the arm is corpus-unreachable". **A third build refutes that.**
+
+Force the whole arm to a CONSTANT and diff constant-`true` against constant-`false`:
+
+| build pair | corpus rows | what it establishes |
+| --- | --- | --- |
+| arm ≡ `false` vs arm ≡ `true` | **1,449 of 2,050** | the arm is **massively live** |
+| arm ≡ `false` vs arm ≡ `arenaSays != nameSays` | **0** | the two columns **never disagree** where it runs |
+
+The arm is reached on 70% of the corpus. Sabotaging either leg moved 0 rows **because the other
+leg was still there and gives the same answer** — a leg knocked out falls through to a twin that
+agrees, and the sweep sees nothing. That is indistinguishable, at the sweep, from an arm no
+program reaches.
+
+**So the two-direction sabotage measures REDUNDANCY, not liveness, and a 0-and-0 says nothing at
+all until a constant-forcing build has established the arm runs.** Every "inert" and every
+"0 rows" this programme recorded from a two-leg sabotage alone is now suspect in the same way and
+is queued for re-measurement with the third build. The separator needs three builds, not two:
+constant-`false`, constant-`true`, and the disagreement indicator.
+
+The disagreement-indicator build is the sharper instrument and should have been the first reach
+for it: make the arm return `arenaSays != nameSays`. If that is observationally identical to
+constant-`false` while constant-`true` is not, the columns provably agree everywhere the arm is
+reached — a positive result about a LIVE arm, which no amount of sabotaging can produce.
+
+### AND #1120'S REFUTATION DOES NOT REACH THIS SITE
+
+`emit_base.vl` carries a standing warning against exactly the route B69 took: `recordInferRet`
+banks "the spelling the checker CHOSE and the type it was choosing ABOUT — a decision and its
+input, not two encodings of one type", and #1120 measured the tyIx reading to differ from the
+NAME reading on **14.5% of a fully-covered column** (783 of 5,415 `fn.fnRet` decisions changed).
+Taken at face value that refutes B69's conversion.
+
+It does not reach it, and the reason is the GUARD. #1120 probed `synthRetAnnots`, whose 15-arm
+ladder runs over the raw stored name; its divergence families are alias adoption (`K0` vs arena
+`string`, `Cat|Dog` vs `{meow:i32}|{bark:i32}`), SPACE-guard spelling (`{x: i32}` vs `{x:i32}`),
+and `?`-vs-`|null` renders at nested FIELD positions (`{f: i64[]?}`). B69's site runs behind
+`isValueUnionName(im)`, which requires `unionMemberCount >= 2` and every atom to satisfy
+`valueAtomKind >= 0` — so it admits only a top-level union of value atoms, and each divergence
+family is either excluded by that guard (nested field renders, record spellings) or agrees on the
+narrower null-bearing question (both `P|null` and `{x:i32}|null` bear null).
+
+**Measured: 0 disagreements over an arm driving 1,449 corpus rows.** A general non-duality between
+two columns does not settle a specific question asked of them behind a specific guard — and the
+right response to the standing warning was to measure the narrow question, not to defer to the
+broad finding or to ignore it.
+
+### METHOD NOTES
+
+* **A 0 from a sabotage is not a liveness claim.** Knocking out one leg of a redundant pair
+  proves only that the pair is redundant. Force the whole site to a constant before reading any
+  0 as "unreached".
+* **Prefer the disagreement indicator to the sabotage.** `return a != b` compared against
+  `return false` answers "do these two ever differ where this runs", which is the actual question
+  a dual-encoding conversion turns on.
+* **A recorded refutation deserves a re-measurement, not a ruling.** #1120's warning was correct
+  about its site and wrong about this one; deferring to it would have declined a sound conversion,
+  and ignoring it would have shipped an unmeasured one.
+
+## B71 — the conversion was WRONG, and the corpus could not have told me
+
+Review found a real defect in B69's conversion, the tenth in this programme's run of
+reviewer-caught defects. It is worth reading beside B70, because B70 measured 0 disagreements
+and B70 was right about its own measurement — the population was the thing that was wrong.
+
+### THE DEFECT
+
+`tyBearsNull` scanned only a `TyUnion`'s DIRECT members for a `TyPrim` named `"null"`. The name
+it replaces is built by `collectRetAtoms`, which RECURSES through both `TyUnion` and `TyNullable`
+and pushes `"null"` for every nullable it passes. So the two are not the same question wherever
+the null sits below a direct member.
+
+The arena genuinely keeps that nesting — `annUnionInnerTy` flattens members only when EVERY member
+is a litunion — and the checker already says so one file over: *"kept NESTED in the arena …
+`tyToStr` flattens it for display, the entry does not."*
+
+Three lines, no alias needed:
+
+```vl
+function gp(x: i32 | (string | null), c: boolean) {
+  if c { return x } else { return x }
+}
+```
+
+Arena: `TyUnion[i32, TyNullable(string)]`. Recorded name: `i32|string|null`. Arena leg says NOT
+null-bearing; name leg says null-bearing. An `emitFail` probe comparing the two legs at the site
+fires on this program before the fix and is silent after it, so the disagreement is confirmed at
+the PREDICATE level.
+
+**THE BYTES CHANGE; THE BEHAVIOUR DOES NOT.** The fixture below is 993 bytes without the recursion
+and 1,011 with it — three functions x the 6-byte null-tagged box replacing an `unreachable`. Seven
+further shapes flip false->true and every one is exactly +6 bytes.
+
+**A RETRACTED RETRACTION, and the mechanism is worth more than the embarrassment.** I first wrote
+that the two builds emit different bytes, taking it from the review without reproducing it. I then
+"corrected" that to say it does not reproduce — recursive, non-recursive and master all
+byte-identical. **The correction was wrong and the original was right.** Every comparison behind it
+used `build/vl-compiler.wasm` as "the fixed compiler", and that file had been left holding the
+PRE-FIX build by my own earlier command:
+
+```
+git stash && bash scripts/refresh-compiler.sh && cp build/vl-compiler.wasm /tmp/master_c.wasm && git stash pop
+```
+
+`refresh-compiler.sh` installs its output at `build/vl-compiler.wasm`. Building a master seed that
+way leaves the SEED PATH holding master's compiler, and `git stash pop` restores the SOURCE without
+restoring the binary. Six subsequent measurements compared no-fix against no-fix and agreed
+perfectly, which is what no-fix against no-fix does.
+
+So: pass on a claim unchecked and it is worth nothing; check it with a stale artifact and it is
+worth less than nothing, because now there are two records and the wrong one is the more recent.
+**Always name the seed explicitly** — `SEED=... OUT=... refresh-compiler.sh` — and never let a
+measurement read a path some earlier command may have written.
+
+**What IS true about the blast radius**, and this is the review's structural finding rather than my
+byte-counting: the totality gate `retNullableNow` tests only `T.tys[ret] is TyNullable`, so a LIVE
+fall-through is permitted only for a top-level nullable — exactly the case `tyBearsNull` answered
+true for even before the fix. The fix therefore cannot change behaviour on any live path; it
+strictly repairs DEAD padding. The pre-fix bug was latent, not live.
+
+That makes the fixture SHAPE COVERAGE and not a behavioural regression test — `@log` cannot catch a
+revert, because the output is identical while the bytes are not. It also makes this recursion a
+strict PREREQUISITE for repairing the totality gate: with the gate recursive and `tyBearsNull` not,
+a demonstrably live fall-through is padded with `unreachable` and traps.
+
+### WHY 1,449 LIVE ROWS AND 0 DISAGREEMENTS WAS STILL A TRUE ANSWER TO THE WRONG QUESTION
+
+`tests/cases` carries 128 nullable-alias declarations and **not one union alias with a
+nullable-alias member**, nor a single inline `A | (B | null)` return. The shape is absent. B70's
+instrument is sound and its number is correct; it was computed over a population that could not
+contain the disagreement. That is this repo's own standing note — *agreement rate is not evidence
+unless the corpus could contain the disagreement* — and B70 walked into it while congratulating
+itself on a sharper instrument.
+
+**So the liveness fix in B70 was necessary and not sufficient.** The full question is three
+questions, and B70 answered two:
+
+1. is the site LIVE? — constant-forcing pair
+2. do the columns DISAGREE where it runs? — disagreement indicator
+3. **could this population contain a disagreement at all?** — a census of the shape, or a
+   fixture that manufactures it
+
+Question 3 has no instrument in this programme's recipe. It is the one that catches this class,
+and it is cheap: ask what shape would disagree, then grep the corpus for that shape BEFORE
+reading the 0.
+
+### THE FIX, AND A SECOND SITE IT REPAIRS
+
+`tyBearsNull` now mirrors `collectRetAtoms`'s walk: descend through UNION and NULLABLE members,
+stop at a `TyArray` / `TyObj` leaf exactly as that walk does, so a nullable FIELD or ELEMENT still
+does not make the union null-bearing. That also repairs the PRE-EXISTING annotated call site
+`if retUnionFlag(r) == 1 { return nodeTyBearsNull(r) }`, wrong today for `: i32 | (string | null)`
+and reached without any of this slice's changes.
+
+`tests/cases/inference/inferred-return-nested-null-union.vl` is the population fix — the three
+spellings (inline parens, alias member, nullable-LIST alias member) that the corpus lacked.
+
+### AND THE FALLBACK IS NOT A LEG
+
+B69's comment presented `return unionSetHasNull(im)` as the fallback half of a two-leg site. It
+never answers: `isValueUnionName(im)` is true only if a row exists, and every `recordInferRet`
+call that keys a row by a FUNCTION NAME passes a real `er` (the seven in `elaborateInferRets` all
+gate on `er >= 0 && er != TY_VOID && er != TY_ERR`; the eighth keys `"#" + nodeIx`). So `irTy >= 0`
+always holds. The line stays as a total-function guard and the comment now says so. **B69's own
+two-direction measurement should have caught this** — a leg that never answers is exactly what
+"sabotage it and nothing moves" means, and I read that as the arm being unreachable instead.
+
+### A DEFECT LEFT UNFIXED, FILED
+
+The checker's TOTALITY gate is a separate non-recursive reader of the same shape:
+`function ga(c: boolean): U { if c { return 5 } }` with `type U = i32 | N`, `type N = string | null`
+is REJECTED — *"annotate the return type `| null` to fall through"* — advice already satisfied one
+level in. The flat spelling `i32 | string | null` is accepted; the two denote the same type.
+`tests/cases/soundness/xfail-miscompile-totality-gate-blind-to-nested-null.vl`, with the flat
+control. Not fixed here: it changes which programs are ACCEPTED, which is a language-behaviour
+change and not part of a destringify slice.
+
+### METHOD NOTES
+
+* **Census the population before reading a 0.** Name the shape that would disagree, then grep
+  the corpus for it. A 0 over a population that cannot contain the shape is not evidence.
+* **A conversion between two encodings is only sound if the two WALKS match.** Compare the
+  producer of the thing being replaced — here `collectRetAtoms` — not just the values it produced.
+* **Manufacture the missing shape as a fixture.** The corpus is a population you can extend, and
+  extending it is cheaper than any instrument.
