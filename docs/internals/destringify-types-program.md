@@ -50173,3 +50173,53 @@ re-measure the rungs below it before trusting their recorded declines.** The dec
 snapshots of a control flow that the conversion just changed. B133's array rung and B131's
 variant lets are the two remaining declines in this ladder's neighbourhood that have not been
 re-measured since #1608, and they are the obvious next check rather than any new site.
+
+## B137 — re-measuring B133, and a probe-shape error that undercounts
+
+B136 ended with a rule: after converting a rung in a cascade, re-measure the rungs below it.
+Applying it to B133's array rung produced a number that does not match, and the mismatch is
+my instrumentation, not the compiler.
+
+**B133 reported 2 disagreements. There are 6.**
+
+The probes differ in shape, and the difference matters:
+
+| probe | fires | reports per file |
+| --- | --- | --- |
+| B133's | UNCONDITIONALLY on every reach | whether the FIRST reaching param disagreed |
+| this one | only on disagreement | the first DISAGREEING param |
+
+`emitFail` aborts the compile, so a file gets one row either way. Under the first shape, a
+file whose first param AGREES contributes an agreement row and its later disagreeing params
+are never seen. B133's "1380 reaching, 2 disagreements" is therefore two different
+measurements reported as one: the reach count is right, the disagreement count is
+"files whose first param disagreed".
+
+**A reach probe and a disagreement probe cannot be read off the same build.** Reach needs the
+unconditional form; disagreements need the conditional one. Every entry that quotes both
+numbers from one sweep should be read as reach-correct and disagreement-under-counted. This
+is the third instrumentation error in this log, after B119's `head -10` truncation and its
+`wrote /tmp/a.wasm` path capture, and it has the same shape: a filter that silently answers a
+narrower question than the one asked.
+
+### What the corrected measurement says
+
+The array rung's decline stands, and is now reinforced by a SECOND cause the first
+measurement could not see:
+
+1. `name=F arena=T` (4 rows) — a bare type PARAMETER (`T`, `X`, `A`). The arena reads through
+   to the parameter's BINDING; the spelling sees the parameter. B133's original finding.
+2. `name=T arena=F` (2 rows) — `i32[]` in `generics/type-param-shadows-alias-funcdecl.vl` and
+   `generics/type-param-shadows-transparent-alias.vl`. Arena SILENCE on a shadowed-alias
+   generic original, the same witness family that made `nameIsStringArray` a measured decline
+   in B79.
+
+Two causes, opposite directions, one rung. Converting would both over-answer for type
+parameters and under-answer for shadowed aliases, and the second direction is the dangerous
+one in a minting chain.
+
+### The habit, amended
+
+B136 said re-measure the rungs below a conversion. B137 adds: **re-measure with the probe
+shape that matches the question**, and do not carry a disagreement count forward from a sweep
+that was built to establish reachability.
