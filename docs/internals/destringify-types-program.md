@@ -45899,3 +45899,51 @@ ones with a reason — a cascade position, a decline, a twin that is narrower or
 name. **A 60% revert rate on the sites reached for last is the signal that the easy ones are
 gone**, not that the work is blocked; each revert so far has produced a durable note at the site
 that stops the next reader repeating it.
+
+## B61 / D-BOOLRET — three sites, recipe-clean, and unreachable by every instrument
+
+The first slice worked with B60's recipe in hand. It is a small one, and its value is that the
+recipe told me which sites to SKIP faster than trying them would have.
+
+### THE SCREENING
+
+Two candidates were declined without a build:
+
+* `emit_rewrite.vl:1215` (`annArrowAt(lt.tyName) < 0`) — guarded by `atoms.length == 1`, and the
+  comment directly above says the hand-over "runs only where the SPELLING denotes the type it is
+  handed … widening that reject into working code is a capability change and belongs to its own
+  slice with its own fuzz gate". Recipe check 4.
+* `emit_query.vl:966` (`lt.tyName == "f32"` in `letIsF32`) — the narrowness is deliberate
+  ("only an explicit `: f32` annotation selects the f32 slot", because a float literal defaults
+  to f64). Widening it to catch `type F = f32` is a capability change in the area that has
+  already produced two reverts (B56, B57). Recipe checks 4 and 5.
+
+**Two screenings, no builds, no reverts.** The previous five slices spent a build cycle each to
+learn the same thing.
+
+### THE THREE THAT CONVERTED
+
+`fieldCloCallIsBool`'s two `tyNameOf(x) == "boolean"` returns and the `rt.tyName == "boolean"`
+in the direct-call arm, all to `nodeTyPrimName(x) == "boolean"`.
+
+Recipe-clean: `nodeTyPrimName` reads `T.tys[ty].primName` directly (check 1); not a
+`helper == K` form (check 2); the `>= 0` guard decides WHETHER each site returns while the
+predicate decides only WHAT, so no cascade suppression (check 3); no decline guarded (check 4).
+The third site also drops the `rt is TypeRef` gate the name form required — a return annotation
+that is not a bare `TypeRef` node has a recorded type all the same, so the spelling path could
+not even ask.
+
+### AND ALL THREE ARE UNREACHABLE
+
+Corpus 0 rows. Sabotage (all three forced false) 0 rows. A constructed program with an aliased
+`type B = boolean` closure return behaves identically on both builds.
+
+So this is a B52-shaped slice: it removes three string-based decisions from the SOURCE and none
+from any RUN, and says so rather than dressing three inert sites as a fix.
+
+### METHOD NOTE
+
+* **The recipe's value is in what it declines, not what it converts.** Two sites screened out in
+  minutes on evidence already written at those sites by earlier work. The programme's accumulated
+  comments are now doing the job the corpus cannot: telling you which narrownesses are load-bearing
+  before you spend a build finding out.
