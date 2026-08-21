@@ -45265,3 +45265,102 @@ was a guess; this is the number.
 * **A grep over a NAMING CONVENTION enumerates what someone already classified.** A grep over the
   CALL enumerates what is actually there. When the fix is "everyone who asks X must also ask Y",
   the search term is X.
+
+## B50 / D-ARRLIT — one symptom, two causes, and the element ORDER tells you which
+
+A literal-union atom in a string-array literal was check-clean invalid wasm. The obvious reading
+— "another missing widen, same as the six" — is right for HALF the cases and wrong for the other
+half, and the element order is what separates them.
+
+| literal | list built | what is wrong |
+| --- | --- | --- |
+| `["plain", v]` | STRING list | the atom element never widened — a MISSING WIDEN |
+| `[v, "plain"]` | ATOM list | the wrong CONTAINER was built |
+| `[v]` | ATOM list | the wrong CONTAINER was built |
+| `[v]` into `K[]` | ATOM list | correct |
+
+`arrLitIsStr` takes the FIRST element's type as the signal, and declines outright when
+`nodeArrayElemIsLitUnion`. So a string-first literal builds a string list (and needed one line —
+`emitStrValue` in place of `emitExpr` in the element loop), while an atom-first literal builds an
+atom list and the binding's `string[]` slot is simply ignored.
+
+**The wat is what separated them**, and reading it was the cheapest step in the whole slice: the
+failing module built `struct.new 2` — a wrapper backed by `(array (mut i32))` — where the slot
+wanted the wrapper backed by `(array (mut (ref null 1)))`. Ref-vs-ref in the error text, not
+ref-vs-i32, and that single detail says "wrong container" rather than "unconverted value".
+
+### THE CHECKER IS RIGHT; THE EMITTER IS WRONG
+
+The pinned half is not an inference gap. The linter reports `ys` **is inferred as `string[]`** —
+the checker resolved it correctly and the emitter built something else. That makes it the same
+shape as B49's parameter-shadowing split, and it narrows the fix from "propagate context" (an
+earlier draft of the pin said that) to "make `arrLitIsStr` prefer the binding's element type when
+they disagree".
+
+Two files, because two causes:
+`tests/cases/literal-unions/litunion-atom-in-string-array-literal.vl` (fixed) and
+`tests/cases/soundness/xfail-miscompile-atom-first-arraylit-ignores-annotation.vl` (pinned).
+
+### METHOD NOTES
+
+* **Read the error's TYPES, not just its shape.** `expected (ref $type), found (ref $type)` and
+  `expected (ref $type), found i32` are different defects wearing the same sentence. The first
+  says the value was converted and put in the wrong container; the second says it was not
+  converted. One `wasm-tools print` distinguished them before any code was written.
+* **A symptom that varies with argument ORDER has more than one cause.** Order-dependence is
+  evidence about mechanism, and it is cheap to test.
+* **A `@hint` can be evidence.** The redundant-annotation hint named the checker's inferred type,
+  which is what proved the checker was right and moved the diagnosis. The lint output is a probe
+  that is already running.
+
+### ADDENDUM — and I shipped the emit without its reservation twin, again
+
+The first version of this slice changed the element emit and stopped. B45 established the rule,
+B49's addendum restated it, and B49 had ALREADY established that `exprHasStrOp`'s ArrayLit arm
+only recurses ITSELF and never asks `exprIsLitAtom` — the exact fact that makes this arm's
+reservation missing. I had that written down, in this file, and did not apply it.
+
+A function whose ONLY string work is such a literal — `const ys = ["plain", v]` returning
+`ys.length`, never printing — allocated no frame and the widen wrote to a local the vector never
+declared: master `type mismatch`, branch `unknown local 5`. Same severity class, but a defect I
+introduced.
+
+The fixture now discriminates THREE states — master, emit-only, and both halves — and its
+`isolated` arm exists solely to have no other string work.
+
+* **The twin rule has cost four slices now.** It is not that the rule is unknown; it is that the
+  emit change is the interesting one and the reservation is bookkeeping, so attention runs out
+  first. The mechanical form: after writing an `emitAtomToStr`/`emitStrValue` call, grep
+  `exprHasStrOp` for the node kind you just changed BEFORE running anything.
+* **A fact recorded in the programme doc is not a fact applied.** B49 named this exact ArrayLit
+  gap as out-of-scope-but-real, and the next slice walked into it.
+
+### SECOND ADDENDUM — the twin was still missing at TAIL positions, and the ORDER model was wrong
+
+Review found both.
+
+**The reservation arm went into `exprHasStrOp`'s ArrayLit case, but `blockHasStrOpScan` — the
+STATEMENT walker — has no ArrayLit arm at all.** So a bare trailing array literal, which is an
+implicit return, was never handed to the walker that had just been taught:
+`function f(v: K) { ["plain", v] }` was `unknown local 4`, as were a lambda's expression body and
+an if-arm tail. A fixture covering only the `let` position passes while every tail spelling is
+broken — which is what happened, and is why the fixture now carries a `tailLit` arm and
+discriminates FOUR builds: master, emit-only, let-position-only, and complete.
+
+**And "the element ORDER tells you which defect" was false.** `arrLitIsStr` asks three questions
+about the RECORDED CONTEXT TYPE before it looks at any element, and `nodeArrayElemIsNulStr`
+answers TRUE for a `(string | null)[]` literal however its elements are ordered. So an atom-FIRST
+literal in that spelling builds a string list and this widen fixes it. Order correlates with the
+outcome for the `string[]` spelling only, and I wrote the correlation into four places as the
+rule: the PR body, the `emitArr` comment, both fixture headers, and this entry.
+
+A third finding is the same one twice: the fixture's "Control 2 — the push sink, SAME value"
+shipped as `zs.push("zz")`, a string literal. `exprIsLitAtom` has no `StrLit` arm, so it reached
+neither the push sink's atom arm nor its reservation predicate and controlled for nothing.
+
+* **A correlation observed on one spelling is not the rule.** I tested `string[]` literals, saw
+  order predict the outcome, and wrote "order decides". The `(string | null)[]` spelling breaks
+  the correlation and was one test away.
+* **When a fix spans two walkers, the fixture needs an arm per WALKER, not per position.** The
+  `let` and tail arms look like two positions and are two dispatchers; only the second catches a
+  missing statement-level arm.

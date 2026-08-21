@@ -1,0 +1,93 @@
+// @run
+// @log plain
+// @log kb
+// @log ka
+// @log kb
+// @log 2
+// @log 2
+// @log 3
+// @log kb
+// @log null-ok
+// A literal-union ATOM as an element of a STRING-ARRAY LITERAL. The backing is
+// `(ref null $aTypeIdx)` and the atom's rep is an i32 id, so the element has to widen to its
+// member string on the way in. It did not: `expected (ref null $type), found i32`, check-clean
+// invalid wasm.
+//
+// THE RECORDED CONTEXT TYPE DECIDES, NOT THE ELEMENT ORDER. `arrLitIsStr` asks three questions
+// about the literal's recorded element type before it ever looks at an element:
+//
+//   nodeArrayElemIsLitUnion    -> false  an ATOM list (`K[]`, or inferred from atom-only elems)
+//   nodeArrayElemIsNulLitUnion -> false  an atom NICHE list
+//   nodeArrayElemIsNulStr      -> TRUE   a STRING list, whatever the first element is
+//   otherwise                           the first element's type decides
+//
+// TWO DEFECTS SHARE ONE SYMPTOM and only one is fixed here:
+//
+//   const ys = ["plain", v]                    // string list, atom did not widen — FIXED HERE
+//   const ys: (string|null)[] = [v, "plain"]   // string list via the context rule — ALSO FIXED
+//   const ys: string[] = [v, "plain"]          // ATOM list, annotation ignored — PINNED
+//   const ys: string[] = [v]                   // ATOM list, annotation ignored — PINNED
+//
+// An earlier version of this header said ELEMENT ORDER decided which defect you got. Order
+// correlates with the outcome for the `string[]` spelling and not at all for `(string|null)[]`,
+// where an atom-first literal builds a string list and this widen fixes it. The correlation was
+// stated as the rule; see docs/internals/destringify-types-program.md B50.
+//
+// THE RESERVATION TWIN IS THE `isolated` ARM, and it fails differently. `emitAtomToStr` stages
+// the atom id in the string-op scratch frame, and `exprHasStrOp`'s ArrayLit arm only recursed
+// ITSELF — it never asked whether an element was an atom — so a function whose ONLY string work
+// is such a literal allocated no frame and the widen wrote to a local the vector never declared
+// (`unknown local 5`). `isolated` returns `ys.length` and never prints the strings, because a
+// `print` of the result would reserve the frame incidentally and hide exactly this.
+//
+// THE `(string | null)[]` ARM pins that a `null` element and an atom element share one literal:
+// the null lowers as `ref.null` under the `pendingNulString` seed while the atom widens.
+//
+// THE CONTROLS ARE THE TWO NEIGHBOURS THAT ALREADY WORKED: an atom literal into a `K[]`
+// annotation (correct — that IS the atom list) and `ys.push(v)` into a `string[]` (fixed
+// earlier, in the push sink). Between them they say the defect is the array LITERAL's element
+// position specifically, not "atoms and string lists".
+type K = "ka" | "kb"
+
+function main() {
+  const v: K = "kb"
+  const ys = ["plain", v]
+  print(ys[0])
+  print(ys[1])
+
+  // Control 1: the atom list, correctly built and read.
+  const ks: K[] = [v, "ka"]
+  print(ks[1])
+
+  // Control 2: the push sink, closed earlier — the SAME atom, same destination type, different
+  // position. It must push `v` and NOT a string literal: `exprIsLitAtom` has no `StrLit` arm, so
+  // `zs.push("zz")` reaches neither the push sink's atom arm nor its reservation predicate and
+  // controls for nothing hundreds of corpus files do not already cover. An earlier draft did
+  // exactly that.
+  const zs: string[] = []
+  zs.push(v)
+  print(zs[0])
+
+  print(isolated("kb"))
+  print(tailLit("kb").length)
+
+  const ns = ["a", null, v]
+  print(ns.length)
+  if ns[2] != null { print(ns[2]) }
+  if ns[1] == null { print("null-ok") }
+}
+
+// The RESERVATION witness: its only string work is the literal's atom widen.
+function isolated(v: K) {
+  const ys = ["plain", v]
+  return ys.length
+}
+
+// The TAIL witness, and it is a separate arm because the walkers differ. `isolated` reaches the
+// scan through the `LetDecl` arm of `blockHasStrOpScan`; a bare trailing array literal is an
+// IMPLICIT RETURN and that walker had no `ArrayLit` arm at all, so the first version of this fix
+// left every tail spelling — this one, a lambda's expression body, an if-arm tail — reserving
+// nothing. A fixture covering only the `let` position passes while the tail position is broken,
+// which is exactly what happened.
+function tailLit(v: K) { ["plain", v] }
+main()
