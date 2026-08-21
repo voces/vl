@@ -47172,3 +47172,70 @@ assertion.
 * **Screen the modules that CREATE the uncovered populations, not just the ones that read types.**
   `emit_mono.vl` had almost nothing convertible and explained three earlier declines; `emit_query.vl`
   had two sites and one of them was broken. Neither was on any list before this pass.
+
+## B81 — the conversion that was "provably safe by construction" was neither, and the corpus could not have told me
+
+A second scout ranked `synthRetAnnots`' arm 14 as the best remaining conversion in the programme:
+rung-banked (so immune to B77's clone gap), 81-file population, eight siblings already converted,
+and — its strongest claim — **a disagreement set empty BY CONSTRUCTION** rather than by a sweep.
+
+The derivation is correct. `tyToStrAt`'s `TyObj` arm writes `", "` between fields, so every
+`recordable` struct render carries a space; the only space-free brace render is `tyToEmitName`'s,
+which is what `structPlainRetName` banks at rung 2. `{}` is space-free without fields and rung 2
+claims it first. I checked both halves in the source before building anything.
+
+**It still gets the wrong answer, and the reason is the canon softening for the fourth time.**
+
+### THE ONE DISAGREEMENT
+
+`literal-unions/inline-atom-shape-field.vl` reaches arm 14 with `ctx = "{v:string}"` at rung
+**SFB28**, not 2. The field is a literal union; canon renders it `string`; the render is space-free
+and says nothing about which rung banked it. Arm 9 (`nameIsStructWithLitUnionField`) cannot see it
+for exactly the same reason, so a rung-28 row legitimately falls through to arm 14 and takes the
+NOMINAL-resolved pin there.
+
+The derivation reasoned about how a RENDER is produced. It never asked whether a render produced
+one way could be banked under another rung — and the softening is precisely a case where the
+render's shape and the row's provenance come apart.
+
+### AND THE CORPUS CANNOT ADJUDICATE IT
+
+Forcing arm 14 OFF entirely moves **0 corpus rows**. The arm is inert on all 2,061 files.
+
+So the conversion's own 0-row A/B — which it passed — measured a site with no observable effect on
+any of the 81 files that reach it. **A clean sweep at an inert site is not evidence of anything**,
+which is B70's rule arriving from the other direction: there I read a 0 as "unreached" when the arm
+was live; here the arm really is inert, and the 0 is just as empty.
+
+A constructed rung-28-with-declared-nominal-twin witness agrees too. The evidence needed to convert
+this does not exist on this corpus, and the shape that would produce it is a fuzz seed — the arm's
+own comment cites two (`sweep3 multiobs`, seeds 784841544 and 369283890), which is where its pin
+was earned.
+
+### WHY DECLINE RATHER THAN SHIP THE INERT CONVERSION
+
+The rung test is NARROWER, and this arm exists to stop a same-fieldset twin row from being
+fieldset-matched wrong — invalid wasm. Narrowing a pin whose job is preventing invalid wasm, on
+evidence that cannot see the pin working, is the trade B60 step 4 warns about: *inert code can be
+load-bearing.*
+
+### THE SOFTENING, FOUR TIMES NOW
+
+| site | what canon softened | verdict |
+| --- | --- | --- |
+| `cloRetIsString` | inline litunion → `string` in a callback RETURN | **convert** — softened name was wrong, produced invalid wasm |
+| `paramString` | litunion → `string` in a PARAM | **decline** — softened name is right; arena broke 2 files |
+| `tyAnnRefListKind` rung 1 | — | decline, arena narrower |
+| **arm 14** | litunion FIELD → `string` inside a struct render | **decline** — softening hides the rung, arena narrower |
+
+It is the single most common reason name and arena disagree in this compiler, and it does not
+carry a consistent verdict. **Four sites, four different right answers.**
+
+### METHOD NOTE
+
+* **A derivation is a claim about the code you read, not about the code that runs.** This one was
+  sound and incomplete: it reasoned about render PRODUCTION and the counterexample lives in render
+  PROVENANCE. Measure anyway; the probe cost one build and found the case in one sweep.
+* **Add a liveness control before believing a conversion's clean sweep, not only before believing
+  an inert one.** B70 established that for 0-means-unreached. The same control turns a passing
+  A/B into a meaningless one.
