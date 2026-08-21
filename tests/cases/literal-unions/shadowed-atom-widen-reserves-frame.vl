@@ -1,0 +1,61 @@
+// @run
+// @log kb
+// @log 7
+// @log 8
+// A literal-union atom in a SHADOWING inner binding, widened to a string. The widen stages the
+// atom id in the string-op scratch frame, and the frame is now reserved for it.
+//
+// It was not, and the reason is that the reservation scan and the emit answered the SAME
+// question differently. Both ask `exprIsLitAtom`, whose `Ident` arm resolves through
+// `declaredSlotOf` — a linear FIRST-MATCH scan over `localNames` when the lexical scope stack
+// is empty. The scan runs BEFORE the body is emitted, so the OUTER `v` (an i32) won and the
+// predicate said "not an atom"; by emit time `scopeBind` had bound the inner `v: K`, so the
+// emit fired and wrote `strScratchBase + 3` into a frame nobody allocated. Out of bounds that
+// is `invalid local index`; with enough locals in the function it lands IN BOUNDS on an
+// unrelated i32 and the module VALIDATES.
+//
+// This was `xfail-miscompile-shadowed-atom-widen-unreserved-frame.vl` and belonged to all SIX
+// atom-widening sinks at once.
+//
+// THE FIX IS SCAN-SIDE ONLY, which is the part worth keeping. `identShadowMayBeLitAtom` asks
+// the question the scan can actually answer — does ANY local of this name hold an atom? — and
+// only when the name has more than one declared local. Over-reserving costs a few locals;
+// under-reserving is invalid wasm, so the asymmetry is deliberate.
+//
+// `exprIsLitAtom` itself is NOT widened this way, and must not be: the EMIT shares it, and an
+// emit that over-answers would widen a value that is really a string. The two halves need
+// different precision because they answer under different information — which is why this is a
+// separate predicate and not a flag on the shared one.
+//
+// BOTH SINKS ARE EXERCISED, one per function, and each in a function whose ONLY string work is
+// the widen — otherwise `print` reserves the frame incidentally and the file proves nothing.
+// That is also why `viaPush` never prints the pushed string and returns a count instead: a
+// `print(xs[0])` would reserve the frame for the whole function and mask exactly what this pins.
+type K = "ka" | "kb"
+
+function viaCall(n: i32) {
+  const v = 7
+  if n > 0 {
+    const v: K = "kb"
+    show(v)
+  }
+  return v
+}
+
+function show(s: string) { print(s) }
+
+function viaPush(n: i32) {
+  const v = 8
+  const xs: string[] = []
+  if n > 0 {
+    const v: K = "kb"
+    xs.push(v)
+  }
+  return v + xs.length - 1
+}
+
+function main() {
+  print(viaCall(1))
+  print(viaPush(1))
+}
+main()

@@ -45176,3 +45176,55 @@ function-local plain string literal with no literal union in it at all, standing
 * **A control must be able to fail for the reason it is a control.** Two here could only detect
   invalid wasm. Print the value, and check the control exercises the mechanism it is controlling
   for.
+
+## B49 / D-SHADOWRES — the shadowing hole closes for all six sinks, and a much quieter bug was underneath it
+
+B45's addendum found that the reservation scan and the emit can answer the SAME question
+differently, because `exprIsLitAtom` reads mutable phase state. That hole belonged to all six
+atom-widening sinks. It is closed.
+
+### 1. THE FIX IS SCAN-SIDE ONLY, AND THAT IS THE DESIGN
+
+`declaredSlotOf` falls back to a linear FIRST-MATCH scan over `localNames`. The reservation scan
+runs before the body is emitted, so the lexical scope stack is empty and an OUTER binding wins;
+by emit time `scopeBind` has bound the shadowing INNER one.
+
+`identShadowMayBeLitAtom` asks the question the scan can actually answer — **does ANY local of
+this name hold an atom?** — and only when the name has more than one declared local.
+Over-reserving costs a few locals; under-reserving is invalid wasm.
+
+**`exprIsLitAtom` itself must NOT be widened this way.** The emit shares it, and an emit that
+over-answers would widen a value that is really a string. The two halves need DIFFERENT
+PRECISION because they answer under different information, which is why this is a separate
+predicate rather than a flag on the shared one. That is the general shape for a scan/emit pair:
+when they disagree because of phase, the scan may over-approximate and the emit may not.
+
+### 2. AND UNDERNEATH IT, A WRONG ANSWER IN ORDINARY CODE
+
+Testing whether the SILENT spellings of the shadowing bug were also fixed turned up something
+unrelated to this programme and worse than anything in it:
+
+```vl
+function f(v: i32, n: i32) { if n > 0 { const v = 99  print(v) }  print(v) }
+// prints 7 7 — the parameter, twice. Correct is 99 7.
+```
+
+**A local declaration that shadows a PARAMETER is silently ignored.** No literal unions, no
+niches, no generics, no annotation. `vl check --codegen` exits 0, the module validates, it runs,
+and it computes the wrong value. A local shadowing another LOCAL resolves correctly, which
+localizes it to the parameter case.
+
+It contradicts the stated rule: ROADMAP B16 records "nested shadowing allowed (uniquified in
+codegen)". Shadowing a parameter is not uniquified — so either the uniquifier misses it or the
+checker should reject the declaration, and it does neither. Pinned with the WRONG answers as its
+`@log` lines so that fixing it is loud:
+`tests/cases/soundness/xfail-miscompile-local-shadowing-param-ignored.vl`.
+
+### METHOD NOTES
+
+* **A scan/emit pair may need different precision, not the same predicate.** The twin rule says
+  they must agree; it does not say they must be identical. Where they disagree because of PHASE,
+  the safe resolution is to let the conservative side over-approximate.
+* **Checking whether the SILENT form of a bug is also fixed is worth doing on its own.** The
+  reservation fix closed the loud spelling. Asking "and the quiet one?" found a defect in
+  ordinary parameter shadowing that no part of this programme would have reached.
