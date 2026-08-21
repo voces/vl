@@ -45839,3 +45839,63 @@ something", and those are different questions.
 * **Before substituting predicate B for expression A, read every `return true` in B.** A header
   that enumerates exclusions is not a claim about inclusions, and a predicate assembled from arms
   accretes them.
+
+## B60 / D-RECIPE — what separates a conversion that lands from one that reverts
+
+Nine conversion slices in (B52–B59), with **three of the last five reverted**, the difference is
+predictable enough to write down. This is the entry to read before touching any of the ~123
+remaining Bucket-A sites.
+
+### THE FOUR THAT LANDED, AND WHAT THEY HAD IN COMMON
+
+| slice | sites | sabotage | the twin |
+| --- | --- | --- | --- |
+| B56 `tyAnnRefListKind` f64/i64 | 2 | 23 rows | `tyKindOf(ty) == 12` / `== 20`, both constants VERIFIED in the return set |
+| B57 `collectA` scalar rungs | 4 | 53 rows | `nodeTyIsNulString`, `nodeTyIsNulI32List`, `nodeTyArrayElemRepName` — all read `T.tys` directly |
+| B55 field-row `keyI32` | 2 | 5 rows | `nodeTyMapKeyIsI32Span`, written for this predicate's exact span |
+| B54 `fnRetNullBearing` | 1 | 3 rows | `nodeTyBearsNull`, written for this site with both shapes handled |
+
+**Every one used a twin whose BODY is a direct structural read, or a constant comparison whose
+constant was checked to be producible.** Two of the four twins were written for the conversion
+rather than found.
+
+### THE THREE THAT REVERTED, AND WHAT THEY HAD IN COMMON
+
+* **B57 `nameIsStringArray` → rep-name.** The twin was fine. The CHAIN was not: in an `else if`
+  cascade a wider rung suppresses every rung below it. *Reasoned about the flag, not the control
+  flow.*
+* **B57 f32 guard repair.** The twin was fine (`callResTyIsF32Array` works). The DECLINE it
+  removed was load-bearing — an unsupported nested leaf reached lowering. *Reasoned about the
+  predicate, not what its narrowness was holding back.*
+* **B59 `nodeTyIsUnionAlias` substitution.** The twin's HEADER matched the expression exactly.
+  Its BODY had two more positive arms. *Reasoned about the comment, not the code.*
+
+None of the three failed because the arena was wrong. All three failed because the SURROUNDINGS
+were not read: the cascade, the decline, the arms.
+
+### THE RECIPE
+
+Before converting site S from `nameIsX(render(n))` to `arenaY(n)`:
+
+1. **Read every `return true` in `arenaY`.** A header enumerating exclusions says nothing about
+   inclusions. (B59)
+2. **If `arenaY` is `helper(x) == K`, extract `helper`'s return set and confirm `K` is in it.**
+   (B56 — `tyIsF32Array` is `== 21` against a helper that never returns 21.)
+3. **If S is a rung in an `else if` cascade, ask what a WIDER answer suppresses**, not what it
+   sets. Monotone flags do not make a monotone chain. (B57)
+4. **If S guards a DECLINE, ask what reaches lowering when it stops declining.** Inert code can be
+   load-bearing. (B57)
+5. **Check the direction that is dangerous.** For most predicates over-answering is the hazard;
+   for type-MINTING flags (`mI32Used`, `slUsed`, `fnValUsed`) under-answering is, and the exact
+   arena twin is usually the narrower one. (B52, B55)
+6. **Run BOTH instruments.** The corpus A/B answers "did I break something" — it caught B59
+   instantly, 7 rows with 6 rc changes. The sabotage separator answers "is this reached" — without
+   it B52's 0 rows and B57's 0 rows look identical and mean opposite things.
+
+### WHAT THIS SAYS ABOUT THE REMAINING SURFACE
+
+The ~123 Bucket-A sites are not uniform. The ones still unconverted are disproportionately the
+ones with a reason — a cascade position, a decline, a twin that is narrower or wider than its
+name. **A 60% revert rate on the sites reached for last is the signal that the easy ones are
+gone**, not that the work is blocked; each revert so far has produced a durable note at the site
+that stops the next reader repeating it.
