@@ -51894,3 +51894,39 @@ itself is not a measurement.
 
 Remaining at the site: **19 files**, uncoded kinds `TyArray` (non-prim elements) 10, `TyObj` 9,
 `TyMap` 1, other 2 — the `TyObj` bucket now closed with a cause rather than a plan.
+
+## B171 — the ref-list arm, and what "any other" means when you arrive from the arena
+
+The array arm B169 shipped stops at `TyPrim` elements. The spelling ladder does not: after its
+five scalar kinds it ends `return 5` for any OTHER `X[]`. Porting that fall-through looks like
+a one-line completion. It is not, and the corpus said so immediately.
+
+**Blanket `return 5`: 1 file, and not a byte move** —
+`lists/nullable-elem-list-null-literal.vl` traps with "an index outside the bounds of an array".
+
+The reason is a property of LADDERS, not of types. "Any other" in the spelling ladder means
+"whatever the arms ABOVE me did not claim", and above it the nullable-element and literal-union
+array families have already been taken by name. Arriving at the same point from the arena, none
+of that has happened — so the fall-through inherits cases the original never sees, and a
+nullable-ELEMENT list (owned by the i32/niche families) gets coded as a ref list.
+
+Naming the three kinds code 5 is actually for — `TyObj`, `TyUnion`, `TyFunc`, exactly as its own
+comment states — is 0 diffs across 1,947 files, and the render path drops **19 -> 17**.
+
+### The rule
+
+**A ladder's fall-through is not a case, it is a REMAINDER**, and a remainder is only meaningful
+relative to the arms above it. Copying `else return X` into a different ladder silently widens
+it by everything the original ladder had already removed. Port the POSITIVE cases; let the new
+ladder's own remainder be a decline.
+
+That is the third distinct way an arm has failed in this pass, and all three were cheap to find
+and impossible to predict:
+
+| arm | how it failed |
+| --- | --- |
+| struct (three predicates) | precondition is the interner's progress, not the type (B170) |
+| ref list, blanket | inherited cases the source ladder had already claimed above it |
+| ref list, named kinds | ships |
+
+Remaining at the site: **17 files**.
