@@ -51930,3 +51930,32 @@ and impossible to predict:
 | ref list, named kinds | ships |
 
 Remaining at the site: **17 files**.
+
+## B172 — the rest of the ref-list family, and the site's floor
+
+B171's rule said to port a ladder's POSITIVE cases and let the new remainder decline. Applying it
+again: which element kinds does code 5 actually own, beyond the struct/union/closure three?
+
+A nested LIST (`i32[][]`) and a MAP-element list. Neither is a scalar backing, and neither is
+claimed by an arm above the spelling ladder's fall-through — only the NULLABLE element families
+are, which is exactly why `TyNullable` stays out. 0 diffs across 1,947 files, and the render path
+drops **17 -> 12**, retiring precisely the five files the kind census predicted.
+
+### The site's floor, stated plainly
+
+The census at 17 read: `TyObj` 9, `TyArray` 5, `TyMap` 1, other 2. The `TyArray` five are now
+gone. What remains:
+
+| bucket | files | status |
+| --- | ---: | --- |
+| `TyObj` field | 9 | **closed** — the precondition is the interner's progress, not the type (B170) |
+| other (`k=8`, an unenumerated kind) | 2 | unexamined |
+| `TyMap` field | 1 | code 19 behind a lowerability gate |
+
+So this site bottoms out near **11 of the original 32** on the arms alone. The nine are not a
+missing predicate — three different ones were tried and the corpus refuted all three. Getting
+them would take a pass-scheduling change (fill the struct table's type column, or move this
+consumer after the interner completes), which is a different risk class from anything in this
+programme so far and should be its own piece of work rather than a coda to this one.
+
+Twenty-six conversions. The render path at the last site: **32 -> 12**.
