@@ -46687,6 +46687,50 @@ That is the same fact read from both sides.
   here compared no-fix against no-fix and agreed perfectly, which is what that comparison does.
 
 
+## B74 / D-INFERRETNULL — the second inferred-return reader, and the first slice run to the corrected recipe end to end
+
+`emit_collect`'s void-inference fixpoint asked `unionSetHasNull(inferRetNameOf(fn.fnName))` — split
+a rendered member set on `|`, look for `null`. It now asks the same helper the annotated reader
+uses. Both callers are routed through one exported `inferRetBearsNull`, which is where that
+question lives now; two dead imports (`inferRetNameOf`, `unionSetHasNull`) leave `emit_collect`
+with them.
+
+This is B60's steps 7-11 run in order, and every one of them mattered:
+
+| step | instrument | result |
+| --- | --- | --- |
+| 7 liveness | site forced `true` vs forced `false` | **828 of 2,054 rows** |
+| — | conversion vs master, one seed both sides | 0 rows |
+| 8 disagreement | `emitFail` on `arena != name`, behaviour preserved | 0 corpus, 0 on the compiler's own source |
+| 8 CONTROL | same probe, recursion disabled in `tyBearsNull` | **fires** on a nested-null witness |
+| 9 census / 10 reach | `emitFail` on every reach, names tabulated | `""` x341, `i32` x4, `i32\|null` x1 of 346 |
+
+**Step 8's control is the entry's reason for existing.** The probe returned 0 on the corpus, 0 on
+the compiler, AND 0 on the very witness built to make it fire — because B71's recursion fix, which
+landed between the two slices, had removed the disagreement it was built to catch. A 0 from an
+instrument that cannot fire is the same 0 as a clean result. Disabling the recursion in a control
+build made it fire on the witness immediately, which is what licenses reading the other three 0s.
+
+**The reach table is the other half.** No union of any complexity arrives at this site: the
+recorded name is EMPTY on 98.6% of reaches. Both encodings agree on `""`, `i32` and `i32|null`
+trivially, so the conversion is equivalent by the shape of its INPUT — a mechanism, not a sweep.
+That is worth stating precisely because it also bounds the slice's value: this removes a string
+decision from the SOURCE and cannot change behaviour, which is exactly the goal and exactly the
+claim.
+
+### AND THE STALE-SEED TRAP CAUGHT ME AGAIN, ONE ENTRY AFTER I WROTE IT DOWN
+
+The first A/B here reported **4 rows**. All four were #1563's own fixtures, and the "master" side
+FAILED them — because the baseline had been copied from `build/vl-compiler.wasm` in the main
+checkout, which had last been refreshed during the #1562 work and so predated #1563 entirely.
+Rebuilding both sides from ONE named seed gave 0.
+
+B73's method note says "always name the seed explicitly" and I copied a path instead, in the very
+next slice. The note is now worth more than the entry it sits in: **a baseline is a build you
+made, from a commit you named, in this measurement — never a file that happens to be lying at a
+well-known path.**
+
+
 ## B75 — the queue closed out, and the fixture written to pin an arm found a miscompile instead
 
 The nine remaining SUSPECT rows, re-measured **census-first and with zero compiler builds**. That
