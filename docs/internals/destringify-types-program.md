@@ -52351,3 +52351,40 @@ they are keyed on the column that happens to be filled.
 
 **So the next attempt is not another predicate at the kind ladder — all three have been tried.**
 It is the variant table's type column.
+
+## B184 — B183 was wrong twice, and flipping the kind makes it worse
+
+B183 recorded three layers of the union-argument reject. Two were wrong, and finding out cost
+four probes — each of which is worth more than the wrong answer it replaced.
+
+**Wrong: "the kind ladder falls through to struct".** The ladder's struct arm is NEVER REACHED
+for these programs. Probed directly. The kind comes from `annRepKindOf` — the rep descriptor,
+consulted FIRST, which answers "struct". Structurally true; the wrong TABLE.
+
+**Wrong: "the variant table's type column misses this type".** It does not. `declTyIxOfName`
+resolves at both push sites (probed, never fired) and `uVarTyIx.length` is 1 at the moment the
+kind is decided. The `variantRowOfTy` arm B183 reported as never firing sat BELOW the
+descriptor's early return — **placement, not coverage.** So B183's closing claim — that this is
+B167's type-column gap again — is retracted. The column is fine.
+
+**And the fix it implied does not work.** Moving that arm ABOVE the descriptor, gated on "the
+variant table holds this type and the struct table does not", makes **7 of 10 repros compile —
+into invalid modules**:
+
+```
+vl check --codegen  =>  Found 0 errors
+vl run              =>  type mismatch: expected (ref $type), found (ref $type)
+```
+
+Two distinct heap types printing the same name: the signature says variant, the body still
+BUILDS the plain struct. That is the check-clean invalid module this programme treats as the
+worst outcome, and it is the same trade the array-union xfail records for its own attempt 2.
+
+### What that leaves
+
+The classification is not the gap. A declared struct that is a union arm has no struct row by
+design, so a real fix changes what the value IS — give the arm a struct row, or make the producer
+build the variant — never merely what it is CALLED. Renaming a rep is how this compiler produces
+invalid wasm; four fixtures now record it.
+
+**Nothing shipped from this attempt.** Both xfails carry the four dead ends.
