@@ -50708,3 +50708,49 @@ Three columns, six declines tested:
 The prior was worth flipping — it turned five declines into conversions — and it is not a
 guarantee. This is the first site where the enumeration came back empty, and the decline is
 stronger for it.
+
+## B148 — bucket 1 fully enumerated against the receipts
+
+B123's ref-list slot was the last untested bucket-1 decline. Measured against all three banked
+columns:
+
+```
+ZRL2 arena=0 name=4 pin=0 atoms=1 canonRewrote=no canonTy=-1 [QView[]]
+```
+
+No receipt reaches it. The newtype collapse — brand and base sharing one `Ty`, with only the
+base owning an `sNames` row — leaves no per-node record: canon did not rewrite the annotation
+(there is nothing to soften), the atom count is 1 (it is not a union), and the pin column is
+empty (it is not monomorphized). The decline holds.
+
+### Bucket 1, complete
+
+| decline | cause | receipt | outcome |
+| --- | --- | --- | --- |
+| `paramVariantIndex` (B107/B109) | same-shape union collapse | `annUnionAtomsOf` | **converted** (B146) |
+| the array rung (B133/B137) | type-param binding; shadowed alias | none | holds (B147) |
+| the ref-list slot (B123) | newtype brand/base | none | holds (B148) |
+
+One of three fell. The two that hold now share a property the one that fell did not: **their
+destruction happens in a pass that writes nothing per-node.** The same-shape union collapse was
+survivable because canon had already banked the atom count for its own reasons; the newtype
+brand/base merge and the type-parameter substitution bank nothing.
+
+That is the actionable form of "blocked by principle", and it names its own repair: a per-node
+column recording newtype provenance (`nwBrand` exists in the checker but is not exposed
+per-node) would unblock B123 the way `annUnionAtomsOf` unblocked B107. Whether that is worth
+adding is a separate question from whether the information is destroyed — it is not destroyed,
+it is simply not written down.
+
+### The programme's shape, after 78 PRs
+
+| bucket | state |
+| --- | --- |
+| 1 — a pass destroyed the distinction | enumerated: 1 converted, 2 hold, each with the missing column named |
+| 2 — the name IS the interning key | closed by definition; a key is its own identity |
+| 3 — a node is in scope | exhausted; 15 conversions, all declines causally recorded |
+| 4 — the name-classifier layer | ~258 functions, needs the interface decision |
+
+The receipt prior (B146) was the single most productive idea in the log — it converted five
+declines that had been measured, argued, and written up as permanent. Its limit is now equally
+clear: it works where some pass had a reason of its own to record the fact, and not otherwise.
