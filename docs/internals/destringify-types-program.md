@@ -45947,3 +45947,74 @@ from any RUN, and says so rather than dressing three inert sites as a fix.
   minutes on evidence already written at those sites by earlier work. The programme's accumulated
   comments are now doing the job the corpus cannot: telling you which narrownesses are load-bearing
   before you spend a build finding out.
+
+## B62 / D-BOOLANN — the surface is 4 clean sites, not 123, and a screen said so before any build
+
+A screening pass applied B60's recipe to the candidate surface. The result revises this
+programme's stated remaining size for the third time, and downward again:
+
+| | |
+| --- | --- |
+| raw grep hits across `emit_classify` / `emit_collect` / `emit_mono` | 116 |
+| not Bucket-A after all (predicate takes a bare `name`, no index in scope AT THE DECISION) | ~58 |
+| string is the OUTPUT, or already arena-first with the name as documented residue | 13 |
+| **screened in detail** | **45** |
+| **PASS** | **4** |
+| DECLINE | 32 |
+| UNKNOWN | 9 |
+
+**`emit_mono` contributed ZERO.** Its two remaining hits take a bare name; the "~6" the first
+inventory gave it does not survive the "index in scope at the decision" test. B61 had reached the
+same conclusion by hand.
+
+So "~123 convertible" was a count of sites where a node is IN SCOPE, not of sites where converting
+is SOUND. Every screening pass has revised the number down and the reasons up — 17/2 became 17/4,
+then 45 screened became 4.
+
+### THE FOUR, AND WHY THEY ARE ONE
+
+All four ask "is this annotation node `boolean`?" in four hand-written copies:
+`emit_base.tyIsBool`, `capturedIsBool`'s Param and LetDecl arms, and `mfCbRetIsBool`. The two
+middle ones are `tyNameOf(x) == "boolean"` — which IS `tyIsBool`, since `tyNameOf` returns `""`
+for a negative index and for a non-`TypeRef`, exactly that function's `false`.
+
+So the slice is one destringification plus a three-copy dedup: `tyIsBool` becomes
+`nodeTyPrimName(tyIx) == "boolean"` and the copies become calls to it.
+
+**`nodeTyPrimName`, NOT the already-imported `nodeTyWidenedRepName`**, though the two are provably
+equal for this constant. The widened form is a SUPERSET twin — it adds a litunion arm returning
+`"string"` and a `softenLitTy` arm — and reaching for a superset because it happens not to hit the
+constant you care about is precisely the shape that broke six tests in B59. There is no `boolean`
+literal type (`litKind` is only `"str"`/`"flt"`/int), so the exact form exists and is what the
+question wants.
+
+Corpus 0 rows; `tyIsBool` forced false, 0 rows. The boolean side channel — print-import selection,
+mono pin names — is not exercised by the corpus, so this is a B52/B61-shaped slice: four string
+decisions out of the SOURCE, none out of any RUN.
+
+### WHAT THE SCREEN DECLINED IS THE REAL RESULT
+
+32 declines, and the two worth carrying forward:
+
+* **The `nameIsString` family looked like the best batch in the file and is the worst.** Three
+  sites, one twin, a node at each. BOTH candidate twins are broken in OPPOSITE directions:
+  `nodeTyWidenedRepName` over-answers (a litunion ALIAS returns `"string"` but reps as an i32
+  atom — claiming a string-ref slot for it is the invalid-wasm shape this programme keeps
+  rediscovering), while `nodeTyPrimName` under-answers (an INLINE `let x: "a" | "b"` canons to the
+  spelling `"string"` but holds a `TyUnion` of `TyLit`). An exact twin exists only as a COMPOSED
+  expression, `nodeTyWidenedRepName(x) == "string" && !nodeTyIsLitUnionAlias(x)` — a slice of its
+  own, not a substitution.
+* **`fnHasMap`'s `nameIsMap(ty.tyName)` passes checks 1–4 and fails check 5.** It drives the map
+  scratch-frame RESERVATION, so over-answering is a spare local and UNDER-answering is the hazard —
+  and `nodeTyIsMap` is strictly narrower (`nameIsMap` also accepts `{[string]: V} | null` and a
+  map-first union). The mirror image of the `slUsed`/`aUsed` error B57 made from the other side.
+  Without check 5 this was the most attractive site on the surface and would have been a fifth
+  revert.
+
+### METHOD NOTES
+
+* **Count what is SOUND to convert, not what has an index in scope.** Three inventories, three
+  different numbers, and only the one that applied the recipe produced a figure that survived
+  contact.
+* **The best-looking batch is worth screening first, not converting first.** `nameIsString` had
+  the highest site-count-per-twin on the surface and the worst semantics under it.
