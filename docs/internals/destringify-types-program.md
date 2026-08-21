@@ -52584,3 +52584,51 @@ special cases live, and each one is a fixture someone already paid for.
 Thirty-one conversions across 119 PRs, six gates green on every one. Nine verdicts written as
 permanent in this log were later overturned by measurement — every one of them a claim about what
 the information could not do, and every one actually a claim about the attempt.
+
+## B190 — the leniency claim, tested: right conclusion, wrong reason
+
+B189 said the last two render sites "rest on the render's LENIENCY" and should stay unmatched.
+That is the shape of claim this log has been wrong about nine times, so it was tested rather
+than left standing.
+
+**The test.** Make the matcher lenient exactly where the render is — accept a field
+`fieldCodeForMatch` cannot code, instead of failing the row. Result: **0 diffs across 1,947
+files, and the render path at that site drops 2 -> 0.** Fully retired, byte-identical.
+
+By the numbers that is a shippable conversion, and it was not shipped.
+
+**Why not.** Three witnesses were built for the disagreeing case — two rows sharing a field-name
+set, differing only in a field nothing codes — and none of them REACHED the site. The third
+attempt explains the other two: the render path is taken precisely when no earlier rung matches,
+and adding a twin row gives an earlier rung something to match. Reach and the hazard appear
+mutually exclusive, which is a reason to suspect the hazard is unreachable and not a proof.
+
+**Then the actual mechanism.** `shapeFieldTypeCompat`'s leniency is NOT uniform. It stays lenient
+for an unclassifiable field EXCEPT at a code-15 nested-struct field, where it tightens through
+`nestedStructNamesCompat` — and its own header says why:
+
+> two unions' arms sharing a field-name set but differing in the nested layout do not collide
+> onto the first arm's variant (invalid wasm at the construct — the code-19 lesson applied to
+> code 15)
+
+A blanket lenient matcher drops that tightening. So the matcher would not be reproducing the
+render's leniency; it would be **strictly looser than the render at the one place the render was
+deliberately tightened after producing invalid wasm.**
+
+### What this changes
+
+B189's conclusion stands and its reason is replaced:
+
+| | |
+| --- | --- |
+| B189 said | the remainder is "the render's leniency", so matching it is the guess the fixtures punish |
+| B190 measured | matching it is 0 diffs and retires the site — the render's leniency is not one thing |
+| the real blocker | the code-15 tightening inside that leniency, which a blanket accept discards |
+
+Retiring the last two renders therefore needs `nestedStructNamesCompat`'s structural tightening
+in arena terms — which is reproducing a REFUSAL, the pattern B188 named as where this compiler
+breaks. That is a coherent piece of work with a known hazard, not a wall.
+
+**Nothing shipped.** The lenient build, its 0-diff A/B, its 2 -> 0 reach, and the three
+non-reaching witnesses are recorded so the next attempt starts at the tightening rather than at
+the leniency.
