@@ -47815,3 +47815,59 @@ is step 2 — thread a type into `registerValueUnionName`, caller by caller, one
 * **Build the measurement into the first step.** The plan's open question was "is threading twelve
   callers worth it", and the cheapest way to answer it was to add the column, populate it where the
   type is already free, and count. 66.3% answers it; an argument would not have.
+
+## B93 — B-1 step 2 opened, and the first caller threaded turned out to be inert
+
+B92 measured the sidecar at 66.3% and said the remaining 33.7% is one function's twelve callers.
+Step 2 opens that function and threads the first one — and the measurement immediately reprices
+the rest of the work.
+
+`registerValueUnionNameTy(name, tyIx)` is the real entry point now; `registerValueUnionName(name)`
+delegates with `-1`. The row's `unTyIx` carries whatever the caller knew.
+
+### THE FIRST CALLER IS INERT, AND WHY IS THE USEFUL PART
+
+`registerValueUnionName(inferLetTyAt(ilu))` looked like the easy one: the inferred-LET table has no
+arena column, but it banks the LetDecl NODE, so `nodeTyIxOf(inferLetIxAt(ilu))` is available.
+Threaded it. **Coverage delta: +0 rows.**
+
+Probing the caller explains it: it reaches **3 times** across the whole corpus, all three arena-
+COVERED, and all three registering `i32|null` — which is already registered by an earlier path, so
+`registerValueUnionNameTy`'s `isUName` guard returns before any row is pushed. The type was
+available, correct, and had nowhere to go.
+
+**A caller can be fully covered and still contribute nothing, because the row it would mint already
+exists.** That is a third way for a conversion to be worthless, alongside "site inert" (B82) and
+"population cannot contain the disagreement" (B71) — and it is invisible until you measure the
+column rather than the call.
+
+### WHERE THE 461 ROWS ACTUALLY COME FROM
+
+A probe firing whenever a row is minted with `tyIx < 0`: **295 corpus files**, and the unions are
+plain scalar value unions —
+
+| union | files |
+| --- | --- |
+| `i32\|null` | 81 |
+| `i32\|string` | 37 |
+| `string\|i32` | 24 |
+| `i64\|null` | 11 |
+| `i32\|boolean` | 11 |
+| `f64\|null` | 11 |
+
+These arrive from the FIELD and ELEMENT registration paths — `sFieldElemName`, `elemNm`, `valName`
+— where the caller holds an element NAME that was itself cut from a field type. So the types are
+upstream and reachable; the threading is real work but it is threading through the field-row
+recorders, not through the inferred-let table.
+
+**Step 2's remaining size is therefore: the field/element registration paths, quantified at 295
+files.** That is a sharper target than "twelve callers", and it is the kind of restatement that only
+comes from instrumenting the column.
+
+0 corpus rows — nothing reads `unTyIx` yet.
+
+### METHOD NOTE
+
+* **Measure the COLUMN, not the call.** "Does this caller have a type" and "does threading it
+  change the column" are different questions, and the first one answered YES here while the second
+  answered +0. The cheap instrument is a probe on the write, not on the caller.
