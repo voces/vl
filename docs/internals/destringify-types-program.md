@@ -45652,3 +45652,54 @@ Recorded as refuted-at-this-shape rather than passed on.
   programme's remaining size. Three is not a sample.
 * **Check a handed-over finding before repeating it.** The `letI32KeyedMap` over-answer was the
   inventory's headline latent bug and it is not one at the shape given.
+
+## B56 / D-REFLISTKIND — two rungs convert with 23 rows of evidence, one must NOT, and one measures dead
+
+`tyAnnRefListKind`'s six name rungs, taken as a batch. The batch is the point: three different
+answers came out of it.
+
+### 1. TWO CONVERT, AND THIS IS THE BEST-EVIDENCED CONVERSION IN THE PROGRAMME
+
+`nameIsF64Array(lt.tyName)` → `tyIsF64Array(nodeTyIxOf(tyIx))`, and the `i64` twin. Corpus 0 rows;
+both rungs forced off moves **23** — `arrays/i64-array.vl`, `arrays/infer-build-scalar.vl`,
+`arrays/f32-array-literal-self-classifies.vl` and twenty more. Reached, load-bearing, arena agrees
+on all 23.
+
+### 2. ONE MUST NOT BE CONVERTED, AND ITS TWIN LOOKS IDENTICAL
+
+`nameIsF32Array` has a sibling `tyIsF32Array` sitting between the other two, written the same way:
+
+```
+tyIsF64Array(tyIx) { tyKindOf(tyIx) == 12 }   // live
+tyIsI64Array(tyIx) { tyKindOf(tyIx) == 20 }   // live
+tyIsF32Array(tyIx) { tyKindOf(tyIx) == 21 }   // DEAD — tyKindOf never returns 21
+```
+
+`tyKindOf` returns {0, 2, 3, 7, 10, 11, 12, 13, 20}. **Converting that rung to match its two
+neighbours would silently disable it** and an `f32[]` annotation would fall through to kind 0.
+
+The gap is deliberate: a float LITERAL types f64, so a general typed claim would mis-classify a
+literal-built f64 list as f32. The arena cannot answer this question today. That is what makes
+the rung different from its neighbours rather than the next one to convert — and nothing in its
+surroundings says so, which is why the reason is now written at the rung.
+
+**A named `tyIs*` predicate is not evidence that the arena can answer.** Three siblings, same
+shape, same file, and one is a constant `false`.
+
+### 3. AND ONE MEASURES DEAD BUT IS NOT DELETED
+
+`nameIsNulLitUnionList(lt.tyName) { return 9 }` sits three rungs below
+`annIsNulLitUnionArray(tyIx) { return 9 }`, which is already arena-side and answers for the same
+shape. Turning the name rung off moves **0 corpus rows**.
+
+That proves corpus-UNREACHABLE, not dead — the distinction this programme has now made four
+times. Deleting a rung on a 0-row reading is the same error as shipping an arm on one. Left in
+place, with the measurement recorded so the next pass starts from it rather than re-deriving it.
+
+### METHOD NOTES
+
+* **Convert in batches within one function, and expect the answers to differ.** Six rungs: two
+  convertible with strong evidence, one actively dangerous to convert, one dead-looking, two
+  needing predicates that do not exist. A per-rung decision, not a per-function one.
+* **Check that the twin you are converting TO actually answers.** `tyIsF32Array` is `== 21`
+  against a function that never returns 21. The name of a predicate is not its behaviour.
