@@ -45508,3 +45508,36 @@ annotation-only path) would reach them, and no such program was built.
 * **An unreachable conversion is still worth making, and must be labelled.** It removes a string
   decision from the source. It does not remove one from any run, and a commit claiming otherwise
   would be the same overreach this programme keeps recording.
+
+## B53 / D-NULSTRLIST — a half-converted predicate finishes, and this one is actually reached
+
+`annIsNulStrListDeep` was half arena already: the guard that rules out the atom-niche element was
+structural, because the NAME test cannot do it — an inline `(("a" | "b") | null)[]` canon-renders
+`(string | null)[]` and `nameIsNulStrListDeep` admits that spelling, which is the invalid wasm
+the predicate exists to prevent. The POSITIVE answer was still `nameIsNulStrListDeep(tyNameOf(...))`.
+
+So the two halves were asking the same question of different sources. `tyIsNulStrArr` — an ARRAY
+whose element is a NULLABLE STRING — is the sibling of `tyIsNulLitUnionArr` sitting directly
+below it, the same shape asked about a different element type. The caller already peels the outer
+`| null`, which is what the name side does with `nullablePartOf`, so both halves now peel once
+and ask the arena.
+
+### THE SEPARATOR RAN, AND THIS TIME IT SAYS SOMETHING
+
+Corpus: **0 rows**. Forcing the arena arm to return FALSE: **1 row** —
+`tests/cases/generics/mono-nullable-arg-pin.vl`. So the arm is reached, load-bearing on a live
+corpus file, and the arena agrees with the render there.
+
+That is the difference between this slice and B52, whose sabotage also moved 0 and which
+therefore shipped as a source-level change with no run-level effect. **Two conversions, identical
+corpus numbers, opposite evidential value** — and only the sabotage distinguishes them.
+
+### METHOD NOTES
+
+* **Run the separator before writing the commit message, not after.** The corpus number is the
+  same in both cases; the sabotage is what determines whether the commit can claim a live
+  conversion. B52's and B53's headline numbers are both "0 rows moved".
+* **A half-converted predicate is a signal, not a leftover.** The structural half was written
+  because the name half was WRONG for a case that mattered. That is evidence the name half is
+  wrong in general, and the remaining half is worth finishing rather than leaving as "the part
+  that works".
