@@ -46686,50 +46686,107 @@ That is the same fact read from both sides.
   SEED PATH holding the stashed build and restores the source without the binary. Six measurements
   here compared no-fix against no-fix and agreed perfectly, which is what that comparison does.
 
-
-## B74 / D-INFERRETNULL — the second inferred-return reader, and the first slice run to the corrected recipe end to end
+## B74 / D-INFERRETNULL — the second inferred-return reader, and a control that proved the wrong caller
 
 `emit_collect`'s void-inference fixpoint asked `unionSetHasNull(inferRetNameOf(fn.fnName))` — split
-a rendered member set on `|`, look for `null`. It now asks the same helper the annotated reader
-uses. Both callers are routed through one exported `inferRetBearsNull`, which is where that
-question lives now; two dead imports (`inferRetNameOf`, `unionSetHasNull`) leave `emit_collect`
-with them.
-
-This is B60's steps 7-11 run in order, and every one of them mattered:
+a rendered member set on `|`, look for `null`. It now asks the arena. Both callers route through
+one `inferRetBearsNull`, which lives in `typecheck.vl` beside its two dependencies; `emit_collect`
+loses two imports with the string decision that used them.
 
 | step | instrument | result |
 | --- | --- | --- |
 | 7 liveness | site forced `true` vs forced `false` | **828 of 2,054 rows** |
-| — | conversion vs master, one seed both sides | 0 rows |
-| 8 disagreement | `emitFail` on `arena != name`, behaviour preserved | 0 corpus, 0 on the compiler's own source |
-| 8 CONTROL | same probe, recursion disabled in `tyBearsNull` | **fires** on a nested-null witness |
-| 9 census / 10 reach | `emitFail` on every reach, names tabulated | `""` x341, `i32` x4, `i32\|null` x1 of 346 |
+| — | conversion vs master, one named seed both sides | 0 rows |
+| 8 disagreement | `emitFail` on `arena != name` at both callers | 0 corpus, 0 on the compiler's own source |
+| 8 control A | recursion deleted from `tyBearsNull` | fires — **at the `emit_classify` caller only** |
+| 8 control B | `TyNullable` arm of `tyBearsNull` forced false | fires on 2 corpus files **at the `emit_collect` caller** |
+| 9/10 reach | `emitFail` on every reach, FULL corpus | 848 reaches |
 
-**Step 8's control is the entry's reason for existing.** The probe returned 0 on the corpus, 0 on
-the compiler, AND 0 on the very witness built to make it fire — because B71's recursion fix, which
-landed between the two slices, had removed the disagreement it was built to catch. A 0 from an
-instrument that cannot fire is the same 0 as a clean result. Disabling the recursion in a control
-build made it fire on the witness immediately, which is what licenses reading the other three 0s.
+### CONTROL A PROVED THE INSTRUMENT AT THE CALLER THIS SLICE DOES NOT CHANGE
 
-**The reach table is the other half.** No union of any complexity arrives at this site: the
-recorded name is EMPTY on 98.6% of reaches. Both encodings agree on `""`, `i32` and `i32|null`
-trivially, so the conversion is equivalent by the shape of its INPUT — a mechanism, not a sweep.
-That is worth stating precisely because it also bounds the slice's value: this removes a string
-decision from the SOURCE and cannot change behaviour, which is exactly the goal and exactly the
-claim.
+The first draft shipped with one control, and it fired exactly once — on
+`inference/inferred-return-nested-null-union.vl`, at the `emit_classify` arm, which #1562 already
+converted. **At the new caller it could not fire at all.** Every name reaching the void-inference
+site carries its `null` at the TOP of the arena type — a `TyNullable` root or a flat `TyUnion` with
+a `TyPrim null` member — and `tyBearsNull` answers both BEFORE the recursion the control disabled.
 
-### AND THE STALE-SEED TRAP CAUGHT ME AGAIN, ONE ENTRY AFTER I WROTE IT DOWN
+So the new caller's 0 was uncontrolled, by exactly the rule this entry was written to state. Control
+B sabotages `if t is TyNullable { return true }` instead and fires on 2 corpus files at the right
+caller. **A control has to be aimed at the site under test, not at the predicate's name.**
 
-The first A/B here reported **4 rows**. All four were #1563's own fixtures, and the "master" side
-FAILED them — because the baseline had been copied from `build/vl-compiler.wasm` in the main
-checkout, which had last been refreshed during the #1562 work and so predated #1563 entirely.
-Rebuilding both sides from ONE named seed gave 0.
+### THE REACH TABLE WAS WRONG, AND SO WAS THE ARGUMENT BUILT ON IT
 
-B73's method note says "always name the seed explicitly" and I copied a path instead, in the very
-next slice. The note is now worth more than the entry it sits in: **a baseline is a build you
-made, from a commit you named, in this measurement — never a file that happens to be lying at a
-well-known path.**
+The draft reported "`""` x341, `i32` x4, `i32|null` x1 of 346" from the first 700 corpus files and
+concluded the conversion was "equivalent by the shape of its INPUT". Over the FULL corpus:
 
+| recorded name arriving | reaches |
+| --- | --- |
+| `""` (empty) | 837 |
+| `i32` | 7 |
+| `string` | 2 |
+| `i32\|null` | 1 |
+| **`Cat\|Dog`** | **1** |
+
+`Cat|Dog` is file 1528 of 1566 — outside the sampling window, and a two-atom struct union that the
+census claimed could not arrive. **The "structurally cannot" hypothesis is false**: a function with
+no valued return reaches here with a complex inferred name by two ordinary productions — an
+else-less tail `if` over a union value (`blockTailIsValue` deliberately ignores else-less ifs), and
+a tail Member-target assignment with a union RHS (`stmtIsTailValue` rejects assignments). Witnesses
+reach with `i32|string|null`, `Cat|Dog|null`, `K|null`, `W|i32|null`, and `i32|string` — a union
+with no `null` atom at all.
+
+The equivalence still holds. **The argument for it does not, and a sampled census is how I got a
+true conclusion from false evidence.** Sample a corpus and you have measured the sample.
+
+### THE FALLBACK WAS `false` WITH A STRING OPERATION IN FRONT OF IT
+
+The draft kept `unionSetHasNull(inferRetNameOf(name))` for `ty < 0` and described it as the live
+half at the unguarded caller. Both halves of that are wrong. It IS reached — 837 of 848 times — and
+it always returns false, because no arena index means no ROW and no row means an empty NAME. Every
+name-keyed `recordInferRet` passes a real `er`; the one that does not keys `"#" + nodeIx`, which no
+function name collides with. So the leg is `unionSetHasNull("")`, which is false by construction.
+
+It is now `if ty < 0 { return false }` — and with the string operation gone the helper has no
+reason to sit in `emit_classify` at all. It moved to `typecheck.vl`, next to `inferRetTyIxOf` and
+`tyBearsNull`, the only two things it reads. **A dead leg had been dictating the module layout.**
+
+### TWO SMALLER THINGS, RECORDED RATHER THAN GLOSSED
+
+**The conversion is not a pure substitution.** `unionSetHasNull` reaches `msSetOfText`, which stamps
+a negative memo and can MINT a set id (`msSetIntern`, first-wins `msSetByText`). Skipping the call
+shifts set-id allocation order at this site, and `collectU` runs before `computeVoidFns`, so
+`i32|null` / `Cat|Dog` are exactly the texts that would have hit. Benign across the corpus, and not
+the same claim as "swapped one predicate for another".
+
+**"One home" is still an overstatement.** `emit_collect` decides an adjacent nullability question
+off the same column from the render 200 lines up — `nameIsNulString(inm)`, `isValueUnionName(inm)`,
+both off `inferRetTyAt(inRow)`. This is the SECOND READER, not the last one.
+
+### AND THE STALE-SEED TRAP, TWICE MORE
+
+The first A/B here reported 4 rows — all of them #1563's own fixtures, with the "master" side
+FAILING them, because the baseline had been copied from `build/vl-compiler.wasm` in the main
+checkout, last refreshed during #1562. Rebuilt from one named seed: 0.
+
+Then, worse: refreshing that same path to FIX the staleness repointed it under a review running
+concurrently, which noticed its baseline change mid-session. **The trap is not just stale artifacts,
+it is a shared mutable path** — `refresh-compiler.sh` reads and writes `build/vl-compiler.wasm`, so
+any measurement that names that path is racing every other session. Name a seed in the scratchpad
+and nothing can move it.
+
+And once here I ran `git checkout -- .` to tidy a probe and deleted the slice's own source, leaving
+a measured binary with nothing behind it. The rebuild came back byte-identical, so the number
+stood — but that was luck, not method. Method note 92 already says this about `git checkout --`.
+
+### METHOD NOTES
+
+* **Aim the control at the SITE, not the predicate.** A sabotage that fires somewhere proves the
+  instrument works somewhere. If it cannot fire at the caller under test, that caller's 0 is
+  uncontrolled.
+* **A sampled census measures the sample.** The one name that refuted the argument sat at file
+  1528 of 1566.
+* **A fallback that always returns false is not a fallback.** Check whether the "declines" branch
+  can produce a non-trivial answer before letting it shape an API or a module boundary.
 
 ## B75 — the queue closed out, and the fixture written to pin an arm found a miscompile instead
 
