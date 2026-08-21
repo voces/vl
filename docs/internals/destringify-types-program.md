@@ -48120,3 +48120,76 @@ inline ones do not"**.
 * **Partition a disagreement before theorising about it.** Two files carried the entire argument
   through two entries and two opposite conclusions. Splitting them by declared-ness took one probe
   and showed both readings were generalising from the same unrepresentative pair.
+
+## B98 — both reader shapes measured, both rejected, and why the string survives here
+
+B97 said the four sites are applicable for declared unions with a two-file inline residue, and that
+an `arena-first, name for the residue` reader was the shape. Both possible shapes are now built and
+measured. **Neither works**, and the reason is the same fact seen from a third side.
+
+### SHAPE 1 — FALLBACK ALWAYS: correct, and removes nothing
+
+```vl
+if ty >= 0 { …index scan…; if hit { return true } }
+isUName(name)          // reached whenever the index misses
+```
+
+Corpus A/B: **0 rows.** And at the converted site, over the corpus:
+
+| | |
+| --- | --- |
+| queries | 2,464 |
+| answered by the ARENA index | **12 — 0.5%** |
+| fell through to the NAME scan | **2,452 — 99.5%** |
+
+The index can only short-circuit a TRUE. This predicate answers FALSE for almost everything it is
+asked about — most nodes are not unions at all — so the name scan runs anyway, now behind an extra
+scan of `unTyIx`. **A fallback reader at a mostly-FALSE membership test is a pessimization, not a
+destringification.**
+
+### SHAPE 2 — AUTHORITATIVE WHEN COVERED: removes the string, and is wrong
+
+```vl
+if ty >= 0 { …index scan…; return hit }   // trust the index entirely
+isUName(name)                              // only for uncovered nodes
+```
+
+Corpus A/B: **2 rows**, both loud emit errors, both the inline-union files —
+`only i32[] arrays and struct/union element arrays are supported`.
+
+### THE FACT, FROM THE THIRD SIDE
+
+An INLINE union's row carries a `unTyIx`, so the registry's coverage is 100% (B94). But that index
+came from resolving a SPELLING, and the querying node's index came from the checker constructing
+the type — and the arena is an append log, so those are different indices for the same inline type.
+Coverage is not the same as correspondence.
+
+For a DECLARED union they do correspond, because `declTyIxOfName` looks the declaration up. That is
+B97's result and it still stands. What B97 got wrong is the inference that a residue small enough
+to name is a residue small enough to bridge: **the residue is 2 files, and it is 99.5% of the
+queries away from being cheap to bridge**, because the queries that matter are the ones answering
+NO.
+
+### SO THE STRING SURVIVES HERE, AND THIS IS THE REASON
+
+`isUName` is a membership test over a registry that holds two kinds of row with two kinds of
+identity — declarations, which have a stable non-string id, and inline spellings, which do not.
+A reader that is correct for both must consult the spelling; a reader that skips the spelling is
+wrong for one of them. **Not because the arena is deficient, and not because the name is the only
+identity — because the registry is heterogeneous.**
+
+Making it homogeneous means giving inline unions a stable identity, which is interning them, which
+B96 measured as 133 broken rows. The circle closes.
+
+### THE STATE, AND IT IS NOT A CLIFFHANGER
+
+Every render-then-test site: measured and settled. The node-in-scope surface: fifteen sites, eleven
+settled. The four that remain are membership tests against a heterogeneous registry, and all three
+candidate shapes — interning, index-authoritative, index-with-fallback — have been built and
+measured against the corpus. The string is doing work no available structure can do.
+
+### METHOD NOTE
+
+* **For a membership test, measure the FALSE path.** Every reader shape in this programme has been
+  judged on whether it agrees; this one agrees perfectly and is still worthless, because agreement
+  says nothing about which branch does the work. 12 short-circuits out of 2,464.
