@@ -52500,3 +52500,42 @@ somewhere the code's shape did not:
 The remaining 21 at this gate are the 7 nullables plus the type-parameter case and whatever the
 struct/array arms still decline — and those DO need the guard, which is the first time in this
 programme that the intricate-looking work is also the actual work.
+
+## B188 — the nullable arm, and the shape of a branch worth porting
+
+The 7 nullables left after B187 sit in `mvValKindOfName`'s `nulRefMapValInnerOf` branch — and
+that branch is a LOWERING branch, not a rejecting one. A string inner is kind 3, a map inner 6,
+any other ref inner kind 1 (the niche rides its non-null twin's vals rep).
+
+Only two shapes in the whole branch reject, and both are EXCLUDED rather than reproduced:
+
+| shape | why it is left to the render |
+| --- | --- |
+| a CLOSURE inner whose RESULT is a literal union (-3) | deciding it needs the arrow's return spelling |
+| a nullable with NO ref inner | falls PAST the branch into the atom counting, which can reject |
+
+So `TyFunc` inners and non-string `TyPrim` inners are out. 0 diffs; the gate answers **87 of
+106**, up from 85.
+
+### The pattern across four arms
+
+B172, B187 and B188 all ported a branch's POSITIVE cases and let anything whose REJECTION they
+would have to reconstruct fall through. B171 and B184 did the opposite — copied a fall-through,
+renamed a rep — and both produced invalid wasm.
+
+**Porting what a branch ACCEPTS is safe; reproducing what it REFUSES is where this compiler
+breaks.** The refusals are where the accumulated special cases live (a litunion behind an arrow,
+an atom niche, a heap-type twin), and each is a fixture someone already paid for.
+
+### The gate, end to end
+
+| | answers | remainder |
+| --- | ---: | --- |
+| B174 (prims, map, closure) | 64 / 106 | — |
+| B175 (+ arrays) | 72 | unions, nullables, structs |
+| B186 (+ structs, by census) | 79 | 8 unions, 7 nullables |
+| B187 (+ non-null unions) | 85 | 7 nullables |
+| B188 (+ nullable ref inners) | **87** | closure inners, non-string prim inners, type params |
+
+What is left is exactly the set whose rejections would have to be reconstructed — which is the
+honest floor for this consumer, not a gap waiting on another predicate.
