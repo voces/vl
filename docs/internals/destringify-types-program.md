@@ -51553,3 +51553,55 @@ someone tried.** The five sources were enumerated; the readings OVER those sourc
 Two of the three "final" categories have now fallen — `paramVariantIndex` to a banked column
 (B146), this one to a wider predicate. The array rung remains, and it is the only site in this
 log where both directions disagree and no reading of any source resolves them.
+
+## B165 — the array rung converts, and the xfail's error moves to its real cause
+
+B164 named the failure mode that had kept four declines alive: **a decline against "the arena"
+is only ever a decline against the specific arena predicate someone tried.** Applying that to
+the last standing site — the array rung, which B133 and B147 declined after testing all five
+sources — asks a different question than either did: not "does a reader exist" but *what reader
+would have to exist*.
+
+The rung asks "is this SPELLED as an array". Both of B147's disagreement directions are
+symptoms of asking the arena instead: it reads through a type PARAMETER to its binding (4 rows),
+and it holds a non-array type for a shadowed alias whose spelling says `i32[]` (2 rows). Neither
+is a question about the spelling.
+
+The tree is. Re-measured on current master:
+
+```
+disagreements (tree vs name): 1     ZAT HAS-TS name=T tree=F [A[]|B[]]
+```
+
+One row, and **the tree is right**: `A[]|B[]` is spelled as a union, and `nameIsArray` claims it
+only through the trailing-`]` false positive B108 documented. Converted, with the name kept for
+annotations canon left treeless.
+
+### The xfail's error moved, and that is the point
+
+Corpus A/B is 0 of 1947 — but `xfail-false-reject-inline-same-shape-array-union.vl` changes
+which error it emits:
+
+```
+before:  emitProgram: only i32[] arrays and struct/union element arrays are supported
+after:   emitProgram: `is` test but no union type declared
+```
+
+The gap is unchanged; the program still does not compile. What changed is that the message now
+names the real cause — the collapsed union was never registered — instead of blaming the rung
+where the failure first surfaced. B133 measured that relocation and treated it as a reason NOT
+to convert; it is the opposite. A diagnostic that points at the actual defect is better than one
+that points at the first place the defect was noticed, and the fixture now pins the accurate one.
+
+### Twenty-two conversions, and the last decline standing
+
+| site | state |
+| --- | --- |
+| the array rung | **converted** — the tree answers the spelled-shape question |
+| `collectFnValUse`'s closure scan | converted (B164) — 152 lines deleted |
+| `paramVariantIndex` | converted (B146) — the banked atom count |
+| `structIndexOfTypeName` | a name→index resolver; its INPUT is a name |
+
+Every site this log ever declined has now been converted except the one whose contract is to
+take a name. Three of the four "permanent" declines fell within the last six entries, all to the
+same correction: **the reader that was tried is not the only reader that could exist.**
