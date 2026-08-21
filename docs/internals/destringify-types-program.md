@@ -51312,3 +51312,49 @@ That is the fourth distinct way a site escaped a survey in this log:
 
 Twenty conversions. Searching for a PATTERN finds what the pattern's spelling covers; walking a
 call graph finds what the pattern missed.
+
+## B160 — the `nodeTyName` walk, completed
+
+B159 found `anonFieldCode` by walking a call graph rather than grepping a pattern, and closed
+with "searching for a pattern finds what the pattern's spelling covers". Completing that walk
+for `nodeTyName` — the renderer B121's surveys never searched — bounds what it can still hide.
+
+Eleven call sites. All but the one B159 converted are already handled, and each states its own
+reason:
+
+| site | state |
+| --- | --- |
+| `emit_classify:7363` | `repRowOfTyStruct(nodeRepTyIxOf(objIx))` leads; the render is the fallback |
+| `emit_classify:19471` | `structIndexOfTypeName(snc)` leads; same shape |
+| `emit_classify:24433` | D-ARROWTY — `nodeTyIsFunc` decides; the render survives only as the `!= ""` gate that made the conversion byte-exact |
+| `emit_classify:24888/24908` | same, and the render is also the RETURN VALUE |
+| `emit_rewrite:984` | the render feeds `resolveShapeToNominal` — a producer, not a test |
+| `emit_collect:823` | the render feeds `internCloResultChain` — a key |
+| `emit_classify:14610` | **converted** (B159) |
+
+So the renderer that escaped every survey was hiding exactly one unconverted site, and the rest
+of its callers had already been through this programme or its predecessors.
+
+### What that settles about the counts
+
+B128's "~258 name-first functions" and every subsequent tally were greps over `.tyName` and
+`tyNameOf(`. B159 showed those miss a renderer; B160 shows the miss was one site, not a hidden
+tranche. Both facts matter: the counts are lower bounds, AND the gap between the bound and the
+truth is small at least for this renderer.
+
+The remaining general renderers (`tyToStr`, `tyToNominalName`, `structNameOfTy`,
+`genAppNameOfTy`, …) are producers by construction — they exist to hand a name to a table, a
+diagnostic, or a synthesis — and a producer's render is its answer, not a fact being recovered.
+
+### Twenty conversions, and where the line is
+
+The programme's remaining surface, walked rather than grepped:
+
+- `collectFnValUse`'s shape entry — declined on BEHAVIOUR, with its own measurement
+- the array rung — no receipt in any of the five sources
+- `shapeFieldTypeCompat`, `nameFieldCode`'s string-only callers — no node and no resolvable
+  type at the call; they take a spelling because the caller manufactured one
+
+That last row is bucket 4 as it actually exists: not 258 convertible sites, but a handful of
+functions whose inputs are strings all the way up to a producer that made them. The count was
+never the shape of the work.
