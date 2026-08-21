@@ -51408,3 +51408,53 @@ Twenty conversions, and a map that took seven wrong turns to draw:
 
 The counts were never the shape of the work. What made the difference was asking what a pass had
 to REMEMBER, and walking call graphs instead of grepping patterns.
+
+## B162 — the behaviour decline re-tested against the tree, and refined
+
+B161 listed `collectFnValUse`'s shape scan as "declined on BEHAVIOUR" and treated that as final.
+The original note declined it against the ARENA, and its reasoning is exact:
+
+> "the name walk is ALIAS-BLIND by construction — it inspects only an INLINE `{…}` spelling, so
+> a declared alias annotation … never reaches the field split, while the arena resolves the
+> alias and finds the closure field."
+
+That is B126/B127's situation precisely — the arena answers a broader question than the site
+asks — and the fix in those two entries was not to accept the broader answer but to find the
+reader that asks the SAME question. For "was this spelled as an inline shape", that reader is
+the spelling tree (`tsKind[root] == TS_OBJ`, #1620), which the original note never tested.
+
+Tested now, per B139's availability-first rule:
+
+```
+217 files where the name test sees an inline shape
+174  HAS-TS
+ 43  NO-TS
+```
+
+**The tree cannot answer for 43 of them.** Canon rewrote those annotations and took their trees
+with it (B139/B140), so a tree-gated conversion would keep the name for a fifth of the
+population — which is not a conversion, it is a second reader beside the first.
+
+So the decline stands, now against all three candidate readers rather than one:
+
+| reader | why it fails here |
+| --- | --- |
+| the arena | resolves aliases; answers a broader question, and `fnValUsed` is monotone so the extra trues intern machinery the compiler does not intern today |
+| the spelling tree | asks the RIGHT question but is absent on 43 of 217 |
+| the name | what the site uses |
+
+That is a materially better-supported decline than B161's, and it took testing the reader the
+original note did not consider. The pattern of this whole log holds to the end: **a decline is
+only as strong as the list of readers it was measured against**, and this one had been measured
+against one.
+
+### The final position
+
+Twenty conversions. Three remaining categories, each now tested against every reader available:
+
+- `collectFnValUse`'s shape scan — arena too broad, tree absent on 43 of 217
+- the array rung — no receipt in any of the five sources (B147)
+- `structIndexOfTypeName` — a name→index resolver whose INPUT is a name, called as the
+  fallback after an arena rung declines (B161)
+
+None is waiting on a decision, and none has an untested reader left.
