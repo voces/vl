@@ -52041,3 +52041,20 @@ an unbuilt probe — all of which look like agreement.
 
 B173 said this function "RENDERS on every map node". It does not: it is reached on 106 of 1,947
 files. The per-CALL claim was right, the per-CORPUS one was overstated.
+
+## B175 — the map gate's array arm
+
+`mvValLowersTy` (B174) left arrays out on the same caution that keeps `TyNullable` out of code 5.
+Checked rather than assumed: a list value reaches `mvValKindOfName`'s TWO array arms —
+`scalarListKindOfName >= 0` and `nameIsRefArray` — and both answer kind 6, so every array shape
+the classifier recognises lowers. The -3 producer is the nullable guard, which tests the TOP
+level (`unionSetHasNull`); an array spelling never trips it, because `(T | null)[]` is an array
+with a nullable ELEMENT, not a nullable union.
+
+Corpus A/B 0 diffs; the rung now answers **72 of the 106** files that reach the function, up
+from 64.
+
+The 34 that still render are unions, nullables, and struct values — the first two by the -3
+guard above, the third by the interner-progress wall (B170) that `structIndexByValName` sits
+behind. Same three causes as the struct site, which is the point: the two consumers are
+different code with the same remainder.
