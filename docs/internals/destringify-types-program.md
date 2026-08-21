@@ -49145,3 +49145,57 @@ The pattern held a fourth time, and this run adds a sharper version of it: twice
 registry-based twin (`isStructOfTy`, `isUnionOfTy`) was the WRONG instrument and a plain
 shape test on the recorded type beat it outright — 28 disagreements down to 8, and 15 down
 to 2. Those twins were built for identity questions. An accept/reject rung never had one.
+
+## B116 — the array rung, and the ladder's name readers are down to two files
+
+`nameIsArray` (124 files) was B113's one undiagnosed rung, and B108 had flagged it as doing
+DOUBLE DUTY: it tests the rendering's last character for `]`, which also matches a union
+whose last arm is an array (`S[] | T[]`, `i64 | S[]`), so the name claimed union boxes as
+well as arrays.
+
+That duty is gone, and not because anything was done to this rung. The union rung ahead of
+it now asks the type (#1607), so union boxes are claimed before the array question is ever
+put — which is what lets this be the strict `TyArray` test it always meant to be.
+
+Dual-run against `nodeTyIsArrayish` (a `TyArray` test peeling the one-member alias wrapper,
+the same transparency `nodeTyIsStructish` needs): **zero disagreements**.
+
+A zero is worth nothing until the site is proven reached, so: **253 files reach this rung**,
+133 answering `T/T` and 120 answering `F/F` — both directions represented, the agreement
+real. Removing `nameIsArray` outright breaks **zero** files. Its import is gone.
+
+### The ladder, finished except for one boundary
+
+| rung | reads |
+| --- | --- |
+| five scalar comparisons | the arena (#1605); spelling fallback measured at 0 corpus uses |
+| `nameIsString` | the arena (#1606), import dropped |
+| `isUName` | the arena (#1607); name kept for **2** files |
+| `isSName` | the arena (#1608), import dropped, **no remainder** |
+| `nameIsArray` | the arena (#1609), import dropped, **no remainder** |
+| `variantIndexOf` | the name — **2** files, declined on B107/B109 |
+
+Five PRs, `emit_sections.vl` down three name-classifier imports, and what began as "the
+ladder is string-based at every rung" is now two files — `union-same-shape-discriminant-sound.vl`
+and `struct-union-same-shape.vl`, the same pair every time.
+
+### What the sequence actually taught
+
+Three separate lessons, each of which had to overturn the previous plan:
+
+1. **B102's decline was about the substitution, not the rung.** Five comparisons could not
+   move because nothing stated the numeric litunion's lowering from the arena. Add that one
+   rung and they move (#1605). A decline is evidence about what was tried.
+2. **The registry twins were the wrong instrument.** `isStructOfTy` and `isUnionOfTy` were
+   built for identity questions and lost to a plain shape test on the recorded type — 28
+   disagreements down to 8, and 15 down to 2. An accept/reject rung never had an identity
+   question in it, and matching against a registry whose rows are parsed from softened
+   spellings cannot work: measured, those rows differ from the arena in arity, grouping and
+   softening all at once.
+3. **Converting one rung can dissolve another.** `nameIsArray`'s double duty needed no
+   repair; it evaporated when the union rung stopped reading names. Rungs in a cascade are
+   not independent, and the cheapest fix for a hard one may be upstream.
+
+What survives is exactly B107's boundary and nothing else: a union of structurally identical
+arms, where the spelling is the only carrier of a distinction the type system has already
+soundly collapsed.
