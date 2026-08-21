@@ -49991,3 +49991,54 @@ second reader to disagree with. The corpus A/B would be the only instrument, and
 established that A/B is blind to any rung that emits no bytes.
 
 Recorded here so the decision is made on numbers rather than on momentum.
+
+## B133 — the array minting rung: two twins, two different wrongs, and where B108 actually lives
+
+The last node-bearing rung in `mAssignTypeIndices`:
+`nameIsArray(nd.tyName) && !isUnionOfTy(nodeTyIxOf(i))`. Both candidate twins were measured,
+and each fails differently — which is what makes the site worth recording rather than just
+declining.
+
+**The arena twin** (`nodeTyIsArrayish(i)`): 1380 files reach the rung, **2** disagreements,
+both `name=F arena=T`, and both a bare type PARAMETER (`T`, `X`). The arena sees the
+parameter's BINDING — a concrete array in a monomorphized instance — while the spelling sees
+the parameter. A `genTyParamArr(nd.tyName)` rung sits immediately above precisely to catch
+generic ORIGINALS, so the name is doing generic-original detection that substitution erases.
+That is a fifth distinct blocked cause: **the arena reads through a type parameter to its
+binding.**
+
+**The tree twin** (`tsKind[root] == TS_ARR`): **1** disagreement, `name=T tree=F`, and it is
+`A[]|B[]` — the fixture this programme filed itself in #1601. The tree is RIGHT: that
+annotation is spelled as a union, and `nameIsArray` claims it only through the trailing-`]`
+false positive B108 documented.
+
+### Why the tree reading still does not ship
+
+It looked like it might FIX B108's false reject. It does not — it MOVES it:
+
+```
+master:        emitProgram: only i32[] arrays and struct/union element arrays are supported
+tree reading:  emitProgram: `is` test but no union type declared
+```
+
+The program clears the array rung and then fails at `xs is A[]`, because the union collapsed
+to a single member and no union type was ever registered. So the array rung was never B108's
+defect — it was the first place the real one surfaced. **The fix belongs where the collapse
+happens, not where it is first noticed**, and converting this rung would only relocate the
+error while changing a pinned xfail's message.
+
+Declined, with both measurements recorded so neither twin is retried.
+
+### The node-bearing surface is now enumerated and closed
+
+Every call site in the emitter that passes a rendered annotation into a classifier while
+still holding its node has been measured and adjudicated:
+
+| outcome | sites |
+| --- | --- |
+| converted | the param ladder (6 rungs), the string rung, the map value ×2, the closure sig key, the top-level arrow, the inline-shape guard, the f32 rung, the nul-bool list, the nullable-scalar list, the return-slot variant, the mono type-param test, the checker's value-union test |
+| declined, cause recorded | `variantIndexOf` ×13 (B131), `isUName` ×4, `structIndexByName` ×4, the ref-list family ×6 (B123), the local-i32 rung (B129), this rung (B133) |
+
+What remains is bucket 4 — ~258 classifiers reachable only through a signature change, with
+its cost quantified in B132 and no dual-run available to validate it. That is a decision
+about the emitter's interfaces, not a continuation of this method.
