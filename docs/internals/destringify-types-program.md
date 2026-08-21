@@ -45265,3 +45265,50 @@ was a guess; this is the number.
 * **A grep over a NAMING CONVENTION enumerates what someone already classified.** A grep over the
   CALL enumerates what is actually there. When the fix is "everyone who asks X must also ask Y",
   the search term is X.
+
+## B50 / D-ARRLIT — one symptom, two causes, and the element ORDER tells you which
+
+A literal-union atom in a string-array literal was check-clean invalid wasm. The obvious reading
+— "another missing widen, same as the six" — is right for HALF the cases and wrong for the other
+half, and the element order is what separates them.
+
+| literal | list built | what is wrong |
+| --- | --- | --- |
+| `["plain", v]` | STRING list | the atom element never widened — a MISSING WIDEN |
+| `[v, "plain"]` | ATOM list | the wrong CONTAINER was built |
+| `[v]` | ATOM list | the wrong CONTAINER was built |
+| `[v]` into `K[]` | ATOM list | correct |
+
+`arrLitIsStr` takes the FIRST element's type as the signal, and declines outright when
+`nodeArrayElemIsLitUnion`. So a string-first literal builds a string list (and needed one line —
+`emitStrValue` in place of `emitExpr` in the element loop), while an atom-first literal builds an
+atom list and the binding's `string[]` slot is simply ignored.
+
+**The wat is what separated them**, and reading it was the cheapest step in the whole slice: the
+failing module built `struct.new 2` — a wrapper backed by `(array (mut i32))` — where the slot
+wanted the wrapper backed by `(array (mut (ref null 1)))`. Ref-vs-ref in the error text, not
+ref-vs-i32, and that single detail says "wrong container" rather than "unconverted value".
+
+### THE CHECKER IS RIGHT; THE EMITTER IS WRONG
+
+The pinned half is not an inference gap. The linter reports `ys` **is inferred as `string[]`** —
+the checker resolved it correctly and the emitter built something else. That makes it the same
+shape as B49's parameter-shadowing split, and it narrows the fix from "propagate context" (an
+earlier draft of the pin said that) to "make `arrLitIsStr` prefer the binding's element type when
+they disagree".
+
+Two files, because two causes:
+`tests/cases/literal-unions/litunion-atom-in-string-array-literal.vl` (fixed) and
+`tests/cases/soundness/xfail-miscompile-atom-first-arraylit-ignores-annotation.vl` (pinned).
+
+### METHOD NOTES
+
+* **Read the error's TYPES, not just its shape.** `expected (ref $type), found (ref $type)` and
+  `expected (ref $type), found i32` are different defects wearing the same sentence. The first
+  says the value was converted and put in the wrong container; the second says it was not
+  converted. One `wasm-tools print` distinguished them before any code was written.
+* **A symptom that varies with argument ORDER has more than one cause.** Order-dependence is
+  evidence about mechanism, and it is cheap to test.
+* **A `@hint` can be evidence.** The redundant-annotation hint named the checker's inferred type,
+  which is what proved the checker was right and moved the diagnosis. The lint output is a probe
+  that is already running.
