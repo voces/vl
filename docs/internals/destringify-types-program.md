@@ -50261,3 +50261,50 @@ When an instrumentation error is found, re-run the measurements it touched again
 SHIPPED, not just against what is queued. Three instrumentation errors are now recorded
 (B119's truncation, B119's path capture, B137's probe shape); this is the first one audited
 backwards, and it should be the pattern for the next.
+
+## B139 — where the spelling tree is NOT available, measured
+
+The B121 survey listed `forceGenAppArgTypes` as CONVERTIBLE-TREE: it decomposes a generic
+application (`Box<Pair<i32, string>>`) into its type arguments by hand-rolled string parsing
+(`annGenAppSpanEnds` + `annGenAppDecompose`), and a `TS_APP` node's KIDS are exactly those
+arguments. The structural reading is obvious and correct in principle.
+
+It cannot be used, and the measurement is unambiguous:
+
+```
+424 files reach the rung
+424 report tree=[NO-TS]
+```
+
+`annTsOf` answers -1 for **every** node this rung sees. The reason is in the tree's own
+contract, recorded at `setAnnTs`: `canonEmitTypeNames` DROPS the root for any node whose name
+it rewrote, because a live root must render to the node's CURRENT name. Generic applications
+are canonicalized — so canon rewrites precisely the nodes this rung is built to handle, and
+takes their trees with it.
+
+### The boundary this establishes
+
+The spelling tree has been the right answer four times (B120's type-param mention, B125's
+arrow-anywhere, B126's top-level arrow, B127's inline shape). This is the first measurement of
+where it is *absent*, and the pattern is not random:
+
+| tree available | tree dropped |
+| --- | --- |
+| annotations canon left alone | annotations canon rewrote |
+| plain shapes, closures, unions as written | generic applications, softened literal unions, folded intersections |
+
+The dropped set is exactly the interesting one — the annotations whose SPELLING differs from
+what the author wrote are the ones whose tree is gone. So the tree is usable where the name
+was already faithful, and unavailable where the name was rewritten, which is the opposite of
+where a structural reading is most needed.
+
+That is a real limit on bucket 3, and it was not visible from reading: every prior tree
+conversion happened to sit on canon-untouched nodes. The three earlier entries that kept a
+name fallback "for nodes with no tree" (#1613's scalar scan, #1618's sig key, #1619's arrow)
+were right to, and now there is a measured reason rather than a defensive one.
+
+### Consequence for the queue
+
+Any remaining CONVERTIBLE-TREE candidate must first be checked for tree AVAILABILITY at its
+site, before its twin is designed. That check is one build and it is cheap; designing the twin
+first is what wasted the effort here.
