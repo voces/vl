@@ -50754,3 +50754,44 @@ it is simply not written down.
 The receipt prior (B146) was the single most productive idea in the log — it converted five
 declines that had been measured, argued, and written up as permanent. Its limit is now equally
 clear: it works where some pass had a reason of its own to record the fact, and not otherwise.
+
+## B149 — `emit_rewrite.vl` stops parsing union spellings
+
+B148 closed bucket 1 and left the remaining surface as two design decisions. Before accepting
+that, the small modules surveyed in B121 but never converted were worth a second look under the
+receipt prior — and `emit_rewrite.vl` had one.
+
+`cboxWalk` rebuilt the atom count character by character:
+
+```vl
+const atoms: string[] = []
+splitUnionAtoms(lt.tyName, atoms)
+if atoms.length == 1 { ... }
+```
+
+`annUnionAtomsOf(n.letType)` is that number, banked by `canonEmitTypeNames` — the pass that
+PRODUCED the very spelling being re-parsed. The node was in scope two lines below
+(`nodeTyIxOf(n.letType)`).
+
+Measured: 2 corpus files reach the site, both answers present (1 atom and 2), 0 disagreements.
+A thin population, recorded as one. Corpus A/B 0 of 1947; six gates green.
+
+`splitUnionAtoms` is now unused in `emit_rewrite.vl` and its import is gone — **the module no
+longer parses a type spelling at all.**
+
+### Why this was missed twice
+
+B121's survey read `emit_rewrite.vl` and classified its three type reads correctly. B128 then
+concluded the tractable surface was exhausted. Both were true against the sources known at the
+time: this site's twin is `annUnionAtomsOf`, which had ONE consumer until B146 and was not on
+anyone's list.
+
+That is now the third distinct thing the receipt prior has found (after four softened-name
+declines and `paramVariantIndex`), and the first outside the modules the surveys focused on.
+The lesson generalises past this programme: **an exhaustiveness claim is only as good as the
+list of sources it was made against**, and this log made two such claims — B128's "the
+remainder is a layer" and B132's "the node-bearing surface is enumerated and closed" — that
+were correct against a three-source model and wrong against a five-source one.
+
+The remaining small modules (`driver.vl`, `lint.vl`, `emit_mono.vl`'s producers) have not been
+re-read under the current source list.
