@@ -49025,3 +49025,74 @@ to match a type it already holds:
    twin.
 
 `variantIndexOf` (2 rows) stays declined on B107/B109.
+
+## B114 — the union rung: the registry was the wrong thing to match against
+
+`isUName` (159 files) is the ladder's largest name reader. B113 left it diagnosed as "the
+union registry does not match inline rows", and the repair looked like teaching
+`isUnionOfTy`'s structural rung to reach them. That was the wrong repair, and the
+measurement that showed it also nearly fooled me.
+
+Rendering the registry row's members beside the arena's, for a disagreeing param:
+
+```
+ZU [string|f64] TyUnion countMatch=2 arenaMembers=[string,f64] row=[string,f64] row=[string,f64]
+```
+
+Identical renderings, and `tySame` still says no — which reads as a bug in `tySame`. It is
+not. **The renderer softens.** A litunion member prints as `string` while the arena holds a
+`TyUnion` of `TyLit`s, so two different types render the same and `tySame` is right to
+separate them. Diagnosing by rendering is the very mistake this programme documents, and it
+appeared here inside the diagnosis of it.
+
+With that understood, the rest of the census is not a matcher shortfall at all. The rows
+differ from the arena in three independent ways:
+
+| | spelling row | arena |
+| --- | --- | --- |
+| ARITY | `string\|i32` (2 atoms) | `[string, string, i32]` (3 members) |
+| GROUPING | `i32\|string\|null` (3 atoms) | `[i32, string\|null]` (nested) |
+| SOFTENING | `TyPrim(string)` | `TyUnion` of `TyLit`s |
+
+The registry is a **rendering-side artifact**. Its member lists are the parsed atoms of a
+softened spelling, and no matcher reconciles two different data models.
+
+### The question did not need the registry
+
+`isUName`'s job at this rung is "is this param a union BOX" — an accept/reject question with
+no identity in it. That needs shape, not membership:
+
+```vl
+export function nodeTyIsUnionish(ix: i32): boolean   // TyUnion(>1) | TyNullable, litunions excluded
+```
+
+Literal unions are excluded because they are interned i32 ATOMS, not boxes — a distinction
+the registry could not make and the type makes for free. Excluding them took the
+disagreement count from 19 to **2**.
+
+### What the spelling still carries, exactly
+
+Removing `isUName` outright breaks **exactly two files**:
+
+```
+tests/cases/soundness/union-same-shape-discriminant-sound.vl   [Cat|Dog]
+tests/cases/types/struct-union-same-shape.vl                   [A|B]
+```
+
+B107's pair, arriving for the third time from a third direction. A union whose arms are
+structurally identical dedupes to one arm, so the arena honestly answers "not a union" and
+the spelling is the only surviving carrier. The name test is kept for precisely that
+remainder and documented as such.
+
+**157 of 159 moved to the arena.** Corpus A/B 0 of 1947; six gates green.
+
+### The shape of the remaining work
+
+Three conversions now share one pattern: find what the softened name was silently covering
+(numeric litunions, string literals, union boxes), state it once from the type, and the name
+rung either drops out or shrinks to a measured remainder. Every remainder so far has been
+the same two files.
+
+Left: `isSName` (142 — generic INSTANCES and the `#anon0` empty-placeholder, two separate
+repairs), `nameIsArray` (124 — undiagnosed, and it does double duty for array-last unions
+per B108), `variantIndexOf` (2 — declined on B107/B109).
