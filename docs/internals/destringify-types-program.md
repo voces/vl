@@ -45334,3 +45334,33 @@ The fixture now discriminates THREE states — master, emit-only, and both halve
   `exprHasStrOp` for the node kind you just changed BEFORE running anything.
 * **A fact recorded in the programme doc is not a fact applied.** B49 named this exact ArrayLit
   gap as out-of-scope-but-real, and the next slice walked into it.
+
+### SECOND ADDENDUM — the twin was still missing at TAIL positions, and the ORDER model was wrong
+
+Review found both.
+
+**The reservation arm went into `exprHasStrOp`'s ArrayLit case, but `blockHasStrOpScan` — the
+STATEMENT walker — has no ArrayLit arm at all.** So a bare trailing array literal, which is an
+implicit return, was never handed to the walker that had just been taught:
+`function f(v: K) { ["plain", v] }` was `unknown local 4`, as were a lambda's expression body and
+an if-arm tail. A fixture covering only the `let` position passes while every tail spelling is
+broken — which is what happened, and is why the fixture now carries a `tailLit` arm and
+discriminates FOUR builds: master, emit-only, let-position-only, and complete.
+
+**And "the element ORDER tells you which defect" was false.** `arrLitIsStr` asks three questions
+about the RECORDED CONTEXT TYPE before it looks at any element, and `nodeArrayElemIsNulStr`
+answers TRUE for a `(string | null)[]` literal however its elements are ordered. So an atom-FIRST
+literal in that spelling builds a string list and this widen fixes it. Order correlates with the
+outcome for the `string[]` spelling only, and I wrote the correlation into four places as the
+rule: the PR body, the `emitArr` comment, both fixture headers, and this entry.
+
+A third finding is the same one twice: the fixture's "Control 2 — the push sink, SAME value"
+shipped as `zs.push("zz")`, a string literal. `exprIsLitAtom` has no `StrLit` arm, so it reached
+neither the push sink's atom arm nor its reservation predicate and controlled for nothing.
+
+* **A correlation observed on one spelling is not the rule.** I tested `string[]` literals, saw
+  order predict the outcome, and wrote "order decides". The `(string | null)[]` spelling breaks
+  the correlation and was one test away.
+* **When a fix spans two walkers, the fixture needs an arm per WALKER, not per position.** The
+  `let` and tail arms look like two positions and are two dispatchers; only the second catches a
+  missing statement-level arm.
