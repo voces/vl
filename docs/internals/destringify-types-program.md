@@ -46286,7 +46286,7 @@ holding a `Ty` rather than a node can ask.
 The `isValueUnionName(im)` GUARD stays a name test: the union registry is name-keyed, and that is
 B-1, a genuinely separate prerequisite.
 
-### AND THE FIRST 0-AND-0
+### AND THE FIRST 0-AND-0 — **WRONG, see B70**
 
 Both legs measured, per B66:
 
@@ -46295,12 +46295,81 @@ Both legs measured, per B66:
 | arena leg (name fallback answers) | 0 |
 | name fallback (arena answers) | 0 |
 
-Neither uniquely answers — the whole arm is corpus-unreachable. That completes the three cases
-B66 named (1-and-0, 0-and-1, 0-and-0) with an observation of each, and it is the honest label for
-this slice: a string decision removed from the SOURCE, at an arm no corpus program reaches.
+I read this as "neither leg uniquely answers, so the arm is corpus-unreachable". **That reading is
+false and B70 measures it false**: the arm drives 1,449 of 2,050 corpus rows. Two legs that AGREE
+produce the same 0-and-0 as an arm that never runs, and the sabotage separator cannot tell them
+apart. The correct result is better than the one recorded here, and the method defect is the more
+valuable half.
 
 ### METHOD NOTE
 
 * **Check whether a prerequisite exists before building it.** Four of this programme's inherited
   claims have now dissolved on a one-command check, and this one would have cost a sidecar
   implementation to satisfy a requirement already satisfied.
+
+
+## B70 — the sabotage separator cannot see liveness, and #1120's non-duality does NOT reach this question
+
+Two findings, and the second is only trustworthy because the first was caught.
+
+### THE METHOD DEFECT: 0-and-0 is two situations, not one
+
+B66 named three outcomes for a two-leg site — 1-and-0, 0-and-1, 0-and-0 — and B69 reported the
+first 0-and-0 and read it as "the arm is corpus-unreachable". **A third build refutes that.**
+
+Force the whole arm to a CONSTANT and diff constant-`true` against constant-`false`:
+
+| build pair | corpus rows | what it establishes |
+| --- | --- | --- |
+| arm ≡ `false` vs arm ≡ `true` | **1,449 of 2,050** | the arm is **massively live** |
+| arm ≡ `false` vs arm ≡ `arenaSays != nameSays` | **0** | the two columns **never disagree** where it runs |
+
+The arm is reached on 70% of the corpus. Sabotaging either leg moved 0 rows **because the other
+leg was still there and gives the same answer** — a leg knocked out falls through to a twin that
+agrees, and the sweep sees nothing. That is indistinguishable, at the sweep, from an arm no
+program reaches.
+
+**So the two-direction sabotage measures REDUNDANCY, not liveness, and a 0-and-0 says nothing at
+all until a constant-forcing build has established the arm runs.** Every "inert" and every
+"0 rows" this programme recorded from a two-leg sabotage alone is now suspect in the same way and
+is queued for re-measurement with the third build. The separator needs three builds, not two:
+constant-`false`, constant-`true`, and the disagreement indicator.
+
+The disagreement-indicator build is the sharper instrument and should have been the first reach
+for it: make the arm return `arenaSays != nameSays`. If that is observationally identical to
+constant-`false` while constant-`true` is not, the columns provably agree everywhere the arm is
+reached — a positive result about a LIVE arm, which no amount of sabotaging can produce.
+
+### AND #1120'S REFUTATION DOES NOT REACH THIS SITE
+
+`emit_base.vl` carries a standing warning against exactly the route B69 took: `recordInferRet`
+banks "the spelling the checker CHOSE and the type it was choosing ABOUT — a decision and its
+input, not two encodings of one type", and #1120 measured the tyIx reading to differ from the
+NAME reading on **14.5% of a fully-covered column** (783 of 5,415 `fn.fnRet` decisions changed).
+Taken at face value that refutes B69's conversion.
+
+It does not reach it, and the reason is the GUARD. #1120 probed `synthRetAnnots`, whose 15-arm
+ladder runs over the raw stored name; its divergence families are alias adoption (`K0` vs arena
+`string`, `Cat|Dog` vs `{meow:i32}|{bark:i32}`), SPACE-guard spelling (`{x: i32}` vs `{x:i32}`),
+and `?`-vs-`|null` renders at nested FIELD positions (`{f: i64[]?}`). B69's site runs behind
+`isValueUnionName(im)`, which requires `unionMemberCount >= 2` and every atom to satisfy
+`valueAtomKind >= 0` — so it admits only a top-level union of value atoms, and each divergence
+family is either excluded by that guard (nested field renders, record spellings) or agrees on the
+narrower null-bearing question (both `P|null` and `{x:i32}|null` bear null).
+
+**Measured: 0 disagreements over an arm driving 1,449 corpus rows.** A general non-duality between
+two columns does not settle a specific question asked of them behind a specific guard — and the
+right response to the standing warning was to measure the narrow question, not to defer to the
+broad finding or to ignore it.
+
+### METHOD NOTES
+
+* **A 0 from a sabotage is not a liveness claim.** Knocking out one leg of a redundant pair
+  proves only that the pair is redundant. Force the whole site to a constant before reading any
+  0 as "unreached".
+* **Prefer the disagreement indicator to the sabotage.** `return a != b` compared against
+  `return false` answers "do these two ever differ where this runs", which is the actual question
+  a dual-encoding conversion turns on.
+* **A recorded refutation deserves a re-measurement, not a ruling.** #1120's warning was correct
+  about its site and wrong about this one; deferring to it would have declined a sound conversion,
+  and ignoring it would have shipped an unmeasured one.
