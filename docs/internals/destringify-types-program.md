@@ -46750,6 +46750,21 @@ It is now `if ty < 0 { return false }` — and with the string operation gone th
 reason to sit in `emit_classify` at all. It moved to `typecheck.vl`, next to `inferRetTyIxOf` and
 `tyBearsNull`, the only two things it reads. **A dead leg had been dictating the module layout.**
 
+**THE GUARANTEE IS NARROWER THAN THAT, AND REVIEW MADE ME SAY SO.** It holds for NAME-keyed rows.
+It does not hold for the `#`-keyed column: the node-keyed `recordInferRet` is gated only on
+`!tyIsDeferredJoin(inferred)`, and that predicate's first line lets a negative index straight
+through while its `rty` is non-empty. Nothing observed produces such a row — but
+`inferRetBearsNullByNode` is the obvious next function to write beside `inferRetNameByNode`, and
+it would need the name leg this one does not.
+
+And the five columns are parallel **by PHASE ORDER, not by a row invariant**:
+`monoInferListElem` / `monoInferLocalScalar` roll a speculative re-check back by popping TWO of the
+five and leaving `inferRetIdx` untouched, while the neighbouring `binCstr*` group pops all of its.
+They run only during `monomorphize`, after every name-keyed row is written. So the reduction is
+correct and its reason is a schedule. That rollback is a latent column-desync — filed, because this
+slice is what makes `inferRetTyIx` load-bearing at a SECOND reader, which is how a dormant bug
+acquires a blast radius.
+
 ### TWO SMALLER THINGS, RECORDED RATHER THAN GLOSSED
 
 **The conversion is not a pure substitution.** `unionSetHasNull` reaches `msSetOfText`, which stamps
