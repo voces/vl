@@ -47998,3 +47998,73 @@ the arena, not of the predicates.
 * **When a conversion keeps failing for different-looking reasons, look under the predicates.** Six
   softening sites, four width mismatches, three coverage gaps — and beneath all of them, one fact
   about `addTy` that nothing in this log had checked until the last blocked site forced it.
+
+## B96 — hash-consing REFUTED: the arena is non-canonical on purpose, because union identity is NOMINAL
+
+B95 concluded that the last four name tests are name-keyed because the arena gives a type no
+canonical index, and named hash-consing `addTy` as what would unblock them. That was an inference.
+This entry tests it, and the inference was wrong in the direction that matters.
+
+### THE MEASUREMENT THAT SAID IT WOULD WORK
+
+`mkUnionTy` across the corpus: **4,673 calls, 3,078 distinct member lists — 34% of constructions
+rebuild a set that already exists.** Those are exactly the constructions handing out a fresh index
+for a type the registry already knew, which is why `isUnionTyIx` under-answered on 2 files.
+
+So interning unions — the narrowest possible version of hash-consing, one constructor, exact member
+order — looked like the bounded change that would make index equality a valid identity test.
+
+### AND THE ATTEMPT REFUTES IT
+
+Built it. Intern table keyed on the member list, reset with `T.tys` so it cannot outlive its
+referent.
+
+**133 corpus rows change. 106 of them are type errors.**
+
+```
+tests/cases/arrays/elem-rep-name-silent-on-covered-nodes.vl
+  cannot assign i64[] to 'ys' of type Kf[]
+```
+
+`type Kf = 1.5 | 2.5` and `type Ki = 5000000000 | 6000000000` are DISTINCT DECLARED TYPES. Sharing
+an arena index between constructions collapses declarations the checker must keep apart — the
+assignment above is correctly rejected today and becomes a type error against the wrong type once
+the indices merge.
+
+### WHAT THIS ACTUALLY SAYS
+
+**VL's type identity for a declared union is NOMINAL, not structural.** Two unions with the same
+member list are not the same type — they are two types that happen to have the same members. The
+arena is an append log because an arena index is the identity of a DECLARATION, and the checker
+relies on that.
+
+So the registries are not name-keyed for want of a better key. **The name IS the nominal identity**,
+and asking the arena for it is asking the wrong structure. `structIndexByName`, `isUName` and
+`variantIndexOf` are correct as written.
+
+That closes B90's four sites for a reason stronger than "blocked": they are not convertible, because
+the question they ask — *is this the declared type X* — is a question about a name by construction.
+
+### AND IT CORRECTS B95
+
+B95's method note said "look under the predicates" and found `addTy`. Right instinct, wrong
+conclusion: it read a non-canonical arena as an omission to be fixed, when it is a design that the
+checker's nominal typing requires. **An attempt refuted in one build what an inference had made
+sound plausible** — which is the same lesson this log has recorded about derivations at B81, now
+applied to an architectural claim rather than a predicate.
+
+### THE STATE OF THE BRIEF, FINAL
+
+* Every render-then-test site: measured, and each converted, declined with a reason, or shown inert.
+* The convertible surface with a node in scope: fifteen sites, eleven settled.
+* The remaining four ask NOMINAL identity, and a name is what nominal identity is. Not blocked —
+  **not applicable.**
+* `unTyIx` remains at 100% coverage. It is useful for structural questions about registered unions;
+  it is not, and cannot be, an identity key.
+
+### METHOD NOTE
+
+* **Test the enabling change before scoping the project it enables.** Hash-consing was scoped in
+  B95 as "a language-implementation project" worth proposing. One build showed it is not a project
+  to propose at all — it contradicts the type system's semantics. The measurement cost one build;
+  the proposal would have cost a great deal more.
