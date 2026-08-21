@@ -52282,3 +52282,37 @@ No program in this family crashes the compiler. **None of them compiles either**
 reject underneath is untouched, and both spellings are pinned as xfails. The deeper fix is the
 one `emitFail`'s own shape suggests: a recorded failure should stop emission rather than rely on
 every caller to propagate -1.
+
+## B182 — the class, retired: a recorded failure now stops the pass
+
+B180 and B181 each guarded a table read and each fixed part of the crash family. B181 named the
+cause but left the guards doing the work. This is the cause's own fix.
+
+`emitFail` banks the FIRST message and returns -1 for the caller to propagate. It does not halt.
+A caller that drops the -1 leaves emission running over state the failure already invalidated,
+and the next unguarded parallel-table read goes out of bounds — a TRAP, which kills the compiler
+before the banked diagnostic can print.
+
+Checking `emitFailed` at the two recursion roots (`emitExpr`, `emitStmt`) makes a failure
+terminal wherever it happened, instead of relying on every caller in between.
+
+**Measured as the general fix, not another patch.** With BOTH shipped bounds guards REMOVED, the
+halt alone turns all ten repros back into diagnostics. The guards were treating symptoms; they
+stay as defence in depth, but they are no longer what stands between a failed emit and a dead
+compiler.
+
+Corpus A/B 0 diffs — for a program that compiles, `emitFailed` is false and nothing changes; for
+one that does not, the message is the same one `emitFail` already banked.
+
+### The shape of this family
+
+Three PRs, each honest about its scope, and the third only visible because the first two were:
+
+| | what it claimed | what it was |
+| --- | --- | --- |
+| B180 | fixed the #1611 repro | one trap site of two |
+| B181 | fixed the rest of the family | the other site, plus the cause named |
+| B182 | retires the class | the cause, fixed where it lives |
+
+None of the three makes any of these programs COMPILE. The false rejects underneath are pinned
+as xfails and are the next work.
