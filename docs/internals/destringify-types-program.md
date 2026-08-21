@@ -48651,3 +48651,45 @@ Two bad controls preceded the good measurement, both from my own list of traps:
 The rung only yielded once the probe printed every value over the whole corpus rather
 than the mismatches over a sample. When two readers disagree, first check they were asked
 the same question (B106); then check the population could have contained the answer.
+
+## B108 — the same dedup, surfacing as a false reject
+
+B107's root cause is not confined to the variant rung. Structural member dedup erases a
+distinction the spelling still carries, and wherever a rung asks the arena "is this a
+union?" the collapsed shape answers honestly and wrongly.
+
+`emit_collect`'s array rung is the second site. It skips array VALIDATION for a union
+whose last arm is an array (`S[] | T[]` ends in `]`, so `nameIsArray` matches it, but it
+is a union box whose ref-array arms are interned on the union path). For arms that are
+arrays of structurally identical structs, the union collapses to a plain `TyArray`, the
+skip does not fire, and the union spelling falls into `checkArrName`:
+
+```
+$ vl build w1.vl     # type A = {v:i32}; type B = {v:i32}; function pick(xs: A[] | B[])
+emitProgram: only i32[] arrays and struct/union element arrays are supported
+```
+
+Three neighbours compile clean, which is what makes the case narrow:
+
+| spelling | arms survive dedup? | verdict |
+| --- | --- | --- |
+| `A[] \| C[]` (different shapes, inline) | yes — a real `TyUnion` | clean |
+| `type Both = A[] \| B[]` (same shapes, DECLARED) | n/a — matched by name/index | clean |
+| `Cat \| Dog` (same shapes, non-array) | no | declines to the name (B107), correct |
+| `A[] \| B[]` (same shapes, inline) | no | **false reject** |
+
+**Not a regression.** Reproduced on the compiler built at `08647012^` — before the arena
+union rung (#1592) existed — so the conversion is exonerated; it inherited the case rather
+than creating it. Filed as
+`tests/cases/soundness/xfail-false-reject-inline-same-shape-array-union.vl`.
+
+The prediction came from B107 rather than from a sweep: having measured *why* the variant
+rung had to decline, the same question asked at any other rung has the same answer, and
+the witness was written directly from the cause. That is the first time on this branch a
+defect was found by reasoning forward from a measured mechanism instead of by differential
+testing — cheaper, and it names the fix rather than just the symptom.
+
+**The fix, when it comes:** the union question needs an arm count that survives dedup (or
+the rung must consult the ANNOTATION's arm structure rather than the collapsed type). Both
+B107 and B108 dissolve the moment a union of same-shape arms keeps its arity, which makes
+that the single highest-value repair left in the arena's representation.
