@@ -45703,3 +45703,59 @@ place, with the measurement recorded so the next pass starts from it rather than
   needing predicates that do not exist. A per-rung decision, not a per-function one.
 * **Check that the twin you are converting TO actually answers.** `tyIsF32Array` is `== 21`
   against a function that never returns 21. The name of a predicate is not its behaviour.
+
+## B57 / D-CHAINSTEAL — monotone flags are not a monotone chain, and a dead guard was load-bearing
+
+Two conversions in this slice were tried and reverted. Both reverts are worth more than the
+conversions that stuck.
+
+### 1. A WIDER PREDICATE IN AN `else if` CHAIN STEALS FROM EVERY RUNG BELOW IT
+
+`nameIsStringArray(nd.tyName)` → `nodeTyArrayElemRepName(i) == "string"` looked safe and was
+argued so: the arena form is WIDER (it also answers for a `(string | null)[]` element, whose list
+shares the exact same backing), and the flags this rung sets — `slUsed`, `aUsed` — are monotone
+MINTING flags, where over-answering mints a type that goes unused.
+
+It moved `generics/type-param-shadows-alias-funcdecl.vl` from rc 0 to rc **1**
+(`emitProgram: only i32[] arrays and struct/union element arrays are supported`).
+
+**The reasoning was about the flags and the mechanism is the chain.** These rungs are `else if`.
+An over-answering rung does not merely set its own flags — it SUPPRESSES every rung below it. A
+`(string | null)[]` that had been falling through to a later rung stopped here.
+
+Monotonicity of the FLAGS is not monotonicity of the CHAIN. Widening a rung is only safe where
+the rungs are independent, and in a cascade they are by construction not.
+
+### 2. AND THE DEAD `tyIsF32Array` GUARD IS LOAD-BEARING BY ACCIDENT
+
+B56 found `tyIsF32Array` dead (`tyKindOf(ty) == 21`; `tyKindOf` never returns 21) and concluded
+"the arena cannot answer this question today". **That was checking ONE candidate and
+generalising** — `callResTyIsF32Array` sits twenty lines away and reads `TyArray` → `TyPrim
+"f32"` directly. A liveness screen found it, along with the fact that `exprF32Array:22425` calls
+the DEAD one as its typed fast path, so that guard has never fired in shipping code.
+
+Fixing it closes two documented f32 gaps: `arrays/error-inferred-f32-list-return.vl` and its
+`-binding` sibling both start printing `1.5`, and the second of those was SILENT INVALID WASM
+rather than a reject.
+
+It also turns `arrays/nested-array-inferred-empty-unsupported-leaf.vl` from a loud emit decline
+into check-clean invalid wasm — and that fixture's header says the decline exists *"because the
+alternative to declining here is a MISCOMPILE"*. The two effects are one mechanism and cannot be
+separated: enabling the f32 fast path lets more f32 programs through, including one that must not
+be.
+
+**So the dead code is what keeps an unsupported nested leaf from reaching lowering.** Reverted,
+with the whole finding written at the guard: fixing it means teaching the nested-array leaf
+decline about f32 FIRST, then enabling the fast path — two changes, in that order, never this one
+alone.
+
+### METHOD NOTES
+
+* **Check the CONTROL FLOW, not just the effect.** "This flag is monotone so over-answering is
+  safe" is a statement about the flag. In an `else if` cascade the question is what the rung
+  SUPPRESSES, and that has nothing to do with what it sets.
+* **"The arena cannot answer this" needs the same enumeration as everything else.** One dead
+  candidate is not the search. B56 asserted an impossibility from a sample of one.
+* **Dead code can be load-bearing.** Before deleting or repairing an inert branch, ask what the
+  narrowness is holding back. Here the inertness is the only thing keeping an unsupported shape
+  out of the lowering path.
