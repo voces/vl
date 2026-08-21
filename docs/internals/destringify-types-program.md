@@ -50308,3 +50308,51 @@ were right to, and now there is a measured reason rather than a defensive one.
 Any remaining CONVERTIBLE-TREE candidate must first be checked for tree AVAILABILITY at its
 site, before its twin is designed. That check is one build and it is cheap; designing the twin
 first is what wasted the effort here.
+
+## B140 — the spelling tree answers about the PRE-canon annotation
+
+B139 concluded that the tree is dropped where canon rewrote a node. That is right and
+incomplete, and `typecheck.vl`'s own `annotResolve` header supplies the missing half:
+
+> "`annTsOf` answers -1 for exactly two populations, and neither is a checker-time
+> annotation … at the two POSITIONED funnels the tree is present on 333,073 of 333,073
+> reads."
+
+So at CHECKER time the tree is essentially total. B139 measured EMIT time, after canon has
+run. The tree is a checker-time instrument that survives into the emitter only for nodes canon
+left alone — which is what B139 saw, from the far side.
+
+### The sharper statement
+
+Applying B139's availability-first rule to `collectAnnShapes`' gate
+(`nameMentionsGenAliasParam`) found the tree present on **69 of 69** files where the gate
+fires — full availability, unlike `forceGenAppArgTypes`' 424 of 424 absent. So the twin is
+usable, and it was dual-run: **1 disagreement**, `name=T tree=F`, in
+`generics/type-param-shadows-alias-through-constructors.vl`.
+
+That single row is the important one, because it is not an availability problem:
+
+**The tree records what the AUTHOR WROTE. The name records what CANON LEFT.** They are the
+same annotation at two different times, and where canon rewrote a spelling they answer
+differently — not because one is stale, but because they are answers to different questions:
+"what was written" versus "what does this denote now".
+
+This gate is asked in the emitter, about the post-canon world, and its job is to decline
+interning where a generic-alias parameter is live. The shadowed-alias family — the same
+witness set behind B79's `nameIsStringArray` decline and B137's two `i32[]` rows — is exactly
+where the two times diverge. Converting would widen a MINTING pass on precisely those files.
+
+Declined, with the cause recorded as a TIME difference rather than a coverage one.
+
+### The rule this adds
+
+B139 said: check tree availability before designing a twin. B140 adds the second question,
+which availability does not answer:
+
+**Is this site asking about the annotation as WRITTEN, or as it now DENOTES?**
+
+The tree can only answer the first. Four conversions used it correctly because they asked what
+was written (a mention of `T`, an arrow anywhere, a top-level arrow, a spelled inline shape).
+A site asking what the annotation denotes post-canon needs the arena or canon's own banked
+columns (`canonRewroteNode` / `canonTyIxOf`, which `collectAnnShapes` already uses two lines
+below this gate) — never the tree.
