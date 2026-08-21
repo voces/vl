@@ -51458,3 +51458,53 @@ Twenty conversions. Three remaining categories, each now tested against every re
   fallback after an arena rung declines (B161)
 
 None is waiting on a decision, and none has an untested reader left.
+
+## B163 — the behaviour decline's stated reason, measured and corrected
+
+B162 re-tested `collectFnValUse`'s shape scan against the spelling tree and let its original
+reason stand. Testing the ARENA reading's actual OUTPUT — rather than its predicate — corrects
+that reason, though not the verdict.
+
+The note declines the arena because:
+
+> "`fnValUsed` is MONOTONE, so the arena's extra `true`s would intern closure machinery this
+> compiler does not intern today — a behavior change, not a destringification."
+
+Measured, by adding an arena rung (`nodeTyIsStructish` + a `TyFunc` field of the recorded
+`TyObj`) alongside the name walk and diffing every corpus module:
+
+```
+files differing:  0   of which larger: 0
+```
+
+**Zero.** The 15 disagreements the original probe found are PREDICATE disagreements, and
+`fnValUsed` being monotone is precisely why they do not reach the output: on those files the
+flag is already true from another path, so an extra true changes nothing. The note's reasoning
+inverted the consequence of monotonicity — monotone is what makes the extra trues HARMLESS, not
+what makes them dangerous.
+
+### The verdict stands for a different reason
+
+The arena rung is not dangerous. It is **redundant**: it catches nothing the name walk misses.
+And the name walk catches things it cannot — the nullable-closure-ARRAY case
+(`((i32,i32) => f32)[] | null`), which the note documents in detail, is an array-grammar
+question that a `TyObj` field scan does not reach at all.
+
+So the site keeps its name walk because the name walk is WIDER, not because the arena is
+unsafe. That is a materially different reason, and it matters for anyone who reads the original
+note and concludes the arena must be kept away from this flag.
+
+### Closing the log
+
+Twenty conversions across 93 PRs. Every remaining read of a rendered type has now been tested
+against every reader available to it, and each has its measurement recorded:
+
+| site | tested against | outcome |
+| --- | --- | --- |
+| `collectFnValUse`'s shape scan | arena (redundant, 0 output diff), tree (absent on 43 of 217) | name walk is wider — keep |
+| the array rung | all five sources | no receipt; both directions disagree |
+| `structIndexOfTypeName` | — | its INPUT is a name; callers lead with the arena |
+
+The programme's method reached its limit here, and the limit is legible: what is left is a
+wider name grammar, a genuine dead end, and a lookup table. None of the three is the defect this
+programme was built to remove, and each says so with a number.
