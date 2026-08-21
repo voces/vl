@@ -46859,3 +46859,48 @@ passing corpus.
   asked for turned up a live miscompile no sweep could have surfaced, because the corpus contained
   the annotation 55 times and the construction never. **Asking what a population is missing finds
   bugs; asking what it agrees on finds nothing.**
+
+## B76 — the rollback that popped two of five columns
+
+B74's review asked what would break the `ty < 0 => false` reduction and found the answer next door,
+in code the destringify programme never touched.
+
+`recordInferRet` pushes **five** parallel columns — `inferRetFn`, `inferRetTy`,
+`inferRetAtomCount`, `inferRetTyIx`, `inferRetRung` — and claims `inferRetIdx[name]` first-wins.
+The two speculative re-check probes, `monoInferListElem` and `monoInferLocalScalar`, undid that by
+popping **two**:
+
+```vl
+while inferRetFn.length > sIRet { inferRetFn.pop() }
+while inferRetTy.length  > sIRet { inferRetTy.pop() }
+```
+
+The `binCstr*` group three lines up pops every column of its group. This one did not, and left the
+name index untouched as well.
+
+**What it would cost.** A row recorded inside a probe survives in three columns and in the index.
+`inferRetTyAt` is an unguarded `inferRetTy[i]`, so a surviving index entry pointing past the
+shortened name column is an out-of-bounds read — and every later `recordInferRet` lands its NAME at
+k and its arena index at k+1. That desynced row, right name and wrong type, is precisely the row
+B74's reduction assumes cannot exist.
+
+**It does not fire today, and the reason is a SCHEDULE.** These probes run only from
+`monomorphize`; every name-keyed row is written by `elaborateInferRets` at the end of checking,
+before that. A whole-table audit over the corpus, the generics and inference fixtures, and the
+compiler's own source found no desynced row. The fix is one `rollbackInferRet(mark)` used by both
+sites — all five columns and the index, index first because `inferRetFn` names the keys. 0 corpus
+rows, as a hardening should be.
+
+### WHY IT IS WORTH DOING RATHER THAN FILING
+
+B74 made `inferRetTyIx` load-bearing at a SECOND reader. Before that it fed `collectU`'s structural
+walks; now a void-classification fixpoint reads it too. **A dormant column-desync acquires a blast
+radius the moment a second consumer starts trusting the column** — and the phase ordering that
+saves it is not written down anywhere near either probe.
+
+### METHOD NOTE
+
+* **When a reduction rests on an invariant, go and check who could break it.** The reduction was
+  correct; its stated reason was a row invariant and its real reason was a pass schedule. Those
+  differ exactly when someone reorders a pass — and the review that asked "what would make this
+  false" found a latent OOB nobody was looking for.
