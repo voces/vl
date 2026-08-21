@@ -14925,6 +14925,26 @@ function plusChainHasStrLit(ix: i32) {
 // literal keeps matching its instance-pinned ANNOTATION shape, which is what it must do.
 // A field whose type neither ladder can name still leaves the whole shape un-interned and
 // the literal still fails loudly downstream — never a trap.
+// `nodeTyName` returns "" for a type it will not spell, and `anonFieldCode` uses that emptiness
+// as a GATE on both of its paths — not merely as the name ladder's input. This is that gate's
+// own partition, read off the type so the gate can be applied without building the string:
+// `nodeTyName` answers non-empty for exactly a non-void `TyPrim`, a `TyObj`, a `TyFunc` and a
+// `TyArray`, and "" for everything else (a union, a nullable, a map, an unsolved parameter, a
+// hole) — the shapes it deliberately keeps to their own paths.
+//
+// Copied from that function's arms rather than inferred from its purpose: B193's lesson is that
+// paraphrasing a predicate's INTENT instead of its PARTITION yields an arm that silently never
+// matches, or one that matches too much.
+function anonTySpellable(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName != "void" }
+  if t is TyObj { return true }
+  if t is TyFunc { return true }
+  if t is TyArray { return true }
+  false
+}
+
 export function anonFieldCode(valIx: i32) {
   if valIx < 0 { return -1 }
   const syn = anonFieldCodeSyn(valIx)
@@ -14933,6 +14953,23 @@ export function anonFieldCode(valIx: i32) {
   // unsolved parameter, a hole, a union, a map — the shapes `nodeTyName` deliberately
   // keeps to their own paths). `nameFieldCode` returns -1 for a name it cannot code, so a
   // miss on either half is the same -1 the syntax ladder alone used to give.
+  // THE GATE, THEN THE ARENA, THEN THE RENDER. The gate below is `nodeTyName(valIx) != ""` asked
+  // of the TYPE (`anonTySpellable`), so it still keeps an unspellable type out of BOTH paths —
+  // which is what the render's emptiness was doing here, and what a naive hoist of the arena
+  // rung DROPS. Measured: that version regressed
+  // `generics/genalias-field-reresolved-after-canon` from rc=0 to rc=1 and moved three
+  // literal-union files.
+  //
+  // With the gate preserved the render is needed only as the NAME ladder's input, so it is built
+  // only when the arena declines. Measured: of the 196 corpus files reaching this rung, the
+  // arena decides 123 — every one of which was constructing a string that nothing then read.
+  if !anonTySpellable(nodeTyIxOf(valIx)) { return -1 }
+  const anonTy = nodeTyIxOf(valIx)
+  const anonArena = fieldCodeOfTy(anonTy)
+  if anonArena != -2 {
+    if !anonCodeIsSelfContained(anonArena) { return -1 }
+    return anonArena
+  }
   const tn = nodeTyName(valIx)
   if tn == "" { return -1 }
   // THE ARENA RUNG FIRST. `nodeTyName(valIx)` above renders the recorded type; classifying
@@ -14944,7 +14981,7 @@ export function anonFieldCode(valIx: i32) {
   // a type the checker cannot spell here (an unsolved parameter, a hole) out of both paths.
   // Measured: 196 corpus files reach this rung, the arena decides 70 and the name 126, 0
   // disagreements.
-  const c = nameFieldCodeTy(tn, nodeTyIxOf(valIx))
+  const c = nameFieldCodeTy(tn, anonTy)
   if !anonCodeIsSelfContained(c) { return -1 }
   c
 }
