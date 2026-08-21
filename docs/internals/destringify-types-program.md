@@ -50844,3 +50844,62 @@ all five sources (arena, spelling tree, canon's columns, the pin column, the nam
 That is a verified statement rather than the two I had to retract. What remains is what B148
 described, unchanged by this pass: two bucket-1 declines whose missing per-node column is named,
 bucket 2 where the name is the key by definition, and bucket 4's ~258 classifiers.
+
+## B151 — the newtype receipt existed too, and bucket 1 goes to 2 of 3
+
+B148 closed bucket 1 with the ref-list slot holding, and named its repair as a change to what
+the compiler stores: "a per-node column recording newtype provenance (`nwBrand` exists in the
+checker but is not exposed per-node)". I then described that as an architectural decision and
+deferred it.
+
+That was wrong twice over, and both errors are the same one B146 caught.
+
+**First**, the record already exists. `nwBrand` maintains `nwTyIxs` — the list of branded arena
+indices — because it must, to reuse a brand rather than mint a new one per resolution. A brand
+is a SECOND index over its base's `Ty`, so no structural reader can tell them apart, and that
+table is the only place the distinction survives. Reading it is a query over existing state, not
+new storage:
+
+```vl
+export function tyIsNewtypeBrand(ty: i32): boolean   // is `ty` in nwTyIxs
+```
+
+**Second**, the repair is not "make the arena distinguish brands". It is B146's guard shape:
+let the arena answer wherever it can see, and decline the one case where it provably cannot.
+
+```vl
+const elemTy = tyRefArrElemOf(nodeTyIxOf(d.letType))
+if !tyIsNewtypeBrand(elemTy) {
+  const a = annBareRefArrSlot(d.letType)
+  if a >= 0 { return a }
+}
+rlSlotByName(letRefListElemName(letIx, fnIx))
+```
+
+The receipt fires on exactly the row B123 measured (`brand=YES [QView[]]`). The fixture runs
+correctly (`11 22 33 44 1 2 …`), corpus A/B 0 of 1947, six gates green.
+
+### Bucket 1, revised
+
+| decline | cause | receipt | outcome |
+| --- | --- | --- | --- |
+| `paramVariantIndex` | same-shape union collapse | `annUnionAtomsOf` | converted (B146) |
+| the ref-list slot | newtype brand/base | `nwTyIxs` | **converted (B151)** |
+| the array rung | type-param binding; shadowed alias | none found | holds |
+
+Two of three. B148's claim that the two survivors "share a property — their destruction happens
+in a pass that writes nothing per-node" was true of the array rung and false of this one: the
+newtype pass writes plenty, just not into a column anyone had exported.
+
+### The pattern, four instances in
+
+Four times now a decline was overturned by a table that already existed:
+`canonTyIxOf` (four sites), `annUnionAtomsOf`, and `nwTyIxs`. Each had few or no consumers
+outside the pass that wrote it, and each was invisible to a survey that reads call sites rather
+than state.
+
+The corrected habit is not "look harder at call sites". It is: **when a pass destroys a
+distinction, ask what that pass had to remember in order to do its job.** A collapse that reuses
+a prior decision has to record it; a rewrite that must be idempotent has to record it; a brand
+that must be stable across resolutions has to record it. Those records are receipts whether or
+not anyone reads them.
