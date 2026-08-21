@@ -47772,3 +47772,46 @@ end of a long session.
 Every place this compiler rendered a type and then tested the render has been measured, and each is
 converted, declined with a recorded reason, or shown inert. What remains is one subsystem whose KEY
 is a name — and the plan above is what turning it into an index costs.
+
+## B92 — B-1 step 1 done, and the coverage number that decides step 2
+
+B91 laid out the plan for the union registry and said step 1's corpus coverage rate is the number
+that says whether step 2 is worth doing. Step 1 is done and the number is in.
+
+`unTyIx` is now the union-registry twin of `sTyIx`: an arena index per row, pushed at all three
+registration sites, resolved ONCE at mint via `declTyIxOfName` exactly as `recordSTyIx(
+sTyIxOfName(s.tdName))` does on the struct side. The third site — `registerValueUnionName`, which
+receives a bare string — pushes `-1`.
+
+### THE COVERAGE
+
+| | |
+| --- | --- |
+| corpus files with at least one union row | 674 |
+| union rows registered | **1,369** |
+| rows carrying a real arena index | **908 — 66.3%** |
+| name-only rows (`registerValueUnionName`) | **461 — 33.7%** |
+
+**Two thirds for free.** The two declaration-driven entry points cover most of the surface, and the
+remaining third is one function's twelve callers. That is a much better ratio than the plan
+assumed, and it makes step 2 clearly worth doing: closing 33.7% is bounded work against a column
+that already answers for the other 66.3%.
+
+### IT HAS NO READER YET, AND THAT IS DELIBERATE
+
+`sTyIx` was introduced the same way — recorded at D0, read later. A reader here would be
+`isUnionTyIx(ty)` beside `isUName(name)`, and its consumers are B90's four blocked sites, which
+receive names today. **Wiring a reader before those sites can pass a type would be adding a second
+answer nobody asks** — and this log has spent several entries on what happens when a predicate
+acquires a caller before its inputs are threaded.
+
+So: the column is populated and measured, the plan's decision point is resolved, and the next slice
+is step 2 — thread a type into `registerValueUnionName`, caller by caller, one build per site.
+
+0 corpus rows: the sidecar changes nothing until something reads it.
+
+### METHOD NOTE
+
+* **Build the measurement into the first step.** The plan's open question was "is threading twelve
+  callers worth it", and the cheapest way to answer it was to add the column, populate it where the
+  type is already free, and count. 66.3% answers it; an argument would not have.
