@@ -51726,3 +51726,77 @@ Twenty-two conversions, 97 PRs, and one site that declines with a reason its own
 enforce. The decline is now backed by a measurement (57 files, one recorder) and a REFUTATION
 (the conversion built, ran, and produced invalid wasm) rather than by an argument about what the
 arena can see.
+
+## B168 — the last site converts: ask the arena for the FIELD SET, not for a spelling of it
+
+B167 closed with the gae population unfillable and the site declined. That decline was against a
+particular reader — the D0 sidecar — and B164's rule applies to it exactly as it applied to the
+seven verdicts before: **a decline against "the arena" is only a decline against the arena
+predicate someone tried.** Three more were tried.
+
+### What the render path actually does
+
+`structIndexOfTypeName` is not one lookup, it is two. A nominal `structIndexByName` first; then,
+for a whole-span shape, it **re-parses the render**: `shapeFieldParse` splits the spelling into
+field NAMES and field type TEXTS, and each text is checked against the row's stored value with
+`shapeFieldTypeCompat`.
+
+The stored value is not text. `sFieldTypes` holds the emitter's **field CODE** — an i32. So the
+round trip is: arena type → `tyToStructStr` render → re-parse → text-vs-CODE compatibility.
+Every input to that comparison already exists in the arena, because `TyObj` IS
+`{objFieldNames, objFieldTypes}`.
+
+### The reader that had to exist
+
+```vl
+export function structRowOfObjFieldSet(ty: i32): i32   // field count + names + fieldCodeOfTy == sFieldTypeAt
+```
+
+Same scan order, same field-count gate, same field-name lookup, and the same half-built-row
+guard (a row mid-append is invisible; reading its trailing `sFieldElemName` is an out-of-bounds
+compiler crash — fuzz sweep zq0NPY). `fieldCodeOfTy` returns -2 for a type it does not code, and
+a declining field fails the ROW rather than matching loosely, so an uncoded field falls through
+to the render instead of guessing.
+
+### Two readers that did not work, and why they were worth measuring
+
+| attempt | result |
+| --- | --- |
+| bank a type INTO `sTyIx` so the existing `repRowOfTyStruct` rung matches | **invalid wasm** — the column is read by the dedup channels, and the row is name-keyed, so shadowed spellings race (B167) |
+| `structRowOfTy` — read `sTyIx` structurally, write nothing | sound, 1946/1947 byte-identical, but retires **1 file of 32** |
+| `structRowOfObjFieldSet` — match the FIELD SET from the arena | **0 diffs / 1947, retires 8 of 32** |
+| the same, plus `fieldCodeOfTy`'s two closure arms | **0 diffs / 1947, retires 10 of 32** |
+
+The middle one is the instructive failure: it was the right instinct (read, don't write) aimed at
+the wrong column. `sTyIx` answers "which row was minted FROM this type", and 57 of its entries
+are -1 for reasons B167 proved unfixable. The field columns answer "which row HAS this shape" —
+and they are populated for every row, because a row without its fields is not a row.
+
+### Widening the coder, once
+
+`fieldCodeOfTy` coded only literal-unions and `TyPrim`; everything else answered -2 and fell to
+`nameFieldCode`'s TEXT ladder. Its first two arms are read straight off the spelling — a nullable
+closure is the fat-pointer 22, a top-level arrow is the closure rep 14 — and both are exact
+questions about a type. Asking them of the arena instead (nullable-of-`TyFunc` first, mirroring
+the text order) retires 2 more files.
+
+Measured decline reasons for the 24 that remain after the plain rung:
+
+| reason | files |
+| --- | ---: |
+| field type UNCODED (`fieldCodeOfTy` -2) | 16 |
+| field NAME miss | 7 |
+| field CODE differs | 1 |
+
+So the residue is dominated by the coder's coverage, not by anything structural — each further
+arm ported from the text ladder to the arena is another slice, gated the same way.
+
+### Standing
+
+The render path at this site answered on 32 corpus files. It now answers on **22**, and the ten
+it lost were taken by a reader that asks the arena the question the render was spelling out.
+Six gates green, corpus byte-identical, fixpoint holds.
+
+`structIndexOfTypeName` is still reached — this does not retire it. What it retires is the claim
+that it COULDN'T be: B166 said ordering, B167 said an unfillable key, and both were true of the
+readers they described. The field columns were a third reader, and they answer.
