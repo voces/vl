@@ -44913,8 +44913,53 @@ a registered alias, so `nodeTyIsLitUnionAlias` still answers no — the name and
 Reverted. Closing it needs the parameter valtype ladder characterized first — specifically, what
 makes a NARROWED alias an atom when the predicate that is supposed to decide that says no.
 
+### 3. TWO CORRECTIONS FROM REVIEW
+
+**The `K | null` NICHE reaches both new arms, and the safety argument was wrong about why it
+does not.** The arms say "a `null` value is not a lit atom and still takes the `nulString`
+path". True of the literal `null`; false of the gate. `exprIsLitAtom`'s FIRST line is
+`if exprNulLitUnion(exprIx, fnIx) { return true }` — it deliberately claims the nullable niche,
+because in a NARROWED position the niche really does hold a plain atom. The arms inherit that
+claim in a position where it does not hold, and `emitAtomToStr` — a `select` tower over the
+member constants with no `-1` arm — refuses.
+
+Measured against master, this is an UPGRADE and the direction is the point: master accepts those
+programs (`check --codegen` rc 0) and emits invalid wasm; the branch rejects them at emit (rc 1).
+Gating the arms on `!exprNulLitUnion` was considered and rejected — it trades a loud failure for
+the silent one. Pinned as `error-nulLitUnion-niche-into-nullable-string.vl`, with its control in
+the runnable fixture because an `@emit-error` file cannot exercise one. The NARROWED niche is
+newly FIXED here, which is what says the defect is the sentinel and not the niche.
+
+**The shadowed-binding hole gains two positions.** B45's addendum found the reservation scan and
+the emit resolve a shadowed name to different bindings; these two sinks inherit it, so the
+"FIXED FOR UNSHADOWED BINDINGS" qualifier is carried onto them in the taxonomy rather than left
+to be rediscovered.
+
+### 4. AND SINK 4 IS NOT BLOCKED AFTER ALL
+
+§2 said closing the narrowed-parameter case "needs the parameter valtype ladder characterized
+first". Review characterized it, and the discriminating predicate already exists —
+`tyLitUnionAliasIx` (`typecheck.vl`), which the REP LAYER itself uses to assign these very
+valtypes (`emit_rep.vl`'s `TyUnion` arm: alias index → `repMk("i32")`, else `repUncovered()`).
+It has TWO legs where `nodeTyIsLitUnionAlias` has one: the registry, AND a copy-provenance table
+(`cLitUnionCopyTyIxs`) recording checker-minted copies from narrowing, join and subtraction.
+
+That second leg is exactly what makes a narrowed alias an atom, and it matches the rep table
+row-for-row: registry → i32, copy → i32, bare inline (canon-softens to `string`, `repUncovered`)
+→ string ref. So "the structural predicate matches all three including the string-repped one" was
+a property of the predicate I reached for, not of the problem.
+
+The remaining work is the CALLER's member-literal argument lowering, which asks the same
+registry-only test at `wasmEmit.vl:17013` / `:17263` and `emit_sections.vl:565` — a bounded,
+named next step.
+
 ### METHOD NOTES
 
+* **"Blocked" deserves the same scepticism as "safe".** I declared a whole class unfixable after
+  one predicate failed, and the right predicate was already load-bearing in the rep layer three
+  files away. A failed attempt tells you the attempt was wrong, not that the problem is hard.
+* **Check the DIRECTION of a failure-class change before calling it a regression.** These arms
+  turn a check-clean miscompile into a loud emit refusal. Both are broken; only one is silent.
 * **A defect filed with others is not necessarily their kind.** Four positions, one symptom
   (`found i32` where a reference was wanted), and three of them were VALUE sinks fixable by
   asking for an existing widen while the fourth is a REP boundary. The symptom was shared; the
