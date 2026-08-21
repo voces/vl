@@ -22004,11 +22004,17 @@ export function inferRetRungIsNullable(i: i32): boolean {
   r == IR_RUNG_NULLABLE || r == IR_RUNG_NUL_LITUNION
 }
 
-export function inferRetTyAt(i: i32) { inferRetTy[i] }
+export function inferRetTyAt(i: i32) {
+  if i < 0 || i >= inferRetTy.length { return "" }
+  inferRetTy[i]
+}
 // The `Ty`-arena index of the `i`th recorded inferred return (`-1` if none) — the emitter's
 // `collectU` drives the structural arena walks off this so an inferred return's reachable
 // unions/closures register/intern exactly like an annotated one.
-export function inferRetTyIxAt(i: i32) { inferRetTyIx[i] }
+export function inferRetTyIxAt(i: i32) {
+  if i < 0 || i >= inferRetTyIx.length { return -1 }
+  inferRetTyIx[i]
+}
 
 // The emitter reads this to classify an un-annotated binding (`const x = if c then v
 // else null`) from its inferred value-union TYPE name (keyed by LetDecl node index),
@@ -24308,38 +24314,34 @@ export function nodeUnionName(ix: i32) {
   ""
 }
 
-// Roll the inferred-return table back to `mark` — ALL FIVE columns and the name index.
+// Roll the inferred-return table back to `mark` — ALL FIVE columns, not two.
 //
 // `recordInferRet` pushes five parallel columns (`inferRetFn`, `inferRetTy`, `inferRetAtomCount`,
 // `inferRetTyIx`, `inferRetRung`) and claims `inferRetIdx[name]` first-wins. The two speculative
-// re-check probes below used to undo that by popping TWO of the five and leaving the map alone,
-// while the `binCstr*` group three lines up pops every column of ITS group. A row recorded inside
-// a probe therefore survived the rollback in three columns and in the index.
+// re-check probes below used to undo that by popping TWO of the five, while the `binCstr*` group
+// three lines up pops every column of ITS group.
 //
-// WHAT THAT COSTS, if it ever fires: `inferRetTyAt` is an unguarded `inferRetTy[i]` read, so a
-// surviving index entry pointing past the shortened name column is an out-of-bounds read; and
-// every later `recordInferRet` lands its NAME at k and its arena index at k+1, which is exactly
-// the desynced row — right name, wrong type — that `inferRetBearsNull`'s `ty < 0 => false`
-// reduction assumes cannot exist.
+// THIS IS UNREACHABLE, AND `inferQuiet` IS WHY — not, as a first draft of this comment claimed, a
+// pass schedule. That framing pointed the next reader at a tripwire that does not exist and stayed
+// quiet about the edit that would actually arm this. The name-keyed `recordInferRet` calls live in
+// `checkProgram`, which the probes never call, so no reordering can put them in reach. The one
+// recorder the probes CAN reach is the node-keyed call in `checkFuncDeclNode` — and its whole
+// block is gated `} else if !inferQuiet {`, while both probes set `inferQuiet = true` for the
+// duration and nothing inside can clear it. So `inferRetFn.length` cannot exceed `mark` here.
 //
-// IT DOES NOT FIRE TODAY, and the reason is a SCHEDULE rather than an invariant: these probes run
-// only from `monomorphize`, and every name-keyed row is written by `elaborateInferRets` at the end
-// of checking, before that. A whole-table audit over the corpus, the generics and inference
-// fixtures, and the compiler's own source found no desynced row. This is hardening a latent
-// defect that a second reader of `inferRetTyIx` has just given a blast radius — not a bug fix with
-// a witness, and it is not claimed as one.
+// **The edit that arms this is relaxing that `!inferQuiet` gate**, and nothing else.
 //
-// The index is cleared BEFORE the columns shrink, because it is `inferRetFn` that names the keys.
+// `paramSolveProbe`, the third quiet re-check, takes no `inferRet*` mark at all and does not need
+// one for the same reason. It is not an omission.
+//
+// THE INDEX IS DELIBERATELY NOT ROLLED BACK. A `.delete()` here would be the compiler's first, and
+// `emitMapDelete` inlines a tombstone plus an amortized compaction at every site — measured at
+// 1,003 bytes of compiler binary to roll back a table that cannot have grown. The readers are
+// hardened instead: `inferRetTyAt` / `inferRetTyIxAt` now bounds-check like their
+// `inferRetAtomCountAt` / `inferRetRungAt` siblings already did, so a stale index entry yields -1
+// rather than an out-of-bounds read. That is the same defence at a twentieth of the cost, and it
+// protects the readers whether or not the rollback is ever reached.
 function rollbackInferRet(mark: i32) {
-  let ri = mark
-  while ri < inferRetFn.length {
-    const nm = inferRetFn[ri]
-    if inferRetIdx.has(nm) {
-      const at = inferRetIdx[nm] ?? -1
-      if at >= mark { inferRetIdx.delete(nm) }
-    }
-    ri = ri + 1
-  }
   while inferRetFn.length > mark { inferRetFn.pop() }
   while inferRetTy.length > mark { inferRetTy.pop() }
   while inferRetTyIx.length > mark { inferRetTyIx.pop() }

@@ -46860,7 +46860,7 @@ passing corpus.
   the annotation 55 times and the construction never. **Asking what a population is missing finds
   bugs; asking what it agrees on finds nothing.**
 
-## B76 — the rollback that popped two of five columns
+## B76 — the rollback that popped two of five columns, and a rationale that protected nothing
 
 B74's review asked what would break the `ty < 0 => false` reduction and found the answer next door,
 in code the destringify programme never touched.
@@ -46868,39 +46868,47 @@ in code the destringify programme never touched.
 `recordInferRet` pushes **five** parallel columns — `inferRetFn`, `inferRetTy`,
 `inferRetAtomCount`, `inferRetTyIx`, `inferRetRung` — and claims `inferRetIdx[name]` first-wins.
 The two speculative re-check probes, `monoInferListElem` and `monoInferLocalScalar`, undid that by
-popping **two**:
+popping **two**. The `binCstr*` group three lines up pops every column of its group.
 
-```vl
-while inferRetFn.length > sIRet { inferRetFn.pop() }
-while inferRetTy.length  > sIRet { inferRetTy.pop() }
-```
+### THE FIRST RATIONALE WAS WRONG, AND REVIEW CAUGHT IT
 
-The `binCstr*` group three lines up pops every column of its group. This one did not, and left the
-name index untouched as well.
+I shipped this as "latent because of a SCHEDULE — the probes run only from `monomorphize`, after
+`elaborateInferRets` has written every name-keyed row" and warned that the tripwire was *someone
+reorders a pass*. **That protects nothing, and it is not why this is safe.**
 
-**What it would cost.** A row recorded inside a probe survives in three columns and in the index.
-`inferRetTyAt` is an unguarded `inferRetTy[i]`, so a surviving index entry pointing past the
-shortened name column is an out-of-bounds read — and every later `recordInferRet` lands its NAME at
-k and its arena index at k+1. That desynced row, right name and wrong type, is precisely the row
-B74's reduction assumes cannot exist.
+The name-keyed `recordInferRet` calls live in `checkProgram`, which the probes never call — no
+reordering can put them in reach. The one recorder the probes CAN reach is the node-keyed call in
+`checkFuncDeclNode`, which the entry never mentioned. Its whole block is gated
+`} else if !inferQuiet {`, and both probes set `inferQuiet = true` for the duration with nothing
+inside able to clear it.
 
-**It does not fire today, and the reason is a SCHEDULE.** These probes run only from
-`monomorphize`; every name-keyed row is written by `elaborateInferRets` at the end of checking,
-before that. A whole-table audit over the corpus, the generics and inference fixtures, and the
-compiler's own source found no desynced row. The fix is one `rollbackInferRet(mark)` used by both
-sites — all five columns and the index, index first because `inferRetFn` names the keys. 0 corpus
-rows, as a hardening should be.
+**So the rollback is unreachable BY CONSTRUCTION, and the edit that arms it is relaxing that
+`!inferQuiet` gate — nothing else.** A comment naming the wrong tripwire is worse than no comment:
+it spends the next reader's attention on a hazard that cannot happen and stays silent about the one
+that can. `paramSolveProbe`, the third quiet re-check, takes no `inferRet*` mark and does not need
+one for the same reason; the entry now says so rather than leaving it looking like an omission.
 
-### WHY IT IS WORTH DOING RATHER THAN FILING
+### AND THE FIX COST 1,003 BYTES TO ROLL BACK A TABLE THAT CANNOT GROW
 
-B74 made `inferRetTyIx` load-bearing at a SECOND reader. Before that it fed `collectU`'s structural
-walks; now a void-classification fixpoint reads it too. **A dormant column-desync acquires a blast
-radius the moment a second consumer starts trusting the column** — and the phase ordering that
-saves it is not written down anywhere near either probe.
+Rolling the name index back needed `.delete()` — which would have been the compiler's FIRST, and
+`emitMapDelete` inlines a tombstone plus an amortized compaction at every site. **1,003 bytes of
+compiler binary for unreachable code.**
 
-### METHOD NOTE
+The review's counter-proposal is better and it is what shipped: drop the delete, keep the
+five-column pop, and spend the hardening on the readers instead. `inferRetTyAt` and
+`inferRetTyIxAt` were raw unguarded indexes while their `inferRetAtomCountAt` / `inferRetRungAt`
+siblings already bounds-checked — so a stale index entry was an out-of-bounds read at exactly the
+place B74 identified as the blast radius. They now bounds-check. **172 bytes instead of 1,003, and
+it protects the readers whether or not the rollback is ever reached.**
 
-* **When a reduction rests on an invariant, go and check who could break it.** The reduction was
-  correct; its stated reason was a row invariant and its real reason was a pass schedule. Those
-  differ exactly when someone reorders a pass — and the review that asked "what would make this
-  false" found a latent OOB nobody was looking for.
+0 corpus rows, on a population proven to exercise the changed code — `inference/
+unannotated-build-expr.vl`'s f64 leg types only via `monoInferListElem`.
+
+### METHOD NOTES
+
+* **A safety argument is a claim, and it gets checked like one.** Mine named a schedule; the real
+  guard was a flag three thousand lines away. Both conclusions were "latent", which is precisely
+  why the wrong reason survived to review — **agreeing conclusions hide disagreeing reasons.**
+* **Price the hardening.** Defence-in-depth against an unreachable path is worth something, but not
+  arbitrarily much. When a fix costs a kilobyte of binary, ask whether the same money buys more
+  somewhere the code actually runs.
