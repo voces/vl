@@ -46258,3 +46258,49 @@ same shape as the four reverts earlier in this programme.
 * **Finish the family.** Measuring one member of a group and generalising is what produced the
   "a dozen residues" error in the first place. Four arms, four builds, and the answers were 0, 1,
   0, and not-applicable — no two the same.
+
+## B69 / D-INFERRET — a "threading prerequisite" that was already threaded, and the first 0-and-0
+
+The inventory's eight blocked groups were ranked by (sites unblocked ÷ cost) and **B-8 came
+first**: the inferred-return NAME table, ~12 sites, *"`recordInferRet` ALREADY takes `er`, the
+arena index, alongside the name — so the table has the type and the readers do not read it.
+Prerequisite: expose the `er` column on the read side."*
+
+**The column was already exposed.** `inferRetTyIxOf(name)` sits in `typecheck.vl`, exported,
+doing exactly the `inferRetIdx[name]` → `inferRetTyIx[i]` lookup the prerequisite describes, and
+`inferRetTyIxByNode` wraps it. One caller already uses it.
+
+So B-8's ~12 sites were never Bucket B. **The cheapest of eight named prerequisites did not
+exist.** That is the fourth inherited claim in this programme to dissolve on inspection, after
+"~123 convertible", "17 askers / 2 convertible", and "a dozen residues" — and, like the others,
+it made the remaining work look more blocked than it is.
+
+### THE CONVERSION
+
+`fnRetNullBearing`'s inferred arm asked `unionSetHasNull(inferRetNameOf(fn.fnName))` — split a
+rendered member set on `|`, look for `null`. It now asks `tyBearsNull(inferRetTyIxOf(fn.fnName))`,
+the same question of the type the table banked beside that name. `nodeTyBearsNull` (B54) is
+refactored into `tyBearsNull` over an arena index plus a one-line node wrapper, so a caller
+holding a `Ty` rather than a node can ask.
+
+The `isValueUnionName(im)` GUARD stays a name test: the union registry is name-keyed, and that is
+B-1, a genuinely separate prerequisite.
+
+### AND THE FIRST 0-AND-0
+
+Both legs measured, per B66:
+
+| leg forced off | rows |
+| --- | --- |
+| arena leg (name fallback answers) | 0 |
+| name fallback (arena answers) | 0 |
+
+Neither uniquely answers — the whole arm is corpus-unreachable. That completes the three cases
+B66 named (1-and-0, 0-and-1, 0-and-0) with an observation of each, and it is the honest label for
+this slice: a string decision removed from the SOURCE, at an arm no corpus program reaches.
+
+### METHOD NOTE
+
+* **Check whether a prerequisite exists before building it.** Four of this programme's inherited
+  claims have now dissolved on a one-command check, and this one would have cost a sidecar
+  implementation to satisfy a requirement already satisfied.
