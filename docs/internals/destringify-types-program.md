@@ -47871,3 +47871,67 @@ comes from instrumenting the column.
 * **Measure the COLUMN, not the call.** "Does this caller have a type" and "does threading it
   change the column" are different questions, and the first one answered YES here while the second
   answered +0. The cheap instrument is a probe on the write, not on the caller.
+
+## B94 — step 2 collapses to one line, and a correction: #1586 shipped docs only
+
+Two things, and the correction comes first because it invalidates part of the previous entry's
+standing.
+
+### #1586 SHIPPED ITS DOCUMENTATION AND NOT ITS CODE
+
+B93 described `registerValueUnionNameTy` and a threaded first caller. **Neither is in the merged
+tree.** A `git checkout --` run to strip a probe also reverted the refactor, and the commit went out
+with only the doc file. The commit message describes code that was never shipped.
+
+The MEASUREMENTS in B93 stand — they were taken against builds that did contain the change (the
++0 coverage delta, the 3 reaches, the 295-file name-only census). What was wrong is the claim that
+the code had landed. It lands here.
+
+### AND STEP 2 IS ONE LINE, NOT TWELVE SLICES
+
+B91 sized step 2 as "thread a type into `registerValueUnionName`, caller by caller — 12 callers x
+the measurement discipline". B93 narrowed the target to the field/element paths, 295 files.
+
+Both were wrong about the *shape*. `registerValueUnionName` does not need its callers to carry a
+type; it needs to RESOLVE one, once, at the boundary:
+
+```vl
+export function registerValueUnionName(name: string) {
+  registerValueUnionNameTy(name, declTyIxOfName(name))
+}
+```
+
+That is precisely what the two declaration-driven sites already do, and what
+`recordSTyIx(sTyIxOfName(s.tdName))` does on the struct side. The string work happens ONCE at mint
+instead of at every query — which is the whole point of a sidecar.
+
+| | rows | coverage |
+| --- | --- | --- |
+| B92, sidecar only | 908 / 1,369 | 66.3% |
+| **after the boundary resolve** | **1,369 / 1,369** | **100%** |
+
+**+461 rows, 0 corpus rows changed.** The union registry now carries an arena index for every row
+it holds.
+
+### WHY THE PLAN OVERSHOT
+
+B91 reasoned from the CALLERS — twelve of them, each holding a name computed by other name work —
+and concluded the types had to be threaded from upstream. That is true if the registry must record
+*the caller's* type. It does not: it must record *this union's* type, and the union is exactly what
+the name denotes, so the registry can resolve it itself.
+
+**The plan mistook "the callers only have names" for "the registry cannot get a type".** Two
+different claims, and only the first was measured.
+
+### WHAT IS NOW POSSIBLE
+
+Step 3 — `isUnionTyIx(ty)` beside `isUName(name)` — has a fully populated column to read, at 100%
+coverage rather than 66%. The four sites B90 found blocked can be approached without a coverage
+guard on the registry side, which was the thing making them expensive.
+
+### METHOD NOTES
+
+* **Verify the diff before claiming the commit.** `git add <paths>` after a `git checkout --` on
+  those same paths commits nothing, and the message still says what you meant to do.
+* **Ask whether the consumer can derive what the producers lack.** Threading is expensive; a
+  boundary resolve is one line, and on this registry it was equivalent.
