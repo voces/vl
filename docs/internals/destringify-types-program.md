@@ -48491,3 +48491,58 @@ remaining three sit.
 * **A census enumerating consumers by NAME will miss a family.** B88's pattern listed every
   predicate it knew and no lookups; the correct question is "what consumes a render", not "which of
   these functions consumes a render". Five sites hid behind that difference for sixteen entries.
+
+## B105 — variants are NOMINAL: B103's inference was wrong, and B104 shipped it
+
+B103 concluded that structs are structural in this compiler, from a real fact: the intern layer
+dedupes an inline SHAPE onto a declared struct of the same field set
+(`shapeElemDeclaredStructIdx`). B104 carried that to variants and gave `variantRowOfTy` a `tySame`
+fallback.
+
+**Wrong, and it shipped.** `types/struct-union-same-shape.vl` declares
+
+```vl
+type A = { tag: i32, v: i32 }
+type B = { tag: i32, v: i32 }   // identical shape to A
+function f(x: A | B) { … }
+```
+
+precisely to pin that two variants with the same field set stay distinct. A `tySame` fallback
+matches the first of them for both. **Same mistake as B96's interning, one level down** — and the
+same fixture family caught it.
+
+The structural rung is removed here. The inference that produced it was: "the intern layer merges
+same-shape structs, therefore struct identity is structural, therefore variant identity is
+structural." The first step is true for shapes reaching the STRUCT registry and false for the arms
+of a union, whose entire purpose is to be told apart.
+
+### THE LIVENESS MAP FOR THE FAMILY
+
+Forcing each of the five `variantIndexOf(tyNameOf(…))` sites off:
+
+| site | rows |
+| --- | --- |
+| `emit_classify.vl:856` | 0 |
+| `wasmEmit.vl:13600` | 0 |
+| `wasmEmit.vl:13557` | 0 |
+| `emit_sections.vl:3504` | **2** |
+| `emit_classify.vl:18920` | **4** |
+
+Three inert, two live — so the family that B104's census correction added is mostly not
+convertible-by-measurement anyway.
+
+### AND THE READER STILL HAS NO CALLER
+
+Index-only `variantRowOfTy` still disagrees with `variantIndexOf` on those same two same-shape
+fixtures, for a reason not yet identified. The columns are in lockstep — two pushes and one reset
+each, verified — so it is not a desync. **Until that is explained the function has no caller**, and
+the comment at the site says so.
+
+Shipping a reader whose disagreement is unexplained would be the thing this log has spent a hundred
+entries not doing.
+
+### METHOD NOTE
+
+* **An inference that travels across registries needs re-measuring at each one.** "Structs are
+  structural" was measured. "Therefore variants are" was not, and it was false. The two registries
+  hold different kinds of thing and the fixture that says so was already in the corpus.
