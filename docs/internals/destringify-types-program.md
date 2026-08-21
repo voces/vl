@@ -47290,3 +47290,57 @@ That is as much evidence as this site can produce, and it is strictly more than 
   measuring them individually found five inert and one live. The liveness pair is cheap — one build
   per arm — and it should run BEFORE a conversion is written, not after, because for five of these
   six the answer is that no conversion is measurable at all.
+
+## B83 — the goal's literal sentence, and the first site that matched it exactly
+
+The programme's brief says: *the system should never print out a type as a string then do
+functional type work on that string.* Most of this log has been about predicates that read a
+spelling somebody ELSE produced — an annotation, a registry key, a checker render banked in a
+table. `monoArgTyName`'s string rung is the other thing, and it is rarer than the brief implies:
+
+```vl
+if nodeTyName(unwrapParen(ix)) == "string" { return "string" }
+```
+
+`nodeTyName` walks the arena and allocates a spelling via `tyToStructStr`. The only use of that
+spelling is a character compare against a constant. **The type is rendered and the render is
+consumed in the same expression** — the literal shape the goal names, with no table, no registry
+and no producer in between.
+
+`nodeTyIsStringPrim(ix)` reads the `TyPrim` variant and its `primName`. No render, and no compare
+against a rendered form.
+
+### MEASURED, IN THE ORDER B82 PUT THEM
+
+| step | result |
+| --- | --- |
+| liveness — rung forced off | **1 row** (live) |
+| disagreement — structural vs rendered | **0** |
+| control — the same probe INVERTED | fires on **129 files** |
+| conversion vs master | **0 rows** |
+
+The control is what makes the 0 readable, and it is a big one: 129 files reach this rung with a
+determinate answer, so the two forms agreeing on all of them is a real result rather than an
+unreached site. B82's map was built the same way and found five of six arms inert; this rung is
+thin (1 row) but genuinely live.
+
+### WHY THIS ONE CANNOT DIVERGE, AND THE NEXT ONE MIGHT
+
+`nodeTyIsStringPrim` is `TyPrim`-only. A literal union canon-softens to the spelling `string` at
+several positions, so `nodeTyName(x) == "string"` can be true where the structural question is
+false — that is the divergence that has now been measured at FIVE sites, with the softened answer
+correct at one and wrong at another. Here they never diverge because a litunion argument is claimed
+by the litunion rungs above this one.
+
+**So the predicate is deliberately narrow, and the narrowness is the point.** A caller that wants
+the softened answer should read the render and say so; a caller that wants the type should ask the
+type. Collapsing the two into one helper is how a site inherits the wrong answer from whichever
+caller was written first — which `tyArrayElemPrimName`'s header already warned about, one slice
+before this programme learned it the expensive way.
+
+### METHOD NOTE
+
+* **The brief's literal shape is rare, and worth separating from the general one.** "Render then
+  test in one expression" has an unambiguous fix and near-zero risk. "Read a spelling somebody else
+  banked" is the hard case, and it is most of the surface — five declines and two conversions so
+  far, none decidable without a measurement.
