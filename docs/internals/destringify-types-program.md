@@ -52003,3 +52003,41 @@ Only (2) is ordinary work. (1) is a different risk class. (3) is a bad trade and
 undone.
 
 Twenty-six conversions, 103 PRs, six gates green on every one.
+
+## B174 — the map-value gate, and two void measurements caught before they shipped
+
+`mapNodeValKindLowerable` asks "does this map's VALUE type lower?" and answers by RENDERING the
+value (`nodeTyMapValName` -> `tyToEmitName(t.mVal)`) and classifying the render with
+`mvValKindOfName`. The gate only needs `!= -3`, so a fast path can answer it from the type and
+leave the render for what the subset declines.
+
+`mvValLowersTy` claims lowering for exactly what the ladder's own arms give a kind: `string` 3 ·
+`f64` 11 · `i64` 10 · `f32` 13 · `i32`/`boolean` the early -1 · a nested MAP 6 · an ARROW 14.
+
+**UNION and NULLABLE values are deliberately absent.** The nullable guard ABOVE the kind dispatch
+returns -3 for two shapes (a single ref member + null; a non-value union with no ref member), so
+"is a union" does not imply "lowers" — claiming it would convert a LOUD reject into a silent
+lowering. Arrays are out for the same reason B171 keeps `TyNullable` out of code 5.
+
+Measured: **entry reached on 106 corpus files, the rung answers 64 of them**, corpus A/B 0 diffs.
+So 60% of this function's renders are gone, and the remainder still falls to the spelling.
+
+### Two void measurements, caught by the same check
+
+The first attempt reported "rung fires on 0 files" and I nearly wrote it up as inert. **The probe
+binary did not exist.** Substituting `emitFail` (an i32) for a boolean return broke the callers,
+the build failed with "if-condition must be boolean, got i32", the sweep ran against a missing
+`--compiler` path, and every build failed instantly — producing a clean, confident, meaningless
+zero. A second probe failed the same way for the same reason.
+
+The tell was mechanical: `ls` the probe binary. Both were absent.
+
+**The rule: a sweep must verify its probe binary exists before it runs.** A missing compiler and
+a never-firing arm produce identical output, and the difference is invisible in the numbers. This
+is the third variant of the same family — an unreached site (B137), an inert arm (B170), and now
+an unbuilt probe — all of which look like agreement.
+
+### A correction
+
+B173 said this function "RENDERS on every map node". It does not: it is reached on 106 of 1,947
+files. The per-CALL claim was right, the per-CORPUS one was overstated.
