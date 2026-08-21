@@ -50502,3 +50502,52 @@ Right, and incomplete by one step. Once you know the consumer needs canon's answ
 *where canon put it*. It is in two places, and only one of them is a string.
 
 `nameIsString` now has 4 remaining uses in `emit_classify.vl`, down from 5.
+
+## B144 — `letIsF64` and `letIsI64`, and the family closes
+
+The last two of the "softened name is RIGHT" declines, converted on canon's banked type.
+Probed in SEPARATE builds, because this pair is where the one-build-per-site rule was learned:
+an earlier probe carried both sites at once, `emitFail` aborted at the first, and the single
+file where both disagree reported only one of them.
+
+| site | reaching | combinations present | disagreements |
+| --- | ---: | --- | ---: |
+| `letIsF64` | 656 | all four | **0** |
+| `letIsI64` | 661 | three of four (no canonTy/true) | **0** |
+
+The three files that made `letIsF64` a decline — `is-numeric-litunion-membership.vl`,
+`single-literal-type.vl`, `soundness/literal-is-runtime-value.vl` — are canon-rewritten and
+now agree. Corpus A/B 0 of 1947; six gates green.
+
+### The family, closed
+
+| decline | recorded reason | outcome |
+| --- | --- | --- |
+| B129's local-i32 rung | mixed litunion wants the softening | converted (B142) |
+| `paramString` | litunion reads as a string at a sink | converted (B143) |
+| `letIsF64` | numeric literal lowers as f64, only the spelling says so | converted (B144) |
+| `letIsI64` | same shape, i64 | converted (B144) |
+| B102's five scalar rungs | 20 rows | already arena (#1605) |
+
+Five sites, one wrong inference, four conversions. Every recorded REASON was correct — each
+site does need canon's answer, and the arena's structural type is the wrong answer at each.
+What was wrong, five times, was the step from "needs canon's answer" to "must read canon's
+name".
+
+### The corrected rule
+
+B129 stated four questions and two destringifiable sources. The corrected form:
+
+| the question | the source |
+| --- | --- |
+| what TYPE is this | the arena (`nodeTyIxOf`) |
+| what did the author WRITE | the spelling tree (`annTsOf`), pre-canon only |
+| what CELL does this take | **canon's banked type** (`canonTyIxOf`) — not canon's name |
+| which interned ROW is this | the name, which IS the key |
+
+Three of four are structural. Only the interning key is genuinely name-shaped, because a key
+is its own identity. That is a materially different picture from B129's, and it was wrong for
+one reason worth stating plainly: **a column with one consumer looks like a special case
+rather than a source.** `canonTyIxOf` had exactly one caller for the whole programme until
+B141, so it never entered the list of things to try, and five declines were written against a
+three-source model.
