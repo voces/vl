@@ -50042,3 +50042,50 @@ still holding its node has been measured and adjudicated:
 What remains is bucket 4 — ~258 classifiers reachable only through a signature change, with
 its cost quantified in B132 and no dual-run available to validate it. That is a decision
 about the emitter's interfaces, not a continuation of this method.
+
+## B134 — correcting B132: bucket 4 IS incrementally verifiable
+
+B132 closed with a claim that is too strong and should not be left standing:
+
+> "no dual-run can validate a signature change, because there is no second reader to
+> disagree with"
+
+That is wrong, and the method this programme already uses refutes it. Threading a node into a
+name classifier splits into two steps, and BOTH are verifiable:
+
+1. **Add the node parameter, leave it unused.** Provably behaviour-neutral — the body is
+   unchanged, so corpus A/B byte-identity is a complete check, and the compiler's own fixpoint
+   confirms it.
+2. **Use the node, keep the name as fallback.** Exactly the dual-run every conversion in this
+   log has used: two readers, one site, disagreements counted, reachability proven, inverted
+   control run.
+
+So bucket 4 is not blocked on the absence of an instrument. It is blocked on SIZE: ~258
+classifiers, each needing its callers threaded before its body can change, and the callers are
+themselves classifiers. `nameIsNulBoolList` is the worked example — after #1623 converted its
+node-bearing call site, its remaining caller is `emit_base.vl:1630`, another name classifier
+taking a string. Eliminating one requires eliminating its callers, which are the same kind of
+thing.
+
+### What that actually costs
+
+The dependency runs leaf-ward, so the order is forced: a classifier can only lose its string
+parameter after every caller holds a node. That makes the work a topological sweep of the
+call graph rather than a list of independent sites, and it is why no amount of picking good
+individual targets makes progress on it — each one is blocked by its callers.
+
+The honest estimate is therefore not "258 conversions" but "one interface change, applied in
+~258 places, in dependency order, with an A/B and a fixpoint at each step". Every individual
+step is safe and checkable. The cost is the count, not the risk.
+
+### Why it still should not start unannounced
+
+Not because it cannot be verified — B132 was wrong about that — but because it changes what
+the emitter passes between its functions, which is a design decision about the compiler
+rather than a defect being repaired. The four-question rule (B129) says a rendered name is the
+CORRECT representation for two of the four questions, so the sweep would also have to decide,
+per classifier, whether it is asking a question that wants a node at all. That is a judgement
+about the emitter's shape, and it belongs to whoever owns that shape.
+
+Recorded as a correction rather than an edit, because the wrong claim shipped in #1625 and the
+log's value depends on its errors being visible.
