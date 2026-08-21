@@ -50903,3 +50903,53 @@ distinction, ask what that pass had to remember in order to do its job.** A coll
 a prior decision has to record it; a rewrite that must be idempotent has to record it; a brand
 that must be stable across resolutions has to record it. Those records are receipts whether or
 not anyone reads them.
+
+## B152 — bucket 2 dissolves: the tables were never name-only
+
+B151 ended with a resolution to apply the state question — *what did this pass have to
+remember?* — to the two categories still called blocked, rather than repeating that they need a
+decision. Applied to bucket 2 ("the name IS the interning key"), the category does not survive.
+
+Every interning table this programme called name-keyed carries a parallel TYPE column:
+
+| table | name column | type column | type-keyed reader |
+| --- | --- | --- | --- |
+| structs | `sNames` | `sTyIx` | `structIndexOfTy` |
+| unions | `unNames` | `unTyIx` | `isUnionOfTy` |
+| variants | `uVariants` | `uVarTyIx` | `variantRowOfTy` |
+| ref-list elements | `rlElemName` | `rlElemTyIx` | `rlSlotOfTy` |
+| struct fields | — | `sFieldElemTyIx` | `fieldElemTyIxOfName` |
+
+And the MINT side already threads the type. `ensureRefElemTy(elemName, ty)`'s own header:
+
+> "the caller's RECORDED arena type for `elemName` … threaded to `rlInternNameTy` for the slot
+> KEY and to nothing else: every classification below still reads the spelling, and the intern
+> still MINTS on a miss."
+
+So the key is already hybrid, and what remains name-based at those sites is the
+CLASSIFICATION — `refArrElemKind`, `fieldCodeOfSpelling`, the `nameIs*` ladder — which is
+bucket 4, functions that take a `string` because their callers hold one.
+
+### The corrected map
+
+| bucket | claim | verdict |
+| --- | --- | --- |
+| 1 | a pass destroyed the distinction | 2 of 3 converted; the survivor's cause is named |
+| 2 | the name IS the interning key | **dissolved** — the tables are dual-keyed and the mints thread types |
+| 3 | a node is in scope | exhausted |
+| 4 | the name-classifier layer | the only genuine remainder |
+
+Bucket 2 was never a category. It was bucket 4 seen from the table's side: the keys are typed,
+the classifiers around them are not, and I attributed the classifiers' name-shape to the keys.
+
+That is the fifth time a "blocked" verdict in this log dissolved on inspection, and the fourth
+that dissolved specifically because the state was richer than the call sites suggested.
+
+### What is actually left
+
+One thing: **~258 classifiers that take a `string` because their callers hold one.** Every other
+category is either converted, exhausted, or — as of this entry — not a category. The remaining
+work is a single interface change, applied leaf-ward through the call graph, with each step
+byte-checkable (B134). Its cost is the count, not the risk, and the one judgement it needs is
+whether the emitter SHOULD pass nodes — which B129's four questions answer with "for three of
+the four, yes".
