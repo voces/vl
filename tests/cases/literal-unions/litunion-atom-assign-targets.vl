@@ -7,6 +7,11 @@
 // @log z
 // @log kb
 // @log kb
+// @log kb
+// @log kb
+// @log kb
+// @log 1
+// @hint redundant type annotation: `a` is inferred as `{s: string}` — remove it to lean on inference
 // A literal-union atom ASSIGNED into four string-backed destinations. Each stored the raw i32
 // atom id into a `(ref null $aTypeIdx)` slot and was check-clean invalid wasm:
 //
@@ -14,6 +19,17 @@
 //   xs[0] = r.f     a `string[]` ELEMENT             (emitAssign's Index arm)
 //   ns[0] = r.f     a `(string | null)[]` ELEMENT    (same arm, niche backing)
 //   m["k"] = r.f    a STRING-VALUED MAP              (emitMapSetValExpr)
+//   t.s = r.f       a NARROWED-union receiver        (emitScalarFieldStoreVal)
+//   o.s = r.f       a VARIANT-TYPED-PARAM receiver   (the same shared helper)
+//   { s: r.f }      a VARIANT field CONSTRUCT        (the variant-box field loop)
+//
+// SEVEN, NOT FOUR. `emitAssign` has THREE `target is Member` branches — a plain struct receiver,
+// a narrowed-union receiver, and a variant-typed-param receiver — and the first version of this
+// change edited one of them. The other two share `emitScalarFieldStoreVal`, which handled the
+// scalar codes 17/23/24 and fell through to a bare `emitExpr` for the string codes. And for a
+// VARIANT receiver the CONSTRUCT half was broken too, so neither half worked there while the
+// plain receiver had both — the construct/assign rule below, applied to one of three receiver
+// shapes and then written down as a general finding.
 //
 // ONE CAUSE, AND THE ERROR TEXT SAID SO BEFORE ANY CODE WAS WRITTEN. All four read
 // `expected (ref null $type), found i32` — ref-vs-i32, meaning the value was never converted.
@@ -40,6 +56,9 @@
 type K = "ka" | "kb"
 type R = { f: K }
 type Box = { v: string | null }
+type VA = { s: string }
+type VB = { w: i32 }
+type VU = VA | VB
 
 function main() {
   const r: R = { f: "kb" }
@@ -73,5 +92,37 @@ function main() {
   const mk: {[string]: K} = Map()
   mk["k"] = r.f
   print(mk["k"])
+
+  // The other two Member-assign receivers, and the variant CONSTRUCT half.
+  narrowedRecv(r)
+  paramRecv({ s: "x" }, r)
+  print(variantCtor(r))
+
+  // The map assign in isolation: its only string work is the widen, so a missing reservation
+  // shows up here as an undeclared local rather than being masked by the prints above.
+  print(isoMap(r))
+}
+
+function narrowedRecv(r: R) {
+  const a: VA = { s: "x" }
+  const p: VU = a
+  const t = p
+  if t is VA { t.s = r.f; print(t.s) }
+}
+
+function paramRecv(o: VA, r: R) { o.s = r.f; print(o.s) }
+
+// The `: VA` annotation is LOAD-BEARING and the `@hint` declares it: the annotation is what
+// routes the literal through the VARIANT-box field loop rather than the plain-struct one, so
+// removing it on the linter's advice would move this arm off the path it exists to pin.
+function variantCtor(r: R) {
+  const a: VA = { s: r.f }
+  a.s
+}
+
+function isoMap(r: R) {
+  const m: {[string]: string} = Map()
+  m["k"] = r.f
+  return 1
 }
 main()

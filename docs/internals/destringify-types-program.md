@@ -45415,3 +45415,42 @@ reading the error's types.
   ref-vs-ref are different diagnoses in the same sentence shape. This slice cost four arms; the
   previous one cost two fixes and a pin because the same question was asked afterwards.
 * **A construct arm and an assign arm are one change.** Every field code has both.
+
+### ADDENDUM — "four destinations" was seven, and the two missing ones were 100 lines up
+
+Review found the census short again, and this time inside the very function that was edited.
+**`emitAssign` has THREE `target is Member` branches**, not one: a plain-struct receiver, a
+NARROWED-union receiver (`if t is A { t.s = … }`), and a VARIANT-TYPED-PARAM receiver
+(`function put(o: A) { o.s = … }`). The fix edited the first. The other two share
+`emitScalarFieldStoreVal`, which handled the scalar codes 17/23/24 and fell through to a bare
+`emitExpr` for the string codes — so both stored the raw id into a reference slot.
+
+And for a variant receiver the CONSTRUCT half was broken too. So the entry above — "a construct
+arm and an assign arm are one change, every field code has both" — was written from a fix applied
+to ONE of three receiver shapes, while a shape existed with NEITHER half working.
+
+**The enumeration is where four of the last five slices went wrong**, each in a different
+disguise: predicates instead of the question (B49), positions instead of destination shapes
+(B48), the expression walker instead of both walkers (B50), and now one receiver branch instead
+of three. The generalisable form is that the unit of enumeration is never the one that first
+comes to mind, and the cheap check is to read the enclosing dispatch to its end before believing
+a count.
+
+**And the map arm shipped without its reservation — the fourth consecutive time.**
+`assignWidensAtomToStr` gates on `exprString(binLeft)`, whose `Index` arm asks
+`exprStringArray(idxArr)` and declines for a map receiver, so `fnUsesStrOp` stayed false.
+`fbBeginFunc` assigns `strScratchBase = fbScratchCur` unconditionally BEFORE the reservation, so
+with no frame the base aliases `mapScratchBase` and the widen wrote `mapScratchBase + 3` — the
+map probe's `slot`. It was dead only because `emitMapSetV` evaluates the value before
+`emitMapProbe` overwrites that slot.
+
+That is worth stating precisely: **a latent scan/emit disagreement held safe by an evaluation
+order is not a safe scan/emit agreement.** It is fixed rather than noted, and the fixture cannot
+pin it — the behaviour was already correct — so the fix is preventive and says so.
+
+### METHOD NOTES
+
+* **Read the enclosing dispatch to its end before believing a census.** Three `target is Member`
+  branches, one edited, and the other two were a screen away in the same function.
+* **"Benign by evaluation order" is a defect, not a non-defect.** The write was real, the slot
+  was aliased, and the only thing making it safe was that someone else overwrote it first.
