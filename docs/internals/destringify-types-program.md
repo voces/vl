@@ -47006,3 +47006,119 @@ carried all along.
 * **Probe several candidates in one build.** A disagreement probe emitting only on disagreement
   costs one build and one sweep no matter how many sites it carries, and the inverted control that
   makes its zeros readable comes in the same pair. Ranking three sites cost two builds total.
+
+## B79 — the site that "needed a fixture first" was hiding a check-clean miscompile
+
+B78 declined to convert `cloRetIsString` because its interesting shape had a census of ZERO: only
+four corpus files reach it with an annotated callback return, and none of them carries the shape
+that would disagree. The honest move was to build the shape before converting. Building it found a
+live defect.
+
+```vl
+const ys = xs.map((v: i32): "a" | "b" => { return "a" })
+```
+
+`vl check --codegen` exits 0. The module does not validate — `type mismatch: expected i32, found
+(ref $type)`. **The canon pass softens an inline literal union to `string`**, so the annotation
+SPELLING reads `string`, `cloRetIsString` answered TRUE, and the result was built with the
+string-list kind while its elements are interned i32 ATOMS.
+
+Reading the arena keeps the `TyUnion` of `TyLit`s the spelling softened away.
+
+### THE FIRST READING WAS WRONG, AND THE MISTAKE IS WORTH NAMING
+
+The substituted build turned that program into `emitProgram: unsupported .map/.filter` and I wrote
+it down as a regression — a decline, like B77. **It is the opposite.** The name form is a
+check-clean invalid module; the arena form is a loud decline at check time. I had compared "works
+vs errors" without comparing the two FAILURE MODES, and the one that looked like success was the
+worse of the two.
+
+| | `check --codegen` | `build` | module |
+| --- | --- | --- | --- |
+| name (before) | **rc 0** | rc 1 | emitted, does not validate |
+| arena (after) | rc 1, emit error | rc 1 | not emitted |
+
+Corpus A/B: **0 rows.** Nothing that compiles today stops compiling.
+
+### AND IT IS A DIFFERENT BOUNDARY FROM B77's
+
+B77 declined a conversion because *the checker never typed the node* — inside a monomorphized
+clone the name is the only surviving record of the type. That is a coverage boundary.
+
+This one looked similar and is not. The node IS typed; the NAME records a deliberate SOFTENING the
+type does not carry. Two questions, not one: *what is this type* and *what did the canon pass
+decide to call it*. Where the emitter needs the second, the name is authoritative. Where it needs
+the first — as here, to pick a result REP — the softened name is a wrong answer that happens to be
+convenient.
+
+**So "the name is load-bearing" has at least two causes, and they want opposite treatment.**
+Uncovered node: keep the name, it is all there is. Softened name: take the arena, the name is
+actively lying.
+
+### THE DECLINE IS PINNED, AND SUPPORT IS THE REAL FIX
+
+`literal-unions/inline-litunion-map-callback-declines.vl` carries the loud verdict. The
+plain-function spelling of the same type already works (`inline-atom.vl`'s
+`function pick(): "x" | "y"`), so nothing in the language justifies the callback position
+differing — only the `.map`/`.filter` result classifier, which has no atom-list result kind. When
+that lands, the file becomes an `@run` asserting `a`.
+
+### METHOD NOTE
+
+* **Compare failure MODES, not outcomes.** "Compiles" and "errors" is not the comparison; a
+  check-clean invalid module is worse than a loud reject, and a conversion that trades the first
+  for the second is an upgrade even though it makes a program stop building.
+* **A zero census is a reason to BUILD the shape, not to skip the site.** Both times this
+  programme has done that, the constructed shape was already broken.
+
+### B79 addendum — D3 measured, and it is a decline for a third reason
+
+The scout's danger row D3 (`tyAnnRefListKind`'s `nameIsStringArray` rung) came with instructions:
+convert only as an `||` second opinion, never a swap, never behind a coverage guard — because the
+twin is silent on a `TyParam` element, where `nodeTyIxOf` IS non-negative so a coverage guard
+cannot reach it. All of that is correct.
+
+Measured anyway, because "convert it this specific way" is still a claim: **1,484 reaches over the
+corpus, 0 disagreements**, and the arena never answers `string` where the name declines — it
+answers `i32` for `i32[]` (58 reaches) and `""` for every non-array.
+
+So the `||` form buys nothing. It would keep the name, add a call, and move no population. **That
+is a third kind of decline**, distinct from B77's (the checker never typed the node) and B79's (the
+name records a softening the type does not carry): here the arena is simply narrower than the name
+on every shape that arrives, so there is nothing to take over.
+
+Worth separating, because only the first two are boundaries of the programme. This one is just a
+site where the conversion has no content — and the honest record is a measurement, not an
+argument.
+
+### B79 addendum 2 — the same softening, the opposite verdict
+
+`paramString` (`exprString`'s Ident arm) was the scout's revised #3, with the same twin as
+`cloRetIsString` and the same "census of the disagreeing shape is zero" note. So the same move:
+build the shape first.
+
+It did not need building. **The corpus already disagrees on 10 files, every one a literal-union
+param** — canon softens the litunion to `string`, the spelling reads `string`, the arena keeps the
+`TyUnion` of `TyLit`s and `nodeTyPrimName` answers `""`. The scout's zero census was for a
+constructed `: "lit"` param; the real population was the alias form, already present and already
+disagreeing.
+
+Substituting the twin turns **two corpus files from valid modules into check-clean invalid wasm**
+(`literal-unions/inline-atom.vl`, `soundness/ordering-hole-string-operand-sound.vl`).
+
+**So `cloRetIsString` and `paramString` read the SAME softened spelling and want OPPOSITE
+treatment**, sixty lines apart in one file:
+
+| | consumer decides | softened name is | verdict |
+| --- | --- | --- | --- |
+| `cloRetIsString` | the `.map` RESULT list rep — atoms and string refs are different backings | **wrong** → invalid module | **convert** |
+| `paramString` | whether an Ident READS as a string — a litunion atom widens at a string sink | **right** | **decline** |
+
+**"The name records a canon decision" is not by itself a reason to convert or to decline.** It only
+says the two encodings differ; which one is correct depends on what the consumer does with the
+answer, and nothing but a measurement settles it. B79's first draft treated the softening as
+evidence for conversion. Half of it was.
+
+That is now three distinct decline causes on record — uncovered node (B77), narrower-than-the-name
+(D3), and softened-name-is-correct (here) — against one softening-based conversion. The programme
+needs all four written down, because they are indistinguishable from the call site.

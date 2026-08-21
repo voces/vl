@@ -630,7 +630,24 @@ export function cloRetIsString(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
-    if fn.fnRet >= 0 { return nameIsString(tyNameOf(fn.fnRet)) }
+    // THE ARENA. `nameIsString(tyNameOf(fn.fnRet))` read the annotation SPELLING, and the canon
+    // pass softens an INLINE literal union to `string` — so an `xs.map((v): "a" | "b" => …)`
+    // callback recorded the name `string` and this answered TRUE for a result whose elements are
+    // interned i32 atoms, not string refs. The module was emitted with the string-list result kind
+    // and did not validate: `type mismatch: expected i32, found (ref $type)`, at `vl check
+    // --codegen` rc 0.
+    //
+    // AN UPGRADE, NOT A NO-OP, AND THE DIRECTION IS THE POINT. The arena keeps the `TyUnion` of
+    // `TyLit`s that the spelling softened away, so this now answers FALSE and the shape reaches
+    // the `.map`/`.filter` result classifier's DECLINE — a loud `emitProgram: unsupported
+    // .map/.filter` at check time instead of a module that only the post-emit validator catches.
+    // Supporting the shape is the real fix (the plain-function form `function pick(): "x" | "y"`
+    // already works); until then, failing loudly is strictly better than failing silently.
+    //
+    // MEASURED: 0 corpus rows — nothing that compiles today stops compiling. The witness had to
+    // be constructed, because the corpus contains exactly ONE inline-litunion return annotation
+    // and it is on a plain function, never a `.map` callback.
+    if fn.fnRet >= 0 { return nodeTyPrimName(fn.fnRet) == "string" }
     if fe < fRetKind.length { return fRetKind[fe] == "str" }
   }
   false
@@ -11649,6 +11666,22 @@ export function tyAnnRefListKind(tyIx: i32) {
     if annIsNulLitUnionArray(tyIx) { return 9 }
     const lt = P.nodes[tyIx]
     if lt is TypeRef {
+      // STAYS ON THE NAME — MEASURED DECLINE (B79), and the measurement is what settles it
+      // rather than the usual chain argument.
+      //
+      // This is rung 1 of six, so the standing worry is B57's: a wider rung steals from every
+      // rung below. `nodeTyArrayElemRepName(tyIx) == "string"` is the twin, and it cannot be
+      // swapped in — it is SILENT on a `TyParam` element (`nodeTyIxOf` is non-negative, so a
+      // coverage guard does not reach it either), which is the shape `generics/
+      // type-param-shadows-alias-funcdecl.vl` carries and the reason the identical conversion
+      // was reverted in `collectA`.
+      //
+      // The `||` second-opinion form — the one that DID work for the f64/i64 rungs in #1563 —
+      // buys nothing here. Probed over the whole corpus: **1,484 reaches, 0 disagreements**, and
+      // the arena never answers `string` where the name declines. It answers `i32` for `i32[]`
+      // (58 reaches) and `""` for every non-array; there is no population where adding it as a
+      // disjunct changes the rung. So the `||` would keep the name, add a call, and move nothing
+      // — not a destringification, just a longer line.
       if nameIsStringArray(lt.tyName) { return 3 }
       // A `(boolean | null)[]` annotation (kind 8): an i32-backed list whose elements
       // carry the boolean sentinel niche (`null → 2`). Threads so an all-`null` `[null]`
@@ -23609,6 +23642,27 @@ function fnRetStringSid(sid: i32) {
 function paramString(fnIx: i32, name: string) {
   const pt = paramTypeNode(fnIx, name)
   if retNulStringFlag(pt) == 1 { return true }
+  // STAYS ON THE NAME — MEASURED DECLINE, and it is the exact MIRROR of `cloRetIsString`
+  // sixty lines up, which converted in the same change. Both read a spelling the canon pass
+  // SOFTENED; only a measurement says which of the two answers the consumer needs.
+  //
+  // `nodeTyPrimName(pt) == "string"` is the twin. Substituting it turns TWO corpus files from
+  // valid modules into check-clean INVALID WASM (`literal-unions/inline-atom.vl`,
+  // `soundness/ordering-hole-string-operand-sound.vl`): `type mismatch: expected i32, found
+  // (ref $type)`.
+  //
+  // The disagreeing population is 10 corpus files and every one is a LITERAL-UNION param. Canon
+  // softens the litunion to `string`, so the spelling reads `string` while the arena keeps the
+  // `TyUnion` of `TyLit`s and `nodeTyPrimName` answers "". **Here the softened name is RIGHT**:
+  // this decides whether an Ident READS as a string, and a litunion param does read as one at a
+  // string sink — the atom widens on the way in. The arena's structural truth is a different
+  // question than the one being asked.
+  //
+  // `cloRetIsString` inverted every clause of that: it picks a RESULT list rep, where atoms and
+  // string refs are genuinely different backings, so the softened name was the wrong answer and
+  // produced an invalid module. Same softening, opposite verdicts. **"The name records a canon
+  // decision" is not by itself a reason to convert OR to decline** — ask which answer the
+  // consumer needs, and measure.
   nameIsString(tyNameOf(pt))
 }
 
