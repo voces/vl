@@ -49855,3 +49855,40 @@ Only the first two are "destringified" in the sense the programme set out to ach
 third and fourth are name-shaped because the answer itself is a name: a lowering decision the
 arena does not record, and an identity the table keys by. Every decline in this log is one of
 those two, and every conversion was one of the first two mistaken for them — or the reverse.
+
+## B130 — the nullable-boolean list rung, and a rung that is inert
+
+B121's `emit_classify` survey named exactly one NEEDS-MEASUREMENT site with a plausible
+untried twin: `nameIsNulBoolList(lt.tyName)` in `tyAnnRefListKind`, which re-parses the
+rendering for `(boolean|null)[]`. The twin it suggested does not exist yet, because the
+element is a NICHE (0/1 with the spare 2 for null) rather than a box, so the elem-rep readers
+that answer for a plain `boolean[]` do not claim it and the nullable hop must be spelled out:
+
+```vl
+export function nodeTyIsNulBoolList(ix: i32): boolean
+  // TyArray over TyNullable over TyPrim("boolean")
+```
+
+Dual-run: **1402** corpus files reach the rung, both answers present (1399 false, 3 true),
+**0** disagreements. Converted, with the name kept for a node the checker never typed.
+
+### And the rung is inert
+
+Forcing the rung to answer false changes **zero** corpus files. The three that answer true
+get kind 8 from elsewhere as well, so the corpus cannot distinguish the two readings — the
+same situation B119 found at the scalar-import fallback.
+
+That is worth recording as a category rather than a footnote, because it is now the second
+instance. A site can be:
+
+- **live and load-bearing** — forcing it off moves files (the param ladder rungs, the mono
+  type-param test, the checker's value-union test)
+- **live but inert** — reached, both answers observed, and forcing it off moves nothing
+  (B119's fallback, this rung)
+
+Both are worth converting when the structural reading is correct — the second just cannot
+claim a measured behavioural win, and should not be written as though it can. The evidence
+here is that the arena reading is right and agrees everywhere it is asked, not that the
+corpus would have caught it being wrong.
+
+Corpus A/B 0 of 1947; six gates green.
