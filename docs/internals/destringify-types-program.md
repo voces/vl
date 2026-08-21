@@ -47645,3 +47645,70 @@ both printing the same. `maps/union-member-map-param-reservation.vl` pins both h
 * **Measure the twin's WIDTH before adopting it, not just its subject.** The cheap test is the one
   used here: substitute, sweep, and read the row count as a statement about width. 4 rows said
   "too narrow" in one build, and the span twin was 20 lines.
+
+## B90 — what is actually left, counted rather than quoted
+
+B88 counted the brief's LITERAL shape and found eight instances, all with verdicts. It then said
+"354 `nameIs*` call-lines remain", and that number has been repeated since without being taken
+apart. Taking it apart changes the picture completely.
+
+### THE 354, CLASSIFIED
+
+| class | count | convertible? |
+| --- | --- | --- |
+| `export function nameIsX` DEFINITIONS | 45 | no — they are the helpers |
+| calls taking a bare STRING variable, no node in scope | 169 | no — nothing to ask the arena about |
+| calls inside `emit_base.vl` (the string-in helper layer) | 88 | no — same reason, by design |
+| calls inside `typecheck.vl` (the name→arena BRIDGE) | 44 | no — you cannot ask the arena about a type it has not built |
+| **calls whose ARGUMENT derives from a node** | **15** | **the real surface** |
+
+**Fifteen.** Not 354. The rest are the helper layer, the bridge that CREATES types from names, and
+calls with no node to ask about — none of which the brief is about.
+
+### THE FIFTEEN
+
+Nine already have recorded verdicts: `nameIsBareMap` (D-BAREMAP decline), `nameIsStringArray` ×2
+(B57 revert, D3), `nameIsClosureElem` (B38 decline — the arena is RIGHT, so converting is a
+behaviour change), `nameIsMap` (**converted**, B89), `nameIsNulBoolList` (inert, B85),
+`nameIsNulLitUnionList` ×2 (DO-NOT-DELETE, B75), `annIsNulStrListDeep` (already arena-first),
+`paramString` (decline, B79).
+
+**Four were open, and all four are blocked on the same prerequisite.** Measured live:
+
+| site | rows | why it cannot convert today |
+| --- | --- | --- |
+| `collectA`'s ref-array rung | **168** | `nameIsRefArray`'s element test ends in `structIndexByName(base)` and the union tables |
+| `collectA`'s array-validation rung | 3 | `nameIsArray(nd.tyName) && !isUName(nd.tyName)` |
+| `emit_sections`' param reject ladder | — | its neighbours are `isUName` and `variantIndexOf` |
+| `letIsStringArray`'s rung | 1 | D3's family — the twin is silent on a `TyParam` element |
+
+And the three registries those consult:
+
+```vl
+isUName(name)            unNames[u] == name
+structIndexByName(name)  sNameIx[name] ?? -1
+variantIndexOf(name)     uVariants[i] == name
+```
+
+**All keyed by the rendered NAME.** A predicate asking "is this array's element a declared struct,
+union, or variant" has to ask by name, because the name is the key. That is prerequisite B-1 from
+the original inventory, and it is now measured as THE blocker for the entire remaining surface —
+not one item on a list of eight.
+
+### WHAT THAT MEANS FOR THE BRIEF
+
+The type system no longer renders a type and tests the render anywhere a measurement could license
+removing it. What remains is one structural fact: **the emitter's struct/union/variant registries
+are name-keyed**, so the last name tests are lookups into tables whose keys are names. Converting
+them is not a predicate swap — it is re-keying three registries by arena index, with every
+`unNames`/`sNames`/`uVariants` reader moved with them.
+
+That is a different piece of work from this programme, it is large, and it should be scoped as its
+own thing rather than smuggled in as "one more site". The honest end state of THIS programme is:
+the surface is fifteen sites, eleven are settled, and four wait on a named prerequisite.
+
+### METHOD NOTE
+
+* **A count is a claim.** "354 remain" survived a dozen entries because nobody classified it. Five
+  greps reduced it to fifteen, and the four that are left share a single cause — which is a
+  roadmap, where 354 was only a number.
