@@ -44814,3 +44814,47 @@ evidence.
   half of a twin pair needs a program built for it.
 * **Two remain in this family** — the `string | null` return and the narrowed-parameter return,
   both still pinned under `xfail-miscompile-`. The field ladder stays blocked until they close.
+
+### B45 ADDENDUM — the twin is a PAIR OF QUESTIONS, and they can resolve one name two ways
+
+Review of #1539 found the pairing has a third failure mode neither B42 nor B45 anticipated. The
+emit arm and the reservation predicate ask the SAME question — `exprIsLitAtom` — and still
+disagree, because the question's answer depends on WHEN it is asked.
+
+`exprIsLitAtom`'s `Ident` arm resolves through `declaredSlotOf`, which falls back to a linear
+`localNames` scan returning the FIRST match. The reservation scan runs before the body is
+emitted, so the scope stack is empty and an OUTER binding wins; by emit time `scopeBind` has
+bound the INNER one. A shadowed atom therefore reserves nothing and widens anyway:
+
+```vl
+const v = 7
+if n > 0 { const v: K = "kb"; show(v) }   // `unknown local 6`, check --codegen rc 0
+```
+
+**This belongs to all SIX sinks and predates the push one** — it reproduces on master at the
+`call` sink, which is where it is now pinned
+(`xfail-miscompile-shadowed-atom-widen-unreserved-frame.vl`), precisely so it does not read as a
+regression introduced with the sink it was found next to.
+
+And it has a silent form. The stolen slot is `strScratchBase + 3`; out of bounds it is a loud
+reject, but a function that declares enough locals — an i32-keyed map frame suffices — lands it
+IN BOUNDS on an i32 slot, the module validates, and the atom id sits on top of an unrelated
+local. In that shape #1539 turns a master rc=1 into a branch rc=0.
+
+The fix is one level down and closes all six at once: make `declaredSlotOf` resolve a name the
+same way in both phases. That is a name-resolution change under six consumers, not a sink fix,
+so it is queued rather than folded in.
+
+### METHOD NOTES
+
+* **"Both sides call the same predicate" is not proof they agree.** A predicate that reads
+  mutable phase state answers differently in different phases. The twin rule needs a stronger
+  form: the two sides must agree *at the times they are asked*, which is a claim about the
+  predicate's inputs, not about its source text.
+* **Check whether a fix converts a LOUD failure into a SILENT one.** Both programs were already
+  broken, so no working program regressed — but "already broken" is the wrong bar when the
+  change moves a rejection into an acceptance. That is a strictly worse failure mode even with
+  no correct program affected.
+* **Name the qualifier in the taxonomy, not just in the commit.** The README said this sink was
+  "already CLOSED"; it is closed FOR UNSHADOWED BINDINGS. A README that overstates a closure is
+  how a fixed-looking defect stops being looked for.
