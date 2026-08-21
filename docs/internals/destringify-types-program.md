@@ -48435,3 +48435,59 @@ measurement is what showed that rather than another conversion.
   worth building — the ref-array rung still needs it — but the site chosen to validate it had been
   arena-first for some time, with an inert name leg. Two builds said so; reading the twenty lines
   above the call would have said so first.
+
+## B104 — B88's census was short by five, and the variant registry gets its column
+
+### THE CENSUS CORRECTION
+
+B88 counted the brief's LITERAL shape — render a type, test the render — across every render
+function and reported **eight instances, all with verdicts**. The grep listed the test predicates
+(`nameIs*`, `arrElemNameRaw`, `unionSetHasNull`, …) and **omitted the registry lookups**. Five more
+exist, all the same shape:
+
+```
+emit_sections.vl:3504   retSlot          = variantIndexOf(tyNameOf(fn.fnRet))
+wasmEmit.vl:13557       pendingVariantIdx = variantIndexOf(tyNameOf(fn.fnRet))
+wasmEmit.vl:13600       retVi            = variantIndexOf(tyNameOf(fn.fnRet))
+emit_classify.vl:856    k == "variant"   → variantIndexOf(tyNameOf(fn.fnRet))
+emit_classify.vl:18920                     variantIndexOf(tyNameOf(paramTypeNode(fnIx, name)))
+```
+
+**Thirteen, not eight.** A registry lookup keyed on a rendered name is as much "print the type and
+work on the string" as a predicate is — arguably more, since the string reaches a table. The census
+that was supposed to bound the work missed a whole family because its pattern enumerated
+consumers by name.
+
+### THE COLUMN AND THE COMPANION
+
+`uVarTyIx` — the arena type each variant row names, resolved once at registration via
+`declTyIxOfName`, matching `sTyIx` and `unTyIx`. `variantRowOfTy(ty)` reads it: index rung first,
+then `tySame`.
+
+**No nominal/structural split**, unlike `isUnionOfTy`: a variant is a declared struct arm, and B103
+established structs are structural here. Named `variantRowOfTy` rather than `variantIndexOfTy`
+because `variantIndexOfTypeName` already exists and the two would read as a pair they are not.
+
+Probed at `emit_classify.vl:856`: **0 disagreements.**
+
+### AND TWO OF THE FIVE SITES ARE INERT
+
+Forcing each off:
+
+| site | rows |
+| --- | --- |
+| `emit_classify.vl:856` (`k == "variant"`) | **0** |
+| `wasmEmit.vl:13600` (`retVi`) | **0** |
+
+So the two measured so far are redundant on this corpus, and converting them would produce the
+empty 0 B82 refuses to ship on. The other three are unmeasured.
+
+**That is the honest state of this family: the column and reader exist and agree, and the sites
+that would use them have to earn it one liveness measurement at a time** — which is where the
+remaining three sit.
+
+### METHOD NOTE
+
+* **A census enumerating consumers by NAME will miss a family.** B88's pattern listed every
+  predicate it knew and no lookups; the correct question is "what consumes a render", not "which of
+  these functions consumes a render". Five sites hid behind that difference for sixteen entries.
