@@ -45228,3 +45228,40 @@ checker should reject the declaration, and it does neither. Pinned with the WRON
 * **Checking whether the SILENT form of a bug is also fixed is worth doing on its own.** The
   reservation fix closed the loud spelling. Asking "and the quiet one?" found a defect in
   ordinary parameter shadowing that no part of this programme would have reached.
+
+### ADDENDUM — I enumerated the predicates instead of the question, and missed three askers
+
+The first version of this fix patched the six `*WidensAtomToStr` predicates and shipped "the hole
+is closed". Review found three more scan-side askers of the SAME question about the SAME shadowed
+Ident, each still emitting invalid wasm at `vl check` rc 0: **`print(v)`**, an object-literal
+**field value**, and an **if-arm join**.
+
+**ENUMERATE THE QUESTION, NOT THE PREDICATES THAT ASK IT.** Grepping `*WidensAtomToStr` finds the
+sinks someone already named and grouped; grepping `exprIsLitAtom` on the scan side finds the ones
+they did not. The blind spot is visible in my own fixture header, which reasons carefully that
+`print` would reserve the frame *incidentally* and steers around it — without once asking whether
+`print` of a SHADOWED atom reserves it. It does not.
+
+Three further corrections from the same review:
+
+* The `assignWidensAtomToStr` call sat OUTSIDE the guard proving the assignment TARGET widens,
+  unlike all five siblings — reserving a 7-slot frame for any assignment whose RHS is an Ident
+  with a litunion homonym, whatever the LHS type. Moved inside.
+* The PR deleted a fixture that two surviving comments still cited as live, one of them the block
+  immediately above the new code, so two adjacent comments contradicted each other in shipped
+  source.
+* The param-shadow pin's symptom taxonomy was wrong. There are THREE symptoms, not two, and the
+  third is the worst: where the types simply differ with no literal union anywhere, it is
+  `check --codegen` rc 0 plus an invalid module. And the CHECKER is right while codegen is wrong
+  — `localIndexOf` resolves PARAM-first while `exprIsLitAtom`'s Ident arm resolves
+  DECLARED-LOCAL-first — which makes it a checker/codegen TYPE CONFUSION rather than only a wrong
+  number.
+
+**The over-reservation cost, measured rather than asserted.** The first version was byte-identical
+on the compiler's own source and across the corpus. With the three added positions the compiler's
+self-build grows 690 bytes of 1,265,070 — 0.05%, and 0 rows move on the corpus. "A few locals"
+was a guess; this is the number.
+
+* **A grep over a NAMING CONVENTION enumerates what someone already classified.** A grep over the
+  CALL enumerates what is actually there. When the fix is "everyone who asks X must also ask Y",
+  the search term is X.
