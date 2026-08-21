@@ -46404,21 +46404,41 @@ null-bearing; name leg says null-bearing. An `emitFail` probe comparing the two 
 fires on this program before the fix and is silent after it, so the disagreement is confirmed at
 the PREDICATE level.
 
-**ITS OBSERVABLE CONSEQUENCE IS NOT DEMONSTRATED, and an earlier draft of this entry claimed it
-was.** I wrote "the two builds emit different bytes for it", repeating a reviewer's measurement I
-had not reproduced — the fifth inherited claim in this programme I passed on without checking, and
-the first one I wrote down myself. It does not reproduce: recursive, non-recursive and master
-builds all emit byte-identical output for the program above and for every annotated, aliased and
-fall-through variant I could construct. The reason is the one the review itself gave — where the
-two legs differ, `bodyTotalForRet` makes the diverging fall-through DEAD; where the fall-through
-is live, `!bodyTotalForRet` wraps the whole type in `mkNullableTy`, putting `null` at the top where
-even the non-recursive scan sees it.
+**THE BYTES CHANGE; THE BEHAVIOUR DOES NOT.** The fixture below is 993 bytes without the recursion
+and 1,011 with it — three functions x the 6-byte null-tagged box replacing an `unreachable`. Seven
+further shapes flip false->true and every one is exactly +6 bytes.
 
-So the honest statement is: **a shared predicate was giving a wrong answer, and no program has yet
-been found where that wrong answer reaches output.** It is still worth fixing — `tyBearsNull` has
-other consumers and the next one need not be so lucky — but it is a correctness repair with an
-undemonstrated blast radius, not a miscompile fix, and the fixture below is SHAPE COVERAGE rather
-than a regression test (reverting the recursion leaves its bytes unchanged).
+**A RETRACTED RETRACTION, and the mechanism is worth more than the embarrassment.** I first wrote
+that the two builds emit different bytes, taking it from the review without reproducing it. I then
+"corrected" that to say it does not reproduce — recursive, non-recursive and master all
+byte-identical. **The correction was wrong and the original was right.** Every comparison behind it
+used `build/vl-compiler.wasm` as "the fixed compiler", and that file had been left holding the
+PRE-FIX build by my own earlier command:
+
+```
+git stash && bash scripts/refresh-compiler.sh && cp build/vl-compiler.wasm /tmp/master_c.wasm && git stash pop
+```
+
+`refresh-compiler.sh` installs its output at `build/vl-compiler.wasm`. Building a master seed that
+way leaves the SEED PATH holding master's compiler, and `git stash pop` restores the SOURCE without
+restoring the binary. Six subsequent measurements compared no-fix against no-fix and agreed
+perfectly, which is what no-fix against no-fix does.
+
+So: pass on a claim unchecked and it is worth nothing; check it with a stale artifact and it is
+worth less than nothing, because now there are two records and the wrong one is the more recent.
+**Always name the seed explicitly** — `SEED=... OUT=... refresh-compiler.sh` — and never let a
+measurement read a path some earlier command may have written.
+
+**What IS true about the blast radius**, and this is the review's structural finding rather than my
+byte-counting: the totality gate `retNullableNow` tests only `T.tys[ret] is TyNullable`, so a LIVE
+fall-through is permitted only for a top-level nullable — exactly the case `tyBearsNull` answered
+true for even before the fix. The fix therefore cannot change behaviour on any live path; it
+strictly repairs DEAD padding. The pre-fix bug was latent, not live.
+
+That makes the fixture SHAPE COVERAGE and not a behavioural regression test — `@log` cannot catch a
+revert, because the output is identical while the bytes are not. It also makes this recursion a
+strict PREREQUISITE for repairing the totality gate: with the gate recursive and `tyBearsNull` not,
+a demonstrably live fall-through is padded with `unreachable` and traps.
 
 ### WHY 1,449 LIVE ROWS AND 0 DISAGREEMENTS WAS STILL A TRUE ANSWER TO THE WRONG QUESTION
 
