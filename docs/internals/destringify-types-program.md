@@ -48590,3 +48590,64 @@ smaller and more precise remainder than "the variant registry is name-keyed".
   this as a registry problem — interning, nominal identity, structural fallback, column desync —
   and it was the argument. Printing every value at the site took one build and settled what four
   hypotheses had not.
+
+## B107 — the variant param rung declines, and the cause is member dedup
+
+B106 blamed the QUERY: `paramTypeNode` looked like it handed over the wrong node, since a
+param annotated `A | B` reported `nodeTyIxOf` = 31 = A's own row type. That was the right
+observation and the wrong explanation, and the correction came from taking a census
+instead of reasoning from two data points.
+
+An unconditional print at `paramVariantIndex`'s rung over 700 corpus files gave 391
+distinct rows, splitting three ways:
+
+| rows | what the arena had | verdict |
+| ---: | --- | --- |
+| 300 | `paramTypeNode` returned -1 — unannotated param, or the name is not a param | inert; both readers say "nothing" |
+| 78 | a faithful type: `AB` -> `{a:i32}\|{b:i32}`, `A\|B\|i32\|f64\|boolean\|string\|null` -> every arm | convertible |
+| 13 | silent: a real spelling, no recorded type — 11 of 13 name a type PARAMETER (`T[]`, `T[][]`, `Pair<X,string>`) | coverage guard would fence these |
+
+So unions are NOT lost in general, which killed the "the query passes the wrong node"
+story: for different-shape unions the annotation node records the whole union.
+
+A whole-corpus dual-run of the two readers then found **exactly two** disagreements:
+
+```
+ZVR name=[Cat|Dog] byName=-1 byTy=0 tyIx=31 rows=2
+ZVR name=[A|B]     byName=-1 byTy=0 tyIx=31 rows=2
+```
+
+Both are a union whose arms are **structurally identical**. Member dedup is structural, so
+`Cat | Dog` — both `{kind:i32,name:string}` — dedupes to a single member and collapses to
+that member's type. `tyIx=31` is arm 0's own row (B106 measured `row0=[A]ty=31
+row1=[B]ty=32`; the arena is an append log, so two identical shapes really do occupy
+distinct rows — this is dedup inside the union constructor, not interning).
+
+The arena answers "arm 0"; the name answers -1; **the name is right** — the param is the
+union, not the arm. Trusting the arena would tell emit the value is a concrete unboxed
+variant ref when it is a boxed union: a miscompile straight through the gap-#2 boundary
+`paramVariantIndex` exists to police.
+
+This is the sharpest boundary the programme has found. Everywhere else a name beat the
+arena it was contingent — a coverage hole, a registry keyed the wrong way, a softened
+spelling — and each was fixable. Here it is structural: the two types that must be told
+apart *are the same type* structurally, and differ only in what they are called. A
+structural arena cannot represent that distinction, so the spelling is not a workaround,
+it is the only carrier of the answer.
+
+`variantRowOfTy` stays, correct and callerless, with the reason recorded on it.
+
+### Method note, again the same one
+
+Two bad controls preceded the good measurement, both from my own list of traps:
+
+1. A different-shape union of plain aliases (`P|Q`) "agreed" — but neither is a registered
+   variant, so both readers returned -1 trivially. An agreement that could not have been
+   a disagreement.
+2. Worse, an unconditional print showed that file never reaches the rung at all. The
+   agreement was measured at an **unreached site** — the worthless zero, for the second
+   time on this branch.
+
+The rung only yielded once the probe printed every value over the whole corpus rather
+than the mismatches over a sample. When two readers disagree, first check they were asked
+the same question (B106); then check the population could have contained the answer.
