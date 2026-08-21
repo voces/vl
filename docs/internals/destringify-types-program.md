@@ -48884,3 +48884,71 @@ Several map-shaped spellings (`{[string]…`) reach the cascade and their files 
 which rung accepts them is not established — the probe truncates the spelling and the
 answer was not measured. Left open rather than guessed; it matters because a typed-value
 map is precisely the shape `retMapFlag` declines.
+
+## B112 — the five scalar rungs converted, and the rung that makes it possible
+
+B102 declined these five and recorded why: substituting `nodeTyPrimName` for
+`ty.tyName != "<prim>"` moved 20 corpus rows, because a NUMERIC literal-union param renders
+as `f64` after canon softening — the spelling accepted it while the arena saw a `TyUnion` of
+`TyLit`s and the param fell through to the reject.
+
+The decline was correct for the substitution as attempted. It is not correct for the
+ladder, because the missing piece was never in those five rungs: it was the absence of a
+rung that states the litunion's lowering from the arena.
+
+```vl
+} else if numLitUnionBaseName(nodeTyIxOf(p.parType)) != "" {
+  // a NUMERIC literal-union param is lowered as its BASE SCALAR
+} else if paramScalarName(p.parType, ty.tyName) != "i32" {
+```
+
+`numLitUnionBaseName` reads the `TyUnion` of `TyLit`s structurally; it does not parse a
+rendering. With the lowering stated once, the five comparisons no longer need the softened
+spelling to carry it for them.
+
+### The second half, and the mistake it corrects
+
+The first version of `paramScalarName` fell back to the spelling whenever the arena had no
+`TyPrim`. That passed the corpus with 0 diffs — and the inverted control showed the
+litunion rung was NOT load-bearing, which meant the conversion was doing nothing: a
+litunion's arena type is a `TyUnion`, so `nodeTyPrimName` returned `""` and the spelling
+answered exactly as before. A no-op wearing a conversion's clothes, and only the control
+caught it.
+
+The distinction it was missing is between the arena having no answer and the arena
+answering "not a prim":
+
+```vl
+if prim != "" { return prim }
+if nodeTyIxOf(tyNodeIx) >= 0 { return "" }   // recorded, and NOT a prim — that is an answer
+spelled                                       // no recorded type — the spelling is all there is
+```
+
+Rebuilt on that, the inverted control reproduces B102's failure exactly (all three pins
+reject), so the litunion rung is load-bearing and the conversion is real.
+
+### Measured
+
+| where the five rungs' answer comes from | files |
+| --- | ---: |
+| the arena, a recorded `TyPrim` | 580 |
+| the arena, recorded and not a prim | 376 |
+| **the spelling** | **0** |
+
+The fallback branch does not fire on any corpus file. It stays for annotation nodes the
+checker never records — measured at 13 of 391, 11 of them naming a type PARAMETER — and is
+documented as that remainder rather than as a second opinion.
+
+Corpus A/B: 0 of 1947 rows differ (exit code, wasm sha, diagnostics). All six gates green,
+including `rep-fuzz-check` (exact, 0 new rejects), which matters more here than usual: B111
+established that a corpus A/B is blind to this ladder by construction, and rep-fuzz is the
+one instrument that exercises the reject arm.
+
+### Still untested
+
+The reject side. No program could be constructed that reaches this ladder's reject — every
+shape tried (map-valued maps, nested arrays, sets, intersections, closure arrays, deep
+nesting) compiles, so the emitter's coverage has grown to meet the checker's. The reject
+arm is reachable only by breaking the ladder, which is how the inverted control exercised
+it. That is a real gap and not one this change closes: the ladder's safety net remains
+unwitnessed by any fixture.

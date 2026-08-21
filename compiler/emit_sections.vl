@@ -15,6 +15,9 @@ import {
   nameIsMemStoreIntrinsic,
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
+  nodeTyIxOf,
+  nodeTyPrimName,
+  numLitUnionBaseName,
 } from "./typecheck"
 import {
   REP_SCAL_F32,
@@ -596,14 +599,22 @@ function checkParams(fnIx: i32) {
             // ladder re-enumerates the supported set by spelling instead of consulting the
             // strangler seam. `annRepKindOf` already answers `VKind | null` — threading that
             // nullable answer through to here leaves the spellings nothing to decide.
-          } else if ty.tyName != "i32" {
-            if ty.tyName != "i64" {
+          } else if numLitUnionBaseName(nodeTyIxOf(p.parType)) != "" {
+            // accepted — a NUMERIC literal-union param (`1 | 2`, `type Z = 1 | 2`) is lowered
+            // as its BASE SCALAR, which is what canon's softened spelling was reporting to the
+            // scalar rungs below. Stating it from the ARENA here (`numLitUnionBaseName` reads
+            // the `TyUnion` of `TyLit`s structurally, it does not parse a rendering) is what
+            // lets those rungs stop reading `ty.tyName` — B102 measured 20 corpus rows that
+            // failed without this, every one a numeric litunion param falling through to the
+            // reject once the spelling stopped answering for it.
+          } else if paramScalarName(p.parType, ty.tyName) != "i32" {
+            if paramScalarName(p.parType, ty.tyName) != "i64" {
               // i64 rides the 0x7e valtype (Slice 1)
-              if ty.tyName != "f64" {
+              if paramScalarName(p.parType, ty.tyName) != "f64" {
                 // f64 rides the 0x7c valtype (Slice 3)
-                if ty.tyName != "f32" {
+                if paramScalarName(p.parType, ty.tyName) != "f32" {
                   // f32 rides the 0x7d valtype (Slice 5)
-                  if ty.tyName != "boolean" {
+                  if paramScalarName(p.parType, ty.tyName) != "boolean" {
                     if !isSName(ty.tyName) {
                       if !isUName(ty.tyName) {
                         if variantIndexOf(ty.tyName) < 0 {
@@ -4599,4 +4610,30 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
   }
   wSection(10, codePayload)
   0
+}
+
+// The scalar name of the param annotation at `tyNodeIx`, taken from the ARENA where the
+// checker recorded a `TyPrim` and from the spelling only where it did not.
+//
+// The arena is primary and the spelling is the documented remainder, not a second opinion:
+// `nodeTyPrimName` answers "" both for "not a prim" and for "no recorded type", and the
+// second case is real here — a param annotation inside a generic ORIGINAL has no recorded
+// arena type at all (measured: 13 of 391 annotation nodes, 11 of them naming a type
+// PARAMETER). Those nodes keep the spelling until the checker records them.
+//
+// Numeric literal unions do NOT arrive here: the rung above accepts them from the arena
+// first, which is the whole reason these five comparisons could move off `ty.tyName`.
+function paramScalarName(tyNodeIx: i32, spelled: string): string {
+  const prim = nodeTyPrimName(tyNodeIx)
+  if prim != "" { return prim }
+  // The arena HAS a type for this node and it is not a `TyPrim` — that is an ANSWER, not a
+  // gap, so the five scalar comparisons below must all miss and the param must fall through
+  // to the struct / union / variant / array / string rungs. Returning the spelling here
+  // would let a rendering decide a question the recorded type already settled.
+  if nodeTyIxOf(tyNodeIx) >= 0 { return "" }
+  // No recorded type at all. Measured: 13 of 391 param annotation nodes, 11 of them naming
+  // a type PARAMETER (`T[]`, `T[][]`, `Pair<X,string>`) — a generic ORIGINAL's annotation,
+  // which the checker never records because the original is replaced by its first instance.
+  // These keep the spelling until the checker records them.
+  spelled
 }
