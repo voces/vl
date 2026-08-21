@@ -49646,3 +49646,39 @@ count, this one's `TyFunc`). The pattern: **an arena predicate answers about the
 some sites ask about the ANNOTATION** — what the author wrote, arrows and all. Those two
 questions coincide often enough to be mistaken for each other, and the corpus tells them
 apart in a single dual-run.
+
+## B126 — the second arrow scan, and why it is not the first one
+
+`calleeCloRetName` tests `annArrowAt(pn) >= 0` — a scan of the rendered name for a DEPTH-0
+arrow. That looks like the site #1618 just converted, and it is a different question.
+
+| site | asks | structural form |
+| --- | --- | --- |
+| `paramCloSigKey` (#1618) | an arrow ANYWHERE, union arms included | `tsHasKind(root, TS_FUNC)` |
+| `calleeCloRetName` (this) | a TOP-LEVEL function type | `tsKind[root] == TS_FUNC` |
+
+Both scans live in the same module and are not interchangeable. Using the whole-tree form
+here would claim `((i32)=>i32) | boolean` as a closure-typed param, which it is not; using
+the root form at the other site drops the 14 closure-in-union files #1618 measured. The
+distinction is invisible in the rendered names, where both are "a string containing `=>`".
+
+**Measured:** 38 corpus files reach this test, **0** disagreements, both answers present
+(37 true, 1 false). Two have no spelling tree, so `annArrowAt` stays for them. The PAYLOAD
+`ft` remains the spelling — it is consumed downstream AS a function-type name, which is
+bucket 2's territory, not this conversion's.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### The rule these two sites establish
+
+A rendered type name flattens several distinct questions into one shape, and character
+scans cannot keep them apart:
+
+- "is this a function type" — the root's kind
+- "does this MENTION a function type" — any node's kind
+- "does this mention type parameter `T`" — any LEAF's text (`tsMentionsAnyName`, B120)
+- "what base scalar does this lower as" — the arena, not the tree (B113)
+
+Four different structural readings, all of which the spelling renders as facts about
+substrings. Every conversion in this family has turned on picking the right one, and three
+of the four were reached only after a first guess failed a dual-run.
