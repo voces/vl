@@ -51116,3 +51116,45 @@ Every category has now been enumerated and each has a named disposition:
 
 What is left is not a list of sites this method can grind through. It is a traversal rewrite and
 a capability decision, and both are choices about the compiler rather than repairs to it.
+
+## B156 — bucket 4's first kind, converted where it exists
+
+B155 split bucket 4 into three kinds and said the first — a caller that HOLDS a node but passes
+a name — was "largely converted". One instance was still open, and it is the site B153 and B154
+were arguing about.
+
+`fieldCodeOfSpelling(t, litNode)` has three callers that differ in exactly this way:
+
+| caller | passes |
+| --- | --- |
+| `fieldTypeCode(tyIx)` | the field's annotation node |
+| `nameFieldCode(t: string)` | `-1` — it has no node, and B154 established the -1 is honest |
+
+Splitting on `litNode >= 0` converts the node-bearing path without touching the name-only one:
+
+```vl
+if litNode >= 0 {
+  let fsTy = nodeTyIxOf(litNode)
+  if canonRewroteNode(litNode) { fsTy = canonTyIxOf(litNode) }
+  if tyScalarBaseName(fsTy) == "string" { return 3 }
+} else if nameIsString(t) { return 3 }
+```
+
+Measured on the node-bearing path: **157** corpus files, both answers present (124 false, 33
+true), **0** disagreements. Corpus A/B 0 of 1947; six gates green.
+
+This is also where B153's error came from and why it mattered: its probe measured BOTH paths
+together, read the `-1` caller's rows as "the arena has no type for field annotations", and
+concluded a checker change was needed. Splitting the paths was all that was required, and the
+split is the conversion.
+
+### What the three kinds look like now
+
+| kind | status |
+| --- | --- |
+| caller holds a node, passes a name | converted wherever found — this was the last one |
+| caller holds only a string | needs the producer rewritten (`shapeInnerFieldSplit` → `TyObj` walk) |
+| root declined on behaviour | `collectFnValUse` — a capability decision, not a destringification |
+
+Eighteen conversions now. The first kind is closed; the second and third are not this method's
+work, and B155 states why for each.
