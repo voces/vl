@@ -50551,3 +50551,47 @@ one reason worth stating plainly: **a column with one consumer looks like a spec
 rather than a source.** `canonTyIxOf` had exactly one caller for the whole programme until
 B141, so it never entered the list of things to try, and five declines were written against a
 three-source model.
+
+## B145 — bucket 1 re-tested against canon's columns, and it holds
+
+B144 closed the "softened name is RIGHT" family by finding a fourth source. The obvious next
+question is whether that source also reaches the declines this programme called blocked BY
+PRINCIPLE — B107's variant param rung, B123's ref-list slot, B109's representation split. Four
+of five declines in the adjacent family fell to `canonTyIxOf`, so assuming these are different
+would be exactly the mistake B144 just corrected.
+
+Measured at `paramVariantIndex`, reading canon's banked type where canon rewrote and the arena
+where it did not, disagreement-only (per B137):
+
+```
+ZPV2 nodeTy name=-1 arena=0 [Cat|Dog]
+ZPV2 nodeTy name=-1 arena=0 [A|B]
+```
+
+**The same two files, and both report `nodeTy`** — canon did not rewrite either node, so
+`canonTyIxOf` never applies. That is not an accident of these fixtures: canon rewrites a
+spelling when it SOFTENS a literal, folds an intersection, or strips a paren. `Cat | Dog` has
+none of those. There is nothing for canon to rewrite, so there is no banked type, so the
+fourth source is silent exactly where the collapse happens.
+
+### Why the two families differ
+
+| family | what destroyed the distinction | is it recorded anywhere? |
+| --- | --- | --- |
+| "softened name is RIGHT" (B142–B144) | canon SOFTENED the spelling | yes — `canonTyIxOf`, banked at the rewrite |
+| bucket 1 (B107/B109/B123) | the CHECKER collapsed the type, or the emitter chose a box | no |
+
+The first is a rewrite, and a rewrite has a record. The second is a resolution — the checker
+dedupes same-shape members, the newtype brand and base share one `Ty`, the emitter picks a box
+— and nothing writes those down as a type. That is the actual content of B109's
+"representation vs type" split, now stated in terms of which pass destroyed the information
+and whether that pass kept a receipt.
+
+So bucket 1 stands, and stands on a better footing than before: it has now been tested against
+all four sources rather than declined against one. The repair it needs is unchanged and is the
+one B135 named — record the emitter's boxing decision where the annotation resolves, i.e. give
+the second family the receipt the first already has.
+
+`nameIsString`'s two remaining uses in `emit_classify.vl` are both inside string-taking
+functions (`fieldCodeOfSpelling(t: string)`, `annParamKind(t: string)`) — bucket 4, no node to
+convert from, exactly as B128 predicted.
