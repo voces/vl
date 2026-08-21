@@ -49096,3 +49096,52 @@ the same two files.
 Left: `isSName` (142 — generic INSTANCES and the `#anon0` empty-placeholder, two separate
 repairs), `nameIsArray` (124 — undiagnosed, and it does double duty for array-last unions
 per B108), `variantIndexOf` (2 — declined on B107/B109).
+
+## B115 — the struct rung converts with NO remainder
+
+`isSName` (142 files) was diagnosed in B113 as two registry repairs: generic INSTANCES
+(`Box<i32>`, whose arena shape is exactly `{v:i32}`) and `#anon0` inline shapes resolving to
+an empty `{}`. Neither repair was needed. The registry was the wrong thing to match against,
+for the same reason as the union rung — the question at a param cell is "does this take a
+struct ref", which needs SHAPE and carries no identity.
+
+Asking the type directly (`TyObj`) cut the disagreements from the registry twin's 28 to
+**8**, and one peel took it to zero-dangerous:
+
+| | before peel | after |
+| --- | ---: | ---: |
+| `name=T arena=F` (would break) | 2 | **0** |
+| `name=F arena=T` (accepts earlier, same verdict) | 6 | 6 |
+
+Both dangerous rows were `AB`, an object INTERSECTION (`type AB = {a} & {b}`). The parser
+encodes every non-`{`-bodied `type N = ...` as a one-member `UnionDecl`, so a canonicalized
+intersection arrives as `TyUnion[TyObj]`. Peeling that wrapper — #1122's transparency rule,
+one construct further out — resolves both. The peel is load-bearing, not defensive: without
+it `intersection-object-merge.vl` and `inline-shape-open-span-homes.vl` are rejected.
+
+The six remaining are variant names (`Cat`, `A`, `VA` — a variant lives in its own registry,
+so `isSName` says no while the type is plainly a `TyObj`) and B107's `Cat|Dog` / `A|B`, whose
+same-shape collapse makes the arena answer "struct". All six are the harmless direction: the
+ladder accepts them one rung earlier and the verdict is identical.
+
+**Removing `isSName` outright breaks ZERO corpus files.** This is the first rung on this
+ladder to convert with no remainder — no fallback, no documented exception. The import is
+gone from `emit_sections.vl`.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### Where the ladder stands
+
+| rung | state |
+| --- | --- |
+| five scalar comparisons | arena (#1605) |
+| `nameIsString` | arena, import dropped (#1606) |
+| `isUName` | arena; name kept for 2 same-shape-union files (#1607) |
+| `isSName` | **arena, no remainder, import dropped** (#1608) |
+| `nameIsArray` | name — undiagnosed, and doing double duty (B108) |
+| `variantIndexOf` | name — declined on B107/B109, 2 files |
+
+The pattern held a fourth time, and this run adds a sharper version of it: twice now the
+registry-based twin (`isStructOfTy`, `isUnionOfTy`) was the WRONG instrument and a plain
+shape test on the recorded type beat it outright — 28 disagreements down to 8, and 15 down
+to 2. Those twins were built for identity questions. An accept/reject rung never had one.
