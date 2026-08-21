@@ -47487,3 +47487,53 @@ disagreements). The verdict has never been derivable from the shape.
   and the same twin. One breaks two files; the other moves nothing. Copying the first verdict onto
   the second would have declined a sound conversion — and copying the second onto the first would
   have shipped invalid wasm.
+
+## B87 — one build per site, and a method note of my own that was wrong
+
+A grep for the purest remaining shape — a RAW equality against a type spelling on an annotation
+node — returned four sites. One was the name bridge B85 had just added. The other three were
+screened by liveness first, and all three were live: `letIsI64` 47 rows, `letIsF64` 36,
+`emit_collect`'s uninitialized-local gate 4.
+
+**Two of the three declined.** The one that converted is the smallest.
+
+| site | disagreements | outcome |
+| --- | --- | --- |
+| `letIsI64` | 1 — an i64 literal union softened to `i64` | **decline** — substitution → check-clean invalid wasm |
+| `letIsF64` | 3 — numeric literal types softened to `f64` | **decline** — substitution → 3 files invalid |
+| uninitialized-local gate | 0 (control fires on 4 files) | **convert** |
+
+### THE METHOD NOTE FROM B78 IS WRONG, AND IT NEARLY SHIPPED A REGRESSION
+
+B78 wrote: *"Probe several candidates in one build. A disagreement probe emitting only on
+disagreement costs one build and one sweep no matter how many sites it carries."*
+
+**`emitFail` ABORTS.** A build carrying two probes reports, per file, only whichever fires FIRST —
+so a file where BOTH sites disagree is counted once, against one site, and the other site reads
+clean. That is precisely what happened: the combined probe reported `letIsI64` at **0
+disagreements**, because the single file where it diverges is also the file where the f64 probe
+fires, and the f64 probe runs first.
+
+I converted `letIsI64` on that 0, and the corpus A/B caught it — 1 row, invalid wasm. Re-probing
+the site ALONE reports the disagreement immediately.
+
+It masked once earlier in the same slice, harmlessly (a second probe read 0 because a 668-file
+probe fired ahead of it), and I re-ran that one in isolation without drawing the general
+conclusion. **The second time it was load-bearing.**
+
+The rule is: **one build per site.** The saving B78 claimed is real and the result is worthless;
+where two probes can fire on one file, the cheaper measurement is measuring something else.
+
+### AND THE ASYMMETRY I ASSERTED WAS ALSO WRONG
+
+The first draft of `letIsI64`'s conversion said: *"There is no i64 literal-union softening to catch
+this one out: the checker softens a NUMERIC literal union to `f64`, and the i64 spelling has no
+equivalent that reaches here."* `is-numeric-litunion-membership.vl` softens an i64 literal union to
+`i64` and reaches exactly there. The claim was written to explain a measurement that had not
+happened.
+
+### METHOD NOTES
+
+* **One probe per build.** An aborting instrument cannot report a second finding in the same file.
+* **A liveness screen does not license the conversion, only the attempt.** All three sites here
+  passed it; two still declined on their disagreement measurement.
