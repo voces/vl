@@ -44969,3 +44969,59 @@ named next step.
   arena" breaks the case it currently gets right.
 * **Check whether the twin is needed; do not add one reflexively.** B45's rule is that the pair
   moves together, not that every sink needs a new predicate.
+
+## B47 / D-SINK4 — the predicate that decides a rep is the predicate its consumers must ask
+
+B46 §2 declared this one blocked. Review refuted that, and the refutation is the entry.
+
+### 1. NOT A MISSING WIDEN — A WRONG QUESTION, ASKED TWICE
+
+A NARROWED literal-union parameter (`K & !"kb"`) is ALREADY declared `i32`. Three symptoms
+followed from one cause: `print(v)` emitted the raw atom id, a `: string` return lowered the id
+into a reference, and the CALLER lowered its member literal as a string into the i32 slot.
+
+`nodeTyIsLitUnionAlias` asks whether the arena type is a REGISTERED alias index. Narrowing does
+not preserve the index — `K & !"kb"` is a fresh copy — so the registry misses even though `K` is
+registered.
+
+`tyLitUnionAliasIx` asks the same question through the checker's COPY-PROVENANCE table
+(`cLitUnionCopyTyIxs`) as well, which records exactly the copies narrowing, join and subtraction
+mint. **It is the predicate `emit_rep`'s `TyUnion` arm already uses to ASSIGN this valtype** — an
+alias index reps `i32`, anything else is uncovered. So the consumers now agree with the rep by
+construction rather than by coincidence:
+
+| spelling | valtype | registry | `tyLitUnionAliasIx` |
+| --- | --- | --- | --- |
+| `v: K` | `i32` | yes | yes |
+| `v: K & !"kb"` | `i32` | **no** | yes |
+| `v: "ia" \| "ib"` | `(ref 1)` | no | no |
+
+### 2. WHY THE STRUCTURAL TEST WAS WRONG, AND WHAT THAT GENERALIZES TO
+
+B46 tried `tyIsLitUnion` and it broke the caller. That is not evidence the problem is hard; it
+is evidence the predicate was wrong. `tyIsLitUnion` is true for ALL THREE rows, including the
+string-repped one, so it swaps one miscompile for another.
+
+**The rule the table states: when a consumer must agree with a rep, ask the predicate that
+ASSIGNED the rep.** Not a structural test that looks equivalent, and not the registry test that
+happens to be nearby. Both were available and both are wrong — one too wide, one too narrow.
+
+### 3. BOTH SIDES MOVED TOGETHER, AGAIN
+
+The callee reads through `exprIsLitAtom`; the caller lowers its argument through
+`cParamLitUnion` (`wasmEmit.vl`). A callee-only build was constructed and it fails in `main` —
+the caller's string literal landing in a now-atom slot. Same twin rule as the widening sinks, a
+different pair, verified rather than assumed.
+
+Corpus: **1 of 2038 rows moves**, the xfail flipping to pass. The family that held four
+`xfail-miscompile-` members is now closed except for the shadowed-binding hole.
+
+### METHOD NOTES
+
+* **"Blocked" needs the same evidence as "safe".** I closed a class after one failed predicate
+  while the right one was load-bearing three files away, in the layer that assigns the very
+  valtype in question. A failed attempt bounds the attempt, not the problem.
+* **`tail -1` on a gate hides its exit code.** `lint-self` failed rc 123 on an unformatted file
+  and printed a success-looking last line from a DIFFERENT stage; the failure was invisible until
+  the rc was read. This is the second time in this programme that a gate's exit code was taken
+  from the wrong place. Read `$?`, not the last line.
