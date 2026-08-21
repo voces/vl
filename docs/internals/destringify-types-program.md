@@ -48399,3 +48399,39 @@ was lower than its rung count suggested.
 * **Cost the SITE, not the rung.** A ladder is spelling-free only when every rung is, and this one
   has four more name-based rungs behind the five that looked convertible. Counting the rungs
   overestimated the prize by the number of rungs left over.
+
+## B103 — the struct companion, and structs turn out NOT to need the union's split
+
+`isUnionOfTy` needed two identities because the union registry is heterogeneous — declarations are
+nominal, inline spellings are structural (B99). The struct registry looked like the same problem.
+**It is not**, and the reason is already in the codebase.
+
+`shapeElemDeclaredStructIdx` exists because *"an INLINE-SHAPE element whose shape deduped onto a
+DECLARED struct at intern time"* is a thing that happens: the intern layer already merges an inline
+shape with a declared struct of the same field set. **So for structs, two matching field sets ARE
+the same struct as far as the registry is concerned** — identity is structural throughout, and
+`isStructOfTy` needs only `tySame`, with an index rung first because it is cheap.
+
+That asymmetry is worth stating: **unions are nominal, structs are structural, in the same
+compiler.** Every failed union attempt (B96, B98) came from forcing one mechanism onto two kinds of
+row; the struct side has one kind and takes one mechanism.
+
+### AND ITS NATURAL CONSUMER TURNED OUT ALREADY CONVERTED
+
+`letIsStruct`'s `isSName(lt.tyName)` rung was the obvious first consumer. Probing `isStructOfTy`
+against it: **0 disagreements**. Then the liveness check: **forcing the `isSName` leg off moves 0
+corpus rows.**
+
+The rung directly above it is `nodeTyIsStruct(d.letType)` — already arena-first, already claiming
+every struct-typed let a corpus program declares. The name leg is a residue that never answers.
+Annotated with B75's rule (0 rows proves redundant, not dead) rather than deleted.
+
+So the struct half of B90's blocker was mostly closed before this programme reached it, and the
+measurement is what showed that rather than another conversion.
+
+### METHOD NOTE
+
+* **Check whether the site is already converted before building its twin.** The predicate here was
+  worth building — the ref-array rung still needs it — but the site chosen to validate it had been
+  arena-first for some time, with an inert name leg. Two builds said so; reading the twenty lines
+  above the call would have said so first.
