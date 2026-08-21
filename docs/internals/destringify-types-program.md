@@ -44753,3 +44753,64 @@ lines that now excuse them are load-bearing, and the header says so.
 * **This is B43's lesson at one more remove.** There the untested half was the sinks; here it is
   a direction. Both times the measurement was real, correctly executed, and answered a question
   adjacent to the one that mattered.
+
+## B45 / D-SINK1 — the first sink closes, and the twin was predicted instead of discovered
+
+B43 said the order is: fix the sinks, THEN widen the field ladder. This is the first sink.
+
+### 1. THE DEFECT WAS ONE MISSING PAIRING
+
+`emitPush` seeds its element emit from the RECEIVER's element type — `isLitArr`, `isNbArr`,
+`isNlluArr`, `isNsArr`, each asking "what does this list hold?". **Not one of them asks what the
+VALUE is.** So a `string[]` receiver took the plain emit, and a literal-union field — whose rep
+is the interned i32 atom id — went into a `(ref null $aTypeIdx)` slot raw:
+`expected (ref $type), found i32`, with `vl check --codegen` rc 0.
+
+The widening already existed and was already reachable: `emitStrValue` is exactly "emit as a
+string, widening an atom if needed", and the `==` path and the `string`-field store both use it.
+The fix is one arm pairing the receiver test with a value test.
+
+### 2. THE TWIN WAS PREDICTED THIS TIME
+
+B42 learned the twin rule by shipping half of one. B43 restated it. Here it was applied BEFORE
+building: `emitAtomToStr` stages the atom id in the string-op scratch frame, so the emit arm
+needs `emit_classify`'s reservation scan to know about the new widening site, and
+`pushWidensAtomToStr` joins `callWidensAtomToStr` / `retWidensAtomToStr` /
+`globalInitWidensAtomToStr` / `letWidensAtomToStr` / `assignWidensAtomToStr` as their sixth
+sibling.
+
+**The twin's failure is a DIFFERENT invalid wasm from the emit's, and it is nearly invisible.**
+An unreserved frame makes the widen write to a local the vector never declared — but only in a
+function whose ONLY string work is the push. Every natural test of this defect prints the pushed
+value, and `print` reserves the frame on its own, so the emit-only build passes all of them. The
+witness has to be built deliberately: `fill` pushes an atom, returns an i32 sum, and never
+prints or concatenates.
+
+### 3. AND THE FIXTURE WAS CHECKED AGAINST BOTH HALVES
+
+Per B44 §5, the fixture was built against three compilers rather than trusted:
+
+| build | result |
+| --- | --- |
+| master | fails |
+| emit arm only | fails |
+| emit arm + reservation twin | passes |
+
+That is what makes it a regression test for both halves rather than for whichever one happens to
+be missing. `tests/cases/literal-unions/litunion-field-into-string-list.vl`, promoted out of
+`xfail-miscompile-` on the trip that kind documents.
+
+Corpus: **1 of 2038 rows moves** — the xfail itself, flipping from reject to pass. Nothing else
+in the corpus reaches the arm, which is expected and is the reason the fixture carries the
+evidence.
+
+### METHOD NOTES
+
+* **A seed keyed on the container is not a seed keyed on the value.** Five sibling seeds all
+  asked the receiver's element type; the defect was that nobody asked the value's rep. When a
+  dispatch enumerates one side of a store, check whether the other side can vary independently.
+* **The twin's witness is usually NOT the defect's witness.** The natural repro of the emit gap
+  (`push` then `print`) reserves the frame incidentally and hides the twin gap entirely. Each
+  half of a twin pair needs a program built for it.
+* **Two remain in this family** — the `string | null` return and the narrowed-parameter return,
+  both still pinned under `xfail-miscompile-`. The field ladder stays blocked until they close.
