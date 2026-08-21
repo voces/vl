@@ -50223,3 +50223,41 @@ one in a minting chain.
 B136 said re-measure the rungs below a conversion. B137 adds: **re-measure with the probe
 shape that matches the question**, and do not carry a disagreement count forward from a sweep
 that was built to establish reachability.
+
+## B138 — auditing the shipped conversions against B137's probe error
+
+B137 found that a probe firing UNCONDITIONALLY on every reach reports "did the first reaching
+call disagree", not "how many disagreed". Two SHIPPED conversions were measured with that
+shape and quoted a disagreement count from it:
+
+- **#1619**, `calleeCloRetName`'s top-level arrow test (claimed 0 over 38 reaches)
+- **#1620**, `letAnnIsUninternedShape`'s inline-shape guard (claimed 0 over 146 reaches)
+
+Both re-measured with a disagreement-only probe on current master:
+
+```
+#1619  TRUE disagreement count: 0
+#1620  TRUE disagreement count: 0
+```
+
+**Both hold.** The conversions are correct; only the provenance of their numbers was weaker
+than stated.
+
+### Why they were never actually at risk
+
+The disagreement count is not the only instrument either change passed. Both also cleared a
+corpus A/B at 0 of 1947 rows and all six gates, and an A/B compares EMITTED BYTES over every
+file — it does not stop at the first call site. A conversion that disagreed anywhere
+behaviourally would have moved a row there regardless of what the probe sampled.
+
+That is the useful structural point: the probe and the A/B fail in different directions. The
+probe can under-sample; the A/B cannot, but it is blind to rungs that emit no bytes (B111).
+Neither alone is sufficient, and this log has relied on both throughout — which is why a
+real instrumentation error produced no shipped defect.
+
+### The audit rule
+
+When an instrumentation error is found, re-run the measurements it touched against what
+SHIPPED, not just against what is queued. Three instrumentation errors are now recorded
+(B119's truncation, B119's path capture, B137's probe shape); this is the first one audited
+backwards, and it should be the pattern for the next.
