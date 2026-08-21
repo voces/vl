@@ -47537,3 +47537,69 @@ happened.
 * **One probe per build.** An aborting instrument cannot report a second finding in the same file.
 * **A liveness screen does not license the conversion, only the attempt.** All three sites here
   passed it; two still declined on their disagreement measurement.
+
+## B88 — the goal's literal shape, counted
+
+B83 named the brief's exact sentence — *print a type as a string then do functional type work on
+that string* — and converted the first site that matched it. This entry finishes the count, because
+"how much is left" has been asserted from inventories all programme and never measured directly.
+
+**Every render function in the compiler, against the two shapes that consume a render:**
+
+| render | fed into a name test | direct `== "spelling"` |
+| --- | --- | --- |
+| `nodeTyName` | 0 | 0 |
+| `tyToEmitName` | 0 | 0 |
+| `tyToStr` | 0 | 0 |
+| `tyToStructStr` | 0 | 0 |
+| `nodeArrayElemName` | 1 | 0 |
+| `inferRetNameOf` | 0 | 1 |
+| `tyNameOf` | 5 | 1 |
+
+**Eight instances**, and their dispositions were already known or are settled here:
+
+| site | disposition |
+| --- | --- |
+| `wasmEmit.vl:13760` `tyNameOf(fn.fnRet) == "string"` | **converted here** |
+| `emit_classify.vl:23666` `paramString` | measured DECLINE (B79 addendum 2) |
+| `emit_classify.vl:12039` `annIsNulStrListDeep` | already arena-first; the name is the uncovered-node bridge, **0 rows** |
+| `emit_collect.vl:6747` `nameIsClosureElem(nodeArrayElemName(i))` | measured DECLINE (B38 — the arena is RIGHT, so converting is a behaviour change) |
+| `typecheck.vl:18410` `inferRetNameOf(nodeKey) == ""` | not a type question — it asks whether a ROW EXISTS |
+| three `nullablePartOf(tyNameOf(…))` sites | extract a non-null NAME for downstream name use; not a test |
+
+### THE CONVERSION
+
+`wasmEmit.vl`'s return-widen rung read the annotation spelling, and canon softens a literal union
+to `string`, so a `: K` return answered TRUE. Its own SIBLING two lines down was already arena-based
+and its comment says why — the `string | null` niche was *"asked of the ARENA rather than by growing
+the spelling test above a second case, which is what missed this in the first place."* This is that
+spelling test.
+
+Five corpus disagreements, all litunion returns; A/B **0 rows**; **six** constructed witnesses (an
+atom-literal return, an alias-param passthrough, into a `string` sink, into a concat, a
+nullable-litunion return, and a plain-`string` control) all byte-identical; forcing the rung off
+moves 5 rows.
+
+**Why the narrowing is inert:** `retLitUnion` is set two lines above by `nodeTyIsLitUnionAlias`, so a
+litunion return is already claimed and never needed `retStrWiden`. Same mechanism as `letIsString`;
+opposite of `paramString`, where nothing claims the binding first and the identical narrowing
+produces invalid wasm.
+
+### WHAT THIS DOES AND DOES NOT SAY
+
+The brief's LITERAL shape is now down to sites with a recorded verdict: one conversion here, two
+measured declines, one already-converted bridge, one non-type-question, and three name-extractions
+that feed name consumers.
+
+**It does not say the programme is done.** 354 `nameIs*` call-lines remain. The overwhelming
+majority are `emit_base`'s definitions and string-in helpers with no node in scope, and
+`typecheck`'s name→arena BRIDGE — you cannot ask the arena about a type it has not built. What
+remains beyond those is the hard case this log has been working through: *a predicate reading a
+spelling somebody else banked*, where six softening sites alone produced two conversions and four
+declines and not one verdict was derivable from the shape.
+
+### METHOD NOTE
+
+* **Count the shape you are chartered against, directly.** Two greps replaced an inventory number
+  that had been quoted from entry to entry since B60. The remaining literal-shape surface was eight
+  sites, five of which already had verdicts.
