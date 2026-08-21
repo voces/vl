@@ -47122,3 +47122,53 @@ evidence for conversion. Half of it was.
 That is now three distinct decline causes on record — uncovered node (B77), narrower-than-the-name
 (D3), and softened-name-is-correct (here) — against one softening-based conversion. The programme
 needs all four written down, because they are indistinguishable from the call site.
+
+## B80 — a minting flag that answered "" for "I have no annotation", found by screening the modules nobody had screened
+
+A second scout took the eleven modules the first one never opened. Six have nothing in scope,
+`emit_mono.vl` turns out to be almost entirely NO-NODE *name production* (it mints the pins that
+BECOME the uncovered population), and the real finds are two: the best remaining conversion family,
+and this defect.
+
+### THE DEFECT, AND HOW IT WAS PROTECTED
+
+`nliAtomOfExpr`'s Call arm finds the atom that fills a `let x = null` hole, and read
+`tyNameOf(f.fnRet)` off the callee's declaration. For an UN-ANNOTATED callee that answers `""`, the
+arm returned `""` with it, `nliInferLet` never called `registerValueUnionName`, and the `T | null`
+box was never interned:
+
+```
+emitProgram: bare null needs a struct-typed context
+```
+
+**And the linter asks you to write the failing program.** `types/infer-null-conditional-assign.vl`
+is the fixture for this idiom, and it carries
+`@hint redundant type annotation: `f` is inferred as `i32``. Delete the annotation the compiler
+tells you to delete, and the build breaks. That is the second time in this programme a "redundant"
+annotation has turned out to be load-bearing — the first was
+`xfail-miscompile-nullable-elem-list-call-init.vl`, where removing it was the *workaround* for a
+codegen bug rather than the trigger for one.
+
+The answer was one lookup away: the checker banks every inferred return in `inferRetIdx`, and
+`elaborateInferRets` fills it before the emitter runs. `if rn == "" { rn = inferRetNameOf(f.fnName) }`.
+
+### THE NAME, NOT THE ARENA, AND THAT IS THE HONEST FIX
+
+`inferRetTyIxOf` is exported beside `inferRetNameOf` and this site could read it. It should not:
+what `nliAtomOfExpr` RETURNS is a registry key, and `registerValueUnionName` is name-keyed. An atom
+NAME is the currency the consumer needs, so converting this is blocked on the union registry
+(prerequisite B-1), not on this site.
+
+**Which makes it a correctness fix in a destringify programme, and worth being clear about.** The
+site was found by asking a destringify question — *does this predicate answer FALSE for "I don't
+know"* — and the answer to that question was a bug, not a conversion. B60 step 5 names this hazard
+for minting flags; it did not say the hazard also finds bugs in code nobody proposed to convert.
+
+0 corpus rows. The new fixture is the annotation-free twin of the existing one, and the pair is the
+assertion.
+
+### METHOD NOTE
+
+* **Screen the modules that CREATE the uncovered populations, not just the ones that read types.**
+  `emit_mono.vl` had almost nothing convertible and explained three earlier declines; `emit_query.vl`
+  had two sites and one of them was broken. Neither was on any list before this pass.
