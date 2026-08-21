@@ -49490,3 +49490,59 @@ string work" are different achievements, and several of the emitter's remaining 
 only reach the first while the mv slot layer stays name-keyed.
 
 Corpus A/B 0 of 1947; six gates green.
+
+## B123 — the ref-list slot declines: a newtype's brand and base are one Ty
+
+`letRefListSlot` is `rlSlotByName(letRefListElemName(letIx, fnIx))` — render the annotation,
+cut its element name, look the name up in the ref-list slot table. `annBareRefArrSlot` is
+documented as exactly the arena reading of that composition, so it looked like the cleanest
+remaining fold in `emit_classify.vl`.
+
+The dual-run found **one** disagreement in the corpus:
+
+```
+ZRL arena=0 name=4 [QView[]]
+```
+
+from `tests/cases/memory/newtype-struct-reflist-key-population.vl`, whose header already
+explains it:
+
+> "A newtype has TWO live arena indices over ONE `Ty`: the BASE that `cUserTypes` registers,
+> and `nwBrand`'s second entry, which is what the annotation grammar resolves the name to.
+> Only the base owns an `sNames` row, so `repElemKey` keys the base NOMINALLY (`S<row>`) and
+> the brand STRUCTURALLY — which is why two same-shape newtypes (`PView` / `QView`) and a
+> bare inline shape share ONE ref-list slot while the same-shape PLAIN declared struct
+> (`Plain`) keeps its own."
+
+So this is a THIRD distinct way the arena loses a distinction the spelling keeps, after
+B107's same-shape union collapse and B109's representation-vs-type split: **a newtype's
+brand and its base are one `Ty`**, and the annotation resolves to the brand while the slot
+table keys the base nominally. `QView[]` and `PView[]` are the same arena type and different
+slots.
+
+### Why it is declined even though every measurement is clean
+
+Both readings produce the fixture's expected output (`11 22 33 44 1 2`), and an arena-first
+build is **byte-identical across all 1947 corpus files**. Nothing measurable objects.
+
+That is precisely the shape of the reasoning this branch has been burned by four times. The
+corpus cannot object here: the fuzzer's grammar emits no `new` type (the fixture's header
+says so), so this one hand-written file is the entire population, and it happens to be a
+program where the two slots hold the same element shape. The fixture exists to pin slot
+population and warns in its own words that "a slot merge that crossed them would print
+another's" values — which is the failure the arena reading would make possible off-corpus,
+silently, in a layer where `ensureRefElem` is name-keyed and slot identity IS the element's
+identity.
+
+Declining costs nothing and keeps a nominal distinction the arena has erased. The twin stays
+correct and unused at this site, with the reason recorded here rather than rediscovered.
+
+### What this closes
+
+The ref-array element family the B121 survey ranked #3–#5 — `letRefListElemName` (22158),
+`retRefArrElemName` (11825), `paramRefArrayName` (21825), `fnRetNulRefArrayNameSid` (21858),
+`refListElemNameOfExpr` (21978) — all feed the same name-keyed slot layer, and the survey
+already flagged that its mint legs (`ensureRefElem`, `rlInternName`, `fRetRArrElem`) must
+keep a name. B123 extends that to the READ side: where a newtype is in play the arena cannot
+key this layer at all, so the family is blocked as a whole until `repElemKey` keys brands
+and bases the same way.
