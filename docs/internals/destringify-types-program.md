@@ -52132,3 +52132,33 @@ consumer, which makes their agreement worth nothing. The shipped fixture was ver
 the site (its build aborts at the instrumented rung) BEFORE its agreement was believed.
 
 Render path at the site: **32 -> 3**.
+
+## B178 — the map field, and what the last two are
+
+The map-field arm was the one piece already built and unused: `mvValLowersTy` (B174/B175) answers
+the exact lowerability question the spelling ladder gates code 19 on. Gating the matcher
+identically is 0 diffs and takes the last non-generic file — **3 -> 2**.
+
+### The two that remain
+
+Both are `TyVar` — a field whose type is a bare TYPE PARAMETER:
+
+```
+generics/body-type-param-composite-locals.vl
+generics/nested-generic-call.vl
+```
+
+This is the one remainder in the whole programme that is not a gap in a reader. No coder codes a
+type parameter, and **the spelling ladder does not either** — `nameIsStructDecl("T")` is false and
+`fieldCodeOfSpelling` bottoms out at -1. Neither side has an answer; what differs is that the
+render path's `shapeFieldTypeCompat` is a COMPATIBILITY test that can accept a field nothing
+codes, while the matcher compares codes and declines (B173).
+
+So the last two files rest on the render's LENIENCY, which is the one thing this programme has
+consistently refused to reproduce — every arm that guessed produced invalid wasm or a trap
+(B170, B171). Reaching them would mean either teaching the matcher to accept an uncoded field
+(the guess the fixtures punish) or changing how a generic ORIGINAL's shape is interned, which
+#1473 deliberately made a no-op.
+
+**Render path at the site: 32 -> 2**, across nine measured arms, three of which were refuted and
+two of which were inert.
