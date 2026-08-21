@@ -51211,3 +51211,61 @@ this one is a function nobody wrote.
 One piece of missing code, one capability decision, one genuine dead end. That is a materially
 smaller and more specific statement than "~258 classifiers", and it is what the count actually
 reduces to once the chains are traced instead of counted.
+
+## B158 — correcting B157: `fieldCodeOfTy` exists, and the variant shape now uses it
+
+B157 called the arena-keyed field coder "the first thing in this log that is genuinely MISSING
+rather than merely unfound", sized it at ~170 lines, and made it the remaining work. Attempting
+to write it produced a compile error:
+
+```
+[ERROR]: redeclared fieldCodeOfTy
+```
+
+**It already exists**, with its own header recording what it is and what it measured:
+
+> "CONFIRM-ONLY, and the decline is the point: it answers only where the arena decides the code
+> EXACTLY, and returns -2 to the name ladder everywhere else … **2,669 of 4,510 corpus field
+> classifications (59.2%) covered, 0 disagreements** … with a sabotage (the f64 and i64 codes
+> swapped) reddening 805 — so the comparator is live and the agreement is not vacuous."
+
+`nameFieldCodeTy(t, ty)` — the arena-first wrapper — exists too. **Seventh time** in this log a
+"blocked" or "missing" verdict turned out to be existing state, and the first where I tried to
+write the thing rather than reason about it. Writing it was what found it.
+
+### What was actually left to do
+
+One line of plumbing. `collectShapeVariantFields` had the field texts and not the field types;
+its caller resolves the variant's arena type on the line above the call
+(`uVarTyIx.push(declTyIxOfName(atoms[vi]))`). Threading it through lets the existing arena rung
+apply:
+
+```vl
+if shp is TyObj {
+  if shp.objFieldTypes.length == ftexts.length { fldTy = shp.objFieldTypes[fi] }
+}
+let fc = nameFieldCodeTy(ftxt, fldTy)
+```
+
+The length guard is what makes the index correspondence legitimate: if the split and the
+recorded shape ever disagree about field COUNT, position `fi` is not the same field in both, and
+the arena rung must not be consulted at all.
+
+**Measured: 160 corpus files reach the site; the arena decides 125, the name the remaining 35,
+0 disagreements.** Live rather than inert, by B130's category. Corpus A/B 0 of 1947; six gates
+green.
+
+### The count, one last time
+
+Nineteen conversions. The remaining surface, after this:
+
+| item | state |
+| --- | --- |
+| `collectFnValUse`'s shape entry | declined on BEHAVIOUR — its own note explains the monotone flag |
+| the array rung (B133/B147) | no receipt in any of the five sources |
+| the rest of the `nameFieldCode` family | the same plumbing as here, wherever a caller can resolve the shape's type |
+
+That last row is now ordinary work rather than a design question, and it is ordinary because the
+classifier it needs was already written. The recurring lesson of this log applies to itself:
+**before concluding something must be built, try to build it** — the compile error is a faster
+and more reliable search than reading.
