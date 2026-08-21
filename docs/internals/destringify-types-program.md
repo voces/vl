@@ -52539,3 +52539,48 @@ an atom niche, a heap-type twin), and each is a fixture someone already paid for
 
 What is left is exactly the set whose rejections would have to be reconstructed — which is the
 honest floor for this consumer, not a gap waiting on another predicate.
+
+## B189 — where the programme actually stands
+
+Two consumers have been driven to a measured floor, and it is worth stating what "floor" means
+in each case, because they are not the same kind of stop.
+
+| consumer | render answered | now | what remains |
+| --- | ---: | ---: | --- |
+| `structIndexOfTypeName`'s caller | 32 files | **2** | the render's LENIENCY |
+| `mapNodeValKindLowerable` | 42 of 106 | **19** | branches whose REJECTIONS would need reconstructing |
+
+**Neither remainder is a missing predicate.** Both are the same thing seen twice: the render path
+is not doing something cleverer than the arena, it is permitted to be VAGUE where the arena
+reader must be exact.
+
+- At the struct site, `shapeFieldTypeCompat` accepts a field whose type nothing codes. The
+  matcher compares codes and declines. Matching that leniency is the guess four fixtures exist
+  to punish.
+- At the map gate, the surviving shapes are the two the guard REFUSES (a litunion behind an
+  arrow, a nullable with no ref inner) plus the type-parameter case. Porting a refusal means
+  reconstructing the special cases that refusal accumulated.
+
+### The rule the whole programme converged on
+
+**Port what a branch ACCEPTS. Never reproduce what it REFUSES.**
+
+Four arms that followed it shipped byte-clean (B172, B186, B187, B188). Two that did not — a
+copied fall-through, a renamed rep — produced invalid wasm (B171, B184), and a third produced a
+check-clean invalid module before it was caught (B185). The refusals are where the accumulated
+special cases live, and each one is a fixture someone already paid for.
+
+### What is left, and what kind of work it is
+
+1. **The union lowering family** (#1611's rejects, #1678's invalid module). NOT destringify work:
+   five predicates were tried and refuted, and the remaining question is why the INLINE-union arm
+   misses a path the DECLARED-union argument position already takes. Characterised on the issue
+   with a neighbour table; needs a read of the union lowering design as a whole.
+2. **The two leniency sites** — should stay unmatched unless the checker is changed so that an
+   uncoded field cannot reach the emitter at all.
+3. **Interner KEYS** (`mvSlotOfValName*`, `structIndexByName`, `variantIndexOf`). A table keyed by
+   a declaration's own name is not type work on a rendering; converting these would be churn.
+
+Thirty-one conversions across 119 PRs, six gates green on every one. Nine verdicts written as
+permanent in this log were later overturned by measurement — every one of them a claim about what
+the information could not do, and every one actually a claim about the attempt.
