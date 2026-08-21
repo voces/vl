@@ -7360,6 +7360,11 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
         // deliberate decline, which the name path keeps).
         const nsi = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
         if nsi >= 0 { return nsi }
+        // The render path below reconstructs this node's FIELD SET by spelling its type and
+        // re-parsing the spelling. Ask the arena for the field set directly first; the render
+        // stays as the fallback for a field `fieldCodeOfTy` does not code.
+        const fsi = structRowOfObjFieldSet(nodeTyIxOf(objIx))
+        if fsi >= 0 { return fsi }
         const sn = nodeTyName(objIx)
         if sn != "" {
           const tsi = structIndexOfTypeName(sn)
@@ -10823,6 +10828,63 @@ export function nameIsWholeSpanShape(name: string) {
 // The struct table index a type NAME names: a declared struct name directly, or an
 // INLINE object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the
 // interned shapes (the anonymous literals interned the same sets). -1 if neither.
+// `structIndexOfTypeName`'s ARENA twin — the struct row whose field set matches the `TyObj`
+// `ty`, or -1 (destringify D-FIELDSETOFTY).
+//
+// The name path below answers this same question by RENDERING the type (`nodeTyName` ->
+// `tyToStructStr`), re-parsing the render into field names + type TEXTS (`shapeFieldParse`),
+// and checking each text against the row's stored CODE (`shapeFieldTypeCompat`). The stored
+// column is not text — `sFieldTypes` holds the emitter's field CODE — and the arena already
+// holds both halves the render reconstructs, because `TyObj` IS `{objFieldNames,
+// objFieldTypes}`. So ask the fields directly and compare the row's code against the code the
+// field's TYPE codes to.
+//
+// Same scan order, same field-count gate, same field-name lookup, and the SAME half-built-row
+// guard as the name path: `internInlineShape` pushes a struct HEADER before populating its
+// per-field rows, and a code-5 field's element-name computation RE-ENTERS the scanner
+// mid-loop, so reading the trailing `sFieldElemName` of a half-built row is an out-of-bounds
+// COMPILER CRASH (fuzz sweep zq0NPY). A row is invisible until its rows are complete.
+//
+// `fieldCodeOfTy` answers -2 for a type it does not code, and a declining field fails the ROW
+// rather than matching loosely — an uncoded field falls through to the render path instead of
+// guessing a match. Measured: the rung answers on 8 of the 32 corpus files that reach the
+// render here, byte-identically, and the remaining 24 decline as 16 uncoded / 7 field-name
+// miss / 1 code difference.
+export function structRowOfObjFieldSet(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyObj {
+    const fnames = t.objFieldNames
+    const ftys = t.objFieldTypes
+    const lim = sScanLim()
+    let si = 0
+    while si < lim {
+      if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
+        si = si + 1
+        continue
+      }
+      if sFieldCount[si] == fnames.length {
+        let ok = true
+        let k = 0
+        while k < fnames.length {
+          const fj = sFieldIndex(si, fnames[k])
+          if fj < 0 {
+            ok = false
+          } else {
+            const want = fieldCodeOfTy(ftys[k])
+            if want < 0 { ok = false }
+            else if want != sFieldTypeAt(si, fj) { ok = false }
+          }
+          k = k + 1
+        }
+        if ok { return si }
+      }
+      si = si + 1
+    }
+  }
+  -1
+}
+
 export function structIndexOfTypeName(name: string) {
   const si = structIndexByName(name)
   if si >= 0 { return si }
@@ -14814,6 +14876,17 @@ function fieldCodeOfTy(ty: i32): i32 {
     if p == "string" { return 3 }
     return -2
   }
+  // The two arms `nameFieldCode` reads off the SPELLING, asked of the type instead. Order
+  // matters and mirrors the text ladder: a NULLABLE closure (`((i32) => i32) | null`) is the
+  // nullable fat-pointer 22 and must be tested BEFORE the bare arrow, which is the closure
+  // rep 14. The text arrow test is depth-aware for the same reason the arena test is exact —
+  // a union CARRYING a closure member is a value union (the box), not a closure field, and
+  // `TyUnion` falls through here as it should.
+  if t is TyNullable {
+    const inner = T.tys[t.nInner]
+    if inner is TyFunc { return 22 }
+  }
+  if t is TyFunc { return 14 }
   -2
 }
 
