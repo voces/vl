@@ -44547,11 +44547,21 @@ function f(v: K): i32 { … }     // builds fine with the arm deleted
 The reason is that **a litunion alias also registers as a union NAME**, so the ladder's `isUName`
 arm accepts it two rungs down. The `nodeTyIsLitUnionAlias` arm is redundant for the aliased form,
 and the INLINE form never arrives — it has already softened to `string`, which the string arm
-accepts. **The arm has no live population at all.**
+accepts. **The arm is never the deciding rung.** (This
+said "has no live population at all", which is the same error in another phrasing — a redundant arm
+can have a perfectly live population and simply never decide anything.)
 
 So converting it is a no-op in the strongest sense: not "inert on this corpus", but "the predicate
 it replaces is never the deciding rung". A measurement of 0 rows there is not evidence of a safe
-conversion — it is evidence of an unreached arm, and B23's rule applies to my own change.
+conversion — it is evidence of a REDUNDANT rung, and B23's rule applies to my own change.
+
+> **CORRECTED BY B70/B72 — the reasoning here is right and one word of the label was wrong.**
+> This section said "evidence of an UNREACHED arm". It is nothing of the kind, and this very
+> paragraph explains why: `isUName` accepts the aliased form two rungs down, so the arm is
+> REDUNDANT — a sibling answers, which is exactly why the sabotage moves 0. An unreached arm and a
+> redundant one are different situations that produce the same 0, and separating them needs the
+> constant-forcing pair of B60 step 7. The confusion propagated from here into B52/B61/B62/B63 as
+> "removes a string decision from the SOURCE, none from any RUN", and B72 re-measures those.
 
 ### 3. WHAT THIS MEANS FOR THE PLAN
 
@@ -45889,8 +45899,41 @@ Before converting site S from `nameIsX(render(n))` to `arenaY(n)`:
    for type-MINTING flags (`mI32Used`, `slUsed`, `fnValUsed`) under-answering is, and the exact
    arena twin is usually the narrower one. (B52, B55)
 6. **Run BOTH instruments.** The corpus A/B answers "did I break something" — it caught B59
-   instantly, 7 rows with 6 rc changes. The sabotage separator answers "is this reached" — without
-   it B52's 0 rows and B57's 0 rows look identical and mean opposite things.
+   instantly, 7 rows with 6 rc changes. The sabotage separator answers "is this REDUNDANT".
+
+   > **CORRECTED BY B70.** This step used to read "the sabotage separator answers *is this
+   > reached*". **It does not, and every 0 recorded under that reading is suspect.** Knocking out
+   > one leg of a site moves 0 rows whenever a SIBLING still answers the same question — which is
+   > indistinguishable, at the sweep, from an arm nothing reaches. B69 read a 0-and-0 as
+   > "corpus-unreachable" at an arm that drives 1,449 of 2,050 rows. The rule was already in this
+   > log four times before B70 (method note 90, notes 114/115, D-GLOBALNICHE, D-UNION batch 1) and
+   > was displaced by the cheaper one-leg test across the B41–B69 window.
+
+7. **Establish LIVENESS with a constant-forcing pair.** Force the whole site to `true`, then to
+   `false`, and diff those two builds against each other. Non-zero means the site is live. Do this
+   BEFORE reading any 0 as "unreached". Nothing else establishes it. (B70)
+
+8. **Then ask whether the two spellings DISAGREE, with the indicator build.** Compile the site as
+   `return oldSpelling != newSpelling` and diff against constant-`false`. Identical while
+   constant-`true` differs ⇒ the two provably agree everywhere the site runs. This is a positive
+   result about a live site, which no sabotage can produce. (B70)
+
+9. **CENSUS the population before believing the indicator's 0.** Name the shape on which the two
+   spellings would disagree, then grep the corpus for that shape. B71's defect survived a sound
+   indicator over 1,449 live rows because `tests/cases` held 128 nullable-alias declarations and
+   not one union alias with a nullable-alias member — a true answer to the wrong question. If the
+   shape has zero instances, the 0 is not evidence; **manufacture the shape as a fixture**, which
+   is cheaper than any instrument. (B71)
+
+10. **Prove your witness REACHES the site.** Invert the site and check the witness's output
+    responds. An agreement measured at a site the witness never reached is the same worthless 0.
+    (B72)
+
+11. **Ask what the accessor RETURNS before theorising about it.** One `emitFail` probe printing
+    `tyName` showed that annotation TypeRefs carry the alias-EXPANDED spelling, which retires a
+    whole family of "the name form is alias-blind" arguments that four entries had reasoned
+    around. Prefer a mechanism to a sweep: a mechanism retires a family, a sweep retires one row.
+    (B72)
 
 ### WHAT THIS SAYS ABOUT THE REMAINING SURFACE
 
@@ -46500,3 +46543,142 @@ change and not part of a destringify slice.
   producer of the thing being replaced — here `collectRetAtoms` — not just the values it produced.
 * **Manufacture the missing shape as a fixture.** The corpus is a population you can extend, and
   extending it is cheaper than any instrument.
+
+## B73 — the re-measurement queue, and a shipped conversion that was a live regression
+
+B70 found the two-leg sabotage measures redundancy rather than liveness and queued every claim
+resting on it. A survey returned **13 SUSPECT rows, 4 of them shipped** — `refactor(vl):` commits
+whose messages each assert "removes a string decision from the SOURCE, none from any RUN" — against
+~25 SOUND ones. This entry re-measures them. **One of the four is a live compile-time regression.**
+
+The survey also found the rule was already written down **four times before B70** — D-UNION batch 1,
+method note 90 (*"only a TWO-VARIABLE sabotage separates them"*), notes 114/115, and D-GLOBALNICHE
+(*"a one-variable sabotage cannot distinguish a leg that nothing reaches from a leg that something
+reaches first"*). The regression is confined to the B41–B69 window, where the cheap one-leg test
+displaced the reach/ANSWERS probes the earlier half used. B60's recipe is corrected accordingly,
+and B41's "evidence of an unreached arm" — the phrase the confusion propagated from — now reads
+REDUNDANT, which is what its own paragraph had already explained.
+
+### B52 / D-MAPKEY (#1546) — SHIPPED AND WRONG
+
+```vl
+type Box = {g: {[i32]: i32} | null} | f64
+const x: Box = 1.5
+print(1)
+```
+
+`emitProgram: i32-keyed map but its map struct was not collected`. Clean before #1546, a loud emit
+failure after it. A dead declaration with no value does it too.
+
+**The mechanism.** `parser.vl` mints a real `TypeRef` per inline-object field, then re-encodes a
+`{…} | …` RHS into a `UnionDecl` from synth text WITHOUT re-parsing — orphaning those field nodes:
+reachable in `P.nodes`, spelling intact, recorded in the arena by no pass. `collectA` walks every
+node, so an orphan arrives at the map rungs with `nodeTyIxOf(i) == -1`.
+
+`nodeTyMapKeyIsI32Span` answers FALSE two different ways — *"not an i32-keyed map"* and *"I have no
+type for this node"* — and only the first is an answer. `mI32Used` is a type-MINTING flag: it mints
+the i32 map struct, the `__map_probe_i32__` helper and a 5-slot scratch frame. **#1546's own commit
+message names under-answering as the harmful direction and then takes it.**
+
+**And its stated rationale is false.** The message says *"The name form is ALIAS-BLIND: a map reached
+through a declared alias has no `{[` in its spelling at all."* `canonEmitTypeNames` rewrites an
+alias annotation to its body before collect ever runs — verified independently here by a probe
+printing `tyName` at a different site, which returned the EXPANDED spelling for an alias-annotated
+declaration. There was no alias blindness to fix.
+
+**Why no instrument caught it.** Only the `type X = { … } | …` DECLARATION path orphans — an
+inline annotation, an `is`-pattern and a declared struct's members all record their field nodes.
+The corpus has exactly one orphan-producing union arm with a map field and its map is string-keyed;
+the only `{[i32]: V} | null` field anywhere is on a declared struct. (Under the looser reading
+"union arm with a map field" the corpus has several, including an i32-keyed one in ANNOTATION
+position — which is precisely why the distinction has to be spelled out in a census.) **The
+population could not contain the disagreement** — B71's hole, now for the third time. Forcing the
+new predicate FALSE was also structurally blind to it, since the defect IS the false answer.
+
+**The fix** guards both rungs by arena COVERAGE rather than reverting them: the arena decides
+wherever it has a type for the node, the spelling answers only where it does not. That keeps the
+destringification on every covered node — which is all of them but the orphans — and restores the
+flag on the orphans. 0 corpus rows against a clean baseline; the repro and a dead-declaration
+variant both compile and validate.
+
+**AND THE ROOT FIX IS ONE TOKEN, NEXT DOOR.** The union variant field pass had a code-19 arm
+(map field) and no code-29 one (NULLABLE map field), while its struct twin has carried both since
+its two arms were folded — so `collectA` was writing 29 rows it never read back, the exact state
+the note beside it forbids. The nullable field's flags had been arriving only by accident, from the
+orphaned annotation `TypeRef`. Adding the 29 arm fixes every repro on its own, at 0 corpus rows.
+Both land, but not for the reason a first draft gave. **The 29 arm has NO pinning witness and no
+pre-existing population**: every nullable-map field in the corpus sits in a STRUCT position, whose
+table already had its 29 arm, and the only union-variant one is the fixture added here. So its 0
+corpus rows means *unreached*, not *redundant* — and the map fixture is green on the guard alone
+AND on the 29 arm alone, pinning the pair rather than either half. That is the same situation
+`maps/i32-keyed-variant-field.vl` already documents for the code-19 pair: sabotage either alone and
+no fixture fails, because the covering row belongs to another pass and not to this table's
+invariant. The 29 arm is kept on that ground — a table must be collectable from its own column —
+and not on a claim that the tests separate the two.
+
+**FOUR MORE SHIPPED REGRESSIONS, worse, from #1551 not #1546 — and only ONE of them is an orphan.**
+`collectA`'s f64 and i64 rungs took `nodeTyArrayElemRepName(i) == "f64"` / `"i64"` in the same
+conversion family. The chain carries a silent node down into `nameIsArray(nd.tyName)` where
+`checkArrName("f64[]")` REJECTS, so the failure is a MIS-ROUTE rather than an under-mint — and
+nothing can mask it, where a module-wide minting flag can be set by any other declaration in the
+file. All four of these fail on master today:
+
+| shape | why the accessor is silent |
+| --- | --- |
+| `type B = { g: f64[] } \| f64` | orphaned field `TypeRef`, no arena type |
+| `type K = 1.5 \| 2.5` + `const xs: K[]` | **covered**; element is a `TyUnion` of numeric `TyLit`s and `tyIsLitUnion` demands `litKind == "str"` |
+| `type K = 5000000000 \| …` + `const xs: K[]` | same, i64 literals |
+| `type T = f64` + `function at<T>(xs: T[])` | **covered**; element is a `TyParam`, handled nowhere — and scope-blind `canonEmitTypeNames` rewrites `T[]` to `f64[]`, which is what lets the name answer |
+
+**So the fix here is an `||`, not the coverage guard the map rungs take, and the difference is
+load-bearing.** `nodeTyArrayElemRepName` answers only for a `TyPrim` element, so `nodeTyIxOf(i) >= 0`
+is TRUE for three of the four rows above — a coverage guard would route them straight back into the
+silent accessor and fix exactly one. The map rungs can use a guard because `mapKeyRepTy` does answer
+for the nominal keys they see. Two rungs, two accessors, two shapes.
+
+An earlier draft of this entry and of the comment at the site both called the name a "coverage
+fallback, NOT a second opinion". That is backwards, and backwards in the direction that invites the
+next reader to tighten it into the form that re-breaks three of the four. Recorded here because this
+log has now been burned three times by a claim that read well and described something else.
+
+(The f32 rung was never converted and needs nothing — #1551 deliberately left it on the name. The
+rungs below are name-only and cannot suffer arena silence.)
+
+**AND A FENCE CAME DOWN.** CONSTRUCTING the arm — `const v: Box = { g: Map() }` — now emits a
+module that does not validate, where before it failed loudly at emit. The loud error was never a
+decision about that shape: it was the same missing mint, failing early enough that lowering could
+not reach the bad instruction. Measured independent of the route — a build carrying ONLY the code-29
+arm emits the byte-identical invalid module — so the defect is in the LOWERING and predates all of
+this. Filed as `soundness/xfail-miscompile-union-arm-constructed-map-field.vl` rather than hidden.
+A fence that works by failing to allocate a type is not a fence, and this one was breaking valid
+programs to stand up.
+
+### B63 / D-KEYEDSPAN, B61 / D-BOOLRET, B62 / D-BOOLANN — SOUND
+
+Census, reach control, then witness, for each. B63's disagreement shape is an alias-annotated
+i32-keyed Set and the corpus has **zero** of them; inverting the rung changes output, so the site is
+live and its answer matters; and a build carrying the pre-conversion spelling emits byte-identical
+output because — the probe again — **the annotation TypeRef already carries the alias-EXPANDED
+spelling**. B61/B62's shape is a boolean alias, of which the corpus has 11 across 9 files, and all 9
+are byte-identical across the two builds.
+
+So three of the four are equal **by construction at annotation positions**, which is a far stronger
+result than any sweep, and the fourth is broken **at exactly the positions that are not annotations**.
+That is the same fact read from both sides.
+
+### METHOD NOTES
+
+* **A predicate that can answer FALSE for "I don't know" is not a predicate.** Split coverage from
+  content before converting a MINTING flag, and let the name answer where the arena has nothing.
+  In an `else if` CHAIN the same silence is worse than a missing mint — the node falls through to a
+  rung that rejects it, and no other declaration can mask that.
+* **A module-wide flag makes co-resident fixtures useless.** The first draft of the map fixture
+  kept a non-nullable control beside the broken case; the control set `mI32Used` and the file was
+  byte-identical on both builds, testing nothing. `emit_collect.vl` and
+  `maps/i32-keyed-variant-field.vl` both already say this, one of them ten lines from the code I was
+  changing. **A witness for a module-wide flag needs a module with nothing else in it.**
+* **Prove the witness REACHES the site.** Invert the site and check the witness responds; an
+  agreement measured at an unreached site is the same worthless 0.
+* **Name the seed explicitly.** `git stash && refresh-compiler.sh && … && git stash pop` leaves the
+  SEED PATH holding the stashed build and restores the source without the binary. Six measurements
+  here compared no-fix against no-fix and agreed perfectly, which is what that comparison does.

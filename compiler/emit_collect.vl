@@ -3860,11 +3860,23 @@ export function collectA(_stmts: i32[]) {
         // probe helper. This walk sees EVERY `TypeRef`, so every annotated i32-keyed
         // map — local, param, return, global, nested — contributes the flag here,
         // before `mAssignTypeIndices` mints the type.
-        // THE ARENA, not the spelling. `nodeTyMapKeyIsI32Span` carries the same span
-        // `mapSpellKeyName` cuts — through `[]` and `| null` alike — so the type-minting flag
-        // cannot narrow. The name form was ALIAS-BLIND: a map reached through a declared alias
-        // has no `{[` in its spelling at all.
-        if nodeTyMapKeyIsI32Span(i) { mI32Used = true }
+        // THE ARENA WHERE IT COVERS THE NODE, THE NAME WHERE IT DOES NOT — and the coverage
+        // test is the whole point, not a hedge. `nodeTyMapKeyIsI32Span` answers FALSE two
+        // different ways: "this type is not an i32-keyed map", and "I have no type for this
+        // node". The second is not an answer, and `mI32Used` is a type-MINTING flag where
+        // under-answering leaves the map struct unminted and the module invalid.
+        //
+        // THE UNCOVERED NODES ARE REAL AND THIS ARM REACHES THEM. `parser.vl` mints a
+        // `TypeRef` per inline-object field, then re-encodes a `{…} | …` RHS into a
+        // `UnionDecl` from synth text WITHOUT re-parsing — leaving those field nodes
+        // orphaned, with no pass recording a `nodeTyIx`. `collectA` walks every node in
+        // `P.nodes`, so an orphan arrives here with its spelling intact and its arena entry
+        // absent. The D-BAREMAP note twenty lines up already names this population.
+        if nodeTyIxOf(i) >= 0 {
+          if nodeTyMapKeyIsI32Span(i) { mI32Used = true }
+        } else if nameIsI32KeyedMap(nd.tyName) {
+          mI32Used = true
+        }
         // A REF value type (`{[string]: string}` / `{[i32]: {x:i32}}`) interns a
         // per-(KEY,VALUE) map slot (its own map struct over a ref vals list). All mv
         // interning happens HERE (collect scans every TypeRef), so the type-index
@@ -3885,11 +3897,23 @@ export function collectA(_stmts: i32[]) {
         mUsed = true
         lUsed = true
         aUsed = true
-        // THE ARENA, not the spelling. `nodeTyMapKeyIsI32Span` carries the same span
-        // `mapSpellKeyName` cuts — through `[]` and `| null` alike — so the type-minting flag
-        // cannot narrow. The name form was ALIAS-BLIND: a map reached through a declared alias
-        // has no `{[` in its spelling at all.
-        if nodeTyMapKeyIsI32Span(i) { mI32Used = true }
+        // THE ARENA WHERE IT COVERS THE NODE, THE NAME WHERE IT DOES NOT — and the coverage
+        // test is the whole point, not a hedge. `nodeTyMapKeyIsI32Span` answers FALSE two
+        // different ways: "this type is not an i32-keyed map", and "I have no type for this
+        // node". The second is not an answer, and `mI32Used` is a type-MINTING flag where
+        // under-answering leaves the map struct unminted and the module invalid.
+        //
+        // THE UNCOVERED NODES ARE REAL AND THIS ARM REACHES THEM. `parser.vl` mints a
+        // `TypeRef` per inline-object field, then re-encodes a `{…} | …` RHS into a
+        // `UnionDecl` from synth text WITHOUT re-parsing — leaving those field nodes
+        // orphaned, with no pass recording a `nodeTyIx`. `collectA` walks every node in
+        // `P.nodes`, so an orphan arrives here with its spelling intact and its arena entry
+        // absent. The D-BAREMAP note twenty lines up already names this population.
+        if nodeTyIxOf(i) >= 0 {
+          if nodeTyMapKeyIsI32Span(i) { mI32Used = true }
+        } else if nameIsI32KeyedMap(nd.tyName) {
+          mI32Used = true
+        }
         mvShapeOfMapName(nulMapInnerName(nd.tyName))
       } else if nameIsStringArray(nd.tyName) {
         // STAYS ON THE NAME, and the reason is the CHAIN, not the predicate.
@@ -3985,12 +4009,45 @@ export function collectA(_stmts: i32[]) {
         // onto the map-REF temporary — `type mismatch: expected (ref $type), found i32`
         // at `vl check` rc 0. Measured subsumed rather than assumed: deleting it moves no
         // cell of the 72-cell key×position×value×op grid and no corpus case.
-      } else if nodeTyArrayElemRepName(i) == "f64" {
+      } else if (
+        nodeTyArrayElemRepName(i) == "f64" ||
+        nameIsF64Array(nd.tyName)
+      ) {
         // An `f64[]` annotation forces the f64 array + wrapper pair (Slice 4) — its own
         // `(array (mut f64))` backing, independent of the i32 array/list.
+        //
+        // THE NAME IS A SECOND OPINION, AND IT HAS TO BE — an `||`, deliberately, NOT the
+        // `nodeTyIxOf(i) >= 0` coverage guard the map rungs above take. The two need different
+        // shapes because their accessors go quiet for different reasons, and taking the map
+        // form here would leave four shapes broken.
+        //
+        // `nodeTyArrayElemRepName` only answers for a `TyPrim` element. A COVERED node whose
+        // `TyArray` element is a numeric literal-union (`type K = 1.5 | 2.5` — `tyIsLitUnion`
+        // demands `litKind == "str"`, so the numeric ones match nothing) or a `TyParam` falls
+        // out of it with `""` while `nodeTyIxOf(i)` is perfectly non-negative. "The arena has
+        // no type" is NOT the only way this accessor goes silent, so a coverage test cannot
+        // reach the cases where it does.
+        //
+        // WHAT THE SILENCE COSTS HERE IS A MIS-ROUTE, not an under-mint, which is why it is
+        // worse than the map rungs: the node falls past this rung and its i64 twin into
+        // `nameIsArray(nd.tyName)` below, where `checkArrName("f64[]")` REJECTS — "only i32[]
+        // arrays and struct/union element arrays are supported". A module-wide minting flag can
+        // be set by any other declaration in the file; a chain mis-route is about the node
+        // itself and nothing can mask it.
+        //
+        // FOUR FAMILIES, all rejecting on master today: the orphaned field `TypeRef`
+        // (`type B = { g: f64[] } | f64`), a float literal-union array, an i64 literal-union
+        // array, and a type parameter SHADOWING a scalar alias (`type T = f64` +
+        // `function at<T>(xs: T[])`, where scope-blind `canonEmitTypeNames` rewrites `T[]` to
+        // `f64[]` and misleads `genTyParamArr` below). Only the FIRST is an orphan; the other
+        // three are covered nodes the accessor cannot describe.
         fa64Used = true
-      } else if nodeTyArrayElemRepName(i) == "i64" {
-        // An `i64[]` annotation forces the i64 array + wrapper pair (`ia64`/`il64`).
+      } else if (
+        nodeTyArrayElemRepName(i) == "i64" ||
+        nameIsI64Array(nd.tyName)
+      ) {
+        // An `i64[]` annotation forces the i64 array + wrapper pair (`ia64`/`il64`). Same
+        // second opinion, for the same reason, with the same mis-route without it.
         ia64Used = true
       } else if nameIsF32Array(nd.tyName) {
         // An `f32[]` annotation forces the f32 array + wrapper pair (`fa32`/`fl32`).
@@ -4240,7 +4297,15 @@ export function collectA(_stmts: i32[]) {
       // …with the row's arena type (D-REPELEMTY) — see the code-5 arm above.
       ensureRefElemTy(uFieldElemName[ufi], uFieldElemTyIxRow(ufi))
     }
-    if uFieldTypes[ufi] == 19 {
+    if uFieldTypes[ufi] == 19 || uFieldTypes[ufi] == 29 {
+      // CODE 29, THE NULLABLE MAP FIELD, BELONGS HERE TOO — the struct pass has carried both
+      // since its two arms were folded, and this table has been writing 29 rows it never read
+      // back. That is exactly the state the note below forbids: a variant row this file writes
+      // must be collectable from this file's own column. Until now the flags for a nullable map
+      // field on a union arm arrived only by accident, from the orphaned field `TypeRef`
+      // reaching the `nulMapInnerName` rung in the annotation walk — so when that rung stopped
+      // answering, nothing was left.
+      //
       // Rule (2)'s witness on this side: a `({f: {[string]: string}} | string)[]` param whose
       // caller only ever passes the string arm. Without the flags the narrowed field's map
       // ops rejected "map type not collected" even though the field names a map.
