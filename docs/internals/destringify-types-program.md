@@ -47344,3 +47344,50 @@ before this programme learned it the expensive way.
   test in one expression" has an unambiguous fix and near-zero risk. "Read a spelling somebody else
   banked" is the hard case, and it is most of the surface — five declines and two conversions so
   far, none decidable without a measurement.
+
+## B84 — the rest of `monoArgTyName`'s render-then-test rungs, and a render that stays
+
+B83 converted this function's `string` rung — the brief's literal shape, a type rendered and the
+render consumed in the same expression. Two more rungs in the same function had it:
+
+```vl
+if arrElemNameRaw(arrElemNameRaw(nodeTyName(ix))) == "boolean" { return nlt }   // nested leaf
+if nodeArrayElemName(ix) == "boolean" { return "boolean[]" }                     // element
+```
+
+The second is the cleaner kill: `nodeArrayElemName`'s `TyPrim` arm is a `tyToStructStr` call whose
+only consumer was that compare, so the render disappears with it. The first is more interesting —
+**its render STAYS**, because `nlt` is the pin returned on the next token. Only the QUESTION moves
+to the arena; the answer is still a name, because a monomorphization pin IS a name.
+
+That distinction is worth having explicitly. *Removing a render* and *removing a question asked of
+a render* are different results, and only the second is always available. This programme's brief
+asks for the second.
+
+### MEASURED, B82's LADDER
+
+| step | result |
+| --- | --- |
+| disagreement — structural vs rendered, both rungs | **0** |
+| control — the same probes INVERTED | fires on **39 files** (38 element, 1 nested) |
+| liveness — both rungs forced off | **3 rows** |
+| conversion vs master | **0 rows** |
+
+The nested rung's control fires on ONE file. That is thin, and it is stated rather than rounded up
+— the element rung carries the evidence and the nested one rides on a shared derivation plus a
+single witness.
+
+### THE NARROWNESS IS INHERITED ON PURPOSE
+
+`tyArrayElemPrimName` is `TyPrim`-only, so the structural forms answer FALSE for the other
+i32-backed spellings — a litunion `K[]`, `(boolean|null)[]`, `(K|null)[]` — exactly as the name
+forms did. The comment at the element rung has required that since D-SHAPEFIELD ("an unreached
+widening is not licenced"), and the conversion inherits it rather than quietly relaxing it. A
+structural predicate is not automatically the *wider* one; it is whatever its author made it, which
+is why `tyArrayElemPrimName`'s own header refuses to fold a caller's whitelist into the helper.
+
+### METHOD NOTE
+
+* **Count what the conversion actually removes.** Three rungs in one function, and only two lose a
+  render; the third loses a compare and keeps the render because a downstream consumer needs the
+  string. Reporting all three as "destringified" would overstate it by one.
