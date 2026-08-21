@@ -45759,3 +45759,50 @@ alone.
 * **Dead code can be load-bearing.** Before deleting or repairing an inert branch, ask what the
   narrowness is holding back. Here the inertness is the only thing keeping an unsupported shape
   out of the lowering path.
+
+## B58 / D-DEADPRED — three zero-caller predicates removed, one of them a documented landmine
+
+A liveness screen over every arena-side type predicate in the compiler (118 live, 5 dead, 12
+narrower-than-their-name) turned up three that are exported, defined, and called by nothing.
+Removed.
+
+### THE ONE THAT MATTERS
+
+`emit_rep.mvSlotOfTy(ty)` was `mvSlotOfTyK(ty, false)` — the key-BLIND form, hardwiring
+`keyI32 = false`. Its own callee's header, ten lines below, says what that costs:
+
+> A slot's identity is (key rep, value type) — the map struct's `keys` field differs between the
+> two reps — so the scan must agree on BOTH halves or a `{[i32]: S}` would resolve its
+> `{[string]: S}` twin's struct (a string-ref keys list read as an i32 list: **invalid wasm that
+> `vl check` cannot see**).
+
+And `tyMapKeyIsI32`'s header asserts *"There is **no** key-blind sibling … a default of
+'string-keyed' is exactly the silent wrong answer the key column exists to prevent."* There was
+one. It was this function. It was safe only because nothing called it, and the first caller
+would have got the miscompile the neighbouring comment describes.
+
+`tyIxIsStructDecl` and `tyIxIsUnionAliasDecl` go with it — the latter also carries comments
+telling readers not to use it (*"the rep layers read this instead of the copy-blind
+`tyIxIsUnionAliasDecl`"*). Those references are rewritten to describe the concept rather than
+name a function that no longer exists.
+
+### WHY THIS DELETION IS EVIDENCED AND THE OTHER ONE WAS NOT
+
+B56 declined to delete a rung that measured 0 corpus rows, because **0 rows proves
+corpus-unreachable, not dead**. This deletion is a different kind of claim: `grep` over
+`compiler/`, `tests/` and `scripts/` finds zero call sites and zero import mentions, and the
+build confirms it. Absence of callers is a property of the source, checkable exhaustively;
+absence of corpus movement is a property of one test set.
+
+`nodeTyPrimName` was on the screen's dead-by-disuse list too, and is NOT deleted — this
+programme gave it a caller two slices ago.
+
+### METHOD NOTES
+
+* **"Dead by disuse" and "dead by construction" need different evidence and have different
+  fixes.** Disuse is a grep and the fix is deletion. Construction (`tyIsF32Array`) is a return-set
+  proof and the fix may be a repair — or, as B57 found, may be neither, because the inertness is
+  holding something back.
+* **A predicate whose neighbours warn against its shape is a landmine, not dead code.** The
+  danger is not that it runs; it is that the name looks like the default and the next caller
+  reaches for it.
