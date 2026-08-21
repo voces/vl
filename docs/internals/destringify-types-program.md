@@ -50406,3 +50406,53 @@ A site reading a name is only a defect if one of the first three answers its act
 entry, two after — and it is the only one that survives canon, which is where the interesting
 annotations end up. That makes it the most promising unexplored source left, and unlike the
 interface sweep it needs no design decision: the column already exists and is already banked.
+
+## B142 — canon's banked TYPE is canon's answer without canon's string
+
+Four rungs reached the same verdict independently — B102's five scalar comparisons,
+`paramString`, `letIsF64`, and B129's local-i32 rung — and B129 wrote it up as a rule:
+
+> "the softening states the LOWERING, and a rung choosing a slot is asking about the
+> lowering, not about the type"
+
+True, and the conclusion drawn from it was wrong. The rungs want canon's ANSWER. They do not
+want canon's STRING, and those are separable, because canon banks both.
+
+`canonTyIxOf(ix)` is the arena type OF THE SOFTENED SPELLING, recorded at the rewrite. Reading
+it where `canonRewroteNode(ix)` and `nodeTyIxOf` where it did not, at B129's rung:
+
+| source | disagreements |
+| --- | ---: |
+| `nodeTyPrimName` | 5 |
+| `nodeScalarBaseName` (B113) | 1 |
+| **canon's banked type** | **0** |
+
+The surviving row was `const kMix: K | i32` — a litunion alias mixed with its own base, whose
+`TyUnion` members are not all `TyLit` so the structural reading declines, while canon softens
+the spelling to `i32`. Under `canonTyIxOf` that node's banked type IS the softened one, and the
+disagreement disappears.
+
+Measured: 13 corpus files reach the rung, both sources exercised (7 `nodeTy`, 6 `canonTy`), 0
+disagreements. Only the TRUE direction is represented — the false branch is a reject and no
+corpus program is rejected here — so this rests on agreement where asked rather than on both
+answers being observed, and the comment says so.
+
+Corpus A/B 0 of 1947; six gates green.
+
+### What this reopens
+
+B129's four-question rule said questions three and four are name-shaped *because the answer is
+a name*. That is right for question four — an interning key IS its name. It is **wrong for
+question three**: a lowering decision is a TYPE, canon computes it, and canon writes it down.
+The name was never the only carrier; it was just the carrier everyone read.
+
+So the "wants canon's softened answer" declines are not a closed category. Three more sit in
+the same family and have not been re-tested against this source:
+
+- B102's five scalar rungs in the param ladder (20 corpus rows when converted naively)
+- `paramString` (2 files → invalid wasm when converted naively)
+- `letIsF64` (3 files)
+
+Each was measured against `nodeTyIxOf` and declined. None was measured against `canonTyIxOf`,
+because until B140 named it the column had one consumer and was not on the list of sources.
+That is the next work, and it is decision-free.
