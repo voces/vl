@@ -47070,3 +47070,23 @@ that lands, the file becomes an `@run` asserting `a`.
   for the second is an upgrade even though it makes a program stop building.
 * **A zero census is a reason to BUILD the shape, not to skip the site.** Both times this
   programme has done that, the constructed shape was already broken.
+
+### B79 addendum — D3 measured, and it is a decline for a third reason
+
+The scout's danger row D3 (`tyAnnRefListKind`'s `nameIsStringArray` rung) came with instructions:
+convert only as an `||` second opinion, never a swap, never behind a coverage guard — because the
+twin is silent on a `TyParam` element, where `nodeTyIxOf` IS non-negative so a coverage guard
+cannot reach it. All of that is correct.
+
+Measured anyway, because "convert it this specific way" is still a claim: **1,484 reaches over the
+corpus, 0 disagreements**, and the arena never answers `string` where the name declines — it
+answers `i32` for `i32[]` (58 reaches) and `""` for every non-array.
+
+So the `||` form buys nothing. It would keep the name, add a call, and move no population. **That
+is a third kind of decline**, distinct from B77's (the checker never typed the node) and B79's (the
+name records a softening the type does not carry): here the arena is simply narrower than the name
+on every shape that arrives, so there is nothing to take over.
+
+Worth separating, because only the first two are boundaries of the programme. This one is just a
+site where the conversion has no content — and the honest record is a measurement, not an
+argument.
