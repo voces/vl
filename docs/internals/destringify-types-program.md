@@ -57076,3 +57076,48 @@ have different answers and only one of them needed the graph rearranged.
 **And measure reach before unblocking.** Half of the queued item — `unionTakesAtomAsStr`, 9 callers
 — turned out to fire zero times. Nine call sites is a static number; it says nothing about whether
 converting them removes any work.
+
+## B274 — a reach census picked the target, and it was not the one with the most callers
+
+Rather than pick the next site by reading, the whole `splitUnionAtoms` surface was measured. A
+counter inside the splitter gives the total; per-function counters in ONE build (the accumulating
+report answers N questions per compile) give the distribution:
+
+| function | splits per corpus pass |
+| --- | --- |
+| **`nulLitUnionInnerName`** | **29,010** |
+| `isValueUnionName` | 24,294 |
+| `nameIsLitUnionArmValueUnion` | 9,092 |
+| `registerInlineUnion` | 8,696 |
+| `nulElemListAtomKind` | 2,099 |
+| `recordUnMemTys` | 1,371 |
+| … 10 more | < 1,400 each |
+
+Total across all 51 sites: **115,348 calls, 180,866 atom strings allocated.**
+
+The top consumer has **3 callers**. `isValueUnionName`, the function this programme has spent four
+entries on, has 43 — and is second. **Static call-site counts had been ranking this work backwards.**
+
+`nulLitUnionInnerName` returns the non-null part of a nullable litunion. One of its three callers is
+`nameIsNulLitUnion`, which compares the result to `""` — and getting that result costs a
+`splitUnionAtoms` (one allocated string per member) plus a `" | "` re-JOIN of the members it keeps,
+every one of which is then discarded.
+
+The predicate now scans in place: same scanner, same bounds, same top-level `=>` stop, the three
+per-member tests in span form. `nameIsQuotedLeaf` is `name[0] == '"'`, so it is one character read
+at the span's start. Zero allocations.
+
+Measured against `nulLitUnionInnerName(name) != ""` before the swap: **34,052 reaches, 0
+disagreements.** `nulLitUnionInnerName` itself is untouched — the two callers that want the NAME
+still get it.
+
+**Total splits 115,348 → 86,350: 28,998 removed, 25.1%, from one predicate.** (Essentially all
+29,010 of that function's splits came in through the predicate; ~12 remain for the name callers.)
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The method, which is the reusable part.** Put a counter in the shared primitive for the total, one
+per suspect in a single build for the distribution, then work down the list. It cost two builds and
+two sweeps and it re-ranked the entire remaining programme — the site worth converting had one
+fourteenth the call sites of the one that looked biggest.
