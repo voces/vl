@@ -56278,3 +56278,54 @@ clean.
 `unionArmSigKey` (1,481) takes a union ARM spelling produced by `splitUnionAtoms` — a substring of a
 rendered union, with no node behind it. That is a name-in producer by construction, and the last
 two sites are under 100 calls between them.
+
+## B257 — an ARENA WALK that parsed its own render
+
+`collectTyReachCloSigs` walks the arena. At its `TyFunc` arm it has the functype in hand — `tyIx`,
+and `t is TyFunc` already matched — and it did this:
+
+```vl
+const nm = arenaEmitName(tyIx)          // RENDER the type
+if nm != "" { internCloSigOfAtom(nm) }  // hand the render to a producer that PARSES a functype
+```
+
+`internCloSigOfAtom` opens with `unionArmSigKey(atom)`, which normalises the spelling and runs
+`annSigKey` over it — splitting the rendered params, finding the arrow, classifying each piece.
+**A walk over the type arena, rendering a type so that a string parser can recover the type it
+already had.** That is the goal's sentence almost verbatim, reached only by following the census
+down four levels: `annSigKey` → `unionArmSigKey` → `internCloSigOfAtom` → here.
+
+`sigKeyOfTy(tyIx)` is `annSigKey`'s documented dual. Measured: **1,102 of 1,133 keys identical, 0
+disagreements**, arena silent on 31.
+
+## The guard stays in the path
+
+`internCloSigOfAtom`'s second line is `nulCloMixedUnionUnregistered(atom)` — a deliberate REJECT
+(a mixed-union unregistered result is skipped so the call fails loudly). So the conversion passes
+the KEY and leaves the guard reading the name:
+
+```vl
+function internCloSigOfAtomTy(atom: string, kIn: string) {
+  let k = kIn
+  if k == "" { k = unionArmSigKey(atom) }   // unhinted callers unchanged
+  if k == "" { return 0 }
+  if nulCloMixedUnionUnregistered(atom) { return 0 }   // still runs, always
+  internCloSigKey(k, -1)
+}
+```
+
+B255 reverted a conversion that answered AROUND a guard of exactly this kind. This one answers only
+the key. The render survives because the GUARD needs it — and saying so is more useful than
+claiming the site is fully destringified.
+
+## Where `annSigKey` stands
+
+| site | calls | status |
+| --- | ---: | --- |
+| `cloNameSigKey`'s arrow path | 1898 → reduced by B256 | ident path now arena-routed |
+| `unionArmSigKey` ← `internCloSigOfAtom` | 2378 | **1,102 keys now from the arena** |
+| `unionArmSigKey` ← the result spine | 61 | the annotation entry, name-in |
+| `:6705` | **0** | dead |
+
+Gated with the test suites FIRST (B255's discipline): 2225 + 2242 pass, A/B 0 diffs, fixpoint
+holds, rep-fuzz exact, grid clean.
