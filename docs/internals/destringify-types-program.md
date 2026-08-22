@@ -55515,3 +55515,62 @@ Corpus A/B 0 diffs; all six gates clean.
 | now | **~11,315** |
 
 **~39% removed across thirteen conversions**, every one byte-identical on the corpus.
+
+## B241 — the surface after thirteen conversions, measured end to end
+
+Re-measured on master, corpus-wide over 2075 files:
+
+| metric | session start (`f035b4bc`) | now | change |
+| --- | ---: | ---: | ---: |
+| `resolveAnnot` calls | 18,532 | **11,376** | **-38.6%** |
+| `nameToTy` parses | 11,000 | 10,331 | -6.1% |
+| `rlInternNameTy` calls carrying a ROW | 765 / 9,095 (**8.4%**) | 5,706 / 9,095 (**62.7%**) | **+54 pts** |
+
+The third row is the one that matters for what comes next: the interner that keys every ref-list
+slot now receives the checker's row on nearly two thirds of its calls, where at the start it
+received one on one call in twelve. The `nameToTy` column moves least because the name-keyed memo
+absorbs most resolutions before they reach a parse (B223: 88%) — which is why `resolveAnnot` is the
+honest metric for this goal and `nameToTy` is not.
+
+## Where the remaining 11,376 are
+
+| block | calls | status |
+| --- | ---: | --- |
+| `declTyIxOfName` | 7,972 | see below |
+| `repElemIdOfNameTy` unhinted | 3,395 | was 8,336 (**-59%**) |
+| two inline-shape fallbacks | 9 | one of them still 0-reached |
+
+And inside `declTyIxOfName`, the four sub-blocks are now each accounted for:
+
+| sub-block | calls | status |
+| --- | ---: | --- |
+| the `mvShape*` path | ~5,271 | **REFUSED** — D-MAPNODETY, invalid-wasm witness, mint-order |
+| `registerValueUnionName` | ~2,520 | **LEGITIMATE** — resolves ONCE at the mint boundary, by design |
+| the five `emit_collect` mint sites | ~1,875 | **LEGITIMATE** — same pattern ("resolve ONCE at mint") |
+| `repRowOfName(renderFaithful(nm))` | ~1,741 | characterized (B226/D-PARENCLASSIFY) |
+
+**Two of the four are not defects.** `registerValueUnionName`'s header states the rule this
+programme should have written itself:
+
+> Resolving at the BOUNDARY rather than at each caller is the difference between a one-line change
+> and twelve measured slices … the string work happens ONCE at mint, not at every query.
+
+A name resolved once, at a mint, to fill a type column is the SHAPE THIS PROGRAMME HAS BEEN
+BUILDING TOWARD — it is what makes every hint downstream possible. Counting it as remaining work
+would be counting the solution as the problem.
+
+## What that means for "complete"
+
+The goal is that the type system does no functional work with string representations. Measured as
+`resolveAnnot`, 38.6% of that work is gone this session and what remains divides into:
+
+* **refused with a measured mechanism and a witness** — the mv/map block, the canon column (B229),
+  `recordClonedNodeTy`'s precedence, the nominal classes at every converted site;
+* **legitimate boundary resolution** — resolve once at a mint to fill a column, which is the
+  mechanism the conversions consume;
+* **characterized but unbuilt** — `repRowOfName`, whose own header asks for its reach census to be
+  re-run before anyone builds on it.
+
+There is no block left that is simply unexamined. The next real reduction is not another hint: it
+is either re-running D-PARENCLASSIFY's census as its header requests, or the language-level change
+B229 named — making the emitter's vocabulary row-valued rather than name-valued.
