@@ -54306,3 +54306,63 @@ line that means both halves passed, and `tail -1` does not reliably land on it b
 check is backgrounded across the fmt sweep and the two interleave. **Read the summary line or the
 exit code, never the last line.** (`vl fmt` also prints to stdout by default; `-w` writes.)
 Reformatting left the built compiler byte-identical, so the gates already run stayed valid.
+
+## B222 — the callback element row, and the family closes
+
+The last site in the `synthTypeRef(name, -1)` family that names a real type.
+`monoCloneLambdaPinned` mints a `.map`/`.filter` callback's pinned parameter annotation from
+`elemType`, an element NAME cut out of the receiver pin's spelling by `listElemNameOf`. The row for
+it is `T.tys[pinTys[pe]].aElem`, and it was never carried.
+
+An element ROW column (`pElemTys`) is now built beside `pElemTypes` from the same pin, threaded
+through `monoPinMapLambdas`' eleven recursive call sites, handed out of `monoRecvParamElem` beside
+the name it already returns, and used at the mint.
+
+Lockstepped rendered-against-rendered before switching: **3 of 3 agree** (`name=f64`, `col=f64`,
+`re=f64`).
+
+## The rule predicted the numbers a third time
+
+| file | firings | `nameToTy` | arena rows |
+| --- | --- | ---: | ---: |
+| `arrays/unannotated-param-f64-map.vl` | 2 | 8 → 6 (**-2**) | 83 → 83 (**0**) |
+| `functions/fn-value-monomorphic.vl` | 1 | 5 → 4 (**-1**) | 68 → 68 (**0**) |
+
+Every element here is the primitive `f64`, so B219's rule says one call removed per firing and NO
+row removed — and that is exactly what both instruments report. Corpus A/B: 0 diffs.
+
+Three entries in a row have now had their row delta predicted before measurement from nothing but
+the spelling's shape. That is the difference between a rule this programme observed and a rule it
+can rely on.
+
+## The family, closed
+
+| site | what it names | files / occ | outcome |
+| --- | --- | --- | --- |
+| `:859` | `outType` | 3 / 12 | converted (B220) |
+| `:2294` | `scTy` | 4 / 10 | converted (B218) |
+| `:2146` | `retName` | 2 / 8 | converted (B221) |
+| `:2279` | `listTy` | 2 / 6 | converted (B219) |
+| `:1894` | `pinned[hp]` | 2 / 5 | deliberate no-op, reason measured (B217) |
+| `:1014` | `elemType` | 2 / 3 | converted (here) |
+| `:2180` `:2182` | `srcElem + "[]"` | 3 / 3 | converted (B221) |
+| `:2235` | `pinned[pli]` | 1 / 1 | converted (B217) |
+| `:2124` `:2212` | `"f64"` | 4 / 4 | NOT a printed type — a source constant |
+
+**Eight of ten converted, one deliberate no-op with a measured cause, and one non-case.** The two
+`"f64"` sites pass a literal the compiler's own source spells; there is no type being printed and
+no round trip to remove, and converting them would trade a constant for a lookup. They are recorded
+as out of scope rather than as remaining work.
+
+## Cumulative
+
+Across B217–B222, on the files that reach these sites:
+
+| file | `nameToTy` before | after |
+| --- | ---: | ---: |
+| `generics/sigkey-pin-infers-callback-result-list.vl` | 15 | 3 |
+| `inference/unannotated-reverse.vl` | 25 | 13 |
+| `closures/hof-inferred-return-through-callback.vl` | 49 | 35 |
+| `arrays/unannotated-param-f64-map.vl` | 12 | 6 |
+
+Every one of those PRs was byte-identical on the corpus.
