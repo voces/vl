@@ -56016,3 +56016,38 @@ record refusals at the granularity you measured them at**, not at the granularit
 were looking at.
 
 Measured: corpus A/B 0 diffs, all six gates clean.
+
+## B251 — the return leg too, and what the `$fnsig` refusal has actually shrunk to
+
+B250 did `sigKeyOfTy`'s PARAM loop. The RETURN leg has the same shape and gets the same twin.
+
+`retTokOfTy` covers the scalar primitives and the scalar lists; dual-written inside `sigKeyOfTy`:
+**95 agree, 0 disagree, 199 decline.** With the arena tried first, a scalar or scalar-list RESULT is
+never rendered.
+
+The return leg carries one decline the param leg does not: **the litunion arms**. `annRetKind` keys
+`>i` for a litunion ALIAS name, while the caller's render softens an INLINE litunion to `string`
+(`>S`) — and that split lives in which NAME `sigKeyOfTy` chose (`litUnionAliasNameOfTy` against
+`tyToEmitName`), not in the type. The name arm stays authoritative there, and that is a precise
+statement of what is left rather than a hand-wave.
+
+## The `$fnsig` refusal, in its final shape
+
+B246 refused 26,065 calls with "the spelling IS the identity". Four entries of measurement later:
+
+| claim | status |
+| --- | --- |
+| the KEY cannot be built from the arena | **false** — 7,108 of 7,109 identical (B249) |
+| the LEAF tokens are name-defined | **false for 5 of 9 arms** — 152/152 params, 95/95 returns |
+| the UNION arm is a name-registry question (`isUName`) | **stands** |
+| the OBJECT arm needs a reverse index `sTyRow` does not have | **stands** (B248) |
+| the LITUNION alias/inline split lives in the chosen NAME | **stands** |
+
+Three named obstacles, each with a measurement behind it, in place of one sentence about identity.
+**That is the difference between a refusal and a description of a refusal.**
+
+Two of the three are not language decisions at all — they are missing INDEX coverage (`sTyRow`) and
+a registry question that could be asked of a type if the union registry carried arena indices. Only
+the litunion alias/inline split is genuinely about which spelling arrived.
+
+Measured: corpus A/B 0 diffs, all six gates clean.
