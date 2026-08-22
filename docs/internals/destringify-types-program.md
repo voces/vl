@@ -53163,3 +53163,53 @@ rediscovered as new surface.
 A render whose result is threaded through a RETURN into another function's decision would not
 match — the pattern is local by construction. That is the honest bound on this number, and it is
 the shape `monoArgTyName` has (B201), so at least one such thread is known to exist.
+
+## B204 — the richest site went to zero, and the `?` retry retired itself
+
+B203 gave the three numbers a decline path has to produce before its render can go, and queued the
+other two sites for them. `structIndexOfExpr`'s object-literal rung is the first, and it was the
+richest entry in B202's census: ONE render feeding THREE string decisions
+(`structIndexOfTypeName`, `strContains(sn, "?")`, and a second `structIndexOfTypeName` through
+`nodeTyCanonObjName`).
+
+| number | result |
+| --- | ---: |
+| first render ANSWERS | **0** |
+| `?`-canon retry ANSWERS | **0** |
+| gate `sn != ""` vs `anonTySpellable` — disagreements | **0** |
+
+And the number that decided the SHAPE of the fix: **neither block returned unconditionally**. Both
+returns sat behind `>= 0`. So unlike the closure-result rung in B203 — where a `-1` return was
+load-bearing on 5 files and had to stay — here there was no control flow to preserve. Answering
+nothing and blocking nothing, the entire tail came out.
+
+### The `?` retry is the clearest case in the programme of a render creating its own problem
+
+Its header says exactly why it existed: *"The SPACED render can spell a nullable field `i64?` — a
+spelling the canon-key resolver reads as a proven mismatch against the `i64|null`-keyed row,
+rejecting EVERY candidate."* So a rung was added to retry with a different render.
+
+That is not a fact about types. It is a fact about SPELLINGS — two renderers disagreeing about how
+to write one type, and a repair rung to reconcile them. **Remove the render and the spelling it
+compensated for never exists.** #979 had to scope that consult to stop an unbounded recursion
+through the resolver cascade; nothing at this site can reach that cascade any more.
+
+Worth generalising: a fallback whose stated justification is a property of the RENDER — a
+softening, a spacing, a cycle collapsing to "" — is not a fallback the arena needs. It is
+scaffolding around the render, and it leaves with it.
+
+### The census, updated
+
+B202 counted five render-then-decide sites. B203 removed one, this removes another:
+
+| site | state |
+| --- | --- |
+| `emit_classify.vl:19902` | **gone** (B203) |
+| `emit_classify.vl:7525` | **gone** (here) |
+| `emit_mono.vl:226` | converted to a gate; the render remains as the ARTEFACT `nominalizeFnType` needs |
+| `emit_rewrite.vl:985` | decline path — queued for the three numbers |
+| `typecheck.vl:20299` | **unreached**: 0 corpus files hit either branch, and two hand-built witnesses miss it too. Not "architectural" — UNVERIFIABLE. No conversion there can be validated by any probe, so none is being made |
+
+The last row is a category this programme did not previously have a name for, and it is worth
+keeping separate from a decline. A decline is measured and refused. This is unmeasurable, and
+shipping a change to it would be shipping an unreachable arm — the thing B173 discarded two of.
