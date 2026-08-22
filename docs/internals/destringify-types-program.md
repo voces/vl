@@ -55185,3 +55185,62 @@ Corpus-wide `resolveAnnot` over 2075 files:
 **~26% of all name-keyed type resolution in the compiler is gone**, across ten conversions, every
 one byte-identical on the corpus and each proven live by the rung of the instrument ladder that
 could see it.
+
+## B236 — the surface after ten conversions, and where the next one is
+
+Re-censusing `emit_rep`'s four `resolveAnnot` callers on current master, against B223's reading:
+
+| site | B223 | now | change |
+| --- | ---: | ---: | --- |
+| `declTyIxOfName`'s bottom rung | 10,187 | **10,187** | untouched |
+| `repElemIdOfNameTy`'s unhinted path | 8,336 | **3,571** | **-57%** |
+| the inline-shape fallback `:1995` | 9 | 9 | — |
+| the inline-shape fallback `:2661` | 0 | 0 | still unreached |
+
+B230–B235 took more than half of the `repElemIdOfNameTy` block. `declTyIxOfName` is now the
+dominant remainder at **74%** of the surface, and it has never been analysed.
+
+## Its callers, censused
+
+18,912 calls (most answered by the `cUserTypes` or primitive rungs before reaching the parse):
+
+| site | calls | files | share |
+| --- | ---: | ---: | ---: |
+| `emit_rep:2044` — `fieldElemTyIxOfName` | **9803** | 667 | **51.8%** |
+| `emit_rep:2161` | 2963 | 676 | 15.7% |
+| `emit_classify:17804` — `registerValueUnionNameTy` | 2520 | 327 | 13.3% |
+| `emit_rep:3051` — `repRowOfName(renderFaithful(nm))` | 1741 | 158 | 9.2% |
+| the five `emit_collect` mint sites | 1875 | — | 9.9% |
+| `emit_rep:2707` | 10 | 2 | 0.1% |
+
+## The dominant caller is a SIDECAR PRODUCER, which changes the shape of the work
+
+`fieldElemTyIxOfName(nm)` is what fills `sFieldElemTyIx` / `uFieldElemTyIx` / `rlElemTyIx` — the
+very columns whose HINTS B230–B235 have been consuming. So the largest remaining block is the
+compiler resolving names in order to build the type columns that let it stop resolving names.
+
+Its recorders take only a spelling:
+
+```vl
+export function recordSFieldElemRow(nm: string, keyI32: boolean) {
+  ...
+  sFieldElemTyIx.push(fieldElemTyIxOfName(nm))   // ← resolve the name to fill the type column
+```
+
+Converting it means threading the field's ROW to the ~7 `sFieldElemName.push` sites that call the
+recorder — the same shape as B220's `monoCloneBody` threading, and the recorder's own header
+already argues for one recorder precisely so a push site cannot forget a column.
+
+**That is the next slice**, and unlike the canon column it is plumbing rather than a semantic
+obstacle: the field's type is what the collect walk is holding when it pushes the name.
+
+## Session totals
+
+| | corpus-wide `resolveAnnot` |
+| --- | ---: |
+| session start (`f035b4bc`) | 18,532 |
+| now | **~13,600** |
+
+**~27% removed across ten conversions**, every one byte-identical on the corpus, each proven live by
+whichever rung of the three-rung ladder could see it — and three of them reopening a refusal this
+programme had already recorded.
