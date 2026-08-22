@@ -17,6 +17,7 @@ import {
 } from "./tyname"
 import {
   T,
+  TyArray,
   TyFunc,
   bindGenWalk,
   flatConstOfNameProp,
@@ -1009,12 +1010,24 @@ function monoLambdaPreservesElem(argIx: i32) {
 // The element type of `recvIx` when it is (a paren around) a PARAMETER reference whose pinned
 // type is an array — looked up in the instance's (pNames → pElems) map. "" otherwise. Used to
 // pin a `.map`/`.filter` callback's element from the concrete receiver of THIS instance.
-function monoRecvParamElem(recvIx: i32, pNames: string[], pElems: string[]) {
+function monoRecvParamElem(
+  recvIx: i32,
+  pNames: string[],
+  pElems: string[],
+  pElemTys: i32[],
+  outTy: i32[],
+) {
   const r = P.nodes[unwrapParen(recvIx)]
   if r is Ident {
     let i = 0
     while i < pNames.length {
-      if pNames[i] == r.identName { return pElems[i] }
+      if pNames[i] == r.identName {
+        // The ELEMENT ROW rides out beside the element name, from the column built
+        // parallel to `pElems`. One lookup answers both, so the caller never has to
+        // recover the row by re-parsing the name this returns.
+        if i < pElemTys.length { outTy.push(pElemTys[i]) }
+        return pElems[i]
+      }
       i = i + 1
     }
   }
@@ -1027,7 +1040,7 @@ function monoRecvParamElem(recvIx: i32, pNames: string[], pElems: string[]) {
 // already-annotated param, or a different arity all ride their existing paths). The body is
 // SHARED with the original: the emitter re-derives every operand type from the (now concrete)
 // parameter per function, so one body lowers correctly under each pinned param.
-function monoCloneLambdaPinned(argIx: i32, elemType: string) {
+function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
   const a = P.nodes[unwrapParen(argIx)]
   if a is FuncDecl {
     if a.fnParams.length == 1 {
@@ -1036,11 +1049,16 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string) {
         if p0.parType < 0 {
           const np = mkParam(
             p0.parName,
-            synthTypeRef(elemType, -1),
+            synthTypeRefTy(elemType, -1, elemTyIx),
             p0.parDefault,
             p0.parOpt,
             p0.pos,
           )
+          // The pinned ELEMENT row is handed over rather than re-parsed out of the
+          // element name. `pElemTys` is built beside `pElems` from the same pin
+          // (`T.tys[pinTys[pe]].aElem`), so the row reaches this mint without the
+          // name ever being turned back into a type.
+
           const nm = "__lambda_" + i32ToStr(lambdaCtr)
           lambdaCtr = lambdaCtr + 1
           const noTP: string[] = []
@@ -1065,7 +1083,12 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string) {
 // callback with its param pinned to the element type (`monoCloneLambdaPinned`) and rebuild the
 // call to reference the clone, cloning the enclosing spine so sibling instances are untouched.
 // The i32 shape (element "i32") is left as-is, so the golden i32 path stays byte-identical.
-function monoPinMapLambdas(ix: i32, pNames: string[], pElems: string[]) {
+function monoPinMapLambdas(
+  ix: i32,
+  pNames: string[],
+  pElems: string[],
+  pElemTys: i32[],
+) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
   if n is Block {
@@ -1073,7 +1096,7 @@ function monoPinMapLambdas(ix: i32, pNames: string[], pElems: string[]) {
     let changed = false
     let i = 0
     while i < n.blkStmts.length {
-      const cs = monoPinMapLambdas(n.blkStmts[i], pNames, pElems)
+      const cs = monoPinMapLambdas(n.blkStmts[i], pNames, pElems, pElemTys)
       ns.push(cs)
       if cs != n.blkStmts[i] { changed = true }
       i = i + 1
@@ -1082,38 +1105,38 @@ function monoPinMapLambdas(ix: i32, pNames: string[], pElems: string[]) {
     return mkBlock(ns, n.pos)
   }
   if n is RetStmt {
-    const ca = monoPinMapLambdas(n.retArg, pNames, pElems)
+    const ca = monoPinMapLambdas(n.retArg, pNames, pElems, pElemTys)
     if ca == n.retArg { return ix }
     return mkReturn(ca, n.pos)
   }
   if n is LetDecl {
-    const ci = monoPinMapLambdas(n.letInit, pNames, pElems)
+    const ci = monoPinMapLambdas(n.letInit, pNames, pElems, pElemTys)
     if ci == n.letInit { return ix }
     return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
   }
   if n is WhileStmt {
-    const cb = monoPinMapLambdas(n.whileBody, pNames, pElems)
+    const cb = monoPinMapLambdas(n.whileBody, pNames, pElems, pElemTys)
     if cb == n.whileBody { return ix }
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoPinMapLambdas(n.ifThen, pNames, pElems)
-    const ce = monoPinMapLambdas(n.ifElse, pNames, pElems)
+    const ct = monoPinMapLambdas(n.ifThen, pNames, pElems, pElemTys)
+    const ce = monoPinMapLambdas(n.ifElse, pNames, pElems, pElemTys)
     if ct == n.ifThen && ce == n.ifElse { return ix }
     return mkIf(n.ifCond, ct, ce, n.pos)
   }
   if n is ForRange {
-    const cb = monoPinMapLambdas(n.frBody, pNames, pElems)
+    const cb = monoPinMapLambdas(n.frBody, pNames, pElems, pElemTys)
     if cb == n.frBody { return ix }
     return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
   }
   if n is ForIn {
-    const cb = monoPinMapLambdas(n.fiBody, pNames, pElems)
+    const cb = monoPinMapLambdas(n.fiBody, pNames, pElems, pElemTys)
     if cb == n.fiBody { return ix }
     return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
   }
   if n is Paren {
-    const ci = monoPinMapLambdas(n.parInner, pNames, pElems)
+    const ci = monoPinMapLambdas(n.parInner, pNames, pElems, pElemTys)
     if ci == n.parInner { return ix }
     return mkParen(ci, n.pos)
   }
@@ -1122,15 +1145,24 @@ function monoPinMapLambdas(ix: i32, pNames: string[], pElems: string[]) {
     const callee = P.nodes[n.callFn]
     // A `<paramRecv>.map/.filter(<lambda>)` over a concrete NON-i32 element: pin the callback.
     if callee is Member {
-      const recvNew = monoPinMapLambdas(callee.memObj, pNames, pElems)
+      const recvNew = monoPinMapLambdas(callee.memObj, pNames, pElems, pElemTys)
       if recvNew != callee.memObj {
         newCallee = mkMember(recvNew, callee.memProp, callee.pos)
       }
       if callee.memProp == "map" || callee.memProp == "filter" {
         if n.callArgs.length == 1 {
-          const elem = monoRecvParamElem(callee.memObj, pNames, pElems)
+          const elemTyOut: i32[] = []
+          const elem = monoRecvParamElem(
+            callee.memObj,
+            pNames,
+            pElems,
+            pElemTys,
+            elemTyOut,
+          )
           if elem != "" && elem != "i32" {
-            const cloned = monoCloneLambdaPinned(n.callArgs[0], elem)
+            let elemTy = -1
+            if elemTyOut.length > 0 { elemTy = elemTyOut[0] }
+            const cloned = monoCloneLambdaPinned(n.callArgs[0], elem, elemTy)
             if cloned >= 0 {
               const oneArg: i32[] = [cloned]
               return mkCallN(newCallee, oneArg, n.callArgNames, n.pos)
@@ -1144,7 +1176,7 @@ function monoPinMapLambdas(ix: i32, pNames: string[], pElems: string[]) {
     let changed = newCallee != n.callFn
     let ai = 0
     while ai < n.callArgs.length {
-      const cca = monoPinMapLambdas(n.callArgs[ai], pNames, pElems)
+      const cca = monoPinMapLambdas(n.callArgs[ai], pNames, pElems, pElemTys)
       nargs.push(cca)
       if cca != n.callArgs[ai] { changed = true }
       ai = ai + 1
@@ -2432,6 +2464,11 @@ function monoMakeInstance(
     // byte-identical).
     const pElemNames: string[] = []
     const pElemTypes: string[] = []
+    // The ELEMENT ROW column, parallel to `pElemTypes`. `listElemNameOf` cuts the
+    // element out of the pin's SPELLING; this reads it off the pin's TYPE, so the
+    // callback's pinned annotation can be minted from a row instead of a re-parse.
+    // -1 wherever the pin is not a recorded array, which degrades to today's path.
+    const pElemTys: i32[] = []
     let pe = 0
     while pe < params.length {
       const pep = P.nodes[params[pe]]
@@ -2441,9 +2478,20 @@ function monoMakeInstance(
         pElemNames.push("")
       }
       pElemTypes.push(listElemNameOf(pinned[pe]))
+      let peTy = -1
+      if pinTys[pe] >= 0 {
+        const pet = T.tys[pinTys[pe]]
+        if pet is TyArray { peTy = pet.aElem }
+      }
+      pElemTys.push(peTy)
       pe = pe + 1
     }
-    const instBody1 = monoPinMapLambdas(instBody0, pElemNames, pElemTypes)
+    const instBody1 = monoPinMapLambdas(
+      instBody0,
+      pElemNames,
+      pElemTypes,
+      pElemTys,
+    )
     // Bake any non-capturing concrete callback into a DIRECT call (`pElemNames` already holds the
     // per-position param NAMES, parallel to `cbFnNames`). No baked callback → no rewrite → the body
     // is the same node `monoPinMapLambdas` produced (byte-identical to the pre-specialization path).
