@@ -52995,3 +52995,50 @@ about what information could not do that was really a claim about what the attem
 
 Item 1 of B198's list is therefore down to `synthParamAnnots` (151) and `monoArgTyName` — and
 neither has been grepped for its twin yet.
+
+## B200 — the 151 was a RENDER count; the decision count is 9
+
+B199 ended by pointing its own rule at the two entries still on B198's list. This is the first of
+them, and the rule held again: **every twin `resolveShapeToNominal` would need was already
+written** — `structIndexOfTy`, `structRowOfObjFieldSet`, `variantRowOfTy`.
+
+But the interesting result is not the conversion. It is that **B198's "151 files" was measuring the
+wrong thing.**
+
+`recordedParamPinName`'s general arm is `resolveShapeToNominal(nodeTyName(pIx))`. B198 counted the
+files that reach the RENDER and called the site 151 files of name production. Two sweeps say
+otherwise:
+
+| probe | result |
+| --- | ---: |
+| arena rung ANSWERS (reach) | **9 files** |
+| arena rung DISAGREES with the name ladder (lockstep) | **0 files** |
+
+The other ~142 are not string decisions at all. At this site the render is the **artefact** —
+`synthParamAnnots` mints an annotation node from it and the emitter keys on that nominal spelling —
+and its emptiness is the inference-HOLE gate, since a `TyVar` renders "". Neither is "functional
+type work on a string"; a scalar name passing through `resolveShapeToNominal` unchanged is a
+passthrough, not a decision.
+
+**So the census counted renders and the goal is about decisions, and the two differ by 16×here.**
+Every earlier "N files" in this document that came from a render census is suspect in the same way,
+including the ones used to price work as too small to take.
+
+### Two rungs, not three, both omissions measured
+
+- **No variant rung.** `variantRowOfTy` fits the signature and is refused by its own header: for a
+  union of structurally identical arms the arena holds arm 0's type, so it answers "arm 0" where
+  the truth is "the union" — and B107 settled that its would-be consumers are PARAM sites, which is
+  the only caller here. Variants are NOMINAL (B96). **A twin existing is not a twin being usable;
+  read its header before wiring it.**
+- **No field-set rung.** `structRowOfObjFieldSet` was added and swept: **9 files either way.** Zero
+  added reach makes it an inert arm, so it was discarded rather than carried.
+
+### What did NOT move, and why the order was left alone
+
+The render still runs. Hoisting the arena rung above it would make the hole gate conditional on the
+arena answering — the exact shape of the B191 regression (`nodeTyName`'s emptiness is a gate on
+BOTH paths). The MATCHING moved; the render stays because at this site it is the artefact.
+
+Corpus A/B: **0 diffs** — expected, since lockstep already showed the two ladders agree on all 9.
+The reach probe is what makes 0 diffs readable as "replaced" instead of "inert".
