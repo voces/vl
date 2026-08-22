@@ -57388,3 +57388,34 @@ record several invalid-wasm incidents in exactly this gate.
 
 **Analysed, priced, and not taken:** partial win, delicate function, and the arena cannot answer the
 nominal half. Recorded here so the next pass does not rediscover it as an opportunity.
+
+## B282 — the last clean site, and the screen that closes the census
+
+**The conversion.** `nulRefMapValInnerOf` wants exactly ONE member of a nullable map-value union —
+the sole non-null one, which it RETURNS. The splitting form allocated every member (2.1 per call on
+average) to keep one. It now walks spans and slices only that one. Dual-written against the returned
+STRING: **5,893 reaches, 0 disagreements**; 566 splits and ~633 surplus allocations removed.
+
+**The screen, which is the more useful half.** Every remaining site on the census was put through
+B277's second question — *does anything downstream consume the materialized form?* — BEFORE any code
+was written, and three of four came back refused with a number:
+
+| site | splits | verdict |
+| --- | --- | --- |
+| `registerInlineUnion` | 8,696 | **REFUSED** (B277). Split relocates to `isVariantBoxUnionAtoms`; win 793 of 8,696. Unblocking needs a span form of a gate whose per-atom ladder is nominal lookups (`isStructAtom`, `nameIsLitUnionType`, `nameIsMap`) — partial win, and that gate's comments record several invalid-wasm incidents. |
+| `canonLitUnionArms` | 1,326 | **REFUSED.** Measured `!hasOther` (the only arm that discards the atoms): **60 of 1,326**. The rebuild consumes them 95% of the time, so the split relocates and the win is 60. |
+| `forceCloResultListTypes` / `forceCloResultMapTypes` | 728 / 330 | **REFUSED.** Every arm is `normTypeAtom(arms[i])` — the atoms are consumed, no length gate to hoist. |
+| `nulRefMapValInnerOf` | 566 | **CONVERTED** (above) — one atom wanted of N. |
+
+**This closes the `splitUnionAtoms` census.** What is left is either genuinely consumed (the atoms
+are the answer) or behind the three standing structural refusals. The axis went **126,675 → ~14,000
+calls** and **180,866 → ~30,000 atom allocations** across eight conversions and four measured
+refusals, with **zero answers changed on any of 2,075 corpus files** at every step.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The habit worth keeping.** Four of the last five candidates were priced by a probe before a line
+of the conversion existed, and three of them were dropped on the number rather than after a
+build-and-gate cycle. B277 learned that the hard way at a cost of one full cycle; the screen above
+is what that lesson looks like applied.
