@@ -53111,3 +53111,55 @@ B200 found the "151" was a render count. This entry finds the "137" is a site-re
 files that reach a call site is measuring reach, not decisions**, and the two have differed by 16×,
 by 137×, and by 13× at the three sites where both were finally measured. Reach bounds the work from
 above; only a lockstep or an answers-probe bounds it from where it actually is.
+
+## B202 — censusing DECISIONS instead of renders, and what it leaves
+
+B201 ended by saying every headline number here came from counting call sites that reach a
+RENDER. So the census was re-run to count the thing the goal actually names: a render whose
+result then **decides** something — bound to a variable, and that variable afterwards compared
+against another spelling or handed to a name-classifier. Diagnostics, and a render whose only
+consumer is `x == ""`, are excluded: an emptiness test is a GATE, not a decision about content.
+
+The whole compiler yields **five** such sites.
+
+| site | render → decision | status |
+| --- | --- | --- |
+| `emit_classify.vl:7525` | `structIndexOfTypeName` / `strContains(sn,"?")` / compare vs canon name | arena rung already ahead of it (B168/B191); render is the fallback for a field `fieldCodeOfTy` does not code |
+| `emit_classify.vl:19902` | `structIndexOfTypeName` | arena rung already ahead of it; **the render answers on 0 corpus files** |
+| `emit_rewrite.vl:985` | `resolveShapeToNominal` | B200; the name ladder is the retained fallback |
+| `emit_mono.vl:226` | `annArrowAt(cn) >= 0` | **converted here** |
+| `typecheck.vl:20299` | `nameIsShapeOpen(inm)` | see below |
+
+Three were already converted, each keeping its name ladder as the DECLINE path rather than as
+the decision. That is what a finished site looks like in this programme: the arena decides, the
+render answers only where the arena has nothing.
+
+### The one converted
+
+`monoArgFnTypeName` spelled the argument's type out and then asked the spelling whether it had a
+top-level arrow. `nodeTyIsFunc` answers that outright. `nominalizeFnType` still needs the
+SPELLING, so the render stays — but behind the gate, so it no longer runs on every argument that
+reaches the site.
+
+Lockstep: **0 disagreements**. Reach: **8 files**, which is what makes the 0 a replacement rather
+than an inert arm. Corpus A/B: 0 diffs.
+
+This is a mono-layer site, and B201 said that layer is spelling-bound. Both hold, because they are
+different questions: this one asks about the node's OWN checker type, which the arena has, not
+about a monomorphized instance's SUBSTITUTED type, which is built nowhere but the annotation text.
+**The layer is not the unit of decidability; the question is.**
+
+### The one left, and why it is not a conversion
+
+`typecheck.vl:20299` renders a nullable's inner `TyObj` and asks `nameIsShapeOpen(inm)` — "does
+this spelling open a `{` that is not a map's `{[`". The enclosing branch is already `if it is
+TyObj`, and a map is `TyMap`, so the arena has ALREADY decided the thing the string test re-asks.
+Converting it means DELETING a gate rather than moving one, and a gate that is redundant today is
+the kind that turns load-bearing when the arm above it widens. Left, and named here so it is not
+rediscovered as new surface.
+
+### What the census does not cover
+
+A render whose result is threaded through a RETURN into another function's decision would not
+match — the pattern is local by construction. That is the honest bound on this number, and it is
+the shape `monoArgTyName` has (B201), so at least one such thread is known to exist.
