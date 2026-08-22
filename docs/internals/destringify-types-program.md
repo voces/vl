@@ -55574,3 +55574,66 @@ The goal is that the type system does no functional work with string representat
 There is no block left that is simply unexamined. The next real reduction is not another hint: it
 is either re-running D-PARENCLASSIFY's census as its header requests, or the language-level change
 B229 named — making the emitter's vocabulary row-valued rather than name-valued.
+
+## B242 — D-PARENCLASSIFY's census, re-run as its header asked, and the ladder that asks twice
+
+`repRowOfName`'s header ends: *"Re-measure this census before building it — the day a program
+reaches the round trip, the node is already there."* B241 named that as the next item. Re-run on
+current master:
+
+| consumer | D-PARENCLASSIFY | now |
+| --- | ---: | ---: |
+| `nulBaseStructRow` | 105 files | **1088 calls / 111 files** |
+| `shapeElemDeclaredStructIdx` | 44 files | 653 calls / 51 files |
+| `structIdxOfElemName` | **0 / 0** | **0 calls / 0 files** |
+| `monoIsRowMatch` | 6 (deleted) | — |
+
+1088 + 653 = 1741, matching `emit_rep:3051`'s count exactly — the two censuses agree from opposite
+directions.
+
+**The invitation has not arrived.** `structIdxOfElemName` is still unreached, so the arena rung its
+header describes as "one line" still buys nothing and can still be graded by nothing. That is now a
+RE-MEASURED zero rather than an inherited one, which is the whole point of the header's request.
+
+## But the re-run found something the original census could not
+
+The original counted REACHES. Probing WHY the live consumer's arena rung declines is a different
+question, and the answer is that `nulBaseStructRow` asks the same question twice:
+
+```vl
+const nt = nodeRepTyIxOf(tyIx)
+if nt >= 0 {
+  const t = T.tys[nt]
+  if t is TyNullable {
+    const ar = repRowOfTyStruct(t.nInner, sScanLim())   // arena: is the inner an object ROW?
+    if ar >= 0 { return ar }
+  }
+}
+const rr = repRowOfName(base, sScanLim())               // name: resolve, then require TyObj
+```
+
+`repRowOfName` resolves the spelling and then requires `TyObj` — **the same question the rung above
+just answered NO to.**
+
+Measured at the 1,088 declines: the rep column IS a `TyNullable` on **1,078**, with the inner a
+non-object (`string`, `i32`, `boolean`, `i32[]`, `K`, a map), and `repRowOfName` returns -1 on
+**1,078 of 1,078**. Zero cases where the name bridge answered what the arena declined.
+
+So the guard is **answer-preserving by construction**, not by tolerance: control reached
+`structIndexOfTypeName` either way. The 10 declines with no `TyNullable` in the rep column keep the
+full ladder.
+
+## Measurement
+
+Corpus A/B 0 diffs; `resolveAnnot` **-593 across 52 files** (1,078 calls skipped, of which 593
+would have reached the parse rung — the rung effect, third measurement). All six gates clean.
+
+## The shape of this one is different from the twelve before it
+
+Every earlier conversion HANDED A ROW to a name path. This one DELETES A QUESTION: the arena had
+already answered it one rung up, and the name path was re-asking. **A ladder whose rungs ask the
+same question of two different sources does not need the second source when the first one's answer
+is dispositive** — and "not an object row" is dispositive, where "no row found" would not have been.
+
+That is a distinct category from a hint, and worth looking for elsewhere: not "can the arena answer
+this?" but "did the arena already answer this, one rung up?"
