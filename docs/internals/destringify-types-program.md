@@ -55757,3 +55757,68 @@ distinction B225 drew about `sTyIx`'s two producers.
 
 `:4119` (`mvValKindOfName`) takes a bare NAME with no type in scope at all, and `:3726` likewise.
 The block is closed.
+
+## B246 — the largest string-typed surface in the compiler is an ABI KEY, and the spelling is its identity
+
+Following `structIndexOfTypeName`'s remaining consumers led to `annParamKind` / `annRetKind`, and
+censusing those found a surface far larger than anything this programme has measured:
+
+| caller | calls | files |
+| --- | ---: | ---: |
+| `annSigKey`'s PARAM loop | **15,941** | 238 |
+| `annSigKey`'s RETURN leg | **9,675** | 345 |
+| `sigKeyOfTy`'s return | 294 | 75 |
+| `sigKeyOfTy`'s params | 155 | 30 |
+| three sites at `:9218` `:9222` `:9229` | **0** | **0** — dead |
+| **TOTAL** | **26,065** | |
+
+For comparison, the whole `resolveAnnot` surface at session start was 18,532. **This is bigger, and
+it is not a type-resolution path at all.**
+
+## What it is
+
+`annSigKey(name)` builds the `$fnsig` KEY of a function type: one token per parameter plus a return
+token, the ABI identity a `call_ref` casts against. `sigKeyOfTy(funcTyIx)` is its arena dual —
+documented as *"byte-identical to `annSigKey(tyToEmitName(funcTyIx))` by construction"* — and it
+reaches that guarantee by RENDERING each param and classifying the render.
+
+So the arena entry point exists, is only 449 of the 26,065 calls, and gets its byte-identity
+precisely BY going through the name.
+
+## Why that is not a defect
+
+`cloNameSigKey`'s caller states it directly:
+
+> The PAYLOAD stays on the name too: `cloNameSigKey` builds an ABI `$fnsig` key, **where the
+> spelling IS the identity**.
+
+And the same header records the measurement that closes it: the narrower "is it a `TyFunc` or a
+nullable closure" arena reading **disagrees on 14 corpus files, every one a union with a closure
+member.**
+
+Three independent producers must agree byte-for-byte on this key (`annSigKey`, `sigKeyOfTy`,
+`cloParamTok` → `vtKindOfType`), and `sigKeyOfTy`'s own header carries the invalid-wasm witness from
+the last time one of them diverged — a litunion-alias param keyed `S>i` against a callee declared
+`i>i`, `vl check` clean.
+
+**A key whose tokens are DEFINED over the name vocabulary is not a type printed and then
+re-parsed.** It is a name used as a name. Converting it would mean redefining the ABI key over
+arena types and moving all three producers together — the same language-level change B229 named for
+the canon column, not a refactor.
+
+## What this settles
+
+The two largest string-typed surfaces in the compiler are now both measured and both refused for
+the same underlying reason:
+
+| surface | calls | why it stays |
+| --- | ---: | --- |
+| `$fnsig` key production | 26,065 | the spelling IS the ABI identity; three producers must agree byte-for-byte |
+| the canon column | 688 | canon is a name→name rewrite whose result depends on the NAME (B229) |
+
+Both are places where **a string is the vocabulary, not a rendering of something else**. That is a
+different category from every site this programme converted, and it is where the destringify goal
+meets the language's own design rather than an implementation shortcut.
+
+Also recorded: four dead call sites found by this census — `annSigKey` at `:6705` and
+`annParamKind` at `:9218` / `:9222` / `:9229`, all 0 of 2075 files.
