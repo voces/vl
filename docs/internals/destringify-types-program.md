@@ -56390,3 +56390,57 @@ Every `annSigKey` consumer has now been walked to its source:
 | `internCloSigOfAtom` ← 5 name-in callers | name-in by construction |
 | the result-spine annotation entry | name-in by construction |
 | `:6705` | dead, 0 of 2075 |
+
+## B259 — the last render at an arena walk, removed: B258 replicated the guard's EARLY-OUT, not its ANSWER
+
+B258 (#1753) recorded the render at `collectTyReachCloSigs`'s `TyFunc` arm as a REFUSAL. That
+conclusion was wrong, and the error is worth more than the conversion.
+
+The arm read:
+
+```vl
+const nm = arenaEmitName(tyIx)
+if nm != "" { internCloSigOfAtomTy(nm, sigKeyOfTy(tyIx)) }
+```
+
+The KEY had already come off the type (#1752). The only thing left needing a name was the guard
+`nulCloMixedUnionUnregistered(nm)`. B258 tried four arena predicates for that guard and none was
+exact — 989/144, 1081/52, 970/163, 1081/52, the residue changing DIRECTION each time — and
+concluded that an atom count is a fact about the spelling. That last part is true. The conclusion
+drawn from it was not.
+
+**What went wrong: I lockstepped the guard's first statement instead of its last.** The guard
+begins `if splitUnionAtoms(cloResultAtomOf(arm), atoms) < 2 { return false }` — an EARLY-OUT, an
+optimisation internal to the guard. Its VERDICT is "does the result union carry both a scalar and
+a composite arm", and that is structural. This is B213's own lesson applied to a predicate instead
+of a table: *replicate the ANSWER, not the ROUTE.* An atom count and a member walk disagree
+constantly — `K0` is one atom by name and many members in the arena, a nullable is one wrapper and
+two atoms — while agreeing on the verdict, because a litunion alias's members are all literals so
+it is not a mixed union by either road.
+
+`cloResultMaybeMixed(tyIx)` walks `fnRet`: a `TyUnion`'s `uMembers`, or a `TyNullable`'s `nInner`
+when that inner is a union (the `| null` is a wrapper here and an atom in the spelling — the mix
+question is about what is INSIDE it). It classifies `TyObj`/`TyMap`/`TyArray`/`TyFunc` composite
+and `TyPrim`/`TyLit` scalar, and returns `hasScalar && hasComposite`. `false` is a DEFINITE no.
+
+Dual-written against the guard's final boolean: **1,123 definite-no of 1,133 reaches, 0 wrong,
+10 deferred.**
+
+One soundness condition had to be measured before the render could go, because the arm's `nm != ""`
+test was doing real gating work: *is there a reach where the arena KEY is non-empty but the render
+would have been empty?* If so, keying off `kAr != ""` would intern something the name path skipped.
+Measured over the corpus: **`keyNoName = 0`** (2 reaches have both empty). So the key subsumes the
+condition, and the ten deferrals render and take the name path unchanged.
+
+Gates: corpus A/B 0 diffs / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds; lint
+clean (exit 0 and summary line); rep-fuzz exact; grid no BAD cells.
+
+**This was the last render sitting on an arena walk.** `collectTyReachCloSigs` descends the arena
+and no longer spells a type to decide anything on 99.1% of its reaches.
+
+**The transferable rule — a guard is two things, and only one of them is its meaning.** When
+lockstepping a predicate, dual-write against its RETURN VALUE, never against a clause inside it.
+An early-out exists to avoid work, so it is free to be conservative, arbitrary, or spelling-shaped;
+the verdict is the contract. Four failed predicates and a refusal came from measuring the wrong
+one, and the residue changing direction between attempts was the tell I misread as "no structural
+answer exists" when it actually said "I am fitting to noise". See [[vl-count-the-work-removed]].
