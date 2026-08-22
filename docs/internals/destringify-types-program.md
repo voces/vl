@@ -53889,3 +53889,98 @@ twice rather than generalised once.
 The last row is the honest remainder. B201 measured the family's constraint at one site and this
 entry at a second; the other four have NOT been measured individually, and this programme has
 already shown twice that a category verdict does not transfer to every member of the category.
+
+## B217 — the re-parse that mints a duplicate row, and an instrument that sees what A/B cannot
+
+Every census this programme has run counts RENDERER CALL SITES: a spelling produced at some line,
+consumed at some line, both visible to a grep over a renderer vocabulary. B216 widened that
+vocabulary after it missed five sites. This entry is a site the census cannot see AT ALL, at any
+vocabulary, because there is no renderer call in it.
+
+`emit_mono.vl:2235` synthesizes the return annotation of a monomorphized instance:
+
+```vl
+if pinned[pli] != "" {
+  nret = synthTypeRef(pinned[pli], -1)
+  ...
+}
+```
+
+`pinned` is a column of type SPELLINGS. `synthTypeRef(name, -1)` reaches
+`recordClonedNodeTyKnown`, and its `-1` arm is:
+
+```vl
+let ty = tyIn
+if ty < 0 { ty = nameToTy(name) }     // ← parse a type back out of the string
+```
+
+So the string type work is real and it is exactly what this programme exists to remove — but it
+happens one module away, inside a shared mint helper, reached through a `-1` sentinel. No grep for
+a renderer finds it. **The census's unit of measurement is wrong for this class**: the laundering
+is not `consumer(render(x))`, it is a string column carried across a function boundary and
+re-parsed by a callee's default arm.
+
+## The measurement
+
+The site is reached by exactly ONE corpus file, `inference/unannotated-reverse.vl`. Lockstepping
+the re-parse against the type column that is already in scope:
+
+```
+M2235  nm=i32[]  pinTy=58  tyA=78  tyB=58
+```
+
+`pinTys` is the instance's ARGUMENT type column, checked parallel to `pinned` at the top of
+`monoMakeInstance`. It holds row **58** for this param. Re-parsing the spelling `i32[]` produces
+row **78** — `nameToTy` does not hash-cons, so the parse MINTS A STRUCTURALLY IDENTICAL DUPLICATE
+of a row the column already held. The cost is not only the parse; it is a second arena row for one
+type.
+
+## The instrument: count the arena, not the output
+
+Corpus A/B over this change is **0 diffs**. On its own that reading is worthless here — it is the
+exact ambiguity B-numbered entries keep hitting, where 0 diffs cannot separate "replaced" from
+"inert". A reach probe does not settle it either: the site reaches, both before and after.
+
+What settles it is asking the ARENA how many rows exist at that moment. Probing each side at the
+same line, compiling the same file:
+
+| side | arena rows | type recorded on the node |
+| --- | ---: | ---: |
+| `synthTypeRef(pinned[pli], -1)` — re-parse | 79 | 78 |
+| `synthTypeRefTy(pinned[pli], -1, pinTys[pli])` — handed over | **78** | **58** |
+
+One fewer row, and the node points at the row the checker recorded rather than a private copy of
+it. **The change is provably live while the output is byte-identical** — which is a thing this
+programme could not previously demonstrate, and the reason to keep the row count in the toolkit
+alongside the A/B and the reach probe.
+
+## Why the read is safe
+
+`monoMakeInstance` opens with a loud parallelism check on this exact pair:
+
+```vl
+if pinTys.length != pinned.length {
+  return emitFail("...pin type column is not parallel to the pins")
+}
+```
+
+Its header argues that per-read bounds guards would be WRONG here — "two reads off one index must
+not have opposite failure policies", since a guard turns misalignment into a silently wrong type
+while the sibling `pinned[pj]` traps. Reading `pinTys[pli]` beside `pinned[pli]` is therefore the
+policy that check exists to provide, not a new unguarded read. And `pinTys[pli]` of -1 falls
+through to today's name resolution inside `recordClonedNodeTyKnown`, so every position the column
+does not cover is unchanged by construction.
+
+## What this does NOT claim
+
+`synthTypeRef(name, -1)` has roughly a dozen further callers in `emit_mono` alone
+(`outType`, `elemType`, `retName`, `srcElem + "[]"`, `listTy`, `scTy` — several of them type
+spellings built by STRING CONCATENATION). This entry converts ONE of them, the one whose type
+column is already in scope and already length-locked. The others each need their own source and
+their own measurement; the category verdict does not transfer, which is the same caution B216
+closed on.
+
+`emit_mono.vl:1894` was checked and deliberately NOT converted: its header already explains that
+the arm is gated on `annotateI32`, whose only caller passes an all-`-1` column, so routing it
+through the fallback would be a no-op today. That is a twin left unused on purpose — the case the
+`*OfTy`-twin note says to check the header for.
