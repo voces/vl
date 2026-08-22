@@ -54366,3 +54366,82 @@ Across B217–B222, on the files that reach these sites:
 | `arrays/unannotated-param-f64-map.vl` | 12 | 6 |
 
 Every one of those PRs was byte-identical on the corpus.
+
+## B223 — census the PARSE, not the print: where string→type work actually remains
+
+Every census in this programme has counted RENDERERS — places a type becomes a string. That unit
+has now been wrong four times (B210 window, B211 nesting, B216 vocabulary, B217 a laundered column
+with no renderer call in it). The dual question is better posed and exactly measurable:
+
+**Who turns a string back INTO a type?** That is `nameToTy`, and it has one body. Counting its
+entry points over the whole corpus answers "how much string type work is left" without depending
+on a vocabulary at all.
+
+## The whole remaining surface, in one build
+
+Per-entry counters, reported once at the end of `emitProgram` (the accumulating shape from B218),
+swept over 2075 corpus files:
+
+| entry point | calls | files | share |
+| --- | ---: | ---: | ---: |
+| `annotResolve`'s no-tree fallback | **2174** | 733 | **56.8%** |
+| `recordClonedNodeTy` | 711 | 144 | 18.6% |
+| the canon column (`canonTyIxCol.push`) | 688 | 167 | 18.0% |
+| generic-application argument names | 154 | 41 | 4.0% |
+| `recordClonedNodeTyKnown` | 69 | 23 | 1.8% |
+| union-member generic-app shape | 31 | 8 | 0.8% |
+| **TOTAL** | **3827** | | |
+
+`recordClonedNodeTyKnown` is the sink B217–B222 have been feeding, and it is now **1.8%** of the
+remaining surface.
+
+## 99.9% of the largest entry is ONE line
+
+Splitting the 2174 by which of `annotResolve`'s eight call sites reached it:
+
+| caller | calls | share |
+| --- | ---: | ---: |
+| `resolveAnnotTs`'s main resolution | **2172** | **99.9%** |
+| the `&`-fold arm | 2 | 0.1% |
+| `nameToTyAnn` · `isTypeTy` · alias-field · variant · typaram-env · memo tail | **0** | 0 |
+
+Six of eight callers measure exactly ZERO. Each of those has a header in this file claiming its
+spelling tree is always present — `isTypeTy` says "0 tree-misses in 228,869 reads", the positioned
+funnels say "333,073 of 333,073". **Those claims are now independently confirmed by an instrument
+that did not exist when they were written**, which is worth more than the original measurements:
+they were verified by the probe that had to be built anyway.
+
+## And that line is `emit_rep`'s post-canon re-resolution
+
+`resolveAnnot(name, typarams)` is `resolveAnnotTs(name, typarams, -1)` — the NAME route by
+construction, because a post-canon emit-time name has no live tree. Its callers are four sites in
+`emit_rep.vl`:
+
+| site | `resolveAnnot` calls | files | share |
+| --- | ---: | ---: | ---: |
+| `declTyIxOfName`'s bottom rung | 10,187 | 780 | 55.0% |
+| `repElemIdOfNameTy`'s unhinted path | 8,336 | 424 | 45.0% |
+| the inline-shape fallback at `:1995` | 9 | 5 | 0.0% |
+| the inline-shape fallback at `:2661` | **0** | **0** | **never fires** |
+
+18,532 calls produce only 2,172 parses: the name-keyed memo absorbs **88%** of them. Any accounting
+that quoted call sites here without the memo would overstate the remaining work by an order of
+magnitude.
+
+## What this says about the next slice — and what it forecloses
+
+`repElemIdOfNameTy` ALREADY takes a type hint and skips the parse when given one (D-REPELEMTY); the
+8,336 are its unhinted callers. And that slice already recorded, with numbers, why the obvious hint
+source is wrong: a hint taken from the NODE bank disagrees on **61 of 1,400** covered entries,
+because `canonEmitTypeNames` rewrites `TypeRef.tyName` IN PLACE to the emitter's spelling while
+`nodeTyIx` keeps the type the checker recorded BEFORE the rewrite. **`tyName` is the emitter's
+vocabulary and `nodeTyIx` is the checker's algebra**, and at that site they answer two different
+questions. A hint must be the type THIS VERY NAME resolved to.
+
+So the largest single remaining block is not unexamined — it is gated by a measured constraint, and
+any attempt on it has to bring a hint source that satisfies that constraint rather than merely a
+type that is nearby. `declTyIxOfName`'s 10,187 is the block that has NOT been through that
+analysis, and it is where the next slice should start.
+
+The `:2661` rung is recorded as UNREACHED (0 of 2075), not deleted — the same treatment the two
+`nodeNulStructInnerName` sites got in B213.
