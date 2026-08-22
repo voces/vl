@@ -53208,3 +53208,48 @@ render is GONE, and getting there needs three numbers, not one:
 Only (1) was ever measured before. B202's other two "finished" sites are now queued for the same
 three numbers, and the honest count of render-then-decide sites is **four**, not the three B202
 implied — until each decline path is driven out the same way.
+
+## B205 — a per-file reach counter cannot see an arm that fires SECOND
+
+B203's three numbers sent the last decline path with reach — `recordedParamPinName`'s name ladder —
+to be measured. The measurement was taken at the CONSUMER rather than at the arm: after
+`shapeNominalOfTy` declines, does `resolveShapeToNominal(tn)` return something OTHER than `tn`?
+That is the only case where the name ladder does functional work rather than passing a spelling
+through.
+
+It fires on **2** corpus files:
+
+```
+arrays/map-collapse-to-variant.vl   tn=[{meow: i32}]      -> [Cat]
+arrays/map-struct-to-struct.vl      tn=[{a: i32, b: i32}] -> [Pt]
+```
+
+### B200 called one of these rungs inert, and B200 was wrong
+
+The `Pt` row is a STRUCT the banked `structIndexOfTy` sidecar does not hold but
+`structRowOfObjFieldSet` matches. B200 swept exactly that rung, read **"9 files either way"**, and
+recorded it as an inert arm not worth carrying.
+
+The sweep counted the **first fire per file**. `arrays/map-struct-to-struct.vl` already had another
+parameter where the banked sidecar answered, so the file was counted under both builds and the
+rung's own contribution was invisible. Adding it drops `{a: i32, b: i32}` -> `Pt` off the name path
+— 2 resolutions become 1.
+
+**A per-file reach counter cannot see an arm that fires second.** This is the fourth distinct way a
+sweep in this programme has silently measured the wrong thing, and it is the most dangerous so far,
+because unlike the others it produced a plausible number rather than an obviously broken one. The
+fix that generalises: measure at the CONSUMER — "does the thing I am trying to retire still do
+work?" — not at the arm — "did my new arm fire?". The consumer question is immune to ordering.
+
+### What is left, and why it is a floor
+
+The `Cat` row is a VARIANT, and it stays on the name. Not for want of a twin: the twin is refused.
+`variantRowOfTy`'s header states it, B96 states the rule, and two fixtures pin it —
+**variants are NOMINAL**. Two variants with the same field set are different variants, so the
+structural field-set match that legitimately resolves a STRUCT would resolve the wrong variant.
+`variantIndexOfTypeName` — the name path — does perform exactly that structural match, which is
+worth flagging as a latent question about the NAME ladder rather than an argument for copying it.
+
+So `recordedParamPinName` ends at: arena for structs (banked row, then field set), name for
+variants, render retained as the ARTEFACT and as the inference-hole gate. That last leg is a
+measured floor, not a decline.
