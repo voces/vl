@@ -139,6 +139,7 @@ import {
   nameIsF64Array,
   nameIsI32KeyedMap,
   nameIsI64Array,
+  nameIsLitUnionArray,
   nameIsMap,
   nameIsMapMemberUnion,
   nameIsNulClosure,
@@ -329,9 +330,10 @@ import {
   declTyIxOfName,
   mvSlotOfValNameTyK,
   recordSFieldElemRow,
+  recordSFieldElemRowTy,
   recordSRowDeclOfName,
   recordSTyIx,
-  recordUFieldElemRow,
+  recordUFieldElemRowTy,
   recordUnMemTys,
   sTyIxOfName,
 } from "./emit_rep"
@@ -491,6 +493,7 @@ import {
   setNarrowFromCond,
   setNarrowFromCondElse,
   shapeFieldElemName,
+  shapeFieldElemRow,
   shapeSetIxReset,
   sigKeyOfTy,
   sioMemoReset,
@@ -531,6 +534,27 @@ import {
 // requires. It is NOT offered at `refListElemNameOfExpr`, whose name is a DECLARED
 // struct's — measured, that one disagrees on both its corpus firings (`nm=P` against a
 // structural `{x: i32}`), because `repElemKey` keys a declared struct nominally.
+
+// The FIELD-ANNOTATION node's row, routed through the canon column where canon rewrote
+// the node. `canonEmitTypeNames` rewrites `TypeRef.tyName` in place and leaves `nodeTyIx`
+// holding the type the CHECKER recorded BEFORE the rewrite, so on a rewritten node the
+// recorded elem NAME is post-canon while `nodeTyIxOf` is pre-canon — measured, that is
+// every one of this site's 4 disagreements (`i32|null` against a `1 | 2 | null` row).
+function fdRowOf(fdType: i32) {
+  if canonRewroteNode(fdType) { return canonTyIxOf(fdType) }
+  nodeTyIxOf(fdType)
+}
+
+// The hint for a field row pushed from a `FieldDef` NODE: the field's own row projected
+// per CODE, declined for the names `repElemKey` keys nominally and for literal unions.
+function fieldElemHintOf(fdType: i32, code: i32, elemNm: string) {
+  if elemNm == "" { return -1 }
+  if elemNameIsNominal(elemNm) { return -1 }
+  if nameIsLitUnionType(elemNm) { return -1 }
+  if nameIsLitUnionArray(elemNm) { return -1 }
+  shapeFieldElemRow(fdRowOf(fdType), code)
+}
+
 function rlHintElemTy(ix: i32) {
   const rt = nodeRepTyIxOf(ix)
   if rt < 0 { return -1 }
@@ -4918,17 +4942,18 @@ function pushFieldRow(
   keyI32: boolean,
   fName: string,
   tyText: string,
+  elemTyHint: i32,
 ) {
   if toVariant {
     uFieldTypes.push(code)
     uFieldTyText.push(tyText)
     uFieldElemName.push(elemNm)
-    recordUFieldElemRow(elemNm, keyI32) // D5 + B6b
+    recordUFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
     uFieldNames.push(fName)
   } else {
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
-    recordSFieldElemRow(elemNm, keyI32) // D5 + B6b
+    recordSFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
     sFieldNames.push(fName)
   }
   // A value-union field interns its box reps (the three recorders' shared parity rule):
@@ -5096,13 +5121,15 @@ export function collectS(stmts: i32[]) {
             // The ROW is `pushFieldRow`'s (the struct table). The recorded elem name IS
             // `fieldRefElemName`'s answer at code 16 (neither of `fieldRecElemName`'s two
             // arms fires), so the home's code-16 intern reads the same value it would.
+            const recNm = fieldRecElemName(fnode.fdType, code)
             pushFieldRow(
               false,
               code,
-              fieldRecElemName(fnode.fdType, code),
+              recNm,
               nodeTyMapKeyIsI32Span(fnode.fdType),
               fnode.fdName,
               "",
+              fieldElemHintOf(fnode.fdType, code, recNm),
             )
             // A DEAD RENDER, deleted. This is `pushFieldRow`'s `tyText`, and the branch this
             // call takes (`toVariant == false`) never reads it — only the VARIANT branch has a
@@ -5193,6 +5220,8 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
     // The ROW is `pushFieldRow`'s (the variant table) — the same four columns and the same
     // two per-row side effects the two NODE recorders push. Only the elem-NAME derivation
     // is this recorder's own: it reads the field TYPE TEXT, where they read a `FieldDef`.
+    // The SHAPE-TEXT recorder has no `FieldDef` node, so no row to hand over: -1 is
+    // exactly today's call.
     pushFieldRow(
       true,
       fc,
@@ -5200,6 +5229,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       nameIsI32KeyedMap(ftxt),
       fnames[fi],
       ftxt,
+      -1,
     )
     cnt = cnt + 1
     fi = fi + 1
@@ -5267,6 +5297,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               nodeTyMapKeyIsI32Span(fnode.fdType),
               fnode.fdName,
               ftxt,
+              fieldElemHintOf(fnode.fdType, code, elemNm),
             )
             // Same column, same reasoning — and `fnode` is still live here, 33 lines after
             // `ftxt` was rendered from it. An earlier pass filed this site as string-only by
