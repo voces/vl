@@ -57926,3 +57926,48 @@ Neither is a type printed and then interrogated.
 canon-softened spelling because that spelling IS the rep. Re-keying them on the precise type would
 change what the rep layer decides on, and B294's 83 is a direct measurement of why the two are not
 interchangeable.
+
+## B295 — the last disagreement closes: the checker had already banked the decision as an i32
+
+B288 measured the inferred-return ladder's value-union arm at **6 disagreements of 3,576** and
+attributed them to canon softening. B294 tried to match by softening the arena walk and got **83**.
+Both were re-deriving a decision **the checker had already made and recorded**.
+
+`recordInferRet` banks four things beside a function name: the SPELLING the adoption ladder settled
+on, the arena row, the atom count — and `inferRetRung`, **which arm of the ladder minted the row**.
+Three of its rungs are value-union producers: `IR_RUNG_VALUE_UNION`, `IR_RUNG_LITUNION_ARR_VU` and
+`IR_RUNG_CLO_ARM_VU`.
+
+Bucketing every reach by banked rung against `isValueUnionName(inm)`:
+
+| rung | name says yes | name says no |
+| --- | --- | --- |
+| 3 `VALUE_UNION` | 63 | 0 |
+| 4 `LITUNION_ARR_VU` | 4 | 0 |
+| 20 `CLO_ARM_VU` | 5 | 0 |
+| the other 28 rungs that occur | 0 | 3,504 |
+
+**No mixed rung anywhere.** The separation is exact, and the three all-true rungs are precisely the
+three whose names say value union — a semantic fact, not a coincidence of this corpus.
+
+`inferRetRungIsValueUnion(i)` reads it. Dual-written: **3,576 reaches, 0 disagreements.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline rebuilt from the current master commit); `deno
+task test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+### The render→decide surface now has ZERO measured disagreements
+
+| route | status |
+| --- | --- |
+| render → banked on an AST node by canon → decided | closed (B290–B292) — 74,225 decisions |
+| render → banked in a checker column → decided | closed (B289, B293, **B295**) — 0 residue |
+| render → interner key | never existed (B288) |
+
+**Nothing remains that prints a type and then decides on the print.**
+
+**The lesson, and it is why B288 and B294 both missed it.** Both asked *"can the arena reproduce what
+this name says?"* — a question about two derivations of the same fact. The right question was
+*"who decided this, and did they write it down?"* The checker chose the rung, and banking it as an
+i32 is the destringified form of a decision; re-deriving it from either the name OR the type is
+solving a problem that was already solved one pass earlier. **When a name is BANKED rather than
+computed at the point of use, look for the producer's own record of what it decided.**
