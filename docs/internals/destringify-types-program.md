@@ -56444,3 +56444,55 @@ An early-out exists to avoid work, so it is free to be conservative, arbitrary, 
 the verdict is the contract. Four failed predicates and a refusal came from measuring the wrong
 one, and the residue changing direction between attempts was the tell I misread as "no structural
 answer exists" when it actually said "I am fitting to noise". See [[vl-count-the-work-removed]].
+
+## B260 — a FIFTH conversion shape: the RETURN TYPE was the render
+
+Every conversion up to here moved a caller from a NAME to the arena. This one changed no
+control flow at all. It changed a return type.
+
+`tyScalarBaseName(ty: i32): string` answers "which base scalar does this type lower as". Its body
+was already fully structural — `if t is TyPrim { return t.primName }`. And `primName` is not a
+string: `PrimName` is a literal union (#1402's conversion of the arena's kind field), so it is an
+INTERNED ATOM and `primName == "i32"` is an `i32.eq`.
+
+The declared return type `string` is what undid that. Returning an atom from a `: string` function
+WIDENS it into a materialized string — this is not incidental, it is a modelled event in this
+compiler: `fnTailWidensAtomToStr` exists to detect exactly this position, and a function it fires
+on reserves the string scratch frame via `fnHasStrOp`. So the arena handed out an atom, the
+signature turned it into a string, and then every caller compared that string to a literal:
+
+```vl
+if tyScalarBaseName(fsTy) == "string" { return 3 }
+if tyScalarBaseName(liTy) == "i64"    { return true }
+if nodeScalarBaseName(p.parType) != "string" { … }
+```
+
+**All six call sites were comparisons. Not one consumer wanted the text.** The type was rendered
+to a string, and functional type work was done on that string — the goal's exact wording — with no
+name path, no lookup table and no spelling anywhere in sight.
+
+The twin was already written, as the memo predicts. `tyPrimNameOf(ix): PrimName | null` and its
+decision form `tyIsPrimNamed(ix, nm)` carry a header saying they replaced `tyToStr(ix) == "i32"`
+"at the sites that were asking a STRUCTURAL question by rendering". `tyScalarBaseName` is the
+sibling that also peels literals and literal unions, and it had been left behind.
+
+- `tyScalarBasePrim(ty): PrimName | null` — the peeling body, now the ONLY implementation.
+- `tyScalarBaseIs(ty, nm)` / `nodeScalarBaseIs(ix, nm)` — `tyIsPrimNamed`'s shape.
+- `tyLitBasePrim(t: TyLit)` — the same fix one level down, since the `TyLit` arm delegates.
+
+With all six callers routed, `tyScalarBaseName` and `nodeScalarBaseName` had **zero references**
+and were deleted. The compiler is 289 bytes smaller (1,286,902 → 1,286,613); no string is
+materialized anywhere on this path.
+
+Gates: corpus A/B 0 diffs / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds; lint
+clean (RC 0 — it caught a fmt miss at RC 123 first, read by exit code not `tail -1`); rep-fuzz
+exact; grid no BAD cells.
+
+**The transferable rule — grep the SIGNATURES, not just the call sites.** A function can do
+functional work on a string representation without containing a single string operation, because
+the render is in its type. The instrument that finds these is not "who calls a name predicate" but
+**"which functions return `string` while their body returns an atom"** — and then, for each, "does
+any caller actually want the text?" Here the answer was no, six times out of six. `numLitUnionBaseName`
+(11 callers), `tyArrayElemPrimName` (4) and `tyNumScalarBaseName` are the same shape and are the
+queued follow-ups; they differ only in that some callers PROPAGATE the value, so the widening moves
+to a boundary instead of vanishing.
