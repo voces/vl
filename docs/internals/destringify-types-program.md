@@ -55401,3 +55401,61 @@ mint-order line, not D-MAPNODETY's.
 | now | **~11,540** |
 
 **~38% removed across eleven conversions**, every one byte-identical on the corpus.
+
+## B239 — the shape-field recorder, arm for arm, and the rung effect on the count
+
+B238 located the last tractable slice: the two field recorders, fed by eight sites of which
+`emit_classify:16627` carries 1,570. Its enclosing `internInlineShapeTy(nm, tyIx)` already takes the
+shape's ROW, so each field's type is in scope.
+
+## The twin, and why it is per-CODE
+
+`shapeFieldElemName(ftxt, code)` is nine arms over a field's TYPE TEXT. The twin projects the
+field's ROW the same way:
+
+| code | the name means | the row |
+| --- | --- | --- |
+| 16 / 0 / 4 | the field's own type | `fty` |
+| 15 | the `\| null`-stripped nested target | peel |
+| 5 | the ref-array element | `aElem` |
+| 28 | the same, stripped first | peel then `aElem` |
+| 19 | the map's VALUE | `tyMapValOf` |
+| 29 | the same, stripped first | peel then `tyMapValOf` |
+
+`tyMapValOf` already existed and its header already said what it was — "the structural form of
+`mapValNameOf(name)`, which slices the value text out of a rendered `{[K]: V}` spelling". The twin
+was written before the site that needed it, for the fourth time in this programme.
+
+**The field row is looked up BY NAME, not by index.** The recording loop walks a FILTERED field
+list (`shapeFieldsRideTyParam` drops generic-parameter fields ahead of it), so `objFieldTypes[pi]`
+would be silently misaligned — the parallel-array skew this programme keeps meeting. `objFieldNames`
+is scanned instead.
+
+## Two guards, both measured
+
+| | ok | bad |
+| --- | ---: | ---: |
+| twin, no guard | 451 | 9 |
+| + decline literal-union names | 329 | 4 |
+| + decline code 30 | **329** | **0** |
+
+All 9 were literal unions rendering identically on a DIFFERENT row (`"x"\|"y"` against
+`"x" \| "y"`). The last four survive the name guard because their members contain the shape
+grammar's own separators (`"a,b" \| "zz"`, `"a}b" \| "zz"`) and the predicate cannot parse them —
+so code 30's arm declines outright.
+
+## The count is smaller than the firing count, and the reason is a RUNG
+
+`resolveAnnot` **-155 across 83 files** against 329 hinted firings.
+
+Every earlier entry matched its firing count, and B234 EXCEEDED it. This one falls short, and the
+cause is the third distinct relationship between the two numbers this programme has measured:
+`declTyIxOfName` is a three-rung ladder, and most of these names are answered by the DECLARED-name
+table or the primitive leaf before the parse rung is reached. The hint removes the whole ladder;
+only 155 of those ladders would have reached `resolveAnnot`.
+
+**Firings, `resolveAnnot` calls and `nameToTy` parses are three different quantities, and which one
+a conversion moves depends on where in the ladder its names were being answered.** Quote the one
+you measured.
+
+Corpus A/B 0 diffs; all six gates clean.
