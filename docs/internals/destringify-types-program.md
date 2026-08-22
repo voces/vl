@@ -55822,3 +55822,47 @@ meets the language's own design rather than an implementation shortcut.
 
 Also recorded: four dead call sites found by this census — `annSigKey` at `:6705` and
 `annParamKind` at `:9218` / `:9222` / `:9229`, all 0 of 2075 files.
+
+## B247 — the fourth site, and the `structIndexOfTypeName` surface closes at 82% refused
+
+`structIndexOfExpr`'s decline path is the fourth site in this file to ask the field-set matcher a
+question the arena already answered. Its arena rung runs first
+(`repRowOfTyStruct(nodeRepTyIxOf(exprIx))`); when that declines, `structIndexOfTypeName(nm)` parses
+`nm`'s field set and scans the struct table.
+
+Measured at the declines: **137 of 137 have a recorded type that is not a `TyObj`, and the matcher
+answers 0 of them.** Skipping it is answer-preserving by construction.
+
+The guard is written on "the arena RECORDED a non-object", not on "the arena declined" —
+`repRowOfTyStruct` also returns -1 for a `TyObj` with no dedup row and for an atom-vs-plain
+collision, and there the name path is still the answer. This site never reaches those (obj=0,
+noty=0), but the guard encodes the distinction rather than the corpus. Same reason B243 needed
+`innerKnown`.
+
+## The surface, closed
+
+`structIndexOfTypeName` was 6,100 calls when B243 sized it. Now **3,798**, and of those:
+
+| block | calls | status |
+| --- | ---: | --- |
+| `structIndexByValName` (3 sites) | 1,442 | REFUSED — hint absent at 91% and wrong 35/41 where present (B245) |
+| `annParamKind` | 934 | REFUSED — `$fnsig` ABI key, the spelling IS the identity (B246) |
+| `annRetKind` | 729 | REFUSED — same |
+| `shapeElemDeclaredStructIdx` | 236 | REFUSED — documented NODE-LESS caller |
+| nine small sites | 457 | unexamined |
+
+**3,341 of 3,798 (88%) carry a documented refusal.** The four converted sites (B243, B244, B247 and
+`nulBaseStructRow`'s two rungs) removed 2,449 field-set scans between them.
+
+## Where this programme now stands
+
+| surface | start | now | status |
+| --- | ---: | ---: | --- |
+| `resolveAnnot` | 18,532 | ~10,700 | 42% removed; remainder refused, legitimate boundary resolution, or characterized |
+| `structIndexOfTypeName` | 6,100 | 3,798 | 38% removed; 88% of the remainder refused |
+| `$fnsig` key production | 26,065 | 26,065 | refused entire — the spelling IS the ABI identity (B246) |
+
+Fifteen conversions, every one byte-identical on the corpus. What is left is either a name used AS
+A NAME (an ABI key, a table's own name column, a node-less caller) or the two language-level changes
+B229 and B246 named — redefining what the emitter's vocabulary and the ABI key are defined over.
+Neither is a refactor.
