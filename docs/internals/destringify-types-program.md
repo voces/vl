@@ -56595,3 +56595,58 @@ no BAD cells.
 session errored (`unexpected extra argument`) behind a `2>&1` redirect and formatted nothing; the
 lint gate caught each one at RC 123. Format one file per call, and do not redirect a formatter's
 stderr away.
+
+## B263 — B-1 step 2: the union-pin selector reads the row the registry resolved at mint
+
+`unionParamPinName` scans the value-union registry for a row to pin an un-annotated parameter to,
+and skipped the wrong ones by asking the NAME two questions:
+
+```vl
+if !nameIsLitUnionType(nm) {
+  if numLitUnionAliasName(nm) == "" { return nm }
+}
+```
+
+Both predicates have the same body shape: `cUserTypes[name]` → an arena index → a structural test
+(`tyIsLitUnion`, `numLitUnionBaseName`). So each iteration re-resolved a name to a row — and the
+row was already in the loop. `unTyIx` is pushed beside `unNames` at all three mint sites with the
+comment *"B-1 step 1: resolve ONCE at mint, like `sTyIx`"*. This entry is step 2: the reader.
+
+Dual-written against the name pair: **42/42 agreement, `norow=0`.** The population is small, so the
+arm that could actually diverge was measured separately — a synthetic spelling absent from
+`cUserTypes`, where the name route falls through to `nameIsInlineLitUnion` while the arena route
+uses whatever `declTyIxOfName` resolved. That arm fired **twice** and agreed both times. Reporting
+it as "42/42" alone would have been the population error [[vl-dual-run-population]] warns about:
+the headline number is dominated by the arm that cannot diverge.
+
+The conversion keeps the name route as a fallback when `unTyIx[u] < 0` (unreachable on the corpus,
+but free), and **still returns `nm`** — `synthParamAnnots` mints an annotation from it, so the name
+is the genuine product here. Only the DECISION moved to the arena.
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean (it caught a duplicate `tyIsLitUnion` import — the module already had one); rep-fuzz
+exact; grid no BAD cells.
+
+### Where the remaining name work actually is — a census, so the next item is not picked ad hoc
+
+`nameIsLitUnionType` has **43 call sites**, which looked like the largest remaining block. Reading
+all 43 says otherwise, and the shape of the residue is the useful finding:
+
+- **Already arena-first.** `structFieldIsLitUnion` and `variantFieldIsLitUnion` both open with
+  `sFieldElemTyIxAt` / `uFieldElemTyIxAt` and fall through to the name only for an uncovered row.
+  Those calls are hint-COVERAGE residue (the 62.7% figure), not unconverted sites.
+- **An atom from an already-split spelling** — `atoms[i]`, `texts[i]`, `elem`, `core`. Name-side by
+  construction: the caller has already cut a spelling into pieces, and a piece is a string.
+- **Genuine boundary resolution** — a name arriving from source that must become a type. Correct as
+  written.
+
+So the remaining core of the goal is **one thing**: `splitUnionAtoms`, with **50 call sites**. It
+takes a union SPELLING and cuts it into atom strings, and every downstream predicate then asks a
+structural question of a piece of text. Converting it is not a site fix; it is replacing a cut of a
+spelling with a walk of `uMembers`, per consumer.
+
+That block has been refused before as "an atom count is a fact about the spelling" — an alias is
+ONE atom and MANY members. B259 showed why that refusal must be re-opened rather than inherited:
+the count is a spelling fact, but the QUESTION each consumer asks of each atom may still have a
+per-member arena answer. **Each of the 50 must be asked what it does with the atoms, not whether
+the atom list can be reproduced.** That is the queue.
