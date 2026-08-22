@@ -53164,6 +53164,51 @@ A render whose result is threaded through a RETURN into another function's decis
 match — the pattern is local by construction. That is the honest bound on this number, and it is
 the shape `monoArgTyName` has (B201), so at least one such thread is known to exist.
 
+## B203 — a decline path is not a finished site; one of them is now gone
+
+B202 listed five render-then-decide sites and called three of them finished because "the arena
+decides, the render answers only where the arena has nothing." That is the right shape for a
+LADDER, but it is not the goal's bar: a decline path still spells a type out and asks the spelling
+a question, every time it fires. So the three were re-measured, starting with the one whose comment
+already claimed the render was dead.
+
+### `emit_classify.vl:19902`, measured three ways
+
+| outcome | files |
+| --- | ---: |
+| the render ANSWERS (`structIndexOfTypeName` >= 0) | **0** |
+| the render SHORT-CIRCUITS (returns -1, blocking the rung below) | **5** |
+| gate `sn != ""` vs `anonTySpellable` on the arena — disagreements | **0** |
+
+The first number is why the call could go. **The second is why the rung could not**: that -1 is a
+`return`, and it stops the nullable-struct rung underneath from running on those 5 files. A reader
+who saw only "answers on 0 files" would have deleted the whole rung and changed 5 programs. The
+third is what let the GATE move too, so nothing renders here at all any more.
+
+### The -1 is the RIGHT answer, not merely the equal one
+
+`structIndexOfTypeName` matching where `structRowOfObjFieldSet` declined would mean the SOFTENED
+spelling matched a row the actual type does not — the render's print-widening finding a row by
+losing the very distinction that rules it out. That is #1694's defect in a different costume
+(there, a litunion alias softened to `string` and keyed a `$fnsig` nothing looks up). Answering -1
+refuses it rather than preserving it.
+
+So this is not "equivalent on the corpus, and off-corpus who knows". Off-corpus, the two ladders
+can only differ in the direction where the render is WRONG.
+
+### The rule this establishes
+
+**"The arena decides first" is a ladder, not a destringification.** A site is finished when the
+render is GONE, and getting there needs three numbers, not one:
+
+1. does the decline path ever ANSWER? (if yes, it is still deciding — not finished)
+2. is its RETURN load-bearing where it declines? (if yes, the control flow stays, only the render goes)
+3. does its GATE have a faithful arena twin? (if no, the render survives as the gate alone)
+
+Only (1) was ever measured before. B202's other two "finished" sites are now queued for the same
+three numbers, and the honest count of render-then-decide sites is **four**, not the three B202
+implied — until each decline path is driven out the same way.
+
 ## B204 — the richest site went to zero, and the `?` retry retired itself
 
 B203 gave the three numbers a decline path has to produce before its render can go, and queued the
@@ -53213,3 +53258,47 @@ B202 counted five render-then-decide sites. B203 removed one, this removes anoth
 The last row is a category this programme did not previously have a name for, and it is worth
 keeping separate from a decline. A decline is measured and refused. This is unmeasurable, and
 shipping a change to it would be shipping an unreachable arm — the thing B173 discarded two of.
+## B205 — a per-file reach counter cannot see an arm that fires SECOND
+
+B203's three numbers sent the last decline path with reach — `recordedParamPinName`'s name ladder —
+to be measured. The measurement was taken at the CONSUMER rather than at the arm: after
+`shapeNominalOfTy` declines, does `resolveShapeToNominal(tn)` return something OTHER than `tn`?
+That is the only case where the name ladder does functional work rather than passing a spelling
+through.
+
+It fires on **2** corpus files:
+
+```
+arrays/map-collapse-to-variant.vl   tn=[{meow: i32}]      -> [Cat]
+arrays/map-struct-to-struct.vl      tn=[{a: i32, b: i32}] -> [Pt]
+```
+
+### B200 called one of these rungs inert, and B200 was wrong
+
+The `Pt` row is a STRUCT the banked `structIndexOfTy` sidecar does not hold but
+`structRowOfObjFieldSet` matches. B200 swept exactly that rung, read **"9 files either way"**, and
+recorded it as an inert arm not worth carrying.
+
+The sweep counted the **first fire per file**. `arrays/map-struct-to-struct.vl` already had another
+parameter where the banked sidecar answered, so the file was counted under both builds and the
+rung's own contribution was invisible. Adding it drops `{a: i32, b: i32}` -> `Pt` off the name path
+— 2 resolutions become 1.
+
+**A per-file reach counter cannot see an arm that fires second.** This is the fourth distinct way a
+sweep in this programme has silently measured the wrong thing, and it is the most dangerous so far,
+because unlike the others it produced a plausible number rather than an obviously broken one. The
+fix that generalises: measure at the CONSUMER — "does the thing I am trying to retire still do
+work?" — not at the arm — "did my new arm fire?". The consumer question is immune to ordering.
+
+### What is left, and why it is a floor
+
+The `Cat` row is a VARIANT, and it stays on the name. Not for want of a twin: the twin is refused.
+`variantRowOfTy`'s header states it, B96 states the rule, and two fixtures pin it —
+**variants are NOMINAL**. Two variants with the same field set are different variants, so the
+structural field-set match that legitimately resolves a STRUCT would resolve the wrong variant.
+`variantIndexOfTypeName` — the name path — does perform exactly that structural match, which is
+worth flagging as a latent question about the NAME ladder rather than an argument for copying it.
+
+So `recordedParamPinName` ends at: arena for structs (banked row, then field set), name for
+variants, render retained as the ARTEFACT and as the inference-hole gate. That last leg is a
+measured floor, not a decline.
