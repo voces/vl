@@ -55637,3 +55637,40 @@ is dispositive** — and "not an object row" is dispositive, where "no row found
 
 That is a distinct category from a hint, and worth looking for elsewhere: not "can the arena answer
 this?" but "did the arena already answer this, one rung up?"
+
+## B243 — the same answer disposes of the rung below it, and a new surface is sized
+
+B242 skipped `repRowOfName` at `nulBaseStructRow` when the arena had already answered "the nullable
+inner is not an object row". The rung BELOW it takes the same answer.
+
+`structIndexOfTypeName(base)` parses `base`'s FIELD SET and matches it against the struct table. A
+non-object inner (`string`, `i32`, `boolean`, `i32[]`, `K`, a map) has no field set to match.
+Measured at the same 1,078 declines: it returns -1 on **1,078 of 1,078**, exactly as `repRowOfName`
+did.
+
+So the whole name tail goes and the function answers -1 from the arena alone — the value it would
+have reached anyway, one field-set scan later. **1,078 field-set scans removed**, on top of B242's
+593 resolutions.
+
+The 10 declines with no `TyNullable` in the rep column keep the full ladder: there the arena said
+NOTHING, and *said nothing* is not *said no*. That distinction is the whole safety argument, and it
+is the reason this pattern needs the `innerKnown` flag rather than a bare `!innerIsObj`.
+
+## `structIndexOfTypeName` is a surface in its own right — 6,100 calls
+
+`resolveAnnot` is not the only string-keyed type work in the compiler. `structIndexOfTypeName`
+takes a NAME, parses its field set, and matches the struct table: **6,100 calls over 453 corpus
+files**, a distinct surface this programme has only ever addressed one site at a time (B214, B215).
+
+It has 16 live call sites. A per-site census was attempted and **is not reported here, because the
+instrument was wrong again**: counters placed on the line BEFORE each call landed outside
+single-line function bodies and before short-circuiting `&&` guards. The tell was site
+`emit_classify:3678` reading exactly 1,735 calls across 1,735 files — one per program, i.e. a
+module-level statement executing once at load.
+
+That is the same placement failure as the guard-evaluation miscount, in a third form. **A counter
+inserted by line number is only sound when the call OWNS its line**, and neither
+`function f(x) { g(x) }` nor `if p && g(x)` does. The census is left unreported rather than
+reported wrong; sizing it needs counters placed inside each body.
+
+Measured here: corpus A/B 0 diffs, all six gates clean.
