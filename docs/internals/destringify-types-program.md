@@ -54508,3 +54508,64 @@ resolved from that very name at mint — which is the hint shape D-REPELEMTY's c
 `emit_collect` (`sNames[rsi]`, `uVariants[cvi]`, `unNames[0]`) have the same property against
 `sTyIx` / `uVarTyIx` / `unTyIx`, but total 8 firings between them. That is where the next attempt
 should go, and it should be dual-written before it is believed.
+
+## B225 — three siblings hinted, and B224's "next attempt" is withdrawn
+
+B224 closed by naming `emit_classify:4475` (`rlInternName(sNames[vsi], 1)`, 200 firings) as the next
+attempt, on the reasoning that `sTyIx[vsi]` is the struct table's own type column and therefore the
+right provenance.
+
+**That recommendation was wrong, and the code says so at the site.** The arm carries a header that
+begins "THE KIND-1 SITE IS DELIBERATELY UNHINTED, AND THE REASON IS A SIDECAR WITH TWO PRODUCERS":
+`sTyIx` is written by `sTyIxOfName` at three mint sites AND by `anonRowTyIx` — a NODE bank — at the
+anonymous-literal row. For an `#anonN` row the two answer differently BY CONSTRUCTION, the bridge
+returning -1 while the sidecar holds the literal's context-resolved `TyObj`. Measured there: 4 of
+116 entries, witness `nm=#anon1 A={a:f64,f:f64,z:string,}`.
+
+The header's closing sentence is the rule B224 violated: **"A hint must be the input the function
+WOULD have computed; a strictly better-covered sidecar is not that input."** Same column, same name,
+still not the same answer. This is the third time in this programme that a site was called
+convertible before its own header was read — and the grep-for-the-twin note already says to read it.
+
+## The three that DO convert
+
+The remaining unhinted siblings in `emit_collect` were dual-written rather than recommended:
+
+| site | name | hint column | firings | agreement |
+| --- | --- | --- | ---: | --- |
+| `:6827` | `sNames[rsi]` | `sTyIx[rsi]` | 4 | 4/4 |
+| `:6836` | `uVariants[cvi]` | `uVarTyIx[cvi]` | 3 | 3/3 |
+| `:6848` | `unNames[0]` | `unTyIx[0]` | 1 | 1/1 |
+
+**8 of 8 agree, with the column populated at every firing.** These reach the same `sTyIx` column
+that refuses at `:4475`, and the difference is which ROWS arrive: `cloRetValSlot` yields a callback's
+result struct, never an `#anonN` literal row, so the two-producer skew has nothing to bite on. The
+refusal is row-shaped, not column-shaped — which is only visible because both were measured.
+
+`rlColAt` bounds the reads. These columns pad lazily and can lag their name arrays, so a short
+column yields -1 — which is exactly the unhinted call, not a trap. That is the `fbValtype`
+discipline the emitFail note asks for at every parallel-table read.
+
+## Measurement
+
+Corpus A/B 0 diffs. `nameToTy` **-5 across 4 files**, 0 arena rows (declared names resolve to rows
+that already exist, so nothing was minting a duplicate here).
+
+The -5 against 8 firings is the memo, and it is worth stating: three of the eight names had already
+been resolved by an earlier call, so only five were parses. **The hint skips the memo lookup as
+well as the parse**, so the firing count is the upper bound on savings and the call delta is the
+real one. Any future entry quoting firings as if they were parses will overstate by the memo's hit
+rate, which B223 measured at 88% on this path.
+
+## Where the `rlInternName` surface now stands
+
+| site | firings | outcome |
+| --- | ---: | --- |
+| `emit_collect:3705` (`arrLitElemName`) | 2854 | REFUSED — 3 mechanisms, 986/2854 disagree (B224) |
+| `emit_classify:4475` (`sNames[vsi]`) | 200 | REFUSED — two-producer sidecar, 4/116 (header, confirmed here) |
+| `:6827` `:6836` `:6848` | 8 | converted (here) |
+| `:3667` `:3688` `:3705`-adjacent, `:3818` | 20 | remaining, unmeasured |
+
+The surface is effectively closed: 97.6% of it is refused with a measured cause, and what converts
+is small. That is the honest shape of this block, and it is worth more than a larger number would
+have been.
