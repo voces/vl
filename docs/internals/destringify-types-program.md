@@ -57347,3 +57347,44 @@ each needing B277's second question asked before any code is written.
 interner keys are strings by design; a source lexeme has to be resolved. Closing any of them means
 changing what the arena RECORDS — an alias-boundary column, say — not converting another call site.
 That is the shape of the next real item, and it is a design change, not a cleanup.
+
+## B281 — the same count-before-cut across the three monomorphizer annotation walks
+
+`monoAnnHasTyParam`, `monoSubstAnn` and `monoBindFromAnn` each open the same way:
+
+```vl
+const uatoms: string[] = []
+splitUnionAtoms(ann, uatoms)
+if uatoms.length > 1 { … }
+```
+
+— B278's shape exactly. The split is unconditional; the members are used only for a 2+-member
+union, so a single-member annotation builds one string holding the whole spelling and drops it.
+`monoBindFromAnn` has a second split (of `actual`) nested inside the same gate, so guarding the
+first guards both.
+
+Measured across the three sites: **1,287 single-member of 1,419 reaches (91%)**, with
+`unionMemberCount` equal to the split's length at **every one, 0 disagreements** — so the guard is
+exact here as it was at the other two families.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; **grid no BAD cells** —
+the gate that matters most for this one, since all three functions are monomorphizer machinery.
+
+**`unionMemberCount(x) == splitUnionAtoms(x).length` has now been measured at four independent
+families** — 26,209 (B272) + 35,292 (B278) + 1,419 (here) + the litunion-arm site — **63,000+
+reaches, 0 disagreements anywhere.** It is the safest substitution in this programme, and the
+remaining question at any new site is never whether the counts agree but whether the ATOMS are
+wanted.
+
+### The queued item that is analysed but not taken
+
+`registerInlineUnion` remains the largest single consumer at 8,696, refused at B277 because the
+split relocates to `isVariantBoxUnionAtoms` at the tail. Unblocking it means giving THAT function a
+span form — and its per-atom ladder is `isStructAtom`, `nameIsLitUnionType`, `nameIsMap`,
+`mapArmValueBoxable`, `nameIsArray`: nominal lookups that need real strings. A span form would save
+only the PLAIN-SCALAR atoms (B276's trick), so the win is partial, and the function's own comments
+record several invalid-wasm incidents in exactly this gate.
+
+**Analysed, priced, and not taken:** partial win, delicate function, and the arena cannot answer the
+nominal half. Recorded here so the next pass does not rediscover it as an opportunity.
