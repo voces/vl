@@ -57707,3 +57707,67 @@ it asks a REGISTRY question, because the registry is keyed on the lowering.*
 
 Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
 test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+## B290 — the residue was real after all: canon LAUNDERS a render through the AST, and `canonTyIxOf` is the row
+
+B289 corrected B288 by finding that `tyNameOf` is an AST field read, and concluded the 131,369
+`isUName` calls were boundary work on source text. **That conclusion was half right, and the half it
+missed is where the remaining render→decide lives.**
+
+The canon pass, at `typecheck.vl`:
+
+```vl
+const c = canonEmitNameTs(n.tyName, RC_ROOT, annTsOf(i))   // RENDER
+if c != n.tyName {
+  canonTyIxCol.push(nameToTy(c))                           // bank the row it denotes
+  n.tyName = c                                             // OVERWRITE the AST field
+}
+```
+
+So a rewritten node's `tyName` is **a compiler-produced spelling, not source text** — and
+`tyNameOf` hands it back indistinguishably. The render is laundered through the AST, which is why
+reading `tyNameOf`'s body was not enough to classify its callers.
+
+**And the row is banked at the same moment.** `canonTyIxOf(ix)` is `nameToTy` of the rewrite; the
+un-rewritten case keeps `nodeTyIxOf(ix)`. `annRowOfNode(ix)` is that pair.
+
+### The measurement that closes it
+
+B288 tried `unRowOfCanon(nodeTyIxOf(ix))` and got 60 residual disagreements, recorded as "canon
+softening, by design". **Those 60 were reading the wrong row** — the pre-canon recorded type instead
+of the row canon banked for the name it wrote. Split by `canonRewroteNode` and reading the right one
+of the two:
+
+| subset | reaches | disagreements |
+| --- | --- | --- |
+| canon rewrote the spelling | 1,321 | **0** |
+| source spelling, untouched | 68,842 | **0** |
+
+**70,163 reaches, exact.** The "by design" refusal in B288 was a measurement artefact of reading
+`nodeTyIxOf` where `canonTyIxOf` was the right column — the fourth conversion shape (ROUTE THE
+COLUMN) applied to the question B288 had already framed correctly.
+
+### The conversion
+
+Both hot sites now decide off the row:
+
+```vl
+const pn = tyNameOf(p.parType)
+if unRowOfCanon(annRowOfNode(p.parType)) >= 0 { return pn }
+```
+
+`isUName` is a linear scan over `unNames` comparing **strings**; `unRowOfCanon` asks the same
+question of `unTyIx` comparing **interned structural ids**. The NAME is still what these functions
+RETURN — their consumers are name-keyed — but the decision no longer touches it.
+**70,163 string-scan decisions per corpus pass become id comparisons.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline rebuilt from the current master commit — the
+first run used one built before the previous merge); `deno task test` 2,225; ci-native 2,242;
+fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The lesson, and it is the third time in this programme.** B258→B259, B284→B285, and now
+B288→B290: each refusal was overturned by measuring the thing it asserted. The pattern in all three
+is that the refusal was reasoned from a plausible mechanism — "an atom count is a spelling fact",
+"the scanner's contract forbids it", "canon softening is by design" — and each time the mechanism
+was real but was not what the site actually did. **A refusal that names a mechanism still has to
+name the MEASUREMENT that ties the mechanism to the site.**
