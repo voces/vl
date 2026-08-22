@@ -53532,3 +53532,60 @@ sites (B198), and a render still produces the pinned annotation ARTEFACT (B206) 
 instance KEY (B207), both of which are names by design and are consumed as keys rather than
 re-parsed. B208 is the standing reason the last of those cannot simply be structural: a name can
 carry NOMINAL identity that structure does not recover.
+
+## B211 — the closure-element predicate, and three attempts at one partition
+
+First entry off B210's corrected census: the four consumers of `nameIsClosureElem(cen)` over an
+array's element (three `arrLit*` classifiers in `emit_classify.vl`, plus `emit_collect.vl:6780`,
+which the census ALSO missed because it nests the render inline — `f(render(x))` rather than
+`const x = render(...)`). **That is a third blind spot in the same instrument**, and it is recorded
+here rather than in a later correction.
+
+The conversion took three attempts, and the two failures are more instructive than the success.
+
+### Attempt 1 — the paraphrase (8 disagreements, one broken test, +83% on a module)
+
+`arrElemIsClosureTy` as "is the element a `TyFunc`, or a nullable one". Both directions disagreed:
+
+| case | name | arena |
+| --- | --- | --- |
+| `cen=[]`, 6 files | false | true |
+| `cen=[((i32)=>f32)[]\|i32]`, 2 files | true | false |
+
+Shipping it broke `functions/error-generic-fn-value-partial-annotation-no-context.vl`: the expected
+"cannot take the generic function `npadd` as a value" became "ref array literal with no interned
+element type". **An empty render is not a missing answer — it is the checker DECLINING to name the
+element, which is precisely the condition that error reports.** The arena knows the KIND and cannot
+know the decline, so the emptiness gate stays on the render.
+
+The other direction was worse than wrong, it was *plausible*: the name's last leg is
+`strContains(name, "=>")`, so a union arm containing an arrow was claimed as a closure element.
+Refusing it kept the program CORRECT — same output — while the module grew **716 -> 1310 bytes**.
+The element still reps as a ref; the narrower answer just sent it down a longer lowering. A
+correctness check alone would have passed this.
+
+### Attempt 2 — faithful, but one arm short (11 disagreements)
+
+Porting `strContains("=>")` as a deep `tyMentionsFunc` walk, and `nameIsBraceSpanEnds` as `TyObj`.
+Three NEW disagreements appeared, all `{[string]:(i32)=>i32}`: **`nameIsBraceSpanEnds` spans BOTH
+brace forms**, an object `{a:…}` and a map `{[k]:v}`. A map whose value is a closure declines there
+exactly as an object with a closure field does.
+
+### Attempt 3 — 0 disagreements, 63 files reach
+
+Emptiness gate on the render; `TyFunc` / nullable-`TyFunc` accept; `TyObj` AND `TyMap` decline;
+otherwise a depth-bounded `tyMentionsFunc`. Corpus A/B: 0 diffs.
+
+### The comment that disagrees with its own function
+
+`emit_collect.vl:6780` justifies its call as *"`nameIsClosureElem` and not a `=>` substring: an
+element that merely CONTAINS a closure … must not force the pair."* The function's last leg **is** a
+`=>` substring test. The comment states the intent; the implementation is looser, and attempt 1
+measured the gap at 2 corpus files. The port copies the implementation, per B193 — but the
+divergence is worth its own note, because a reader takes that comment as a specification.
+
+### The method, updated
+
+B203 gave three numbers for retiring a decline path. This adds a fourth check for replacing a
+PREDICATE: **compare module SIZE, not just correctness.** Attempt 1 produced identical output on
+every corpus file and was still wrong, and the only channel that said so was 716 vs 1310 bytes.
