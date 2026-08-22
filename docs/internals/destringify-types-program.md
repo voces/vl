@@ -57302,3 +57302,48 @@ none of which changed a single answer on any of 2,075 corpus files.
 broken.** B274's census produced a plausible ranked table, drove three good conversions, and was
 wrong about the biggest item on it by a factor of 238. What exposed it was re-running the census at
 a finer key after the top entries were converted — not doubting it, but *repeating* it.
+
+## B280 — the niche-nullable list kind, and a consolidated status of the programme
+
+`nulElemListAtomKind` cuts a list's ELEMENT spelling into members to answer which of five scalar
+backings the list rides. Its members are only ever COMPARED — the "second question" of B277 comes
+back clean, nothing downstream consumes the list — so it converts to a span walk:
+`spanEqAt` for `"null"` / `"boolean"` / `"string"`, one character for the quoted-leaf test, and
+`unionMemberCount` for the `< 2` gate.
+
+**Only the one-member litunion-ALIAS arm still materializes**, because `nameIsLitUnionType` is a
+`cUserTypes` lookup and needs a real string. That is the correct residue: it is a nominal question.
+
+Dual-written: **42,026 reaches, 0 disagreements** (the function is called 42k times; 2,099 of those
+reached the split, the rest exit at the `length < 5` / `elem == ""` guards). **2,099 splits removed.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+---
+
+### STATUS: what is converted, what is refused, and what is left
+
+**The render→decide class is CLOSED.** Every function that turns an arena index into a `string` and
+whose result reaches a decision has been converted or classified. What still renders does so for one
+of three reasons, each documented and each a deliberate end state:
+
+| survivor | why it is not a defect |
+| --- | --- |
+| `repCanonKey`, `repElemKey`, `repMvValKey`, `rtInternKeyOf` | INTERNER KEYS — a key is an identity token, built structurally from the arena |
+| `tyToNominalName*`, `structNameOfTy`, `shapeNominalOfTy`, `unionAliasDeclNameOfTy`, `litUnionInlineNameOfTy` | NOMINAL IDENTITY — the name IS the answer; refused six times, most sharply at B266 (an alias and the set it denotes are the same row and different answers) |
+| `tsToName`, `declTyIxOfName`'s rungs, `primTyOfName`'s lexeme callers | BOUNDARY RESOLUTION — a name arriving from SOURCE must become a type |
+
+**The spelling-PARSE axis is down 87%.** `splitUnionAtoms` went 126,675 → ~17,000 calls and
+180,866 → ~32,000 atom allocations across seven conversions and two measured refusals, without one
+answer changing on any of 2,075 corpus files.
+
+**What is left, and it is a different kind of work.** The residue is boundary parsing done
+wastefully rather than type work done on renders — `registerInlineUnion` (8,696, REFUSED at B277
+with the number: the split relocates, the win is 793), then a tail of sites at 1,300 and below,
+each needing B277's second question asked before any code is written.
+
+**The three standing refusals are structural, not effort.** Nominal identity lives in the name;
+interner keys are strings by design; a source lexeme has to be resolved. Closing any of them means
+changing what the arena RECORDS — an alias-boundary column, say — not converting another call site.
+That is the shape of the next real item, and it is a design change, not a cleanup.
