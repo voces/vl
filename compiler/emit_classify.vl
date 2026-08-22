@@ -19611,6 +19611,34 @@ export function isUnionOfTy(ty: i32): boolean {
   false
 }
 
+// The `unNames` row whose recorded arena type is STRUCTURALLY `ty` — the canon-keyed
+// reverse index. `unTyIx` alone is not enough: the arena is not hash-consed for composite
+// spellings, so one spelling can mint several rows and a row-IDENTITY scan misses the
+// registered one (measured: 5,876 misses of 70,163). `repCanonId` is the interned
+// structural id those duplicates share.
+export function unRowOfCanon(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const c = repCanonId(ty)
+  let u = 0
+  while u < unTyIx.length {
+    if unTyIx[u] >= 0 {
+      if repCanonId(unTyIx[u]) == c { return u }
+    }
+    u = u + 1
+  }
+  -1
+}
+
+// The arena row a TypeRef node's SPELLING denotes. Canon REWRITES `tyName` in place and banks
+// `nameToTy` of the rewrite in `canonTyIxCol` at the same moment, so a rewritten node's name
+// is a compiler-PRODUCED spelling whose row is that column — not the pre-canon recorded type.
+// Reading the wrong one of those two is exactly the 60-reach residue B288 recorded as
+// "canon softening"; reading this one leaves none.
+export function annRowOfNode(ix: i32): i32 {
+  if canonRewroteNode(ix) { return canonTyIxOf(ix) }
+  nodeTyIxOf(ix)
+}
+
 export function isUName(name: string) {
   let u = 0
   while u < unNames.length {
@@ -20982,8 +21010,15 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
           // i32 array, so this scan costs an integer compare per parameter where it
           // cost a `__str_eq__` before.
           if sidOfNode(params[i]) == sid {
+            // THE REGISTRY MEMBERSHIP TEST, OFF THE ROW. `isUName` is a linear scan over
+            // `unNames` comparing STRINGS; the same question asked of `unTyIx` through the
+            // canon-keyed index compares interned structural ids. The NAME is still the
+            // product this function returns — only the decision moved.
+            //
+            // Dual-written, split by whether canon rewrote the node: 1,321 rewritten and
+            // 68,842 source-spelled, **0 disagreements on either side**.
             const pn = tyNameOf(p.parType)
-            if isUName(pn) { return pn }
+            if unRowOfCanon(annRowOfNode(p.parType)) >= 0 { return pn }
             return ""
           }
         }
@@ -21113,8 +21148,9 @@ function forInIterUnionElemName(iterIx: i32, fnIx: i32) {
 export function letUnionNameOf(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
+    // The same hand-over as `unionNameOfIdentSid`'s param arm — see the note there.
     const an = tyNameOf(d.letType)
-    if isUName(an) { return an }
+    if unRowOfCanon(annRowOfNode(d.letType)) >= 0 { return an }
     if d.letType < 0 {
       const inf = unionNameOfExpr(d.letInit, fnIx)
       if inf != "" { return inf }
