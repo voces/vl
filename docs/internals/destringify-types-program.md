@@ -56650,3 +56650,56 @@ ONE atom and MANY members. B259 showed why that refusal must be re-opened rather
 the count is a spelling fact, but the QUESTION each consumer asks of each atom may still have a
 per-member arena answer. **Each of the 50 must be asked what it does with the atoms, not whether
 the atom list can be reproduced.** That is the queue.
+
+## B264 — the atom block opens: `valueAtomKind` has an arena twin, and the wrapper was the whole residue
+
+B263's census named `splitUnionAtoms` (50 sites) as the remaining core, and the largest consumer
+by reach is `isValueUnionName` — **43 callers** — which decides whether the emitter BOXES a union.
+Its body cuts a spelling into atoms and asks `valueAtomKind` of each; `valueAtomKind` itself is the
+most-used name predicate in the compiler, at **72 call sites**.
+
+The standing refusal was "an atom count is a fact about the spelling": an alias arm is ONE atom and
+MANY members. Checking the mechanism rather than inheriting the slogan, the arena turns out to
+**flatten only when EVERY member is a literal union** (`annUnionTy`'s `allLit` guard) — and the
+comment there says the mixed shape is deliberately preserved, because
+`(() => K0 | boolean) | null` emits invalid wasm the moment `K0`'s literals become sibling members.
+So for exactly the mixed unions this predicate judges, the alias boundary IS in the arena.
+
+`valueRowKind(ty)` mirrors `valueAtomKind` arm for arm over rows — the seven scalars, the five list
+backings, the litunion-array and niche-nullable-element lists, the closure — and returns **-2 for
+"the arena declines"**, kept distinct from `valueAtomKind`'s own -1 ("not a value atom") so a
+decline can never be read as a negative answer. `isValueUnionTyOr` walks `uMembers` with it.
+
+Dual-written at `registerValueUnionNameTy`, which holds the name and the row:
+
+| | first cut | after the wrapper arm |
+| --- | --- | --- |
+| answered, agreeing | 276 | **460** |
+| **disagreeing** | **0** | **0** |
+| declined | 185 | **1** |
+
+**Bucketing the 185 declines is what finished this**, and it took a histogram rather than a new
+instrument — the residue as a NUMBER was 40% and looked like a wall. By cause: `mem=0` (the member
+walk never declined), `neg=0`, `notu=1`, and **`nul=184`** — the row was a `TyNullable`.
+
+That is the `T | null` spelling: a WRAPPER in the arena, TWO ATOMS in the text. Not a count to work
+around — it is precisely case (b) of the name predicate, *"exactly one non-null NUMERIC atom plus
+`null`"*. Supplying the null as a flag instead of a member and reusing the same counting walk
+converted all 184. **The residue was never the union logic; it was one spelling shape.**
+
+The conversion at the mint site routes THROUGH the gate: the arena decides, the name answers the
+declines, and `nameIsLitUnionArmValueUnion` still runs unchanged.
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells. The compiler GREW (1,286,500 → 1,287,817): the twin
+is new code, and it pays off as callers route to it.
+
+**A stale-artifact catch worth recording.** The first A/B run reported 2 differing rows against
+`/home/verit/vl/build/vl-compiler.wasm`. That artifact is untracked and was stale; against a
+compiler actually built from master the answer is 0. **Never baseline an A/B on the checked-out
+`build/` artifact** — build the baseline from the commit. See [[vl-stale-build-artifact]].
+
+**What this unlocks.** The twin now exists, so the remaining 42 `isValueUnionName` callers are a
+per-caller question of "does this one hold a row?", not a blocked class. Same for `valueAtomKind`'s
+72 — `valueRowKind` is the twin, and every site whose atom came from a member rather than a cut can
+route. That is the queue.

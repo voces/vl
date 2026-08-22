@@ -906,6 +906,7 @@ let asgDeclFrames: i32[] = []
 // The scope-chain DEPTH of the innermost binding of `name`, or -1 when undeclared.
 // `lookup` is the same walk reading the type out; this one reads the frame it came
 // from, which is what the narrowing bank validates its entries against.
+
 function lookupDepth(name: string) {
   let i = T.scopes.length - 1
   while i >= 0 {
@@ -25276,6 +25277,132 @@ export function valueAtomKind(name: string) {
   // name (none of which carry a top-level `=>`) never reaches it.
   if nameIsFuncTypeAtom(name) { return 11 }
   -1
+}
+
+// The VALUE-ATOM KIND of an arena ROW — `valueAtomKind`'s twin, arm for arm, for the
+// callers that hold a type instead of a piece of a spelling. Codes are identical and
+// append-only (each doubles as a union tag offset).
+//
+// `-2` means THE ARENA DECLINES — a shape this twin does not claim — and is distinct from
+// `-1`, which is `valueAtomKind`'s own "not a value atom". A caller must treat -2 as "ask
+// the name", never as a negative answer.
+export function valueRowKind(ty: i32): i32 {
+  if ty < 0 { return -2 }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const pn = t.primName
+    if pn == "i32" { return 0 }
+    if pn == "boolean" { return 1 }
+    if pn == "string" { return 2 }
+    if pn == "i64" { return 3 }
+    if pn == "f64" { return 4 }
+    if pn == "f32" { return 5 }
+    if pn == "null" { return 6 }
+    return -1 // void / never — not a value atom
+  }
+  // A closure member rides the box's anyref `value` directly (kind 11).
+  if t is TyFunc { return 11 }
+  if t is TyArray { return valueRowListKind(t.aElem) }
+  // A struct / map is not a value atom; a UNION row here is an alias ARM (`K0` in
+  // `K0 | i64`), which `valueAtomKind` answers -1 for by name as well.
+  if t is TyObj { return -1 }
+  if t is TyMap { return -1 }
+  if t is TyLit { return -1 }
+  if t is TyUnion { return -1 }
+  -2
+}
+
+// The LIST arms of `valueAtomKind`, over the element ROW rather than the cut spelling.
+function valueRowListKind(elem: i32): i32 {
+  if elem < 0 { return -2 }
+  const e = T.tys[elem]
+  if e is TyPrim {
+    const en = e.primName
+    if en == "i32" || en == "boolean" { return 7 }
+    if en == "f64" { return 8 }
+    if en == "string" { return 9 }
+    if en == "i64" { return 10 }
+    if en == "f32" { return 12 }
+    return -1
+  }
+  // A literal-union ELEMENT list shares the `i32[]` backing (its members are interned
+  // atom ids) — `litUnionArrayElemOf`'s arm.
+  if tyIsLitUnion(elem) { return 7 }
+  // A NICHE-nullable scalar-element list (`(boolean | null)[]`, `(string | null)[]`,
+  // `(K | null)[]`, `("a" | "b" | null)[]`): the null rides IN the element rep, so the
+  // list IS its leaf backing's atom. `nulElemListAtomKind`'s arms.
+  if e is TyNullable { return valueRowNulElemKind(e.nInner) }
+  if e is TyUnion { return valueRowNulElemKind(unionSoleNonNullMember(elem)) }
+  -2
+}
+
+// The non-null leaf of a niche-nullable list element -> the backing's atom kind.
+function valueRowNulElemKind(inner: i32): i32 {
+  if inner < 0 { return -2 }
+  const it = T.tys[inner]
+  if it is TyPrim {
+    if it.primName == "boolean" { return 7 }
+    if it.primName == "string" { return 9 }
+    return -2
+  }
+  if tyIsLitUnion(inner) { return 7 }
+  -2
+}
+
+// `isValueUnionName`'s twin over a ROW. Declines (-1 => "ask the name") whenever any
+// member row declines, so a shape this walk does not claim never manufactures an answer.
+// Returns 1 = yes, 0 = no, -1 = decline.
+export function isValueUnionTyOr(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyUnion { return valueUnionVerdict(t.uMembers, false) }
+  // `T | null` is a `TyNullable` WRAPPER in the arena and TWO ATOMS in the spelling. That
+  // is not a count mismatch to work around — it is the whole of the name predicate's case
+  // (b), "exactly one non-null NUMERIC atom plus null", so the wrapper carries the same
+  // verdict once the null is supplied as a flag instead of a member.
+  if t is TyNullable {
+    const inner = t.nInner
+    if inner < 0 { return -1 }
+    const it = T.tys[inner]
+    if it is TyUnion { return valueUnionVerdict(it.uMembers, true) }
+    const one: i32[] = [inner]
+    return valueUnionVerdict(one, true)
+  }
+  -1
+}
+
+// The counting half of `isValueUnionName`, over member ROWS. `nullSeen` supplies the null
+// a `TyNullable` spells as a wrapper rather than a member. -1 = decline, 1 = yes, 0 = no.
+function valueUnionVerdict(ms: i32[], nullSeen: boolean): i32 {
+  let nonNull = 0
+  let hasNull = nullSeen
+  let soloKind = -1
+  let i = 0
+  while i < ms.length {
+    const k = valueRowKind(ms[i])
+    if k == -2 { return -1 }
+    if k < 0 { return 0 }
+    if k == 6 {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      soloKind = k
+    }
+    i = i + 1
+  }
+  // `unionMemberCount(name) < 2` — the name predicate's first gate, in atoms.
+  let atoms = nonNull
+  if hasNull { atoms = atoms + 1 }
+  if atoms < 2 { return 0 }
+  if nonNull >= 2 { return 1 }
+  if nonNull == 1 && hasNull {
+    // Only a NUMERIC scalar boxes with null; boolean|null / string|null are niches.
+    if soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5 {
+      return 1
+    }
+    return 0
+  }
+  0
 }
 
 // True if `name` is a VALUE union this emitter boxes: 2+ top-level atoms, every
