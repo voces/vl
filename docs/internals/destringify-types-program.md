@@ -57250,3 +57250,55 @@ which would have cost minutes and did cost a full build-and-gate cycle here.
 
 Sites remaining on the census below this one are all under 2,100 and each needs the same second
 question asked first.
+
+## B278 — the census was wrong about its own top entry, because it counted FUNCTIONS not SITES
+
+B274's census put `internShapeDeepTy` at 149 splits, near the bottom. Re-running it with one counter
+per **call site** instead of one per **function** puts it at **35,441 — 67% of everything left.**
+
+The earlier census inserted one counter per function and stopped at the first `splitUnionAtoms` it
+found in each. `internShapeDeepTy` has three. **This is the "one build, one question" shape from the
+probe memo, in its per-site form: a per-function counter answers for the first site and silently
+reports zero for the rest.** The corrected instrument is mechanical — walk every file, insert a
+uniquely-named counter above every call that OWNS ITS LINE, skip and REPORT the guarded ones (3 of
+39 here, where a counter on the preceding line would count reaches instead of calls).
+
+What it found, at the two hot sites:
+
+```vl
+const uArms: string[] = []
+splitUnionAtoms(nm, uArms)
+if uArms.length > 1 { internShapeArms(nm, uArms)  return 0 }
+```
+
+The split is unconditional; its result is used only when the name has 2+ top-level members. So a
+single-member name — which is most names, this being a recursive descent over every annotation and
+sub-part — built one string containing the whole name and threw it away.
+
+| | multi | single |
+| --- | --- | --- |
+| paren-free branch | 1,150 | **32,431** |
+| paren branch | 236 | **1,475** |
+
+`unionMemberCount(nm)` equalled the split's length at all **35,292** reaches, **0 disagreements** —
+so the guard is exact. **33,906 splits removed, 96% of that function's total.**
+
+**Total `splitUnionAtoms` calls 52,964 → 19,058: −64% in one change.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+### The axis, end to end
+
+| | calls | atom strings allocated |
+| --- | --- | --- |
+| before B273 | 126,675 | 180,866 |
+| now | **19,058** | **34,223** |
+
+**−85% of the calls and −81% of the allocations**, across six conversions and one measured refusal,
+none of which changed a single answer on any of 2,075 corpus files.
+
+**And the transferable warning: an instrument that aggregates by the wrong key does not look
+broken.** B274's census produced a plausible ranked table, drove three good conversions, and was
+wrong about the biggest item on it by a factor of 238. What exposed it was re-running the census at
+a finer key after the top entries were converted — not doubting it, but *repeating* it.
