@@ -54908,3 +54908,64 @@ hint it tested and false of the site. **A single wrong hint across a multi-arm r
 disagreement rate that looks like a property of the site.** It is a property of the test. Any
 refusal recorded from a one-hint test over a multi-arm function should be re-opened the same way
 this one was.
+
+## B231 — the struct arm converts too, once the two row classes that cannot are named
+
+B230 hinted the two arms that measured 100% and left the struct arm declining at 97.6% — 20
+disagreements in 833. Those 20 are not noise, and naming them takes the arm to zero.
+
+## The 20, identified
+
+Every one is `PView` / `AView` / `FView`, all rendering `{base: i32, length: i32}`. In the corpus
+they are declared:
+
+```vl
+type PView = new { base: i32, length: i32 }
+```
+
+**Newtypes.** `newtype-design.md` §3: a brand is a SECOND arena index over the same `Ty` value,
+erased before the emitter runs, so no structural reader can tell a brand from its base. The
+`nwTyIxs`/`nwNames` sidecar is the one place the distinction survives — which `emit_classify`
+already relies on at `letRefListSlot`, declining `annBareRefArrSlot` on exactly this class with a
+`tyIsNewtypeBrand` guard (B123 declined a sibling site on the same `QView[]` row).
+
+## The index test reads FALSE here, and that is the point
+
+The obvious guard — `tyIsNewtypeBrand(sTyIx[si])` — was tried first and changed nothing: still 20.
+**`sTyIx[si]` holds the UNBRANDED base**, not the brand index, so an index-side test cannot see it.
+The row's NAME is the brand and its TYPE column is the base, so only a name-side reader answers.
+
+`nameIsNewtypeBrand(nm)` is that reader — the same `nwNames` sidecar, scanned by name instead of by
+index. With it the struct arm is **813 of 813**.
+
+That the two halves of one row disagree about their own nominality is worth stating plainly: at this
+site `sNames[si]` is nominal and `sTyIx[si]` is structural, and a hint built from either alone is
+wrong for the rows where they diverge.
+
+## The site, after three PRs
+
+| arm | agree | differ | outcome |
+| --- | ---: | ---: | --- |
+| struct → `sTyIx[si]` | **813** | **0** | hinted (B231, two exclusions) |
+| variant → `unTyIx[u]` | **112** | **0** | hinted (B230) |
+| union element | **32** | **0** | hinted (B230) |
+| map element | 658 | 162 | declines |
+| closure element | 220 | 12 | declines |
+| nested-list bucket | — | — | unhinted BY DESIGN |
+
+**957 of 2852 firings** now resolve from a row. B224 refused all 2852 on one measurement.
+
+Measured: corpus A/B 0 diffs; `resolveAnnot` **-813 across 130 files**, exactly the agreeing
+firings.
+
+## What is left here
+
+The map arm (162 of 820) and the closure arm (12 of 232) still decline, and their residues are
+named in B230 — the whole `{[K]:V}` spelling against the recorded element, and an un-widened literal
+union against its base. Both are the same SHAPE of problem the struct arm just had: a class of rows
+where the name and the type answer different questions. Whether either has a sidecar that separates
+them, as `nwNames` did here, has not been measured.
+
+The lesson generalises past this site: **a decline at 95-98% is usually one identifiable row class,
+not a fundamental limit.** Three refusals in this programme have now been reopened and converted by
+naming the class — B215's canon rung, B230's two arms, and this one.
