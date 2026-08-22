@@ -53733,3 +53733,45 @@ hand-built witnesses for the `ifExprRefSlot` one (an if-EXPRESSION whose THEN ar
 `pendingStructIdx` seed) that compile, run correctly, and still miss it. Their 0-disagreement
 readings are therefore VACUOUS, and converting either would ship an inert arm. Recorded rather than
 converted.
+
+## B214 — the empty-array-literal element name, and `structIndexOfTypeName` leaves `emit_collect`
+
+`emit_collect.vl:1860` (B210 census) resolves the ELEMENT name of an empty array literal
+(`const xs: P[] = []`) from its render: take `nodeArrayElemName`, hand the spelling to
+`structIndexOfTypeName` to re-parse its field set against the struct table, then read the matched
+row's declared name back out.
+
+`arrElemNominalOfTy` peels the `TyArray` and asks `shapeNominalOfTy` — the ladder B200/B205/B206
+built and corrected — of the ELEMENT TYPE. Only the resulting NAME is a string, and that name is
+the artefact the block exists to produce: the ref-list machinery (`nameIsRefArray`, `rlSlotByName`)
+keys on the declared spelling.
+
+Lockstep on the FINAL `synName` rather than the row index — B213's rule, applied without having to
+be taught it again this time: **0 disagreements**. The arena arm answers on **1** corpus file
+(`arrays/infer-build-struct.vl`, `{v: i32}` -> `P`), which is what makes the 0 a replacement rather
+than an inert arm. A/B: 0 diffs.
+
+**`structIndexOfTypeName` now has no caller in `emit_collect.vl` at all** — the import is gone. It
+entered this programme with 32 render-fed call sites across two consumers (B168), and the count in
+this module is now zero.
+
+### Standing census
+
+| site | state |
+| --- | --- |
+| `emit_classify.vl:7525`, `:19902` | gone (B203, B204) |
+| `emit_rewrite.vl:985` | gone (B206) |
+| `emit_mono.vl:226` | gone (B207) |
+| `typecheck.vl:20299` | gone (B209) |
+| `emit_classify.vl:14035`/`:14120`/`:14224`/`:14269` + `emit_collect.vl:6780` | gone (B211) |
+| `emit_rewrite.vl:524` map-field arm | gone (B212) |
+| `emit_classify.vl:11566` | gone (B213) |
+| `emit_collect.vl:1860` | **gone (here)** |
+| `emit_classify.vl:8289`, `:20101` | UNREACHED — 0 files, verified probes, 3 witnesses (B213) |
+| `emit_classify.vl:19943` | not yet measured |
+| `ctx` litunion + union arms | REFUSED with named causes (B212) |
+| `ctx` nominalization | REFUSED (B208) |
+
+What is left is one unmeasured site, two unreachable ones, and three refusals each carrying a
+witness and a mechanism. That is a different shape of "remaining" from the one this programme
+started with, where every entry was simply unexamined.
