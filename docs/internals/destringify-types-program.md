@@ -56739,3 +56739,57 @@ lint clean; rep-fuzz exact; grid no BAD cells.
 one that bites — a value-union arm inserted at the wrong rung claims inputs an earlier arm owned.
 Adding it at the tail of an already-arena-first classifier is the safe default, because the arena
 ladder and the name ladder then agree on precedence by construction.
+
+## B266 — REFUSAL, and the finding is bigger than the site: `isValueUnionName` means two different things
+
+Routing the next consumer of B264's twin — `internShapeDeepTy(nm, ty)`, which is handed a name AND
+the row for it — produced the first disagreements of this block:
+
+```
+ok=5852  bad=8  decline=35662   (neg=826, wantyes=2)
+```
+
+The declines are almost free (only **2** of 35,662 were cases where the name said yes, so declining
+changes nothing there). The eight disagreements are the finding, and a witness settles what they
+are:
+
+```
+nm=[Cell] name=N row=yes ty=[Cell]
+nm=[UL]   name=N row=yes ty=[UL]
+```
+
+**Not drift.** `nm` and `ty` are in sync — the same type, spelled the same. `Cell` and `UL` are
+DECLARED ALIASES of value unions. `isValueUnionName("Cell")` is false because `unionMemberCount`
+sees ONE atom: the name is an identifier, not a `|` spelling. The arena, correctly, sees through
+the alias to the union underneath.
+
+So the predicate is **overloaded**, and its name hides which question a caller is asking:
+
+| question | answer for `Cell` |
+| --- | --- |
+| *is this SPELLING an inline value union?* | **no** — it is a single identifier |
+| *is this TYPE a value union?* | **yes** |
+
+`internShapeDeepTy` needs the FIRST. Its arm registers box reps for a union LEAF **spelling** while
+walking a name; a declared alias is registered by the declaration collector instead, so answering
+"yes" here would double-register. `isValueUnionTyOr` answers the SECOND and always will — "was this
+row reached through an alias" is not a fact about the row. Same family as the standing nominal
+refusal: the alias boundary lives in the name.
+
+**REFUSED**, and not for lack of a twin.
+
+### Re-checking the two sites already shipped, because this hazard is invisible to a clean A/B
+
+- **B264 (`registerValueUnionNameTy`)** is safe *structurally*, not just empirically: it opens with
+  `if isUName(name) { return 0 }`, and an alias declared as a union IS a `U` name, so an alias never
+  reaches the predicate at all. That is why its dual-write read 460/0.
+- **B265 (`fieldCodeOfTy`'s code-16 arm)** measured 172/0, but the corpus may simply not contain a
+  field typed with a value-union alias — the population trap. Checked directly with a fixture
+  (`type Cell = i32 | string` / `type Box = { c: Cell }`) compiled by the pre-#1760 and post-#1760
+  compilers: **byte-identical output**. The alias resolves before that tail arm is reached.
+
+**The rule this adds to the queue.** Before routing any of the remaining 41 callers, establish
+WHICH question it asks. A caller walking a SPELLING (peeling parens, splitting on `|`, recursing on
+a name) almost always means the spelling question, and the arena twin is the wrong answer for it —
+not a better one. A caller holding a type and classifying it means the type question, and the twin
+is exact. The two are indistinguishable at the call site; only the surrounding walk says which.
