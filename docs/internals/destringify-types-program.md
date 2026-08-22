@@ -56189,3 +56189,47 @@ The `TyObj` row is the one with a known, built answer waiting (`fieldBaseStructR
 structural hybrid). The other three are the genuine remainder.
 
 Measured: corpus A/B 0 diffs, all six gates clean.
+
+## B255 — the struct return arm is REFUSED, and the corpus could not see why
+
+B254 closed the ref-array decline class and named `TyObj` as "the one with a known, built answer
+waiting" — B253's exact-then-structural row lookup. Built it. Dual-written: **45 agree, 0
+disagree.** Corpus A/B: **0 diffs over 2075 files.**
+
+**It is wrong, and `deno task test` caught it.**
+
+`tests/playground_lsp_wasm_test.ts` compiles a program whose closure result is
+`{f: (i32 | null)[] | null}` — a struct with a nullable ref-list field, deliberately OUTSIDE the
+closure-result lowerable set — and asserts an EMIT-STAGE FAILURE with a positioned diagnostic. With
+the struct arm, `retTokOfTy` answers where `annRetKind` returns `""`, `sigKeyOfTy` produces a key
+instead of `""`, and the program COMPILES. Bytes where a loud reject was the contract.
+
+## Why 45 of 45 and 0 of 2075 were both true and both useless
+
+The dual-write compared the arena token to the name token **and they never disagreed** — because in
+every corpus reach the name arm ANSWERED. The failure needs a reach where the name arm DECLINES and
+the arena does not, and the corpus contains no such program. The test file does.
+
+That is the dual-run-population rule exactly: **agreement is not evidence unless the population
+could contain the disagreement.** A 45/45 with no declining reach in it measures nothing about
+declining reaches.
+
+And it is D-MAPNODETY's rule arriving somewhere new: *an arena leg that answers where the name
+bridge does not SKIPS the reject the name bridge exists to raise.* That note was written about a
+MINT path; this is a KEY path, and the hazard is identical — `sigKeyOfTy` returning "" is not a
+failure to answer, it is the answer "this signature is not in the value-call ABI".
+
+## The rule this adds
+
+Before hinting a site, ask what the name path's DECLINE means. Two possibilities, and only one is
+safe:
+
+* decline = "I could not resolve this" → an arena answer is a coverage win;
+* decline = **"this is not allowed"** → an arena answer silently removes a guard.
+
+At `annRetKind` the empty string is the second kind. The struct arm stays on the name, and the
+`TyFunc` / `TyNullable` / `TyUnion` arms stay for the same reason — all four are shapes the ABI
+deliberately refuses, not shapes the classifier failed to see.
+
+The ref-array arm (B254) is safe under this rule and stays: `rlSlotOfTy` answers only where a slot
+was actually interned, so it never manufactures a key for an un-interned shape.
