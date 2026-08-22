@@ -57522,3 +57522,41 @@ says is impossible is actually attempted anywhere.
 `nameIsI32ListArray` (163,407) is the same shape one level deeper — its element goes to
 `nameIsI32Array`, which is now `arrElemIs || arrElemIs || nameIsNulBoolList`, and only the last
 still needs a string. That is the next site, and it is a conversion, not a design change.
+
+## B286 — the necessary condition again, and a dual-write that caught a dropped arm
+
+`nameIsI32ListArray` (163,407 reaches) cut the element out to ask `nameIsI32Array(elem)`. Every one
+of that predicate's FOUR arms — `i32[]`, `boolean[]`, a litunion array, a `(K | null)[]` — requires
+a trailing `[]`, and the last two reach `listElemNameOf`, which returns "" for a non-array. So
+**`name` must be `X[][]`**, which is four character reads and no cut (B270's shape).
+
+Behind that guard the two cheap arms are asked in place (`arrElemIsArrayOf`), and anything that
+passes the guard and fails both falls through to **the full predicate, slice and all**.
+
+**That fallback is the point of this entry.** The first attempt reproduced the predicate instead of
+delegating to it — and reproduced only two of its four arms. The dual-write read **ok=163,215,
+bad=192**: the litunion-array and `(K | null)[]` cases. Delegating cannot drift; re-deriving can,
+and did, silently, in a function whose four arms are spread over 16 lines of commentary.
+
+Re-measured after the fix: **163,407 reaches, 0 disagreements.**
+
+With B285's `nameIsMapArray`, and counting the cascade (a rejected guard also skips the nested
+`listElemNameOf` inside the arms), **`arrElemNameRaw` is now 603,819 calls — from 2,090,719.**
+
+| | calls |
+| --- | --- |
+| before B283 | 2,090,719 |
+| after B283 | 1,312,898 |
+| after B284 | 1,073,861 |
+| after B285 + B286 | **603,819** |
+
+**1,486,900 slices removed, 71%**, across four entries, with 0 differing corpus rows at every step.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The rule this earns: prefer DELEGATING to the predicate over reproducing it.** A fast path should
+decide only the cases it can decide cheaply and hand everything else to the original — then it is
+correct by construction on the residue, however many arms that residue has. Reproducing buys a
+little more speed and costs an unbounded correctness obligation that grows every time someone adds
+an arm to the original.
