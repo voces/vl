@@ -54657,3 +54657,62 @@ That is a real slice and it is not a small one: it needs the three rules express
 dual-written against the name path over the whole corpus, with the nominal hazards B224 named.
 Recorded as the next substantial piece of work rather than attempted at the end of a sequence of
 small ones.
+
+## B227 — the parse census closed, and two of its rows were not entry points
+
+B223 counted six `nameToTy` entry points. Walking all six to their callers finishes the map and
+corrects the census's own shape.
+
+**Two rows are not independent entries at all.**
+
+* **Generic-application argument names, 154 calls.** `applyGenAliasArgs`'s name route is reached
+  from `applyGenAlias`, and `applyGenAlias` has exactly ONE caller — `nameToTyReal` itself, at its
+  generic-application arm. These 154 are `nameToTy`'s OWN RECURSIVE DESCENT through a spelling some
+  other entry already asked it to parse. They cannot be removed at this site; they disappear only
+  when the call that started the parse does. Counting them beside the true entries double-counts
+  the same work.
+* **Union-member generic-app shape, 31 calls.** `unionMemberGenAppShape` parses a member spelling
+  and immediately RENDERS the result back (`tyToEmitName`) — a name→name rewrite that needs the
+  type only in the middle. Its consumers require a NAME (the union-member vocabulary
+  `isStructAtom` accepts), so the type cannot be handed on in place of it. Refused by the
+  consumer's contract, not by a hazard.
+
+## The corrected map
+
+| entry | calls | share | outcome |
+| --- | ---: | ---: | --- |
+| `annotResolve` no-tree fallback | 2174 | 56.8% | REFUSED — walked to two `emit_rep` consumers, both with measured mechanisms (B224, B225) |
+| `recordClonedNodeTy` | 711 | 18.6% | REFUSED — name-first precedence measured in its own header (838 agree / 119 name-is-right / 77 unresolvable) |
+| the canon column | 688 | 18.0% | CHARACTERIZED — 47.5% re-derive a recorded type; needs a type-level canon (B226) |
+| generic-app argument names | 154 | 4.0% | NOT AN ENTRY — `nameToTy`'s own recursion |
+| `recordClonedNodeTyKnown` | 69 | 1.8% | the sink B217–B222 fed; what remains is unhinted callers |
+| union-member gen-app | 31 | 0.8% | REFUSED — the consumer's contract is a name |
+
+**One block is open work and it is the canon column.** Everything else is either refused with a
+mechanism, already at its floor, or an artifact of how the census was drawn.
+
+## What the sequence actually produced
+
+B217–B222 and B225 converted nine sites. Not one moved a byte of emitted output — every corpus A/B
+was 0 diffs — and that is why the instruments mattered more than the conversions:
+
+| instrument | what it settles | first used |
+| --- | --- | --- |
+| arena ROW count | replaced vs inert, when output is identical | B217 |
+| `nameToTy` CALL count | the same, where the row count is also silent | B218 |
+| the ACCUMULATING probe | N questions in one build; survives expected-failure files | B218 |
+| rendered-against-RENDERED lockstep | whether a hint MEANS the same type | B221 |
+| the entry-point census | how much string→type work exists at all | B223 |
+
+The composite/primitive rule (B219) went on to predict the row delta at three later sites before it
+was measured, and the memo rate (B223) explains why firings overstate savings (B225). A rule that
+predicts is the useful product here; the nine conversions are the occasion for it.
+
+## The honest remainder
+
+`nameToTy` does not hash-cons. That single fact produced every duplicate row this sequence removed
+one site at a time, and 247 more in the canon column alone. The type-level canon named in B226 is
+the next substantial slice; making the resolver hash-cons is the larger question behind it, and it
+is NOT a safe drive-by — B224 measured that row identity is load-bearing for rep keys, so merging
+structurally identical rows would need its own dual-write against every rep consumer before anyone
+should believe it.
