@@ -55032,3 +55032,66 @@ distance between those two numbers is the value of building the twin arm for arm
 
 Measured here: corpus A/B 0 diffs; `resolveAnnot` **-184 across 49 files**, exactly the agreeing
 firings.
+
+## B233 — the annotation ref-array element: 3184 firings, and the canon column earns its keep
+
+The `rlInternName` surface closed at B228/B232 with only refused callers left. Its SIBLING —
+`ensureRefElem`, the unhinted wrapper over `ensureRefElemTy` — had never been censused. Per-site:
+
+| site | calls | files |
+| --- | ---: | ---: |
+| `emit_collect:4071` — `recordAnnRlSlot(i, ensureRefElem(ren), ranNul)` | **4215** | 275 |
+| `emit_classify:13457` — the nested-list recursion | 660 | 52 |
+| `emit_classify:17791` | 214 | 49 |
+| `emit_classify:17943` | 157 | 34 |
+
+The first is larger than the whole array-literal site B230–B232 worked through.
+
+## The five sources, again — and this time the canon column is the answer
+
+`ren` is `refArrElemName(nullablePartOf(nd.tyName))`: the element cut from the ANNOTATION's
+spelling. The obvious twin is `nodeTyIxOf(i)`, nullable-peeled, `aElem`. Dual-written: **4111 agree,
+95 disagree.**
+
+The 95 are dominated by canon rewrites — `{a:i32}` against `{a: 0 | 1}`, `i32|null` against
+`1 | 2 | null`, `i32|null` against `Id | null`. `canonEmitTypeNames` rewrites `TypeRef.tyName` IN
+PLACE and leaves `nodeTyIx` holding the type the checker recorded BEFORE the rewrite, so on a
+rewritten node **the name is post-canon and `nodeTyIxOf` is pre-canon.**
+
+Reading `canonTyIxOf` where `canonRewroteNode` says so: **95 → 36.** Every one of the 59 it fixes is
+a canon rewrite.
+
+That is the fact B224 stated as a REFUSAL ("`tyName` is the emitter's vocabulary and `nodeTyIx` is
+the checker's algebra") used instead as a ROUTING RULE. The two columns disagree, and the node
+records which one to read.
+
+## The residue is nominality, and the guard is the same four classes
+
+The remaining 36 are names `repElemKey` keys NOMINALLY against structural rows: `#anonN`, newtype
+brands, declared structs (`P` against `{v: i32}`), and a declared alias reached through the array
+grammar (`S[]` against a widened `i32[]`). `elemNameIsNominal` declines all four — peeling `[]` to
+ask about the leaf, which is what the last two needed.
+
+**3184 hinted, 0 disagreements, 1022 declined.** The guard costs firings that mostly agreed; at a
+rep key that trade is the same one B232 made.
+
+## Measurement
+
+Corpus A/B 0 diffs. `resolveAnnot` **-3184 across 191 files**, exactly the agreeing firings — the
+largest single conversion in this programme.
+
+`ensureRefElem` (the unhinted wrapper) now has NO caller in `emit_collect`, the same shape as
+`structIndexOfTypeName` leaving that module in B214.
+
+## Session arithmetic
+
+Corpus-wide `resolveAnnot`, measured end to end over 2075 files:
+
+| | calls |
+| --- | ---: |
+| session start (`f035b4bc`) | 18,532 |
+| after B230–B232 | 17,549 |
+| after this entry | **~14,365** |
+
+**~22% of all name-keyed type resolution in the compiler is gone**, and every conversion was
+byte-identical on the corpus.
