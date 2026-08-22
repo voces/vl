@@ -57388,3 +57388,59 @@ record several invalid-wasm incidents in exactly this gate.
 
 **Analysed, priced, and not taken:** partial win, delicate function, and the arena cannot answer the
 nominal half. Recorded here so the next pass does not rediscover it as an opportunity.
+
+## B283 — the census was pointed at the wrong primitive: `arrElemNameRaw` runs 2.09 MILLION times
+
+With the `splitUnionAtoms` census closed, the same instrument was turned on the rest of the
+type-name scanner surface in `tyname.vl`. The numbers are of a different order:
+
+| scanner | calls per corpus pass |
+| --- | --- |
+| `nameIsArray` | **2,815,228** |
+| **`arrElemNameRaw`** | **2,090,719** |
+| `tyTopIndexOf` | 1,372,714 |
+| `listElemNameOf` | 514,397 |
+| `unionMemberCount` | 214,574 |
+| `splitUnionAtoms` | ~14,000 |
+
+**The axis this programme has spent nine entries on was its 6th-largest by two orders of
+magnitude.** `nameIsArray` is two character reads and allocates nothing, but `arrElemNameRaw` is
+
+```vl
+if !nameIsArray(name) { return "" }
+name.slice(0, name.length - 2)
+```
+
+— a **slice on every call**, two million times.
+
+A per-site census (pass-through wrapper `aeAt(N, x)`, sound in guards and single-line bodies alike)
+found the reach concentrated in one-line predicates that allocate the element only to compare it:
+
+```vl
+export function nameIsF64Array(name: string) { arrElemNameRaw(name) == "f64" }   // 216,797
+export function nameIsF32Array(name: string) { arrElemNameRaw(name) == "f32" }   // 213,689
+export function nameIsI64Array(name: string) { arrElemNameRaw(name) == "i64" }   // 212,698
+export function nameIsStringArray(name: string) { … == "string" … }              // 129,822
+```
+
+`arrElemIs(name, want)` is `nameIsArray(name) && spanEqAt(name, 0, name.length - 2, want)` —
+**exactly** equivalent for any NON-EMPTY `want`, by the two arms of `arrElemNameRaw` itself: a
+non-array yields `""` there and `false` here, and for an array the slice IS the span. `want == ""`
+is a different question (`"[]"` has an empty element), so those three callers keep the old form.
+
+Seven call sites converted. **2,090,719 → 1,312,898 calls: 777,821 slices removed, 37%** — larger
+than the entire `splitUnionAtoms` axis (~112,000) that took nine entries.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**Two process notes, both bought the hard way in this entry.**
+
+1. **A regex conversion rewrites COMMENTS.** Of 19 textual replacements, **12 were inside comment
+   prose** describing `arrElemNameRaw`'s behaviour — three whole files had no real call at all and
+   only looked converted. Lint's unused-import warning is what exposed it. Skip comment lines when
+   rewriting, and count the REAL sites afterwards.
+2. **The scanner census should have come first.** Nine entries of careful work on a 126k-call
+   primitive sat beside an untouched 2.09M-call one, and nothing but measuring the whole surface
+   would have said so. **When an axis closes, re-census one level out before assuming the area is
+   done.**
