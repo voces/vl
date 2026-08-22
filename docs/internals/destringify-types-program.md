@@ -57250,3 +57250,53 @@ which would have cost minutes and did cost a full build-and-gate cycle here.
 
 Sites remaining on the census below this one are all under 2,100 and each needs the same second
 question asked first.
+
+## B279 — the last live render→decide hop in a param ladder, and a stale-tree correction
+
+Re-censusing the type RENDERERS (functions returning `string` from an arena index) at current master
+leaves a short list, and almost all of it is already documented as legitimate: `repCanonKey` /
+`repElemKey` / `repMvValKey` / `rtInternKeyOf` are INTERNER KEYS, and `tyToNominalName*` /
+`structNameOfTy` / `shapeNominalOfTy` / `unionAliasDeclNameOfTy` carry NOMINAL identity, refused six
+times over.
+
+One entry was neither. The param-cell ladder in `emitSections` ran:
+
+```vl
+} else if paramScalarName(p.parType, ty.tyName) != "i32" {
+  if paramScalarName(p.parType, ty.tyName) != "i64" {
+    if paramScalarName(p.parType, ty.tyName) != "f64" {
+      if paramScalarName(p.parType, ty.tyName) != "f32" {
+        if paramScalarName(p.parType, ty.tyName) != "boolean" {
+```
+
+**Five calls, identical arguments, one pure function** — and its arena rung is
+`nodeTyPrimName`, which returns `t.primName` (a `PrimName` ATOM) through a `: string` signature,
+so each of the five materializes a string and then compares it. B260's shape, still live, five
+times per parameter.
+
+`paramScalarIs(tyNodeIx, spelled, want: PrimName)` keeps the three rungs exactly — the arena prim,
+the "arena has a non-prim type, so every scalar rung must miss" rule, then the spelling — but
+compares ATOMS via `tyPrimNameOf`. Only the spelling fallback still compares text, and that is 13 of
+391 param nodes, every one a type PARAMETER the checker never records.
+
+Dual-written: **17,329 comparisons, 0 disagreements.** With all five callers routed,
+`paramScalarName` had zero references and is deleted.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean (it caught two imports left dangling by the
+deletion); rep-fuzz exact; grid no BAD cells.
+
+### A correction to the static counts quoted in earlier entries
+
+`/home/verit/vl` was on branch `master` at a commit **62 merges behind `origin/master`** for this
+whole stretch. `git fetch` moves `origin/master`; it does not move the working tree. So the
+exploratory greps run there — "43 callers", "51 call sites", and the renderer table in B260 — read
+source from the start of the session.
+
+**No conclusion changes and nothing was mis-shipped**, because every edit and every counter build
+happened in a worktree explicitly checked out to `origin/master`, and every number that drove a
+decision was a measured REACH from such a build. But those static counts were of the past, and the
+tell was a renderer census listing `tyScalarBaseName` — deleted 18 merges earlier.
+
+**Do the reading where you do the writing**, and print `git log --oneline -1` at the top of any
+census whose numbers you intend to quote.
