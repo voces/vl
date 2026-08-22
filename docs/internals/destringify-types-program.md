@@ -56144,3 +56144,48 @@ has a sibling.** `structIndexOfTy` had one, `annParamKind` had five arms that we
 being refused, and `arrLitElemName` had five arms behind one hint.
 
 Measured: corpus A/B 0 diffs, all six gates clean.
+
+## B254 — the ref-array return, the biggest decline class, and the `$fnsig` leaf is nearly closed
+
+B251 left the return leg declining 199 reaches. Measuring what they ARE, rather than treating them
+as one residue:
+
+| decline | count | share |
+| --- | ---: | ---: |
+| `TyArray` (a REF array — element not a prim) | **286** | **48.1%** |
+| `TyFunc` | 122 | 20.5% |
+| `TyNullable` | 106 | 17.8% |
+| `TyObj` | 45 | 7.6% |
+| `TyUnion` | 28 | 4.7% |
+| `TyPrim` (the `void` arm) | 6 | 1.0% |
+
+Nearly half is one class, and it has a twin sitting in the same file. `annRetKind` reaches it as
+`nameIsRefArray(t)` → `rlSlotOfArrName(t)`; the arena form is the ELEMENT's own ref-list slot,
+which `rlSlotOfTy` resolves through `repElemId` — **the same key the name resolver ends at**.
+
+Dual-written: **275 agree, 0 disagree.**
+
+## The pattern, stated once more
+
+That is now five refusals reopened by measuring a narrower question (B224→B230, B246→B249/B250/B251,
+B248→B253, and this). Here the narrower question was simply *"what ARE the declines?"* — a residue
+counted as a number is a residue nobody has looked at.
+
+**A decline class is not a refusal until it has been named.** B251 wrote "199 decline" and moved on;
+those 199 contained a 48% block whose twin was three functions away.
+
+## Where the leaf classifier stands
+
+`retTokOfTy` now covers the scalar primitives, the scalar lists and the ref arrays. What declines:
+
+| class | why |
+| --- | --- |
+| `TyFunc` | the name arm reads a paren-wrapped rendering |
+| `TyNullable` | the nullable arms key a box/niche off the spelling |
+| `TyObj` | needs the two-path row lookup B253 built — untested here |
+| `TyUnion` | the litunion alias/inline split lives in the chosen NAME |
+
+The `TyObj` row is the one with a known, built answer waiting (`fieldBaseStructRow`'s exact-then-
+structural hybrid). The other three are the genuine remainder.
+
+Measured: corpus A/B 0 diffs, all six gates clean.
