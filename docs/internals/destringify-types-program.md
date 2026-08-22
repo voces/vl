@@ -55866,3 +55866,53 @@ Fifteen conversions, every one byte-identical on the corpus. What is left is eit
 A NAME (an ABI key, a table's own name column, a node-less caller) or the two language-level changes
 B229 and B246 named — redefining what the emitter's vocabulary and the ABI key are defined over.
 Neither is a refactor.
+
+## B248 — the last two node-bearing field sites, refused: `sTyRow` does not cover what a field-set match reaches
+
+The nine small `structIndexOfTypeName` sites left after B247 include two that hold a NODE —
+`fieldRefElemName` (81 calls) and `fieldTypeCode` (70). Both peel `| null` off the annotation name
+and ask the struct table; the arena twin is peel-the-row then `structIndexOfTy`.
+
+Dual-written, canon-routed:
+
+| site | agree | disagree | no row |
+| --- | ---: | ---: | ---: |
+| `fieldRefElemName` | 77 | **4** | 0 |
+| `fieldTypeCode` | 62 | **8** | 0 |
+
+Every disagreement is the same shape, and it runs the OPPOSITE way to every other refusal in this
+programme:
+
+```
+[A {a:i32,b:i32}            nm=0   ar=-1]
+[A {f:(i32,i32,i32)=>boolean} nm=1 ar=-1]
+[A {x:i32}                  nm=0   ar=-1]
+```
+
+**The NAME answers and the ARENA does not.** `structIndexOfTypeName` field-set-matches an INLINE
+SHAPE to its interned struct row; `structIndexOfTy` reads the `sTyRow` reverse map, which has no
+entry for those rows. The arena holds the type — it is the reverse INDEX that is partial, not the
+type information.
+
+That is a distinct failure mode from everything above. B224's classes were *the arena knows less
+about NOMINALITY*; B229's was *the arena does not hold the deciding input*. This one is **the
+arena↔table reverse index is incomplete**, and it means a hint here would silently LOSE
+resolutions the name path makes — the opposite of a wrong answer, and just as bad.
+
+Refused. The remaining seven small sites are `annRetKind`'s own `structIndexOfTypeName` (the
+`$fnsig` block, B246), `resolveShapeToNominal` and `rlSlotByNameTyK`'s `qBase` rung (name-only
+inputs), and four sites under 30 calls each.
+
+## `structIndexOfTypeName` is closed
+
+| block | calls | status |
+| --- | ---: | --- |
+| `structIndexByValName` | 1442 | refused (B245) |
+| `annParamKind` / `annRetKind` | 1731 | refused — ABI key (B246) |
+| `shapeElemDeclaredStructIdx` | 236 | refused — node-less |
+| `fieldRefElemName` / `fieldTypeCode` | 151 | **refused — `sTyRow` partial (here)** |
+| four sites under 30 calls | ~70 | unexamined, all tiny |
+| **converted** | **2449** | B243, B244, B247 |
+
+**3,560 of 3,798 remaining calls (94%) now carry a documented refusal**, and the surface went 6,100
+→ 3,798 across this sequence.
