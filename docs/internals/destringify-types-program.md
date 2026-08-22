@@ -53419,3 +53419,61 @@ not match them — its pattern is `const X = render(...)` followed by a use of `
 their name from a parameter rather than a local render. **The census's own blind spot, stated at
 B202, has now produced two candidates**; whether `ctx` is a render or an author's spelling at those
 sites is the next thing to measure.
+
+## B208 — the first conversion measurement REFUSED, with a check-clean invalid module to prove it
+
+B207 queued `emit_rewrite.vl:744` / `:813` — the two sites the B202 census missed, because its
+pattern is `const X = render(...)` then a use of `X` and these take their name from further away.
+They looked like the easiest conversion yet: `resolveShapeToNominal(ctx)` sits beside `ctxTy`, the
+TYPE column of the very same inference-return table (the five-sources shape, and a neighbouring
+rung had already moved its decision to `inferRetRungIsStructElemList(ctxRow)`).
+
+Lockstep over the corpus:
+
+| outcome | files |
+| --- | ---: |
+| arena declines, name passes `ctx` through unchanged | 3 |
+| arena answers and DIFFERS | **1** |
+
+```
+literal-unions/inline-atom-shape-field.vl
+   nm=[Box<string>]   ty=[{v:K}]
+```
+
+Swapping in the arena answer: **`vl check` reports no errors and the module fails validation** —
+`type mismatch: expected (ref $type), found (ref $type)`, the check-clean-invalid-wasm class.
+
+### Why, precisely
+
+`ctx` here is `Box<string>` — a NOMINAL generic-instance name, not a shape spelling at all.
+`resolveShapeToNominal` has no struct row for it and passes it through, which is the right answer:
+it preserves an identity. `shapeNominalOfTy` never sees the name; it sees the TYPE, field-set
+matches it against the rows, and lands on the inline row `{v:K}` — a different row from the
+instance's. The minted annotation then keys the wrong struct.
+
+**A structural type-to-row matcher cannot be substituted for a name path whose input may already be
+a NOMINAL name.** The passthrough is not a gap in the name path — it is the name path carrying an
+identity that structure cannot recover. This is B96's rule (variants are nominal) and B206's
+variant rung generalised one step further: generic INSTANCES are nominal too.
+
+### The shipped sites were checked against the same hazard
+
+`recordedParamPinName` (B200/B206) runs `shapeNominalOfTy` ahead of a name in exactly this way, so
+it was probed for the same overreach. It fires on 10 corpus files and every one is the intended
+nominalization of a SHAPE — `{x: i32}` -> `P`, `{meow: i32}` -> `Cat` — with no nominal-instance
+name among them. The difference is in the INPUT, and it is structural rather than lucky:
+
+| site | where its name comes from | can it be a nominal instance? |
+| --- | --- | --- |
+| `recordedParamPinName` | `nodeTyName(pIx)` — the parameter's own render | no: a declared type returns early via `nominalNameOfObj`; the general arm sees a SHAPE |
+| `emit_rewrite:744` / `:813` | `inferRetNameByNode(lamIx)` — a recorded inference-return name | **yes** |
+
+### What this changes about the method
+
+Every measurement in this programme so far has either confirmed a conversion or overturned a
+decline. This is the first to REFUSE one, and it refused it in the only channel that could have
+caught it: not the corpus A/B (which sees the diff but not the cause), not `vl check` (clean), but
+BUILDING the witness and validating the module.
+
+**Add "does the module still validate" to the three numbers of B203 whenever a conversion changes
+a name that gets MINTED into an annotation.** A pin name is not an opinion; it is a key.
