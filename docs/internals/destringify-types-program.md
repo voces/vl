@@ -56839,3 +56839,41 @@ first is safe to convert; the second has to be measured, and can fail.
   evidence, and it should stay unconverted until a fixture reaches it.
 - `unionRowOf` — its own header already calls it "nominal identity lookup, not a structural
   decision", and it matches on the alias NAME *or* the pipe-joined member set. Correct as written.
+
+## B268 — the same position's SECOND parse, and the negative bucket is again the larger one
+
+B267 converted the closure-ARM key at the union-member position. The same loop then asked a second
+spelling question of the same atom:
+
+```vl
+const uCael = cloArrElemNameOf(atoms[uj])   // nullClosureArrElem / nameIsClosureArray / arrElemNameRaw
+if uCael != "" { internCloSigOfAtom(uCael) }
+```
+
+— peeling a closure-ARRAY arm's ELEMENT out of the text, then parsing that element for its key.
+
+The row answers the first half outright: a closure-array arm is a `TyArray` whose `aElem` is a
+`TyFunc`, or a `TyNullable` over one (the kind-5 niche the name form spells `((i32) => R | null)[]`).
+
+| | count | result |
+| --- | --- | --- |
+| arms with a closure element | 17 | element key identical |
+| arms without one | 1,017 | both `""` |
+| **disagreements** | **0** | |
+
+So **1,017 of 1,034 positions skip the element peel entirely** — the negative bucket, again far
+larger than the positive one, and again invisible if you only count the reaches that produce a key.
+
+**The 17 that do have an element keep their peel, deliberately.** `internCloSigOfAtom` evaluates
+`nulCloMixedUnionUnregistered(uCael)` on the ELEMENT, and that is a deliberate reject — so the
+element NAME is still needed as the guard's input. Only the KEY comes from the arena. This is the
+B255 rule applied twice in the same statement: convert the key, leave the guard its argument.
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells.
+
+**Running total at this position.** Two conversions, both off `unMemTys`: 1,034 arm parses (B267)
+and 1,017 element peels (B268) removed per full corpus pass, with the guards intact and no call
+site's meaning changed. The D-UNION columns' stated intent — *"no consumer ever re-splits a member
+set to learn what its members are"* — now extends to what the consumer ASKS of each member, not
+just how it obtains them.
