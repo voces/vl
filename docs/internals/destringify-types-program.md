@@ -55968,4 +55968,51 @@ but "the ABI key's LEAF TOKENS are currently defined by a name classifier". Rewr
 classifier over the arena keeps the key byte-identical — `sigKeyOfTy`'s own construction guarantee
 is the proof obligation, and it is testable the same way this entry was.
 
+## B250 — the ABI key's LEAF tokens leave the name, for the arms that are a question about a `Ty`
+
+B249 routed the closure-param key through `sigKeyOfTy` and was explicit about what it did NOT do:
+`sigKeyOfTy` still RENDERED each param and classified the render. That is this entry.
+
+`annParamKind` is nine arms over a type NAME. Five of them ask something a `Ty` answers directly:
+
+| arm | name test | type test |
+| --- | --- | --- |
+| i32 / boolean | `t == "i32" \|\| t == "boolean"` | `TyPrim` primName |
+| f64 / i64 / f32 | string equality | `TyPrim` primName |
+| string | `nameIsString(t)` | `TyPrim` primName |
+| scalar list | `scalarListKindOfName(t)` | `TyArray` over a `TyPrim` |
+
+`paramTokOfTy` is those, and it DECLINES the rest — the caller then renders and uses the name
+classifier exactly as before. Each decline has its own reason, and none is incidental:
+
+* **UNIONS** — `annParamKind`'s arm is `isUName(t)`, a NAME-REGISTRY question, and the litunion
+  split under it distinguishes a declared ALIAS (keys the i32 atom) from an inline litunion (which
+  really is a string). That is `sigKeyOfTy`'s own `unionAliasDeclNameOfTy` subtlety, and its header
+  carries the invalid-wasm witness from getting it wrong.
+* **OBJECTS** — the row lookup needs `structIndexOfTy`, whose `sTyRow` reverse map B248 measured as
+  NOT covering inline-shape rows the name path field-set-matches.
+* **FUNCTIONS / NULLABLES** — the name arm reads a paren-wrapped rendering.
+
+Dual-written: **152 agree, 0 disagree, 3 decline.** With the arena tried FIRST, a scalar or
+scalar-list param is now never rendered at all.
+
+## What this settles about B246
+
+B246 refused the whole 26,065-call `$fnsig` surface on the claim that "the spelling IS the
+identity". Two entries later that claim has been narrowed twice by measurement:
+
+| B246 said | measured |
+| --- | --- |
+| the key cannot leave the name | B249: the KEY agrees with `sigKeyOfTy` on 7,108 of 7,109 |
+| the leaf tokens are name-defined | here: 5 of 9 arms are a question about a `Ty`, 152/152 |
+
+What actually stays is smaller and sharper than the original refusal: **the union arm is a
+name-registry question, and the object arm needs a reverse index that is incomplete.** Those are two
+specific, named obstacles — not "the spelling is the identity".
+
+Twice now a refusal in this programme has been recorded at the level of a whole surface and then
+cut down by measuring the actual sub-question (B224 → B230, B246 → B249/B250). **The lesson is to
+record refusals at the granularity you measured them at**, not at the granularity of the thing you
+were looking at.
+
 Measured: corpus A/B 0 diffs, all six gates clean.

@@ -25792,6 +25792,48 @@ function annSigKey(name: string) {
 // i32-atom `>i`, not the softened `string`'s `>S`) and a function-type result keeps its grouping
 // parens (one result token). "" for a non-function type, or any leaf outside the value-call ABI
 // (the same "" the string path yields → the all-i32 arity fallback / soundness floor).
+// THE ARM-FOR-ARM TWIN of `annParamKind`, for the arms that are unambiguously a question
+// about a `Ty`: the scalar PRIMITIVES and the scalar LISTS. Returns "" — decline — for
+// everything else, and the caller then renders and uses the name classifier unchanged.
+//
+// The declines are deliberate, one reason each:
+//   * UNIONS — `annParamKind`'s arm is `isUName(t)`, a NAME-REGISTRY question, and the
+//     litunion split below it distinguishes a declared ALIAS (keys the i32 atom) from an
+//     inline litunion (which really is a string). That is `sigKeyOfTy`'s own
+//     `unionAliasDeclNameOfTy` subtlety and carries an invalid-wasm witness.
+//   * OBJECTS — the row lookup needs `structIndexOfTy`, whose `sTyRow` reverse map B248
+//     measured as NOT covering inline-shape rows that the name path field-set-matches.
+//   * FUNCTIONS and NULLABLES — the name arm reads a paren-wrapped rendering.
+//
+// Dual-written inside `sigKeyOfTy` over the corpus: **152 agree, 0 disagree, 3 decline.**
+function paramTokOfTy(ty: i32) {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const pn = t.primName
+    if pn == "i32" || pn == "boolean" { return repSigTokOfKind("i32") }
+    if pn == "f64" { return repSigTokOfKind("f64") }
+    if pn == "i64" { return repSigTokOfKind("i64") }
+    if pn == "f32" { return repSigTokOfKind("f32") }
+    if pn == "string" { return repSigTokOfKind("str") }
+    return ""
+  }
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const el = T.tys[t.aElem]
+    if el is TyPrim {
+      const en = el.primName
+      if en == "i32" || en == "boolean" { return repSigTokOfKind("list") }
+      if en == "string" { return repSigTokOfKind("strlist") }
+      if en == "f64" { return repSigTokOfKind("f64list") }
+      if en == "i64" { return repSigTokOfKind("i64list") }
+      if en == "f32" { return repSigTokOfKind("f32list") }
+    }
+    return ""
+  }
+  ""
+}
+
 export function sigKeyOfTy(funcTyIx: i32): string {
   if funcTyIx < 0 { return "" }
   const t = T.tys[funcTyIx]
@@ -25815,13 +25857,19 @@ export function sigKeyOfTy(funcTyIx: i32): string {
     // the param context is outside `litUnionPreserve`'s ELEM/FIELD/MAP_VAL/FN_RES set). Keying
     // the atom for it turns WORKING programs into invalid wasm; measured, both spellings, at
     // `tests/cases/literal-unions/fn-value-litunion-arg.vl`'s inline controls.
-    let pnm = ""
-    if tyIsLitUnion(t.fnParamTypes[i]) {
-      pnm = unionAliasDeclNameOfTy(t.fnParamTypes[i])
+    // THE ARENA FIRST, so a scalar / scalar-list param is never RENDERED at all. The
+    // render below runs only for the arms `paramTokOfTy` declines, where the name
+    // classifier is still the authority (see its header).
+    let pc = paramTokOfTy(t.fnParamTypes[i])
+    if pc == "" {
+      let pnm = ""
+      if tyIsLitUnion(t.fnParamTypes[i]) {
+        pnm = unionAliasDeclNameOfTy(t.fnParamTypes[i])
+      }
+      if pnm == "" { pnm = tyToEmitName(t.fnParamTypes[i]) }
+      if pnm == "" { return "" }
+      pc = annParamKind(pnm)
     }
-    if pnm == "" { pnm = tyToEmitName(t.fnParamTypes[i]) }
-    if pnm == "" { return "" }
-    const pc = annParamKind(pnm)
     if pc == "" { return "" }
     key = key + pc
     i = i + 1
