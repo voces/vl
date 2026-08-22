@@ -53042,3 +53042,72 @@ BOTH paths). The MATCHING moved; the render stays because at this site it is the
 
 Corpus A/B: **0 diffs** — expected, since lockstep already showed the two ladders agree on all 9.
 The reach probe is what makes 0 diffs readable as "replaced" instead of "inert".
+
+## B201 — the third item, and the first decline that survived measurement
+
+B199's rule sent me at `monoArgTyName`, the last of B198's three name-production entries. The rule
+produced a result again, but not the one it had produced twice before.
+
+### The stated reason for the layer being off-limits is not the real one
+
+`monoArgTyName`'s arms repeat a rationale: *"the locals table isn't built during monomorphization"*,
+*"buildFnMap is post-mono"*, so the annotation is the reliable source. That is about the EMITTER's
+classifier tables. **It says nothing about the arena**, which is the CHECKER's output and is built
+long before emit — and the file itself already calls `nodeTyIxOf(unwrapParen(ix))` three times.
+
+Probed over the corpus, at `monoArgTyName`'s entry:
+
+| | files |
+| --- | ---: |
+| reach the site | 137 |
+| arena HAS a recorded type at that node | **136** |
+| arena empty | 1 |
+
+So the layer is not type-blind, and "the tables aren't built" is not a reason to keep a spelling.
+
+### The real reason, which is narrower and does hold
+
+At the one place it matters — a MONOMORPHIZED INSTANCE — the arena holds the **unsubstituted type
+variable**. Diagnosed at `wasmEmit`'s static `is` fold on
+`types/is-alias-transparent-degenerate-union.vl`:
+
+```
+ISFOLD-NM-ONLY sk=[i32] cmp=[i32] rcvKind=tyvar:T rcvCanon=6 cmpCanon=0
+               rcvRender=[] canonTy=-1 canonRewrote=0
+```
+
+`monoArgTyName` answers `i32`; the arena node answers `TyVar T` and renders "". The FIFTH source was
+checked too and banks nothing: `canonTyIxOf` = -1, `canonRewroteNode` = 0.
+
+**Monomorphization substitutes into SPELLINGS, not into arena rows.** The emitter's mono pass clones
+AST nodes and rewrites their annotation text; the substituted type exists nowhere else. That is why
+`synthParamAnnots` has to hand a type over explicitly (`recordNodeTyFrom`) — it is the one place that
+repairs this by construction.
+
+This is the FIRST "only the name knows" in the programme that survived being measured. Five earlier
+ones did not (see the five-sources note). What distinguishes it: the other five asked *"can this
+type answer this question"* and the answer was yes; this one asks for a type that **was never
+built**.
+
+### And the 13 was a site count too
+
+B198 priced the `is`-fold conversion at 13 files. Two sweeps:
+
+| probe | files |
+| --- | ---: |
+| arena rung ANSWERS (`tySame`, non-`TyVar` receiver) | **1** |
+| arena vs name DISAGREE (lockstep) | 1 — and it is the REGRESSION direction |
+
+`repCanonId` was tried as a looser comparison and declines identically. The single disagreement is
+the name folding where the arena will not, so a conversion would *lose* a fold, not gain one.
+
+**Declined on numbers rather than on architecture.** That is the difference between this entry and
+B198's version of the same decline.
+
+### The census correction, now three for three
+
+B200 found the "151" was a render count. This entry finds the "137" is a site-reach count and the
+"13" is a site-reach count. **Every headline number in this document that was produced by counting
+files that reach a call site is measuring reach, not decisions**, and the two have differed by 16×,
+by 137×, and by 13× at the three sites where both were finally measured. Reach bounds the work from
+above; only a lockstep or an answers-probe bounds it from where it actually is.
