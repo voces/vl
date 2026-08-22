@@ -56051,3 +56051,55 @@ a registry question that could be asked of a type if the union registry carried 
 the litunion alias/inline split is genuinely about which spelling arrived.
 
 Measured: corpus A/B 0 diffs, all six gates clean.
+
+## B252 — the three surfaces, measured end to end
+
+Corpus-wide over 2075 files, session start against now:
+
+| surface | start | now | change |
+| --- | ---: | ---: | ---: |
+| `resolveAnnot` — name-keyed type resolution | 18,532 | **10,713** | **-42%** |
+| `structIndexOfTypeName` — field-set match on a name | 6,100 | **3,661** | **-40%** |
+| `annParamKind` + `annRetKind` — `$fnsig` leaf classification | 26,065 | **6,407** | **-75%** |
+
+**The third row is the one to read twice.** B246 measured that surface at 26,065 calls and refused
+it whole — "the spelling IS the identity". It is down 75%, and every step of that came from
+measuring a smaller question than the one the refusal was written about:
+
+* B249 — the refusal quoted a header measuring the PREDICATE that decides whether the arm fires.
+  The KEY agrees with `sigKeyOfTy` on 7,108 of 7,109.
+* B250 — of `annParamKind`'s nine leaf arms, five are plain questions about a `Ty`. 152/152.
+* B251 — the same for the return leg. 95/95.
+
+What is left of that refusal is three named obstacles, not one claim: the union arm is a
+name-REGISTRY question, the object arm needs a reverse index `sTyRow` does not carry, and the
+litunion alias/inline split lives in which NAME the caller chose. Two of the three are missing
+index coverage rather than language decisions.
+
+## The conversion shapes this programme ended up with
+
+Four, and they are genuinely different techniques:
+
+| shape | what it does | first at |
+| --- | --- | --- |
+| HAND OVER THE ROW | a caller that resolved a type passes it instead of the spelling | B217 |
+| BUILD THE TWIN ARM FOR ARM | each arm of a multi-arm name resolver gets its own arena source | B230 |
+| DELETE THE QUESTION | a ladder rung asks what the rung above already answered dispositively | B242 |
+| ROUTE THE COLUMN | `canonRewroteNode` picks which of two disagreeing type columns to read | B233 |
+
+And three instruments, ordered by what they can see: arena ROW count → `nameToTy` CALL count →
+`resolveAnnot` CALL count. Report the first rung that moves and say which it was.
+
+## What the remainder is
+
+Not a backlog. Every block now carries one of:
+
+* **a measured refusal with a witness** — D-MAPNODETY's invalid wasm, the canon column's
+  spelling-dependence, the nominal classes, `sTyRow`'s partial coverage;
+* **legitimate boundary resolution** — a name resolved ONCE at a mint to fill a type column, which
+  is the mechanism every conversion here consumes;
+* **a name used AS A NAME** — an ABI key token, a table's own name column, a node-less caller.
+
+The two language-level changes named in B229 and B246 are what would move the rest, and both are
+decisions about what the emitter's vocabulary and the ABI key are DEFINED over. They are the user's
+to make, not a refactor to run.
