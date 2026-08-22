@@ -54240,3 +54240,69 @@ alone, like it did nothing.
 The `srcElem + "[]"` pair is the shape this programme has not yet faced anywhere: not a type that
 was printed and re-parsed, but a type that exists ONLY as a string, assembled by concatenation and
 never held as a row at all. Converting it means minting the `TyArray` instead of spelling it.
+
+## B221 — surgery on a spelling, twice, when the pin's own row was in scope
+
+Two sites in the same function, both doing STRING SURGERY on a pinned param's spelling to derive a
+type that the param's arena row already holds.
+
+**`:2146` cuts the arrow.** `annRetNameOf(pn)` takes everything past the top-level `=>` of the
+pinned function-type spelling to get the callback's result. `pinTys[pq]` is that param's row, and
+it is a `TyFunc` at **every one of 8 corpus firings** — so `fnRet` IS what the cut is reaching for.
+
+**`:2180`/`:2182` cut and re-concatenate.** `listElemNameOf(pinned[pqm])` strips the `[]`, and then
+`srcElem + "[]"` puts it back. Both arms produce the receiver's own list type (`.filter` preserves
+the element by definition; the `.map` arm is gated on `monoLambdaPreservesElem`), so the whole
+round trip reconstructs `pinned[pqm]` — measured string-identical to it — while the row sat in
+`pinTys[pqm]`.
+
+## The nominal check that had to be run
+
+`fnRet` rendered against `retName` DISAGREED on 5 of 8, which read like a conversion that changes
+meaning. Four were renderer spacing (`string|null` vs `string | null`). The fifth was not:
+
+```
+name=Cat|Dog     fnRet={meow: i32} | {bark: i32}
+```
+
+The arena row has lost the NOMINAL names — the exact shape the nominal-vs-structural note says a
+structural row cannot stand in for. Comparing rendering to SPELLING is the wrong test, though; the
+right one is rendered-against-rendered, both sides through the same renderer:
+
+```
+name=Cat|Dog   fnRet={meow: i32} | {bark: i32}   reparsed={meow: i32} | {bark: i32}   SAME
+```
+
+**8 of 8 agree.** The re-parse already collapses `Cat|Dog` to its structural union, so the existing
+path lost the nominal names too — handing the row over is not a regression, and the nominal
+spelling still rides on the node's own `tyName` because `retName` is still what is passed as the
+name. Had this been compared only against the spelling, a correct conversion would have been
+refused on a rendering artifact — which is the mirror of B199's `?`-canon retry, refused for being
+one.
+
+## Both instruments, and a prediction that held
+
+| file | firings | `nameToTy` | arena rows |
+| --- | --- | ---: | ---: |
+| `arrays/unannotated-param-f64-map.vl` | 2 srcElem | 12 → 8 (**-4**) | 85 → 83 (**-2**) |
+| `functions/fn-value-monomorphic.vl` | 1 srcElem | 7 → 5 (**-2**) | 69 → 68 (**-1**) |
+| `closures/hof-inferred-return-through-callback.vl` | 7 retName | 49 → 35 (**-14**) | 217 → 212 (**-5**) |
+| `soundness/hole-arg-concrete-param-sound.vl` | 1 retName | 2 → 1 (**-1**) | 70 → 70 (**0**) |
+
+The row column is the check worth noting. B219's rule — composites mint, primitives do not —
+PREDICTS these numbers before they are measured: the `hof` file's 7 firings are 5 composite
+(`string|null`, `i32|string`, `Cat|Dog`, `i32|null`, `i64|null`) and 2 primitive (`f64`, `string`),
+so -5 rows; `hole-arg`'s single firing is `i32`, so 0 rows despite the call still being removed.
+Both came out exactly as predicted. A rule that predicts is worth more than a rule that describes.
+
+Corpus A/B: 0 diffs. Totals: **-21 `nameToTy` calls, -8 arena rows.**
+
+## A gate that nearly slipped
+
+`lint-self.sh` was read with `tail -1` and reported `Checked 1 file, no errors.` — which is the
+LINT half. The fmt half prints separately and had said `compiler/emit_mono.vl: not formatted`; the
+run's real exit was 123. The script's own summary line (`self-lint + fmt-check clean`) is the only
+line that means both halves passed, and `tail -1` does not reliably land on it because the graph
+check is backgrounded across the fmt sweep and the two interleave. **Read the summary line or the
+exit code, never the last line.** (`vl fmt` also prints to stdout by default; `-w` writes.)
+Reformatting left the built compiler byte-identical, so the gates already run stayed valid.
