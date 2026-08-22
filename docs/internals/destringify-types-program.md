@@ -53984,3 +53984,113 @@ closed on.
 the arm is gated on `annotateI32`, whose only caller passes an all-`-1` column, so routing it
 through the fallback would be a no-op today. That is a twin left unused on purpose — the case the
 `*OfTy`-twin note says to check the header for.
+
+## B218 — the inferrer already had the row; two new instruments, and a census I had to correct
+
+`monoInferLocalScalar` re-checks a generic body with its params pinned and reports the type of an
+un-annotated scalar local. Its answer is computed like this:
+
+```vl
+const lt = lookup(localName)          // ← an ARENA INDEX
+if lt >= 0 {
+  const ltt = T.tys[lt]
+  if ltt is TyPrim {
+    const pn = ltt.primName
+    if pn == "string" || pn == "f64" || pn == "i64" || pn == "f32" { scalarName = pn }
+  }
+}
+```
+
+It resolves the type to `lt`, then returns only the type's PRINTED NAME. The caller
+(`emit_mono.vl:2294`) does `synthTypeRef(scTy, -1)`, whose `-1` arm runs `nameToTy(scTy)` — parsing
+a type back out of that print. **The round trip starts and ends on the same arena row**, with a
+string in the middle, and the row was in hand at the top.
+
+The fix hands `lt` out beside the name (`outTy: i32[]`) and mints with `synthTypeRefTy`.
+
+## Two instruments, because A/B says nothing here
+
+Corpus A/B is 0 diffs. Unlike B217's site, the ARENA ROW COUNT is silent too: measured at the
+caller, the re-parse landed on the row it started from every time —
+
+```
+[string,lt=5,re=5] x7      [f64,lt=2,re=2] x3
+```
+
+— because a bare primitive name resolves to the canonical row rather than minting a duplicate. So
+both existing instruments are blind, and "replaced" vs "inert" is undecided by either.
+
+**Count the work the change claims to remove.** A call counter on `nameToTy`, compared over the
+four corpus files that reach the site:
+
+| file | before | after | delta |
+| --- | ---: | ---: | ---: |
+| `generics/nested-generic-call-spine.vl` | 45 | 43 | -2 |
+| `inference/hole-join-generic-arg.vl` | 11 | 10 | -1 |
+| `inference/hole-join-two-level-chain.vl` | 24 | 22 | -2 |
+| `inference/unannotated-param-scalar-return.vl` | 17 | 12 | -5 |
+
+**-10 total, matching the 10 site firings the reach probe counted independently (7 + 3).** Two
+instruments built from different mechanisms agreeing on the same number is the liveness evidence;
+neither the output nor the arena size could supply it.
+
+## The accumulating probe — and why the old probe shape under-reported
+
+`emitFail` KEEPS THE FIRST MESSAGE and does not halt (`if !emitFailed { … }`). Every multi-site
+probe in this programme has therefore reported only whichever question fired first — the failure
+mode the probe-shapes note records as its fifth entry, and one that gets worse on a corpus where
+397 of 2075 files are EXPECTED to fail: a legitimate diagnostic fires before the probe and masks it
+entirely.
+
+Measured here: an `emitFail`-based probe at this site reported **4 files**; the same site through an
+accumulator (append to a global, report once at the end of `emitProgram`) reported **4 files, 10
+occurrences** — and the first probe had silently collapsed every repeat firing to one.
+
+The accumulator is now the default shape for any probe asking more than one question, or asking a
+question on a corpus that contains expected failures.
+
+## A census correction — a SIXTH way a probe shape lies
+
+Marking the ten `synthTypeRef(name, -1)` sites by inserting `probeMark` on the LINE BEFORE the call
+is correct only when the call has its own line. Two sites are single-line guarded forms:
+
+```vl
+if n.letName == outName { nt = synthTypeRef(outType, -1) }
+if scTy != "" { nret = synthTypeRef(scTy, -1) }
+```
+
+For these the marker fires when control REACHES THE LINE, not when the call happens — it counts the
+guard's evaluations, not the site's firings. Re-measured with the marker moved INSIDE the braces:
+
+| site | first reading | corrected |
+| --- | --- | --- |
+| `S859` (`outType`) | 3 files / 21 occ | 3 files / **12** occ |
+| `S2294` (`scTy`) | **10** files / 21 occ | **4** files / **10** occ |
+
+The file count for `S2294` was wrong by more than a factor of two. The eight sites whose call owns
+its line were unaffected. Recorded because the correction is not a detail: the first reading would
+have ranked `S2294` as the widest-reaching site in the family, and it is not.
+
+## The corrected family census
+
+`synthTypeRef(name, -1)` — the `-1` that means "parse the type back out of the name" — in
+`emit_mono`, after B217 converted the `pinned` return site:
+
+| site | what it names | files | occ |
+| --- | --- | ---: | ---: |
+| `:859` | `outType` | 3 | 12 |
+| `:2294` | `scTy` | 4 | 10 | ← converted here |
+| `:2146` | `retName` | 2 | 8 |
+| `:2279` | `listTy` | 2 | 6 |
+| `:1894` | `pinned[hp]` | 2 | 5 | ← deliberate, see B217 |
+| `:2212` | `"f64"` literal | 3 | 3 |
+| `:1014` | `elemType` | 2 | 3 |
+| `:2182` | `srcElem + "[]"` | 2 | 2 |
+| `:2180` | `srcElem + "[]"` | 1 | 1 |
+| `:2124` | `"f64"` literal | 1 | 1 |
+
+The two `"f64"` literals are not string type work in the sense this programme targets — the
+spelling is a constant in the source, not a printed type — and are listed only for completeness.
+The two `srcElem + "[]"` sites BUILD a type by string concatenation and are the most interesting
+remainder. `:2279` (`listTy`) is `monoInferListElem`, the exact sibling of the function converted
+here, and should take the same out-param treatment.
