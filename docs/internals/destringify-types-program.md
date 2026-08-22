@@ -57801,3 +57801,50 @@ registry's own dedup key** (the question IS "have I already registered this spel
 `letAnnIsUnion`'s carries a comment saying it "needs the narrower set", and `buildFnMap`'s reads a
 name the checker banked whose row-keyed twin disagrees 179 times (B289). Those are not renders being
 interrogated; they are the registry being asked about its own keys.
+
+## B292 — the `tyNameOf`-fed decision surface is EXHAUSTED
+
+A full census of every `tyNameOf(...)` result that reaches a call or a literal comparison — 68 call
+sites, filtered to those whose value is DECIDED on — leaves four, and this entry closes them:
+
+| site | outcome |
+| --- | --- |
+| `unionNameOfExpr`'s closure-callee `isValueUnionName(crn)` | **converted** — 174 reaches, 0 disagreements |
+| `letWidensAtomToStr`'s `unionTakesAtomAsStr(tn)` | **dead** — measured 0 reaches |
+| `sFieldElemName`'s `nameMentionsGenAliasParam(fdNm)` | name-side: asks whether a spelling MENTIONS a type-PARAMETER name |
+| `monoArgTyName`'s `pn == ""` | an emptiness check, not a type decision |
+
+**With B290 and B291 this closes the shape**: every place the compiler read a name off a TypeRef
+node and asked a TYPE question of it now asks the arena row instead.
+
+| entry | decisions moved off the render |
+| --- | --- |
+| B290 | 70,163 |
+| B291 | 3,888 |
+| B292 | 174 |
+| **total** | **74,225** |
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline rebuilt from the current master commit); `deno
+task test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+### Where the goal now stands, stated precisely
+
+**"Print a type as a string, then do functional type work on that string" has no live instance left
+that this programme can find.** The three routes a rendered name could take to a decision are each
+closed or accounted for:
+
+1. **Rendered → banked on a node by canon → decided on.** Closed here (B290–B292): `annRowOfNode`
+   reads canon's own banked row.
+2. **Rendered → banked in a checker column → decided on.** One arm converted (B289's
+   `tyIsLitUnion`); the other two disagree because the banked NAME is the lowering while the row is
+   the precise type — the registry is deliberately keyed on the lowering.
+3. **Rendered → used as an interner key.** Never existed: the keys are interned i32 ids
+   (`repCanonId`), and the string builders are an off-by-default shadow oracle (B288).
+
+What still reads strings is **source text** (`isUName` on the registry's own dedup key,
+`resolveAnnot`, `primTyOfName` — a lexeme must become a type) and **name PRODUCTION** for name-keyed
+consumers. Neither is a type printed and then interrogated.
+
+**The remaining structural question is a design one and is stated, not started:** the emitter's
+registries are keyed on the canon-softened spelling because that is the REP, not the type. Re-keying
+them on the precise type would change what the rep layer decides on.
