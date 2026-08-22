@@ -488,7 +488,7 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > `8`s are literals hand-computed from a layout written down nowhere, and adding a
 > field silently makes every one of them wrong.
 
-### P1.3 Optimization defaults  🟡 PROFILE SHIPPED (`vl build -O3`) — wrappers melt, the READ union box does not
+### P1.3 Optimization defaults  🟡 PROFILE + WRAPPERS + 3 OF 4 UNION-BOX SPELLINGS SHIPPED — one spelling blocked upstream
 
 - The sim ships through `wasm-opt` always — but webcraft can own that in its
   build. The real ask: **Heap2Local in the blessed pipeline** and a
@@ -1038,6 +1038,41 @@ and needs nothing from vl beyond scalar exports.
 - **Readonly fields / A9 variance**: would let kernel expose read-only views
   of component data to wc3 systems, enforcing the "renderer/systems read,
   commands write" direction in the type system.
+  **ANSWERED 2026-08-22 — the NEED is met today with P1.5 newtypes; the FEATURE is
+  ruled and its blocking half is a representation problem, not a scheduling one.**
+  > **The pattern, verified end to end.** Brand the same shape twice and hand systems
+  > the read brand:
+  >
+  > ```vl
+  > type ReadHp  = new { base: i32, length: i32 }
+  > type WriteHp = new { base: i32, length: i32 }
+  >
+  > function readHp(v: ReadHp, i: i32): f32 { __load_f32__(v.base + (i << 2)) }
+  > function writeHp(v: WriteHp, i: i32, x: f32) { __store_f32__(v.base + (i << 2), x) }
+  >
+  > const r: ReadHp = { base: 16, length: 4 }
+  > writeHp(r, 0, 1.0 as f32)   // argument 1: expected WriteHp, got ReadHp
+  > ```
+  >
+  > A struct-shaped newtype is built by an **annotated object literal** and read by
+  > plain field access — `as` is numeric-only and is not involved. This is exactly how
+  > `std:buffer` builds `F32View`/`I32View`, so the pattern is already load-bearing in
+  > the std lib.
+  >
+  > **The honest limit: this is advisory, not airtight.** A system holding a `ReadHp`
+  > can forge `const w: WriteHp = { base: r.base, length: r.length }` and write through
+  > it — measured, it compiles and stores. That is the same strength the TS twin you
+  > cited gives (`readonly` is erasable too): it catches the accident, not the
+  > determined caller, and defeating it is an explicit, greppable act.
+  >
+  > **On A9 itself:** RULED 2026-08-18 — inferred, no annotation surface in v1, nothing
+  > to migrate. The **Writable** half only moves reject cells up a column. The
+  > **Readable** half — the one this ask actually wants for containers — is blocked on
+  > REPRESENTATION, not on the ruling: `Cat[]` and `Animal[]` are distinct WasmGC types
+  > with no conversion, and the checker already says so ("type-valid … but not yet
+  > supported by codegen"). So a container-variance answer is not schedulable as a
+  > checker change. **If the brand pattern above covers your case, this row needs no vl
+  > work at all — say so if it does not.**
 - ~~**Default/optional params** (B15a): API ergonomics only.~~ **SHIPPED** — `p: T = <literal>`
   and `p?: T` (sugar for `p: T | null = null`). Direct calls only: a function VALUE keeps its full
   arity, and UFCS (`o.f(a)`) still matches a `self`-function by exact arity.
@@ -1045,8 +1080,12 @@ and needs nothing from vl beyond scalar exports.
   addresses linear memory — the WasmGC ceiling). Future pathing/hash kernels;
   not requested now. Same for engine-level threads/atomics: webcraft's
   topology keeps the sim single-threaded on principle.
-- **Guest profiling parity in browser**: `VL_PROFILE_GUEST` exists for
-  wasmtime; in-browser we'll use DevTools + the names section. ~~Ask is only:
+  **NOT AN ASK — deferred by the asker, not by vl.** Recorded explicitly so this row
+  stops reading as vl backlog: the text above says "not requested now", and P0 (the
+  thing that unlocks it) is now complete. Re-open it when a pathing or hash kernel
+  actually wants v128 and it becomes a real requirement with a shape.
+- **Guest profiling parity in browser**  ✅ **ANSWERED (no vl change)**: `VL_PROFILE_GUEST`
+  exists for wasmtime; in-browser we'll use DevTools + the names section. ~~Ask is only:
   keep emitting a names section on non-`-O` builds.~~ **There is no such state to
   keep — the name section is off by DEFAULT, at every optimization level. Pass
   `--names`; the subsection below is the whole answer.**
