@@ -55459,3 +55459,59 @@ a conversion moves depends on where in the ladder its names were being answered.
 you measured.
 
 Corpus A/B 0 diffs; all six gates clean.
+
+## B240 — the node-fed field rows, and both unhinted recorders leave `emit_collect`
+
+B239 converted the shape-TEXT recorder. The other two recorder sites are one function —
+`pushFieldRow`, which both `emit_collect` field walks push through — and its three callers split
+exactly on whether they hold a `FieldDef` NODE:
+
+| caller | elem name from | node? |
+| --- | --- | --- |
+| `:5099` (struct table) | `fieldRecElemName(fnode.fdType, code)` | yes |
+| `:5263` (variant table) | the same, or the shape text when the node could not code it | yes |
+| `:5196` (variant table) | `shapeFieldElemName(ftxt, fc)` | **no** — the shape-text recorder |
+
+The two node-fed callers hand `pushFieldRow` a row; the shape-text one passes -1, which is exactly
+today's call.
+
+## The canon column, a third time
+
+Dual-written with `nodeTyIxOf(fnode.fdType)`: **70 ok, 4 bad**. All four:
+
+```
+i32|null   against  1 | 2 | null
+i64|null   against  5000000000 | 6000000000 | null
+f64|null   against  1.5 | 2.5 | null
+```
+
+The recorded elem NAME is post-canon and `nodeTyIxOf` is pre-canon. Routing through
+`canonTyIxOf` where `canonRewroteNode` says so: **74 ok, 0 bad**, and the sibling site 28/0.
+
+That is the third independent site where this routing was the whole difference (B233, B239's
+sibling measurement, here). **The rule has stopped being a discovery and become a checklist item:
+when a name and a type column disagree, ask whether canon moved one of them.**
+
+## Both unhinted recorders are now unreachable from `emit_collect`
+
+`recordUFieldElemRow` joined `recordSFieldElemRow` and `ensureRefElem` in having no caller in that
+module — the same shape as `structIndexOfTypeName` leaving it in B214. The lint's unused-import
+warning is what reports it, which makes "the name path left this module" a mechanically checkable
+claim rather than a narrative one.
+
+## Measurement, and the count falls short again
+
+`resolveAnnot` **-70 across 42 files** against 102 hinted firings — the rung effect B239 named,
+measured a second time: `declTyIxOfName` answers most of these from the declared-name table before
+the parse rung.
+
+Corpus A/B 0 diffs; all six gates clean.
+
+## Session totals
+
+| | corpus-wide `resolveAnnot` |
+| --- | ---: |
+| session start (`f035b4bc`) | 18,532 |
+| now | **~11,315** |
+
+**~39% removed across thirteen conversions**, every one byte-identical on the corpus.
