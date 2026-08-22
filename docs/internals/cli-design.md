@@ -136,6 +136,9 @@ CMD_READ_FILE  2   // read cliCmdPath(); commit via cliFileCommit(found, data)
 CMD_WRITE_FILE 3   // write cliCmdData() to cliCmdPath(); commit via cliWriteCommit
 CMD_PRINT_OUT  4   // write cliCmdData() (+ newline) to stdout; no commit
 CMD_PRINT_ERR  5   // write cliCmdData() (+ newline) to stderr; no commit
+CMD_READ_STDIN 6   // slurp stdin; commit via cliFileCommit(found, data)
+CMD_TEST_*   7-9   // see `test` below
+CMD_VALIDATE  10   // validate the module now in rbyte*; commit via cliValidateCommit(ok)
 ```
 
 The set is deliberately tiny and grows only when a subcommand needs a genuinely
@@ -282,6 +285,39 @@ needs:
 Everything else — discovery (the same walk with a `*.test.vl` predicate),
 compilation, the plan, `-t` filtering, the report and the exit code — is VL in
 `cli.vl`. Shipped shape: `docs/internals/vl-test-design.md`.
+
+## `check --codegen` validates its own output
+
+| code | command | host mechanism |
+| ---- | ------- | -------------- |
+| 10 | `CMD_VALIDATE` | `Module::validate` over the module in `rbyte*`; the verdict returns through `cliValidateCommit(ok)`, with the engine's own message on `cliResult*` when `ok = 0` |
+
+The FOURTH thing a VL program cannot do for itself, beside listing a directory,
+reading a file and executing wasm: **decide whether bytes are a module.** The
+validator lives in the engine and the engine is the host's.
+
+That gap had a cost. `compileSrc()` returning 0 means "the emitter ran to
+completion", which is a strictly weaker claim than "these bytes load" — so
+`--codegen`, the flag whose whole promise is *this program lowers*, exited 0 over
+programs that could not load. `build` and `run` had covered themselves for a while
+(`validate_written_module`; `Module::new` validates before it translates) and
+`check` had not, purely because its bytes never left the guest. They do now, on the
+same `rbyte*` readback channel `CMD_TEST_STASH` already used — no new mechanism.
+
+The verdict lands as a **positionless `error` with code `invalid-module`**: the
+validator names a wasm offset and no map from one back to a VL span exists, so the
+diagnostic names the file, says the fault is the compiler's rather than the
+program's, and passes the engine's reason through verbatim. `--no-validate` opts
+out, mirroring `vl build --no-validate`.
+
+Measured over `tests/cases` (2,075 files): **11 flagged, and all 11 are exactly the
+files the corpus already marks `@no-instantiate`** — no false positives, nothing
+missed. That set equality is a test
+(`tests/vl_check_codegen_test.ts`), so a fixed defect and a newly-introduced one
+both redden the suite.
+
+The commit is probed lazily, inside the arm, so a seed predating this command still
+runs under a host that has it.
 
 ## `run` and `build`
 
