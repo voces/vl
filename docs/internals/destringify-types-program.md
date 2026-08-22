@@ -56496,3 +56496,59 @@ any caller actually want the text?" Here the answer was no, six times out of six
 (11 callers), `tyArrayElemPrimName` (4) and `tyNumScalarBaseName` are the same shape and are the
 queued follow-ups; they differ only in that some callers PROPAGATE the value, so the widening moves
 to a boundary instead of vanishing.
+
+## B261 — the numeric-litunion base: the ROW was in hand the whole time, and the walk threw it away
+
+Applying B260's instrument (grep the SIGNATURES) to the rest of the family found the same widening
+in `numLitUnionBaseName` (11 callers) and `tyArrayElemPrimName` (4) — both return `t.primName`, an
+interned `PrimName` atom, through a `: string` signature that materializes it.
+
+But `numLitUnionBaseName` was worse than a widening. Its walk ends:
+
+```vl
+const soft = softenLitTy(cur)
+…
+const st = T.tys[soft]
+if st is TyPrim {
+  const pn = st.primName
+  if pn == "i32" || pn == "i64" || pn == "f64" { return pn }
+}
+```
+
+`soft` **is the base row.** The function computed an arena index, read a name off it, discarded the
+index — and its consumer in `tyKindOf` then converted the name straight back into a row:
+
+```vl
+if litBase != "" { return tyKindOf(primTyOfName(litBase)) }
+```
+
+`primTyOfName` is eight string comparisons. So the path was *arena type → softened row → rendered
+name → eight string compares → arena row → kind*: a complete round trip out of the arena and back,
+to arrive at a row the first step already had.
+
+- `numLitUnionBaseTy(ty): i32` — the row, now the base implementation.
+- `numLitUnionBasePrim(ty): PrimName | null`, `numLitUnionHasBase(ty)` — the atom and the
+  existence test five callers were spelling as `!= ""`.
+- `numLitUnionBaseName` — kept, as a `primNameStr` wrapper, for the five callers that genuinely
+  propagate a NAME upward into the nominal renderers. That is the right boundary: the widening
+  happens where a name is actually wanted, not on every ask.
+- `tyArrayElemPrim` / `tyArrayElemPrimIs` — the same treatment; `emit_collect`'s five-way compare
+  is now five atom compares with one `primNameStr` where the name is stored.
+
+`primTyOfName`'s other three callers all pass a LEXEME the parser produced (`tsLeafTy`, the annot
+resolver, the rep leaf). Those are boundary resolution and stay: a name arriving from source has to
+be resolved to a type. Only the type-derived caller was a round trip.
+
+Compiler 1,286,613 → 1,286,491. Gates: corpus A/B 0 differing rows / 2,075; `deno task test`
+2,225; ci-native 2,242; fixpoint holds; lint clean (it caught two unused imports first); rep-fuzz
+exact; grid no BAD cells.
+
+**A note on the A/B instrument, because it was wrong for two entries.** B259 and B260 reported
+"corpus A/B 0 diffs" from `grep -c DIFF` over `ab.sh`'s output — but `ab.sh` writes tab-separated
+ROWS and never emits the string `DIFF`, so that filter could not have returned anything but 0. The
+comparison step (run the sweep for BOTH seeds, normalize the `mktemp` paths, diff) had been
+dropped. Re-run properly against the pre-#1754 compiler, both entries' claims hold — **0 differing
+rows of 2,075 for #1754 and #1755 together** — so no conclusion changes. The lesson is the
+instrument, not the result: *a comparator you have never seen report a difference has not been
+shown to be able to.* Before trusting a green, feed it two inputs that DO differ and watch it go
+red. See [[vl-probe-shapes]].
