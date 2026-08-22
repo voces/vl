@@ -53775,3 +53775,59 @@ this module is now zero.
 What is left is one unmeasured site, two unreachable ones, and three refusals each carrying a
 witness and a mechanism. That is a different shape of "remaining" from the one this programme
 started with, where every entry was simply unexamined.
+
+## B216 — the census grew a third time, and the `monoArgTyName` family is what is left
+
+B215 closed "the corrected census". Re-running it with a WIDER RENDERER VOCABULARY returns
+**twelve** sites, not the five that list tracked. This is the third time this instrument has been
+too narrow (B210: fixed window; B211: inline nesting; here: vocabulary), and the correction is
+recorded before any claim is made about what remains.
+
+What the earlier runs knew as "renderers" was `nodeTyName` / `tyToEmitName` / `tyToStr` /
+`tyToStructStr`, plus the five `*Name` wrappers B210 added. It did not know `monoArgTyName` —
+and **all five newly visible sites are its consumers**:
+
+| site | decisions |
+| --- | --- |
+| `emit_mono.vl:563` | `nameIsArray(arrTy)`, `listElemNameOf(arrTy)` |
+| `emit_mono.vl:575` | `structIndexByName(recvTy)` |
+| `emit_mono.vl:2821` | `nameIsArray(an2)`, `arrElemNameRaw(an2)` |
+| `wasmEmit.vl:1973` | `sk == nd.isVariant`, `sk == tyToEmitName(cmpTy)` |
+| `wasmEmit.vl:2139` | `mn == "i32" \|\| mn == "i64" \|\| mn == "f64"` |
+
+The INLINE form (`consumer(render(...))` with no intermediate binding) was censused separately and
+returns **0** — B211's blind spot is closed rather than merely noted.
+
+### One of the five, measured to its floor
+
+`isNumRecvBaseName` (`wasmEmit.vl:2139`) already opens with an ARENA rung
+(`nodeNumScalarBaseName`); the `monoArgTyName` comparison is its DECLINE path. B203's first
+question — does the decline path ever ANSWER? — gives **1 corpus file**,
+`literal-unions/is-numeric-litunion-hole-receiver.vl`, `mn=[i32]`.
+
+And B215's lesson applied without waiting to relearn it: **all** columns were probed, not one.
+
+```
+mn=[i32]  nodeTy=113  kind=tyvar:?hIf.0  repTy=113  repKind=tyvar  canonTy=-1
+```
+
+Every source holds a type VARIABLE — the inference hole `?hIf.0` the fixture is named for. The
+substituted `i32` exists only in the instance's spelling, which is B201's mechanism confirmed at a
+second, independent site.
+
+**So this is a refusal with a cause, not an unexamined site.** The distinction matters because the
+five newly visible sites are all in the same family, and the family's constraint is now measured
+twice rather than generalised once.
+
+### Standing position
+
+| outcome | sites |
+| --- | ---: |
+| converted or deleted | 13 |
+| REFUSED, mechanism measured | 4 (`ctx` nominalization B208; `ctx` litunion + union B212; this one) |
+| UNREACHED (0 files, verified probes, witnesses miss) | 2 |
+| `monoArgTyName` family, not yet individually measured | 4 |
+
+The last row is the honest remainder. B201 measured the family's constraint at one site and this
+entry at a second; the other four have NOT been measured individually, and this programme has
+already shown twice that a category verdict does not transfer to every member of the category.
