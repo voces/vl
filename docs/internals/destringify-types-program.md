@@ -53576,3 +53576,53 @@ ones a 45-line window could see.
 B205 said measure at the consumer rather than at the arm. This adds: when a census returns zero,
 widen it deliberately and re-run before reporting, because a zero is indistinguishable from a
 blind spot. The two censuses differ only in window and vocabulary, and they differ by ten sites.
+
+## B212 — three predicates, one probe, and the reading that was wrong again
+
+Next off B210's corrected census: the `ctx` family in `emit_rewrite`'s contextual-return pin, the
+largest entry at 8 decisions. Three of them are STRUCT-FIELD classifiers with obvious arena
+readings, so all three twins were written and checked in ONE lockstep build.
+
+**That build reported map 0, litunion 0, union 8. Two of those three numbers were wrong**, and
+switching the two "faithful" twins on broke `literal-unions/inline-atom-shape-field.vl`.
+
+`emitFail` HALTS. A build carrying three checks reports only the FIRST disagreement in each file —
+so the union twin's divergence, which fires earlier in the if-chain, masked a litunion divergence
+LATER in the same file. This is the exact hazard already recorded at B173 ("run two builds — the
+unconditional one for reachability, the conditional one for disagreements") applied to a case it
+did not literally name: not two SHAPES of probe, but three QUESTIONS in one probe.
+
+Re-measured in three builds that each ask ONE question:
+
+| twin | disagreements | cause |
+| --- | ---: | --- |
+| `tyStructHasMapField` | **0** | — |
+| `tyStructHasLitUnionField` | **1** | `ctx=[{v:string}]` — the render SOFTENED the litunion alias `K`, so the name reads "no litunion field" where the arena reads one |
+| `tyStructHasUnionField` | **8** | see below |
+
+Only the map twin converts. It reaches 3 corpus files; A/B 0 diffs.
+
+### The union twin's divergence is about FORMATTING, not types
+
+Seven of its eight are spaced spellings — `{a: i32, f: i32[] | null, z: i32}`. All three name
+predicates open with `canonBareShapeName`, which requires the CANONICAL, space-free form. So
+`nameIsStructWithUnionField` answers FALSE for a struct that HAS a union field whenever the
+recorded name happens to carry spaces.
+
+**The predicate's answer depends on how the name was printed.** That is not a property of the type
+it is being asked about, and it is the plainest example the programme has produced of why the goal
+is worth pursuing. It is also why the conversion cannot simply be made: eight files currently take
+the FALSE branch and the pin they skip is load-bearing until each is examined.
+
+### The litunion twin is B208 again
+
+`{v:string}` versus `{v:K}`: `tyToEmitName` prints a literal-union alias as `string`, so the name
+says "no litunion field". Converting made the arena's truthful answer fire — and broke the file.
+The softened answer is load-bearing there, exactly as `Box<string>` was at B208. Same file, in
+fact.
+
+### Standing count
+
+Of the `ctx` family's 8 decisions: 1 converted, 2 measured and refused with a named cause, 5 not
+yet measured (`nameIsArray`, `arrElemNameRaw`, `nameIsWholeSpanShape`, `nameIsSpaceFree`, and the
+nominalization B208 already refused).
