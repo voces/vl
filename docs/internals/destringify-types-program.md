@@ -57170,3 +57170,41 @@ first, not about the code.** Rebasing and re-measuring gave 62,056, exactly 86,3
 
 **−51% of the calls and −53% of the allocations**, across four conversions (B273, B274, B275 and
 B271's seam), none of which changed a single answer.
+
+## B276 — third on the census: a scalar span decides BOTH arms, so it needs no string at all
+
+`nameIsLitUnionArmValueUnion` (9,092 splits, third on B274's census) asks two things of every
+non-null member:
+
+```vl
+if nameIsLitUnionType(a) { hasAlias = true }
+else if valueAtomKind(a) < 0 { return false }
+```
+
+`nameIsLitUnionType` needs a real string — it is a `cUserTypes` lookup with an inline fallback — so
+the B275 span walk alone would still materialize every member.
+
+It does not have to. **A member the span form recognises as one of the seven plain scalars is
+answered on BOTH arms without a string:**
+
+- `nameIsLitUnionType` is false for it. No declaration can be spelled with a primitive keyword
+  (`declTyIxOf`'s own rung comment says so), and the inline leg needs 2+ QUOTED members.
+- `valueAtomKind` is `>= 0` by construction — the span form just returned the kind.
+
+So the whole iteration is decided from the span, and only a member that is NOT a plain scalar is
+materialized for the alias lookup. The `atoms.length < 2` gate becomes `unionMemberCount(name) < 2`,
+which was already the allocation-free dual (B272).
+
+Dual-written against the splitting form: **9,092 reaches, 0 disagreements.**
+
+Total `splitUnionAtoms` calls **62,056 → 52,964**.
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells. The rebased binary was byte-identical to the gated
+one, so the run stands.
+
+**The generalisable step: a cheap classifier can discharge an EXPENSIVE predicate, not just its
+own.** B270 used a structural fact to kill a conjunction. This uses one to answer a *different*
+question — "is this a declared litunion" — because the two predicates' domains are provably
+disjoint on that class. When a loop asks several questions per item, check whether the cheapest one
+settles any of the others before reaching for the item's full form.
