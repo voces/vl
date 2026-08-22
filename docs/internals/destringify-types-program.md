@@ -57881,3 +57881,48 @@ measuring the wrong thing: the guard's early-out instead of its verdict, a contr
 permitted the call, the pre-canon row instead of canon's banked one, and now row identity instead of
 structural identity. **A number does not make a refusal true; it makes it checkable. Re-check it
 when a neighbouring entry finds a better instrument.**
+
+## B294 — the last residue, tested twice and REFUSED: 6 of 3,576, and softening makes it worse
+
+After B293 the inferred-return ladder has exactly one arm left on the name:
+`isValueUnionName(inm)`, disagreeing with `isValueUnionTyOr(row)` on **6 of 3,576** reaches. B288
+characterised those as canon softening — the checker banks the LOWERING as the name (`1 | 2 | null`
+→ `i32|null`) while the row is the precise type — and the strict arena walk answers about the type,
+so a literal member yields -1 and the union is "not a value union".
+
+**The obvious fix makes it worse.** If the disagreement is that literals are not softened, soften
+them: `valueRowKindSoft` returns a `TyLit`'s BASE scalar kind (via `tyScalarBasePrim`) where
+`valueRowKind` returns -1, and `isValueUnionTySoftOr` counts with it. Measured at the same site:
+
+| instrument | disagreements of 3,576 |
+| --- | --- |
+| strict (`isValueUnionTyOr`) | **6** |
+| softened (`isValueUnionTySoftOr`) | **83** |
+
+Softening every literal member over-claims: it turns unions the name calls NOT value-unions into
+value-unions, thirteen times more often than the strict walk under-claims. The banked name is not
+"the strict type softened uniformly" — canon's softening is **contextual**, and reproducing it
+member-by-member is not the same function.
+
+**REFUSED, with both numbers.** The helpers were built, measured, and are not shipped; this entry
+exists so the next pass does not rebuild them. The residue is 6 reaches at one site, 0.17%, and it
+is the last measured disagreement anywhere in the render→decide surface.
+
+### The programme's state after B288–B294
+
+Every route by which a rendered type name could reach a decision is closed or accounted for:
+
+| route | status |
+| --- | --- |
+| render → banked on a node by canon → decided | **closed** (B290–B292), 74,225 decisions moved |
+| render → banked in a checker column → decided | **closed** (B289, B293) except 6 reaches at one arm (this entry) |
+| render → interner key | never existed — keys are interned i32 ids; the string builders are an off-by-default oracle (B288) |
+
+What still reads a string is **source text** — the registry's own dedup key, `resolveAnnot`,
+`primTyOfName`; a lexeme must become a type — and **name PRODUCTION** for name-keyed consumers.
+Neither is a type printed and then interrogated.
+
+**The one open design question, stated and not started:** the emitter's registries are keyed on the
+canon-softened spelling because that spelling IS the rep. Re-keying them on the precise type would
+change what the rep layer decides on, and B294's 83 is a direct measurement of why the two are not
+interchangeable.
