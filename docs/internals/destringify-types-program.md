@@ -55916,3 +55916,56 @@ inputs), and four sites under 30 calls each.
 
 **3,560 of 3,798 remaining calls (94%) now carry a documented refusal**, and the surface went 6,100
 → 3,798 across this sequence.
+
+## B249 — B246's refusal was about the wrong question, and the ABI key routes to the arena
+
+B246 sized `$fnsig` key production at **26,065 calls** and refused it whole, on the strength of a
+header at `paramCloSigKey`:
+
+> the "is it a `TyFunc` or a nullable closure" arena reading is NOT its twin: that disagrees on 14
+> corpus files, every one a union with a closure member … The PAYLOAD stays on the name too:
+> `cloNameSigKey` builds an ABI `$fnsig` key, where the spelling IS the identity.
+
+**That measurement is about the PREDICATE, not the KEY.** "Is it a closure" decides whether the arm
+fires; the key is what the arm then produces. B246 read the two as one refusal. They are not, and
+B230 already recorded the general form of this mistake — a measurement of one question quoted as a
+verdict on another.
+
+## The key itself, measured
+
+Dual-writing `cloNameSigKey(nm)` against `sigKeyOfTy` on the param's recorded functype:
+
+| | |
+| --- | ---: |
+| identical key | **7,108** |
+| different | **1** |
+| no `TyFunc` recorded | 921 |
+
+The single difference is a GAIN: a paren-wrapped `((i32)=>i32)` where `annArrowAt` does not see the
+arrow, so the NAME path answers `""` (the all-i32 arity fallback) and the arena answers `i>i`.
+Corpus A/B is 0 diffs, so no emission depended on that fallback.
+
+`sigKeyOfTy` is `annSigKey`'s documented dual — "byte-identical to
+`annSigKey(tyToEmitName(funcTyIx))` by construction" — and routing through it skips PARSING a
+rendered function type back into its params and return. The predicate (`annCloSigSpelled`) is
+untouched, so the 14 union-with-closure-member files still decide the same way.
+
+The 921 reaches with no recorded `TyFunc` keep the name path.
+
+## What is and is not destringified here
+
+Honest about the remainder: `sigKeyOfTy` still RENDERS each param (`tyToEmitName`) and classifies
+the render (`annParamKind`). So this conversion removes the *structural decomposition* of a
+function-type spelling — finding its arrow, splitting its params — and leaves the *leaf
+classification* on names.
+
+That leaf is the next step and it is a genuine arm-for-arm twin: `annParamKind` is nine arms over a
+type NAME (`i32`/`boolean`, `f64`, `i64`, `f32`, litunion-vs-union, string, scalar list, closure,
+struct row), every one of which is a question about a `Ty`.
+
+**The refusal that stands is narrower than B246 claimed**: not "the ABI key cannot leave the name",
+but "the ABI key's LEAF TOKENS are currently defined by a name classifier". Rewriting that
+classifier over the arena keeps the key byte-identical — `sigKeyOfTy`'s own construction guarantee
+is the proof obligation, and it is testable the same way this entry was.
+
+Measured: corpus A/B 0 diffs, all six gates clean.
