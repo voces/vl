@@ -54969,3 +54969,66 @@ them, as `nwNames` did here, has not been measured.
 The lesson generalises past this site: **a decline at 95-98% is usually one identifiable row class,
 not a fundamental limit.** Three refusals in this programme have now been reopened and converted by
 naming the class — B215's canon rung, B230's two arms, and this one.
+
+## B232 — the closure arm, guarded; and the map arm's residue is a DIFFERENT failure
+
+Two arms were left declining after B231. Both are now characterized, and one converts.
+
+## Closure: two classes, one guard, 184 of 184
+
+The 12 disagreements in 232 are:
+
+```
+((i32)=>{x:i32}|null)     against  (i32) => {x: i32} | null      10 of 12
+((i32)=>{x:i32})                   (i32) => {x: i32}
+((i32)=>{x:i32,y:i32})             (i32) => {x: i32, y: i32}
+((string)=>i32)           against  ("a" | "b") => i32             2 of 12
+```
+
+A struct-RETURNING closure, where the name renders the return's shape inline while the recorded
+return is a row; and an un-widened literal union in a PARAMETER. `tyMentionsLitOrObj` declines both,
+and the arm is **184 of 184**.
+
+The guard costs 36 firings that agreed anyway (220 → 184). That trade is deliberate: at a rep key a
+conservative decline is a parse, and a wrong hint is a silently wrong slot.
+
+## Map: the residue is row identity, NOT meaning
+
+The map arm's 162 in 820 look like the others until both sides are rendered:
+
+```
+nm={[i32]:boolean}      ty={[i32]: boolean}
+nm={[string]:boolean}   ty={[string]: boolean}
+nm={[string]:{v:i32}}   ty={[string]: {v: i32}}
+```
+
+**Semantically identical — the only difference is the renderer's space after `:`.** So this is not
+the struct arm's nominal-vs-structural problem and not the closure arm's widening problem. The name
+resolves to one arena row and the recorded element is a DIFFERENT, structurally identical row, and
+`repElemId` separates them.
+
+That is the duplicate-mint problem (`nameToTy` does not hash-cons) surfacing as a rep-key
+disagreement. **Hinting here would not fix a wrong answer, it would pick a different row for the
+same type** — which B224 measured to be load-bearing for rep keys. Declined, and declined for a
+reason unrelated to the other two arms.
+
+Naming that distinction matters more than the 658 firings it costs: **three arms declined at this
+site and the causes were three different things.** A single "disagrees" number would have hidden
+that, which is exactly how B224 refused all 2852 at once.
+
+## The site, complete
+
+| arm | firings | agree | outcome |
+| --- | ---: | ---: | --- |
+| struct → `sTyIx[si]` | 833 | **813** | hinted, 2 exclusions (B231) |
+| map element | 820 | 658 | declines — row identity (here) |
+| closure element | 232 | **184** | hinted, guarded (here) |
+| variant → `unTyIx[u]` | 112 | **112** | hinted (B230) |
+| union element | 32 | **32** | hinted (B230) |
+| nested-list bucket | ~800 | — | unhinted BY DESIGN |
+
+**1141 of 2852 firings resolve from a row.** B224 refused all 2852 on one measurement, and the
+distance between those two numbers is the value of building the twin arm for arm.
+
+Measured here: corpus A/B 0 diffs; `resolveAnnot` **-184 across 49 files**, exactly the agreeing
+firings.
