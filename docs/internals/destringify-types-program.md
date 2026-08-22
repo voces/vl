@@ -53533,6 +53533,49 @@ instance KEY (B207), both of which are names by design and are consumed as keys 
 re-parsed. B208 is the standing reason the last of those cannot simply be structural: a name can
 carry NOMINAL identity that structure does not recover.
 
+## B210 — the census under-counted, and B209's "zero" is withdrawn
+
+B209 closed by reporting that re-running B202's census over `compiler/` returns **zero**
+render-then-decide sites. **That number is wrong and the claim is withdrawn.** The correct count,
+measured the same day with the same intent and a fixed instrument, is **ten**.
+
+Two defects in the census script, both mine, both the same species as B205's per-file reach
+counter — an instrument that answers a narrower question than the one asked:
+
+1. **A FIXED 45-LINE WINDOW.** The script bound a render to a variable and then looked ahead 45
+   lines for a decision on it. `emit_rewrite.vl` binds `ctx = inferRetNameByNode(lamIx)` at line
+   524 and asks its first question at line 683 — **159 lines later**, and seven more after that.
+   Every one of them was invisible. Tracking to the end of the ENCLOSING FUNCTION instead is both
+   more correct and no harder to write.
+2. **AN INCOMPLETE RENDERER LIST.** It knew four renderers (`nodeTyName`, `tyToEmitName`,
+   `tyToStr`, `tyToStructStr`) and missed the `*Name` producers that wrap them —
+   `inferRetNameByNode`, `nodeArrayElemName`, `nodeTyCanonObjName`, `nodeNulStructInnerName`,
+   `nodeTyMapName`. B207 had already flagged the interprocedural blind spot in the abstract; these
+   are it in the concrete, and they account for 9 of the 10 sites.
+
+### The corrected census
+
+| site | binding | decisions |
+| --- | --- | ---: |
+| `emit_rewrite.vl:524` | `ctx = inferRetNameByNode` | **8** |
+| `emit_classify.vl:11566` | `nm = inferRetNameByNode` | 2 |
+| `emit_classify.vl:19943` | `snc = nodeTyCanonObjName` | 2 |
+| `emit_collect.vl:1860` | `synElem = nodeArrayElemName` | 2 |
+| `emit_classify.vl:14035` / `:14120` / `:14224` / `:14269` | `cen = nodeArrayElemName` | 1 each |
+| `emit_classify.vl:8288` / `:20010` | `inn`/`nn = nodeNulStructInnerName` | 1 each |
+
+### What the shipped work still is
+
+Nothing in B203–B209 is retracted: those sites were real, were measured at the consumer, and are
+gone. What is retracted is the CLOSING CLAIM — that they were all of them. They were all of the
+ones a 45-line window could see.
+
+### The rule
+
+**A census is an instrument, and an instrument that reports ZERO is the one to distrust most.**
+B205 said measure at the consumer rather than at the arm. This adds: when a census returns zero,
+widen it deliberately and re-run before reporting, because a zero is indistinguishable from a
+blind spot. The two censuses differ only in window and vocabulary, and they differ by ten sites.
 ## B211 — the closure-element predicate, and three attempts at one partition
 
 First entry off B210's corrected census: the four consumers of `nameIsClosureElem(cen)` over an
