@@ -53356,3 +53356,66 @@ strongest — a named function, a header refusing the exact move, a rule with fi
 
 **Check that the refusal you are quoting is a refusal of YOUR question.** A neighbouring function
 declining a structurally similar move is not evidence about the move you are making.
+
+## B207 — the last census site, and a union that the render collapsed
+
+B202's census had five render-then-decide sites. Four are now gone or converted; this is the
+fourth to close, and it closed the way B205 said to look — by asking at the CONSUMER whether the
+thing being retired still does work.
+
+`monoArgFnTypeName` had been left at "the render remains as the ARTEFACT": #1697 moved its GATE to
+`nodeTyIsFunc` but kept `nominalizeFnType(cn)`, on the grounds that the caller needs a spelling.
+The spelling is indeed the output. **What was never checked is how the spelling gets built.**
+
+`nominalizeFnType` decomposes a rendered function name with `annFnDecompose`, runs each piece
+through `resolveShapeToNominal`, and reassembles — a walk `TyFunc` already holds as
+`fnParamTypes` / `fnRet`. `nominalizeFnTypeOfTy` does it on the type, nominalizing each part with
+`shapeNominalOfTy` (which B206 had just completed with its variant rung) and rendering the rest.
+The name twin had **zero callers** afterwards and is deleted.
+
+### The one disagreement is a union the render collapsed
+
+Lockstep over the corpus, name vs arena, gives **1** difference:
+
+```
+closures/hof-inferred-return-through-callback.vl
+   nm=[(i32)=>Cat]   ty=[(i32)=>{meow:i32}|{bark:i32}]
+```
+
+The return type is a UNION of two shapes. The name path hands the whole spelling
+`{meow:i32}|{bark:i32}` to `resolveShapeToNominal`, whose `nameIsShapeOpen` test sees a leading
+`{`, parses a field set out of it, and matches `Cat` — **the first arm, with the second silently
+dropped.** The arena declines instead: the return is a `TyUnion`, which is not a struct row and
+not a variant row, so it renders faithfully.
+
+Measured rather than assumed to be harmless: the file builds to the same SIZE and runs to the same
+output on both, and the corpus A/B is 0 diffs. So the collapse was not load-bearing — but it was
+also not correct, and it is the kind of thing that stays invisible until a program depends on the
+second arm.
+
+**A shape-matcher pointed at a UNION spelling will match its first arm.** The name path has no way
+to know it was handed a union; the arena cannot fail to.
+
+### Census, closed out
+
+| site | state |
+| --- | --- |
+| `emit_classify.vl:19902` | gone (B203) |
+| `emit_classify.vl:7525` | gone (B204) |
+| `emit_rewrite.vl:985` | gone (B206) |
+| `emit_mono.vl:226` | gone (here) — gate at B202, render at B207, `nominalizeFnType` deleted |
+| `typecheck.vl:20299` | UNREACHED — 0 corpus files, and witnesses built from its own comment miss it |
+
+Of the five, four are closed and the fifth cannot be measured. That is not the same as "the
+compiler renders no types": `tyToStr` and friends still spell types into DIAGNOSTICS by the
+hundred (B198), and a render still produces the pinned annotation ARTEFACT at
+`recordedParamPinName` and the mono key here. The claim is narrower and is the one the goal makes:
+**no site in the census now spells a type out and then asks the spelling a question.**
+
+### Queued
+
+`emit_rewrite.vl:744` / `:813` pass a `ctx` name to `resolveShapeToNominal`. The B202 census did
+not match them — its pattern is `const X = render(...)` followed by a use of `X`, and these take
+their name from a parameter rather than a local render. **The census's own blind spot, stated at
+B202, has now produced two candidates**; whether `ctx` is a render or an author's spelling at those
+sites is the next thing to measure.
