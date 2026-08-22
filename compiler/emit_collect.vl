@@ -540,6 +540,61 @@ import {
 // holding the type the CHECKER recorded BEFORE the rewrite, so on a rewritten node the
 // recorded elem NAME is post-canon while `nodeTyIxOf` is pre-canon — measured, that is
 // every one of this site's 4 disagreements (`i32|null` against a `1 | 2 | null` row).
+// ARENA: could this functype's RESULT be a MIXED scalar+composite union? `false` is a
+// DEFINITE no — the caller then knows `nulCloMixedUnionUnregistered` would return false
+// without rendering the type to ask it.
+//
+// This is the guard's ANSWER, not its early-out. B258 tried four predicates for the
+// early-out (`splitUnionAtoms(res).length < 2`) and none was exact, because an atom count
+// is a fact about the SPELLING: a litunion alias `K0` is one atom and many `uMembers`, a
+// nullable is one wrapper and two atoms. But the early-out is an OPTIMISATION inside the
+// guard — the VERDICT is "scalar and composite both present", and that IS structural.
+// `K0` counts as one atom by name and as many members here, and both routes conclude
+// "not mixed" because every member is a literal.
+//
+// Measured against the full name guard: **1,123 definite-no of 1,133, 0 wrong, 10
+// deferred**. The deferred ten render and take the name path unchanged.
+function cloResultMaybeMixed(tyIx: i32): boolean {
+  if tyIx < 0 { return false }
+  const t = T.tys[tyIx]
+  if !(t is TyFunc) { return false }
+  const fr = t.fnRet
+  if fr < 0 { return false }
+  const frt = T.tys[fr]
+  if frt is TyUnion { return unionArmsMixed(frt.uMembers) }
+  // A `| null` result is a WRAPPER here and an ATOM in the spelling; the mix question is
+  // about what is INSIDE it.
+  if frt is TyNullable {
+    if frt.nInner < 0 { return false }
+    const it = T.tys[frt.nInner]
+    if it is TyUnion { return unionArmsMixed(it.uMembers) }
+    return false
+  }
+  false
+}
+
+// Do these union members carry BOTH a scalar (prim / literal) and a composite
+// (object / map / array / closure) arm? A closure counts composite, mirroring the name
+// guard's `nameIsFuncTypeAtom` exception.
+function unionArmsMixed(ms: i32[]): boolean {
+  let hasScalar = false
+  let hasComposite = false
+  let i = 0
+  while i < ms.length {
+    if ms[i] >= 0 {
+      const m = T.tys[ms[i]]
+      if m is TyObj { hasComposite = true }
+      else if m is TyMap { hasComposite = true }
+      else if m is TyArray { hasComposite = true }
+      else if m is TyFunc { hasComposite = true }
+      else if m is TyPrim { hasScalar = true }
+      else if m is TyLit { hasScalar = true }
+    }
+    i = i + 1
+  }
+  hasScalar && hasComposite
+}
+
 function fdRowOf(fdType: i32) {
   if canonRewroteNode(fdType) { return canonTyIxOf(fdType) }
   nodeTyIxOf(fdType)
@@ -6221,8 +6276,20 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
       //
       // Measured: **1,102 of 1,133 keys identical**, 0 disagreements, arena silent on 31
       // (which fall back to the parse).
-      const nm = arenaEmitName(tyIx)
-      if nm != "" { internCloSigOfAtomTy(nm, sigKeyOfTy(tyIx)) }
+      // THE RENDER IS GONE on the definite-no path. `arenaEmitName` ran here only so the
+      // guard could read a name; when the arena proves the result cannot be a mixed
+      // union, the guard's verdict is known and the key is already in hand.
+      //
+      // SOUNDNESS, measured: a non-empty key implies a non-empty render at this site —
+      // `keyNoName = 0` over the corpus (2 reaches have both empty). So gating on the key
+      // preserves the `nm != ""` condition this arm used to apply.
+      const kAr = sigKeyOfTy(tyIx)
+      if kAr != "" && !cloResultMaybeMixed(tyIx) {
+        internCloSigKey(kAr, -1)
+      } else {
+        const nm = arenaEmitName(tyIx)
+        if nm != "" { internCloSigOfAtomTy(nm, kAr) }
+      }
     }
     // Descend params + result to reach closures nested inside them (a result struct's
     // closure field, a param closure, a closure arm of a field union).
