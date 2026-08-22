@@ -56703,3 +56703,39 @@ compiler actually built from master the answer is 0. **Never baseline an A/B on 
 per-caller question of "does this one hold a row?", not a blocked class. Same for `valueAtomKind`'s
 72 — `valueRowKind` is the twin, and every site whose atom came from a member rather than a cut can
 route. That is the queue.
+
+## B265 — first consumer routed to the new twin: the field-code ladder's box arm
+
+B264 built `isValueUnionTyOr` and used it at one site (the registry mint). This is the first
+CONSUMER routed to it, and it is the shape the rest of the 43 will take.
+
+`nameFieldCodeTy(t, ty)` was already arena-first — `fieldCodeOfTy(ty)` answers or returns `-2`, and
+the name ladder `nameFieldCode(t)` runs on a decline. `fieldCodeOfTy` had no `TyUnion` arm at all,
+so every value-union field fell through to the spelling, where `isValueUnionName(t)` returned code
+16 (the box) after splitting the rendering into atoms.
+
+Adding one arm at the TAIL of `fieldCodeOfTy`:
+
+```vl
+if isValueUnionTyOr(ty) == 1 { return 16 }
+```
+
+Placement is the whole correctness argument. It goes LAST so every arm the arena already claims
+still wins — which matches the name ladder, where 16 sits below the string and array arms. And only
+a definite `1` is acted on: `isValueUnionTyOr` DECLINES rather than guess, and a literal union
+answers **0** (its members are `TyLit`, which `valueRowKind` codes -1), so the box code can never
+be claimed for a litunion field. That is exactly the confusion the `litNode` arms above it exist to
+prevent, preserved structurally rather than by ordering luck.
+
+Dual-written at `nameFieldCodeTy` — *when the arena says value-union, does the name ladder say 16?*
+— **172 reaches, 0 disagreements.** The measurement is one-sided on purpose: the arm fires only on
+a definite yes, so the decline and the "no" both keep the existing route.
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The pattern for the remaining 41.** Each `isValueUnionName` caller is now a two-question check:
+*does it hold a row?* and *where in its ladder does the answer belong?* The second question is the
+one that bites — a value-union arm inserted at the wrong rung claims inputs an earlier arm owned.
+Adding it at the tail of an already-arena-first classifier is the safe default, because the arena
+ladder and the name ladder then agree on precedence by construction.
