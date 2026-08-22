@@ -56992,3 +56992,44 @@ a `cov` branch reading `mems[i]` and a documented arena hand-over. The waste was
 the helper they all share, doing work that only the uncovered 0.1% needed. **A seam that serves both
 a converted and an unconverted path tends to keep paying the unconverted path's cost for
 everybody.** After converting a set of callers, go back and read the helper they call.
+
+## B272 — count, do not materialize: 26,209 atom arrays built to read a `.length`
+
+`nameIsMapMemberUnion` was three lines:
+
+```vl
+if !nameIsMap(name) { return false }
+const atoms: string[] = []
+splitUnionAtoms(name, atoms)
+atoms.length >= 2
+```
+
+It cut the spelling into an array of member strings, allocated every one of them, and then read
+**only the length**. `unionMemberCount` is that query without the allocation — its own header calls
+itself *"the counting dual of `splitUnionAtoms` … the same query, without materializing the atom
+strings"*, and it carries the same top-level `=>` rule that keeps `(i32) => i32 | string` one
+member.
+
+The comment was there. B213's rule is that a comment saying two things agree is not a mechanism, so
+it was measured: **26,209 reaches, the count equal to the split's length every time, 0
+disagreements.** Then the split was deleted.
+
+This is the biggest reach count in the programme so far, and the cheapest conversion in it — no
+twin, no arena, no new column. The question `nameIsMapMemberUnion` asks *is* a spelling question
+("does this map name carry a top-level `|`"), so there is nothing to destringify. What there was,
+was a projection: **the caller needed a number and the callee built a list.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**A module-graph refusal, recorded so it is not re-tried.** The sibling seams `unionHasAtom` and
+`unionTakesAtomAsStr` (7 and 9 callers) split for the same reason and COULD read the recorded atom
+column instead — but they live in `emit_base.vl`, and `msMemberAtomsOf` lives in `emit_classify.vl`,
+which imports `emit_base` and not the other way round. Converting them needs the recorded-atoms
+reader moved to a leaf module (`tyname.vl` is the leaf with zero imports), which is a separate
+change with its own risk. Refused here, queued as that.
+
+**Where to look for more of this shape:** any `splitUnionAtoms(x, a)` whose only use of `a` is
+`a.length`. It is a different defect from the rest of the programme — not "functional work on a
+string representation of a type" but a projection of a value the caller never wanted — and it hides
+in exactly the same places.
