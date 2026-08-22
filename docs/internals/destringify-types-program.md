@@ -56552,3 +56552,46 @@ rows of 2,075 for #1754 and #1755 together** — so no conclusion changes. The l
 instrument, not the result: *a comparator you have never seen report a difference has not been
 shown to be able to.* Before trusting a green, feed it two inputs that DO differ and watch it go
 red. See [[vl-probe-shapes]].
+
+## B262 — the comparability vocabulary becomes a literal union: the third closed set
+
+B260/B261 handled functions whose body returns an ATOM through a `: string` signature. This entry
+is the other half of the family: functions whose body returns a **bare string literal** from a
+closed set, so there is no atom to widen — the strings are real, and every consumer compares them
+with a real string `==`.
+
+`eqCmpKindOfTy` answers *which lowering does a `==`/`!=` operand's rep take*: `"str"`, `"scalar"`,
+`"closure"`, `"struct"`, `"list"`, `"strlist"`, `"reflist"`, the six `nul*` niches, `"none"` for a
+rep with no compare core, and `""` for "not a niche". Fifteen members, all spelled in this file,
+consumed by string comparison in `eqCoreKindOfTyToken`, `eqKindIsNulNiche`, `binEqNulNiche`,
+`binEqHasNoLowering` and the checker's `has no lowering` reject.
+
+This is a CLASSIFICATION OF A TYPE carried as a string and decided on as a string — and the fix is
+the one this compiler has already applied twice, to `PrimName` (#1402) and `LitKind`. Declaring
+
+```vl
+export type EqCmpKind = "" | "str" | "scalar" | … | "nulreflist"
+```
+
+and changing seven signatures to return/accept it turns every `k == "nulstr"` into an `i32.eq`
+against an interned atom, with the source text untouched and **no call site edited**. The type
+declaration does all of the work.
+
+Two properties worth stating:
+- **The checker becomes a complete oracle.** A member outside the set is now a hard type error
+  rather than a silently-false comparison. That the compiler builds at all is the proof that the
+  declared vocabulary is exactly the one the four producers emit.
+- **`""` and `"none"` are different answers and both are load-bearing** — the checker REJECTS
+  `"none"` (`\`==\` over … has no lowering`, which exists because those cases were check-clean
+  INVALID WASM), while `""` means "not a niche". The set carries both rather than folding absence
+  into one, which is why this could not be modelled as `EqCmpKind | null`.
+
+Compiler 1,286,491 → 1,286,425. Gates: corpus A/B 0 differing rows / 2,075 (with the comparator
+from B261, sanity-checked to report 262 differences on two genuinely different builds before being
+trusted); `deno task test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid
+no BAD cells.
+
+**Operational note: `vl fmt -w` takes ONE path per run.** Several multi-path invocations this
+session errored (`unexpected extra argument`) behind a `2>&1` redirect and formatted nothing; the
+lint gate caught each one at RC 123. Format one file per call, and do not redirect a formatter's
+stderr away.
