@@ -56906,3 +56906,47 @@ test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid n
 **Three conversions off `unMemTys` now** — 1,034 arm parses (B267), 1,017 element peels (B268), 416
 name→row resolutions (B269). All three had the same shape: the arena fact was already recorded in a
 column parallel to the atoms, and the consumer re-derived it from the text anyway.
+
+## B270 — a SIXTH conversion shape: the row as a NECESSARY CONDITION
+
+Every conversion so far replaced a name answer with an arena answer. This one does not answer the
+question at all — it proves the answer is NO, cheaply, and lets the name handle the rest.
+
+`registerInlineUnion`'s ref-array-arm loop asked:
+
+```vl
+if raa != "null" && valueAtomKind(raa) < 0 && nameIsRefArray(raa) { … }
+```
+
+`nameIsRefArray` is not a small predicate. It runs `annArrowAt`, `nameIsLitUnionArray`, the whole
+`refArrShapeKind` ladder, and then a struct/union TABLE scan. Mirroring it structurally would mean
+re-deriving nominal table membership from the arena, which is the standing refusal.
+
+But **every arm of it requires the member to be an ARRAY.** So a recorded row that is not a
+`TyArray` decides the entire conjunction false — without running the ladder, and without
+`valueAtomKind` splitting the atom either.
+
+| | count |
+| --- | --- |
+| row decides it (not an array) | **803** |
+| row allows it, name test runs unchanged | 79 |
+| **disagreements** | **0** |
+
+Only the NEGATIVE comes from the arena. A row that IS an array still goes through the full name
+test, because the positive answer depends on nominal table membership the row does not carry.
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells.
+
+**Why this shape matters for what is left.** The remaining name predicates are mostly like
+`nameIsRefArray`: ladders that end in a nominal lookup, which is exactly the class the programme
+has refused six times. This shape sidesteps the refusal instead of arguing with it — you do not
+need to reproduce the ladder, only ONE structural fact the ladder requires. And because the
+predicate is a conjunction, the arena only has to be right about the cheap half.
+
+Look for it wherever a name test is guarded by a shape the arena knows: *is it an array, is it a
+map, does it have an arrow.* The win is measured in reaches that never enter the ladder, which —
+as in B267 and B268 — is usually most of them.
+
+**Four conversions off `unMemTys` now**, all in one function family: 1,034 arm parses (B267), 1,017
+element peels (B268), 416 name→row resolutions (B269), 803 ladder walks (B270).
