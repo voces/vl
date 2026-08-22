@@ -55244,3 +55244,83 @@ obstacle: the field's type is what the collect walk is holding when it pushes th
 **~27% removed across ten conversions**, every one byte-identical on the corpus, each proven live by
 whichever rung of the three-rung ladder could see it — and three of them reopening a refusal this
 programme had already recorded.
+
+## B237 — the hints come back around: the ref-list sidecar records the caller's row
+
+B236 put `declTyIxOfName` at 74% of the remaining surface and `fieldElemTyIxOfName` at 51.8% of
+THAT. Censusing the latter's five callers:
+
+| site | calls | files | share |
+| --- | ---: | ---: | ---: |
+| `emit_rep:1129` | 5271 | 191 | 42.1% |
+| `emit_classify:14903` — `rlElemTyIx.push` | **3250** | 470 | 25.9% |
+| `emit_rep:2123` — `sFieldElemTyIx.push` | 3089 | 797 | 24.7% |
+| `emit_rep:2138` — `uFieldElemTyIx.push` | 827 | 271 | 6.6% |
+| `emit_rep:1102` | 92 | 22 | 0.7% |
+
+**The second is inside `rlInternNameTy`** — the function B230–B235 spent six PRs feeding hints to.
+It mints a ref-list row and then records the element's arena type by RESOLVING the stored spelling,
+while the hint for that very name sits in scope as `ty`.
+
+## The measurement
+
+Dual-written at 2,206 hinted firings:
+
+| | |
+| --- | ---: |
+| `ty` is the IDENTICAL row | 562 |
+| same rendering, DIFFERENT row | **1644** |
+| semantically different | **0** |
+| resolve fails where `ty` answers | 0 |
+| folded spelling (`stored != name`) | 25 |
+| no hint | 1019 |
+
+**Zero semantic disagreements.** The 1,644 are `fieldElemTyIxOfName` re-resolving through a
+`resolveAnnot` that does not hash-cons and handing back a structural DUPLICATE of the row the
+checker already recorded. Recording the caller's row records the checker's, not a copy.
+
+Nominal spellings never arrive with a hint — every caller that passes one guards with
+`elemNameIsNominal` first — so the classes `repElemKey` keys by name are already -1 here and take
+the resolve unchanged. A folded spelling takes it too: the hint describes `name`, and a fold is
+exactly when the two differ.
+
+## This is the first conversion that COMPOUNDS ACROSS PRs
+
+B234 showed a hint compounding within one recursion. This one compounds across the sequence: the
+1,187 hinted firings that exist here at all exist BECAUSE B230–B235 taught the callers to pass a
+row. Before them `ty` was -1 almost everywhere and this site had nothing to use.
+
+The programme's own output became its next input.
+
+Measured: corpus A/B 0 diffs; `resolveAnnot` **-2060 across 299 files**; all six gates clean,
+including `rep-fuzz-check` — the gate that exists for exactly this kind of rep-layer row change.
+
+## Session totals
+
+| | corpus-wide `resolveAnnot` |
+| --- | ---: |
+| session start (`f035b4bc`) | 18,532 |
+| now | **~11,540** |
+
+**~38% of all name-keyed type resolution in the compiler removed**, across eleven conversions.
+
+### A near-miss worth recording
+
+The first commit of this entry CONTAINED THE MEASUREMENT PROBE. `counter3.py` had been applied to
+this worktree to count `resolveAnnot`, and its `return emitFail("RA ...")` sat above
+`emitModule` — a compiler that fails every program. `git status` was clean because everything,
+including the probe, had been committed.
+
+`lint-self.sh` caught it (`Unreachable code: this can never execute`, exit 1) and the commit went
+out anyway, because the exit code was printed and not read. **That is the same failure the
+test-discipline note already records — read the gate, do not merely run it** — and it now has a
+second instance where the consequence was a pushed branch rather than a wrong claim.
+
+The recovery is the check that makes it safe: reset to master, re-apply ONLY the conversion, and
+confirm the rebuilt compiler is BYTE-IDENTICAL to the binary the gates were run against
+(`66d8e9f1`). It was, so the measurements above stand unchanged. Without that comparison the whole
+gate run would have had to be repeated.
+
+A second slip in the same recovery: `git commit --amend` after a `reset --hard origin/master`
+amends MASTER'S TIP, not your own commit — it silently dropped the preceding merged entry from the
+branch. Caught by reading `HEAD^`. After a reset, commit; never amend.
