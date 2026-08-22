@@ -14394,24 +14394,73 @@ export function arrLitElemKind(arrIx: i32) {
 //   | variant -> `unTyIx[u]`       |  112  |   0    |  <- hinted
 //   | union element                |   32  |   0    |  <- hinted
 //   | struct -> `sTyIx[si]`        |  813  |   0    |  <- hinted (two exclusions)
-//   | closure element              |  220  |  12    |  declines
+//   | closure element (guarded)    |  184  |   0    |  <- hinted
 //   | map element                  |  658  | 162    |  declines
 //
 // The three that decline are recorded rather than forced, and their residues are named:
-//   * CLOSURE — the recorded element carries an un-widened literal union where the name
-//     carries its base (`("a" | "b") => i32` against `((string)=>i32)`).
 //   * MAP — the element name is the whole `{[K]:V}` spelling and the recorded element
 //     disagrees on a fifth of reaches.
 //
 // ARM 2 (the nested-list bucket) is unhinted BY DESIGN, not by measurement: it keys on one
 // of four COARSE spellings picked by the leaf classifiers, while the arena holds the
 // PRECISE element, so the two answer different questions on purpose.
+// Does `ty` mention a literal type or an object shape anywhere in its structure? The
+// guard the CLOSURE-element arm of `arrLitElemHintTy` needs, and it is conservative on
+// purpose: it declines a hint rather than risking a wrong rep key.
+//
+// The two classes it exists to exclude, both measured at that arm:
+//   * a struct-RETURNING closure (`((i32)=>{x:i32})`, `((i32)=>{x:i32}|null)`), where the
+//     name renders the return's shape inline and the recorded return is a row — 10 of 12
+//     disagreements;
+//   * an un-widened literal union in a PARAMETER (`("a" | "b") => i32` against the name's
+//     `((string)=>i32)`) — the remaining 2.
+//
+// Costed: the guard drops 36 of 220 firings that agreed anyway, and takes the arm's 12
+// disagreements to 0. A conservative exclusion is the right trade at a rep key.
+function tyMentionsLitOrObj(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  // The depth bound is a recursion guard, not a policy: a self-referential row would
+  // otherwise walk forever, and past this depth the arm declines rather than guesses.
+  if depth > 6 { return false }
+  const t = T.tys[ty]
+  if t is TyLit { return true }
+  if t is TyObj { return true }
+  if t is TyArray { return tyMentionsLitOrObj(t.aElem, depth + 1) }
+  if t is TyNullable { return tyMentionsLitOrObj(t.nInner, depth + 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if tyMentionsLitOrObj(ms[i], depth + 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if tyMentionsLitOrObj(ps[i], depth + 1) { return true }
+      i = i + 1
+    }
+    return tyMentionsLitOrObj(t.fnRet, depth + 1)
+  }
+  false
+}
 export function arrLitElemHintTy(arrIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     const cen = nodeArrayElemName(arrIx)
-    // Closure element — declines, see the header.
-    if arrElemIsClosureTy(arrIx, cen) { return -1 }
+    // THE CLOSURE-ELEMENT ARM, 184 of 184 under the guard. The name is
+    // `nodeArrayElemName`, so the row is the array's own recorded element — but only
+    // where the element mentions no literal type and no object shape, the two classes
+    // measured to disagree (see `tyMentionsLitOrObj`).
+    if arrElemIsClosureTy(arrIx, cen) {
+      const cty = arrLitArenaElemRow(arrIx)
+      if cty < 0 { return -1 }
+      if tyMentionsLitOrObj(cty, 0) { return -1 }
+      return cty
+    }
     if a.arrElems.length >= 1 {
       const e0 = P.nodes[a.arrElems[0]]
       // Arm 2 — the coarse nested-list bucket.
