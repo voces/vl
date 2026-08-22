@@ -14375,6 +14375,87 @@ export function arrLitElemKind(arrIx: i32) {
 // The ref-list ELEMENT type-NAME of the array literal at `arrIx` (assumes `arrLitIsRef`):
 // the union alias name for a union-variant element, else the matched struct's name. This
 // is the table key (`rlElemName`) the per-element-type interning uses.
+// THE ARENA TWIN of `arrLitElemName`, arm for arm: the ROW that arm's name denotes, or
+// -1 where the arm's answer is deliberately a NAME. Handed to `rlInternNameTy` beside the
+// name so the ref-list key resolves from the row the arm already looked up, instead of
+// re-resolving the spelling the arm just rendered.
+//
+// EACH ARM MUST USE ITS OWN SOURCE. Hinting every arm with the array's arena element
+// (`T.tys[nodeTyIxOf(arrIx)].aElem`) disagrees on 1057 of 2852 firings, because the two
+// OBJECT-LITERAL arms do not name that element at all — they name a row found in a TABLE
+// (`unNames[u]`, `sNames[si]`), and `repElemKey` keys a declared struct NOMINALLY. Their
+// faithful row is the same table's own TYPE column, which is the provenance
+// `repElemIdOfNameTy`'s header requires ("the type THIS VERY NAME was resolved to").
+//
+// ONLY THE TWO ARMS MEASURED AT 100% ARE HINTED. Dual-written per arm over the corpus:
+//
+//   | arm                          | agree | differ |
+//   | variant -> `unTyIx[u]`       |  112  |   0    |  <- hinted
+//   | union element                |   32  |   0    |  <- hinted
+//   | struct -> `sTyIx[si]`        |  813  |  20    |  declines
+//   | closure element              |  220  |  12    |  declines
+//   | map element                  |  658  | 162    |  declines
+//
+// The three that decline are recorded rather than forced, and their residues are named:
+//   * STRUCT — `sTyIx` has two producers (`sTyIxOfName` and the `anonRowTyIx` NODE bank).
+//     Excluding `#anon` rows moves it 43 -> 20, and what is left is the declared VIEW
+//     rows (`PView`/`AView`/`FView`, `{base: i32, length: i32}`) where the two producers
+//     still answer differently. 97.6% is not 100%, and a rep key that is silently wrong
+//     is worse than a parse.
+//   * CLOSURE — the recorded element carries an un-widened literal union where the name
+//     carries its base (`("a" | "b") => i32` against `((string)=>i32)`).
+//   * MAP — the element name is the whole `{[K]:V}` spelling and the recorded element
+//     disagrees on a fifth of reaches.
+//
+// ARM 2 (the nested-list bucket) is unhinted BY DESIGN, not by measurement: it keys on one
+// of four COARSE spellings picked by the leaf classifiers, while the arena holds the
+// PRECISE element, so the two answer different questions on purpose.
+export function arrLitElemHintTy(arrIx: i32) {
+  const a = P.nodes[arrIx]
+  if a is ArrayLit {
+    const cen = nodeArrayElemName(arrIx)
+    // Closure element — declines, see the header.
+    if arrElemIsClosureTy(arrIx, cen) { return -1 }
+    if a.arrElems.length >= 1 {
+      const e0 = P.nodes[a.arrElems[0]]
+      // Arm 2 — the coarse nested-list bucket.
+      if e0 is ArrayLit { return -1 }
+      if e0 is ObjLit {
+        if uDeclared {
+          const vn = objVariantName(a.arrElems[0])
+          if vn != "" {
+            // THE VARIANT ARM, 112 of 112. The name is `unNames[u]`; the row is that
+            // table's own `unTyIx[u]`, resolved from that very name at mint.
+            const u = unionOfVariant(variantIndexOf(vn))
+            if u < 0 { return -1 }
+            if u >= unTyIx.length { return -1 }
+            return unTyIx[u]
+          }
+        }
+        // Struct element — declines, see the header.
+        return -1
+      }
+    }
+    // THE UNION-ELEMENT ARM, 32 of 32. `arrLitUnionElemName` is `nodeArrayElemName`
+    // gated by `isUName`, so the row it renders from is the array's own recorded
+    // element — read off `nodeTyIxOf`, the column that renderer reads, not
+    // `nodeRepTyIxOf`.
+    if arrLitUnionElemName(arrIx) != "" { return arrLitArenaElemRow(arrIx) }
+  }
+  -1
+}
+
+// The array literal's own recorded ELEMENT row — the source `nodeArrayElemName` renders.
+// `nodeTyIxOf`, not `nodeRepTyIxOf`: the renderer reads the checker's column and the twin
+// must read the same one, which an earlier attempt got wrong.
+function arrLitArenaElemRow(arrIx: i32) {
+  const ty = nodeTyIxOf(arrIx)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
 export function arrLitElemName(arrIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {

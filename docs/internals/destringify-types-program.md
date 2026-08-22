@@ -54845,3 +54845,66 @@ name-valued, and three of the six blocks exist to serve consumers whose contract
 That is the honest end state of the census. Further progress needs a change to what the emitter's
 vocabulary IS — carrying rows where it now carries spellings — which is a language-implementation
 decision rather than a refactor, and belongs to the user, not to this programme's remit.
+
+## B230 — B224's refusal was too broad: the arm-for-arm twin converts two of its five arms
+
+B224 refused `emit_collect:3705` — the largest single site in the census, 2852 firings — on the
+grounds that the arena hint disagreed on 986 of them. That refusal was tested with **one hint for
+all five arms**, and that is not this programme's method. The method is the faithful twin, built
+ARM FOR ARM, as `shapeNominalOfTy` and `variantRowOfObjFieldSet` were.
+
+Rebuilt that way, the picture is completely different.
+
+## Two errors in the original test
+
+1. **The wrong column.** B224 hinted with `T.tys[nodeRepTyIxOf(i)].aElem`. `arrLitElemName` renders
+   from `nodeArrayElemName`, which reads **`nodeTyIxOf`**. Re-running on the renderer's own column
+   is the five-sources note's own rule — though here it made things slightly WORSE (1057 differ
+   against 986), which is itself worth recording: the column was wrong AND it was not the cause.
+2. **One hint for five arms.** Two of the arms do not name the array's element at all. They name a
+   row found in a TABLE — `unNames[u]` and `sNames[si]` — and `repElemKey` keys a declared struct
+   nominally, so the array's structural element could never match. Their faithful row is the same
+   table's own TYPE column.
+
+## Per-arm agreement, dual-written
+
+| arm | source of the name | faithful row | agree | differ |
+| --- | --- | --- | ---: | ---: |
+| variant | `unNames[u]` | `unTyIx[u]` | **112** | **0** |
+| union element | `nodeArrayElemName` | the recorded element | **32** | **0** |
+| struct | `sNames[si]` | `sTyIx[si]` | 813 | 20 |
+| closure element | `nodeArrayElemName` | the recorded element | 220 | 12 |
+| map element | `arrLitMapElemName` | the recorded element | 658 | 162 |
+| nested-list bucket | four fixed spellings | — | unhinted BY DESIGN | — |
+
+**The two 100% arms are converted; the three that are not, decline.** 144 firings move from a
+name-keyed resolution to a row.
+
+## The three declines, with their residues named
+
+* **STRUCT, 20 of 833.** `sTyIx` has two producers — `sTyIxOfName` and the `anonRowTyIx` NODE bank
+  (B225). Excluding `#anon` rows via the existing `sIsAnonRow` moves it 43 → 20, and what remains is
+  the declared VIEW rows (`PView`/`AView`/`FView`, all `{base: i32, length: i32}`) where the two
+  producers still answer differently. **97.6% is not 100%, and a silently wrong rep key is worse
+  than a parse.**
+* **CLOSURE, 12 of 232.** The recorded element carries an un-widened literal union where the name
+  carries its base: `("a" | "b") => i32` against `((string)=>i32)`.
+* **MAP, 162 of 820.** The element name is the whole `{[K]:V}` spelling; the recorded element
+  disagrees on a fifth of reaches.
+
+The nested-list arm is unhinted by DESIGN rather than by measurement: it keys on one of four COARSE
+bucket spellings picked by the leaf classifiers, while the arena holds the PRECISE element. B224
+read that as evidence against hinting; it is evidence that the arm's answer is a name on purpose.
+
+## Measurement
+
+Corpus A/B 0 diffs. `resolveAnnot` **-144 across 46 files**, exactly the 144 agreeing firings — the
+third instrument again, because the memo absorbs these before they reach a parse.
+
+## The correction that matters
+
+B224's headline — "the arena can answer at every firing and disagrees on 34.6%" — was true of the
+hint it tested and false of the site. **A single wrong hint across a multi-arm resolver produces a
+disagreement rate that looks like a property of the site.** It is a property of the test. Any
+refusal recorded from a one-hint test over a multi-arm function should be re-opened the same way
+this one was.
