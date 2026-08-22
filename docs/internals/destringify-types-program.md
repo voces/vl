@@ -55131,3 +55131,57 @@ site makes ANOTHER site's conversion more effective rather than just smaller.
 | `emit_classify:17943` | 157 | not yet measured |
 
 Measured: corpus A/B 0 diffs, all six gates clean.
+
+## B235 — the union-arm element, and the `ensureRefElem` surface closes
+
+The third of `ensureRefElem`'s four callers. Its own header already says what to do:
+
+```vl
+// ARENA HAND-OVER: `mems` is this very seam's answer for these very atoms, so a
+// covered row hands the arm's type straight down instead of resolving `a` again.
+let aTy = -1
+if cov { aTy = mems[i] }
+internShapeDeepTy(a, aTy)
+const elem = refArrElemName(a)
+if elem != "" {
+  ensureRefElem(elem)        // ← and then resolved `elem` again anyway
+}
+```
+
+The hand-over was built and used one line above; the intern below it kept the name route.
+`aTy` is `a`'s row, so the arm's ELEMENT is its `aElem`.
+
+Dual-written: **167 hinted, 0 disagreements**, 47 declined by `elemNameIsNominal`, and the row
+available at **every** reach (0 unhinted) — the first site in this sequence with full coverage,
+because `unionSetArmTys` is a seam that already carries types.
+
+Measured: corpus A/B 0 diffs; `resolveAnnot` **-167 across 35 files**.
+
+## The surface, closed
+
+| site | calls | outcome |
+| --- | ---: | --- |
+| `emit_collect:4071` | 4215 | 3184 hinted (B233) |
+| `emit_classify:13457` — recursion | 660 | 406+, compounding (B234) |
+| `emit_classify:17891` — union arm | 214 | **167 hinted (here)** |
+| `emit_classify:18043` — closure result | 157 | declines — no row in scope |
+
+`18043` is the one with nothing to hand over: `res` is a closure RESULT spelling produced by
+`annRetNameOf`'s arrow cut, and the enclosing walk holds no row for it. That is a genuine absence,
+not a hazard — unlike the four nominal classes, there is simply no arena index in scope to offer.
+Recorded as such.
+
+## Session totals
+
+Corpus-wide `resolveAnnot` over 2075 files:
+
+| | calls |
+| --- | ---: |
+| session start (`f035b4bc`) | 18,532 |
+| after B230–B232 (array literal) | 17,549 |
+| after B233 (annotation element) | ~14,365 |
+| after B234–B235 | **~13,784** |
+
+**~26% of all name-keyed type resolution in the compiler is gone**, across ten conversions, every
+one byte-identical on the corpus and each proven live by the rung of the instrument ladder that
+could see it.
