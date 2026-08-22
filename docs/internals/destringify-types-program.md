@@ -57971,3 +57971,54 @@ this name says?"* — a question about two derivations of the same fact. The rig
 i32 is the destringified form of a decision; re-deriving it from either the name OR the type is
 solving a problem that was already solved one pass earlier. **When a name is BANKED rather than
 computed at the point of use, look for the producer's own record of what it decided.**
+
+## B296 — the safety contract PINNED, one waste removed, one refusal earned
+
+The owner's ruling on the rep-sharing question: *"So long as a `7 | 9 | null` can't be passed as an
+argument expecting `1 | 2 | null` I don't care how it's internally handled. Also `7 is 1` or `x is T`
+where x is typed as `1 | 2 | null` and T is an alias for `7 | 9 | null` should both obviously be
+false."*
+
+**All three hold, and they now have fixtures.** Softening is confined to the rep layer; the checker
+reads the precise arena types and never the softened spelling:
+
+| property | result | fixture |
+| --- | --- | --- |
+| cross-assign the two aliases | REJECTED — `argument 1: expected 1 \| 2 \| null, got 7 \| 9 \| null` | `error-same-layout-litunion-arg.vl` |
+| `x is T`, disjoint same-layout alias | REJECTED — `` `is` check type 'T' is not a variant of 1 \| 2 \| null `` | `error-same-layout-litunion-is.vl` |
+| `7 is 1` / `1 is 1` | `0` / `1` | `same-layout-litunions-stay-distinct.vl` |
+
+The second is STRICTER than "false": VL rejects a narrowing that can never succeed rather than
+folding it to a constant. Worth knowing, since the ruling asked for false.
+
+### A — 11,748 scans for a name that cannot exist
+
+`inferRetIsUnionAt` / `inferRetIsValueUnionAt` fall back to the name when there is no table entry —
+and at their one call site `inm` is `""` exactly then. The union registry never holds an empty name:
+measured **`emptyUn = 0`** over every row of every corpus program. So the fallback was scanning the
+whole table for `""` **11,748 times per corpus pass**, always to answer false. Short-circuited.
+
+### B — REFUSED: the guard is about the SPELLING because the return value is an intern key
+
+`arrLitUnionElemName` (16,410 reaches) renders the array element (`nodeArrayElemName` →
+`tyToStructStr`, a real render) and asks `isUName` of it — so it looks like the render→decide shape.
+The row route disagrees **10 times of 16,410**, and the direction is the tell: **row-yes /
+name-no**, with witnesses
+
+```
+cen=[string|i32]  elemTy=[string | i32]     (a structurally-equal row IS registered)
+cen=[f64]         elemTy=[K]                (the name is the SOFTENED form)
+```
+
+The arena is MORE permissive — it finds registrations the spelling misses, e.g. one registered as
+`i32|string` when the element renders `string|i32`. That is not an improvement here, because the
+function **returns `cen`, and its caller uses it as an intern key** (`rlInternNameTy(emptyElem, 2,
+…)`). Admitting a spelling the registry does not hold would mint a key nothing can look up.
+
+**So the guard must be about the NAME's registration, not the type's** — B266's two-questions rule,
+in its sharpest instance yet: the site's question is "is this SPELLING registered", because the
+spelling is the product.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline rebuilt from the current master commit); `deno
+task test` **2,228** (+3 fixtures); ci-native **2,245**; fixpoint holds; lint clean; rep-fuzz exact;
+grid no BAD cells.
