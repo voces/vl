@@ -53776,6 +53776,64 @@ What is left is one unmeasured site, two unreachable ones, and three refusals ea
 witness and a mechanism. That is a different shape of "remaining" from the one this programme
 started with, where every entry was simply unexamined.
 
+## B215 — the last unmeasured census site, and the wrong column again
+
+`emit_classify.vl:19943` was the one entry on B210's corrected census never measured. It is a
+ladder with two decisions on the canonical render `snc = nodeTyCanonObjName(exprIx)`:
+
+```vl
+if snc != "" { const sbn = structIndexByName(snc)      // NOMINAL — a declared name lookup
+               if sbn >= 0 { return sbn } }
+const cr = repRowOfTyStruct(nodeRepTyIxOf(exprIx), sScanLim())
+if cr >= 0 { return cr }
+if snc != "" { const sic = structIndexOfTypeName(snc)  // FIELD-SET on the spelling
+               if sic >= 0 { return sic } }
+const fsx = structRowOfObjFieldSet(nodeTyIxOf(exprIx)) // ...which the rung BELOW already asks
+if fsx >= 0 { return fsx }
+```
+
+The first is nominal identity and stays (B208). The second is the target, and it **answers on
+exactly one corpus file** — `closures/field-closure-chain-same-fieldset.vl`, `{f:(i32)=>K0}`.
+
+### The first arena source tried was the wrong one
+
+Lockstepping against `structRowOfObjFieldSet(canonTyIxOf(exprIx))` gave a disagreement:
+`nm=0 ty=-1 canonTy=-1`. Read alone, that says the arena cannot answer and the render is
+load-bearing — which is how a decline gets recorded.
+
+Probing all five sources at the site instead:
+
+```
+nm=0  nodeTy=36  fsNode=0  canonTy=-1  repTy=36  fsRep=0  rewrote=0
+```
+
+**`canonTyIxOf` is -1 at this node; `nodeTyIxOf` and `nodeRepTyIxOf` both hold the type, and both
+field-set match to the SAME row the render found.** The type was there the whole time, in a
+different column. This is the five-sources note's own failure mode, and it is the sixth time in
+this programme that "the arena cannot answer" turned out to mean "I asked the wrong column".
+
+### So the rung is not converted — it is DELETED
+
+Its single answering case resolves identically at the rung directly beneath it. Removing it lets
+control fall through to `structRowOfObjFieldSet(nodeTyIxOf(exprIx))`, which returns row 0 for that
+file. Corpus A/B: **0 diffs**.
+
+`snc` itself stays, feeding the nominal `structIndexByName` above.
+
+### The corrected census is now closed
+
+Every site on B210's list is either converted, deleted, unreachable, or refused with a witness:
+
+| outcome | sites |
+| --- | --- |
+| converted or deleted | 12 |
+| UNREACHED (0 files, verified probes, hand-built witnesses miss) | 2 (`emit_classify.vl:8289`, `:20101`) |
+| REFUSED with a named mechanism | 3 (`ctx` nominalization B208; `ctx` litunion + union arms B212) |
+
+The refusals are not "not yet done". Each has a witness program, a measured cause, and — for the
+nominalization — a check-clean invalid module proving the conversion wrong. The two unreached sites
+have neither a corpus file nor a constructed witness that reaches them.
+
 ## B216 — the census grew a third time, and the `monoArgTyName` family is what is left
 
 B215 closed "the corrected census". Re-running it with a WIDER RENDERER VOCABULARY returns
