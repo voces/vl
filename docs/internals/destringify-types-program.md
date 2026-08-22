@@ -53682,3 +53682,54 @@ fact.
 Of the `ctx` family's 8 decisions: 1 converted, 2 measured and refused with a named cause, 5 not
 yet measured (`nameIsArray`, `arrElemNameRaw`, `nameIsWholeSpanShape`, `nameIsSpaceFree`, and the
 nominalization B208 already refused).
+
+## B213 — measure the FINAL answer when a later guard can overturn the one you changed
+
+`cbRetVariantIdx` (B210 census, `emit_classify.vl:11566`) opens with
+`variantIndexOfTypeName(inferRetNameByNode(...))`. That function is TWO arms in sequence — a direct
+match against registered variant NAMES, then a field-set match parsed out of the spelling — and
+only the second is convertible. The first asks whether the name IS a declared variant, which is
+nominal identity the arena cannot recover (B208). So the shipped form is a hybrid: `variantIndexOf`
+on the name, `variantRowOfObjFieldSet` on the type.
+
+### The lockstep said 1 disagreement and the lockstep was asking the wrong question
+
+Compared at the assignment, the two answers differ on
+`closures/variant-box-closure-field-nested-struct-result.vl`: spelling 0, arena -1. Three
+hypotheses were tested and all three were wrong — the code-15 canonical tightening (removed it, the
+disagreement stayed), the bounds guard (removed it, stayed), and the type column being unpopulated
+(`retTy=87 kind=obj:1`, it is populated). Instrumenting the matcher for its reason gave:
+
+```
+why=code 15vs14
+```
+
+The variant row records field `f` as a CLOSURE (14); the query's field is a nested STRUCT (15).
+`shapeFieldTypeCompat` is lenient and lets the spelling through; `variantRowOfObjFieldSet` refuses.
+
+**And the spurious match is what the guard twenty lines below exists to undo.** Its header names
+this exact file and the `ref.cast` CAST TRAP it prevents. So the name path matches wrongly and then
+corrects itself, while the arena path never matches.
+
+Re-measured on the FUNCTION'S RETURN rather than on that line: **0 disagreements.** Reach: the
+arena arm answers on 4 files. A/B: 0 diffs.
+
+### The rule
+
+**When the value you are changing passes through a later guard, the lockstep belongs on the final
+answer, not on the assignment.** An intermediate disagreement is not a defect if a downstream check
+absorbs it — and here the "disagreeing" arena answer is the better one, arriving at the same result
+without the round trip through a wrong match.
+
+This is the second time in three entries that a first measurement asked a narrower question than
+the one that mattered (B212's three-questions-in-one-build was the first). The instrument keeps
+being the thing under test.
+
+### Also measured, and NOT shipped
+
+Both `nodeNulStructInnerName` -> `structIndexOfTypeName` sites (`emit_classify.vl:8289` and
+`:20101`) are **unreached**: 0 corpus files each, with verified-distinct probe binaries, and three
+hand-built witnesses for the `ifExprRefSlot` one (an if-EXPRESSION whose THEN arm is `null` with no
+`pendingStructIdx` seed) that compile, run correctly, and still miss it. Their 0-disagreement
+readings are therefore VACUOUS, and converting either would ship an inert arm. Recorded rather than
+converted.
