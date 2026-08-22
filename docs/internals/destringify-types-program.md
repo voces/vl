@@ -53163,3 +53163,48 @@ rediscovered as new surface.
 A render whose result is threaded through a RETURN into another function's decision would not
 match — the pattern is local by construction. That is the honest bound on this number, and it is
 the shape `monoArgTyName` has (B201), so at least one such thread is known to exist.
+
+## B203 — a decline path is not a finished site; one of them is now gone
+
+B202 listed five render-then-decide sites and called three of them finished because "the arena
+decides, the render answers only where the arena has nothing." That is the right shape for a
+LADDER, but it is not the goal's bar: a decline path still spells a type out and asks the spelling
+a question, every time it fires. So the three were re-measured, starting with the one whose comment
+already claimed the render was dead.
+
+### `emit_classify.vl:19902`, measured three ways
+
+| outcome | files |
+| --- | ---: |
+| the render ANSWERS (`structIndexOfTypeName` >= 0) | **0** |
+| the render SHORT-CIRCUITS (returns -1, blocking the rung below) | **5** |
+| gate `sn != ""` vs `anonTySpellable` on the arena — disagreements | **0** |
+
+The first number is why the call could go. **The second is why the rung could not**: that -1 is a
+`return`, and it stops the nullable-struct rung underneath from running on those 5 files. A reader
+who saw only "answers on 0 files" would have deleted the whole rung and changed 5 programs. The
+third is what let the GATE move too, so nothing renders here at all any more.
+
+### The -1 is the RIGHT answer, not merely the equal one
+
+`structIndexOfTypeName` matching where `structRowOfObjFieldSet` declined would mean the SOFTENED
+spelling matched a row the actual type does not — the render's print-widening finding a row by
+losing the very distinction that rules it out. That is #1694's defect in a different costume
+(there, a litunion alias softened to `string` and keyed a `$fnsig` nothing looks up). Answering -1
+refuses it rather than preserving it.
+
+So this is not "equivalent on the corpus, and off-corpus who knows". Off-corpus, the two ladders
+can only differ in the direction where the render is WRONG.
+
+### The rule this establishes
+
+**"The arena decides first" is a ladder, not a destringification.** A site is finished when the
+render is GONE, and getting there needs three numbers, not one:
+
+1. does the decline path ever ANSWER? (if yes, it is still deciding — not finished)
+2. is its RETURN load-bearing where it declines? (if yes, the control flow stays, only the render goes)
+3. does its GATE have a faithful arena twin? (if no, the render survives as the gate alone)
+
+Only (1) was ever measured before. B202's other two "finished" sites are now queued for the same
+three numbers, and the honest count of render-then-decide sites is **four**, not the three B202
+implied — until each decline path is driven out the same way.
