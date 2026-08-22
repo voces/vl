@@ -54094,3 +54094,68 @@ spelling is a constant in the source, not a printed type — and are listed only
 The two `srcElem + "[]"` sites BUILD a type by string concatenation and are the most interesting
 remainder. `:2279` (`listTy`) is `monoInferListElem`, the exact sibling of the function converted
 here, and should take the same out-param treatment.
+
+## B219 — the sibling, and the round trip that mints a row every single time
+
+`monoInferListElem` is `monoInferLocalScalar`'s sibling (B218), and it is the sharper case. Its
+answer is computed from an arena row and then PRINTED:
+
+```vl
+const lt = lookup(localName)
+if lt >= 0 {
+  const ltt = T.tys[lt]
+  if ltt is TyArray {
+    if ltt.aElem >= 0 {
+      const el = T.tys[ltt.aElem]
+      if !(el is TyVar) { listName = tyToStructStr(lt) }   // ← a RENDER of `lt`
+    }
+  }
+}
+```
+
+`tyToStructStr` is a renderer in the strict sense the goal names — it takes a type and returns its
+string. The caller then ran `synthTypeRef(listTy, -1)`, whose `-1` arm parses a type back out of
+that string. Render, then parse the render: the exact shape the programme exists to remove, with
+the original row sitting in a local the whole time.
+
+## Every firing minted a duplicate
+
+Two corpus files reach the site, three firings each:
+
+```
+[i32[],lt=64,re=65]  [boolean[],lt=67,re=68]  [f64[],lt=70,re=71]
+[i32[],lt=68,re=69]  [f64[],lt=72,re=73]      [i32[],lt=76,re=77]
+```
+
+**`re == lt + 1` in all six.** A composite spelling never resolves back to the row it was printed
+from, because `nameToTy` does not hash-cons — it builds a fresh row and hands back its index. So
+this round trip cost one duplicate arena row per firing, not merely a parse.
+
+That is the contrast with B218's site, and it is a property of the SPELLING rather than of the
+site: a bare primitive (`f64`) resolves to the canonical row and mints nothing, a composite
+(`f64[]`) mints. Neither is safe to assume without measuring, which is why both were measured.
+
+## Both instruments fire, and they agree with the probe
+
+Corpus A/B: 0 diffs, as always. The two liveness instruments, per file:
+
+| file | `nameToTy` calls | arena rows |
+| --- | ---: | ---: |
+| `generics/sigkey-pin-infers-callback-result-list.vl` | 15 → 9 (**-6**) | 73 → 70 (**-3**) |
+| `inference/unannotated-build-expr.vl` | 18 → 12 (**-6**) | 79 → 76 (**-3**) |
+
+The row delta is **-3 per file, exactly the three firings each** — one duplicate removed per firing,
+matching the `re == lt + 1` reading independently.
+
+The call delta is **-6 per file, TWO calls per firing.** That is not a discrepancy: parsing the
+composite `i32[]` recurses into its element, so re-parsing a printed composite is itself recursive
+string work. The count makes visible something the site reading did not — the cost of a round trip
+scales with the depth of the type's spelling.
+
+## Where the family stands
+
+Converted: `:2235` (B217), `:2294` (B218), `:2279` (here). `:1894` is deliberately unconverted with
+a measured reason. The remainder, in reach order: `:859` (`outType`, 3 files / 12), `:2146`
+(`retName`, 2 / 8), `:1014` (`elemType`, 2 / 3), `:2182` + `:2180` (`srcElem + "[]"`, 3 / 3 — types
+BUILT by string concatenation, the most interesting shape left), and two `"f64"` source literals
+that are not printed types at all.
