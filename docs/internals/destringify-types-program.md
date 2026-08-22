@@ -56329,3 +56329,64 @@ claiming the site is fully destringified.
 
 Gated with the test suites FIRST (B255's discipline): 2225 + 2242 pass, A/B 0 diffs, fixpoint
 holds, rep-fuzz exact, grid clean.
+
+## B258 — the render that survives, and why: an ATOM COUNT is a fact about the SPELLING
+
+B257 left one render at `collectTyReachCloSigs`'s `TyFunc` arm: the key now comes from
+`sigKeyOfTy(tyIx)`, but `arenaEmitName(tyIx)` still runs because
+`nulCloMixedUnionUnregistered(nm)` — a deliberate reject — reads the name.
+
+Censusing that guard's exit paths over 1,397 calls:
+
+| exit | count | share |
+| --- | ---: | ---: |
+| the closure RESULT is not a multi-atom union (`atoms.length < 2`) | **1178** | **84.3%** |
+| the scalar/composite mix test fails | 184 | 13.2% |
+| reaches the four registration checks | 35 | 2.5% |
+
+84% exit on one question. If the arena could answer it, the render would be skipped on the common
+path — roughly 950 of 1,133 reaches.
+
+## Four predicates, none exact
+
+| predicate | agree | disagree |
+| --- | ---: | ---: |
+| `TyUnion` with ≥2 members | 989 | 144 |
+| + `TyNullable` counts as two atoms | 1081 | **52** |
+| conservative: only kinds that cannot render a top-level `\|` | 970 | 163 |
+| + `TyArray` (renders `X[]`, one atom) | 1081 | **52** |
+
+The residue does not shrink — it CHANGES DIRECTION. Adding the nullable arm fixes `()=>K0|null`
+and breaks nothing; the remaining 52 are `(i32)=>K0`, `(K)=>K`, `(i32)=>Animal` — **a literal-union
+alias and a union alias are each a `TyUnion` with many members that RENDERS AS ONE NAME.**
+
+## The boundary, stated precisely
+
+`splitUnionAtoms` counts TOP-LEVEL ATOMS IN A SPELLING. That count is not a function of the type:
+
+* a litunion alias `K0` — one atom, many `uMembers`;
+* a union alias `Animal` — one atom, many `uMembers`;
+* a nullable `boolean | null` — two atoms, one `TyNullable` wrapper;
+* an array `((f64|string)[]|null)[]` — one atom, a `|` nested two levels down.
+
+Two types with identical structure have different atom counts depending on whether a declaration
+names them. **The guard is asking how the type was WRITTEN, and the arena does not record that** —
+the same shape as B229's canon (a rewrite whose result depends on the spelling it arrived in) and
+B246's ABI key (tokens defined over the name vocabulary).
+
+So the render at this site stays, and it stays for a reason that is now measured rather than
+assumed. B257's conversion — the KEY off the type, the GUARD still reading the name — is the
+correct decomposition of this site, not a partial one.
+
+## What this closes
+
+Every `annSigKey` consumer has now been walked to its source:
+
+| consumer | outcome |
+| --- | --- |
+| `paramCloSigKey` | arena-routed (B249) |
+| the ident path | arena-routed (B256) |
+| `internCloSigOfAtom` ← the arena walk | KEY arena-routed; guard's render REFUSED (B257, here) |
+| `internCloSigOfAtom` ← 5 name-in callers | name-in by construction |
+| the result-spine annotation entry | name-in by construction |
+| `:6705` | dead, 0 of 2075 |
