@@ -1015,12 +1015,24 @@ and needs nothing from vl beyond scalar exports.
   > the shapes this document itself nominates as the defect are fixed, so treat
   > 81/42 as refuted as a LIVE number and re-derive before anyone schedules work
   > against it — not that every cell was re-measured. Combined with the memory
-  > finding above, this row now has no half worth scheduling. `const k: K = "aa"; const x: K | f64 = k`
-  > converts the atom ID to a float; `if x is K { const y: K = x }` is invalid wasm;
-  > `K | string` answers `x is K` TRUE for a plain string. If webcraft's order/state
-  > enums ever sit in a union beside a non-enum arm, those are the shapes to avoid —
-  > and if that is a real pattern for you rather than a hypothetical, say so, because
-  > it moves this from "nicety" to a correctness item and changes its priority.
+  > finding above, this row now has no half worth scheduling.
+  >
+  > **RE-RUN 2026-08-22 — the three nominated shapes are correct, and the sentence
+  > that used to sit here saying otherwise was stale.** This paragraph previously
+  > ended by restating the original defect list as if it were live, one screen after
+  > the UPDATE that refuted it — so the row told a reader both things at once. What
+  > actually happens on the tip:
+  >
+  > | shape | old claim | measured |
+  > | --- | --- | --- |
+  > | `const k: K = "aa"; const x: K \| f64 = k` | converts the atom ID to a float | prints `aa` |
+  > | `if x is K { const y: K = x }` | invalid wasm | prints `aa` |
+  > | `K \| string`, `x is K` over a plain string | answers TRUE | answers **false** |
+  >
+  > So there are no shapes to avoid here. If webcraft's order/state enums sit in a
+  > union beside a non-enum arm, that is fine today — and if it is a real pattern for
+  > you rather than a hypothetical, say so anyway, because a 244-cell re-derivation is
+  > worth doing before you depend on the whole grid rather than these three cells.
   > Enums that stay standalone, or live in a Buffer, are unaffected: they are already
   > i32 atoms.
 - **Readonly fields / A9 variance**: would let kernel expose read-only views
