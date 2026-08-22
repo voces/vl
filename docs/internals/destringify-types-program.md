@@ -57121,3 +57121,52 @@ test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid n
 per suspect in a single build for the distribution, then work down the list. It cost two builds and
 two sweeps and it re-ranked the entire remaining programme — the site worth converting had one
 fourteenth the call sites of the one that looked biggest.
+
+## B275 — second on the census list: walk the spans, materialize only what the ladder needs
+
+B274's census ranked `isValueUnionName` second at **24,294 splits**. Instrumenting it further shows
+why splitting was the wrong shape here, in two independent ways:
+
+| | |
+| --- | --- |
+| atom strings allocated | 50,330 |
+| atoms ever examined | 35,698 |
+| **allocated and never looked at** | **14,632** |
+| of the examined, one of the 7 plain scalars | **17,336** |
+
+The first number is an EAGER/LAZY mismatch: the loop returns on the first member that is not a value
+atom, but the split builds every member first. The second is a MATERIALIZATION mismatch: half the
+members it does examine are `i32`/`boolean`/`string`/`i64`/`f64`/`f32`/`null`, which
+`valueAtomKindSpan` decides with seven `spanEqAt` comparisons and no slice at all.
+
+The function now walks spans, calls the span form first, and materializes only when that returns
+`-2` ("not one of these — ask the full ladder"), which is kept distinct from `valueAtomKind`'s own
+`-1` ("not a value atom") so a caller can never read one as the other.
+
+The `unionMemberCount(name) < 2` guard stays in FRONT of the walk. It is allocation-free and rejects
+the common single-name case (`isValueUnionName("S")`) before any of this starts — which is why the
+walk is not simply merged into it.
+
+Dual-written against the splitting form: **94,362 reaches, 0 disagreements.**
+
+**Total `splitUnionAtoms` calls 86,350 → 62,056 — 24,294 removed, 28.1%.**
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells. Re-run in full after the rebase, because the rebased
+binary was NOT byte-identical to the gated one.
+
+**An arithmetic check caught a stale base, and it is worth keeping as a habit.** The first
+measurement of this change read 91,054 where ~62,000 was expected. The discrepancy was exactly
+28,998 — B274's number — which said the worktree predated that merge rather than that the change
+misbehaved. **A measured total that disagrees with the sum of its parts is evidence about the SETUP
+first, not about the code.** Rebasing and re-measuring gave 62,056, exactly 86,350 − 24,294.
+
+### The arc of this axis
+
+| | calls | atoms allocated |
+| --- | --- | --- |
+| before B273 | 126,675 | 180,866 |
+| now | **62,056** | **84,941** |
+
+**−51% of the calls and −53% of the allocations**, across four conversions (B273, B274, B275 and
+B271's seam), none of which changed a single answer.
