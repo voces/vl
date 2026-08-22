@@ -55674,3 +55674,51 @@ inserted by line number is only sound when the call OWNS its line**, and neither
 reported wrong; sizing it needs counters placed inside each body.
 
 Measured here: corpus A/B 0 diffs, all six gates clean.
+
+## B244 — the census redone with a syntax-safe instrument, and the third nullable-base site
+
+B243 reported a `structIndexOfTypeName` per-site census as UNRELIABLE and refused to publish it.
+Redone with a pass-through wrapper — `f(X)` becomes `probeAt(N, X)`, an EXPRESSION, so it is sound
+in a guard, an argument and a single-line body alike — the total is **6,100**, matching the direct
+counter exactly. The broken instrument had said 8,111.
+
+| site | calls | files | share |
+| --- | ---: | ---: | ---: |
+| `structIndexByValName` (a one-line wrapper) | 1442 | 92 | 23.6% |
+| `retNulRefFlag` | 1235 | 153 | 20.2% |
+| `nulBaseStructRow` | 1088 | 111 | **removed in B243** |
+| `annParamKind` | 934 | 6 | 15.3% |
+| `annRetKind` | 729 | 131 | 12.0% |
+| eleven others | 672 | — | 11.0% |
+
+**The instrument being wrong was itself informative**: the mis-measured site read 1,735 calls across
+1,735 files — one per program — which is the signature of a counter that landed at module top
+level, outside a single-line function body. A per-site count exactly equal to the file count is
+that tell.
+
+## The third site asking "is the nullable base a struct?"
+
+`retNulRefFlag(tyIx)` holds a NODE and asks the field-set matcher a boolean question:
+
+```vl
+const base = nullablePartOf(ty.tyName)
+if base != "" {
+  if structIndexOfTypeName(base) >= 0 { return 1 }
+}
+```
+
+That is the question B242 and B243 answered from the arena at `nulBaseStructRow` — and here the
+site wants only the BOOLEAN, not the row, so the arena replaces the matcher outright rather than
+guarding it.
+
+Dual-written: **1,224 agree, 0 disagree**, arena uncovered on 11. Those 11 keep the name path,
+because *said nothing* is not *said no* — the same distinction B243 turned on.
+
+**1,224 field-set scans removed.** Corpus A/B 0 diffs; all six gates clean.
+
+## Three sites, one question, one answer
+
+`nulBaseStructRow`, its field-set tail, and now `retNulRefFlag` all asked "is this nullable
+annotation's base a struct?" of a rendered name. All three now ask the arena. The name path
+survives in each only where the arena has no `TyNullable` recorded at all — 10, 10 and 11 reaches
+respectively, which is the honest floor of this question rather than a target.
