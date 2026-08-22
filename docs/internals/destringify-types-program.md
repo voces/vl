@@ -57481,3 +57481,44 @@ The mechanical step that would unlock the family is giving `tyTopIndexOf` an `un
 already takes `from`), which makes every scanner over it span-addressable. That is a change to the
 scanner's own contract rather than to its callers — **the same shape as the three standing refusals:
 the next real item is a representation change, not another call-site conversion.**
+
+## B285 — the scanner takes a SPAN, and the "representation change" turns out not to need one
+
+B284 closed by naming the blocker: the remaining `arrElemNameRaw` reach is at sites that hand the
+element to a predicate needing a REAL string, and unlocking those "means giving `tyTopIndexOf` an
+`until` bound — a change to the scanner's contract."
+
+**It does not.** `tyTopIndexOf` already takes a `from`, and a separator it reports at or past `to`
+is *outside the span* — which is indistinguishable, to a caller, from finding none. So
+`unionMemberCountSpan(name, from, to)` is the existing scanner with one comparison added at the
+call, and no signature changed. Depth is tracked from `from`, so it is exact for any span that is
+balanced on its own — which every element/leaf cut of a rendered type name is.
+
+With that, `nameIsMapArray` (154,070 reaches) converts. It cut the element out purely to ask
+`nameIsBareMap`, and that predicate reduces:
+
+```
+nameIsBareMap(x) = nameIsMap(x) && !nameIsMapMemberUnion(x)
+                 = nameIsMap(x) && !(nameIsMap(x) && unionMemberCount(x) >= 2)
+                 = nameIsMap(x) && unionMemberCount(x) < 2
+```
+
+Both halves transpose: the map test is three character compares (`nameIsMapSpan`), the count is the
+bounded scanner. The span used is the same RAW cut `[0, len-2)` the function's own header insists
+on — no paren strip — so the sabotage-measured distinction it documents is preserved exactly.
+
+Dual-written: **154,070 reaches, 0 disagreements.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The lesson, and it is the second time this programme has made this mistake.** B258 recorded a
+refusal that B259 overturned by measuring the guard's VERDICT instead of its early-out. B284
+recorded a blocker — "this needs a contract change" — that this entry overturns by noticing the
+contract already permitted it. **Both were reasoned, not measured.** A blocker stated in a
+conclusions section is a claim like any other; before inheriting one, check whether the thing it
+says is impossible is actually attempted anywhere.
+
+`nameIsI32ListArray` (163,407) is the same shape one level deeper — its element goes to
+`nameIsI32Array`, which is now `arrElemIs || arrElemIs || nameIsNulBoolList`, and only the last
+still needs a string. That is the next site, and it is a conversion, not a design change.
