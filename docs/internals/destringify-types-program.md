@@ -57444,3 +57444,40 @@ test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid n
    primitive sat beside an untouched 2.09M-call one, and nothing but measuring the whole surface
    would have said so. **When an axis closes, re-census one level out before assuming the area is
    done.**
+
+## B284 — the `X[][]` question, asked without cutting `X[]` out first
+
+B283 converted the sites that compare the element to a LITERAL. The next tier down asks whether the
+element is itself an ARRAY of something — `nameIsF64Array(arrElemNameRaw(name))`, i.e. "is this
+`f64[][]`" — and pays a slice to ask it.
+
+`arrElemIsArrayOf(name, want)` reads the inner `[]` at `len-4 .. len-3` and compares the leaf span
+`[0, len-4)`. It is the two-step form arm for arm: a non-array `name` yields `""` there and `false`
+here, and for an array the element string IS the span `[0, len-2)`, so its own array test and
+element compare are exactly those reads.
+
+Converted:
+- **`refArrShapeKind`** (124,675 reaches) — `const inner2 = arrElemNameRaw(name)` existed ONLY for
+  three `nameIsXArray(inner2)` tests. The binding is gone.
+- **`refArrElemName`** (32,070 + 31,988 + 21,058) — the three scalar-inner-list arms return the
+  element, so they now TEST in place and cut only on the way OUT. A name that is none of the three —
+  the overwhelming majority — never builds the string.
+- **`nameIsI32Array`** (82,374) — `const elem = …; if elem == "i32" || elem == "boolean"` is two
+  span compares off one name instead of one slice and two string compares.
+
+**1,312,898 → 1,073,861 calls: 239,037 more removed.** Cumulative over B283+B284:
+**2,090,719 → 1,073,861 — 1,016,858 slices removed, 49%.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**What is left at this primitive, and why it is a different problem.** The remaining ~1.07M calls
+are dominated by sites that pass the element string to a predicate needing a REAL string —
+`nameIsBareMap(bare)` in `nameIsMapArray` (154,070), `nameIsI32Array(elem)` in `nameIsI32ListArray`
+(163,407). Converting those means span forms of THOSE predicates, and they bottom out in
+`unionMemberCount` / `nameIsMap` / the `cUserTypes` lookup.
+
+The mechanical step that would unlock the family is giving `tyTopIndexOf` an `until` bound (it
+already takes `from`), which makes every scanner over it span-addressable. That is a change to the
+scanner's own contract rather than to its callers — **the same shape as the three standing refusals:
+the next real item is a representation change, not another call-site conversion.**
