@@ -54445,3 +54445,66 @@ analysis, and it is where the next slice should start.
 
 The `:2661` rung is recorded as UNREACHED (0 of 2075), not deleted — the same treatment the two
 `nodeNulStructInnerName` sites got in B213.
+
+## B224 — the largest remaining site, refused with three measured mechanisms
+
+B223 pointed the next slice at the unhinted callers of `repElemIdOfNameTy`. Following the volume
+down: 92% of `rlInternNameTy` calls pass no hint (8,330 of 9,095), those arrive through the
+`rlInternName(name, kind)` wrapper (`ty = -1`), and the wrapper's eight call sites are ONE site
+almost entirely:
+
+| unhinted site | calls | files | share |
+| --- | ---: | ---: | ---: |
+| `emit_collect:3705` — `rlInternName(arrLitElemName(i), arrLitElemKind(i))` | **2854** | 308 | **92.6%** |
+| `emit_classify:4475` — `sNames[vsi]` | 200 | 53 | 6.5% |
+| the other six | 28 | — | 0.9% |
+
+## The hint is always available — and wrong a third of the time
+
+The obvious hint is the array literal's own recorded element type,
+`T.tys[nodeRepTyIxOf(i)].aElem`. Dual-written against today's unhinted key over the corpus, exactly
+as D-REPELEMTY dual-wrote its own:
+
+| bucket | firings | files |
+| --- | ---: | ---: |
+| agree | 1868 | 208 |
+| **differ** | **986** | **151** |
+| no hint available | **0** | 0 |
+
+**The arena can answer at every single firing, and disagrees on 34.6% of them.** This is the shape
+that makes a hint dangerous rather than missing: an unavailable hint declines loudly, a wrong one
+silently keys the wrong rep slot.
+
+D-REPELEMTY measured the same constraint at the sibling site and found 61 of 1,400 (4.4%). Here it
+is **986 of 2,854**, eight times the rate — so the rule is not merely confirmed, it is confirmed to
+get worse the further the hint travels from the name it is supposed to describe.
+
+## Three mechanisms, sampled rather than assumed
+
+The disagreeing pairs (`name` vs the hint's rendering) fall into three groups:
+
+| sample | mechanism |
+| --- | --- |
+| `nm=S` / `P` / `A` / `Cell` / `Node` / `#anon0` vs `hint={v: i32}` | **NOMINAL vs STRUCTURAL.** `repElemKey` keys a declared struct NOMINALLY — its own header says "Declared struct twins stay apart" — so a structural hint collapses two rows the key exists to separate. |
+| `nm=f64[]` vs `hint=f32[]` | **COARSE BUCKET vs PRECISE ELEMENT.** `arrLitElemName` deliberately buckets a nested list into four kinds (`string[]`/`f64[]`/`i64[]`/`i32[]`); the arena holds the exact element. The two are answering different questions on purpose. |
+| `nm=i32[]` vs `hint=i32[] \| null` | **NULLABILITY SKEW.** The arena element carries a `\| null` the table key's vocabulary does not. |
+
+Only the first is the failure the nominal-vs-structural note predicts. The other two are the name
+path being deliberately COARSER than the arena — which is the mirror-image error and one this
+programme had not previously named: a conversion can be wrong not because the arena knows less, but
+because it knows MORE than the consumer's vocabulary wants.
+
+## Recorded as refused, with the door left open
+
+`rlInternNameTy` already accepts a hint and `repElemIdOfNameTy` already skips the parse when given
+one; the machinery is built. What does not exist is a hint that is *the type this very name
+resolved to* for an array-literal element, and the three mechanisms above say why the nearest
+available type is not it.
+
+The 200-call `emit_classify:4475` site is a different proposition and is NOT covered by this
+refusal: its name is `sNames[vsi]`, and `sTyIx[vsi]` is the struct table's own TYPE column,
+resolved from that very name at mint — which is the hint shape D-REPELEMTY's constraint asks for
+(the same provenance as the shipped `sFieldElemTyIx` sidecar). Three sibling sites in
+`emit_collect` (`sNames[rsi]`, `uVariants[cvi]`, `unNames[0]`) have the same property against
+`sTyIx` / `uVarTyIx` / `unTyIx`, but total 8 firings between them. That is where the next attempt
+should go, and it should be dual-written before it is believed.
