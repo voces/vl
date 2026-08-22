@@ -57208,3 +57208,45 @@ own.** B270 used a structural fact to kill a conjunction. This uses one to answe
 question — "is this a declared litunion" — because the two predicates' domains are provably
 disjoint on that class. When a loop asks several questions per item, check whether the cheapest one
 settles any of the others before reaching for the item's full form.
+
+## B277 — REFUSED, with the number: a census counts where a split HAPPENS, not where it is NEEDED
+
+Fourth on B274's census was `registerInlineUnion` at **8,696 splits**. It splits `name` once at the
+top; two loops then ask each member a CHARACTER test (`nameIsMapOpen` is two characters at the
+front, `nameIsArray` two at the back), which is exactly the shape B275/B276 converted.
+
+The conversion was built and dual-written, and every claim held — **8,696 reaches, 0
+disagreements** on all four:
+
+- the span walk yields the same member COUNT as the split;
+- it yields the same `mNonNull` and `mHasMap`;
+- a member the span form calls a PLAIN SCALAR is never `nameIsArray` and never `nameIsBareMap`,
+  so skipping both recursions for it changes nothing;
+- `matoms.length < 2` is `unionMemberCount(name) < 2` (B272's dual).
+
+All six gates passed. **And it was reverted, because the measured win was 793 splits, not 8,696.**
+
+The reason is at the END of the function, 180 lines below the split:
+
+```vl
+if !isVariantBoxUnionAtoms(stmts, vbAtoms) { return 0 }
+```
+
+`isVariantBoxUnionAtoms` consumes the whole member list, so that call NEEDS the strings. Moving the
+split down to it means every union that reaches the tail still pays for it — and **91% of them
+do.** Total went 52,964 → 52,171: 1.5%, in exchange for two extra scans of the name (the span walks
+re-read what the single split had already read once) and a materially more complicated function.
+
+**The refinement to B274's method.** A reach census tells you where a primitive is CALLED. It does
+not tell you whether the call is REDUNDANT. Those were the same thing for the three sites converted
+before this one — each built a list to answer questions that needed no list — and they are not the
+same thing here, where a real consumer wants the list.
+
+**So the census gives you a ranked list of candidates, not a ranked list of wins.** The second
+question, per candidate, is: *does anything downstream actually consume the materialized form?* If
+yes, the split relocates rather than disappears, and the saving is only the calls that exit before
+the consumer. Measure that number before building — it is a `grep` for the out-param's other uses,
+which would have cost minutes and did cost a full build-and-gate cycle here.
+
+Sites remaining on the census below this one are all under 2,100 and each needs the same second
+question asked first.
