@@ -54159,3 +54159,84 @@ a measured reason. The remainder, in reach order: `:859` (`outType`, 3 files / 1
 (`retName`, 2 / 8), `:1014` (`elemType`, 2 / 3), `:2182` + `:2180` (`srcElem + "[]"`, 3 / 3 — types
 BUILT by string concatenation, the most interesting shape left), and two `"f64"` source literals
 that are not printed types at all.
+
+## B220 — the out-type row is threaded, and the family's last wide site closes
+
+`monoOutType` is the instance's substituted OUT type, carried as a SPELLING from wherever it was
+decided down into `monoCloneBody`, which mints the substituted `LetDecl` annotation with
+`synthTypeRef(outType, -1)` — the `-1` that re-parses.
+
+What makes this site convertible now is B218 and B219: `monoOutType` has exactly TWO producers,
+and both of them now hold the arena row.
+
+```vl
+monoOutType = pinned[pli]     // row: pinTys[pli]        (B217's column)
+monoOutType = listTy          // row: the list inferrer's outTy hand-back (B219)
+```
+
+So a parallel `monoOutTypeIx` is threaded beside the spelling through `monoCloneBody`'s eight
+recursive call sites and its one outer caller, and the mint becomes
+`synthTypeRefTy(outType, -1, outTyIx)`. Nothing needs to be recovered by parsing, because nothing
+was ever lost — the row simply was not carried.
+
+**This is what a conversion enables rather than what it removes.** Neither producer could have
+supplied a row before B218/B219 gave the inferrers a way to hand one back, and this site could not
+have been converted first.
+
+## Every spelling here is a composite
+
+Measured over the three corpus files that reach it, 12 firings:
+
+```
+[i32[],re=65,rows=66]  [boolean[],re=67,rows=68]  [f64[],re=69,rows=70]
+[i32[],re=69,rows=70]  [f64[],re=72,rows=73]      [i32[],re=75,rows=76]
+[i32[],re=78,rows=79]  [string[],re=80,rows=81]   [f64[],re=82,rows=83]
+[P[],re=84,rows=85]    [i32[],re=86,rows=87]      [string[],re=88,rows=89]
+```
+
+Not one primitive among them — and `rows` climbs by one at every firing, so the arena grew 12 rows
+across 3 files purely to re-derive types it already had. B219's rule holds without exception here:
+a composite spelling never resolves back to the row it was printed from.
+
+## Both instruments, per file
+
+| file | `nameToTy` calls | arena rows | firings |
+| --- | ---: | ---: | ---: |
+| `generics/sigkey-pin-infers-callback-result-list.vl` | 9 → 3 (**-6**) | 70 → 67 (**-3**) | 3 |
+| `inference/unannotated-build-expr.vl` | 12 → 6 (**-6**) | 76 → 73 (**-3**) | 3 |
+| `inference/unannotated-reverse.vl` | 25 → 13 (**-12**) | 89 → 83 (**-6**) | 6 |
+
+**-24 calls and -12 rows**, one row and two calls per firing, matching the firing count from a
+separately built probe. Corpus A/B: 0 diffs.
+
+## The cumulative reading
+
+`sigkey-pin-infers-callback-result-list.vl` is worth following across the four entries, because a
+per-PR delta understates what the sequence does:
+
+| after | `nameToTy` calls on that file |
+| --- | ---: |
+| B217 (`:2235`) | 15 |
+| B219 (`:2279`) | 9 |
+| B220 (`:859`) | **3** |
+
+15 → 3 on one file. Each individual PR was byte-identical on the corpus and each looked, by the A/B
+alone, like it did nothing.
+
+## Where the family stands
+
+| site | what it names | files / occ | status |
+| --- | --- | --- | --- |
+| `:2235` | `pinned[pli]` | 1 / 1 | converted (B217) |
+| `:2294` | `scTy` | 4 / 10 | converted (B218) |
+| `:2279` | `listTy` | 2 / 6 | converted (B219) |
+| `:859` | `outType` | 3 / 12 | converted (here) |
+| `:1894` | `pinned[hp]` | 2 / 5 | deliberate no-op, reason measured (B217) |
+| `:2146` | `retName` | 2 / 8 | remaining |
+| `:1014` | `elemType` | 2 / 3 | remaining |
+| `:2182` `:2180` | `srcElem + "[]"` | 3 / 3 | remaining — types BUILT by concatenation |
+| `:2212` `:2124` | `"f64"` literal | 4 / 4 | not printed types; source constants |
+
+The `srcElem + "[]"` pair is the shape this programme has not yet faced anywhere: not a type that
+was printed and re-parsed, but a type that exists ONLY as a string, assembled by concatenation and
+never held as a row at all. Converting it means minting the `TyArray` instead of spelling it.
