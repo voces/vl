@@ -55095,3 +55095,39 @@ Corpus-wide `resolveAnnot`, measured end to end over 2075 files:
 
 **~22% of all name-keyed type resolution in the compiler is gone**, and every conversion was
 byte-identical on the corpus.
+
+## B234 — the nested recursion carries the row down, and the hint compounds
+
+`ensureRefElemTy(elemName, ty)` recurses when its element is itself a ref array (kind 9), and that
+recursion was unhinted: `ensureRefElem(refArrElemName(elemName))` — cut the inner name out of the
+outer SPELLING and resolve it from scratch, 660 firings over 52 files.
+
+The function already holds `ty`, the row for `elemName`. When that element is an array, its inner
+element is `ty`'s own `aElem`. Nothing needs resolving.
+
+Dual-written: **406 hinted with 0 disagreements**, 32 declined by `elemNameIsNominal` (B233's
+guard, reused unchanged), and **222 still unhinted because their OUTER call had no row to pass**.
+
+## The measurement is LARGER than the firing count, and that is the point
+
+`resolveAnnot` **-414 across 30 files** against 406 measured firings.
+
+Every previous entry in this programme measured a delta EQUAL to its firing count. This one
+overshoots, and the cause is structural: a hinted inner intern is itself an `ensureRefElemTy` call
+WITH a row, so its own kind-9 recursion is hinted too. **The hint propagates down the nesting** —
+one row handed in at the top serves every level of an `X[][][]`.
+
+That also explains the 222: they are levels whose parent had no row. As callers above gain hints
+that residue shrinks on its own, which is the first place in this programme where converting one
+site makes ANOTHER site's conversion more effective rather than just smaller.
+
+## Where the `ensureRefElem` surface stands
+
+| site | calls | outcome |
+| --- | ---: | --- |
+| `emit_collect:4071` | 4215 | 3184 hinted (B233) |
+| `emit_classify:13457` — the recursion | 660 | **406+ hinted (here), compounding** |
+| `emit_classify:17791` | 214 | not yet measured |
+| `emit_classify:17943` | 157 | not yet measured |
+
+Measured: corpus A/B 0 diffs, all six gates clean.
