@@ -24,11 +24,31 @@ module; `$VL_GC` host knob (server side).
 
 ---
 
-## P0 — gates the M7 port starting (the Buffer tier, spec'd)
+## P0 — gates the M7 port starting (the Buffer tier, spec'd)  ✅ COMPLETE
 
 vl's roadmap already plans a scoped `Buffer` linear-memory tier (DECISIONS
 "one deliberate escape hatch"; ROADMAP B-mem). This section is the concrete
 requirements list from webcraft's side — what "done" needs to mean.
+
+> **ALL FOUR P0 ROWS ARE SHIPPED, re-verified end to end 2026-08-22.** Two of them
+> (P0.3, P0.4) were still marked as outstanding here while the implementation and its
+> fixtures had already landed, and `ROADMAP.md` had them ✅ — so the drift was in THIS
+> file, one direction only. **If the M7 port was being held on the P0 tier, it is not
+> blocked.**
+>
+> What was run, against the compiler at `90a2e4cb`:
+>
+> | row | check |
+> | --- | --- |
+> | P0.1 Buffer | `Buffer(64)`, `storeI32`/`loadI32`, `storeF64`/`loadF64`, `.length` |
+> | P0.2 exported memory | `memory` present in the export section of a built module |
+> | P0.3 bitcasts | all four, round-tripping f32/f64 against their bit patterns |
+> | P0.4 opcode intrinsics | all 20 names, **both widths each** |
+>
+> Fixtures already pin every one: `tests/cases/numerics/bitcast-f32.vl`,
+> `bitcast-f64.vl`, `bitcast-shadowed.vl`, `error-bitcast-args.vl`,
+> `float-opcodes-f32.vl`, `float-opcodes-f64.vl`, `float-opcodes-nan-zero.vl`,
+> `int-opcodes-i32.vl`, `int-opcodes-i64.vl`, `int-opcodes-shadowed.vl`.
 
 ### P0.1 `Buffer`: allocation + full-width load/store  ✅ SHIPPED
 
@@ -193,7 +213,7 @@ export with `(offset, len)`.
   sim memory across workers without a copy. Copy-out to a SAB is acceptable
   v1; note shared memories must declare a max size.
 
-### P0.3 Reinterpret casts (bitcasts)
+### P0.3 Reinterpret casts (bitcasts)  ✅ SHIPPED
 
 ```vl
 f32bits(x: f32): i32     // i32.reinterpret_f32
@@ -206,9 +226,25 @@ Hard requirement, tiny to implement (one opcode each). Everything
 determinism-critical passes through these: hashing float state, NaN
 canonicalization (the WASM NaN-payload nondeterminism mitigation), and
 implementing WC3-matched transcendentals (bit-level range reduction,
-Q-format tricks). Currently absent entirely.
+Q-format tricks).
 
-### P0.4 Float/int opcode intrinsics
+> Maintainer's note (vl side): **SHIPPED — all four, exactly as spelled.**
+> `emitBitcastIntr` (`wasmEmit.vl`) lowers them to the single opcode each:
+> `i32.reinterpret_f32` / `f32.reinterpret_i32` / `i64.reinterpret_f64` /
+> `f64.reinterpret_i64`.
+>
+> ```
+> f32bits(1.0 as f32)               -> 1065353216
+> f32fromBits(1065353216)           -> 1
+> f64bits(1.0)                      -> 4607182418800017408
+> f64fromBits(4607182418800017408)  -> 1
+> ```
+>
+> **This row read "Currently absent entirely" until 2026-08-22**, while the
+> implementation had already landed — the fourth stale webcraft row found this way.
+> If you were holding the M7 port on the P0 tier, it is not blocked.
+
+### P0.4 Float/int opcode intrinsics  ✅ SHIPPED
 
 The single-opcode, IEEE-deterministic operations, for f32 and f64:
 `sqrt`, `abs`, `floor`, `ceil`, `trunc`, `nearest`, `min`, `max`,
@@ -222,6 +258,21 @@ unsigned variants `divU`, `remU`, `ltU/leU/gtU/geU` (`>>>` already exists).
   exist for other users; the sim won't import it.
 - Unsigned ops matter for hashing, the xorshift RNG, fourCC comparisons, and
   Lua's string hash. i64-widening emulation works but poisons hot loops.
+
+> Maintainer's note (vl side): **SHIPPED — the entire list, both widths.**
+> `floatIntrOpF32`/`floatIntrOpF64` and `intIntrOpI32`/`intIntrOpI64`
+> (`wasmEmit.vl`) map each name to its one opcode.
+>
+> - float, f32 **and** f64: `sqrt` `abs` `floor` `ceil` `trunc` `nearest` `min`
+>   `max` `copysign`
+> - int, i32 **and** i64: `clz` `ctz` `popcnt` `rotl` `rotr` `divU` `remU`
+>   `ltU` `leU` `gtU` `geU`
+>
+> Verified end to end on 2026-08-22, every name in both widths. `nearest(2.5)`
+> answers `2` — ties-to-even, as IEEE requires — and `clz` over an `i64` answers
+> `63` for `1`, so the width is the operand's and not i32-by-default.
+>
+> The `sin/cos/atan2/pow/exp` exclusion is honoured: vl provides none of them.
 
 ## P1 — gates the port being good (perf + core ergonomics)
 
@@ -713,7 +764,7 @@ eliminate some checks; "some" isn't a contract.)
 > worth 31% on the `scale` kernel — `v.getF32(i)` avoids it. Both wasm-opt rungs
 > inline the forward away and the two spellings converge exactly.
 
-### P1.5 Nominal/opaque types (vl A14) — id safety
+### P1.5 Nominal/opaque types (vl A14) — id safety  ✅ SHIPPED
 
 The kernel traffics in `EntityId`, `PlayerSlot`, `AbilityHandle`, all i32.
 Under pure structural typing they interchange silently; a generation-tagged
