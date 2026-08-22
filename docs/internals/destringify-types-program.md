@@ -56793,3 +56793,49 @@ WHICH question it asks. A caller walking a SPELLING (peeling parens, splitting o
 a name) almost always means the spelling question, and the arena twin is the wrong answer for it —
 not a better one. A caller holding a type and classifying it means the type question, and the twin
 is exact. The two are indistinguishable at the call site; only the surrounding walk says which.
+
+## B267 — the union-member position stops parsing its arm, in BOTH directions
+
+`collectCloSigs` walks each union row's members to intern any closure-arm `$fnsig`. The member
+ATOMS already come from the arena side — `unMemAtoms[uSt + um]`, the D-UNION columns — with the
+`splitUnionAtoms` call surviving only as the fallback for an unrecorded row. But what it then did
+with each atom was parse it:
+
+```vl
+internCloSigOfAtom(atoms[uj])   // -> unionArmSigKey(atom) -> normTypeAtom + annArrowAt + annSigKey
+```
+
+`unMemTys` is recorded in EXACTLY `unMemAtoms` order — the columns are one `recordUnMemTys` pass
+and the box-tag ABI depends on that order — so slot `uj` already holds the arm's arena type. Two
+things follow, and the second is the larger half:
+
+- a `TyFunc` row hands `sigKeyOfTy` the key the parse would have produced;
+- a **non-`TyFunc` row means there is no arrow**, which is the `""` the parse returns only after
+  doing all of the work. The arena knows there is no key without looking for one.
+
+Measured at the position: **76 arrow arms, key-identical; 958 non-arrow arms, both `""`; 0
+disagreements.** So all **1,034** arm parses go, not just the 76 that produced a key.
+
+The guard is untouched. `internCloSigOfAtomTy` still evaluates `nulCloMixedUnionUnregistered(atom)`
+on the arm spelling, and the no-arrow branch returns before the guard exactly as
+`if k == "" { return 0 }` did — the B255 rule (answer the KEY, leave the guard in the path).
+
+Gates: corpus A/B 0 differing rows / 2,075; `deno task test` 2,225; ci-native 2,242; fixpoint holds;
+lint clean; rep-fuzz exact; grid no BAD cells.
+
+**Why this one worked where B266 refused.** Both sites hold an atom and a row. The difference is
+where the atom CAME FROM: here it was read out of a column recorded FROM the arena, alongside its
+own type, so atom and row are the same fact in two encodings. At `internShapeDeepTy` the atom came
+from a spelling walk and the row was a companion parameter — and an alias made them disagree.
+
+**A column recorded in lockstep is a different thing from a row handed alongside a name.** The
+first is safe to convert; the second has to be measured, and can fail.
+
+### Two sites measured and NOT converted, recorded so they are not re-tried blind
+
+- `fnUnionRetSinkOk`'s inferred-return arm (`isValueUnionName(im) || isUName(im)` with
+  `inferRetTyIxOf` available): the probe fired **zero times across 2,075 files**. Unreachable in the
+  corpus, so a conversion there is unverifiable rather than safe. Not a refusal — an absence of
+  evidence, and it should stay unconverted until a fixture reaches it.
+- `unionRowOf` — its own header already calls it "nominal identity lookup, not a structural
+  decision", and it matches on the alias NAME *or* the pipe-joined member set. Correct as written.
