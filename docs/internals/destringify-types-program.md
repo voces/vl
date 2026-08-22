@@ -57771,3 +57771,33 @@ is that the refusal was reasoned from a plausible mechanism — "an atom count i
 "the scanner's contract forbids it", "canon softening is by design" — and each time the mechanism
 was real but was not what the site actually did. **A refusal that names a mechanism still has to
 name the MEASUREMENT that ties the mechanism to the site.**
+
+## B291 — the same hand-over at the five sibling sites
+
+B290's route generalises: any site that reads `tyNameOf(node)` and DECIDES on the result is asking
+about a string that canon may have written, and `annRowOfNode(ix)` is the row for it either way.
+Censusing for the shape found five more:
+
+| site | question | reaches | disagreements |
+| --- | --- | --- | --- |
+| `unionNameOfBindingSid`'s Param arm | `isUName` | | |
+| `unionNameOfExpr`'s FuncDecl return | `isUName` | | |
+| …its closure-callee return | `isUName` | 2,956 total | **0** |
+| …its member-callee return | `isUName` | | |
+| `sFieldElemNameOf`'s code-0 arm | `nameIsLitUnionType` | 932 | **0** |
+
+All five convert exactly, and all five keep returning the NAME — their consumers are name-keyed.
+Only the decision moved off the string.
+
+**Running total for this shape: 70,163 + 2,956 + 932 = 74,051 registry/structural decisions per
+corpus pass that no longer read a rendered name.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline rebuilt from the current master commit); `deno
+task test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**What is left of `isUName`'s 131,369.** The converted sites account for ~73,000. The remainder are
+genuinely name-side and each is documented: `registerInlineUnion`'s `isUName(name)` is **the
+registry's own dedup key** (the question IS "have I already registered this spelling"),
+`letAnnIsUnion`'s carries a comment saying it "needs the narrower set", and `buildFnMap`'s reads a
+name the checker banked whose row-keyed twin disagrees 179 times (B289). Those are not renders being
+interrogated; they are the registry being asked about its own keys.
