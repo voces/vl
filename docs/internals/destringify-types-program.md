@@ -54716,3 +54716,62 @@ the next substantial slice; making the resolver hash-cons is the larger question
 is NOT a safe drive-by — B224 measured that row identity is load-bearing for rep keys, so merging
 structurally identical rows would need its own dual-write against every rep consumer before anyone
 should believe it.
+
+## B228 — the last two ref-list sites, and a THIRD liveness instrument
+
+B225 left four `rlInternName` sites unmeasured. Dual-written together:
+
+| site | name source | firings | agreement |
+| --- | --- | ---: | --- |
+| `:3667` | `arrLitUnionElemName` (empty literal, union-pinned element) | 8 | **8/8** |
+| `:3688` | `arrLitNestedElemName` (nested-array element) | 10 | **10/10** |
+| `:3818` | `refListElemNameOfExpr` | 2 | **0/2** |
+
+Hint available at every firing (`nohint=0`). The first two take the hint; the third does not, and
+its two disagreements are the mechanism B224 named — `nm=P` against a structural `{x: i32}`,
+because `repElemKey` keys a declared struct NOMINALLY. The difference is provenance:
+`arrLitUnionElemName` and `arrLitNestedElemName` both return `nodeArrayElemName`, the CHECKER's own
+recorded element, while `refListElemNameOfExpr` returns a declared struct's name.
+
+## Both existing instruments read ZERO — and the change is live
+
+Corpus A/B: 0 diffs, as always. Then:
+
+* arena ROW count: **0**
+* `nameToTy` CALL count: **0**
+
+By B217's and B218's standards that is an INERT change, and it would have been reported as one.
+
+It is not. The third instrument — counting `resolveAnnot`, the name-keyed entry the hint actually
+skips — reads:
+
+| file | `resolveAnnot` before | after | delta |
+| --- | ---: | ---: | ---: |
+| `arrays/nested-array-inferred-empty-push.vl` | 12 | 6 | **-6** |
+| `arrays/un-annotated-empty-list-union-push.vl` | 12 | 8 | **-4** |
+| `arrays/inline-nested-atom-array.vl` | 56 | 54 | -2 |
+| `soundness/xfail-miscompile-toplevel-nested-array-inferred-empty.vl` | 4 | 2 | -2 |
+| `unions/union-narrowed-helper-recursion.vl` | 4 | 2 | -2 |
+| `unions/union-two-visitors.vl` | 4 | 2 | -2 |
+
+**-18, exactly the 18 agreeing firings.**
+
+## Why the parse counter was blind here
+
+The MEMO. B223 measured it absorbing 88% of `resolveAnnot` calls on this path; here it absorbs
+100% — every one of these 18 names had already been resolved by an earlier call, so not one of them
+was a parse. The hint skips the memo LOOKUP, and a memo keyed on the type's SPELLING is still
+functional work on a string representation of a type. It is exactly what the goal names, and the
+`nameToTy` counter cannot see it.
+
+**So the instrument ladder now has three rungs, and they are ordered by what they can see:**
+
+| rung | sees | blind to |
+| --- | --- | --- |
+| arena ROW count | duplicate mints (composite spellings) | primitive spellings, memo hits |
+| `nameToTy` CALL count | parses | anything the memo absorbed |
+| `resolveAnnot` CALL count | every name-keyed resolution | work that never reaches the resolver |
+
+Report the FIRST rung that moves, and say which one it was. B225's caution — "firings are the upper
+bound and the call delta is the real one" — needed this correction: the call delta depends on WHICH
+call you count, and quoting a zero from too coarse a rung reports a live change as inert.
