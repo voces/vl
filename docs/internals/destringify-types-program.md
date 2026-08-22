@@ -56103,3 +56103,44 @@ Not a backlog. Every block now carries one of:
 The two language-level changes named in B229 and B246 are what would move the rest, and both are
 decisions about what the emitter's vocabulary and the ABI key are DEFINED over. They are the user's
 to make, not a refactor to run.
+
+## B253 — B248's refusal was about ONE reverse path; there are two, and together they cover
+
+B248 refused `fieldRefElemName` and `fieldTypeCode` because `structIndexOfTy` answered where the
+NAME path did not — 4 of 81 and 8 of 70 — and concluded "the arena↔table reverse index is
+incomplete".
+
+**It concluded that from one reverse path when the compiler has two**, and they fail on opposite
+classes:
+
+| reverse path | keyed by | finds | misses |
+| --- | --- | --- | --- |
+| `structIndexOfTy` | EXACT arena index (`sTyIx[row] == ty`) | a DECLARED struct | an inline shape whose row was minted separately |
+| `repRowOfTyStruct` | STRUCTURE | the inline shape | the declared ones |
+
+Measured at `fieldRefElemName`, against `structIndexOfTypeName`:
+
+| lookup | matches |
+| --- | ---: |
+| `structIndexOfTy` alone (B248) | 77 of 81 |
+| `repRowOfTyStruct` alone | **65 of 81** — WORSE, and every new failure nominal (`Also`, `Inner`, `L1`) |
+| **exact first, structural second** | **80 of 81** |
+
+The single remaining reach is an inline shape with a closure field
+(`{f:(i32,i32,i32)=>boolean}`) that BOTH decline. So a -1 from the hybrid means "I do not know",
+never "no row", and the caller falls back to the field-set matcher on it — which is the same
+`innerKnown` discipline B243 needed, applied to a two-path lookup instead of a one-path one.
+
+## The correction
+
+B248's sentence — "the arena holds the type, the reverse INDEX is partial" — was right about
+`structIndexOfTy` and wrong as a statement about the arena. The index is partial IN ONE DIRECTION
+EACH, and the union of the two is nearly total.
+
+That is the fourth refusal in this programme reopened by measuring a narrower question than the one
+the refusal was written about (B224→B230, B246→B249/B250/B251, B248→here). The pattern is now
+specific enough to state as a rule: **when a refusal names a mechanism, check whether the mechanism
+has a sibling.** `structIndexOfTy` had one, `annParamKind` had five arms that were not the arm
+being refused, and `arrLitElemName` had five arms behind one hint.
+
+Measured: corpus A/B 0 diffs, all six gates clean.
