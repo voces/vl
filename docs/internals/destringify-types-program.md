@@ -56233,3 +56233,48 @@ deliberately refuses, not shapes the classifier failed to see.
 
 The ref-array arm (B254) is safe under this rule and stays: `rlSlotOfTy` answers only where a slot
 was actually interned, so it never manufactures a key for an un-interned shape.
+
+## B256 — the ident path's `$fnsig` key, and B255's rule applied as a design constraint
+
+`annSigKey` — the NAME-side `$fnsig` producer that PARSES a rendered function type — is down from
+10,607 calls to **3,499** across B249-B254. Re-censused, what is left:
+
+| site | calls | files |
+| --- | ---: | ---: |
+| `cloNameSigKey`'s arrow path | **1898** | 47 |
+| `unionArmSigKey` | 1481 | 344 |
+| two sites under 100 | 120 | — |
+| `:6705` | **0** | **0** — dead |
+
+The first is reached from the IDENT path, whose name comes from `identFnTypeAnnNameSid` — and that
+function's first arm is `tyNameOf(d.letType)`. **The node is right there**; only the name was being
+passed on.
+
+`identFnTypeAnnNodeSid` returns that node for the first arm and -1 for every other, so the arena is
+offered only where the name would have come from a plain function-type annotation. Dual-written:
+**781 agree, 0 disagree**, arena silent on 297.
+
+## Why this one is safe and B255's was not
+
+Both add an arena leg to a `$fnsig` producer. The difference is what happens on a DECLINE:
+
+* B255's struct arm answered INSIDE `retTokOfTy`, so `annRetKind` never ran — and its `""`, which
+  means *this signature is not in the value-call ABI*, was skipped. A deliberate emit-stage reject
+  became a compiling program.
+* This routes to `sigKeyOfTy`, which still classifies every param and the return through
+  `annParamKind` / `annRetKind`. A signature outside the ABI yields `""` from the arena route too,
+  and the caller falls through exactly as before.
+
+**An arena route that goes THROUGH the guard is safe; one that goes AROUND it is not.** That is the
+sharpest form of the rule B255 paid for, and it is what separates B249's conversion (which stands)
+from B255's (which was reverted).
+
+Gated with the FULL battery and the test suites run FIRST, because B255 established that corpus A/B
+alone cannot see this class: 2225 + 2242 pass, A/B 0 diffs, fixpoint holds, rep-fuzz exact, grid
+clean.
+
+## What remains of `annSigKey`
+
+`unionArmSigKey` (1,481) takes a union ARM spelling produced by `splitUnionAtoms` — a substring of a
+rendered union, with no node behind it. That is a name-in producer by construction, and the last
+two sites are under 100 calls between them.
