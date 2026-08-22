@@ -57848,3 +57848,36 @@ consumers. Neither is a type printed and then interrogated.
 **The remaining structural question is a design one and is stated, not started:** the emitter's
 registries are keyed on the canon-softened spelling because that is the REP, not the type. Re-keying
 them on the precise type would change what the rep layer decides on.
+
+## B293 — the wrong index, not an unanswerable question: the checker-column route closes too
+
+B289 measured the inferred-return ladder's three arms and converted one, recording the other two as
+unconvertible with numbers: `isValueUnionName` 6 disagreements, `isUName` **179**.
+
+**The 179 were the wrong index.** B289 tested `unRowOfTy` — row IDENTITY — and the arena is not
+hash-consed, so one spelling mints several rows and the scan misses the registered one. That is the
+same mechanism B290 named at the canon-written-node sites, and the same fix applies: `unRowOfCanon`
+compares interned structural ids. Re-measured at the identical site:
+
+| index | disagreements of 3,576 |
+| --- | --- |
+| `unRowOfTy` (row identity) | 179 |
+| `unRowOfCanon` (structural id) | **0** |
+
+Converted. **The checker-column route — route 2 of B292's three — is now closed for its registry
+arm as well as its structural one.**
+
+What remains at that ladder is `isValueUnionName(inm)` alone, 6 disagreements of 3,576, and those
+are the canon-softening cases B288 characterised: the checker banks the LOWERING as the name while
+the row is the precise type, so the two disagree exactly where a litunion alias softens to its base
+scalar.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline rebuilt from the current master commit); `deno
+task test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**Fourth time.** B258→B259, B284→B285, B288→B290, and now B289→B293. Every one of these refusals was
+recorded with a number, which is what made it look settled — and in each case the number was
+measuring the wrong thing: the guard's early-out instead of its verdict, a contract that already
+permitted the call, the pre-canon row instead of canon's banked one, and now row identity instead of
+structural identity. **A number does not make a refusal true; it makes it checkable. Re-check it
+when a neighbouring entry finds a better instrument.**
