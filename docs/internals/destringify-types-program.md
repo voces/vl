@@ -53477,3 +53477,58 @@ BUILDING the witness and validating the module.
 
 **Add "does the module still validate" to the three numbers of B203 whenever a conversion changes
 a name that gets MINTED into an annotation.** A pin name is not an opinion; it is a key.
+
+## B209 — the last census site was not unreachable, only unreached by the routes I tried
+
+B204 recorded `typecheck.vl`'s `if nameIsShapeOpen(inm)` as UNREACHED and gave it its own
+category — not "architectural", but "unverifiable": 0 corpus files, and two witnesses built from
+the leg's own comment ("an INLINE shape with no matching TypeDecl") missing it as well. The
+conclusion drawn was that no conversion there could be validated.
+
+**That conclusion was about my witnesses, not about the site.** Both had the right SHAPE and the
+wrong ROUTE. `nullableRetName`'s three callers are the tell: two take `t.aElem`, so the array
+spellings I tried went somewhere else, and a plain annotated return resolves through
+`nominalNameOfObj` before ever reaching `inm`. The leg wants a **contextually-typed lambda** whose
+INFERRED return is a nullable inline shape:
+
+```vl
+function each(f: (i32) => { q: f32 } | null) { … }
+each((k) => { if k == 0 { return null }  return { q: 1.5 } })
+```
+
+which reaches it with `inm=[{q:f64}]`.
+
+`closures/error-nullable-inline-shape-contextual-ret.vl` is that program, added here. The corpus
+now covers the leg — and it is the whole of the coverage, which is stated rather than glossed.
+
+### The conversion, and what actually justifies it
+
+The gate re-read the rendering's first two characters to ask "is this an inline shape and not a
+map `{[`". The enclosing arm is already `if it is TyObj`, and a map is a `TyMap`, so **the arena
+had decided that before the string was ever consulted.** The only thing the character test could
+still answer is whether the render came back at all, which is now asked as `inm != ""`.
+
+The justification is STRUCTURAL, not statistical: `TyMap` is not `TyObj`. That distinction is worth
+drawing because the numbers here are the thinnest in the programme — one fixture, one reach — and
+a reader should not mistake "0 corpus diffs" for evidence when the corpus reaches the site once.
+
+### The mismatch in the fixture is load-bearing
+
+The same program with `f64` on both sides compiles and runs, and never reaches the leg: the
+rendering exists to spell the "got" half of an argument-type error. So the covering fixture has to
+be an `@error` case. That is not a workaround — it says something about the site, namely that its
+render feeds the inference-return name column AND the diagnostic, and only the failing path
+exercises the inline-shape leg today.
+
+### Where the census stands
+
+All five of B202's render-then-decide sites are now closed. Re-running the census over `compiler/`
+returns **zero**.
+
+That is a claim about one specific pattern — a render bound to a name, then that name compared
+against another spelling or handed to a name-classifier — and it should not be inflated. Renders
+remain, and are supposed to: `tyToStr` and its siblings spell types into DIAGNOSTICS at 163 call
+sites (B198), and a render still produces the pinned annotation ARTEFACT (B206) and the mono
+instance KEY (B207), both of which are names by design and are consumed as keys rather than
+re-parsed. B208 is the standing reason the last of those cannot simply be structural: a name can
+carry NOMINAL identity that structure does not recover.
