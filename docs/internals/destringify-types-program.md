@@ -54775,3 +54775,73 @@ functional work on a string representation of a type. It is exactly what the goa
 Report the FIRST rung that moves, and say which one it was. B225's caution — "firings are the upper
 bound and the call delta is the real one" — needed this correction: the call delta depends on WHICH
 call you count, and quoting a zero from too coarse a rung reports a live change as inert.
+
+## B229 — the canon column is NOT a pure function of the type, and that closes the census
+
+B226 named a type-level canon as the next substantial slice and B227 recorded it as the one block of
+open work. It is not achievable as stated, and the reason is worth more than the slice would have
+been.
+
+## Three candidate rules, measured
+
+| rule | reaches | unsound | verdict |
+| --- | ---: | ---: | --- |
+| reuse pre-canon type when `tyToStructStr(pre) == c` | 47 / 688 | **0** | sound, useless (B226) |
+| reuse when `tyToEmitName(pre) == c` | 562 / 688 | **303** | UNSOUND |
+| `softenLitTy(pre)` — the arena's own literal-union widener | 442 / 688 | — | incomplete, and over-applies |
+
+The second rule fails for a reason that is instructive rather than incidental: `tyToEmitName` ALREADY
+widens a literal union to its base scalar, so it matches the canon name precisely BECAUSE of the
+rewrite it was supposed to detect (`{c=i32;pre=0 | 1;post=i32}`, `{c=i32;pre=RowAddr;post=i32}`).
+A renderer that shares the target vocabulary cannot witness the move into it.
+
+## What the arena rule misses, categorized
+
+`softenLitTy` is the arena twin of canon's literal-union arm and already exists (grep-for-the-twin,
+again). Its 246 misses:
+
+| miss | example | what is needed |
+| --- | --- | --- |
+| transparent alias not folded | `pre=RowAddr soft=RowAddr want=i32` | canon's single-member-alias arm on the arena |
+| union with a NON-literal member | `pre=1 \| 2 \| null want=i32 \| null` | soften members individually, not all-or-nothing |
+| MIXED literal bases | `pre="x" \| 7 want=string \| i32` | same |
+| composite positions | `pre=(0 \| 1) => i32 want=(i32) => i32` | recursion into params / elems / map halves |
+| **over-application** | **`c=K pre="a" \| "b" soft=string want="a" \| "b"`** | **nothing — the rule is WRONG here** |
+
+The first four are ordinary incompleteness and could be built. The fifth is not.
+
+## The finding
+
+**`c=K; pre="a" | "b"; want="a" | "b"`** — canon did NOT widen. The annotation spelled the declared
+alias `K`, so canon kept `K`, and `nameToTy("K")` returns the literal union unchanged. Elsewhere in
+the same corpus the IDENTICAL arena type `"a" | "b"`, spelled inline, canons to `string`.
+
+**The same type canons two different ways depending on the spelling it arrived in.** Canon is a
+name→name rewrite whose result is a function of the NAME, not of the type — which is what its
+position in the pipeline says: it exists to move the emitter's vocabulary, and the emitter's
+vocabulary distinguishes a declared alias from its expansion.
+
+So the parse at `canonTyIxCol.push(nameToTy(c))` is not a round trip that can be short-circuited by
+asking the arena. The arena does not hold the input that decides the answer. A hybrid keyed on
+"did canon keep a declared alias name" is expressible, but it is a SPELLING test wearing a type
+test's clothes, and it would buy parses the memo has already absorbed (B223: 88%; B228: 100% at one
+site).
+
+## The census is closed
+
+| entry | parses | outcome |
+| --- | ---: | --- |
+| `annotResolve` fallback | 2174 | refused — two consumers, measured (B224, B225) |
+| `recordClonedNodeTy` | 711 | refused — name-first precedence measured in its own header |
+| the canon column | 688 | **refused — canon is spelling-dependent (here)** |
+| generic-app args | 154 | not an entry — `nameToTy`'s own recursion (B227) |
+| `recordClonedNodeTyKnown` | 69 | the sink B217–B222, B228 fed |
+| union-member gen-app | 31 | refused — the consumer's contract is a name |
+
+Every block now carries a measured mechanism. **This programme's remaining string→type work is not
+a backlog; it is a boundary**, and the boundary has a shape: the emitter's vocabulary is
+name-valued, and three of the six blocks exist to serve consumers whose contract is a name.
+
+That is the honest end state of the census. Further progress needs a change to what the emitter's
+vocabulary IS — carrying rows where it now carries spellings — which is a language-implementation
+decision rather than a refactor, and belongs to the user, not to this programme's remit.
