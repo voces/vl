@@ -54569,3 +54569,91 @@ rate, which B223 measured at 88% on this path.
 The surface is effectively closed: 97.6% of it is refused with a measured cause, and what converts
 is small. That is the honest shape of this block, and it is worth more than a larger number would
 have been.
+
+## B226 — the canon column characterized, and why it does not yield to a small rule
+
+B223's census left three blocks. Two are now closed:
+
+* **`recordClonedNodeTy`, 711 parses (18.6%)** — its header already carries the measurement that
+  makes the parse LOAD-BEARING: over the corpus the monomorphizer's pinned names resolve and AGREE
+  with the argument's recorded type 838 times, resolve and DISAGREE 119 times (where the NAME is the
+  correct answer and an override would be a wrong pin), and fail to resolve 77 times. The precedence
+  is name-first BY MEASUREMENT. Refused, with the cause already in the source.
+* **`annotResolve`'s 2174 (56.8%)** — B224/B225 walked it to its two consumers and refused both with
+  measured mechanisms.
+
+This entry does the third.
+
+## What the canon rewrite actually does
+
+```vl
+const c = canonEmitNameTs(n.tyName, RC_ROOT, annTsOf(i))   // RENDER a canonical NAME
+if c != n.tyName {
+  clearAnnTs(i)                    // the spelling tree now describes a different TYPE
+  canonTyIxCol.push(nameToTy(c))   // PARSE that render back into a type
+  n.tyName = c
+}
+```
+
+A render immediately followed by a parse of the render — the shape this programme exists to remove.
+688 firings, matching the census exactly. Classified against the checker's pre-canon type
+(`nodeTyIxOf`, which canon deliberately leaves alone):
+
+| bucket | firings | share |
+| --- | ---: | ---: |
+| pre-canon type UNAVAILABLE | **0** | 0% |
+| canon type is the SAME ARENA ROW | 80 | 11.6% |
+| same rendering, DIFFERENT row (a duplicate mint) | 247 | 35.9% |
+| genuinely a different type | 361 | 52.5% |
+
+The pre-canon type is available at every single firing, and **47.5% of the parses reproduce a type
+the checker had already recorded** — 247 of them by minting a structurally identical duplicate row.
+
+## The two populations, sampled
+
+```
+diff:     Kf[] -> f64[]      pre=(1.5 | 2.5)[]   post=f64[]      litunion alias → base scalar
+          Tf[] -> f64[]      pre=Tf[]            post=f64[]      transparent alias → member
+sameStr:  (f64)[] -> f64[]   pre=f64[]           post=f64[]      GROUPING PARENS, nothing else
+          (string)[] -> string[]                                 same
+```
+
+The 361 are real: canon widens a literal-union alias to its base scalar and folds a transparent
+alias to its member, and those ARE different types. The 247 are pure spelling — redundant grouping
+parens — costing a parse and an arena row apiece.
+
+## The small rule was measured and is not worth shipping
+
+The conservative rule that needs no parse is: *if the pre-canon type already RENDERS to the canon
+name, reuse it.* Measured over the corpus:
+
+| | |
+| --- | ---: |
+| rule fires | **47 of 688 (6.8%)** |
+| of those, the parse would have returned the same row anyway | 34 |
+| duplicate rows actually saved | **13** |
+| cases where the rule would pick a differently-rendering type | **0** |
+
+Sound (0 unsound), and nearly pointless. It cannot reach the 247 because rendering conventions
+differ from spellings — `tyToStructStr` writes `string | null` where the canon name is
+`string|null`, so textual equality fails on exactly the composite spellings that mint the
+duplicates. **A rule that is sound and useless is still a result**, and it is recorded so the next
+reader does not re-derive it.
+
+Worth naming precisely: the 13 rows it would save come with a CHANGE OF BANKED ROW IDENTITY, and
+B224 measured that row identity is load-bearing for rep keys. A 13-row saving is not worth a
+dual-write against every rep consumer.
+
+## What would actually move this
+
+Every duplicate row in this entry, in B217, B219, B220 and B221 has one cause: **`nameToTy` does
+not hash-cons.** The per-site work has been routing around that; the 247 here are the clearest
+statement of its cost in one place. A type-level canon — mapping the pre-canon TYPE through the
+same three rules (litunion alias → base, transparent alias → member, shadowed type-parameter →
+body) instead of rendering a name and parsing it — would remove the parse AND the duplicate for all
+688, not 47.
+
+That is a real slice and it is not a small one: it needs the three rules expressed on the arena and
+dual-written against the name path over the whole corpus, with the nominal hazards B224 named.
+Recorded as the next substantial piece of work rather than attempted at the end of a sequence of
+small ones.
