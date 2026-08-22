@@ -57560,3 +57560,38 @@ decide only the cases it can decide cheaply and hand everything else to the orig
 correct by construction on the residue, however many arms that residue has. Reproducing buys a
 little more speed and costs an unbounded correctness obligation that grows every time someone adds
 an arm to the original.
+
+## B287 — two conversions recovered from CONFLICTING, and the watcher bug that stranded them
+
+**The process failure first, because it is the one the user has already caught once.** Two PRs —
+the param-ladder atom compare and the nullable-map-value span walk — were opened, fully gated, and
+then **stranded**. The merge watcher's loop treats `CONFLICTING` as a terminal state and exits;
+nothing re-queued them, and the next entry's `git fetch` moved on. They sat open while eight later
+PRs merged past them. Exactly the shape of the four-hour stall that prompted "you seem stopped".
+
+**The fix is not a smarter watcher, it is a CHECK-BEFORE-CLAIMING-DONE.** `gh pr list --state open`
+takes a second and would have caught it after any of those eight merges. It is now part of taking
+stock, not something to remember.
+
+Both changes were re-applied on current master rather than rebased — the conflicts were in
+`typecheck.vl`, `emit_sections.vl` and the append-only log, all of which later entries had touched,
+and a clean re-application of a small, well-understood change is cheaper and safer to review than a
+three-file conflict resolution.
+
+**The conversions themselves**, both already measured before they were stranded:
+
+1. **The param-cell ladder.** `paramScalarName(p.parType, ty.tyName)` was called FIVE times with
+   identical arguments, each compared to a different literal — and its arena rung `nodeTyPrimName`
+   returns `t.primName` (a `PrimName` ATOM) through a `: string` signature, so each call
+   materialized a string to compare it. B260's shape, five times per parameter.
+   `paramScalarIs(tyNodeIx, spelled, want: PrimName)` keeps all three rungs and compares atoms via
+   `tyPrimNameOf`. **17,329 comparisons, 0 disagreements.** `paramScalarName` then had zero
+   references and is deleted.
+
+2. **`nulRefMapValInnerOf`.** It wants exactly ONE member of a nullable map-value union — the sole
+   non-null one, which it RETURNS — and the splitting form allocated every member (2.1 per call) to
+   keep one. It now walks spans and slices only that one. **5,893 reaches, 0 disagreements.**
+
+Gates (run once, on the combined tree): corpus A/B 0 differing rows / 2,075; `deno task test` 2,225;
+ci-native 2,242; fixpoint holds; lint clean (it caught an import left dangling by the deletion);
+rep-fuzz exact; grid no BAD cells.
