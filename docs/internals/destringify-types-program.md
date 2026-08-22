@@ -55722,3 +55722,38 @@ because *said nothing* is not *said no* — the same distinction B243 turned on.
 annotation's base a struct?" of a rendered name. All three now ask the arena. The name path
 survives in each only where the arena has no `TyNullable` recorded at all — 10, 10 and 11 reaches
 respectively, which is the honest floor of this question rather than a target.
+
+## B245 — the `structIndexByValName` block, refused where it looked easiest
+
+B244's corrected census left `structIndexByValName` as the largest remaining
+`structIndexOfTypeName` consumer (1,442 calls). It has three call sites:
+
+| site | calls | files |
+| --- | ---: | ---: |
+| `mvValKindOfName:4119` | 683 | 83 |
+| `mvShapeOfValNameRowTy:4372` | 479 | 53 |
+| `:3726` | 280 | 13 |
+
+`:4372` looked like the obvious one: its enclosing function ALREADY takes `rowTy`, and
+`structIndexOfTy` is the row-returning arena twin (a `sTyRow` reverse map), documented next to
+`isStructOfTy` as "that same registry question asked of the type".
+
+Dual-written, it fails on both counts:
+
+| | |
+| --- | ---: |
+| `rowTy` absent | **438 of 479** |
+| present and AGREES | 6 |
+| present and DISAGREES | **35** |
+
+The hint is missing at 91% of reaches, and where it exists it is wrong five times out of six
+(`{f:i64}`, `{f:K0}`, `{f:(i32)=>string}` — inline shapes whose `rowTy` is not the row
+`structIndexByValName` finds by field-set match).
+
+**A hint that is both mostly absent and mostly wrong is a refusal, not a partial win.** Recorded
+here so the next reader does not re-derive it from the fact that `structIndexOfTy` exists — the
+twin existing is not evidence that a caller holds the right input for it, which is the same
+distinction B225 drew about `sTyIx`'s two producers.
+
+`:4119` (`mvValKindOfName`) takes a bare NAME with no type in scope at all, and `:3726` likewise.
+The block is closed.
