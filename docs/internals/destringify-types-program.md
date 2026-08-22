@@ -53302,3 +53302,57 @@ worth flagging as a latent question about the NAME ladder rather than an argumen
 So `recordedParamPinName` ends at: arena for structs (banked row, then field set), name for
 variants, render retained as the ARTEFACT and as the inference-hole gate. That last leg is a
 measured floor, not a decline.
+
+## B206 — the "measured floor" was the wrong function's refusal
+
+B205 ended by recording a floor: the last thing `recordedParamPinName`'s name ladder still
+resolved was a VARIANT (`{meow: i32}` -> `Cat`), and that leg had to stay on the name because
+**variants are nominal** — `variantRowOfTy`'s header says so, B96 states the rule, two fixtures
+pin it, and a structural field-set match would resolve the wrong variant.
+
+Every clause of that is true. **It is also about a different function.**
+
+| function | question it asks |
+| --- | --- |
+| `variantRowOfTy` | is there a variant row whose ARENA INDEX is this type? (`uVarTyIx[i] == ty`) |
+| `variantIndexOfTypeName` | parse this SHAPE spelling's field set, match it against the variant rows, first match wins |
+
+`variantRowOfTy`'s header refuses adding a structural rung to ITS question, because index identity
+plus a `tySame` fallback would merge two same-field-set variants that the arena deliberately keeps
+apart. The name ladder at this consumer never asked that question. It asked the second one — and
+that one **already does the structural field-set match**, first-match-wins and all.
+
+So the twin was not refused. It was unwritten, and I quoted the refusal of its neighbour.
+
+`variantRowOfObjFieldSet` is that twin: `structRowOfObjFieldSet`'s body over the variant tables,
+copying `variantIndexOfTypeName`'s partition rather than its intent (B193) — including the
+first-match behaviour, which it INHERITS rather than introduces.
+
+### The consumer went to zero
+
+Measured at the consumer each time a rung landed (B205's rule):
+
+| arena rungs in `shapeNominalOfTy` | files where the name ladder still resolves |
+| --- | ---: |
+| banked `structIndexOfTy` only | 2 |
+| + `structRowOfObjFieldSet` | 1 |
+| + `variantRowOfObjFieldSet` | **0** |
+
+At zero the call is a pure passthrough — `resolveShapeToNominal(tn)` can only return `tn` — so it
+is gone, replaced by `tn`. And as at B203/B204, `tn` is the RIGHT answer where the two could still
+differ: the ladder matching where the arena declined means the RENDERED field set found a row the
+TYPE's field set does not.
+
+The render above stays and is not a decline path. `tn` is the ARTEFACT this function exists to
+produce and its emptiness is the inference-hole gate. **Nothing at the site asks a question of it
+any more.**
+
+### The pattern, stated plainly
+
+This is the thirteenth verdict in this programme overturned by measurement, and it is the same
+shape as the twelve before: a claim about what information CANNOT do that was really a claim about
+what the attempt had not tried. What makes this one worth its own entry is that the evidence looked
+strongest — a named function, a header refusing the exact move, a rule with fixtures behind it.
+
+**Check that the refusal you are quoting is a refusal of YOUR question.** A neighbouring function
+declining a structurally similar move is not evidence about the move you are making.
