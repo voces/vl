@@ -56950,3 +56950,45 @@ as in B267 and B268 — is usually most of them.
 
 **Four conversions off `unMemTys` now**, all in one function family: 1,034 arm parses (B267), 1,017
 element peels (B268), 416 name→row resolutions (B269), 803 ladder walks (B270).
+
+## B271 — the largest single cut: `unionSetArmTys` stops splitting on the path that succeeds
+
+`unionSetArmTys(set, atoms, tys)` is the seam four arm-classifying loops go through
+(`markRefArrayArms`, `markMapUnionArms`, and two siblings). Its whole body was:
+
+```vl
+splitUnionAtoms(set, atoms)
+unionMemberTysOf(set, tys) && tys.length == atoms.length
+```
+
+So it cut the member-set spelling into atoms on EVERY call — including the calls that then resolve
+the row and return `true`, which is the case its four callers use the arena on.
+
+`recordUnMemTys` cuts the set ONCE at mint and appends the verbatim atom spellings to `unMemAtoms`
+beside their types in `unMemTys`. On the covered path both out-params are one slice of one row, so
+the cut is redundant — and the `tys.length == atoms.length` test is redundant with it, since taking
+both arrays from the same slice makes the lengths equal by construction. **That count check is the
+tell**: it exists because the two sources could disagree, which is the thing to measure.
+
+Measured before removing anything — comparing the split's atoms to the column's, element by
+element:
+
+| | count |
+| --- | --- |
+| covered, every atom identical | **13,305** |
+| covered, any atom differing | **0** |
+| covered but column out of range | 0 |
+| uncovered (legacy path kept) | 14 |
+
+**13,305 spelling cuts removed per full corpus pass** — the largest single conversion in this
+programme, and it took no new twin: the column had been recorded for this purpose all along, and
+the seam simply never read it.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The lesson is where to look, not what to do.** The four callers were already converted — each has
+a `cov` branch reading `mems[i]` and a documented arena hand-over. The waste was one level DOWN, in
+the helper they all share, doing work that only the uncovered 0.1% needed. **A seam that serves both
+a converted and an unconverted path tends to keep paying the unconverted path's cost for
+everybody.** After converting a set of callers, go back and read the helper they call.
