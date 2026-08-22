@@ -56877,3 +56877,32 @@ and 1,017 element peels (B268) removed per full corpus pass, with the guards int
 site's meaning changed. The D-UNION columns' stated intent — *"no consumer ever re-splits a member
 set to learn what its members are"* — now extends to what the consumer ASKS of each member, not
 just how it obtains them.
+
+## B269 — the variant row was resolved one pass earlier, and re-resolved from the same atom
+
+`registerInlineUnion` reads its member spellings back out of the column `recordUnMemTys` just
+wrote — the header there says the parse is "DELETED rather than laddered" because the column's tail
+IS the atom list. But for every STRUCT member it then did this:
+
+```vl
+uVariants.push(atoms[vi])
+uVarTyIx.push(declTyIxOfName(atoms[vi]))
+```
+
+`declTyIxOfName` re-runs the whole name→row ladder (`cUserTypes`, then the primitive and
+composition rungs) — for a row `recordUnMemTys` had already resolved **from that same atom**, into
+`unMemTys`, in the pass that produced `atoms`. Measured: **416 resolutions, 0 disagreements.**
+
+**The snapshot is the correctness detail.** The rows are copied into a local in the SAME loop that
+copies the spellings, not indexed out of the column at use time — because the loop below recurses
+into `collectVariantFields`, which can register another inline union, appending to the columns and,
+on the recorder's self-heal path, clearing and refilling them. Reading `unMemTys[uMemBase + vi]`
+during the loop would be correct today only by luck about that reset; a snapshot taken beside
+`atoms` is correct by the same argument the existing code already relies on for the spellings.
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**Three conversions off `unMemTys` now** — 1,034 arm parses (B267), 1,017 element peels (B268), 416
+name→row resolutions (B269). All three had the same shape: the arena fact was already recorded in a
+column parallel to the atoms, and the consumer re-derived it from the text anyway.
