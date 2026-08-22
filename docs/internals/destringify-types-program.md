@@ -57658,3 +57658,52 @@ closable by `repCanonId` (99%), one intentional (0.09%).
 
 `unRowOfCanon` is not shipped here because neither hot site wants the type question. It is recorded
 as the tool for any site that does.
+
+## B289 — `tyNameOf` IS NOT A RENDERER, and the one arm at the inferred-return ladder that converts
+
+**A correction that resizes the residue.** B288 reported `isUName` at 131,369 calls as the largest
+remaining name consumer and described its two hottest callers as render→decide:
+
+```vl
+const pn = tyNameOf(p.parType)
+if isUName(pn) { return pn }
+```
+
+`tyNameOf` is not a renderer. Its body is `P.nodes[tyIx]` → `if ty is TypeRef { return ty.tyName }`
+— an **AST field read**. The parameter is a NODE index, not an arena index, and the string it
+returns is **the source text the programmer wrote**, stored by the parser. Nothing is printed.
+
+The witness that exposed it: a counterexample where the name said `A|B` and the recorded type was
+`A` (kind `TyObj`). They differ precisely *because* one is source text and the other is what the
+checker inferred. Reading `ty` in `tyNameOf` as "type index" is what I got wrong.
+
+**So the 131,369 `isUName` calls are boundary work on source spellings, not functional type work on
+renders**, and the same holds for the other hot sites: `registerInlineUnion`'s `isUName(name)` is
+the registry's own dedup key, and `letAnnIsUnion`'s comment says outright that it "needs the
+narrower set".
+
+### The one place at this ladder that IS render→decide, and converts
+
+`buildFnMap`'s inferred-return kind ladder is different: `inm` comes from `inferRetTyAt(inRow)` —
+a name the CHECKER rendered from an inferred type and banked. Three name decisions there, dual
+written against the arena row the same table entry records:
+
+| decision | agree | disagree |
+| --- | --- | --- |
+| `nameIsLitUnionType(inm)` vs `tyIsLitUnion(row)` | 3,576 | **0** |
+| `isValueUnionName(inm)` vs `isValueUnionTyOr(row)` | 3,570 | 6 |
+| `isUName(inm)` vs `unRowOfTy(row)` | 3,397 | 179 |
+
+**The column is not the limit: `rowGap = 0`** — `inferRetTyIx` is populated for every entry that
+exists. (The 11,748 reaches with no row have no ENTRY either, so `inm == ""` and every name
+predicate is trivially false. An earlier reading of that number as a 76% coverage gap was wrong.)
+
+Only the litunion arm converts, and it converts exactly. Its two neighbours fail for the mechanisms
+B288 measured — canon softening (the banked NAME is the lowering, the row is the precise type) and
+arena duplication (a row-identity scan misses duplicates). **`tyIsLitUnion` is free of both because
+it is a structural test on the row itself, not a registry lookup** — which is the general rule this
+entry adds: *an arena route survives when it asks a STRUCTURAL question of the row, and fails when
+it asks a REGISTRY question, because the registry is keyed on the lowering.*
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
