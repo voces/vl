@@ -11163,11 +11163,15 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
 // and that selector reads the type ARENA (this entry) and the registered `unNames` ROWS (the
 // name-keyed entry below) — neither of which is an annotation. Same rule, same home, no second
 // answer; see that call site for the wasm it got wrong without it.
-export function numLitUnionBaseName(ty: i32): string {
+// The base ROW, which is what the walk actually computes — `softenLitTy` hands back an
+// arena index and the name forms below read `primName` off it. A consumer that wants a
+// TYPE was going type -> name -> type through `primTyOfName`'s eight string compares; the
+// row it wanted was in hand the whole time.
+export function numLitUnionBaseTy(ty: i32): i32 {
   let cur = ty
   let peels = 0
   while peels < 8 {
-    if cur < 0 { return "" }
+    if cur < 0 { return -1 }
     const t = T.tys[cur]
     let inner = -1
     if t is TyUnion {
@@ -11180,16 +11184,38 @@ export function numLitUnionBaseName(ty: i32): string {
       peels = peels + 1
     }
   }
-  if cur < 0 { return "" }
+  if cur < 0 { return -1 }
   const soft = softenLitTy(cur)
-  if soft == cur { return "" }
-  if soft < 0 { return "" }
+  if soft == cur { return -1 }
+  if soft < 0 { return -1 }
   const st = T.tys[soft]
   if st is TyPrim {
     const pn = st.primName
-    if pn == "i32" || pn == "i64" || pn == "f64" { return pn }
+    if pn == "i32" || pn == "i64" || pn == "f64" { return soft }
   }
-  ""
+  -1
+}
+
+// The base as the ATOM. `PrimName` is a literal union, so this stays an interned atom and a
+// caller's `== "i64"` is an `i32.eq`; declaring it `string` would WIDEN it (see B260).
+export function numLitUnionBasePrim(ty: i32): PrimName | null {
+  const b = numLitUnionBaseTy(ty)
+  if b < 0 { return null }
+  const bt = T.tys[b]
+  if bt is TyPrim { return bt.primName }
+  null
+}
+
+// Does `ty` HAVE a numeric-litunion base? The `!= ""` most callers were really asking, with
+// no name built to ask it.
+export function numLitUnionHasBase(ty: i32): boolean {
+  numLitUnionBaseTy(ty) >= 0
+}
+
+// The base as TEXT — for the callers that genuinely propagate a NAME upward (the nominal
+// renderers), where the widening belongs at that boundary rather than on every ask.
+export function numLitUnionBaseName(ty: i32): string {
+  primNameStr(numLitUnionBasePrim(ty))
 }
 
 // The single base NUMERIC scalar every value of `ty` reps as at emit — `"i32"` /
@@ -11325,7 +11351,7 @@ export function nodeNumScalarBaseName(ix: i32) {
 // same bound `numLitUnionBaseName` peels on, so an alias-of-an-alias yields the members.
 export function tyNumLitMemberTexts(ty: i32) {
   const out: string[] = []
-  if numLitUnionBaseName(ty) == "" { return out }
+  if !numLitUnionHasBase(ty) { return out }
   let cur = ty
   let peels = 0
   while peels < 8 {
@@ -22555,8 +22581,8 @@ export function nodeTyIsFunc(ix: i32) {
 // DELIBERATELY UNFILTERED — it answers `boolean` too. A consumer that must stay as narrow as the
 // name cut applies its own whitelist; folding one in here would make the helper's answer depend
 // on which caller was written first.
-export function tyArrayElemPrimName(ty: i32): string {
-  if ty < 0 { return "" }
+export function tyArrayElemPrim(ty: i32): PrimName | null {
+  if ty < 0 { return null }
   const t = T.tys[ty]
   if t is TyArray {
     if t.aElem >= 0 {
@@ -22564,7 +22590,17 @@ export function tyArrayElemPrimName(ty: i32): string {
       if el is TyPrim { return el.primName }
     }
   }
-  ""
+  null
+}
+
+// The decision form — `tyIsPrimNamed`'s shape over the array element.
+export function tyArrayElemPrimIs(ty: i32, nm: PrimName): boolean {
+  tyArrayElemPrim(ty) == nm
+}
+
+// The element prim as TEXT, for the one consumer that carries it onward as a name.
+export function tyArrayElemPrimName(ty: i32): string {
+  primNameStr(tyArrayElemPrim(ty))
 }
 
 export function nodeTyArrayElemRepName(ix: i32) {
@@ -23563,7 +23599,7 @@ export function tyNestedArrLeafSupported(elemTy: i32): boolean {
 // with no render and no compare against one. Replaces `nodeArrayElemName(ix) == "boolean"`, whose
 // `TyPrim` arm is a `tyToStructStr` call whose only consumer was that compare.
 export function nodeTyArrayElemIsBoolPrim(ix: i32): boolean {
-  tyArrayElemPrimName(nodeTyIxOf(ix)) == "boolean"
+  tyArrayElemPrimIs(nodeTyIxOf(ix), "boolean")
 }
 
 // The NESTED form: an array of arrays whose LEAF element is the `boolean` primitive. Replaces
@@ -23573,7 +23609,7 @@ export function nodeTyNestedElemIsBoolPrim(ix: i32): boolean {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyArray { return tyArrayElemPrimName(t.aElem) == "boolean" }
+  if t is TyArray { return tyArrayElemPrimIs(t.aElem, "boolean") }
   false
 }
 
