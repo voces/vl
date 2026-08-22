@@ -207,7 +207,6 @@ import {
   nameIsBareMap,
   nameIsClosureArray,
   nameIsClosureArrayTy,
-  nameIsClosureElem,
   nameIsElemArray,
   nameIsF32Array,
   nameIsF64Array,
@@ -14061,6 +14060,73 @@ export function tyStructHasMapField(ty: i32, depth: i32): boolean {
   false
 }
 
+// Does the type tree at `ty` MENTION a function type anywhere? The faithful arena reading of
+// `nameIsClosureElem`'s last leg, `strContains(name, "=>")` — which matches an arrow at ANY
+// depth of the spelling, inside a union arm or an array element or a field.
+function tyMentionsFunc(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth > 12 { return false }
+  const t = T.tys[ty]
+  if t is TyFunc { return true }
+  if t is TyArray { return tyMentionsFunc(t.aElem, depth + 1) }
+  if t is TyNullable { return tyMentionsFunc(t.nInner, depth + 1) }
+  if t is TyMap { return tyMentionsFunc(t.mVal, depth + 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if tyMentionsFunc(ms[i], depth + 1) { return true }
+      i = i + 1
+    }
+  }
+  if t is TyObj {
+    const fts = t.objFieldTypes
+    let k = 0
+    while k < fts.length {
+      if tyMentionsFunc(fts[k], depth + 1) { return true }
+      k = k + 1
+    }
+  }
+  false
+}
+
+// The ARENA twin of `nameIsClosureElem`, asked of an ARRAY's element. The partition is COPIED,
+// not intended (B193), arm for arm:
+//   `nameIsFuncTypeAtom`  -> `TyFunc`
+//   `nameIsNulClosure`    -> `TyNullable` over a `TyFunc`
+//   `nameIsBraceSpanEnds` -> a bare `TyObj`, which DECLINES even when a field is a closure
+//   `strContains("=>")`   -> `tyMentionsFunc` at any depth
+// The third arm is the one a paraphrase drops. Ported narrowly as "is it a `TyFunc`", it refused
+// `((i32)=>f32)[]|i32` — correct output, but the module grew 716 -> 1310 bytes, because the
+// element still reps as a ref and the narrow answer sent it down a longer lowering.
+export function arrElemIsClosureTy(arrIx: i32, cen: string): boolean {
+  // The EMPTINESS gate, kept on the render. "" is not a missing answer — it is the checker
+  // declining to name the element, which is the condition
+  // `functions/error-generic-fn-value-partial-annotation-no-context.vl` reports on. The arena
+  // knows the KIND and cannot know the decline.
+  if cen == "" { return false }
+  const aty = nodeTyIxOf(arrIx)
+  if aty < 0 { return false }
+  const at = T.tys[aty]
+  if at is TyArray {
+    const ety = at.aElem
+    const et = T.tys[ety]
+    if et is TyFunc { return true }
+    if et is TyNullable {
+      const it2 = T.tys[et.nInner]
+      if it2 is TyFunc { return true }
+    }
+    // `nameIsBraceSpanEnds` spans BOTH brace forms — an object `{a:…}` and a map
+    // `{[k]:v}` — so a map whose VALUE is a closure declines here exactly as an object with a
+    // closure field does. Ported as `TyObj` alone it disagreed on
+    // `closures/inferred-array-elem-arrow-position.vl` (`{[string]:(i32)=>i32}`).
+    if et is TyObj { return false }
+    if et is TyMap { return false }
+    return tyMentionsFunc(ety, 0)
+  }
+  false
+}
+
 export function arrLitMapElemName(arrIx: i32): string {
   const cen = nodeArrayElemName(arrIx)
   if cen == "" { return "" }
@@ -14148,7 +14214,7 @@ export function arrLitIsRef(arrIx: i32) {
     // mis-claimed — and it subsumes the lambda-literal case below for any closure array the
     // checker concretely typed.
     const cen = nodeArrayElemName(arrIx)
-    if nameIsClosureElem(cen) { return true }
+    if arrElemIsClosureTy(arrIx, cen) { return true }
     const e0 = P.nodes[a.arrElems[0]]
     if e0 is ObjLit { return true }
     // A CLOSURE-element literal (`[(x) => x + 1]`) is a ref list (element kind 5), NOT an i32
@@ -14252,7 +14318,7 @@ export function arrLitElemKind(arrIx: i32) {
     // asked of the element ITSELF, so a struct / map / union element that merely CONTAINS a
     // closure keeps its own kind (1 / 3 / 2) and its own wrapper.
     const cen = nodeArrayElemName(arrIx)
-    if nameIsClosureElem(cen) { return 5 }
+    if arrElemIsClosureTy(arrIx, cen) { return 5 }
     if a.arrElems.length >= 1 {
       const e0 = P.nodes[a.arrElems[0]]
       // A nested-list element: the INNER literal's leaf picks the element kind —
@@ -14297,7 +14363,7 @@ export function arrLitElemName(arrIx: i32) {
     // A closure-element literal: the parenthesized function-type table key the checker recorded.
     // The kind-5 gate is `arrLitElemKind`'s, arm for arm — the two must agree per slot.
     const cen = nodeArrayElemName(arrIx)
-    if nameIsClosureElem(cen) { return cen }
+    if arrElemIsClosureTy(arrIx, cen) { return cen }
     if a.arrElems.length >= 1 {
       const e0 = P.nodes[a.arrElems[0]]
       // A nested-list element keys the INNER list's name by its leaf — the table
