@@ -55324,3 +55324,80 @@ gate run would have had to be repeated.
 A second slip in the same recovery: `git commit --amend` after a `reset --hard origin/master`
 amends MASTER'S TIP, not your own commit — it silently dropped the preceding merged entry from the
 branch. Caught by reading `HEAD^`. After a reset, commit; never amend.
+
+## B238 — following `fieldElemTyIxOfName` to the end: one conversion, one refusal chain, one slice left
+
+B237 converted the second-largest of `fieldElemTyIxOfName`'s five callers. Walking the other four
+finishes that function.
+
+## `emit_rep:1129` (5271, 42%) — refused, and the refusal is already written down
+
+`mvValTyIxOfNameRow(nm, rowTy)` ALREADY takes a hint and returns it when `rowTy >= 0`. Every one of
+the 5,271 is a call where the hint was -1. Censused, they come from ONE caller
+(`emit_classify:4385`, 5271 unhinted against 329 hinted; the other caller is fully covered at
+1445/0), which is reached through `mvShapeOfValNameK` — the `-1` wrapper — from two live sites:
+
+| wrapper caller | calls | files |
+| --- | ---: | ---: |
+| `mvShapeOfMapName` — value SLICED out of a rendered map spelling | 8600 | 278 |
+| `mvShapeOfMapNodeTy` — the caller holds the NODE | 2844 | 263 |
+| a third | **0** | **0** — dead |
+
+Both carry an explicit refusal, and it is the same one:
+
+> **…AND THE "ONE CALL TO CHANGE" IS NOT THIS ONE — D-MAPNODETY BUILT IT AND TOOK IT BACK.** The
+> two `collectA` `TypeRef`-walk callers hold the annotation NODE, so the value type is free
+> (`nodeMapValTyIx`); routing it emitted INVALID WASM on
+> `tests/cases/maps/alias-positions-and-value-kinds.vl`, because this path MINTS.
+
+`mvShapeOfMapNodeTy` repeats it: "NOT FRONTED WITH `nodeMapValTyIx`, though the caller holds the
+node: this path MINTS, and an arena leg that answers where the name bridge does not SKIPS the
+mint."
+
+**An arena leg that answers where the name bridge declines is not an optimisation on a MINT path —
+it changes which types get minted, and mint ORDER is load-bearing** (`repElemKeyGo`'s identity arm
+keys `TyVar`/`TyLit`/`TyErr` by arena INDEX). That is why B237's site was safe and these are not:
+B237 records a sidecar AFTER the mint; these decide the mint.
+
+Reading the header before attempting is what caught it. Two of this programme's own entries had to
+reopen refusals; this one stays.
+
+## The remaining slice, located exactly
+
+| caller | calls | outcome |
+| --- | ---: | --- |
+| `emit_rep:1129` | 5271 | refused — D-MAPNODETY, invalid-wasm witness |
+| `emit_classify:14903` | 3250 | **converted (B237)** |
+| `emit_rep:2123` — `sFieldElemTyIx.push` | 3089 | the slice |
+| `emit_rep:2138` — `uFieldElemTyIx.push` | 827 | the slice |
+| `emit_rep:1102` | 92 | — |
+
+The two recorders are fed by eight call sites, of which three carry 84%:
+
+| site | calls | files |
+| --- | ---: | ---: |
+| `emit_classify:16627` — `shapeFieldElemName(texts[pi], codes[pi])` | 1570 | 355 |
+| `emit_collect:4931` | 916 | 387 |
+| `emit_collect:4926` | 827 | 271 |
+
+**And the row is in scope at the biggest**: its enclosing function is
+`internInlineShapeTy(nm: string, tyIx: i32)` — the shape's own arena row is already a parameter, so
+field `pi`'s type is `T.tys[tyIx]`'s `objFieldTypes[pi]`.
+
+What it needs is the same treatment B230–B232 gave `arrLitElemName`: `shapeFieldElemName` projects
+PER FIELD CODE (16 → the union, 15 → the `| null`-stripped nested target, 19/29 → the map's VALUE,
+0/4 → the litunion atom / atom array, 30 → the niche union), so the twin projects the field's ROW
+per code and each arm is dual-written on its own. A single hint across all of them is exactly the
+mistake B224 made and B230 undid.
+
+These recorders run BEFORE the reads and record a sidecar, so they are on B237's side of the
+mint-order line, not D-MAPNODETY's.
+
+## Session totals
+
+| | corpus-wide `resolveAnnot` |
+| --- | ---: |
+| session start (`f035b4bc`) | 18,532 |
+| now | **~11,540** |
+
+**~38% removed across eleven conversions**, every one byte-identical on the corpus.
