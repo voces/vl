@@ -57033,3 +57033,46 @@ change with its own risk. Refused here, queued as that.
 `a.length`. It is a different defect from the rest of the programme — not "functional work on a
 string representation of a type" but a projection of a value the caller never wanted — and it hides
 in exactly the same places.
+
+## B273 — the module graph refused the arena route, so the SPLIT went instead
+
+B272 queued `unionHasAtom` as blocked: it could read the recorded atom column, but it lives in
+`emit_base.vl` while `msMemberAtomsOf` lives in `emit_classify.vl`, which imports `emit_base` — the
+dependency runs the wrong way, and moving the reader to the zero-import leaf is its own change.
+
+Reach first, since a blocked site is only worth unblocking if it is hot. Measured: **`unionHasAtom`
+11,327 reaches; `unionTakesAtomAsStr` 0** (its two litunion guards reject before the split — so the
+sibling seam, 9 callers, is dead weight and needs no conversion at all).
+
+11,327 justified a second look, and there is a route that needs no module move. `splitUnionAtoms`'s
+own header says its atoms are **VERBATIM substrings** between top-level `|` separators — no
+trimming, no paren peeling. So membership does not need the substrings to exist:
+
+```vl
+while going {
+  const at = tyTopIndexOf(name, '|', '=', start)
+  let end = name.length
+  if at >= 0 && name[at] != '=' { end = at } else { going = false }
+  if spanEqAt(name, start, end, atom) { return true }   // no slice
+  if going { start = at + 1 }
+}
+```
+
+Same scanner, same bounds, same top-level `=>` stop, **zero allocations** — where the old body
+allocated one string per member and compared and discarded each. `spanEqAt` (a length check and a
+code-point loop) goes in `tyname.vl`, the leaf, where it is available to everything.
+
+Measured against the splitting form before removing it: **11,327 reaches, 0 disagreements.**
+
+Gates: corpus A/B 0 differing rows / 2,075 (baseline built fresh from the master commit); `deno task
+test` 2,225; ci-native 2,242; fixpoint holds; lint clean; rep-fuzz exact; grid no BAD cells.
+
+**The lesson: a blocked route is not a blocked conversion.** B272 recorded a module-graph refusal
+and queued the module move. The move was never needed — the waste was the MATERIALIZATION, not the
+choice of where the answer comes from, and that could be removed inside one file. When an arena
+route is blocked, ask separately whether the name route is doing avoidable work; the two questions
+have different answers and only one of them needed the graph rearranged.
+
+**And measure reach before unblocking.** Half of the queued item — `unionTakesAtomAsStr`, 9 callers
+— turned out to fire zero times. Nine call sites is a static number; it says nothing about whether
+converting them removes any work.
