@@ -57595,3 +57595,66 @@ three-file conflict resolution.
 Gates (run once, on the combined tree): corpus A/B 0 differing rows / 2,075; `deno task test` 2,225;
 ci-native 2,242; fixpoint holds; lint clean (it caught an import left dangling by the deletion);
 rep-fuzz exact; grid no BAD cells.
+
+## B288 — the residue, measured: the interner-key refusal was never real, and the reverse-index one is TWO mechanisms
+
+B280's status listed three standing refusals. Auditing them at current master, **one of the three
+does not exist** and a second splits into a closable half and an intentional half.
+
+### 1. INTERNER KEYS — not a refusal. The keys are already ids.
+
+`repCanonKey` / `repElemKey` / `repMvValKey` render a type to a structural string. **None of them
+has a functional caller.** Identity is `repCanonId` / `repElemId` / `repMvValId` — interned i32 ids
+built from CHILD IDS (`hcIntern`), not from a render. The string builders survive only inside
+`repShadowCheckTy`, reached from `repShadowSweep`, which opens `if !repShadowOn { return 0 }` — and
+`repShadowOn = false`. The code says so itself: *"`repMvValKey` has no functional caller any more —
+`mvSlotOfTyK` compares ids — and this is where it earns its keep, as the SHADOW of the id it was
+replaced by."*
+
+**Correction to B280:** that category was closed before this session; the survivors are an
+off-by-default oracle, not type work. Listing them as a refusal overstated the residue.
+
+### 2. The reverse index — 99% of the gap is arena DUPLICATION, and `repCanonId` closes it
+
+The name-keyed union registry is the largest remaining name consumer by reach: **`isUName` at
+131,369 calls**, a linear scan over `unNames` with string equality. Its two hottest callers
+(38,971 + 31,192) have the goal's exact shape —
+
+```vl
+const pn = tyNameOf(p.parType)     // RENDER
+if isUName(pn) { return pn }       // decide on the render
+```
+
+— and **88% of those renders are discarded** (true 8,275 / false 61,888).
+
+`unTyIx` is fully populated (measured: **0 unresolved rows of 109,936**), so a row-identity scan
+should work. It does not: **5,876 disagreements of 70,163, and 5,876 of them run name-yes/row-no** —
+useless as a necessary condition. The cause is that the arena is **not hash-consed** for composite
+spellings, so one spelling mints several rows and a row-identity scan misses the registered one.
+
+`repCanonId` is the interned structural id those duplicates already share. Re-keying the reverse
+index on it: **5,876 → 60 disagreements** (rowOnly stays 2). **The duplication half of this refusal
+is closable, with machinery that already exists.**
+
+### 3. The residual 60 are CANON SOFTENING, and they are by design
+
+Witnesses, all one shape:
+
+```
+nm=[i32|null]    tyStr=[N | null]         (N = a litunion alias)
+nm=[i32|null]    tyStr=[1 | 2 | null]
+nm=[string|i32]  tyStr=["a" | "b" | 1]
+```
+
+**The name is the LOWERING; the row is the TYPE.** `tyNameOf` renders the canon-softened spelling — a
+literal union softens to its base scalar — and the registry is keyed on that softened form because
+the rep decision is what its consumers need. The arena row is the precise type. Both are correct
+and they answer different questions, which is B229's "canon is spelling-dependent" in its sharpest
+form yet.
+
+**So these two call sites stay on the name, and correctly.** What changes is the map: the standing
+"arena↔table reverse index is partial" refusal is now two named mechanisms with numbers — one
+closable by `repCanonId` (99%), one intentional (0.09%).
+
+`unRowOfCanon` is not shipped here because neither hot site wants the type question. It is recorded
+as the tool for any site that does.
