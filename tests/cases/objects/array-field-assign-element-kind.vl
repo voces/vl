@@ -1,0 +1,187 @@
+// @run
+// @log 7
+// @log 0
+// @log z
+// @log 0
+// @log 7
+// @log 9000000000
+// @log 0
+// @log 7.5
+// @log 0
+// @log 7
+// @log 0
+// @log 7
+// @log 0
+// @log 7
+// @log 0
+// @log 7
+// @log 0
+// @log 7.5
+// @log 0
+// @log z
+// @log 0
+// @log 7
+// @log 0
+// @log 7
+// @log 0
+// @log 7.5
+// @log 0
+// @log z
+// @log 0
+// @hint redundant type annotation: `wi` is inferred as `{f: i32[]}`
+// @hint redundant type annotation: `ws` is inferred as `{f: string[]}`
+// @hint redundant type annotation: `w32` is inferred as `{f: f32[]}`
+// @hint redundant type annotation: `wf` is inferred as `{f: f64[]}`
+// The four annotations the hints name are kept DELIBERATELY: each row states its element
+// type at the binding as well as in the alias, so the row reads as one storage class end
+// to end. They are redundant only because the literal already infers the same shape.
+// ASSIGNING A WHOLE LIST TO AN ARRAY-TYPED FIELD, one row per element storage class.
+// `emitObj` builds a field's list literal under the field's own element kind; the ASSIGN
+// twin threaded that kind for only TWO of the codes (ref lists and `string[]`), so a bare
+// `[7]` written to an `i64[]` / `f32[]` field self-classified as the DEFAULT i32 list and
+// `struct.set` stored an i32-list wrapper into the field's own wrapper slot — `vl check`
+// rc 0, `vl check --codegen` "the emitted module is not valid wasm" (#1824).
+//
+// The i32 and string rows are the CONTROLS and are the reason the bug was invisible: the
+// i32 list IS the default, and a string literal self-identifies, so those two codes worked
+// with no seed at all. They must keep working — a fix that seeds the wrong kind breaks
+// them, and a regression that drops the seed breaks only the rows below them.
+//
+// The f64 row is a control in one direction and a defect cell in the other: `[7.5]` self-
+// identifies as f64, but `[7]` does not, so an INT-element literal is the f64 witness.
+//
+// Every row is written twice — a NON-EMPTY literal (whose elements re-encode at the store)
+// and an EMPTY `[]` (which has no elements to classify and can only take the seed). The
+// empty form fails for `string[]` too when the seed is dropped, so it is the row that
+// catches a regression in the arm the controls otherwise cover.
+type WI = { f: i32[] }
+type WS = { f: string[] }
+type W64 = { f: i64[] }
+type W32 = { f: f32[] }
+type WF = { f: f64[] }
+
+const wi: WI = { f: [1] }
+wi.f = [7]
+print(wi.f[0])
+wi.f = []
+print(wi.f.length)
+
+const ws: WS = { f: ["a"] }
+ws.f = ["z"]
+print(ws.f[0])
+ws.f = []
+print(ws.f.length)
+
+const w64: W64 = { f: [1] }
+w64.f = [7]
+print(w64.f[0])
+w64.f = [9000000000]
+print(w64.f[0])
+w64.f = []
+print(w64.f.length)
+
+// A `.`-less float literal stays f64, so the f32 list is only ever reached through the
+// declared element type — on BOTH sides: the constructor needs an f32-typed element for
+// the checker, and the assign needs the threaded kind for the emitter.
+const s32: f32 = 1.5
+const w32: W32 = { f: [s32] }
+w32.f = [7.5]
+print(w32.f[0])
+w32.f = []
+print(w32.f.length)
+
+const wf: WF = { f: [1.5] }
+wf.f = [7]
+print(wf.f[0])
+wf.f = []
+print(wf.f.length)
+
+// The NULLABLE distinct-backing twins (`i64[] | null` and friends) carry their own wrapper
+// heap type, so they need the same seed: the list literal builds the LEAF list and its
+// non-null ref subtypes the nullable slot.
+type N64 = { f: i64[] | null }
+const n64: N64 = { f: null }
+n64.f = [7]
+if n64.f is i64[] {
+  print(n64.f[0])
+  n64.f = []
+  print(n64.f.length)
+}
+
+// THE BOXED HALF. `emitAssign` has THREE `target is Member` receivers, and only the plain
+// one seeded anything: a field write through a NARROWED union arm (`if u is A { u.f = … }`)
+// or through a variant-typed PARAM shares one value emit (`emitScalarFieldStoreVal`) that
+// knew nothing about list kinds. The i32 and string arms below are again the controls that
+// worked without a seed.
+type BX = { g: i32 }
+type AI = { f: i32[] }
+type A64 = { f: i64[] }
+type A32 = { f: f32[] }
+type AS = { f: string[] }
+
+const ui: AI | BX = { f: [1] }
+if ui is AI {
+  ui.f = [7]
+  print(ui.f[0])
+  ui.f = []
+  print(ui.f.length)
+}
+
+const u64: A64 | BX = { f: [1] }
+if u64 is A64 {
+  u64.f = [7]
+  print(u64.f[0])
+  u64.f = []
+  print(u64.f.length)
+}
+
+const u32: A32 | BX = { f: [s32] }
+if u32 is A32 {
+  u32.f = [7.5]
+  print(u32.f[0])
+  u32.f = []
+  print(u32.f.length)
+}
+
+const us: AS | BX = { f: ["a"] }
+if us is AS {
+  us.f = ["z"]
+  print(us.f[0])
+  us.f = []
+  print(us.f.length)
+}
+
+// THE THIRD RECEIVER: a variant-typed PARAM (`function put(o: A)`), where the param IS the
+// unboxed variant ref. It shares the narrowed arm's value emit, so it shared the hole —
+// including for `string[]`, whose EMPTY `[]` had no seed on either variant receiver.
+function putI(o: AI) {
+  o.f = [7]
+  print(o.f[0])
+  o.f = []
+  print(o.f.length)
+}
+putI({ f: [1] })
+
+function put64(o: A64) {
+  o.f = [7]
+  print(o.f[0])
+  o.f = []
+  print(o.f.length)
+}
+put64({ f: [1] })
+
+function put32(o: A32) {
+  o.f = [7.5]
+  print(o.f[0])
+  o.f = []
+  print(o.f.length)
+}
+put32({ f: [s32] })
+
+function putS(o: AS) {
+  o.f = ["z"]
+  print(o.f[0])
+  o.f = []
+  print(o.f.length)
+}
+putS({ f: ["a"] })
