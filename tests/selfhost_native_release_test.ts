@@ -115,8 +115,14 @@ if (GATED && !ENABLED) {
 // `opt-profile-design.md` §3 and `unboxed-union-rep-design.md` §13.
 const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }> = [
   { fixture: "struct-scratch-call", none: 3, O: 0, O3: 0 },
-  { fixture: "list-wrapper-literal", none: 3, O: 0, O3: 0 },
-  { fixture: "list-wrapper-call", none: 3, O: 0, O3: 0 },
+  // THE `none` COLUMN OF THE THREE LIST ROWS ROSE BY ONE AT THE STRING SLICE-HEADER CHANGE
+  // (Stage 2b), AND NOT FOR A REASON IN THE FIXTURE. None of the three mentions a string.
+  // What they count is the WHOLE module, and every module carries the shared
+  // `__str_concat__` helper at the tail — which now `struct.new`s a `{backing,start,len}`
+  // header around the backing it allocated. The site is in dead code here, which is exactly
+  // why the `-O`/`-O3` columns are unmoved: 0/0 and 3/2 as before. Re-measured, not guessed.
+  { fixture: "list-wrapper-literal", none: 4, O: 0, O3: 0 },
+  { fixture: "list-wrapper-call", none: 4, O: 0, O3: 0 },
   // Both union-box producers here are two-armed helpers, and the RETURN SINK gives such a
   // function ONE construction site: every `return` writes the tag/payload pair into two
   // reserved locals and branches to a single exit that performs the only `struct.new`. So
@@ -148,7 +154,7 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // around it is local scalarization across a liveness window: a rep change
   // (`unboxed-union-rep-design.md` §12.4), not a sink.
   { fixture: "union-box-branch-local-read", none: 4, O: 4, O3: 4 },
-  { fixture: "list-wrapper-push", none: 6, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push", none: 7, O: 3, O3: 2 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
@@ -371,7 +377,11 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
   {
     bench: "algorithms/dispatch-table",
     axis: "4-way indirect dispatch (registry / interpreter shape)",
-    O: { bytes: 656, fns: 6, allocs: 18, indirect: 2 },
+    // `-O` allocs 18 -> 22 at the string slice-header change (Stage 2b): this program builds
+    // strings, and a string is now a HEADER over a backing — two `*.new` sites where it used
+    // to be one. `-O3` is unmoved at 14, so `--closed-world` melts every header the extra
+    // sites introduced. `indirect` is the row's real axis and did not move.
+    O: { bytes: 696, fns: 6, allocs: 22, indirect: 2 },
     O3: { bytes: 466, fns: 6, allocs: 14, indirect: 2 },
   },
   // TAIL CALLS. `meta.json` still carries the `vlDefect` entry from when VL emitted a plain
@@ -409,8 +419,15 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
   {
     bench: "strings/str-eq",
     axis: "string == : identity / equal / early-mismatch / late-mismatch",
-    O: { bytes: 1491, fns: 3, allocs: 14, indirect: 0, refEq: 1 },
-    O3: { bytes: 1466, fns: 3, allocs: 14, indirect: 0, refEq: 1 },
+    // Stage 2b (the string slice header) moved both rungs: allocs 14 -> 16 — two more
+    // `struct.new` sites, one per string CONSTRUCTOR in the module (a header now wraps the
+    // backing) — and bytes +101/+47 for the header reads the helper does. `refEq` HELD at 1,
+    // which is the pin that matters here: `__str_eq__` still short-circuits on identity, now
+    // comparing headers rather than element arrays. Two DISTINCT headers over the same
+    // backing and range no longer short-circuit and walk instead — a lost optimisation, not
+    // a wrong answer, and the pool still gives one header per distinct literal.
+    O: { bytes: 1592, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    O3: { bytes: 1513, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
@@ -421,8 +438,14 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
   {
     bench: "collections/map-string",
     axis: "string-keyed map: insert, hit/miss probe, iterate",
-    O: { bytes: 1881, fns: 4, allocs: 18, indirect: 0, refEq: 1 },
-    O3: { bytes: 1849, fns: 3, allocs: 19, indirect: 0, refEq: 1 },
+    // Stage 2b: allocs 18 -> 22 at `-O` and 19 -> 21 at `-O3` (a header per string
+    // construction), bytes +156/+77 (`__str_hash__` and the probe both read the header).
+    // `fns` at `-O3` went 3 -> 4: one helper stopped being inlined, because `__str_hash__`
+    // grew a hoist prologue. That is the one line of this re-record that is a cost rather
+    // than an accounting change, and it is the trade the prologue buys — the hoist takes the
+    // header reads OUT of the per-code-point loop.
+    O: { bytes: 2037, fns: 4, allocs: 22, indirect: 0, refEq: 1 },
+    O3: { bytes: 1926, fns: 4, allocs: 21, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -442,8 +465,13 @@ const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3: ShapeP
   {
     bench: "collections/word-freq",
     axis: "tokenize + word-frequency upsert (map + string)",
-    O: { bytes: 2471, fns: 5, allocs: 25, indirect: 0, refEq: 1 },
-    O3: { bytes: 2404, fns: 5, allocs: 25, indirect: 0, refEq: 1 },
+    // Stage 2b: allocs 25 -> 30 at both rungs. Note what did NOT happen — `meta.json`
+    // attributes ~21% of this benchmark to `slice`, and `slice` is now allocation-free at the
+    // ELEMENT level (a header, no `array.new_default` and no `array.copy`). The site COUNT
+    // still rose because a header is a `struct.new` the counter sees; what fell is the bytes
+    // copied per slice, which this table cannot see and `bench/run.sh` can.
+    O: { bytes: 2662, fns: 5, allocs: 30, indirect: 0, refEq: 1 },
+    O3: { bytes: 2595, fns: 5, allocs: 30, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been

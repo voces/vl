@@ -616,11 +616,24 @@ export let strPushScratchBase = 0
 // strings (so an operand expression is evaluated ONCE — no re-eval of a side-
 // effecting call) and to drive an element loop. ONE shared frame covers them all,
 // reserved in any function using ANY string op (detected by `fnHasStrOp`):
-//   strScrA/strScrB/strScrOut : 3 NON-NULL `(ref $sTypeIdx)` string refs — the two
-//                               operands + the freshly-allocated result.
+//   strScrA/strScrB           : 2 NON-NULL `(ref $sTypeIdx)` string HEADERS — the
+//                               two operands.
+//   strScrOut                 : a NON-NULL `(ref $sBackIdx)` — the freshly
+//                               allocated BACKING a builder fills. Stage 2b: a
+//                               builder makes elements first and wraps the header
+//                               around them last, so the slot holds the array, not
+//                               a finished string.
 //   strScrI0..strScrI3        : 4 i32 temporaries — loop index, length, clamped
 //                               start/end (slice), running result (equality).
-// `strScratchBase` is `strScrA`'s wasm local index; the other six follow at +1..+6.
+//   strScrABk/strScrBBk       : the two operands' HOISTED backings, `(ref null
+//                               $sBackIdx)` (nullable so the slot is defaultable;
+//                               `array.get`/`array.len`/`array.copy` all accept a
+//                               nullable ref and trap on null).
+//   strScrAOff/strScrBOff     : the two operands' `start` offsets, i32.
+// `strScratchBase` is `strScrA`'s wasm local index; the other ten follow at +1..+10.
+// The last four exist because every element loop here reads its operands O(n) times:
+// hoisting `struct.get $s 0` / `$s 1` out of the loop is done in CODEGEN, not left to
+// binaryen's LICM, which is not guaranteed to lift a GC `struct.get` out of a loop body.
 export let fnUsesStrOp = false
 export let strScratchBase = 0
 // ── per-function list `==`/`!=`/`+` scratch frames (collections-design §VL.4/6) ──
@@ -791,17 +804,36 @@ export let sTyIx: i32[] = []
 // `emitModule`.
 export let aUsed = false
 export let aTypeIdx = 0
-// ── string-type table (`string`'s OWN heap type) ──────────────────────────────
-// STAGE 2a OF THE STRING REPRESENTATION MIGRATION (`docs/internals/string-rep-measurements.md`
-// Part 2, `docs/guide/strings-design.md`). A `string` USED to share `aTypeIdx` with the i32
-// list's backing — one heap-type index serving two reps — which is exactly what blocked
-// changing the string's storage. It now has its own index, `sTypeIdx`, emitted immediately
-// after `aTypeIdx`.
+// ── string-type table (`string`'s OWN heap types) ─────────────────────────────
+// STAGE 2b OF THE STRING REPRESENTATION MIGRATION (`docs/internals/string-rep-measurements.md`
+// Part 2 §2.5, `docs/guide/strings-design.md` §Header). A `string` USED to share `aTypeIdx`
+// with the i32 list's backing (one heap-type index serving two reps); Stage 2a split that into
+// `sTypeIdx`, still a bare `(array (mut i32))`. Stage 2b promotes `sTypeIdx` to a SLICE HEADER
+// and moves the elements down into `sBackIdx`:
 //
-// AT THIS STAGE THE TWO TYPES ARE STRUCTURALLY IDENTICAL: `sTypeIdx` is also
-// `(array (mut i32))` of CODE POINTS, so `s[i]` is still a code point and `.length` is still
-// a code-point count. NOTHING about the emitted semantics changes — only which index each
-// site names. The residual `aTypeIdx` code sites are the i32-list backing and the map's raw
+//   $sBackIdx = (array (mut i32))                    ;; the code points — UNCHANGED unit
+//   $sTypeIdx = (struct (field (ref $sBackIdx))      ;; 0 backing
+//                       (field i32)                  ;; 1 start — element offset into backing
+//                       (field i32))                 ;; 2 len   — element length of THIS view
+//
+// A `string` VALUE is now `(ref $sTypeIdx)` — the header — so every valtype/param/local/cast
+// site keeps naming `sTypeIdx` unchanged, and every site that touched ELEMENTS had to move to
+// `sBackIdx` plus the `start` bias. `.length` is `struct.get $s 2` (NOT `array.len`, which is
+// the backing's physical length and would read a sibling view's characters); `s[i]` is
+// `backing[start + i]` behind the same `i u< len` guard a list index gets, so an out-of-range
+// index still TRAPS instead of reading into the rest of the backing.
+//
+// THE UNIT DID NOT CHANGE. Elements are still i32 CODE POINTS: `s[i]` is a code point,
+// `.length` a code-point count, `'é'.length == 1`. UTF-8 storage is Stage 2c and `$hash` is
+// Stage 3 (it must move atomically with byte-level equality, so no hash field is minted here
+// even though §1.2 measured the 4th field free).
+//
+// WHAT IT BUYS: `s.slice(a, b)` allocates a HEADER ONLY — same backing, adjusted start/len, no
+// element copy. Substring-heavy work (split/trim/tokenize/parse) stops copying bytes.
+// THE COST IT INHERITS: a small view retains its whole backing (Go's `strings.Clone` gotcha).
+// `compact()` is the documented escape and is NOT in this stage — see the PR notes.
+//
+// The residual `aTypeIdx` code sites are the i32-list backing and the map's raw
 // `live`/`index`/`hashes`/mono-`vals` parallel arrays.
 //
 // AND A WRONG INDEX IS INVALID WASM TODAY, NOT A LATENT STAGE-2b BREAK — which is the whole
@@ -822,6 +854,13 @@ export let aTypeIdx = 0
 // invalid wasm. The cost of the shared flag is one unused 3-byte type in a module that uses
 // a list but no string (or the reverse). Splitting the flag is a separate, measurable change.
 export let sTypeIdx = 0
+// The string's BACKING array heap type — `(array (mut i32))` of code points, minted from the
+// same `aUsed` flag and emitted between `aTypeIdx` and the header struct. Structurally
+// identical to `aTypeIdx`, and DELIBERATELY a separate index: iso-recursive identity is
+// (rec group, POSITION), so naming the wrong one is invalid wasm rather than a silent share.
+// Every element read/write/copy under a string names THIS index; nothing that types a string
+// VALUE does.
+export let sBackIdx = 0
 // ── list-type table (the growable `i32[]` wrapper struct) ─────────────────────
 // A growable `i32[]` value lowers to a WasmGC struct `{ backing: (ref $aTypeIdx),
 // len: i32, cap: i32 }` — the `{ptr,len,cap}` triple (collections-design §VL.1,
@@ -939,9 +978,9 @@ export let rlElemNullable: i32[] = []
 // `hashes` cache included: justified for large/long-key maps so resize/compact don't
 // re-hash keys, NOT a compiler-symbol-table-narrow optimization) where
 //   • `keys` is a growable list of STRING refs — the wrapper `{ backing: (ref
-//     $mkArr), len, cap }` over a backing `(array (mut (ref null $aTypeIdx)))`
-//     (a string IS the raw `(array i32)` at `sTypeIdx`, so a keys element is a
-//     nullable ref to that array); its wrapper heap-type index is `mkListIdx`,
+//     $mkArr), len, cap }` over a backing `(array (mut (ref null $sTypeIdx)))`
+//     (a string is the HEADER STRUCT at `sTypeIdx` since Stage 2b, so a keys element is a
+//     nullable ref to that struct); its wrapper heap-type index is `mkListIdx`,
 //     its backing `mkArrIdx`. Holds the INSERTION-ORDERED entry keys.
 //   • `vals` is the EXISTING growable i32 list (`lTypeIdx` over `aTypeIdx`) — the
 //     insertion-ordered entry values; the checker's map value type is always i32.
