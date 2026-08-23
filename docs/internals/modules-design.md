@@ -225,6 +225,36 @@ import { distance as dist } from "./geometry"        // rename (in v1)
   model) — a larger surface than H3 needs; default exports add a second export
   concept (the ES mistake of `default` vs named) for no clear VL win. Both can be
   added later without breaking named imports.
+  - **REVISITED 2026-08-22 (owner: "fine to go forward and revisit"). Still
+    deferred — but the stated blocker is AVOIDABLE, and the shape is now decided so
+    the revisit does not restart.** The "module value" objection assumes Zig, where
+    `@import` returns a value you can bind, pass and store; that does need a module
+    type. **Rust's model is not that** — `use std::fs; fs::read(p)` makes `fs` a
+    PATH SEGMENT resolved at compile time, not a value you can pass anywhere. So:
+    **a VL namespace is a compile-time path prefix, never a value** — erased before
+    emit, no module type, no runtime representation, no emitter change. It is a
+    name-resolution rung over the mechanism named imports already use.
+    `.` stays the spelling (no `::`): **B16's one-binding-per-name-per-scope is what
+    makes it unambiguous** — if `fs` is a namespace binding then no local `fs` can
+    exist, so the resolver tries the namespace table first with nothing to fall back
+    past. Rust needs `::` precisely because it lacks that guarantee.
+  - **THE COST OF DEFERRING IS THE NAMES, NOT THE FEATURE.** The feature is additive
+    and free to delay. The names are not: with no namespace, every export must be
+    self-sufficient in a flat namespace, and **there is no deprecation story**, so
+    each one is close to permanent. That constraint is already visible in the tree —
+    `encodeUtf8`/`decodeUtf8` repeat their module, `readTextFile` is not `readText`,
+    `listDir` is not `list`.
+  - **`std:path` is the forcing collision, and it is one module away.** `std:fmt`
+    already exports `join(self: string[], sep)` and `split(self: string, sep)`; a
+    path module wants both names. Today's only answers are
+    `import { join as pathJoin }` at every call site, or `pathJoin`/`pathSplit`
+    forever. **Build namespaces before `std:path`, not after.**
+  - Costs to weigh at the revisit, both real: named imports declare a file's
+    dependencies at the top while `fs.foo` hides which members are used, which the
+    project-wide unused-export lint (Track D) would have to resolve as member
+    accesses rather than identifiers; and `import * as fs from "std:fs"` is more
+    ceremony than `import { readTextFile }`, which is a poor trade at six std
+    modules and inverts at twenty. Keep named imports the DEFAULT idiom either way.
 - **Aggressive inference still applies** to imported items: an imported generic
   `function map<T>(…)` monomorphizes at the *call site in the importing module*,
   same as a local generic — imports are a *resolution* mechanism, not a typing
