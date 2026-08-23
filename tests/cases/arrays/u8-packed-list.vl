@@ -1,0 +1,97 @@
+// @run
+// @log 3
+// @log 1
+// @log 2
+// @log 255
+// @log 3
+// @log 0
+// @log 44
+// @log 200
+// @log 2
+// @log 10
+// @log 250
+// @log 260
+// @log 0
+// @log 4
+// @log 7
+// @log 7
+// THE PACKED BYTE LIST `u8[]` — one byte per element, not four.
+//
+// `u8` is a STORAGE type, not a value type. Wasm has no 8-bit VALUE type (every 8-bit
+// quantity computes as an i32) but WasmGC does have packed STORAGE types: `i8`/`i16` are
+// legal as array element and struct field types. So `u8[]` is a real `(array (mut i8))`
+// backing under the usual `{backing, len, cap}` wrapper, while every VALUE that crosses
+// its boundary is an ordinary i32:
+//
+//   `b[i]`      → `array.get_u`, which ZERO-EXTENDS the byte, so the read is 0..255
+//   `b[i] = v`  → `array.set`, which TRUNCATES to the low 8 bits
+//   `b.push(v)` → the same truncation, over the packed backing
+//
+// That is the same shape `string` has: `(array i32)` of code points whose `s[i]` is an
+// i32 and with no `char` type above it (DECISIONS A7). A `u8` VALUE would be a LIE — an
+// i32 at runtime with nothing enforcing 0..255 — whereas a `u8` SLOT is backed by one
+// byte and the claim is enforced by the storage. `u8` is therefore legal ONLY as an array
+// element; `error-u8-not-a-value.vl` pins the rejection everywhere else.
+//
+// The out-of-range rule is split deliberately, and both halves are exercised below: an
+// out-of-range non-negative LITERAL is a compile error (`error-u8-literal-range.vl`),
+// because a hand-written 300 silently becoming 44 is a typo the compiler can see; a
+// COMPUTED value truncates, because a range check on every element store is not payable
+// and `5.7 as i32` → `5` is the same documented narrowing.
+
+// ── construction, read, length ───────────────────────────────────────────────
+const b: u8[] = [1, 2, 255]
+print(b.length)
+print(b[0])
+print(b[1])
+print(b[2]) // 255 reads back as 255, not -1 — `array.get_u` zero-extends
+
+// ── the store truncates ──────────────────────────────────────────────────────
+const t: u8[] = [0, 0, 0]
+const three = 3
+t[0] = 256 * three     // computed: 768 & 0xFF == 0
+t[1] = 300 - three * 0 // computed: 300 & 0xFF == 44
+t[2] = 200             // in range, stored exactly
+print(t.length)
+print(t[0])
+print(t[1])
+print(t[2])
+
+// ── the EMPTY literal pins from the annotation, and `push` grows ─────────────
+// `const out: u8[] = []` has to build the PACKED wrapper, not the i32 one: the literal
+// carries no element to classify, so the annotation is the only signal the build has.
+function mk(): u8[] {
+  const out: u8[] = []
+  out.push(10)
+  out.push(250)
+  out
+}
+
+// ── a `u8[]` crosses a function boundary in both directions ──────────────────
+function total(xs: u8[]) {
+  let acc = 0
+  let i = 0
+  while i < xs.length {
+    acc = acc + xs[i]
+    i = i + 1
+  }
+  acc
+}
+
+const xs = mk() // un-annotated, so the BINDING learns the rep from the call
+print(xs.length)
+print(xs[0])
+print(xs[1])
+print(total(xs))
+print(total(b) - 258) // 1 + 2 + 255 == 258
+
+// ── growth past the initial capacity keeps the packed backing ────────────────
+const g: u8[] = []
+let k = 0
+while k < 4 {
+  g.push(7)
+  k = k + 1
+}
+print(g.length)
+print(g[0])
+print(g[3])

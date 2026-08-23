@@ -184,6 +184,9 @@ import {
   aUsed,
   armPreludeBlocks,
   arrNewScratchBase,
+  ba8TypeIdx,
+  ba8Used,
+  bl8TypeIdx,
   callRefSlot,
   capCacheOn,
   capCountTbl,
@@ -304,6 +307,7 @@ import {
   strScratchBase,
   tailCallEnd,
   tailCallIdx,
+  u8PushScratchBase,
   uBoxIdx,
   uBoxNewEnd,
   uDeclared,
@@ -607,6 +611,7 @@ import {
   sFieldIsLitUnionArray,
   sFieldTgtStructIdx,
   sFieldTypeAt,
+  exprU8Array,
   scalarListElemKind,
   scopeBind,
   scopePop,
@@ -758,6 +763,7 @@ function mvScalarValKind(slot: i32): VKind | null {
 
 // The WRAPPER struct heap type for a scalar element kind.
 function scalarListWrap(elemKind: VKind) {
+  if elemKind == "u8list" { return bl8TypeIdx }
   if elemKind == "f64" { return fl64TypeIdx }
   if elemKind == "i64" { return il64TypeIdx }
   if elemKind == "f32" { return fl32TypeIdx }
@@ -766,6 +772,7 @@ function scalarListWrap(elemKind: VKind) {
 
 // The BACKING `(array (mut <elem>))` heap type for a scalar element kind.
 function scalarListBack(elemKind: VKind) {
+  if elemKind == "u8list" { return ba8TypeIdx }
   if elemKind == "f64" { return fa64TypeIdx }
   if elemKind == "i64" { return ia64TypeIdx }
   if elemKind == "f32" { return fa32TypeIdx }
@@ -775,6 +782,9 @@ function scalarListBack(elemKind: VKind) {
 // The `array.get` RESULT blocktype byte for a scalar element kind (i32 `0x7f`, f64 `0x7c`,
 // i64 `0x7e`) — the value-typed-`if` rep a fused `?? d` read joins on.
 function scalarListBlocktype(elemKind: VKind) {
+  // A `u8[]` element READS as an i32 (`array.get_u` widens), so its blocktype is the
+  // plain i32 `0x7f` — the storage width is invisible above the load.
+  if elemKind == "u8list" { return 127 }
   if elemKind == "f64" { return 124 }
   if elemKind == "i64" { return 126 }
   if elemKind == "f32" { return 125 }
@@ -784,6 +794,7 @@ function scalarListBlocktype(elemKind: VKind) {
 // Whether the module-global list types for a scalar element kind were collected (the
 // loud-fail guard every list op shares).
 function scalarListUsed(elemKind: VKind) {
+  if elemKind == "u8list" { return ba8Used }
   if elemKind == "f64" { return fa64Used }
   if elemKind == "i64" { return ia64Used }
   if elemKind == "f32" { return fa32Used }
@@ -794,6 +805,9 @@ function scalarListUsed(elemKind: VKind) {
 // narrower literal/`i32` so a list element / `?? d` default matches the backing element
 // type. The i32 kind passes through unchanged (byte-identical to a bare `emitExpr`).
 function emitScalarValue(body: i32[], exprIx: i32, fnIx: i32, elemKind: VKind) {
+  // A `u8[]` element VALUE is an ordinary i32 — there is no widening to do, and the
+  // TRUNCATION to one byte is `array.set`'s, not an instruction this has to emit. So the
+  // packed list takes the i32 pass-through below, like the plain i32 list.
   if elemKind == "f64" { return emitExprAsF64(body, exprIx, fnIx) }
   if elemKind == "i64" { return emitExprAsI64(body, exprIx, fnIx) }
   if elemKind == "f32" { return emitExprAsF32(body, exprIx, fnIx) }
@@ -5005,6 +5019,40 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
       isI64Lit = false
       isF32Lit = false
     }
+    // A `u8[]` LITERAL (`pendingListKind == 10`) — the PACKED byte list. Checked ahead of
+    // every scalar arm below and returning directly, because the elements are ordinary
+    // i32 expressions: nothing about the literal itself says `u8`, only the threaded
+    // annotation does, so there is no `arrLitIsU8` flag for the ladder below to consult.
+    //
+    // Each element is emitted as a plain i32 and `array.new_fixed` TRUNCATES it into the
+    // packed byte — that is what `array.set`/`array.new*` do for an i8 storage type, and
+    // the checker has already rejected any out-of-range LITERAL (`assignableExpr`'s `u8`
+    // arm), so what truncates here is only ever a computed value.
+    if pendingListKind == 10 {
+      if !ba8Used {
+        return emitFail(
+          "emitProgram: u8 array literal but u8 list type not collected",
+        )
+      }
+      if elems.length > NEW_FIXED_MAX {
+        return emitFail(
+          "emitProgram: u8 array literal is too long for one array.new_fixed",
+        )
+      }
+      let iu8 = 0
+      while iu8 < elems.length {
+        if exprArray(elems[iu8], fnIx) || exprRefArray(elems[iu8], fnIx) {
+          return emitFail("emitProgram: nested arrays are not supported")
+        }
+        if emitExpr(body, elems[iu8], fnIx) < 0 { return -1 }
+        iu8 = iu8 + 1
+      }
+      fbArrayNewFixed(ba8TypeIdx, elems.length) // builds the packed byte backing
+      fbI32Const(elems.length)                  // len
+      fbI32Const(elems.length)                  // cap
+      fbStructNew(bl8TypeIdx)                   // the `u8[]` wrapper
+      return 0
+    }
     if isF32Lit {
       if !fa32Used {
         return emitFail(
@@ -7774,6 +7822,10 @@ function hoistWrapTyOfRow(row: i32) {
   if k == "f64" { return scalarListWrap("f64") }
   if k == "i64" { return scalarListWrap("i64") }
   if k == "f32" { return scalarListWrap("f32") }
+  // The PACKED byte list's frame kind is `"u8"` (`listIdxKindOf`), and its wrapper is
+  // `$bl8TypeIdx` — the i32 fall-through below would name the 4-byte list's wrapper for a
+  // row whose local is typed `(ref null $bl8TypeIdx)`.
+  if k == "u8" { return scalarListWrap("u8list") }
   scalarListWrap("i32")
 }
 
@@ -8052,7 +8104,10 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32) {
     // i32, the same shape for every element kind over that kind's wrapper. (f64/i64 before
     // i32 since their elements are not i32.)
     const lek = scalarListElemKind(m.memObj, fnIx)
-    if lek != null && (lek == "f64" || lek == "i64" || lek == "f32") {
+    if (
+      lek != null &&
+      (lek == "f64" || lek == "i64" || lek == "f32" || lek == "u8list")
+    ) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
       fbStructGet(scalarListWrap(lek), 1) // field 1: len
       return 0
@@ -11873,6 +11928,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       const isF64 = exprF64Array(target.idxArr, fnIx)
       const isI64 = exprI64Array(target.idxArr, fnIx)
       const isF32 = exprF32Array(target.idxArr, fnIx)
+      // The PACKED byte list — an i32-element list with a one-byte backing, so it is the
+      // one rep the `else` i32 fall-through below would silently claim.
+      const isU8 = exprU8Array(target.idxArr, fnIx)
       let lTy = lTypeIdx
       let aTy = aTypeIdx
       // The bounds-check frame kind (+ ref-list table slot) for this target list —
@@ -11944,6 +12002,21 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         lTy = fl32TypeIdx
         aTy = fa32TypeIdx
         idxKind = "f32"
+      } else if isU8 {
+        // A `u8[]` store `b[i] = v`: the same unwrap + `array.set` spine over the PACKED
+        // backing. The value takes the plain i32 path in the value-emit ladder below (no
+        // arm needed — the `else` is `emitExpr`), because a `u8` element VALUE is an i32;
+        // what makes it a byte is `array.set` on an i8-storage array, which TRUNCATES to
+        // the low 8 bits. The checker has already rejected an out-of-range LITERAL, so
+        // the truncation only ever applies to a computed value.
+        if !ba8Used {
+          return emitFail(
+            "emitProgram: u8 indexed assignment but u8 list type not collected",
+          )
+        }
+        lTy = bl8TypeIdx
+        aTy = ba8TypeIdx
+        idxKind = "u8"
       } else {
         if !lUsed {
           return emitFail(
@@ -12370,6 +12443,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       const isF64 = exprF64Array(callee.memObj, fnIx)
       const isI64 = exprI64Array(callee.memObj, fnIx)
       const isF32 = exprF32Array(callee.memObj, fnIx)
+      const isU8 = exprU8Array(callee.memObj, fnIx)
       // A LITERAL-UNION array push (`xs.push("a")` over `xs: K[]`) rides the i32-list spine, but the
       // pushed member literal must lower as its atom id — seed `pendingLitUnion` for the value emit.
       const isLitArr = nodeArrayElemIsLitUnion(callee.memObj)
@@ -12391,6 +12465,7 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         !isF64 &&
         !isI64 &&
         !isF32 &&
+        !isU8 &&
         !exprArray(callee.memObj, fnIx)
       ) {
         return emitFail("emitProgram: .push receiver is not a list")
@@ -12463,6 +12538,20 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
         lTy = fl32TypeIdx
         aTy = fa32TypeIdx
         base = f32PushScratchBase
+      } else if isU8 {
+        // The packed byte list runs the IDENTICAL grow/append sequence over its own
+        // wrapper/backing and its own push quad. The pushed VALUE takes the plain i32
+        // path (no coercion arm below), and `array.set` on the i8-storage backing
+        // TRUNCATES it to the low 8 bits — the documented rule, and the same one the
+        // indexed store follows.
+        if !ba8Used {
+          return emitFail(
+            "emitProgram: u8 .push but u8 list type not collected",
+          )
+        }
+        lTy = bl8TypeIdx
+        aTy = ba8TypeIdx
+        base = u8PushScratchBase
       } else if !lUsed {
         return emitFail("emitProgram: .push but list type not collected")
       }
@@ -16667,7 +16756,8 @@ function emitMemberNode(body: i32[], e: Member, exprIx: i32, fnIx: i32) {
       exprStringArray(e.memObj, fnIx) ||
       exprF64Array(e.memObj, fnIx) ||
       exprI64Array(e.memObj, fnIx) ||
-      exprF32Array(e.memObj, fnIx)
+      exprF32Array(e.memObj, fnIx) ||
+      exprU8Array(e.memObj, fnIx)
     ) {
       return emitArrLen(body, exprIx, fnIx)
     }

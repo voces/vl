@@ -325,6 +325,10 @@ export type PrimName = "i32"
   | "void"
   | "null"
   | "never"
+  // A STORAGE type, not a value type — the one member of this union that may not
+  // appear as the type of a local, param, return, binding, map value, union member or
+  // generic argument. See `TY_U8`.
+  | "u8"
 
 // A primitive.
 export type TyPrim = { primName: PrimName }
@@ -1387,6 +1391,27 @@ let TY_NULL = -1
 // concrete types folds to. The bottom type: assignable to anything, nothing
 // (but itself / err) assignable to it.
 let TY_NEVER = -1
+// `u8` — a STORAGE type. Wasm has no 8-bit VALUE type (every 8-bit quantity computes as
+// an i32) but WasmGC DOES have packed STORAGE types: `i8`/`i16` are legal as array
+// element and struct field types. VL mirrors its substrate exactly, and the distinction
+// is what makes the type honest: a `u8` VALUE would be an i32 with nothing enforcing
+// 0..255 — a claim the runtime does not keep — whereas a `u8` SLOT is backed by one
+// byte, the store truncates, and every read genuinely yields 0..255. The claim is
+// enforced by the storage.
+//
+// So `u8` is legal in exactly ONE position today: the ELEMENT of an array (`u8[]`).
+// It is reachable ONLY through that spelling — `primTyOfName` deliberately does not
+// answer for it, so a bare `u8` annotation is not a type at all and gets the storage-type
+// diagnostic instead of resolving into a value position. `u8[]`'s elements are `u8` for
+// STORAGE and `i32` for VALUES: `b[i]` yields an i32 in 0..255 (`array.get_u` widens),
+// `b[i] = v` truncates to the low 8 bits (`array.set` does), and `push` takes an i32 —
+// exactly as `string` is `(array i32)` whose `s[i]` is an i32 code point with no `char`
+// type above it (DECISIONS A7).
+//
+// CONSEQUENCE, and it is deliberate: `u8[]` is NOT an instantiation of `T[]`, because
+// `T` binds VALUE types and `u8` is not one. `tyVarMayBind` refuses it, so generic code
+// cannot abstract over a `u8[]`.
+let TY_U8 = -1
 
 // ── type-arena constructors ──────────────────────────────────────────────────
 // Each appends a variant to `T.tys` and returns its index. (The same shape as the
@@ -2729,6 +2754,7 @@ export function initChecker() {
   TY_ERR = mkErrTy()
   TY_NULL = mkPrim("null")
   TY_NEVER = mkPrim("never")
+  TY_U8 = mkPrim("u8")
   T.scopes.push(Map())
   constScopes = []
   constScopes.push(Map())
@@ -6461,6 +6487,56 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // recurses through `assignableExpr` per field, which re-applies the brand rule to
   // every field value. A wrongly-branded variable inside a literal still rejects.
   if nomLitAdopts(srcExpr, srcTy, dstTy) { return true }
+  // A `u8` STORAGE SLOT — an array element, the only position `u8` is legal in
+  // (`TY_U8`) — accepts any `i32` VALUE, because that is what the storage is: one byte
+  // written by `array.set`, which TRUNCATES to the low 8 bits, and read by
+  // `array.get_u`, which widens back to an i32 in 0..255. The truncation is documented,
+  // not hidden: it is the same rule `__store_i8__` states for linear memory, where
+  // `255` and `-1` write the same byte.
+  //
+  // THE ONE CASE THAT IS AN ERROR is an out-of-range non-negative integer LITERAL
+  // (`b[i] = 300`, `const b: u8[] = [1, 300]`). A literal is written by hand with a
+  // known value and there is no computation for the truncation to be the point of, so
+  // silently storing 44 is a typo the compiler can see. A COMPUTED value keeps the
+  // documented truncation — a runtime range check on every element store is not
+  // payable in a hot path, and the parallel precedent is `5.7 as i32` → `5`, a
+  // documented narrowing rather than a pretence.
+  //
+  // A NEGATED literal (`-1`) is not a `NumLit` but a unary minus over one, so it takes
+  // the computed path and truncates — deliberately, matching `__store_i8__`'s rule
+  // where `-1` is the ordinary spelling of the byte `0xFF`.
+  //
+  // This lives at the EXPRESSION seam and not in `assignable`, and the distinction is
+  // load-bearing: `assignable(i32, u8)` stays FALSE, so an `i32[]` VARIABLE does not
+  // flow into a `u8[]` slot (they are different reps — a 4-byte backing and a 1-byte
+  // one — and accepting that would be a miscompile, not a coercion). Only an element
+  // EXPRESSION checked against the element type reaches here.
+  if primNameOf(dstTy) == "u8" {
+    if srcExpr >= 0 {
+      const u8e = P.nodes[srcExpr]
+      if u8e is Paren { return assignableExpr(u8e.parInner, srcTy, dstTy) }
+      if u8e is NumLit {
+        if hasDot(u8e.numText) { return false }
+        if u8LexValue(u8e.numText) > 255 {
+          if !inferQuiet {
+            tErr(
+              "the literal " +
+                u8e.numText +
+                " does not fit a `u8` element (0..255) — a computed value truncates to its low 8 bits, but a literal this size is a mistake the compiler can see",
+              srcExpr,
+            )
+          }
+          // Reported HERE and answered TRUE, the same discipline
+          // `objShapeAdapterlessErr` follows: the position is otherwise well-typed, so
+          // a second "cannot assign" from the caller would contradict this message.
+          return true
+        }
+        return true
+      }
+    }
+    const u8s = primNameOf(srcTy)
+    return u8s == "i32" || u8s == "u8" || u8s == "boolean"
+  }
   // A LITERAL re-encodes EXACTLY at f32, so it flows into any destination whose f32
   // position it fits: a bare `f32`, a nullable `f32?` (a map value / niche), or an f32 MEMBER
   // of a union (`f32 | string`). A `.` literal is context-typed and rounds once; an integer
@@ -6689,6 +6765,46 @@ function hasDot(s: string) {
 // A `NumLit` lexeme never carries a sign (unary minus is a separate node), so
 // only the positive bound is checked. Digits fold with a pre-multiply overflow
 // guard (`v > (max - d) / base`) instead of 64-bit arithmetic.
+// The VALUE of an integer LEXEME, saturated at 256 — "256" means "above the `u8` range",
+// whatever the lexeme actually is. Saturating rather than folding is what keeps this free
+// of the bignum path `intLexemeFitsI32` needs: the walk stops the moment the accumulator
+// passes 255, so a 400-digit literal costs three digits. Radix prefixes and `_` separators
+// are the lexer's, so they are honoured here (`0xFF` is 255, `0b1_0000_0000` is over).
+// A lexeme with a digit its radix does not admit saturates too — it is not a `u8` either
+// way, and the lexer has already rejected it as a number.
+function u8LexValue(t: string) {
+  let base = 10
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  let v = 0
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      let d = -1
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      if d < 0 || d >= base { return 256 }
+      v = v * base + d
+      if v > 255 { return 256 }
+    }
+    i = i + 1
+  }
+  v
+}
+
 export function intLexemeFitsI32(t: string) {
   let v = 0
   let i = 0
@@ -7266,6 +7382,7 @@ function declaredTyOfName(name: string) {
 // a `<`-application) provably cannot fire on them — an IDENT lexeme holds no
 // `[`, `{`, `<` or `|`.
 function tsLeafTy(name: string) {
+  if name == "u8" { return storageTyLeafFail() }
   const pv = primTyOfName(name)
   if pv >= 0 { return pv }
   const tv = tpEnvTyOfName(name)
@@ -7384,6 +7501,18 @@ let unkTyDepth = 0
 // banks WHY. Every `unknownTyText` caller then reports the specific reason without gaining
 // an arm. Same lifetime as `unkTyPart` — cleared by the outermost resolver frame.
 let unkTyClash = ""
+
+// A STORAGE type named where a VALUE type is required. Banks the reason on the
+// `unkTyClash` wire — the same channel the union rep-clash uses — so every
+// `unknownTyText` caller reports WHY without gaining an arm, and returns the -1 that
+// poisons the enclosing annotation exactly as an unresolved name does.
+//
+// The message names the rule rather than the symptom, because the rule is the whole
+// design: wasm has i8 as a STORAGE type and not as a value type, and VL mirrors that.
+function storageTyLeafFail() {
+  unkTyClash = "`u8` is a storage type, not a value type — it may be an array element (`u8[]`), but a local, parameter, return, field, map value or generic argument is a value, and values are `i32`"
+  -1
+}
 
 // The `unknown type` diagnostic text for the whole annotation `name`, naming the
 // offending COMPONENT when the bank holds one that is not the whole name. Read
@@ -7768,7 +7897,17 @@ function tsToTyReal(ix: i32) {
   // `xs[i]` read, and a member access on that hole indexes the arena at -1 — a
   // checker CRASH (`generics/type-alias-nested.vl`).
   if k == TS_ARR {
-    const aeTy = tsToTy(tsKids[start])
+    // `u8[]` — the ONE position `u8` is legal in. Matched on the element SPELLING
+    // rather than by resolving it, because `u8` deliberately does not resolve as a
+    // leaf (see `TY_U8`): making the element position the only door is what keeps the
+    // storage type out of every value position without a context flag threaded through
+    // this recursion. `u8[][]` still works — its element spelling is `u8[]`, an
+    // ordinary array of ordinary VALUES, which re-enters this arm one level down.
+    const aeKid = tsKids[start]
+    if tsKind[aeKid] == TS_NAME && tsText[aeKid] == "u8" {
+      return mkArrayTy(TY_U8)
+    }
+    const aeTy = tsToTy(aeKid)
     if aeTy < 0 { return -1 }
     return mkArrayTy(aeTy)
   }
@@ -7949,6 +8088,7 @@ function nameToTyReal(name: string) {
     const lmt = litMemberTy(name)
     if lmt >= 0 { return lmt }
   }
+  if name == "u8" { return storageTyLeafFail() }
   const pv = primTyOfName(name)
   if pv >= 0 { return pv }
   // An array type `T[]`: the parser appends a literal `[]` per array suffix to the
@@ -7960,12 +8100,18 @@ function nameToTyReal(name: string) {
   // is an array name whose element is "", and this arm must still enter for it (master
   // resolved `nameToTy("")`) — collapsing to the one-call form would skip the arm.
   if nameIsArray(name) {
+    // `u8[]` through the RENDERED-NAME path, the twin of the `TS_ARR` arm in
+    // `tsToTyReal` — the same element-spelling door, because a type question in this
+    // compiler has more than one source and an answer only one of them knows is a bug
+    // waiting for the other caller.
+    const aeName = arrElemNameRaw(name)
+    if aeName == "u8" { return mkArrayTy(TY_U8) }
     // An UNRESOLVED element name poisons the whole array annotation (-1,
     // "unknown type 'Bad[]'"). Building `mkArrayTy(-1)` here instead would
     // leak the `-1` ELEMENT HOLE (the empty-`[]` sentinel) as the type of
     // every `xs[i]` read — and a member access on that hole indexes the
     // type arena at -1, a checker CRASH (generics/type-alias-nested.vl).
-    const aeTy = nameToTy(arrElemNameRaw(name))
+    const aeTy = nameToTy(aeName)
     if aeTy < 0 { return -1 }
     return mkArrayTy(aeTy)
   }
@@ -14928,6 +15074,18 @@ export function bindGenWalk(
   if expIx < 0 || atIx < 0 { return 0 }
   const e = T.tys[expIx]
   if e is TyVar {
+    // A TYPE PARAMETER NEVER BINDS `u8`. `T` ranges over VALUE types and `u8` is a
+    // STORAGE type (`TY_U8`), so `f<T>(xs: T[])` applied to a `u8[]` would instantiate a
+    // body whose `xs[i]` is a value of a type that has no value rep — the monomorphizer
+    // then builds the i32-list machinery over a one-byte backing, which is invalid wasm
+    // with `vl check` clean (measured on this commit before the guard: "type mismatch:
+    // expected (ref $type), found (ref $type)" at the call site).
+    //
+    // Declining the BINDING rather than erroring here is what keeps the message good: the
+    // argument then fails the ordinary `assignable` check one level up and the author is
+    // told `u8[]` does not fit `T[]`, at the argument, instead of getting a second
+    // diagnostic about a type parameter they did not write.
+    if primNameOf(atIx) == "u8" { return 0 }
     if bindOf(bNames, bTys, e.tvName) < 0 {
       bNames.push(e.tvName)
       bTys.push(atIx)
@@ -16688,6 +16846,26 @@ function checkCallNode(n: Call, ix: i32) {
       // SUBSTITUTED expected type — a later disagreeing use errors here.
       bindGenWalk(params[i], at, bNames, bTys)
       const expected = substTyDeep(params[i], bNames, bTys)
+      // A `u8[]` ARGUMENT meeting a GENERIC parameter. `bindGenWalk` above declined to
+      // bind `T` to the storage type `u8`, so `expected` still carries the unsolved hole
+      // — and `assignable` answers TRUE for a hole, which is exactly why this needs its
+      // own message: without it `first(b)` over `function first<T>(xs: T[])` checked
+      // clean and the monomorphizer built the i32-list machinery over a one-byte backing
+      // (measured on this commit: "type mismatch: expected (ref $type), found (ref
+      // $type)", `vl check` rc 0).
+      //
+      // The rule stated positively: `u8[]` is NOT an instantiation of `T[]`, because `T`
+      // ranges over VALUE types and `u8` is storage. Generic code cannot abstract over a
+      // `u8[]`, and that is a consequence of the type being honest rather than a hole in
+      // the generics.
+      if !inferQuiet {
+        if tyIsU8ArrayTy(at) && tyReachesHole(expected, 8) {
+          tErr(
+            "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
+            args[i],
+          )
+        }
+      }
       // A HOLE argument meeting a CONCRETE param can't be judged here — a hole is
       // permissively assignable both ways, so the check below passes vacuously.
       // Record the demand; the generic call site that pins the hole re-validates
@@ -23056,6 +23234,22 @@ export function nodeTyIsStructish(ix: i32): boolean {
 // `i64 | S[]`) also ends in `]`, so the name claimed union boxes as well as arrays (B108). It
 // no longer has to — the union rung ahead of it now asks the type (`nodeTyIsUnionish`, #1607)
 // and claims those boxes first, which is what lets this be a strict `TyArray` test.
+// True if arena type `ty` is a `u8[]` — a `TyArray` whose element is the `u8` STORAGE
+// prim. The arena answers this one WITHOUT the caveat its f32 sibling carries: there is no
+// literal whose default type is `u8[]` (a bare `[1, 2]` types `i32[]`), so the recorded
+// type says `u8[]` exactly when an annotation did, and a node that carries it carries it
+// unambiguously. That is what lets the emitter's `u8[]` receiver classifier be four lines
+// instead of the fifty `exprF32Array` needs.
+export function tyIsU8ArrayTy(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return false }
+    return primNameOf(t.aElem) == "u8"
+  }
+  false
+}
+
 export function nodeTyIsArrayish(ix: i32): boolean {
   let cur = nodeTyIxOf(ix)
   let peels = 0
@@ -25755,6 +25949,15 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
           arrT0.aElem = rt
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
         }
+        // A `u8[]` STORE checks against the ELEMENT type, which the target's own recorded
+        // type cannot supply: `checkIndexNode` deliberately types a `u8[]` READ as `i32`
+        // (the widened value `array.get_u` produces), so the assignment's `lt` above is
+        // `i32` and the out-of-range literal rule would never see the slot it is writing
+        // into. Re-checking the RHS against `u8` here is what makes `b[i] = 300` an error
+        // in the same way `const b: u8[] = [300]` is — one rule, both spellings.
+        if primNameOf(arrT0.aElem) == "u8" {
+          assignableExpr(n.binRight, rt, arrT0.aElem)
+        }
       }
       // An index-set into a bare `Map()` (`m[k] = v`) pins its key and value holes the
       // SAME way `m.set(k, v)` pins them one arm over — the two WRITE spellings of one
@@ -27756,7 +27959,15 @@ function checkIndexNode(n: Index, ix: i32) {
   if !assignable(idxTy, TY_I32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), ix)
   }
-  if at is TyArray { return at.aElem }
+  if at is TyArray {
+    // A `u8[]` READ yields an `i32`, never a `u8` — the storage is one byte and the
+    // VALUE is the widened i32 `array.get_u` produces (0..255). This is the same shape
+    // the string arm below has: `string` is `(array i32)` and `s[i]` is an i32 code
+    // point with no `char` type above it (DECISIONS A7). Returning `at.aElem` here
+    // would put a `u8` into a value position, which is exactly what `u8` may not be.
+    if primNameOf(at.aElem) == "u8" { return TY_I32 }
+    return at.aElem
+  }
   if at is TyErr { return TY_ERR }
   // Indexing a string yields the i32 code point at that position.
   if at is TyPrim {
