@@ -99,6 +99,7 @@ import {
   rlElemNullable,
   rlWrapIdx,
   sHeapIdx,
+  sTypeIdx,
   strPushScratchBase,
   strScratchBase,
   u8PushScratchBase,
@@ -863,7 +864,7 @@ export function mvValsBackOf(slot: i32) {
 }
 export function mvValElemHeapOf(slot: i32) {
   if slot < 0 { return aTypeIdx }
-  if mvValKind[slot] == 3 { return aTypeIdx }
+  if mvValKind[slot] == 3 { return sTypeIdx }
   if mvValKind[slot] == 11 {
     return fa64TypeIdx // f64-valued map: f64 array backing
   }
@@ -1019,7 +1020,7 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   arrNewScratchBase = fbScratchCur
   if fnUsesArrNew { fbReserve(1) }
   // Call-LHS `??` stash, appended after every existing frame so layouts without it are
-  // untouched: a `(ref $uBoxIdx)` box slot, then a `(ref null $aTypeIdx)` string|null
+  // untouched: a `(ref $uBoxIdx)` box slot, then a `(ref null $sTypeIdx)` string|null
   // slot, then an i32 boolean|null slot — one per rep the call result may take.
   coalesceCallSlot = fbScratchCur
   if fnUsesCoalesceCall { fbReserve(1) }
@@ -1211,14 +1212,14 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(rlWrapIdx[rfs])
     rfk = rfk + 1
   }
-  // String-list push quad: pushStrVal (ref $aTypeIdx), pushStrCap i32,
+  // String-list push quad: pushStrVal (ref $sTypeIdx), pushStrCap i32,
   // pushStrBacking (ref $mkArrIdx), pushStrRecvRef (ref $mkListIdx).
   if fnUsesStrPush {
     // The VALUE slot is `(ref null $aTypeIdx)` in a function that pushes onto a
     // `(string | null)[]` — the niche shares this backing (whose element slot is already
     // nullable), so only the staging local differs. The ref-push frame above makes the same
     // distinction per element slot; here one flag covers the one string backing.
-    if fnUsesNulStrPush { fbRefNullRun(aTypeIdx) } else { fbRefRun(aTypeIdx) }
+    if fnUsesNulStrPush { fbRefNullRun(sTypeIdx) } else { fbRefRun(sTypeIdx) }
     fbI32Run()
     fbRefRun(mkArrIdx)
     fbRefRun(mkListIdx)
@@ -1260,12 +1261,12 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(ba8TypeIdx)
     fbRefRun(bl8TypeIdx)
   }
-  // String-op frame: strScrA/B/Out (3 non-null `(ref $aTypeIdx)` string refs),
+  // String-op frame: strScrA/B/Out (3 non-null `(ref $sTypeIdx)` string refs),
   // then strScrI0..strScrI3 (4 i32 temporaries).
   if fnUsesStrOp {
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
+    fbRefRun(sTypeIdx)
+    fbRefRun(sTypeIdx)
+    fbRefRun(sTypeIdx)
     fbI32Run()
     fbI32Run()
     fbI32Run()
@@ -1279,8 +1280,8 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   //   14 valSet i32 (the mono SET value stash — reserved across the probe).
   if fnUsesMap {
     fbRefRun(mStructIdx)
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
+    fbRefRun(sTypeIdx)
+    fbRefRun(sTypeIdx)
     fbI32Run()
     fbI32Run()
     fbI32Run()
@@ -1425,10 +1426,10 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // Array-intrinsic frame (1 i32 slot — the staged allocation length).
   if fnUsesArrNew { fbI32Run() }
   // Call-LHS `??` stash (3 slots, appended LAST): the `(ref $uBoxIdx)` box, the
-  // `(ref null $aTypeIdx)` string|null niche, then the i32 boolean|null niche.
+  // `(ref null $sTypeIdx)` string|null niche, then the i32 boolean|null niche.
   if fnUsesCoalesceCall {
     fbRefRun(uBoxIdx)
-    fbRefNullRun(aTypeIdx)
+    fbRefNullRun(sTypeIdx)
     fbI32Run()
   }
   // Variant-rebox stash: one `(ref null struct)` slot (holds any plain-struct source ref;
@@ -1448,8 +1449,9 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // matching `fbBeginFunc`'s base): the shared i32 index stash, then one
   // typed slot per entry (ref slots NULLABLE so they are defaultable) —
   // a WRAPPER ref for a bounds-check slot (`liBack` 0), the raw BACKING array
-  // ref for a chunked-literal destination (`liBack` 1; a string literal's
-  // "i32" backing is the code-point array itself, `aTypeIdx`), the element
+  // ref for a chunked LIST-literal destination (`liBack` 1), the raw `$sTypeIdx`
+  // array of a chunked STRING literal (`liBack` 5 — its kind is "i32" too, so the
+  // kind alone cannot pick the slot type), the element
   // VALUE for an indexed-store stash (`liBack` 2 — the scalar valtype, the
   // nullable string ref, or the slot's nullable element ref), the HOISTED
   // backing ref of a cached list header (`liBack` 3 — the same backing typing
@@ -1460,7 +1462,14 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     let lix = 0
     while lix < liKinds.length {
       const lk = liKinds[lix]
-      if liBack[lix] == 1 || liBack[lix] == 3 {
+      if liBack[lix] == 5 {
+        // A chunked long STRING literal's destination backing (`arrLitChunkStart`'s
+        // `strBack`) — the raw `(ref null $sTypeIdx)` string itself, NOT a list backing. Its
+        // `liKinds` entry is "i32" because the elements are i32 code points, so the kind
+        // match below would type it `$aTypeIdx`; the string's own heap type needs its own
+        // `liBack` code.
+        fbRefNullRun(sTypeIdx)
+      } else if liBack[lix] == 1 || liBack[lix] == 3 {
         match lk {
           "f64" => fbRefNullRun(fa64TypeIdx)
           "i64" => fbRefNullRun(ia64TypeIdx)
@@ -1478,7 +1487,7 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
           "i64" => fbI64Run()
           "f32" => fbF32Run()
           "ref" => fbRefNullRun(rlElemHeap[liSlots[lix]])
-          "str" => fbRefNullRun(aTypeIdx)
+          "str" => fbRefNullRun(sTypeIdx)
           "i32" => fbI32Run()
           "u8" => fbI32Run()
         }
@@ -1538,7 +1547,14 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
   } else if kind == "list" || kind == "nullist" {
     wSLEB(lTypeIdx)
   } else if kind == "str" {
-    wSLEB(aTypeIdx)
+    wSLEB(sTypeIdx)
+  } else if kind == "nulstr" {
+    // `string | null` — the SAME string heap type, the nullability in the slot. Spelled as
+    // its own arm rather than riding the `else`: the fallthrough used to BE the string case
+    // (the only VKind members that reach `else` are the scalars, which never get here), and
+    // a fallthrough that answers for one rep is the shape this emitter keeps re-finding as a
+    // missing arm. `fbValtype` / `fbValtypeNullable` both spell `nulstr` out; so does this.
+    wSLEB(sTypeIdx)
   } else if kind == "union" {
     wSLEB(uBoxIdx)
   } else if kind == "reflist" || kind == "nulreflist" {
@@ -1674,11 +1690,11 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     }
     "str" => {
       wU8(RT_REF_NULL)
-      wSLEB(aTypeIdx)
+      wSLEB(sTypeIdx)
     }
     "nulstr" => {
       wU8(RT_REF_NULL) // `string | null`: the nullable raw-array ref
-      wSLEB(aTypeIdx)
+      wSLEB(sTypeIdx)
     }
     "union" => {
       wU8(RT_REF_NULL)
@@ -1757,7 +1773,7 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
 //   0    → i32 (`0x7f`)
 //   1    → struct ref `(ref $sHeapIdx[structIdx])` — a standalone struct
 //   2    → i32-list ref `(ref $lTypeIdx)` (the growable `i32[]` wrapper struct)
-//   3    → string ref `(ref $aTypeIdx)` — the raw `(array (mut i32))` of code points
+//   3    → string ref `(ref $sTypeIdx)` — the raw `(array (mut i32))` of code points
 //   4    → union-box ref `(ref $uBoxIdx)` — the `{tag, value}` box
 //   5    → ref-list ref `(ref $rlWrapIdx[structIdx])` — the ref-element list wrapper
 //          for THIS slot. For kind 5, `structIdx` is the ref-list TABLE SLOT (NOT a
@@ -1823,7 +1839,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "str" => {
       wU8(RT_REF)
-      wSLEB(aTypeIdx)
+      wSLEB(sTypeIdx)
     }
     "union" => {
       wU8(RT_REF)
@@ -1875,7 +1891,7 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "nulstr" => {
       wU8(RT_REF_NULL)
-      wSLEB(aTypeIdx)
+      wSLEB(sTypeIdx)
     }
     "nulreflist" => {
       wU8(RT_REF_NULL)

@@ -256,6 +256,7 @@ import {
   sRowDecl,
   sTwin,
   sTyIx,
+  sTypeIdx,
   scopeFrames,
   scopeNames,
   scopeSlots,
@@ -572,7 +573,7 @@ function checkParams(fnIx: i32) {
           } else if tyIsNulBool(p.parType) {
             // accepted — a `boolean | null` NICHE param (the i32 sentinel 0/1/2)
           } else if retNulStringFlag(p.parType) == 1 {
-            // accepted — a `string | null` param (`(ref null $aTypeIdx)`, kind 16)
+            // accepted — a `string | null` param (`(ref null $sTypeIdx)`, kind 16)
           } else if retMapFlag(p.parType) == 1 {
             // accepted — a string-keyed map param (kind 6, `(ref $mapStruct)`). The mv
             // SHAPE crosses the boundary (`paramStructIdxOf` → `mapAnnShape`): -1 for a
@@ -1645,7 +1646,7 @@ function emitStartFnCode(out: i32[]) {
               pendingStructIdx = globalCellStructIdx(globalStmts[gi])
             }
             // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
-            // a `string|null` global lowers it as `ref.null $aTypeIdx` (kind 16).
+            // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
             pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
             pendingNulString = letIsNulString(globalStmts[gi], -1)
             if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
@@ -1899,7 +1900,7 @@ function fbStrHashStep(k: i32) {
     fbI32Const(k)
     fbI32Bin(106) // i32.add (i + k)
   }
-  fbArrayGet(aTypeIdx)
+  fbArrayGet(sTypeIdx)
   fbI32Bin(115) // 0x73 i32.xor
   fbI32Const(16777619)
   fbI32Bin(108) // 0x6c i32.mul
@@ -2096,14 +2097,14 @@ function emitStrEqFnCode(out: i32[]) {
       fbI32Const(k)
       fbI32Bin(106) // i32.add
     }
-    fbArrayGet(aTypeIdx)
+    fbArrayGet(sTypeIdx)
     fbLocalGet(1) // b
     fbLocalGet(3) // i
     if k > 0 {
       fbI32Const(k)
       fbI32Bin(106) // i32.add
     }
-    fbArrayGet(aTypeIdx)
+    fbArrayGet(sTypeIdx)
     fbI32Bin(115) // 0x73 i32.xor — 0 exactly when the pair matches
     if k > 0 {
       fbI32Bin(114) // 0x72 i32.or — fold into the accumulator
@@ -2134,10 +2135,10 @@ function emitStrEqFnCode(out: i32[]) {
   // if a[i] != b[i] { 0 ; br out }
   fbLocalGet(0)
   fbLocalGet(3)
-  fbArrayGet(aTypeIdx)
+  fbArrayGet(sTypeIdx)
   fbLocalGet(1)
   fbLocalGet(3)
-  fbArrayGet(aTypeIdx)
+  fbArrayGet(sTypeIdx)
   fbI32Bin(71) // i32.ne
   fbIf(64)
   fbI32Const(0)
@@ -2170,7 +2171,7 @@ function emitStrConcatFnCode(out: i32[]) {
   wU8(127) // 0x7f i32 (lenA, lenB)
   wULEB(1) // count 1
   wU8(100) // 0x64 (ref $aTypeIdx) — out
-  wSLEB(aTypeIdx)
+  wSLEB(sTypeIdx)
   // lenA = len(a) ; lenB = len(b)
   fbLocalGet(0)
   fbArrayLen()
@@ -2182,7 +2183,7 @@ function emitStrConcatFnCode(out: i32[]) {
   fbLocalGet(2)
   fbLocalGet(3)
   fbI32Bin(106) // i32.add
-  fbArrayNewDefault(aTypeIdx)
+  fbArrayNewDefault(sTypeIdx)
   fbLocalSet(4)
   // array.copy out 0 a 0 lenA
   fbLocalGet(4)
@@ -2190,14 +2191,14 @@ function emitStrConcatFnCode(out: i32[]) {
   fbLocalGet(0)
   fbI32Const(0)
   fbLocalGet(2)
-  fbArrayCopy(aTypeIdx, aTypeIdx)
+  fbArrayCopy(sTypeIdx, sTypeIdx)
   // array.copy out lenA b 0 lenB
   fbLocalGet(4)
   fbLocalGet(2)
   fbLocalGet(1)
   fbI32Const(0)
   fbLocalGet(3)
-  fbArrayCopy(aTypeIdx, aTypeIdx)
+  fbArrayCopy(sTypeIdx, sTypeIdx)
   fbLocalGet(4)
   fbEnd() // end (function) — leaves the fresh string ref
   wTarget(prev)
@@ -3512,8 +3513,14 @@ export function emitProgram(rootIx: i32) {
 
 // Emit one shared-runtime-helper FUNCTYPE (`0x60 func`, params, results) onto the
 // current buffer. `params`/`res` are valtype descriptor strings, one char per slot:
-// 'i' = i32 (`0x7f`), 'a' = a non-null `(ref $aTypeIdx)` string/i32-array ref,
+// 'i' = i32 (`0x7f`), 'a' = a non-null `(ref $aTypeIdx)` i32-array ref,
+// 's' = a non-null `(ref $sTypeIdx)` STRING ref,
 // 'm' = a non-null `(ref $mkArrIdx)` string-list backing ref.
+//
+// 's' EXISTS BECAUSE ONE DESCRIPTOR STRING HOLDS BOTH REPS: `__map_probe__`'s "iaaams" has
+// three i32-array slots (`index`/`hashes`/`live`) and one STRING slot (the probed key) —
+// indistinguishable while `string` and `i32[]`'s backing shared a heap index, and a wrong
+// functype on any of the six helpers is a call-site type mismatch at every use.
 function helpFuncType(params: string, res: string) {
   wU8(96) // 0x60 func
   wULEB(params.length)
@@ -3538,7 +3545,9 @@ function helpValtype(c: i32) {
     return 0
   }
   wU8(100) // 0x64 (ref ht) — non-null
-  if c == 'm' { wSLEB(mkArrIdx) } else { wSLEB(aTypeIdx) }
+  if c == 'm' { wSLEB(mkArrIdx) }
+  else if c == 's' { wSLEB(sTypeIdx) }
+  else { wSLEB(aTypeIdx) }
   0
 }
 
@@ -3776,7 +3785,7 @@ function emitTypeSection(
     // One `0x5f` struct per declared type (declaration order = heap-type index),
     // each a struct of its fields in declaration order. A field is `0x7f` i32
     // (`sFieldTypes == 0`) or, for a string field (`== 3`), a non-null `(ref
-    // $aTypeIdx)` (`0x64 <aTypeIdx>` — the raw `(array i32)` string rep); both mutable.
+    // $sTypeIdx)` (`0x64 <sTypeIdx>` — the raw `(array i32)` string rep); both mutable.
     let si = 0
     while si < sNames.length {
       // twin skip
@@ -3875,6 +3884,14 @@ function emitTypeSection(
     }
   }
   if aUsed {
+    wU8(94)  // 0x5e array ($aTypeIdx — the i32-list / map backing)
+    wU8(127) // 0x7f i32 storagetype
+    wU8(1)   // mutable
+    // `string`'s OWN array heap type ($sTypeIdx), minted from the same `aUsed` flag and
+    // emitted immediately after it (`mAssignTypeIndices` allocates the pair in this order).
+    // STRUCTURALLY IDENTICAL to the one above at Stage 2a — a string is still an
+    // `(array (mut i32))` of code points; only the INDEX is now the string's own, which is
+    // what the UTF-8 storage change needs in order to be a one-line edit here.
     wU8(94)  // 0x5e array
     wU8(127) // 0x7f i32 storagetype
     wU8(1)   // mutable
@@ -3919,13 +3936,13 @@ function emitTypeSection(
   if slUsed || mUsed {
     // The STRING-REF list types, shared by the map's keys list and any `string[]`
     // field. (1) the backing array `(array (mut (ref null $aTypeIdx)))` — element is a
-    // NULLABLE string ref (`0x63 <aTypeIdx>`) so `array.new_default` defaults spare
+    // NULLABLE string ref (`0x63 <sTypeIdx>`) so `array.new_default` defaults spare
     // slots to null; an element read recovers the non-null string. (2) the list wrapper
     // `{ backing: (ref $mkArrIdx), len, cap }` — the same `{backing,len,cap}` triple as
     // the i32 list, over the string backing.
     wU8(94)  // 0x5e array (keys/string backing)
     wU8(99)  // 0x63 (ref null ht) — nullable string ref
-    wSLEB(aTypeIdx)
+    wSLEB(sTypeIdx)
     wU8(1)   // mutable
     wU8(95)  // 0x5f struct (string-list wrapper)
     wU8(3)   // 3 fields
@@ -4335,13 +4352,14 @@ function emitTypeSection(
   }
   // The shared runtime helpers, in helper-index order.
   if gHelpStrHash >= 0 {
-    helpFuncType("a", "i")  // __str_hash__: (str) -> i32
-    helpFuncType("aa", "i") // __str_eq__: (str, str) -> i32
-    helpFuncType("aa", "a") // __str_concat__: (str, str) -> (ref str)
+    helpFuncType("s", "i")  // __str_hash__: (str) -> i32
+    helpFuncType("ss", "i") // __str_eq__: (str, str) -> i32
+    helpFuncType("ss", "s") // __str_concat__: (str, str) -> (ref str)
   }
   if gHelpMapProbe >= 0 {
-    // __map_probe__: (keyHash, index, hashes, live, keysBacking, key) -> slot
-    helpFuncType("iaaama", "i")
+    // __map_probe__: (keyHash, index, hashes, live, keysBacking, key) -> slot — three 'a'
+    // i32 arrays, the 'm' string-list backing, then the 's' STRING key.
+    helpFuncType("iaaams", "i")
     helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
   }
   if gHelpMapProbeI32 >= 0 {
@@ -4564,8 +4582,8 @@ function emitGlobalSection() {
     // `array.new_fixed` — every pooled literal fits the cap by construction).
     let pli = 0
     while pli < np {
-      wU8(100) // 0x64 (ref $aTypeIdx) — non-null string ref
-      wSLEB(aTypeIdx)
+      wU8(100) // 0x64 (ref $sTypeIdx) — non-null string ref
+      wSLEB(sTypeIdx)
       wU8(0)   // immutable
       const pcps = decodeStr(strToCps(gStrPoolTexts[pli]))
       let pci = 0
@@ -4573,7 +4591,7 @@ function emitGlobalSection() {
         fbI32Const(pcps[pci])
         pci = pci + 1
       }
-      fbArrayNewFixed(aTypeIdx, pcps.length)
+      fbArrayNewFixed(sTypeIdx, pcps.length)
       fbEnd() // 0x0b end of init expr
       pli = pli + 1
     }

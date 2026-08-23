@@ -767,6 +767,17 @@ Go-lean validity lands here.
 > rep migrations doubles exposure to the one defect class this emitter demonstrably
 > has. Go to the final shape once.
 
+> **The heap-type split (2a) is DONE and is not one of the two.** `string` had no heap
+> type of its own: it shared `aTypeIdx` with the i32 list's backing, so "change the
+> storage" had no single place to happen. It now has `sTypeIdx` — still
+> `(array (mut i32))` of code points, so **no value, no unit and no lowering changed**,
+> and the corpus buckets are file-for-file identical. This is index bookkeeping, not a rep
+> migration: it does not build the header, does not touch a unit, and never produces the
+> half-migrated state §1.7 of `docs/internals/string-rep-measurements.md` prices as worse
+> than either endpoint. What it buys is that step 2 edits one type DEFINITION instead of
+> hunting 168 shared call sites while also changing their meaning. The eight sites that
+> had to stop sharing are enumerated and closed in §2.2 of that file.
+
 Gates for step 2 are the full ladder, non-negotiable: `deno task test`, the native
 align suites, `scripts/native-fixpoint.sh` (byte-exact), `scripts/lint-self.sh`, and
 **`scripts/rep-fuzz-check.sh`** — mandatory, since this is a representation change and
