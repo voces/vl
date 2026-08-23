@@ -776,6 +776,29 @@ Note the fixpoint is a genuinely load-bearing instrument here: the compiler's **
 non-ASCII string literals** are all diagnostic messages, so a broken multi-byte
 encode/decode surfaces as a fixpoint break rather than passing silently.
 
+> **Read `docs/internals/str-byte-semantics.md` before starting Step 2.** It is the
+> per-function audit of what this step does to the 15 `std:str` exports: 7 unchanged,
+> **0** that get more correct, 5 that were BROKEN as shipped, and 3 that need an owner
+> ruling. The broken five are already repaired (every builder in `std:str` filled an
+> `i32[]` by `buf.push(s[i])` and drained it through `fromCodePoints`, whose contract
+> is code points — so the day `s[i]` becomes a byte, `join`/`replaceAll`/`repeat`/
+> `padStart`/`padEnd`/`toUpperAscii`/`toLowerAscii` all start double-encoding, with no
+> type error, because a byte and a code point are both `i32`. Measured on today's
+> build: `fromCodePoints([195, 169])` is `"Ã©"`.) **`std/utf8.vl` has the same defect
+> class and is NOT yet audited.**
+>
+> The audit also verified this document's own load-bearing claim rather than
+> restating it: *a substring match IS a byte match* holds — 73,800 exhaustive
+> haystack/needle pairs over a byte-colliding alphabet plus 200,000 randomized
+> trials, in `findFrom`/`lastIndexOf`/`startsWith`/`endsWith`/`split`/`replaceAll`/
+> `trim`, **zero disagreements** — with one precondition worth carrying: it needs the
+> NEEDLE to be valid UTF-8, and a needle sliced at a non-character boundary can
+> legitimately match mid-character.
+>
+> The new fixture `tests/cases/std/str-multibyte.vl` is the instrument for this step.
+> Every other `str-*.vl` file is pure ASCII and **cannot tell the two representations
+> apart**; that one can.
+
 **Step 3 — `__map_hash__` and `__string_eq__` to byte level, atomically** (§Equality),
 together with the header's cached hash.
 
@@ -821,9 +844,14 @@ of weight:
 2. **Promotion is one-way, and the representation is about to move.** Demoting a core
    name breaks code, so intrinsics would freeze 15 semantics immediately before Step 2
    changes what they mean. In VL those semantics cost a library edit; in the emitter
-   they cost a compiler release. (`split`/`indexOf`/`replace` written byte-wise get
-   *more* correct for free under UTF-8 — a substring match **is** a byte match. But
-   `padStart(s, 3)` must decide bytes-or-characters, and that ruling wants to be cheap.)
+   they cost a compiler release. (`split`/`indexOf`/`replace` written byte-wise give the
+   IDENTICAL answers for free under UTF-8 — a substring match **is** a byte match,
+   now verified rather than asserted; see `../internals/str-byte-semantics.md`
+   §Property. "*More* correct" was the wrong word: the audit found **nothing** in
+   `std:str` that code-point semantics was getting wrong, so what the search family
+   gains is speed and view-slices, not correctness. But `padStart(s, 3)` must decide
+   bytes-or-characters, and that ruling wants to be cheap — it is filed as §R1 of the
+   audit and indexed in `../internals/open-rulings.md`.)
 3. **The optimization argument for intrinsics is not real here.** It was tabled as
    "core methods can be constant-folded and fused." **VL does neither, for any of the
    six existing core methods.** `print("abcdef".slice(1,3))` is **932 bytes** against
