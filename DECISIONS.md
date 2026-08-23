@@ -374,6 +374,23 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   can sit at the loop and tolerate an intervening counter declaration.
   Field-target lists, multi-loop builds, and `for…in` are not yet covered. (B6b)
 - **String-accumulation fusion: buffer-and-materialize, not per-`+` concat.**
+  > **REGRESSED — THIS DOES NOT SHIP. Read this note before relying on the entry
+  > below.** B7b was implemented in `compiler/toWasm.ts` (#168) and **deleted with the
+  > TS core (#466); it was never ported to the self-hosted `compiler/*.vl`.** There is
+  > no recognizer in the VL compiler — `grep -rn "accumulat" compiler/*.vl` finds only
+  > unrelated comments — and `s = s + piece` in a loop measures **quadratic** today
+  > (0.31 s / 1.44 s / 9.47 s at 20k / 40k / 80k appends). The `tests/cases/strings/
+  > accum-*.vl` fixtures still pass because they assert only the RESULT, which
+  > per-append concat also produces — **they are blind to the cost class they were
+  > written to pin.** Until it is re-ported, build strings by filling an `i32[]` and
+  > calling `fromCodePoints` once (`compiler/format.vl`); that is 28 ms vs 12,475 ms on
+  > a 40,000-piece join. Tracked as the live half of `strings-design.md` OQ-2.
+  >
+  > *A DECISIONS entry records what was decided and shipped; nothing sweeps it when a
+  > later refactor deletes the implementation. A shipped-then-deleted feature reads as
+  > still-shipped forever. Re-derive before citing one as precedent.*
+  >
+  > The original entry follows, describing the TS implementation.
   `let s = ""` built purely by `s = s + e` appends in a loop (any number, incl.
   conditional and multi-piece `+`-chains) lowers to a growable char buffer with
   amortized appends, materialized to one new immutable string after the loop —

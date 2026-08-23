@@ -38,17 +38,28 @@ demand for that operation is **zero**. What real string code does is *scan*, or 
 at an *end* — and the sequential 63% is a C-brain spelling of an iteration, reached
 for because the language offered an index and not a cursor.
 
-**2. The blast radius of the change is zero.**
+**2. The blast radius is small and CONCENTRATED — but it is not zero.**
+
+> **CORRECTION.** The first version of this section claimed the blast radius was
+> **zero**, on a census that stripped comments with a naive `sed` and so missed real
+> literals. Re-derived with a quote-aware scanner, the corpus holds **8 non-ASCII
+> literals across 3 files**. The claim was wrong; the conclusion it supported still
+> holds, for the reason below.
 
 | | |
 |---|---|
-| Corpus: 2,075 `.vl` files | **0** non-ASCII string literals outside comments |
+| Corpus: 2,075 `.vl` files | **8** non-ASCII literals in **3** files — `chars/literals.vl`, `std/utf8-roundtrip.vl`, `std/utf8-lossy.vl` |
 | Compiler: 27 `.vl` files | **97** non-ASCII string literals — *all* diagnostic messages (em-dashes, middots), concatenated and printed, never indexed |
 
-For ASCII, byte index **is** code-point index and byte length **is** code-point
-length. So every one of the 111 indexed sites in the compiler, and every corpus
-fixture, keeps working **unchanged**. (`"héllo→".length` is `6` today and becomes
-`9`; nothing in the tree observes it.)
+**All three corpus files exist specifically to test non-ASCII handling.** So their
+expectations *should* move when the index unit changes — that is the fixture doing its
+job, not collateral damage. What matters for the reversal is the negative: **no fixture
+that is not about Unicode observes the change at all**, because for ASCII the byte index
+**is** the code-point index and the byte length **is** the code-point length. All 111
+indexed sites in the compiler keep working unchanged.
+
+(`"héllo→".length` is `6` today and becomes `9`. Three fixtures observe that; nothing
+else does.)
 
 **3. Code-point indexing was paying for itself with the whole complexity budget.**
 The ASCII flag existed *only* to make code-point `s[i]` O(1). Removing the promise
@@ -634,11 +645,36 @@ Immutability is what makes the cached hash (§Equality) a pure win, the byte vie
 (§Bytes) safe to alias, and slice views (§Header) free of invalidation. In-place
 update stays an opportunistic compiler optimization, never a surface guarantee.
 
-**B7b string-accumulation fusion already ships on this basis** — a fresh `let s = ""`
-built purely by `s = s + piece` in a loop lowers to a growable buffer materialized
-once, turning the O(n²) build loop into O(n) with no surface change
-(`tests/cases/strings/accum-*`). That optimization is unaffected by the storage swap
-and its machinery is directly relevant to §Methods.
+> **CORRECTION — B7b DOES NOT SHIP, AND THE PERF TRAP IS OPEN.** An earlier version of
+> this section said "B7b string-accumulation fusion already ships on this basis," and
+> cited it as precedent that the compiler can pattern-lower a whole loop shape.
+> **`DECISIONS.md` records B7b as shipped, but it shipped in `compiler/toWasm.ts` and
+> died with the TS core — it was never ported to `compiler/*.vl`.** There is no
+> recognizer: `grep -rn "accumulat" compiler/*.vl` finds only unrelated comments.
+>
+> Measured on the native compiler, `s = s + piece` in a loop is **quadratic**:
+>
+> | appends | time |
+> |---|---|
+> | 20,000 | 0.31 s |
+> | 40,000 | 1.44 s |
+> | 80,000 | 9.47 s |
+>
+> **And the fixtures named for it are blind to it.** `tests/cases/strings/accum-*.vl`
+> assert only the RESULT — `accum-basic.vl` pins `@log 5` and `@log xxxxx` over a
+> five-iteration loop — which per-append concat produces just as correctly. They pass,
+> and always would have, on a compiler with no fusion at all. A fixture that pins a
+> value cannot pin a cost class.
+>
+> Consequences: **(a)** the O(n²) string-build trap is OPEN, not closed, and is now the
+> live half of OQ-2; **(b)** the argument that pattern-lowering an indexed loop has
+> in-repo precedent is **withdrawn** — the precedent does not exist; **(c)** every
+> builder in `std:str` therefore fills an `i32[]` and calls `fromCodePoints` once (the
+> `compiler/format.vl` idiom), measured at **28 ms vs 12,475 ms** for a 40,000-piece
+> `join`.
+
+In-place update stays an opportunistic compiler optimization, never a surface
+guarantee — but today no such optimization exists for strings.
 
 ---
 
