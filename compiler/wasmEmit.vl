@@ -3289,6 +3289,17 @@ function listWrapHeapOfKind(k: i32) {
   if k == 9 { return mkListIdx }
   if k == 10 { return il64TypeIdx }
   if k == 12 { return fl32TypeIdx }
+  // The PACKED byte list rides the box's anyref as its own `{backing, len, cap}` wrapper,
+  // exactly like the five above — the only thing that differs is that its backing's element
+  // is the packed `i8` STORAGE type. `ba8Used` is the guard, not a convenience: it is what
+  // `uAtomBandTop` lifted the slot bands off, so a kind-13 tag without it would collide with
+  // `refArrSlotTag(0)`, and `bl8TypeIdx` would name a heap type the module never interned.
+  // Declining here is LOUD at both consumers — `atomIsRefKind` answers false and the scalar
+  // value-box lookup then fails with "union atom has no value box".
+  if k == 13 {
+    if !ba8Used { return -1 }
+    return bl8TypeIdx
+  }
   -1
 }
 
@@ -3856,7 +3867,7 @@ export function emitUnionCoerce(
   // the six `atom == …` compares picking the widened emit, the two list re-encodes — is a
   // projection of that one code. FAITHFUL because the map IS `valueAtomKind`'s own
   // first-match ladder, a bijection over exactly these eleven lexemes: nothing below its
-  // literal compares can produce 0–5, and codes 7 / 8 / 9 / 10 / 12 name one list backing
+  // literal compares can produce 0–5, and codes 7 / 8 / 9 / 10 / 12 / 13 name one list backing
   // each. Each arm's comment names the atom it stands for.
   let cak = 0 // "i32"
   if exprString(exprIx, fnIx) {
@@ -3873,6 +3884,14 @@ export function emitUnionCoerce(
     cak = 8 // "f64[]"
   } else if exprI64Array(exprIx, fnIx) {
     cak = 10 // "i64[]"
+  } else if exprU8Array(exprIx, fnIx) {
+    // Checked BEFORE the i32-list arm for the same reason the f32 arm precedes the f64 one:
+    // a `u8[]` element READS as an i32 everywhere (`array.get_u` widens it), so the generic
+    // array arm below would claim it and tag the box `i32[]` over a one-byte backing.
+    // Without this arm a `u8[]` carrier fell past the WHOLE ladder to the numeric default
+    // `cak = 0` and `struct.new $vbI32` was applied to the wrapper REF — `vl check` rc 0,
+    // "type mismatch: expected i32, found (ref $type)" (#1806, shape `u8[] | i32`).
+    cak = 13 // "u8[]"
   } else if exprArray(exprIx, fnIx) {
     cak = 7 // "i32[]"
   } else if exprIsF32(exprIx, fnIx) {
@@ -3937,6 +3956,15 @@ export function emitUnionCoerce(
   // at the store (as an annotated `let` does). Without this the box TAGGED `i32[]` while
   // the checker typed the member `i64[]` — `is i64[]` was silently FALSE.
   let coerceListKind = 0
+  // A `u8[]`-classified carrier that is a LIST LITERAL has to build the PACKED backing.
+  // The checker records `u8[]` on the literal node (the union's only array arm pins it), so
+  // the ladder above answers 13 and the box is tagged 13 — but `emitArr` reads the ELEMENTS
+  // to pick a backing and a bare `[1, 2, 255]` reads as i32, so without the build kind the
+  // box carried an i32-list wrapper under the packed tag and the narrowed read's
+  // `ref.cast $bl8` TRAPPED at runtime (`vl check` rc 0, VALID wasm, wrong at run time —
+  // the worst cell in the family). Kind 10 is the packed build (`emitArr`'s own arm), and it
+  // is inert for a non-literal carrier because `emitArr` is the only reader.
+  if cak == 13 { coerceListKind = 10 }
   if cak == 7 && !unionHasAtomTy(unionName, "i32", true) {
     if unionHasAtomTy(unionName, "i64", true) {
       cak = 10 // "i64[]"

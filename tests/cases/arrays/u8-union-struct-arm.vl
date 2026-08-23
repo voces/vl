@@ -1,0 +1,69 @@
+// @run
+// @log 3
+// @log 1
+// @log 255
+// @log 44
+// @log nope
+// @log 3
+// @log 4
+// @log 250
+// A `u8[]` AS A UNION MEMBER — the shape `std:fs`'s `readFile(path): u8[] | IoError` is,
+// and the reason #1806 exists.
+//
+// The union BOX is `{tag: i32, payload: anyref}` and every member's payload rep is chosen
+// by its VALUE-ATOM KIND (`valueAtomKind`). The five scalar-element lists already had a
+// code each — `i32[]` 7, `f64[]` 8, `string[]` 9, `i64[]` 10, `f32[]` 12 — and the packed
+// byte list had none, so it fell past the whole vocabulary:
+//
+//   · `unionHasValueAtom` saw no value atom in `u8[] | IoError` (a struct arm is -1 too),
+//     took the ALL-STRUCT raw pass-through, and returned the bare `$bl8` wrapper ref where
+//     a `(ref $uBox)` was expected — `vl check` rc 0, "type mismatch: expected (ref $type),
+//     found (ref $type)";
+//   · `unMemIsRefElemArray` answered TRUE for it (its ladder excluded f64/i64/f32 elements
+//     and nothing else), so `markRefArrayArms` interned a REF-LIST slot for the element
+//     spelling `u8` — the same fall-through shape #1805 closed in `fieldCodeOfSpelling`'s
+//     `return 5`, one vocabulary over.
+//
+// `u8[]` now carries value-atom code 13 and rides the box's `anyref` as its own
+// `{backing, len, cap}` wrapper, exactly like the other five lists. Nothing about the
+// payload is special — the packed `i8` storage is entirely inside the backing.
+type IoError = { code: i32, msg: string }
+
+function readFile(ok: boolean): u8[] | IoError {
+  if ok {
+    const b: u8[] = [1, 2, 255]
+    return b
+  }
+  { code: 44, msg: "nope" }
+}
+
+// ── the LIST arm: narrow, then read through the recovered wrapper ────────────
+const ok = readFile(true)
+if ok is u8[] {
+  print(ok.length)
+  print(ok[0])
+  print(ok[2]) // 255 reads back as 255 — the narrowed read is still `array.get_u`
+} else {
+  print(-1)
+}
+
+// ── the STRUCT arm: the variant tag is unchanged by the list arm's arrival ───
+const bad = readFile(false)
+if bad is IoError {
+  print(bad.code)
+  print(bad.msg)
+} else {
+  print(-2)
+}
+
+// ── the narrowed arm is a REAL `u8[]`: it pushes, stores and truncates ───────
+const g = readFile(true)
+if g is u8[] {
+  print(g.length)
+  g.push(9)
+  print(g.length)
+  g[0] = 250
+  print(g[0])
+} else {
+  print(-3)
+}
