@@ -39,7 +39,14 @@ classify() {
   if ! "$VL" check "$f" --compiler "$SEED" >/dev/null 2>&1; then
     echo "CHECKFAIL	$f" >> "$RESULTS"; return
   fi
-  expected=$(sed -n 's|^// @log ||p' "$f")
+  # Leading whitespace is STRIPPED before matching, because the TS harness does
+  # `raw.trim()` before it looks for `//` (tests/cases_wasm_test.ts) — so a fixture
+  # may put its `@log` directives INLINE and INDENTED next to the code they describe,
+  # and many do. Anchoring this to column 0 made every such file look like a runtime
+  # mismatch: the sweep read only the unindented subset as "expected" and diffed it
+  # against the program's FULL stdout. Four corpus files bucketed LOGDIFF for exactly
+  # that reason with nothing wrong with them. The two directive parsers must agree.
+  expected=$(sed -n 's|^[[:space:]]*// @log ||p' "$f")
   if ! actual=$("$VL" run "$f" --compiler "$SEED" 2>/dev/null); then
     echo "RUNFAIL	$f" >> "$RESULTS"; return
   fi
