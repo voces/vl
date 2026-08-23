@@ -11,6 +11,7 @@
 import {
   PrimName,
   fsArgIsU8List,
+  fsIntrinsicArity,
   fsIntrinsicCount,
   fsIntrinsicNameAt,
   fsIntrinsicSlot,
@@ -4274,34 +4275,53 @@ function emitTypeSection(
   // conversion in either direction. It also makes the error contract structural: a
   // failing call cannot answer null because the type forbids it, so it answers an EMPTY
   // `u8[]` and `__fs_errno__()` carries the reason.
+  // DERIVED FROM THE SLOT TABLES, not re-spelled here. An earlier draft of this loop
+  // hardcoded the shapes as slot NUMBERS (`if fsty == 1 { two u8[] params }`), which made
+  // this a fourth place a signature lives — beside the checker's `declare`, the call
+  // lowering's operand spine and the host's registration — and the one place a new
+  // syscall would be forgotten, because nothing here would fail if it were. Reading
+  // `fsIntrinsicArity` for the param count and `fsArgIsU8List` for each position's type
+  // means the functype is derived from the SAME tables the call site pushes operands
+  // from, so a declared type and the stack shape offered to it cannot disagree.
   let fsty = 0
   while fsty < fsIntrinsicCount() {
     if fsUsedAt(fsty) {
-      wU8(96) // 0x60 func
-      // Params: the `u8[]` operands first, then `__args_get__`'s i32 index.
-      if fsty == 1 {
-        wULEB(2) // __fs_write__(path, data)
-        wU8(100) // 0x64 (ref $bl8) — path
-        wSLEB(bl8TypeIdx)
-        wU8(100) // 0x64 (ref $bl8) — data
-        wSLEB(bl8TypeIdx)
-      } else if fsty == 0 || fsty == 2 || fsty == 3 {
-        wULEB(1) // __fs_read__ / __fs_list__ / __fs_stat__ (path)
-        wU8(100) // 0x64 (ref $bl8)
-        wSLEB(bl8TypeIdx)
-      } else if fsty == 5 {
-        wULEB(1) // __args_get__(i)
+      const fsAr = fsIntrinsicArity(fsty)
+      if fsAr < 0 {
+        // Cannot `return` — `curBuf` is bound to `typePayload` across this whole block,
+        // and returning would skip the `wTarget` that unbinds it. Record the failure and
+        // write a well-formed 0-param shape so the section stays parseable while it
+        // unwinds; the import entry naming this functype comes off the same slot table,
+        // so the two stay in step even on this path.
+        emitFail(
+          "emitProgram: fs import slot has no arity — the slot table and the arity table have drifted",
+        )
+        wU8(96)  // 0x60 func
+        wULEB(0) // 0 params
+        wULEB(1)
         wU8(127) // 0x7f i32
       } else {
-        wULEB(0) // __args_count__ / __fs_errno__
-      }
-      // Results: the packed wrapper for the three byte-valued slots, an i32 for the rest.
-      wULEB(1)
-      if fsRetIsU8List(fsty) {
-        wU8(100) // 0x64 (ref $bl8) — non-null, EMPTY on error
-        wSLEB(bl8TypeIdx)
-      } else {
-        wU8(127) // 0x7f i32 — 0/1 or a negative -errno
+        wU8(96) // 0x60 func
+        wULEB(fsAr)
+        let fsp = 0
+        while fsp < fsAr {
+          if fsArgIsU8List(fsty, fsp) {
+            wU8(100) // 0x64 (ref $bl8) — a path or a payload
+            wSLEB(bl8TypeIdx)
+          } else {
+            wU8(127) // 0x7f i32 — `__args_get__`'s index
+          }
+          fsp = fsp + 1
+        }
+        // Every slot returns exactly one value: the packed wrapper, or an i32 carrying
+        // 0/1 or a negative `-errno`.
+        wULEB(1)
+        if fsRetIsU8List(fsty) {
+          wU8(100) // 0x64 (ref $bl8) — non-null, EMPTY on error
+          wSLEB(bl8TypeIdx)
+        } else {
+          wU8(127) // 0x7f i32
+        }
       }
     }
     fsty = fsty + 1
