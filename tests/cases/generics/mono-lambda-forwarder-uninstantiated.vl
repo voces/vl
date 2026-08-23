@@ -1,0 +1,82 @@
+// @run
+// @log 3
+// @log q
+// @log 5
+// @log 8
+// @log 12
+// @log 7
+// @log 1
+// @log 2
+// @log 101
+// @hint Intentionally-unused parameter `_y`
+// @hint Intentionally-unused variable `_never`
+// @hint Intentionally-unused variable `_nested`
+// A LAMBDA WHOSE BODY FORWARDS TO A GENERIC, in every arrangement where nothing ever
+// monomorphizes the lambda itself (#1827).
+//
+// `monomorphize` walks top-level statements and every NON-generic lifted function's body;
+// a `monoGen == 1` slot is skipped because "a generic original's body is only ever walked
+// through an instance". That is exact for a NAMED generic and false for a lifted anonymous
+// LAMBDA, which `monoIsGenericDecl` also flags (its parameters are inference holes). A
+// lambda is instantiated only when a call goes through its own binding (`monoWalk`'s
+// `fe = afe` arm); a lambda that is merely `call_ref`'d reaches no such call site — handed
+// to a higher-order function, read back through a REASSIGNED binding, or never called at
+// all. Its body was walked by NOTHING, so the generic it forwards to was never
+// instantiated, the prune stubbed that generic to `() -> void`, and the lambda went on
+// calling it with arguments: `vl check` rc 0, INVALID WASM.
+//
+// The boundary, and each half is a cell below: an ANNOTATED lambda parameter is not a hole,
+// so its slot is `monoGen == 0` and the loop above already walked it; a NAMED forwarder is
+// reached by `monoInstantiate` like any generic; and a lambda CALLED through its own
+// binding instantiates through that call. Those three worked before this fix and are the
+// controls that say the walk added here is the missing arm rather than a second one.
+function id<T>(x: T): T { return x }
+function pair<A, B>(x: A, _y: B): A { return x }
+
+// A HIGHER-ORDER PARAMETER is the shape that has nothing to do with reassignment: the
+// lambda is `call_ref`'d from inside `take`, so no call site names its binding.
+function take(g: (i32) => i32) { return g(3) }
+function takeStr(g: (string) => string) { return g("q") }
+print(take((a) => id(a)))
+print(takeStr((a) => id(a)))
+
+// TWO TYPE PARAMS through the same seam.
+function takePair(g: (i32) => i32) { return g(5) }
+print(takePair((a) => pair(a, "b")))
+
+// NEVER CALLED AT ALL — the two-line reduction. The lambda still emits, so its callee has
+// to exist at the shape it calls.
+const _never = (a) => id(a)
+
+// NESTED inside another lambda: the outer one is instantiated through its binding, the
+// inner one is not.
+const outer = (z) => {
+  const _nested = (a) => id(a)
+  return z
+}
+print(outer(8))
+
+// CONTROLS — all three worked before #1827 and still do.
+const annotated = (a: i32) => id(a)
+print(annotated(12))
+function named(a) { return id(a) }
+print(named(7))
+
+// THE ISSUE'S OWN STRUCTURE, at the one argument type a single binding can carry: two
+// lambdas forwarding to two DIFFERENT generics through one reassigned `let`. `hits` is the
+// witness that the SECOND lambda actually runs — the append-path rename that #1827's other
+// half removes had every later call answering the first one (101 read 2).
+let hits = 0
+function bump1<T>(x: T): T {
+  hits = hits + 1
+  return x
+}
+function bump2<T>(x: T): T {
+  hits = hits + 100
+  return x
+}
+let f = (a) => bump1(a)
+print(f(1))
+f = (a) => bump2(a)
+print(f(2))
+print(hits)

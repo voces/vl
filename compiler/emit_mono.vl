@@ -2700,6 +2700,37 @@ function monoMakeInstance(
             "annotate its parameters, or bind a separate copy per type",
         )
       }
+      // THE ARM THE SIBLING LADDER HAS AND THIS ONE LACKED (#1827 — #1821's shape, one rung
+      // over). The rename below folds `f(1.5)` into a by-name call to the APPENDED instance of
+      // the binding's INITIALIZER, which is faithful only while the binding still holds that
+      // initializer. The registry-hit rung above already declines the rename for a REASSIGNED
+      // binding (`keepCallRef` — its `monoNameIsAssigned` arm IS #1821); this rung renamed
+      // unconditionally, so every call at a SECOND shape answered the FIRST lambda. `hits` reads
+      // 3 where the program says 102 — a silent WRONG ANSWER, and one that master hid behind the
+      // invalid wasm this issue's other half produces.
+      //
+      // A REJECT and not a `keepCallRef`, and the reason is the same one the capturing rung above
+      // gives: there is nothing to keep calling. The binding owns ONE closure cell carrying ONE
+      // functype, and two lambdas written into it at two argument types want two — a `call_ref`
+      // at the second shape traps on the cell's own funcref. The shape has no lowering, so the
+      // only honest outcome is to name it.
+      //
+      // NOT a by-name call: `monoNameIsAssigned` is a program-wide arena scan for `name = …` and
+      // a function's own name is never an assignment target, so a plain `bump1(x)` at a second
+      // type keeps its rename. The `!= fn.fnName` test says so in front rather than relying on
+      // that, because the two answers must agree for a lambda whose binding shadows its name.
+      const cal3 = P.nodes[calleeIx]
+      if cal3 is Ident {
+        if cal3.identName != fn.fnName && monoNameIsAssigned(cal3.identName) {
+          return emitFail(
+            "emitProgram: the reassigned function binding `" +
+              cal3.identName +
+              "` is called at more than one argument type — one binding holds one closure " +
+              "signature, and the values written to it want two. Annotate the parameters, or " +
+              "bind a separate value per type",
+          )
+        }
+      }
       fnStmts.push(nfn)
       fnParent.push(-1)
       fnDispNames.push("")
@@ -3952,6 +3983,79 @@ export function monoGenericAliasFe(letIx: i32) {
 // function body; instance bodies are walked as they are created. Usage-gated:
 // a program with no generic declaration returns immediately.
 
+// The `fnStmts` slot of the lambda a lifted lambda's own binding ALREADY holds — the
+// binding's INITIALIZER — when this lambda reached its slot through an ASSIGNMENT
+// (`f = (a) => …`), or -1.
+//
+// One binding owns ONE closure cell and that cell carries ONE functype, so every lambda
+// written into it has to be lowered at the same signature. Only the INITIALIZER is ever
+// reached by a call: `monoWalk` resolves `f(1.5)` through `identClosureFeSid`, which reads
+// the `LetDecl`'s init and knows nothing about later writes. The assigned lambda therefore
+// arrived at the emitter un-pinned, took the i32 default, and the cell's own `call_indirect`
+// — typed from the instance the INITIALIZER got — refused it at runtime.
+//
+// EXACTLY ONE assignment, or -1: a lambda literal written into two different bindings has no
+// single signature to adopt, and guessing one is how a trap becomes a wrong answer. The
+// enclosing frame comes from `fnParent` (an `fnStmts` slot, -1 at module scope), which is what
+// `identClosureFeSid` wants for a function-scoped `let`.
+function monoAssignedPeerFe(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const node = fnStmts[fe]
+  let tgt = -1
+  let seen = 0
+  let i = 0
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is BinExpr {
+      if nd.binOp == "=" && nd.binRight == node {
+        const lt = P.nodes[nd.binLeft]
+        if lt is Ident {
+          tgt = nd.binLeft
+          seen = seen + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if seen != 1 || tgt < 0 { return -1 }
+  let ctx = -1
+  if fe < fnParent.length {
+    const pp = fnParent[fe]
+    if pp >= 0 && pp < fnStmts.length { ctx = fnStmts[pp] }
+  }
+  const peer = identClosureFeSid(sidOfNode(tgt), ctx)
+  if peer == fe { return -1 }
+  peer
+}
+
+// The concrete parameter SPELLINGS a lifted slot's declaration carries, appended to `out` —
+// an instance's pins, read the way `monoPinnedSigsOf` reads them, with `"i32"` for the hole a
+// count-0 all-i32 clone deliberately leaves un-annotated. false when the slot is not a
+// function declaration at all (nothing appended that a caller could mistake for a pin).
+function monoSlotParamPins(fe: i32, out: string[]) {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType >= 0 {
+          out.push(tyNameOf(p.parType))
+        } else {
+          out.push("i32")
+        }
+      } else {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
 export function monomorphize(stmts: i32[]) {
   monoGen = []
   monoOrigNode = []
@@ -4007,6 +4111,60 @@ export function monomorphize(stmts: i32[]) {
       if monoWalkFnBody(fnStmts[fe2]) < 0 { return -1 }
     }
     fe2 = fe2 + 1
+  }
+  // THE LAMBDA HALF OF THAT LOOP, and the arm it lacked (#1827). `monoGen == 1` covers two
+  // carriers that are only alike on paper. A NAMED generic is reached ONLY through
+  // `monoInstantiate`, so "the instance walks the body" is exact for it. A lifted ANONYMOUS
+  // LAMBDA is not: it is instantiated only when a call goes through its own binding
+  // (`monoWalk`'s `fe = afe` arm), and a lambda that is merely `call_ref`'d reaches no such
+  // call site — passed to a higher-order function (`take((a) => id(a))`), read back through a
+  // REASSIGNED binding (the second lambda is not the one `identClosureFeSid` resolves), or
+  // never called at all. Its body was therefore walked by NOTHING, so a generic it forwards to
+  // was never instantiated, and the prune below stubbed that generic to `() -> void` while the
+  // lambda went on calling it with arguments — `vl check` rc 0, INVALID WASM.
+  //
+  // Walked HERE, after the two loops above, because "was this lambda instantiated" is only
+  // settled once every call site has been seen; `monoInstantiatedAny` is the same predicate
+  // `monoGenericAliasFe` already asks of a slot. Walking one lambda can instantiate another
+  // (or itself, through a binding), which is why the guard is re-read per iteration rather
+  // than collected up front. Appended instance slots sit past `nDecl` and their bodies were
+  // walked on creation, exactly as the loop above notes.
+  //
+  // USAGE-GATED: a lambda whose body contains no generic call walks to a no-op, so every
+  // program without this shape emits byte-identical output.
+  let fe3 = 0
+  while fe3 < nDecl {
+    if monoGen[fe3] == 1 && criFnIsAnonLambda(fe3) {
+      if !monoInstantiatedAny(fe3) {
+        // THE BINDING'S SIGNATURE FIRST, where this lambda got its slot from an `f = …`
+        // write. Pinning it from its peer is what makes the two lambdas one cell: pinned by
+        // the cascade's own catch-all instead, `f = (a) => g(a)` after `let f = (a) => g(a)`
+        // and `f(1.5)` declared an i32 parameter under a cell the initializer's f64 instance
+        // typed — `call_indirect type mismatch` at runtime. The i32 rep only ever agreed by
+        // accident.
+        const peer = monoAssignedPeerFe(fe3)
+        if peer >= 0 && peer < nDecl && monoInstantiatedAny(peer) {
+          const pins: string[] = []
+          if monoSlotParamPins(peer, pins) {
+            const own = P.nodes[fnStmts[fe3]]
+            if own is FuncDecl {
+              if own.fnParams.length == pins.length {
+                if monoInstanceFor(fe3, pins, fnStmts[fe3]) < 0 { return -1 }
+              }
+            }
+          }
+        }
+        // `monoInstanceFor` DECLINES silently on a boundary it cannot reproduce (a concrete
+        // annotation the pin contradicts, a first-use-wins binding the second position
+        // denies), so the walk is gated on the OUTCOME rather than on having tried — a
+        // declined pin must still get its body walked, or the generic it forwards to is the
+        // `() -> void` stub again.
+        if !monoInstantiatedAny(fe3) {
+          if monoWalkFnBody(fnStmts[fe3]) < 0 { return -1 }
+        }
+      }
+    }
+    fe3 = fe3 + 1
   }
   // PRUNE the un-instantiated `<T>` generics. A type-parameterized decl that NO call site
   // reached still holds its template node — `monoInstantiate` REPLACES the slot on the first
