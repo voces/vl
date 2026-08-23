@@ -1,9 +1,59 @@
 // `std:fmt` — pure-VL formatting helpers over the intrinsic floor
-// (docs/std-design.md D4 item 1). Imports nothing: strings are built with
-// `+`/`.slice` and rendered digit by digit. The exported helpers take a
-// `self` first parameter, so they read as UFCS methods on the receiver
-// (`n.toStr()`, `parts.join(sep)`). f64→string (shortest round-trip,
-// Ryu-class) is deliberately absent — `print` keeps covering floats.
+// (docs/std-design.md D4 item 1). The exported helpers take a `self` first
+// parameter, so they read as UFCS methods on the receiver (`n.toStr()`,
+// `parts.join(sep)`). f64→string (shortest round-trip, Ryu-class) is
+// deliberately absent — `print` keeps covering floats.
+//
+// WHAT IS STILL WRITTEN HERE is the number rendering: `toStr` over the two
+// integer widths and boolean, digit by digit, in the negative range so i64 min
+// survives.
+//
+// WHAT IS NOT is the string manipulation. `split`, `join`, `repeat` and
+// `padLeft` used to have their implementations in this file; they now live in
+// `std:str`, which owns the whole string method surface
+// (`docs/guide/strings-design.md` §Methods, step 1), and the names below are a
+// re-export plus one delegating call. Nothing an existing importer spells has
+// changed — `"5".padLeft(4, "ab")` is still `"aba5"` — and `join` got FASTER on
+// the way: `std:str` fills one code-point buffer where the version here ran an
+// `out = out + parts[i]` accumulator, which is O(n²) on this compiler (the B7b
+// fusion that used to hide that lives only in the deleted TS emitter — the
+// measurement is in `std:str`'s header).
+//
+// THE MOVE WAS NOT TIDINESS. VL has no namespace import, so every export lands
+// in the importer's flat top-level scope and a name declared twice across two
+// imported modules is a HARD PARSE ERROR. Two modules each carrying their own
+// `split` would mean a file could import `toStr` and `split` from `std:fmt`, or
+// `trim` and `split` from `std:str`, but never `toStr` and `trim` and `split` —
+// and whichever module the caller reached for would have silently decided
+// whether their `join` was O(n) or O(n²). One implementation, one home, and
+// this module keeps the names its importers already spell.
+//
+// WHAT THE MOVE COSTS, MEASURED. There is no cross-module dead-code
+// elimination, so a program that imports ONLY `toStr` now emits `std:str` too:
+// `import { toStr } from "std:fmt"` + one `n.toStr()` builds to 5,540 bytes
+// where it used to build to 2,850. That is a real regression and it is recorded
+// here rather than left to be discovered, but it is a symptom of the missing
+// DCE and not of the module shape — the same program already carried this
+// module's own unused `split`/`join`/`repeat` before the move, for the same
+// reason. The fix is whole-program dead-code elimination, which nothing in the
+// pipeline does today; the alternative — two implementations of `split`, so
+// that a formatting import stays small — buys the bytes back by paying in the
+// hazard above.
+//
+// `padLeft` IS THE ONE NAME THAT DID NOT MOVE VERBATIM. `std:str` spells it
+// `padStart`, matching `padEnd` beside it and the JS pair both are modelled on;
+// `padLeft`/`padRight` is the other convention and picking one mattered less
+// than not shipping both. The wrapper below keeps this module's spelling for
+// its existing callers at the cost of one call, and it is a DELEGATION rather
+// than a copy — there is still exactly one padder in the tree.
+
+import { padStart } from "std:str"
+
+// The string surface, re-exported from its owner. A re-export records a NAME,
+// so these are the SAME functions `std:str` exports and not second copies —
+// importing `split` from either module reaches one implementation. (The same
+// mechanism `std:args` uses to republish `Utf8Error`.)
+export { join, repeat, split } from "std:str"
 
 // Decimal digit d in 0..=9 as its character. Takes i64 so both integer
 // widths share one renderer (i64 cannot narrow to i32, so a string-index
@@ -55,70 +105,12 @@ export function toStr(self: i32 | i64 | boolean) {
   return renderI64(self)
 }
 
-// `self` concatenated n times; n <= 0 yields "".
-export function repeat(self: string, n: i32) {
-  let out = ""
-  let i = 0
-  while i < n {
-    out = out + self
-    i = i + 1
-  }
-  out
-}
-
-// Pads `self` on the left with `fill` up to `width`. A multi-codepoint fill is
-// tiled and truncated so the result is exactly `width` long; returns `self`
-// unchanged when it is already wide enough or when fill is empty.
+// `padLeft` is this module's historical spelling of `std:str`'s `padStart` and
+// is kept for its existing importers. Pads `self` on the left with `fill` up to
+// `width`: a multi-character fill is tiled and truncated so the result is
+// exactly `width` long, and `self` comes back unchanged when it is already wide
+// enough or when `fill` is empty. New code should reach for `padStart` (and its
+// `padEnd` twin, which has no name here).
 export function padLeft(self: string, width: i32, fill: string) {
-  if fill.length == 0 { return self }
-  const deficit = width - self.length
-  if deficit <= 0 { return self }
-  let pad = ""
-  let have = 0
-  while have < deficit {
-    pad = pad + fill
-    have = have + fill.length
-  }
-  return pad.slice(0, deficit) + self
-}
-
-// Elements of `self` concatenated with `sep` between consecutive elements.
-export function join(self: string[], sep: string) {
-  let out = ""
-  let i = 0
-  while i < self.length {
-    if i > 0 { out = out + sep }
-    out = out + self[i]
-    i = i + 1
-  }
-  out
-}
-
-// Splits `self` into the substrings between each (non-overlapping, left-to-right)
-// occurrence of `sep`. An empty `sep` splits into individual characters; a `sep`
-// longer than the remaining text leaves the whole remainder as the final segment.
-// `"a,b,c".split(",")` → ["a", "b", "c"]; `"".split(",")` → [""].
-export function split(self: string, sep: string): string[] {
-  const out: string[] = []
-  if sep.length == 0 {
-    let i = 0
-    while i < self.length {
-      out.push(self.slice(i, i + 1))
-      i = i + 1
-    }
-    return out
-  }
-  let start = 0
-  let i = 0
-  while i <= self.length - sep.length {
-    if self.slice(i, i + sep.length) == sep {
-      out.push(self.slice(start, i))
-      i = i + sep.length
-      start = i
-    } else {
-      i = i + 1
-    }
-  }
-  out.push(self.slice(start, self.length))
-  return out
+  return padStart(self, width, fill)
 }

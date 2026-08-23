@@ -644,12 +644,35 @@ and its machinery is directly relevant to §Methods.
 
 ## The method surface — the largest user-facing gap
 
-VL's entire string method surface today is **six operations**: `slice`, `indexOf`,
-`includes`, `charCodeAt`, `fromCodePoint`, `toString` — plus `+`, `==`, `.length`,
-`s[i]`, and `for cp in s`.
+> **Step 1 has SHIPPED as `std:str`.** The gap described below is closed as a
+> LIBRARY: `std/str.vl` implements `split`, `join`, `trim`/`trimStart`/`trimEnd`,
+> `startsWith`/`endsWith`, `lastIndexOf`, `replace`/`replaceAll`, `repeat`,
+> `padStart`/`padEnd` and `toUpperAscii`/`toLowerAscii` in ordinary VL over the six
+> primitives — no emitter change, no new intrinsic, no rep dependency. It rides UFCS
+> (`self`-first parameters), so `"a,b".split(",")` reads as a method on a string
+> receiver. Fixtures: `tests/cases/std/str-*.vl`. **Whether these names ultimately
+> live in the CORE rather than behind an import is still OQ-3** — the table below is
+> the proposal, and `std:str` is deliberately the reversible half of it: promoting a
+> name from `std` to the core is additive, demoting one is not.
+>
+> Two things the implementation found that this document did not predict:
+> **(1)** the B7b string-accumulation fusion recorded in `DECISIONS.md` (and cited by
+> §Mutability below) exists only in the DELETED TS emitter — `s = s + piece` in a
+> loop is measured quadratic on the native compiler today, so every builder in
+> `std:str` fills an `i32[]` and calls `fromCodePoints` once. **(2)** a bare member
+> CALL in implicit-return (tail) position — `function f(s: string) { s.slice(1, 2) }`
+> — passes `vl check` and fails at emit with `unsupported member-call statement`; the
+> adjacent shape `s.slice(a, b).length` is pinned by
+> `tests/cases/strings/slice-member-tail.vl` and works. An explicit `return` is the
+> workaround.
 
-**You cannot split a string in VL.** No `split`, `join`, `trim`, `replace`,
-`startsWith`, `endsWith`, `padStart`/`padEnd`, `repeat`, `toUpper`/`toLower`.
+VL's entire string method surface in the CORE is **six operations**: `slice`,
+`indexOf`, `includes`, `charCodeAt`, `fromCodePoint`, `toString` — plus `+`, `==`,
+`.length`, `s[i]`, and `for cp in s`.
+
+**You could not split a string in VL** before `std:str`. No `split`, `join`, `trim`,
+`replace`, `startsWith`, `endsWith`, `padStart`/`padEnd`, `repeat`,
+`toUpper`/`toLower`.
 
 This matters for sequencing, because **the method surface is rep-independent**: every
 one of these is writable today against `array i32` and survives the UTF-8 swap
@@ -687,10 +710,15 @@ crossover is bad enough, the fallback is a bare `array i8` with copying slices �
 costs §Scanning its cursor idiom, so the measurement genuinely decides a design
 question, not just a number.
 
-**Step 1 — the method surface, on the current representation.** `split`, `trim`,
-`join`, `replace`, `startsWith`/`endsWith`, padding, ASCII case. Rep-independent,
-immediately useful, and it builds the fixture corpus the rep change will be validated
-against.
+**Step 1 — the method surface, on the current representation. DONE, as `std:str`.**
+`split`, `trim`, `join`, `replace`/`replaceAll`, `startsWith`/`endsWith`,
+`lastIndexOf`, `repeat`, padding, ASCII case — all pure VL over the six primitives,
+all UFCS-reachable, none of it touching the emitter. Rep-independent, immediately
+useful, and it builds the fixture corpus the rep change will be validated against:
+`tests/cases/std/str-*.vl`, 163 pinned lines over 7 files whose assertions are written against
+the SURFACE and not the storage (equality and slices, never a `.length` over a
+multi-byte character), so they survive step 2 unchanged and go red if it goes wrong.
+`std:fmt`'s four string helpers were re-pointed at it rather than duplicated.
 
 **Step 2 — the storage + header swap, in ONE rep migration.** `array i32` of code
 points → `{backing: (array i8), start, len, hash}` of UTF-8, with `s[i]`/`.length`

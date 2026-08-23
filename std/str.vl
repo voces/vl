@@ -1,0 +1,586 @@
+// `std:str` — the string method surface VL's core does not have.
+//
+// The core's whole string vocabulary is SIX operations — `slice`, `indexOf`,
+// `includes`, `charCodeAt`, `fromCodePoint`, `toString` — plus `+`, `==`,
+// `.length`, `s[i]` and `for cp in s`. Everything a program actually does to
+// text is missing: you cannot split a string in VL, cannot trim one, cannot
+// replace inside one, cannot ask whether one ends with another.
+// `docs/guide/strings-design.md` §Methods calls this "the largest user-facing
+// gap in the whole area", and this module is its **step 1**.
+//
+// WHY THIS IS A LIBRARY AND NOT COMPILER WORK. Every operation here is
+// expressible over the primitives the core already has, so none of it needs the
+// emitter, a new intrinsic, or a representation change — and that is exactly
+// why the design doc sequences it FIRST. The rep change that follows (UTF-8
+// bytes behind a slice header, §Storage/§Header) has to be validated against
+// something, and six methods' worth of fixtures is a thin instrument against an
+// emitter whose known failure mode is a silently missing ladder arm. The
+// fixtures under `tests/cases/std/str-*.vl` are that instrument; they are
+// written against the SURFACE (`.length`, `s[i]`, `slice`) and not the storage,
+// so they survive the swap unchanged and fail loudly if it goes wrong.
+//
+// SELF-FIRST, SO EVERY EXPORT IS A METHOD. `self` is VL's UFCS switch (B14): a
+// free function whose first parameter is named `self` is reachable as
+// `receiver.name(rest)`. `"a,b".split(",")` and `split("a,b", ",")` are the
+// same call, and a string RECEIVER resolves it exactly like a struct one
+// (verified — `typecheck.vl`'s string-method arm falls through to `ufcsCallTy`
+// after the four builtins). The one export that breaks the pattern is `join`,
+// whose receiver is a `string[]`; that is not an inconsistency but the shape of
+// the operation, and `std:fmt` already spelled it that way.
+//
+// ── EVERY BUILDER HERE FILLS A CODE-POINT BUFFER. READ THIS BEFORE EDITING. ──
+//
+// The obvious way to build a string in VL — `let s = ""` then `s = s + piece`
+// in a loop — is **O(n²) on this compiler**, and that is a measured fact rather
+// than a caution. `DECISIONS.md` (B7b) records a string-accumulation fusion
+// that turns exactly that shape into an amortized buffer fill; the fixtures for
+// it still sit in `tests/cases/strings/accum-*.vl`. But that optimization was
+// implemented in `compiler/toWasm.ts` (PR #168) and **deleted with the TS core**
+// (PR #466) — it was never ported to the native emitter, and
+// `grep -rn "accumulat" compiler/*.vl` finds no recognizer. The accum fixtures
+// still pass because they only assert the RESULT, which per-append concat also
+// produces; they are blind to the cost class they were written to pin.
+//
+// Measured on this head, `s = s + "abcdefgh"` in a loop, whole-run wall clock:
+//
+//     n = 20000  →   313 ms
+//     n = 40000  →  1502 ms   (×4.8)
+//     n = 80000  →  7614 ms   (×5.1)
+//
+// Doubling the input quintuples the time. That is quadratic, and it is why no
+// function in this file accumulates into a string. The repo's established
+// answer is a single code-point buffer materialized once — `compiler/format.vl`'s
+// `joinOut`, `fmt_util.vl`'s `collapseWs` and `joinLinesRange` all carry the
+// scar tissue, the last of them noting that the accumulator it replaced "blew
+// the compiler's NON-FREEING null-GC heap" on a large file. `pushRange` /
+// `pushStr` / `fromCodePoints` below are that idiom, factored once.
+//
+// The rule for anyone extending this module: **an `i32[]` grows, a `string`
+// does not.** `buf.push(c)` is an amortized append; `s + c` copies the whole
+// left operand. Two `+`s to splice a result (`replace`) are fine — that is
+// O(n) once, not O(n) per element.
+//
+// ── ASCII IS IN THE NAME WHERE ASCII IS THE BEHAVIOUR ──
+//
+// `toUpperAscii` / `toLowerAscii` are spelled that way DELIBERATELY, and the
+// design doc rules it: an unqualified `toUpper` that silently leaves `é` alone
+// is the quiet-lie class VL exists to reject — it works on every string the
+// author tests and is wrong on the first one a user types. Full case mapping
+// needs Unicode tables (and is not even a per-code-point map: `ß` upper-cases
+// to two characters, and Turkish dotless-i makes it LOCALE-dependent), so it
+// belongs to a future `std:unicode` alongside `normalize`, `graphemes` and
+// `reverse`. The name here promises exactly what it does.
+//
+// `trim` is ASCII-only for the same reason and is NOT named for it, which is a
+// deliberate asymmetry rather than an oversight: the whitespace set is a
+// closed, tiny, universally-agreed list (space, `\t`, `\n`, `\v`, `\f`, `\r` —
+// the same six C's `isspace` takes and Go's `strings.TrimSpace` starts from),
+// and the Unicode additions to it (NBSP, the en/em spaces, U+3000) are exactly
+// the characters a caller does NOT want collapsed when trimming a field. A
+// `toUpper` that ignores non-ASCII gives a WRONG answer; a `trim` that ignores
+// non-ASCII space gives the answer nearly every caller wanted. When
+// `std:unicode` lands it can add `trimUnicodeSpace` beside this, not instead
+// of it.
+//
+// ── THE DEGENERATE INPUTS ARE RULED, NOT LEFT TO FALL OUT ──
+//
+// Every export below documents its own edges and every one is pinned by a
+// fixture. The rulings all resolve the same way: **follow the unanimous
+// precedent**, because `DECISIONS.md` already put the core's string methods in
+// the JS camp ("`indexOf("")` returns 0") and a std module that disagreed with
+// its own core would be the seam this language is written to avoid. Where JS,
+// Python, Rust and Go agree — and on the empty-needle question all four do —
+// that agreement is the answer. The two consequences worth stating up front:
+//
+//   - An empty separator SPLITS INTO CHARACTERS, so `"".split("")` is `[]`
+//     (nothing to split) while `"".split(",")` is `[""]` (one empty field).
+//     Those look inconsistent side by side and are not: a separator that
+//     appears zero times always yields exactly one field.
+//   - An empty `from` MATCHES AT EVERY BOUNDARY, so `"abc".replaceAll("", "-")`
+//     is `"-a-b-c-"` — `to` before the first character, between each pair, and
+//     after the last. Go's own documentation spells this out ("if old is empty,
+//     it matches at the beginning of the string and after each UTF-8 sequence"),
+//     and Rust/Python/JS produce the identical string.
+//
+// ── THE ONE LAW WORTH REMEMBERING ──
+//
+//     s.replaceAll(from, to) == s.split(from).join(to)      for a non-empty `from`
+//
+// It holds for every input, including the ones people get wrong (a separator at
+// the very start, at the very end, adjacent, or overlapping), and it is pinned
+// as a fixture rather than left as a claim. It is why `split` and `replaceAll`
+// share `findFrom` and agree about overlap: matches are consumed
+// non-overlapping, left to right, so `"aaa".replaceAll("aa", "b")` is `"ba"`
+// and not `"bb"` or `"b"`. For an EMPTY `from` the law does not hold and cannot
+// — the boundary rule above puts `to` at both ends, and `split("")` does not —
+// which is stated here so nobody "fixes" one side into agreement with the other.
+//
+// ── WHAT THIS MODULE DOES NOT DO ──
+//
+// NO REGEX, NO PATTERN ARGUMENT. Every `from`/`sep`/`prefix` here is a literal
+// string. `std:regex` is its own module in the design doc's core-vs-std table,
+// wants a compiled pattern type, and would put a second coordinate system next
+// to these byte offsets; a half-regex hidden behind a `split` overload is worse
+// than none.
+//
+// NO `splitN` / `splitOnce` / `rsplit`, NO `trimPrefix`/`trimSuffix`, NO
+// `replaceFrom(i)`. Each is a real operation with real callers elsewhere, and
+// none has a caller in this tree yet — `docs/internals/std-design.md` D1's
+// admission principle is that nothing lands without one. They are all purely
+// additive over `findFrom`/`lastIndexOf`, so the day a consumer appears they
+// cost a few lines. A name that does not exist yet is the only one still free
+// to be right.
+//
+// NO `contains`, NO `indexOf`, NO `slice`. Those are core builtins on `string`
+// already; re-exporting them would create a SECOND name for one operation and,
+// because VL has no namespace import, a program that imported both would take a
+// hard duplicate-binding parse error. `lastIndexOf` is here because the core has
+// no counterpart at all.
+//
+// NO CODE-POINT-COUNTING ANYWHERE. `.length` and every index in this file is
+// whatever the core's index unit is — today a code point, after the rep swap a
+// UTF-8 byte. Nothing here converts between units or assumes which one it is,
+// which is what makes the whole module survive §Storage unchanged.
+//
+// ── RELATIONSHIP TO `std:fmt` ──
+//
+// `std:fmt` used to own `split`, `join`, `repeat` and `padLeft`. It no longer
+// implements any of them: it re-exports the first three from here and its
+// `padLeft` is a one-line call into `padStart`, so there is exactly one
+// implementation of each in the tree. That is not tidiness — it is a bug fix.
+// VL has no namespace import, so two modules exporting `split` means
+// `import { toStr } from "std:fmt"` and `import { split } from "std:str"` in one
+// file is fine but `import { split } from "std:fmt"` beside it is a HARD PARSE
+// ERROR, and which module a caller reached for would have silently decided
+// whether their join was O(n) or O(n²). `std:fmt` keeps the name for its
+// existing importers; `std:str` keeps the code.
+
+// ── the shared cores ───────────────────────────────────────────────────────
+
+// Whether `needle` occurs at index `at`. The one comparison primitive: every
+// search in this file (`findFrom`, `lastIndexOf`, `startsWith`, `endsWith`)
+// is a policy about WHICH `at` to try, and none of them re-spells the compare.
+//
+// It reads element by element rather than `self.slice(at, at + needle.length)
+// == needle` because the slice ALLOCATES — an allocation per candidate position
+// turns every search in the module into garbage pressure proportional to the
+// haystack. An out-of-range `at` (negative, or a needle that would run off the
+// end) is `false`, not a trap, so callers may hand it an unchecked offset;
+// `endsWith` relies on that for a suffix longer than the string.
+function matchAt(self: string, needle: string, at: i32): boolean {
+  if at < 0 { return false }
+  if at + needle.length > self.length { return false }
+  let i = 0
+  while i < needle.length {
+    if self[i + at] != needle[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The index of the first occurrence of `needle` at or after `from`, or -1.
+//
+// The core's `indexOf` takes no start offset (checked: `typecheck.vl` types it
+// at exactly one argument), which is the reason this exists — a scan that
+// resumes is what `split` and `replaceAll` are made of.
+//
+// An EMPTY needle is found immediately at `from`, matching the core's
+// `indexOf("") == 0`; `from` past the end yields -1 for a non-empty needle and
+// `from` itself for an empty one, which is what makes the empty case terminate
+// in callers that advance by `needle.length` — they must, and do, special-case
+// it instead.
+function findFrom(self: string, needle: string, from: i32): i32 {
+  let i = from
+  if i < 0 { i = 0 }
+  const last = self.length - needle.length
+  while i <= last {
+    if matchAt(self, needle, i) { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Append `s[lo..hi)` to `buf`. The single copy primitive of this module — see
+// the header: `buf` GROWS (amortized push), a string would be COPIED WHOLE per
+// append. Bounds are clamped, so a caller may pass an empty or inverted range.
+function pushRange(buf: i32[], s: string, lo: i32, hi: i32) {
+  let i = lo
+  if i < 0 { i = 0 }
+  let end = hi
+  if end > s.length { end = s.length }
+  while i < end {
+    buf.push(s[i])
+    i = i + 1
+  }
+}
+
+// Append all of `s` to `buf`.
+function pushStr(buf: i32[], s: string) { pushRange(buf, s, 0, s.length) }
+
+// The six ASCII whitespace characters — space, tab, newline, vertical tab, form
+// feed, carriage return. See the header for why the set is closed at ASCII and
+// why that does NOT put "Ascii" in `trim`'s name.
+function isSpace(c: i32): boolean {
+  c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
+}
+
+// The index of the first non-whitespace character, or `self.length` when there
+// is none (an all-blank string, which includes the empty one).
+function spanStart(self: string): i32 {
+  let i = 0
+  while i < self.length {
+    if !isSpace(self[i]) { return i }
+    i = i + 1
+  }
+  self.length
+}
+
+// One PAST the index of the last non-whitespace character, or 0 when there is
+// none. Paired with `spanStart` these bound the trimmed span as a half-open
+// `[a, b)` — and on an all-blank string they cross (`a == length`, `b == 0`),
+// which the callers handle explicitly rather than leaning on `slice`'s clamp.
+function spanEnd(self: string): i32 {
+  let i = self.length
+  while i > 0 {
+    if !isSpace(self[i - 1]) { return i }
+    i = i - 1
+  }
+  0
+}
+
+// ── searching ──────────────────────────────────────────────────────────────
+
+// Whether `self` begins with `prefix`. An empty prefix is always present
+// (every string begins with nothing), a prefix longer than `self` never is.
+export function startsWith(self: string, prefix: string): boolean {
+  matchAt(self, prefix, 0)
+}
+
+// Whether `self` ends with `suffix`. An empty suffix is always present; a
+// suffix longer than `self` computes a NEGATIVE offset, which `matchAt` refuses
+// rather than trapping — that is the reason for its `at < 0` guard.
+export function endsWith(self: string, suffix: string): boolean {
+  matchAt(self, suffix, self.length - suffix.length)
+}
+
+// The index of the LAST occurrence of `needle`, or -1 when absent — the missing
+// counterpart to the core's `indexOf`, and it keeps `indexOf`'s -1 convention
+// rather than inventing a `i32 | null` the core would disagree with.
+//
+// Scanning DOWN from the last position a match could start at means the first
+// hit is the answer, so no candidate is examined twice. An empty needle
+// returns `self.length` (it occurs at the boundary after the last character,
+// which is the last of the `length + 1` places it occurs) — the mirror of
+// `indexOf("") == 0`, and what JS, Python, Rust and Go all report.
+// Occurrences may overlap here, unlike in `split`/`replaceAll`, because a
+// single position is being reported rather than a sequence consumed:
+// `"aaa".lastIndexOf("aa")` is 1.
+export function lastIndexOf(self: string, needle: string): i32 {
+  let i = self.length - needle.length
+  while i >= 0 {
+    if matchAt(self, needle, i) { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// ── splitting and joining ──────────────────────────────────────────────────
+
+// The pieces of `self` between each occurrence of `sep`, left to right.
+//
+// The result ALWAYS has one more element than `sep` has occurrences, which is
+// the single rule every edge below follows from:
+//
+//   - `"a,b,c".split(",")` → `["a", "b", "c"]`
+//   - a separator at the very START gives a leading empty piece:
+//     `",a".split(",")` → `["", "a"]`
+//   - at the very END, a trailing one: `"a,".split(",")` → `["a", ""]`
+//   - ADJACENT separators give an empty piece between them:
+//     `"a,,b".split(",")` → `["a", "", "b"]`
+//   - a separator that never occurs gives the whole string as one piece:
+//     `"abc".split(",")` → `["abc"]`
+//   - an EMPTY input therefore gives one empty piece: `"".split(",")` → `[""]`
+//   - matches do not OVERLAP, they are consumed left to right:
+//     `"aaa".split("aa")` → `["", "a"]`
+//
+// An EMPTY separator is the one case outside that rule: it splits into single
+// characters, so `"abc".split("")` → `["a", "b", "c"]` and — this is the edge
+// people trip on — `"".split("")` → `[]`, an EMPTY list rather than `[""]`.
+// The two empty-input answers differ because the questions differ: splitting
+// "" on "," finds no separator and hands back the one field it was given,
+// while splitting "" into its characters finds none. Every one of JS, Python
+// (via `list(s)`), Rust `.chars()` and Go `strings.Split` agrees; so did the
+// `std:fmt` implementation this replaces.
+//
+// The pieces are `slice`s of `self`, which is O(1) and allocation-free once the
+// rep change lands (§Header) — splitting a 1 MB file into 10k lines will
+// allocate 10k headers and copy zero bytes. It copies today.
+export function split(self: string, sep: string): string[] {
+  const out: string[] = []
+  if sep.length == 0 {
+    let c = 0
+    while c < self.length {
+      out.push(self.slice(c, c + 1))
+      c = c + 1
+    }
+    return out
+  }
+  let start = 0
+  let at = findFrom(self, sep, 0)
+  while at >= 0 {
+    out.push(self.slice(start, at))
+    start = at + sep.length
+    at = findFrom(self, sep, start)
+  }
+  out.push(self.slice(start, self.length))
+  out
+}
+
+// The elements of `self` concatenated with `sep` between each adjacent pair —
+// `split`'s inverse, and the receiver is a `string[]` rather than a string
+// because that is what the operation is ON.
+//
+// An empty list joins to `""` and a one-element list to that element, both
+// without touching `sep` — so `[""].join(",")` is `""` and `["", ""].join("-")`
+// is `"-"`, one separator for the one gap. There is no trailing separator,
+// ever.
+//
+// One buffer, one `fromCodePoints`: the `out = out + parts[i]` spelling of this
+// function is the exact loop that went quadratic and blew the compiler's heap
+// (`compiler/fmt_util.vl:216`). Joining 40,000 eight-character pieces, whole-run
+// wall clock, same 359,999-character result: **28 ms buffered against 12,475 ms
+// accumulated** — the two spellings are not a tuning difference, they are two
+// complexity classes, and this is the A/B behind the header's rule. The single-
+// and zero-element early returns are not micro-optimization either: they are
+// what makes joining a one-piece list allocation-free, which is the common
+// result of splitting on a separator that was not there.
+export function join(self: string[], sep: string): string {
+  if self.length == 0 { return "" }
+  if self.length == 1 { return self[0] }
+  const buf: i32[] = []
+  let i = 0
+  while i < self.length {
+    if i > 0 { pushStr(buf, sep) }
+    pushStr(buf, self[i])
+    i = i + 1
+  }
+  fromCodePoints(buf)
+}
+
+// ── replacing ──────────────────────────────────────────────────────────────
+
+// `self` with the FIRST occurrence of `from` replaced by `to`. When `from` does
+// not occur, `self` comes back unchanged and untouched — the same object, no
+// allocation.
+//
+// An EMPTY `from` occurs at index 0 (the core's own `indexOf("") == 0` rule),
+// so `"abc".replace("", "-")` is `"-abc"`: `to` is prepended. JS, Python and
+// Rust all produce that exact string.
+//
+// Two `+`s and no buffer, deliberately: this splices at ONE point, so it is a
+// pair of O(n) copies rather than the O(n)-per-element accumulator the header
+// warns about. `replaceAll` cannot say the same and does not try.
+export function replace(self: string, from: string, to: string): string {
+  const at = findFrom(self, from, 0)
+  if at < 0 { return self }
+  self.slice(0, at) + to + self.slice(at + from.length, self.length)
+}
+
+// `self` with EVERY occurrence of `from` replaced by `to`.
+//
+// Matches are consumed left to right and never overlap, because the scan
+// resumes PAST the match it just took: `"aaa".replaceAll("aa", "b")` is `"ba"`
+// — the first two characters are consumed, the third is left. This is the same
+// consumption rule `split` uses, which is what makes the law in the header
+// (`replaceAll(f, t) == split(f).join(t)` for a non-empty `f`) hold on exactly
+// these awkward inputs. A `to` that CONTAINS `from` is not rescanned, so
+// `"a".replaceAll("a", "aa")` terminates at `"aa"`.
+//
+// An EMPTY `from` matches at every boundary — before the first character,
+// between each pair, and after the last — so `"abc".replaceAll("", "-")` is
+// `"-a-b-c-"` and `"".replaceAll("", "-")` is `"-"`. That is JS, Python, Rust
+// and Go verbatim (Go documents it as "up to k+1 replacements for a k-rune
+// string"), and it is the one input where the split/join law does not hold.
+//
+// A `from` that never occurs returns `self` unchanged with nothing allocated —
+// checked BEFORE the buffer is built, because "no match" is the common case for
+// a caller sanitizing input that is usually already clean.
+export function replaceAll(self: string, from: string, to: string): string {
+  const buf: i32[] = []
+  if from.length == 0 {
+    let c = 0
+    while c < self.length {
+      pushStr(buf, to)
+      buf.push(self[c])
+      c = c + 1
+    }
+    pushStr(buf, to)
+    return fromCodePoints(buf)
+  }
+  let at = findFrom(self, from, 0)
+  if at < 0 { return self }
+  let start = 0
+  while at >= 0 {
+    pushRange(buf, self, start, at)
+    pushStr(buf, to)
+    start = at + from.length
+    at = findFrom(self, from, start)
+  }
+  pushRange(buf, self, start, self.length)
+  fromCodePoints(buf)
+}
+
+// ── trimming ───────────────────────────────────────────────────────────────
+
+// `self` without leading ASCII whitespace. An all-blank string trims to `""`;
+// a string with nothing to remove comes back unchanged and unallocated.
+export function trimStart(self: string): string {
+  const a = spanStart(self)
+  if a == 0 { return self }
+  if a == self.length { return "" }
+  return self.slice(a, self.length)
+}
+
+// `self` without trailing ASCII whitespace. All-blank trims to `""`.
+export function trimEnd(self: string): string {
+  const b = spanEnd(self)
+  if b == self.length { return self }
+  if b == 0 { return "" }
+  return self.slice(0, b)
+}
+
+// `self` without leading or trailing ASCII whitespace — interior whitespace is
+// UNTOUCHED (`" a b ".trim()` is `"a b"`, not `"ab"`).
+//
+// This is not `trimStart(trimEnd(self))`: that spelling allocates an
+// intermediate string for the common case where both ends need work. One pass
+// for each bound, one slice. The all-blank case is checked FIRST because the
+// two bounds cross there (`spanStart` reports `length`, `spanEnd` reports 0),
+// and leaning on `slice`'s start >= end clamp to paper over it would be relying
+// on a clamp to express an intent.
+export function trim(self: string): string {
+  const a = spanStart(self)
+  if a == self.length { return "" }
+  const b = spanEnd(self)
+  if a == 0 && b == self.length { return self }
+  return self.slice(a, b)
+}
+
+// ── building ───────────────────────────────────────────────────────────────
+
+// `self` concatenated `n` times. `n <= 0` yields `""` — a negative count is
+// treated as zero rather than trapping, because "repeat this negative-one
+// times" is a computed count that came out empty, not a bug in the program.
+// (JS throws a RangeError here; Rust and Go's `strings.Repeat` panic. VL's
+// error-handling design reserves traps for bugs, and the useful reading of a
+// count that fell below zero is an empty result.)
+export function repeat(self: string, n: i32): string {
+  if n <= 0 { return "" }
+  if n == 1 { return self }
+  if self.length == 0 { return "" }
+  const buf: i32[] = []
+  let i = 0
+  while i < n {
+    pushStr(buf, self)
+    i = i + 1
+  }
+  fromCodePoints(buf)
+}
+
+// Exactly `n` characters of `pad`, tiled and truncated at whatever character
+// the tiling lands on — `padFill(3, "ab")` is `"aba"`. `n <= 0` or an empty
+// `pad` yields `""`, which is what makes both padders return their input
+// untouched instead of special-casing the two degenerate arguments twice.
+//
+// Truncating mid-tile rather than refusing a multi-character pad is what JS
+// does, and it is the behaviour that makes the result EXACTLY `len` long, which
+// is the entire point of padding (a column that is sometimes one character
+// wider is not a column).
+function padFill(n: i32, pad: string): string {
+  if n <= 0 { return "" }
+  if pad.length == 0 { return "" }
+  const buf: i32[] = []
+  let i = 0
+  while i < n {
+    buf.push(pad[i % pad.length])
+    i = i + 1
+  }
+  fromCodePoints(buf)
+}
+
+// `self` padded on the LEFT with `pad` until it is `len` long.
+//
+// Returns `self` untouched when it is already `len` or longer — padding never
+// TRUNCATES, so `"hello".padStart(3, "0")` is `"hello"` and not `"hel"`. That
+// is JS's rule and the only safe one: a padder that shortened its input would
+// silently destroy data in exactly the logging and table-formatting code that
+// calls it. An empty `pad` is likewise a no-op rather than an infinite loop.
+export function padStart(self: string, len: i32, pad: string): string {
+  const fill = padFill(len - self.length, pad)
+  if fill.length == 0 { return self }
+  fill + self
+}
+
+// `self` padded on the RIGHT with `pad` until it is `len` long. Same rules as
+// `padStart`: never truncates, empty `pad` is a no-op, the result is exactly
+// `len` long whenever padding happened at all.
+export function padEnd(self: string, len: i32, pad: string): string {
+  const fill = padFill(len - self.length, pad)
+  if fill.length == 0 { return self }
+  self + fill
+}
+
+// ── ASCII case ─────────────────────────────────────────────────────────────
+
+// The distance from `c` to its ASCII case counterpart, or 0 when it has none —
+// the one place the alphabet is named, so `mapAsciiCase` carries no direction
+// logic and neither exported wrapper carries any at all.
+//
+// Every code point outside `a`–`z` / `A`–`Z` maps to 0 and therefore passes
+// through byte-identical. That includes every non-ASCII character, which is the
+// promise the `Ascii` suffix makes.
+function caseShift(c: i32, up: boolean): i32 {
+  if up {
+    if c >= 'a' && c <= 'z' { return -32 }
+    return 0
+  }
+  if c >= 'A' && c <= 'Z' { return 32 }
+  0
+}
+
+// The one case walk, shared by both exported directions.
+//
+// It SCANS before it builds: a string with nothing to change — already-upper
+// text, a number, a punctuation run, anything non-ASCII — is returned as it
+// arrived, with no buffer and no allocation. That matters because the common
+// call is a normalizing comparison (`a.toLowerAscii() == b.toLowerAscii()`)
+// where one side is usually already lower-case.
+function mapAsciiCase(self: string, up: boolean): string {
+  let i = 0
+  let hit = false
+  while i < self.length {
+    if caseShift(self[i], up) != 0 {
+      hit = true
+      break
+    }
+    i = i + 1
+  }
+  if !hit { return self }
+  const buf: i32[] = []
+  let j = 0
+  while j < self.length {
+    buf.push(self[j] + caseShift(self[j], up))
+    j = j + 1
+  }
+  fromCodePoints(buf)
+}
+
+// `self` with every ASCII lower-case letter upper-cased. NOTHING else changes —
+// `"é"`, `"ß"` and every other non-ASCII character pass through untouched, and
+// the name says so. Full Unicode case mapping is a future `std:unicode`; see
+// the header for why it cannot be this function under a shorter name.
+export function toUpperAscii(self: string): string { mapAsciiCase(self, true) }
+
+// `self` with every ASCII upper-case letter lower-cased. Same promise, same
+// limit, same reason for the name.
+export function toLowerAscii(self: string): string { mapAsciiCase(self, false) }
