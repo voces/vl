@@ -32,6 +32,24 @@ if x is K { print("WRONG: zz claimed to be K") } else { print("ok: not K") }
 
 A silent wrong answer at rc 0 on both commands — the worst outcome column there is.
 
+**THAT WITNESS NO LONGER REPRODUCES (re-derived 2026-08-22 on `be49bfcc`), SO THIS SECTION MAY BE
+EMPTY.** Pasted verbatim and run, the program above prints `ok: not K`. Two neighbouring witnesses the
+A16 row cites go the same way: F1, storing an atom-typed value into `K | f64`, tags it `K`; F2, reading
+a narrowed arm back into a `K`-typed position, compiles and prints `aa` where the filing says
+*"invalid wasm in 9 of 9 spellings"*. All three also answer correctly on a seed **81 commits older**,
+so this is a long-closed class, not a fresh fix.
+
+**Do not read that as "A16 is fixed" — three cells are not a grid.** The filing's population is 81 of
+244 (and 420 elsewhere); what has been established is only that the three programs this file prints as
+its evidence are not evidence any more. **What it does mean is that the section header is now
+unsupported: nothing here is demonstrated to be BROKEN while these wait, and the "cost of waiting"
+paragraphs below quote defect counts from the same stale source.** Re-derive the grid before briefing
+either A16 ruling — the cheapest honest brief is the grid re-run, not this text.
+
+The same check retired two of the largest rows in `silent-class-inventory-2.md` on the same day; the
+shape is general enough that it is worth stating as a rule for this file specifically: **an entry here
+is a scheduling instrument, so its witness must be RUN, not read, before it is quoted.**
+
 **N5 (mutable-container variance) used to sit here and is now RULED (2026-08-18)** — see the Ruled
 section. Its witness above no longer reproduces: `stash(cats, …)` is a loud reject at HEAD behind
 #1456's width gate. What survives it is the union-widening family, which is check-clean invalid wasm
