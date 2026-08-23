@@ -1195,14 +1195,32 @@ in-language GC knobs.
   - **Language-wide, still open** — value-vs-reference (default reference), error model.
   - **Deferred** — per-frame pooling; user-facing low-level array escape.
   - **Remaining open questions** — capacity/seed construction spelling; `map`/`filter` return type.
-- 🟡 **B7. Strings.** REMAINING: switch backing to `(array mut i16)` + `wasm:js-string` builtins
-  (bulk JS-host interop — dart2wasm/Kotlin-Wasm style); UTF-8/i8 packing (size); richer methods.
-  **Strings direction:** `docs/guide/strings-design.md` — long-term UTF-8 internal storage,
-  code-point-indexed API made O(1) for the ASCII common case via an ASCII fast-path flag; strings
-  immutable. Ties A7. **Third argument for the i8 packing, beyond size:** wasmtime's
-  `ArrayRef::new_from_i8_slice` (memcpy a host byte slice straight into a GC array) is i8-only, so
-  `(array i8)` is what lets the host stage source in ONE call instead of ~3.4M — see B-mem. Weigh
-  against the loss of word-at-a-time scanning (`memory-gc-design.md` §2.2).
+- 🟡 **B7. Strings — DESIGN DECIDED, implementation not started.**
+  `docs/guide/strings-design.md` is now a ruled design, and **the "not before bootstrap" gate it
+  opened with is LIFTED** (byte-exact fixpoint, TS host gone, `u8`/packed `(array mut i8)` shipped
+  with `std:fs` — the substrate). **The design REVERSED its own API ruling:** the core is now
+  **byte-indexed** (Go/Rust camp) — `s[i]` a byte and `.length` a byte count, both O(1) — with code
+  points by **iteration** (`for cp in s`, `s.backwards()`, `s.cpAt`/`s.cpLen` named and explicit).
+  That deletes the ASCII fast-path flag, its constant-propagation heuristic, the **O(n²)
+  indexed-loop cliff** on non-ASCII, and the two-coordinate-system seam against `std:regex` byte
+  offsets. Storage is UTF-8 `array i8` under a **slice header** `{backing, start, len, hash}` — the
+  header is for **O(1) views** (`slice`, `split`), NOT an ASCII flag, and it is what lets a
+  re-slice serve as the scanning cursor so VL needs no cursor type. `string` stays **GC**; SIMD /
+  word-at-a-time work belongs to **`Buffer`** (B-mem) — wasm SIMD is linear-memory-only and a GC
+  `(array i8)` cannot be read as an `i64`/`v128`. `wasm:js-string` is **rejected** (UTF-16
+  semantics + browser-only). Ties A7.
+  REMAINING, in order: **(0)** measure the two-object header break-even on short strings — the
+  compiler's workload is short interned identifiers and that is where the memory claim is weakest;
+  **(1)** the **method surface** on today's rep — `split`/`join`/`trim`/`replace`/`startsWith`/
+  padding/ASCII case; there are only **six** string methods today and *you cannot split a string in
+  VL*. Rep-independent, and it is the fixture corpus the rep change gets validated against;
+  **(2)** the storage + header swap in **ONE** rep migration (not bare-array-then-struct — that is
+  two rep migrations of the most-used type in the compiler); **(3)** `__map_hash__` +
+  `__string_eq__` to byte level **atomically** with the cached hash. **Unblocks:** wasmtime's
+  `ArrayRef::new_from_i8_slice` is i8-only, so `(array i8)` is what lets the host stage source in
+  ONE call instead of ~3.4M (B-mem); and the UTF-8 encode/decode half of **H-M2** (killing the Rust
+  host). Weigh against the loss of word-at-a-time scanning (`memory-gc-design.md` §2.2) — resolved
+  here by pushing that work to `Buffer` rather than to `string`.
 - 🟡 **B8. Loops.** REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms; **expression `step`** on a counter range (`for i = 1 to 5 step i * 2` — a
   multiplicative/variable step, not just a const increment), distinct from the const-step
