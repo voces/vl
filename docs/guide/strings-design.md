@@ -1,9 +1,16 @@
 # VL strings design — UTF-8 storage, a byte-indexed core, and code points by iteration
 
-> Status: **design, decided — implementation not yet started.** The identity-defining
-> choices below are ruled and recorded so they are not re-litigated. The
-> `DECISIONS.md` entry lands with the implementation PR, not before; this document is
-> the rationale it will point at.
+> Status: **SHIPPED.** Stage 2a (a heap type of its own), Stage 2b (the slice header and
+> O(1) views) and **Stage 2c (UTF-8 storage and the byte-indexed surface)** have all
+> landed; the `DECISIONS.md` entry is written. What remains of the migration list is
+> Step 3 (byte-level `__map_hash__`/`__string_eq__` plus the cached header hash, which
+> must move atomically) and Step 4 (`std:unicode`, `std:regex`), neither of which changes
+> the storage or the index unit.
+>
+> **Where the implementation DEVIATES from what is written below, the deviation is marked
+> inline** — there are three: `s.bytes()` copies rather than aliasing (§Byte view),
+> `isCharBoundary` does not special-case index 0 (§API), and `compact()` is still not
+> built (§Header). Everything else shipped as ruled.
 
 > **The hard gate that used to open this file is LIFTED.** Every prior revision began
 > "this does NOT change before bootstrap." Bootstrap is done: `compiler/*.vl` compiles
@@ -401,6 +408,14 @@ Go-lean validity (§Validity) that is not an error — it decodes leniently to U
 `s.isCharBoundary(i)` is available for code that wants to check (Rust's primitive; it
 is O(1), a single lead/continuation bit test).
 
+> **ONE DEVIATION FROM RUST, DELIBERATE.** Rust's `is_char_boundary` returns `true` at
+> index 0 unconditionally. It can: a `&str` is *guaranteed* valid, so its byte 0 is never
+> a continuation byte and the special case is a free shortcut. A VL string carries no such
+> guarantee — `"é→".slice(1, 4)` begins on a continuation byte and is an ordinary legal
+> value — so answering `true` there would report a boundary that is not one, on exactly
+> the input the function exists to detect. VL's version is the bit test with no index-0
+> arm; on every valid string the two rules agree.
+
 **What this gives up.** `s[i]` no longer means "the i-th character." That is a real
 walk-back of the ergonomic the previous revision was built around, and it is taken
 deliberately on the evidence in §Reversal: the indexing programs actually perform is
@@ -432,7 +447,15 @@ s.cpLen()                  ;; count of code points              — O(n), named
   subscript sugar.
 - **`s.cpLen()` is O(n) and named so.** A method call at the point of use, where the
   cost is visible, rather than a `.length` that is O(1) on some strings and O(n) on
-  others depending on runtime data.
+  others depending on runtime data. **It DRIVES the decoder rather than counting
+  non-continuation bytes**, which is only distinguishable on malformed input and is
+  exactly why it matters: `"é→".slice(1, 4)` holds one lead byte and three U+FFFDs, so
+  the cheap count would say 1 while `for cp in s` iterates 3. Two answers to one question
+  is the defect shape this compiler is most prone to; sharing the decoder makes them
+  equal by construction.
+- **`s.backwards()` is NOT shipped.** It is specified above, it is cheap, and nothing
+  needed it — no `std:` function and no fixture. Adding an iteration form to the core is
+  additive and can land whenever a caller exists.
 
 The principle: **operations whose cost depends on the data get a name, not a
 subscript.** A subscript should mean O(1), always, on every input.
@@ -595,13 +618,42 @@ explicit `string` ↔ `Buffer` boundary is more honest and vastly safer.
 answer is "use a `Buffer`," which is a real ergonomic seam. It is taken knowingly, and
 recorded here so it is a stated consequence rather than a discovered one.
 
-### Byte view: `s.bytes()` is zero-copy — DECIDED
+### Byte view: `s.bytes()` — the zero-copy claim is WITHDRAWN, it COPIES
 
-`s.bytes()` returns a **`u8[]` view over the same backing** — not a copy. Because
-strings are immutable (§Mutability), the view aliases `$backing`/`$start`/`$len`
-directly with no defensive copy and no invalidation risk; constructing it is O(1).
-This is the FFI and host-boundary path, and it now composes with the `u8[]` surface
-that shipped with `std:fs`.
+> **THIS SECTION IS AMENDED BY THE IMPLEMENTATION.** It said `s.bytes()` returns a
+> **`u8[]` view over the same backing — not a copy**, justified by immutability: *"Because
+> strings are immutable, the view aliases `$backing`/`$start`/`$len` directly with no
+> defensive copy and no invalidation risk."* **Two things make that unbuildable, and the
+> second one makes it unsafe rather than merely hard.**
+>
+> **1. A `u8[]` has no `start`.** Its representation is `{backing, len, cap}` and `xs[i]`
+> is `backing[i]`, full stop. A string VIEW whose `start` is non-zero — which is what
+> every `slice` produces, i.e. the whole point of §Header — therefore has *no* `u8[]`
+> spelling. An aliasing `bytes()` would be correct on `s` and silently wrong on
+> `s.slice(1)`, returning the parent's leading bytes. Giving `u8[]` a slice header of its
+> own is the same migration this document just described, performed again on a second
+> type, with its own gates.
+>
+> **2. THE JUSTIFICATION WAS ONE-DIRECTIONAL, AND A `u8[]` IS MUTABLE.** Immutability
+> establishes that the *string* cannot change under the *view*. It does not establish
+> that the *view* cannot change under the *string* — and `b[0] = 74` / `b.push(33)` are
+> both legal on a `u8[]` (verified). An aliasing `bytes()` would hand out a **writable
+> pointer into an immutable string's storage**, breaking §Equality's cached hash
+> (compute-once-never-invalidate rests on immutability), §Header's invalidation-free
+> slice views, and this section's own defensive-copy-free argument — in one method call
+> and one element assignment.
+>
+> **The ruling taken: `s.bytes()` COPIES.** It is one `array.copy` — a memcpy the engine
+> lowers to `memmove` — into a fresh, mutable, growable `u8[]` the caller owns, which is
+> exactly the contract `std:utf8`'s `encodeUtf8` has always had (so collapsing that
+> function onto this one changes nothing for its callers). The alternatives, recorded so
+> they are not re-derived: make the backing `(array i8)` **immutable** and give `bytes()`
+> a read-only spelling of its own, or add a read-only array type to the language. Both
+> are larger than this stage and neither is needed for anything shipped.
+
+`s.bytes()` returns the string's UTF-8 storage as a **`u8[]`** — the view's own bytes,
+never its parent's. This is the FFI and host-boundary path, and it composes with the
+`u8[]` surface that shipped with `std:fs`.
 
 ### Validity: bytes that are usually UTF-8 (Go-lean) — DECIDED
 
@@ -615,6 +667,21 @@ with one bad byte" into an error path.
 This also means **slicing off a character boundary is legal**, producing partial
 sequences at the edges that decode as U+FFFD. `s.isCharBoundary(i)` is there for code
 that cares.
+
+**THE SWAP FORCED ONE RULING THIS SECTION DID NOT ANTICIPATE, AND IT IS RULED:
+`fromCodePoints` SUBSTITUTES U+FFFD.** A code-point array can hold a value with no UTF-8
+encoding — a lone surrogate (D800–DFFF), anything past U+10FFFF, a negative — and the old
+`array i32` backing simply stored it. UTF-8 storage cannot, so the constructor has to
+substitute, trap, or drop. Before the swap the tree held **three different answers to this
+at once**, measured: storage kept a lone surrogate verbatim, `print` silently DROPPED it,
+and `std:utf8`'s `encodeUtf8` substituted U+FFFD. Substitution wins, on three grounds:
+it is what this section already rules for the decode direction, so the two directions
+agree; it is what one of the three shipped behaviours already did, so a behaviour survives
+rather than none; and **dropping changes `.length` in a way no caller can detect**, where
+substitution is visible in the output. Trapping is rejected explicitly rather than by
+omission — it turns a `u8[]` → `i32[]` → `string` pipeline into a panic on data. `print`
+was brought into line: it streams the stored replacement bytes. Pinned by
+`tests/cases/strings/utf8-lenient.vl`.
 
 ### Unicode scope: graphemes / normalization / collation are out of the core — DECIDED
 
@@ -783,10 +850,28 @@ the SURFACE and not the storage (equality and slices, never a `.length` over a
 multi-byte character), so they survive step 2 unchanged and go red if it goes wrong.
 `std:fmt`'s four string helpers were re-pointed at it rather than duplicated.
 
-**Step 2 — the storage + header swap, in ONE rep migration.** `array i32` of code
-points → `{backing: (array i8), start, len, hash}` of UTF-8, with `s[i]`/`.length`
-becoming byte-valued and `slice` becoming a view. Host boundaries become bulk copies.
-Go-lean validity lands here.
+**Step 2 — the storage + header swap. DONE, in three stages (2a / 2b / 2c).** `array i32`
+of code points → `{backing: (array i8), start, len}` of UTF-8, with `s[i]`/`.length`
+byte-valued and `slice` an O(1) view. Go-lean validity landed with 2c. `$hash` is NOT in
+the struct — it is Step 3's, because it must move atomically with byte-level equality.
+
+> **WHAT STAGE 2c ACTUALLY COST, MEASURED.** The self-compile fixpoint grows
+> **1 361 951 → 1 372 836 bytes (+0.80 %)** — three shared UTF-8 helpers plus a fourth
+> for `bytes()`, all riding `aUsed`. Self-compile wall time is flat (2.05–2.13 s → 2.01–2.17 s,
+> inside the noise) and its peak RSS drops **694 MB → 651 MB (−6.3 %)**. `vl check` over a
+> 7 MB file goes **0.49 s → 0.25 s** and `vl fmt` over the same file **0.80 s → 0.46 s**.
+> The one regression is printing NON-ASCII: `__print_char__` is still one host call per
+> ELEMENT and the element is now a byte, so a line of 39 code points / 45 bytes costs 15 %
+> more crossings — measured at 0.22 s → 0.26 s over 200 000 such lines. ASCII printing is
+> unchanged (0.19 s either way), which is the same 1-byte-per-character identity that keeps
+> the rest of the corpus still.
+>
+> **`__print_string__` was NOT built.** §2.6 of the measurements map proposed replacing the
+> per-element print import with a bulk one; it would need a new import functype over
+> `(ref $sTypeIdx)` and it moves four hardcoded import indices, so it is filed rather than
+> bundled into the stage that changes the representation. The boundary that DID become bulk
+> is the CLI data-out channel (`cliCmdDataStore`), which now packs four bytes per word
+> exactly as `rbyteStore` always has — worth the 1.7× on `vl fmt` above.
 
 > **One migration, not two.** An earlier plan sequenced this as bare-array first, then
 > promote to a struct. That is **two full rep migrations of the most-used type in the
@@ -960,6 +1045,19 @@ document's selection principle (*a module belongs in the default set iff it oper
 a type with literal syntax*), `std:str` qualifies on `"…"`. Cost of an ambient module in
 a shipped `-O` build is **~210 bytes**, and it does not scale with module size. Nothing
 further to decide here; it needs the prelude mechanism to exist.
+
+**OQ-3 ADDENDUM — Stage 2c added FOUR names to the core, and the OQ-3 rule is what
+decided which.** `cpAt`, `cpLen`, `isCharBoundary` and `bytes` are intrinsics; the 15
+`std:str` names still are not, and the line between them is not size or popularity. Every
+one of the four needs the UTF-8 **storage** — a decode at a byte offset, a scan for
+non-continuation bytes, a lead/continuation bit test, a bulk `array.copy` — and the surface
+deliberately exposes no way to reach the storage except `s[i]`, which is the byte they would
+have to re-derive their answer from. `split`/`trim`/`join` are functions over the six
+primitives; these are primitives. The emitter cost OQ-3 priced (roughly 48 hand-synced
+ladder arms for 15 names) came in at **five ladders × four names**: the checker arm, the LSP
+completion table, one classifier predicate each, the dispatch rung, and the lowering — plus
+one `collectA`-adjacent forcing arm for `bytes()`, because `s.bytes()` is the only producer
+of a `u8[]` that spells no `u8[]` anywhere.
 
 **OQ-4 — automatic compaction.** Should the compiler ever auto-`compact()` a small
 view of a large backing that escapes into a long-lived structure, or is the retention

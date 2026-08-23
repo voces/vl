@@ -1,3 +1,4 @@
+import { pushCps } from "./strutil"
 // The source-in / bytes-out DRIVER — the interface `scripts/vl-host` embeds
 // against. A real `import`/`export` MODULE that imports the pipeline (lexer →
 // ast → parser → typecheck → wasmEmit → lint → format) and exposes the host ABI
@@ -158,12 +159,33 @@ import {
   formatProgram,
 } from "./format"
 export let vcCodes: i32[] = []
+// The IN-MODULE source channel — set when a VL caller already holds the source string
+// (`cli.cliStageEntry`), as opposed to the host channel below which has to arrive one
+// element at a time. Exactly one of the two is used per compile, which is what lets
+// `vcSource` choose between them on `vcCodes.length` alone rather than carrying a flag
+// (a flag would be a second thing to keep in step, and `srcReset` clears both).
+let vcSrcStr = ""
 export function srcReset(): i32 {
   vcCodes = []
+  vcSrcStr = ""
   0
 }
 export function srcPush(c: i32): i32 {
   vcCodes.push(c)
+  0
+}
+// Stage a source string DIRECTLY, with no per-element round trip.
+//
+// STAGE 2c MADE THE ROUND TRIP WRONG, not merely wasteful. `cli.cliStageEntry` used to run
+// `while i < src.length { srcPush(src[i]) }` and `vcSource` rebuilt the string with
+// `fromCodePoints` — a byte producer feeding a code-point consumer, so every non-ASCII
+// character in the file being compiled was re-encoded into two before the lexer saw it, and
+// `'é'` lexed as two characters. That is `str-byte-semantics.md` §Builders' defect sitting
+// on the compiler's own entry path, and the fix is the same one the audit prescribes: stop
+// naming a unit. A string handed over as a string has no unit to get wrong.
+export function srcSetStr(s: string): i32 {
+  vcCodes = []
+  vcSrcStr = s
   0
 }
 // ── BULK SOURCE INTAKE over linear memory (`docs/internals/perf-program.md` §3.1)
@@ -204,7 +226,10 @@ export function srcLoad(count: i32): i32 {
   }
   0
 }
-export function vcSource(): string { fromCodePoints(vcCodes) }
+export function vcSource(): string {
+  if vcCodes.length == 0 { return vcSrcStr }
+  fromCodePoints(vcCodes)
+}
 // Source positions (and owning module) for the `P.diags` entries that carry NO
 // token anchor: LEX diagnostics (`Diag.at` is a token index, which a lex diag
 // doesn't have) and MODULE-RESOLUTION diagnostics (emitted before any tokens
@@ -1546,6 +1571,18 @@ export function modCommit(found: i32): i32 {
   const src = fromCodePoints(modSrcAcc)
   modKeyAcc = []
   modSrcAcc = []
+  modCommitStr(key, src, found)
+}
+// The direct entry point, for a caller that ALREADY HOLDS the strings. `cliModCommitOne`
+// is that caller — it is VL calling VL, with no host boundary between them — and it used to
+// push its two strings element by element into the accumulators above just so this function
+// could rebuild them. That cost two full copies of every module's source per compile, and
+// once `s[i]` became a UTF-8 BYTE (Stage 2c) while `fromCodePoints` still meant CODE POINTS
+// it also silently double-encoded every non-ASCII character in the program being compiled,
+// BEFORE the lexer saw it. The accumulators remain for the genuine host channel
+// (`modKeyLoad`/`modSrcLoad` stage UTF-32 words through linear memory), which is the only
+// place a per-element protocol is forced on us.
+export function modCommitStr(key: string, src: string, found: i32): i32 {
   modKeys.push(key)
   modSrcs.push(src)
   modFound.push(found)
@@ -1683,6 +1720,10 @@ function vcLoadToksMod(m: i32): i32 {
 export function modPendingCount(): i32 { modPending.length }
 export function modPendingLen(i: i32): i32 { modPending[i].length }
 export function modPendingAt(i: i32, j: i32): i32 { modPending[i][j] }
+// The whole key as a STRING. The per-element pair above is the HOST's ABI (its reader
+// collects bytes); an in-module caller wants the string itself, and reassembling it from
+// elements is the §Builders double-encode since Stage 2c made those elements bytes.
+export function modPendingKeyAt(i: i32): string { modPending[i] }
 
 // Cross-file symbols (kill-TS #3-C): the import/export SURFACE the module scan
 // already built (`imp*`/`exp*`), exposed as accessors. After committing the graph
@@ -1797,15 +1838,19 @@ function modNormalize(path: string): string {
     if path[0] == '/' { absolute = true }
   }
   let segs: string[] = []
-  let cur: i32[] = []
+  // STAGE 2c: segments come out as SLICES of `path`, not rebuilt through a code-point
+  // buffer. `/` is ASCII so it is found at the same offsets in either unit, and a slice
+  // names no unit at all — where `fromCodePoints(cur)` over `path[i]` bytes would have
+  // re-encoded every non-ASCII character in a path.
+  let segStart = 0
   let i = 0
   while i <= path.length {
     const atEnd = i == path.length
     let c = 0
     if !atEnd { c = path[i] }
     if atEnd || c == '/' {
-      const seg = fromCodePoints(cur)
-      cur = []
+      const seg = path.slice(segStart, i)
+      segStart = i + 1
       if seg == "" || seg == "." {
         // skip
       } else if seg == ".." {
@@ -1825,8 +1870,6 @@ function modNormalize(path: string): string {
       } else {
         segs.push(seg)
       }
-    } else {
-      cur.push(c)
     }
     i = i + 1
   }
@@ -2756,7 +2799,11 @@ function modRenamed(name: string): string {
 // consumer feeding it a rendered name gets the same answer every other scanner gives.
 function modTypeRenamed(tn: string): string {
   const out: i32[] = []
-  let run: i32[] = []
+  // STAGE 2c: identifier runs and quoted literal members are SLICED out of `tn` rather
+  // than rebuilt from elements. An identifier run is ASCII by `nameIdentChar`'s own test,
+  // but a QUOTED member is not — a literal-union arm can be spelled `"é"` — and that arm
+  // copied `tn[i]` into the same code-point buffer.
+  let runStart = 0
   let i = 0
   while i <= tn.length {
     const atEnd = i == tn.length
@@ -2765,11 +2812,11 @@ function modTypeRenamed(tn: string): string {
     let isIdent = false
     if !atEnd { isIdent = nameIdentChar(c) }
     if isIdent {
-      run.push(c)
+      if runStart < 0 { runStart = i }
     } else {
-      if run.length > 0 {
-        const seg = fromCodePoints(run)
-        run = []
+      if runStart >= 0 && i > runStart {
+        const seg = tn.slice(runStart, i)
+        runStart = 0 - 1
         let rep = seg
         // A live generic type-parameter name is the PARAMETER here, never the
         // top-level binding it may textually collide with.
@@ -2777,12 +2824,9 @@ function modTypeRenamed(tn: string): string {
           const row = sidArrGet(modRenameLastBySid, sidLookup(seg))
           if row >= 0 { rep = modRenameTo[row] }
         }
-        let k = 0
-        while k < rep.length {
-          out.push(rep[k])
-          k = k + 1
-        }
+        pushCps(out, rep)
       }
+      runStart = 0 - 1
       if !atEnd {
         if c == '"' {
           // Copy a quoted literal member verbatim. `skipQuotedName` owns where one ends —
@@ -2790,11 +2834,8 @@ function modTypeRenamed(tn: string): string {
           // segment, so the span is total. The trailing decrement hands the outer `i + 1`
           // the character AFTER the member.
           const qEnd = skipQuotedName(tn, i)
-          while i < qEnd {
-            out.push(tn[i])
-            i = i + 1
-          }
-          i = i - 1
+          pushCps(out, tn.slice(i, qEnd))
+          i = qEnd - 1
         } else {
           out.push(c)
         }

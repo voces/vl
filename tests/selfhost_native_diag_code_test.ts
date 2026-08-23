@@ -35,10 +35,11 @@ const instantiate = (): Exports => {
   return new WebAssembly.Instance(module, {}).exports as unknown as Exports;
 };
 
+// STAGE 2c: the element is a UTF-8 byte, not a code point.
 const readString = (len: number, at: (j: number) => number): string => {
-  const cps = new Array<number>(len);
-  for (let j = 0; j < len; j++) cps[j] = at(j);
-  return String.fromCodePoint(...cps);
+  const bytes = new Uint8Array(len);
+  for (let j = 0; j < len; j++) bytes[j] = at(j);
+  return new TextDecoder().decode(bytes);
 };
 
 /** Check `src` on a fresh store; return each diagnostic's `{ message, code }`. */

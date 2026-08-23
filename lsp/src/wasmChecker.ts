@@ -460,26 +460,19 @@ const pushString = (push: (cp: number) => number, text: string) => {
 };
 
 /**
- * Chunked decode: `String.fromCodePoint(...cps)` spreads each code point as a
- * JS argument, and V8 caps a call's argument count at the stack size — an
- * MB-scale string (e.g. `formatSrc` returning a whole file) throws RangeError.
- * Decoding a bounded slice per call keeps every spread far under the cap.
+ * STAGE 2c: the element is a UTF-8 BYTE. `TextDecoder` takes the whole buffer, so the
+ * chunking this used to need is gone with the reason for it: `String.fromCodePoint(...cps)`
+ * spread each element as a JS ARGUMENT and V8 caps a call's argument count at the stack
+ * size, which made an MB-scale string (`formatSrc` returning a whole file) throw
+ * RangeError. Nothing is spread now, so one call handles any length.
+ *
+ * Lossy by design (`strings-design.md` §Validity): a guest string is bytes that are usually
+ * UTF-8, and the editor must render a malformed one rather than throw inside a keystroke.
  */
-const READ_CHUNK = 4096;
 const readString = (len: number, at: (j: number) => number): string => {
-  if (len <= READ_CHUNK) {
-    const cps = new Array<number>(len);
-    for (let j = 0; j < len; j++) cps[j] = at(j);
-    return String.fromCodePoint(...cps);
-  }
-  const parts: string[] = [];
-  for (let base = 0; base < len; base += READ_CHUNK) {
-    const n = Math.min(READ_CHUNK, len - base);
-    const cps = new Array<number>(n);
-    for (let j = 0; j < n; j++) cps[j] = at(base + j);
-    parts.push(String.fromCodePoint(...cps));
-  }
-  return parts.join("");
+  const bytes = new Uint8Array(len);
+  for (let j = 0; j < len; j++) bytes[j] = at(j);
+  return new TextDecoder().decode(bytes);
 };
 
 /** Mirrors the Rust host's module gate: a LINE-LEADING `import {`. */

@@ -95,9 +95,22 @@ Deno.test({
   ignore,
 }, async () => {
   const names = await memberNames('let s = "hi"\ns\nprint(1)\n', 1, 0);
+  // Stage 2c added the four UTF-8 methods the byte-indexed surface needs: `cpAt`,
+  // `cpLen`, `isCharBoundary` and `bytes`. They are listed here as well as typed in
+  // `typecheck.vl` because this table is the sibling ladder that has silently lagged
+  // before — `.length` is typed on a string and STILL not offered.
   assertEquals(
     names.sort(),
-    ["charCodeAt", "includes", "indexOf", "slice"],
+    [
+      "bytes",
+      "charCodeAt",
+      "cpAt",
+      "cpLen",
+      "includes",
+      "indexOf",
+      "isCharBoundary",
+      "slice",
+    ],
     "string builtin methods",
   );
 });

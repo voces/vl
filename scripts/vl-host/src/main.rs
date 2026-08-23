@@ -218,12 +218,7 @@ impl DiagPaths {
         let mut keys = Vec::with_capacity(n.max(0) as usize);
         for m in 0..n {
             let len = key_len.call(&mut *store, m).ok()?;
-            let mut key = String::with_capacity(len as usize);
-            for j in 0..len {
-                if let Some(c) = char::from_u32(key_at.call(&mut *store, (m, j)).ok()? as u32) {
-                    key.push(c);
-                }
-            }
+            let key = read_guest_str(len, |j| Ok(key_at.call(&mut *store, (m, j))?)).ok()?;
             keys.push(key);
         }
         Some(DiagPaths { module_of, keys })
@@ -235,6 +230,27 @@ impl DiagPaths {
         let m = self.module_of.call(&mut *store, i).ok()?;
         self.keys.get(usize::try_from(m).ok()?).map(String::as_str)
     }
+}
+
+/// Read one guest string through the per-element `<name>Len(i)` / `<name>At(i, j)` ABI.
+///
+/// STAGE 2c: the element is a UTF-8 **byte**, not a code point. Every one of the five
+/// hand-copied `char::from_u32(at(i, j))` loops this replaces would render a non-ASCII
+/// diagnostic as mojibake the moment the guest's `s[j]` changed unit — and §2.6 of the
+/// migration map named exactly that: "all five change together or diagnostics render
+/// mojibake". They are one function now so they cannot change separately again.
+///
+/// Lossy by design (`strings-design.md` §Validity, Go-lean): a guest string is bytes that
+/// are USUALLY UTF-8, so a malformed run becomes U+FFFD rather than an error.
+fn read_guest_str<F>(len: i32, mut at: F) -> Result<String>
+where
+    F: FnMut(i32) -> Result<i32>,
+{
+    let mut bytes = Vec::with_capacity(len.max(0) as usize);
+    for j in 0..len {
+        bytes.push(at(j)? as u8);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Render the compiler's accumulated diagnostics, one per line. A compiler
@@ -263,12 +279,7 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
         let mut out = String::new();
         for i in 0..n {
             let len = mlen.call(&mut *store, i)?;
-            let mut msg = String::with_capacity(len as usize);
-            for j in 0..len {
-                if let Some(c) = char::from_u32(mat.call(&mut *store, (i, j))? as u32) {
-                    msg.push(c);
-                }
-            }
+            let msg = read_guest_str(len, |j| Ok(mat.call(&mut *store, (i, j))?))?;
             let line = dline.call(&mut *store, i)?;
             if line > 0 {
                 let col = dcol.call(&mut *store, i)?;
@@ -287,13 +298,7 @@ fn render_diags(inst: &Instance, store: &mut Store<()>, path: &str) -> Result<St
     let dlen = inst.get_typed_func::<(), i32>(&mut *store, "diagLen")?;
     let dat = inst.get_typed_func::<i32, i32>(&mut *store, "diagAt")?;
     let n = dlen.call(&mut *store, ())?;
-    let mut diags = String::with_capacity(n as usize);
-    for i in 0..n {
-        if let Some(c) = char::from_u32(dat.call(&mut *store, i)? as u32) {
-            diags.push(c);
-        }
-    }
-    Ok(diags)
+    read_guest_str(n, |i| Ok(dat.call(&mut *store, i)?))
 }
 
 /// Where the compiler seed bytes come from: a path on disk (the dev/CI default,
@@ -797,11 +802,17 @@ impl StrOut {
         Ok(StrOut { name: name.to_string(), len, at, bulk })
     }
 
+    /// STAGE 2c: the payload is UTF-8 **bytes**, so the bulk window carries FOUR elements
+    /// per i32 word instead of one, and the host's copy is a `memcpy` of exactly the bytes
+    /// it wants rather than a strided gather that rebuilt each code point from four. That
+    /// is the same packing `rbyteStore` has always used on the wasm read-back channel —
+    /// §2.6 predicted the two would converge the moment the element became a byte, and this
+    /// is that convergence: the guest halves are now the same loop.
     fn read(&self, store: &mut Store<()>) -> Result<String> {
         let n = self.len.call(&mut *store, ())?.max(0);
-        let mut s = String::with_capacity(n as usize);
+        let mut bytes = Vec::with_capacity(n as usize);
         if let Some((mem, store_fn)) = &self.bulk {
-            let cap = mem.data_size(&mut *store) / 4;
+            let cap = mem.data_size(&mut *store);
             if cap > 0 {
                 let mut off = 0i32;
                 while off < n {
@@ -813,36 +824,16 @@ impl StrOut {
                             self.name
                         );
                     }
-                    let data = mem.data(&*store);
-                    for k in 0..got as usize {
-                        let v = u32::from_le_bytes([
-                            data[k * 4],
-                            data[k * 4 + 1],
-                            data[k * 4 + 2],
-                            data[k * 4 + 3],
-                        ]);
-                        push_cp(&mut s, v, off + k as i32);
-                    }
+                    bytes.extend_from_slice(&mem.data(&*store)[..got as usize]);
                     off += got;
                 }
-                return Ok(s);
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
             }
         }
         for j in 0..n {
-            let v = self.at.call(&mut *store, j)? as u32;
-            push_cp(&mut s, v, j);
+            bytes.push(self.at.call(&mut *store, j)? as u8);
         }
-        Ok(s)
-    }
-}
-
-/// Append one UTF-32 code point to a payload being read back. The seed only stores
-/// code points that came from valid strings, so an unmappable value is a protocol
-/// bug — surface it in debug builds rather than silently shortening the payload.
-fn push_cp(s: &mut String, v: u32, j: i32) {
-    match char::from_u32(v) {
-        Some(c) => s.push(c),
-        None => debug_assert!(false, "invalid code point {v:#x} in a CLI payload at index {j}"),
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 
@@ -913,12 +904,7 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
                 let mut keys = Vec::with_capacity(n as usize);
                 for i in 0..n {
                     let len = pend_len.call(&mut *store, i)?;
-                    let mut key = String::with_capacity(len as usize);
-                    for j in 0..len {
-                        if let Some(c) = char::from_u32(pend_at.call(&mut *store, (i, j))? as u32) {
-                            key.push(c);
-                        }
-                    }
+                    let key = read_guest_str(len, |j| Ok(pend_at.call(&mut *store, (i, j))?))?;
                     keys.push(key);
                 }
                 for key in keys {
@@ -1125,13 +1111,7 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
                     i: i32|
      -> Result<String> {
         let len = len_of.call(&mut *store, i)?;
-        let mut s = String::with_capacity(len as usize);
-        for j in 0..len {
-            if let Some(c) = char::from_u32(at.call(&mut *store, (i, j))? as u32) {
-                s.push(c);
-            }
-        }
-        Ok(s)
+        read_guest_str(len, |j| Ok(at.call(&mut *store, (i, j))?))
     };
     if let (Ok(stat), Ok(rcount), Ok(rlen), Ok(rat), Ok(rn), Ok(mcount), Ok(mlen), Ok(mat)) = (
         inst.get_typed_func::<i32, i32>(&mut *store, "repShadowStat"),
@@ -1810,7 +1790,7 @@ fn instantiate_program(
     module: &Module,
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
 ) -> Result<(Store<()>, Instance)> {
-    let chars: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let chars: Arc<Mutex<Vec<u8>>> = Arc::default();
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
@@ -1839,14 +1819,20 @@ fn instantiate_program(
         s(if v != 0 { "true" } else { "false" })
     })?;
     let c = chars.clone();
-    linker.func_wrap("imports", "__print_char__", move |code: i32| {
-        c.lock().unwrap().push(code as u32);
+    // STAGE 2c: the argument is a UTF-8 **byte**, not a code point. The guest streams a
+    // string's storage bytes verbatim, so the host does no transcoding at all — where it
+    // used to run `char::from_u32` per element and rebuild a `String` from scratch, it now
+    // accumulates raw bytes and decodes ONCE per line.
+    linker.func_wrap("imports", "__print_char__", move |b: i32| {
+        c.lock().unwrap().push(b as u8);
     })?;
     let c = chars.clone();
     let s = sink.clone();
     linker.func_wrap("imports", "__print_str_flush__", move || {
         let mut buf = c.lock().unwrap();
-        let line: String = buf.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        // Lossy, per §Validity: a string sliced off a character boundary is a legal VL
+        // value and must print as U+FFFD rather than killing the program.
+        let line = String::from_utf8_lossy(&buf).into_owned();
         buf.clear();
         s(&line);
     })?;
@@ -2448,13 +2434,7 @@ fn read_test_str(
     i: i32,
 ) -> Result<String> {
     let n = len.call(&mut *store, i)?;
-    let mut s = String::with_capacity(n.max(0) as usize);
-    for j in 0..n {
-        if let Some(c) = char::from_u32(at.call(&mut *store, (i, j))? as u32) {
-            s.push(c);
-        }
-    }
-    Ok(s)
+    read_guest_str(n, |j| Ok(at.call(&mut *store, (i, j))?))
 }
 
 /// Collect one file's registry: load the module, instantiate it (which RUNS the
@@ -2754,11 +2734,7 @@ fn read_cli_str(
     at: &TypedFunc<i32, i32>,
 ) -> Result<String> {
     let n = len.call(&mut *store, ())?;
-    let mut s = String::with_capacity(n.max(0) as usize);
-    for j in 0..n {
-        push_cp(&mut s, at.call(&mut *store, j)? as u32, j);
-    }
-    Ok(s)
+    read_guest_str(n, |j| Ok(at.call(&mut *store, j)?))
 }
 
 /// `vl check` (and, later, every subcommand) over the command-queue pump. The host

@@ -121,8 +121,16 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // `__str_concat__` helper at the tail — which now `struct.new`s a `{backing,start,len}`
   // header around the backing it allocated. The site is in dead code here, which is exactly
   // why the `-O`/`-O3` columns are unmoved: 0/0 and 3/2 as before. Re-measured, not guessed.
-  { fixture: "list-wrapper-literal", none: 4, O: 0, O3: 0 },
-  { fixture: "list-wrapper-call", none: 4, O: 0, O3: 0 },
+  //
+  // AND ROSE BY TWO MORE AT STAGE 2c, FOR THE SAME REASON AND ON THE SAME AXIS. The UTF-8
+  // storage swap adds a third shared helper with allocations — `__utf8_enc__`, which
+  // `array.new_default`s the byte backing and `struct.new`s the header around it, the two
+  // sites `fromCodePoints` used to inline. Like `__str_concat__` it rides `aUsed`, so it is
+  // present in every module that has a string OR a list and dead in all three of these
+  // fixtures. `-O`/`-O3` unmoved again (0/0, 0/0, 3/2), which is the DCE proving the sites
+  // are unreachable rather than an assertion that they are.
+  { fixture: "list-wrapper-literal", none: 6, O: 0, O3: 0 },
+  { fixture: "list-wrapper-call", none: 6, O: 0, O3: 0 },
   // Both union-box producers here are two-armed helpers, and the RETURN SINK gives such a
   // function ONE construction site: every `return` writes the tag/payload pair into two
   // reserved locals and branches to a single exit that performs the only `struct.new`. So
@@ -154,7 +162,7 @@ const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: number }
   // around it is local scalarization across a liveness window: a rep change
   // (`unboxed-union-rep-design.md` §12.4), not a sink.
   { fixture: "union-box-branch-local-read", none: 4, O: 4, O3: 4 },
-  { fixture: "list-wrapper-push", none: 7, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push", none: 9, O: 3, O3: 2 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
@@ -259,7 +267,18 @@ const LOOP_TABLE: Array<{
   // rotated" (the 2.40x defect it exists to catch) from "a helper this program never
   // calls gained a loop". Until that lands, a helper change legitimately moves these
   // numbers and the fix is to re-verify PER FUNCTION and update the row.
-  { fixture: "binsearch-probe", none: [7, 4, 6], O: [3, 3, 6], O3: [3, 3, 6] },
+  //
+  // THIRD FIRING, SAME WRONG AXIS: 7,4,6 -> 11,4,6 at Stage 2c. The UTF-8 swap adds three
+  // shared helpers at the module tail, and four of the module's loops are theirs —
+  // `__utf8_dec__`'s continuation-byte walk (1), `__utf8_enc__`'s width pass and write pass
+  // (2), `__utf8_cplen__`'s decode walk (1). Verified per function rather than assumed: the
+  // probe's own `$5` is BYTE-IDENTICAL, no user function gained a loop, and ROTATED is
+  // unchanged at 4 — the four new loops are all un-rotated helper bodies. `binsearch-probe`
+  // contains zero string operations, so it calls none of them; `-O`/`-O3` stay 3,3,6 because
+  // both rungs DCE the whole tail away. The gate has now fired three times on a helper the
+  // probe cannot reach and zero times on the defect it exists to catch, which is the
+  // strongest argument yet for scoping it to the probe's own functions.
+  { fixture: "binsearch-probe", none: [11, 4, 6], O: [3, 3, 6], O3: [3, 3, 6] },
 ];
 
 // ── THE BENCHMARK SHAPE PINS ────────────────────────────────────────────────

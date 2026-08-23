@@ -1,6 +1,18 @@
 # `std:str` under byte-indexed UTF-8 — the semantic audit
 
-> **Status: audit, complete. Three owner rulings open; nothing else in the module
+> **Status: audit, complete — and R1/R2 are now RULED and SHIPPED (Stage 2c).**
+> **§R1: `padStart`/`padEnd`'s `len` counts CODE POINTS.** The owner took the
+> recommendation below; `padFill` tiles code points and truncates on a character
+> boundary, and both padders measure with `cpLen()`. That also closed a hazard §R1
+> only half-saw: the old `repeat`+`slice` truncation became a BYTE slice under the
+> swap and would have emitted a partial sequence for a multi-byte pad.
+> **§R2: code-point boundaries**, i.e. today's answer preserved, exactly as this
+> document recommended and already implemented. **§R3 remains open** and still gates
+> nothing. Fixture for the ruling: `tests/cases/std/str-pad-codepoints.vl` — the other
+> `str-*.vl` files pin padding only through invariants that hold under either reading,
+> so a byte reading would have passed the whole suite.
+>
+> **Original status: audit, complete. Three owner rulings open; nothing else in the module
 > is undecided.** This document is what the string representation migration
 > (`docs/guide/strings-design.md` §Storage / §API, "Step 2") implements against
 > for `std/str.vl`. It classifies all 15 exports, states the property the search
@@ -300,7 +312,7 @@ claim someone will otherwise make on its behalf during the migration.
 
 ---
 
-## §R1 — Is `padStart`/`padEnd`'s `len` a byte count or a character count?
+## §R1 — Is `padStart`/`padEnd`'s `len` a byte count or a character count? **RULED: CODE POINTS**
 
 **The question.** `padStart(self, len, pad)` pads until `self` is `len` long.
 After §API, `self.length` is a byte count. `"héllo".padStart(8, " ")` gets 3
@@ -377,7 +389,7 @@ has no importer outside `std/fmt.vl` (whose `padLeft` delegates to `padStart`)
 and `tests/cases/std/str-*.vl`. Nothing in `compiler/*.vl` imports it. This
 ruling is at its cheapest right now and gets monotonically more expensive.
 
-## §R2 — What is a "boundary" for an EMPTY needle in `split` / `replaceAll`?
+## §R2 — What is a "boundary" for an EMPTY needle in `split` / `replaceAll`? **RULED: CODE POINTS**
 
 **The question.** `"abc".split("")` is `["a","b","c"]` and `"abc".replaceAll("",
 "-")` is `"-a-b-c-"`: an empty needle matches at every boundary. After §API,

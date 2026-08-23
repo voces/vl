@@ -111,10 +111,16 @@ const pushString = (push: (cp: number) => number, text: string) => {
   for (const ch of text) push(ch.codePointAt(0)!);
 };
 
+/**
+ * STAGE 2c: the element is a UTF-8 BYTE, not a code point. `String.fromCodePoint` over
+ * bytes renders every multi-byte character as its bytes read as Latin-1 (`—` becomes
+ * `â\u0080\u0094`), which is the same double-decode the Rust host had to stop doing —
+ * this is the sixth copy of that loop and the last one. Lossy by design (§Validity).
+ */
 const readString = (len: number, at: (j: number) => number): string => {
-  const cps = new Array<number>(len);
-  for (let j = 0; j < len; j++) cps[j] = at(j);
-  return String.fromCodePoint(...cps);
+  const bytes = new Uint8Array(len);
+  for (let j = 0; j < len; j++) bytes[j] = at(j);
+  return new TextDecoder().decode(bytes);
 };
 
 const exports: Exports | undefined = seedExists

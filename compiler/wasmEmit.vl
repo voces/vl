@@ -142,6 +142,7 @@ import {
   binOpcodeF32,
   binOpcodeF64,
   binOpcodeI64,
+  cpsToUtf8,
   decodeStr,
   directArgsBad,
   inferNicheNullByName,
@@ -232,9 +233,13 @@ import {
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
+  gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
   gHelpStrHash,
+  gHelpUtf8CpLen,
+  gHelpUtf8Dec,
+  gHelpUtf8Enc,
   gImports,
   gMemLogIdx,
   gPromoInStart,
@@ -463,7 +468,11 @@ import {
   exprIsF64,
   exprIsI64,
   exprIsLitAtom,
+  exprIsStrBytes,
+  exprIsStrCharBoundary,
   exprIsStrCharCode,
+  exprIsStrCpAt,
+  exprIsStrCpLen,
   exprIsStrConcat,
   exprIsStrEq,
   exprIsStrIndexOf,
@@ -4927,19 +4936,22 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
 // A `StrLit` carries the RAW lexeme in `strText` (surrounding quotes kept, escapes
 // UNRESOLVED — see `parser.vl`'s `mkStr` of the STRING token's raw text), so the emitter decodes it
 // here to the sequence of Unicode CODE POINTS the string denotes. Because a VL string's
-// ELEMENTS are code points (still true at Stage 2b — only the wrapper changed), `strText[i]` already
-// yields the i32 code point of the i-th source char, so decoding is a direct walk over
-// those code points with the same escape grammar the lexer applies (`scanQuoted`):
-// `\n \t \r \\ \" \' \0 \b \f \v`, `\xXX`, `\uXXXX`, `\u{…}`. The result is the
-// emittable code-point vector that `emitStr` lowers to `array.new_fixed`.
+// `strToCps` walks the raw lexeme by ITERATION (`for cp in s`), which yields code points under
+// both the pre- and post-Stage-2c representations, so decoding is a walk over code points with
+// the same escape grammar the lexer applies (`scanQuoted`):
+// `\n \t \r \\ \" \' \0 \b \f \v`, `\xXX`, `\uXXXX`, `\u{…}`. `cpsToUtf8` then encodes the
+// decoded code points into the UTF-8 BYTES the backing actually holds.
 
-// Lower a string literal `"abc"` onto `body`: decode `strText` to its code-point
-// vector, push each code point as `i32.const`, then `array.new_fixed $sBackIdx <count>` for
-// the backing and `struct.new $sTypeIdx` for the whole-backing header (Stage 2b). A literal
-// past the `array.new_fixed` operand cap builds the BACKING chunked
+// Lower a string literal `"abc"` onto `body`: decode `strText` to its code-point vector,
+// UTF-8-encode it, push each BYTE as `i32.const`, then `array.new_fixed $sBackIdx <count>`
+// for the packed `(array (mut i8))` backing and `struct.new $sTypeIdx` for the whole-backing
+// header. A literal past the `array.new_fixed` operand cap builds the BACKING chunked
 // (`arrLitChunkStart`/`arrLitChunkFlush`) and wraps once at the end — same value,
-// engine-valid module. The UTF-8 `array i8` storage migration (Stage 2c) is the deliberate
-// follow-up and is NOT built here.
+// engine-valid module.
+//
+// STAGE 2c: the cap is now counted in BYTES, because the operands are bytes. `collectStrPool`
+// applies the same byte budget to decide poolability, and the two must agree — a literal the
+// pool accepted but this rejected would be emitted twice under two different shapes.
 function emitStr(_body: i32[], strIx: i32, _fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string literal but array type not collected")
@@ -4954,7 +4966,7 @@ function emitStr(_body: i32[], strIx: i32, _fnIx: i32) {
       fbGlobalGet(pi) // the pool occupies global indices 0..pool-1
       return 0
     }
-    const cps = decodeStr(strToCps(s.strText))
+    const cps = cpsToUtf8(decodeStr(strToCps(s.strText)))
     if cps.length > NEW_FIXED_MAX {
       // Past the engines' `array.new_fixed` operand cap — build chunked (an
       // unchunked emit validates nowhere). The chunked build fills the BACKING;
@@ -9928,6 +9940,204 @@ function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string charCodeAt call")
 }
 
+// ── the Stage 2c code-point trio: `cpAt` / `cpLen` / `isCharBoundary` ─────────
+// All three read the UTF-8 STORAGE, which is the reason they are core intrinsics and the 15
+// `std:str` names are not (OQ-3): nothing writable in VL can see a byte as anything but a
+// byte. They ride the SAME lazy stash `s[i]` uses (`strHdrSlot` + `listIdxScratchBase`) and
+// therefore need no `exprHasStrOp` reservation arm — exactly the property `emitStrCharCode`
+// documents for itself.
+
+// Stash [receiver, index] off the wasm stack into the shared header/index slots. On entry
+// BOTH are fully evaluated (a nested string index inside either has already come and gone
+// through these slots — the nested-op discipline `strHdrSlot`'s header states). Returns the
+// header slot; the index is at `listIdxScratchBase`.
+function stashStrRecvIdx(_body: i32[]) {
+  const hs = strHdrSlot()
+  fbLocalSet(listIdxScratchBase) // the index
+  fbLocalSet(hs)                 // the header
+  hs
+}
+
+// Push the header's one-past-the-end BACKING offset, `start + len` — `__utf8_dec__`'s bound,
+// and the reason a sequence that runs off the end of a VIEW decodes to U+FFFD instead of
+// reading its sibling view's bytes.
+function pushStrHdrEnd(_body: i32[], hs: i32) {
+  fbLocalGet(hs)
+  fbStrStart()
+  fbLocalGet(hs)
+  fbStrLen()
+  fbI32Bin(106) // 0x6a i32.add
+  0
+}
+
+// Push the guarded BACKING offset of byte `i`: `start + i` when `i u< len`, else `-1`. The
+// SAME select `emitStrIdxGuard` builds, so an out-of-range `cpAt` traps exactly where an
+// out-of-range `s[i]` does rather than decoding a neighbour's bytes.
+function pushStrGuardedOff(_body: i32[], hs: i32) {
+  fbLocalGet(hs)
+  fbStrStart()
+  fbLocalGet(listIdxScratchBase)
+  fbI32Bin(106)  // i32.add → start + i
+  fbI32Const(-1) // the out-of-range replacement offset
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(hs)
+  fbStrLen()
+  fbI32Bin(73)   // 0x49 i32.lt_u — covers negative and past-len in one compare
+  wU8(27)        // 0x1b select
+  0
+}
+
+// Lower `s.cpAt(i)` — the code point whose UTF-8 sequence BEGINS at byte offset `i`, O(1).
+// `__utf8_dec__` returns `(width << 24) | cp`; only the code point is wanted here, so the
+// width is masked off. Offset `i` landing mid-sequence is not an error (§Validity): the byte
+// there is a continuation byte, which begins nothing, so the answer is U+FFFD.
+function emitStrCpAt(body: i32[], callIx: i32, fnIx: i32) {
+  if !aUsed {
+    return emitFail("emitProgram: string cpAt but array type not collected")
+  }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail("emitProgram: string .cpAt takes exactly one argument")
+    }
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      const hs = stashStrRecvIdx(body)
+      fbLocalGet(hs)
+      fbStrBack()
+      pushStrGuardedOff(body, hs)
+      pushStrHdrEnd(body, hs)
+      fbCall(gHelpUtf8Dec)
+      fbI32Const(16777215) // 0x00ffffff — drop the width, keep the code point
+      fbI32Bin(113)        // 0x71 i32.and
+      return 0
+    }
+    return emitFail("emitProgram: string .cpAt receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a string cpAt call")
+}
+
+// Lower `s.cpLen()` — the code-point count, one call into `__utf8_cplen__`. O(n), and the
+// call site says so.
+function emitStrCpLen(body: i32[], callIx: i32, fnIx: i32) {
+  if !aUsed {
+    return emitFail("emitProgram: string cpLen but array type not collected")
+  }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 0 {
+      return emitFail("emitProgram: string .cpLen takes no arguments")
+    }
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      fbCall(gHelpUtf8CpLen)
+      return 0
+    }
+    return emitFail(
+      "emitProgram: string .cpLen receiver is not a member access",
+    )
+  }
+  emitFail("emitProgram: expected a string cpLen call")
+}
+
+// Lower `s.isCharBoundary(i)` — Rust's primitive, O(1): does byte `i` BEGIN a UTF-8
+// sequence? True at `len` (the end of a view is a boundary), false past `len` or below 0,
+// and otherwise the lead/continuation bit test — a continuation byte is `10xxxxxx`,
+// everything else begins a sequence.
+//
+// RUST SPECIAL-CASES INDEX 0 AND THIS DELIBERATELY DOES NOT. Rust can: a `&str` is
+// guaranteed valid, so its byte 0 is never a continuation byte and the special case is a
+// free shortcut. A VL string carries no such guarantee (§Validity) — `"é→".slice(1, 4)`
+// starts on a continuation byte and is an ordinary legal value — so answering `true` at 0
+// unconditionally would report a boundary that is not one, on exactly the input this
+// function exists to detect. On every VALID string the two rules agree, because byte 0 of
+// valid UTF-8 is never a continuation byte.
+function emitStrIsCharBoundary(body: i32[], callIx: i32, fnIx: i32) {
+  if !aUsed {
+    return emitFail(
+      "emitProgram: string isCharBoundary but array type not collected",
+    )
+  }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 {
+      return emitFail(
+        "emitProgram: string .isCharBoundary takes exactly one argument",
+      )
+    }
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      const hs = stashStrRecvIdx(body)
+      // i == len — the end of the VIEW, never of the backing.
+      fbLocalGet(listIdxScratchBase)
+      fbLocalGet(hs)
+      fbStrLen()
+      fbI32Bin(70) // 0x46 i32.eq
+      fbIf(127)    // if (result i32)
+      fbI32Const(1)
+      fbElse()
+      // In range? (one unsigned compare covers negative and past-len.)
+      fbLocalGet(listIdxScratchBase)
+      fbLocalGet(hs)
+      fbStrLen()
+      fbI32Bin(73)  // 0x49 i32.lt_u
+      fbIf(127)
+      fbLocalGet(hs)
+      fbStrBack()
+      fbLocalGet(hs)
+      fbStrStart()
+      fbLocalGet(listIdxScratchBase)
+      fbI32Bin(106) // i32.add
+      fbArrayGet(sBackIdx)
+      fbI32Const(192)
+      fbI32Bin(113) // i32.and
+      fbI32Const(128)
+      fbI32Bin(71)  // 0x47 i32.ne
+      fbElse()
+      fbI32Const(0)
+      fbEnd()
+      fbEnd()
+      return 0
+    }
+    return emitFail(
+      "emitProgram: string .isCharBoundary receiver is not a member access",
+    )
+  }
+  emitFail("emitProgram: expected a string isCharBoundary call")
+}
+
+// Lower `s.bytes()` — one call into `__str_bytes__`, which `array.copy`s the view's byte
+// range into a fresh `u8[]`. `ba8Used` was forced by `scanPrintUse`'s `.bytes()` arm, which
+// is the ONLY thing that makes the packed pair exist for a program that spells no `u8[]`.
+function emitStrBytes(body: i32[], callIx: i32, fnIx: i32) {
+  if !aUsed || !ba8Used || gHelpStrBytes < 0 {
+    return emitFail(
+      "emitProgram: string bytes() but the packed byte-list types were not collected",
+    )
+  }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 0 {
+      return emitFail("emitProgram: string .bytes takes no arguments")
+    }
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      fbCall(gHelpStrBytes)
+      return 0
+    }
+    return emitFail(
+      "emitProgram: string .bytes receiver is not a member access",
+    )
+  }
+  emitFail("emitProgram: expected a string bytes call")
+}
+
 export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
   // STOP AFTER A RECORDED FAILURE. `emitFail` banks the first message and returns -1 for the
   // caller to propagate; it does NOT halt the pass. A caller that drops the -1 leaves emission
@@ -11303,12 +11513,25 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
       if callee.identName == "toString" {
         return emitToString(body, callIx, fnIx)
       }
-      // `fromCodePoints(xs)` (H2): bulk string construction — ONE array.copy of
-      // the list's live elements into an exact-length string array, instead of
-      // per-char concat (quadratic churn). Uses the string-op scratch frame
-      // (I0 = len, Out = the result) — `exprHasStrOp` reserves it. The list is
-      // re-read per use, so the argument must be a NAME (param/local/global);
-      // an arbitrary expression would need a list-typed temp slot.
+      // `fromCodePoints(xs)` (H2): bulk string construction — one call into the shared
+      // `__utf8_enc__` helper, which UTF-8-ENCODES the list's live code points into an
+      // exact-fit backing and wraps a whole-backing header around it.
+      //
+      // STAGE 2c CHANGED WHAT THIS OPERATION IS. It was one `array.copy` — a memcpy, because
+      // a string WAS an i32 array of code points. Under UTF-8 storage the unit differs on
+      // both sides of the boundary, so it has to encode; `strings-design.md` §Migration calls
+      // this "the largest semantic change in the bucket". The CONTRACT is unchanged and that
+      // is the point: each i32 is a CODE POINT, before and after. A caller that fills its
+      // buffer by `buf.push(s[i])` is now pushing BYTES and double-encodes with no type error
+      // — the §Builders defect the `std:str` audit found — which is why every builder in
+      // `std/` feeds itself by `for cp in s`.
+      //
+      // The str-op frame this used to stage `len` and the fresh backing in is no longer
+      // touched — the helper owns both. `exprHasStrOp`'s reservation arm STAYS: an unused
+      // slot costs a local, while removing a reservation is the direction that produces
+      // check-clean invalid wasm (§2.7 L2: "every recorded defect here was a missing arm,
+      // never a stale one"). The NAME restriction stays for the same reason — the wrapper is
+      // still read twice, once for `backing` and once for `len`.
       if callee.identName == "fromCodePoints" {
         if !aUsed || !lUsed {
           return emitFail(
@@ -11325,29 +11548,13 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if fcpN0 is Paren { fcpArg = fcpN0.parInner }
         const fcpNode = P.nodes[fcpArg]
         if fcpNode is Ident {
-          // I0 = xs.len
-          if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
-          fbStructGet(lTypeIdx, 1)
-          setStrScrI(body, 0)
-          // Out = array.new_default(I0) — the BACKING (an exact fit for the whole list),
-          // wrapped in a start-0 header once the copy has landed.
-          pushStrScrI(body, 0)
-          fbArrayNewDefault(sBackIdx)
-          fbLocalSet(strScratchBase + 2)
-          // array.copy Out 0 xs.backing 0 I0. The cross-type copy is legal because
-          // `array.copy`'s validation rule is on the STORAGE types (i32 ≤ i32), not on
-          // heap-type identity — the same reason it stayed a memcpy in Stage 2a.
-          pushStrScrRef(body, 2)
-          fbI32Const(0)
+          // __utf8_enc__(xs.backing, 0, xs.len)
           if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
           fbStructGet(lTypeIdx, 0)
           fbI32Const(0)
-          pushStrScrI(body, 0)
-          fbArrayCopy(sBackIdx, aTypeIdx)
-          pushStrScrRef(body, 2)
-          fbI32Const(0)
-          pushStrScrI(body, 0)
-          fbStrNew()
+          if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
+          fbStructGet(lTypeIdx, 1)
+          fbCall(gHelpUtf8Enc)
           return 0
         }
         return emitFail(
@@ -11355,9 +11562,12 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         )
       }
       // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
-      // string from an i32 code point. A VL string is a HEADER over an `(array i32)` of code
-      // points, so this is a length-1 backing wrapped in a whole-backing view — push the one
-      // i32 arg, `array.new_fixed $sBackIdx 1`, then `struct.new $sTypeIdx`.
+      // string from an i32 code point. Under UTF-8 storage that is 1 to 4 bytes, not one
+      // element, so it rides the SAME `__utf8_enc__` helper `fromCodePoints` does — a
+      // one-element i32 array wrapped around the argument and handed straight to it. Sharing
+      // the encoder is deliberate: a second, inlined width-and-shift ladder here is exactly
+      // the "one fact, two writings" shape that produces a silent disagreement (`'é'` from
+      // `fromCodePoint(233)` not equal to the literal `"é"`).
       if callee.identName == "fromCodePoint" {
         if !aUsed {
           return emitFail(
@@ -11370,10 +11580,10 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           )
         }
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-        fbArrayNewFixed(sBackIdx, 1) // 0xfb 0x08 <typeidx> 1 — the one-element backing
-        fbI32Const(0)
-        fbI32Const(1)
-        fbStrNew()                   // the whole-backing view over it
+        fbArrayNewFixed(aTypeIdx, 1) // the one-element CODE-POINT array
+        fbI32Const(0)                // start
+        fbI32Const(1)                // len
+        fbCall(gHelpUtf8Enc)
         return 0
       }
       // `print(x)` is a compiler builtin lowered to the host's import family:
@@ -15878,9 +16088,16 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   // `struct.get` out of a loop body (§Header).
   let fiSBack = -1
   let fiSEnd = -1
+  let fiSPk = -1
   if strSrc {
     fiSBack = strBackSlot()
     fiSEnd = strI32Slot()
+    // STAGE 2c: the packed `(width << 24) | cp` `__utf8_dec__` returns. The loop VARIABLE is
+    // still a code point — `for cp in s` keeps its surface exactly — but the STRIDE is now
+    // data-dependent, so the width has to survive the body to reach the increment at the
+    // bottom. Its own slot per loop (`strI32Slot` mints fresh), so a nested `for cp in t`
+    // inside the body cannot clobber the outer loop's stride.
+    fiSPk = strI32Slot()
     fbLocalGet(lIdx)
     fbStrBack()
     fbLocalSet(fiSBack)
@@ -15937,9 +16154,16 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   // v = backing[cursor] (a string element recovers its non-null ref). A STRING source reads
   // its HOISTED backing at a cursor that is already a backing offset; the code unit is an i32.
   if strSrc {
+    // pk = __utf8_dec__(backing, cursor, end) ; v = pk & 0x00ffffff
     fbLocalGet(fiSBack)
+    wU8(212) // 0xd4 ref.as_non_null — the hoist slot is nullable so it stays defaultable;
+    // `array.get` tolerated that, a CALL does not.
     fbLocalGet(iIdx)
-    fbArrayGet(sBackIdx)
+    fbLocalGet(fiSEnd)
+    fbCall(gHelpUtf8Dec)
+    fbLocalTee(fiSPk)
+    fbI32Const(16777215) // 0x00ffffff — strip the width, keep the code point
+    fbI32Bin(113)        // 0x71 i32.and
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 0)
@@ -15984,9 +16208,19 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     loopContDepth.pop()
     loopContLabel.pop()
   }
-  // cursor = cursor + 1
+  // cursor = cursor + <stride>. Every source but a string strides by one element; a STRING
+  // strides by the UTF-8 WIDTH of the sequence just decoded (1..4), which `__utf8_dec__`
+  // parked in the high byte of `fiSPk`. The width is never 0 — a byte that begins nothing
+  // decodes as a one-byte U+FFFD — so the loop always advances and always terminates,
+  // including over bytes no encoder produced (§Validity, Go-lean).
   fbLocalGet(iIdx)
-  fbI32Const(1)
+  if strSrc {
+    fbLocalGet(fiSPk)
+    fbI32Const(24)
+    fbI32Bin(118) // 0x76 i32.shr_u
+  } else {
+    fbI32Const(1)
+  }
   fbI32Bin(106) // 0x6a i32.add
   fbLocalSet(iIdx)
   fbBr(0)       // continue loop
@@ -17185,6 +17419,16 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
   if exprIsStrCharCode(exprIx, fnIx) {
     return emitStrCharCode(body, exprIx, fnIx)
   }
+  // The Stage 2c codec trio. Dispatched from the SAME ladder rung as `charCodeAt` because
+  // they are the same shape — a member call on a string receiver yielding a scalar — and a
+  // rung further down would sit past the `Map`/`Set`/`has`/`delete` arms that key on a bare
+  // property NAME.
+  if exprIsStrCpAt(exprIx, fnIx) { return emitStrCpAt(body, exprIx, fnIx) }
+  if exprIsStrCpLen(exprIx, fnIx) { return emitStrCpLen(body, exprIx, fnIx) }
+  if exprIsStrCharBoundary(exprIx, fnIx) {
+    return emitStrIsCharBoundary(body, exprIx, fnIx)
+  }
+  if exprIsStrBytes(exprIx, fnIx) { return emitStrBytes(body, exprIx, fnIx) }
   // G8: the `Map()` builtin constructs an empty string-keyed map. `Set()` is a
   // boolean-valued string map over the SAME 7-field struct, so it emits the
   // IDENTICAL empty-map construction.

@@ -166,11 +166,11 @@
 // `fromCodePoints`'s contract and is filled by iteration for exactly that
 // reason (see the buffer rule above).
 //
-// The two places the unit is still LOAD-BEARING, and therefore still open:
-// `padStart`/`padEnd`'s `len` argument, which is a width rather than an offset
-// and so has nothing to cancel against; and the EMPTY-needle rule in `split`/
-// `replaceAll`, which asks what a "boundary" is. Both are written up with
-// options and a recommendation in `docs/internals/str-byte-semantics.md`.
+// The two places the unit is LOAD-BEARING are now both RULED, and both ruled the
+// same way — CODE POINTS: `padStart`/`padEnd`'s `len`, which is a width rather
+// than an offset and so has nothing to cancel against (§R1), and the EMPTY-needle
+// boundary in `split`/`replaceAll` (§R2, which today's implementation already
+// satisfies because those loops iterate). Nothing else in this file names a unit.
 //
 // ── RELATIONSHIP TO `std:fmt` ──
 //
@@ -548,56 +548,79 @@ export function repeat(self: string, n: i32): string {
   fromCodePoints(buf)
 }
 
-// Exactly `n` index units of `pad`, tiled and truncated wherever the tiling
+// Exactly `n` CODE POINTS of `pad`, tiled and truncated wherever the tiling
 // lands — `padFill(3, "ab")` is `"aba"`. `n <= 0` or an empty `pad` yields
 // `""`, which is what makes both padders return their input untouched instead
 // of special-casing the two degenerate arguments twice.
 //
 // Truncating mid-tile rather than refusing a multi-character pad is what JS
-// does, and it is the behaviour that makes the result EXACTLY `len` long, which
+// does, and it is the behaviour that makes the result EXACTLY `len` wide, which
 // is the entire point of padding (a column that is sometimes one unit wider is
 // not a column).
 //
-// "INDEX UNIT", NOT "CHARACTER", AND THE TWO ARE THE SAME THING TODAY. `n`
-// arrives from `padStart`/`padEnd` as `len - self.length`, so whatever
-// `.length` counts is what this tiles — code points today, UTF-8 bytes after
-// `docs/guide/strings-design.md` §API lands. Spelling it `repeat` + `slice`
-// rather than `buf.push(pad[i % pad.length])` keeps it in lockstep with
-// `.length` through that change instead of pushing bytes into a code-point
-// buffer (see `pushStr`), and it is the same string today: `repeat("ab", 2)`
-// sliced to 3 is `"aba"`. **Whether `len` SHOULD be a byte count at all is an
-// open owner ruling** — `docs/internals/str-byte-semantics.md` §R1 lays out the
-// options and recommends code points, which every surveyed language including
-// byte-indexed Go uses for padding. If that ruling lands, this function and the
-// `self.length` in both padders move together; nothing else in the file does.
+// §R1 IS RULED, AND THE UNIT IS CODE POINTS. `docs/internals/str-byte-semantics.md`
+// §R1 laid out bytes / code points / two names and recommended code points; the
+// owner took it. The evidence is that not one surveyed language measures padding
+// in bytes except C, which is also the only one whose columns visibly misalign —
+// and Go, the byte-indexed language VL joins, went out of its way to differ from
+// C on exactly this point and said so in its documentation: *"Width and precision
+// are measured in units of Unicode code points, that is, runes. (This differs from
+// C's printf where the units are always measured in bytes.)"*
+//
+// §API's "one coordinate system" does not reach this. That argument is about
+// OFFSETS — `slice`, `indexOf`, regex match positions, the I/O boundary — which
+// must agree so no converter sits on a hot path. `len` is a WIDTH: it is never
+// handed to `slice`, never compared to a match position, never crosses a
+// boundary. There is nothing for it to be inconsistent with.
+//
+// SO THE TILING IS BY CODE POINT, WHICH ALSO CLOSES `padFill`'s OWN HAZARD: the
+// previous spelling truncated with `slice`, which now takes BYTE offsets, so a
+// multi-byte pad would have been cut mid-character and emitted a partial
+// sequence. Filling from a code-point vector cannot produce one.
 function padFill(n: i32, pad: string): string {
   if n <= 0 { return "" }
-  if pad.length == 0 { return "" }
-  if n <= pad.length { return pad.slice(0, n) }
-  // `return` is not optional here: a bare member CALL in tail position is
-  // `emitProgram: unsupported member-call statement` at emit time (checked;
-  // `docs/guide/strings-design.md` §Methods records the same shape).
-  return repeat(pad, (n + pad.length - 1) / pad.length).slice(0, n)
+  const tile: i32[] = []
+  for cp in pad { tile.push(cp) }
+  if tile.length == 0 { return "" }
+  const buf: i32[] = []
+  let i = 0
+  while i < n {
+    buf.push(tile[i % tile.length])
+    i = i + 1
+  }
+  fromCodePoints(buf)
 }
 
 // `self` padded on the LEFT with `pad` until it is `len` long.
 //
-// Returns `self` untouched when it is already `len` or longer — padding never
+// Returns `self` untouched when it is already `len` wide or wider — padding never
 // TRUNCATES, so `"hello".padStart(3, "0")` is `"hello"` and not `"hel"`. That
 // is JS's rule and the only safe one: a padder that shortened its input would
 // silently destroy data in exactly the logging and table-formatting code that
 // calls it. An empty `pad` is likewise a no-op rather than an infinite loop.
+//
+// `len` COUNTS CODE POINTS (§R1, ruled — see `padFill`), so the width is measured
+// with `cpLen()` and not with `.length`. That is O(n) and named so at the call
+// site, which is §Codepoints' own principle satisfied: `padStart` is a named
+// call, not a subscript, so paying for a data-dependent measurement inside it is
+// visible exactly where that principle wants it.
+//
+// Code points are still not DISPLAY width — a CJK character is two columns, a
+// combining mark is zero — and Go, Rust and Python all accept the same gap.
+// Grapheme- or width-correct padding belongs to `std:unicode` alongside
+// `graphemes()`; code points are the right floor beneath it, strictly better than
+// bytes and reachable without tables.
 export function padStart(self: string, len: i32, pad: string): string {
-  const fill = padFill(len - self.length, pad)
+  const fill = padFill(len - self.cpLen(), pad)
   if fill.length == 0 { return self }
   fill + self
 }
 
-// `self` padded on the RIGHT with `pad` until it is `len` long. Same rules as
-// `padStart`: never truncates, empty `pad` is a no-op, the result is exactly
-// `len` long whenever padding happened at all.
+// `self` padded on the RIGHT with `pad` until it is `len` wide. Same rules as
+// `padStart`: never truncates, empty `pad` is a no-op, `len` counts CODE POINTS,
+// and the result is exactly `len` code points wide whenever padding happened.
 export function padEnd(self: string, len: i32, pad: string): string {
-  const fill = padFill(len - self.length, pad)
+  const fill = padFill(len - self.cpLen(), pad)
   if fill.length == 0 { return self }
   self + fill
 }

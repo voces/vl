@@ -94,10 +94,13 @@ const loadString = (exp: Exports, load: (n: number) => number, s: string) => {
   }
 };
 
+// The INTAKE is UTF-32 code points; the READ-BACK accessor is bytes since Stage 2c, so
+// this side decodes rather than spreading. That asymmetry is the point of the round trip:
+// what goes in as code points must come back out as the same TEXT.
 const readString = (len: number, at: (j: number) => number): string => {
-  const cps = new Array<number>(len);
-  for (let j = 0; j < len; j++) cps[j] = at(j);
-  return String.fromCodePoint(...cps);
+  const bytes = new Uint8Array(len);
+  for (let j = 0; j < len; j++) bytes[j] = at(j);
+  return new TextDecoder().decode(bytes);
 };
 
 /** Round-trip a payload through the MODULE-KEY channel and read it back out.
@@ -188,8 +191,10 @@ Deno.test({
   name: "bulk intake: non-ASCII and astral code points survive the round trip",
   ignore,
   fn: () => {
-    // The pipe is UTF-32LE, so a BMP char and an astral one are one element
-    // each. A host that wrote UTF-16 code UNITS would pass ASCII and fail here.
+    // The INTAKE pipe is UTF-32LE, so a BMP char and an astral one are one element each
+    // on the way IN. A host that wrote UTF-16 code UNITS would pass ASCII and fail here.
+    // On the way back OUT the same text is UTF-8 bytes (Stage 2c), which is what makes
+    // this a round trip across the unit change rather than an identity check.
     const payload = "kÿ→漢字🙂/emoji🚀.vl";
     assertEquals(roundTripKey(payload, "load"), payload);
     assertEquals(roundTripKey(payload, "load"), roundTripKey(payload, "push"));

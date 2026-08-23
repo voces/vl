@@ -45,8 +45,15 @@ if (GATED && !ENABLED) console.warn("[vl-std-args] skipped — missing vl binary
 
 // The probe program: the whole vector, rendered so every property under test is
 // visible in one stdout. `n=` is the count; each line then carries the INDEX, the
-// argument bracketed (so an empty one is `[]` rather than nothing), and its length
-// in CODE POINTS (so a multi-byte argument is distinguishable from its byte count).
+// argument bracketed (so an empty one is `[]` rather than nothing), and BOTH of its
+// lengths — bytes (`.length`) and code points (`.cpLen()`).
+//
+// STAGE 2c MADE BOTH NUMBERS NECESSARY, and the reason is worth stating because the
+// old comment here now reads backwards. It said a length of 9 for `héllo→` would prove
+// the module "forgot to decode"; since `.length` counts BYTES, 9 is what a correctly
+// decoded string reports. The measure that still separates a decode from a non-decode is
+// `cpLen()`, and printing both is what keeps the test able to tell them apart: a module
+// that treated the argv bytes as code points would report 9 for BOTH.
 const ECHO = `import { programArgs } from "std:args"
 import { Utf8Error } from "std:utf8"
 
@@ -57,7 +64,10 @@ if args is Utf8Error {
   print("n=" + toString(args.length))
   let i = 0
   while i < args.length {
-    print(toString(i) + ":[" + args[i] + "]:" + toString(args[i].length))
+    print(
+      toString(i) + ":[" + args[i] + "]:" + toString(args[i].length) + ":" +
+        toString(args[i].cpLen()),
+    )
     i = i + 1
   }
 }
@@ -106,9 +116,9 @@ Deno.test({
   fn: async () => {
     await expect(["--", "one", "two", "three"], [
       "n=3",
-      "0:[one]:3",
-      "1:[two]:3",
-      "2:[three]:5",
+      "0:[one]:3:3",
+      "1:[two]:3:3",
+      "2:[three]:5:5",
     ]);
   },
 });
@@ -138,9 +148,9 @@ Deno.test({
   fn: async () => {
     await expect(["--", "", "x", ""], [
       "n=3",
-      "0:[]:0",
-      "1:[x]:1",
-      "2:[]:0",
+      "0:[]:0:0",
+      "1:[x]:1:1",
+      "2:[]:0:0",
     ]);
   },
 });
@@ -154,8 +164,8 @@ Deno.test({
   fn: async () => {
     await expect(["--", "héllo→", "naïve"], [
       "n=2",
-      "0:[héllo→]:6",
-      "1:[naïve]:5",
+      "0:[héllo→]:9:6",
+      "1:[naïve]:6:5",
     ]);
   },
 });
@@ -217,9 +227,9 @@ Deno.test({
     // The `--` spelling is unchanged, and carries every dash shape through verbatim.
     await expect(["--", "-v", "--long=1", "x"], [
       "n=3",
-      "0:[-v]:2",
-      "1:[--long=1]:8",
-      "2:[x]:1",
+      "0:[-v]:2:2",
+      "1:[--long=1]:8:8",
+      "2:[x]:1:1",
     ]);
   },
 });
