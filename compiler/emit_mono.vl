@@ -2070,9 +2070,23 @@ function monoMakeInstance(
           // to the lifted instance name would make a by-name call that drops the captured env. A
           // non-capturing instance keeps the by-name rename (a null env is fine), so the
           // named-function path stays byte-identical.
+          //
+          // THE SIBLING ARM THIS LADDER LACKED (#1821): the binding is REASSIGNED. The rename
+          // folds `v(10)` into a by-name call to the INITIALIZER's instance, which is faithful
+          // only while the binding still holds that initializer — a later `v = (n) => n + 2` is
+          // then invisible and every call after the FIRST answers the first lambda. `monoWalk`'s
+          // named-function fold already guards on exactly this (`monoNameIsAssigned`); the
+          // anon-lambda arm that reaches here did not, so the guard belongs on the rename the
+          // two arms share. Silent wrong ANSWER, not invalid wasm: `vl check --codegen` was
+          // clean and the module loaded and ran (#1821's `((i32) => i32) | Uz` witness, and the
+          // union-free `let v = (n) => n + 1` / `v = (n) => n + 2` twin).
+          //
+          // Only the count-0 rung needs it. `cal.identName == monoInstName[k]` is a by-NAME call
+          // whose rename is a no-op, so the arena scan is paid only by a call through a BINDING.
           let keepCallRef = false
-          if monoInstFe[k] == origFe {
+          if monoInstFe[k] == origFe && cal.identName != monoInstName[k] {
             if captureCountOf(origFe) > 0 { keepCallRef = true }
+            else if monoNameIsAssigned(cal.identName) { keepCallRef = true }
           }
           if !keepCallRef {
             if cal.identName != monoInstName[k] {
@@ -3374,6 +3388,26 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         i = i + 1
       }
       if !monoAnyBakedCallback(cbFnNames) { return 0 }
+      // #1821'S SIBLING RUNG, and the reason the fix is not one line: both renames below
+      // (the registry hit and the fresh specialization) point the call site at a
+      // specialization of the callee `fe` RESOLVED FROM THE BINDING'S INITIALIZER. That is
+      // faithful only while the binding still holds it — `let r = reduce1` / `r = reduce2` /
+      // `r(xs, add, 0)` answered `reduce1`'s bake for EVERY call, including the two after the
+      // write, at rc 0 from `vl check --codegen` and from the runtime. Unlike
+      // `monoInstantiate`'s rung there is no instance to keep: the ORIGINAL concrete function
+      // is never replaced (see the header), so declining the specialization simply leaves the
+      // `call_ref` through the binding, which is what a written cell requires.
+      //
+      // Placed AFTER the bakeable-callback gate, so the only call it can decline is one that
+      // would really have been specialized: a call BY NAME (`reduce(…)`) names the
+      // declaration rather than a binding and never reaches it, which is why the corpus and
+      // every existing specialization stay byte-identical.
+      const spCal = P.nodes[c.callFn]
+      if spCal is Ident {
+        if spCal.identName != fn.fnName && monoNameIsAssigned(spCal.identName) {
+          return 0
+        }
+      }
       // Key on the callee + each baked callback identity, so `reduce(xs, add, …)` and `reduce(xs,
       // mul, …)` get distinct specializations. The `C` prefix keeps these out of the generic keyspace
       // (which always carries a `#`), so the two registries share storage without colliding.
