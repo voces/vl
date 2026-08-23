@@ -1,17 +1,39 @@
 // `std:utf8` — the boundary between VL's strings and the byte world.
 //
-// WHY THIS MODULE EXISTS. A VL `string` is a sequence of Unicode CODE POINTS:
-// `s.length` counts code points, `s[i]` and `s.charCodeAt(i)` yield the whole
-// code point, and `fromCodePoints` builds one back from an `i32[]`. A `u8[]` is
-// a sequence of BYTES — `u8` is a STORAGE type, so an element is one byte that
-// reads out widened to `i32` (0..255) and truncates on write, the same split
-// wasm itself makes between i8 as an array element and i8 as a value, which
-// does not exist. Files, paths, argv, stdin and every other boundary VL will
-// grow are bytes; UTF-8 is the conversion between the two worlds, and it has to
-// be written exactly once. It lives in its own module rather than privately
-// inside `std:fs` because `std:fs` is merely the FIRST consumer, and a private
-// copy is how a program ends up with two decoders holding two different
+// WHY THIS MODULE EXISTS. A VL `string` is TODAY a sequence of Unicode CODE
+// POINTS: `s.length` counts code points, `s[i]` and `s.charCodeAt(i)` yield the
+// whole code point, and `fromCodePoints` builds one back from an `i32[]`. A
+// `u8[]` is a sequence of BYTES — `u8` is a STORAGE type, so an element is one
+// byte that reads out widened to `i32` (0..255) and truncates on write, the same
+// split wasm itself makes between i8 as an array element and i8 as a value,
+// which does not exist. Files, paths, argv, stdin and every other boundary VL
+// will grow are bytes; UTF-8 is the conversion between the two worlds, and it
+// has to be written exactly once. It lives in its own module rather than
+// privately inside `std:fs` because `std:fs` is merely the FIRST consumer, and a
+// private copy is how a program ends up with two decoders holding two different
 // opinions about invalid input.
+//
+// THE WORD "TODAY" IN THAT PARAGRAPH IS LOAD-BEARING, and the whole audit of
+// this module is `docs/internals/utf8-byte-ready.md`. `strings-design.md`
+// §Storage makes a string's backing UTF-8 BYTES; §API makes `s[i]` a byte and
+// `.length` a byte count; §Codepoints moves code points to `for cp in s` /
+// `s.cpAt(i)` / `s.cpLen()`. When that lands, the two worlds this module
+// converts between STOP BEING TWO WORLDS at the level of storage, and the
+// module's job shrinks to the part that is not storage:
+//
+//   `utf8Length(s)`  becomes  `s.length`      — an O(n) count becomes O(1)
+//   `encodeUtf8(s)`  becomes  `s.bytes()`     — an O(n) transcode becomes an
+//                                               O(1) zero-copy view (§Byte view)
+//   `decodeUtf8`/`decodeUtf8At`/`decodeUtf8Lossy` and `Utf8Error` STAY, because
+//   §Validity is deliberately Go-lean — the CORE does no validation at the host
+//   boundary and lets malformed bytes decode leniently to U+FFFD. VALIDATION,
+//   POSITIONED ERROR REPORTING AND SANITIZATION ARE THIS MODULE'S REMAINING JOB,
+//   and there is nothing in the core that will ever do them.
+//
+// The two exports that collapse are also the only two that read a `string`, and
+// they are written by ITERATION rather than by INDEX for exactly that reason —
+// see `encodeUtf8`. Everything else here takes a `u8[]`, which is already bytes
+// and therefore does not move at all.
 //
 // THE INVALID-INPUT RULING, both directions, because it is the whole design:
 //
@@ -47,11 +69,27 @@
 
 // A decode failure, carrying the position AND the offending byte.
 //
-// `at` is the byte offset of the failure WITHIN THE DECODED RANGE — relative to
-// the `off` that was passed in, never an absolute index — so it stays meaningful
-// to a caller decoding a slice out of a larger array. `byte` is the lead byte
-// that could not be decoded, which was previously only stringified into `msg`
-// and so could not be inspected without parsing prose.
+// `at` is a BYTE OFFSET — RULED, not merely inherited; see
+// `docs/internals/utf8-byte-ready.md` §at. It is the offset of the failure
+// WITHIN THE DECODED RANGE — relative to the `off` that was passed in, never an
+// absolute index — so it stays meaningful to a caller decoding a slice out of a
+// larger array. That is Rust's `Utf8Error::valid_up_to()`, which is likewise
+// relative to the slice handed to `from_utf8`. `byte` is the lead byte that
+// could not be decoded, which was previously only stringified into `msg` and so
+// could not be inspected without parsing prose.
+//
+// BYTES IS THE ANSWER AFTER §API TOO, AND THE REASON IS THAT IT WAS NEVER
+// ANYTHING ELSE. The input is a `u8[]`; `at` counts positions in a byte array,
+// so there is no code-point reading of it to lose. What CHANGES is that it stops
+// being an offset in a foreign coordinate system and becomes one in the ONLY
+// coordinate system (§API: byte offsets are what `slice` takes, what `indexOf`
+// returns, and what `std:regex` will report) — so `s.slice(0, e.at)` is the
+// valid prefix, with no converter. It also acquires a second reading it does not
+// have today: because UTF-8 storage makes decode a byte identity, `at` is
+// simultaneously the byte LENGTH of the successfully decoded prefix. Today those
+// two numbers differ for any non-ASCII prefix. Pinned in
+// `tests/cases/std/utf8-invariant.vl` §6 as `at == encodeUtf8(prefix).length`,
+// which is true on both sides of the swap.
 //
 // `byte` IS ALSO WHAT KEEPS THIS TYPE DISTINCT. `error-handling-design.md` §90
 // blesses `ParseError = { at: i32, msg: string }`, and VL aliases are
@@ -70,6 +108,18 @@ const REPLACEMENT = 0xFFFD
 // an i32 can hold: below the range, above it, and the surrogate block
 // D800..DFFF — which UTF-8 must never carry (a codec that accepts them is
 // CESU-8/WTF-8, not UTF-8).
+//
+// THE SWAP TAKES THIS RULING AWAY FROM THIS MODULE AND HANDS IT TO THE CORE, and
+// that hand-over is an item on `utf8-byte-ready.md`'s checklist rather than a
+// detail. `fromCodePoints` stores a non-scalar VERBATIM today — measured:
+// `fromCodePoints([0xD800]).charCodeAt(0)` is 55296, `[0x110000]` is 1114112,
+// `[-1]` is -1 — which is only possible because the backing is `i32`. Once the
+// backing is UTF-8 bytes there is no such storage, so `fromCodePoints` itself
+// must substitute, trap, or drop. It matters that it picks SUBSTITUTE: `print`
+// already DROPS non-scalars (`print(fromCodePoints([97, 0xD800, 98]))` writes
+// `ab`) while `encodeUtf8` substitutes U+FFFD, so the tree already holds the two
+// different opinions about invalid input this module's header exists to prevent
+// — and the swap is the moment one of them has to win.
 function scalar(cp: i32) {
   if cp < 0 { return REPLACEMENT }
   if cp > 0x10FFFF { return REPLACEMENT }
@@ -90,27 +140,38 @@ function utf8Width(cp: i32) {
 }
 
 // `s.utf8Length()` — the exact length of `s.encodeUtf8()`, WITHOUT encoding it.
-// Distinct from `s.length`, which counts code points: the two agree for ASCII
-// and for nothing else. Exported because it is the only way to answer "how big
-// will this be on the wire" — a size check, a quota, a header field — short of
-// producing the bytes and throwing them away.
+// Distinct from `s.length`, which counts code points TODAY and bytes after the
+// §Storage swap: the two agree for ASCII and for nothing else, and the direction
+// of the disagreement is about to flip. Exported because it is the only way to
+// answer "how big will this be on the wire" — a size check, a quota, a header
+// field — short of producing the bytes and throwing them away.
+//
+// **It iterates, it does not index** — see `encodeUtf8` for why, and
+// `docs/internals/utf8-byte-ready.md` for the fact that this export collapses to
+// `self.length` the day the swap lands.
 export function utf8Length(self: string) {
   let n = 0
-  let i = 0
-  while i < self.length {
-    n = n + utf8Width(self.charCodeAt(i))
-    i = i + 1
-  }
+  for cp in self { n = n + utf8Width(cp) }
   n
 }
 
 // `s.encodeUtf8()` — `s` as UTF-8 bytes. Total: a non-scalar element encodes as
 // U+FFFD (this module's header).
+//
+// THE LOOP IS `for cp in self`, NOT `while i < self.length`, AND THAT IS LOAD-
+// BEARING. The body is an ENCODER: every branch of it reads its input as a CODE
+// POINT and writes BYTES. `for cp in self` yields code points today and
+// `strings-design.md` §Codepoints keeps it yielding code points after `s[i]` and
+// `.length` become byte-valued — so producer and consumer are a matched pair
+// whose meanings move together. The indexed spelling agreed only by coincidence:
+// the day `charCodeAt` reads a byte, `"é"` (C3 A9) would encode as C3 83 C2 A9,
+// which is the double-encoding defect `docs/internals/str-byte-semantics.md`
+// §Builders found in `std:str`. Same class, opposite direction, no type error to
+// catch it — a byte and a code point are both `i32`.
 export function encodeUtf8(self: string): u8[] {
   const out: u8[] = []
-  let i = 0
-  while i < self.length {
-    const c = scalar(self.charCodeAt(i))
+  for cp in self {
+    const c = scalar(cp)
     if c < 0x80 {
       out.push(c)
     } else if c < 0x800 {
@@ -126,7 +187,6 @@ export function encodeUtf8(self: string): u8[] {
       out.push(0x80 | ((c >> 6) & 0x3F))
       out.push(0x80 | (c & 0x3F))
     }
-    i = i + 1
   }
   out
 }
@@ -245,6 +305,18 @@ export function decodeUtf8At(
 
 // `b.decodeUtf8Lossy()` — the whole array, with one U+FFFD per maximal
 // ill-formed subpart. Total: there is no input this rejects.
+//
+// AFTER §STORAGE THIS STOPS BEING A DECODER AND BECOMES A SANITIZER, and the
+// distinction is the reason it does not collapse into the core's lenient wrap.
+// §Validity is Go-lean: a string is bytes that are *usually* UTF-8, so the core
+// will happily wrap ill-formed bytes and let them read as U+FFFD only at the
+// moment something iterates them. That wrap KEEPS THE ORIGINAL BYTES — `s.bytes()`
+// hands them back unchanged, and `s.length` counts them. This function REWRITES
+// them: what comes out is guaranteed well-formed UTF-8, whose bytes are EF BF BD
+// where the bad bytes were, and the original is gone. Go draws the same line
+// between `string(b)` and `strings.ToValidUTF8`. A caller who wants "show me
+// something" wants the wrap; a caller who wants "give me bytes I can hand onward
+// as text" wants this.
 export function decodeUtf8Lossy(self: u8[]) {
   const r = decodeCore(self, 0, self.length, true)
   // Unreachable: the lossy path substitutes rather than returning the error arm.

@@ -864,8 +864,20 @@ encode/decode surfaces as a fixpoint break rather than passing silently.
 > is code points — so the day `s[i]` becomes a byte, `join`/`replaceAll`/`repeat`/
 > `padStart`/`padEnd`/`toUpperAscii`/`toLowerAscii` all start double-encoding, with no
 > type error, because a byte and a code point are both `i32`. Measured on today's
-> build: `fromCodePoints([195, 169])` is `"Ã©"`.) **`std/utf8.vl` has the same defect
-> class and is NOT yet audited.**
+> build: `fromCodePoints([195, 169])` is `"Ã©"`.) **`std/utf8.vl` had the same defect
+> class in 2 of its 5 exports and is NOW AUDITED —
+> `../internals/utf8-byte-ready.md`.** `utf8Length` and `encodeUtf8` both indexed
+> a string and are repaired the same way, byte-identically on today's build; the
+> other three exports take a `u8[]` and are untouched by the swap. The module
+> does **not** collapse: §Validity's Go-lean ruling means the core will never
+> validate, so strict decode, positioned `Utf8Error` reporting and WHATWG
+> sanitization stay its job — 2 of 5 exports become core one-liners, 3 stay.
+> That audit ruled `Utf8Error.at` (a byte offset, relative to `off`) and filed
+> three questions the swap forces on the **CORE** — `../internals/open-rulings.md`
+> §B `utf8-byte-swap-core-rulings` — of which the one that fails silently is what
+> `fromCodePoints` does with a non-scalar element once there is no `i32` to store
+> it in. Its companion fixture `tests/cases/std/utf8-invariant.vl` is to
+> `std:utf8` what `str-multibyte.vl` is to `std:str`.
 >
 > The audit also verified this document's own load-bearing claim rather than
 > restating it: *a substring match IS a byte match* holds — 73,800 exhaustive

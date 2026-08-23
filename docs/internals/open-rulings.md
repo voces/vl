@@ -155,6 +155,35 @@ Repro: `const d: f64 = 100000000000.0; const i = d as i32` → `vl run` rc 1, `E
 
 </details>
 
+### utf8-byte-swap-core-rulings
+
+**Three CORE questions the `std:utf8` audit found the byte-indexed-UTF-8 swap cannot answer for itself — what `fromCodePoints` does with a non-scalar, whether `s.bytes()` is writable, and whether `encodeUtf8` returns raw or sanitized bytes**  
+`docs/internals/utf8-byte-ready.md` §NonScalar / §Ownership / §Wrap (the full audit; per-export table at §Exports)
+
+**The question.** `str-byte-semantics.md`'s checklist item 6 asked for `std/utf8.vl` to be audited before Step 2 ships. It has been. Two of the five exports were broken by the swap (`utf8Length`, `encodeUtf8` — both indexed a string; repaired byte-identically in the same change), three were untouched (`decodeUtf8`, `decodeUtf8At`, `decodeUtf8Lossy` are `u8[]`-domain), and the audit's `at`-coordinate question ruled itself (bytes, and it always was — §at). What it could **not** rule are three questions that belong to the CORE:
+
+- **N1 — what does `fromCodePoints` do with a non-scalar element after the swap?** Today it stores it VERBATIM; measured on this build, `fromCodePoints([0xD800]).charCodeAt(0)` is 55296, `[0x110000]` is 1114112, `[-1]` is -1. That is only possible because the backing is `i32`. Once it is UTF-8 bytes there is no such storage, so the core must substitute, trap, or drop. **The tree already holds two different answers**: `encodeUtf8` substitutes U+FFFD while `print` DROPS (`print(fromCodePoints([97, 0xD800, 98]))` writes exactly `ab` — `hexdump -C` of stdout is `61 62 0a`). **This one fails silently** — drop and substitute both produce a perfectly valid string.
+- **N2 — is `s.bytes()` writable?** §Byte view specifies it as a zero-copy view justified by string immutability, but that justification is one-directional: it establishes the string cannot change under the view, not that the view cannot change under the string. `u8[]` is demonstrably mutable — measured, `const b = encodeUtf8("hello"); b[0] = 74; b.push(33)` yields `"Jello!"` at length 6. If `bytes()` is writable, string immutability is breakable from ordinary VL in two lines, and §Equality's cached hash rests on it.
+- **N3 — does `encodeUtf8` return RAW bytes (a view, possibly malformed under Go-lean §Validity) or SANITIZED bytes (a copy, always well-formed)?** It decides `utf8Length`'s fate with it: the module's stated no-drift invariant ties the measurement to the encoder, so raw ⇒ `utf8Length` is exactly `.length` and should be deleted; sanitized ⇒ it stays an O(n) function that disagrees with `.length` on malformed input.
+
+**Options.** N1: (i) substitute U+FFFD; (ii) trap; (iii) drop (what `print` does today). N2: (i) read-only view — needs a read-only array notion VL lacks, or a discipline; (ii) writable view — O(1) but breaks immutability; (iii) copy — safe, gives up the O(1) claim §Byte view makes. N3: (i) raw; (ii) sanitized.
+
+**Recommendations.** N1 → **substitute U+FFFD**, and bring `print` into line. It matches the shipped `encodeUtf8` ruling and its argument (a fallible constructor infects every caller for an input no correct program produces, and must still emit *some* bytes), matches WHATWG, and makes *"every string `fromCodePoints` produces is well-formed UTF-8"* true by construction. Trapping is the defensible alternative and should be rejected explicitly rather than by omission — it turns a `u8[]` → `i32[]` → `string` pipeline into a panic on data. N2 → **read-only**, with `encodeUtf8` kept as the named wrapper so the ownership change has somewhere to be documented; nothing in the tree mutates an `encodeUtf8` result today (`std/fs.vl` hands all five straight to a host builtin), so it is safe to make now and a silent contract change for any future caller if it is not. N3 → **raw**: §Byte view already specifies `bytes()` as the raw zero-copy view and `encodeUtf8` should not be a different, costlier operation wearing the same shape; a caller wanting the guarantee composes `decodeUtf8Lossy(s.bytes())` and pays visibly, which is §Codepoints' own principle.
+
+**Blocked while unruled.** Nothing today — a string can hold a non-scalar and everything works. Step 2 of the strings migration is what is parked: collapsing `utf8Length`/`encodeUtf8` onto the core surface before N1 is answered creates a silent data-loss path (a dropping `fromCodePoints` plus a raw-bytes `encodeUtf8`).
+
+**Reversible?** N1 and N3 cheaply, right now; N1 becomes a semantic change to shipped behaviour afterwards. N2 is the one-way one: shipping a writable `bytes()` and narrowing it later breaks callers, while shipping it read-only and widening later does not.
+
+**Cost if taken.** N1: the substitution already exists as `scalar()` in `std/utf8.vl` — moving it into `fromCodePoints`'s lowering is porting three comparisons; `print`'s alignment is host-side. N2: unpriced; the cheap form is a discipline plus a doc line, the expensive form is a read-only array type. N3: (i) is a deletion and a one-line body; (ii) is the status quo cost.
+
+**Cost of waiting.** N1 only, and only from Step 2 onward: ship the swap unruled and `fromCodePoints` acquires whatever the emitter happens to do, with no diagnostic and a valid-looking string either way.
+
+<details><summary>verification</summary>
+
+Open at this commit. `grep -rn '"bytes"\|"cpAt"\|"cpLen"\|"backwards"\|"isCharBoundary"\|"compact"' compiler/*.vl` → **zero hits**: none of §Codepoints'/§Byte view's methods exists yet, so N2 and N3 are genuinely ahead of the code rather than describing shipped behaviour. The core string surface today is four members — `slice`, `indexOf`, `includes`, `charCodeAt` (`compiler/check_query.vl:516-519`). `fromCodePoints`'s signature `(i32[]) => string` at `compiler/driver.vl:1123`. No ruling elsewhere: `grep -n -i 'fromCodePoints\|non-scalar\|surrogate' DECISIONS.md ROADMAP.md` finds no unit or substitution ruling; `strings-design.md` §Validity rules the *decode* direction (Go-lean, U+FFFD) and is silent on the *construction* direction, and §Byte view's immutability argument is quoted in full in the audit and does not reach N2. The three measurements above (verbatim non-scalar storage, `print` dropping, `encodeUtf8`'s result being mutable and growable) were run on this build with `scripts/vl-host/target/release/vl run … --compiler build/vl-compiler.wasm`; the `print` row is a `hexdump -C` of the process's stdout, not a terminal reading.
+
+</details>
+
 ---
 
 ## C. Ergonomics, naming and future extensions — blocks nothing
