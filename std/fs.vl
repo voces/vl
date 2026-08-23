@@ -1,0 +1,389 @@
+// `std:fs` — the filesystem, and VL's first FALLIBLE std module.
+//
+// Everything before this module was total: `std:fmt`, `std:array` and
+// `std:buffer` either answer or trap, because a bad index is a BUG. A missing
+// file is not a bug. It is a normal program state that the caller must be able
+// to handle, and `docs/error-handling-design.md` (owner-ruled 2026-07-26) says
+// how VL spells that: **errors are values, carried in the return type as a
+// union**. There is no `throw` here, no `try`, and nothing to catch. `__trap__`
+// appears in this file exactly zero times.
+//
+// THE THREE LAYERS, and which one each function uses:
+//   - `T | null`    — expected absence, no reason to carry. Not used for I/O
+//                     failure; used for "the operation succeeded and has
+//                     nothing to report" (`writeFile` returns `IoResult`, which
+//                     is `IoError | null`).
+//   - `T | IoError` — reasoned failure. Every read/list/stat surface.
+//   - trap          — a bug. Not reachable from anything in this module.
+//
+// `IoError = { code: i32, msg: string }` is the ruled I/O shape: `code` is the
+// WASI errno (`ENOENT` = 44, and the constants below name the ones worth
+// testing), `msg` is a human sentence naming the operation and the path. The
+// design doc's FLOOR shape is `{ msg: string }` and `IoError` is meant to
+// extend it; be warned that at this compiler head the extension does not
+// interoperate the way the doc implies — a value of shape `{code, msg}` does
+// NOT satisfy a `{msg}` parameter (structural width subtyping is a codegen
+// reject), and `x is Err` over a union whose arm is `IoError` is a hard type
+// error rather than a match. So a caller handles `IoError` by name, and a
+// function that wants to accept "any error" must spell the union.
+//
+// THE LADDER, and what it becomes. The `as` trio (`as` propagates, `as?`
+// coalesces to null, `as!` traps) is RULED but NOT BUILT — union-operand `as` is
+// still `` `as` supports numeric conversions only `` at this head. So callers
+// write the explicit check today:
+//
+//     function head(p: string): string | IoError {
+//       const src = readTextFile(p)
+//       if src is IoError { return src }      // re-raise, unchanged
+//       return src.slice(0, 80)               // `src` is a string here
+//     }
+//
+// and the same function, once the trio lands, is:
+//
+//     function head(p: string): string | IoError {
+//       return (readTextFile(p) as string).slice(0, 80)
+//     }
+//
+// This module is the consumer that boilerplate is supposed to be measured on.
+// Every `is IoError { return e }` below is one rung of it.
+//
+// NAMING, AND TWO DELIBERATE BREAKS WITH THE REST OF std. Both are required
+// reading before "fixing" them, per `docs/internals/std-api-review.md`.
+//
+// (1) NOT `self`-FIRST, so these are free functions and not UFCS methods. `self`
+// is not a style convention in VL — it is the UFCS SWITCH, matched by the
+// compiler on the literal parameter name, so a first parameter named `path` makes
+// method syntax unspellable. That is the point: the thing operated on here is the
+// FILE, not the string naming it, and `"hello".readTextFile()` would type-check
+// and be nonsense. Naming the parameter `path` removes that spelling by
+// construction rather than by convention.
+//
+// (2) NOUN-FIRST for the two questions — `pathKind` and `pathExists`, not `kind`
+// and `exists`. VL has no namespace import, so every export lands in the
+// importer's flat top-level scope and a bare `exists` collides with every other
+// existence check a program has. The prefix also marks the real split in this
+// module: `readFile`/`writeFile`/`listDir` OPERATE ON a file, while these two ASK
+// ABOUT a path. `pathKind` is deliberately not `stat`, because `stat` promises
+// POSIX's `stat` — size, mtime, mode — and this returns only file-or-directory;
+// a name that overpromises spends the good name before the feature arrives.
+//
+// WHAT CROSSES THE FLOOR. The intrinsics take and return `u8[]` — packed GC byte
+// arrays, no linear memory, no pointers, no capacities, no size negotiation.
+// Paths cross as UTF-8 bytes because that is what POSIX actually stores, and
+// file CONTENT crosses as bytes because a file is bytes: a PNG, a `.wasm` and a
+// zip are not text and must survive a round trip. Text is a DECODING on top,
+// which is why `readFile`/`readTextFile` are two functions with two types and
+// not one function with a flag. `std:utf8` owns the conversion and the
+// invalid-input policy in both directions.
+//
+// WHAT THIS MODULE DOES NOT DO. No path manipulation (join, normalize, extension
+// — that is a future `std:fs/path`, and until it exists `dir + "/" + name` is
+// the join). No open file handles, no seeking, no streaming, no partial reads:
+// every read here is whole-file, so a file larger than memory is not readable
+// through this surface. No metadata beyond file-or-directory — no size, no
+// mtime, no permissions, because the floor does not carry them. No mkdir, no
+// remove, no rename, no symlink inspection. Each of those is a floor intrinsic
+// that does not exist yet, and adding a std wrapper for a syscall VL cannot make
+// would be a name that fails at emit.
+//
+// CONCURRENCY AND TOCTOU. Nothing here is atomic against another process. A
+// path that `pathExists` reported yesterday can be gone by the next line, which is
+// why nothing in this module pre-checks on the caller's behalf: `readFile` does
+// not stat first to produce a prettier error, it just reads and reports what the
+// host said. A pre-check would cost a syscall and buy a race.
+
+import { Utf8Error, decodeUtf8, decodeUtf8At, encodeUtf8 } from "std:utf8"
+
+// The blessed I/O error shape (`docs/error-handling-design.md` O3). `code` is
+// the WASI errno as a POSITIVE number — the floor reports `-errno` and this
+// module negates once, at the boundary, so a caller never sees a sign
+// convention.
+export type IoError = { code: i32, msg: string }
+
+// The result of an operation that has NOTHING to report when it succeeds: a
+// reason, or `null` for "it worked". This is the `T | null` layer of the ruled
+// model doing exactly what it is for — a successful whole-file write has no
+// value to hand back, and inventing one (a byte count the floor never reported,
+// a boolean that is only ever `true`) would be fabricating information.
+//
+// Spelled as a NAMED alias rather than inline as `IoError | null` in each
+// signature, and that is a constraint rather than a preference: a struct that
+// appears both in an inline `S | null` and in some other union in the same
+// module fails at emit with `ref valtype with no interned shape`. The
+// declaration route interns the shape; the inline one does not.
+export type IoResult = IoError | null
+
+// What a path names. A literal union rather than a struct or an i32: it is one
+// closed question with two answers today, `match` dispatches it exhaustively,
+// and a third answer (`"symlink"`) is a one-word edit that makes every existing
+// `match` fail loudly instead of silently falling through.
+export type FileKind = "file" | "dir"
+
+// The errno numbers worth naming, in WASI preview1's numbering (which is what
+// the host reports and what `docs/error-handling-design.md` already uses when it
+// writes `{ code: 44, msg: "no such file" }`). These are the codes a program
+// actually branches on; the rest are rendered by number.
+export const EACCES = 2
+export const EILSEQ = 25
+export const EINVAL = 28
+export const EIO = 29
+export const EISDIR = 31
+export const ENOENT = 44
+export const ENOSPC = 51
+export const ENOTDIR = 54
+export const EPERM = 63
+
+// The errno as a short name, or `"errno N"` for everything else. Deliberately
+// not a 76-arm table: these are the ones a caller can do something about, and a
+// number is a perfectly good rendering of a code nobody branches on.
+function errName(code: i32) {
+  if code == EACCES { return "EACCES (permission denied)" }
+  if code == EILSEQ { return "EILSEQ (invalid byte sequence)" }
+  if code == EINVAL { return "EINVAL (invalid argument)" }
+  if code == EIO { return "EIO (i/o error)" }
+  if code == EISDIR { return "EISDIR (is a directory)" }
+  if code == ENOENT { return "ENOENT (no such file or directory)" }
+  if code == ENOSPC { return "ENOSPC (no space left on device)" }
+  if code == ENOTDIR { return "ENOTDIR (not a directory)" }
+  if code == EPERM { return "EPERM (operation not permitted)" }
+  "errno " + toString(code)
+}
+
+// The one message shape, so every error out of this module reads the same and a
+// grep for one of them finds all of them. The operation is named because the
+// path alone does not say whether the read or the decode failed.
+function failed(op: string, path: string, code: i32) {
+  "fs." + op + " " + path + ": " + errName(code)
+}
+
+// The errno for a floor call that answered EMPTY.
+//
+// This is the one piece of GLOBAL STATE in the module's contract, and it is a
+// DEVIATION knowingly taken: `std-api-review.md` §2 flags ambient state, and the
+// rule there is that the header must name the constraint that forced it.
+//
+// The constraint was that neither in-band shape lowered — `u8[] | i32` was
+// check-clean invalid wasm and `u8[] | null` declined — so the reason had no
+// way to travel with the result and had to go out of band through
+// `__fs_errno__()`. Read it IMMEDIATELY after the failed call and never
+// otherwise.
+//
+// THAT CONSTRAINT HAS SINCE LIFTED (#1806 shipped `u8[]` into the union box's
+// kind vocabulary, so `u8[] | i32` now lowers and runs), and this wrapper is why
+// the swap is cheap: an in-band floor changes `emptyErrno` and its three callers
+// rather than every caller of the module. It is deliberately NOT taken in the
+// same change that introduces the module — swapping the floor means re-cutting
+// the intrinsics and both hosts, and the protocol below is correct as it stands.
+//
+// RETURNS 0 WHEN THE LAST CALL DID NOT FAIL, and that zero is load-bearing: the
+// floor reports failure by answering an EMPTY `u8[]`, which an empty FILE and an
+// empty DIRECTORY also produce. The errno is what tells those apart, so a zero
+// must reach `readOk` intact rather than being folded to `EIO` the way the
+// i32-returning `__fs_write__`/`__fs_stat__` paths fold theirs — there, a call
+// has already declared itself failed and a zero would be a contract violation;
+// here a zero is the ordinary answer.
+//
+// A negative errno is folded rather than propagated, so a floor that reports
+// `-ENOENT` and one that reports `ENOENT` are the same to every caller.
+function lastErrno(): i32 {
+  const e = __fs_errno__()
+  if e < 0 { return 0 - e }
+  e
+}
+
+// Whether an EMPTY result from a `u8[]`-returning intrinsic is a failure, and if
+// so which. Returns 0 for "not a failure — the file or directory really is
+// empty". One home for the empty-plus-errno protocol, so the three call sites
+// cannot drift, and so the swap to an in-band `u8[] | i32` floor (now expressible
+// — see #1806) is a change to this function rather than to every caller.
+function emptyErrno(): i32 { lastErrno() }
+
+// The message for an empty path, which every entry point rejects before it
+// reaches the floor. This is the ONLY policy this module applies ahead of the
+// syscall, and it earns its place twice: `""` names nothing on any host (POSIX
+// `openat` answers ENOENT, other hosts vary), and answering identically
+// everywhere is worth one comparison.
+//
+// Only the MESSAGE is factored out, not the error value, and that is a
+// constraint rather than a preference: a struct produced by a CALL and flowing
+// into a union position does not lower — `return someHelper()` from a function
+// returning `T | IoError` fails at emit with `ref valtype with no interned
+// shape`. Every `IoError` in this file is therefore an object LITERAL written at
+// the site that returns it. Factoring them into a constructor is the obvious
+// tidy-up and it does not compile.
+function emptyPathMsg(op: string) { "fs." + op + ": the path is empty" }
+
+// `readFile(path)` — the whole file as bytes, or why not.
+//
+// BYTES, not text: this is the function that reads a PNG. Whole-file only —
+// there is no handle, no offset and no way to read part of one, so the result is
+// as large as the file and a file that does not fit in memory is not readable
+// here.
+export function readFile(path: string): u8[] | IoError {
+  if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("readFile") } }
+  const r = __fs_read__(encodeUtf8(path))
+  // EMPTY is the floor's failure signal AND a legitimate empty file, so the
+  // errno is the disambiguator — see `emptyErrno`.
+  if r.length == 0 {
+    const e = emptyErrno()
+    if e != 0 { return { code: e, msg: failed("readFile", path, e) } }
+  }
+  r
+}
+
+// `readTextFile(path)` — the whole file, decoded as UTF-8.
+//
+// Two failures, one type: the read can fail (any errno the host reports) and the
+// DECODE can fail (`EILSEQ`, with the byte offset in the message). The second is
+// the honest answer to "this file is not text" — see `std:utf8` for why the
+// strict decode is the default and `decodeUtf8Lossy` is the opt-out. A caller
+// who wants the lossy behaviour reads bytes and decodes them itself; that is two
+// lines and it is not this function's decision to make.
+export function readTextFile(path: string): string | IoError {
+  // Guarded here as well as in `readFile`, so the message names the function the
+  // caller actually called. Every OTHER error below is forwarded verbatim from
+  // the call that produced it, and keeps that call's operation name — which is
+  // where the failure really happened, and is more useful than a re-wrap.
+  if path.length == 0 {
+    return { code: EINVAL, msg: emptyPathMsg("readTextFile") }
+  }
+  const bytes = readFile(path)
+  if bytes is IoError { return bytes }
+  const text = decodeUtf8(bytes)
+  if text is Utf8Error {
+    return { code: EILSEQ, msg: "fs.readTextFile " + path + ": " + text.msg }
+  }
+  text
+}
+
+// `writeFile(path, data)` — replace the file's contents with `data`.
+//
+// Returns `IoResult` — `null` IS the success case, because a successful write
+// has nothing to report; no partial-write count exists at this floor, so
+// returning one would be a fabrication. The call site reads
+// `if e != null { … }`.
+//
+// Whether the file is created, truncated or replaced atomically is the HOST's
+// policy, not this module's, and it is documented where the intrinsic is.
+export function writeFile(path: string, data: u8[]): IoResult {
+  if path.length == 0 {
+    return { code: EINVAL, msg: emptyPathMsg("writeFile") }
+  }
+  const rc = __fs_write__(encodeUtf8(path), data)
+  if rc == 0 { return null }
+  // Negative is `-errno`. A POSITIVE non-zero is a floor protocol violation —
+  // reported as EIO rather than trapped, because a std module has no business
+  // killing the instance over a host that answered out of contract.
+  let code = EIO
+  if rc < 0 { code = 0 - rc }
+  { code: code, msg: failed("writeFile", path, code) }
+}
+
+// `writeTextFile(path, text)` — the same, encoding `text` as UTF-8 first.
+// Encoding cannot fail (`std:utf8`'s header), so this adds no failure mode.
+export function writeTextFile(path: string, text: string): IoResult {
+  if path.length == 0 {
+    return { code: EINVAL, msg: emptyPathMsg("writeTextFile") }
+  }
+  writeFile(path, encodeUtf8(text))
+}
+
+// `listDir(path)` — the entries of a directory, as NAMES.
+//
+// Names, not paths: that is what the syscall reports, it is what you print, and
+// re-attaching the directory is one `+` (`dir + "/" + name`) which the caller
+// can skip entirely when it is about to `chdir`-relative or match on the name.
+// Returning joined paths would be a lossy convenience — you cannot recover the
+// name from a path without a path parser, and `std:fs/path` does not exist yet.
+// `"."` and `".."` are NOT included (the host filters them); the order is the
+// host's and is not sorted.
+//
+// A single entry that is not valid UTF-8 fails the WHOLE call with `EILSEQ`.
+// That is deliberate: the alternative is silently dropping a file that exists,
+// which turns a listing into a wrong answer instead of a loud one. The message
+// carries the byte offset within the block so the entry is identifiable.
+export function listDir(path: string): string[] | IoError {
+  if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("listDir") } }
+  const block = __fs_list__(encodeUtf8(path))
+  // An EMPTY block is a failure or an empty directory; the errno separates them.
+  if block.length == 0 {
+    const e = emptyErrno()
+    if e != 0 { return { code: e, msg: failed("listDir", path, e) } }
+  }
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  // `i` runs one PAST the end so the final entry — which has no separator after
+  // it — is emitted by the same block as every other. `atSep` is computed in two
+  // steps rather than folded into one `||`, so nothing indexes the array at
+  // `length`.
+  while i <= block.length {
+    let atSep = i == block.length
+    if !atSep { atSep = block[i] == 0x00 }
+    if atSep {
+      // Empty runs are skipped rather than yielded, which makes this agnostic
+      // to whether the host treats 0x00 as a SEPARATOR or a TERMINATOR — a
+      // filename is never empty, so a zero-length run carries no information.
+      if i > start {
+        const name = decodeUtf8At(block, start, i - start)
+        if name is Utf8Error {
+          return {
+            code: EILSEQ,
+            msg: "fs.listDir " +
+              path +
+              ": entry at byte " +
+              toString(start + name.at) +
+              " is not UTF-8",
+          }
+        }
+        out.push(name)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+// `pathKind(path)` — what `path` names, or why the question could not be answered.
+//
+// A missing path is an ERROR here (`ENOENT`), not a third `FileKind`: "there is
+// nothing here" is not a kind of thing, and folding it into the success arm is
+// what makes callers forget that `EACCES` is also possible. `pathExists` is the
+// function that turns ENOENT into a boolean, and it is separate precisely so
+// that decision is made once and visibly.
+export function pathKind(path: string): FileKind | IoError {
+  if path.length == 0 { return { code: EINVAL, msg: emptyPathMsg("pathKind") } }
+  const k = __fs_stat__(encodeUtf8(path))
+  if k == 0 { return "file" }
+  if k == 1 { return "dir" }
+  let code = EIO
+  if k < 0 { code = 0 - k }
+  { code: code, msg: failed("pathKind", path, code) }
+}
+
+// `pathExists(path)` — whether `path` names anything, or why that is unanswerable.
+//
+// `boolean | IoError`, NOT `boolean`, and this is the whole reason the function
+// is worth writing down. "Does not exist" and "you are not allowed to look" are
+// different facts, and a `boolean` return has to lie about one of them.
+// `Path::exists()` in Rust and `os.path.exists` in Python both answer `false`
+// for a permission error, and both ship a documented footgun where a program
+// creates a file it was told was absent, or reports a config missing when the
+// truth is the directory is unreadable.
+//
+// So exactly two errnos become `false`, and both mean "nothing is there":
+//   - ENOENT  — no such file or directory;
+//   - ENOTDIR — a component of the path is not a directory, so nothing can be
+//               at the end of it.
+// Everything else — EACCES, EPERM, EIO, a loop, a name too long — propagates
+// with its reason intact.
+export function pathExists(path: string): boolean | IoError {
+  const k = pathKind(path)
+  if k is IoError {
+    if k.code == ENOENT { return false }
+    if k.code == ENOTDIR { return false }
+    return k
+  }
+  true
+}

@@ -1701,7 +1701,7 @@ fn register_fs_imports(
         })?;
     }
 
-    // `__fs_list__(path)` — the directory's entry NAMES, separated by 0x0A, or EMPTY
+    // `__fs_list__(path)` — the directory's entry NAMES, separated by 0x00 (NUL), or EMPTY
     // with `errno` set.
     //
     // `.` and `..` are filtered HERE, per the contract, so `std:fs` need not know
@@ -1709,7 +1709,8 @@ fn register_fs_imports(
     // costs two comparisons and makes the answer platform-independent). A newline is a
     // legal byte in a POSIX filename, so a name containing one is genuinely ambiguous
     // in this encoding — that is the documented cost of a flat separated block, and
-    // `std:fs` treats 0x0A as a separator either way.
+    // `std:fs` treats 0x00 as a separator either way. NUL is the one byte a POSIX
+    // filename cannot contain, so a name holding a newline still lists as ONE entry.
     if let Some((_, ft)) = has("__fs_list__") {
         let e = errno.clone();
         let (st, at) = (st.clone(), at.clone());
@@ -1740,7 +1741,7 @@ fn register_fs_imports(
                                         }
                                         Some(b) => {
                                             if !block.is_empty() {
-                                                block.push(0x0A);
+                                                block.push(0x00);
                                             }
                                             block.extend_from_slice(&b);
                                         }
