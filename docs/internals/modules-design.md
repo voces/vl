@@ -321,7 +321,63 @@ import { distance as dist } from "./geometry"        // rename (in v1)
   **shadows** a prelude name (B16); the **LSP must know the active prelude per file**
   (completion/hover/"unresolved name" all depend on it); and the prelude is **data**
   (config), not hardcoded, so it composes with the resolver. (A custom non-test
-  prelude is the same mechanism; the lean stays "empty by default, opt in".)
+  prelude is the same mechanism.)
+- **AMENDED (owner ruling): the default set MAY be non-empty — and the config must
+  ADD TO and REMOVE FROM it, not just replace it.** The line above used to end *"the
+  lean stays 'empty by default, opt in'."* That is withdrawn. A default prelude is
+  allowed; the binding constraints are that it is **overridable** and that editing it
+  is **incremental**.
+  - **Why incremental is the whole point.** A config that only accepts a *list*
+    forces "default plus one" to be spelled by restating the entire default — and
+    that restatement **rots the moment the default changes**, silently pinning a
+    user to an old set. This is the well-known tsconfig `lib` papercut. So the shape
+    is subtractive/additive, with wholesale replacement available but not the only
+    move:
+    ```jsonc
+    { "prelude": { "add": ["./lib/helpers"], "remove": ["std:array"] } }  // default ± delta
+    { "prelude": { "set": [] } }                                          // opt out entirely
+    { "prelude": { "test": { "add": ["std:test"] } } }                    // per file-set (above)
+    ```
+  - **Proposed selection principle for what is IN the default — a rule, not a taste
+    call, so the set does not churn: a module belongs in the default prelude iff it
+    operates on a type that has LITERAL SYNTAX.** Strings have `"…"`, arrays have
+    `[…]`, maps have `{[K]:V}`. This is the direct extension of the no-prelude
+    rationale two bullets up, which observes that *collections are syntax so they
+    need no prelude* — true of the **types**, but their **operations** still needed an
+    import, which is the gap this closes. Under it the default set is **`std:str` +
+    `std:array`** and nothing else: `std:fs`, `std:args`, `std:buffer`, `std:utf8`,
+    `std:fmt`, `std:seed` all stay explicit (no literal syntax for a file, an
+    argv, or a formatter), and `std:test` is already covered by the test-file rule.
+  - **COST — small in an OPTIMIZED build, large in an unoptimized one. Not a
+    blocker.** The VL compiler itself does **no** tree-shaking: an import links the
+    whole module. **binaryen does**, at `-O`, and it does it well. Measured on
+    `97d8237a`, `print("hello")` with a module merely IN SCOPE:
+
+    | ambient module | raw | `-O` |
+    |---|---|---|
+    | *none* | 806 | **168** |
+    | `std:str` (15 exports) | 4,992 | **391** |
+    | `std:fs` (19 exports) | 7,237 | **376** |
+
+    The `-O` residue is **~210 bytes and does not scale with module size** — `std:fs`
+    carries four more exports and 2,245 more raw bytes than `std:str` and optimizes
+    *smaller*, so what survives is fixed plumbing (types, import wiring), not
+    per-function code. **So an ambient module costs ~210 bytes shipped, and 4–6× in a
+    dev build.** That makes in-compiler DCE (#1839) a **dev-iteration and
+    no-`-O`-path** concern rather than a prerequisite: it is worth doing, and it does
+    **not** gate a default prelude.
+
+    *(An earlier draft of this bullet called DCE a HARD PREREQUISITE on the strength
+    of the 806→4,992 raw number alone, without measuring `-O`. Wrong: the optimized
+    delta is 223 bytes, not 4,186. One number is not a cost model — measure the
+    build the user actually ships.)*
+  - **OPEN — is the default set VERSIONED?** Adding a name to it in a later VL
+    release changes what existing code means (a program that defined its own `split`
+    is fine via shadowing, but one that *referenced* an undefined `split` starts
+    compiling). Rust answers this with **editions** — prelude 2015/2018/2021 are
+    distinct and a crate pins one. VL should decide whether the default prelude is
+    pinned by a manifest field or allowed to grow freely. This is the choice that
+    bites in year three, not year one, but it is cheapest to make now.
 
 **Interaction with the current `compile()` entry.** Today `compile(source: string)`
 is single-input. The proposal makes it **graph-aware** without changing the *shape*
