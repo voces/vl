@@ -1,0 +1,67 @@
+// @run
+// @log hi
+// @log 7
+// @log ok
+// @log 42
+// THE DOUBLY-NARROWED STRING READ — a union VARIANT whose field is a VALUE UNION, with
+// that field narrowed to `string`.
+//
+// WHY THIS FILE EXISTS: it was the ONE string site the corpus could not see. When
+// `string` got its own WasmGC heap type (#1843) the split moved ~76 emitter sites off
+// `aTypeIdx`, and the completeness argument was that a missed site cannot hide — this
+// emitter puts every heap type in ONE rec group, so iso-recursive identity is
+// (group, position) and two structurally identical `(array (mut i32))` types are still
+// DISTINCT. Reverting a site therefore fails `vl check --codegen` immediately. That
+// argument was verified by sabotage on `emitStrSlice` and it holds.
+//
+// It did NOT hold for `emitNarrowedMem`'s arm (`wasmEmit.vl`, the `D-UNION-ATOM-KIND`
+// string leg): reverting `fbRefCast(sTypeIdx)` there left the ENTIRE 1,618-file corpus
+// green. Nothing reached it. The site's own comment had said as much — "#1128 migrated
+// that twin and left this line for the next slice rather than ship it unmeasured" — so
+// the line was known-unmeasured and stayed that way, one revert from silent invalid wasm.
+//
+// THE REACHING SHAPE, which took four tries to find and is worth stating exactly,
+// because every simpler spelling misses:
+//   * the receiver must be a NOMINAL UNION narrowed to one variant  (`u is V1`)
+//   * that variant's field must itself be a VALUE UNION             (`f: string | i64`)
+//   * and the field must then be narrowed to the STRING atom        (`u.f is string`)
+// Both narrowings are load-bearing. A plain struct-field union (`type W = { f: A1 |
+// string }` + `if w.f is string`) does NOT reach here — that is the twin one thousand
+// lines away that #1128 already migrated, which is exactly why this leg was left behind.
+//
+// Under a sabotage of that one `fbRefCast`, this file fails `vl check --codegen` with a
+// `type mismatch` and nothing else in the corpus moves.
+
+type V1 = { a: i32, f: string | i64 }
+type V2 = { b: i32 }
+
+// The string leg — the one the cast serves.
+function readStr(u: V1 | V2) {
+  if u is V1 {
+    if u.f is string { print(u.f) }
+  }
+}
+readStr({ a: 1, f: "hi" })
+
+// The SIBLING leg of the same ladder, so a fix that swaps the arms is caught too: the
+// identical shape narrowed to the i64 atom goes through `vbHeapIdxOfKind`, not the
+// string cast. If the two arms were ever transposed, this line and the one above would
+// both be wrong and only one of them would look it.
+function readInt(u: V1 | V2) {
+  if u is V1 {
+    if u.f is i64 { print(u.f) }
+  }
+}
+readInt({ a: 2, f: 7 })
+
+// A const-bound receiver rather than a parameter, since the variant is resolved from the
+// RECEIVER's own active narrowing and a local and a param reach that differently.
+const c: V1 | V2 = { a: 3, f: "ok" }
+if c is V1 {
+  if c.f is string { print(c.f) }
+}
+
+// The OTHER variant still reads normally — proves the narrowing is per-variant and that
+// nothing here disturbed the plain-field path.
+const d: V1 | V2 = { b: 42 }
+if d is V2 { print(d.b) }
