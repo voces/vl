@@ -2751,6 +2751,32 @@ export function criClassify(rx0: i32, i: i32) {
         fRetStructIdx[i] = structIndexOfLet(rll, fnStmts[i])
       }
     }
+    // A returned local ANNOTATED as the STRING primitive. The block header above says the
+    // string local kinds "never reach here — the A20 pass already covers them", and that is
+    // true for the spelling `string` and FALSE for a BRANDED newtype (`type Nstr = new
+    // string`): the checker banks an inferred-return row only for a name
+    // `isClassifiableRetName` admits, `Nstr` is not one, so no row exists, the A20 arms
+    // no-op, and NOTHING classified the return. The functype result stayed at the i32
+    // default over a body pushing the `(ref $type)` string array — `vl check` clean,
+    // INVALID WASM (`type mismatch: expected i32, found (ref $type)`).
+    //
+    // `nodeTyPrimName` IS THE NARROW ARENA TEST, the same first rung `letIsString` uses, and
+    // the narrowness is the point in BOTH directions. A branded newtype is minted as a COPY
+    // of its base `Ty`, so it IS a `TyPrim` named `string` and is claimed. A LITERAL UNION
+    // (`type K = "a" | "b"`) is a `TyUnion` of `TyLit`s, is NOT claimed, and must not be: its
+    // rep is an interned i32 ATOM, so claiming it would be this defect mirrored.
+    //
+    // `letIsString` itself is deliberately NOT called. Its un-annotated leg falls through to
+    // `exprString(d.letInit, …)`, which answers TRUE for the string LITERAL a litunion local
+    // is initialised with (`const k: K = "a"`) — the exact population the narrow test
+    // excludes. An UN-annotated string local needs no arm here: the checker records `string`
+    // for it and the A20 pass already carries it.
+    const rld = P.nodes[rll]
+    if rld is LetDecl {
+      if rld.letType >= 0 {
+        if nodeTyPrimName(rld.letType) == "string" { criSetRetKind(i, "str") }
+      }
+    }
   }
   if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
     fRetBool[i] = 1
@@ -27472,16 +27498,65 @@ function blockTailIsClosure(blockIx: i32, fnIx: i32) {
   false
 }
 
+// The DECLARATION half of `exprIsClosureNoLocal`'s binding arm: "does this `let`/`const`
+// hold a function value", answered WITHOUT the locals registry. The ANNOTATION decides it
+// outright (`tyIsFuncType`); an un-annotated binding is claimed only by an initializer that
+// is a function value in ONE node read — a `function(…)` literal, or a bare reference to a
+// lifted/top-level function.
+//
+// DELIBERATELY NOT RECURSIVE. A chained initializer (`const a = b`) is left to the
+// registry-backed `exprIsClosure`, which reaches it through a table read (`localIsRef`) and
+// so cannot spin; a scan from here would loop on `const a = a`, which the parser accepts.
+function letDeclIsClosureNoLocal(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return tyIsFuncType(d.letType) }
+    if d.letInit < 0 { return false }
+    const u = unwrapParen(d.letInit)
+    const ui = P.nodes[u]
+    if ui is FuncDecl { return true }
+    if ui is Ident { return fnIndexOfSid(sidOfNode(u)) >= 0 }
+  }
+  false
+}
+
 // `exprIsClosure` restricted to forms safe to query during return-kind classification
 // (avoids recursion through `declaredSlotOf`, which needs the local registry built):
 // a function name, a `function(...)` literal, or an object field. Captures the common
 // `return add` / `{ go: add }` escaping-closure tails.
+//
+// THE ARM THIS LADDER LACKED — a closure-typed PARAM or LOCAL returned BY NAME
+// (`const a: () => i32 = () => 11` then `return a`, or `function g(a: () => i32) { return a }`).
+// `fnReturnsClosure`'s own header has promised "or a closure-typed local" since it was
+// written; only the registry ROUTE to that fact was unavailable here, and the DECLARATION is
+// the same source `criClassify`'s sibling rungs (`letIsRefArray` / `letIsStruct` behind
+// `criRetLocalLet`) already read for exactly this reason, one ladder over.
+//
+// WHAT IT COST, both halves of one gap. The function's result valtype fell to the i32
+// DEFAULT over a body pushing a `(ref $cloStruct)`: through an anonymous LAMBDA that is
+// check-clean INVALID WASM (`current function requires result type [(ref (id 0))] but callee
+// returns [i32]`), and through a NAMED function a loud `emitProgram: call to unknown
+// function` — the caller's `exprIsClosure` reads this same predicate for a Call result, so
+// `const q = g()` did not bind a closure and `q()` folded to a by-name call to `q`.
+//
+// `paramIsClosure` is annotation-only (`tyIsFuncType(paramTypeNode(…))`) and
+// `letDeclIsClosureNoLocal` reads the annotation or one initializer node, so the
+// no-registry contract this function exists to keep is intact.
 function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Paren { return exprIsClosureNoLocal(e.parInner, fnIx) }
   if e is FuncDecl { return true }
-  if e is Ident { return fnIndexOfSid(sidOfNode(exprIx)) >= 0 }
+  if e is Ident {
+    if fnIndexOfSid(sidOfNode(exprIx)) >= 0 { return true }
+    if paramIsClosure(fnIx, e.identName) { return true }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, e.identName)
+      if li >= 0 { return letDeclIsClosureNoLocal(li) }
+    }
+    return false
+  }
   if e is ObjLit { return false }
   false
 }
