@@ -854,14 +854,53 @@ export function decodeStr(raw: i32[]) {
   }
   out
 }
-// Copy a `string`'s code points into an `i32[]` so `decodeStr` can index past the end
-// safely with arithmetic. `s[i]` already yields the i32 code point (strings ARE
-// code-point arrays in this representation), so this is a straight element copy.
+// Copy a `string`'s CODE POINTS into an `i32[]` so `decodeStr` can index past the end
+// safely with arithmetic.
+//
+// IT ITERATES RATHER THAN INDEXES, AND THAT IS THE WHOLE POINT AT STAGE 2c. `s[i]` used to
+// yield a code point and now yields a UTF-8 BYTE; `for cp in s` yields a code point under
+// BOTH representations. Every consumer downstream (`decodeStr`'s escape grammar, the
+// `\u{…}` arm, `emitCharLitNode`'s one-code-point check) is written in code points, so this
+// is the seam that has to be unit-stable — and it has to be unit-stable in a stronger sense
+// than "correct after the migration": the compiler that BUILDS the next compiler is itself
+// compiled by the previous one, so this function runs under the OLD representation on the
+// bootstrap rung and under the NEW one thereafter. An indexed spelling gives two different
+// answers on those two rungs and the self-compile fixpoint stops converging.
 export function strToCps(s: string) {
   const out: i32[] = []
+  for cp in s { out.push(cp) }
+  out
+}
+// UTF-8-encode a code-point vector into the BYTE vector a Stage 2c string literal is
+// built from. The inverse of `strToCps` + the decode `for cp in s` lowers to.
+//
+// Go-lean, per `docs/guide/strings-design.md` §Validity: a code point outside
+// [0, 0x10FFFF] or inside the UTF-16 surrogate range D800..DFFF has NO UTF-8 encoding, so
+// it is replaced by U+FFFD rather than trapping or rejecting. The lexer cannot produce
+// either (`\u{…}` is capped at 0x10FFFF) but `fromCodePoints` can be handed anything, and
+// the emitter half must agree with the runtime half arm for arm — see `emitUtf8EncFnCode`,
+// which is this function transliterated into wasm and must stay in step with it.
+export function cpsToUtf8(cps: i32[]) {
+  const out: i32[] = []
   let i = 0
-  while i < s.length {
-    out.push(s[i])
+  while i < cps.length {
+    let cp = cps[i]
+    if cp < 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343) { cp = 65533 }
+    if cp < 128 {
+      out.push(cp)
+    } else if cp < 2048 {
+      out.push(192 | (cp >> 6))
+      out.push(128 | (cp & 63))
+    } else if cp < 65536 {
+      out.push(224 | (cp >> 12))
+      out.push(128 | ((cp >> 6) & 63))
+      out.push(128 | (cp & 63))
+    } else {
+      out.push(240 | (cp >> 18))
+      out.push(128 | ((cp >> 12) & 63))
+      out.push(128 | ((cp >> 6) & 63))
+      out.push(128 | (cp & 63))
+    }
     i = i + 1
   }
   out

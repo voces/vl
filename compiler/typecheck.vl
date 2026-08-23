@@ -1,3 +1,5 @@
+import { pushCps } from "./strutil"
+
 // A type-checker for a meaningful subset of VL, written in VL
 // (Track H / H3 self-hosting — the compiler stage after the lexer and parser).
 //
@@ -1132,7 +1134,9 @@ function flushUninferred(depth: i32) {
     if pendDepths[i] == depth {
       if unresolvedHole(pendTys[i]) {
         tErr(
-          "cannot infer a type for '" + pendNames[i] + "' — add a type annotation",
+          "cannot infer a type for '" +
+            pendNames[i] +
+            "' — add a type annotation",
           pendAts[i],
         )
       }
@@ -5590,6 +5594,15 @@ export function demangleName(nm: string) {
 export function demangleMsg(s: string) {
   const out: i32[] = []
   let i = 0
+  // STAGE 2c: the VERBATIM run is copied through a SLICE (O(1) since 2b) rather than pushed
+  // element by element, because the buffer is drained by `fromCodePoints` and `s[i]` is now
+  // a byte. This function walks DIAGNOSTIC MESSAGES — the one corner of the compiler where
+  // all 105 of its non-ASCII characters live — so the double-encode would have been visible
+  // in every em-dash of every error the compiler prints. The `$m<digits>` scan itself is
+  // pure ASCII and unit-free: `$`, `m` and the digits sit at the same offsets in either
+  // unit, and a multi-byte character's continuation bytes are all >= 0x80 and so can never
+  // be mistaken for one of them.
+  let runStart = 0
   while i < s.length {
     if (
       s[i] == '$' &&
@@ -5598,13 +5611,15 @@ export function demangleMsg(s: string) {
       s[i + 2] >= '0' &&
       s[i + 2] <= '9'
     ) {
+      pushCps(out, s.slice(runStart, i))
       i = i + 2
       while i < s.length && s[i] >= '0' && s[i] <= '9' { i = i + 1 }
+      runStart = i
     } else {
-      out.push(s[i])
       i = i + 1
     }
   }
+  pushCps(out, s.slice(runStart, s.length))
   fromCodePoints(out)
 }
 
@@ -16640,8 +16655,16 @@ function checkCallNode(n: Call, ix: i32) {
       return TY_ERR
     }
     // String methods: `.slice(i32,i32)->string`, `.indexOf(string)->i32`,
-    // `.includes(string)->bool`, `.charCodeAt(i32)->i32`. (`.length` is a Member,
-    // handled there; `s[i]` is an Index.) Element types are checked.
+    // `.includes(string)->bool`, `.charCodeAt(i32)->i32`, and the STAGE 2c trio
+    // `.cpAt(i32)->i32`, `.cpLen()->i32`, `.isCharBoundary(i32)->bool`. (`.length` is a
+    // Member, handled there; `s[i]` is an Index.) Element types are checked.
+    //
+    // WHY THE TRIO IS IN THE CORE AND THE 15 `std:str` NAMES ARE NOT (OQ-3): these three
+    // cannot be written in VL at all. Every one of them needs the UTF-8 STORAGE — a decode
+    // at a byte offset, a scan for non-continuation bytes, a lead/continuation bit test —
+    // and the surface deliberately exposes no way to reach it except `s[i]`, which is the
+    // byte they would have to re-derive the code point from. `split`/`trim`/`join` are
+    // library functions over the six primitives; these are the primitives.
     if rt is TyPrim {
       if rt.primName == "string" {
         const sp = cfn.memProp
@@ -16705,6 +16728,64 @@ function checkCallNode(n: Call, ix: i32) {
             }
           }
           return TY_I32
+        }
+        // `s.cpAt(i)` — the CODE POINT whose UTF-8 sequence begins at BYTE offset `i`,
+        // O(1) (§Codepoints). Not "the i-th code point": the argument is in the one
+        // coordinate system `slice`, `indexOf` and `.length` share.
+        if sp == "cpAt" {
+          if sargs.length != 1 {
+            tErr("cpAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
+          } else {
+            const a0 = checkNode(sargs[0])
+            if !assignable(a0, TY_I32) {
+              tErr("cpAt expects an i32 byte offset, got " + tyToStr(a0), ix)
+            }
+          }
+          return TY_I32
+        }
+        // `s.cpLen()` — the code-point count, O(n) and NAMED so the cost is visible at the
+        // call site rather than hidden in a `.length` that is O(1) on some data and O(n)
+        // on other data (§Codepoints: "a subscript should mean O(1), always").
+        if sp == "cpLen" {
+          if sargs.length != 0 {
+            tErr(
+              "cpLen expects no arguments, got " + i32ToStr(sargs.length),
+              ix,
+            )
+          }
+          return TY_I32
+        }
+        // `s.isCharBoundary(i)` — Rust's primitive, O(1): a single lead/continuation bit
+        // test. Slicing off a boundary is LEGAL under Go-lean validity (§Validity), so this
+        // is the tool for code that wants to check rather than a guard the language imposes.
+        if sp == "isCharBoundary" {
+          if sargs.length != 1 {
+            tErr(
+              "isCharBoundary expects 1 argument, got " + i32ToStr(sargs.length),
+              ix,
+            )
+          } else {
+            const a0 = checkNode(sargs[0])
+            if !assignable(a0, TY_I32) {
+              tErr(
+                "isCharBoundary expects an i32 byte offset, got " + tyToStr(a0),
+                ix,
+              )
+            }
+          }
+          return TY_BOOL
+        }
+        // `s.bytes()` — the string's UTF-8 storage as a `u8[]`. A COPY, not a view:
+        // see `emitStrBytesFnCode` for why a `u8[]` cannot express a non-zero `start`,
+        // and `strings-design.md` §Byte view for the withdrawn zero-copy claim.
+        if sp == "bytes" {
+          if sargs.length != 0 {
+            tErr(
+              "bytes expects no arguments, got " + i32ToStr(sargs.length),
+              ix,
+            )
+          }
+          return mkArrayTy(TY_U8)
         }
         // UFCS `self`-method on a string receiver (`"hello".first()`).
         const su = ufcsCallTy(sp, recvTy, n, ix)

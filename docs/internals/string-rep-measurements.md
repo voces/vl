@@ -475,6 +475,48 @@ separate piece of work.**
 > Where a number here disagrees with `docs/guide/strings-design.md`, the
 > disagreement is stated rather than smoothed over.
 
+> **STATUS — STAGE 2c HAS LANDED. THE UNIT MOVED.** `$sBackIdx` is `(array (mut i8))` of
+> **UTF-8 bytes**; `s[i]` is a byte (`array.get_u`, zero-extended), `.length` is the byte
+> count, `slice` takes byte offsets, and `for cp in s` is a UTF-8 DECODE with a variable
+> stride (its surface unchanged). `cpAt`/`cpLen`/`isCharBoundary`/`bytes` are new core
+> intrinsics. Everything §2.3–§2.6 below says about UNITS is now BEHIND rather than ahead;
+> read those sections as the map that was followed, with the corrections in this note.
+>
+> **What the map got right, and it was most of it.** §2.3's list of element-read sites is
+> the list that changed. §2.3's warning that "the idiom that breaks loudly and silently is
+> `read elements into an i32[], then `fromCodePoints`" is the single most valuable line in
+> Part 2: it named the defect class, and the class turned out to have **eleven live
+> instances in `compiler/*.vl`** — `cliUpper`, `cliDetab`, `cliSplitLines`, `cliJsonEsc`,
+> `cliPendingKey`, `cliModCommitOne`, `collapseWs`, `joinLinesRange`, `joinOut`, `wrapList`
+> (×2), `demangleMsg`, `modNormalize`, `modTypeRenamed` — plus **three copies** of a
+> `srcPush(src[i])` staging loop that double-encoded the source of every program the
+> compiler read. All are fixed; the shared answer is `compiler/strutil.vl`.
+>
+> **What the map got wrong or missed, stated because a map's value is its accuracy:**
+>
+> * **§2.4's `.length`-as-a-width list is incomplete.** It names `cliVisualWidth` and the
+>   two `NEW_FIXED_MAX` thresholds. It does not name the LEXER's char-literal check
+>   (`value.length != 1`), which is the FIRST thing that breaks — `'é'` becomes a
+>   two-character literal and every corpus file with a raw non-ASCII char literal fails to
+>   PARSE. It also does not name `padStart`/`padEnd` (filed separately as §R1) or the
+>   formatter's line-width arithmetic (still in bytes; see the residue note below).
+> * **§2.6's "the guest side becomes one bulk copy" is not achievable for `print`** without
+>   a new import, and the import table is hardcoded at four indices in four places (L8).
+>   Not built. The channel that DID converge is `cliCmdDataStore`, exactly as §2.6
+>   predicted for `StrOut`/`BytesOut`.
+> * **§2.5's premise that `emitStrSlice` loses a reservation arm was already spent by 2b**;
+>   2c removed no arm and added four (the codec trio's dispatch plus `bytes`).
+> * **The `array.new_fixed` cap is now a BYTE budget**, which §2.4 predicted, and the two
+>   places that decide it had to move together. `tests/cases/strings/literal-chunked-bytes.vl`
+>   is the input that separates the two answers: 3,400 U+2192 characters, under the cap in
+>   code points and over it in bytes.
+>
+> **Known residue, not fixed here:** the formatter's line-width arithmetic
+> (`format.wrapList`'s `oneLineLen`, `emitLine`'s column math) still measures in BYTES, so
+> `vl fmt` wraps a line holding non-ASCII slightly earlier than it did. No fixture observes
+> it (every `fmt` fixture is ASCII) and the output is valid either way; it is the same
+> width-vs-offset distinction §R1 ruled for padding, and it wants the same answer.
+
 > **STATUS — the SLICE HEADER (Stage 2b) HAS LANDED, on top of Stage 2a.** `sTypeIdx` is now
 > the string HEADER — `(struct (field (ref $sBackIdx)) (field i32 $start) (field i32 $len))`,
 > all three fields immutable — and the code-point array moved down to a new index,

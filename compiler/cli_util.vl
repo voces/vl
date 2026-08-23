@@ -1,3 +1,5 @@
+import { cpCount } from "./strutil"
+
 // `cli_util.vl` — pure string/format/glob helpers for the CLI: ANSI colouring, detab /
 // visual-width, line splitting, severity rank/validation, `--exclude` glob matching,
 // and import-line detection. State-free (no `cli.vl` module global) — a leaf the CLI
@@ -6,13 +8,10 @@
 import { i32ToStr } from "./ast"
 import {
   formatSrc,
-  modCommit,
-  modKeyPush,
-  modPendingAt,
-  modPendingLen,
-  modSrcPush,
-  srcPush,
+  modCommitStr,
+  modPendingKeyAt,
   srcReset,
+  srcSetStr,
 } from "./driver"
 
 // Directories skipped when walking broadly (build output, deps, vendored,
@@ -35,12 +34,10 @@ export function cliRepeat(s: string, n: i32) {
 }
 export function cliUpper(s: string) {
   const out: i32[] = []
-  let i = 0
-  while i < s.length {
-    let c = s[i]
+  for cp in s {
+    let c = cp
     if c >= 'a' && c <= 'z' { c = c - 32 }
     out.push(c)
-    i = i + 1
   }
   fromCodePoints(out)
 }
@@ -48,10 +45,8 @@ export function cliUpper(s: string) {
 // detabbed to match). Mirrors the host's former `detab`.
 export function cliDetab(s: string) {
   const out: i32[] = []
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c == '\t' {
+  for cp in s {
+    if cp == '\t' {
       const pad = 4 - (out.length % 4)
       let p = 0
       while p < pad {
@@ -59,41 +54,48 @@ export function cliDetab(s: string) {
         p = p + 1
       }
     } else {
-      out.push(c)
+      out.push(cp)
     }
-    i = i + 1
   }
   fromCodePoints(out)
 }
 // The visual column the prefix `[0, n)` of `raw` ends at, after detabbing.
+//
+// `n` is a BYTE offset (it comes from the lexer's columns, which are byte columns since
+// Stage 2c) but the answer is a COLUMN — a width — so it is counted in code points. This is
+// the §R1 distinction: the offset that selects the prefix and the number that positions the
+// caret are different kinds of integer, and only the first one cancels against `slice`.
+// Getting this wrong puts the caret one column right per non-ASCII byte before the error.
 export function cliVisualWidth(raw: string, n: i32) {
   let m = n
   if m > raw.length { m = raw.length }
   if m < 0 { m = 0 }
-  cliDetab(raw.slice(0, m)).length
+  cpCount(cliDetab(raw.slice(0, m)))
 }
 // `str::lines()` semantics: split on `\n`, drop a trailing `\r`, no trailing
 // empty line for a final newline.
 export function cliSplitLines(s: string) {
   const out: string[] = []
-  let cur: i32[] = []
+  // SLICES, NOT A CODE-POINT BUFFER. Splitting is a pure OFFSET operation — `\n` and `\r`
+  // are ASCII, so they are found at the same places in either unit, and every piece is a
+  // range of the input handed straight back to `slice`. Rebuilding each line through
+  // `fromCodePoints` would have re-encoded every non-ASCII byte as its own character; a
+  // slice cannot, because it never names a unit at all. It is also O(1) per line now.
+  let lineStart = 0
   let i = 0
   while i < s.length {
-    const c = s[i]
-    if c == '\n' {
-      let line = fromCodePoints(cur)
+    if s[i] == '\n' {
+      let line = s.slice(lineStart, i)
       if line.length > 0 && line[line.length - 1] == '\r' {
         line = line.slice(0, line.length - 1)
       }
       out.push(line)
-      cur = []
-    } else {
-      cur.push(c)
+      lineStart = i + 1
     }
     i = i + 1
   }
-  if cur.length > 0 {
-    let line = fromCodePoints(cur)
+  if lineStart < s.length {
+    let line = s.slice(lineStart, s.length)
     if line.length > 0 && line[line.length - 1] == '\r' {
       line = line.slice(0, line.length - 1)
     }
@@ -135,9 +137,7 @@ function cliHexDigit(v: i32) {
 // writes UTF-8.
 export function cliJsonEsc(s: string) {
   const out: i32[] = []
-  let i = 0
-  while i < s.length {
-    const c = s[i]
+  for c in s {
     if c == '"' || c == '\\' {
       out.push('\\')
       out.push(c)
@@ -160,7 +160,6 @@ export function cliJsonEsc(s: string) {
     } else {
       out.push(c)
     }
-    i = i + 1
   }
   fromCodePoints(out)
 }
@@ -267,33 +266,24 @@ export function cliGlob(pat: string, text: string) {
   false
 }
 // Commit one (key, src, found) into the module table (the fetch protocol).
+// STAGE 2c: this hands the STRINGS over directly instead of re-pushing them element by
+// element into the driver's code-point accumulators. The old spelling was the §Builders
+// defect on the compiler's own PARSE path — `src[j]` became a byte while `modCommit`'s
+// `fromCodePoints(modSrcAcc)` still meant code points, so every module of a graph compile
+// was double-encoded before the lexer ever saw it, and `'é'` in a source file lexed as two
+// characters. The accumulators still exist for the HOST channel (`modSrcLoad` stages UTF-32
+// words); a caller that already holds the string has no reason to go through them, and now
+// does not — which also removes two full copies of every module's source per compile.
 export function cliModCommitOne(key: string, src: string, found: i32) {
-  let i = 0
-  while i < key.length {
-    modKeyPush(key[i])
-    i = i + 1
-  }
-  if found != 0 {
-    let j = 0
-    while j < src.length {
-      modSrcPush(src[j])
-      j = j + 1
-    }
-  }
-  modCommit(found)
+  let body = ""
+  if found != 0 { body = src }
+  modCommitStr(key, body, found)
   0
 }
 // The k-th pending module key, read per-code-point from the driver's accessors.
-export function cliPendingKey(k: i32) {
-  const out: i32[] = []
-  const n = modPendingLen(k)
-  let j = 0
-  while j < n {
-    out.push(modPendingAt(k, j))
-    j = j + 1
-  }
-  fromCodePoints(out)
-}
+// STAGE 2c: reads the key as a STRING rather than reassembling it from `modPendingAt`
+// elements, which are bytes now and were being re-encoded one per character.
+export function cliPendingKey(k: i32) { modPendingKeyAt(k) }
 // ── directory walk ──────────────────────────────────────────────────────────
 // True when `name` ends in `.vl`.
 export function cliEndsVl(name: string) {
@@ -373,12 +363,14 @@ export function cliPopLast(xs: string[]) {
 //   2 — the round-trip gate tripped: the OUTPUT does not re-parse (a formatter
 //       bug) — the caller must keep the original bytes and report loudly.
 export function cliFormatNow(src: string): i32 {
+  // `srcSetStr`, not a `srcPush(src[i])` loop — the THIRD copy of that loop, and the one
+  // that outlived the other two by a full gate cycle: `vl check` was already correct while
+  // `vl fmt` still re-encoded every non-ASCII character in the file it was formatting
+  // (`—` came back as `â\u{80}\u{94}`). `scripts/lint-self.sh` caught it as "not formatted"
+  // on 26 files at once, which is the only reason it was not shipped. Three writings of one
+  // fact, and the third had no reason to exist: see `driver.srcSetStr`.
   srcReset()
-  let i = 0
-  while i < src.length {
-    srcPush(src[i])
-    i = i + 1
-  }
+  srcSetStr(src)
   const len = formatSrc()
   if len == -2 { return 2 }
   if len < 0 { return 1 }

@@ -240,6 +240,17 @@ The premise holds in today's tree and no ruling exists. `sed -n '1,30p' tests/ca
 
 ### str-byte-index-unit-rulings
 
+> **TWO OF THE THREE ARE RULED AND SHIPPED (Stage 2c, the UTF-8 swap).** **R1 → CODE
+> POINTS**: `padStart`/`padEnd` measure `len` with `cpLen()` and `padFill` tiles code
+> points, so a column stays a column on non-ASCII input and a multi-byte pad can no longer
+> be truncated mid-sequence. **R2 → CODE POINTS**, i.e. the conservative answer already in
+> the code, now load-bearing rather than incidental. Fixture:
+> `tests/cases/std/str-pad-codepoints.vl`. **R3 (trim's whitespace set) REMAINS OPEN** — it
+> is rep-independent, it gated nothing before the swap and gates nothing after, and the
+> deadline R1 carried ("ship the swap without ruling it and `padStart` changes meaning with
+> no diagnostic") does not apply to it. The rest of this entry is kept as the record of the
+> evidence the two rulings were made on.
+
 **Three `std:str` semantics the byte-indexed-UTF-8 migration cannot decide for itself — padding width, the empty-needle boundary, and trim's whitespace set**
 `docs/internals/str-byte-semantics.md` §R1/§R2/§R3 (the full audit; per-function table at §Table)
 

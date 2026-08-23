@@ -197,6 +197,26 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Memory, runtime & object model
 
+- **A `string` is UTF-8 BYTES behind a slice header, and the surface is
+  BYTE-INDEXED.** `s[i]` is a byte (0–255, O(1)), `.length` is the byte count
+  (O(1)), `slice(a, b)` takes byte offsets and returns an O(1) view; code points
+  come from `for cp in s` (a UTF-8 decode with a variable stride), `s.cpAt(i)`
+  (O(1), at a BYTE offset) and `s.cpLen()` (O(n), named so the cost is visible).
+  `s.bytes()` is the storage as a `u8[]`, `s.isCharBoundary(i)` an O(1) bit test.
+  This puts VL in the Go/Rust camp and was taken on measurement, not taste: a
+  census of `compiler/*.vl` found **zero** true random-access indexed string
+  reads (63% sequential, 29% length-relative, 8% constant), so code-point
+  indexing's whole purpose — O(1) access by character — had no demand, while its
+  price was an ASCII fast-path flag and an **O(n²) indexed-loop cliff** that
+  triggered on exactly the input an English-speaking developer never tests.
+  Validity is **Go-lean**: no boundary validation, slicing off a character
+  boundary is legal, and a malformed sequence decodes leniently to U+FFFD —
+  never a trap, never a rejection. `fromCodePoints` SUBSTITUTES U+FFFD for a
+  value with no UTF-8 encoding (a lone surrogate, out of range, negative),
+  because the storage cannot hold one and dropping it would change `.length`
+  undetectably; `print` agrees with it rather than dropping. Measured: 40 M live
+  ASCII characters cost 161 MB of backing before and 44.6 MB after (3.6×, 4× on
+  the character payload alone). (`docs/guide/strings-design.md`, Stage 2c)
 - **Allocation = WasmGC.** Heap values (closures, objects, arrays, strings) are
   WasmGC structs/arrays; linear memory is an opt-in escape hatch;
   escape-analysis stack allocation is a later optimization. Lean on binaryen's

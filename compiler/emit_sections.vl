@@ -82,6 +82,7 @@ import {
   NEW_FIXED_MAX,
   appendAll,
   capHas,
+  cpsToUtf8,
   decodeStr,
   nulCloFlag,
   numTextIsFloat,
@@ -174,9 +175,13 @@ import {
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
+  gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
   gHelpStrHash,
+  gHelpUtf8CpLen,
+  gHelpUtf8Dec,
+  gHelpUtf8Enc,
   gImports,
   gMemLogIdx,
   gNeedsF32Print,
@@ -2283,6 +2288,556 @@ function emitStrConcatFnCode(out: i32[]) {
   helpFrameBody(out, body)
 }
 
+// ── the UTF-8 codec helpers (Stage 2c) ───────────────────────────────────────
+// Three module-tail functions, minted from `aUsed` alongside the string trio above. They
+// exist because the codec is a LOOP with a variable stride — the one shape a lowering
+// cannot inline at every use site without re-spelling the whole grammar per site, which is
+// exactly how this emitter's signature defect (a ladder with an arm its sibling lacks)
+// reproduces. One copy each: `for cp in s` and `s.cpAt(i)` share `__utf8_dec__`;
+// `fromCodePoint`, `fromCodePoints` and every future string producer share `__utf8_enc__`.
+//
+// THE ENCODER'S FOURTH TWIN IS IN VL, NOT WASM: `emit_base.cpsToUtf8` encodes a literal at
+// COMPILE time and `__utf8_enc__` encodes at RUN time, and the two must answer identically
+// or `"é" == fromCodePoint(233)` goes false. Both replace an out-of-range or surrogate code
+// point with U+FFFD (§Validity, Go-lean) and neither traps.
+
+// Replace the code point in local `cpL` with U+FFFD when it has no UTF-8 encoding — outside
+// [0, 0x10FFFF], or inside the UTF-16 surrogate range D800..DFFF. Emitted into BOTH of
+// `__utf8_enc__`'s passes (the width pass and the write pass), because sanitizing changes
+// the WIDTH (`0x110000` would measure 4 and write 3) and a width pass that disagreed with
+// the write pass would size the backing wrong.
+function fbUtf8Sanitize(cpL: i32) {
+  fbLocalGet(cpL)
+  fbI32Const(0)
+  fbI32Bin(72)      // 0x48 i32.lt_s
+  fbLocalGet(cpL)
+  fbI32Const(1114111)
+  fbI32Bin(74)      // 0x4a i32.gt_s
+  fbI32Bin(114)     // 0x72 i32.or
+  fbLocalGet(cpL)
+  fbI32Const(55296)
+  fbI32Bin(78)      // 0x4e i32.ge_s
+  fbLocalGet(cpL)
+  fbI32Const(57343)
+  fbI32Bin(76)      // 0x4c i32.le_s
+  fbI32Bin(113)     // 0x71 i32.and
+  fbI32Bin(114)     // 0x72 i32.or
+  fbIf(64)
+  fbI32Const(65533) // U+FFFD
+  fbLocalSet(cpL)
+  fbEnd()
+  0
+}
+
+// `(1 << 24) | 0xFFFD` — the decoder's "consume ONE byte, yield the replacement character"
+// answer, and the only answer it gives for a byte that begins nothing. Consuming exactly one
+// byte is what makes `for cp in s` terminate on arbitrary bytes: a width of 0 would spin.
+function fbUtf8DecBad() {
+  fbI32Const(16842749) // (1 << 24) | 65533 — width 1, U+FFFD
+  fbReturn()
+  0
+}
+
+// `__utf8_dec__(back, i, end) -> i32` — decode the UTF-8 sequence beginning at BACKING offset
+// `i`, never reading at or past `end`. Returns `(width << 24) | codepoint`, so one call
+// answers both questions a decoding cursor has; `width` is always >= 1.
+//
+// Params: back(0) `(ref $sBackIdx)`, i(1), end(2). Locals: b(3), n(4), cp(5), k(6), c(7),
+// lo(8).
+//
+// GO-LEAN (§Validity): a malformed sequence — a stray continuation byte, an invalid lead, a
+// truncated tail, an overlong form, a surrogate, or a value past U+10FFFF — decodes to U+FFFD
+// rather than trapping. `0xC0`/`0xC1` (the only 2-byte overlongs) and `0xF5`..`0xFF` are
+// rejected by the lead-byte range itself; the `lo` test below catches the 3- and 4-byte
+// overlongs, which have no such shortcut.
+function emitUtf8DecFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1) // 1 locals run
+  wULEB(6) // b, n, cp, k, c, lo
+  wU8(127) // 0x7f i32
+  // b = back[i]  (array.get_u — the backing is packed i8, so this zero-extends to 0..255)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbArrayGet(sBackIdx)
+  fbLocalSet(3)
+  // ASCII: one byte, the code point IS the byte.
+  fbLocalGet(3)
+  fbI32Const(128)
+  fbI32Bin(72)         // i32.lt_s
+  fbIf(64)
+  fbI32Const(16777216) // 1 << 24
+  fbLocalGet(3)
+  fbI32Bin(114)        // i32.or
+  fbReturn()
+  fbEnd()
+  // A lead byte below 0xC2 is a continuation byte or a 2-byte overlong — neither begins a
+  // sequence.
+  fbLocalGet(3)
+  fbI32Const(194)
+  fbI32Bin(72) // i32.lt_s
+  fbIf(64)
+  fbUtf8DecBad()
+  fbEnd()
+  // n = 2 / 3 / 4 by lead-byte range; 0xF5 and up is not a lead byte at all.
+  fbI32Const(2)
+  fbLocalSet(4)
+  fbLocalGet(3)
+  fbI32Const(224)
+  fbI32Bin(78) // i32.ge_s
+  fbIf(64)
+  fbI32Const(3)
+  fbLocalSet(4)
+  fbLocalGet(3)
+  fbI32Const(240)
+  fbI32Bin(78) // i32.ge_s
+  fbIf(64)
+  fbI32Const(4)
+  fbLocalSet(4)
+  fbLocalGet(3)
+  fbI32Const(245)
+  fbI32Bin(78) // i32.ge_s
+  fbIf(64)
+  fbUtf8DecBad()
+  fbEnd()
+  fbEnd()
+  fbEnd()
+  // A sequence that runs past `end` is truncated — this is the SLICE-OFF-A-BOUNDARY case
+  // §API deliberately permits, so it is lenient rather than a trap.
+  fbLocalGet(1)
+  fbLocalGet(4)
+  fbI32Bin(106) // i32.add
+  fbLocalGet(2)
+  fbI32Bin(74)  // i32.gt_s
+  fbIf(64)
+  fbUtf8DecBad()
+  fbEnd()
+  // cp = b & (0x7f >> n) — 0x1f / 0x0f / 0x07 for n = 2 / 3 / 4.
+  fbLocalGet(3)
+  fbI32Const(127)
+  fbLocalGet(4)
+  fbI32Bin(118) // 0x76 i32.shr_u
+  fbI32Bin(113) // 0x71 i32.and
+  fbLocalSet(5)
+  // for k in 1..n { c = back[i + k]; require 10xxxxxx; cp = (cp << 6) | (c & 0x3f) }
+  fbI32Const(1)
+  fbLocalSet(6)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(6)
+  fbLocalGet(4)
+  fbI32Bin(78)  // i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbLocalGet(6)
+  fbI32Bin(106) // i32.add
+  fbArrayGet(sBackIdx)
+  fbLocalSet(7)
+  fbLocalGet(7)
+  fbI32Const(192)
+  fbI32Bin(113) // i32.and
+  fbI32Const(128)
+  fbI32Bin(71)  // 0x47 i32.ne
+  fbIf(64)
+  fbUtf8DecBad()
+  fbEnd()
+  fbLocalGet(5)
+  fbI32Const(6)
+  fbI32Bin(116) // 0x74 i32.shl
+  fbLocalGet(7)
+  fbI32Const(63)
+  fbI32Bin(113) // i32.and
+  fbI32Bin(114) // i32.or
+  fbLocalSet(5)
+  fbLocalGet(6)
+  fbI32Const(1)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(6)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // lo = the smallest code point this width is allowed to encode (the overlong test).
+  fbI32Const(128)
+  fbLocalSet(8)
+  fbLocalGet(4)
+  fbI32Const(3)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
+  fbI32Const(2048)
+  fbLocalSet(8)
+  fbEnd()
+  fbLocalGet(4)
+  fbI32Const(4)
+  fbI32Bin(70) // i32.eq
+  fbIf(64)
+  fbI32Const(65536)
+  fbLocalSet(8)
+  fbEnd()
+  // Overlong, surrogate, or past U+10FFFF: U+FFFD, but consume the WHOLE malformed
+  // sequence (width n) — the maximal-subpart rule the lossy decoder already follows.
+  fbLocalGet(5)
+  fbLocalGet(8)
+  fbI32Bin(72) // i32.lt_s
+  fbLocalGet(5)
+  fbI32Const(1114111)
+  fbI32Bin(74) // i32.gt_s
+  fbI32Bin(114) // i32.or
+  fbLocalGet(5)
+  fbI32Const(55296)
+  fbI32Bin(78) // i32.ge_s
+  fbLocalGet(5)
+  fbI32Const(57343)
+  fbI32Bin(76) // i32.le_s
+  fbI32Bin(113) // i32.and
+  fbI32Bin(114) // i32.or
+  fbIf(64)
+  fbI32Const(65533)
+  fbLocalSet(5)
+  fbEnd()
+  fbLocalGet(4)
+  fbI32Const(24)
+  fbI32Bin(116) // i32.shl
+  fbLocalGet(5)
+  fbI32Bin(114) // i32.or
+  fbEnd() // end (function) — leaves (width << 24) | cp
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// Push `[out, w + off]` — the destination array and index for the `off`-th byte of the
+// sequence being written. The caller pushes the byte value and closes with `array.set`.
+function fbUtf8Put(outL: i32, wL: i32, off: i32) {
+  fbLocalGet(outL)
+  fbLocalGet(wL)
+  if off != 0 {
+    fbI32Const(off)
+    fbI32Bin(106) // i32.add
+  }
+  0
+}
+
+// `back[start + i]` for `__utf8_enc__`'s source list — the i32 CODE POINT at logical index
+// `i`, read through `$aTypeIdx` (a plain i32 array, not the packed string backing).
+function fbUtf8EncRead(iL: i32, cpL: i32) {
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbLocalGet(iL)
+  fbI32Bin(106) // i32.add
+  fbArrayGet(aTypeIdx)
+  fbLocalSet(cpL)
+  fbUtf8Sanitize(cpL)
+  0
+}
+
+// `if cp >= <bound> { n = n + 1 }` — one rung of `__utf8_enc__`'s width sum. Three rungs at
+// 0x80 / 0x800 / 0x10000 give 1 / 2 / 3 / 4 with no branch tree.
+function fbUtf8WidthStep(bound: i32) {
+  fbLocalGet(5)
+  fbI32Const(bound)
+  fbI32Bin(78) // i32.ge_s
+  fbIf(64)
+  fbLocalGet(3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(3)
+  fbEnd()
+  0
+}
+
+// The LEAD byte of a multi-byte sequence: `mark | (cp >> shift)`.
+function fbUtf8Lead(mark: i32, shift: i32) {
+  fbI32Const(mark)
+  fbLocalGet(5)
+  fbI32Const(shift)
+  fbI32Bin(118) // i32.shr_u
+  fbI32Bin(114) // i32.or
+  0
+}
+
+// A CONTINUATION byte: `0x80 | ((cp >> shift) & 0x3f)`.
+function fbUtf8Cont(shift: i32) {
+  fbI32Const(128)
+  fbLocalGet(5)
+  if shift != 0 {
+    fbI32Const(shift)
+    fbI32Bin(118) // i32.shr_u
+  }
+  fbI32Const(63)
+  fbI32Bin(113) // i32.and
+  fbI32Bin(114) // i32.or
+  0
+}
+
+// `w = w + k` — advance `__utf8_enc__`'s write cursor past the sequence just written.
+function fbUtf8Bump(wL: i32, k: i32) {
+  fbLocalGet(wL)
+  fbI32Const(k)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(wL)
+  0
+}
+
+// `__utf8_enc__(back, start, len) -> (ref str)` — UTF-8-encode `len` i32 CODE POINTS read
+// from `back[start ..]` into a fresh, exact-fit string.
+//
+// This is what `fromCodePoints` STOPS being: it was one `array.copy`, and `strings-design.md`
+// §Migration called that "the largest semantic change in the bucket". `fromCodePoints`'s
+// contract is fixed by its name — each i32 is a code point — so under UTF-8 storage it has to
+// encode, and a caller that fills its buffer with `s[i]` (now a byte) double-encodes. That is
+// the §Builders defect the `std:str` audit found in shipped code, and it is why the repaired
+// builders feed themselves by `for cp in s` instead.
+//
+// TWO PASSES, because a WasmGC array is fixed-length: pass 1 sums the widths to size the
+// backing, pass 2 writes. Both read through `fbUtf8EncRead`, so they cannot disagree about
+// what a code point is or which of them sanitizes.
+//
+// Params: back(0) `(ref $aTypeIdx)`, start(1), len(2). Locals: n(3), i(4), cp(5), out(6)
+// `(ref $sBackIdx)`, w(7).
+function emitUtf8EncFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(3) // 3 locals runs — the ref sits BETWEEN two i32 runs, so the vector splits
+  wULEB(3) // n(3), i(4), cp(5)
+  wU8(127) // 0x7f i32
+  wULEB(1)
+  wU8(100) // 0x64 (ref $sBackIdx) — out(6), set once at top level before any read
+  wSLEB(sBackIdx)
+  wULEB(1) // w(7)
+  wU8(127) // 0x7f i32
+  // pass 1: n = Σ width(cp)
+  fbI32Const(0)
+  fbLocalSet(3)
+  fbI32Const(0)
+  fbLocalSet(4)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(4)
+  fbLocalGet(2)
+  fbI32Bin(78) // i32.ge_s
+  fbBrIf(1)
+  fbUtf8EncRead(4, 5)
+  fbLocalGet(3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(3)
+  fbUtf8WidthStep(128)
+  fbUtf8WidthStep(2048)
+  fbUtf8WidthStep(65536)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(4)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // out = array.new_default $sBackIdx n
+  fbLocalGet(3)
+  fbArrayNewDefault(sBackIdx)
+  fbLocalSet(6)
+  // pass 2: write
+  fbI32Const(0)
+  fbLocalSet(7)
+  fbI32Const(0)
+  fbLocalSet(4)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(4)
+  fbLocalGet(2)
+  fbI32Bin(78) // i32.ge_s
+  fbBrIf(1)
+  fbUtf8EncRead(4, 5)
+  // 1 byte: 0xxxxxxx
+  fbLocalGet(5)
+  fbI32Const(128)
+  fbI32Bin(72) // i32.lt_s
+  fbIf(64)
+  fbUtf8Put(6, 7, 0)
+  fbLocalGet(5)
+  fbArraySet(sBackIdx)
+  fbUtf8Bump(7, 1)
+  fbElse()
+  // 2 bytes: 110xxxxx 10xxxxxx
+  fbLocalGet(5)
+  fbI32Const(2048)
+  fbI32Bin(72) // i32.lt_s
+  fbIf(64)
+  fbUtf8Put(6, 7, 0)
+  fbUtf8Lead(192, 6)
+  fbArraySet(sBackIdx)
+  fbUtf8Put(6, 7, 1)
+  fbUtf8Cont(0)
+  fbArraySet(sBackIdx)
+  fbUtf8Bump(7, 2)
+  fbElse()
+  // 3 bytes: 1110xxxx 10xxxxxx 10xxxxxx
+  fbLocalGet(5)
+  fbI32Const(65536)
+  fbI32Bin(72) // i32.lt_s
+  fbIf(64)
+  fbUtf8Put(6, 7, 0)
+  fbUtf8Lead(224, 12)
+  fbArraySet(sBackIdx)
+  fbUtf8Put(6, 7, 1)
+  fbUtf8Cont(6)
+  fbArraySet(sBackIdx)
+  fbUtf8Put(6, 7, 2)
+  fbUtf8Cont(0)
+  fbArraySet(sBackIdx)
+  fbUtf8Bump(7, 3)
+  fbElse()
+  // 4 bytes: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+  fbUtf8Put(6, 7, 0)
+  fbUtf8Lead(240, 18)
+  fbArraySet(sBackIdx)
+  fbUtf8Put(6, 7, 1)
+  fbUtf8Cont(12)
+  fbArraySet(sBackIdx)
+  fbUtf8Put(6, 7, 2)
+  fbUtf8Cont(6)
+  fbArraySet(sBackIdx)
+  fbUtf8Put(6, 7, 3)
+  fbUtf8Cont(0)
+  fbArraySet(sBackIdx)
+  fbUtf8Bump(7, 4)
+  fbEnd()
+  fbEnd()
+  fbEnd()
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(4)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // The whole-backing header over the exact fit.
+  fbLocalGet(6)
+  fbI32Const(0)
+  fbLocalGet(3)
+  fbStrNew()
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__utf8_cplen__(s) -> i32` — the CODE POINT count of a string view, O(n) and named so
+// (§Codepoints: "operations whose cost depends on the data get a name, not a subscript").
+//
+// IT DRIVES `__utf8_dec__` RATHER THAN COUNTING NON-CONTINUATION BYTES, and the difference
+// is only visible on malformed input — which is exactly why it matters. The cheap count
+// says `"é→".slice(1, 4)` (the bytes `A9 E2 86`) holds ONE code point, because only `E2` is
+// a lead byte; the decode says THREE, because a stray continuation byte and a truncated
+// sequence each yield their own U+FFFD. `for cp in s` iterates three times, so the cheap
+// count would make `cpLen()` disagree with the loop it is supposed to measure — a second
+// answer to one question, which is this emitter's signature defect wearing a different hat.
+// Sharing the decoder makes the two unconditionally equal, at the cost of a call per code
+// point on a function that is already O(n) and already named for its cost.
+//
+// Params: s(0). Locals: back(1) `(ref null $sBackIdx)`, i(2), end(3), n(4).
+function emitUtf8CpLenFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(2)
+  wULEB(1)
+  wU8(99)       // 0x63 (ref null ht) — the hoisted backing
+  wSLEB(sBackIdx)
+  wULEB(3)
+  wU8(127)      // 0x7f i32 (i, end, n)
+  fbLocalGet(0)
+  fbStrBack()
+  fbLocalSet(1)
+  fbLocalGet(0)
+  fbStrStart()
+  fbLocalSet(2)
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbStrLen()
+  fbI32Bin(106) // i32.add
+  fbLocalSet(3)
+  fbI32Const(0)
+  fbLocalSet(4)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(2)
+  fbLocalGet(3)
+  fbI32Bin(78)  // i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(4) // one more code point
+  fbLocalGet(2)
+  fbLocalGet(1)
+  wU8(212)      // 0xd4 ref.as_non_null — the hoist slot is nullable; the call is not
+  fbLocalGet(2)
+  fbLocalGet(3)
+  fbCall(gHelpUtf8Dec)
+  fbI32Const(24)
+  fbI32Bin(118) // 0x76 i32.shr_u — the WIDTH, the same stride `for cp in s` takes
+  fbI32Bin(106) // i32.add
+  fbLocalSet(2)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  fbLocalGet(4)
+  fbEnd()       // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__str_bytes__(s) -> (ref $bl8TypeIdx)` — `s.bytes()`, the `u8[]` view of a string's UTF-8
+// storage (§Byte view). One `array.copy` of the VIEW's byte range into an exact-fit packed
+// backing, wrapped in the ordinary `{backing, len, cap}` list struct.
+//
+// IT COPIES, AND `strings-design.md` §Byte view SAYS IT WOULD NOT. That claim assumed the
+// `u8[]` wrapper could alias `$backing`/`$start`/`$len` directly; it cannot, because a `u8[]`
+// wrapper has NO `start` field — `xs[i]` is `backing[i]`, full stop — so a view whose `start`
+// is non-zero has no wrapper spelling at all. Making one exist means giving `u8[]` a slice
+// header too, i.e. the same migration this stage just performed, on a second type. That is a
+// separate change with its own gates, and pretending otherwise here would mean a `bytes()`
+// that is zero-copy on `s` and silently wrong on `s.slice(1)`. Filed, not done.
+//
+// What it still buys over the four lines of VL that would do the same thing is that this is
+// ONE `array.copy` — a memcpy the engine lowers to `memmove` — where a VL loop is one
+// `array.get_u` + one `array.set` per byte. That is the property that keeps it a core
+// intrinsic under OQ-3's rule rather than a `std:str` function.
+//
+// Params: s(0). Locals: out(1), a NON-NULL `(ref $ba8TypeIdx)` set before every read.
+function emitStrBytesFnCode(out: i32[]) {
+  const body: i32[] = []
+  const prev = wTarget(body)
+  wULEB(1)
+  wULEB(1)
+  wU8(100) // 0x64 (ref $ba8TypeIdx) — out
+  wSLEB(ba8TypeIdx)
+  // out = array.new_default $ba8 (s.len)
+  fbLocalGet(0)
+  fbStrLen()
+  fbArrayNewDefault(ba8TypeIdx)
+  fbLocalSet(1)
+  // array.copy out 0 s.backing s.start s.len — the cross-heap-type copy is legal because
+  // `array.copy` validates on STORAGE types (i8 into i8), not on heap-type identity.
+  fbLocalGet(1)
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbStrBack()
+  fbLocalGet(0)
+  fbStrStart()
+  fbLocalGet(0)
+  fbStrLen()
+  fbArrayCopy(ba8TypeIdx, sBackIdx)
+  // { backing: out, len: s.len, cap: s.len } — an exact fit, as `array.new_fixed` makes.
+  fbLocalGet(1)
+  fbLocalGet(0)
+  fbStrLen()
+  fbLocalGet(0)
+  fbStrLen()
+  fbStructNew(bl8TypeIdx)
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // THE INDEX-CAPACITY POWER-OF-TWO INVARIANT, which both probe helpers and the
 // rehash rely on to wrap with `i32.and` instead of `i32.rem_u` (a hardware
 // divide on every probe and every collision step). The `index` array's length is
@@ -2597,7 +3152,8 @@ function emitNameSection(n: i32) {
   const fnameMap: i32[] = []
   const mapPrev = wTarget(fnameMap)
   let count = gImports + n
-  if gHelpStrHash >= 0 { count = count + 3 }
+  if gHelpStrHash >= 0 { count = count + 6 }
+  if gHelpStrBytes >= 0 { count = count + 1 }
   if gHelpMapProbe >= 0 { count = count + 2 }
   if gHelpMapProbeI32 >= 0 { count = count + 1 }
   wULEB(count)
@@ -2674,6 +3230,16 @@ function emitNameSection(n: i32) {
     wName("__str_eq__")
     wULEB(gHelpStrConcat)
     wName("__str_concat__")
+    wULEB(gHelpUtf8Dec)
+    wName("__utf8_dec__")
+    wULEB(gHelpUtf8Enc)
+    wName("__utf8_enc__")
+    wULEB(gHelpUtf8CpLen)
+    wName("__utf8_cplen__")
+  }
+  if gHelpStrBytes >= 0 {
+    wULEB(gHelpStrBytes)
+    wName("__str_bytes__")
   }
   if gHelpMapProbe >= 0 {
     wULEB(gHelpMapProbe)
@@ -2726,7 +3292,7 @@ function collectStrPool() {
     const nd = P.nodes[i]
     if nd is StrLit {
       if (gStrPoolIx[nd.strText] ?? -1) < 0 {
-        if decodeStr(strToCps(nd.strText)).length <= NEW_FIXED_MAX {
+        if cpsToUtf8(decodeStr(strToCps(nd.strText))).length <= NEW_FIXED_MAX {
           gStrPoolIx[nd.strText] = gStrPoolTexts.length
           gStrPoolTexts.push(nd.strText)
         }
@@ -2794,6 +3360,10 @@ function emitModule(_stmts: i32[]) {
   gHelpStrHash = -1
   gHelpStrEq = -1
   gHelpStrConcat = -1
+  gHelpUtf8Dec = -1
+  gHelpUtf8Enc = -1
+  gHelpUtf8CpLen = -1
+  gHelpStrBytes = -1
   gHelpMapProbe = -1
   gHelpMapProbeI32 = -1
   gHelpMapResize = -1
@@ -2806,6 +3376,22 @@ function emitModule(_stmts: i32[]) {
     nHelpers = nHelpers + 1
     gHelpStrConcat = helpBase + nHelpers
     nHelpers = nHelpers + 1
+    // The UTF-8 codec trio, AFTER the string trio so a program's existing helper indices
+    // are unmoved by Stage 2c. Same `aUsed` gate and same "enabled-but-uncalled costs a
+    // few dozen bytes, never correctness" trade the trio above documents.
+    gHelpUtf8Dec = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpUtf8Enc = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpUtf8CpLen = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    // `s.bytes()` needs the PACKED PAIR to exist, so unlike its three neighbours it is
+    // gated on `ba8Used` as well — `bl8TypeIdx` is 0 when unminted and a helper naming it
+    // would collide with heap type 0.
+    if ba8Used {
+      gHelpStrBytes = helpBase + nHelpers
+      nHelpers = nHelpers + 1
+    }
   }
   if mUsed {
     gHelpMapProbe = helpBase + nHelpers
@@ -3203,6 +3789,20 @@ function scanPrintUse() {
             if (iscal & REP_SCAL_F32) != 0 { sawF32 = true }
           }
         }
+      }
+      // `s.bytes()` yields a `u8[]` (Stage 2c, §Byte view). It is the one producer of a
+      // packed byte list that spells no `u8[]` ANYWHERE — the annotation scan matches a
+      // TYPE, and `for b in s.bytes()` has none — so without this the `ba8`/`bl8` pair is
+      // never minted and `struct.new $bl8` names a heap type that does not exist. This is
+      // the same window and the same argument as the `fsRetIsU8List` forcing above.
+      //
+      // MATCHED ON THE PROPERTY NAME ALONE, deliberately: this pass runs before the
+      // emitter's receiver classifiers are usable, and over-forcing is a pair of unused
+      // 3-byte types in a program that spells `.bytes()` on something else, while
+      // under-forcing is invalid wasm. The presence flags in this file are all sized that
+      // way (`aUsed` is set by string OR list use, for the same reason).
+      if pcallee is Member {
+        if pcallee.memProp == "bytes" { ba8Used = true }
       }
     }
     // Any type annotation CONTAINING an i64/f64/f32 leaf anywhere — bare, `T[]`
@@ -3623,9 +4223,21 @@ function helpValtype(c: i32) {
     return 0
   }
   wU8(100) // 0x64 (ref ht) — non-null
-  if c == 'm' { wSLEB(mkArrIdx) }
-  else if c == 's' { wSLEB(sTypeIdx) }
-  else { wSLEB(aTypeIdx) }
+  if c == 'm' {
+    wSLEB(mkArrIdx)
+  } else if c == 's' {
+    wSLEB(sTypeIdx)
+  } else if c == 'b' {
+    // 'b' = the string's BACKING, `(ref $sBackIdx)` — distinct from 'a' since Stage 2a and
+    // distinct in STORAGE TYPE since Stage 2c (packed i8, not i32). `__utf8_dec__` is the
+    // only helper that takes one; naming 'a' here would be a call-site type mismatch.
+    wSLEB(sBackIdx)
+  } else if c == 'y' {
+    // 'y' = the `u8[]` WRAPPER, `(ref $bl8TypeIdx)` — `__str_bytes__`'s result.
+    wSLEB(bl8TypeIdx)
+  } else {
+    wSLEB(aTypeIdx)
+  }
   0
 }
 
@@ -3967,11 +4579,13 @@ function emitTypeSection(
     wU8(1)   // mutable
     // `string`'s OWN BACKING array heap type ($sBackIdx), minted from the same `aUsed` flag
     // and emitted immediately after it (`mAssignTypeIndices` allocates the triple in this
-    // order). STRUCTURALLY IDENTICAL to the one above — the elements are still i32 CODE
-    // POINTS at Stage 2b; only the INDEX is the string's own, which is what the UTF-8 storage
-    // change (Stage 2c) needs in order to be a one-line edit here.
+    // order). STAGE 2c: its storage type is PACKED i8 and its elements are UTF-8 BYTES, not
+    // i32 code points — this one byte is the whole storage half of the migration. It is
+    // NOT `ba8TypeIdx` (the `u8[]` backing) even though the two are now structurally
+    // identical: iso-recursive identity is (rec group, POSITION), so keeping the index
+    // separate is what makes a missed lowering site invalid wasm instead of a silent share.
     wU8(94)  // 0x5e array
-    wU8(127) // 0x7f i32 storagetype
+    wU8(120) // 0x78 i8 storagetype — PACKED UTF-8 bytes (Stage 2c)
     wU8(1)   // mutable
     // THE STRING HEADER ($sTypeIdx) — Stage 2b. A `string` VALUE is this struct, a VIEW over
     // the backing above: `{ backing: (ref $sBackIdx), start: i32, len: i32 }`. All three
@@ -4445,9 +5059,15 @@ function emitTypeSection(
   }
   // The shared runtime helpers, in helper-index order.
   if gHelpStrHash >= 0 {
-    helpFuncType("s", "i")  // __str_hash__: (str) -> i32
-    helpFuncType("ss", "i") // __str_eq__: (str, str) -> i32
-    helpFuncType("ss", "s") // __str_concat__: (str, str) -> (ref str)
+    helpFuncType("s", "i")   // __str_hash__: (str) -> i32
+    helpFuncType("ss", "i")  // __str_eq__: (str, str) -> i32
+    helpFuncType("ss", "s")  // __str_concat__: (str, str) -> (ref str)
+    helpFuncType("bii", "i") // __utf8_dec__: (strBacking, i, end) -> (width<<24)|cp
+    helpFuncType("aii", "s") // __utf8_enc__: (i32Backing, start, len) -> (ref str)
+    helpFuncType("s", "i")   // __utf8_cplen__: (str) -> i32
+    if ba8Used {
+      helpFuncType("s", "y") // __str_bytes__: (str) -> (ref u8[])
+    }
   }
   if gHelpMapProbe >= 0 {
     // __map_probe__: (keyHash, index, hashes, live, keysBacking, key) -> slot — three 'a'
@@ -4671,9 +5291,10 @@ function emitGlobalSection() {
     wULEB(nCells + np)
     // The string-literal POOL first (indices 0..np-1, before the user cells — see
     // `gStrPoolTexts`): each entry an IMMUTABLE non-null string ref whose init
-    // constexpr builds the literal once (`i32.const` per code point +
-    // `array.new_fixed` for the backing, then `struct.new` for the whole-backing header —
-    // every pooled literal fits the cap by construction).
+    // constexpr builds the literal once (`i32.const` per UTF-8 BYTE +
+    // `array.new_fixed` for the packed backing, then `struct.new` for the whole-backing
+    // header — every pooled literal fits the cap by construction, in the same BYTE unit
+    // `collectStrPool` measured it in).
     //
     // `array.new_fixed` and `struct.new` are BOTH constant instructions under the GC
     // proposal, so the header construction stays inside the init constexpr and the pool
@@ -4683,7 +5304,7 @@ function emitGlobalSection() {
       wU8(100) // 0x64 (ref $sTypeIdx) — non-null string ref
       wSLEB(sTypeIdx)
       wU8(0)   // immutable
-      const pcps = decodeStr(strToCps(gStrPoolTexts[pli]))
+      const pcps = cpsToUtf8(decodeStr(strToCps(gStrPoolTexts[pli])))
       let pci = 0
       while pci < pcps.length {
         fbI32Const(pcps[pci])
@@ -5066,6 +5687,12 @@ function emitCodeSection(n: i32, hasStart: i32, memFn: i32, nHelpers: i32) {
     if emitStrHashFnCode(codePayload) < 0 { return -1 }
     if emitStrEqFnCode(codePayload) < 0 { return -1 }
     if emitStrConcatFnCode(codePayload) < 0 { return -1 }
+    if emitUtf8DecFnCode(codePayload) < 0 { return -1 }
+    if emitUtf8EncFnCode(codePayload) < 0 { return -1 }
+    if emitUtf8CpLenFnCode(codePayload) < 0 { return -1 }
+    if gHelpStrBytes >= 0 {
+      if emitStrBytesFnCode(codePayload) < 0 { return -1 }
+    }
   }
   if gHelpMapProbe >= 0 {
     if emitMapProbeFnCode(codePayload) < 0 { return -1 }

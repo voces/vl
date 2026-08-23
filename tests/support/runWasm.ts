@@ -133,7 +133,10 @@ const mapTrap = (err: unknown): unknown => {
  */
 export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   const logs: string[] = [];
-  // Accumulates code points streamed by `__print_char__` until `__print_str_flush__`.
+  // Accumulates the UTF-8 BYTES streamed by `__print_char__` until `__print_str_flush__`.
+  // STAGE 2c: the guest hands over its storage bytes verbatim — the import's name is
+  // historical, and the code-point spread this used to do rendered every multi-byte
+  // character as its bytes read as Latin-1.
   const printChars: number[] = [];
   let exports: WebAssembly.Exports = {};
   try {
@@ -209,14 +212,11 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
           }]),
         ),
         __print_str_flush__: () => {
-          // Chunk the code-point→string conversion: `String.fromCodePoint(...spread)`
-          // blows the JS call-argument limit on very large prints — build the line
-          // in bounded slices instead.
-          let s = "";
-          for (let i = 0; i < printChars.length; i += 8192) {
-            s += String.fromCodePoint(...printChars.slice(i, i + 8192));
-          }
-          logs.push(s);
+          // `TextDecoder` takes the whole buffer, so the chunking this used to need is
+          // gone with its cause: `String.fromCodePoint(...spread)` blew the JS
+          // call-argument limit on very large prints. Lossy per §Validity — a string
+          // sliced off a character boundary is a legal VL value and must print.
+          logs.push(new TextDecoder().decode(new Uint8Array(printChars)));
           printChars.length = 0;
         },
       },

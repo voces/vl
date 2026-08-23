@@ -14,7 +14,8 @@
 /** Instantiate `wasm` and return the captured `print`/`log` lines. */
 export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
   const logs: string[] = [];
-  // Accumulates code points streamed by `__print_char__` until `__print_str_flush__`.
+  // Accumulates the UTF-8 BYTES streamed by `__print_char__` until `__print_str_flush__`
+  // (Stage 2c: a string's element is a byte, and the guest streams its storage verbatim).
   const printChars: number[] = [];
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
   await WebAssembly.instantiate(wasm, {
@@ -54,16 +55,10 @@ export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
       __print_f32__: (v: number) => logs.push(String(v)),
       __print_f64__: (v: number) => logs.push(String(v)),
       __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
-      // A string prints by streaming its code points; flush assembles the line.
+      // A string prints by streaming its UTF-8 bytes; flush decodes the line.
       __print_char__: (code: number) => printChars.push(code),
       __print_str_flush__: () => {
-        // Chunk the code-point→string conversion: `String.fromCodePoint(...spread)`
-        // blows the JS call-argument limit on very large prints — build in slices.
-        let s = "";
-        for (let i = 0; i < printChars.length; i += 8192) {
-          s += String.fromCodePoint(...printChars.slice(i, i + 8192));
-        }
-        logs.push(s);
+        logs.push(new TextDecoder().decode(new Uint8Array(printChars)));
         printChars.length = 0;
       },
     },

@@ -1,6 +1,33 @@
 # `std:utf8` under byte-indexed UTF-8 — the semantic audit
 
-> **Status: audit, complete. One ruling made (§at), three filed for the
+> **Status: audit complete, and ALL THREE FILED QUESTIONS ARE NOW ANSWERED (Stage 2c).**
+>
+> * **§NonScalar → SUBSTITUTE U+FFFD, in the core.** `fromCodePoints` and `fromCodePoint`
+>   share one encoder and both replace a value with no UTF-8 encoding — lone surrogate,
+>   past U+10FFFF, negative — with U+FFFD; `print` streams those replacement bytes instead
+>   of dropping. `strings-design.md` §Validity carries the ruling and
+>   `tests/cases/strings/utf8-lenient.vl` pins it. Consequence taken further than this
+>   document suggested: `scalar`/`utf8Width` are DELETED rather than kept as defensive
+>   code. A post-swap string cannot hold a non-scalar, so they were a second copy of a rule
+>   that no test could ever catch disagreeing with the first.
+> * **§Ownership → `s.bytes()` COPIES, so there is NO contract change.** The read-only view
+>   this document recommended is not buildable: a `u8[]` wrapper has no `start` field, so a
+>   view of a SLICED string has no spelling, and a `u8[]` is mutable, so aliasing would hand
+>   out a writable pointer into an immutable string. `encodeUtf8` therefore still returns
+>   the fresh, mutable, growable array it always did. `strings-design.md` §Byte view is
+>   amended; the zero-copy claim is withdrawn there rather than left standing.
+> * **§Wrap → RAW.** `encodeUtf8` is `self.bytes()` and hands back the storage bytes
+>   unexamined, so a string holding a partial sequence round-trips as itself. That is what
+>   also makes `utf8Length` exactly `self.length`, per this document's own no-drift
+>   invariant.
+>
+> **Both (d) exports collapsed as predicted:** `utf8Length` → `self.length` (O(n) → O(1)),
+> `encodeUtf8` → `self.bytes()` (a transcode loop → one `array.copy`). The recommended
+> DELETION of `utf8Length` was NOT taken — it is a subtractive change to a shipped `std:`
+> surface with its own fixture edit, and bundling a breaking removal into the change whose
+> claim is that nothing else moved would forfeit that claim.
+>
+> **Original status: audit, complete. One ruling made (§at), three filed for the
 > compiler-side agent (§NonScalar, §Ownership, §Wrap). Two exports were BROKEN by
 > the migration and are repaired here, behaviour-identically.** This is the
 > companion to `str-byte-semantics.md`, which audited `std/str.vl` and closed

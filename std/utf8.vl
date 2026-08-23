@@ -104,92 +104,66 @@ export type Utf8Error = { at: i32, byte: i32, msg: string }
 // U+FFFD, substituted in both directions.
 const REPLACEMENT = 0xFFFD
 
-// `cp` if it is a Unicode scalar value, U+FFFD otherwise. The three non-scalars
-// an i32 can hold: below the range, above it, and the surrogate block
-// D800..DFFF — which UTF-8 must never carry (a codec that accepts them is
-// CESU-8/WTF-8, not UTF-8).
+// THE ENCODE SIDE OF THIS MODULE IS GONE, AND `scalar`/`utf8Width` WENT WITH IT.
 //
-// THE SWAP TAKES THIS RULING AWAY FROM THIS MODULE AND HANDS IT TO THE CORE, and
-// that hand-over is an item on `utf8-byte-ready.md`'s checklist rather than a
-// detail. `fromCodePoints` stores a non-scalar VERBATIM today — measured:
-// `fromCodePoints([0xD800]).charCodeAt(0)` is 55296, `[0x110000]` is 1114112,
-// `[-1]` is -1 — which is only possible because the backing is `i32`. Once the
-// backing is UTF-8 bytes there is no such storage, so `fromCodePoints` itself
-// must substitute, trap, or drop. It matters that it picks SUBSTITUTE: `print`
-// already DROPS non-scalars (`print(fromCodePoints([97, 0xD800, 98]))` writes
-// `ab`) while `encodeUtf8` substitutes U+FFFD, so the tree already holds the two
-// different opinions about invalid input this module's header exists to prevent
-// — and the swap is the moment one of them has to win.
-function scalar(cp: i32) {
-  if cp < 0 { return REPLACEMENT }
-  if cp > 0x10FFFF { return REPLACEMENT }
-  if cp >= 0xD800 && cp <= 0xDFFF { return REPLACEMENT }
-  cp
-}
-
-// How many bytes `cp` occupies once encoded — applying the SAME substitution the
-// encoder applies, which is what makes `utf8Length` an exact prediction of what
-// `encodeUtf8` produces rather than an estimate. One width function, so the
-// measurement and the encoder cannot drift.
-function utf8Width(cp: i32) {
-  const c = scalar(cp)
-  if c < 0x80 { return 1 }
-  if c < 0x800 { return 2 }
-  if c < 0x10000 { return 3 }
-  4
-}
+// They existed to hold ONE ruling — *a VL string is an i32 sequence and nothing stops it
+// holding -1, 0x110000 or a lone surrogate, so encode substitutes U+FFFD* — and
+// `utf8-byte-ready.md` §NonScalar filed the hand-over: the swap forces the CORE to pick,
+// because a UTF-8 backing has no storage for a non-scalar at all. The core picked
+// SUBSTITUTE, in `fromCodePoints` (and `print` now agrees with it instead of dropping —
+// it streams the stored replacement bytes). So a post-swap string CANNOT contain a
+// non-scalar, and there is nothing left for a substitution branch here to substitute for.
+//
+// The audit suggested leaving them as "unreachable-but-harmless defensive code that
+// documents the rule". Deleted instead, for the reason this codebase keeps rediscovering:
+// a second copy of a rule is a thing that can disagree with the first, and dead code cannot
+// be caught disagreeing by any test. The rule is documented HERE, once, next to the fact
+// that the core now owns it.
 
 // `s.utf8Length()` — the exact length of `s.encodeUtf8()`, WITHOUT encoding it.
-// Distinct from `s.length`, which counts code points TODAY and bytes after the
-// §Storage swap: the two agree for ASCII and for nothing else, and the direction
-// of the disagreement is about to flip. Exported because it is the only way to
-// answer "how big will this be on the wire" — a size check, a quota, a header
-// field — short of producing the bytes and throwing them away.
 //
-// **It iterates, it does not index** — see `encodeUtf8` for why, and
-// `docs/internals/utf8-byte-ready.md` for the fact that this export collapses to
-// `self.length` the day the swap lands.
-export function utf8Length(self: string) {
-  let n = 0
-  for cp in self { n = n + utf8Width(cp) }
-  n
-}
+// THE SWAP LANDED AND THIS IS NOW `self.length`, EXACTLY. A string IS its UTF-8 bytes, so
+// the number this used to compute in O(n) is the number the header already holds in O(1)
+// (`docs/internals/utf8-byte-ready.md` §utf8Length predicted the collapse; this is it).
+//
+// The collapse is only sound because §Wrap ruled `encodeUtf8` RAW: a string holding
+// malformed bytes (legal — slicing off a character boundary is permitted, §Validity) keeps
+// those bytes through `encodeUtf8`, so `.length` still counts exactly what the encoder
+// emits. The pre-swap spelling — decode to code points, re-measure each — would instead
+// answer 3 per replacement character and DISAGREE with its own encoder, breaking the
+// module header's no-drift invariant in the opposite direction.
+//
+// The audit recommends deleting this export outright as a second name for `.length`. Not
+// taken here: it is a purely subtractive change to a shipped `std:` surface with its own
+// fixture edit, and bundling it into the representation migration would put a breaking
+// removal inside the change whose whole claim is that nothing else moved.
+export function utf8Length(self: string) { self.length }
 
-// `s.encodeUtf8()` — `s` as UTF-8 bytes. Total: a non-scalar element encodes as
-// U+FFFD (this module's header).
+// `s.encodeUtf8()` — `s` as UTF-8 bytes.
 //
-// THE LOOP IS `for cp in self`, NOT `while i < self.length`, AND THAT IS LOAD-
-// BEARING. The body is an ENCODER: every branch of it reads its input as a CODE
-// POINT and writes BYTES. `for cp in self` yields code points today and
-// `strings-design.md` §Codepoints keeps it yielding code points after `s[i]` and
-// `.length` become byte-valued — so producer and consumer are a matched pair
-// whose meanings move together. The indexed spelling agreed only by coincidence:
-// the day `charCodeAt` reads a byte, `"é"` (C3 A9) would encode as C3 83 C2 A9,
-// which is the double-encoding defect `docs/internals/str-byte-semantics.md`
-// §Builders found in `std:str`. Same class, opposite direction, no type error to
-// catch it — a byte and a code point are both `i32`.
-export function encodeUtf8(self: string): u8[] {
-  const out: u8[] = []
-  for cp in self {
-    const c = scalar(cp)
-    if c < 0x80 {
-      out.push(c)
-    } else if c < 0x800 {
-      out.push(0xC0 | (c >> 6))
-      out.push(0x80 | (c & 0x3F))
-    } else if c < 0x10000 {
-      out.push(0xE0 | (c >> 12))
-      out.push(0x80 | ((c >> 6) & 0x3F))
-      out.push(0x80 | (c & 0x3F))
-    } else {
-      out.push(0xF0 | (c >> 18))
-      out.push(0x80 | ((c >> 12) & 0x3F))
-      out.push(0x80 | ((c >> 6) & 0x3F))
-      out.push(0x80 | (c & 0x3F))
-    }
-  }
-  out
-}
+// THE SWAP LANDED AND THIS IS NOW `self.bytes()`. The transcoding loop is gone: a string is
+// already its UTF-8 bytes, so the core intrinsic's single `array.copy` produces exactly what
+// the 20-line encoder produced, at memcpy speed.
+//
+// THE TWO CONTRACT QUESTIONS `utf8-byte-ready.md` FILED, ANSWERED:
+//
+// §Wrap (raw or sanitized?) — **RAW**, as recommended. `bytes()` hands back the storage
+// bytes unexamined, so a string holding a partial sequence round-trips through
+// `encodeUtf8`/`decodeUtf8` as itself rather than being silently repaired. A caller who
+// wants the guarantee composes it — `decodeUtf8Lossy(s.bytes())` — and pays visibly.
+//
+// §Ownership (view or fresh array?) — **FRESH**, and therefore NO contract change at all.
+// `s.bytes()` COPIES (`emitStrBytesFnCode`), because a `u8[]` wrapper has no `start` field
+// and so cannot express a view of a sliced string, and because a `u8[]` is MUTABLE — an
+// aliasing `bytes()` would hand out a writable pointer into an immutable string's storage
+// and break every argument that rests on that immutability. So the result is still the
+// fresh, mutable, growable array callers have always got, `b[0] = 74` and all.
+//
+// The substitution branch this used to carry is gone with the loop, and cannot be missed:
+// §NonScalar's ruling moved into the CORE, where `fromCodePoints` now substitutes U+FFFD
+// for a non-scalar. A post-swap string cannot contain one, so there is nothing left here to
+// substitute FOR.
+export function encodeUtf8(self: string): u8[] { return self.bytes() }
 
 // The one decode loop. The strict/lossy fork is a PARAMETER rather than two
 // copies so the two public spellings cannot disagree about what "ill-formed"

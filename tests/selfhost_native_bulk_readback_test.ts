@@ -99,6 +99,9 @@ const loadString = (exp: Exports, load: (n: number) => number, s: string) => {
 const BYTE_CAP = seedExists
   ? stagingMemory(instantiate()).buffer.byteLength
   : 65536;
+// The INTAKE window is still one UTF-32 code point per word (`srcLoad`/`cliResultLoad`
+// take code points and `fromCodePoints` encodes them), so the /4 cap survives on that
+// side. The READ-BACK side is bytes on BOTH channels since Stage 2c.
 const CP_CAP = (BYTE_CAP / 4) | 0;
 
 /** Offsets and counts that hit every boundary the two loops have: the start, the
@@ -154,7 +157,15 @@ const bytesBulk = (
   };
 };
 
-// ── the CODE-POINT channel ────────────────────────────────────────────────────
+// ── the CLI-DATA channel (BYTES since Stage 2c) ───────────────────────────────
+//
+// This channel used to be UTF-32LE, one code point per i32 word, because a string's
+// ELEMENT was a code point. Stage 2c made it a UTF-8 byte, so `cliCmdDataStore` now packs
+// FOUR elements per word exactly as `rbyteStore` always has — §2.6 of the migration map
+// predicted the two would converge the moment the element became a byte, and they have.
+// What follows is therefore the same shape as the byte-channel block above, and the astral
+// assertion at the end is what proves the packing is UTF-8 and not something that merely
+// looks right for ASCII.
 
 /** Drive the CLI pump to a `CMD_PRINT_OUT` whose payload is longer than two
  * chunks: `fmt` of a generated file, serviced entirely in memory. Returns the
@@ -163,6 +174,7 @@ const bytesBulk = (
  * The generated file is COMMENTS: the formatter preserves them verbatim, so the
  * output length is under the test's control and the payload carries astral
  * characters through a channel that must treat them as one element each. */
+const PRINT_LINES = 5000;
 const bigPrint = (): Exports => {
   const exp = instantiate();
   const arg = (s: string) => {
@@ -174,7 +186,13 @@ const bigPrint = (): Exports => {
   arg("generated.vl");
   arg("--color=never");
   let body = "";
-  for (let i = 0; i < 3000; i++) {
+  // STAGE 2c RAISED THIS COUNT, AND THE REASON IS THE POINT OF THE TEST. The channel's
+  // chunk was `memory.data_size() / 4` when its element was a UTF-32 code point and is
+  // the full `memory.data_size()` now that it is a byte — four times as many elements per
+  // chunk — so a 3,000-line payload that used to span six chunks spans less than two. A
+  // test that no longer reaches the seam it is named for is a test that passes for the
+  // wrong reason, which is why the guard below is a hard failure and not a skip.
+  for (let i = 0; i < PRINT_LINES; i++) {
     body += `// line ${String(i).padStart(6, "0")} 🚀漢字 ${"x".repeat(8)}\n`;
   }
   body += "function f(): i32 { 1 }\n";
@@ -209,8 +227,10 @@ const cpsBulk = (
 ): { written: number; cps: number[] } => {
   const written = exp.cliCmdDataStore(off, count);
   const mem = stagingMemory(exp);
-  const view = new Int32Array(mem.buffer, 0, Math.max(written, 0));
-  return { written, cps: Array.from(view) };
+  return {
+    written,
+    cps: Array.from(new Uint8Array(mem.buffer, 0, Math.max(written, 0))),
+  };
 };
 
 // ── the assertions ────────────────────────────────────────────────────────────
@@ -241,9 +261,10 @@ Deno.test({
   name: "bulk readback: the staging window is a whole 64 KiB page",
   ignore,
   fn: () => {
-    // A PROTOCOL assertion, not a performance one: the host derives its byte
-    // chunk from `memory.data_size()` and its code-point chunk from that over 4,
-    // so a window that came out a different size would silently change both.
+    // A PROTOCOL assertion, not a performance one: the host derives its read-back
+    // chunk from `memory.data_size()` — in BYTES for both channels since Stage 2c — and
+    // its INTAKE chunk from that over 4, because the intake element is still an i32 code
+    // point. A window that came out a different size would silently change both.
     assertEquals(BYTE_CAP, 65536);
     assertEquals(CP_CAP, 16384);
   },
@@ -305,18 +326,18 @@ Deno.test({
 });
 
 Deno.test({
-  name: "bulk readback: code points — bulk == per-call across the chunk seam",
+  name: "bulk readback: cli data — bulk == per-call across the chunk seam",
   ignore,
   fn: () => {
     const exp = bigPrint();
     const len = exp.cliCmdDataLen();
-    if (len <= 2 * CP_CAP) {
+    if (len <= 2 * BYTE_CAP) {
       throw new Error(
-        `the generated print payload is ${len} code points — under two chunks ` +
-          `(${2 * CP_CAP}), so this test no longer reaches the seam`,
+        `the generated print payload is ${len} bytes — under two chunks ` +
+          `(${2 * BYTE_CAP}), so this test no longer reaches the seam`,
       );
     }
-    for (const [off, count] of matrix(len, CP_CAP)) {
+    for (const [off, count] of matrix(len, BYTE_CAP)) {
       const { written, cps } = cpsBulk(exp, off, count);
       assertEquals(
         written,
@@ -333,17 +354,18 @@ Deno.test({
 });
 
 Deno.test({
-  name: "bulk readback: code points — astral characters are ONE element each",
+  name: "bulk readback: cli data — an astral character is FOUR elements, and survives",
   ignore,
   fn: () => {
-    // The pipe is UTF-32LE. A channel that wrote UTF-16 code UNITS would pass
-    // every ASCII assertion above and desynchronise here.
+    // The pipe is packed UTF-8. A channel that wrote one element per WORD, or that
+    // re-encoded each byte as its own character, would pass every ASCII assertion above
+    // and desynchronise here.
     const exp = bigPrint();
     const len = exp.cliCmdDataLen();
     const whole: number[] = [];
     let off = 0;
     while (off < len) {
-      const want = Math.min(len - off, CP_CAP);
+      const want = Math.min(len - off, BYTE_CAP);
       const { written, cps } = cpsBulk(exp, off, want);
       if (written <= 0 || written > want) {
         throw new Error(`cliCmdDataStore(${off}, ${want}) returned ${written}`);
@@ -352,14 +374,19 @@ Deno.test({
       off += written;
     }
     assertEquals(whole, cpsPerCall(exp, 0, len));
-    const text = String.fromCodePoint(...whole);
+    const text = new TextDecoder().decode(new Uint8Array(whole));
     assertEquals(
       text.includes("🚀漢字"),
       true,
       "the astral run did not survive",
     );
-    // 3,000 rocket + 3,000 CJK code points, each ONE element of the channel.
-    assertEquals(whole.filter((c) => c === 0x1f680).length, 3000);
+    // One rocket per line, each FOUR elements of the channel — U+1F680 is `F0 9F 9A 80`. The
+    // lead byte is what is counted: it appears once per character, so the count is the
+    // character count while the ELEMENT count is four times it. Under the old UTF-32
+    // channel this same assertion counted `0x1f680` itself; that it had to change is the
+    // unit moving, and that it still reads 3,000 is the payload surviving.
+    assertEquals(whole.filter((c) => c === 0xf0).length, PRINT_LINES);
+    assertEquals(len, whole.length);
   },
 });
 
