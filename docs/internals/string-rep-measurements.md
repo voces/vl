@@ -531,25 +531,43 @@ is zero" concludes from it that "every corpus fixture keeps working
 | file | n | what it asserts | survives byte-indexing? |
 |---|---|---|---|
 | `tests/cases/std/utf8-roundtrip.vl` | 5 | `encodeUtf8("é").length` etc. — all `u8[]` lengths | yes |
-| `tests/cases/std/utf8-lossy.vl` | 2 | `decodeUtf8Lossy(twoBad).length` == 4, with the comment *"A VL string IS a code-point sequence, so `.length` counts characters, not the 8 bytes"* (`:27`) | **NO — prints 8** |
+| `tests/cases/std/utf8-lossy.vl` | 2 | ~~`decodeUtf8Lossy(twoBad).length` == 4~~ — **REPAIRED, see below** | ~~**NO — prints 8**~~ → **yes** |
 | `tests/cases/chars/literals.vl` | 2 | `print('é')` == 233 — a char literal stays a code point | yes |
 | `tests/cases/strings/escapes.vl` | 1 | `"é".length` == 1 (`:72`) and `.charCodeAt(0)` == 233 (`:73`) | **NO — 2, and 195** |
 | `tests/cases/lexer/string-escape-runs.vl` | 1 | `@log start🙂midA end` — printed, never indexed | yes |
 
-So the fixture blast radius is **two files and three assertions**, not zero. That
-is still small — but it is not zero, and one of the two is a fixture whose
-*prose comment* states the invariant the change removes. Both must be updated in
-the same PR as the rep change or the corpus sweep will report a spurious
+So the fixture blast radius was **two files and three assertions**, not zero.
+That is still small — but it is not zero, and one of the two was a fixture whose
+*prose comment* stated the invariant the change removes. Both had to be updated
+in the same PR as the rep change or the corpus sweep would report a spurious
 regression.
 
-`std/utf8.vl` (259 lines) is the other user-facing casualty, and it is not a
-casualty so much as an inversion: `utf8Length(self: string)` becomes `s.length`,
-`encodeUtf8(self: string): u8[]` becomes `s.bytes()` — the O(1) zero-copy view
-§Byte view promises — and `decodeUtf8(self: u8[]): string | Utf8Error` becomes a
-header construction plus an optional validity scan. The module does not go away
-(the `Utf8Error`/maximal-subpart semantics of `decodeUtf8Lossy` still need code),
-but four of its six exports change from O(n) transcoders to O(1) wrappers, and
-`tests/cases/std/utf8-*.vl` are its only fixtures.
+> **UPDATED — the radius is now ONE file and ONE assertion.**
+> `tests/cases/std/utf8-lossy.vl:27` no longer prints a `string` `.length`: it
+> counts by `for cp in s`, which yields code points on **both** sides of the swap
+> (§Codepoints), so the fixture reads 4 under either representation with its
+> `@log` block unchanged. It still pins the thing the file exists to pin — the
+> COUNT of replacement characters, a count that only means anything in code
+> points. What remains scheduled to break is `tests/cases/strings/escapes.vl`
+> alone (`"é".length` == 1 → 2, `.charCodeAt(0)` == 233 → 195), and that one is a
+> deliberate pin of the old surface rather than an accident of spelling.
+> Companion: `tests/cases/std/utf8-invariant.vl`, 38 assertions written to be
+> identical across the swap.
+
+`std/utf8.vl` is the other user-facing casualty, and it is not a casualty so much
+as an inversion — **now audited in full at `docs/internals/utf8-byte-ready.md`,
+which corrects the arithmetic in the sentence this paragraph used to end with.**
+`utf8Length(self: string)` becomes `s.length` and `encodeUtf8(self: string): u8[]`
+becomes `s.bytes()` — the O(1) zero-copy view §Byte view promises. But it is
+**two of five exports that collapse, not four of six**: `decodeUtf8`,
+`decodeUtf8At` and `decodeUtf8Lossy` all take a `u8[]`, which is already bytes
+and does not move at all, so they are *unchanged* rather than reduced to
+wrappers. The two that collapse are also the only two the swap **breaks** — both
+walked `self.charCodeAt(i)` — and both are now repaired to `for cp in self`,
+byte-identically on today's build. What keeps the module alive is that §Validity
+is deliberately Go-lean: the core will never validate, so strict decode,
+positioned `Utf8Error` reporting and WHATWG sanitization have no core equivalent
+and never will.
 
 ### 2.1 The `aTypeIdx` census, re-derived
 

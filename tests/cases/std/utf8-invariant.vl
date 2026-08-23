@@ -1,0 +1,207 @@
+// @run
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 5
+// @log 5
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 4
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// `std:utf8` — the assertions that are IDENTICAL before and after the byte-indexed
+// UTF-8 storage swap. This is `std:utf8`'s answer to `tests/cases/std/str-multibyte.vl`.
+//
+// WHY THIS FILE EXISTS SEPARATELY FROM THE OTHER THREE. `utf8-roundtrip.vl`,
+// `utf8-lossy.vl` and `utf8-reject.vl` were written against today's CODE-POINT string
+// surface, when `s.length` counted characters. `docs/guide/strings-design.md` §Storage
+// makes a string's backing UTF-8 bytes, `s[i]` a byte and `.length` a byte count — so a
+// fixture that prints a string `.length` is pinning a number that is scheduled to move.
+// The audit in `docs/internals/utf8-byte-ready.md` classifies every export against that
+// swap; this file pins the half of the behaviour that the swap must NOT change, so that
+// "the suite is green" afterwards means something.
+//
+// THE RULE THIS FILE FOLLOWS, and it is the same rule `str-multibyte.vl` follows:
+// **nothing whose unit is about to move is printed.** No `string` `.length`, no
+// `charCodeAt`, no `s[i]` over a string, no offset compared against a character count.
+// What IS pinned:
+//
+//   * `u8[]` lengths and `u8[]` element values — `u8[]` is already bytes, so nothing
+//     about it moves;
+//   * string VALUES, compared with `==`, which is byte equality before and after;
+//   * `Utf8Error.at` and `.byte`, which are byte-domain readings of a `u8[]` input and
+//     were already byte offsets before the swap was designed (see the `at` ruling in
+//     `utf8-byte-ready.md`);
+//   * code-point counts obtained by `for cp in s`, which §Codepoints keeps yielding
+//     code points across the swap;
+//   * pure-ASCII numbers, where the byte count and the code-point count are the same
+//     number by definition.
+import {
+  Utf8Error,
+  decodeUtf8,
+  decodeUtf8At,
+  decodeUtf8Lossy,
+  encodeUtf8,
+  utf8Length,
+} from "std:utf8"
+
+function ok(b: boolean) { if b { print(1) } else { print(0) } }
+
+// ── 1. Round trip is the identity, at every width ──────────────────────────────────
+// `decodeUtf8(encodeUtf8(s)) == s` is the module's whole contract, and it is stated
+// entirely in string VALUES — no length, no index, no offset. It is therefore the
+// single strongest assertion available that survives the swap untouched.
+function roundTrips(s: string) {
+  const back = decodeUtf8(encodeUtf8(s))
+  if back is Utf8Error { return false }
+  back == s
+}
+ok(roundTrips(""))
+ok(roundTrips("hello, world"))
+ok(roundTrips("é"))
+ok(roundTrips("中"))
+ok(roundTrips("😀"))
+ok(roundTrips("aé中😀"))
+
+// ── 2. ASCII is the fixed point of the whole migration ─────────────────────────────
+// For pure ASCII the byte count and the code-point count are the same number, so these
+// two are invariant even though they are unit-bearing everywhere else.
+print(utf8Length("hello"))
+print(encodeUtf8("hello").length)
+ok(utf8Length("hello") == encodeUtf8("hello").length)
+
+// ── 3. `utf8Length` predicts `encodeUtf8` exactly — the module's own stated invariant ─
+// Both sides are `u8[]`-domain counts, so the equality holds whatever a string is made
+// of. It is checked at every width because the two are computed by different code and
+// the header claims they cannot drift.
+ok(utf8Length("") == encodeUtf8("").length)
+ok(utf8Length("é") == encodeUtf8("é").length)
+ok(utf8Length("中") == encodeUtf8("中").length)
+ok(utf8Length("😀") == encodeUtf8("😀").length)
+ok(utf8Length("aé中😀") == encodeUtf8("aé中😀").length)
+
+// ── 4. The wire bytes, spelled out ─────────────────────────────────────────────────
+// These are the bytes UTF-8 defines; they do not depend on how VL stores a string, only
+// on what UTF-8 is. One width per line, exhaustively.
+const e1 = encodeUtf8("a")
+ok(e1.length == 1 && e1[0] == 0x61)
+const e2 = encodeUtf8("é")
+ok(e2.length == 2 && e2[0] == 0xC3 && e2[1] == 0xA9)
+const e3 = encodeUtf8("中")
+ok(e3.length == 3 && e3[0] == 0xE4 && e3[1] == 0xB8 && e3[2] == 0xAD)
+const e4 = encodeUtf8("😀")
+ok(e4.length == 4 && e4[0] == 0xF0 && e4[1] == 0x9F && e4[2] == 0x98 && e4[3] == 0x80)
+
+// ── 5. Decoding the bytes back gives the character, by VALUE ───────────────────────
+const b2: u8[] = [0xC3, 0xA9]
+const d2 = decodeUtf8(b2)
+if d2 is Utf8Error { ok(false) } else { ok(d2 == "é") }
+const b4: u8[] = [0xF0, 0x9F, 0x98, 0x80]
+const d4 = decodeUtf8(b4)
+if d4 is Utf8Error { ok(false) } else { ok(d4 == "😀") }
+
+// ── 6. `Utf8Error.at` is a BYTE offset, and it always was ──────────────────────────
+// The input is a `u8[]`, so `at` counts positions in a byte array — a reading that has
+// no code-point interpretation to lose. The ruling recorded in `utf8-byte-ready.md` is
+// that it STAYS a byte offset, matching §API's one coordinate system.
+//
+// Pinned WITHOUT a literal, so the assertion survives even a change of prefix: `at` is
+// exactly the encoded length of the valid prefix. That equality is the byte-era payoff
+// — after the swap `at` is also the `.length` of the successfully decoded prefix, which
+// is NOT true today (today that prefix has code-point length 1, and `at` is 2).
+const prefix = "é"
+const late: u8[] = [0xC3, 0xA9, 0xC0, 0x80]
+const eLate = decodeUtf8(late)
+if eLate is Utf8Error {
+  ok(eLate.at == encodeUtf8(prefix).length)
+  ok(eLate.byte == 0xC0)
+} else {
+  ok(false)
+  ok(false)
+}
+
+// ── 7. `decodeUtf8At`'s `at` is relative to `off`, not absolute ────────────────────
+// The range form exists so a consumer splitting a byte block into records attributes a
+// failure to the RECORD. `std/fs.vl`'s directory listing depends on this. Pinned here
+// because the byte-offset ruling has to say WHICH origin as well as which unit.
+const block: u8[] = [97, 98, 99, 100, 0xC0, 101]
+const rec = decodeUtf8At(block, 3, 3)
+if rec is Utf8Error { ok(rec.at == 1) } else { ok(false) }
+const whole = decodeUtf8(block)
+if whole is Utf8Error { ok(whole.at == 4) } else { ok(false) }
+
+// ── 8. Strict rejects exactly what lossy repairs ───────────────────────────────────
+// Booleans, so nothing here carries a unit at all.
+function strictRejects(b: u8[]) {
+  const r = decodeUtf8(b)
+  r is Utf8Error
+}
+const overlong: u8[] = [0xC0, 0x80]
+const surrogate: u8[] = [0xED, 0xA0, 0x80]
+const tooBig: u8[] = [0xF5, 0x80, 0x80, 0x80]
+const truncated: u8[] = [0xE4, 0xB8]
+const strayCont: u8[] = [0x80]
+ok(strictRejects(overlong))
+ok(strictRejects(surrogate))
+ok(strictRejects(tooBig))
+ok(strictRejects(truncated))
+ok(strictRejects(strayCont))
+
+// Well-formed input is accepted by both, and they agree on the answer.
+const good = encodeUtf8("aé中😀")
+const gs = decodeUtf8(good)
+if gs is Utf8Error { ok(false) } else { ok(gs == decodeUtf8Lossy(good)) }
+
+// ── 9. Lossy substitutes per MAXIMAL SUBPART — counted in code points ──────────────
+// The WHATWG rule is stated in code points ("one U+FFFD per maximal ill-formed
+// subpart"), so it is counted by iteration. A truncated 4-byte sequence is ONE subpart.
+function cpCount(s: string) {
+  let n = 0
+  for cp in s { n = n + 1 }
+  n
+}
+const truncEmoji: u8[] = [0xF0, 0x9F, 0x98]
+ok(cpCount(decodeUtf8Lossy(truncEmoji)) == 1)
+// ...and the same fact expressed in the byte domain: U+FFFD is EF BF BD, three bytes.
+ok(encodeUtf8(decodeUtf8Lossy(truncEmoji)).length == 3)
+// Two independent bad bytes are two subparts, so two replacements, four code points.
+const twoBad: u8[] = [104, 0xC0, 0x80, 105]
+print(cpCount(decodeUtf8Lossy(twoBad)))
+ok(encodeUtf8(decodeUtf8Lossy(twoBad)).length == 8)
+// Lossy is total: there is no input it rejects, including the empty one.
+const empty: u8[] = []
+ok(decodeUtf8Lossy(empty) == "")
+ok(cpCount(decodeUtf8Lossy(strayCont)) == 1)
+
+// ── 10. Empty is a real case in both directions ────────────────────────────────────
+ok(encodeUtf8("").length == 0)
+const de = decodeUtf8(empty)
+if de is Utf8Error { ok(false) } else { ok(de == "") }

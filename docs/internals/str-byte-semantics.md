@@ -175,14 +175,23 @@ correct with a code-point-typed `fromCodePoints`; the follow-on optimization is 
 `fromBytes`-shaped primitive (or `Buffer`), and it is **an optimization on a
 correct implementation, not a prerequisite**. Filed here, not done.
 
-**Adjacent, out of scope, worth someone's attention:** `std/utf8.vl` has the same
-defect class and is *not* covered by this audit. `utf8Length` and `encodeUtf8`
-both walk `while i < self.length { … self.charCodeAt(i) … }` — a code-point walk
-over what will be byte indices — so after the swap `encodeUtf8` re-encodes bytes
-as UTF-8 and `utf8Length` returns the byte length of the *doubly*-encoded form.
-It may be that most of `std:utf8` simply becomes `s.bytes()` after §API, which is
-a design call rather than a repair; either way it is not the 15 functions this
-document was scoped to and it was left alone.
+**Adjacent, out of scope here — AND NOW AUDITED SEPARATELY:
+`docs/internals/utf8-byte-ready.md`.** `std/utf8.vl` had the same defect class in
+exactly two of its five exports: `utf8Length` and `encodeUtf8` both walked
+`while i < self.length { … self.charCodeAt(i) … }` — a code-point walk over what
+will be byte indices — so after the swap `encodeUtf8` would re-encode bytes as
+UTF-8 (`"é"` → `C3 83 C2 A9`) and `utf8Length` would return the byte length of
+the *doubly*-encoded form. Both are now repaired with the same `for cp in s`
+move, byte-identically on today's build.
+
+The speculation in this paragraph's original last sentence — *"it may be that
+most of `std:utf8` simply becomes `s.bytes()`"* — turned out to be **half right,
+and the half that is wrong is the load-bearing half**. The two `string`-taking
+exports do collapse (`utf8Length` → `.length`, `encodeUtf8` → `s.bytes()`), but
+the other three take a `u8[]`, which is already bytes and does not move at all,
+and they carry the job §Validity's Go-lean ruling says the core will never do:
+**validation, positioned error reporting, and sanitization**. The audit's answer
+to "does the module still exist" is B-with-a-2-of-5-collapse, not A.
 
 ---
 
@@ -524,8 +533,14 @@ For whoever executes Step 2, in order:
    other way, the two `for cp in` loops in `split` and `replaceAll` become
    indexed loops again.
 5. **§R3 does not gate anything.** Rule it whenever.
-6. **`std/utf8.vl` is not covered by this audit** and has the same defect class
-   (§Builders, last paragraph). Audit it separately before Step 2 ships.
+6. **`std/utf8.vl` — DONE. `docs/internals/utf8-byte-ready.md`** is that audit:
+   2 of 5 exports were broken by the same defect class and are repaired
+   byte-identically, 3 are unchanged, the `Utf8Error.at` coordinate is ruled
+   (bytes), and three CORE questions the swap forces are filed in
+   `open-rulings.md` §B `utf8-byte-swap-core-rulings` — the one that fails
+   silently is what `fromCodePoints` does with a non-scalar element once there is
+   no `i32` to store it in. Its companion fixture is
+   `tests/cases/std/utf8-invariant.vl`.
 
 ## Sources
 
