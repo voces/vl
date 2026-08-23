@@ -1,0 +1,247 @@
+// `std:utf8` — the boundary between VL's strings and the byte world.
+//
+// WHY THIS MODULE EXISTS. A VL `string` is a sequence of Unicode CODE POINTS:
+// `s.length` counts code points, `s[i]` and `s.charCodeAt(i)` yield the whole
+// code point, and `fromCodePoints` builds one back from an `i32[]`. A `u8[]` is
+// a sequence of BYTES — `u8` is a STORAGE type, so an element is one byte that
+// reads out widened to `i32` (0..255) and truncates on write, the same split
+// wasm itself makes between i8 as an array element and i8 as a value, which
+// does not exist. Files, paths, argv, stdin and every other boundary VL will
+// grow are bytes; UTF-8 is the conversion between the two worlds, and it has to
+// be written exactly once. It lives in its own module rather than privately
+// inside `std:fs` because `std:fs` is merely the FIRST consumer, and a private
+// copy is how a program ends up with two decoders holding two different
+// opinions about invalid input.
+//
+// THE INVALID-INPUT RULING, both directions, because it is the whole design:
+//
+//   ENCODE IS TOTAL. `encodeUtf8` cannot fail. A VL string is an i32 sequence
+//   and nothing stops it holding -1, 0x110000 or a lone surrogate
+//   (`fromCodePoints` accepts any `i32[]`) — none of which is a Unicode scalar
+//   value, and none of which has a UTF-8 encoding. Each such element is encoded
+//   as U+FFFD. The alternative — a fallible encoder — would infect the signature
+//   of every caller that merely wants to name a FILE, for an input no correct
+//   program produces, and it would still have to emit *some* bytes. Substitution
+//   buys the invariant that matters: what leaves here is always well-formed
+//   UTF-8, so the host that receives it (a Rust `str`, a POSIX path) never
+//   rejects it.
+//
+//   DECODE IS FALLIBLE, AND STRICT BY DEFAULT. `decodeUtf8` returns
+//   `string | Utf8Error` and rejects every ill-formed sequence: bad lead byte,
+//   bad continuation, overlong form, surrogate, beyond U+10FFFF, truncated
+//   tail. This is Rust's `from_utf8`, not `from_utf8_lossy`, and the reason the
+//   strict one is the DEFAULT is that a decode failure is information: those
+//   bytes are not text, and the program about to treat them as text is about to
+//   be wrong. Silently substituting U+FFFD would turn "this is a PNG" into a
+//   string of question marks that compares unequal to everything and explains
+//   nothing. `decodeUtf8Lossy` is the deliberate opt-out for a caller who would
+//   rather render mojibake than stop — a log tailer, an editor opening whatever
+//   it was handed — and substitutes one U+FFFD per maximal ill-formed subpart,
+//   which is the WHATWG rule.
+//
+// WHAT THIS MODULE DOES NOT DO. No UTF-16, no other encodings, no BOM handling
+// (a leading U+FEFF decodes to U+FEFF and stays in the string — stripping it is
+// a policy for whoever knows the format), no normalization, no grapheme or
+// display-width analysis. Those are not "later here"; they are a different
+// module.
+
+// A decode failure, in the shape `docs/error-handling-design.md` gives a
+// position-carrying failure (its `ParseError = { at: i32, msg: string }`).
+// `at` is the byte offset of the failure WITHIN THE DECODED RANGE — relative to
+// the `off` that was passed in, never an absolute index — so it stays
+// meaningful to a caller who is decoding a slice out of a larger array.
+export type Utf8Error = { at: i32, msg: string }
+
+// U+FFFD, substituted in both directions.
+const REPLACEMENT = 0xFFFD
+
+// `cp` if it is a Unicode scalar value, U+FFFD otherwise. The three non-scalars
+// an i32 can hold: below the range, above it, and the surrogate block
+// D800..DFFF — which UTF-8 must never carry (a codec that accepts them is
+// CESU-8/WTF-8, not UTF-8).
+function scalar(cp: i32) {
+  if cp < 0 { return REPLACEMENT }
+  if cp > 0x10FFFF { return REPLACEMENT }
+  if cp >= 0xD800 && cp <= 0xDFFF { return REPLACEMENT }
+  cp
+}
+
+// How many bytes `cp` occupies once encoded — applying the SAME substitution the
+// encoder applies, which is what makes `utf8Length` an exact prediction of what
+// `encodeUtf8` produces rather than an estimate. One width function, so the
+// measurement and the encoder cannot drift.
+function utf8Width(cp: i32) {
+  const c = scalar(cp)
+  if c < 0x80 { return 1 }
+  if c < 0x800 { return 2 }
+  if c < 0x10000 { return 3 }
+  4
+}
+
+// `s.utf8Length()` — the exact length of `s.encodeUtf8()`, WITHOUT encoding it.
+// Distinct from `s.length`, which counts code points: the two agree for ASCII
+// and for nothing else. Exported because it is the only way to answer "how big
+// will this be on the wire" — a size check, a quota, a header field — short of
+// producing the bytes and throwing them away.
+export function utf8Length(self: string) {
+  let n = 0
+  let i = 0
+  while i < self.length {
+    n = n + utf8Width(self.charCodeAt(i))
+    i = i + 1
+  }
+  n
+}
+
+// `s.encodeUtf8()` — `s` as UTF-8 bytes. Total: a non-scalar element encodes as
+// U+FFFD (this module's header).
+export function encodeUtf8(self: string): u8[] {
+  const out: u8[] = []
+  let i = 0
+  while i < self.length {
+    const c = scalar(self.charCodeAt(i))
+    if c < 0x80 {
+      out.push(c)
+    } else if c < 0x800 {
+      out.push(0xC0 | (c >> 6))
+      out.push(0x80 | (c & 0x3F))
+    } else if c < 0x10000 {
+      out.push(0xE0 | (c >> 12))
+      out.push(0x80 | ((c >> 6) & 0x3F))
+      out.push(0x80 | (c & 0x3F))
+    } else {
+      out.push(0xF0 | (c >> 18))
+      out.push(0x80 | ((c >> 12) & 0x3F))
+      out.push(0x80 | ((c >> 6) & 0x3F))
+      out.push(0x80 | (c & 0x3F))
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The one decode loop. The strict/lossy fork is a PARAMETER rather than two
+// copies so the two public spellings cannot disagree about what "ill-formed"
+// means — the bug that shows up as a validator and a consumer accepting
+// different byte strings.
+//
+// The validity table is the standard one, and every row of it rejects a sequence
+// a naive shift-and-or would happily decode:
+//   C0 C1        overlong two-byte forms of ASCII
+//   E0 80..9F    overlong three-byte forms
+//   ED A0..BF    the surrogate block
+//   F0 80..8F    overlong four-byte forms
+//   F4 90..BF    beyond U+10FFFF
+//   F5..FF       no such lead byte
+// Accepting any of them is the classic security bug: two byte strings decoding
+// to one string is how a path check that already ran gets walked past.
+function decodeCore(
+  self: u8[],
+  off: i32,
+  len: i32,
+  lossy: boolean,
+): string | Utf8Error {
+  const cps: i32[] = []
+  let i = 0
+  while i < len {
+    const b0 = self[off + i]
+    // The sequence length comes from the lead byte, together with the TIGHTENED
+    // bounds the FIRST continuation byte must satisfy (every later one is the
+    // plain 0x80..0xBF).
+    let size = 0
+    let cp = 0
+    let lo = 0x80
+    let hi = 0xBF
+    if b0 < 0x80 {
+      size = 1
+      cp = b0
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      size = 2
+      cp = b0 & 0x1F
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      size = 3
+      cp = b0 & 0x0F
+      if b0 == 0xE0 { lo = 0xA0 }
+      if b0 == 0xED { hi = 0x9F }
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      size = 4
+      cp = b0 & 0x07
+      if b0 == 0xF0 { lo = 0x90 }
+      if b0 == 0xF4 { hi = 0x8F }
+    }
+    // `good` counts the MAXIMAL VALID SUBPART — how far the sequence got before
+    // it went wrong, never less than 1. It is what the lossy path advances by,
+    // so a truncated 4-byte sequence at the end of the range yields ONE U+FFFD
+    // rather than one per leftover byte. That is the WHATWG rule, and it is also
+    // the only advance that cannot loop: `good >= 1` always.
+    let ok = size > 0
+    let good = 1
+    let k = 1
+    while ok && k < size {
+      if i + k >= len {
+        ok = false
+      } else {
+        const b = self[off + i + k]
+        let blo = 0x80
+        let bhi = 0xBF
+        if k == 1 {
+          blo = lo
+          bhi = hi
+        }
+        if b < blo || b > bhi {
+          ok = false
+        } else {
+          cp = (cp << 6) | (b & 0x3F)
+          good = good + 1
+        }
+      }
+      k = k + 1
+    }
+    if ok {
+      cps.push(cp)
+      i = i + size
+    } else if lossy {
+      cps.push(REPLACEMENT)
+      i = i + good
+    } else {
+      return {
+        at: i,
+        msg: "invalid UTF-8: byte " + toString(b0) + " at offset " + toString(i),
+      }
+    }
+  }
+  fromCodePoints(cps)
+}
+
+// `b.decodeUtf8()` — the whole array as a string, or the position of the first
+// ill-formed sequence. STRICT; see the header for why strict is the default.
+export function decodeUtf8(self: u8[]): string | Utf8Error {
+  decodeCore(self, 0, self.length, false)
+}
+
+// `b.decodeUtf8At(off, len)` — the same, over one range. The range form exists
+// because a consumer that splits a byte block into records (`std:fs`'s
+// directory listing, a line reader) must attribute a decode failure to the
+// RECORD, not to the block.
+export function decodeUtf8At(
+  self: u8[],
+  off: i32,
+  len: i32,
+): string | Utf8Error {
+  decodeCore(self, off, len, false)
+}
+
+// `b.decodeUtf8Lossy()` — the whole array, with one U+FFFD per maximal
+// ill-formed subpart. Total: there is no input this rejects.
+export function decodeUtf8Lossy(self: u8[]) {
+  const r = decodeCore(self, 0, self.length, true)
+  // Unreachable: the lossy path substitutes rather than returning the error arm.
+  // The narrowing is what makes the `string` return type provable, and the trap
+  // is what makes a future edit that breaks the invariant loud instead of
+  // silent — VL has no way to say "this arm cannot happen" in a type.
+  if r is Utf8Error {
+    __trap__("std:utf8: lossy decode reported an error")
+    return ""
+  }
+  r
+}
