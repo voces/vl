@@ -849,6 +849,50 @@ collapses to: eval receiver, clamp both bounds against `$len`,
 > §Scanning's re-slicing cursor and §Header's "split a 1 MB file into 10k lines" claim were
 > asking for. What the numbers refuse is the wider claim that a header makes string PROGRAMS
 > faster; it makes substring EXTRACTION free and charges a little for every indexed read.
+>
+> ### CORRECTION — the cause is RETENTION, not the per-access guard
+>
+> The paragraph above attributes the `VL_GC=auto` regression to "the per-access guard …
+> paid on every character scanned." **Re-measured independently, that attribution is wrong,
+> and so is the +10 % scan figure it rests on.**
+>
+> | probe (medians, interleaved) | master | 2b | |
+> |---|---|---|---|
+> | 800 M indexed `s[i]` reads | 1.04 s | 1.05 s | **≈1 %**, not 10 % |
+> | split a 400 k-char string, `VL_GC=none` | 1.07 s / **1,089 MB** | 1.06 s / **245 MB** | **4.4× less**, wall identical |
+> | the same, `VL_GC=auto` (copying) | **0.85 s** | **1.01 s** | **+19 %** — reproduces |
+> | split a **39-char** string 300 k times, `VL_GC=auto` | 0.08 s | 0.08 s | **no regression at all** |
+> | trivial program (fixed overhead) | 0.00 s | 0.00 s | the +3.8 % module is not the cause |
+>
+> The last two rows are the ones that identify the mechanism. If the guard were the cost it
+> would be paid per character regardless of backing size, and the small-string row would
+> regress too. It does not. The regression appears **only when many views pin one large
+> backing** — which is exactly the retention hazard §Header already documents as a *leak*
+> risk.
+>
+> **So retention is not only a leak risk; under a copying collector it is a THROUGHPUT
+> cost.** Master's `split` copies each piece and lets the 400 k-char backing die at the next
+> collection. A view-based `split` keeps it **live**, so the collector copies the whole
+> backing on every cycle, forever. Allocating 4.4× less does not help when what you stopped
+> allocating was garbage the collector was reclaiming cheaply, and what you started retaining
+> is live data it must copy.
+>
+> Three consequences, none of which sink the stage:
+>
+> 1. **`compact()` is load-bearing for PERFORMANCE, not just for leaks.** §Header presents it
+>    as the escape hatch for "a small view of a large buffer held a long time." It is also the
+>    fix for this regression, which moves it up the priority order.
+> 2. **Stage 2c should shrink the regression on its own.** UTF-8 backings are ~4× smaller
+>    than today's `array i32` for ASCII, so the retained set — the thing being re-copied —
+>    shrinks with it. Re-measure this exact probe after 2c before doing anything else about it.
+> 3. **The guard is cheap and should stay.** It is a correctness requirement (a view's backing
+>    outlives the view, so an unguarded read returns a *sibling view's* character instead of
+>    trapping) and it costs ≈1 %, not 10 %.
+>
+> *Method note: the original +10 % came from a probe whose shape could not separate the guard
+> from retention, and the conclusion was drawn from it anyway. A control that varies ONE
+> input — here, backing size with everything else fixed — is what turned an attribution into
+> a measurement.*
 
 **Nothing in the tree blocks aliasing**, which is the genuinely good news:
 
