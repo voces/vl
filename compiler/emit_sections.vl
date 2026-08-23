@@ -447,6 +447,7 @@ import {
   emitFuncBody,
   emitNullForRet,
   emitStmt,
+  emitUnionBoxArg,
   emitUnionCoerce,
   emitUnionRetSink,
   emitUserGlobalSet,
@@ -1696,6 +1697,22 @@ function emitStartFnCode(out: i32[]) {
             // A UNION cell (kind 4) coerces a raw init value into the box
             // (`let w: string | i32 = n` boxes the i32 read) — a union-valued
             // init (a union-returning call) passes through unchanged.
+            //
+            // THE BOX-TYPED POSITION. A union global's cell is ALWAYS the box
+            // (`globalCellKind` has no kind-8 raw-variant cell, unlike `buildLocals`), so a
+            // CONCRETE-VARIANT init — `const b: A | B = mkB()`, `mkB` returning the arm `B` —
+            // must be boxed here exactly as a call argument / return / array element is:
+            // `emitUnionBoxArg` boxes a variant ref and defers every other shape (object
+            // literal, passthrough union, scalar atom) to `emitUnionCoerce`. Plain
+            // `emitUnionCoerce` RAW-PASSES a struct-typed init whose heap type is already
+            // deduped with the arm's variant struct, storing a `(ref $variant)` into the
+            // `(ref null $uBox)` cell — invalid wasm, `vl check` clean before `--codegen`
+            // validated the module (#1678). The same three lines inside a `function` ran,
+            // because a union-annotated LOCAL with a variant init binds the RAW variant
+            // (kind 8) and so needs no box; only the global cell disagreed with its store.
+            // The heap-dedup gate is why a MIXED union (`{w:i32} | i32`) escaped: its arm's
+            // variant struct is a distinct heap type, so `emitUnionCoerce`'s twin-rebox arm
+            // already boxed it (`unions/call-struct-arm-into-variant-box-local.vl`).
             let gun = ""
             if gck == "union" { gun = letUnionNameOf(globalStmts[gi], -1) }
             // A module-level `let f = add` aliasing a GENERIC (un-annotated-param) named
@@ -1703,7 +1720,7 @@ function emitStartFnCode(out: i32[]) {
             // core, the start-fn twin of the const-cell arm in `emitGlobalSection`.
             const gAliasFe = monoGenericAliasFe(globalStmts[gi])
             if gun != "" {
-              if emitUnionCoerce(bodyExpr, gun, g.letInit, -1) < 0 {
+              if emitUnionBoxArg(bodyExpr, gun, g.letInit, -1) < 0 {
                 wTarget(exprPrev)
                 return -1
               }
