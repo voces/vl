@@ -100,7 +100,7 @@ fn main() -> Result<()> {
     //
     // Semantics are `scripts/vl-host/src/main.rs`'s (`register_fs_imports`) and that is
     // the authoritative copy: WASI preview1 errno numbering, EMPTY-`u8[]`-on-error with
-    // the reason in `__fs_errno__`, `.`/`..` filtered out of a listing, 0x0A between
+    // the reason in `__fs_errno__`, `.`/`..` filtered out of a listing, 0x00 (NUL) between
     // entries. What is deliberately NOT duplicated is the full errno table — this host
     // maps the handful of kinds a parity run can produce and answers EIO (29) for the
     // rest, which is the same fallback the primary host uses for an unrecognized error.
@@ -300,7 +300,7 @@ fn main() -> Result<()> {
                                         continue;
                                     }
                                     if !block.is_empty() {
-                                        block.push(0x0A);
+                                        block.push(0x00);
                                     }
                                     block.extend_from_slice(name.as_bytes());
                                 }
