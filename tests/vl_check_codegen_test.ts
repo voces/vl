@@ -85,18 +85,23 @@ const EMIT_ERROR_SRC =
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 
-// Type-checks clean, EMITS clean, and the module does not validate: a union of two
-// literal unions in RETURN position (issue #1792 — the flat `1 | 2 | 3 | 4` spelling
-// works, and so does the `is`-narrowing of this one, so it is the return path).
+// Type-checks clean, EMITS clean, and the module does not validate: a `string | null`
+// argument at a GENERIC call, whose instance declares a NON-null parameter
+// (`tests/cases/soundness/xfail-miscompile-nullable-ref-generic-arg.vl`).
 // Distinct from EMIT_ERROR_SRC above: the emitter raises nothing at all here.
-// If #1792 is fixed, this test goes red — swap in any other `@no-instantiate`
-// shape from tests/cases/soundness/ rather than deleting the assertion.
+//
+// The previous specimen was issue #1792 — a DECLARED alias over two literal unions
+// (`type A = 1 | 2; type B = 3 | 4; type U = A | B`), which is fixed, so this test went
+// red exactly as the note here said it would. Same instruction stands: if this shape
+// graduates, swap in any other `@no-instantiate` shape from tests/cases/soundness/
+// rather than deleting the assertion.
 const INVALID_MODULE_SRC =
-  `type A = 1 | 2\n` +
-  `type B = 3 | 4\n` +
-  `type U = A | B\n` +
-  `function f(x: U): U { x }\n` +
-  `print(f(1))\n`;
+  `function id<T>(v: T): T {\n` +
+  `  return v\n` +
+  `}\n` +
+  `const s: string | null = "hi"\n` +
+  `const r = id(s)\n` +
+  `if r != null { print(r) } else { print(0) }\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

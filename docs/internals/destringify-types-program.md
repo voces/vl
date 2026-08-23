@@ -37891,6 +37891,23 @@ declared alias. The two ANNOTATION routes (`tsToTyReal`, the parser-tree route, 
 `nameToTyReal`, the string route) were the only two places with neither the arena flatten
 nor canon's `unionAliasMembers` name-side equivalent.
 
+> **CORRECTION (#1792).** The first sentence of the paragraph above is false, and the
+> second sentence is the reason it was believed: the witness spelled the flattened set as
+> a declared alias (`type KA = "aa"|"bb"|"cc"|"dd"`), which *is* a real litunion — but
+> `type Q = K | K2`, an alias whose BODY is two litunion aliases, is a different
+> declaration and never flattened at all. `fillTypeDeclAt`'s `UnionDecl` arm builds its
+> member list itself (it fills the pass-0a placeholder in place, so it cannot call
+> anything that MINTS a type) and pushed the resolved VARIANTS straight in, so `Q`
+> interned as a union whose members are unions at its own registered index — the exact
+> shape this section says the annotation routes had. Measured on master `be49bfcc` with
+> `type A = "aa"|"bb"; type B = "cc"|"dd"; type U = A | B`: a `const x: U` local, a
+> `{ v: U }` field and an `f(x: U): U` return are all `vl check --codegen` rc 0 and
+> INVALID WASM (`type mismatch: expected i32, found (ref $type)`); only `if x is A` works,
+> and only because the narrow rebinds to `A`. The flatten is now a member-list transform,
+> `litUnionFlatMembers`, that BOTH routes climb — and its member test moved from
+> `tyIsLitUnion` (string-only) to `homogLitUnionBase` (`softenLitTy`'s own rule), which is
+> what brings the numeric, i64 and f64 spellings with it.
+
 ### What shipped, and the four gates each of which is a measurement
 
 `annUnionInnerTy(members, hasNull)` — one home, called by both annotation routes — plus
