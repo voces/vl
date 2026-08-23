@@ -389,6 +389,51 @@ has no importer outside `std/fmt.vl` (whose `padLeft` delegates to `padStart`)
 and `tests/cases/std/str-*.vl`. Nothing in `compiler/*.vl` imports it. This
 ruling is at its cheapest right now and gets monotonically more expensive.
 
+## §Width — §R1 in the FORMATTER: shipped wrong, repaired, and one item left open
+
+**§R1 ruled the unit and named `padStart` as the blast radius. The blast radius
+was bigger, and the second half shipped broken.** `compiler/format.vl` measures
+every line it prints against `fmtWidth` (80) and threads a `column` through the
+expression printer, and it spelled all of it `.length`. After the swap that is a
+byte count, so **every line holding a non-ASCII character wrapped 2–4× too
+early** — silently, because the output is still valid VL. The witness:
+
+```vl
+const msg = "————————————" + "————————————" + "————————————"
+```
+
+60 columns, 132 bytes. Before the swap it stayed on one line; after it broke into
+three. One diagnostic in `compiler/typecheck.vl` — an 83-column string chain with
+an em dash in it — was being wrapped across three lines for the same reason, and
+un-wraps on the repair. A trailing-comment run holding an em dash aligned its
+comments eight columns apart while measuring, to the code, as aligned.
+
+**Why it got through every gate.** `scripts/lint-self.sh` gates fmt with `vl fmt
+--check`, which returns an exit code and never inspects the payload, and the
+tree's fmt fixtures were pure ASCII — where the byte count *is* the code-point
+count, exactly the blindness §Fixture describes for `str-*.vl`. Nothing in the
+tree could tell the two apart. `tests/vl_fmt_test.ts` now carries one that can (a
+60-column/132-byte chain, a 53-column/117-byte call, a comment column measured in
+code points, and an over-80-**column** negative control so "never wrap" cannot
+pass it).
+
+**The repair, and its shape.** Widths are code points, per §R1; offsets stay
+bytes. The two questions get two names — `dispWidth(s)` in `compiler/fmt_util.vl`
+is every number compared against `fmtWidth`, and `.length` is every number handed
+to `slice`/`[i]`. `codeWidthBefore` (a byte offset, it feeds `slice`) gained the
+twin `codeColumnBefore` (a column, it feeds the alignment target) rather than
+being made to answer both. About 20 of `format.vl`'s ~150 `.length` uses were
+width-bearing; the rest are array lengths, index bounds and emptiness tests,
+which are neither and were left alone.
+
+**Still open: code points are not display width.** §R1 already says so for
+padding and the same holds here — CJK and other full-width forms occupy two
+terminal columns, combining marks zero, emoji vary, so `dispWidth` still
+mismeasures a line of CJK by a factor of two. The repair deliberately restores
+the pre-swap behaviour and nothing more: code points are the right floor, and
+width-correct measurement belongs with `graphemes()` in `std:unicode`, behind a
+width table. `dispWidth` is the single site that would change.
+
 ## §R2 — What is a "boundary" for an EMPTY needle in `split` / `replaceAll`? **RULED: CODE POINTS**
 
 **The question.** `"abc".split("")` is `["a","b","c"]` and `"abc".replaceAll("",

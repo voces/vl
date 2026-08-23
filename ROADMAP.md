@@ -1247,7 +1247,10 @@ in-language GC knobs.
      meaningless and is worth its own look. Related: item 1.
   7. **True display width ≠ code points** (CJK double-width, combining marks, emoji). `vl
      fmt` counting code points restores pre-#1848 behaviour and no more; a real width
-     model is a separate question.
+     model is a separate question. `vl fmt` was in fact counting BYTES — every line with a
+     non-ASCII character wrapped 2–4× too early — until `dispWidth` in
+     `compiler/fmt_util.vl`; §Width in `str-byte-semantics.md` has the repair and why no
+     gate in the tree could see it. That helper is the single site a width model changes.
 
   `docs/guide/strings-design.md` is now a ruled design, and **the "not before bootstrap" gate it
   opened with is LIFTED** (byte-exact fixpoint, TS host gone, `u8`/packed `(array mut i8)` shipped
