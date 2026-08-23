@@ -343,6 +343,35 @@ which is why they closed in order rather than in parallel.
   outside the fixture (`{x:i32,y:i32}` → 8, `{p:i64,q:i32,r:i32}` → 16, that type's `q` → 8).
   **Of the two filed blockers, one was never a blocker**: generic `flat` DECLARATIONS are unrelated,
   because the records `rows<T>` indexes are concrete. Generic `flat` decls remain rejected by design.
+  **SUB-BYTE AND BYTE-MULTIPLE FIELD WIDTHS — RULED (owner, 2026-08-22), not yet built.**
+  `flat` accepts only `i32`/`i64`/`f32`/`f64`, newtypes over those, and nested `flat`, **so a byte
+  field costs four bytes and `flat` cannot express a C struct containing a `uint8_t`** — which is
+  the job it exists for. It gains STORAGE widths: byte-multiple (`u8`/`i8`/`u16`/`i16`, the same
+  packed-storage feature `u8[]` needs — see B7 and the `u8[]` work) and **sub-byte
+  (`u1`…`u7`)**, so a wire format spells itself: `flat type Header = { ver: u1, ext: u1, kind: u6 }`
+  is ONE byte and self-documenting where today it is a `u8` plus a comment.
+  **`boolean` becomes legal at 1 bit** — it rejects today only because it has no defined width,
+  and `{ ver: boolean, ext: boolean, kind: u6 }` reads better than `u1` for a flag.
+  **THE COMPILER FOLDS THE LAYOUT, THE USER WRITES THE SHIFT** (owner: *"100% accept shift/mask
+  to read/write"*). `Header.kind` / `Header.kind_shift` / `Header.kind_mask` are checker-folded
+  constants — the same running-sum machinery, over BITS instead of bytes — and access stays
+  explicit (`getBits(__load_u8__(a + Header.kind), Header.kind_shift, Header.kind_mask)`).
+  **So this needs NO emitter change**, exactly like `flat` today; the error-prone half (which byte,
+  which shift, which mask) is computed from the declaration and the mechanical half stays visible.
+  GENERATED accessors (`h.kind` doing the shift for you) are the expensive half and are
+  deliberately NOT taken — additive later if the explicit form grates once a real decoder is
+  written.
+  Two rules attached: **a field may not straddle a byte boundary** (a compile error naming explicit
+  padding as the remedy — the same discipline as `flat`'s no-implicit-padding rule, and it sidesteps
+  the worst of C's ambiguity), and **bits pack MSB-first within a byte**, matching how RFC-style
+  specs number them (IP's version field is the top four bits).
+  *Why this is safe where C bitfields are not:* C's are cursed because **C** does not specify bit
+  order, so they cannot port a C struct bit-exactly. A binary FORMAT does specify it, so decoding
+  one is a different job with a definite answer — the objection does not transfer. Rust, Go, Swift
+  and C# all declined bitfields; Zig took them with a specified layout, which is the model to copy
+  if generated accessors are ever built. The honest width set is bounded by what widens losslessly
+  into the next value type: `u8`/`i8`/`u16`/`i16` → `i32`, and `u32` would need `i64` while `u64`
+  fits nothing — so byte-multiples stop at 16 bits.
   REMAINING for `buf.rows<T>` is the BRAND alone, and it is subtler than filed: letting the
   operator's return be a type parameter so the container names the brand *compiles, runs and reads
   the right bytes* — and proves nothing, because the discriminating witness is the one where the
