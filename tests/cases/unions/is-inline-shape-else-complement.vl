@@ -1,0 +1,169 @@
+// @run
+// @log boom
+// @log plain
+// @log bang
+// @log bare
+// @log quiet
+// @log 1
+// @log 7
+// @log 3
+// @log 2
+// @log 9
+// @log 4
+// @log 105
+// @log neg
+// @log flip
+// @log local
+// @log 0
+// @log arm
+// @log other
+// @log 50
+// @log 50
+// @hint redundant type annotation: `widthOf` is inferred as `i32`
+// @hint redundant type annotation: `pick3` is inferred as `i32`
+// @hint redundant type annotation: `levelOf` is inferred as `i32`
+// @hint redundant type annotation: `localRecv` is inferred as `i32`
+// The ELSE arm of an `is` test spelled as an INLINE SHAPE. `setNarrowFromCondElse`'s
+// struct-union complement subtracts the tested variant from the receiver's member set —
+// and it was the ONE reader of the `is` spelling still asking the author's raw string.
+//
+//     type IoError = { code: i32, msg: string }
+//     function f(): string | IoError { return { code: 44, msg: "boom" } }
+//     const a = f()
+//     if a is { code: i32, msg: string } { print(a.msg) } else { print(a) }
+//
+// The union registers the rows `string` and `IoError`, so `{code:i32,msg:string}` names no
+// member and the subtraction removed NOTHING: `msSubAtom` cleared no bit, `msSetIntern`
+// handed back the SAME set, and `pushNarrowComplement` reported success — the else arm was
+// pushed a "narrowing" identical to the un-narrowed union. The CHECKER had narrowed (it
+// resolves the shape structurally, so it sees `string` and admits `print(a)` — the print of
+// a bare union is a loud emitter-capability reject), so `vl check` said no errors and the
+// emitter then handed `__print_i32__` the raw `(ref $uBox)`: **check-clean INVALID WASM**,
+// `type mismatch: expected i32, found (ref $type)`.
+//
+// The subtracted atom is now `isVariantSpelling(c.isVariant, isVarTyIxOf(condIx))` — the
+// SAME resolution the then-arm push (`pushNarrowIs`), the `is` test itself (`emitIs`) and
+// the monomorphized-guard exclusion (`monoStaticIsResult`) already used. That rule now has
+// four readers and they agree; the else arm was the fourth and it was the odd one out.
+//
+// STRICTLY ADDITIVE, and the corpus cannot see it: a probe that fires when the resolved
+// spelling DIFFERS from the author's reads 0 of 2,191 corpus files while the arm ITSELF is
+// reached by 293 of them, so the module bytes are identical corpus-wide and this file is
+// the only witness. Every case below READS THE RECEIVER IN THE ELSE — an else that does not
+// (`else { print(1) }`) is green on both compilers, because a no-op narrowing only shows
+// when something reads through it.
+//
+// NO UNION HERE MAY BE ANNOTATED WITH INLINE SHAPES. A `{code: i32} | i32` annotation
+// registers those shapes as its OWN rows, which would put them in `uVariants` and make the
+// nominal cases below resolve on the parent commit too — the same masking
+// `is-inline-shape-structural-union-control.vl` is quarantined for. Every union below spells
+// its struct members through a `type` alias, and every case uses a DISTINCT field shape so
+// no case can register the row another case needs.
+
+type IoError = { code: i32, msg: string }
+type Reader = { path: string }
+type Writer = { fd: i32 }
+type Seeker = { off: i32 }
+type Meta = { tag: i32 }
+type Note = { note: string }
+
+// ── (1) THE REPRO, over a PARAM so BOTH arms run. The else arm reads the `string`
+// member — the arm whose rep the raw box was standing in for.
+function shout(a: string | IoError) {
+  if a is { code: i32, msg: string } { print(a.msg) } else { print(a) }
+}
+shout({ code: 44, msg: "boom" }) // boom
+shout("plain") // plain
+
+// ── (2) CONTROL: the ALIAS spelling of the identical program. Green on both compilers;
+// it is here so a regression that "fixes" the inline spelling by breaking the nominal one
+// is caught in the other direction.
+function shoutAlias(a: string | IoError) {
+  if a is IoError { print(a.msg) } else { print(a) }
+}
+shoutAlias({ code: 45, msg: "bang" }) // bang
+shoutAlias("bare") // bare
+
+// ── (3) CONTROL: the inline spelling with NO else. Green on both compilers — the then-arm
+// push already resolved the spelling, which is what made this look like an else-only bug.
+function shoutNoElse(a: string | IoError) {
+  if a is { code: i32, msg: string } { print(a.msg) }
+}
+shoutNoElse({ code: 46, msg: "quiet" }) // quiet
+shoutNoElse("skipped")
+
+// ── (4) TWO STRUCT ARMS: the else reads the OTHER struct's field. This cell was a LOUD
+// reject before (`emitProgram: narrowed receiver names no union variant`) rather than
+// invalid wasm — the narrowed receiver carried the un-subtracted set, and the member read
+// asked it for a variant.
+function widthOf(v: Reader | Writer): i32 {
+  if v is { path: string } { return 1 } else { return v.fd }
+}
+print(widthOf({ path: "p" })) // 1
+print(widthOf({ fd: 7 })) // 7
+
+// ── (5) An `else if` CHAIN, inline at every rung: each else subtracts one more member and
+// the last arm must land on a singleton.
+function pick3(v: Meta | Note | Seeker): i32 {
+  if v is { tag: i32 } { return v.tag }
+  else if v is { note: string } { return 2 }
+  else { return v.off }
+}
+print(pick3({ tag: 3 })) // 3
+print(pick3({ note: "n" })) // 2
+print(pick3({ off: 9 })) // 9
+
+// ── (6) A MIXED union (struct arm + value atom) tested by the INLINE STRUCT shape: the
+// else arm subtracts the struct and reads the surviving `i32`. The reverse spelling
+// (`is i32`, else reads the struct) is `mixed-union-else-narrow.vl`'s reverse pin.
+function levelOf(v: Meta | i32): i32 {
+  if v is { tag: i32 } { return v.tag } else { return v + 100 }
+}
+print(levelOf({ tag: 4 })) // 4
+print(levelOf(5)) // 105
+
+// ── (7) NEGATION: `!(x is <shape>)` puts the complement in the THEN arm, so the receiver
+// is read under the else-narrowing from the other branch sense.
+function negated(a: string | IoError) {
+  if !(a is { code: i32, msg: string }) { print(a) } else { print(a.msg) }
+}
+negated({ code: 47, msg: "neg" }) // neg
+negated("flip") // flip
+
+// ── (8) A FUNCTION-LOCAL receiver and a MODULE-LEVEL one lower through different receiver
+// paths (a local slot against a global cell), and both must narrow.
+function localRecv(): i32 {
+  const a: string | IoError = { code: 48, msg: "local" }
+  if a is { code: i32, msg: string } {
+    print(a.msg) // local
+  } else {
+    print(a)
+  }
+  0
+}
+print(localRecv()) // 0
+
+// ── (9) `match` reaches the same complement through its arm lowering, so an inline-shape
+// arm is the `match` spelling of case (1).
+function matched(a: string | IoError) {
+  match a {
+    { code: i32, msg: string } => print(a.msg)
+    string => print(a)
+  }
+}
+matched({ code: 49, msg: "arm" }) // arm
+matched("other") // other
+
+// ── (10) Inside a LOOP body: the loop consumers restrict the narrowing pushes
+// (`narrowStripNullOnly`), so the complement is re-derived on a path the straight-line
+// cases never take.
+let i = 0
+while i < 2 {
+  const a: string | IoError = { code: 50, msg: "loop" }
+  if a is { code: i32, msg: string } {
+    print(a.code) // 50, twice
+  } else {
+    print(a)
+  }
+  i = i + 1
+}
