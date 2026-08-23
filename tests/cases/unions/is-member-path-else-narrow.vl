@@ -1,0 +1,54 @@
+// @run
+// @log 5
+// @log 9
+// @log hi
+// @log 9
+// @log 3
+// @log 42
+// `w.f is T` OVER A UNION-TYPED STRUCT FIELD — the ELSE arm was reading through an
+// un-narrowed view, and for a MIXED union that was check-clean INVALID WASM.
+//
+// `setNarrowFromCondElse` had the member-path arm INSIDE its `valueAtomKind >= 0`
+// gate. A struct variant is not a value atom, so the gate answered no and the whole
+// block was skipped — and the struct-union complement below it requires an `Ident`
+// receiver, which a `Member` is not. **The member path fell BETWEEN the two arms and
+// got no complement at all.** It is a gap rather than a missing arm: the code was
+// already correct for a struct variant, it simply never ran. Hoisting it out of the
+// gate is the minimal fix; widening the gate instead would also hand the `Ident` arm
+// struct variants it deliberately declines.
+//
+// The discriminator is a READ OF THE RECEIVER in the negative arm — the same one the
+// sibling `is`-complement bug turned on. A no-op narrowing is invisible until
+// something reads through it.
+type A1 = { a: i32 }
+type B1 = { b: string }
+
+// MIXED union — a struct arm beside a scalar. This was the silent one: `vl check`
+// clean, module would not load.
+type W = { f: A1 | i32 }
+const w: W = { f: 5 }
+if w.f is A1 { print(w.f.a) } else { print(w.f) }
+
+// ...and the positive arm still narrows, so the fix did not trade one for the other.
+const w9: W = { f: { a: 9 } }
+if w9.f is A1 { print(w9.f.a) } else { print(w9.f) }
+
+// TWO STRUCT ARMS — this was a LOUD reject (`field access receiver is not a struct`)
+// and now runs. Both arms, so neither direction is assumed.
+type V = { f: A1 | B1 }
+const v1: V = { f: { b: "hi" } }
+if v1.f is A1 { print(v1.f.a) } else { print(v1.f.b) }
+const v2: V = { f: { a: 9 } }
+if v2.f is A1 { print(v2.f.a) } else { print(v2.f.b) }
+
+// CONTROL — no read in the else. Was already clean and must stay clean; if this
+// regresses, the hoist has started narrowing something it should not.
+function kind(x: W) {
+  if x.f is A1 { return x.f.a }
+  3
+}
+print(kind({ f: 7 }))
+
+// CONTROL — a plain IDENT receiver, which never went through the member arm at all.
+const p: A1 | i32 = 42
+if p is A1 { print(p.a) } else { print(p) }
