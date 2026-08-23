@@ -2,7 +2,8 @@
 //
 //   vl build <in.vl> -o <out.wasm>   compile a file to a wasm module, then VALIDATE it
 //   vl check <in.vl>                 typecheck; print diagnostics (`--codegen` emits + VALIDATES)
-//   vl run   <in.vl>                 compile in-memory, then instantiate + run
+//   vl run   <in.vl> [args...]       compile in-memory, then instantiate + run
+//                                    (`--` ends host parsing; the rest is the program's)
 //   vl fmt   [path] [-w|--check]     format source (stdout / write / CI gate); stdin when no path
 //   vl test  [path] [-t <name>]      discover `*.test.vl`, run them in parallel, report
 //
@@ -32,6 +33,7 @@ use wasmtime::*;
 
 fn usage() -> ! {
     eprintln!("usage: vl <build|check|run|fmt|test> <file.vl> [-o out.wasm] [-O|-O3] [--wat] [--no-validate] [-w|--check] [-t name] [--jobs N] [--compiler vl-compiler.wasm]");
+    eprintln!("       vl run <file.vl> [args...] [-- args...]   arguments after `--` reach the program verbatim");
     std::process::exit(2);
 }
 
@@ -2189,6 +2191,44 @@ fn compile_and_run(
     run_program(run_engine, &bytes)
 }
 
+/// The value of a value-taking `vl run` flag, or a usage error when the flag ended the
+/// command line. Not a silent fallback: `vl run p.vl --compiler` used to leave
+/// `compiler` as `None` and resolve the DEFAULT seed, so a truncated command line ran
+/// against a compiler the caller never named and said nothing about it.
+fn flag_value(v: Option<&String>, flag: &str) -> String {
+    match v {
+        Some(s) => s.clone(),
+        None => arg_error(&format!("`{flag}` requires a value"), None),
+    }
+}
+
+/// One `vl run` argument-parsing usage error: the message names the OFFENDING TOKEN,
+/// then the remedy that makes the command mean what the caller meant. Exit 2, the code
+/// reserved for usage errors across this CLI (`usage()` here, `cliUsageErr` in
+/// `compiler/cli.vl`) — 1 means "the program or its compilation failed", and an
+/// unparseable command line never got as far as a program.
+///
+/// `token`, when present, is a dash-led argument the walk could not place; it is echoed
+/// into the remedy so the note is a line the caller can run rather than a template. A
+/// token that also NAMES AN EXISTING PATH gets the other remedy: a file argument
+/// beginning with `-` is indistinguishable from a flag, and `./` disambiguates it.
+fn arg_error(msg: &str, token: Option<&str>) -> ! {
+    eprintln!("vl run: {msg}");
+    if let Some(t) = token {
+        if std::path::Path::new(t).exists() {
+            eprintln!("note: `{t}` names an existing path — to run it as the source file,");
+            eprintln!("      spell it `./{t}` so it is not read as a flag.");
+        }
+        eprintln!("note: to pass `{t}` to the PROGRAM, put it after `--`:");
+        eprintln!("      vl run <file.vl> -- {t} ...");
+    }
+    eprintln!(
+        "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
+-O/-O3, --names, --wat, --no-validate."
+    );
+    std::process::exit(2);
+}
+
 /// `vl run` — compile + run a VL program, matching the TS CLI's `run`. Source comes
 /// from (in priority) `-e "<snippet>"`, a file argument, or stdin (when piped). A
 /// file whose bytes start with the wasm magic runs straight through wasmtime (a
@@ -2197,44 +2237,81 @@ fn compile_and_run(
 /// shape (no file with `-e`/stdin) is dispatched before the positional parsing.
 fn run_cmd(args: &[String]) -> Result<()> {
     use std::io::{IsTerminal, Read};
+    // Everything from a literal `--` onward belongs to the PROGRAM, host flags
+    // included — so the batch probe must not see it. Scanning the whole of `args`
+    // let a program argument spelled `--batch` hijack the host: `vl run p.vl --
+    // --batch x` dispatched into `run_batch`, which then rejected the separator
+    // ("vl run --batch: unknown flag `--`", exit 1). The separator is found once,
+    // here, and every host-side scan below stops at it.
+    let sep = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let (host, tail) = args.split_at(sep);
     // `--batch` is its own arg shape (many files, --out-dir) — dispatch first.
-    if args.iter().any(|a| a == "--batch") {
+    if host.iter().any(|a| a == "--batch") {
         return run_batch(args);
     }
     let mut compiler: Option<String> = None;
     let mut inline: Option<String> = None;
-    let mut file: Option<String> = None;
+    // Positionals in order, before the file/argument split is made. The split cannot
+    // be made DURING the walk because it depends on `-e`, which may arrive later:
+    // with a `-e` snippet there is no source file, so `vl run -e <src> a b` has TWO
+    // program arguments. Assigning the first positional to `file` on sight dropped
+    // `a` on the floor — `file` is never read on the `-e` path.
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < host.len() {
+        match host[i].as_str() {
+            "--compiler" => {
+                compiler = Some(flag_value(host.get(i + 1), "--compiler"));
+                i += 1;
+            }
+            "-e" => {
+                inline = Some(flag_value(host.get(i + 1), "-e"));
+                i += 1;
+            }
+            // Flags `build`/`check` act on and `run` does not: it compiles in memory
+            // and writes nothing, so there is no artifact to optimize (`-O`/`-O3`),
+            // disassemble (`--wat`), name (`--names`), or skip validating
+            // (`--no-validate`). Accepted and INERT rather than rejected, because
+            // that is what they have always been on this path — turning a spelling
+            // that runs today into an error is the thing this change is avoiding.
+            "-O" | "-O3" | "--names" | "--wat" | "--no-validate" => {}
+            a if !a.starts_with('-') => positional.push(a.to_string()),
+            // THE `_ => {}` THIS REPLACES. An unrecognised dash-led token used to be
+            // consumed and discarded with no diagnostic and no exit code, which made
+            // every flag-shaped PROGRAM argument disappear: `vl run p.vl -v x` handed
+            // the guest one argument, `x`. Worse shapes existed — `-o out.wasm` ate
+            // the flag and injected `out.wasm` INTO argv, and a dash-led file argument
+            // (`vl run -weird.vl`) set no file at all and fell through to the stdin
+            // read, which BLOCKS FOREVER when stdin is a pipe rather than a tty.
+            other => arg_error(&format!("unknown flag `{other}`"), Some(other)),
+        }
+        i += 1;
+    }
+    // The file/argument split, once every positional is known. Program arguments are
+    // the positionals that are not the source file, then everything after `--`
+    // verbatim — in that order, so `vl run p.vl a -- b` is `a`, `b`.
+    let mut positional = positional.into_iter();
+    // `-e` supplies the source, so on that path NO positional is a file.
+    let file: Option<String> = if inline.is_none() {
+        positional.next()
+    } else {
+        None
+    };
     // The PROGRAM's own arguments — what `__args_count__` / `__args_get__` answer for.
     // Two spellings, because one of them cannot express an argument beginning with `-`:
     // every positional after the source file is a program argument, and a literal `--`
     // ends host parsing so everything after it (flags included) passes through verbatim.
     // A `vl run` with neither is unchanged: the list stays empty.
-    let mut prog_args: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                prog_args.extend(args[i + 1..].iter().cloned());
-                break;
-            }
-            "--compiler" => {
-                compiler = args.get(i + 1).cloned();
-                i += 1;
-            }
-            "-e" => {
-                inline = args.get(i + 1).cloned();
-                i += 1;
-            }
-            a if !a.starts_with('-') && file.is_none() => file = Some(a.to_string()),
-            a if !a.starts_with('-') => prog_args.push(a.to_string()),
-            _ => {}
-        }
-        i += 1;
-    }
+    let mut prog_args: Vec<String> = positional.collect();
+    prog_args.extend(tail.iter().skip(1).cloned());
     set_program_args(&prog_args);
     let compiler = resolve_compiler(compiler);
 
-    const USAGE: &str = "usage: vl run <file.vl> | -e <source> | < stdin";
+    const USAGE: &str = concat!(
+        "usage: vl run <file.vl> [args...] [-- args...] | -e <source> | < stdin\n",
+        "       a program argument that looks like a flag goes after `--`: ",
+        "vl run <file.vl> -- -v",
+    );
     let run_engine = gc_engine(run_collector()?)?;
 
     // A file argument (no `-e`): a prebuilt wasm runs directly; else it's source.

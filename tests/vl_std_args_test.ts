@@ -172,16 +172,49 @@ Deno.test({
 });
 
 Deno.test({
-  // A HOST WART, pinned so a fix is noticed rather than silently changing what
-  // programs see. `vl run p.vl -v` SILENTLY DROPS `-v`: the host's flag loop
-  // (`run_cmd`) matches `--compiler`/`-e`/`--`, sends every other non-dash token to
-  // the vector, and falls through dash-led tokens to `_ => {}` with no diagnostic.
-  // Nothing inside `std:args` can tell a dropped argument from an un-passed one, so
-  // the only place this can be asserted is from out here. `--` passes it through.
-  name: "std:args: a dash-led argument is DROPPED by the host unless it follows `--`",
+  // WAS A HOST WART, NOW A LOUD ERROR — and this test is the reason the change was
+  // noticed rather than silently reshaping what programs see.
+  //
+  // `vl run p.vl -v x` used to SILENTLY DROP `-v` and deliver only `x`: the host's
+  // flag loop fell through unrecognised dash-led tokens to `_ => {}` with no
+  // diagnostic. Nothing inside `std:args` could tell a dropped argument from an
+  // un-passed one — a dropped argument and an absent one are the same absence — so
+  // out here was the only place it could be asserted at all. Fixed in #1818; the
+  // token is now rejected with exit 2 and a runnable remedy.
+  //
+  // `--` was ALWAYS the way to pass one and still is, unchanged.
+  name: "std:args: a dash-led argument is a loud error unless it follows `--` (#1818)",
   ignore: !ENABLED,
   fn: async () => {
-    await expect(["-v", "x"], ["n=1", "0:[x]:1"]);
+    const dir = await Deno.makeTempDir({ prefix: "vl_std_args_dash_" });
+    const entry = `${dir}/echo.vl`;
+    await Deno.writeTextFile(entry, ECHO);
+    try {
+      const { code, stderr } = await new Deno.Command(VL, {
+        args: ["run", entry, "--compiler", COMPILER, "-v", "x"],
+        stdout: "null",
+        stderr: "piped",
+        env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: STD },
+      }).output();
+      const err = new TextDecoder().decode(stderr);
+      // Exit 2 is the usage code `usage()` and `cliUsageErr` already reserve; 1 would
+      // mean the PROGRAM failed, which is a different thing entirely.
+      if (code !== 2) {
+        throw new Error(`want exit 2 for an unknown flag, got ${code}\nstderr:\n${err}`);
+      }
+      // The message must name the ACTUAL token, not a placeholder — a remedy the
+      // reader cannot copy is barely better than the silent drop it replaced.
+      if (!err.includes("`-v`")) {
+        throw new Error(`the error should name the token \`-v\`\nstderr:\n${err}`);
+      }
+      if (!err.includes("--")) {
+        throw new Error(`the error should point at \`--\` as the remedy\nstderr:\n${err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+
+    // The `--` spelling is unchanged, and carries every dash shape through verbatim.
     await expect(["--", "-v", "--long=1", "x"], [
       "n=3",
       "0:[-v]:2",
