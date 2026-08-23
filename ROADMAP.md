@@ -1195,7 +1195,60 @@ in-language GC knobs.
   - **Language-wide, still open** — value-vs-reference (default reference), error model.
   - **Deferred** — per-frame pooling; user-facing low-level array escape.
   - **Remaining open questions** — capacity/seed construction spelling; `map`/`filter` return type.
-- 🟡 **B7. Strings — DESIGN DECIDED, implementation not started.**
+- 🟡 **B7. Strings — THE REPRESENTATION MIGRATION IS SHIPPED.** Steps 0–2c are in:
+  `std:str` (#1835), Step-0 measurements (#1836), the heap-type split (#1843), the slice
+  header with O(1) views (#1845), and the **UTF-8 byte swap** (#1848). A VL string is now
+  `(struct (ref (array (mut i8))) $start $len)` — `s[i]` is a **byte**, `.length` a **byte
+  count**, `slice` **byte offsets** returning an O(1) view; code points come from
+  `for cp in s` / `cpAt` / `cpLen` / `isCharBoundary`. Validity is Go-lean (U+FFFD, never a
+  trap). See `docs/guide/strings-design.md`, `docs/internals/string-rep-measurements.md`,
+  `docs/internals/str-byte-semantics.md`, `docs/internals/utf8-byte-ready.md`.
+
+  **MEASURED END TO END** (`23b9f55f` → `5f66c6ca`, user-CPU medians of 5 interleaved runs,
+  peak RSS; wall clock was unusable — the box averaged 2.7 load, and synthetic
+  function-name corpora proved worthless because map probe cost is **bimodal on BOTH
+  builds**, see the residue item below):
+
+  | workload | before | after | |
+  |---|---|---|---|
+  | `vl build` — full self-compile | 2.04 s · 700 MB | 2.05 s · 650 MB | CPU **flat**, mem −7% |
+  | `vl check` — whole compiler (5.9 MB) | 1.09 s · **546 MB** | 1.56 s · **284 MB** | CPU **+43%**, mem **−48%** |
+  | `vl fmt --check compiler` | 0.49 s | 0.58 s | +18% |
+  | seed module | 1,308,280 B | 1,372,836 B | +4.9% |
+  | `split` of a 400 k-char string | — | — | **4.4× less allocated** |
+
+  The shape: **memory is much better where strings dominate and CPU is worse there**;
+  `vl build` is flat because emit (~60% of a compile) never touched a string. The −48% on
+  `check` is the headline win; the +43% CPU is the headline cost and the cached hash below
+  is the designed answer to it.
+
+  REMAINING, in priority order:
+  1. **Step 3 — the cached hash, still unwired.** The `$hash` header field was deliberately
+     deferred in #1845 ("do not wire any hash logic") because it must move atomically with
+     byte-level equality; the byte-level half landed implicitly with #1848 (a string IS
+     bytes), so **only the cache is outstanding**. `strings-design.md` §Equality has the
+     design. This is the natural response to the `check` CPU regression: the compiler is
+     overwhelmingly map-key-heavy and re-hashes the same immutable key object repeatedly.
+  2. **`__print_string__` is still per-element.** #1848 converted the CLI data-out channel
+     (`vl fmt` on 7 MB 0.80→0.46 s) but not this one — a new import functype moves four
+     hardcoded indices. **Non-ASCII printing is 15% slower** than before the swap; ASCII is
+     unchanged.
+  3. **Source intake is still UTF-32**, one code point per word, so the host→guest staging
+     path did not get the 4× the storage did.
+  4. **`s.backwards()` is unbuilt.** §Codepoints specifies it and UTF-8
+     self-synchronisation makes it O(1)/step; nothing consumes it yet.
+  5. **`utf8Length` should be deleted** — a second name for `.length` is a trap
+     (`utf8-byte-ready.md`), but it is a breaking removal wanting its own slice.
+  6. **Map probe cost is bimodal, on BOTH builds** — an 8,000-function corpus checks SLOWER
+     than a 12,000-function one, in both directions, reproducibly, under user-CPU timing.
+     That is hash-collision luck, not size, and #1848 changed the hash domain (bytes, not
+     code points) so it reshuffled which inputs are lucky. **Pre-existing weakness the
+     migration exposed rather than caused** — but it makes any per-file benchmark
+     meaningless and is worth its own look. Related: item 1.
+  7. **True display width ≠ code points** (CJK double-width, combining marks, emoji). `vl
+     fmt` counting code points restores pre-#1848 behaviour and no more; a real width
+     model is a separate question.
+
   `docs/guide/strings-design.md` is now a ruled design, and **the "not before bootstrap" gate it
   opened with is LIFTED** (byte-exact fixpoint, TS host gone, `u8`/packed `(array mut i8)` shipped
   with `std:fs` — the substrate). **The design REVERSED its own API ruling:** the core is now
