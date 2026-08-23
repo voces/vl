@@ -209,6 +209,35 @@ The premise holds in today's tree and no ruling exists. `sed -n '1,30p' tests/ca
 
 </details>
 
+### str-byte-index-unit-rulings
+
+**Three `std:str` semantics the byte-indexed-UTF-8 migration cannot decide for itself — padding width, the empty-needle boundary, and trim's whitespace set**
+`docs/internals/str-byte-semantics.md` §R1/§R2/§R3 (the full audit; per-function table at §Table)
+
+**The question.** `docs/guide/strings-design.md` §API is DECIDED — `s[i]` becomes a byte, `.length` a byte count, `slice` byte offsets. An audit of all 15 `std/str.vl` exports against that target classifies 7 unchanged, 0 improved, 5 broken-as-shipped (repaired in the same PR, byte-identically on today's build) and **3 needing an owner ruling**:
+
+- **R1 — `padStart`/`padEnd`'s `len`: bytes or code points?** `"héllo".padStart(8, " ")` prepends 3 spaces today and 2 after. `len` is the module's only WIDTH rather than an offset, so unlike every other number in the file it has no matching `slice` to cancel against and the unit is observable. **This one has a deadline**: unruled, the swap changes what a shipped function means, silently.
+- **R2 — what is a "boundary" for an EMPTY needle in `split`/`replaceAll`?** Byte boundaries or character boundaries. The byte reading makes `"é".split("")` two half-characters and `"é".replaceAll("", "-")` an invalid string. Already resolved CONSERVATIVELY in code (the loops iterate rather than index, so today's answer survives); reverting is two lines.
+- **R3 — should `trim` strip ASCII whitespace or Unicode whitespace?** REP-INDEPENDENT, gates nothing, filed because the audit found the module's stated justification for ASCII-only is false: it cites Go's `strings.TrimSpace` as stopping at the six ASCII characters, and Go's six are a fast path that falls through to `unicode.IsSpace`. Rust, Python and JS all strip NBSP too; only C does not.
+
+**Options.** R1: (i) bytes — O(1), consistent with `.length`, but aligns nothing once a non-ASCII character appears and can truncate mid-character; (ii) code points — O(n), needs `cpLen` (already specified in §Codepoints); (iii) two names. R2: (i) code-point boundaries (today's answer, always valid UTF-8); (ii) byte boundaries (mechanically consistent with `.length`, can emit invalid strings). R3: (i) keep ASCII-only (right for scanners, a byte test, no decode); (ii) Unicode `White_Space` — a fixed 25-code-point predicate, NO tables needed, so the "that needs `std:unicode`" objection does not hold; (iii) both, named apart.
+
+**Recommendations, with the measurement behind each.** R1 → **code points.** Measured locally: Rust `format!("{:>8}", "héllo")` pads by chars, Python `rjust` by code points, JS `padStart` by UTF-16 units, and C `printf("%8s")` by bytes — C being the only byte answer and the only visibly ragged column. Go, the byte-indexed language VL is joining, documents *"Width and precision are measured in units of Unicode code points, that is, runes. (This differs from C's printf where the units are always measured in bytes.)"* §API's one-coordinate-system argument is about OFFSETS and does not reach a width. R2 → **code points**, unanimous: Go documents *"Split splits after each UTF-8 sequence"*, Rust/Python/JS all keep `é` whole; JS is the cautionary case, splitting at its index unit and so handing back lone surrogates for an emoji. R3 → **both, named** (`trim` = Unicode, `trimAscii*` = the six) when a second caller exists, else Unicode — the module already resolved this exact tension correctly for `toUpperAscii`.
+
+**Blocked while unruled.** Nothing today. R1 acquires a cost at Step 2 of the strings migration: ship the swap without ruling it and `padStart` changes meaning with no diagnostic. R2 and R3 block nothing at any point.
+
+**Reversible?** Cheaply, right now, and not later. `std:str` has NO importer outside `std/fmt.vl` (whose `padLeft` delegates to `padStart`) and `tests/cases/std/str-*.vl` — nothing in `compiler/*.vl` imports it — so R1 is two functions and one line each today. Once programs pad columns with it, changing the unit is a breaking change.
+
+**Cost if taken.** R1: `padStart`/`padEnd` swap `self.length` for a code-point count and `padFill` tiles code points — under 20 lines, plus `cpLen` whenever §Codepoints lands. R2: zero if the recommendation stands (already implemented), two lines to revert. R3: (ii) is a 25-value predicate; (iii) adds three exports.
+
+**Cost of waiting.** R1 only: every day of waiting is free until Step 2 ships, and after that the ruling is a breaking change instead of an edit.
+
+<details><summary>verification</summary>
+
+Open, and the underlying rep decision is real rather than aspirational. `docs/guide/strings-design.md` §API/§Storage are marked DECIDED with Step 2 in the migration list; `docs/internals/str-byte-semantics.md` is the audit filing these three and carries the per-function table, the differential property check (73,800 exhaustive + 200,000 randomized two-domain trials, zero disagreements) and the survey measurements. No ruling exists elsewhere: `grep -n "padStart\|padEnd" DECISIONS.md ROADMAP.md` finds no unit ruling, and OQ-3 in strings-design.md (RESOLVED — the 15 names stay in `std:str`) explicitly defers this, noting *"`padStart(s, 3)` must decide bytes-or-characters, and that ruling wants to be cheap."* Importer census re-derived: `grep -rl 'std:str' --include='*.vl' .` → `std/fmt.vl`, `std/str.vl`, and eight `tests/cases/std/str-*.vl` files, nothing else.
+
+</details>
+
 ### buffer-scalar-arg-accessors
 
 **Per-width scalar-argument accessors (`getF32At(base, length, i)`) — widen `std:buffer`'s public surface, or leave the 3.0x to hand-written loops**  

@@ -1,0 +1,240 @@
+// @run
+// @log true
+// @log true
+// @log true
+// @log true
+// @log true
+// @log true
+// @log true
+// @log true
+// @log false
+// @log false
+// @log false
+// @log -1
+// @log -1
+// @log [<Ã©>]
+// @log [Ã©]
+// @log [<a><b><c>]
+// @log [<><a><>]
+// @log [<a><><b>]
+// @log [<><>]
+// @log [é·→·𝄞]
+// @log [é]
+// @log [→]
+// @log true
+// @log true
+// @log true
+// @log [a≠b→c]
+// @log [a≠b≠c]
+// @log [a→b]
+// @log [ab]
+// @log [a→c]
+// @log true
+// @log [a→b]
+// @log [c]
+// @log [→é]
+// @log [𝄞]
+// @log [é ]
+// @log [ é]
+// @log [é]
+// @log [→é𝄞]
+// @log [é→é→é→]
+// @log [𝄞𝄞]
+// @log [é]
+// @log []
+// @log []
+// @log [héllo]
+// @log [héllo]
+// @log [é]
+// @log [é]
+// @log [→𝄞]
+// @log [CAFé→]
+// @log [cafÉ→]
+// @log [é→𝄞]
+// @log [é→𝄞]
+// @log true
+// @log [a→b]
+// @log [A→B]
+// `std:str` ON MULTI-BYTE TEXT — the answers that MUST NOT MOVE when the string
+// representation becomes byte-indexed UTF-8.
+//
+// WHAT THIS FILE IS FOR. `docs/guide/strings-design.md` §API is decided:
+// storage becomes UTF-8 `array i8`, `s[i]` becomes a BYTE, `.length` becomes a
+// BYTE COUNT, `slice` takes byte offsets. `std:str` is written entirely on that
+// surface, so the migration either leaves it alone or breaks it silently —
+// there is no third outcome, and "the suite is green" is not evidence when the
+// suite is ASCII. Every other `str-*.vl` fixture here is pure ASCII, where the
+// byte index IS the code-point index and the byte length IS the code-point
+// length; not one of them can tell the two representations apart. This file is
+// the one that can. It passes today, and `docs/internals/str-byte-semantics.md`
+// is the audit that says which of these lines are supposed to still pass after.
+//
+// EVERY ASSERTION HERE IS DELIBERATELY UNIT-FREE. Nothing below prints a
+// `.length`, prints an `indexOf`, or compares an offset against a literal —
+// those are exactly the numbers that MOVE (`"héllo".length` is 5 today and 6
+// after), and a fixture that gets rewritten to match new behaviour has checked
+// nothing. What is pinned instead is: string VALUES, booleans, `-1`, list
+// shapes, and offsets consumed by the same `slice` that produced them. Those
+// are invariant by construction, which is what makes a failure here mean the
+// migration is wrong rather than that this file is old.
+//
+// THE PROPERTY UNDER TEST, STATED. UTF-8 is self-synchronizing: a continuation
+// byte is `10xxxxxx` and no lead byte or ASCII byte ever looks like one, so a
+// valid multi-byte sequence CANNOT occur inside a different character's bytes.
+// Therefore a substring match IS a byte match: searching, splitting and
+// replacing byte-wise give the identical answers to searching code-point-wise,
+// and get faster doing it. That was verified exhaustively rather than assumed
+// (73,800 haystack/needle pairs over an alphabet chosen so the byte sequences
+// collide pairwise, plus 200,000 randomized trials — zero disagreements;
+// §Property in the audit). §2 below pins the expressible half of it.
+//
+// The alphabet is chosen the same adversarial way: `é` U+00E9 is `C3 A9`, `Ã`
+// U+00C3 is `C3 83` and `©` U+00A9 is `C2 A9`, so the three share a lead byte
+// or a trailing byte pairwise and a byte scan has every chance to straddle.
+// `→` U+2192 is three bytes and `𝄞` U+1D11E is four, so all four UTF-8 widths
+// appear. `·` U+00B7 and `≠` U+2260 are multi-byte replacements, because a
+// replacement is a place where bytes get WRITTEN and not just read.
+import { endsWith, join, lastIndexOf, padEnd, padStart, repeat, replace, replaceAll, split, startsWith, toLowerAscii, toUpperAscii, trim, trimEnd, trimStart } from "std:str"
+
+// Pieces render as `<piece><piece>` inside `[]` so an empty piece and an empty
+// LIST stay distinguishable, and — as in `str-split.vl` — `show` does NOT use
+// `join`, because this file asserts `join` too and a renderer built out of the
+// thing under test asserts nothing.
+function show(xs: string[]) {
+  let out = "["
+  let i = 0
+  while i < xs.length {
+    out = out + "<" + xs[i] + ">"
+    i = i + 1
+  }
+  return out + "]"
+}
+
+// ── 1. AFFIXES: a multi-byte prefix or suffix is found, at every width ──────
+// `startsWith`/`endsWith` compare element by element from a computed offset.
+// Byte-wise that offset is a byte offset and the comparison is a byte
+// comparison, and both answers are the same one for the same reason the search
+// family is: the needle is itself valid UTF-8, so it can only line up on a
+// character boundary.
+print("café→".startsWith("café"))     // true  — 2-byte char inside the prefix
+print("café→".startsWith("caf"))      // true  — an ASCII prefix of the same
+print("café→".endsWith("é→"))         // true  — 2-byte then 3-byte suffix
+print("café→".endsWith("→"))          // true  — 3 bytes at the very end
+print("𝄞x".startsWith("𝄞"))           // true  — 4 bytes at the very start
+print("x𝄞".endsWith("𝄞"))             // true  — 4 bytes at the very end
+print("é".startsWith("é"))            // true  — the whole string
+print("é".endsWith("é"))              // true
+
+// ── 2. THE SELF-SYNCHRONIZATION PROPERTY, in the direction VL can spell ─────
+// `é` is `C3 A9`, `Ã` is `C3 83`, `©` is `C2 A9`. Each pair shares a byte —
+// the LEAD byte for (é, Ã), the TRAILING byte for (é, ©) — so a byte scan that
+// got the boundary logic wrong would report a hit on one of these lines.
+//
+// The counterexample that would BREAK the property cannot be written here at
+// all, and that is the proof rather than a gap in it: it would need a needle
+// starting with a continuation byte (`0xA9…`), and no such byte sequence is a
+// valid string, so it has no VL literal. It can only arrive by slicing at a
+// non-character boundary, which §Validity permits and this file does not do.
+print("Ã©".startsWith("é"))           // false — shares the LEAD byte C3
+print("é".startsWith("Ã"))            // false — the mirror
+print("aé".endsWith("©"))             // false — shares the TRAILING byte A9
+print("Ã©".lastIndexOf("é"))          // -1    — and -1 has no unit, so it holds
+print("aé".lastIndexOf("©"))          // -1
+print(show("Ã©".split("é")))          // [<Ã©>] — not found: one piece, the input
+print("[" + "Ã©".replaceAll("é", "!") + "]")   // [Ã©] — and nothing written
+
+// ── 3. SPLIT, JOIN, and the law, over multi-byte separators and pieces ──────
+// A separator is a needle, so §2 covers finding it; what these add is that the
+// PIECES either side of it come back whole. A byte-wise split that mis-placed
+// a boundary would hand back half a character, and the `==` on the last three
+// lines would go red rather than the pieces looking subtly wrong in a log.
+print(show("a→b→c".split("→")))       // [<a><b><c>]
+print(show("→a→".split("→")))         // [<><a><>]   — leading and trailing
+print(show("a𝄞𝄞b".split("𝄞")))        // [<a><><b>]  — adjacent, 4-byte
+print(show("é".split("é")))           // [<><>]      — the separator alone
+print("[" + ["é", "→", "𝄞"].join("·") + "]")   // [é·→·𝄞] — all four widths
+print("[" + ["é"].join("·") + "]")             // [é]     — sep never used
+print("[" + ["", ""].join("→") + "]")          // [→]     — one gap
+// THE LAW from `std:str`'s header — `replaceAll` is split-then-join for a
+// non-empty `from` — restated over multi-byte inputs. It ties the two
+// families together: if either side moved under the rep change and the other
+// did not, this goes false without anyone having to guess which line to read.
+print("a→b→c".replaceAll("→", "≠") == "a→b→c".split("→").join("≠"))
+print("→a→→b→".replaceAll("→", "≠") == "→a→→b→".split("→").join("≠"))
+print("é𝄞é".replaceAll("é", "·") == "é𝄞é".split("é").join("·"))
+
+// ── 4. REPLACE: multi-byte in, multi-byte out, and widths that differ ───────
+// `replace` splices with two `+`s and no buffer; `replaceAll` fills a buffer
+// and calls `fromCodePoints`. They are the module's two different write paths
+// and they are asserted on the same inputs so a divergence names itself.
+print("[" + "a→b→c".replace("→", "≠") + "]")     // [a≠b→c] — FIRST only
+print("[" + "a→b→c".replaceAll("→", "≠") + "]")  // [a≠b≠c] — 3 bytes for 3
+print("[" + "a→b".replace("←", "!") + "]")       // [a→b]   — absent, untouched
+print("[" + "a→b".replaceAll("→", "") + "]")     // [ab]    — deletion
+print("[" + "abc".replaceAll("b", "→") + "]")    // [a→c]   — 1 byte becomes 3
+
+// ── 5. AN OFFSET USED AS A SLICE BOUND — the migration-proof idiom ──────────
+// `lastIndexOf` returns 3 today and 4 after the swap, and NEITHER number is
+// pinned here. What is pinned is that the offset means the same thing to the
+// `slice` that consumes it, which is the whole content of "one coordinate
+// system" (§API) and the shape every caller of `indexOf`/`lastIndexOf` should
+// be written in.
+const h = "a→b→c"
+const at = h.lastIndexOf("→")
+print(h.slice(at, at + "→".length) == "→")       // true — round trip
+print("[" + h.slice(0, at) + "]")                // [a→b] — before the match
+print("[" + h.slice(at + "→".length, h.length) + "]")  // [c] — after it
+
+// ── 6. TRIM: ASCII whitespace around, and never inside, multi-byte text ─────
+// No byte of a multi-byte sequence is ever below 0x80, so an ASCII-whitespace
+// byte scan cannot mistake part of a character for a space — which is why the
+// trim family is one of the operations that gets FASTER and not different.
+// (Whether `trim` should also strip Unicode spaces such as U+00A0 is an open
+// ruling, §R3 of the audit, and is deliberately NOT pinned here: pinning an
+// answer that is under review is how a fixture becomes a rewrite.)
+print("[" + "  →é  ".trim() + "]")    // [→é]
+print("[" + "\t𝄞\n".trim() + "]")      // [𝄞]   — tab and newline, 4-byte body
+print("[" + " é ".trimStart() + "]")  // [é ]
+print("[" + " é ".trimEnd() + "]")    // [ é]
+print("[" + "é".trim() + "]")         // [é]   — C3 A9: neither byte is a space
+print("[" + "→é𝄞".trim() + "]")       // [→é𝄞] — nothing to remove, returned as is
+
+// ── 7. REPEAT: `n` is a MULTIPLIER, so no unit question arises ──────────────
+// This is the one builder whose argument the rep change cannot touch — "three
+// times" is three times whatever a string is. What it DOES test is the buffer
+// path: `repeat` fills a code-point buffer and drains it through
+// `fromCodePoints`, so if that buffer is ever fed bytes instead, `é→é→é→` comes
+// back as six mojibake characters.
+print("[" + "é→".repeat(3) + "]")     // [é→é→é→]
+print("[" + "𝄞".repeat(2) + "]")      // [𝄞𝄞]
+print("[" + "é".repeat(1) + "]")      // [é]  — the identity early return
+print("[" + "é".repeat(0) + "]")      // []
+print("[" + "é".repeat(-1) + "]")     // []   — a negative count is empty
+
+// ── 8. PADDING, only where the unit cannot decide the answer ───────────────
+// `padStart(s, len, pad)`'s `len` is the module's one genuinely OPEN question
+// (§R1): it is a WIDTH, not an offset, so it has nothing to cancel against and
+// `"héllo".padStart(8)` means different things in bytes and in characters.
+// Nothing below depends on which: `len` is small enough that no padding
+// happens under EITHER unit (a byte count is never less than a code-point
+// count), or `pad` is empty and the padder is a no-op by a rule of its own.
+print("[" + "héllo".padStart(3, "0") + "]")   // [héllo] — never TRUNCATES
+print("[" + "héllo".padEnd(2, "-") + "]")     // [héllo]
+print("[" + "é".padStart(10, "") + "]")       // [é]  — empty pad is a no-op
+print("[" + "é".padEnd(10, "") + "]")         // [é]
+print("[" + "→𝄞".padStart(0, "-") + "]")      // [→𝄞] — nothing asked for
+
+// ── 9. ASCII CASE: the `Ascii` in the name, over non-ASCII input ────────────
+// `caseShift` moves exactly `a`–`z` and `A`–`Z`. Those are byte values 0x41–
+// 0x5A and 0x61–0x7A, and no byte of a multi-byte sequence can land in either
+// range (they are all >= 0x80) — so the mapping is the same set of characters
+// whether it walks code points or bytes. `é` and `É` survive both directions
+// untouched, which is the promise the name makes and the one a Unicode-aware
+// `toUpper` would break.
+print("[" + "café→".toUpperAscii() + "]")     // [CAFé→] — é is NOT upper-cased
+print("[" + "CAFÉ→".toLowerAscii() + "]")     // [cafÉ→] — É is NOT lower-cased
+print("[" + "é→𝄞".toUpperAscii() + "]")       // [é→𝄞]  — nothing to change
+print("[" + "é→𝄞".toLowerAscii() + "]")       // [é→𝄞]
+print("Ãé".toUpperAscii() == "Ãé")            // true   — returned as it arrived
+print("[" + "a→B".toLowerAscii() + "]")       // [a→b]  — ASCII either side of →
+print("[" + "a→B".toUpperAscii() + "]")       // [A→B]

@@ -60,6 +60,16 @@
 // left operand. Two `+`s to splice a result (`replace`) are fine — that is
 // O(n) once, not O(n) per element.
 //
+// And the second half of the rule, which is about the UNIT rather than the
+// cost: **what goes into that buffer is a CODE POINT, and it gets there by
+// `for cp in s`, never by `s[i]`.** `fromCodePoints` reads its argument as code
+// points — its name is its contract — and `for cp in s` yields code points both
+// today and after the UTF-8 swap, so the two move together. `s[i]` does not:
+// §API makes it a BYTE, and a byte pushed into a code-point buffer comes back
+// out as a different character (`fromCodePoints([195, 169])` is `"Ã©"`, not
+// `"é"` — run it). `pushStr` is where that discipline is enforced for the whole
+// file; `docs/internals/str-byte-semantics.md` is the audit that found it.
+//
 // ── ASCII IS IN THE NAME WHERE ASCII IS THE BEHAVIOUR ──
 //
 // `toUpperAscii` / `toLowerAscii` are spelled that way DELIBERATELY, and the
@@ -71,16 +81,26 @@
 // belongs to a future `std:unicode` alongside `normalize`, `graphemes` and
 // `reverse`. The name here promises exactly what it does.
 //
-// `trim` is ASCII-only for the same reason and is NOT named for it, which is a
-// deliberate asymmetry rather than an oversight: the whitespace set is a
-// closed, tiny, universally-agreed list (space, `\t`, `\n`, `\v`, `\f`, `\r` —
-// the same six C's `isspace` takes and Go's `strings.TrimSpace` starts from),
-// and the Unicode additions to it (NBSP, the en/em spaces, U+3000) are exactly
-// the characters a caller does NOT want collapsed when trimming a field. A
-// `toUpper` that ignores non-ASCII gives a WRONG answer; a `trim` that ignores
-// non-ASCII space gives the answer nearly every caller wanted. When
-// `std:unicode` lands it can add `trimUnicodeSpace` beside this, not instead
-// of it.
+// `trim` is ASCII-only and is NOT named for it, which this comment used to call
+// a deliberate asymmetry. **CORRECTION — the precedent it claimed is not
+// there.** It said the six-character set is "the same six C's `isspace` takes
+// and Go's `strings.TrimSpace` starts from". "Starts from" is the tell: Go's
+// six are a FAST PATH, and `TrimSpace` falls through to `TrimFunc(s,
+// unicode.IsSpace)` the moment it meets a byte >= 0x80 — so Go trims NBSP.
+// So do Rust (`char::is_whitespace`, the Unicode White_Space property), Python
+// (`str.strip()`), and JS (`String.prototype.trim`, WhiteSpace + LineTerminator).
+// All four of the languages this module's rulings defer to strip U+00A0; VL
+// implemented Go's optimization and stopped, which is not the same as
+// implementing Go.
+//
+// The behaviour is UNCHANGED here — an audit is not the place to move a shipped
+// answer — but it is now an OPEN RULING rather than a settled asymmetry, and
+// the argument on each side (including the good one for ASCII-only: a lexer
+// wants exactly these six, and White_Space is 25 code points that need no
+// tables) is written up in `docs/internals/str-byte-semantics.md` §R3. Note the
+// question is rep-INDEPENDENT: byte-scanning for ASCII whitespace stays exactly
+// correct after the UTF-8 swap, because no byte of a multi-byte sequence is
+// ever < 0x80. It surfaces here only because the audit had to check it.
 //
 // ── THE DEGENERATE INPUTS ARE RULED, NOT LEFT TO FALL OUT ──
 //
@@ -137,10 +157,20 @@
 // hard duplicate-binding parse error. `lastIndexOf` is here because the core has
 // no counterpart at all.
 //
-// NO CODE-POINT-COUNTING ANYWHERE. `.length` and every index in this file is
-// whatever the core's index unit is — today a code point, after the rep swap a
-// UTF-8 byte. Nothing here converts between units or assumes which one it is,
-// which is what makes the whole module survive §Storage unchanged.
+// NO CODE-POINT-COUNTING ANYWHERE, AND NO UNIT CONVERSION EITHER. `.length`
+// and every index in this file is whatever the core's index unit is — today a
+// code point, after the rep swap a UTF-8 byte — and nothing here converts
+// between the two or asks which one it is. Offsets are produced by `indexOf`/
+// `length` and consumed by `slice`/`matchAt` in the same unit, so they cancel.
+// The one place a unit is NAMED is the builder buffer, which is code points by
+// `fromCodePoints`'s contract and is filled by iteration for exactly that
+// reason (see the buffer rule above).
+//
+// The two places the unit is still LOAD-BEARING, and therefore still open:
+// `padStart`/`padEnd`'s `len` argument, which is a width rather than an offset
+// and so has nothing to cancel against; and the EMPTY-needle rule in `split`/
+// `replaceAll`, which asks what a "boundary" is. Both are written up with
+// options and a recommendation in `docs/internals/str-byte-semantics.md`.
 //
 // ── RELATIONSHIP TO `std:fmt` ──
 //
@@ -200,26 +230,51 @@ function findFrom(self: string, needle: string, from: i32): i32 {
   -1
 }
 
-// Append `s[lo..hi)` to `buf`. The single copy primitive of this module — see
-// the header: `buf` GROWS (amortized push), a string would be COPIED WHOLE per
-// append. Bounds are clamped, so a caller may pass an empty or inverted range.
-function pushRange(buf: i32[], s: string, lo: i32, hi: i32) {
-  let i = lo
-  if i < 0 { i = 0 }
-  let end = hi
-  if end > s.length { end = s.length }
-  while i < end {
-    buf.push(s[i])
-    i = i + 1
-  }
+// Append every code point of `s` to `buf`. The single copy primitive of this
+// module — see the header: `buf` GROWS (amortized push), a string would be
+// COPIED WHOLE per append.
+//
+// IT ITERATES RATHER THAN INDEXES, AND THAT IS LOAD-BEARING, NOT STYLE.
+// `buf` is drained by `fromCodePoints`, whose contract is fixed by its name:
+// each `i32` is a CODE POINT. `for cp in s` yields code points too, and
+// `docs/guide/strings-design.md` §Codepoints keeps it yielding code points
+// after the UTF-8 swap — so the producer and the consumer are a matched pair
+// whose meanings move together, i.e. not at all. `buf.push(s[i])` was the
+// SAME VALUE today and a different one after: `s[i]` becomes a BYTE, and
+// pushing the two bytes of `é` into a code-point buffer re-encodes them as
+// two separate characters. `fromCodePoints([195, 169])` is `"Ã©"` on this very
+// build — measured, not predicted — so every builder in this file (`join`,
+// `replaceAll`, `repeat`, `padFill`, `mapAsciiCase`) would have shipped
+// mojibake the day the representation changed. See
+// `docs/internals/str-byte-semantics.md` §Builders.
+function pushStr(buf: i32[], s: string) {
+  for cp in s { buf.push(cp) }
 }
 
-// Append all of `s` to `buf`.
-function pushStr(buf: i32[], s: string) { pushRange(buf, s, 0, s.length) }
+// Append `s[lo..hi)` to `buf`. `lo` is clamped up to 0 and `hi` down to the
+// end, so a caller may pass an empty or inverted range.
+//
+// The clamp on `lo` is EXPLICIT and not delegated to `slice`, because VL's
+// `slice` reads a negative index as JS does — from the END (`"abc".slice(-1, 3)`
+// is `"c"`, checked) — which is the opposite of the "clamp to the start" this
+// helper promises. `hi` needs no such care: an over-long `hi` clamps the same
+// way in both.
+function pushRange(buf: i32[], s: string, lo: i32, hi: i32) {
+  let start = lo
+  if start < 0 { start = 0 }
+  pushStr(buf, s.slice(start, hi))
+}
 
 // The six ASCII whitespace characters — space, tab, newline, vertical tab, form
-// feed, carriage return. See the header for why the set is closed at ASCII and
-// why that does NOT put "Ascii" in `trim`'s name.
+// feed, carriage return.
+//
+// Whether the set SHOULD stop at ASCII is an open owner ruling: the header
+// records the correction (all four of JS, Python, Rust and Go strip Unicode
+// spaces such as NBSP; Go's six are a fast path, not its definition) and
+// `docs/internals/str-byte-semantics.md` §R3 has the options. It is
+// rep-INDEPENDENT — a byte test for a value below 0x80 stays exactly correct
+// after the UTF-8 swap, because no byte of a multi-byte sequence is ever that
+// low — so nothing about the migration forces the question either way.
 function isSpace(c: i32): boolean {
   c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
 }
@@ -304,8 +359,15 @@ export function lastIndexOf(self: string, needle: string): i32 {
 //     `"aaa".split("aa")` → `["", "a"]`
 //
 // An EMPTY separator is the one case outside that rule: it splits into single
-// characters, so `"abc".split("")` → `["a", "b", "c"]` and — this is the edge
+// CODE POINTS, so `"abc".split("")` → `["a", "b", "c"]` and — this is the edge
 // people trip on — `"".split("")` → `[]`, an EMPTY list rather than `[""]`.
+// "Code points" is the word that matters after the UTF-8 swap: an empty
+// separator is the only input in this file where "every boundary" has two
+// possible readings, and the loop below iterates rather than indexes so the
+// answer stays the one it gives today — which is also Go's ("if sep is empty,
+// Split splits after each UTF-8 sequence"). `"é".split("")` is one piece, not
+// two half-characters. The alternative reading is an OPEN RULING;
+// `docs/internals/str-byte-semantics.md` §R2 has it.
 // The two empty-input answers differ because the questions differ: splitting
 // "" on "," finds no separator and hands back the one field it was given,
 // while splitting "" into its characters finds none. Every one of JS, Python
@@ -318,11 +380,7 @@ export function lastIndexOf(self: string, needle: string): i32 {
 export function split(self: string, sep: string): string[] {
   const out: string[] = []
   if sep.length == 0 {
-    let c = 0
-    while c < self.length {
-      out.push(self.slice(c, c + 1))
-      c = c + 1
-    }
+    for cp in self { out.push(fromCodePoint(cp)) }
     return out
   }
   let start = 0
@@ -396,11 +454,16 @@ export function replace(self: string, from: string, to: string): string {
 // these awkward inputs. A `to` that CONTAINS `from` is not rescanned, so
 // `"a".replaceAll("a", "aa")` terminates at `"aa"`.
 //
-// An EMPTY `from` matches at every boundary — before the first character,
-// between each pair, and after the last — so `"abc".replaceAll("", "-")` is
-// `"-a-b-c-"` and `"".replaceAll("", "-")` is `"-"`. That is JS, Python, Rust
-// and Go verbatim (Go documents it as "up to k+1 replacements for a k-rune
-// string"), and it is the one input where the split/join law does not hold.
+// An EMPTY `from` matches at every CODE-POINT boundary — before the first
+// character, between each pair, and after the last — so `"abc".replaceAll("",
+// "-")` is `"-a-b-c-"` and `"".replaceAll("", "-")` is `"-"`. That is JS,
+// Python, Rust and Go verbatim (Go documents it as "up to k+1 replacements for
+// a k-rune string" — note *rune*), and it is the one input where the split/join
+// law does not hold. The loop iterates code points rather than indexing, so
+// after the UTF-8 swap it still puts `to` between CHARACTERS and not between
+// the bytes of one: a byte-boundary reading would make `"é".replaceAll("", "-")`
+// the invalid `"-\xC3-\xA9-"`. Same open ruling as `split("")`
+// (`docs/internals/str-byte-semantics.md` §R2).
 //
 // A `from` that never occurs returns `self` unchanged with nothing allocated —
 // checked BEFORE the buffer is built, because "no match" is the common case for
@@ -408,11 +471,9 @@ export function replace(self: string, from: string, to: string): string {
 export function replaceAll(self: string, from: string, to: string): string {
   const buf: i32[] = []
   if from.length == 0 {
-    let c = 0
-    while c < self.length {
+    for cp in self {
       pushStr(buf, to)
-      buf.push(self[c])
-      c = c + 1
+      buf.push(cp)
     }
     pushStr(buf, to)
     return fromCodePoints(buf)
@@ -487,25 +548,36 @@ export function repeat(self: string, n: i32): string {
   fromCodePoints(buf)
 }
 
-// Exactly `n` characters of `pad`, tiled and truncated at whatever character
-// the tiling lands on — `padFill(3, "ab")` is `"aba"`. `n <= 0` or an empty
-// `pad` yields `""`, which is what makes both padders return their input
-// untouched instead of special-casing the two degenerate arguments twice.
+// Exactly `n` index units of `pad`, tiled and truncated wherever the tiling
+// lands — `padFill(3, "ab")` is `"aba"`. `n <= 0` or an empty `pad` yields
+// `""`, which is what makes both padders return their input untouched instead
+// of special-casing the two degenerate arguments twice.
 //
 // Truncating mid-tile rather than refusing a multi-character pad is what JS
 // does, and it is the behaviour that makes the result EXACTLY `len` long, which
-// is the entire point of padding (a column that is sometimes one character
-// wider is not a column).
+// is the entire point of padding (a column that is sometimes one unit wider is
+// not a column).
+//
+// "INDEX UNIT", NOT "CHARACTER", AND THE TWO ARE THE SAME THING TODAY. `n`
+// arrives from `padStart`/`padEnd` as `len - self.length`, so whatever
+// `.length` counts is what this tiles — code points today, UTF-8 bytes after
+// `docs/guide/strings-design.md` §API lands. Spelling it `repeat` + `slice`
+// rather than `buf.push(pad[i % pad.length])` keeps it in lockstep with
+// `.length` through that change instead of pushing bytes into a code-point
+// buffer (see `pushStr`), and it is the same string today: `repeat("ab", 2)`
+// sliced to 3 is `"aba"`. **Whether `len` SHOULD be a byte count at all is an
+// open owner ruling** — `docs/internals/str-byte-semantics.md` §R1 lays out the
+// options and recommends code points, which every surveyed language including
+// byte-indexed Go uses for padding. If that ruling lands, this function and the
+// `self.length` in both padders move together; nothing else in the file does.
 function padFill(n: i32, pad: string): string {
   if n <= 0 { return "" }
   if pad.length == 0 { return "" }
-  const buf: i32[] = []
-  let i = 0
-  while i < n {
-    buf.push(pad[i % pad.length])
-    i = i + 1
-  }
-  fromCodePoints(buf)
+  if n <= pad.length { return pad.slice(0, n) }
+  // `return` is not optional here: a bare member CALL in tail position is
+  // `emitProgram: unsupported member-call statement` at emit time (checked;
+  // `docs/guide/strings-design.md` §Methods records the same shape).
+  return repeat(pad, (n + pad.length - 1) / pad.length).slice(0, n)
 }
 
 // `self` padded on the LEFT with `pad` until it is `len` long.
@@ -556,22 +628,16 @@ function caseShift(c: i32, up: boolean): i32 {
 // call is a normalizing comparison (`a.toLowerAscii() == b.toLowerAscii()`)
 // where one side is usually already lower-case.
 function mapAsciiCase(self: string, up: boolean): string {
-  let i = 0
   let hit = false
-  while i < self.length {
-    if caseShift(self[i], up) != 0 {
+  for cp in self {
+    if caseShift(cp, up) != 0 {
       hit = true
       break
     }
-    i = i + 1
   }
   if !hit { return self }
   const buf: i32[] = []
-  let j = 0
-  while j < self.length {
-    buf.push(self[j] + caseShift(self[j], up))
-    j = j + 1
-  }
+  for cp in self { buf.push(cp + caseShift(cp, up)) }
   fromCodePoints(buf)
 }
 
