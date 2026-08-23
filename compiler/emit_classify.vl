@@ -13878,6 +13878,28 @@ export function nameIsNulRefList(name: string) {
   return nameIsRefArray(np)
 }
 
+// THE FIELD-CODE TABLE'S DEFERRAL SET — the field type spellings `fieldCodeOfSpelling`
+// refuses because the rep is NOT BUILT YET, as against the far larger set it refuses
+// because it cannot tell what they are (an un-interned shape, an unregistered union, a
+// type parameter). Both come back -1 from the table, and the two are not the same fact:
+//
+//   * "not interned YET" is a PASS-ORDER answer that a later pass improves, so a caller
+//     mid-cascade must stay SILENT on it — `gaeEnsure` declining `{head: T}` and
+//     `internInlineShapeTy` declining a functype leaf are both correct, and three corpus
+//     files (`generic-application-name-grammar`, `nested-application-close-continuation`,
+//     `recursive-generic-alias-uninstantiated`) compile today only because they are;
+//   * a DEFERRED spelling is a decision, permanent for this compiler, and no later pass
+//     improves it. `#1805` shipped `u8[]` for the VALUE positions and deferred the
+//     CONTAINER ones deliberately — its own words for the field arm are "deferred here
+//     means REFUSED LOUDLY, not lowered wrongly".
+//
+// Naming the set is what lets a field-code consumer tell the two apart, and it is why
+// `Box<u8[]>` was silent: the generic-alias instance interner reads the SAME -1 the
+// declared-struct path reads, but had no way to see that this one was the loud kind.
+// A second deferral (`u16[]`, a packed struct field) belongs HERE, so every consumer
+// grows the arm at once instead of one of them drifting quiet again.
+export function fieldTypeIsDeferred(t: string): boolean { nameIsU8Array(t) }
+
 // The per-field wasm-type code a field type SPELLING carries — the ONE home of
 // the field-code ladder, shared by both entry points: `fieldTypeCode` (an AST
 // `TypeRef` node) and `nameFieldCode` (an inline object-type annotation member's
@@ -13965,7 +13987,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
     // each of them until every one grew an arm. A `u8[]` in those positions is deferred,
     // and deferred here means REFUSED LOUDLY, not lowered wrongly. See the report's
     // position table for the remaining container ladders.
-    if nameIsU8Array(t) { return -1 }
+    if fieldTypeIsDeferred(t) { return -1 }
     const sk = scalarListKindOfName(t)
     if sk == 0 { return 4 }
     if sk == 1 { return 6 }
@@ -15664,6 +15686,25 @@ function anonTySpellable(ty: i32): boolean {
 
 export function anonFieldCode(valIx: i32) {
   if valIx < 0 { return -1 }
+  // THE PACKED BYTE LIST HAS NO FIELD CODE (`fieldTypeIsDeferred`), so no synthetic row may
+  // claim one for it — and this is the ONE rung that can see the difference. Every rung
+  // below reads the literal's OWN type: `anonFieldCodeSyn` reads its element TEXTS, and the
+  // arena/name rungs read `nodeTyIxOf`. A bare `[7]` never infers `u8[]` (the default is
+  // `i32[]`, which is exactly what the checker records here), so all three answer 4 — an
+  // i32-list wrapper — for a literal the annotation typed as the one-byte backing.
+  //
+  // `nodeRepTyIxOf` is the CONTEXT-resolved sidecar the emitter's rep resolvers key on, and
+  // it carries the destination the literal was adopted into. Asked here rather than inside
+  // the `ArrayLit` arm because the arm is only the first of three rungs that guess: with the
+  // syntax arm alone declining, `fieldCodeOfTy(nodeTyIxOf(valIx))` re-derived the same 4
+  // from the naive type one line later (measured — the repro stayed invalid wasm).
+  //
+  // WHAT IT COST WHILE MISSING. A `u8[]` field is deferred, so no interner mints a row for
+  // the shape carrying it — and `collectAnonShapes` then minted a `#anon` one from the
+  // literal instead, substituting a guessed rep for the declared one. `vl build` exited 0
+  // on a module whose field was an i32-list wrapper over a `u8[]`; reading the field was
+  // invalid wasm, and not reading it was a valid module with the wrong shape in it.
+  if tyIsU8ArrayTy(nodeRepTyIxOf(valIx)) { return -1 }
   const syn = anonFieldCodeSyn(valIx)
   if syn >= 0 { return syn }
   // The recorded type's EMIT NAME, or "" for a type the checker cannot spell here (an
@@ -17450,6 +17491,23 @@ export function gaeEnsure(name: string) {
       if structIndexByName(tn) >= 0 {
         code = 15
         elem = tn
+      } else if fieldTypeIsDeferred(tn) {
+        // THE INSTANCE'S FIELD IS A DEFERRED REP, so this -1 is the same refusal the
+        // DECLARED-struct field loop makes (`collectS`) and the struct-ALIAS one makes
+        // (`internShapeAs`) — and it is reported in their words, because the two spellings
+        // of one field must not be tellable apart by their diagnostics.
+        //
+        // The silent `return 0` below is right for every OTHER -1 (see
+        // `fieldTypeIsDeferred`'s header: an un-interned field type is a pass-order
+        // answer a later pass improves, and three corpus files rely on the silence). It
+        // was WRONG for this one: `type Box<T> = { v: T }` at `T := u8[]` left the
+        // instance un-interned, the binding's object literal then interned its OWN
+        // `#anon` row from the literal's syntax — an i32-list field over a one-byte
+        // backing — and `vl check --codegen` reported invalid wasm on a file `vl check`
+        // called clean, while the direct `type W = { v: u8[] }` refused in one line.
+        return emitFail(
+          "emitProgram: only i32 / boolean / string / array struct fields are supported",
+        )
       }
     } else if code == 5 {
       // The APPLIED element text, RAW: an instance field's list element is spelled
