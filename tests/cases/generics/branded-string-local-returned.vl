@@ -1,0 +1,92 @@
+// A function whose tail RETURNS A LOCAL ANNOTATED WITH A BRANDED STRING NEWTYPE
+// (`type Nstr = new string`), with no return annotation of its own.
+//
+// THE HOLE THIS PINS. An un-annotated function's result valtype comes from the stored
+// `fRetKind` slot, and for a returned LOCAL there are exactly two producers: the A20 pass
+// in `buildFnMap`, which reads the CHECKER's inferred-return row, and `criClassify`'s
+// `criRetLocalLet` ladder, which classifies through the DECLARATION for the cases A20
+// cannot see. That ladder's header says the string local kinds "never reach here — the
+// A20 pass already covers them". True for the spelling `string`; FALSE for a branded
+// newtype. The checker banks an inferred-return row only for a name
+// `isClassifiableRetName` admits — six bare prim spellings plus `i32[]`/`string[]` — and
+// `Nstr` is not one, so no row is written, every A20 arm no-ops, and NOTHING classified
+// the return. The result valtype stayed at the i32 DEFAULT over a body pushing the
+// `(ref $type)` string array: `vl check` clean, INVALID WASM
+// (`type mismatch: expected i32, found (ref $type)`).
+//
+// The arena arm's own header in `emit_collect.vl` already names this shape — a branded
+// newtype is minted as a COPY of its base `Ty`, so it IS a `TyPrim` whose `primName` is
+// `string` while it RENDERS as `Nstr` — and calls it "inert here only because no recorder
+// rung banks such a row". Inert at that site; the missing classification is what this
+// pins.
+//
+// NOT A GENERIC DEFECT — the generic is the carrier the sweep found it through
+// (`gcall<T>(f: () => T): T` at `T = Nstr`). `mkBranded` below has no generic anywhere
+// and was invalid wasm on master too.
+//
+// THE LITERAL-UNION CONTROL IS THE POINT OF THE NARROW TEST. The fix reads
+// `nodeTyPrimName`, the ARENA's structural answer, not `letIsString`: a litunion
+// (`type K = "a" | "b"`) is a `TyUnion` of `TyLit`s whose rep is an interned i32 ATOM, so
+// it must NOT be claimed as a string return — that would be this same defect mirrored.
+// `letIsString`'s un-annotated leg would claim it, because it falls through to
+// `exprString` on the string LITERAL such a local is initialised with.
+
+// @run
+// @log aa
+// @log bb
+// @log cc
+// @log dd
+// @log ee
+// @log a
+// @hint redundant type annotation: `a` is inferred as `string`
+
+type Nstr = new string
+type K = "a" | "b"
+
+function gcall<T>(f: () => T): T { return f() }
+
+// ── the sweep's shape: `T` binds the branded string ──
+function throughGeneric() {
+  const q = gcall(() => { const a: Nstr = "aa"
+    return a })
+  print(q)
+}
+throughGeneric()
+
+// ── a NAMED, un-annotated function returning the branded local: no generic involved ──
+function mkBranded() {
+  const a: Nstr = "bb"
+  return a
+}
+
+// ── CONTROLS, one per channel that already answered, so the new rung is proven to be an
+// ADDITION rather than a replacement ──
+// The plain spelling, carried by the A20 pass (`isClassifiableRetName("string")`).
+function mkPlain() {
+  const a: string = "cc"
+  return a
+}
+// An ANNOTATED branded return, carried by `retAnnKindChain` off the annotation node.
+function mkBrandedAnnotated(): Nstr {
+  const a: Nstr = "dd"
+  return a
+}
+// A branded PARAMETER returned by name, carried by `paramString`'s `tyScalarBaseIs`,
+// which peels the brand the same way — the param side of this question was never broken.
+function takeBranded(a: Nstr) { return a }
+// The litunion local. Its return kind must stay the i32 default: the value is an interned
+// atom, and a `"str"` classification here would declare a `(ref $type)` result over a body
+// pushing an i32.
+function mkLitUnion() {
+  const k: K = "a"
+  return k
+}
+
+function named() {
+  print(mkBranded())
+  print(mkPlain())
+  print(mkBrandedAnnotated())
+  print(takeBranded("ee"))
+  print(mkLitUnion())
+}
+named()

@@ -1,0 +1,126 @@
+// A function whose tail RETURNS A CLOSURE-TYPED BINDING BY NAME — a local `let`/`const`
+// or a parameter — rather than a closure literal or a bare function name.
+//
+// THE HOLE THIS PINS. `fnReturnsClosure` is the single home for "this un-annotated
+// function's result is a function value": `emitOneFuncType` reads it to emit the kind-14
+// `(ref $cloStruct)` result, `cloRetValKind` / `cloRetKindOf` read it for the `$fnsig`
+// functype, and `exprIsClosure`'s Call arm reads it to decide whether `const q = g()`
+// binds a CLOSURE. It answers through `exprIsClosureNoLocal`, whose Ident arm resolved a
+// name against `fnIndexOfSid` ALONE — a lifted/top-level function name — so a bare
+// `return a` over a closure-typed LOCAL or PARAM fell through to false, and the result
+// valtype defaulted to i32 over a body pushing a `(ref $cloStruct)`.
+//
+// The header of `fnReturnsClosure` has claimed "or a closure-typed local" since it was
+// written; what was missing was a ROUTE to that fact. The general `exprIsClosure` reaches
+// it through `declaredSlotOf` / `localIsRef`, tables `buildLocals` fills AFTER this
+// classification runs — which is exactly why the `NoLocal` variant exists. The
+// DECLARATION is available at this point and is the same source the sibling ladder one
+// function over (`criRetLocalLet` -> `letIsRefArray` / `letIsStruct`) already reads for
+// the identical reason.
+//
+// TWO FAILURE MODES, ONE GAP, and both are here because they look nothing alike:
+//   · Through an anonymous LAMBDA the module is CHECK-CLEAN INVALID WASM —
+//     `current function requires result type [(ref (id 0))] but callee returns [i32]`.
+//   · Through a NAMED function it is a LOUD `emitProgram: call to unknown function`: the
+//     caller asks this same predicate about the Call result, so `const q = g()` did not
+//     bind a closure and `q()` folded to a by-name call to a function called `q`.
+//
+// NOT A GENERIC DEFECT — the generic is only the carrier that made it visible (a
+// `gcall<T>(f: () => T): T` whose `T` binds a closure). The `hof` block below has no
+// generic anywhere and failed identically on master.
+//
+// ALL FOUR CLOSURE REPS are exercised through the generic, because the wasm result
+// valtype of the closure's OWN call differs across them and a fix that got the fat
+// pointer right could still get the inner signature wrong: `() => i32`, `(i32) => i32`,
+// `(string) => string` (a `(ref array)` result) and `() => i32[]` (a ref-list result).
+
+// @run
+// @log 11
+// @log 11
+// @log aa!
+// @log 11
+// @log 7
+// @log 8
+// @log 9
+// @log 12
+// @log 21
+// @log 13
+// @log 13
+// @hint redundant type annotation: `a` is inferred as `() => i32`
+// @hint redundant type annotation: `a` is inferred as `(i32) => i32`
+// @hint redundant type annotation: `a` is inferred as `(string) => string`
+// @hint redundant type annotation: `a` is inferred as `() => i32[]`
+
+function gcall<T>(f: () => T): T { return f() }
+
+// ── the sweep's shape: a generic whose parameter is a zero-arg function it CALLS and
+// returns the result of, with `T` bound to each closure rep in turn ──
+function throughGeneric() {
+  const q0 = gcall(() => { const a: (() => i32) = () => 11
+    return a })
+  print(q0())
+  const q1 = gcall(() => { const a: ((i32) => i32) = (n) => n + 1
+    return a })
+  print(q1(10))
+  const q2 = gcall(() => { const a: ((string) => string) = (s) => s + "!"
+    return a })
+  print(q2("aa"))
+  const q3 = gcall(() => { const a: (() => i32[]) = () => [11]
+    return a })
+  print(q3()[0])
+}
+throughGeneric()
+
+// ── the same lambda handed to a plain higher-order function: NO generic is involved,
+// and this failed on master with the identical invalid-wasm diagnostic ──
+function hof(f: () => (() => i32)) {
+  const q = f()
+  print(q())
+}
+function viaHof() {
+  hof(() => { const a: (() => i32) = () => 7
+    return a })
+}
+viaHof()
+
+// ── a NAMED un-annotated function, where the same gap is a LOUD reject instead ──
+// ANNOTATED local: the arm reads `tyIsFuncType(d.letType)`.
+function mkAnnotated() {
+  const a: (() => i32) = () => 8
+  return a
+}
+// UN-annotated local: no annotation to read, so the arm reads the initializer — one node,
+// a `function(…)` literal. It deliberately does NOT chase a chained `const a = b`, which
+// would spin on `const a = a`; the registry-backed `exprIsClosure` reaches that case.
+function mkInferred() {
+  const a = () => 9
+  return a
+}
+// A closure-typed PARAMETER returned by name — `paramIsClosure` is annotation-only, so it
+// is answerable here for the same reason the local's annotation is.
+function mkParam(a: (() => i32)) { return a }
+// A CAPTURING closure returned through the local arm: the fat pointer carries the env, so
+// the returned closure still sees `k`.
+function mkCapturing() {
+  const k = 1
+  const a = () => k + 20
+  return a
+}
+function named() {
+  print(mkAnnotated()())
+  print(mkInferred()())
+  print(mkParam(() => 12)())
+  print(mkCapturing()())
+}
+named()
+
+// ── CONTROLS: the two tail forms `exprIsClosureNoLocal` always claimed, so these were
+// correct before the fix and must stay byte-for-byte correct after it ──
+function mkLiteral() { return () => 13 }
+function helper() { return 13 }
+function mkByName() { return helper }
+function controls() {
+  print(mkLiteral()())
+  print(mkByName()())
+}
+controls()
