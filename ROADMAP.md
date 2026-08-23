@@ -1215,7 +1215,11 @@ in-language GC knobs.
   padding/ASCII case; there are only **six** string methods today and *you cannot split a string in
   VL*. Rep-independent, and it is the fixture corpus the rep change gets validated against;
   **(2)** the storage + header swap in **ONE** rep migration (not bare-array-then-struct — that is
-  two rep migrations of the most-used type in the compiler); **(3)** `__map_hash__` +
+  two rep migrations of the most-used type in the compiler); *the mechanical prerequisite is
+  DONE — `string` has its own WasmGC heap type `sTypeIdx`, split from the i32-list backing's
+  `aTypeIdx`, with zero semantic change (still `(array mut i32)` of code points). The eight
+  shared sites `docs/internals/string-rep-measurements.md` §2.2 named are closed, so (2) is
+  now a change to one type DEFINITION plus the unit work in §2.3–§2.6, not an index hunt;* **(3)** `__map_hash__` +
   `__string_eq__` to byte level **atomically** with the cached hash. **Unblocks:** wasmtime's
   `ArrayRef::new_from_i8_slice` is i8-only, so `(array i8)` is what lets the host stage source in
   ONE call instead of ~3.4M (B-mem); and the UTF-8 encode/decode half of **H-M2** (killing the Rust

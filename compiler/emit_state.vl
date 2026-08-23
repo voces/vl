@@ -588,7 +588,7 @@ export let refPushScratchBase = 0
 // `refPushScratchBase` aliases the first quad. (Slice 4.)
 export let fnRefPushSlots: i32[] = []
 export let refPushBaseBySlot: i32[] = []
-// `string[]`: val + backing are `(ref $aTypeIdx)` / `(ref $mkArrIdx)`, recvRef `(ref
+// `string[]`: val + backing are `(ref $sTypeIdx)` / `(ref $mkArrIdx)`, recvRef `(ref
 // $mkListIdx)`. Its base is `strPushScratchBase`, declared at the end of this group.
 export let fnUsesStrPush = false
 // A `(string | null)[]` push shares that quad — the niche's backing IS the string list — but
@@ -616,7 +616,7 @@ export let strPushScratchBase = 0
 // strings (so an operand expression is evaluated ONCE — no re-eval of a side-
 // effecting call) and to drive an element loop. ONE shared frame covers them all,
 // reserved in any function using ANY string op (detected by `fnHasStrOp`):
-//   strScrA/strScrB/strScrOut : 3 NON-NULL `(ref $aTypeIdx)` string refs — the two
+//   strScrA/strScrB/strScrOut : 3 NON-NULL `(ref $sTypeIdx)` string refs — the two
 //                               operands + the freshly-allocated result.
 //   strScrI0..strScrI3        : 4 i32 temporaries — loop index, length, clamped
 //                               start/end (slice), running result (equality).
@@ -654,7 +654,7 @@ export let arrNewScratchBase = 0
 // `f(x) ?? d` (call-LHS null-coalesce) frame: stashes the call's result once so the
 // null test + recovery read the SAME evaluation (a call cannot be re-evaluated). THREE
 // slots, one per rep the call may return: a `(ref $uBoxIdx)` for a value-union box, a
-// `(ref null $aTypeIdx)` for a `string | null` niche, and an i32 for a `boolean | null`
+// `(ref null $sTypeIdx)` for a `string | null` niche, and an i32 for a `boolean | null`
 // niche. Flagged by `fnHasCoalesceCall` (over-approximating ANY call-LHS `??`).
 export let fnUsesCoalesceCall = false
 export let coalesceCallSlot = 0
@@ -782,16 +782,46 @@ export let sTwin: i32[] = []
 // literal shapes.
 export let sTyIx: i32[] = []
 // ── array-type table (the raw `(array (mut i32))` heap type) ──────────────────
-// A single element type — `i32` — so ALL raw arrays share one WasmGC array heap type
-// `(array (mut i32))`. This raw array now serves TWO roles: it is the `string` rep
-// (an `array i32` of code points — unchanged), AND it is the BACKING store of a
-// growable `i32[]` list (see the list-struct table below). It is emitted whenever the
-// program uses a string OR a list (a list needs a backing), placed in the type section
-// right AFTER the struct type (if any), so its index is `structOffset`. `aUsed` is a
-// presence flag set by `collectA`'s up-front arena scan; `aTypeIdx` is the resolved
-// heap-type index, computed in `emitModule`.
+// A single element type — `i32` — so ALL raw i32 arrays share one WasmGC array heap type
+// `(array (mut i32))`: the BACKING store of a growable `i32[]` list (see the list-struct
+// table below) and the map's raw `live`/`index`/`hashes`/mono-`vals` arrays. It is emitted
+// whenever the program uses a string OR a list, placed in the type section right AFTER the
+// struct type (if any), so its index is `structOffset`. `aUsed` is a presence flag set by
+// `collectA`'s up-front arena scan; `aTypeIdx` is the resolved heap-type index, computed in
+// `emitModule`.
 export let aUsed = false
 export let aTypeIdx = 0
+// ── string-type table (`string`'s OWN heap type) ──────────────────────────────
+// STAGE 2a OF THE STRING REPRESENTATION MIGRATION (`docs/internals/string-rep-measurements.md`
+// Part 2, `docs/guide/strings-design.md`). A `string` USED to share `aTypeIdx` with the i32
+// list's backing — one heap-type index serving two reps — which is exactly what blocked
+// changing the string's storage. It now has its own index, `sTypeIdx`, emitted immediately
+// after `aTypeIdx`.
+//
+// AT THIS STAGE THE TWO TYPES ARE STRUCTURALLY IDENTICAL: `sTypeIdx` is also
+// `(array (mut i32))` of CODE POINTS, so `s[i]` is still a code point and `.length` is still
+// a code-point count. NOTHING about the emitted semantics changes — only which index each
+// site names. The residual `aTypeIdx` code sites are the i32-list backing and the map's raw
+// `live`/`index`/`hashes`/mono-`vals` parallel arrays.
+//
+// AND A WRONG INDEX IS INVALID WASM TODAY, NOT A LATENT STAGE-2b BREAK — which is the whole
+// reason this split is checkable at all. Two structurally identical types would canonicalize
+// together if each sat in its OWN rec group, but `emitTypeSection` puts every heap type in
+// ONE rec group, and iso-recursive type identity is (canonical rec group, POSITION): two
+// entries at different positions are different types however identical their structure.
+// Verified rather than assumed — reverting `emitStrSlice` alone to `aTypeIdx` makes
+// `"hello".slice(0,5)` fail `vl check --codegen` with `type mismatch: expected (ref $type),
+// found (ref $type)`. So `vl check --codegen` over the corpus is a real completeness gate for
+// the split, and Stage 2b inherits that same property.
+//
+// ONE PRESENCE FLAG, DELIBERATELY. Both indices are minted from `aUsed` (emit_collect's
+// `mAssignTypeIndices`). `aUsed` is already forced by BOTH string and `i32[]` use, and every
+// string lowering already guards on it, so minting the string type from the same flag is
+// provably available exactly where it was before — whereas FORKING the flag would add a
+// second ~64-arm usage ladder whose fallthrough ("the program does not use X") is silent
+// invalid wasm. The cost of the shared flag is one unused 3-byte type in a module that uses
+// a list but no string (or the reverse). Splitting the flag is a separate, measurable change.
+export let sTypeIdx = 0
 // ── list-type table (the growable `i32[]` wrapper struct) ─────────────────────
 // A growable `i32[]` value lowers to a WasmGC struct `{ backing: (ref $aTypeIdx),
 // len: i32, cap: i32 }` — the `{ptr,len,cap}` triple (collections-design §VL.1,
@@ -910,7 +940,7 @@ export let rlElemNullable: i32[] = []
 // re-hash keys, NOT a compiler-symbol-table-narrow optimization) where
 //   • `keys` is a growable list of STRING refs — the wrapper `{ backing: (ref
 //     $mkArr), len, cap }` over a backing `(array (mut (ref null $aTypeIdx)))`
-//     (a string IS the raw `(array i32)` at `aTypeIdx`, so a keys element is a
+//     (a string IS the raw `(array i32)` at `sTypeIdx`, so a keys element is a
 //     nullable ref to that array); its wrapper heap-type index is `mkListIdx`,
 //     its backing `mkArrIdx`. Holds the INSERTION-ORDERED entry keys.
 //   • `vals` is the EXISTING growable i32 list (`lTypeIdx` over `aTypeIdx`) — the
@@ -1149,7 +1179,7 @@ export let pendingF64 = false
 //                      `nullSentinel`), NOT a `ref.null`.
 //   pendingNulLitUnion `K | null` NICHE — `i32.const -1`, the spare sentinel below the
 //                      >= 0 atom ids, NOT a `ref.null` or the boolean sentinel 2.
-//   pendingNulString   `string | null` (kind 16) — `ref.null $aTypeIdx`, the raw string
+//   pendingNulString   `string | null` (kind 16) — `ref.null $sTypeIdx`, the raw string
 //                      array made nullable, NOT the struct seed.
 //   pendingNulClosure  `fn | null` (kind 19) — `ref.null $cloStruct`.
 //   pendingNulList     an `(i32[] | null)[]` element — `ref.null $lTypeIdx`, the
@@ -1184,7 +1214,7 @@ export let pendingRawNullRead = false
 // gets the non-null block plus recovering arms. Spelling the conjunction at each site is how
 // `emitCoalesce` came to ask only half of it — its `string | null` arm declared
 // `(ref $aTypeIdx)` for every BINDING consumer while the default arm's read, still raw under
-// `pendingNulString`, left a `(ref null $aTypeIdx)` in it: invalid wasm with `vl check` rc 0.
+// `pendingNulString`, left a `(ref null $sTypeIdx)` in it: invalid wasm with `vl check` rc 0.
 export function nulStrReadStaysRaw() { pendingRawNullRead || pendingNulString }
 // ── discriminated-union table (G1: struct unions + `is`-narrowing) ────────────
 // A union alias `type N = A | B | …` (a `UnionDecl`) whose members are struct `type`s
@@ -1342,7 +1372,7 @@ export let uVarTwin: i32[] = []
 // box (`uBoxIdx`) as a struct union; a SCALAR payload (i32/boolean/i64/f64/f32) is
 // wrapped in a one-field `{ rep }` VALUE BOX behind the `anyref` slot (mirroring
 // `toWasm.ts`'s `valueBoxStruct`, keyed by wasm rep — boolean shares the i32 box);
-// a STRING payload is the `(ref $aTypeIdx)` array itself (already an `anyref`
+// a STRING payload is the `(ref $sTypeIdx)` array itself (already an `anyref`
 // subtype, no inner box). Atom tags are globally stable: `scalarTagOf` assigns each
 // atom KIND a fixed tag ABOVE every struct-variant tag (`uVariants.length + kind`),
 // so a value keeps its identity across sub-union flow and alongside struct unions.
@@ -1368,7 +1398,7 @@ export let uFieldNames: string[] = []
 export let uFieldStart: i32[] = []
 export let uFieldCount: i32[] = []
 // Parallel to `uFieldNames`: each variant field's wasm-type code (`0` = i32/boolean,
-// `3` = string). A string variant field lowers to a non-null `(ref $aTypeIdx)`.
+// `3` = string). A string variant field lowers to a non-null `(ref $sTypeIdx)`.
 export let uFieldTypes: i32[] = []
 // Parallel to `uFieldTypes`: a ref-list variant field's element type-NAME, "" otherwise.
 export let uFieldElemName: string[] = []

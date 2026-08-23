@@ -475,6 +475,23 @@ separate piece of work.**
 > Where a number here disagrees with `docs/guide/strings-design.md`, the
 > disagreement is stated rather than smoothed over.
 
+> **STATUS — the HEAP-TYPE SPLIT (Stage 2a) HAS LANDED.** `string` no longer shares
+> `aTypeIdx` with the i32 list's backing: it has its own index, `sTypeIdx`
+> (`compiler/emit_state.vl`, minted in `emit_collect.mAssignTypeIndices`, emitted
+> immediately after `aTypeIdx` in `emit_sections.emitTypeSection`). Both types are still
+> `(array (mut i32))` of code points, so **nothing about the emitted semantics changed** —
+> `s[i]` is a code point, `.length` a code-point count, the corpus buckets are
+> file-for-file identical. Everything §2.3–§2.6 says about UNITS is still ahead.
+>
+> What that means for a reader of the rest of Part 2: **every `aTypeIdx` line number below
+> is pre-split**, and the string-side ones now name `sTypeIdx`. §2.2's eight sites are
+> **all closed** (see the note at the end of it), so §2.2 is now a record of how they were
+> closed, not a to-do list. §2.7's ladders are untouched and still the working brief —
+> except L1, whose reachability was RUN and is recorded there.
+>
+> The one thing that did NOT split is the **presence flag**: both indices are minted from
+> the single `aUsed`, deliberately, for the reason given at the end of §2.2.
+
 ### 2.0 Two of the design doc's own denominators do not reproduce
 
 `strings-design.md` opens its case with a "blast radius is zero" table. Two of
@@ -580,10 +597,11 @@ alone is 166 lines, because a site like `fbArrayGet(aTypeIdx)` inside
 | ±20-line window contains `str` (ci) | 324 |
 | **read with the enclosing function: A + C** | **180** |
 
-### 2.2 The eight sites that MUST split
+### 2.2 The eight sites that MUST split — **all eight are closed**
 
 Every C-bucket code site must split; none can stay shared. They cluster into four
-mechanisms.
+mechanisms. **All four mechanisms landed in Stage 2a**; how each was closed is recorded
+in the last column of the table below and at the end of this section.
 
 | # | site | what it is | why it must split |
 |---|---|---|---|
@@ -595,13 +613,44 @@ mechanisms.
 `strScrOut` (`emit_bytes.vl:1268`) is *not* affected — its only non-string user
 (`wasmEmit.vl:11011`) already holds a string.
 
-**The wider gate is `aUsed`, not `aTypeIdx`.** `compiler/emit_collect.vl:3300` is
+**How each closed (Stage 2a):**
+
+| # | closed by |
+|---|---|
+| 1–2 | `strScrA`/`strScrB` are `(ref $sTypeIdx)` now, and the `i32[]` field-equality arm stopped borrowing them: it mints **two fresh `(ref null $aTypeIdx)` slots of the lazy list frame** per compare (`wasmEmit.listBackStashSlot`, `liBack` 1 typing, no emitted instructions). The i32 counters it also takes from the string-op frame stayed — they carry no rep. |
+| 3 | a new `liBack` code **5**, "the raw string backing", written by `arrLitChunkStart`'s new `strBack` argument. The `MfKind` vocabulary is untouched: the kind of a long string literal genuinely IS `"i32"` (the elements are i32 code points), so the discriminant belongs on the destination, not on the element kind. |
+| 4 | a new descriptor char **`'s'`** in `helpValtype`. `__map_probe__` is `helpFuncType("iaaams", "i")` — three `'a'` i32 arrays, the `'m'` keys backing, the `'s'` key; `__str_hash__`/`__str_eq__`/`__str_concat__` became `"s"→"i"`, `"ss"→"i"`, `"ss"→"s"`. `__map_resize__` (`"aaaii"→"a"`) and `__map_probe_i32__` (`"aaaai"→"i"`) are all-i32-array and did not move. |
+| 5–6 | `array.new_default $sTypeIdx` + **`array.copy $sTypeIdx $aTypeIdx`**. It stays a memcpy: `array.copy`'s validation rule is on the *storage* types (`i32 ≤ i32`), not on heap-type identity, so a cross-type copy is legal and the encode loop is genuinely Stage 2b's problem. |
+
+**THE GATES CAN SEE A MISSED SITE, which was not obvious in advance.** The emitter puts
+every heap type in ONE rec group (`emit_sections.emitTypeSection` writes `0x4e` then
+`n + typeOffset + hasStart` entries), and iso-recursive type identity is *(canonical rec
+group, position)* — so two structurally identical entries at different positions are
+**different types**, not canonicalized together the way two singleton groups would be. A
+site left naming the wrong index is invalid wasm. Verified, not assumed: a one-line
+sabotage of `emitStrSlice` back to `aTypeIdx` made `"hello".slice(0,5)` fail
+`vl check --codegen` with `type mismatch: expected (ref $type), found (ref $type)`. That
+is why the completeness evidence for this stage is *1 617 corpus files codegen-validated*
+rather than an argument about how the sites were enumerated.
+
+**The wider gate is `aUsed`, not `aTypeIdx`** — and it was DELIBERATELY NOT SPLIT.
+`compiler/emit_collect.vl:3300` was
 `if aUsed { aTypeIdx = mAllocType() } else { aTypeIdx = mNextType }`, and `aUsed`
 is forced by *both* string usage (`emit_collect.vl:4067` `fromCodePoint`, `:4069`
-`toString`, `:4199` "string backing + vals backing") and `i32[]` usage. It needs a
-sibling flag and a sibling index. `grep -c 'aUsed' compiler/*.vl` totals **141**
-occurrences over 6 files (upper bound: the count includes `raUsed` as a
-substring) — a **larger** secondary surface than the C bucket itself.
+`toString`, `:4199` "string backing + vals backing") and `i32[]` usage. `grep -c 'aUsed'
+compiler/*.vl` totals **141** occurrences over 6 files (upper bound: the count includes
+`raUsed` as a substring) — a **larger** secondary surface than the C bucket itself.
+
+Stage 2a mints **both** indices from that one flag. The argument for it is not economy,
+it is the governing hazard: `aUsed` is *already* true wherever a string type index is
+needed (every string lowering guards on it today, and the program would not compile
+otherwise), so the string index is available exactly where it was — **provably, without
+classifying 64 flag-writes**. Forking the flag would add a second usage ladder whose
+fallthrough is "the program does not use X", which turns off a family of downstream
+classifiers at once with no diagnostic; that is the shape §2.7 opens by naming. The cost
+of not forking is **one unused 3-byte type** in a module that uses a list but no string,
+or the reverse. Splitting the flag is a separate change with its own measurement, and
+Stage 2b does not need it: an unused string type is 3 bytes, a missing one is invalid wasm.
 
 ### 2.3 Where the element is assumed to be a code point
 
@@ -804,8 +853,43 @@ it will be forgotten** — because the fallthrough of a usage detector is
 "the program does not use X", which turns off a whole family of downstream
 classifiers at once with no diagnostic.
 
-*(Whether `Box<u8[]>` actually mis-mints today was not run as a witness; the
-structural asymmetry is verified, the reachability is not.)*
+**THE REACHABILITY WAS RUN (2026-08-23, Stage 2a) AND IT IS A NEGATIVE: the missing
+`nameIsU8Array` arm CANNOT fire today.** The asymmetry is real; the hole is unreachable,
+because everything upstream of it refuses first. `forceGenAppArgTypes` only ever sees the
+ARGUMENTS of a `Head<…>` spelling, and VL has exactly one kind of generic alias — a struct
+shape:
+
+| witness | result |
+|---|---|
+| `type Box<T> = { v: T }` + `Box<u8[]>` (param, return, and array-of positions) | **loud reject**: `emitProgram: only i32 / boolean / string / array struct fields are supported` — a `u8[]` cannot be a struct field at all |
+| `type Pair<A, B> = { a: A, b: B }` + `Pair<i32, u8[]>` | same loud reject |
+| `type Id<T> = T` (a non-struct alias) | `unknown type 'T' in union 'Id<T>'` — the alias form does not exist |
+| `type Opt<T> = T \| null` + `Opt<u8[]>` | type error, same reason |
+| **control**: `Box<i32[]>`, `Box<string>` | both compile and run — the sibling arms this one lacks DO fire |
+
+So the arm was left alone, per "a precise negative result is worth more than a speculative
+fix". Two things follow for whoever revisits this. First, the arm becomes reachable the day
+a `u8[]` struct field is supported, and it should land in the SAME change. Second, the
+`string` arm the analogous Stage-2b flag would need (`nameIsString` / `nameIsNulString`,
+`emit_collect.vl:3818`) **is present and does fire** — `Box<string>` was the control above.
+
+**A DIFFERENT `u8[]` GENERIC DEFECT DID REPRODUCE while running these witnesses, and it is
+NOT this one.** Binding a bare `T` to `u8[]` is check-clean invalid wasm:
+
+```vl
+function id<T>(x: T) { x }
+const q: u8[] = [1, 2]
+print(id(q).length)
+```
+
+`vl check` rc 0 · `vl check --codegen`: `type mismatch: expected (ref $type), found (ref
+$type)` · `vl run` exits 0 having printed a wasm translation error. It is **not** a
+`*Used` reservation miss — adding a bystander `for v in q` elsewhere in the same program
+does not rescue it, so the type IS minted and the monomorphized body lowers the packed
+list with the i32-list machinery. `tests/cases/arrays/error-u8-not-generic.vl` refuses the
+`T[]` spelling for exactly this reason and documents the refusal as two halves
+(`bindGenWalk` declines to bind, the argument seam reports); the **bare-`T`** binding
+reaches neither half. Pre-existing, unrelated to the string rep, not fixed here.
 
 ---
 
@@ -967,7 +1051,10 @@ wasm at every string index in the program.
   `(ref $aTypeIdx)` to `(ref $strStruct)`, and `helpFuncType`'s `'a'` for
   `__str_hash__`/`__str_eq__`/`__str_concat__` (`emit_sections.vl:4338–4340`)
   must become a new letter or all three helpers get the wrong functype (this is
-  C-bucket site #4 from §2.2).
+  C-bucket site #4 from §2.2). **The letter half is DONE** — it is `'s'`, and the three
+  helpers are `"s"→"i"`, `"ss"→"i"`, `"ss"→"s"`. `S`'s valtype rides `fbValtype`'s
+  `"str"`/`"nulstr"` arms, which point at `sTypeIdx`, so Stage 2b changes them in one
+  place; neither ladder in `emit_rep.vl` needed an arm.
 - **String literal interning vs runtime construction** — **three independent
   decodes of the same lexeme** (`emit_sections.vl:2650`, `:4570`,
   `wasmEmit.vl:4950`) and **two independent length thresholds**
