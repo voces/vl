@@ -36,6 +36,7 @@ import {
   recordClonedNodeTy,
   substTyDeep,
   tyHasTyVar,
+  tyToEmitName,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -179,6 +180,7 @@ import {
   sFieldElemNameAt,
   sFieldIndex,
   sFieldTypeAt,
+  sigKeyOfTy,
   sigKeyPinPayload,
   sigKeyRetKind,
   structIndexByName,
@@ -186,6 +188,7 @@ import {
   synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
+  tyNulFuncInner,
 } from "./emit_classify"
 import {
   buildFnMap,
@@ -433,14 +436,155 @@ function monoCompositeListAnnName(name: string) {
   ""
 }
 
+// True when the type-annotation node `annIx` is a FUNCTION-VALUE pin in either of the two
+// spellings `monoArgTyName` mints — the bare closure's `$fnsig` marker (`"=>i>i"`) or a
+// nullable function type (`((i32) => i32) | null`). One predicate, so the gate, the name and
+// the banked type all agree about what counts as a pin.
+function monoAnnIsCloPin(annIx: i32) {
+  if annIx < 0 { return false }
+  if sigKeyPinPayload(tyNameOf(annIx)) != "" { return true }
+  tyNulFuncInner(nodeTyIxOf(annIx)) >= 0
+}
+
+// The type-ANNOTATION NODE of a binding whose annotation is already a monomorphized
+// FUNCTION-VALUE PIN (`monoAnnIsCloPin`) — a parameter or an annotated local of `fnIx` —
+// or -1.
+//
+// A monomorphized instance's body is a CLONE whose `T`-typed param/local annotations were
+// REWRITTEN to the pin, and a pin is not a type SPELLING: `nameToTy` resolves it to
+// nothing, so the clone's Ident nodes carry no `TyFunc` of their own and the arena route
+// (`sigKeyOfTy`) answers "" for them. A generic FORWARDER is exactly that shape —
+// `function gwrap<T>(x: T): T { return gid(x) }` instantiated at a closure reaches the
+// inner `gid(x)` with `x` annotated `"=>i>i"` and nothing else in the pass able to say so.
+//
+// The NODE rather than the name, because both halves of the pin live on it and they must
+// come from ONE place: `tyNameOf` is the instance-key spelling, and `nodeTyIxOf` is the
+// `TyFunc` the OUTER instantiation banked there (`synthTypeRefFb`'s `tyFb`) — the row the
+// inner instance's own parameter node has to carry, or `checkParams`'s first rung
+// (`tyIsFuncType`, an arena question) rejects a parameter this pass just pinned as a
+// closure. Naming without typing is exactly the half-fix that turns a silent miscompile
+// into a loud one.
+//
+// PARAM before LOCAL, and both, because a forwarder hands on either — `gid(x)` on its own
+// parameter, or `gid(y)` on a `const y: T = x` the same substitution rewrote.
+// `sigKeyPinPayload` is the marker's documented home, so the two-character `"=>"` test is
+// never re-spelled here.
+//
+// NOT folded into `monoAnnPinName`, the other "the annotation is the only truth mid-mono"
+// ladder, because the two are never both reachable: `monoArgTyName`'s closure arm claims a
+// function-valued argument outright, so a name reaching `monoAnnPinName` is by construction
+// one the closure arm declined.
+function monoCloPinAnnNodeOf(identName: string, fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  const ptn = paramTypeNode(fnIx, identName)
+  if monoAnnIsCloPin(ptn) { return ptn }
+  const ctxFn = P.nodes[fnIx]
+  if ctxFn is FuncDecl {
+    const li = parentLetOf(ctxFn.fnBody, identName)
+    if li >= 0 {
+      const ld = P.nodes[li]
+      if ld is LetDecl {
+        if monoAnnIsCloPin(ld.letType) { return ld.letType }
+      }
+    }
+  }
+  -1
+}
+
+// `monoCloPinAnnNodeOf` over an EXPRESSION — the Ident unwrap, in one place, so the gate
+// and the type-banking helper below cannot ask the question of different nodes.
+function monoCloPinAnnNodeOfExpr(ax: i32, fnIx: i32): i32 {
+  if ax < 0 { return -1 }
+  const n = P.nodes[ax]
+  if n is Ident { return monoCloPinAnnNodeOf(n.identName, fnIx) }
+  -1
+}
+
+// The ARENA TYPE to BANK beside the pin `monoArgTyName` chose for `ix` — the argument's own
+// recorded type, except where the pin came from a binding's ANNOTATION rather than from the
+// argument node (`monoCloPinAnnNodeOf`), in which case it is that annotation's type.
+//
+// One home for the `pinTys` entry, so the NAME and the TYPE of a pin can never be sourced
+// from two different nodes. Every other pin keeps `nodeTyIxOf(arg)` exactly as before.
+function monoArgPinTyIx(ix: i32, fnIx: i32) {
+  const ax = unwrapParen(ix)
+  const own = nodeTyIxOf(ax)
+  // The node's OWN recorded type wins wherever it already names a function value (bare or
+  // nullable) — the annotation channel exists only for the clone whose node carries `T`.
+  if own >= 0 && nodeTyIsFunc(ax) { return own }
+  if tyNulFuncInner(own) >= 0 { return own }
+  const pn = monoCloPinAnnNodeOfExpr(ax, fnIx)
+  if pn >= 0 { return nodeTyIxOf(pn) }
+  own
+}
+
 export function monoArgTyName(ix: i32, fnIx: i32) {
-  if exprIsClosure(ix, fnIx) {
+  const cax = unwrapParen(ix)
+  // THE THIRD CHANNEL, read before both arms below because both need it: an instance's own
+  // `x: T` parameter / `const y: T = x` local carries the pin as its ANNOTATION, and neither
+  // other channel can see it — `exprIsClosure` reads the post-mono locals table, and the
+  // Ident's recorded type is still the ORIGINAL's `T` (a clone shares its leaf expression
+  // nodes). This is what a generic FORWARDER hands its inner call.
+  const cloPinNode = monoCloPinAnnNodeOfExpr(cax, fnIx)
+  // A NULLABLE FUNCTION VALUE (`((i32) => i32) | null`, kind 19), BEFORE the bare-closure
+  // arm below, and the two are pinned differently on purpose.
+  //
+  // A bare closure pins the `$fnsig` MARKER (`"=>i>i"`) — a key, not a spelling, minted
+  // because a bare function type had no annotation form the instance could carry. A
+  // NULLABLE one does: `((i32) => i32) | null` is a parameter annotation the emitter
+  // already lowers end to end (`checkParams`' `nulCloFlag` rung → kind 19, the
+  // `(ref null $cloStruct)` cell, `ref.is_null` narrowing at the call). Pinning that
+  // SPELLING keeps this family on the path that already works instead of widening the
+  // marker vocabulary to carry a nullability bit — the `sigKeyPinPayload` marker has five
+  // readers and #1805 declined exactly that kind of widening.
+  //
+  // `tyToEmitName` is the render that GROUPS the arrow (`((i32)=>i32)|null`), which is what
+  // makes the pin round-trip: the ungrouped `(i32)=>i32|null` re-parses as a function
+  // RETURNING `i32 | null`, a different type and a different instance. `nodeTyName` is not
+  // the twin to use here — it answers "" for this shape (measured), which is how the
+  // function-scoped cells reached the `"i32"` catch-all in the first place.
+  //
+  // Without this arm the two scopes failed differently for one reason: at MODULE scope
+  // `exprIsClosure` answers true (`globalCellKind` → "nulclosure") so the closure arm below
+  // claimed it and floored it loudly, while inside a function every channel went blind
+  // (`declaredSlotOf` is post-mono, `nodeTyIsFunc` is false for a `TyNullable`) and the
+  // cascade's `"i32"` catch-all pinned an i32 over a `(ref null $cloStruct)` — check-clean
+  // INVALID WASM. One arm, both scopes.
+  let nulFnTy = nodeTyIxOf(cax)
+  // A forwarder's own binding again: its node carries `T`, its annotation carries the pin,
+  // and for a NULLABLE closure that pin is already the spelling this arm returns.
+  if tyNulFuncInner(nulFnTy) < 0 && cloPinNode >= 0 {
+    nulFnTy = nodeTyIxOf(cloPinNode)
+  }
+  if tyNulFuncInner(nulFnTy) >= 0 {
+    const nulFnName = tyToEmitName(nulFnTy)
+    if nulFnName != "" { return nulFnName }
+  }
+  // THE ARENA ASKS THE CLOSURE QUESTION, because `exprIsClosure` CANNOT ask it here.
+  // That predicate resolves an Ident through `declaredSlotOf`/`localIsRef` (and a field
+  // through `memberIsClosure`) — tables `buildLocals` fills POST-mono — so mid-pass it
+  // answered "not a closure" for every function-valued argument that is not a bare
+  // top-level function NAME. The gate is the reason, not a detail: a `const a: (i32) =>
+  // i32` local handed to `gid(a)` fell past this arm, past every arm below it (the
+  // annotation ladder `monoAnnPinName` declines a closure spelling by design), and landed
+  // on the `"i32"` catch-all — so `T` bound i32 and the instance declared an i32 parameter
+  // and an i32 RESULT over a body carrying a `(ref $cloStruct)`. `vl check` clean, INVALID
+  // WASM, and it is the whole of #1823: all four closure reps, every generic position.
+  //
+  // `nodeTyIsFunc` is the CHECKER's answer about the argument node and needs no emit-side
+  // table, so it is available at this point in the pass; it is the same source the sibling
+  // `monoArgFnTypeName` already trusts one arm up for exactly this reason (D-ARROWTY).
+  // The two gates are OR'd rather than swapped: `exprIsClosure` still claims the shapes
+  // the checker did not type (a lifted lambda literal, a `narrowedClosureOf` union arm),
+  // so no cell that reached this arm before stops reaching it.
+  // `cloPinNode` joins the gate for the same reason it was read first: left out, a
+  // forwarder's `gid(x)` fell past this whole arm to the `"i32"` catch-all and the inner
+  // instance was pinned i32 over a `(ref $cloStruct)`.
+  if exprIsClosure(ix, fnIx) || nodeTyIsFunc(cax) || cloPinNode >= 0 {
     // A FUNCTION-VALUE argument pins its param as a CLOSURE (kind 14). The
     // pinned name carries the callee's `$fnsig` KEY (`"=>ii>i"`) so the
     // instance's value-call (`fn(a, b)`) ref-casts to the EXACT signature.
-    // Only a bare top-level function name resolves a key here (the HOF shape
-    // in scope); any other closure value fails loudly at the caller.
-    const ce = P.nodes[unwrapParen(ix)]
+    const ce = P.nodes[cax]
     if ce is Ident {
       const cfe = fnIndexOf(ce.identName)
       if cfe >= 0 {
@@ -448,6 +592,25 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
         if ck != "" { return "=>" + ck }
       }
     }
+    // EVERY OTHER function VALUE — a closure local/param, a struct field, a list or map
+    // element, a lambda literal, a call result — keys off the argument's own recorded
+    // FUNCTION TYPE. `sigKeyOfTy` is the `$fnsig` producer that takes a `TyFunc` (the
+    // arm-for-arm twin of the name-side `annSigKey`), so the pin this mints is
+    // byte-identical to the one the named-function route above produces for the same
+    // signature — one key vocabulary, and the instance's `call_ref` casts to the same
+    // interned functype either way.
+    //
+    // The named route stays FIRST and unchanged: `fnSigKeyOf` reads the DECLARATION, which
+    // is the answer the working cells are pinned by today, and swapping the order would
+    // re-key them off the checker's rendering of the same signature for no gain.
+    //
+    // "" is still the loud floor (`monoInstantiate` fails the call) for a signature outside
+    // the value-call ABI — a pin that cannot name the signature must not fall through to
+    // the cascade, whose catch-all is the i32 that this whole arm exists to prevent.
+    const ak = sigKeyOfTy(nodeTyIxOf(cax))
+    if ak != "" { return "=>" + ak }
+    // Last: the pin an instance's OWN binding already carries (a generic forwarder).
+    if cloPinNode >= 0 { return tyNameOf(cloPinNode) }
     return ""
   }
   // A CALL ARGUMENT whose callee has a CONCRETE return annotation takes that annotation as
@@ -2944,7 +3107,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
               )
             }
             pinned.push(an)
-            pinTys.push(nodeTyIxOf(args[i]))
+            pinTys.push(monoArgPinTyIx(args[i], ctx))
           } else {
             // The DECLARED spelling where the annotation IS a type parameter
             // (`monoDeclAnnName`), the arena's canon'd one everywhere else. Without it a
@@ -2995,10 +3158,10 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                   )
                 }
                 pinned.push(pinC)
-                pinTys.push(nodeTyIxOf(args[i]))
+                pinTys.push(monoArgPinTyIx(args[i], ctx))
               } else {
                 pinned.push(ann)
-                pinTys.push(nodeTyIxOf(args[i]))
+                pinTys.push(monoArgPinTyIx(args[i], ctx))
               }
             } else {
               const an2 = monoArgTyName(args[i], ctx)
@@ -3042,10 +3205,10 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
               }
               if ann != tp {
                 pinned.push(bind + "[]")
-                pinTys.push(nodeTyIxOf(args[i]))
+                pinTys.push(monoArgPinTyIx(args[i], ctx))
               } else {
                 pinned.push(bind)
-                pinTys.push(nodeTyIxOf(args[i]))
+                pinTys.push(monoArgPinTyIx(args[i], ctx))
               }
             }
           }
