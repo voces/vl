@@ -1447,6 +1447,82 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name: "vl-fmt: the width is COLUMNS, not bytes (a 60-col / 132-byte line stays on one line)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // #1848 made `string` UTF-8 bytes, so `.length` became a BYTE count — and
+    // `compiler/format.vl` measured every line width with `.length`. A line holding a
+    // non-ASCII character then measured 2-4x too wide and wrapped far too early. `fmtWidth`
+    // is 80 COLUMNS; the lines below sit under that and over 80 BYTES, so each assertion
+    // distinguishes the two units — nothing here could be pinned with ASCII.
+    //
+    // `wide` is the NEGATIVE control: genuinely over 80 columns, so it must still wrap. A
+    // test without it would pass on "never wrap at all".
+    const em = "—"; // EM DASH — one column, three UTF-8 bytes
+    const cols = (s: string): number => [...s].length;
+    const bytes = (s: string): number => new TextEncoder().encode(s).length;
+
+    // Three paths reach `fmtWidth` with a rendered string: the binary chain
+    // (`binaryChain`), the list reflow (`wrapList`), and the trailing-comment column
+    // (`alignComments`). One case each.
+    const chain = `const msg = "${em.repeat(12)}" + "${em.repeat(12)}" + "${em.repeat(12)}"`;
+    const wide = `const wide = "${em.repeat(20)}" + "${em.repeat(20)}" + "${em.repeat(20)}"`;
+    const call = `print("${em.repeat(8)}", "${em.repeat(8)}", "${em.repeat(8)}", "${em.repeat(8)}")`;
+    // Guard the fixture itself: if these stop straddling 80 the test proves nothing.
+    for (const [what, line, over] of [["chain", chain, false], ["call", call, false], ["wide", wide, true]] as const) {
+      if (cols(line) >= 80 !== over || bytes(line) <= 80) {
+        throw new Error(`fixture ${what} no longer straddles the width: ${cols(line)} cols, ${bytes(line)} bytes`);
+      }
+    }
+
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    try {
+      const f = `${dir}/w.vl`;
+      const src = chain + "\n" + wide + "\n" + call + "\n" +
+        `const x = "${em.repeat(4)}"    // tail\n` + // 16 cols / 28 bytes of code
+        "const yy = 2          // tail\n"; // 12 cols, padded → alignment intent
+      await Deno.writeTextFile(f, src);
+      const r = await run([f]);
+      if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+
+      // 1. The `+` chain fits in 80 columns (it does not in 80 bytes) — one line.
+      if (!r.out.includes(chain + "\n")) {
+        throw new Error(`a ${cols(chain)}-column / ${bytes(chain)}-byte chain was wrapped:\n${r.out}`);
+      }
+      // 2. The argument list likewise (`wrapList`'s one-line width sum).
+      if (!r.out.includes(call + "\n")) {
+        throw new Error(`a ${cols(call)}-column / ${bytes(call)}-byte call was wrapped:\n${r.out}`);
+      }
+      // 3. NEGATIVE control: over 80 COLUMNS still wraps.
+      if (r.out.includes(wide + "\n")) {
+        throw new Error(`a ${cols(wide)}-column line must still wrap:\n${r.out}`);
+      }
+      // 4. The trailing-comment column is a column: the two `// tail` comments line up
+      //    visually. Measured in bytes they would sit 8 columns apart (the four em dashes).
+      const at = (needle: string): number => {
+        const line = r.out.split("\n").find((l) => l.startsWith(needle));
+        if (line === undefined) throw new Error(`no ${JSON.stringify(needle)} line:\n${r.out}`);
+        return cols(line.slice(0, line.indexOf("//")));
+      };
+      const [cx, cy] = [at("const x ="), at("const yy =")];
+      if (cx !== cy) {
+        throw new Error(`trailing comments misaligned: column ${cx} vs ${cy}\n${r.out}`);
+      }
+
+      // Idempotent — the alignment pass re-reads its own output.
+      const f2 = `${dir}/w2.vl`;
+      await Deno.writeTextFile(f2, r.out);
+      const twice = await run([f2]);
+      if (twice.out !== r.out) {
+        throw new Error(`not idempotent:\n${diffFirstLine(r.out, twice.out)}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 /** The first differing line of two texts, for a legible failure. */
 const diffFirstLine = (a: string, b: string): string => {
   const la = a.split("\n"), lb = b.split("\n");

@@ -18,6 +18,16 @@ import { pushCps } from "./strutil"
 // comments). A driver (`scripts/vl-compiler-driver.vl`) lexes → parses → calls
 // `formatProgram`, then the host reads the result string char-by-char.
 //
+// ── WIDTHS ARE CODE POINTS, OFFSETS ARE BYTES ────────────────────────────────
+// Every number in this file that is compared against `fmtWidth`, or added to
+// something that will be (a `column`), is a WIDTH and is spelled `dispWidth(s)`
+// (`fmt_util.vl`, which carries the argument). Every number that indexes or
+// slices a string is an OFFSET and stays `s.length` / `s[i]`. Stage 2c split the
+// two — `.length` is a byte count now — and `.length` left in a width position
+// wraps any line holding a non-ASCII character early, silently: a 60-column line
+// of em dashes measures 132 and breaks into three. An emptiness test (`s.length
+// == 0`) and an ARRAY length are neither, and are left alone.
+//
 // ── COVERAGE (what this port DOES and DOES NOT yet cover) ────────────────────
 // Covered: top-level + nested let/const (with `export` recovered by token scan),
 // function declarations (block + single-expression bodies), `type` struct decls
@@ -123,8 +133,10 @@ import {
   binPrecOf,
   branchIsSimple,
   calleePrimary,
+  codeColumnBefore,
   codeWidthBefore,
   collapseWs,
+  dispWidth,
   elseIsIf,
   exportPrefix,
   hasNewline,
@@ -315,6 +327,11 @@ function alignComments(text: string) {
       // ≥2 spaces before its `//`; otherwise each comment normalizes to one space.
       // The widest fitting commented line sets the column; one too wide to leave
       // room keeps its single space rather than dragging the column out.
+      //
+      // COLUMNS, NOT OFFSETS. `codeColumnBefore` is the width twin of the byte offset
+      // `codeWidthBefore` returns; only the offset may be handed to `slice`, and only the
+      // column may be compared to `fmtWidth` or used as the alignment target. Measuring the
+      // target in bytes pushes a run's comments right by one column per non-ASCII byte.
       const runIndent = leadingSpaces(lines[i])
       let j = i
       let alignCol = 0
@@ -327,8 +344,8 @@ function alignComments(text: string) {
       ) {
         const c = trailingCommentAt(lines[j])
         if c >= 0 {
-          const w = codeWidthBefore(lines[j], c)
-          if w + 2 <= fmtWidth && w > alignCol { alignCol = w }
+          const wc = codeColumnBefore(lines[j], c)
+          if wc + 2 <= fmtWidth && wc > alignCol { alignCol = wc }
         }
         j = j + 1
       }
@@ -341,8 +358,12 @@ function alignComments(text: string) {
       while m < j {
         const c = trailingCommentAt(lines[m])
         if c >= 0 {
+          // `c - w` is the author's GAP, and it is spaces/tabs — ASCII — so the byte
+          // difference is the column difference. It is the only place the two units meet.
           const w = codeWidthBefore(lines[m], c)
-          if w < alignCol && c - w >= 2 { intent = true }
+          if codeColumnBefore(lines[m], c) < alignCol && c - w >= 2 {
+            intent = true
+          }
         }
         m = m + 1
       }
@@ -351,15 +372,18 @@ function alignComments(text: string) {
       while k < j {
         const c = trailingCommentAt(lines[k])
         if c >= 0 {
+          // `w` SLICES (a byte offset); `wc` POSITIONS (a column). The pad is the column
+          // gap `col - wc`, never `col - w` — those differ by the line's non-ASCII bytes.
           const w = codeWidthBefore(lines[k], c)
-          let col = w + 1
+          const wc = codeColumnBefore(lines[k], c)
+          let col = wc + 1
           if intent {
             col = target
-            if w >= col || w + 2 > fmtWidth { col = w + 1 }
+            if wc >= col || wc + 2 > fmtWidth { col = wc + 1 }
           }
           out.push(
             lines[k].slice(0, w) +
-              spaces(col - w) +
+              spaces(col - wc) +
               lines[k].slice(c, lines[k].length),
           )
         } else {
@@ -619,7 +643,9 @@ function fmtImport(kw: i32, pathTok: i32) {
   fmtSortNames(items)
   const head = t.text + " "
   const tail = " from " + endTok.text
-  head + wrapList("{ ", items, " }", 0, head.length + tail.length) + tail
+  head +
+    wrapList("{ ", items, " }", 0, dispWidth(head) + dispWidth(tail)) +
+    tail
 }
 
 // Whether any pending comment starts inside the char span `[start, stop)` — a
@@ -802,7 +828,7 @@ function emitStatements(stmts: i32[], indent: i32) {
         joined = joined + inner
         g = g + 1
       }
-      if ok && indent * 2 + joined.length <= fmtWidth {
+      if ok && indent * 2 + dispWidth(joined) <= fmtWidth {
         emitLine(indent, joined)
       } else {
         // The one-liner is over the width (or an item went multi-line): expand the WHOLE
@@ -893,7 +919,7 @@ function emitMultiline(rendered: string, indent: i32, line: i32) {
 // The visual column a statement's expression starts at is the leading indent
 // (`indent * 2`) plus any keyword/binding prefix already on the line. Pass that
 // ABSOLUTE column into `expr` so the width checks in `wrapList` / `binaryChain`
-// (which compare `column + text.length` against `fmtWidth`) account for the
+// (which compare `column + dispWidth(text)` against `fmtWidth`) account for the
 // indentation — otherwise a deeply-indented over-width call or `+`-chain measures
 // as if it began at column 0 and is left un-wrapped past 80.
 function emitExpressionStatement(ix: i32, indent: i32) {
@@ -908,7 +934,11 @@ function emitLet(ix: i32, node: LetDecl, indent: i32) {
   let head = exportPrefix(ix) + node.letKw + " " + node.letName
   if node.letType >= 0 { head = head + ": " + recoverType(node.letType) }
   if node.letInit >= 0 {
-    const valueText = expr(node.letInit, indent, indent * 2 + head.length + 3)
+    const valueText = expr(
+      node.letInit,
+      indent,
+      indent * 2 + dispWidth(head) + 3,
+    )
     emitMultiline(head + " = " + valueText, indent, line)
   } else {
     emitMultiline(head, indent, line)
@@ -1086,7 +1116,7 @@ function emitTypeOrUnionDecl(ix: i32, indent: i32, isRecord: boolean) {
   // comment stays on one line. An already multi-line decl keeps its layout.
   if lines.length == 1 {
     const codeLine = exportPrefix(ix) + trimWsStart(lines[0])
-    if indent * 2 + codeLine.length > fmtWidth {
+    if indent * 2 + dispWidth(codeLine) > fmtWidth {
       if wrapTypeDecl(codeLine, indent, suffix, isRecord) { return 0 }
     }
   }
@@ -1123,7 +1153,12 @@ function emitWhile(ix: i32, node: WhileStmt, indent: i32) {
     if (
       !hasNewline(cond) &&
       inline.length > 0 &&
-      indent * 2 + label.length + 6 + cond.length + 1 + inline.length <=
+      indent * 2 +
+        dispWidth(label) +
+        6 +
+        dispWidth(cond) +
+        1 +
+        dispWidth(inline) <=
         fmtWidth
     ) {
       emitLine(indent, label + "while " + cond + " " + inline)
@@ -1191,7 +1226,7 @@ function emitLoopBody(head: string, body: i32, indent: i32, headerLine: i32) {
     const inline = inlineBlockBody(body, indent)
     if (
       inline.length > 0 &&
-      indent * 2 + head.length + 1 + inline.length <= fmtWidth
+      indent * 2 + dispWidth(head) + 1 + dispWidth(inline) <= fmtWidth
     ) {
       emitLine(indent, head + " " + inline)
     } else {
@@ -1277,7 +1312,7 @@ function collapseSingleIf(_ix: i32, node: IfStmt, indent: i32) {
     if elseBody.length == 0 { return "" }
     line = line + " else " + elseBody
   }
-  if indent * 2 + line.length > fmtWidth { return "" }
+  if indent * 2 + dispWidth(line) > fmtWidth { return "" }
   line
 }
 
@@ -1386,7 +1421,11 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
       let pre0 = "if "
       if q > 0 { pre0 = "else if " }
       const ln = pre0 + cd + " " + b
-      if b.length == 0 || hasNewline(cd) || indent * 2 + ln.length > fmtWidth {
+      if (
+        b.length == 0 ||
+        hasNewline(cd) ||
+        indent * 2 + dispWidth(ln) > fmtWidth
+      ) {
         ok = false
       }
       clauseLines.push(ln)
@@ -1395,7 +1434,7 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
     if ok && hasElse {
       const eb = inlineBlockBody(elseBodyIx, indent)
       const eln = "else " + eb
-      if eb.length == 0 || indent * 2 + eln.length > fmtWidth { ok = false }
+      if eb.length == 0 || indent * 2 + dispWidth(eln) > fmtWidth { ok = false }
       clauseLines.push(eln)
     }
     if ok {
@@ -1429,7 +1468,7 @@ function emitIfChain(ix: i32, node: IfStmt, indent: i32) {
 
 function emitFunction(ix: i32, node: FuncDecl, indent: i32) {
   const exp = exportPrefix(ix)
-  const header = exp + functionHeader(ix, node, indent * 2 + exp.length + 2)
+  const header = exp + functionHeader(ix, node, indent * 2 + dispWidth(exp) + 2)
   const body = node.fnBody
   if isBracedBlock(body) {
     const bn = P.nodes[body]
@@ -1441,7 +1480,7 @@ function emitFunction(ix: i32, node: FuncDecl, indent: i32) {
       const inline = inlineBlockBody(body, indent)
       if (
         inline.length > 0 &&
-        indent * 2 + header.length + 1 + inline.length <= fmtWidth
+        indent * 2 + dispWidth(header) + 1 + dispWidth(inline) <= fmtWidth
       ) {
         emitLine(indent, header + " " + inline)
         return 0
@@ -1503,7 +1542,7 @@ function functionHeader(_ix: i32, node: FuncDecl, reserved: i32) {
     params,
     ")",
     0,
-    prefix.length + ret.length + reserved,
+    dispWidth(prefix) + dispWidth(ret) + reserved,
   )
   prefix + paramList + ret
 }
@@ -1737,7 +1776,7 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32) {
     oneLine = oneLine + txt[i]
     i = i + 1
   }
-  if column + oneLine.length <= fmtWidth && !hasNewline(oneLine) {
+  if column + dispWidth(oneLine) <= fmtWidth && !hasNewline(oneLine) {
     return oneLine
   }
   // Reflow: operator at END of previous line; each operand after the first on its
@@ -1807,7 +1846,7 @@ function emitCondHead(
 ) {
   const inline = expr(condIx, indent, 0)
   const head = prefix + inline + suffix
-  if !hasNewline(inline) && indent * 2 + head.length <= fmtWidth {
+  if !hasNewline(inline) && indent * 2 + dispWidth(head) <= fmtWidth {
     emitLine(indent, head)
     return 0
   }
@@ -1838,9 +1877,9 @@ function renderAssign(_ix: i32, node: BinExpr, indent: i32, column: i32) {
       " " +
       op +
       "= " +
-      expr(addendIx, indent, column + left.length + 4)
+      expr(addendIx, indent, column + dispWidth(left) + 4)
   }
-  left + " = " + expr(node.binRight, indent, column + left.length + 3)
+  left + " = " + expr(node.binRight, indent, column + dispWidth(left) + 3)
 }
 
 function unary(_ix: i32, node: Unary, indent: i32, column: i32) {
@@ -1969,7 +2008,7 @@ function callExpr(_ix: i32, node: Call, indent: i32, column: i32) {
     }
     args.push(callArgText(node, n - 1, indent + 1, column))
   }
-  head + wrapList("(", args, ")", indent, column + head.length)
+  head + wrapList("(", args, ")", indent, column + dispWidth(head))
 }
 
 // Argument `i` as a list item: the value, with its optional NAME prefix.
@@ -2049,7 +2088,7 @@ function hugTrailingLambda(
     const header = arrowHeader(lam, indent * 2 + 6)
     if hasNewline(header) { return "" }
     const firstLine = head + "(" + joined + nm + header + " => {"
-    if column + firstLine.length > fmtWidth { return "" }
+    if column + dispWidth(firstLine) > fmtWidth { return "" }
     const body = expr(lastIx, indent, column)
     return head + "(" + joined + nm + body + ")"
   }
@@ -2164,7 +2203,7 @@ function arrowHeader(node: FuncDecl, reserved: i32) {
   }
   let ret = ""
   if node.fnRet >= 0 { ret = ": " + recoverType(node.fnRet) }
-  wrapList("(", params, ")", 0, reserved + ret.length) + ret
+  wrapList("(", params, ")", 0, reserved + dispWidth(ret)) + ret
 }
 
 function ifExpr(ix: i32, node: IfStmt, indent: i32) {
@@ -2249,16 +2288,18 @@ function wrapList(
   column: i32,
 ) {
   if items.length == 0 { return trimWs(open) + trimWs(close) }
-  // Sum the one-line length with cheap integer arithmetic first — no string
-  // allocation. If it can't possibly fit `fmtWidth`, skip straight to the
-  // wrapped form below without ever materializing `oneLine`. A running
+  // Sum the one-line WIDTH first — no string allocation. If it can't possibly fit
+  // `fmtWidth`, skip straight to the wrapped form below without ever materializing
+  // `oneLine`. `dispWidth` is O(text) rather than O(1), but it is still strictly
+  // cheaper than the concatenation it guards, and it is a width: `.length` here
+  // counted an em dash as three columns. A running
   // `s = s + item` accumulator here (and in the wrapped `body` accumulator
   // below) was O(n²) and blew the compiler's non-freeing GC heap on a
   // 10,001-element single-line array literal (`allocation size too large`).
-  let oneLineLen = open.length + close.length + (items.length - 1) * 2
+  let oneLineLen = dispWidth(open) + dispWidth(close) + (items.length - 1) * 2
   let li = 0
   while li < items.length {
-    oneLineLen = oneLineLen + items[li].length
+    oneLineLen = oneLineLen + dispWidth(items[li])
     li = li + 1
   }
   if column + oneLineLen <= fmtWidth {
