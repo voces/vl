@@ -9828,6 +9828,48 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
   // The else of `x is null` STRIPS null (that is how `!(e is null)` narrows); the else of
   // `x is T` subtracts `T`, which pins a variant. A strip-only consumer keeps the former.
   if c is IsExpr && (c.isVariant == "null" || !narrowStripNullOnly) {
+    // MEMBER PATH FIRST, AND OUTSIDE THE `valueAtomKind` GATE. `o.y is T` over a
+    // union-typed struct FIELD: the guard was FALSE, so `T` is stripped from the
+    // path's current set — a 2-member field union fully discriminates
+    // (`string | i32` minus `i32` reads as `string`), unboxing the else-arm's `o.y`
+    // under the same path key `setNarrowFromCond` pushes.
+    //
+    // THIS USED TO SIT INSIDE THAT GATE, WHICH IS WHY `w.f is A1` OVER A MIXED
+    // `A1 | i32` FIELD WAS CHECK-CLEAN INVALID WASM. A struct variant is not a value
+    // atom, so `valueAtomKind` answered < 0 and the whole block was skipped — and the
+    // struct-union complement below requires an `Ident` receiver, which a `Member` is
+    // not. The member path fell BETWEEN the two arms and got no complement at all, so
+    // the else branch read through an un-narrowed view. It is a gap, not a missing
+    // arm: the code was already correct for a struct variant, it simply never ran.
+    // Hoisting is therefore the minimal fix — the alternative, widening the gate,
+    // would also let the Ident arm below see struct variants it deliberately declines.
+    const mrecv = P.nodes[unwrapParen(c.isObj)]
+    if mrecv is Member {
+      const mun = memberUnionFieldName(unwrapParen(c.isObj), fnIx)
+      if mun != "" {
+        const mk = memberPathKeyOf(unwrapParen(c.isObj))
+        if mk != "" {
+          let mcur = ""
+          let msid = -1
+          // The member PATH's own narrowing stack slot carries both its rendered
+          // current set and that set's identity — one walk answers both.
+          const mslot = narrowSlotOf(mk)
+          if mslot >= 0 {
+            mcur = narrowVariants[mslot]
+            msid = narrowSets[mslot]
+          } else {
+            mcur = unionMemberSetOf(mun)
+            msid = msSetOfText(mcur)
+          }
+          if pushNarrowComplement(mk, msid, c.isVariant) != "" { return true }
+          const mrest = removeAtomFromSet(mcur, c.isVariant)
+          if mrest != "" {
+            pushNarrow(mk, mrest)
+            return true
+          }
+        }
+      }
+    }
     if valueAtomKind(c.isVariant) >= 0 {
       const recv = P.nodes[unwrapParen(c.isObj)]
       if recv is Ident {
@@ -9844,36 +9886,6 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
             )
             if rest != "" {
               pushNarrow(recv.identName, rest)
-              return true
-            }
-          }
-        }
-      }
-      // `o.y is T` over a UNION-typed struct FIELD: the guard was FALSE there, so
-      // `T` is stripped from the path's current set — a 2-member field union fully
-      // discriminates (`string | i32` minus `i32` reads as `string`), unboxing the
-      // else-arm's `o.y` under the same path key `setNarrowFromCond` pushes.
-      if recv is Member {
-        const mun = memberUnionFieldName(unwrapParen(c.isObj), fnIx)
-        if mun != "" {
-          const mk = memberPathKeyOf(unwrapParen(c.isObj))
-          if mk != "" {
-            let mcur = ""
-            let msid = -1
-            // The member PATH's own narrowing stack slot carries both its rendered
-            // current set and that set's identity — one walk answers both.
-            const mslot = narrowSlotOf(mk)
-            if mslot >= 0 {
-              mcur = narrowVariants[mslot]
-              msid = narrowSets[mslot]
-            } else {
-              mcur = unionMemberSetOf(mun)
-              msid = msSetOfText(mcur)
-            }
-            if pushNarrowComplement(mk, msid, c.isVariant) != "" { return true }
-            const mrest = removeAtomFromSet(mcur, c.isVariant)
-            if mrest != "" {
-              pushNarrow(mk, mrest)
               return true
             }
           }
