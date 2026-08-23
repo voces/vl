@@ -12,6 +12,20 @@ and is *written down*, rather than drifting in because nobody compared.
 
 ---
 
+## 0. Mechanical, and check it FIRST
+
+**Is the module actually shipped?** Run:
+
+    deno test -A --no-check tests/std_embedded_test.ts
+
+The CLI and the Rust host read `std/` from disk and will pass regardless. **The LSP
+checkers and the playground read only the generated map in `std/embedded.ts`** (§D3), so a
+stale map means the module does not exist in the editor while every command-line probe in
+your review succeeds. That asymmetry is why this is first and why it is mechanical: it is
+invisible from the terminal. Fix is `deno task gen-std`.
+
+---
+
 ## 1. The conventions, derived from the std that exists
 
 Read these before reviewing anything — consistency is measured against them, not against
@@ -22,7 +36,7 @@ taste.
 | **`self` first, so exports read as UFCS methods** | `array.indexOf(self: T[], needle)`, `fmt.join(self: string[], sep)`, `buffer.loadI32(self: Buf, off)`, `utf8.encodeUtf8(self: string)` — and `fmt.vl`'s header says so outright |
 | **lowerCamelCase**, except a constructor | `Buffer(byteLength: i32): Buf` is the one capitalised export |
 | **generic in the element type** where it varies | all of `array.vl` |
-| **return types elided when inferred** | `toStr`, `repeat`, `utf8Length` carry none — VL's types-invisible aesthetic applies to std too |
+| **union returns are ALWAYS explicit; scalar returns are usually elided** | measured across all 77 std exports: **10 of 10** union-returning exports annotate (`decodeUtf8`, `readFile`, `listDir`, `pathKind`, `programArgs`, …), while `utf8Length`/`join`/`repeat`/`padLeft`/`toStr` elide. Check the union half — it is exceptionless. The scalar half is taste, not convention. |
 | **the module header explains WHY and names what it does NOT do** | `fmt.vl`: *"f64→string … is deliberately absent — `print` keeps covering floats"* |
 | **a width-suffixed family stays uniform** | `loadI8/loadU8/loadI16/loadU16/loadI32/loadI64/loadF32/loadF64` |
 
@@ -64,8 +78,12 @@ without a reason should ask for the reason, not the removal.
 - **Duplicated functionality.** A second `split`, a second decoder. `std:utf8` is its own
   module precisely so there is one decoder with one opinion about invalid input.
 - **Anything speculative.** `std-design.md` D1's admission principle: nothing lands without
-  a consumer in the tree. `std:args` was deliberately *not* shipped alongside `std:fs` for
-  this reason.
+  a consumer in the tree — its own illustration is *no `std:http` before a network story*.
+  **Check WHICH clause admits the module**, though: the same principle separately admits
+  "what the LANGUAGE story needs to be complete without third parties", and names
+  `std:fmt`, `std:test`, `std:list`, `std:map`/`std:set`, then `std:fs`, `std:args` and
+  `std:io` as the WASI-era additions. A module resting its case on the wrong clause reads
+  as inadmissible to a reviewer who checks it.
 
 ---
 
@@ -82,6 +100,18 @@ without a reason should ask for the reason, not the removal.
 - **Does the generic machinery reach it?** `u8[]` is not a `T[]`, so `std:array`'s helpers
   do not apply to it. An export that silently sits outside the generic surface should say
   so in its header.
+- **Can the caller SPELL the error arm?** A fallible export whose error type is borrowed
+  from another module should **re-export it** (`export { E } from "std:other"`) or say why
+  not. VL supports type re-export (`tests/cases/modules/reexport-type/`), it does not
+  collide with an existing import of the same name
+  (`tests/cases/modules/reexport-alongside-import/`), and it costs **no host imports** —
+  measured. Otherwise every caller pays a second import to write one `is` branch, which is
+  exactly the tax a module that cares about its call site is trying to avoid.
+- **Which floor intrinsics does it declare, and do any belong to another module?** A shared
+  cell makes two modules' invariants JOINT, and the header must say which module owns it.
+  `std:args` declares `__fs_errno__` — `std:fs`'s — and its only `__trap__` is unreachable
+  solely because `__args_get__` zeroes that cell on success. Cross-module coupling of this
+  kind is invisible to every other criterion here.
 
 ---
 
