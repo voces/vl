@@ -807,9 +807,39 @@ cases fusion cannot see, interpolation syntax (`f"Hello {name}"` or
 `` `Hello ${name}` ``), and a `std:fmt`. *Recommendation: interpolation is the highest
 ergonomic value now that fusion covers the perf trap; `std:fmt` can back it.*
 
-**OQ-3 — the exact core-vs-`std` line** for the method surface (§Methods table).
-*Recommendation as tabled: cheap byte/ASCII operations in core, table-dependent ones in
-`std:unicode`.*
+**OQ-3 — the core-vs-`std` line for the method surface. RESOLVED (owner ruling): the 15
+names STAY IN `std:str`.** Not promoted to compiler intrinsics. Three reasons, in order
+of weight:
+
+1. **Emitter cost, against this compiler's known weakness.** A core string method is not
+   one site: `slice` spans **5** across `emit_collect`/`emit_classify`/`typecheck`,
+   `includes` 3, `indexOf` and `charCodeAt` 1 each — and 10 of the 15 return *strings*,
+   the expensive kind that needs rep classification. Promotion buys roughly **48 new
+   hand-synced ladder arms** in an emitter whose signature defect is *a ladder with an
+   arm its sibling lacks* — twelve instances in one month, including `decodeStr`'s
+   missing line-continuation arm (#1837).
+2. **Promotion is one-way, and the representation is about to move.** Demoting a core
+   name breaks code, so intrinsics would freeze 15 semantics immediately before Step 2
+   changes what they mean. In VL those semantics cost a library edit; in the emitter
+   they cost a compiler release. (`split`/`indexOf`/`replace` written byte-wise get
+   *more* correct for free under UTF-8 — a substring match **is** a byte match. But
+   `padStart(s, 3)` must decide bytes-or-characters, and that ruling wants to be cheap.)
+3. **The optimization argument for intrinsics is not real here.** It was tabled as
+   "core methods can be constant-folded and fused." **VL does neither, for any of the
+   six existing core methods.** `print("abcdef".slice(1,3))` is **932 bytes** against
+   **797** for `print("bc")`, and the gap survives `-O` (**235** vs **159**) — a core
+   intrinsic with two literal operands is emitted as runtime work. Folding is also not
+   intrinsic-exclusive: a pure function called with literal arguments can be
+   const-evaluated whatever module it lives in.
+
+**The ergonomic follow-on is the prelude, not promotion.** "No import line" and
+"discoverable" are the only advantages promotion retained, and both are served by the
+**configurable prelude** already specified in `../internals/modules-design.md` — as
+*data*, reversibly, with local definitions shadowing prelude names (B16). Under that
+document's selection principle (*a module belongs in the default set iff it operates on
+a type with literal syntax*), `std:str` qualifies on `"…"`. Cost of an ambient module in
+a shipped `-O` build is **~210 bytes**, and it does not scale with module size. Nothing
+further to decide here; it needs the prelude mechanism to exist.
 
 **OQ-4 — automatic compaction.** Should the compiler ever auto-`compact()` a small
 view of a large backing that escapes into a long-lived structure, or is the retention
