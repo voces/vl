@@ -308,6 +308,7 @@ import {
   aUsed,
   annRlNul,
   annRlSlot,
+  ba8Used,
   capCacheOn,
   capCountTbl,
   capNamesFlat,
@@ -17958,21 +17959,45 @@ export function scalarTagOf(atom: string) {
   scalarTagOfKind(valueAtomKind(atom))
 }
 
+// THE FIRST TAG ABOVE THE VALUE-ATOM BAND — the base the three slot-keyed bands below are
+// measured from. The value-atom codes `valueAtomKind` produces are 0..12 plus the packed
+// byte list's 13, and 13 EXISTS ONLY IN A MODULE THAT HAS ONE: `ba8Used` is the module's
+// "a `(array (mut i8))` is interned" bit, set by `collectA`'s annotation scan, by
+// `markValueUnionAtoms`' kind-13 arm (a `u8[]` union member) and by the fs-intrinsic force
+// — all of them collection-time, all of them settled before `emitModule` runs, so every
+// tag in one module is measured from ONE base.
+//
+// WHY IT IS CONDITIONAL RATHER THAN A FLAT 14. The three bands interleave by residue mod 3
+// off this base, so ANY base keeps them pairwise disjoint — but moving the base
+// unconditionally renumbers every ref-array / map / multi-signature-closure arm tag in
+// every program that has one. Measured: 77 of 2,095 corpus files change bytes for a flat
+// +3, and not one of them mentions `u8[]`. Keyed on `ba8Used` the lift is paid only by the
+// programs that need code 13, and a program with no `u8[]` emits the pre-#1806 numbering
+// byte for byte (measured: 0 of 2,095).
+export function uAtomBandTop(): i32 {
+  if ba8Used { return 14 }
+  13
+}
+
 // The globally-stable tag of the REF-ELEMENT-ARRAY arm whose interned reflist slot is `slot`.
-// Value-atom tags fill the fixed band `uVariants.length + 0..12` (the `valueAtomKind` codes —
-// scalar/string/null/scalar-list/closure), so ref-array arms claim the band ABOVE it.
+// Value-atom tags fill the band `uVariants.length + 0 .. uAtomBandTop()-1` (the
+// `valueAtomKind` codes — scalar/string/null/scalar-list/closure, plus the packed byte
+// list's 13 in a module that has one), so ref-array arms claim the band ABOVE it.
 //
 // THREE SLOT-KEYED BANDS SHARE THAT SPACE AND THEY INTERLEAVE BY RESIDUE MOD 3. Ref-array,
 // MAP and bare-CLOSURE arms can coexist in one union (`S[] | {[string]: i32} | ((i32) => i32)`)
 // with INDEPENDENT intern-slot tables, so each band claims one residue class of
-// `uVariants.length + 13 …` and none of them can collide however deep its own table runs:
-// ref-arrays `+13 + 3*slot` (residue 1), maps `+17 + 3*slot` (residue 2 — `mapSlotTag`, whose
-// mono `-1` slot lands on `+14`), closure signatures `+15 + 3*(slot-1)` (residue 0 —
-// `cloSigSlotTag`, whose FIRST slot keeps the value-atom band's kind-11 offset). A distinct
+// `uVariants.length + B …` (`B` = `uAtomBandTop()`) and none of them can collide however
+// deep its own table runs: ref-arrays `+B + 3*slot`, maps `+B+4 + 3*slot` (`mapSlotTag`,
+// whose mono `-1` slot lands on `+B+1`), closure signatures `+B+2 + 3*(slot-1)`
+// (`cloSigSlotTag`, whose FIRST slot keeps the value-atom band's kind-11 offset). The three
+// residues stay pairwise distinct for ANY `B`, which is what makes the lift inert. A distinct
 // element type interns a distinct reflist slot (`rlSlotByName`), so it gets a distinct,
-// deterministic tag stable across every sub-union (mirroring `scalarTagOf`). The `+ 13` clears
+// deterministic tag stable across every sub-union (mirroring `scalarTagOf`). The `+ B` clears
 // the value-atom band.
-export function refArrSlotTag(slot: i32) { uVariants.length + 13 + slot * 3 }
+export function refArrSlotTag(slot: i32) {
+  uVariants.length + uAtomBandTop() + slot * 3
+}
 
 // The globally-stable tag of the MAP arm whose interned map value-slot is `slot` (the mono i32 /
 // atom map rides slot `-1`, its shared `$mStructIdx`). Maps take residue 2 of the mod-3
@@ -17988,7 +18013,7 @@ export function refArrSlotTag(slot: i32) { uVariants.length + 13 + slot * 3 }
 export function mapSlotTag(slot: i32) {
   let s = slot
   if s >= 0 { s = mvCanonRepOf(s) }
-  uVariants.length + 17 + s * 3
+  uVariants.length + uAtomBandTop() + 4 + s * 3
 }
 
 // The SLOT the function type rendered `nm` claims in the closure-signature tag table,
@@ -18022,7 +18047,7 @@ export function cloSigTagSlot(nm: string): i32 {
 // the first slot's tag, which is the tag it already had.
 export function cloSigSlotTag(slot: i32): i32 {
   if slot <= 0 { return scalarTagOfKind(11) }
-  uVariants.length + 15 + (slot - 1) * 3
+  uVariants.length + uAtomBandTop() + 2 + (slot - 1) * 3
 }
 
 // The union box TAG a bare function-typed arm of arena type `ty` claims — THE ONE HOME of
@@ -18124,7 +18149,7 @@ export function markValueUnionAtoms(name: string) {
     if k == 3 { vbI64Used = true }
     if k == 4 { vbF64Used = true }
     if k == 5 { vbF32Used = true }
-    // A LIST member (codes 7..10, 12) forces its list type so the wrapper heap the box
+    // A LIST member (codes 7..10, 12, 13) forces its list type so the wrapper heap the box
     // payload rides exists — the union annotation alone may be the only mention of that
     // list type.
     if k == 7 {
@@ -18138,6 +18163,12 @@ export function markValueUnionAtoms(name: string) {
     }
     if k == 10 { ia64Used = true }
     if k == 12 { fa32Used = true }
+    // A PACKED BYTE-LIST member (code 13) forces the `ba8`/`bl8` pair, and it is the ONLY
+    // arm here that also decides a TAG: `uAtomBandTop` reads `ba8Used` to lift the three
+    // slot-keyed bands off code 13's tag. This mark is what makes that bit true before any
+    // tag is emitted — the union annotation is frequently the program's only mention of
+    // `u8[]`, so `collectA`'s annotation scan (which matches an array SPELLING) never sees it.
+    if k == 13 { ba8Used = true }
     // A CLOSURE member (code 11) rides the box anyref as the `$cloStructIdx` fat-pointer —
     // force the closure rec-group types so that heap type exists (the union annotation may be
     // the only mention of a function value in the program), the string/list analogue above.
@@ -22355,6 +22386,13 @@ export function unMemIsRefElemArray(m: i32): boolean {
       if et.primName == "f64" { return false }
       if et.primName == "i64" { return false }
       if et.primName == "f32" { return false }
+      // THE PACKED BYTE LIST IS NOT A REF-ELEMENT ARRAY. Without this arm a `u8[]` union
+      // member fell through to `return true` — the same shape of fall-through #1805 closed
+      // in `fieldCodeOfSpelling` (its `return 5`) — and `markRefArrayArms` interned a
+      // REFLIST slot for the element spelling `u8`, so the box was tagged and cast against a
+      // ref-list wrapper over a one-byte backing. `u8[]` is a SCALAR-element list: it rides
+      // the box's anyref as its own `$bl8` wrapper under value-atom kind 13.
+      if et.primName == "u8" { return false }
     }
     return true
   }
@@ -22389,6 +22427,10 @@ export function unMemAtomKind(m: i32): i32 {
       if et.primName == "f64" { return 8 }
       if et.primName == "i64" { return 10 }
       if et.primName == "f32" { return 12 }
+      // The PACKED byte list — `valueAtomKind`'s `u8` arm, asked of the element ROW.
+      // Without it `is u8[]` fell past `isArmTagOfTy`'s value-atom arm to the struct-
+      // variant ladder and rejected a program the checker accepts.
+      if et.primName == "u8" { return 13 }
     }
     if tyIsStrLeafElem(e) { return 9 }
     return -1
@@ -24280,6 +24322,15 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Ident {
+    // NO NARROWED-UNION ARM HERE, and the contrast with `exprArray` (kind 7) and
+    // `exprF32Array` (kind 12) is the header's point restated: those two need a
+    // `unionIdentReadKind == <kind>` arm because the checker's recorded type does not
+    // carry their claim through a narrowing. `u8[]` has a `TyPrim("u8")` element the
+    // narrowing keeps, so the arena leg at the top answers for every narrowed read AND
+    // write. Adding the arm anyway was measured and REFUTED: 0 of 216 union-position
+    // grid cells and 0 of 7 narrowed-receiver probes (read / index / index-store /
+    // `.length` / pass-to-`u8[]`-param / global / reassigned local) changed either way.
+    //
     // The three NAME positions the recorded type does not reach: a PARAM read inside its
     // own body, a declared LOCAL, and a module GLOBAL. Each asks the declaration that
     // already decided the cell's kind, so the read and the cell cannot disagree.
