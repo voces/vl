@@ -3667,6 +3667,24 @@ export function refPushScratchBaseFor(slot: i32) {
     if fnRefPushSlots[i] == slot { return refPushBaseBySlot[i] }
     i = i + 1
   }
+  // NO SLOT, NO FRAME — and the fall-through that used to stand here could never be
+  // right. `refPushScratchBase` is the base of the FIRST typed ref quad: with
+  // `fnRefPushSlots` empty it is the cursor past every reserved frame (so the four
+  // indices are out of bounds — `unknown local N`), and with it non-empty it names a
+  // quad typed for a DIFFERENT element (so the backing/receiver refs are the wrong
+  // heap types). Both are `vl check`-clean INVALID WASM.
+  //
+  // It is reached when the frame PRE-PASS classified this receiver differently from the
+  // emit: the pre-pass runs with no `is`-narrow active, so a union box narrowed to a
+  // ref-array arm (`function f(x: S[] | i32) { if x is S[] { x.push(s) } }`) reserves the
+  // i32 quad and emits the ref sequence. Declining says so at the gate instead of writing
+  // a module that cannot instantiate. Measured: 0 of 2,106 corpus files reach it, and the
+  // four grid cells that do are invalid wasm on master.
+  emitFail(
+    "emitProgram: a ref-element list op needs its receiver's element type known before " +
+      "the body is lowered; a union arm narrowed to a ref-element list is not yet reached " +
+      "by that pass",
+  )
   refPushScratchBase
 }
 
@@ -4919,7 +4937,19 @@ function callPopBits(callIx: i32, fnIx: i32) {
         if recv is Member {
           needsScratch = true
         } else if recv is Ident {
-          if localIndexOf(fnIx, recv.identName) < 0 {
+          if identSlotIsUnionBox(fnIx, recv.identName) {
+            // A frame slot holding the union BOX narrowed to a list arm (`if x is i32[] {
+            // x.clear() }`). It resolves through `localIndexOf` like any other local, but
+            // the LIST is the box's anyref payload — so the receiver stages through
+            // `emitExpr`'s unbox into `recvRef`, exactly as a global/field one does, and
+            // needs the frame reserved. THE RESERVATION TWIN OF `listOpRecvNarrowedUnion`:
+            // without it `.pop`/`.clear` staged into a frame `fbBeginFunc` never laid out —
+            // `unknown local`, `vl check` rc 0. Asked of the SLOT because this walk runs
+            // with no narrowing active (see `identSlotIsUnionBox`); an un-narrowed list op
+            // on a union box is a type error, so the slot answer and the live-narrow answer
+            // coincide wherever emission actually reaches.
+            needsScratch = true
+          } else if localIndexOf(fnIx, recv.identName) < 0 {
             if globalIndexOf(recv.identName) >= 0 { needsScratch = true }
           }
         }
@@ -10201,6 +10231,14 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // An i64 element list (`i64[]`): the loop var binds as a scalar i64 local (code 10), and
   // the `#l` temp is the i64-list (code 20).
   if exprI64Array(iterIx, fnIx) { return "i64" }
+  // A PACKED BYTE LIST (`u8[]`): each element reads as an i32 (`array.get_u` zero-extends),
+  // so the loop var is the plain i32 code — the one-byte storage lives entirely in the `#l`
+  // TEMP, which `forInU8Src` types `u8list`. Asked EXPLICITLY rather than left to the i32
+  // default below, because `exprArray` claims a `u8[]` in only SOME storage classes: a
+  // module GLOBAL fell through to it and iterated, while a function LOCAL, a param and a
+  // narrowed union arm reached `return null` and the loud `unsupported for-in iterable`.
+  // Every other scalar-element list states its arm here for the same reason.
+  if exprU8Array(iterIx, fnIx) { return "i32" }
   // A STRING iterable (`for ch in s`): each code unit is an i32 (loop-var code 0, same as an
   // `i32[]`), but the source is the RAW i32 array — the `#l` temp is the string itself (code 3),
   // and the length/element reads skip the list-wrapper `struct.get`. `forInStringSrc` flags it
@@ -10215,6 +10253,23 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
 export function forInStringSrc(iterIx: i32, fnIx: i32) {
   if forInElemKind(iterIx, fnIx) != "i32" { return false }
   exprString(iterIx, fnIx)
+}
+
+// Whether a `for v in <iter>` iterable is the PACKED byte list (`u8[]`) — the i32-element walk
+// over an `(array (mut i8))` backing under its own `$bl8` wrapper, distinct from an `i32[]`
+// (element kind `"i32"` too) whose backing is four bytes wide.
+//
+// THE `forInStringSrc` TWIN, AND IT EXISTS FOR EXACTLY THE SAME REASON: three list backings
+// hand the loop var an i32 (`i32[]`, a string, `u8[]`), so the element kind cannot tell them
+// apart and the `#l` TEMP's kind is where they differ. `u8[]` has no arm in the `forInElemKind`
+// ladder because it needs none — its element genuinely is an i32 (`array.get_u` zero-extends,
+// the storage width is invisible above the load); what it needs is for the two sites that type
+// the temp (`declareForInLocals`) and read it back (`emitForInStmt`) to agree that the wrapper
+// is `$bl8`. Without this the temp was declared `(ref $list)` and the iterable assigned to it
+// was `(ref $bl8)` — `vl check` rc 0, "type mismatch" at the `local.set` (#1814 repro A).
+export function forInU8Src(iterIx: i32, fnIx: i32) {
+  if forInElemKind(iterIx, fnIx) != "i32" { return false }
+  exprU8Array(iterIx, fnIx)
 }
 
 // TRUE when a `for v in <iter>` walks a map's ordered VALS list (map-struct field 1)
@@ -13524,6 +13579,21 @@ export function nameIsRefArray(name: string) {
   // same match with no per-iteration allocation.)
   if nameIsElemArray(name) {
     const base = arrElemNameRaw(name)
+    // A MULTI-ATOM element spelling is not an element at all — it is the TAIL of a UNION
+    // whose LAST arm happens to be an array (`string[] | i32[]`), whose whole name therefore
+    // ends in `]`. This is the array twin of `nameIsMapMemberUnion`, and it is the same
+    // subtraction: `nameIsMap` matches a map-FIRST union because it only probes two opening
+    // characters; `nameIsElemArray` matches an array-LAST union because it only probes two
+    // closing ones. There is no legitimate name on the other side of it — `rlCanonLitUnionAtoms`
+    // and `canonEmitName` both RE-GROUP a union element in parens (`(A | B)[]`, one top-level
+    // atom), so a bare top-level `|` inside `base` can never have come from an array-of-union.
+    //
+    // WITHOUT IT the `unNames` scan below matched the SHORTER union: `string[] | i32[]` cut to
+    // `string[] | i32`, which is a registered union in any module that also declares one, so a
+    // reflist slot was interned with a UNION-BOX element and `refListSlotOfExpr` handed every
+    // narrowed `.length` / index read that slot's wrapper — `vl check` rc 0, invalid wasm.
+    // Either union ALONE was correct, because the cut then named nothing (#1814 repro C).
+    if unionMemberCount(base) >= 2 { return false }
     if structIndexByName(base) >= 0 { return true }
     // An INLINE-SHAPE element (`{v:i32}[]`) whose shape deduped onto a DECLARED
     // struct at intern time (so the spelling has no `sNames` entry): the
@@ -20568,6 +20638,23 @@ function capturedKindOf(fnIx: i32, name: string): VKind | null {
 // unboxing is a REP question, and this is where the capture's rep lives.
 export function capturedIsUnionBox(fnIx: i32, name: string) {
   capturedKindOf(fnIx, name) == "union"
+}
+
+// True when the identifier `name` reads a FRAME SLOT of `fnIx` — a param, a declared local,
+// or a capture — that holds the union BOX. NARROWING-BLIND on purpose, and that is the whole
+// point of it: it is the question a list op's SCRATCH RESERVATION (`callPopBits`) and its
+// RECEIVER RESOLUTION (`listOpRecvLocal`) must answer the same way, and those two run in
+// different passes — the reservation walk happens before any `is`-narrow is pushed, so it
+// cannot ask whether an unbox is live at the receiver. What the slot HOLDS does not depend
+// on the narrowing, so both passes get one answer.
+//
+// A GLOBAL is deliberately not here: a global list receiver has no frame slot and already
+// stages through the global arm in both passes.
+export function identSlotIsUnionBox(fnIx: i32, name: string) {
+  const pt = paramTypeNode(fnIx, name)
+  if pt >= 0 { return vtKindOfType(pt) == "union" }
+  if declaredKind(name) == "union" { return true }
+  capturedIsUnionBox(fnIx, name)
 }
 
 // The union member-set NAME of a CAPTURED union-box variable `name` (kind 4) of the capturing
