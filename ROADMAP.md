@@ -1181,7 +1181,35 @@ in-language GC knobs.
   **float for-range bounds** (`for i = 1 to 1.5` — today bounds must be i32; open up to f64, maint.
   note on #377); **user-defined iterators** (`for x in <anything>` via an iterator protocol, so
   `for…in` is not array/map-only — maint. note on #377).
-- ⬜ **B12. `async`/`await`.** Keywords lexed; no semantics/codegen. Large; likely last.
+- ⬜ **B12. Concurrency — and it is NOT `async`/`await`.** The model is RULED (owner,
+  2026-08-22) and written up in `docs/internals/concurrency-design.md`; nothing is built.
+  **I/O concurrency is UNCOLOURED and direct-style** — an I/O function is an ordinary
+  function, suspension is the host's business (stack switching) and is invisible in source,
+  so `std:fs` can ship against a blocking host and gain concurrency later with ZERO source
+  changes anywhere. Concurrency is requested with **one optional argument on `map`**
+  (`urls.map(f, 8)`), which is bounded and structured by construction and has no unsafe
+  spelling — omitting the limit gives SERIAL, unlike `Promise.all`, where the hazard is
+  reached by writing less. Results are `(T | E)[]`, needing no machinery beyond the ruled
+  error model. **CPU parallelism is DEFERRED** (a worker is a separate heap, and those
+  restrictions are artifacts of WasmGC references not crossing threads *yet* — baking a
+  temporary platform gap into a permanent surface is how you get two APIs); multiple cores
+  stay a HOST capability, where `vl test`'s `parallel_map` already uses them. An **inferred
+  effect analysis — never written down, never in a type** — powers three things: the
+  "these run one at a time" lint, mechanism selection, and eliding the concurrency
+  machinery when a callback cannot suspend. `async`/`await` is REJECTED with reasons
+  (ecosystem duplication; the CPS transform; `await x as T` on every fallible call);
+  `await` stays a reserved keyword and `async` stays a legal identifier.
+  **Browser parity is deliberately off the initial path** (owner, 2026-08-22) — blocking
+  I/O is trivial under wasmtime and *not implementable* on a browser main thread.
+  Sequencing (steps 1–3 need no async decisions at all): host ABI batch → `std:fs` →
+  the `as` trio → stack switching → `map(f, limit)` → effect inference.
+  **`map` should be std** (owner, 2026-08-22) and the blocker is one intrinsic, not the
+  optimizer: the builtin does NOT inline the callback (`call_indirect` per element, same
+  as std would pay), it buys a pre-sized `array.new_default`; `mapIndexed<T, U>` in
+  `std/array.vl` is the existence proof that a generic std `map` is writable today, and
+  the residue is a generic, monomorphization-aware sized-array constructor
+  (`__array_new_default__` is i32-only — its element kind "is not derivable from the
+  argument list").
 - 🟡 **B13. Well-known-symbol dispatch.** REMAINING: callable objects (`"()"`).
 - ⬜ **B13a. Multi-index matrix idiom** (low priority). Single-bracket `m[i, j]` → multi-arg
   `"[]"`/`"[]="` + flat-backed `Matrix`/`Grid` type. Nested `m[i][j]` already composes today —
