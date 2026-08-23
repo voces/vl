@@ -942,6 +942,19 @@ in-language GC knobs.
   > `tests/cases/literal-unions/union-of-litunions-flatten.vl`.
   > *Also measured: the fuzzer DOES reach litunion-in-mixed-union (26 and 14 of 800 cases on two
   > seeds) and is VACUOUS on every defect family — it only ever stores a member LITERAL.*
+  >
+  > **THE THREE WITNESSES THIS ENTRY RESTS ON NO LONGER REPRODUCE (2026-08-22, `be49bfcc`).** Run
+  > verbatim: F1 (an atom-typed value stored into `K | f64`) tags it `K`; F2 (a narrowed arm read
+  > back into a `K`-typed position — *"invalid wasm in 9 of 9 spellings"*) prints `aa`; F3 (`x is K`
+  > TRUE for a plain `"zz"`) prints `ok: not K`. Same answers on a seed 81 commits older, so this is
+  > long closed rather than freshly fixed. **Three cells are not a 244-cell grid, so this is NOT
+  > "A16 is fixed"** — but the two remaining owner rulings (`open-rulings.md` §A16-tag-scheme,
+  > §A16-ref-i31) are briefed entirely on the population these three witnesses stand for, and
+  > `open-rulings.md`'s section A — *"Something is BROKEN while these wait"* — has no surviving
+  > demonstration. **Re-derive the grid before briefing either ruling or scheduling slice B.** The
+  > same re-run retired D3 and D4 from `silent-class-inventory-2.md`, D4 being that document's
+  > largest filed silent family; the standing rule both corrections argue for is *run the witness
+  > before scheduling from the row*.
 - ⬜ **A17 follow-up: `never` inference.** A17 demand-driven inference is shipped, and so is
   half (b) of this row — **the `unconditional-recursion` lint SHIPPED** (`compiler/lint.vl`,
   headline case `tests/cases/lint/unconditional-recursion.vl`). It fires with the return type

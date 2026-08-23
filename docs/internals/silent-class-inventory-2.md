@@ -1077,10 +1077,27 @@ Re-derived on master `9907d711`:
 
 | row | filed | on the tip |
 |---|---|---|
-| **D3** silently wrong value | `gtake<T>(x)` printing `x[0][1]` over `boolean[][]` gives `0` | **LIVE** — prints `0` where the direct read prints `false` |
-| **D4** invalid wasm | `const y: string = "aa"; gid(y)` | **LIVE** — check-clean invalid wasm; deleting the annotation prints `aa`, so the annotation is the axis |
+| **D3** silently wrong value | `gtake<T>(x)` printing `x[0][1]` over `boolean[][]` gives `0` | ~~**LIVE**~~ — **CLOSED, see below** |
+| **D4** invalid wasm | `const y: string = "aa"; gid(y)` | ~~**LIVE**~~ — **CLOSED, see below** |
 | **D8** loud check, 46 cells | `if w.f != null { w.f = src() }` | **CLOSED by #1451** — now accepted, which is exactly what that slice widened |
 | **D1** compiler trap, 8 cells | a captured `{[i32]: string}` | **does not reproduce at my spelling** on the tip (`.length` on a captured i32-keyed string map checks clean). #1450 fixed the captured-map trap family; whether D1's exact shape survives needs the sweep's own program, not mine |
+
+**D3 AND D4 ARE CLOSED, AND NOBODY CAME BACK TO SAY SO (re-derived 2026-08-22 on `be49bfcc`).**
+Both witnesses above, pasted verbatim into a `.vl` and run: D3 prints `false` (the correct value, not
+`0`) and D4 prints `aa` (a module that loads, not check-clean invalid wasm). D4 was **the largest
+filed silent family in this document — 34 of 76 cells.**
+
+They were not closed recently. The same two witnesses give the same correct answers on a seed **81
+commits older**, so this file described a fixed defect as live across a long stretch of the programme,
+and any scheduling done from its ranked list over that stretch was weighting a closed class first.
+
+**The bias is one-directional, which is what makes it worth a standing rule.** A defect inventory
+almost never *under*-claims: the fix ships, and the inventory is not the file the fixer edits. So its
+residue always reads bigger than it is. The rule the programme should adopt — **run the witness before
+scheduling from the row** — costs two seconds, because the house style already requires every row to
+carry its minimal program. That is what this correction is: not new analysis, just the run nobody did.
+
+The same check retired the whole of `open-rulings.md` section A on the same day; see the note there.
 
 **On D1 and the CHANGELOG:** the sweep says it "corrects a CHANGELOG correction", on the grounds
 that the earlier work measured the *for-in receiver* rather than the *capture*. That reading is
