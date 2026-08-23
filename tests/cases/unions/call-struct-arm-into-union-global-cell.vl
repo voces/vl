@@ -1,0 +1,94 @@
+// Regression (#1678): a MODULE-LEVEL binding annotated with a DECLARED union whose
+// initializer is a CALL returning one concrete ARM stored the RAW variant ref into the
+// union global's BOX cell — `type mismatch: expected (ref null $uBox), found
+// (ref $variant)`, an invalid module with `vl check` clean before `--codegen` validated
+// what it emits. The same lines inside a `function` always ran: a union-annotated LOCAL
+// with a variant init binds the raw variant (kind 8), so its store needs no box, while
+// `globalCellKind` has NO raw-variant cell — a union global is always the box. So both
+// the start-fn INIT and a later ASSIGNMENT must box a concrete-variant value exactly as a
+// call argument / return / array element does (`emitUnionBoxArg`), not raw-pass it
+// (`emitUnionCoerce`, which the two global sites called directly).
+//
+// NOT shape-dependent: `A`/`B` are identical and `C`/`D` are not, and BOTH spellings were
+// invalid before the fix. What was required is that the arm's own struct heap type be
+// DEDUPED with the union's variant struct — a MIXED union (`{w: i32} | i32`) escaped
+// because its arm interns a distinct heap type and `emitUnionCoerce`'s twin-rebox arm
+// already boxed it (`unions/call-struct-arm-into-variant-box-local.vl`, which passed
+// throughout).
+//
+// The ARGUMENT-position controls (`rdU(mkB())` / `rdV(mkD())`) always lowered correctly
+// and are kept here so a regression in EITHER direction fails this case, as are the
+// object-LITERAL global and the union-annotated LOCAL, the two spellings that worked.
+// Each reader narrows to BOTH arms, so a box carrying the wrong tag prints the other
+// arm's value rather than passing.
+// @run
+// @log 2
+// @log 2
+// @log 2
+// @log 2
+// @log 1
+// @log 2
+// @log 4
+// @log 4
+// @log 4
+// @log 4
+// @log 3
+// @log 4
+
+// ── same-shape arms ───────────────────────────────────────────────────────────
+type A = { tag: i32, v: i32 }
+type B = { tag: i32, v: i32 }
+type U = A | B
+
+function mkB(): B { return { tag: 2, v: 200 } }
+function rdU(u: U) {
+  if u is B { return u.tag }
+  if u is A { return u.tag }
+  return 0
+}
+
+// THE BUG: the cell is the box, the init is a bare variant ref.
+const gConstU: U = mkB()
+let gLetU: U = mkB()
+// The object-LITERAL global control (always boxed through the `ObjLit` arm).
+let gLitU: U = { tag: 1, v: 100 }
+
+// ── distinct-shape arms ───────────────────────────────────────────────────────
+type C = { tag: i32, v: i32 }
+type D = { tag: i32, w: string }
+type V = C | D
+
+function mkD(): D { return { tag: 4, w: "hi" } }
+function rdV(v: V) {
+  if v is D { return v.tag }
+  if v is C { return v.tag }
+  return 0
+}
+
+const gConstV: V = mkD()
+let gLetV: V = mkD()
+let gLitV: V = { tag: 3, v: 300 }
+
+function main() {
+  print(rdU(gConstU)) // 2 — the const cell, init from a call
+  print(rdU(gLetU))   // 2 — the let cell, init from a call
+  print(rdU(mkB()))   // 2 — the argument-position control
+  const localU: U = mkB()
+  print(rdU(localU))  // 2 — the union-annotated LOCAL control
+  print(rdU(gLitU))   // 1 — the object-literal control
+  // THE BUG's assignment twin: the same box cell, re-bound from a call.
+  gLetU = mkB()
+  gLitU = mkB()
+  print(rdU(gLitU)) // 2
+
+  print(rdV(gConstV)) // 4
+  print(rdV(gLetV))   // 4
+  print(rdV(mkD()))   // 4
+  const localV: V = mkD()
+  print(rdV(localV))  // 4
+  print(rdV(gLitV))   // 3
+  gLetV = mkD()
+  gLitV = mkD()
+  print(rdV(gLitV))   // 4
+}
+main()
