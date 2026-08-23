@@ -98,6 +98,7 @@ import {
   rlElemHeap,
   rlElemNullable,
   rlWrapIdx,
+  sBackIdx,
   sHeapIdx,
   sTypeIdx,
   strPushScratchBase,
@@ -671,6 +672,28 @@ export function fbStructNew(heapIdx: i32) {
   if heapIdx == uBoxIdx { uBoxNewEnd = curBuf.length }
   0
 }
+// ── string header accessors (Stage 2b) ───────────────────────────────────────
+// A `string` VALUE is `(ref $sTypeIdx)`, the 3-field view header. These four spell the only
+// four things any lowering does with one, so the field NUMBERS live in exactly one place. A
+// direct `fbStructGet(sTypeIdx, n)` elsewhere would be a second writing of the field order.
+export function fbStrBack() {
+  fbStructGet(sTypeIdx, 0)
+  0
+}
+export function fbStrStart() {
+  fbStructGet(sTypeIdx, 1)
+  0
+}
+export function fbStrLen() {
+  fbStructGet(sTypeIdx, 2)
+  0
+}
+// `[backing, start, len] -> [string]`.
+export function fbStrNew() {
+  fbStructNew(sTypeIdx)
+  0
+}
+
 export function fbStructGet(heapIdx: i32, field: i32) {
   wU8(GC_PREFIX) // 0xfb GC prefix
   wU8(GC_STRUCT_GET) // struct.get
@@ -937,9 +960,10 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   // every earlier frame base is unchanged in a program with no `u8[]`.
   u8PushScratchBase = fbScratchCur
   if fnUsesU8Push { fbReserve(4) }
-  // String-op frame (3 non-null string refs + 4 i32 temporaries).
+  // String-op frame (2 string headers + the out BACKING + 4 i32 temporaries + the two
+  // hoisted operand backings + their two `start` offsets — 11 slots, Stage 2b).
   strScratchBase = fbScratchCur
-  if fnUsesStrOp { fbReserve(7) }
+  if fnUsesStrOp { fbReserve(11) }
   // G8 map scratch frame (15 slots).
   mapScratchBase = fbScratchCur
   if fnUsesMap { fbReserve(15) }
@@ -1054,6 +1078,7 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   lhSlot = []
   lhBack = []
   lhLen = []
+  lhStart = []
   lhLive = []
   lhOpen = []
   lhScanName = []
@@ -1071,6 +1096,11 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
 //     row key: two same-named bindings of DIFFERENT rep get different rows, so
 //     a row's slot types always match the header it caches.
 //   lhBack/lhLen        — the two frame locals (`liBack` 3 and 4).
+//   lhStart             — the THIRD local a RAW-STRING row needs (`liBack` 4 as
+//     well: it is an i32). A `string` is a `{backing, start, len}` VIEW since
+//     Stage 2b, so hoisting its header takes three locals where a list's
+//     `{backing, len, cap}` takes two — `start` has no list counterpart and is
+//     -1 on every list row, which is also how `hoistRowIsStr` tells them apart.
 //   lhLive              — how many enclosing loops opened this row. Positive
 //     means the locals hold this binding's live header and an index lowering
 //     may read them; zero means they are stale and must not be.
@@ -1084,6 +1114,8 @@ export let lhKind: MfKind[] = []
 export let lhSlot: i32[] = []
 export let lhBack: i32[] = []
 export let lhLen: i32[] = []
+// The raw-string row's `start` local; -1 on a list row (which has no such field).
+export let lhStart: i32[] = []
 export let lhLive: i32[] = []
 // The rows each open loop activated, innermost last — `loopHoistClose` pops the
 // count its own `loopHoistOpen` returned.
@@ -1151,7 +1183,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fnUsesI64Push { n = n + 4 }
   if fnUsesF32Push { n = n + 4 }
   if fnUsesU8Push { n = n + 4 }
-  if fnUsesStrOp { n = n + 7 }
+  if fnUsesStrOp { n = n + 11 }
   if fnUsesMap { n = n + 15 + mvValName.length * 3 }
   if fnUsesMap && mI32Used { n = n + 5 }
   if fnUsesMapKeys { n = n + 6 }
@@ -1261,14 +1293,24 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbRefRun(ba8TypeIdx)
     fbRefRun(bl8TypeIdx)
   }
-  // String-op frame: strScrA/B/Out (3 non-null `(ref $sTypeIdx)` string refs),
-  // then strScrI0..strScrI3 (4 i32 temporaries).
+  // String-op frame (Stage 2b layout): strScrA/strScrB (2 non-null `(ref $sTypeIdx)` string
+  // HEADERS), strScrOut (a non-null `(ref $sBackIdx)` — the BACKING under construction, not a
+  // finished string: every builder allocates elements first and wraps a header around them
+  // last), strScrI0..strScrI3 (4 i32 temporaries), then the Stage-2b additions — strScrABk /
+  // strScrBBk (the two operands' HOISTED backings, nullable so the slot is defaultable) and
+  // strScrAOff / strScrBOff (their `start` offsets). The four are what keeps an element loop
+  // at one `array.get` per step: `struct.get` of a GC ref is NOT reliably lifted out of a loop
+  // by binaryen's LICM, so the hoist is done here in codegen (§Header).
   if fnUsesStrOp {
     fbRefRun(sTypeIdx)
     fbRefRun(sTypeIdx)
-    fbRefRun(sTypeIdx)
+    fbRefRun(sBackIdx)
     fbI32Run()
     fbI32Run()
+    fbI32Run()
+    fbI32Run()
+    fbRefNullRun(sBackIdx)
+    fbRefNullRun(sBackIdx)
     fbI32Run()
     fbI32Run()
   }
@@ -1464,10 +1506,17 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
       const lk = liKinds[lix]
       if liBack[lix] == 5 {
         // A chunked long STRING literal's destination backing (`arrLitChunkStart`'s
-        // `strBack`) — the raw `(ref null $sTypeIdx)` string itself, NOT a list backing. Its
-        // `liKinds` entry is "i32" because the elements are i32 code points, so the kind
-        // match below would type it `$aTypeIdx`; the string's own heap type needs its own
-        // `liBack` code.
+        // `strBack`) — the raw `(ref null $sBackIdx)` element array, NOT a list backing and
+        // (since Stage 2b) NOT the finished string either: the header is `struct.new`n around
+        // this array once every chunk has landed. Its `liKinds` entry is "i32" because the
+        // elements are i32 code points, so the kind match below would type it `$aTypeIdx`;
+        // the string backing's own heap type needs its own `liBack` code.
+        fbRefNullRun(sBackIdx)
+      } else if liBack[lix] == 6 {
+        // A STRING HEADER stash (`strHdrSlot`) — the `(ref null $sTypeIdx)` receiver of an
+        // `s[i]` / `s.charCodeAt(i)`, parked so the lowering can read `backing`, `start` and
+        // `len` off ONE evaluation. Kind is "i32" here too (a string element is an i32 code
+        // point), so, like code 5, it needs its own code rather than a kind match.
         fbRefNullRun(sTypeIdx)
       } else if liBack[lix] == 1 || liBack[lix] == 3 {
         match lk {

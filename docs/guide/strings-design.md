@@ -267,9 +267,13 @@ rather than the one that is expensive, data-dependent, and merely *less* wrong.
 
 ### Context: what VL has today
 
-- **A string is a WasmGC `array i32` of Unicode code points.** Same `(array mut i32)`
-  representation an `i32[]` gets, plus `.length` (`array.len`) and `s[i]`
-  (`array.get`) for free. One code point per `i32`, full Unicode range.
+- **A string is a WasmGC slice header over an `array i32` of Unicode code points** —
+  `(struct (field (ref (array (mut i32)))) (field i32 $start) (field i32 $len))`, its own
+  heap type since Stage 2a and a header since **Stage 2b**. `.length` is `struct.get 2`,
+  `s[i]` is `backing[start + i]` behind an `i u< len` guard, and **`slice` is O(1)**: a
+  header sharing the receiver's backing, no element copy. One code point per `i32`, full
+  Unicode range. *(Before Stage 2b a string WAS the bare array; `.length` was `array.len`
+  and `slice` allocated and copied.)*
 - **A char literal `'a'` is an `i32` code point.** The lexer decodes a single-quoted
   literal to exactly one code point (`''` and `'ab'` are hard errors; `\u{1-6 hex}`
   admits the full range).
@@ -320,6 +324,25 @@ string  ≅  (struct (field $backing (ref (array i8)))   ;; the UTF-8 bytes
                    (field $hash    i32))               ;; cached FNV/xx hash, 0 = uncomputed
 ```
 
+> **STAGE 2b HAS SHIPPED — the header and the views, with the element type UNCHANGED.**
+> `string` is `(struct $backing:(ref (array (mut i32))) $start:i32 $len:i32)` today: `slice`
+> allocates a header only, `.length` reads `$len`, `s[i]` reads `$backing[$start + i]`.
+> **`$hash` is deliberately absent** — the fourth field is free (§1.2 of the measurements
+> priced 3- and 4-field structs identically under all three collectors), but caching the
+> hash must move ATOMICALLY with byte-level equality (§Equality's migration note), so no
+> hash logic is wired. The elements are still i32 code points; **UTF-8 is Stage 2c.**
+>
+> **`compact()` is NOT in Stage 2b, and that is a considered call, not an omission.** The
+> retention hazard below is real and now live — a small view keeps its whole backing. But
+> `compact()` is a *user-facing method*, and OQ-3 ruled that the 15 `std:str` names stay in
+> `std:str` rather than becoming intrinsics precisely because a core string method costs
+> ~48 hand-synced emitter ladder arms. Adding one in the stage whose entire claim is
+> *behavioural identity against master* would forfeit that claim: a new method changes what
+> the corpus can express, so a corpus that comes back identical would no longer be evidence.
+> It also cannot be written in VL over today's surface — `s.slice(0, s.length)` returns a
+> view of the same backing, so there is no spelling that copies. **It belongs with Stage 2c**,
+> where the element type changes anyway and the copy has to be written regardless.
+
 **Why a header, when the previous revision's header was just deleted.** The old
 header existed to carry an `ascii` flag so code-point `s[i]` could be O(1). That flag
 is gone. This header exists for a different and much better reason: **`slice` becomes
@@ -347,8 +370,12 @@ long-lived structure is filed as **OQ-4**; the default is explicit.)
 
 **Cost accounting, stated plainly.** Every string is now **two objects** — the header
 struct and the backing array — where today it is one. For very short strings the
-second object header can exceed the byte savings. **The break-even point must be
-measured before this lands** (§Migration step 0), because the compiler's own workload
+second object header can exceed the byte savings. **The break-even point WAS measured
+before this landed** (§Migration step 0 → `../internals/string-rep-measurements.md`
+Part 1: the crossover is 8–16 bytes for a string that does NOT share a backing, but
+**100 %** of the strings the compiler's lexer allocates are slices of one source string,
+so the amortized object count is 1.00004 and the verdict is a large win). The rest of this
+paragraph is kept as the statement of what had to be measured, because the compiler's own workload
 is dominated by short interned identifiers and the headline "4× leaner" claim is
 per-*character* while the header cost is per-*string*. The previous revision asserted
 the 4× win without a denominator; the roadmap's own standing rule applies — *quote
@@ -766,6 +793,48 @@ Go-lean validity lands here.
 > compiler**, each with its own fixpoint, corpus, and rep-fuzz exposure — and doubling
 > rep migrations doubles exposure to the one defect class this emitter demonstrably
 > has. Go to the final shape once.
+
+> **STAGE 2b DEVIATES FROM THAT RULING, DELIBERATELY, AND HERE IS THE ARGUMENT — plus the
+> one place it turned out to be weaker than claimed.** Step 2 shipped in two pieces: **2b**
+> is the header WITH views and the element type UNCHANGED (i32 code points); **2c** is the
+> UTF-8 byte swap. That is *not* the pair the ruling above rejects, on two counts.
+>
+> **1. The rejected pair is bare-`array i8` first, then promote.** Its intermediate state is
+> a *different unit with no views* — every `s[i]` changes meaning AND every `slice` still
+> copies. §1.7 row 3 of `../internals/string-rep-measurements.md` prices exactly that state
+> at a **net loss** (+1.7 % null / +15.2 % copying / +26.8 % DRC on the per-string
+> population), worse than either endpoint. Stage 2b's intermediate state is the opposite:
+> the unit does not move at all, and the views land in the SAME change as the header, so the
+> state §1.7 prices as worse than both endpoints is never entered. There is no rung of this
+> ladder where `slice` copies under a header.
+>
+> **2. It buys a check the combined change could not have.** Because 2b changes no
+> semantics, it is verifiable by **behavioural identity against master** — the 1,619-file
+> corpus sweep must come back *file-for-file identical*, not merely green, and it did
+> (PASS 1617 / CHECKFAIL 2 / RUNFAIL 0 / LOGDIFF 0, the same set). Once the element type
+> moves, that instrument is gone: three fixture assertions legitimately change output
+> (§2.0), so "identical" stops being the expected answer and every diff has to be
+> adjudicated by hand. Splitting the migration spends the strongest available check on the
+> half that can use it.
+>
+> **AND THE ARGUMENT IS WEAKER THAN IT LOOKS IN ONE SPECIFIC WAY — stated because the point
+> of recording a deviation is to make it auditable, not to make it look good.** Behavioural
+> identity is only as strong as the corpus's ability to express the disagreement, and this
+> area holds a live instance of exactly that limit: `emitNarrowedMem`'s `D-UNION-ATOM-KIND`
+> string arm is reachable, but **nothing in the 1,618-file corpus reached it** until #1844
+> added a fixture. A gate that cannot see a site cannot certify it, and a byte-identical
+> sweep says nothing about the arms no fixture exercises. The completeness gate is real (a
+> wrong heap index IS invalid wasm) but it is a *reachability* gate, and its reach is the
+> corpus, not the emitter.
+>
+> **The honest cost of the split, measured.** Stage 2b's own numbers: the self-compile
+> fixpoint grows **1 311 933 → 1 361 951 bytes (+3.8 %)** and self-compile wall time
+> **1.96 s → 2.00 s (+2 %)**, against a **7.2× drop in bytes allocated** by split-heavy
+> substring work (525 900 kB → 73 272 kB over 100 splits of a 1.22 M-code-point input).
+> An indexed read costs **+10 %** on an 800 M-iteration scan, because a view's bounds check
+> has to be explicit where a bare array's `array.get` trapped for free. Those are costs 2c
+> would have absorbed into one number; splitting makes them separately attributable, which is
+> the point. Full table in `../internals/string-rep-measurements.md` §2.5.
 
 > **The heap-type split (2a) is DONE and is not one of the two.** `string` had no heap
 > type of its own: it shared `aTypeIdx` with the i32 list's backing, so "change the

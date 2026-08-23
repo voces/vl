@@ -475,6 +475,27 @@ separate piece of work.**
 > Where a number here disagrees with `docs/guide/strings-design.md`, the
 > disagreement is stated rather than smoothed over.
 
+> **STATUS — the SLICE HEADER (Stage 2b) HAS LANDED, on top of Stage 2a.** `sTypeIdx` is now
+> the string HEADER — `(struct (field (ref $sBackIdx)) (field i32 $start) (field i32 $len))`,
+> all three fields immutable — and the code-point array moved down to a new index,
+> `sBackIdx`. **`s.slice(a, b)` allocates a header only**: same backing, `start` biased,
+> `len` set. `.length` is `struct.get $s 2`; `s[i]` is `backing[start + i]` behind the same
+> `i u< len` guard a list index gets, so an out-of-range index still TRAPS instead of reading
+> a sibling view's characters — that guard is NEW work and is the one place the header costs
+> per-access time (§2.5, remeasured below).
+>
+> **THE UNIT DID NOT MOVE.** Elements are still i32 code points, `.length` is still a
+> code-point count, `'é'.length` is still 1. Everything §2.3–§2.6 says about UNITS is still
+> ahead; what is now behind is everything they say about `slice` copying and about
+> `array.len` being the length. **UTF-8 storage is Stage 2c; the cached `$hash` is Stage 3**
+> and no hash logic is wired (it must move atomically with byte-level equality).
+>
+> The corpus buckets are file-for-file identical to master, which is the whole verification
+> argument for a stage that changes no semantics — see `../guide/strings-design.md`
+> §Migration for why the step was split and where that argument is weaker than it looks.
+>
+> Line numbers below are pre-2b as well as pre-2a; read them as site names.
+
 > **STATUS — the HEAP-TYPE SPLIT (Stage 2a) HAS LANDED.** `string` no longer shares
 > `aTypeIdx` with the i32 list's backing: it has its own index, `sTypeIdx`
 > (`compiler/emit_state.vl`, minted in `emit_collect.mAssignTypeIndices`, emitted
@@ -744,6 +765,90 @@ collapses to: eval receiver, clamp both bounds against `$len`,
 `struct.new $str (backing, start+a, b-a, 0)`. What goes away is
 `fbArrayNewDefault(aTypeIdx)` at `wasmEmit.vl:9384` and
 `fbArrayCopy(aTypeIdx, aTypeIdx)` at `:9392`.
+
+> **STAGE 2b RESULT — the prediction held for `slice` itself and UNDERSTATED the rest of
+> the stage by roughly an order of magnitude.** `emitStrSlice` did collapse exactly as
+> described (three fewer instructions, minus its `strScrOut` use). But "a deletion, and a
+> small one" describes ONE site, and this section is the whole brief for a stage that
+> touched **~18 lowerings** across four files — because every place that read an ELEMENT had
+> to learn `start`, and every place that read a LENGTH had to stop reading `array.len`:
+>
+> | what moved | sites |
+> |---|---|
+> | element reads that needed `backing` + `start` | `emitIndex`'s string arm, `emitStrCharCode`, `emitStrLessCore`, `emitStrIndexOf`, `emitPrintStrFromScratch`, `emitForInStmt`, `fbStrHashStep`, `emitStrEqFnCode`, `emitStrConcatFnCode` |
+> | length reads that had to stop being `array.len` | `emitArrLen`, `emitStrSlice`, `emitStrIndexOf`, `emitStrLessCore`, `__str_eq__`, `__str_hash__`, `__str_concat__`, `for cp in s` |
+> | constructors that had to wrap a header | `emitStr` (short + chunked), the pooled-literal GLOBAL init, `emitToString` (both arms), `fromCodePoint`, `fromCodePoints`, `__str_concat__` |
+>
+> **The one prediction in this section that inverted: the reservation scan did NOT have to
+> shrink.** §2.5 warned that `exprHasStrOp`'s `.slice` arm and `blockHasStrOpScan`'s `Member`
+> arm "must be **removed** in the same change, or every function containing a slice
+> over-reserves", and flagged removing an arm as the un-drilled direction of this family's
+> failure mode. Neither was removed and neither should be: the view lowering still stages the
+> receiver and three clamped bounds in the string-op frame (`strScrA`, `I0`–`I3`), so the
+> reservation is still needed in full. What actually happened to the frame is the OPPOSITE of
+> a shrink — it grew from **7 slots to 11**: `strScrOut` was re-typed from a finished string
+> to the BACKING under construction, and four slots were added (`strScrABk`/`strScrBBk`, the
+> two operands' hoisted backings, and `strScrAOff`/`strScrBOff`, their starts).
+>
+> **The `array.copy` inventory was right and complete.** All three named sites moved:
+> `wasmEmit.vl:9392` (slice — deleted outright), `emit_sections.vl:2165` (`__str_concat__`,
+> now copying from each operand's `start`), and `wasmEmit.vl:11460` (`__array_copy__`) —
+> though the third needed no change at all: it is gated on `exprArray` for both operands, so
+> a raw string never reached it. §2.5's "currently reachable with a string operand *because*
+> a string is `$aTypeIdx`" does not reproduce.
+>
+> **The aliasing argument held exactly as written.** No string element store exists, no
+> `ref.eq` on a string is reachable from user code, and the whole corpus is byte-identical.
+> The one place `ref.eq` DOES appear — `__str_eq__`'s identity fast path — now compares
+> HEADERS, which is still a sound short-circuit (a header equals itself) and still fires on
+> the literal pool (one global per distinct literal). What it stops covering is two distinct
+> headers over the same backing and range; those now walk. A lost optimisation, never a wrong
+> answer.
+>
+> **What a view costs, measured on this branch** (12th Gen i9-12900KF, wasmtime 47.0.2,
+> `VL_GC=none` so RSS delta is exactly bytes allocated):
+>
+> Two Stage-2b columns, because the USER-LOOP HOIST is a separate, separable decision and it
+> is not a free win — "2b−" is the header with the emitter's own loops hoisted but no
+> raw-string row in the loop-hoist table; "2b" is what shipped, with it. Medians of five
+> interleaved runs.
+>
+> | probe | master | 2b− (no user-loop hoist) | 2b (shipped) |
+> |---|---|---|---|
+> | 100 × `split` of a 1.22 M-code-point input — **bytes allocated** | 525 900 kB | 73 272 kB | 73 272 kB (**−86.1 %, 7.2×**) |
+> | the same, wall clock (`VL_GC=none`) | 0.54 s | 0.49 s (−9 %) | 0.52 s (−4 %) |
+> | the same, wall clock (`VL_GC=auto`, copying) | 0.46 s | — | 0.54 s (**+17 %**) |
+> | 800 M `s[i]` in a scan loop (`VL_GC=none`) | 0.80 s | 0.96 s (+20 %) | 0.88 s (**+10 %**) |
+> | compiler self-compile, wall | 1.96 s | 1.98 s | 2.00 s (+2 %) |
+> | compiler self-compile, peak RSS | 699 MB | — | 694 MB (−0.8 %) |
+> | the fixpoint module itself | 1 311 933 B | 1 358 292 B | 1 361 951 B (+3.8 %) |
+>
+> **The +10 % on the pure scan is the honest headline cost, and it is NOT the `struct.get`s.**
+> Those are hoisted out of the loop. What remains is the **bounds guard**: before Stage 2b a
+> string WAS its element array, so `array.get`'s own trap was the view's bounds check for
+> free. A view's backing outlives the view, so the check has to be explicit — a compare and a
+> `select` per access, which is exactly what an `i32[]` index has always paid. Strings did not
+> become slower than lists; they stopped being cheaper than lists.
+>
+> **The user-loop hoist is a WASH, and the two columns are why it is worth stating.** It buys
+> back half the scan regression (+20 % → +10 %) and gives back half the split win (−9 % →
+> −4 %), because its prologue is paid per loop ENTRY: a short loop inside a hot leaf function
+> (`std:str`'s `matchAt`, entered ~1.2 M times per round with a handful of iterations each)
+> pays three `struct.get`s and three `local.set`s it cannot amortize. §Header rules that the
+> lift happens in codegen rather than in binaryen, and it does; the measurement says the rule
+> is right for LONG scans and neutral-to-negative for short ones. The same property applies
+> to the pre-existing LIST hoist this rides on, which is not something that had been recorded.
+>
+> **The `VL_GC=auto` row is the one that argues against this stage** and is left in for that
+> reason: under the copying collector, allocating 7.2× less did **not** make the split
+> workload faster — it made it 17 % slower, because the collector was already absorbing the
+> old allocation rate cheaply while the per-access guard is paid on every character scanned.
+> The allocation win is real and shows up as RSS under a non-collecting or
+> allocation-rate-bound workload; on this box, under `auto`, it is not a wall-clock win.
+> **`slice` itself is unambiguously better** — O(1), zero element copies — and that is what
+> §Scanning's re-slicing cursor and §Header's "split a 1 MB file into 10k lines" claim were
+> asking for. What the numbers refuse is the wider claim that a header makes string PROGRAMS
+> faster; it makes substring EXTRACTION free and charges a little for every indexed read.
 
 **Nothing in the tree blocks aliasing**, which is the genuinely good news:
 

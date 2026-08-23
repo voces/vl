@@ -248,6 +248,7 @@ import {
   rlElemTyIx,
   rlTwin,
   rlWrapIdx,
+  sBackIdx,
   sDeclared,
   sFieldCount,
   sFieldElemKeyI32,
@@ -317,6 +318,10 @@ import {
   fbRefNullForKind,
   fbRefNullStruct,
   fbReturn,
+  fbStrBack,
+  fbStrLen,
+  fbStrNew,
+  fbStrStart,
   fbStructNew,
   fbUnreachable,
   fbValtype,
@@ -1888,19 +1893,23 @@ function helpFrameBody(out: i32[], body: i32[]) {
   0
 }
 
-// One `h = (h ^ s[i + k]) * 16777619` step of the FNV chain, against the
-// `__str_hash__` frame (s = param 0, h = local 1, i = local 2). `k == 0` skips
+// One `h = (h ^ back[i + k]) * 16777619` step of the FNV chain, against the
+// `__str_hash__` frame (back = local 5, h = local 1, i = local 2). `k == 0` skips
 // the offset add. Shared by the unrolled block and the remainder loop so the two
 // cannot drift into hashing differently.
+//
+// STAGE 2b: `i` is a BACKING offset, not a view offset — the prologue seeds it from the
+// header's `start` and bounds it at `start + len`, so the per-element cost is exactly what
+// it was and the header is read three times per CALL rather than once per code point.
 function fbStrHashStep(k: i32) {
   fbLocalGet(1)
-  fbLocalGet(0)
+  fbLocalGet(5)
   fbLocalGet(2)
   if k != 0 {
     fbI32Const(k)
     fbI32Bin(106) // i32.add (i + k)
   }
-  fbArrayGet(sTypeIdx)
+  fbArrayGet(sBackIdx)
   fbI32Bin(115) // 0x73 i32.xor
   fbI32Const(16777619)
   fbI32Bin(108) // 0x6c i32.mul
@@ -1935,20 +1944,31 @@ function fbStrHashStep(k: i32) {
 function emitStrHashFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
-  wULEB(1)                // 1 locals run
+  wULEB(2)                // 2 locals runs
   wULEB(4)                // count 4
-  wU8(127)                // 0x7f i32
+  wU8(127)                // 0x7f i32 (h, i, n, lim)
+  wULEB(1)                // count 1
+  wU8(99)                 // 0x63 (ref null ht) — the hoisted backing
+  wSLEB(sBackIdx)
   fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
   fbLocalSet(1)           // h
-  fbI32Const(0)
-  fbLocalSet(2)           // i = 0
-  fbLocalGet(0)           // s
-  fbArrayLen()
-  fbLocalSet(3)           // n = array.len(s)
+  // Hoist the header ONCE: backing into local 5, the cursor seeded to `start`, the bound to
+  // `start + len`. Every element step below then costs one `array.get` and no `struct.get`.
+  fbLocalGet(0)
+  fbStrBack()
+  fbLocalSet(5) // back = s.backing
+  fbLocalGet(0)
+  fbStrStart()
+  fbLocalSet(2) // i = s.start
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbStrLen()
+  fbI32Bin(106) // i32.add
+  fbLocalSet(3) // n = s.start + s.len  (one past the last offset)
   fbLocalGet(3)
   fbI32Const(4)
-  fbI32Bin(107)           // i32.sub
-  fbLocalSet(4)           // lim = n - 4
+  fbI32Bin(107) // i32.sub
+  fbLocalSet(4) // lim = n - 4
   // Wide block: while i <= lim { 4 chained steps ; i += 4 }
   fbLoop(64)    // loop, void
   fbLocalGet(2) // i
@@ -2038,14 +2058,53 @@ function emitStrHashFnCode(out: i32[]) {
 // null traps upstream of this helper. Both compilers run the probe (two null
 // `string | null` values compared with `==`) to the same `wasm trap: null
 // reference` at the same address; a reachable corner would have printed `EQ`.
+// The two element reads of `__str_eq__`, written as a PAIR so they cannot drift: `a[i + k]`
+// is `aBack[i + k]` (the cursor is already in A's backing coordinates) and `b[i + k]` is
+// `bBack[i + k + d]`. Frame: aBack(5), bBack(6), i(3), d(7). Used by both the eight-wide
+// block and the scalar remainder, so all four spellings of the read come from these two.
+function fbStrEqReadA(k: i32) {
+  fbLocalGet(5) // aBack
+  fbLocalGet(3) // i
+  if k > 0 {
+    fbI32Const(k)
+    fbI32Bin(106) // i32.add
+  }
+  fbArrayGet(sBackIdx)
+  0
+}
+function fbStrEqReadB(k: i32) {
+  fbLocalGet(6) // bBack
+  fbLocalGet(3) // i
+  fbLocalGet(7) // d = b.start - a.start
+  fbI32Bin(106) // i32.add
+  if k > 0 {
+    fbI32Const(k)
+    fbI32Bin(106) // i32.add
+  }
+  fbArrayGet(sBackIdx)
+  0
+}
+
 function emitStrEqFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
-  wULEB(1)     // 1 locals run
+  wULEB(3)     // 3 locals runs
   wULEB(3)     // count 3
-  wU8(127)     // 0x7f i32
+  wU8(127)     // 0x7f i32 (n, i, lim)
+  wULEB(2)     // count 2
+  wU8(99)      // 0x63 (ref null ht) — the two hoisted backings
+  wSLEB(sBackIdx)
+  wULEB(1)     // count 1
+  wU8(127)     // 0x7f i32 (d — b's start relative to a's)
   fbBlock(127) // block i32 — yields the 0/1 result
   // if ref.eq(a, b) { 1 ; br out }
+  //
+  // STAGE 2b NOTE ON THE IDENTITY FAST PATH: the operands are HEADERS now, so `ref.eq`
+  // compares views, not element arrays. It is still a pure short-circuit — the same header
+  // is trivially equal to itself — and it still fires on the literal pool (one global per
+  // distinct literal, so `tok.kind == "IDENT"` is still reference-identical). What it stops
+  // covering is two DISTINCT headers over the same backing and range, which now walk. That
+  // is a lost optimisation, never a wrong answer.
   fbLocalGet(0)
   fbLocalGet(1)
   wU8(211) // 0xd3 ref.eq
@@ -2053,58 +2112,66 @@ function emitStrEqFnCode(out: i32[]) {
   fbI32Const(1)
   fbBr(1)  // → out of the i32 block
   fbEnd()
-  // n = len(a) ; if n != len(b) { 0 ; br out }
+  // if a.len != b.len { 0 ; br out }
   fbLocalGet(0)
-  fbArrayLen()
-  fbLocalSet(2) // n
-  fbLocalGet(2)
+  fbStrLen()
   fbLocalGet(1)
-  fbArrayLen()
-  fbI32Bin(71)  // 0x47 i32.ne
-  fbIf(64)      // if, void
-  fbI32Const(0)
-  fbBr(1)       // → out of the i32 block
-  fbEnd()
-  // i = 0
-  fbI32Const(0)
-  fbLocalSet(3)
-  // SHORT-STRING GATE: skip the wide loop and its setup entirely unless a full
-  // block can run at least once. Strings shorter than the unroll factor are the
-  // common case in real programs (identifiers, keywords, tags), and for them the
-  // whole wide region is dead weight — one compare here replaces the limit
-  // computation plus a wide-loop trip test that could never succeed.
-  fbLocalGet(2)
-  fbI32Const(8)
-  fbI32Bin(78) // 0x4e i32.ge_s (n >= 8)
+  fbStrLen()
+  fbI32Bin(71) // 0x47 i32.ne
   fbIf(64)     // if, void
-  // lim = n - 8 — the last start index at which a full eight-element block fits.
+  fbI32Const(0)
+  fbBr(1)      // → out of the i32 block
+  fbEnd()
+  // Hoist BOTH headers once. The cursor `i` walks A's BACKING coordinates, so an A read is
+  // `aBack[i]` with no bias at all and a B read is `bBack[i + d]` for the one-time
+  // `d = b.start - a.start`. `n` is A's END offset (`a.start + a.len`).
+  fbLocalGet(0)
+  fbStrBack()
+  fbLocalSet(5) // aBack
+  fbLocalGet(1)
+  fbStrBack()
+  fbLocalSet(6) // bBack
+  fbLocalGet(0)
+  fbStrStart()
+  fbLocalSet(3) // i = a.start
+  fbLocalGet(3)
+  fbLocalGet(0)
+  fbStrLen()
+  fbI32Bin(106) // i32.add
+  fbLocalSet(2) // n = a.start + a.len
+  fbLocalGet(1)
+  fbStrStart()
+  fbLocalGet(3)
+  fbI32Bin(107) // 0x6b i32.sub
+  fbLocalSet(7) // d = b.start - a.start
+  // lim = n - 8 — the last cursor at which a full eight-element block fits. A SUBTRACTION
+  // rather than `i + 8 > n`: `n` is bounded by the backing's length and cannot overflow it,
+  // while `i + 8` on a maximal-length string could.
   fbLocalGet(2)
   fbI32Const(8)
   fbI32Bin(107) // 0x6b i32.sub
   fbLocalSet(4)
-  fbLoop(64)    // loop (eight wide), void
+  // SHORT-STRING GATE: skip the wide loop entirely unless a full block can run at least
+  // once. Strings shorter than the unroll factor are the common case in real programs
+  // (identifiers, keywords, tags), and for them the whole wide region is dead weight. The
+  // test is `lim >= i` rather than the pre-Stage-2b `n >= 8`, because `i` no longer starts
+  // at 0 — a VIEW starts at its own `start`, and `n >= 8` would then be asking about the
+  // parent's extent instead of this view's length.
+  fbLocalGet(4)
+  fbLocalGet(3)
+  fbI32Bin(78) // 0x4e i32.ge_s (lim >= i → at least one full block fits)
+  fbIf(64)     // if, void
+  fbLoop(64)   // loop (eight wide), void
   fbLocalGet(3)
   fbLocalGet(4)
-  fbI32Bin(74)  // 0x4a i32.gt_s (i > lim → no full block left)
-  fbIf(64)      // then: done (empty)
+  fbI32Bin(74) // 0x4a i32.gt_s (i > lim → no full block left)
+  fbIf(64)     // then: done (empty)
   fbElse()
   // acc = (a[i]^b[i]) | (a[i+1]^b[i+1]) | ... | (a[i+7]^b[i+7]), on the stack.
   let k = 0
   while k < 8 {
-    fbLocalGet(0) // a
-    fbLocalGet(3) // i
-    if k > 0 {
-      fbI32Const(k)
-      fbI32Bin(106) // i32.add
-    }
-    fbArrayGet(sTypeIdx)
-    fbLocalGet(1) // b
-    fbLocalGet(3) // i
-    if k > 0 {
-      fbI32Const(k)
-      fbI32Bin(106) // i32.add
-    }
-    fbArrayGet(sTypeIdx)
+    fbStrEqReadA(k)
+    fbStrEqReadB(k)
     fbI32Bin(115) // 0x73 i32.xor — 0 exactly when the pair matches
     if k > 0 {
       fbI32Bin(114) // 0x72 i32.or — fold into the accumulator
@@ -2133,12 +2200,8 @@ function emitStrEqFnCode(out: i32[]) {
   fbIf(64)     // then: done (empty)
   fbElse()
   // if a[i] != b[i] { 0 ; br out }
-  fbLocalGet(0)
-  fbLocalGet(3)
-  fbArrayGet(sTypeIdx)
-  fbLocalGet(1)
-  fbLocalGet(3)
-  fbArrayGet(sTypeIdx)
+  fbStrEqReadA(0)
+  fbStrEqReadB(0)
   fbI32Bin(71) // i32.ne
   fbIf(64)
   fbI32Const(0)
@@ -2159,10 +2222,15 @@ function emitStrEqFnCode(out: i32[]) {
   helpFrameBody(out, body)
 }
 
-// `__str_concat__(a, b) -> (ref str)`: allocate a fresh `lenA + lenB` string and
-// `array.copy` both operands in. Params: a(0), b(1). Locals: lenA(2), lenB(3) i32;
-// out(4) a NON-NULL `(ref $aTypeIdx)` (set before every read — validation accepts
-// a non-defaultable local under init tracking).
+// `__str_concat__(a, b) -> (ref str)`: allocate a fresh `lenA + lenB` BACKING, `array.copy`
+// both operands' live ranges in, and wrap a whole-backing header around it. Params: a(0),
+// b(1). Locals: lenA(2), lenB(3) i32; out(4) a NON-NULL `(ref $sBackIdx)` (set before every
+// read — validation accepts a non-defaultable local under init tracking).
+//
+// CONCAT IS THE ONE STRING OP A VIEW CANNOT MAKE CHEAPER — two disjoint ranges have to
+// become one contiguous run, so this still allocates and still copies. What Stage 2b changes
+// is that each `array.copy` reads from its operand's `start`, not from 0: an operand that is
+// itself a view would otherwise concatenate its PARENT's leading characters.
 function emitStrConcatFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
@@ -2170,36 +2238,46 @@ function emitStrConcatFnCode(out: i32[]) {
   wULEB(2) // count 2
   wU8(127) // 0x7f i32 (lenA, lenB)
   wULEB(1) // count 1
-  wU8(100) // 0x64 (ref $aTypeIdx) — out
-  wSLEB(sTypeIdx)
-  // lenA = len(a) ; lenB = len(b)
+  wU8(100) // 0x64 (ref $sBackIdx) — out
+  wSLEB(sBackIdx)
+  // lenA = a.len ; lenB = b.len
   fbLocalGet(0)
-  fbArrayLen()
+  fbStrLen()
   fbLocalSet(2)
   fbLocalGet(1)
-  fbArrayLen()
+  fbStrLen()
   fbLocalSet(3)
-  // out = array.new_default $aTypeIdx (lenA + lenB)
+  // out = array.new_default $sBackIdx (lenA + lenB)
   fbLocalGet(2)
   fbLocalGet(3)
   fbI32Bin(106) // i32.add
-  fbArrayNewDefault(sTypeIdx)
+  fbArrayNewDefault(sBackIdx)
   fbLocalSet(4)
-  // array.copy out 0 a 0 lenA
+  // array.copy out 0 a.backing a.start lenA
   fbLocalGet(4)
   fbI32Const(0)
   fbLocalGet(0)
-  fbI32Const(0)
+  fbStrBack()
+  fbLocalGet(0)
+  fbStrStart()
   fbLocalGet(2)
-  fbArrayCopy(sTypeIdx, sTypeIdx)
-  // array.copy out lenA b 0 lenB
+  fbArrayCopy(sBackIdx, sBackIdx)
+  // array.copy out lenA b.backing b.start lenB
   fbLocalGet(4)
   fbLocalGet(2)
   fbLocalGet(1)
-  fbI32Const(0)
+  fbStrBack()
+  fbLocalGet(1)
+  fbStrStart()
   fbLocalGet(3)
-  fbArrayCopy(sTypeIdx, sTypeIdx)
+  fbArrayCopy(sBackIdx, sBackIdx)
+  // The header over the exact-fit backing.
   fbLocalGet(4)
+  fbI32Const(0)
+  fbLocalGet(2)
+  fbLocalGet(3)
+  fbI32Bin(106) // i32.add
+  fbStrNew()
   fbEnd() // end (function) — leaves the fresh string ref
   wTarget(prev)
   helpFrameBody(out, body)
@@ -3887,14 +3965,29 @@ function emitTypeSection(
     wU8(94)  // 0x5e array ($aTypeIdx — the i32-list / map backing)
     wU8(127) // 0x7f i32 storagetype
     wU8(1)   // mutable
-    // `string`'s OWN array heap type ($sTypeIdx), minted from the same `aUsed` flag and
-    // emitted immediately after it (`mAssignTypeIndices` allocates the pair in this order).
-    // STRUCTURALLY IDENTICAL to the one above at Stage 2a — a string is still an
-    // `(array (mut i32))` of code points; only the INDEX is now the string's own, which is
-    // what the UTF-8 storage change needs in order to be a one-line edit here.
+    // `string`'s OWN BACKING array heap type ($sBackIdx), minted from the same `aUsed` flag
+    // and emitted immediately after it (`mAssignTypeIndices` allocates the triple in this
+    // order). STRUCTURALLY IDENTICAL to the one above — the elements are still i32 CODE
+    // POINTS at Stage 2b; only the INDEX is the string's own, which is what the UTF-8 storage
+    // change (Stage 2c) needs in order to be a one-line edit here.
     wU8(94)  // 0x5e array
     wU8(127) // 0x7f i32 storagetype
     wU8(1)   // mutable
+    // THE STRING HEADER ($sTypeIdx) — Stage 2b. A `string` VALUE is this struct, a VIEW over
+    // the backing above: `{ backing: (ref $sBackIdx), start: i32, len: i32 }`. All three
+    // fields are IMMUTABLE, which is the representation-level statement of §Mutability —
+    // strings are immutable, so a view can alias its parent's backing with no invalidation
+    // risk and `slice` needs no defensive copy. Field indices are fixed by this order:
+    // backing=0, start=1, len=2.
+    wU8(95)         // 0x5f struct
+    wU8(3)          // 3 fields
+    wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
+    wSLEB(sBackIdx) // ...to the string backing array
+    wU8(0)          // immutable
+    wU8(127)        // field 1 start: 0x7f i32
+    wU8(0)          // immutable
+    wU8(127)        // field 2 len: 0x7f i32
+    wU8(0)          // immutable
   }
   if lUsed {
     wU8(95)         // 0x5f struct
@@ -4579,7 +4672,12 @@ function emitGlobalSection() {
     // The string-literal POOL first (indices 0..np-1, before the user cells — see
     // `gStrPoolTexts`): each entry an IMMUTABLE non-null string ref whose init
     // constexpr builds the literal once (`i32.const` per code point +
-    // `array.new_fixed` — every pooled literal fits the cap by construction).
+    // `array.new_fixed` for the backing, then `struct.new` for the whole-backing header —
+    // every pooled literal fits the cap by construction).
+    //
+    // `array.new_fixed` and `struct.new` are BOTH constant instructions under the GC
+    // proposal, so the header construction stays inside the init constexpr and the pool
+    // remains one `global.get` at every use site.
     let pli = 0
     while pli < np {
       wU8(100) // 0x64 (ref $sTypeIdx) — non-null string ref
@@ -4591,8 +4689,11 @@ function emitGlobalSection() {
         fbI32Const(pcps[pci])
         pci = pci + 1
       }
-      fbArrayNewFixed(sTypeIdx, pcps.length)
-      fbEnd() // 0x0b end of init expr
+      fbArrayNewFixed(sBackIdx, pcps.length)
+      fbI32Const(0)           // start
+      fbI32Const(pcps.length) // len
+      fbStrNew()              // 0xfb 0x00 <string header>
+      fbEnd()                 // 0x0b end of init expr
       pli = pli + 1
     }
     let gi = 0

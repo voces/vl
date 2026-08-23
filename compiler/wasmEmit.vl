@@ -301,6 +301,7 @@ import {
   rlElemNullable,
   rlUsed,
   rlWrapIdx,
+  sBackIdx,
   sDeclared,
   sFieldCount,
   sFieldNames,
@@ -379,6 +380,10 @@ import {
   fbReturn,
   fbReturnCall,
   fbSelect,
+  fbStrBack,
+  fbStrLen,
+  fbStrNew,
+  fbStrStart,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -394,6 +399,7 @@ import {
   lhScanName,
   lhScanRep,
   lhSlot,
+  lhStart,
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
@@ -4920,20 +4926,20 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
 // ── string-literal decoding ───────────────────────────────────────────────────
 // A `StrLit` carries the RAW lexeme in `strText` (surrounding quotes kept, escapes
 // UNRESOLVED — see `parser.vl`'s `mkStr` of the STRING token's raw text), so the emitter decodes it
-// here to the sequence of Unicode CODE POINTS the string denotes. Because a VL string
-// is itself a code-point `array i32` (this very representation), `strText[i]` already
+// here to the sequence of Unicode CODE POINTS the string denotes. Because a VL string's
+// ELEMENTS are code points (still true at Stage 2b — only the wrapper changed), `strText[i]` already
 // yields the i32 code point of the i-th source char, so decoding is a direct walk over
 // those code points with the same escape grammar the lexer applies (`scanQuoted`):
 // `\n \t \r \\ \" \' \0 \b \f \v`, `\xXX`, `\uXXXX`, `\u{…}`. The result is the
 // emittable code-point vector that `emitStr` lowers to `array.new_fixed`.
 
 // Lower a string literal `"abc"` onto `body`: decode `strText` to its code-point
-// vector, push each code point as `i32.const`, then `array.new_fixed $aTypeIdx <count>`
-// — i.e. the IDENTICAL shape an `i32[]` literal of those code points uses (a string is
-// CURRENTLY an `array i32` of code points; `docs/strings-design.md`). A literal past
-// the `array.new_fixed` operand cap builds CHUNKED (`arrLitChunkStart`/`arrLitChunkFlush`)
-// — same value, engine-valid module. The UTF-8 `array i8` storage migration is the
-// deliberate B7 follow-up and is NOT built here.
+// vector, push each code point as `i32.const`, then `array.new_fixed $sBackIdx <count>` for
+// the backing and `struct.new $sTypeIdx` for the whole-backing header (Stage 2b). A literal
+// past the `array.new_fixed` operand cap builds the BACKING chunked
+// (`arrLitChunkStart`/`arrLitChunkFlush`) and wraps once at the end — same value,
+// engine-valid module. The UTF-8 `array i8` storage migration (Stage 2c) is the deliberate
+// follow-up and is NOT built here.
 function emitStr(_body: i32[], strIx: i32, _fnIx: i32) {
   if !aUsed {
     return emitFail("emitProgram: string literal but array type not collected")
@@ -4951,18 +4957,21 @@ function emitStr(_body: i32[], strIx: i32, _fnIx: i32) {
     const cps = decodeStr(strToCps(s.strText))
     if cps.length > NEW_FIXED_MAX {
       // Past the engines' `array.new_fixed` operand cap — build chunked (an
-      // unchunked emit validates nowhere). A string IS the raw i32 code-point
-      // array, so the finished backing is the value itself.
-      const dst = arrLitChunkStart("i32", 0, sTypeIdx, cps.length, true)
+      // unchunked emit validates nowhere). The chunked build fills the BACKING;
+      // the header is wrapped around it once the last chunk has landed.
+      const dst = arrLitChunkStart("i32", 0, sBackIdx, cps.length, true)
       let ci = 0
       let coff = 0
       while ci < cps.length {
         fbI32Const(cps[ci])
         ci = ci + 1
-        coff = arrLitChunkFlush(dst, sTypeIdx, coff, ci, cps.length)
+        coff = arrLitChunkFlush(dst, sBackIdx, coff, ci, cps.length)
       }
       fbLocalGet(dst)
-      wU8(212) // 0xd4 ref.as_non_null (the slot is declared nullable)
+      wU8(212)               // 0xd4 ref.as_non_null (the slot is declared nullable)
+      fbI32Const(0)          // start
+      fbI32Const(cps.length) // len
+      fbStrNew()             // the view over the whole freshly built backing
       return 0
     }
     let i = 0
@@ -4970,7 +4979,10 @@ function emitStr(_body: i32[], strIx: i32, _fnIx: i32) {
       fbI32Const(cps[i]) // 0x41 i32.const <code point>
       i = i + 1
     }
-    fbArrayNewFixed(sTypeIdx, cps.length) // 0xfb 0x08 <typeidx> <count>; type shared with i32[]
+    fbArrayNewFixed(sBackIdx, cps.length) // 0xfb 0x08 <typeidx> <count>
+    fbI32Const(0)                         // start
+    fbI32Const(cps.length)                // len
+    fbStrNew()                            // 0xfb 0x00 <string header>
     return 0
   }
   emitFail("emitProgram: expected a string literal")
@@ -7554,6 +7566,10 @@ function emitListIdxGuardHoisted(row: i32) {
 // classifier disagreement between the prologue and the access DECLINE rather
 // than read a wrongly-typed local: the prologue cached whatever rep it resolved,
 // and an arm that resolved a different one falls through to the general guard.
+// A raw-STRING row is keyed (kind "i32", slot -1) and an i32-LIST row (kind "i32", slot 0),
+// so the triple compare below already separates them: an i32-list arm asking with slot 0
+// cannot match a string row and vice versa. Worth stating because raw strings and i32 lists
+// are the only two reps in this table that share a KIND.
 function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
   if exprIx < 0 { return 0 - 1 }
   const e = P.nodes[exprIx]
@@ -7596,6 +7612,52 @@ function listHoistRow(name: string, kind: MfKind, slot: i32) {
   lhSlot.push(slot)
   lhBack.push(bSlot)
   lhLen.push(lSlot)
+  lhStart.push(0 - 1) // a list header has no `start`
+  lhLive.push(0)
+  lhName.length - 1
+}
+
+// A raw-string row is keyed (kind "i32", slot -1) — distinct from the i32-LIST rows, which
+// are (kind "i32", slot 0), so the two can never be confused by `liveHoistRow`'s rep check.
+// `hoistRowIsStr` reads the same pair.
+function hoistRowIsStr(row: i32) { lhKind[row] == "i32" && lhSlot[row] < 0 }
+
+// Find (or mint) the hoist row for raw STRING binding `name`. Minting takes THREE slots of
+// the lazy list frame — the backing ref (`liBack` 5, `(ref null $sBackIdx)`; code 3 with kind
+// "i32" would type it `$aTypeIdx`), then the i32 `start` and the i32 `len` (both `liBack` 4).
+//
+// EXISTS BECAUSE STAGE 2b MADE `s[i]` A THREE-FIELD READ. Unhoisted, a scan loop pays
+// `struct.get` ×3 plus a select per code point where it used to pay one `array.get`; measured
+// at +20% on an 800M-iteration `while i < s.length { acc = acc + s[i] }`. The header is
+// loop-invariant by CONSTRUCTION — strings are immutable, the three fields are declared
+// immutable in the type section, and there is no string element store anywhere in the emitter
+// — so nothing but a rebinding of the NAME can invalidate the cache, which
+// `blockReboundsName` already refuses. §Header rules that the lift happens here rather than
+// in binaryen, whose LICM is not guaranteed to move a GC `struct.get` out of a loop body.
+function strHoistRow(name: string) {
+  let k = 0
+  while k < lhName.length {
+    if lhName[k] == name && hoistRowIsStr(k) { return k }
+    k = k + 1
+  }
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(5)
+  const sbSlot = listIdxScratchBase + liKinds.length
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(4)
+  const stSlot = listIdxScratchBase + liKinds.length
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(4)
+  const slSlot = listIdxScratchBase + liKinds.length
+  lhName.push(name)
+  lhKind.push("i32")
+  lhSlot.push(0 - 1)
+  lhBack.push(sbSlot)
+  lhLen.push(slSlot)
+  lhStart.push(stSlot)
   lhLive.push(0)
   lhName.length - 1
 }
@@ -7622,6 +7684,100 @@ function listBackStashSlot(kind: MfKind, slot: i32) {
   liSlots.push(slot)
   liBack.push(1)
   listIdxScratchBase + liKinds.length
+}
+
+// The STRING-HEADER stash slot — a `liBack == 6` entry of the same lazy list frame,
+// `(ref null $sTypeIdx)`. Deduped per function: every `s[i]` / `s.charCodeAt(i)` in one
+// function shares it, which is safe under the SAME nested-op discipline the string-op frame
+// runs on — the receiver is stashed only after BOTH the receiver and the index expression
+// have fully evaluated onto the wasm stack, so a nested string index inside either one has
+// already come and gone through this slot.
+//
+// EXISTS BECAUSE Stage 2b made a `string` a HEADER. `s[i]` needs `backing`, `start` and `len`
+// off ONE evaluation of the receiver, and `struct.get` consumes the ref — so the receiver has
+// to land in a local. It rides the LAZY frame (minted during lowering) rather than the
+// string-op frame precisely so no reservation-scan arm has to learn about it: `emitStrCharCode`
+// deliberately has no `exprHasStrOp` arm (`emit_classify.vl`), and a plain `s[i]` never had one.
+function strHdrSlot() {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == 6 { return listIdxScratchBase + 1 + k }
+    k = k + 1
+  }
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(6)
+  listIdxScratchBase + liKinds.length
+}
+
+// Lower the bounds guard of a raw-string `s[i]` read. On entry the stack holds
+// [string, index] — both FULLY evaluated. Leaves [backing, offset] where `offset` is
+// `start + i` when `i u< len` and `-1` otherwise, so the following `array.get $sBackIdx`
+// TRAPS at its own instruction exactly as the pre-header `array.get` over the bare array did.
+//
+// THE GUARD IS NOT DECORATION AND NOT COPIED FROM THE LIST ARM FOR SYMMETRY. Before Stage 2b
+// a string WAS its element array, so `array.get`'s own bounds check against the physical
+// length was the semantics. A view's backing is longer than the view, so an unguarded
+// `array.get (start + i)` would silently return a SIBLING VIEW'S character for an
+// out-of-range `i` instead of trapping. Note the select is over the FINAL OFFSET, not over
+// the index: `start + (-1)` is a perfectly valid backing index whenever `start > 0`.
+function emitStrIdxGuard() {
+  const hs = strHdrSlot()
+  fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
+  fbLocalSet(hs)                 // 0x21 local.set — stash the string header
+  fbLocalGet(hs)
+  fbStrBack()                    // field 0: backing
+  fbLocalGet(hs)
+  fbStrStart()                   // field 1: start
+  fbLocalGet(listIdxScratchBase)
+  fbI32Bin(106)                  // 0x6a i32.add → start + i   [a]
+  fbI32Const(-1)                 // the out-of-range replacement offset  [b]
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(hs)
+  fbStrLen()                     // field 2: len
+  fbI32Bin(73)                   // 0x49 i32.lt_u (covers negative + past-len)
+  wU8(27)                        // 0x1b select → start+i if in-bounds else -1
+  0
+}
+
+// Mint a FRESH `(ref null $sBackIdx)` lazy-frame slot — the same `liBack` 5 typing a chunked
+// string literal's destination gets, without emitting anything. Fresh and never deduped: the
+// caller holds the backing live across a whole loop, so two nested `for cp in s` loops
+// sharing one slot would clobber the outer one's backing with the inner one's.
+function strBackSlot() {
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(5)
+  listIdxScratchBase + liKinds.length
+}
+
+// Mint a FRESH i32 lazy-frame slot (`liBack` 4, the same code a hoisted list `len` uses).
+// Fresh for the same reason `strBackSlot` is.
+function strI32Slot() {
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(4)
+  listIdxScratchBase + liKinds.length
+}
+
+// The HOISTED twin of `emitStrIdxGuard`, for a `s[i]` whose receiver is a binding with a live
+// cached header. On entry the stack holds ONLY the index — the receiver was never emitted,
+// because backing / start / len are already in locals — and it leaves the same
+// [backing, offset] pair, with the same `-1`-on-out-of-range meaning, that the general form
+// leaves. THE BOUNDS CHECK IS NOT WEAKENED: it compares against the same `len`, read once
+// before the loop instead of once per access.
+function emitStrIdxGuardHoisted(row: i32) {
+  fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
+  fbLocalGet(lhBack[row])        // the cached backing (was `struct.get` field 0)
+  fbLocalGet(lhStart[row])       // the cached start   (was `struct.get` field 1)
+  fbLocalGet(listIdxScratchBase)
+  fbI32Bin(106)                  // 0x6a i32.add → start + i   [a]
+  fbI32Const(-1)                 // the out-of-range replacement offset  [b]
+  fbLocalGet(listIdxScratchBase)
+  fbLocalGet(lhLen[row])         // the cached len     (was `struct.get` field 2)
+  fbI32Bin(73)                   // 0x49 i32.lt_u
+  wU8(27)                        // 0x1b select
+  0
 }
 
 function listIdxValSlot(kind: MfKind, slot: i32) {
@@ -7938,6 +8094,19 @@ function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
     if !scalarListUsed(ek) { return 0 - 1 }
     return listHoistRow(name, listIdxKindOf(ek), 0)
   }
+  // A RAW STRING receiver (Stage 2b). LAST, after every list rep: a string is not a list and
+  // `exprString` must not get a chance to answer for one.
+  //
+  // The `| null` niche DECLINES, for the same reason `exprNullableList` declines two arms up
+  // and for the same measured reason: the prologue reads the header ABOVE the guard that
+  // proves the value present, so `while t != null && t[0] == 'x'` would hoist a `struct.get`
+  // in front of the null test and trap on a null `t`. `exprNullableString` is documented as
+  // STRICTLY WIDER than `exprString`, so declining on it is the conservative side.
+  if exprString(recvIx, fnIx) {
+    if !aUsed { return 0 - 1 }
+    if exprNullableString(recvIx, fnIx) { return 0 - 1 }
+    return strHoistRow(name)
+  }
   0 - 1
 }
 
@@ -7999,15 +8168,32 @@ function loopHoistOpen(
       if rep is Index {
         const row = hoistRowOfRecv(rep.idxArr, nm, fnIx)
         if row >= 0 && lhLive[row] == 0 {
-          const wrapTy = hoistWrapTyOfRow(row)
           const savedHF32 = pendingF32
           pendingF32 = false
-          if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
-          fbStructGet(wrapTy, 0) // field 0: backing
-          fbLocalSet(lhBack[row])
-          if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
-          fbStructGet(wrapTy, 1) // field 1: len
-          fbLocalSet(lhLen[row])
+          if hoistRowIsStr(row) {
+            // A RAW STRING's header is `{backing, start, len}` — THREE reads, because a
+            // view's element offset is `start + i` and its bound is `len`, and neither is
+            // recoverable from the other two. The list arm below reads two; keeping the two
+            // spellings in one `if` (rather than a second copy of `loopHoistOpen`) is what
+            // stops them drifting.
+            if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+            fbStrBack()
+            fbLocalSet(lhBack[row])
+            if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+            fbStrStart()
+            fbLocalSet(lhStart[row])
+            if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+            fbStrLen()
+            fbLocalSet(lhLen[row])
+          } else {
+            const wrapTy = hoistWrapTyOfRow(row)
+            if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+            fbStructGet(wrapTy, 0) // field 0: backing
+            fbLocalSet(lhBack[row])
+            if emitExpr(body, rep.idxArr, fnIx) < 0 { return 0 - 1 }
+            fbStructGet(wrapTy, 1) // field 1: len
+            fbLocalSet(lhLen[row])
+          }
           pendingF32 = savedHF32
           lhLive[row] = 1
           lhOpen.push(row)
@@ -8198,10 +8384,17 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
     if !exprString(nd.idxArr, fnIx) {
       return emitFail("emitProgram: index receiver is not an array or string")
     }
-    // A raw string `s[i]` — the `(array i32)` of code points, indexed directly (no unwrap).
-    if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+    // A raw string `s[i]` — Stage 2b: the receiver is a HEADER, so the read is
+    // `backing[start + i]` behind the `i u< len` guard that keeps an out-of-range index
+    // trapping instead of reading past the view into the rest of the backing. A binding with
+    // a live LOOP-HOISTED header skips the receiver entirely and reads three locals.
+    const shz = liveHoistRow(nd.idxArr, "i32", 0 - 1)
+    if shz < 0 {
+      if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
+    }
     if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-    fbArrayGet(sTypeIdx) // 0xfb 0x0b <raw array type index>
+    if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
+    fbArrayGet(sBackIdx) // 0xfb 0x0b <string backing array type index>
     return 0
   }
   emitFail("emitProgram: expected an index access")
@@ -8241,30 +8434,45 @@ function emitArrLen(body: i32[], memIx: i32, fnIx: i32) {
       fbStructGet(scalarListWrap(lek), 1) // field 1: len
       return 0
     }
-    const isList = exprArray(m.memObj, fnIx)
-    if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
-    if isList {
+    if exprArray(m.memObj, fnIx) {
+      if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
       fbStructGet(lTypeIdx, 1) // 0xfb 0x02 <list wrapper struct type index> field 1: len
       return 0
     }
-    fbArrayLen() // 0xfb 0x0f array.len (no type-index operand)
+    // A raw STRING's `.length` is the HEADER's `len` field (Stage 2b) — NOT `array.len`,
+    // which is the BACKING's physical length and would report a parent string's length for
+    // every view of it. THE ARM IS SPELLED OUT AND THE FALLTHROUGH REJECTS. Before Stage 2b
+    // the string case WAS the fallthrough and `array.len` happened to be right for it; that
+    // made this a 5-arm ladder under an 8-predicate gate (`emitMemberNode`) whose leftover
+    // admitted anything the gate let through. Now the fallthrough would be a `struct.get $str
+    // 2` applied to whatever else arrives, which is invalid wasm at best and a wrong integer
+    // at worst — so it fails loudly instead.
+    if !exprString(m.memObj, fnIx) {
+      return emitFail("emitProgram: .length receiver is not an array or string")
+    }
+    if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
+    fbStrLen() // 0xfb 0x02 <string header> field 2: len
     return 0
   }
   emitFail("emitProgram: expected a length access")
 }
 
 // ── G6: string concatenation / value-equality / slice ────────────────────────
-// Strings are WasmGC `(array (mut i32))` of code points, so all three lower to the
-// same array machinery the list `.push` uses (`array.new_default`/`array.copy`/
-// `array.get`/`array.len`), INLINE — no helper functions. Each routine evaluates
+// A string is a `{backing, start, len}` VIEW over a WasmGC `(array (mut i32))` of code
+// points (Stage 2b), so these lower to the same array machinery the list `.push` uses
+// (`array.new_default`/`array.copy`/`array.get`) over the BACKING, with the header read once
+// per op into the frame's hoist slots.  `.slice` no longer allocates elements at all — it is
+// one `struct.new` over the receiver's backing. Each routine evaluates
 // BOTH operands onto the stack FIRST, then stashes them into the shared string
-// scratch frame (`strScratchBase`+0/+1/+2 = string refs A/B/Out; +3/+4/+5/+6 = i32
-// temps) — so a NESTED string op (an operand that is itself a `+`/`==`/`.slice`)
+// scratch frame (`strScratchBase` +0/+1 = the two string HEADERS A/B, +2 = the BACKING a
+// builder fills, +3..+6 = i32 temps, +7/+8 = A/B's hoisted backings, +9/+10 = their
+// starts) — so a NESTED string op (an operand that is itself a `+`/`==`/`.slice`)
 // fully completes and leaves its result on the stack BEFORE any scratch `local.set`,
 // and the single frame is safe to share. Mirrors `toWasm.ts`'s string `+`/`==`/
 // `__string_slice__` shapes, just without the named helper functions.
 
-// `local.get` of string scratch local `n` (0=A, 1=B, 2=Out).
+// `local.get` of string scratch local `n` (0 = header A, 1 = header B, 2 = the Out BACKING —
+// Stage 2b re-typed slot 2 from a finished string to the element array under construction).
 function pushStrScrRef(_body: i32[], n: i32) {
   fbLocalGet(strScratchBase + n) // 0x20 local.get
   0
@@ -8279,6 +8487,49 @@ function pushStrScrI(_body: i32[], n: i32) {
 // `local.set` of i32 scratch temp `n`.
 function setStrScrI(_body: i32[], n: i32) {
   fbLocalSet(strScratchBase + 3 + n) // 0x21 local.set
+  0
+}
+
+// ── the Stage-2b hoist half of the string-op frame ───────────────────────────
+// A `string` is a HEADER now, so an element loop that reads `A[i]` per step would pay two
+// `struct.get`s (backing, start) on every trip. `hoistStrScr` reads them ONCE into the
+// frame's last four slots — `strScrABk`/`strScrBBk` at +7/+8 and `strScrAOff`/`strScrBOff`
+// at +9/+10 — and `pushStrScrBase` re-pushes the pair. The lift is done HERE, in codegen,
+// rather than left to binaryen: LICM over a GC `struct.get` is not guaranteed (the loads are
+// from a GC object, not linear memory), and §Header rules that this compiler hoists rather
+// than relies on the optimizer.
+//
+// The operands are IMMUTABLE (the header's three fields are declared immutable in the type
+// section and no string element store exists — `emitAssign`'s `Index` target has no
+// raw-string arm), so the hoist can never go stale within the op that took it.
+
+// Hoist operand `n` (0 = A, 1 = B) — its header must already be in `strScratchBase + n`.
+function hoistStrScr(_body: i32[], n: i32) {
+  fbLocalGet(strScratchBase + n)
+  fbStrBack()
+  fbLocalSet(strScratchBase + 7 + n)
+  fbLocalGet(strScratchBase + n)
+  fbStrStart()
+  fbLocalSet(strScratchBase + 9 + n)
+  0
+}
+
+// Push `[backing_n, start_n]` for a hoisted operand — the caller adds its own index and
+// closes with `array.get $sBackIdx`.
+function pushStrScrBase(_body: i32[], n: i32) {
+  fbLocalGet(strScratchBase + 7 + n)
+  fbLocalGet(strScratchBase + 9 + n)
+  0
+}
+
+// `[.., i] -> [.., backing_n[start_n + i]]` is not expressible (the base has to go under the
+// index), so this is the whole read for the common `operand[<i32 temp>]` shape: push the
+// hoisted base, push temp `t`, add, read.
+function pushStrScrElem(body: i32[], n: i32, t: i32) {
+  pushStrScrBase(body, n)
+  pushStrScrI(body, t)
+  fbI32Bin(106) // 0x6a i32.add — start_n + t
+  fbArrayGet(sBackIdx)
   0
 }
 
@@ -8308,13 +8559,19 @@ function emitToString(body: i32[], callIx: i32, fnIx: i32) {
       fbI32Const(114) // 'r'
       fbI32Const(117) // 'u'
       fbI32Const(101) // 'e'
-      fbArrayNewFixed(sTypeIdx, 4)
+      fbArrayNewFixed(sBackIdx, 4)
+      fbI32Const(0)
+      fbI32Const(4)
+      fbStrNew()      // the whole-backing view "true"
       fbI32Const(102) // 'f'
       fbI32Const(97)  // 'a'
       fbI32Const(108) // 'l'
       fbI32Const(115) // 's'
       fbI32Const(101) // 'e'
-      fbArrayNewFixed(sTypeIdx, 5)
+      fbArrayNewFixed(sBackIdx, 5)
+      fbI32Const(0)
+      fbI32Const(5)
+      fbStrNew()      // the whole-backing view "false"
       if emitExpr(body, argIx, fnIx) < 0 { return -1 }
       wU8(28)         // 0x1c select_t
       wU8(1)          // one valtype
@@ -8363,11 +8620,12 @@ function emitToString(body: i32[], callIx: i32, fnIx: i32) {
     fbBr(0)
     fbEnd()       // end loop
     fbEnd()       // end block
-    // Out = array.new_default (len = I2 + I1)
+    // Out = array.new_default (len = I2 + I1) — the BACKING; the header is wrapped
+    // around it at the end, when the digits are in.
     pushStrScrI(body, 2)
     pushStrScrI(body, 1)
     fbI32Bin(106) // i32.add
-    fbArrayNewDefault(sTypeIdx)
+    fbArrayNewDefault(sBackIdx)
     fbLocalSet(strScratchBase + 2)
     // if I1 { Out[0] = '-' }
     pushStrScrI(body, 1)
@@ -8375,7 +8633,7 @@ function emitToString(body: i32[], callIx: i32, fnIx: i32) {
     pushStrScrRef(body, 2)
     fbI32Const(0)
     fbI32Const(45) // '-'
-    fbArraySet(sTypeIdx)
+    fbArraySet(sBackIdx)
     fbEnd()
     // write cursor I3 = I1 + I2 - 1 (the last index)
     pushStrScrI(body, 1)
@@ -8391,27 +8649,34 @@ function emitToString(body: i32[], callIx: i32, fnIx: i32) {
     fbLoop(64)
     pushStrScrRef(body, 2)
     pushStrScrI(body, 3)
-    fbI32Const(48)         // '0'
+    fbI32Const(48) // '0'
     pushStrScrI(body, 0)
     fbI32Const(10)
-    fbI32Bin(111)          // 0x6f i32.rem_s (negative for a negative I0)
-    fbI32Bin(107)          // 0x6b i32.sub — 48 - (-d) = 48 + d
-    fbArraySet(sTypeIdx)
+    fbI32Bin(111)  // 0x6f i32.rem_s (negative for a negative I0)
+    fbI32Bin(107)  // 0x6b i32.sub — 48 - (-d) = 48 + d
+    fbArraySet(sBackIdx)
     pushStrScrI(body, 0)
     fbI32Const(10)
-    fbI32Bin(109)          // i32.div_s
+    fbI32Bin(109)  // i32.div_s
     setStrScrI(body, 0)
     pushStrScrI(body, 3)
     fbI32Const(1)
-    fbI32Bin(107)          // i32.sub
+    fbI32Bin(107)  // i32.sub
     setStrScrI(body, 3)
     pushStrScrI(body, 0)
-    fbI32Eqz()             // 0x45 — exit when I0 == 0
+    fbI32Eqz()     // 0x45 — exit when I0 == 0
     fbBrIf(1)
     fbBr(0)
-    fbEnd()                // end loop
-    fbEnd()                // end block
-    pushStrScrRef(body, 2) // the built string
+    fbEnd()        // end loop
+    fbEnd()        // end block
+    // The header over the exact-fit backing: start 0, len = sign + digits (I1 + I2, both
+    // still live — only I0 and I3 move in the write loop above).
+    pushStrScrRef(body, 2) // the built BACKING
+    fbI32Const(0)
+    pushStrScrI(body, 1)
+    pushStrScrI(body, 2)
+    fbI32Bin(106)          // i32.add — the length written
+    fbStrNew()
     return 0
   }
   emitFail("emitProgram: expected a toString call")
@@ -8537,13 +8802,17 @@ function emitStrOrder(body: i32[], binIx: i32, fnIx: i32) {
 function emitStrLessCore(body: i32[]) {
   fbLocalSet(strScratchBase + 1) // B (stack top)
   fbLocalSet(strScratchBase + 0) // A
-  fbBlock(127)                   // 0x02 block, 0x7f i32 blocktype → the 0/1 result
-  // lenA = len(A) ; lenB = len(B)
+  // Hoist both headers' backing + start BEFORE the block — the element loop below reads
+  // both operands once per trip.
+  hoistStrScr(body, 0)
+  hoistStrScr(body, 1)
+  fbBlock(127) // 0x02 block, 0x7f i32 blocktype → the 0/1 result
+  // lenA = len(A) ; lenB = len(B) — the HEADER's `len` (field 2), not `array.len`
   pushStrScrRef(body, 0)
-  fbArrayLen()
+  fbStrLen()
   setStrScrI(body, 0) // lenA
   pushStrScrRef(body, 1)
-  fbArrayLen()
+  fbStrLen()
   setStrScrI(body, 1) // lenB
   // n = min(lenA, lenB):  n = lenA ; if lenB < lenA { n = lenB }
   pushStrScrI(body, 0)
@@ -8566,23 +8835,15 @@ function emitStrLessCore(body: i32[]) {
   fbIf(64)             // then: fall through (empty)
   fbElse()
   // if A[i] != B[i] { push (A[i] <_u B[i]) ; br out of block }
-  pushStrScrRef(body, 0)
-  pushStrScrI(body, 3)
-  fbArrayGet(sTypeIdx) // A[i]
-  pushStrScrRef(body, 1)
-  pushStrScrI(body, 3)
-  fbArrayGet(sTypeIdx) // B[i]
-  fbI32Bin(71)         // 0x47 i32.ne
+  pushStrScrElem(body, 0, 3) // A[i]
+  pushStrScrElem(body, 1, 3) // B[i]
+  fbI32Bin(71)               // 0x47 i32.ne
   fbIf(64)
-  pushStrScrRef(body, 0)
-  pushStrScrI(body, 3)
-  fbArrayGet(sTypeIdx) // A[i]
-  pushStrScrRef(body, 1)
-  pushStrScrI(body, 3)
-  fbArrayGet(sTypeIdx) // B[i]
-  fbI32Bin(73)         // 0x49 i32.lt_u (A[i] < B[i] → the answer at the first diff)
-  fbBr(3)              // 0x0c br depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
-  fbEnd()              // end (mismatch if)
+  pushStrScrElem(body, 0, 3) // A[i]
+  pushStrScrElem(body, 1, 3) // B[i]
+  fbI32Bin(73)               // 0x49 i32.lt_u (A[i] < B[i] → the answer at the first diff)
+  fbBr(3)                    // 0x0c br depth 3 → out of: if(0)·else(1)·loop(2)·block(3)
+  fbEnd()                    // end (mismatch if)
   // i = i + 1
   pushStrScrI(body, 3)
   fbI32Const(1)
@@ -9374,10 +9635,22 @@ function emitClampIdx(body: i32[], idxSlot: i32, lenSlot: i32) {
   0
 }
 
-// Lower a string `s.slice(start, end)` onto `body`, leaving the new string ref on
-// the stack — a fresh `(array i32)` over the half-open clamped range `[start, end)`.
-// JS semantics (mirroring `__string_slice__`): each bound clamps via `emitClampIdx`,
-// the out length is `max(end - start, 0)`, then one `array.copy` from `s[start]`.
+// Lower a string `s.slice(start, end)` onto `body`, leaving the new string ref on the
+// stack — Stage 2b: a **HEADER ONLY**, sharing the receiver's backing. JS semantics
+// (mirroring `__string_slice__`) are unchanged: each bound clamps via `emitClampIdx`, the
+// out length is `max(end - start, 0)`; what changed is that the result is
+// `struct.new $str (s.backing, s.start + start, len)` instead of an `array.new_default` plus
+// an `array.copy`. O(1), allocation of one 3-field struct, ZERO element copies.
+//
+// THE ALIASING IS SAFE BY CONSTRUCTION, not by convention (§2.5): there is no string element
+// store anywhere in the emitter (`emitAssign`'s `Index` target has no raw-string arm and the
+// checker gives a string only `.length` as a member), and no `ref.eq` on a string — every
+// `==` is element-wise — so a view and a copy are indistinguishable to every comparison the
+// language can express.
+//
+// THE RETENTION HAZARD IS REAL AND IS TAKEN KNOWINGLY: a 3-element view keeps its whole
+// backing alive (Go's `strings.Clone` gotcha, and why Java reverted `substring` to a copy in
+// 7u6). `compact()` is the documented escape and is NOT in this stage — see §Header / OQ-4.
 // i32 temps: I0 = clamped start, I1 = clamped end, I2 = len(s), I3 = out length.
 function emitStrSlice(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed {
@@ -9400,9 +9673,10 @@ function emitStrSlice(body: i32[], callIx: i32, fnIx: i32) {
       setStrScrI(body, 1)            // raw end → I1
       setStrScrI(body, 0)            // raw start → I0
       fbLocalSet(strScratchBase + 0) // local.set strScrA (receiver)
-      // I2 = len(s)
+      // I2 = len(s) — the HEADER's `len` (field 2). `array.len` here would be the BACKING's
+      // physical length, so a slice of a slice would clamp against its parent's extent.
       pushStrScrRef(body, 0)
-      fbArrayLen() // array.len
+      fbStrLen()
       setStrScrI(body, 2)
       // I0 = clamp(rawStart, len)
       if emitClampIdx(body, 0, 2) < 0 { return -1 }
@@ -9420,19 +9694,16 @@ function emitStrSlice(body: i32[], callIx: i32, fnIx: i32) {
       fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
       wU8(27)       // 0x1b select
       setStrScrI(body, 3)
-      // Out = array.new_default $aTypeIdx I3
-      pushStrScrI(body, 3)
-      fbArrayNewDefault(sTypeIdx)    // 0xfb 0x07 array.new_default <typeidx>
-      fbLocalSet(strScratchBase + 2) // local.set strScrOut
-      // array.copy Out 0 s start n
-      pushStrScrRef(body, 2)          // dest
-      fbI32Const(0)                   // i32.const 0 (dest offset)
-      pushStrScrRef(body, 0)          // src s
-      pushStrScrI(body, 0)            // src offset = clamped start
-      pushStrScrI(body, 3)            // count = n
-      fbArrayCopy(sTypeIdx, sTypeIdx) // array.copy (dest type, src type)
-      // Result: the new string ref.
-      pushStrScrRef(body, 2)
+      // The VIEW: same backing, start biased by the receiver's own start, len = I3. This is
+      // the whole lowering now — no allocation of elements, no copy.
+      pushStrScrRef(body, 0)
+      fbStrBack()          // field 0: the SHARED backing
+      pushStrScrRef(body, 0)
+      fbStrStart()         // field 1: the receiver's own start …
+      pushStrScrI(body, 0)
+      fbI32Bin(106)        // 0x6a i32.add — … plus the clamped slice start
+      pushStrScrI(body, 3) // field 2: len = max(end - start, 0)
+      fbStrNew()           // 0xfb 0x00 <string header>
       return 0
     }
     return emitFail(
@@ -9506,12 +9777,18 @@ function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
       fbLocalSet(strScratchBase + 1) // local.set strScrB (sub)
       fbLocalSet(strScratchBase + 0) // local.set strScrA (s)
-      // I3 = len(sub); I2 = len(s) - len(sub), the last start the needle fits at.
+      // Hoist both headers' backing + start before the search — every one of the three
+      // loops below reads one or both operands per trip (§Header: hoist in codegen).
+      hoistStrScr(body, 0)
+      hoistStrScr(body, 1)
+      // I3 = len(sub); I2 = len(s) - len(sub), the last start the needle fits at. Both are
+      // the HEADER's `len` (field 2): `array.len` would be the shared backing's extent, so a
+      // needle that is a VIEW would report its parent's length and the scan would run off it.
       pushStrScrRef(body, 1)
-      fbArrayLen()  // array.len
+      fbStrLen()
       setStrScrI(body, 3)
       pushStrScrRef(body, 0)
-      fbArrayLen()  // array.len
+      fbStrLen()
       pushStrScrI(body, 3)
       fbI32Bin(107) // 0x6b i32.sub
       setStrScrI(body, 2)
@@ -9536,11 +9813,10 @@ function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
       setStrScrI(body, 0) // I0 = 0
       fbLoop(64)          // 0x03 loop (outer) — one trip per verify attempt
       // I1 = B[0]: the character every candidate start has to carry.
-      pushStrScrRef(body, 1)
-      fbI32Const(0)
-      fbArrayGet(sTypeIdx) // 0xfb 0x0b array.get
+      pushStrScrBase(body, 1) // needle backing + its start …
+      fbArrayGet(sBackIdx)    // … which IS the offset of B[0]
       setStrScrI(body, 1)
-      fbLoop(64)           // 0x03 loop (skip) — advance to the next candidate
+      fbLoop(64)              // 0x03 loop (skip) — advance to the next candidate
       // Past the last possible start → no match.
       pushStrScrI(body, 0)
       pushStrScrI(body, 2)
@@ -9550,9 +9826,7 @@ function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
       fbBr(3)      // depths: if(0)·skip(1)·outer(2)·block(3)
       fbEnd()
       // A[I0] != B[0] → not a candidate: advance and keep skipping. ONE load.
-      pushStrScrRef(body, 0)
-      pushStrScrI(body, 0)
-      fbArrayGet(sTypeIdx)
+      pushStrScrElem(body, 0, 0)
       pushStrScrI(body, 1)
       fbI32Bin(71)  // 0x47 i32.ne
       fbIf(64)
@@ -9576,22 +9850,21 @@ function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
       fbBr(3)      // depths: if(0)·verify(1)·outer(2)·block(3)
       fbEnd()
       // A[I0+I1] != B[I1] → mismatch: advance I0 and re-enter the skip loop.
-      pushStrScrRef(body, 0)
+      pushStrScrBase(body, 0)
       pushStrScrI(body, 0)
+      fbI32Bin(106)              // 0x6a i32.add — startA + I0
       pushStrScrI(body, 1)
-      fbI32Bin(106)        // 0x6a i32.add
-      fbArrayGet(sTypeIdx) // 0xfb 0x0b array.get
-      pushStrScrRef(body, 1)
-      pushStrScrI(body, 1)
-      fbArrayGet(sTypeIdx) // array.get
-      fbI32Bin(71)         // 0x47 i32.ne
+      fbI32Bin(106)              // 0x6a i32.add — … + I1
+      fbArrayGet(sBackIdx)       // 0xfb 0x0b array.get
+      pushStrScrElem(body, 1, 1) // B[I1]
+      fbI32Bin(71)               // 0x47 i32.ne
       fbIf(64)
       pushStrScrI(body, 0)
       fbI32Const(1)
-      fbI32Bin(106)        // i32.add
-      setStrScrI(body, 0)  // I0 = I0 + 1
-      fbBr(2)              // 0x0c br depth 2 → outer loop header
-      fbEnd()              // 0x0b end (mismatch if)
+      fbI32Bin(106)              // i32.add
+      setStrScrI(body, 0)        // I0 = I0 + 1
+      fbBr(2)                    // 0x0c br depth 2 → outer loop header
+      fbEnd()                    // 0x0b end (mismatch if)
       // I1 = I1 + 1; br verify loop
       pushStrScrI(body, 1)
       fbI32Const(1)
@@ -9615,9 +9888,11 @@ function emitStrIndexOf(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string indexOf call")
 }
 
-// Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32. A direct
-// `array.get` over the code-point array — an out-of-range index TRAPS, matching
-// the host (`s[i]` semantics, no JS NaN; compiler/builtins/strings.ts).
+// Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32. A guarded
+// `backing[start + i]` over the code-point backing — an out-of-range index TRAPS, matching
+// the host (`s[i]` semantics, no JS NaN; compiler/builtins/strings.ts). The guard is what
+// keeps the trap: past Stage 2b the backing outlives the view, so `array.get`'s own bounds
+// check is no longer the view's.
 function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
   if !aUsed {
     return emitFail(
@@ -9633,9 +9908,17 @@ function emitStrCharCode(body: i32[], callIx: i32, fnIx: i32) {
     }
     const callee = P.nodes[c.callFn]
     if callee is Member {
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      // The SAME guarded `backing[start + i]` shape `s[i]` gets, INCLUDING the loop-hoist
+      // arm — the two are one operation spelled twice (`emitIndex`'s string arm is the
+      // sibling ladder), and Stage 2b keeps them reading through ONE pair of helpers so they
+      // cannot drift into different bounds rules or different hoisting.
+      const ccHz = liveHoistRow(callee.memObj, "i32", 0 - 1)
+      if ccHz < 0 {
+        if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      }
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbArrayGet(sTypeIdx) // 0xfb 0x0b array.get
+      if ccHz >= 0 { emitStrIdxGuardHoisted(ccHz) } else { emitStrIdxGuard() }
+      fbArrayGet(sBackIdx) // 0xfb 0x0b array.get
       return 0
     }
     return emitFail(
@@ -11046,19 +11329,25 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
           fbStructGet(lTypeIdx, 1)
           setStrScrI(body, 0)
-          // Out = array.new_default(I0)
+          // Out = array.new_default(I0) — the BACKING (an exact fit for the whole list),
+          // wrapped in a start-0 header once the copy has landed.
           pushStrScrI(body, 0)
-          fbArrayNewDefault(sTypeIdx)
+          fbArrayNewDefault(sBackIdx)
           fbLocalSet(strScratchBase + 2)
-          // array.copy Out 0 xs.backing 0 I0
+          // array.copy Out 0 xs.backing 0 I0. The cross-type copy is legal because
+          // `array.copy`'s validation rule is on the STORAGE types (i32 ≤ i32), not on
+          // heap-type identity — the same reason it stayed a memcpy in Stage 2a.
           pushStrScrRef(body, 2)
           fbI32Const(0)
           if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
           fbStructGet(lTypeIdx, 0)
           fbI32Const(0)
           pushStrScrI(body, 0)
-          fbArrayCopy(sTypeIdx, aTypeIdx)
+          fbArrayCopy(sBackIdx, aTypeIdx)
           pushStrScrRef(body, 2)
+          fbI32Const(0)
+          pushStrScrI(body, 0)
+          fbStrNew()
           return 0
         }
         return emitFail(
@@ -11066,9 +11355,9 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         )
       }
       // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
-      // string from an i32 code point. A VL string IS the shared `(array i32)` of code
-      // points (`aTypeIdx`), so this is a length-1 array — push the one i32 arg, then
-      // `array.new_fixed $aTypeIdx 1`. Mirrors toWasm's `fromCodePoint` lowering.
+      // string from an i32 code point. A VL string is a HEADER over an `(array i32)` of code
+      // points, so this is a length-1 backing wrapped in a whole-backing view — push the one
+      // i32 arg, `array.new_fixed $sBackIdx 1`, then `struct.new $sTypeIdx`.
       if callee.identName == "fromCodePoint" {
         if !aUsed {
           return emitFail(
@@ -11081,7 +11370,10 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           )
         }
         if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-        fbArrayNewFixed(sTypeIdx, 1) // 0xfb 0x08 <typeidx> 1; type shared with i32[]
+        fbArrayNewFixed(sBackIdx, 1) // 0xfb 0x08 <typeidx> 1 — the one-element backing
+        fbI32Const(0)
+        fbI32Const(1)
+        fbStrNew()                   // the whole-backing view over it
         return 0
       }
       // `print(x)` is a compiler builtin lowered to the host's import family:
@@ -15578,7 +15870,31 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     wU8(212) // 0xd4 ref.as_non_null
   }
   fbLocalSet(lIdx)
-  fbI32Const(0)
+  // A STRING source runs its cursor in BACKING coordinates (Stage 2b): the `#l` temp holds
+  // the HEADER, so hoist the backing into its own slot, start the cursor at `start`, and
+  // pre-compute the exit bound `start + len`. That is one `array.get` per code point and NO
+  // `struct.get` in the loop at all — where the naive shape would re-read `backing`, `start`
+  // and `len` off the header on every trip, and binaryen is not guaranteed to lift a GC
+  // `struct.get` out of a loop body (§Header).
+  let fiSBack = -1
+  let fiSEnd = -1
+  if strSrc {
+    fiSBack = strBackSlot()
+    fiSEnd = strI32Slot()
+    fbLocalGet(lIdx)
+    fbStrBack()
+    fbLocalSet(fiSBack)
+    fbLocalGet(lIdx)
+    fbStrStart()
+    fbLocalGet(lIdx)
+    fbStrLen()
+    fbI32Bin(106) // 0x6a i32.add — the one-past-the-end backing offset
+    fbLocalSet(fiSEnd)
+    fbLocalGet(lIdx)
+    fbStrStart()
+  } else {
+    fbI32Const(0)
+  }
   fbLocalSet(iIdx)
   scopeBind(s.fiVar, vSlot)
   fbBlock(64) // 0x02 block, void
@@ -15589,10 +15905,15 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   ctrlEnter()
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
-  // exit when cursor >= len (the list wrapper's field 1; a STRING is the raw array → array.len)
+  // exit when cursor >= len (the list wrapper's field 1; a STRING compares its
+  // backing-coordinate cursor against the pre-computed `start + len` bound)
   fbLocalGet(iIdx)
-  fbLocalGet(lIdx)
-  if strSrc { fbArrayLen() } else { fbStructGet(wrapTy, 1) }
+  if strSrc {
+    fbLocalGet(fiSEnd)
+  } else {
+    fbLocalGet(lIdx)
+    fbStructGet(wrapTy, 1)
+  }
   fbI32Bin(78) // 0x4e i32.ge_s
   fbBrIf(1)    // 0x0d br_if -> break out of block
   // TOMBSTONE SKIP: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
@@ -15613,12 +15934,18 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbBr(1)              // 0x0c br -> loop header (re-check exit)
     fbEnd()              // 0x0b end (if)
   }
-  // v = backing[cursor] (a string element recovers its non-null ref). A STRING source IS the
-  // raw array, so index it directly (no list-wrapper `struct.get`); the code unit is an i32.
-  fbLocalGet(lIdx)
-  if !strSrc { fbStructGet(wrapTy, 0) }
-  fbLocalGet(iIdx)
-  if strSrc { fbArrayGet(sTypeIdx) } else { fbArrayGet(backTy) }
+  // v = backing[cursor] (a string element recovers its non-null ref). A STRING source reads
+  // its HOISTED backing at a cursor that is already a backing offset; the code unit is an i32.
+  if strSrc {
+    fbLocalGet(fiSBack)
+    fbLocalGet(iIdx)
+    fbArrayGet(sBackIdx)
+  } else {
+    fbLocalGet(lIdx)
+    fbStructGet(wrapTy, 0)
+    fbLocalGet(iIdx)
+    fbArrayGet(backTy)
+  }
   if (
     ek == "str" ||
     ek == "struct" ||
@@ -16265,10 +16592,11 @@ function emitPrintNulLitUnion(
 // tail, split out so the nullable arm above can reach it with the ref it recovered from
 // `br_on_null` instead of re-evaluating the expression.
 function emitPrintStrFromScratch(body: i32[]) {
+  hoistStrScr(body, 0) // the streaming loop reads the backing once per code point
   fbI32Const(0)
   setStrScrI(body, 0)
   pushStrScrRef(body, 0)
-  fbArrayLen()
+  fbStrLen() // field 2: the VIEW's length, not the backing's
   setStrScrI(body, 1)
   fbBlock(64)
   ctrlEnter()
@@ -16278,9 +16606,7 @@ function emitPrintStrFromScratch(body: i32[]) {
   pushStrScrI(body, 1)
   fbI32Bin(78) // i32.ge_s
   fbBrIf(1)
-  pushStrScrRef(body, 0)
-  pushStrScrI(body, 0)
-  fbArrayGet(sTypeIdx)
+  pushStrScrElem(body, 0, 0)
   fbCall(2) // __print_char__
   pushStrScrI(body, 0)
   fbI32Const(1)
@@ -17005,11 +17331,11 @@ function emitObjLitNode(body: i32[], _e: ObjLit, exprIx: i32, fnIx: i32) {
 }
 
 function emitMemberNode(body: i32[], e: Member, exprIx: i32, fnIx: i32) {
-  // `a.length` on an array OR string receiver is `array.len` (a string is the SAME
-  // `array i32` of code points, so `.length` is the code-point count); every other
-  // member access is a struct field read. `length` over a non-array/non-string
-  // receiver falls through to the struct path (which fails loudly if no such field),
-  // matching the slice's scope.
+  // `a.length` on an array OR string receiver is a `struct.get` of the receiver's own length
+  // field — the list wrapper's `len` (field 1) or, since Stage 2b, the string HEADER's `len`
+  // (field 2), still a CODE-POINT count. Every other member access is a struct field read.
+  // `length` over a non-array/non-string receiver falls through to the struct path (which
+  // fails loudly if no such field), matching the slice's scope.
   if e.memProp == "length" {
     if (
       exprArray(e.memObj, fnIx) ||
