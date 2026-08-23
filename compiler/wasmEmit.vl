@@ -502,6 +502,7 @@ import {
   forInMapValsSlot,
   forInMapWalksVals,
   forInStringSrc,
+  forInU8Src,
   globalCellKind,
   globalCellStructIdx,
   globalIndexOf,
@@ -513,6 +514,7 @@ import {
   identChainTyBoxedUnion,
   identChainTyMapArmUnion,
   identNullableBoolPop,
+  identSlotIsUnionBox,
   ifArmIsValue,
   ifExprRefKind,
   ifExprRefSlot,
@@ -12513,6 +12515,109 @@ function stageListRecv(body: i32[], objIx: i32, fnIx: i32, base: i32) {
   0
 }
 
+// TRUE when an ident READ of `name` (the node at `exprIx`) UNBOXES a narrowed union arm
+// rather than yielding the frame slot raw — the GATE `emitIdentNode`'s narrowed value-atom
+// and ref-array arms share, and the one a list-op receiver has to ask before it treats a
+// bare identifier as a list local. Three storage questions in the order that function asks
+// them: a union binding resolvable in THIS frame, a CAPTURE (whose binding is in another
+// frame, so the name question answers "" while the read is narrowed), and the typed-IR net
+// behind both (a binding that holds the box without producing a `unionNameOfIdent` render).
+// The narrowed-MAP arm is deliberately not here: its net is `identChainTyMapArmUnion`, a
+// different question, and a map is not a list receiver.
+function identReadIsUnionUnbox(exprIx: i32, name: string, fnIx: i32) {
+  if unionNameOfIdentSid(sidOfNode(exprIx), fnIx) != "" { return true }
+  if capturedIsUnionBox(fnIx, name) { return true }
+  identChainTyBoxedUnion(name, fnIx, 4)
+}
+
+// TRUE when the list-op receiver at `objIx` is an identifier NARROWED to a list arm of a
+// union box (`function f(x: i32[] | i32) { if x is i32[] { x.push(7) } }`). Such a name
+// resolves through `localIndexOf` like any other local, but that local holds the `(ref
+// $uBox)` — the LIST is the box's anyref payload, recovered by `emitIdentNode`'s unbox. So
+// the receiver must be STAGED through `emitExpr` (which runs that unbox) exactly like a
+// global/field/index receiver, not read as a bare frame slot.
+//
+// #1814 repro B: without it `.push` / `.clear` emitted `struct.get $list` against the raw
+// box at every LOCAL and PARAM storage class — `vl check` rc 0, invalid wasm — while the
+// GLOBAL spelling of the same program was correct, because a global never had a frame slot
+// to take and always went down the staging arm. `.length`, `x[i]` and `x[i] = v` were
+// correct throughout: they reach the receiver through `emitExpr`.
+//
+// No kind filter on the narrowed atom: every caller has already established the receiver
+// classifies as a LIST (each fails loudly otherwise), so a non-"" narrow here IS a list arm.
+function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
+  if narrowedValueAtomOf(name) == "" && narrowedRefArrayOf(name) == "" {
+    return false
+  }
+  // THE SLOT TEST IS LOAD-BEARING, not belt-and-braces: `callPopBits` reserves the scratch
+  // frame off `identSlotIsUnionBox` alone (it runs before any narrow is pushed and cannot
+  // ask more), so staging on a WIDER condition here would stage into a frame that was never
+  // laid out. The two passes ask the one question.
+  if !identSlotIsUnionBox(fnIx, name) { return false }
+  identReadIsUnionUnbox(objIx, name, fnIx)
+}
+
+// THE ONE HOME OF LIST-OP RECEIVER RESOLUTION — resolve the receiver expression `objIx` to a
+// wasm local index holding the list-wrapper ref, or -1 (loud, already recorded) when it is
+// not a resolvable receiver. `.push` / `.pop` / `.clear` / `.pop() ?? d` each spelled this
+// ladder out by hand, and the copies are why the narrowed-union arm above could be missing
+// from all four at once.
+//
+// A bare identifier IS such a local — UNLESS it is a narrowed union arm (see above). Every
+// OTHER form — a struct FIELD (`P.nodes`), a module GLOBAL, an INDEX (`g[0].push(x)`) — is
+// evaluated ONCE through `emitExpr` into the `recvRef` scratch slot (`base + 3`) and pushed
+// through that. NO WRITE-BACK is needed in any of them: the wrapper is mutated IN PLACE by
+// reference, and a growth swaps the backing on that same shared wrapper, so the mutation is
+// visible through the field / global / outer array / map.
+//
+// `op` names the operation in the two diagnostics; `allowIndex` is the one behavioural
+// difference between the callers (only `.push` accepts an INDEXED receiver, whose inner list
+// the classifiers upstream have already resolved into `base`).
+function listOpRecvLocal(
+  body: i32[],
+  objIx: i32,
+  fnIx: i32,
+  base: i32,
+  op: string,
+  allowIndex: boolean,
+): i32 {
+  const recv = P.nodes[objIx]
+  if recv is Ident {
+    if listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
+      if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
+      return base + 3
+    }
+    const lIdx = localIndexOf(fnIx, recv.identName)
+    if lIdx >= 0 { return lIdx }
+    // A module-GLOBAL list ident: `emitExpr` runs the existing Ident->global read
+    // (`global.get` + `ref.as_non_null` for a non-const ref cell).
+    if globalIndexOfSid(sidOfNode(objIx)) < 0 {
+      return emitFail("emitProgram: " + op + " receiver is not a list local")
+    }
+    if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
+    return base + 3
+  }
+  if recv is Member {
+    if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
+    return base + 3
+  }
+  if allowIndex {
+    // An INDEXED receiver (`g[0].push(x)` - push onto an INNER list of a nested array, or
+    // onto a list read from a list-valued map). The classifiers upstream already recognize a
+    // nested `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
+    if recv is Index {
+      if stageListRecv(body, objIx, fnIx, base) < 0 { return -1 }
+      return base + 3
+    }
+    return emitFail(
+      "emitProgram: " +
+        op +
+        " receiver must be a local, struct field, or index",
+    )
+  }
+  emitFail("emitProgram: " + op + " receiver must be a local or struct field")
+}
+
 // Lower a `recv.push(x)` member-call statement onto `body` — the growable-list append
 // (mirroring `toWasm.ts`'s `__list_grow__`/`__list_push__`, but INLINED). `recv` must be
 // a bare `Ident` naming a LIST local/param (so its `local.get` is side-effect-free and
@@ -12542,7 +12647,6 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
-      const recv = P.nodes[callee.memObj]
       // The receiver must PRODUCE a list — either a bare list local/param (`xs.push`) or
       // a struct-FIELD array read (`P.nodes.push`, gap #3). Both `exprArray`/`exprRefArray`
       // already classify a `Member` array-field read, so the only extra work for a field
@@ -12664,40 +12768,16 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       } else if !lUsed {
         return emitFail("emitProgram: .push but list type not collected")
       }
-      // RECEIVER RESOLUTION (the shared rule — `emitPop`/`emitClear`/`emitPopOr` mirror it).
-      // Resolve the receiver to a wasm local index holding the list-wrapper ref. A bare
-      // identifier IS such a local. Every OTHER form — a struct FIELD (`P.nodes`), a module
-      // GLOBAL, an INDEX (`g[0].push(x)`) — is evaluated ONCE through `emitExpr` into the
-      // `recvRef` scratch slot (`base + 3`) and pushed through that. NO WRITE-BACK is needed
-      // in any of them: the wrapper is mutated IN PLACE by reference, and a growth swaps the
-      // backing on that same shared wrapper, so the mutation is visible through the field /
-      // global / outer array / map.
-      let lIdx = -1
-      if recv is Ident {
-        lIdx = localIndexOf(fnIx, recv.identName)
-        if lIdx < 0 {
-          // A module-GLOBAL list ident: `emitExpr` runs the existing Ident→global read
-          // (`global.get` + `ref.as_non_null` for a non-const ref cell).
-          if globalIndexOfSid(sidOfNode(callee.memObj)) < 0 {
-            return emitFail("emitProgram: .push receiver is not a list local")
-          }
-          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-          lIdx = base + 3
-        }
-      } else if recv is Member {
-        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-        lIdx = base + 3
-      } else if recv is Index {
-        // An INDEXED receiver (`g[0].push(x)` — push onto an INNER list of a nested array, or
-        // onto a list read from a list-valued map). The classifiers above already recognize a
-        // nested `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
-        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-        lIdx = base + 3
-      } else {
-        return emitFail(
-          "emitProgram: .push receiver must be a local, struct field, or index",
-        )
-      }
+      // RECEIVER RESOLUTION — `listOpRecvLocal`, the one home the four list ops share.
+      const lIdx = listOpRecvLocal(
+        body,
+        callee.memObj,
+        fnIx,
+        base,
+        ".push",
+        true,
+      )
+      if lIdx < 0 { return -1 }
       if true {
         if c.callArgs.length != 1 {
           return emitFail("emitProgram: .push takes exactly one argument")
@@ -12832,7 +12912,6 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
-      const recv = P.nodes[callee.memObj]
       if c.callArgs.length != 0 {
         return emitFail("emitProgram: .pop takes no arguments")
       }
@@ -12873,26 +12952,16 @@ function emitPop(body: i32[], callIx: i32, fnIx: i32) {
       } else if !lUsed {
         return emitFail("emitProgram: .pop but list type not collected")
       }
-      // Receiver resolution — `emitPush`'s rule (see there): a bare local IS the local, a
-      // struct FIELD (`T.scopes`) or a global stages into `recvRef` (`base + 3`), no write-back.
-      let lIdx = -1
-      if recv is Ident {
-        lIdx = localIndexOf(fnIx, recv.identName)
-        if lIdx < 0 {
-          if globalIndexOfSid(sidOfNode(callee.memObj)) < 0 {
-            return emitFail("emitProgram: .pop receiver is not a list local")
-          }
-          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-          lIdx = base + 3
-        }
-      } else if recv is Member {
-        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-        lIdx = base + 3
-      } else {
-        return emitFail(
-          "emitProgram: .pop receiver must be a local or struct field",
-        )
-      }
+      // Receiver resolution — `listOpRecvLocal`, shared with `.push`/`.clear`/`.pop() ?? d`.
+      const lIdx = listOpRecvLocal(
+        body,
+        callee.memObj,
+        fnIx,
+        base,
+        ".pop",
+        false,
+      )
+      if lIdx < 0 { return -1 }
       if true {
         // A BOOLEAN-element list pops CHECKED: `boolean | null` rides the i32
         // niche (true=1 / false=0 / null=2), so an empty pop yields the sentinel
@@ -12949,7 +13018,6 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
       if c.callArgs.length != 0 {
         return emitFail("emitProgram: .clear takes no arguments")
       }
-      const recv = P.nodes[callee.memObj]
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
       if !isRef && !isStr && !exprArray(callee.memObj, fnIx) {
@@ -12977,24 +13045,15 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
       } else if !lUsed {
         return emitFail("emitProgram: .clear but list type not collected")
       }
-      let lIdx = -1
-      if recv is Ident {
-        lIdx = localIndexOf(fnIx, recv.identName)
-        if lIdx < 0 {
-          if globalIndexOfSid(sidOfNode(callee.memObj)) < 0 {
-            return emitFail("emitProgram: .clear receiver is not a list local")
-          }
-          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-          lIdx = base + 3
-        }
-      } else if recv is Member {
-        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-        lIdx = base + 3
-      } else {
-        return emitFail(
-          "emitProgram: .clear receiver must be a local or struct field",
-        )
-      }
+      const lIdx = listOpRecvLocal(
+        body,
+        callee.memObj,
+        fnIx,
+        base,
+        ".clear",
+        false,
+      )
+      if lIdx < 0 { return -1 }
       // L.len = 0
       fbLocalGet(lIdx)
       fbI32Const(0)
@@ -13148,28 +13207,18 @@ function emitPopOr(body: i32[], popIx: i32, defIx: i32, fnIx: i32) {
       if !lUsed {
         return emitFail("emitProgram: .pop but list type not collected")
       }
-      const recv = P.nodes[callee.memObj]
       const lTy = lTypeIdx
       const aTy = aTypeIdx
       const base = pushScratchBase
-      let lIdx = -1
-      if recv is Ident {
-        lIdx = localIndexOf(fnIx, recv.identName)
-        if lIdx < 0 {
-          if globalIndexOfSid(sidOfNode(callee.memObj)) < 0 {
-            return emitFail("emitProgram: .pop receiver is not a list local")
-          }
-          if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-          lIdx = base + 3
-        }
-      } else if recv is Member {
-        if stageListRecv(body, callee.memObj, fnIx, base) < 0 { return -1 }
-        lIdx = base + 3
-      } else {
-        return emitFail(
-          "emitProgram: .pop receiver must be a local or struct field",
-        )
-      }
+      const lIdx = listOpRecvLocal(
+        body,
+        callee.memObj,
+        fnIx,
+        base,
+        ".pop",
+        false,
+      )
+      if lIdx < 0 { return -1 }
       // cond: len != 0 (len is never negative)
       pushListLen(body, lIdx, lTy)
       fbIf(127) // 0x04 if, 0x7f i32 result blocktype
@@ -15342,6 +15391,15 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   // list wrapper), so the length is `array.len` and each element `array.get $aTypeIdx` —
   // skipping the `struct.get wrapTy` the i32-list path uses. The loop var is an i32 code unit.
   const strSrc = forInStringSrc(s.fiIter, fnIx)
+  // A PACKED BYTE-LIST iterable (`for b in bs`, `bs: u8[]`): the `#l` temp is the `$bl8`
+  // wrapper over the one-byte backing, so the length is `struct.get $bl8 1` and each element
+  // `array.get_u $ba8` — `fbArrayGet` picks the unsigned opcode off the backing heap index
+  // itself (`heapIsPacked`), so only the two type indices below change. The loop var stays an
+  // i32; `declareForInLocals` types the temp from the SAME predicate.
+  const u8Src = forInU8Src(s.fiIter, fnIx)
+  if u8Src && !ba8Used {
+    return emitFail("emitProgram: u8 for-in but u8 list type not collected")
+  }
   const vSlot = emitLetCursor
   emitLetCursor = emitLetCursor + 1
   const iSlot = emitLetCursor
@@ -15399,6 +15457,11 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     // `array.get <back>` yields the scalar directly (no `ref.as_non_null`).
     wrapTy = scalarListWrap(ek)
     backTy = scalarListBack(ek)
+  } else if u8Src {
+    // The packed byte list — the same descriptor pair, keyed on the `#l` temp's kind rather
+    // than the loop var's (which is `"i32"`, shared with the i32 list and the string walk).
+    wrapTy = scalarListWrap("u8list")
+    backTy = scalarListBack("u8list")
   }
   // For a map iteration (`m.keys()`, `m.values()`, or the bare `for k in m` —
   // `mapRecv >= 0` iff so), evaluate the receiver ONCE and stash the MAP ref (mono
