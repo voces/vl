@@ -1,0 +1,43 @@
+// @emit-error emitProgram: ref valtype with no interned shape
+// A NULLABLE UNION VARIANT HAS NO REP, and that is what refuses this program — not the
+// inline-vs-declared split #1803 closed for every other position.
+//
+// `E | null` over a plain declared struct is the `nulstruct` NICHE: `(ref null $E)`, whose
+// `fbValtype` slot is a row in the STANDALONE struct table. Make `E` a union arm anywhere in
+// the module (the `y` line below) and `collectS` stops interning that row — the arm's values
+// belong to the variant table — so the niche has no slot to name. `rtNulVKind` says so in its
+// own words at the rep layer: "A nullable VARIANT member's slot vocabulary is the variant
+// index — the flat alphabet has no kind for it". There is no `nulvariant` VKind.
+//
+// MEASURED, and the measurement is why this is filed rather than folded into #1803:
+//
+//   - The DECLARED spelling floors IDENTICALLY. Replace the inline `string | E` below with
+//     `type U = string | E` + `const y: U = "v"` and the message is the same, before and
+//     after the fix. So this is NOT the two-registry disagreement — 24 of 315 grid cells
+//     (`nulret`, every union spelling) stay refused on both.
+//   - Routing the nullable variant to the union BOX instead was built and REFUTED: declining
+//     `retNulRefFlag` for a variant inner moves 0 of those 24 cells up and takes the
+//     `type R = E | null` alias spelling from RUN-OK to INVALID WASM
+//     (`expected i32, found (ref $type)`).
+//   - `E | null` on its own — with no other union in the module — lowers and runs. Delete the
+//     `y` line and this file passes. Three-arm `string | E | null` also lowers, because it is
+//     an ordinary box whose `null` rides a tag, not a niche.
+//
+// AND IT IS WHY #1803 IS SCOPED THE WAY IT IS. `annCommitVariantMembers` deliberately does NOT
+// register a declared struct the module also uses as a nullable inner: calling `E` a variant
+// satisfies its union positions and BREAKS this one, because the niche below still indexes the
+// standalone struct table. Measured on a 24-cell nullable grid (3 union spellings x 8 nullable
+// positions, producer = call vs literal, spelling = inline vs alias): with the exclusion, 0
+// cells move; without it, 2 go RUN-OK -> check-clean INVALID WASM and 1 goes loud-reject ->
+// runtime trap. The RUN-OK pair is the `std/fs.vl` shape — an `IoError` constructor returning
+// into `IoResult` — so the exclusion is what keeps that module compiling.
+//
+// Lifting it is a rep slice: a `nulvariant` VKind, its valtype / `ref.null` / `$fnsig` arms
+// and the null-compare, exactly the shape of the `nulf32list` slice. Refused loudly at every
+// position today, never a wrong answer. When it lands, drop the exclusion with it.
+type E = { code: i32, msg: string }
+function a(): E | null { return { code: 1, msg: "m" } }
+const r = a()
+if r != null { print(r.code) } else { print(-1) }
+const y: string | E = "v"
+if y is E { print(y.code) } else { print(y) }

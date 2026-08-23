@@ -13066,6 +13066,13 @@ function globalKind(initIx: i32): VKind {
   // the one-byte one (invalid wasm, `vl check` clean).
   if exprU8Array(initIx, -1) { return "u8list" }
   if exprUnion(initIx, -1) { return "union" }
+  // A CONCRETE-VARIANT init (`const r = mk()` where `mk` returns a union arm) is the raw
+  // variant ref (kind 8), the module-scope twin of `buildLocals`' kind-8 variant slot.
+  // BEFORE `exprStruct`, which claims the same expression and names the STANDALONE struct
+  // table — a table a variant has no row in, so the cell's heap type and the value's
+  // disagreed (`expected (ref null $type), found (ref $type)`). Only reachable in a
+  // program that has a union at all.
+  if exprVariantIndex(initIx, -1) >= 0 { return "variant" }
   if exprStruct(initIx, -1) { return "struct" }
   if exprArray(initIx, -1) { return "list" }
   // A SCALAR f32 non-literal init (an f32 map-`??` read, f32 arithmetic, an f32-returning
@@ -13228,6 +13235,10 @@ export function globalCellStructIdx(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if globalHasTypeAnn(letIx) { return structIndexOfLet(letIx, -1) }
+    // A kind-8 VARIANT cell's slot is the VARIANT index, not a struct row — paired with
+    // `globalKind`'s variant arm, which decides the kind this slot is read beside.
+    const gvi = exprVariantIndex(d.letInit, -1)
+    if gvi >= 0 { return gvi }
     return structIndexOfExpr(d.letInit, -1)
   }
   -1
@@ -20312,7 +20323,12 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   if e is Ident {
     const pvi = paramVariantIndex(fnIx, e.identName)
     if pvi >= 0 { return pvi }
-    return declaredVariantIndex(e.identName)
+    const dvi = declaredVariantIndex(e.identName)
+    if dvi >= 0 { return dvi }
+    // A module GLOBAL whose cell is the kind-8 raw variant — the global twin of the
+    // `declaredVariantIndex` LOCAL leg above, and the leg every member-read site
+    // (`o.field`) needs to pick `uVarHeap` over `sHeapIdx` for a variant receiver.
+    return globalVariantIndexSid(sidOfNode(exprIx))
   }
   // A call to a `: Cat`-returning function yields the concrete variant ref.
   if e is Call {
@@ -20337,6 +20353,18 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
   -1
 }
 
+// The union-VARIANT table index a module GLOBAL's cell holds, or -1 — the global sibling
+// of `globalStructIndexSid`, gated on the cell actually BEING the kind-8 variant so the
+// two never both answer for one binding. `globalCellKind` re-derives from the same
+// initializer this is asked about; a global whose init names another global recurses one
+// level per link and module globals cannot cycle.
+function globalVariantIndexSid(sid: i32): i32 {
+  const li = globalLetOfSid(sid)
+  if li < 0 { return -1 }
+  if globalCellKind(li) != "variant" { return -1 }
+  globalCellStructIdx(li)
+}
+
 // The union-VARIANT table index a function `name` returns (its `: Cat` return
 // annotation), or -1.
 function fnRetVariantIndexSid(sid: i32) {
@@ -20345,6 +20373,16 @@ function fnRetVariantIndexSid(sid: i32) {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
       if fn.fnRet >= 0 {
+        // THE KIND DECIDES, not the name. `variantIndexOf` answers for any spelling the
+        // emitter's `uVariants` holds — including one whose positions still lower as the
+        // STANDALONE struct because the checker never called it a variant (the
+        // nullable-used arms `annCommitVariantMembers` deliberately excludes). A caller
+        // that took the index anyway got a `uVarHeap` cell fed by an `sHeapIdx` value:
+        // check-clean invalid wasm at the `global.set` (measured: 4 of 315 position-grid
+        // cells, an un-annotated global bound to such a call). `retVariantFlag` is the same
+        // predicate the callee's own functype result is emitted from, so gating on it makes
+        // the call site and the callee agree by construction.
+        if retVariantFlag(fn.fnRet) != 1 { return -1 }
         const rt = P.nodes[fn.fnRet]
         if rt is TypeRef { return variantIndexOf(rt.tyName) }
       }
