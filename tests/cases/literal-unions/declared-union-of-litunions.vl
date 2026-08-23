@@ -1,0 +1,219 @@
+// @run
+// @log 1
+// @log 4
+// @log nA
+// @log nB
+// @log 2
+// @log 3
+// @log nA
+// @log nB
+// @log aa
+// @log dd
+// @log sA
+// @log sB
+// @log bb
+// @log cc
+// @log bb
+// @log cc
+// @log oa
+// @log oc
+// @log Y
+// @log Y
+// @log ee
+// @log Y
+// @log Y
+// @log N
+// @log 5000000000
+// @log Y
+// @log 2.5
+// @log Y
+// @log gg
+// @log A
+// @log X
+// @log P
+// @log O
+// A UNION OF LITERAL UNIONS IS A LITERAL UNION — **AT A DECLARED ALIAS TOO** (#1792).
+//
+// Slice C (`docs/internals/litunion-compact-rep-design.md` §8.3) taught the ANNOTATION
+// routes to flatten `K | K2`, and its own header asserted the DECLARATION route "HAS
+// ALWAYS FLATTENED". It never had. `fillTypeDeclAt`'s `UnionDecl` arm builds its member
+// list itself — it fills the pass-0a placeholder in place and so cannot call a function
+// that MINTS a type — and it pushed the resolved VARIANTS straight in. `type U = A | B`
+// therefore interned as a union whose members are UNIONS, and every classifier that reads
+// the arena answered for that while every NAME channel softened to the members' base:
+// `tyIsLitUnion(U)` NO, `numLitUnionBaseTy(U)` -1, `isValueUnionBox(U)` YES,
+// `unionAliasDeclNameOfTy(U)` "U". So the emitter gave `U` a `{tag, anyref}` variant box
+// at the signature while the receiving position wanted the scalar: `vl check --codegen`
+// rc 0 and a module that does not load —
+// `type mismatch: expected i32, found (ref $type)`. The flatten now lives in ONE place,
+// `litUnionFlatMembers`, and both routes climb it.
+//
+// THE SECOND HALF IS THE BASE. The flatten's member test used to be `tyIsLitUnion`, the
+// STRING-only predicate (`litKind != "str"` rejects) — string-only because a string
+// litunion's alias NAME is its interned-atom identity. A flatten has no such stake; it
+// asks only "do these members share one rep", which all four bases answer. It now asks
+// `softenLitTy` through `homogLitUnionBase`, so #1792's own i32 repro, the i64 arms
+// (`5000000000 | 5000000001`) and the f64 arms move together — three shapes, one test.
+//
+// IT WAS NEVER THE RETURN POSITION, which is what the issue's scope table said. Measured
+// on the pre-fix compiler with `type A = "aa"|"bb"; type B = "cc"|"dd"; type U = A | B`:
+// the `f(x: U): U` return is invalid wasm, a bare `const x: U` local is invalid wasm, and
+// a `{ v: U }` field is invalid wasm — three positions, one cause. `if x is A` is the one
+// cell that worked, and it works because the narrow REBINDS to `A`, whose own arena node
+// was a litunion all along; nothing on that path ever reads `U`'s.
+//
+// EVERY SECTION'S MEMBERS ARE DISJOINT from every other section's (#1304's method note),
+// so a registered alias cannot answer a lookup it was not asked: no two sections share a
+// numeric value or a string lexeme.
+//
+// TWO CELLS ARE DELIBERATELY NOT SPELLED HERE, both because they are PRE-EXISTING holes
+// this fix does not touch and both verified to sit identically on the FLAT spelling:
+//   · `print` of a numeric-litunion ARRAY ELEMENT in a module that also uses a string
+//     litunion — `emitProgram: print of a literal-union atom whose type carries no member
+//     texts`, rc 1 for `type NU = 1|2|3|4` too, so the numeric element read below is
+//     graded through `is` instead of through `print`;
+//   · the `| null` SIBLING (`type QU = QA | QB | null`) — `emitProgram: only i32 locals
+//     are supported`, loud on both compilers, while the flat `"qa"|"qb"|"qc"|"qd"|null`
+//     runs. The flatten is gated on `!sawNull` here for the reason `annUnionInnerTy`
+//     states in its own header (the atom niche's three open holes, measured 10 UP / 3
+//     DOWN on the 20-cell nullable row), so closing it is that slice's job, not this one's.
+
+// ── #1792 VERBATIM: the numeric declared alias ──────────────────────────────────
+type NA = 1 | 2
+type NB = 3 | 4
+type NU = NA | NB
+function nid(x: NU): NU { x }
+function numRet() {
+  print(nid(1))
+  print(nid(4))
+  // `is` stays a SUBSET test over the TESTED alias's own members — not a membership
+  // test on the flattened set, which would always fire.
+  const a: NU = 2
+  if a is NA { print("nA") } else { print("nB") }
+  const b: NU = 3
+  if b is NA { print("nA") } else { print("nB") }
+}
+numRet()
+function numPositions() {
+  const x: NU = 2
+  print(x)
+  const s: { v: NU } = { v: 3 }
+  print(s.v)
+  const xs: NU[] = [2, 3]
+  const e0 = xs[0]
+  if e0 is NA { print("nA") } else { print("nB") }
+  const e1 = xs[1]
+  if e1 is NA { print("nA") } else { print("nB") }
+}
+numPositions()
+
+// ── the STRING declared alias, the same positions ───────────────────────────────
+type SA = "aa" | "bb"
+type SB = "cc" | "dd"
+type SU = SA | SB
+function sid(x: SU): SU { x }
+function strRet() {
+  print(sid("aa"))
+  print(sid("dd"))
+  const a: SU = "bb"
+  if a is SA { print("sA") } else { print("sB") }
+  const b: SU = "cc"
+  if b is SA { print("sA") } else { print("sB") }
+}
+strRet()
+function strPositions() {
+  const x: SU = "bb"
+  print(x)
+  const s: { v: SU } = { v: "cc" }
+  print(s.v)
+  const xs: SU[] = ["bb", "cc"]
+  print(xs[0])
+  print(xs[1])
+}
+strPositions()
+
+// ── OVERLAPPING member sets: the flattened set is the UNION, `is` stays a SUBSET ─
+type OA = "oa" | "ob"
+type OB = "ob" | "oc"
+type OU = OA | OB
+function overlap() {
+  const xs: OU[] = ["oa", "oc"]
+  print(xs[0])
+  print(xs[1])
+  const x: OU = "ob"
+  if x is OA { print("Y") } else { print("N") }
+  if x is OB { print("Y") } else { print("N") }
+}
+overlap()
+
+// ── NESTED TWICE: a declared alias OVER a declared alias-of-litunions ───────────
+// `SU`'s own arena node is now the flat four-literal union, so `SU | EA` is a member
+// list `litUnionFlatMembers` claims again. The grouping is not a type.
+type EA = "ee" | "ef"
+type EU = SU | EA
+function nested() {
+  const x: EU = "ee"
+  print(x)
+  if x is EA { print("Y") } else { print("N") }
+  const y: EU = "aa"
+  if y is SA { print("Y") } else { print("N") }
+  if y is EA { print("Y") } else { print("N") }
+}
+nested()
+
+// ── THE OTHER TWO BASES: i64 and f64 arms were the same defect ──────────────────
+type IA = 5000000000 | 5000000001
+type IB = 6000000000 | 6000000001
+type IU = IA | IB
+function wideInt() {
+  const x: IU = 5000000000
+  print(x)
+  if x is IA { print("Y") } else { print("N") }
+}
+wideInt()
+type FA = 1.5 | 2.5
+type FB = 3.5 | 4.5
+type FU = FA | FB
+function reals() {
+  const x: FU = 2.5
+  print(x)
+  if x is FA { print("Y") } else { print("N") }
+}
+reals()
+
+// ── A ONE-MEMBER ARM is a literal union of one, and flattens with the rest ──────
+type GA = "gg"
+type GB = "gh" | "gi"
+type GU = GA | GB
+function sidG(x: GU): GU { x }
+function oneMemberArm() { print(sidG("gg")) }
+oneMemberArm()
+
+// ── THE CONTROLS THAT MUST NOT FLATTEN, and do not ─────────────────────────────
+// A MIXED-BASE pair has no single rep whatever the nesting, so `litUnionFlatMembers`
+// declines the whole list and the union keeps its members nested — the same refusal
+// `K | f64` gets. Both cells RUN on master and must still run.
+type MA = 41 | 42
+type MK = "ma" | "mb"
+type MU = MA | MK
+function mixedBase() {
+  const x: MU = 41
+  if x is MA { print("A") } else { print("K") }
+  const y: MU = "ma"
+  if y is MA { print("A") } else { print("X") }
+}
+mixedBase()
+// A member that is not a literal union AT ALL declines it too, and the union then
+// collapses to the shared base scalar exactly as it did before. Graded through `is`
+// rather than `print` for the same reason the numeric element above is: `print` of a
+// `K | i32` local is invalid wasm on the FLAT spelling too (`type PU = 61 | 62 | i32`,
+// rc 1 on both compilers) — a third pre-existing hole this fix does not touch.
+type PA = 61 | 62
+type PU = PA | i32
+function withPrim() {
+  const x: PU = 61
+  if x is PA { print("P") } else { print("O") }
+  const y: PU = 71
+  if y is PA { print("P") } else { print("O") }
+}
+withPrim()

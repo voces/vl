@@ -7453,6 +7453,89 @@ function nameToTy(name: string) {
   r
 }
 
+// ── the LITERAL-UNION FLATTEN, shared by the annotation AND declaration routes ──────
+// "A union all of whose members are literal unions IS one" (slice C,
+// `docs/internals/litunion-compact-rep-design.md` §8.3). Stated ONCE, as a member-list
+// transform, because a union's member list is built in two places that never met: the
+// ANNOTATION home (`annUnionInnerTy`, below) and the DECLARATION home
+// (`fillTypeDeclAt`'s `UnionDecl` arm, which fills the pass-0a placeholder in place and
+// therefore cannot call a function that MINTS a type).
+
+// Push `ty` onto `out` unless a member already there is the SAME variant. The dedup the
+// flatten and the non-flatten leg both need, so an overlapping pair
+// (`"oa"|"ob" | "ob"|"oc"`) keeps `"ob"` exactly once.
+function pushDistinctVariantTy(out: i32[], ty: i32) {
+  let i = 0
+  while i < out.length {
+    if sameVariantTy(ty, out[i]) { return 0 }
+    i = i + 1
+  }
+  out.push(ty)
+  0
+}
+
+// The BASE SCALAR of a HOMOGENEOUS literal union — a `TyUnion` whose members are all
+// `TyLit` over one base (`"aa" | "bb"` → string, `1 | 2` → i32, `1.5 | 2.5` → f64) — or
+// -1 for anything else.
+//
+// `softenLitTy` IS the rule and this is a projection of it, not a second answer: it moves
+// exactly the homogeneous all-`TyLit` unions and returns its argument unchanged for every
+// set it does not claim (a non-literal member, a mixed-base pair, an empty member list).
+//
+// `tyIsLitUnion` CANNOT BE ASKED HERE, and that is the whole reason this exists. That
+// predicate is the STRING-only one — `litKind != "str"` rejects — because a string
+// litunion's alias name IS its interned-atom identity. The flatten has no such stake: it
+// asks only "do these members share one rep", which the numeric spellings answer too, and
+// asking `tyIsLitUnion` instead is what left `type U = 1 | 2 | 3 | 4` working while
+// `type A = 1 | 2; type B = 3 | 4; type U = A | B` reached the emitter as a union OF
+// unions (#1792).
+function homogLitUnionBase(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return -1 }
+    const soft = softenLitTy(ty)
+    if soft != ty { return soft }
+  }
+  -1
+}
+
+// The FLATTENED, deduped literal members of `members` when EVERY member is a homogeneous
+// literal union over ONE COMMON base — filled into `out`, answering true. Answers false
+// and leaves `out` UNTOUCHED otherwise, so a caller keeps its own member list on that leg.
+//
+// THE COMMON-BASE TEST IS THE SCOPE. `K | KN` (a string litunion beside a numeric one)
+// has no single rep whatever the nesting, so flattening it would only swap one boxed
+// shape for another while destroying the member unions' own arena nodes; it is declined
+// for the same reason `K | f64` is. A member that is not a literal union at all —
+// `TyPrim`, `TyObj`, a one-member alias WRAPPER over a litunion — declines the whole
+// list, which is §8.3's "the mixed arena SHAPE is load-bearing" ruling read exactly.
+function litUnionFlatMembers(members: i32[], out: i32[]): boolean {
+  if members.length < 2 { return false }
+  let base = -1
+  let i = 0
+  while i < members.length {
+    const b = homogLitUnionBase(members[i])
+    if b < 0 { return false }
+    if base < 0 { base = b }
+    if base != b { return false }
+    i = i + 1
+  }
+  i = 0
+  while i < members.length {
+    const mt = T.tys[members[i]]
+    if mt is TyUnion {
+      let ml = 0
+      while ml < mt.uMembers.length {
+        pushDistinctVariantTy(out, mt.uMembers[ml])
+        ml = ml + 1
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
 // ── the ANNOTATION union's member list, shared by BOTH annotation routes ────────────
 // `tsToTyReal` (the parser TREE route) and `nameToTyReal` (the string NAME route) build
 // the same union from the same members, so the two rules below have ONE home each. A
@@ -7469,9 +7552,13 @@ function nameToTy(name: string) {
 // Sixteen of the twenty grid cells in `docs/internals/litunion-compact-rep-design.md`
 // §8.3 are that one missing flatten, eleven of them SILENTLY wrong.
 //
-// THE DECLARATION ROUTE HAS ALWAYS FLATTENED — `type Q = K | K2` registers a real
-// litunion alias — so this is the ANNOTATION route reaching the same arena shape, not a
-// new rule. It is the same "a union of unions is one union" that `joinTys` applies
+// THE DECLARATION ROUTE FLATTENS TOO — `type Q = K | K2` fills its placeholder with the
+// flattened literals — so this is the ANNOTATION route reaching the same arena shape, not
+// a new rule. (Slice C's header asserted that of master and it was never true: the
+// `UnionDecl` fill arm builds its member list itself and had no flatten at all, so a
+// DECLARED alias of two litunions was a union of unions at every position — #1792, which
+// is why the two routes now share `litUnionFlatMembers` instead of describing each other.)
+// It is the same "a union of unions is one union" that `joinTys` applies
 // through `flattenVariantsInto` and that canon's `unionAliasMembers` applies on the NAME
 // side; the two annotation arms were the only places that had neither, and they are the
 // reason a render-only fix cannot work: canon can be taught to SPELL `K | K2` as its
@@ -7521,39 +7608,17 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   // elsewhere — `tests/cases/closures/closure-result-union-composed-carrier.vl`'s
   // `(() => K0 | boolean) | null` emits invalid wasm the moment `K0`'s literals become
   // sibling members of the closure's result union.
-  let allLit = true
-  let a = 0
-  while a < members.length {
-    if !tyIsLitUnion(members[a]) { allLit = false }
-    a = a + 1
-  }
+  //
+  // The flatten itself is `litUnionFlatMembers` — the member-list transform the
+  // DECLARATION route (`fillTypeDeclAt`'s `UnionDecl` arm) climbs too. On its FALSE leg
+  // the member list is kept as it stands, deduped exactly as the flattened one is.
   const flat: i32[] = []
-  let i = 0
-  while i < members.length {
-    const mlits: i32[] = []
-    if allLit {
-      const mt = T.tys[members[i]]
-      if mt is TyUnion {
-        let ml = 0
-        while ml < mt.uMembers.length {
-          mlits.push(mt.uMembers[ml])
-          ml = ml + 1
-        }
-      }
+  if !litUnionFlatMembers(members, flat) {
+    let i = 0
+    while i < members.length {
+      pushDistinctVariantTy(flat, members[i])
+      i = i + 1
     }
-    if mlits.length == 0 { mlits.push(members[i]) }
-    let mk = 0
-    while mk < mlits.length {
-      let dup = false
-      let dj = 0
-      while dj < flat.length {
-        if sameVariantTy(mlits[mk], flat[dj]) { dup = true }
-        dj = dj + 1
-      }
-      if !dup { flat.push(mlits[mk]) }
-      mk = mk + 1
-    }
-    i = i + 1
   }
   if flat.length == 1 { return flat[0] }
   // A DECLARED alias with exactly these literal members OWNS the arena index — see
@@ -18874,13 +18939,40 @@ function fillTypeDeclAt(sx: i32) {
           if sawNull && nonNull.length > 0 {
             folded = annUnionTy(nonNull, true)
           }
+          // THE LITERAL-UNION FLATTEN, on the DECLARATION side — `litUnionFlatMembers`,
+          // the same member-list transform `annUnionInnerTy` climbs. This arm builds its
+          // member list itself and so never reached the shared annotation home, which is
+          // why slice C's flatten landed on the INLINE spelling only: `type U = A | B`
+          // over two litunion aliases filled the placeholder with `[A, B]` — a union whose
+          // members are UNIONS — so `tyIsLitUnion(U)` answered NO, `numLitUnionBaseTy(U)`
+          // answered -1, and `U` was a nominal union ALIAS to the name channel and a
+          // value-union BOX to `isValueUnionBox` while every other channel softened it to
+          // the members' base. `vl check` rc 0, INVALID WASM at every position that is not
+          // an `is` narrow (#1792: `expected i32, found (ref $type)`). Filling the
+          // placeholder with the flattened LITERALS makes the nested spelling land on the
+          // flat spelling's own arena shape, which is the only rep either channel has.
+          //
+          // GATED ON `!sawNull` because the fold above already owns that list, and because
+          // `annUnionInnerTy` declines a `null`-carrying flatten for its own measured
+          // reason (the atom niche's three open holes — see its header).
+          const flatU: i32[] = []
+          let flattened = false
           if folded >= 0 {
             members.push(folded)
           } else {
-            let mi = 0
-            while mi < surviving.length {
-              members.push(surviving[mi])
-              mi = mi + 1
+            if !sawNull { flattened = litUnionFlatMembers(surviving, flatU) }
+            if flattened {
+              let fi = 0
+              while fi < flatU.length {
+                members.push(flatU[fi])
+                fi = fi + 1
+              }
+            } else {
+              let mi = 0
+              while mi < surviving.length {
+                members.push(surviving[mi])
+                mi = mi + 1
+              }
             }
           }
           // Variant-member registration is ARITY-AWARE (Stage B b1, latent
@@ -18891,11 +18983,24 @@ function fillTypeDeclAt(sx: i32) {
           // never as a variant box — the old arity-blind push made such a
           // member's index classify "variant" through the flat TyObj arm
           // while the union's own index classified "struct".
+          //
+          // A FLATTENED union registers the FLATTENED members, not the aliases the source
+          // spelled: `type U = A | B` must register exactly what `type U = 1 | 2 | 3 | 4`
+          // registers, and marking `A` itself a variant member would hand a litunion ALIAS
+          // a boxed classification at every OTHER use of `A` in the module.
           if members.length >= 2 {
-            let ri = 0
-            while ri < declMemberIxs.length {
-              cVariantMemberTyIxs.push(declMemberIxs[ri])
-              ri = ri + 1
+            if flattened {
+              let fr = 0
+              while fr < flatU.length {
+                cVariantMemberTyIxs.push(flatU[fr])
+                fr = fr + 1
+              }
+            } else {
+              let ri = 0
+              while ri < declMemberIxs.length {
+                cVariantMemberTyIxs.push(declMemberIxs[ri])
+                ri = ri + 1
+              }
             }
           }
           // The 0a placeholder union was just FILLED in place (`members` is
