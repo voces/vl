@@ -180,10 +180,15 @@ const tiersOf = (s: string): Tier[] => {
   if (directive(s, "trap")) t.push("trap");
   // `@no-instantiate` (the `xfail-miscompile-` kind) is an ACCEPT case here, and that is the
   // point of the directive rather than a convenience: the program is well-typed and `vl check`
-  // — even `--codegen` — exits 0 on it. The failure is that the module it writes does not
-  // instantiate, which only `vl build`/`vl run` can see. So what native alignment has to assert
-  // is exactly that the native tool ACCEPTS it too; asserting a run tier would demand the
-  // module load, which is the very thing the case pins as broken.
+  // exits 0 on it. The failure is that the module it writes does not instantiate. So what native
+  // alignment has to assert is exactly that the native tool ACCEPTS it too; asserting a run tier
+  // would demand the module load, which is the very thing the case pins as broken.
+  //
+  // The accept tier checks WITHOUT `--codegen` (see `checkCleanDivergence`), which is what keeps
+  // this tier correct now that `--codegen` validates its own output and reports these as
+  // `invalid-module`. That second gate is asserted over the same files, as a set-equality
+  // tripwire, in tests/vl_check_codegen_test.ts — deliberately there and not here, so this
+  // suite keeps asserting front-end alignment and nothing else.
   //
   // Pushed BEFORE the run tier and with no `t.length` guard, so a file carrying BOTH
   // `@no-instantiate` and `@run`/`@log` claims two tiers and lands in AMBIGUOUS. That

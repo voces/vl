@@ -94,25 +94,33 @@ const CMD_READ_STDIN = 6
 const CMD_TEST_STASH = 7   // keep the module now in rbyte* as test file `cliCmdPath`
 const CMD_TEST_COLLECT = 8 // instantiate every stashed module; report its registry
 const CMD_TEST_RUN = 9     // run the pushed plan (in parallel); report each result
+// `vl check --codegen`. The wasm VALIDATOR lives in the engine, and the engine is
+// the host's — a VL program has none — so "did the emitter produce a MODULE?" is
+// the second thing (after execution) this brain cannot decide for itself. The
+// emitter running to completion is not the same claim, and the gap between them is
+// the check-clean-invalid-wasm class. The bytes are already in the driver's `rbyte*`
+// buffer, exactly where CMD_TEST_STASH reads them, so nothing new crosses.
+const CMD_VALIDATE = 10 // validate the module now in rbyte*; report engine verdict
 
 // The state-machine states (cliState). `*_RECV` states resume after the host has
 // committed the result of the command the previous `cliNext` returned.
-const ST_INIT = 0          // parse argv, classify the target
-const ST_CLASSIFY = 1      // got the LIST_DIR result for the target (dir vs file)
-const ST_WALK = 2          // got a LIST_DIR result for a pending directory
-const ST_PRINT = 3         // draining cliOut to stderr
-const ST_CHECK_READ = 4    // got a check file's source
-const ST_CHECK_FETCH = 5   // got a pending module's source
-const ST_DONE = 6          // finished
-const ST_FMT_STDIN = 7     // got stdin for `fmt`
-const ST_FMT_READ = 8      // got a fmt file's source
-const ST_FMT_AFTER = 9     // a fmt write/print was serviced; advance
-const ST_FIX_WROTE = 10    // a `check --fix` write was serviced; run the check
-const ST_TEST_READ = 11    // got a test file's source
-const ST_TEST_FETCH = 12   // got a test file dependency's source
-const ST_TEST_STASH = 13   // the host stashed the compiled test module
-const ST_TEST_COLLECT = 14 // the host reported every stashed file's registry
-const ST_TEST_RUN = 15     // the host reported every planned test's result
+const ST_INIT = 0            // parse argv, classify the target
+const ST_CLASSIFY = 1        // got the LIST_DIR result for the target (dir vs file)
+const ST_WALK = 2            // got a LIST_DIR result for a pending directory
+const ST_PRINT = 3           // draining cliOut to stderr
+const ST_CHECK_READ = 4      // got a check file's source
+const ST_CHECK_FETCH = 5     // got a pending module's source
+const ST_DONE = 6            // finished
+const ST_FMT_STDIN = 7       // got stdin for `fmt`
+const ST_FMT_READ = 8        // got a fmt file's source
+const ST_FMT_AFTER = 9       // a fmt write/print was serviced; advance
+const ST_FIX_WROTE = 10      // a `check --fix` write was serviced; run the check
+const ST_TEST_READ = 11      // got a test file's source
+const ST_TEST_FETCH = 12     // got a test file dependency's source
+const ST_TEST_STASH = 13     // the host stashed the compiled test module
+const ST_TEST_COLLECT = 14   // the host reported every stashed file's registry
+const ST_TEST_RUN = 15       // the host reported every planned test's result
+const ST_CHECK_VALIDATE = 16 // the host validated this file's emitted module
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []   // committed argv (cliArgs[0] = the subcommand)
@@ -129,6 +137,8 @@ let cliExit = 0              // the process exit code, read after CMD_DONE
 let cliFile = ""
 let cliConcise = 0
 let cliCodegen = 0
+let cliNoValidate = 0          // --no-validate: emit under --codegen, skip the engine check
+let cliValidateMsg = ""        // the engine's rejection for the current file ("" = valid)
 let cliJson = 0
 let cliColor = 0
 let cliSeverity = "error"
@@ -301,6 +311,8 @@ export function cliArgReset() {
   cliFile = ""
   cliConcise = 0
   cliCodegen = 0
+  cliNoValidate = 0
+  cliValidateMsg = ""
   cliJson = 0
   cliColor = 0
   cliSeverity = "error"
@@ -441,6 +453,18 @@ export function cliResultLoad(count: i32) {
 export function cliFileCommit(found: i32) {
   cliFileFound = found
   cliFileSrc = fromCodePoints(cliResultAcc)
+  cliResultAcc = []
+  0
+}
+// The host's CMD_VALIDATE verdict for the file just emitted: `ok = 1` and the
+// module is one the engine accepts; `ok = 0` and `cliResultAcc` carries the
+// engine's rejection, which becomes this file's positionless error diagnostic.
+export function cliValidateCommit(ok: i32) {
+  if ok != 0 {
+    cliValidateMsg = ""
+  } else {
+    cliValidateMsg = fromCodePoints(cliResultAcc)
+  }
   cliResultAcc = []
   0
 }
@@ -714,6 +738,11 @@ function cliParseArgs() {
       cliConcise = 1
     } else if sub == "check" && a == "--codegen" {
       cliCodegen = 1
+    } else if sub == "check" && a == "--no-validate" {
+      // Mirrors `vl build --no-validate`: run the emitter, skip the engine's
+      // verdict on its output. For anyone measuring emitter reach on a corpus
+      // where invalid modules are the point.
+      cliNoValidate = 1
     } else if sub == "check" && a == "--json" {
       cliJson = 1
     } else if sub == "check" && a == "--severity" {
@@ -874,6 +903,24 @@ function cliCheckCurFile() {
   else if rc == 2 { cliLastStage = "type" }
   else if rc == 3 { cliLastStage = "emit" }
 
+  // `--codegen` is the promise that the program LOWERS, and the emitter returning
+  // 0 does not establish it — the validator is the engine's, so the bytes have to
+  // cross. Hand them over and resume in `cliCheckCurFileRest` with the verdict in
+  // `cliValidateMsg`. A host round-trip is safe HERE and nowhere later: it reads
+  // `rbyte*` and commits a string, never re-entering the compiler, so the driver's
+  // diagnostic stores the rest of this function reads are untouched.
+  cliValidateMsg = ""
+  if cliCodegen != 0 && rc == 0 && cliNoValidate == 0 {
+    cliState = ST_CHECK_VALIDATE
+    return CMD_VALIDATE
+  }
+  cliCheckCurFileRest()
+}
+
+// The rest of the per-file check, after the engine has had its say (see
+// `cliCheckCurFile`). Split out ONLY so the validate round-trip has somewhere to
+// resume; nothing else about the ordering changed.
+function cliCheckCurFileRest() {
   // Error-tier diagnostics (all `error`) — capture them NOW, straight from the
   // driver stores, BEFORE `lintSrc` below: that re-parses the entry source and
   // resets the diagnostic stores, which would otherwise drop module-compile errors.
@@ -899,6 +946,25 @@ function cliCheckCurFile() {
       diagModule(i),
     )
     i = i + 1
+  }
+  // The engine rejected the module this file emitted. POSITIONLESS: the offset the
+  // validator names is a wasm offset, and no map from it back to a VL span exists —
+  // so the diagnostic says which FILE and what the engine said, and stops there.
+  // It is an `error` because the alternative is what this gate was built to end: a
+  // clean `check --codegen` over a program that cannot load.
+  if cliValidateMsg.length > 0 {
+    cliAddDiag(
+      "error",
+      "invalid-module",
+      0,
+      0,
+      0,
+      "the emitted module is not valid wasm (a compiler emit bug, not an error " +
+        "in this file): " +
+        cliValidateMsg,
+      0,
+    )
+    cliValidateMsg = ""
   }
 
   // Lint (parse-only). Run BEFORE the --fix block (which needs the lint stream)
@@ -1910,6 +1976,7 @@ export function cliNext() {
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
     return cliTestFetchOrCompile()
   }
+  if st == ST_CHECK_VALIDATE { return cliCheckCurFileRest() }
   if st == ST_TEST_STASH {
     cliFileIdx = cliFileIdx + 1
     return cliStartTestFile()

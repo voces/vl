@@ -5,7 +5,10 @@
 # WHAT IT IS FOR. `monoSubstAnn` rebuilds a type SPELLING per generic instance, and a
 # rebuilt spelling is a second intern key (that function's own header says so). The failure
 # it produces is not a diagnostic: the emitter resolves a type-parameter name through the
-# NOMINAL path and emits a module that `vl check --codegen` accepts and wasmtime refuses.
+# NOMINAL path and emits a module wasmtime refuses. (`vl check --codegen` accepted such a
+# module when this grid was written; it now validates its output, so the `check=` column
+# reads 1 on a BAD cell. The BUCKETS are still decided by `vl run`, so that change moves no
+# cell — which is why this grid stays the instrument for the class.)
 # Four such holes were closed in #1473/#1475; the corpus contained NONE of them, because
 # every corpus generic annotates the shape that hides the bug.
 #

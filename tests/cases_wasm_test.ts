@@ -38,8 +38,11 @@
 //   - @no-instantiate asserts the emitted module FAILS TO INSTANTIATE (the engine
 //     refuses it — a CompileError, not a VLRuntimeError). This is the MISCOMPILE
 //     tier: a well-typed program the checker is right to accept and the emitter
-//     lowers wrong, which `vl check` (even `--codegen`) cannot see and `@trap`
-//     explicitly rejects. An optional TEXT matches the engine's message.
+//     lowers wrong, which `@trap` explicitly rejects. An optional TEXT matches
+//     the engine's message. (`vl check --codegen` DOES see this class now — it
+//     validates its bytes and reports `invalid-module`; the two gates agree by
+//     construction, asserted in tests/vl_check_codegen_test.ts. This comment used
+//     to say `--codegen` could not see it, which was true when it was written.)
 //     See tests/cases/soundness/README.vl, `xfail-miscompile-*`.
 //   - @trap asserts a runtime trap (a `VLRuntimeError` from `runWasm`) and
 //     matches MESSAGE substrings only. `line:col` trap substrings are skipped:
@@ -469,8 +472,7 @@ const assertCase = async (
     }
     if (d.noInstantiate.length) {
       // The MISCOMPILE tier. A well-typed program the checker is right to accept, whose
-      // emitted module the engine refuses to instantiate — `vl check --codegen` exits 0 and
-      // nothing below the runner can see it. `@trap` cannot pin this: it asserts a
+      // emitted module the engine refuses to instantiate. `@trap` cannot pin this: it asserts a
       // VLRuntimeError from a module that DID load, and rejects the CompileError this
       // produces. See tests/cases/soundness/README.vl, `xfail-miscompile-*`.
       let thrownNI: unknown;

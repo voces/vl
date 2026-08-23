@@ -1,18 +1,20 @@
 // The native `vl` tool — a single binary with deno-style subcommands:
 //
 //   vl build <in.vl> -o <out.wasm>   compile a file to a wasm module, then VALIDATE it
-//   vl check <in.vl>                 typecheck; print diagnostics (`--codegen` also emits)
+//   vl check <in.vl>                 typecheck; print diagnostics (`--codegen` emits + VALIDATES)
 //   vl run   <in.vl>                 compile in-memory, then instantiate + run
 //   vl fmt   [path] [-w|--check]     format source (stdout / write / CI gate); stdin when no path
 //   vl test  [path] [-t <name>]      discover `*.test.vl`, run them in parallel, report
 //
-// Only `build` and `run` ever hand the emitted bytes to the ENGINE, so only they can
-// tell a valid module from an invalid one — the validator lives in wasmtime, and the
-// compiler is a VL program inside the guest with no engine of its own. `check
-// --codegen` runs the emitter but never leaves the guest with the bytes, so it
-// reports the emitter's own errors and nothing about the module's validity. (This
-// header used to claim `check` did "emit-validate"; measured false — see
-// `validate_written_module`.)
+// The wasm validator lives in wasmtime, and the compiler is a VL program inside the
+// guest with no engine of its own — so telling a valid module from an invalid one is
+// always the host's job. `build` validates the file it wrote, `run` validates before
+// it translates, and `check --codegen` now hands its bytes over too (CMD_VALIDATE),
+// so all three report module validity. (Before that it ran the emitter and never let
+// the bytes leave the guest, which made a clean `--codegen` compatible with a module
+// that could not load — the check-clean-invalid-wasm class. An older version of this
+// header claimed `check` did "emit-validate" when it did not; it does now, by the
+// mechanism named here.) `--no-validate` opts out on both commands.
 //
 // This is a THIN host adapter: all compiler logic (lex/parse/typecheck/emit) lives
 // in the self-hosted compiler wasm (`build/vl-compiler.wasm`, self-compiled from
@@ -2157,6 +2159,7 @@ const CMD_READ_STDIN: i32 = 6;
 const CMD_TEST_STASH: i32 = 7;
 const CMD_TEST_COLLECT: i32 = 8;
 const CMD_TEST_RUN: i32 = 9;
+const CMD_VALIDATE: i32 = 10;
 
 /// Read a string payload via a bare `<prefix>Len()` / `<prefix>At(j)` accessor pair
 /// (one UTF-32 code point per `At`) off an instance that is NOT the compiler — a
@@ -2418,6 +2421,39 @@ fn cli_pump(args: &[String]) -> Result<()> {
                         out_push.call(&mut store, ch as i32)?;
                     }
                     res_commit.call(&mut store, (k as i32, outcome.status))?;
+                }
+            }
+            CMD_VALIDATE => {
+                // `vl check --codegen` just emitted a module for the current file.
+                // Run the engine's validator over it and hand the verdict back.
+                //
+                // This is the SAME check `vl build` runs over the file it wrote
+                // (`validate_written_module`) and the one `vl run` fails on, and it
+                // closes the gap that header comment used to describe: `--codegen`
+                // ran the emitter and reported nothing about the module's validity,
+                // so a program that could not load passed the gate that promises it
+                // will lower. Nothing new crosses the boundary — the bytes come off
+                // the driver's own `rbyte` readback channel, exactly as
+                // CMD_TEST_STASH reads them.
+                //
+                // In memory, not off disk: unlike `vl build` there is no artifact
+                // and no `-O` rung to cover, so the emitter's own bytes ARE what a
+                // caller would run.
+                //
+                // The commit is probed HERE, not up front with the rest of the pump
+                // exports, so a seed that predates this command — and therefore
+                // never issues it — still runs under this host.
+                let validate_commit =
+                    inst.get_typed_func::<i32, i32>(&mut store, "cliValidateCommit")?;
+                let bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
+                match Module::validate(&engine, &bytes) {
+                    Ok(()) => {
+                        validate_commit.call(&mut store, 1)?;
+                    }
+                    Err(e) => {
+                        result_in.send(&mut store, &format!("{e}"))?;
+                        validate_commit.call(&mut store, 0)?;
+                    }
                 }
             }
             other => bail!("vl: unknown CLI command {other} from the wasm pump"),
