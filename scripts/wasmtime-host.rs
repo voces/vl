@@ -91,6 +91,251 @@ fn main() -> Result<()> {
         s.lock().unwrap().out.push(parts.join(" "));
     })?;
 
+    // ── the filesystem floor (`std:fs`) ──────────────────────────────────────
+    // The seven fs imports, registered only when the module declares them. This spike
+    // is not in CI and is built by nothing (see the header) — it carries them because
+    // ROADMAP's host-ABI item requires every new import to land in all three hosts, and
+    // because a parity harness that cannot instantiate a file-touching module cannot
+    // compare its output.
+    //
+    // Semantics are `scripts/vl-host/src/main.rs`'s (`register_fs_imports`) and that is
+    // the authoritative copy: WASI preview1 errno numbering, EMPTY-`u8[]`-on-error with
+    // the reason in `__fs_errno__`, `.`/`..` filtered out of a listing, 0x0A between
+    // entries. What is deliberately NOT duplicated is the full errno table — this host
+    // maps the handful of kinds a parity run can produce and answers EIO (29) for the
+    // rest, which is the same fallback the primary host uses for an unrecognized error.
+    //
+    // The types come from the MODULE, never from here: wasmtime treats rec-group types
+    // nominally, so a `StructType` minted in this file would not match the module's
+    // `u8[]` wrapper and the import would be rejected at instantiation.
+    let fs_errno = Arc::new(Mutex::new(0i32));
+    let declared: Vec<(String, FuncType)> = module
+        .imports()
+        .filter(|i| i.module() == "imports")
+        .filter_map(|i| match i.ty() {
+            ExternType::Func(ft) => Some((i.name().to_string(), ft)),
+            _ => None,
+        })
+        .collect();
+    let fs_ty = |n: &str| {
+        declared
+            .iter()
+            .find(|(name, _)| name == n)
+            .map(|(_, ft)| ft.clone())
+    };
+    // The module's own `u8[]` wrapper struct and packed backing, recovered from the
+    // first fs import signature that names them.
+    let mut u8_types: Option<(StructType, ArrayType)> = None;
+    for (_, ft) in &declared {
+        for vt in ft.params().chain(ft.results()) {
+            let Some(rt) = vt.as_ref() else { continue };
+            let HeapType::ConcreteStruct(st) = rt.heap_type() else {
+                continue;
+            };
+            let Some(f0) = st.field(0) else { continue };
+            let Some(inner) = f0.element_type().as_val_type() else {
+                continue;
+            };
+            let Some(ir) = inner.as_ref() else { continue };
+            let HeapType::ConcreteArray(at) = ir.heap_type() else {
+                continue;
+            };
+            if at.element_type().is_i8() {
+                u8_types = Some((st.clone(), at.clone()));
+            }
+        }
+    }
+    fn errno_of(e: &std::io::Error) -> i32 {
+        use std::io::ErrorKind::*;
+        match e.kind() {
+            NotFound => 44,
+            PermissionDenied => 2,
+            AlreadyExists => 20,
+            IsADirectory => 31,
+            NotADirectory => 54,
+            DirectoryNotEmpty => 55,
+            ReadOnlyFilesystem => 69,
+            StorageFull => 51,
+            InvalidInput | InvalidData => 28,
+            _ => 29,
+        }
+    }
+    fn bytes_of(c: &mut Caller<'_, Arc<Mutex<HostState>>>, v: &Val) -> Result<Vec<u8>> {
+        let Val::AnyRef(Some(r)) = v else {
+            bail!("fs intrinsic: expected a non-null u8[] argument")
+        };
+        let s = r.unwrap_struct(&c)?;
+        let Val::AnyRef(Some(b)) = s.field(&mut *c, 0)? else {
+            bail!("fs intrinsic: u8[] wrapper has a null backing")
+        };
+        let arr = b.unwrap_array(&c)?;
+        let cap = arr.len(&c)? as usize;
+        let mut buf = vec![0u8; cap];
+        arr.copy_to_i8_slice(&mut *c, &mut buf)?;
+        // The WRAPPER's `len` is the live length; the backing may be longer.
+        if let Val::I32(n) = s.field(&mut *c, 1)? {
+            buf.truncate((n.max(0) as usize).min(cap));
+        }
+        Ok(buf)
+    }
+    fn mk_list(
+        c: &mut Caller<'_, Arc<Mutex<HostState>>>,
+        st: &StructType,
+        at: &ArrayType,
+        bytes: &[u8],
+    ) -> Result<Val> {
+        let ap = ArrayRefPre::new(&mut *c, at.clone());
+        let sp = StructRefPre::new(&mut *c, st.clone());
+        let n = bytes.len() as i32;
+        let backing = ArrayRef::new_from_i8_slice(&mut *c, &ap, bytes)?;
+        let w = StructRef::new(
+            &mut *c,
+            &sp,
+            &[
+                Val::AnyRef(Some(backing.to_anyref())),
+                Val::I32(n),
+                Val::I32(n),
+            ],
+        )?;
+        Ok(Val::AnyRef(Some(w.to_anyref())))
+    }
+    // Unix-only, like the spike itself: a path is raw bytes.
+    fn to_path(b: &[u8]) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b))
+    }
+    if let Some(ft) = fs_ty("__fs_errno__") {
+        let e = fs_errno.clone();
+        linker.func_new("imports", "__fs_errno__", ft, move |_c, _a, r| {
+            r[0] = Val::I32(*e.lock().unwrap());
+            Ok(())
+        })?;
+    }
+    if let Some(ft) = fs_ty("__args_count__") {
+        let n = std::env::args().skip(2).count() as i32;
+        linker.func_new("imports", "__args_count__", ft, move |_c, _a, r| {
+            r[0] = Val::I32(n);
+            Ok(())
+        })?;
+    }
+    if let Some(ft) = fs_ty("__fs_stat__") {
+        let e = fs_errno.clone();
+        linker.func_new("imports", "__fs_stat__", ft, move |mut c, a, r| {
+            let p = to_path(&bytes_of(&mut c, &a[0])?);
+            r[0] = Val::I32(match std::fs::metadata(&p) {
+                Ok(m) => {
+                    *e.lock().unwrap() = 0;
+                    if m.is_dir() { 1 } else { 0 }
+                }
+                Err(err) => {
+                    let code = errno_of(&err);
+                    *e.lock().unwrap() = code;
+                    -code
+                }
+            });
+            Ok(())
+        })?;
+    }
+    if let Some(ft) = fs_ty("__fs_write__") {
+        let e = fs_errno.clone();
+        linker.func_new("imports", "__fs_write__", ft, move |mut c, a, r| {
+            let p = to_path(&bytes_of(&mut c, &a[0])?);
+            let d = bytes_of(&mut c, &a[1])?;
+            r[0] = Val::I32(match std::fs::write(&p, &d) {
+                Ok(()) => {
+                    *e.lock().unwrap() = 0;
+                    0
+                }
+                Err(err) => {
+                    let code = errno_of(&err);
+                    *e.lock().unwrap() = code;
+                    -code
+                }
+            });
+            Ok(())
+        })?;
+    }
+    if let Some((st, at)) = u8_types {
+        if let Some(ft) = fs_ty("__fs_read__") {
+            let e = fs_errno.clone();
+            let (st, at) = (st.clone(), at.clone());
+            linker.func_new("imports", "__fs_read__", ft, move |mut c, a, r| {
+                let p = to_path(&bytes_of(&mut c, &a[0])?);
+                // A DIRECTORY fails here as EISDIR, from the OS's own read — the guest
+                // deliberately does not pre-stat.
+                let out = match std::fs::read(&p) {
+                    Ok(b) => {
+                        *e.lock().unwrap() = 0;
+                        b
+                    }
+                    Err(err) => {
+                        *e.lock().unwrap() = errno_of(&err);
+                        Vec::new()
+                    }
+                };
+                r[0] = mk_list(&mut c, &st, &at, &out)?;
+                Ok(())
+            })?;
+        }
+        if let Some(ft) = fs_ty("__fs_list__") {
+            let e = fs_errno.clone();
+            let (st, at) = (st.clone(), at.clone());
+            linker.func_new("imports", "__fs_list__", ft, move |mut c, a, r| {
+                use std::os::unix::ffi::OsStrExt;
+                let p = to_path(&bytes_of(&mut c, &a[0])?);
+                let mut block: Vec<u8> = Vec::new();
+                let mut code = 0i32;
+                match std::fs::read_dir(&p) {
+                    Err(err) => code = errno_of(&err),
+                    Ok(entries) => {
+                        for ent in entries {
+                            match ent {
+                                Err(err) => {
+                                    code = errno_of(&err);
+                                    break;
+                                }
+                                Ok(ent) => {
+                                    let name = ent.file_name();
+                                    if name == "." || name == ".." {
+                                        continue;
+                                    }
+                                    if !block.is_empty() {
+                                        block.push(0x0A);
+                                    }
+                                    block.extend_from_slice(name.as_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+                if code != 0 {
+                    block.clear();
+                }
+                *e.lock().unwrap() = code;
+                r[0] = mk_list(&mut c, &st, &at, &block)?;
+                Ok(())
+            })?;
+        }
+        if let Some(ft) = fs_ty("__args_get__") {
+            let e = fs_errno.clone();
+            let argv: Vec<Vec<u8>> = std::env::args().skip(2).map(|s| s.into_bytes()).collect();
+            linker.func_new("imports", "__args_get__", ft, move |mut c, a, r| {
+                let Val::I32(i) = a[0] else {
+                    bail!("__args_get__: expected an i32 index")
+                };
+                let out = if i >= 0 && (i as usize) < argv.len() {
+                    *e.lock().unwrap() = 0;
+                    argv[i as usize].clone()
+                } else {
+                    *e.lock().unwrap() = 28; // EINVAL
+                    Vec::new()
+                };
+                r[0] = mk_list(&mut c, &st, &at, &out)?;
+                Ok(())
+            })?;
+        }
+    }
+
     // Instantiation runs the module's start function (VL's program body).
     let _instance = linker.instantiate(&mut store, &module)?;
 

@@ -162,6 +162,52 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
         // A string prints by streaming its code points (no shared memory); flush
         // assembles and emits the accumulated line.
         __print_char__: (code: number) => printChars.push(code),
+        // ── the filesystem floor: STUBS THAT THROW, and why they cannot be more ──
+        //
+        // MEASURED against this Deno's V8 (14.9.207.2), not assumed. Two independent
+        // walls, either of which alone would be fatal:
+        //
+        //   1. A WasmGC object is OPAQUE TO JS. A `(array (mut i8))` handed to an
+        //      import arrives as `typeof "object"` with `.length === undefined`,
+        //      `a[0] === undefined`, `Object.keys(a) === []`, and `String(a)` throws
+        //      "Cannot convert object to primitive value". So `__fs_write__` cannot
+        //      read the path it was given.
+        //   2. JS CANNOT CONSTRUCT ONE. Returning a `Uint8Array`, an array, a number
+        //      or `undefined` for a `(ref null $arr)` result is rejected with "type
+        //      incompatibility when transforming from/to JS"; `null` is the ONLY value
+        //      V8 accepts, and the VL floor's results are NON-NULL `(ref $bl8)`, so
+        //      even that is unusable. `Object.keys(WebAssembly)` carries no GC
+        //      constructor: compile, validate, instantiate, compileStreaming,
+        //      instantiateStreaming, promising.
+        //
+        // The usual escape — drive the module's own exported accessors — is closed
+        // twice: a VL program's top level runs as the START function, so an import
+        // firing from it sees `instance === undefined` (measured directly), and a
+        // plain VL program exports nothing at all (`Object.keys(inst.exports)` is
+        // empty), so there is no accessor to reach even afterwards.
+        //
+        // Hence: throw, with the reason in the message. fs coverage lives in the
+        // native suites (`tests/selfhost_native_*`), and a corpus fixture that uses
+        // these carries `// @skip`, which this harness honors and the native
+        // alignment suite deliberately does not. See `scripts/vl-host/src/main.rs`'s
+        // `register_fs_imports` for the working implementation.
+        ...Object.fromEntries(
+          [
+            "__fs_read__",
+            "__fs_write__",
+            "__fs_list__",
+            "__fs_stat__",
+            "__args_count__",
+            "__args_get__",
+            "__fs_errno__",
+          ].map((name) => [name, () => {
+            throw new Error(
+              `${name} is not available under the V8 harness — WasmGC values are opaque to JS ` +
+                `and cannot be constructed from it. Run this case through the native \`vl\` ` +
+                `(tests/selfhost_native_align_test.ts), or mark the fixture \`// @skip\`.`,
+            );
+          }]),
+        ),
         __print_str_flush__: () => {
           // Chunk the code-point→string conversion: `String.fromCodePoint(...spread)`
           // blows the JS call-argument limit on very large prints — build the line

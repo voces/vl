@@ -1314,6 +1314,486 @@ fn run_program_with(
     Ok(())
 }
 
+// ── the filesystem floor (`std:fs`) ──────────────────────────────────────────
+// Seven host imports. Unlike the print family they are OPTIONAL: the emitter declares
+// only the ones the program calls, so this side registers only what the module asks
+// for and a file-free program's instantiation is byte-for-byte the work it was before.
+//
+// THE TYPES COME FROM THE MODULE, NOT FROM HERE. A `u8[]` is a WasmGC struct in the
+// module's own rec group, and wasmtime treats rec-group types NOMINALLY: a
+// `StructType` this host minted with `StructType::new` would be a different type from
+// the module's, and the import would be rejected at instantiation with an incompatible
+// type. So `u8_list_types` recovers the module's own `StructType`/`ArrayType` by
+// reflecting the declared import signature (`Module::imports` -> `FuncType` ->
+// `RefType::heap_type` -> `HeapType::ConcreteStruct`), and every allocation this host
+// makes is pre-typed with THAT. Same reason the `FuncType` handed to `Linker::func_new`
+// is the module's own rather than one built here.
+//
+// THIS IS THE FIRST HOST IMPORT WHOSE SIGNATURE IS NOT SCALAR. Every other import in
+// this file is `func_wrap` with plain i32/i64/f32/f64 — see the header on
+// `instantiate_program` — which is why these use `func_new` with an explicit `FuncType`
+// and a `Caller` instead: `func_wrap`'s `WasmTy` impl for `Rooted<StructRef>` would
+// publish the ABSTRACT `(ref struct)` heap type, and function-result subtyping is
+// covariant, so `(ref struct)` does not satisfy a declared `(ref $bl8)` result.
+//
+// NO SANDBOX, DELIBERATELY AND WORTH SAYING OUT LOUD: a VL program run by `vl run`
+// reads and writes with the invoking user's full privileges, exactly like a script run
+// by `python` or `node`. There is no preopen set, no path allowlist and no chroot. If
+// VL ever grows a capability model, this is the layer it lands in.
+
+/// WASI preview1 errno for a `std::io::Error`.
+///
+/// **The numbering is WASI's, not the host platform's**, and the two disagree on almost
+/// every value that matters: WASI's `ENOENT` is 44 where POSIX's is 2, and WASI's 2 is
+/// `EACCES`. `std/fs.vl` hardcodes the WASI constants, so this function is the contract
+/// boundary — a raw `errno` leaking through would make `e.code == ENOENT` silently
+/// false for every missing file.
+///
+/// `ErrorKind` FIRST, raw errno second. The kind is portable and stable, so the common
+/// filesystem outcomes map identically on every OS; the raw table below it is Linux
+/// numbering and only catches what no kind names. Anything unrecognized becomes `EIO`
+/// (29) rather than passing through as a number `std:fs` cannot interpret — an
+/// unmatchable code reaches the caller as an error that looks like none of them.
+fn wasi_errno(e: &std::io::Error) -> i32 {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => return 44,          // ENOENT
+        ErrorKind::PermissionDenied => return 2,   // EACCES
+        ErrorKind::AlreadyExists => return 20,     // EEXIST
+        ErrorKind::IsADirectory => return 31,      // EISDIR
+        ErrorKind::NotADirectory => return 54,     // ENOTDIR
+        ErrorKind::DirectoryNotEmpty => return 55, // ENOTEMPTY
+        ErrorKind::ReadOnlyFilesystem => return 69, // EROFS
+        ErrorKind::StorageFull => return 51,       // ENOSPC
+        ErrorKind::QuotaExceeded => return 19,     // EDQUOT
+        ErrorKind::FileTooLarge => return 22,      // EFBIG
+        ErrorKind::TooManyLinks => return 34,      // EMLINK
+        ErrorKind::InvalidFilename => return 37,   // ENAMETOOLONG
+        ErrorKind::CrossesDevices => return 75,    // EXDEV
+        ErrorKind::ResourceBusy | ErrorKind::ExecutableFileBusy => return 10, // EBUSY
+        ErrorKind::OutOfMemory => return 48,       // ENOMEM
+        ErrorKind::Interrupted => return 27,       // EINTR
+        ErrorKind::WouldBlock => return 6,         // EAGAIN
+        ErrorKind::Unsupported => return 58,       // ENOTSUP
+        ErrorKind::InvalidInput | ErrorKind::InvalidData => return 28, // EINVAL
+        _ => {}
+    }
+    match e.raw_os_error() {
+        Some(9) => 8,   // EBADF
+        Some(14) => 21, // EFAULT
+        Some(23) => 41, // ENFILE
+        Some(24) => 33, // EMFILE
+        Some(29) => 70, // ESPIPE
+        Some(38) => 52, // ENOSYS
+        Some(40) => 32, // ELOOP
+        Some(84) => 25, // EILSEQ
+        _ => 29,        // EIO — the honest "something went wrong" of the set
+    }
+}
+
+/// The program arguments `__args_count__` / `__args_get__` answer for.
+///
+/// A PROCESS-WIDE cell rather than a threaded parameter, because that is what these
+/// are: argv belongs to the process, and `instantiate_program` is reached from five
+/// call sites (`vl run`, `vl run --batch`, and three `vl test` paths) none of which
+/// would otherwise carry it. Empty unless `vl run` filled it, so `__args_count__()` is
+/// 0 under `vl test` and under `--batch` — where "the program's arguments" has no
+/// meaning, several programs sharing one process.
+static PROGRAM_ARGS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+fn set_program_args(args: &[String]) {
+    let mut slot = PROGRAM_ARGS.lock().unwrap();
+    *slot = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+}
+
+/// The module's OWN `u8[]` wrapper struct and its packed backing array, recovered from
+/// a declared fs import's signature. `None` when the module declares no fs import that
+/// mentions `u8[]` — in which case no handler that needs them is registered either.
+///
+/// SHAPE-CHECKED, not just position-checked: the struct must be `{ (ref <i8 array>),
+/// i32, i32 }`. Today no other import carries a struct so the first hit is always the
+/// right one, but "first concrete struct in any import signature" is the kind of rule
+/// that silently picks the wrong type the day a second one appears.
+fn u8_list_types(module: &Module) -> Option<(StructType, ArrayType)> {
+    for imp in module.imports() {
+        if imp.module() != "imports" {
+            continue;
+        }
+        let ExternType::Func(ft) = imp.ty() else {
+            continue;
+        };
+        for vt in ft.params().chain(ft.results()) {
+            let Some(rt) = vt.as_ref() else { continue };
+            let HeapType::ConcreteStruct(st) = rt.heap_type() else {
+                continue;
+            };
+            if st.fields().len() != 3 {
+                continue;
+            }
+            let Some(f0) = st.field(0) else { continue };
+            let Some(inner) = f0.element_type().as_val_type() else {
+                continue;
+            };
+            let Some(inner_ref) = inner.as_ref() else { continue };
+            let HeapType::ConcreteArray(at) = inner_ref.heap_type() else {
+                continue;
+            };
+            if !at.element_type().is_i8() {
+                continue;
+            }
+            return Some((st.clone(), at.clone()));
+        }
+    }
+    None
+}
+
+/// Read a guest `u8[]` argument out as bytes.
+///
+/// The wrapper's `len` (field 1) is the live length and the BACKING may be longer —
+/// that is the whole point of the `{backing, len, cap}` shape, and reading
+/// `array.len()` instead would hand the syscall a path with trailing garbage after
+/// every `push`-grown build. `copy_to_i8_slice` requires the destination to match the
+/// backing exactly, so the copy is full-width and the truncation to `len` happens here.
+fn read_u8_list(caller: &mut Caller<'_, ()>, v: &Val) -> Result<Vec<u8>> {
+    let Val::AnyRef(Some(r)) = v else {
+        bail!("fs intrinsic: expected a non-null u8[] argument");
+    };
+    let s = r.unwrap_struct(&caller)?;
+    let backing = s.field(&mut *caller, 0)?;
+    let Val::AnyRef(Some(b)) = backing else {
+        bail!("fs intrinsic: u8[] wrapper has a null backing");
+    };
+    let arr = b.unwrap_array(&caller)?;
+    let cap = arr.len(&caller)? as usize;
+    let mut buf = vec![0u8; cap];
+    arr.copy_to_i8_slice(&mut *caller, &mut buf)?;
+    let len = match s.field(&mut *caller, 1)? {
+        Val::I32(n) if n >= 0 => n as usize,
+        _ => bail!("fs intrinsic: u8[] wrapper has a negative length"),
+    };
+    buf.truncate(len.min(cap));
+    Ok(buf)
+}
+
+/// Build a guest `u8[]` from bytes — the EMPTY one on the error path, a full one on
+/// success. Always non-null, because the declared result type is `(ref $bl8)` and the
+/// error signal is emptiness plus `__fs_errno__()`, never null.
+///
+/// The backing is allocated inside a `RootScope` and only the finished wrapper escapes
+/// it, promoted through an `OwnedRooted`. That is HYGIENE, not a fix for a measured
+/// leak, and the distinction is worth recording because the code reads like the latter.
+///
+/// The worry was real on inspection: `Func::new`'s trampoline (wasmtime 47
+/// `src/runtime/func.rs:2464`) roots the parameters and anything the handler allocates
+/// in the store's outer LIFO scope, and it enters no per-call scope — so nothing in the
+/// API obviously releases them. MEASURED instead of assumed: a program doing N whole-file
+/// reads in a loop, each allocating a fresh backing and wrapper, peaks at **20.5–20.8 MB
+/// RSS for N = 0, 20k, 100k, 150k, 200k and 400k alike** — flat, not linear. The
+/// collector reclaims them. (One 200k run read 628 MB and did not reproduce on a second
+/// 200k run at 20.8 MB; treat that as machine noise, which the flat series either side of
+/// it says it was.) The scope stays because it costs nothing and keeps the intermediate
+/// backing from outliving the call that made it.
+fn make_u8_list(
+    caller: &mut Caller<'_, ()>,
+    st: &StructType,
+    at: &ArrayType,
+    bytes: &[u8],
+) -> Result<Val> {
+    let arr_pre = ArrayRefPre::new(&mut *caller, at.clone());
+    let st_pre = StructRefPre::new(&mut *caller, st.clone());
+    let n = i32::try_from(bytes.len())
+        .map_err(|_| Error::msg("fs intrinsic: payload larger than i32 can index"))?;
+    let owned = {
+        let mut scope = RootScope::new(&mut *caller);
+        let backing = ArrayRef::new_from_i8_slice(&mut scope, &arr_pre, bytes)?;
+        let wrapper = StructRef::new(
+            &mut scope,
+            &st_pre,
+            &[
+                Val::AnyRef(Some(backing.to_anyref())),
+                Val::I32(n), // len
+                Val::I32(n), // cap — an exact-fit allocation, as `array.new_fixed` makes
+            ],
+        )?;
+        wrapper.to_owned_rooted(&mut scope)?
+    };
+    let rooted = owned.to_rooted(&mut *caller);
+    Ok(Val::AnyRef(Some(rooted.to_anyref())))
+}
+
+/// A path from guest bytes. UTF-8 on Unix is not required — `OsString` is built from
+/// the raw bytes, so a path no encoder would produce still round-trips. On a
+/// non-Unix host the bytes must be UTF-8 (Windows paths are UTF-16 underneath and
+/// there is no lossless byte view), and a non-UTF-8 path there is `EILSEQ`.
+#[cfg(unix)]
+fn os_path(bytes: &[u8]) -> Result<std::path::PathBuf, i32> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+#[cfg(not(unix))]
+fn os_path(bytes: &[u8]) -> Result<std::path::PathBuf, i32> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok(std::path::PathBuf::from(s)),
+        Err(_) => Err(25), // EILSEQ
+    }
+}
+
+/// The bytes of one directory entry's name. Unix hands them over raw; elsewhere the
+/// name must be UTF-8 for the same reason `os_path` requires it.
+#[cfg(unix)]
+fn entry_name_bytes(name: &std::ffi::OsStr) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(name.as_bytes().to_vec())
+}
+#[cfg(not(unix))]
+fn entry_name_bytes(name: &std::ffi::OsStr) -> Option<Vec<u8>> {
+    name.to_str().map(|s| s.as_bytes().to_vec())
+}
+
+/// Register the fs imports the module actually declares.
+///
+/// GATED ON THE MODULE, twice over: a name the module does not import is never
+/// defined (harmless but pointless), and a name it does import is defined with the
+/// module's OWN `FuncType`, so a signature drift between emitter and host is an
+/// instantiation error naming the import rather than a wrong answer at runtime.
+///
+/// `errno` is per-instance, shared by every handler: zeroed on each success, set to a
+/// POSITIVE WASI errno on each failure. `__fs_errno__` only reads it, and
+/// `__args_count__` deliberately does not touch it — it cannot fail, so leaving the
+/// cell alone keeps `lastErrno()` meaningful right after an unrelated failed call.
+fn register_fs_imports(
+    linker: &mut Linker<()>,
+    module: &Module,
+    errno: &Arc<Mutex<i32>>,
+) -> Result<()> {
+    let declared: Vec<(String, FuncType)> = module
+        .imports()
+        .filter(|i| i.module() == "imports")
+        .filter_map(|i| match i.ty() {
+            ExternType::Func(ft) => Some((i.name().to_string(), ft)),
+            _ => None,
+        })
+        .collect();
+    let has = |n: &str| declared.iter().find(|(name, _)| name == n).cloned();
+    let types = u8_list_types(module);
+
+    // `__fs_errno__()` — the out-of-band reason for the last failed call. Reads only.
+    if let Some((_, ft)) = has("__fs_errno__") {
+        let e = errno.clone();
+        linker.func_new("imports", "__fs_errno__", ft, move |_c, _a, results| {
+            results[0] = Val::I32(*e.lock().unwrap());
+            Ok(())
+        })?;
+    }
+
+    // `__args_count__()` — how many arguments followed the source file on the `vl run`
+    // command line. Cannot fail, so it does not write `errno`.
+    if let Some((_, ft)) = has("__args_count__") {
+        linker.func_new("imports", "__args_count__", ft, move |_c, _a, results| {
+            let n = PROGRAM_ARGS.lock().unwrap().len();
+            results[0] = Val::I32(i32::try_from(n).unwrap_or(i32::MAX));
+            Ok(())
+        })?;
+    }
+
+    // `__fs_stat__(path)` — 0 = file, 1 = dir, negative = -errno. Follows symlinks
+    // (`metadata`, not `symlink_metadata`), so a link to a directory answers `dir`.
+    // Anything that is neither a directory nor a regular file — a fifo, a socket, a
+    // device — answers `file`, which is what `is_dir()` being false means and is the
+    // honest answer for a floor with a two-valued `FileKind` above it.
+    if let Some((_, ft)) = has("__fs_stat__") {
+        let e = errno.clone();
+        linker.func_new("imports", "__fs_stat__", ft, move |mut c, args, results| {
+            let path = read_u8_list(&mut c, &args[0])?;
+            let p = match os_path(&path) {
+                Ok(p) => p,
+                Err(code) => {
+                    *e.lock().unwrap() = code;
+                    results[0] = Val::I32(-code);
+                    return Ok(());
+                }
+            };
+            match std::fs::metadata(&p) {
+                Ok(m) => {
+                    *e.lock().unwrap() = 0;
+                    results[0] = Val::I32(if m.is_dir() { 1 } else { 0 });
+                }
+                Err(err) => {
+                    let code = wasi_errno(&err);
+                    *e.lock().unwrap() = code;
+                    results[0] = Val::I32(-code);
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    // `__fs_write__(path, data)` — 0 = ok, negative = -errno. Whole-file, truncating,
+    // creating when absent: `std::fs::write`'s own semantics, which are `O_WRONLY |
+    // O_CREAT | O_TRUNC`. No parent directories are created — a missing parent is
+    // `ENOENT`, which is what the syscall says and not something to paper over here.
+    if let Some((_, ft)) = has("__fs_write__") {
+        let e = errno.clone();
+        linker.func_new("imports", "__fs_write__", ft, move |mut c, args, results| {
+            let path = read_u8_list(&mut c, &args[0])?;
+            let data = read_u8_list(&mut c, &args[1])?;
+            let p = match os_path(&path) {
+                Ok(p) => p,
+                Err(code) => {
+                    *e.lock().unwrap() = code;
+                    results[0] = Val::I32(-code);
+                    return Ok(());
+                }
+            };
+            match std::fs::write(&p, &data) {
+                Ok(()) => {
+                    *e.lock().unwrap() = 0;
+                    results[0] = Val::I32(0);
+                }
+                Err(err) => {
+                    let code = wasi_errno(&err);
+                    *e.lock().unwrap() = code;
+                    results[0] = Val::I32(-code);
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    let Some((st, at)) = types else {
+        // No `u8[]`-returning fs import is declared, so nothing below can be registered
+        // — and nothing below is needed. Not an error: `__fs_stat__` + `__fs_errno__`
+        // is a complete program.
+        return Ok(());
+    };
+
+    // `__fs_read__(path)` — the whole file, or EMPTY with `errno` set.
+    //
+    // READING A DIRECTORY IS `-EISDIR`, and it arrives here as the OS's own answer
+    // rather than as a pre-flight check: `std:fs` deliberately does not stat before
+    // reading (a syscall per read, plus a TOCTOU window where the thing stat'd is not
+    // the thing opened), so the host must let `read` fail and report why. On Linux the
+    // open succeeds and the `read` returns EISDIR; `wasi_errno` maps
+    // `ErrorKind::IsADirectory` to 31 on every platform that names it.
+    if let Some((_, ft)) = has("__fs_read__") {
+        let e = errno.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new("imports", "__fs_read__", ft, move |mut c, args, results| {
+            let path = read_u8_list(&mut c, &args[0])?;
+            let out = match os_path(&path).map_err(Ok).and_then(|p| {
+                std::fs::read(&p).map_err(|err| Err::<i32, std::io::Error>(err))
+            }) {
+                Ok(bytes) => {
+                    *e.lock().unwrap() = 0;
+                    bytes
+                }
+                Err(Ok(code)) => {
+                    *e.lock().unwrap() = code;
+                    Vec::new()
+                }
+                Err(Err(err)) => {
+                    *e.lock().unwrap() = wasi_errno(&err);
+                    Vec::new()
+                }
+            };
+            results[0] = make_u8_list(&mut c, &st, &at, &out)?;
+            Ok(())
+        })?;
+    }
+
+    // `__fs_list__(path)` — the directory's entry NAMES, separated by 0x0A, or EMPTY
+    // with `errno` set.
+    //
+    // `.` and `..` are filtered HERE, per the contract, so `std:fs` need not know
+    // whether a given platform's `read_dir` yields them (Unix's does not; the filter
+    // costs two comparisons and makes the answer platform-independent). A newline is a
+    // legal byte in a POSIX filename, so a name containing one is genuinely ambiguous
+    // in this encoding — that is the documented cost of a flat separated block, and
+    // `std:fs` treats 0x0A as a separator either way.
+    if let Some((_, ft)) = has("__fs_list__") {
+        let e = errno.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new("imports", "__fs_list__", ft, move |mut c, args, results| {
+            let path = read_u8_list(&mut c, &args[0])?;
+            let mut block: Vec<u8> = Vec::new();
+            let mut code = 0i32;
+            match os_path(&path) {
+                Err(bad) => code = bad,
+                Ok(p) => match std::fs::read_dir(&p) {
+                    Err(err) => code = wasi_errno(&err),
+                    Ok(entries) => {
+                        for ent in entries {
+                            match ent {
+                                Err(err) => {
+                                    code = wasi_errno(&err);
+                                    break;
+                                }
+                                Ok(ent) => {
+                                    let name = ent.file_name();
+                                    if name == "." || name == ".." {
+                                        continue;
+                                    }
+                                    match entry_name_bytes(&name) {
+                                        None => {
+                                            code = 25; // EILSEQ
+                                            break;
+                                        }
+                                        Some(b) => {
+                                            if !block.is_empty() {
+                                                block.push(0x0A);
+                                            }
+                                            block.extend_from_slice(&b);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+            if code != 0 {
+                block.clear();
+            }
+            *e.lock().unwrap() = code;
+            results[0] = make_u8_list(&mut c, &st, &at, &block)?;
+            Ok(())
+        })?;
+    }
+
+    // `__args_get__(i)` — argument `i` as bytes, or EMPTY with `errno = EINVAL` for an
+    // index outside `0 .. __args_count__()`.
+    if let Some((_, ft)) = has("__args_get__") {
+        let e = errno.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new("imports", "__args_get__", ft, move |mut c, args, results| {
+            let Val::I32(i) = args[0] else {
+                bail!("__args_get__: expected an i32 index");
+            };
+            let picked = {
+                let all = PROGRAM_ARGS.lock().unwrap();
+                if i < 0 {
+                    None
+                } else {
+                    all.get(i as usize).cloned()
+                }
+            };
+            let out = match picked {
+                Some(b) => {
+                    *e.lock().unwrap() = 0;
+                    b
+                }
+                None => {
+                    *e.lock().unwrap() = 28; // EINVAL
+                    Vec::new()
+                }
+            };
+            results[0] = make_u8_list(&mut c, &st, &at, &out)?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 /// Instantiate an already-loaded program module with the host print-import family,
 /// returning the live store + instance. Instantiation RUNS the start function (the
 /// VL program's top level), which for a `*.test.vl` module is the registration pass.
@@ -1368,7 +1848,19 @@ fn instantiate_program(
         s(&line);
     })?;
 
+    // The FILESYSTEM floor, registered only for the imports this module declares — so a
+    // program that touches no file pays nothing and instantiates exactly as before.
+    let fs_errno: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
+    register_fs_imports(&mut linker, module, &fs_errno)?;
+
     // Instantiation runs the start function — the VL program's top level.
+    //
+    // THE FS IMPORTS ARE LIVE AT THAT MOMENT, and that is the whole reason this host can
+    // implement them while the V8 harness cannot: a `Caller` carries store access, so a
+    // handler firing from the start function can read and allocate GC objects without
+    // ever naming the instance — which does not exist yet. `tests/support/runWasm.ts`
+    // has no such handle (measured: `instance` is `undefined` for every import call made
+    // from a VL top level), and V8 gives JS no way to build a WasmGC object regardless.
     let instance = linker.instantiate(&mut store, module)?;
     Ok((store, instance))
 }
@@ -1711,9 +2203,19 @@ fn run_cmd(args: &[String]) -> Result<()> {
     let mut compiler: Option<String> = None;
     let mut inline: Option<String> = None;
     let mut file: Option<String> = None;
+    // The PROGRAM's own arguments — what `__args_count__` / `__args_get__` answer for.
+    // Two spellings, because one of them cannot express an argument beginning with `-`:
+    // every positional after the source file is a program argument, and a literal `--`
+    // ends host parsing so everything after it (flags included) passes through verbatim.
+    // A `vl run` with neither is unchanged: the list stays empty.
+    let mut prog_args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--" => {
+                prog_args.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             "--compiler" => {
                 compiler = args.get(i + 1).cloned();
                 i += 1;
@@ -1723,10 +2225,12 @@ fn run_cmd(args: &[String]) -> Result<()> {
                 i += 1;
             }
             a if !a.starts_with('-') && file.is_none() => file = Some(a.to_string()),
+            a if !a.starts_with('-') => prog_args.push(a.to_string()),
             _ => {}
         }
         i += 1;
     }
+    set_program_args(&prog_args);
     let compiler = resolve_compiler(compiler);
 
     const USAGE: &str = "usage: vl run <file.vl> | -e <source> | < stdin";
