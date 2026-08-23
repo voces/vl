@@ -1840,6 +1840,66 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
+// The list-BUILD seed an ARRAY-typed FIELD of wasm-type `code` demands of a LIST-LITERAL
+// right-hand side: `pendingListKind` picks which (backing, wrapper) pair `emitArr` builds
+// and `pendingListSlot` which interned element row the ref-list codes build THROUGH.
+//
+// ONE home for the seed all THREE `emitAssign` Member receivers share — a plain struct
+// (`w.f = …`), a NARROWED union arm (`if u is A { u.f = … }`) and a variant-typed PARAM
+// (`function put(o: A) { o.f = … }`) — the exact set `emitScalarFieldStoreVal` below is
+// the shared value emit for. Before this, only the plain receiver seeded anything and only
+// for codes 5/6: a bare `[7]` assigned to an `i64[]`/`f32[]` field self-classified as the
+// DEFAULT i32 list and `struct.set` it into the field's own wrapper — `vl check`-clean
+// invalid wasm (#1824). The construct halves (`emitObj`, `emitVariantObj`) keep their own
+// ladders, which differ in arms this one deliberately does not copy.
+//
+// `refSlot` is the field's interned ref-list element row (`sFieldRefSlot` /
+// `variantFieldRefSlot`), read only by the ref-list codes 5 / 28. Returns 0, or -1 after a
+// LOUD fail when that row was never interned: `emitFail` does not halt, so the parallel
+// `rlElemKindTbl` read is bound-checked rather than trapping the compiler on a slot the
+// type section already rejected.
+function seedFieldListBuild(code: i32, refSlot: i32) {
+  pendingListKind = 0
+  pendingListSlot = 0
+  if code == 5 || code == 28 {
+    let slot = refSlot
+    if slot < 0 { slot = 0 }
+    if slot >= rlElemKindTbl.length {
+      return emitFail(
+        "emitProgram: ref-list field element type is not interned",
+      )
+    }
+    pendingListSlot = slot
+    if rlElemKindTbl[slot] == 2 {
+      pendingListKind = 2
+    } else if code == 28 && rlElemKindTbl[slot] != 1 {
+      // A NESTED / CLOSURE element under the NULLABLE ref-list code builds through the
+      // slot as its own ref list (kind 5), the `emitObj` code-28 reading. Code 5 keeps
+      // the struct kind for that case — the assign receiver has always used it and every
+      // nested / closure / map-element spelling lowers correctly under it, so widening it
+      // here would be an unmeasured byte change, not a fix.
+      pendingListKind = 5
+    } else {
+      pendingListKind = 1
+    }
+    return 0
+  }
+  if code == 6 { pendingListKind = 3 }
+  // The DISTINCT-BACKING scalar lists: f64 (25) coerces the RHS elements to f64, i64 (26)
+  // widens bare ints, f32 (27) re-encodes floats — and an EMPTY `[]` under any of them
+  // builds that leaf's wrapper instead of the i32 one.
+  if code == 25 { pendingListKind = 4 }
+  if code == 26 { pendingListKind = 6 }
+  if code == 27 { pendingListKind = 7 }
+  // The four NULLABLE distinct-backing scalar-list fields (31/32/33/34) build the same
+  // LEAF list; its non-null wrapper ref subtypes the nullable slot. A bare `null` RHS
+  // never reaches `emitArr` and is unaffected by the seed.
+  if isNulScalarListFieldCode(code) {
+    pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(code))
+  }
+  0
+}
+
 // Emit a field-STORE's RHS value with the scalar widening its field code demands —
 // f64 (17) / i64 (23) / f32 (24) re-encode at the boundary (pass-through for an
 // already-matching value), any other code emits plainly. The store-side twin of the
@@ -12250,20 +12310,21 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
           if emitExpr(body, nm.memObj, fnIx) < 0 { return -1 }
           fbStructGet(uBoxIdx, 1)  // box field 1: value (anyref)
           fbRefCast(uVarHeap[nvi]) // ref.cast to the variant struct
+          // An ARRAY-typed variant field threads its element kind, exactly as the plain
+          // receiver above does — seeded AFTER the receiver's own emit, which is free to
+          // clobber the pending globals, and cleared again before the `struct.set`.
+          const nvCode = variantFieldTypeAt(nvi, nfi)
+          if seedFieldListBuild(nvCode, variantFieldRefSlot(nvi, nfi)) < 0 {
+            return -1
+          }
           // A SCALAR f64/i64/f32 variant field widens its RHS at the store boundary,
           // exactly as the construct does (`v.f = 9` into an i64 field emitted a raw
           // `i32.const` — invalid wasm at `struct.set`).
-          if (
-            emitScalarFieldStoreVal(
-              body,
-              a.binRight,
-              fnIx,
-              variantFieldTypeAt(nvi, nfi),
-            ) <
-            0
-          ) {
+          if emitScalarFieldStoreVal(body, a.binRight, fnIx, nvCode) < 0 {
             return -1
           }
+          pendingListKind = 0
+          pendingListSlot = 0
           fbStructSet(uVarHeap[nvi], nfi)
           return 0
         }
@@ -12281,18 +12342,17 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             )
           }
           if emitExpr(body, m1.memObj, fnIx) < 0 { return -1 }
-          // Scalar-field RHS widening, as the narrowed branch above.
-          if (
-            emitScalarFieldStoreVal(
-              body,
-              a.binRight,
-              fnIx,
-              variantFieldTypeAt(pwvi, pwfi),
-            ) <
-            0
-          ) {
+          // Array-field element-kind seed + scalar-field RHS widening, as the narrowed
+          // branch above.
+          const pwCode = variantFieldTypeAt(pwvi, pwfi)
+          if seedFieldListBuild(pwCode, variantFieldRefSlot(pwvi, pwfi)) < 0 {
             return -1
           }
+          if emitScalarFieldStoreVal(body, a.binRight, fnIx, pwCode) < 0 {
+            return -1
+          }
+          pendingListKind = 0
+          pendingListSlot = 0
           fbStructSet(uVarHeap[pwvi], pwfi)
           return 0
         }
@@ -12324,20 +12384,9 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // wrapper matches the field's declared type — the same `pendingListKind` an
       // annotated `let xs: T[] = []` or an object-literal array field uses (else the
       // empty literal defaults to the i32-list wrapper and the `struct.set` rejects it).
-      pendingListKind = 0
-      pendingListSlot = 0
       const fscode = sFieldTypeAt(si, fieldIdx)
-      if fscode == 5 {
-        let faslot = sFieldRefSlot(si, fieldIdx)
-        if faslot < 0 { faslot = 0 }
-        pendingListSlot = faslot
-        if rlElemKindTbl[faslot] == 2 {
-          pendingListKind = 2
-        } else {
-          pendingListKind = 1
-        }
-      } else if fscode == 6 {
-        pendingListKind = 3
+      if seedFieldListBuild(fscode, sFieldRefSlot(si, fieldIdx)) < 0 {
+        return -1
       }
       // A MAP-typed field (code 19) seeds the map SHAPE — the write twin of `emitObj`'s
       // construct-side seed, carrying the same defect the ident arms above describe.
