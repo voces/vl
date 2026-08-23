@@ -1,0 +1,147 @@
+// @run
+// @skip the fs floor needs a host that can build a WasmGC value — V8 cannot; asserted natively by tests/selfhost_native_align_test.ts
+// @log 0
+// @log 0
+// @log 5
+// @log 72
+// @log 101
+// @log 108
+// @log 108
+// @log 111
+// @log 0
+// @log 0
+// @log 1
+// @log true
+// @log 0
+// @log 0
+// @log 44
+// @log 0
+// @log 31
+// @log 0
+// @log 0
+// @log 28
+// THE FILESYSTEM FLOOR, END TO END — write a file, read it back, list its directory,
+// stat both, and take each documented failure.
+//
+// WHY THIS CASE CARRIES `@skip` AND STILL RUNS. `tests/cases/` is executed WHOLESALE by
+// two harnesses that do not share a skip channel, and that asymmetry is exactly what
+// this case needs rather than something it works around:
+//
+//   tests/cases_wasm_test.ts        Deno/V8. Reads `@skip` and IGNORES this case.
+//   tests/selfhost_native_align_test.ts   the native `vl`. Never looks at `@skip`;
+//                                   `@run` + `@log` put this in its RUN tier, so every
+//                                   line below is asserted there.
+//
+// So the coverage is not lost, it is RELOCATED to the only host that can provide the
+// imports. V8's inability is measured, not assumed — a WasmGC array handed to a JS
+// import has `.length === undefined` and `Object.keys() === []`, and returning anything
+// but `null` for a GC-ref result is "type incompatibility when transforming from/to JS"
+// (the floor's results are NON-NULL, so even `null` is unusable). The stubs in
+// `tests/support/runWasm.ts` throw with that reason, so a case that forgets `@skip`
+// fails with an explanation rather than a `LinkError`.
+//
+// HERMETIC AS FAR AS IT CAN BE. There is no mkdir intrinsic and no temp-name source, so
+// the case writes ONE file at a FIXED path under `/tmp` with FIXED contents. That makes
+// a concurrent second run of the same case harmless — both writers write the same five
+// bytes — which matters because several native suites take corpus spreads and may run
+// this file while the alignment suite does. Nothing outside `/tmp` is touched, and the
+// repository tree is not written to at all.
+//
+// The path is spelled as bytes because that is what the floor takes: a path is what
+// POSIX stores, and `std:utf8` (not this layer) is what turns a `string` into them.
+function pathBytes(s: string): u8[] {
+  const out: u8[] = []
+  let i = 0
+  while i < s.length {
+    out.push(s[i])
+    i = i + 1
+  }
+  out
+}
+
+// Is `needle` present in `hay` as a whole 0x0A-separated entry? `__fs_list__` answers a
+// flat block of names separated by byte 0x0A, so membership is a run comparison rather
+// than a substring search — a substring test would answer true for `hello.txt` when the
+// directory only holds `not-hello.txt`.
+function blockHasEntry(hay: u8[], needle: u8[]): boolean {
+  let start = 0
+  let i = 0
+  while i <= hay.length {
+    let atSep = i == hay.length
+    if !atSep { atSep = hay[i] == 0x0A }
+    if atSep {
+      if i - start == needle.length {
+        let j = 0
+        let same = true
+        while j < needle.length {
+          if hay[start + j] != needle[j] { same = false }
+          j = j + 1
+        }
+        if same { return true }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+const dir = pathBytes("/tmp")
+const name = pathBytes("vl-fs-roundtrip-case.txt")
+const path = pathBytes("/tmp/vl-fs-roundtrip-case.txt")
+const data: u8[] = [72, 101, 108, 108, 111] // "Hello"
+
+// ── write ────────────────────────────────────────────────────────────────────
+// 0 is success; a negative answer would be `-errno`.
+print(__fs_write__(path, data))
+print(__fs_errno__())
+
+// ── read back ────────────────────────────────────────────────────────────────
+// Whole-file, as bytes. The five code units come back in order and unchanged — this is
+// the round trip the whole floor exists for.
+const back = __fs_read__(path)
+print(back.length)
+print(back[0])
+print(back[1])
+print(back[2])
+print(back[3])
+print(back[4])
+print(__fs_errno__())
+
+// ── stat ─────────────────────────────────────────────────────────────────────
+// 0 = file, 1 = dir. Two calls, because a floor that answered the same for both would
+// pass a test that only asked about one.
+print(__fs_stat__(path))
+print(__fs_stat__(dir))
+
+// ── list ─────────────────────────────────────────────────────────────────────
+// `/tmp` holds whatever the machine put there, so the ASSERTION is membership, not the
+// block's length or order: the file just written must appear, by name, as a whole entry.
+// `.` and `..` are the host's to filter and are not in the block.
+print(blockHasEntry(__fs_list__(dir), name))
+print(__fs_errno__())
+
+// ── the failures, each with its errno ────────────────────────────────────────
+// EMPTY-ON-ERROR is unambiguous only because errno is zeroed on success: `len == 0 &&
+// errno == 0` is an empty file, `len == 0 && errno != 0` is a failure. Both halves are
+// asserted here — the success path above prints errno 0 after a read that returned data.
+//
+// A missing file is ENOENT, which is 44 in WASI preview1 numbering and 2 in POSIX's.
+// The floor reports WASI's, because that is what `std:fs` hardcodes.
+const missing = __fs_read__(pathBytes("/tmp/vl-fs-roundtrip-case-absent.txt"))
+print(missing.length)
+print(__fs_errno__())
+
+// Reading a DIRECTORY is EISDIR (31), and it comes from the host's own failed read
+// rather than from a pre-flight stat: `std:fs` does not pre-stat, because that is a
+// syscall per read plus a TOCTOU window between the check and the open.
+const asFile = __fs_read__(dir)
+print(asFile.length)
+print(__fs_errno__())
+
+// An argument index outside `0 .. __args_count__()` is EINVAL (28). The corpus runs with
+// no program arguments, under `vl run` and `vl run --batch` alike, so the count is 0 and
+// every index is out of range.
+print(__args_count__())
+print(__args_get__(0).length)
+print(__fs_errno__())

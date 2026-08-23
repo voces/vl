@@ -2890,6 +2890,40 @@ export function initChecker() {
   declare("__load_i64__", mkFuncTy([TY_I32], TY_I64))
   declare("__load_f32__", mkFuncTy([TY_I32], TY_F32))
   declare("__load_f64__", mkFuncTy([TY_I32], TY_F64))
+  // ── THE FILESYSTEM FLOOR (`std:fs`) ─────────────────────────────────────────
+  // Seven HOST IMPORTS — unlike everything above them in this function, these do not
+  // lower to instructions. Each is a real entry in the `"imports"` module, because a
+  // syscall is the one thing wasm cannot express: the module asks the embedder.
+  //
+  // BYTES, NOT STRINGS, in both directions. A path is what POSIX stores — a byte
+  // string, not necessarily UTF-8 — and file CONTENT is bytes by definition. `u8[]`
+  // (#1805) is the packed `(array (mut i8))` under the standard wrapper, so a payload
+  // crosses as ONE GC object with no linear memory, no pointer and no length
+  // negotiation. `std:utf8` owns the transcoding on top; this layer never decodes.
+  //
+  // ERRORS ARE OUT OF BAND, and that is a WART with a filed reason. The shape this
+  // wants is `u8[] | i32` (contents or errno) or `u8[] | null`; BOTH were measured at
+  // this head and neither lowers — `u8[] | i32` is check-clean INVALID WASM
+  // (`expected i32, found (ref $type)`) while the `i32[] | i32` control runs, and
+  // `u8[] | null` declines loudly (`bare null needs a struct-typed context`). Filed as
+  // #1806. So a failing call answers an EMPTY `u8[]` and the reason is read from
+  // `__fs_errno__()`, which is POSIX's own convention and is UNAMBIGUOUS because errno
+  // is zeroed on success: `len == 0 && errno == 0` is an empty file, `len == 0 &&
+  // errno != 0` is a failure. `std:fs` isolates that read in one helper, so when #1806
+  // lands the floor becomes stateless without touching a caller.
+  //
+  // THE ERRNOS ARE WASI PREVIEW1 NUMBERING (ENOENT=44, not 2) because that is the
+  // numbering `std/fs.vl` already hardcodes and the numbering a WASI host would report.
+  // A negative return is `-errno`; `__fs_stat__` answers 0 for a file, 1 for a
+  // directory.
+  const u8Arr = mkArrayTy(TY_U8)
+  declare("__fs_read__", mkFuncTy([u8Arr], u8Arr))
+  declare("__fs_write__", mkFuncTy([u8Arr, u8Arr], TY_I32))
+  declare("__fs_list__", mkFuncTy([u8Arr], u8Arr))
+  declare("__fs_stat__", mkFuncTy([u8Arr], TY_I32))
+  declare("__args_count__", mkFuncTy(noParams, TY_I32))
+  declare("__args_get__", mkFuncTy([TY_I32], u8Arr))
+  declare("__fs_errno__", mkFuncTy(noParams, TY_I32))
   0
 }
 
@@ -2938,6 +2972,12 @@ export function nameIsEmitterIntrinsic(name: string) {
   if name == "__memory_grow__" { return true }
   // The bulk pair, reserved the day they acquired their arm.
   if nameIsMemBulkIntrinsic(name) { return true }
+  // The filesystem floor. These lower to a `call` of a HOST IMPORT rather than to
+  // instructions, but the reservation reason is identical and is about the CALL SITE,
+  // not the lowering: `emitCall` matches these names before it ever looks up a
+  // declaration, so a user `function __fs_read__(p: u8[]) { … }` would be silently
+  // discarded and every call to it would become a syscall.
+  if nameIsFsIntrinsic(name) { return true }
   false
 }
 
@@ -3012,6 +3052,85 @@ export function nameIsMemStoreIntrinsic(name: string) {
   false
 }
 
+// ── the filesystem floor: ONE ordered list, six readers ───────────────────────
+// The SLOT is the identity of an fs intrinsic everywhere downstream, and the order
+// below is the only place it is written. Six consumers key off it — the checker's
+// redefinition reservation (`nameIsEmitterIntrinsic`), the emitter's use scan
+// (`scanPrintUse`), the type section's standalone functypes, the import section's
+// entries, the name section's labels, and the call lowering's `fbCall` target — so a
+// name added here appears in all six or in none, and none of them carries its own
+// spelling of the set.
+//
+// THE ORDER IS APPEND-ONLY, for the same reason the print family's is: slot k's import
+// index is assigned by counting the USED slots below k, so inserting a name in the
+// middle would move the wasm function index of every later import in a program that
+// uses both. A new syscall goes on the END.
+//
+// -1 for every other name, which is what makes `nameIsFsIntrinsic` a projection of this
+// function rather than a second list beside it.
+export function fsIntrinsicSlot(name: string): i32 {
+  if name == "__fs_read__" { return 0 }
+  if name == "__fs_write__" { return 1 }
+  if name == "__fs_list__" { return 2 }
+  if name == "__fs_stat__" { return 3 }
+  if name == "__args_count__" { return 4 }
+  if name == "__args_get__" { return 5 }
+  if name == "__fs_errno__" { return 6 }
+  -1
+}
+
+// How many fs slots exist. Every parallel table the emitter keeps (`gFsUse`, `gFsIdx`)
+// is exactly this long, and every read of one is bound-checked against it — `emitFail`
+// does not halt emission, so an out-of-bounds read here would be a trap in a compiler
+// that had already decided to fail.
+export function fsIntrinsicCount(): i32 { 7 }
+
+// The name at slot `k` — the inverse of `fsIntrinsicSlot`, used by the import and name
+// sections, which iterate slots rather than spelling names. `""` for a slot out of
+// range, which every caller treats as "emit nothing" rather than writing an empty name.
+export function fsIntrinsicNameAt(k: i32): string {
+  if k == 0 { return "__fs_read__" }
+  if k == 1 { return "__fs_write__" }
+  if k == 2 { return "__fs_list__" }
+  if k == 3 { return "__fs_stat__" }
+  if k == 4 { return "__args_count__" }
+  if k == 5 { return "__args_get__" }
+  if k == 6 { return "__fs_errno__" }
+  ""
+}
+
+// True when `name` is one of the seven. A PROJECTION of `fsIntrinsicSlot`, deliberately
+// not a second `if`-chain: the two could not then disagree.
+export function nameIsFsIntrinsic(name: string) { fsIntrinsicSlot(name) >= 0 }
+
+// True when slot `k` takes a `u8[]` in ARGUMENT position `a` (0-based). Drives the call
+// lowering's per-argument context seeding — a `u8[]` operand threads the packed-list
+// build kind so an empty `[]` literal argument builds the packed wrapper, while an i32
+// operand (`__args_get__`'s index) takes the ordinary width-cleared spine.
+export function fsArgIsU8List(k: i32, a: i32) {
+  if k == 0 { return a == 0 }
+  if k == 1 { return a == 0 || a == 1 }
+  if k == 2 { return a == 0 }
+  if k == 3 { return a == 0 }
+  false
+}
+
+// The declared ARITY of slot `k`. The emitter checks it before lowering so a wrong-arity
+// call is a named diagnostic rather than a stack shape that happens to validate.
+export function fsIntrinsicArity(k: i32): i32 {
+  if k == 1 { return 2 }
+  if k == 4 { return 0 }
+  if k == 6 { return 0 }
+  if k == 5 { return 1 }
+  if k >= 0 && k <= 3 { return 1 }
+  -1
+}
+
+// True when slot `k` RETURNS a `u8[]` (the packed wrapper) rather than an i32 — the
+// split the type section's functype shapes and the emitter's result classification both
+// turn on.
+export function fsRetIsU8List(k: i32) { k == 0 || k == 2 || k == 5 }
+
 // THE DECLARED-BUT-UNLOWERED MEMORY INTRINSICS — the ones that pass `vl check` and then
 // die at emit with `emitProgram: call to unknown function`. Re-censused at each head, in
 // three call POSITIONS each (statement / value / binding), against the names
@@ -3038,12 +3157,25 @@ export function nameIsUnimplementedIntrinsic(name: string) {
 }
 
 // The shared rejection for a definition that binds an emitter-intrinsic name.
+//
+// The REASON half of the message is per-family, because the two families fail the same
+// way for different reasons and a message that names the wrong one sends the reader to
+// the wrong place. The memory tier lowers to instructions; the filesystem tier lowers to
+// a `call` of a host import. Both discard the user's body — that is the part the author
+// needs to know — but "lowers to instructions inline" is simply untrue of `__fs_read__`,
+// and this codebase does not ship a diagnostic that is true of most of its subjects.
 function checkNotEmitterIntrinsic(name: string, at: i32) {
   if nameIsEmitterIntrinsic(name) {
+    let how = "every call to it lowers to instructions inline"
+    if nameIsFsIntrinsic(name) {
+      how = "every call to it lowers to a host import"
+    }
     tErr(
       "'" +
         name +
-        "' is a compiler intrinsic and cannot be redefined — every call to it lowers to instructions inline, so this definition would never run",
+        "' is a compiler intrinsic and cannot be redefined — " +
+        how +
+        ", so this definition would never run",
       at,
     )
   }

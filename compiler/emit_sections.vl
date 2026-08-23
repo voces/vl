@@ -10,6 +10,11 @@
 
 import {
   PrimName,
+  fsArgIsU8List,
+  fsIntrinsicCount,
+  fsIntrinsicNameAt,
+  fsIntrinsicSlot,
+  fsRetIsU8List,
   isNumIntrinsicName,
   nameIsMemBulkIntrinsic,
   nameIsMemLoadIntrinsic,
@@ -109,6 +114,7 @@ import {
   armPreludeBlocks,
   ba8TypeIdx,
   ba8Used,
+  bl8TypeIdx,
   capCacheOn,
   cloSigKeys,
   cloSigRepFn,
@@ -155,10 +161,15 @@ import {
   fnUsesUnionSink,
   fnUsesVariantRebox,
   fnValUsed,
+  fsIdxAt,
+  fsImportCount,
+  fsUsedAt,
   gCellIdx,
   gEmitNames,
   gF32PrintIdx,
   gF64PrintIdx,
+  gFsIdx,
+  gFsUse,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
@@ -2534,6 +2545,33 @@ function emitNameSection(n: i32) {
       wULEB(gF32PrintIdx)
       wName("__print_f32__")
     }
+    // The fs imports, each at the index `scanPrintUse` recorded. They sit between the
+    // print family and the user functions, which is where slot order puts them, so the
+    // namemap stays STRICTLY INCREASING — the one hard requirement the appendix places
+    // on this subsection. `count` above is `gImports + n` and `gImports` already grew by
+    // the number of used slots, so writing them here is what makes the count honest;
+    // omitting them would leave a count promising more entries than follow.
+    let fsnm = 0
+    while fsnm < fsIntrinsicCount() {
+      if fsUsedAt(fsnm) {
+        let fsIx = fsIdxAt(fsnm)
+        let fsLbl = fsIntrinsicNameAt(fsnm)
+        if fsIx < 0 || fsLbl == "" {
+          // Same rule as the import section's twin loop: `curBuf` is bound to
+          // `fnameMap` here, so record the failure and write a placeholder rather
+          // than returning out from under the binding. The namemap COUNT was
+          // written from `gImports + n` before the loop and must still be met.
+          emitFail(
+            "emitProgram: fs import is used but has no index or name — the slot tables have drifted",
+          )
+          fsIx = 0
+          fsLbl = "__fs_unknown__"
+        }
+        wULEB(fsIx)
+        wName(fsLbl)
+      }
+      fsnm = fsnm + 1
+    }
   }
   let fi = 0
   while fi < n {
@@ -2741,6 +2779,21 @@ function emitModule(_stmts: i32[]) {
   if gNeedsF32Print {
     nPrintTypes = nPrintTypes + 1 // + (f32)->() for __print_f32__
   }
+  // ONE standalone functype per USED fs import, folded into `nPrintTypes` rather than
+  // threaded as a seventh parameter. That is the whole reason the fs functypes sit
+  // immediately after the print ones instead of at the very end of the section: every
+  // index downstream — the `__log__` decoder's functype (`+ nPrintTypes`), `helpTyBase`,
+  // the export-wrapper block, and the rectype COUNT — is already expressed in terms of
+  // this number, so they all absorb the fs types with no arithmetic of their own. A
+  // seventh parameter would have had to reach four call sites and each would have been a
+  // place for the two to drift.
+  //
+  // One per USED import, not one per distinct SHAPE: `__fs_read__` and `__fs_list__`
+  // share a signature and get two structurally identical rectypes. Duplicate functypes
+  // are valid wasm and cost ~5 bytes; sharing them would make slot k's functype index
+  // depend on which OTHER slots the program uses, which is precisely the coupling the
+  // append-only slot order exists to avoid.
+  nPrintTypes = nPrintTypes + fsImportCount()
 
   emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
@@ -2937,6 +2990,17 @@ function scanPrintUse() {
   gF32PrintIdx = 0
   memUsed = false
   memLogUsed = false
+  // The fs tables are rebuilt from scratch, never patched: `scanPrintUse` is the single
+  // writer and it runs once per module, so a stale row from a previous compile in the
+  // same process would silently declare an import the program never calls.
+  gFsUse = []
+  gFsIdx = []
+  let fsr = 0
+  while fsr < fsIntrinsicCount() {
+    gFsUse.push(0)
+    gFsIdx.push(-1)
+    fsr = fsr + 1
+  }
   let pscan = 0
   let sawI64Ann = false
   let sawF64 = false
@@ -2984,6 +3048,33 @@ function scanPrintUse() {
         // names a memory that does not exist. Both are void, so like the stores they
         // add nothing to the print-import scan below.
         if nameIsMemBulkIntrinsic(pcallee.identName) { memUsed = true }
+        // THE FILESYSTEM FLOOR. Unlike every memory intrinsic above, these are host
+        // IMPORTS, so a use here reserves a wasm function index — which is exactly why
+        // the reservation has to happen in this scan and not at the call site: an extra
+        // import shifts every user function's index, and the count cannot be discovered
+        // mid-emit (`gImports`' own header says so).
+        //
+        // `gImports = 4` pulls in the whole print family, the same thing `__log__` and
+        // `__trap__(<string>)` above do. The fs imports are appended AFTER it rather
+        // than replacing it: `emitImportSection` writes the four print entries
+        // unconditionally whenever `gImports > 0`, and every host already provides them,
+        // so reusing that reservation costs a file-touching program four unused import
+        // entries and costs a file-free program nothing at all. Splitting the print
+        // family's own gate would be the alternative and it would rewrite the one
+        // section whose bytes 2,089 corpus goldens pin.
+        //
+        // `ba8Used` is forced for any slot whose signature mentions `u8[]`, because the
+        // packed heap-type pair must exist for the import's FUNCTYPE to name it. The
+        // annotation scan that normally sets it sees only what the program SPELLS, and
+        // `__fs_errno__() != 0` next to a bare `__fs_read__(p)` in statement position
+        // spells no `u8[]` anywhere. This pass runs after every node-minting pass and
+        // before `mAssignTypeIndices`, which is the window in which forcing it is legal.
+        const fslot = fsIntrinsicSlot(pcallee.identName)
+        if fslot >= 0 {
+          gImports = 4
+          if fslot < gFsUse.length { gFsUse[fslot] = 1 }
+          if fsRetIsU8List(fslot) || fsArgIsU8List(fslot, 0) { ba8Used = true }
+        }
         // `memory.size` / `memory.grow` are instructions ON the memory: a program whose
         // ONLY memory contact is `__memory_size__()` still needs section 5 emitted, or
         // the instruction refers to a memory that does not exist and the module fails to
@@ -3138,6 +3229,24 @@ function scanPrintUse() {
       gImports = gImports + 1
       gNeedsF32Print = true
     }
+  }
+  // The fs imports trail the ENTIRE print family — the four fixed entries and all three
+  // conditional wide-scalar ones — so no print index ever moves, and within the block
+  // they run in SLOT order over the used slots only. Two consequences worth stating:
+  // adding a syscall to a program that already made one does not move the first one's
+  // index (slots are append-only, and an unused slot occupies nothing), and a program
+  // that makes no syscall runs this loop over seven zeros and emits nothing.
+  //
+  // Outside the `gImports == 4` guard above on purpose: by the time this runs `gImports`
+  // is 4..7, not 4, so guarding on the literal would silently skip every fs import in a
+  // program that also prints an f64.
+  let fsa = 0
+  while fsa < gFsUse.length {
+    if gFsUse[fsa] == 1 {
+      gFsIdx[fsa] = gImports
+      gImports = gImports + 1
+    }
+    fsa = fsa + 1
   }
   0
 }
@@ -4147,6 +4256,56 @@ function emitTypeSection(
     wU8(125) // 0x7d f32
     wU8(0)   // 0 results
   }
+  // ── the filesystem functypes ────────────────────────────────────────────────
+  // One `0x60` rectype per USED fs slot, in slot order, appended after the print family
+  // so no earlier functype index moves. STANDALONE, outside the rec group, for exactly
+  // the reason stated above for the print family: wasmtime will not match a
+  // rec-group-member functype against a host-provided function.
+  //
+  // These are the FIRST imports whose signature names a rec-group HEAP type — the `u8[]`
+  // wrapper `$bl8TypeIdx`. That direction is fine and is the asymmetry worth naming: a
+  // later rectype may REFERENCE an earlier type index freely; what wasmtime refuses is
+  // for the functype ITSELF to carry rec-group identity. So `(ref $bl8) -> (ref $bl8)`
+  // as a standalone rectype instantiates, while the same shape inside the rec group
+  // would not.
+  //
+  // The wrapper ref is NON-NULL (`0x64`), matching `fbValtype`'s `"u8list"` arm — that is
+  // what a `u8[]` param/result is everywhere else in the module, so a call site needs no
+  // conversion in either direction. It also makes the error contract structural: a
+  // failing call cannot answer null because the type forbids it, so it answers an EMPTY
+  // `u8[]` and `__fs_errno__()` carries the reason.
+  let fsty = 0
+  while fsty < fsIntrinsicCount() {
+    if fsUsedAt(fsty) {
+      wU8(96) // 0x60 func
+      // Params: the `u8[]` operands first, then `__args_get__`'s i32 index.
+      if fsty == 1 {
+        wULEB(2) // __fs_write__(path, data)
+        wU8(100) // 0x64 (ref $bl8) — path
+        wSLEB(bl8TypeIdx)
+        wU8(100) // 0x64 (ref $bl8) — data
+        wSLEB(bl8TypeIdx)
+      } else if fsty == 0 || fsty == 2 || fsty == 3 {
+        wULEB(1) // __fs_read__ / __fs_list__ / __fs_stat__ (path)
+        wU8(100) // 0x64 (ref $bl8)
+        wSLEB(bl8TypeIdx)
+      } else if fsty == 5 {
+        wULEB(1) // __args_get__(i)
+        wU8(127) // 0x7f i32
+      } else {
+        wULEB(0) // __args_count__ / __fs_errno__
+      }
+      // Results: the packed wrapper for the three byte-valued slots, an i32 for the rest.
+      wULEB(1)
+      if fsRetIsU8List(fsty) {
+        wU8(100) // 0x64 (ref $bl8) — non-null, EMPTY on error
+        wSLEB(bl8TypeIdx)
+      } else {
+        wU8(127) // 0x7f i32 — 0/1 or a negative -errno
+      }
+    }
+    fsty = fsty + 1
+  }
   if memLogUsed {
     wU8(96)  // 0x60 func — the `__log__` decoder
     wU8(2)   // 2 params
@@ -4202,6 +4361,12 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     // f64 index would be (the standalone functypes are emitted i64 → f64 → f32 in order).
     let ftF32 = ftF64
     if gNeedsF64Print { ftF32 = ftF64 + 1 }
+    // The first fs functype index — one past wherever the f32 one would sit. `ftF32` is
+    // "the next free index" whether or not the f32 print import exists (each of the
+    // three conditionals above advances only when its own flag is set), so this
+    // continues the same chain rather than re-deriving it.
+    let ftFs = ftF32
+    if gNeedsF32Print { ftFs = ftF32 + 1 }
     const importPayload: i32[] = []
     const imPrev = wTarget(importPayload)
     // 4 imports normally; +1 each for `__print_i64__` / `__print_f64__` / `__print_f32__`.
@@ -4209,6 +4374,8 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     if gNeedsI64Print { nImports = nImports + 1 }
     if gNeedsF64Print { nImports = nImports + 1 }
     if gNeedsF32Print { nImports = nImports + 1 }
+    // …and one per USED fs slot, counted from the same table the entries below iterate.
+    nImports = nImports + fsImportCount()
     wULEB(nImports)
     wName("imports")
     wName("__print_i32__")
@@ -4247,6 +4414,38 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
       wName("__print_f32__")
       wU8(0)
       wULEB(ftF32)
+    }
+    // The FILESYSTEM entries LAST, in slot order, each at the function index
+    // `scanPrintUse` recorded for it and each carrying the functype the type section
+    // appended for it in the SAME loop shape — so the two orders cannot diverge without
+    // both loops being edited. `emitFail` on a missing index rather than writing -1 as a
+    // ULEB: the index tables and this loop are the parallel pair this file's own
+    // discipline says to bound-check, and a negative here would be a 5-byte ULEB naming
+    // a functype that does not exist.
+    let fsim = 0
+    while fsim < fsIntrinsicCount() {
+      if fsUsedAt(fsim) {
+        let fsNm = fsIntrinsicNameAt(fsim)
+        if fsNm == "" {
+          // RECORD AND CARRY ON, never `return` from here: `curBuf` is bound to
+          // `importPayload` for the whole of this block, and returning early would
+          // skip the `wTarget(imPrev)` that unbinds it — every later section would
+          // then append into a buffer nothing frames. `emitFail` does not halt
+          // emission, so the only safe shape is a placeholder that keeps the entry
+          // COUNT honest (it was written above from `fsImportCount()`) while the
+          // recorded failure unwinds the compile.
+          emitFail(
+            "emitProgram: fs import slot has no name — the slot table and its count have drifted",
+          )
+          fsNm = "__fs_unknown__"
+        }
+        wName("imports")
+        wName(fsNm)
+        wU8(0) // import kind: func
+        wULEB(ftFs)
+        ftFs = ftFs + 1
+      }
+      fsim = fsim + 1
     }
     wTarget(imPrev)
     wSection(2, importPayload)
