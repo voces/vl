@@ -142,6 +142,7 @@ import {
   tyIsLitUnionArray,
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
+  tyIsU8ArrayTy,
   tyLitUnionAliasIx,
   tyNestedArrLeafSupported,
   tySame,
@@ -235,6 +236,7 @@ import {
   nameIsShapeSpanEnds,
   nameIsString,
   nameIsStringArray,
+  nameIsU8Array,
   nameNamesFunction,
   nonNullMemberCountOf,
   normTypeAtom,
@@ -345,6 +347,7 @@ import {
   fnUsesPush,
   fnUsesRefPush,
   fnUsesStrPush,
+  fnUsesU8Push,
   fnValUsed,
   gStrInfLet,
   gaeBases,
@@ -2244,6 +2247,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // local-decl chain. Checked before the scalar-list cases for that reason.
   if letIsUnion(letIx, fnIx) { return "union" }
   if letIsStringArray(letIx, fnIx) { return "strlist" }
+  if letIsU8Array(letIx, fnIx) { return "u8list" }
   if letIsF32Array(letIx, fnIx) { return "f32list" }
   if letIsF64Array(letIx, fnIx) { return "f64list" }
   if letIsI64Array(letIx, fnIx) { return "i64list" }
@@ -4625,6 +4629,13 @@ function mapReadStructListMvSlot(exprIx: i32, fnIx: i32) {
 // (f64), 10 (i64) — or -1 (a ref / string / map list, or not a list). The single dispatch
 // the scalar list ops consult instead of each re-deriving `exprF64Array`.
 export function scalarListElemKind(exprIx: i32, fnIx: i32): VKind | null {
+  // THE PACKED BYTE LIST FIRST. What this function returns is the discriminator the
+  // scalar-list ops select a REP with, and `u8[]` is the one list whose element VALUE
+  // kind (i32) does not identify its rep — its backing is `(array (mut i8))` while every
+  // other i32-element list is `(array (mut i32))`. So the packed list answers with its
+  // own LIST kind, `"u8list"`, and the `scalarList*` family keys the wrapper / backing /
+  // used-flag off that. It must precede `exprArray`, which claims any i32-element list.
+  if exprU8Array(exprIx, fnIx) { return "u8list" }
   if exprF32Array(exprIx, fnIx) { return "f32" }
   if exprF64Array(exprIx, fnIx) { return "f64" }
   if exprI64Array(exprIx, fnIx) { return "i64" }
@@ -4830,7 +4841,7 @@ export function markLoopVarIter(slot: i32, iterIx: i32) {
 
 // The `.push`/`.pop` element-kind SELECTOR threaded through the reservation walkers (C2 cleanup:
 // a named literal union replacing the bare 0–5 codes). `pop` only uses i32/ref/str.
-type PushKind = "i32" | "ref" | "str" | "f64" | "i64" | "f32"
+type PushKind = "i32" | "ref" | "str" | "f64" | "i64" | "f32" | "u8"
 
 // The scratch pre-scan carries all six PushKinds as ONE bitmask, LSB-first in
 // PushKind declaration order, so a single body walk classifies every `.push`/
@@ -4841,7 +4852,10 @@ function pushKindBit(kind: PushKind) {
   if kind == "str" { return 4 }
   if kind == "f64" { return 8 }
   if kind == "i64" { return 16 }
-  32 // "f32"
+  if kind == "f32" { return 32 }
+  // Bit 64 is already taken by the ADDITIVE `(string | null)[]` value-slot marker
+  // (see `pushKindBitsOf`), so the packed byte list takes 128.
+  128 // "u8"
 }
 
 // Classify the `.push`/`.pop` RECEIVER at `objIx` into its PushKind bits with one
@@ -4854,6 +4868,9 @@ function pushKindBitsOf(objIx: i32, fnIx: i32) {
   if exprF64Array(objIx, fnIx) { bits = bits | 8 }
   if exprI64Array(objIx, fnIx) { bits = bits | 16 }
   if exprF32Array(objIx, fnIx) { bits = bits | 32 }
+  // The PACKED byte list gets its own bit, and so its own scratch quad: its value slot
+  // is an i32 like the plain list's, but its backing and receiver refs are not.
+  if exprU8Array(objIx, fnIx) { bits = bits | 128 }
   // Bit 64 is ADDITIVE to bit 4, not an alternative: a `(string | null)[]` push uses the
   // STRING quad (one backing), and only its VALUE slot changes — to `(ref null $aTypeIdx)`,
   // because the pushed value may be `null`. `exprNulStrArray` is the same predicate the
@@ -5073,6 +5090,7 @@ export function applyPushPopBits(bits: i32) {
   if (bits & 8) != 0 { fnUsesF64Push = true }
   if (bits & 16) != 0 { fnUsesI64Push = true }
   if (bits & 32) != 0 { fnUsesF32Push = true }
+  if (bits & 128) != 0 { fnUsesU8Push = true }
   0
 }
 
@@ -8212,6 +8230,10 @@ export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
 // The bounds-check frame kind for a SCALAR list element kind (`scalarListElemKind`
 // only ever yields the four scalar members of `VKind`).
 export function listIdxKindOf(ek: VKind): MfKind {
+  // The packed byte list's frame slots must carry ITS heap types (`bl8`/`ba8`), not the
+  // i32 list's — the `"i32"` default below would type the hoisted wrapper local
+  // `(ref null $lTypeIdx)` and store a `(ref $bl8TypeIdx)` into it.
+  if ek == "u8list" { return "u8" }
   if ek == "f64" { return "f64" }
   if ek == "i64" { return "i64" }
   if ek == "f32" { return "f32" }
@@ -12258,6 +12280,13 @@ export function tyAnnRefListKind(tyIx: i32) {
       // this question today, which is what makes this rung different from the two above it
       // rather than the next one to convert.
       if nameIsF32Array(lt.tyName) { return 7 }
+      // A `u8[]` annotation (kind 10) — the PACKED byte list. Threads for a NON-EMPTY
+      // literal too, for the same reason the f32 rung does: a bare `[1, 2]` does not
+      // self-identify as `u8[]` (it types `i32[]`), so the annotation is the only signal
+      // the literal build has. On the NAME for the moment its siblings are: the arena
+      // rung would need a `tyIsU8Array`, and this function deliberately has no `repOf`
+      // leg (see its header).
+      if nameIsU8Array(lt.tyName) { return 10 }
     }
   }
   0
@@ -12692,6 +12721,11 @@ export function vtKindOfType(tyIx: i32): VKind {
   if retStrArrFlag(tyIx) == 1 { return "strlist" }
   if retF64ArrFlag(tyIx) == 1 { return "f64list" }
   if retI64ArrFlag(tyIx) == 1 { return "i64list" }
+  // A `u8[]` annotation — the PACKED byte list. BEFORE `retArrFlag`, whose i32-list
+  // answer would name a 4-byte backing for a one-byte one. The `repOf` seam above
+  // already answers for a node the checker recorded a type on; this rung is the
+  // annotation-node fallback its scalar-list siblings each carry too.
+  if annIsU8Array(tyIx) { return "u8list" }
   if retF32ArrFlag(tyIx) == 1 { return "f32list" }
   if retRefArrFlag(tyIx) == 1 { return "reflist" }
   if retUnionFlag(tyIx) == 1 { return "union" }
@@ -13010,6 +13044,10 @@ function globalKind(initIx: i32): VKind {
   if exprF64Array(initIx, -1) { return "f64list" }
   if exprI64Array(initIx, -1) { return "i64list" }
   if exprF32Array(initIx, -1) { return "f32list" }
+  // The PACKED byte list — BEFORE `exprArray` below, which claims any i32-element list
+  // and would type the cell as the 4-byte list's wrapper while the initialiser produces
+  // the one-byte one (invalid wasm, `vl check` clean).
+  if exprU8Array(initIx, -1) { return "u8list" }
   if exprUnion(initIx, -1) { return "union" }
   if exprStruct(initIx, -1) { return "struct" }
   if exprArray(initIx, -1) { return "list" }
@@ -13105,6 +13143,7 @@ export function globalCellKind(letIx: i32): VKind {
       if letIsUnion(letIx, -1) { return "union" }
       if letIsStringArray(letIx, -1) { return "strlist" }
       if letIsRefArray(letIx, -1) { return "reflist" }
+      if letIsU8Array(letIx, -1) { return "u8list" }
       if letIsF32Array(letIx, -1) { return "f32list" }
       if letIsF64Array(letIx, -1) { return "f64list" }
       if letIsI64Array(letIx, -1) { return "i64list" }
@@ -13767,6 +13806,19 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
     // (code 25/26/27), NOT a ref-list wrapper (code 5 is for struct/union/closure elements
     // only — returning 5 here emitted the wrong heap type, the invalid-wasm hole). Any
     // OTHER `X[]` is a struct/union ref list.
+    // A `u8[]` FIELD DECLINES (-1), and declining is the whole point: the fall-through
+    // below is `return 5`, a REF list, which would intern a ref-list slot whose element is
+    // the storage type and emit a wrapper of the wrong heap type — measured on this
+    // commit as a module that fails to parse with `vl check` rc 0, the
+    // silent-invalid-wasm class this codebase treats as its worst failure.
+    //
+    // The packed byte list is not in `scalarListKindOfName` for the same reason: that
+    // function's five codes are consumed by the map-value, field, closure-result and
+    // `$fnsig` param/result ladders, and a sixth code would be a silent wrong answer in
+    // each of them until every one grew an arm. A `u8[]` in those positions is deferred,
+    // and deferred here means REFUSED LOUDLY, not lowered wrongly. See the report's
+    // position table for the remaining container ladders.
+    if nameIsU8Array(t) { return -1 }
     const sk = scalarListKindOfName(t)
     if sk == 0 { return 4 }
     if sk == 1 { return 6 }
@@ -24100,6 +24152,34 @@ function fnRetAnnF32ArraySid(sid: i32) {
   false
 }
 
+// True if the `let`/`const` at `letIx` binds a `u8[]` — the PACKED byte list. Its cell is
+// `(ref $bl8TypeIdx)`, whose backing is `(array (mut i8))`.
+//
+// ANNOTATION-ONLY, unlike its f32/f64/i64 siblings, and that is a property of the type
+// rather than an omission: a bare array literal `[1, 2]` types `i32[]`, and there is no
+// expression whose OWN type is `u8[]` except one already annotated somewhere. So there is
+// no initialiser fall-through to write — a `u8[]` binding is reached through the
+// annotation or not at all, which also means an un-annotated `const b = [1, 2]` stays the
+// i32 list it has always been and no existing program's classification moves.
+export function letIsU8Array(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      // ARENA-FIRST (see `letIsArray`), name as the documented second opinion.
+      const k = annRepKindOf(d.letType)
+      if k != null { return k == "u8list" }
+      const lt = P.nodes[d.letType]
+      if lt is TypeRef { return nameIsU8Array(lt.tyName) }
+    }
+    // UN-ANNOTATED: the initialiser decides, exactly as the scalar-list siblings let it.
+    // `const xs = mk()` over a `u8[]`-returning function has to bind the packed wrapper —
+    // without this rung the cell is the i32 list and the call's result is stored into it,
+    // which is invalid wasm rather than a loud reject.
+    return exprU8Array(d.letInit, fnIx)
+  }
+  false
+}
+
 export function letIsF32Array(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -24158,6 +24238,60 @@ export function arrLitIsF32(arrIx: i32, fnIx: i32) {
       i = i + 1
     }
     return true
+  }
+  false
+}
+
+// True if `exprIx` evaluates to a `u8[]` — the PACKED byte list.
+//
+// THE ARENA IS ENOUGH HERE, and the contrast with `exprF32Array`'s fifty lines is the
+// point: that classifier needs a syntactic arm per position because a float LITERAL types
+// f64, so the checker's recorded type cannot be trusted to say "f32 list". `u8[]` has no
+// such literal — nothing infers to it — so the recorded type says `u8[]` exactly when an
+// annotation put it there, at every position (ident, call result, member, index).
+// True if the type-ANNOTATION node `tyIx` spells `u8[]` — the arena's recorded type
+// first, the written spelling as the documented second opinion (the pattern every scalar
+// list rung in `vtKindOfType` follows).
+export function annIsU8Array(tyIx: i32) {
+  if tyIx < 0 { return false }
+  if tyIsU8ArrayTy(nodeTyIxOf(tyIx)) { return true }
+  const t = P.nodes[tyIx]
+  if t is TypeRef { return nameIsU8Array(t.tyName) }
+  false
+}
+
+export function exprU8Array(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  if tyIsU8ArrayTy(nodeTyIxOf(exprIx)) { return true }
+  const e = P.nodes[exprIx]
+  if e is Paren { return exprU8Array(e.parInner, fnIx) }
+  if e is Call {
+    // A call of a NAMED function with an annotated `u8[]` return. The recorded type above
+    // answers at most positions; this reads the callee's own annotation for the ones it
+    // does not, which is how `const xs = mk()` binds the packed wrapper.
+    const cf = P.nodes[e.callFn]
+    if cf is Ident {
+      const cfi = fnIndexOfSid(sidOfNode(e.callFn))
+      if cfi >= 0 {
+        const fd = P.nodes[fnStmts[cfi]]
+        if fd is FuncDecl { return annIsU8Array(fd.fnRet) }
+      }
+    }
+    return false
+  }
+  if e is Ident {
+    // The three NAME positions the recorded type does not reach: a PARAM read inside its
+    // own body, a declared LOCAL, and a module GLOBAL. Each asks the declaration that
+    // already decided the cell's kind, so the read and the cell cannot disagree.
+    if annIsU8Array(paramTypeNode(fnIx, e.identName)) { return true }
+    if declaredKind(e.identName) == "u8list" { return true }
+    const gli = globalLetOfSid(sidOfNode(exprIx))
+    if gli >= 0 {
+      if letIsU8Array(gli, -1) {
+        return !identShadowedByFrame(fnIx, e.identName)
+      }
+    }
+    return false
   }
   false
 }

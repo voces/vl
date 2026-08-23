@@ -431,6 +431,14 @@ export type VKind = "i32"
   | "nuli64list"
   | "nulf32list"
   | "nulmap"
+  // A `u8[]` — the PACKED byte list. Its wrapper is `{ backing: (ref $ba8TypeIdx),
+  // len, cap }` exactly like the other scalar lists, but the backing's element
+  // STORAGE type is the packed `i8` (0x78), not a valtype: one byte per element
+  // instead of four. Its VALUES are i32 at every seam (`array.get_u` widens on read,
+  // `array.set` truncates on write, `push` takes an i32), so unlike `i64list` /
+  // `f64list` / `f32list` it needs no new scalar anywhere — the element kind is
+  // `"i32"`, and the only thing that is not an i32 is the storage.
+  | "u8list"
 
 export let localIsRef: VKind[] = []
 // Parallel to `localNames`: when the i-th local is a STRUCT ref (`localIsRef[i] == 1`),
@@ -545,6 +553,11 @@ export let fnUsesI64Push = false // `i64[]`: val i64, backing/recvRef $ia64/$il6
 export let i64PushScratchBase = 0
 export let fnUsesF32Push = false // `f32[]`: val f32, backing/recvRef $fa32/$fl32
 export let f32PushScratchBase = 0
+// `u8[]`: val i32 (a byte VALUE is an i32 — only the backing is packed), backing/recvRef
+// $ba8/$bl8. It needs its OWN quad rather than riding the i32 one for exactly that
+// reason: the value slot matches, the two ref slots do not.
+export let fnUsesU8Push = false
+export let u8PushScratchBase = 0
 export let strPushScratchBase = 0
 // ── per-function string-op scratch locals (G6: `+` / `==`/`!=` / `.slice`) ────
 // String concat and value-equality lower as a `call` into the shared module-tail
@@ -967,6 +980,25 @@ export let il64TypeIdx = 0
 export let fa32Used = false
 export let fa32TypeIdx = 0
 export let fl32TypeIdx = 0
+// ── the PACKED byte list (`u8[]`) ─────────────────────────────────────────────
+// A FOURTH sibling of the three wide-scalar list reps above, and the first with a
+// PACKED backing: `(array (mut i8))` — storage type `0x78`, one byte per element —
+// under the same `{ backing, len, cap }` wrapper. Interned AFTER the f32 pair, so no
+// existing type index shifts and a program with no `u8[]` mints nothing.
+//
+// WHAT IS DIFFERENT FROM THE THREE ABOVE, and it is only two things:
+//   · the backing's element type is a packed STORAGE type, so the type section writes
+//     `5e 78 01` where the f32 array writes `5e 7d 01`;
+//   · a READ must be `array.get_u` (0xfb 0x0d), which zero-extends the byte into an
+//     i32. `array.get` is not even valid on a packed array — the engine rejects the
+//     module — so this is a validity requirement, not a choice of signedness. It is
+//     dispatched inside `fbArrayGet` off the heap index, so every existing element-read
+//     site gets it without an arm.
+// Everything else is the i32 list's machinery unchanged, because a `u8[]` element IS an
+// i32 everywhere except in the backing.
+export let ba8Used = false
+export let ba8TypeIdx = 0
+export let bl8TypeIdx = 0
 // Linear-memory intrinsics (`__store_i32__` / `__load_i32__` / `__log__`): `memUsed`
 // gates the module-DEFINED memory (section 5); `memLogUsed` additionally gates the
 // synthetic in-module `__log__` decoder function. DIVERGENCE from the host (justified):
@@ -1353,7 +1385,11 @@ export let callRefSlot = 0
 // table slot is `mfSrcSlots[k]`); `mfDstKinds[k]` is `0` (i32 backing) / `1` (f64
 // backing). Reserved only in a function whose body contains a `.map`/`.filter` over
 // a list (`mfScan`) — every other function's frame layout is byte-identical.
-export type MfKind = "i32" | "f64" | "ref" | "str" | "i64" | "f32"
+// `"u8"` is the PACKED byte list's frame kind. It is not a scalar VALUE kind — a `u8[]`
+// element is an i32 everywhere above the load — it is here because a frame slot holding a
+// `u8[]` WRAPPER or its BACKING needs the packed heap type, and `"i32"` names the 4-byte
+// list's types. The stashed VALUE slot (`liBack == 2`) really is an i32.
+export type MfKind = "i32" | "f64" | "ref" | "str" | "i64" | "f32" | "u8"
 export let fnUsesMapFilter = false
 export let mfScratchBase = 0
 export let mfSrcKinds: MfKind[] = []
