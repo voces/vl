@@ -91,6 +91,7 @@ import {
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
+  nodeArrayElemIsStr,
   nodeArrayElemName,
   nodeEqCmpKind,
   nodeLitUnionMemberTexts,
@@ -2648,6 +2649,31 @@ export function criClassify(rx0: i32, i: i32) {
   if !retKindIsList(fRetKind[i]) && exprStringArray(rx, fnStmts[i]) {
     criSetRetKind(i, "strlist")
   }
+  // THE RETURNED LIST **LOCAL** WHOSE ELEMENT SPELLING ONLY THE ARENA KNOWS — the list twin
+  // of the `retIsMapLocal` rung below, and there for the same reason that one gives: a
+  // returned LOCAL's collected kind does not exist during this GLOBAL return pass
+  // (`buildLocals` runs per function, much later), so `exprArray`/`exprStringArray` above
+  // answer for a list LITERAL and for a param/global but not for `const ys = …; return ys`.
+  //
+  // The `expr*` families rescue the common cases through their typed-IR fast path
+  // (`tyKindOf`), which maps only `TyPrim` elements. FOUR element spellings share a scalar
+  // list's backing without being one: a litunion `K[]`, its `(K | null)[]` niche and the
+  // `(boolean | null)[]` sentinel niche are the i32 list; `(string | null)[]` is the string
+  // list. Every one of them returned as a local left `fRetKind` at the `"i32"` default while
+  // the body handed back the wrapper — `expected i32, found (ref $type)`, `vl check` rc 0
+  // (`soundness/miscompile-nullable-elem-list-call-init`, and the three siblings beside it).
+  //
+  // ASKED HERE AND NOT IN `tyKindOf`, deliberately, and the difference was MEASURED. Widening
+  // that mapping instead makes `exprArray` claim a `K[]` at every position, and
+  // `generics/error-litunion-list-arg-not-pinned.vl` — the file that pins a `K[]` generic
+  // argument FAILING CLOSED — starts printing the raw atom id `0` where its oracle says `a`.
+  // A loud reject traded for a wrong value is worse than the bug being fixed. The RESULT
+  // VALTYPE of a function is the one question whose answer is the same for all four spellings,
+  // so it is the one place the widening is safe.
+  if !retKindIsList(fRetKind[i]) {
+    const rlk = tyScalarBackedListKind(nodeTyIxOf(rx))
+    if rlk != null { criSetRetKind(i, rlk) }
+  }
   if !retKindIsList(fRetKind[i]) && exprF64Array(rx, fnStmts[i]) {
     criSetRetKind(i, "f64list")
   }
@@ -2803,7 +2829,66 @@ export function criClassify(rx0: i32, i: i32) {
     else if exprIsF32(rx, fnStmts[i]) { criSetRetKind(i, "f32") }
     else if exprIsI64(rx, fnStmts[i]) { criSetRetKind(i, "i64") }
   }
+  // LAST RESORT: A RETURNED LOCAL, TYPED FROM ITS OWN DECLARATION. Everything above
+  // classifies the return EXPRESSION, and for an Ident naming a local that means either the
+  // typed-IR fast path (the checker's recorded type) or `declaredKind` — and BOTH can be
+  // blind at once. `declaredKind` reads a per-function table `buildLocals` fills much later,
+  // and a MONOMORPHIZED INSTANCE's body is a CLONE whose leaf nodes carry no recorded type
+  // (the arena cannot hold a per-instance type on a shared leaf). A lambda inside such an
+  // instance therefore had no source at all for its result valtype:
+  //
+  //     function f(self) { const g = () => { const z = self[0]  return z }  print(g())  … }
+  //     f([1.5, 2.5])            // g's local IS f64; g's RESULT was i32 — invalid wasm
+  //
+  // The LOCAL was typed correctly all along — `collectLocals` runs per function, after the
+  // pin, and reads the annotation. So the fix is to ask the DECLARATION the same way, through
+  // `letCellKind`, which is the shared home `collectLocals`' own ladder mirrors. That is what
+  // `retIsMapLocal` already does one column up, for maps only, and for the same stated reason.
+  //
+  // THE PAYLOAD-FREE KINDS ONLY. A struct / nullable-struct / ref-list / map / variant result
+  // needs a companion slot beside the kind (`fRetStructIdx`, `fRetRArrElem`, the map shape),
+  // and naming the kind without it selects the wrong index space. The scalars and the
+  // scalar-element lists need no slot, which is exactly the set below. `nulstr` / `closure`
+  // are excluded for the reasons `letCellKind`'s own decline list gives.
+  //
+  // GATED ON THE SLOT STILL BEING THE DEFAULT, so this can only ever fill a hole: a function
+  // any arm above claimed keeps that answer, and a function still reading `"i32"` while
+  // returning an f64/string/list local was miscompiling.
+  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
+    const lk = retLocalCellKind(rx, i)
+    if lk != null { criSetRetKind(i, lk) }
+  }
   0
+}
+
+// The payload-free CELL KIND of a returned LOCAL of function `i`, or `null` — the declaration
+// half of `criClassify`'s last rung above. Resolves the `LetDecl` by name in this function's
+// own body and asks `letCellKind`, the shared annotation-else-initializer ladder.
+function retLocalCellKind(rx: i32, i: i32): VKind | null {
+  if i < 0 || i >= fnStmts.length { return null }
+  const rn = P.nodes[unwrapParen(rx)]
+  if rn is Ident {
+    const fn = P.nodes[fnStmts[i]]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, rn.identName)
+      if li < 0 { return null }
+      const k = letCellKind(li, fnStmts[i])
+      if (
+        k == "f64" ||
+        k == "f32" ||
+        k == "i64" ||
+        k == "str" ||
+        k == "list" ||
+        k == "strlist" ||
+        k == "f64list" ||
+        k == "i64list" ||
+        k == "f32list"
+      ) {
+        return k
+      }
+    }
+  }
+  null
 }
 
 // Walk a block's statements classifying every `return <e>` under the SAME
@@ -14763,6 +14848,19 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // `nodeArrayElemIsNulLitUnion` recognizes — without this exclusion a string-FIRST literal claims
     // the string-list slot/collect while every consumer reads the atom rep (invalid wasm).
     if nodeArrayElemIsNulLitUnion(arrIx) { return false }
+    // A `string[]` literal with NO string-typed first element (`const ys: string[] = [k,
+    // "plain"]` over a litunion `k`): the recorded context-adoption type is the only signal.
+    // The checker resolved this literal to `string[]` — the redundant-annotation lint says so
+    // in the fixture's own `@hint` — and the emitter then built the ATOM list from the first
+    // element and stored it in a string-list slot: check-clean INVALID WASM. The atom element
+    // WIDENS on the way into a string list (the string-FIRST spelling of the same literal has
+    // always worked, `literal-unions/litunion-atom-in-string-array-literal.vl`), so claiming
+    // the string list here reaches machinery that is already in place.
+    //
+    // AFTER the two literal-union exclusions above, which keep a genuine `K[]` / `(K | null)[]`
+    // annotation on the atom list, and BESIDE the nullable twin below, which is this arm for
+    // the `(string | null)[]` spelling and is the reason that spelling already worked.
+    if nodeArrayElemIsStr(arrIx) { return true }
     // A `(string | null)[]` literal with NO string-typed first element (`[null]`, `[null,
     // "x"]`): the recorded context-adoption type is the only signal — it IS the string-ref
     // niche list (`emitArr` seeds `pendingNulString` off the same recorded type), so the
@@ -24389,6 +24487,40 @@ function declaredF64Array(name: string) { declaredKind(name) == "f64list" }
 // / nullable / closure type returns -1 (its lowering needs a slot/table the kind code alone
 // can't carry), and a node with no recorded type (a monomorphized instance body, whose
 // shared leaves can't hold a per-instance type) also reads -1 — both keep the syntactic path.
+// The SCALAR-LIST wrapper kind of an ARRAY type whose ELEMENT is one of the four spellings
+// that ride a scalar list's backing WITHOUT being a `TyPrim` — `"list"` for a literal-union
+// `K[]`, its `(K | null)[]` niche and the `(boolean | null)[]` sentinel niche (all three the
+// i32 list), `"strlist"` for the `(string | null)[]` ref niche — else `null`.
+//
+// THE WRAPPERS ARE THE SAME HEAP TYPE, which is checkable and was checked rather than argued:
+// a program binding all eight list spellings side by side gives `K[]`, `(K | null)[]` and
+// `(boolean | null)[]` the same wrapper as `i32[]` and `(string | null)[]` the same wrapper as
+// `string[]`, while `(i32 | null)[]` and `(f64 | null)[]` get the BOX list — which is why the
+// nullable arm below claims boolean and string and nothing else.
+//
+// The NAME-side ladders have folded these spellings for a long time (`nameIsI32Array` accepts
+// `boolean[]`, a litunion `K[]`, `(boolean|null)[]` and `(K|null)[]`; `nameIsStringArray`
+// accepts `(string|null)[]`), so a BINDING of one is typed correctly. This is the same fold on
+// the ARENA, for the one consumer that holds a type and no name.
+function tyScalarBackedListKind(tyIx: i32): VKind | null {
+  if tyIx < 0 { return null }
+  const t = T.tys[tyIx]
+  if t is TyArray {
+    if t.aElem < 0 { return null }
+    if tyIsLitUnion(t.aElem) { return "list" }
+    if tyIsNullableLitUnion(t.aElem) { return "list" }
+    const el = T.tys[t.aElem]
+    if el is TyNullable {
+      const inner = T.tys[el.nInner]
+      if inner is TyPrim {
+        if inner.primName == "boolean" { return "list" }
+        if inner.primName == "string" { return "strlist" }
+      }
+    }
+  }
+  null
+}
+
 function tyKindOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
