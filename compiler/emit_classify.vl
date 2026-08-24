@@ -133,6 +133,7 @@ import {
   nodeTyWidenedRepName,
   nodeUnionName,
   nominalStructNameOfTy,
+  numLitUnionArrayBaseName,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   recordClonedNodeTyFb,
@@ -12546,6 +12547,23 @@ export function tyAnnRefListKind(tyIx: i32) {
     // answers a literal-BUILD seed, not a cell rep — so the rep layer cannot subsume it and
     // the check has to stand here.
     if tyIsLitUnionArray(nodeTyIxOf(tyIx)) { return 0 }
+    // THE NUMERIC TWIN OF THE ARM ABOVE, and it needs three answers where that one needs the
+    // default. A numeric literal union has no atom: its members ARE `i32` / `i64` / `f64`
+    // values, so a `K[]` is the BASE SCALAR's list — kind 4 for f64, kind 6 for i64, and the
+    // default i32 wrapper for i32, which is the only reason the i32 base worked before this arm
+    // existed and the other two did not.
+    //
+    // AHEAD OF THE NAME ARMS for the same reason the string arm is, and the canon pass is why:
+    // it softens the bare member spelling to the BASE, so `(1.5 | 2.5)[]` reads `f64[]` and the
+    // `tyIsF64Array` rung below would answer for the alias — but only for the alias-free
+    // spellings it happens to soften, and `tyIsF64Array` is a `TyPrim` test the ARENA type
+    // (a `TyArray` over a `TyUnion` of `TyLit`s) never satisfies. So an empty `[]` seeded no
+    // list kind at all and built the default i32 wrapper into an f64/i64 cell — check-clean
+    // invalid wasm, and specifically NOT a mis-route that a name second opinion reaches.
+    const nlab = numLitUnionArrayBaseName(nodeTyIxOf(tyIx))
+    if nlab == "f64" { return 4 }
+    if nlab == "i64" { return 6 }
+    if nlab != "" { return 0 }
     // The nullable-ELEMENT twin (`(("a" | "b") | null)[]`, kind 9), ahead of the name arms
     // for the same reason: the softened `(string | null)[]` spelling would seed the
     // string-list build (kind 3) for a cell that is the i32 atom-niche list.
@@ -17995,7 +18013,24 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // residual of the nullable-nested-map family: `const m = t1[k] ?? h2` then
     // `m[k] == "bbpt"`; also the bare direct-receiver spelling). The map dual of
     // the array-element claim above.
-    if nodeTyIsPureLitUnion(unwrapParen(exprIx)) { return true }
+    // …UNLESS THE MEMBERS ARE NUMBERS. `nodeTyIsPureLitUnion` asks only that every member is
+    // a `TyLit`, and it has to keep asking exactly that: its OTHER caller uses it to say "this
+    // result is not the union BOX", which is true of both literal-union families. Here the
+    // question is the narrower one — "is this value an interned i32 ATOM" — and a numeric
+    // literal union is not one. Its members ARE `i32` / `i64` / `f64` values
+    // (`numLitUnionBaseTy`, the same rule `tyKindOf`'s own literal arm states), so there is no
+    // member id to widen and `nodeLitUnionMemberTexts` has nothing to hand back.
+    //
+    // THE WITNESS NEEDS BOTH FAMILIES IN ONE MODULE, which is why this survived: the whole
+    // classifier is behind `gLitUnionUsed`, a module-wide flag that only a STRING litunion
+    // turns on. `type S = "a" | "b"` + `type K = 1.5 | 2.5`, both as arrays, then
+    // `print(k[0])` — `emitProgram: print of a literal-union atom whose type carries no member
+    // texts`, on a program whose numeric half is correct in every other position. Drop the `S`
+    // declaration and the same line prints `1.5`.
+    const pluIx = unwrapParen(exprIx)
+    if nodeTyIsPureLitUnion(pluIx) {
+      if numLitUnionBaseTy(nodeTyIxOf(pluIx)) < 0 { return true }
+    }
     // The BARE read types `K0 | null` (a missing key reads null) — the emit is the
     // i32 atom either way (the not-found arm yields a non-member sentinel), so the
     // nullable spelling claims too.
@@ -24536,7 +24571,30 @@ function tyKindOf(tyIx: i32) {
   }
   if t is TyArray {
     if t.aElem < 0 { return -1 }
-    const el = T.tys[t.aElem]
+    // A NUMERIC literal-union ELEMENT (a `K[]` over `type K = 1.5 | 2.5`, an inline
+    // `(1 | 2)[]`) reps as its BASE SCALAR's list, by the SAME rule the standalone arm at
+    // the bottom of this function states for the scalar — so the row the element kind is
+    // read off is the base's, resolved through the one home (`numLitUnionBaseTy`) and then
+    // through the `TyPrim` map below, which stays written once.
+    //
+    // A STRING litunion element answers -1 at that home and keeps falling through, and
+    // that is required rather than incidental: its rep is the interned i32 ATOM (kind 2,
+    // reached through `tyIsLitUnionArray` at the annotation sites), not the `(ref $array)`
+    // that kind 7 names for a `string` element.
+    //
+    // GATED ON THE VARIANT for the same reason the scalar arm is: only a literal or a
+    // union element can be a numeric litunion, so no other element shape pays the walk.
+    let elIx = t.aElem
+    const el0 = T.tys[elIx]
+    if el0 is TyLit {
+      const eb0 = numLitUnionBaseTy(elIx)
+      if eb0 >= 0 { elIx = eb0 }
+    }
+    if el0 is TyUnion {
+      const eb1 = numLitUnionBaseTy(elIx)
+      if eb1 >= 0 { elIx = eb1 }
+    }
+    const el = T.tys[elIx]
     if el is TyPrim {
       const en = el.primName
       if en == "i32" { return 2 }
