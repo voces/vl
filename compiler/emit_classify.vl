@@ -436,6 +436,7 @@ import {
   sTyIx,
   scopeFrames,
   scopeNames,
+  scopeSlotOf,
   scopeSlots,
   slUsed,
   startStmts,
@@ -3662,18 +3663,6 @@ export function scopeUnbind() {
   0
 }
 
-// The declared-local POSITION bound to `name` by the innermost live scope frame, or
-// -1 if `name` is not a live lexical binding. Searches the scope stack top-down
-// (innermost first), so a shadowing inner `let` wins over an outer same-named one.
-function scopeSlotOf(name: string) {
-  let k = scopeNames.length
-  while k > 0 {
-    k = k - 1
-    if scopeNames[k] == name { return scopeSlots[k] }
-  }
-  -1
-}
-
 // Opening a control frame: bump the running depth. Returns 0.
 export function ctrlEnter() {
   ctrlDepth = ctrlDepth + 1
@@ -6293,11 +6282,12 @@ export function declaredKind(name: string): VKind | null {
   localIsRef[slot]
 }
 
-// The wasm local index of declared local `name`, or -1 if it is not a declared
-// local. Declared locals sit AFTER the params, so the slot is `paramCount + pos`
-// where `pos` is the name's resolved declared-local position (`declaredSlotOf`).
-function declaredIndexOf(fnIx: i32, name: string) {
-  const pos = declaredSlotLive(name)
+// The wasm local index of the declared-local POSITION `pos` in function `fnIx`, or -1
+// if `pos` names no local. Declared locals sit AFTER the params, so the index is
+// `envShift + paramCount + pos`. The position→index half of declared-local resolution,
+// shared by the name lookup (`declaredIndexOf`) and by `localIndexOf`'s scope-stack
+// arm, which already holds a position and must not re-resolve the name.
+function declaredIndexAt(fnIx: i32, pos: i32) {
   if pos < 0 { return -1 }
   if fnIx < 0 {
     // Module scope = the START FUNCTION's body (top-level statements — a `for`
@@ -6311,6 +6301,13 @@ function declaredIndexOf(fnIx: i32, name: string) {
   -1
 }
 
+// The wasm local index of declared local `name`, or -1 if it is not a declared
+// local. `declaredSlotLive` resolves the name (innermost live lexical binding, else
+// the loop-var-skipping flat scan); `declaredIndexAt` turns that position into an index.
+function declaredIndexOf(fnIx: i32, name: string) {
+  declaredIndexAt(fnIx, declaredSlotLive(name))
+}
+
 // The wasm-local-index offset introduced by the env-leading closure param: when ANY
 // function value exists in the module (`fnValUsed`), EVERY function (except the start
 // fn, `fnIx < 0`) carries a hidden leading `structref env` at local 0, so its declared
@@ -6321,10 +6318,34 @@ export function envSlotShift(fnIx: i32) {
   0
 }
 
-// Resolve an identifier `name` to its wasm local index for function `fnIx`: a param
-// first (locals 0..p-1, shifted past the env param when `fnValUsed`), else a declared
-// local. Returns -1 if neither.
+// Resolve an identifier `name` to its wasm local index for function `fnIx`: a LIVE
+// lexical binding first, else a param (locals 0..p-1, shifted past the env param when
+// `fnValUsed`), else a declared local through the flat fallback. Returns -1 if none.
+//
+// THE SCOPE STACK OUTRANKS THE PARAM, and that ordering is the whole point. A
+// block-scoped local that shadows a parameter —
+//
+//   function f(v: i32, n: i32) { if n > 0 { const v = 99  print(v) }  print(v) }
+//
+// — gets its own slot from `addLocalName` (one wasm local per lexical binding, no
+// dedupe by name) and is `scopeBind`-ed by both passes, so every part of the machinery
+// already knew about it. This function was the one that did not: asking
+// `paramIndexOf` FIRST meant a same-named param always won, the inner `const` was
+// resolved away to local 0, and the declaration was silently ignored — `99` printed as
+// `7`. It also made this resolver disagree with every TYPE classifier in this file
+// (`declaredKind` and the `declared*` predicates consult `declaredSlotOf` and never look
+// at params at all), and that disagreement is what turned a wrong number into an
+// invalid module whenever the two bindings' reps differed.
+//
+// ONLY THE SCOPE-STACK HIT OUTRANKS THE PARAM — not `declaredIndexOf`, whose flat
+// `localNames` fallback would also match a binding whose block has already CLOSED. The
+// trailing `print(v)` above must read the param again, and `declaredSlotLive`'s flat
+// scan cannot tell a dead binding from a live one (it serves the scope-less detection
+// passes, which must see in-body bindings). So the live lookup is hoisted ahead of the
+// param and the fallback is left behind it.
 export function localIndexOf(fnIx: i32, name: string) {
+  const scoped = scopeSlotOf(name)
+  if scoped >= 0 { return declaredIndexAt(fnIx, scoped) }
   const pIx = paramIndexOf(fnIx, name)
   if pIx >= 0 { return envSlotShift(fnIx) + pIx }
   declaredIndexOf(fnIx, name)
