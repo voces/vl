@@ -287,8 +287,12 @@ land — that invisibility is the defining property of the uncoloured model.
    `error-handling-design.md` §O7 measured every signature shape it needs as already
    lowering — **re-run that probe at the head that implements it**, per its own
    instruction.
-3. **The `as` trio.** Its stated trigger — *"once `std:fs` proves the ladder
-   boilerplate"* — fires here.
+3. **The `as` trio.** ~~Its stated trigger — *"once `std:fs` proves the ladder
+   boilerplate"* — fires here.~~ **DONE (2026-08-24)** for the two lowered members:
+   `as` propagates and `as!` traps, over a value-atom arm, a struct arm and a
+   sub-union target. `as?` is parsed and refused at the checker (its `T | null`
+   result needs the per-rep nullable classifiers); it is the lossy member, so step 4
+   is not blocked on it.
 4. **Stack switching**, wasmtime first.
 5. **`map(f, limit)`**, with the generic sized-array intrinsic so `map` moves to std
    (§3.1).
