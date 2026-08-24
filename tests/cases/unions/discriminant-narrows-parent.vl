@@ -1,0 +1,80 @@
+// THE DISCRIMINANT RULE: a test on a struct union's FIELD refines the UNION itself.
+//
+//     if s.kind is KC { s.r }
+//
+// narrowed only the FIELD — the `s.kind` path overlay — and left `s` at the full union, so
+// the very next token was `field 'r' is not on every member of S — narrow with \`is\` first`.
+// That is the discriminated-union move, and the reason a tag is written at all: the arms
+// differ in it precisely so that reading it tells you which arm you have.
+//
+// A member survives when its own field type is still inhabitable under the fact (mutual
+// assignability either way — the same test `sharedUnionFieldTy` used to demand of the whole
+// union). `KC` keeps a `kind: KC` arm and drops a `kind: KR` one.
+//
+// FOUR REFUSALS in the checker, each otherwise unsound or useless: a receiver behind a `?.`
+// hop (the chain may be null because a RECEIVER was); any member that is not a struct or that
+// lacks the field (a field does not discriminate a union it is not on, and dropping arms on
+// that basis is narrowing on absence); ZERO survivors (a contradiction, to be reported where
+// it happens rather than smuggled in as `never` through an overlay); and ALL survivors (no
+// refinement, so a fact would only cost a shadow).
+//
+// THE EMITTER TAKES THE CHECKER'S ANSWER rather than re-deriving it. Deriving it there means
+// comparing the tested SPELLING against each arm's field identity, which lives in a different
+// column depending on how the tag was written — a litunion alias in `uFieldElemName`, a bare
+// literal in `uFieldTyText`, a plain type in neither. So the surviving type is banked at the
+// `is` node (`isParentTyIx`, parallel to `isVarTyIx` and for the same reason its header
+// gives) and read by `setNarrowFromCond`.
+//
+// TWO LIMITS, both LOUD and neither silent:
+//   - SINGLE SURVIVOR only. A test leaving two of three arms needs an interned member-SET id
+//     rather than a name; with nothing pushed the emitter keeps the full union, and a field
+//     present on only the survivors fails the shared-field plan's all-members test and takes
+//     its loud reject. A field on ALL arms still reads correctly through that same plan.
+//   - THEN branch only. `setNarrowFromCondElse` deliberately declines to else-narrow a struct
+//     union ("their member reads must not change"), so the checker does NOT complement here
+//     either — a checker-only complement would type `else { s.w }` clean and hand it to an
+//     emitter still seeing the full union, turning an accurate `field 'w' is not on every
+//     member` into an obscure `field access but no struct type declared`. Both reject; the one
+//     that names the field is the better message. The ELSE half is one slice, in both layers.
+// @run
+// @log 3
+// @log 0
+// @log 5
+// @log 0
+// @log 7
+
+type KC = "circle"
+type KR = "rect"
+type C = { kind: KC, r: f64 }
+type R = { kind: KR, w: f64 }
+type S = C | R
+
+// two arms: the tag test narrows `s` to `C`, so `s.r` — which is NOT on `R` — reads
+function area(s: S) {
+  if s.kind is KC { return s.r }
+  return 0.0
+}
+print(area({ kind: "circle", r: 3.0 }))   // 3
+print(area({ kind: "rect", w: 4.0 }))     // 0
+
+// three arms, a single survivor: `u.m` is on `X` alone
+type KA = "a"
+type KB = "b"
+type KX = "x"
+type A = { k: KA, n: i32 }
+type B = { k: KB, s: string }
+type X = { k: KX, m: f64 }
+type U = A | B | X
+function pick(u: U) {
+  if u.k is KX { return u.m }
+  return 0.0
+}
+print(pick({ k: "x", m: 5.0 }))           // 5
+print(pick({ k: "a", n: 1 }))             // 0
+
+// the bare `is C` spelling is untouched — it narrows as it always did
+function areaB(s: S) {
+  if s is C { return s.r }
+  return s.w
+}
+print(areaB({ kind: "rect", w: 7.0 }))    // 7
