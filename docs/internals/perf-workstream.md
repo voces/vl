@@ -379,10 +379,84 @@ concatenation and the `string`-returning accessors (`repTreeKindOf`,
 - **Byte-identity cross-check:** both seeds compile the pinned master tree to the same
   1,375,877-byte wasm, and the patched tree reaches its own fixpoint at 1,376,574 bytes.
   All seven gates match master exactly, rep-fuzz included (`exact`, 1 baselined reject).
-- **Residue, not done:** `rtReason` is still a `string[]` of a closed policy vocabulary —
-  but it is read almost entirely as a *return value*, not a comparison (`repTreeUnsupReason`
-  hands it out), and its two hot comparisons are the `== "litunion:noalias"` pair. Census
-  it before converting; the number above is the reason not to assume.
+- **Residue — censused and CLOSED, do not convert.** `rtReason` was the other
+  closed-vocabulary `string[]` among the `rt*` columns. The census is §4.2b: it is compared
+  **zero** times in a self-compile, and the census incidentally found a candidate ~2.5× the
+  size of this one (§4.6).
+
+### 2b. `rtReason` → a named litunion — **CENSUSED AND CLOSED: DO NOT CONVERT**
+
+The follow-on §4.2 filed. The answer is **no**, and the reason is not the one the residue
+note predicted.
+
+**THE PREDICTION WAS THE RIGHT SHAPE AND THE WRONG AXIS.** §4.2 guessed `rtReason` would
+lose because it is *returned* rather than *compared*. The census says it loses because the
+**whole column is cold**: `rtKind` sits on a hot READ path and `rtReason` sits on a cold
+CONSTRUCTION path, and that distinction — not return-vs-compare — is what decides a
+litunion conversion.
+
+**METHOD.** A counter at every site in `emit_rep.vl` (every site that reads, writes, compares or
+concatenates the column), dumped from `compileSrc`, run under a `vl build compiler/entry.vl`
+of a **pinned `origin/master` tree** at `5bbab0b1`. The instrumented seed compiles that tree
+to the **byte-identical** 1,377,126-byte wasm master's seed does, so the counters describe
+the real workload. **Reach-probed:** every comparison counter is zero on the self-compile,
+so each one was re-run against `tests/cases/lists/litunion-nullable-list.vl`, where they read
+`cmpNul=2` / `cmpElemName=2` — the zeros are measurements, not dead probes.
+
+| site | kind | per self-compile | per 1,855-program corpus |
+| --- | --- | ---: | ---: |
+| `rtListVKind` `== "litunion:noalias"` | compare | **0** | 162 |
+| `rtNulVKind` `== "litunion:noalias"` | compare | **0** | 2 |
+| `repTreeListElemName` `== "litunion:noalias"` | compare | **0** | 164 |
+| `repTreeReasonOf` | return | **0** | 0 |
+| `repTreeUnsupReason` | return | **0** | 0 |
+| `rtInternKeyOf` key build | concat (column) | 1,353 | 8,358 |
+| `rtLeafOf` key build | concat (param) | 12 | 3,601 |
+| `rtAlloc` / `rtLeafOf` | write | 1,357 / 4 | 11,798 / 3,440 |
+
+- **Three comparison sites, ZERO executions.** All three are guarded by
+  `rtKind[elem] == "unsup"` at a list or nullable-list ELEMENT, and after #1855 that guard
+  is already an `i32.eq`. The compiler's own source contains no array whose element is a
+  genuinely-inline (non-aliased) literal union, so the string compare behind the guard never
+  runs. **Across the whole 2,156-file corpus only 4 programs execute it at all**, 328 times
+  between them.
+- **Two return sites, ZERO executions.** `repTreeReasonOf` has **no caller anywhere in
+  `compiler/`** — `destringify-types-program.md` already records it as "uncalled by
+  construction", a Stage-A (#919/#920) staging surface shipped ahead of its consumers. `repTreeUnsupReason` has exactly one caller,
+  `repShadowCheckTy`, behind `if !repShadowOn { return 0 }` — the debug-only differential
+  harness, off in every real build.
+- **The share of `__str_eq__` self-time attributable to `rtReason` is 0.00%.** Not "small":
+  zero comparisons. The column's only live traffic is 1,365 hash-cons key builds per
+  self-compile, where it is one of three-to-four concatenated pieces — against `__str_eq__`
+  at **19.35% self** (6 warm `VL_PROFILE_GUEST` runs, 10,611 samples, `$mNN` stripped;
+  #1855's post-change reading of 19.18% reproduces).
+- **Compare the sibling that DID pay: 17,664,170 comparisons vs 0.** Same file, same two
+  writers, same closed vocabulary, adjacent columns — and a ratio with no finite value. The
+  transferable rule is narrower than "call counts rank, they do not size": **a litunion pays
+  for a column that is READ hot. `rtKind` is read 1,849,728 times over a tree of 1,357
+  nodes; `rtReason` is touched 1,365 times in the same build, all of them during
+  construction.** Adjacency in a struct-of-arrays says nothing about access frequency.
+- **It would also cost more than four annotations.** `rtOfPrim`'s fallthrough builds its
+  reason as `"prim:" + primNameStr(pn)` — a *computed* string, the one site that is not a
+  literal. A litunion forces it to an explicit two-arm ladder. Cheap, but it is real work
+  bought for a measured zero.
+
+**THE VALUE SET, for the record — it is closed, which is why "no" had to be measured rather
+than argued.** 23 `rtLeafOf` call sites; `rtAlloc` and `rtLeafOf` remain the only writers.
+**14 values:** `""` (every non-`unsup` node, 10 sites) · `hole` · `list:hole` · `neg` ·
+`leaf:unnarrowable` · `prim:null` · `prim:never` (the computed pair — `rtOfPrim` handles
+i32/boolean/i64/f64/f32/string/u8/void above it, so only `null` and `never` fall through) ·
+`litunion:noalias` (2 sites) · `union:single-nonobj` · `union:unclassified` · `nul:hole` ·
+`nul:unclassified` · `map:key` · `map:val-hole`. The corpus exercises 7 of the 14; `hole`,
+`list:hole`, `neg`, `nul:hole`, `map:val-hole` and both `prim:` codes never fire in 1,855
+programs. A future `PrimName` member would silently mint a 15th — which a litunion would
+turn into a compile error, the one genuine (non-performance) argument for converting.
+
+**THE `rt*` LITUNION SEAM IS NOW EXHAUSTED.** §4.2's "fifteen `rt*` tables" is fifteen
+*names*: eleven arrays, one map, three scalars. Nine of the eleven arrays are `i32[]`,
+`rtKind` is the converted `RtKind[]`, and `rtReason` is this one — so there is no third
+`string[]` to census. `rtIntern`, the `{[string]: i32}` hash-cons map, is probed 1,365 times
+per self-compile and is cold for the same reason the column is.
 
 ### 3. Litunion dispatch and the `string`→litunion crossing — **(A) before (B), and the ordering is the point**
 
@@ -479,6 +553,36 @@ literal union"; B287's param-cell ladder, **17,329 comparisons, 0 disagreements*
 - **Proposed:** `{[string]: i32}` built once in `collectU` (which already owns the reset).
   Mean 35.1 is the clearest map case in the set.
 - **Projected:** 5,742,013 → ~163,371. Arithmetic.
+
+### 6. `repOfTy` is a 99.93% redundant call — **found by §4.2b's census; ceiling measured, soundness open**
+
+Not a string item at all, and the largest single number in this document that nobody has
+tried. Measured on the same instrumented self-compile as §4.2b.
+
+- **Site:** `compiler/emit_rep.vl:3209`. `repOfTy(ty)` = `repOfTyFlat(ty)` + `repTreeOfTy` +
+  `repTreeVKind` + `repTreeNulOf` + `repTreeListElemName` + a `repMk` allocation.
+- **Evidence:** **1,855,025 calls over 1,346 distinct `ty` arguments, and `rtSync` rebuilds
+  the tree EXACTLY ONCE in the whole build** (`syncRebuild=1`). A per-`ty` memo on the
+  tree's own epoch would take 1,346 misses and 1,853,679 hits — **99.927%**.
+- **Size (profile, not the call count — §4.2's lesson):** `repOfTy` is **0.22% self /
+  5.65% inclusive**. The parts are visible: `repTreeOfTy` 1.00% self for a two-line body
+  called 1.85 M times (pure call overhead), `repMk` 0.82%, `repTreeVKind` 0.57%,
+  `repTreeNulOf` 0.52%, `repOfTyFlat` 0.05/1.43%, `repTreeListElemName` 0.18%,
+  `rtListVKind` 0.14%, `rtGo` 0.15%, `rtSync` 0.06%. **An inclusive share is a CEILING, not
+  a prediction** — 5.65% is what disappears if the memo is free and always hits, and it is
+  the right instrument here only because §4.2's lesson is that a *call count* is not. Even a
+  third of that ceiling clears candidate 2's −2.10%. A/B it before believing any of it.
+- **Two things must be settled before it is written, and neither is measured yet.**
+  (1) **Validity.** `rtSync`'s epoch guard is `tyMutEpoch` + `cUserTypesVer`, but
+  `repOfTyFlat` also reads `repSlotOfTy` and the variant tables, and the file's own header
+  says the tree is "built against the FINAL slot table" — the memo needs its own
+  invalidation argument, not the tree's. (2) **Aliasing.** `RepDesc` is a mutable object
+  and `repOfTy`'s own last act is `td.rdSlot = d.rdSlot`; a memo must hand back copies or
+  the first caller to mutate a cached descriptor corrupts every later one. That is the
+  `emitFail`-class trap — a silent wrong answer, not a crash.
+- **Do not schedule it as "the litunion follow-on".** It shares only its discovery with
+  §4.2b. It is a memoisation, its risk is correctness rather than effort, and it wants the
+  rep-fuzz gate (`scripts/rep-fuzz-check.sh`) more than any item here.
 
 ### Below the line, with their reasons
 
@@ -837,13 +941,20 @@ Recorded because the brief asked to be corrected rather than agreed with.
 2. ~~**Candidate 2** (`rtKind` → named litunion).~~ **SHIPPED, #1855, −2.10%** over four
    annotations. The projected `17,664,170 __str_eq__ → i32.eq` happened exactly as written;
    the *time* it was worth was ~6× less than the call count implied. See §2.
-3. **Candidate 3(A)** (`br_table` for litunion dispatch). Compounds with 2 and needs no
+3. ~~**`rtReason` → named litunion.**~~ **CENSUSED AND CLOSED — do not convert** (§4.2b).
+   Zero comparisons in a self-compile, zero return-site executions, 0.00% of `__str_eq__`.
+   The residue note's *reason* was wrong too: the axis is hot-read vs cold-construct, not
+   return vs compare.
+4. **Candidate 3(A)** (`br_table` for litunion dispatch). Compounds with 2 and needs no
    language change.
-4. **Candidates 4 and 5** (`isUName`, `variantIndexOf` → maps). Small, independent, and
+5. **Candidate 6** (`repOfTy` per-`ty` memo, §4.6). 5.65% inclusive over 1,346 distinct
+   inputs and one tree epoch — the biggest untried number in this document. Gated on the
+   validity and aliasing questions in its entry, not on effort.
+6. **Candidates 4 and 5** (`isUName`, `variantIndexOf` → maps). Small, independent, and
    together they are the honest test of §1's threshold — if either measures like #1851's
    −0.17%, the threshold is wrong and this document should say so.
-5. **Re-profile with a consumer split** (§9.7) before anything below this line is scheduled.
-6. Then, and only then: `capIsBound`'s callers, the LSP diagnostic path, and the std sort.
+7. **Re-profile with a consumer split** (§9.7) before anything below this line is scheduled.
+8. Then, and only then: `capIsBound`'s callers, the LSP diagnostic path, and the std sort.
 
 **Candidate 3(B)** (`string` → litunion) is a language change gated on 3(A) proving the
 dispatch win, on a sub-linear lookup design, and on ROADMAP A5c's named-vs-inferred rep
