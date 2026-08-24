@@ -6365,15 +6365,17 @@ function unionArmBoxSafe(tyIx: i32) {
 // `assignable` lattice, PLUS the float-literal→f32 exception (`isFloatLitExpr`). Used
 // where the SOURCE EXPRESSION node is in hand (so the literal can be recognized);
 // type-only sites keep using `assignable`.
-// Record the destination ARRAY type on an ArrayLit source whose element target is a
-// NICHE-nullable scalar (`K | null` / `boolean | null` / `string | null`), peeling a
+// Record the destination ARRAY type on an ArrayLit source whose element target REPS
+// DIFFERENTLY from the literal's own inference — a NICHE-nullable scalar element
+// (`K | null` / `boolean | null` / `string | null`), or a plain `string` element over an
+// all-literal-union literal (the two arms in the `TyArray` branch below) — peeling a
 // nullable destination wrapper (`(K|null)[] | null`) and grouping parens. Runs BEFORE
 // `assignableExpr`'s plain-assignable short-circuit: `[null]` infers `null[]`, which IS
 // covariantly assignable, so the literal-aware adoption block (where the litunion-array
 // recording lives) is never reached for it — yet the recorded type is the emitter's ONLY
 // classification signal for a literal with no rep-classifying element (all-`null`, or a
 // string-first `["x", null]` that would else claim the plain string list).
-function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
+function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
   let dtix = dstTy
   const dN = T.tys[dtix]
@@ -6388,7 +6390,7 @@ function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
     // typed-IR fast paths (`exprStringArray` and siblings) consult whichever node a
     // consumer holds — a Paren keeping its stale pre-adoption record (`string[]`)
     // would re-claim the wrong rep at the closure-result classification.
-    if recordNicheNulElemArrayLit(e.parInner, dtix, depth) == 1 {
+    if recordElemRepArrayLit(e.parInner, dtix, depth) == 1 {
       while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
       nodeTyIx[srcExpr] = dtix
       return 1
@@ -6401,6 +6403,37 @@ function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
         while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
         nodeTyIx[srcExpr] = dtix
         return 1
+      }
+    }
+    // THE OTHER DIRECTION OF THE SAME DISAGREEMENT: a `string[]` DESTINATION over a literal
+    // whose OWN element is a LITERAL UNION (`const ys: string[] = [k]`, `[k1, k2]`). The two
+    // reps genuinely differ — an atom is an interned i32 id, the destination's element is a
+    // `(ref $array)` — and an all-atom literal self-infers the ATOM list, so with nothing
+    // recorded the emitter built the atom list into a string-list slot: check-clean INVALID
+    // WASM (`soundness/miscompile-atom-first-arraylit-ignores-annotation`).
+    //
+    // IT BELONGS ON THIS SIDE OF THE SHORT-CIRCUIT for exactly the reason the header above
+    // gives for the niche elements: `K[]` IS covariantly assignable to `string[]`, so
+    // `assignableExpr`'s plain-assignable return fires and the literal-aware adoption block
+    // further down is never reached. An arm added there is dead code — which is how this was
+    // first written, and how it was caught.
+    //
+    // A MIXED literal (`[k, "plain"]`) never had the bug for an accidental reason: its own
+    // element type joins to `string`, so it already recorded what this arm records — which is
+    // why the defect looked like it was about element ORDER and is not.
+    //
+    // GATED ON THE DISAGREEMENT, so a `string[]` destination over an ordinary string literal
+    // records nothing and every other array literal in the language is untouched. The atom
+    // WIDENS on the way into a string list wherever the literal is classified as one
+    // (`literal-unions/litunion-atom-in-string-array-literal.vl` has always relied on that),
+    // so this reaches machinery that is already in place.
+    if tyIsPrimNamed(d.aElem, "string") {
+      if e is ArrayLit {
+        if tyIsLitUnionArray(nodeTyIxOf(srcExpr)) {
+          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+          nodeTyIx[srcExpr] = dtix
+          return 1
+        }
       }
     }
     return 0
@@ -6426,9 +6459,7 @@ function recordNicheNulElemArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
             if dfn[j] == f.fiName { dj = j }
             j = j + 1
           }
-          if dj >= 0 {
-            recordNicheNulElemArrayLit(f.fiValue, dft[dj], depth - 1)
-          }
+          if dj >= 0 { recordElemRepArrayLit(f.fiValue, dft[dj], depth - 1) }
         }
         k = k + 1
       }
@@ -6501,7 +6532,7 @@ function tyDeeperThan(ti: i32, budget: i32): boolean {
 // against every twin), falling back to the first same-fieldset row — the WRONG twin
 // when an inner/outer pair shares the fieldset (invalid wasm; fuzz sweep7 declared
 // leg, seed 129301940 case_00201). The struct-element sibling of
-// `recordNicheNulElemArrayLit`; like it, runs BEFORE the plain-assignable
+// `recordElemRepArrayLit`; like it, runs BEFORE the plain-assignable
 // short-circuit. Nested ObjLit field values re-stamp recursively so the inner
 // literal's resolution corrects too. Returns 1 when this node was re-stamped.
 function recordNullHoleObjAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
@@ -6597,7 +6628,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
   // array element too, not just this expression-level entry.)
-  recordNicheNulElemArrayLit(srcExpr, dstTy, 6)
+  recordElemRepArrayLit(srcExpr, dstTy, 6)
   recordNullHoleObjAdopt(srcExpr, dstTy, 6)
   // REP SIDECAR (phase 0a2): an ObjLit/ArrayLit whose source type reaches an unresolved
   // empty-collection hole (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its
@@ -19697,6 +19728,57 @@ function checkProgramNode(n: Program) {
   let t0 = 0
   while t0 < stmts.length {
     const sd0 = P.nodes[stmts[t0]]
+    // A `type` DECLARATION MAY NOT TAKE A PRIMITIVE'S NAME, and this is the only place that
+    // can say so: the two resolvers disagree about such a name and neither is wrong on its
+    // own. The checker resolves a bare name through `tsLeafTy`, which asks `primTyOfName`
+    // FIRST — so `f64` in an annotation is the PRIMITIVE and `const x: f64 = 1.5` type-checks
+    // — while nothing screened the declaration side, so `udName` went into `cUnionNames`
+    // verbatim and the emitter's alias registry believed `f64` named a literal union. The
+    // value was then stored as an f64 and read as the union's anyref box: `vl check` rc 0 and
+    // a module that does not instantiate. EVERY primitive spelling reproduced it, with the
+    // mismatch reported in whichever direction that prim's rep differs from the atom box
+    // (`type f64 = "a"|"b"` → `expected anyref, found f64`; `type string = "a"|"b"` →
+    // `expected i32, found (ref $type)`).
+    //
+    // A REJECT, NOT A RESOLUTION CHANGE. Making one side win would silently redefine what a
+    // primitive keyword means inside one file — the declaration is unusable either way, since
+    // no annotation can ever name it (the primitive shadows it at every use site). Rejecting
+    // at the declaration is the only outcome that leaves the language's meaning fixed.
+    //
+    // REJECT-PARITY: nothing in the tree declares one. `compiler/*.vl`, `std/*.vl`,
+    // `scripts/*.vl` and the whole `tests/cases` corpus were scanned for
+    // `type <prim> =` and the ONLY hit was the xfail fixture this closes.
+    //
+    // BOTH DECLARATION NODES, because the parser splits them: a `{`-bodied `type` is a
+    // `TypeDecl` and everything else (including the literal union that found this) is a
+    // `UnionDecl`. `primTyOfName` is the ONE home of the primitive spellings — the same
+    // function `tsLeafTy` asks — so the reject and the resolution cannot drift apart.
+    //
+    // The name is compared WHOLE. A GENERIC alias carries its parameters in the declared name
+    // (`Box<T>`), which no primitive spelling can equal, so `type f64<T> = …` is untouched:
+    // its applications synthesize names like `f64<i32>` that shadow nothing.
+    if sd0 is TypeDecl {
+      if primTyOfName(sd0.tdName) >= 0 {
+        tErr(
+          "a `type` declaration may not take the built-in type name `" +
+            sd0.tdName +
+            "` — every annotation resolves that name to the primitive, so the declaration " +
+            "can never be referred to; rename it",
+          stmts[t0],
+        )
+      }
+    }
+    if sd0 is UnionDecl {
+      if primTyOfName(sd0.udName) >= 0 {
+        tErr(
+          "a `type` declaration may not take the built-in type name `" +
+            sd0.udName +
+            "` — every annotation resolves that name to the primitive, so the declaration " +
+            "can never be referred to; rename it",
+          stmts[t0],
+        )
+      }
+    }
     if sd0 is TypeDecl {
       // A GENERIC alias (`type Box<T> = …` — the parser folds the params into
       // the declared name "Box<T>") registers in the generic-alias registry,
@@ -22354,10 +22436,41 @@ export function checkProgram(rootIx: i32) {
             // (`{x: i32}`, `A | B`, `Tok[]`) can mis-classify, and the emitter's
             // expression-based fallback already handles those, so leave them be.
             const enm = tyToStructStr(er)
-            if isClassifiableRetName(enm) {
+            // A BRANDED newtype over a classifiable base (`type NS = new string`) renders as
+            // its BRAND, not its base: a brand is minted as a COPY of the base `Ty`, and
+            // `tyToStrGo`'s first act is a `nomNameOfTy` check. So `NS` is not classifiable,
+            // nothing was recorded, and `fRetKind` kept the `"i32"` default while the body
+            // handed back the string ref — check-clean INVALID WASM
+            // (`soundness/miscompile-newtype-string-inferred-return`). The comment on the
+            // emitter's A20 arms names this exact shape as inert "only because no recorder
+            // rung banks such a row"; this is that rung.
+            //
+            // THE ERASED TYPE IS THE RIGHT ANSWER, not a widening of the gate. A brand has no
+            // runtime witness — it is erased before the emitter runs (`canonEmitTypeNames`;
+            // `newtype-design.md` §3) — so the rep of an `NS` return IS the rep of a `string`
+            // return, which is what this column exists to name. `nomErasedTyIx` iterates to a
+            // fixpoint, so `type N2 = new NS` reaches `string` too.
+            //
+            // SCOPED TO THE TOP-LEVEL BRAND. An `NF[]` return (a branded ELEMENT) is a
+            // `TyArray` that is not itself branded, so it erases to itself and this arm is
+            // inert for it — the array-element hazard the emitter's A20 comment describes
+            // stays exactly as it is.
+            let recNm = enm
+            let recTy = er
+            if !isClassifiableRetName(recNm) {
+              const erased = nomErasedTyIx(er)
+              if erased != er {
+                const ernm = tyToStructStr(erased)
+                if isClassifiableRetName(ernm) {
+                  recNm = ernm
+                  recTy = erased
+                }
+              }
+            }
+            if isClassifiableRetName(recNm) {
               // `isClassifiableRetName`'s admitted set is six scalar spellings plus
               // `i32[]`/`string[]` — every one of them a single atom (#1115).
-              recordInferRet(efn.fnName, enm, er, 1, IR_REC_CLASSIFIABLE)
+              recordInferRet(efn.fnName, recNm, recTy, 1, IR_REC_CLASSIFIABLE)
             } else {
               // A VALUE union/nullable inferred return (`i32 | string`, `i32 | null`)
               // lowers through the same `uBoxIdx` machinery as an annotation — export
@@ -24876,6 +24989,38 @@ export function nodeArrayElemIsNulBool(ix: i32) {
         const en = T.tys[et.nInner]
         if en is TyPrim { return en.primName == "boolean" }
       }
+    }
+  }
+  false
+}
+
+// True if node `ix` has a recorded ARRAY type whose ELEMENT is a plain `string` (a `string[]`)
+// — the NON-null twin of `nodeArrayElemIsNulStr` below, and the array-literal classifier's
+// only handle on a `string[]` ANNOTATION the literal's own first element disagrees with.
+//
+// WHY IT IS ASKED AT ALL. `arrLitIsStr` classifies an array literal by its FIRST ELEMENT, and
+// a literal-union atom element (`const ys: string[] = [k, "plain"]`) is a string EXPRESSION
+// that does not read as one — it lowers as its interned i32 id. So an atom-FIRST literal under
+// a `string[]` annotation built the ATOM list while the binding's slot held the string-list
+// wrapper: check-clean INVALID WASM. The same literal written string-FIRST works, and so does
+// the same atom-first literal under a `(string | null)[]` annotation, because THAT spelling has
+// had this arm (`nodeArrayElemIsNulStr`) all along. One niche's arm, missing from its non-null
+// sibling.
+//
+// The recorded ARRAY type is the CHECKER's answer for this literal — it adopted the binding's
+// annotation onto it — so this is the emitter asking the question the checker already
+// answered, not a second inference. It is asked AFTER the two literal-union exclusions, so a
+// genuine `K[]` / `(K | null)[]` annotation still builds the atom list: the canon pass softens
+// only the SPELLING, never the arena row, so those exclusions see the `TyUnion` of `TyLit`s.
+export function nodeArrayElemIsStr(ix: i32) {
+  const pty = nodeArrayElemPeelTy(ix)
+  if pty < 0 { return false }
+  const t = T.tys[pty]
+  if t is TyArray {
+    const e = t.aElem
+    if e >= 0 {
+      const et = T.tys[e]
+      if et is TyPrim { return et.primName == "string" }
     }
   }
   false

@@ -85,10 +85,15 @@ const EMIT_ERROR_SRC =
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 
-// Type-checks clean, EMITS clean, and the module does not validate: a `string | null`
-// argument at a GENERIC call, whose instance declares a NON-null parameter
-// (`tests/cases/soundness/xfail-miscompile-nullable-ref-generic-arg.vl`).
+// Type-checks clean, EMITS clean, and the module does not validate: CONSTRUCTING the
+// inline-object arm of a union whose field is a nullable i32-keyed map
+// (`tests/cases/soundness/xfail-miscompile-union-arm-constructed-map-field.vl`).
 // Distinct from EMIT_ERROR_SRC above: the emitter raises nothing at all here.
+//
+// The previous specimen was a `string | null` argument at a GENERIC call, whose instance
+// declared a NON-null parameter — fixed by giving the module-scope pin arm the nullable
+// ladder its function-scoped siblings had, so this test went red exactly as the note below
+// said it would, and the same instruction was followed.
 //
 // The previous specimen was issue #1792 — a DECLARED alias over two literal unions
 // (`type A = 1 | 2; type B = 3 | 4; type U = A | B`), which is fixed, so this test went
@@ -96,12 +101,9 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // graduates, swap in any other `@no-instantiate` shape from tests/cases/soundness/
 // rather than deleting the assertion.
 const INVALID_MODULE_SRC =
-  `function id<T>(v: T): T {\n` +
-  `  return v\n` +
-  `}\n` +
-  `const s: string | null = "hi"\n` +
-  `const r = id(s)\n` +
-  `if r != null { print(r) } else { print(0) }\n`;
+  `type Box = { g: {[i32]: i32} | null } | f64\n` +
+  `const v: Box = { g: Map() }\n` +
+  `if v is f64 { print(1) } else { print(2) }\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

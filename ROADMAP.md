@@ -906,6 +906,25 @@ in-language GC knobs.
   param) is live and not pinned here at all — `docs/internals/open-rulings.md`. The SELF-HOST
   checker's soundness floor (15 false-accept classes) is closed; new classes go straight to corpus
   + both checkers.
+  THE `xfail-miscompile-` TIER (accepts, then emits invalid wasm) stands at **five** members here
+  plus one under `tests/cases/std/`, down from twelve: seven closed in one pass and SIX of the
+  seven were the same sentence — a ladder with an arm its sibling ladder lacks (see `CHANGELOG.md`,
+  Track B, and the enumeration in `tests/cases/soundness/README.vl`). What remains is attributed
+  rather than merely listed: the `$fnsig` producer chain keyed on a rendered spelling
+  (`narrowed-litunion-fn-value-arg` here + `array-litunion-element` in std — one question, and they
+  need `cloParamTok` / `annSigKey` / `sigKeyOfTy` moved TOGETHER or nothing measures); the numeric
+  literal-union family's missing REP decision (`numeric-litunion-empty-list-seed`, the same
+  `litKind == "str"` restriction behind `xfail-false-reject-numeric-litunion-array-in-signature`);
+  a union whose two closure arms are ONE TYPE (`permuted-object-closure-arms` — the permutation
+  turns out to be incidental, and the degenerate form, two identically-spelled `(i32) => i32`
+  arms, is a VALID module that silently prints nothing where both `is` tests should be true: a
+  wrong VALUE, pre-existing on master, worse than the file that pins it and with no fixture kind
+  yet); a constructed nullable-map union-arm field whose `Map()` builds the STRING-keyed map
+  struct while the field declares the i32-keyed one, with three controls narrowing it to a
+  missing nullable PEEL (`union-arm-constructed-map-field`); and the checker-side totality gate,
+  which carries an ordering constraint in its own header.
+  **RE-DERIVE A FILED DIAGNOSIS BEFORE BUILDING ON IT.** Two of the seven headers were wrong about
+  their own defect, and for a miscompile the re-derivation is `wasm-tools print` on the bad module.
 - 🟡 **A13. Operator-constraint inference.** A binary op with a hole operand records a deferred
   `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
   argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall
