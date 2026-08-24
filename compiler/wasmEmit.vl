@@ -36,6 +36,7 @@ import {
   nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
+  nominalStructNameOfTy,
   numLitUnionBaseName,
   numLitUnionHasBase,
   tyIsLitUnion,
@@ -11169,22 +11170,23 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     // The target arm's TYPE is the cast node's own recorded type — the checker set it to
     // exactly the arm it proved. No spelling is resolved here.
     const tty = nodeTyIxOf(_exprIx)
-    const tag = isArmTagOfTy(tty)
+    let tag = isArmTagOfTy(tty)
     const ak = unMemAtomKind(tty)
-    if tag < 0 || ak < 0 {
-      // A STRUCT arm (`Config | IoError`, the shape a fallible function usually returns) is a
-      // VARIANT, not a value atom: its tag lives in `uTags` rather than `isArmTagOfTy`, and
-      // giving it one here is not the hard part — every rep CLASSIFIER would also have to see
-      // through the cast to its target, and they read the `AsExpr` node and default to i32.
-      // Measured: wiring the tag alone lowers a `ref.cast` into a slot the caller still types
-      // i32 (`expected i32, found (ref $type)`), so the arm is refused until the classifier
-      // family learns the cast. The message names the spelling that works meanwhile.
+    // A STRUCT arm (`Config | IoError`) is a VARIANT: its box tag is `uTags[vi]`, the same
+    // program-global rank the box was built with, not an `isArmTagOfTy` value-atom kind.
+    let armVi = -1
+    if tag < 0 {
+      const armNm = nominalStructNameOfTy(tty)
+      if armNm != "" { armVi = variantIndexOf(armNm) }
+      if armVi >= 0 { tag = uTags[armVi] }
+    }
+    if tag < 0 || (armVi < 0 && ak < 0) {
       return emitFail(
         "emitProgram: `as " +
           tgt +
-          "` is supported for a value-union arm (`string`, a scalar, a closure, a map, a list); `" +
+          "` is supported for a value-union arm or a struct-variant arm; `" +
           tgt +
-          "` is a struct arm — write the explicit `if x is " +
+          "` is neither — write the explicit `if x is " +
           tgt +
           " { … }` ladder for it",
       )
@@ -11213,6 +11215,13 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     fbEnd()
     ctrlLeave()
     fbLocalGet(unionAsSlot)
+    // A STRUCT arm's payload IS the variant struct — recover it with the variant heap cast,
+    // exactly as the shared-field dispatch does. A value atom takes the shared atom tail.
+    if armVi >= 0 {
+      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+      fbRefCast(uVarHeap[armVi])
+      return 0
+    }
     return emitUnionUnboxTail(ak)
   }
   // Target f64: every source (i32/f32/i64/f64, incl. literals) is a widening or a

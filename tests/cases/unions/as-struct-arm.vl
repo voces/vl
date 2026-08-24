@@ -1,0 +1,82 @@
+// `x as T` OVER A STRUCT ARM — `Config | IoError`, the shape a fallible function actually
+// returns. This file replaces a floor pin written an hour before it, and the correction is
+// worth recording because the pin's own reasoning was wrong.
+//
+// The pin said the blocker was that "every rep CLASSIFIER reads the `AsExpr` node and defaults
+// to i32", so the fix would need the whole family. It needed ONE: `exprVariantIndex`, reached
+// through `letIsVariant`. The measured symptom — a correct `ref.cast` landing in a slot the
+// caller typed i32 — was a LOCAL SLOT being classified from the init, not a family of
+// consumers each reading the node. One arm there, and the binding is a variant like any other.
+//
+// The observation that produced the wrong conclusion was real: `exprString` had needed its own
+// arm to see through `as` for the value-atom case. Generalising from one classifier to "the
+// family" was the error, and the cost of it was a floor pin that lasted one commit.
+//
+// THE ARM'S TAG comes from a different registry than a value atom's. A value atom (`string`, a
+// scalar, a closure, a map, a list) tags through `isArmTagOfTy`; a STRUCT arm is a VARIANT and
+// tags through `uTags[vi]`, the same program-global rank the box was built with. Its payload
+// is likewise recovered with the variant heap cast rather than the atom tail — the same two
+// steps the shared-field dispatch takes.
+//
+// STRUCTURAL DEDUP MAKES THE NOMINAL LOOKUP SAFE HERE, which is not true everywhere: the
+// discriminant rule needed a set-membership guard because two structurally-equal declared
+// types can be different VARIANT ROWS in different unions. For a plain struct arm they are the
+// same row — structs are structural in the registry — so two same-shape types in two unions
+// resolve to one tag and both work, which the last case below pins.
+// @run
+// @log 3
+// @log bad
+// @log 3
+// @log ok
+// @log 4
+// @log 1
+// @log 2
+// @log e2
+
+type Circle     = { kind: "circle", r: f64 }
+type ParseError = { why: string }
+
+function mk(a: f64): Circle | ParseError {
+  if a <= 0.0 { return { why: "bad" } }
+  return { kind: "circle", r: a }
+}
+
+// the binding form: happy path unboxes, sad path propagates
+function radiusOf(a: f64): f64 | ParseError {
+  const c = mk(a) as Circle
+  return c.r
+}
+const x = radiusOf(3.0)
+if x is f64 { print(x) } else { print(x.why) }       // 3
+const y = radiusOf(-1.0)
+if y is f64 { print(y) } else { print(y.why) }       // bad
+
+// ARGUMENT position
+function rad(c: Circle) { print(c.r) }
+function useIt(a: f64): f64 | ParseError {
+  rad(mk(a) as Circle)
+  return 0.0
+}
+const z = useIt(3.0)
+if z is f64 { print("ok") }                          // 3, then ok
+
+// a field read straight off the cast
+function radDirect(a: f64): f64 | ParseError { return (mk(a) as Circle).r }
+const w = radDirect(4.0)
+if w is f64 { print(w) } else { print(w.why) }       // 4
+
+// TWO STRUCTURALLY-EQUAL arms in two different unions — one variant row, one tag, both correct
+type A1 = { v: f64 }
+type E1 = { why: string }
+type A2 = { v: f64 }
+type E2 = { code: i32 }
+function m1(n: f64): A1 | E1 { if n < 0.0 { return { why: "n" } }  return { v: n } }
+function m2(n: f64): A2 | E2 { if n < 0.0 { return { code: 7 } }  return { v: n } }
+function f1(n: f64): f64 | E1 { const a = m1(n) as A1   return a.v }
+function f2(n: f64): f64 | E2 { const a = m2(n) as A2   return a.v }
+const p = f1(1.0)
+if p is f64 { print(p) } else { print("e1") }        // 1
+const q = f2(2.0)
+if q is f64 { print(q) } else { print("e2") }        // 2
+const r = f2(-1.0)
+if r is f64 { print(r) } else { print("e2") }        // e2
