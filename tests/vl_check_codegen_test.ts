@@ -109,15 +109,22 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // ladder its function-scoped siblings had, so this test went red exactly as the note below
 // said it would, and the same instruction was followed.
 //
-// The previous specimen was issue #1792 — a DECLARED alias over two literal unions
-// (`type A = 1 | 2; type B = 3 | 4; type U = A | B`), which is fixed, so this test went
-// red exactly as the note here said it would. Same instruction stands: if this shape
-// graduates, swap in any other `@no-instantiate` shape from tests/cases/soundness/
-// rather than deleting the assertion. This one is a FAMILY DECISION rather than a missing
-// arm (`ctxKeepsLitUnion` must pick one position-independent rule), so it should outlast the
-// last few specimens.
+// The previous specimen was the PLAIN-FUNCTION rung of this same family —
+// `function pick(self: ("a" | "b")[]): "a" | "b"` — and it graduated: the RETURN boundary
+// grew the inline-literal-union arm it lacked (`retStrWiden` covered `: string`,
+// `string | null` and an inferred `string`, but not `: "a" | "b"`), so the atom now widens
+// into the string slot and `soundness/xfail-miscompile-inline-litunion-element-read.vl` is a
+// `@run` fixture. Same instruction as ever, and followed here: swap in another
+// `@no-instantiate` shape rather than deleting the assertion.
+//
+// This specimen is the GENERIC rung of the family, one position further out — the fix above
+// was per-BOUNDARY (each decides its slot type in its own ladder), so the generic instance's
+// boundary is untouched by it. The remaining rungs are a BINDING (`const v: "a" | "b" =
+// tags[0]`, which is worse: a VALID module printing the raw atom id, and unpinnable with the
+// directives that exist) and this one. Both wait on `ctxKeepsLitUnion` picking a
+// position-independent rule, which is why this should outlast the last few specimens.
 const INVALID_MODULE_SRC =
-  `function pick(self: ("a" | "b")[]): "a" | "b" { self[0] }\n` +
+  `function pick<T>(self: T[]): T { self[0] }\n` +
   `const tags: ("a" | "b")[] = ["b", "a", "b"]\n` +
   `print(pick(tags))\n`;
 
