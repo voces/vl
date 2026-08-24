@@ -398,6 +398,7 @@ import {
   mvValStructIdx,
   mvValTyIx,
   mvValsOutBase,
+  narrowBareIdentOnly,
   narrowNames,
   narrowRetired,
   narrowSets,
@@ -4767,6 +4768,12 @@ function narrowSlotTy(i: i32): i32 {
 // needed; all four columns move together, so a slot index is valid in every one of them.
 // Returns the new depth.
 function pushNarrowRep(name: string, variant: string, ty: i32, set: i32) {
+  // The BARE-NAME-only window (`narrowBareIdentOnly`, held only across the post-guard
+  // complement of an `if` that HAS an `else`). Declining here rather than at each member
+  // arm is deliberate: this is the single push every narrowing channel bottoms out at, so
+  // one test covers the `is` member path, the `w.f != null` member path and any channel
+  // added later — a per-arm gate would silently miss the next one.
+  if narrowBareIdentOnly && name.indexOf(".") >= 0 { return narrowTop }
   if narrowTop < narrowNames.length {
     narrowNames[narrowTop] = name
     narrowVariants[narrowTop] = variant
@@ -10148,6 +10155,27 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
       if blockAlwaysReturns(s.ifThen) || blockLastStmtExits(s.ifThen) {
         setNarrowFromCondElse(s.ifCond, fnIx)
       }
+    } else if blockLastStmtExits(s.ifThen) {
+      // WITH an `else`, two things narrow the window, and BOTH are check-parity, not taste.
+      //
+      //   * The divergence test is `blockLastStmtExits` ALONE — the exact test
+      //     `checkIfStmtNode`'s guard-clause arm runs. `blockAlwaysReturns` is strictly
+      //     broader (it fires on a `return` anywhere in the block, and on a nested
+      //     all-returning `if`), and the no-`else` gate above can afford it only because
+      //     the two tests were never compared there. Taking the union HERE narrowed blocks
+      //     the checker leaves boxed, and the compiler MISCOMPILED ITSELF: stage2 baked
+      //     non-ASCII string literals one truncated element wide, reddening 65 cases whose
+      //     only common factor was an em-dash in a diagnostic.
+      //   * Only BARE NAMES post-narrow, for the reason the checker states at length: a
+      //     path's narrowing is an overlay entry the else arm can RETIRE, and the
+      //     retirement dies with the else arm's scope.
+      //
+      // Emit has to agree with check on which guards post-narrow, or the rest of the block
+      // reads a boxed union as an unboxed one.
+      const savedBare = narrowBareIdentOnly
+      narrowBareIdentOnly = true
+      setNarrowFromCondElse(s.ifCond, fnIx)
+      narrowBareIdentOnly = savedBare
     }
   }
   // ASSIGNMENT narrowing (A-infer-null, the host's `assignmentNarrowing`): a
