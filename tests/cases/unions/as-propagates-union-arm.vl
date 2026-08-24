@@ -1,0 +1,97 @@
+// `x as T` — THE PROPAGATING CAST, the ruled `as` trio's first member
+// (`docs/error-handling-design.md` §Trio, owner 2026-07-26). Its stated trigger was "once
+// std:fs / parsing chains prove the ladder boilerplate", and `std:fs` shipping fallible is
+// what fired it: that module's header spells the ladder out rung by rung.
+//
+//     const src = readIt(p) as string
+//         is
+//     const src = readIt(p)
+//     if !(src is string) { return src }   // src: string below
+//
+// `x as T` over `x: A | B | …` names the arm the caller WANTS; the error is everything except
+// that arm, so the mechanism needs no blessed `Error` type — "not the wanted arm" IS the
+// error, structurally. The checker enforces that the propagated REMAINDER fits the enclosing
+// function's return type, which is what makes the short form exactly as total as the long one.
+//
+// THE LOWERING evaluates the operand ONCE — it is typically a call — into a 1-slot box
+// scratch, tests the box tag, and either hands the WHOLE box to the caller or unboxes to `T`:
+//
+//     <operand> · local.set $unionAs · local.get $unionAs · struct.get $uBox 0 ·
+//     i32.const <T's tag> · i32.eq · i32.eqz · if · local.get $unionAs · return · end ·
+//     local.get $unionAs · <unbox to T>
+//
+// THE EARLY RETURN NEEDS NO COERCION, which is why this is cheap: there is ONE box struct and
+// the tag registry is global, so the operand's box already IS a value of the enclosing
+// function's union return. The checker's remainder test is what makes that sound.
+//
+// The unbox is `emitUnionUnboxTail`, EXTRACTED from `emitValueUnionUnboxRead` rather than
+// written again — a narrowed read and a cast recover an arm the same way, and two ladders here
+// would be two chances to disagree about a payload's rep, which in this area is invalid wasm.
+//
+// ONE SCRATCH SLOT SERVES EVERY CAST IN A FUNCTION. A cast's slot lifetime is contained within
+// its own lowering — the value is on the stack before the next cast runs — so sequential casts
+// (below), nested ones and casts in sibling argument positions all share it safely.
+// @run
+// @log hel
+// @log err
+// @log 44
+// @log missing
+// @log hellohello
+// @log 44
+// @log hello
+// @log ok
+// @log hello
+// @log 5
+
+type IoError = { code: i32, msg: string }
+function readIt(p: string): string | IoError {
+  if p == "" { return { code: 44, msg: "missing" } }
+  return "hello"
+}
+
+// the motivating shape: the whole ladder is one cast
+function head(p: string): string | IoError {
+  const src = readIt(p) as string
+  return src.slice(0, 3)
+}
+const a = head("f")
+if a is string { print(a) } else { print("err") }   // hel
+const b = head("")
+if b is string { print(b) } else { print("err") }   // err
+
+// the propagated ERROR VALUE is the original, field for field
+const c = head("")
+if c is IoError { print(c.code)  print(c.msg) } else { print("?") }  // 44, missing
+
+// TWO casts in one function — they share the one scratch slot
+function two(p: string, q: string): string | IoError {
+  const x = readIt(p) as string
+  const y = readIt(q) as string
+  return x + y
+}
+const d = two("x", "y")
+if d is string { print(d) } else { print("err") }   // hellohello
+const e = two("x", "")
+if e is IoError { print(e.code) } else { print("?") }  // 44
+
+// ARGUMENT position, and RETURN position
+function shout(s: string) { print(s) }
+function go(p: string): string | IoError {
+  shout(readIt(p) as string)
+  return "ok"
+}
+const f = go("a")
+if f is string { print(f) }                          // hello, then ok
+
+function pass(p: string): string | IoError { return readIt(p) as string }
+const g = pass("a")
+if g is string { print(g) }                          // hello
+
+// a WIDER return union: the remainder need only FIT, not match
+type ParseError = { why: string }
+function wide(p: string): i32 | IoError | ParseError {
+  const s = readIt(p) as string
+  return s.length
+}
+const h = wide("a")
+if h is i32 { print(h) } else { print("err") }       // 5

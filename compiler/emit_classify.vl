@@ -8177,6 +8177,41 @@ export function fnHasMap(fnIx: i32) {
 // True if the statement/expression tree at `ix` contains a function-VALUE call (a
 // `Call` whose callee is a closure value rather than a known function name) — so the
 // function needs the closure scratch slot for `call_ref`. (Lambdas.)
+// Does the MODULE contain a UNION-operand `as` cast — the ruled propagating form? It needs a
+// 1-slot box scratch, because its operand is evaluated ONCE and then both tested and unboxed.
+//
+// MODULE-WIDE, NOT PER-FUNCTION, and deliberately. The per-function scans beside it
+// (`blockHasCallRef` and friends) each hand-walk the node kinds they care about; there is no
+// shared child iterator to hang a new one on, and a hand-walk that misses a node KIND
+// under-reserves the slot — which is a wrong local index, i.e. invalid wasm, not a missed
+// optimisation. A linear pass over the arena cannot miss one. The cost is one unused local in
+// the other functions of a module that uses the cast anywhere, which is the same trade the
+// `aUsed` flag's header already records ("one unused 3-byte type").
+export function moduleHasUnionAs(): boolean {
+  let i = 0
+  while i < P.nodes.length {
+    if asExprIsUnionCast(i) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the `AsExpr` at `ix` is the UNION-operand form. ONE home, read by the reservation
+// scan and by the lowering, so the two cannot disagree about which casts need the frame.
+//
+// Asked of the OPERAND's checker type, not the cast's: the cast node's own type is the target
+// ARM, so it cannot tell a union propagation from a numeric conversion.
+export function asExprIsUnionCast(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  const oty = nodeTyIxOf(n.asObj)
+  if oty < 0 { return false }
+  const ot = T.tys[oty]
+  if ot is TyUnion { return true }
+  false
+}
+
 export function blockHasCallRef(ix: i32, fnIx: i32) {
   if ix < 0 { return false }
   const n = P.nodes[ix]
@@ -26315,6 +26350,11 @@ export function exprString(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is StrLit { return true }
   if e is Paren { return exprString(e.parInner, fnIx) }
+  // `x as T` yields a `T`, and the checker recorded exactly `T` on the cast node. Asked of
+  // that type rather than of the operand: the whole point of the cast is that its result type
+  // differs from what it was applied to. A NUMERIC cast lands here too and answers false,
+  // which is correct — its target is a scalar.
+  if e is AsExpr { return tyKindOf(nodeTyIxOf(exprIx)) == 3 }
   // An if-EXPRESSION whose branch join is a STRING (`const b = if c { "x" } else { "y" }`):
   // the value is a string ref, so an UN-annotated binding classifies kind 3 — matching the
   // `(ref $aTypeIdx)` the `emitIfExprRef` join already emits. The checker proved both arms

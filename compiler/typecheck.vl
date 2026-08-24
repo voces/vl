@@ -28636,6 +28636,92 @@ function checkCastNode(n: AsExpr, ix: i32) {
   // arrays/objects/unions/type-vars). The OPERAND uses the tolerant `isNumeric`
   // (true for `TyErr`), so an already-errored operand does not pile on a second
   // diagnostic here.
+  // UNION-OPERAND `as` — THE RULED PROPAGATION CAST (`error-handling-design.md` §Trio, owner
+  // 2026-07-26), whose stated trigger — "once std:fs / parsing chains prove the ladder
+  // boilerplate" — fired when `std:fs` shipped fallible. That module's own header spells the
+  // ladder out and records the trio as "RULED but NOT BUILT".
+  //
+  //     const src = readTextFile(p) as string
+  //         is
+  //     const src = readTextFile(p)
+  //     if !(src is string) { return src }   // src: string below
+  //
+  // `x as T` over `x: A | B | …` names the arm the caller WANTS; the error is everything
+  // except that arm, so the mechanism needs no blessed `Error` type — "not the wanted arm" IS
+  // the error, structurally. The expression's type is `T`.
+  //
+  // Checked BEFORE the numeric ladder and disjoint from it by operand: a union is not
+  // `isNumeric`, so every program that compiled before takes the same arm it did. The
+  // ruling's own measurement — that union-`as` was a clean compile error, so all three
+  // spellings are unclaimed and no existing program can change meaning — is what makes this
+  // additive rather than a migration.
+  if arg >= 0 {
+    const argT = T.tys[arg]
+    if argT is TyUnion {
+      if !unionHasMemberTy(argT, target) {
+        tErr(
+          "`as " +
+            n.asTy +
+            "` names a type that is not a member of " +
+            tyToStr(arg),
+          ix,
+        )
+        return TY_ERR
+      }
+      const rest = subtractTy(arg, target)
+      if rest < 0 {
+        tErr(
+          "`as` cannot compute the propagated remainder of " + tyToStr(arg),
+          ix,
+        )
+        return TY_ERR
+      }
+      // THE PROPAGATED REMAINDER MUST FIT THE ENCLOSING RETURN, because that is where it
+      // goes. A PENDING return (-2, still being inferred) is refused rather than joined
+      // into: a cast that silently widens the function's own signature is the opposite of
+      // what an explicit cast is for, and the annotation is one word.
+      if T.curRet == -2 {
+        tErr(
+          "`as " +
+            n.asTy +
+            "` propagates " +
+            tyToStr(rest) +
+            " — annotate the enclosing function's return type so the propagation has a declared home",
+          ix,
+        )
+        return TY_ERR
+      }
+      // AT MODULE SCOPE THERE IS NOWHERE TO PROPAGATE TO, and saying "the enclosing function
+      // cannot return it" there names a function that does not exist (it rendered
+      // "it returns _"). The cast is still the wrong tool, but for a different reason, so it
+      // gets its own sentence and points at the two spellings that do work.
+      if T.curRet < 0 {
+        tErr(
+          "`as " +
+            n.asTy +
+            "` propagates " +
+            tyToStr(rest) +
+            " out of the enclosing function, and there is none here — at module scope, test the value with `is` instead",
+          ix,
+        )
+        return TY_ERR
+      }
+      if !assignable(rest, T.curRet) {
+        tErr(
+          "`as " +
+            n.asTy +
+            "` propagates " +
+            tyToStr(rest) +
+            ", which the enclosing function cannot return (it returns " +
+            tyToStr(T.curRet) +
+            ")",
+          ix,
+        )
+        return TY_ERR
+      }
+      return target
+    }
+  }
   const tn = primNameOf(target)
   const targetIsScalar = tn == "i32" ||
     tn == "i64" ||
@@ -28646,6 +28732,21 @@ function checkCastNode(n: AsExpr, ix: i32) {
     return TY_ERR
   }
   target
+}
+
+// Whether `ty` is one of the union's members, by arena identity or by `tySame` — the same two
+// rungs `isStructOfTy` uses, and for the same reason: an arm reached through an alias is a
+// different index for one type.
+function unionHasMemberTy(u: TyUnion, ty: i32): boolean {
+  if ty < 0 { return false }
+  const ms = u.uMembers
+  let i = 0
+  while i < ms.length {
+    if ms[i] == ty { return true }
+    if tySame(ms[i], ty) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // ── unary ──────────────────────────────────────────────────────────────────
