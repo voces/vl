@@ -39,6 +39,8 @@ import {
   numLitUnionBaseName,
   numLitUnionHasBase,
   tyIsLitUnion,
+  tyIsLitUnionArray,
+  tyIsLitUnionOrLit,
   tyLitMemberTexts,
   tyLitUnionAliasIx,
   tyNumLitMemberTexts,
@@ -15537,6 +15539,18 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     pendingNulString = letIsNulString(stmtIx, fnIx)
     if s.letType >= 0 {
       if nodeTyIsLitUnionAlias(s.letType) { pendingLitUnion = 1 }
+      // An ATOM-ARRAY annotation (`const xs: K[]`) — the LET twin of `emitObj`'s
+      // `sFieldIsLitUnionArray` arm, which the binding position never grew. The value is the
+      // i32 LIST of atom ids, so the atom context has to reach the literal: `arrLitIsStr`
+      // claims any literal whose FIRST element is a string EXPRESSION, which `[s]` for an
+      // `is`-narrowed / `"aa"`-annotated `s` is. Paired with the `K[]` reject in
+      // `letIsStringArray` — the SLOT and the literal BUILD have to agree, and a seed here
+      // without that reject builds the i32 list into a `strlist` slot (#1852).
+      //
+      // A non-literal init is unaffected: `emitExpr`'s atom hook asks `strReppedLitUnionAt`,
+      // and a `K[]`-typed value (an ident, a call, a `.map`) is a `TyArray` — not a member
+      // set — so it declines and lowers unchanged.
+      if tyIsLitUnionArray(nodeTyIxOf(s.letType)) { pendingLitUnion = 1 }
       // `K | null` is dual-natured — a member init is an atom id, only a `null` is the
       // sentinel — so seed BOTH, as the param-arg / return boundaries do.
       if nodeTyIsNulLitUnion(s.letType) {
@@ -16969,7 +16983,10 @@ function emitStrValue(body: i32[], ix: i32, fnIx: i32) {
 // the value is RE-READ per member instead, which costs the receiver bound
 // (`unionEqOperandOk`) and buys the whole scan out of the change.
 function emitStrToAtom(body: i32[], ix: i32, fnIx: i32) {
-  const texts = nodeLitUnionMemberTexts(ix)
+  // `tyLitMemberTexts` over the node's recorded type, NOT `nodeLitUnionMemberTexts`: that
+  // node query declines a bare `TyLit` on purpose (its callers read an empty list as "not a
+  // widenable atom"), and a bare `TyLit` is exactly the one-member set this narrowing serves.
+  const texts = tyLitMemberTexts(nodeTyIxOf(ix))
   if texts.length == 0 {
     return emitFail("emitProgram: literal-union atom narrowing with no members")
   }
@@ -17024,12 +17041,22 @@ function emitStrToAtomChain(
 // declines are the two things that are already atoms in atom context: an atom-repped
 // expression (`exprIsLitAtom`, the classifier the valtype ladders agree with), and a member
 // STRING LITERAL, whose id `emitExpr`'s `StrLit` arm folds at compile time.
+//
+// THE MEMBER SET MAY BE A SINGLETON (`tyIsLitUnionOrLit`, not `tyIsLitUnion`): `if s is "aa"`
+// over a `string` and a `"aa"` parameter both produce a bare `TyLit`, whose value is the same
+// `(ref $array)` string and whose atom-slot destination is the same i32. Asking the union-only
+// predicate here answered NO for exactly those and let the string ref through (#1852).
+//
+// The `exprIsLitAtom` decline above is what keeps the singleton arm from claiming a value that
+// is ALREADY an atom — `if k is "aa"` over a `K` parameter, and every `match` arm over a
+// litunion, both of which narrow an atom-repped binding to a bare `TyLit` and need no
+// conversion at all.
 function strReppedLitUnionAt(ix: i32, fnIx: i32) {
   if exprIsLitAtom(ix, fnIx) { return false }
   const av = unwrapParen(ix)
   const e = P.nodes[av]
   if e is StrLit { return false }
-  nodeTyIsLitUnion(av)
+  tyIsLitUnionOrLit(nodeTyIxOf(av))
 }
 
 // True when `ix` can be lowered in ATOM context — as the interned i32 id the litunion atom
