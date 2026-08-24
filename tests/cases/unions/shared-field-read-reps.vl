@@ -1,0 +1,95 @@
+// SHARED-FIELD ACCESS over an un-narrowed struct union — `(A | B).tag` — at every field rep
+// the dispatch can spell, and through the consumers that read the result.
+//
+// It was i32-only, and its own header said so: *"Ported SUBSET: … an i32-rep field (a
+// single-byte `if (result i32)` blocktype); anything else falls through to the loud failures
+// below."* Measured code by code on master, with the field type as the only axis:
+//
+//     i32 ✅   boolean ✅   f64 ❌   i64 ❌   f32 ❌   string ❌
+//
+// — every ❌ being `emitProgram: field access but no struct type declared`. The three
+// remaining SCALARS are each their own single valtype byte, exactly as a value-position `if`
+// already spells them (A-typed-if-expr: 0x7c / 0x7d / 0x7e). STRING needs the other blocktype
+// form, `(ref $sTypeIdx)`, and `fbIfRef` was already that form — three union-box sites in
+// `wasmEmit.vl` use it.
+//
+// THE STRING ARM THEN EXPOSED A SECOND, SEPARATE HOLE, and it is the part worth reading. With
+// the blocktype fixed the read lowered CORRECTLY — binding it to a `string` printed the right
+// value — but `print(s.k)` was `type mismatch: expected i32, found (ref $type)`. The bytes
+// were right and the CONSUMER was wrong: `memberFieldCode`, whose own header calls itself
+// "the single place the `exprString`/`exprStruct`/`exprArray`/`exprMap` classifiers consult so
+// a field read of ANY receiver shape resolves to its declared field type", resolved three
+// receiver shapes — a narrowed union local, a variant-typed value, a plain struct — and NOT
+// this one. So every classifier answered for the read as if it were an i32.
+//
+// It has a TWIN, `memFieldTypeCode`, serving the other code families (17 / 23 / 24 / 4 / 5 /
+// 6 / 18 / 19 / 29) and differing from it in exactly one early `-1`. Both needed the rung,
+// which is why the derivation is now ONE exported function, `sharedUnionFieldPlan`, that the
+// two twins AND the emitter's dispatch all read. The emitter keeps only the question that is
+// actually its own — whether a code can be spelled as a blocktype — because asking that in a
+// classifier would make its answer depend on `aUsed`, a flag whose value moves during
+// collection.
+// @run
+// @log 7
+// @log 8
+// @log true
+// @log false
+// @log 1.5
+// @log 2.5
+// @log 9
+// @log 10
+// @log 0.5
+// @log 1.25
+// @log x
+// @log y
+// @log 2
+// @log <xy>
+// @log eq
+
+// The two arms deliberately differ in their OTHER field, so the shared field sits at a
+// different index in each — which is the whole reason the read is a per-tag dispatch rather
+// than one `struct.get`.
+type Ai = { k: i32, a: f64 }
+type Bi = { pad: boolean, k: i32 }
+function fi(s: Ai | Bi) { print(s.k) }
+fi({ k: 7, a: 1.0 })
+fi({ pad: true, k: 8 })
+
+type Ab = { k: boolean, a: f64 }
+type Bb = { pad: i32, k: boolean }
+function fb(s: Ab | Bb) { print(s.k) }
+fb({ k: true, a: 1.0 })
+fb({ pad: 1, k: false })
+
+type Ad = { k: f64, a: i32 }
+type Bd = { pad: boolean, k: f64 }
+function fd(s: Ad | Bd) { print(s.k) }
+fd({ k: 1.5, a: 1 })
+fd({ pad: true, k: 2.5 })
+
+type Al = { k: i64, a: i32 }
+type Bl = { pad: boolean, k: i64 }
+function fl(s: Al | Bl) { print(s.k) }
+fl({ k: 9, a: 1 })
+fl({ pad: true, k: 10 })
+
+type As = { k: f32, a: i32 }
+type Bs = { pad: boolean, k: f32 }
+function fs(s: As | Bs) { print(s.k) }
+fs({ k: 0.5, a: 1 })
+fs({ pad: true, k: 1.25 })
+
+type At = { k: string, a: f64 }
+type Bt = { pad: boolean, k: string }
+function ft(s: At | Bt) { print(s.k) }
+ft({ k: "x", a: 1.0 })
+ft({ pad: true, k: "y" })
+
+// The string CONSUMERS — the half the classifier rung fixes. Each of these routed the i32
+// sink over a `(ref $type)` before it.
+function flen(s: At | Bt) { print(s.k.length) }
+flen({ k: "xy", a: 1.0 })
+function fcat(s: At | Bt) { print("<" + s.k + ">") }
+fcat({ k: "xy", a: 1.0 })
+function feq(s: At | Bt) { if s.k == "xy" { print("eq") } else { print("ne") } }
+feq({ k: "xy", a: 1.0 })

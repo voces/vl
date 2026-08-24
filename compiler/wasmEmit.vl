@@ -453,8 +453,6 @@ import {
   ctrlLeave,
   currentNarrowSetIdOf,
   currentNarrowSetOf,
-  currentStructNarrowSetIdOf,
-  currentStructNarrowSetOf,
   declaredKind,
   declaredNulString,
   elseLessNullableTail,
@@ -576,6 +574,7 @@ import {
   mfResultSlotOf,
   mfSrcLocalFor,
   msMemberAtomsOfSet,
+  sharedUnionFieldPlan,
   msSetOfText,
   msSubNull,
   mvInnerMapShape,
@@ -4822,6 +4821,45 @@ function emitUnionLitIs(body: i32[], objIx: i32, lit: string, fnIx: i32) {
   0
 }
 
+// True if a variant FIELD CODE has an `if (result …)` blocktype the shared-field dispatch
+// can spell. See the table's rationale at the dispatch site in `emitMem`.
+function sharedFieldCodeDispatchable(code: i32): boolean {
+  if code == 0 {
+    return true // i32 / boolean — single valtype byte 0x7f
+  }
+  if code == 17 {
+    return true // f64 — 0x7c
+  }
+  if code == 23 {
+    return true // i64 — 0x7e
+  }
+  if code == 24 {
+    return true // f32 — 0x7d
+  }
+  if code == 3 {
+    return aUsed // string — the `(ref $sTypeIdx)` blocktype form
+  }
+  false
+}
+
+// Emit the `if` whose result is the shared field's rep. Only called for a code
+// `sharedFieldCodeDispatchable` admitted, so it has no failure arm of its own.
+function fbIfForSharedField(code: i32) {
+  if code == 17 {
+    return fbIf(124) // f64
+  }
+  if code == 23 {
+    return fbIf(126) // i64
+  }
+  if code == 24 {
+    return fbIf(125) // f32
+  }
+  if code == 3 {
+    return fbIfRef(sTypeIdx) // string header ref
+  }
+  fbIf(127) // i32 / boolean
+}
+
 function emitMem(body: i32[], memIx: i32, fnIx: i32) {
   // A field read on a NARROWED union identifier downcasts through the box (G1).
   if memIsNarrowed(memIx) { return emitNarrowedMem(body, memIx, fnIx) }
@@ -4842,6 +4880,34 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       return 0
     }
   }
+  // THE SHARED-FIELD DISPATCH'S RESULT REP. The dispatch below is a chain of
+  // `if (result …)` blocks, one per box tag, so the field's rep has to be spellable as a
+  // blocktype. It was pinned to i32 and its own header said so — *"Ported SUBSET: … an
+  // i32-rep field (a single-byte `if (result i32)` blocktype); anything else falls through
+  // to the loud failures below"* — which made `(A | B).tag` readable for an `i32`/`boolean`
+  // field and a loud `field access but no struct type declared` for an `f64`, `i64`, `f32`
+  // or `string` one, measured code by code.
+  //
+  // The three remaining SCALARS are their own single valtype byte, exactly as the
+  // value-position `if` already spells them (A-typed-if-expr: `0x7c` / `0x7d` / `0x7e`).
+  // STRING is the one that needs the other form — a `(ref $sTypeIdx)` result is not a
+  // valtype byte — and `fbIfRef` is already that form, used by three union-box sites in
+  // this file. It is also the code that matters most: a discriminated union's TAG is a
+  // string field, so `s.kind` over `{kind: "circle", …} | {kind: "rect", …}` is exactly a
+  // code-3 shared read.
+  //
+  // `sTypeIdx` is available whenever a code-3 field exists: both it and `aTypeIdx` are
+  // minted from the one `aUsed` flag (`mAssignTypeIndices`), and a string field forces it.
+  // Guarded anyway rather than assumed — an unminted index would name type 0, which is
+  // invalid wasm rather than a message.
+  //
+  // Codes with no arm here keep the loud reject, which is the correct column for them: a
+  // boxed / niche / container field has no single-block result rep to dispatch on.
+  //
+  // The two functions are deliberately a PREDICATE and an EMITTER over one table rather
+  // than one function returning a byte: the validation loop runs before any bytes are
+  // written and must be able to decline without emitting, and the string arm is not a byte.
+
   // Shared-field access over an UN-narrowed struct union (`(A | B).tag` — the
   // host's `sharedUnionFieldRead`): the checker proved the field present on EVERY
   // member, but members may store it at DIFFERENT indices, so dispatch on the box
@@ -4854,78 +4920,51 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
   // its remaining members.
   const mS = P.nodes[memIx]
   if mS is Member {
-    if exprUnion(mS.memObj, fnIx) {
-      const shRecv = P.nodes[unwrapParen(mS.memObj)]
-      if shRecv is Ident {
-        const shSet = currentStructNarrowSetOf(shRecv.identName, fnIx)
-        if shSet != "" {
-          // D-UNION set ADT — the narrowed set's members from the recorded member
-          // columns (the row's recorded order IS the box-tag order this dispatch
-          // walks); a narrowed subset the pool has not interned re-splits.
-          //
-          // D-SETID: the set id comes from the narrowing table's banked (row, mask)
-          // pair (`currentStructNarrowSetIdOf`, the set-ADT reading of the
-          // `currentStructNarrowSetOf` above — same un-narrowed alias EXPANSION),
-          // not from resolving the rendering this site still needs for the split
-          // fall-through.
-          const shAtoms: string[] = []
-          if (
-            !msMemberAtomsOfSet(
-              currentStructNarrowSetIdOf(shRecv.identName, fnIx),
-              shAtoms,
-            )
-          ) {
-            splitUnionAtoms(shSet, shAtoms)
-          }
-          // Validate: every member a struct VARIANT carrying the field as i32.
-          const shVis: i32[] = []
-          const shFis: i32[] = []
-          let shOk = shAtoms.length >= 2
-          let sa = 0
-          while sa < shAtoms.length {
-            const svi = variantIndexOf(shAtoms[sa])
-            if svi < 0 {
-              shOk = false
-            } else {
-              const sfi = variantFieldIndex(svi, mS.memProp)
-              if sfi < 0 || variantFieldTypeAt(svi, sfi) != 0 {
-                shOk = false
-              } else {
-                shVis.push(svi)
-                shFis.push(sfi)
-              }
-            }
-            sa = sa + 1
-          }
-          if shOk {
-            let si2 = 0
-            while si2 < shAtoms.length - 1 {
-              if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
-              fbStructGet(uBoxIdx, 0) // field 0: tag
-              fbI32Const(uTags[shVis[si2]])
-              fbI32Bin(70)            // 0x46 i32.eq
-              fbIf(127)               // if (result i32)
-              if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
-              fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-              fbRefCast(uVarHeap[shVis[si2]])
-              fbStructGet(uVarHeap[shVis[si2]], shFis[si2])
-              fbElse()
-              si2 = si2 + 1
-            }
-            const shLast = shAtoms.length - 1
-            if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
-            fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-            fbRefCast(uVarHeap[shVis[shLast]])
-            fbStructGet(uVarHeap[shVis[shLast]], shFis[shLast])
-            let se = 0
-            while se < shAtoms.length - 1 {
-              fbEnd()
-              se = se + 1
-            }
-            return 0
-          }
-        }
+    // THE PLAN IS SHARED. `sharedUnionFieldPlan` owns the receiver test, the narrowed-set
+    // member resolution (D-UNION / D-SETID: the row's recorded order IS the box-tag order
+    // this dispatch walks, and a narrowed subset the pool has not interned re-splits) and
+    // the per-member field lookup — the same derivation BOTH classifier twins read, so what
+    // this lowers and what `print` dispatches cannot disagree. That disagreement is not
+    // hypothetical: it is what made a shared STRING read emit correct bytes and then hand
+    // them to the i32 sink.
+    //
+    // DISPATCHABILITY stays here, because it is a question about spelling a blocktype
+    // rather than about typing a read.
+    const shVis: i32[] = []
+    const shFis: i32[] = []
+    const shCode = sharedUnionFieldPlan(
+      mS.memObj,
+      mS.memProp,
+      fnIx,
+      shVis,
+      shFis,
+    )
+    if shCode >= 0 && sharedFieldCodeDispatchable(shCode) {
+      let si2 = 0
+      while si2 < shVis.length - 1 {
+        if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 0)    // field 0: tag
+        fbI32Const(uTags[shVis[si2]])
+        fbI32Bin(70)               // 0x46 i32.eq
+        fbIfForSharedField(shCode) // if (result <the field's own rep>)
+        if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 1)    // field 1: value (anyref)
+        fbRefCast(uVarHeap[shVis[si2]])
+        fbStructGet(uVarHeap[shVis[si2]], shFis[si2])
+        fbElse()
+        si2 = si2 + 1
       }
+      const shLast = shVis.length - 1
+      if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+      fbRefCast(uVarHeap[shVis[shLast]])
+      fbStructGet(uVarHeap[shVis[shLast]], shFis[shLast])
+      let se = 0
+      while se < shVis.length - 1 {
+        fbEnd()
+        se = se + 1
+      }
+      return 0
     }
   }
   if !sDeclared {
