@@ -1394,7 +1394,10 @@ in-language GC knobs.
   wait on this — `__trap__(msg?)` (error-handling-design.md) is bespoke checker arity, like
   existing builtins.
 - ⬜ **B16. Redeclaration / overloading.** Current: same-scope redeclaration errors; nested shadowing
-  allowed (uniquified in codegen). Future: ad-hoc overloading? Default "no" → `DECISIONS.md`.
+  allowed (uniquified in codegen) — INCLUDING a block-scoped local that shadows a PARAMETER, which
+  codegen ignored outright until the live lexical binding was made to outrank the param in both
+  halves of name resolution; witness `tests/cases/scope/local-shadows-param.vl`. Future: ad-hoc
+  overloading? Default "no" → `DECISIONS.md`.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
   `CHANGELOG.md`): prefer-`const`, unused-import, dead/constant branch (`constant-condition`), `step 0`
   (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else, unused function,

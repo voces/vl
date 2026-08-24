@@ -45247,6 +45247,15 @@ checker should reject the declaration, and it does neither. Pinned with the WRON
 `@log` lines so that fixing it is loud:
 `tests/cases/soundness/xfail-miscompile-local-shadowing-param-ignored.vl`.
 
+**CLOSED.** `localIndexOf` asked `paramIndexOf` before the scope stack, so a same-named parameter
+always won and the inner binding resolved away to the parameter's slot. Every construct that opens
+a block was wrong the same way — `if`, `else`, `while`, `for`, a `match` arm, `let` as well as
+`const`, ref parameter as well as scalar — because the fault was in the shared name lookup rather
+than in any rep-specific ladder. The live lexical binding now outranks the parameter in both halves
+of resolution: the local INDEX at `localIndexOf`, and the TYPE at `paramTypeNode`, the one
+param-scan the whole `param*` family shares. The fixture made the trip to `@run` as
+`tests/cases/scope/local-shadows-param.vl`.
+
 ### METHOD NOTES
 
 * **A scan/emit pair may need different precision, not the same predicate.** The twin rule says

@@ -63,6 +63,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
+import { scopeSlotOf } from "./emit_state"
 
 // True if param `name` of function `fnIx` is a NULLABLE function value (`fn | null`, kind
 // 19) — the closure dual of `paramNulRef`.
@@ -840,12 +841,33 @@ export function ifExprCollectAtoms(ifIx: i32, atoms: string[]) {
 }
 // True if the parameter `name` of function `fnIx` is an array type.
 // The TYPE-annotation node index of parameter `name` of function `fnIx` (its `parType`),
-// or -1 (no such param / module scope / an un-annotated param). The single param-scan the
-// `param*` type predicates share — each then reads the node via a `ret*Flag` classifier
-// (D-PARAMARR took the last five off `tyNameOf`; only `paramMap` still renders, and its
-// header says why).
+// or -1 (no such param / module scope / an un-annotated param / `name` is SHADOWED by a
+// live lexical binding). The single param-scan the `param*` type predicates share — each
+// then reads the node via a `ret*Flag` classifier (D-PARAMARR took the last five off
+// `tyNameOf`; only `paramMap` still renders, and its header says why).
+//
+// A LIVE LEXICAL BINDING SUPPRESSES THE PARAM ANSWER, and this is the type half of the
+// same rule `localIndexOf` applies to the local INDEX. Inside
+//
+//   function f(v: string, n: i32) { if n > 0 { const v = 99  print(v) } }
+//
+// the inner `v` is an i32 local with its own slot; `localIndexOf` resolves the read to
+// that slot, so every `param*` predicate must stop claiming the read is a `string`. When
+// the two disagreed the emitter picked the sink from the PARAM's type and the operand
+// from the LOCAL's slot — `print` dispatched its string arm over a raw i32, an invalid
+// module. Because this is the one scan the whole `param*` family shares, gating it here
+// keeps all ~20 predicates in agreement rather than fixing them one arm at a time.
+//
+// INERT WHENEVER THE SCOPE STACK IS NOT LIVE. The detection/classifier and
+// monomorphization passes run scope-less (`scopeNames` empty — mono runs before the
+// locals table is even built), so `scopeSlotOf` answers -1 there and every existing
+// answer is unchanged. Only the collect/emit walks, which maintain the stack in
+// lockstep, can reach the new arm — and a binding enters the stack only AFTER its own
+// declaration (`scopeBind`), so a param read in the shadowing local's own INITIALIZER
+// (`const v = v + 1`) still resolves to the param.
 export function paramTypeNode(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
+  if scopeSlotOf(name) >= 0 { return -1 }
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     const params = fn.fnParams

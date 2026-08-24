@@ -1,0 +1,191 @@
+// @run
+// @log 99
+// @log 7
+// @log inner
+// @log a
+// @log 100
+// @log 7
+// @log 99
+// @log 7
+// @log 99
+// @log 7
+// @log 100
+// @log 7
+// @log 99
+// @log 7
+// @log 99
+// @log 55
+// @log 7
+// @log 1
+// @log 8
+// @log 7
+// @log 99
+// @log a
+// @log 99
+// @log 55
+// @log 1
+// @log 7
+// @log 99
+// @log 7
+// A block-scoped local SHADOWS a same-named parameter. The inner binding gets its own
+// wasm local (one slot per lexical binding, no dedupe by name), every read inside the
+// block resolves to it, and the parameter is untouched — reads after the block, and a
+// WRITE to the shadowing `let`, both prove the two slots are distinct.
+//
+// It used to be ignored outright. `localIndexOf` asked `paramIndexOf` FIRST, so a
+// same-named param always won and the inner `const` resolved away to the param's slot:
+// `const v = 99` over `v: i32` printed `7`. Nothing caught it — `vl check --codegen`
+// exited 0, the module validated, and it ran. The scope stack, the slot allocation and
+// the type predicates all already knew about the inner binding; the local-INDEX resolver
+// was the one place that did not, which is why the wrong answer was silent rather than a
+// reject or an invalid module.
+//
+// THE SIBLING ARMS ARE ALL HERE because the fault was in scope resolution, not in any
+// rep-specific ladder: every construct that opens a block was wrong the same way and in
+// the same amount — `if`, `else`, `while`, `for`, a `match` arm — for `let` as well as
+// `const`, and for a ref parameter as well as a scalar one. The `fLocal` control at the
+// bottom is the arm that already worked (a local shadowing another LOCAL), which is what
+// localized the fault to the param lookup in the first place.
+//
+// `fRep` is the arm that made the two halves of name resolution agree. Where the
+// shadowing local's rep DIFFERS from the parameter's, fixing only the index left the
+// emitter picking the sink from the PARAMETER's type and the operand from the LOCAL's
+// slot — `print` dispatching its string arm over a raw i32, an invalid module. The type
+// half is gated at `paramTypeNode`, the one param-scan the whole `param*` family shares.
+//
+// `fInit` pins the boundary in the other direction: a binding enters the scope stack only
+// AFTER its own declaration, so the shadowing local's INITIALIZER still reads the
+// parameter (`const v = v + 1` over `v: i32` is 8, not a self-reference).
+
+// scalar + ref, `const`, in an `if`
+function fInt(v: i32, n: i32) {
+  if n > 0 {
+    const v = 99
+    print(v)
+  }
+  print(v)
+}
+function fStr(s: string, n: i32) {
+  if n > 0 {
+    const s = "inner"
+    print(s)
+  }
+  print(s)
+}
+
+// `let`, and a WRITE to it must not reach the parameter
+function fLet(v: i32, n: i32) {
+  if n > 0 {
+    let v = 99
+    v = v + 1
+    print(v)
+  }
+  print(v)
+}
+
+// the `else` arm
+function fElse(v: i32, n: i32) {
+  if n > 0 { print(0) } else {
+    const v = 99
+    print(v)
+  }
+  print(v)
+}
+
+// `while` and `for`
+function fWhile(v: i32, n: i32) {
+  let i = 0
+  while i < n {
+    const v = 99
+    print(v)
+    i = i + 1
+  }
+  print(v)
+}
+function fFor(v: i32, xs: i32[]) {
+  for x in xs {
+    const v = 99 + x
+    print(v)
+  }
+  print(v)
+}
+
+// a `match` arm
+type K = "a" | "b"
+function fMatch(v: i32, k: K) {
+  match k {
+    "a" => {
+      const v = 99
+      print(v)
+    }
+    "b" => { print(0) }
+  }
+  print(v)
+}
+
+// two parameters shadowed in one block
+function fBoth(a: i32, b: i32) {
+  if b > 0 {
+    const a = 99
+    const b = 55
+    print(a)
+    print(b)
+  }
+  print(a)
+  print(b)
+}
+
+// the shadowing local's own initializer still reads the PARAMETER
+function fInit(v: i32, n: i32) {
+  if n > 0 {
+    const v = v + 1
+    print(v)
+  }
+  print(v)
+}
+
+// a DIFFERENT rep than the parameter's: an i32 local over a `string` parameter
+function fRep(v: string, n: i32) {
+  if n > 0 {
+    const v = 99
+    print(v)
+  }
+  print(v)
+}
+
+// a lambda PARAMETER shadowing an enclosing parameter, and a lambda BODY local
+// shadowing one
+function fLambda(v: i32) {
+  const g = (v: i32) => { print(v) }
+  g(99)
+  const h = (n: i32) => {
+    const v = 55
+    print(v)
+    return n
+  }
+  print(h(1))
+  print(v)
+}
+
+// CONTROL: a local shadowing another LOCAL already resolved correctly
+function fLocal(n: i32) {
+  const v = 7
+  if n > 0 {
+    const v = 99
+    print(v)
+  }
+  print(v)
+}
+
+fInt(7, 1)
+fStr("a", 1)
+fLet(7, 1)
+fElse(7, 0)
+fWhile(7, 1)
+fFor(7, [1])
+fMatch(7, "a")
+fBoth(7, 1)
+fInit(7, 1)
+fRep("a", 1)
+fLambda(7)
+fLocal(1)
