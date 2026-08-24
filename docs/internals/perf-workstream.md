@@ -310,7 +310,7 @@ probe counts are unmeasured. **Do not convert them on the strength of #1853's nu
 a counter on them first. This is exactly the trap §2 warns about — 196 sites, and the nine
 that matter are not the nine that look alike.
 
-### 2. `repTreeVKind`'s literal chain → a named litunion tag — **measured, and the pattern is already in tree**
+### 2. `repTreeVKind`'s literal chain → a named litunion tag — **SHIPPED, #1855, −2.1%**
 
 - **Site:** `compiler/emit_rep.vl:4300`, over `rtKind: string[]` (`emit_rep.vl:3829`).
 - **Evidence:** **1,847,718 calls, 17,664,170 `__str_eq__` calls, mean 9.56** of an 11-arm
@@ -334,6 +334,55 @@ that matter are not the nine that look alike.
   is one of **two** `string[]` columns among fifteen `rt*` tables (`rtReason`, a policy
   reason-code, is the other — also a closed vocabulary). Do the wider census after this
   lands, not before.
+
+**SHIPPED (#1855).** Four annotations, exactly the `TokKind` shape: the `type RtKind`
+declaration, `rtKind`'s element type, and the two writers (`rtAlloc`, `rtLeafOf`). Nothing
+else moved — atoms widen back to `string` transparently, so `rtInternKeyOf`'s key
+concatenation and the `string`-returning accessors (`repTreeKindOf`,
+`repTreeListElemName`, which *returns* a tag) compiled unchanged.
+
+- **The vocabulary is 15, not 14.** `repTreeVKind`'s 13 + `unsup` + **`u8`**, which only
+  `rtListVKind` / `repTreeListElemName` test. Enumerating the writers (`rtAlloc` ×6 literal
+  + `rtLeafOf` ×9 literal, the only two) gives the closed set; the checker then holds it
+  closed at every *reader* too — `k == "notamember"` is a type error, not a false branch.
+  (`hole` / `neg` are `rtReason` codes, not kinds. They look like tags in a grep.)
+- **Measured: `vl build compiler/entry.vl` −2.10% user CPU** (1.837 s → 1.798 s mean;
+  medians 1.830 → 1.790). 52 samples per arm, 26 order-balanced A-B-B-A quads against a
+  pinned `origin/master` source tree so only the *seed* differs; paired-quad mean +0.0387 s,
+  sd 0.0375, t≈5.3. **A 9-pair run first gave −0.63% — inside `%U`'s own 0.01 s
+  quantisation.** On a box at load average 3 this size of win needs ~50 samples per arm,
+  not ~10.
+- **Profile (`VL_PROFILE_GUEST`, 6 warm runs per arm, `$mNN` stripped).** `__str_eq__`
+  **21.88% → 19.18% self** of ALL samples (this is the *total* share, not the
+  symbol-class share — do not compare it to `perf-program.md` §2's 25.19% without noting
+  that baseline predates #1851 and #1853). The mechanism is visible without any share
+  arithmetic: **every reader's inclusive share collapsed onto its self share**, i.e. the
+  functions stopped calling anything at all.
+
+  | fn | master self / incl | patched self / incl |
+  | --- | ---: | ---: |
+  | `repTreeVKind` | 0.57 / 2.57 | 0.54 / **0.54** |
+  | `repTreeListElemName` | 0.17 / 1.04 | 0.22 / **0.22** |
+  | `repTreeNulOf` | 0.29 / 0.59 | 0.49 / **0.49** |
+  | `rtListVKind` | 0.09 / 0.37 | 0.23 / **0.23** |
+  | `repOfTy` | 0.22 / 8.47 | 0.27 / 5.92 |
+
+- **The call-count estimate over-predicted by ~6×, and that is the transferable lesson.**
+  42.6% of all `__str_eq__` *calls* came from this chain, but the chain was only ~3.2% of
+  *self-time* inclusive — its comparisons are the cheapest ones in the program (tags are
+  1–7 bytes and mismatch on length, and #1851's cached header already made the rest fast).
+  **Call counts rank candidates; they do not size them.** Where §1's threshold asks for a
+  probe, the probe should be an inclusive-share reading, not a counter.
+- **Do NOT infer the total-sample count as a speedup.** The two arms' 6-run sample totals
+  were 17,127 vs 14,961 — a −12.6% that is pure scheduler noise (individual runs ranged
+  2.0 s to 7.3 s of sampled guest time). Only the *shares* survive that variance.
+- **Byte-identity cross-check:** both seeds compile the pinned master tree to the same
+  1,375,877-byte wasm, and the patched tree reaches its own fixpoint at 1,376,574 bytes.
+  All seven gates match master exactly, rep-fuzz included (`exact`, 1 baselined reject).
+- **Residue, not done:** `rtReason` is still a `string[]` of a closed policy vocabulary —
+  but it is read almost entirely as a *return value*, not a comparison (`repTreeUnsupReason`
+  hands it out), and its two hot comparisons are the `== "litunion:noalias"` pair. Census
+  it before converting; the number above is the reason not to assume.
 
 ### 3. Litunion dispatch and the `string`→litunion crossing — **(A) before (B), and the ordering is the point**
 
@@ -361,6 +410,15 @@ short-string comparison with an integer/hash comparison buys almost nothing, bec
 literals are 3–7 bytes and the post-length-check scan is 1–3 iterations. *"Atoms compare
 faster than strings"* is **measurably almost false at these sizes.** (B) alone converts N
 string compares into N integer compares. **The prize is (A): N compares into one dispatch.**
+
+**Candidate 2 revises the size of "N compares into N compares", and #1851 is not the
+witness for it.** #1851 made `__str_eq__` itself cheaper (a cached header hash); candidate 2
+**deleted the call**. Over 17.66 M comparisons that was worth **−2.10%** of `vl build`,
+not −0.17% — an inlined `i32.eq` beats a call to a fast `__str_eq__` by the call, not by
+the compare. So the ordering above still holds — (A) is the bigger prize — but **(B)'s
+standalone value is ~2% per 17 M comparisons, not ~0%.** Weigh it against the design cost
+with that number, and re-measure before quoting either figure again: candidate 2 also showed
+the *call count* over-predicting the *time* by ~6×.
 
 Two constraints on (B) that must be in its design or it is pointless:
 
@@ -724,8 +782,9 @@ Recorded because the brief asked to be corrected rather than agreed with.
 ## 10. Sequence
 
 1. ~~**Candidate 1** (`cTyIxListHas` → dense side table).~~ **SHIPPED, #1853, −11.6%.**
-2. **Candidate 2** (`rtKind` → named litunion). Proven in-tree pattern with a shipped
-   precedent and a number. Rep-fuzz gate mandatory.
+2. ~~**Candidate 2** (`rtKind` → named litunion).~~ **SHIPPED, #1855, −2.10%** over four
+   annotations. The projected `17,664,170 __str_eq__ → i32.eq` happened exactly as written;
+   the *time* it was worth was ~6× less than the call count implied. See §2.
 3. **Candidate 3(A)** (`br_table` for litunion dispatch). Compounds with 2 and needs no
    language change.
 4. **Candidates 4 and 5** (`isUName`, `variantIndexOf` → maps). Small, independent, and
