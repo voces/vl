@@ -204,6 +204,7 @@ import {
   emitFailed,
   fRetBool,
   fRetKind,
+  fRetLitAtom,
   fRetRArrElem,
   fRetStructIdx,
   fRetVoid,
@@ -386,11 +387,13 @@ import {
   ensureRefElemTy,
   eqCoreKindOfBin,
   exprIsBareFnName,
+  exprIsLitAtom,
   exprMap,
   fieldRefElemName,
   fieldTypeCode,
   fieldValueFeOf,
   fnIndexOfSid,
+  fnRetExprOf,
   fnReturnsClosure,
   fnSigKeyOf,
   fnStmtsPosOf,
@@ -1636,6 +1639,7 @@ export function buildFnMap(_stmts: i32[]) {
   fRetRArrElem = []
   fRetBool = []
   fRetKind = []
+  fRetLitAtom = []
   let i = 0
   while i < fnStmts.length {
     const s = P.nodes[fnStmts[i]]
@@ -1661,6 +1665,7 @@ export function buildFnMap(_stmts: i32[]) {
       // `computeRetInference` (the A20 name pass below + `criClassify`) writes the
       // un-annotated facts into the same slot, so `inferredRetKindCore` is a plain read.
       fRetKind.push(retAnnKindChain(s.fnRet))
+      fRetLitAtom.push(0)
       // A20: an un-annotated SCALAR/STRING/array function's return is set DIRECTLY from
       // the checker's inferred return name — the emitter's expression-based fallback
       // below misses a return that is a plain variable (a `let`-bound string or list),
@@ -2143,6 +2148,44 @@ export function computeRetInference() {
       }
       i = i + 1
     }
+  }
+  // THE LITERAL-UNION ATOM RETURN, recorded once the kinds have settled.
+  //
+  // A SEPARATE PASS, not an arm inside `criClassify`, and the reason is measured: asking
+  // `exprIsLitAtom` inside that classifier moved `unions/atom-string-join.vl` from green to
+  // `print of a literal-union atom whose type carries no member texts`. `criClassify` runs to
+  // a FIXPOINT and its arms feed each other through `criSetRetKind`/`criChanged`, so an extra
+  // question asked inside it is not free of the loop it sits in. Asked once, afterwards, it
+  // observes the settled state instead of participating in it.
+  //
+  // It needs no narrowing replay: the receiver of a shared TAG read resolves through
+  // `unionNameOfIdent` — the PARAM's declared union — which `currentStructNarrowSetOf` falls
+  // back to when nothing is narrowed. That is why this can live outside `criWalkBlock`.
+  //
+  // WHY A FLAG AND NOT A `fRetKind`: both reps ARE i32, so the kind cannot carry it. See
+  // `fRetLitAtom`'s header for the wrong value that costs.
+  let la = 0
+  while la < fnStmts.length {
+    const laFn = P.nodes[fnStmts[la]]
+    if laFn is FuncDecl {
+      // GATED ON THE SETTLED KIND BEING `i32`, which is what an atom return leaves it at. A
+      // function whose returns JOIN an atom with a string (`if c { return k }  return "cc"`)
+      // settles at `"str"` and WIDENS the atom at its own return — its result is a string
+      // ref, and `fnRetExprOf` picks only one return, which may be the atom arm. Without this
+      // gate that function was flagged and its callers widened a value already widened:
+      // measured, `unions/atom-string-join.vl` went from green to `print of a literal-union
+      // atom whose type carries no member texts`. The kind is the settled answer for ALL
+      // returns; the expression test is what distinguishes an atom from a plain i32.
+      if laFn.fnRet < 0 && fRetVoid[la] == 0 && fRetKind[la] == "i32" {
+        const laRx = fnRetExprOf(fnStmts[la])
+        if laRx >= 0 {
+          if exprIsLitAtom(laRx, fnStmts[la]) {
+            if la < fRetLitAtom.length { fRetLitAtom[la] = 1 }
+          }
+        }
+      }
+    }
+    la = la + 1
   }
   0
 }
