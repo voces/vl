@@ -23408,6 +23408,65 @@ function declaredArray(name: string) { declaredKind(name) == "list" }
 // True if evaluating the expression at `exprIx` yields the i32 array: an array
 // literal (with i32 / no elements — a ref-element literal is NOT this), an
 // array-returning call, an array param/local reference, or a parenthesized array
+// THE SHARED-FIELD PLAN over an UN-NARROWED struct union — `(A | B).tag`, where the checker
+// proved the field present on every member. ONE derivation, consulted by the three places
+// that need it: the emitter's per-tag dispatch in `emitMem`, and BOTH member field-code
+// twins below (`memFieldTypeCode` and `memberFieldCode` — the same question asked of
+// different code families, differing only in whether the variant rung falls through).
+//
+// Only the dispatch existed. Neither twin had the rung, so a shared read of a non-i32 field
+// lowered its bytes correctly and was then handed to the WRONG consumer: `print(s.k)` over a
+// string field dispatched the i32 sink onto a `(ref $type)`.
+//
+// Fills `outVis` / `outFis` with each member's variant index and its index for this field,
+// in the recorded member order (which IS the box-tag order the dispatch walks), and returns
+// the ONE field CODE they all carry. -1 when the receiver is not an un-narrowed union
+// Ident, when any member lacks the field, or when the members disagree on its code.
+//
+// THE CODES MUST AGREE, and that is not conservatism: the dispatch is a chain of
+// `if (result …)` blocks, so two reps would be two result types for one block. Whether a
+// code can be SPELLED as a blocktype is deliberately NOT asked here — that is the emitter's
+// question, and asking it here would make a classifier's answer depend on `aUsed`, a flag
+// whose value moves during collection.
+export function sharedUnionFieldPlan(
+  recvIx: i32,
+  prop: string,
+  fnIx: i32,
+  outVis: i32[],
+  outFis: i32[],
+): i32 {
+  if !exprUnion(recvIx, fnIx) { return -1 }
+  const recv = P.nodes[unwrapParen(recvIx)]
+  if !(recv is Ident) { return -1 }
+  // The narrowed set's members from the recorded member columns; a narrowed subset the pool
+  // has not interned re-splits. A multi-variant NARROWED set ("N2|N3") plans over just its
+  // remaining members, exactly as the dispatch always did.
+  const set = currentStructNarrowSetOf(recv.identName, fnIx)
+  if set == "" { return -1 }
+  const atoms: string[] = []
+  if (
+    !msMemberAtomsOfSet(currentStructNarrowSetIdOf(recv.identName, fnIx), atoms)
+  ) {
+    splitUnionAtoms(set, atoms)
+  }
+  if atoms.length < 2 { return -1 }
+  let code = -1
+  let i = 0
+  while i < atoms.length {
+    const vi = variantIndexOf(atoms[i])
+    if vi < 0 { return -1 }
+    const fi = variantFieldIndex(vi, prop)
+    if fi < 0 { return -1 }
+    const fc = variantFieldTypeAt(vi, fi)
+    if code < 0 { code = fc }
+    else if code != fc { return -1 }
+    outVis.push(vi)
+    outFis.push(fi)
+    i = i + 1
+  }
+  code
+}
+
 // The wasm-type code of the struct / variant FIELD a `Member` expression at `memIx`
 // reads (`0` i32, `3` string, `4` i32-list, `5` ref-list), or `-1` if `memIx` is not a
 // field read of a known struct/variant field. Mirrors `exprString`'s Member dispatch:
@@ -23438,6 +23497,13 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
       const fi = sFieldIndex(si, e.memProp)
       if fi >= 0 { return sFieldTypeAt(si, fi) }
     }
+    // THE FOURTH RECEIVER SHAPE: an UN-NARROWED struct union whose members all carry the
+    // field at one code (`(A | B).tag`). Without it every classifier reading through here
+    // answered for the shared read as if it were an i32.
+    const uvis: i32[] = []
+    const ufis: i32[] = []
+    const ucode = sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis)
+    if ucode >= 0 { return ucode }
   }
   -1
 }
@@ -26098,6 +26164,13 @@ function memberFieldCode(memIx: i32, fnIx: i32) {
       const fi = sFieldIndex(si, e.memProp)
       if fi >= 0 { return sFieldTypeAt(si, fi) }
     }
+    // THE FOURTH RECEIVER SHAPE: an UN-NARROWED struct union whose members all carry the
+    // field at one code (`(A | B).tag`). Without it every classifier reading through here
+    // answered for the shared read as if it were an i32.
+    const uvis: i32[] = []
+    const ufis: i32[] = []
+    const ucode = sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis)
+    if ucode >= 0 { return ucode }
   }
   -1
 }
