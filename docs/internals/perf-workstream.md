@@ -540,9 +540,10 @@ that enumeration is a named litunion, and it is free at the use sites.
 
 **Ordered or range queries → sorted + binary search.** There are **zero** in the compiler
 today: `grep -i 'binarysearch\|lowerBound\|upperBound' compiler/ std/` returns nothing, and
-the two sorts in tree are insertion sorts over lists that are ordered for *output*, not for
-lookup. **Do not add a binary search speculatively.** If a sorted lookup appears, it appears
-with a consumer.
+the sorts in tree are insertion sorts over lists that are ordered for *output*, not for
+lookup. (This paragraph and §6.1 said **two**; a re-count while implementing §6.2's sort
+found **four** — see the corrected row in §6.1.) **Do not add a binary search
+speculatively.** If a sorted lookup appears, it appears with a consumer.
 
 **And the structure that is usually right: none.** 196 scan sites, and the measurements put
 essentially all of the cost in nine. The other ~187 are correct as written, and each one
@@ -576,7 +577,7 @@ moving almost nothing.
 
 | candidate | where | verdict |
 | --- | --- | --- |
-| **Insertion sort, written twice** | `cli.cliStableSort` (`cli.vl:682`), `format.fmtSortNames` (`format.vl:673`) | **One algorithm, two comparators.** Identical loop, differing only in `cliDiagLess` vs `fmtNameLess`. This is the genuine std candidate in the tree — and VL has first-class functions (P2 shipped `call_indirect` dispatch), so `sortBy<T>(self: T[], less: (T, T) => boolean)` is expressible today. **Neither copy is measured hot**; the DRY case is real, the perf case is unmeasured. |
+| **Insertion sort, written ~~twice~~ FOUR times** | `cli.cliStableSort` (`cli.vl:682`), `format.fmtSortNames` (`format.vl:673`), `cli.cliSortFiles` (`cli.vl:874`), the edit-order sort in `cli`'s lint-fix path (`cli.vl:1689`) | **One algorithm, four comparators.** Identical stable-insertion body (`while j >= 0 && less(key, xs[j])`), differing only in `cliDiagLess` / `fmtNameLess` / `cliStrGt` / a `pos[]` lookup — and **every one of the four is a boolean less-than**, the multi-key one included, which is what settled the comparator shape in `std:array.sorted` (§6.2). Two of the four sort an **index list** whose comparator reads parallel arrays it closes over. **No copy is measured hot**; the DRY case is real, the perf case is unmeasured. **Migration is NOT scheduled**: §6.0's blocker stands (the compiler imports zero std modules and its seed is built unoptimised, so it would pay #1839's raw cost), and insertion sort is genuinely optimal at these call sites — lowest constant, stable, no auxiliary allocation, lists short by construction. The right end state may well be that the four collapse into one internal helper and never import std at all. |
 | **`i32ToStr`** | `ast.vl:1540` | Duplicates `std:fmt.toStr(self: i32 \| i64 \| boolean)`. A textbook move — and blocked by §6.0. Leave it and note the duplication. |
 | **`indentStr`** | `fmt_util.vl:56` | A memoized `std:str.repeat`. **The memo is the interesting part, not the repeat** — a general `repeat` in std does not carry a per-depth cache, and the cache is what removed the per-line allocation. Do not move; the compiler-specific half is the whole value. |
 | **`strutil.cpCount` / `pushCps`** | `compiler/strutil.vl` | **Explicitly must NOT move.** Its header records why: `cpCount` deliberately avoids the `cpLen()` intrinsic because the bootstrap seed that compiles this source predates it, and every function in that file must answer identically under both string representations or `compile(X) == X` stops converging. This is bootstrap-constrained code that *looks* like a std utility. Good example of why this pass has to read headers. |
@@ -587,15 +588,30 @@ moving almost nothing.
 ### 6.2 Direction B — what `std:` should grow for users, independent of the compiler
 
 Today: `str`, `fmt`, `fs`, `args`, `utf8`, `array`, `buffer`, `test`, `seed`. No `list`, no
-`map`, no `set`, **no sort, no binary search, no priority queue, no deque.**
+`map`, no `set`, ~~no sort~~ (shipped, below), **no binary search, no priority queue, no
+deque.**
 
-- **A sort.** The clearest gap, and the one with two in-tree consumers already written. Both
-  are stable insertion sorts, which is a legitimate std answer for small n but not the only
-  one — the API must **state its stability and its complexity**, because std has no
-  deprecation story. `std:array` is the right home (it is already generic). This is exactly
-  the change `CLAUDE.md` requires the `std-api-reviewer` agent to see before it merges, and
-  the rubric clause it will be judged against is §4: *"Where a measurement drove the design,
-  the number is in the comment."*
+- **A sort. SHIPPED** — `std:array.sorted<T>(self: T[], less: (T, T) => boolean): T[]`, one
+  export, stable, O(n log n) comparisons worst case, O(n) auxiliary space. A bottom-up merge
+  over runs an insertion sort has already ordered; the base-case run length is **16**, picked
+  off a sweep of 8/12/16/24/32 at six sizes rather than off folklore, and the table is in the
+  comment above the function. It **returns a new list** — `std:array` has no mutating export
+  and `reverse` is the exact structural analogue — and the comparator is a **boolean strict
+  less-than**, which is what all four in-tree comparators already are (§6.1). Behaviour under
+  an *inconsistent* comparator is documented rather than undefined: the order is unspecified
+  but the result is always a permutation, and it never traps, because every loop is bounded by
+  an index and not by the comparator.
+
+  Two numbers decided the shape. Generality is **free at the short lengths this tree actually
+  sorts** — n=16 measures 0.448 us for both `sorted` and a plain insertion sort, n=8 0.176 vs
+  0.168 us — and it is **11.2x** at n=1024 (90.5 us vs 1014.5 us; 10,583 comparisons vs
+  258,411). That is why the API did not settle for insertion sort: `std` has unknown callers
+  and no deprecation story, so a quadratic worst case would be permanent.
+
+  What was deliberately NOT added: `sortUnstable` (a second name doing almost the same thing;
+  additive later if a measurement demands it), `sortedBy(keyOf)` (a two-line comparator), a
+  defaulted `xs.sorted()` (no `<` for structs, and no overloading to express the split), and a
+  binary search (still zero consumers — the ruling above stands).
 - **`std:map` / `std:set` are already planned** (std-design slice 6, gated on slice 5
   `std:list`). Worth noting for scope: `{[K]:V}`, `Map()` and `Set()` are **language**
   builtins, class 1 of the intrinsic floor. What std would add is *algorithms over* them —

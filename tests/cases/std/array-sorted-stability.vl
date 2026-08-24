@@ -1,0 +1,124 @@
+// @run
+// @hint Intentionally-unused parameter `_a` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_b` (leading `_` marks it unused)
+// @log 0:3 0:5 1:1 1:4 2:0 2:2
+// @log 0000000000111111111122222222223333333333
+// @log true
+// @log 0,4,8,12,16,20,24,28,32,36
+// @log true
+// `std:array.sorted` is STABLE, and this file is the pin that makes that a promise
+// rather than an accident of the current algorithm. An unstable sort that happens to
+// be stable today is the worst kind of trap in a library with no deprecation story:
+// callers come to depend on the observed behaviour and a later "harmless" swap of the
+// algorithm silently reorders their output.
+//
+// The technique is the standard one — sort by ONE key and check that a SECOND key's
+// input order survives inside every group of equal first keys — written in the form
+// the tree already uses: sort an INDEX list while the comparator reads the keys out
+// of a parallel array it closes over. That is exactly `compiler/cli.vl`'s diagnostic
+// sort (`order: i32[]` ordered by `dgLine`/`dgCol`) and the edit-order sort in its
+// lint-fix path, and it is a first-class use of `sorted` rather than a workaround:
+// a `(T, T) => boolean` comparator can close over anything, which a key-extractor
+// API would not have allowed. It also sidesteps a real compiler limitation — see
+// `error-array-struct-element.vl`, which pins that `std:array`'s whole
+// generic surface refuses a list of STRUCTS today.
+//
+// Because the index IS the input position, "stable" has a mechanical statement here:
+// inside a run of equal keys the indices must come out ASCENDING.
+//
+// The two lengths below are chosen against SORT_RUN = 16, `sorted`'s insertion
+// base-case run length, because stability can break in two independent places:
+//   - inside the insertion base case, if it stopped on `!less(a[j], key)` rather than
+//     on `less(key, a[j])` — an element would then step past its equals;
+//   - inside the merge, if the right half won ties instead of the left.
+// n = 6 exercises only the first; n = 40 exercises both, and crosses run boundaries
+// (16 + 16 + 8) so equal keys sit on opposite sides of a merge.
+//
+// VL's own consumer of this property is `compiler/cli.vl`, whose diagnostic sort
+// documents that ties keep insertion order "so error-tier diagnostics precede
+// lint-tier ones at the same position".
+import { sorted } from "std:array"
+import { join, toStr } from "std:fmt"
+
+// ── n = 6: the insertion base case only ───────────────────────────────────────
+// Every key appears twice, and the pairs are interleaved rather than adjacent, so a
+// sort that merely happened to leave already-neighbouring equals alone is still
+// caught.
+const smallKey = [2, 1, 2, 0, 1, 0]
+const smallOrder: i32[] = []
+let i = 0
+while i < smallKey.length {
+  smallOrder.push(i)
+  i = i + 1
+}
+const smallSorted = smallOrder.sorted((a: i32, b: i32) => smallKey[a] < smallKey[b])
+
+// Printed as `key:index`, so both the ordering and the tie order are visible.
+const smallParts: string[] = []
+i = 0
+while i < smallSorted.length {
+  smallParts.push(toStr(smallKey[smallSorted[i]]) + ":" + toStr(smallSorted[i]))
+  i = i + 1
+}
+print(smallParts.join(" "))
+
+// ── n = 40: base case AND merge, with equal keys spanning run boundaries ──────
+// `key = i % 4` puts ten indices in each of four groups, spread evenly across all
+// three base runs, so every group is assembled by the merge out of pieces of at least
+// two runs. Indices 15 and 16 — the last element of run 0 and the first of run 1 —
+// share key 3, which is precisely the pair a right-biased merge would swap.
+const bigKey: i32[] = []
+const bigOrder: i32[] = []
+i = 0
+while i < 40 {
+  bigKey.push(i % 4)
+  bigOrder.push(i)
+  i = i + 1
+}
+const bigSorted = bigOrder.sorted((a: i32, b: i32) => bigKey[a] < bigKey[b])
+
+// The keys come out ascending …
+const keyParts: string[] = []
+i = 0
+while i < bigSorted.length {
+  keyParts.push(toStr(bigKey[bigSorted[i]]))
+  i = i + 1
+}
+print(keyParts.join(""))
+
+// … and inside each group the ORIGINAL indices are still ascending. This is the
+// stability assertion; it is checked mechanically as well as printed because the
+// printed line is long enough to hide a single transposition.
+let stable = true
+i = 1
+while i < bigSorted.length {
+  const prev = bigSorted[i - 1]
+  const cur = bigSorted[i]
+  if bigKey[prev] == bigKey[cur] && prev > cur { stable = false }
+  i = i + 1
+}
+print(stable)
+
+// The first group spelled out, so the fixture fails with a readable diff rather than
+// a bare `false` if the tie rule ever flips: key 0 is indices 0, 4, 8, … 36 in order.
+const groupParts: string[] = []
+i = 0
+while i < bigSorted.length {
+  if bigKey[bigSorted[i]] == 0 { groupParts.push(toStr(bigSorted[i])) }
+  i = i + 1
+}
+print(groupParts.join(","))
+
+// ── a comparator that sees NO differences at all ─────────────────────────────
+// When `less` is constantly false every element is "equal" to every other, so a
+// stable sort must return the input order EXACTLY. This is the strongest stability
+// assertion available, and it is the one an algorithm carrying a hidden tie-break —
+// a fallback to identity, an index-based nudge — fails.
+const flat = bigOrder.sorted((_a: i32, _b: i32) => false)
+let identity = true
+i = 0
+while i < flat.length {
+  if flat[i] != i { identity = false }
+  i = i + 1
+}
+print(identity)
