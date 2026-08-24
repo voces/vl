@@ -85,10 +85,16 @@ const EMIT_ERROR_SRC =
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 
-// Type-checks clean, EMITS clean, and the module does not validate: CONSTRUCTING the
-// inline-object arm of a union whose field is a nullable i32-keyed map
-// (`tests/cases/soundness/xfail-miscompile-union-arm-constructed-map-field.vl`).
+// Type-checks clean, EMITS clean, and the module does not validate: a union whose two
+// CLOSURE arms are ONE TYPE — the parameter types `{a: i32, b: string}` and
+// `{b: string, a: i32}` are field-permuted, which the 2026-08 ruling makes the same type
+// (`tests/cases/soundness/xfail-miscompile-permuted-object-closure-arms.vl`).
 // Distinct from EMIT_ERROR_SRC above: the emitter raises nothing at all here.
+//
+// The previous specimen was CONSTRUCTING the inline-object arm of a union whose field is a
+// nullable map — fixed by giving the VARIANT-literal emitter the `vcode == 29` construct
+// seed its plain struct-literal sibling had, so this test went red exactly as the note
+// below said it would, and the same instruction was followed.
 //
 // The previous specimen was a `string | null` argument at a GENERIC call, whose instance
 // declared a NON-null parameter — fixed by giving the module-scope pin arm the nullable
@@ -99,11 +105,16 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // (`type A = 1 | 2; type B = 3 | 4; type U = A | B`), which is fixed, so this test went
 // red exactly as the note here said it would. Same instruction stands: if this shape
 // graduates, swap in any other `@no-instantiate` shape from tests/cases/soundness/
-// rather than deleting the assertion.
+// rather than deleting the assertion. This one is LIVE WORK — issue #1864 owns the
+// silent-wrong-value tier underneath it — so expect to follow that instruction soon.
 const INVALID_MODULE_SRC =
-  `type Box = { g: {[i32]: i32} | null } | f64\n` +
-  `const v: Box = { g: Map() }\n` +
-  `if v is f64 { print(1) } else { print(2) }\n`;
+  `type PA = { a: i32, b: string }\n` +
+  `type PB = { b: string, a: i32 }\n` +
+  `type FA = (PA) => i32\n` +
+  `type FB = (PB) => i32\n` +
+  `function pm(x: FA | FB) { if x is FA { print(1) } }\n` +
+  `function fa(v: PA) { v.a }\n` +
+  `pm(fa)\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

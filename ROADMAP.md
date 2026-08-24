@@ -907,24 +907,40 @@ in-language GC knobs.
   checker's soundness floor (15 false-accept classes) is closed; new classes go straight to corpus
   + both checkers.
   THE `xfail-miscompile-` TIER (accepts, then emits invalid wasm) stands at **four** members here
-  plus one under `tests/cases/std/`, down from twelve: seven closed in one pass and SIX of the
-  seven were the same sentence — a ladder with an arm its sibling ladder lacks (see `CHANGELOG.md`,
-  Track B, and the enumeration in `tests/cases/soundness/README.vl`) — and the eighth,
-  `numeric-litunion-empty-list-seed`, turned out to be that same sentence once its "this needs a
-  REP decision first" header was checked rather than believed. What remains is attributed
-  rather than merely listed: the `$fnsig` producer chain keyed on a rendered spelling
-  (`narrowed-litunion-fn-value-arg` here + `array-litunion-element` in std — one question, and they
-  need `cloParamTok` / `annSigKey` / `sigKeyOfTy` moved TOGETHER or nothing measures);
-  a union whose two closure arms are ONE TYPE (`permuted-object-closure-arms` — the permutation
-  turns out to be incidental, and the degenerate form, two identically-spelled `(i32) => i32`
-  arms, is a VALID module that silently prints nothing where both `is` tests should be true: a
-  wrong VALUE, pre-existing on master, worse than the file that pins it and with no fixture kind
-  yet); a constructed nullable-map union-arm field whose `Map()` builds the STRING-keyed map
-  struct while the field declares the i32-keyed one, with three controls narrowing it to a
-  missing nullable PEEL (`union-arm-constructed-map-field`); and the checker-side totality gate,
+  plus one under `tests/cases/std/`, down from twelve: seven closed in one pass (#1863), an eighth
+  right after (#1865) and a ninth beside it (#1866) — and EIGHT of those nine were the same
+  sentence, a ladder with an arm its sibling ladder lacks (see `CHANGELOG.md`, Track B, and the
+  enumeration in `tests/cases/soundness/README.vl`). The eighth was the map one: `emitObj` seeds a
+  nullable-map field's construct context under `scode == 29` and the VARIANT-literal twin had no
+  `vcode == 29` arm, so FIVE shapes — not the one its header named — rode the ambient mono
+  STRING-keyed default. The ninth, `numeric-litunion-empty-list-seed`, was the same sentence once
+  its "this needs a REP decision first" header was checked rather than believed: the rep was
+  already decided and already named (`numLitUnionBaseTy` — a numeric literal union reps as its
+  BASE SCALAR), so the pair closed together with the `xfail-false-reject-` file beside it.
+  **FOUR miscompile fixtures remain** (three of the twelve, plus the loud `totality-gate` one) and
+  TWO false rejects. What remains is attributed rather than merely listed: the `$fnsig` producer chain keyed on a
+  rendered spelling (`narrowed-litunion-fn-value-arg` here + `array-litunion-element` in std — one
+  question, and they need `cloParamTok` / `annSigKey` / `sigKeyOfTy` moved TOGETHER or nothing
+  measures); the numeric literal-union family's missing REP decision
+  (`numeric-litunion-empty-list-seed`, the same `litKind == "str"` restriction behind
+  `xfail-false-reject-numeric-litunion-array-in-signature`); a union whose two closure arms are ONE
+  TYPE (`permuted-object-closure-arms` — **needs a Track A ruling, and its header was re-derived
+  and REPLACED**: the permutation is the trigger for that file after all, the reported
+  `(ref null)`/`(ref)` is the printer eliding two type INDICES, and the split is two `TyObj` arms
+  of which one sorts. `repCanonIdGo` sorts field names — that sort IS the 2026-08 ruling — so the
+  union collapses to ONE closure rep, while `tyToEmitNameAt` does NOT sort, renders the two aliases
+  apart and interns two box TAGS; `emitIs` is the only half that disagrees, since deleting the `is`
+  tests makes the same program run. Same field ORDER gives the degenerate form — a VALID module
+  that silently prints nothing, **issue #1864**. NEITHER FIX WORKS ALONE: #1864 alone leaves the
+  file invalid, and sorting the render alone trades invalid wasm for #1864's strictly worse silent
+  wrong value. A THIRD shape with no functions at all — a permuted OBJECT union arm, where
+  `u is PB` answers FALSE for a PB — is a valid module with a wrong value on master; the 2026-08
+  change measured 14 positions and the union ARM is a 15th it did not reach. None of the three has
+  a fixture KIND here, and one kind would serve all three); and the checker-side totality gate,
   which carries an ordering constraint in its own header.
-  **RE-DERIVE A FILED DIAGNOSIS BEFORE BUILDING ON IT.** Two of the seven headers were wrong about
-  their own defect, and for a miscompile the re-derivation is `wasm-tools print` on the bad module.
+  **RE-DERIVE A FILED DIAGNOSIS BEFORE BUILDING ON IT.** THREE of the headers were wrong about
+  their own defect, and for a miscompile the re-derivation is `wasm-tools print` on the bad module
+  — which is also what showed the two elided type indices above.
 - 🟡 **A13. Operator-constraint inference.** A binary op with a hole operand records a deferred
   `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
   argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall
