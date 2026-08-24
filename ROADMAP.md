@@ -1219,33 +1219,48 @@ in-language GC knobs.
 
   The shape: **memory is much better where strings dominate and CPU is worse there**;
   `vl build` is flat because emit (~60% of a compile) never touched a string. The −48% on
-  `check` is the headline win; the +43% CPU is the headline cost and the cached hash below
-  is the designed answer to it.
+  `check` is the headline win; the +43% CPU is the headline cost.
+
+  **STEP 3 — THE CACHED HASH — IS SHIPPED, AND IT IS NOT THE ANSWER TO THE +43%.** The
+  header is now `{backing, start, len, hash}` with `$hash` the ONE mutable field (a memo of
+  a pure function of three immutable fields — `java.lang.String.hash`, sound for the same
+  reason), 0 = not-yet-computed. It removes **80% of all hashing**: a guest sampling profile
+  of a self-compile reads `__str_hash__` at **3.59% → 0.73%** self time. But 3.59% was the
+  entire ceiling, so the workload moves **−1.5% user CPU** (`vl check`, n=21 interleaved
+  pairs, 1.560 → 1.536 s) at **0 B per string** of memory (§1.2's prediction re-measured
+  under all three collectors) and +0.25% seed size. **The `==` hash short-circuit was also
+  built, measured, and REJECTED** — it fires, but buys −0.17% (noise), because
+  `__map_probe__` already gates its compare on the stored per-entry hash and the direct-`==`
+  population is 3–7-byte pooled literals whose byte scan is 1–3 iterations. See
+  `strings-design.md` §Equality.
+
+  **WHERE THE +43% ACTUALLY LIVES, measured** (same profile, self-times, master):
+  `__str_eq__` **19.2%**, `cTyIxListHas` **12.9%** (a LINEAR LIST SEARCH — nothing to do
+  with strings, and the largest single item on the board), `tyTopIndexOf` 3.0%,
+  `__str_hash__` 3.6% (now 0.7%). `__str_eq__`'s own top consumers are literal-compare
+  chains (`repTreeVKind`, `repTreeListElemName`, `objFieldType`, `litUnionAliasOfLitTexts`),
+  not map probes. The next slice should look at `cTyIxListHas` and at turning those
+  literal chains into something that is not a chain — **not** at hashing.
 
   REMAINING, in priority order:
-  1. **Step 3 — the cached hash, still unwired.** The `$hash` header field was deliberately
-     deferred in #1845 ("do not wire any hash logic") because it must move atomically with
-     byte-level equality; the byte-level half landed implicitly with #1848 (a string IS
-     bytes), so **only the cache is outstanding**. `strings-design.md` §Equality has the
-     design. This is the natural response to the `check` CPU regression: the compiler is
-     overwhelmingly map-key-heavy and re-hashes the same immutable key object repeatedly.
-  2. **`__print_string__` is still per-element.** #1848 converted the CLI data-out channel
+  1. **`__print_string__` is still per-element.** #1848 converted the CLI data-out channel
      (`vl fmt` on 7 MB 0.80→0.46 s) but not this one — a new import functype moves four
      hardcoded indices. **Non-ASCII printing is 15% slower** than before the swap; ASCII is
      unchanged.
-  3. **Source intake is still UTF-32**, one code point per word, so the host→guest staging
+  2. **Source intake is still UTF-32**, one code point per word, so the host→guest staging
      path did not get the 4× the storage did.
-  4. **`s.backwards()` is unbuilt.** §Codepoints specifies it and UTF-8
+  3. **`s.backwards()` is unbuilt.** §Codepoints specifies it and UTF-8
      self-synchronisation makes it O(1)/step; nothing consumes it yet.
-  5. **`utf8Length` should be deleted** — a second name for `.length` is a trap
+  4. **`utf8Length` should be deleted** — a second name for `.length` is a trap
      (`utf8-byte-ready.md`), but it is a breaking removal wanting its own slice.
-  6. **Map probe cost is bimodal, on BOTH builds** — an 8,000-function corpus checks SLOWER
+  5. **Map probe cost is bimodal, on BOTH builds** — an 8,000-function corpus checks SLOWER
      than a 12,000-function one, in both directions, reproducibly, under user-CPU timing.
      That is hash-collision luck, not size, and #1848 changed the hash domain (bytes, not
      code points) so it reshuffled which inputs are lucky. **Pre-existing weakness the
      migration exposed rather than caused** — but it makes any per-file benchmark
-     meaningless and is worth its own look. Related: item 1.
-  7. **True display width ≠ code points** (CJK double-width, combining marks, emoji). `vl
+     meaningless and is worth its own look. **Step 3 did not change this** — the memo
+     removes repeat hashing, not collisions.
+  6. **True display width ≠ code points** (CJK double-width, combining marks, emoji). `vl
      fmt` counting code points restores pre-#1848 behaviour and no more; a real width
      model is a separate question. `vl fmt` was in fact counting BYTES — every line with a
      non-ASCII character wrapped 2–4× too early — until `dispWidth` in
@@ -1274,9 +1289,9 @@ in-language GC knobs.
   (2a), the slice header with O(1) views (2b), and **UTF-8 `(array i8)` storage with a
   byte-indexed surface (2c)**. `s[i]` is a byte, `.length` a byte count, `slice` byte offsets,
   and code points come from `for cp in s` / `cpAt` / `cpLen`; validity is Go-lean (no
-  validation, U+FFFD on malformed input, `fromCodePoints` substitutes). **(3)** `__map_hash__` +
-  `__string_eq__` to byte level **atomically** with the cached hash — STILL OPEN, and now the
-  only rep work left. **Unblocked, and NOT taken here:** wasmtime's
+  validation, U+FFFD on malformed input, `fromCodePoints` substitutes). **(3) DONE** — `__map_hash__` +
+  `__string_eq__` to byte level **atomically** with the cached hash: the byte-level half came
+  free with 2c (a string IS bytes) and the header memo shipped as Step 3. **Unblocked, and NOT taken here:** wasmtime's
   `ArrayRef::new_from_i8_slice` is i8-only, so `(array i8)` is what lets the host stage source in
   ONE call instead of ~3.4M (B-mem) — the guest-side intake is still one UTF-32 word per code
   point through `srcLoad`, because the change is a protocol edit on both sides and does not

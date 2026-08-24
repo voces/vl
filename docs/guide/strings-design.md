@@ -1,11 +1,10 @@
 # VL strings design — UTF-8 storage, a byte-indexed core, and code points by iteration
 
 > Status: **SHIPPED.** Stage 2a (a heap type of its own), Stage 2b (the slice header and
-> O(1) views) and **Stage 2c (UTF-8 storage and the byte-indexed surface)** have all
-> landed; the `DECISIONS.md` entry is written. What remains of the migration list is
-> Step 3 (byte-level `__map_hash__`/`__string_eq__` plus the cached header hash, which
-> must move atomically) and Step 4 (`std:unicode`, `std:regex`), neither of which changes
-> the storage or the index unit.
+> O(1) views), **Stage 2c (UTF-8 storage and the byte-indexed surface)** and **Step 3 (the
+> cached header hash)** have all landed; the `DECISIONS.md` entry is written. What remains
+> of the migration list is Step 4 (`std:unicode`, `std:regex`), which changes neither the
+> storage nor the index unit.
 >
 > **Where the implementation DEVIATES from what is written below, the deviation is marked
 > inline** — there are three: `s.bytes()` copies rather than aliasing (§Byte view),
@@ -558,19 +557,35 @@ backwards wants `s.backwards()` and should not allocate anything.
   compute-once-never-invalidate. It is per-*header*, not per-backing — a slice's hash
   differs from its parent's.
 
-> **Migration note — atomic switch.** `__map_hash__` and `__string_eq__` must move to
-> byte-level in the **same** step. A mismatch — one on code points, the other on bytes
-> — leaves two byte-equal strings hashing to different buckets, **silently corrupting
-> every map** with no error. Indivisible; do not land one without the other.
+> **ALL FOUR NOW HOLD.** The first three landed implicitly with Stage 2c, because a string
+> simply *is* bytes; the cache is **built** (`emit_sections.vl`'s type section and
+> `emitStrHashFnCode`). The field is the ONE mutable field in an otherwise immutable
+> header, and that is sound because the hash is a pure function of three fields that can
+> never change — the write is a memo, not state, and cannot change an observable value.
+> `java.lang.String.hash`, exactly. The sentinel is `0`; a string that genuinely hashes to
+> 0 re-walks, at 1 in 2^31 (the result is masked `& 0x7fffffff`, so the codomain is 2^31
+> values and one of them is the sentinel).
+
+> **Migration note — atomic switch.** *(Discharged.)* `__map_hash__` and `__string_eq__`
+> had to move to byte-level in the **same** step. A mismatch — one on code points, the
+> other on bytes — leaves two byte-equal strings hashing to different buckets, **silently
+> corrupting every map** with no error. Stage 2c moved both at once by making a string BE
+> bytes; `tests/cases/strings/hash-eq-consistency.vl` is the standing fixture, and it
+> fails under a deliberately-wrong memo.
 
 **Why map lookups are slow today, and what actually fixes it.** Maps already cache the
 FNV hash *per entry* (`emit_state.vl:866` — "CACHED FNV hash of `keys[i]`, stored on
 append"). What is **not** cached is the hash of the **lookup key**: every `m[k]`
 re-hashes `k` from scratch. Three fixes, in descending value:
 
-1. **Cache the hash in the string header** (above). The compiler is overwhelmingly
-   map-key-heavy — symbol tables, scopes, interned names — and hashes the *same
-   immutable key object* repeatedly. Largest win, one `i32` field.
+1. **Cache the hash in the string header** (above). **BUILT, and MEASURED at less than
+   this paragraph promised.** It removes **80% of all hashing** — a guest sampling profile
+   of a self-compile puts `__str_hash__` at 3.59% self time before and **0.73%** after —
+   but 3.59% was the whole ceiling, so the workload-level saving is **−1.5% user CPU** on
+   `vl check` of the compiler, not the "largest win" this list implies. Memory is free
+   (§1.2's prediction re-measured: 0 B per string within ±0.7 B under all three
+   collectors). **Hashing was never where the migration's +43% `check` regression went** —
+   `__str_eq__` is 19% and a linear list search (`cTyIxListHas`) is 13%.
 2. **Replace FNV-1a.** Its serial `mul` chain is already documented as a bottleneck in
    this codebase (`emit_sections.vl:1887` — *"FNV is a SERIAL dependency chain — each
    `i32.mul` waits on the previous `h`"*). xxHash/wyhash-family hashes process
@@ -583,6 +598,39 @@ re-hashes `k` from scratch. Three fixes, in descending value:
 
 **SIMD is not the answer here** and should not be reached for: setup cost dominates
 below ~16 bytes, and identifiers — the actual key population — are 3–20.
+
+**THE `==` HASH SHORT-CIRCUIT WAS BUILT, MEASURED, AND REJECTED.** Two strings with
+different cached hashes cannot be equal, so a mismatch could skip the byte scan. Built as
+a gate that fires only when BOTH operands are already memoised (computing a hash there
+would cost more than the walk it replaces), placed after the `ref.eq` fast path and after
+the length check.
+
+**It FIRES, on a witness worth reading, because the obvious version of that witness is
+confounded.** Sabotaging the emitter and diffing the OUTPUT proves nothing: the sabotaged
+compiler also *emits* the changed byte, so the outputs differ whether or not the arm ever
+runs. The sound shape is to build TWO compilers from the SAME (sabotaged) emitter source —
+one stage apart, so they differ only in **their own** `__str_eq__` — and have each compile
+the same input. `cmp -l` confirms the pair differs in exactly one byte (the sabotage
+constant); the honest-eq one self-compiles fine and the sabotaged-eq one dies with
+`compiler/cli.vl:1983:4: undeclared identifier 'cliModCommitOne'`. The arm runs, on real
+name comparisons.
+
+And it still buys **nothing measurable**: −0.17% user CPU at n=11 interleaved pairs, and
+−3.5% of `__str_eq__`'s own self time (1249 → 1205 samples). Two reasons, both structural:
+
+- **The map path already has it.** `__map_probe__` gates its `__str_eq__` call on the
+  stored per-entry hash (`emit_sections.vl`), so a map lookup never reaches the compare
+  with a different-hash key. The gate can only help direct `==`.
+- **Direct `==` is over SHORT pooled literals.** The top consumers in a profile are chains
+  like `repTreeVKind`'s `k == "i32" || k == "bool" || …` — 3-to-7-byte literals where the
+  post-length-check byte scan is one to three iterations. Two `struct.get`s and three
+  branches cannot beat that. This is the same floor `emitStrHashFnCode` already records:
+  replacing the walk with a constant-time answer is worth 1.88× at ~97-char keys and
+  **nothing at ~9**.
+
+Not shipped: it adds a second place where hash and equality must agree — a maintenance
+liability against exactly the silent-map-corruption defect this section warns about — for
+no measured gain.
 
 ### Memory: `string` is GC; `Buffer` is the linear/SIMD tier — DECIDED
 

@@ -318,14 +318,17 @@ import {
   fbIf,
   fbLocalGet,
   fbLocalSet,
+  fbLocalTee,
   fbLoop,
   fbRefAsNonNull,
   fbRefNullForKind,
   fbRefNullStruct,
   fbReturn,
   fbStrBack,
+  fbStrHash,
   fbStrLen,
   fbStrNew,
+  fbStrSetHash,
   fbStrStart,
   fbStructNew,
   fbUnreachable,
@@ -1925,7 +1928,21 @@ function fbStrHashStep(k: i32) {
 // `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash of a string —
 // `h = 2166136261; for c in s { h = (h ^ c) * 16777619 }; h & 0x7fffffff`. The
 // 32-bit wasm `i32.mul` wraps exactly as the host's hash does. Params: s(0).
-// Locals: h(1), i(2), n(3), lim(4).
+// Locals: h(1), i(2), n(3), lim(4), back(5).
+//
+// STAGE 3 — THE CACHE. The walk runs at most ONCE per header. The answer is memoised in
+// the header's mutable `$hash` field (field 3): the prologue returns it when it is
+// non-zero, the epilogue stores it. Sound because the hash is a pure function of
+// `{backing, start, len}` and all three are immutable — the write cannot change any
+// observable value, which is why one mutable field in an immutable string is a memo and
+// not state (`java.lang.String.hash`, exactly).
+//
+// THE ZERO SENTINEL. `0` means "not computed yet", so a string whose hash genuinely IS 0
+// re-walks on every call — Java's tradeoff, taken here for the same reason (a second flag
+// field would cost a whole word to save one value's worth of work). The probability is
+// **1 in 2^31**, not 2^32: the returned value is masked to `& 0x7fffffff`, so the codomain
+// is the 2^31 non-negative i32s and exactly one of them is the sentinel. ~4.7e-10 per
+// distinct string; the compiler's ~600k-string self-compile expects 0.0003 of them.
 //
 // The walk is UNROLLED FOUR WIDE, then a scalar remainder loop finishes the tail —
 // the same shape `__str_eq__` uses, and `lim = n - 4` is likewise a SUBTRACTION so
@@ -1949,12 +1966,23 @@ function fbStrHashStep(k: i32) {
 function emitStrHashFnCode(out: i32[]) {
   const body: i32[] = []
   const prev = wTarget(body)
-  wULEB(2)                // 2 locals runs
-  wULEB(4)                // count 4
-  wU8(127)                // 0x7f i32 (h, i, n, lim)
-  wULEB(1)                // count 1
-  wU8(99)                 // 0x63 (ref null ht) — the hoisted backing
+  wULEB(2)     // 2 locals runs
+  wULEB(4)     // count 4
+  wU8(127)     // 0x7f i32 (h, i, n, lim)
+  wULEB(1)     // count 1
+  wU8(99)      // 0x63 (ref null ht) — the hoisted backing
   wSLEB(sBackIdx)
+  fbBlock(127) // block i32 — yields the hash, cached or freshly walked
+  // MEMO HIT: h = s.hash ; if h != 0 { yield h }. Two instructions and a branch on the
+  // path that matters — the compiler hashes the SAME immutable key object (a pooled
+  // literal, a token's text, an interned name) over and over.
+  fbLocalGet(0)
+  fbStrHash()
+  fbLocalTee(1)           // h = s.hash
+  fbIf(64)                // if h != 0, void
+  fbLocalGet(1)
+  fbBr(1)                 // → out of the i32 block with the cached hash
+  fbEnd()
   fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
   fbLocalSet(1)           // h
   // Hoist the header ONCE: backing into local 5, the cursor seeded to `start`, the bound to
@@ -2007,11 +2035,19 @@ function emitStrHashFnCode(out: i32[]) {
   fbBr(1)       // → loop header
   fbEnd()       // end (ge_s if)
   fbEnd()       // end (remainder loop)
-  // h & 0x7fffffff — force non-negative (the result).
+  // h & 0x7fffffff — force non-negative (the result), then MEMOISE it. The store is the
+  // only write anyone ever makes to field 3 and it stores exactly what this walk computed,
+  // so a second caller either reads this value or recomputes the identical one.
   fbLocalGet(1)
   fbI32Const(2147483647)
-  fbI32Bin(113) // 0x71 i32.and
-  fbEnd()       // end (function) — leaves the i32 result
+  fbI32Bin(113)  // 0x71 i32.and
+  fbLocalSet(1)  // h = the masked result
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbStrSetHash() // s.hash = h  — 0 stays 0 and simply re-walks next time (see the header)
+  fbLocalGet(1)
+  fbEnd()        // end (block) — leaves the i32 result
+  fbEnd()        // end (function)
   wTarget(prev)
   helpFrameBody(out, body)
 }
@@ -4587,14 +4623,31 @@ function emitTypeSection(
     wU8(94)  // 0x5e array
     wU8(120) // 0x78 i8 storagetype — PACKED UTF-8 bytes (Stage 2c)
     wU8(1)   // mutable
-    // THE STRING HEADER ($sTypeIdx) — Stage 2b. A `string` VALUE is this struct, a VIEW over
-    // the backing above: `{ backing: (ref $sBackIdx), start: i32, len: i32 }`. All three
-    // fields are IMMUTABLE, which is the representation-level statement of §Mutability —
-    // strings are immutable, so a view can alias its parent's backing with no invalidation
-    // risk and `slice` needs no defensive copy. Field indices are fixed by this order:
-    // backing=0, start=1, len=2.
+    // THE STRING HEADER ($sTypeIdx) — Stage 2b, plus Stage 3's `$hash`. A `string` VALUE is
+    // this struct, a VIEW over the backing above:
+    // `{ backing: (ref $sBackIdx), start: i32, len: i32, hash: i32 }`. Field indices are
+    // fixed by this order: backing=0, start=1, len=2, hash=3.
+    //
+    // THE FIRST THREE FIELDS ARE IMMUTABLE, which is the representation-level statement of
+    // §Mutability — strings are immutable, so a view can alias its parent's backing with no
+    // invalidation risk and `slice` needs no defensive copy.
+    //
+    // `$hash` IS MUTABLE, AND THAT DOES NOT WEAKEN ANY OF THAT. It is a MEMO, not state:
+    // the cached `__str_hash__` of the view's bytes, which is a PURE FUNCTION of fields
+    // that can never change. `0` means "not computed yet"; the only write anyone ever makes
+    // stores exactly the value a fresh walk would have returned, so no observable value can
+    // differ before and after it, and two readers racing on it would write the same bits.
+    // This is `java.lang.String.hash` exactly — the one mutable field in an immutable
+    // object — and the §Header/§Bytes aliasing arguments are untouched by it: a slice
+    // aliasing its parent's BACKING still sees bytes nobody can write, and a `$hash` write
+    // on the parent is invisible to the child (each header memoises its OWN range, so a
+    // slice's hash rightly differs from its parent's).
+    //
+    // The 4th field is FREE in memory: `{ref,i32,i32}` and `{ref,i32,i32,i32}` are the same
+    // size under all three collectors — the field lands in padding the third already forced
+    // (`string-rep-measurements.md` §1.2/§1.3 Table B, re-measured for this stage).
     wU8(95)         // 0x5f struct
-    wU8(3)          // 3 fields
+    wU8(4)          // 4 fields
     wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
     wSLEB(sBackIdx) // ...to the string backing array
     wU8(0)          // immutable
@@ -4602,6 +4655,8 @@ function emitTypeSection(
     wU8(0)          // immutable
     wU8(127)        // field 2 len: 0x7f i32
     wU8(0)          // immutable
+    wU8(127)        // field 3 hash: 0x7f i32
+    wU8(1)          // MUTABLE — the memo, see above
   }
   if lUsed {
     wU8(95)         // 0x5f struct

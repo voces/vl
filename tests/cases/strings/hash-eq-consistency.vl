@@ -1,0 +1,136 @@
+// @run
+// @log builds 5
+// @log pairs-equal 10
+// @log map-hits 5
+// @log map-size 1
+// @log memo-stable 1
+// @log slice-distinct 1
+// @log hash-then-eq 1
+// @log eq-then-hash 1
+// @log empty-ok 1
+// @log long-ok 1
+// The CACHED HASH's safety property, pinned (`strings-design.md` §Equality). The header's
+// `$hash` field is a MEMO, written on the first `__str_hash__` of a header and read on
+// every later one. Two things must hold or every map in the program is silently corrupt
+// with no error, which is the failure §Equality warns about:
+//
+//   1. byte-equal strings are `==`, however they were BUILT — literal, concat, slice,
+//      `fromCodePoints`, or a slice of a concat; and
+//   2. byte-equal strings hash EQUAL, so they are interchangeable as map keys.
+//
+// A hash/eq mismatch has no diagnostic: the map simply misses. So this fixture drives the
+// map, not just `==` — `m[a] = 1` followed by `m.has(b)` is the only test that sees the
+// hash at all, and a per-header memo that ever answered from the WRONG range would show
+// up here as a miss.
+//
+// ORDER IS PART OF THE TEST. The memo is written by a side effect, so a header that has
+// been hashed is in a different physical state from one that has not. `hash-then-eq` and
+// `eq-then-hash` drive the same pair in both orders; a memo write that clobbered `start`,
+// `len` or `backing` would make exactly one of them fail.
+
+const LIT = "hello"
+
+// (1) five byte-equal spellings of "hello", built five different ways.
+const bLit = LIT
+const bConcat = "hel" + "lo"
+const bSlice = "xhellox".slice(1, 6)
+const cps = [104, 101, 108, 108, 111]
+const bCps = fromCodePoints(cps)
+const bSliceOfConcat = ("ohell" + "oo").slice(1, 6)
+
+const all = [bLit, bConcat, bSlice, bCps, bSliceOfConcat]
+print("builds " + toString(all.length))
+
+// (2) every unordered pair compares EQUAL. 5 choose 2 = 10.
+let pairs = 0
+let i = 0
+while i < all.length {
+  let j = i + 1
+  while j < all.length {
+    if all[i] == all[j] { pairs = pairs + 1 }
+    j = j + 1
+  }
+  i = i + 1
+}
+print("pairs-equal " + toString(pairs))
+
+// (3) all five are the SAME map key. One insert, five hits, size stays 1.
+const m: {[string]: i32} = Map()
+m[bLit] = 7
+let hits = 0
+let k = 0
+while k < all.length {
+  if m.has(all[k]) { hits = hits + 1 }
+  k = k + 1
+}
+print("map-hits " + toString(hits))
+print("map-size " + toString(m.length))
+
+// (4) the memo answers the SAME on the second and hundredth hash of one header. A memo
+// that stored a truncated or unmasked value would miss from the second lookup onward.
+let stable = 1
+let r = 0
+while r < 100 {
+  if !m.has(bConcat) { stable = 0 }
+  r = r + 1
+}
+print("memo-stable " + toString(stable))
+
+// (5) a SLICE memoises its OWN range, never its parent's. `"xhellox"` and its 1..6 view
+// share a backing; if the memo were per-BACKING they would collide as keys.
+const parent = "xhellox"
+const m2: {[string]: i32} = Map()
+m2[parent] = 1
+m2[parent.slice(1, 6)] = 2
+let sliceDistinct = 0
+if m2.length == 2 { sliceDistinct = 1 }
+if parent == parent.slice(1, 6) { sliceDistinct = 0 }
+print("slice-distinct " + toString(sliceDistinct))
+
+// (6) both orders of (hash, compare) on a pair that was never hashed before.
+const h1 = "orderTestAlpha"
+const h2 = "orderTest" + "Alpha"
+const m3: {[string]: i32} = Map()
+m3[h1] = 1                       // hashes h1 (writes its memo), leaves h2 unhashed
+let hashThenEq = 0
+if h1 == h2 { hashThenEq = 1 }   // compare AFTER one side is memoised
+if !m3.has(h2) { hashThenEq = 0 }
+print("hash-then-eq " + toString(hashThenEq))
+
+const e1 = "orderTestBeta"
+const e2 = "orderTest" + "Beta"
+let eqThenHash = 0
+if e1 == e2 { eqThenHash = 1 }   // compare BEFORE either side is memoised
+const m4: {[string]: i32} = Map()
+m4[e1] = 1
+if !m4.has(e2) { eqThenHash = 0 }
+if m4.length != 1 { eqThenHash = 0 }
+print("eq-then-hash " + toString(eqThenHash))
+
+// (7) the empty string — length 0, so the hash walk runs zero steps and the FNV basis
+// masks to a fixed non-zero value. Two empties from different constructions must agree.
+const emptyLit = ""
+const emptySlice = "abc".slice(1, 1)
+const noCps: i32[] = []
+const emptyCps = fromCodePoints(noCps)
+const m5: {[string]: i32} = Map()
+m5[emptyLit] = 1
+let emptyOk = 0
+if emptyLit == emptySlice && emptySlice == emptyCps { emptyOk = 1 }
+if !m5.has(emptySlice) { emptyOk = 0 }
+if !m5.has(emptyCps) { emptyOk = 0 }
+if m5.length != 1 { emptyOk = 0 }
+print("empty-ok " + toString(emptyOk))
+
+// (8) past the four-wide unroll and its remainder, both as a key and under `==`: a memo
+// stored before the tail was folded in would make these two collide with their prefixes.
+const longA = "the quick brown fox jumps over the lazy dog 0123456789"
+const longB = "the quick brown fox jumps over the lazy dog 012345678" + "9"
+const longPrefix = longA.slice(0, 43)
+const m6: {[string]: i32} = Map()
+m6[longA] = 1
+m6[longPrefix] = 2
+let longOk = 0
+if longA == longB && m6.has(longB) && m6.length == 2 { longOk = 1 }
+if longA == longPrefix { longOk = 0 }
+print("long-ok " + toString(longOk))
