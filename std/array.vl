@@ -8,17 +8,23 @@
 //
 // The first group is the SEARCH family (each returns an i32 / boolean, building no
 // new collection); the second is the BUILDING family (`reverse` / `concat` /
-// `mapIndexed` / `sorted`, each returning a NEW list). The building family is
+// `mapIndexed` / `sorted`, each returning a NEW list); the third is the ORDERING pair
+// `sort` / `sorted`, which is the one place the module has both a mutating and a
+// building spelling of the same operation. The building family is
 // GENERIC over the element type too: a generic `const out: T[] = []` followed by
 // `out.push(…)` now propagates `T` through monomorphization, so one definition
 // builds the right list per instantiation. (`slice` and the bare `map`/`filter` are
 // emitter primitives; these add what the floor does not cover.)
 //
-// NOTHING HERE MUTATES ITS RECEIVER, and that is a module-wide rule rather than an
-// accident of which functions happened to be written first: VL lists are REFERENCE
-// types with no ownership discipline, so a mutating helper reorders or rewrites every
-// other binding that aliases the same list, silently and permanently. `sorted` is the
-// export where that rule cost the most to keep — see its block below.
+// EXACTLY ONE EXPORT MUTATES ITS RECEIVER — `sort`. Everything else leaves it alone
+// (the SEARCH family builds nothing at all; the BUILDING family returns a new list). That is
+// worth stating because the module briefly claimed the stronger rule ("nothing here
+// mutates"), and the stronger rule was wrong on its own terms: it was a description of
+// nine transformers, not a principle. `sort`'s block below has the argument. What the
+// rule DOES still buy is that mutation is visible in the name: VL lists are REFERENCE
+// types with no ownership discipline, so a mutating helper reorders every other binding
+// that aliases the same list — and the only export that does it is the one whose name
+// is the bare imperative verb.
 //
 // HOW FAR THE GENERIC SURFACE REACHES — three answers, and only one of them is an
 // honest error. Every export here is `<T>` over a `T[]`, and each element type below
@@ -40,7 +46,7 @@
 //   A LITERAL-UNION ELEMENT is WORSE, and this is the one to know about, because it
 //   is not an error at all. `reverse` and `concat` — whose signatures mention nothing
 //   but `T` and `T[]` — handle a `("a" | "b")[]` correctly. Every export that takes a
-//   CLOSURE over `T` (`sorted`, `reduce`, `mapIndexed`) or compares `T` with `==`
+//   CLOSURE over `T` (`sort`, `sorted`, `reduce`, `mapIndexed`) or compares `T` with `==`
 //   (`indexOf`, `lastIndexOf`, `includes`, `count`) emits an INVALID WASM MODULE:
 //   `vl check` exits 0, `vl build` writes the file, and only instantiation fails
 //   ("type mismatch: expected (ref $type), found i32"). A NUMERIC literal union
@@ -114,6 +120,8 @@ export function reduce<T, A>(self: T[], f: (A, T) => A, init: A): A {
 }
 
 // ── The BUILDING family — each returns a NEW list, leaving its inputs unmutated. ──
+// (`sorted` is a fourth member and lives with `sort` at the bottom of the file, so the
+// ordering pair reads together.)
 
 // `self`'s elements in reverse order.
 export function reverse<T>(self: T[]): T[] {
@@ -156,114 +164,216 @@ export function mapIndexed<T, U>(self: T[], f: (T, i32) => U): U[] {
   return out
 }
 
-// ── `sorted` — the ORDERING member of the BUILDING family ──────────────────────
+// ── The ORDERING pair — `sort` in place, `sorted` as a copy ────────────────────
 //
-// The contract, then the four decisions behind it. std is version-locked to the
-// compiler and has NO deprecation story, so each of these is close to permanent and
-// each was made against a measurement or against an existing convention.
+// Two exports, one algorithm, and four decisions. std is version-locked to the
+// compiler and has no deprecation story, so each of these is close to permanent.
+//
+//   sort<T>(self: T[], less: (T, T) => boolean)          // reorders self, returns nothing
+//   sorted<T>(self: T[], less: (T, T) => boolean): T[]   // leaves self alone, returns a new list
+//
+// CONTRACT, both. Ascending under `less`. STABLE (equal elements keep their input
+// order). O(n log n) comparisons in the WORST case — a bottom-up merge over runs an
+// insertion sort has already ordered. Allocation is the one place the two differ, and it
+// differs on BOTH sides of the base case: `sort` allocates NOTHING for n <= 16 and one
+// n-element auxiliary above it, while `sorted` allocates the returned list always and
+// the same auxiliary only above it — so 0 vs n below the threshold, and n vs 2n above.
 //
 // WHY THIS IS IN STD, by clause. `std-design.md` D1's admission principle has two
-// halves, and this one lands on the FIRST: "(a) what the LANGUAGE story needs to be
-// complete without third parties", which names collections outright — seconded by
-// `perf-workstream.md` §6.2, which calls a sort "the clearest gap" and `std:array`
-// "the right home". It is NOT admitted by the consumer clause, and that distinction
-// is load-bearing: `compiler/`'s four hand-written sorts CANNOT migrate onto it,
-// because D1 also rules that the compiler does not import std in Phase 2 (a program
-// that imports nothing must compile byte-identically to today). So `sorted` ships
-// with no in-tree caller, and the four compiler sorts appear below as evidence about
-// SHAPE, never as consumers.
+// halves and this lands on the FIRST: "(a) what the LANGUAGE story needs to be complete
+// without third parties", which names collections outright — seconded by
+// `perf-workstream.md` §6.2, which calls a sort "the clearest gap" and `std:array` "the
+// right home". It is NOT admitted by the consumer clause: nothing in the tree imports
+// it, because the compiler imports zero std modules today.
 //
-// CONTRACT. `xs.sorted(less)` is a NEW list holding `xs`'s elements in ascending
-// order under `less`. It is STABLE (equal elements keep their input order) and costs
-// O(n log n) comparisons in the WORST case — a bottom-up merge sort over runs that an
-// insertion sort has already ordered. It allocates n element slots for n <= 16 and 2n
-// above that (the returned list, plus one auxiliary buffer once the merge runs at
-// all); the second buffer is a real cost and it is not avoidable in a stable merge.
+// AND THAT LAST FACT IS A CHOICE, NOT A LAW — this module previously said otherwise, and
+// the correction matters here only for what it forbids as an ARGUMENT. D1's bar rested
+// on a seed assembly that concatenated `compiler/*.vl` with import lines range-blanked;
+// that assembly is gone, and a compiler module importing `std:array` was measured to
+// build and work, at a real seed cost and one unmeasured fixpoint risk. The full note,
+// with the quotes and the numbers, is in `std-design.md` D1 (2026-08-23) and
+// `perf-workstream.md` §6.0 — the right venue for a bootstrap ruling.
 //
-// 1. RETURNS A NEW LIST — it does NOT sort in place. `reverse` is the exact
-//    structural analogue (a permutation of the receiver) and it builds; the emitter's
-//    own transform primitives `map`/`filter`/`slice` all build; no export in this
-//    module mutates. The alternative was real: all FOUR of the hand-written insertion
-//    sorts in `compiler/` (`format.fmtSortNames`, `cli.cliStableSort`,
-//    `cli.cliSortFiles`, and the edit-order sort in `cli`'s lint-fix path) sort in
-//    place, so an in-place export would have dropped into them with no rebinding. It
-//    lost on two counts. (a) The aliasing hazard above — a permanent library name is
-//    the worst possible place to put JS's `xs.sort()` footgun. (b) The copy it saves
-//    is not the allocation that decides anything: a stable merge needs an n-element
-//    auxiliary buffer either way, so in place costs n and returning costs 2n. Both
-//    are O(n), and the copy is O(n) against O(n log n) comparisons through an
-//    indirect call. The name is the past participle so that the mistake the shape
-//    invites — `xs.sorted(less)` written as a bare statement, expecting mutation —
-//    is one the name argues against.
+// What it means for the pair below: it is NOT defended by "the compiler could never call
+// it". It is defended on its own merits, and the compiler's four in-place sorts are cited
+// as evidence about SHAPE — never as consumers, and never as impossible consumers.
 //
-//    ONE MORE THING THE COPY BUYS, free: `sorted` copies `self` and reads `n` BEFORE
-//    it calls `less` even once, so a comparator that mutates the receiver mid-sort
-//    cannot corrupt the sort either — the working buffer and its length are already
-//    fixed. An in-place variant would have had to defend against that separately, or
-//    document it as undefined.
+// 1. BOTH SPELLINGS SHIP, and in place is the primary. The first draft of this module
+//    shipped only `sorted`, on the argument that every other `std:array` export builds.
+//    Three things beat it:
 //
-//    THE PARTICIPLE IS STD'S FIRST, and the deviation is deliberate. Every other
-//    building export across std is a bare verb — `reverse`, `concat`, `mapIndexed`,
-//    `trim`, `replace`, `split`, `join`, `repeat`, `padStart`, `toUpperAscii`,
-//    `encodeUtf8` — all of which return new values under verb names. Most of those
-//    are safe as bare verbs for a reason that does not extend here: they live on
-//    `string`, which is IMMUTABLE, so `s.trim()` could not have mutated even if it
-//    wanted to and no reader can be misled. On a MUTABLE list the verb is a claim. In
-//    hindsight
-//    `reverse` is the outlier rather than `sorted`: JS mutates in both, but a
-//    discarded `xs.reverse()` is merely useless while a discarded `xs.sort(less)`
-//    LOOKS like it worked, and VL emits no unused-result diagnostic at ANY severity
-//    (measured: `xs.sorted(lt)` as a bare statement is clean at `--severity info`),
-//    so the name is the only guard there is. `reverse` cannot be renamed — std has no
-//    deprecation story — so the module carries both spellings. The rule going forward
-//    is that a new BUILDING export whose verb also names a common in-place operation
+//    (a) IN PLACE IS THE CONVENTION, not the exception. Rust `slice::sort` (std ships no
+//        copying variant at all), Go `sort.Slice`, C++ `std::sort`, Java `Arrays.sort`
+//        are all in place; JS `.sort()` has always been in place and `toSorted()` is
+//        ES2023. Only Python ships both. Shipping ONLY the copy was the unusual choice.
+//    (b) THE COPY TAXES EXACTLY THE CALLERS THE ALGORITHM IS FOR. `sorted` is 2n against
+//        `sort`'s n above the base case, and n against ZERO below it. On the short lists
+//        this tree sorts that is a rounding error — but the whole reason this is
+//        O(n log n) rather than an insertion sort is the caller who sorts a million
+//        elements, and a copy-only
+//        surface hands that caller a doubling with no way to opt out. An API whose cost
+//        model fights its own justification is the wrong API.
+//
+//        THE WIN IS ALLOCATION, NOT TIME, and the numbers say so plainly (best-of-5,
+//        ns/sort, same harness as the SORT_RUN table): n=16 420 vs 469 (`sort` allocates
+//        nothing at all here, so this 10% is the whole allocation); n=1536 143,180 vs
+//        142,714 — a tie, because `sort`'s copy-home and `sorted`'s extra copy cancel;
+//        n=65,536 9,078,350 vs 9,195,883, 1.3%. Anyone reaching for `sort` to go faster
+//        is reaching for the wrong reason; reach for it to halve the footprint.
+//    (c) "NO STD EXPORT MUTATES THROUGH `self`" WAS THINNER THAN IT READ. It was really
+//        "`std:array`'s nine exports are all transformers so far" — and `std:buffer`
+//        already has ELEVEN `self`-first exports that mutate through the receiver
+//        (`storeI32/I64/F32/F64`, `store8`, `store16`, `fill`, `setF32`, `setI32`, and
+//        both `"[]="` operators), while `std:test` mutates module globals. Counted, not
+//        estimated. So the rule was not thin — it was false outside this module, and
+//        true inside it only because nothing had needed to mutate yet.
+//
+//    THE PAIR IS PYTHON'S, AND JS'S `toSorted` WAS THE OTHER CANDIDATE. Recording why
+//    it lost, because #1856 is already on master and this is the last PR in which either
+//    name is free. `sort`/`toSorted` differ at the FIRST character and `sort`/`sorted` at
+//    the last two, so JS's pair is the more legible one — a real point against the choice
+//    made here. It loses on three others: `toSorted` reads as a CONVERSION (`toStr`,
+//    `toUpperAscii` in this very std turn a value into another type, and this does not);
+//    it is ES2023, the newest convention in the survey rather than the settled one; and
+//    every building export in std is a plain name, so a `to`-prefixed outlier would need
+//    its own rule. The mitigation for the two-character gap is that the DANGEROUS
+//    direction is a type error — see the void-return note below.
+//
+//    `reverse` IS A SHARPER PROBLEM THAN "WART" CONVEYS, and adding `sort` sharpened it:
+//    the module now TEACHES "bare imperative verb = mutates" by example, and `reverse` is
+//    a bare imperative verb that does not. In JS `Array.prototype.reverse()` DOES mutate
+//    (`toReversed()` is ES2023, the same batch as `toSorted`), so a JS-shaped reader
+//    writing `xs.reverse()` as a statement gets a silent no-op — measured: no diagnostic
+//    at any severity. It cannot be renamed; std has no deprecation story. The rule going
+//    forward is that a BUILDING export whose verb also names a common in-place operation
 //    takes the participle.
 //
-// 2. `less` IS A BOOLEAN STRICT LESS-THAN, not a three-way `(T, T) => i32`. A
-//    three-way composes better in the abstract; in this tree it composes with
-//    nothing. All four hand-written comparators are two-argument boolean predicates —
-//    two spelled `<` (`fmtNameLess`, `cliDiagLess`) and two spelled `>` with the
-//    arguments reversed (`cliStrGt`, and a bare `pos[order[b]] > pos[key]` that is not
-//    a named function at all); not one is three-way. That includes the MULTI-KEY one,
-//    which is the case three-way is usually argued for: `cli.cliDiagLess` orders
-//    diagnostics by line and then by column in three readable lines. Boolean also has no sign convention to get backwards, and it keeps the
-//    generic closure parameter on exactly the shape this module already ships and
-//    tests (`reduce`, `mapIndexed`) rather than on new ground — generics through
-//    closures have been a defect source (#1823, #1827).
+//    THE VOID RETURN IS LOAD-BEARING, and it is what makes the pair safe in the direction
+//    that matters. `const ys = xs.sort(less)` is a TYPE ERROR ("cannot bind the void
+//    result of 'ys' — a void function returns no value"), so a reader who expects `sort`
+//    to hand back the sorted list is stopped by the compiler. Had `sort` returned `self`
+//    for chaining, that mistake would compile and hide the mutation. The other direction
+//    has no such guard: a discarded `xs.sorted(less)` is clean at every severity, and the
+//    name is the only thing arguing against it.
 //
-//    `less` may close over anything, which makes SORTING AN INDEX LIST a first-class
-//    use rather than a workaround: `order.sorted((a, b) => line[a] < line[b])` is how
-//    two of the four in-tree sorts are already written, with the keys in parallel
-//    arrays the comparator reads.
+//    WHY `sorted` EARNS A SECOND PERMANENT NAME — the composability argument, which is
+//    the one that survives checking. `sort` is void, so there is NO expression-position
+//    spelling of "a sorted copy" without it: `xs.sorted(less)[0]` and
+//    `xs.sorted(less).indexOf(9)` have no `sort`-only equivalent, and rubric §3 rates a
+//    self-first export that returns something chainable above one that returns a status.
+//    That, and not the shield below, is why the second name exists. (An earlier draft
+//    claimed the shield was the reason. It is not: `const out = xs.slice(0)` followed by
+//    `out.sort(less)` gets the IDENTICAL shield — verified, same 40/39/0/39 — because the
+//    shield is bought by the COPY, and `slice` is also a copy. What `sorted` adds there
+//    is only that the copy cannot be forgotten.)
+//
+//    A CONSEQUENCE OF THE COPY, which `xs.slice(0)` shares: a comparator that MUTATES
+//    THE RECEIVER mid-sort. `sorted` snapshots — it fills its
+//    working buffer and reads `n` before `less` is called even once — so such a
+//    comparator changes the receiver and cannot touch the result. `sort` has no shield,
+//    and the consequence is not merely a wrong answer:
+//
+//      A COMPARATOR THAT SHRINKS `self` MAKES `sort` TRAP. `n` is captured once, `pop()`
+//      is expressible, and an index below the captured `n` is then out of bounds. Pinned
+//      in `tests/cases/std/array-sort-comparator-pops-traps.vl`; the same comparator
+//      under `sorted` returns a correct sort of the ORIGINAL 40 elements while the
+//      receiver ends at 39 (`array-sort-inplace.vl`).
+//
+//      A comparator that GROWS `self` does not trap — the appended elements are simply
+//      outside the captured range and are left unsorted at the end.
+//
+//    This is a caller error either way and neither export defends against it, but only
+//    one of them turns it into a trap, and the header of a permanent API should say
+//    which. (An earlier draft of this paragraph asserted `sort` "cannot trap". It was
+//    wrong, and it was wrong because it reasoned about the captured bound instead of
+//    running it.)
+//
+// 2. `less` IS A BOOLEAN STRICT LESS-THAN, not a three-way `(T, T) => i32`. A three-way
+//    composes better in the abstract; in this tree it composes with nothing. All four
+//    hand-written comparators in `compiler/` are two-argument boolean predicates — two
+//    spelled `<` (`fmtNameLess`, `cliDiagLess`) and two spelled `>` with the arguments
+//    reversed (`cliStrGt`, and a bare `pos[order[b]] > pos[key]` that is not a named
+//    function at all); not one is three-way. That includes the MULTI-KEY one, which is
+//    the case three-way is usually argued for: `cli.cliDiagLess` orders diagnostics by
+//    line and then by column in three readable lines. Boolean also has no sign
+//    convention to get backwards, and it keeps the generic closure parameter on exactly
+//    the shape this module already ships and tests (`reduce`, `mapIndexed`) rather than
+//    on new ground — generics through closures have been a defect source (#1823, #1827),
+//    and decision 5 below is this change's own contribution to that list.
+//
+//    `less` may close over anything, which makes SORTING AN INDEX LIST a first-class use
+//    rather than a workaround: `order.sort((a, b) => line[a] < line[b])` is how two of
+//    the four in-tree sorts are already written, with the keys in parallel arrays the
+//    comparator reads.
 //
 // 3. `less` MUST BE A STRICT ORDER — `less(a, a)` false, and `less(a, b)` and
 //    `less(b, a)` never both true. An INCONSISTENT `less` is NOT undefined behaviour
-//    here, and that is a guarantee rather than an implementation detail: the result
-//    is an unspecified ORDER, but it is always a PERMUTATION of the input. No element
-//    is lost, duplicated or invented, and it never traps or reads out of bounds. Both
-//    loops are bounded by INDICES rather than by the comparator (`j >= lo`, and
-//    `p < mid && q < e` with unconditional drains after it), which is what buys that;
-//    a sentinel-style `while less(...)` walk would run off the end instead.
+//    here, and that is a guarantee rather than an implementation detail: the result is
+//    an unspecified ORDER, but it is always a PERMUTATION of the input. No element is
+//    lost, duplicated or invented, and — for a comparator that merely ANSWERS wrongly —
+//    it never traps or reads out of bounds. Both loops
+//    are bounded by INDICES rather than by the comparator (`j >= lo`, and
+//    `p < mid && q < e` with unconditional drains after it), which is what buys that; a
+//    sentinel-style `while less(...)` walk would run off the end instead.
+//
+//    READ THAT AS SCOPED TO WHAT `less` ANSWERS, not to what it does. It covers a
+//    comparator that returns the wrong booleans, however wrongly. It does NOT cover a
+//    comparator that MUTATES the receiver, which is a different failure with a different
+//    outcome — under `sort`, shrinking `self` traps. See decision 1's last paragraph;
+//    the index bounds that make a lying comparator safe are the same bounds a shrinking
+//    one invalidates.
 //
 // 4. NOT DONE, DELIBERATELY. No `sortUnstable` — Rust and Go both split the API, but
-//    that is a second name doing almost the same thing, every in-tree caller needs
-//    the stable one (`cli.vl` orders error-tier diagnostics before lint-tier ones at
-//    the same position by relying on it), and adding a name later is possible while
-//    removing one is not. No `sortedBy(keyOf)` — it is `sorted` with a two-line
-//    comparator and a second way to spell the same thing. No default ordering
-//    (`xs.sorted()`): `<` is defined for the scalars and for `string` but not for a
-//    struct or a union, so a defaulted overload would type-check for some `T` and not
-//    others, and VL has no overloading to express that. No `binarySearch` / `lowerBound`
-//    — that one is a STANDING RULING rather than a judgement made here:
-//    `perf-workstream.md` §6.2 says *"Zero occurrences in the tree, no consumer. The
-//    admission principle excludes it by name"*, and a sorted list existing does not
-//    change that. No adaptivity: an
-//    already-sorted input is NOT detected and still pays every merge pass; the run
-//    detection that would fix it is the bulk of Timsort's machinery and no measured
-//    consumer wants it.
-
-// WHERE SORT_RUN = 16 COMES FROM — it is the insertion-sort run length of `sorted`'s
-// base case, declared inside the function below, and it is MEASURED rather than
+//    that is a second name doing almost the same thing, `cli.vl` needs the stable one
+//    (it orders error-tier diagnostics before lint-tier ones at the same position by
+//    relying on it), and adding a name later is possible while removing one is not. No
+//    `sortedBy(keyOf)` / `sortBy(keyOf)` — each is `sort` with a two-line comparator and
+//    a second way to spell the same thing. No default ordering (`xs.sort()`): `<` is
+//    defined for the scalars and for `string` but not for a struct or a union ("comparison
+//    expects numeric operands, got P and P"), so a defaulted overload would type-check
+//    for some `T` and not others, and VL has no overloading to express that. No
+//    `binarySearch` / `lowerBound` — a STANDING RULING rather than a judgement made here:
+//    `perf-workstream.md` §6.2 says "Zero occurrences in the tree, no consumer. The
+//    admission principle excludes it by name", and a sorted list existing does not change
+//    that. No adaptivity: an already-sorted input is NOT detected and still pays every
+//    merge pass; the run detection that would fix it is the bulk of Timsort's machinery
+//    and no measured consumer wants it.
+//
+// 5. THE TWO BODIES ARE DUPLICATED, AND THAT IS A COMPILER LIMITATION, NOT A CHOICE.
+//    `sorted` should be four lines — copy, `sort(out, less)`, return — and it cannot be,
+//    because A GENERIC FUNCTION CANNOT PASS ITS OWN GENERIC-TYPED FUNCTION PARAMETER TO
+//    ANOTHER GENERIC FUNCTION. Minimal repro, no std involved:
+//
+//      function inner<T>(xs: T[], f: (T, T) => boolean) { f(xs[0], xs[1]) }
+//      function outer<T>(xs: T[], f: (T, T) => boolean) { inner(xs, f) }   // <- refused
+//      // emitProgram: monomorphize: unsupported argument type for `f` in a call to `inner`
+//
+//    Four spellings were tried and all four fail: the direct call, the UFCS call
+//    (`xs.inner(f)`, "unsupported member-call statement"), forwarding through a local
+//    binding, and re-wrapping in a fresh lambda (`(a: T, b: T) => f(a, b)`, "only i32,
+//    i64, f64, f32, boolean, struct, union, array, or string parameters are supported").
+//    A generic->generic call with a plain `T[]` argument works, and a NON-generic caller
+//    forwarding a concrete closure into a generic function works — it is specifically the
+//    generic-to-generic FUNCTION-VALUE hop that has no lowering. Pinned in
+//    `tests/cases/std/error-generic-closure-forward.vl`.
+//
+//    THE GATE COVERS ORDER, NOT COST — worth stating precisely, because the gate is the
+//    whole defence. Set `sort`'s SORT_RUN to 32 and leave `sorted`'s at 16 and every
+//    assertion in the fixture still passes, while the CONTRACT's "allocates NOTHING for
+//    n <= 16" quietly becomes false. Allocation is not observable from VL, so no fixture
+//    can close that gap; the two constants have to be read together by hand.
+//
+//    THE MITIGATION IS A GATE, NOT A PROMISE. `tests/cases/std/array-sort-agrees.vl`
+//    sorts every length from 0 to 200 through BOTH exports and fails if they ever
+//    disagree by one element, so drift between the copies is caught by the corpus rather
+//    than by a reader. WHEN THE COMPILER GROWS THIS, collapse `sorted` to copy + `sort` +
+//    return; it is a pure refactor with no API change, and that fixture is what makes it
+//    safe to do.
+// WHERE SORT_RUN = 16 COMES FROM — it is the insertion-sort run length of the
+// ORDERING pair's base case, declared inside `sort` below. IT WAS SWEPT ON `sorted`, when
+// that was the only export; `sort` shares the constant and differs only by not making the
+// leading copy, so the sweep transfers except at the base-case cliff itself (below n = 17
+// `sort` allocates nothing where `sorted` allocates n). It is MEASURED rather than
 // folklore: best-of-5 (minimum) WALL time per sort of a fresh MINSTD-seeded `i32[]`,
 // comparator reached through an indirect call, native host, `RUN` swept at fixed n
 // (ns/sort). `perf-workstream.md` §8.1 mandates user CPU (`%U`) and NEVER wall clock,
@@ -299,70 +409,176 @@ export function mapIndexed<T, U>(self: T[], f: (T, i32) => U): U[] {
 // The other direction — what the generality costs a SHORT list, which is the only
 // length the tree itself ever sorts — is nothing. Against a plain stable insertion
 // sort (best-of-3): at n=16 both measure 0.448 us; at n=8, 0.176 vs 0.168 us (the one
-// extra copy); at n=32, 1.328 vs 1.360 us. The crossover sits between n=32 (a tie) and
-// n=64 (3.104 vs 5.792 us, 1.9x), and by n=1024 `sorted` is 90.5 us against insertion
+// extra copy the MEASURED variant made — `sort` does not make it at all); at n=32,
+// 1.328 vs 1.360 us. The crossover sits between n=32 (a tie) and
+// n=64 (3.104 vs 5.792 us, 1.9x), and by n=1024 the merge is 90.5 us against insertion
 // sort's 1014.5 us — 11.2x, and 10,583 comparisons against 258,411.
 
-// `self`'s elements in ascending order under `less`, as a NEW list. STABLE;
-// O(n log n) comparisons worst case; allocates n element slots up to n = 16 and 2n
-// above that. See the block above for the contract `less` must satisfy and for what
-// happens when it does not.
-export function sorted<T>(self: T[], less: (T, T) => boolean): T[] {
+// Reorder `self` IN PLACE, ascending under `less`. STABLE; O(n log n) comparisons worst
+// case; allocates nothing up to n = 16 and one n-element buffer above that. Returns
+// nothing — the receiver IS the result. See the block above for the contract `less` must
+// satisfy and for what happens when it does not.
+export function sort<T>(self: T[], less: (T, T) => boolean) {
   // SORT_RUN lives INSIDE the function rather than beside the module header because a
   // module-level const is emitted as a wasm global whether or not anything imports the
-  // export that reads it: measured, a program importing only `indexOf` is 1,982 bytes
-  // on master, 1,999 with a module-level `SORT_RUN`, and 1,991 with it here. 8 bytes
-  // is small, but it is 8 bytes charged to callers who never sort, and the run length
-  // is not a tuning knob anyone outside this function can reach. No timing difference:
-  // 4,000 sorts of a 1,536-element `i32[]` measure 597.4 ms and 598.8 ms the two ways.
+  // export that reads it. THE DELTA IS 8 BYTES, and the probe is this whole program:
+  //
+  //   import { indexOf } from "std:array"
+  //   print([1, 2, 3].indexOf(2))
+  //
+  // built with `vl build`, module-level `SORT_RUN` against function-local. Absolute sizes
+  // are deliberately NOT quoted — they move with every unrelated std edit, and an earlier
+  // draft of this comment quoted three that no longer reproduce. The delta is what the
+  // argument uses. 8 bytes is small, but it is 8 bytes charged to callers who never sort,
+  // and the run length is not a knob anyone outside this function can reach.
   const SORT_RUN = 16
   const n = self.length
-  // The copy IS the working array — `sorted` builds, so there is no in-place variant
-  // paying for this separately.
-  const a: T[] = []
+  // A 0- or 1-element list is already sorted, and saying so by NESTING rather than with
+  // an early `return` is forced: VL's emitter rejects a bare `return` in a void function
+  // (the same shape `std:buffer.fill` uses).
+  if n >= 2 {
+    // Base case: insertion-sort each block of SORT_RUN in place. `less(key, self[j])`
+    // and not `!less(self[j], key)` is what makes this half STABLE — an element stops as
+    // soon as its left neighbour is not strictly greater, so equals never cross.
+    let lo = 0
+    while lo < n {
+      let hi = lo + SORT_RUN
+      if hi > n { hi = n }
+      let k = lo + 1
+      while k < hi {
+        const key = self[k]
+        let j = k - 1
+        while j >= lo && less(key, self[j]) {
+          self[j + 1] = self[j]
+          j = j - 1
+        }
+        self[j + 1] = key
+        k = k + 1
+      }
+      lo = lo + SORT_RUN
+    }
+    // A list that fits in one run is done. Skipping here is what makes `sort` allocate
+    // NOTHING at the lengths this tree actually sorts — the whole n-vs-2n difference
+    // between `sort` and `sorted` is n-vs-0 below n = 17.
+    if n > SORT_RUN {
+      const aux: T[] = []
+      let z = 0
+      while z < n {
+        aux.push(self[z])
+        z = z + 1
+      }
+      // Bottom-up merge, ping-ponging between `self` and `aux` so no pass copies back.
+      // `srcIsSelf` is a parity BIT and not a comparison, because `==` on two lists is
+      // not reference identity in VL and would answer a different question.
+      let src = self
+      let dst = aux
+      let srcIsSelf = true
+      let width = SORT_RUN
+      while width < n {
+        let s = 0
+        while s < n {
+          let mid = s + width
+          if mid > n { mid = n }
+          let e = mid + width
+          if e > n { e = n }
+          let p = s
+          let q = mid
+          let o = s
+          // STABLE: the right half wins only when it is STRICTLY less, so on a tie the
+          // left (earlier) element goes first.
+          while p < mid && q < e {
+            if less(src[q], src[p]) {
+              dst[o] = src[q]
+              q = q + 1
+            } else {
+              dst[o] = src[p]
+              p = p + 1
+            }
+            o = o + 1
+          }
+          // Unconditional drains — index-bounded, so a comparator that lies still yields
+          // a permutation rather than a trap.
+          while p < mid {
+            dst[o] = src[p]
+            p = p + 1
+            o = o + 1
+          }
+          while q < e {
+            dst[o] = src[q]
+            q = q + 1
+            o = o + 1
+          }
+          s = e
+        }
+        const tmp = src
+        src = dst
+        dst = tmp
+        srcIsSelf = !srcIsSelf
+        width = width + width
+      }
+      // An ODD number of merge passes leaves the answer in `aux`; copy it home. This is
+      // the one cost `sort` pays that `sorted` does not, it is n writes against the
+      // merge's n log n, and it is skipped outright whenever the pass count is even.
+      if !srcIsSelf {
+        let i = 0
+        while i < n {
+          self[i] = src[i]
+          i = i + 1
+        }
+      }
+    }
+  }
+}
+
+// `self`'s elements in ascending order under `less`, as a NEW list, leaving `self`
+// untouched. STABLE; O(n log n) comparisons worst case; allocates the returned list
+// always and one auxiliary only above n = 16 — so n below the threshold and 2n above,
+// against `sort`'s 0 and n.
+//
+// THIS BODY IS `sort`'s, COPIED. It should read `const out = …copy…; sort(out, less);
+// return out` and cannot — see decision 5 above for the repro and
+// `tests/cases/std/array-sort-agrees.vl` for the differential fixture that keeps the two
+// copies honest. The only intended differences are the leading copy, and the tail:
+// `sorted` RETURNS whichever buffer holds the answer, so it never pays `sort`'s
+// copy-home.
+export function sorted<T>(self: T[], less: (T, T) => boolean): T[] {
+  const SORT_RUN = 16
+  const n = self.length
+  const out: T[] = []
   let c = 0
   while c < n {
-    a.push(self[c])
+    out.push(self[c])
     c = c + 1
   }
-  if n < 2 { return a }
+  if n < 2 { return out }
 
-  // Base case: insertion-sort each block of SORT_RUN in place on the copy. `less(key,
-  // a[j])` and not `!less(a[j], key)` is what makes this half STABLE — an element
-  // stops as soon as its left neighbour is not strictly greater, so equals never
-  // cross.
   let lo = 0
   while lo < n {
     let hi = lo + SORT_RUN
     if hi > n { hi = n }
     let k = lo + 1
     while k < hi {
-      const key = a[k]
+      const key = out[k]
       let j = k - 1
-      while j >= lo && less(key, a[j]) {
-        a[j + 1] = a[j]
+      while j >= lo && less(key, out[j]) {
+        out[j + 1] = out[j]
         j = j - 1
       }
-      a[j + 1] = key
+      out[j + 1] = key
       k = k + 1
     }
     lo = lo + SORT_RUN
   }
-  // A list that fits in one run is already done, and skipping here is what keeps the
-  // auxiliary buffer unallocated for the short lists that dominate real use.
-  if n <= SORT_RUN { return a }
+  if n <= SORT_RUN { return out }
 
-  // Bottom-up merge, ping-ponging between two buffers so no pass copies back. `src`
-  // and `dst` swap each doubling; whichever holds the result at the end IS the answer
-  // (both are freshly built here, so returning either is safe).
-  const b: T[] = []
+  const aux: T[] = []
   let z = 0
   while z < n {
-    b.push(a[z])
+    aux.push(out[z])
     z = z + 1
   }
-  let src = a
-  let dst = b
+  let src = out
+  let dst = aux
   let width = SORT_RUN
   while width < n {
     let s = 0
@@ -374,8 +590,6 @@ export function sorted<T>(self: T[], less: (T, T) => boolean): T[] {
       let p = s
       let q = mid
       let o = s
-      // STABLE: the right half wins only when it is STRICTLY less, so on a tie the
-      // left (earlier) element goes first.
       while p < mid && q < e {
         if less(src[q], src[p]) {
           dst[o] = src[q]
@@ -386,8 +600,6 @@ export function sorted<T>(self: T[], less: (T, T) => boolean): T[] {
         }
         o = o + 1
       }
-      // Unconditional drains — these are index-bounded, so a comparator that lies
-      // still yields a permutation rather than a trap.
       while p < mid {
         dst[o] = src[p]
         p = p + 1

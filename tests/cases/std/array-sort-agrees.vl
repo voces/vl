@@ -1,0 +1,163 @@
+// @run
+// @hint Intentionally-unused parameter `_x` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_y` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_x` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_y` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_x` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_y` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_x` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_y` (leading `_` marks it unused)
+// @log -1
+// @log true
+// @log true
+// THE ANTI-DRIFT GATE for `std:array`'s ordering pair.
+//
+// `sort` and `sorted` carry the SAME algorithm written out TWICE. That is not a style
+// choice — `sorted` should be `copy; sort(out, less); return out` and cannot be, because
+// a generic function cannot pass its own generic-typed function parameter to another
+// generic function (`error-generic-closure-forward.vl` pins the refusal). Until that
+// lands, two copies of a sixty-line merge exist in one module with no deprecation story,
+// and "keep them in agreement" is worth nothing as an instruction to a reader.
+//
+// So it is a gate instead. Every length from 0 to 200 goes through BOTH exports and the
+// results are compared ELEMENT FOR ELEMENT. Any divergence — a base-case boundary moved
+// in one copy, a tie rule flipped, a drain dropped, a copy-home forgotten — fails here,
+// on the shortest length that shows it.
+//
+// The lengths matter: 0..200 crosses SORT_RUN = 16 (base case only, below), the first
+// merge at 17, and the doublings at 33, 65 and 129, and it covers both merge PARITIES
+// (odd pass counts, where `sort` must copy the answer home out of its auxiliary buffer,
+// and even ones, where it must not). It also runs the degenerate lengths 0 and 1, which
+// take different early exits in the two bodies.
+//
+// Data is a MINSTD stream reduced mod 17 into [-8, 8], so collisions are dense and the
+// STABILITY paths are exercised on nearly every length rather than only on the crafted
+// inputs in `array-sorted-stability.vl`.
+import { count, sort, sorted } from "std:array"
+
+function ltI(a: i32, b: i32) { a < b }
+
+let seed = 12345
+function rnd(m: i32) {
+  seed = (seed * 75 + 74) % 65537
+  seed % m
+}
+
+// Four claims per length, all mechanical:
+//   1. `sorted` leaves its receiver byte-for-byte untouched;
+//   2. `sort` and `sorted` produce the same list, element for element;
+//   3. the result is ascending;
+//   4. the result is a permutation of the input (same multiset).
+// The whole sweep collapses to one boolean so a failure is a single flipped log line,
+// and the length that broke it is reported separately below.
+function sweep() {
+  let firstBad = -1
+  let n = 0
+  while n <= 200 {
+    const src: i32[] = []
+    let i = 0
+    while i < n {
+      src.push(rnd(17) - 8)
+      i = i + 1
+    }
+    // an independent copy for the in-place half
+    const mut: i32[] = []
+    i = 0
+    while i < n {
+      mut.push(src[i])
+      i = i + 1
+    }
+
+    const built = src.sorted(ltI)
+
+    let ok = true
+    // 1. `sorted` did not touch `src` — checked BEFORE `mut` is sorted, so `src` is
+    //    still the pristine input either way.
+    i = 0
+    while i < n {
+      if src[i] != mut[i] { ok = false }
+      i = i + 1
+    }
+
+    mut.sort(ltI)
+
+    // 2. the two agree
+    if mut.length != n { ok = false }
+    if built.length != n { ok = false }
+    i = 0
+    while i < n {
+      if mut[i] != built[i] { ok = false }
+      i = i + 1
+    }
+    // 3. ascending
+    i = 1
+    while i < n {
+      if mut[i - 1] > mut[i] { ok = false }
+      i = i + 1
+    }
+    // 4. a permutation of the input
+    i = 0
+    while i < n {
+      if src.count(src[i]) != mut.count(src[i]) { ok = false }
+      i = i + 1
+    }
+
+    if !ok && firstBad < 0 { firstBad = n }
+    n = n + 1
+  }
+  firstBad
+}
+
+// -1 means every length from 0 to 200 agreed. Any other number is the SHORTEST length
+// at which the two copies diverged, which is the first thing a debugger wants.
+print(sweep())
+
+// The same agreement over a comparator with NO discrimination at all. Both exports must
+// return the input order — and because a merge is a permutation regardless of what the
+// comparator says, this also pins that neither copy loses or duplicates an element when
+// `less` is degenerate.
+function flatAgrees() {
+  const a: i32[] = []
+  const b: i32[] = []
+  let i = 0
+  while i < 100 {
+    a.push(i)
+    b.push(i)
+    i = i + 1
+  }
+  const built = a.sorted((_x: i32, _y: i32) => false)
+  b.sort((_x: i32, _y: i32) => false)
+  let ok = true
+  i = 0
+  while i < 100 {
+    if built[i] != i { ok = false }
+    if b[i] != i { ok = false }
+    i = i + 1
+  }
+  ok
+}
+print(flatAgrees())
+
+// And over a comparator that is CONSTANTLY TRUE, the other degenerate end — the one that
+// makes every element want to travel to the front. Neither copy may trap, and the two
+// must still agree with each other.
+function trueAgrees() {
+  const a: i32[] = []
+  const b: i32[] = []
+  let i = 0
+  while i < 100 {
+    a.push((i * 31) % 100)
+    b.push((i * 31) % 100)
+    i = i + 1
+  }
+  const built = a.sorted((_x: i32, _y: i32) => true)
+  b.sort((_x: i32, _y: i32) => true)
+  let ok = built.length == 100 && b.length == 100
+  i = 0
+  while i < 100 {
+    if built[i] != b[i] { ok = false }
+    i = i + 1
+  }
+  ok
+}
+print(trueAgrees())
