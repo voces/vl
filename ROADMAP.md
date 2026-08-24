@@ -907,13 +907,18 @@ in-language GC knobs.
   checker's soundness floor (15 false-accept classes) is closed; new classes go straight to corpus
   + both checkers.
   THE `xfail-miscompile-` TIER (accepts, then emits invalid wasm) stands at **four** members here
-  plus one under `tests/cases/std/`, down from twelve: seven closed in one pass, an eighth right
-  after, and SEVEN of those eight were the same sentence — a ladder with an arm its sibling ladder
-  lacks (see `CHANGELOG.md`, Track B, and the enumeration in `tests/cases/soundness/README.vl`).
-  The eighth was the map one: `emitObj` seeds a nullable-map field's construct context under
-  `scode == 29` and the VARIANT-literal twin had no `vcode == 29` arm, so five shapes — not the
-  one its header named — rode the ambient mono STRING-keyed default.
-  What remains is attributed rather than merely listed: the `$fnsig` producer chain keyed on a
+  plus one under `tests/cases/std/`, down from twelve: seven closed in one pass (#1863), an eighth
+  right after (#1865) and a ninth beside it (#1866) — and EIGHT of those nine were the same
+  sentence, a ladder with an arm its sibling ladder lacks (see `CHANGELOG.md`, Track B, and the
+  enumeration in `tests/cases/soundness/README.vl`). The eighth was the map one: `emitObj` seeds a
+  nullable-map field's construct context under `scode == 29` and the VARIANT-literal twin had no
+  `vcode == 29` arm, so FIVE shapes — not the one its header named — rode the ambient mono
+  STRING-keyed default. The ninth, `numeric-litunion-empty-list-seed`, was the same sentence once
+  its "this needs a REP decision first" header was checked rather than believed: the rep was
+  already decided and already named (`numLitUnionBaseTy` — a numeric literal union reps as its
+  BASE SCALAR), so the pair closed together with the `xfail-false-reject-` file beside it.
+  **FOUR miscompile fixtures remain** (three of the twelve, plus the loud `totality-gate` one) and
+  TWO false rejects. What remains is attributed rather than merely listed: the `$fnsig` producer chain keyed on a
   rendered spelling (`narrowed-litunion-fn-value-arg` here + `array-litunion-element` in std — one
   question, and they need `cloParamTok` / `annSigKey` / `sigKeyOfTy` moved TOGETHER or nothing
   measures); the numeric literal-union family's missing REP decision
@@ -964,6 +969,42 @@ in-language GC knobs.
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/guide/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
+  > **THE NUMERIC LITERAL-UNION FAMILY IS RULED AND SHIPPED, AND IT WAS NEVER A16's.** `type K =
+  > 1.5 | 2.5` reps as its **BASE SCALAR** — `i32` / `i64` / `f64` — and membership is a value
+  > test. That is not a new decision: `numLitUnionBaseTy` has been its home, `tyKindOf`'s own
+  > literal arm states it verbatim, and `emit_rewrite`'s `$fnsig` pin reads it. A16's two open
+  > owner rulings (`open-rulings.md` §A16-tag-scheme, §A16-ref-i31) are about how to encode the
+  > interned **atom ID** of a STRING literal union inside a mixed union box; a numeric literal
+  > union has **no atom ID**, so there is nothing for either scheme to encode and nothing here
+  > waits on either ruling. Two filings had concluded the opposite —
+  > `xfail-false-reject-numeric-litunion-array-in-signature` re-attributed itself to A16 on
+  > 2026-08-23 ("it closes with A16's numeric-literal-union representation, not before"), and
+  > `xfail-miscompile-numeric-litunion-empty-list-seed` called it "a feature decision about that
+  > family, not a missing arm". **Both are wrong in the same way**: they inferred a missing rep
+  > from a missing ARM, because `tyIsLitUnion` demands `litKind == "str"` and every ladder they
+  > landed in was the string one.
+  >
+  > **MEASURED before choosing** (`cdf7940c`, 14 broken cells over a base × position grid, string
+  > column 0 broken): the numeric family is used — 71 alias declarations in 36 corpus files plus
+  > 37 inline annotations, and **0 in `compiler/` and 0 in `std/`** — and it already WORKED at
+  > every scalar position (a `K` param, return, const, struct field, `is` narrowing over
+  > `K | string`, arithmetic, a `K` value printed). Every broken cell was an ARRAY position, and
+  > the i32 base passed most of them **by accident** — the un-seeded list default IS the i32
+  > wrapper, so only f64 and i64 had a cell the default did not fit. Three ladders had the
+  > `TyPrim` element case and not the literal-union one (`nodeTyArrayElemRepName`,
+  > `tyAnnRefListKind`, `tyKindOf`'s `TyArray` leg), and a fourth site claimed a numeric litunion
+  > as an ATOM (`exprIsLitAtom`'s array-element arm, via `nodeTyIsPureLitUnion`, which tests only
+  > `is TyLit`) — invisible until a STRING litunion is declared in the same module, because every
+  > atom classifier sits behind the module-wide `gLitUnionUsed` that only the string family sets.
+  > Grid green afterwards, runtime output pinned. Pins:
+  > `tests/cases/soundness/numeric-litunion-{empty-list-seed,array-in-signature}.vl` and
+  > `tests/cases/literal-unions/numeric-and-string-litunion-in-one-module.vl`.
+  >
+  > What the numeric family still does NOT do, and it is a loud reject rather than a wrong
+  > answer: `x is K` over `K | f64` is refused (``emitProgram: `is` names a type that is not a
+  > union variant``) because both arms rep as the same f64 and the box collapses. That IS an A16
+  > question — it is the same discrimination problem the tag scheme exists for — but it is a
+  > REJECT, not a miscompile, and it is the only cell of the family that is.
   > **The MIXED-UNION half is DESIGNED AND FILED, not shipped** — `docs/internals/litunion-compact-rep-design.md`.
   > A standalone litunion and the four `ctxKeepsLitUnion` positions ALREADY rep as the interned
   > i32 atom; what does not is the member of a mixed box (`K | f64`), which stores a string ref.
