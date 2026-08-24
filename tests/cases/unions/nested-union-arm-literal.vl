@@ -1,0 +1,72 @@
+// AN OBJECT LITERAL INTO A UNION WHOSE MEMBER IS ITSELF A UNION —
+// `type Parsed = Shape | ParseError`, where `type Shape = Circle | Rect`. This is what the
+// error model produces the moment a program keeps a DOMAIN union and an error type apart and
+// joins them at one boundary.
+//
+// The ObjLit arm-pick walked `d.uMembers` and tested `mt is TyObj` per member, so a nested
+// union was skipped whole and no arm was found:
+//
+//     return type mismatch: expected Shape | ParseError, got {kind: string, r: f64}
+//
+// — naming a type whose own arm the literal is. The candidate list is now FLATTENED with the
+// existing `flattenVariantsInto` (the walk `joinTys` uses), so the arms offered are the set
+// every other consumer of a nested union already sees. Each candidate is still gated by
+// `unionArmBoxSafe` and still recorded as the CONCRETE arm, so no per-arm rule changes.
+//
+// THE EMITTER ALREADY HANDLED IT, which is what makes this one-sided: building at the ARM type
+// and widening (`const r: Rect = {…}` then `const x: Parsed = r`) lowered and ran before this,
+// so the variant registration reaches the nested arms. Only the literal's arm-PICK could not.
+//
+// GATED ON THE OUTER UNION BEING A DECLARED ALIAS, and the gate is the emitter's capability
+// rather than a taste. `collectU` registers a declared union's variants by resolving each
+// member NAME, so the nested arms land in its variant table. An INLINE `x: Shape | ParseError`
+// annotation registers through `registerInlineUnion`, which splits the SPELLING and sees
+// `Shape` as one atom `isStructAtom` rejects — its nested arms are absent.
+//
+// That inline shape is ALREADY BROKEN, with no literal and no arm-pick involved: measured on
+// master, `const r: Rect = {…}` then `const x: Shape | ParseError = r` fails to compile.
+// Offering arms for it here would turn its literal spelling from a clean type error into a
+// `wasm trap: cast failure` — a worse column for a shape that does not work either way. So the
+// gate keeps it at the type error (`nested-union-inline-reject.vl`) until the inline
+// registration flattens too.
+// @run
+// @log 3
+// @log bad
+// @log 5
+// @log unknown
+// @log 9
+
+type Circle     = { kind: "circle", r: f64 }
+type Rect       = { kind: "rect", w: f64, h: f64 }
+type ParseError = { why: string }
+type Shape      = Circle | Rect
+type Parsed     = Shape | ParseError
+
+// a literal straight into the nested union, on both sides of the nesting
+const x: Parsed = { kind: "rect", w: 3.0, h: 1.0 }
+if x is Rect { print(x.w) } else { print("no") }      // 3
+const e: Parsed = { why: "bad" }
+if e is ParseError { print(e.why) } else { print("no") }  // bad
+
+// RETURN position, which is where a fallible function actually writes it
+function parse(t: string, a: f64): Parsed {
+  if t == "rect" { return { kind: "rect", w: a, h: 1.0 } }
+  return { why: "unknown" }
+}
+const p = parse("rect", 5.0)
+if p is Rect { print(p.w) } else { print("no") }      // 5
+const q = parse("hex", 1.0)
+if q is ParseError { print(q.why) } else { print("no") }  // unknown
+
+// and it composes with the `as` cast's sub-union target: `Parsed` narrows to `Shape`,
+// `ParseError` propagates, and the domain function never sees an error type
+function area(s: Shape) {
+  if s.kind == "circle" { return 3.14159 * s.r * s.r }
+  return s.w * s.h
+}
+function areaOf(t: string, a: f64): f64 | ParseError {
+  const s = parse(t, a) as Shape
+  return area(s)
+}
+const r = areaOf("rect", 9.0)
+if r is f64 { print(r) } else { print(r.why) }        // 9

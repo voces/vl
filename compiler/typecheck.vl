@@ -7098,7 +7098,49 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         // member) reach that same rep. Record the concrete arm on the literal node so the
         // shape interner / field encoder sees the arm's field types, not the inferred ones.
         if d is TyUnion {
-          const members = d.uMembers
+          // FLATTENED, because a union member may itself be a union. `type Shape = Circle |
+          // Rect` used as an arm of `Shape | ParseError` leaves a `TyUnion` in `uMembers`, and
+          // the `mt is TyObj` test below skipped it — so an object literal flowing into
+          // `Shape | ParseError` found NO arm and reported `expected Shape | ParseError, got
+          // {kind: string, r: f64}`, naming a type whose own arm it was.
+          //
+          // Nesting is how a program keeps a DOMAIN union and an error type apart and joins
+          // them at one boundary, which is the shape the error model produces the moment a
+          // fallible function returns a union.
+          //
+          // THE EMITTER ALREADY HANDLES IT, which is what makes this a one-sided fix: building
+          // at the ARM type and widening (`const r: Rect = {…}` then `const x: Parsed = r`)
+          // lowers and runs today, so the variant registration reaches the nested arms. Only
+          // the literal's arm-PICK could not see them.
+          //
+          // `flattenVariantsInto` is the existing walk (`joinTys` uses it), so the candidate
+          // list is the same set every other consumer of a nested union sees. Each candidate
+          // is still gated by `unionArmBoxSafe` and still recorded as the CONCRETE arm, so
+          // nothing about the per-arm rules changes — only which arms are offered.
+          // GATED ON THE OUTER UNION BEING A DECLARED ALIAS, and that gate is the emitter's
+          // capability, not a taste. A declared `type Parsed = Shape | ParseError` registers
+          // its variants through `collectU`, which resolves each member name — so the nested
+          // arms are in its variant table and the arm this pick records is one the emitter can
+          // tag. An INLINE `x: Shape | ParseError` annotation registers through
+          // `registerInlineUnion` instead, which splits the SPELLING and sees `Shape` as one
+          // atom that `isStructAtom` rejects; its nested arms are therefore absent.
+          //
+          // That inline shape is ALREADY BROKEN on master, with no literal and no arm-pick
+          // involved: `const r: Rect = {…}` then `const x: Shape | ParseError = r` fails to
+          // compile. Offering the arms here would turn its LITERAL spelling from a clean type
+          // error into a `wasm trap: cast failure`, which is a worse column for a shape that
+          // does not work either way — so the gate keeps it at the type error until the inline
+          // registration flattens too.
+          const members: i32[] = []
+          if cTyIxSetHas(cUnionTyIxSet, dstTy) {
+            flattenVariantsInto(dstTy, members)
+          } else {
+            let dm = 0
+            while dm < d.uMembers.length {
+              members.push(d.uMembers[dm])
+              dm = dm + 1
+            }
+          }
           let mi = 0
           while mi < members.length {
             const mt = T.tys[members[mi]]
