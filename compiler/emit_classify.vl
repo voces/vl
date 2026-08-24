@@ -13519,6 +13519,18 @@ export function globalCellKind(letIx: i32): VKind {
       // STRING-ref cell while the read side classified the niche i32 — INVALID-WASM
       // (fuzz post-#1000 sweep plain leg, `K0 | null` p3r).
       if nodeTyIsNulLitUnion(d.letType) { return "i32" }
+      // A CONCRETE union-VARIANT global (`const g: Cat = {…}`), kind 8 — the bare variant
+      // struct ref `(ref $(uVarHeap[vi]))`. BEFORE `letIsUnion`/`letIsStruct`, exactly where
+      // `buildLocals` puts its own `letIsVariant` rung: a variant name is neither the union
+      // box nor a standalone struct, and `collectS` deliberately keeps a variant's `TypeDecl`
+      // out of the struct table (the variant table owns it), so falling to `letIsStruct` left
+      // `globalCellStructIdx` answering -1 and tripped `fbValtypeNullable`'s bounds guard —
+      // `ref valtype with no interned shape`, the floor `variant-annotated-global-floor.vl`
+      // pinned. #1803 grew the UN-ANNOTATED half of this ladder (`globalKind`'s variant arm,
+      // the variant leg of `globalCellStructIdx`, `fbRefNullForKind`'s `uVarHeap` zero-init
+      // and `exprVariantIndex`'s module-global leg); this is the annotated half it named as
+      // the remaining one, and it reuses all four.
+      if letAnnVariantIdx(letIx) >= 0 { return "variant" }
       if letIsUnion(letIx, -1) { return "union" }
       if letIsStringArray(letIx, -1) { return "strlist" }
       if letIsRefArray(letIx, -1) { return "reflist" }
@@ -13589,7 +13601,16 @@ export function globalCellKind(letIx: i32): VKind {
 export function globalCellStructIdx(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if globalHasTypeAnn(letIx) { return structIndexOfLet(letIx, -1) }
+    if globalHasTypeAnn(letIx) {
+      // The ANNOTATED twin of the variant leg below: a kind-8 cell's slot is the VARIANT
+      // index, and the annotation names it directly. Asked BEFORE `structIndexOfLet`, which
+      // answers -1 for a variant by construction (the struct table does not hold one) and
+      // whose -1 is what tripped the bounds guard this pairs with `globalCellKind`'s new
+      // variant rung to close.
+      const avi = letAnnVariantIdx(letIx)
+      if avi >= 0 { return avi }
+      return structIndexOfLet(letIx, -1)
+    }
     // A kind-8 VARIANT cell's slot is the VARIANT index, not a struct row — paired with
     // `globalKind`'s variant arm, which decides the kind this slot is read beside.
     const gvi = exprVariantIndex(d.letInit, -1)
