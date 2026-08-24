@@ -1,0 +1,95 @@
+// THE DISCRIMINATED UNION, SPELLED THE WAY IT IS SPELLED EVERYWHERE ELSE:
+//
+//     type C = { kind: "circle", r: f64 }
+//     type R = { kind: "rect", w: f64 }
+//     function area(s: C | R) {
+//       if s.kind == "circle" { return s.r }
+//       return 0.0
+//     }
+//
+// The `is` spelling of this landed first, and it carries a hidden cost: `is` tests against a
+// NAME, so the tag must be given one (`type KC = "circle"`) before it can be tested. Nobody
+// writes that from memory. `==` against the literal needs no declaration at all, and it is
+// the form every other typed language uses for this idiom.
+//
+// ONE RULE, TWO SPELLINGS. Both are the discriminant: a test on a struct union's FIELD
+// refines the union. They differ only in how the checker arrives at the surviving type, so
+// the emitter reads ONE banked answer (`isParentTyIx`, keyed on the condition node) through
+// one shared `pushDiscrimNarrow`, and the `is` arm was rewritten to call it too.
+//
+// Only the PARENT is narrowed, not the tested field. Pinning `s.kind` to a bare `TyLit` would
+// put a literal type where the field's own rep — an interned atom, or a plain string — is
+// what every consumer reads, and the parent narrowing is the entire value of the test. The
+// equality itself already type-checks on its own.
+//
+// THE LITERAL MUST BE SYNTACTIC. Comparing against a VARIABLE that merely happens to hold
+// `"circle"` proves nothing about the place, so it does not narrow — pinned below, where the
+// read stays the loud `field 'r' is not on every member`. Both operand orders DO narrow:
+// `"circle" == s.kind` is the same fact written backwards.
+//
+// `litTyOfExpr` answers both halves of the match — "is the other operand a literal" and
+// "which literal" — so the two questions cannot disagree about what counts as one. It also
+// owns the QUOTE STRIP, which a second reader would have had to duplicate and which the first
+// draft of this got wrong (it keyed on the raw lexeme, quotes included).
+// @run
+// @log 3
+// @log 0
+// @log 3
+// @log 3
+// @log 0
+// @log 5
+// @log 0
+// @log 3
+
+// the bare literal tag — no alias declared anywhere
+type C = { kind: "circle", r: f64 }
+type R = { kind: "rect", w: f64 }
+type S = C | R
+function area(s: S) {
+  if s.kind == "circle" { return s.r }
+  return 0.0
+}
+print(area({ kind: "circle", r: 3.0 }))   // 3
+print(area({ kind: "rect", w: 4.0 }))     // 0
+
+// the same fact written backwards
+function areaL(s: S) {
+  if "circle" == s.kind { return s.r }
+  return 0.0
+}
+print(areaL({ kind: "circle", r: 3.0 }))  // 3
+
+// a NAMED litunion tag reads through the same rule — its field is the interned atom rep,
+// and the narrowing is decided on the arena either way. Its payload fields are named apart
+// from the pair above ON PURPOSE: `{kind: KC, r: f64}` and `{kind: "circle", r: f64}` are the
+// SAME arena type once `KC` folds, and a receiver whose surviving name is ambiguous across two
+// unions declines to narrow — `discriminant-eq-ambiguous-name-floor.vl`.
+type KC = "circle"
+type KR = "rect"
+type Ca = { kind: KC, radius: f64 }
+type Ra = { kind: KR, width: f64 }
+function areaA(s: Ca | Ra) {
+  if s.kind == "circle" { return s.radius }
+  return 0.0
+}
+print(areaA({ kind: "circle", radius: 3.0 }))  // 3
+print(areaA({ kind: "rect", width: 4.0 }))    // 0
+
+// three arms, one survivor: `u.m` is on `X` alone
+type A = { k: "a", n: i32 }
+type B = { k: "b", s: string }
+type X = { k: "x", m: f64 }
+type U = A | B | X
+function pick(u: U) {
+  if u.k == "x" { return u.m }
+  return 0.0
+}
+print(pick({ k: "x", m: 5.0 }))           // 5
+print(pick({ k: "a", n: 1 }))             // 0
+
+// the `is` spelling still narrows, through the same shared push
+function areaIs(s: Ca | Ra) {
+  if s.kind is KC { return s.radius }
+  return 0.0
+}
+print(areaIs({ kind: "circle", radius: 3.0 })) // 3

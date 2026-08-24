@@ -9803,6 +9803,58 @@ function mfResKindFromSigRet(k: VKind | null): MfKind | null {
   null
 }
 
+// Push the DISCRIMINANT narrowing a field test implies for its RECEIVER: `s.kind is KC` and
+// `s.kind == "circle"` both refine `s`, and they differ only in how the checker arrived at
+// the surviving type — which it BANKED at the condition node, so this reads one answer for
+// both spellings. Returns whether anything was pushed.
+//
+// The surviving type is not re-derived here on purpose. Deriving it means comparing the test
+// against each arm's field identity, and that identity lives in a different column depending
+// on how the tag was written: a litunion alias in `uFieldElemName`, a bare literal in
+// `uFieldTyText`, a plain type in neither. The checker decided it once against the arena.
+//
+// SINGLE SURVIVOR ONLY. A test leaving two of three arms needs an interned member-SET id
+// rather than a name; with nothing pushed the emitter keeps the full union, and a field
+// present on only the survivors then fails the shared-field plan's all-members test and takes
+// its loud reject. A field on ALL arms still reads correctly through that same plan.
+function pushDiscrimNarrow(placeIx: i32, condIx: i32, fnIx: i32): boolean {
+  const pn = P.nodes[placeIx]
+  if !(pn is Member) { return false }
+  const root = P.nodes[unwrapParen(pn.memObj)]
+  if !(root is Ident) { return false }
+  const dTy = isParentTyIxOf(condIx)
+  if dTy < 0 { return false }
+  const dNm = nominalStructNameOfTy(dTy)
+  if dNm == "" { return false }
+  if variantIndexOf(dNm) < 0 { return false }
+  // THE NAME MUST BE A MEMBER OF THIS RECEIVER'S OWN SET, and skipping that check was a
+  // CAST-FAILURE TRAP. An arena type can carry more than one nominal name: `C = {kind:
+  // "circle", r: f64}` and `Ca = {kind: KC, r: f64}` are the SAME structure once the alias
+  // `KC = "circle"` folds, so with both unions in one module `nominalStructNameOfTy` answers
+  // whichever it finds first. Narrowing `Ca | Ra` to the name `C` then made the emitter cast
+  // the box to `C`'s variant heap type — `wasm trap: cast failure`, and each union compiled
+  // correctly ON ITS OWN, which is what kept it out of a per-program grid.
+  //
+  // The bare `s is C` path never had this: it takes the SPELLING from the source. The
+  // discriminant has no spelling to take, so it checks the name it derived against the set
+  // the receiver actually holds, and declines when it is not there. Declining costs the
+  // narrowing and nothing else — the read falls to the shared-field plan and takes that
+  // plan's loud reject for a field the other arms lack.
+  const setTxt = currentStructNarrowSetOf(root.identName, fnIx)
+  if setTxt == "" { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(setTxt, atoms)
+  let found = false
+  let ai = 0
+  while ai < atoms.length {
+    if atoms[ai] == dNm { found = true }
+    ai = ai + 1
+  }
+  if !found { return false }
+  pushNarrowRep(root.identName, dNm, dTy, -1)
+  true
+}
+
 // If the `if` condition at `condIx` is `n is Variant` over a bare union identifier
 // `n`, PUSH the narrowing (`narrowNames`/`narrowVariants`) so the then-branch's
 // `n.field` reads downcast through the box, and return true. Otherwise leave the
@@ -9854,21 +9906,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     // emitter keeps the full union, and a field present on only the survivors then fails the
     // shared-field plan's all-members test and takes its loud reject. A field present on ALL
     // arms still reads correctly through that same plan, so nothing regresses.
-    if mrecv is Member {
-      const dRoot = P.nodes[unwrapParen(mrecv.memObj)]
-      if dRoot is Ident {
-        const dTy = isParentTyIxOf(condIx)
-        if dTy >= 0 {
-          const dNm = nominalStructNameOfTy(dTy)
-          if dNm != "" {
-            if variantIndexOf(dNm) >= 0 {
-              pushNarrowRep(dRoot.identName, dNm, dTy, -1)
-              return true
-            }
-          }
-        }
-      }
-    }
+    if pushDiscrimNarrow(unwrapParen(c.isObj), condIx, fnIx) { return true }
     // `x?.y is T` narrows the member PATH exactly like `x.y is T` — the then-arm
     // only runs when every chain link held AND the union field matched, so the
     // plain `x.y` reads inside it unbox under the same path key.
@@ -9896,6 +9934,15 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   // host's A5 — the RHS is even CHECKED under the LHS's narrowing). The pushes
   // stack; the caller's save/restore of `narrowTop` unwinds them together.
   if c is BinExpr {
+    // `s.kind == "circle"` — the DISCRIMINANT in the spelling that needs no tag alias
+    // declared, and the one a user writes first. Same bank, same push as the `is` arm above;
+    // the checker recorded which arm survives, keyed on this very node.
+    if c.binOp == "==" && !narrowStripNullOnly {
+      if pushDiscrimNarrow(unwrapParen(c.binLeft), condIx, fnIx) { return true }
+      if pushDiscrimNarrow(unwrapParen(c.binRight), condIx, fnIx) {
+        return true
+      }
+    }
     if c.binOp == "&&" {
       const nl = setNarrowFromCond(c.binLeft, fnIx)
       const nr = setNarrowFromCond(c.binRight, fnIx)
