@@ -906,41 +906,57 @@ in-language GC knobs.
   param) is live and not pinned here at all — `docs/internals/open-rulings.md`. The SELF-HOST
   checker's soundness floor (15 false-accept classes) is closed; new classes go straight to corpus
   + both checkers.
-  THE `xfail-miscompile-` TIER (accepts, then emits invalid wasm) stands at **four** members here
+  THE `xfail-miscompile-` TIER (accepts, then emits invalid wasm) stands at **two** members here
   plus one under `tests/cases/std/`, down from twelve: seven closed in one pass (#1863), an eighth
-  right after (#1865) and a ninth beside it (#1866) — and EIGHT of those nine were the same
-  sentence, a ladder with an arm its sibling ladder lacks (see `CHANGELOG.md`, Track B, and the
-  enumeration in `tests/cases/soundness/README.vl`). The eighth was the map one: `emitObj` seeds a
-  nullable-map field's construct context under `scode == 29` and the VARIANT-literal twin had no
-  `vcode == 29` arm, so FIVE shapes — not the one its header named — rode the ambient mono
-  STRING-keyed default. The ninth, `numeric-litunion-empty-list-seed`, was the same sentence once
-  its "this needs a REP decision first" header was checked rather than believed: the rep was
-  already decided and already named (`numLitUnionBaseTy` — a numeric literal union reps as its
-  BASE SCALAR), so the pair closed together with the `xfail-false-reject-` file beside it.
-  **FOUR miscompile fixtures remain** (three of the twelve, plus the loud `totality-gate` one) and
-  TWO false rejects. What remains is attributed rather than merely listed: the `$fnsig` producer chain keyed on a
-  rendered spelling (`narrowed-litunion-fn-value-arg` here + `array-litunion-element` in std — one
-  question, and they need `cloParamTok` / `annSigKey` / `sigKeyOfTy` moved TOGETHER or nothing
-  measures); the numeric literal-union family's missing REP decision
-  (`numeric-litunion-empty-list-seed`, the same `litKind == "str"` restriction behind
-  `xfail-false-reject-numeric-litunion-array-in-signature`); a union whose two closure arms are ONE
-  TYPE (`permuted-object-closure-arms` — **needs a Track A ruling, and its header was re-derived
-  and REPLACED**: the permutation is the trigger for that file after all, the reported
-  `(ref null)`/`(ref)` is the printer eliding two type INDICES, and the split is two `TyObj` arms
-  of which one sorts. `repCanonIdGo` sorts field names — that sort IS the 2026-08 ruling — so the
-  union collapses to ONE closure rep, while `tyToEmitNameAt` does NOT sort, renders the two aliases
-  apart and interns two box TAGS; `emitIs` is the only half that disagrees, since deleting the `is`
-  tests makes the same program run. Same field ORDER gives the degenerate form — a VALID module
-  that silently prints nothing, **issue #1864**. NEITHER FIX WORKS ALONE: #1864 alone leaves the
-  file invalid, and sorting the render alone trades invalid wasm for #1864's strictly worse silent
-  wrong value. A THIRD shape with no functions at all — a permuted OBJECT union arm, where
-  `u is PB` answers FALSE for a PB — is a valid module with a wrong value on master; the 2026-08
-  change measured 14 positions and the union ARM is a 15th it did not reach. None of the three has
-  a fixture KIND here, and one kind would serve all three); and the checker-side totality gate,
-  which carries an ordering constraint in its own header.
-  **RE-DERIVE A FILED DIAGNOSIS BEFORE BUILDING ON IT.** THREE of the headers were wrong about
-  their own defect, and for a miscompile the re-derivation is `wasm-tools print` on the bad module
-  — which is also what showed the two elided type indices above.
+  right after (#1865), a ninth beside it (#1866) and two more with #1864 — and EIGHT of those nine
+  were the same sentence, a ladder with an arm its sibling ladder lacks (see `CHANGELOG.md`,
+  Track B, and the enumeration in `tests/cases/soundness/README.vl`). The eighth was the map one:
+  `emitObj` seeds a nullable-map field's construct context under `scode == 29` and the
+  VARIANT-literal twin had no `vcode == 29` arm, so FIVE shapes — not the one its header named —
+  rode the ambient mono STRING-keyed default. The ninth, `numeric-litunion-empty-list-seed`, was
+  the same sentence once its "this needs a REP decision first" header was checked rather than
+  believed: the rep was already decided and already named (`numLitUnionBaseTy` — a numeric literal
+  union reps as its BASE SCALAR), so the pair closed together with the `xfail-false-reject-` file
+  beside it.
+  **TWO miscompile fixtures remain here** (the inline-litunion element read, plus the loud
+  `totality-gate` one) and TWO false rejects, with one more miscompile under `tests/cases/std/`.
+  What remains is attributed rather than merely listed: the `ctxKeepsLitUnion` FAMILY DECISION —
+  a literal union's members are PRESERVED at `RC_ELEM` and SOFTENED at `RC_ROOT`/`RC_FN_PARAM`, so
+  the INLINE spelling `("a" | "b")[]` is an array of interned atoms while `"a" | "b"` in a
+  parameter or return position is a string reference, and the two meet at every element read
+  (`xfail-miscompile-inline-litunion-element-read.vl` is the four-line witness; the std
+  `array-litunion-element` file is the same defect with std, a generic and a closure on top, and
+  the DECLARED-alias spelling of both is green). Closing it means CHOOSING one
+  position-INDEPENDENT rule; that predicate's header names the two candidate position rules already
+  built and REFUTED. And the checker-side totality gate, which carries an ordering constraint in
+  its own header.
+  **#1864 CLOSED TWO AND CORRECTED TWO FILED DIAGNOSES IN OPPOSITE DIRECTIONS.**
+  `narrowed-litunion-fn-value-arg` was filed as needing three `$fnsig` producers moved
+  "byte-identical or nothing" (`cloParamTok` / `annSigKey` / `sigKeyOfTy`); re-derived,
+  `cloParamTok` was already right and `annSigKey` CANNOT be fixed — its whole input is a rendered
+  spelling, and a narrowed litunion COPY renders exactly like a genuinely INLINE one while repping
+  differently. One producer moved and the CONSUMER ranks them. `array-litunion-element` was grouped
+  with it as "the same question" and is NOT — closing the first changed nothing there.
+  `permuted-object-closure-arms` called its INTERLOCK with #1864 correctly (neither half works
+  alone) and named the wrong second half: the RENDER SORT it proposed was built and MEASURED, and
+  sorting `tyToEmitNameAt` needs `tyToNominalNameAt` with it and STILL forks, because a fourth
+  producer — `canonEmitNameAt`, which canons the SOURCE ANNOTATION TEXT — keys declaration order
+  (`types/nullable-union-alias.vl` and `literal-unions/inline-atom-shape-field.vl` both go red).
+  What landed instead is two lines, neither a render: `emitIs`' union-box arm asks the STORAGE
+  question as well as the registry one, and `tySameAt` compares object fields by SET rather than by
+  POSITION.
+  **THE MISSING FIXTURE KIND IS NOW A TWO-INSTANCE GAP, NOT A ONE-OFF.** #1867 (a permuted OBJECT
+  union arm: `u is PB` answers FALSE for a PB, because `structFieldCodesEq` is POSITIONAL and the
+  2026-08 layout canonicalization's 14 measured positions do not include the union arm) and the
+  inline-litunion silent sibling (`const v: "a" | "b" = tags[0]` prints the raw atom id) both
+  COMPILE, VALIDATE, run and exit 0 with a WRONG ANSWER. `@no-instantiate` cannot pin a valid
+  module, `@trap` explicitly rejects one, and `@run` + `@log` cannot assert that output is ABSENT
+  or that a printed value is not some OTHER value. Two instances is enough to say the gap is in the
+  harness. The cheapest kind that would serve both is an EXACT-output directive — assert the FULL
+  output sequence rather than a subsequence — because #1864's own shape ("runs, exits 0, prints
+  nothing") is then just the empty case and #1867 is the "prints 1 and only 1" case.
+  **RE-DERIVE A FILED DIAGNOSIS BEFORE BUILDING ON IT.** FIVE of the headers were wrong about
+  their own defect, and for a miscompile the re-derivation is `wasm-tools print` on the bad module.
 - 🟡 **A13. Operator-constraint inference.** A binary op with a hole operand records a deferred
   `(lt, op, rt)` constraint that every generic call site re-validates under the substituted
   argument types (`binOpDefinedFor`) — arithmetic, string concat, relational and equality all fall

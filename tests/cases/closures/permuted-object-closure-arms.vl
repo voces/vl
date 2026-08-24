@@ -1,0 +1,87 @@
+// @run
+// @log A isFA
+// @log A isFB
+// @log B isFA
+// @log B isFB
+// A union whose two CLOSURE arms are ONE TYPE: the parameter objects `{a: i32, b: string}`
+// and `{b: string, a: i32}` are field-permuted, which the 2026-08 ruling makes the same type.
+// This was `soundness/xfail-miscompile-permuted-object-closure-arms.vl` and makes that kind's
+// documented trip to `@run`. BOTH calls report BOTH arms, which is what "the two signatures
+// are the same type" has to mean.
+//
+// TWO PRODUCERS DISAGREED ABOUT ONE UNION, AND THE HEADER THIS REPLACES NAMED THE PAIR. The
+// REP layer collapses it: `repCanonIdGo`'s `TyObj` arm SORTS the (field-sid, child-id) pairs —
+// that sort IS the ruling, added when this kind's first member closed
+// (`types/permuted-named-alias-shares-row.vl`) — so `(PA) => i32` and `(PB) => i32` share a
+// canon id, the union has ONE distinct member, and the parameter's valtype is the bare closure
+// fat pointer. The REGISTRY does not: it is reached through renders (`tyToEmitNameAt`,
+// `tyToNominalNameAt`) whose `TyObj` arms walk `objFieldNames` in DECLARATION order, so the
+// row is still a two-arm union. `emitIs` believed the registry and emitted
+// `struct.get $uBox 0` against a `(ref $cloStruct)` — `vl check --codegen` rc 0, a module the
+// engine refuses at load.
+//
+// THE FIX IS NOT THE RENDER SORT, AND THAT IS A MEASURED RESULT. Sorting `tyToEmitNameAt`'s
+// `TyObj` arm was built first, because the replaced header proposed it. It is not enough and
+// not safe alone: `tyToNominalNameAt` has to move with it, and even both together leave a
+// FOURTH producer keying declaration order — `canonEmitNameAt`, which canons the SOURCE
+// ANNOTATION TEXT rather than the arena — so an inline shape ANNOTATION registers under
+// `{t:i32,a:i32}` while the arena renders `{a:i32,t:i32}`. With both renderers sorted,
+// `types/nullable-union-alias.vl` lost its narrowed read (`4` no longer printed) and
+// `literal-unions/inline-atom-shape-field.vl` reached `emitProgram: ref valtype with no
+// interned shape`. Landing the render agreement means moving all four together, which is its
+// own slice.
+//
+// WHAT LANDED INSTEAD IS TWO LINES, NEITHER OF THEM A RENDER.
+//
+//   · `emitIs`'s union-box arm now asks the STORAGE question as well as the registry one
+//     (`identSlotIsUnionBox`). The registry says "this annotation names a union"; the rep
+//     layer says what the slot actually holds. They can disagree in exactly one direction —
+//     a multi-arm row whose arms collapse to one rep — and a box-tag read is invalid wasm
+//     there. It is deliberately NOT `exprUnion`: that classifier is narrowing-sensitive, and
+//     this arm exists precisely to serve a union ident an outer guard has narrowed to one
+//     atom, whose STORAGE is still the box.
+//
+//   · `tySameAt`'s `TyObj` arm compares by field SET rather than by POSITION. With the box
+//     read gone the guard falls to the `emitIs` fold, which asks `tySame` — and that
+//     predicate had never caught up to the ruling, so `x is FB` answered FALSE for a value
+//     whose type FB IS. Same safety argument as the canon sort: field names are unique, so
+//     with equal lengths a name-keyed lookup is a bijection on the field set; it can only
+//     MERGE what position split.
+//
+// AND THE FOLD ITSELF IS #1864, WITHOUT WHICH THIS FILE CANNOT PASS. Once the box read is
+// gone the guard is decided at compile time, and `monoStaticIsResult` const-folded every
+// function-typed `is` to FALSE — it compared `monoArgTyName`'s answer against type NAMES,
+// and for a function-valued receiver that call returns the `$fnsig` PIN MARKER `"=>i>i"`,
+// an interned ABI key rather than a spelling. `tests/cases/closures/is-bare-closure-receiver.vl`
+// is that defect's own pin. The interlock the replaced header predicted is real, and this is
+// which halves it turned out to need.
+//
+// A THIRD, WORSE, STILL-OPEN SHAPE FOUND WHILE RE-DERIVING THIS ONE — no functions anywhere:
+//
+//   type PA = { a: i32, b: string }
+//   type PB = { b: string, a: i32 }
+//   function g(u: PA | PB) { if u is PA { print(1) } ; if u is PB { print(2) } }
+//   g({ a: 5, b: "z" })
+//
+// `vl check` rc 0, a VALID module, exit 0, and it prints `1` — `u is PB` answers FALSE for a
+// value whose type PB IS. Verified unchanged by everything above, so it does NOT share this
+// file's cause: the module carries TWO struct rows with TWO field ORDERS, and
+// `buildStructTwins`' second gate (`structFieldCodesEq`) is POSITIONAL, which the 2026-08
+// layout canonicalization's 14 measured positions do not include. That is issue #1867, and it
+// still has no fixture kind here — `@no-instantiate` cannot pin a valid module and `@trap`
+// rejects it.
+type PA = { a: i32, b: string }
+type PB = { b: string, a: i32 }
+type FA = (PA) => i32
+type FB = (PB) => i32
+
+function pm(lbl: string, x: FA | FB) {
+  if x is FA { print(lbl + " isFA") }
+  if x is FB { print(lbl + " isFB") }
+}
+
+function fa(v: PA) { v.a }
+function fb(v: PB) { v.a }
+
+pm("A", fa)
+pm("B", fb)

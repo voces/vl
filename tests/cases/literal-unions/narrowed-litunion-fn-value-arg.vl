@@ -1,0 +1,78 @@
+// @run
+// @log ka
+// @log ka
+// @log kc
+// @log ka
+// @log kc
+// @hint redundant type annotation: `f` is inferred as `("ka" | "kc") => string` — remove it to lean on inference
+// @hint redundant type annotation: `h` is inferred as `("ka" | "kc") => string` — remove it to lean on inference
+// A NARROWED literal-union parameter (`K & !"kb"`) reached through a FUNCTION VALUE. This was
+// `soundness/xfail-miscompile-narrowed-litunion-fn-value-arg.vl` and makes that kind's
+// documented trip to `@run`.
+//
+// THE CALLEE AND THE CALL SITE DISAGREED ABOUT ONE PARAMETER'S VALTYPE. `takesN`'s own param is
+// the interned i32 ATOM — the rep layer assigns it through `tyLitUnionAliasIx`, which consults
+// the checker's COPY-PROVENANCE table, so a narrowed copy of a registered alias keeps the atom
+// (`narrowed-litunion-param-atom-rep.vl` is that contract's pin). The `$fnsig` the VALUE call
+// resolved said `string`, so the `call_indirect` named a `(structref, stringref)` functype at a
+// callee declared `(structref, i32)` and pushed the atom id into it: `vl check --codegen` rc 0,
+// and a module the engine refuses at load.
+//
+// TWO PRODUCERS, NOT THREE, AND ONLY ONE OF THEM COULD BE FIXED WHERE IT STOOD.
+//
+//   · `sigKeyOfTy` — the ARENA producer — asked `unionAliasDeclNameOfTy`, the alias REGISTRY
+//     alone, which answers "" for a copy; the render then softened the type to `string` and
+//     keyed the box `S`. It now asks `tyLitUnionAliasIx` first, exactly as
+//     `cloCallParamLitUnion` does one screen over, so the producer's answer comes from the
+//     same provenance table that assigned the valtype. `litUnionAliasNameOfTy` is still the
+//     wrong tool here — it falls back to matching the member-literal SET, so in a program that
+//     also declares `type K = …` it names the INLINE spelling too, and an inline litunion
+//     param really IS a string.
+//
+//   · the NAME producer (`cloNameSigKey` → `annSigKey` → `annParamKind`) CANNOT be fixed, and
+//     that is the useful finding. Its whole input is the rendered spelling `"ka" | "kc"`, and
+//     a narrowed COPY and a genuinely INLINE litunion render identically while repping
+//     differently (atom against string ref). No arm added to `annParamKind` can separate them,
+//     because the distinguishing fact — provenance — is not in the string. So the CONSUMER
+//     resolves the tie instead: `cloCallSigKey`'s Ident arm now prefers the arena key when the
+//     name key names NO interned signature and the arena key does. That is monotone (a call
+//     whose historic key names a real `$fnsig` keeps it byte-for-byte) and it is the same
+//     interned-divergence discipline the `Member` arm already carried.
+//
+// THE FILED DIAGNOSIS SAID THREE PRODUCERS HAD TO MOVE TOGETHER (`cloParamTok`, `annSigKey`,
+// `sigKeyOfTy`, "byte-identical or nothing"). Re-derived: `cloParamTok` was already right — it
+// reads `vtKindOfParam`, i.e. the same rep layer — so it never needed to move, and `annSigKey`
+// cannot. A one-line disassembly of the bad module says which functype each side named.
+//
+// THE `@hint`s ARE LOAD-BEARING. The linter calls the binding annotations redundant, and
+// removing one makes the program compile for the wrong reason — an un-annotated
+// `const f = takesN` resolves the callee's own signature instead of building one from the
+// annotation, which is the channel this file exists to cover.
+type K = "ka" | "kb" | "kc"
+type N = K & !"kb"
+
+function takesN(v: N): string { v }
+
+function use(g: (N) => string) {
+  print(g("ka"))
+}
+
+function main() {
+  // (1) the headline cell: an annotated LOCAL binding over a named callee
+  const f: (N) => string = takesN
+  print(f("ka"))
+  // (2) the same value reached through a higher-order PARAM
+  use(f)
+  // (3) the other member of the narrowed set, so the atom id is not the winner by accident
+  print(f("kc"))
+}
+
+main()
+
+// (4) the MODULE-SCOPE binding. It needed the consumer-side tie-break: at module scope the
+// name producer claims the call before the general arena fallback is reached, so fixing
+// `sigKeyOfTy` alone turned this row from invalid wasm into a loud
+// `function-value call arity has no interned signature`.
+const h: (N) => string = takesN
+print(h("ka"))
+print(h("kc"))
