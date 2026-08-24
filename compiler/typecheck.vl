@@ -7117,30 +7117,25 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           // list is the same set every other consumer of a nested union sees. Each candidate
           // is still gated by `unionArmBoxSafe` and still recorded as the CONCRETE arm, so
           // nothing about the per-arm rules changes — only which arms are offered.
-          // GATED ON THE OUTER UNION BEING A DECLARED ALIAS, and that gate is the emitter's
-          // capability, not a taste. A declared `type Parsed = Shape | ParseError` registers
-          // its variants through `collectU`, which resolves each member name — so the nested
-          // arms are in its variant table and the arm this pick records is one the emitter can
-          // tag. An INLINE `x: Shape | ParseError` annotation registers through
-          // `registerInlineUnion` instead, which splits the SPELLING and sees `Shape` as one
-          // atom that `isStructAtom` rejects; its nested arms are therefore absent.
+          // FLATTENED FOR BOTH SPELLINGS. This was gated on the outer union being a
+          // DECLARED alias, and the gate was the emitter's capability rather than a taste:
+          // a declared `type Parsed = Shape | ParseError` registers its nested arms through
+          // `collectU` (which resolves each member NAME), while an INLINE
+          // `x: Shape | ParseError` registered through `registerInlineUnion`, which split
+          // the SPELLING and saw `Shape` as one atom `isStructAtom` rejects — so its nested
+          // arms were absent and offering them here would have turned a clean type error
+          // into a `cast failure` TRAP.
           //
-          // That inline shape is ALREADY BROKEN on master, with no literal and no arm-pick
-          // involved: `const r: Rect = {…}` then `const x: Shape | ParseError = r` fails to
-          // compile. Offering the arms here would turn its LITERAL spelling from a clean type
-          // error into a `wasm trap: cast failure`, which is a worse column for a shape that
-          // does not work either way — so the gate keeps it at the type error until the inline
-          // registration flattens too.
+          // THE GATE'S OWN WITNESS NO LONGER REPRODUCES. It recorded that the inline shape
+          // was broken with no literal and no arm-pick involved — `const r: Rect = {…}`
+          // then `const x: Shape | ParseError = r` "fails to compile". It compiles and runs
+          // now: canon's union-alias flatten renders a member by its DECLARED SPELLING
+          // (`declaredStructUnionMembers`), so the inline annotation reaches
+          // `registerInlineUnion` already spelled `Circle|Rect|ParseError` and its nested
+          // arms register exactly as the declared route's do. Both halves have moved, which
+          // is the condition this gate named for its own removal.
           const members: i32[] = []
-          if cTyIxSetHas(cUnionTyIxSet, dstTy) {
-            flattenVariantsInto(dstTy, members)
-          } else {
-            let dm = 0
-            while dm < d.uMembers.length {
-              members.push(d.uMembers[dm])
-              dm = dm + 1
-            }
-          }
+          flattenVariantsInto(dstTy, members)
           let mi = 0
           while mi < members.length {
             const mt = T.tys[members[mi]]
@@ -10766,7 +10761,70 @@ function unionAliasMembers(name: string) {
   const ix = cUserTypes[name] ?? -1
   if ix < 0 { return "" }
   const t = T.tys[ix]
-  if t is TyUnion { return tyToEmitName(ix) }
+  if t is TyUnion {
+    // THE DECLARED MEMBER SPELLINGS FIRST — see `declaredStructUnionMembers`. "" from it
+    // means "not a union of declared structs", which keeps every other alias on the
+    // structural render below byte-identically.
+    const dsm = declaredStructUnionMembers(name)
+    if dsm != "" { return dsm }
+    return tyToEmitName(ix)
+  }
+  ""
+}
+
+// The `|`-joined DECLARED member SPELLINGS of union alias `name` (`type Shape = Circle |
+// Rect` -> "Circle|Rect"), when every member names a declared STRUCT or is `null`; "" for
+// anything else.
+//
+// WHY THE SPELLING AND NOT THE RENDER. `tyToEmitNameGo`'s `TyObj` arm has no nominal rung:
+// it renders a member as its SHAPE (`{kind:string,r:f64}`) — anonymous, and with the
+// literal tag SOFTENED through the field arm. So `Shape | null` canon'd to
+// `{…}|{…}|null` and registered two ANONYMOUS shape variants unrelated to `Circle` and
+// `Rect`, while the INLINE spelling of the same type — `Circle | Rect | null` — registered
+// the real ones and ran. Two spellings of one type carrying two reps is exactly the split
+// this flatten was written to prevent, so the flatten was reintroducing it one level down.
+//
+// THE DECLARATION ALREADY HOLDS THE ANSWER (`udVariants`), which is why this asks the
+// parser rather than reverse-mapping the arena shape. `nominalNameOfObj` matches by
+// bidirectional assignability and returns the FIRST structurally-equal user type — the
+// wrong tag the moment two variants share a field set, and a `cast failure` trap rather
+// than a type error when it is wrong.
+//
+// `null` IS AN ACCEPTED MEMBER (`type N = Circle | null`) because it is what the outer
+// union spells too: the atom rides the tag, and dropping the alias here would leave that
+// spelling on the structural render for no reason. A member that is neither — a scalar, a
+// literal, a nested alias, an inline shape — returns "" for the WHOLE alias rather than a
+// partial join, so a mixed union is unchanged rather than half-rewritten.
+function declaredStructUnionMembers(name: string) {
+  let si = 0
+  while si < gRootStmts.length {
+    const s = P.nodes[gRootStmts[si]]
+    if s is UnionDecl {
+      if s.udName == name {
+        const vs = s.udVariants
+        if vs.length < 2 { return "" }
+        let out = ""
+        let i = 0
+        while i < vs.length {
+          const m = vs[i]
+          if m != "null" {
+            const mi = cUserTypes[m] ?? (-1)
+            if mi < 0 { return "" }
+            const mt = T.tys[mi]
+            if mt is TyObj {} else { return "" }
+          }
+          if i > 0 { out = out + "|" }
+          out = out + m
+          i = i + 1
+        }
+        // The join's own atom width, for the caller that reads `emitNameAtoms` after a
+        // flatten: one atom per member, since each is a bare name.
+        emitNameAtoms = vs.length
+        return out
+      }
+    }
+    si = si + 1
+  }
   ""
 }
 
@@ -24029,15 +24087,7 @@ export function nodeTyIsVariant(ix: i32) {
   if t is TyObj { return true }
   false
 }
-// STRUCTURAL (C1): node `ix`'s recorded type is a NULLABLE declared struct (`S | null`) — a
-// `TyNullable` whose inner is a declared struct (never a variant member, never `string | null`,
-// which its `TyPrim` inner already excludes). The nominal analogue of `retNulRefFlag`'s name path.
-// PAIRED WITH `nodeTyIsNullableStruct`, and the split runs the OTHER way from the string pair.
-// This one accepts an inner registered in `cStructTyIxs` OR a bare `TyObj`, and EXCLUDES variant
-// members. Its sibling is only `it is TyObj` — so it misses a declared struct whose arena entry is
-// nominal rather than a bare `TyObj` (the struct-alias one-member `TyUnion` shape
-// `nodeTyIsStruct` handles), and it does not exclude variant members. Same naming distance,
-// opposite direction of narrowness: read the bodies, not the names.
+
 export function nodeTyIsNulStruct(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }

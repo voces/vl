@@ -1622,11 +1622,15 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
     kind == "struct" ||
     kind == "reflist" ||
     kind == "nulreflist" ||
+    kind == "variant" ||
+    kind == "nulvariant" ||
     kind == "nulstruct"
   ) {
     if (
       structIdx < 0 ||
       ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length) ||
+      ((kind == "variant" || kind == "nulvariant") &&
+        structIdx >= uVarHeap.length) ||
       ((kind == "reflist" || kind == "nulreflist") &&
         structIdx >= rlWrapIdx.length)
     ) {
@@ -1636,6 +1640,15 @@ export function fbRefNullForKind(kind: VKind, structIdx: i32) {
   }
   if kind == "struct" || kind == "nulstruct" {
     wSLEB(sHeapIdx[structIdx])
+  } else if kind == "variant" || kind == "nulvariant" {
+    // THE VARIANT TABLE, not `sHeapIdx`. Without this arm the two variant kinds fell off
+    // the end of this chain to its default heap type, so a nullable-variant GLOBAL cell
+    // was zero-initialized with a `ref.null` of an unrelated type while its own valtype
+    // said `uVarHeap[vi]` — "expected (ref null $A), found (ref null $B)", a module that
+    // does not even parse. The third member of the kind/slot pairing trio
+    // (`fbValtype` / `fbValtypeNullable` / `fbRefNullForKind`), and the one an
+    // exhaustiveness check does not cover, because it is an `if`-chain.
+    wSLEB(uVarHeap[structIdx])
   } else if kind == "list" || kind == "nullist" {
     wSLEB(lTypeIdx)
   } else if kind == "str" {
@@ -1722,14 +1735,23 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     kind == "reflist" ||
     kind == "nulreflist" ||
     kind == "variant" ||
+    kind == "nulvariant" ||
     kind == "nulstruct"
   ) {
     if (
       structIdx < 0 ||
       ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length) ||
+      ((kind == "variant" || kind == "nulvariant") &&
+        structIdx >= uVarHeap.length) ||
       ((kind == "reflist" || kind == "nulreflist") &&
         structIdx >= rlWrapIdx.length)
     ) {
+      // The VARIANT kinds read `uVarHeap`, and until now only their `structIdx < 0` leg
+      // was guarded — an index PAST the variant table indexed it out of bounds and
+      // TRAPPED, the one failure mode this guard exists to convert into a loud reject
+      // (`emitFail` records and returns, it does not halt, so an unbounded read here is
+      // reached with emission still running).
+
       wU8(VT_I32)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
@@ -1794,6 +1816,13 @@ export function fbValtypeNullable(kind: VKind, structIdx: i32) {
     }
     "variant" => {
       wU8(RT_REF_NULL) // the concrete union-variant struct ref, made nullable
+      wSLEB(uVarHeap[structIdx])
+    }
+    "nulvariant" => {
+      // `Circle | null` — the SAME cell as the non-null `variant` above, because a wasm
+      // local is declared nullable either way; the two differ only in the SIGNATURE
+      // positions, which `fbValtype` writes.
+      wU8(RT_REF_NULL)
       wSLEB(uVarHeap[structIdx])
     }
     "reflist" => {
@@ -1888,15 +1917,20 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     kind == "struct" ||
     kind == "reflist" ||
     kind == "variant" ||
+    kind == "nulvariant" ||
     kind == "nulstruct" ||
     kind == "nulreflist"
   ) {
     if (
       structIdx < 0 ||
       ((kind == "struct" || kind == "nulstruct") && structIdx >= sHeapIdx.length) ||
+      ((kind == "variant" || kind == "nulvariant") &&
+        structIdx >= uVarHeap.length) ||
       ((kind == "reflist" || kind == "nulreflist") &&
         structIdx >= rlWrapIdx.length)
     ) {
+      // Same `uVarHeap` bound as `fbValtypeNullable`'s guard — see there.
+
       wU8(VT_I32)
       return emitFail("emitProgram: ref valtype with no interned shape")
     }
@@ -1951,6 +1985,13 @@ export function fbValtype(kind: VKind, structIdx: i32) {
     }
     "variant" => {
       wU8(RT_REF)
+      wSLEB(uVarHeap[structIdx])
+    }
+    "nulvariant" => {
+      // The variant-table twin of `nulstruct` just below: a NULLABLE ref (0x63) to the
+      // variant's own heap type, which is what makes `Circle | null` a niche rather than
+      // a box — no allocation, and `null` is the ref's own null.
+      wU8(RT_REF_NULL)
       wSLEB(uVarHeap[structIdx])
     }
     "f64list" => {
