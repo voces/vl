@@ -145,6 +145,24 @@ the third already forced. Confirmed both from `common_struct_or_exn_layout`'s
 final `align_up` and by measurement (§1.3 table B). The cached hash costs
 nothing.
 
+> **RE-MEASURED WHEN THE FIELD ACTUALLY SHIPPED** (Step 3), against the real
+> before/after builds rather than against hand-written `obj3`/`obj4` probes — the
+> prediction held. A 2,000,000-slice probe, retained in a keep-array so the
+> collecting collectors price it too, compiled by both compilers:
+>
+> | `VL_GC` | B/string, 3-field | B/string, 4-field | delta |
+> |---|---|---|---|
+> | `none` | 23.28 | 23.56 | +0.28 |
+> | `tracing` (copying) | 57.59 | 56.95 | −0.64 |
+> | `refcount` (DRC) | 47.01 | 47.02 | +0.01 |
+>
+> The deltas disagree in SIGN, which is the tell that they are measurement floor
+> and not cost: peak RSS on a 50–150 MB probe is stable to about 1 MB, i.e. ~±0.5 B
+> per string at N = 2 M. **The honest reading is 0 B per string.** The two real
+> workloads say the same: `vl check` of the whole compiler moved 284.4 → 284.5 MB
+> peak (+0.05%) and `vl build` 651.5 → 651.2 MB (−0.05%). The seed module grew
+> 1,373,064 → 1,376,549 B (+0.25%), which is the emitted memo code, not the field.
+
 ### 1.3 Method B — empirical, by peak RSS
 
 Every probe is a generated VL program, **prebuilt to `.wasm`** so no compile time
