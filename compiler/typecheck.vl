@@ -1454,8 +1454,8 @@ function mkNullableTy(inner: i32) {
   // `T | null` is minted through — the annotation routes, the declaration route's niche
   // fold, the narrowing widenings — so recording here is the whole program's answer.
   if inner >= 0 {
-    if !cTyIxListHas(cNullableInnerTyIxs, inner) {
-      cNullableInnerTyIxs.push(inner)
+    if !cTyIxSetHas(cNullableInnerTyIxSet, inner) {
+      cTyIxSetAdd(cNullableInnerTyIxs, cNullableInnerTyIxSet, inner)
     }
   }
   const t: Ty = { nInner: inner }
@@ -1922,6 +1922,7 @@ let annUnionAtoms: i32[] = []
 // nominal classifier then confirms structurally instead of an O(nodes) `nameIsStructDecl` AST scan.
 // The arena stays purely STRUCTURAL (`TyObj` has no name); nominal-ness is checker metadata, not a Ty.
 let cStructTyIxs: i32[] = []
+let cStructTyIxSet: boolean[] = []
 // The declared NAME of each `cStructTyIxs` entry (parallel array), so a declared-struct
 // arena index resolves back to its alias name — the reverse map `cUnionTyIxs`/`cUnionNames`
 // already give unions. Used by the NAME-FAITHFUL renderer (`tyToNominalName`) to render a
@@ -1929,16 +1930,20 @@ let cStructTyIxs: i32[] = []
 // reproduces the name walk's registration keys (rep-adoption name-faithful-renderer slice).
 let cStructNames: string[] = []
 let cVariantMemberTyIxs: i32[] = []
+let cVariantMemberTyIxSet: boolean[] = []
 // The ANNOTATION route's candidate variant members, held until `annCommitVariantMembers`
 // runs at the end of checking — see `annRegisterVariantMembers` for why the decision cannot
 // be made at the moment the annotation resolves.
 let annPendingVariantTyIxs: i32[] = []
+let annPendingVariantTyIxSet: boolean[] = []
 // Every arena type that appears as the INNER of a `T | null` in this program, recorded at
 // `mkNullableTy` — the one home every nullable is minted through. Read only by
 // `annCommitVariantMembers`, which needs the WHOLE program's answer.
 let cNullableInnerTyIxs: i32[] = []
+let cNullableInnerTyIxSet: boolean[] = []
 // Declared UNION-ALIAS `Ty` indices (`type T = A | B`), for the emitter's `isUName` (C1).
 let cUnionTyIxs: i32[] = []
+let cUnionTyIxSet: boolean[] = []
 // The declared NAME of each `cUnionTyIxs` entry (parallel array), so a union type index can
 // resolve back to its alias name — used to pin an anonymous lambda's litunion return as the
 // ALIAS (an inline litunion spelling reps as a string ref, so the alias name is required).
@@ -1961,6 +1966,7 @@ let cUnionNames: string[] = []
 // The ARGUMENTS are stored as ARENA INDICES, not as a spelling — the renderer recurses
 // through them, so nothing here has to be parsed back.
 let gaAppTyIxs: i32[] = []
+let gaAppTyIxSet: boolean[] = []
 let gaAppHeads: string[] = []
 // The arguments of each `gaAppTyIxs` entry, flattened: entry `i` owns
 // `gaAppArgFlat[gaAppArgStart[i] .. + gaAppArgCount[i]]`. Same flat-slice shape as the
@@ -7378,7 +7384,7 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   // TYPED-IR P1: bank the fact that this arena index IS the application `head<argTys>`.
   // Recorded on the memo MISS, so exactly one row exists per distinct application — the
   // same population `cUserTypes` keys, and the same index every later hit returns.
-  gaAppTyIxs.push(resIx)
+  cTyIxSetAdd(gaAppTyIxs, gaAppTyIxSet, resIx)
   gaAppHeads.push(head)
   gaAppArgStart.push(gaAppArgFlat.length)
   gaAppArgCount.push(argTys.length)
@@ -7854,16 +7860,17 @@ function litUnionFlatMembers(members: i32[], out: i32[]): boolean {
 // — flipping which one its positions select would move a population that is not broken.
 //
 // Duplicate-suppressed because an annotation is resolved once per OCCURRENCE while a
-// declaration is resolved once: `cTyIxListHas` is a linear scan, and a hot loop's
-// annotation would otherwise grow the list without bound. Membership is what every reader
-// asks, so suppression is answer-preserving.
+// declaration is resolved once, and `annCommitVariantMembers` WALKS this list, so a hot
+// loop's annotation would otherwise grow the committed pass without bound. Membership is
+// what every reader asks, so suppression is answer-preserving. (The suppressing probe is
+// now the O(1) `cTyIxSetHas`, so the guard costs nothing that it saves.)
 function annRegisterVariantMembers(ms: i32[]) {
   let i = 0
   while i < ms.length {
     const m = ms[i]
     if m >= 0 {
-      if !cTyIxListHas(annPendingVariantTyIxs, m) {
-        annPendingVariantTyIxs.push(m)
+      if !cTyIxSetHas(annPendingVariantTyIxSet, m) {
+        cTyIxSetAdd(annPendingVariantTyIxs, annPendingVariantTyIxSet, m)
       }
     }
     i = i + 1
@@ -7901,9 +7908,11 @@ function annCommitVariantMembers() {
   let i = 0
   while i < annPendingVariantTyIxs.length {
     const m = annPendingVariantTyIxs[i]
-    if cTyIxListHas(cStructTyIxs, m) {
-      if !cTyIxListHas(cNullableInnerTyIxs, m) {
-        if !cTyIxListHas(cVariantMemberTyIxs, m) { cVariantMemberTyIxs.push(m) }
+    if cTyIxSetHas(cStructTyIxSet, m) {
+      if !cTyIxSetHas(cNullableInnerTyIxSet, m) {
+        if !cTyIxSetHas(cVariantMemberTyIxSet, m) {
+          cTyIxSetAdd(cVariantMemberTyIxs, cVariantMemberTyIxSet, m)
+        }
       }
     }
     i = i + 1
@@ -9378,7 +9387,7 @@ function tyToEmitNameAt(ix: i32, ctx: i32) {
 // The NOMINAL renderer needs none of this: `genAppNameOfTy` short-circuits ahead of its
 // composite arms, so an application instance never reaches them.
 function appKidCtx(ix: i32, ctx: i32): i32 {
-  if cTyIxListHas(gaAppTyIxs, ix) { return RC_ROOT }
+  if cTyIxSetHas(gaAppTyIxSet, ix) { return RC_ROOT }
   ctx
 }
 
@@ -11151,12 +11160,12 @@ function nwBrand(name: string, base: i32) {
   nwBaseTyIxs.push(base)
   const sdn = structNameOfTy(base)
   if sdn != "" {
-    cStructTyIxs.push(ix)
+    cTyIxSetAdd(cStructTyIxs, cStructTyIxSet, ix)
     cStructNames.push(sdn)
   }
   const udn = unionAliasDeclNameOfTy(base)
   if udn != "" {
-    cUnionTyIxs.push(ix)
+    cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, ix)
     cUnionNames.push(udn)
   }
   ix
@@ -19486,13 +19495,21 @@ function fillTypeDeclAt(sx: i32) {
             if flattened {
               let fr = 0
               while fr < flatU.length {
-                cVariantMemberTyIxs.push(flatU[fr])
+                cTyIxSetAdd(
+                  cVariantMemberTyIxs,
+                  cVariantMemberTyIxSet,
+                  flatU[fr],
+                )
                 fr = fr + 1
               }
             } else {
               let ri = 0
               while ri < declMemberIxs.length {
-                cVariantMemberTyIxs.push(declMemberIxs[ri])
+                cTyIxSetAdd(
+                  cVariantMemberTyIxs,
+                  cVariantMemberTyIxSet,
+                  declMemberIxs[ri],
+                )
                 ri = ri + 1
               }
             }
@@ -19629,13 +19646,19 @@ function forceDeclFill(name: string) {
 function checkProgramNode(n: Program) {
   const stmts = n.progStmts
   cStructTyIxs = []
+  cStructTyIxSet = []
   cStructNames = []
   cVariantMemberTyIxs = []
+  cVariantMemberTyIxSet = []
   annPendingVariantTyIxs = []
+  annPendingVariantTyIxSet = []
   cNullableInnerTyIxs = []
+  cNullableInnerTyIxSet = []
   cUnionTyIxs = []
+  cUnionTyIxSet = []
   cUnionNames = []
   gaAppTyIxs = []
+  gaAppTyIxSet = []
   gaAppHeads = []
   gaAppArgStart = []
   gaAppArgCount = []
@@ -19738,7 +19761,7 @@ function checkProgramNode(n: Program) {
           const sIx0 = mkObjTy(fnames0, ftys0)
           cUserTypes[sd0.tdName] = sIx0
           cUserTypesVer = cUserTypesVer + 1
-          cStructTyIxs.push(sIx0)
+          cTyIxSetAdd(cStructTyIxs, cStructTyIxSet, sIx0)
           cStructNames.push(sd0.tdName)
           if sd0.tdNew == 1 { nwDeclNames.push(sd0.tdName) }
         }
@@ -19766,7 +19789,7 @@ function checkProgramNode(n: Program) {
       const uIx0 = mkUnionTy(members0)
       cUserTypes[sd0.udName] = uIx0
       cUserTypesVer = cUserTypesVer + 1
-      cUnionTyIxs.push(uIx0)
+      cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, uIx0)
       cUnionNames.push(sd0.udName)
       if sd0.udNew == 1 { nwDeclNames.push(sd0.udName) }
     }
@@ -23426,14 +23449,79 @@ export function nodeTyIsClosureArray(ix: i32) {
   }
   false
 }
-// Linear membership over a small nominal-index set (a handful of struct/variant decls per program).
-function cTyIxListHas(xs: i32[], v: i32) {
-  let i = 0
-  while i < xs.length {
-    if xs[i] == v { return true }
-    i = i + 1
+// ── DENSE MEMBERSHIP over the `Ty`-arena index sets ──────────────────────
+// Every nominal-identity sidecar set (`cStructTyIxs`, `cVariantMemberTyIxs`,
+// `cUnionTyIxs`, `cNullableInnerTyIxs`, `gaAppTyIxs`, `annPendingVariantTyIxs` —
+// declared together near the top of this file) is a MEMBERSHIP set keyed by a
+// `Ty`-arena index: a dense, small, non-negative integer. So each carries a
+// parallel `boolean[]` indexed BY THE ARENA INDEX ITSELF, and that flag array —
+// not the `i32[]` — is what every membership question reads.
+//
+// WHY, measured on ONE self-compile (`vl build compiler/entry.vl`) with an
+// instrumented compiler counting probes and loop iterations per set:
+//
+//   set                      probes      scan iterations      list length
+//   cVariantMemberTyIxs   1,053,414        198,848,340            189
+//   cUnionTyIxs             207,768          2,035,142             10
+//   cStructTyIxs            157,795          8,211,175             60
+//   gaAppTyIxs                7,100                  0              0
+//   cNullableInnerTyIxs         573              2,788             29
+//   annPendingVariantTyIxs        0                  0              0
+//                         ─────────      ─────────────
+//                         1,426,650        209,097,445
+//
+// THE LISTS ARE SMALL, and the old header here ("a handful of struct/variant
+// decls per program") was RIGHT about that and wrong about what it cost. The scan
+// is hot because of the PROBE COUNT, not the length: the emitter's rep
+// classifiers (`nodeTyIsStruct`, `nodeTyIsVariant`, `nodeTyIsNulStruct`,
+// `nodeTyIsStructArray`, `tyIxIsVariantMember`, `nodeTyIsLitUnionAlias`) ask about
+// nearly every typed node, and they nearly always answer NO — 198,848,340 of the
+// 199,095,246 `cVariantMemberTyIxs` slots a probe could have walked were walked,
+// so 99.9% of that work is a full-list MISS. 209 M compare-and-increment
+// iterations is 11.9–12.9% of compiler self time in a `VL_PROFILE_GUEST` sample
+// (`cTyIxListHas`, second only to `__str_eq__`). A flag array answers every one of
+// them with a bounds test and a load: no hashing, no allocation, nothing
+// proportional to the set.
+//
+// WHERE THE WIN IS: `vl check` makes 605 of those 1,426,650 probes. Membership is
+// asked by the EMITTER, so a `vl check` A/B measures nothing here — the honest
+// instrument is `vl build compiler/entry.vl`.
+//
+// THE LIST STAYS. Four of the six are ITERATED IN ORDER, in parallel with a
+// names/args array (`cStructTyIxs`+`cStructNames` in `structNameOfTyIx`,
+// `cUnionTyIxs`+`cUnionNames` in `litUnionAliasNameOfTy`, `gaAppTyIxs`+`gaAppHeads`
+// in `genAppNameOfTy`, `annPendingVariantTyIxs` in `annCommitVariantMembers`), so
+// the flags are an INDEX BESIDE the list, never a replacement — and the other two
+// keep theirs for the same shape, because six sets that differ in structure is how
+// one of them ends up missing an arm.
+//
+// LOCKSTEP IS THE WHOLE CONTRACT, and nothing downstream would catch a break in
+// it: a flag left set after its list was cleared silently reclassifies a type, and
+// no gate reads these sets directly. So there are exactly two ways to write one —
+// `cTyIxSetAdd`, which appends to the list AND sets the flag in one call, and the
+// paired reset in `checkProgramNode`, where each list's `= []` sits on the line
+// above its set's. Do not `push` one of these lists directly.
+
+// Append `v` to `xs` and mark it present in `xs`'s parallel dense flag array.
+// A negative `v` is appended but not flagged — it is not an arena index, and
+// `cTyIxSetHas` refuses one on the way in, so there is nowhere to record it.
+function cTyIxSetAdd(xs: i32[], flags: boolean[], v: i32) {
+  xs.push(v)
+  if v >= 0 {
+    // Grown lazily to the largest MEMBER index, never to `T.tys.length`: the arena
+    // keeps growing long after the last member is recorded, and an out-of-range
+    // read is already the right answer.
+    while flags.length <= v { flags.push(false) }
+    flags[v] = true
   }
-  false
+  0
+}
+// Membership in the set `flags` indexes. Out of range answers false and never
+// traps, which covers both a negative index and an arena that outgrew the set.
+function cTyIxSetHas(flags: boolean[], v: i32) {
+  if v < 0 { return false }
+  if v >= flags.length { return false }
+  flags[v]
 }
 // STRUCTURAL (C1): node `ix`'s recorded type IS a declared struct and NOT a union-variant member —
 // the nominal analogue of the emitter's `isSName(tyNameOf(ix))`, read from the checker's arena-index
@@ -23442,8 +23530,8 @@ function cTyIxListHas(xs: i32[], v: i32) {
 export function nodeTyIsStruct(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
-  if cTyIxListHas(cVariantMemberTyIxs, ty) { return false }
-  if cTyIxListHas(cStructTyIxs, ty) { return true }
+  if cTyIxSetHas(cVariantMemberTyIxSet, ty) { return false }
+  if cTyIxSetHas(cStructTyIxSet, ty) { return true }
   const t = T.tys[ty]
   if t is TyObj { return true }
   if t is TyUnion {
@@ -23463,7 +23551,7 @@ export function nodeTyIsStruct(ix: i32) {
 export function nodeTyIsVariant(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
-  if !cTyIxListHas(cVariantMemberTyIxs, ty) { return false }
+  if !cTyIxSetHas(cVariantMemberTyIxSet, ty) { return false }
   const t = T.tys[ty]
   if t is TyObj { return true }
   false
@@ -23484,8 +23572,8 @@ export function nodeTyIsNulStruct(ix: i32) {
   if t is TyNullable {
     const inner = t.nInner
     if inner < 0 { return false }
-    if cTyIxListHas(cVariantMemberTyIxs, inner) { return false }
-    if cTyIxListHas(cStructTyIxs, inner) { return true }
+    if cTyIxSetHas(cVariantMemberTyIxSet, inner) { return false }
+    if cTyIxSetHas(cStructTyIxSet, inner) { return true }
     const it = T.tys[inner]
     if it is TyObj { return true }
     return false
@@ -23659,8 +23747,8 @@ export function nodeTyIsStructArray(ix: i32) {
   if t is TyArray {
     const e = t.aElem
     if e < 0 { return false }
-    if cTyIxListHas(cVariantMemberTyIxs, e) { return false }
-    if cTyIxListHas(cStructTyIxs, e) { return true }
+    if cTyIxSetHas(cVariantMemberTyIxSet, e) { return false }
+    if cTyIxSetHas(cStructTyIxSet, e) { return true }
     const et = T.tys[e]
     if et is TyObj { return true }
     return false
@@ -23779,7 +23867,7 @@ export function litUnionAliasOfLitTexts(texts: string[]): string {
 // index apart: a NAME that is an intern key must be one name per type, and an arena
 // INDEX that a classifier compares by identity must be one index per type.
 // `nodeTyIsLitUnionAlias` / `litUnionAliasNameOfTy` / `noteLitUnionCopy` all ask
-// `cTyIxListHas(cUnionTyIxs, ty)` — INDEX identity with a registered alias — so a
+// `cTyIxSetHas(cUnionTyIxSet, ty)` — INDEX identity with a registered alias — so a
 // FRESHLY MINTED union carrying exactly `K`'s members is not `K` to any of them.
 // `tsToTy`'s union arm used to get that identity for free on the degenerate spellings
 // (`K | K` deduped to ONE member and returned `K`'s own index); once the litunion
@@ -23919,7 +24007,7 @@ export function litUnionInlineNameOfTy(ty: i32): string {
 export function nodeTyIsLitUnionAlias(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
-  if !cTyIxListHas(cUnionTyIxs, ty) { return false }
+  if !cTyIxSetHas(cUnionTyIxSet, ty) { return false }
   tyIsLitUnion(ty)
 }
 // Does the annotation node's type BEAR NULL — structurally, without rendering it and splitting
@@ -24187,7 +24275,7 @@ export function nodeTyIsNulClosure(ix: i32) {
 // structural walk cannot re-derive (the arena's `TyObj`/`TyUnion` carry no name).
 export function tyIxIsVariantMember(ty: i32) {
   if ty < 0 { return false }
-  cTyIxListHas(cVariantMemberTyIxs, ty)
+  cTyIxSetHas(cVariantMemberTyIxSet, ty)
 }
 // The declared litunion ALIAS a litunion arena index denotes, or -1: the index
 // itself when it IS a declared alias (`type K = "a" | "b"`), else the recorded
@@ -24199,7 +24287,7 @@ export function tyIxIsVariantMember(ty: i32) {
 export function tyLitUnionAliasIx(ty: i32): i32 {
   if ty < 0 { return -1 }
   if !tyIsLitUnion(ty) { return -1 }
-  if cTyIxListHas(cUnionTyIxs, ty) { return ty }
+  if cTyIxSetHas(cUnionTyIxSet, ty) { return ty }
   let i = 0
   while i < cLitUnionCopyTyIxs.length {
     if cLitUnionCopyTyIxs[i] == ty { return cLitUnionCopyAliasIxs[i] }
