@@ -1,0 +1,90 @@
+// THE DISCRIMINATED-UNION MOVE: read the tag off the un-narrowed union, and branch on it.
+// Two changes meet here, and the second one is a silent defect that predates both.
+//
+// (1) THE JOIN. `sharedUnionFieldTy` required the field's type to be MUTUALLY ASSIGNABLE
+// across members, so `{kind: "circle", …} | {kind: "rect", …}` — which carries `kind` on both
+// arms, at two types neither assignable to the other — was refused, under a diagnostic wrong
+// on its own terms: `field 'kind' is not on every member of S — narrow with \`is\` first`,
+// when `kind` IS on every member. The arms differing in that field is precisely what makes it
+// a TAG rather than a field. The type is now the JOIN of the per-member field types, which is
+// a STRICT REFINEMENT: `joinTys` short-circuits on exactly the mutual assignability the old
+// rule demanded, so every pair that answered before answers identically.
+//
+// (2) THE ATOM WIDEN, and it is a SILENT WRONG VALUE that reproduces on master with no join
+// involved. A named literal-union field (`kind: KC`) reps as an interned i32 ATOM, and
+// `exprIsLitAtom` claims that rep for a narrowed receiver, a variant-typed receiver and a
+// plain struct receiver — the three shapes whose reads print `circle`. It did NOT claim the
+// UN-NARROWED UNION receiver, so `print` skipped the atom→member widen and printed the raw
+// id: `0`. Two arms both spelling `kind: KC` are mutually assignable, so that read was
+// ALWAYS allowed, and the field codes 0, so the dispatch ALWAYS fired — verified on
+// `origin/master` in a clean worktree before this file was written. The variant arm's own
+// comment names the failure exactly one receiver shape over: *"Without it the read printed
+// the raw atom id."*
+//
+// Both fixes hang off `sharedUnionFieldPlan`, the one derivation the emitter's dispatch and
+// the classifiers share, so the atom claim cannot drift from the bytes. Code 0 is necessary
+// and NOT sufficient for the atom claim — it is also plain `i32`/`boolean` — so every
+// member's field must additionally BE a litunion, asked per member through the variant table.
+//
+// The ATOM ID SPACE is probed deliberately below: two DIFFERENT named litunions, and two
+// MULTI-MEMBER ones, each exercised through both arms. Per-alias id numbering would print the
+// wrong member here; it prints the right one.
+// @run
+// @log circle
+// @log rect
+// @log C
+// @log R
+// @log circle
+// @log rect
+// @log round
+// @log square
+// @log circle
+// @log circle
+// @log 7
+
+// (1) bare literal tags — the spelling a user writes first. These rep as plain strings.
+type C = { kind: "circle", r: f64 }
+type R = { kind: "rect", w: f64 }
+type S = C | R
+function tag(s: S) { print(s.kind) }
+tag({ kind: "circle", r: 1.0 })
+tag({ kind: "rect", w: 2.0 })
+
+// branching ON the tag — the move the whole idiom exists for
+function which(s: S) {
+  if s.kind == "circle" { print("C") } else { print("R") }
+}
+which({ kind: "circle", r: 1.0 })
+which({ kind: "rect", w: 2.0 })
+
+// (2) NAMED litunion tags — the atom rep. Two distinct aliases, both arms exercised, so a
+// collision in the interned id space would show as the wrong member text.
+type KC = "circle"
+type KR = "rect"
+type Ca = { kind: KC, r: f64 }
+type Ra = { kind: KR, w: f64 }
+function tagA(s: Ca | Ra) { print(s.kind) }
+tagA({ kind: "circle", r: 1.0 })
+tagA({ kind: "rect", w: 2.0 })
+
+// MULTI-MEMBER named litunions, reading a non-first member from each arm
+type MC = "circle" | "round"
+type MR = "rect" | "square"
+type Cm = { kind: MC, r: f64 }
+type Rm = { kind: MR, w: f64 }
+function tagM(s: Cm | Rm) { print(s.kind) }
+tagM({ kind: "round", r: 1.0 })
+tagM({ kind: "square", w: 2.0 })
+
+// The cell that was silently wrong on master: ONE named litunion, both arms, no join needed.
+type Cs = { kind: KC, r: f64 }
+type Rs = { kind: KC, w: f64 }
+function tagS(s: Cs | Rs) { print(s.kind) }
+tagS({ kind: "circle", r: 1.0 })
+tagS({ kind: "circle", w: 2.0 })
+
+// A plain i32 shared field is code 0 too and must NOT be claimed as an atom.
+type Ci = { n: i32, r: f64 }
+type Ri = { n: i32, w: f64 }
+function tagI(s: Ci | Ri) { print(s.n) }
+tagI({ n: 7, r: 1.0 })

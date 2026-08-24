@@ -4332,10 +4332,30 @@ function placeFieldTy(baseTy: i32, prop: string, optional: boolean) {
   ft
 }
 
-// SHARED-FIELD ACCESS over a struct union (the host's `sharedUnionField`): a
-// field present on EVERY member with a mutually-assignable type is readable on
-// the union directly, without narrowing — `(A | B).tag`. -1 when any member
-// lacks the field, disagrees on its type, or isn't a struct.
+// SHARED-FIELD ACCESS over a struct union (the host's `sharedUnionField`): a field present
+// on EVERY member is readable on the union directly, without narrowing — `(A | B).tag` — and
+// its type is the JOIN of the per-member field types. -1 when any member lacks the field or
+// isn't a struct.
+//
+// THE JOIN REPLACES A MUTUAL-ASSIGNABILITY TEST, and that test is why the DISCRIMINATED-UNION
+// move did not work. `{kind: "circle", …} | {kind: "rect", …}` carries `kind` on both arms, at
+// two types neither of which is assignable to the other, so the read was refused — under a
+// diagnostic that was wrong on its own terms: *"field 'kind' is not on every member of S —
+// narrow with `is` first"*, when `kind` IS on every member. `s.kind` is the whole point of a
+// tag, and the arms differing in it is what makes it a tag rather than a field.
+//
+// A STRICT REFINEMENT of the old rule, not a widening of it: `joinTys` short-circuits on
+// exactly the mutual-assignability this used to require (`assignable(b,a)` → `a`), so every
+// pair that answered before answers identically now, and only pairs that previously answered
+// -1 can move.
+//
+// THE REP QUESTION IS NOT ASKED HERE, deliberately, and it is the emitter's for a reason: a
+// join is about what the value CAN BE, while whether the read can be lowered is about whether
+// the members store it the same way. `sharedUnionFieldPlan` requires one field CODE across
+// members and the dispatch refuses otherwise — so a join over two different reps (`{n: i32} |
+// {n: f64}`) types cleanly here and takes a loud emit reject there, which is the correct
+// column for it and the same one it had before. Teaching this seam about codes would put the
+// rep ladder in the checker to buy a slightly earlier message.
 function sharedUnionFieldTy(u: TyUnion, prop: string) {
   const members = u.uMembers
   if members.length < 1 { return -1 }
@@ -4348,8 +4368,7 @@ function sharedUnionFieldTy(u: TyUnion, prop: string) {
     if m is TyObj {
       const ft = objFieldType(m, prop)
       if ft < 0 { return -1 }
-      if shared < 0 { shared = ft }
-      else if !assignable(shared, ft) || !assignable(ft, shared) { return -1 }
+      if shared < 0 { shared = ft } else { shared = joinTys(shared, ft) }
     } else {
       return -1
     }
