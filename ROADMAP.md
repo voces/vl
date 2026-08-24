@@ -860,6 +860,11 @@ in-language GC knobs.
   produces un-named types BY CONSTRUCTION, so shipping this without first extending the atom rep to
   un-named literal types puts inferred values in the slower rep — losing the runtime parity that is
   the whole argument for string enums.
+  **#1852 did NOT move that rep, and A5c still needs it.** What it added is the missing CONVERSION
+  at atom-typed destinations for a ONE-MEMBER literal set — `if s is "aa" { return s }` and a `"aa"`
+  parameter were check-clean invalid wasm while the two-member spelling beside them ran, because the
+  conversion hook asked a predicate that requires a `TyUnion`. Values still rep as strings at their
+  own type; they convert only where an atom slot receives them.
 - ⬜ **A5d. Deferred (use-site) widening.** `softenImplicitType` widens a literal to its base EAGERLY
   at the binding. A5c needs the opposite: keep the literal, widen on demand at the use. Different
   machinery, not a parameter of the existing pass. Unfiled before 2026-08-16.

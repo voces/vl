@@ -1,0 +1,135 @@
+// @run
+// CONTRACT: a STRING-repped value whose type is a ONE-MEMBER literal set — what `if s is "aa"`
+// over a plain `string` produces, and what a `"aa"` annotation produces without any `is` at all —
+// may be CONSUMED at every ATOM-typed destination, exactly as the multi-member spelling beside it
+// already could (`narrowed-string-rep-litunion-consumption.vl`).
+//
+// WHY IT IS A FIXTURE. A named litunion reps as an interned i32 ATOM; a `string` is a
+// `(ref $array)`. The emitter converts between them with a `select` tower over the member texts
+// (`emitStrToAtom`), and that tower is total for a set of ANY size — its last arm is the
+// unconditional default either way, so a one-member set is the tower with no comparison at all.
+// But the hook that reached it asked `tyIsLitUnion`, which requires a `TyUnion` and therefore
+// answered NO for the bare `TyLit` a one-member set is. So the SAME program compiled with two
+// members and emitted a `(ref $array)` into an i32 slot with one:
+//
+//     if s is "aa" | "ab" { return s }   // ran
+//     if s is "aa"        { return s }   // `vl check` clean, INVALID WASM
+//
+// One ladder, one arm short (#1852). Every group below is a shape that was check-clean invalid
+// wasm; the two CONTROL groups are the shapes that already worked and must not move.
+//
+// MEMBERSHIP IS CHECKER-GUARANTEED, which is what makes the comparison-free tower sound: `is`
+// lowers to a real string compare (`fromString("zz")` takes the else arm below), and every other
+// route to a one-member type rejects a plain `string` source — `const x: "aa" = s`,
+// `g(s)` into a `"aa"` parameter and `t = "zz"` over a narrowed `t` are all hard type errors.
+//
+// EVERY GROUP SPELLS DISJOINT LEXEMES (#1304's method note) so no alias registration can answer
+// a lookup it was not asked.
+
+// ── 1. a plain `string` narrowed by `is "aa"`, at all six atom-typed destinations ──
+// @log l:aa
+// @log p:aa
+// @log f:aa
+// @log e:aa
+// @log r:aa
+// @log m:aa
+// @log no
+type K = "aa" | "ab"
+type SK = { f: K }
+function takesK(k: K) { print("p:" + k) }
+function retK(k: K): K { return k }
+function fromString(s: string) {
+  if s is "aa" {
+    const r: K = s // an annotated local slot
+    print("l:" + r)
+    takesK(s) // a `K` parameter
+    const o: SK = { f: s } // a `K` struct field
+    print("f:" + o.f)
+    const xs: K[] = [s] // a `K[]` element
+    print("e:" + xs[0])
+    print("r:" + retK(s)) // a `K` return, through a `K` argument
+    let m: K = "ab"
+    m = s // an assignment to a `K` local
+    print("m:" + m)
+  } else {
+    print("no")
+  }
+  0
+}
+fromString("aa")
+fromString("zz")
+
+// ── 2. the `K` RETURN of the narrowed value — the issue's own program ──────────────
+// @log true
+// @log false
+type B = "ba" | "bb"
+function fromStr(s: string): B {
+  if s is "ba" { return s }
+  return "bb"
+}
+print(fromStr("ba") == "ba")
+print(fromStr("zz") == "ba")
+
+// ── 3. a `"ca"` PARAMETER — the same rep gap with no `is` anywhere ─────────────────
+// @log true
+type C = "ca" | "cb"
+function fromLitParam(s: "ca"): C { return s }
+print(fromLitParam("ca") == "ca")
+
+// ── 4. a `"da"` LOCAL, and a NAMED one-member alias as the destination ────────────
+// @log true
+// @log true
+// @hint redundant type annotation: `n` is inferred as `"da"`
+type D = "da" | "db"
+type DOne = "da"
+function fromLitLocal() {
+  const s: "da" = "da"
+  const k: D = s
+  print(k == "da")
+  const n: DOne = s
+  print(n == "da")
+  0
+}
+fromLitLocal()
+
+// ── CONTROL A: an ATOM-repped receiver narrowed the same way ──────────────────────
+// The `exprIsLitAtom` decline in front of the conversion is what keeps this group out of it:
+// `k` is already the interned id every destination here wants, so it must keep lowering to the
+// plain i32 copy it always did. Every `match` arm over a litunion is this shape.
+// @log A:ea
+// @log A:ea
+// @log A:-
+type E = "ea" | "eb"
+function fromAtom(k: E) {
+  if k is "ea" {
+    const r: E = k
+    print("A:" + r)
+    const xs: E[] = [k]
+    print("A:" + xs[0])
+  } else {
+    print("A:-")
+  }
+  0
+}
+fromAtom("ea")
+fromAtom("eb")
+
+// ── CONTROL B: the narrowed value is still a `string` where a string is wanted ─────
+// The narrowing must not move the value onto the atom rep at its OWN type — only at an
+// atom-typed destination. `print`, `+` and a `string` parameter all keep it.
+// (`.length` is a separate, pre-existing gap: a one-member literal type carries no string
+// members, so `s.length` inside the guard is a hard type error. Not a rep question.)
+// @log fa
+// @log fa!
+// @log h:fa
+type F = "fa" | "fb"
+function takesStr(x: string) { print("h:" + x) }
+function stillString(s: string) {
+  if s is "fa" {
+    print(s)
+    print(s + "!")
+    takesStr(s)
+  }
+  0
+}
+stillString("fa")
