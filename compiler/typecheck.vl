@@ -1882,6 +1882,15 @@ let nodeTyIx: i32[] = []
 // Sized with `nodeTyIx` and read through `isVarTyIxOf`, so an emitter-synthesized
 // (monomorphized) `is` node falls past the end, reads -1, and its consumer keeps the name path.
 let isVarTyIx: i32[] = []
+// THE DISCRIMINANT BANK, parallel to `isVarTyIx` and sized with it. At an `is` test whose
+// receiver is a member PATH over a struct union, this records the type the RECEIVER narrows to
+// in the THEN branch — `pushDiscrimParentFact`'s answer. The emitter cannot cheaply re-derive
+// it: doing so means comparing a tested SPELLING against each arm's field identity, which lives
+// in a different column depending on how the tag was written (a litunion alias in
+// `uFieldElemName`, a bare literal in `uFieldTyText`, a plain type in neither). The checker
+// already decided it against the arena, so it banks THE ANSWER — the same reason `isVarTyIx`
+// exists, one narrowing channel over. THEN only: the emitter's complement path is another site.
+let isParentTyIx: i32[] = []
 // CONTEXT-RESOLVED type sidecar (rep-twin-matcher phase 0a): parallel to `nodeTyIx`, this table
 // records — at the arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal
 // node was widened INTO, which the emitter actually builds the rep for. `nodeTyIx` holds the
@@ -2750,6 +2759,7 @@ export function initChecker() {
   bodyChecked = Map()
   nodeTyIx = []
   isVarTyIx = []
+  isParentTyIx = []
   nodeRepTyIx = []
   annUnionAtoms = []
   cFuncPinTyIx = -1
@@ -4797,6 +4807,71 @@ function pushNarrowFact(placeIx: i32, ty: i32, names: string[], tys: i32[]) {
   0
 }
 
+// THE DISCRIMINANT RULE: a test on a struct union's FIELD refines the UNION itself.
+//
+// `if s.kind is KC { s.r }` over `{kind: KC, r: f64} | {kind: KR, w: f64}` narrowed only the
+// FIELD — the `s.kind` path overlay — and left `s` at the full union, so the very next line
+// was `field 'r' is not on every member of S — narrow with \`is\` first`. That is the
+// discriminated-union move, and the reason a tag is written at all: the arms differ in it
+// precisely so that reading it tells you which arm you have.
+//
+// A member survives when its own field type is still INHABITABLE under the fact — mutual
+// assignability either way, the same test `sharedUnionFieldTy` used to demand of the whole
+// union. `KC` against a `KC` arm keeps it; `KC` against a `KR` arm drops it.
+//
+// FOUR REFUSALS, each of which would otherwise be unsound or useless:
+//   - a receiver behind a `?.` hop — the chain may be null because a RECEIVER was, the same
+//     reason `collectElseNarrows` refuses one;
+//   - any member that is not a struct, or that lacks the field — the field does not
+//     discriminate a union it is not present on, and dropping arms on that basis would be
+//     narrowing on absence;
+//   - ZERO survivors — the fact contradicts every arm, which is a type error to be reported
+//     where it happens, not a `never` smuggled in through an overlay;
+//   - ALL survivors — no refinement, so pushing a fact would only cost a shadow.
+//
+// The fact is pushed for the RECEIVER place, so it rides the identical machinery a direct
+// `s is C` uses; nothing downstream needs to know the narrowing came from a field.
+function pushDiscrimParentFact(
+  placeIx: i32,
+  fieldTy: i32,
+  names: string[],
+  tys: i32[],
+  bankIx: i32,
+) {
+  if fieldTy < 0 { return 0 }
+  const n = P.nodes[placeIx]
+  if !(n is Member) { return 0 }
+  if placeHasOptionalHop(placeIx) { return 0 }
+  const recvTy = placeCurTy(n.memObj, names, tys)
+  if recvTy < 0 { return 0 }
+  const rt = T.tys[recvTy]
+  if !(rt is TyUnion) { return 0 }
+  const ms = rt.uMembers
+  const kept: i32[] = []
+  let i = 0
+  while i < ms.length {
+    if ms[i] < 0 { return 0 }
+    const m = T.tys[ms[i]]
+    if !(m is TyObj) { return 0 }
+    const ft = objFieldType(m, n.memProp)
+    if ft < 0 { return 0 }
+    if assignable(fieldTy, ft) || assignable(ft, fieldTy) { kept.push(ms[i]) }
+    i = i + 1
+  }
+  if kept.length == 0 { return 0 }
+  if kept.length == ms.length { return 0 }
+  let res = kept[0]
+  if kept.length > 1 { res = mkUnionTy(kept) }
+  // Bank the answer for the emitter's narrowing stack (`isParentTyIxOf`), which cannot
+  // re-derive it from the tested spelling. Guarded on the node being in range: an
+  // emitter-synthesized `is` (a monomorphized clone) falls past the end and reads -1, which
+  // is the "push nothing" answer.
+  if bankIx >= 0 {
+    if bankIx < isParentTyIx.length { isParentTyIx[bankIx] = res }
+  }
+  pushNarrowFact(n.memObj, res, names, tys)
+}
+
 // Whether the place runs through a `?.` hop — its negation is then not a sound
 // else-branch refinement (the chain may be null because a RECEIVER was).
 function placeHasOptionalHop(ix: i32) {
@@ -4875,7 +4950,10 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
       pushNarrowFact(cond.isObj, TY_NULL, names, tys)
     } else {
       const tIdx = isTypeTyRead(cond.isVariant, condIx)
-      if tIdx >= 0 { pushNarrowFact(cond.isObj, tIdx, names, tys) }
+      if tIdx >= 0 {
+        pushNarrowFact(cond.isObj, tIdx, names, tys)
+        pushDiscrimParentFact(cond.isObj, tIdx, names, tys, condIx)
+      }
     }
     return 0
   }
@@ -4941,6 +5019,15 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
       const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 {
         pushNarrowFact(cond.isObj, subtractTy(cur, tIdx), names, tys)
+        // NO DISCRIMINANT COMPLEMENT HERE, and the reason is agreement rather than
+        // difficulty. `setNarrowFromCondElse` deliberately declines to else-narrow a STRUCT
+        // union — "their member reads must not change" — so a checker-side complement would
+        // type `else { s.w }` clean and hand it to an emitter that still sees the full union:
+        // a LOUD `field access but no struct type declared` instead of the accurate
+        // `field 'w' is not on every member of S — narrow with \`is\` first`. Both reject, so
+        // nothing is unsound either way; the one that names the field is the better message,
+        // and it is the honest one while the emitter's complement does not exist. The THEN
+        // half is complete and shipped; the ELSE half is one slice, in both layers at once.
       }
     }
     return 0
@@ -22419,6 +22506,7 @@ export function checkProgram(rootIx: i32) {
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
   isVarTyIx = []
+  isParentTyIx = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   nodePinKind = []
@@ -22427,6 +22515,7 @@ export function checkProgram(rootIx: i32) {
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
     isVarTyIx.push(-1)
+    isParentTyIx.push(-1)
     ntz = ntz + 1
   }
   checkNode(rootIx)
@@ -23030,6 +23119,15 @@ export function annUnionAtomsOf(ix: i32) {
 export function isVarTyIxOf(ix: i32) {
   if ix >= 0 {
     if ix < isVarTyIx.length { return isVarTyIx[ix] }
+  }
+  -1
+}
+// The type the RECEIVER of a member-path `is` test narrows to in the THEN branch — the
+// DISCRIMINANT rule's answer, banked at the `is` node. -1 when the test does not discriminate
+// a parent union (the common case), which is exactly when the emitter should push nothing.
+export function isParentTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < isParentTyIx.length { return isParentTyIx[ix] }
   }
   -1
 }
