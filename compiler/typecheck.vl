@@ -1891,6 +1891,11 @@ let isVarTyIx: i32[] = []
 // already decided it against the arena, so it banks THE ANSWER — the same reason `isVarTyIx`
 // exists, one narrowing channel over. THEN only: the emitter's complement path is another site.
 let isParentTyIx: i32[] = []
+// THE ELSE TWIN of `isParentTyIx`. One table per BRANCH rather than one table plus a
+// direction flag: both facts are keyed on the SAME condition node, and the emitter reads
+// them from two different sites (`setNarrowFromCond` and `setNarrowFromCondElse`) that never
+// run together for one branch. A flag would have to be set by whichever site asked last.
+let isParentElseTyIx: i32[] = []
 // CONTEXT-RESOLVED type sidecar (rep-twin-matcher phase 0a): parallel to `nodeTyIx`, this table
 // records — at the arena-pure coercion/ADOPTION sites — the DESTINATION (context) type a literal
 // node was widened INTO, which the emitter actually builds the rep for. `nodeTyIx` holds the
@@ -2760,6 +2765,7 @@ export function initChecker() {
   nodeTyIx = []
   isVarTyIx = []
   isParentTyIx = []
+  isParentElseTyIx = []
   nodeRepTyIx = []
   annUnionAtoms = []
   cFuncPinTyIx = -1
@@ -4807,6 +4813,13 @@ function pushNarrowFact(placeIx: i32, ty: i32, names: string[], tys: i32[]) {
   0
 }
 
+// How a discriminant fact selects surviving arms. `"intersect"` keeps an arm whose field
+// type can still BE the fact — the rule for a positive test, and for the complement of an
+// `is`, where the fact is already the subtracted remainder. `"exclude"` keeps an arm whose
+// field type is NOT wholly the fact — the rule for the complement of an EQUALITY, where the
+// fact is a single literal and only an arm pinned to exactly that literal is ruled out.
+type DiscrimMode = "intersect" | "exclude"
+
 // THE DISCRIMINANT RULE: a test on a struct union's FIELD refines the UNION itself.
 //
 // `if s.kind is KC { s.r }` over `{kind: KC, r: f64} | {kind: KR, w: f64}` narrowed only the
@@ -4837,6 +4850,8 @@ function pushDiscrimParentFact(
   names: string[],
   tys: i32[],
   bankIx: i32,
+  elseBank: boolean,
+  mode: DiscrimMode,
 ) {
   if fieldTy < 0 { return 0 }
   const n = P.nodes[placeIx]
@@ -4855,19 +4870,32 @@ function pushDiscrimParentFact(
     if !(m is TyObj) { return 0 }
     const ft = objFieldType(m, n.memProp)
     if ft < 0 { return 0 }
-    if assignable(fieldTy, ft) || assignable(ft, fieldTy) { kept.push(ms[i]) }
+    if mode == "exclude" {
+      // THE COMPLEMENT OF AN EQUALITY. `s.kind == "circle"` being FALSE rules out exactly
+      // the arms whose tag can ONLY be `"circle"` — `assignable(ft, fact)` says every value
+      // of that field IS the literal. An arm whose tag is a WIDER set (`"circle" | "round"`,
+      // or plain `string`) survives: it can hold something else, so the false branch has not
+      // ruled it out. That asymmetry is why this is not the intersect test negated.
+      if !assignable(ft, fieldTy) { kept.push(ms[i]) }
+    } else if assignable(fieldTy, ft) || assignable(ft, fieldTy) {
+      kept.push(ms[i])
+    }
     i = i + 1
   }
   if kept.length == 0 { return 0 }
   if kept.length == ms.length { return 0 }
   let res = kept[0]
   if kept.length > 1 { res = mkUnionTy(kept) }
-  // Bank the answer for the emitter's narrowing stack (`isParentTyIxOf`), which cannot
-  // re-derive it from the tested spelling. Guarded on the node being in range: an
-  // emitter-synthesized `is` (a monomorphized clone) falls past the end and reads -1, which
-  // is the "push nothing" answer.
+  // Bank the answer for the emitter's narrowing stack (`isParentTyIxOf` /
+  // `isParentElseTyIxOf`), which cannot re-derive it from the tested spelling. Guarded on
+  // the node being in range: an emitter-synthesized `is` (a monomorphized clone) falls past
+  // the end and reads -1, which is the "push nothing" answer.
   if bankIx >= 0 {
-    if bankIx < isParentTyIx.length { isParentTyIx[bankIx] = res }
+    if elseBank {
+      if bankIx < isParentElseTyIx.length { isParentElseTyIx[bankIx] = res }
+    } else {
+      if bankIx < isParentTyIx.length { isParentTyIx[bankIx] = res }
+    }
   }
   pushNarrowFact(n.memObj, res, names, tys)
 }
@@ -4984,7 +5012,15 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
       const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 {
         pushNarrowFact(cond.isObj, tIdx, names, tys)
-        pushDiscrimParentFact(cond.isObj, tIdx, names, tys, condIx)
+        pushDiscrimParentFact(
+          cond.isObj,
+          tIdx,
+          names,
+          tys,
+          condIx,
+          false,
+          "intersect",
+        )
       }
     }
     return 0
@@ -5019,7 +5055,15 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
       if eqPlace >= 0 {
         const eqTy = litCmpTy(condIx)
         if eqTy >= 0 {
-          pushDiscrimParentFact(eqPlace, eqTy, names, tys, condIx)
+          pushDiscrimParentFact(
+            eqPlace,
+            eqTy,
+            names,
+            tys,
+            condIx,
+            false,
+            "intersect",
+          )
         }
       }
     }
@@ -5067,16 +5111,23 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
     } else {
       const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 {
-        pushNarrowFact(cond.isObj, subtractTy(cur, tIdx), names, tys)
-        // NO DISCRIMINANT COMPLEMENT HERE, and the reason is agreement rather than
-        // difficulty. `setNarrowFromCondElse` deliberately declines to else-narrow a STRUCT
-        // union — "their member reads must not change" — so a checker-side complement would
-        // type `else { s.w }` clean and hand it to an emitter that still sees the full union:
-        // a LOUD `field access but no struct type declared` instead of the accurate
-        // `field 'w' is not on every member of S — narrow with \`is\` first`. Both reject, so
-        // nothing is unsound either way; the one that names the field is the better message,
-        // and it is the honest one while the emitter's complement does not exist. The THEN
-        // half is complete and shipped; the ELSE half is one slice, in both layers at once.
+        const sub = subtractTy(cur, tIdx)
+        pushNarrowFact(cond.isObj, sub, names, tys)
+        // THE COMPLEMENT, banked into the ELSE table. This was deliberately withheld when
+        // the THEN half shipped, because `setNarrowFromCondElse` declines to else-narrow a
+        // struct union and a checker-only complement would have typed `else { s.w }` clean
+        // for an emitter still seeing the full union — trading an accurate
+        // `field 'w' is not on every member` for an obscure emit reject. The emitter's
+        // discriminant complement lands with this, so the two layers agree again.
+        pushDiscrimParentFact(
+          cond.isObj,
+          sub,
+          names,
+          tys,
+          condIx,
+          true,
+          "intersect",
+        )
       }
     }
     return 0
@@ -5096,6 +5147,25 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
           if inner >= 0 && inner != cur {
             pushNarrowFact(placeIx, inner, names, tys)
           }
+        }
+      }
+      // `if s.kind == "circle" { … } else { … }` — the ELSE arm of the discriminant. The
+      // test being FALSE rules out exactly the arms whose tag can ONLY be that literal, so
+      // the fact is the literal and the mode is `"exclude"`; see its header for why that is
+      // not the positive test negated.
+      const eqPlace = litCmpPlace(condIx)
+      if eqPlace >= 0 {
+        const eqTy = litCmpTy(condIx)
+        if eqTy >= 0 {
+          pushDiscrimParentFact(
+            eqPlace,
+            eqTy,
+            names,
+            tys,
+            condIx,
+            true,
+            "exclude",
+          )
         }
       }
     }
@@ -22575,6 +22645,7 @@ export function checkProgram(rootIx: i32) {
   nodeTyIx = []
   isVarTyIx = []
   isParentTyIx = []
+  isParentElseTyIx = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   nodePinKind = []
@@ -22584,6 +22655,7 @@ export function checkProgram(rootIx: i32) {
     nodeTyIx.push(-1)
     isVarTyIx.push(-1)
     isParentTyIx.push(-1)
+    isParentElseTyIx.push(-1)
     ntz = ntz + 1
   }
   checkNode(rootIx)
@@ -23196,6 +23268,15 @@ export function isVarTyIxOf(ix: i32) {
 export function isParentTyIxOf(ix: i32) {
   if ix >= 0 {
     if ix < isParentTyIx.length { return isParentTyIx[ix] }
+  }
+  -1
+}
+// The ELSE-branch twin: the type the receiver of a member-path test narrows to when the test
+// is FALSE. -1 when the complement does not refine the parent, which is when the emitter
+// should push nothing.
+export function isParentElseTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < isParentElseTyIx.length { return isParentElseTyIx[ix] }
   }
   -1
 }

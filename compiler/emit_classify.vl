@@ -77,6 +77,7 @@ import {
   isBoolLitExpr,
   isInferLetNulBool,
   isInferLetNulStr,
+  isParentElseTyIxOf,
   isParentTyIxOf,
   isTopLevelFuncTypeName,
   isValueUnionName,
@@ -9817,12 +9818,18 @@ function mfResKindFromSigRet(k: VKind | null): MfKind | null {
 // rather than a name; with nothing pushed the emitter keeps the full union, and a field
 // present on only the survivors then fails the shared-field plan's all-members test and takes
 // its loud reject. A field on ALL arms still reads correctly through that same plan.
-function pushDiscrimNarrow(placeIx: i32, condIx: i32, fnIx: i32): boolean {
+function pushDiscrimNarrow(
+  placeIx: i32,
+  condIx: i32,
+  fnIx: i32,
+  elseArm: boolean,
+): boolean {
   const pn = P.nodes[placeIx]
   if !(pn is Member) { return false }
   const root = P.nodes[unwrapParen(pn.memObj)]
   if !(root is Ident) { return false }
-  const dTy = isParentTyIxOf(condIx)
+  let dTy = isParentTyIxOf(condIx)
+  if elseArm { dTy = isParentElseTyIxOf(condIx) }
   if dTy < 0 { return false }
   const dNm = nominalStructNameOfTy(dTy)
   if dNm == "" { return false }
@@ -9906,7 +9913,9 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     // emitter keeps the full union, and a field present on only the survivors then fails the
     // shared-field plan's all-members test and takes its loud reject. A field present on ALL
     // arms still reads correctly through that same plan, so nothing regresses.
-    if pushDiscrimNarrow(unwrapParen(c.isObj), condIx, fnIx) { return true }
+    if pushDiscrimNarrow(unwrapParen(c.isObj), condIx, fnIx, false) {
+      return true
+    }
     // `x?.y is T` narrows the member PATH exactly like `x.y is T` — the then-arm
     // only runs when every chain link held AND the union field matched, so the
     // plain `x.y` reads inside it unbox under the same path key.
@@ -9938,8 +9947,10 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     // declared, and the one a user writes first. Same bank, same push as the `is` arm above;
     // the checker recorded which arm survives, keyed on this very node.
     if c.binOp == "==" && !narrowStripNullOnly {
-      if pushDiscrimNarrow(unwrapParen(c.binLeft), condIx, fnIx) { return true }
-      if pushDiscrimNarrow(unwrapParen(c.binRight), condIx, fnIx) {
+      if pushDiscrimNarrow(unwrapParen(c.binLeft), condIx, fnIx, false) {
+        return true
+      }
+      if pushDiscrimNarrow(unwrapParen(c.binRight), condIx, fnIx, false) {
         return true
       }
     }
@@ -10136,6 +10147,16 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     // Hoisting is therefore the minimal fix — the alternative, widening the gate,
     // would also let the Ident arm below see struct variants it deliberately declines.
     const mrecv = P.nodes[unwrapParen(c.isObj)]
+    // THE DISCRIMINANT COMPLEMENT. `if s.kind is KC { … } else { … }` rules the tested arm
+    // OUT of the else branch, so the receiver narrows there too. This is the exception the
+    // "struct unions keep their existing (no else-narrowing) behavior" note above is scoped
+    // around: it applies to the general struct-union complement, which is derived from a
+    // rendered SET and would change member reads broadly. This one is the CHECKER's banked
+    // answer for one condition node, pushed only when a single arm survives, so it moves
+    // exactly the branches the checker already typed as narrowed and nothing else.
+    if pushDiscrimNarrow(unwrapParen(c.isObj), condIx, fnIx, true) {
+      return true
+    }
     if mrecv is Member {
       const mun = memberUnionFieldName(unwrapParen(c.isObj), fnIx)
       if mun != "" {
@@ -10255,6 +10276,18 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       const el = setNarrowFromCondElse(c.binLeft, fnIx)
       const er = setNarrowFromCondElse(c.binRight, fnIx)
       return el || er
+    }
+    // The ELSE arm of `s.kind == "circle"`: the test being FALSE rules out the arms whose
+    // tag can only be that literal. Same banked answer, same single-survivor bound as the
+    // `is` complement just above; the checker's `"exclude"` mode is what makes the two
+    // complements different rules rather than one negated.
+    if c.binOp == "==" && !narrowStripNullOnly {
+      if pushDiscrimNarrow(unwrapParen(c.binLeft), condIx, fnIx, true) {
+        return true
+      }
+      if pushDiscrimNarrow(unwrapParen(c.binRight), condIx, fnIx, true) {
+        return true
+      }
     }
   }
   // `!cond` in the ELSE-arm: the inner condition was TRUE there, so the else sees
