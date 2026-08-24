@@ -54,10 +54,13 @@ walks) and the wasm checker's fetch loop (lsp/src/wasmChecker.ts — `commit(key
 await read(key))`). A `std:` key must resolve in BOTH readers or the editor and
 the CLI disagree.
 
-**The seed/fixpoint flow std must not break.** The seed is assembled by
+**The seed/fixpoint flow std must not break.** ~~The seed is assembled by
 concatenating `compiler/*.vl` + the driver with import lines range-blanked
-(refresh-compiler.sh, native-fixpoint.sh);
-`refresh-compiler.sh` gives a ~40s edit→seed loop.
+(refresh-compiler.sh, native-fixpoint.sh);~~ **STALE AS WRITTEN — corrected
+2026-08-23, see the note under D1's Contract.** The seed is now built as a REAL
+module graph (`vl build compiler/entry.vl --compiler $SEED`); `refresh-compiler.sh`
+says so in as many words — *"The compiler is built from REAL `import`/`export`
+modules … No sed/cat/rename glue"* — and gives a ~40s edit→seed loop.
 
 **Generic exports are a known hole in BOTH module pipelines.** The native
 rename pass skips any declaration with `<` in its name ("exporting generics is
@@ -135,6 +138,54 @@ allowed AFTER the module-system revisit moves the build off concatenation;
 not in Phase 2, where keeping the compiler std-free keeps the seed/fixpoint
 flow untouched. The one-way door is avoided: nothing in Phase 2 makes
 compiler-uses-std harder later.
+
+> **2026-08-23 — THE MECHANISM PRECONDITION HAS BEEN MET; THE PHASE CLAUSE HAS NOT
+> BEEN RE-RULED.** The verdict above is two clauses on one semicolon. The first is
+> keyed on a MECHANISM ("after the module-system revisit moves the build off
+> concatenation") and that mechanism is gone. The second is keyed on the PHASE ("not
+> in Phase 2, where keeping the compiler std-free keeps the seed/fixpoint flow
+> untouched"), it carries exactly the cost this note leaves unmeasured, and
+> `ROADMAP.md` still shows `std:` Phase 2 open — so nothing below re-rules it. Filed
+> while adding
+> `std:array`'s ordering pair (#1856 and its follow-up), because that change had
+> been leaning on this ruling as if it were permanent, and the owner asked for the
+> constraint to be stated as mechanical and revisitable rather than settled.
+>
+> **What the constraint actually was.** Not a principle that compilers should not
+> use their own std — this section already says the opposite ("rustc uses
+> core/std, Go's compiler uses its stdlib"). It was a property of ONE SHELL
+> SCRIPT: seed assembly concatenated `compiler/*.vl` with import lines
+> range-blanked, so a `std:` import line would be blanked out and the symbol would
+> simply vanish from the seed.
+>
+> **That assembly is gone.** `scripts/refresh-compiler.sh` now builds the module
+> graph directly (`"$VL" build compiler/entry.vl -o … --compiler "$SEED"`) and its
+> own comment reads *"The compiler is built from REAL `import`/`export` modules:
+> `compiler/entry.vl` re-exports the host ABI under bare names and the vl host's
+> module fetch loop resolves the graph … No sed/cat/rename glue."* The build IS
+> off concatenation, which is exactly what the verdict above made the lift
+> conditional on.
+>
+> **Measured, not inferred.** Patching `compiler/format.vl` to
+> `import { sort } from "std:array"` and delegating `fmtSortNames` to it BUILDS
+> against the current seed, and the compiler it produces WORKS: it compiled and
+> ran a std-importing program, and `vl fmt` still sorted import names correctly
+> through the delegated call. Seed size **1,376,574 → 1,443,654 bytes, +67,080
+> (+4.9%)** unoptimised, for one module — which is the raw #1839 cost this
+> document predicts, on the seed that ROADMAP:393 records as UNOPTIMISED.
+>
+> **What is still NOT measured, and is the reason this is a note and not a
+> proposal:** whether `scripts/native-fixpoint.sh` still converges with std in the
+> graph. That is the other half of the price named above ("std sources join the
+> seed assembly + the fixpoint surface — every std edit perturbs the seed"), and
+> it is the part that would actually hurt: a std edit would then perturb the seed
+> on every commit. The bootstrap ordering rule (std must compile without importing
+> itself) is satisfiable and unchanged.
+>
+> **Status: REVISITABLE, not settled.** Nothing here proposes doing it. What it
+> forbids is citing D1 as a permanent bar — an argument resting on this ruling
+> must name the mechanism (seed assembly, now changed) and the unmeasured
+> fixpoint cost, not treat "the compiler cannot import std" as a law.
 
 ### D2. Resolution semantics
 

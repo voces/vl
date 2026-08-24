@@ -1,0 +1,160 @@
+// @run
+// @log 1,3,5,7,9
+// @log 1,2,3
+// @log 5,3,9,1,7
+// @log 1,3,5,7,9
+// @log 1,2
+// @log 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
+// @log 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39
+// @log 1,3,2,0
+// @log Apple fig pear
+// @log 40
+// @log 39
+// @log 0
+// @log 39
+// @log true
+// `std:array.sort` REORDERS ITS RECEIVER, and every assertion in this file is about the
+// half of that sentence a returning sort cannot have: the mutation is OBSERVABLE, and it
+// is observable through bindings the call never mentioned.
+//
+// This is the file that fails if `sort` is ever quietly reimplemented as `sorted` — the
+// element order would still be right and every ordering test would still pass, while
+// every caller silently stopped being sorted. That is exactly the failure a mutating API
+// invites, so it gets its own fixture rather than a line in the ordering tests.
+//
+// `array-sort-agrees.vl` pins that `sort` and `sorted` produce the SAME order;
+// `array-sorted.vl` pins the ordering itself. This one pins only the mutation.
+import { sort, sorted } from "std:array"
+import { join, toStr } from "std:fmt"
+
+function ltI(a: i32, b: i32) { a < b }
+
+function show(xs: i32[]) {
+  const parts: string[] = []
+  let i = 0
+  while i < xs.length {
+    parts.push(toStr(xs[i]))
+    i = i + 1
+  }
+  print(parts.join(","))
+}
+
+// ── the argument itself changes ───────────────────────────────────────────────
+// Note `const`: a VL list is a REFERENCE, so `const` binds the reference and does not
+// freeze the elements. `sort` needs no `let` at the call site, which is half of why it
+// drops into existing code where a returning sort does not.
+const xs = [5, 3, 9, 1, 7]
+xs.sort(ltI)
+show(xs)
+
+// ── and it changes for every ALIAS, which is the hazard stated out loud ───────
+// `alias` was bound before the sort and is never mentioned by it. VL lists have no
+// ownership discipline, so this is not a quirk — it is the semantics, and it is why the
+// module gives the mutating spelling the bare imperative verb.
+const owner = [3, 1, 2]
+const alias = owner
+owner.sort(ltI)
+show(alias)
+
+// ── `sorted` is the other half of the pair and does NOT do this ───────────────
+const keep = [5, 3, 9, 1, 7]
+const fresh = keep.sorted(ltI)
+show(keep)    // untouched
+show(fresh)   // sorted
+
+// ── in place on a list that never allocates: n <= SORT_RUN ────────────────────
+// Below the base-case run length `sort` allocates NOTHING — no auxiliary buffer, no
+// copy. Nothing here can observe an allocation directly; what it pins is that the
+// no-allocation path produces the same answer as the merge path, which is the only part
+// a test can hold onto.
+const small = [2, 1]
+small.sort(ltI)
+show(small)
+
+// ── in place ACROSS the merge, where the answer can end up in the wrong buffer ─
+// A bottom-up merge ping-pongs between the receiver and an auxiliary buffer. After an
+// ODD number of merge passes the answer sits in the auxiliary and must be copied home;
+// after an EVEN number it is already in the receiver. Both cases have to be exercised or
+// half the implementation is untested, and the parity is decided by the length:
+//   n = 17..32   -> one pass  (odd)  -> copy home
+//   n = 33..64   -> two passes (even) -> no copy
+// A `sort` that forgot the copy-home would leave the ODD case in INPUT order, so these
+// two lines are the ones that catch it.
+const odd: i32[] = []
+let i = 0
+while i < 20 {
+  odd.push((i * 7) % 20)
+  i = i + 1
+}
+odd.sort(ltI)
+show(odd)
+
+const even: i32[] = []
+i = 0
+while i < 40 {
+  even.push((i * 17) % 40)
+  i = i + 1
+}
+even.sort(ltI)
+show(even)
+
+// ── sorting an INDEX list in place, the in-tree idiom ─────────────────────────
+// Two of `compiler/`'s four hand-written sorts have exactly this shape: the list being
+// reordered holds indices, and the comparator closes over the parallel array holding the
+// keys. It is a first-class use of a closure comparator, and it is in place by nature —
+// the caller wants the reordered index list, not a copy of it.
+const line = [30, 10, 20, 10]
+const order = [0, 1, 2, 3]
+order.sort((a: i32, b: i32) => line[a] < line[b])
+show(order)   // 1,3 (line 10, stable) then 2 (20) then 0 (30)
+
+// ── the receiver is generic, and `sort` returns nothing ───────────────────────
+// A void return is the point: there is no result to discard by accident, which is the
+// mirror of `sorted`'s hazard. The same definition serves `string[]`.
+const names = ["pear", "Apple", "fig"]
+names.sort((a: string, b: string) => a < b)
+print(names.join(" "))
+
+// ── THE INVERTED CONTROL for `array-sort-comparator-pops-traps.vl` ────────────
+// That fixture asserts `sort` TRAPS when the comparator shrinks the receiver. A trap
+// assertion alone cannot show what the other half of the pair does with the same input,
+// and the harness ignores `@log` on a `@trap` case — so the control lives here.
+//
+// `sorted` SNAPSHOTS: it fills its working buffer and reads the length before `less` is
+// called even once, so the receiver stops being load-bearing. The identical comparator
+// that traps `sort` leaves `sorted` returning a correct, complete sort of all 40 ORIGINAL
+// elements — while the pop still lands, on the receiver, which ends one shorter.
+//
+// Be precise about what this proves, though: it is the COPY that shields, not the NAME.
+// `const out = xs.slice(0)` followed by `out.sort(less)` gets the IDENTICAL shield —
+// verified, printing the same 40 / 39 / 0 / 39 — because `slice` is a copy too. So this
+// is not the reason `sorted` exists.
+//
+// The reason `sorted` exists is that `sort` is VOID: there is no expression-position
+// spelling of "a sorted copy" without it. `xs.sorted(less)[0]` and
+// `xs.sorted(less).indexOf(9)` have no `sort`-only equivalent, and a `self`-first export
+// that returns something chainable is worth more than one that returns nothing. What the
+// shield adds is that the copy cannot be forgotten.
+const victim: i32[] = []
+i = 0
+while i < 40 {
+  victim.push((i * 7) % 40)
+  i = i + 1
+}
+let calls = 0
+const shielded = victim.sorted((a: i32, b: i32) => {
+  calls = calls + 1
+  if calls == 5 { victim.pop() }
+  a < b
+})
+print(shielded.length)   // 40 — the snapshot was taken before the pop
+print(victim.length)     // 39 — the pop landed on the receiver
+print(shielded[0])       // 0  — and the result is a real sort, not a truncated one
+print(shielded[39])      // 39
+let ascending = true
+i = 1
+while i < shielded.length {
+  if shielded[i - 1] > shielded[i] { ascending = false }
+  i = i + 1
+}
+print(ascending)

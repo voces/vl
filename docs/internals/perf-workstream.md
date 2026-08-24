@@ -561,14 +561,30 @@ the compiler does not import std (a program that imports nothing compiles byte-i
 to today)"*, with compiler-uses-std *"allowed AFTER the module-system revisit moves the
 build off concatenation; not in Phase 2."*
 
+**But the MECHANISM half of that precondition is already met, and this section originally
+read as if none of it were — CORRECTED 2026-08-23.** (D1's verdict is two clauses: a
+mechanism clause, which is met, and a phase clause, which is not re-ruled. See the
+2026-08-23 note under `std-design.md` D1.) D1's bar rested on seed assembly concatenating
+`compiler/*.vl` with import lines range-blanked, which would have blanked a `std:` import
+out of the seed. That assembly is gone: `refresh-compiler.sh` builds the real module graph
+(the very line quoted three paragraphs down) and says *"No sed/cat/rename glue."* The lift
+was **measured** while shipping §6.2's sort — patching `compiler/format.vl` to
+`import { sort } from "std:array"` builds, and the resulting compiler works — so what
+remains is not a mechanism but a PRICE, and one unmeasured risk. See the 2026-08-23 note
+under `std-design.md` D1. **Do not cite "the compiler cannot import std" as a law.**
+
 **And the size cost is worse for the compiler than #1839's headline suggests.** #1839's
 scoping comment says the +95% figure is dev-build-only and that `-O` tree-shakes the residue
 to ~210 bytes per module. But **the shipped seed is built with plain `vl build`** —
 `scripts/refresh-compiler.sh:83` is `"$VL" build compiler/entry.vl -o … --compiler "$SEED"`,
 no `-O`, and ROADMAP:393 states the seed *"is UNOPTIMISED"*. So the compiler is precisely
 the consumer that pays #1839's **raw** cost: 4,992 bytes for `std:str`'s 15 exports, 7,237
-for `std:fs`'s 19. **Any "move it to std" proposal for compiler code is blocked on the
-module-system revisit and, after that, owes a measured byte delta on the seed.**
+for `std:fs`'s 19. **Any "move it to std" proposal for compiler code owes a measured byte
+delta on the seed** — and there is now one: importing `std:array` into `compiler/format.vl`
+took the seed from **1,376,574 to 1,443,654 bytes, +67,080 (+4.9%)**, for one module. The
+second half of the price is **unmeasured**: whether `scripts/native-fixpoint.sh` still
+converges with std in the graph, i.e. whether every std edit then perturbs the seed. That
+is the question a real proposal has to answer first.
 
 That is not an argument against the direction. It is the reason this section recommends
 moving almost nothing.
@@ -577,7 +593,7 @@ moving almost nothing.
 
 | candidate | where | verdict |
 | --- | --- | --- |
-| **Insertion sort, written ~~twice~~ FOUR times** | `cli.cliStableSort` (`cli.vl:682`), `format.fmtSortNames` (`format.vl:673`), `cli.cliSortFiles` (`cli.vl:874`), the edit-order sort in `cli`'s lint-fix path (`cli.vl:1689`) | **One algorithm, four comparators.** Identical stable-insertion body (`while j >= 0 && less(key, xs[j])`), differing only in `cliDiagLess` / `fmtNameLess` / `cliStrGt` / a `pos[]` lookup — and **every one of the four is a boolean less-than**, the multi-key one included, which is what settled the comparator shape in `std:array.sorted` (§6.2). Two of the four sort an **index list** whose comparator reads parallel arrays it closes over. **No copy is measured hot**; the DRY case is real, the perf case is unmeasured. **Migration is NOT scheduled**: §6.0's blocker stands (the compiler imports zero std modules and its seed is built unoptimised, so it would pay #1839's raw cost), and insertion sort is genuinely optimal at these call sites — lowest constant, stable, no auxiliary allocation, lists short by construction. The right end state may well be that the four collapse into one internal helper and never import std at all. |
+| **Insertion sort, written ~~twice~~ FOUR times** | `cli.cliStableSort` (`cli.vl:682`), `format.fmtSortNames` (`format.vl:673`), `cli.cliSortFiles` (`cli.vl:874`), the edit-order sort in `cli`'s lint-fix path (`cli.vl:1689`) | **One algorithm, four comparators.** Identical stable-insertion body (`while j >= 0 && less(key, xs[j])`), differing only in `cliDiagLess` / `fmtNameLess` / `cliStrGt` / a `pos[]` lookup — and **every one of the four is a boolean less-than**, the multi-key one included, which is what settled the comparator shape in `std:array`'s ordering pair (§6.2). Two of the four sort an **index list** whose comparator reads parallel arrays it closes over. **No copy is measured hot**; the DRY case is real, the perf case is unmeasured. **Migration is NOT scheduled, and the reason is a PRICE, not a bar** (this row first said §6.0's blocker "stands"; §6.0 is corrected — the module-system precondition is met and the import was measured to work). Importing `std:array` into one compiler module costs **+67,080 bytes (+4.9%)** on the unoptimised seed, and the fixpoint cost is unmeasured. Against that, insertion sort is genuinely optimal at these four call sites — lowest constant, stable, **no auxiliary allocation**, lists short by construction — so `std:array.sort` would not make them faster or smaller. The right end state may well be that the four collapse into one internal helper and never import std at all. |
 | **`i32ToStr`** | `ast.vl:1540` | Duplicates `std:fmt.toStr(self: i32 \| i64 \| boolean)`. A textbook move — and blocked by §6.0. Leave it and note the duplication. |
 | **`indentStr`** | `fmt_util.vl:56` | A memoized `std:str.repeat`. **The memo is the interesting part, not the repeat** — a general `repeat` in std does not carry a per-depth cache, and the cache is what removed the per-line allocation. Do not move; the compiler-specific half is the whole value. |
 | **`strutil.cpCount` / `pushCps`** | `compiler/strutil.vl` | **Explicitly must NOT move.** Its header records why: `cpCount` deliberately avoids the `cpLen()` intrinsic because the bootstrap seed that compiles this source predates it, and every function in that file must answer identically under both string representations or `compile(X) == X` stops converging. This is bootstrap-constrained code that *looks* like a std utility. Good example of why this pass has to read headers. |
@@ -588,29 +604,49 @@ moving almost nothing.
 ### 6.2 Direction B — what `std:` should grow for users, independent of the compiler
 
 Today: `str`, `fmt`, `fs`, `args`, `utf8`, `array`, `buffer`, `test`, `seed`. No `list`, no
-`map`, no `set`, ~~no sort~~ (shipped, below), **no binary search, no priority queue, no
-deque.**
+`map`, no `set`, ~~no sort~~ (shipped as a pair, below), **no binary search, no priority
+queue, no deque.**
 
-- **A sort. SHIPPED** — `std:array.sorted<T>(self: T[], less: (T, T) => boolean): T[]`, one
-  export, stable, O(n log n) comparisons worst case, O(n) auxiliary space. A bottom-up merge
-  over runs an insertion sort has already ordered; the base-case run length is **16**, picked
-  off a sweep of 8/12/16/24/32 at six sizes rather than off folklore, and the table is in the
-  comment above the function. It **returns a new list** — `std:array` has no mutating export
-  and `reverse` is the exact structural analogue — and the comparator is a **boolean strict
-  less-than**, which is what all four in-tree comparators already are (§6.1). Behaviour under
-  an *inconsistent* comparator is documented rather than undefined: the order is unspecified
-  but the result is always a permutation, and it never traps, because every loop is bounded by
-  an index and not by the comparator.
+- **A sort. SHIPPED, as a PAIR** — `std:array.sort<T>(self: T[], less)` in place, and
+  `sorted<T>(self: T[], less): T[]` returning a new list. Both stable, both O(n log n)
+  comparisons worst case; a bottom-up merge over runs an insertion sort has already ordered,
+  base-case run length **16** picked off a sweep of 8/12/16/24/32 at six sizes rather than off
+  folklore (table in the comment above the function). `sort` allocates **nothing** up to n=16
+  and one n-element buffer above; `sorted` allocates the returned list always and the same
+  auxiliary only above the threshold — n below, 2n above.
 
-  Two numbers decided the shape. Generality is **free at the short lengths this tree actually
-  sorts** — n=16 measures 0.448 us for both `sorted` and a plain insertion sort, n=8 0.176 vs
-  0.168 us — and it is **11.2x** at n=1024 (90.5 us vs 1014.5 us; 10,583 comparisons vs
-  258,411). That is why the API did not settle for insertion sort: `std` has unknown callers
-  and no deprecation story, so a quadratic worst case would be permanent.
+  **#1856 shipped only `sorted`, and that was the wrong surface.** In place is the
+  convention, not the exception — Rust `slice::sort` (no copying variant in std at all), Go
+  `sort.Slice`, C++ `std::sort`, Java `Arrays.sort`; JS `.sort()` has always mutated and
+  `toSorted()` is ES2023. Only Python ships both. And the copy taxes precisely the caller the
+  O(n log n) is *for*: 2n on the million-element sort, with no way to opt out. The argument
+  that carried the first draft — "no std export mutates through `self`" — was really "these
+  nine exports are all transformers so far", while `std:buffer` mutates linear memory and
+  `std:test` mutates module globals.
+
+  The comparator is a **boolean strict less-than**, which is what all four in-tree comparators
+  already are (§6.1). Behaviour under an *inconsistent* comparator is documented rather than
+  undefined: the order is unspecified but the result is always a permutation, and — for a
+  comparator that merely ANSWERS wrongly — it never traps, because every loop is bounded by
+  an index and not by the comparator. (A comparator that MUTATES the receiver is a separate
+  failure: under the in-place `sort`, shrinking `self` traps.)
+
+  Generality is **free at the short lengths this tree actually sorts** — n=16 measures
+  0.448 us for the merge and for a plain insertion sort alike, n=8 0.176 vs 0.168 us — and it
+  is **11.2x** at n=1024 (90.5 us vs 1014.5 us; 10,583 comparisons vs 258,411). `sort` vs
+  `sorted` is an ALLOCATION difference and barely a time one: 420 vs 469 ns at n=16, a tie at
+  n=1536, 1.3% at n=65,536.
+
+  **The two bodies are duplicated, and that is a compiler limitation.** `sorted` should be
+  `copy; sort(out, less); return out`; a generic function cannot pass its own generic-typed
+  function parameter to another generic function, in any of four spellings
+  (`tests/cases/std/error-generic-closure-forward.vl`). `tests/cases/std/array-sort-agrees.vl`
+  runs both exports over every length 0..200 and fails on the first divergence, so the
+  duplication is gated rather than merely deprecated.
 
   What was deliberately NOT added: `sortUnstable` (a second name doing almost the same thing;
   additive later if a measurement demands it), `sortedBy(keyOf)` (a two-line comparator), a
-  defaulted `xs.sorted()` (no `<` for structs, and no overloading to express the split), and a
+  defaulted `xs.sort()` (no `<` for structs, and no overloading to express the split), and a
   binary search (still zero consumers — the ruling above stands).
 - **`std:map` / `std:set` are already planned** (std-design slice 6, gated on slice 5
   `std:list`). Worth noting for scope: `{[K]:V}`, `Map()` and `Set()` are **language**
