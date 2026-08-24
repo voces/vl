@@ -3,6 +3,11 @@
 Filed 2026-08-23 on master `727c7cc2`. This is a **plan**, not a change: nothing in
 `compiler/` was touched to write it.
 
+**Candidate 1 shipped as #1853 while this was being written** — `0dd545f2`, a dense flag
+array, **−11.6% user CPU on `vl build compiler/entry.vl`**. §4.1 records the outcome and
+what it settled. The rest of the document is written against `727c7cc2` and is unaffected;
+the top of the ranking is not.
+
 `perf-program.md` and `perf-landscape.md` own the shipped/rejected ledger — read §9 before
 proposing anything, because a third of the obvious ideas are already refuted there with
 numbers. This document covers the tier those two do not: not "is anything quadratic" (the
@@ -30,9 +35,15 @@ the whole workstream started from: **list length is nearly useless as a triage s
 answer distribution is the thing that decides.** `scopeSlotOf` scans a 36-deep stack and
 averages **1.72** iterations — a map there is a loss. `isUName` scans an **11**-element list
 and averages **11.0**, because it answers NO, and costs 9.2 M string comparisons. The
-biggest single item, `cTyIxListHas`, runs **209,097,445** iterations over a list whose
-header calls it "a handful". The triage rule in §1 is built to catch all three of those,
-and it needs a counter, not a reading of the code.
+biggest single item, `cTyIxListHas`, runs **209,097,445** iterations over a **189**-element
+list — hot because of the probe count, not the length. The triage rule in §1 is built to
+catch all three of those, and it needs a counter, not a reading of the code.
+
+That last one is now settled rather than proposed: #1853 replaced it with a dense flag array
+and measured **−11.6%** on a self-compile. Its independently-written instrumentation
+reported **1,426,650 probes and 209,097,445 iterations** — digit-for-digit the numbers in
+§3, from a different counter written by a different author. §4.1 is what a candidate in this
+document looks like once it has been through §8.
 
 ---
 
@@ -116,9 +127,19 @@ it: **`nameIn` (`compiler/typecheck.vl:3640`) is called 0 times in a self-compil
 
 ### The comment corollary
 
-`cTyIxListHas` carries the header *"a small nominal-index set (a handful of struct/variant
-decls per program)"*. Measured: the list reaches **189** and the function runs **209 million
-iterations**. **Stale size assumptions in comments are a category, not a one-off** — the
+`cTyIxListHas` carried the header *"a small nominal-index set (a handful of struct/variant
+decls per program)"*. Measured: **189** elements and **209 million iterations**.
+
+**The precise diagnosis matters, and #1853's is better than the one this document filed.**
+The comment was *right* about the size — 60 declared structs, 189 variant members, none of
+it growing with the 28,555-entry arena — and wrong about what the size implied. The scan was
+hot because of the **probe count**, and because the predicate answers NO: 198,848,340 of the
+199,095,246 slots a probe *could* have walked *were* walked, so 99.9% of the work was a
+full-list miss. **A comment that states a size is answering a question nobody asked.** The
+question is iterations per call and total iterations, and no comment in this tree states
+either.
+
+**Assumptions asserted in comments are a category, not a one-off** — the
 same shape sits at `compiler/typecheck.vl:5703`, where the diagnostic de-dup scans every
 prior diagnostic on every push under the header *"the diagnostic count stays small, so the
 scan is cheap"*. On a clean self-compile that is true (zero diagnostics, zero cost). **In
@@ -198,6 +219,8 @@ Two more facts that fell out and change designs:
 - **`cTyIxListHas` is an emit-path cost, not a checker cost.** A `vl check` without
   `--codegen` runs it **605** times for **3,057** iterations. That is 0.04% of the traffic.
   The 12.9% is entirely the emitter's `nodeTyIs*` family.
+- **These two facts are why #1853's change was an afternoon.** Both were re-derived
+  independently by its author and both held.
 - **Its two backing sets are frozen before the emitter starts.** At the end of
   `checkProgram`: `cStructTyIxs=60`, `cVariantMemberTyIxs=189`, `cUnionTyIxs=10`,
   `arenaTys=28,554`. At the end of `emitProgram`: **identical**, `arenaTys=28,555` (one type
@@ -225,11 +248,40 @@ post-#1848** — the correct next profile is not a new total, it is a new split.
 
 ## 4. Ranked inventory
 
-Ranked by **measured work removed**, not by how bad the code looks. The projected reductions
+Ranked by **measured work removed**, not by how bad the code looks. Item 1 has since
+shipped; the rest are open as of `727c7cc2`. The projected reductions
 are *arithmetic on the measured counters* — they are not runtime claims, and every one of
 them needs §8's A/B before it merges.
 
-### 1. `cTyIxListHas` → a dense arena-indexed side table — **measured, largest, cheapest**
+### 1. `cTyIxListHas` → a dense arena-indexed side table — **SHIPPED as #1853 (`0dd545f2`)**
+
+**Outcome, measured by #1853:** `vl build compiler/entry.vl` **2.16 s → 1.91 s, −11.6% user
+CPU** (median of 9 interleaved); `vl check` **+0.0%**, exactly as the census predicted; peak
+RSS 636 → 637 MB. `cTyIxListHas` was 12.68% of self time, the largest single item on the
+board after `__str_eq__`.
+
+**Two things it settled that this document only proposed.** The structure landed as a
+`boolean[]` per set indexed by the arena index, **with the list kept** as a parallel index
+rather than replaced — four of the six sets are iterated in order alongside a names/args
+array, so the flags are an index *beside* the list. And it is **one shared helper pair**
+(`cTyIxSetAdd` / `cTyIxSetHas`), not six hand-rolled structures, because six sets that
+differ in structure is how one of them ends up missing an arm. That is the §7 liability
+handled at the design level rather than argued about.
+
+**Two things it corrected in this document's own analysis**, both found by its census:
+
+- **The set list is six, not two.** `cUnionTyIxs` (207,768 probes), `cNullableInnerTyIxs`,
+  `gaAppTyIxs` and `annPendingVariantTyIxs` also route through `cTyIxListHas`. This document
+  named two because two is what the call sites I read used.
+- **"A handful" was right about the size.** See §1's corollary — the diagnosis is the probe
+  count and the NO-answer, not a stale number.
+
+**And one cross-validation worth keeping.** Two instrumentations, written independently by
+two authors on the same day, reported **1,426,650 probes / 209,097,445 iterations** and
+**605 `vl check` probes** — identical to the digit. Counters are a *reproducible* instrument
+in a way profile shares are not; §8.2 is not a shortcut.
+
+The original filing is kept below, because the reasoning is what §1 is for.
 
 - **Site:** `compiler/typecheck.vl:23430`, over `cStructTyIxs` (`:1924`) and
   `cVariantMemberTyIxs` (`:1931`). Ten call sites, all in the `nodeTyIs*` family.
@@ -249,8 +301,14 @@ them needs §8's A/B before it merges.
 - **Projected:** 209,097,445 iterations → 1,426,650 indexed reads. Arithmetic.
 - **Risk:** low. The sets are measured frozen after checking. Build once at the end of
   `checkProgram`, or maintain incrementally — either is provably equivalent.
-- **Also fix the header.** "a handful of struct/variant decls per program" is the sentence
-  that kept this at 12.9% for as long as it stood.
+- **Also fix the header.** — done; #1853 replaced it with the measured table.
+
+**Residue, unmeasured.** `structNameOfTy` (`typecheck.vl:9757`), `unionAliasDeclNameOfTy`
+(`:9771`) and one more `cUnionTyIxs` walk (`:23805`) are still linear scans over these same
+lists — deliberately, because they want the parallel *name* column, not membership. Their
+probe counts are unmeasured. **Do not convert them on the strength of #1853's number**; put
+a counter on them first. This is exactly the trap §2 warns about — 196 sites, and the nine
+that matter are not the nine that look alike.
 
 ### 2. `repTreeVKind`'s literal chain → a named litunion tag — **measured, and the pattern is already in tree**
 
@@ -580,7 +638,19 @@ n = 21 interleaved pairs (ABABAB…, never all-A then all-B), user CPU time, a *
 bar. Do not quote a single wall clock. Re-baseline before targeting — half the filed numbers
 in `perf-landscape.md` moved between filing and pricing.
 
-### 8.5 Three instrument traps already paid for
+### 8.5 Measure the command that exercises the path
+
+`vl check` and `vl build` are not interchangeable and the difference is not small.
+`cTyIxListHas` runs **605** of its 1,426,650 probes during checking, so #1853 — worth
+**−11.6%** on `vl build compiler/entry.vl` — measured **+0.0%** on `vl check`. A `vl check`
+A/B would have read that change as dead and rejected it.
+
+Before the A/B, ask the counter *which command runs the code*. Checker-side work
+(`typecheck.vl` proper, scope resolution, annotation resolution) measures on `vl check`;
+anything in the `nodeTyIs*` / rep / classify / section families is emit-path and needs
+`vl build`. When in doubt, run the counter under both — that is one extra 6-second run.
+
+### 8.6 Three instrument traps already paid for
 
 - **The loop-shape counter in `tests/selfhost_native_release_test.ts` is module-wide** and has
   produced two false positives (P3's and P7a's unroll remainders). Get per-function counts.
@@ -591,7 +661,7 @@ in `perf-landscape.md` moved between filing and pricing.
   already happened this session. `scripts/refresh-compiler.sh` before any measurement that
   follows an edit to `compiler/*.vl`.
 
-### 8.6 Gates
+### 8.7 Gates
 
 Candidates 1, 4 and 5 change how the compiler *decides*, not what it emits, so the primary
 correctness gate is byte-identity of the self-compile plus `scripts/native-fixpoint.sh`.
@@ -615,10 +685,14 @@ Recorded because the brief asked to be corrected rather than agreed with.
    **676**. `isUName`'s measures 11 and still costs 9.2 M string comparisons because the
    predicate answers NO. **Length is a weak signal; mean-iterations-per-call is the strong
    one.**
-5. **The `cTyIxListHas` "handful" comment is stale exactly as suspected** — 189, 209 M
-   iterations — **and the deeper reading is right too**: `typecheck.vl:5703` is a second
-   instance of the same shape, and its stale assumption is invisible to every gate the
-   project runs because it only breaks in the LSP.
+5. **The `cTyIxListHas` "handful" comment was wrong, but not in the way the brief or this
+   document first said.** It was *right* about the size — 60 structs, 189 variant members,
+   none of it growing with the arena. It was wrong because size was never the deciding
+   quantity: the cost was 1,426,650 probes that nearly always answer NO. **The category
+   still holds** (`typecheck.vl:5703` is a second instance, and its assumption is invisible
+   to every gate the project runs because it only breaks in the LSP) — but the category is
+   *"a comment that asserts a quantity nobody measured"*, not *"a comment whose number went
+   stale"*.
 6. **The 102-function census over-counts for the stated reason, and the corrected number is
    196 scan sites over 115 backing arrays** — larger, not smaller, because it counts loops
    rather than functions and includes integer keys. Neither number ranks anything: **nine
@@ -635,7 +709,12 @@ Recorded because the brief asked to be corrected rather than agreed with.
 9. **`tyTopIndexOf` is not a data-structure problem** and should not get a data-structure
    fix. It is a string parser for type spellings, it already belongs to an active programme,
    and that programme's own rule is that its slices are not sold as speed.
-10. **#1839's "no cross-module DCE" is true, but its headline number does not apply to the
+10. **This document's own §4.1 was incomplete within four hours of being written.**
+    `cTyIxListHas` routes **six** arena-index sets, not the two its call sites showed me,
+    and #1853's census found the other four. The lesson is the one `CLAUDE.md` already
+    states — *re-run a doc's own witness before quoting from it* — and it applies to this
+    file from the day it lands. Every number here is dated `727c7cc2`.
+11. **#1839's "no cross-module DCE" is true, but its headline number does not apply to the
     compiler — it applies *worse*.** The issue's own scoping comment retires the +95% figure
     for `-O` builds (~210 bytes/module). The compiler seed is built **without** `-O`, so it
     is the one consumer that would pay the raw 4,992–7,237 bytes per std module.
@@ -644,8 +723,7 @@ Recorded because the brief asked to be corrected rather than agreed with.
 
 ## 10. Sequence
 
-1. **Candidate 1** (`cTyIxListHas` → dense side table). Largest measured item, lowest risk,
-   sets are measured frozen. Also fix the header.
+1. ~~**Candidate 1** (`cTyIxListHas` → dense side table).~~ **SHIPPED, #1853, −11.6%.**
 2. **Candidate 2** (`rtKind` → named litunion). Proven in-tree pattern with a shipped
    precedent and a number. Rep-fuzz gate mandatory.
 3. **Candidate 3(A)** (`br_table` for litunion dispatch). Compounds with 2 and needs no
