@@ -1,0 +1,73 @@
+// @run
+// @hint redundant type annotation: `f` is inferred as `i32`
+// @hint redundant type annotation: `g` is inferred as `i32`
+// @log 0
+// @log 1
+// @log int
+// @log 42
+// Was `xfail-false-reject-elseif-chain-residual.vl` (ROADMAP A5 flow narrowing) — a SOUND
+// program the compiler refused with `expected i32, got string | i32`. CLOSED; the file keeps
+// the diagnosis because the part that took the longest to see is where the fix had to STOP.
+//
+// THE GAP. Post-guard residual narrowing fired for a bare SEQUENCE of divergent guard-clauses
+// — `if x is string { return … }` then a plain `return x` narrows `x` to the complement `i32`
+// — but the gate carried "…and only a SINGLE-arm `if` with NO `else`", inherited verbatim from
+// the deleted TS host's `postGuardNarrowings`. So an `if`/`else if` chain post-narrowed
+// nothing: every arm `return`ed, and below the chain `x` was still the full `string | i32`.
+//
+// THE RULE THAT REPLACED IT. When the THEN branch diverges, reaching the code after the `if`
+// means the ELSE path ran — so the condition was false there, and the false narrowings hold
+// exactly as they do with no `else`. Whether there is an `else` was never the question; whether
+// the then-branch exits always was.
+//
+// WHERE IT STOPS, AND WHY THAT IS THE SOUNDNESS ARGUMENT. Only BARE NAMES post-narrow past an
+// `else`. A bare name's narrowing is a shadowing `declare`, and writes to it inside the else are
+// checked against the NARROWED type — `else { x = "s" }` under an `i32` narrowing is a type
+// error (`guard-else-narrowed-write-reject.vl`), so nothing the else body can legally do
+// falsifies the fact. A property PATH's narrowing is an `npKeys` overlay entry that a call or an
+// aliasing write RETIRES IN PLACE, and the else arm's entry is popped with the else's scope — so
+// re-deriving one after the `if` would resurrect a narrowing the else already invalidated. That
+// was measured, not assumed: `if b.v is string { return 0 } else { set(b) }` compiled and
+// TRAPPED on the cast, reading a string through an `i32` view. Paths keep the no-`else` gate
+// (`guard-else-path-alias-write-reject.vl`).
+//
+// EMIT MOVED WITH CHECK. `emit_classify.pushPostGuardNarrow` had the same `s.ifElse < 0` gate,
+// and relaxing only the checker made these programs check-clean INVALID WASM ("expected i32,
+// found (ref $type)") — the block below read a boxed union the checker had already unboxed. The
+// bare-name restriction rides one choke point there (`pushNarrowRep`), so every narrowing
+// channel declines paths together.
+//
+// STILL OPEN — the MULTI-STEP chain, and it is the SAME wall `xfail-false-reject-seq-guard-
+// residual.vl` sits behind. Only the OUTERMOST condition's complement is subtracted, so a chain
+// over a 3-way union leaves two members, not one:
+//
+//   function h(x: string | i32 | boolean): boolean {
+//     if x is string { return false } else if x is i32 { return false }
+//     return x                    // still `expected boolean, got i32 | boolean`
+//   }
+//
+// The inner arm's own subtraction is applied inside the else arm's scope and popped with it, and
+// hoisting it out is the "multi-step subtraction of the discriminated place" this file's TODO
+// originally asked for. That half is NOT blocked on codegen — the twice-subtracted residual
+// lowers and runs, measured — it is blocked on dead-arm tolerance in `match`; the seq-guard
+// file carries the witness and both routes out. So the two files split as: this one is the
+// `else` gate, which was independent and is closed; that one is the SUBTRACTION COUNT, which
+// is not.
+function f(x: string | i32): i32 {
+  if x is string { return 0 }
+  else if x is i32 { return 1 }
+  return x
+}
+print(f("a"))
+print(f(3))
+
+// The residual is not merely well-typed — it is REACHED. This else arm does NOT diverge, so
+// control leaves the chain through it with `x` narrowed to `i32`, and the arithmetic below is an
+// unboxed `i32.add`. A narrowing that existed only in the checker would lower to a `ref` operand
+// here and fail validation, so the `42` is the emitter half of the pin.
+function g(x: string | i32): i32 {
+  if x is string { return 0 }
+  else { print("int") }
+  return x + 1
+}
+print(g(41))

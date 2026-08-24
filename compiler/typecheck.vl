@@ -27994,14 +27994,36 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   }
   // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
   // the rest of the enclosing block (`if x == null { return } … x.f …`).
-  // Host `postGuardNarrowings` parity: only a SINGLE-arm `if` with NO `else`
-  // (an `else`/`else if` chain does not post-narrow the fall-through), and
-  // only ONE union SUBTRACTION per place per block — the host checker accepts
-  // a twice-subtracted residual but both codegens reject it
-  // (xfail-false-reject-seq-guard-residual), so the front end keeps rejecting the
-  // second subtraction. Null-STRIPS always apply (guard sequences rely on
-  // them). Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
-  if enNames.length > 0 && !daHasElse {
+  //
+  // ONE UNION SUBTRACTION PER PLACE PER BLOCK, banked in `pgKeys`. The reason written on
+  // this gate — "the host checker accepts a twice-subtracted residual but both codegens
+  // reject it" — is REFUTED: the native codegen lowers the twice-subtracted residual and
+  // RUNS it (`string | i32 | boolean` minus `i32` minus `string` reads back as an unboxed
+  // `boolean`; 3-step, struct-arm, null-strip and `f64`-residue spellings all correct), and
+  // the TS host it was written against is deleted. The veto stays anyway, for a DIFFERENT
+  // reason nobody had named — see `xfail-false-reject-seq-guard-residual.vl`: subtracting
+  // consistently makes every `match` written after a guard CHAIN reject its own arms, and
+  // this compiler's `assignable()` is the witness. Null-STRIPS always apply (guard
+  // sequences rely on them).
+  //
+  // THE `else` ARM IS NOT PART OF THAT VETO, and used to be excluded by the same gate ("an
+  // `else`/`else if` chain does not post-narrow the fall-through"). When the THEN diverges,
+  // reaching the code after the `if` means the ELSE path ran, so the false narrowings hold
+  // there exactly as they do with no `else` (`soundness/elseif-chain-residual.vl`).
+  // Restricted to BARE NAMES, and the restriction is the soundness argument: a bare name's
+  // narrowing is a shadowing `declare` whose writes are checked against the NARROWED type,
+  // so nothing the else body can legally do falsifies it (`x = "s"` under an `i32` narrowing
+  // is a type error — `guard-else-narrowed-write-reject.vl`). A property PATH's narrowing is
+  // an `npKeys` overlay entry that a call or an aliasing write RETIRES IN PLACE, and the
+  // else arm's entry is popped with the else's scope — so re-pushing one here would
+  // resurrect a narrowing the else already invalidated: `if b.v is string { return } else
+  // { set(b) }` read `b.v` as an `i32` off a string and TRAPPED on the cast, measured.
+  // Paths keep the no-`else` gate (`guard-else-path-alias-write-reject.vl`).
+  //
+  // `emit_classify.pushPostGuardNarrow` mirrors both lines; the two sides must agree on
+  // which guards post-narrow or the rest of the block reads a boxed union the checker
+  // already unboxed. Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
+  if enNames.length > 0 {
     const tn2 = P.nodes[n.ifThen]
     if tn2 is Block {
       const tst = tn2.blkStmts
@@ -28017,10 +28039,12 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
             const gKey = enNames[gi2]
             const gTy = enTys[gi2]
             if isPathKey(gKey) {
-              npKeys.push(gKey)
-              npTys.push(gTy)
-              npInvBy.push(-1)
-              npEpochs.push(narFnEpoch)
+              if !daHasElse {
+                npKeys.push(gKey)
+                npTys.push(gTy)
+                npInvBy.push(-1)
+                npEpochs.push(narFnEpoch)
+              }
             } else if gTy == nonNullTy(lookup(gKey)) {
               declare(gKey, gTy)
             } else {
