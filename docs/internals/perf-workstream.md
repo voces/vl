@@ -458,19 +458,64 @@ turn into a compile error, the one genuine (non-performance) argument for conver
 `string[]` to census. `rtIntern`, the `{[string]: i32}` hash-cons map, is probed 1,365 times
 per self-compile and is cold for the same reason the column is.
 
-### 3. Litunion dispatch and the `string`→litunion crossing — **(A) before (B), and the ordering is the point**
+### 3. Litunion dispatch and the `string`→litunion crossing — **(A) MEASURED AND REFUTED; (B) loses its stated gate**
 
 Two separable items that belong in one entry because **(B)'s value is largely contingent on
 (A) existing.** The intuitive ordering is the reverse of the right one.
 
-**(A) `br_table` dispatch for litunion `match` / `is`-chains.** Verified by the owner on
-`727c7cc2` (2026-08-23) by disassembling a `match` over a 4-member named litunion
-(`node_modules/.bin/wasm-dis`): it lowers to **a chain of `i32.eq`, with zero `br_table`**.
-Not independently re-run for this document. The interned-atom rep is real and
-working — a litunion comparison is already not `__str_eq__` — but dispatch over it is still
-linear in the arm count. No language change, no new surface, no design risk: this is purely
-how an existing construct lowers, and it speeds up every litunion `match` in the tree today.
-`repTreeVKind`-shaped chains are the target, and candidate 2 creates more of them.
+**(A) `br_table` dispatch for litunion `match` / `is`-chains — REFUTED 2026-08-23, do not
+build it.** Full workings: `bench/findings/litunion-br-table.md`. The premise held and the
+conclusion did not. Dispatch really is a chain of `i32.eq` with **zero `br_table`** anywhere
+in the compiler wasm (re-confirmed here on `877454fe`), and the chain really is linear in the
+arm count — but **the chain is the faster code**, and the axis it sits on is worth ~0.16% in
+total.
+
+- **`br_table` at the compiler's largest litunion dispatch is a REGRESSION.** `repTreeVKind`,
+  benchmarked at its exact shape (12 arms, 13 atom ids, span 40) with its exact measured key
+  distribution: chain `0.0288 s / 20M`, `br_table` `0.1011 s / 20M` — **+3.61 ns per
+  dispatch**, ≈ **+0.36%** of a `vl build`. Under a *perfectly* predictable key stream, the
+  only regime where the table wins, it is **−0.65 ns**, i.e. **−0.065%**.
+- **The crossover is not an arm count. It is branch predictability of the target.** Each
+  `i32.eq` in a chain is biased ~(N−1)/N not-taken and predicts near-perfectly at any N; a
+  `br_table`'s one indirect jump is a fresh N-way guess. Measured under wasmtime 47: with an
+  unpredictable target the chain wins at **every** arm count from 2 to **67**; with a single
+  target the crossover is N≈4. Break-even on `repTreeVKind`'s shape sits at runs of ~6
+  identical keys. **The emitter has the arm count statically and cannot know the
+  distribution**, so it has no sound heuristic to gate on.
+- **Atom ids are NOT contiguous per union, and it does not matter.** `internAtom`
+  (`emit_classify.vl:17743`) is one program-wide `{[string]: i32}` keyed on the raw literal
+  text, so unions sharing a spelling share its id — `"i32"` belongs to `VKind`, `MfKind`,
+  `PrimName` *and* `RtKind`. Measured densities: `repTreeVKind` 33%, `rtListVKind` 27%,
+  `fbValtype` 63%, `kindTag` 99%. Density is **second-order**: 11 arms at span 11 vs the same
+  11 at span 41 differ by 2.6%. The cost is the indirect branch, not the table.
+- **The two longest chains in the tree execute ZERO times.** Counter over
+  `vl build compiler/entry.vl`: `kindTag` (67 arms, 99% dense) **0 calls**, `lexClassOf`
+  (49 arms) **0 calls**. They are error-text and formatter paths. The hottest litunion
+  dispatch is `repTreeVKind` at **1,849,728** calls — which independently reproduces §3's
+  1,847,718 from a different instrument.
+- **The ceiling, which is the result worth keeping.** At its measured mean depth of 8.39 the
+  chain costs 0.515 ns per dispatch, so **making `repTreeVKind`'s dispatch instantaneous by
+  any mechanism saves 0.95 ms = 0.052% of a `vl build`.** Cross-checks the profile: the
+  function reads 0.73% self, so the compare chain is ~7% of its own self time; the rest is
+  the bounds-checked `rtKind[ix]` load and call/return. Across the axis — the 51 functions
+  with both a litunion signature and a ≥3-arm chain sum to 2.24% self — the same ratio gives
+  **~0.16% for every litunion dispatch in the compiler combined.**
+- **Arm ORDER is worth the same ~0.06%, from the other side.** `repTreeVKind`'s two most
+  frequent answers are arms 10 and 11 of 12 (79.4% of calls); reordering by frequency takes
+  the mean depth 8.39 → 1.80 with no lowering change at all. **Two independent mechanisms
+  hitting the same ~0.05–0.06% is the evidence that the axis is exhausted, not that the
+  mechanism was wrong.**
+
+**What this re-ranks.** (A) is closed. **(B)'s stated gate — "gated on 3(A) proving the
+dispatch win" — is not met**, so the case for a `string`→litunion conversion is back to
+#1855's ~2% per 17 M *comparisons* and nothing more; it should be weighed as a correctness /
+language item (#1852's invalid wasm) rather than as a speed item. The *right* place to
+re-open `br_table`, if anyone does, is **value-union tag dispatch**, not litunion atoms:
+`match` over a value union lowers to `i32.eq` against `(struct.get <box> 0)` with tags
+0, 1, 2, … **contiguous per union by construction**, and including that shape moves the
+≥10-arm chain population from 1.71% to **5.42%** of self time. The same physics still refuses
+it — those are AST walkers, i.e. the uncorrelated regime — so bring a measured
+autocorrelation of the node-kind stream, not an arm count.
 
 **(B) A runtime `string` → litunion conversion (#1852).** No mechanism exists. `if s ==
 "i32"` is rejected (`expected K, got string`); `if s is "i32"` is **`vl check`-clean and
@@ -932,6 +977,20 @@ Recorded because the brief asked to be corrected rather than agreed with.
     compiler — it applies *worse*.** The issue's own scoping comment retires the +95% figure
     for `-O` builds (~210 bytes/module). The compiler seed is built **without** `-O`, so it
     is the one consumer that would pay the raw 4,992–7,237 bytes per std module.
+12. **"N compares into one dispatch" was the wrong model of the prize, and this document
+    ranked candidate 3(A) on it.** The model assumed the compares are the cost. Measured
+    (§4.3): a compare chain's individual branches are each strongly biased and predict
+    near-perfectly, so an 8-deep chain of `i32.eq` retires in ~0.5 ns, while the one indirect
+    jump that replaces it mispredicts whenever the target varies and costs ~4 ns.
+    **`br_table` is not "the same work with less branching" — it trades N *predictable*
+    branches for one *unpredictable* one.** The threshold §1 asks for on a linear scan has no
+    analogue here: the deciding quantity is the autocorrelation of the key stream, which no
+    static property of the code reveals.
+13. **A chain's length in the source is not evidence that it runs.** The two longest `i32.eq`
+    chains in the compiler — 67 arms and 49 arms, the shapes any jump-table argument reaches
+    for first — execute **zero times** in a `vl build`. Both were on this document's implicit
+    target list by virtue of being long. §1's second gate (*total iterations must be large
+    enough to see*) applies to dispatch chains verbatim, and it was not applied to them.
 
 ---
 
@@ -945,8 +1004,10 @@ Recorded because the brief asked to be corrected rather than agreed with.
    Zero comparisons in a self-compile, zero return-site executions, 0.00% of `__str_eq__`.
    The residue note's *reason* was wrong too: the axis is hot-read vs cold-construct, not
    return vs compare.
-4. **Candidate 3(A)** (`br_table` for litunion dispatch). Compounds with 2 and needs no
-   language change.
+4. ~~**Candidate 3(A)** (`br_table` for litunion dispatch).~~ **MEASURED AND REFUTED — do
+   not build it** (§4.3, `bench/findings/litunion-br-table.md`). A regression at the largest
+   site (+0.36%), −0.065% at its theoretical best, and the axis totals ~0.16%. The crossover
+   is target predictability, not arm count, and the emitter cannot see it.
 5. **Candidate 6** (`repOfTy` per-`ty` memo, §4.6). 5.65% inclusive over 1,346 distinct
    inputs and one tree epoch — the biggest untried number in this document. Gated on the
    validity and aliasing questions in its entry, not on effort.
@@ -956,7 +1017,8 @@ Recorded because the brief asked to be corrected rather than agreed with.
 7. **Re-profile with a consumer split** (§9.7) before anything below this line is scheduled.
 8. Then, and only then: `capIsBound`'s callers, the LSP diagnostic path, and the std sort.
 
-**Candidate 3(B)** (`string` → litunion) is a language change gated on 3(A) proving the
-dispatch win, on a sub-linear lookup design, and on ROADMAP A5c's named-vs-inferred rep
-split. It is also, independently, an invalid-wasm bug (#1852) that should be closed by
+**Candidate 3(B)** (`string` → litunion) was gated on 3(A) proving the dispatch win, on a
+sub-linear lookup design, and on ROADMAP A5c's named-vs-inferred rep split. **3(A) measured
+the dispatch win at ~0.05%, so that gate is not met** — weigh 3(B) as a language/correctness
+item, not a speed one. It is also, independently, an invalid-wasm bug (#1852) that should be closed by
 rejecting `s is "lit"` on a `string` in the meantime.
