@@ -85,11 +85,19 @@ const EMIT_ERROR_SRC =
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 
-// Type-checks clean, EMITS clean, and the module does not validate: a union whose two
-// CLOSURE arms are ONE TYPE — the parameter types `{a: i32, b: string}` and
-// `{b: string, a: i32}` are field-permuted, which the 2026-08 ruling makes the same type
-// (`tests/cases/soundness/xfail-miscompile-permuted-object-closure-arms.vl`).
+// Type-checks clean, EMITS clean, and the module does not validate: an element read out of
+// an INLINE literal-union array, handed back at the same inline type
+// (`tests/cases/soundness/xfail-miscompile-inline-litunion-element-read.vl`). The array is
+// interned i32 ATOMS (`ctxKeepsLitUnion` preserves at `RC_ELEM`) while the return position
+// softens to a string reference, so the function is emitted `(result (ref $string))` over a
+// body whose `array.get` yields an i32.
 // Distinct from EMIT_ERROR_SRC above: the emitter raises nothing at all here.
+//
+// The previous specimen was a union whose two CLOSURE arms are ONE TYPE (field-permuted
+// parameter objects) — fixed by making `emitIs`' union-box arm ask the STORAGE question as
+// well as the registry one, and `tySameAt` compare object fields by SET rather than by
+// position, so this test went red exactly as the note below said it would, and the same
+// instruction was followed.
 //
 // The previous specimen was CONSTRUCTING the inline-object arm of a union whose field is a
 // nullable map — fixed by giving the VARIANT-literal emitter the `vcode == 29` construct
@@ -105,16 +113,13 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // (`type A = 1 | 2; type B = 3 | 4; type U = A | B`), which is fixed, so this test went
 // red exactly as the note here said it would. Same instruction stands: if this shape
 // graduates, swap in any other `@no-instantiate` shape from tests/cases/soundness/
-// rather than deleting the assertion. This one is LIVE WORK — issue #1864 owns the
-// silent-wrong-value tier underneath it — so expect to follow that instruction soon.
+// rather than deleting the assertion. This one is a FAMILY DECISION rather than a missing
+// arm (`ctxKeepsLitUnion` must pick one position-independent rule), so it should outlast the
+// last few specimens.
 const INVALID_MODULE_SRC =
-  `type PA = { a: i32, b: string }\n` +
-  `type PB = { b: string, a: i32 }\n` +
-  `type FA = (PA) => i32\n` +
-  `type FB = (PB) => i32\n` +
-  `function pm(x: FA | FB) { if x is FA { print(1) } }\n` +
-  `function fa(v: PA) { v.a }\n` +
-  `pm(fa)\n`;
+  `function pick(self: ("a" | "b")[]): "a" | "b" { self[0] }\n` +
+  `const tags: ("a" | "b")[] = ["b", "a", "b"]\n` +
+  `print(pick(tags))\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

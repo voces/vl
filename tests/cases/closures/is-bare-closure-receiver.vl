@@ -1,0 +1,107 @@
+// @run
+// @log union-FA
+// @log union-FB
+// @log bare-FA
+// @log inline
+// @log alias-of-alias
+// @log generic-FA
+// @log with-a-union-declared
+// @log distinct-FA-only
+// @log nullable-present
+// @log nullable-absent
+// `x is F` over a receiver whose OWN type is the function type `F`. It is a TAUTOLOGY — a
+// bare closure value has exactly one static function type and carries no runtime
+// discriminant — and every spelling below CONST-FOLDED TO FALSE (#1864): `vl check` clean,
+// `vl check --codegen` clean, a module that VALIDATES, exit 0, and the guard never fires.
+//
+// A SILENTLY WRONG VALUE, WHICH IS WHY IT NEEDED A PIN AND NOT A `@no-instantiate`. The
+// twelve `xfail-miscompile-*` shapes are all refused by an engine; this one runs to
+// completion with the wrong answer, so no gate in the tree saw it. It was found while
+// triaging `soundness/xfail-miscompile-permuted-object-closure-arms.vl`, whose permutation
+// turned out to be incidental to it.
+//
+// THE ROOT CAUSE IS A PIN READ AS A SPELLING. `monoStaticIsResult` decides a non-union `is`
+// by comparing `monoArgTyName(receiver)` against type NAMES. For a function-valued receiver
+// that call does not return a name at all — it returns the `$fnsig` PIN MARKER `"=>i>i"`, an
+// interned ABI key, because a bare function type has no annotation form a monomorphized
+// instance could carry. A pin matches no raw spelling, no `tyToEmitName`, and no struct row,
+// so the ladder fell through to its `return 0`. The fix asks the ARENA for the pin's TYPE
+// (`monoArgPinTyIx`, the documented type-side twin of the very call that produced the name)
+// and answers with `tySame`.
+//
+// THE UNION IS INCIDENTAL, and the first four rows say so in order of decreasing ceremony.
+// `FA | FB` over two structurally identical aliases is the sharpest spelling — the checker
+// dedupes union members structurally, so the two arms are ONE member, there is no box to
+// tag-compare, and BOTH guards folded false — but the bare `x: FA` one-liner folds the same
+// way with no union in the file.
+//
+// THE CONTROLS ARE THE OTHER HALF. A union whose two arms are DISTINCT signatures still
+// discriminates by box tag (it never reached this fold), a nullable-closure `is` is still the
+// non-null test, and the generic row pins that a monomorphized clone — whose leaf `v` still
+// carries the original's `T` while its rewritten ANNOTATION carries the instance's `TyFunc` —
+// answers from the annotation.
+type FA = (i32) => i32
+type FB = (i32) => i32
+
+// (1) the issue's own program: two structurally identical aliases as a union
+function probeUnion(x: FA | FB) {
+  if x is FA { print("union-FA") }
+  if x is FB { print("union-FB") }
+}
+probeUnion((n) => n + 1)
+
+// (2) no union anywhere — the same fold, one line shorter
+function probeBare(x: FA) {
+  if x is FA { print("bare-FA") }
+}
+probeBare((n) => n + 1)
+
+// (3) the INLINE spelling of the same test
+function probeInline(x: (i32) => i32) {
+  if x is (i32) => i32 { print("inline") }
+}
+probeInline((n) => n + 1)
+
+// (4) an alias of an alias — the tested name and the receiver's name differ textually
+type FC = FA
+function probeAliasChain(x: FC) {
+  if x is FA { print("alias-of-alias") }
+}
+probeAliasChain((n) => n + 1)
+
+// (5) inside a MONOMORPHIZED instance. The clone's `v` carries `T`; the pin lives on the
+// rewritten annotation, which is where the answer has to come from.
+function probeGeneric<T>(v: T) {
+  if v is FA { print("generic-FA") } else { print("generic-not-FA") }
+}
+probeGeneric((n: i32) => n + 1)
+
+// (6) with a union DECLARED elsewhere in the program. `uDeclared` flips the tail of
+// `emitIs`, so the fold has to answer this rather than decline to the runtime ladder — a
+// declining fix turns this row into `emitProgram: \`is\` names a type that is not a union
+// variant`.
+type Shape = { a: i32 } | { b: i32 }
+function useShape(s: Shape) {
+  if s is { a: i32 } { print("with-a-union-declared") }
+}
+function probeWithUnion(x: FA) {
+  if x is FA { useShape({ a: 1 }) }
+}
+probeWithUnion((n) => n + 1)
+
+// ── CONTROLS ────────────────────────────────────────────────────────────────────────────
+// (7) DISTINCT signatures still discriminate: a real two-arm union, a real box tag.
+type GA = (i32) => i32
+type GB = (i32) => f64
+function probeDistinct(x: GA | GB) {
+  if x is GA { print("distinct-FA-only") }
+  if x is GB { print("distinct-GB") }
+}
+probeDistinct((n) => n + 1)
+
+// (8) a NULLABLE closure keeps its non-null test in both states.
+function probeNullable(x: FA | null) {
+  if x is FA { print("nullable-present") } else { print("nullable-absent") }
+}
+probeNullable((n) => n + 1)
+probeNullable(null)

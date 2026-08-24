@@ -643,6 +643,7 @@ import {
   scopeUnbind,
   setNarrowFromCond,
   setNarrowFromCondElse,
+  sigKeyPinPayload,
   sigParamCoerceKind,
   sigParamKindAt,
   stmtIsTailValue,
@@ -706,6 +707,7 @@ import {
   vbHeapIdxOfKind,
 } from "./emit_rep"
 import {
+  monoArgPinTyIx,
   monoArgTyName,
   monoInstantiatedAny,
   monoPinnedSigsOf,
@@ -2088,6 +2090,37 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
     if nodeTyIsNullable(nd.isObj) { return -1 }
     const sk = monoArgTyName(nd.isObj, fnIx)
     if sk == "" { return -1 }
+    // A FUNCTION-VALUE receiver's `sk` is a `$fnsig` PIN MARKER (`"=>i>i"`), not a type
+    // SPELLING — `monoArgTyName`'s closure arm mints an interned ABI key precisely because a
+    // bare function type has no annotation form an instance could carry. Every compare below
+    // reads `sk` AS a spelling (the raw `is` name, `tyToEmitName`, the struct-row match), so a
+    // pin misses all three by construction and the ladder's `return 0` CONST-FOLDED `x is F`
+    // to FALSE for every closure-typed receiver — `vl check --codegen` clean, a module that
+    // VALIDATES, and a guard that never fires (#1864). The structurally-identical-alias union
+    // `FA | FB` is the sharpest spelling of it (the checker collapses the two arms to one
+    // member, so there is no box to tag-compare and both guards fold false), but the union is
+    // incidental: the bare `x: FA` / `x is FA` one-liner folds false too.
+    //
+    // The ARENA answers it. A bare closure value has exactly ONE static function type and no
+    // runtime discriminant, so `is` over it IS a compile-time question — the same question the
+    // collapsed-same-shape tautology arm at the foot of `emitIs` asks, and the same answer.
+    // `monoArgPinTyIx` is the documented type-side twin of the very call that produced `sk`, so
+    // the NAME and the TYPE of the pin cannot come from two different nodes — which matters for
+    // a monomorphized CLONE, whose leaf `v` still carries the original's `T` while the rewritten
+    // ANNOTATION carries the instance's `TyFunc`.
+    //
+    // A STRICT REFINEMENT of the fold: a pin never matched any compare below and
+    // `repIsRowMatchTy` names no row for one either, so master answered 0 for EVERY pin. Only
+    // the cells whose two types are the same type change, and they change from a wrong FALSE to
+    // TRUE. An undecidable receiver keeps the 0 rather than declining to the runtime ladder —
+    // `-1` there is a loud "`is` names a type that is not a union variant" emit failure
+    // wherever the program happens to declare a union elsewhere (measured on both shapes).
+    if sigKeyPinPayload(sk) != "" {
+      const fvTy = monoArgPinTyIx(nd.isObj, fnIx)
+      const fvTest = isVarTyIxOf(isIx)
+      if fvTy >= 0 && fvTest >= 0 && tySame(fvTy, fvTest) { return 1 }
+      return 0
+    }
     if sk == nd.isVariant { return 1 }
     // THE SAME COMPARE, WITH THE TESTED SPELLING RESOLVED. `sk` is a CANONICAL emit name
     // (`monoArgTyName` reads post-canon annotations) while `nd.isVariant` is the RAW source
@@ -2865,7 +2898,27 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       // Ident read would unbox instead of yielding the box.
       const vrecv = P.nodes[unwrapParen(ndv.isObj)]
       if vrecv is Ident {
-        if unionNameOfIdentSid(sidOfNode(unwrapParen(ndv.isObj)), fnIx) != "" {
+        // THE REGISTRY AND THE STORAGE ARE TWO QUESTIONS, AND THE BOX PATH NEEDS BOTH.
+        // `unionNameOfIdentSid` answers about the annotation's registry ROW;
+        // `identSlotIsUnionBox` asks the rep layer what the slot holding the value actually
+        // is. They disagree in exactly one direction: an annotation the registry holds as a
+        // multi-arm union whose arms COLLAPSE to a single rep gets a bare cell, not a box.
+        // `type FA = (PA) => i32` beside `type FB = (PB) => i32` over field-permuted
+        // parameter objects is that shape — `repCanonIdGo`'s `TyObj` arm sorts its field
+        // pairs (the 2026-08 ruling) so the two arms are ONE closure rep and the parameter's
+        // valtype is the closure fat pointer, while `tyToEmitNameAt` does not sort and the
+        // registry still holds a two-arm row. This arm then read `struct.get $uBox 0` off a
+        // `(ref $cloStruct)`: check-clean, and a module the engine refuses at load.
+        //
+        // IT IS THE STORAGE QUESTION AND NOT `exprUnion`, which is the distinction this
+        // arm's own existence rests on: a union-typed ident an outer guard has NARROWED to a
+        // single atom still HAS box storage, and `exprUnion` — narrowing-sensitive — would
+        // say no and unbox. `identSlotIsUnionBox` reads the DECLARATION (param annotation,
+        // declared kind, capture kind), which narrowing does not move.
+        if (
+          unionNameOfIdentSid(sidOfNode(unwrapParen(ndv.isObj)), fnIx) != "" &&
+          identSlotIsUnionBox(fnIx, vrecv.identName)
+        ) {
           if emitUnionBoxPush(body, vrecv.identName, fnIx) < 0 { return -1 }
           fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
           fbI32Const(armTag)
