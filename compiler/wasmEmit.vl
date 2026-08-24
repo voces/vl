@@ -378,6 +378,7 @@ import {
   fbI64TruncF64S,
   fbIf,
   fbIfRef,
+  fbIfRefNul,
   fbLocalGet,
   fbLocalSet,
   fbLocalTee,
@@ -424,6 +425,7 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  tyPeelNul,
   asExprIsUnionCast,
   arrLitElemName,
   arrLitIsF32,
@@ -11169,7 +11171,12 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   if asExprIsUnionCast(_exprIx) {
     // The target arm's TYPE is the cast node's own recorded type — the checker set it to
     // exactly the arm it proved. No spelling is resolved here.
-    const tty = nodeTyIxOf(_exprIx)
+    // The TARGET arm's type. For `as` / `as!` the cast node's own recorded type IS the
+    // target; for `as?` the node is `T | null` (its result), so the nullable is peeled to
+    // recover `T`. Without the peel the tag and heap were derived from `T | null` — the
+    // wrong type — and the block's result type could not match the slot's.
+    let tty = nodeTyIxOf(_exprIx)
+    if e.asMode == "null" { tty = tyPeelNul(tty) }
     // THE TARGET'S ARMS, flattened. A SUB-UNION target (`as Shape` over
     // `Circle | Rect | ParseError`, where `type Shape = Circle | Rect`) is the shape the error
     // model produces the moment a program keeps a DOMAIN union and an error type apart and
@@ -11243,6 +11250,44 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
         fbI32Bin(114) // 0x72 i32.or
       }
       wi = wi + 1
+    }
+    // `as?` YIELDS A VALUE ON BOTH PATHS, so it is a value-producing `if` rather than the
+    // early exit the other two take: `T` when the tag matches, `null` when it does not.
+    //
+    // SUPPORTED WHERE `T | null` ALREADY HAS A REP, and that is a much narrower set than it
+    // looks, for reasons that have nothing to do with this cast. Measured on the tip:
+    //
+    //   · `string | null`   — the kind-16 nullable string ref. WORKS.
+    //   · `i32 | null`      — exists, but as a value NICHE (a sentinel in the i32), not a
+    //                         nullable ref, so it needs a second lowering rather than this one.
+    //   · `Circle | null` where `Circle` is a union ARM — DOES NOT EXIST. `emitProgram: ref
+    //                         valtype with no interned shape`, with no cast in the program.
+    //   · `Shape | null` where `Shape` is a union — DOES NOT EXIST either.
+    //
+    // The last two are pre-existing gaps in the nullable reps, not in the trio, so they are
+    // refused here by naming the missing rep rather than guessed at. A nullable plain struct
+    // (not a union arm) does exist, which is what makes the variant case a real hole rather
+    // than a category that was never built.
+    if e.asMode == "null" {
+      if ak != 2 || subUnion || armVi >= 0 {
+        return emitFail(
+          "emitProgram: `as? " +
+            tgt +
+            "` needs `" +
+            tgt +
+            " | null` to have a representation; today only a string arm does — a scalar arm is a value niche, and a union arm or sub-union has no nullable form at all",
+        )
+      }
+      fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
+      ctrlEnter()
+      fbLocalGet(unionAsSlot)
+      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+      fbRefCast(sTypeIdx)
+      fbElse()
+      fbRefNull(sTypeIdx)
+      fbEnd()
+      ctrlLeave()
+      return 0
     }
     fbI32Eqz() // 0x45
     fbIf(64)   // if, void
