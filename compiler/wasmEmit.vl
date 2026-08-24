@@ -1,5 +1,6 @@
 import {
   EqCmpKind,
+  flattenVariantsInto,
   fsArgIsU8List,
   fsIntrinsicArity,
   fsIntrinsicSlot,
@@ -11170,25 +11171,52 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     // The target arm's TYPE is the cast node's own recorded type — the checker set it to
     // exactly the arm it proved. No spelling is resolved here.
     const tty = nodeTyIxOf(_exprIx)
-    let tag = isArmTagOfTy(tty)
-    const ak = unMemAtomKind(tty)
-    // A STRUCT arm (`Config | IoError`) is a VARIANT: its box tag is `uTags[vi]`, the same
-    // program-global rank the box was built with, not an `isArmTagOfTy` value-atom kind.
+    // THE TARGET'S ARMS, flattened. A SUB-UNION target (`as Shape` over
+    // `Circle | Rect | ParseError`, where `type Shape = Circle | Rect`) is the shape the error
+    // model produces the moment a program keeps a DOMAIN union and an error type apart and
+    // joins them at one boundary. It is the CHEAPER lowering, not a harder one: the result IS
+    // the box at a narrower type, so there is no unbox at all — only the membership test
+    // widens, from one tag compare to a chain over the arms.
+    //
+    // The flatten decides which shape this is rather than a `TyUnion` test: it pushes a
+    // non-union type as itself, so one arm means one tag.
+    const armTys: i32[] = []
+    flattenVariantsInto(tty, armTys)
+    const subUnion = armTys.length > 1
+    const wantTags: i32[] = []
     let armVi = -1
-    if tag < 0 {
-      const armNm = nominalStructNameOfTy(tty)
-      if armNm != "" { armVi = variantIndexOf(armNm) }
-      if armVi >= 0 { tag = uTags[armVi] }
+    let ak = 0
+    if !subUnion { ak = unMemAtomKind(tty) }
+    let at = 0
+    while at < armTys.length {
+      const aty = armTys[at]
+      let t1 = isArmTagOfTy(aty)
+      // A STRUCT arm is a VARIANT: its box tag is `uTags[vi]`, the same program-global rank
+      // the box was built with, not an `isArmTagOfTy` value-atom kind.
+      let vi = -1
+      if t1 < 0 {
+        const armNm = nominalStructNameOfTy(aty)
+        if armNm != "" { vi = variantIndexOf(armNm) }
+        if vi >= 0 { t1 = uTags[vi] }
+      }
+      if t1 < 0 {
+        return emitFail(
+          "emitProgram: `as " +
+            tgt +
+            "` is supported for a value-union arm or a struct-variant arm; this arm is neither — write the explicit `if x is " +
+            tgt +
+            " { … }` ladder for it",
+        )
+      }
+      if !subUnion { armVi = vi }
+      wantTags.push(t1)
+      at = at + 1
     }
-    if tag < 0 || (armVi < 0 && ak < 0) {
+    if wantTags.length < 1 || (!subUnion && armVi < 0 && ak < 0) {
       return emitFail(
         "emitProgram: `as " +
           tgt +
-          "` is supported for a value-union arm or a struct-variant arm; `" +
-          tgt +
-          "` is neither — write the explicit `if x is " +
-          tgt +
-          " { … }` ladder for it",
+          "` names no union arm this cast can test",
       )
     }
     // The operand must actually carry the BOX. A niche-repped union (`T | null`) has no tag
@@ -11203,18 +11231,30 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     }
     if emitExpr(body, obj, fnIx) < 0 { return -1 }
     fbLocalSet(unionAsSlot)
-    fbLocalGet(unionAsSlot)
-    fbStructGet(uBoxIdx, 0) // field 0: the tag
-    fbI32Const(tag)
-    fbI32Bin(70)            // 0x46 i32.eq
-    fbI32Eqz()              // 0x45
-    fbIf(64)                // if, void
+    // `tag == w0 || tag == w1 || …` — one compare for a single arm, a chain for a sub-union.
+    // The tag is re-read per arm rather than stashed in a second i32 slot: it is a
+    // `struct.get` off a local, two instructions, and costs no frame.
+    let wi = 0
+    while wi < wantTags.length {
+      fbLocalGet(unionAsSlot)
+      fbStructGet(uBoxIdx, 0) // field 0: the tag
+      fbI32Const(wantTags[wi])
+      fbI32Bin(70)            // 0x46 i32.eq
+      if wi > 0 {
+        fbI32Bin(114) // 0x72 i32.or
+      }
+      wi = wi + 1
+    }
+    fbI32Eqz() // 0x45
+    fbIf(64)   // if, void
     ctrlEnter()
     fbLocalGet(unionAsSlot)
     fbReturn()
     fbEnd()
     ctrlLeave()
     fbLocalGet(unionAsSlot)
+    // A SUB-UNION result IS the box, at a narrower type — nothing to unbox.
+    if subUnion { return 0 }
     // A STRUCT arm's payload IS the variant struct — recover it with the variant heap cast,
     // exactly as the shared-field dispatch does. A value atom takes the shared atom tail.
     if armVi >= 0 {
