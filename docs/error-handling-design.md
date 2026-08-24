@@ -342,9 +342,20 @@ The checker enforces that the **propagated remainder** (`A | B | … minus T`) i
 assignable to the enclosing function's declared return type. In `loadAndParse`,
 `fs.read(raw) as string` propagates `IoError`, and `parse(raw) as Config`
 propagates `ParseError`, both admitted by the `Config | IoError | ParseError`
-return — the whole ladder collapses to two `as` casts. **Not v1**; trigger:
-"once std:fs / parsing chains prove the ladder boilerplate" — after a real
-consumer exists, not speculatively.
+return — the whole ladder collapses to two `as` casts.
+
+**SHIPPED (2026-08-24).** The trigger — "once std:fs / parsing chains prove the
+ladder boilerplate" — fired when `std:fs` shipped fallible; writing that module is
+what proved it. `as` (propagate) and `as!` (trap) are both lowered, over a value
+-atom arm, a struct arm and a SUB-UNION target (`as Shape` over
+`Circle | Rect | ParseError`, the shape this section's own `loadAndParse` example
+takes). `as?` parses and is refused at the checker, naming the two working
+spellings: it is the one member whose RESULT type differs (`T | null`), and that rep
+is per-`T` — a nullable REF for a string/struct/sub-union arm, a value NICHE for a
+scalar. Its lowering emits correct bytes; what remains is the binding and consumer
+classifiers seeing through the cast to the NULLABLE kind, per rep. Since `as?` is
+the member this section itself calls lossy ("it DESTROYS the error value"), nothing
+load-bearing waits on it.
 
 ### The unified `as` principle
 

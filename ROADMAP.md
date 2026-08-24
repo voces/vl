@@ -796,15 +796,19 @@ in-language GC knobs.
   Next); chartered follow-ups: compiler-injected call sites, generic `expect<T>` + structural diffs,
   power-`assert` rewriting. New behavioral tests switch to `*.test.vl` at v1 (directive-corpus
   growth stops; conversion waits for the TS-tier teardown).
-- ⬜ **Error-handling design** — DRAFTED, pending owner review: `docs/error-handling-design.md`
+- 🟡 **Error-handling design** — RULED and PARTLY BUILT: `docs/error-handling-design.md`
   (errors-as-values via unions — `T | null` for absence, `T | E` with a structural `IoError`
   alias for reasoned failure, traps (`__trap__(msg)`) for bugs; no catchable throw in v1, `exnref`
   reserved for a possible async era, Go-style multi-value returns ruled out; union-`as`
-  propagation (`x as T` narrows-or-early-returns the remainder, under a unified `as`
-  principle) chartered as follow-up; fallible std sequenced after the R3b/R7 rep family). Settles the
-  failure story BEFORE std grows fallible APIs (`std:fs`, parsing). Until it lands, std ships
-  only total functions + `__trap__` aborts (std-design D1). Seven open questions (O1–O7)
-  flagged for the maintainer.
+  propagation, under a unified `as` principle). **REMAINING: `as?` only.** The model shipped —
+  `std:fs` is fallible on the ruled `T | E` shape, and the `as` trio's two lowered members
+  landed 2026-08-24: `as` propagates the remainder (checked against the enclosing return) and
+  `as!` traps, both over a value-atom arm, a struct arm and a SUB-UNION target. `as?` parses
+  and is refused at the checker — its `T | null` result is the one member whose rep is
+  per-`T` (a nullable REF for a string/struct/sub-union arm, a value NICHE for a scalar), and
+  its lowering emits correct bytes while the binding/consumer classifiers still need a
+  nullable arm each. It is the member the design itself calls lossy, so nothing waits on it.
+  Also open: the seven O1–O7 questions, of which O5/O6 are settled by the above.
 - ✅ **Explicit numeric conversion syntax — SHIPPED; this entry was STALE.** The lossless-only
   implicit-widening rule (#298) makes the lossy edges expressible only via a cast, and that cast
   **exists**: `as` covers every edge this item named — `i32 as f32`, `i64 as f64`, and the
@@ -1418,7 +1422,9 @@ in-language GC knobs.
   **Browser parity is deliberately off the initial path** (owner, 2026-08-22) — blocking
   I/O is trivial under wasmtime and *not implementable* on a browser main thread.
   Sequencing (steps 1–3 need no async decisions at all): host ABI batch → `std:fs` →
-  the `as` trio → stack switching → `map(f, limit)` → effect inference.
+  the `as` trio (steps 1-3 DONE: `std:args`/`std:fs` ship, and `as`/`as!` lowered
+  2026-08-24 — `as?` refused at the checker, and it is the lossy member) → stack
+  switching → `map(f, limit)` → effect inference.
   **`map` should be std** (owner, 2026-08-22) and the blocker is one intrinsic, not the
   optimizer: the builtin does NOT inline the callback (`call_indirect` per element, same
   as std would pay), it buys a pre-sized `array.new_default`; `mapIndexed<T, U>` in
