@@ -815,6 +815,11 @@ export function retAnnKindChain(tyIx: i32): VKind {
   if retUnionFlag(tyIx) == 1 { k = "union" }
   if retTRFlag(tyIx) == 1 { k = "struct" }
   if retNulRefFlag(tyIx) == 1 { k = "nulstruct" }
+  // `Circle | null` — the recorded RETURN kind a caller reads back (`fRetKind`) to
+  // declare an inferred binding's slot and to resolve the call's result valtype. Without
+  // it the chain fell through to its `"i32"` default, so a call of a nulvariant-returning
+  // function landed in an i32 local while the callee's own functype said `(ref null …)`.
+  if retNulVariantFlag(tyIx) == 1 { k = "nulvariant" }
   if lk == 5 { k = "reflist" }
   if lk == 7 { k = "strlist" }
   if lk == 12 { k = "f64list" }
@@ -886,6 +891,9 @@ export function cloRetValSlot(fe: i32) {
       if k == "struct" || k == "nulstruct" { return retStructIndex(fn.fnRet) }
       // A `: Cat` annotated variant result (kind 8) — the slot is the VARIANT index.
       if k == "variant" { return variantIndexOf(tyNameOf(fn.fnRet)) }
+      // A `: Circle | null` annotated result — the slot is the VARIANT index under the
+      // null, since `retStructIndex` has no row for a variant.
+      if k == "nulvariant" { return nulVariantIndexOf(fn.fnRet) }
       // A `: S[]` / `: ((i32) => i32)[]` annotated REF-LIST result (kind 5) — the slot is the
       // ref-list slot (`rlWrapIdx`-bearing), the dual of a `cloParamTok` kind-5 param's slot.
       if k == "reflist" { return tyAnnRefListSlot(fn.fnRet) }
@@ -1326,6 +1334,12 @@ function paramNulRef(fnIx: i32, name: string) {
   retNulRefFlag(paramTypeNode(fnIx, name)) == 1
 }
 
+// True if parameter `name` of `fnIx` is a NULLABLE union VARIANT (`Circle | null`, kind
+// `nulvariant`) — the variant twin of `paramNulRef`, disjoint from it by construction.
+function paramNulVariant(fnIx: i32, name: string) {
+  retNulVariantFlag(paramTypeNode(fnIx, name)) == 1
+}
+
 // True if the parameter `name` of function `fnIx` is a NULLABLE map (`{[string]: V} | null`,
 // kind `nulmap`). The map twin of `paramNulRef`/`paramNulRefArray`.
 export function paramNulMap(fnIx: i32, name: string) {
@@ -1356,6 +1370,83 @@ export function letIsNulRef(letIx: i32, fnIx: i32) {
     return exprNullableStruct(d.letInit, fnIx)
   }
   false
+}
+
+// The VARIANT twin of `letIsNulRef`: binding `letIx` is a `Circle | null` (kind
+// `nulvariant`), by annotation or by a nullable-variant initializer. Disjoint from its
+// struct twin, so the `declareLocals` ladder can test either order.
+export function letIsNulVariant(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if retNulVariantFlag(d.letType) == 1 { return true }
+    }
+    return exprNullableVariant(d.letInit, fnIx)
+  }
+  false
+}
+
+// The VARIANT-table index a `Circle | null` binding's `(ref null $uVarHeap[vi])` cell
+// resolves to, or -1 — the `nulvariant` twin of `nulRefStructIdxOfLet`.
+export function nulVariantIdxOfLet(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const a = nulVariantIndexOf(d.letType)
+      if a >= 0 { return a }
+    }
+    return nulVariantIdxOfExpr(d.letInit, fnIx)
+  }
+  -1
+}
+
+// The variant index behind a nullable-variant EXPRESSION (an `as?` cast, a call, an
+// ident), or -1 — the initializer half of `nulVariantIdxOfLet`.
+export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[exprIx]
+  if e is Paren { return nulVariantIdxOfExpr(e.parInner, fnIx) }
+  if e is AsExpr { return variantIndexOf(e.asTy) }
+  // A CALL of a `: Circle | null`-returning function — the callee's own annotation owns
+  // the index, which is what an INFERRED binding (`const c = h(true)`) has to read: it
+  // has no annotation of its own, and its slot is declared from this answer.
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const cfe = fnIndexOfSid(sidOfNode(e.callFn))
+      if cfe >= 0 { return cloRetValSlot(cfe) }
+    }
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return cloRetValSlot(ffe) }
+    }
+    return -1
+  }
+  if e is Ident {
+    // A DECLARED LOCAL carries its variant index in the slot's parallel column, put
+    // there by the `declareLocals` ladder — read it back rather than re-deriving from
+    // the annotation, which an INFERRED binding (`const c = x as? Circle`) does not have.
+    const dsl = declaredSlotOf(e.identName)
+    if dsl >= 0 {
+      if localIsRef[dsl] == "nulvariant" { return localStructIdx[dsl] }
+    }
+    const pt = paramTypeNode(fnIx, e.identName)
+    if pt >= 0 {
+      const pa = nulVariantIndexOf(pt)
+      if pa >= 0 { return pa }
+    }
+    const gi = globalLetOf(e.identName)
+    if gi >= 0 {
+      const g = P.nodes[gi]
+      if g is LetDecl {
+        if g.letType >= 0 { return nulVariantIndexOf(g.letType) }
+        // UN-ANNOTATED (`const c = h(true)`): the index comes from the initializer, the
+        // same place `globalCellKind` reads the cell's kind from.
+        return nulVariantIdxOfExpr(g.letInit, -1)
+      }
+    }
+  }
+  -1
 }
 
 // The NULLABLE local VKind a bare `const t = m[k]` read of a LIST- or nested-MAP-valued
@@ -12500,6 +12591,28 @@ export function retNulRefFlag(tyIx: i32) {
       // nullable-string ref (`retNulStringFlag`), never a nullable struct. Exclude it
       // here so it isn't mis-claimed as kind 9 (which would read the box as a struct).
       if base == "string" { return 0 }
+      // A union VARIANT under the null is `nulvariant`, NOT kind 9 — the positive answer
+      // is `retNulVariantFlag` just below. Excluded HERE, at the one producer, rather
+      // than at each of this flag's readers: `collectS` refuses a variant its own struct
+      // row, so every `nulstruct` answer for one pairs an `sHeapIdx` read with a
+      // `uVariants` index (#1803 — a `ref valtype with no interned shape` reject where
+      // the struct table is empty, a silent read of an unrelated heap type where it is
+      // not). The arena fast-path above already declines variants
+      // (`nodeTyIsNulStruct`'s `cVariantMemberTyIxSet` test); this makes the NAME path
+      // agree with it, which is the divergence that produced the crash.
+      // A union VARIANT WITH NO STRUCT ROW is `nulvariant`, not kind 9 — the positive
+      // answer is `retNulVariantFlag`. The `structIndexOfTypeName` half is load-bearing
+      // and not belt-and-braces: a name can be BOTH, and `std/fs.vl`'s `IoResult` is
+      // exactly that (`type IoResult = IoError | null`, where `IoError` is also a union
+      // member). The DECLARED-alias route interns the shape, so such a name keeps a real
+      // struct row and must keep its kind-9 answer; only the name `collectS` actually
+      // refused a row — the one that fails today with `ref valtype with no interned
+      // shape` — belongs to the new kind.
+      if base != "" {
+        if variantIndexOf(base) >= 0 && structIndexOfTypeName(base) < 0 {
+          return 0
+        }
+      }
       if base != "" {
         // THE ARENA ANSWERS "is the nullable base a STRUCT?", the same question
         // `nulBaseStructRow` asks one rung of this file away (B242/B243) — and here it
@@ -12527,6 +12640,65 @@ export function retNulRefFlag(tyIx: i32) {
     }
   }
   0
+}
+
+// A NULLABLE union VARIANT annotation (`Circle | null`, where `Circle` is a union ARM) —
+// `1`, else `0`. The variant-table twin of `retNulRefFlag`, and DISJOINT from it by
+// construction: that flag now returns 0 for exactly the names this one claims.
+//
+// The name is the whole test. A variant has no struct row to ask the arena about
+// (`collectS` skips it), so `nullablePartOf` + `variantIndexOf` is not a shortcut past a
+// structural question — it is the only registry that knows the answer.
+// A NULLABLE union VARIANT annotation or expression (`Circle | null`, `x as? Circle`) —
+// `1`, else `0`. The variant-table twin of `retNulRefFlag`, and DISJOINT from it by
+// construction: that flag returns 0 for exactly what this one claims.
+//
+// DEFINED IN TERMS OF THE INDEX, deliberately. The kind and its companion slot are read
+// as a PAIR (`annValtypeSlotOf`), and a flag that can say "yes" where the index resolves
+// to -1 hands `fbValtype` an unresolvable pair — which is not a clean reject but a
+// `structIdx < 0` guard trip, arriving with emission still running. Asking the index is
+// the only way to make the two agree by construction rather than by review.
+export function retNulVariantFlag(tyIx: i32) {
+  if nulVariantIndexOf(tyIx) >= 0 { return 1 }
+  0
+}
+
+// The VARIANT table index behind a `Circle | null` annotation or expression at `tyIx`, or
+// -1 — the `nulvariant` half of `annValtypeSlotOf`'s kind/slot pairing, and the whole of
+// its kind test above.
+//
+// TWO RUNGS, in the order the rest of the file uses. The NAME answers for an annotation
+// (`nullablePartOf` + the `uVariants` scan); the ARENA answers for an EXPRESSION, which
+// carries a recorded type and no spelling at all — `mk(a) as? Circle` is the shape that
+// needs it. `variantRowOfTy` matches on arena-index identity, so it cannot pick a
+// same-shaped sibling the way a field-set match could.
+export function nulVariantIndexOf(tyIx: i32) {
+  if tyIx < 0 { return -1 }
+  const ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    const base = nullablePartOf(ty.tyName)
+    if base != "" {
+      const nvn = variantIndexOf(base)
+      // ONLY where the struct table refused a row — see `retNulRefFlag`'s matching gate.
+      // A name that is both a variant and a declared struct keeps the kind-9 niche it
+      // already lowers with, so this kind never takes a position that works today.
+      if nvn >= 0 && structIndexOfTypeName(base) < 0 { return nvn }
+      return -1
+    }
+  }
+  const nvt = nodeTyIxOf(tyIx)
+  if nvt >= 0 {
+    const nvty = T.tys[nvt]
+    if nvty is TyNullable {
+      if nvty.nInner >= 0 {
+        const nvr = variantRowOfTy(nvty.nInner)
+        if nvr >= 0 {
+          if structIndexOfTypeName(uVariants[nvr]) < 0 { return nvr }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // The base struct table index of a `S | null` annotation at `tyIx`, or -1.
@@ -13234,6 +13406,10 @@ export function vtKindOfType(tyIx: i32): VKind {
   // disjoint from it anyway (a `| null` map name is a `nameIsMapMemberUnion`, which `retMapFlag`
   // excludes). Its shape arg is `mapAnnShape` (now `| null`-aware), resolving THIS map's `$mapStruct`.
   if retNulMapFlag(tyIx) == 1 { return "nulmap" }
+  // A NULLABLE union VARIANT (`Circle | null`) — the `(ref null $uVarHeap[vi])` niche,
+  // paired in `annValtypeSlotOf` with the VARIANT index. Beside `retNulRefFlag` rather
+  // than after it as a fallback, because the two are disjoint at the producer.
+  if retNulVariantFlag(tyIx) == 1 { return "nulvariant" }
   if retNulRefFlag(tyIx) == 1 { return "nulstruct" }
   if retNulStringFlag(tyIx) == 1 { return "nulstr" }
   if retNulListFlag(tyIx) == 1 { return "nullist" }
@@ -13504,6 +13680,10 @@ export function annValtypeSlotOf(tyIx: i32) {
     const ptv = P.nodes[tyIx]
     if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
   }
+  // `Circle | null` — the VARIANT index under the null, the slot `fbValtype`'s
+  // `nulvariant` arm indexes `uVarHeap` with. `retStructIndex` below cannot answer it:
+  // a variant has no struct row.
+  if retNulVariantFlag(tyIx) == 1 { return nulVariantIndexOf(tyIx) }
   retStructIndex(tyIx)
 }
 
@@ -13562,6 +13742,7 @@ function globalKind(initIx: i32): VKind {
   // expression-family cases (it never overlaps the others, and only fires in a program
   // that uses function values, so non-closure globals stay byte-identical).
   if exprIsClosure(initIx, -1) { return "closure" }
+  if exprNullableVariant(initIx, -1) { return "nulvariant" }
   if exprNullableStruct(initIx, -1) { return "nulstruct" }
   if exprMap(initIx, -1) { return "map" }
   if exprString(initIx, -1) { return "str" }
@@ -13643,6 +13824,10 @@ export function globalCellKind(letIx: i32): VKind {
       // A function-typed global (`const g: (i32) => i32 = inc`) is a closure fat-pointer
       // cell (kind 14), like a function-valued local.
       if tyIsFuncType(d.letType) { return "closure" }
+      // A `Circle | null` global — the `nulvariant` niche. BEFORE its struct twin for the
+      // ladder's usual reason: `letIsNulRef` falls through an annotation it cannot claim
+      // to the INITIALIZER, and a nullable-variant-returning call answers there.
+      if letIsNulVariant(letIx, -1) { return "nulvariant" }
       if letIsNulRef(letIx, -1) { return "nulstruct" }
       // A NULLABLE ref-array global (`(P | null)[] | null`, `S[] | null`, `i32[][] | null`) —
       // kind 18, a `(ref null $rlWrap)` cell over the inner ref-list's wrapper — BEFORE the
@@ -13769,6 +13954,11 @@ export function globalCellStructIdx(letIx: i32) {
     // `globalKind`'s variant arm, which decides the kind this slot is read beside.
     const gvi = exprVariantIndex(d.letInit, -1)
     if gvi >= 0 { return gvi }
+    // The UN-ANNOTATED nullable-variant cell (`const c = h(true)` where `h` returns
+    // `Circle | null`) — its slot comes from the callee's return, the same place its
+    // KIND does.
+    const gnvi = nulVariantIdxOfExpr(d.letInit, -1)
+    if gnvi >= 0 { return gnvi }
     return structIndexOfExpr(d.letInit, -1)
   }
   -1
@@ -20561,6 +20751,81 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
 
 // True if the already-collected declared local `name` is a nullable struct (code 9).
 function declaredNulRef(name: string) { declaredKind(name) == "nulstruct" }
+function declaredNulVariant(name: string) { declaredKind(name) == "nulvariant" }
+
+// Expression `exprIx` is a NULLABLE union VARIANT (`Circle | null`) — the variant twin of
+// `exprNullableStruct`, ARM FOR ARM over the receiver shapes a nullable niche reaches:
+// a parenthesised inner, an `as?` cast, a call result, and an ident (param / local /
+// captured / global). Kept STRICT and separate rather than folded into its struct twin
+// because the two kinds index DIFFERENT heap tables (`uVarHeap` vs `sHeapIdx`), so a
+// caller deciding a KIND must be able to tell them apart; only the callers deciding a
+// NULL TEST want the union of the two, and they ask `exprNullableRefNiche`.
+export function exprNullableVariant(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Paren { return exprNullableVariant(e.parInner, fnIx) }
+  if e is AsExpr { return retNulVariantFlag(exprIx) == 1 }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      // The DIRECT call of a top-level function — the `nulvariant` twin of
+      // `fnRetNulRefSid`, asked of the callee's ANNOTATION as well as of its recorded
+      // kind. Both, and the annotation is the load-bearing one: `fRetKind` is seeded by
+      // `buildFnMap` from `retAnnKindChain`, which runs BEFORE `collectU` fills the
+      // variant table — so `variantIndexOf` answers -1 there and the stored kind for a
+      // `: Circle | null` return is whatever the chain's earlier arms left. Reading
+      // `fn.fnRet` here is order-independent, which is what a classifier consulted during
+      // emission needs.
+      const nvfe = fnIndexOfSid(sidOfNode(e.callFn))
+      if nvfe >= 0 {
+        if fRetKind[nvfe] == "nulvariant" { return true }
+        if nvfe < fnStmts.length {
+          const nvfn = P.nodes[fnStmts[nvfe]]
+          if nvfn is FuncDecl {
+            if nvfn.fnRet >= 0 {
+              if retNulVariantFlag(nvfn.fnRet) == 1 { return true }
+            }
+          }
+        }
+      }
+      if calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nulvariant" {
+        return true
+      }
+    }
+    if callee is Member {
+      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if ffe >= 0 { return fRetKind[ffe] == "nulvariant" }
+    }
+    return false
+  }
+  if e is Ident {
+    if paramNulVariant(fnIx, e.identName) { return true }
+    if declaredNulVariant(e.identName) { return true }
+    if capturedKindOf(fnIx, e.identName) == "nulvariant" { return true }
+    const gi = globalLetOf(e.identName)
+    if gi >= 0 {
+      const g = P.nodes[gi]
+      if g is LetDecl {
+        if g.letType >= 0 { return retNulVariantFlag(g.letType) == 1 }
+        // UN-ANNOTATED — classify through the initializer, as the global cell's own
+        // kind ladder does.
+        return exprNullableVariant(g.letInit, -1)
+      }
+    }
+    return false
+  }
+  false
+}
+
+// Expression `exprIx` is a NULLABLE REF NICHE — a nullable struct (kind 9) OR a nullable
+// union variant. THE PREDICATE EVERY NULL-TEST AND NARROWING SITE WANTS: both lower a
+// bare `null` as the ref's own `ref.null` and test it with `ref.is_null`, and neither
+// consults the heap TABLE that is the only thing separating the two kinds. A site
+// deciding a KIND must keep asking the strict twins instead — it has to know which table.
+export function exprNullableRefNiche(exprIx: i32, fnIx: i32) {
+  if exprNullableStruct(exprIx, fnIx) { return true }
+  exprNullableVariant(exprIx, fnIx)
+}
 
 // True if `name` is a declared NULLABLE function-value local (`fn | null`, kind 19) — the
 // closure dual of `declaredNulRef`.
@@ -21697,6 +21962,18 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       if cty >= 0 {
         const ct = T.tys[cty]
         if ct is TyUnion { return true }
+        // `x as? Shape` records `Shape | null` — a `TyNullable` over the union. Its rep is
+        // still the BOX (a non-null box carrying `nullBoxTag()` for the absent case), so
+        // every box consumer must see it as one; reading only the bare `TyUnion` here left
+        // the coalescing form of the sub-union cast classified as "not a union", and its
+        // `!= null` then fell out to the scalar compare and emitted an untyped `null`.
+        if ct is TyNullable {
+          const cin = ct.nInner
+          if cin >= 0 {
+            const cit = T.tys[cin]
+            if cit is TyUnion { return true }
+          }
+        }
       }
     }
     return false
@@ -24478,7 +24755,15 @@ export function letAnnVariantIdx(letIx: i32) {
   if d is LetDecl {
     if d.letType >= 0 {
       const lt = P.nodes[d.letType]
-      if lt is TypeRef { return variantIndexOf(lt.tyName) }
+      if lt is TypeRef {
+        const lav = variantIndexOf(lt.tyName)
+        if lav >= 0 { return lav }
+        // `Circle | null` seeds the SAME concrete variant the bare `Circle` annotation
+        // does: the niche's non-null payload IS a variant struct, so an object literal
+        // under a nullable annotation must build that heap type and not fall through to
+        // the field-name struct match (which resolves a different — or no — row).
+        return nulVariantIndexOf(d.letType)
+      }
     }
   }
   -1

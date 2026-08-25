@@ -1,0 +1,68 @@
+// `x as? T` FOR THE TWO TARGETS THAT HAD NO NULLABLE REP — a struct-VARIANT arm and a
+// SUB-UNION. With the string arm (`as-coalesce.vl`) this completes the coalescing member of
+// the ruled trio (`error-handling-design.md` §Trio): `as` propagates · `as?` coalesces to
+// null · `as!` traps.
+//
+// BOTH WERE REFUSED BY NAMING THE MISSING REP, and the refusal was honest — `Circle | null`
+// and `Shape | null` genuinely had no representation, with no cast in the program at all.
+// They have one now (`nullable-variant-positions.vl`, `nullable-union-alias.vl`), so the
+// cast lowers instead of declining.
+//
+// THE TWO LOWERINGS DIFFER, because the two targets have different reps and each cast
+// yields its own target's:
+//
+//   · a VARIANT arm  → `(ref null $uVarHeap[vi])`. Unbox and cast on the tag hit, that
+//                      variant's own typed null on the miss. NO ALLOCATION on either path.
+//   · a SUB-UNION    → the BOX at a narrower type, so the hit is the box itself with no
+//                      unbox at all; the miss builds the NULL-TAGGED box (`nullBoxTag()`),
+//                      which is what `T | null` means for a boxed union and what the
+//                      `!= null` test on the result reads.
+//
+// A SCALAR arm is still refused, and that one is a real difference rather than a gap:
+// `i32 | null` exists as a value NICHE — a sentinel inside the i32 — which is a different
+// lowering from the nullable ref this cast emits. See `as-coalesce-no-nullable-rep.vl`.
+// @run
+// @log 3
+// @log -1
+// @log 9
+// @log -1
+// @log 4
+// @log -1
+
+type Circle     = { kind: "circle", r: f64 }
+type Rect       = { kind: "rect", w: f64, h: f64 }
+type ParseError = { why: string }
+type Shape      = Circle | Rect
+type Parsed     = Circle | Rect | ParseError
+
+function parse(t: string, n: f64): Parsed {
+  if t == "circle" { return { kind: "circle", r: n } }
+  if t == "rect" { return { kind: "rect", w: n, h: n } }
+  { why: "unknown" }
+}
+
+// A VARIANT ARM — `Parsed` narrowed to the one arm `Circle`, absent as null.
+function radiusOf(t: string, n: f64) {
+  const c = parse(t, n) as? Circle
+  if c != null { return c.r }
+  -1.0
+}
+print(radiusOf("circle", 3.0))       // 3
+print(radiusOf("bad", 3.0))          // -1
+
+// A SUB-UNION — `Parsed` narrowed to `Shape`, the domain half, with the error half coalesced
+// away. This is the shape the error model produces at a boundary: the domain function never
+// sees an error type, and the caller decides what absence means.
+function area(s: Shape) {
+  if s is Circle { return s.r * s.r }
+  s.w * s.h
+}
+function areaOf(t: string, n: f64) {
+  const s = parse(t, n) as? Shape
+  if s != null { return area(s) }
+  -1.0
+}
+print(areaOf("rect", 3.0))           // 9
+print(areaOf("bad", 3.0))            // -1
+print(areaOf("circle", 2.0))         // 4
+print(areaOf("nope", 1.0))           // -1

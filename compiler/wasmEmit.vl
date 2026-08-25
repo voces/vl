@@ -496,6 +496,11 @@ import {
   exprNullableMap,
   exprNullableRefArray,
   exprNullableString,
+  exprNullableRefNiche,
+  retNulVariantFlag,
+  nulVariantIndexOf,
+  exprNullableVariant,
+  nulVariantIdxOfExpr,
   exprNullableStruct,
   exprReReadable,
   exprRefArray,
@@ -2436,13 +2441,17 @@ function emitNulIsNullTest(
   // distinct-backing scalar list's wrapper (`string[]|null`, `f64[]|null`, `i64[]|null`,
   // `f32[]|null`) and a ref array's inner wrapper.
   if (
-    exprNullableStruct(refIx, fnIx) ||
+    exprNullableRefNiche(refIx, fnIx) ||
     exprNullableMap(refIx, fnIx) ||
     exprNulClosure(refIx, fnIx) ||
     exprNullableList(refIx, fnIx) ||
     exprNulScalarListKind(refIx, fnIx) != null ||
     exprNullableRefArray(refIx, fnIx)
   ) {
+    // `exprNullableRefNiche`, not the struct-only twin: a nullable union VARIANT
+    // (`Circle | null`) is a `(ref null $uVarHeap[vi])` and tests `ref.is_null` exactly
+    // like the struct ref beside it.
+
     if emitExpr(body, refIx, fnIx) < 0 { return -1 }
     wU8(209) // 0xd1 ref.is_null
     if invert {
@@ -2652,7 +2661,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
   // niche arm further down, which the box / atom / membership paths deliberately precede.
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
-    if exprNullableStruct(nd0.isObj, fnIx) {
+    if exprNullableRefNiche(nd0.isObj, fnIx) {
       const nst = emitNulIsNullTest(
         body,
         nd0.isObj,
@@ -3386,7 +3395,11 @@ function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32) {
     return 0
   }
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-  if exprNullableStruct(exprIx, fnIx) {
+  if exprNullableRefNiche(exprIx, fnIx) {
+    // The SOLE-member niches only. A nullable BOX must NOT be recovered here: this helper
+    // also feeds the `is` receiver, and a `Shape | null` receiver is legitimately null at
+    // the moment the tag is tested — asserting non-null TRAPS on the `f(null)` call the
+    // test is there to answer.
     fbRefAsNonNull() // 0xd4
   }
   0
@@ -4893,6 +4906,25 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
       fbStructGet(uVarHeap[pvi], pvfi) // 0xfb 0x02 <variant struct ht> <field index>
       return 0
+    }
+    // THE NULLABLE FORM of the same read (`c: Circle | null`, inside its `!= null`
+    // branch). Identical `struct.get`, one `ref.as_non_null` ahead of it: the cell is a
+    // `(ref null $uVarHeap[vi])` and `struct.get` takes a non-null ref. The assertion
+    // cannot trap where the checker admits the read — a nullable field access is only
+    // reachable through a null TEST, which is the same discipline the `nulstruct` reads
+    // downstream follow.
+    const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
+    if nvi >= 0 {
+      if exprNullableVariant(m0.memObj, fnIx) {
+        const nvfi = variantFieldIndex(nvi, m0.memProp)
+        if nvfi < 0 {
+          return emitFail("emitProgram: unknown variant field in field access")
+        }
+        if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
+        fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+        fbStructGet(uVarHeap[nvi], nvfi)
+        return 0
+      }
     }
   }
   // THE SHARED-FIELD DISPATCH'S RESULT REP. The dispatch below is a chain of
@@ -11269,13 +11301,61 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     // (not a union arm) does exist, which is what makes the variant case a real hole rather
     // than a category that was never built.
     if e.asMode == "null" {
-      if ak != 2 || subUnion || armVi >= 0 {
+      // A SUB-UNION target (`as? Shape` over `Circle | Rect | ParseError`) — the result IS
+      // the operand's box at a narrower type, so the happy path is the box itself and the
+      // sad path is a null box ref. The same "no unbox at all" the non-coalescing forms
+      // get for a sub-union, with `(ref null $uBoxIdx)` for the block instead of
+      // `(ref $uBoxIdx)`.
+      if subUnion {
+        fbIfRefNul(uBoxIdx, false) // if (result (ref $uBoxIdx))
+        ctrlEnter()
+        fbLocalGet(unionAsSlot)
+        fbElse()
+        // THE NULL-TAGGED BOX, which is what `T | null` means for a BOXED union — a
+        // non-null box carrying `nullBoxTag()`, NOT a null box ref. That is the rep the
+        // null TEST already reads (`emitNulIsNullTest`'s tag arm) and the one
+        // `emitUnionCoerce`'s `NullLit` builds, so the cast's miss path has to agree with
+        // it or the `!= null` on the result cannot see the null at all.
+        fbI32Const(nullBoxTag())
+        fbRefNullNone() // the payload slot is unread under the null tag
+        fbStructNew(uBoxIdx)
+        fbEnd()
+        ctrlLeave()
+        return 0
+      }
+      // A STRUCT-VARIANT target (`as? Circle`) — `Circle | null` is the `nulvariant`
+      // niche, a `(ref null $uVarHeap[vi])`. Unbox and cast on the hit, the variant's own
+      // typed null on the miss; no allocation on either path.
+      if armVi >= 0 {
+        if armVi >= uVarHeap.length {
+          return emitFail(
+            "emitProgram: `as? " +
+              tgt +
+              "` names a variant with no interned shape",
+          )
+        }
+        fbIfRefNul(uVarHeap[armVi], true)
+        ctrlEnter()
+        fbLocalGet(unionAsSlot)
+        fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+        fbRefCast(uVarHeap[armVi])
+        fbElse()
+        fbRefNull(uVarHeap[armVi])
+        fbEnd()
+        ctrlLeave()
+        return 0
+      }
+      // What is left is a VALUE-ATOM arm. The string arm is the nullable string ref
+      // below; a NUMERIC arm is refused because `i32 | null` exists as a value NICHE — a
+      // sentinel inside the i32 — which is a different lowering from the nullable ref
+      // this cast emits, not a missing one.
+      if ak != 2 {
         return emitFail(
           "emitProgram: `as? " +
             tgt +
             "` needs `" +
             tgt +
-            " | null` to have a representation; today only a string arm does — a scalar arm is a value niche, and a union arm or sub-union has no nullable form at all",
+            " | null` to have a nullable-REF representation; a scalar arm is a value niche (a sentinel inside the scalar), which is a different lowering",
         )
       }
       fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
@@ -14778,6 +14858,17 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retVariantFlag(fn.fnRet) == 1 {
       pendingVariantIdx = variantIndexOf(tyNameOf(fn.fnRet))
     }
+    // A `: Circle | null` return seeds BOTH halves of its niche, as the nullable
+    // boundaries elsewhere do: the variant index so a `return { … }` literal builds the
+    // concrete variant struct, and the heap type so a bare `return null` lowers as
+    // `ref.null $uVarHeap[vi]` instead of reaching `emitNullLitNode` with no context.
+    if retNulVariantFlag(fn.fnRet) == 1 {
+      const rnvi = nulVariantIndexOf(fn.fnRet)
+      if rnvi >= 0 && rnvi < uVarHeap.length {
+        pendingVariantIdx = rnvi
+        pendingNulRefHeap = uVarHeap[rnvi]
+      }
+    }
     // An INFERRED variant return (a `.map` lambda collapsing to one variant): seed it from
     // the checker's recorded return shape so the else-arm's `{ … }` literal builds the bare
     // variant too, matching the then-arm's narrowed variant rep.
@@ -17632,6 +17723,7 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
         if (
           gck0 != "i32" &&
           gck0 != "nulstruct" &&
+          gck0 != "nulvariant" &&
           gck0 != "i64" &&
           gck0 != "f64" &&
           gck0 != "f32" &&
@@ -17641,6 +17733,11 @@ function emitIdentNode(body: i32[], e: Ident, exprIx: i32, fnIx: i32) {
           gck0 != "nulmap" &&
           !isNulScalarListKind(gck0)
         ) {
+          // A NULLABLE-VARIANT cell (`Circle | null`) legitimately holds null, exactly
+          // like the `nulstruct` cell above it — recovering here made `gn != null` emit
+          // `global.get; ref.as_non_null; ref.is_null`, which TRAPS on the very value the
+          // test exists to detect. The field read recovers at its own use site instead.
+
           // A NULLABLE-map cell (kind `nulmap`) legitimately holds null — its reads stay nullable
           // (the `!= null` check reads raw; the narrowed map op recovers non-null at the receiver,
           // `emitMapPrep`). Excluded from the eager recover, like the nulstruct/nullist cells.
@@ -17865,7 +17962,7 @@ function emitCallNode(body: i32[], e: Call, exprIx: i32, fnIx: i32) {
 //   pendingStructIdx    `S | null`         → `ref.null $S`
 // ORDER is load-bearing: the four NICHE arms come first because a niche `null` is an i32
 // or a non-struct ref, and the struct seed at the bottom would type it `ref.null $S`.
-function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, _fnIx: i32) {
+function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, fnIx: i32) {
   if pendingNulBool {
     fbI32Const(2)
     return 0
@@ -17897,6 +17994,42 @@ function emitNullLitNode(_body: i32[], _e: NullLit, _exprIx: i32, _fnIx: i32) {
     wU8(208) // 0xd0 ref.null
     wSLEB(nrh)
     return 0
+  }
+  // A bare `null` under a nullable-VARIANT context — `ref.null $uVarHeap[vi]`, the
+  // variant twin of the `pendingStructIdx` arm just below, reading the same seed the
+  // concrete-variant object literal does. PERSISTENT for the binding/return the way
+  // `pendingStructIdx` is, rather than one-shot like `pendingNulRefHeap` above: a
+  // function whose `| null` arrives as an implicit TAIL expression (`… }  null`) rather
+  // than a `return null` statement reaches this node with the one-shot seed already
+  // consumed, and the two spellings must lower the same.
+  if pendingVariantIdx >= 0 {
+    if pendingVariantIdx < uVarHeap.length {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(uVarHeap[pendingVariantIdx])
+      return 0
+    }
+  }
+  // LAST RESORT, THE ENCLOSING FUNCTION'S OWN RETURN ANNOTATION. Every seed above is
+  // set at a boundary and cleared after it, which is right for an argument or a binding
+  // but leaves TAIL position unserved: `function mk(): Circle | null { … }  null` reaches
+  // this node with the statement seeds already reset, while the `return null` spelling of
+  // the same function is seeded and lowers. Two spellings of one return must agree.
+  //
+  // Only reached where nothing else claimed the null — the alternative here is the loud
+  // failure below — so this can convert a reject into code but can never re-type a null
+  // some boundary already spoke for.
+  if fnIx >= 0 {
+    const nlFn = P.nodes[fnIx]
+    if nlFn is FuncDecl {
+      if nlFn.fnRet >= 0 {
+        const nlVi = nulVariantIndexOf(nlFn.fnRet)
+        if nlVi >= 0 && nlVi < uVarHeap.length {
+          wU8(208) // 0xd0 ref.null
+          wSLEB(uVarHeap[nlVi])
+          return 0
+        }
+      }
+    }
   }
   // A bare `null` VALUE: its target struct comes from the binding/argument/
   // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
@@ -18470,6 +18603,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     let cParamNulList = false
     let cParamNulRefArr = false
     let cParamNulRefArrHeap = -1
+    // A `Circle | null` param position: the heap type a bare `null` ARGUMENT lowers as
+    // (`ref.null $uVarHeap[vi]`), `-1` for none. The variant twin of
+    // `cParamNulRefArrHeap`, and it rides the SAME generic `nulRefHeap` seed.
+    let cParamNulVariantHeap = -1
     let cParamNulSLKind: VKind | null = null
     // A literal-union param position: a member-literal argument lowers as its interned i32 id.
     let cParamLitUnion = false
@@ -18487,6 +18624,12 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
           if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
           cParamNulSLKind = nulScalarListKindOfNode(cpnb.parType)
+          if retNulVariantFlag(cpnb.parType) == 1 {
+            const cpNvi = nulVariantIndexOf(cpnb.parType)
+            if cpNvi >= 0 && cpNvi < uVarHeap.length {
+              cParamNulVariantHeap = uVarHeap[cpNvi]
+            }
+          }
           if retNulRefArrFlag(cpnb.parType) == 1 {
             cParamNulRefArr = true
             const cpRls = tyAnnRefListSlot(cpnb.parType)
@@ -18624,6 +18767,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           // is `ref.null $wrapper`. Mirrors the return-position seeding.
           argCtx.listKind = nulScalarListBuildKind(argNulSLK)
           argCtx.nulRefHeap = nulScalarListWrapHeap(argNulSLK)
+        }
+        if cParamNulVariantHeap >= 0 {
+          const nvArg = P.nodes[args[i]]
+          if nvArg is NullLit { argCtx.nulRefHeap = cParamNulVariantHeap }
         }
         if cParamLitUnion { argCtx.litUnion = 1 }
         if cParamNulLitUnion {
