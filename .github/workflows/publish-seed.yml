@@ -96,11 +96,14 @@ jobs:
       # publish-seed run since #1848 has failed there, on `@hint`/`@error` cases
       # whose expected text contains an em dash.
       #
-      # IT CANNOT SELF-HEAL. Both the warm path (restore-keys) and the cold path
-      # (fetch `seed-latest`) hand back the same generation-1 artifact, and a
-      # generation-1 seed can never bootstrap generation-2 source through a
-      # generation-2 host. Recovery is a one-time manual publish of a seed built
-      # by a matching host; after that the self-perpetuation below works again.
+      # WHY IT COULD NOT SELF-HEAL, and what fixed it: the two seed caches were in
+      # SEPARATE NAMESPACES (see the cache step below). The warm path replayed this
+      # workflow's own frozen pre-#1848 entry and the cold path fetched the equally
+      # pre-#1848 `seed-latest`, so both inputs were generation 1 — while `ci.yml`
+      # sat on a healthy generation-2 seed this job could not see. Sharing the
+      # namespace lets `ci`'s refresh carry this job out of the hole, and the first
+      # green run re-points `seed-latest` through the full gate, which repairs the
+      # cold path too. No manual publish needed.
       #
       # The durable fix is the host-side check against the seed's `hostAbi()`
       # export (added in #1891, `compiler/driver.vl`): it turns this into a named
@@ -108,13 +111,36 @@ jobs:
       # obscure corpus failure three steps later over a corrupt candidate that
       # should never have been built. `docs/internals/cli-design.md` §"The
       # host<->seed ABI generation".
+      # ONE NAMESPACE, SHARED WITH `ci.yml`. This step used to key on `vl-seed-`
+      # while `ci.yml` keys on `vl-seedpair-` over the SAME `hashFiles('compiler/*.vl')`
+      # input, and that split is what took this pipeline down for two days.
+      #
+      # Nothing but this workflow ever wrote a `vl-seed-` entry, and this workflow only
+      # writes one when it SUCCEEDS — so a single failure freezes the namespace, every
+      # later run restores that same frozen entry by restore-key, and the pipeline can
+      # never climb out. The frozen entry was from 2026-08-23 21:01, i.e. pre-#1848, so
+      # every run since bootstrapped a generation-1 seed with a generation-2 host and
+      # produced the corrupt-but-fixpointing candidate the corpus oracle below rejects.
+      # `ci.yml` was meanwhile passing that very same oracle on that very same commit,
+      # off its own healthy `vl-seedpair-` entry — the two workflows could not see each
+      # other's seeds.
+      #
+      # Sharing the namespace fixes it structurally rather than by hand: `ci` refreshes
+      # the seed on every non-docs push, so a failure here can no longer freeze the
+      # input this job bootstraps from. It costs no soundness — the fixpoint, the corpus
+      # oracle and the native suites below still gate whatever is restored, which is
+      # exactly how the stale entry was caught rather than published.
+      #
+      # The path list matches `ci.yml`'s so the two write interchangeable archives.
       - name: Cache seed compiler wasm
         uses: actions/cache@v5
         with:
-          path: build/vl-compiler.wasm
-          key: vl-seed-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.*.cwasm
+          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
           restore-keys: |
-            vl-seed-${{ runner.os }}-
+            vl-seedpair-${{ runner.os }}-
 
       # Cold path: with no cached seed, fetch the prior `seed-latest` so the new
       # seed is compiled by the previously published seed (self-perpetuation). A
