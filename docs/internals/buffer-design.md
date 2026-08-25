@@ -2231,14 +2231,91 @@ For everything else, in the order the decisions get made:
    common case and it costs nothing worth naming.
 2. **`-O3 --closed-world` is not optional** — it is `vl build -O3`, it is a 3-6x swing over no
    flags on every fenced row, and `-O` gets a third of it. P1.3's ask, priced again here.
-3. **If the loop touches TWO OR MORE views of the same width, hoist.** That is the `axpy` row, that
+3. **If the loop touches TWO OR MORE views of the same width, hoist — and `std:buffer` now has the
+   hoisted spelling, so this is an import rather than a recipe (§M8).** That is the `axpy` row, that
    is the SoA integrate step, and the 3.5x is not the check — it is seven field loads per element
    that nothing removes. Hoisting recovers all of it. **And hoisting does not mean giving up the
-   fence**: hoist the base and the extent, then keep `if i < 0 { __trap__() }` /
-   `if i >= n { __trap__() }` in the loop over the hoisted `n`. Measured 0.543 vs 0.403 ns — 1.35x
-   for a full per-access fence, against 4.1x for the same fence taken through the accessors (M4).
+   fence**: `getF32At(base, length, i)` takes the pair as scalars and keeps both compares. Measured
+   0.543 vs 0.403 ns — 1.35x for a full per-access fence, against 4.1x for the same fence taken
+   through the accessors (M4).
 4. **If you ship a flagless build, prefer `v.getF32(i)` to `v[i]`** — 31% on `scale`. At `-O`/`-O3`
    the two are identical, so this is an edit-loop consideration only.
+
+### M8. The hoisted accessors — the fence without the reload, in std (webcraft A1)
+
+M4 named the descriptor reload as the cost and M5 item 3 gave the repair as a RECIPE: hoist the base
+and the extent by hand, then write the two compares out inside the loop. `axpy-fencedhoist.vl` is the
+control that proved it works, and its own header says it "is deliberately NOT a proposed API" — it is
+the experiment that a `getF32At(base, length, i)`-shaped std addition would turn on.
+
+**It turned on, and it shipped.** `std:buffer` exports `getF32At` / `setF32At` / `getI32At` /
+`setI32At`: each is the body of its view accessor with the two field reads replaced by parameters.
+Same trap order, same address arithmetic, same `[0, length)` policy.
+
+**The number, on the kernel A1 was actually filed on.** The `axpy` shape is two views and three
+accesses, which UNDERSTATES the reload — there the per-trip view-construction reads dominate. The new
+`soa` shape is webcraft's own six-column movement integrator (`px py vx vy ax ay`, four updates,
+twelve accesses per element, columns taken as parameters so construction stays out of the loop):
+
+| spelling | `struct.get` per element | traps | `f32.load` / `f32.store` | ns/element |
+| --- | --- | --- | --- | --- |
+| `soa-view` — fenced `v[i]` | **24** | 24 | 8 / 4 | 6.345 |
+| `soa-at` — hoisted accessors | **0** | 24 | 8 / 4 | 1.964 |
+
+**3.23x, with the fence fully intact** (min-of-7 interleaved, R=0 control subtracted, `-O3`). The 24
+is exactly two descriptor fields times twelve accesses. **The column is PER ELEMENT**; the pinned
+in-loop goldens read 25 and 12, because the shape test counts loop MEMBERSHIP and `soa-at`'s twelve
+are the six bases and six lengths taken once per tick inside the driver's trip loop — the same
+counter limit called out on the `axpy-fencedhoist` row. Both spellings print the same value, which is
+the cross-check that the kernel was not optimized away.
+
+For comparison, webcraft's own hand-hoisted twin — which drops the bounds check entirely and uses the
+bare intrinsics — measured 2.40x on their machine. The fenced hoist is not a compromise between the
+two; on this shape it beats the unfenced hand-roll's ratio while keeping every trap.
+
+**The two compiler-side repairs, both measured and both refuted.** This is a library answer to a
+codegen-shaped problem, so the alternatives are on the record with their numbers:
+
+| candidate | prediction | measured |
+| --- | --- | --- |
+| emit the descriptor's fields IMMUTABLE so the load is pure | reads hoist | **28 → 28.** Identical in every column at `--closed-world -O3 --gufa -O3`. And the premise was wrong too: fields are already emitted MUTABLE (`emit_sections.vl` writes `wU8(1)` unconditionally), so an earlier note claiming binaryen "will not hoist immutable `struct.get`s" was describing a module that does not exist. |
+| build the views inside a function, not at module scope, so Heap2Local can scalarize | descriptor melts | **28 → 28.** Byte-for-byte identical. The views escape into the kernel call, and after inlining the reads still do not move. |
+
+So it is neither a mutability problem nor an escape problem. A VL-level LICM would not reach it
+either: the field read lives inside a `std:buffer` accessor, behind a call boundary that only
+binaryen inlines, so there is nothing for a source-level pass to hoist. That is what makes the
+surface fix the proportionate one rather than a workaround for unfinished codegen.
+
+**The brand, which the original filing did not consider.** `f32base(v)` / `i32base(v)` mint a
+width-branded `F32Base` / `I32Base`, and the accessors take that rather than a bare `i32`. Without
+it `getF32At(i32base(iv), iv.length, 0)` would type-check and reinterpret four integer bytes as a
+float — exactly the hazard §L's header calls "measured, not feared" and spends fifteen lines
+justifying `new` on the views to close, reopened one function later. With it that call is
+`argument 1: expected F32Base, got I32Base`, and so is a laundered bare `i32`. Zero-cost: a newtype
+is erased before emit, so the module is `cmp`-identical to the unbranded twin.
+
+Branding `byteAddrF32`'s RETURN was tried first and reverted. That function exists for raw address
+arithmetic and host interop, so a brand turns `a + (i << 2)` into `operator '+' mixes F32Base and
+i32` at all 64 of its uses in this tree. The raw accessor answers a raw address; the brand belongs
+on a handle whose only job is to be handed back to a fenced accessor, so it is its own name.
+
+**The hazard, and why these are an opt-in rather than the primary surface.** `base` and `length`
+arrive as two loose i32s and nothing ties them to each other or to the view they came from:
+`getF32At(pxBase, vxLen, i)` type-checks and fences against the wrong column's extent — the brand
+closes the WIDTH half of that, not the same-width half, which no scalar signature can. **And
+`view4Base`'s construction-time extent check does not transfer**: it is what makes the per-access
+`0 <= i < length` sufficient (it proved the whole extent lies inside the `Buf`), and these take a
+base and a length as claims. `getI32At(0, 1000000, 0)` reads address 0 and does not trap. So the
+compares fence against a CLAIMED extent, not a validated one — which is why the only public way to
+mint an `F32Base` is from a real view. The view accessors cannot be mispaired at all, so `v[i]`
+stays the default. The argument for shipping them
+anyway is that the advice they REPLACE was worse — M5's recipe sent an author to the bare intrinsics,
+which have no check at all, in exactly the SoA code whose failure mode is a silent read of a
+neighbouring column. These are strictly safer than what this document used to recommend.
+
+Pinned by `soa-view` / `soa-at` / `axpy-at` in `tests/vl_buffer_view_bounds_shape_test.ts`,
+`tests/cases/std/buffer-hoisted-accessors.vl` (every read written both ways and compared), and two
+`@trap` files for the two halves of the fence.
 
 ### M6. What this corrects
 

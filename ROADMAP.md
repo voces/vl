@@ -485,9 +485,17 @@ which is why they closed in order rather than in parallel.
   `getF32`, an extra frame worth **0.855 ns/element (31%)** at the flagless rung.
   Pinned by `tests/vl_buffer_view_bounds_shape_test.ts` (per-kernel per-rung goldens **plus three
   contract assertions independent of the numbers**, sabotage-verified) and `bench/buffer-view-bounds/`.
-  `buffer-design.md` §M. **Filed for an owner ruling, NOT shipped**: a scalar-arg `getF32At(base,
+  `buffer-design.md` §M. ~~**Filed for an owner ruling, NOT shipped**: a scalar-arg `getF32At(base,
   length, i)` per width is zero compiler lines and 3.0× on the fenced two-view kernel, but it widens
-  `std:buffer`'s public surface and its §L6a size tax, and the same win is reachable by hand today.
+  `std:buffer`'s public surface and its §L6a size tax, and the same win is reachable by hand today.~~
+  **SHIPPED 2026-08-24** as webcraft's A1 — `getF32At`/`setF32At`/`getI32At`/`setI32At`, plus
+  `f32base`/`i32base` minting a width-BRANDED `F32Base`/`I32Base` so a cross-width call is a named
+  reject rather than a silent reinterpretation. The two costs that argued against it did not survive
+  re-measurement: the §L6a size tax is **zero** (only imported names are emitted — 1609 bytes either
+  way), and the alternative it was being held for, B6b's backing-pointer LICM, closed as a measured
+  negative on 2026-08-16. On the consumer's own six-column kernel: 24 `struct.get` per element → **0**,
+  6.345 → 1.964 ns/element, **3.23× with all 24 bounds traps intact**. `buffer-design.md` §M8; new
+  bench rows `soa-view`/`soa-at`/`axpy-at`.
   *(This row read ⬜ "not started" while `webcraft-requirements.md` §P1.4 already read ✅ STATED from
   the typed-views slice — the THIRD stale webcraft row found in one day. Re-derive a tier row against
   the requirements doc and the tree before quoting it.)*
