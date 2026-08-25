@@ -85,6 +85,7 @@ import {
   tyIsLitUnionAlias,
   tyNomNameCycled,
   tyScalarBasePrim,
+  tyToEmitName,
   tyToNominalName,
   valueAtomKind,
 } from "./typecheck"
@@ -450,6 +451,7 @@ import {
   letNulScalarListKind,
   letRefListSlot,
   listOpKindOfBin,
+  mapReadScalarBoxKindTy,
   mapShapeOfExpr,
   markLoopVarIter,
   markLoopVarSlot,
@@ -846,6 +848,83 @@ export function synthEmptyListAnn(letIx: i32) {
   0
 }
 
+// SYNTHESIZE the `T | null` ANNOTATION of an un-annotated binding whose initializer is
+// already nullable — the sibling of `synthEmptyListAnn` above, and it exists for the same
+// reason: an annotation is the ONE input every downstream path reads, so writing the
+// inferred type back as one makes the slot classifier agree without teaching it to
+// re-infer.
+//
+// THE DEFECT. `const v = m["k"]` then `if v is i32` failed with `emitProgram: is test but
+// no union type declared` on a two-line program with NO union anywhere. The ANNOTATED twin
+// worked (#1901 made it correct as well as compiling), and so did an inferred binding off a
+// FUNCTION returning `i32 | null` — because that function's return ANNOTATION is what the
+// registration walk reads. A map read has an annotation on NEITHER side.
+//
+// IT FOLLOWED THE REP SPLIT: `string | null` (a nullable ref) and `boolean | null` (an i32
+// sentinel) worked, because their `is` needs no box. The numeric widths and a list value
+// rep as the BOX, and the box is what went unminted.
+//
+// THIS IS HALF THE FIX. `collectU` is the FIRST emit pass and reads the annotation node
+// directly, so it cannot wait for a synthesis twelve passes later — it seeds its
+// registration walk from the INITIALIZER's recorded type instead (see `collectInlineUnions`).
+// Registration alone leaves ``is` names a type that is not a union variant`; this annotation
+// alone is never seen. Both, and it lowers.
+// Whether `initIx` is the one initializer shape this change claims: a bare read of a
+// SCALAR-valued map, whose `V | null` result reps as the shared value box.
+//
+// SCOPED TO MAP READS, NOT TO "ANY NULLABLE OF A BOX REP", and the narrowing was forced
+// by measurement rather than chosen. Claiming every box-rep nullable DIVERTED working
+// bindings onto the annotated ladder — 9 corpus regressions, then 2 after excluding the
+// niches by hand, and the survivors were nullable numeric LITUNIONS, which answer
+// `tyScalarBaseIs(f64)` (they rep as their base scalar, #1866) while their NULLABLE reps
+// as the -1 niche. The base-scalar question and the nullable-rep question have different
+// answers there, so a predicate built from the first will keep mis-claiming.
+//
+// A map read is what this change is FOR and it is decidable directly
+// (`mapReadScalarBoxKind` is the same predicate #1901's coerce arm uses, so the two
+// halves of the map-read story cannot drift). Every other inferred nullable binding keeps
+// exactly the lowering it has today.
+function initNullableIsBoxScalar(initIx: i32) {
+  if initIx < 0 { return false }
+  mapReadScalarBoxKindTy(initIx) >= 0
+}
+
+export function synthNullableAnn(letIx: i32) {
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 { return 0 }
+    if s.letInit < 0 { return 0 }
+    const nty = nodeTyIxOf(unwrapParen(s.letInit))
+    if nty < 0 { return 0 }
+    const nt = T.tys[nty]
+    if nt is TyNullable {
+      // An UNFILLED hole (`let x = null`, inner -1) is A-infer-null's business — it has its
+      // own usage-driven inference (`nliInferLet`) and no type to render yet.
+      if nt.nInner < 0 { return 0 }
+      // ONLY THE BOX REPS. Every other `T | null` already has a niche that carries
+      // "absent" — `boolean` and a litunion ride an i32 sentinel (2 / -1), and a string,
+      // struct, list, map or variant rides a nullable ref — and those bindings CLASSIFY
+      // AND LOWER CORRECTLY TODAY without an annotation. Synthesizing one for them does
+      // not add a path, it DIVERTS a working one onto the annotated ladder, which expects
+      // a different slot: measured, that broke 9 corpus cases (`only i32 locals are
+      // supported`, `is names a type that is not a union variant`) across nullable mono
+      // maps, nullable litunions and union-valued reads.
+      //
+      // The four numeric widths are the whole residue — they are the reps with no spare
+      // bit pattern, which is exactly why they needed the box and exactly why the
+      // classifier had nothing to go on.
+      if mapReadScalarBoxKindTy(s.letInit) < 0 { return 0 }
+      const nm = tyToEmitName(nty)
+      if nm == "" { return 0 }
+      // Hand the RECORDED type over rather than re-parsing the rendered name: the two agree
+      // here (the spelling denotes exactly the type in hand), and re-resolving would mint a
+      // structurally duplicate arena row.
+      s.letType = synthTypeRefTy(nm, -1, nty)
+    }
+  }
+  0
+}
+
 // The MODULE-SCOPE run of `synthEmptyListAnn`, over every top-level binding.
 //
 // A GLOBAL NEVER REACHES `collectLocals`, which is the whole of the defect this closes: that
@@ -866,6 +945,7 @@ export function synthGlobalEmptyListAnns() {
   let i = 0
   while i < globalStmts.length {
     synthEmptyListAnn(globalStmts[i])
+    synthNullableAnn(globalStmts[i])
     i = i + 1
   }
   0
@@ -2341,6 +2421,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
       const s = P.nodes[stmts[i]]
       if s is LetDecl {
         synthEmptyListAnn(stmts[i])
+        synthNullableAnn(stmts[i])
         // Classify the init type BEFORE binding the name, then allocate a fresh slot and
         // bind `name → slot` so a LATER reference (or a shadowing inner `let`) resolves to
         // THIS slot. `slot` is the new slot's declared-local position.
@@ -6887,6 +6968,29 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       // Arena walk first (bucket (c) ordering — see the return-type site).
       if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {
         return -1
+      }
+      // AN UNANNOTATED BINDING STILL HAS A TYPE, and it can be a union the emitter must
+      // register. `letTy` is the ANNOTATION node — `-1` when there is none — so the walk
+      // above sees nothing for `const v = m["k"]`, whose inferred type is `i32 | null`,
+      // and the nullable's shared value box is never minted.
+      //
+      // IT HAS TO HAPPEN HERE rather than in `synthNullableAnn`: `collectU` is the FIRST
+      // emit pass and the synthesis runs at `synthGlobalEmptyListAnns`, twelve passes
+      // later. The two halves are not redundant — this one mints the box type, that one
+      // steers the slot classifier.
+      //
+      // Idempotent: an ANNOTATED binding walks the same arena type twice and every
+      // registration below no-ops the second time, so nothing reorders for the spellings
+      // that already worked.
+      if letTy < 0 {
+        if initNullableIsBoxScalar(s.letInit) {
+          if (
+            collectTyReachRegister(stmts, nodeTyIxOf(s.letInit), 16, false) <
+            0
+          ) {
+            return -1
+          }
+        }
       }
       // Same-shape collapse fallback (see the return-type site).
       if registerCollapsedUnionName(stmts, letTy) < 0 { return -1 }
