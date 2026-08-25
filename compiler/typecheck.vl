@@ -832,12 +832,6 @@ let tyToStrDepth = 0
 // return and read by the immediate caller, never carried between programs.
 let tyStrAtoms = 1
 
-// Places already union-SUBTRACTED by a post-guard fall-through in the current
-// scope (one subtraction per place per block — see the guard-clause comment in
-// the IfStmt arm), with per-scope frame marks like the path overlay's.
-let pgKeys: string[] = []
-let pgFrames: i32[] = []
-
 // NARROWED bare-name bindings: name → the type it was DECLARED with, before a
 // narrowing shadowed it. Per-scope frame marks like the two overlays above, so
 // `popScope` unwinds a scope's entries with the narrowings themselves. Two entry
@@ -2817,8 +2811,6 @@ export function initChecker() {
   asgSrcStack = []
   asgDstStack = []
   tyToStrDepth = 0
-  pgKeys = []
-  pgFrames = []
   asgDeclKeys = []
   asgDeclTys = []
   asgDeclDepths = []
@@ -5327,7 +5319,6 @@ function pushScope(owner: i32) {
   constScopes.push(Map())
   fnDeclScopes.push(Map())
   npFrames.push(npKeys.length)
-  pgFrames.push(pgKeys.length)
   asgDeclFrames.push(asgDeclKeys.length)
   if symEnabled != 0 {
     symDeclScope.push(Map())
@@ -5353,11 +5344,6 @@ function popScope() {
       npInvBy.pop()
       npEpochs.pop()
     }
-  }
-  if pgFrames.length > 0 {
-    const pbase = pgFrames[pgFrames.length - 1]
-    pgFrames.pop()
-    while pgKeys.length > pbase { pgKeys.pop() }
   }
   if asgDeclFrames.length > 0 {
     const abase = asgDeclFrames[asgDeclFrames.length - 1]
@@ -14371,6 +14357,15 @@ function assignable(src: i32, dst: i32) {
 function assignableGo(src: i32, dst: i32) {
   const s = T.tys[src]
   const d = T.tys[dst]
+  // A SECOND, NEVER-NARROWED name for the same source variant, bound here where `s` is
+  // still the whole `Ty` union. The `s is X { return … }` guards below are divergent
+  // guard clauses, so each SUBTRACTS its variant from `s` for the rest of the body — and
+  // a `match` arm naming a member the scrutinee no longer has is a type error. The
+  // structural tail at the bottom wants the DECLARED union, not the guard residue, and
+  // `sTail` is that. Bound at the TOP rather than re-read at the tail so it is provably
+  // the same variant as `s`, with no dependence on the arena staying append-only across
+  // the recursive `assignable` calls in between.
+  const sTail = s
   if s is TyErr { return true }
   if d is TyErr { return true }
   if s is TyVar { return true }
@@ -14451,11 +14446,11 @@ function assignableGo(src: i32, dst: i32) {
   // decided structurally, so the claimed variants are spelled as empty arms naming
   // the earlier test that returns for them.
   //
-  // `TyErr` has NO ARM because it cannot: the early `s is TyErr { return true }`
-  // NARROWS `s`, so `TyErr` is not a member of the scrutinee's type here and an arm
-  // for it is a type error. The guard is unaffected — exhaustiveness is checked
-  // against the narrowed member set, which a 12th variant joins too.
-  match s {
+  // Scrutinised on `sTail`, NOT `s` — see its binding at the top. `s` has had every
+  // guarded variant above subtracted from it, so arms naming those would not be
+  // spellable; `sTail` carries the full declared `Ty`, which is what keeps all ELEVEN
+  // arms legal and this match exhaustive over the whole arena.
+  match sTail {
     TyPrim => {
       if d is TyPrim {
         // Lossless numeric WIDENING (B2): a narrower numeric value flows into a wider
@@ -14465,8 +14460,8 @@ function assignableGo(src: i32, dst: i32) {
         // matching wasm convert at the boundary. f32 literals reach an f32 slot via the
         // float-literal exception at the binding/arg/return sites (a float literal types
         // f64 by default but re-encodes exactly at f32). The binding takes the WIDER type.
-        if numWidensName(s.primName, d.primName) { return true }
-        return s.primName == d.primName
+        if numWidensName(sTail.primName, d.primName) { return true }
+        return sTail.primName == d.primName
       }
       return false
     }
@@ -14477,7 +14472,7 @@ function assignableGo(src: i32, dst: i32) {
         let i = 0
         let ok = true
         while i < dnames.length {
-          const srcIx = objFieldType(s, dnames[i])
+          const srcIx = objFieldType(sTail, dnames[i])
           if srcIx < 0 { ok = false }
           else if !assignable(srcIx, dtys[i]) { ok = false }
           i = i + 1
@@ -14490,14 +14485,14 @@ function assignableGo(src: i32, dst: i32) {
       if d is TyArray {
         // An empty `[]` (element `-1`) is assignable to any array; otherwise the
         // element types must be assignable.
-        return assignable(s.aElem, d.aElem)
+        return assignable(sTail.aElem, d.aElem)
       }
       return false
     }
     TyMap => {
       if d is TyMap {
         // A bare `Map()`/`Set()` (key/value holes, `-1`) is assignable to any map.
-        return assignable(s.mKey, d.mKey) && assignable(s.mVal, d.mVal)
+        return assignable(sTail.mKey, d.mKey) && assignable(sTail.mVal, d.mVal)
       }
       return false
     }
@@ -14509,11 +14504,11 @@ function assignableGo(src: i32, dst: i32) {
         // type-level check reaches every nested position (an ARRAY element, a field) that the
         // expression-level `assignableExpr` interception does not.
         if fnTyHasHole(src) { return genericFnAssignable(src, dst) }
-        const sp = s.fnParamTypes
+        const sp = sTail.fnParamTypes
         const dp = d.fnParamTypes
         if sp.length != dp.length { return false }
         let i = 0
-        let ok = fnSlotAssignable(s.fnRet, d.fnRet)
+        let ok = fnSlotAssignable(sTail.fnRet, d.fnRet)
         while i < sp.length {
           if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
           i = i + 1
@@ -14521,6 +14516,9 @@ function assignableGo(src: i32, dst: i32) {
         return ok
       }
       return false
+    }
+    TyErr => {
+      // Claimed by `s is TyErr` at the top, which returns true.
     }
     TyVar => {
       // Claimed by `s is TyVar` at the top, which returns true.
@@ -28665,21 +28663,36 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // GUARD CLAUSE: a THEN that always exits applies the FALSE narrowings to
   // the rest of the enclosing block (`if x == null { return } … x.f …`).
   //
-  // ONE UNION SUBTRACTION PER PLACE PER BLOCK, banked in `pgKeys`. The reason written on
-  // this gate — "the host checker accepts a twice-subtracted residual but both codegens
-  // reject it" — is REFUTED: the native codegen lowers the twice-subtracted residual and
-  // RUNS it (`string | i32 | boolean` minus `i32` minus `string` reads back as an unboxed
-  // `boolean`; 3-step, struct-arm, null-strip and `f64`-residue spellings all correct), and
-  // the TS host it was written against is deleted. The veto stays anyway, for a DIFFERENT
-  // reason nobody had named — see `xfail-false-reject-seq-guard-residual.vl`: subtracting
-  // consistently makes every `match` written after a guard CHAIN reject its own arms, and
-  // this compiler's `assignable()` is the witness. Null-STRIPS always apply (guard
-  // sequences rely on them).
+  // SUBTRACTIONS ACCUMULATE: a SEQUENCE of guard clauses over one place narrows the
+  // fall-through to the residue of every member claimed so far, so
+  // `if x is i32 { return } if x is string { return }` leaves `x` a bare `boolean`
+  // (`soundness/seq-guard-residual.vl`). There used to be a bank (`pgKeys`) admitting
+  // ONE subtraction per place per block, and BOTH reasons written on it were wrong:
   //
-  // THE `else` ARM IS NOT PART OF THAT VETO, and used to be excluded by the same gate ("an
-  // `else`/`else if` chain does not post-narrow the fall-through"). When the THEN diverges,
-  // reaching the code after the `if` means the ELSE path ran, so the false narrowings hold
-  // there exactly as they do with no `else` (`soundness/elseif-chain-residual.vl`).
+  //   * "the host checker accepts a twice-subtracted residual but both codegens reject
+  //     it" — REFUTED. `pushPostGuardNarrow`'s complement pushes STACK, so the emitter
+  //     always did N subtractions; the bank made CHECK do one and EMIT do N, and the two
+  //     sides were only in apparent agreement because the checker refused the programs
+  //     that would show the difference. Removing it makes them agree for real. Measured:
+  //     3-step, struct-arm, null-strip, `f64`-residue and used-not-just-returned
+  //     residuals all lower and run correctly.
+  //   * "subtracting consistently makes every `match` after a guard CHAIN reject its own
+  //     arms, and this compiler's `assignable()` is the witness" — TRUE of the old
+  //     `assignable()` source, but that is not a reason to under-narrow. A `match` arm
+  //     naming a subtracted member has ALWAYS been a type error (the rule already fired
+  //     for the first subtraction); the bank only hid the 2nd..Nth. `assignableGo` now
+  //     keeps a second, never-narrowed name for its scrutinee (`sTail`) and matches on
+  //     that — the honest spelling of "this match wants the DECLARED union, not the
+  //     guard residue", and one function's edit, not a language slice.
+  //
+  // Null-STRIPS were exempt from the bank and always applied; they used to need their own
+  // leg below to say so, and with the bank gone a strip and a subtraction are the same
+  // shadowing `declare` and share one.
+  //
+  // AN `else` ARM DOES NOT STOP ANY OF THIS, and used to ("an `else`/`else if` chain does
+  // not post-narrow the fall-through"). When the THEN diverges, reaching the code after
+  // the `if` means the ELSE path ran, so the false narrowings hold there exactly as they
+  // do with no `else` (`soundness/elseif-chain-residual.vl`).
   // Restricted to BARE NAMES, and the restriction is the soundness argument: a bare name's
   // narrowing is a shadowing `declare` whose writes are checked against the NARROWED type,
   // so nothing the else body can legally do falsifies it (`x = "s"` under an `i32` narrowing
@@ -28692,7 +28705,9 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   //
   // `emit_classify.pushPostGuardNarrow` mirrors both lines; the two sides must agree on
   // which guards post-narrow or the rest of the block reads a boxed union the checker
-  // already unboxed. Path-keyed entries unwind at the ENCLOSING scope's `popScope`.
+  // already unboxed. It has no bank of its own and never did — that is the half of the
+  // agreement the removed `pgKeys` was breaking. Path-keyed entries unwind at the
+  // ENCLOSING scope's `popScope`.
   if enNames.length > 0 {
     const tn2 = P.nodes[n.ifThen]
     if tn2 is Block {
@@ -28715,19 +28730,12 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
                 npInvBy.push(-1)
                 npEpochs.push(narFnEpoch)
               }
-            } else if gTy == nonNullTy(lookup(gKey)) {
-              declare(gKey, gTy)
             } else {
-              let gSeen = false
-              let gj = 0
-              while gj < pgKeys.length {
-                if pgKeys[gj] == gKey { gSeen = true }
-                gj = gj + 1
-              }
-              if !gSeen {
-                pgKeys.push(gKey)
-                declare(gKey, gTy)
-              }
+              // ONE LEG FOR BOTH KINDS. A null STRIP (`gTy == nonNullTy(lookup(gKey))`)
+              // and a union SUBTRACTION are the same shadowing `declare`; they were split
+              // here only so the strip could skip the subtraction bank, and the bank is
+              // gone.
+              declare(gKey, gTy)
             }
             gi2 = gi2 + 1
           }

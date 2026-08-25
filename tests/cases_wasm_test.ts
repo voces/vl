@@ -100,8 +100,6 @@ const EXPECTED_DIVERGENCES: Record<string, string> = {
     "wasm CHECKER gap: a generic intersection `T & S` reports `unknown type 'T&S'` where the TS checker accepts it (not a lint divergence)",
   "soundness/README.vl":
     "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
-  "soundness/xfail-false-reject-seq-guard-residual.vl":
-    "@error pins the TS host's own Codegen error; the wasm checker rejects earlier, at the type tier",
 };
 
 type Exports = Record<string, (...args: number[]) => number>;
