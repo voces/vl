@@ -501,6 +501,7 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
     let mut store = Store::new(engine, ());
     let linker = Linker::new(engine);
     let inst = linker.instantiate(&mut store, &module)?;
+    check_seed_abi(&mut store, &inst, source)?;
     Ok((store, inst))
 }
 
@@ -1906,6 +1907,15 @@ fn run_batch(args: &[String]) -> Result<()> {
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
     let pre = Linker::new(&compile_engine).instantiate_pre(&module)?;
+    // `run_batch` is the ONE loader that bypasses `load_compiler` (it holds the
+    // Module engine-level and instantiates per case for isolation), so the ABI
+    // check has to be repeated here or a stale seed reaches every case unchecked.
+    // Once, against a throwaway store — not per case.
+    {
+        let mut probe = Store::new(&compile_engine, ());
+        let inst = pre.instantiate(&mut probe)?;
+        check_seed_abi(&mut probe, &inst, &compiler)?;
+    }
 
     for f in &files {
         let name = std::path::Path::new(f)
@@ -2722,6 +2732,83 @@ const CMD_TEST_STASH: i32 = 7;
 const CMD_TEST_COLLECT: i32 = 8;
 const CMD_TEST_RUN: i32 = 9;
 const CMD_VALIDATE: i32 = 10;
+
+/// The host↔seed contract generation this binary speaks. Checked against the seed's
+/// exported `hostAbi()` before the seed is trusted; a mismatch is a hard error.
+///
+/// Covers the guest→host string element unit, the bulk `Load`/`Store` packing over
+/// the staging window, and the `CMD_*` table above. Bump in the SAME commit that
+/// changes any of them, and bump `hostAbi()` in `compiler/driver.vl` with it — that
+/// function's header carries the generation table and the reasoning.
+///
+///   1  strings are UTF-32 code points (pre-#1848)
+///   2  strings are UTF-8 bytes
+const HOST_ABI: i32 = 2;
+
+/// Refuse a seed this binary cannot talk to.
+///
+/// WHY THIS IS AN ERROR AND NOT A WARNING. The two artifacts do not fail loudly when
+/// they disagree — they produce WRONG OUTPUT AT A SUCCESSFUL EXIT CODE. #1848 flipped
+/// a string's element unit from a code point to a byte while adding, removing and
+/// re-typing nothing, so every export probe still succeeds and the negotiation reports
+/// "compatible"; the host then reads `4 * count` bytes where the seed wrote `count`,
+/// and the overshoot lands in its own leftover UTF-32 image of the last file it staged,
+/// which decodes perfectly. A stale `vl test` printed readable chunks of `std/test.vl`
+/// and exited 0, and a working feature was graded as broken on that output.
+///
+/// A seed exporting nothing here predates the stamp — which is exactly the vintage that
+/// produces the bug — so absent is a mismatch, not a pass.
+fn check_seed_abi(store: &mut Store<()>, inst: &Instance, source: &CompilerSource) -> Result<()> {
+    let seed = inst
+        .get_typed_func::<(), i32>(&mut *store, "hostAbi")
+        .ok()
+        .and_then(|f| f.call(&mut *store, ()).ok());
+    if seed == Some(HOST_ABI) {
+        return Ok(());
+    }
+    let seed_line = match seed {
+        Some(v) => format!("the seed speaks host ABI {v}"),
+        None => "the seed exports no `hostAbi` — it predates ABI versioning (ABI 1 or older)"
+            .to_string(),
+    };
+    // Name the RESOLVED seed: the resolution order is itself the surprise. A
+    // `./build/vl-compiler.wasm` in the CURRENT WORKING DIRECTORY silently outranks
+    // the binary's own embedded seed (`resolve_compiler`), which is how a correct
+    // release binary run from inside a checkout starts emitting garbage.
+    let where_ = match source {
+        CompilerSource::Path(p) => {
+            let meta = std::fs::metadata(p).ok();
+            match meta.map(|m| m.len()) {
+                Some(n) => format!("{p}  ({n} bytes)"),
+                None => p.clone(),
+            }
+        }
+        CompilerSource::Embedded(b) => {
+            format!("embedded in this binary ({} bytes)", b.len())
+        }
+    };
+    bail!(
+        "compiler seed ABI mismatch — this `vl` binary and this seed cannot talk to each other\n\
+         \n\
+         \x20 this vl host speaks host ABI {HOST_ABI}\n\
+         \x20 {seed_line}\n\
+         \x20 seed: {where_}\n\
+         \n\
+         The host<->seed contract — the string element unit, the bulk Load/Store packing,\n\
+         and the CMD_* command table (docs/internals/cli-design.md) — changed between\n\
+         these two builds. Running them together produces WRONG OUTPUT at a successful\n\
+         exit code, not a crash, so this is an error rather than a warning.\n\
+         \n\
+         Fix one of:\n\
+         \x20 rebuild the seed for this host    scripts/refresh-compiler.sh\n\
+         \x20 fetch a matching rolling seed     scripts/fetch-seed.sh\n\
+         \x20 rebuild the host for this seed    (cd scripts/vl-host && cargo build --release)\n\
+         \x20 point at a matching seed          --compiler <a seed that speaks ABI {HOST_ABI}>\n\
+         \n\
+         Note that a ./build/vl-compiler.wasm in the current directory outranks this\n\
+         binary's own embedded seed."
+    )
+}
 
 /// Read a string payload via a bare `<prefix>Len()` / `<prefix>At(j)` accessor pair
 /// (one UTF-32 code point per `At`) off an instance that is NOT the compiler — a
