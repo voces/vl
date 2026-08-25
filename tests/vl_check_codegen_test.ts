@@ -132,14 +132,22 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/generic-litunion-element-read.vl`) and the program now runs, which
 // reddened this file exactly as intended.
 //
-// Its replacement is the same family's ELEMENT-ASSIGNMENT boundary, which is still open:
-// the read direction widens the atom to the string the slot wants, and the STORE direction
-// has no mirroring narrow, so a string ref arrives where the array's i32 backing wants an
-// atom. Mapped in `tests/cases/std/xfail-miscompile-array-litunion-element.vl`.
-const INVALID_MODULE_SRC =
-  `function f<T>(self: T[]): T { self[1] = self[0]  return self[1] }\n` +
-  `const tags: ("a" | "b")[] = ["b", "a"]\n` +
-  `print(f(tags))\n`;
+// Its previous replacement was the same family's ELEMENT-ASSIGNMENT boundary
+// (`self[1] = self[0]` inside a generic instance over `("a" | "b")[]`). That closed too —
+// the filing's "the STORE direction has no mirroring narrow" was a mis-diagnosis; the store
+// ladder's TARGET classification was blind inside a monomorphized instance, so the ladder
+// fell past its atom-element arm to a string WIDEN that should never have been reached.
+// See `tests/cases/soundness/generic-litunion-element-bind-and-store.vl`.
+//
+// This specimen leaves the literal-union family entirely, which the last four did not: `??`
+// over a LIST INDEX whose element is `string | null`. The coalesce lowers to an
+// if-expression typed at the NON-NULL string it promises, and its ELSE arm re-reads
+// `array.get` off an `(array (mut (ref null $str)))` backing without narrowing — so a
+// `(ref null $str)` reaches a slot declared `(ref $str)`. Pinned as a corpus case by
+// `tests/cases/soundness/xfail-miscompile-nulstr-list-coalesce.vl`, and filed before that in
+// `docs/internals/per-rep-ladder-audit.md` as the one check-clean-invalid-wasm cell of the
+// `??`-over-a-list-index row.
+const INVALID_MODULE_SRC = `const xs = ["p", null]\nprint(xs[1] ?? "q")\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
@@ -246,7 +254,11 @@ Deno.test({
     // of it, leaving the last live case in `std/` — at which point a soundness-only scan
     // found ZERO marked files and tripped the "read nothing" guard below. The guard was
     // right and the scan was too narrow: a check-clean-invalid-wasm shape can be filed
-    // wherever its subject lives.
+    // wherever its subject lives. That `std/` case has since graduated too (the family is
+    // closed), and both directories are populated again by two unrelated shapes — the `??`
+    // list-index coalesce under `soundness/` and `mapIndexed`'s literal-union RESULT list
+    // under `std/`. The membership moves; the two-directory scan is what stops it moving
+    // out from under the gate.
     const dirs = [`${ROOT}/tests/cases/soundness`, `${ROOT}/tests/cases/std`];
     const marked = new Set<string>();
     for (const dir of dirs) {

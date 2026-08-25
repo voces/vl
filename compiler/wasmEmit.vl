@@ -17,7 +17,6 @@ import {
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
-  nodeArrayElemTyIx,
   nodeEqCmpKind,
   nodeLitMembersWithin,
   nodeLitUnionMemberTexts,
@@ -185,7 +184,6 @@ import {
   ifArmValueExpr,
   letIsF32,
   paramNulString,
-  paramTypeNode,
 } from "./emit_query"
 import {
   MfKind,
@@ -431,6 +429,7 @@ import {
   // (`monoIsRowMatch` was imported here — its ONE caller took the arena route,
   // callerless function itself was deleted at D-SLOTARENA.),
   // through `repIsRowMatchTy` at D-MONOISTY; see `monoStaticIsResult`. The,
+  arrElemLitUnionTy,
   arrLitElemName,
   arrLitIsF32,
   arrLitIsF64,
@@ -574,6 +573,7 @@ import {
   listIdxKindOf,
   listIdxWrapSlot,
   listOpKindOfBin,
+  litAtomMemberTy,
   localIndexOf,
   mapAnnShape,
   mapReadScalarBoxKind,
@@ -13465,8 +13465,17 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         pendingF32 = true
         if emitExprAsF32(body, a.binRight, fnIx) < 0 { return -1 }
         pendingF32 = savedPF32
-      } else if nodeArrayElemIsLitUnion(target.idxArr) {
+      } else if arrElemLitUnionTy(target.idxArr, fnIx) >= 0 {
         // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id.
+        //
+        // THROUGH THE DECLARATION FALLBACK, and this arm is the STORE half of the boundary
+        // whose READ half `exprIsLitAtom`'s Index arm holds. A monomorphized `self[1] =
+        // self[0]` classified its TARGET off the receiver's shared node — which records the
+        // generic's `T[]` — so this arm declined, the ladder fell through to the string-widen
+        // arm below, and the widened `(ref $string)` went into an `(array (mut i32))`:
+        // `type mismatch: expected i32, found (ref $type)`, `vl check` rc 0. It is not a
+        // missing NARROW, as the family's filing supposed; it is a widen that should never
+        // have been reached, and the target classification is what reaches it.
         const xluCtx = expCtxHere()
         xluCtx.litUnion = 1
         if emitExprExpect(body, a.binRight, fnIx, xluCtx) < 0 { return -1 }
@@ -17593,23 +17602,17 @@ function emitPrintStrFromScratch(body: i32[]) {
 // reserve the str-op frame via `callWidensAtomToStr` / `retWidensAtomToStr` / `exprIsStrConcat`.
 export function emitAtomToStr(body: i32[], atomIx: i32, fnIx: i32) {
   let texts = nodeLitUnionMemberTexts(atomIx)
-  // THE ANNOTATION TWIN, for an operand whose RECORDED type is not there to read — the
-  // same gap `exprIsLitAtom`'s Index arm covers, one consumer later. A MONOMORPHIZED
-  // instance's body is a fresh clone minted after the checker ran, so `self[0]` inside it
-  // carries no recorded type and the member list comes back EMPTY. Two consumers ask the
-  // question and both had to learn the fallback: the first decides WHETHER to widen, this
-  // one needs the members to widen WITH. Fixing only the first turned a silent invalid
-  // module into a loud `literal-union string widening with no members`, which is better
-  // and still wrong.
+  // THE DECLARATION FALLBACK, for an operand whose recorded type is the GENERIC's — the same
+  // gap `exprIsLitAtom`'s Index arm covers, one consumer later. Two consumers ask the
+  // question and both need the fallback: the first decides WHETHER to widen, this one needs
+  // the members to widen WITH. Fixing only the first turns a silent invalid module into a
+  // loud `literal-union string widening with no members`, which is better and still wrong.
+  //
+  // It resolves through `litAtomMemberTy` rather than re-walking the operand here, because
+  // the operand is not always the element READ: `sorted` binds it (`const key = out[k]`) and
+  // then widens the LOCAL, at the return and again at the comparator's string parameter.
   if texts.length == 0 {
-    const aRef = P.nodes[unwrapParen(atomIx)]
-    if aRef is Index {
-      const rcv = P.nodes[unwrapParen(aRef.idxArr)]
-      if rcv is Ident {
-        const pElem = nodeArrayElemTyIx(paramTypeNode(fnIx, rcv.identName))
-        if pElem >= 0 { texts = tyLitMemberTexts(pElem) }
-      }
-    }
+    texts = tyLitMemberTexts(litAtomMemberTy(atomIx, fnIx))
   }
   if texts.length == 0 {
     return emitFail(

@@ -1,0 +1,137 @@
+// @run
+// @log b
+// @log b
+// @log b
+// @log a
+// @log b
+// @log b
+// @log b
+// @log b
+// @log q
+// @log q
+// THE LAST TWO BOUNDARIES OF THE INLINE-LITERAL-UNION ELEMENT FAMILY — CLOSED.
+//
+// `soundness/generic-litunion-element-read.vl` closed the family's root: `("a" | "b")[]` is
+// an array of interned i32 ATOMS (`ctxKeepsLitUnion` PRESERVES a literal union's members at
+// `RC_ELEM`) while `"a" | "b"` in a result position is a STRING REF (it SOFTENS them at
+// `RC_ROOT`), so every read of an element needs a boundary WIDEN. Two boundaries that fix
+// did not reach were mapped by `std/xfail-miscompile-array-litunion-element.vl` and are
+// what `std:array`'s `sorted` needs; both are here, with the five neighbours the same
+// mechanism turned out to cover.
+//
+// WHY A MONOMORPHIZED INSTANCE IS THE ONLY RUNG THAT SHOWS THEM. `monoCloneBody` rebuilds
+// only the STATEMENT SPINE — every leaf EXPRESSION node is SHARED with the generic body, and
+// the checker recorded the GENERIC's types on those shared nodes. So inside an instance over
+// `("a" | "b")[]` the receiver `self` still records `T[]` and `self[0]` still records `T`.
+// That is WORSE than an absent type: it is an arena index ≥ 0 that answers the litunion
+// question `false`, so a probe short-circuiting on "the node has a recorded type" never
+// looks further. What IS concrete in an instance is its ANNOTATIONS — mono substitutes the
+// type param into the param list and into every annotated `LetDecl` (`monoSubstLetType`) —
+// and that is the fallback all three consumers now share (`arrElemLitUnionTy` /
+// `litAtomMemberTy`).
+//
+// THE SEVEN ROWS, in the order they print. Each was a distinct verdict before the fix:
+//
+//   · `bindThenReturn` — BINDING the element read to a local. `localLitUnion` claimed the
+//     local as an atom, so the return widened; `emitAtomToStr` then had no MEMBERS to widen
+//     with, because it only knew how to recover them from a direct `Index` operand:
+//     `emitProgram: literal-union string widening with no members`.
+//   · `chain` — the same one hop further (`const a = self[0]  const b = a`). It is why the
+//     declaration fallback RECURS rather than looking one level down.
+//   · `deepChain` — six hops, which pins the RECURSION BOUND. The fallback is depth-limited
+//     (`declFallbackDepthCap`) while the atom CLAIM that reaches it is not: `localLitUnion`
+//     propagates down a rebinding chain iteratively, so a chain past the bound is a value
+//     claimed as an atom with no members to widen with. That is loud rather than a
+//     miscompile, and this row is the measurement that the bound sits well past it — at the
+//     first bound tried, 4, this exact function was
+//     `emitProgram: literal-union string widening with no members`.
+//   · `viaLocalArray` — a LOCAL array of the instance's element type, which is `sorted`'s own
+//     working buffer (`const out: T[] = []`). Its annotation is concrete and its Ident node
+//     is not, so the read did not claim an atom at all and the raw i32 flowed into the string
+//     result slot: `vl check` rc 0, `vl build` reporting success, and the engine refusing the
+//     module with `expected (ref $type), found i32`.
+//   · `viaLoopVar` — a for-in element over the same array. A loop var has no declaration node
+//     at all, so its members resolve through the ITERABLE (`localLoopIter`), the slot column
+//     that exists for exactly this shape.
+//   · `storeElem` — ELEMENT ASSIGNMENT, `self[1] = self[0]`. THE FILING CALLED THIS "the
+//     REVERSE direction, which needs the mirroring NARROW" AND THAT WAS WRONG. There is no
+//     narrow to add: the store ladder classifies its TARGET first, that classification was
+//     blind for the same shared-node reason, so the ladder fell PAST the atom-element arm to
+//     the string-widen arm below it — and the widened `(ref $string)` went into an
+//     `(array (mut i32))`, `type mismatch: expected i32, found (ref $type)`. It is a widen
+//     that should never have been reached. The `print(mut[1])` row beside it is the proof
+//     the store landed as an ATOM and not as an id-shaped accident: it reads back through
+//     the ordinary element widen and prints the MEMBER.
+//   · `crossStore` — source and destination are DIFFERENT arrays, so the fix cannot be
+//     reading the target's classification off the value's.
+//
+// THE NAMED-ALIAS CONTROL is the last two rows, and it is instantiated from the SAME generic
+// as the inline rows above — two instances of one function, one per spelling. `K` in result
+// position reps as the atom, so those two ends already agree and no widen is wanted; the
+// control's job is to show the fallback does not now claim a widen where none belongs, and
+// that the two instances do not read each other's annotation.
+function bindThenReturn<T>(self: T[]): T {
+  const key = self[0]
+  return key
+}
+
+function chain<T>(self: T[]): T {
+  const a = self[0]
+  const b = a
+  return b
+}
+
+function deepChain<T>(self: T[]): T {
+  const a = self[0]
+  const b = a
+  const c = b
+  const d = c
+  const e = d
+  const g = e
+  return g
+}
+
+function viaLocalArray<T>(self: T[]): T {
+  const out: T[] = []
+  out.push(self[1])
+  return out[0]
+}
+
+function viaLoopVar<T>(self: T[]): T {
+  let last = self[0]
+  for k in self {
+    last = k
+  }
+  return last
+}
+
+function storeElem<T>(self: T[]): T {
+  self[1] = self[0]
+  return self[1]
+}
+
+function crossStore<T>(dst: T[], src: T[]): T {
+  dst[0] = src[1]
+  return dst[0]
+}
+
+type K = "p" | "q"
+
+const tags: ("a" | "b")[] = ["b", "a", "b"]
+print(bindThenReturn(tags))
+print(chain(tags))
+print(deepChain(tags))
+print(viaLocalArray(tags))
+print(viaLoopVar(tags))
+
+const mut: ("a" | "b")[] = ["b", "a", "b"]
+print(storeElem(mut))
+print(mut[1])
+
+const dst: ("a" | "b")[] = ["a", "a"]
+const src: ("a" | "b")[] = ["a", "b"]
+print(crossStore(dst, src))
+
+const ks: K[] = ["q", "p"]
+print(bindThenReturn(ks))
+print(chain(ks))
