@@ -8251,6 +8251,66 @@ function annRegisterVariantMembers(ms: i32[]) {
   0
 }
 
+// THE ANNOTATION ROUTES' MEMBER DEDUP, and the one home of what happens to the member it
+// DROPS. `tsToTyReal`'s `TS_UNION` arm and `nameToTyReal`'s pipe arm had this loop each;
+// the loop is not the interesting half.
+//
+// A DROPPED duplicate IS THE SAME-SHAPE COLLAPSE. `type A = {v: i32}` / `type B = {v: i32}`
+// mint TWO arena `TyObj`s that `sameVariantTy` calls one variant (mutual `assignable` — the
+// arena is structural, and a `B` value genuinely IS an `A`; the entries are NOT the same
+// index, which is what the gate below turns on). So the inline `A | B` keeps ONE member and
+// `annUnionInnerTy` returns it at the `members.length == 1` early-out — before
+// `annRegisterVariantMembers`.
+// The EMITTER does not collapse: `registerCollapsedUnionName` reads the annotation node's
+// banked ATOM COUNT (`annUnionAtomsOf >= 2`, #1055) and pushes BOTH declared names into
+// `uVariants`, so `collectS` refuses `A` AND `B` a standalone struct row ("a variant is
+// owned by the variant table"). The two registries then disagree exactly as they did for
+// the NON-collapsing inline union before #1803: every position typed `A` or `B` — a
+// function param, a function result, a binding — classifies `"struct"` off
+// `cVariantMemberTyIxs` and asks `sHeapIdx` for a row the emitter deliberately did not
+// intern. `emitProgram: ref valtype with no interned shape`, on a sound program
+// (`soundness/call-result-union-binding.vl` and its family).
+//
+// So register the collapsing pair HERE — the only place the pre-dedup arity is still in
+// hand, since both callers dedup before `annUnionTy` ever sees the list. BOTH sides are
+// registered, not just the dropped one: `sameVariantTy` is mutual `assignable`, not index
+// equality, so a match can hold across two distinct arena indices and the survivor's index
+// is the one the classifiers will ask about.
+//
+// THE DECLARATION ROUTE NEVER HAD THIS HOLE, and that is the control: `type U = A | B`
+// does not dedup at all (pass 0b's `UnionDecl` arm pushes every resolved variant), so its
+// `members.length >= 2` gate passes and the shared index registers. The same-shape pair
+// runs today through the declared spelling and rejects through the inline one; this is the
+// annotation route reaching the answer the declaration route already gives.
+//
+// SAFE FOR NON-STRUCT DUPLICATES BY THE COMMIT FILTER, not by a test here:
+// `annCommitVariantMembers` keeps only entries in `cStructTyIxs` that are not also used as
+// `T | null`, so a dropped literal (`"a" | "a"`), scalar, or list duplicate registers a
+// candidate that is then discarded.
+//
+// GATED ON `m != kept` — TWO DISTINCT ARENA ENTRIES that are mutually assignable, which is
+// what "two declarations of the same shape" is. The SAME entry twice (`A | A`, `K | K`) is
+// the degenerate repeat, not a collapse: the emitter's `splitUnionAtoms` sees one distinct
+// NAME, so no variant rows are pushed, `collectS` keeps `A`'s standalone struct row, and
+// calling `A` a variant member would send every `A` position at a variant table that has no
+// row for it — the same reject, mirrored. MEASURED: without this gate `type A = {v: i32}` +
+// `const b: A | A = mkA()` goes RUN-OK 200 → `ref valtype with no interned shape`, while
+// every same-shape-PAIR cell is unaffected.
+function annUnionPushDistinctMember(members: i32[], m: i32) {
+  let dup = false
+  let dj = 0
+  while dj < members.length {
+    const kept = members[dj]
+    if sameVariantTy(m, kept) {
+      dup = true
+      if m != kept { annRegisterVariantMembers([m, kept]) }
+    }
+    dj = dj + 1
+  }
+  if !dup { members.push(m) }
+  0
+}
+
 // Commit the annotation route's candidates into `cVariantMemberTyIxs`. Runs ONCE, at the end
 // of `checkProgramNode`, because both of its filters need the WHOLE program:
 //
@@ -8446,13 +8506,7 @@ function tsToTyReal(ix: i32) {
         // renders "" — the string arm's `part.length > 0`
         const m = tsToTy(kid)
         if m < 0 { return -1 }
-        let dup = false
-        let dj = 0
-        while dj < members.length {
-          if sameVariantTy(m, members[dj]) { dup = true }
-          dj = dj + 1
-        }
-        if !dup { members.push(m) }
+        annUnionPushDistinctMember(members, m)
       }
       pi = pi + 1
     }
@@ -8616,13 +8670,7 @@ function nameToTyReal(name: string) {
         // every source.
         const m = nameToTy(part)
         if m < 0 { return -1 }
-        let dup = false
-        let dj = 0
-        while dj < members.length {
-          if sameVariantTy(m, members[dj]) { dup = true }
-          dj = dj + 1
-        }
-        if !dup { members.push(m) }
+        annUnionPushDistinctMember(members, m)
       }
       pi = pi + 1
     }
