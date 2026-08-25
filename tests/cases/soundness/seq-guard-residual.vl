@@ -1,0 +1,111 @@
+// @run
+// @hint redundant type annotation: `f` is inferred as `boolean`
+// @hint redundant type annotation: `three` is inferred as `f64`
+// @hint redundant type annotation: `structArm` is inferred as `i32`
+// @hint redundant type annotation: `strip` is inferred as `boolean`
+// @hint redundant type annotation: `used` is inferred as `i32`
+// @log true
+// @log 4.5
+// @log 42
+// @log true
+// @log 42
+// EVERY return annotation here is LOAD-BEARING and the hints are the price: drop one and
+// the function infers the residual it was meant to CHECK, so the case passes vacuously.
+// Was `xfail-false-reject-seq-guard-residual.vl` (ROADMAP A5 / A6) — a SOUND program the
+// compiler refused with `return type mismatch: expected boolean, got string | boolean`.
+// CLOSED. The file keeps the diagnosis because both reasons written on the gate were
+// wrong, and the second one had been believed long enough to shape the compiler's source.
+//
+// THE GAP. A SEQUENCE of divergent guard clauses over one place narrows the fall-through
+// to the residue of every member claimed so far — `x` below is a bare `boolean` after
+// `i32` and `string` are subtracted. `checkIfStmtNode` banked the subtracted places in
+// `pgKeys` and applied ONE PER PLACE PER BLOCK, so the second guard narrowed nothing and
+// the `return x` met `string | boolean`. Null STRIPS were exempt and always applied,
+// which is why `narrowing-null-guard.vl` and the one-subtraction case
+// (`is-value-kind-union-sound.vl`) never saw it.
+//
+// REASON ONE ON THE GATE — "neither codegen can materialize a twice-subtracted residual"
+// — was refuted before this change and re-measured during it. It is worse than stale: the
+// emitter never had the bank. `emit_classify.pushPostGuardNarrow` pushes a complement per
+// guard and the pushes STACK, so EMIT always did N subtractions while CHECK did one. The
+// two sides were in apparent agreement only because the checker refused every program
+// that could show the difference. Removing the bank makes them agree for real, and the
+// four control shapes below are the emitter half of the pin — each one is a residual that
+// must reach codegen, not merely typecheck.
+//
+// REASON TWO — "subtracting consistently makes every `match` after a guard CHAIN reject
+// its own arms, and this compiler's `assignable()` is the witness" — described a real
+// symptom and drew the wrong conclusion. Deleting the bank did stop the compiler
+// compiling itself, at five arms of one match:
+//
+//     compiler/typecheck.vl: match pattern `TyVar` is not a member of
+//       TyPrim | TyObj | TyFunc | TyArray | TyMap        (…and TyNullable, TyUnion,
+//                                                          TyLit, TyNeg)
+//
+// But "a `match` arm naming a subtracted member is a type error" was ALREADY the rule,
+// already firing for the FIRST subtraction — `assignableGo`'s own comment said so in as
+// many words about `TyErr`. The bank was not protecting a design; it was hiding
+// subtractions two through six from ONE function that wanted its scrutinee un-narrowed.
+// That function now re-reads the arena for its structural tail (`const sTail =
+// T.tys[src]`), which is the honest spelling of what it meant, and it restores something
+// the bank had quietly taken away: the tail match is exhaustive over all ELEVEN arena
+// variants again, `TyErr` included, so a 12th variant breaks the self-compile there — the
+// property the `_`-less spelling exists for. No dead-arm tolerance was needed, and no
+// ruling on how many subtractions a block may accumulate: the answer is all of them.
+//
+// STILL OPEN, and it is a DIFFERENT mechanism — the multi-step `else if` CHAIN:
+//
+//   if x is i32 { return false } else if x is string { return false }
+//   return x                     // still `expected boolean, got string | boolean`
+//
+// Measured against this change: unmoved. The inner arm's subtraction is applied inside
+// the else arm's SCOPE and popped with it, so the count was never what blocked it (see
+// `elseif-chain-residual.vl`, which owns that half).
+function f(x: string | i32 | boolean): boolean {
+  if x is i32 { return false }
+  if x is string { return false }
+  return x
+}
+print(f(true))
+
+// CONTROL 1 — THREE subtractions, residue `f64`. The bank's limit was one; nothing
+// replaces it with a larger constant.
+function three(x: string | i32 | boolean | f64): f64 {
+  if x is string { return 0.0 }
+  if x is i32 { return 1.0 }
+  if x is boolean { return 2.0 }
+  return x
+}
+print(three(4.5))
+
+// CONTROL 2 — the residue is a STRUCT arm, and the field read goes THROUGH the
+// twice-subtracted place. A checker-only narrowing would leave a union box here and the
+// field read would not lower.
+type P = {px: i32}
+function structArm(x: string | i32 | P): i32 {
+  if x is string { return -1 }
+  if x is i32 { return -2 }
+  return x.px
+}
+print(structArm({px: 42}))
+
+// CONTROL 3 — a null STRIP followed by TWO `is` subtractions. The strip took a different
+// leg of the guard-clause arm (it was never banked); this pins that the two kinds compose.
+function strip(x: string | i32 | boolean | null): boolean {
+  if x == null { return false }
+  if x is string { return false }
+  if x is i32 { return false }
+  return x
+}
+print(strip(true))
+
+// CONTROL 4 — the residual is USED, not just returned: an unboxed `i32.add` that only
+// validates if the second subtraction reached the EMITTER. This is the control that fails
+// loudly if check and emit ever drift apart again.
+function used(x: string | boolean | i32): i32 {
+  if x is string { return -1 }
+  if x is boolean { return -2 }
+  const y = x
+  return y + 1
+}
+print(used(41))

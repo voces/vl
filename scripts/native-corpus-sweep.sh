@@ -11,11 +11,14 @@
 # roughly with core count; the results file is sorted before bucketing, so the
 # buckets and summary are deterministic regardless of worker scheduling.
 #
-# NOTE: matches files containing the literal `// @run` ANYWHERE — ONE soundness
-# @check file mentions `// @run` in a prose comment and shows up as CHECKFAIL noise
-# (xfail-false-reject-seq-guard-residual); read the directive line before chasing it.
-# Its former neighbour (xfail-false-reject-elseif-chain-residual) is gone: that gap
-# closed and the file is a genuine `@run` case now, so the expected count is 1, not 2.
+# NOTE: matches files containing the literal `// @run` ANYWHERE, so a @check file that
+# merely MENTIONS `// @run` in a prose comment gets swept and buckets as CHECKFAIL noise.
+# There is no such file today — the expected CHECKFAIL count is 0. Both files that used to
+# sit here are gone, each because its gap CLOSED and each now a genuine `@run` case:
+# xfail-false-reject-elseif-chain-residual → elseif-chain-residual.vl, and
+# xfail-false-reject-seq-guard-residual → seq-guard-residual.vl. If a CHECKFAIL does
+# appear, read the file's directive line before chasing it — it may be this same
+# prose-match artifact rather than a real reject.
 #
 # Prereqs: scripts/vl-host built (cargo build --release) and a fresh seed
 # (bash scripts/refresh-compiler.sh).
