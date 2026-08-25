@@ -603,6 +603,49 @@ stack[i].tt          // i32.load at offset + i*16 + 8
 > So the practical guidance inverts: **prefer `const u = if c { … } else { … }` over
 > a `let` written on two branches** in per-tick scratch code. The first sinks, the
 > second does not.
+>
+> **ON THE LINT webcraft asks for instead (A3): scoped, measured, and it needs one
+> ruling before it can be built.** Their words — *"the failure is silent and is a
+> perf cliff, i.e. exactly the shape a reviewer cannot see. If a lint could name the
+> shape, that would close it for us as well as a rep change would."* Agreed on the
+> value. What the measurement says about WHERE it can live:
+>
+> **`compiler/lint.vl` is the wrong home, and this is not a matter of taste.** That
+> pass is AST-only by construction — its own header says it consumes the parsed arena
+> rather than re-deriving type information. The cliff is a REP property, not a syntax
+> one, and the four shapes that must be told apart are indistinguishable without
+> types:
+>
+> | spelling | reps as | has the cliff? |
+> | --- | --- | --- |
+> | `let u: C \| S` | the variant box | **yes** |
+> | `let s: "ok" \| "err"` | an interned i32 atom | no |
+> | `let n: i32 \| null` | a niche | no |
+> | `let xs: (S \| K)[]` | a list; the union is the ELEMENT | no |
+>
+> A syntactic rule ("a `let` whose annotation contains `|`, later assigned") was
+> written and run over the whole tree: **31 firings, zero in `compiler/` or `std/` or
+> `bench/`, and the majority are the three non-cliff rows above.** So the naive rule
+> is mostly false positives, and it would be teaching kernel authors to ignore it.
+>
+> **The corpus makes precision a requirement rather than a nicety.** `assertLint` is
+> strict in BOTH directions — an undeclared diagnostic fails its fixture
+> (*"unexpected hint(s) (declare with @hint if intended)"*) — so every firing costs a
+> fixture edit. A noisy rule is not merely untidy here; it is ~20 fixture edits
+> asserting a property that is not true of those files.
+>
+> **So it belongs where the rep is decided**, beside the predicates that already
+> distinguish these (`tyIsLitUnion`, the nullable-niche tests, the variant-box atom
+> check) — the checker's hint stream, which `cli.vl` already folds together with the
+> lint stream.
+>
+> **The ruling it needs, which is a language-design call and not a mechanical one:**
+> the cliff only bites in a HOT path, and nothing in the type system marks one. Fire
+> on every reassigned box-union local and it is advisory noise in cold code; restrict
+> it to loop bodies and it is quiet and nearly always right, but it misses a tick
+> function whose `let` is declared outside its own loop. **Recommendation: restrict to
+> loop bodies for v1** — the false-negative is a shape a profiler still finds, whereas
+> a diagnostic that cries wolf is one nobody reads. Not built pending that call.
 > `unboxed-union-rep-design.md` is the design record.
 >
 > ```
