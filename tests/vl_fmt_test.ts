@@ -1533,3 +1533,65 @@ const diffFirstLine = (a: string, b: string): string => {
   }
   return "(texts differ only in length)";
 };
+
+// ── THE `as` TRIO'S SUFFIX IS PART OF THE OPERATOR ──────────────────────────
+//
+// `asExpr` printed a bare `" as "` for all three members, so `vl fmt` silently rewrote
+// `x as! T` and `x as? T` to `x as T`. That is a SEMANTIC change, not a cosmetic one — the
+// three differ only in this token (`error-handling-design.md` §Trio: `as` propagates the
+// remainder, `as?` coalesces to null, `as!` traps) — and it is the one thing a formatter
+// may never do.
+//
+// It was latent rather than damaging: `lint-self.sh`'s fmt-check covers `compiler/ std/
+// scripts/` only, and none of those use the trio, so no tracked file was ever rewritten.
+// It would have bitten the first user to run `vl fmt` on code using it — turning an
+// intended trap into a propagation that either fails to compile or, where the enclosing
+// return happens to accept the remainder, silently changes what the program does.
+//
+// Asserted as a ROUND TRIP rather than against an expected string: the point is that the
+// input survives, and a round-trip test cannot pass by agreeing with a wrong expectation.
+Deno.test({
+  name: "vl-fmt: `as` / `as?` / `as!` keep their suffix through a round trip",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      'type A = { kind: "a", x: i32 }',
+      'type B = { kind: "b", y: i32 }',
+      'function mk(): A | B { return { kind: "a", x: 1 } }',
+      "function propagate(): A | B {",
+      "  const v = mk() as A",
+      "  return v",
+      "}",
+      "function trap() {",
+      "  const v = mk() as! A",
+      "  print(v.x)",
+      "}",
+      "function coalesce() {",
+      "  const v = mk() as? A",
+      '  if v is A { print(v.x) } else { print("no") }',
+      "}",
+      "propagate()",
+      "trap()",
+      "coalesce()",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt exited ${r.code}`);
+    for (const want of ["as A", "as! A", "as? A"]) {
+      if (!r.out.includes(want)) {
+        throw new Error(`formatted output lost \`${want}\`:\n${r.out}`);
+      }
+    }
+    // The bare `as` must appear ONCE, not three times — the failure mode is every
+    // spelling collapsing onto it, which the three `includes` above cannot catch alone.
+    const bare = r.out.split("\n").filter((l) => / as A$/.test(l.trimEnd())).length;
+    if (bare !== 1) {
+      throw new Error(`expected exactly one bare \`as A\`, found ${bare}:\n${r.out}`);
+    }
+    // Idempotent: formatting the formatted source changes nothing.
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error("fmt is not idempotent over the `as` trio");
+    }
+  },
+});

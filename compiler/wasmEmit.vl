@@ -11348,6 +11348,56 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   // ONE box struct (`uBoxIdx`) and the tag registry is global, so the operand's box IS a
   // value of the enclosing function's union return type. The checker's remainder test is what
   // makes that sound — it refuses any return type the remainder does not fit.
+  // `m[k] as! V` — THE ASSERTED MAP READ, and the reason it is fused rather than routed
+  // through the box path below: there is nothing for a box to carry. The union box exists
+  // to say WHICH ARM a value is; `as!` asserts the arm, so the tag is already known and the
+  // only question left is whether the key was there — which the probe answers.
+  //
+  //     <probe>            ;; entry -> scratch, the same probe `.has` runs
+  //     entry; i32.eqz
+  //     if  unreachable  end   ;; a miss is a bug — that is what `as!` MEANS
+  //     vals[entry - 1]        ;; the raw scalar
+  //
+  // FREE, NOT MERELY CHEAP. The correct narrowing read (#1901) allocates a `$vb*` and a
+  // `$uBox` on a hit; this allocates neither, and the trap costs no extra branch because it
+  // rides the compare the probe already performs. So the caller who has proved presence —
+  // by iterating `.keys()`, or after `.has(k)` — pays nothing for saying so.
+  //
+  // ONLY `as!`. `as` propagates the null to the caller and `as?` re-wraps it, and both of
+  // those NEED the box, because both hand a `V | null` onward. Only the trapping member can
+  // discard it.
+  if e.asMode == "trap" {
+    const amk = mapReadScalarBoxKindTy(obj)
+    if amk >= 0 {
+      const amRef = P.nodes[unwrapParen(obj)]
+      if amRef is Index {
+        if emitMapPrep(body, amRef.idxArr, amRef.idxIndex, fnIx) < 0 {
+          return -1
+        }
+        pushMapScr(body, 5) // entry
+        fbI32Eqz()
+        fbIf(64) // void
+        fbUnreachable()
+        fbEnd()
+        if cmSlot >= 0 {
+          pushMapVals(body)
+          fbStructGet(cmValsWrap(), 0)
+          pushMapScr(body, 5)
+          fbI32Const(1)
+          fbI32Bin(107) // i32.sub
+          fbArrayGet(cmValsBack())
+        } else {
+          pushMapVals(body)
+          fbStructGet(lTypeIdx, 0)
+          pushMapScr(body, 5)
+          fbI32Const(1)
+          fbI32Bin(107)
+          fbArrayGet(aTypeIdx)
+        }
+        return 0
+      }
+    }
+  }
   if asExprIsUnionCast(_exprIx) {
     // The target arm's TYPE is the cast node's own recorded type — the checker set it to
     // exactly the arm it proved. No spelling is resolved here.

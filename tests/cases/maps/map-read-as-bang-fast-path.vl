@@ -1,0 +1,65 @@
+// `m[k] as! V` — THE ASSERTED MAP READ (ROADMAP B6c).
+//
+// The correct narrowing read (#1901/#1903) builds a `$vb*` payload box and a `$uBox` union
+// box on every access, because it has to hand back something that can say "absent". A
+// caller who has ALREADY proved presence — by iterating `.keys()`, or after `.has(k)` —
+// knows the answer and pays for it anyway.
+//
+// `as!` is the ruled spelling for that assertion (`error-handling-design.md` §Trio: "a miss
+// is a bug"), and over a map read it fuses to the probe itself:
+//
+//     <probe>              ;; the same probe `.has(k)` runs
+//     entry; i32.eqz
+//     if  unreachable  end ;; a miss is a bug — that is what `as!` MEANS
+//     vals[entry - 1]      ;; the raw scalar, no box
+//
+// FREE, NOT MERELY CHEAP, and the trap is free too: it rides the compare the probe already
+// performs, so the assertion adds no branch of its own. Measured against the narrowing
+// spelling of the same loop at `-O3`: **0 `struct.new` inside the loop against 1**, and
+// **1.31x** over 4.1M reads (35ms vs 46ms, min-of-5, R=0 control subtracted). At small
+// scale the two are indistinguishable — the win needs enough reads to clear the noise,
+// which is worth knowing before reaching for it.
+//
+// ONLY `as!`. `as` propagates the null to the caller and `as?` re-wraps it; both hand a
+// `V | null` onward and so both still need the box. Only the trapping member can discard
+// it, which is exactly the asymmetry the trio's ruling describes.
+// @run
+// @log 3
+// @log 3
+// @log 1.5
+// @log 7
+// @log 0
+// @log ok
+
+const m: {[i32]: i32} = Map()
+m[7] = 3
+print(m[7] as! i32) // 3
+
+// through a binding, and with a string key
+const ms: {[string]: i32} = Map()
+ms["a"] = 3
+const v = ms["a"] as! i32
+print(v) // 3
+
+// the other scalar widths
+const mf: {[string]: f64} = Map()
+mf["a"] = 1.5
+print(mf["a"] as! f64) // 1.5
+const mq: {[string]: i64} = Map()
+mq["a"] = 7
+print(mq["a"] as! i64) // 7
+
+// A STORED ZERO is present, and `as!` must hand it back rather than trap — the assertion
+// is about the KEY, not about the value being non-zero. This is the case the pre-#1901
+// lowering could not express at all.
+const z: {[i32]: i32} = Map()
+z[1] = 0
+print(z[1] as! i32) // 0
+
+// and it agrees with the narrowing spelling on the same key
+const w = z[1]
+if w is i32 {
+  if w == (z[1] as! i32) { print("ok") } else { print("WRONG") }
+} else {
+  print("WRONG")
+}
