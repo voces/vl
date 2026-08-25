@@ -1286,3 +1286,36 @@ this cause.
 per-tick simulation loop, which the corpus contains none of. The honest statement is that
 the shape is cheap to AVOID — the if-expression spelling of the same program is available,
 already melts, and is 2.5× faster at `-O` — and expensive to hit.
+
+### 13.6 The re-open was proposed and REFUSED, 2026-08-25 — on a premise that did not survive
+
+Recorded because the proposal is the obvious one and someone will make it again.
+
+**The argument was: "§13.4's timing was taken on the wrong shape, so the real cost is worse
+than the refusal was argued against."** It came from reading §12.4's correction — that
+`4/4/2` was measured with the payload DISCARDED and reads `4/4/4` with it read — and
+generalising it from ALLOCATION-SITE COUNTS to the TIMINGS. That generalisation is false.
+§13.4's numbers are a separate measurement, taken on the payload-read shape, and its own
+header says so ("the optimizer's having run is asserted structurally in each timed
+artifact per §10.7: `A` 4/4/4").
+
+**Re-derived independently before the proposal was withdrawn**, on a fresh pair (the same
+two spellings, 3 M trips, min-of-5, R=0 control subtracted, `-O3`): **2.60×**, against
+§13.4's 2.50× at the same rung. A CONFIRMATION, not a new finding. So the refusal was made
+with this number in hand and "the cost is larger than they knew" is not an available
+argument.
+
+**What the refusal actually rests on, restated so it is not re-litigated on cost alone:**
+
+1. It is a REPRESENTATION change, not an optimization (§13.3) — holding tag and payload in
+   scalars across a liveness window changes what a union-typed local IS between two program
+   points, which is Heap2Local's job done in the emitter, against the standing rule.
+2. The cost is AVOIDABLE in one line. That is the asymmetry that decides it: 2.5× is a real
+   price, but it is the price of a spelling whose alternative is already written, already
+   melts, and is right there.
+
+**So the residual problem is VISIBILITY, not representation** — the cheap alternative is
+invisible in the source, which is what makes a lint the proportionate answer rather than a
+consolation prize. See `webcraft-requirements.md` P1.3 for that row's scoping, and B6d in
+`ROADMAP.md` for the sibling lint that measures as the higher-value one (it fires on a
+spelling people reach for from memory; this one fires zero times tree-wide).
