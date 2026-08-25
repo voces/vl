@@ -1,0 +1,262 @@
+// @run
+// AN UN-ANNOTATED ARRAY LITERAL CLASSIFIES FROM THE CHECKER'S ELEMENT TYPE, and lands on
+// the same kind-2 box path the annotated `(A | B)[]` spelling has always taken.
+//
+// ONE MISSING ROW, THREE FAILURE MODES. `arrLitIsRef`'s last rung already claimed a literal
+// whose checker-recorded element is a value union, and `nodeArrayElemName` already had the
+// `TyUnion` arm that names it. What was missing was the ROW: every union-registration route
+// runs off a SPELLING that appears in the source — a `type U = A | B` declaration, an
+// annotation the name/arena walks reach, an inferred RETURN, an inferred `let` — and an
+// un-annotated literal spells its union nowhere. So `isUName` was false, the rung never
+// fired, and the literal fell to the i32 list, where:
+//
+//   `[1, true]`   stored `true` as its i32 and printed `1` twice — a SILENT WRONG ANSWER
+//   `[1, "two"]`  stored a string ref into an i32 backing — `vl check` rc 0, then
+//                 `expected i32, found (ref $type)` at instantiation
+//   `[c, d]`      hit the i32 path's loud floor, `struct array elements are not supported`
+//
+// The witness that the row was the whole story: adding an unrelated `const dummy: i32 |
+// string = 1` to the first two programs — a spelling that contributes nothing but the
+// registration — made both run correctly on the parent.
+//
+// AND THE FIRST-ELEMENT PROBES WERE THE OTHER HALF. With the row minted, `[1, "two"]`
+// reached the box list but `["two", 1]` did not: `arrLitIsStr` asks `exprString` of element
+// 0 and claimed the string list, storing the i32 sibling into a `(ref null $type)` backing.
+// The f64 and i64 classifiers had the mirror defect from the opposite direction — their
+// scans are order-BLIND, so `[2.5, "a"]` AND `["a", 2.5]` both claimed the f64 list. All
+// three now decline a literal whose recorded element is a registered value union, which is
+// why every pair below is spelled in both orders and both orders print the same values.
+//
+// A LITUNION-ALIAS ARM (`K | f64`) IS DELIBERATELY NOT IN THIS FAMILY and keeps the scalar
+// classification it had; `literal-unions/mixed-union-alias-member-preserves.vl` is that
+// shape's fixture and its go4 case reaches its box only BY being classified `string[]`.
+//
+// THE FOUR REDUNDANCY HINTS BELOW ARE PART OF THE PIN, not noise to be silenced. `a1` and
+// `a2` are the ANNOTATED controls, and the lint saying their annotations are redundant is
+// the checker stating that it infers exactly the type the annotation spells — which is the
+// premise this whole fix rests on: the inference was never wrong, only the emitter's
+// registration was missing.
+// @hint redundant type annotation: `c` is inferred as `{m: i32}`
+// @hint redundant type annotation: `d` is inferred as `{w: i32}`
+// @hint redundant type annotation: `a1` is inferred as `(i32 | string)[]`
+// @hint redundant type annotation: `a2` is inferred as `(C | D)[]`
+// @hint redundant type annotation: `cs` is inferred as `C[]`
+type C = { m: i32 }
+type D = { w: i32 }
+
+const c: C = { m: 1 }
+const d: D = { w: 2 }
+
+// ── i32 | string, both orders ────────────────────────────────────────────────
+function scalarAndString() {
+  const xs = [1, "two"]
+  for x in xs {
+    // @log 1
+    // @log two
+    if x is i32 { print(x) } else { print(x) }
+  }
+  const ys = ["two", 1]
+  for y in ys {
+    // @log two
+    // @log 1
+    if y is i32 { print(y) } else { print(y) }
+  }
+}
+scalarAndString()
+
+// ── i32 | boolean, both orders — the SILENT one ──────────────────────────────
+function scalarAndBool() {
+  const xs = [1, true]
+  for x in xs {
+    // @log 1
+    // @log true
+    if x is i32 { print(x) } else { print(x) }
+  }
+  const ys = [true, 1]
+  for y in ys {
+    // @log true
+    // @log 1
+    if y is i32 { print(y) } else { print(y) }
+  }
+}
+scalarAndBool()
+
+// ── string | boolean ─────────────────────────────────────────────────────────
+function stringAndBool() {
+  const xs = ["a", true]
+  for x in xs {
+    // @log a
+    // @log true
+    if x is string { print(x) } else { print(x) }
+  }
+}
+stringAndBool()
+
+// ── f64 | string, both orders — the order-BLIND classifier ───────────────────
+function floatAndString() {
+  const xs = [2.5, "a"]
+  for x in xs {
+    // @log 2.5
+    // @log a
+    if x is f64 { print(x) } else { print(x) }
+  }
+  const ys = ["a", 2.5]
+  for y in ys {
+    // @log a
+    // @log 2.5
+    if y is f64 { print(y) } else { print(y) }
+  }
+}
+floatAndString()
+
+// ── i64 | string, both orders — the i64 twin ─────────────────────────────────
+function wideAndString() {
+  const xs = [6000000000, "a"]
+  for x in xs {
+    // @log 6000000000
+    // @log a
+    if x is i64 { print(x) } else { print(x) }
+  }
+  const ys = ["a", 6000000000]
+  for y in ys {
+    // @log a
+    // @log 6000000000
+    if y is i64 { print(y) } else { print(y) }
+  }
+}
+wideAndString()
+
+// ── a THREE-member union ─────────────────────────────────────────────────────
+function threeMembers() {
+  const xs = [1, "two", true]
+  for x in xs {
+    // @log 1
+    // @log two
+    // @log true
+    if x is i32 { print(x) }
+    else if x is string { print(x) }
+    else { print(x) }
+  }
+}
+threeMembers()
+
+// ── TWO STRUCT TYPES — the shape that used to be a loud reject ───────────────
+// It RUNS now rather than staying a reject, and the evidence is its own annotated control
+// below: `const xs: (C | D)[] = [c, d]` already ran on the parent, so the variant-box
+// machinery this literal reaches is the machinery that spelling was already using. The
+// reject was never about structs — it was the i32 path's floor, reached because the row
+// was missing, and nothing about it survives the row being there.
+function twoStructs() {
+  const xs = [c, d]
+  for x in xs {
+    // @log 1
+    // @log 2
+    if x is C { print(x.m) } else { print(x.w) }
+  }
+}
+twoStructs()
+
+// ── STRUCT + SCALAR, both orders ─────────────────────────────────────────────
+function structAndScalar() {
+  const xs = [c, 7]
+  for x in xs {
+    // @log 1
+    // @log 7
+    if x is C { print(x.m) } else { print(x) }
+  }
+  const ys = [7, c]
+  for y in ys {
+    // @log 7
+    // @log 1
+    if y is C { print(y.m) } else { print(y) }
+  }
+}
+structAndScalar()
+
+// ── the union under a DECLARED ALIAS, which registers under `U` not `C|D` ────
+// The literal's own name is the nominal composite, so the two rows are distinct spellings
+// of one union and the alias does not satisfy the literal's lookup. Pinned because it is
+// the shape where "already registered" is most tempting to assume.
+type U = C | D
+function aliasedUnion() {
+  const u: U = c
+  // @log 1
+  if u is C { print(u.m) }
+  const xs = [c, d]
+  for x in xs {
+    // @log 1
+    // @log 2
+    if x is C { print(x.m) } else { print(x.w) }
+  }
+}
+aliasedUnion()
+
+// ── CONTROLS: the annotated spellings, which already ran ─────────────────────
+function annotatedControls() {
+  const a1: (i32 | string)[] = [1, "two"]
+  for x in a1 {
+    // @log 1
+    // @log two
+    if x is i32 { print(x) } else { print(x) }
+  }
+  const a2: (C | D)[] = [c, d]
+  for y in a2 {
+    // @log 1
+    // @log 2
+    if y is C { print(y.m) } else { print(y.w) }
+  }
+}
+annotatedControls()
+
+// ── CONTROLS: every literal that is NOT a union element keeps its answer ─────
+function scalarControls() {
+  // A mixed int/float literal WIDENS to f64 — it is not a union at all, so no row is
+  // minted and the f64 list is still what it builds.
+  const ws = [1, 2.5]
+  for w in ws {
+    // @log 1
+    // @log 2.5
+    print(w)
+  }
+  // Single-type literals, one per rep that the new decline could have stolen.
+  const ns = [1, 2]
+  // @log 3
+  print(ns[0] + ns[1])
+  const ss = ["a", "b"]
+  for s in ss {
+    // @log a
+    // @log b
+    print(s)
+  }
+  const bs = [true, false]
+  for b in bs {
+    // @log true
+    // @log false
+    print(b)
+  }
+  const fs = [1.5, 2.5]
+  for f in fs {
+    // @log 1.5
+    // @log 2.5
+    print(f)
+  }
+  const ls = [6000000000, 7000000000]
+  for l in ls {
+    // @log 6000000000
+    // @log 7000000000
+    print(l)
+  }
+  // An EMPTY literal has no element to classify and takes its kind from the annotation,
+  // exactly as before.
+  const es: i32[] = []
+  // @log 0
+  print(es.length)
+  // A ONE-element literal of a declared struct is no union, so nothing here claims it and
+  // master's answer stands — which for the UN-annotated spelling `[c]` is still the loud
+  // reject pinned in `error-inferred-union-element-lone-struct.vl` beside this file. The
+  // ANNOTATED spelling is the control that must not move.
+  const cs: C[] = [c]
+  // @log 1
+  print(cs[0].m)
+}
+scalarControls()

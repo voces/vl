@@ -164,6 +164,14 @@ green, native fixpoint byte-exact, the structural-identity harness 0/0/0. The re
 `closures/error-narrow-reflist-arm-of-closure-result-union.vl` so the next attempt at that merge
 fails in the corpus first.
 
+> **UPDATE — the pin moved and is no longer a reject.** That shape now COMPILES AND RUNS
+> correctly (`internFuncTypeShapesTy` gained a composite-union arm; `refArmUnionRetName`'s
+> `hasObjSibling` decline came off behind it), so the fixture graduated to
+> `closures/narrow-reflist-arm-of-closure-result-union.vl` with `@run` / `@log false`. The
+> guard against this merge is unchanged in force and stronger in kind: the file used to pin a
+> REJECT that the merge would flip to MISMATCH, and now pins the CORRECT answer directly, so a
+> re-enabled element dedup reddens it as a LOGDIFF rather than as a lost reject.
+
 **What the constant-false actually is, then.** Not an oversight to be tidied away: it is the thing
 standing between a name-keyed row table and an unsound merge. The measurement that found it (5 codes,
 1,365 comparisons, 0 matches) stands; the conclusion that it was safe to fix does not.
