@@ -1,0 +1,67 @@
+// @run
+// @log 200
+// @hint redundant type annotation: `b` is inferred as `B` — remove it to lean on inference
+// CLOSED — this was `xfail-false-reject-call-result-union-binding.vl`, and the prefix is
+// dropped per this directory's README ("when it closes, drop the prefix and flip the file to
+// @run + @log"). A declared struct produced by a CALL, bound to an INLINE union-annotated
+// const. Sound program, refused with `emitProgram: ref valtype with no interned shape`.
+//
+// THE OLD HEADER'S DIAGNOSIS WAS RIGHT AND ITS TRIGGER WAS WRONG. It named the SAME-SHAPE
+// COLLAPSE — `A` and `B` here have identical fields, the annotation route dedups its members
+// with `sameVariantTy`, and the inline `A | B` keeps ONE member — and it named the consequence
+// (`registerInlineUnion` pushes BOTH names into `uVariants` anyway, so `collectS` refuses both
+// a standalone struct row). What it never was is a CALL-RESULT-IN-A-UNION-POSITION defect.
+// Measured one axis at a time, the collapse alone is the trigger and the union position is not
+// involved at all — this program has the identical reject with the call result never touching
+// the union:
+//
+//     type A = { v: i32 }
+//     type B = { v: i32 }
+//     function mkB(): B { return { v: 200 } }
+//     const b: A | B = { v: 1 }     // the collapsed union, initialized by a LITERAL
+//     print(mkB().v)                // `B` in a signature is what has no valtype
+//
+// Any function signature mentioning `A` or `B` does it — a param (`function f(x: B)`) as
+// readily as a return. Drop the `A | B` binding and it compiles; give `A` and `B` DISTINCT
+// field sets and it compiles; write the union as a declared alias (`type U = A | B`) and it
+// compiles. Only the inline spelling of a collapsing pair fails, and it fails at the FIRST
+// position that needs `B`'s valtype, which is why the old bisect landed on the call.
+//
+// THE FIX IS #1803's, ONE EARLY RETURN FURTHER IN. That change taught the ANNOTATION route to
+// feed `cVariantMemberTyIxs` (`annRegisterVariantMembers`) so the checker and `collectU` agree
+// about which declared structs are variant members — but `annUnionInnerTy` returns its single
+// member before reaching that call, so a union that DEDUPS to one member never registered.
+// `annUnionPushDistinctMember` (typecheck) now registers the pair at the moment the dedup drops
+// one, which is the only place the pre-dedup arity is still in hand. The DECLARED spelling is
+// the control and always worked for exactly this reason: pass 0b's `UnionDecl` arm does not
+// dedup, so its `members.length >= 2` gate passes and the shared index registers.
+//
+// A | A IS NOT THIS, and the gate says so: the registration fires only when the two members are
+// DISTINCT arena entries that are mutually assignable. The same entry twice is a degenerate
+// repeat the emitter also collapses (one distinct NAME, no variant rows, `collectS` keeps the
+// struct row), and registering it moved `const b: A | A = mkA()` from RUN-OK to this very
+// reject — measured, and the reason the gate is not just `sameVariantTy`.
+//
+// THE B184 DEAD END IS NOT REVISITED. Flipping only the emitter's KIND made 7 of 10 repros
+// compile into INVALID MODULES ("the signature now says variant while the body still BUILDS
+// the plain struct"); registering the member moves the producer too, so the value IS the
+// variant. `types/variant-as-value.vl` — which B185 found in conflict with minting a struct
+// row — is untouched: no struct row is minted for `A` or `B` anywhere.
+//
+// THE NULLABLE RESIDUE IS UNMOVED, BY DESIGN. Add `const n: B | null = null` beside the
+// binding and this program is refused exactly as it is on master:
+// `annCommitVariantMembers` excludes any arm the module also uses as `T | null`, because the
+// niche rep and the variant rep are incompatible and calling such a struct a variant turns a
+// loud reject into check-clean INVALID WASM (that exclusion's own 24-cell measurement). The
+// family stays filed at `unions/error-nullable-variant-unsupported.vl`.
+//
+// STILL OPEN, and NOT this family: a field read directly off a union-returning CALL,
+// `function g(): A | B { … }` then `g().v`, is `emitProgram: field access but no struct type
+// declared`. It is the same on master, it is the same for the DECLARED alias `type U = A | B`,
+// and it is the same for a DISTINCT-shape pair — so it is a union-call-receiver gap, not a
+// same-shape one. Binding the call first (`const r = g()`) runs.
+type A = { tag: i32, v: i32 }
+type B = { tag: i32, v: i32 }
+function mkB(): B { return { tag: 2, v: 200 } }
+const b: A | B = mkB()
+print(b.v)
