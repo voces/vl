@@ -280,7 +280,16 @@ Open, and the underlying rep decision is real rather than aspirational. `docs/gu
 
 </details>
 
-### buffer-scalar-arg-accessors
+### buffer-scalar-arg-accessors — CLOSED 2026-08-24: SHIPPED
+
+**Ruled by the consumer asking for it.** webcraft's A1 (2026-08-24) names this function by name as
+their highest-priority ask, and the fork this entry poses — "std surface now, or wait for B6b's LICM
+to make the plain view spelling fast" — has only one arm left: B6b's LICM was **refuted as a measured
+negative** on 2026-08-16, three weeks after this entry was filed. Two of the costs priced below are
+also wrong on re-measurement: the +162-byte size tax is **zero** (only imported names are emitted),
+and the "immutable `struct.get`" framing is false (every field is emitted mutable, and an
+immutability A/B moves nothing). See the ruling block further down for the full accounting and the
+numbers on the consumer's own kernel. Everything below is the filing as it stood.
 
 **Per-width scalar-argument accessors (`getF32At(base, length, i)`) — widen `std:buffer`'s public surface, or leave the 3.0x to hand-written loops**  
 `docs/internals/buffer-design.md:2120 (section §M4, heading :2071); indexed at ROADMAP.md:424`
@@ -472,16 +481,43 @@ evidence was that the workaround already existed in TWO places (`bench/run.sh` a
 independent places is the wrong default. It had already produced published `-O3` timings that were
 re-runs of the `-O0` module.
 
-### `getF32At(base, length, i)` — RECOMMENDED AGAINST, awaiting the owner's word
+### `getF32At(base, length, i)` — SHIPPED 2026-08-24; the standing recommendation against it rested on a premise that had since been refuted
 
-Not ruled, but the orchestrator's recommendation is on record so it is not re-analysed from scratch:
-**decline it, and fix the reload instead.** Adding per-width scalar-argument accessors is a
-hand-workaround for an optimizer gap (binaryen will not hoist immutable `struct.get`s of a view
-descriptor out of a loop), and it makes the fast path a second, uglier spelling every kernel author
-must learn — colliding with the project's own rule that users must not need hacks for top
-performance. The principled fix is ROADMAP B6b's backing-pointer LICM, which webcraft P1.4's
-measurement has now PRICED at 89% of the view-kernel excess. See the `buffer-scalar-arg-accessors`
-entry above for the full trade-off.
+~~Not ruled, but the orchestrator's recommendation is on record so it is not re-analysed from
+scratch: **decline it, and fix the reload instead.**~~ **That recommendation is withdrawn, and the
+reason is a date.** It was written 2026-08-03 and its load-bearing sentence was *"the principled fix
+is ROADMAP B6b's backing-pointer LICM"*. B6b's LICM closed as a **measured negative — REFUTED** on
+2026-08-16 (`ffded4e5`, workboard C2; `ROADMAP.md` says so directly). So the alternative the
+recommendation deferred to no longer exists, and "wait for the compiler fix" became "wait forever".
+
+Two further claims in it were also checked and are false:
+
+- *"binaryen will not hoist immutable `struct.get`s"* — **the fields are not immutable.**
+  `compiler/emit_sections.vl` writes `wU8(1) // mutable` for every field of every declared struct,
+  unconditionally; the disassembly of a view module reads
+  `(struct (field (mut i32)) (field (mut i32)))`. And making them immutable by hand changes nothing:
+  a mutable-vs-immutable A/B at `--closed-world -O3 --gufa -O3` leaves the identical reload count.
+  Mutability was never the blocker.
+- *"§L6a's measured size tax — +162 bytes per width family on EVERY program importing
+  `std:buffer`"* — **measured zero.** Only imported names are emitted; a program importing
+  `Buffer` + `f32view` + `getF32` builds to 1609 bytes against both the old and the new `std/`.
+
+What remains of the recommendation is its real objection — "a second, uglier spelling every kernel
+author must learn" — and that one stands, is not dismissed, and is answered by scope rather than by
+argument: `v[i]` is still the default, these are the opt-in for a measured hot loop, and
+`std/buffer.vl`'s header says so in those words along with both things the tier gives up (the
+same-width pair can still be mismatched; `view4Base`'s construction check does not transfer).
+
+**What decided it:** the consumer asked. webcraft's A1 names the descriptor reload as "the only row
+that changes whether the port is worth doing", spells this exact function, and states no preference
+between it and the compiler fix that no longer exists. Measured on their own six-column kernel:
+24 `struct.get` per element → **0**, 6.345 → 1.964 ns/element, **3.23x with every bounds trap
+intact** — better than their own hand-hoisted twin, which dropped the fence to get 2.40x.
+
+Shipped with a brand the original filing did not consider: `f32base(v)` / `i32base(v)` mint a
+width-branded `F32Base` / `I32Base`, so `getF32At(i32base(iv), …)` is a named reject rather than a
+silent reinterpretation of four integer bytes as a float. Zero-cost (a newtype is erased before
+emit). `docs/internals/buffer-design.md` §M8.
 
 ### `O-release-rung-default` — RULED 2026-08-18: `-O3` stays
 

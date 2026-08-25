@@ -382,6 +382,35 @@ export type F32View = new { base: i32, length: i32 }
 // A view of 4-byte signed integers.
 export type I32View = new { base: i32, length: i32 }
 
+// THE BASE ADDRESS OF A VIEW, BRANDED BY WIDTH — the handle the `*At` accessors
+// below take, minted by `f32base` / `i32base`.
+//
+// Same reason `F32View` and `I32View` are `new`: the two are structurally
+// identical (both an address) and nothing but a nominal brand tells them apart.
+// It matters at exactly one place. Unbranded,
+// `getF32At(iv.byteAddrI32(0), iv.length, 0)` would type-check and reinterpret
+// four integer bytes as a float, silently — precisely the hazard the view
+// section's header calls "measured, not feared" and spends fifteen lines
+// justifying `new` to close. Handing the extent out as two bare i32s would have
+// reopened it one function later.
+//
+// WHY THIS IS A SEPARATE MINTER AND NOT `byteAddrF32`'s RETURN TYPE. Branding
+// `byteAddrF32` was tried first and is wrong: that function exists for "a caller
+// mixing view access with the bare intrinsics or with a host-side typed array",
+// i.e. for raw address ARITHMETIC, and a brand makes `a + (i << 2)` a type error
+// (`operator '+' mixes F32Base and i32`) at all 64 of its uses in this tree. The
+// raw accessor should answer a raw address. The brand belongs on the handle whose
+// only purpose is to be handed back to a fenced accessor, so it is its own name.
+//
+// ZERO-COST, and byte-identically so: a newtype is erased before the emitter runs,
+// so a module using these is `cmp`-identical to the same module with the brands
+// removed. The price is one `as i32` inside each accessor body here, and nothing
+// at all at a call site.
+export type F32Base = new i32
+
+// The i32 twin. Distinct from `F32Base` only nominally — that is the whole job.
+export type I32Base = new i32
+
 // Shared construction check for a 4-byte-element view over `self`: `off` is a
 // BYTE offset into the `Buf` and `count` is an ELEMENT count. Traps unless the
 // whole range `[off, off + count*4)` lies inside the `Buf`.
@@ -497,11 +526,22 @@ export function byteAddrI32(self: I32View, i: i32): i32 {
 // a kernel with six columns does not.
 //
 // These four take the base and the length as SCALARS, so the caller hoists them
-// once — `const b = byteAddrF32(v, 0)`, `const n = v.length` — and the loop body
+// once — `const b = f32base(v)`, `const n = v.length` — and the loop body
 // holds no reference at all. The same integrator rewritten against them reads
-// **0 `struct.get` inside the loop**, with the identical 24 traps and the
-// identical 8 loads / 4 stores. The fence is not what costs; the descriptor
-// reload is.
+// **0 per element**, with the identical 24 traps and the identical loads and
+// stores. (In-loop the pinned counts are 25 and 12: the 12 are the six bases and
+// six lengths taken once per TICK, which the driver's trip loop lexically
+// contains. Per element is the unit that matters and the one §M8 tabulates.) The
+// fence is not what costs; the descriptor reload is.
+//
+// THE COMPILER-SIDE REPAIRS WERE MEASURED AND REFUTED, which is why this is a
+// library answer to a codegen-shaped problem. Emitting the descriptor's fields as
+// IMMUTABLE changes nothing — binaryen leaves every read either way — and building
+// the views inside a function so Heap2Local could scalarize them is byte-for-byte
+// identical to building them at module scope. So the reload is neither a
+// mutability nor an escape problem, and a VL-level LICM would not see it at all:
+// the field read lives inside the accessor below, behind a call boundary that only
+// binaryen inlines. `docs/internals/buffer-design.md` §M8 has both A/Bs.
 //
 // THESE ARE STRICTLY SAFER THAN THE RECIPE THIS MODULE USED TO GIVE. The advice
 // in the section header above was to hoist `byteAddrF32(v, 0)` / `v.length` and
@@ -510,49 +550,85 @@ export function byteAddrI32(self: I32View, i: i32): i32 {
 // silent read of a neighbouring column. These keep the check. A kernel wanting
 // the fast spelling no longer has to choose between the two.
 //
-// THE ONE HAZARD, stated because it is the reason these are not simply the
-// primary surface: `base` and `length` arrive as two loose i32s, and nothing ties
-// them to each other or to the view they came from. `getF32At(pxBase, vxLen, i)`
-// type-checks and fences against the WRONG column's extent. The view accessors
-// cannot be mispaired that way, so `v[i]` stays the default and these are the
-// deliberate opt-in for a measured hot loop — the same posture `Buf`'s unfenced
-// loads already have. Take both scalars from one view, on adjacent lines, and
-// treat the pair as one value.
+// TWO THINGS ARE GIVEN UP, and they are the reason these are an opt-in rather
+// than the primary surface.
+//
+// 1. THE PAIR CAN BE MISMATCHED ACROSS COLUMNS. `base` and `length` are separate
+//    arguments and nothing ties them to each other, so `getF32At(pxBase, vxLen, i)`
+//    type-checks and fences against the wrong column's extent. The WIDTH half of
+//    this is closed by the `F32Base` / `I32Base` brands above — a cross-width call
+//    is a named reject — but two views of the SAME width are interchangeable, and
+//    no scalar signature can fix that. Take both from one view, on adjacent lines,
+//    and treat the pair as one value.
+//
+// 2. THE CONSTRUCTION-TIME EXTENT CHECK DOES NOT TRANSFER. `view4Base` is what
+//    makes the per-access `0 <= i < length` sufficient — it proved when the view
+//    was made that the whole extent lies inside the `Buf`, so an in-range index
+//    cannot leave it. These take a base and a length as claims and never run it.
+//    `getI32At(0, 1000000, 0)` reads address 0 and does not trap. So the compares
+//    fence against a CLAIMED extent, not a validated one; a base that came from
+//    `byteAddrF32` on a real view carries the guarantee, and one you computed does
+//    not. The brands make that provenance the type's business as far as a scalar
+//    can, since the only public way to mint an `F32Base` is from an `F32View`.
+//
+// So `v[i]` stays the default and these are the deliberate opt-in for a measured
+// hot loop — the same posture `Buf`'s unfenced loads already have.
+//
+// ON THE NAMES. Every other name in this module ends in its width (`loadF32`,
+// `storeF32`, `getF32`, `byteAddrF32`); these put it medially. The rule is that the
+// VERB carries the unit — `load`/`store` take a byte offset into a `Buf`, `get`/`set`
+// take an element index — and `At` carries "you supply the extent rather than hold
+// it". `getAtF32` would restore the trailing width and reads worse, so the medial
+// width is the trade, recorded here the way `store8`-against-`loadI8` is recorded
+// above.
+//
+// SELF-FIRST IS NOMINAL HERE. `base` leads, matching `setF32(self, i, v)` and
+// `storeF32(self, off, v)`, but the convention's PURPOSE — exports that read as
+// UFCS methods — is out of reach: an i32 is not a UFCS receiver, so
+// `pxBase.getF32At(n, i)` is unspellable. Kept anyway for uniformity with the tier
+// these mirror, the same call `bufferMark()` / `bufferRelease(mark)` makes.
 //
 // No `I64View`/`F64View` twin exists yet, so these cover the two widths the view
 // tier ships. Each is the body of its view accessor with the two field reads
 // replaced by parameters — same trap order, same address arithmetic.
 
+// `f32base(v)` — the branded base of an f32 view, for the accessors below. This is
+// the ONLY public way to mint an `F32Base`, which is what makes the brand carry
+// PROVENANCE as well as width: a base that came from here was validated by
+// `view4Base` when the view was constructed.
+export function f32base(self: F32View): F32Base { return self.base as F32Base }
+
+// `i32base(v)` — the i32 twin.
+export function i32base(self: I32View): I32Base { return self.base as I32Base }
+
 // Element `i` of the f32 extent `[base, base + length*4)`. Traps on an index
-// outside `[0, length)`. `base` must be the address of element 0 —
-// `byteAddrF32(v, 0)`.
-export function getF32At(base: i32, length: i32, i: i32): f32 {
+// outside `[0, length)`. `base` comes from `f32base(v)`.
+export function getF32At(base: F32Base, length: i32, i: i32): f32 {
   if i < 0 { __trap__() }
   if i >= length { __trap__() }
-  return __load_f32__(base + (i << 2))
+  return __load_f32__((base as i32) + (i << 2))
 }
 
 // Write element `i` of the f32 extent `[base, base + length*4)`. Traps on an
 // index outside `[0, length)`.
-export function setF32At(base: i32, length: i32, i: i32, v: f32) {
+export function setF32At(base: F32Base, length: i32, i: i32, v: f32) {
   if i < 0 { __trap__() }
   if i >= length { __trap__() }
-  __store_f32__(base + (i << 2), v)
+  __store_f32__((base as i32) + (i << 2), v)
 }
 
 // Element `i` of the i32 extent `[base, base + length*4)`. Traps on an index
-// outside `[0, length)`. `base` must be the address of element 0 —
-// `byteAddrI32(v, 0)`.
-export function getI32At(base: i32, length: i32, i: i32): i32 {
+// outside `[0, length)`. `base` comes from `i32base(v)`.
+export function getI32At(base: I32Base, length: i32, i: i32): i32 {
   if i < 0 { __trap__() }
   if i >= length { __trap__() }
-  return __load_i32__(base + (i << 2))
+  return __load_i32__((base as i32) + (i << 2))
 }
 
 // Write element `i` of the i32 extent `[base, base + length*4)`. Traps on an
 // index outside `[0, length)`.
-export function setI32At(base: i32, length: i32, i: i32, v: i32) {
+export function setI32At(base: I32Base, length: i32, i: i32, v: i32) {
   if i < 0 { __trap__() }
   if i >= length { __trap__() }
-  __store_i32__(base + (i << 2), v)
+  __store_i32__((base as i32) + (i << 2), v)
 }
