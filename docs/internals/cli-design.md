@@ -200,11 +200,25 @@ the corpus-oracle gate was added to backstop, and **the oracle is doing its job*
 every `publish-seed` run since #1848 has failed there, on `@hint`/`@error` cases whose
 expected text contains an em dash (U+2014 arriving as its low byte, 0x14).
 
-**It cannot self-heal.** The warm path (cache restore-keys) and the cold path
-(`fetch-seed.sh`) both hand back the same generation-1 artifact, and a generation-1
-seed cannot bootstrap generation-2 source through a generation-2 host. Recovery is a
-one-time manual publish of a seed built by a matching host; the self-perpetuation
-works again afterwards.
+**Why it could not self-heal — and it was not what it looked like.** Both inputs were
+generation 1: the warm path replayed the workflow's own cached seed and the cold path
+fetched `seed-latest`. But the reason the cache never refreshed is that **the two
+workflows keyed the same artifact into different namespaces** — `publish-seed` on
+`vl-seed-`, `ci` on `vl-seedpair-`, over the identical `hashFiles('compiler/*.vl')`
+input. Nothing but `publish-seed` ever wrote a `vl-seed-` entry, and it only writes one
+when it SUCCEEDS, so a single failure froze the namespace at 2026-08-23 21:01 and every
+later run restored that same frozen entry by restore-key.
+
+Meanwhile `ci.yml` was passing **this very same corpus oracle on the very same commits**
+off its own healthy `vl-seedpair-` entry. The source was never sick; only this job's
+bootstrap input was, and the two jobs could not see each other's seeds.
+
+**The fix is structural, not manual:** share the namespace. `ci` refreshes the seed on
+every non-docs push, so a failure here can no longer freeze the input this job
+bootstraps from, and the first green run re-points `seed-latest` through the full gate —
+which repairs the cold path too. It costs no soundness: the fixpoint, the corpus oracle
+and the native suites still gate whatever is restored, which is exactly how the stale
+entry was caught rather than published.
 
 **What the stamp would have changed.** Nothing about the corruption — it would have
 refused to produce it. The host check names both generations at the FIRST bootstrap
