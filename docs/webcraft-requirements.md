@@ -1089,6 +1089,37 @@ and needs nothing from vl beyond scalar exports.
   > (a multi-pattern arm gets no then-narrowing, so `scrut.x` cannot type), a
   > duplicate binding, a body declaration shadowing a binding, and an unknown field.
   > `docs/internals/match-design.md` is the design record.
+- **A MAP MISS NARROWS AS PRESENT for a numeric value type — filed 2026-08-25, NOT an
+  ask, found while working A3 and reported because it is on your path.** wc3's
+  fourCC rule tables are `{[i32]: i32}`, and this is what reading one back does:
+
+  ```vl
+  const m: {[string]: i32} = Map()
+  m["a"] = 7
+  const v: i32 | null = m["nope"]
+  if v is i32 { print("PRESENT") } else { print("absent") }   // prints PRESENT
+  ```
+
+  > A silent wrong answer, `vl check`-clean, in the spelling the compiler's own
+  > diagnostic recommends (*"narrow it first, e.g. `if v is i32 { print(v) }`"*).
+  >
+  > **`.has(k)` and `m[k] ?? d` are both CORRECT** — they probe the entry table — and a
+  > HIT is correct. Only the narrowing spelling lies, so **the workaround is to use
+  > `?? default` or `.has` and not `is`** on a numeric-valued map until this is fixed.
+  >
+  > **It follows the rep split**, which bounds it: `boolean` (an i32 sentinel), `string`
+  > and a STRUCT value (both refs) all carry a representable absent and answer
+  > correctly. `i32`/`i64`/`f64`/`f32` are the box widths, and for them there is no box
+  > at all — `emitMapGet`'s own comment says a miss yields "the rep's empty value: 0.0
+  > for an f64 map, 0 for an i64 map", so the `| null` in the type has no runtime
+  > representation and `is V` is trivially true.
+  >
+  > **Not scheduled, because the fix is a ruling rather than a patch:** making it
+  > correct means routing a scalar-valued map read through the union-box path whenever
+  > it is consumed as a nullable, which ALLOCATES on every such read — on the hot path
+  > of the exact rule-table code the map tier exists for. Correctness versus cost, and
+  > it wants a decision before code. Pinned as a running witness by
+  > `tests/cases/soundness/xfail-miscompile-map-scalar-miss-narrows-present.vl`.
 - **Literal-union compact representation** (A16 remaining): order/state enums
   stored as i32 tags rather than softened values — mostly a memory nicety
   since authoritative enums live in Buffers anyway.
