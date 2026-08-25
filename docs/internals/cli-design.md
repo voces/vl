@@ -175,6 +175,43 @@ because it was designed for graceful probing.
 **A seed exporting nothing here predates the stamp**, which is the exact vintage
 that produces the bug, so absent counts as a mismatch rather than a pass.
 
+#### The generation gap took the seed-publish pipeline down (2026-08-25)
+
+Recorded because it is the ask's own bug, happening to the project's own release
+pipeline, and because the workflow's comments asserted it could not.
+
+`seed-latest` is pinned at **`a45c4843`** — the commit immediately BEFORE #1848, so
+it speaks **generation 1** while every current `vl` binary speaks generation 2.
+`publish-seed.yml` bootstraps by self-compiling current source with that seed:
+
+```
+$ vl check x.vl --compiler <released seed-latest>
+[^@^@^@H^@^@^@I^@^@^@N^@^@^@T^@^@^@]^@^@^@:^@^@^@ ...
+```
+
+Raw UTF-32LE, at exit 0. Reproduced directly, not inferred.
+
+**The fixpoint does not catch it, and the workflow said it would.** Its comment read
+*"the fixpoint step re-proves it regardless, so a cache hit never weakens the gate."*
+The corruption is SELF-CONSISTENT — stage1 is built with mangled string literals,
+stage2 and stage3 inherit them, and `stage3 == stage4` holds byte-for-byte over a
+compiler that miscompiles. This is precisely the "fixpointing-but-miscompiling seed"
+the corpus-oracle gate was added to backstop, and **the oracle is doing its job**:
+every `publish-seed` run since #1848 has failed there, on `@hint`/`@error` cases whose
+expected text contains an em dash (U+2014 arriving as its low byte, 0x14).
+
+**It cannot self-heal.** The warm path (cache restore-keys) and the cold path
+(`fetch-seed.sh`) both hand back the same generation-1 artifact, and a generation-1
+seed cannot bootstrap generation-2 source through a generation-2 host. Recovery is a
+one-time manual publish of a seed built by a matching host; the self-perpetuation
+works again afterwards.
+
+**What the stamp would have changed.** Nothing about the corruption — it would have
+refused to produce it. The host check names both generations at the FIRST bootstrap
+step, instead of surfacing three steps later as an em-dash diff in a corpus fixture,
+over a candidate seed that should never have been built. That is the whole argument
+for the check being an error rather than a warning, and it is no longer hypothetical.
+
 The set is deliberately tiny and grows only when a subcommand needs a genuinely
 new capability. Diagnostics print on stderr (`CMD_PRINT_ERR`); program output and
 formatted source print on stdout.
