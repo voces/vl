@@ -21962,18 +21962,17 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       if cty >= 0 {
         const ct = T.tys[cty]
         if ct is TyUnion { return true }
-        // `x as? Shape` records `Shape | null` — a `TyNullable` over the union. Its rep is
-        // still the BOX (a non-null box carrying `nullBoxTag()` for the absent case), so
-        // every box consumer must see it as one; reading only the bare `TyUnion` here left
-        // the coalescing form of the sub-union cast classified as "not a union", and its
-        // `!= null` then fell out to the scalar compare and emitted an untyped `null`.
-        if ct is TyNullable {
-          const cin = ct.nInner
-          if cin >= 0 {
-            const cit = T.tys[cin]
-            if cit is TyUnion { return true }
-          }
-        }
+        // `x as? T` records `T | null`, and for a SUB-UNION or a NUMERIC arm that is still
+        // a BOX — a non-null box carrying `nullBoxTag()` for the absent case — so every box
+        // consumer must see it as one. Reading only the bare `TyUnion` here left the
+        // coalescing forms classified as "not a union", and their `!= null` fell out to the
+        // scalar compare and emitted an untyped `null`.
+        //
+        // `nodeTyIsUnionAlias` rather than a hand-rolled `TyNullable` test: its third arm is
+        // already exactly this question — a nullable whose inner is a value-union box OR one
+        // of the four numeric primitives — so `Shape | null` and `i32 | null` are one answer
+        // from one predicate instead of two spellings of it that can drift apart.
+        if nodeTyIsUnionAlias(exprIx) { return true }
       }
     }
     return false
@@ -22348,6 +22347,20 @@ function paramUnionRetName(fnIx: i32, name: string) {
 export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return "" }
   const e = P.nodes[unwrapParen(exprIx)]
+  // `x as? T` whose result is a BOX (`i32 | null`, `Shape | null`) — the binding it
+  // initializes needs the union NAME, because that is what the narrow/unbox tables key on:
+  // without one, `if c != null { return c }` leaves the raw box on the stack where the
+  // return wants the arm (`expected i32, found (ref $type)`, at `vl check` rc 0). The name
+  // is the cast node's own recorded type rendered in the emitter's vocabulary — the same
+  // rendering the equivalent ANNOTATION would produce, so the two spellings key the same row.
+  if e is AsExpr {
+    const acn = tyToEmitName(nodeTyIxOf(unwrapParen(exprIx)))
+    if acn != "" {
+      if isValueUnionName(acn) { return acn }
+      if isUName(acn) { return acn }
+    }
+    return ""
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
