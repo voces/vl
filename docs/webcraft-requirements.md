@@ -1152,6 +1152,48 @@ and needs nothing from vl beyond scalar exports.
   stops reading as vl backlog: the text above says "not requested now", and P0 (the
   thing that unlocks it) is now complete. Re-open it when a pathing or hash kernel
   actually wants v128 and it becomes a real requirement with a shape.
+- **`shared` linear memory (webcraft A5)** — *"not yet, but tell us before it is hard to
+  change"*. **ANSWERED 2026-08-25, all four halves measured rather than reasoned.** Nothing
+  is being built; this is the answer the ask asked for.
+
+  > **1. `--closed-world` soundness is NOT disturbed. Measured.** The release profile
+  > (`--closed-world -O3 --gufa -O3`, plus `--enable-threads`) over a memory-using module and
+  > its shared twin produces output **identical apart from the memory declaration line** —
+  > 164 vs 166 bytes, the two extra bytes being the max and the shared flag; same allocation
+  > count, same `memory.grow`, an empty diff once that one line is excluded. That is the
+  > expected result for the right reason: `--closed-world` is a WasmGC TYPE-refinement
+  > assumption, linear memory is not a GC type, and the invariant it rests on (DECISIONS H6 —
+  > no GC type reaches an import or export) is untouched by sharing the memory. Your question
+  > was the right one to ask, and the answer is no.
+  >
+  > **2. The MAX is the real cost, and it is the part that is genuinely hard to change later.**
+  > VL emits limits flag `0x00` today — **min 1 page, NO max** (`emit_sections.vl`) — and
+  > `std:buffer` grows lazily against a 2 GiB overflow guard rather than a declared ceiling. A
+  > shared memory must use flag `0x03` and declare a max, so the sim's linear-memory ceiling
+  > stops being "whatever the host will give you" and becomes a **number chosen at build time
+  > and visible in the module's contract with its host**. That is the one thing to decide
+  > deliberately before M8 rather than after; everything else here is reversible.
+  >
+  > **3. The seed's own build IS affected, so this must be a per-build FLAG, not an emitter
+  > default.** The compiler seed uses linear memory itself — `(memory (;0;) 1)`, exported —
+  > for the `ioMem` staging window. A blanket change would make the seed's memory shared,
+  > forcing a max on it and requiring every host that loads it to enable the threads proposal.
+  > The precedent is already in the tree: `--names` is opt-in for exactly this shape of reason,
+  > and a default build stays byte-identical. Expect `vl build sim.vl --shared-memory=<pages>`
+  > or similar, not a global flip.
+  >
+  > **4. The `vl` host refuses a shared memory today**, and it is worth knowing it is not free:
+  > `shared memory support is disabled for this engine -- see Config::shared_memory`. One
+  > wasmtime `Config` line, but a real host change that has to land with the flag.
+  >
+  > **One consequence in your favour, flagged as UNVERIFIED HERE.** P0.2 documents that a
+  > `memory.grow` **detaches every host view** (`byteLength` goes to 0; a JS host must re-take
+  > its typed arrays after any allocating call), and that hazard is asserted by test. Growing a
+  > SHARED memory is defined not to detach — the SharedArrayBuffer grows in place — so going
+  > shared would remove that whole class of staleness bug for the render thread rather than
+  > add to it. That is read off the threads proposal, not measured here (this tree's host will
+  > not instantiate a shared memory yet), so treat it as a reason to want this, not as a
+  > result. Worth re-deriving when M8 actually starts.
 - **Guest profiling parity in browser**  ✅ **ANSWERED (no vl change)**: `VL_PROFILE_GUEST`
   exists for wasmtime; in-browser we'll use DevTools + the names section. ~~Ask is only:
   keep emitting a names section on non-`-O` builds.~~ **There is no such state to
