@@ -37,264 +37,30 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ## Next (highest leverage)
 
-> **#1 priority — destringify types (`docs/internals/destringify-types-program.md`).** The 2026-07-25
-> discovery census measured **2,414 type-string operations** still live — *under its own vocabulary*:
-> 222 discovered resolvers + any character-literal comparison + whole-spelling structure equality
-> (1,435 resolver calls · 931 inline surgery · 48 whole-spelling), **703 of them distinct consumer
-> decisions**. Quote that number *with* its denominator or not at all — the old SCORECARD list covered
-> 38% of one column and 0% of another, which is why every prior "we're done" verdict was premature.
-> The single highest-value target: **`nameToTy` is the checker's SECOND recursive-descent type parser**
-> (~150 ops), and its bank is already shipped and proven — #1117's spelling tree probed at **0
-> disagreement over 319,945 comparisons**. #1129 measured away the prerequisite that was thought to
-> gate it: the canon pass runs at the *end* of `checkProgram`, so it cannot reach a checker-time
-> resolution (333,073 reads · 0 stale · 0 missing). `tsToTy` is the whole remaining cost.
-> *(This line used to end "…and still completely unread — `typecheck.vl` does not contain the string
-> `annTs`". **That is false and has been since #1288**: `annTs` occurs 9 times in `typecheck.vl` today,
-> and the tree is read at five live sites — `annotResolve(name, annTsOf(ann))`, `isTypeTy`, the
-> field-declaration resolve, `canonEmitNameTs`'s `TypeRef` arm (#1294) and `tsMapKeyNodeOf`. The bank
-> is PARTLY read; what remains unconverted is `nameToTy`'s own descent, not the plumbing. Re-derive a
-> claim of the form "file X does not contain string Y" before quoting it — `grep -c` is the whole
-> cost.)*
+> **Destringify types — CLOSED, nothing to schedule.** Verified 2026-08-25 against the programme's
+> own standing check (`docs/internals/destringify-types-program.md` § "How to verify"): both greps
+> pass. Do not re-open it from a stale call-site census; run that check first.
 >
-> **THE EMIT-SIDE / CHECKER-SIDE FRONTIER IS TRACKED PER BUCKET IN THE PROGRAMME DOC**, with the
-> populations re-derived on each slice's own base (they drift, and three consecutive slices found the
-> filed *unit* wrong rather than the filed number).
+> **The one forward question it leaves, stated and unstarted:** the emitter's registries are keyed on
+> the canon-SOFTENED spelling because that is the REP, not the type. Re-keying them on the precise
+> type would change what the rep layer decides on — a DESIGN change to what the arena records, not a
+> call-site conversion. Unpriced.
 >
-> **THE UNIT IS WRONG AGAIN, AND THIS TIME IT INVERTS THE RANK ORDER (#1327).** `resolveAnnot` has
-> carried a name-keyed memo since #961 — the source says so in as many words: *"Only the MISS path
-> resolves, so only the miss path reads the tree."* Every scorecard in this programme has counted a
-> memo HIT and a real parse as one "reach", and **80.3% of emit-side reaches are hits**: 15,901
-> reaches are **3,031 parses**. Split that way the frontier reorders — `fieldElemTyIxOfName` is
-> 6,812 reaches but only **514 parses (7.5%, the LOWEST rate of the seven rows)**, dropping it from
-> 1st to 3rd, while `unMemAtomTyIx` is 1,991 reaches and **1,229 parses (61.7%)**, making it **first
-> at 40.5% of all emitter parsing**. *Five consecutive slices (#1291 → #1300) drove the row that asks
-> the annotation grammar least often per reach.* Rank by PARSES from here; the reach column is a
-> cache-hit census. (Row 4 is 1c below, which is design-blocked on W9 — so the honest reading is that
-> the top-by-parses item is blocked and the programme's remaining emit-side parsing is ~3,031 ops,
-> not ~15,901.) Note also the compiler's own 39k lines make the entire emitter parse **24** spellings.
->
-> **#1331 ADDS THE THIRD COLUMN AND IT REFUTES #1327's OWN GATE.** #1327 warned that replacing a
-> parse is a REP CHANGE, because a first-in-program resolution mints a `T.tys` entry and skipping it
-> renumbers the arena. Measuring what each parse actually MINTS: **1,342 of the 3,031 mint nothing**,
-> so that hazard governs less than half the population. `declTyIxOfName` — one home for the
-> `cUserTypes`-then-grammar bridge, with `fieldElemTyIxOfName` delegating and rows 6/7 gaining rung 1
-> — takes the emitter **3,031 → 2,800 parses (−7.6%)** at **+10 bytes**, corpus A/B 1,727/1,727
-> identical and fuzz 12,480/12,480 identical. *Measure the mint, not just the parse.*
->
-> **#1332 TAKES THE EMITTER TO 1,846 PARSES (−34.1% in one slice) AND REFUTES THE CANON RECORDER A
-> SECOND TIME, ON REP GROUNDS.** Row 4 `unMemAtomTyIx` — first by parses at 1,229 — falls to **426**.
-> The briefed remedy was a recorder written by canon, and the 444/761 checker-vs-bridge disagreement
-> DOES reproduce (as **489 of 709, 69.0%**) — but re-deriving it with the arena KIND on both sides
-> changes what it means: **every disagreement but two is a `TyLit` read as its `TyPrim` base scalar**
-> (188 str · 14 int · 3 flt). That is a literal union's BOX REP, not an incidental spelling rewrite,
-> so a canon recorder would hand the box-tag ABI a literal type where a scalar rep is required.
-> *The disagreement is a rep decision, not a staleness bug.*
->
-> What shipped instead came from bucketing the row's parses **by TEXT**, which no prior slice had
-> done: 804 of the 1,229 mint nothing, and **803 of those are a bare primitive keyword**. So the
-> majority needed a RUNG, not a recorder — `typecheck.primTyOfName`, already one of the three leaf
-> rungs both resolvers bottom out at, is now exported and asked between the declared-name table and
-> the grammar. The residue is **426, of which 425 MINT** — the row is now, to within one parse,
-> exactly the population whose skipping would renumber the arena. **−137 bytes.**
->
-> Two instrument findings from it, both worth carrying: **the corpus A/B is VACUOUS for this family**
-> (a sabotage emitting an invalid module moves 0 of 1,727 corpus files on all six channels while
-> moving 2,373 of 10,800 fuzz programs — the usual asymmetry runs backwards), and **`tErr` dedupes
-> exact repeats**, so a probe reporting through the diagnostic channel silently reports a distinct-
-> value SET rather than a count (a first census read 481 for a population of 1,229).
->
-> **THE NAME-SHORTCUT ROUTE IS EXHAUSTED (#1334). Both remaining rows are untakeable, for OPPOSITE
-> reasons, and the emit-side total stays 1,846.**
-> - **Row 2 `sTyIxOfNameTy` — the parse IS the mint.** 0 of 402 parses are arena-neutral (918 entries
->   minted), and there is no text class to exploit: **282 distinct spellings for 402 parses**, head
->   `{v:i32}` at 4.0%. That flatness is structural — the site is guarded by `nameIsShapeSpanEnds`, so
->   every spelling reaching the grammar is an inline shape **whose arena type does not exist until
->   this call creates it**. There is no bank to read and no rung to add, at any price.
-> - **Row 1 `repElemKeyOfNameTy` — its arena-neutral half IS the rung already refused here.** Of 463
->   parses only 126 are mint-free, and **111 of those (88.1%) are exactly the `cUserTypes` rung
->   #1331 declined over the `FView` newtype.** Taking it buys 111 parses for a silently re-keyed
->   ref-list row. Residue: 15 parses, 0.8% of the total.
->
-> **A NEW SOUNDNESS RULE, and it is the reusable part.** Row 1's by-TEXT head is not the declared
-> names — it is six PRIMITIVE-ARRAY spellings (`i32[]` 36 · `string[]` 12 · `f64[]` 11 · …), which
-> have exactly the closed-key-space property that made #1332's `primTyOfName` rung sound. And **70 of
-> those 70 MINT.** #1332 was arena-neutral because the arena *seeds* `i32`; nothing seeds `i32[]`.
-> *A closed key space is NECESSARY AND NOT SUFFICIENT — the second precondition #1332 satisfied by
-> accident is that the arena already holds the answer at a stable index.* Check both before reusing
-> that pattern.
->
-> Also refuted: the "double resolution" hypothesis briefed for row 1. `resolveAnnot` memoizes per
-> spelling, so the intern's key call and `fieldElemTyIxOfName(stored)` ten lines later share one memo
-> entry — **463 is already the deduped count** and no reordering removes it.
->
-> **What moves next is not a shortcut but the ARENA-INDEX THREADING** (D-INLINESHAPETY /
-> D-REPELEMTY): relocating parses to callers that already hold the index rather than removing them.
-> #1331 measured that population at 18 of 1,064 at row 2 — small, so price it before scheduling.
->
-> **And the briefed target was refuted by its own witness.** Row 1 `repElemKeyOfNameTy`'s FIND rung 2
-> parses **0 times in 237 reaches** — all 463 of its parses are at the INTERN, and 457 of them are
-> immediately followed by a row mint resolving the same spelling. Its one arena-neutral shortcut
-> disagrees on **4 of 976** covered memo-HIT reaches, every one the newtype `FView` in
-> `memory/newtype-struct-views-distinct.vl`, where the two indices key different `repElemKey`s.
-> **Filed latent defect**: `fieldElemTyIxOfName` already has that rung and therefore records a
-> different `rlElemTyIx` for `FView` than its own interner keyed — inert *only* because rung 2
-> answers zero times. A newtype over a struct is the shape that separates arena-index identity from
-> rep identity; any future rung here must be graded against it.
->
-> Four standing corrections that outlived the slices that made them:
-> - **1c `unMemAtomTyIx` — a checker-side recorder is REFUTED, not merely unscheduled** (#1294 §8).
->   The checker and the emitter's bridge resolve the same union member and disagree on **444 of 761**
->   comparable atoms, because `canonEmitTypeNames` rewrites the spelling in between. A recorder at the
->   checker's union registration would ship green (it is write-only) and be wrong the moment anything
->   read it. The recorder has to be written by whoever performs the rewrite — canon — which is W9.
-> - **1c `sTyIxOfName` — filed to the EMITTER by #1294, and the emitter route is 14 reaches, not
->   1,064** (#1297). All 1,064 resolutions do come from one function, `internInlineShape`; split by
->   that function's SIX callers, only the two variant-field-table sites hold the D5 column the filing
->   named. 1,046 arrive through `internShapeDeep`'s peeled leaf, `internFuncTypeShapes`, the nested-
->   field recursion and `internShapeFieldElems` — each of which CUT `nm` out of a larger spelling, so
->   no caller banks the cut. The 14 shipped; the rest waits on the mono-clone `nodeTyIx` item.
-> - **1a `mvSlotOfValNameTyK` — 61% of the "largest routable population now standing" is two rows the
->   programme had ALREADY refuted** (#1301). #1297's bonus census is exact (4,677 reaches at one
->   FIND) and its availability claim is not: bucketed by CALLER, 2,042 are `letMapShapeOf` and 812
->   are `collectA`'s `TypeRef` walk — D-MAPNODETY §3a/§3b, both re-measured to the same entry here
->   (D3 = 128 · D2 = 2). Neither is a routing problem: the first needs the alias identity in the emit
->   spelling, the second needs the intern and the lookup split into two functions. *A bucket's SIZE
->   and its AVAILABILITY are independent facts; check a new census against the refutations already in
->   the document before filing it as work.*
-> - **bucket 3 is `monoInferListElem` / `monoInferLocalScalar`, not `inferListElemName`** (#1294 §6) —
->   a function name that never existed in the tree, carried through four slices against a count that
->   was exact. Its producer `pinned` is built by string surgery in `emit_mono.monoInstanceFor`, so the
->   route is one commit spanning `typecheck.vl` + `emit_mono.vl`, not an emitter-only move.
-> - **B2 is a strict SUBSET of B3, the G class is ZERO, and 80 of B3's 136 rows are not a
->   disagreement at all** (post-preserve P1, off `c7301d3a`). Joined PER RECORD rather than compared
->   as two class tables: `B2-only` = **0**, so B3 = B2's 39 + 97, and the 97 split into **80
->   PARAM-INST** (the annotation is a generic type PARAMETER — `nameToTy` cannot resolve it and
->   `nodeTyIxOf` returns the clone's instantiation; 49 of 49 files are `tests/cases/generics/*`) and
->   **17 SHADOW** (3 files, all named `generics/type-param-shadows-*.vl`). **G — "the generic
->   application the arena cannot spell", 114 rows at `8c22fa06` — is 0**: #1274's `genAppNameOfTy`
->   closed it, and the nine rows that still hold that PAIR of spellings have swapped sides (canon
->   expands, the renderer names) and are class T. So B2/B3's schedulable content is **TRANSP 19 ·
->   ~~LINSOFT 7~~ · UCOLL 4 (terminal by design) · UEXP 2 · ISECT 2 · TRANSP-INV 1**, and TRANSP is the
->   one with a measured emitter cost — **26 duplicate `uVariants` rows in 16 corpus programs**, one
->   layout under two names, each an extra entry in the base of all three tag bands. *Do not quote a
->   B3 total as a defect count; join it to B2 per record first.*
->
->   **LINSOFT IS CLOSED (2026-07-29, off `81f47aaf`) and B2's residue is 28.** Both renderers gained
->   the un-aliased inline litunion spelling (`litUnionInlineNameOfTy`, the arena twin of canon's
->   `litUnionPreserve` / `nulLitUnionPreserve` pair), so the class reads **0 on B2 and B3** — 11 rows
->   on the shipped corpus, 7 owned by the `ctxKeepsLitUnion` leg and 4 by the `| null` leg, an exact
->   partition proved by deleting each. The registration key that moved is the **STRUCT LAYOUT row**,
->   countable off the module: master interns 42 rec-group heap types for the grown fixture where the
->   head interns 41, and the one that vanishes is the string-field twin of an atom-field struct. Two
->   `vl check`-clean invalid-wasm shapes close with it (a lambda's inferred return, a closure-valued
->   map). *Its published direction column was wrong too — all 7 rows are `REND-ONLY`, not
->   `6 REND-ONLY, 1 BOTH`; the class totals only close with seven.*
->
->   **TRANSP IS HALF CLOSED (2026-07-29, off `8970dea6`) AND TWO OF THE LINES ABOVE ARE REFUTED.**
->   *(a)* The filing's "TRANSP needs W9's `renderEmit` plus the #1122 ruling" is wrong at the
->   ruling: #1122 says the transparent alias must render STRUCTURALLY *because* `collectU`
->   registers it as a one-variant union and pushes the member's name into `uVariants` — and under
->   that same ruling the alias is not a union, so the row was never owed. `collectU` skips it now
->   (`isTransparentObjAlias`) and the member renders as its declared NAME
->   (`transparentMemberEmitName`, read by canon AND the `is` rewriter). **B2 29 → 20, B3 127 → 120,
->   9 rows, and the two halves are inseparable — either alone is a cell DOWN.** Six positions of
->   `MyCat | i32` go from broken to running (2 silent INVALID WASM, 4 emit rejects), each landing on
->   its alias-free control's verdict. The remaining 10 TRANSP rows are the generic-APPLICATION and
->   map-value members; the application rung is BUILT and measured (B2 → 11) and blocked on ONE cell,
->   `fieldTypeCode`'s missing route for `type Holder = { c: Box<i32> }`, which is an emit reject on
->   master too. *(b)* **The "26 duplicate `uVariants` rows in 16 programs" is NOT TRANSP's cost.**
->   Joined on FILE against the B2 dump, TRANSP contributes **0 of the 26**: 17 are an INFERRED union
->   registered twice (the arena walk's structural spelling against the checker's reverse-mapped
->   `Cat|Dog` — a class the census structurally cannot see, since an inferred return has no
->   annotation), 7 are UCOLL or UCOLL-in-kind, 2 are UEXP. TRANSP's own duplicate row was in the
->   82-row "SAME spelling, by design" bucket the probe dismissed — `{MyCat}=(0:Cat)` beside
->   `{Cat|i32}=(1:Cat)`, two `Cat` rows where the first union does not exist. *Intersect the file
->   sets before inheriting a class attribution; two populations that read alike need not overlap.*
->
->   **THE INFERRED-UNION DUPLICATE IS CLOSED AND THE WIDENING SHIPPED (2026-07-29, off `8b7679c6`).**
->   The line above says the 26 duplicate rows are "17 inferred, 7 UCOLL, 2 UEXP". **The 17 is 11**,
->   and the correction comes from the producer itself: a ZZIRR probe (dump `inferRetTyAt` against
->   `reachRegisterName` at every inferred-return row) reads EMPTY on three of the eight programs the
->   17 was attributed to — they have no inferred return at all, and their 6 rows are the SOURCE
->   spelling one layout two ways (an inline-shape annotation beside a nominal `type` chain), the
->   UCOLL family one rung over. *An attribution by elimination is still an attribution; ask the
->   producer.* The 11 are gone (`inferRetArenaUnionIsDup`: where the arena walk's structural render
->   and the name fallback's nominal composite are two spellings of ONE union, the walk descends the
->   MEMBERS and the row is the name's) — **corpus TWO-spelling 26 → 15 over 5 files, 0 added, and
->   the 15 that remain are 4 UCOLL-in-kind + 3 UCOLL + 2 UEXP + those 6, every one terminal by
->   design or already filed.** The removal takes the inline-shape `is` spelling with it (the
->   duplicate's rows were what `is {meow: i32}` matched — the two-half trap, caught by an
->   `is`-spelling × union-PROVENANCE sweep, 3 cells DOWN), so the spelling is resolved at its
->   CONSUMER instead (`isVariantSpelling`, from the checker's banked `is` type through the same
->   reverse map that spelled the union's members). **That is 2 cells UP over master and it ends an
->   action at a distance**: on master `x is {meow: i32}` over a `Cat | Dog` binding compiled only
->   when the module happened to contain an unrelated inferred struct-union return. **S-WIDEN
->   SHIPPED**: the `TyObj` gate on the transparency skip is gone (`isTransparentAlias`), because an
->   EMPTY alias row still sets `uDeclared` and mints the union box — 37 corpus files, all smaller,
->   **−437 bytes**, 26 of them losing exactly that box; its widening-guard sweep is 19 member kinds
->   × 17 positions × {alias, control} = 608 cells with **0 run movement**, a 140-cell module-channel
->   reach, and an inverted control that reddens 11. **Filed, with a reproduction: an ARRAY LITERAL
->   of inferred-union elements still registers the structural spelling a second time** — a different
->   producer, identical on both compilers, and the next twin-row target.
->
->   **THE TWIN-ROW RESIDUE IS RE-DERIVED BY PRODUCER, AND THE FILED "ARRAY LITERAL" IS A BYSTANDER
->   (2026-07-29, off `187869b7`).** A site-attribution probe (ZZSITE — tag every registration walk
->   ROOT, log `(root, name)` at the funnel) says the second row comes from the `iru` loop, and the
->   smallest witness has NO ARRAY: any annotation that spells the union's nominal composite is
->   enough, because `inferRetArenaUnionIsDup` disqualified itself on `isUName(nm)`. That gate was
->   BACKWARDS — `isUName(nm)` TRUE means the row already exists, which is the strongest reason to
->   suppress the walk's structural second spelling, not to allow it. *A gate that asserts another
->   producer's behaviour must name the STATE it is asserting; these two readings differ only in
->   tense.* The gate is gone and `functions/inferred-union-one-row.vl` has its LIST and FIELD
->   positions back: **corpus TWO-spelling twins with those positions restored are 17 on master and
->   15 here.** The dedup exposed a **THIRD reader of the `is` spelling** (`monoStaticIsResult`'s
->   exclusion, which const-folded an inline-shape union test to FALSE once the duplicate row stopped
->   registering that spelling) — and applying #1309's rule there UNCONDITIONALLY costs **12 of 60
->   monomorphized-guard cells**, so it is scoped by `nodeTyIsUnion(receiver)`, the CHECKER's view
->   rather than the emitter's `exprUnion`. *A guard's blast radius is measured on the axis the guard
->   does not mention.* **THE RESIDUE IS NOW RULED, family by family**: 6 SOURCE-spells-it-twice + 3
->   UCOLL (the second row IS the union's second member) + 4 UCOLL-in-kind (per-union `uVariants`
->   slice entries) are TERMINAL BY DESIGN, and the 2 UEXP rows are **canon's, not the walk's** —
->   ZZLTN shows the arena renderer producing `AB|null` correctly and `canonEmitName` expanding it
->   structurally because `unionAliasMembers` renders through `tyToEmitName`, which makes
->   `types/nullable-union-alias.vl`'s own header stale. **Filed, not taken** (a canon union-arm
->   change in the twice-ruled Lsoft/PRESERVE region), together with a bigger one found by the grid:
->   **an UN-ANNOTATED array literal of union elements is silent INVALID WASM on master in every
->   shape measured**.
->
->   **THE UN-ANNOTATED ARRAY LITERAL IS CLOSED, AND ITS FILED ROOT CAUSE WAS STALE (2026-08-25).**
->   The 2026-07-29 filing named `arrLitIsRef`'s first-element syntax probe plus "the checker's
->   `nodeArrayElemName` having no `TyUnion` arm"; that arm has existed since the inferred-union work
->   landed, and `arrLitIsRef` has carried a union rung since then too. **The missing piece was the
->   ROW.** Every union-registration route runs off a SPELLING that appears in the source — a
->   `type U = A | B` declaration, an annotation the name/arena walks reach, an inferred RETURN, an
->   inferred `let` — and an un-annotated literal spells its union nowhere, so
->   `arrLitUnionElemName`'s `isUName` gate declined and the rung could never fire. Witness: adding
->   an unrelated `const dummy: i32 | string = 1` to `const xs = [1, "two"]` makes it run correctly
->   ON MASTER. `collectU` now registers the literal's element union under the classifier's own key,
->   the literal twin of the inferred-return and inferred-`let` loops beside it. *A rung that never
->   fires is not evidence that the rung is wrong.* Three failure modes, one row: `[1, true]` printed
->   `1` twice (silent wrong answer), `[1, "two"]` was check-clean invalid wasm, `[c, d]` hit
->   `struct array elements are not supported`. **The scalar classifiers were the second half**:
->   `arrLitIsStr`'s first-element probe claimed `["two", 1]`, and `arrLitIsF64`/`arrLitIsI64`'s
->   order-BLIND scans claimed `[2.5, "a"]` in BOTH orders — all three now decline a literal whose
->   recorded element is a registered value union, which is what makes the two orders one answer. A
->   litunion-alias arm (`K | f64`) is carved out and keeps its scalar path, which
->   `literal-unions/mixed-union-alias-member-preserves.vl` requires. Pinned by
->   `arrays/inferred-union-element-literal.vl`. **Residue, both loud and both pinned**: an
->   un-annotated NESTED literal with a union leaf (`[[1, "a"]]`) went from silent invalid wasm to
->   `nested arrays are not supported` — it joins the ref-inner class `arrLitIsRef`'s nested rung
->   already excludes, and a union leaf needs a ref-list-of-ref-lists element kind plus an inner row
->   at a strictly lower slot (`error-inferred-union-element-nested.vl`); and a LONE declared-struct
->   ident element (`const cs = [c]`) still rejects, because a one-member set is no union and no
->   first-element syntax probe sees a bare ident
->   (`error-inferred-union-element-lone-struct.vl`).
+> **Before scheduling any remaining boundary-parse cleanup**, ask B277's second question (does the
+> split relocate the work, or remove it?). `registerInlineUnion` is 8,696 reaches and was REFUSED on
+> exactly that ground — the measured win is 793 — and the tail below 1,300 has not been re-asked.
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 
 The first real downstream consumer, currently TS with a planned VL rewrite, has published a tiered
 ask keyed to **our own item IDs** (A14, A16, B6a, B15a, B-mem, B-hint). Its tiers are adopted as-is
 rather than re-derived. The forcing date is **M7** (the port begins); M2–M6 gate on nothing from us.
+
+> **No open ask as of 2026-08-25.** A1/A2 shipped, A5 answered, and every A3 row is shipped or
+> non-reproducing; only field-position UFCS remains and webcraft agrees our reject is right. Their
+> priority order lives in `~/webcraft/docs/design/vl-requirements.md` § "Remaining asks, prioritized"
+> — a different repo, and the authority. **Re-run an ask before scheduling it**: across two passes,
+> six rows filed here as live work were already fixed.
 
 **P0 — gates the port STARTING. The `Buffer` linear-memory tier (our B-mem, "one deliberate escape
 hatch"). ALL FOUR SHIP; this tier is CLOSED.** They were prerequisites for each other in practice,
