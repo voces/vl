@@ -276,7 +276,7 @@ unsigned variants `divU`, `remU`, `ltU/leU/gtU/geU` (`>>>` already exists).
 
 ## P1 — gates the port being good (perf + core ergonomics)
 
-### P1.1 Typed views over Buffer  ✅ SHIPPED, bracket included
+### P1.1 Typed views over Buffer  ✅ SHIPPED, bracket included — and ask A1 (the descriptor reload) is CLOSED
 
 ```vl
 const x  = buf.f32view(offset, count)   // F32View
@@ -297,6 +297,57 @@ ring and for the differential harness to diff columns.
 > ROADMAP B14's free INDEX OPERATORS, which are compiler lines and are general —
 > they land the bracket for every user type at once, not for views.
 > `buffer-design.md` §L, `index-operator-design.md`.
+>
+> **ASK A1 — the loop-invariant descriptor reload — is CLOSED, by the cheap fix you
+> named, and it is measured on YOUR kernel rather than on ours.** You wrote that
+> either repair worked and you had no preference; this is the scalar-argument
+> accessor, `std:buffer` only, zero compiler lines.
+>
+> `getF32At(base, length, i)` / `setF32At` / `getI32At` / `setI32At`. Each is the
+> body of its view accessor with the two field reads replaced by parameters — same
+> trap order, same address arithmetic, same `[0, length)` policy. Hoist once per
+> column (`const b = v.byteAddrF32(0)`, `const n = v.length`) and the loop body
+> holds no view reference at all.
+>
+> **The number, on the six-column integrator A1 was filed on** — `px py vx vy ax
+> ay`, four updates, twelve accesses per element, columns taken as parameters,
+> `-O3 --closed-world`, min-of-7 with an R=0 control subtracted:
+>
+> | spelling | `struct.get` per element | traps | ns/element |
+> | --- | --- | --- | --- |
+> | fenced `v[i]` | **24** | 24 | 6.345 |
+> | hoisted accessors | **0** | 24 | 1.964 |
+>
+> **3.23x, with every bounds trap intact.** Your own hand-hoisted twin measured
+> 2.40x and dropped the fence to get there; this beats that ratio and keeps the
+> check. The 24 is exactly two descriptor fields times twelve accesses, which is
+> the confound-free number you asked us to attribute against — we reproduced it
+> before changing anything.
+>
+> **The hazard, stated because it is why these are an opt-in and not the default
+> surface:** `base` and `length` are two loose i32s, so `getF32At(pxBase, vxLen, i)`
+> type-checks and fences against the wrong column. `v[i]` cannot be mispaired and
+> stays the recommendation for everything that is not a measured hot loop. The
+> argument for shipping them anyway is that the advice they REPLACE was worse —
+> `buffer-design.md` §M5 sent you to the bare intrinsics, which have no check at
+> all, in exactly the SoA code whose failure mode is a silent read of a neighbouring
+> column.
+>
+> **We did NOT do the "real" fix**, and the reason is measured rather than assumed.
+> Two candidate root causes were tested and both refuted: emitting the descriptor's
+> fields as IMMUTABLE (binaryen leaves all 24 reads either way) and building the
+> views inside a function rather than at module scope so Heap2Local could scalarize
+> them (identical, 28 reads both ways). So the reload is not a mutability or an
+> escape problem, and a vl-level LICM would not see it anyway — the field read lives
+> inside a std accessor behind a call boundary that only binaryen inlines. That
+> leaves a representation change, which is not warranted now that the surface fix
+> measures 3.23x.
+>
+> Pinned by `soa-view` / `soa-at` / `axpy-at` in
+> `tests/vl_buffer_view_bounds_shape_test.ts` (exact instruction-count goldens at
+> three rungs), `tests/cases/std/buffer-hoisted-accessors.vl` (every read written
+> both ways and compared), and two `@trap` files.
+> `docs/internals/buffer-design.md` §M8.
 >
 > ```vl
 > const x = buf.f32view(off, count)     // F32View
@@ -808,8 +859,25 @@ i32` or similar) closes it. Cheap, high-value for engine code.
 > Not in this phase, filed with reasoning in the design doc: generic newtypes
 > (`type Handle<T> = new …`), `x is EntityId` narrowing (a newtype has no runtime
 > tag by construction), and opting a newtype OUT of struct dedup for runtime
-> identity. Also worth knowing: a newtype cannot be a MAP KEY — but neither can a
-> plain alias, which is a pre-existing map-key-grammar gap, not this feature's.
+> identity.
+>
+> ~~Also worth knowing: a newtype cannot be a MAP KEY — but neither can a plain
+> alias, which is a pre-existing map-key-grammar gap, not this feature's.~~
+> **FIXED — re-run 2026-08-24. A newtype IS a map key today, and it BRANDS the
+> key**, which is more than the row asked for. webcraft's A3 names
+> `{[EntityId]: …}` as "the natural spelling for kernel side tables"; measured on
+> the tip, over `type EntityId = new i32`:
+>
+> | spelling | result |
+> | --- | --- |
+> | `const m: {[EntityId]: i32} = Map()` | declares |
+> | `m[e] = 3`, `m.set(e, 3)`, `m.has(e)`, `m.length` | all work |
+> | `for k in m` | iterates, `k` is an `EntityId` |
+> | `m[7] = 3` — a RAW i32 key | **rejected**: `map key must be EntityId, got i32` |
+>
+> That last row is the id-safety P1.5 exists for, now reaching the one position
+> that previously escaped it: a side table keyed by a bare integer no longer
+> type-checks. Pinned by `tests/cases/maps/newtype-key-annotation.vl`.
 
 ### P1.6 `vl test` (already designed) — ✅ SHIPPED
 
@@ -959,14 +1027,14 @@ and needs nothing from vl beyond scalar exports.
   >
   > **What is left, in the order it will bite you:**
   >
-  > - **A binding arm cannot sit in a `const` INITIALIZER.** `const r = match u { … }`
-  >   is fine while every arm is a single expression, but the moment an arm binds, the
-  >   desugar's prepended `const x = scrut.x` makes that arm a multi-statement block
-  >   and the if-EXPRESSION lowering refuses it:
-  >   `emitProgram: if-expression arm is not a single value`. It is an emit-time
-  >   error, not a checker one. The workaround is one line — declare the result
-  >   `let r = 0` and use the match in STATEMENT position, assigning in each arm —
-  >   but the value-position spelling is the one you will reach for first.
+  > - ~~**A binding arm cannot sit in a `const` INITIALIZER.**~~ **FIXED — re-run
+  >   2026-08-24, this no longer reproduces.** The witness this row carried
+  >   (`const r = match c { Move{x, y} => x + y, Attack{target} => target }`)
+  >   compiles and runs, answering 7 and 9. The `emitProgram: if-expression arm is
+  >   not a single value` reject is gone and the statement-position workaround is
+  >   no longer needed. This row was the one webcraft's A3 list called out as the
+  >   sliver most likely to bite the order pipeline, so it is worth saying plainly:
+  >   value-position `match` with payload binding works today.
   > - **Arm renaming** `Move{x: a}` — punning only. A parse error
   >   (`match payload binding must be a field name`), and the fix is one parser branch
   >   plus a formatter that prints `field: name` when the two differ.

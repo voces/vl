@@ -360,11 +360,14 @@ export function copyFrom(
 // and `length`, which binaryen hoists out of the loop only when GUFA can fold
 // them to constants — i.e. only when the program has one live view of the shape.
 // A two-view loop pays 7 field loads per element and runs 3.7x the hoisted
-// spelling. So the recipe for a kernel that has proved its own bounds is to take
-// the base and the count ONCE (`byteAddrF32(v, 0)`, `v.length`) and run the bare
-// intrinsics inside — measured identical to a hand-written raw kernel at EVERY
-// rung, no flag needed. `Buf`'s `loadF32`/`storeF32` are also still there, still
-// unfenced, and still take a byte offset.
+// spelling. THE ANSWER TO THAT IS NOW IN THIS MODULE and it does not cost the
+// fence: hoist the base and the count once and call `getF32At`/`setF32At` (the
+// last section below), which take them as scalars and keep the bounds trap. The
+// older advice — hoist the pair and run the BARE intrinsics inside — is still
+// available and still measures identical to a hand-written raw kernel at every
+// rung, but it throws the check away and the fenced hoist does not, so prefer the
+// accessors. `Buf`'s `loadF32`/`storeF32` are also still there, still unfenced,
+// and still take a byte offset.
 
 // The largest element count whose byte size fits in a positive i32, per width.
 // `count << 2` at 2^29 is already negative, so the count must be rejected BEFORE
@@ -481,4 +484,75 @@ export function byteAddrF32(self: F32View, i: i32): i32 {
 
 export function byteAddrI32(self: I32View, i: i32): i32 {
   return self.base + (i << 2)
+}
+
+// ── hoisted accessors: the same fence, without the per-access descriptor read ─
+//
+// webcraft P1.1's ask A1. The four functions above take the VIEW, so each access
+// re-reads that struct's `base` and `length` — and nothing hoists those reads out
+// of a loop. Measured on a six-column SoA integrator (four updates per element,
+// twelve accesses per trip) at the full release profile: **24 `struct.get` inside
+// the loop**, exactly two descriptor fields times twelve accesses. Binaryen folds
+// them only when GUFA can prove the program has ONE live view of the shape, which
+// a kernel with six columns does not.
+//
+// These four take the base and the length as SCALARS, so the caller hoists them
+// once — `const b = byteAddrF32(v, 0)`, `const n = v.length` — and the loop body
+// holds no reference at all. The same integrator rewritten against them reads
+// **0 `struct.get` inside the loop**, with the identical 24 traps and the
+// identical 8 loads / 4 stores. The fence is not what costs; the descriptor
+// reload is.
+//
+// THESE ARE STRICTLY SAFER THAN THE RECIPE THIS MODULE USED TO GIVE. The advice
+// in the section header above was to hoist `byteAddrF32(v, 0)` / `v.length` and
+// then run the BARE intrinsics inside the loop — which is fast, and which throws
+// the bounds check away entirely, in exactly the SoA code whose failure mode is a
+// silent read of a neighbouring column. These keep the check. A kernel wanting
+// the fast spelling no longer has to choose between the two.
+//
+// THE ONE HAZARD, stated because it is the reason these are not simply the
+// primary surface: `base` and `length` arrive as two loose i32s, and nothing ties
+// them to each other or to the view they came from. `getF32At(pxBase, vxLen, i)`
+// type-checks and fences against the WRONG column's extent. The view accessors
+// cannot be mispaired that way, so `v[i]` stays the default and these are the
+// deliberate opt-in for a measured hot loop — the same posture `Buf`'s unfenced
+// loads already have. Take both scalars from one view, on adjacent lines, and
+// treat the pair as one value.
+//
+// No `I64View`/`F64View` twin exists yet, so these cover the two widths the view
+// tier ships. Each is the body of its view accessor with the two field reads
+// replaced by parameters — same trap order, same address arithmetic.
+
+// Element `i` of the f32 extent `[base, base + length*4)`. Traps on an index
+// outside `[0, length)`. `base` must be the address of element 0 —
+// `byteAddrF32(v, 0)`.
+export function getF32At(base: i32, length: i32, i: i32): f32 {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  return __load_f32__(base + (i << 2))
+}
+
+// Write element `i` of the f32 extent `[base, base + length*4)`. Traps on an
+// index outside `[0, length)`.
+export function setF32At(base: i32, length: i32, i: i32, v: f32) {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  __store_f32__(base + (i << 2), v)
+}
+
+// Element `i` of the i32 extent `[base, base + length*4)`. Traps on an index
+// outside `[0, length)`. `base` must be the address of element 0 —
+// `byteAddrI32(v, 0)`.
+export function getI32At(base: i32, length: i32, i: i32): i32 {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  return __load_i32__(base + (i << 2))
+}
+
+// Write element `i` of the i32 extent `[base, base + length*4)`. Traps on an
+// index outside `[0, length)`.
+export function setI32At(base: i32, length: i32, i: i32, v: i32) {
+  if i < 0 { __trap__() }
+  if i >= length { __trap__() }
+  __store_i32__(base + (i << 2), v)
 }

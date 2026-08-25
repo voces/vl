@@ -2231,14 +2231,56 @@ For everything else, in the order the decisions get made:
    common case and it costs nothing worth naming.
 2. **`-O3 --closed-world` is not optional** — it is `vl build -O3`, it is a 3-6x swing over no
    flags on every fenced row, and `-O` gets a third of it. P1.3's ask, priced again here.
-3. **If the loop touches TWO OR MORE views of the same width, hoist.** That is the `axpy` row, that
+3. **If the loop touches TWO OR MORE views of the same width, hoist — and `std:buffer` now has the
+   hoisted spelling, so this is an import rather than a recipe (§M8).** That is the `axpy` row, that
    is the SoA integrate step, and the 3.5x is not the check — it is seven field loads per element
    that nothing removes. Hoisting recovers all of it. **And hoisting does not mean giving up the
-   fence**: hoist the base and the extent, then keep `if i < 0 { __trap__() }` /
-   `if i >= n { __trap__() }` in the loop over the hoisted `n`. Measured 0.543 vs 0.403 ns — 1.35x
-   for a full per-access fence, against 4.1x for the same fence taken through the accessors (M4).
+   fence**: `getF32At(base, length, i)` takes the pair as scalars and keeps both compares. Measured
+   0.543 vs 0.403 ns — 1.35x for a full per-access fence, against 4.1x for the same fence taken
+   through the accessors (M4).
 4. **If you ship a flagless build, prefer `v.getF32(i)` to `v[i]`** — 31% on `scale`. At `-O`/`-O3`
    the two are identical, so this is an edit-loop consideration only.
+
+### M8. The hoisted accessors — the fence without the reload, in std (webcraft A1)
+
+M4 named the descriptor reload as the cost and M5 item 3 gave the repair as a RECIPE: hoist the base
+and the extent by hand, then write the two compares out inside the loop. `axpy-fencedhoist.vl` is the
+control that proved it works, and its own header says it "is deliberately NOT a proposed API" — it is
+the experiment that a `getF32At(base, length, i)`-shaped std addition would turn on.
+
+**It turned on, and it shipped.** `std:buffer` exports `getF32At` / `setF32At` / `getI32At` /
+`setI32At`: each is the body of its view accessor with the two field reads replaced by parameters.
+Same trap order, same address arithmetic, same `[0, length)` policy.
+
+**The number, on the kernel A1 was actually filed on.** The `axpy` shape is two views and three
+accesses, which UNDERSTATES the reload — there the per-trip view-construction reads dominate. The new
+`soa` shape is webcraft's own six-column movement integrator (`px py vx vy ax ay`, four updates,
+twelve accesses per element, columns taken as parameters so construction stays out of the loop):
+
+| spelling | `struct.get` per element | traps | `f32.load` / `f32.store` | ns/element |
+| --- | --- | --- | --- | --- |
+| `soa-view` — fenced `v[i]` | **24** | 24 | 8 / 4 | 6.345 |
+| `soa-at` — hoisted accessors | **0** | 24 | 8 / 4 | 1.964 |
+
+**3.23x, with the fence fully intact** (min-of-7 interleaved, R=0 control subtracted, `-O3`). The 24
+is exactly two descriptor fields times twelve accesses. Both spellings print the same value, which is
+the cross-check that the kernel was not optimized away.
+
+For comparison, webcraft's own hand-hoisted twin — which drops the bounds check entirely and uses the
+bare intrinsics — measured 2.40x on their machine. The fenced hoist is not a compromise between the
+two; on this shape it beats the unfenced hand-roll's ratio while keeping every trap.
+
+**The hazard, and why these are an opt-in rather than the primary surface.** `base` and `length`
+arrive as two loose i32s and nothing ties them to each other or to the view they came from:
+`getF32At(pxBase, vxLen, i)` type-checks and fences against the wrong column's extent. The view
+accessors cannot be mispaired that way, so `v[i]` stays the default. The argument for shipping them
+anyway is that the advice they REPLACE was worse — M5's recipe sent an author to the bare intrinsics,
+which have no check at all, in exactly the SoA code whose failure mode is a silent read of a
+neighbouring column. These are strictly safer than what this document used to recommend.
+
+Pinned by `soa-view` / `soa-at` / `axpy-at` in `tests/vl_buffer_view_bounds_shape_test.ts`,
+`tests/cases/std/buffer-hoisted-accessors.vl` (every read written both ways and compared), and two
+`@trap` files for the two halves of the fence.
 
 ### M6. What this corrects
 

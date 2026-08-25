@@ -159,8 +159,30 @@ const TABLE: Record<string, Row> = {
   // check and its field reads, inlined into the driver's TRIP loop — per trip,
   // not per element, which is the limit of a loop-membership counter.
   "axpy-fencedhoist": { none: c(6, 1, 0), O: c(7, 0, 4), O3: c(7, 0, 4) },
+  // The control above, as a LIBRARY call rather than six hand-written compares:
+  // `getF32At`/`setF32At` shipped in `std:buffer` (webcraft A1). At `none` the
+  // traps sit in the callees, so this reads like `axpy-view`; what matters is the
+  // `-O3` cell, where the per-element reload is gone (7 -> 4, and those 4 are the
+  // view construction in the TRIP loop, exactly as on the `fencedhoist` row) while
+  // all six per-access compares survive.
+  "axpy-at": { none: c(0, 4, 0), O: c(2, 2, 4), O3: c(6, 0, 4) },
   "axpy-buf": { none: c(0, 4, 0), O: c(0, 2, 1), O3: c(0, 0, 1) },
   "axpy-hoist": { none: c(0, 1, 0), O: c(0, 0, 3), O3: c(0, 0, 3) },
+  // ── shape `soa`: webcraft's own six-column integrator (A1) ──────────────────
+  // The two-view `axpy` rows UNDERSTATE the reload, because there the per-trip
+  // view-construction reads dominate the per-element ones. This pair is the
+  // kernel A1 was actually filed on — six columns taken as PARAMETERS, four
+  // updates, twelve accesses per element — so `soa-view`'s `sget` is per-element
+  // and nothing else: 24, being two descriptor fields times twelve accesses.
+  //
+  // `soa-at` is the same kernel over the hoisted accessors. Its per-ELEMENT
+  // reload count is ZERO; the 12 it reports are the six bases and six lengths
+  // taken once at the top of the tick, which the driver's TRIP loop lexically
+  // contains — the same loop-membership limit called out on `axpy-fencedhoist`.
+  // Both rows keep all 24 traps at `-O3`, which is the point: the fence is not
+  // what costs.
+  "soa-view": { none: c(0, 13, 0), O: c(0, 12, 1), O3: c(24, 0, 25) },
+  "soa-at": { none: c(0, 13, 0), O: c(0, 12, 12), O3: c(24, 0, 12) },
   "rows-view": { none: c(0, 3, 0), O: c(2, 1, 2), O3: c(4, 0, 0) },
   "rows-buf": { none: c(0, 3, 0), O: c(0, 2, 0), O3: c(0, 0, 1) },
   "rows-hoist": { none: c(0, 1, 0), O: c(0, 0, 0), O3: c(0, 0, 0) },
