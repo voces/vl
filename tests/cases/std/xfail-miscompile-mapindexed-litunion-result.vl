@@ -1,0 +1,51 @@
+// @no-instantiate
+// MISCOMPILE, pinned: `std:array`'s `mapIndexed` when the CALLBACK'S RESULT `U` is a STRING
+// literal union. `vl check` exits 0, `vl build` writes the `.wasm` and reports success, and
+// the engine refuses the module at load —
+//
+//   type mismatch: expected (ref $type), found (ref $type)
+//
+// (the two `$type`s are different heap types; the disassembly names them apart.)
+//
+// THE RECEIVER'S ELEMENT TYPE IS IRRELEVANT, which is the whole reason this file exists and
+// is written over an `i32[]`. `i32` is on `std/array.vl`'s ADMITTED list, so a reader who
+// takes that list at face value concludes this program is fine. It is not. Measured across
+// the `T` × `U` grid:
+//
+//   T = `i32[]`         U = `"a" | "b"`   → invalid module   ← this file
+//   T = `string[]`      U = `"a" | "b"`   → invalid module
+//   T = `("a"|"b")[]`   U = `"a" | "b"`   → invalid module
+//   T = `("a"|"b")[]`   U = `"x" | "y"`   → invalid module (a DIFFERENT union)
+//   T = `i32[]`         U = `1 | 2`       → runs, correct    (a NUMERIC union)
+//   T = `("a"|"b")[]`   U = `i32`         → runs, correct
+//
+// So the predicate is `U` alone, and only for the STRING family.
+//
+// THE MECHANISM is a RESULT-LIST boundary, not the element-read one the rest of this family
+// turned out to be. `mapIndexed` builds a `U[]`, and a `U[]` over a literal union is an array
+// of interned i32 ATOMS (`ctxKeepsLitUnion` PRESERVES the members at `RC_ELEM`), while the
+// callback's declared result `"a" | "b"` SOFTENS to a string ref at `RC_ROOT` — so the value
+// the callback hands back and the slot the result list wants disagree, in the same direction
+// as every other cell of this family and at a boundary none of the element-read fixes reach.
+// The read boundaries were closed by giving three consumers a DECLARATION fallback
+// (`tests/cases/soundness/generic-litunion-element-bind-and-store.vl`); this one is the
+// `.push` into the freshly built result list, whose element rep comes from the instance's
+// `U`, and it has no such consumer yet.
+//
+// WHY IT IS A `@no-instantiate` AND NOT A FIX HERE: it is a different boundary in a different
+// ladder from the element-read family that closed, and the header of `std/array.vl` had it
+// mis-scoped ("only when the callback returns the ELEMENT type") until this grid was run. A
+// pinned witness is what stops the next rewrite of that header from guessing again.
+//
+// WHEN IT IS FIXED this file starts failing (the module instantiates), which is the point:
+// delete it, drop the carve-out from `std/array.vl`'s reach section, and fold a running row
+// into the `mapIndexed` coverage.
+import { mapIndexed } from "std:array"
+
+function toAB(x: i32, i: i32): "a" | "b" {
+  if x + i > 0 { return "b" }
+  "a"
+}
+
+const ns = [0, 1]
+print(ns.mapIndexed(toAB)[1])

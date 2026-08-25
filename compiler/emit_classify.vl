@@ -95,6 +95,7 @@ import {
   nodeArrayElemIsNulStr,
   nodeArrayElemIsStr,
   nodeArrayElemName,
+  nodeArrayElemTyIx,
   nodeEqCmpKind,
   nodeLitUnionMemberTexts,
   nodeNulLitUnionMemberTexts,
@@ -375,6 +376,7 @@ import {
   liKinds,
   liSlots,
   listIdxScratchBase,
+  localDeclIx,
   localIsRef,
   localLitUnion,
   localLoopIter,
@@ -5041,8 +5043,17 @@ export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
   localStructIdx.push(structIdx)
   localLoopVar.push(0)
   localLoopIter.push(-1)
+  localDeclIx.push(-1)
   localLitUnion.push(0)
   pos
+}
+
+// Pin the `LetDecl` that declared the slot, so a question only the DECLARATION can answer
+// resolves from the slot the scope stack hands out (`localDeclIx`'s header carries why the
+// name is not the key). The `LetDecl` twin of `markLoopVarIter`.
+export function markLocalDecl(slot: i32, declIx: i32) {
+  if slot >= 0 { localDeclIx[slot] = declIx }
+  0
 }
 
 // Mark the declared-local slot as a LOOP VARIABLE (a `for` counter / for-in
@@ -18649,6 +18660,129 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
   )
 }
 
+// ── THE DECLARATION FALLBACK, for a body whose EXPRESSIONS record nothing usable ─────────
+//
+// A monomorphized instance rebuilds only the STATEMENT SPINE; every leaf EXPRESSION node is
+// SHARED with the generic body (`monoCloneBody`'s own header says so), and the checker
+// recorded the GENERIC's types on those shared nodes. So inside an instance over
+// `("a" | "b")[]`, the receiver `self` still records `T[]` and `self[0]` still records `T` —
+// not absent, WORSE than absent: a type index ≥ 0 that answers the litunion question `false`.
+// A probe that short-circuits on "the node has a recorded type" therefore never reaches the
+// fallback, which is why both functions below ask the LITUNION question of the direct answer
+// and fall through on anything else.
+//
+// WHAT IS CONCRETE in an instance is its ANNOTATIONS: mono substitutes the type param into
+// the param list and into every annotated `LetDecl` (`monoSubstLetType`), and records the
+// substituted arena type on the fresh node. #1910 gave `exprIsLitAtom`'s Index arm that
+// fallback for a PARAM receiver, one arm at a time. These two are the arm-for-arm
+// generalization, and each extra storage class was a live defect:
+//
+//   · a LOCAL array (`const out: T[] = []` — `sorted`'s own working buffer): `out[k]` did not
+//     read as an atom, so the return widen was withheld and the module did not validate;
+//   · a LOCAL bound to an element read (`const key = out[k]`): claimed as an atom by
+//     `localLitUnion`, but with no members to widen WITH — `literal-union string widening
+//     with no members`;
+//   · a for-in LOOP VAR over such an array, same error;
+//   · and the chain (`const a = self[0]  const b = a`), which is why they recur.
+//
+// The recursion is depth-bounded rather than cycle-tracked: a declaration chain is a DAG in
+// any accepted program (a `let`'s initializer resolves in the scope BEFORE its own binding),
+// and the bound costs one compare per hop where a visited-set costs an allocation. Every
+// mutual call increments, so the bound is reached and not merely approached.
+//
+// THE BOUND IS 32 AND IT WAS MEASURED, not picked. `localLitUnion` propagates the ATOM claim
+// down a rebinding chain ITERATIVELY (each `let` reads the previous slot's already-computed
+// flag), so it has no depth limit at all — and a chain longer than this bound therefore ends
+// with a value CLAIMED as an atom that has no members to widen with. That is a LOUD
+// `literal-union string widening with no members`, never a miscompile, but it is a cliff, so
+// the bound sits far past anything a chain of plain rebindings reaches: at 4 a six-deep
+// `const a = self[0]  const b = a  …` fell off it.
+function declFallbackDepthCap() { 32 }
+
+// The ELEMENT arena type of the ARRAY expression `arrIx` WHEN THAT ELEMENT IS A LITERAL
+// UNION, or -1. `nodeArrayElemIsLitUnion` is exactly the `tyIsLitUnion` of its direct half.
+export function arrElemLitUnionTy(arrIx: i32, fnIx: i32) {
+  arrElemLitUnionTyAt(arrIx, fnIx, 0)
+}
+
+function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
+  if arrIx < 0 { return 0 - 1 }
+  const direct = nodeArrayElemTyIx(arrIx)
+  if tyIsLitUnion(direct) { return direct }
+  if depth >= declFallbackDepthCap() { return 0 - 1 }
+  const n = P.nodes[unwrapParen(arrIx)]
+  if n is Ident {
+    const slot = declaredSlotOf(n.identName)
+    if slot >= 0 {
+      const d = localDeclIx[slot]
+      if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, true) }
+    }
+    const pElem = nodeArrayElemTyIx(paramTypeNode(fnIx, n.identName))
+    if tyIsLitUnion(pElem) { return pElem }
+  }
+  0 - 1
+}
+
+// The LITERAL-UNION arena type an ATOM-repped expression's members come from, or -1 — the
+// `arrElemLitUnionTy` dual for a value that IS the atom rather than the array holding it.
+export function litAtomMemberTy(exprIx: i32, fnIx: i32) {
+  litAtomMemberTyAt(exprIx, fnIx, 0)
+}
+
+function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
+  if exprIx < 0 { return 0 - 1 }
+  const ix = unwrapParen(exprIx)
+  const direct = nodeTyIxOf(ix)
+  if tyIsLitUnion(direct) { return direct }
+  if depth >= declFallbackDepthCap() { return 0 - 1 }
+  const e = P.nodes[ix]
+  if e is Index { return arrElemLitUnionTyAt(e.idxArr, fnIx, depth + 1) }
+  if e is Ident {
+    const slot = declaredSlotOf(e.identName)
+    if slot >= 0 {
+      // A for-in element loop var IS the array's element, so its members come from the
+      // ITERABLE — the one storage class with no declaration node to read.
+      const iter = localLoopIter[slot]
+      if iter >= 0 { return arrElemLitUnionTyAt(iter, fnIx, depth + 1) }
+      const d = localDeclIx[slot]
+      if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, false) }
+    }
+    const pTy = nodeTyIxOf(paramTypeNode(fnIx, e.identName))
+    if tyIsLitUnion(pTy) { return pTy }
+  }
+  0 - 1
+}
+
+// The two above, asked of a `LetDecl`: its ANNOTATION when it has one (the concrete fact mono
+// substituted), else its INITIALIZER one hop deeper. `wantElem` picks which question — the
+// declaration's element type (`const out: K[]`) or the declaration's own type (`const key =
+// out[k]`).
+function declLitUnionTyAt(
+  declIx: i32,
+  fnIx: i32,
+  depth: i32,
+  wantElem: boolean,
+): i32 {
+  const d = P.nodes[declIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if wantElem {
+        const aTy = nodeArrayElemTyIx(d.letType)
+        if tyIsLitUnion(aTy) { return aTy }
+        return 0 - 1
+      }
+      const lTy = nodeTyIxOf(d.letType)
+      if tyIsLitUnion(lTy) { return lTy }
+      return 0 - 1
+    }
+    if d.letInit >= 0 {
+      if wantElem { return arrElemLitUnionTyAt(d.letInit, fnIx, depth + 1) }
+      return litAtomMemberTyAt(d.letInit, fnIx, depth + 1)
+    }
+  }
+  0 - 1
+}
+
 // True if `exprIx` is a literal-union ATOM VALUE (an i32 id) — a litunion-flagged local or a litunion-
 // annotated param. Distinguishes a real atom from a checker-inferred literal union (which is a string).
 export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
@@ -18704,29 +18838,18 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   }
   if e is Index {
     // `xs[i]` over a literal-union ARRAY yields an atom element (the array's i32 backing holds ids).
-    const r = nodeArrayElemIsLitUnion(e.idxArr)
-    if r { return true }
-    // THE ANNOTATION TWIN, for a receiver whose RECORDED type is not there to read. The
-    // probe above asks `nodeTyIxOf` of the receiver NODE, and a MONOMORPHIZED instance's
-    // body is a fresh clone minted after the checker ran — so a parameter reference inside
-    // it carries no recorded type and the probe answers FALSE for an array it should claim.
     //
-    // THE COST WAS SILENT INVALID WASM, and only in the generic rung.
-    // `function pick<T>(self: T[]): T { self[0] }` over `("a" | "b")[]` emitted an instance
-    // whose result slot is a string ref (an INLINE literal-union return reps that way) over
-    // a body whose `array.get` yields the i32 atom — `vl check` rc 0, `vl build` reporting
-    // success, and the engine refusing the module at load. The widen that fixes it
+    // THROUGH THE DECLARATION FALLBACK, because a MONOMORPHIZED instance's receiver records
+    // the GENERIC's `T[]` (see `arrElemLitUnionTy`'s header) — the direct probe answers FALSE
+    // for an array it should claim. THE COST WAS SILENT INVALID WASM, and only in the generic
+    // rung: `function pick<T>(self: T[]): T { self[0] }` over `("a" | "b")[]` emitted an
+    // instance whose result slot is a string ref (an INLINE literal-union return reps that
+    // way) over a body whose `array.get` yields the i32 atom — `vl check` rc 0, `vl build`
+    // reporting success, and the engine refusing the module at load. The widen that fixes it
     // (`retStrWiden`) is gated on this predicate, so the missing claim is what withheld it.
-    //
     // The NAMED-alias spelling never showed it: `K` in result position reps as the atom, so
-    // the two ends already agree and no widen is wanted. That is why the family's other two
-    // rungs closed without this one.
-    const pn = P.nodes[unwrapParen(e.idxArr)]
-    if pn is Ident {
-      if nodeArrayElemIsLitUnion(paramTypeNode(fnIx, pn.identName)) {
-        return true
-      }
-    }
+    // the two ends already agree and no widen is wanted.
+    if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
     // `m[k]` over a LITUNION-valued map (`{[string]: K0}`) yields the atom id — the
     // atom map rides the MONO mv slot, whose i32 backing stores interned member ids
     // (no per-slot value name to consult, so this is the TYPED-IR net: the checker
