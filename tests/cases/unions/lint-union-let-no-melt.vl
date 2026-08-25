@@ -1,0 +1,95 @@
+// LINT `union-let-no-melt` — a union-typed `let` written on more than one path INSIDE A
+// LOOP allocates a box every trip that the `const u = if … else …` spelling does not.
+//
+// Two spellings of one program, 100 M trips (`unboxed-union-rep-design.md` §13.4):
+//
+//     plain `vl build`   1.52x        `vl build -O`   2.54x        `-O3`   2.50x
+//
+// THE COMPILER CANNOT JUST FIX IT, so the rule is not standing in for missing work.
+// Heap2Local scalarizes per allocation SITE and only when every local an allocation
+// reaches provably holds that ONE allocation; two `struct.new` writing one local defeats
+// it for both. Collapsing it means holding tag and payload in scalars across a liveness
+// window — a REPRESENTATION change, refused twice (§13.3, and the re-open at §13.6). What
+// is left is that the cheap alternative is invisible in the source.
+//
+// LOOP BODIES ONLY. The cliff costs what it costs PER TRIP, so outside a loop it is one
+// allocation and not worth a word. That bound is also what keeps the rule quiet: it fires
+// ZERO times across `compiler/ std/ bench/ tests/cases`, because this tree is a compiler
+// and the shape's home is a per-tick simulation loop. The accepted false NEGATIVE is a
+// `let` declared just outside its own loop.
+//
+// IT AGREES WITH THE OPT-MELT GOLDENS, which is the check that matters: it fires on
+// `tests/fixtures/opt-melt/union-box-branch-local-read.vl` (documented 4/4/4 — nothing
+// melts at any rung) and is silent on `union-sink-if-expression.vl` (the spelling that
+// does melt).
+// @run
+// @log 350
+// @log 350
+// @log 4
+// @log ab
+// @info `u` is a union-typed `let` written on more than one path inside a loop
+// @log 7
+
+// FIRES — the documented non-melting shape, verbatim
+function slow(n: i32) {
+  let acc = 0
+  let i = 0
+  while i < n {
+    let u: i64 | boolean = true
+    if i % 2 == 0 { u = 7 }
+    if u is i64 { acc = acc + (u as i32) }
+    i = i + 1
+  }
+  return acc
+}
+print(slow(100)) // 350
+
+// QUIET — the fix the message names: built in ONE place, so it melts
+function fast(n: i32) {
+  let acc = 0
+  let i = 0
+  while i < n {
+    const u: i64 | boolean = if i % 2 == 0 then 7 else true
+    if u is i64 { acc = acc + (u as i32) }
+    i = i + 1
+  }
+  return acc
+}
+print(fast(100)) // 350
+
+// QUIET — `T | null` is a NICHE, not a box: there is nothing to allocate
+function nullable(n: i32) {
+  let hits = 0
+  let i = 0
+  while i < n {
+    let u: i32 | null = null
+    if i % 2 == 0 { u = 7 }
+    if u is i32 { hits = hits + 1 }
+    i = i + 1
+  }
+  return hits
+}
+print(nullable(8)) // 4
+
+// QUIET — an all-literal union interns as an i32 ATOM, not a box
+function atoms(n: i32) {
+  let out = ""
+  let i = 0
+  while i < n {
+    let s: "a" | "b" = "a"
+    if i % 2 == 1 { s = "b" }
+    out = out + s
+    i = i + 1
+  }
+  return out
+}
+print(atoms(2)) // ab
+
+// QUIET — a union `let` OUTSIDE a loop is one allocation, not one per trip
+let top: i64 | boolean = true
+top = 7
+if top is i64 {
+  print(top as i32) // 7
+} else {
+  print(0)
+}
