@@ -574,6 +574,7 @@ import {
   localIndexOf,
   mapAnnShape,
   mapReadScalarBoxKind,
+  mapReadScalarBoxKindTy,
   mapRetExprShape,
   mapShapeOfExpr,
   mapSlotTag,
@@ -2426,6 +2427,33 @@ function emitNulIsNullTest(
     // own arm reads the same predicate), so both spellings of the null test emit this one tag
     // compare instead of the `!= null` half falling to the i32 tail with an unseeded bare
     // `null` (`bare null needs a struct-typed context`) while `is null` was already correct.
+    // A bare SCALAR-valued map read compared straight against `null`, with no binding in
+    // between: `if m[k] != null`. The binding spelling (`const v = m[k]; v != null`) is the
+    // arm below — it boxes, then tests the tag — but here there is nothing to bind and the
+    // read fell through to the i32 compare, which emitted an unseeded bare `null`:
+    // `emitProgram: bare null needs a struct-typed context`, a loud reject.
+    //
+    // IT NEEDS NO BOX AT ALL, which is why this arm sits above the box arm rather than
+    // reusing it. `m[k] != null` asks exactly the question the probe already answers — is
+    // there a live entry for this key — so the lowering IS the probe, and it is the same
+    // code `m.has(k)` emits. Boxing the value only to read a tag back off it would allocate
+    // twice to recover a bit the probe already had in a register.
+    //
+    // The niche-bearing value types never reach here: their reads already compare correctly
+    // through the arms above (a `string` map's read is a nullable ref, a `boolean` map's is
+    // the `2` sentinel), and `mapReadScalarBoxKindTy` excludes them by construction.
+    if mapReadScalarBoxKindTy(refIx) >= 0 {
+      const mnRef = P.nodes[unwrapParen(refIx)]
+      if mnRef is Index {
+        if emitMapHas(body, mnRef.idxArr, mnRef.idxIndex, fnIx) < 0 {
+          return -1
+        }
+        if !invert {
+          fbI32Eqz() // `== null` is the probe's negation
+        }
+        return 1
+      }
+    }
     if exprUnion(refIx, fnIx) || nodeTyIsNulNumLitUnion(refIx) {
       if emitExpr(body, refIx, fnIx) < 0 { return -1 }
       fbStructGet(uBoxIdx, 0) // box field 0: tag
