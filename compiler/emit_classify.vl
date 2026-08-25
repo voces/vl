@@ -126,6 +126,7 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyIsI32,
   nodeTyMapKeyIsI32Span,
+  nodeTyMapValIsBool,
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
@@ -10869,6 +10870,53 @@ export function mapIsSetExpr(exprIx: i32, fnIx: i32) {
 // map) or `m.get(k)` (the method form), else -1. The chokepoint the expression-kind
 // resolvers (`exprString` / struct resolution / `??` lowering) consult so a
 // ref-valued `m[k] ?? d` classifies as its VALUE type.
+// The value-atom KIND (`valueAtomKind`'s code) of a bare SCALAR-valued map read
+// `m[k]` / `m.get(k)`, or -1 when the expression is not one.
+//
+// WHY THIS EXISTS. A map read's type is `V | null` — a miss IS the read's null — but for a
+// SCALAR value type the read has no way to say so. `emitMapGet` yields "the rep's empty
+// value" on a miss, and for a plain `i32` map that empty value is `0`, which is a real
+// value. The union-coerce ladder downstream then boxes it with the value's own tag, so a
+// MISS arrives tagged PRESENT and `if v is i32` takes the then-branch with 0. That is the
+// silent wrong answer pinned by
+// `tests/cases/soundness/xfail-miscompile-map-scalar-miss-narrows-present.vl`.
+//
+// THE NICHE-BEARING VALUES ARE NOT HERE, and that is the whole shape of the predicate.
+// `boolean` (the `2` sentinel), a litunion and `K | null` (the `-1` sentinel), `string`
+// and a struct (`ref.null`) all have a spare value that MEANS absent, so their miss
+// already narrows correctly and their read must keep today's lowering. What is left is
+// exactly the four widths with no spare bit pattern: `i32`, `i64`, `f64`, `f32`.
+//
+// TWO SHAPES, because a scalar map is stored two ways. `i64`/`f64`/`f32` values intern an
+// mv slot (kinds 10/11/13); a plain `i32` value has NO mv slot at all — it rides the
+// shared mono i32 map — so a predicate keyed only on `mapReadMvSlot >= 0` would miss the
+// exact program in the witness. The mono arm re-uses `emitMapGet`'s own niche exclusions
+// (`nodeTyMapValIsLitUnion` and the boolean twins) so the two cannot drift apart.
+export function mapReadScalarBoxKind(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is Index) { return -1 }
+  if !exprMap(e.idxArr, fnIx) { return -1 }
+  const sl = mapShapeOfExpr(e.idxArr, fnIx)
+  if sl >= 0 {
+    if mvValKind[sl] == 10 {
+      return 3 // i64
+    }
+    if mvValKind[sl] == 11 {
+      return 4 // f64
+    }
+    if mvValKind[sl] == 13 {
+      return 5 // f32
+    }
+    return -1
+  }
+  // The mono map (no mv slot). Only PLAIN i32 lands here without a niche of its own.
+  const rv = e.idxArr
+  if nodeTyMapValIsNulLitUnion(rv) || nodeTyMapValIsLitUnion(rv) { return -1 }
+  if nodeTyMapValIsNulBool(rv) || nodeTyMapValIsBool(rv) { return -1 }
+  0 // i32
+}
+
 function mapReadMvSlot(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
