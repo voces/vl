@@ -123,10 +123,23 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // tags[0]`, which is worse: a VALID module printing the raw atom id, and unpinnable with the
 // directives that exist) and this one. Both wait on `ctxKeepsLitUnion` picking a
 // position-independent rule, which is why this should outlast the last few specimens.
+// A program that CHECKS CLEAN and whose module does not validate — the whole point of
+// `--codegen`. It must be a LIVE instance of that class, so it needs replacing whenever
+// the defect it rides closes.
+//
+// It used to be `function pick<T>(self: T[]): T { self[0] }` over `("a" | "b")[]` — the
+// generic rung of the inline-literal-union element family. That rung is FIXED (see
+// `tests/cases/soundness/generic-litunion-element-read.vl`) and the program now runs, which
+// reddened this file exactly as intended.
+//
+// Its replacement is the same family's ELEMENT-ASSIGNMENT boundary, which is still open:
+// the read direction widens the atom to the string the slot wants, and the STORE direction
+// has no mirroring narrow, so a string ref arrives where the array's i32 backing wants an
+// atom. Mapped in `tests/cases/std/xfail-miscompile-array-litunion-element.vl`.
 const INVALID_MODULE_SRC =
-  `function pick<T>(self: T[]): T { self[0] }\n` +
-  `const tags: ("a" | "b")[] = ["b", "a", "b"]\n` +
-  `print(pick(tags))\n`;
+  `function f<T>(self: T[]): T { self[1] = self[0]  return self[1] }\n` +
+  `const tags: ("a" | "b")[] = ["b", "a"]\n` +
+  `print(f(tags))\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
@@ -228,25 +241,38 @@ Deno.test({
   name: "vl-check-codegen: the invalid-module gate flags exactly the @no-instantiate cases",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = `${ROOT}/tests/cases/soundness`;
+    // TWO DIRECTORIES, because the class is not confined to one. `soundness/` was the only
+    // home until the inline-litunion element family's generic rung closed and graduated out
+    // of it, leaving the last live case in `std/` — at which point a soundness-only scan
+    // found ZERO marked files and tripped the "read nothing" guard below. The guard was
+    // right and the scan was too narrow: a check-clean-invalid-wasm shape can be filed
+    // wherever its subject lives.
+    const dirs = [`${ROOT}/tests/cases/soundness`, `${ROOT}/tests/cases/std`];
     const marked = new Set<string>();
-    for await (const e of Deno.readDir(dir)) {
-      if (!e.isFile || !e.name.endsWith(".vl") || e.name === "README.vl") continue;
-      const src = await Deno.readTextFile(`${dir}/${e.name}`);
-      if (/^\/\/\s*@no-instantiate\b/m.test(src)) marked.add(e.name);
+    for (const dir of dirs) {
+      for await (const e of Deno.readDir(dir)) {
+        if (!e.isFile || !e.name.endsWith(".vl") || e.name === "README.vl") continue;
+        const src = await Deno.readTextFile(`${dir}/${e.name}`);
+        if (/^\/\/\s*@no-instantiate\b/m.test(src)) marked.add(e.name);
+      }
     }
-    const { stdout, stderr } = await new Deno.Command(VL, {
-      args: ["check", "--codegen", "--concise", dir, "--compiler", COMPILER],
-      stdout: "piped",
-      stderr: "piped",
-      env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
-    }).output();
+    // ONE INVOCATION PER DIRECTORY. `vl check` takes a single path — handing it two
+    // silently sweeps NEITHER (measured: two dirs flagged 0, each alone flagged its own),
+    // which would have turned this gate into a test that passes by looking at nothing.
     const dec = new TextDecoder();
     const flagged = new Set<string>();
-    for (const line of (dec.decode(stdout) + dec.decode(stderr)).split("\n")) {
-      if (!line.includes("not valid wasm")) continue;
-      const file = line.slice(0, line.indexOf(":"));
-      flagged.add(file.slice(file.lastIndexOf("/") + 1));
+    for (const dir of dirs) {
+      const { stdout, stderr } = await new Deno.Command(VL, {
+        args: ["check", "--codegen", "--concise", dir, "--compiler", COMPILER],
+        stdout: "piped",
+        stderr: "piped",
+        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      }).output();
+      for (const line of (dec.decode(stdout) + dec.decode(stderr)).split("\n")) {
+        if (!line.includes("not valid wasm")) continue;
+        const file = line.slice(0, line.indexOf(":"));
+        flagged.add(file.slice(file.lastIndexOf("/") + 1));
+      }
     }
     const only = (a: Set<string>, b: Set<string>) => [...a].filter((x) => !b.has(x)).sort();
     const unmarked = only(flagged, marked);

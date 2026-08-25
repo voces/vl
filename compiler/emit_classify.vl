@@ -5678,6 +5678,16 @@ function arrLitHasAtomElem(ix: i32, fnIx: i32) {
 // it to a string (`fnIx`'s `fnRet`): `string`, or (D-ATOMSTORE) a boxed UNION with a litunion /
 // `string` arm. It widens at the return, riding the string-op scratch frame. Witness:
 // `retIsolated` in `tests/cases/literal-unions/atom-store-into-mixed-union.vl`.
+// The emit side's `retLitUnionInline`, on this side of the seam. An INLINE literal-union
+// return reps as a STRING REF and so widens an atom operand; a NAMED alias (`: K`) reps as
+// the atom itself and must NOT. Kept as its own function rather than inlined so the two
+// passes can be read against each other.
+function retLitUnionInlineTy(tyIx: i32): boolean {
+  if tyIx < 0 { return false }
+  if nodeTyIsLitUnionAlias(tyIx) { return false }
+  tyIsLitUnion(nodeTyIxOf(tyIx))
+}
+
 function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   if retArgIx < 0 { return false }
@@ -5685,6 +5695,22 @@ function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     if unionTakesAtomAsStr(tyNameOf(fn.fnRet)) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
+    }
+    // THE INLINE LITERAL-UNION RETURN, mirroring the arm of the same name in
+    // `emitReturnValue`'s widen ladder. This is a RESERVATION pass and that is an EMIT
+    // pass, and the two must claim the same set arm for arm: the emit side decides to
+    // widen, this side reserves the string-op scratch frame the widen writes through. When
+    // only the emit side had the arm, the widen ran against unreserved locals —
+    // `unknown local 4: local index out of bounds`, `vl check` rc 0.
+    //
+    // The gap was reachable only through a MONOMORPHIZED instance
+    // (`function pick<T>(self: T[]): T { self[0] }` over `("a" | "b")[]`), because a
+    // hand-written inline-litunion return usually returns a member LITERAL — already a
+    // string, no widen, no frame. It takes an ATOM-repped operand to need one, and the
+    // generic instance's element read is exactly that.
+    if retLitUnionInlineTy(fn.fnRet) {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
       if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
     }
@@ -18490,6 +18516,27 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // `xs[i]` over a literal-union ARRAY yields an atom element (the array's i32 backing holds ids).
     const r = nodeArrayElemIsLitUnion(e.idxArr)
     if r { return true }
+    // THE ANNOTATION TWIN, for a receiver whose RECORDED type is not there to read. The
+    // probe above asks `nodeTyIxOf` of the receiver NODE, and a MONOMORPHIZED instance's
+    // body is a fresh clone minted after the checker ran — so a parameter reference inside
+    // it carries no recorded type and the probe answers FALSE for an array it should claim.
+    //
+    // THE COST WAS SILENT INVALID WASM, and only in the generic rung.
+    // `function pick<T>(self: T[]): T { self[0] }` over `("a" | "b")[]` emitted an instance
+    // whose result slot is a string ref (an INLINE literal-union return reps that way) over
+    // a body whose `array.get` yields the i32 atom — `vl check` rc 0, `vl build` reporting
+    // success, and the engine refusing the module at load. The widen that fixes it
+    // (`retStrWiden`) is gated on this predicate, so the missing claim is what withheld it.
+    //
+    // The NAMED-alias spelling never showed it: `K` in result position reps as the atom, so
+    // the two ends already agree and no widen is wanted. That is why the family's other two
+    // rungs closed without this one.
+    const pn = P.nodes[unwrapParen(e.idxArr)]
+    if pn is Ident {
+      if nodeArrayElemIsLitUnion(paramTypeNode(fnIx, pn.identName)) {
+        return true
+      }
+    }
     // `m[k]` over a LITUNION-valued map (`{[string]: K0}`) yields the atom id — the
     // atom map rides the MONO mv slot, whose i32 backing stores interned member ids
     // (no per-slot value name to consult, so this is the TYPED-IR net: the checker
