@@ -1,0 +1,75 @@
+// @run
+// @log false
+// @log a
+// @log a
+// GRADUATED from `xfail-miscompile-litunion-alias-relational-compare.vl`. This was a
+// WRONG-VALUE miscompile — a valid module that ran to exit 0 and answered `x < y` with
+// `true` for `x = "b"`, `y = "a"` — and the three `@log`s above are the values its own
+// "WHEN IT IS FIXED" line predicted. It stays here, as a `@run` pin, because the wrong
+// answer was silent in every channel: `vl check` was clean, the wasm validated, and the
+// only witness was the printed value.
+//
+// THE MECHANISM THAT WAS WRONG, read off the disassembly of the first three lines:
+//
+//   type K = "a" | "b"   const x: K = "b"   const y: K = "a"   print(x < y)
+//   →  (local.set $0 (i32.const 0))        ;; "b" — interned FIRST, so id 0
+//      (local.set $1 (i32.const 1))        ;; "a" — interned second, id 1
+//      (call $print_bool (i32.lt_s (local.get $0) (local.get $1)))
+//
+// A named alias `K` reps as the i32 ATOM in every scalar position (`nodeTyIsLitUnionAlias`,
+// the rep #843 established), so BOTH operands arrived at `emitBinExprNode` already i32 and
+// the ladder fell through to the numeric arm without ever asking whether they were atoms.
+// Ids are assigned in the order the members are first INTERNED — first appearance in the
+// emitted code — so `x < y` was answering "was `"b"` written before `"a"`". NOT the alias's
+// member order, which is the natural guess and is wrong: `type K = "c" | "a" | "b"` sorting
+// `["a", "b", "c"]` returned `a b c`, because the array literal is what interns them.
+//
+// THE SCOPE WAS THE WHOLE COMPILED PROGRAM, not the module, and that is what made the
+// inline spelling no workaround. `"a" | "b"` written inline SOFTENS to a string ref in a
+// scalar position (`ctxKeepsLitUnion` at `RC_ROOT`), so it took the string comparison and
+// answered on the TEXT — but only while no same-layout ALIAS was declared ANYWHERE in the
+// program graph. One unused `type K = "a" | "b"` was enough (the same-layout rule
+// `literal-unions/error-same-layout-litunion-arg.vl` pins), and so was one
+// `import { pathKind } from "std:fs"`, which flipped a `("file" | "dir")[]` sort from
+// `dir file` to `file dir` because `std/fs.vl:130` declares `export type FileKind =
+// "file" | "dir"`. That cross-module row is pinned by
+// `literal-unions/litunion-order-cross-module-alias.vl`, the same-module rows by
+// `literal-unions/litunion-order-is-member-text.vl`.
+//
+// THE FIX is one predicate and one call. `exprIsStrOrder` (`emit_classify.vl`) now asks
+// `strOrderOperandIsText` — a string ref OR a literal-union ATOM — of each operand instead
+// of `exprString`, and `emitStrOrder` (`wasmEmit.vl`) pushes each operand with
+// `emitStrValue` instead of `emitExpr`, so an atom widens to its member string
+// (`emitAtomToStr`) before the lexicographic core. The one predicate serves BOTH the
+// dispatch and the `exprHasStrOp` frame reservation, so the two cannot disagree about the
+// operand set.
+//
+// TWO THINGS DELIBERATELY DID NOT MOVE, both verified byte-identical A/B:
+//   · `==`/`!=` over atoms. Equal ids iff equal texts, so the `i32.eq` in
+//     `emitBinExprNode`'s litunion-equality arm is already a correct equality and a cheaper
+//     one. The whole `eq-litunion-*` family is untouched.
+//   · NUMERIC literal unions. `tyIsLitUnion` requires every member to be `litKind == "str"`,
+//     so `type N = 1 | 2 | 3` is not a litunion to `exprIsLitAtom` at all and keeps the
+//     numeric compare, which is both correct and faster
+//     (`soundness/numeric-litunion-alias-membership.vl` and the grid row in
+//     `literal-unions/litunion-order-is-member-text.vl`).
+//
+// THE COST, measured over 20,000,000 comparisons of a 5-member alias: 0.04 s before (the
+// wrong `i32.lt_s`), 0.16 s after, against 0.14 s for the identical loop hand-written over
+// a `string[]` — so the correct answer costs what a string comparison costs, plus the widen
+// tower. Correctness first is the standing ruling; the cheaper correct designs (interning
+// atom ids in global text order, or an id->rank side table so the compare stays one
+// `i32.lt_s`) are FILED, not built.
+import { sorted } from "std:array"
+
+type K = "a" | "b"
+
+const x: K = "b"
+const y: K = "a"
+print(x < y)
+
+const ks: K[] = ["b", "a", "b"]
+print(ks.sorted((p: K, q: K) => p < q)[0])
+
+const inl: ("a" | "b")[] = ["b", "a", "b"]
+print(inl.sorted((p: "a" | "b", q: "a" | "b") => p < q)[0])

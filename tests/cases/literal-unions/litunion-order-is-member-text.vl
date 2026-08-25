@@ -1,0 +1,162 @@
+// @run
+// The two annotations the lint oracle calls redundant are load-bearing: `plain: string` is
+// what states that operand is a PLAIN string and not a litunion (the mixed-rep row is the
+// whole point of it), and `best: W` is what makes the accumulator an ATOM rather than the
+// softened element type inference hands back.
+// @hint redundant type annotation: `plain` is inferred as `string` — remove it to lean on inference
+// @hint redundant type annotation: `best` is inferred as `W$m0` — remove it to lean on inference
+// CONTRACT: `<` `>` `<=` `>=` over a literal-union operand compare MEMBER TEXT, at every
+// spelling of the operand, and `==` / `!=` and NUMERIC literal unions keep the cheap atom /
+// numeric compare they already had. The grid below is the whole rule in one file.
+//
+// WHAT THIS REPLACED: a NAMED alias reps as the interned i32 ATOM in every scalar position
+// (`nodeTyIsLitUnionAlias`), so both operands of `x < y` arrived at `emitBinExprNode` already
+// i32 and the ladder took the NUMERIC arm — `i32.lt_s` over two INTERNED IDS, which follow
+// first appearance in the emitted code and not member text. Valid module, exit 0, wrong
+// answer. `soundness/litunion-alias-relational-compare.vl` is the graduated pin and carries
+// the disassembly; this file is the coverage grid around it.
+//
+// `exprIsStrOrder` now asks `strOrderOperandIsText` — a string ref OR a literal-union atom —
+// of each operand, and `emitStrOrder` pushes each with `emitStrValue`, so an atom widens to
+// its member string before the lexicographic core. ONE predicate serves both the dispatch and
+// the `exprHasStrOp` frame reservation, which is why they cannot disagree about the set.
+import { sorted } from "std:array"
+
+// ── all four operators over a NAMED alias, whose intern order is the REVERSE of its text
+// order (`"b"` is interned first, so before the fix `x < y` answered `0 < 1` = true) ──
+type K = "a" | "b"
+
+const x: K = "b"
+const y: K = "a"
+// @log false
+print(x < y)
+// @log true
+print(x > y)
+// @log false
+print(x <= y)
+// @log true
+print(x >= y)
+// `==` / `!=` are NOT routed through the widen: equal ids iff equal texts, so the atom
+// `i32.eq` is already a correct equality and a cheaper one. Byte-identical across the fix.
+// @log false
+print(x == y)
+// @log true
+print(x != y)
+
+// ── a NUMERIC literal union KEEPS the numeric compare. `tyIsLitUnion` requires every member
+// to be `litKind == "str"`, so `N` is not a litunion to `exprIsLitAtom` and never reaches the
+// widen at all — the emitted bytes for this block are identical before and after the fix. ──
+type N = 3 | 1 | 2
+
+const p: N = 3
+const q: N = 1
+// @log false
+print(p < q)
+// @log true
+print(p > q)
+// @log false
+print(p <= q)
+// @log true
+print(p >= q)
+// @log false
+print(p == q)
+// @log true
+print(p != q)
+
+// ── the INLINE spelling, with a same-layout alias `K` declared above. Inline softens to a
+// string ref at `RC_ROOT` (`ctxKeepsLitUnion`), so this row was correct on its own — but it
+// registers as `K` (`error-same-layout-litunion-arg.vl`'s rule) and was ordered by id too as
+// soon as any same-layout alias existed ANYWHERE in the program graph. ──
+const ia: "a" | "b" = "b"
+const ib: "a" | "b" = "a"
+// @log false
+print(ia < ib)
+// @log true
+print(ia >= ib)
+
+// ── a MIXED pair: one plain `string`, one atom. The checker accepts it; before the fix the
+// old predicate declined (only one operand was a string) and the numeric arm pushed a
+// `(ref $array)` under `i32.lt_s` — INVALID WASM with `vl check` rc 0. Now the atom widens. ──
+const plain: string = "a"
+// @log false
+print(x < plain)
+// @log true
+print(plain < x)
+
+// ── a MIXED union `"a" | "b" | null`: the nullable NICHE holds the atom id or the `-1`
+// sentinel. Narrowed non-null it is an ordinary atom. This was invalid wasm too. ──
+type M = "b" | "a" | null
+
+const m1: M = "b"
+const m2: M = "a"
+if m1 != null {
+  if m2 != null {
+    // @log false
+    print(m1 < m2)
+    // @log true
+    print(m1 > m2)
+  }
+}
+
+// ── 3 members, where DECLARATION order (c a b), INTERN order (b c a) and TEXT order (a b c)
+// are three different permutations, so no accident can make all four rows right. ──
+type T3 = "c" | "a" | "b"
+
+const t1: T3 = "b"
+const t2: T3 = "c"
+const t3: T3 = "a"
+// @log true
+print(t1 < t2)
+// @log false
+print(t2 < t3)
+// @log true
+print(t3 < t1)
+// @log false
+print(t1 < t3)
+
+// ── `sorted` over a `K[]`: the hot shape, and how the defect was found. ──
+const f3: T3[] = ["b", "c", "a"]
+const s3 = f3.sorted((u: T3, v: T3) => u < v)
+// @log a
+print(s3[0])
+// @log b
+print(s3[1])
+// @log c
+print(s3[2])
+
+// ── 5 members ──
+type T5 = "e" | "d" | "c" | "b" | "a"
+
+const f5: T5[] = ["c", "e", "a", "d", "b"]
+const s5 = f5.sorted((u: T5, v: T5) => u < v)
+// @log a
+print(s5[0])
+// @log b
+print(s5[1])
+// @log c
+print(s5[2])
+// @log d
+print(s5[3])
+// @log e
+print(s5[4])
+
+// ── a HAND-WRITTEN minimum loop, with no `sorted` in the comparison path — the defect was
+// never about `std:array`, and this row is what says so. ──
+type W = "zz" | "mm" | "aa"
+
+const ws: W[] = ["mm", "zz", "aa"]
+let best: W = ws[0]
+for w in ws {
+  if w < best { best = w }
+}
+// @log aa
+print(best)
+
+// ── the comparison inside a FUNCTION, over `K`-annotated PARAMETERS rather than locals: a
+// different storage class for the atom, and the shape a comparator actually compiles to. ──
+function lessK(u: K, v: K) { u < v }
+
+// @log false
+print(lessK("b", "a"))
+// @log true
+print(lessK("a", "b"))
