@@ -5829,19 +5829,55 @@ export function exprIsStrEq(binIx: i32, fnIx: i32) {
   false
 }
 
-// True if `binIx` is an ORDERING comparison (`<`/`>`/`<=`/`>=`) over two STRING operands
-// — a lexicographic compare (`emitStrLessCore`), not the numeric `i32.lt_s` path that
-// would compare the array refs. BOTH operands must be strings (the checker rejects a
-// mixed string/numeric ordering); the frame reserved by `exprHasStrOp` carries the loop.
+// True if `binIx` is an ORDERING comparison (`<`/`>`/`<=`/`>=`) whose operands are TEXT — a
+// lexicographic compare (`emitStrLessCore`), not the numeric `i32.lt_s` path. BOTH operands
+// must be text (the checker rejects a mixed string/numeric ordering); the frame reserved by
+// `exprHasStrOp` carries the loop.
+//
+// "TEXT" IS WIDER THAN "STRING REF", and that widening is the soundness fix for the
+// litunion-alias miscompile. A litunion whose type is a REGISTERED ALIAS reps as the interned
+// i32 ATOM in every scalar position (`nodeTyIsLitUnionAlias`), so `exprString` answers FALSE
+// for it and both operands of `x < y` over a `K` arrived here already i32 — the ladder in
+// `emitBinExprNode` then fell through to the numeric arm and emitted `i32.lt_s` over two
+// INTERNED IDS. Ids follow first INTERNING (first appearance in the emitted code), not member
+// text and not declaration order, so `type K = "a" | "b"; const x: K = "b"; const y: K = "a"`
+// printed `x < y` as TRUE. Valid module, exit 0, wrong answer; the whole ordering family
+// (`sorted` over a `K[]`, a hand-written minimum loop) inherited it, and the scope was the
+// compiled PROGRAM — one `import { pathKind } from "std:fs"` re-ordered an inline
+// `("file" | "dir")[]` sort, because `std/fs.vl` declares that same-layout alias.
+//
+// `==`/`!=` ARE DELIBERATELY NOT ROUTED HERE. Equal ids iff equal texts, so the atom `i32.eq`
+// in `emitBinExprNode`'s litunion-equality arm is already a correct equality and a cheaper
+// one. NUMERIC literal unions are likewise untouched: `tyIsLitUnion` requires every member to
+// be `litKind == "str"`, so `type N = 1 | 2 | 3` is not a litunion to `exprIsLitAtom` at all
+// and keeps the numeric compare, which is both correct and faster.
 export function exprIsStrOrder(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const op = e.binOp
     if op == "<" || op == ">" || op == "<=" || op == ">=" {
-      return exprString(e.binLeft, fnIx) && exprString(e.binRight, fnIx)
+      return strOrderOperandIsText(e.binLeft, fnIx) &&
+        strOrderOperandIsText(e.binRight, fnIx)
     }
   }
   false
+}
+
+// One ORDERING operand's "is this text" test: a string ref, or a literal-union ATOM that
+// widens to its member string. Exactly the set `emitStrValue` can push as a string, which is
+// what makes this one predicate safe to use as BOTH the dispatch (`emitBinExprNode` →
+// `emitStrOrder`) and the frame reservation (`exprHasStrOp`) — the two cannot disagree about
+// the operand set, which is this emitter's richest invalid-wasm vein everywhere the widen has
+// a separate scan.
+//
+// A MIXED `s < k` (`s: string`, `k: K`) IS CLAIMED, and that closes an invalid module rather
+// than only a wrong value: the checker accepts the mixed spelling, and with only one operand
+// a string the old predicate declined, leaving the numeric arm to push a `(ref $array)` under
+// `i32.lt_s` — `vl check` rc 0, "type mismatch: expected i32, found (ref $type)" at
+// instantiation. The `==` twin already widens the same pair (`emitStrEq` → `emitStrValue`).
+function strOrderOperandIsText(ix: i32, fnIx: i32) {
+  if exprString(ix, fnIx) { return true }
+  exprIsLitAtom(ix, fnIx)
 }
 
 // True if `binIx` is a `==`/`!=` whose union-box value compare can hit the

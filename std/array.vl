@@ -32,8 +32,8 @@
 // than anything std chose, but it decides what this module can be used for.
 //
 //   ADMITTED: `i32`, `i64`, `f64`, `boolean`, `string`, and nested lists (`i32[][]`) —
-//   subject to the `mapIndexed` carve-out below, which is keyed on the callback's RESULT
-//   type and so reaches every one of them.
+//   subject to the two `mapIndexed` carve-outs below, the first of which is keyed on the
+//   callback's RESULT type and so reaches every one of them.
 //
 //   A STRUCT ELEMENT is refused at EMIT with a clean error ("monomorphize:
 //   unsupported argument type for `self`"). Plain `vl check` reports the program
@@ -45,60 +45,38 @@
 //   works instead: sort an INDEX list and let the comparator read the keys out of
 //   parallel arrays it closes over.
 //
-//   A LITERAL-UNION ELEMENT is ADMITTED, with THREE carve-outs — and CARVE-OUT 1 is the
-//   one to read first, because it returns a WRONG ANSWER instead of failing. The
-//   closure-taking and `==`-comparing exports all handle a `("a" | "b")[]` and a NUMERIC
-//   `(1 | 2)[]`: `indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`, `reverse`,
-//   `concat`, `sort` and `sorted`. The rep disagreement underneath is real and unchanged —
-//   a literal union's members are PRESERVED at element position (an interned i32 ATOM) and
-//   SOFTENED everywhere else (a string ref) — but it is reconciled at each boundary a
-//   generic instance crosses instead of being left to meet inside an invalid module.
+//   A LITERAL-UNION ELEMENT is ADMITTED, with TWO carve-outs. NEITHER RETURNS A WRONG
+//   ANSWER, but only one is a clean refusal: CARVE-OUT 2 stops at emit and writes nothing
+//   even under `--no-validate`, while CARVE-OUT 1 writes an invalid `.wasm` that plain
+//   `vl check` calls clean and `--no-validate` will ship (measured: 2,394 bytes, exit 0). The closure-taking and `==`-comparing exports all
+//   handle a `("a" | "b")[]` and a NUMERIC `(1 | 2)[]`: `indexOf`, `lastIndexOf`,
+//   `includes`, `count`, `reduce`, `reverse`, `concat`, `sort` and `sorted`. The rep
+//   disagreement underneath is real and unchanged — a literal union's members are
+//   PRESERVED at element position (an interned i32 ATOM) and SOFTENED everywhere else (a
+//   string ref) — but it is reconciled at each boundary a generic instance crosses instead
+//   of being left to meet inside an invalid module.
 //   `tests/cases/soundness/generic-litunion-element-bind-and-store.vl` carries the
 //   mechanism; `tests/cases/std/array-sorted.vl` pins the ordering.
 //
-//   CARVE-OUT 1, THE SILENT ONE — ORDERING OVER A NAMED **STRING** LITERAL-UNION ALIAS IS
-//   WRONG. `<` `>` `<=` `>=` over a `K` where `type K = "a" | "b"` compare interned IDS,
-//   not member text. The module is valid, the program runs, exit 0, and the answer is
-//   wrong. Ordering is by first INTERNED id, which follows first appearance in the EMITTED
-//   CODE and not the alias's member order — so a list already in that order is a no-op
-//   that looks like a sort, and reordering the alias's members changes nothing. A NUMERIC
-//   alias (`type N = 1 | 2 | 3`) orders CORRECTLY — measured — so this is the string
-//   family only.
+//   ORDERING (`<` `>` `<=` `>=`) OVER A STRING LITERAL UNION COMPARES MEMBER TEXT, at
+//   every spelling of the operand — a named alias, the inline form, a `K | null` narrowed
+//   non-null, and a mixed `string`/alias pair. This paragraph carried a third carve-out
+//   for it until the compiler was fixed: an aliased `K` reps as the interned i32 ATOM, so
+//   the ordering used to compare INTERNED IDS (first appearance in the emitted code) and
+//   returned a silently wrong answer whose hazard scope was the whole compiled program.
+//   `tests/cases/soundness/litunion-alias-relational-compare.vl` is the graduated pin;
+//   `tests/cases/literal-unions/litunion-order-is-member-text.vl` is the grid, and
+//   `litunion-order-cross-module-alias.vl` beside it is the cross-module row. A NUMERIC
+//   alias (`type N = 1 | 2 | 3`) keeps the numeric compare, which is the correct order for
+//   it and a cheaper one.
 //
-//   THIS IS NOT A `sorted` BUG. `<` `>` `<=` `>=` over an aliased string literal union are
-//   wrong ANYWHERE in VL; `sorted` is only where you are most likely to meet it. A
-//   hand-written minimum loop over a `K[]`, importing nothing, returns the wrong element.
+//   IF YOU CARRIED THE OLD REMEDY, DELETE IT. Widening inside the comparator
+//   (`const ps: string = p`) is now redundant and costs a local for nothing. Copying to a
+//   `string[]` and sorting that is not free either way — measured, it buys ~12% on the
+//   compares (0.15 s against 0.17 s over 20M) at the price of an O(n) allocation and a
+//   changed result type, so take it only if you wanted strings anyway.
 //
-//   THE HAZARD SCOPE IS THE COMPILED PROGRAM, NOT YOUR MODULE. An inline
-//   `("a" | "b" | "c")[]` registers as a same-layout alias declared anywhere in the
-//   program graph — including a module you import ONE function from and whose type
-//   declarations you never read. **`std:fs` alone declares
-//   `export type FileKind = "file" | "dir"` (`std/fs.vl:130`), so
-//   `import { pathKind } from "std:fs"` is enough to flip a `("file" | "dir")[]` sort from
-//   `dir file` to `file dir`** — measured. There is no local check for this, so "declare
-//   no same-layout alias" is NOT a remedy a caller can verify.
-//
-//   REMEDY, measured: widen inside the comparator and keep the element type.
-//
-//       function lessK(p: K, q: K) {
-//         const ps: string = p
-//         const qs: string = q
-//         ps < qs
-//       }
-//       ks.sorted(lessK)          // correct, and still a `K[]`
-//
-//   Copying the elements into a `string[]` and sorting that also works, at an O(n) copy
-//   and a changed result type; prefer it only when the caller wanted strings anyway. Do
-//   NOT apply either to a numeric alias — the copy would give lexicographic order
-//   (`10 < 9`), and numeric aliases are already correct.
-//
-//   Pinned as
-//   `tests/cases/soundness/xfail-miscompile-litunion-alias-relational-compare.vl`, whose
-//   header carries the disassembly. `==` is unaffected — equal ids iff equal texts — so
-//   `indexOf` / `lastIndexOf` / `includes` / `count` are sound; this is the ORDERING
-//   operators only.
-//
-//   CARVE-OUT 2 — `mapIndexed` WHEN `U` IS AN INLINE STRING LITERAL UNION, whatever `T`
+//   CARVE-OUT 1 — `mapIndexed` WHEN `U` IS AN INLINE STRING LITERAL UNION, whatever `T`
 //   is. The `U[]` it builds holds interned atoms while the callback's result reps as a
 //   string ref, and the module does not validate ("type mismatch: expected (ref $type),
 //   found (ref $type)", `vl check` exits 0). THE RECEIVER'S ELEMENT TYPE IS IRRELEVANT:
@@ -106,27 +84,34 @@
 //   DIFFERENT union `"x" | "y"`. A NUMERIC `U` (`1 | 2`) is fine. That is a RESULT-LIST
 //   boundary rather than an element-read one, which is why it did not close with the rest.
 //   REMEDY, measured: declare the callback's result `string` and narrow at the use site.
+//   Pinned as `tests/cases/std/xfail-miscompile-mapindexed-litunion-result.vl`, whose
+//   header carries the full `T` x `U` grid.
 //
-//   CARVE-OUT 3 — A STRING-LITERAL-UNION **ALIAS** IN A NON-ELEMENT TYPE PARAMETER
+//   CARVE-OUT 2 — A STRING-LITERAL-UNION **ALIAS** IN A NON-ELEMENT TYPE PARAMETER
 //   (`mapIndexed`'s `U`, `reduce`'s accumulator `A`) is refused at EMIT:
 //   "literal-union string widening with no members". Honest — no invalid module and no
 //   wrong answer — but the message names neither the export nor the alias, so a reader who
 //   has just been told literal unions are ADMITTED will not connect it. The INLINE
-//   spelling of the same `U` is carve-out 2 above; the inline spelling of `A` runs
+//   spelling of the same `U` is carve-out 1 above; the inline spelling of `A` runs
 //   correctly.
 //
 // This paragraph first claimed literal unions worked, on the strength of a probe that
 // used `reverse` — the one shape-blind export in the module. It was then rewritten to
-// claim they were broken everywhere else, on probes that predated the boundary-widen
+// claim they were broken everywhere else (that one UNDER-claimed), on probes that
+// predated the boundary-widen
 // work. Then it over-promised twice more — it called the inline spelling a workaround
 // when an unused alias defeats it, and it scoped `mapIndexed` by the RECEIVER when the
-// defect is keyed on the CALLBACK'S RESULT. A std review then found two more: the alias
-// hazard's scope is the whole COMPILED PROGRAM and not the module (std's own `std:fs`
-// defeats the "declare no alias" advice), and carve-out 1 was scoped to "named alias"
-// when a NUMERIC alias orders correctly. The lesson has now been paid for FIVE times: a
-// generic surface has to be probed ARM BY ARM, the probe has to vary the dimension the
-// claim is about, a remedy is not a remedy until it has been RUN in the situation that
-// needs it, and the whole section has to be re-probed when the family under it moves.
+// defect is keyed on the CALLBACK'S RESULT. A std review then found two more: the
+// ordering hazard's scope was the whole COMPILED PROGRAM and not the module (std's own
+// `std:fs` defeated the "declare no alias" advice), and the ordering carve-out was scoped
+// to "named alias" when a NUMERIC alias orders correctly. FIVE over-promises, and THREE
+// of them were about the ordering carve-out — which is why a reader will not find their
+// subject above: it was DELETED, not softened, when the compiler stopped comparing
+// interned ids. What the five bought: a generic surface has to be probed ARM BY ARM, the
+// probe has to vary the dimension the claim is about, a remedy is not a remedy until it
+// has been RUN in the situation that needs it, and the whole section has to be re-probed
+// when the family under it moves — including when it moves TOWARD correctness, because a
+// stale carve-out sends callers to a workaround they no longer need.
 //
 // `u8[]` is separately outside the surface, and that one is a CHECKER error rather
 // than an emit-time surprise: `u8` is a storage type, so it cannot be a generic
@@ -225,8 +210,8 @@ export function concat<T>(self: T[], other: T[]): T[] {
 // `map` with the element INDEX: `f(element, i)` for each element, collected in
 // order into a new list. The result element type `U` may differ from `T`. The
 // emitter's bare `.map` passes only the element; this is the indexed companion.
-// A `U` that is a STRING literal union does not lower — see CARVE-OUT 2 (inline) and
-// CARVE-OUT 3 (alias) in the module header.
+// A `U` that is a STRING literal union does not lower — see CARVE-OUT 1 (inline) and
+// CARVE-OUT 2 (alias) in the module header.
 export function mapIndexed<T, U>(self: T[], f: (T, i32) => U): U[] {
   const out: U[] = []
   let i = 0
@@ -491,8 +476,6 @@ export function mapIndexed<T, U>(self: T[], f: (T, i32) => U): U[] {
 // case; allocates nothing up to n = 16 and one n-element buffer above that. Returns
 // nothing — the receiver IS the result. See the block above for the contract `less` must
 // satisfy and for what happens when it does not.
-// ORDERING over an aliased STRING literal union is silently WRONG — see CARVE-OUT 1 in
-// the module header, which carries the remedy.
 export function sort<T>(self: T[], less: (T, T) => boolean) {
   // SORT_RUN lives INSIDE the function rather than beside the module header because a
   // module-level const is emitted as a wasm global whether or not anything imports the
@@ -616,8 +599,6 @@ export function sort<T>(self: T[], less: (T, T) => boolean) {
 // copies honest. The only intended differences are the leading copy, and the tail:
 // `sorted` RETURNS whichever buffer holds the answer, so it never pays `sort`'s
 // copy-home.
-// ORDERING over an aliased STRING literal union is silently WRONG — see CARVE-OUT 1 in
-// the module header, which carries the remedy.
 export function sorted<T>(self: T[], less: (T, T) => boolean): T[] {
   const SORT_RUN = 16
   const n = self.length

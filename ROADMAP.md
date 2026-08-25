@@ -881,6 +881,28 @@ in-language GC knobs.
   > same re-run retired D3 and D4 from `silent-class-inventory-2.md`, D4 being that document's
   > largest filed silent family; the standing rule both corrections argue for is *run the witness
   > before scheduling from the row*.
+  >
+  > **ORDERING OVER A STRING LITERAL UNION IS CORRECT AND COSTS A WIDEN — the cheaper correct
+  > designs are FILED HERE, NOT BUILT.** `<` `>` `<=` `>=` used to compare INTERNED IDS (a valid
+  > module, exit 0, wrong answer); they now widen each atom to its member string and take the
+  > lexicographic core. Pinned by `tests/cases/soundness/litunion-alias-relational-compare.vl`
+  > and the grid beside it. **MEASURED COST**, 20,000,000 comparisons over a 5-member alias:
+  > **0.04 s before (the wrong `i32.lt_s`), 0.16 s after, 0.14 s for the identical loop
+  > hand-written over a `string[]`** — so the correct answer costs a string comparison plus
+  > ~15% for the widen tower, and code size is +205 bytes on a two-member witness (1816 →
+  > 2021). Corpus-wide the change is inert: **1685 of 1688 `@run` fixtures emit byte-identical
+  > wasm**, the three that move being the new pins. Correctness first was the standing ruling,
+  > so this shipped as-is. TWO CHEAPER DESIGNS, both O(1) per compare and neither built:
+  > **(a) an id→RANK side table** — one `(array i32)` global mapping atom id to its
+  > lexicographic rank, so the compare stays `rank[x] < rank[y]`: two `array.get`s and one
+  > `i32.lt_s`, no widen, no string loop, and no change to how ids are assigned. Costs one
+  > global sized by the atom count. **(b) assigning atom ids in GLOBAL member-text order at
+  > intern time**, which makes the bare `i32.lt_s` correct for ANY pair of atoms (one global
+  > order is order-isomorphic to every alias's own). It needs ids to be frozen before emission
+  > — today `internAtom` runs DURING emission, from `emitAtomToStrChain` among others — so it
+  > is a two-pass change to the interner, and every consumer that reads first-appearance order
+  > has to be audited. (a) is the smaller bet; (b) is free at run time. Neither is worth doing
+  > until an ordering-heavy shape shows up in a profile — a sort over a `K[]` is the hot one.
 - ⬜ **A17 follow-up: `never` inference.** A17 demand-driven inference is shipped, and so is
   half (b) of this row — **the `unconditional-recursion` lint SHIPPED** (`compiler/lint.vl`,
   headline case `tests/cases/lint/unconditional-recursion.vl`). It fires with the return type
