@@ -15149,6 +15149,108 @@ export function arrLitUnionElemName(arrIx: i32): string {
   cen
 }
 
+// The checker-recorded VALUE-UNION element of the array literal at `arrIx` — the name the
+// literal's elements BOX under (kind 2) — WITHOUT asking whether the emitter holds that
+// union's row. Two readers, and the split between them is the whole fix:
+// `arrLitInferUnionElemName` below reads this because at REGISTRATION time the row is
+// exactly what does not exist yet, and `arrLitBoxElem` adds the `isUName` gate back for
+// every CLASSIFIER that consults it afterwards.
+//
+// THE MISSING ROW IS THE BUG. `arrLitUnionElemName`'s `isUName` gate asks whether the
+// emitter registered the union, and every registration route runs off a SPELLING that
+// appears in the source: a `type U = A | B` declaration, an annotation the name/arena walks
+// reach, an inferred RETURN, an inferred `let`. An un-annotated `const xs = [1, "two"]`
+// spells its union NOWHERE — the checker infers `(i32 | string)[]` and no pass registered
+// it — so `arrLitUnionElemName` declined, `arrLitIsRef`'s last rung never fired, and the
+// literal fell to the i32 list. That one miss produced three failures: `[1, true]` stored
+// `true` as an i32 and printed `1` twice (silent wrong answer), `[1, "two"]` stored a string
+// ref into an i32 backing (`vl check` rc 0, `expected i32, found (ref $type)` at
+// instantiation), and `[c, d]` over two declared struct types hit the i32 path's loud floor
+// (`struct array elements are not supported`). Adding an unrelated `const dummy: i32 |
+// string = 1` to the first two programs — a spelling that contributes nothing but the row —
+// makes both run correctly at master, which is the witness that the row, not the
+// classifier, was the missing piece.
+//
+// THE ARENA GATE IS `nodeArrayElemName`'s TyUnion ARM, arm for arm: two or more members and
+// not a literal union. Asked of the ARENA rather than inferred from the render, because the
+// render is shared — a struct / map / closure / nested-array element also answers a non-""
+// name and none of those is a union to register. A LITERAL union is excluded for the reason
+// that arm excludes it: its elements are interned i32 atoms riding the i32-list wrapper,
+// not boxes.
+//
+// A LITUNION-ALIAS ARM (`K | f64`) IS EXCLUDED TOO, and that exclusion is load-bearing
+// rather than cautious. `literal-unions/mixed-union-alias-member-preserves.vl` pins exactly
+// this shape in exactly this position — `elems(): (K | f64)[] { return ["bb", 2.5] }` and
+// `const u: (K | f64)[] | {w: i32} = ["aa", 2.5]` — and its go4 case reaches the arm's
+// box-element build ONLY by classifying itself as a scalar `string[]` and matching the
+// probed atom `"string"` against the arm's stored element atoms
+// (`unionRefArrayArmSlotForElem`); that file's own header says so. A litunion arm's
+// string-shaped members are interned ATOMS, not string values, so "is the first element a
+// string expression" is not the same question there and master's answer is kept.
+export function arrLitBoxElemName(arrIx: i32): string {
+  const ty = nodeTyIxOf(arrIx)
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if !(t is TyArray) { return "" }
+  if t.aElem < 0 { return "" }
+  const el = T.tys[t.aElem]
+  if !(el is TyUnion) { return "" }
+  if el.uMembers.length < 2 { return "" }
+  if tyIsLitUnion(t.aElem) { return "" }
+  const cen = nodeArrayElemName(arrIx)
+  if cen == "" { return "" }
+  if nameIsLitUnionArmValueUnion(cen) { return "" }
+  cen
+}
+
+// The REGISTERED form — `arrLitBoxElemName` plus the row check — for the scalar classifiers
+// to consult. It cannot be `arrLitUnionElemName` itself: that one asks `arrLitIsStr`, so a
+// scalar classifier asking it back would close a cycle.
+//
+// THE SCALAR CLASSIFIERS ARE FIRST-ELEMENT PROBES, AND THAT IS THE OTHER HALF OF THE BUG.
+// With the row minted, `[1, "two"]` reaches the box list — but `["two", 1]`, the same list
+// written the other way round, did not: `arrLitIsStr`'s last leg asks `exprString` of
+// element 0, claimed the string list, and the i32 `1` was stored into a `(ref null $type)`
+// backing — `vl check` rc 0 and invalid wasm at instantiation, the mirror image of what the
+// i32-first order used to do. The recorded element type is the same union in both orders,
+// so asking IT is what makes the two orders one answer.
+export function arrLitBoxElem(arrIx: i32): boolean {
+  const nm = arrLitBoxElemName(arrIx)
+  if nm == "" { return false }
+  isUName(nm)
+}
+
+// The name the REGISTRATION pass (`collectU`) mints a row for: the box element of a literal
+// that today has no row and no other classification.
+//
+// `arrLitIsRef` IS THE EXCLUSION THAT TOOK SEVEN CORPUS REGRESSIONS TO FIND. The union rung
+// is `arrLitIsRef`'s LAST rung by design — "every literal that classifies by its FIRST
+// ELEMENT keeps exactly the classification it had" — so a literal an EARLIER rung already
+// claims has no missing row and must not be registered from here. It is not a redundancy:
+// for a literal of OBJECT LITERALS under an annotation (`const g: {…, f: {a: f64, f: K0 |
+// {w: i32}, z: string}[], …} = {…, f: [{…}, {…}], …}`) the checker's own recorded element is
+// the naive JOIN of the two element shapes — an ANONYMOUS structural composite
+// (`{a:f64,f:string,z:string}|{a:f64,f:{w:i32},z:string}`) the annotation never spells and
+// the emitter never needs, because `e0 is ObjLit` has already routed the literal to the ref
+// list. Registering it ran `collectVariantFields` over two arms with identical field NAMES
+// and different field TYPES and failed the whole emit (`cannot be discriminated`). Seven
+// corpus files, one shape, all green again with this line.
+//
+// NO SCALAR EXCLUSION, and that is deliberate rather than an omission. `arrLitUnionElemName`
+// excludes a literal `arrLitIsStr` / `arrLitIsF64` / `arrLitIsI64` claims, to keep master's
+// path where the two sides could disagree. Repeating those here would be the chicken-and-egg
+// that leaves `["two", 1]` broken: the three classifiers now decline a box literal
+// themselves (`arrLitBoxElem`), but only ONCE THE ROW EXISTS — and this is the function that
+// mints it. The scalar-vs-box conflict the exclusions guarded is settled one level down, at
+// `arrLitBoxElemName`'s litunion-arm carve-out, which is the shape that actually needed the
+// scalar path.
+export function arrLitInferUnionElemName(arrIx: i32): string {
+  const cen = arrLitBoxElemName(arrIx)
+  if cen == "" { return "" }
+  if arrLitIsRef(arrIx) { return "" }
+  cen
+}
+
 // The ref-list element-NAME of an array literal whose ELEMENTS ARE MAPS (`[Map()]`,
 // `[Set()]`, `[mk()]` over a map factory), or "" when they are not — the map twin of
 // `arrLitUnionElemName`, and the ONE answer all three `arrLit*` classifiers read so they
@@ -15419,6 +15521,18 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
     // niche list (`emitArr` seeds `pendingNulString` off the same recorded type), so the
     // string-list build is authoritative even though the first-element probe below misses.
     if nodeArrayElemIsNulStr(arrIx) { return true }
+    // A BOX-LIST literal whose first element happens to be a string (`["two", 1]`,
+    // `["a", true]`): the checker recorded a value UNION element and the emitter holds its
+    // row, so the elements BOX — the string-list build would store the i32 sibling into a
+    // `(ref null $type)` backing, `vl check` rc 0 and invalid wasm at instantiation. Asked
+    // of the RECORDED TYPE, which is order-blind, so `[1, "two"]` and `["two", 1]` are one
+    // answer instead of two; see `arrLitBoxElem` for why a litunion-alias arm is excluded.
+    //
+    // LAST, immediately before the first-element probe it exists to override, and after
+    // every arm above that answers from a recorded type of its own — a `K[]` /
+    // `(K | null)[]` / `string[]` / `(string | null)[]` element is not a value union and
+    // none of those arms can be reached by a literal this one claims.
+    if arrLitBoxElem(arrIx) { return false }
     return exprString(a.arrElems[0], fnIx)
   }
   false
@@ -15432,6 +15546,13 @@ export function arrLitIsF64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    // A BOX-LIST literal with an f64 member (`[2.5, "a"]`, `["a", 2.5]`): the checker
+    // recorded a value UNION element and the emitter holds its row, so the elements BOX,
+    // and the f64-list build would store the string ref into an `(array (mut f64))`
+    // backing. The scalar twin of the arm in `arrLitIsStr`, and needed in BOTH orders for
+    // opposite reasons — the scan below is order-BLIND (any f64 member claims the list), so
+    // here it is the union that has to win rather than the first element.
+    if arrLitBoxElem(arrIx) { return false }
     // ANY f64 element makes the literal an f64 LIST (the i64 dual above): an
     // int sibling re-encodes at the store, exactly as when the float comes
     // FIRST. First-element-only classification let `[2, 1.5]` claim the i32
@@ -25851,6 +25972,10 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    // A BOX-LIST literal with an i64 member (`[6000000000, "a"]`): the f64 arm's twin, and
+    // the same reason — the scan below is order-blind, the recorded element is a value
+    // union the emitter holds a row for, and the elements box. See `arrLitBoxElem`.
+    if arrLitBoxElem(arrIx) { return false }
     // ANY i64 element makes the literal an i64 LIST — a small-magnitude sibling
     // widens at the store, exactly as it does when the i64 element comes FIRST.
     // First-element-only classification let `[712583, 13131313131]` claim the i32

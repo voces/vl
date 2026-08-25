@@ -361,6 +361,7 @@ import {
   arrLitElemHintTy,
   arrLitElemKind,
   arrLitElemName,
+  arrLitInferUnionElemName,
   arrLitIsF32,
   arrLitIsF64,
   arrLitIsI64,
@@ -726,6 +727,17 @@ function rlHintElemTy(ix: i32) {
   const rt = nodeRepTyIxOf(ix)
   if rt < 0 { return -1 }
   const t = T.tys[rt]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
+// The arena ELEMENT type of the array node `ix`, read off the CHECKER's recorded type
+// (`nodeTyIxOf`) rather than the rep one — the type `arrLitInferUnionElemName` renders its
+// name from, so the members this feeds to `collectTyMembersReach` are that name's members.
+function arrLitElemTyIxOf(ix: i32) {
+  const at = nodeTyIxOf(ix)
+  if at < 0 { return -1 }
+  const t = T.tys[at]
   if t is TyArray { return t.aElem }
   -1
 }
@@ -7307,6 +7319,54 @@ export function collectU(stmts: i32[]) {
   while ilu < inferLetCount() {
     registerValueUnionName(inferLetTyAt(ilu))
     ilu = ilu + 1
+  }
+  // INFERRED ARRAY-ELEMENT UNIONS (`const xs = [1, "two"]`, `const xs = [c, d]`) — the
+  // literal twin of the two loops above, and the last position whose union the emitter
+  // could learn about only from an annotation.
+  //
+  // Every other registration route runs off a SPELLING: a `type` declaration, an
+  // annotation the name/arena walks reach, an inferred return, an inferred binding. An
+  // un-annotated array literal spells its element union nowhere, so the row was never
+  // minted, `arrLitUnionElemName`'s `isUName` gate declined, and `arrLitIsRef`'s union rung
+  // — written for exactly this literal — could never fire. The literal fell to the i32
+  // list, where a boolean member is silently stored as its i32 (`[1, true]` printed `1`
+  // twice), a string member is a ref in an i32 backing (`[1, "two"]`: `vl check` rc 0, then
+  // `expected i32, found (ref $type)` at instantiation), and a struct member hits the i32
+  // path's loud floor (`[c, d]`: `struct array elements are not supported`). One missing
+  // row, three failure modes.
+  //
+  // REGISTERED UNDER THE CLASSIFIER'S OWN KEY (`arrLitInferUnionElemName`, i.e.
+  // `nodeArrayElemName`), not under the arena walk's render. `collectTyReachRegister` keys
+  // on `canonEmitName(tyToNominalName(ty))` and `nodeArrayElemName` prefers the reverse-
+  // mapped nominal composite for an ANONYMOUS inferred member set — two spellings, and only
+  // the second one satisfies the `isUName` the classifier asks. This is the same choice
+  // `registerInferRetNominalUnion` makes for inferred returns, for the same reason, and it
+  // keeps ONE row per union rather than the duplicate-tag hazard that function's header
+  // describes.
+  //
+  // MEMBERS FIRST — bucket (c). Registering a variant-box union runs `collectVariantFields`
+  // on its struct arms synchronously, so an arm whose FIELD is itself a union must already
+  // be registered or `fieldTypeCode` fails loud. `collectTyMembersReach` is the same
+  // pre-descent the walk's own `TyUnion` arm runs.
+  //
+  // `isUName`-gated, so the ANNOTATED spelling of the same list (`const xs: (i32 |
+  // string)[] = [1, "two"]`, which already runs at master) is untouched: its row exists by
+  // the time this runs and the loop is a no-op. Every literal this pass does not claim
+  // keeps master's classification exactly.
+  let iau = 0
+  while iau < P.nodes.length {
+    const an = P.nodes[iau]
+    if an is ArrayLit {
+      const aeu = arrLitInferUnionElemName(iau)
+      if aeu != "" {
+        if !isUName(aeu) {
+          const aety = arrLitElemTyIxOf(iau)
+          if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
+          if registerInlineUnion(stmts, aeu) < 0 { return -1 }
+        }
+      }
+    }
+    iau = iau + 1
   }
   if uDeclared {
     if assignTags() < 0 { return -1 }

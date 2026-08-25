@@ -260,8 +260,35 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 >   `types/nullable-union-alias.vl`'s own header stale. **Filed, not taken** (a canon union-arm
 >   change in the twice-ruled Lsoft/PRESERVE region), together with a bigger one found by the grid:
 >   **an UN-ANNOTATED array literal of union elements is silent INVALID WASM on master in every
->   shape measured** — root cause `arrLitIsRef` classifying by the SYNTAX of the first element, and
->   the checker's `nodeArrayElemName` having no `TyUnion` arm to read.
+>   shape measured**.
+>
+>   **THE UN-ANNOTATED ARRAY LITERAL IS CLOSED, AND ITS FILED ROOT CAUSE WAS STALE (2026-08-25).**
+>   The 2026-07-29 filing named `arrLitIsRef`'s first-element syntax probe plus "the checker's
+>   `nodeArrayElemName` having no `TyUnion` arm"; that arm has existed since the inferred-union work
+>   landed, and `arrLitIsRef` has carried a union rung since then too. **The missing piece was the
+>   ROW.** Every union-registration route runs off a SPELLING that appears in the source — a
+>   `type U = A | B` declaration, an annotation the name/arena walks reach, an inferred RETURN, an
+>   inferred `let` — and an un-annotated literal spells its union nowhere, so
+>   `arrLitUnionElemName`'s `isUName` gate declined and the rung could never fire. Witness: adding
+>   an unrelated `const dummy: i32 | string = 1` to `const xs = [1, "two"]` makes it run correctly
+>   ON MASTER. `collectU` now registers the literal's element union under the classifier's own key,
+>   the literal twin of the inferred-return and inferred-`let` loops beside it. *A rung that never
+>   fires is not evidence that the rung is wrong.* Three failure modes, one row: `[1, true]` printed
+>   `1` twice (silent wrong answer), `[1, "two"]` was check-clean invalid wasm, `[c, d]` hit
+>   `struct array elements are not supported`. **The scalar classifiers were the second half**:
+>   `arrLitIsStr`'s first-element probe claimed `["two", 1]`, and `arrLitIsF64`/`arrLitIsI64`'s
+>   order-BLIND scans claimed `[2.5, "a"]` in BOTH orders — all three now decline a literal whose
+>   recorded element is a registered value union, which is what makes the two orders one answer. A
+>   litunion-alias arm (`K | f64`) is carved out and keeps its scalar path, which
+>   `literal-unions/mixed-union-alias-member-preserves.vl` requires. Pinned by
+>   `arrays/inferred-union-element-literal.vl`. **Residue, both loud and both pinned**: an
+>   un-annotated NESTED literal with a union leaf (`[[1, "a"]]`) went from silent invalid wasm to
+>   `nested arrays are not supported` — it joins the ref-inner class `arrLitIsRef`'s nested rung
+>   already excludes, and a union leaf needs a ref-list-of-ref-lists element kind plus an inner row
+>   at a strictly lower slot (`error-inferred-union-element-nested.vl`); and a LONE declared-struct
+>   ident element (`const cs = [c]`) still rejects, because a one-member set is no union and no
+>   first-element syntax probe sees a bare ident
+>   (`error-inferred-union-element-lone-struct.vl`).
 
 ### Consumer-driven requirements — webcraft (`docs/webcraft-requirements.md`)
 
