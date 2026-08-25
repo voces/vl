@@ -130,6 +130,7 @@ import {
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
+  nodeTyMapValIsNumLitUnion,
   nodeTyMapValName,
   nodeTyName,
   nodeTyPrimName,
@@ -140,6 +141,7 @@ import {
   numLitUnionArrayBaseName,
   numLitUnionBaseName,
   numLitUnionBaseTy,
+  numLitUnionHasBase,
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
   recordNodePin,
@@ -10892,11 +10894,53 @@ export function mapIsSetExpr(exprIx: i32, fnIx: i32) {
 // shared mono i32 map — so a predicate keyed only on `mapReadMvSlot >= 0` would miss the
 // exact program in the witness. The mono arm re-uses `emitMapGet`'s own niche exclusions
 // (`nodeTyMapValIsLitUnion` and the boolean twins) so the two cannot drift apart.
+// The ARENA-ONLY twin of `mapReadScalarBoxKind` below: same question, answered from the
+// recorded types alone so it can run in passes that have no enclosing function to resolve
+// a receiver against.
+//
+// WHY A TWIN RATHER THAN A DEFAULT ARGUMENT. `mapReadScalarBoxKind` opens with
+// `exprMap(e.idxArr, fnIx)`, which resolves the receiver through the FUNCTION's locals and
+// params; handed `-1` it answers false for every receiver, so the predicate silently
+// returns "not a map read" everywhere. That is not a hypothetical — it is what this
+// function was written to replace, after the `-1` spelling made the whole feature read as
+// working-but-inert on the scalar widths while the niche widths (which never needed it)
+// kept passing. A predicate that degrades to FALSE on a missing input is the shape that
+// hides itself.
+//
+// The exclusions are the same set and stated once, in the sibling below.
+export function mapReadScalarBoxKindTy(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is Index) { return -1 }
+  const rt = nodeTyIxOf(e.idxArr)
+  if rt < 0 { return -1 }
+  const r = T.tys[rt]
+  if !(r is TyMap) { return -1 }
+  const v = r.mVal
+  if v < 0 { return -1 }
+  // Every niche-bearing value carries its own "absent" and must keep today's lowering.
+  if tyIsLitUnion(v) { return -1 }
+  if numLitUnionHasBase(v) { return -1 }
+  if tyScalarBaseIs(v, "boolean") { return -1 }
+  if tyScalarBaseIs(v, "i32") { return 0 }
+  if tyScalarBaseIs(v, "i64") { return 3 }
+  if tyScalarBaseIs(v, "f64") { return 4 }
+  if tyScalarBaseIs(v, "f32") { return 5 }
+  -1
+}
+
 export function mapReadScalarBoxKind(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[unwrapParen(exprIx)]
   if !(e is Index) { return -1 }
   if !exprMap(e.idxArr, fnIx) { return -1 }
+  // A NUMERIC LITERAL UNION value is excluded FIRST, because neither test below can see
+  // it: it reps as its BASE SCALAR (#1866) so it interns an ordinary f64/i32 mv slot,
+  // while its NULLABLE is the `-1` niche rather than the value box — and the litunion
+  // exclusions further down are string-only by construction (`tyIsLitUnion` requires every
+  // member to be `litKind == "str"`). Measured: without this a `{[string]: N}` read claims
+  // f64 and the narrow becomes `literal is over a struct union is not supported`.
+  if nodeTyMapValIsNumLitUnion(e.idxArr) { return -1 }
   const sl = mapShapeOfExpr(e.idxArr, fnIx)
   if sl >= 0 {
     if mvValKind[sl] == 10 {
