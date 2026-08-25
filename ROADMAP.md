@@ -1499,6 +1499,29 @@ in-language GC knobs.
   codegen ignored outright until the live lexical binding was made to outrank the param in both
   halves of name resolution; witness `tests/cases/scope/local-shadows-param.vl`. Future: ad-hoc
   overloading? Default "no" → `DECISIONS.md`.
+- ⬜ **B6c. An UNCHECKED map read — the fast path beside the boxing fix.** Filed 2026-08-25
+  from the owner's question when the boxing fix was approved: *"we should maybe figure it an
+  unsafe fast path?"* Not scheduled; recorded so the shape is not re-derived.
+  - **Why it becomes worth having.** A map MISS on a numeric-valued map currently narrows as
+    PRESENT (`tests/cases/soundness/xfail-miscompile-map-scalar-miss-narrows-present.vl`), and
+    the ruled fix is to BOX the read wherever it is consumed as a nullable — measured at a
+    proxy ~1.11x / 1.2 ns per read. That is the right default. It is also the first time a
+    correct map read costs anything, so the escape hatch stops being hypothetical.
+  - **The hatch is narrower than "unsafe".** The caller who wants it has usually ALREADY
+    proved presence — iterating `m.keys()`, or following a `.has(k)` — so the wanted operation
+    is "read a key I know is live, with no absent-check and no box". That is a `getUnchecked`
+    /`m.at(k)`-shaped name, not a blanket unsafe mode, and it fails like every other
+    unchecked read in the language: `__trap__` on a genuine miss rather than silent garbage.
+    Contrast `std:buffer`'s hoisted accessors (§M8), which kept their fence precisely because
+    dropping it bought nothing there.
+  - **Measure BEFORE building it.** Two of the three obvious customers may already be served:
+    `m[k] ?? d` does NOT box (it probes the entry table and coalesces), and a `for k in m`
+    loop already has the entry in hand. So the residual population might be small enough that
+    the hatch is unnecessary — establish that it is not before widening a permanent surface,
+    the same discipline the `getF32At` addition was held to.
+  - **std, not the compiler**, if it lands: `Map` is a compiler-known type but this is
+    POLICY over an existing probe, the same call `std:buffer` made for `Buffer` (O1 = (c)).
+    A std export means the `std-api-reviewer` gate applies.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
   `CHANGELOG.md`): prefer-`const`, unused-import, dead/constant branch (`constant-condition`), `step 0`
   (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else, unused function,
