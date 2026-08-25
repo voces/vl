@@ -24,7 +24,12 @@ becomes a different type within a branch. The fact is produced once (in the chec
   N-case union peels one variant per `if`; nested narrowings compose on the *current* view, not the
   declared type.
 - **Post-guard (guard clauses):** `if x == null { return }` → `x` non-null for the rest of the block
-  (any divergent then-branch — return/break/continue, via `divergesStatement`).
+  (any divergent then-branch — return/break/continue, via `divergesStatement`). Post-guard
+  subtractions **accumulate**, both across a sequence of separate `if`s and down an `else if`
+  chain, so `if u is A { return } else if u is B { return }` leaves the tail a bare `U − A − B`.
+  The accumulation stops at the first arm that does *not* diverge — control can leave the chain
+  through that arm's body with its condition true — and it applies to **bare names only**
+  (a property path's narrowing can be retired inside an arm, so it is not carried out).
 - **`&&` / `||` chains:** a guard narrows a *list* of facts. `&&` narrows several places at once
   (`x != null && x.y is i32`), and its RHS is type-checked *and* codegen'd with the LHS's narrowing
   already applied (short-circuit). `||` is the De Morgan dual — `if x == null || y == null { return }`

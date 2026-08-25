@@ -800,6 +800,57 @@ let npInvBy: i32[] = []
 let npEpochs: i32[] = []
 let npFrames: i32[] = []
 
+// POST-GUARD narrowings HANDED UP by an `if` that is itself the ELSE ARM of another
+// `if` — an `else if`. Such an `if` has NO enclosing block of its own: "the rest of its
+// block" is the rest of the PARENT's block, and it is the parent that decides whether
+// that code is reachable at all. So it cannot `declare` its own fall-through narrowing,
+// and both ways it used to try were wrong, one in each direction:
+//
+//   * the parent had pushed an else-arm narrowing scope, and `popScope` unwound the
+//     arm's `declare` with it — the whole `else if` chain narrowed nothing past the
+//     FIRST arm (`soundness/elseif-chain-residual.vl`'s open half);
+//   * the parent had pushed NO scope (its condition narrowed nothing — `else if` after
+//     `if k > 0 { … }`), so the arm's `declare` landed straight in the enclosing block
+//     and applied even when the PARENT's then did not diverge — a fall-through the
+//     guard never proved. `if k > 0 { print(…) } else if x is string { return 0 }` then
+//     `return x + 1` was check-clean and emitted `type mismatch: expected i32, found
+//     (ref $type)`, measured on `e2b5a1f7`.
+//
+// The parent consumes these ONLY when its own then diverges, which composes to exactly
+// "every arm from the top of the chain down to here exited, so control reached here
+// through the last arm's false edge". Bare names only, for the reason the guard-clause
+// comment in `checkIfStmtNode` gives at length about property paths.
+//
+// Entries are pushed in POST-ORDER, so the innermost arm's (tightest) residual for a
+// place lands LAST — `checkIfStmtNode` applies the buffer in REVERSE for that reason.
+// A frame mark (`pgUpMark`, a local) drops an arm's whole subtree when that arm's own
+// then does not diverge.
+let pgUpKeys: string[] = []
+let pgUpTys: i32[] = []
+
+// The node index of the `if` currently being checked AS the else arm of a chain, or
+// `-1`. Set immediately before `checkNode(n.ifElse)` and read-and-cleared at the very
+// top of `checkIfStmtNode`, so ONLY the immediate callee sees it: an `if` nested inside
+// an arm's BODY has a block of its own and declares normally.
+let pgUpArmIx = -1
+
+// THE PLACE TYPE A TRAILING CHAIN SAW, banked at the instant the post-guard subtraction
+// replaced it. `ifChainExhausts` asks whether a chain's arms COVER its place's union,
+// and by the time it runs the chain has already SUBTRACTED those same arms from that
+// place — so asking `lookup` is circular and answers "covered" every time. It did:
+// `exhaustive-is-chain-no-else-reject.vl` and `exhaustive-missing-is-case.vl` both went
+// silently green, which is the failure mode this whole change has to avoid.
+//
+// Keyed by the chain HEAD's node index, and that is the load-bearing part. A head that
+// does not post-narrow (its then falls through, or its condition narrows nothing) writes
+// nothing, so `pgPreIx` still names some earlier statement's `if` — the check must not
+// read that bank, or a chain whose place was legitimately narrowed by a guard ABOVE it
+// gets a "missing" list computed against a union it never saw. On a miss it falls back
+// to `lookup`, which is right whenever nothing subtracted.
+let pgPreIx = -1
+let pgPreKeys: string[] = []
+let pgPreTys: i32[] = []
+
 // CYCLE GUARD stacks for `assignable` over recursive named types (A11): a
 // (src, dst) pair already being compared higher in the recursion is assumed
 // assignable — coinductive, mirroring the host's lazy alias-leaf leniency for
@@ -2803,6 +2854,12 @@ export function initChecker() {
   npInvBy = []
   npEpochs = []
   npFrames = []
+  pgUpKeys = []
+  pgUpTys = []
+  pgUpArmIx = -1
+  pgPreIx = -1
+  pgPreKeys = []
+  pgPreTys = []
   weSums = Map()
   weOpen = []
   weRoots = []
@@ -18205,7 +18262,22 @@ function ifChainExhausts(ifIx: i32) {
   // No place was discriminated (shouldn't happen) — not exhaustive.
   if !havePlace { return false }
   // Look up the place's union members; cover each against the tested set.
-  const pty = lookup(placeName)
+  //
+  // THE PRE-SUBTRACTION TYPE FIRST (`pgPreIx`). This chain's own post-guard narrowing has
+  // ALREADY replaced the place's binding with the residue of the very arms being counted
+  // here, so `lookup` alone makes the question circular — it reports "covered" for every
+  // chain whose arms diverge, which is exactly the two rejects this rule exists to make.
+  // The bank is keyed by this chain's node index, so it answers only when THIS chain is
+  // what subtracted; `lookup` is the fallback and is correct when nothing did.
+  let pty = -1
+  if pgPreIx == ifIx {
+    let pk = 0
+    while pk < pgPreKeys.length {
+      if pgPreKeys[pk] == placeName { pty = pgPreTys[pk] }
+      pk = pk + 1
+    }
+  }
+  if pty < 0 { pty = lookup(placeName) }
   if pty < 0 { return false }
   const pt = T.tys[pty]
   if pt is TyNullable {
@@ -28582,6 +28654,12 @@ function ifExprNodeOf(ix: i32): i32 {
 }
 
 function checkIfStmtNode(n: IfStmt, ix: i32) {
+  // Am I the ELSE ARM of an enclosing `if` (`… else if …`)? Read and cleared here, so
+  // the flag reaches exactly one callee and every `if` inside a branch BODY sees `-1`
+  // (see `pgUpKeys`). `pgUpMark` is this subtree's frame in the hand-up buffer.
+  const isElseArm = ix >= 0 && ix == pgUpArmIx
+  pgUpArmIx = -1
+  const pgUpMark = pgUpKeys.length
   // An `if`/`else` in VALUE position is an EXPRESSION whose value is the join of its
   // branch tail values (`if c { 1 } else { 2 }` is `i32`). Capture whether THIS `if`
   // sits in the function's return-tail position; the condition itself never does.
@@ -28609,6 +28687,22 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const enNames: string[] = []
   const enTys: i32[] = []
   collectElseNarrows(n.ifCond, enNames, enTys)
+  // THE GUARD-CLAUSE DIVERGENCE TEST, hoisted: the post-guard leg at the bottom asks it,
+  // and so does the hand-up decision for an `else if` chain, and the two must ask the
+  // SAME question. Deliberately the LAST-STATEMENT test and not the broader
+  // `daBranchDiverges` — `emit_classify.pushPostGuardNarrow` runs exactly
+  // `blockLastStmtExits`, and taking the union there once miscompiled the compiler.
+  let thenExits = false
+  const tnDiv = P.nodes[n.ifThen]
+  if tnDiv is Block {
+    const tdst = tnDiv.blkStmts
+    if tdst.length > 0 {
+      const tdlast = P.nodes[tdst[tdst.length - 1]]
+      if tdlast is RetStmt { thenExits = true }
+      else if tdlast is BreakStmt { thenExits = true }
+      else if tdlast is ContinueStmt { thenExits = true }
+    }
+  }
   // Definite-assignment fork/join: each branch is a separate path forked off
   // the if-entry state; after the chain they JOIN. A binding is assigned after
   // the `if` only if assigned on EVERY surviving (non-diverging) path. With no
@@ -28698,16 +28792,24 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       pushScope(-1)
       applyNarrows(enNames, enTys)
     }
-    retTailPos = ifTail
-    const elseRes = checkNode(n.ifElse)
-    retTailPos = false
-    elseTy = blockTailTy
     // An `else if` CHAIN: the else node is an IfStmt whose VALUE is its own branch
     // join (the checkNode result). `blockTailTy` holds only the INNERMOST block's
     // tail, which under-joins a mixed chain (`if a then k else if b then "cc" else
     // k2` joined to the litunion, dropping the string arm — the emitted string ref
-    // then flowed into an i32 join).
+    // then flowed into an i32 join). Read BEFORE the arm is checked so the same node
+    // also answers "is this arm a chain link?" for the hand-up marker below; `P.nodes`
+    // is not rewritten by checking, so the two reads are the same node.
     const enElse = P.nodes[n.ifElse]
+    // A chain link post-narrows the PARENT's fall-through, not its own — mark it so its
+    // `checkIfStmtNode` banks into `pgUpKeys` instead of declaring into a scope that is
+    // about to be popped (or, with no scope pushed, into a block the guard never
+    // reached).
+    if enElse is IfStmt { pgUpArmIx = n.ifElse }
+    retTailPos = ifTail
+    const elseRes = checkNode(n.ifElse)
+    pgUpArmIx = -1
+    retTailPos = false
+    elseTy = blockTailTy
     if enElse is IfStmt { elseTy = elseRes }
     if enNames.length > 0 { popScope() }
     if ifTail {
@@ -28773,6 +28875,14 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // not post-narrow the fall-through"). When the THEN diverges, reaching the code after
   // the `if` means the ELSE path ran, so the false narrowings hold there exactly as they
   // do with no `else` (`soundness/elseif-chain-residual.vl`).
+  //
+  // AND EVERY ARM OF AN `else if` CHAIN SUBTRACTS, not just this one. A chain link has no
+  // enclosing block of its own, so it banks its residual in `pgUpKeys` and the head of
+  // the chain applies the bank here (`soundness/elseif-chain-multistep.vl`). The bank is
+  // read only under `thenExits`, and each link drops its own subtree when ITS then does
+  // not diverge — so a chain whose MIDDLE arm falls through stops subtracting there, and
+  // the members below it stay in the residual because the fall-through really can be
+  // reached holding one (`soundness/elseif-chain-nondiverging-arm-reject.vl`).
   // Restricted to BARE NAMES, and the restriction is the soundness argument: a bare name's
   // narrowing is a shadowing `declare` whose writes are checked against the NARROWED type,
   // so nothing the else body can legally do falsifies it (`x = "s"` under an `i32` narrowing
@@ -28788,39 +28898,65 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // already unboxed. It has no bank of its own and never did — that is the half of the
   // agreement the removed `pgKeys` was breaking. Path-keyed entries unwind at the
   // ENCLOSING scope's `popScope`.
-  if enNames.length > 0 {
-    const tn2 = P.nodes[n.ifThen]
-    if tn2 is Block {
-      const tst = tn2.blkStmts
-      if tst.length > 0 {
-        const last = P.nodes[tst[tst.length - 1]]
-        let diverges = false
-        if last is RetStmt { diverges = true }
-        else if last is BreakStmt { diverges = true }
-        else if last is ContinueStmt { diverges = true }
-        if diverges {
-          let gi2 = 0
-          while gi2 < enNames.length {
-            const gKey = enNames[gi2]
-            const gTy = enTys[gi2]
-            if isPathKey(gKey) {
-              if !daHasElse {
-                npKeys.push(gKey)
-                npTys.push(gTy)
-                npInvBy.push(-1)
-                npEpochs.push(narFnEpoch)
-              }
-            } else {
-              // ONE LEG FOR BOTH KINDS. A null STRIP (`gTy == nonNullTy(lookup(gKey))`)
-              // and a union SUBTRACTION are the same shadowing `declare`; they were split
-              // here only so the strip could skip the subtraction bank, and the bank is
-              // gone.
-              declare(gKey, gTy)
-            }
-            gi2 = gi2 + 1
-          }
+  if thenExits {
+    let gi2 = 0
+    while gi2 < enNames.length {
+      const gKey = enNames[gi2]
+      const gTy = enTys[gi2]
+      if isPathKey(gKey) {
+        // Paths keep the no-`else` gate, and an else ARM never hands one up either: an
+        // `npKeys` entry is retired IN PLACE by a call or an aliasing write inside the
+        // arm, and re-deriving it in the parent would resurrect exactly what the arm
+        // invalidated — the same argument the `else` gate rests on, one level out.
+        if !daHasElse && !isElseArm {
+          npKeys.push(gKey)
+          npTys.push(gTy)
+          npInvBy.push(-1)
+          npEpochs.push(narFnEpoch)
         }
+      } else if isElseArm {
+        pgUpKeys.push(gKey)
+        pgUpTys.push(gTy)
+      } else {
+        // Bank what the place held BEFORE this subtraction, for the exhaustiveness
+        // check that runs after a TRAILING chain (see `pgPreIx`). Written here and
+        // nowhere else: this is the one line that makes `lookup` stop answering the
+        // question `ifChainExhausts` is asking.
+        if pgPreIx != ix {
+          pgPreIx = ix
+          pgPreKeys = []
+          pgPreTys = []
+        }
+        pgPreKeys.push(gKey)
+        pgPreTys.push(lookup(gKey))
+        // ONE LEG FOR BOTH KINDS. A null STRIP (`gTy == nonNullTy(lookup(gKey))`)
+        // and a union SUBTRACTION are the same shadowing `declare`; they were split
+        // here only so the strip could skip the subtraction bank, and the bank is
+        // gone.
+        declare(gKey, gTy)
       }
+      gi2 = gi2 + 1
+    }
+    // THE CHAIN BELOW THIS `if`, banked by every `else if` arm whose own then diverged.
+    // Applied in REVERSE push order — the buffer is filled post-order, so the deepest
+    // arm's residual is last in and must be declared last to win. Reached only when THIS
+    // then diverges: otherwise the fall-through is also reached with the guard TRUE and
+    // nothing the chain proved holds there.
+    if !isElseArm {
+      let pu = pgUpKeys.length
+      while pu > pgUpMark {
+        pu = pu - 1
+        declare(pgUpKeys[pu], pgUpTys[pu])
+      }
+    }
+  }
+  // Retire this subtree's hand-ups, unless THIS `if` is itself a chain link whose then
+  // diverged — then its own entry and its chain's ride up to the parent, which asks the
+  // same question of its own then.
+  if !isElseArm || !thenExits {
+    while pgUpKeys.length > pgUpMark {
+      pgUpKeys.pop()
+      pgUpTys.pop()
     }
   }
   retTailPos = ifTail
