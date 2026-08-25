@@ -28,7 +28,12 @@ The PR gate has more parts than `deno task test`. In order:
 
 1. `deno task test`
 2. `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts` — the `ci-native` job, **not** part of the above
-3. `scripts/native-fixpoint.sh` and `scripts/lint-self.sh`
+3. `scripts/native-fixpoint.sh` and `scripts/lint-self.sh`, plus **`deno lint`** if the
+   change touches a `.ts` file — CI runs it as its own step, `lint-self.sh` does NOT cover it
+   (that one lints the VL module graph and runs `vl fmt --check`), so a `.ts` edit can pass
+   every other gate here and still fail CI. Two rules bite in practice: `no-import-prefix`
+   and `no-unversioned-import`. Note the convention they enforce — **no test under `tests/`
+   imports an assertion library**; they all `throw new Error` with want/got in the message.
 4. `scripts/rep-fuzz-check.sh` — **mandatory** for anything touching the rep layer or the
    interner; the corpus, the suites and the fixpoint are all blind to REJECT→MISMATCH
 5. `scripts/mono-tyaram-grid.sh` for monomorphizer changes
