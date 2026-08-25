@@ -1,0 +1,93 @@
+// `if m[k] != null` — THE BARE READ COMPARED STRAIGHT AGAINST NULL, no binding.
+//
+// The binding spelling (`const v = m[k]; if v != null`) works, and so does the direct
+// compare over a map whose value has a NICHE (a `string` map's read is a nullable ref, a
+// `boolean` map's is the `2` sentinel). What rejected was the direct compare over a SCALAR
+// value: there is nothing to bind, so the read fell through to the i32 compare and emitted
+// an unseeded bare `null` — `emitProgram: bare null needs a struct-typed context`.
+//
+// IT NEEDS NO BOX AT ALL, which is the point of the arm and why it sits ABOVE the
+// value-union arm rather than reusing it. `m[k] != null` asks exactly the question the
+// probe already answers — is there a live entry for this key — so the lowering IS the
+// probe, the same code `m.has(k)` emits. Boxing the value only to read a tag back off it
+// would allocate twice to recover a bit that was already in a register.
+//
+// THE STORED-ZERO CASE IS THE ONE THAT MATTERS and it is pinned below. `m[7] = 0` then
+// `m[7] != null` must say PRESENT: before the map-read work (#1901, #1903) a scalar map's
+// miss and a stored `0` were indistinguishable, because the read handed back "the rep's
+// empty value" with nothing to mark absence. `.has` was the only spelling that could tell
+// them apart; now the compare can too, and both lower to the same probe.
+// @run
+// @log hit
+// @log absent
+// @log absent
+// @log hit
+// @log hit
+// @log absent
+// @log a-hit
+// @log b-absent
+// @log has-agrees
+
+const m: {[string]: i32} = Map()
+m["a"] = 7
+
+// `!= null`, both directions
+if m["a"] != null {
+  print("hit") // hit
+} else {
+  print("WRONG")
+}
+if m["nope"] != null {
+  print("WRONG") // absent
+} else {
+  print("absent")
+}
+
+// `== null` is the same probe, negated
+if m["nope"] == null {
+  print("absent") // absent
+} else {
+  print("WRONG")
+}
+if m["a"] == null {
+  print("WRONG") // hit
+} else {
+  print("hit")
+}
+
+// A STORED ZERO is present. This is the distinction the old lowering could not make.
+const z: {[i32]: i32} = Map()
+z[7] = 0
+if z[7] != null {
+  print("hit") // hit
+} else {
+  print("WRONG")
+}
+if z[9] != null {
+  print("WRONG") // absent
+} else {
+  print("absent")
+}
+
+// the other scalar widths
+const a: {[string]: f64} = Map()
+a["k"] = 1.5
+const b: {[string]: i64} = Map()
+b["k"] = 7
+if a["k"] != null {
+  print("a-hit") // a-hit
+} else {
+  print("WRONG")
+}
+if b["nope"] != null {
+  print("WRONG") // b-absent
+} else {
+  print("b-absent")
+}
+
+// and it agrees with `.has`, which is the same question spelled the other way
+if (z[7] != null) == z.has(7) {
+  print("has-agrees") // has-agrees
+} else {
+  print("WRONG")
+}
