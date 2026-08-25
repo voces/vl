@@ -1539,6 +1539,33 @@ in-language GC knobs.
   - **std, not the compiler**, if it lands: `Map` is a compiler-known type but this is
     POLICY over an existing probe, the same call `std:buffer` made for `Buffer` (O1 = (c)).
     A std export means the `std-api-reviewer` gate applies.
+- ⬜ **B6d. Lint: a `.has(k)` guard whose body re-reads `m[k]`.** Filed 2026-08-25 from the
+  owner's question — *"if the user checks `m[k]` manually, do we narrow a later assignment,
+  saving allocations?"* The answer is NO, and the guard makes it WORSE, which is what makes
+  this worth a diagnostic rather than a doc line. Measured in one loop, `-O3`, in-loop:
+
+  | spelling | allocations | probe calls |
+  | --- | ---: | ---: |
+  | `const v = m[k]` then `if v is i32` | 1 | 1 |
+  | `if m.has(k) { … m[k] … }` | 1 | **2** |
+  | `if m[k] != null { … m[k] … }` | 1 | **2** |
+  | `m[k] as! i32` | **0** | 1 |
+
+  - **Why it does not narrow, and why that is right.** `m[k]` is not a stable place. Carrying
+    "present" from the guard to the read needs a proof that nothing mutated `m` and nothing
+    changed `k` in between — including through any call — which is an aliasing analysis, not
+    a narrowing rule. TypeScript declines the same thing for the same reason: it narrows a
+    BINDING (`const v = m.get(k)`), never a repeated call. So the language's answer is bind
+    once, and that answer is fine; what is missing is telling anyone.
+  - **The shape is syntactically local**, which is what separates this from B17's harder
+    rows and from the union-let lint (which needs rep knowledge, see the P1.3 row in
+    `webcraft-requirements.md`): a `.has(k)` / `!= null` guard whose body reads the SAME
+    receiver with the SAME key expression, with no assignment to either in between. Precise
+    to detect, mechanical to fix, and the fix is one of two spellings the language already
+    has (`as!` for an assertion, or bind once and narrow).
+  - **Why it will actually fire**, unlike the union-let lint's zero hits: `if m.has(k)` then
+    `m[k]` is the spelling people reach for from memory, because it is what every other
+    language teaches. It is currently the worst-performing of the four.
 - 🟡 **B17. Diagnostics + lint.** BUILD OUT — the lint rule backlog (a few at a time). Shipped (see
   `CHANGELOG.md`): prefer-`const`, unused-import, dead/constant branch (`constant-condition`), `step 0`
   (`for-step-zero`), unreachable-after-return / -break / -diverging-if/else, unused function,
