@@ -540,6 +540,65 @@ export const createWasmChecker = (
     pushString(exp.srcPush, source);
   };
 
+  // THE HOST<->SEED ABI GENERATION this checker speaks. Kept in step with the Rust
+  // host's `HOST_ABI` and the seed's `hostAbi()` — bump all three in the same commit
+  // that changes the contract (the guest->host string element unit, the bulk
+  // Load/Store packing, or the CMD_* table). `docs/internals/cli-design.md`.
+  const LSP_ABI = 2;
+
+  /**
+   * Whether this checker can talk to `exp` at all.
+   *
+   * NOT A CAPABILITY GATE, unlike `hasSymbols` below, and the difference is why this
+   * is separate. A capability gate asks "is this seed OLDER than the feature" and
+   * degrading is the right answer. This asks "do we disagree about what a string IS",
+   * where the failure is not a missing result — it is a WRONG one. #1848 changed a
+   * string's element unit from a UTF-32 code point to a UTF-8 byte while adding,
+   * removing and re-typing NOTHING, so every `typeof exp.foo === "function"` probe
+   * still passes on a mismatched seed and the reader quietly returns mojibake.
+   *
+   * A VS Code extension is pinned independently of the workspace's seed, so this pair
+   * really does drift: the extension updates from the marketplace and the seed from
+   * the repo. That is the same shape as the CLI bug this comes from, where a
+   * four-month-old binary printed raw UTF-32 at exit 0.
+   *
+   * A seed exporting nothing here predates the stamp, which is exactly the vintage
+   * that produces the bug — so absent is a mismatch, not a pass.
+   */
+  const speaksAbi = (exp: Exports): boolean =>
+    typeof exp.hostAbi === "function" && exp.hostAbi() === LSP_ABI;
+
+  /**
+   * The single diagnostic an incompatible seed produces, in place of the check it
+   * cannot safely run. Positionless (line 0, zero-width) because it is about the
+   * TOOLCHAIN rather than about the file.
+   *
+   * Every other query degrades to "no result" on a mismatch — the existing safe
+   * idiom, which drops the LSP back to its TS path. That is right for them and wrong
+   * here alone: diagnostics are the one surface where silence is indistinguishable
+   * from "your file is clean", so this says why out loud instead.
+   */
+  const abiMismatchDiag = (exp: Exports): VLDiagnostic[] => {
+    const seed = typeof exp.hostAbi === "function"
+      ? `speaks host ABI ${exp.hostAbi()}`
+      : "predates ABI versioning (host ABI 1 or older)";
+    return [{
+      message:
+        `VL seed is incompatible with this extension — the extension speaks host ` +
+        `ABI ${LSP_ABI}, the seed ${seed}. Diagnostics are disabled rather than ` +
+        `shown wrong: the two disagree about how strings cross the boundary, so ` +
+        `every message read from this seed would be mis-decoded. Update the ` +
+        `extension, or rebuild the workspace seed with scripts/refresh-compiler.sh.`,
+      severity: "error",
+      source: "vital",
+      code: "seed-abi-mismatch",
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 0 },
+      },
+    }];
+  };
+
   // The symbol-query exports land in a single Stage-2 seed. An older Stage-1 seed
   // (diagnostics only) lacks them; the methods degrade to "no result" so the LSP
   // falls back to its TS path rather than crashing on a missing export.
@@ -567,7 +626,7 @@ export const createWasmChecker = (
     character: number,
   ): Promise<WasmRange | undefined> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp)) return undefined;
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return undefined;
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     // Native lines are 1-based; the LSP cursor line is 0-based.
@@ -584,7 +643,7 @@ export const createWasmChecker = (
     includeDeclaration: boolean,
   ): Promise<WasmRange[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp)) return [];
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return [];
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     const nativeLine = line + 1;
@@ -618,7 +677,10 @@ export const createWasmChecker = (
     },
   ): Promise<WasmOccurrence[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasModuleTags(exp)) return [];
+    if (
+      exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      !hasModuleTags(exp)
+    ) return [];
     // Compile this candidate as its own entry (module 0) + its transitive deps,
     // so its committed graph includes the declaring module IFF the candidate
     // reaches it via imports.
@@ -687,7 +749,7 @@ export const createWasmChecker = (
     character: number,
   ): Promise<string | undefined> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) ||
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
       typeof exp.typeStrAt !== "function") {
       return undefined;
     }
@@ -706,7 +768,7 @@ export const createWasmChecker = (
     character: number,
   ): Promise<string | undefined> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) ||
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
       typeof exp.memberTypeStrAt !== "function") {
       return undefined;
     }
@@ -725,7 +787,7 @@ export const createWasmChecker = (
     character: number,
   ): Promise<string | undefined> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) ||
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
       typeof exp.typeAliasAt !== "function") {
       return undefined;
     }
@@ -749,7 +811,7 @@ export const createWasmChecker = (
     read: ModuleReader,
   ): Promise<WasmToken[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasTokens(exp)) return [];
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasTokens(exp)) return [];
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     const count = exp.tokCount();
@@ -796,7 +858,7 @@ export const createWasmChecker = (
     read: ModuleReader,
   ): Promise<WasmMemberToken[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasMembers(exp)) return [];
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasMembers(exp)) return [];
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     const count = exp.memberCount();
@@ -831,7 +893,7 @@ export const createWasmChecker = (
     character: number,
   ): Promise<WasmScopeBinding[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasScope(exp)) return [];
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasScope(exp)) return [];
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     // Native lines are 1-based; the LSP cursor line is 0-based.
@@ -869,7 +931,10 @@ export const createWasmChecker = (
     character: number,
   ): Promise<WasmMemberCompletion[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasMemberScan(exp)) return [];
+    if (
+      exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      !hasMemberScan(exp)
+    ) return [];
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     // Native lines are 1-based; the LSP cursor line is 0-based.
@@ -904,7 +969,7 @@ export const createWasmChecker = (
     read: ModuleReader,
   ): Promise<WasmInlayCandidate[]> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasInlay(exp)) return [];
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasInlay(exp)) return [];
     await prepare(exp, source, entryKey, read);
     exp.checkSrcSym();
     const count = exp.inlayScan();
@@ -947,7 +1012,10 @@ export const createWasmChecker = (
     read: ModuleReader,
   ): Promise<Record<string, WasmImportedSource>> => {
     const exp = instantiate();
-    if (exp === undefined || !hasSymbols(exp) || !hasCrossFile(exp)) return {};
+    if (
+      exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      !hasCrossFile(exp)
+    ) return {};
     // `prepare` commits the entry (table index 0) plus its transitive deps, so
     // the import/export tables below cover every committed module.
     await prepare(exp, source, entryKey, read);
@@ -1016,7 +1084,7 @@ export const createWasmChecker = (
     entryKey: string,
   ): WasmModuleSurface => {
     const exp = instantiate();
-    if (exp === undefined || !hasCrossFile(exp) || !hasExportKw(exp)) {
+    if (exp === undefined || !speaksAbi(exp) || !hasCrossFile(exp) || !hasExportKw(exp)) {
       return { exports: [], imports: [] };
     }
     // Commit the entry (table index 0) so `modScan` fills the import/export tables
@@ -1108,6 +1176,12 @@ export const createWasmChecker = (
     if (exp === undefined) {
       throw new Error("wasm checker became unavailable (seed removed?)");
     }
+    // The one surface that REPORTS the mismatch instead of degrading: an empty
+    // diagnostic list is indistinguishable from "your file is clean", which is the
+    // worst possible answer here. Everything else falls back to the TS path silently
+    // (correctly — it produces a right answer by another route); diagnostics cannot,
+    // because every message read from a mismatched seed would be mis-decoded.
+    if (!speaksAbi(exp)) return abiMismatchDiag(exp);
     await prepare(exp, source, entryKey, read);
     exp.checkSrc();
     return readDiags(exp);
@@ -1130,6 +1204,11 @@ export const createWasmChecker = (
     const exp = instantiate();
     if (exp === undefined || typeof exp.compileSrc !== "function") {
       return { bytes: undefined, diagnostics: [] };
+    }
+    // This path RETURNS diagnostics alongside its bytes, so it can say why rather
+    // than hand back a silent empty module (the playground's Run button).
+    if (!speaksAbi(exp)) {
+      return { bytes: undefined, diagnostics: abiMismatchDiag(exp) };
     }
     await prepare(exp, source, entryKey, read);
     const status = exp.compileSrc(); // 0 ok; 1 lex/parse; 2 type; 3 emit
@@ -1275,7 +1354,7 @@ export const createWasmChecker = (
   // Static (no source / `prepare`) — the builtin surface is fixed.
   const builtinCompletions = (): WasmBuiltin[] => {
     const exp = instantiate();
-    if (exp === undefined || typeof exp.builtinScan !== "function") return [];
+    if (exp === undefined || !speaksAbi(exp) || typeof exp.builtinScan !== "function") return [];
     const n = exp.builtinScan();
     const out: WasmBuiltin[] = [];
     for (let i = 0; i < n; i++) {

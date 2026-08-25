@@ -233,3 +233,88 @@ Deno.test("playground-lsp: features degrade to empty before a seed is wired", as
   );
   assertEquals(lsp.format("let x=1\n"), undefined);
 });
+
+// ── THE HOST↔SEED ABI GATE (webcraft A2, the LSP half) ──────────────────────
+//
+// The extension is pinned independently of the workspace's seed — it updates from
+// the marketplace, the seed from the repo — so the pair really does drift. When it
+// does, the failure is NOT a missing result: #1848 changed a string's element unit
+// from a UTF-32 code point to a UTF-8 byte while adding, removing and re-typing
+// NOTHING, so every `typeof exp.foo === "function"` probe still passes and the
+// reader quietly returns mojibake. The CLI's version of this printed raw UTF-32 at
+// exit 0 for two days.
+//
+// `speaksAbi` refuses the seed instead. Every query degrades to "no result" (the
+// existing safe idiom — the LSP falls back to its TS path), EXCEPT diagnostics and
+// compile, which report the mismatch: an empty diagnostic list is indistinguishable
+// from "your file is clean", which is the one answer worse than saying nothing.
+
+// A checker over a seed whose `hostAbi` is overridden — the drift, without needing
+// a genuinely old artifact on disk. `undefined` removes the export entirely, which
+// is what any pre-stamp seed looks like.
+const checkerAtAbi = (abi: number | undefined): WasmChecker => {
+  const bytes = Deno.readFileSync(SEED);
+  const instance = new WebAssembly.Instance(
+    new WebAssembly.Module(bytes as BufferSource),
+    {},
+  );
+  // A PLAIN COPY, not a Proxy: a wasm export is a non-configurable own data
+  // property, so a `get` trap that returns anything else throws a TypeError.
+  const real = instance.exports as unknown as Exports;
+  const patched: Exports = { ...real };
+  if (abi === undefined) delete patched.hostAbi;
+  else patched.hostAbi = () => abi;
+  return createWasmChecker(() => patched);
+};
+
+Deno.test({ name: "lsp-abi: the real seed matches, so a clean program still checks clean", ignore }, async () => {
+  const diags = await seedChecker().check("print(1 + 2)\n", "main.vl", noSiblings);
+  if (diags.length !== 0) {
+    throw new Error(
+      `the on-disk seed should satisfy the gate; got: ${diags.map((d) => d.message).join("; ")}`,
+    );
+  }
+});
+
+Deno.test({ name: "lsp-abi: a MISMATCHED seed reports, and names both generations", ignore }, async () => {
+  const diags = await checkerAtAbi(1).check("print(1 + 2)\n", "main.vl", noSiblings);
+  if (diags.length !== 1) {
+    throw new Error(`expected exactly one diagnostic, got ${diags.length}`);
+  }
+  const d = diags[0];
+  if (d.code !== "seed-abi-mismatch") throw new Error(`wrong code: ${d.code}`);
+  // Both numbers must appear: the whole cost of the CLI bug this comes from was a
+  // re-grade that could not tell WHICH of the two artifacts was wrong.
+  if (!d.message.includes("host ABI 2") || !d.message.includes("host ABI 1")) {
+    throw new Error(`message names only one generation: ${d.message}`);
+  }
+});
+
+Deno.test({ name: "lsp-abi: a PRE-STAMP seed (no hostAbi export) is a mismatch too", ignore }, async () => {
+  // Absent is not a pass: a seed exporting nothing here predates the stamp, which is
+  // exactly the vintage that produces the bug.
+  const diags = await checkerAtAbi(undefined).check("print(1 + 2)\n", "main.vl", noSiblings);
+  if (diags.length !== 1 || diags[0].code !== "seed-abi-mismatch") {
+    throw new Error(`expected the mismatch diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (!diags[0].message.includes("predates ABI versioning")) {
+    throw new Error(`should name the pre-stamp case: ${diags[0].message}`);
+  }
+});
+
+Deno.test({ name: "lsp-abi: a mismatched seed emits NO wasm from the Run path", ignore }, async () => {
+  const { bytes, diagnostics } = await checkerAtAbi(1).compile("print(1 + 2)\n", "main.vl", noSiblings);
+  if (bytes !== undefined) throw new Error("a mismatched seed must not hand back bytes");
+  if (diagnostics.length !== 1 || diagnostics[0].code !== "seed-abi-mismatch") {
+    throw new Error(`Run path should explain itself, got: ${JSON.stringify(diagnostics)}`);
+  }
+});
+
+Deno.test({ name: "lsp-abi: a mismatched seed degrades the QUERY paths to no result", ignore }, async () => {
+  // The other surfaces stay silent on purpose — the LSP falls back to its TS path
+  // and produces a right answer by another route, so a diagnostic there would be
+  // noise rather than news.
+  const c = checkerAtAbi(1);
+  const def = await c.definitionAt("const x = 1\nprint(x)\n", "main.vl", noSiblings, 1, 6);
+  if (def !== undefined) throw new Error("definitionAt should degrade to undefined");
+});
