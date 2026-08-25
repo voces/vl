@@ -235,8 +235,174 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleStepZero, progRoot)
     lintWalk(lintRuleUncondRecursion, progRoot)
     lintWalk(lintRuleHasGuardReread, progRoot)
+    lintWalk(lintRuleUnionLetNoMelt, progRoot)
   }
   lintCodes.length
+}
+
+// ── union-let-no-melt ────────────────────────────────────────────────────────
+//
+// A union-typed `let` DECLARED INSIDE A LOOP and written again in the body allocates a
+// union box on every trip that the `const u = if … else …` spelling of the same program
+// does not. Measured, two spellings of one program, 100 M trips
+// (`unboxed-union-rep-design.md` §13.4):
+//
+//     plain `vl build`   1.52x        `vl build -O`   2.54x        `-O3`   2.50x
+//
+// WHY THE COMPILER CANNOT JUST FIX IT — the rule is not a stand-in for missing work.
+// Binaryen's Heap2Local scalarizes per allocation SITE, and only when every local an
+// allocation reaches provably holds that ONE allocation. Two `struct.new` writing one
+// local defeats it for both, and no marker the emitter can add changes that. Collapsing it
+// means holding tag and payload in scalars across a liveness window — a REPRESENTATION
+// change, refused twice (§13.3, and the re-open at §13.6). What is left is that the cheap
+// alternative is invisible in the source, which is a diagnostic's job.
+//
+// LOOP BODIES ONLY, and the bound is deliberate. The cliff costs what it costs PER TRIP,
+// so outside a loop it is one allocation and not worth a word. Restricting here is also
+// what keeps the rule quiet: it fires ZERO times across `compiler/ std/ bench/ tests/` as
+// measured before it was written, because this tree is a compiler and the shape's home is
+// a per-tick simulation loop. That is a known and accepted false-NEGATIVE bound — a `let`
+// declared just outside its own loop is missed — taken because a diagnostic that cries
+// wolf is one nobody reads.
+//
+// SYNTACTIC, because that is all this pass has (see the file header), and the exclusions
+// are chosen so what remains really does box:
+//   - `T | null` (one non-null member) is a NICHE, not a box.
+//   - an all-literal union (`"a" | "b"`, `1 | 2`) interns as an i32 atom, not a box.
+//   - a `|` nested inside `[]` / `()` / `{}` / `<>` belongs to an ELEMENT or a field, not
+//     to this binding's own type.
+// What it cannot see is an ALIAS hiding a literal union (`type N = 1 | 2` then
+// `let x: N | i32`); that would over-report, and it is the residual this bound accepts.
+function unionLetNoMeltVisit(ix: i32) {
+  const n = P.nodes[ix]
+  let body = -1
+  if n is WhileStmt { body = n.whileBody }
+  else if n is ForRange { body = n.frBody }
+  else if n is ForIn { body = n.fiBody }
+  if body < 0 { return 0 }
+  reportUnionLetsIn(body, body)
+  0
+}
+
+// Report every qualifying `let` DIRECTLY in this loop body's statement list. Nested loops
+// are reached by the walker's own visit of them, so this does not recurse into one.
+function reportUnionLetsIn(blockIx: i32, loopBody: i32) {
+  if blockIx < 0 || blockIx >= P.nodes.length { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const st = b.blkStmts
+    let i = 0
+    while i < st.length {
+      const sIx = st[i]
+      const s = P.nodes[sIx]
+      if s is LetDecl {
+        if s.letKw == "let" {
+          if boxUnionAnnotation(s.letType) {
+            if nameReassignedIn(loopBody, s.letName) {
+              lintEmit(
+                "union-let-no-melt",
+                "`" +
+                  s.letName +
+                  "` is a union-typed `let` written on more than one path inside a loop, so its box is allocated every trip and cannot be optimized away — build it in one place instead: `const " +
+                  s.letName +
+                  " = if … { … } else { … }`",
+                "info",
+                sIx,
+              )
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Whether the annotation at `tyIx` is a union that reps as a BOX: two or more non-`null`
+// members at the TOP level, not all of them literals.
+function boxUnionAnnotation(tyIx: i32) {
+  if tyIx < 0 || tyIx >= P.nodes.length { return false }
+  const t = P.nodes[tyIx]
+  if !(t is TypeRef) { return false }
+  const parts = topLevelUnionParts(t.tyName)
+  if parts.length < 2 { return false }
+  let nonNull = 0
+  let literals = 0
+  let i = 0
+  while i < parts.length {
+    const p = parts[i]
+    if p != "null" {
+      nonNull = nonNull + 1
+      if looksLiteral(p) { literals = literals + 1 }
+    }
+    i = i + 1
+  }
+  if nonNull < 2 { return false }
+  // An all-literal union interns as an i32 atom — there is no box to melt.
+  if literals == nonNull { return false }
+  true
+}
+
+// Split a rendered type name on TOP-LEVEL `|` only — a bar inside `[]`, `()`, `{}` or `<>`
+// belongs to an element or a field, not to this type.
+function topLevelUnionParts(name: string) {
+  const out: string[] = []
+  let depth = 0
+  let cur = ""
+  let i = 0
+  while i < name.length {
+    const c = name.slice(i, i + 1)
+    if c == "[" || c == "(" || c == "{" || c == "<" { depth = depth + 1 }
+    if c == "]" || c == ")" || c == "}" || c == ">" { depth = depth - 1 }
+    if c == "|" && depth == 0 {
+      out.push(trimSpaces(cur))
+      cur = ""
+    } else {
+      cur = cur + c
+    }
+    i = i + 1
+  }
+  out.push(trimSpaces(cur))
+  out
+}
+
+function trimSpaces(s: string) {
+  let a = 0
+  let b = s.length
+  while a < b && s.slice(a, a + 1) == " " { a = a + 1 }
+  while b > a && s.slice(b - 1, b) == " " { b = b - 1 }
+  return s.slice(a, b)
+}
+
+// A literal member of a union spelling: a quoted string, or something starting with a
+// digit or `-` (a numeric literal). `true`/`false` are the boolean TYPE's values, not a
+// literal-union member spelling, so they are not treated as literals here.
+function looksLiteral(p: string) {
+  if p.length == 0 { return false }
+  const c = p.slice(0, 1)
+  if c == "\"" { return true }
+  if c == "-" { return true }
+  if c >= "0" && c <= "9" { return true }
+  false
+}
+
+// Whether `name` is the LHS of an assignment anywhere in the loop body.
+function nameReassignedIn(ix: i32, name: string) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      if plainIdentName(n.binLeft) == name { return true }
+    }
+  }
+  let i = 0
+  const kids = nodeChildren(ix)
+  while i < kids.length {
+    if nameReassignedIn(kids[i], name) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // ── map-has-guard-reread ─────────────────────────────────────────────────────
@@ -547,6 +713,7 @@ const lintRuleStepZero = 1
 const lintRuleUnreachable = 2
 const lintRuleUncondRecursion = 3
 const lintRuleHasGuardReread = 4
+const lintRuleUnionLetNoMelt = 5
 
 // Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
 // a node before any of its descendants). `-1` child slots (absent) and any
@@ -555,6 +722,7 @@ function lintWalk(rule: i32, ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   if rule == lintRuleConstBranch { constantBranchVisit(ix) }
   if rule == lintRuleHasGuardReread { hasGuardRereadVisit(ix) }
+  if rule == lintRuleUnionLetNoMelt { unionLetNoMeltVisit(ix) }
   else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
   else if rule == lintRuleUnreachable { unreachableVisit(ix) }
   else if rule == lintRuleUncondRecursion { uncondRecursionVisit(ix) }
