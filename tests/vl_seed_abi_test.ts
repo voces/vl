@@ -22,8 +22,6 @@
 //
 // The `vl_` prefix is load-bearing: it is one of the globs `ci-native`
 // auto-discovers, and a seed-backed test matching no glob runs nowhere.
-import { assertEquals } from "jsr:@std/assert";
-
 const SEED = "build/vl-compiler.wasm";
 
 // The generation this tree speaks. Bump here, in `compiler/driver.vl`'s
@@ -43,24 +41,29 @@ Deno.test({
 
     const exported = WebAssembly.Module.exports(module)
       .filter((e) => e.name === "hostAbi");
-    assertEquals(
-      exported.length,
-      1,
-      "the seed must export `hostAbi` — without it a host cannot tell a " +
-        "contract-compatible seed from one that will silently mis-decode " +
-        "every string it hands back",
-    );
-    assertEquals(exported[0].kind, "function");
+    if (exported.length !== 1) {
+      throw new Error(
+        "the seed must export `hostAbi` — without it a host cannot tell a " +
+          "contract-compatible seed from one that will silently mis-decode " +
+          `every string it hands back (found ${exported.length} exports)`,
+      );
+    }
+    if (exported[0].kind !== "function") {
+      throw new Error(`hostAbi must be a function, got ${exported[0].kind}`);
+    }
 
     const inst = await WebAssembly.instantiate(module, {});
     const hostAbi = inst.exports.hostAbi as () => number;
-    assertEquals(
-      hostAbi(),
-      EXPECTED_ABI,
-      "`hostAbi()` disagrees with this test's EXPECTED_ABI. If you changed the " +
-        "host<->seed contract on purpose, bump BOTH here and in the host's " +
-        "HOST_ABI in the same commit; if you did not, the seed is stale — " +
-        "run scripts/refresh-compiler.sh.",
-    );
+    const got = hostAbi();
+    if (got !== EXPECTED_ABI) {
+      throw new Error(
+        `hostAbi() is ${got}, this tree expects ${EXPECTED_ABI}.\n` +
+          "  If you changed the host<->seed contract on purpose, bump BOTH " +
+          "this file's EXPECTED_ABI and the host's HOST_ABI in the same " +
+          "commit.\n" +
+          "  If you did not, the seed is stale — run " +
+          "scripts/refresh-compiler.sh.",
+      );
+    }
   },
 });
