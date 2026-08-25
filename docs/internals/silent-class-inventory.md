@@ -9,6 +9,53 @@ The sweep is reproducible: `scripts/silent-sweep/gen.py` (main grid), `genorder.
 (declaration-order grid), `sabotage.py` (grader proof), `sweep.sh` (bounded runner, four
 concurrent `vl` invocations), `grade.py` (classifier), `counts.py` / `pivot.py` (tallies).
 
+---
+
+## RE-MEASURED 2026-08-25 — READ THIS BEFORE SCHEDULING FROM ANY ROW BELOW
+
+The whole sweep was regenerated and re-run against master `fb7900e7`, and the grader was
+re-validated first (`sabotage.py` → 12 wrong_value / 8 wrong_evalcount / 6 trap / 4
+correct, exactly as published). **The queue below is substantially stale, in one
+direction: fixed rows still read as live.**
+
+| | as filed | 2026-08-25 |
+|---|---|---|
+| check-clean **silently wrong value** | 2 | **0** |
+| check-clean **wrong evaluation count** | 4 | **0** |
+| **compiler trap** (no diagnostic, no module) | 4 | **0** |
+| check-clean **invalid wasm** | 97 | **23** |
+| **SILENT TOTAL** | **107** / 9,345 (1.14%) | **23** / 9,126 (0.25%) |
+
+Declaration-order grid: **0 silent** (was D1's family). The two categories that produce a
+WRONG ANSWER rather than a failure are now **zero** — every survivor is invalid wasm, which
+is loud at load.
+
+*(Cell counts differ because the generator now skips more unreachable combinations, so this
+is not a cell-for-cell delta.)*
+
+**Per-row verdict, from `scripts/check-filed-witnesses.py` — which runs each row's OWN filed
+repro rather than a paraphrase:**
+
+| row | filed | today |
+|---|---|---|
+| D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
+| D6 D7 D9 D12 D13 D14 D15 D16 | various | as filed, still live |
+
+**THE LARGEST REMAINING FAMILY IS NOT IN THIS DOCUMENT.** 17 of the 23 surviving silent
+cells are one shape that was never filed: **a nullable CLOSURE narrowed with
+`is <functype>` and then CALLED**. All `nul=1`, all `read=call`, all `con=is_t`; seven
+positions (`param` 3 · `const_local` 3 · `ret_ann` 3 · `global` 3 · `elem` 3 · `let_local`
+1 · `ret_unann` 1), 12 inline spellings and 5 alias. The `!= null` narrow of the identical
+program lowers correctly, so the discriminator is the `is`-narrow over a function type. The
+remaining 6 are D6 (4 cells, numeric-litunion map value at `mapget`) and D7's family (2).
+
+**Do not re-derive this by hand.** `python3 scripts/check-filed-witnesses.py <doc>` runs
+every filed repro and prints which have moved; it exits non-zero when any row no longer
+behaves as filed. Prose cannot be re-run — that is why eight rows sat here as live work
+after they were fixed.
+
+---
+
 ## 0. What was measured
 
 | | |
@@ -148,8 +195,8 @@ wasm → trap; within a class, flat-across-many-reps before single-rep.
 
 ---
 
-### D1 — a struct field whose type is an alias declared LATER in the file resolves to the wrong rep
-**check-clean SILENTLY WRONG VALUE · 2 cells + 1 invalid wasm + 30 loud check rejects, of 45 in the `fwd` leg (12 correct)**
+### D1 — [CLOSED 2026-08-25] a struct field whose type is an alias declared LATER in the file resolves to the wrong rep
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean SILENTLY WRONG VALUE · 2 cells + 1 invalid wasm + 30 loud check rejects, of 45 in the `fwd` leg (12 correct)**
 
 Repro (`boolean` payload — prints `1`, must print `true`):
 
@@ -218,8 +265,8 @@ Fourth spelling, a **bogus diagnostic** on a legal program:
 
 ---
 
-### D2 — `for x in <expr>.keys()` / `.values()` evaluates `<expr>` TWICE, and iterates the SECOND result
-**check-clean WRONG EVALUATION COUNT · 4 cells of 4 reachable in the grid; confirmed on 8 further hand-written receivers**
+### D2 — [CLOSED 2026-08-25] `for x in <expr>.keys()` / `.values()` evaluates `<expr>` TWICE, and iterates the SECOND result
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean WRONG EVALUATION COUNT · 4 cells of 4 reachable in the grid; confirmed on 8 further hand-written receivers**
 
 Repro:
 
@@ -263,8 +310,8 @@ Control (bind the receiver first — one call, and the first map is the one iter
 
 ---
 
-### D3 — a nullable SCALAR BOX captured by a nested function, narrowed with a `null` COMPARISON, emits invalid wasm
-**check-clean INVALID WASM · 86 cells, the largest silent family**
+### D3 — [CLOSED 2026-08-25] a nullable SCALAR BOX captured by a nested function, narrowed with a `null` COMPARISON, emits invalid wasm
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · 86 cells, the largest silent family**
 
 Repro:
 
@@ -343,8 +390,8 @@ Second control (the same capture with a niche payload instead of a box — corre
 
 ---
 
-### D4 — a map captured by a closure TRAPS INSIDE THE COMPILER — **FIXED, and the filed axis was wrong**
-**COMPILER TRAP · 4 cells · check-clean, no diagnostic, no module**
+### D4 — [CLOSED 2026-08-25] a map captured by a closure TRAPS INSIDE THE COMPILER — **FIXED, and the filed axis was wrong**
+**CLOSED 2026-08-25 — the repro now RUNS. Was: COMPILER TRAP · 4 cells · check-clean, no diagnostic, no module**
 
 **RESOLVED.** The axis filed below as "the map's KEY rep only" is the map's **VALUE** type.
 Measured over 220 cells (11 value types × 2 keys × 4 capture routes + an uncaptured control ×
@@ -410,8 +457,8 @@ Second control (an i32-keyed map read WITHOUT the capture — correct).
 
 ---
 
-### D5 — a NARROWED nullable map iterated by `.values()` / `.keys()` emits invalid wasm
-**check-clean INVALID WASM · 4 cells**
+### D5 — [CLOSED 2026-08-25] a NARROWED nullable map iterated by `.values()` / `.keys()` emits invalid wasm
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · 4 cells**
 
 Repro:
 
@@ -496,8 +543,8 @@ Second control: `??` on a map index get (`m["k"] ?? "DD"`) — correct.
 
 ---
 
-### D8 — assigning `null` to a nullable binding INSIDE the block where it is narrowed non-null is rejected
-**loud check reject · flat across every place**
+### D8 — [CLOSED 2026-08-25] assigning `null` to a nullable binding INSIDE the block where it is narrowed non-null is rejected
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud check reject · flat across every place**
 
 Repro:
 
@@ -559,8 +606,8 @@ uncaptured.
 
 ---
 
-### D10 — a numeric-valued map read by index and narrowed is a loud emit reject
-**loud emit reject · 40 cells at the `mapget` position across the four numeric value reps**
+### D10 — [CLOSED 2026-08-25] a numeric-valued map read by index and narrowed is a loud emit reject
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 40 cells at the `mapget` position across the four numeric value reps**
 
 Repro:
 
@@ -593,8 +640,8 @@ Controls, all correct: `{[string]: boolean}`; `{[string]: string}`;
 
 ---
 
-### D11 — a nullable STRUCT UNION narrowed twice (`!= null`, then `is Variant`) is a loud emit reject
-**loud emit reject · 158 cells carry this message**
+### D11 — [CLOSED 2026-08-25] a nullable STRUCT UNION narrowed twice (`!= null`, then `is Variant`) is a loud emit reject
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 158 cells carry this message**
 
 Repro:
 

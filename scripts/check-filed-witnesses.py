@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+Run the repro program filed under every defect heading in a docs inventory and report
+which ones NO LONGER BEHAVE AS FILED.
+
+WHY THIS EXISTS. A defect inventory goes stale in ONE DIRECTION: a fixed defect keeps
+reading as live, because the person who fixes it is not the person editing the inventory.
+Measured repeatedly on this tree — a roadmap headline outlived its programme by ~30
+slices, six consumer-ask rows were already fixed while filed as live work, and four of six
+"known issue" root causes were wrong when re-derived. Prose cannot be re-run; this can.
+
+It grades the DOC's own repro, never a paraphrase. That distinction is load-bearing: a
+hand-retyped witness that differs in one type is a different program, and grading it tells
+you nothing about the row.
+
+USAGE
+    python3 scripts/check-filed-witnesses.py docs/internals/silent-class-inventory.md
+    python3 scripts/check-filed-witnesses.py --json out.json <doc>...
+
+Exit 0 when every row still behaves as filed; 1 when any row has MOVED (which is a
+prompt to re-grade the doc, not necessarily a regression — a row that moved because it
+was FIXED is the common case and the whole point).
+
+DOC SHAPE IT READS
+    ### <ID> — <title>
+    **<declared status> · <notes>**
+    ...
+    Repro[ (...)]:
+
+        <4-space-indented VL program>
+
+Only the FIRST indented block after the first `Repro` line is run. Lines inside it that
+begin with `//` at top level are kept (they may be directives), so the program is used
+verbatim.
+"""
+import json, re, subprocess, sys, tempfile, os
+from pathlib import Path
+
+VL = "./scripts/vl-host/target/release/vl"
+COMPILER = "build/vl-compiler.wasm"
+
+# Declared-status vocabulary -> canonical outcome. Ordered: first match wins, so the more
+# specific phrases precede the substrings they contain.
+# A row marked CLOSED expects the repro to RUN. Without this a re-graded doc could never
+# grade clean, the non-zero exit would fire forever, and the signal would be ignored —
+# which is how the doc got eight stale rows in the first place.
+DECLARED = [
+    ("closed",                     "runs"),
+    ("check-clean invalid wasm",   "silent_invalid_wasm"),
+    ("check-clean silently wrong", "silent_wrong_value"),
+    ("check-clean wrong evaluation", "silent_wrong_evalcount"),
+    ("compiler trap",              "compiler_trap"),
+    ("loud emit reject",           "emit_reject"),
+    ("loud check reject",          "check_reject"),
+]
+
+def declared_outcome(status_line):
+    low = status_line.lower()
+    for needle, outcome in DECLARED:
+        if needle in low:
+            return outcome
+    return None
+
+def run_program(src):
+    """Classify what the compiler does with `src`, on the same three channels the
+    silent-sweep harness separates: check (diagnostic), run (value), build (module)."""
+    with tempfile.TemporaryDirectory() as td:
+        f = os.path.join(td, "w.vl")
+        Path(f).write_text(src)
+        chk = subprocess.run([VL, "check", f, "--compiler", COMPILER],
+                             capture_output=True, text=True, timeout=120)
+        run = subprocess.run([VL, "run", f, "--compiler", COMPILER],
+                             capture_output=True, text=True, timeout=120)
+        if chk.returncode != 0:
+            return "check_reject", (chk.stdout + chk.stderr).strip()[:200]
+        if run.returncode == 0:
+            return "runs", run.stdout.strip()[:200]
+        err = (run.stdout + run.stderr).strip()
+        if "emit error" in err:
+            return "emit_reject", err[:200]
+        # No module at all vs a module the engine refuses.
+        out = os.path.join(td, "w.wasm")
+        bld = subprocess.run([VL, "build", f, "--compiler", COMPILER, "-o", out],
+                             capture_output=True, text=True, timeout=120)
+        if bld.returncode != 0 and not os.path.exists(out):
+            return "compiler_trap", err[:200]
+        return "silent_invalid_wasm", err[:200]
+
+SEC = re.compile(r"^#{2,4}\s+(D\d+[A-Za-z]?|[A-Z]\d+)\s+[—-]\s+(.*)$")
+
+def parse(doc):
+    """Yield (id, title, declared_status_line, repro_source) per section."""
+    lines = Path(doc).read_text().splitlines()
+    rows, cur = [], None
+    for i, ln in enumerate(lines):
+        m = SEC.match(ln)
+        if m:
+            if cur: rows.append(cur)
+            cur = {"id": m.group(1), "title": m.group(2).strip(),
+                   "status": None, "repro": None, "doc": doc, "line": i + 1}
+            continue
+        if not cur:
+            continue
+        if cur["status"] is None and ln.startswith("**") and ln.rstrip().endswith("**"):
+            cur["status"] = ln.strip("*").strip()
+        if cur["repro"] is None and re.match(r"^Repro\b", ln):
+            # The `Repro:` lead-in may WRAP onto further prose lines before the block
+            # (D16 does). Scan forward for the first indented line, bounded so a section
+            # with no block at all cannot swallow the next one's.
+            body, j = [], i + 1
+            scanned = 0
+            while j < len(lines) and scanned < 6 and not lines[j].startswith("    "):
+                if lines[j].strip() and re.match(r"^#{2,4}\s", lines[j]):
+                    break
+                j += 1; scanned += 1
+            while j < len(lines) and (lines[j].startswith("    ") or not lines[j].strip()):
+                body.append(lines[j][4:] if lines[j].startswith("    ") else "")
+                j += 1
+            src = "\n".join(body).rstrip()
+            if src.strip():
+                cur["repro"] = src + "\n"
+    if cur: rows.append(cur)
+    return rows
+
+def main(argv):
+    out_json, docs = None, []
+    it = iter(argv)
+    for a in it:
+        if a == "--json": out_json = next(it)
+        else: docs.append(a)
+    if not docs:
+        print(__doc__); return 2
+
+    results, moved, ungradable = [], [], []
+    for doc in docs:
+        for r in parse(doc):
+            if not r["repro"]:
+                ungradable.append((r, "no Repro block")); continue
+            want = declared_outcome(r["status"] or "")
+            if want is None:
+                ungradable.append((r, "status line names no known outcome")); continue
+            got, detail = run_program(r["repro"])
+            rec = {**r, "declared": want, "actual": got, "detail": detail,
+                   "agrees": got == want}
+            results.append(rec)
+            if not rec["agrees"]:
+                moved.append(rec)
+
+    w = max([len(r["id"]) for r in results] + [4])
+    print(f"{'ID':<{w}}  {'FILED':<22} {'TODAY':<22} VERDICT")
+    for r in results:
+        v = "as filed" if r["agrees"] else "** MOVED **"
+        print(f"{r['id']:<{w}}  {r['declared']:<22} {r['actual']:<22} {v}")
+    for r, why in ungradable:
+        print(f"{r['id']:<{w}}  {'-':<22} {'-':<22} not graded ({why})")
+
+    print(f"\n{len(results)} graded · {len(results)-len(moved)} as filed · "
+          f"{len(moved)} MOVED · {len(ungradable)} not graded")
+    if moved:
+        print("\nRows whose filed behaviour no longer reproduces — re-grade the doc:")
+        for r in moved:
+            print(f"  {r['doc']}:{r['line']}  {r['id']} — {r['title']}")
+            print(f"      filed {r['declared']}, now {r['actual']}: {r['detail'].splitlines()[0] if r['detail'] else ''}")
+    if out_json:
+        Path(out_json).write_text(json.dumps(results, indent=2))
+        print(f"\nwrote {out_json}")
+    return 1 if moved else 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

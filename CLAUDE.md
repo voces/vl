@@ -55,3 +55,16 @@ Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL pr
 as live, because the inventory is not the file the fixer edits. **Re-run a doc's own witness
 before scheduling, briefing, or quoting from it.** Every row in those files carries a
 minimal program; running it costs seconds.
+
+For any doc whose rows are `### <ID> — <title>` + a `**<status>**` line + a `Repro:` block,
+that is one command:
+
+```sh
+python3 scripts/check-filed-witnesses.py docs/internals/silent-class-inventory.md
+```
+
+It runs each row's OWN filed program — never a paraphrase, which is a different program —
+and prints which rows no longer behave as filed; non-zero exit means at least one moved.
+It found **eight of sixteen** rows already fixed on first use. Grade the doc against it
+rather than against memory, and **run the repro verbatim**: a hand-retyped witness that
+differs in one type tells you nothing about the row.
