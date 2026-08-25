@@ -1,0 +1,183 @@
+// AN OBJECT LITERAL INTO A TAGGED UNION WHOSE ARM HAS A LIST OR MAP FIELD.
+//
+// `unionArmBoxSafe` is a whitelist of field types the emitter is known to box into
+// a variant, and a `TyArray` or `TyMap` field fell to its closing `return false`.
+// So the arm was refused as box-unsafe and the literal found no arm at all:
+//
+//     return type mismatch: expected U, got {kind: string, xs: i32[]}
+//
+// — naming a type whose own arm the literal is, and reporting the tag as the
+// widened `string` because no candidate matched to pin the literal.
+//
+// THE REP WAS ALREADY THERE, which is what makes this the arm-PICK's defect and
+// not the emitter's. Building at the ARM type and widening —
+// `const a: A = { kind: "a", xs: [7] }` then `return a` — lowered and ran before
+// this change, for every shape below. Measured on `i32[]`: the direct literal now
+// emits the SAME heap types and the same `struct.new` / `array.new` counts as the
+// widened spelling, differing only by the local the extra binding needs (the
+// direct form is two instructions shorter). So this admits an arm; it claims no
+// new field rep.
+//
+// A LIST OR MAP FIELD IS ONE REFERENCE SLOT, which is why neither arm recurses
+// into its element or value type the way the nested-`TyObj` arm recurses. The
+// variant box holds a ref to the arm struct; the arm struct holds a ref to the
+// array or map. What the element reps to is not a property the variant needs.
+//
+// THE MAP READS BELOW USE `?? default`, NOT `is`, AND THAT IS NOT COSMETIC. The
+// inferred spelling — `const v = m["k"]` then `if v is i32` — is a SEPARATE and
+// PRE-EXISTING defect with nothing to do with unions: it reproduces on a bare
+// two-line program with no union in the file at all, for every NUMERIC value type
+// and for a list value, while `string` and `boolean` values work. (Those two are
+// the nullable-ref and i32-sentinel reps; the numerics are the box, so the missing
+// registration follows the rep split.) It cost real time here, because inside a
+// union fixture it surfaces as `emitProgram: is names a type that is not a union
+// variant` pointing several blocks ABOVE the actual read — misleading enough to
+// send a bisect after the wrong axis twice. Filed separately; both
+// `const v: i32 | null = m["k"]` and `m["k"] ?? d` work today.
+//
+// THE MIS-ATTRIBUTION THIS CORRECTS. webcraft's A3 list carries this as "i32-keyed
+// map as a struct/variant FIELD ... the field row records the map's value name and
+// type with the key erased", i.e. as an i32-KEY gap. It is not one. The
+// string-keyed twin failed identically, and so did a plain `i32[]` field with no
+// map anywhere — all three for the one reason above. The plain-STRUCT field
+// position (`type R = { tbl: {[i32]: i32} }`) was never affected and works for
+// every value type.
+// @run
+// @log 7
+// @log q
+// @log 4
+// @log 5
+// @log z
+// @log 3
+// @log true
+// @log 1
+// @log 0
+// @log 0
+
+// ── a LIST field, three element reps ──
+type A1 = { kind: "a", xs: i32[] }
+type B1 = { kind: "b", n: i32 }
+type U1 = A1 | B1
+function mkList(): U1 { return { kind: "a", xs: [7] } }
+const l1 = mkList()
+if l1 is A1 {
+  print(l1.xs[0]) // 7
+} else {
+  print("no")
+}
+
+type A2 = { kind: "a", ss: string[] }
+type B2 = { kind: "b", n: i32 }
+type U2 = A2 | B2
+function mkStrList(): U2 { return { kind: "a", ss: ["q"] } }
+const l2 = mkStrList()
+if l2 is A2 {
+  print(l2.ss[0]) // q
+} else {
+  print("no")
+}
+
+type P = { x: i32 }
+type A3 = { kind: "a", ps: P[] }
+type B3 = { kind: "b", n: i32 }
+type U3 = A3 | B3
+function mkObjList(): U3 { return { kind: "a", ps: [{ x: 4 }] } }
+const l3 = mkObjList()
+if l3 is A3 {
+  print(l3.ps[0].x) // 4
+} else {
+  print("no")
+}
+
+// ── a MAP field, both key types — the shape webcraft's rule tables are ──
+type A4 = { kind: "a", m: {[string]: i32} }
+type B4 = { kind: "b", n: i32 }
+type U4 = A4 | B4
+function mkStrMap(): U4 {
+  const a: U4 = { kind: "a", m: Map() }
+  if a is A4 { a.m["k"] = 5 }
+  return a
+}
+const m1 = mkStrMap()
+if m1 is A4 {
+  print(m1.m["k"] ?? 0) // 5
+} else {
+  print("no")
+}
+
+type A5 = { kind: "a", m: {[i32]: string} }
+type B5 = { kind: "b", n: i32 }
+type U5 = A5 | B5
+function mkI32Map(): U5 {
+  const a: U5 = { kind: "a", m: Map() }
+  if a is A5 { a.m[1214603620] = "z" }
+  return a
+}
+const m2 = mkI32Map()
+if m2 is A5 {
+  print(m2.m[1214603620] ?? "no") // z
+} else {
+  print("no")
+}
+
+// ── composites and a Set ──
+type A6 = { kind: "a", g: i32[][] }
+type B6 = { kind: "b", n: i32 }
+type U6 = A6 | B6
+function mkNested(): U6 { return { kind: "a", g: [[3]] } }
+const n1 = mkNested()
+if n1 is A6 {
+  print(n1.g[0][0]) // 3
+} else {
+  print("no")
+}
+
+type A7 = { kind: "a", s: {[string]: boolean} }
+type B7 = { kind: "b", n: i32 }
+type U7 = A7 | B7
+function mkSet(): U7 {
+  const a: U7 = { kind: "a", s: Set() }
+  if a is A7 { a.s.add("q") }
+  return a
+}
+const s1 = mkSet()
+if s1 is A7 {
+  print(s1.s.has("q")) // true
+} else {
+  print("no")
+}
+
+// ── THREE arms, two of them carrying a ref field ──
+type A8 = { kind: "a", xs: i32[] }
+type B8 = { kind: "b", m: {[i32]: i32} }
+type C8 = { kind: "c", n: i32 }
+type U8 = A8 | B8 | C8
+function mk3(k: i32): U8 {
+  if k == 0 { return { kind: "a", xs: [1] } }
+  if k == 1 { return { kind: "b", m: Map() } }
+  return { kind: "c", n: 3 }
+}
+const t0 = mk3(0)
+if t0 is A8 {
+  print(t0.xs[0]) // 1
+} else {
+  print("no")
+}
+const t1 = mk3(1)
+if t1 is B8 {
+  print(t1.m.length) // 0
+} else {
+  print("no")
+}
+
+// ── a NUMERIC literal tag beside a map field: the other tag family, same arm ──
+type A9 = { kind: 0, m: {[i32]: i32} }
+type B9 = { kind: 1, n: i32 }
+type U9 = A9 | B9
+function mkNumTag(): U9 { return { kind: 0, m: Map() } }
+const q = mkNumTag()
+if q is A9 {
+  print(q.m.length) // 0
+} else {
+  print("no")
+}
