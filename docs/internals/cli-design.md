@@ -141,6 +141,40 @@ CMD_TEST_*   7-9   // see `test` below
 CMD_VALIDATE  10   // validate the module now in rbyte*; commit via cliValidateCommit(ok)
 ```
 
+### The host↔seed ABI generation
+
+The seed exports `hostAbi()` (`compiler/driver.vl`) and a `vl` binary carries a
+matching `HOST_ABI`. **They are compared with `==`, and a mismatch is a hard error**
+— the same posture as a missing `wasm-opt`, and for the same reason: the two
+artifacts do not fail loudly when they disagree, they produce **wrong output at a
+successful exit code**.
+
+| generation | contract |
+| --- | --- |
+| 1 | strings are UTF-32 code points (pre-#1848) |
+| 2 | strings are UTF-8 bytes |
+
+The number covers the **guest→host string element unit**, the **bulk `Load`/`Store`
+packing** over the staging window, and the **`CMD_*` table above**. Bump it in the
+same commit that changes any of them, in all three places (`hostAbi()`, `HOST_ABI`,
+and `EXPECTED_ABI` in `tests/vl_seed_abi_test.ts`).
+
+**What went wrong without it.** #1848 flipped the string element unit while adding,
+removing and re-typing nothing — so every export probe still succeeded, the ABI
+negotiation reported "compatible", and the host read `4 * count` bytes where the
+seed wrote `count`. The overshoot landed in the host's own leftover UTF-32 image of
+the last file it staged, which decoded perfectly, so a stale `vl test` printed
+readable chunks of `std/test.vl` and exited 0. Note also that `resolve_compiler`
+prefers a **CWD-relative** `./build/vl-compiler.wasm` over the binary's own embedded
+seed, so a released `vl` run inside a checkout picks up whatever is on disk.
+
+Only the string channel was silent. `CMD_VALIDATE = 10` was already loud on an old
+host, whose dispatch bails on an unknown code — the string path is quiet precisely
+because it was designed for graceful probing.
+
+**A seed exporting nothing here predates the stamp**, which is the exact vintage
+that produces the bug, so absent counts as a mismatch rather than a pass.
+
 The set is deliberately tiny and grows only when a subcommand needs a genuinely
 new capability. Diagnostics print on stderr (`CMD_PRINT_ERR`); program output and
 formatted source print on stdout.
