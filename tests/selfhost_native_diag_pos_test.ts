@@ -235,6 +235,54 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name: "native-diag-pos: a TOP-LEVEL emit failure anchors at the read, not at the last function",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The function-name anchor above is the right one for a failure raised deep inside a
+    // body, and the WRONG one twice over for a top-level statement. The synthetic start
+    // function is lowered AFTER every user body, so the "function being lowered" cursor
+    // still names the file's LAST `function` — `print(g(true).xs.length)` on line 11
+    // reported line 3, inside an unrelated `g`, and a reader following it looked at code
+    // that had nothing to do with the failure.
+    //
+    // Two things fix it and this pins both: the field-access floors are NODE-anchored
+    // (`emitFailAt`, the `Member` node → its property token, 0-based col 14 of line 11),
+    // and the start function arms a top-level STATEMENT cursor so any other failure it
+    // raises lands on the statement instead of on a stale function.
+    //
+    // The shared field here is a LIST (`xs`), which has no single-block result rep to
+    // dispatch on — so this is still a loud reject after call receivers were taught to
+    // dispatch, which is exactly why it is usable as a position witness.
+    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_top_" });
+    try {
+      const path = `${dir}/case.vl`;
+      await Deno.writeTextFile(
+        path,
+        "type A = { xs: i32[], a: i32 }\n" +
+          "type B = { pad: boolean, xs: i32[] }\n" +
+          "function g(flag: boolean): A | B {\n" +
+          "  if flag { return { xs: [1, 2], a: 3 } }\n" +
+          "  return { pad: true, xs: [4] }\n" +
+          "}\n" +
+          "function pad(x: i32): i32 {\n" +
+          "  return x + 1\n" +
+          "}\n" +
+          "print(pad(1))\n" +
+          "print(g(true).xs.length)\n",
+      );
+      const r = await build(path);
+      if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");
+      const needle = `${path}:11:14:`;
+      if (!r.err.includes(needle)) {
+        throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 // ── WHICH FILE a diagnostic is labelled with (multi-module) ──────────────────
 //
 // A positioned diagnostic's line and column belong to the module that OWNS it,

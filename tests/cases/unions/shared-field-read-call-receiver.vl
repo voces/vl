@@ -1,0 +1,121 @@
+// SHARED-FIELD ACCESS whose RECEIVER IS A CALL — `g(true).v` over a union-returning `g`.
+//
+// The read was `emitProgram: field access but no struct type declared` while the one-line
+// binding spelling `const u = g(true); u.v` printed the value, and nothing was being
+// narrowed away: `.v` is on EVERY member. The gap was never about typing. The per-tag
+// dispatch re-emits its receiver twice per arm (the tag test, then the payload cast), so it
+// was ported for an IDENT receiver only — re-emitting a `local.get` is free, re-emitting a
+// CALL would run it 2N-1 times. `sharedUnionFieldPlan` then declined every non-Ident
+// receiver outright, and the two classifier twins that read the same plan declined with it.
+//
+// The receiver is now EVALUATED ONCE into a lazy-frame local (`sharedFieldRecvSlot`) when it
+// is not a re-emittable place, and the plan resolves a non-ident receiver's member set from
+// the expression's own union NAME — the same derivation the ident arm's own fallback already
+// made. An IDENT receiver still re-emits and takes no slot, so every program that compiled
+// before emits BYTE-IDENTICAL output (measured: 1683/1683 corpus `@run` cases).
+//
+// `calls` below is the load-bearing assertion: a THREE-member union dispatches over three
+// arms, so a re-emitting lowering would have called `g` five times per read.
+// @run
+// @log 1
+// @log 2
+// @log 4
+// @log 3
+// @log 1
+// @log 3
+// @log 20
+// @log a
+// @log b
+// @log 3
+// @log 5
+// @log 1
+// @log 11
+// @log 1
+// @log 2
+// @log 9
+// @log 2
+
+// COMMON FIELD ON EVERY MEMBER, two members, the field at index 0 in both.
+type A = { v: i32 }
+type B = { v: i32, w: i32 }
+function g2(flag: boolean): A | B {
+  if flag { return { v: 1 } }
+  return { v: 2, w: 3 }
+}
+print(g2(true).v)
+print(g2(false).v)
+
+// THREE members, and the shared field at a DIFFERENT INDEX in each — which is why the read
+// is a per-tag dispatch and not one `struct.get`.
+type T0 = { v: i32 }
+type T1 = { pad: boolean, v: i32 }
+type T2 = { pad: boolean, pad2: i32, v: i32 }
+let calls = 0
+function g3(n: i32): T0 | T1 | T2 {
+  calls = calls + 1
+  if n == 0 { return { v: 4 } }
+  if n == 1 { return { pad: true, v: 3 } }
+  return { pad: false, pad2: 9, v: 1 }
+}
+print(g3(0).v)
+print(g3(1).v)
+print(g3(2).v)
+// EXACTLY ONE evaluation per read: three reads above, three calls.
+print(calls)
+
+// A CHAINED read — two dispatches in one expression, reusing the one stash slot in turn
+// (the second `local.set` cannot land before the first dispatch has finished reading).
+print(g2(true).v + g2(false).v * 10 - 1)
+
+// A STRING shared field (the discriminated-union tag), which needs the `(ref $sTypeIdx)`
+// blocktype rather than a valtype byte.
+type Ka = { kind: string, v: i32 }
+type Kb = { pad: boolean, kind: string }
+function gk(flag: boolean): Ka | Kb {
+  if flag { return { kind: "a", v: 1 } }
+  return { pad: true, kind: "b" }
+}
+print(gk(true).kind)
+print(gk(false).kind)
+
+// A METHOD (UFCS) receiver — `b.pick(…)` is rewritten to `pick(b, …)` before emit, so the
+// receiver is a Call by the time the dispatch sees it. It floored on the OTHER field-access
+// message (`field access receiver is not a struct`), same mechanism one message over.
+type Box = { n: i32 }
+function pick(self: Box, flag: boolean): A | B {
+  if flag { return { v: self.n } }
+  return { v: self.n + 2, w: 1 }
+}
+const bx = { n: 3 }
+print(bx.pick(true).v)
+print(bx.pick(false).v)
+
+// THROUGH A GENERIC: `T` instantiated to the union, so the monomorphized call's result is
+// the box exactly as an annotated union return is.
+function idu<T>(x: T): T { return x }
+print(idu(g3(2)).v)
+
+// OTHER NON-IDENT RECEIVERS take the same route — the fix is not call-specific. An INDEX
+// read off a union-element list, and a parenthesised call.
+const us: (A | B)[] = [{ v: 11 }, { v: 7, w: 2 }]
+print(us[0].v)
+print((g2(true)).v)
+print((g2(false)).v)
+
+// AN INDEX RECEIVER REACHED THROUGH A NARROW — the shape that decides WHERE the stash slot
+// comes from. `ys[0]` is a union-element read only INSIDE `ys is (A | B)[]`, so the question
+// "does this read need a receiver stash" has different answers before and during lowering. A
+// pre-pass reserving the slot would run before the narrow exists, reserve nothing, and floor
+// the read; the slot is handed out during lowering instead, which is why this runs.
+function firstV(ys: (A | B)[] | i32) {
+  if ys is (A | B)[] { return ys[0].v }
+  return 0
+}
+print(firstV([{ v: 9 }, { v: 8, w: 1 }]))
+
+// A union-typed struct FIELD as the receiver, un-narrowed (`w.s.v`) — a Member receiver, the
+// third non-ident shape, and one that floored on `field access receiver is not a struct`. The
+// `W` alias is load-bearing, not decoration: it is what registers the field's union.
+type W = { s: A | B }
+const wv = { s: g2(false) }
+print(wv.s.v)

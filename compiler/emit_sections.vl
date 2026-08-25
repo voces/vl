@@ -124,6 +124,7 @@ import {
   curBuf,
   emitCurFnIx,
   emitCurFnPos,
+  emitCurStmtIx,
   emitErr,
   emitErrAt,
   emitFailed,
@@ -1573,6 +1574,13 @@ function emitStartFnCode(out: i32[]) {
   // a for-in string element), so the registry must be populated before they run —
   // `declaredSlotOf` falls back to the flat `localNames` scan when no scope frame
   // is active, exactly for detection passes. Then the frames follow the locals.
+  // The start function is SYNTHETIC — it has no `FuncDecl` to anchor a failure at, and the
+  // cursor still holds the LAST user function `emitCodeSection` lowered. Leaving it there
+  // made every top-level emit failure point at an unrelated `function` several lines up
+  // (measured: `print(g(true).v)` on line 7 reported line 3). -1 is the honest anchor for a
+  // failure with no owning declaration; a node-anchored caller (`emitFailAt`) overrides it.
+  emitCurFnIx = -1
+  emitCurFnPos = -1
   const nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return -1 }
   startFnDetectScratch()
@@ -1624,6 +1632,9 @@ function emitStartFnCode(out: i32[]) {
       if startStmts[si] < globalStmts[gi] { takeGlobal = false }
     }
     if takeGlobal {
+      // ANCHOR any emit failure raised below at the top-level node being lowered (see
+      // `emitCurStmtIx`) — the start function has no declaration of its own to name.
+      emitCurStmtIx = globalStmts[gi]
       if globalRunsInStartFn(gi) {
         const g = P.nodes[globalStmts[gi]]
         if g is LetDecl {
@@ -1834,6 +1845,7 @@ function emitStartFnCode(out: i32[]) {
       }
       gi = gi + 1
     } else {
+      emitCurStmtIx = startStmts[si]
       if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
@@ -1842,6 +1854,9 @@ function emitStartFnCode(out: i32[]) {
       si = si + 1
     }
   }
+  // The cursor is armed for exactly the span that streams this body; the `return -1` paths
+  // above leave it set, which is what carries the anchor out to the diagnostic.
+  emitCurStmtIx = -1
   // Close the promotion window. The `return -1` paths above leave it armed, which is
   // inert: a failed body aborts the whole module emit, and `computeGlobalPromotion`
   // clears the flag at the top of the next one.
@@ -4133,6 +4148,7 @@ export function emitProgram(rootIx: i32) {
   emitErrAt = -1
   emitCurFnIx = -1
   emitCurFnPos = -1
+  emitCurStmtIx = -1
   narrowNames = []
   narrowVariants = []
   narrowTys = []

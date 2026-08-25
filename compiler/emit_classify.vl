@@ -8680,6 +8680,32 @@ export function listIdxWrapSlot(kind: MfKind, slot: i32) {
   listIdxScratchBase + liKinds.length
 }
 
+// The SHARED-UNION-FIELD receiver stash (`liBack` code 7) — one `(ref null $uBoxIdx)` slot
+// holding the box across a per-tag dispatch whose receiver cannot be re-emitted per arm
+// (`g(true).v` would call `g` 2N-1 times).
+//
+// IN THE LAZY FRAME, and not as an eagerly-reserved one, because a pre-pass CANNOT answer
+// the question. Every other `fnUses*` frame is decided by a walk that runs before the body
+// is lowered — i.e. before any `is`-narrowing is active — while "is this a shared read"
+// consults narrowing on both sides: `g[0].v` inside `if g is (A | B)[]` is a shared read
+// ONLY under the narrow, so a pre-pass reserves nothing and the read floors, and the
+// same-shape read on a NARROWED path (`if w.s is B { w.s.v }`) is claimed by a pre-pass and
+// then taken by an earlier arm, leaving a spare local. Both were measured. A slot handed out
+// during lowering asks the question exactly once, at the moment the answer is used — which
+// is the discipline the list-index frame around it already follows.
+export function sharedFieldRecvSlot() {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == 7 { return listIdxScratchBase + 1 + k }
+    k = k + 1
+  }
+  // `liKinds`/`liSlots` are unread for this code — `liBack` 7 alone selects the valtype.
+  liKinds.push("i32")
+  liSlots.push(0)
+  liBack.push(7)
+  listIdxScratchBase + liKinds.length
+}
+
 // The tail-value expression of an if-expression's THEN arm (`ifArmValueExpr`: the arm
 // Block's LAST statement), or -1. The arms share the checker's join type, so the then
 // arm's rep classifies the whole if-expression.
@@ -24237,8 +24263,9 @@ function declaredArray(name: string) { declaredKind(name) == "list" }
 //
 // Fills `outVis` / `outFis` with each member's variant index and its index for this field,
 // in the recorded member order (which IS the box-tag order the dispatch walks), and returns
-// the ONE field CODE they all carry. -1 when the receiver is not an un-narrowed union
-// Ident, when any member lacks the field, or when the members disagree on its code.
+// the ONE field CODE they all carry. -1 when the receiver is not a union-valued expression
+// whose member set resolves, when any member lacks the field, or when the members disagree
+// on its code.
 //
 // THE CODES MUST AGREE, and that is not conservatism: the dispatch is a chain of
 // `if (result …)` blocks, so two reps would be two result types for one block. Whether a
@@ -24254,18 +24281,31 @@ export function sharedUnionFieldPlan(
 ): i32 {
   if !exprUnion(recvIx, fnIx) { return -1 }
   const recv = P.nodes[unwrapParen(recvIx)]
-  if !(recv is Ident) { return -1 }
   // The narrowed set's members from the recorded member columns; a narrowed subset the pool
   // has not interned re-splits. A multi-variant NARROWED set ("N2|N3") plans over just its
   // remaining members, exactly as the dispatch always did.
-  const set = currentStructNarrowSetOf(recv.identName, fnIx)
+  //
+  // THE RECEIVER NEED NOT BE AN IDENT. It was, and the restriction was about RE-EVALUATION,
+  // not about typing: the dispatch re-emits the receiver once per arm, which is free for an
+  // effect-free place and wrong for a call. So `g(true).v` — a shared read whose receiver is
+  // a union-returning CALL — took the emitter's `field access but no struct type declared`
+  // floor while the one-line `const u = g(true); u.v` spelling worked. The re-evaluation
+  // question now lives where it belongs (the emitter stashes a non-ident receiver in a
+  // lazy-frame local and reads it per arm); what is left here is the TYPING question, and
+  // the non-ident answer is the same derivation the ident arm's own fallback makes — the
+  // expression's union NAME resolved to its member set.
+  let set = ""
+  let setId = -1
+  if recv is Ident {
+    set = currentStructNarrowSetOf(recv.identName, fnIx)
+    setId = currentStructNarrowSetIdOf(recv.identName, fnIx)
+  } else {
+    set = unionMemberSetOf(unionNameOfExpr(recvIx, fnIx))
+    setId = msSetOfText(set)
+  }
   if set == "" { return -1 }
   const atoms: string[] = []
-  if (
-    !msMemberAtomsOfSet(currentStructNarrowSetIdOf(recv.identName, fnIx), atoms)
-  ) {
-    splitUnionAtoms(set, atoms)
-  }
+  if (!msMemberAtomsOfSet(setId, atoms)) { splitUnionAtoms(set, atoms) }
   if atoms.length < 2 { return -1 }
   let code = -1
   let i = 0

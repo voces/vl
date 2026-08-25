@@ -23,6 +23,7 @@ import {
   coalesceCallStrSlot,
   curBuf,
   emitCurFnIx,
+  emitCurStmtIx,
   emitErr,
   emitErrAt,
   emitFailed,
@@ -865,12 +866,25 @@ export function fbRefAsNonNull() {
 // emitted so far, so a partial/garbage module can never reach instantiation.
 // Returns -1, the sentinel `emitProgram` propagates so callers can branch on it.
 export function emitFail(msg: string) {
+  // Anchor the diagnostic at the function currently being lowered (if any), so
+  // the emit failure carries a source span instead of rendering positionless. Inside the
+  // SYNTHETIC start function there is no such function — the cursor still names the last
+  // user body — so the top-level statement cursor wins whenever it is armed.
+  if emitCurStmtIx >= 0 { return emitFailAt(msg, emitCurStmtIx) }
+  emitFailAt(msg, emitCurFnIx)
+}
+// The NODE-ANCHORED form. `emitCurFnIx` is a whole FUNCTION, which is the only anchor a
+// failure raised deep in a shared helper can honestly claim — but it is a bad one wherever
+// the failing construct is known, and it is WRONG for a top-level statement: the start
+// function is lowered after every user body, so the cursor still names the LAST function in
+// the file. `print(g(true).v)` on line 7 reported line 3, inside an unrelated `g`. A caller
+// that HAS the offending node passes it and the reader is pointed at the read itself
+// (resolved through `nodeToks`, exactly as a type diag's node anchor is).
+export function emitFailAt(msg: string, at: i32) {
   if !emitFailed {
     emitFailed = true
     emitErr = msg
-    // Anchor the diagnostic at the function currently being lowered (if any), so
-    // the emit failure carries a source span instead of rendering positionless.
-    emitErrAt = emitCurFnIx
+    emitErrAt = at
   }
   W.bytes = []
   -1
@@ -1541,7 +1555,8 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
   // nullable string ref, or the slot's nullable element ref), the HOISTED
   // backing ref of a cached list header (`liBack` 3 — the same backing typing
   // as 1, since it holds the same `struct.get 0` result), or that header's
-  // hoisted `len` (`liBack` 4 — always i32).
+  // hoisted `len` (`liBack` 4 — always i32), or the shared-union-field receiver stash
+  // (`liBack` 7 — the `(ref null $uBoxIdx)` box a per-tag dispatch reads per arm).
   if liKinds.length > 0 {
     fbI32Run()
     let lix = 0
@@ -1561,6 +1576,12 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
         // `len` off ONE evaluation. Kind is "i32" here too (a string element is an i32 code
         // point), so, like code 5, it needs its own code rather than a kind match.
         fbRefNullRun(sTypeIdx)
+      } else if liBack[lix] == 7 {
+        // The SHARED-UNION-FIELD receiver stash (`sharedFieldRecvSlot`) — the
+        // `(ref null $uBoxIdx)` box of a per-tag dispatch whose receiver cannot be re-emitted
+        // per arm. Kind is "i32" for the same reason 5 and 6 are: the slot's type comes from
+        // its code, not from a list element kind.
+        fbRefNullRun(uBoxIdx)
       } else if liBack[lix] == 1 || liBack[lix] == 3 {
         match lk {
           "f64" => fbRefNullRun(fa64TypeIdx)
