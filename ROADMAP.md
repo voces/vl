@@ -1507,11 +1507,28 @@ in-language GC knobs.
     the ruled fix is to BOX the read wherever it is consumed as a nullable — measured at a
     proxy ~1.11x / 1.2 ns per read. That is the right default. It is also the first time a
     correct map read costs anything, so the escape hatch stops being hypothetical.
-  - **The hatch is narrower than "unsafe".** The caller who wants it has usually ALREADY
-    proved presence — iterating `m.keys()`, or following a `.has(k)` — so the wanted operation
-    is "read a key I know is live, with no absent-check and no box". That is a `getUnchecked`
-    /`m.at(k)`-shaped name, not a blanket unsafe mode, and it fails like every other
-    unchecked read in the language: `__trap__` on a genuine miss rather than silent garbage.
+  - **THE SPELLING IS ALREADY RULED: `m[k] as! V`.** The owner's question found the better
+    answer than the `getUnchecked`/`m.at(k)` name filed here first. `as!` is the trapping
+    member of the ruled `as` trio (`error-handling-design.md` §Trio) and it already MEANS
+    exactly this — "a miss is a bug" — so the hatch needs no new name, only a lowering.
+  - **It is free, not merely cheap, and that is the point.** The union box exists solely to
+    carry WHICH ARM a value is; `as!` asserts the arm, so there is nothing left to carry:
+
+    | | the correct read (#1901) | `m[k] as! i32` fused |
+    | --- | --- | --- |
+    | probe | `entry != 0` | the same compare |
+    | miss | build the null-tagged box | `unreachable` |
+    | hit | 2 allocations | **0** — the raw scalar |
+    | extra branch | — | **none** — the trap rides the probe's own compare |
+
+    So this is not "unsafe for speed" — it is the same work with the box deleted, and the
+    only thing given up is a recoverable miss, which is precisely what `as!` is for.
+  - **BLOCKED ON A PREREQUISITE, and it is not about maps.** Measured 2026-08-25: the `as`
+    trio does not accept `T | null` as a SOURCE at all — `f() as! i32` over a
+    `function f(): i32 | null` is `` `as` supports numeric conversions only ``, and so is
+    the `string | null` twin. The trio works on multi-arm unions (`Circle | Rect`) only. So
+    the order is: extend the trio to nullables FIRST (its own change, useful on its own),
+    then fuse the map-read case. Not measurable before that — there is nothing to compile.
     Contrast `std:buffer`'s hoisted accessors (§M8), which kept their fence precisely because
     dropping it bought nothing there.
   - **Measure BEFORE building it.** Two of the three obvious customers may already be served:
