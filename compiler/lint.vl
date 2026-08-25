@@ -90,6 +90,7 @@ import {
   Paren,
   Program,
   RetStmt,
+  StrLit,
   TypeDecl,
   TypeRef,
   Unary,
@@ -233,8 +234,302 @@ export function lint(progRoot: i32) {
     lintWalk(lintRuleConstBranch, progRoot)
     lintWalk(lintRuleStepZero, progRoot)
     lintWalk(lintRuleUncondRecursion, progRoot)
+    lintWalk(lintRuleHasGuardReread, progRoot)
   }
   lintCodes.length
+}
+
+// ── map-has-guard-reread ─────────────────────────────────────────────────────
+//
+// `if m.has(k) { … m[k] … }` — the guard PROBES the map, then the read probes it AGAIN,
+// and the guard buys nothing: it does not narrow the read.
+//
+// MEASURED, in one loop at `-O3`, in-loop counts (ROADMAP B6d):
+//
+//     const v = m[k]  then `if v is i32`     1 allocation, 1 probe
+//     if m.has(k) { … m[k] … }               1 allocation, 2 probes
+//     m[k] as! i32                           0 allocations, 1 probe
+//
+// WHY IT CANNOT NARROW, so the rule is not asking for a missing feature: `m[k]` is not a
+// stable place. Carrying "present" from the guard to the read needs a proof that nothing
+// mutated `m` and nothing changed `k` in between — including through any call — which is
+// an aliasing analysis, not a narrowing rule. TypeScript declines the same thing for the
+// same reason: it narrows a BINDING, never a repeated call.
+//
+// SO THE FIX IS A SPELLING, and there are two, which is why this is `info` and names both:
+// `m[k] as! V` asserts presence (one probe, no box, and the trap rides the probe's own
+// compare), or bind once — `const v = m[k]` — and narrow `v`, which IS a stable place.
+//
+// CONSERVATIVE ON PURPOSE. It fires only when the receiver is a plain name and the key is
+// a plain name or a literal, and it declines if the guard body assigns to either or calls
+// a mutating method on the receiver — in those cases the second probe may be doing real
+// work. The residual it does NOT model is an opaque call mutating a module-level map
+// between the two; that is why this is a hint rather than a warning.
+function hasGuardRereadVisit(ix: i32) {
+  const s = P.nodes[ix]
+  if s is IfStmt {
+    const recv = guardProbeRecv(s.ifCond)
+    if recv < 0 { return 0 }
+    const key = guardProbeKey(s.ifCond)
+    if key < 0 { return 0 }
+    const rn = plainIdentName(recv)
+    if rn == "" { return 0 }
+    if !isPlainKey(key) { return 0 }
+    if blockMutates(s.ifThen, rn, key) { return 0 }
+    // A CALL BETWEEN THE GUARD AND THE READ DISQUALIFIES IT, and this is a CORRECTNESS
+    // bound on the advice rather than politeness. The suggested fix — bind once, before
+    // the guard — reads the map EARLIER; if anything in between mutates it, the binding
+    // holds a stale value and the rewrite changes behaviour. A call is opaque here (this
+    // pass has no call graph), so any statement holding one, ahead of the read's own
+    // statement, is enough to decline.
+    //
+    // Found by running the rule on this compiler: `declaredTyOfName` is
+    // `if cUserTypes.has(name) { forceDeclFill(name)  … cUserTypes[name] … }`, and
+    // `forceDeclFill` FILLS the entry the guard just tested. Suggesting a bind-once there
+    // would have been actively wrong.
+    if stmtsCallBeforeRead(s.ifThen, rn, key) { return 0 }
+    // THE ADVICE DEPENDS ON WHAT THE BODY ALREADY DOES. A body that has reached for
+    // `as!` is not being told to reach for it — it is being told the GUARD is the
+    // redundant half, since `as!` already asserts presence and traps without one. Naming
+    // the fix a caller has already applied is how a lint teaches people to ignore it.
+    const bang = blockRereadsAsBang(s.ifThen, rn, key)
+    if bang >= 0 {
+      lintEmit(
+        "map-has-guard-reread",
+        "`" +
+          rn +
+          "` is probed twice — `as!` already asserts presence and traps without a guard, so the `" +
+          rn +
+          "` check around it is the redundant half; drop it",
+        "info",
+        bang,
+      )
+      return 0
+    }
+    const hit = blockRereads(s.ifThen, rn, key)
+    if hit >= 0 {
+      lintEmit(
+        "map-has-guard-reread",
+        "`" +
+          rn +
+          "` is probed twice — the guard does not narrow the read. Use `" +
+          rn +
+          "[k] as! T` to assert presence, or bind once with `const v = " +
+          rn +
+          "[k]` and narrow `v`",
+        "info",
+        hit,
+      )
+    }
+  }
+  0
+}
+
+// The map RECEIVER a `m.has(k)` guard probes, or -1.
+//
+// `.has` ONLY — NOT the `m[k] != null` spelling, and the exclusion is a PRECISION bound
+// rather than an oversight. This pass is AST-only (see this file's header), so it cannot
+// tell a MAP from an ARRAY, and `xs[0] != null` over a `(string | null)[]` followed by
+// `xs[0]` is a perfectly ordinary element read with no probe in it at all. Measured: the
+// `!= null` form fired on three corpus files, every one of them an array. `.has` is a map
+// method, so requiring it is what makes the receiver a map without needing a type.
+//
+// The lost case is `if m[k] != null { … m[k] … }` over a real map, which does double-probe
+// and is not reported. A false NEGATIVE in a hint costs a missed suggestion; the false
+// POSITIVE it replaces costs the rule's credibility.
+function guardProbeRecv(condIx: i32) {
+  if condIx < 0 || condIx >= P.nodes.length { return -1 }
+  const c = P.nodes[condIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "has" && c.callArgs.length == 1 {
+        return callee.memObj
+      }
+    }
+    return -1
+  }
+  -1
+}
+
+// The KEY a `m.has(k)` guard probes with — the mirror of `guardProbeRecv`.
+function guardProbeKey(condIx: i32) {
+  if condIx < 0 || condIx >= P.nodes.length { return -1 }
+  const c = P.nodes[condIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "has" && c.callArgs.length == 1 {
+        return c.callArgs[0]
+      }
+    }
+    return -1
+  }
+  -1
+}
+
+// A plain binding NAME, or "" for anything else (a call result, a field read, …). The rule
+// compares receiver and key SYNTACTICALLY, so it only accepts shapes it can compare.
+function plainIdentName(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName }
+  ""
+}
+
+// A key the rule can match across two occurrences: a plain name, an int literal or a
+// string literal. Anything computed (`m[i + 1]`) is declined — the two reads might not be
+// the same key at all.
+function isPlainKey(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return true }
+  if n is NumLit { return true }
+  if n is StrLit { return true }
+  false
+}
+
+// Whether two key expressions are the SAME key, syntactically.
+function sameKey(a: i32, b: i32) {
+  if a < 0 || b < 0 { return false }
+  const x = P.nodes[a]
+  const y = P.nodes[b]
+  if x is Ident {
+    if y is Ident { return x.identName == y.identName }
+    return false
+  }
+  if x is NumLit {
+    if y is NumLit { return x.numText == y.numText }
+    return false
+  }
+  if x is StrLit {
+    if y is StrLit { return x.strText == y.strText }
+    return false
+  }
+  false
+}
+
+// Whether the guard body could invalidate the guard: an assignment to the receiver or the
+// key, or a mutating method on the receiver. Conservative — a hit here declines the rule.
+function blockMutates(ix: i32, recvName: string, key: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const lhs = plainIdentName(n.binLeft)
+      if lhs != "" {
+        if lhs == recvName { return true }
+        if lhs == plainIdentName(key) { return true }
+      }
+      const li = P.nodes[n.binLeft]
+      if li is Index {
+        if plainIdentName(li.idxArr) == recvName { return true }
+      }
+    }
+  }
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    if callee is Member {
+      if plainIdentName(callee.memObj) == recvName {
+        const mp = callee.memProp
+        if mp == "set" || mp == "delete" || mp == "clear" || mp == "add" {
+          return true
+        }
+      }
+    }
+  }
+  let i = 0
+  const kids = nodeChildren(ix)
+  while i < kids.length {
+    if blockMutates(kids[i], recvName, key) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether a STATEMENT holding a call precedes the statement holding the read. Statement
+// granularity is the point: `print(m[k])` is one statement whose call CONTAINS the read
+// (fine), while `f(x)` on the line above is a statement that does not (not fine).
+function stmtsCallBeforeRead(blockIx: i32, recvName: string, key: i32) {
+  if blockIx < 0 || blockIx >= P.nodes.length { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const st = b.blkStmts
+    let i = 0
+    while i < st.length {
+      if blockRereads(st[i], recvName, key) >= 0 { return false }
+      if subtreeHasCall(st[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether the subtree at `ix` contains a call of any kind.
+function subtreeHasCall(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Call { return true }
+  let i = 0
+  const kids = nodeChildren(ix)
+  while i < kids.length {
+    if subtreeHasCall(kids[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The first `recvName[key]` read that is ALREADY the operand of an `as!`. Separate from
+// `blockRereads` so the two can carry different advice — see the caller.
+function blockRereadsAsBang(ix: i32, recvName: string, key: i32) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is AsExpr {
+    if n.asMode == "trap" {
+      const inner = P.nodes[unparen(n.asObj)]
+      if inner is Index {
+        if plainIdentName(inner.idxArr) == recvName {
+          if sameKey(inner.idxIndex, key) { return ix }
+        }
+      }
+    }
+  }
+  let i = 0
+  const kids = nodeChildren(ix)
+  while i < kids.length {
+    const hit = blockRereadsAsBang(kids[i], recvName, key)
+    if hit >= 0 { return hit }
+    i = i + 1
+  }
+  -1
+}
+
+// Peel grouping parens — `(m[k]) as! T` is the same shape as `m[k] as! T`.
+function unparen(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return ix }
+  const n = P.nodes[ix]
+  if n is Paren { return unparen(n.parInner) }
+  ix
+}
+
+// The arena index of the first `recvName[key]` READ inside the block, or -1. The read is
+// what the diagnostic points at — the guard is fine, it is the second probe that is not.
+function blockRereads(ix: i32, recvName: string, key: i32) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is Index {
+    if plainIdentName(n.idxArr) == recvName {
+      if sameKey(n.idxIndex, key) { return ix }
+    }
+  }
+  let i = 0
+  const kids = nodeChildren(ix)
+  while i < kids.length {
+    const hit = blockRereads(kids[i], recvName, key)
+    if hit >= 0 { return hit }
+    i = i + 1
+  }
+  -1
 }
 
 // ── Generic AST walk (one child-enumerator, per-rule visit dispatch) ──────────
@@ -251,6 +546,7 @@ const lintRuleConstBranch = 0
 const lintRuleStepZero = 1
 const lintRuleUnreachable = 2
 const lintRuleUncondRecursion = 3
+const lintRuleHasGuardReread = 4
 
 // Visit `ix` for `rule`, then recurse into its children (pre-order: a rule sees
 // a node before any of its descendants). `-1` child slots (absent) and any
@@ -258,6 +554,7 @@ const lintRuleUncondRecursion = 3
 function lintWalk(rule: i32, ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   if rule == lintRuleConstBranch { constantBranchVisit(ix) }
+  if rule == lintRuleHasGuardReread { hasGuardRereadVisit(ix) }
   else if rule == lintRuleStepZero { degenerateStepVisit(ix) }
   else if rule == lintRuleUnreachable { unreachableVisit(ix) }
   else if rule == lintRuleUncondRecursion { uncondRecursionVisit(ix) }

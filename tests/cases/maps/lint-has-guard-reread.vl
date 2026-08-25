@@ -1,0 +1,104 @@
+// LINT `map-has-guard-reread` — `if m.has(k) { … m[k] … }` probes the map TWICE and the
+// guard narrows nothing (ROADMAP B6d).
+//
+// Measured in one loop at `-O3`, in-loop counts:
+//
+//     const v = m[k]  then `if v is i32`     1 allocation, 1 probe
+//     if m.has(k) { … m[k] … }               1 allocation, 2 probes
+//     m[k] as! i32                           0 allocations, 1 probe
+//
+// WHY IT CANNOT NARROW, so the rule is not asking for a missing feature: `m[k]` is not a
+// stable place. Carrying "present" from the guard to the read needs a proof that nothing
+// mutated `m` and nothing changed `k` in between — including through any call — which is
+// an aliasing analysis rather than a narrowing rule. TypeScript declines it for the same
+// reason: it narrows a BINDING, never a repeated call.
+//
+// `.has` ONLY, and that bound is measured rather than chosen. The lint pass is AST-only,
+// so it cannot tell a MAP from an ARRAY — and `xs[0] != null` followed by `xs[0]` over a
+// `(string | null)[]` is an ordinary element read with no probe in it. The `!= null`
+// spelling fired on three corpus files, every one of them an array. `.has` is a map method,
+// so requiring it makes the receiver a map without needing a type. The lost case is a real
+// map read guarded by `!= null`, which goes unreported: a false NEGATIVE costs a missed
+// suggestion, the false POSITIVE it replaces costs the rule's credibility.
+// @run
+// @log 5
+// @log 5
+// @log 5
+// @log 9
+// @log 7
+// @info `m` is probed twice — the guard does not narrow the read
+// @info `n` is probed twice — the guard does not narrow the read
+// @info `p` is probed twice — `as!` already asserts presence and traps without a guard
+// @log 3
+// @log 9
+
+const m: {[i32]: i32} = Map()
+m[1] = 5
+// FIRES — a literal key
+if m.has(1) {
+  print(m[1] ?? 0) // 5
+}
+
+const n: {[i32]: i32} = Map()
+const k = 1
+n[k] = 5
+// FIRES — a name key
+if n.has(k) {
+  print(n[k] ?? 0) // 5
+}
+
+// FIRES, WITH DIFFERENT ADVICE: a body already using `as!` is not told to use `as!` — it
+// is told the GUARD is the redundant half, since `as!` asserts presence on its own.
+const p: {[i32]: i32} = Map()
+p[1] = 5
+if p.has(1) {
+  print(p[1] as! i32) // 5
+}
+
+// QUIET — a DIFFERENT key is a different question, not a repeated one
+const q: {[i32]: i32} = Map()
+q[1] = 5
+q[2] = 9
+if q.has(1) {
+  print(q[2] ?? 0) // 9
+}
+
+// QUIET — the body MUTATES the map, so the second probe is doing real work
+const r: {[i32]: i32} = Map()
+r[1] = 5
+if r.has(1) {
+  r.set(1, 7)
+  print(r[1] ?? 0) // 7
+}
+
+// QUIET — the recommended fix: bind once, then narrow the BINDING, which is a stable place
+const s: {[i32]: i32} = Map()
+s[1] = 3
+const v = s[1]
+if v is i32 {
+  print(v) // 3
+} else {
+  print("absent")
+}
+
+// QUIET, AND THIS ONE IS A CORRECTNESS BOUND RATHER THAN POLITENESS. A call between the
+// guard and the read is opaque to an AST-only pass, and the suggested fix reads the map
+// EARLIER — so if that call mutates the map, binding once would hold a stale value and the
+// rewrite would change behaviour. The program below proves the hazard is real rather than
+// theoretical: it prints 9, the value `fill` wrote, where a bind-before-guard rewrite would
+// have printed 1.
+//
+// Found by running this rule on the compiler itself: `declaredTyOfName` is
+// `if cUserTypes.has(name) { forceDeclFill(name) … cUserTypes[name] … }`, and
+// `forceDeclFill` fills the very entry the guard tested.
+const store: {[string]: i32} = Map()
+function fill(k: string) { store[k] = 9 }
+function get(k: string) {
+  if store.has(k) {
+    fill(k)
+    return store[k] ?? 0
+  }
+  return 0 - 1
+}
+store["a"] = 1
+print(get("a")) // 9
