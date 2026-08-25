@@ -340,6 +340,7 @@ import {
 } from "./emit_state"
 import {
   emitFail,
+  emitFailAt,
   fbArrayCopy,
   fbArrayGet,
   fbArrayLen,
@@ -657,6 +658,7 @@ import {
   sFieldMapShape,
   sFieldTgtStructIdx,
   sFieldTypeAt,
+  sharedFieldRecvSlot,
   sharedUnionFieldPlan,
   sigKeyPinPayload,
   sigParamCoerceKind,
@@ -4974,6 +4976,22 @@ function fbIfForSharedField(code: i32) {
   fbIf(127) // i32 / boolean
 }
 
+// Push the shared-field dispatch's RECEIVER box: the value stashed in `slot` when the
+// receiver was evaluated once (`slot >= 0`), else a fresh emission of the place — an ident,
+// effect-free, and byte-identical to what this dispatch always emitted. ONE function so the
+// tag test and the payload read cannot pick different halves.
+function emitSharedFieldRecv(body: i32[], recvIx: i32, fnIx: i32, slot: i32) {
+  if slot >= 0 {
+    fbLocalGet(slot)
+    // The lazy frame's ref slots are NULLABLE (they must be defaultable), and `struct.get`
+    // takes a non-null ref. The value stored is the receiver's own box, so this recovers a
+    // nullness the store never had; it cannot trap on a checked program (the checker
+    // refuses a shared read through a nullable receiver outright).
+    return fbRefAsNonNull() // 0xd4
+  }
+  emitExpr(body, recvIx, fnIx)
+}
+
 function emitMem(body: i32[], memIx: i32, fnIx: i32) {
   // A field read on a NARROWED union identifier downcasts through the box (G1).
   if memIsNarrowed(memIx) { return emitNarrowedMem(body, memIx, fnIx) }
@@ -5073,14 +5091,33 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       shFis,
     )
     if shCode >= 0 && sharedFieldCodeDispatchable(shCode) {
+      // THE RECEIVER IS EVALUATED ONCE unless re-emitting it is free. The arms below read it
+      // TWICE EACH (the tag test, then the payload cast), which is why the ported subset was
+      // an IDENT receiver: a `local.get` re-emits for nothing. A CALL does not — `g(true).v`
+      // would have called `g` 2N-1 times — and that restriction, not any typing gap, is why
+      // this whole family floored on `field access but no struct type declared` while the
+      // one-line `const u = g(true); u.v` spelling worked.
+      //
+      // The stash slot is handed out HERE, during lowering (`sharedFieldRecvSlot`, the lazy
+      // list frame), not reserved by a pre-pass: a pre-pass runs before any `is`-narrowing is
+      // active and this question consults narrowing, so the two answers differ in both
+      // directions (measured — see that function's header). An IDENT receiver takes no slot
+      // and re-emits, which is what keeps every program that compiled before byte-identical.
+      const shRecv = P.nodes[unwrapParen(mS.memObj)]
+      let shSlot = -1
+      if !(shRecv is Ident) {
+        shSlot = sharedFieldRecvSlot()
+        if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+        fbLocalSet(shSlot)
+      }
       let si2 = 0
       while si2 < shVis.length - 1 {
-        if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+        if emitSharedFieldRecv(body, mS.memObj, fnIx, shSlot) < 0 { return -1 }
         fbStructGet(uBoxIdx, 0)    // field 0: tag
         fbI32Const(uTags[shVis[si2]])
         fbI32Bin(70)               // 0x46 i32.eq
         fbIfForSharedField(shCode) // if (result <the field's own rep>)
-        if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+        if emitSharedFieldRecv(body, mS.memObj, fnIx, shSlot) < 0 { return -1 }
         fbStructGet(uBoxIdx, 1)    // field 1: value (anyref)
         fbRefCast(uVarHeap[shVis[si2]])
         fbStructGet(uVarHeap[shVis[si2]], shFis[si2])
@@ -5088,7 +5125,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
         si2 = si2 + 1
       }
       const shLast = shVis.length - 1
-      if emitExpr(body, mS.memObj, fnIx) < 0 { return -1 }
+      if emitSharedFieldRecv(body, mS.memObj, fnIx, shSlot) < 0 { return -1 }
       fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
       fbRefCast(uVarHeap[shVis[shLast]])
       fbStructGet(uVarHeap[shVis[shLast]], shFis[shLast])
@@ -5100,18 +5137,31 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       return 0
     }
   }
+  // THE THREE FIELD-ACCESS FLOORS ARE NODE-ANCHORED (`emitFailAt`), not function-anchored.
+  // A reader given "line 3, inside `g`" for a read on line 7 looks in the wrong place, and
+  // for a TOP-LEVEL read that is exactly what the function cursor said — the start function
+  // is lowered last, so `emitCurFnIx` still names the file's final `function`.
   if !sDeclared {
-    return emitFail("emitProgram: field access but no struct type declared")
+    return emitFailAt(
+      "emitProgram: field access but no struct type declared",
+      memIx,
+    )
   }
   const m = P.nodes[memIx]
   if m is Member {
     const si = structIndexOfExpr(m.memObj, fnIx)
     if si < 0 {
-      return emitFail("emitProgram: field access receiver is not a struct")
+      return emitFailAt(
+        "emitProgram: field access receiver is not a struct",
+        memIx,
+      )
     }
     const idx = sFieldIndex(si, m.memProp)
     if idx < 0 {
-      return emitFail("emitProgram: unknown struct field in field access")
+      return emitFailAt(
+        "emitProgram: unknown struct field in field access",
+        memIx,
+      )
     }
     if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
     // A NULLABLE-struct receiver (`S | null`) recovers its non-null ref before the
