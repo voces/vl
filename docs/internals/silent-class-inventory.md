@@ -45,8 +45,10 @@ repro rather than a paraphrase:**
 | D16 D7 D6 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
 | D17 D18 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below; one root, one change) |
 | D14 | loud emit reject | **runs — CLOSED 2026-08-25** (below) |
-| D9 D12 D13 D15 D19 | various | as filed, still live |
-| D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14, because it is what D14's residue turned out to be (360 cells, every list rep, not f32-specific) |
+| D9 | loud emit reject | **runs — CLOSED 2026-08-25** (below; 144 cells, `loud emit reject → correct`, nothing moved the other way) |
+| D12 D13 D15 D19 | various | as filed, still live |
+| D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
+| D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -729,8 +731,8 @@ Control (assign after the narrowed block — correct, prints `a` / `true`):
 
 ---
 
-### D9 — a nullable-niche list / map / closure captured by a nested function is a loud emit reject
-**loud emit reject · 124 cells at the capture position**
+### D9 — [CLOSED 2026-08-25] a nullable-niche list / map / closure captured by a nested function is a loud emit reject
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 144 cells at the capture position (124 as filed, on the pre-`c0ee3089` grid)**
 
 Repro:
 
@@ -745,15 +747,65 @@ Repro:
 Controls (both correct): the same capture with `i32[] | null`; and the same read
 uncaptured.
 
-* **Flat on**: `string[] | null`, `f64[] | null`, `i64[] | null`, `f32[] | null`,
-  `{[string]: i32} | null`, `((i32) => i32) | null` — all `bare null needs a struct-typed
-  context`. `S[] | null` gives `ref valtype with no interned shape`; **different message,
-  same root** (see §3).
-* This is audit row R10's last bullet reached with a program: *"`exprNulScalarListKind`'s
-  Ident arm covers param / declared local / global but **not the CAPTURE storage class**"*.
-  It is now measured: 6 of the 11 niches fail at that storage class and 4 succeed, and the
-  two that succeed (`nulstr`, `nulbool`, plus `nulstruct` and `nullist`) are exactly the
-  four the audit says get remembered.
+**THE DIVERGENCE SITE IS ONE LADDER, AND IT IS THE `!= null` TEST, NOT THE READ.**
+`emitNulIsNullTest` (`compiler/wasmEmit.vl`) is the one home for the null question of every
+nullable rep — the `==`/`!=` compare and the `is`/`match` guard both call it — and it ends in
+a disjunction of the per-rep `expr*` classifiers. An in-compiler probe placed at that
+disjunction's fall-through (emit a distinguishing message whenever the receiver is an Ident
+that `capturedKindOf` DOES type) fired on **190 cells**, and the 144 of them that were loud
+emit rejects were exactly this row: `nulstrlist` 24, `nulf64list` 24, `nuli64list` 24,
+`nulf32list` 24, `nulmap` 48. So the site is reached, the capture channel can answer, and the
+ladder had no arm to ask it with — `exprNulScalarListKind`, `exprNullableMap` and
+`exprNulClosure` resolved an Ident through param / declared local / global only, while
+`exprNullableList` (`i32[] | null`, the filed control), `exprNullableRefArray` (`S[] | null`)
+and `exprNullableVariant` already carried the fourth arm. That is why the controls were
+correct and why message text could not group this: the identical fall-through reports
+`bare null needs a struct-typed context` for `!=`/`==`/`while` (96 cells) and `` `is` test but
+no union type declared`` for `is`/`match` (48 cells).
+
+The fix asks `capturedKindOf` — `captureValKind` on the parent frame, the ladder that TYPED
+the env field — so the read and the field cannot disagree about the wrapper.
+
+**A NULL TEST ALONE IS A SEVERITY REGRESSION FOR THE MAP HALF, and the grid said so before it
+shipped.** Teaching only `exprNullableMap` the storage class moved 22 `{[i32]: string} | null`
+capture cells from `loud emit reject` to **check-clean invalid wasm**: the compare lowers, and
+the narrowed `.size` then resolves its map SHAPE through `mapShapeOfExpr`, whose capture arm
+answered for the non-null `map` kind only — so the read named the mono string-keyed
+`$mapStruct` while `captureValStructIdx` had typed the env field with the i32-keyed one. The
+shipped arm reads the env field's OWN companion slot (`capturedNulMapShape`), the number that
+minted the field's heap type. A mono string-keyed map alone cannot catch this: its wrong
+answer and its right answer are the same `-1`.
+
+Measured on the 9,126-cell grid at `c0ee3089`: **144 cells moved, every one
+`loud emit reject → correct`, nothing moved in the other direction, SILENT stays 0.** Per rep
+(all /24): `string[]` 24, `f64[]` 24, `i64[]` 24, `f32[]` 24, `{[string]: i32}` 24,
+`{[i32]: string}` 24. `f32[] | null` closes here only because D14 landed first — before it,
+the same cells advanced from this row's failure to D14's `field access but no struct type
+declared`.
+
+Two more things this row's own 728-cell arm-for-arm population settled, over four capture
+BINDING FORMS the main grid does not generate (outer param / annotated local / un-annotated
+local / two frames deep) and thirteen reps:
+
+* `((i32) => i32) | null` — the null TEST is closed; **CALLING** a captured closure is a
+  separate gap that fails for a NON-nullable `(i32) => i32` capture too
+  (`call to unknown function`), so it is not this axis.
+* `S[] | null` at a capture no longer reports `ref valtype with no interned shape` and did not
+  on this tip before the fix either — `exprNullableRefArray` already had the arm. **The filed
+  claim of a second message inside this axis does not reproduce**; the real second message was
+  the `is`/`match` one above.
+* `string | null` at a `.length` READ was loud at every capture form (`field access but no
+  struct type declared`) while `print(p)` of the same cell was correct. `exprString` knew the
+  `str` capture kind and not `nulstr`, where `declaredString`/`paramString` claim both. Closed
+  in the same change; pinned in the same fixture.
+* **An UN-ANNOTATED captured local (`const v = mk()`) is still loud, for EVERY rep including
+  `i32[] | null` and `S[] | null`** — 168 of the 728. It is a different site and it is filed
+  as **D21** below, not silently absorbed here: `captureValKind` types an un-annotated env
+  field through `letInitCellKind`, whose ladder names no nullable kind at all.
+
+Pins: `tests/cases/closures/capture-nullable-niche-storage-class.vl`,
+`tests/cases/closures/capture-nullable-map-shape-agreement.vl` (the map-shape one exists
+because the null test alone passes the first fixture and still emits the invalid module).
 
 ---
 
@@ -1189,24 +1241,55 @@ Control — the SAME seven lines inside a function print `1` / `absent`:
 
 ---
 
-### D20 — a NULLABLE LIST is a loud emit reject at `capture`, `loopvar` and `mapval` — for every list rep
-**loud emit reject · 360 cells over the nullable leg of the six list reps · filed 2026-08-25 while closing D14, because it is what D14's residue turned out to be**
+### D20 — a NULLABLE LIST is a loud emit reject at `loopvar` and `mapval` — for every list rep
+**loud emit reject · 264 cells (`loopvar` 120 + `mapval` 144) · filed 2026-08-25 alongside D14, because it is what D14's residue turned out to be. Its `capture` leg was D9 and no longer reproduces; the repro below is RE-FILED on `loopvar` so this row grades against a leg that is still live**
 
 Repro:
 
     function mk(): f64[] | null { return [1.5, 2.5] }
     function body() {
-      const w: f64[] | null = mk()
-      const f = () => {
+      const xs: (f64[] | null)[] = [mk()]
+      for w in xs {
         if w != null { print(w.length) } else { print("N") }
       }
-      f()
     }
     body()
     // vl check rc 0; vl run: emitProgram: bare null needs a struct-typed context
 
-Controls, both correct: the same capture with the list made NON-nullable (`f64[]`); the same
-capture over the SHARED-backing `i32[] | null`, which is clean at this position.
+Controls, both correct: the same loop with the element made NON-nullable (`f64[]`); the same
+loop over the SHARED-backing `(i32[] | null)[]`, which is clean at this position.
+
+**THE THREE LEGS ARE THREE SITES, PROVEN BY A FIX THAT REACHED EXACTLY ONE OF THEM.** D9's
+change (the capture storage class in `exprNulScalarListKind` / `exprNullableMap` /
+`exprNulClosure`) moved 144 cells and **0 at `loopvar`, 0 at `mapval`** — so the shared
+`bare null needs a struct-typed context` between the capture and loopvar legs was message
+identity, not root identity, exactly as §3's Root D warns in the direction people forget.
+
+* **`loopvar` is `forInElemKind`, not a classifier storage class.** A loop variable IS a
+  declared local (`declareForInLocals` → `addLocalName`), so `declaredKind` reaches it; the
+  kind STORED there is the non-null one. Its ref-array ladder splits the nullable niche for
+  element kind 4 (`nullist`), for a nullable struct (`nulstruct`) and for `(string | null)[]`
+  (`nulstr`), and does NOT split it for element kinds 6 / 7 / 8 / 10 / 9 — the four
+  distinct-backing leaf lists and the nested ref array. That is why `i32[] | null` escapes at
+  `loopvar` and the other five do not.
+* **Adding those five arms is site 1 of N and was MEASURED as a severity regression, not
+  shipped.** Returning `nulstrlist` / `nulf64list` / `nuli64list` / `nulf32list` /
+  `nulreflist` from `forInElemKind` (with the matching `fiLk` / `fiVarIdx` rows in
+  `declareForInLocals`) turns all **120 loopvar cells from `loud emit reject` into
+  check-clean INVALID WASM** — `type mismatch: expected (ref null $type), found (ref $type)`
+  — because the element READ still recovers the slot non-null. The loop-var slot kind and the
+  element read/recover have to move together, the way the `nullist` arm's do. Reverted; this
+  paragraph is the measurement that makes the leg schedulable.
+* A GRADER FOOTGUN this row tripped, recorded so the next partial closure does not: the
+  status line's vocabulary is first-match ordered and `closed` is the FIRST entry, so the
+  literal word anywhere on that line makes `check-filed-witnesses.py` expect the whole row to
+  RUN. A row closing one leg of several must say so in its BODY, and keep the word off the
+  `**…**` line.
+* **`mapval` is the mv rep layer and shares nothing with either.** Its message is an explicit
+  capability decline — *"no rep for a union-member struct, a nullable list, or a nullable
+  litunion-result closure"* — and it fires for `i32[] | null` too, which is the rep that
+  escapes at both other positions. A nullable-list map VALUE needs an mv slot that does not
+  exist, which is a layout change, not a missing arm.
 
 **THIS IS NOT D14 AND IT IS NOT f32-SPECIFIC**, which is the whole reason it is filed
 separately. When D14 closed, `list_f32` reached exact parity with `list_f64` — 0 differing
@@ -1215,23 +1298,62 @@ cells of 340 — and the cells that stayed loud stayed loud in BOTH. Re-probed o
 
 | position | `i32[]` | `S[]` | `string[]` | `i64[]` | `f64[]` | `f32[]` | message |
 |---|---|---|---|---|---|---|---|
-| capture | runs | runs | LOUD | LOUD | LOUD | LOUD | `bare null needs a struct-typed context` |
+| capture | runs | runs | ~~LOUD~~ runs | ~~LOUD~~ runs | ~~LOUD~~ runs | ~~LOUD~~ runs | **CLOSED — was D9** |
 | loopvar | runs | LOUD | LOUD | LOUD | LOUD | LOUD | `bare null needs a struct-typed context` |
 | mapval | LOUD | LOUD | LOUD | LOUD | LOUD | LOUD | `unsupported map value type` |
 
 * **Flat on**: the list's ELEMENT type, except that the shared i32-list backing escapes at
-  `capture` and `loopvar` (and `S[]` escapes at `capture` only). `mapval` declines for every
-  rep including `i32[]`, and its message is an explicit capability decline — *"no rep for a
-  union-member struct, a nullable list, or a nullable litunion-result closure"*.
-* **Varies on**: nullability. The non-nullable list is clean at all three positions.
-* Grid counts, nullable leg only: capture **96**, loopvar **120**, mapval **144** loud-emit
-  cells. Message split across the three: 144 `unsupported map value type`, 144 `bare null
-  needs a struct-typed context`, 72 `` `is` test but no union type declared`` — three messages
-  for one axis, which is §3's message-identity warning again.
-* **Do not read the size of this row as difficulty.** It is bigger than D14 was and it is a
-  different shape: D14 was one classifier missing an arm its twin had, and this is a niche
-  with no rep at three specific positions. Nothing in D14's fix touches it — the D14 branch
-  moved 174 cells and not one of them was at these positions.
+  `loopvar`. `mapval` declines for every rep including `i32[]`.
+* **Varies on**: nullability. The non-nullable list is clean at both remaining positions.
+* Grid counts at `c0ee3089`, nullable leg only: ~~capture **96**~~ (closed), loopvar **120**,
+  mapval **144** loud-emit cells. Message split across the two live legs: 144 `unsupported map
+  value type`, 80 `bare null needs a struct-typed context`, 40 `` `is` test but no union type
+  declared``.
+* **Do not read the size of this row as difficulty, and do not read its three messages as one
+  axis.** Nothing in D14's fix touched it (that branch moved 174 cells, none at these
+  positions) and nothing in D9's fix touched what is left of it (144 cells, all at `capture`).
+
+---
+
+### D21 — an UN-ANNOTATED captured local loses its `| null` for EVERY nullable rep
+**loud emit reject · 168 of a 728-cell capture population · filed 2026-08-25 while closing D9, because D9's fix reaches every capture form EXCEPT this one**
+
+Repro:
+
+    function mk(): i32[] | null { return [1, 2] }
+    function body() {
+      const v = mk()
+      function inner() { if v != null { print(v.length) } else { print("N") } }
+      inner()
+    }
+    body()
+    // vl check rc 0; vl run: emitProgram: bare null needs a struct-typed context
+
+Controls, both correct: the same capture with the local ANNOTATED (`const v: i32[] | null =
+mk()`); and the same un-annotated local read UNCAPTURED.
+
+**IT IS NOT A REP AXIS — IT IS THE ANNOTATION.** Measured over four capture binding forms
+(outer param / annotated local / un-annotated local / two frames deep) × thirteen reps × seven
+narrowing constructs × two runtime inputs: after D9, the param / annotated-local / two-deep
+forms are clean for every rep the compiler otherwise supports, and the un-annotated form is
+loud for **every rep except plain `S`** — including `i32[] | null` and `S[] | null`, the two
+that were D9's own working controls. 168 of 728, 14 per rep, flat.
+
+The site: `captureValKind` types an ANNOTATED env field through `vtKindOfType(annotation)` and
+an un-annotated one through `letInitCellKind`, whose ladder returns `map` / `nulstruct` /
+`union` / the six non-null list kinds / `struct` / `list` / `str` / `i64` / `f32` / `f64` /
+`closure` / `i32` — **no nullable kind but `nulstruct`**. So `const v = mk()` over a
+`T | null`-returning call types the env field at the NON-NULL kind, `capturedKindOf` answers
+the non-null kind to every classifier that asks, and the null test finds no nullable rep. That
+is also why the row is loud rather than silent today: the field and the read agree, and they
+are both wrong in the same direction.
+
+**Do not fix it by widening `letInitCellKind` without measuring the other consumers.** It is
+also `letCellKind`'s initializer arm, which feeds `criClassify` / `fnAssignRetKind` — and
+`fnAssignKindGuard` right beside it already DECLINES `nulstr` / `nulclosure` / `nulmap` /
+`nulreflist` at those consumers with a recorded reason per kind (a named `nulstr` there
+converts a reject into a TRAP). A nullable kind admitted here has to be admitted at a
+consumer's granularity, not the ladder's.
 
 ---
 
@@ -1282,10 +1404,27 @@ axis: independent confirmation that Root C and this message are one site.
 ### Root D — "bare null needs a struct-typed context" is a GENERIC FALLTHROUGH and must not be used to group
 192 cells carry that message across at least **three unrelated axes**: the capture storage
 class (D9), the map-index-read nullable (D10), and a nullable-niche map VALUE type. They are
-grouped here as three separate rows on purpose. Conversely `S[] | null` at a capture reports
-`ref valtype with no interned shape` — a DIFFERENT message inside D9's single axis. Message
-identity and root identity are independent in this compiler, in both directions, and the
-sweep shows both directions in the same table.
+grouped here as three separate rows on purpose.
+
+**BOTH DIRECTIONS OF THIS WARNING WERE RE-MEASURED WHILE CLOSING D9, AND ONE OF THE TWO
+EXAMPLES ON THIS LINE WAS WRONG.**
+
+* The one-axis-many-messages direction HOLDS and is now exact, not anecdotal: D9's single
+  decision site (`emitNulIsNullTest`'s niche disjunction returning 0) reports `bare null
+  needs a struct-typed context` from the `==`/`!=`/`while` callers, 96 cells, and `` `is`
+  test but no union type declared`` from the `is`/`match` caller, 48 cells. One site, two
+  messages, one fix, verified by an in-compiler probe at the site rather than by the text.
+* **The example this paragraph used for it did NOT reproduce.** `S[] | null` at a capture
+  does not report `ref valtype with no interned shape`: `exprNullableRefArray` already
+  carried the capture arm, and that rep was CLEAN at the capture position before D9's fix as
+  well as after. The claim was inherited, not re-run.
+* The many-axes-one-message direction also holds and grew a live case: D20's `loopvar` leg
+  carries D9's exact message from a DIFFERENT site (`forInElemKind`'s missing nullable arms).
+  D9's fix moved 144 cells and 0 of them at `loopvar`, which is the cheapest possible proof
+  that the two are not one root.
+
+Message identity and root identity are independent in this compiler, in both directions —
+and so is INHERITED evidence for either. Re-run the example before quoting it.
 
 ### Root E — the map-index read's implicit `T?` has no rep for the numeric reps
 **[BOTH CLOSED — D10 by #1901/#1903/#1904, D6 on 2026-08-25.]**
