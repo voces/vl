@@ -2278,9 +2278,11 @@ Controls, each RUN:
 * **THE TWIN SIG PASS CARRIES THE SAME LADDER** (`rlSig`'s `else` arm) by design — its
   header says it "mirrors the `rlElemHeap` resolution below" — so a fix must move BOTH in
   lock-step or the dedup decision and the heap disagree.
-* **DELIBERATELY NOT FIXED WITH D26.** `rlElemStructRow` has four other consumers
-  (`wasmEmit`'s element store / push / array-literal sites) that would each need the same
-  gate, and `rlElemLitStructRow`'s header already records a MEASURED reason its own name
+* **DELIBERATELY NOT FIXED WITH D26.** Besides the two ref-pair-loop sites above,
+  `rlElemStructRow` has SIX other call sites — `wasmEmit`'s element STORE (13564), PUSH
+  (14215) and array-LITERAL (19787), `emit_classify`'s `rlSlotsLayoutTwin` (the ref-list
+  slot dedup itself) and `structListPopGetElem` (`xs.pop()` / `xs.get(i)`) — and each would
+  need the same gate, and `rlElemLitStructRow`'s header already records a MEASURED reason its own name
   rung is deliberately narrower ("changes the answer on 7 corpus calls and 311 fuzz
   programs — every one of them a both-decline today, i.e. exactly the -1 the variant route
   depends on"). This is the seam ROADMAP charters as repOf item (e), the variant/struct-table
