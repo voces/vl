@@ -174,17 +174,39 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // result stored into a LIST or MAP all closed together, and the `@no-instantiate` class was
 // briefly EMPTY — which the tripwire below would have read as a sweep that saw nothing.
 //
-// This specimen is therefore a `u8[]` handed to a `std:array` generic. It is not a literal
-// union at all: `u8` is a PACKED array element with no value-position rep, and a generic call
-// spells `u8` nowhere, so the instance is pinned from the argument's REP (the byte-array
-// wrapper) while its body resolves the i32-list wrapper. `std/array.vl`'s storage-type
-// section has recorded it as pre-existing and unpinned since #1927, with all three of its
-// outcomes measured; it is now pinned as
-// `tests/cases/std/xfail-miscompile-u8-array-generic-needle.vl`.
-const INVALID_MODULE_SRC = `import { indexOf } from "std:array"\n` +
+// The `u8[]`-into-a-`std:array`-generic specimen that followed it is gone too, and it left the
+// class by a different door than a codegen fix: the RULE it violates ("`u8[]` cannot be passed
+// to a generic parameter" — `T` ranges over value types, `u8` is storage) already existed and
+// reached only the DIRECT spelling, because it sits in the argument loop and a UFCS receiver
+// arrives ahead of one. Giving `ufcsCallTy` the receiver rung turned every UFCS spelling into
+// the same checker error its direct twin already gave. Its grid is
+// `tests/cases/std/error-u8-array-generic.vl`, which runs the two spellings side by side.
+//
+// THIS SPECIMEN IS AN OBJECT LITERAL MEETING A `Circle | null` PARAMETER, and it is neither of
+// the two families above. `Circle | null` is the `nulvariant` NICHE (one non-null member, so no
+// box), but an object literal in that argument position takes the union-BOX path because the
+// program declares a union at all — `struct.new $Circle ; struct.new $unionBox` into a slot
+// typed for the bare niche. A `null` argument to the same parameter is fine, and so is the same
+// literal handed to a `Shape` parameter; it is the third combination that has no arm. It was
+// MASKED until the narrowed-`Circle | null` pass-through in the same file was fixed, which is
+// how gridding the call-argument boundary surfaced it. Pinned as
+// `tests/cases/soundness/xfail-miscompile-nulvariant-literal-arg.vl`.
+const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
+  `type Sq = { s: i32 }\n` +
+  `type Shape = Circle | Sq\n` +
   `\n` +
-  `const xs: u8[] = [1, 2, 3]\n` +
-  `print(xs.indexOf(2))\n`;
+  `export function area(sh: Shape) {\n` +
+  `  if sh is Circle { return sh.r }\n` +
+  `  return 0\n` +
+  `}\n` +
+  `\n` +
+  `function go(v: Circle | null) {\n` +
+  `  if v is Circle { return v.r }\n` +
+  `  return -1\n` +
+  `}\n` +
+  `\n` +
+  `print(go(null))\n` +
+  `print(go({ r: 3 }))\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
