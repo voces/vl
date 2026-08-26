@@ -9,11 +9,22 @@ PREDICTED (stated before the run):
    8 wrong_evalcount  -- callee runs TWICE, value lines still correct, count line wrong
    6 trap             -- list index out of bounds at runtime
    4 correct          -- clean controls, must NOT move
-  30 total
+  30 total            -- `--legacy` emits exactly these, and they are the published counts
+
+PLUS the MODULE-SCOPE block (added with the scope axis, 2026-08-26). The grader had never
+been shown to fire on a program whose reading statements sit at module top level in the
+shape `gen.py --scopes mod` builds — a global binding, narrowed and read, with no enclosing
+function. Every column is made to fire again in that shape:
+   3 wrong_value      +  2 wrong_evalcount  +  2 trap  +  1 correct   =  8
+  38 total, i.e. 15 wrong_value / 10 wrong_evalcount / 8 trap / 5 correct
+
+The `correct` control and one of the `wrong_value` cells are THE SAME PROGRAM with different
+manifests, which is what proves the grader reads the expectation and not the output.
 """
 import json, os, sys
 
 OUT = sys.argv[1]
+LEGACY = "--legacy" in sys.argv
 os.makedirs(OUT, exist_ok=True)
 cells = {}
 n = 0
@@ -98,5 +109,54 @@ add("const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(1)\n", ["2", "1"], "sab_c
 add("type S = { w: i32 }\nconst s: S = { w: 5 }\nprint(s.w)\nprint(1)\n",
     ["5", "1"], "sab_control")
 
+nLegacy = n
+
+# ---------------------------------------------------------------- MODULE SCOPE
+# The same four columns, in the shape `gen.py --scopes mod` generates: a module-scope
+# binding, narrowed and read, with no enclosing function anywhere in the program.
+MODMAP = ('const m: {[string]: i32 | null} = Map()\n'
+          'm["a"] = 1\n'
+          'const v = m["nope"]\n'
+          'if v != null { print(v) } else { print("absent") }\n'
+          'print(1)\n')
+
+if not LEGACY:
+    # 3 wrong_value
+    add('const v: i32 | null = 7\n'
+        'if v != null { print(v) } else { print("NUL") }\n'
+        'print(1)\n', ["NUL", "1"], "sab_mod_wrongvalue")
+    # SAME PROGRAM as the module-scope `correct` control below, wrong manifest.
+    add(MODMAP, ["1", "1"], "sab_mod_wrongvalue")
+    add("type S = { w: i32 }\nconst s: S = { w: 5 }\nprint(s.w)\nprint(1)\n",
+        ["6", "1"], "sab_mod_wrongvalue")
+    # 2 wrong_evalcount — the producer runs twice at module scope, values still right
+    for ty, val, rd, exp in (("i32", "7", "print(a + b - 7)", ["7"]),
+                             ("string", '"aa"', "print(a)", ["aa"])):
+        add("let nCalls = 0\n"
+            f"function src(): {ty} {{ nCalls = nCalls + 1\n  return {val} }}\n"
+            f"const a: {ty} = src()\n"
+            f"const b: {ty} = src()\n"
+            f"{rd}\n"
+            "print(nCalls)\n", exp + ["1"], "sab_mod_evalcount")
+    # 2 trap — a VALID module that loads, prints, then dies at module scope
+    add("const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])\nprint(1)\n",
+        ["2", "1", "1"], "sab_mod_trap")
+    add('const m: {[string]: i32} = Map()\n'
+        'm["a"] = 1\n'
+        'const v = m["a"]\n'
+        'if v != null {\n'
+        '  const xs: i32[] = [1]\n'
+        '  print(xs[9])\n'
+        '} else { print("N") }\n'
+        'print(1)\n', ["1", "1"], "sab_mod_trap")
+    # 1 correct — must NOT move. This is the shape the scope axis found silent.
+    add(MODMAP, ["absent", "1"], "sab_mod_control")
+
 json.dump(dict(cells=cells, skipped=[]), open(os.path.join(OUT, "manifest.json"), "w"))
-print(f"generated {n} sabotage cells")
+print(f"generated {n} sabotage cells "
+      f"({nLegacy} legacy function-scope + {n - nLegacy} module-scope)")
+if LEGACY:
+    print("PREDICTED: 12 wrong_value / 8 wrong_evalcount / 6 trap / 4 correct")
+else:
+    print("PREDICTED: 15 wrong_value / 10 wrong_evalcount / 8 trap / 5 correct")
+    print("  the legacy 30 alone (--legacy): 12 / 8 / 6 / 4, unchanged")

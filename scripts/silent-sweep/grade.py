@@ -152,12 +152,12 @@ def main():
         with open(out, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["cell", "leg", "rep", "nul", "pos", "con", "read", "inp",
-                        "spell", "outcome", "msg", "expected"])
+                        "spell", "scope", "outcome", "msg", "expected"])
             for name, cell, col, msg in rows:
                 w.writerow([name, cell["leg"], cell["rep"], cell["nul"], cell["pos"],
                             cell["con"], cell["read"], cell["inp"],
-                            cell.get("spell", "inline"), col, msg,
-                            "|".join(cell["expected"])])
+                            cell.get("spell", "inline"), cell.get("scope", "fn"),
+                            col, msg, "|".join(cell["expected"])])
         print(f"\nwrote {out}")
 
 
