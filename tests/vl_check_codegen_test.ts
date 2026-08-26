@@ -157,26 +157,34 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/std/array-mapindexed-litunion-result.vl`, the graduated grid.
 //
 // TWO SPECIMENS IN A ROW WERE SHAPES SOMEONE WAS ALREADY REPAIRING, which is how this
-// constant ends up naming a program that runs. So this one was chosen for NOT being anyone's
-// current work, and it is the sharpest remaining member of the class: CALLING a function
-// VALUE whose annotated type declares an INLINE string literal-union RESULT.
-// `ctxKeepsLitUnion` PRESERVES a literal union's members at `RC_FN_RES` and SOFTENS them at
-// `RC_ROOT`, so `const f: (i32) => ("a" | "b") = toAB` interns a signature whose result is
-// the i32 ATOM while the `toAB` it holds returns the string ref its own declaration softened
-// to. The STORE is fine; the `call_ref` RESULT is where the two meet. `compiler/typecheck.vl`
-// said that asymmetry was "not reachable as a miscompile"; this is the counter-example, and
-// that comment now says so.
+// constant ends up naming a program that runs. The one chosen next for NOT being anyone's
+// current work was CALLING a function VALUE whose annotated type declares an INLINE string
+// literal-union RESULT — `ctxKeepsLitUnion` preserved a literal union's members at
+// `RC_FN_RES` and softened them at `RC_ROOT`, so `const f: (i32) => ("a" | "b") = toAB`
+// interned a signature whose result is the i32 ATOM while the `toAB` it held returned the
+// string ref its own declaration softened to. It is fixed: the three surviving preserve
+// positions are CONTAINERS (element / field / map value), a function RESULT is the same
+// scalar position a declaration's return annotation occupies, and that one is `RC_ROOT`. Its
+// grid is folded into `tests/cases/literal-unions/fntype-litunion-result-controls.vl`, all
+// eight cells running.
 //
-// Pinned as a corpus case by
-// `tests/cases/soundness/xfail-miscompile-fntype-litunion-result-call.vl`, whose header
-// carries the eight-cell grid, with the five RUNNING cells pinned executably beside it in
-// `tests/cases/literal-unions/fntype-litunion-result-controls.vl`.
-const INVALID_MODULE_SRC = `function toAB(x: i32): "a" | "b" {\n` +
-  `  if x > 0 { return "b" }\n` +
-  `  "a"\n` +
-  `}\n` +
-  `const f: (i32) => ("a" | "b") = toAB\n` +
-  `print(f(1))\n`;
+// THE WHOLE LITERAL-UNION BOUNDARY CLASS WENT WITH IT, which is why this specimen leaves the
+// family entirely rather than moving one position over inside it: the monomorphized ARGUMENT,
+// the function-value CALL RESULT, the callback reaching a call through a BINDING and the call
+// result stored into a LIST or MAP all closed together, and the `@no-instantiate` class was
+// briefly EMPTY — which the tripwire below would have read as a sweep that saw nothing.
+//
+// This specimen is therefore a `u8[]` handed to a `std:array` generic. It is not a literal
+// union at all: `u8` is a PACKED array element with no value-position rep, and a generic call
+// spells `u8` nowhere, so the instance is pinned from the argument's REP (the byte-array
+// wrapper) while its body resolves the i32-list wrapper. `std/array.vl`'s storage-type
+// section has recorded it as pre-existing and unpinned since #1927, with all three of its
+// outcomes measured; it is now pinned as
+// `tests/cases/std/xfail-miscompile-u8-array-generic-needle.vl`.
+const INVALID_MODULE_SRC = `import { indexOf } from "std:array"\n` +
+  `\n` +
+  `const xs: u8[] = [1, 2, 3]\n` +
+  `print(xs.indexOf(2))\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
@@ -283,13 +291,11 @@ Deno.test({
     // of it, leaving the last live case in `std/` — at which point a soundness-only scan
     // found ZERO marked files and tripped the "read nothing" guard below. The guard was
     // right and the scan was too narrow: a check-clean-invalid-wasm shape can be filed
-    // wherever its subject lives. Membership has moved three times since — that `std/` case
-    // graduated and both directories filled again (the `??` list-index coalesce under
-    // `soundness/`, `mapIndexed`'s literal-union RESULT list under `std/`), then the coalesce
-    // one graduated, and now the `mapIndexed` one has too. `std/` was empty for the length of
-    // one review — the std reviewer of this very commit found a bare member LITERAL handed to
-    // `indexOf` over a litunion array, four lines importing only std, and it refilled the
-    // directory (`xfail-miscompile-array-litunion-needle.vl`). One member per directory again.
+    // wherever its subject lives. Membership has moved repeatedly since, and the literal-union
+    // BOUNDARY class then emptied both at once — its four directions closed together — before
+    // the std review of that same commit refilled `soundness/` with a shape from outside the
+    // family (a narrowed NULLABLE function value passed as an argument) and the `u8[]` generic
+    // argument refilled `std/`. One member per directory again, from two unrelated causes.
     //
     // THE SCAN MUST STAY TWO-DIRECTORY REGARDLESS. An empty directory costs one `vl check`
     // invocation; a directory dropped because it happened to be empty is what stops the gate
@@ -298,9 +304,11 @@ Deno.test({
     // guard below is on the UNION, not on either directory.
     const dirs = [`${ROOT}/tests/cases/soundness`, `${ROOT}/tests/cases/std`];
     const marked = new Set<string>();
+    let scanned = 0;
     for (const dir of dirs) {
       for await (const e of Deno.readDir(dir)) {
         if (!e.isFile || !e.name.endsWith(".vl") || e.name === "README.vl") continue;
+        scanned++;
         const src = await Deno.readTextFile(`${dir}/${e.name}`);
         if (/^\/\/\s*@no-instantiate\b/m.test(src)) marked.add(e.name);
       }
@@ -337,6 +345,15 @@ Deno.test({
           }`,
       );
     }
-    if (marked.size === 0) throw new Error("no @no-instantiate cases found — the sweep read nothing");
+    // THE "READ NOTHING" GUARD, on the SCAN rather than on the CLASS. It used to require at
+    // least one marked file, which conflates two different states: a scan that walked no files
+    // (the real hazard — a renamed directory, a filter that matches nothing) and a class that
+    // is genuinely EMPTY, which is the outcome every fix in this family is working toward. The
+    // literal-union boundary class emptied both directories at once and the old form would have
+    // reddened on a tree with no defect in it. What has to be non-zero is the number of case
+    // files this test READ; whether any of them is marked is the finding, not the precondition.
+    if (scanned === 0) {
+      throw new Error("the @no-instantiate sweep walked no case files — check the directories");
+    }
   },
 });

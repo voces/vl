@@ -12314,7 +12314,17 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
           if lpNul.length > 0 {
             return emitPrintNulLitUnion(body, c.callArgs[0], lpNul, fnIx)
           }
-          const lpTexts = nodeLitUnionMemberTexts(c.callArgs[0])
+          let lpTexts = nodeLitUnionMemberTexts(c.callArgs[0])
+          // THE DECLARATION FALLBACK, a THIRD consumer of the fact `exprIsLitAtom`'s Index arm
+          // and `emitAtomToStr` already take it from. A monomorphized instance's leaf nodes are
+          // SHARED with the generic body, so `print(x[0])` inside `gtake<T>(x: T)` at `T := K[]`
+          // records the generic's `T` and this query answers nothing — while the instance's own
+          // parameter annotation names `K[]` outright. Same resolver, same reason: the first
+          // consumer decides WHETHER the value is an atom, the second and third need the members
+          // to spell it with.
+          if lpTexts.length == 0 {
+            lpTexts = tyLitMemberTexts(litAtomMemberTy(c.callArgs[0], fnIx))
+          }
           // `exprIsLitAtom` claims a value whose REP is the atom; the member texts come from the
           // recorded TYPE. A claim with no texts on either query means the two disagree, and the
           // chain would match nothing: rc=0 and NO OUTPUT, the quietest possible wrong answer.
@@ -17790,9 +17800,49 @@ function emitStrToAtom(body: i32[], ix: i32, fnIx: i32) {
     )
   }
   if !unionEqOperandOk(ix) {
-    return emitFail(
-      "emitProgram: literal-union atom narrowing needs a re-readable receiver",
-    )
+    // A NON-PLACE value — a CALL, a `+`, a ternary — is STAGED rather than refused: evaluated
+    // ONCE into `atomStageSlot`, then re-read per member. That is `emitAtomToStr`'s id stash
+    // mirrored, and it is what `emitDestStrToAtom` already does one destination over.
+    //
+    // WHY IT BELONGS HERE RATHER THAN AT EACH DESTINATION. This function is reached through
+    // `emitExpr`'s single `pendingLitUnion` hook — the ONE place a string-repped literal union
+    // meets an atom-typed slot — so every destination that seeds that context is served by one
+    // arm: an array LITERAL element, an indexed store, a map-value store, an annotated local, a
+    // `K` parameter, a `K` field, a `K` return. `emitDestStrToAtom`'s header filed the first two
+    // as "the same boundary one destination over" and predicted a walk per destination; the hook
+    // makes it one walk, `exprPopBits`' — the same value-position walk that already reserves the
+    // `.pop` frames, which reaches every one of those positions because they are all expression
+    // positions.
+    //
+    // MEASURED AS THE WHOLE OF D13: `const xs: ("p" | "q")[] = [src()]` and its indexed-store and
+    // map-value siblings were `emitProgram: literal-union atom narrowing needs a re-readable
+    // receiver`, at module scope and inside a function alike, and the named-ALIAS spelling was
+    // clean because the alias reps as the atom at BOTH ends and no narrow is wanted at all.
+    if !fnUsesAtomStage {
+      // The reservation scan claims a strict SUPERSET of what this arm stages, so reaching here
+      // means the two have drifted. Keep the LOUD refusal rather than `local.set` an index the
+      // locals vector never declared — that trade is what this whole family exists to refuse.
+      return emitFail(
+        "emitProgram: literal-union atom narrowing needs a re-readable receiver",
+      )
+    }
+    // The atom context is cleared across the STASH **AND** the chain, not just the stash. Both
+    // halves lower strings: the value must reach the slot as the `(ref $array)` it is, and each
+    // member constant in the tower must lower as a string CONSTANT — under `pendingLitUnion` an
+    // `emitExpr` of a member literal folds to its interned ID, so the tower called `strEq` with
+    // an i32 second operand. `vl check` rc 0 and `type mismatch: expected (ref $type), found
+    // i32`: this arm exists to end a loud reject, and restoring one line early turned it into a
+    // silent miscompile instead. Restored on BOTH exits, so a failed inner emit cannot leak the
+    // cleared context to the caller.
+    const savedST = pendingLitUnion
+    pendingLitUnion = 0
+    let rv = emitExpr(body, ix, fnIx)
+    if rv >= 0 {
+      fbLocalSet(atomStageSlot)
+      rv = emitStagedStrToAtomChain(body, texts, 0, fnIx)
+    }
+    pendingLitUnion = savedST
+    return rv
   }
   // The inner emits run OUTSIDE the atom context: the value re-reads must lower as the
   // string they are (re-entering this arm would not terminate), and the per-member literal
@@ -17850,18 +17900,20 @@ function emitStrToAtomChain(
 // A re-readable value takes the re-reading tower and needs no slot, which is the shape the
 // non-generic spelling already had.
 //
-// TWO SIBLING DESTINATIONS STILL REFUSE A NON-PLACE VALUE, and both were measured to be
-// unchanged by this — they are the same boundary one destination over, not a regression:
+// THE SIBLING DESTINATIONS CLOSED, AND NOT THE WAY THIS HEADER PREDICTED. It named two —
 //
 //   const xs: ("a" | "b")[] = [toAB(0), toAB(1)]   // an array LITERAL element
 //   xs[1] = toAB(1)                                // an INDEXED store
 //
-// Each is `emitProgram: literal-union atom narrowing needs a re-readable receiver`, i.e. a
-// LOUD refusal and never an invalid module, and each would close by routing its value emit
-// through this function the way `emitPush` now does. They are left because a staged narrow
-// costs a reserved slot and the reservation has to be hung on a walk that cannot miss the
-// site (see `pushStagesAtomNarrow`) — `stmtPushBits` is that walk for a `.push`, and the
-// array-literal and indexed-store paths would each need their own.
+// — plus the map-value store, and expected each to need its OWN reservation walk, since a
+// staged narrow costs a slot and the reservation has to hang on a walk that cannot miss the
+// site. It did not. Those three (D13 of the silent-class inventory) all reach the narrow
+// through `emitExpr`'s single `pendingLitUnion` hook, so `emitStrToAtom` stages there and
+// serves every atom-typed destination at once; and because they are all EXPRESSION positions,
+// the walk that reserves them is `exprPopBits`, the value-position walk that already reserves
+// the `.pop` frames. THIS function stays because its own destination asks a different
+// question: at a `.push` inside a MONOMORPHIZED instance the value's recorded type is the type
+// VARIABLE, so the members come from the DESTINATION rather than from the value.
 function emitDestStrToAtom(body: i32[], valIx: i32, fnIx: i32, luTy: i32) {
   const texts = tyLitMemberTexts(luTy)
   if texts.length == 0 {
