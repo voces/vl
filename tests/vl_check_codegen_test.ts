@@ -275,32 +275,52 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `xfail-miscompile-list-elem-struct-twin.vl` is DELETED, which is that file's own written
 // instruction for the day it starts passing.
 //
-// THE SUCCESSOR WAS NOT LEFT TO BE RE-DERIVED, AND IT DID NOT COME FROM THE INVENTORY. The
-// note this paragraph replaces said D30 and D32 were the last two live rows and that there
-// might be no live member of the class left — which was true of the FILED rows and false of
-// the tree. The `std-api-reviewer` pass over D32's own retirement went looking for the cross
-// cell that retirement had no fixture for and found one. That is the third consecutive time
-// that review has produced the closing change's next piece of work — D26 from the ninth
-// retirement's review, D32's understatement from D26's, and a whole row from D32's — and only
-// the first and third of those are rows, which is the honest form of the pattern:
-// `silent-class-inventory.md` **D33** — a type parameter first
-// bound through a CALLBACK'S ANNOTATION resolving a union ARM onto a declared standalone
-// struct of that arm's exact layout. The constant below is its `mapIndexed` spelling
-// (`(T, i32) => Circle`); `reduce`'s accumulator at `A = Circle[]` is the same row and is
-// pinned beside it. The row was first written up as "the callback-RESULT position" and the
-// review's SECOND pass corrected it to the property, with the control that decides it: the
-// same `Circle[]` reaching a type parameter through the RECEIVER runs, twin and all.
+// THE D33 SPECIMEN THAT STOOD HERE — a type parameter FIRST BOUND through a CALLBACK'S
+// ANNOTATION resolving a union ARM onto a declared standalone struct of that arm's exact
+// layout — IS CLOSED (#1944), and it went the way its two predecessors did: the rule the fix
+// needed was already written and simply not consulted. `shapeNominalOfTy` maps a structural
+// shape back to a nominal NAME over four rungs, and only ONE was nominal by construction
+// (`structIndexOfTy`, the struct-table arena sidecar). Its twin — `variantRowOfTy`, matching
+// `uVarTyIx[i] == ty`, the arm DECLARATION's own identity — existed, was documented as
+// correct, and was not asked. Below it sat two STRUCTURAL field-set scans, one per table, and
+// a layout twin is claimed by both, so their fixed order was the whole answer. Probed on the
+// row's own witness: `arenaS=-1 arenaV=0 fsS=0 fsV=0`. One rung, placed where D32 placed its
+// own. 34 of a 360-cell grid moved, 28 from check-clean invalid wasm and 6 from a LOUD emit
+// refusal (`std:array`'s last live carve-out, retired by the same predicate), none backward.
+// Graduated to `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl`, and the
+// two `xfail-miscompile-mono-*-twin.vl` pins are DELETED.
 //
-// IT IS THE SAME FAMILY AS D32 AND A DIFFERENT RUNG, which is why D32's gate does not reach
-// it: the element NAME of the instance's minted `U[]` is not `Circle` at all — a probe at
-// `rlElemStructRow` reads `name=[Dot] arena=0 byname=0 canon=0 vi=-1`, so the monomorphizer's
-// substitution had already resolved `U`'s structural spelling onto the declared twin's
-// NOMINAL name, and every rung below is answering correctly for the name it was given.
+// THE SUCCESSOR AGAIN DID NOT COME FROM THE INVENTORY, and this time it did not come from the
+// std review either — it came from the GRID built to close the predecessor, which is a fourth
+// source and the first that is a by-product of the closing change rather than a reading of it.
+// D33's grid crossed (binding column x substituted type x twin) and left 42 of 360 cells
+// silent under BOTH compilers, flat across the twin axis — which is what said they were a
+// different root rather than a residue. Four rows came out of that residue and out of the
+// constructed controls beside it (`silent-class-inventory.md` D34-D37).
+//
+// The one below is **D36**: an anonymous `{ r: i32 }` object literal in a LAMBDA's inferred
+// LIST return, in a module that declares BOTH a union arm of that layout and a standalone
+// struct twin of it. No import, no generic, 14 lines. Its controls, each ONE line different
+// and each measured: `Dot` DELETED is LOUD (`emitProgram: field access but no struct type
+// declared`); deleting `Sq`/`Shape` so `Circle` is not an arm RUNS and prints 7; ANNOTATING
+// the element (`const o: Circle[] = [{ r: n }]`) RUNS and prints 7. The third names the axis —
+// the ANONYMOUS spelling is the trigger, not the list and not the lambda.
+//
+// IT IS THE SAME FAMILY AS D32 AND D33 WITH THE DIRECTION REVERSED, which is why neither fix
+// reaches it and why it is a real successor rather than a near-miss of the one just closed.
+// Both of those are "a DECLARED arm resolved onto a struct row". Here the expression holds no
+// declared arm at all: an INLINE literal is resolved, and a real struct row and a real arm
+// both claim its layout. At D33's own site this program probes `arenaS=-1 arenaV=-1 fsS=0
+// fsV=0` — **both arena rungs correctly decline**, because an anonymous shape has no
+// declaration identity, so nothing in the arena can break the tie. That is recorded in D33's
+// census rather than discovered afterwards.
+//
 // Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
-// diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref
-// $type), found (ref $type)`, and NO `emit error` marker — every property the three
-// assertions below need. Pre-existing and byte-identical on `a80c6717`. Pinned as
-// `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl`.
+// diagnostics at all — not even a hint — `--codegen` rc 1 with `not valid wasm` + `type
+// mismatch: expected (ref null $type), found (ref $type)`, and NO `emit error` marker.
+// Pre-existing and byte-identical on `235b365b` and on D33's branch. Pinned as
+// `tests/cases/soundness/xfail-miscompile-lambda-list-anon-elem-arm-twin.vl` per the REFILLS
+// procedure below, in the same commit that swapped this constant.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
@@ -338,16 +358,20 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
 // state can be entered halfway.
 // ─────────────────────────────────────────────────────────────────────────────
-const INVALID_MODULE_SRC: string | null = `import { mapIndexed } from "std:array"\n` +
-  `\n` +
-  `type Circle = { r: i32 }\n` +
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
   `\n` +
-  `function mk(x: i32, i: i32): Circle { return { r: x + i } }\n` +
+  `function f() {\n` +
+  `  const g = (n: i32) => {\n` +
+  `    const o = [{ r: n }]\n` +
+  `    return o\n` +
+  `  }\n` +
+  `  return g(7)[0].r\n` +
+  `}\n` +
   `\n` +
-  `print(mapIndexed([1, 2], mk)[0].r)\n`;
+  `print(f())\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
