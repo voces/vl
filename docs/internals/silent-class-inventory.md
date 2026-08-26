@@ -41,13 +41,29 @@ repro rather than a paraphrase:**
 | D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
 | D6 D7 D9 D12 D13 D14 D15 D16 | various | as filed, still live |
 
-**THE LARGEST REMAINING FAMILY IS NOT IN THIS DOCUMENT.** 17 of the 23 surviving silent
-cells are one shape that was never filed: **a nullable CLOSURE narrowed with
-`is <functype>` and then CALLED**. All `nul=1`, all `read=call`, all `con=is_t`; seven
-positions (`param` 3 · `const_local` 3 · `ret_ann` 3 · `global` 3 · `elem` 3 · `let_local`
-1 · `ret_unann` 1), 12 inline spellings and 5 alias. The `!= null` narrow of the identical
-program lowers correctly, so the discriminator is the `is`-narrow over a function type. The
-remaining 6 are D6 (4 cells, numeric-litunion map value at `mapget`) and D7's family (2).
+**THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
+TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
+wrongly: it is NOT a nullable closure. `(i32) => i32 | null` binds the `|` INTO THE RETURN,
+so every one of those cells carried a function RETURNING `i32 | null` — the parenthesised
+nullable closure `((i32) => i32) | null` narrows and calls correctly at all seven positions
+and always did (see §4d, whose 54-cell "probe error" is the loud half of the same spelling).
+
+The real defect was rep invariance at a function SLOT. `v is (i32) => i32` over a
+`v: (i32) => (i32 | null)` was gated on `assignable(tested, receiver)`, which accepts by
+return covariance; the THEN branch then bound `v` at the unboxed-result type while the value
+repped boxed, and the call emitted a `call_indirect` whose `(ref $box)` result met `print`'s
+`i32` parameter. A closure carries no runtime type tag, so the narrow could never have been
+true in the first place. `fnSlotAssignable` now enforces the invariance its own header had
+stated since the numeric pair (`() => i32` must not reach a `() => i64` slot), and the same
+rung closed three ASSIGNMENT-side twins that were `vl check`-clean `indirect call type
+mismatch` traps: a named `(i32) => i32` into a `(i32) => (i32 | null)` parameter, the
+`string` / `string | null` pair, and `(i32) => K0` into `(i32) => string`.
+
+Measured before/after on the same 322 closure cells, same harness: silent 17 → 0, `correct`
+unchanged at 43. The surviving 6 are D6 (4 cells, numeric-litunion map value at `mapget`)
+and D7's family (2). Pins: `tests/cases/closures/error-is-functype-slot-rep-reject.vl`,
+`error-fn-slot-rep-differs-reject.vl`, and — for the shape the cells were aimed at —
+`nullable-closure-is-narrow-positions.vl`.
 
 **Do not re-derive this by hand.** `python3 scripts/check-filed-witnesses.py <doc>` runs
 every filed repro and prints which have moved; it exits non-zero when any row no longer
@@ -924,6 +940,26 @@ a silent alias/inline divergence — is closed; do not brief it.**
   `type F = ((i32) => i32) | null` is **correct** (`print(src() == null)` → `true`;
   `if f != null { print(f(3)) }` → `4`). Had I filed the 54 cells I would have filed the
   parser's correct behaviour as a defect.
+  **CORRECTION — the same probe error also hid 17 REAL silent cells, and they are now
+  CLOSED.** The 54 cells above are the ones the unparenthesised spelling made LOUD. The
+  residue — `read=call`, `con=is_t`, all seven positions, both the inline and the alias
+  spelling — reached `vl check` rc 0 and a module that does not validate
+  (`type mismatch: expected i32, found (ref $type)`), so it was never among the 136 and
+  never in a defect count either. The mechanism is not the parse: `v is (i32) => i32` over
+  a `v: (i32) => (i32 | null)` was gated on `assignable(tested, receiver)`, which accepts by
+  RETURN COVARIANCE, so the THEN branch bound `v` at the unboxed-result type while the value
+  repped boxed. A closure carries no runtime type tag, so the narrow could never have been
+  true. `fnSlotAssignable` now enforces the rep invariance its own header already stated,
+  all 17 cells grade `loud_check_reject`, and the `correct` column over the 322 closure
+  cells is unchanged at 43. Pinned by
+  `tests/cases/closures/error-is-functype-slot-rep-reject.vl` and — for the shape those
+  cells were AIMED at, which works at every one of the seven positions —
+  `tests/cases/closures/nullable-closure-is-narrow-positions.vl`.
+
+  The lesson survives with its sign flipped: a probe-error SPELLING is not automatically a
+  probe-error CELL. The 54 loud cells were the parser being right; the 17 silent ones were
+  a real defect standing behind it, and excluding the family wholesale on the spelling is
+  what kept them unfiled.
 * **A nested `is Cat` inside `is Cat`.** My plain-leg `is_t` construct wrapped a read that
   was itself an `is` chain, making the inner else arm unreachable and correctly typed `Cat`;
   82 cells reported `no field 'd' on {c: i32}`. That is the checker being right.
