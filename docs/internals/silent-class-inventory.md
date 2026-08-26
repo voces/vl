@@ -58,7 +58,7 @@ repro rather than a paraphrase:**
 | D30 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the call site was asking a DIFFERENT question than the callee and now asks the callee's own — `fnRetMapShapeAt` → `inferredRetMapSlot`. The recursion the row filed as a blocker is GUARDED, not avoided: its unguarded symptom is a compiler HANG, not a trap, and the answer on re-entry is the checker's recorded type rather than the mono map, which is what keeps the self-referential case fixed too. 1,215 grid cells, 383 moved, none backward) |
 | D32 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; `rlElemStructRow`'s canon-key rung declines for a name the variant table claims — the exact complement of the gate `exprVariantIndex`'s `Index` arm had carried all along. 140 of 480 grid cells moved, none backward) |
 | D33 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the SAME complement one rung up and read through the ARENA rather than the NAME table. `shapeNominalOfTy` had four rungs and only ONE was nominal by construction; `variantRowOfTy` — arm-DECLARATION identity — was written, correct, and unasked, so two STRUCTURAL field-set scans decided a nominal question and a layout twin is claimed by both. 34 of 360 grid cells moved, 28 from silent and **6 from LOUD** — `std:array`'s last live carve-out, retired by the same predicate — and 0 backward) |
-| D34 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D33's grid: a map VALUE typed at a union ARM is invalid wasm at the STORE **once anything READS the map**. Without the read it is the LOUD documented refusal, so an unrelated expression switches an emit floor OFF. 30 cells, flat across the twin axis; no generic, no import, no twin |
+| D34 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D33's grid: a map VALUE typed at a union ARM is invalid wasm at the STORE **once anything READS the map**. Without the read it is the LOUD documented refusal, so an unrelated expression switches an emit floor OFF. 24 cells, flat at 4 per twin; no generic, no import, no twin |
 | D35 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D33's grid, and it is `std:array`'s ONE live carve-out: a `needle: T` at a LIST type whose element is a struct. The same `==` written DIRECTLY is a LOUD checker error, so the refusal is LOST in the instantiation rather than missing. All four `needle` exports; no union, no twin |
 | D36 | check-clean invalid wasm | **NEW 2026-08-26** — filed as a constructed positive control for D33's census probe, and it is the new `INVALID_MODULE_SRC`: an ANONYMOUS literal in a lambda's inferred LIST return, where a struct row AND an arm both claim its layout. The same family with the direction REVERSED — both arena rungs correctly decline, so D33's fix cannot reach it by construction |
 | D37 | check-clean invalid wasm | **NEW 2026-08-26** — filed while building D33's graduated fixture: a generic in the INIT-FIRST parameter order with an EMPTY list-of-arm seed. D33's grid held the seed axis constant at "seeded" while D33's own witness used an empty one — the diagonal passing for a cross product. No twin; no `std:array` spelling (its `reduce` is callback-first) |
@@ -3117,10 +3117,24 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
   7 per twin across all six twin spellings, including `absent`. They are D34/D35 below, and
   they were live on master at the same 42 coordinates.
 
-  The moved cells' axes are the mechanism restated: twin presence — `exact` and `after` carry
-  every moved cell, `namediff`/`typediff`/`armtwin`/`none` are 0; parameter ORDER — the
-  hand-written `reduce` at `A = Circle[]` was silent at callback-first and RAN at init-first on
-  master, the litunion carve-out's column at a new rep, and both run now.
+  **THE MOVED CELLS' OWN AXES ARE THE BINDING-COLUMN PROPERTY MEASURED BY THE DELTA**, which is
+  stronger than the six-position table above because it is the whole grid rather than eight
+  hand-picked cells:
+
+  * twin presence — `exact` **17** and `after` **17**, and `namediff` / `typediff` / `armtwin` /
+    `none` are **0 each**. Both movers are the same exact-layout twin, one declared later. A
+    LAYOUT bridge, not a name coincidence, and declaration order is not an axis.
+  * binding column — every one of the 34 is a CALLBACK-BOUND column (`mapIndexed` RESULT 6,
+    `reduce` ACCUMULATOR 6, hand-written map RESULT 6, hand-written `reduce` callback-first 6,
+    one type parameter in two columns callback-first 6, callback PARAMETER 4). **Zero receiver
+    cells and zero init-first cells moved, because they already ran.** The property is not
+    asserted from controls here; it is what the delta's own distribution says.
+  * substituted type — `bare` 10, `list` 12, `listlist` 12, and `field` / `mapval` 0. A `Wrap`
+    holding a `Circle[]` runs either way (the wrapper's own row answers the arena rung), and
+    `mapval` is D34/D35 territory on both sides.
+  * parameter ORDER — the hand-written `reduce` at `A = Circle[]` was silent at callback-first
+    and RAN at init-first on master, which is the litunion carve-out's column at a new rep.
+    Both run now, and both are pinned running.
 
 * **CORPUS BYTE-IDENTITY vs `235b365b`: 1,837 of 2,262 compile under both seeds, 2
   byte-different, 0 lost, 1 gained.** All three are this change's own pins (the two graduated
@@ -3157,7 +3171,7 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
 ---
 
 ### D34 — a map VALUE typed at a union ARM is invalid wasm at the STORE, once anything READS the map
-**check-clean invalid wasm · found 2026-08-26 by D33's own 360-cell grid (30 of its 42 flat-across-twin residue cells) · pre-existing, byte-identical on `235b365b` and on D33's branch · NO generic, NO import, NO layout twin**
+**check-clean invalid wasm · found 2026-08-26 by D33's own 360-cell grid (24 of its 42 flat-across-twin residue cells) · pre-existing, byte-identical on `235b365b` and on D33's branch · NO generic, NO import, NO layout twin**
 
 Repro:
 
@@ -3199,13 +3213,15 @@ Repro:
   RUNS. That control is why this is filed as a union-arm row and not as a map-rep row.
 * Controls, each ONE line different, all measured: `Sq`/`Shape` deleted so `Circle` is a plain
   struct → runs; no `rdX` → loud emit refusal; the annotation dropped → runs.
-* 30 grid cells, flat at 5 per twin spelling across all six INCLUDING `absent`, which is what
-  separates it from D32/D33.
+* 24 grid cells, flat at **4 per twin** across all six spellings INCLUDING `absent`, which is
+  what separates it from D32/D33. All 24 are the `mapval` substituted type, across four
+  different generic spellings, and every one fails in the STORE helper (`mkX` / `mkX$m0`)
+  rather than in the generic — which is the same thing the import-free witness above says.
 
 ---
 
 ### D35 — a `needle: T` at a LIST type LOSES the checker's own `==` refusal
-**check-clean invalid wasm · found 2026-08-26 by D33's grid (12 of its 42 residue cells) · pre-existing, byte-identical on `235b365b` and on D33's branch · NO union, NO layout twin, NO hand-written generic — this is `std:array`'s ONE live carve-out**
+**check-clean invalid wasm · found 2026-08-26 by D33's grid (18 of its 42 residue cells) · pre-existing, byte-identical on `235b365b` and on D33's branch · NO union, NO layout twin, NO hand-written generic — this is `std:array`'s ONE live carve-out**
 
 Repro:
 
@@ -3249,7 +3265,9 @@ Repro:
 * **AN `i32[][]` RECEIVER WITH AN `i32[]` NEEDLE RUNS** (prints 7), so the nested list is
   admitted and the STRUCT innermost element is the axis. `T` = a bare struct or a struct
   wrapper is the LOUD receiver refusal at all six twins; `T` = a list, a list-of-list, or a map
-  is this row at all six twins. Flat across the twin axis — no twin required.
+  is this row at all six twins. **18 cells, flat at 3 per twin — no twin required**, and each
+  one fails in `indexOf$m1` rather than anywhere else, which is what separates these six
+  `mapval` cells from D34's twenty-four (those fail in the STORE helper).
 
 ---
 
