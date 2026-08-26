@@ -252,9 +252,13 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // that review has produced the closing change's next piece of work — D26 from the ninth
 // retirement's review, D32's understatement from D26's, and a whole row from D32's — and only
 // the first and third of those are rows, which is the honest form of the pattern:
-// `silent-class-inventory.md` **D33** — `std:array`'s
-// `mapIndexed` whose callback returns a union MEMBER (`(T, i32) => Circle`), in a program that
-// also declares a standalone struct of that arm's exact layout.
+// `silent-class-inventory.md` **D33** — a type parameter first
+// bound through a CALLBACK'S ANNOTATION resolving a union ARM onto a declared standalone
+// struct of that arm's exact layout. The constant below is its `mapIndexed` spelling
+// (`(T, i32) => Circle`); `reduce`'s accumulator at `A = Circle[]` is the same row and is
+// pinned beside it. The row was first written up as "the callback-RESULT position" and the
+// review's SECOND pass corrected it to the property, with the control that decides it: the
+// same `Circle[]` reaching a type parameter through the RECEIVER runs, twin and all.
 //
 // IT IS THE SAME FAMILY AS D32 AND A DIFFERENT RUNG, which is why D32's gate does not reach
 // it: the element NAME of the instance's minted `U[]` is not `Circle` at all — a probe at

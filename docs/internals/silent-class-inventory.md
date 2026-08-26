@@ -2839,8 +2839,10 @@ branch has ZERO silent cells on the grid. The axes reproduce the filed controls 
   **that zero is the grid measuring the wrong coordinate, not a limit of the fix.** The cell
   generated a map whose value type is a bare `Circle`, which has no map-value rep at all and
   never reaches a ref-list slot. A `Circle[]` map VALUE does, and it is a D32 cell the grid
-  therefore never held: `{[string]: Circle[]}` narrowed with `!= null` is invalid wasm at
-  offset 568 on master and prints `8 / 1 / 3` on this branch. Found by the `std-api-reviewer`
+  therefore never held: `{[string]: Circle[]}` narrowed with `!= null` is invalid wasm on
+  master and prints `8 / 1 / 3` on this branch. (The offset is deliberately not quoted: it
+  reads 568 under `a80c6717`'s seed and 518 under `da133669`'s, so a bare offset in prose goes
+  stale without anything noticing — the message and the function are the stable identifiers.) Found by the `std-api-reviewer`
   pass, not by the grid — the inventory's own coverage-gaps section states the rule this
   broke ("**read the generator before quoting a zero**: a coordinate that is not generated and
   a defect that is not present produce the same number"), and this is that rule catching an
@@ -2867,8 +2869,9 @@ consumptions, no import and no generic), and `circleList` in
 a `Circle[]` in a function that calls no generic, beside that file's union accumulators.
 **The second pin was written for this close, not inherited**: the first draft of the
 `std/array.vl` retirement cited that fixture as already covering the cell and the fixture
-contained no `Circle[]` at all. It fails on master (`a80c6717`) at offset 1597 with the
-row's own message, which is what makes it a regression pin rather than a demonstration.
+contained no `Circle[]` at all. It fails on master with the row's own message (offset 1597
+under `a80c6717`'s seed — quoted with the seed named, because offsets move between them),
+which is what makes it a regression pin rather than a demonstration.
 
 An incidental finding from writing it, pre-existing and NOT fixed here: the hint tier
 renders that binding's inferred type with the monomorphization suffix intact —
@@ -2918,7 +2921,7 @@ question. Both are "asked the wrong table", at different rungs. Both patterns we
 
 ---
 
-### D33 — a MONOMORPHIZED instance's minted result list takes its element heap from a DECLARED layout twin
+### D33 — a type parameter bound through a CALLBACK ANNOTATION resolves a union arm onto a DECLARED layout twin
 **check-clean invalid wasm · found by the `std-api-reviewer` pass over D32's OWN retirement, looking for the cross cell that retirement had no fixture for · filed 2026-08-26 · pre-existing, byte-identical on master (`a80c6717`) and on D32's branch · the SAME FAMILY as D32 and a DIFFERENT RUNG, unmoved by its fix**
 
 Repro:
@@ -2934,19 +2937,66 @@ Repro:
 
     print(mapIndexed([1, 2], mk)[0].r)
     // vl check rc 0 with NO diagnostics at all — not even a hint; vl run:
-    //   Invalid input WebAssembly code at offset 485:
     //   type mismatch: expected (ref $type), found (ref $type)
+    //   (in mapIndexed$m1. No byte offset quoted: it moves with the seed — the
+    //    Circle[]-map-value cell in D32 above was 568 under `a80c6717` and 518 under
+    //    `da133669`, which is why a bare offset in prose goes stale silently.)
 
-Controls, each RUN, each ONE line different from the above:
+SECOND SPELLING, the `reduce` ACCUMULATOR — same file shape, `A = Circle[]` instead of a
+callback result, and this is the one that turns the row from a position into a property:
+
+    import { reduce } from "std:array"
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function addTo(acc: Circle[], x: i32): Circle[] {
+      const c: Circle = { r: x }
+      acc.push(c)
+      return acc
+    }
+    function f(): i32 {
+      const seed: Circle[] = []
+      const out = reduce([1, 2], addTo, seed)
+      return out[0].r
+    }
+    print(f())
+    // vl check rc 0; vl run: type mismatch: expected (ref $type), found (ref $type)
+
+Controls, each RUN, each ONE line different from the above (verified on BOTH spellings):
 
 * `Dot` DELETED — `Dot` is never mentioned below the type declarations, and it is the whole
   trigger;
 * `type Dot = { q: i32 }` (same arity, different field NAME — not a layout twin);
+* `Sq` and `Shape` DELETED, so `Circle` is not a union arm at all;
 * a plain non-arm struct as the callback result, so no variant namespace is involved.
 
+* **THE DECIDING PROPERTY IS THE BINDING COLUMN, NOT THE POSITION NAME**, and the row was
+  filed one position too narrow. A type parameter first bound through a CALLBACK'S ANNOTATION
+  carries the defect; one bound through the RECEIVER does not. Measured over six positions,
+  and the LAST one is what makes it a property rather than a count of two:
+
+  | position | outcome |
+  |---|---|
+  | `mapIndexed`'s `U` — callback RESULT | check-clean invalid wasm |
+  | `reduce`'s `A` at `Circle[]` — accumulator | check-clean invalid wasm |
+  | `reduce`'s `A` at a STRUCT holding a `Circle[]` | runs |
+  | `reverse` over a `Circle[]` RECEIVER | loud (``monomorphize: expected an array argument for `self```) |
+  | `indexOf`'s `needle` | loud (the same receiver refusal arrives first) |
+  | **`reduce` over a `Circle[][]` RECEIVER (`T = Circle[]`, `A = i32`)** | **runs, with `Dot` declared** |
+
+  The last row is the same `Circle[]` type reaching a type parameter through the receiver
+  instead of through a callback annotation, in a program that has the twin — so the trigger is
+  the binding column, not the type and not the presence of the twin alone. That split is the
+  seam `std/array.vl`'s header already reasons about: a substituted RETURN annotation goes
+  through the argument's arena rows (`pinTys`) while the body's annotated locals go through
+  the pin re-resolved from the pin's NAME (`pinnedTyIx`), and the header's own note says those
+  two "differ in coverage, not in meaning" — this is a second place where they differ in
+  MEANING. **Found by the std review's second pass**, after the first pass's finding had
+  already been written up as "the callback-result position".
 * **IT IS NOT `mapIndexed`'S AND NOT std'S.** A hand-written `myMap<T, U>` importing nothing
-  reproduces it. `mapIndexed` is where a caller of `std:array` meets it, which is why that
-  module's header names it.
+  reproduces it, and so does a hand-written `myReduce<T, A>` for the accumulator spelling.
+  `std:array` is where a caller meets both, which is why that module's header names them.
 * **IT IS A DIFFERENT RUNG FROM D32, AND THE PROBE IS WHAT SAYS SO** rather than the
   resemblance. D32 was `rlElemStructRow` bridging a variant arm's SHAPE onto a standalone
   row, and its fix is a NOMINAL gate — decline for an element name the variant table claims.
@@ -2964,8 +3014,12 @@ Controls, each RUN, each ONE line different from the above:
 * **THE DISASSEMBLY IS THE SAME TWO-TABLES SHAPE.** The backing array is
   `(array (mut (ref null $Dot)))` — `Dot`'s standalone row — while `mapIndexed$m1`'s functype
   result is `(ref $uVarHeap[Circle])`.
-* **IT IS THE SPECIMEN.** `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC` names it,
-  pinned as `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl`. It has
+* **IT IS THE SPECIMEN, AND IT IS PINNED TWICE.**
+  `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl` is the callback-RESULT
+  spelling and is kept byte-for-byte identical to `tests/vl_check_codegen_test.ts`'s
+  `INVALID_MODULE_SRC`; `…/xfail-miscompile-mono-callback-accum-list-twin.vl` is the
+  `reduce`-ACCUMULATOR spelling and carries the six-position table above. Both are
+  `@no-instantiate`. It has
   every property those three assertions need, re-run at the swap rather than inherited:
   `vl check` rc 0 with no diagnostics, `--codegen` rc 1 with `not valid wasm` + `type
   mismatch`, and no `emit error` marker.
