@@ -896,10 +896,32 @@ relying on a coincidence one rep table away from changing.** The direct spelling
 been `K[] isn't equatable`; the pin now says the same. `std/array.vl`'s ledger records this as
 its first entry cleared by making a spelling LOUDER.
 
+### The message goes in FRONT of the refusal, not behind it
+
+The pin reports the direct spelling's sentence verbatim, so the two are greppable as one rule
+— but the attribution is a PREFIX (`` `indexOf` compares its type parameter with `==` here: ``)
+rather than the suffix the generic operator message uses. The reader is standing at
+`xs.indexOf(n)`: they wrote no `==` and no `Circle[]`. The generic sentence can take
+` (the call's argument types)` behind it because it ENDS on the two types; the equatability one
+ends on a remedy clause (`— define a `==` operator for it`), and a suffix after that reads as
+an instruction to define the operator *for the call's argument types*.
+
 ### What this does NOT reach, measured rather than assumed
 
-A NULLABLE `T` whose compare the checker ACCEPTS and correctly lowers — `string | null`,
-`i32[] | null` — is D35's MIRROR and is untouched: `eqCmpKindOfTy` answers `"nulstr"` /
-`"nullist"`, a compare core exists, the direct spelling runs and is right. There is no refusal
-to lose, so `eqRefusals` is correct to stay silent; the defect is that the PIN drops an
-acceptance. Filed as D39 with its own 84 cells.
+* A NULLABLE `T` whose compare the checker ACCEPTS and correctly lowers — `string | null`,
+  `i32[] | null` — is D35's MIRROR and is untouched: `eqCmpKindOfTy` answers `"nulstr"` /
+  `"nullist"`, a compare core exists, the direct spelling runs and is right. There is no
+  refusal to lose, so `eqRefusals` is correct to stay silent; the defect is that the PIN drops
+  an acceptance. **D39**, 96 cells.
+* **Whether the refusal being propagated is itself right.** For `T = ("a"|"b")[]` its first
+  sentence says "a field is not value-comparable", and the field is `K` — `K == K` runs and is
+  correct, as does `string[] == string[]`. So D35's close makes the pin state a refusal that is
+  over-broad about its own reason, and the 18 cells it costs are not purely a caller's luck.
+  **The fix is still the right call** — two spellings of one call answering with two severities
+  is not a capability, and the silent answer was the permissive one — but the other half is
+  filed as **D42** rather than absorbed into a sentence about coincidence.
+* **The remedy clause it prints.** `— define a `==` operator for it` cannot be followed: a
+  `function "=="` declaration parses, type-checks, and is silently discarded. **D43.** Left
+  alone here on purpose: the clause lives in `eqRefusals`, the ONE home, so changing it changes
+  both spellings, and choosing between "implement the dispatch" and "delete the clause" is a
+  language-design call rather than a rider on this one.

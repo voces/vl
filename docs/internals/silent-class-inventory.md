@@ -3382,16 +3382,13 @@ The rule that shipped withholds only the RE-RECORD from an unnamed callee, which
 narrower thing the HOF case needed; the callee axis is now in the grid and in
 `error-deferred-constraint-true-positives.vl`.
 
-**THE 113 REMAINING SILENT CELLS, ALL THREE FAMILIES ACCOUNTED FOR, and none of them is this
-row.**
+**THE 113 CELLS THE BRANCH STILL GRADES SILENT, ALL ACCOUNTED FOR, and none of them is this
+row.** The residue proper is **104 = 96 + 8**; the other 9 are counted here only because the
+harness put them in this column, and they do not belong to it — see the last bullet.
 
 * **96** are a NULLABLE `T` — `string | null`, `i32[] | null` — where the DIRECT spelling is
   ACCEPTED and correct, so there is no refusal to lose and `eqRefusals` is right to stay
   silent. D35's MIRROR, filed as **D39**.
-* **9** are `type E = Circle[]` cells failing inside the MAKER rather than the compare: a
-  list-of-struct ALIAS is opaque in both directions, filed as **D40**. They measure nothing
-  about the comparison they were written for; the same three bindings spelled out DO reach it
-  and are loud.
 * **8** are `+` rather than `==`, and **six of them are this row's exact shape one operator
   over** — `addT<T>(a: T, b: T) { return a + b }` at `T = Circle[]` is `vl check` rc 0 over an
   invalid module while `a + b` spelled out is a loud emit reject. Filed as **D41**. The other
@@ -3400,6 +3397,13 @@ row.**
   scoped to `==`/`!=` deliberately** — `binOpDefinedFor`'s `+` arm claims any two arrays are a
   list concat, and tightening that needs its own grid over the concat rules rather than a rider
   on this one.
+* **9 are NOT residue of this grid and are the arithmetic's own trap.** They are
+  `type E = Circle[]` cells that die inside the MAKER before the comparison is reached —
+  **D40, whose own filed outcome is `loud check reject`**, so a bucket labelled "check-clean
+  invalid wasm" cannot contain them and a draft of this paragraph that made `96 + 9 + 8 = 113`
+  close was adding two different outcome classes. They measure nothing about the comparison
+  they were written for; the same three bindings spelled out DO reach it and are loud. The
+  right reading is that the grid has 9 cells it cannot grade, not 9 silent ones.
 
 Fixtures: `tests/cases/std/error-array-needle-not-equatable.vl` (all four exports, the
 struct-free `CM` row, the cell that used to run, a hand-written generic off the std surface,
@@ -3569,7 +3573,7 @@ Repro:
 ---
 
 ### D39 — a `needle: T` the checker WILL `==` loses that ACCEPTANCE in the instantiation
-**check-clean invalid wasm · found 2026-08-26 by D35's 1514-cell grid (84 cells, the whole non-D35 residue) · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO struct, NO layout twin, NO hand-written generic needed (though every route reproduces)**
+**check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (96 cells, the largest of three residue families) · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO struct, NO layout twin, NO hand-written generic needed (though every route reproduces)**
 
 Repro:
 
@@ -3616,7 +3620,8 @@ Repro:
   | `Circle \| null` | runs, correct | loud emit reject |
   | `i32 \| string` | runs, correct | loud emit reject |
 
-  The first two are the silent half — 84 of the 97 cells left silent after D35's close. The
+  The first two are the silent half — 96 of the 113 cells the branch still grades silent after
+  D35's close, and the largest of three residue families rather than the whole residue. The
   other three are honest and are listed because the split is the finding: the NICHE-repped
   nullables (a `(ref null …)` whose non-null core exists) are the ones that get through the
   pin and hand a nullable ref to a non-null slot; the BOX- and SENTINEL-repped ones are
@@ -3713,6 +3718,91 @@ Repro:
 * The `"a" | "b"` row's DIRECT message names `string and string`, not the union — the literal
   union softens before the operator arm sees it. That is a diagnostic-quality note, not a
   second defect, and it is recorded so a future reader does not chase it as one.
+
+---
+
+### D42 — `isEquatable` refuses a LITERAL-UNION element although that element compares correctly
+**loud check reject · found 2026-08-26 by the `std-api-reviewer` pass over D35's retirement — the FIFTH consecutive time that review has produced the closing change's next row · pre-existing, byte-identical on `f2064bec` and on D35's branch · NOT silent, and filed anyway because D35's close is what put it in a caller's way**
+
+Repro:
+
+    type K = "a" | "b"
+
+    function cell(): boolean {
+      const a: K[] = ["a"]
+      const b: K[] = ["b"]
+      return a == b
+    }
+
+    print(cell())
+    // vl check rc 1, TWO errors:
+    //   K[] isn't equatable (a field is not value-comparable) — define a `==` operator for it
+    //   `==` over K[] has no lowering
+
+* **THE FIRST SENTENCE IS FACTUALLY WRONG ABOUT THE FIELD, and that is the row.** `isEquatable`
+  answers false for a `TyUnion`, so a list whose element is a literal union is "not
+  value-comparable". Measured, one line each: `K == K` over two `K` bindings runs and prints
+  `false` (correct), and `string[] == string[]` runs and prints `true`. The element compares,
+  the container shape compares, and the refusal names a component that is fine. `type N = 1 | 2`
+  behaves identically.
+* **THE SECOND SENTENCE MAY BE HONEST.** `eqCmpKindOfArrayElem` has three list cores and a
+  literal-union element reaches none of them; a `K[]` will not launder into a `string[]`,
+  because a container's wasm type is fixed by its element's storage. So "has no lowering" is
+  plausibly a real missing arm even though the pre-D35 grid measured `indexOf` at `T = K[]`
+  RETURNING THE CORRECT INDEX — the emitter's generic path found a compare the direct path
+  never offered.
+* **WHY IT IS FILED THOUGH IT IS LOUD.** D35's close made the pin state this refusal, so 18
+  grid cells that ran correctly now do not, and this row is the reason to ask whether the
+  refusal itself is right rather than only whether it is consistent. **D35's fix is still the
+  right call** — two spellings of one call answering with two severities is not a capability,
+  and the silent answer was the permissive one — but "the caller was relying on a coincidence"
+  is only half the story, and the other half is here. Same precedent as D40: a loud row filed
+  because it is now the reason a working spelling stopped working.
+* Fixing it is a language-design question, not a rider on D35: either `isEquatable` grows a
+  literal-union arm (and `eqCmpKindOfArrayElem` a core to match), or the refusal stays and the
+  MESSAGE stops naming a field that is comparable.
+
+---
+
+### D43 — a `function "=="` declaration parses, type-checks, and is SILENTLY IGNORED — and a diagnostic tells you to write one
+**check-clean SILENTLY WRONG VALUE · found 2026-08-26 by the `std-api-reviewer` pass over D35's retirement · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO generic, NO import, six lines**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function "=="(self: Circle, other: Circle): boolean {
+      return true
+    }
+
+    function cell(): boolean {
+      const a: Circle = { r: 1 }
+      const b: Circle = { r: 2 }
+      return a == b
+    }
+
+    print(cell())
+    // vl check rc 0, no diagnostic.
+    // The declared operator returns `true` unconditionally, so a dispatch would print `true`.
+    // PRINTS false
+
+* **THE DECLARATION HAS NO EFFECT AND NOTHING SAYS SO.** It is not a parse error, not an
+  unknown-name error, not an unused-function warning: it is accepted and the structural
+  compare runs instead. `compiler/parser.vl`'s `opDeclName` is reached only from
+  `OP_INDEX_GET` / `OP_INDEX_SET`, and `checkBinary` returns on the equality arm before the
+  operator-dispatch tail, so `==` is not in the overloadable set at either end.
+* **THE COMPILER ASKS FOR IT BY NAME.** `isEquatable`'s refusal ends "— define a `==` operator
+  for it", and doing exactly that changes nothing: the same two errors come back over a `K[]`,
+  and over a struct the declaration is quietly discarded. A diagnostic that prescribes an
+  unimplemented remedy is the loud-message counterpart of this file's silent classes, and D35's
+  close is what puts this one in front of a `std:array` caller.
+* **THE `true`-RETURNING BODY IS LOAD-BEARING IN THE WITNESS.** A first draft used
+  `return self.r == other.r`, which agrees with the structural compare on every input, so it
+  printed `false` and proved nothing. The witness has to disagree with the fallback to see
+  which one ran.
+* Two ways out, and they are not the same size: implement the dispatch (`==` joins the
+  B13/B14 operator-function set), or delete the clause from the message. The second is a
+  one-line change and is what the message should do until the first exists.
 
 ---
 
