@@ -204,50 +204,48 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/generic-narrowed-arg-pin.vl`, all 24 cells running, and it reddened
 // this file exactly as intended.
 //
-// THIS SPECIMEN NEEDS NEITHER NARROWING NOR NULLABILITY, which is what made it the right
-// next one: `std:array`'s `reduce` instantiated twice in one program, once with a UNION
-// accumulator (`Shape`) and once with an accumulator that is one of that union's own MEMBER
-// structs (`Circle`). `Circle` owns two structurally identical heap rows — the plain struct
-// row (`sHeapIdx`) and the union-ARM row (`uVarHeap`) — and the two tables never cross-dedup,
-// so the instance agrees with itself on `(ref 2)` throughout while the `const out` BINDING's
-// slot resolved `Circle` through the other table and reads it back as `(ref 0)`. Taking the
-// same call inline (`return reduce(…).r`) runs, because with no binding there is no second
-// resolution to disagree with. `silent-class-inventory.md` D26; pinned as
-// `tests/cases/soundness/xfail-miscompile-reduce-union-and-member-struct-accum.vl`.
+// THE D26 SPECIMEN THAT STOOD HERE — `std:array`'s `reduce` instantiated twice in one
+// program, once at a UNION accumulator and once at one of that union's own MEMBER structs —
+// LASTED ONE COMMIT. It is closed, and the close is worth a sentence because the reason this
+// constant kept naming it was wrong: the diagnosis in its own pin (a heap-type TWIN the two
+// tables never cross-dedup) described a true fact that was not the mechanism. The mechanism
+// was that `letInitReboxesToVariant` compared the two tables using ONE index that belongs to
+// the VARIANT namespace, and its `< sHeapIdx.length` test was a BOUNDS check standing in for
+// a namespace check. Graduated to `tests/cases/unions/unannotated-bind-variant-call-beside-plain-struct.vl`
+// and to the fifth accumulator of `tests/cases/std/array-reduce-narrowed-variant-init.vl`.
 //
-// THE NEXT SPECIMEN IS NAMED HERE RATHER THAN LEFT TO BE RE-DERIVED, because D26 is being
-// worked on and this constant has twice ended up naming a program someone was already
-// repairing. When it closes, take `silent-class-inventory.md` **D30** — the CALLER's view of
-// an inferred REF-VALUED map return from an if-arm TAIL assignment, 16 cells of a 192-cell
-// grid, filed by #1938 and deliberately NOT fixed there (routing `fnRetMapShapeSid` through
-// `inferredRetMapSlot` opens an unbounded recursion, so it needs a visited-set of its own).
-// It was RUN against this tree, not assumed: `vl check` rc 0 with two redundant-annotation
-// hints, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref null $type),
-// found (ref $type)` at offset 0x493, and NO `emit error` marker — which is every property
-// the three assertions below need. It has no `@no-instantiate` pin yet, so pin it in the
-// same commit or the tripwire at the foot of this file goes red.
-const INVALID_MODULE_SRC = `import { reduce } from "std:array"\n` +
-  `type Circle = { r: i32 }\n` +
-  `type Sq = { s: i32 }\n` +
-  `type Shape = Circle | Sq\n` +
-  `function bumpC(acc: Circle, x: i32): Circle { return { r: acc.r + x } }\n` +
-  `function bump(acc: Shape, x: i32): Shape {\n` +
-  `  if acc is Circle { return { r: acc.r + x } }\n` +
-  `  return acc\n` +
+// THIS SPECIMEN IS THE ONE THAT CONSTANT NAMED AS ITS OWN SUCCESSOR, which is the practice
+// that made the swap a two-line edit instead of a re-derivation: `silent-class-inventory.md`
+// **D30** — the CALLER's view of an inferred REF-VALUED map return from an if-arm TAIL
+// assignment, 16 cells of a 192-cell grid, filed by #1938 and deliberately NOT fixed there
+// (routing `fnRetMapShapeSid` through `inferredRetMapSlot` opens an unbounded recursion, so
+// it needs a visited-set of its own). Re-RUN against this tree at the swap rather than
+// inherited: `vl check` rc 0 with two redundant-annotation hints, `--codegen` rc 1 with `not
+// valid wasm` + `type mismatch: expected (ref null $type), found (ref $type)` at offset
+// 0x493, and NO `emit error` marker — every property the three assertions below need. Pinned
+// as `tests/cases/soundness/xfail-miscompile-map-return-if-arm-tail-caller.vl`.
+//
+// THE NEXT SPECIMEN IS NAMED HERE RATHER THAN LEFT TO BE RE-DERIVED. When D30 closes, take
+// `silent-class-inventory.md` **D32** — a `Circle[]` whose element is a union MEMBER resolves
+// the LIST's element heap through the struct table whenever a layout twin of the arm exists,
+// and ONE `reduce` at a union accumulator mints that twin. It needs no import and no generic
+// to reproduce (`type Dot = { r: i32 }` beside `type Shape = Circle | Sq` is the whole
+// witness), it was found by D26's own 240-cell grid, and it is the seam ROADMAP charters as
+// repOf item (e). It has no `@no-instantiate` pin yet, so pin it in the same commit or the
+// tripwire at the foot of this file goes red.
+const INVALID_MODULE_SRC = `type S = { a: i32 }\n` +
+  `function mkR(v: i32): {[string]: S} {\n` +
+  `  const m: {[string]: S} = Map()\n` +
+  `  m["a"] = { a: v }\n` +
+  `  return m\n` +
   `}\n` +
-  `function circleFold(): i32 {\n` +
-  `  const c: Circle = { r: 5 }\n` +
-  `  const out = reduce([1, 2], bumpC, c)\n` +
-  `  return out.r\n` +
+  `let g: {[string]: S} = mkR(3)\n` +
+  `let h: {[string]: S} = mkR(3)\n` +
+  `function f(c: boolean) {\n` +
+  `  if c { g = mkR(9) } else { h = mkR(9) }\n` +
   `}\n` +
-  `function shapeFold(): i32 {\n` +
-  `  const s: Shape = { r: 1 }\n` +
-  `  const out = reduce([1, 2], bump, s)\n` +
-  `  if out is Circle { return out.r }\n` +
-  `  return -2\n` +
-  `}\n` +
-  `print(circleFold())\n` +
-  `print(shapeFold())\n`;
+  `const r = f(true)\n` +
+  `print(r.size)\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

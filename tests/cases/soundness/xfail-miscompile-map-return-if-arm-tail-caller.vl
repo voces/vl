@@ -1,0 +1,54 @@
+// @no-instantiate
+// MISCOMPILE, pinned: the CALLER's view of an inferred REF-VALUED map return whose callee
+// body ends in an if-arm TAIL assignment. `vl check` exits 0 (two redundant-annotation hints,
+// nothing above HINT) and is the ONLY command that misses it — `vl check --codegen` exits 1,
+// `vl build` writes the `.wasm` and exits 1, `vl run` exits 1. The engine refuses the module:
+//
+//   the emitted module is not valid wasm … type mismatch:
+//   expected (ref null $type), found (ref $type)   (at offset 0x493)
+//
+// THE CALLEE IS RIGHT AND THE CALLER IS WRONG. #1938 gave the callee's result valtype its map
+// SHAPE (`inferredRetMapSlot`, via `fnAssignRetSlot`). The CALL SITE resolves the same
+// function's shape through `fnRetMapShapeSid`, whose un-annotated rung is
+// `mapRetExprShape(fnRetExprOf(...))` — and `fnRetExprOf` reads the body's last STATEMENT,
+// which for a tail `if` is not an expression at all. It answers -1, so `collectLocals` types
+// the receiving `const r` at the MONO `$mapStruct` while the call pushes the ref-valued one.
+//
+// CONTROLS, all of which RUN: a MONO value type (`{[string]: i32}` with `m["a"] = v`); the
+// straight-line tail `g = mkR(9)` instead of the tail `if` (there `fnRetExprOf` IS the
+// assignment node and `mapRetExprShape` falls through to its recorded type); and the result
+// left UNCONSUMED (`f(true)` then `print(g.size)`).
+//
+// It is `silent-class-inventory.md` D30, filed by #1938 and deliberately NOT fixed there:
+// routing `fnRetMapShapeSid` through `inferredRetMapSlot` closes it and opens the cycle
+// `fnRetMapShapeSid → inferredRetMapSlot → fnAssignRetSlot → fnAssignCellMapShape →
+// letMapShapeOf → mapShapeOfExpr → fnRetMapShapeSid`, which an un-annotated cell whose
+// initializer calls the very function being asked about would walk without bound. It needs a
+// visited-set or a depth bound, which is a separate change with its own witness.
+//
+// IT REPLACED the D26 specimen (`xfail-miscompile-reduce-union-and-member-struct-accum.vl`),
+// which was deleted when D26 closed — `tests/vl_check_codegen_test.ts` had already NAMED this
+// row as the successor rather than leaving it to be re-derived, and this file is that
+// instruction carried out. WHEN IT IS FIXED this file starts failing (the module
+// instantiates), which is the point: delete it, graduate a `@run` row, and swap
+// `INVALID_MODULE_SRC` for another live member of the class — `silent-class-inventory.md`
+// D32 is the next one, and needs no import and no generic.
+// @hint redundant type annotation: `g` is inferred as `{[string]: S}`
+// @hint redundant type annotation: `h` is inferred as `{[string]: S}`
+type S = { a: i32 }
+
+function mkR(v: i32): {[string]: S} {
+  const m: {[string]: S} = Map()
+  m["a"] = { a: v }
+  return m
+}
+
+let g: {[string]: S} = mkR(3)
+let h: {[string]: S} = mkR(3)
+
+function f(c: boolean) {
+  if c { g = mkR(9) } else { h = mkR(9) }
+}
+
+const r = f(true)
+print(r.size)

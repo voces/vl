@@ -53,9 +53,10 @@ repro rather than a paraphrase:**
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 | D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class. THREE roots at three layers, separated by an ABLATION and not by argument — a missing BOX, a misplaced one failing in the opposite direction at the same seam, and the monomorphizer's pin a whole layer earlier) |
 | D25 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the ruling is in `DECISIONS.md`. The row named ONE cell and a 187-cell grid found **53**: neither filed option won — the argument-node channel moved 6 cells loud→silent, the annotation channel left 8. Two rungs, 0 silent) |
-| D26 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the `std-api-reviewer` pass over D24's retirement: a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in ONE program. No narrowing, no nullability — the heap-type TWIN at a monomorphized instance's result |
+| D26 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; NOT the heap-type twin the filing named. `letInitReboxesToVariant` read a VARIANT index through the STRUCT table, and its `< sHeapIdx.length` test was a BOUNDS check standing in for a namespace check — it only ever declined while the struct table was EMPTY. Guard retired; 32 of 240 grid cells moved, all forward, and 1,832 corpus files emit byte-identically) |
 | D27 D28 D29 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root — `fnAssignKindGuard`, a five-entry decline list whose `null` restored the caller's `i32` default. Four of its five recorded reasons were false and the fifth named a condition that was already available. The guard is deleted; 220 cells of three grids moved, every one forward) |
 | D30 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D27/D28/D29 by the if-arm-join grid that closed them: the CALLER's view of an inferred ref-valued map return, 16 cells the same change could not reach from the callee side |
+| D32 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D26 by its 240-cell grid: a `Circle[]` whose element is a union MEMBER resolves the list's ELEMENT heap through the struct table whenever a layout twin exists, and ONE `reduce` at a union accumulator mints that twin. 16 cells; needs no import and no generic to reproduce |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
@@ -2261,7 +2262,7 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   2026-08-22, a MONTH after the guard landed (#1010, 2026-07-22). That gate is what makes
   the plain-struct twin the guard was written for (`mk3(): {a:i32,f:i32}`, #1005) answer -1
   at `exprVariantIndex` and stop reaching the guard at all.
-* **MEASURED DEAD.** A probe firing only when the guard returns TRUE, over **all 2,254
+* **MEASURED DEAD.** A probe firing only when the guard returns TRUE, over **all 2,254 (at the time)
   `tests/cases/*.vl`** and over the compiler's own module graph: **0 programs**. A second
   probe firing on every entry past `vi >= 0`: 12 corpus files, every one returning false —
   8 on `ssi < 0` and 4 on the empty-table bound (`types/variant-as-value.vl`,
@@ -2269,13 +2270,14 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   `unions/declared-union-struct-arm-call-positions.vl`,
   `unions/inline-union-struct-arm-call-positions.vl`) — and `sHeapIdx[ssi]` out of range in
   all 12. The guard's only live effect was this defect. **AND FROM THE EMISSION SIDE**: of the
-  2,254 `tests/cases/**/*.vl`, 1,829 compile under both master's seed and this one, and all
-  1,829 are BYTE-IDENTICAL — 0 differ, 0 lost the ability to compile, and exactly 2 gained it
-  (the two fixtures this close adds). Not one byte moves anywhere the guard was consulted.
+  2,256 `tests/cases/**/*.vl`, 1,832 compile under both master `7fe81e5b`'s seed and this
+  one, and all 1,832 are BYTE-IDENTICAL — 0 differ, 0 lost the ability to compile, and exactly
+  2 gained it (the two fixtures this close adds). Not one byte moves anywhere the guard was
+  consulted.
 * **GRID, 240 cells** (accumulator pairing x consumption x std-`reduce`/hand-written generic
   x declaration order x 2-or-3 instances), master vs branch:
 
-  | | master `c99838a8` | branch |
+  | | master `7fe81e5b` | branch |
   |---|---|---|
   | runs | 192 | **224** |
   | check-clean invalid wasm | 40 | **16** |
@@ -2289,7 +2291,7 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   with the filed controls: only the `um` / `umt` pairings ever failed (union + MEMBER
   struct), `std` and `own` are identical at 20/4/96 each — so it was never a std problem —
   and `fwd`/`rev` declaration order and 2-vs-3 instances are flat.
-* **WHAT REMAINS: the 16 `list` cells, and they are a DIFFERENT RUNG** — D30 below. Storing
+* **WHAT REMAINS: the 16 `list` cells, and they are a DIFFERENT RUNG** — D32 below. Storing
   the variant into a `Circle[]` resolves the ref-list ELEMENT heap through `rlElemStructRow`,
   whose canon-key rung (`repRowOfTyStruct`) bridges the variant's SHAPE onto a standalone
   struct row. Identical on master and on this branch (same 16 cells, same message),
@@ -2298,63 +2300,6 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   loud spelling, no generic, four consumptions) and as the fifth accumulator of
   `tests/cases/std/array-reduce-narrowed-variant-init.vl`, which its own header had reserved
   for this close.
-
----
-
-### D30 — a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table when a layout twin exists
-**check-clean invalid wasm · found by D26's 240-cell grid (16 cells, the `list` consumption) · filed 2026-08-26 while closing D26 · pre-existing, identical on master `c99838a8` and on D26's branch (same offset 0x15c, same message) · a DIFFERENT rung from D26 and unmoved by its fix**
-
-Repro:
-
-    type Dot = { r: i32 }
-    type Circle = { r: i32 }
-    type Sq = { s: i32 }
-    type Shape = Circle | Sq
-    function mkD(): Dot { return { r: 3 } }
-    function useShape(): i32 {
-      const s: Shape = { r: 1 }
-      if s is Circle { return s.r }
-      return -2
-    }
-    function circleList(): i32 {
-      const c: Circle = { r: 8 }
-      const xs: Circle[] = [c]
-      return xs[0].r
-    }
-    print(circleList())
-    print(useShape())
-    print(mkD().r)
-    // vl check rc 0, no diagnostic at any severity; vl run:
-    //   Invalid input WebAssembly code at offset 348:
-    //   type mismatch: expected (ref null $type), found (ref $type)
-
-Controls, each RUN:
-
-* the same file with `Dot` DELETED — with no layout twin in `sNames` the element resolves
-  through `uVarHeap`;
-* the same file with `type Dot = { d: i32 }` (a struct that is NOT a layout twin);
-* the same `Circle` value not put in a list (`return c.r` in place of the two list lines).
-
-* **THE PRODUCER AND THE CONSUMER DISAGREE, ARM FOR ARM.** The READ side
-  (`exprVariantIndex`'s `Index` arm) resolves a `Cat[]` element through `uVarHeap` and gates
-  on `structIndexByName(elemName) < 0` — an EXACT-NAME lookup, which `Circle` passes because
-  a variant has no `sNames` row. The ELEMENT-HEAP side (`mAssignTypeIndices`' ref-pair loop
-  in `emit_collect.vl`) tries `rlElemStructRow` FIRST and only falls through to
-  `rlElemVariantHeap`; `rlElemStructRow`'s third rung is `repRowOfTyStruct`, the structural
-  canon-key bridge, which returns `Dot`'s row. So the backing array is typed
-  `(array (mut (ref null $Dot)))` while the value stored is `(ref $uVarHeap[Circle])`.
-* **THE TWIN SIG PASS CARRIES THE SAME LADDER** (`rlSig`'s `else` arm) by design — its
-  header says it "mirrors the `rlElemHeap` resolution below" — so a fix must move BOTH in
-  lock-step or the dedup decision and the heap disagree.
-* **DELIBERATELY NOT FIXED WITH D26.** Besides the two ref-pair-loop sites above,
-  `rlElemStructRow` has SIX other call sites — `wasmEmit`'s element STORE (13564), PUSH
-  (14215) and array-LITERAL (19787), `emit_classify`'s `rlSlotsLayoutTwin` (the ref-list
-  slot dedup itself) and `structListPopGetElem` (`xs.pop()` / `xs.get(i)`) — and each would
-  need the same gate, and `rlElemLitStructRow`'s header already records a MEASURED reason its own name
-  rung is deliberately narrower ("changes the answer on 7 corpus calls and 311 fuzz
-  programs — every one of them a both-decline today, i.e. exactly the -1 the variant route
-  depends on"). This is the seam ROADMAP charters as repOf item (e), the variant/struct-table
-  seam, whose LOUD half is already recorded there.
 
 ---
 
@@ -2693,6 +2638,107 @@ Two more that run, isolating the axis: the call taken through a binding
   below; the seeded four had none because the seed was supposed to BE the answer.
 * Graduated: `tests/cases/soundness/nullable-return-arg-seed.vl`. It reproduces on the parent
   commit and runs on this one.
+
+---
+
+### D32 — a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table when a layout twin exists
+**check-clean invalid wasm · found by D26's 240-cell grid (16 cells, the `list` consumption) · filed 2026-08-26 while closing D26 · pre-existing, identical on master (`c99838a8` and `7fe81e5b`) and on D26's branch — same 16 cells, same message · a DIFFERENT rung from D26 and unmoved by its fix**
+
+Repro:
+
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function mkD(): Dot { return { r: 3 } }
+    function useShape(): i32 {
+      const s: Shape = { r: 1 }
+      if s is Circle { return s.r }
+      return -2
+    }
+    function circleList(): i32 {
+      const c: Circle = { r: 8 }
+      const xs: Circle[] = [c]
+      return xs[0].r
+    }
+    print(circleList())
+    print(useShape())
+    print(mkD().r)
+    // vl check rc 0 (four redundant-annotation HINTS, no error or warning); vl run:
+    //   Invalid input WebAssembly code at offset 348:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+Controls, each RUN:
+
+* the same file with `Dot` DELETED — with no layout twin in `sNames` the element resolves
+  through `uVarHeap`;
+* the same file with `type Dot = { d: i32 }` (a struct that is NOT a layout twin);
+* the same `Circle` value not put in a list (`return c.r` in place of the two list lines).
+
+**AND THE TWIN DOES NOT HAVE TO BE THE CALLER'S OWN TYPE — ONE `std:array` CALL MINTS IT.**
+This is the spelling a user meets, and it is why `std/array.vl`'s header names this row. There
+is no `Dot`, no member-struct accumulator, and `circleList` calls no generic:
+
+    import { reduce } from "std:array"
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function bump(acc: Shape, x: i32): Shape {
+      if acc is Circle { return { r: acc.r + x } }
+      return acc
+    }
+    function shapeFold(): i32 {
+      const s: Shape = { r: 1 }
+      const out = reduce([1, 2], bump, s)
+      if out is Circle { return out.r }
+      return -2
+    }
+    function circleList(): i32 {
+      const c: Circle = { r: 8 }
+      const xs: Circle[] = [c]
+      return xs[0].r
+    }
+    print(circleList())
+    print(shapeFold())
+    // vl check rc 0; vl run: Invalid input WebAssembly code at offset 687,
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+Control — **the same program with the one `reduce` call spelled as two direct `bump` calls**
+(`const out = bump(bump(s, 1), 2)`), the only change: prints `8` / `4`. The monomorphized
+`f: (A, T) => A` is the mint.
+
+**EVERY `Circle[]` IN THE PROGRAM IS AFFECTED, not just a literal.** Measured on this branch
+and on master, same program shape, only the list spelling varying:
+
+| spelling | outcome |
+|---|---|
+| `const xs: Circle[] = [c]` | check-clean invalid wasm |
+| `const xs: Circle[] = []` then `xs.push(c)` | check-clean invalid wasm |
+| a `Circle[]` PARAMETER, called with the list | check-clean invalid wasm (`take$m0`) |
+| a `Circle[]` STRUCT FIELD (`type Bag = { items: Circle[] }`) | check-clean invalid wasm |
+| `const xs: Circle[] = []` never written | runs |
+| **`const xs: Shape[] = [c]`, `is`-narrowed on read** | **runs — the remedy** |
+
+* **THE PRODUCER AND THE CONSUMER DISAGREE, ARM FOR ARM.** The READ side
+  (`exprVariantIndex`'s `Index` arm) resolves a `Cat[]` element through `uVarHeap` and gates
+  on `structIndexByName(elemName) < 0` — an EXACT-NAME lookup, which `Circle` passes because
+  a variant has no `sNames` row. The ELEMENT-HEAP side (`mAssignTypeIndices`' ref-pair loop
+  in `emit_collect.vl`) tries `rlElemStructRow` FIRST and only falls through to
+  `rlElemVariantHeap`; `rlElemStructRow`'s third rung is `repRowOfTyStruct`, the structural
+  canon-key bridge, which returns `Dot`'s row. So the backing array is typed
+  `(array (mut (ref null $Dot)))` while the value stored is `(ref $uVarHeap[Circle])`.
+* **THE TWIN SIG PASS CARRIES THE SAME LADDER** (`rlSig`'s `else` arm) by design — its
+  header says it "mirrors the `rlElemHeap` resolution below" — so a fix must move BOTH in
+  lock-step or the dedup decision and the heap disagree.
+* **DELIBERATELY NOT FIXED WITH D26.** Besides the two ref-pair-loop sites above,
+  `rlElemStructRow` has SIX other call sites — `wasmEmit`'s element STORE (13564), PUSH
+  (14215) and array-LITERAL (19787), `emit_classify`'s `rlSlotsLayoutTwin` (the ref-list
+  slot dedup itself) and `structListPopGetElem` (`xs.pop()` / `xs.get(i)`) — and each would
+  need the same gate, and `rlElemLitStructRow`'s header already records a MEASURED reason its own name
+  rung is deliberately narrower ("changes the answer on 7 corpus calls and 311 fuzz
+  programs — every one of them a both-decline today, i.e. exactly the -1 the variant route
+  depends on"). This is the seam ROADMAP charters as repOf item (e), the variant/struct-table
+  seam, whose LOUD half is already recorded there.
 
 ---
 
