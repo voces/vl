@@ -93,7 +93,15 @@ add("i32list-param", "", "function goc(xs: i32[]): i32 {\n  return dstGen(xs, 7)
 add("bool-literal", "", "function go(): i32 {\n  return dstGen(true, 7)\n}\n")
 add("i32-literal", "", "function go(): i32 {\n  return dstGen(1, 7)\n}\n")
 
+# GRADE AGAINST ANOTHER COMPILER WITHOUT SWAPPING `build/vl-compiler.wasm`. A baseline has
+# to be taken with the OTHER side's compiler, and the obvious way -- check out the other
+# sources and refresh -- leaves a ~40s window in which every other `vl` in the worktree is
+# reading the wrong seed. `--compiler` is the CLI's own override and costs nothing.
+VL_COMPILER = os.environ.get("VL_COMPILER", "")
+
 def run(cmd):
+    if VL_COMPILER:
+        cmd = cmd + ["--compiler", VL_COMPILER]
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 

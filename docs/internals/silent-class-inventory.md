@@ -51,7 +51,7 @@ repro rather than a paraphrase:**
 | D19 | check-clean invalid wasm (mis-graded; it LOADS then traps) | **runs — CLOSED 2026-08-26** (below, with the scope axis that measured the whole class: 38 silent cells, all module scope) |
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
-| D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class, TWO roots and not one — a missing BOX and a misplaced one, failing in opposite directions at the same seam) |
+| D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class. THREE roots at three layers, separated by an ABLATION and not by argument — a missing BOX, a misplaced one failing in the opposite direction at the same seam, and the monomorphizer's pin a whole layer earlier) |
 | D25 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the specimen hunt that closed the three above: a NARROWED argument's type does not ride the monomorphization pin. Needs a ruling on which channel owns it, not an arm |
 | D26 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the `std-api-reviewer` pass over D24's retirement: a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in ONE program. No narrowing, no nullability — the heap-type TWIN at a monomorphized instance's result |
 
@@ -2036,12 +2036,27 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
 
 * **NO NARROWING AND NO NULLABILITY ANYWHERE**, which is what separates it from D22/D23/D24
   (all three need the `nulvariant` niche) and from D25 (which needs a narrowed argument
-  riding a generic RESULT). It is the heap-type TWIN problem at a monomorphized instance's
-  result: `Circle` is both a plain struct row (`sHeapIdx`) and a union arm
-  (`uVarHeap`), those are distinct heap types, and which one the `A = Circle` instance
-  produces disagrees with which one the `const out` binding's slot was declared as. The
-  binding is load-bearing — the same call consumed inline runs — so the disagreement is
-  between the instance's result and the LOCAL's kind, not inside the instance.
+  riding a generic RESULT). It is the heap-type TWIN at a monomorphized instance's RESULT,
+  and the disassembly says so rather than the message shape — `wasm-tools print` of
+  `circleFold`:
+
+      (func (;16;) (type 14) (param structref) (result i32)
+        (local (ref 2) (ref 0) (ref 9))     ;; local 1 = the Circle VALUE, local 2 = `out`
+        i32.const 5
+        struct.new 2                        ;; the literal builds heap type 2
+        local.set 1
+        …
+        call 8                              ;; the A = Circle instance: (ref 2) -> (ref 2)
+        local.set 2                         ;; …into a local DECLARED (ref 0)
+        local.get 2
+        struct.get 0 0                      ;; and read back through heap type 0
+
+  Types 0 and 2 are both `(struct (field (mut i32)))` and are distinct heap types: the plain
+  struct row (`sHeapIdx`) and the union-arm row (`uVarHeap`), which the two tables never
+  cross-dedup. The instance's parameter, body and result agree with each other on `(ref 2)`;
+  it is the `const out` BINDING's slot that resolved `Circle` through the other table. That
+  is why the same call consumed inline (`return reduce(…).r`) runs — with no binding there is
+  no second resolution to disagree with.
 * **THE UNION HAS TO BE INSTANTIATED TOO.** With only the `Circle` instance the program
   runs; the union instance is what makes `Circle` resolve through `uVarHeap` at one end.
   This is precisely the interaction a single-instance grid cannot see, and it is the third

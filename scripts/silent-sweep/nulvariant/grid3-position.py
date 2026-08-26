@@ -71,7 +71,15 @@ B("assign-local", "function go(): i32 {\n  let c: Circle | null = null\n  c = { 
 B("nested-call-arg", "function take(k: i32, v: Circle | null): i32 {\n  if v is Circle { return v.r + k }\n  return -1\n}\nprint(take(0, { r: 5 }))\n")
 B("captured-call-arg", "function go(): i32 {\n  const bias = 0\n  function inner(v: Circle | null): i32 {\n    if v is Circle { return v.r + bias }\n    return -1\n  }\n  return inner({ r: 5 })\n}\nprint(go())\n")
 
+# GRADE AGAINST ANOTHER COMPILER WITHOUT SWAPPING `build/vl-compiler.wasm`. A baseline has
+# to be taken with the OTHER side's compiler, and the obvious way -- check out the other
+# sources and refresh -- leaves a ~40s window in which every other `vl` in the worktree is
+# reading the wrong seed. `--compiler` is the CLI's own override and costs nothing.
+VL_COMPILER = os.environ.get("VL_COMPILER", "")
+
 def run(cmd):
+    if VL_COMPILER:
+        cmd = cmd + ["--compiler", VL_COMPILER]
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 

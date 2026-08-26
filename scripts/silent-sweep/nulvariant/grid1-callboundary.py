@@ -141,7 +141,15 @@ def build(afname, nw, dname):
     exp = d["nullexp"] if afname == "bare-null" else d["exp"](5)
     return src, exp
 
+# GRADE AGAINST ANOTHER COMPILER WITHOUT SWAPPING `build/vl-compiler.wasm`. A baseline has
+# to be taken with the OTHER side's compiler, and the obvious way -- check out the other
+# sources and refresh -- leaves a ~40s window in which every other `vl` in the worktree is
+# reading the wrong seed. `--compiler` is the CLI's own override and costs nothing.
+VL_COMPILER = os.environ.get("VL_COMPILER", "")
+
 def run(cmd):
+    if VL_COMPILER:
+        cmd = cmd + ["--compiler", VL_COMPILER]
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
