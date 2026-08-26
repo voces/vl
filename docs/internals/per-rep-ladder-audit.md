@@ -491,15 +491,39 @@ than every row above — recorded so the next sweep starts from the analysis:
 * `cloCallUnionMixUnrep` (the floor for the deferred value-union-closure-result
   family) sets neither `hasScalar` nor `hasComposite` for a `TyNullable` member or
   a nested non-literal `TyUnion` member, and "no composite" means "admit".
-* `exprNulScalarListKind`'s Ident arm covers param / declared local / global but
-  **not the CAPTURE storage class**, which every sibling niche classifier carries.
-  A missing storage class, not a missing rep, but the same silent-`null` shape.
+* ~~`exprNulScalarListKind`'s Ident arm covers param / declared local / global but
+  **not the CAPTURE storage class**~~ — **REACHED AND CLOSED 2026-08-25** as D9 in
+  the silent-class inventory. It was not "lower-severity for want of a reaching
+  program": it was 144 grid cells, a loud emit reject on ordinary code, and the
+  reaching program is four lines. A missing storage class, not a missing rep, and
+  the same silent-`null` shape as this bullet predicted.
   **This bullet's sibling was reached and closed by C4**: `exprNulLitUnion`'s Ident
   arm was missing the for-in LOOP VAR — a storage class with no declaration node
   at all, so it cannot be resolved the way the other four are; the fix reads the
   checker's recorded type for that read instead. Every niche classifier with an
   Ident arm should be re-read against the FULL storage-class list (capture, param,
   `let`, global, **for-in loop var**), which is five, not four.
+
+  **THAT RE-READ WAS DONE, and it found two more classifiers and one non-classifier.**
+  `exprNullableMap` and `exprNulClosure` were missing the same capture arm and closed
+  with D9; `exprString` knew the `str` capture kind but not `nulstr`, where its
+  param/local twins claim both. Two things the sweep of that list also settled:
+  * **A capture arm on a null TEST is not sufficient on its own where the narrowed READ
+    carries a companion slot.** Adding it to `exprNullableMap` alone converted 22 cells
+    from loud to CHECK-CLEAN INVALID WASM, because `mapShapeOfExpr`'s capture arm
+    answered for the non-null `map` kind only and the read then named a different
+    `$mapStruct` from the one `captureValStructIdx` typed the env field with. For a
+    kind with a companion index, the storage-class arm has to be added at the SLOT
+    resolver in the same change, and it should read the companion the field was minted
+    from rather than re-derive it.
+  * The fifth storage class on that list, **for-in loop var, is NOT reachable by adding
+    an Ident arm** for the list niches: a loop var IS a declared local
+    (`declareForInLocals` → `addLocalName`), so `declaredKind` already reaches it — the
+    kind STORED there is the non-null one, because `forInElemKind` splits the nullable
+    niche for element kinds 4 / nulstruct / nulstr and not for 6 / 7 / 8 / 10 / 9. Making
+    it split turns all 120 of those cells from loud into check-clean invalid wasm
+    (the element read still recovers the slot non-null), so that leg is a paired change,
+    filed as D20 in the silent-class inventory with the measurement.
 
 ### R11. UNREACHABLE, with the guard named
 

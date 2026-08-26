@@ -1781,11 +1781,18 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is Paren { return exprNulScalarListKind(e.parInner, fnIx) }
   if e is Ident {
-    // A nullable-scalar-list PARAM, a same-kind LOCAL (`const t0 = v`), or a GLOBAL cell.
+    // A nullable-scalar-list PARAM, a same-kind LOCAL (`const t0 = v`), a CAPTURE, or a
+    // GLOBAL cell — the four storage classes a binding of this niche can have.
     const pk = nulScalarListKindOfNode(paramTypeNode(fnIx, e.identName))
     if pk != null { return pk }
     const dk = declaredKind(e.identName)
     if isNulScalarListKind(dk) { return dk }
+    // A CAPTURED leaf-list cell, asked of the ladder that TYPED the env field
+    // (`capturedKindOf` is `captureValKind` on the resolved parent frame), so the read and
+    // the field can never disagree about the wrapper. The `nullist` / `nulreflist` /
+    // `nulvariant` arms of the sibling classifiers are the same rung on the other niches.
+    const ck = capturedKindOf(fnIx, e.identName)
+    if isNulScalarListKind(ck) { return ck }
     const gl = globalLetOf(e.identName)
     if gl >= 0 { return letNulScalarListKind(gl, fnIx) }
   }
@@ -21486,6 +21493,9 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulClosure(fnIx, e.identName) { return true }
     if declaredNulClosure(e.identName) { return true }
+    // A CAPTURED `((…) => R) | null` cell — the env field is the same
+    // `(ref null $cloStruct)` fat pointer, typed by `captureValKind`.
+    if capturedKindOf(fnIx, e.identName) == "nulclosure" { return true }
     // A module-global nullable-closure cell (kind 19).
     const gl = globalLetOf(e.identName)
     if gl >= 0 { return globalCellKind(gl) == "nulclosure" }
@@ -22067,6 +22077,19 @@ function capturedStructIndex(fnIx: i32, name: string) {
 export function capturedRefListSlot(fnIx: i32, name: string) {
   const ck = capturedKindOf(fnIx, name)
   if ck != "reflist" && ck != "nulreflist" { return -1 }
+  capturedCompanionSlot(fnIx, name)
+}
+
+// The map SHAPE of a CAPTURED NULLABLE-map cell (`{[K]: V} | null`), or -1 when `name` is not
+// such a capture. The kind-gated reader on the map index space, and it reads the COMPANION
+// SLOT rather than re-deriving from the parent binding on purpose: `captureValStructIdx` typed
+// the env FIELD off that very number, so the narrowed read and the field cannot name two
+// different `$mapStruct`s. (`mapShapeOfExpr`'s non-null `map` capture arm re-derives instead;
+// it agrees with the field on every shape the corpus reaches, and re-pointing it would move
+// bytes for no defect.) -1 is the mono string-keyed shape either way, so conflating it with
+// "not a capture" is safe only because the kind gate runs first.
+function capturedNulMapShape(fnIx: i32, name: string) {
+  if capturedKindOf(fnIx, name) != "nulmap" { return -1 }
   capturedCompanionSlot(fnIx, name)
 }
 
@@ -26636,6 +26659,10 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   if e is Ident {
     if paramNulMap(fnIx, e.identName) { return true }
     if declaredNulMap(e.identName) { return true }
+    // A CAPTURED `{[K]: V} | null` cell: the env field holds the same
+    // `(ref null $mapStruct)` niche, typed by `captureValKind` off the parent frame's
+    // binding — the map twin of `exprNullableList`'s `nullist` capture arm.
+    if capturedKindOf(fnIx, e.identName) == "nulmap" { return true }
     return globalIsNulMapSid(sidOfNode(exprIx))
   }
   // A `recv.f` read of a NULLABLE map FIELD (`f: {[string]: V} | null`, code 29) yields a
@@ -27267,6 +27294,14 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       }
       return -1
     }
+    // A CAPTURED NULLABLE map narrowed non-null — the `| null` twin of the arm above, over a
+    // storage class `declaredNulMap` / `paramNulMap` cannot reach (the binding lives in another
+    // frame). Without it a `{[i32]: string} | null` capture read the mono `-1` string-keyed
+    // `$mapStruct` while its env field held the i32-keyed one: check-clean INVALID WASM at the
+    // narrowed `.size`, the exact failure the `map` arm's header above records for the param form.
+    if capturedKindOf(fnIx, e.identName) == "nulmap" {
+      return capturedNulMapShape(fnIx, e.identName)
+    }
     const gl = globalLetOf(e.identName)
     if gl >= 0 {
       if letIsMap(gl, -1) { return letMapShapeOf(gl, -1) }
@@ -27638,7 +27673,15 @@ export function exprString(exprIx: i32, fnIx: i32) {
     if declaredString(e.identName) { return true }
     // A CAPTURED string (`const s = "…"; () => s.length`): the env field is a string ref (kind
     // 3), so classify it like a string param/local — else `s.length` reads as a struct field.
-    if capturedKindOf(fnIx, e.identName) == "str" { return true }
+    //
+    // `nulstr` TOO, on exactly the rule `declaredString` and `paramString` already state for
+    // the other three storage classes: a `string | null` cell reads AS a string for string
+    // ops, because the checker gates those on the narrowed branch and the array ops accept
+    // the nullable ref, while `exprNullableString` claims the `!= null` test first so this
+    // cannot mis-route it. Without the second kind a narrowed captured `s.length` fell to the
+    // struct path — `field access but no struct type declared`, on a program `vl check` passes.
+    const csk = capturedKindOf(fnIx, e.identName)
+    if csk == "str" || csk == "nulstr" { return true }
     return globalIsStringSid(sidOfNode(exprIx))
   }
   // An index read over a STRING list (`names[i]`, a `string[]` element) yields a
