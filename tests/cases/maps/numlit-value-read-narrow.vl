@@ -1,0 +1,181 @@
+// @run
+// @log 1
+// @log absent
+// @log 2
+// @log absent
+// @log 3
+// @log absent
+// @log 5
+// @log absent
+// @log 7
+// @log 13
+// @log absent
+// @log 0
+// @log absent
+// @log 1.5
+// @log absent
+// @log 2
+// @log absent
+// @log 2
+// @log absent
+// @log 1
+// @log absent
+
+// A NUMERIC-LITUNION MAP VALUE, READ BY INDEX AND NARROWED — the silent-class inventory's
+// D6, and it needed a four-way conjunction: a MAP container, a NUMERIC litunion value, the
+// nullability arriving IMPLICITLY from a bare read of a NON-nullable value type, and a
+// narrow. Every one of those four had a working control before this fix. `vl check` rc 0,
+// module written, engine rejected:
+//
+//     type mismatch: expected (ref null $type), found i32
+//
+// THE STRING-LITUNION TWIN IS THE NEAREST WORKING PATH, and the reason it works is the
+// whole mechanism. `K = "a" | "b"` reps as an interned ATOM ID, so every negative bit
+// pattern is spare and `K | null` rides the `-1` NICHE: the read yields an i32, the narrow
+// compares it against -1, and nothing is boxed. A NUMERIC litunion reps as THE NUMBER
+// (#1866) — `1 | 2` is 1 and 2 — so no bit pattern is spare, and `1 | 2 | null` reps as the
+// VALUE-UNION BOX, exactly as `nulNumLitUnionBaseName`'s header says. The read was lowered
+// as though it had the string family's niche while every consumer of it expected the box.
+//
+// TWO RUNGS CLOSED IT, both corrections to a claim rather than new machinery:
+//
+//   1. `mapReadScalarBoxKind*` (the predicate #1901 built for the scalar widths) EXCLUDED
+//      the numeric litunion outright, on a claim written into both twins' headers: that its
+//      nullable "reps as the `-1` niche rather than the value box". It does not. Admitting
+//      it at the BASE scalar's atom gives the read the same conditional box `i32`/`i64`/
+//      `f64` already get.
+//   2. `synthNullableAnn` then handed the RECORDED type over under a spelling that does not
+//      denote it — `tyToEmitName` renders the REP, so `N2 | null` renders `i32|null` — and
+//      the annotation node's row became unmatchable by `unRowOfCanon`. `letUnionNameOf`
+//      answered "" for a binding whose union NAME was registered, so `emitIdentNode` skipped
+//      the narrowed unbox and pushed the raw `(ref $uBox)` into `print`'s i32 parameter.
+//      A SOURCE `const v: N2 | null` never hit this: canon rewrites that spelling and
+//      REBANKS its row in the same move. This is that rebanking for a node canon never sees.
+//
+// The four controls stay byte-identical (measured, not assumed): the string-litunion twin,
+// the plain `i32`/`f64` twins, the `(N | null)[]` element, the `N | null` local, and the
+// DECLARED-nullable map value `{[string]: N2 | null}`.
+
+type N2 = 1 | 2
+
+// THE FILED REPRO, both inputs. A present key yields the member; a missing key is absent.
+function two(k: string) {
+  const m: {[string]: N2} = Map()
+  m["k"] = 1
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+two("k") // 1
+two("zz") // absent
+
+// The `== null`-else narrow form — the row records the defect as flat across both, and so
+// is the fix.
+function twoElse(k: string) {
+  const m: {[string]: N2} = Map()
+  m["k"] = 2
+  const v = m[k]
+  if v == null { print("absent") } else { print(v) }
+}
+twoElse("k") // 2
+twoElse("zz") // absent
+
+// THREE and FIVE members: the arm count is not what decides the rep.
+type N3 = 1 | 2 | 3
+function three(k: string) {
+  const m: {[string]: N3} = Map()
+  m["a"] = 3
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+three("a") // 3
+three("b") // absent
+
+type N5 = 1 | 2 | 3 | 4 | 5
+function five(k: string) {
+  const m: {[string]: N5} = Map()
+  m["a"] = 5
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+five("a") // 5
+five("b") // absent
+
+// NON-CONTIGUOUS members. The rep is the number, not an index into the member list, so a
+// gap in the members must not change anything.
+type NN = 7 | 9 | 13
+function gap(k: string) {
+  const m: {[string]: NN} = Map()
+  m["a"] = 7
+  m["b"] = 13
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+gap("a") // 7
+gap("b") // 13
+gap("c") // absent
+
+// A MEMBER THAT IS ZERO — the collision the whole box exists for. `emitMapGet`'s miss arm
+// yields "the rep's empty value", which for this map is `0`, a perfectly real member. A
+// STORED zero and a MISS must stay distinguishable.
+type NZ = 0 | 1
+function zero(k: string) {
+  const m: {[string]: NZ} = Map()
+  m["a"] = 0
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+zero("a") // 0 — stored, not absent
+zero("b") // absent
+
+// A FLOAT base. The box's atom is the litunion's BASE scalar, so this one tags f64 where
+// the others tag i32; the mv slot differs too (an f64 map interns a slot, a mono i32 map
+// has none), and both legs of the predicate have to answer.
+type F2 = 1.5 | 2.5
+function floats(k: string) {
+  const m: {[string]: F2} = Map()
+  m["a"] = 1.5
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+floats("a") // 1.5
+floats("b") // absent
+
+// An i32 KEY, so the key rep is not what carries this.
+function i32Key(k: i32) {
+  const m: {[i32]: N2} = Map()
+  m[7] = 2
+  const v = m[k]
+  if v != null { print(v) } else { print("absent") }
+}
+i32Key(7) // 2
+i32Key(8) // absent
+
+// THE VALUE FLOWS ONWARD after the narrow: into a parameter typed as the litunion itself,
+// and into an equality against a member. Both were `emitProgram: `==` over a struct union
+// is not supported yet` at the intermediate rung of this fix, so they are pinned.
+function take(x: N2) { print(x) }
+function onward(k: string) {
+  const m: {[string]: N2} = Map()
+  m["k"] = 2
+  const v = m[k]
+  if v != null { take(v) } else { print("absent") }
+}
+onward("k") // 2
+onward("zz") // absent
+
+// NESTED — the outer read narrows to a map, the inner read narrows to the litunion.
+function nested(k: string) {
+  const inner: {[string]: N2} = Map()
+  inner["i"] = 1
+  const m: {[string]: {[string]: N2}} = Map()
+  m["o"] = inner
+  const o = m["o"]
+  if o != null {
+    const v = o[k]
+    if v != null { print(v) } else { print("absent") }
+  } else {
+    print("no-outer")
+  }
+}
+nested("i") // 1
+nested("zz") // absent
