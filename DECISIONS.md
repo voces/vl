@@ -680,3 +680,90 @@ corpus vs 571 `else if`). A dedicated `elseif`/`elif` keyword only earns its kee
 block-terminator languages (Python/Lua/Ruby) where `else if` would force an extra `end`;
 VL's `{}` blocks make it redundant. One form means no parser ambiguity and no formatter
 surface-recovery for the chain keyword.
+
+## Which channel owns a NARROWED argument's type at a monomorphization pin
+
+**The pin's own NAME owns it, and the checker's recorded type on the argument node is
+consulted only to pick among that name's OWN members.** (D25, #1938)
+
+Two channels answer "what type is this argument" during monomorphization, and they are
+already both per-parameter columns of one instance:
+
+* `pinned[j]` — the pin NAMES, from `monoArgTyName`, which reads the PARAMETER's declared
+  annotation because mid-mono every `expr*` classifier is blind (`buildLocals` is post-mono);
+* `pinTys[j]` — the ARGUMENT NODE's arena row, which knows the narrow.
+
+The parameter slot and the body's binding column were built from the NAME; the RETURN
+annotation's `substTyDeep` was built from the argument's ROW. Inside `if c is Circle` those
+disagree — the annotation is still `Circle | null`, the checker has already typed the node
+`Circle` — so `idg<T>(x: T): T` was minted `(param (ref null $uVarHeap[vi])) (result (ref
+$uVarHeap[vi]))`. `vl check` rc 0, module refused at load.
+
+### The measurement
+
+A 187-cell grid over generic-call shapes (type parameter in the result vs not · `is` /
+`!= null` / no narrow · nulvariant, plain variant, nulstruct, struct, nulreflist, reflist,
+nulstring, string, nul-i32/f64, nul scalar list, nulmap, nullable closure, litunion,
+nominal struct · direct / binding / nested / call-result / field-read / module-scope
+delivery · generic returning `T`, returning a concrete type, two type parameters, a
+forwarder), graded on `runs` · `loud check reject` · `loud emit reject` · `check-clean
+invalid wasm` · `compiler trap` · `runs but wrong value`:
+
+| | runs | loud check | loud emit | check-clean INVALID WASM | blockers (loud→silent) |
+|---|---|---|---|---|---|
+| master | 94 | 33 | 7 | **53** | — |
+| (a) annotation owns it | 134 | 33 | 12 | **8** | 0 |
+| (b) node type owns it | 98 | 33 | 10 | **46** | **6** |
+| (c) shipped | **146** | 33 | 8 | **0** | 0 |
+
+* **(b) is disqualified on the brief's own rule** — 6 cells moved from a loud outcome to a
+  silent one, and 21 more from `runs` to invalid wasm. Its breakage is exactly where the row
+  warned: a literal union's render SOFTENS to `string`, a nominal `P` renders `{x:i32}`, a
+  closure renders an arrow where the pin needs a `$fnsig` marker, and a generic FORWARDER's
+  leaf node still carries the ORIGINAL's `T`.
+* **(a) is sound but leaves the result at a rep the checker does not believe in.** Its whole
+  residue is the call RESULT's onward use: 8 silent cells at the boxed nullable scalars, and
+  4 `runs` cells lost to a loud `field access but no struct type declared` because the
+  instance returns `string | null` / `P[] | null` where the checker typed the expression
+  `string` / `P[]`.
+* **(c) is (a)'s consistency rung plus a GATED narrowing rung**, and it is what shipped.
+
+### The ruling, in two rungs
+
+1. **An instance is a function of its registry key.** The RESULT's substitution takes
+   `letTyCol` — the same column the parameter slot and the body's bindings take — not
+   `pinTys`. The registry is keyed on `pinned` alone, so sourcing the result from a column
+   the key does not carry made the instance depend on something the key cannot see. That was
+   an ORDER DEPENDENCE, not merely a wrong type: one program with two function declarations
+   swapped moved between `runs` and check-clean invalid wasm, with identical call sites and
+   an identical key.
+2. **A narrowed argument's pin NAME is the narrowed spelling**, where the checker's recorded
+   type renders a name that is a top-level MEMBER of the annotation's own union/nullable
+   spelling AND that `monoAnnPinName` echoes back unchanged.
+
+Rung 2 is the reason (c) beats (a), and the MEMBERSHIP gate is the reason it is not (b). The
+justification for taking the narrow at all is `monoScalarAnnName`'s exact-name safety
+property read at the CALL BOUNDARY: a pin becomes the instance's parameter annotation, so it
+is safe exactly where a NON-generic function carrying that annotation already lowers the same
+program. Measured, on the concrete twin of every rep in the grid — `function takeN(x: N): N`
+called with a `W` value narrowed to `N` — **all ten run on master**, argument coercion
+(`ref.as_non_null`, unbox) and result box included. Pinning `W` is equally legal as an
+annotation and lands the RESULT off that path; pinning `N` lands the whole instance on it.
+
+Where rung 2 declines (the nominal reps, whose render is structural), rung 1 alone keeps the
+instance consistent — which is why the two rungs ship together and neither is redundant.
+
+### What is deliberately NOT done
+
+* **The narrowing is not decided by TYPE identity.** A `tySame`-based membership test would
+  reach the nominal reps too (`{r:i32}` matching the `Circle` arm). It is not licenced: the
+  grid has 0 silent cells and 0 regressions without it, and widening a rule past its measured
+  need is the D-SHAPEFIELD precedent this repo keeps paying for.
+* **`monoArgTyName` itself is unchanged**; the narrowing lives in a separate
+  `monoArgPinName` that only `monoInstantiate` calls. `wasmEmit`'s `monoStaticIsResult` asks
+  `monoArgTyName` about an `is` RECEIVER and const-folds on the answer — narrowing there
+  would fold a guard the mono pass has no business deciding.
+* **Five cells remain LOUD rather than running**: a narrowed `P[] | null` and a narrowed
+  nullable closure whose generic RESULT is then indexed / called. Both are honest emit
+  refusals (`field access receiver is not a struct`, `callee is not a function name`), both
+  were check-clean invalid wasm before, and a loud floor beats a wrong instance.
