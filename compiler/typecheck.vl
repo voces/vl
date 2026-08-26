@@ -182,6 +182,10 @@ import {
 } from "./ast"
 import {
   SYM_MEM_METHOD,
+  rcoalCol,
+  rcoalLine,
+  rcoalTok,
+  rcoalType,
   redunECol,
   redunELine,
   redunName,
@@ -1026,6 +1030,23 @@ function noteNarShadow(name: string, declTy: i32, kind: i32) {
   asgDeclKinds.push(kind)
   asgDeclEpochs.push(narFnEpoch)
   0
+}
+
+// True when `ix` names a place whose CURRENT non-nullable type came from a narrowing
+// rather than from its declaration — the exemption the dead-`??` finding needs, so a
+// defensive `??` inside a guard is never reported. A bare name answers from the
+// narrowing bank (`narDeclaredTy`, either kind); a MEMBER or INDEX place answers TRUE
+// unconditionally, because the property-path narrowing overlay is not keyed by name and
+// there is no bank entry to consult — over-exempting is the safe direction for a
+// diagnostic whose only cost of silence is a missing hint.
+function coalNarrowedPlace(ix: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Paren { return coalNarrowedPlace(n.parInner) }
+  if n is Ident { return narDeclaredTy(n.identName, -1) >= 0 }
+  if n is Member { return true }
+  if n is Index { return true }
+  false
 }
 
 // True when `ix` is a bare NAME that an assignment narrowed away from a declared
@@ -2784,6 +2805,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
 // global scope. Call once before checking.
 export function initChecker() {
   redunReset()
+  rcoalReset()
   cbExpNode = []
   cbExpOff = []
   cbExpLen = []
@@ -5731,6 +5753,43 @@ function inlayHoleDeep(ty: i32, depth: i32): boolean {
 // `modOfTok` resolves which file a finding is in; the
 // cli keeps only the entry module's (driver wrapper
 // `redunModuleAt`).
+
+function rcoalReset() {
+  rcoalLine = []
+  rcoalCol = []
+  rcoalTok = []
+  rcoalType = []
+  0
+}
+
+// Record `x ?? d` whose left operand's type admits no `null`: the default is dead.
+// Anchored at the `??` node, exactly where every other diagnostic on that node lands.
+function recordDeadCoalesce(ix: i32, lt: i32) {
+  if ix < 0 || ix >= nodeToks.length { return 0 }
+  const tk = nodeToks[ix]
+  if tk < 0 || tk >= P.toks.length { return 0 }
+  const t = P.toks[tk]
+  // An EXACT repeat (same anchor) is the re-check of one node, not a second finding —
+  // the same de-duplication `tErrCoded` applies to the error tier.
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalTok.push(tk)
+  rcoalType.push(tyToStr(lt))
+  0
+}
+
+function rcoalTruncate(n: i32) {
+  while rcoalLine.length > n { rcoalLine.pop() }
+  while rcoalCol.length > n { rcoalCol.pop() }
+  while rcoalTok.length > n { rcoalTok.pop() }
+  while rcoalType.length > n { rcoalType.pop() }
+  0
+}
 
 function redunReset() {
   redunSLine = []
@@ -15529,6 +15588,7 @@ function solveUnannotParams(fnIx: i32) {
     const savedDiag = T.diags.length
     const savedSym = symEnabled
     const savedRedun = redunName.length
+    const savedRcoal = rcoalTok.length
     const savedQuiet = inferQuiet
     const savedBinN = binCstrOp.length
     const savedArgN = argCstrAt.length
@@ -15543,6 +15603,7 @@ function solveUnannotParams(fnIx: i32) {
     symEnabled = savedSym
     while T.diags.length > savedDiag { T.diags.pop() }
     redunTruncate(savedRedun)
+    rcoalTruncate(savedRcoal)
     while binCstrOp.length > savedBinN {
       binCstrLt.pop()
       binCstrOp.pop()
@@ -18286,6 +18347,7 @@ function inferReturnsPrePass() {
   const savedDiag = T.diags.length
   const savedSym = symEnabled
   const savedRedun = redunName.length
+  const savedRcoal = rcoalTok.length
   symEnabled = 0
   let i = 0
   while i < topUnannotFns.length {
@@ -18320,6 +18382,7 @@ function inferReturnsPrePass() {
   symEnabled = savedSym
   while T.diags.length > savedDiag { T.diags.pop() }
   redunTruncate(savedRedun)
+  rcoalTruncate(savedRcoal)
   inferQuiet = false
   0
 }
@@ -26425,6 +26488,46 @@ export function nodeTyIsNullable(ix: i32) {
   T.tys[ty] is TyNullable
 }
 
+// True only when node `ix`'s recorded type PROVABLY admits no `null` — the positive
+// question, which is NOT `!nodeTyIsNullable(ix)`: an unrecorded node, an inference hole
+// and a `TyVar` all answer "not nullable" to that one while being unknown here. Every
+// "don't know" answers FALSE, because the one consumer (`??` over a non-nullable LHS,
+// lowered as the identity on the left operand) turns a wrong TRUE into a rep mismatch —
+// the nullable rep emitted where the consumer wants the non-null one, i.e. invalid wasm
+// in place of the loud reject it replaces.
+//
+// A `null` member can arrive two ways and both are excluded: the `T | null` spelling is a
+// `TyNullable`, while a value union carrying null (`i32 | string | null`, and the expanded
+// nullable literal union `"a" | "b" | null`) is a `TyUnion` with a `null` member — that
+// second shape never reaches `TyNullable`, so scanning the members is required, not
+// belt-and-braces.
+export function nodeTyExcludesNull(ix: i32) { tyExcludesNull(nodeTyIxOf(ix)) }
+
+// The type-level half of `nodeTyExcludesNull` — shared so the CHECKER (which holds a
+// type, not a node) and the emit-time fold (which holds a node) cannot disagree about
+// which left operands make a `??` redundant.
+export function tyExcludesNull(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return false }
+  if t is TyErr { return false }
+  if t is TyVar { return false }
+  if t is TyNeg { return false }
+  // The bare `null` literal is a `TyPrim` — `null ?? d` IS `d`, the one shape where a
+  // non-`TyNullable` type is entirely null.
+  if isNullTy(ty) { return false }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if isNullTy(ms[i]) { return false }
+      if T.tys[ms[i]] is TyNullable { return false }
+      i = i + 1
+    }
+  }
+  true
+}
+
 // True if node `ix` has a recorded `string | null` type — the niche-string (kind 16) dual of
 // `nodeTyIsNullableStruct`. Gates `exprNullableString`'s fallback so a `string | null`-returning
 // closure value call whose callee it misses (an indexed closure-array element) classifies kind-16.
@@ -27621,6 +27724,23 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   // nullables), not one layer. A non-null default then types the whole `??`
   // NON-NULL (universal operator contract; USER SEMANTICS RULING 2026-07-23).
   if op == "??" {
+    // A `??` WHOSE LEFT OPERAND CAN NEVER BE NULL HAS A DEAD DEFAULT. Recorded, not
+    // rejected: the expression is well-typed and `emit_rewrite.vl` folds it to the left
+    // operand, so the program runs — this only says the `?? d` is doing nothing. The
+    // severity (`warning`, applied in `cli.vl`) is the one the parse-only lint pass
+    // already gives the same family: `constant-condition`, a branch never taken.
+    //
+    // A NARROWED place is EXEMPT, and that exemption is the whole rule. `if p != null {
+    // print(p ?? 0) }` types `p` non-nullable at the read while its STORAGE still admits
+    // null — a defensive `??` there is a deliberate spelling this compiler supports (and
+    // `tests/cases/soundness/narrowed-read-coalesce-lowers.vl` pins as correct at ten
+    // sites). Measured over the whole tree: without the exemption the rule fires 10 times
+    // and every firing is that fixture's contract; with it, ZERO times across
+    // `compiler/*.vl` (494 `??` uses), `std/*.vl` and ~1,450 corpus fixtures — i.e. it
+    // fires only on the shape it names, an operand that could never have been null.
+    if tyExcludesNull(lt) {
+      if !coalNarrowedPlace(n.binLeft) { recordDeadCoalesce(ix, lt) }
+    }
     const lt2 = T.tys[lt]
     if lt2 is TyNullable {
       const innerFull = nonNullTy(lt)
