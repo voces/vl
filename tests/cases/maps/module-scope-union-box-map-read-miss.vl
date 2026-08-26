@@ -1,0 +1,111 @@
+// @run
+// @log 1
+// @log absent
+// @log 7
+// @log absent
+// @log aa
+// @log absent
+// @log 3
+// @log absent
+// @log 2
+// @log 1
+// @log absent
+
+// A MISS ON A UNION-BOX-VALUED MAP, BOUND AT MODULE SCOPE, NARROWS AS ABSENT.
+//
+// This is D19 (`docs/internals/silent-class-inventory.md`) and the class the scope-crossed
+// sweep found around it. Every binding below is the SAME seven lines the row files, and the
+// last block is the function-scope control that always worked — the file itself is the
+// discriminator, exactly as `error-module-scope-list-value-read-bind.vl` is for its rung.
+//
+// THE STORAGE CLASS OF THE EXECUTING BODY WAS THE ONLY DIFFERENCE. A bare `const t = m[k]`
+// over a map whose value reps as the shared `{tag, payload}` union box lowered its MISS two
+// different ways depending on where it sat. Inside a `function`, `emitLetDeclStmt`'s
+// `letNulMapReadUnionBox` arm routed it to `emitMapGetUnionBox`, whose else-arm synthesizes
+// the NULL-TAGGED box. At module scope, `emitStartFnCode`'s global-init ladder had no such
+// arm, so the init fell to `emitMapGet` — whose miss arm yields the rep's bare `ref.null`.
+//
+// The consuming `!= null` / `is` / `??` is a TAG COMPARE that recovers the box with
+// `ref.as_non_null` FIRST, so the bare null trapped there:
+//
+//     global.get 5 ; ref.as_non_null ; struct.get $uBox 0 ; i32.const 6 ; i32.ne
+//
+// `vl check` rc 0, a VALID module that LOADS, every line before the read printed, and then
+// `wasm trap: null reference`. That outcome had no name in
+// `scripts/check-filed-witnesses.py`'s vocabulary either — a module that exists plus a
+// non-zero rc graded `silent_invalid_wasm`, which sends the reader to the emitter when the
+// miscompile is in what the emitted code DOES. `trap_loads` is that state, and
+// `--self-test` proves it fires.
+//
+// SEVEN REPS, ONE ARM. Measured on the scope-crossed grid (`scripts/silent-sweep/gen.py`,
+// `--scopes fn,mod`): 38 of 8,550 paired coordinates, all `scope=mod`, all on a MISSING
+// key, all `wasm trap: null reference`, and the function-scope twin of every one correct.
+// The reps are exactly those whose map value is the box — `i32`/`i64`/`f64`/`f32` under a
+// `| null`, a numeric literal union, a value union and a struct union. `boolean`, `string`,
+// `struct`, the STRING literal unions and nested maps each carry their own spare "absent"
+// and never reach the box, which is why they were already correct at both scopes.
+
+type N2 = 1 | 2
+type Cat = { c: i32 }
+type Dog = { d: i32 }
+type Shape = Cat | Dog
+
+// D19's own rep: a DECLARED-nullable numeric literal union. Trapped on `nmiss`.
+const nm: {[string]: N2 | null} = Map()
+nm["a"] = 1
+const nhit = nm["a"]
+if nhit != null { print(nhit) } else { print("absent") }
+const nmiss = nm["nope"]
+if nmiss != null { print(nmiss) } else { print("absent") }
+
+// The nullable SCALAR value — the same box, reached by a `| null` on a plain `i32`.
+const sm: {[string]: i32 | null} = Map()
+sm["a"] = 7
+const shit = sm["a"]
+if shit != null { print(shit) } else { print("absent") }
+const smiss = sm["nope"]
+if smiss != null { print(smiss) } else { print("absent") }
+
+// A VALUE UNION, where the `| null` comes from the index read alone and the value type
+// carries none — so this half is not a nullability question at all.
+const vm: {[string]: string | i32} = Map()
+vm["a"] = "aa"
+const vhit = vm["a"]
+if vhit is string { print(vhit) } else { print("absent") }
+const vmiss = vm["nope"]
+if vmiss is string { print(vmiss) } else { print("absent") }
+
+// A STRUCT UNION narrowed twice — `!= null`, then `is Cat`.
+const xm: {[string]: Shape | null} = Map()
+xm["a"] = { c: 3 }
+const xhit = xm["a"]
+if xhit != null {
+  if xhit is Cat { print(xhit.c) } else { print("dog") }
+} else {
+  print("absent")
+}
+const xmiss = xm["nope"]
+if xmiss != null {
+  if xmiss is Cat { print(xmiss.c) } else { print("dog") }
+} else {
+  print("absent")
+}
+
+// `??` over the same binding — the miss must reach the default, not the recover.
+const fm: {[string]: N2 | null} = Map()
+fm["a"] = 1
+const fmiss = fm["nope"]
+print(fmiss ?? 2)
+
+// THE FUNCTION-SCOPE CONTROL, and the one thing that differs from the first block. It
+// printed `1` / `absent` before this change too; keeping both halves in one file is what
+// stops a future half-fix from passing by moving only the noisy one.
+function body() {
+  const d: {[string]: N2 | null} = Map()
+  d["a"] = 1
+  const dhit = d["a"]
+  if dhit != null { print(dhit) } else { print("absent") }
+  const dmiss = d["nope"]
+  if dmiss != null { print(dmiss) } else { print("absent") }
+}
+body()

@@ -395,6 +395,7 @@ import {
   letIsLitUnion,
   letIsNulString,
   letMapShapeOf,
+  letNulMapReadUnionBox,
   letUnionNameOf,
   mapAnnShape,
   mapRetExprShape,
@@ -484,6 +485,7 @@ import {
   emitExprAsF64,
   emitExprAsI64,
   emitFuncBody,
+  emitMapGetUnionBox,
   emitNullForRet,
   emitStmt,
   emitUnionBoxArg,
@@ -1797,7 +1799,42 @@ function emitStartFnCode(out: i32[]) {
             // function, used only as a direct-call callee: the closure through the floor-LESS
             // core, the start-fn twin of the const-cell arm in `emitGlobalSection`.
             const gAliasFe = monoGenericAliasFe(globalStmts[gi])
-            if gun != "" {
+            // THE MODULE-SCOPE TWIN of `emitLetDeclStmt`'s union-box map-read arm, and the
+            // one arm of that ladder this one never grew. A bare top-level `const t = m[k]`
+            // over a UNION-valued map (mv kind 2 — a value union, a struct union, a numeric
+            // literal union, and every `T | null` scalar, all of which rep as the shared
+            // `{tag, payload}` box) must lower its MISS as the NULL-TAGGED BOX, because the
+            // consuming `!= null` / `is` / `match` / `??` is a TAG COMPARE that recovers the
+            // box with `ref.as_non_null` first.
+            //
+            // Without this arm the init fell through to `emitExpr` -> `emitMapGet`, whose
+            // miss arm yields "the rep's empty value" — a BARE `ref.null`. The module is
+            // VALID and `vl check` is rc 0; the program LOADS, prints every line before the
+            // read, and then traps `null reference` on the recover. The same binding inside
+            // a `function` has always lowered correctly, which is what made this invisible:
+            // the storage class of the executing body is the only thing that differs.
+            //
+            // Measured on the scope-crossed grid (`scripts/silent-sweep/gen.py --scopes`):
+            // 38 of 8,550 paired coordinates, all `scope=mod`, all on a MISSING key, all
+            // `wasm trap: null reference`; the function-scope twin of every one is correct.
+            const gUmr = letNulMapReadUnionBox(globalStmts[gi], -1)
+            if gUmr {
+              const gumrN = P.nodes[unwrapParen(g.letInit)]
+              if gumrN is Index {
+                if (
+                  emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) <
+                  0
+                ) {
+                  wTarget(exprPrev)
+                  return -1
+                }
+              } else {
+                wTarget(exprPrev)
+                return emitFail(
+                  "emitProgram: union-valued map read binding's init is not an index read",
+                )
+              }
+            } else if gun != "" {
               if emitUnionBoxArg(bodyExpr, gun, g.letInit, -1) < 0 {
                 wTarget(exprPrev)
                 return -1

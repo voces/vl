@@ -36,8 +36,10 @@ def axis(name, key):
 
 
 for nm, k in (("leg", "leg"), ("representation", "rep"), ("position", "pos"),
-              ("construct", "con"), ("runtime input", "inp"), ("nullability", "nul")):
-    axis(nm, k)
+              ("construct", "con"), ("runtime input", "inp"), ("nullability", "nul"),
+              ("scope", "scope")):
+    if any(k in r for r in rows):
+        axis(nm, k)
 
 print("\n== silent-cell message histogram ==")
 h = collections.Counter()
