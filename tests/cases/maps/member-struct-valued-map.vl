@@ -1,0 +1,106 @@
+// Regression (silent-class-inventory D34): a map whose declared VALUE type is a union ARM.
+// No generic, no import, no layout twin — `Dot` is absent from this file on purpose, which is
+// what separates this row from D32/D33.
+//
+// THE MAP LAYER NEVER SEES THE NAME `Circle`. Every value spelling it holds is a RENDER
+// (`nodeTyMapValName` is `tyToEmitName` of the value type), and `tyToEmitName` spells a
+// declared arm `{r:i32}` — character for character what a genuinely anonymous shape renders
+// as. Two NAME-keyed resolvers then answer about the wrong table each: `variantIndexOf`
+// declines (the render is not the arm's name, so #1942's gate cannot fire here by
+// construction) and `structIndexByValName` ACCEPTS, matching the INLINE-SHAPE row
+// `internInlineShape` minted from the very same field set. Measured at the site on this
+// file's own witness:
+//
+//   INLINEMINT nm={r:i32} row=0 varShape=0
+//   MVPROBE in={r:i32} canon={r:i32} kind=1 vsi=0 vname={r:i32} varIdx=-1 varShape=0
+//
+// `varShape=0` is the variant table claiming the same shape; `varIdx=-1` is the NAME rung
+// declining. Re-resolving the render mints a FRESH arena index (`vTy=61`, where `Circle`'s
+// declaration is `40`), so `variantRowOfTy` — nominal by construction — correctly declined
+// that too. The nominal channel had been destroyed upstream, and the fix is to carry it: the
+// `collectA` `TypeRef` walk holds the annotation NODE, whose recorded value type is still the
+// declaration's own index, and hands it over as an ARM-ONLY hint (`mvShapeOfMapNameArmTy`).
+// It is a second parameter rather than the `rowTy` bank because D-MAPNODETY forbids a better
+// ANSWER at the slot FIND rung, not an input consulted after the mint is decided.
+//
+// THE DISASSEMBLY IS ONE TYPE INDEX, master `f2064bec` (seed 1,425,295 bytes) vs this branch
+// (seed 1,426,430 bytes), every other instruction in `mkX` identical:
+//
+//   master   (type (;8;) (array (mut (ref null 0))))   ; 0 = the inline-shape row {r:i32}
+//   branch   (type (;8;) (array (mut (ref null 1))))   ; 1 = uVarHeap[Circle]
+//
+// with `struct.new 1` under BOTH and the field read moving `struct.get 0 0` → `struct.get 1 0`
+// — two DIFFERENT heap types behind one placeholder, `vl check` rc 0 and a module the engine
+// refuses. Downstream of the vals element the fix is four one-line pairings at sites whose
+// STRUCT half was already written and whose VARIANT half was not: the store literal's seed
+// (`ExpCtx.variantIdx`, which has existed since the variant literal path), `structIndexOfExpr`'s
+// two map rungs (which now decline for an arm), and `exprNullableVariant` /
+// `nulVariantIdxOfExpr` — the twin its own header says is built ARM FOR ARM against
+// `exprNullableStruct`, which had the map-read rung all along.
+//
+// THE `: Circle` ANNOTATION ON THE STORED VALUE IS LOAD-BEARING and its hint is DECLARED
+// rather than dropped: it is what makes the value a union ARM rather than an inferred inline
+// shape, and the un-annotated store is the `mkI` cell below, which ran on master too.
+// @run
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 1
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `d` is inferred as `{r: i32}`
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+type CM = {[string]: Circle}
+
+// The row's own filed witness: an ANNOTATED arm value stored, the map RETURNED, and read back
+// through a narrowed bare get in a second function.
+function mkX(i: i32): CM {
+  const m: CM = Map()
+  const c: Circle = { r: i }
+  m["k"] = c
+  return m
+}
+
+function rdX(v: CM) {
+  const g = v["k"]
+  if g != null { return g.r }
+  return -1
+}
+
+// The UN-ANNOTATED store — an inline literal at the same position. It ran on master, because
+// the store seed built the same inline-shape row the vals list was typed to; it has to keep
+// running now that the vals list is the arm's heap, which is what the `ExpCtx.variantIdx`
+// half of the fix is for.
+function mkI(i: i32): CM {
+  const m: CM = Map()
+  m["k"] = { r: i }
+  return m
+}
+
+// The `?? default` read over the same slot — the BinExpr dual of the bare get, and the arm
+// spelling of the seed `emitMapGetOr` applies to a struct-valued map's default literal.
+function rdDefault(v: CM) {
+  const d: Circle = { r: 3 }
+  const g = v["k"] ?? d
+  return g.r
+}
+
+// The map never READ at all. On master this was silent invalid wasm too — the store alone
+// puts the arm's heap into the inline row's array — so it is pinned beside the read cells
+// rather than treated as the trivial case.
+function storeOnly(i: i32) {
+  const m: CM = Map()
+  const c: Circle = { r: i }
+  m["k"] = c
+  return m.size
+}
+
+print(rdX(mkX(7)))
+print(rdX(mkI(7)))
+print(rdDefault(mkX(7)))
+print(rdDefault(mkI(7)))
+print(storeOnly(7))
