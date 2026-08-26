@@ -25,6 +25,7 @@ import {
   litUnionAliasNameOfTy,
   mkArrayTy,
   nameIsLitUnionType,
+  nodeTyExcludesNull,
   nodeTyIsLitUnionAlias,
   nodeTyIsNullable,
   nodeTyIsUnion,
@@ -368,6 +369,31 @@ function drwWalk(ix: i32, ctx: i32) {
     }
     n.binLeft = drwWalk(n.binLeft, ctx)
     n.binRight = drwWalk(n.binRight, ctx)
+    // `x ?? d` OVER A PROVABLY NON-NULLABLE LHS **IS** `x` — the default can never be
+    // selected, so the coalesce FOLDS AWAY here, before collection and classification.
+    //
+    // WHY A REWRITE AND NOT AN EMIT ARM. Lowering the identity inside `emitCoalesce`
+    // (`emitExpr` on the left operand) produces the right BYTES and the wrong TYPE: every
+    // consumer classifier — `exprString`, `exprIsLitAtom`, the print-import chooser, the
+    // local-cell ladder — dispatches on the `??` NODE, and each of their `??` arms answers
+    // only for a NULLABLE left operand (they were written for the fused map/niche reads).
+    // A non-nullable LHS therefore fell past all of them to the i32 default while the emit
+    // pushed the LHS's real rep. MEASURED on the 9,126-cell nullability sweep: the emit-arm
+    // version turned 132 loud rejects into `correct` and 62 into SILENT failures — 40
+    // invalid-wasm (`string`, inline litunion: `expected i32, found (ref $type)` at `print`)
+    // and 22 wrong-value (a named litunion printed its raw atom id). Folding the node
+    // instead means there is no `??` node left to classify, so all of them agree by
+    // construction.
+    //
+    // Safe to run this EARLY, ahead of every fused `??` lowering, because each of those
+    // lowerings requires a NULLABLE left operand and this fires only on a non-nullable one:
+    // `m[k]`, `m.get(k)`, `xs.get(i)` and `xs.pop()` are all typed `V | null` by the
+    // checker, so `nodeTyExcludesNull` declines them and their fused reads keep their
+    // default. Anything the query cannot prove non-nullable keeps the `??` node and the
+    // emitter's own loud reject.
+    if n.binOp == "??" {
+      if nodeTyExcludesNull(n.binLeft) { return n.binLeft }
+    }
     if drwDispatchOp(n.binOp) {
       const osi = structIndexOfExpr(n.binLeft, ctx)
       if osi >= 0 {

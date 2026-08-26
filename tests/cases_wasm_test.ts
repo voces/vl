@@ -339,10 +339,10 @@ const driveCase = (
   // and the instance is shared across cases, so don't trust `diagCount` on a
   // success: a stale emit failure could still be sitting in its store.
   const diags = rc === 0 ? [] : readDiags(exp);
-  // Read the redundant-annotation findings HERE, while this compile's token
-  // table is still standing: `redunModuleAt` resolves each finding's owner
+  // Both TYPE-INFORMED finding streams, read HERE while this compile's token table
+  // is still standing: `redunModuleAt` / `rcoalModuleAt` resolve each finding's owner
   // through `modOfTok`, and the later `lintSrc` re-parse resets that table.
-  const redun = readRedun(exp);
+  const redun = [...readRedun(exp), ...readRcoal(exp)];
   let bytes: Uint8Array | undefined;
   if (emit && rc === 0) {
     const n = exp.rbyteLen();
@@ -577,6 +577,28 @@ const readRedun = (exp: Exports): LintDiag[] => {
       line: exp.redunSLineAt(i),
       col: exp.redunSColAt(i),
       msg: readString(exp.redunMsgLen(i), (j) => exp.redunMsgByte(i, j)),
+    });
+  }
+  return out;
+};
+
+/**
+ * The dead-`??`-default findings (`rcoal*`) as lint diagnostics — `readRedun`'s twin,
+ * for the same reason: the finding is TYPE-informed (a `??` whose left operand's type
+ * admits no null), so it is invisible to the parse-only `lintSrc` stream this harness
+ * otherwise adjudicates `@warning` against. Entry module only, and the message comes
+ * over `rcoalMsg*` so the wording cannot drift from `cli.vl`'s.
+ */
+const readRcoal = (exp: Exports): LintDiag[] => {
+  const out: LintDiag[] = [];
+  const n = exp.rcoalCount();
+  for (let i = 0; i < n; i++) {
+    if (exp.rcoalModuleAt(i) !== 0) continue;
+    out.push({
+      sev: "warning",
+      line: exp.rcoalLineAt(i),
+      col: exp.rcoalColAt(i),
+      msg: readString(exp.rcoalMsgLen(i), (j) => exp.rcoalMsgByte(i, j)),
     });
   }
   return out;
