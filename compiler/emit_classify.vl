@@ -13327,15 +13327,17 @@ export function tyAnnRefListKind(tyIx: i32) {
       // `[1.5]` does not self-identify as f32 (it defaults to f64).
       //
       // STAYS ON THE NAME, and the sibling twin is why. `tyIsF64Array` and `tyIsI64Array` are
-      // `tyKindOf(ty) == 12` and `== 20`; `tyIsF32Array` is `tyKindOf(ty) == 21` and **`tyKindOf`
-      // never returns 21** — it returns {0,2,3,7,10,11,12,13,20}. So the f32 twin is DEAD, and
-      // converting this rung to match its two neighbours would silently disable it: an `f32[]`
-      // annotation would fall through to kind 0.
+      // `tyKindOf(ty) == 12` and `== 20`; the matching `tyKindOf(ty) == 21` test is a constant
+      // FALSE — **`tyKindOf` never returns 21**, it returns {0,2,3,7,10,11,12,13,20} — so
+      // spelling this rung like its two neighbours would silently disable it and an `f32[]`
+      // annotation would fall through to kind 0. (That dead test used to exist, as
+      // `tyIsF32Array`; it was removed with D14 rather than left reading like a fast path.)
       //
-      // The absence is deliberate, not an oversight — a float LITERAL types f64, so a general
-      // typed claim would mis-classify a literal-built f64 list as f32. The arena cannot answer
-      // this question today, which is what makes this rung different from the two above it
-      // rather than the next one to convert.
+      // The absence in `tyKindOf` is deliberate, not an oversight — a float LITERAL types f64,
+      // so a kind-based claim would mis-classify a literal-built f64 list as f32. The structural
+      // arena test `tyIsF32ArrayShape` DOES answer, and D14 attached it to `exprF32Array`'s
+      // ident/member arms; converting THIS rung to it is a separate question, because it is
+      // reading an ANNOTATION node inside a `TypeRef` arm where the name is already in hand.
       if nameIsF32Array(lt.tyName) { return 7 }
       // A `u8[]` annotation (kind 10) — the PACKED byte list. Threads for a NON-EMPTY
       // literal too, for the same reason the f32 rung does: a bare `[1, 2]` does not
@@ -26125,16 +26127,31 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 // ── f32-array typedness (the f32 sibling of the f64-array family, rep code 21) ──
 // f32 is the checker's weak spot (a float literal types f64), so these lean on the SYNTACTIC
 // path — an `f32[]` annotation (`nameIsF32Array`) on a let/param/global/return — rather than a
-// typed-IR fast path. A bare `[1.5]` literal stays f64 (it is NOT claimed here), so a value is
-// f32[] only when its declared type says so.
-function tyIsF32Array(tyIx: i32) { tyKindOf(tyIx) == 21 }
+// blanket typed-IR fast path. A bare `[1.5]` literal stays f64, so a value is f32[] only when
+// its declared type says so, or when a POSITION whose rep that declaration already fixed reads
+// the arena's `f32[]` back (see `exprF32Array`'s Ident / Member arms).
 
-// The checker-recorded type `tyIx` tested for an f32-element ARRAY — scoped to CALL
-// results only (`exprF32Array`'s curried-call arm). `tyKindOf` deliberately carries no
-// f32-array kind (a float LITERAL types f64, so a general typed claim would mis-claim a
-// literal-built f64 list as f32); a call result's f32-ness comes from the callee's
-// functype and is reliable.
-function callResTyIsF32Array(tyIx: i32) {
+// The checker-recorded type `tyIx` tested for an f32-element ARRAY, read STRUCTURALLY out of
+// the arena (`TyArray` -> `TyPrim "f32"`). This is the only working arena test for the rep:
+// `tyKindOf` deliberately carries NO f32-array kind (a float LITERAL types f64, so a kind-based
+// claim would mis-classify a literal-built f64 list as f32), which is why the sibling
+// `tyIsF64Array` / `tyIsI64Array` one-liners have no f32 twin.
+//
+// IT IS NOT SAFE AT EVERY NODE, and the two shapes it must not reach are both pinned:
+//
+//   * an `ArrayLit`. `const g: f32[] | string = [63.5]` records the union's `f32[]` ARM on the
+//     literal while the literal itself still BUILDS the f64 list — the coerce is what re-encodes
+//     it at f32. Claiming the literal here skips that coerce and boxes an `(ref $fl64)` payload
+//     under the f32-list atom tag: `wasm trap: cast failure` at the narrowed read
+//     (`tests/cases/unions/f32-list-union-member.vl`).
+//   * an `Index`. An element read's rep comes from the CONTAINER's interned row, not from the
+//     checker's element type, and the inferred-empty nested-array synthesis DECLINES an `f32[]`
+//     leaf on purpose (`tyNestedArrLeafSupported`). Claiming `outer[0]` here turns that decline
+//     into check-clean invalid wasm
+//     (`tests/cases/arrays/nested-array-inferred-empty-unsupported-leaf.vl`).
+//
+// Both were measured, in that order, by enabling this test at the TOP of `exprF32Array`.
+function tyIsF32ArrayShape(tyIx: i32) {
   if tyIx < 0 { return false }
   const t = T.tys[tyIx]
   if t is TyArray {
@@ -26268,7 +26285,7 @@ export function letIsF32Array(letIx: i32, fnIx: i32) {
 // (`letIsF32Array` answers off `nameIsF32Array` without consulting the initialiser). So
 // the homogeneous literal is the whole population this can claim, and claiming only it
 // leaves every mixed spelling exactly where it is. A bare `[1.5]` stays f64: a float
-// LITERAL is deliberately not `exprIsF32` (`tyIsF32Array`'s note), so an f32 list is only
+// LITERAL is deliberately not `exprIsF32` (`tyIsF32ArrayShape`'s note), so an f32 list is only
 // ever built from values whose own type says f32.
 export function arrLitIsF32(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
@@ -26349,24 +26366,21 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
 
 export function exprF32Array(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
-  // THIS GUARD NEVER FIRES, AND FIXING IT REGRESSES THE COMPILER. `tyIsF32Array` is
-  // `tyKindOf(ty) == 21` against a helper whose return set is {-1,0,2,3,7,10,11,12,13,20} — a
-  // constant `false`. It reads as the typed fast path its `exprF64Array` / `exprI64Array`
-  // siblings have, so an audit asking "does this have an arena leg?" answers yes. It does not.
+  // THE ARENA LEG IS PER-ARM, NOT AT THE TOP, and that placement is the whole content of
+  // this function's f32-vs-f64 difference. `exprF64Array` opens with `tyIsF64Array(nodeTyIxOf)`
+  // and every position rides it; the f32 twin used to open with `tyIsF32Array`, a
+  // `tyKindOf(ty) == 21` test against a helper whose return set is {-1,0,2,3,7,10,11,12,13,20},
+  // i.e. a CONSTANT FALSE that read as a fast path an audit would tick off.
   //
-  // A working arena test EXISTS twenty lines up (`callResTyIsF32Array`, reading `TyArray` ->
-  // `TyPrim "f32"` directly), and swapping it in was tried and REVERTED. It does close two
-  // documented f32 gaps — `arrays/error-inferred-f32-list-return.vl` and its `-binding` sibling
-  // both start printing `1.5`, the second of which was silent invalid wasm — but it also turns
-  // `arrays/nested-array-inferred-empty-unsupported-leaf.vl` from a LOUD emit decline into
-  // check-clean invalid wasm, and that fixture's own header says the decline exists "because the
-  // alternative to declining here is a MISCOMPILE".
-  //
-  // So the dead guard is load-bearing BY ACCIDENT: the f32 path is narrower than its siblings,
-  // and the narrowness is what keeps an unsupported nested leaf from reaching lowering. Fixing
-  // this means teaching the nested-array leaf decline about f32 FIRST, then enabling the fast
-  // path — two changes, in that order, and never this one alone.
-  if tyIsF32Array(nodeTyIxOf(exprIx)) { return true }
+  // Enabling the working arena test (`tyIsF32ArrayShape`) HERE, at the top, was measured: it
+  // brings the sweep's `list_f32` rep from 76/340 correct to 250/340 — exact parity with
+  // `list_f64` — and it breaks two corpus fixtures, one into a TRAP and one into check-clean
+  // invalid wasm. Those two shapes are named in `tyIsF32ArrayShape`'s own header: an `ArrayLit`
+  // (whose recorded union arm is not what the literal BUILDS) and an `Index` (whose rep comes
+  // from the container's interned row). So the leg is attached to the two node shapes that
+  // reach it soundly — an IDENT and a MEMBER, each a place whose cell rep the declaration
+  // already fixed — and the same 174 cells move with both fixtures still passing.
+
   // A read of an `f32[]`-valued map (`m[k] ?? []`, or a bare `m[k]`) — its value-list rep is the
   // f32 list (`mvListValKind` → 21), the f32 dual of the f64-list (12) case above.
   if mapReadListKind(exprIx, fnIx) == "f32list" { return true }
@@ -26375,9 +26389,10 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
   // Without it `[fv]` fell past every scalar-list arm to the i32-list catch-all at the
   // bottom of each cascade, so an INFERRED binding (`const xs = [fv]`) and a generic
   // `T[]` argument (`gfirst([fv])`) built an i32 backing over f32 elements — check-clean
-  // INVALID WASM. `tyIsF32Array` above cannot answer for it: the checker carries no
-  // f32-array KIND (a float literal types f64), which is exactly why the syntactic arm
-  // is the one that has to.
+  // INVALID WASM. The arena cannot answer for it either, and this is the arm the
+  // `tyIsF32ArrayShape` leg must never pre-empt: a float literal types f64, so a literal in a
+  // union context carries the union's `f32[]` ARM as its recorded type while still BUILDING
+  // the f64 list. Only the syntactic test knows which of the two it is.
   if e is ArrayLit { return arrLitIsF32(exprIx, fnIx) }
   if e is Paren { return exprF32Array(e.parInner, fnIx) }
   if e is Ident {
@@ -26391,13 +26406,29 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
     }
     // A CAPTURED f32-list read (incl. a boxed captured-mutated `f32` local). Kind 21 = f32 list.
-    return capturedKindOf(fnIx, e.identName) == "f32list"
+    if capturedKindOf(fnIx, e.identName) == "f32list" { return true }
+    // THE ARENA LEG. Every rung above answers off a NAME whose declared kind is the bare
+    // `f32[]`, so none of them answers for the nullable niche: a `const w: f32[] | null`
+    // declares `"nulf32list"`, and `declaredF32Array` / `paramF32Array` / `globalIsF32ArraySid`
+    // all decline it. The checker records the NARROWED type on the read inside `if w != null`,
+    // and that recorded type is the plain `f32[]` — which is exactly the signal `exprF64Array`
+    // has had at the top of the function all along and this one had no working form of.
+    //
+    // A name is a sound place for it: the ident's CELL rep was fixed by its own declaration,
+    // and the arena only ever narrows that declaration (`f32[] | null` -> `f32[]`), never
+    // re-reps it. An UN-narrowed read keeps its `TyNullable` recorded type and is still
+    // declined here, so the loud reject the audit worried about trading away is untouched.
+    return tyIsF32ArrayShape(nodeTyIxOf(exprIx))
   }
   // A struct-field READ of an `f32[]` field (code 27) — the checker's per-node type does not always
   // carry f32[] through a member, so recognize it directly by the field code (the f64/i64 duals get
   // this from their typed-IR fast path; this keeps f32 fields on par).
   if e is Member {
     if memberFieldCode(exprIx, fnIx) == 27 { return true }
+    // The NULLABLE-field niche (`{ f: (f32[] | null) }`), narrowed in place — `w.f.length`
+    // inside `if w.f != null`. The field's own code is the nullable one, so the code-27 rung
+    // above declines; the arena leg answers from the narrowed read, as it does for an ident.
+    return tyIsF32ArrayShape(nodeTyIxOf(exprIx))
   }
   if e is Call {
     // `xs.map(f)` / `xs.filter(p)` whose result element is f32 (mf-result kind 13) — a `.map`
@@ -26424,9 +26455,9 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     }
     // A CURRIED / composed value call (`t0()(1)` — the callee is itself a Call): the
     // checker's recorded RESULT type decides. Reliable here, unlike a general typed-IR
-    // claim (see `tyIsF32Array`'s note — a float LITERAL types f64): a call result's
+    // claim (see `tyIsF32ArrayShape`'s note — a float LITERAL types f64): a call result's
     // f32-ness comes from the callee's functype, not a literal's default.
-    return callResTyIsF32Array(nodeTyIxOf(exprIx))
+    return tyIsF32ArrayShape(nodeTyIxOf(exprIx))
   }
   // `g[i]` over an `f32[][]` (ref-list element kind 10 — the inner f32-list wrapper) yields an
   // `f32[]`, so `g[i][j]` reads the f32 scalar.

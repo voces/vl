@@ -44,7 +44,9 @@ repro rather than a paraphrase:**
 | D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
 | D16 D7 D6 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
 | D17 D18 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below; one root, one change) |
-| D9 D12 D13 D14 D15 D19 | various | as filed, still live |
+| D14 | loud emit reject | **runs — CLOSED 2026-08-25** (below) |
+| D9 D12 D13 D15 D19 | various | as filed, still live |
+| D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14, because it is what D14's residue turned out to be (360 cells, every list rep, not f32-specific) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -80,13 +82,18 @@ evaluation-count oracle at 1. Pins: `tests/cases/closures/error-is-functype-slot
 grader was re-validated against the final compiler first (`sabotage.py` → 12 wrong_value /
 8 wrong_evalcount / 6 trap / 4 correct, exactly as published).
 
-| | `c31e9fae` | D6 alone | merged (D7 #1924 + D6) |
-|---|---|---|---|
-| correct | 6,895 | 6,907 | **6,909** |
-| check-clean invalid wasm | 6 | 2 | **0** |
-| loud check reject | 1,199 | 1,199 | 1,199 |
-| loud emit reject | 1,026 | 1,018 | **1,018** |
-| **SILENT TOTAL** | **6** | **2** | **0** |
+| | `c31e9fae` | D6 alone | merged (D7 #1924 + D6) | + D14 |
+|---|---|---|---|---|
+| correct | 6,895 | 6,907 | **6,909** | **7,083** |
+| check-clean invalid wasm | 6 | 2 | **0** | **0** |
+| loud check reject | 1,199 | 1,199 | 1,199 | 1,199 |
+| loud emit reject | 1,026 | 1,018 | **1,018** | **844** |
+| **SILENT TOTAL** | **6** | **2** | **0** | **0** |
+
+The `+ D14` column is a real re-run of the same 9,126 cells on the closing branch, with its
+own baseline re-run on the same tree (which reproduced the `merged` column exactly). Cell for
+cell, **174 cells moved, every one `loud_emit_reject → correct`, all of them `list_f32`** —
+see D14 below.
 
 Cell-by-cell against `c31e9fae`, **14 cells moved and every one of them improved** — 6
 `invalid_wasm → correct` and 8 `loud_emit_reject → correct`. Nothing moved the other way,
@@ -200,7 +207,7 @@ column exists and would fire; it simply never did.
 | list_str | 377 | 253 | 0 | 50 | 74 |
 | list_f64 | 355 | 253 | 0 | 28 | 74 |
 | list_i64 | 340 | 244 | 0 | 24 | 72 |
-| list_f32 | 340 | 76 | 0 | 24 | 240 |
+| list_f32 | 340 | 76 -> **250** | 0 | 24 | 240 -> **72** |   *(D14, closed 2026-08-25; re-measured baseline on the closing branch was 76 / 0 / 18 / 246)*
 | list_ref | 365 | 218 | 0 | 53 | 94 |
 | closure | 331 | 31 | 0 | 252 | 48 |
 | map_str | 371 | 257 | **4** | 50 | 60 |
@@ -866,8 +873,8 @@ NAMED alias (`type K = "p" | "q"` … `const xs: K[] = [src2()]`); the same call
 
 ---
 
-### D14 — `f32[] | null` (audit row R2) is still loud at every operation
-**loud emit reject · 140 cells carry `field access but no struct type declared`; list_f32 is 240 loud-emit cells of 340**
+### D14 — [CLOSED 2026-08-25] `f32[] | null` (audit row R2) was loud at every operation
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 140 cells carry `field access but no struct type declared`; `list_f32` was the worst-served rep in the whole sweep, 76 correct of 340**
 
 Repro:
 
@@ -881,9 +888,77 @@ Repro:
 
 Controls, both correct: the `f64[] | null` twin; the non-nullable `f32[]`.
 
-* Re-measured, unchanged from the audit's R2. Recorded with a fresh count so the next
-  reader does not re-derive it: `list_f32` is the worst-served rep in the sweep, 76 correct
-  of 340.
+**THE DIVERGENCE SITE WAS ONE FUNCTION, AND THE `f64` TWIN ALREADY CONTAINED THE ARM.**
+`exprF64Array` opens with `tyIsF64Array(nodeTyIxOf(exprIx))` — it trusts the type the CHECKER
+recorded, which on a read inside `if v != null` is the narrowed, non-null `f64[]`, and every
+position rides that one line. `exprF32Array` opened with `tyIsF32Array`, spelled
+`tyKindOf(ty) == 21` against a helper whose return set is {-1,0,2,3,7,10,11,12,13,20} — a
+CONSTANT FALSE that read like the same fast path. Every remaining rung in it asks a NAME
+(`declaredF32Array` / `paramF32Array` / `globalIsF32ArraySid` / `capturedKindOf`), and a
+`f32[] | null` name declares `"nulf32list"`, which none of them accepts. So the narrowed read
+fell past the entire list ladder to the struct-field floor and reported the generic
+field-access message — at every position at once, which is why this row was 174 cells wide
+while the other nullable niches were narrow.
+
+The arena CAN answer, structurally (`TyArray` -> `TyPrim "f32"`); that test already existed
+one screen up as `callResTyIsF32Array`, scoped to curried-call results. It is now
+`tyIsF32ArrayShape` and is attached to `exprF32Array`'s **IDENT** and **MEMBER** arms.
+
+**NOT at the top of the function — that placement is wrong twice, and both were measured.**
+Enabling it there reaches the same 250/340, and breaks two pinned corpus fixtures:
+
+| shape | fixture | what the top placement does |
+|---|---|---|
+| `ArrayLit` | `unions/f32-list-union-member.vl` | `const g: f32[] \| string = [63.5]` records the union's `f32[]` ARM on the literal while the literal still BUILDS the f64 list — the coerce is what re-encodes it. Claiming the literal skips the coerce and boxes an `(ref $fl64)` payload under the f32-list atom tag: `wasm trap: cast failure`. |
+| `Index` | `arrays/nested-array-inferred-empty-unsupported-leaf.vl` | an element read's rep comes from the CONTAINER's interned row, and the inferred-empty nested-array synthesis DECLINES an `f32[]` leaf on purpose (`tyNestedArrLeafSupported`). Claiming `outer[0]` turns that pinned loud decline into check-clean INVALID WASM. |
+
+The second is the severity regression #1467 warned about, reproduced exactly: a partial fix
+that converts a loud reject into a silent miscompile is site 1 of N, not a fix. Restricting
+the leg to the two node shapes whose cell rep the declaration already fixed keeps both
+fixtures at their pinned verdicts and still moves all 174 cells.
+
+**Before / after, same 340 `list_f32` cells, same harness** (`correct` / denominator; the
+`list_f64` column is the twin measured on the same run):
+
+| position | before | after | `list_f64` |
+|---|---|---|---|
+| const_local | 14 / 40 | **40 / 40** | 40 / 40 |
+| let_local | 6 / 16 | **16 / 16** | 16 / 16 |
+| param | 6 / 28 | **28 / 28** | 28 / 28 |
+| ret_ann | 6 / 28 | **28 / 28** | 28 / 28 |
+| ret_unann | 6 / 16 | **16 / 16** | 16 / 16 |
+| global | 6 / 28 | **28 / 28** | 28 / 28 |
+| field | 6 / 28 | **28 / 28** | 28 / 28 |
+| field_place | 0 / 8 | **8 / 8** | 8 / 8 |
+| elem | 6 / 28 | **28 / 28** | 28 / 28 |
+| mapget | 0 / 8 | **8 / 8** | 8 / 8 |
+| mapval | 0 / 28 | **2 / 28** | 2 / 28 |
+| capture | 4 / 28 | 4 / 28 | 4 / 28 |
+| loopvar | 4 / 28 | 4 / 28 | 4 / 28 |
+| callres | 12 / 12 | 12 / 12 | 12 / 12 |
+| elem_place | 0 / 8 | 0 / 8 | 0 / 8 |
+| mapval_place | 0 / 8 | 0 / 8 | 0 / 8 |
+| **TOTAL** | **76 / 340** | **250 / 340** | **250 / 340** |
+
+174 cells moved and **every one of them was `loud_emit_reject` -> `correct`**; nothing moved
+the other way and the rep's SILENT total stayed 0. Joined coordinate-for-coordinate against
+`list_f64` the two reps now differ on **0 of 340** cells — the residue (capture, loopvar,
+mapval, the two `*_place` check rejects) is shared with `f64` and is therefore not this row.
+**That residue is now filed as D20**, re-probed per (position, rep): it is a nullable-list
+niche with no rep at three positions, 360 cells across every list rep, and nothing in this
+fix touches it.
+Corpus byte-identity across the whole `tests/cases` tree: **2,232 of 2,233 identical**, the
+single mover being the new fixture, which the old compiler cannot emit at all.
+
+* Pin: `tests/cases/arrays/nullable-f32-list-narrowed-positions.vl` (one narrowed read per
+  moved position, with the lint hints DECLARED rather than the annotations deleted — each
+  annotation IS the position under test).
+* **FULL GRID, before and after on the closing branch**: `correct` **6,909 -> 7,083**, loud
+  emit **1,018 -> 844**, loud check 1,199 -> 1,199, SILENT TOTAL **0 -> 0**. Cell for cell,
+  exactly those 174 cells moved and nothing else in the other 21 reps did.
+* **THE CORPUS WAS BLIND TO THIS, and the byte-identity number is the proof**: all 2,232
+  pre-existing fixtures emit byte-identical modules, because not one of them narrowed an
+  `f32[] | null`. A rep-by-position grid found it; no amount of corpus green would have.
 
 ---
 
@@ -1114,6 +1189,52 @@ Control — the SAME seven lines inside a function print `1` / `absent`:
 
 ---
 
+### D20 — a NULLABLE LIST is a loud emit reject at `capture`, `loopvar` and `mapval` — for every list rep
+**loud emit reject · 360 cells over the nullable leg of the six list reps · filed 2026-08-25 while closing D14, because it is what D14's residue turned out to be**
+
+Repro:
+
+    function mk(): f64[] | null { return [1.5, 2.5] }
+    function body() {
+      const w: f64[] | null = mk()
+      const f = () => {
+        if w != null { print(w.length) } else { print("N") }
+      }
+      f()
+    }
+    body()
+    // vl check rc 0; vl run: emitProgram: bare null needs a struct-typed context
+
+Controls, both correct: the same capture with the list made NON-nullable (`f64[]`); the same
+capture over the SHARED-backing `i32[] | null`, which is clean at this position.
+
+**THIS IS NOT D14 AND IT IS NOT f32-SPECIFIC**, which is the whole reason it is filed
+separately. When D14 closed, `list_f32` reached exact parity with `list_f64` — 0 differing
+cells of 340 — and the cells that stayed loud stayed loud in BOTH. Re-probed one program per
+(position, rep) against the current compiler:
+
+| position | `i32[]` | `S[]` | `string[]` | `i64[]` | `f64[]` | `f32[]` | message |
+|---|---|---|---|---|---|---|---|
+| capture | runs | runs | LOUD | LOUD | LOUD | LOUD | `bare null needs a struct-typed context` |
+| loopvar | runs | LOUD | LOUD | LOUD | LOUD | LOUD | `bare null needs a struct-typed context` |
+| mapval | LOUD | LOUD | LOUD | LOUD | LOUD | LOUD | `unsupported map value type` |
+
+* **Flat on**: the list's ELEMENT type, except that the shared i32-list backing escapes at
+  `capture` and `loopvar` (and `S[]` escapes at `capture` only). `mapval` declines for every
+  rep including `i32[]`, and its message is an explicit capability decline — *"no rep for a
+  union-member struct, a nullable list, or a nullable litunion-result closure"*.
+* **Varies on**: nullability. The non-nullable list is clean at all three positions.
+* Grid counts, nullable leg only: capture **96**, loopvar **120**, mapval **144** loud-emit
+  cells. Message split across the three: 144 `unsupported map value type`, 144 `bare null
+  needs a struct-typed context`, 72 `` `is` test but no union type declared`` — three messages
+  for one axis, which is §3's message-identity warning again.
+* **Do not read the size of this row as difficulty.** It is bigger than D14 was and it is a
+  different shape: D14 was one classifier missing an arm its twin had, and this is a niche
+  with no rep at three specific positions. Nothing in D14's fix touches it — the D14 branch
+  moved 174 cells and not one of them was at these positions.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
@@ -1186,8 +1307,10 @@ and one corpus fixture, all four of which asserted the false half.
 
 ### Not shared, though it looks it
 `f32[] | null` (D14) is NOT part of Root A or D despite also being a nullable niche: its
-failure is in the typed-IR read path (`exprF32Array`, audit R2) and it fails at every
-position including the ones where the other niches are clean. Filed separately.
+failure is in the typed-IR read path (`exprF32Array`, audit R2) and it failed at every
+position including the ones where the other niches are clean. Filed separately — and
+**CLOSED 2026-08-25** on its own, without touching either root, which is the separation
+confirmed rather than merely asserted.
 
 ## 4. NOT A DEFECT
 
