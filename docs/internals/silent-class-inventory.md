@@ -2812,7 +2812,10 @@ with `struct.new 1` pushing a `(ref 1)` into it in both — which is precisely t
 "expected (ref null $type), found (ref $type)", two DIFFERENT heap types behind one
 placeholder.
 
-**GRID — 480 cells, master `a80c6717` vs this branch.** Axes: twin presence (none / exact
+**GRID — 480 cells, master vs this branch, RUN TWICE.** Once against `a80c6717` and again
+against `da133669` after D30 merged into this branch — same 280/140/60 → 420/0/60 both times,
+so D30's fix and this one do not interact and the numbers below are the merged tree's, not
+inherited from the earlier baseline. Axes: twin presence (none / exact
 layout twin / same-arity different-field-NAME / same-field different-TYPE / minted only by a
 `std:array` generic instance) × consumption (element read / element written via `push` /
 nested `Circle[][]` / map value / struct field / parameter / return / captured) ×
@@ -2850,9 +2853,13 @@ branch has ZERO silent cells on the grid. The axes reproduce the filed controls 
   is 28/32 at all three, because the monomorphizer's anonymous `#anonN` row is not something
   a declaration can take away.
 
-**CORPUS BYTE-IDENTITY.** 1,834 of the 2,258 `tests/cases/*.vl` compile under both master's
-seed and this branch's, and all 1,834 are **BYTE-IDENTICAL**: 0 byte-different, 0 lost the
-ability to compile, 0 gained it. The gate fires where the defect was and nowhere else.
+**CORPUS BYTE-IDENTITY**, also re-baselined against `da133669`: 1,834 of the 2,260
+`tests/cases/*.vl` compile under both seeds, and **exactly 2 are byte-different — this
+change's own two pins**, with 0 lost and 0 gained. The 2 are the point rather than a
+blemish: a program carrying this defect still COMPILES (the engine refuses it at LOAD), so an
+affected corpus file shows up as byte-different rather than as newly-compiling, and these are
+the only two the corpus has. Measured before the fixtures existed the same sweep read 0
+byte-different over 2,258 files. The gate fires where the defect was and nowhere else.
 
 Pinned TWICE: `tests/cases/unions/variant-element-list-beside-layout-twin.vl` (seven
 consumptions, no import and no generic), and `circleList` in
