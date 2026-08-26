@@ -1,0 +1,156 @@
+// @run
+// @log 9
+// @log 3
+// @log 9
+// @log 5
+// @log 9
+// @log -1
+// @log -1
+// @log 5
+// @log 5
+// @log 7
+// @hint redundant type annotation: `gm` is inferred as `{[string]: i32}`
+// @hint redundant type annotation: `rm` is inferred as `{[string]: S}`
+// @hint redundant type annotation: `lm` is inferred as `{[string]: S}`
+// @hint redundant type annotation: `gf` is inferred as `(i32) => i32`
+// @hint redundant type annotation: `ga` is inferred as `(i32) => i32`
+// @hint redundant type annotation: `gb` is inferred as `(i32) => i32`
+// A function whose body's LAST statement is an ASSIGNMENT returns the TARGET CELL, and
+// this file pins the four cell KINDS that a decline list used to hand to the `i32` default
+// instead: `closure`, `map`, `nulmap` and `nulstr` (D27 / D28 / D29, #1938).
+//
+// WHY THIS FIXTURE COULD NOT BE WRITTEN BEFORE. Each row below was check-clean INVALID
+// WASM — `vl check` rc 0, and the engine refusing the module with `type mismatch: expected
+// i32, found (ref $type)`, where the `expected i32` was `fnAssignKindGuard`'s own fallback.
+// D27's filing says so in as many words: "an `@error`/`@run` row cannot express 'check-clean
+// invalid module'". Naming the kinds is what turns the class into something `@run` can hold,
+// so the pin and the fix are the same change.
+//
+// THE PAYLOAD COLUMN IS THE OTHER HALF, and the `mapref` rows are what pin it. A map cell's
+// result valtype needs its VALUE SHAPE beside the kind (`fnAssignCellMapShape`), not a
+// struct index: name `map` without it and `fbValtype` resolves `mapTypeIdxOf(-1)` — the MONO
+// `$mapStruct` — under a `{[string]: S}` body. Measured while landing this: with the kind
+// named and the shape missing, 8 cells of a 144-cell lambda-producer grid went `runs ->
+// check-clean invalid wasm`, the only backward move of the whole change. The `refMapLam`
+// row below is one of those 8.
+//
+// CONSUMPTION IS ITS OWN AXIS and the rows are split on it deliberately. A map result is
+// bound and READ here (the strongest available pin — a wrong `$mapStruct` shows up at the
+// read, not just at validation). A CLOSURE result cannot be: `const r = f()  r(4)` is a
+// loud `emitProgram: call to unknown function`, a separate open gap, so the closure and
+// niche rows call the function for effect and then read the CELL, which proves the module
+// validated and the store landed.
+//
+// THE ANNOTATIONS ARE THE AXIS, so the six redundant-annotation hints are DECLARED rather
+// than removed. `letCellKind` takes its ANNOTATED arm (`vtKindOfType`) when `letType >= 0`
+// and its INITIALIZER arm (`letInitCellKind`) otherwise, and those are two different
+// ladders; dropping the annotations here would silently move every row to the other one.
+type S = { n: i32 }
+
+function mkF(): (i32) => i32 { return (x) => x + 1 }
+function mkG(): (i32) => i32 { return (x) => x + 5 }
+
+function mkM(v: i32): {[string]: i32} {
+  const m: {[string]: i32} = Map()
+  m["k"] = v
+  return m
+}
+
+function mkR(v: i32): {[string]: S} {
+  const m: {[string]: S} = Map()
+  m["k"] = { n: v }
+  return m
+}
+
+// ── `map`, mono value type — a module GLOBAL cell, straight-line tail, result CONSUMED ──
+let gm: {[string]: i32} = mkM(3)
+
+function bumpGlobalMap() { gm = mkM(9) }
+
+print(bumpGlobalMap()["k"] ?? 0)
+
+// ── `map`, REF-VALUED — an annotated LOCAL, `return (g = e)`, result consumed and READ.
+// The read is the point: a mono-vs-ref `$mapStruct` mismatch surfaces here.
+function bumpLocalRefMap() {
+  let rm: {[string]: S} = mkR(3)
+  return (rm = mkR(3))
+}
+
+const rmv = bumpLocalRefMap()["k"]
+if rmv != null { print(rmv.n) } else { print(-1) }
+
+// ── `map`, REF-VALUED — the LAMBDA producer (`cloRetValKind` / `cloRetValSlot`), whose
+// slot comes from `fnAssignRetSlot` rather than from the return expression.
+const refMapLam = () => {
+  let lm: {[string]: S} = mkR(3)
+  lm = mkR(9)
+}
+
+const lmv = refMapLam()["k"]
+if lmv != null { print(lmv.n) } else { print(-1) }
+
+// ── `closure` — a module GLOBAL cell. The result is not consumed (that is a separate,
+// still-open gap); the CELL is read afterwards, which is what proves the store landed
+// through a module the engine accepted.
+let gf: (i32) => i32 = mkF()
+
+function bumpGlobalClosure() { gf = mkG() }
+
+bumpGlobalClosure()
+print(gf(0))
+
+// ── `closure` — a PARAM cell, `return (p = e)`. Same shape, second storage class.
+function bumpParamClosure(pf: (i32) => i32) { return (pf = mkG()) }
+
+bumpParamClosure(mkF())
+print(gf(4))
+
+// ── `nulstr` (D29) — a `string | null` GLOBAL assigned `null`. The re-read this return
+// value IS must keep the RAW nullable ref, which is what `emitReturnValue`'s
+// `fnAssignRetKind` seed buys; recovering non-null here TRAPS on exactly this program.
+let gs: string | null = "hi"
+
+function clearGlobalStr() { gs = null }
+
+clearGlobalStr()
+if gs != null { print(gs.length) } else { print(-1) }
+
+// ── `nulmap` — a `{[string]: i32} | null` GLOBAL assigned `null`, same shape one kind over.
+let gn: {[string]: i32} | null = mkM(1)
+
+function clearGlobalNulMap() { gn = null }
+
+clearGlobalNulMap()
+if gn != null { print(gn.size) } else { print(-1) }
+
+// ── THE IF-ARM JOIN over TWO DIFFERENT cells of one kind — the only spelling that reaches
+// `fnAssignCellEq`, because `ifTailArmAgrees` short-circuits on `nm == nm0` when both arms
+// name the same cell. A declined kind never agreed, so the join declined with it.
+let ga: (i32) => i32 = mkF()
+let gb: (i32) => i32 = mkF()
+
+function bumpEither(c: boolean) {
+  if c { ga = mkG() } else { gb = mkG() }
+}
+
+bumpEither(true)
+bumpEither(false)
+print(ga(0))
+print(gb(0))
+
+// ── the CONSTRUCTOR seed under an if-arm tail. `emitReturnValue`'s inferred-map arm reads
+// `mapRetExprShape` over `fnRetExprOf`, which is -1 for a tail `if` — so the seed never
+// fires here and the `Map()` build is left to `emitAssign`'s TARGET-CELL seed. This row is
+// the witness that the two ladders cannot disagree, and it is check-clean invalid wasm on
+// master (`expected i32, found (ref $type)`, offset 422).
+let ca: {[string]: S} = Map()
+let cb: {[string]: S} = Map()
+
+function reseed(c: boolean) {
+  if c { ca = Map() } else { cb = Map() }
+}
+
+reseed(true)
+ca["k"] = { n: 7 }
+const cav = ca["k"]
+if cav != null { print(cav.n) } else { print(-1) }

@@ -1,0 +1,77 @@
+// @no-instantiate
+// MISCOMPILE, pinned: `std:array`'s `reduce` instantiated TWICE in one program — once with a
+// UNION accumulator (`Shape`) and once with an accumulator that is one of that union's own
+// MEMBER structs (`Circle`). `vl check` exits 0 with no diagnostic at any severity and is the
+// ONLY command that misses it — `vl build` writes the `.wasm` and exits 1, `vl check
+// --codegen` exits 1, `vl run` exits 1. The engine refuses the module at load —
+//
+//   (wasmtime) wasm[0]::function[16]::circleFold$m0 … type mismatch:
+//              expected (ref $type), found (ref $type)   (at offset 0x29e)
+//
+// — and the two `$type`s are DIFFERENT heap types printed by the same placeholder, which is
+// the tell: this is not a nullability complaint and there is no `| null` anywhere in the file.
+//
+// THE HEAP-TYPE TWIN AT A MONOMORPHIZED INSTANCE'S RESULT. `Circle` owns two structurally
+// identical rows — the plain struct row (`sHeapIdx`) and the union-ARM row (`uVarHeap`) — and
+// the two tables never cross-dedup. `wasm-tools print` of `circleFold`:
+//
+//     (func (;16;) (type 14) (param structref) (result i32)
+//       (local (ref 2) (ref 0) (ref 9))     ;; local 1 = the Circle VALUE, local 2 = `out`
+//       i32.const 5
+//       struct.new 2                        ;; the literal builds heap type 2
+//       …
+//       call 8                              ;; the A = Circle instance: (ref 2) -> (ref 2)
+//       local.set 2                         ;; …into a local DECLARED (ref 0)
+//       local.get 2
+//       struct.get 0 0                      ;; and read back through heap type 0
+//
+// The instance's parameter, body and result agree with each other on `(ref 2)`; it is the
+// `const out` BINDING's slot that resolved `Circle` through the other table.
+//
+// CONTROLS, all of which RUN: either accumulator ALONE; two DISTINCT struct accumulators
+// (`Circle` + `Sq`) with no union in the program; the union accumulator beside a NON-MEMBER
+// struct accumulator (`Other`); and the same pair with the member-struct result taken as
+// `return reduce(…).r` instead of through a `const out` binding — with no binding there is
+// no second resolution to disagree with.
+//
+// DISTINCT FROM D25, which this file REPLACED as `tests/vl_check_codegen_test.ts`'s live
+// `INVALID_MODULE_SRC` specimen: that one needed a NARROWED argument riding a generic RESULT
+// and is closed (`tests/cases/soundness/generic-narrowed-arg-pin.vl`). This one has no
+// narrowing and no nullability at all — the disagreement is between two heap-type TABLES for
+// one nominal type, not between two channels answering about one value.
+//
+// It is `silent-class-inventory.md` D26. WHEN IT IS FIXED this file starts failing (the
+// module instantiates), which is the point: delete it, graduate a `@run` row, and swap
+// `INVALID_MODULE_SRC` for another live member of the class — the instruction that file has
+// carried through nine specimens.
+// @hint redundant type annotation: `circleFold` is inferred as `i32`
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `shapeFold` is inferred as `i32`
+import { reduce } from "std:array"
+
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+
+function bumpC(acc: Circle, x: i32): Circle { return { r: acc.r + x } }
+
+function bump(acc: Shape, x: i32): Shape {
+  if acc is Circle { return { r: acc.r + x } }
+  return acc
+}
+
+function circleFold(): i32 {
+  const c: Circle = { r: 5 }
+  const out = reduce([1, 2], bumpC, c)
+  return out.r
+}
+
+function shapeFold(): i32 {
+  const s: Shape = { r: 1 }
+  const out = reduce([1, 2], bump, s)
+  if out is Circle { return out.r }
+  return -2
+}
+
+print(circleFold())
+print(shapeFold())

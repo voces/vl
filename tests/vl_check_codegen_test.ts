@@ -192,39 +192,62 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // the two reps the pin still cannot NAME are loud now
 // (`…/error-generic-nulreflist-field-pin.vl`, `…/error-generic-u8-list-pin.vl`).
 //
-// THIS SPECIMEN IS THE ONE CELL THAT SURVIVED THAT SWEEP, and it survived because it is not a
-// question about one boundary at all. A narrowed `Circle | null` handed to a generic identity
-// `<T>(x: T): T` comes back out with the instance's declared result type — and the pin read the
-// PARAMETER's annotation (`Circle | null`), while the checker had already typed the narrowed
-// expression `Circle`. So the value that flows on is the `(ref null $uVarHeap[vi])` niche where
-// the consumer's `Shape` parameter wants the `(ref $uBox)`: two channels answering one question
-// about one call, each correctly for the question it was asked. Deciding which channel owns a
-// narrowed argument's type is a design question, not a missing arm, which is why it is filed
-// (`silent-class-inventory.md` D25) rather than fixed beside the others. Pinned as
-// `tests/cases/soundness/xfail-miscompile-generic-roundtrip-nulvariant.vl`.
-const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
+// The specimen that survived that sweep was the NARROWED-ARGUMENT cell (D25): a narrowed
+// `Circle | null` handed to a generic identity `<T>(x: T): T` came back out with the
+// instance's declared result type, because the pin read the PARAMETER's annotation
+// (`Circle | null`) while the checker had already typed the narrowed expression `Circle`.
+// That is closed and it took a RULING rather than an arm (`DECISIONS.md`, "which channel
+// owns a narrowed argument's type"): the instance's RESULT now substitutes through the same
+// column its parameter slot and body bindings take, so an instance is a function of its
+// registry key, and a narrowed argument pins the narrowed spelling wherever that spelling is
+// one of the annotation's own members. Its grid is
+// `tests/cases/soundness/generic-narrowed-arg-pin.vl`, all 24 cells running, and it reddened
+// this file exactly as intended.
+//
+// THIS SPECIMEN NEEDS NEITHER NARROWING NOR NULLABILITY, which is what made it the right
+// next one: `std:array`'s `reduce` instantiated twice in one program, once with a UNION
+// accumulator (`Shape`) and once with an accumulator that is one of that union's own MEMBER
+// structs (`Circle`). `Circle` owns two structurally identical heap rows — the plain struct
+// row (`sHeapIdx`) and the union-ARM row (`uVarHeap`) — and the two tables never cross-dedup,
+// so the instance agrees with itself on `(ref 2)` throughout while the `const out` BINDING's
+// slot resolved `Circle` through the other table and reads it back as `(ref 0)`. Taking the
+// same call inline (`return reduce(…).r`) runs, because with no binding there is no second
+// resolution to disagree with. `silent-class-inventory.md` D26; pinned as
+// `tests/cases/soundness/xfail-miscompile-reduce-union-and-member-struct-accum.vl`.
+//
+// THE NEXT SPECIMEN IS NAMED HERE RATHER THAN LEFT TO BE RE-DERIVED, because D26 is being
+// worked on and this constant has twice ended up naming a program someone was already
+// repairing. When it closes, take `silent-class-inventory.md` **D30** — the CALLER's view of
+// an inferred REF-VALUED map return from an if-arm TAIL assignment, 16 cells of a 192-cell
+// grid, filed by #1938 and deliberately NOT fixed there (routing `fnRetMapShapeSid` through
+// `inferredRetMapSlot` opens an unbounded recursion, so it needs a visited-set of its own).
+// It was RUN against this tree, not assumed: `vl check` rc 0 with two redundant-annotation
+// hints, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref null $type),
+// found (ref $type)` at offset 0x493, and NO `emit error` marker — which is every property
+// the three assertions below need. It has no `@no-instantiate` pin yet, so pin it in the
+// same commit or the tripwire at the foot of this file goes red.
+const INVALID_MODULE_SRC = `import { reduce } from "std:array"\n` +
+  `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
-  `\n` +
-  `export function area(sh: Shape) {\n` +
-  `  if sh is Circle { return sh.r }\n` +
-  `  return 0\n` +
+  `function bumpC(acc: Circle, x: i32): Circle { return { r: acc.r + x } }\n` +
+  `function bump(acc: Shape, x: i32): Shape {\n` +
+  `  if acc is Circle { return { r: acc.r + x } }\n` +
+  `  return acc\n` +
   `}\n` +
-  `\n` +
-  `function idg<T>(x: T): T {\n` +
-  `  return x\n` +
+  `function circleFold(): i32 {\n` +
+  `  const c: Circle = { r: 5 }\n` +
+  `  const out = reduce([1, 2], bumpC, c)\n` +
+  `  return out.r\n` +
   `}\n` +
-  `\n` +
-  `function mkc(): Circle | null {\n` +
-  `  return { r: 5 }\n` +
+  `function shapeFold(): i32 {\n` +
+  `  const s: Shape = { r: 1 }\n` +
+  `  const out = reduce([1, 2], bump, s)\n` +
+  `  if out is Circle { return out.r }\n` +
+  `  return -2\n` +
   `}\n` +
-  `\n` +
-  `function go(c: Circle | null) {\n` +
-  `  if c is Circle { return area(idg(c)) }\n` +
-  `  return -1\n` +
-  `}\n` +
-  `\n` +
-  `print(go(mkc()))\n`;
+  `print(circleFold())\n` +
+  `print(shapeFold())\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

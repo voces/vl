@@ -52,8 +52,11 @@ repro rather than a paraphrase:**
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 | D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class. THREE roots at three layers, separated by an ABLATION and not by argument — a missing BOX, a misplaced one failing in the opposite direction at the same seam, and the monomorphizer's pin a whole layer earlier) |
-| D25 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the specimen hunt that closed the three above: a NARROWED argument's type does not ride the monomorphization pin. Needs a ruling on which channel owns it, not an arm |
+| D25 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the ruling is in `DECISIONS.md`. The row named ONE cell and a 187-cell grid found **53**: neither filed option won — the argument-node channel moved 6 cells loud→silent, the annotation channel left 8. Two rungs, 0 silent) |
 | D26 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the `std-api-reviewer` pass over D24's retirement: a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in ONE program. No narrowing, no nullability — the heap-type TWIN at a monomorphized instance's result |
+| D27 D28 D29 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root — `fnAssignKindGuard`, a five-entry decline list whose `null` restored the caller's `i32` default. Four of its five recorded reasons were false and the fifth named a condition that was already available. The guard is deleted; 220 cells of three grids moved, every one forward) |
+| D30 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D27/D28/D29 by the if-arm-join grid that closed them: the CALLER's view of an inferred ref-valued map return, 16 cells the same change could not reach from the callee side |
+| D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -1775,13 +1778,16 @@ drifted, not a missing inference.
   worked — kept as the control that a future half-fix cannot pass on alone) and `tests/cases/functions/tail-assign-variant-cell-reject.vl`.
   `tests/cases/closures/capture-nullable-niche-storage-class.vl` is the ANNOTATED control
   the first is measured against — the two must not diverge again.
-* **WHAT THE `variant` RESULT OPENED, filed as D27 / D28 / D29.** Lifting that decline proved
-  `fnAssignKindGuard`'s `null` is not a no-answer but an `i32`. The four SURVIVING declines
-  were then each lifted ALONE over a 192-cell grid that is identical on master and on this
-  branch: **all 76 of its check-clean-invalid-wasm cells are caused by a decline**, 70
-  becoming correct programs and 6 a trap, 0 backward. Four of the five recorded reasons are
-  refuted by that measurement; only `nulstr`'s survives. Not fixed here — removing them
-  touches every consumer of the guard and needs its own before/after.
+* **WHAT THE `variant` RESULT OPENED, filed as D27 / D28 / D29 — ALL THREE CLOSED 2026-08-26
+  (#1938).** Lifting that decline proved `fnAssignKindGuard`'s `null` is not a no-answer but
+  an `i32`. The four SURVIVING declines were then each lifted ALONE over a 192-cell grid that
+  is identical on master and on this branch: **all 76 of its check-clean-invalid-wasm cells
+  are caused by a decline**, 70 becoming correct programs and 6 a trap, 0 backward. Four of
+  the five recorded reasons are refuted by that measurement. The fifth (`nulstr`) survived
+  THIS grid and did not survive the next one: its "the recover is UNCONDITIONAL" premise was
+  false — the recover is gated on `nulStrReadStaysRaw`, and the missing condition was that the
+  implicit-return-assignment position never declared itself a nullable-string target. The
+  guard is now DELETED outright, not shortened.
 
 ---
 
@@ -2009,8 +2015,8 @@ with D22. `std/array.vl`'s live-`reduce`-cell paragraph is retired.
 
 ---
 
-### D25 — a NARROWED argument's type does not ride the monomorphization pin
-**check-clean invalid wasm · filed 2026-08-26 by the specimen hunt that followed D22/D23/D24 · pre-existing, measured ON THE FILED FILE against the parent commit (rc 0 / rc 1 there too, with the pin's older `expected (ref $type), found i32`)**
+### D25 — [CLOSED 2026-08-26] a NARROWED argument's type does not ride the monomorphization pin
+**CLOSED 2026-08-26 — the repro RUNS (prints 5). Was: check-clean invalid wasm · filed 2026-08-26 by the specimen hunt that followed D22/D23/D24 · pre-existing, measured ON THE FILED FILE against the parent commit (rc 0 / rc 1 there too, with the pin's older `expected (ref $type), found i32`)**
 
 Repro:
 
@@ -2064,6 +2070,65 @@ same narrowed value handed to a generic that does not return it (`dstGen<T>(x: T
   $type)` at 0xe4. Same cell, same silence, one rung along.
 * Pinned as `tests/cases/soundness/xfail-miscompile-generic-roundtrip-nulvariant.vl` and it is
   `tests/vl_check_codegen_test.ts`'s live `INVALID_MODULE_SRC` specimen — the ninth.
+
+**CLOSED 2026-08-26, AND THE RULING IS IN `DECISIONS.md`** ("which channel owns a NARROWED
+argument's type at a monomorphization pin"). Read it there; what belongs here is the size of
+the row and what it cost to grade.
+
+**THE ROW NAMED ONE CELL AND THE GRID FOUND 53.** A 187-cell grid over generic-call shapes —
+type parameter in the result vs not · `is` / `!= null` / no narrow · fifteen argument reps ·
+six deliveries · four callee shapes — graded on the real outcome vocabulary:
+
+| | runs | loud check | loud emit | check-clean INVALID WASM | blockers (loud→silent) |
+|---|---|---|---|---|---|
+| master | 94 | 33 | 7 | **53** | — |
+| (a) the annotation owns it | 134 | 33 | 12 | **8** | 0 |
+| (b) the argument node owns it | 98 | 33 | 10 | **46** | **6** |
+| (c) shipped | **146** | 33 | 8 | **0** | 0 |
+
+* **THE `nulvariant` NICHE IS NOT THE AXIS.** `P | null`, `P[] | null`, `i32[] | null`,
+  `string | null`, `i32 | null`, `f64 | null`, `{[K]:V} | null` and a nullable CLOSURE all sit
+  in the same 53, and so does a shape with no nullability at all: a `Shape` PARAMETER narrowed
+  to the ARM `Circle` (`expected (ref $type), found (ref $type)` — the union BOX against the
+  variant row).
+* **IT WAS AN ORDER DEPENDENCE.** The registry is keyed on the pin NAMES; the RESULT was
+  substituted through the argument NODE's arena row, which the key does not carry. One
+  program, two function declarations swapped, nothing else changed: wide-call-first RUNS,
+  narrow-call-first is check-clean invalid wasm. The `Circle | null` twin moves between
+  running and a loud emit failure the same way. Both orders are in the graduated fixture.
+* **OPTION (b) IS DISQUALIFIED BY MEASUREMENT, NOT BY TASTE** — 6 cells loud→silent, which is
+  the blocker rule, plus 21 `runs`→invalid-wasm. Its breakage is exactly where this row
+  warned the node type is unreliable: a literal union's render softens to `string`, a nominal
+  `P` renders `{r:i32}`, a closure renders an arrow where the pin needs a `$fnsig` marker.
+* **WHAT SHIPPED IS TWO RUNGS**: the instance's RESULT substitutes through the same column its
+  parameter slot and body bindings take (so an instance is a function of its key), and a
+  narrowed argument pins the NARROWED spelling where that spelling is a top-level MEMBER of
+  the annotation's own union/nullable spelling and `monoAnnPinName` echoes it back unchanged.
+  The membership gate is what admits the narrow and excludes (b)'s breakage by construction.
+* **THE SAFETY PROPERTY WAS MEASURED, NOT ASSUMED.** A pin becomes the instance's parameter
+  annotation, so the question is whether a NON-generic function with that annotation already
+  lowers the same program. `function takeN(x: N): N` called with a `W` value narrowed to `N`
+  RUNS ON MASTER for all ten reps in the grid — the call boundary emits the `ref.as_non_null`
+  and the result is boxed for a union consumer. Pinning the WIDE spelling is equally legal and
+  lands the RESULT off that path, which is the whole of option (a)'s residue.
+* **FIVE CELLS ARE NOW LOUD RATHER THAN RUNNING**, and that is the intended floor: a narrowed
+  `P[] | null` and a narrowed nullable CLOSURE whose generic RESULT is then indexed / called
+  give `emitProgram: field access receiver is not a struct` and `emitProgram: callee is not a
+  function name`. Both were check-clean invalid wasm before.
+* **IT ROUTED A CORPUS CONTROL ONTO A SEPARATE ROOT, WHICH IS FILED AS D31 AND FIXED IN THE
+  SAME COMMIT.** Closing the pin put `generics/mono-nullable-arg-pin.vl`'s own `narrowed`
+  control on a generics-free master defect — a call ARGUMENT inheriting the enclosing
+  RETURN's nullable expectation. The two are independent (D31's witness has no generic in
+  it) and neither closes the other; they ship together only because the corpus reaches D31
+  through D25's fix.
+* **RE-MEASURED ON `d26c4421`** after #1938 closed D27/D28/D29 by deleting `fnAssignKindGuard`,
+  since that change touched `wasmEmit.vl`'s nullable-string return seeding, which is adjacent
+  to D31's fix. The whole 187-cell grid is **byte-identical at both baselines**: 53 silent on
+  `c99838a8` and 53 silent on `d26c4421`, 0 cells moved between them, and 0 silent with the
+  fix at either. The five loud-floor cells below are the same five, with the same messages.
+* Retired: `xfail-miscompile-generic-roundtrip-nulvariant.vl`. Graduated:
+  `tests/cases/soundness/generic-narrowed-arg-pin.vl` (24 cells). `INVALID_MODULE_SRC` moved
+  to D26 — see that row.
 
 ---
 
@@ -2132,8 +2197,11 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   runs; the union instance is what makes `Circle` resolve through `uVarHeap` at one end.
   This is precisely the interaction a single-instance grid cannot see, and it is the third
   time `std/array.vl`'s ledger has recorded a diagonal standing in for a cross product.
-* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid
-  module", and the class already has its live specimen in D25.
+* **PINNED 2026-08-26, AND IT IS NOW THE LIVE SPECIMEN.** D25 closed, so this row inherited
+  `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC` — the tenth. Its file is
+  `tests/cases/soundness/xfail-miscompile-reduce-union-and-member-struct-accum.vl`
+  (`@no-instantiate`), and the row was re-run verbatim against the D25 fix first: identical
+  rejection, identical offset 0x29e, so the pin closure did not move it.
   `tests/cases/std/array-reduce-narrowed-variant-init.vl` instantiates `reduce` at four
   accumulator types on purpose and says in its header which fifth one is missing and why.
 
@@ -2290,8 +2358,8 @@ Controls, each RUN:
 
 ---
 
-### D27 — a `closure` cell at an implicit-return assignment: the guard declines, the result valtype falls back to `i32`
-**check-clean invalid wasm · 18 of a 192-cell guard-decline grid, plus 16 of the 432-cell implicit-return assignment grid · filed 2026-08-26 while closing D21 · pre-existing, identical on master's `vl-compiler.wasm` and on D21's branch (same offset, same message)**
+### D27 — [CLOSED 2026-08-26] a `closure` cell at an implicit-return assignment: the guard declines, the result valtype falls back to `i32`
+**CLOSED 2026-08-26 (#1938) — the repro RUNS. Was: check-clean invalid wasm · 18 of a 192-cell guard-decline grid, plus 16 of the 432-cell implicit-return assignment grid · filed 2026-08-26 while closing D21 · pre-existing, identical on master's `vl-compiler.wasm` and on D21's branch (same offset, same message)**
 
 Repro:
 
@@ -2356,13 +2424,30 @@ Second control — the SAME program with an ANNOTATED return, correct. An annota
   loud `emitProgram: call to unknown function` — a different, already-known gap. The
   unconsumed half is silent because the checker never types the result, so nothing downstream
   notices the disagreement.
-* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid
-  module", and the class already has live specimens in D22 and `tests/vl_check_codegen_test.ts`.
+* Not pinnable in the corpus AS FILED: an `@error`/`@run` row cannot express "check-clean
+  invalid module". **THAT IS NO LONGER TRUE OF THIS ROW, AND THE PIN AND THE FIX ARE THE SAME
+  CHANGE** — the cells RUN now, so `tests/cases/statements/tail-assign-cell-kinds.vl` holds
+  them as an `@run` with real `@log` values. That fixture is check-clean invalid wasm on
+  master (`type mismatch: expected i32, found (ref $type)`, offset 2241) and prints its ten
+  lines on the branch.
+
+**CLOSING EVIDENCE (#1938).** `fnAssignKindGuard` is DELETED, not shortened;
+`fnAssignCellKind` answers each storage class directly. Three grids, master vs branch:
+
+| grid | cells | silent (master) | silent (branch) | moved | backward |
+|---|---|---|---|---|---|
+| straight-line (`g = e` / `return (g = e)`) | 192 | 76 | **0** | 76 | 0 |
+| if-arm join (both spellings) | 192 | 108 | 16 (D30) | 92 | 0 |
+| lambda producer (`cloRetValKind`) | 144 | 44 | **0** | 52 | 0 |
+
+Every one of the 220 moves is `check-clean invalid wasm → runs`, except 8 lambda cells that
+went `check-clean invalid wasm → loud emit reject` (the closure-result consumption gap, which
+is loud) and 8 that went `loud emit reject → runs`.
 
 ---
 
-### D28 — a `map` / `nulmap` cell at an implicit-return assignment, same root as D27
-**check-clean invalid wasm · 40 of a 192-cell guard-decline grid (32 `map`, 8 `nulmap`) · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch**
+### D28 — [CLOSED 2026-08-26] a `map` / `nulmap` cell at an implicit-return assignment, same root as D27
+**CLOSED 2026-08-26 (#1938) — the repro RUNS. Was: check-clean invalid wasm · 40 of a 192-cell guard-decline grid (32 `map`, 8 `nulmap`) · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch**
 
 Repro:
 
@@ -2412,10 +2497,28 @@ Control — the SAME program with the straight-line tail spelling instead of
   own filed note about the checker typing `x = e` as `e`'s UN-coerced type: a `null` RHS
   types as `null` and slips past the gate that catches the nullable one.
 
+**CLOSING EVIDENCE (#1938), AND THE HALF THE ROW DID NOT SEE.** The recorded reason named a
+hazard ("a named kind whose companion slot cannot be minted from the same binding") that the
+row then declared unreachable, on the strength of every `mapref` cell of the straight-line
+grid moving to `runs`. It IS reachable — one storage class over. `cloRetValSlot` routes the
+whole assignment-cell answer through `fnAssignRetSlot`, which answered `-1` for a map, so
+naming the kind pointed a `{[string]: S}` LAMBDA cell at the MONO `$mapStruct`. Measured:
+with the declines lifted and no slot arm, 8 cells of a 144-cell lambda-producer grid moved
+`runs → check-clean invalid wasm` — the ONLY backward move of the whole change, and one no
+grid in the filing covered. The straight-line grid is silent about it because
+`mapRetExprShape` falls through to the assignment node's recorded type there and happens to
+be right.
+
+The fix is the missing payload column, not a re-decline: `fnAssignCellMapShape` answers the
+cell's value shape per storage class (`letMapShapeOf` / `nulMapShapeOf` / `paramMapShape`),
+`fnAssignRetSlot` returns it for `map` / `nulmap`, and `inferredRetMapSlot` is the one home
+both the functype result (`emitFunctionSection`) and the in-body `Map()` seed
+(`emitReturnValue`) read. With it, the lambda grid moves 52 cells forward and 0 backward.
+
 ---
 
-### D29 — a `nulstr` cell at an implicit-return assignment: the one decline measurement CONFIRMS
-**check-clean invalid wasm · 6 of a 192-cell guard-decline grid · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch · NOT the same disposition as D27/D28**
+### D29 — [CLOSED 2026-08-26] a `nulstr` cell at an implicit-return assignment: the one decline measurement CONFIRMS — and the premise UNDER it did not
+**CLOSED 2026-08-26 (#1938) — the repro RUNS. Was: check-clean invalid wasm · 6 of a 192-cell guard-decline grid · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch · NOT the same disposition as D27/D28**
 
 Repro:
 
@@ -2460,6 +2563,136 @@ Second control — the SAME program with the annotation dropped, a loud CHECK re
 * **Flat on the three ANNOTATED storage classes** (global, parameter, annotated local) × both
   assignment shapes, unconsumed. The un-annotated local is a loud check reject instead (see
   the second control), and every CONSUMED cell is a loud check reject.
+
+**CLOSING EVIDENCE (#1938) — THE MEASUREMENT WAS RIGHT AND THE PREMISE UNDER IT WAS WRONG.**
+Lifting the decline alone really does turn these 6 cells into `wasm trap: null reference`,
+exactly as filed. But the reason that was the whole outcome — "`emitIdentNode`'s kind-16 arm
+applies `ref.as_non_null` UNCONDITIONALLY" — is false at all three of its sites. Every one of
+them reads
+
+    if !nulStrReadStaysRaw() { … ref.as_non_null … }
+
+and `nulStrReadStaysRaw()` is `pendingRawNullRead || pendingNulString`. The recover has been
+conditional since the rule was written; what was missing is that the implicit-return
+assignment position never declared itself a nullable-string TARGET, which is the second of the
+two contexts the rule's own header names. So the choice this row framed — "fix the read rule
+(bigger) or convert the silent outcome to a loud one" — had a third option that is smaller
+than either: declare the context.
+
+`emitReturnValue` now seeds `retNulString` from `fnAssignRetKind(fnPos)` — the SAME fact the
+functype result valtype is minted from, beside the existing `inferNicheNullByName` niche seed
+— so the re-read keeps the raw `(ref null $sTypeIdx)` the result declares. The READ RULE is
+untouched, and so are its other consumers; the blast radius is one `if` reachable only for a
+function whose implicit return is an assignment to a `string | null` cell.
+
+Measured with everything else already in place (so this is the entry's own effect and not the
+change's): straight-line grid 6 cells `check-clean invalid wasm → runs`, if-arm-join grid the
+same 6, lambda grid 4, 0 backward in any of the three, and **no cell anywhere became a trap**.
+Pinned by the `gs` row of `tests/cases/statements/tail-assign-cell-kinds.vl`.
+
+---
+
+### D30 — the CALLER's view of an inferred REF-VALUED map return from an if-arm tail assignment
+**check-clean invalid wasm · 16 of a 192-cell if-arm-join grid · filed 2026-08-26 by the if-arm-join grid built to measure D27/D28/D29 · pre-existing (silent on master too, with the older `expected i32` message the guard's `i32` default produced)**
+
+Repro:
+
+    type S = { a: i32 }
+    function mkR(v: i32): {[string]: S} {
+      const m: {[string]: S} = Map()
+      m["a"] = { a: v }
+      return m
+    }
+
+    let g: {[string]: S} = mkR(3)
+    let h: {[string]: S} = mkR(3)
+
+    function f(c: boolean) {
+      if c {
+        g = mkR(9)
+      } else {
+        h = mkR(9)
+      }
+    }
+
+    const r = f(true)
+    print(r.size)
+    // vl check rc 0 (two redundant-annotation hints); vl run:
+    //   Invalid input WebAssembly code at offset 1171:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+Control — the SAME program with a MONO value type (`{[string]: i32}`, and `m["a"] = v`), the
+only change, correct — it prints 1.
+
+Second control — the SAME program with the straight-line tail `g = mkR(9)` instead of the
+tail `if`, the only change, correct.
+
+Third control — the SAME program with the result UNCONSUMED (`f(true)` then `print(g.size)`),
+the only change, correct.
+
+* **THE CALLEE IS RIGHT AND THE CALLER IS WRONG.** #1938 gave the callee's result valtype its
+  map SHAPE (`inferredRetMapSlot`, via `fnAssignRetSlot`), which is why the third control
+  runs. The CALL SITE resolves the same function's map shape through `fnRetMapShapeSid`,
+  whose un-annotated rung is `mapRetExprShape(fnRetExprOf(...))` — and `fnRetExprOf` reads the
+  body's last STATEMENT, which for a tail `if` is not an expression at all. It answers -1, so
+  `collectLocals` types the receiving `const r` at the MONO `$mapStruct` while the call pushes
+  the ref-valued one. The straight-line control escapes because there `fnRetExprOf` IS the
+  assignment node and `mapRetExprShape` falls through to its recorded type.
+* **NOT A REGRESSION, and the message changed while the class did not.** Master rejects the
+  same program at offset 1137 with `expected i32, found (ref $type)` — the decline's `i32`
+  default — and the branch at 1171 with `expected (ref null $type), found (ref $type)`. Both
+  are `vl check` rc 0 with a module the engine refuses.
+* **THE OBVIOUS FIX IS A RECURSION HAZARD, WHICH IS WHY IT IS FILED RATHER THAN TAKEN.**
+  Routing `fnRetMapShapeSid` through `inferredRetMapSlot` closes it, and opens the cycle
+  `fnRetMapShapeSid → inferredRetMapSlot → fnAssignRetSlot → fnAssignCellMapShape →
+  letMapShapeOf → mapShapeOfExpr → fnRetMapShapeSid`. An ANNOTATED cell short-circuits at
+  `letMapShapeOf`'s annotation arm, but an un-annotated one whose initializer calls the very
+  function being asked about does not: `let g = h()` beside `function h() { g = h() }` would
+  recur without bound. The existing cycle through `mapRetExprShape` has no such leg. Needs a
+  visited-set or a depth bound, which is a separate change with its own witness.
+
+---
+
+### D31 — [CLOSED 2026-08-26] a call ARGUMENT inherits the enclosing RETURN's nullable expectation
+**CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · filed 2026-08-26 by D25's grid, which routed `generics/mono-nullable-arg-pin.vl`'s own `narrowed` control onto it · pre-existing, measured on this exact program against master's compiler**
+
+Repro:
+
+    function takeS(x: string): string { return x }
+    function narrowed(x: string | null): string | null {
+      if x != null { return takeS(x) }
+      return null
+    }
+    print(1)
+    // vl check rc 0, no diagnostic at any severity; the engine refuses the module:
+    //   type mismatch: expected (ref $type), found (ref null $type)
+
+Control — the SAME call in the SAME function with a CONCRETE enclosing return, the only
+change, and it prints `1`:
+
+    function narrowed(x: string | null): string { … return "zz" }
+
+Two more that run, isolating the axis: the call taken through a binding
+(`const y = takeS(x); return y`), and the call not in return position (`return takeS(x).length`).
+
+* **NO GENERICS ANYWHERE**, which is what separates it from D25. The callee is an ordinary
+  function; the two boundaries are its PARAMETER and the CALLER's RETURN.
+* **`expCtxHere()` SNAPSHOTS THE AMBIENT SEEDS.** `emitDirectCall` builds each argument's
+  context from it, and at a `return f(x)` those seeds are the RETURN boundary's. The four
+  nullable seeds were set only ever TO TRUE — `if cParamNulString { argCtx.nulString = true }`
+  — never cleared, so a `string | null` RESULT expectation reached the ARGUMENT of a call whose
+  parameter is a plain `string`, and the narrowed value kept its `(ref null $s)` rep under a
+  `(ref $s)` param.
+* **THE ONE-BIT DIFF IS THE WITNESS**, not an inference from the message: disassembled, the
+  concrete-return control carries `local.get 0 ; ref.as_non_null ; return_call` and the filed
+  shape carries `local.get 0 ; return_call`, on the same argument of the same call to the same
+  function.
+* **THE FIX IS ASSIGNMENT, NOT AN OR.** All four seeds (`nulBool`, `nulString`, `nulClosure`,
+  `nulList`) now take the PARAMETER's answer and only the parameter's. The other four reps
+  (`struct`, non-null list, `closure`, `variant`) already had their own explicit recover arms
+  below; the seeded four had none because the seed was supposed to BE the answer.
+* Graduated: `tests/cases/soundness/nullable-return-arg-seed.vl`. It reproduces on the parent
+  commit and runs on this one.
 
 ---
 

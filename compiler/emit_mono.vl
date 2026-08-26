@@ -38,6 +38,7 @@ import {
   substTyDeep,
   tyHasTyVar,
   tyIsLitUnionArray,
+  tyRenderSoftensLits,
   tyToEmitName,
 } from "./typecheck"
 import {
@@ -194,6 +195,7 @@ import {
   synthTypeRefFb,
   synthTypeRefTy,
   tyNulFuncInner,
+  unionArmsOf,
   variantIndexOf,
 } from "./emit_classify"
 import {
@@ -564,6 +566,90 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   const pn = monoCloPinAnnNodeOfExpr(ax, fnIx)
   if pn >= 0 { return nodeTyIxOf(pn) }
   own
+}
+
+// True when the SPELLING `narrow` is a top-level MEMBER of the union / nullable spelling
+// `wide` — i.e. `narrow` is what `wide` NARROWS TO, and not a second RENDERING of it.
+//
+// THE MEMBERSHIP TEST IS THE WHOLE SAFETY PROPERTY of the narrowed pin (DECISIONS.md,
+// "which channel owns a narrowed argument's type"). The checker's recorded type on an
+// argument node knows the narrow, and is unreliable for exactly the shapes the annotation
+// arms exist to cover — a literal union's render SOFTENS to `string`, a nominal `P` renders
+// structurally, a closure renders an arrow where the pin needs a `$fnsig` marker. None of
+// those is a MEMBER of the annotation's own spelling, so requiring membership admits the
+// narrow and excludes every one of them by construction rather than by a list of exceptions.
+// Measured: pinning the node's render UNCONDITIONALLY moves 6 grid cells from a loud
+// outcome to a silent one and 21 from `runs` to invalid wasm; this gate moves none.
+//
+// `unionArmsOf` is the ONE home for "give me this union's top-level arms" (it resolves an
+// alias to its member set, so `Shape` answers `Circle`/`Sq`), and `nullablePartOf` is
+// `emit_base`'s depth-aware `| null` split. A non-union spelling splits to ONE atom, which
+// the length gate declines — a name is never a narrowing of itself.
+function monoNameNarrowsFrom(narrow: string, wide: string) {
+  if narrow == "" { return false }
+  if narrow == wide { return false }
+  if nullablePartOf(wide) == narrow { return true }
+  const arms: string[] = []
+  unionArmsOf(wide, arms)
+  if arms.length < 2 { return false }
+  let ai = 0
+  while ai < arms.length {
+    if arms[ai] == narrow { return true }
+    ai = ai + 1
+  }
+  false
+}
+
+// The pin a NARROWED argument at `ax` wants, given the pin `wide` the annotation ladder
+// chose — else "" (the ladder's answer stands).
+//
+// A pin BECOMES the instance's parameter annotation, so it is safe exactly where a
+// NON-GENERIC function carrying that annotation already lowers the same program end to end
+// (`monoScalarAnnName`'s exact-name rule). That rule is what picks the NARROWED spelling
+// here: `function takeC(x: Circle): Circle` called with a `Circle | null` narrowed by
+// `is` runs today — the call boundary emits the `ref.as_non_null` and the result is boxed
+// for a `Shape` consumer — and the same twin runs for all ten reps in the grid
+// (nulvariant, union ARM, nulstruct, nulstring, nul-i32/f64, nul scalar/ref list, nulmap,
+// nullable closure). Pinning the WIDE spelling is equally legal as an annotation and lands
+// the instance's RESULT on a rep the checker does not believe in, which is where option
+// (a)'s residue was: eight silent scalar cells plus four `runs` cells lost to a loud
+// `field access but no struct type declared`.
+//
+// `monoAnnPinName(n) == n` is the second half of the same rule, echoed back UNCHANGED for
+// the reason `monoNulAnnName`'s header gives: a spelling the ladder would RENAME could only
+// pin a different rep.
+function monoNarrowedPinName(ax: i32, wide: string) {
+  if wide == "" { return "" }
+  const nt = nodeTyIxOf(ax)
+  // A TYPE WHOSE RENDER SOFTENS ITS LITERALS IS NOT A NAME THIS TEST CAN COMPARE, and it
+  // reaches the membership test looking like a match on BOTH sides. Measured with a probe
+  // on `type K = "a" | "b"` + `idg(k)`: the argument's own type renders `string`, and
+  // `unionArmsOf("K")` answers the member set `string|string` — two softened arms — so
+  // `string` IS a member of `K` by the spelling and the pin dropped from the interned ATOM
+  // to a string ref (`expected i32, found (ref $type)`, check-clean invalid wasm, the one
+  // cell option (c) regressed before this gate). `tyRenderSoftensLits` is this compiler's
+  // home for exactly that hazard — `monoStaticIsResult` declines its own name compare on it
+  // for the same reason — and a litunion argument's pin is claimed by the litunion rungs of
+  // `monoArgTyName` anyway, so declining here takes nothing away.
+  if tyRenderSoftensLits(nt) { return "" }
+  const n = tyToEmitName(nt)
+  if !monoNameNarrowsFrom(n, wide) { return "" }
+  if monoAnnPinName(n) != n { return "" }
+  n
+}
+
+// `monoArgTyName` AT A MONOMORPHIZATION PIN — the ladder's answer, narrowed to what the
+// CHECKER recorded for this argument node where that is one of the annotation's own members.
+//
+// SEPARATE FROM `monoArgTyName` BECAUSE THAT FUNCTION HAS A SECOND CONSUMER. `wasmEmit`'s
+// `monoStaticIsResult` asks it for the receiver of an `is` test and const-folds on the
+// answer; narrowing there would fold a guard the mono pass has no business deciding. The
+// pin is the only question the narrow belongs to, so it is the only caller that asks it.
+function monoArgPinName(ix: i32, fnIx: i32) {
+  const w = monoArgTyName(ix, fnIx)
+  const n = monoNarrowedPinName(unwrapParen(ix), w)
+  if n != "" { return n }
+  w
 }
 
 export function monoArgTyName(ix: i32, fnIx: i32) {
@@ -2464,7 +2550,23 @@ function monoMakeInstance(
         if origRet >= 0 {
           const bN: string[] = []
           const bT: i32[] = []
-          monoBindCols(params, pinTys, bN, bT)
+          // THE SAME COLUMN THE PARAMETER SLOT AND THE BODY'S BINDINGS TAKE, and that
+          // agreement is the invariant, not a preference. `letTyCol` is `pinnedTyIx` — the
+          // pin re-resolved from the pin's NAME — with the function-type exception this
+          // file's own header explains. `pinTys` is the ARGUMENT NODE's arena row, and the
+          // instance registry is keyed on `pinned` (the NAMES) alone: sourcing the RESULT
+          // from a column the key does not carry made the instance a function of something
+          // the key cannot see, so two call sites that key to ONE instance could demand two
+          // different ones and whichever the walker reached first won.
+          //
+          // MEASURED, ON ONE PROGRAM WITH THE DECLARATION ORDER SWAPPED. `narrow(sh: Shape)`
+          // (which calls `idg(sh)` inside `if sh is Circle`) beside `wide(sh: Shape)` (which
+          // calls it un-narrowed): declared wide-first the program runs, declared
+          // narrow-first the same program is `vl check` rc 0 and a module the engine refuses
+          // — `type mismatch: expected (ref $type), found (ref $type)`, the plain-struct row
+          // against the union-arm row. The `Circle | null` twin moves the same way, between
+          // running and a loud emit failure. See DECISIONS.md.
+          monoBindCols(params, letTyCol, bN, bT)
           const sub2 = substTyDeep(origRet, bN, bT)
           if sub2 >= 0 {
             if sub2 != origRet {
@@ -3308,7 +3410,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
             // the same recorded type). "" is the faithful "still an open hole", which keeps
             // the argument-derived pin — and with it every byte of today's generic path.
             let an = recordedParamPinName(params[i])
-            if an == "" { an = monoArgTyName(args[i], ctx) }
+            if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
               return emitFail(
                 "emitProgram: monomorphize: unsupported argument type for `" +
@@ -3347,7 +3449,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                 if annArrowAt(ann) >= 1 {
                   anC = monoArgFnTypeName(args[i], ctx)
                 } else {
-                  anC = monoArgTyName(args[i], ctx)
+                  anC = monoArgPinName(args[i], ctx)
                 }
                 if anC == "" {
                   return emitFail(
@@ -3376,7 +3478,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                 pinTys.push(monoArgPinTyIx(args[i], ctx))
               }
             } else {
-              const an2 = monoArgTyName(args[i], ctx)
+              const an2 = monoArgPinName(args[i], ctx)
               if an2 == "" {
                 return emitFail(
                   "emitProgram: monomorphize: unsupported argument type for `" +
