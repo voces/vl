@@ -356,7 +356,11 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   **What stays open at that seam is slot IDENTITY, not the heap.** An arm-valued and a
   twin-struct-valued map in one program still share ONE mv slot, because the slot's key
   is that same render (D43); the dedup layer below it is arm-gated for the day they
-  separate, measured 0 times and kept for the reason #1942 kept its own.
+  separate. That gate's zero is split into its two halves rather than reported as one: the
+  enclosing arm is LIVE (46 calls over 25 corpus files, so the counter is not #1944's unproven
+  kind) and the parity branch is NOT REACHABLE today, because D43 is the very reason the two
+  slots it would discriminate never both exist. Kept as a structural guard, for the reason
+  #1942 kept its own.
   (structural slot dedup, variant layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a

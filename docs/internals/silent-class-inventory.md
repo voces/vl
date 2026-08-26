@@ -3284,9 +3284,24 @@ Repro:
   `mvValStructIdx` is the INLINE row: an arm-valued `{[string]: Circle}` and a plain
   `{[string]: Dot}` matched the same row. Harmless while both sides had the same wrong heap;
   with the arm's own `uVarHeap[vi]` under one of them it is one map struct over two different
-  vals wrappers. An arm-parity gate is in this change. It is measured **0 times** on the corpus
-  and on the 300-cell grid, because those two maps do not reach separate slots at all (D43) —
-  gated anyway, exactly as #1942 gated `fnRetStructIndexSid`.
+  vals wrappers. An arm-parity gate is in this change.
+* **THE ZERO IS SPLIT INTO ITS TWO HALVES, because "measured 0" is the claim #1944 got wrong
+  when its counter read 0 on its own positive controls.** A THREE-rung counter was built —
+  the kind-1 arm ENTERED, the parity test returning 0, the parity test returning 1 — and swept:
+
+      arm entered      46 calls over 25 of the 2,263 corpus files
+      parity returns 0  0
+      parity returns 1  0
+
+  So the counter is **reachable and reached**: the arm is live, and this is not #1944's
+  unproven zero. What is 0 is the parity BRANCH, and the honest word for it is not "measured
+  0" but **not reachable today**: deciding it needs two DISTINCT kind-1 slots agreeing on canon
+  id and key rep, and D43 is exactly the reason that pair cannot exist — the two maps collapse
+  onto ONE slot before the twin question is asked. Three constructed positive controls confirm
+  it rather than assume it (an arm beside a layout twin; two arms of ONE union sharing a field
+  set; two arms of DIFFERENT unions sharing a field set): all three build, and all three enter
+  the arm **0 times**. The gate is therefore kept as a STRUCTURAL guard for the day D43 closes,
+  not as a measured-inert one — the distinction #1942 could make and #1944 could not.
 * Pin: `tests/cases/maps/member-struct-valued-map.vl` (five cells: the annotated store, the
   un-annotated store, both read through a bare get and through `?? d`, and the store-only
   program the filed control claimed was loud).
@@ -4014,11 +4029,13 @@ Repro:
   everything else identical — RUNS on D34's branch and prints `7` / `9`. It was silent invalid
   wasm on `f2064bec`. So the collision is the shared render, not the pair of maps.
 * **THE DEDUP LAYER IS ALREADY GATED FOR THE DAY THE SLOTS SEPARATE.** `repMapValSlotsTwin`'s
-  kind-1 arm now requires arm PARITY before it asks `repStructSlotsTwin` — measured 0 times on
-  the corpus and on the 300-cell grid precisely because these two maps never reach separate
-  slots. Closing this row is the other half: the arm has to enter the slot's IDENTITY (the
-  `mvSlotOfTyK` / `mvSlotByValNameK` find rungs), and the find sites at the op boundary do not
-  hold the annotation node the mint site does.
+  kind-1 arm now requires arm PARITY before it asks `repStructSlotsTwin`. Counted properly (see
+  D34's census bullet) the ENCLOSING arm is live — 46 calls over 25 corpus files — while the
+  parity branch itself is **not reachable today**, and THIS ROW IS WHY: deciding it needs two
+  distinct kind-1 slots agreeing on canon id and key rep, which is exactly the pair that
+  collapses here. Closing this row is the other half: the arm has to enter the slot's IDENTITY
+  (the `mvSlotOfTyK` / `mvSlotByValNameK` find rungs), and the find sites at the op boundary do
+  not hold the annotation node the mint site does.
 * Ranked below D42 because the outcome is unchanged (silent on both sides), but it is the
   strictly worse row: the reject in D42 is loud.
 
