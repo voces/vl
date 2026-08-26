@@ -48,7 +48,7 @@ repro rather than a paraphrase:**
 | D9 | loud emit reject | **runs — CLOSED 2026-08-25** (below; 144 cells, `loud emit reject → correct`, nothing moved the other way) |
 | D13 | loud emit reject | **runs — CLOSED 2026-08-25** (below, with the literal-union boundary class) |
 | D12 D15 | loud emit reject | **runs — CLOSED 2026-08-25** (below; two roots, not one — grouped only as diagnostic-quality work of the same size) |
-| D19 | check-clean invalid wasm | as filed, still live |
+| D19 | check-clean invalid wasm (mis-graded; it LOADS then traps) | **runs — CLOSED 2026-08-26** (below, with the scope axis that measured the whole class: 38 silent cells, all module scope) |
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 
@@ -143,6 +143,77 @@ twenty minutes on 9,126.
 every filed repro and prints which have moved; it exits non-zero when any row no longer
 behaves as filed. Prose cannot be re-run — that is why eight rows sat here as live work
 after they were fixed.
+
+---
+
+## THE SCOPE AXIS (2026-08-26) — module scope was an unmeasured storage class, and it held 38 silent cells
+
+**The whole grid had only ever executed inside a function.** `ALIAS_POSITIONS` carried a
+`global` entry, so the grid varied where a binding SITS; the reading statements were always
+wrapped in `function reader() { … }` and called. Two independent rows pointed at that gap
+from opposite directions — D19 (a module-scope map miss that TRAPS, where the identical seven
+lines inside a function print `1` / `absent`) and D20's residual (a module-scope list-valued
+map read that is loud, and loud for its NON-nullable control too). Neither is a nullability
+finding; both turn on the storage class of the executing body.
+
+`gen.py` now takes a `--scopes` axis crossed with rep × nullability × position × construct ×
+runtime input. `scope=fn` emits exactly what it always did; `scope=mod` emits the same
+statements at module top level, with no enclosing function and no call.
+
+**THE PAIRED RESULT, which is the only number that answers the question.** A module-scope
+grid's absolute silent count means nothing on its own, because its population is not the
+function-scope one. `scripts/silent-sweep/pairscope.py` compares the SAME
+(leg, rep, nul, pos, con, read, inp, spell) coordinate at both scopes, so exactly one thing
+differs between a cell and its control:
+
+| | `scope=fn` | `scope=mod` |
+|---|---|---|
+| correct | 7,219 | 6,863 |
+| **SILENT** | **0** | **38** |
+| loud check reject | 1,147 | 1,147 |
+| loud emit reject | 184 | 502 |
+
+8,550 paired coordinates (17,100 cells) + 780 coordinates that exist only at `scope=fn`.
+**All 780 skips are `pos=param`** — a parameter needs a function to be a parameter of, the one
+structurally unrepresentable combination. The skip is recorded in the manifest and printed by
+the generator; nothing else in the cross product is dropped. `pos=capture` IS generated at
+module scope and is a real program, but its captured binding is then a global, so it re-covers
+`global`'s storage class rather than adding one.
+
+**All 38 silent cells were the same defect**: `pos ∈ {mapget, mapval_miss}`, `inp=1` (a
+MISSING key), message `wasm trap: null reference`, function-scope twin `correct` in every
+case. That is D19, and the seven reps it spans are exactly the ones whose map value reps as
+the shared `{tag, payload}` union box. Closed by the arm named in D19's row; the grid re-run
+on the fixed compiler moves **38 cells, every one `trap → correct`, zero in the other
+direction, `correct → not-correct` zero**.
+
+**A COVERAGE HOLE THE AXIS EXPOSED, worth more than the axis's own finding.** `mapval` only
+ever read a key it had just STORED, so a declared-nullable map value was never once read at a
+MISSING key by this grid — D19's own coordinate was not in the population that reported 0
+silent. The new `mapval_miss` position adds it (204 cells at `scope=fn`), and 31 of the 38
+silent cells live there. A grid can report zero because the defect is absent or because the
+coordinate is; only reading the generator tells you which.
+
+**THE 322 THAT WENT LOUD, and why they were NOT fixed here.** 322 paired coordinates are
+`correct` at function scope and `loud_emit_reject` at module scope — 164 `bare null needs a
+struct-typed context` and 110 `` `is` test but no union type declared ``, concentrated in the
+list family (`mapval` 158, `mapget` 56, `field` 24, `elem` 24, `ret_unann` 12). That is D20's
+residual, already filed, already named down to the rung (`exprNulScalarListKind` /
+`exprNullableList` / `exprNullableRefArray` carry no `mapReadMvSlot` arm for value kind 6),
+and already argued as deliberately not-widened because closing it changes NON-nullable
+behaviour too. This measurement raises its size from the 12 coordinates its own 2×2 saw to
+322 and leaves the ruling alone. Mixing it into a silent-class fix is the exact shape of
+widening that has twice turned a loud reject into a silent one in this programme.
+
+**Grader re-validated first, against the compiler actually being measured with**, both before
+and after the fix: `sabotage.py` → **12 wrong_value / 8 wrong_evalcount / 6 trap / 4
+correct**, exactly as published. A zero in a silent column is worth nothing until that column
+has been made to fire on demand.
+
+    python3 scripts/silent-sweep/gen.py       <cells>            # --scopes fn,mod (default)
+    bash    scripts/silent-sweep/sweep.sh     <cells> <res>      # still xargs -P4
+    python3 scripts/silent-sweep/grade.py     <cells> <res> --csv scope.csv
+    python3 scripts/silent-sweep/pairscope.py scope.csv
 
 ---
 
@@ -1282,8 +1353,8 @@ conflicting-consumer ruling and the grid.
 
 ---
 
-### D19 — a MISS on a DECLARED-nullable numeric-litunion map, read at MODULE SCOPE, traps
-**check-clean invalid wasm as the witness checker grades it — but the module LOADS and the miss TRAPS at run time · found while closing D6, filed unfixed · module scope only**
+### D19 — [CLOSED 2026-08-26] a MISS on a DECLARED-nullable numeric-litunion map, read at MODULE SCOPE, traps
+**CLOSED 2026-08-26 — the repro now RUNS and prints `1` / `absent`, the same two lines its function-scope control always printed. Was: check-clean LOADS THEN TRAPS · found while closing D6, filed unfixed · module scope only. It was one rep of a seven-rep class the scope-crossed sweep then measured whole — see "THE SCOPE AXIS" below**
 
 Repro:
 
@@ -1311,19 +1382,45 @@ Control — the SAME seven lines inside a function print `1` / `absent`:
     body()
 
 * **PRE-EXISTING, measured in both directions.** Byte-identical modules before and after the
-  D6 fix (`md5 ac93932e`, 3354 bytes), so this change neither caused nor cures it.
-* **The classifier cannot say what this is.** `check-filed-witnesses.py`'s outcome vocabulary
-  has no "loads then traps" — a module that exists and a non-zero run rc grades
-  `silent_invalid_wasm`. The status line above is worded so the row grades as filed while the
-  prose says what actually happens; a trap-loads outcome is the honest addition to make to
-  that vocabulary when someone next touches it.
-* **The value type is DECLARED nullable**, so this is not D6's implicit-`T?` seam: the map
-  stores boxes and the miss arm hands back a `ref.null` that the module-scope read path
-  dereferences without the recover the function-scope path applies. The axis is the STORAGE
-  CLASS of the binding, not the value rep — which is D9's axis, not Root E's.
-* Deliberately NOT pinned in the corpus: `maps/numlit-value-annotated-miss.vl` carries the
-  control inside a function and names this row in a comment, because pinning a trap freezes
-  it as contract.
+  D6 fix (`md5 ac93932e`, 3354 bytes), so that change neither caused nor cured it.
+* **THE ROOT, and it is one missing arm.** `emitStartFnCode`'s global-init ladder
+  (`compiler/emit_sections.vl`) is the module-scope twin of `emitLetDeclStmt`'s kind ladder,
+  arm for arm — map, nulmap, struct, nulstruct, variant, nulvariant, nulbool, nulstring,
+  litunion, nullitunion, list, nullist, the three nullable scalar lists, nulreflist,
+  nulclosure, union. The one arm it never grew is `letNulMapReadUnionBox` →
+  `emitMapGetUnionBox`, so a bare top-level `const t = m[k]` over a UNION-BOX-valued map fell
+  through to `emitExpr` → `emitMapGet`, whose miss arm yields "the rep's empty value" — a
+  BARE `ref.null`. The consuming `!= null` is a TAG COMPARE that recovers the box first, read
+  straight off the disassembly of the repro and its control:
+
+  | | miss arm the module emits | the null test that follows |
+  |---|---|---|
+  | inside a function | `i32.const 6 ; ref.null none ; struct.new $uBox` | `ref.as_non_null ; struct.get $uBox 0 ; i32.ne 6` |
+  | **at module scope** | **`ref.null $uBox`** | the same three instructions — and the recover traps |
+
+  The fix routes the module-scope init through the same `emitMapGetUnionBox`. It is 20 lines
+  in `emitStartFnCode` plus an `export` on the helper; no layout, no new heap type, no
+  allocation change (the miss builds the box it was already meant to build).
+* **The value type is DECLARED nullable**, so this is not D6's implicit-`T?` seam — but the
+  scope-crossed grid showed the implicit spelling has the same hole: `{[string]: string|i32}`
+  read at module scope trapped identically with no `| null` in the program at all. The axis
+  really is the STORAGE CLASS of the executing body, and the row's own reading of it was
+  right.
+* **`trap_loads` — the outcome vocabulary now has this state.** The former bullet here said
+  `check-filed-witnesses.py` could not say what this row was, because a module that exists
+  plus a non-zero run rc graded `silent_invalid_wasm`, and the status line was worded to grade
+  as filed while the prose said the truth. That workaround is gone: the classifier now splits
+  the two on the same marker vocabulary `grade.py` uses, `--self-test` proves the state fires
+  (a program that prints `2` then indexes out of bounds routed `silent_invalid_wasm` before
+  and `trap_loads` after), and **re-grading all 24 rows found no other row hiding behind the
+  conflation** — D22, D23 and D24 stay `silent_invalid_wasm` under the sharper classifier,
+  which is now a measurement rather than an assumption.
+* **NOW PINNED, and the earlier refusal to pin was right at the time.**
+  `maps/numlit-value-annotated-miss.vl` deliberately kept only the function-scope control,
+  because pinning a trap freezes it as contract. A CLOSED trap is a different object:
+  `tests/cases/maps/module-scope-union-box-map-read-miss.vl` is a `@run` fixture carrying all
+  four affected value shapes at module scope plus the function-scope control in the same file,
+  and it traps on master's own seed (`d7cab73e`) and runs on this branch.
 
 ---
 
@@ -1460,6 +1557,19 @@ independent rows now turn on it, which makes it a candidate axis for a sweep of 
 than a coincidence. This fix's own sites cannot see it: they classify a value TYPE from a
 spelling and are storage-class blind by construction; the residual is in binding
 classification, which is D21's ladder, not this one's.
+
+> **THE SWEEP WAS BUILT AND IT RULED ON BOTH HALVES — 2026-08-26, see "THE SCOPE AXIS"
+> above.** *Adjacent, not shared* holds: D19's class closed on one arm in
+> `emitStartFnCode` that this residual's coordinates never touch, and re-running the grid on
+> the fixed compiler moved 38 cells, none of them here. What the axis DID change about this
+> row is its size — **322 paired coordinates**, not the 12 its own 2×2 saw, are `correct`
+> inside a function and `loud_emit_reject` at module scope, concentrated exactly where this
+> row predicted (`mapval` 158, `mapget` 56, `field` 24, `elem` 24, `ret_unann` 12; 164 of
+> them `bare null needs a struct-typed context`, 110 `` `is` test but no union type
+> declared ``). **The "NOT WIDENED HERE, deliberately" ruling above stands, and the scope
+> sweep is a reason to keep it** rather than to revisit it: the 322 are LOUD, the silent
+> class that shared their axis had a different root, and folding the two together is how a
+> loud reject becomes a silent one.
 
 **One more thing the probes turned up, recorded so nobody spends the afternoon on it**:
 annotating the binding is not a workaround and not scope-related. `const v: f64[] | null =
@@ -2166,6 +2276,15 @@ before running and every leg hit exactly:
 So the two columns that read ZERO on the live population — `wrong_value` outside D1, and
 `trap` — are zero because the population is clean there, not because the column is dead.
 
+**Extended for the scope axis (2026-08-26).** The grader had never been shown to fire on a
+program whose reading statements sit at module top level in the shape `--scopes mod` builds,
+so 8 further cells make every column fire again there: 3 `wrong_value`, 2 `wrong_evalcount`,
+2 `trap`, 1 `correct`. Predicted before the run and measured exactly — **15 / 10 / 8 / 5**
+over 38 cells. `sabotage.py --legacy` still emits only the original 30 and still reports
+**12 / 8 / 6 / 4**, so the published counts remain directly checkable. The module-scope
+`correct` control and one of its `wrong_value` cells are the SAME PROGRAM under different
+manifests, which is what proves the grader reads the expectation rather than the output.
+
 ### The fourth silent column was proven against an independent validator
 `invalid_wasm` fires 97 times on the live population, and one instance was checked outside
 the harness:
@@ -2188,6 +2307,28 @@ appearing in exactly 44 of those cells moved **44 cells** into `compiler_trap` a
 pre-sabotage classification on all 608 cells after restoring the compiler from a saved,
 `md5sum -c`-verified artefact.
 
+### The WITNESS CHECKER's vocabulary was proven the same way (2026-08-26)
+`check-filed-witnesses.py` grades this document's own rows, and it had one column doing two
+jobs: a module the engine REFUSES and a module the engine LOADS whose PROGRAM then traps both
+graded `silent_invalid_wasm`. That is not a naming nit — it sends the reader to the emitter
+when the miscompile is in what the emitted code DOES, and D19 sat behind it for a day with a
+status line worded to grade as filed while its prose said the truth.
+
+The split now uses the same marker vocabulary `grade.py` separates its `invalid_wasm` and
+`trap` columns with, and `--self-test` makes it fire on demand — three specimens whose outcome
+is known by construction, predicted in source ahead of the run:
+
+    python3 scripts/check-filed-witnesses.py --self-test
+      want runs        got runs        ok
+      want check_reject got check_reject ok
+      want trap_loads  got trap_loads  ok
+
+The third specimen (`print(xs.length)` then `print(xs[9])`) is the proof the state is a real
+distinction rather than a rename: it emits a VALID module that prints `2` and then traps, and
+the pre-change classifier routed it `silent_invalid_wasm`. **Re-grading all 24 rows under the
+sharper classifier found no other row hiding behind the conflation** — D22, D23 and D24 stay
+`silent_invalid_wasm`, which is now measured rather than assumed.
+
 ### Structural guarantees
 * **One result file per cell.** `runcell.sh` writes `<cell>.res` and never appends to a
   shared file, so nothing can tear under `-P4`.
@@ -2207,6 +2348,16 @@ pre-sabotage classification on all 608 cells after restoring the compiler from a
 
 Stated plainly rather than reported as a silent zero.
 
+* **MODULE-SCOPE EXECUTION — was the largest of these, and is now BUILT** (2026-08-26, see
+  "THE SCOPE AXIS"). Every cell used to run inside `function reader()`; the `global` position
+  varied where the BINDING sat and never where the READ executed. Crossing it found 38 silent
+  cells against a function-scope 0 on the same coordinates. The only combination still not
+  covered is `pos=param` (780 coordinates), which has no module-scope spelling at all.
+* **A MAP READ AT A MISSING KEY over a DECLARED-nullable value type — was not in the
+  population, and is now** (`mapval_miss`). `mapval` only ever read a key it had just stored,
+  so D19's own coordinate was absent from the grid that reported 0 silent; 31 of the 38 cells
+  above live at the new position. **Read the generator before quoting a zero**: a coordinate
+  that is not generated and a defect that is not present produce the same number.
 * **Sets** (string-key and i32-key) — not built. The rep vocabulary in the audit lists them
   as reps a ladder must answer for, and the i32-keyed map defect (D4) suggests the i32-keyed
   SET is worth the same probe. No syntax for a set literal was located in the time budget.
