@@ -723,18 +723,24 @@ in-language GC knobs.
   believed: the rep was already decided and already named (`numLitUnionBaseTy` — a numeric literal
   union reps as its BASE SCALAR), so the pair closed together with the `xfail-false-reject-` file
   beside it.
-  **TWO miscompile fixtures remain here** (the inline-litunion element read, plus the loud
+  ~~**TWO miscompile fixtures remain here** (the inline-litunion element read, plus the loud
   `totality-gate` one) and TWO false rejects, with one more miscompile under `tests/cases/std/`.
   What remains is attributed rather than merely listed: the `ctxKeepsLitUnion` FAMILY DECISION —
-  a literal union's members are PRESERVED at `RC_ELEM` and SOFTENED at `RC_ROOT`/`RC_FN_PARAM`, so
-  the INLINE spelling `("a" | "b")[]` is an array of interned atoms while `"a" | "b"` in a
-  parameter or return position is a string reference, and the two meet at every element read
-  (`xfail-miscompile-inline-litunion-element-read.vl` is the four-line witness; the std
-  `array-litunion-element` file is the same defect with std, a generic and a closure on top, and
-  the DECLARED-alias spelling of both is green). Closing it means CHOOSING one
-  position-INDEPENDENT rule; that predicate's header names the two candidate position rules already
-  built and REFUTED. And the checker-side totality gate, which carries an ordering constraint in
-  its own header.
+  … Closing it means CHOOSING one position-INDEPENDENT rule; that predicate's header names the two
+  candidate position rules already built and REFUTED.~~
+  **STALE — THE `ctxKeepsLitUnion` FAMILY IS CLOSED, AND IT DID NOT NEED THE DECISION THIS
+  PARAGRAPH DEMANDED.** Every fixture it names has graduated, `tests/cases/soundness/` holds no
+  `xfail-miscompile-` file at all, and the ONE under `tests/cases/std/` is a `u8[]` generic
+  argument with nothing to do with literal unions. The predicted "choose one position-INDEPENDENT
+  rule" is not what closed it: the position rule is RIGHT — the three preserve positions are
+  CONTAINERS, whose slots really do hold the atom — and what was wrong was (a) that `RC_FN_RES`
+  was in that set while a function RESULT is a scalar position whose counterpart `RC_ROOT`
+  softens, and (b) that the conversions across the remaining boundaries were missing at four
+  producers. Closed by the boundary reconciliations of #1910 / #1917 / #1919 / #1926 and the four
+  rungs of the BOUNDARY class (element read, element store, ordering, result list, monomorphized
+  argument, function-value call result, callback delivery, container store). The checker-side
+  totality gate, which carries an ordering constraint in its own header, is unrelated and its own
+  row.
   **#1864 CLOSED TWO AND CORRECTED TWO FILED DIAGNOSES IN OPPOSITE DIRECTIONS.**
   `narrowed-litunion-fn-value-arg` was filed as needing three `$fnsig` producers moved
   "byte-identical or nothing" (`cloParamTok` / `annSigKey` / `sigKeyOfTy`); re-derived,

@@ -148,7 +148,9 @@ import {
   recordNodePin,
   tyFieldTyOf,
   tyIsLitUnion,
+  tyIsLitUnionAlias,
   tyIsLitUnionArray,
+  tyIsLitUnionOrLit,
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
@@ -2785,7 +2787,7 @@ export function criClassify(rx0: i32, i: i32) {
   //
   // ASKED HERE AND NOT IN `tyKindOf`, deliberately, and the difference was MEASURED. Widening
   // that mapping instead makes `exprArray` claim a `K[]` at every position, and
-  // `generics/error-litunion-list-arg-not-pinned.vl` — the file that pins a `K[]` generic
+  // `generics/litunion-list-arg-pinned.vl` — the file that pins a `K[]` generic
   // argument FAILING CLOSED — starts printing the raw atom id `0` where its oracle says `a`.
   // A loud reject traded for a wrong value is worse than the bug being fixed. The RESULT
   // VALTYPE of a function is the one question whose answer is the same for all four spellings,
@@ -5290,7 +5292,63 @@ export function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: PushKind) {
 // The Member-receiver `.pop` kind bits anywhere in the expression at `exprIx` —
 // a `.pop` appears in VALUE position (`let x = T.scopes.pop()`), so the
 // reservation walk must descend expressions, not just statement receivers.
+// Bit 256 at a VALUE position: does the expression AT `ix` itself need the atom-NARROW
+// staging slot (`atomStageSlot`)?
+//
+// THE SIBLING OF `pushStagesAtomNarrow`, one destination set wider. That one asks the question
+// of a `.push` argument, where the members come from the DESTINATION; this asks it of any value
+// reaching `emitExpr`'s single `pendingLitUnion` hook, where they come from the value's own
+// recorded type — which is why the type test is here and not there.
+//
+// DELIBERATELY AN OVER-APPROXIMATION, and the omission is the same one for the same reason: the
+// emit side also declines a value that is ALREADY atom-repped (`exprIsLitAtom`), and that
+// predicate reads tables this walk runs before — no live scope stack, no narrowing replay — so
+// asking it here could answer differently from the emit and MISS a reservation. Claiming the
+// superset costs one unused local; claiming too little costs a `local.set` against an index the
+// locals vector never declared. The asymmetry decides the direction.
+//
+// `gLitUnionUsed` keeps every module without a string literal union byte-identical.
+// `_fnIx` is carried and UNUSED on purpose: every test this asks is scope-FREE, which is the
+// property that makes the answer safe to compute in a walk that runs before the locals tables
+// exist. The parameter keeps the signature identical to `pushStagesAtomNarrow`'s and marks the
+// place a scope-dependent test would have to go — and would then be wrong.
+function exprStagesAtomNarrow(exprIx: i32, _fnIx: i32): boolean {
+  if gLitUnionUsed == 0 { return false }
+  const ax = unwrapParen(exprIx)
+  const a = P.nodes[ax]
+  // A member STRING LITERAL lowers as its interned id with no tower at all.
+  if a is StrLit { return false }
+  // A re-readable PLACE takes the re-reading tower, which needs no slot.
+  if unionEqOperandOk(exprIx) { return false }
+  // A value whose recorded type is a REGISTERED litunion ALIAS is ALREADY the atom — no
+  // conversion is wanted at any destination, and the emit declines it through
+  // `exprIsLitAtom`'s `nodeTyIsLitUnionAlias` arm, which is this same test. Scope-FREE (an
+  // arena index-set membership), so unlike `exprIsLitAtom` as a whole it cannot answer
+  // differently here from at emit time for the shape it claims.
+  //
+  // IT IS WORTH ASKING because the alias is the common spelling: without it every corpus file
+  // holding a `K`-returning call reserved a local it never used — 81 files, +3 bytes each,
+  // for nothing. With it the reservation is confined to the string-repped spellings the narrow
+  // is actually for.
+  const axTy = nodeTyIxOf(ax)
+  if tyIsLitUnionAlias(axTy) { return false }
+  // The value's own recorded type — `strReppedLitUnionAt`'s test, and a SINGLETON `TyLit`
+  // counts for that predicate's reason: `if s is "aa"` and an `"aa"` parameter both produce
+  // one, whose value is the same string and whose atom-slot destination is the same i32.
+  tyIsLitUnionOrLit(axTy)
+}
+
 export function exprPopBits(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  if exprStagesAtomNarrow(exprIx, fnIx) {
+    // OR'd in and the descent CONTINUES: the staging slot is one shared local, so a second
+    // site inside the same expression needs nothing more, but the `.pop` bits below still do.
+    return 256 | exprPopBitsGo(exprIx, fnIx)
+  }
+  exprPopBitsGo(exprIx, fnIx)
+}
+
+function exprPopBitsGo(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
   if e is Call {
@@ -9795,6 +9853,77 @@ export function cloCallParamLitUnion(callIx: i32, idx: i32) {
     }
   }
   0
+}
+
+// The callee's own `TyFunc` arena row for value call `callIx`, or -1 — asked of the CALLEE'S
+// ANNOTATION before the call node's recorded type, and the ORDER is the whole point.
+//
+// Inside a MONOMORPHIZED instance the body is a fresh clone that SHARES its leaf expression
+// nodes with the generic, so `nodeTyIxOf(c.callFn)` still answers the generic's own
+// `(T, i32) => U` — a `TyFunc` whose parts are type VARIABLES. That is a resolvable-looking
+// answer to every structural test and a wrong one to every rep question, so a channel order
+// that asks it first cannot be rescued by a later arm. The instance's parameter carries the
+// SUBSTITUTED pin as its synthesized annotation, and that is the authority for what the
+// `call_indirect` was interned at.
+//
+// The same shape #1910 met three times over: a mono clone's node has no useful recorded type
+// and the fact has to come from the annotation instead.
+function cloCallCalleeFnTy(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident {
+      // A PARAMETER (an instance's substituted `f: (i32, i32) => K`, or an ordinary
+      // annotated function-typed param).
+      const pt = paramTypeNode(fnIx, cre.identName)
+      if pt >= 0 {
+        const pty = nodeTyIxOf(pt)
+        if pty >= 0 {
+          if T.tys[pty] is TyFunc { return pty }
+        }
+      }
+      // An annotated function-typed BINDING (`const f: (i32) => K = base`).
+      const jnd = identFnTypeAnnNodeSid(sidOfNode(c.callFn), fnIx)
+      if jnd >= 0 {
+        const jty = nodeTyIxOf(jnd)
+        if jty >= 0 {
+          if T.tys[jty] is TyFunc { return jty }
+        }
+      }
+    }
+    // Everything else — a field closure, an indexed element, an inferred binding — keys off
+    // the callee's own checker type, exactly as `cloCallSigKey`'s general fallback does.
+    const direct = nodeTyIxOf(c.callFn)
+    if direct >= 0 {
+      if T.tys[direct] is TyFunc { return direct }
+    }
+  }
+  -1
+}
+
+// THE RESULT TWIN of `cloCallParamLitUnion`: does value call `callIx` yield a literal-union
+// interned i32 ATOM? The parameter side has had its seed since function values learned to take
+// a `K`; the result side never had one, and the `$fnsig` key cannot supply it for the reason
+// stated one function up — a litunion result's token is `i`, byte-identical to a plain i32's.
+//
+// WITHOUT IT A VALUE CALL'S ATOM RESULT READ AS A STRING. `exprIsLitAtom`'s `Call` arm claims a
+// DECLARED callee by walking to its `FuncDecl` and a checker-typed call by its recorded type;
+// a function-VALUE call inside a monomorphized instance has neither, so `std:array.mapIndexed`
+// over a callback delivered as anything but a bare NAME staged the `call_indirect`'s i32 atom
+// into the string-narrow slot: `vl check` rc 0 and `type mismatch: expected (ref $type), found
+// i32` at load. The by-NAME spelling escaped because mono lowers it to a direct call, where the
+// `FuncDecl` arm answers.
+//
+// ALIAS-ONLY, by arena-index identity, for `cloCallParamLitUnion`'s measured reason: an INLINE
+// `"a" | "b"` result really is a string ref at this position, and `tyLitUnionAliasIx` is the
+// predicate the rep layer itself assigns the valtype with — so the consumer agrees with the
+// rep by construction rather than by coincidence.
+export function cloCallResultLitUnion(callIx: i32, fnIx: i32): boolean {
+  const ft = cloCallCalleeFnTy(callIx, fnIx)
+  if ft < 0 { return false }
+  const t = T.tys[ft]
+  if t is TyFunc { return tyLitUnionAliasIx(t.fnRet) >= 0 }
+  false
 }
 
 // The union-BOX PARAMETER NAME of value call `callIx`'s parameter `idx` — the emitter's
@@ -19156,6 +19285,12 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // which the callee-Ident named arm below can reach. A NAMED call to an INLINE-litunion-returning
     // function reps as a string ref, so `nodeTyIsLitUnionAlias` (alias-only) correctly excludes it.
     if nodeTyIsLitUnionAlias(unwrapParen(exprIx)) { return true }
+    // A FUNCTION-VALUE call whose CALLEE's annotated result is an aliased litunion — the arm
+    // the line above cannot reach inside a MONOMORPHIZED instance, where the call node is
+    // shared with the generic and still records the type VARIABLE. `cloCallResultLitUnion`
+    // asks the callee's own substituted annotation, which is what the `call_indirect` was
+    // interned at.
+    if cloCallResultLitUnion(unwrapParen(exprIx), fnIx) { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfSid(sidOfNode(e.callFn))
@@ -29880,6 +30015,37 @@ export function cloRetTypeName(fe: i32) {
 // Each part is nominalized by `shapeNominalOfTy` (banked struct row, struct field set, variant
 // field set) and otherwise rendered. The render is the ARTEFACT here: nothing is asked of the
 // string. "" means the type is not a `TyFunc`, i.e. the caller keeps its name path.
+// A LITERAL-UNION ALIAS keeps its NAME here, at the parameter as well as the result, and
+// that is the one place this nominalizer differs from a bare `tyToEmitName` per part.
+//
+// `tyToEmitName` is the POSITION-FREE entry — `RC_ROOT` by definition — and
+// `ctxKeepsLitUnion` is false there, so a `K`-taking, `K`-returning function rendered
+// `(string)=>string`. The renderer's own `TyFunc` arm does NOT: it preserves the alias at the
+// result (`litUnionAliasNameOfTy` before recursing) exactly as the `TyArray` element, `TyObj`
+// field, `TyMap` value and union MEMBER arms do. This function is a THIRD hand-written copy of
+// that arm and it had neither leg, so ONE alias got TWO reps depending on which producer
+// spelled it.
+//
+// THE PIN IS WHERE THAT BITES. `monoArgFnTypeName` renders this to bind a generic's
+// function-type parameter, so `once<A>(f: (A) => A, init: A): A` over a `K`-taking callback
+// bound `A := string` from the softened render, pinned `init` as a `(ref $array)` and handed
+// the instance's i32-atom callback a string — `vl check` rc 0 and a module the engine refuses
+// (`type mismatch: expected i32, found (ref $type)`). Both parts take the leg because the
+// disagreement is between the two ENDS of one rendered signature, not between one end and its
+// caller: fixing only the result leaves `(string)=>K`, which binds `A` twice over.
+//
+// The ALIAS only, never the inline member spelling — `ctxKeepsLitUnion`'s measurement is about
+// that spelling (the two valtype ladders it names have an arm for the alias NAME and none for
+// the member run), and `canonEmitNameAt` already draws the line at the shape of the answer
+// rather than at the position.
+function nominalizePartOfTy(ty: i32): string {
+  const al = litUnionAliasNameOfTy(ty)
+  if al != "" { return al }
+  const sn = shapeNominalOfTy(ty)
+  if sn != "" { return sn }
+  tyToEmitName(ty)
+}
+
 export function nominalizeFnTypeOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const t = T.tys[ty]
@@ -29889,14 +30055,10 @@ export function nominalizeFnTypeOfTy(ty: i32): string {
   let i = 0
   while i < pts.length {
     if i > 0 { out = out + "," }
-    const pn = shapeNominalOfTy(pts[i])
-    if pn != "" { out = out + pn } else { out = out + tyToEmitName(pts[i]) }
+    out = out + nominalizePartOfTy(pts[i])
     i = i + 1
   }
-  out = out + ")=>"
-  const rn = shapeNominalOfTy(t.fnRet)
-  if rn != "" { return out + rn }
-  out + tyToEmitName(t.fnRet)
+  out + ")=>" + nominalizePartOfTy(t.fnRet)
 }
 
 // `monoUnwrapParens` LIVED HERE and is gone (D-MONOPAREN) — it was the compiler's LAST

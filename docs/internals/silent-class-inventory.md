@@ -46,7 +46,8 @@ repro rather than a paraphrase:**
 | D17 D18 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below; one root, one change) |
 | D14 | loud emit reject | **runs — CLOSED 2026-08-25** (below) |
 | D9 | loud emit reject | **runs — CLOSED 2026-08-25** (below; 144 cells, `loud emit reject → correct`, nothing moved the other way) |
-| D12 D13 D15 D19 | various | as filed, still live |
+| D13 | loud emit reject | **runs — CLOSED 2026-08-25** (below, with the literal-union boundary class) |
+| D12 D15 D19 | various | as filed, still live |
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 
@@ -901,8 +902,8 @@ Controls, all correct: `print(a?.w ?? 0)` (no intermediate binding); `if a?.w !=
 
 ---
 
-### D13 — an INLINE literal union produced by a CALL and stored in a list or map is a loud emit reject
-**loud emit reject · 40 cells**
+### D13 — [CLOSED 2026-08-25] an INLINE literal union produced by a CALL and stored in a list or map is a loud emit reject
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 40 cells**
 
 Repro:
 
@@ -912,16 +913,42 @@ Repro:
       print(xs[0])
     }
     body()
-    // vl check rc 0; vl run:
+    // now prints `p`. Was: vl check rc 0; vl run:
     //   emitProgram: literal-union atom narrowing needs a re-readable receiver
 
-Controls, all correct: the same list from a LITERAL (`["p"]`); the same call through a
-NAMED alias (`type K = "p" | "q"` … `const xs: K[] = [src2()]`); the same call into a plain
-`string[]`; the same call into a bare `const v: "p" | "q" = src4()`.
+Controls, all correct then and now: the same list from a LITERAL (`["p"]`); the same call
+through a NAMED alias (`type K = "p" | "q"` … `const xs: K[] = [src2()]`); the same call into
+a plain `string[]`; the same call into a bare `const v: "p" | "q" = src4()`.
 
 * **Flat on**: the list-element and map-value containers.
 * **Varies on**: named vs inline (named is clean), and literal vs call initialiser (literal
-  is clean). It needs BOTH the inline spelling and the call.
+  is clean). It needed BOTH the inline spelling and the call.
+
+**CLOSED WITH THE LITERAL-UNION BOUNDARY CLASS, and this row is the reason the class was
+grouped rather than worked defect by defect.** The container's slot holds the interned i32
+ATOM (`ctxKeepsLitUnion` holds at an element, a field and a map value) while the call's result
+is the string ref an inline literal union softens to at `RC_ROOT`, so the store needs a NARROW
+— and the narrow is a `select` tower that re-reads its operand once per member, which for a
+CALL is the wrong number of EVALUATIONS rather than merely a wrong value. So the tower refused
+one. A non-place value is now STAGED: evaluated once into a slot, then re-read per member,
+which is `emitAtomToStr`'s id stash mirrored and what the `.push` destination already did.
+
+**ONE ARM, THREE DESTINATIONS, AND THE PREDICTED THREE WALKS WERE NOT NEEDED.**
+`emitDestStrToAtom`'s header filed the array-LITERAL element and the INDEXED store as "the
+same boundary one destination over" and expected each to need its own reservation walk. They
+did not: the narrow has ONE entry point (`emitExpr`'s `pendingLitUnion` hook, which every
+atom-typed destination already seeds), and all three destinations are EXPRESSION positions, so
+`exprPopBits` — the value-position walk that already reserves the `.pop` frames — reaches them
+all. Pinned as `tests/cases/literal-unions/inline-litunion-call-into-container.vl`, which
+includes an evaluation-COUNT row: a tower that re-read the call per member would be a wrong
+answer, not a refusal.
+
+**LOUD DID NOT MEAN A DIFFERENT RUNG.** D13 was the only loud member of a class whose other
+three directions were silent miscompiles, and the standing warning in *Root D* — that message
+identity and root identity are independent in both directions — applies to SEVERITY too. The
+severity split was an artifact of which side of the seam had a conversion available: at a
+container store the emitter could see that the reps disagreed and refuse, and at the three
+argument/result boundaries it could not see it at all.
 
 ---
 

@@ -26,6 +26,7 @@ import {
   litUnionAliasNameOfTy,
   monoInferListElem,
   monoInferLocalScalar,
+  nameIsLitUnionType,
   nodeTyArrayElemIsBoolPrim,
   nodeTyIsFunc,
   nodeTyIsStringPrim,
@@ -36,6 +37,7 @@ import {
   recordClonedNodeTy,
   substTyDeep,
   tyHasTyVar,
+  tyIsLitUnionArray,
   tyToEmitName,
 } from "./typecheck"
 import {
@@ -355,6 +357,30 @@ function monoAnnPinName(name: string) {
   if isUName(name) { return name }
   const rl = monoCompositeListAnnName(name)
   if rl != "" { return rl }
+  // A LITERAL-UNION ALIAS ARRAY (`K[]`), the array sibling of the `isUName` arm above and of
+  // the recorded-type litunion arm in the cascade. The BARE alias has been claimed here since
+  // the alias-pin arm was written; `K[]` never was, and the ARRAY is the shape a `std:array`
+  // generic takes.
+  //
+  // WHAT IT COSTS TO DECLINE, measured both scopes: at MODULE scope the cascade falls to
+  // `exprArray`, which spells the REP (`nameIsI32Array` accepts a litunion `K[]`) and pins
+  // `i32[]` — so `indexOf<T>(self: T[], needle: T)` over a `K[]` bound `T := i32`, declared
+  // `needle` an i32, and the bare member literal `"b"` lowered as the string ref it is at an
+  // ordinary expression position: `vl check` rc 0 and `type mismatch: expected i32, found
+  // (ref $type)` at load. Inside a FUNCTION every rep classifier is post-mono blind, so the
+  // same call reached the `"i32"` catch-all, which is not an array at all — the LOUD
+  // `monomorphize: expected an array argument for `self``, and it took the documented remedy
+  // (bind the needle first) down with it, since the receiver is what fails there.
+  //
+  // The pin is the caller's OWN spelling, which is `monoScalarAnnName`'s exact-name safety
+  // property read straight: `self: K[]` and `needle: K` are annotations a NON-generic function
+  // already lowers, so the instance lands on the working path instead of beside it.
+  if nameIsArray(name) {
+    const luElem = arrElemNameRaw(name)
+    if luElem != "" && isUName(luElem) && nameIsLitUnionType(luElem) {
+      return name
+    }
+  }
   // A `boolean[]` annotation. Its REP is the i32 list exactly (`nameIsI32Array`), so the
   // cascade cannot spell it and the pin is a NAME — the same reason the `exprArray` arm
   // reads the checker's element name. Only a genuine `boolean` LEAF is claimed; the other
@@ -782,6 +808,24 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   // lowered a string→atom widen over that i32 parameter — INVALID WASM.
   const luAl = litUnionAliasNameOfTy(nodeTyIxOf(unwrapParen(ix)))
   if luAl != "" { return luAl }
+  // THE ARRAY SIBLING of the arm above, and it has to sit HERE rather than below: the
+  // collection arms spell a litunion array by its REP, and `nameIsI32Array` accepts a litunion
+  // `K[]`, so `exprArray`'s catch-all pins `i32[]` and binds every `T` mentioning the element
+  // to plain i32. That is the same "the pin lost the type entirely" failure the arm above
+  // records, one container out: `indexOf<T>(self: T[], needle: T)` over a `K[]` declared
+  // `needle` an i32 while the caller pushed the member literal's string ref — `vl check` rc 0
+  // and a module the engine refuses. See `monoAnnPinName`'s litunion-array arm, which is this
+  // question asked of the ANNOTATION for the function-scoped spelling the rep classifiers
+  // cannot see mid-pass; the two channels must claim the same shape or the two scopes pin one
+  // call two ways.
+  const luArrTy = nodeTyIxOf(unwrapParen(ix))
+  if tyIsLitUnionArray(luArrTy) {
+    const luArrT = T.tys[luArrTy]
+    if luArrT is TyArray {
+      const luElAl = litUnionAliasNameOfTy(luArrT.aElem)
+      if luElAl != "" { return luElAl + "[]" }
+    }
+  }
   // A MAP / SET argument pins its param as that map — the whole `{[K]:V}` spelling, which
   // is the synthetic name an annotated `{[K]: V}` parameter carries, so the instance lowers
   // through the ALREADY-WORKING annotated-map-param path. Without it a map argument fell
