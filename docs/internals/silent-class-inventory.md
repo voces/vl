@@ -2983,11 +2983,24 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
   | `reduce`'s `A` at a STRUCT holding a `Circle[]` | runs |
   | `reverse` over a `Circle[]` RECEIVER | loud (``monomorphize: expected an array argument for `self```) |
   | `indexOf`'s `needle` | loud (the same receiver refusal arrives first) |
-  | **`reduce` over a `Circle[][]` RECEIVER (`T = Circle[]`, `A = i32`)** | **runs, with `Dot` declared** |
+  | **`reduce` over `Circle[][]` (`T = Circle[]`, `A = i32`)** | **runs, with `Dot` declared** |
+  | **`reverse` over `Circle[][]` (`T = Circle[]`)** | **runs, with `Dot` declared** |
+  | **`sorted` over `Circle[][]`, comparator `byR(a: Circle[], b: Circle[])`** | **runs, with `Dot` declared** |
 
-  The last row is the same `Circle[]` type reaching a type parameter through the receiver
-  instead of through a callback annotation, in a program that has the twin — so the trigger is
-  the binding column, not the type and not the presence of the twin alone. That split is the
+  The last three rows are the same `Circle[]` type reaching a type parameter through the
+  RECEIVER instead of through a callback annotation, in a program that still has the twin and
+  still has `Circle` as an arm — so they isolate the binding column with the trigger HELD
+  CONSTANT rather than by removing it, which is what makes them controls rather than three
+  more negative cells. **The `sorted` one is the sharpest and it is why the word FIRST is in
+  the property**: its comparator ANNOTATES `Circle[]` outright, and it still runs, because
+  `T` is first bound at `self: T[]`. A callback merely MENTIONING the type is not the trigger;
+  being where the parameter is FIRST BOUND is.
+
+  **The same property is recorded one carve-out back**, which makes it corroboration rather
+  than coincidence: `std/array.vl`'s litunion-accumulator paragraph had already found that
+  "the deciding property is PARAMETER ORDER (`A` is first bound at the CALLBACK parameter;
+  move `init: A` ahead of `f` and the identical body runs)". Same column, a different rep,
+  found independently twice. That split is the
   seam `std/array.vl`'s header already reasons about: a substituted RETURN annotation goes
   through the argument's arena rows (`pinTys`) while the body's annotated locals go through
   the pin re-resolved from the pin's NAME (`pinnedTyIx`), and the header's own note says those
