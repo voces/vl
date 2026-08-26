@@ -1270,8 +1270,18 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
       // A VALUE-UNION field (code 16) coerces a raw scalar/string/null value into
       // the box (`{ y: 5 }` against `{ y: string | i32 }` boxes the 5 with its
       // atom tag); a union-valued field expression passes through unchanged.
+      //
+      // `emitUnionBoxArg`, NOT plain `emitUnionCoerce`, and the cell type is the whole
+      // reason: a code-16 field slot IS the `(ref $uBox)`, so it is a BOX-typed position
+      // exactly like a call argument / return / list element / map value / push — every
+      // one of which routes through this wrapper. `emitUnionCoerce` alone RAW-PASSES a
+      // concrete kind-8 VARIANT (`{ s: v }` over `{ s: Shape }` with `v: Circle`) and,
+      // since D24's rung landed beside it, the `nulvariant` NICHE too. Both were
+      // `vl check` rc 0 and `type mismatch: expected (ref $type), found (ref $type)` at
+      // load. The wrapper boxes those two shapes and defers every other one here
+      // unchanged, so the scalar / string / null / passthrough cells keep their bytes.
       if scode == 16 {
-        if emitUnionCoerce(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 {
+        if emitUnionBoxArg(body, sFieldElemNameAt(si, fi), valIx, fnIx) < 0 {
           return -1
         }
       } else if scode == 17 {
@@ -1861,7 +1871,12 @@ function emitVariantStruct(body: i32[], objIx: i32, vi: i32, fnIx: i32) {
       // path (`emitObj`) gives a code-16 field. Without it the raw value was `struct.new`'d
       // straight into the box slot (an i32 where a `(ref $box)` is required — invalid wasm,
       // the nested struct-field-union construction hole).
-      if emitUnionCoerce(body, variantFieldElemName(vi, fj), valIx, fnIx) < 0 {
+      //
+      // Through `emitUnionBoxArg` for the reason its plain-struct twin above states: the
+      // field cell is the `(ref $uBox)`, so a concrete variant / `nulvariant` niche value
+      // has to be BOXED rather than raw-passed. Every other shape defers to
+      // `emitUnionCoerce` unchanged.
+      if emitUnionBoxArg(body, variantFieldElemName(vi, fj), valIx, fnIx) < 0 {
         return -1
       }
     } else if vcode == 0 && variantFieldIsLitUnion(vi, fj) {
@@ -4447,6 +4462,33 @@ export function emitUnionBoxArg(
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, variant-ref }
       return 0
+    }
+    // THE NICHE TWIN of the rung above (silent-class-inventory D24). A narrowed `Circle |
+    // null` is the `nulvariant` NICHE — one non-null member, so a bare `(ref null $Circle)`
+    // and NOT a `{tag, value}` box — and `exprVariantIndex` answers -1 for it by
+    // construction: its arms are the kind-8 param, the declared local and the global, none
+    // of which is the nullable cell. So the value fell past this whole gate into
+    // `emitUnionCoerce`, whose own variant rung asks the same -1 question, and was passed
+    // through RAW: `local.get 0 ; return_call $area` with no `struct.new $uBox` between
+    // them, a `(ref null $Circle)` under a `(ref $uBox)` parameter. `vl check` rc 0, and
+    // the engine refuses the module.
+    //
+    // THE NARROW IS WHAT MAKES IT SOUND: this position is only reachable with the value
+    // proved non-null, and the box's payload field is `anyref`, so the niche rides it
+    // exactly as the non-null variant ref does — same three bytes, one different source.
+    //
+    // GATED ON THE BOOLEAN TWIN, not on the index alone: `exprNullableVariant` and
+    // `nulVariantIdxOfExpr` are a kind/slot PAIR (that helper's header states the rule),
+    // and reading the slot without the kind is how a number from another index space gets
+    // used as a tag.
+    if exprNullableVariant(exprIx, fnIx) {
+      const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
+      if nvi >= 0 && nvi < uTags.length {
+        fbI32Const(uTags[nvi]) // 0x41 i32.const <variant tag>
+        if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+        fbStructNew(uBoxIdx) // { tag, niche-ref }
+        return 0
+      }
     }
   }
   emitUnionCoerce(body, unionName, exprIx, fnIx)
@@ -13428,6 +13470,27 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
             if asNraRhs is NullLit { asCtx.nulRefHeap = rlWrapIdx[asRls] }
           }
         }
+        // THE VARIANT NICHE (`c: Circle | null`) — the last niche this arm lacked, and the
+        // only one whose NON-NULL half needs a seed too. Its null is `ref.null
+        // $uVarHeap[vi]`, the same heap the DECLARATION's `= null` seeds; and an object
+        // LITERAL right-hand side must build the concrete variant struct that subtypes the
+        // niche, because without the index `emitObj` takes its union-program default and
+        // `struct.new`s a BOX into the niche slot — `vl check` rc 0, `expected (ref null
+        // $type), found (ref $type)` at load (silent-class-inventory D22, at the ASSIGNMENT
+        // position rather than the argument one). The kind gates the slot, as everywhere
+        // this pair is read; the heap seed carries the #964 leak gate for the same reason
+        // its ref-array sibling above does, and the index seed is consumed by `emitObj`
+        // alone, so a niche VALUE right-hand side ignores it.
+        if exprNullableVariant(a.binLeft, fnIx) {
+          const asNvi = nulVariantIdxOfExpr(a.binLeft, fnIx)
+          if asNvi >= 0 {
+            asCtx.variantIdx = asNvi
+            if asNvi < uVarHeap.length {
+              const asNvRhs = P.nodes[unwrapParen(a.binRight)]
+              if asNvRhs is NullLit { asCtx.nulRefHeap = uVarHeap[asNvi] }
+            }
+          }
+        }
         // A literal-union local (`k = "b"`): the member RHS lowers as its interned i32 id.
         if exprIsLitAtom(a.binLeft, fnIx) { asCtx.litUnion = 1 }
         if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
@@ -13768,9 +13831,15 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // A BOX-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
       // NICHE fields seed their null rep for a bare `null` RHS (the table at
       // `emitNullLitNode`). A non-null value passes through.
+      //
+      // The WRITE twin of the construct-side seed above, and it takes `emitUnionBoxArg` for
+      // the same reason: the field cell is the `(ref $uBox)`, so a concrete kind-8 variant
+      // or a `nulvariant` niche RHS must be boxed rather than raw-passed. One home for
+      // "which coercer does a box-typed position use", so the three code-16 sites
+      // (construct, variant payload, this store) cannot drift apart again.
       if fscode == 16 {
         if (
-          emitUnionCoerce(
+          emitUnionBoxArg(
             body,
             sFieldElemNameAt(si, fieldIdx),
             a.binRight,
@@ -19266,6 +19335,19 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // (`ref.null $uVarHeap[vi]`), `-1` for none. The variant twin of
     // `cParamNulRefArrHeap`, and it rides the SAME generic `nulRefHeap` seed.
     let cParamNulVariantHeap = -1
+    // THE OTHER HALF OF THAT NICHE. A `Circle | null` slot is `(ref null $uVarHeap[vi])`, so
+    // an object LITERAL in it must build the concrete VARIANT struct (which subtypes the
+    // niche) — the heap seed above answers only for a bare `null`. Without it the literal
+    // fell to `emitObj`'s union-program default and emitted `struct.new $Circle ;
+    // struct.new $uBox` into the niche: `vl check` rc 0 and `expected (ref null $type),
+    // found (ref $type)` at load (silent-class-inventory D22).
+    //
+    // FOUR POSITIONS SEED THIS PAIR AND TWO OF THEM LACKED THE NON-NULL HALF. The LET
+    // position has it through `letAnnVariantIdx` and the RETURN position through
+    // `retNulVariantFlag` + `nulVariantIndexOf`; this is the argument rung, and the local
+    // ASSIGNMENT rung is in `emitAssign`'s niche-seed block. Not a new rule — the two rungs
+    // that already existed are the rule, and these two were missing from it.
+    let cParamNulVariantIdx = -1
     let cParamNulSLKind: VKind | null = null
     // A literal-union param position: a member-literal argument lowers as its interned i32 id.
     let cParamLitUnion = false
@@ -19287,6 +19369,7 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
             const cpNvi = nulVariantIndexOf(cpnb.parType)
             if cpNvi >= 0 && cpNvi < uVarHeap.length {
               cParamNulVariantHeap = uVarHeap[cpNvi]
+              cParamNulVariantIdx = cpNvi
             }
           }
           if retNulRefArrFlag(cpnb.parType) == 1 {
@@ -19433,6 +19516,12 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           const nvArg = P.nodes[args[i]]
           if nvArg is NullLit { argCtx.nulRefHeap = cParamNulVariantHeap }
         }
+        // The NON-null half of that niche (D22): an object LITERAL builds the concrete
+        // variant struct, which subtypes the `(ref null $uVarHeap[vi])` slot. Seeded
+        // UNCONDITIONALLY, exactly as the `cVi` variant-param seed below is: the hint is
+        // consumed by `emitObj` alone (`pendingVariantIdx`, cleared on use), so a variant /
+        // niche VALUE argument ignores it and its bytes are unchanged.
+        if cParamNulVariantIdx >= 0 { argCtx.variantIdx = cParamNulVariantIdx }
         if cParamLitUnion { argCtx.litUnion = 1 }
         if cParamNulLitUnion {
           argCtx.litUnion = 1
