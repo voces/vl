@@ -3604,6 +3604,7 @@ Repro:
   | `named` producer — the element is an IDENT of a declared ARM type | **135** | **D40** below (50 of them also `mapval`) |
   | `call` producer — the element is a CALL result | **64** | D40's sibling (50 also `mapval`) |
   | of which `mapval` container, either producer | *(100)* | **D34** |
+  | of the `named` total, the `bare` container with NO union required | *(subset)* | **D41** below |
 
   No arm of this fix can see the `named` or `call` populations: their first element is not an
   `ObjLit`, so the three classifiers' object arms never run. The 20 `anon` cells that remain
@@ -3700,7 +3701,19 @@ header, and its engine MESSAGE differs, which is recorded rather than smoothed o
     // vl check rc 0; vl run:
     //   failed to compile: type mismatch: expected (ref $type), found (ref $type)
 
-* **THE INTERMEDIATE BINDING IS THE AXIS**, and it is one line: `return [c]` directly RUNS.
+* **THE INTERMEDIATE BINDING IS THE AXIS ON THE IMPORT-FREE SPELLING ONLY, and the std review
+  of this change caught the difference.** `return [c]` with no intermediate local RUNS above and
+  is SILENT through `mapIndexed` — the same message, unchanged. The remedy that holds for BOTH
+  is annotating the local. That distinction was written the wrong way round into `std/array.vl`'s
+  header first, as a remedy a caller would have followed into a `vl check`-clean invalid module,
+  which is the worst shape this repo files. Measured, all four `vl check` rc 0:
+
+  | spelling | import-free | through `mapIndexed` |
+  |---|---|---|
+  | the witness | silent | silent |
+  | `return [c]`, no intermediate local | **runs, 7** | **silent** |
+  | `const o: Circle[] = [c]` | **runs, 7** | **runs, 7** |
+  | annotate the callback's own return `: Circle[]` | (is the witness) | silent |
 * **THE TWO SPELLINGS GIVE DIFFERENT ENGINE MESSAGES** — `expected i32` import-free, `expected
   (ref $type)` through `mapIndexed` — so whether they are one rung or two is OPEN. Both are
   silent, both are byte-identical on `f2064bec`, and both are fixed by the same two one-line
@@ -3717,7 +3730,7 @@ header, and its engine MESSAGE differs, which is recorded rather than smoothed o
   here it is a union ARM arriving the same two ways.
 * Controls, each ONE line different, all measured:
 
-  | control | outcome |
+  | control (on the IMPORT-FREE witness) | outcome |
   |---|---|
   | `return [c]` with no intermediate local | **runs, prints 7** |
   | the LOCAL annotated (`const o: Circle[] = [c]`) | runs, prints 7 |
@@ -3728,6 +3741,13 @@ header, and its engine MESSAGE differs, which is recorded rather than smoothed o
   The last two are what keep it out of D39's family: D39's own axis control (drop the return
   annotation) is LOUD here rather than running, and the plain-struct control reaches a
   documented emit floor rather than the defect.
+* **IT IS A GENUINE `std:array` CARVE-OUT BY THE ROUTING TEST, and that is a stronger statement
+  than "a caller can reach it".** The std spelling has no return annotation, and its import-free
+  sibling — the same body called directly — is the LOUD `emitProgram: field access but no struct
+  type declared`. Routing the identical producer through `mapIndexed` turns that loud refusal
+  into silence, which is D35's property at a second position. **The BARE container does the same
+  thing** (`const c: Circle = { r: n }  const o = c  return o`): loud called directly, silent
+  through `mapIndexed`. Both containers are counted in `std/array.vl`'s header for that reason.
 * **ALMOST FLAT ACROSS THE TWIN AXIS, and the exception is measured rather than rounded off**:
   the 135 `named` cells are 25 at `none`, 25 at `namediff`, 25 at `armtwin`, 30 at `exact` and
   30 at `after`. The witness above is in the flat 25 — no twin at all — which is what separates
@@ -3739,6 +3759,55 @@ header, and its engine MESSAGE differs, which is recorded rather than smoothed o
   twin profile and is very likely the same root by `arrLitIsRef`'s own account — an IDENT and a
   CALL miss the same first-element probes. It is recorded as a sibling rather than folded in,
   because it was not separately reduced to a witness.
+
+---
+
+### D41 — an un-annotated local ALIASING an un-annotated object literal, returned
+**check-clean invalid wasm · found 2026-08-26 by the `std-api-reviewer` pass over D36/D38's OWN retirement — the FIFTH consecutive time that review has produced the closing change's next row · pre-existing and byte-identical on `f2064bec` (same offset, same message) · SEVEN lines, no import, no generic, no union, no twin, no annotation and NO TYPE DECLARATION AT ALL**
+
+Repro:
+
+    function mk(n: i32) {
+      const c = { r: n }
+      const o = c
+      return o
+    }
+
+    print(mk(7).r)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   failed to compile: …::mk — type mismatch: expected i32, found (ref $type)
+
+* **THE ALIAS IS THE WHOLE OF IT.** Two controls, each ONE line different, both RUN:
+
+  | control | outcome |
+  |---|---|
+  | `return c` — drop the intermediate local | **runs, prints 7** |
+  | `function mk(n: i32): Circle` with `type Circle = { r: i32 }` declared | **runs, prints 7** |
+
+  A third, `return o.r` inside `mk` so the object never crosses the return boundary, also runs.
+  So the defect is an un-annotated RETURN whose value reaches it through an alias of an
+  anonymous object literal; the emitter types the result `i32` and the body hands it a ref.
+* **THE REVIEW FOUND IT AND ITS DIAGNOSIS WAS WRONG, which is why this row carries a smaller
+  witness than the one filed.** The review's nine-line version imports `mapIndexed` and declares
+  a struct, and it concluded "the route is the whole of it — this is D35's property at the RESULT
+  position", on a direct-call control that was LOUD. That control had a UNION declared. Delete
+  the union and the direct call is SILENT too — the seven lines above, with nothing declared —
+  so the generic is not the axis and neither is the union. Re-running the review's own control
+  cells is what separated them; the finding survived, the mechanism did not.
+* **IT IS THEREFORE NOT A `std:array` CARVE-OUT** under that header's routing test (an outcome
+  that is WORSE through the module than written directly), and `std/array.vl` names it as a
+  compiler row rather than counting it. The union-PRESENT bare cell IS a carve-out and is
+  counted there, under D40.
+* **IT IS THE UNION AXIS THE 900-CELL GRID COULD NOT SEE.** `type Sq`/`type Shape` are declared
+  in every one of those 900 files, so a cell whose finding is "the union is not required" was
+  outside the population by construction. That is the same shape as the two entries
+  `std/array.vl`'s ledger already catalogues (a grid that held the callback result's SPELLING
+  constant, and "the diagonal passing for a cross product") — a population measurement is only
+  as wide as its axes.
+* Pinned as `tests/cases/soundness/xfail-miscompile-alias-local-anon-objlit-return.vl`,
+  `@no-instantiate`. It is NOT the specimen — `INVALID_MODULE_SRC` points at D39 — but the
+  tripwire's biconditional only asks that the marked set be non-empty while a specimen is
+  named, so a second pin is legal and is what freezes this shape.
 
 ---
 
