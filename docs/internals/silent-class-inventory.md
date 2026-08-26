@@ -1746,15 +1746,33 @@ drifted, not a missing inference.
   `tests/cases/functions/tail-assign-variant-cell-reject.vl`. The `nulstr` decline, newly
   REACHED from the un-annotated local, delivered what it promised: 12 cells to `runs`.
 * **The capture population after the fix: perfect annotation parity.** All four binding
-  forms score identically, 166 `runs` / 14 loud emit reject / 2 loud check reject of 182
-  each; 126 cells moved, every one `loud emit reject → runs`. The residual 14 per form is
-  `nulvariant`, which is loud in ALL FOUR forms and therefore not this axis (see D22–D24);
-  the 2 per form is `match` over a literal-member union, a checker limitation, also flat.
-* **No collateral.** 1825 of 2247 corpus programs compile under both seeds and all 1825 are
-  BYTE-IDENTICAL; the only two files that differ are the two fixtures this change adds.
-* Pins: `tests/cases/closures/capture-unannotated-nullable-reps.vl` (nine reps that moved
-  plus `S | null`, the one that already worked, kept as the control that a future half-fix
-  cannot pass on alone) and `tests/cases/functions/tail-assign-variant-cell-reject.vl`.
+  forms score identically — **180 `runs` / 0 loud emit reject / 2 loud check reject of 182
+  each**, 140 cells moved and every one `loud emit reject → runs`. The only residual in the
+  whole 728-cell grid is 8 cells: `match` over a literal-member union, a checker limitation,
+  flat across all four forms and so not an annotation axis at all.
+* **THE `nulvariant` RESIDUAL CLOSED, AND IT TOOK BOTH FIXES — measured, not assumed.** When
+  this row was first written the residual was 14 per form at `Circle | null`, attributed to
+  the D22–D24 call-boundary class rather than to the annotation axis. #1937 closed that class.
+  Re-run on the merged base, the un-annotated `nulvariant` cells are a 2x2 over the two
+  branches:
+
+      neither fix   (master ea8e59aa)     14 cells loud emit reject
+      D21 fix only  (branch pre-#1937)    14 cells loud emit reject
+      #1937 only    (master 2788d76f)     14 cells loud emit reject
+      BOTH          (branch merged)       14 cells RUN
+
+  Neither fix alone moves a single one of them. The nullable-variant NICHE is resolved by the
+  call-boundary ladders #1937 repaired, and reaching those ladders at all needs the capture
+  ladder this row repairs — so the attribution was right and the two changes compose exactly.
+  Pinned at the foot of `capture-unannotated-nullable-reps.vl`, where deleting either half
+  restores `bare null needs a struct-typed context`.
+* **No collateral.** Re-measured against each master this branch was merged onto; on
+  `2788d76f` the figure is in the commit that merged it. Every corpus program that compiles
+  under both seeds is BYTE-IDENTICAL under both; the only files that differ are the fixtures
+  this change adds.
+* Pins: `tests/cases/closures/capture-unannotated-nullable-reps.vl` (nine reps that moved,
+  `Circle | null` for the two-fix composition above, and `S | null` — the one that already
+  worked — kept as the control that a future half-fix cannot pass on alone) and `tests/cases/functions/tail-assign-variant-cell-reject.vl`.
   `tests/cases/closures/capture-nullable-niche-storage-class.vl` is the ANNOTATED control
   the first is measured against — the two must not diverge again.
 * **WHAT THE `variant` RESULT OPENED, filed as D27 / D28 / D29.** Lifting that decline proved
