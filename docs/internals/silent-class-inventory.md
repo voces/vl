@@ -3137,9 +3137,13 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
     Both run now, and both are pinned running.
 
 * **CORPUS BYTE-IDENTITY vs `235b365b`: 1,837 of 2,262 compile under both seeds, 2
-  byte-different, 0 lost, 1 gained.** All three are this change's own pins (the two graduated
-  `xfail` files and `array-reduce-member-accum-layout-twin.vl`, which compiles at all only
-  because the loud refusal is retired). Nothing else in the corpus moved a byte.
+  byte-different, 0 lost, 1 gained.** The file list is the corpus AS OF `235b365b` — taken
+  before this change added or renamed anything, so the three movers are named by the names
+  they had then: `xfail-miscompile-mono-result-list-elem-twin.vl` and
+  `…-callback-accum-list-twin.vl` (byte-different — a D33 program still COMPILES; it is the
+  engine that refuses it at load), and `error-array-reduce-member-accum-layout-twin.vl`
+  (gained — it emits no bytes at all on master, because the loud refusal aborts the module).
+  All three are this change's own pins. Nothing else in the corpus moved a byte.
 
 * **THE CENSUS, extended from #1942's to the SUBSTITUTION path, in two halves.**
 
