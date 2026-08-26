@@ -2811,9 +2811,21 @@ branch has ZERO silent cells on the grid. The axes reproduce the filed controls 
 seed and this branch's, and all 1,834 are **BYTE-IDENTICAL**: 0 byte-different, 0 lost the
 ability to compile, 0 gained it. The gate fires where the defect was and nowhere else.
 
-Pinned as `tests/cases/unions/variant-element-list-beside-layout-twin.vl` (seven
-consumptions, no import and no generic) and, for the `std:array` mint, by
-`tests/cases/std/array-reduce-narrowed-variant-init.vl`.
+Pinned TWICE: `tests/cases/unions/variant-element-list-beside-layout-twin.vl` (seven
+consumptions, no import and no generic), and `circleList` in
+`tests/cases/std/array-reduce-narrowed-variant-init.vl` for the `reduce`-MINTED spelling —
+a `Circle[]` in a function that calls no generic, beside that file's union accumulators.
+**The second pin was written for this close, not inherited**: the first draft of the
+`std/array.vl` retirement cited that fixture as already covering the cell and the fixture
+contained no `Circle[]` at all. It fails on master (`a80c6717`) at offset 1597 with the
+row's own message, which is what makes it a regression pin rather than a demonstration.
+
+An incidental finding from writing it, pre-existing and NOT fixed here: the hint tier
+renders that binding's inferred type with the monomorphization suffix intact —
+``redundant type annotation: `xs` is inferred as `Circle$m0[]` `` — a mangled instance name
+leaking into a user-facing diagnostic. Byte-identical on master for the same four-line
+program, so it is a separate row's worth of work; it is declared verbatim in the fixture
+rather than pinned in its pretty form, so the tree notices when it is fixed.
 
 #### THE CENSUS THE CLOSE OWED — one rung here, and a SECOND live rung at D26's source
 
