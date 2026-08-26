@@ -139,15 +139,34 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // fell past its atom-element arm to a string WIDEN that should never have been reached.
 // See `tests/cases/soundness/generic-litunion-element-bind-and-store.vl`.
 //
-// This specimen leaves the literal-union family entirely, which the last four did not: `??`
-// over a LIST INDEX whose element is `string | null`. The coalesce lowers to an
-// if-expression typed at the NON-NULL string it promises, and its ELSE arm re-reads
-// `array.get` off an `(array (mut (ref null $str)))` backing without narrowing — so a
-// `(ref null $str)` reaches a slot declared `(ref $str)`. Pinned as a corpus case by
-// `tests/cases/soundness/xfail-miscompile-nulstr-list-coalesce.vl`, and filed before that in
-// `docs/internals/per-rep-ladder-audit.md` as the one check-clean-invalid-wasm cell of the
-// `??`-over-a-list-index row.
-const INVALID_MODULE_SRC = `const xs = ["p", null]\nprint(xs[1] ?? "q")\n`;
+// Its previous replacement left the literal-union family entirely: `??` over a LIST INDEX
+// whose element is `string | null`, which lowered to an if-expression typed at the NON-NULL
+// string it promises and re-read `array.get` off an `(array (mut (ref null $str)))` backing
+// in its ELSE arm without narrowing. That closed too — the re-read is gone, replaced by the
+// `br_on_non_null` block every other nullable-REF niche already used, so the narrow IS the
+// branch and there is no value arm left to get wrong. See
+// `tests/cases/lists/nullable-elem-list-coalesce.vl`, the `@run` fixture that replaced the
+// pin, and it reddened this file exactly as intended.
+//
+// This specimen is the OTHER `@no-instantiate` case — the one the set-equality tripwire below
+// scans `tests/cases/std` for: `std:array`'s `mapIndexed` when the callback's RESULT `U` is a
+// STRING literal union. `mapIndexed` builds a `U[]`, which over a literal union is an array of
+// interned i32 ATOMS, while the callback's declared result softens to a string ref at the
+// signature boundary — so the `.push` into the freshly built result list hands one heap type
+// to a slot declared as another. The receiver's element type is irrelevant (this is written
+// over an `i32[]`, which `std/array.vl`'s ADMITTED list says is fine); `U` alone is the
+// predicate, and only for the string family. Pinned as a corpus case by
+// `tests/cases/std/xfail-miscompile-mapindexed-litunion-result.vl`, whose header carries the
+// `T` x `U` grid.
+const INVALID_MODULE_SRC = `import { mapIndexed } from "std:array"\n` +
+  `\n` +
+  `function toAB(x: i32, i: i32): "a" | "b" {\n` +
+  `  if x + i > 0 { return "b" }\n` +
+  `  "a"\n` +
+  `}\n` +
+  `\n` +
+  `const ns = [0, 1]\n` +
+  `print(ns.mapIndexed(toAB)[1])\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
@@ -254,11 +273,13 @@ Deno.test({
     // of it, leaving the last live case in `std/` — at which point a soundness-only scan
     // found ZERO marked files and tripped the "read nothing" guard below. The guard was
     // right and the scan was too narrow: a check-clean-invalid-wasm shape can be filed
-    // wherever its subject lives. That `std/` case has since graduated too (the family is
-    // closed), and both directories are populated again by two unrelated shapes — the `??`
-    // list-index coalesce under `soundness/` and `mapIndexed`'s literal-union RESULT list
-    // under `std/`. The membership moves; the two-directory scan is what stops it moving
-    // out from under the gate.
+    // wherever its subject lives. Membership has moved twice since — that `std/` case
+    // graduated and both directories filled again (the `??` list-index coalesce under
+    // `soundness/`, `mapIndexed`'s literal-union RESULT list under `std/`), and then the
+    // coalesce one graduated too, leaving `std/` the sole home again. THE SCAN MUST STAY
+    // TWO-DIRECTORY REGARDLESS: it is what stops the membership moving out from under the
+    // gate, and a `soundness/`-only scan is exactly the narrowing that tripped the "read
+    // nothing" guard the last time this list emptied.
     const dirs = [`${ROOT}/tests/cases/soundness`, `${ROOT}/tests/cases/std`];
     const marked = new Set<string>();
     for (const dir of dirs) {

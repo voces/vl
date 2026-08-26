@@ -39,8 +39,8 @@ repro rather than a paraphrase:**
 | row | filed | today |
 |---|---|---|
 | D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
-| D16 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
-| D6 D7 D9 D12 D13 D14 D15 | various | as filed, still live |
+| D16 D7 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
+| D6 D9 D12 D13 D14 D15 | various | as filed, still live |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -62,7 +62,11 @@ mismatch` traps: a named `(i32) => i32` into a `(i32) => (i32 | null)` parameter
 
 Measured before/after on the same 322 closure cells, same harness: silent 17 → 0, `correct`
 unchanged at 43. The surviving 6 are D6 (4 cells, numeric-litunion map value at `mapget`)
-and D7's family (2). Pins: `tests/cases/closures/error-is-functype-slot-rep-reject.vl`,
+and D7's family (2). **D7 IS NOW CLOSED TOO — SILENT TOTAL 6 → 4**, re-measured on the same
+9,126 + 219 cells with the grader re-validated first: main grid `correct` 6,897 /
+invalid_wasm 4, order grid 0 silent, and the 4 are exactly D6's `rep=numlit pos=mapget`
+cells (c08730-c08733). D7's own two cells (c08570 / c08571) grade `correct` with the
+evaluation-count oracle at 1. Pins: `tests/cases/closures/error-is-functype-slot-rep-reject.vl`,
 `error-fn-slot-rep-differs-reject.vl`, and — for the shape the cells were aimed at —
 `nullable-closure-is-narrow-positions.vl`.
 
@@ -533,8 +537,8 @@ DECLARED-nullable value type `{[string]: N2 | null}`.
 
 ---
 
-### D7 — `xs[0] ?? d` over a nullable-ELEMENT list emits invalid wasm
-**check-clean INVALID WASM · 2 cells · already documented as a residue, still live**
+### D7 — [CLOSED 2026-08-25] `xs[0] ?? d` over a nullable-ELEMENT list emits invalid wasm
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · 2 cells · already documented as a residue, still live**
 
 Repro:
 
@@ -558,10 +562,12 @@ Second control: `??` on a map index get (`m["k"] ?? "DD"`) — correct.
   verdict and is pre-existing."* Re-measured here at 2 cells (both inputs) and unchanged.
   Recorded so it is not re-derived a third time.
 
-**THIS ROW AND `soundness/xfail-miscompile-nulstr-list-coalesce.vl` ARE ONE DEFECT.** Same
-program, same disassembly, filed twice under two names — and the fixture is the better
-record, because it carries the mechanism off the disassembly rather than only the verdict.
-Quoted here so this row cannot outlive the fixture:
+**THIS ROW AND `soundness/xfail-miscompile-nulstr-list-coalesce.vl` WERE ONE DEFECT** —
+same program, same disassembly, filed twice under two names, cross-linked in #1923 before
+either was fixed precisely so that closing it could not leave half the queue reading as
+live. **BOTH HALVES ARE CLOSED**: this row is re-graded above, and the fixture graduated to
+`tests/cases/lists/nullable-elem-list-coalesce.vl` (`@run` + `@log`). The mechanism the
+fixture carried, kept here because it is what the fix had to remove:
 
     (if (result (ref $str))                   ;; the NON-NULL type `??` promises
       (ref.is_null (array.get $back …))       ;; the null test, on a re-read
@@ -569,15 +575,32 @@ Quoted here so this row cannot outlive the fixture:
       (else (array.get $back …)))             ;; THE SAME READ AGAIN, still (ref null $str)
 
 The backing of a `(string | null)[]` is `(array (mut (ref null $str)))`, so the ELSE arm's
-`array.get` yields the nullable reference into a slot declared non-null. Every other `??`
-sink narrows at this seam; the list-index arm re-reads and hands the raw nullable through.
-The `then` arm is fine, which is why the shape surfaces at validation rather than at
+`array.get` yielded the nullable reference into a slot declared non-null. Every other `??`
+sink narrowed at this seam; the list-index arm re-read and handed the raw nullable through.
+The `then` arm was fine, which is why the shape surfaced at validation rather than at
 execution.
 
-**Two entries for one defect is the condition that lets a queue rot**: fixing it clears one
-and leaves the other reading as live, which is how eight rows in this file sat stale. When
-this closes, close BOTH — graduate the fixture out of `xfail-` and re-grade this row — and
-`python3 scripts/check-filed-witnesses.py` will hold you to the second half.
+**THE FIX, and why it is one fix for two defects.** Every other lhs of this rep narrows on
+that re-read — an ident / struct-field read recovers itself once `rawNullRead` is cleared —
+but a LIST INDEX cannot: the element legitimately holds null, so `xs[i]`'s `array.get` must
+stay `(ref null $str)` under EVERY context and a recovering read arm would trap on the very
+value `??` exists to answer for. **The re-read was also a SECOND EVALUATION of the index**,
+which the invalid module hid: built with `--no-validate`, `xs[f()] ?? d` disassembles to two
+`call $f`. Narrowing the else arm would have closed the first and left the second, so the
+arm now takes the `br_on_non_null` block every OTHER nullable-ref niche already used
+(`emitCoalesceNulRefCtx`, factored out of `emitCoalesceNulRef`): the place is evaluated ONCE
+and the narrow IS the branch, so there is no value arm left to get wrong. Measured after:
+both cells `correct`, eval-count oracle 1, and `xs[f()] ?? d` prints one tick.
+
+* **Byte-identical after the fix**: the map-index control, the non-nullable-element list, and
+  every non-`string`-rep cell of the grid (`boolean | null`, `K | null`, `S | null`,
+  `i32[] | null` elements). The bind-first control is NOT byte-identical — it shares this
+  lowering, so it lost its own re-read too (2102 → 2096 bytes) — and it answers the same.
+* **NOT closed by this, and not this defect**: `(i32 | null)[]`, `(f64 | null)[]` and a
+  nullable-CLOSURE element at the same position are a LOUD emit reject
+  (``emitProgram: `??` is only supported on a map index get``) — the boxed value union and
+  the closure have no INDEX arm in `emitCoalesce`, only an ident arm and a call arm. Loud,
+  so not in the silent population; bind-first works for all of them.
 
 ---
 
