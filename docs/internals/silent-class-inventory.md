@@ -58,11 +58,12 @@ repro rather than a paraphrase:**
 | D30 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the call site was asking a DIFFERENT question than the callee and now asks the callee's own — `fnRetMapShapeAt` → `inferredRetMapSlot`. The recursion the row filed as a blocker is GUARDED, not avoided: its unguarded symptom is a compiler HANG, not a trap, and the answer on re-entry is the checker's recorded type rather than the mono map, which is what keeps the self-referential case fixed too. 1,215 grid cells, 383 moved, none backward) |
 | D32 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; `rlElemStructRow`'s canon-key rung declines for a name the variant table claims — the exact complement of the gate `exprVariantIndex`'s `Index` arm had carried all along. 140 of 480 grid cells moved, none backward) |
 | D33 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the SAME complement one rung up and read through the ARENA rather than the NAME table. `shapeNominalOfTy` had four rungs and only ONE was nominal by construction; `variantRowOfTy` — arm-DECLARATION identity — was written, correct, and unasked, so two STRUCTURAL field-set scans decided a nominal question and a layout twin is claimed by both. 34 of 360 grid cells moved, 28 from silent and **6 from LOUD** — `std:array`'s last live carve-out, retired by the same predicate — and 0 backward) |
-| D34 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D33's grid: a map VALUE typed at a union ARM is invalid wasm at the STORE **once anything READS the map**. Without the read it is the LOUD documented refusal, so an unrelated expression switches an emit floor OFF. 24 cells, flat at 4 per twin; no generic, no import, no twin |
+| D34 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the mv layer holds only a RENDER of the value type, and `tyToEmitName` spells a declared arm `{r:i32}` — so #1942's NAME gate cannot fire and #1944's `variantRowOfTy` correctly declines a re-resolved render. The fix CARRIES the nominal channel from the annotation node as an ARM-ONLY hint; everything downstream was a pairing whose STRUCT half already existed, `exprNullableVariant`'s missing map rung included. 36 of 300 grid cells moved, 30 to `runs` and 6 silent→LOUD, 0 backward. The filed read-dependence was mis-attributed and the retirement says how) |
 | D35 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D33's grid, and it is `std:array`'s ONE live carve-out: a `needle: T` at a LIST type whose element is a struct. The same `==` written DIRECTLY is a LOUD checker error, so the refusal is LOST in the instantiation rather than missing. All four `needle` exports; no union, no twin |
 | D36 D38 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root, and the grid is what says so. Three classifiers that must agree ARM FOR ARM each carried their own un-gated `objVariantName` field-set scan, so an ANONYMOUS `{r: n}` matched a union arm structurally and the arms WIDENED it to the whole union — a kind-2 BOX list under a reader that unboxes. `arrLitBoxElemName`, which asks the ARENA whether the CHECKER recorded a union element, was written for `collectU` and had no caller on this path. 37 of 900 grid cells moved, 28 from silent and 9 from LOUD, none backward) |
 | D39 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D36/D38's own closing grid, which left 8 of its 900 cells silent under BOTH compilers at the same coordinates. An anonymous element bound to an UN-ANNOTATED local and returned from a function whose RETURN is annotated `Circle[]`, beside an exact layout twin. Eleven lines, no import, no generic, no lambda; it is the new `INVALID_MODULE_SRC` |
-| D37 | check-clean invalid wasm | **NEW 2026-08-26** — filed while building D33's graduated fixture: a generic in the INIT-FIRST parameter order with an EMPTY list-of-arm seed. D33's grid held the seed axis constant at "seeded" while D33's own witness used an empty one — the diagonal passing for a cross product. No twin; no `std:array` spelling (its `reduce` is callback-first) |
+| D37 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE ARM, and its complement is three lines up in the same function — `monoStructAnnName` has had both a BARE and a LIST rung since it was written, and D23's union-arm arm took only the bare one, so `Circle[]` had no home and the cascade's `"i32"` catch-all claimed it. The filed "EMPTY seed" axis is REFUTED by its own cross product: the trigger is the ANNOTATION, flat across empty / literal / call-result seeds and absent from both un-annotated ones. 12 of 120 grid cells moved, all to `runs`) |
+| D47 D48 D49 D50 | — | **NEW 2026-08-26** — four rows the D34/D37 grids and the census produced (renumbered from D39-D47 when #1945 landed first and took those three). D47: the INLINE map-annotation spelling of an arm-valued map keeps the LOUD `-3` floor while the ALIAS spelling now lowers. D48: an arm-valued map and a layout-TWIN struct-valued map in ONE program share a single mv slot (silent, master and branch). D49: `type C = Circle[]` — the array-ALIAS spelling of an arm-element list — is check-clean invalid wasm where the direct `Circle[]` spelling runs (silent, master and branch). D50: a `for` loop over an arm-valued container binds no variant loop var — LOUD on both, list and map spellings alike |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
@@ -3180,8 +3181,8 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
 
 ---
 
-### D34 — a map VALUE typed at a union ARM is invalid wasm at the STORE, once anything READS the map
-**check-clean invalid wasm · found 2026-08-26 by D33's own 360-cell grid (24 of its 42 flat-across-twin residue cells) · pre-existing, byte-identical on `235b365b` and on D33's branch · NO generic, NO import, NO layout twin**
+### D34 — [CLOSED 2026-08-26] a map VALUE typed at a union ARM is invalid wasm at the STORE, once anything READS the map
+**CLOSED 2026-08-26 — the repro now RUNS (prints `7`). Was: check-clean invalid wasm · found by D33's own 360-cell grid (24 of its 42 flat-across-twin residue cells) · pre-existing, byte-identical on `235b365b`, `f2064bec` and on D33's branch · NO generic, NO import, NO layout twin · a DIFFERENT ROOT from D37, which was closed in the same change**
 
 Repro:
 
@@ -3227,6 +3228,83 @@ Repro:
   what separates it from D32/D33. All 24 are the `mapval` substituted type, across four
   different generic spellings, and every one fails in the STORE helper (`mkX` / `mkX$m0`)
   rather than in the generic — which is the same thing the import-free witness above says.
+
+---
+
+**CLOSED — the map layer never saw the name, and the node that still had it was one hop away.**
+
+* **THE FILED READ-DEPENDENCE IS REAL BUT NOT THE MECHANISM, and the grid corrected it.** The
+  row said "delete `rdX` and the same store is the LOUD documented refusal". Re-run verbatim
+  on `f2064bec`, a store-only program with no read at all (`m["k"] = c; return i`) is the SAME
+  silent invalid wasm — offset 478, same message. What switches the loud floor off is not a
+  READ but whether anything in the program interned an INLINE-SHAPE struct row for the value's
+  rendered field set; the row's own repro interned one through its `type CM = {[string]:
+  Circle}` alias, and the fixture it was contrasted against (`error-map-value-struct-in-union.vl`)
+  does not. That fixture's spelling is still the loud floor on this branch (filed as D47).
+* **THE MECHANISM, MEASURED.** Every value spelling the mv layer holds is a RENDER —
+  `nodeTyMapValName` is `tyToEmitName(t.mVal)` — and `tyToEmitName` spells a declared arm
+  `{r:i32}`, character for character what an anonymous shape renders as. Both NAME-keyed
+  resolvers then answer about the wrong table:
+
+      INLINEMINT nm={r:i32} row=0 varShape=0
+      MVPROBE in={r:i32} canon={r:i32} kind=1 vsi=0 vname={r:i32} varIdx=-1 varShape=0
+
+  `varIdx=-1` is `variantIndexOf` declining (the render is not the arm's NAME, so **#1942's
+  gate cannot fire here by construction** — this row needed no twin because the second claimant
+  is an inline row minted from the arm's own field set, not a declared one). `varShape=0` is the
+  variant table claiming the same shape structurally. Re-resolving the render mints a FRESH
+  arena index (`vTy=61`, where `Circle`'s declaration is `40`), so **#1944's `variantRowOfTy`
+  correctly declined too** — the nominal channel had already been destroyed upstream, which is
+  the one thing that makes this row unlike the three before it.
+* **THE FIX CARRIES THE CHANNEL RATHER THAN GUESSING IT BACK.** `collectA`'s `TypeRef` walk
+  holds the annotation NODE, whose recorded value type is still the declaration's own index, and
+  hands it to the interner as an ARM-ONLY hint (`mvShapeOfMapNameArmTy`). It is a SECOND
+  parameter rather than the existing `rowTy` bank because D-MAPNODETY forbids a better ANSWER at
+  the slot FIND rung — an arena leg that answers where the name bridge does not skips the mint —
+  and says nothing about an input consulted after the mint has been decided on.
+* **EVERYTHING DOWNSTREAM WAS A PAIRING WHOSE STRUCT HALF ALREADY EXISTED.** Four of them, and
+  the fourth is the one that makes the point: `exprNullableVariant`'s own header says it is
+  built ARM FOR ARM against `exprNullableStruct`, and `exprNullableStruct` has had the map-read
+  rung (`mapReadMvSlot` → `mvValKind == 1`) since the struct-valued map was written. The variant
+  twin had no `Index` arm at all. The others: `ExpCtx.variantIdx` ("the bare variant an ObjLit
+  must build") has existed since the variant literal path and the map STORE seed only ever set
+  its struct twin; `structIndexOfExpr`'s two map rungs now decline for an arm; and
+  `mvValElemHeapOf`'s kind-1 arm now reads `rlElemHeap` like the four ref kinds above it
+  instead of re-deriving from the struct table.
+* **THE DISASSEMBLY IS ONE TYPE INDEX.** `wasm-tools print`, master `f2064bec` (seed 1,425,295
+  bytes) vs this branch (seed 1,426,430 bytes), every other instruction in `mkX` identical:
+
+      master   (type (;8;) (array (mut (ref null 0))))   ; 0 = the inline-shape row {r:i32}
+      branch   (type (;8;) (array (mut (ref null 1))))   ; 1 = uVarHeap[Circle]
+
+  with `struct.new 1` under BOTH and the narrowed field read moving `struct.get 0 0` →
+  `struct.get 1 0`.
+* **CENSUS — the change created one hazard of its own and it is gated.** `repMapValSlotsTwin`'s
+  kind-1 arm deduped two map slots through `repStructSlotsTwin(mvValStructIdx[a], …)`, and
+  `mvValStructIdx` is the INLINE row: an arm-valued `{[string]: Circle}` and a plain
+  `{[string]: Dot}` matched the same row. Harmless while both sides had the same wrong heap;
+  with the arm's own `uVarHeap[vi]` under one of them it is one map struct over two different
+  vals wrappers. An arm-parity gate is in this change.
+* **THE ZERO IS SPLIT INTO ITS TWO HALVES, because "measured 0" is the claim #1944 got wrong
+  when its counter read 0 on its own positive controls.** A THREE-rung counter was built —
+  the kind-1 arm ENTERED, the parity test returning 0, the parity test returning 1 — and swept:
+
+      arm entered      46 calls over 25 of the 2,263 corpus files
+      parity returns 0  0
+      parity returns 1  0
+
+  So the counter is **reachable and reached**: the arm is live, and this is not #1944's
+  unproven zero. What is 0 is the parity BRANCH, and the honest word for it is not "measured
+  0" but **not reachable today**: deciding it needs two DISTINCT kind-1 slots agreeing on canon
+  id and key rep, and D48 is exactly the reason that pair cannot exist — the two maps collapse
+  onto ONE slot before the twin question is asked. Three constructed positive controls confirm
+  it rather than assume it (an arm beside a layout twin; two arms of ONE union sharing a field
+  set; two arms of DIFFERENT unions sharing a field set): all three build, and all three enter
+  the arm **0 times**. The gate is therefore kept as a STRUCTURAL guard for the day D48 closes,
+  not as a measured-inert one — the distinction #1942 could make and #1944 could not.
+* Pin: `tests/cases/maps/member-struct-valued-map.vl` (five cells: the annotated store, the
+  un-annotated store, both read through a bare get and through `?? d`, and the store-only
+  program the filed control claimed was loud).
 
 ---
 
@@ -3473,8 +3551,8 @@ Repro:
 
 ---
 
-### D37 — a generic in the INIT-FIRST parameter order with an EMPTY list-of-arm seed
-**check-clean invalid wasm · found 2026-08-26 while building D33's graduated fixture, by an axis D33's own grid held constant · pre-existing, byte-identical on `235b365b` and on D33's branch · NO layout twin · NOT reachable through `std:array`, whose `reduce` is callback-first**
+### D37 — [CLOSED 2026-08-26] a generic in the INIT-FIRST parameter order with an ANNOTATED list-of-arm seed
+**CLOSED 2026-08-26 — the repro now RUNS (prints `1`). Was: check-clean invalid wasm · found while building D33's graduated fixture, by an axis D33's own grid held constant · pre-existing, byte-identical on `235b365b`, `f2064bec` and on D33's branch · NO layout twin · NOT reachable through `std:array`, whose `reduce` is callback-first · TITLE CORRECTED: the trigger is the ANNOTATION on the seed, not its emptiness — see below · a DIFFERENT ROOT from D34, which was closed in the same change**
 
 Repro:
 
@@ -3526,6 +3604,59 @@ Repro:
   spelling and is reachable only with a hand-written generic. Recorded in
   `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl`, whose init-first cell
   is deliberately SEEDED with a comment saying why.
+
+---
+
+**CLOSED — one arm, and its complement is three lines above it in the same function.**
+
+* **`monoAnnPinName` IS THE ONE HOME for "which annotation NAME can serve as a pin", and its
+  STRUCT twin has had BOTH rungs since it was written:**
+
+      function monoStructAnnName(name: string) {
+        if isSName(name) { return name }                                        // bare  S
+        if nameIsArray(name) && isSName(arrElemNameRaw(name)) { return name }   // list  S[]
+        ""
+      }
+
+  The union-ARM arm added for D23 took only the FIRST. `Circle[]` was then claimed by NEITHER —
+  `monoStructAnnName`'s list rung asks `isSName("Circle")`, false by the very construction its
+  own header names (a variant has no struct row), and `variantIndexOf("Circle[]")` is false
+  because the name is an array. Both declines are correct in isolation; together they left a
+  spelling with no home and the cascade's `"i32"` catch-all pinned an i32 over a `(ref $rlWrap)`
+  list — which is the sentence D23's own paragraph, four lines up, already writes about the
+  bare arm. **Four for four: the closing predicate's complement already existed and was not
+  consulted.**
+* **THE FILED AXIS WAS WRONG AND THE CROSS PRODUCT IS WHAT SAYS SO.** The row read "THE SEED
+  BEING EMPTY IS THE TRIGGER", because its control replaced the annotated empty local with a
+  call-result ARGUMENT — two changes in one step, the same failure mode the row's own second
+  bullet accuses D33's grid of. Crossed properly (120 cells: parameter order x seed spelling x
+  arm-ness x declaration order):
+
+  | seed spelling | master | branch |   | parameter order | master | branch |
+  |---|---|---|---|---|---|---|
+  | ANNOTATED `[]` | 4/24 | **0/24** | | init-first | 12/40 | **0/40** |
+  | ANNOTATED `[c0]` | 4/24 | **0/24** | | callback-first | 0/40 | 0/40 |
+  | ANNOTATED `mkSeed()` | 4/24 | **0/24** | | no generic | 0/40 | 0/40 |
+  | INFERRED `mkSeed()` | 0/24 | 0/24 | | | | |
+  | DIRECT `mkSeed()` | 0/24 | 0/24 | | | | |
+
+  Emptiness is FLAT across the three ANNOTATED spellings and absent from both un-annotated ones.
+  The annotation is the trigger because it is the only channel `monoAnnPinName` is consulted on:
+  an INFERRED binding never reaches it and the cascade answers correctly. Parameter order and
+  arm-ness are load-bearing exactly as filed (0/30 at `plain`, 0/30 at a non-member struct);
+  declaration order is FLAT (6/60 each).
+* **IT IS NOT D34, AND THE FIX SEPARATES THEM MECHANICALLY.** The two rows were grouped on
+  suspicion ("a union arm inside a container the compiler types elsewhere"). They are two roots
+  in two layers: D37's fix (one arm in `emit_mono.vl`) moved all 12 of its cells and **0** of
+  D34's; D34's fix (`emit_classify` / `emit_bytes` / `wasmEmit`) moved all 30 of its cells and
+  0 of D37's — measured by building each compiler separately. Their failure SIGNATURES differ
+  in kind too: D34 is two heap types for one shape with no rep-class change
+  (`expected (ref null $type), found (ref $type)`), D37 a rep-class collapse to the i32
+  catch-all with no second heap type involved (`expected (ref $type), found i32`).
+* Pin: `tests/cases/generics/mono-initfirst-annotated-arm-list-pin.vl` (all five seed spellings
+  at the init-first column plus the callback-first control).
+  `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl`'s init-first cell is now
+  UN-SEEDED, which is that paragraph's own written instruction for the day this row closed.
 
 ---
 
@@ -4156,6 +4287,185 @@ Repro:
 * Two ways out, and they are not the same size: implement the dispatch (`==` joins the
   B13/B14 operator-function set), or delete the clause from the message. The second is a
   one-line change and is what the message should do until the first exists.
+
+---
+
+### D47 — the INLINE map-annotation spelling of an arm-valued map keeps the LOUD `-3` floor the ALIAS spelling no longer hits
+**loud emit reject · found 2026-08-26 by D34's own retirement, which had to explain why the pinned `error-map-value-struct-in-union.vl` still errors · pre-existing and IDENTICAL on `f2064bec` and on D34's branch · the ACCEPTABLE class (loud both sides), filed for the SPELLING-dependence, not for the reject**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+
+    function cell() {
+      const a: {[string]: Circle} = Map()
+      const c: Circle = { r: 7 }
+      a["k"] = c
+      const g = a["k"]
+      if g != null { return g.r }
+      return -1
+    }
+
+    print(cell())
+    // vl check rc 0 (two hints); vl run:
+    //   emitProgram: unsupported map value type (no rep for a union-member struct, …)
+
+* **THE CONTROL IS ONE LINE AND IT IS THE WHOLE ROW.** Hoisting the annotation into an alias —
+  `type CM = {[string]: Circle}` and `const a: CM = Map()`, nothing else changed — RUNS on
+  D34's branch and prints `7`. It was silent invalid wasm on `f2064bec`.
+* **THE MECHANISM IS THE KIND GATE, WHICH IS NAME-KEYED AND RUNS AHEAD OF THE ARM HINT.**
+  `mvValKindOfName`'s last arm is `structIndexByValName(valName) >= 0`, a field-set scan over
+  the struct table for the value's RENDER. The alias declaration causes the render `{r:i32}` to
+  be interned as an inline-shape row before the map is asked, so the arm answers kind 1 and
+  D34's arm hint then supplies the arm; the inline spelling asks first and gets `-3`. So
+  whether an arm-valued map lowers at all still depends on an incidental intern — which is the
+  half of D34's "an unrelated expression switches an emit floor off" that survives it.
+* **CLOSING IT IS A KIND-LADDER CHANGE, NOT A COLUMN ONE, AND THAT IS WHY IT IS FILED RATHER
+  THAN FOLDED IN.** `mvValStructIdx`'s missing variant half — the reason
+  `tests/cases/maps/error-map-value-struct-in-union.vl`'s header gives for the floor — no
+  longer exists; the column is there (`mvValVariantIdx`). What remains is the `-3` sentinel
+  itself plus the FIVE name-keyed `mvValKindOfName(...) != -3` gates
+  (`mapValKindLowerable` and its four siblings), which decide whether a map local / return /
+  field is lowerable at all and have no type in hand at several of them. Its arena twin
+  `mvValLowersTy` is where an arm arm would go.
+* Pinned as-is by `tests/cases/maps/error-map-value-struct-in-union.vl`, whose header now
+  records the corrected mechanism.
+
+---
+
+### D48 — an arm-valued map and a LAYOUT-TWIN struct-valued map in one program share a single mv slot
+**check-clean invalid wasm · found 2026-08-26 by the census extension D34's change required · pre-existing on `f2064bec` and NOT fixed by D34 — the branch fails in the OTHER function · NO generic, NO import**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    type CM = {[string]: Circle}
+    type DM = {[string]: Dot}
+
+    function mkC(i: i32): CM {
+      const m: CM = Map()
+      const c: Circle = { r: i }
+      m["k"] = c
+      return m
+    }
+
+    function mkD(i: i32): DM {
+      const m: DM = Map()
+      const d: Dot = { r: i }
+      m["k"] = d
+      return m
+    }
+
+    function rdC(v: CM) { const g = v["k"]; if g != null { return g.r }; return -1 }
+    function rdD(v: DM) { const g = v["k"]; if g != null { return g.r }; return -1 }
+
+    print(rdC(mkC(7)))
+    print(rdD(mkD(9)))
+    // vl check rc 0; vl run on f2064bec:  invalid wasm at offset 500 in mkC
+    //                 vl run on D34's branch: invalid wasm at offset 1244 in mkD
+
+* **THE mv SLOT'S IDENTITY IS STRUCTURAL AND BOTH MAPS RENDER THE SAME.** `mvSlotOfTyK` is
+  keyed on the VALUE's arena type, reached by re-resolving `tyToEmitName(t.mVal)`, and
+  `{[string]: Circle}` and `{[string]: Dot}` both render `{[string]: {r:i32}}` — so there is
+  ONE slot, not two, and the first minter's arm hint decides it for both.
+* **THE CONTROL IS THE FIELD NAME.** `type Dot = { q: i32 }` — same arity, different field name,
+  everything else identical — RUNS on D34's branch and prints `7` / `9`. It was silent invalid
+  wasm on `f2064bec`. So the collision is the shared render, not the pair of maps.
+* **THE DEDUP LAYER IS ALREADY GATED FOR THE DAY THE SLOTS SEPARATE.** `repMapValSlotsTwin`'s
+  kind-1 arm now requires arm PARITY before it asks `repStructSlotsTwin`. Counted properly (see
+  D34's census bullet) the ENCLOSING arm is live — 46 calls over 25 corpus files — while the
+  parity branch itself is **not reachable today**, and THIS ROW IS WHY: deciding it needs two
+  distinct kind-1 slots agreeing on canon id and key rep, which is exactly the pair that
+  collapses here. Closing this row is the other half: the arm has to enter the slot's IDENTITY
+  (the `mvSlotOfTyK` / `mvSlotByValNameK` find rungs), and the find sites at the op boundary do
+  not hold the annotation node the mint site does.
+* Ranked below D47 because the outcome is unchanged (silent on both sides), but it is the
+  strictly worse row: the reject in D47 is loud.
+
+---
+
+### D49 — the array-ALIAS spelling of an arm-element list is invalid wasm where the direct spelling runs
+**check-clean invalid wasm · found 2026-08-26 by D34's 300-cell grid (6 of its 6 residual silent cells, flat at 2 per arm-ness across `arm_notwin` / `arm_twin` / `arm_namediff`) · pre-existing and IDENTICAL on `f2064bec` and on D34's branch · NO generic, NO import, NO twin needed**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type C = Circle[]
+
+    function mk(i: i32): C {
+      const c: Circle = { r: i }
+      const l: C = [c]
+      return l
+    }
+
+    function cell(): i32 {
+      const l = mk(7)
+      return 1
+    }
+
+    print(cell())
+    // vl check rc 0 (one hint); vl run:
+    //   Invalid input WebAssembly code at offset 274:
+    //   type mismatch: expected i32, found (ref $type)
+
+* **THE ALIAS IS THE WHOLE TRIGGER.** Spelling the same two annotations `Circle[]` directly —
+  `function mk(i: i32): Circle[]` and `const l: Circle[] = [c]`, `type C` deleted — RUNS and
+  prints `1`, on both compilers.
+* Controls, each ONE line different, all measured: `Sq`/`Shape` deleted so `Circle` is a plain
+  struct → runs; a `Dot` twin present or absent → no change (flat 2/2 at every arm-ness that
+  has an arm, 0/2 at `plain` and at a non-member struct); declaration order → flat.
+* **IT IS NOT D34's ROOT AND ITS SIGNATURE SAYS SO**: `expected i32, found (ref $type)` is a
+  rep-class collapse, not two heap types for one shape — the same signature D37 had, one layer
+  down. The remaining cells of D34's grid at `listelem` READ positions are a LOUD checker
+  reject (`cannot index non-array C`), which is a second, independent alias gap.
+
+---
+
+### D50 — a `for` loop over an ARM-valued container binds no variant loop var
+**loud emit reject · found 2026-08-26 by D34's 300-cell grid (6 cells moved silent → LOUD by its fix) · the LIST spelling is loud on `f2064bec` too; the MAP spelling was silent there and is loud now**
+
+Repro (the LIST spelling — loud on both compilers):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+
+    function mk(i: i32): Circle[] {
+      const c: Circle = { r: i }
+      const l: Circle[] = [c]
+      return l
+    }
+
+    function cell(): i32 {
+      const l = mk(7)
+      let t = 0
+      for v in l { t = t + v.r }
+      return t
+    }
+
+    print(cell())
+    // vl check rc 0; vl run:
+    //   emitProgram: field access but no struct type declared
+
+The MAP spelling (`for v in m.values()` over a `{[string]: Circle}`) is the same gap reached
+from the other container; it was check-clean invalid wasm on `f2064bec` and is
+`emitProgram: field access receiver is not a struct` on D34's branch, because
+`forInRefArrayStructIdx` now DECLINES for an arm rather than handing back a struct row from
+the wrong namespace.
+
+* **`forInElemKind` HAS NO `"variant"` ARM**, so `declareForInLocals` binds the loop var
+  through the struct/nulstruct legs and `addLocalName` gets a struct index the arm does not
+  have. Both container spellings land there, which is what makes this ONE row rather than a
+  map row and a list row.
+* Reading the same element OUT of the loop runs on D34's branch (`l[0].r`,
+  `m["k"]` narrowed) — the loop VAR's storage class is the whole difference.
 
 ---
 

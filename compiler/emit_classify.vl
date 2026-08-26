@@ -413,6 +413,7 @@ import {
   mvValName,
   mvValStructIdx,
   mvValTyIx,
+  mvValVariantIdx,
   mvValsOutBase,
   narrowBareIdentOnly,
   narrowNames,
@@ -1464,6 +1465,18 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is Paren { return nulVariantIdxOfExpr(e.parInner, fnIx) }
+  // The INDEX half of the two map rungs the twin above gained (D34) — a bare `m[k]` and an
+  // `m[k] ?? d` over an ARM-VALUED map. Same slot, same column, so the kind and its
+  // companion index come from one fact, which is the pairing rule this function's header
+  // spends its length on.
+  if e is Index {
+    const mri = mapReadMvSlot(exprIx, fnIx)
+    if mri >= 0 { return mvValVariantOf(mri) }
+  }
+  if e is BinExpr {
+    const cri = coalesceMvSlot(exprIx, fnIx)
+    if cri >= 0 { return mvValVariantOf(cri) }
+  }
   if e is AsExpr { return nulVariantIndexOf(exprIx) }
   // A CALL of a `: Circle | null`-returning function — the callee's own annotation owns
   // the index, which is what an INFERRED binding (`const c = h(true)`) has to read: it
@@ -4856,8 +4869,27 @@ export function mvSlotByValNameK(valName: string, keyI32: boolean): i32 {
 // `tests/cases/maps/alias-positions-and-value-kinds.vl`, because this path MINTS. The rule
 // that came out of it is on `mvShapeOfValNameK` below.
 export function mvShapeOfMapName(mapName: string) {
+  mvShapeOfMapNameArmTy(mapName, -1)
+}
+
+// `mvShapeOfMapName` PLUS the ARM-ONLY type hint (D34). `armTy` is the map VALUE's arena
+// type as the CALLER's node recorded it, and it is used for exactly ONE question inside the
+// mint — "is this value a declared union ARM" (`mvValArmName`). It never reaches a slot
+// LOOKUP rung, which is the distinction D-MAPNODETY draws and the reason this is a second
+// parameter rather than the `rowTy` bank: a better ANSWER at the find rung skips the mint
+// (measured invalid wasm on `tests/cases/maps/alias-positions-and-value-kinds.vl`), while an
+// input consulted only AFTER the mint has been decided on cannot move which slot is minted
+// or whether one is. -1 is "no hint" and the layer behaves exactly as it did.
+//
+// THE HINT IS THE ONLY CHANNEL THAT CARRIES THE ANSWER, which is why the caller has to hand
+// it over rather than this layer asking: every name the mv layer holds is a RENDER, and
+// `tyToEmitName` spells a declared arm `{r:i32}` — identical to a genuinely anonymous shape.
+// Re-resolving that render (`fieldElemTyIxOfName`) mints a FRESH arena index (measured: 61,
+// where `Circle`'s declaration is 40), so `variantRowOfTy` — nominal by construction —
+// correctly declines it. The node the caller holds still has the declaration's own index.
+export function mvShapeOfMapNameArmTy(mapName: string, armTy: i32) {
   const ki = nameIsI32KeyedMap(mapName)
-  const sh = mvShapeOfValNameK(mapValNameOf(mapName), ki)
+  const sh = mvShapeOfValNameArmTy(mapValNameOf(mapName), ki, -1, armTy)
   // A MONO value (i32 / boolean / a literal-union atom / a nullable atom) rides the
   // shared i32 `vals` list, so it needs no per-value struct at all: it is the `-1`
   // string-keyed / `-4` i32-keyed sentinel, which is the pair every value-blind
@@ -4888,7 +4920,12 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   const ki = nodeTyMapKeyIsI32(ix)
   if nodeTyMapValIsLitUnion(ix) { return mapMonoShapeOfKey(ki) }
   if nodeTyMapValIsNulLitUnion(ix) { return mapMonoShapeOfKey(ki) }
-  const sh = mvShapeOfValNameK(nodeTyMapValName(ix), ki)
+  const sh = mvShapeOfValNameArmTy(
+    nodeTyMapValName(ix),
+    ki,
+    -1,
+    nodeMapValTyIx(ix),
+  )
   if sh == -1 { return mapMonoShapeOfKey(ki) }
   sh
 }
@@ -4956,10 +4993,59 @@ export function mvShapeOfValNameK(valNameIn: string, keyI32: boolean) {
   mvShapeOfValNameRowTy(valNameIn, keyI32, -1)
 }
 
+// The DECLARED UNION ARM a map VALUE's arena type names (`{[string]: Circle}` → `"Circle"`),
+// or "" when the value is not one — the mv layer's reading of the same nominal question
+// #1942 asks at the ref-list element and #1944 at the monomorphizer's pin.
+//
+// IT MUST BE ASKED OF THE TYPE, NOT THE SPELLING, and that is the whole reason it exists.
+// Every name the mv layer holds is a RENDER (`nodeTyMapValName` is `tyToEmitName` of the
+// value type), so the arm reaches this layer spelled `{r:i32}` and the two NAME-keyed
+// resolvers both answer about a different table than the one that owns it: `variantIndexOf`
+// declines (the render is not the arm's name) and `structIndexByValName` ACCEPTS, matching
+// the inline-shape row `internInlineShape` minted from the same field set. `variantRowOfTy`
+// is the arena reading — `uVarTyIx[i] == ty`, a DECLARATION identity with no structural
+// rung, for the reason its own header gives: variants are nominal.
+//
+// NOT `variantIndexOfTypeName`, which is the SHAPE scan over the same table: it would claim
+// an inline `{[string]: {r: i32}}` whose value is genuinely anonymous, and #1942's ruling is
+// that a nominal question must not be settled structurally in either direction.
+// The VARIANT-table row a map-value SLOT's value is a declared arm of, or -1 — the read
+// side of the `mvValVariantIdx` column, bounds-guarded like every other parallel-table
+// accessor (the `fbValtype` discipline: a slot whose column never resolved answers -1, it
+// does not trap the compiler).
+//
+// EVERY CONSUMER PAIRS IT WITH THE STRUCT HALF AND THE TWO CANNOT BOTH ANSWER: a value name
+// in `uVariants` has no `sNames` row. So a site that already asks `mvValStructIdx` asks this
+// FIRST and keeps its existing answer unchanged wherever this declines — which is every
+// program with no arm-valued map, i.e. all but the population this row is about.
+export function mvValVariantOf(slot: i32): i32 {
+  if slot < 0 { return -1 }
+  if slot >= mvValVariantIdx.length { return -1 }
+  mvValVariantIdx[slot]
+}
+
+function mvValArmName(ty: i32): string {
+  const vr = variantRowOfTy(ty)
+  if vr < 0 { return "" }
+  if vr >= uVariants.length { return "" }
+  uVariants[vr]
+}
+
 export function mvShapeOfValNameRowTy(
   valNameIn: string,
   keyI32: boolean,
   rowTy: i32,
+) {
+  // The row-table callers' `rowTy` IS the value's own recorded type (the D5 field-row cell),
+  // so it serves as the arm hint unchanged; a -1 bank is a -1 hint.
+  mvShapeOfValNameArmTy(valNameIn, keyI32, rowTy, rowTy)
+}
+
+export function mvShapeOfValNameArmTy(
+  valNameIn: string,
+  keyI32: boolean,
+  rowTy: i32,
+  armTy: i32,
 ) {
   const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
@@ -5065,6 +5151,11 @@ export function mvShapeOfValNameRowTy(
   const vRowTy = mvValTyIxAt(mvValTyIx.length - 1)
   mvValKind.push(kind)
   mvValStructIdx.push(vsi)
+  // THE VARIANT HALF OF THAT COLUMN, pushed in the same breath so the pair is one row (D34).
+  // `variantRowOfTy` is a pure scan over `uVarTyIx` — it interns nothing, which is the
+  // property the parallel-table discipline three comments up requires of anything sitting
+  // between two pushes.
+  mvValVariantIdx.push(variantRowOfTy(armTy))
   if kind == 1 {
     // THE KIND-1 SITE IS DELIBERATELY UNHINTED, AND THE REASON IS A SIDECAR WITH TWO
     // PRODUCERS. It interns `sNames[vsi]`, not `valName`, so the obvious hint is that
@@ -5077,7 +5168,28 @@ export function mvShapeOfValNameRowTy(
     // MINT re-keys the row from "never merged" to a structural key. A hint must be the
     // input the function WOULD have computed; a strictly better-covered sidecar is not
     // that input.
-    mvRlSlot.push(rlInternName(sNames[vsi], 1))
+    //
+    // …AND IT IS KEYED BY THE **ARM'S** NAME WHERE THE VALUE IS ONE (D34). `sNames[vsi]`
+    // is a STRUCT-table row, and for a map whose declared value is a union ARM that row is
+    // an INLINE-SHAPE row minted from the arm's own field set — `{r:i32}`, interned by
+    // `internInlineShape` off the render, which has no variant gate and no reason to have
+    // one. Keyed by that row, the vals backing came out an array over the INLINE row's heap
+    // while an annotated `const c: Circle = {…}` store put a `(ref $uVarHeap[Circle])` into
+    // it: two DIFFERENT heap types behind one placeholder, `vl check` rc 0.
+    //
+    // `mvValArmName` asks the ARENA by DECLARATION identity (`variantRowOfTy` — #1944's own
+    // resolver, whose header states there is no structural rung *because variants are
+    // nominal*), so the render's loss of the name is not the channel it answers on. With the
+    // arm's spelling as the key, the ref-list layer's OWN gate does the rest: #1942 taught
+    // `rlElemStructRow` to decline a name that is a registered variant and not a registered
+    // struct, and `rlElemVariantHeap` then supplies `uVarHeap[vi]`. The complement was
+    // already written — it just had a struct-table row handed to it instead of the arm.
+    const armNm = mvValArmName(armTy)
+    if armNm != "" {
+      mvRlSlot.push(rlInternName(armNm, 1))
+    } else {
+      mvRlSlot.push(rlInternName(sNames[vsi], 1))
+    }
     rlUsed = true
     raUsed = true
   } else if kind == 2 {
@@ -11588,6 +11700,10 @@ export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
 export function forInRefArrayStructIdx(iterIx: i32, fnIx: i32) {
   const mvs = forInMapValsSlot(iterIx, fnIx)
   if mvs >= 0 {
+    // An ARM-valued map's `.values()` walk has no STRUCT row to bind (D34) — the loop var's
+    // layout lives in the variant table, and this resolver's contract is a struct index. It
+    // declines rather than handing back a row from the other namespace.
+    if mvValVariantOf(mvs) >= 0 { return -1 }
     if mvValKind[mvs] == 1 { return mvValStructIdx[mvs] }
     return -1
   }
@@ -17389,7 +17505,24 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   if ka != mvValCanonId(b) { return 0 }
   if k == 3 || k == 10 || k == 11 || k == 13 { return 1 }
   if k == 2 || k == 14 { return 1 }
-  if k == 1 { return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b]) }
+  if k == 1 {
+    // THE ARM HALF OF THE KIND-1 GUARD, and it is a HAZARD THIS CHANGE CREATED rather than
+    // one it found (D34, census). `mvValStructIdx` holds the INLINE-SHAPE row a rendered
+    // value name matched, and an arm-valued `{[string]: Circle}` and a plain-struct
+    // `{[string]: Dot}` over the same field set match the SAME row — so `repStructSlotsTwin`
+    // called them twins and they shared one map struct. Before the vals element learned the
+    // arm that was harmless (both sides had the wrong heap for the same reason); with the
+    // arm's own `uVarHeap[vi]` under one of them, one map struct over two DIFFERENT vals
+    // wrapper heaps is invalid wasm at the OTHER map's store — measured on a two-map witness,
+    // `expected (ref null $type), found (ref $type)` in `mkD`.
+    //
+    // The parity test is the whole gate: same arm (or neither an arm) is required before the
+    // struct-row question is even asked, which is the `mvSlotKeyI32` discipline this function
+    // opens with — a half of the LAYOUT the value-side guards cannot see.
+    if mvValVariantOf(a) != mvValVariantOf(b) { return 0 }
+    if mvValVariantOf(a) >= 0 { return 1 }
+    return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b])
+  }
   if k == 6 { return rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) }
   0
 }
@@ -22141,6 +22274,26 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     }
     return false
   }
+  // A BARE `m[k]` over an ARM-VALUED map (`{[string]: Circle}`) is `Circle | null` — the
+  // vals slot is `(ref null $uVarHeap[vi])` and the get yields it unrecovered. This is the
+  // map-read rung `exprNullableStruct`'s own `Index` arm has carried since the struct-valued
+  // map was written, and the one this twin — built ARM FOR ARM against it, by its own
+  // header — did not have (D34): without it `const g = v["k"]` bound the kind-9 STRUCT niche
+  // over a variant heap, and the narrowed `g.r` floored on `field access receiver is not a
+  // struct`.
+  if e is Index {
+    const mrv = mapReadMvSlot(exprIx, fnIx)
+    if mrv >= 0 { return mvValVariantOf(mrv) >= 0 }
+  }
+  // The `m[k] ?? d` dual, gated by the SAME helper the struct twin gates its own with, so
+  // the two cannot disagree about when a coalesce keeps the niche.
+  if e is BinExpr {
+    const crv = coalesceMvSlot(exprIx, fnIx)
+    if crv >= 0 {
+      return mvValVariantOf(crv) >= 0 &&
+        coalesceStaysNullable(exprIx, crv, fnIx)
+    }
+  }
   false
 }
 
@@ -22635,6 +22788,19 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       // registered plain struct) resolves through the variant heap here.
       if structIndexByName(ren) < 0 { return variantIndexOf(ren) }
     }
+    // A BARE `m[k]` over an ARM-VALUED map yields the bare variant struct — the map rung
+    // this ladder lacked while `structIndexOfExpr`'s own `Index` arm has carried its STRUCT
+    // twin (`mapReadMvSlot` → `mvValStructIdx`) since the struct-valued map was written
+    // (D34). Same slot, same kind gate, the other column; the two cannot both answer.
+    const ivs = mapReadMvSlot(exprIx, fnIx)
+    if ivs >= 0 { return mvValVariantOf(ivs) }
+  }
+  // A `m[k] ?? d` over an ARM-VALUED map — the BinExpr dual of the Index rung above, and
+  // the same pairing: `structIndexOfExpr`'s `??` arm already reads `mvValStructIdx` off
+  // `coalesceMvSlot`.
+  if e is BinExpr {
+    const cvs = coalesceMvSlot(exprIx, fnIx)
+    if cvs >= 0 { return mvValVariantOf(cvs) }
   }
   -1
 }
@@ -22954,6 +23120,8 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 {
+      // An ARM value has no `sNames` row; its layout is `exprVariantIndex`'s (D34).
+      if mvValVariantOf(cms) >= 0 { return -1 }
       if mvValKind[cms] == 1 { return mvValStructIdx[cms] }
     }
     // A `<S|null> ?? <S>` coalesce resolves to the (inner) struct index — so `(r ?? d).field` finds
@@ -23172,6 +23340,8 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     // narrowed `(m[k]).field` finds the layout — the Index dual of the `?? default` BinExpr case.
     const mrs = mapReadMvSlot(exprIx, fnIx)
     if mrs >= 0 {
+      // An ARM value has no `sNames` row; its layout is `exprVariantIndex`'s (D34).
+      if mvValVariantOf(mrs) >= 0 { return -1 }
       if mvValKind[mrs] == 1 { return mvValStructIdx[mrs] }
     }
   }

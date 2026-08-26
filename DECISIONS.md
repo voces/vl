@@ -338,7 +338,30 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   scans decide it with nothing to break the tie (D36). That is a real remaining
   cell of the class and it is not reachable by a third rung of this shape — it
   needs the seam to answer a question about a value with no nominal identity at
-  all. (structural slot dedup, variant layer)
+  all.
+  **AND THERE IS A THIRD PLACE FOR THE SAME RULE THAT IS NOT A RESOLVER RUNG AT ALL:
+  a layer whose ONLY view of the value is a RENDER.** The map-VALUE layer holds
+  `tyToEmitName(t.mVal)`, and that render spells a declared arm `{r:i32}` — the same
+  characters an anonymous shape produces — so BOTH gates above are unreachable there:
+  the name one because the name is gone, and the arena one because re-resolving the
+  render mints a fresh index rather than recovering the declaration's (D34, measured:
+  `vTy=61` where the declaration is `40`). **The rule for such a layer is to CARRY the
+  nominal channel from the node that still has it, not to add a structural tiebreak** —
+  the annotation node the collect walk already holds. It enters as an ARM-ONLY hint
+  used after the mint is decided, which is what keeps it compatible with D-MAPNODETY's
+  refusal to front the slot FIND with a better answer. The direction generalises: where
+  a nominal question reaches a layer that only has a render, the fix is upstream of the
+  layer, and adding a rung to the layer is guaranteed not to work — a render of `Circle`
+  and a render of `{r:i32}` are the same string.
+  **What stays open at that seam is slot IDENTITY, not the heap.** An arm-valued and a
+  twin-struct-valued map in one program still share ONE mv slot, because the slot's key
+  is that same render (D48); the dedup layer below it is arm-gated for the day they
+  separate. That gate's zero is split into its two halves rather than reported as one: the
+  enclosing arm is LIVE (46 calls over 25 corpus files, so the counter is not #1944's unproven
+  kind) and the parity branch is NOT REACHABLE today, because D48 is the very reason the two
+  slots it would discriminate never both exist. Kept as a structural guard, for the reason
+  #1942 kept its own.
+  (structural slot dedup, variant layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
   LAYOUT table — two structurally-identical checker types can lower to DIFFERENT
