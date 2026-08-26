@@ -720,6 +720,7 @@ import {
   nullBoxTag,
   nullValKind,
   repIsRowMatchTy,
+  repOfNode,
   repScanLim,
   scalarTagOfKind,
   tyDenotesFunc,
@@ -3469,6 +3470,103 @@ function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32) {
     fbRefAsNonNull() // 0xd4
   }
   0
+}
+
+// Lower a STANDALONE optional chain `recv?.f` — a `?.` in ordinary VALUE position (a
+// `const`/`let` initializer, an argument, a `??` LHS the niche arms dispatch on by TYPE
+// rather than by node shape) — as the value of its own recorded type `F | null`.
+//
+// UNTIL THIS EXISTED, `emitExpr` HAD NO `OptMember` ARM AT ALL. `?.` was reachable only
+// where a bigger pattern consumed it whole (`emitCoalesce`'s fused arms, the null-test
+// guards through `emitOptChainIsNull`), and every other position fell out of `emitExpr`'s
+// trailing catch-all — which said `unsupported expression in return`, at the enclosing
+// FUNCTION's line, for a `const t = a?.w` with no `return` anywhere in the program.
+//
+// The shape is the same two-arm select the fused `?? d` arms already emit, with the
+// DEFAULT replaced by the null of the result's own rep — which is why the arms below are a
+// rep dispatch and not a field dispatch. `repOfNode` is that rep, from the checker's arena:
+//   `i32 | null`     -> the value-union BOX (a nullable scalar has no spare value to niche)
+//   `boolean | null` -> the i32 sentinel-2 niche (the VALTYPE is plain i32)
+// Any other leaf rep keeps a loud reject rather than guessing a null encoding.
+//
+// The receiver is read TWICE (the null test, then the field), so it must be a re-readable
+// place — the same `optRecvReReadable` gate the `?.f ?? d` arms hold.
+function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    if !optRecvReReadable(e.omObj) {
+      return emitFailAt(
+        "emitProgram: `?.` needs a re-readable receiver (a name, or a field chain of names)",
+        exprIx,
+      )
+    }
+    const osi = optChainStructIdxOf(e.omObj, fnIx)
+    if osi < 0 {
+      return emitFailAt(
+        "emitProgram: `?.` receiver is not a struct chain",
+        exprIx,
+      )
+    }
+    const ofi = sFieldIndex(osi, e.omProp)
+    if ofi < 0 {
+      return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
+    }
+    if sFieldTypeAt(osi, ofi) != 0 {
+      return emitFailAt(
+        "emitProgram: a standalone `?.` supports only i32/boolean leaf fields — read it through `?? d` or a `!= null` guard",
+        exprIx,
+      )
+    }
+    const ord = repOfNode(exprIx)
+    // `boolean | null` — the i32 cell holds 0/1 or the sentinel 2 (`null`). One
+    // unconditional `0x7f` blocktype: nullable and non-null share the valtype.
+    if ord.rdKind == "i32" && ord.rdNul == 2 {
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      fbIf(127) // 0x04 if, 0x7f i32 blocktype — a null link selects the sentinel
+      ctrlEnter()
+      fbI32Const(2)
+      fbElse() // 0x05 else — every link present, the 0/1 cell
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbEnd() // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+    // `i32 | null` — the `{tag, payload}` value-union box, `null` carried as the null
+    // tag over an unread payload. Both heap types are usage-gated (`uDeclared` mints
+    // the box, `vbI32Used` its i32 value box), so a program whose collect walk never
+    // registered the union fails loudly instead of emitting `struct.new` on index 0.
+    if ord.rdKind == "union" && ord.rdNul == 4 {
+      const ovb = vbHeapIdxOfKind(0)
+      if !uDeclared || ovb < 0 {
+        return emitFailAt(
+          "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
+          exprIx,
+        )
+      }
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      wU8(4)                 // 0x04 if
+      fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
+      ctrlEnter()
+      fbI32Const(nullBoxTag())
+      fbRefNullNone()        // the payload slot is unread under the null tag
+      fbStructNew(uBoxIdx)
+      fbElse()               // 0x05 else — every link present, the boxed field value
+      fbI32Const(scalarTagOfKind(0))
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbStructNew(ovb)       // wrap the scalar payload
+      fbStructNew(uBoxIdx)
+      fbEnd()                // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+    return emitFailAt(
+      "emitProgram: a standalone `?.` has no rep for this result type — read it through `?? d` or a `!= null` guard",
+      exprIx,
+    )
+  }
+  emitFailAt("emitProgram: expected an optional-chain member access", exprIx)
 }
 
 // Push the RAW union box ref of the binding `name` (a local/param or a module
@@ -10604,6 +10702,9 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     return emitIndex(body, exprIx, fnIx)
   }
   if e is Member { return emitMemberNode(body, e, exprIx, fnIx) }
+  // A STANDALONE `?.` (one no enclosing `?? d` / null-test pattern consumed) yields its
+  // own `F | null` value — see `emitOptMemberValue`.
+  if e is OptMember { return emitOptMemberValue(body, exprIx, fnIx) }
   if e is BinExpr { return emitBinExprNode(body, e, exprIx, fnIx) }
   if e is FuncDecl {
     // An anonymous `function(...)` literal in value position (it was lifted to a
@@ -10618,7 +10719,13 @@ export function emitExpr(body: i32[], exprIx: i32, fnIx: i32) {
     // else slot). Lowered as `if (result i32)` over the arm VALUES.
     return emitIfExpr(body, exprIx, fnIx)
   }
-  emitFail("emitProgram: unsupported expression in return")
+  // THE CATCH-ALL, and it must name the EXPRESSION, not a position. This said
+  // `unsupported expression in return` — a message written for the return arm but
+  // reached by every unhandled expression anywhere, and anchored by `emitFail`'s
+  // function-level fallback, so a `const t = a?.w` was reported as a `return` on the
+  // enclosing function's OWN header line. `emitFailAt` puts the caret on the offending
+  // node, the way every caller that HAS the node already does.
+  emitFailAt("emitProgram: unsupported expression", exprIx)
 }
 
 // Lower an if-EXPRESSION (`if c then a else b` in value position) onto `body`:
