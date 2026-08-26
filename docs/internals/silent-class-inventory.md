@@ -81,13 +81,18 @@ evaluation-count oracle at 1. Pins: `tests/cases/closures/error-is-functype-slot
 grader was re-validated against the final compiler first (`sabotage.py` → 12 wrong_value /
 8 wrong_evalcount / 6 trap / 4 correct, exactly as published).
 
-| | `c31e9fae` | D6 alone | merged (D7 #1924 + D6) |
-|---|---|---|---|
-| correct | 6,895 | 6,907 | **6,909** |
-| check-clean invalid wasm | 6 | 2 | **0** |
-| loud check reject | 1,199 | 1,199 | 1,199 |
-| loud emit reject | 1,026 | 1,018 | **1,018** |
-| **SILENT TOTAL** | **6** | **2** | **0** |
+| | `c31e9fae` | D6 alone | merged (D7 #1924 + D6) | + D14 |
+|---|---|---|---|---|
+| correct | 6,895 | 6,907 | **6,909** | **7,083** |
+| check-clean invalid wasm | 6 | 2 | **0** | **0** |
+| loud check reject | 1,199 | 1,199 | 1,199 | 1,199 |
+| loud emit reject | 1,026 | 1,018 | **1,018** | **844** |
+| **SILENT TOTAL** | **6** | **2** | **0** | **0** |
+
+The `+ D14` column is a real re-run of the same 9,126 cells on the closing branch, with its
+own baseline re-run on the same tree (which reproduced the `merged` column exactly). Cell for
+cell, **174 cells moved, every one `loud_emit_reject → correct`, all of them `list_f32`** —
+see D14 below.
 
 Cell-by-cell against `c31e9fae`, **14 cells moved and every one of them improved** — 6
 `invalid_wasm → correct` and 8 `loud_emit_reject → correct`. Nothing moved the other way,
@@ -944,9 +949,12 @@ single mover being the new fixture, which the old compiler cannot emit at all.
 * Pin: `tests/cases/arrays/nullable-f32-list-narrowed-positions.vl` (one narrowed read per
   moved position, with the lint hints DECLARED rather than the annotations deleted — each
   annotation IS the position under test).
-* **THE CORPUS WAS BLIND TO THIS, and the byte-identity number is the proof**: not one of
-  2,230 existing fixtures changed a byte, because not one of them narrowed an `f32[] | null`.
-  A rep-by-position grid found it; no amount of corpus green would have.
+* **FULL GRID, before and after on the closing branch**: `correct` **6,909 -> 7,083**, loud
+  emit **1,018 -> 844**, loud check 1,199 -> 1,199, SILENT TOTAL **0 -> 0**. Cell for cell,
+  exactly those 174 cells moved and nothing else in the other 21 reps did.
+* **THE CORPUS WAS BLIND TO THIS, and the byte-identity number is the proof**: all 2,229
+  pre-existing fixtures emit byte-identical modules, because not one of them narrowed an
+  `f32[] | null`. A rep-by-position grid found it; no amount of corpus green would have.
 
 ---
 
