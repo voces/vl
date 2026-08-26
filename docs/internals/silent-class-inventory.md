@@ -558,6 +558,27 @@ Second control: `??` on a map index get (`m["k"] ?? "DD"`) — correct.
   verdict and is pre-existing."* Re-measured here at 2 cells (both inputs) and unchanged.
   Recorded so it is not re-derived a third time.
 
+**THIS ROW AND `soundness/xfail-miscompile-nulstr-list-coalesce.vl` ARE ONE DEFECT.** Same
+program, same disassembly, filed twice under two names — and the fixture is the better
+record, because it carries the mechanism off the disassembly rather than only the verdict.
+Quoted here so this row cannot outlive the fixture:
+
+    (if (result (ref $str))                   ;; the NON-NULL type `??` promises
+      (ref.is_null (array.get $back …))       ;; the null test, on a re-read
+      (then (global.get $default))            ;; already non-null — fine
+      (else (array.get $back …)))             ;; THE SAME READ AGAIN, still (ref null $str)
+
+The backing of a `(string | null)[]` is `(array (mut (ref null $str)))`, so the ELSE arm's
+`array.get` yields the nullable reference into a slot declared non-null. Every other `??`
+sink narrows at this seam; the list-index arm re-reads and hands the raw nullable through.
+The `then` arm is fine, which is why the shape surfaces at validation rather than at
+execution.
+
+**Two entries for one defect is the condition that lets a queue rot**: fixing it clears one
+and leaves the other reading as live, which is how eight rows in this file sat stale. When
+this closes, close BOTH — graduate the fixture out of `xfail-` and re-grade this row — and
+`python3 scripts/check-filed-witnesses.py` will hold you to the second half.
+
 ---
 
 ### D8 — [CLOSED 2026-08-25] assigning `null` to a nullable binding INSIDE the block where it is narrowed non-null is rejected
