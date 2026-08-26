@@ -47,7 +47,8 @@ repro rather than a paraphrase:**
 | D14 | loud emit reject | **runs — CLOSED 2026-08-25** (below) |
 | D9 | loud emit reject | **runs — CLOSED 2026-08-25** (below; 144 cells, `loud emit reject → correct`, nothing moved the other way) |
 | D13 | loud emit reject | **runs — CLOSED 2026-08-25** (below, with the literal-union boundary class) |
-| D12 D15 D19 | various | as filed, still live |
+| D12 D15 | loud emit reject | **runs — CLOSED 2026-08-25** (below; two roots, not one — grouped only as diagnostic-quality work of the same size) |
+| D19 | check-clean invalid wasm | as filed, still live |
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 
@@ -875,8 +876,8 @@ Control — do the `is` test DIRECTLY on the nullable, which also handles `null`
 
 ---
 
-### D12 — binding an optional-chain result to a `const` is a loud emit reject, with a message about `return`
-**loud emit reject · 22 cells · 0 of 132 `optchain` cells correct**
+### D12 — [CLOSED 2026-08-25] binding an optional-chain result to a `const` is a loud emit reject, with a message about `return`
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 22 cells · 0 of 132 `optchain` cells correct**
 
 Repro:
 
@@ -899,6 +900,35 @@ Controls, all correct: `print(a?.w ?? 0)` (no intermediate binding); `if a?.w !=
   `[ERROR]: member access '?.length' on non-object i32[]?`. The message calls `i32[]?` a
   non-object, which is misleading, but the decline itself is consistent (only struct fields
   are reachable through `?.`). Filed as a message defect, not a capability defect.
+
+**CLOSED — the root, and it is not about `return`.** `emitExpr`'s node dispatch had NO
+`OptMember` arm at all. `?.` was reachable only where a bigger pattern consumed it whole
+(`emitCoalesce`'s fused `?.f ?? d` arms; the null-test guards through
+`emitOptChainIsNull`), so a `?.` that had to produce a value of its own reached the
+dispatcher's trailing catch-all — which carried the message written for the RETURN arm and
+raised it through `emitFail`, whose no-node fallback anchors at `emitCurFnIx`. That is both
+halves of the defect from one cause. **The `const` binding is not the trigger**:
+`print(a?.b ?? false)` over a `boolean` field is the same reject with no binding anywhere in
+the program, because `emitCoalesce` dispatches the boolean niche on the operand's TYPE
+(`exprNulBool`) long before its own `?.` arms.
+
+`emitOptMemberValue` now lowers a standalone chain as the same two-arm select the fused arms
+emit, with the default replaced by the null of the RESULT's own rep — a REP dispatch, not a
+field one: `i32 | null` is the value-union box, `boolean | null` the i32 sentinel-2 niche.
+Three ends had to agree: `exprUnion` answers for a scalar-leaf `?.` (else `emitUnionCoerce`
+boxed the box a second time — `vl check` rc 0, `expected i32, found (ref $type)`), and the
+checker exports the binding's inferred union (`inferLetNameOf` → `nliInferOptChainLet`),
+which is the ONLY route for this type: `i32 | null` is synthesized from `S | null` plus an
+`i32` field and is spelled in no annotation, so nothing else mints the box.
+
+The catch-all message is now `emitProgram: unsupported expression`, anchored at the node.
+**The 110-cell neighbour was fixed as the message defect it was filed as**: `?.` reaches
+declared struct FIELDS only, so the message now says that and names the narrowing, instead
+of calling a list a non-object. The decline is unchanged. Sweep, same 9,126 cells: the
+`optchain` construct goes 0 correct / 132 to 22 correct + 110 loud check rejects, and
+`unsupported expression in return` goes 22 cells to 0. Pins:
+`tests/cases/structs/optional-chain-value-binding.vl`,
+`tests/cases/structs/error-optional-chain-builtin-property.vl`.
 
 ---
 
@@ -1041,8 +1071,8 @@ single mover being the new fixture, which the old compiler cannot emit at all.
 
 ---
 
-### D15 — `??` applied to a NON-nullable value reports a map-index rule
-**loud emit reject · 224 cells carry this message**
+### D15 — [CLOSED 2026-08-25] `??` applied to a NON-nullable value reports a map-index rule
+**CLOSED 2026-08-25 — the repro now RUNS. Was: loud emit reject · 224 cells carry this message (204 when re-measured at `c0ee3089`, after D14's f32 work moved 20 of them)**
 
 Repro:
 
@@ -1056,6 +1086,35 @@ Control: make the operand nullable (`function mk2(): i32 | null`) — correct.
   survives to emit and reports a rule about map index gets, which is not the reason. This
   is the single most common loud message in the sweep and most of its firings are of this
   shape, so it is worth correcting for the diagnostic alone.
+
+**CLOSED — the policy, and what decided it.** `x ?? d` over an operand that cannot be null
+is USELESS, not ill-formed: the operator is total and its value is `x`. It is now ACCEPTED
+and lowered as the identity on the left operand, and the redundancy is STATED at check time
+as a `warning` (`dead-coalesce-default`) rather than blocking the build. Against a check-time
+error: `tests/cases/soundness/narrowed-read-coalesce-lowers.vl` pins `if p != null { print(p
+?? 0) }` as correct at ten sites, and that shape types `p` NON-nullable at the read, so an
+error keyed on the flow type would reject a contract the compiler deliberately supports.
+Measured with narrowed places exempt, the rule fires **zero** times across `compiler/*.vl`
+(494 `??` uses), `std/*.vl` and ~1,450 corpus fixtures — every `??` this compiler writes is
+on a genuinely nullable operand; without the exemption it fires 10 times and all 10 are that
+soundness fixture. Swift and Kotlin warn on the same construct, and VL's own parse-only lint
+already reports the same family (`constant-condition`, a branch never taken) at `warning`.
+
+**THE FOLD IS A REWRITE, NOT AN EMIT ARM, and that is measured.** Lowering the identity
+inside `emitCoalesce` gives the right BYTES and leaves the `??` NODE for `exprString` /
+`exprIsLitAtom` / the print-import chooser to classify — and each of their `??` arms answers
+only for a NULLABLE operand. On these same 9,126 cells that version turned 132 loud rejects
+into `correct` **and 62 into SILENT failures** (40 invalid-wasm on `string` / inline
+litunion, 22 wrong-value on a named litunion printing its raw atom id). Folding the node in
+`emit_rewrite.vl` leaves nothing to classify. Safe to fold early because every fused `??`
+lowering needs a nullable operand: `m[k]`, `m.get(k)`, `xs.get(i)`, `xs.pop()` are all typed
+`V | null`, so the query declines them.
+
+The residue keeps a loud reject and finally names itself: ``emitProgram: `??` over this
+nullable value is not supported yet — narrow it first, e.g. `if v != null { … }` ``, 204 → 10
+cells. Pins: `tests/cases/expressions/coalesce-non-nullable-folds.vl`, and
+`tests/cases/maps/error-nonmap-coalesce.vl` (the one fixture that held the old text — a
+`K0 | null` operand, i.e. exactly the residue).
 
 ---
 
