@@ -4131,13 +4131,17 @@ Repro:
     }
 
     print(cell())
-    // vl check rc 0, no diagnostic.
-    // The declared operator returns `true` unconditionally, so a dispatch would print `true`.
+    // vl check rc 0. The declared operator returns `true` unconditionally, so a dispatch
+    // would print `true`. The two warnings it does emit are `Unused parameter self/other` —
+    // the witness's own, and a CONSEQUENCE of needing a body that disagrees with the
+    // structural fallback; nothing says the declaration itself is inert.
     // PRINTS false
 
 * **THE DECLARATION HAS NO EFFECT AND NOTHING SAYS SO.** It is not a parse error, not an
   unknown-name error, not an unused-function warning: it is accepted and the structural
-  compare runs instead. `compiler/parser.vl`'s `opDeclName` is reached only from
+  compare runs instead. (`vl check` does report `Unused parameter self/other` — those are the
+  witness's own parameters, unused because the body has to disagree with the fallback to be
+  observable, and they say nothing about the declaration's fate.) `compiler/parser.vl`'s `opDeclName` is reached only from
   `OP_INDEX_GET` / `OP_INDEX_SET`, and `checkBinary` returns on the equality arm before the
   operator-dispatch tail, so `==` is not in the overloadable set at either end.
 * **THE COMPILER ASKS FOR IT BY NAME.** `isEquatable`'s refusal ends "— define a `==` operator
