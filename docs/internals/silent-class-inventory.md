@@ -43,7 +43,8 @@ repro rather than a paraphrase:**
 |---|---|---|
 | D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
 | D16 D7 D6 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
-| D9 D12 D13 D14 D15 | various | as filed, still live |
+| D17 D18 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below; one root, one change) |
+| D9 D12 D13 D14 D15 D19 | various | as filed, still live |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -961,8 +962,39 @@ Controls, both correct:
 
 ---
 
-### D17 — an empty `[]` in a STRUCT-FIELD initializer is never pinned by the field's type
-**check-clean INVALID WASM · found while closing D16, filed unfixed · the root is the CHECKER, not the emitter**
+### D17 — [CLOSED 2026-08-25] an empty `[]` in a STRUCT-FIELD initializer is never pinned by the field's type
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · found while closing D16 · the root was the CHECKER, not the emitter · 111 SILENT cells of a 231-cell grid, 0 after**
+
+CLOSED, with D18, by ONE change: `constrainEmpty` (`compiler/typecheck.vl`) now recurses through a
+STRUCT FIELD, a MAP VALUE and a `| null` wrapper, and the three WRITE spellings that never called it
+at all now do (`x = e`, `m.set(k, v)`, `xs.push(v)`). The row's own prediction held in both halves:
+the fix belongs in `typecheck.vl`, and the D16 emit-side seed (`emptyArrHoleKind`, read off the
+literal node) is what lowers them once the checker pins — **no emitter line changed**.
+
+ONE ROOT, NOT TWO, and that was measured rather than assumed: the walk already recursed through an
+ARRAY destination's element (`const xss: string[][] = [fq()]` has never been red), so the container
+positions were not three defects but three arms missing from one recursion. D17, D18 and the write
+spellings all close on it together.
+
+THE CONFLICTING-CONSUMER RULE WAS CHOSEN: a hole pins from the FIRST consumer that reaches it and a
+conflicting later use is a loud type error — the rule the call-argument position has shipped since
+D16. "Reject as ambiguous" was considered and refused: the accept/reject VERDICT is already
+order-independent (all 10 conflicting pairs measured reject in both orders; only the wording names
+whichever consumer came second), so ambiguity would buy no determinism, and a second rule for the
+container positions would make one program's verdict depend on which slot the author wrote it into.
+Both behaviours are pinned: `tests/cases/arrays/empty-hole-pinned-by-container-position.vl` (accept)
+and `tests/cases/arrays/empty-hole-container-conflict-rejected.vl` (reject, both orders and a
+same-statement conflict).
+
+THE ONE TRAP, worth reading before touching this walk again: **the pin erases its own trigger.**
+`assignableExpr` records an ObjLit/ArrayLit's destination rep on the `nodeRepTyIx` sidecar only
+while the literal still REACHES an open hole (`tyReachesEmptyHole` gates `recordRepTyAdopt`).
+Pinning first makes that gate false, the rep is never recorded, and the literal falls back to
+structural row resolution — which has no answer for a self-referential map value:
+`tests/cases/types/recursive-map-value.vl` went `emitProgram: map value type has no interned slot`,
+the one corpus file the field-wise pin reddened. `constrainEmptyExpr` records on the SAME condition
+BEFORE pinning. Reordering to check-first instead would lose a same-statement conflict, so the
+order is load-bearing in both directions.
 
 Repro:
 
@@ -988,21 +1020,27 @@ establishes nothing: add a SECOND, conflicting consumer and it still says nothin
     // vl check rc 0 — `fq()` is accepted into a `string[]` FIELD and an `f64[]` PARAM in one
     // program. The argument position alone would be `argument 1: expected f64[], got string[]`.
 
-So the struct-field position does not propagate its element type back to an un-annotated
-producer at all. There is no fact on the literal node for the emitter to read, `fq`'s result
-valtype and its `struct.new` agree with each other at the i32 default, and the mismatch is at
-the `struct.set` into the field. **Fixing it belongs in `typecheck.vl`** — the field position
-has to join the positions that pin a hole — and only then does the D16 emit-side seed answer.
+So the struct-field position did not propagate its element type back to an un-annotated
+producer at all. There was no fact on the literal node for the emitter to read, `fq`'s result
+valtype and its `struct.new` agreed with each other at the i32 default, and the mismatch was at
+the `struct.set` into the field. **The fix belonged in `typecheck.vl`** — the field position
+joined the positions that pin a hole — and only then did the D16 emit-side seed answer. Both
+programs above are now loud: the second is `argument 1: expected f64[], got string[]`.
 
-* Control: `const w: W = { xs: [] }` — a DIRECT empty literal in the same field — lowers, because
-  the field annotation seeds the build (`seedFieldListBuild`). It is the call RESULT that is unpinned.
-* Pre-existing: the same program is check-clean invalid wasm on master before the D16 fix, and
+* Control: `const w: W = { xs: [] }` — a DIRECT empty literal in the same field — lowered throughout,
+  because the field annotation seeds the build (`seedFieldListBuild`). It was the call RESULT that was
+  unpinned; the control is pinned as leg L7 of the accept fixture so a wider fix cannot quietly
+  replace it.
+* Pre-existing: the same program was check-clean invalid wasm on master before the D16 fix, and
   after it, unchanged in both directions.
+* Grid: 21 positions × 11 element reps = **231 cells; 111 SILENT before, 0 after**,
+  with `emit_reject` flat at 30 (the pre-existing `u8`-element and nullable-map-value loud floors) and
+  `check_reject` flat at 0. Corpus sweep PASS=1697 CHECKFAIL=0 RUNFAIL=0 LOGDIFF=0.
 
 ---
 
-### D18 — an empty `[]` assigned into a MAP VALUE is never pinned by the map's value type
-**check-clean INVALID WASM · found while closing D16, filed unfixed · D17's twin, one container out**
+### D18 — [CLOSED 2026-08-25] an empty `[]` assigned into a MAP VALUE is never pinned by the map's value type
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · found while closing D16 · D17's twin, one container out**
 
 Repro:
 
@@ -1013,12 +1051,20 @@ Repro:
     // vl check rc 0, no diagnostic. Module written; the engine rejects it:
     //   type mismatch: expected (ref null $type), found (ref $type)
 
-Same root as D17 and worth filing separately only because the container differs: the map-value
-position does not pin an un-annotated producer's hole either, so the emitter has nothing to
-read and the i32-list wrapper is stored into an `f64[]`-valued cell. If the checker learns to
-pin a hole from a container's declared element/value type, both rows close together and the
-D16 seed is what makes them lower.
+Same root as D17, and the prediction in this paragraph is the one that was tested: the map-value
+position did not pin an un-annotated producer's hole either, so the emitter had nothing to
+read and the i32-list wrapper was stored into an `f64[]`-valued cell. The checker learned to
+pin a hole from a container's declared element/value type, and **both rows closed together on the
+one recursion**, with the D16 seed making them lower. See D17 for the mechanism, the
+conflicting-consumer ruling and the grid.
 
+* The `.set` SPELLING was the residue, and it is why this row is not merely D17 restated: `m[k] = v`
+  and `m.set(k, v)` are two write paths, and the first fix closed only the first — 7 cells stayed
+  SILENT until `.set` (and `.push`, the array sibling) called the same pin. The map arms already
+  state that rule for their key/value HOLES one screen up; the VALUE ARGUMENT's own holes were the
+  half that never followed it.
+* Pinned: `tests/cases/maps/empty-hole-pinned-by-map-value.vl` (this repro, the `.set` twin, a
+  struct-valued map, a nested map and the direct-`[]` control).
 * Pre-existing: identical outcome on master before the D16 fix and after it.
 
 ---
