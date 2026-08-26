@@ -2496,8 +2496,34 @@ function letCellKind(letIx: i32, fnIx: i32): VKind {
 }
 
 // The kinds an implicit-return assignment DECLINES to name, whatever storage class the
-// target cell lives in — `null` meaning "no answer, leave every classifier exactly as it
-// was". Each declines because naming it makes the outcome WORSE than what it replaces:
+// target cell lives in.
+//
+// `null` IS NOT A NEUTRAL ANSWER, AND THIS COMMENT USED TO SAY IT WAS. It read "`null`
+// meaning *no answer, leave every classifier exactly as it was*". It is an answer:
+// `fnAssignRetKind` returns `null`, `emit_sections`' inferred-return arm falls through to
+// its `i32` default, and an `i32` result valtype under a body that pushes a ref is
+// check-clean INVALID WASM — `type mismatch: expected i32, found (ref $type)`, where the
+// `expected i32` is this function's own fallback. Every decline below therefore has to be
+// justified against `i32`, not against "whatever master did".
+//
+// MEASURED, ONE DECLINE AT A TIME (#1935). Each surviving entry was lifted ALONE and the
+// 192-cell guard-decline grid re-graded — 6 reps × 4 storage classes (module global /
+// parameter / annotated local / un-annotated local) × 2 assignment shapes × 2 consumption
+// modes × 2 inputs. 76 of its cells are check-clean invalid wasm, and ALL 76 are caused by
+// a decline here: each disappears when, and only when, its own entry is lifted, and no
+// experiment moved a single cell backward.
+//
+//     decline lifted   cells moved   outcome after      filed as
+//     `nulstr`              6        wasm trap          D27  — reason CONFIRMED
+//     `closure`            18        runs               D25  — reason refuted
+//     `nulclosure`         12        runs               D25  — reason refuted
+//     `map`                32        runs               D26  — reason refuted
+//     `nulmap`              8        runs               D26  — reason refuted
+//
+// SO FOUR OF THE FIVE KINDS DECLINED BELOW ARE KNOWN-WRONG, AND THEY ARE KEPT ONLY BECAUSE
+// REMOVING THEM IS A SEPARATE CHANGE with its own gates — it touches every consumer of this guard and
+// deserves a clean before/after rather than riding along on a closed defect. The recorded
+// reasons are kept verbatim so the next reader can see exactly which claim failed:
 //
 //   `nulstr` — a `string | null` cell does not read back as its cell. `emitIdentNode`'s
 //     kind-16 arm applies `ref.as_non_null` UNCONDITIONALLY (the "`string | null` READ
@@ -2508,10 +2534,19 @@ function letCellKind(letIx: i32, fnIx: i32): VKind {
 //     is on master, at ALL THREE storage classes. THE ROOT IS THE UNCONDITIONAL RECOVER IN
 //     `wasmEmit.emitIdentNode` (~12740), not here — a store-then-re-read cannot be sound
 //     while the re-read force-recovers non-null.
+//       MEASURED, AND THE ONLY REASON HERE THAT SURVIVED: lifting this entry alone turns
+//       its 6 cells into `wasm trap: null reference`, precisely as predicted. But what it
+//       preserves is NOT “the loud invalid-wasm reject” — check-clean invalid wasm is a
+//       SILENT class (`vl check` rc 0), so the trade is a loud trap for a silent failure,
+//       not a trap for a reject. Filed as D27; the root named above is still the fix.
 //
 //   `closure` / `nulclosure` — `fnReturnsClosure` already owns the closure result at both
 //     functype producers, ahead of every kind this could supply; naming it here would only
 //     race that owner.
+//       REFUTED. `fnReturnsClosure` owns a tail that IS a function value; this tail is an
+//       ASSIGNMENT, so nothing owns it and the decline hands the position to the `i32`
+//       default. Lifting `closure` alone moves 18 cells invalid-wasm → runs, `nulclosure`
+//       alone another 12, both with 0 backward. There is no owner to race. Filed as D25.
 //
 //   `map` / `nulmap` — `emit_sections`' INFERRED-return arm resolves an `infSlot` for
 //     `struct` / `nulstruct` / `reflist` / `map` only, and its `map` arm reads the SHAPE
@@ -2519,13 +2554,17 @@ function letCellKind(letIx: i32, fnIx: i32): VKind {
 //     shape is the assignment node, not a map expression. A named kind whose companion
 //     slot cannot be minted from the same binding would declare a result valtype over the
 //     wrong heap type; `null` keeps the master outcome instead.
+//       REFUTED ON THE SHAPE IT NAMES. A mono map's shape is -1, so only a REF-VALUED map
+//       has an mv slot to get wrong — the grid carries both `{[string]: i32}` and
+//       `{[string]: S}`, and lifting `map` alone moves all 32 cells (16 of each) to `runs`,
+//       `nulmap` alone another 8, 0 backward. And `null` does not keep the master outcome:
+//       the master outcome IS the invalid wasm this produces. Filed as D26.
 //
 // AND THE COMPLEMENT — the kinds that are NOT here, each because DECLINING them is what
-// makes the outcome worse. `null` is not a neutral answer: it restores the classifier's
-// default, which for an inferred return is `i32`, and an `i32` result valtype under a body
-// that pushes a ref is check-clean INVALID WASM. A kind whose slot cannot be minted is
-// better NAMED, because `fbValtype`'s out-of-bounds guard then turns the missing slot into
-// `emitProgram: ref valtype with no interned shape` — a loud emit reject.
+// makes the outcome worse. A kind whose slot cannot be minted is better NAMED, because
+// `fbValtype`'s out-of-bounds guard then turns the missing slot into `emitProgram: ref
+// valtype with no interned shape` — a loud emit reject, where `null` gives silent invalid
+// wasm.
 //
 //   `nulreflist` — the original instance of that rule, pinned by
 //     `tests/cases/functions/tail-assign-nullable-reflist-reject.vl`.

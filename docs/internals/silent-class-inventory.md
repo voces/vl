@@ -1786,6 +1786,179 @@ Control — the SAME call with a NON-nullable `Circle` parameter boxes correctly
 
 ---
 
+### D25 — a `closure` cell at an implicit-return assignment: the guard declines, the result valtype falls back to `i32`
+**check-clean invalid wasm · 18 of a 192-cell guard-decline grid, plus 16 of the 432-cell implicit-return assignment grid · filed 2026-08-26 while closing D21 · pre-existing, identical on master's `vl-compiler.wasm` and on D21's branch (same offset, same message)**
+
+Repro:
+
+    function mkF(): (i32) => i32 { return (x) => x + 1 }
+    function mkG(): (i32) => i32 { return (x) => x + 5 }
+
+    let g: (i32) => i32 = mkF()
+
+    function f() {
+      g = mkG()
+    }
+
+    f()
+    print(0)
+    // vl check rc 0 (one redundant-annotation hint); vl run:
+    //   Invalid input WebAssembly code at offset 262:
+    //   type mismatch: expected i32, found (ref $type)
+
+Control — the SAME shape over a cell kind the guard does NOT decline (`struct` for
+`closure`, the only change), correct:
+
+    type S = { a: i32 }
+    function mkS(v: i32): S { return { a: v } }
+
+    let g: S = mkS(3)
+
+    function f() {
+      g = mkS(9)
+    }
+
+    f()
+    print(0)
+    // prints 0
+
+Second control — the SAME program with an ANNOTATED return, correct. An annotation takes
+`emit_sections`' `fn.fnRet >= 0` branch and the guard is never consulted:
+
+    function f(): (i32) => i32 {
+      g = mkG()
+    }
+
+* **THE `expected i32` IN THE MESSAGE IS THE GUARD'S OWN FALLBACK.** `fnAssignKindGuard`
+  returns `null` for `closure`, `fnAssignRetKind` therefore answers "no kind", and
+  `emit_sections`' inferred-return arm writes the `i32` default result valtype while the body
+  pushes `(ref $cloStructIdx)`. The guard's header called `null` *"no answer, leave every
+  classifier exactly as it was"*; it is not that. It is an answer, and the answer is `i32`.
+* **MEASURED BY LIFTING THE ONE DECLINE.** With `if k == "closure"` removed from
+  `fnAssignKindGuard` and NOTHING else changed, 18 of the 192 grid-3 cells move
+  `check-clean invalid wasm → runs` and 0 move backward; in grid 2 the same single change
+  moves 10 cells the same way. The decline is the cause, not an incidental bystander.
+* **THE RECORDED REASON DOES NOT HOLD FOR THIS SHAPE.** It reads "`fnReturnsClosure` already
+  owns the closure result at both functype producers, ahead of every kind this could supply".
+  `fnReturnsClosure` owns a tail that IS a function value; this tail is an ASSIGNMENT, so
+  nothing owns it and the decline hands the position to the `i32` default instead.
+* **Flat on all four storage classes** — module global, parameter, annotated local,
+  un-annotated local — and on both assignment shapes (`g = e`, `return (g = e)`), 16 cells.
+  The `nulclosure` sibling adds 12 more with its own decline lifted, and 2 more cells filed
+  under `nulclosure` in the grid are actually `closure` cells (their un-annotated initializer
+  is non-null) and move with this one.
+* **Varies on CONSUMPTION, and that is the silent/loud line**: with the result UNCONSUMED
+  (`f()`) it is invalid wasm; with it bound and called (`const r = f()  print(r(4))`) it is a
+  loud `emitProgram: call to unknown function` — a different, already-known gap. The
+  unconsumed half is silent because the checker never types the result, so nothing downstream
+  notices the disagreement.
+* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid
+  module", and the class already has live specimens in D22 and `tests/vl_check_codegen_test.ts`.
+
+---
+
+### D26 — a `map` / `nulmap` cell at an implicit-return assignment, same root as D25
+**check-clean invalid wasm · 40 of a 192-cell guard-decline grid (32 `map`, 8 `nulmap`) · filed 2026-08-26 beside D25 · pre-existing, identical on master and on D21's branch**
+
+Repro:
+
+    function mkM(v: i32): {[string]: i32} {
+      const m: {[string]: i32} = Map()
+      m["a"] = v
+      return m
+    }
+
+    let g: {[string]: i32} = mkM(3)
+
+    function f() {
+      return (g = mkM(9))
+    }
+
+    f()
+    print(0)
+    // vl check rc 0 (one redundant-annotation hint); vl run:
+    //   Invalid input WebAssembly code at offset 1061:
+    //   type mismatch: expected i32, found (ref $type)
+
+Control — the SAME program with the straight-line tail spelling instead of
+`return (g = …)`, the only change, correct:
+
+    function f() {
+      g = mkM(9)
+    }
+    // prints 0
+
+* **SAME ROOT AS D25** — `fnAssignKindGuard` declines `map`, the result valtype falls back
+  to `i32`, the body pushes `(ref $mapStruct)`. Lifting `if k == "map"` alone moves all 32
+  `map` cells `check-clean invalid wasm → runs`, 0 backward; lifting `if k == "nulmap"` alone
+  moves its 8 the same way. Neither lift disturbs the other's cells, which is what makes the
+  attribution per-decline rather than shared.
+* **THE RECORDED REASON WAS TESTED ON THE SHAPE IT NAMES, AND IT DOES NOT HOLD.** The guard
+  says the `map` arm "reads the SHAPE off the return EXPRESSION (`mapRetExprShape` over
+  `fnRetExprOf`), which for this shape is the assignment node, not a map expression", which
+  would only have a slot to get wrong for a REF-VALUED map (a mono map's shape is -1). The
+  grid carries both: `{[string]: i32}` (mono) and `{[string]: S}` (mv slot ≥ 0). **All 16
+  cells of each move to `runs`.** The mv-slot hazard the reason describes is not reachable
+  from this position.
+* **The `map` half varies on the ASSIGNMENT SHAPE and not on the storage class**: the
+  straight-line tail runs at all four classes and `return (g = e)` is invalid wasm at all
+  four. The `nulmap` half varies on the VALUE instead — `g = null` is invalid wasm at all
+  four classes while `g = mkN(true)` is a loud check reject (`'f' infers the nullable return
+  type … not yet supported by codegen`). That second asymmetry is `fnAssignRetTargetName`'s
+  own filed note about the checker typing `x = e` as `e`'s UN-coerced type: a `null` RHS
+  types as `null` and slips past the gate that catches the nullable one.
+
+---
+
+### D27 — a `nulstr` cell at an implicit-return assignment: the one decline measurement CONFIRMS
+**check-clean invalid wasm · 6 of a 192-cell guard-decline grid · filed 2026-08-26 beside D25 · pre-existing, identical on master and on D21's branch · NOT the same disposition as D25/D26**
+
+Repro:
+
+    let g: string | null = "hi"
+
+    function f() {
+      g = null
+    }
+
+    f()
+    print(0)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 256:
+    //   type mismatch: expected i32, found (ref $type)
+
+Control — the SAME program assigning a non-null value instead of `null`, the only change,
+correct:
+
+    function f() {
+      g = "bye"
+    }
+    // prints 0
+
+Second control — the SAME program with the annotation dropped, a loud CHECK reject
+(`cannot assign null to string`), because the un-annotated cell is `str` and not `nulstr`.
+
+* **THE MECHANISM IS D25's** — the guard declines `nulstr`, the result valtype falls back to
+  `i32`. **THE DISPOSITION IS NOT.** Lifting `if k == "nulstr"` alone moves these 6 cells to
+  `wasm trap: null reference`, not to `runs` — exactly what the guard's own comment predicts
+  ("makes the module VALID and it then TRAPS on `g = null`"). Of the five surviving-decline
+  experiments this is the only one whose recorded reason survived measurement.
+* **BUT THE COMMENT MIS-NAMES WHAT IT PRESERVES.** It says the decline keeps "the loud
+  invalid-wasm reject it is on master". Check-clean invalid wasm is a SILENT class by this
+  document's vocabulary — `vl check` says rc 0 — so the decline is trading a loud runtime
+  trap for a silent one, not a trap for a reject. Whether that is the right trade is a real
+  question; the comment currently answers a different one.
+* **THE ROOT IS NOT THE GUARD**, and the comment already says where it is: `emitIdentNode`'s
+  kind-16 arm applies `ref.as_non_null` UNCONDITIONALLY, so a store-then-re-read of a
+  `string | null` cell cannot be sound whatever the guard answers. Fixing that arm is what
+  turns these 6 cells into `runs`; until then neither disposition is correct and the choice
+  is between two failure classes.
+* **Flat on the three ANNOTATED storage classes** (global, parameter, annotated local) × both
+  assignment shapes, unconsumed. The un-annotated local is a loud check reject instead (see
+  the second control), and every CONSUMED cell is a loud check reject.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
