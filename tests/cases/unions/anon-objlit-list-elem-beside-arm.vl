@@ -1,0 +1,154 @@
+// Regression (silent-class-inventory D36 and D38, ONE root): an ANONYMOUS object literal as
+// the first element of an ARRAY LITERAL was resolved onto a union ARM and then WIDENED to that
+// arm's whole union, so the literal built a kind-2 BOX list — while every consumer of the same
+// anonymous shape resolved it to a nominal ROW and read the value unboxed.
+//
+// THE THREE CLASSIFIERS EACH CARRIED THEIR OWN COPY OF THE SCAN. `arrLitElemName`,
+// `arrLitElemKind` and `arrLitElemHintTy` must agree ARM FOR ARM (their own headers say so),
+// and each asked `objVariantName` — a global FIELD-NAME-SET scan of the variant table — with
+// no gate. In any program declaring `Shape = Circle | Sq`, an anonymous `{ r: n }` matches
+// `Circle` structurally, so `const o = [{ r: n }]` keyed the row `Shape`, kind 2. Disassembled
+// on the D36 witness, master `f2064bec` vs branch, every other instruction identical:
+//
+//   master   (type (;4;) (array (mut (ref null 3))))   ; 3 = the union BOX {i32, anyref}
+//            i32.const 0 / struct.new 1 / struct.new 3 ; tag, uVarHeap[Circle], box
+//   branch   (type (;4;) (array (mut (ref null 0))))   ; 0 = Dot's standalone row
+//            struct.new 0
+//
+// The READ is `struct.get 0 0` under BOTH — which is the whole of the engine's "type mismatch:
+// expected (ref null $type), found (ref $type)": two DIFFERENT heap types behind one
+// placeholder. `vl check` was rc 0 with NO diagnostics at all.
+//
+// THE FIX IS `arrLitBoxElemName`, WHICH ALREADY EXISTED AND HAD NO CALLER ON THIS PATH — the
+// fourth consecutive rung of this family closed by a predicate whose complement was already
+// written (D26's namespace check, D32's `exprVariantIndex` gate, D33's `variantRowOfTy`). It
+// asks the ARENA whether the CHECKER recorded this array's element as a union
+// (`nodeTyIxOf(arrIx)`'s `TyArray` element `is TyUnion`), and its own header states the rule
+// this rung needed: "asked of the ARENA rather than inferred from the render, because the
+// render is shared — a struct / map / closure / nested-array element also answers a non-`""`
+// name and none of those is a union to register". Measured at the site:
+//
+//   D36  vn=[Circle]     box=[]          si=0   -> was widened to `Shape`
+//   D38  vn=[Circle$m0]  box=[]          si=-1  -> was widened to `Shape$m0`
+//   het  vn=[Circle]     box=[Circle|Sq] si=-1  -> `Shape`, and CORRECTLY so
+//
+// The three arms now share ONE predicate (`arrLitObjElemBoxVariant`) rather than three copies.
+//
+// D36 AND D38 ARE ONE ROOT AND THE GRID IS WHAT SAYS SO, not the resemblance — this repo has
+// had that hypothesis refuted as often as confirmed. 900 cells crossed (twin x producer x
+// route x container) moved 37, and their distribution IS the property: producer `anon` 37 of
+// 37 with `named` and `call` at 0, container `list` 37 of 37 with `bare` / `listlist` /
+// `mapval` / `field` at 0, and the twin axis SPREAD — none 9, namediff 9, armtwin 9, exact 5,
+// after 5. A twin is NOT NEEDED: the nine `none` movers have no standalone struct declared at
+// all. What the twin changes is only which FAILURE the cell had before — `none`, `namediff` and
+// `armtwin` each moved 3 from a LOUD emit refusal and 6 from silence, while `exact` and `after`
+// moved 5 each, all from silence, because there the wrong row existed to be found. 28 of the 37
+// came from check-clean invalid wasm and 9 from a loud emit refusal; 0 moved backward.
+//
+// THE TWO HETEROGENEOUS CELLS AT THE FOOT ARE THE CONTROL THE GATE IS ABOUT. There the checker
+// really did record a union element, `arrLitBoxElemName` answers `Circle|Sq`, and the literal
+// keeps master's boxing exactly — annotated and un-annotated both. Without them this file
+// would pin only that the widening stopped, not that it still happens where it belongs.
+//
+// THE TWIN IS A WHOLE-PROGRAM PROPERTY, so one file can pin exactly one twin state and this
+// one pins `Dot` DECLARED — the state D36 needs. The other three twin spellings live in
+// `anon-objlit-list-elem-arm-no-twin.vl` beside it (absent, and an exact-layout twin that is
+// itself an ARM of a second union), which is also where D38's "no twin needed" is shown as
+// such rather than merely asserted.
+// @run
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 1
+// @log 1
+// THE `Shape[]` ANNOTATION IS LOAD-BEARING — it is the annotated half of the heterogeneous
+// control — so its hint is DECLARED rather than removed. `_i` is the deliberate unused
+// callback parameter D38's own witness carries.
+// @hint Intentionally-unused parameter `_i`
+// @hint redundant type annotation: `xs` is inferred as `({r: i32} | {s: i32})[]`
+import { mapIndexed } from "std:array"
+
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+
+// The exact-layout standalone twin D36 needs, and which D38 does not.
+type Dot = { r: i32 }
+
+// ── D36: an anonymous element in a LAMBDA's inferred list return, twin present ──
+function d36() {
+  const g = (n: i32) => {
+    const o = [{ r: n }]
+    return o
+  }
+  return g(7)[0].r
+}
+
+// ── D38: an anonymous element in a generic CALLBACK's inferred list result ──
+// No twin is needed here: `mapIndexed`'s minted `U[]` supplies the row.
+function mk(n: i32, _i: i32) {
+  const o = [{ r: n }]
+  return o
+}
+
+function d38() {
+  const out = mapIndexed([7], mk)
+  return out[0][0].r
+}
+
+// ── the same shape with NO import and NO generic at all ──
+function plainInferred(n: i32) {
+  const o = [{ r: n }]
+  return o
+}
+
+// ── a hand-written generic, so the row is not `mapIndexed`'s ──
+function myMap<T, U>(xs: T[], f: (T, i32) => U): U[] {
+  const out: U[] = []
+  let i = 0
+  while i < xs.length {
+    out.push(f(xs[i], i))
+    i = i + 1
+  }
+  return out
+}
+
+function handMap() {
+  const out = myMap([7], mk)
+  return out[0][0].r
+}
+
+// ── no function boundary at all: the literal, the binding and the read in one body ──
+function direct() {
+  const n = 7
+  const o = [{ r: n }]
+  return o[0].r
+}
+
+// ── THE CONTROLS: a genuinely heterogeneous literal, where the checker DOES record a union
+//    element and the elements must keep boxing. Un-annotated and annotated. ──
+function hetInferred() {
+  const xs = [{ r: 1 }, { s: 2 }]
+  const e = xs[0]
+  if e is Circle { return e.r }
+  return -1
+}
+
+function hetAnnotated() {
+  const xs: Shape[] = [{ r: 1 }, { s: 2 }]
+  const e = xs[0]
+  if e is Circle { return e.r }
+  return -1
+}
+
+print(d36())
+print(d38())
+print(plainInferred(7)[0].r)
+print(handMap())
+print(direct())
+print(mk(7, 0)[0].r)
+print(hetInferred())
+print(hetAnnotated())
