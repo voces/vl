@@ -3491,8 +3491,11 @@ Repro:
   declared after use) x **producer** (anonymous object literal / a named `const c: Circle` /
   a call result) x **route** (direct / lambda inferred / lambda annotated / function inferred
   / function annotated / `std:array` callback inferred / annotated / hand-written generic
-  callback inferred / annotated / `std:array` RECEIVER / init-first `reduce` / hand-written
-  init-first) x **container** (bare / list / list-of-list / map value / struct field).
+  callback inferred / annotated / `std:array` RECEIVER (`reverse`) / `std:array` `reduce`,
+  which is CALLBACK-first (`(self, f, init)`) / a hand-written `reduce` that is INIT-first)
+  x **container** (bare / list / list-of-list / map value / struct field). The last two are
+  D33's binding-column axis carried forward; neither contributed a moved cell here, so this
+  change says nothing new about that column and does not claim to.
 
   | | master `f2064bec` | branch |
   |---|---|---|
