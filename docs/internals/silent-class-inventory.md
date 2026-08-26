@@ -2067,8 +2067,8 @@ same narrowed value handed to a generic that does not return it (`dstGen<T>(x: T
 
 ---
 
-### D26 — a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in one program
-**check-clean invalid wasm · filed 2026-08-26 by the `std-api-reviewer` pass over the D24 retirement, which went looking for the CROSS cell the retirement's own pin did not have · pre-existing, measured on this exact file against master's compiler (identical rejection, identical offset 0x29e)**
+### D26 — [CLOSED 2026-08-26] a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in one program
+**check-clean invalid wasm · filed 2026-08-26 by the `std-api-reviewer` pass over the D24 retirement, which went looking for the CROSS cell the retirement's own pin did not have · pre-existing, measured on this exact file against master's compiler (identical rejection, identical offset 0x29e) · CLOSED by retiring `letInitReboxesToVariant`, whose heap comparison read a VARIANT index through the STRUCT table**
 
 Repro:
 
@@ -2136,6 +2136,141 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   module", and the class already has its live specimen in D25.
   `tests/cases/std/array-reduce-narrowed-variant-init.vl` instantiates `reduce` at four
   accumulator types on purpose and says in its header which fifth one is missing and why.
+
+**CLOSED 2026-08-26.** The filed program above runs and prints `8` / `4`.
+
+* **IT IS NOT ABOUT `reduce`, NOT ABOUT THE MONOMORPHIZER, AND NOT ABOUT TWO INSTANCES.**
+  The root is `letInitReboxesToVariant` (`compiler/emit_classify.vl`, #1010), the one
+  predicate that can veto `letIsVariant`. It compared the two heap tables:
+
+      const ssi = structIndexOfExpr(d.letInit, fnIx)
+      if ssi < 0 || ssi >= sHeapIdx.length { return false }
+      return sHeapIdx[ssi] != uVarHeap[vi]
+
+  `structIndexOfExpr` hands back a **VARIANT** index for a variant-returning call —
+  `fRetStructIdx` is the polymorphic companion slot (`emit_state`'s own header: *"also a
+  union-VARIANT return's variant index"*), a `: Circle` annotation leaves `fRetKind` at
+  `"i32"` (`retAnnKindChain`), and `fnRetStructIndexSid` reads the slot UN-GATED. So the
+  comparison is mis-typed, and `ssi < sHeapIdx.length` is a **BOUNDS check, not a namespace
+  check**. It declined every variant index only while the struct table was EMPTY — which is
+  exactly a program whose object types are ALL union arms, because `collectS` skips a
+  `TypeDecl` that `variantIndexOf` claims (`emit_collect.vl`). Add ONE standalone struct and
+  the variant index lands in bounds and is read as `sHeapIdx[<variant index>]`.
+* **MEASURED AT THE SITE**, with a probe printing the guard's own intermediates. On the filed
+  program: `vi=0 ssi=0 sLen=2 uVarHeap[vi]=2 names=[0]{r:i32}@0[1]{s:i32}@1`. On the same
+  program minus the union instance: `vi=0 ssi=0 sLen=0` — the bounds check declining. And
+  with a `Pre = {p,q}` struct declared FIRST, so the anonymous row is index 1 while the
+  variant index is 0: `ssi=0` — the answer really is in the VARIANT namespace, not the
+  anonymous row's.
+* **WHAT MADE THE STRUCT TABLE NON-EMPTY IN THE FILED PROGRAM.** `Circle`/`Sq` have no
+  `sNames` row of their own. The two rows are ANONYMOUS inline shapes `{r:i32}` / `{s:i32}`,
+  minted because the monomorphizer's instance annotation spells the union STRUCTURALLY: a
+  chain probe caught `internShapeDeepTy` entered with
+  `({r:i32}|{s:i32},i32)=>{r:i32}|{s:i32}` — the substituted `f: (A, T) => A` — whereupon
+  `internFuncTypeShapesTy` split the composite union and interned each arm. That is why the
+  row read as "needs a monomorphized generic": the generic is only how the struct table
+  stops being empty. **One plain `type Pre = { p: i32, q: i32 }` is enough**, and then no
+  generic is involved at all —
+  `tests/cases/unions/unannotated-bind-variant-call-beside-plain-struct.vl`.
+* **THE SAME ROOT IS LOUD OR SILENT DEPENDING ON WHICH ROW THE VARIANT INDEX LANDS ON.** If
+  that row carries the field being read, the module emits and the engine refuses it (the
+  filed cell); if it does not, `emitProgram: unknown struct field in field access` — the
+  `umt` (union + member struct + a THIRD struct) eighth of the grid below.
+* **THE GUARD CANNOT BE RIGHT FOR ANY ARM `exprVariantIndex` ANSWERS FROM**, which is why it
+  is retired rather than re-typed. Every arm is REP-authoritative: `paramVariantIndex` /
+  `declaredVariantIndex` / `capturedVariantIndex` / `globalVariantIndexSid` read the cell
+  KIND; the `as` arm reads the cast the checker proved; the `Index` arm excludes a
+  plain-struct element list by name; and the CALL arm is gated on `retVariantFlag` — *"the
+  same predicate the callee's own functype result is emitted from"* — added in #1816 on
+  2026-08-22, a MONTH after the guard landed (#1010, 2026-07-22). That gate is what makes
+  the plain-struct twin the guard was written for (`mk3(): {a:i32,f:i32}`, #1005) answer -1
+  at `exprVariantIndex` and stop reaching the guard at all.
+* **MEASURED DEAD.** A probe firing only when the guard returns TRUE, over **all 2,254
+  `tests/cases/*.vl`** and over the compiler's own module graph: **0 programs**. A second
+  probe firing on every entry past `vi >= 0`: 12 corpus files, every one returning false —
+  9 on `ssi < 0` and 3 on the empty-table bound — and `sHeapIdx[ssi]` out of range in all
+  12. The guard's only live effect was this defect.
+* **GRID, 240 cells** (accumulator pairing x consumption x std-`reduce`/hand-written generic
+  x declaration order x 2-or-3 instances), master vs branch:
+
+  | | master `c99838a8` | branch |
+  |---|---|---|
+  | runs | 192 | **224** |
+  | check-clean invalid wasm | 40 | **16** |
+  | loud emit reject | 8 | **0** |
+  | loud check reject / trap / wrong value | 0 | 0 |
+
+  **32 cells moved, every one toward a better outcome; 0 moved backward** — 24
+  `check-clean invalid wasm -> runs` (the `um`/`umt` `bind` and `pass` consumptions) and 8
+  `loud emit reject -> runs` (`umt_bind`, where the row the variant index landed on had no
+  such field). The axes agree
+  with the filed controls: only the `um` / `umt` pairings ever failed (union + MEMBER
+  struct), `std` and `own` are identical at 20/4/96 each — so it was never a std problem —
+  and `fwd`/`rev` declaration order and 2-vs-3 instances are flat.
+* **WHAT REMAINS: the 16 `list` cells, and they are a DIFFERENT RUNG** — D30 below. Storing
+  the variant into a `Circle[]` resolves the ref-list ELEMENT heap through `rlElemStructRow`,
+  whose canon-key rung (`repRowOfTyStruct`) bridges the variant's SHAPE onto a standalone
+  struct row. Identical on master and on this branch (same 16 cells, same message),
+  reachable with no generic at all, and chartered as ROADMAP repOf item (e).
+* Pinned as `tests/cases/unions/unannotated-bind-variant-call-beside-plain-struct.vl` (the
+  loud spelling, no generic, four consumptions) and as the fifth accumulator of
+  `tests/cases/std/array-reduce-narrowed-variant-init.vl`, which its own header had reserved
+  for this close.
+
+---
+
+### D30 — a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table when a layout twin exists
+**check-clean invalid wasm · found by D26's 240-cell grid (16 cells, the `list` consumption) · filed 2026-08-26 while closing D26 · pre-existing, identical on master `c99838a8` and on D26's branch (same offset 0x15c, same message) · a DIFFERENT rung from D26 and unmoved by its fix**
+
+Repro:
+
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function mkD(): Dot { return { r: 3 } }
+    function useShape(): i32 {
+      const s: Shape = { r: 1 }
+      if s is Circle { return s.r }
+      return -2
+    }
+    function circleList(): i32 {
+      const c: Circle = { r: 8 }
+      const xs: Circle[] = [c]
+      return xs[0].r
+    }
+    print(circleList())
+    print(useShape())
+    print(mkD().r)
+    // vl check rc 0, no diagnostic at any severity; vl run:
+    //   Invalid input WebAssembly code at offset 348:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+Controls, each RUN:
+
+* the same file with `Dot` DELETED — with no layout twin in `sNames` the element resolves
+  through `uVarHeap`;
+* the same file with `type Dot = { d: i32 }` (a struct that is NOT a layout twin);
+* the same `Circle` value not put in a list (`return c.r` in place of the two list lines).
+
+* **THE PRODUCER AND THE CONSUMER DISAGREE, ARM FOR ARM.** The READ side
+  (`exprVariantIndex`'s `Index` arm) resolves a `Cat[]` element through `uVarHeap` and gates
+  on `structIndexByName(elemName) < 0` — an EXACT-NAME lookup, which `Circle` passes because
+  a variant has no `sNames` row. The ELEMENT-HEAP side (`mAssignTypeIndices`' ref-pair loop
+  in `emit_collect.vl`) tries `rlElemStructRow` FIRST and only falls through to
+  `rlElemVariantHeap`; `rlElemStructRow`'s third rung is `repRowOfTyStruct`, the structural
+  canon-key bridge, which returns `Dot`'s row. So the backing array is typed
+  `(array (mut (ref null $Dot)))` while the value stored is `(ref $uVarHeap[Circle])`.
+* **THE TWIN SIG PASS CARRIES THE SAME LADDER** (`rlSig`'s `else` arm) by design — its
+  header says it "mirrors the `rlElemHeap` resolution below" — so a fix must move BOTH in
+  lock-step or the dedup decision and the heap disagree.
+* **DELIBERATELY NOT FIXED WITH D26.** `rlElemStructRow` has four other consumers
+  (`wasmEmit`'s element store / push / array-literal sites) that would each need the same
+  gate, and `rlElemLitStructRow`'s header already records a MEASURED reason its own name
+  rung is deliberately narrower ("changes the answer on 7 corpus calls and 311 fuzz
+  programs — every one of them a both-decline today, i.e. exactly the -1 the variant route
+  depends on"). This is the seam ROADMAP charters as repOf item (e), the variant/struct-table
+  seam, whose LOUD half is already recorded there.
 
 ---
 
