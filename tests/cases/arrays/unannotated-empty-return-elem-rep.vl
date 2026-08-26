@@ -1,0 +1,192 @@
+// @run
+// AN UN-ANNOTATED FUNCTION RETURNING AN EMPTY `[]` TAKES ITS ELEMENT REP FROM THE SLOT
+// THE HOLE MEETS (D16, `docs/internals/silent-class-inventory.md`).
+//
+// Master emitted a CHECK-CLEAN INVALID MODULE for every one of these legs: `vl check` rc 0,
+// no diagnostic, module written, and the engine refused it with `type mismatch: expected
+// (ref $type), found (ref $type)`. Two readers of one fact disagreed. The empty literal has
+// no element, so every syntactic list classifier declines it and the `return []` BUILD fell
+// to the DEFAULT i32 list; the function's RESULT VALTYPE meanwhile came from the checker's
+// unification of the hole with the consuming slot (`exprStringArray`'s typed fast path),
+// which is why `string`/`f64`/`i64` producers declared the right wrapper over an i32-list
+// body, and why `f32`/`u8`/struct/closure/nested — which no arm answered for — got the i32
+// wrapper AND the i32 body and failed at the CALL instead. `i32[]` and `boolean[]` were the
+// only reps that ran, because for them the default IS the answer.
+//
+// Both readers now take the element rep off the type the CHECKER recorded on the literal
+// node (`emptyArrHoleKind` → the result valtype in `criClassify`, `emptyArrHoleBuildKind` →
+// the `pendingListKind` seed in `emitReturnValue`), so they cannot drift.
+//
+// EVERY LEG PUSHES A REAL ELEMENT AND READS IT BACK where the rep allows. A wrapper that
+// merely type-checks is not the claim — the claim is that the BACKING array holds that
+// element's rep, and only a store-then-load can show it.
+
+type S = { m: i32 }
+type Cat = { meow: i32 }
+type Dog = { woof: i32 }
+type Pet = Cat | Dog
+
+// L1 — the filed repro verbatim: a `string[]` slot at the CALL-ARGUMENT position.
+// @log 0
+function sinkStr(xs: string[]) { print(xs.length) }
+function fqStr() { return [] }
+sinkStr(fqStr())
+
+// L2..L5 — the four DISTINCT scalar backings (`f64` / `i64` / `f32` / the packed `u8`).
+// Each is a separate wrapper heap type, so each is a separate way for the build and the
+// declared result to disagree.
+// @log 1.5
+function sinkF64(xs: f64[]) {
+  xs.push(1.5)
+  print(xs[0])
+}
+function fqF64() { return [] }
+sinkF64(fqF64())
+
+// @log 9
+function sinkI64(xs: i64[]) {
+  xs.push(9)
+  print(xs[0])
+}
+function fqI64() { return [] }
+sinkI64(fqI64())
+
+// @log 2.5
+function sinkF32(xs: f32[]) {
+  xs.push(2.5)
+  print(xs[0])
+}
+function fqF32() { return [] }
+sinkF32(fqF32())
+
+// @log 200
+function sinkU8(xs: u8[]) {
+  xs.push(200)
+  print(xs[0])
+}
+function fqU8() { return [] }
+sinkU8(fqU8())
+
+// L6 — a STRUCT element: the ref-list backing (`pendingListKind` 1) plus its interned row.
+// @log 7
+function sinkStruct(xs: S[]) {
+  xs.push({ m: 7 })
+  print(xs[0].m)
+}
+function fqStruct() { return [] }
+sinkStruct(fqStruct())
+
+// L7 — a CLOSURE element: the same ref-list backing at kind 5, whose element wrapper is the
+// closure fat pointer rather than a struct.
+// @log 12
+function sinkClo(xs: ((i32) => i32)[]) {
+  xs.push((z: i32) => z + 2)
+  print(xs[0](10))
+}
+function fqClo() { return [] }
+sinkClo(fqClo())
+
+// L8 — a UNION-BOX element (`pendingListKind` 2).
+// @log 3
+function sinkUnion(xs: Pet[]) {
+  xs.push({ meow: 3 })
+  const p = xs[0]
+  if p is Cat { print(p.meow) }
+}
+function fqUnion() { return [] }
+sinkUnion(fqUnion())
+
+// L9 — a NESTED list element (`i32[][]`): the ref-list row whose element is the inner
+// i32-list wrapper.
+// @log 4
+function sinkNest(xs: i32[][]) {
+  xs.push([4])
+  print(xs[0][0])
+}
+function fqNest() { return [] }
+sinkNest(fqNest())
+
+// L10..L13 — THE SAME HOLE AT THE OTHER CONSUMER POSITIONS. The producer is one function,
+// so a fix that only reached the call-argument boundary would leave these red.
+// @log 0
+// @hint redundant type annotation: `midPos` is inferred as `string[]` — remove it to lean on inference
+// THE HINT IS PINNED, NOT ACTED ON — the playbook's "a redundant-annotation hint can be wrong
+// about a LOAD-BEARING annotation" landmine, and the same one
+// `lambda-empty-array-literal-return.vl` records. Inference does now reach `string[]` for
+// `midPos`, but removing the annotation turns this leg into the two-hop leg below and stops
+// testing the TYPED-RETURN position at all.
+function fqPos() { return [] }
+function midPos(): string[] { return fqPos() }
+print(midPos().length)
+
+// @log 0
+function fqLocal() { return [] }
+const xsLocal: string[] = fqLocal()
+print(xsLocal.length)
+
+// @log 0
+// @log 0
+function fqGlobal() { return [] }
+let xsGlobal: string[] = fqGlobal()
+print(xsGlobal.length)
+xsGlobal = fqGlobal()
+print(xsGlobal.length)
+
+// L13 — TWO HOPS before the hole meets its slot: neither hop is annotated either, so the
+// rep has to survive two un-annotated return boundaries.
+// @log 0
+function fqHop() { return [] }
+function hop1() { return fqHop() }
+function hop2() { return hop1() }
+function sinkHop(xs: string[]) { print(xs.length) }
+sinkHop(hop2())
+
+// L14 — the LAMBDA spelling of the producer. `fmt` keeps the two forms distinct but the
+// emitter must not: the D4 slice established the named/lambda equality as an invariant.
+// @log 5
+const fqLam = () => []
+function sinkLam(xs: f64[]) {
+  xs.push(5.0)
+  print(xs[0])
+}
+sinkLam(fqLam())
+
+// L15 — `[[]]`: the hole is the ELEMENT of a non-empty literal, so the outer literal's own
+// row key is what was wrong (it read `i32[]` off a first element that has no element).
+// @log 1
+// @log 6
+function fqHoleInHole() { return [[]] }
+function sinkHIH(xs: i32[][]) {
+  print(xs.length)
+  xs[0].push(6)
+  print(xs[0][0])
+}
+sinkHIH(fqHoleInHole())
+
+// L16 — THE TWO REPS THAT ALWAYS WORKED, pinned as the no-change control: for `i32[]` and
+// `boolean[]` the DEFAULT i32 list is the right answer, and the new seed must agree with it
+// rather than route them somewhere new.
+// @log 8
+function sinkI32(xs: i32[]) {
+  xs.push(8)
+  print(xs[0])
+}
+function fqI32() { return [] }
+sinkI32(fqI32())
+
+// @log true
+function sinkBool(xs: boolean[]) {
+  xs.push(true)
+  print(xs[0])
+}
+function fqBool() { return [] }
+sinkBool(fqBool())
+
+// L17 — THE HOLE THAT MEETS NO SLOT. It stays the i32 default and must keep lowering: a
+// `.length` read of the call result, and a call whose result is discarded entirely.
+// @log 0
+// @log 99
+function fqUnmet() { return [] }
+print(fqUnmet().length)
+fqUnmet()
+print(99)
