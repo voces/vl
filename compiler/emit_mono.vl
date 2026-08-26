@@ -160,11 +160,14 @@ import {
   exprIsF32,
   exprIsF64,
   exprIsI64,
+  exprNullableRefArray,
   exprNullableStruct,
+  exprNullableVariant,
   exprRefArray,
   exprString,
   exprStringArray,
   exprStruct,
+  exprU8Array,
   exprUnion,
   fieldValueFeOf,
   fnHasUnannotatedParam,
@@ -191,6 +194,7 @@ import {
   synthTypeRefFb,
   synthTypeRefTy,
   tyNulFuncInner,
+  variantIndexOf,
 } from "./emit_classify"
 import {
   buildFnMap,
@@ -355,6 +359,24 @@ function monoAnnPinName(name: string) {
   // the instance's param/return ride the union box. `isUName` covers a registered inline
   // union and a `type … = … | …` alias (both in `unNames`).
   if isUName(name) { return name }
+  // A declared union ARM (`Circle`, a member of `type Shape = Circle | Sq`) — the kind-8
+  // VARIANT, whose slot is `(ref $uVarHeap[vi])`. `monoStructAnnName` above declines it BY
+  // CONSTRUCTION (a variant has no struct row, which is the very gate `nulVariantIndexOf`
+  // applies), `isUName` declines it because an arm is not the union, and every channel in
+  // the cascade below answers about the REP — so the argument fell to the `"i32"`
+  // catch-all and the instance declared an i32 parameter over a `(ref $type)` value.
+  // `vl check` rc 0, `type mismatch: expected i32, found (ref $type)` at load.
+  //
+  // The pin is the arm's OWN spelling, which is `monoScalarAnnName`'s exact-name safety
+  // property read straight: `x: Circle` is an annotation a NON-generic function already
+  // lowers end to end, so the instance lands on the working path rather than beside it.
+  //
+  // IT ALSO GIVES `monoNulAnnName` ITS `Circle | null` FOR FREE, which is the whole of the
+  // nullable half (silent-class-inventory D23): that helper delegates its base to this
+  // ladder precisely so there is ONE membership list, and the niche's rep — the
+  // `(ref null $uVarHeap[vi])` cell — is one an annotated `c: Circle | null` parameter
+  // already lowers too.
+  if variantIndexOf(name) >= 0 { return name }
   const rl = monoCompositeListAnnName(name)
   if rl != "" { return rl }
   // A LITERAL-UNION ALIAS ARRAY (`K[]`), the array sibling of the `isUName` arm above and of
@@ -700,6 +722,15 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
             if ld.letType < 0 && ld.letInit >= 0 {
               const innerTy = monoArgTyName(ld.letInit, fnIx)
               if innerTy != "" && innerTy != "i32" { return innerTy }
+              // A REFUSAL PROPAGATES. `""` here is not "nothing known" — it is one of this
+              // ladder's explicit FLOORS (`exprUnion`, `exprNullableStruct`, and the three
+              // at the bottom), i.e. "this init has a REF rep no pin can name". Falling
+              // through hands the question back to the Ident cascade, which is post-mono
+              // blind for a local (`buildLocals` has not run) and therefore answers `"i32"`
+              // — re-entering, one binding later, exactly the wrong-instance failure the
+              // floor exists to prevent. Witness: `const xs = o.xs` over a `P[] | null`
+              // FIELD, the `nulreflist` half of silent-class-inventory D23.
+              if innerTy == "" { return "" }
             }
           }
         }
@@ -952,6 +983,39 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   if exprIsF64(ix, fnIx) { return "f64" }
   if exprIsI64(ix, fnIx) { return "i64" }
   if exprIsBool(ix, fnIx) { return "boolean" }
+  // THE `"i32"` CATCH-ALL IS THE DEFECT, NOT THE MISSING ARM (silent-class-inventory D23).
+  // A cascade that answers `i32` for a rep it did not recognise mints a wrong INSTANCE
+  // silently: the pin BECOMES the instance's parameter annotation, so an unrecognised REF
+  // rep declares an i32 parameter over a body and a caller both carrying a `(ref …)` —
+  // `vl check` rc 0 and `type mismatch: expected i32, found (ref …)` at load, which is the
+  // only failure shape this ladder can produce. `""` is the LOUD floor (`monoInstantiate`
+  // fails the call, naming the parameter and the callee), and a loud floor beats a wrong
+  // instance even where a pin could eventually be found.
+  //
+  // Two floors already exist further up (`exprUnion`, `exprNullableStruct`), beside the
+  // arms they partition with. These are the measured remainder, asked LAST so every arm
+  // that CAN name a shape still names it — each a rep whose wasm cell is a `(ref …)` that
+  // no arm above spells:
+  //
+  //   `exprNullableVariant`   a `Circle | null` reached with no annotation to read (the
+  //                           annotated param / local / global spellings resolve above,
+  //                           through the variant arm `monoAnnPinName` now carries)
+  //   `exprNullableRefArray`  an `S[] | null` through a struct FIELD read — the param and
+  //                           annotated-local spellings resolve through `monoNulAnnName`,
+  //                           and a field read has no annotation channel at all
+  //   `exprU8Array`           the PACKED byte list, which `exprArray`'s i32-list arm
+  //                           declines — the same ordering rule `globalKind` states, and it
+  //                           makes the two `u8[]` spellings agree: the `readFile`-shaped
+  //                           one already got this refusal while the bound one miscompiled
+  //
+  // NARROW ON PURPOSE. Only reps MEASURED silent-wrong are floored; the other nullable
+  // niches (`nullist`, `nulmap`, `nulstr`, `nulclosure`, the scalar lists, `boolean |
+  // null`) resolve through the annotation channels and were measured RUNNING, and a floor
+  // fires only where the answer would otherwise be `"i32"` — so widening it unmeasured
+  // could turn a working cell loud. D-SHAPEFIELD's rule, one ladder over.
+  if exprNullableVariant(ix, fnIx) { return "" }
+  if exprNullableRefArray(ix, fnIx) { return "" }
+  if exprU8Array(ix, fnIx) { return "" }
   "i32"
 }
 

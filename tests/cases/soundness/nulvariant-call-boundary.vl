@@ -1,0 +1,130 @@
+// @run
+// @log 5
+// @log -1
+// @log 5
+// @log 5
+// @log 5
+// @log 5
+// @log 5
+// @log 5
+// @log 5
+// THE `nulvariant` CALL BOUNDARY, both directions, graduated from
+// `tests/cases/soundness/xfail-miscompile-nulvariant-literal-arg.vl` (which was
+// `silent-class-inventory` D22 and `tests/vl_check_codegen_test.ts`'s live specimen).
+//
+// `Circle | null` is the `nulvariant` NICHE: one non-null member, so the cell is a bare
+// `(ref null $uVarHeap[vi])` and NOT the `{tag, value}` box a two-member union gets. Every
+// cell below is a value crossing into a position where that niche meets something else, and
+// the two directions fail in OPPOSITE ways — which is why one fix could not have covered
+// both, and why the message reads like a nullability complaint in each case and is not one
+// (the two `$type`s the disassembler prints are different heap types).
+//
+//   DIRECTION A (D24) — a NARROWED niche into a UNION position needs a BOX and got none.
+//     `emitUnionBoxArg` asked `exprVariantIndex`, whose arms are the kind-8 param, the
+//     declared local and the global; the nullable cell is none of those, so it answered -1,
+//     the value fell through to `emitUnionCoerce` and was passed through RAW.
+//     `local.get 0 ; return_call $area`, a `(ref null $Circle)` under a `(ref $uBox)`.
+//
+//   DIRECTION B (D22) — an object LITERAL into a `Circle | null` position needs the NICHE
+//     and got a box. The LET position seeds the variant index (`letAnnVariantIdx`) and so
+//     does the RETURN position; the ARGUMENT and ASSIGNMENT positions never did, so the
+//     literal took `emitObj`'s union-program default and emitted
+//     `struct.new $Circle ; struct.new $uBox` into the niche slot.
+//
+// Both were `vl check` rc 0 with no diagnostic at any severity, and both are pre-existing —
+// measured against master's published `seed-latest` at the identical byte offsets.
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+
+function area(sh: Shape) {
+  if sh is Circle { return sh.r }
+  return 0
+}
+
+function mkc(): Circle | null {
+  return { r: 5 }
+}
+
+// DIRECTION B, the ARGUMENT position: the literal must build the bare variant struct, which
+// subtypes the niche. The `null` argument beside it is the control that always worked — it
+// takes the niche's own `ref.null` seed, which is the OTHER half of the same pairing.
+function takeNiche(v: Circle | null) {
+  if v is Circle { return v.r }
+  return -1
+}
+
+// DIRECTION B, the ASSIGNMENT position: the same seed, one statement kind over. A
+// declaration (`const c: Circle | null = { r: 5 }`) already worked, so the two spellings of
+// one binding disagreed.
+function assignNiche() {
+  let c: Circle | null = null
+  c = { r: 5 }
+  if c is Circle { return c.r }
+  return -1
+}
+
+// DIRECTION A, through each narrowing construct. `is Circle` and `!= null` reach the
+// boundary through different classifiers, so both are pinned.
+function narrowIs(c: Circle | null) {
+  if c is Circle { return area(c) }
+  return -1
+}
+
+function narrowNeNull(c: Circle | null) {
+  if c != null { return area(c) }
+  return -1
+}
+
+// DIRECTION A with a BINDING between the narrow and the argument — the delivery shape that
+// makes the value a declared local rather than the narrowed param itself.
+function narrowBound(c: Circle | null) {
+  if c is Circle {
+    const d = c
+    return area(d)
+  }
+  return -1
+}
+
+// DIRECTION A into a STRUCT FIELD, which is a box-typed cell exactly as an argument is. Its
+// three code-16 sites (construct, variant payload, field store) called `emitUnionCoerce`
+// directly instead of `emitUnionBoxArg`, so they raw-passed a variant — the NON-null variant
+// as much as the niche.
+type Holder = { s: Shape }
+
+function intoField(c: Circle | null) {
+  if c is Circle {
+    const o: Holder = { s: c }
+    return area(o.s)
+  }
+  return -1
+}
+
+// A NON-NULL variant into that same field cell — the twin the field sites also broke, and the
+// reason the fix is one callee swap rather than a nullable special case.
+function variantIntoField(v: Circle) {
+  const o: Holder = { s: v }
+  return area(o.s)
+}
+
+// DIRECTION A from a CAPTURE. `exprVariantIndex` had param / declared / global legs and no
+// capture leg, while `captureValKind` types the env field "variant" and `captureValStructIdx`
+// banks the variant index beside it — the fact was already there, only the reader was
+// missing. The niche twin `exprNullableVariant` carries its capture arm, so the two now
+// answer for the same storage classes.
+function capturedVariant(v: Circle) {
+  function inner() {
+    return area(v)
+  }
+  return inner()
+}
+
+print(takeNiche({ r: 5 }))
+print(takeNiche(null))
+print(assignNiche())
+print(narrowIs(mkc()))
+print(narrowNeNull(mkc()))
+print(narrowBound(mkc()))
+print(intoField(mkc()))
+print(variantIntoField({ r: 5 }))
+print(capturedVariant({ r: 5 }))

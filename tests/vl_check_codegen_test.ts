@@ -182,15 +182,26 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // the same checker error its direct twin already gave. Its grid is
 // `tests/cases/std/error-u8-array-generic.vl`, which runs the two spellings side by side.
 //
-// THIS SPECIMEN IS AN OBJECT LITERAL MEETING A `Circle | null` PARAMETER, and it is neither of
-// the two families above. `Circle | null` is the `nulvariant` NICHE (one non-null member, so no
-// box), but an object literal in that argument position takes the union-BOX path because the
-// program declares a union at all — `struct.new $Circle ; struct.new $unionBox` into a slot
-// typed for the bare niche. A `null` argument to the same parameter is fine, and so is the same
-// literal handed to a `Shape` parameter; it is the third combination that has no arm. It was
-// MASKED until the narrowed-`Circle | null` pass-through in the same file was fixed, which is
-// how gridding the call-argument boundary surfaced it. Pinned as
-// `tests/cases/soundness/xfail-miscompile-nulvariant-literal-arg.vl`.
+// The object-literal-into-a-`Circle | null`-parameter specimen that followed it is gone too, and
+// so is the WHOLE `nulvariant` call-boundary class it belonged to. That class was three filed
+// rows — the literal needing the niche and getting a box, a narrowed niche needing a box and
+// getting none, and the monomorphizer's pin answering `i32` for both reps — and gridding the
+// cross product turned up eleven more cells of the same two roots at other POSITIONS (a struct
+// field's three code-16 sites, a local assignment, a capture). All of it graduated to
+// `tests/cases/soundness/nulvariant-call-boundary.vl` and `…/nulvariant-generic-pin.vl`, and
+// the two reps the pin still cannot NAME are loud now
+// (`…/error-generic-nulreflist-field-pin.vl`, `…/error-generic-u8-list-pin.vl`).
+//
+// THIS SPECIMEN IS THE ONE CELL THAT SURVIVED THAT SWEEP, and it survived because it is not a
+// question about one boundary at all. A narrowed `Circle | null` handed to a generic identity
+// `<T>(x: T): T` comes back out with the instance's declared result type — and the pin read the
+// PARAMETER's annotation (`Circle | null`), while the checker had already typed the narrowed
+// expression `Circle`. So the value that flows on is the `(ref null $uVarHeap[vi])` niche where
+// the consumer's `Shape` parameter wants the `(ref $uBox)`: two channels answering one question
+// about one call, each correctly for the question it was asked. Deciding which channel owns a
+// narrowed argument's type is a design question, not a missing arm, which is why it is filed
+// (`silent-class-inventory.md` D25) rather than fixed beside the others. Pinned as
+// `tests/cases/soundness/xfail-miscompile-generic-roundtrip-nulvariant.vl`.
 const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
@@ -200,13 +211,20 @@ const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
   `  return 0\n` +
   `}\n` +
   `\n` +
-  `function go(v: Circle | null) {\n` +
-  `  if v is Circle { return v.r }\n` +
+  `function idg<T>(x: T): T {\n` +
+  `  return x\n` +
+  `}\n` +
+  `\n` +
+  `function mkc(): Circle | null {\n` +
+  `  return { r: 5 }\n` +
+  `}\n` +
+  `\n` +
+  `function go(c: Circle | null) {\n` +
+  `  if c is Circle { return area(idg(c)) }\n` +
   `  return -1\n` +
   `}\n` +
   `\n` +
-  `print(go(null))\n` +
-  `print(go({ r: 3 }))\n`;
+  `print(go(mkc()))\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
