@@ -947,7 +947,7 @@ mapval, the two `*_place` check rejects) is shared with `f64` and is therefore n
 **That residue is now filed as D20**, re-probed per (position, rep): it is a nullable-list
 niche with no rep at three positions, 360 cells across every list rep, and nothing in this
 fix touches it.
-Corpus byte-identity across the whole `tests/cases` tree: **2,229 of 2,230 identical**, the
+Corpus byte-identity across the whole `tests/cases` tree: **2,232 of 2,233 identical**, the
 single mover being the new fixture, which the old compiler cannot emit at all.
 
 * Pin: `tests/cases/arrays/nullable-f32-list-narrowed-positions.vl` (one narrowed read per
@@ -956,7 +956,7 @@ single mover being the new fixture, which the old compiler cannot emit at all.
 * **FULL GRID, before and after on the closing branch**: `correct` **6,909 -> 7,083**, loud
   emit **1,018 -> 844**, loud check 1,199 -> 1,199, SILENT TOTAL **0 -> 0**. Cell for cell,
   exactly those 174 cells moved and nothing else in the other 21 reps did.
-* **THE CORPUS WAS BLIND TO THIS, and the byte-identity number is the proof**: all 2,229
+* **THE CORPUS WAS BLIND TO THIS, and the byte-identity number is the proof**: all 2,232
   pre-existing fixtures emit byte-identical modules, because not one of them narrowed an
   `f32[] | null`. A rep-by-position grid found it; no amount of corpus green would have.
 

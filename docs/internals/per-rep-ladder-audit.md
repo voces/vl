@@ -381,7 +381,7 @@ turning into check-clean invalid wasm).
   parity with `list_f64` (0 differing cells of 340 when the two are joined on
   their coordinate). All 174 movers are `loud_emit_reject -> correct`; the rep's
   silent total stays 0. On the FULL 9,126-cell grid exactly those 174 cells move
-  and nothing else does. Corpus byte-identity 2,229 / 2,230.
+  and nothing else does. Corpus byte-identity 2,232 / 2,233.
 * This row's OWN op grid, re-probed one program per op against the `f64` twin:
   `.length`, `xs[0] = e`, `.push`, `for-in`, `.slice`, `.filter`, `.map` were all
   LOUD and all now run; the bare index read `w[0]`, the one op that already
