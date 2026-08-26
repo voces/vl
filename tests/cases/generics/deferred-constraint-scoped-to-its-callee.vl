@@ -1,0 +1,115 @@
+// @run
+// @log 7
+// @log 2
+// @log 2
+// @log 1
+// @log 1
+// @hint Intentionally-unused parameter `_i` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_e` (leading `_` marks it unused)
+// @hint redundant type annotation: `o` is inferred as `f64[]`
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `xs` is inferred as `f64[][]`
+// @hint redundant type annotation: `xs` is inferred as `f64[][]`
+// @hint redundant type annotation: `xs` is inferred as `i32[]`
+// A DEFERRED BINARY-OP CONSTRAINT BELONGS TO ONE BODY, and until this change the list was a
+// single global keyed on the TyVar NAME. `substTyDeep` maps ANY `T` to the call's binding, so
+// every generic in the program shared one namespace: a `function addT<T>(a: T, b: T) { return
+// a + b }` sitting anywhere made `idT(c)` — a generic that adds nothing — report `operator '+'
+// is not defined for Circle and Circle`. That was a false reject on master, and it is the
+// first two lines below.
+//
+// IT IS ALSO WHAT MADE THE D35 FIX POSSIBLE. Stating the EQUALITY capability at the pin means
+// asking "is the pinned type comparable" of every constraint the call is entitled to
+// adjudicate — so with the whole list in scope, `indexOf`'s `self[i] == needle` would have
+// refused `xs.reverse()` over the same receiver. The owner column is load-bearing, not tidying.
+//
+// THE THREE DEGREES A CALL SITE KNOWS ITS CALLEE, each pinned here:
+//
+//   · a DECLARED callee adjudicates its own body's constraints — `addT(c, c)` at the bottom
+//     still rejects, which is the true positive the scoping must not cost;
+//   · a callee with NO declaration is a closure PARAMETER called inside a generic body
+//     (`f(self[i], i)` in a HOF). It can only bind the enclosing body's own type parameters,
+//     so only that body's constraints are its business. This one is not cosmetic:
+//     `validateBinCstrs` RE-RECORDS a partially-substituted constraint under the hole it
+//     landed on, and with the whole list in scope that inner call re-recorded a SIBLING
+//     generic's `T == T` onto the HOF's own `T` — which is how `xs.mapIndexed(toI)` came to
+//     report `==` over an element type nothing in the program compares;
+//   · no callee at all — a function VALUE instantiated from its TYPE — consults everything,
+//     unchanged.
+//
+// The UFCS half is here too. `validateBinCstrs` lived on the direct-call path alone, so
+// `xs.myMap(toI)` and `myMap(xs, toI)` answered differently — the same asymmetry the
+// `u8[]`-meets-a-generic rule had, for the same reason: `self` arrives AHEAD of the argument
+// loop the rule sat in.
+type Circle = { r: i32 }
+type E = f64[]
+
+function addT<T>(a: T, b: T): T { return a + b }
+
+function idT<T>(a: T): T { return a }
+
+// A generic HOF that CALLS its callback — the re-deferral trigger.
+function myMap<T, U>(self: T[], f: (T, i32) => U): U[] {
+  const out: U[] = []
+  let i = 0
+  while i < self.length {
+    out.push(f(self[i], i))
+    i = i + 1
+  }
+  return out
+}
+
+// A comparing generic, so a `T == T` constraint exists to leak. Called at the bottom over an
+// EQUATABLE element, which is both what keeps it live for the lint and the reminder that the
+// constraint it records is a real one — it is only other callees' business that it is not.
+function myIndexOf<T>(self: T[], needle: T) {
+  let i = 0
+  while i < self.length {
+    if self[i] == needle { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+function mkT(_i: i32): E {
+  const o: f64[] = [1.5]
+  return o
+}
+function toI(_e: E, i: i32) { return i }
+
+// `idT` adds nothing — `addT`'s constraint is none of its business.
+function noLeakIntoIdT() {
+  const c: Circle = { r: 7 }
+  const d = idT(c)
+  return d.r
+}
+print(noLeakIntoIdT())
+
+// `myMap` compares nothing — `myIndexOf`'s constraint is none of its business, in BOTH
+// spellings of the one call.
+function noLeakIntoMapDirect() {
+  const xs: E[] = [mkT(1), mkT(2)]
+  return myMap(xs, toI).length
+}
+print(noLeakIntoMapDirect())
+
+function noLeakIntoMapUfcs() {
+  const xs: E[] = [mkT(1), mkT(2)]
+  return xs.myMap(toI).length
+}
+print(noLeakIntoMapUfcs())
+
+// THE TRUE POSITIVE, unchanged: `addT` adjudicated by a call to `addT`.
+function stillRejects() {
+  const ok = addT(1, 2)
+  if ok == 3 { return 1 }
+  return 0
+}
+print(stillRejects())
+
+// The comparing generic at an EQUATABLE pin — still admitted, still correct.
+function equatablePin() {
+  const xs: i32[] = [4, 5, 6]
+  return myIndexOf(xs, 5)
+}
+print(equatablePin())
