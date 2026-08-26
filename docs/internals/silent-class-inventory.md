@@ -3132,6 +3132,11 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
   * substituted type — `bare` 10, `list` 12, `listlist` 12, and `field` / `mapval` 0. A `Wrap`
     holding a `Circle[]` runs either way (the wrapper's own row answers the arena rung), and
     `mapval` is D34/D35 territory on both sides.
+  * a SIXTH substituted type — a NESTED GENERIC, where the accumulator's own value comes out of
+    another generic instance — was **measured as a spot cell rather than crossed into the grid**,
+    and it is recorded that way rather than counted: `reduce([1,2], addTo, mapIndexed([5,6], mk))`
+    is silent on master (`reduce$m1`) and RUNS here. It is pinned as `nestedGeneric` in the
+    graduated fixture. A spot cell is weaker evidence than a crossed axis and is labelled so.
   * parameter ORDER — the hand-written `reduce` at `A = Circle[]` was silent at callback-first
     and RAN at init-first on master, which is the litunion carve-out's column at a new rep.
     Both run now, and both are pinned running.
