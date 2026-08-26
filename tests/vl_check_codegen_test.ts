@@ -248,8 +248,11 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // note this paragraph replaces said D30 and D32 were the last two live rows and that there
 // might be no live member of the class left — which was true of the FILED rows and false of
 // the tree. The `std-api-reviewer` pass over D32's own retirement went looking for the cross
-// cell that retirement had no fixture for and found one, which is the third consecutive time
-// that review has produced the next row: `silent-class-inventory.md` **D33** — `std:array`'s
+// cell that retirement had no fixture for and found one. That is the third consecutive time
+// that review has produced the closing change's next piece of work — D26 from the ninth
+// retirement's review, D32's understatement from D26's, and a whole row from D32's — and only
+// the first and third of those are rows, which is the honest form of the pattern:
+// `silent-class-inventory.md` **D33** — `std:array`'s
 // `mapIndexed` whose callback returns a union MEMBER (`(T, i32) => Circle`), in a program that
 // also declares a standalone struct of that arm's exact layout.
 //
