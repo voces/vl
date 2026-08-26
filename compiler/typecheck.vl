@@ -13934,10 +13934,59 @@ export function nodeEqCmpKind(ix: i32): EqCmpKind {
 // invalid wasm). A lambda LITERAL in that position still works: the checker seeds the
 // expected return (`recordCbExpectedRet`) and the body ADOPTS it, widening at its return
 // seam, so the lambda reaches this comparison already at the wider type.
+//
+// THE STORAGE CLASS IS THE SAME RULE, and the numeric pair was only its first instance.
+// "No adapter thunk exists" is a statement about the wasm valtype of each slot, and
+// `i32` vs `i64` is one way two types land on different valtypes; `i32` vs `i32 | null`
+// (an unboxed scalar vs the `{tag, payload}` BOX a value union reps as) is another, and
+// `string` vs a literal union (a string ref vs one interned i32 atom id) a third. Every
+// one of them is what `elemStoreClassOf` already names for an ARRAY element and a MAP
+// key/value — the two other positions whose storage a container fixes — so a function
+// SLOT asks it through the same predicate rather than growing a private ladder.
+//
+// TWO `vl check`-clean defects closed by the one rung, and they look unrelated until the
+// slot is what they share:
+//   · a named `(i32) => i32` flowing into a `(i32) => (i32 | null)` parameter — accepted,
+//     and the call TRAPS with `indirect call type mismatch`, because the callee's
+//     `call_indirect` names the boxed-result `$fnsig` the value was never built at;
+//   · `v is (i32) => i32` over a `v: (i32) => (i32 | null)` — `checkIsExprNode` gates the
+//     narrow on `assignable(tested, receiver)`, so the covariant accept let the THEN
+//     branch bind `v` at the unboxed-result type while the value still reps boxed, and
+//     `print(v(3))` emitted a `call_indirect` whose `(ref $box)` result met `print`'s
+//     `i32` parameter — invalid wasm from a file `vl check` reports clean. A closure
+//     carries no runtime type tag, so that narrow could never have been true either.
+// `containerElemClassDiffers` DECLINES on an unclassified side (a hole, a type variable),
+// which is what keeps a generic slot and an un-inferred lambda param out of the rung.
 function fnSlotAssignable(src: i32, dst: i32) {
   if numWidens(src, dst) { return false }
   if objNumWidens(src, dst) { return false }
+  if containerElemClassDiffers(src, dst) { return false }
+  if fnSlotNulDiffers(src, dst) { return false }
   assignable(src, dst)
+}
+
+// The HALF of a function slot's valtype that `elemStoreClassOf` deliberately does not
+// carry: NULLABILITY. `(ref null $str)` and `(ref $str)` are two wasm valtypes, so a
+// `$fnsig` built at one is not the `$fnsig` a call site built at the other — but a
+// niche-nullable ELEMENT reps exactly as its base does inside the container it sits in,
+// which is why the shared classifier collapses the pair and must keep collapsing it for
+// arrays and maps. The slot asks the extra question here instead of changing what the
+// classifier means everywhere.
+//
+// Its own two measured cells, both `vl check`-clean traps before this rung: a named
+// `(i32) => string` into a `(i32) => (string | null)` parameter, and the closure-valued
+// twin `(i32) => F` into `(i32) => (F | null)`. Both reach `indirect call type mismatch`
+// at the first call — the boxed pair (`i32` vs `i32 | null`) is the ESC rung's, and these
+// two ride the SAME class on both sides, so nothing above them could see the difference.
+//
+// The DECLINE DISCIPLINE is `containerElemClassDiffers`'s, for its reason: a slot with a
+// hole or a type variable on either side is unclassified, and `tyBearsNull` answers a flat
+// `false` for one rather than "unknown" — asking it alone would reject a generic slot
+// meeting a nullable concrete one on nothing but the hole's silence.
+function fnSlotNulDiffers(src: i32, dst: i32) {
+  if elemStoreClassOf(src, 8) == ESC_UNKNOWN { return false }
+  if elemStoreClassOf(dst, 8) == ESC_UNKNOWN { return false }
+  tyBearsNull(src) != tyBearsNull(dst)
 }
 
 // A struct type with a numerically-WIDER field on the destination side (`{f: i32}` vs
