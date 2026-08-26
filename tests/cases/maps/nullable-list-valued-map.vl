@@ -1,0 +1,156 @@
+// @run
+// @log 2
+// @log N
+// @log N
+// @log 2
+// @log true
+// @log false
+// @log 2
+// @log 0
+// @log 0
+// @log 2
+// @log N
+// @log a
+// @log b
+// @log 1
+// @log N
+// @log 1.25
+// @log N
+// @log 7
+// @log N
+// @log 2
+// @log N
+// A map whose VALUE is a NULLABLE LIST (`{[K]: T[] | null}`) — the mv rep layer's
+// nullable-list niche, at every op the layer exposes.
+//
+// IT IS NOT A LAYOUT CHANGE, WHICH IS WHAT THE ROW IT CLOSES ASSUMED. A ref-valued map's
+// `vals` element slot is `(ref null <elem>)` for EVERY value kind — that is what lets a
+// MISS read as null — so a stored null needs no new slot shape, exactly as it needs none for
+// the `{[K]: S | null}` / `{[K]: {[K]: V} | null}` / `{[K]: (() => T) | null}` niches the
+// layer already lowers. What was missing was the classification: `nulRefMapValInnerOf`
+// excluded a list inner outright and the value fell to the atom counting, whose single-ref-
+// member arm answers the `-3` loud reject.
+//
+// The exclusion had a real reason and it was an ORDERING one, not a rep one: the struct
+// probe below it (`structIndexByValName`) ignores a trailing `[]`, so `{f: f64}[] | null`
+// matched the ELEMENT struct and minted a kind-1 slot whose vals element is
+// `(ref null $struct)` — the list store then pushed a `(ref $rlWrap)` into it, invalid wasm
+// (`maps/nullable-struct-list-valued-map.vl`, the fuzz case that filed it). Naming the list
+// arm ABOVE the struct probe answers kind 6, the same kind the non-nullable list value gets,
+// and the ordering hazard is gone rather than avoided.
+//
+// `.values()` IS THE OTHER HALF AND IT SHIPS IN THE SAME COMMIT. The loop var of a
+// `for v in m.values()` walk takes its rep from `forInElemKind`, and its kind-6 arm answered
+// the NON-null list kind: the element read would then recover a stored null non-null and TRAP.
+// That is the same two-site pairing the `(T[] | null)[]` loop var needs
+// (`arrays/nullable-list-elem-loopvar.vl`) — the loop-var kind and the element recover move
+// together or the fix is a severity regression.
+//
+// EVERY LEG BELOW IS INSIDE A FUNCTION, AND THAT IS A LIMIT OF THIS FILE, not a stylistic
+// choice — it was caught in review after the first version shipped as the whole story. The
+// same five lines at MODULE scope still reject: a global cell's kind resolves through
+// `letNulScalarListKind` -> `exprNulScalarListKind`, where a function-local one resolves
+// through `letCellKind` / `letInitCellKind`, and only the latter carries a `mapReadMvSlot`
+// arm. Pinned with its own non-nullable control in
+// `maps/error-module-scope-list-value-read-bind.vl`. Read that file before concluding from
+// this one that the niche is closed everywhere.
+//
+// WHAT STAYS LOUD, and it is NOT this axis: an INLINE `m[k] == null` over a LIST-valued map.
+// Its control is `maps/error-inline-null-compare-list-value.vl` — the same compare over a
+// NON-nullable `{[string]: f64[]}` is loud too, so what has no arm is the inline map-read
+// null test for LIST values, not the nullable niche. Binding the read first
+// (`const r = m[k]`) is the form used throughout here, and it lowers for both.
+
+type S = { v: i32 }
+
+// `{[string]: i32[] | null}` — the shared i32 backing. Store a list, store a null, and miss.
+function i32Vals() {
+  const m: {[string]: i32[] | null} = Map()
+  m["a"] = [1, 2]
+  m["b"] = null
+  const ra = m["a"]
+  if ra != null { print(ra.length) } else { print("N") }
+  const rb = m["b"]
+  if rb != null { print(rb.length) } else { print("N") }
+  const rz = m["zz"]
+  if rz != null { print(rz.length) } else { print("N") }
+  print(m.size)
+  print(m.has("b"))
+  print(m.has("zz"))
+}
+
+// `{[string]: string[] | null}` — the string-list wrapper, plus the fused `?? []` default.
+// `??` coalesces on the READ VALUE being null, so a STORED null takes the default exactly as
+// a missing key does (the 2026-07-23 semantics ruling).
+function strVals() {
+  const m: {[string]: string[] | null} = Map()
+  m["a"] = ["x", "y"]
+  m["b"] = null
+  print((m["a"] ?? []).length)
+  print((m["b"] ?? []).length)
+  print((m["zz"] ?? []).length)
+}
+
+// `{[string]: f64[] | null}` — `.values()`, the walk whose loop var is the niche.
+function f64Vals() {
+  const m: {[string]: f64[] | null} = Map()
+  m["a"] = [1.5, 2.5]
+  m["b"] = null
+  for v in m.values() {
+    if v != null { print(v.length) } else { print("N") }
+  }
+  for k in m.keys() { print(k) }
+}
+
+// `{[string]: i64[] | null}` — delete, which walks the same vals list.
+function i64Vals() {
+  const m: {[string]: i64[] | null} = Map()
+  m["a"] = [10, 20]
+  m["b"] = null
+  m.delete("a")
+  print(m.size)
+  const rb = m["b"]
+  if rb != null { print(rb.length) } else { print("N") }
+}
+
+// `{[string]: f32[] | null}` — the fourth distinct backing.
+function f32Vals() {
+  const m: {[string]: f32[] | null} = Map()
+  m["a"] = [1.25, 2.25]
+  m["b"] = null
+  for v in m.values() {
+    if v != null { print(v[0]) } else { print("N") }
+  }
+}
+
+// `{[string]: S[] | null}` — a REF-element list value: the vals element is the ref-list
+// wrapper, and the read's element resolves recursively to the inner struct.
+function refVals() {
+  const m: {[string]: S[] | null} = Map()
+  m["a"] = [{ v: 7 }]
+  m["b"] = null
+  const ra = m["a"]
+  if ra != null { print(ra[0].v) } else { print("N") }
+  const rb = m["b"]
+  if rb != null { print(rb[0].v) } else { print("N") }
+}
+
+// The I32-KEYED half of the slot identity: `{[string]: V}` and `{[i32]: V}` are two layouts,
+// and the niche has to be minted on both.
+function i32KeyedVals() {
+  const m: {[i32]: f64[] | null} = Map()
+  m[7] = [1.5, 2.5]
+  m[8] = null
+  const r7 = m[7]
+  if r7 != null { print(r7.length) } else { print("N") }
+  const r8 = m[8]
+  if r8 != null { print(r8.length) } else { print("N") }
+}
+
+i32Vals()
+strVals()
+f64Vals()
+i64Vals()
+f32Vals()
+refVals()
+i32KeyedVals()

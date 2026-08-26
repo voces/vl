@@ -6326,8 +6326,13 @@ function emitMapProbe(body: i32[], keepHash: boolean) {
 //   · a struct that is a MEMBER of a declared union — it lives in the variant table, and
 //     the mv slot's `mvValStructIdx` column has no variant half
 //     (`tests/cases/maps/error-map-value-struct-in-union.vl`);
-//   · a NULLABLE list value, and a nullable closure with a literal-union result — no
-//     niche rep is minted (`tests/cases/maps/error-nullable-list-value.vl`);
+//   · a nullable closure with a literal-union result — the read stays nullable, so the
+//     call needs a narrowed spelling the checker does not accept at this value shape;
+//   · a NULLABLE LIST whose element rep the layer does not name — `u8[] | null` is the
+//     live instance (`scalarListKindOfName` covers i32/string/f64/i64/f32 leaves and
+//     `nameIsRefArray` the ref elements; the packed byte list is neither). The rest of
+//     the nullable-list family DOES lower — it rides its non-null twin's `(ref null
+//     <elem>)` vals slot (`tests/cases/maps/nullable-list-valued-map.vl`);
 //   · a value NAME that resolves to none of the above (an un-monomorphized generic
 //     application).
 //
@@ -6337,7 +6342,7 @@ function emitMapProbe(body: i32[], keepHash: boolean) {
 // language limit, and the message must not claim the value type is at fault.
 function failMapValueType() {
   emitFail(
-    "emitProgram: unsupported map value type (no rep for a union-member struct, a nullable list, or a nullable litunion-result closure; any other value type here interned no mv slot)",
+    "emitProgram: unsupported map value type (no rep for a union-member struct, a nullable list over an unnamed element rep, or a nullable litunion-result closure; any other value type here interned no mv slot)",
   )
 }
 
@@ -16928,15 +16933,20 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     ek == "f64list" ||
     ek == "i64list" ||
     ek == "f32list" ||
+    ek == "nulstrlist" ||
+    ek == "nulf64list" ||
+    ek == "nuli64list" ||
+    ek == "nulf32list" ||
     ek == "closure" ||
-    ek == "reflist"
+    ek == "reflist" ||
+    ek == "nulreflist"
   ) {
     // A struct ref list (`S[]`, ek 1), a UNION-box element list (`(C|S)[]`, ek 4), a
     // NULLABLE-struct element list (`(P|null)[]`, ek 9), a CLOSURE element list
-    // (`((i32)=>i32)[]`, ek 14), a NESTED-ARRAY scalar inner list (ek 2/7/12/20 — nullable
-    // for a `(i32[]|null)[]` niche), or a NESTED REF array whose loop var is the inner REF
-    // LIST (`S[][]`, ek 5): the wrapper/backing are THIS ref-list slot's. All recover each
-    // element non-null EXCEPT the two nullable NICHES (ek 9, and the nullable inner list). A
+    // (`((i32)=>i32)[]`, ek 14), a NESTED-ARRAY scalar inner list (ek 2/7/12/20/21 — nullable
+    // for a `(T[]|null)[]` niche, ek 15/22/23/24/25), or a NESTED REF array whose loop var is
+    // the inner REF LIST (`S[][]`, ek 5; ek 18 for a `(S[]|null)[]` niche): the wrapper/backing
+    // are THIS ref-list slot's. All recover each element non-null EXCEPT the nullable NICHES. A
     // STRUCT-VALUED map walk reads its mv slot's vals list instead.
     const fimv = forInMapValsSlot(s.fiIter, fnIx)
     if fimv >= 0 {
@@ -17089,10 +17099,14 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     // nested-ref-array inner REF LIST (ek 5) — all are a non-null ref recovered from the
     // `(ref null <elem>)` backing slot.
     //
-    // THE THREE NICHE ELEMENT KINDS ARE ABSENT ON PURPOSE: `nulstruct` (`(P | null)[]`),
-    // `nulstr` (`(string | null)[]`) and `nullist` (`(i32[] | null)[]`) bind a loop var that
-    // legitimately holds null, so recovering here would trap on exactly the element the body
-    // is about to test.
+    // EVERY NICHE ELEMENT KIND IS ABSENT ON PURPOSE: `nulstruct` (`(P | null)[]`), `nulstr`
+    // (`(string | null)[]`), `nullist` (`(i32[] | null)[]`), the four distinct-backing scalar
+    // niches (`nulstrlist` / `nulf64list` / `nuli64list` / `nulf32list`) and `nulreflist`
+    // (`(S[] | null)[]`) bind a loop var that legitimately holds null, so recovering here would
+    // trap on exactly the element the body is about to test. This set and `forInElemKind`'s
+    // niche arms are ONE decision: adding a niche arm there without removing the recover here
+    // turns the loud reject into check-clean invalid wasm, because the loop-var slot is
+    // `(ref null $w)` and the recovered value is `(ref $w)` — measured, not argued.
     wU8(212) // 0xd4 ref.as_non_null
   }
   fbLocalSet(vIdx)
