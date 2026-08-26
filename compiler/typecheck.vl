@@ -1134,17 +1134,65 @@ function tyReachesUnion(ty: i32, depth: i32): boolean {
 // so the binding is no longer uninferable. Mirrors the host's `constrainElementHole`.
 // A no-op unless the source is an array/map with an open hole and the destination
 // supplies the matching shape; recurses into element types so a nested empty pins too.
+//
+// THE CONTAINER POSITIONS (D17/D18) ARE THE OBJ/MAP-VALUE RECURSION, NOT A SECOND ROOT.
+// `{ xs: fq() }` against `{xs: string[]}` and `m["a"] = fq()` against `{[string]: f64[]}`
+// were check-clean invalid wasm for one reason: this walk stopped at the CONTAINER. An
+// array destination already recursed (`const xss: string[][] = [fq()]` has always lowered),
+// so the element-of-an-array position pinned while the field-of-a-struct and
+// value-of-a-map positions did not — a difference with no rule behind it. Once the hole is
+// pinned, the D16 emit-side seed (`emptyArrHoleKind`, read off the literal node) is what
+// makes it lower; nothing on the emit side changed for these.
+//
+// DEPTH-BOUNDED because the object arm closes a cycle the array/map arms could not: a
+// recursive struct (`type T = { xs: T[] }`) constrained against itself would recur forever
+// through the field. The bound is the same shape `tyReachesEmptyHole` uses one screen up.
 function constrainEmpty(srcTy: i32, dstTy: i32) {
-  if srcTy < 0 || dstTy < 0 { return 0 }
+  constrainEmptyD(srcTy, dstTy, 12)
+}
+
+// `constrainEmpty` AT A POSITION THAT HOLDS THE SOURCE EXPRESSION — the form every site
+// that pins and then asks `assignableExpr` must use.
+//
+// THE PIN ERASES ITS OWN TRIGGER. `assignableExpr` records an ObjLit/ArrayLit's
+// DESTINATION rep on the `nodeRepTyIx` sidecar only while the literal still REACHES an
+// open hole (`tyReachesEmptyHole` gates `recordRepTyAdopt` there — an unpinned literal is
+// plainly `assignable`, so it would short-circuit past the literal-aware adoption block).
+// Pinning first makes that gate FALSE, the rep is never recorded, and the literal falls
+// back to structural row resolution. With a SELF-REFERENTIAL map value that resolver has
+// no answer: `type Tree = { value: i32, children: {[string]: Tree} }` /
+// `const leaf: Tree = { value: 1, children: Map() }` became "emitProgram: map value type
+// has no interned slot" — `tests/cases/types/recursive-map-value.vl`, the one corpus file
+// the field-wise pin reddened. Recording on the SAME condition, BEFORE the pin, is what
+// keeps the two in step.
+//
+// Not "check first, then pin": that order would lose a SAME-STATEMENT conflict
+// (`const w: W = { xs: fq(), ys: fq() }` over `{xs: string[], ys: f64[]}` is loud today
+// because the first field's pin is what makes the second field's check fail).
+function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
+    recordRepTyAdopt(srcExpr, dstTy, 6)
+  }
+  constrainEmpty(srcTy, dstTy)
+}
+
+function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
+  if srcTy < 0 || dstTy < 0 || depth <= 0 { return 0 }
   const s = T.tys[srcTy]
   const d = T.tys[dstTy]
+  // A NULLABLE destination pins the same holes its inner shape does: a `string[] | null`
+  // field or map value accepts a non-null `[]`, and the hole behind it needs the element
+  // rep either way. Unwrapped on the source side too, so a nullable-typed producer flowing
+  // into a nullable slot lines its inner shapes up rather than stopping at the wrapper.
+  if d is TyNullable { return constrainEmptyD(srcTy, d.nInner, depth - 1) }
+  if s is TyNullable { return constrainEmptyD(s.nInner, dstTy, depth - 1) }
   if s is TyArray {
     if d is TyArray {
       if s.aElem < 0 {
         s.aElem = d.aElem
         tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
       } else {
-        constrainEmpty(s.aElem, d.aElem)
+        constrainEmptyD(s.aElem, d.aElem, depth - 1)
       }
     }
     return 0
@@ -1158,6 +1206,24 @@ function constrainEmpty(srcTy: i32, dstTy: i32) {
       if s.mVal < 0 {
         s.mVal = d.mVal
         tyMutEpoch = tyMutEpoch + 1 // in-place value pin
+      } else {
+        constrainEmptyD(s.mVal, d.mVal, depth - 1)
+      }
+    }
+    return 0
+  }
+  // A STRUCT/OBJECT destination pins field-wise, BY NAME. The source is an object literal's
+  // own inferred shape, so its field order is the literal's, not the declaration's — matching
+  // positionally would pin `{ b: fq(), a: [1] }` from the wrong field.
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < s.objFieldNames.length {
+        if i < s.objFieldTypes.length {
+          const dft = objFieldType(d, s.objFieldNames[i])
+          if dft >= 0 { constrainEmptyD(s.objFieldTypes[i], dft, depth - 1) }
+        }
+        i = i + 1
       }
     }
     return 0
@@ -16668,7 +16734,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, ix) }
         }
       }
-      constrainEmpty(at, expected)
+      constrainEmptyExpr(args[i], at, expected)
       if !assignableExpr(args[i], at, expected) {
         tErr(
           "argument " +
@@ -17018,13 +17084,19 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.aElem < 0 {
             rt.aElem = pat
             tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
-          } else if !assignableExpr(margs[0], pat, rt.aElem) {
-            // `assignableExpr` (not bare `assignable`) so a float-literal argument re-encodes into
-            // an `f32` element (`xs.push(2.5)` over `f32[]`), exactly as it does at a binding.
-            tErr(
-              "push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy),
-              ix,
-            )
+          } else {
+            // The pushed value's OWN open holes pin from the element slot — the
+            // `.set` / `m[k] = v` / `xs = e` rule for the third store spelling
+            // (`xss.push(fq())` over an `f64[][]`).
+            constrainEmptyExpr(margs[0], pat, rt.aElem)
+            if !assignableExpr(margs[0], pat, rt.aElem) {
+              // `assignableExpr` (not bare `assignable`) so a float-literal argument re-encodes into
+              // an `f32` element (`xs.push(2.5)` over `f32[]`), exactly as it does at a binding.
+              tErr(
+                "push: cannot add " + tyToStr(pat) + " to " + tyToStr(recvTy),
+                ix,
+              )
+            }
           }
         }
         return TY_I32
@@ -17187,15 +17259,22 @@ function checkCallNode(n: Call, ix: i32) {
           if rt.mVal < 0 {
             rt.mVal = v0
             tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
-          } else if !assignableExpr(margs2[1], v0, rt.mVal) {
-            // `assignableExpr` SUBSUMES the `nomSlotAccepts` retry this arm used to
-            // carry (that helper IS `assignableExpr` behind two gates), so the newtype
-            // literal-adoption rule the map slot needed — `m.set("k", 1)` over a
-            // `{[string]: EntityId}` — still fires, now as one rung instead of two.
-            tErr(
-              "set: expected " + tyToStr(rt.mVal) + ", got " + tyToStr(v0),
-              ix,
-            )
+          } else {
+            // The value argument's own open holes pin FROM the slot, the third step
+            // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
+            // `=` arm). `m.set("a", fq())` over a `{[string]: f64[]}` was the one
+            // write spelling still reaching the emitter with an unpinned `[]`.
+            constrainEmptyExpr(margs2[1], v0, rt.mVal)
+            if !assignableExpr(margs2[1], v0, rt.mVal) {
+              // `assignableExpr` SUBSUMES the `nomSlotAccepts` retry this arm used to
+              // carry (that helper IS `assignableExpr` behind two gates), so the newtype
+              // literal-adoption rule the map slot needed — `m.set("k", 1)` over a
+              // `{[string]: EntityId}` — still fires, now as one rung instead of two.
+              tErr(
+                "set: expected " + tyToStr(rt.mVal) + ", got " + tyToStr(v0),
+                ix,
+              )
+            }
           }
         }
         return TY_VOID
@@ -17858,7 +17937,7 @@ function checkCallNode(n: Call, ix: i32) {
       // Passing an empty-collection argument into a concrete `T[]` / map param pins
       // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
       // clearing its uninferred floor — pure downstream-usage inference, no push.
-      constrainEmpty(at, expected)
+      constrainEmptyExpr(args[i], at, expected)
       if !assignableExpr(args[i], at, expected) {
         tErr(
           "argument " +
@@ -18704,7 +18783,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           // (empty `[]`/`Map()`, `null`) disqualifies the function.
           if retInfluencedByAnnot(stmts[s]) { retNaturalErr = true }
           noteNaturalRet(stTy)
-          constrainEmpty(stTy, ret)
+          constrainEmptyExpr(stmts[s], stTy, ret)
           // SOUNDNESS — missing-return / non-exhaustive fall-through. When the
           // body's LAST statement is an else-less `is`-chain that does NOT cover
           // every variant of its discriminated union, a value falls off the end
@@ -27451,6 +27530,16 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
         asgBarred = writeBarredByLoop(n.binLeft)
       }
     }
+    // A PLAIN ASSIGNMENT PINS THE SOURCE'S OPEN HOLES, exactly as the annotated
+    // let-init, the call argument and the typed return already do. `xs = fq()` into a
+    // `let xs: string[]`, `w.xs = fq()` into a struct field and `m["a"] = fq()` into a
+    // `{[string]: f64[]}` cell were the three write spellings this walk never reached:
+    // check-clean, module written, engine refuses it (D18 and its two siblings). The
+    // destination is the place's own type, so this pins nothing an annotation did not
+    // already declare. Runs BEFORE `assignableExpr` so the pinned element is what the
+    // assignability question is asked about — an unpinned `[]` is assignable to anything,
+    // which is precisely how these reached the emitter.
+    constrainEmptyExpr(n.binRight, rt, asgLt)
     const asgOk = assignableExpr(n.binRight, rt, asgLt)
     if !asgOk {
       if asgBarred {
@@ -28003,7 +28092,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       // An annotated assignment of an empty-collection initializer pins the
       // SOURCE binding's open holes from the annotation (`const ys: i32[] = zs`
       // resolves `zs`'s element) — clearing its uninferred floor in place.
-      constrainEmpty(initTy, annot)
+      constrainEmptyExpr(n.letInit, initTy, annot)
       // A `never`-typed annotation (a degenerate/empty-intersection alias) was
       // ALREADY reported at its declaration; don't also cascade a "cannot assign
       // … of type <empty>" at every use site.
@@ -29972,7 +30061,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   noteNaturalRet(got)
   // An explicit `return inner` of an empty collection pins its element from the
   // declared return type — usage-driven inference clearing the floor.
-  constrainEmpty(got, want)
+  constrainEmptyExpr(n.retArg, got, want)
   if want >= 0 && !assignableExpr(n.retArg, got, want) {
     tErr(
       "return type mismatch: expected " + tyToStr(want) + ", got " + tyToStr(got),
