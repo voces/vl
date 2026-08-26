@@ -22157,46 +22157,6 @@ export function letIsStruct(letIx: i32, fnIx: i32) {
 // first, else the init's variant value (a variant param/local read). Checked AFTER the
 // struct/union local cases so only an explicit variant annotation / variant-valued init
 // reaches here.
-// True if the `LetDecl`'s init produces a PLAIN-STRUCT TWIN of a variant arm (a call /
-// literal built as the plain struct — its own interned heap, a layout TWIN of but DISTINCT
-// heap from the arm's variant struct), NOT a genuine kind-8 variant ref. Such a value is
-// RE-BOXED into the union (`emitStructExprAsVariantBox`, #1005) at whatever boundary later
-// consumes it, so the binding must NOT be a variant local `(ref $variant)`:
-//   - a UNION-annotated binding falls through to the union BOX (kind 4);
-//   - an UN-annotated binding (`const s = mk3(); return s`, mk3 returning the PLAIN struct)
-//     falls through to a plain STRUCT (kind 1) — the value IS a plain struct at this point;
-//     only its later flow into a union (return/arg/field) reboxes.
-// A genuine variant-REP init (a kind-8 variant local/param, a `: Cat`-returning call)
-// resolves `structIndexOfExpr < 0` and is left as a raw variant — untouched.
-function letInitReboxesToVariant(letIx: i32, fnIx: i32): boolean {
-  const d = P.nodes[letIx]
-  if d is LetDecl {
-    // When ANNOTATED, only a `{…} | scalar` UNION annotation qualifies (a plain-struct /
-    // variant-name annotation is authoritative and handled by `letIsVariant`'s annotation
-    // arm). An UN-annotated binding (`letType < 0`) is driven purely by the init's shape.
-    if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
-      if !(lt is TypeRef) { return false }
-      if !isUName(lt.tyName) { return false }
-      if nodeTyIsLitUnionAlias(d.letType) { return false }
-    }
-    // A genuine variant-REP init (a kind-8 variant local/param, a `: Cat`-returning call)
-    // resolves `structIndexOfExpr < 0` and stays raw + boxes at the boundary; only a PLAIN-
-    // STRUCT TWIN of an arm (a call / literal built as the plain struct — a DISTINCT heap)
-    // reboxes, so the binding must not be a variant `(ref $variant)` that would receive the
-    // box `(ref $uBox)` (annotated) or the raw plain struct (un-annotated — invalid wasm).
-    const vi = exprVariantIndex(d.letInit, fnIx)
-    if vi < 0 || vi >= uVarHeap.length { return false }
-    const ssi = structIndexOfExpr(d.letInit, fnIx)
-    // `structIndexOfExpr` returns a VARIANT index (not a struct-table index) for a genuine
-    // variant-returning call — bound to the struct table so it is never misused as one (a
-    // variant-REP init stays raw; only a plain-struct twin reboxes).
-    if ssi < 0 || ssi >= sHeapIdx.length { return false }
-    return sHeapIdx[ssi] != uVarHeap[vi]
-  }
-  false
-}
-
 export function letIsVariant(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -22216,11 +22176,46 @@ export function letIsVariant(letIx: i32, fnIx: i32) {
         if variantIndexOf(lt.tyName) >= 0 { return true }
       }
     }
-    // A plain-struct-TWIN init (`const t: {w:i32}|i32 = mkS()`, mkS returning the PLAIN
-    // struct) matches a variant arm by SHAPE via `exprVariantIndex` but its value is RE-
-    // BOXED into the union — so it must bind the union BOX, not a variant. A genuine
-    // variant-REP init is untouched (see `letInitReboxesToVariant`).
-    if letInitReboxesToVariant(letIx, fnIx) { return false }
+    // THE INIT'S REP IS `exprVariantIndex`'S ANSWER, AND NOTHING SECOND-GUESSES IT.
+    // A `letInitReboxesToVariant` guard stood here (#1010): it re-asked the STRUCT table
+    // (`structIndexOfExpr`) and declined the variant binding when the two tables handed
+    // back different heap types, to catch a PLAIN-STRUCT TWIN of an arm (`const s = mk3()`,
+    // `mk3` returning the plain struct whose shape a union also carries — its value is
+    // `(ref $sHeapIdx)`, and a variant cell would be receiving a foreign heap).
+    //
+    // THE TWO TABLES SHARE ONE INTEGER NAMESPACE, so that comparison was mis-typed.
+    // `structIndexOfExpr` hands back a VARIANT index for a variant-returning call —
+    // `fRetStructIdx` is the polymorphic companion slot (`emit_state`'s header: "also a
+    // union-VARIANT return's variant index"), a `: Circle` annotation leaves `fRetKind` at
+    // `"i32"` (`retAnnKindChain`), and `fnRetStructIndexSid` reads the slot UN-gated. The
+    // guard's `ssi < sHeapIdx.length` test is a BOUNDS check, not a namespace check: it
+    // declined every variant index only while the struct table was EMPTY, which is exactly
+    // the shape of a program whose object types are ALL union arms (`collectS` skips a
+    // `TypeDecl` that `variantIndexOf` claims). Add one standalone struct — or one
+    // ANONYMOUS inline-shape row, which a monomorphized closure annotation spelling the
+    // union structurally mints (`internFuncTypeShapesTy` splits
+    // `({r:i32}|{s:i32},i32)=>{r:i32}|{s:i32}` and interns each arm) — and the variant
+    // index lands IN BOUNDS and is read as `sHeapIdx[<variant index>]`. That is
+    // silent-class-inventory D26: `const out = reduce(xs, bumpC, c)` beside a
+    // `reduce` instance at the UNION bound its result to the plain-struct row while the
+    // instance returned `(ref $uVarHeap[vi])` — `vl check` rc 0, invalid module. Where the
+    // row it landed on has no such field the same root is LOUD instead ("unknown struct
+    // field in field access"), which is the `umt` half of that grid.
+    //
+    // AND THE GUARD CANNOT BE RIGHT FOR ANY ARM `exprVariantIndex` ANSWERS FROM. Every one
+    // of them is REP-authoritative, not a shape match: `paramVariantIndex` /
+    // `declaredVariantIndex` / `capturedVariantIndex` / `globalVariantIndexSid` read the
+    // cell KIND, the `as` arm reads the cast the checker proved, the `Index` arm excludes a
+    // plain-struct element list by name, and the CALL arm is gated on `retVariantFlag` —
+    // "the same predicate the callee's own functype result is emitted from", added in #1816
+    // a month AFTER the guard. That gate is what made the plain-struct-twin call
+    // (`mk3(): {a:i32,f:i32}`) answer -1 here and stop reaching the guard at all.
+    // MEASURED: over all 2,254 `tests/cases/*.vl` AND the compiler's own module graph, the
+    // guard returned TRUE on ZERO programs — its only live effect was the D26 misread. A
+    // second probe, firing on every entry past `vi >= 0`, reached the comparison on 12
+    // corpus files and every one returned false: 8 on `ssi < 0`, 4 on the empty-table bound.
+    // A future non-authoritative arm added to `exprVariantIndex` would want a rep check
+    // HERE, on the init's own heap type, never a second table's index.
     return exprVariantIndex(d.letInit, fnIx) >= 0
   }
   false
@@ -22238,9 +22233,8 @@ export function variantIndexOfLet(letIx: i32, fnIx: i32) {
         if vi >= 0 { return vi }
       }
     }
-    // Mirrors `letIsVariant`: a plain-struct-twin init reboxes into the union box (kind 4),
-    // so it resolves NO concrete variant index.
-    if letInitReboxesToVariant(letIx, fnIx) { return -1 }
+    // Mirrors `letIsVariant` — including the retired `letInitReboxesToVariant` guard, whose
+    // reasoning is recorded there.
     return exprVariantIndex(d.letInit, fnIx)
   }
   -1
