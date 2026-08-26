@@ -2188,8 +2188,11 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
 * **MEASURED DEAD.** A probe firing only when the guard returns TRUE, over **all 2,254
   `tests/cases/*.vl`** and over the compiler's own module graph: **0 programs**. A second
   probe firing on every entry past `vi >= 0`: 12 corpus files, every one returning false —
-  9 on `ssi < 0` and 3 on the empty-table bound — and `sHeapIdx[ssi]` out of range in all
-  12. The guard's only live effect was this defect.
+  8 on `ssi < 0` and 4 on the empty-table bound (`types/variant-as-value.vl`,
+  `unions/call-struct-arm-into-union-global-cell.vl`,
+  `unions/declared-union-struct-arm-call-positions.vl`,
+  `unions/inline-union-struct-arm-call-positions.vl`) — and `sHeapIdx[ssi]` out of range in
+  all 12. The guard's only live effect was this defect.
 * **GRID, 240 cells** (accumulator pairing x consumption x std-`reduce`/hand-written generic
   x declaration order x 2-or-3 instances), master vs branch:
 
