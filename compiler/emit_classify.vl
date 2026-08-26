@@ -277,6 +277,7 @@ import {
   tyIsNulBareMap,
   tyIsNulBool,
   tyNameOf,
+  unionEqOperandOk,
   unionHasAtom,
   unionTakesAtomAsStr,
   unwrapParen,
@@ -350,6 +351,7 @@ import {
   fnParent,
   fnRefPushSlots,
   fnStmts,
+  fnUsesAtomStage,
   fnUsesCloEq,
   fnUsesF32Push,
   fnUsesF64Push,
@@ -5179,10 +5181,44 @@ export function stmtPushBits(stmtIx: i32, fnIx: i32) {
   if s is Call {
     const callee = P.nodes[s.callFn]
     if callee is Member {
-      if callee.memProp == "push" { return pushKindBitsOf(callee.memObj, fnIx) }
+      if callee.memProp == "push" {
+        let b = pushKindBitsOf(callee.memObj, fnIx)
+        if pushStagesAtomNarrow(stmtIx) { b = b | 256 }
+        return b
+      }
     }
   }
   0
+}
+
+// Bit 256: does this `.push` need the atom-NARROW staging slot (`atomStageSlot`)?
+//
+// DELIBERATELY AN OVER-APPROXIMATION, and its inputs are deliberately SCOPE-FREE. The emit
+// side stages exactly when the pushed value is a literal-union array's element and is
+// neither atom-repped nor a member literal nor a re-readable place; of those four tests only
+// the last two can be asked here (this walk carries no live scope stack and no narrowing
+// replay), so this claims the whole superset. The cost of claiming too much is ONE unused
+// local; the cost of claiming too little is a `local.set` against an index the locals vector
+// never declared, i.e. invalid wasm — so the asymmetry decides the direction.
+//
+// It rides `stmtPushBits`, which is the SAME walk that reserves the push QUAD. A `.push` this
+// walk fails to reach already emits against an unreserved quad, so the staging slot cannot go
+// missing on its own — the two are reserved or missed together.
+//
+// `gLitUnionUsed` keeps every module without a string literal union byte-identical, the
+// self-hosted compiler included.
+function pushStagesAtomNarrow(callIx: i32): boolean {
+  if gLitUnionUsed == 0 { return false }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 { return false }
+    const a = P.nodes[unwrapParen(c.callArgs[0])]
+    // A member STRING LITERAL lowers as its interned id with no tower at all.
+    if a is StrLit { return false }
+    // A re-readable PLACE takes the re-reading tower, which needs no slot.
+    return !unionEqOperandOk(c.callArgs[0])
+  }
+  false
 }
 
 // The receiver-kind bits of a `recv.pop()` at `callIx` whose receiver is a
@@ -5393,6 +5429,7 @@ export function applyPushPopBits(bits: i32) {
   if (bits & 16) != 0 { fnUsesI64Push = true }
   if (bits & 32) != 0 { fnUsesF32Push = true }
   if (bits & 128) != 0 { fnUsesU8Push = true }
+  if (bits & 256) != 0 { fnUsesAtomStage = true }
   0
 }
 
@@ -18992,8 +19029,8 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // for an array it should claim. THE COST WAS SILENT INVALID WASM, and only in the generic
     // rung: `function pick<T>(self: T[]): T { self[0] }` over `("a" | "b")[]` emitted an
     // instance whose result slot is a string ref (an INLINE literal-union return reps that
-    // way) over a body whose `array.get` yields the i32 atom — `vl check` rc 0, `vl build`
-    // reporting success, and the engine refusing the module at load. The widen that fixes it
+    // way) over a body whose `array.get` yields the i32 atom — `vl check` rc 0, the only
+    // command that missed it, and the engine refusing the module at load. The widen that fixes it
     // (`retStrWiden`) is gated on this predicate, so the missing claim is what withheld it.
     // The NAMED-alias spelling never showed it: `K` in result position reps as the atom, so
     // the two ends already agree and no widen is wanted.

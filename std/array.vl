@@ -26,14 +26,17 @@
 // that aliases the same list — and the only export that does it is the one whose name
 // is the bare imperative verb.
 //
-// HOW FAR THE GENERIC SURFACE REACHES — three answers, and only one of them is an
-// honest error. Every export here is `<T>` over a `T[]`, and each element type below
-// was RUN, not assumed. All of this is pre-existing monomorphizer behaviour rather
-// than anything std chose, but it decides what this module can be used for.
+// HOW FAR THE GENERIC SURFACE REACHES — three answers, and the two that are errors are not
+// the same KIND of error: the struct one and `reduce`'s accumulator are honest refusals that
+// write nothing, while a bare member LITERAL handed to `indexOf`/`lastIndexOf`/`includes`/
+// `count` writes an INVALID module a plain `vl check` calls clean. Every export here is
+// `<T>` over a `T[]`, and each element type below was RUN, not assumed. All of this is
+// pre-existing monomorphizer behaviour rather than anything std chose, but it decides what
+// this module can be used for.
 //
-//   ADMITTED: `i32`, `i64`, `f64`, `boolean`, `string`, and nested lists (`i32[][]`) —
-//   subject to the two `mapIndexed` carve-outs below, the first of which is keyed on the
-//   callback's RESULT type and so reaches every one of them.
+//   ADMITTED: `i32`, `i64`, `f64`, `boolean`, `string`, and nested lists (`i32[][]`). Two
+//   carve-outs qualify this list and NEITHER is keyed on the element type alone — one is
+//   `reduce`'s ACCUMULATOR, the other is a member LITERAL in the `needle` ARGUMENT.
 //
 //   A STRUCT ELEMENT is refused at EMIT with a clean error ("monomorphize:
 //   unsupported argument type for `self`"). Plain `vl check` reports the program
@@ -45,18 +48,24 @@
 //   works instead: sort an INDEX list and let the comparator read the keys out of
 //   parallel arrays it closes over.
 //
-//   A LITERAL-UNION ELEMENT is ADMITTED, with TWO carve-outs. NEITHER RETURNS A WRONG
-//   ANSWER, but only one is a clean refusal: CARVE-OUT 2 stops at emit and writes nothing
-//   even under `--no-validate`, while CARVE-OUT 1 writes an invalid `.wasm` that plain
-//   `vl check` calls clean and `--no-validate` will ship (measured: 2,394 bytes, exit 0). The closure-taking and `==`-comparing exports all
-//   handle a `("a" | "b")[]` and a NUMERIC `(1 | 2)[]`: `indexOf`, `lastIndexOf`,
-//   `includes`, `count`, `reduce`, `reverse`, `concat`, `sort` and `sorted`. The rep
-//   disagreement underneath is real and unchanged — a literal union's members are
-//   PRESERVED at element position (an interned i32 ATOM) and SOFTENED everywhere else (a
-//   string ref) — but it is reconciled at each boundary a generic instance crosses instead
-//   of being left to meet inside an invalid module.
+//   A LITERAL-UNION ELEMENT IS ADMITTED, and the two carve-outs this paragraph used to
+//   carry were both `mapIndexed` and both closed — but ONE ELEMENT-LEVEL HAZARD IS LEFT and
+//   it is the dishonest kind, so read the `needle` carve-out below before taking this
+//   paragraph as a clearance. The exports that take no bare `T` — `reverse`, `concat`,
+//   `mapIndexed`, `sorted`, and the mutating `sort` — all handle a `("a" | "b")[]` and a
+//   NUMERIC `(1 | 2)[]`; the four that take a `needle: T` do not, for a bare literal.
+//   `reduce` over a literal-union ELEMENT is fine too — its carve-out is the ACCUMULATOR,
+//   below. The rep disagreement underneath is real
+//   and unchanged — a literal union's members are PRESERVED at element position (an interned
+//   i32 ATOM) and SOFTENED everywhere else (a string ref) — and it is reconciled at the
+//   element READ, the element STORE and the RESULT list. TWO boundaries are not, and they
+//   are exactly the two carve-outs below: the ARGUMENT (dishonest — an invalid module) and
+//   the CALLBACK PIN a type parameter can be first bound at (honest — an emit refusal).
 //   `tests/cases/soundness/generic-litunion-element-bind-and-store.vl` carries the
-//   mechanism; `tests/cases/std/array-sorted.vl` pins the ordering.
+//   element-read and element-store mechanism;
+//   `tests/cases/std/array-mapindexed-litunion-result.vl` carries the RESULT-list one (the
+//   `T` x `U` grid, both `U` spellings, 3- and 5-member unions, a lambda callback and an
+//   empty receiver); `tests/cases/std/array-sorted.vl` pins the ordering.
 //
 //   ORDERING (`<` `>` `<=` `>=`) OVER A STRING LITERAL UNION COMPARES MEMBER TEXT, at
 //   every spelling of the operand — a named alias, the inline form, a `K | null` narrowed
@@ -76,24 +85,64 @@
 //   compares (0.15 s against 0.17 s over 20M) at the price of an O(n) allocation and a
 //   changed result type, so take it only if you wanted strings anyway.
 //
-//   CARVE-OUT 1 — `mapIndexed` WHEN `U` IS AN INLINE STRING LITERAL UNION, whatever `T`
-//   is. The `U[]` it builds holds interned atoms while the callback's result reps as a
-//   string ref, and the module does not validate ("type mismatch: expected (ref $type),
-//   found (ref $type)", `vl check` exits 0). THE RECEIVER'S ELEMENT TYPE IS IRRELEVANT:
-//   `i32[]`, `string[]` and `("a" | "b")[]` all fail alike, including `("a" | "b")[]` to a
-//   DIFFERENT union `"x" | "y"`. A NUMERIC `U` (`1 | 2`) is fine. That is a RESULT-LIST
-//   boundary rather than an element-read one, which is why it did not close with the rest.
-//   REMEDY, measured: declare the callback's result `string` and narrow at the use site.
-//   Pinned as `tests/cases/std/xfail-miscompile-mapindexed-litunion-result.vl`, whose
-//   header carries the full `T` x `U` grid.
+//   THE DISHONEST CARVE-OUT — A BARE MEMBER LITERAL AS THE `needle` ARGUMENT.
+//   `xs.indexOf("b")` over an atom-repped `("a" | "b")[]` writes an INVALID module: `vl check`
+//   exits 0 with no diagnostic at any severity and is the ONLY command that misses it — `vl
+//   build` and `vl check --codegen` both validate the written artifact and exit 1 (`vl build`
+//   leaves the invalid file on disk deliberately), and `--no-validate` restores the
+//   write-and-bless path that ships it. The engine
+//   refuses at load with (wasmtime) "type mismatch: expected i32, found (ref $type)" — V8
+//   words the same rejection differently, which is why no fixture pins the text. `--no-validate`
+//   will ship it. It is the ARGUMENT boundary of a monomorphized instance — the literal reps
+//   as a string ref at `RC_ROOT` while the substituted `needle: T` is the interned atom — and
+//   it reaches the four exports that take one: `indexOf`, `lastIndexOf`, `includes`, `count`.
+//   The BUILDING family is unaffected (none of them takes a bare `T`).
 //
-//   CARVE-OUT 2 — A STRING-LITERAL-UNION **ALIAS** IN A NON-ELEMENT TYPE PARAMETER
-//   (`mapIndexed`'s `U`, `reduce`'s accumulator `A`) is refused at EMIT:
-//   "literal-union string widening with no members". Honest — no invalid module and no
-//   wrong answer — but the message names neither the export nor the alias, so a reader who
-//   has just been told literal unions are ADMITTED will not connect it. The INLINE
-//   spelling of the same `U` is carve-out 1 above; the inline spelling of `A` runs
-//   correctly.
+//   THE ATOM REP IS WHAT TRIGGERS IT, so the hazard scope is the COMPILED PROGRAM and not
+//   your spelling: an inline `("a" | "b")[]` is fine until any same-layout alias is declared
+//   anywhere in the graph, at which point the identical program is an invalid module —
+//   `std:fs`'s exported `FileKind = "file" | "dir"` makes a `("file" | "dir")[]` fail by
+//   IMPORT ALONE. A NUMERIC union is unaffected. It is not a std bug: a hand-written
+//   `find<T>(self: T[], needle: T)` importing nothing reproduces it.
+//   REMEDY, measured with the alias declared: BIND THE NEEDLE FIRST —
+//   `const needle: K = "b"` then `xs.indexOf(needle)` runs. Pinned as
+//   `tests/cases/std/xfail-miscompile-array-litunion-needle.vl`.
+//
+//   THE HONEST CARVE-OUT — `reduce` WHOSE ACCUMULATOR `A` IS A STRING LITERAL UNION is
+//   refused at EMIT: "literal-union string widening with no members". No invalid module and
+//   no wrong answer, and it writes nothing even under `--no-validate` — but the message
+//   names neither the export nor the type, so a reader who has just been told literal
+//   unions are ADMITTED will not connect it.
+//
+//   IT IS NOT A `reduce` BUG AND IT IS NOT ABOUT THE ALIAS, both of which this paragraph
+//   claimed before the axis was probed. A hand-written generic importing nothing reproduces
+//   it, and the deciding property is where `A` is FIRST BOUND: at `f: (A, T) => A`, a
+//   CALLBACK parameter, whose pin renders the type parameter's SOFTENED spelling — so a type
+//   parameter that must WIDEN back to member text has no member list to widen with. Swap the
+//   signature to `fold(self, init, f)` and the IDENTICAL body runs — measured, on the same
+//   program. `reduce(self, f, init)` cannot take that remedy: the argument order is the
+//   conventional one and is not worth breaking for a compiler defect.
+//
+//   THAT PROPERTY PREDICTS *THAT* SOMETHING BREAKS, NOT *WHICH WAY*, and neither half of it
+//   is a rule you can carry to another signature. `mapIndexed`'s `U` is first bound at a
+//   callback parameter TOO and is fine, because its direction is a NARROW into an
+//   atom-backed list rather than a widen. And the family is not uniformly honest: a
+//   hand-written `once<A>(f: (A) => A, init: A)` over an alias `K` writes an INVALID module
+//   instead of refusing — check-clean, `type mismatch: expected i32, found (ref $type)` at
+//   load — so "no invalid module" above is a statement about `reduce`, measured, and not
+//   about the defect underneath it.
+//
+//   THE INLINE SPELLING IS NOT A REMEDY, and this is the SECOND time this module has said it
+//   was. `reduce` with an inline `"a" | "b"` accumulator runs ONLY while no
+//   same-layout alias is declared anywhere in the compiled program — add an UNUSED
+//   `type Unrelated = "a" | "b"` and the same program is the same emit refusal. Measured.
+//   That is the "hazard scope is the compiled program, not the module" rule again, and std's
+//   own `std:fs` (`export type FileKind = "file" | "dir"`) is enough to trip a `"file" |
+//   "dir"` accumulator by import alone.
+//
+//   THE REMEDY THAT HOLDS, measured in a module that DOES declare the alias: give the
+//   accumulator the type `string` and narrow at the use site (`if r is K { … }`).
+//   Pinned as `tests/cases/std/error-array-litunion-alias-tyaram.vl`.
 //
 // This paragraph first claimed literal unions worked, on the strength of a probe that
 // used `reverse` — the one shape-blind export in the module. It was then rewritten to
@@ -104,14 +153,33 @@
 // defect is keyed on the CALLBACK'S RESULT. A std review then found two more: the
 // ordering hazard's scope was the whole COMPILED PROGRAM and not the module (std's own
 // `std:fs` defeated the "declare no alias" advice), and the ordering carve-out was scoped
-// to "named alias" when a NUMERIC alias orders correctly. FIVE over-promises, and THREE
-// of them were about the ordering carve-out — which is why a reader will not find their
-// subject above: it was DELETED, not softened, when the compiler stopped comparing
-// interned ids. What the five bought: a generic surface has to be probed ARM BY ARM, the
-// probe has to vary the dimension the claim is about, a remedy is not a remedy until it
-// has been RUN in the situation that needs it, and the whole section has to be re-probed
-// when the family under it moves — including when it moves TOWARD correctness, because a
-// stale carve-out sends callers to a workaround they no longer need.
+// to "named alias" when a NUMERIC alias orders correctly. Then a SIXTH, when the
+// `mapIndexed` carve-outs closed: the survivor was scoped to "a string-literal-union ALIAS
+// in a non-element type parameter" and BOTH halves of that are wrong — the alias is not the
+// axis (the inline spelling fails too, the moment any same-layout alias exists in the
+// program), and "non-element" described where that one example's parameter happened to sit
+// rather than anything measured.
+//
+// AND A SEVENTH, caught by the std review of the very commit that deleted the two
+// `mapIndexed` rows: closing them was written up as "a literal-union ELEMENT is admitted
+// with NO carve-out at all", and `xs.indexOf("b")` over a `K[]` is four lines, imports only
+// std, and writes an invalid module. It is the worst-shaped over-promise this section has
+// made — the strongest claim, on the dishonest failure kind, in the paragraph a caller
+// reads first — and the rule that would have caught it was already written two paragraphs
+// below, in the ordering carve-out's own "the hazard scope is the compiled PROGRAM".
+//
+// SEVEN over-promises. THREE were about the ordering carve-out — which is why a reader will
+// not find their subject above: it was DELETED, not softened, when the compiler stopped
+// comparing interned ids. ONE was `mapIndexed` scoped by the RECEIVER, deleted the same way
+// when the monomorphizer stopped spelling one type parameter two ways inside one instance;
+// one was the `reverse` probe; one was the survivor's scoping, which is still here and so
+// was mis-stated rather than made moot; and the seventh is the one above. What the seven
+// bought: a generic surface has to be probed ARM BY ARM, the probe has to vary the dimension
+// the claim is about, a remedy is not a remedy until it has been RUN in the situation that
+// needs it — in a module shaped like the one that needs it — and the whole section has to be
+// re-probed when the family under it moves, including when it moves TOWARD correctness,
+// because a stale carve-out sends callers to a workaround they no longer need AND a deleted
+// one tempts the next writer to clear the whole paragraph instead of re-probing it.
 //
 // `u8[]` is separately outside the surface, and that one is a CHECKER error rather
 // than an emit-time surprise: `u8` is a storage type, so it cannot be a generic
@@ -165,6 +233,11 @@ export function count<T>(self: T[], needle: T): i32 {
 // differ from the element type `T` (summing an `i32[]` to an `i32`, joining a
 // `string[]` to a `string`, summing an `f64[]` to an `f64`). The generic closure
 // parameter `f: (A, T) => A` is monomorphized per call shape.
+// A STRING literal-union accumulator is this module's one HONEST carve-out: refused at EMIT
+// ("literal-union string widening with no members") whatever the element type, and the
+// inline spelling is not a way round it. Type the accumulator `string` and narrow at the use
+// site — see the module header; pinned as
+// `tests/cases/std/error-array-litunion-alias-tyaram.vl`.
 export function reduce<T, A>(self: T[], f: (A, T) => A, init: A): A {
   let acc = init
   let i = 0
@@ -210,8 +283,10 @@ export function concat<T>(self: T[], other: T[]): T[] {
 // `map` with the element INDEX: `f(element, i)` for each element, collected in
 // order into a new list. The result element type `U` may differ from `T`. The
 // emitter's bare `.map` passes only the element; this is the indexed companion.
-// A `U` that is a STRING literal union does not lower — see CARVE-OUT 1 (inline) and
-// CARVE-OUT 2 (alias) in the module header.
+// A `U` that is a STRING literal union lowers correctly in BOTH spellings, inline and a
+// declared alias, as of the RESULT-list boundary fix — it did not until then, so a caller
+// carrying the old "declare the callback's result `string`" workaround can drop it. The grid
+// is `tests/cases/std/array-mapindexed-litunion-result.vl`.
 export function mapIndexed<T, U>(self: T[], f: (T, i32) => U): U[] {
   const out: U[] = []
   let i = 0

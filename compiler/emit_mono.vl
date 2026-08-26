@@ -2252,15 +2252,53 @@ function monoMakeInstance(
       pj = pj + 1
     }
     // THE BODY'S binding column, built from `pinnedTyIx` — the column the clone loop above
-    // just resolved — rather than from the raw `pinTys` the return site takes. The two differ
-    // in coverage, not in meaning: `pinTys` is the ARGUMENT type and is -1 wherever no
-    // argument node exists, while `pinnedTyIx` is "the pin, resolved once, never re-resolved
-    // from its spelling" and so also covers a position pinned from a NAME. Kept as a separate
-    // build rather than unifying the two: widening the return site's column changes what IT
-    // substitutes, which is a different population and wants its own measurement.
+    // just resolved — EXCEPT at a FUNCTION-TYPE parameter, where it takes the argument's own
+    // arena row (`pinTys`, exactly the column the RETURN annotation below substitutes
+    // through). Its header used to say the two "differ in coverage, not in meaning", and that
+    // was true of every parameter shape but this one.
+    //
+    // WHY THE FUNCTION-TYPE POSITION IS DIFFERENT. `pinnedTyIx` is the pin re-resolved from
+    // the pin's NAME (`recordClonedNodeTyFb`: the name wins wherever it resolves), and a pin
+    // name comes from `monoSubstAnn`, which substitutes each type parameter's BOUND NAME. A
+    // literal union's bound name is the SOFTENED `string` (`ctxKeepsLitUnion` is false at
+    // `RC_ROOT`), so `f: (T, i32) => U` over a `"a" | "b"`-returning callback pins
+    // `(i32, i32) => string` and binds `U := string`, while the argument's arena row is a
+    // `TyFunc` whose result is the litunion itself and binds `U := "a" | "b"`.
+    //
+    // ONE INSTANCE THEN SPELLED `U[]` TWO WAYS: the RETURN annotation recorded `("a"|"b")[]`
+    // (an i32 ATOM-backed list — `ctxKeepsLitUnion` holds at `RC_ELEM`) while the body's
+    // `const out: U[]` recorded `string[]` (a string-ref-backed list), so `std:array`'s
+    // `mapIndexed` returned a `(ref $strList)` from a function declared `(ref $i32List)`:
+    // `vl check` rc 0 — the only command that missed it — and the engine refusing it at
+    // load with `type mismatch: expected (ref $type), found (ref $type)`. The CALLER agrees
+    // with the return — it reads the result's elements as atoms and widens them — so the body
+    // is the side that was wrong.
+    //
+    // AND WHY NOT EVERYWHERE, which was measured rather than reasoned: taking `pinTys` at
+    // EVERY position reddens the whole litunion-ORDERING family (`sorted$m1` over a `K[]`
+    // becomes `type mismatch: expected (ref $type), found i32`, three corpus files). A VALUE
+    // parameter's pin name is the argument type's own NAME, and a name carries the nominal
+    // fact an arena row does not — `nameToTy("K")` answers the REGISTERED litunion alias,
+    // whose rep is the interned atom, where the argument's row is a structural copy that
+    // `tyLitUnionAliasIx` does not claim. `bindGenWalk` binds first-wins and `self` precedes
+    // the callback in every `std:array` signature, so the nominal answer still wins wherever
+    // a value parameter mentions the same parameter.
+    const letTyCol: i32[] = []
+    let lj = 0
+    while lj < params.length {
+      let lt = -1
+      if lj < pinnedTyIx.length { lt = pinnedTyIx[lj] }
+      if lj < pinned.length {
+        if annArrowAt(pinned[lj]) >= 1 || pinKinds[lj] == PIN_SIGKEY {
+          if lj < pinTys.length && pinTys[lj] >= 0 { lt = pinTys[lj] }
+        }
+      }
+      letTyCol.push(lt)
+      lj = lj + 1
+    }
     const letBN: string[] = []
     const letBT: i32[] = []
-    monoBindCols(params, pinnedTyIx, letBN, letBT)
+    monoBindCols(params, letTyCol, letBN, letBT)
     // Substitute a type-param-riding RETURN annotation through the binding —
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
     // (`{first:B,second:A}`); a concrete annotation passes through unchanged.

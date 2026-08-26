@@ -148,25 +148,35 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/lists/nullable-elem-list-coalesce.vl`, the `@run` fixture that replaced the
 // pin, and it reddened this file exactly as intended.
 //
-// This specimen is the OTHER `@no-instantiate` case — the one the set-equality tripwire below
-// scans `tests/cases/std` for: `std:array`'s `mapIndexed` when the callback's RESULT `U` is a
-// STRING literal union. `mapIndexed` builds a `U[]`, which over a literal union is an array of
-// interned i32 ATOMS, while the callback's declared result softens to a string ref at the
-// signature boundary — so the `.push` into the freshly built result list hands one heap type
-// to a slot declared as another. The receiver's element type is irrelevant (this is written
-// over an `i32[]`, which `std/array.vl`'s ADMITTED list says is fine); `U` alone is the
-// predicate, and only for the string family. Pinned as a corpus case by
-// `tests/cases/std/xfail-miscompile-mapindexed-litunion-result.vl`, whose header carries the
-// `T` x `U` grid.
-const INVALID_MODULE_SRC = `import { mapIndexed } from "std:array"\n` +
-  `\n` +
-  `function toAB(x: i32, i: i32): "a" | "b" {\n` +
-  `  if x + i > 0 { return "b" }\n` +
+// The specimen that replaced THAT was `std:array`'s `mapIndexed` with a STRING literal-union
+// callback result `U`, and it lasted one commit: it is fixed here. A monomorphized instance
+// was binding its body's annotated locals from the pin NAME and its RETURN annotation from
+// the ARGUMENT's arena row, and the two disagree at a function-type parameter — whose pin
+// renders the type parameter's SOFTENED spelling — so one instance spelled `U[]` as both an
+// atom-backed and a string-backed list. See
+// `tests/cases/std/array-mapindexed-litunion-result.vl`, the graduated grid.
+//
+// TWO SPECIMENS IN A ROW WERE SHAPES SOMEONE WAS ALREADY REPAIRING, which is how this
+// constant ends up naming a program that runs. So this one was chosen for NOT being anyone's
+// current work, and it is the sharpest remaining member of the class: CALLING a function
+// VALUE whose annotated type declares an INLINE string literal-union RESULT.
+// `ctxKeepsLitUnion` PRESERVES a literal union's members at `RC_FN_RES` and SOFTENS them at
+// `RC_ROOT`, so `const f: (i32) => ("a" | "b") = toAB` interns a signature whose result is
+// the i32 ATOM while the `toAB` it holds returns the string ref its own declaration softened
+// to. The STORE is fine; the `call_ref` RESULT is where the two meet. `compiler/typecheck.vl`
+// said that asymmetry was "not reachable as a miscompile"; this is the counter-example, and
+// that comment now says so.
+//
+// Pinned as a corpus case by
+// `tests/cases/soundness/xfail-miscompile-fntype-litunion-result-call.vl`, whose header
+// carries the eight-cell grid, with the five RUNNING cells pinned executably beside it in
+// `tests/cases/literal-unions/fntype-litunion-result-controls.vl`.
+const INVALID_MODULE_SRC = `function toAB(x: i32): "a" | "b" {\n` +
+  `  if x > 0 { return "b" }\n` +
   `  "a"\n` +
   `}\n` +
-  `\n` +
-  `const ns = [0, 1]\n` +
-  `print(ns.mapIndexed(toAB)[1])\n`;
+  `const f: (i32) => ("a" | "b") = toAB\n` +
+  `print(f(1))\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
@@ -273,13 +283,19 @@ Deno.test({
     // of it, leaving the last live case in `std/` — at which point a soundness-only scan
     // found ZERO marked files and tripped the "read nothing" guard below. The guard was
     // right and the scan was too narrow: a check-clean-invalid-wasm shape can be filed
-    // wherever its subject lives. Membership has moved twice since — that `std/` case
+    // wherever its subject lives. Membership has moved three times since — that `std/` case
     // graduated and both directories filled again (the `??` list-index coalesce under
-    // `soundness/`, `mapIndexed`'s literal-union RESULT list under `std/`), and then the
-    // coalesce one graduated too, leaving `std/` the sole home again. THE SCAN MUST STAY
-    // TWO-DIRECTORY REGARDLESS: it is what stops the membership moving out from under the
-    // gate, and a `soundness/`-only scan is exactly the narrowing that tripped the "read
-    // nothing" guard the last time this list emptied.
+    // `soundness/`, `mapIndexed`'s literal-union RESULT list under `std/`), then the coalesce
+    // one graduated, and now the `mapIndexed` one has too. `std/` was empty for the length of
+    // one review — the std reviewer of this very commit found a bare member LITERAL handed to
+    // `indexOf` over a litunion array, four lines importing only std, and it refilled the
+    // directory (`xfail-miscompile-array-litunion-needle.vl`). One member per directory again.
+    //
+    // THE SCAN MUST STAY TWO-DIRECTORY REGARDLESS. An empty directory costs one `vl check`
+    // invocation; a directory dropped because it happened to be empty is what stops the gate
+    // seeing the class move back into it, and a `soundness/`-only scan is exactly the
+    // narrowing that tripped the "read nothing" guard the last time this list emptied. The
+    // guard below is on the UNION, not on either directory.
     const dirs = [`${ROOT}/tests/cases/soundness`, `${ROOT}/tests/cases/std`];
     const marked = new Set<string>();
     for (const dir of dirs) {
