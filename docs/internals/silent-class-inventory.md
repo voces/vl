@@ -39,7 +39,8 @@ repro rather than a paraphrase:**
 | row | filed | today |
 |---|---|---|
 | D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
-| D6 D7 D9 D12 D13 D14 D15 D16 | various | as filed, still live |
+| D16 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
+| D6 D7 D9 D12 D13 D14 D15 | various | as filed, still live |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -777,8 +778,26 @@ Control: make the operand nullable (`function mk2(): i32 | null`) — correct.
 
 ---
 
-### D16 — an UN-ANNOTATED function returning an empty `[]`, passed on or returned, emits invalid wasm
-**check-clean INVALID WASM · 28 cells of a 384-cell grid · UNFIXED, filed by the D4/Shape-A slice**
+### D16 — [CLOSED 2026-08-25] an UN-ANNOTATED function returning an empty `[]`, passed on or returned, emits invalid wasm
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · 28 cells of a 384-cell grid · UNFIXED, filed by the D4/Shape-A slice**
+
+CLOSED by reading the hole's element rep off the type the CHECKER unified it with, recorded on
+the literal node itself (`emptyArrHoleKind` / `emptyArrHoleBuildKind`, `compiler/emit_classify.vl`).
+The "Why it is not fixed here" note below asked for "a contextual seed at the argument boundary or
+a reject scoped to a call-result hole" — neither was needed, because the context had already been
+propagated: `vl check` was clean precisely because the checker HAD unified the hole with the slot.
+The two emit-side readers of that unification disagreed. The RESULT VALTYPE was minted from it via
+`exprStringArray`'s typed fast path (which is why `string`/`f64`/`i64` producers declared the right
+wrapper) while the `return []` BUILD had no annotation node to seed from and fell to the default
+i32 list; for `f32`/`u8`/struct/closure/nested elements neither reader answered and the SIGNATURE
+was wrong too. Both now read the same node.
+
+Verified over a 203-cell grid (8 non-i32 element reps × {named, lambda, annotated} producers ×
+{call argument, typed return, typed local, typed global, two hops, push-after-arrival}, plus
+`[[]]`, an unconsumed hole, a `.length`-only hole and two two-slot programs): **98 SILENT before,
+0 after**. The two remaining non-running cells are the two-slot programs, and they are LOUD — one
+hole reaching `string[]` and `f64[]` in one program is `type error … argument 1: expected f64[],
+got string[]` at `vl check`, so the compiler never silently picks one.
 
 This entry was not in the original sweep's population. It was found by the grid that fixed D4
 and the empty-`[]` compiler trap, where it is the residual: 16 of its cells are red on master
@@ -813,6 +832,68 @@ Controls, both correct:
   a reject-parity change with its own evidence to gather. The annotated-lambda sibling of this
   shape ships as a loud floor instead (`tests/cases/arrays/
   lambda-empty-array-ref-element-rejected.vl`).
+
+---
+
+### D17 — an empty `[]` in a STRUCT-FIELD initializer is never pinned by the field's type
+**check-clean INVALID WASM · found while closing D16, filed unfixed · the root is the CHECKER, not the emitter**
+
+Repro:
+
+    type W = { xs: string[] }
+    function fq() { return [] }
+    const w: W = { xs: fq() }
+    print(w.xs.length)
+    // vl check rc 0, no diagnostic. Module written; the engine rejects it:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+THE DISCRIMINATOR FROM D16, and it is what makes this a different defect rather than a leg
+of that one. D16 was two emit-side readers disagreeing about a fact the CHECKER had already
+established — `vl check` was clean *because* the hole had been unified with the consuming
+slot, and the fix was to make both readers take it from the literal node. Here the checker
+establishes nothing: add a SECOND, conflicting consumer and it still says nothing.
+
+    type W = { xs: string[] }
+    function fq() { return [] }
+    const w: W = { xs: fq() }
+    function sinkF(ys: f64[]) { print(ys.length) }
+    sinkF(fq())
+    print(w.xs.length)
+    // vl check rc 0 — `fq()` is accepted into a `string[]` FIELD and an `f64[]` PARAM in one
+    // program. The argument position alone would be `argument 1: expected f64[], got string[]`.
+
+So the struct-field position does not propagate its element type back to an un-annotated
+producer at all. There is no fact on the literal node for the emitter to read, `fq`'s result
+valtype and its `struct.new` agree with each other at the i32 default, and the mismatch is at
+the `struct.set` into the field. **Fixing it belongs in `typecheck.vl`** — the field position
+has to join the positions that pin a hole — and only then does the D16 emit-side seed answer.
+
+* Control: `const w: W = { xs: [] }` — a DIRECT empty literal in the same field — lowers, because
+  the field annotation seeds the build (`seedFieldListBuild`). It is the call RESULT that is unpinned.
+* Pre-existing: the same program is check-clean invalid wasm on master before the D16 fix, and
+  after it, unchanged in both directions.
+
+---
+
+### D18 — an empty `[]` assigned into a MAP VALUE is never pinned by the map's value type
+**check-clean INVALID WASM · found while closing D16, filed unfixed · D17's twin, one container out**
+
+Repro:
+
+    function fq() { return [] }
+    const m: {[string]: f64[]} = Map()
+    m["a"] = fq()
+    print((m["a"] ?? [1.0]).length)
+    // vl check rc 0, no diagnostic. Module written; the engine rejects it:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+Same root as D17 and worth filing separately only because the container differs: the map-value
+position does not pin an un-annotated producer's hole either, so the emitter has nothing to
+read and the i32-list wrapper is stored into an `f64[]`-valued cell. If the checker learns to
+pin a hole from a container's declared element/value type, both rows close together and the
+D16 seed is what makes them lower.
+
+* Pre-existing: identical outcome on master before the D16 fix and after it.
 
 ---
 

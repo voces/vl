@@ -773,6 +773,11 @@ function retKindPri(k: VKind) {
   if k == "f64list" { return 8 }
   if k == "i64list" { return 9 }
   if k == "f32list" { return 10 }
+  // The PACKED byte list, which nothing ever inferred before the empty-`[]` hole arm
+  // (`criClassify`) could read one off the checker's type. It shares f32list's tier: the
+  // two are mutually exclusive facts about one return, so neither can need to outrank the
+  // other, and giving it a tier of its own would reorder a ladder that is historical.
+  if k == "u8list" { return 10 }
   if k == "map" { return 11 }
   if k == "nulstr" { return 12 }
   if k == "i64" { return 13 }
@@ -2792,6 +2797,50 @@ export function criClassify(rx0: i32, i: i32) {
   }
   if !retKindIsList(fRetKind[i]) && exprF32Array(rx, fnStmts[i]) {
     criSetRetKind(i, "f32list")
+  }
+  // A `u8[]` RETURN EXPRESSION — the PACKED byte list, the one list backing with NO inferred-
+  // return arm at all. `u8` is a STORAGE type and not a value kind (`array.get_u` widens at
+  // every value seam), so no `expr*Array` classifier speaks it: an un-annotated `return fq()`
+  // over a `u8[]`-returning callee declared an i32 SCALAR result over a body pushing the
+  // wrapper — `expected i32, found (ref $type)`, `vl check` rc 0, and it bit the ANNOTATED
+  // producer too, so it is not the hole's defect but the hop's. Every sibling backing already
+  // crosses this boundary; this arm makes `u8[]` uniform with them.
+  //
+  // NARROW BY CONSTRUCTION: only the `u8` answer is taken from `tyPrimLeafListKind`. The other
+  // five leaves are already decided by the arms above, from expression classifiers with their
+  // own coverage, and re-deciding them here from a second fact is exactly the drift this
+  // slice is removing.
+  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
+    if tyPrimLeafListKind(nodeTyIxOf(rx)) == "u8list" {
+      criSetRetKind(i, "u8list")
+    }
+  }
+  // THE EMPTY `[]` RETURN — the element HOLE, and the RESULT-VALTYPE half of D16. Every
+  // arm above classifies from the literal's own ELEMENTS or through a `tyKindOf` fast path
+  // that maps only `TyPrim` leaves, so a hole whose element is a struct / closure / nested
+  // list / `f32` / `u8` fell through to the i32-list DEFAULT while the caller's slot demanded
+  // the real rep — check-clean invalid wasm AT THE CALL, one constructor out from the same
+  // defect's body half. Read off the type the CHECKER unified the hole with
+  // (`emptyArrHoleKind`); `emitReturnValue`'s build seed reads the SAME node, so the declared
+  // result and the `struct.new` are one fact rather than two guesses.
+  //
+  // Under `retKindIsList`'s guard like its five siblings, plus `"u8list"` — that kind is
+  // outside `retKindIsList`'s historical set (nothing ever inferred one), and re-entering
+  // this arm on a later fixed-point round must not re-decide a `u8[]` hole the arm above
+  // already answered.
+  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
+    const hk = emptyArrHoleKind(rx)
+    if hk != null {
+      if criSetRetKind(i, hk) {
+        // The ref-list payload column the result valtype needs beside the kind — the same
+        // `fRetRArrElem` slot the `exprRefArray` arm above fills, from the same renderer.
+        if hk == "reflist" {
+          if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+            fRetRArrElem[i] = emptyArrHoleElemName(rx)
+          }
+        }
+      }
+    }
   }
   if fRetKind[i] != "map" {
     // `exprMap` classifies a returned map PARAM (reads `parType` directly) and a `Map()`/
@@ -15903,6 +15952,16 @@ export function arrLitElemName(arrIx: i32) {
       // A nested-list element keys the INNER list's name by its leaf — the table
       // key `arrLitElemKind` picks the matching kind for (6/7/8, else 4).
       if e0 is ArrayLit {
+        // AN INNER HOLE (`[[]]`) HAS NO ELEMENT for the three leaf probes below to read, so
+        // all three decline and the row keys `i32[]` whatever the outer list really holds —
+        // `[[]]` flowing into a `string[][]` slot was check-clean invalid wasm (D16's
+        // element-position leg). The checker recorded the OUTER array's element type on this
+        // node, and its nested-array arm renders exactly the inner list's emit name — the
+        // same key the annotated `string[][]` spelling interns. Gated on the hole, so a
+        // non-empty inner literal keeps classifying from its own elements.
+        if emptyArrLitIxOf(a.arrElems[0]) >= 0 {
+          if cen != "" { return cen }
+        }
         if arrLitIsStr(a.arrElems[0], -1) { return "string[]" }
         if arrLitIsF64(a.arrElems[0], -1) { return "f64[]" }
         if arrLitIsI64(a.arrElems[0], -1) { return "i64[]" }
@@ -25123,6 +25182,146 @@ export function exprListCellBuildSlot(exprIx: i32, fnIx: i32) {
     return refListSlotOfExpr(exprIx, fnIx)
   }
   0
+}
+
+// ── The empty-`[]` HOLE: an element rep no element can supply ────────────────
+// An empty array literal carries NO element, so every syntactic list classifier
+// (`arrLitIsRef` / `arrLitIsStr` / `arrLitIsF64` …) declines it, and both the BUILD
+// and the inferred RESULT VALTYPE fall to the i32-list default. That default is the
+// right answer only where the cell IS the i32 list — `i32[]`, `boolean[]`, a litunion
+// `K[]` — and it is why exactly those two element reps lowered while every other one
+// did not. The annotated positions escape it because an annotation NODE seeds the
+// build (`tyAnnRefListKind` / `letAnnRefListKind`); an un-annotated `return []` has no
+// such node, so nothing seeded it (D16: `vl check` rc 0, engine refuses the module).
+//
+// THE CHECKER ALREADY HOLDS THE ANSWER AND RECORDS IT ON THE LITERAL. It unifies the
+// hole with the consuming slot, so `nodeTyIxOf(<the [] node>)` is `string[]` / `S[]` /
+// `i32[][]` at the very node the emitter is lowering — the same fact `exprStringArray`'s
+// typed fast path already reads, which is the only reason the `string` / `f64` / `i64`
+// SIGNATURES were right while their bodies were not. Both halves of the fix read THIS
+// pair — `criClassify` for the result valtype, `emitReturnValue` for the `struct.new` —
+// so the two cannot drift the way they did.
+//
+// `null` / `-1` mean "the checker left the element unpinned" (`TyArray.aElem` is -1 for
+// a hole that never met a slot), which is the i32 default's own case and needs no seed.
+
+// The `ArrayLit` node index of an EMPTY `[]` expression (through parens), else -1.
+function emptyArrLitIxOf(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[exprIx]
+  if e is ArrayLit {
+    if e.arrElems.length == 0 { return exprIx }
+    return -1
+  }
+  if e is Paren { return emptyArrLitIxOf(e.parInner) }
+  -1
+}
+
+// The interned ref-list ROW an empty `[]`'s element resolves to, or -1. The element NAME
+// is the CHECKER's own rendering of the recorded element type (`nodeArrayElemName` —
+// struct shape, closure key, nested list, union composite, map spelling), which is
+// character-for-character the key the ANNOTATED `S[]` / `((i32) => i32)[]` / `i32[][]`
+// spelling interns its row under, so the hole and the annotation land on ONE row.
+function emptyArrHoleElemName(exprIx: i32) {
+  const ax = emptyArrLitIxOf(exprIx)
+  if ax < 0 { return "" }
+  nodeArrayElemName(ax)
+}
+
+function emptyArrHoleElemSlot(exprIx: i32) {
+  const en = emptyArrHoleElemName(exprIx)
+  if en == "" { return -1 }
+  rlSlotByName(en)
+}
+
+// The `VKind` an empty `[]`'s recorded ARRAY type reps as, or `null` when this is not an
+// element-pinned hole. ORDERED AS `tyAnnRefListKind`'s LADDER IS: the spellings that ride
+// an existing backing WITHOUT being a `TyPrim` element first (a litunion `K[]` and the two
+// nullable niches — `tyScalarBackedListKind` is that fold's one home), then the `TyPrim`
+// leaves, then the ref-list row. The `TyPrim` arm RETURNS on an unmapped leaf rather than
+// falling into the row lookup: `nodeArrayElemName` renders a prim element as its bare name,
+// and a bare scalar is not a ref-list key — matching one would be a coincidence, not an answer.
+function emptyArrHoleKind(exprIx: i32): VKind | null {
+  const ax = emptyArrLitIxOf(exprIx)
+  if ax < 0 { return null }
+  const ty = nodeTyIxOf(ax)
+  if ty < 0 { return null }
+  const sbk = tyScalarBackedListKind(ty)
+  if sbk != null { return sbk }
+  const lk = tyPrimLeafListKind(ty)
+  if lk != null { return lk }
+  if tyPrimLeafElem(ty) { return null }
+  if emptyArrHoleElemSlot(exprIx) >= 0 { return "reflist" }
+  null
+}
+
+// The list `VKind` an ARRAY type over a bare `TyPrim` LEAF reps as — `i32`/`boolean` share
+// the one i32-list backing, every other leaf has its own — or `null` for any other element
+// (or any non-array). The ARENA twin of the `nameIs*Array` ladder, written once for the
+// positions that hold a TYPE and no annotation node to run the name ladder over.
+function tyPrimLeafListKind(ty: i32): VKind | null {
+  if ty < 0 { return null }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 { return null }
+    const el = T.tys[t.aElem]
+    if el is TyPrim {
+      const n = el.primName
+      if n == "i32" || n == "boolean" { return "list" }
+      if n == "string" { return "strlist" }
+      if n == "f64" { return "f64list" }
+      if n == "i64" { return "i64list" }
+      if n == "f32" { return "f32list" }
+      if n == "u8" { return "u8list" }
+    }
+  }
+  null
+}
+
+// True if `ty` is an array over a bare `TyPrim` element — the guard that keeps a leaf
+// `tyPrimLeafListKind` does NOT map (a `TyPrim` the list layer has no backing for) out of
+// the ref-list row lookup below it. `nodeArrayElemName` renders a prim element as its bare
+// scalar name, and a bare scalar is not a ref-list key: matching one would be a coincidence.
+function tyPrimLeafElem(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const el = T.tys[t.aElem]
+    if el is TyPrim { return true }
+  }
+  false
+}
+
+// The `pendingListKind` build vocabulary a list `VKind` + its ref-list ROW demand — the
+// same 0/1/2/3/4/5/6/7/10 alphabet `tyAnnRefListKind` produces from an ANNOTATION node and
+// `seedFieldListBuild` from a FIELD code. `0` (the i32-list default) for every kind that is
+// not a distinct-backing list, which is also the correct seed for the i32-backed ones.
+function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
+  if kind == "strlist" { return 3 }
+  if kind == "f64list" { return 4 }
+  if kind == "i64list" { return 6 }
+  if kind == "f32list" { return 7 }
+  if kind == "u8list" { return 10 }
+  if kind == "reflist" {
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      if rlElemKindTbl[slot] == 2 { return 2 }
+      if rlElemKindTbl[slot] == 5 { return 5 }
+    }
+    return 1
+  }
+  nulScalarListBuildKind(kind)
+}
+
+// The `pendingListKind` / `pendingListSlot` pair an empty `[]` hole demands of `emitArr`.
+export function emptyArrHoleBuildKind(exprIx: i32) {
+  listBuildKindOfVKind(emptyArrHoleKind(exprIx), emptyArrHoleElemSlot(exprIx))
+}
+
+export function emptyArrHoleBuildSlot(exprIx: i32) {
+  const s = emptyArrHoleElemSlot(exprIx)
+  if s < 0 { return 0 }
+  s
 }
 
 // True if the `LetDecl` at `letIx` declares a ref-list local: its annotation is a ref
