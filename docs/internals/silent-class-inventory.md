@@ -3506,9 +3506,18 @@ Repro:
   an argument: **producer `anon` 37 of 37** (`named` 0, `call` 0) and **container `list` 37 of
   37** (`bare` 0, `listlist` 0, `mapval` 0, `field` 0). Both rows are the same coordinate on
   both of those axes, and nothing else moved on either. The twin axis SPREADS — none 9,
-  namediff 9, armtwin 9, exact 5, after 5 — which is the answer to the brief's obvious
-  discriminator: a twin is neither necessary (D38, and the nine `none` cells) nor sufficient
-  (the `namediff` nine moved from LOUD, not from silent).
+  namediff 9, armtwin 9, exact 5, after 5 — and **a twin is not necessary**: the nine `none`
+  movers declare no standalone struct at all. What the twin decides is only which FAILURE the
+  cell had beforehand. Per twin, by the outcome it moved FROM:
+
+  | twin | from `loud emit reject` | from `check-clean invalid wasm` |
+  |---|---|---|
+  | none / namediff / armtwin | 3 each | 6 each |
+  | exact / after | 0 | 5 each |
+
+  Where no standalone row shares the layout, three of the nine cells had no struct row to
+  resolve onto at all and were the LOUD `field access but no struct type declared`; where one
+  does, every mover was already silent, because the wrong row existed to be found.
 
 * **THE COMPLEMENT ALREADY EXISTED — the fourth consecutive rung of this family to close that
   way**, after D26's namespace check, D32's `exprVariantIndex` gate and D33's `variantRowOfTy`.

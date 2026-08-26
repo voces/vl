@@ -313,7 +313,8 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // heterogeneous control that must keep boxing. 37 of a 900-cell grid moved, 28 from
 // check-clean invalid wasm and 9 from a loud emit refusal, none backward; the moved cells are
 // `anon` 37 of 37 on the producer axis and `list` 37 of 37 on the container axis, which is
-// what says the two rows are one root rather than two. Graduated to
+// what says the two rows are one root rather than two — while the twin axis SPREADS (none 9,
+// namediff 9, armtwin 9, exact 5, after 5) and decides only which failure the cell had first. Graduated to
 // `tests/cases/unions/anon-objlit-list-elem-beside-arm.vl` and
 // `…/anon-objlit-list-elem-arm-no-twin.vl`, and
 // `xfail-miscompile-lambda-list-anon-elem-arm-twin.vl` is DELETED, which is that file's own
