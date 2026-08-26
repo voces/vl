@@ -19571,39 +19571,48 @@ function coalesceNulCollArmCtx(lhsIx: i32, wrapIx: i32, fnIx: i32): ExpCtx {
   return c
 }
 
-// The `br_on_non_null` lowering EVERY nullable-REF-niche `??` shares — the nullable STRUCT
-// (`S | null`) and the nullable COLLECTIONS (`i32[] | null`, `string[] | null`,
-// `i32[][] | null`, …). `heapIx` is the cell's own heap type and `defCtx` the context the
-// default arm emits under.
+// The `br_on_non_null` CORE every nullable-REF-niche `??` shares, with both contexts and the
+// block's null-ness spelled out by the caller. `heapIx` is the cell's own heap type,
+// `nulBlock` whether the result may still be null, `lhsCtx` the context the ONE lhs
+// evaluation runs under and `defCtx` the context the default arm emits under.
 //
-// ONE EVALUATION, NO STASH, AND IT SHORT-CIRCUITS. `br_on_non_null` consumes the one
-// nullable ref and either branches out of the block carrying `(ref $heapIx)` or falls through
-// to the default — so this shape needs NEITHER the re-eval the `boolean | null` / `K | null`
-// sentinel arms use (their niche is an i32, which has no `br_on_null`) NOR the per-rep stash
-// slot the `string | null` call arm reserves, and it covers every LHS source (ident, param,
-// field, index, CALL) with one arm. The default is reached only when the LHS was null.
+// ONE EVALUATION, NO STASH, NO RE-READ, AND IT SHORT-CIRCUITS. `br_on_non_null` consumes the
+// one nullable ref and either branches out of the block carrying `(ref $heapIx)` or falls
+// through to the default — so this shape needs NEITHER the re-eval the `boolean | null` /
+// `K | null` sentinel arms use (their niche is an i32, which has no `br_on_null`) NOR a
+// per-rep stash slot, and it covers every LHS source (ident, param, field, INDEX, call) with
+// one arm. The default is reached only when the LHS was null.
 //
-// THE RESULT TYPE IS THE DEFAULT'S NULL-NESS (`coalesceDefaultNullable`), not a constant: a
-// NON-null default collapses the read to `(ref $heapIx)`, a NULLABLE one leaves it nullable
-// and the block must say so, else the default arm's legitimately-null ref meets a non-null
-// block type. `br_on_non_null` works under either — it branches with `(ref $heapIx)`, a
-// subtype of both.
-function emitCoalesceNulRef(
+// THE NARROW IS THE BRANCH, which is why this shape has no "narrow the value arm" step to get
+// wrong. The re-read shape it replaced for `string | null` had one, and the LIST-INDEX lhs is
+// exactly where it was missing: `xs[i]`'s `array.get` off a `(array (mut (ref null $str)))`
+// backing yields the NULLABLE element under every context (the element legitimately holds
+// null, so no read arm may recover it), and the re-read handed that straight into a block
+// declared `(ref $str)` — `vl check` rc 0, module written, engine refuses. Here the value arm
+// IS the branch operand, so its non-null-ness is `br_on_non_null`'s own postcondition.
+//
+// THE LHS CONTEXT IS THE CALLER'S because the rep decides it: a `string | null` read RECOVERS
+// ITSELF unless `rawNullRead` says otherwise, and a recovered read would trap on the very null
+// this operator exists to answer for. The collection / struct families inherit the ambient
+// seeds (`emitCoalesceNulRef`), which is what they always did.
+function emitCoalesceNulRefCtx(
   body: i32[],
   e: BinExpr,
   heapIx: i32,
+  nulBlock: boolean,
+  lhsCtx: ExpCtx,
   defCtx: ExpCtx,
   fnIx: i32,
 ) {
   wU8(2) // 0x02 block
-  if coalesceDefaultNullable(e.binRight, fnIx) {
+  if nulBlock {
     wU8(99) // blocktype: (ref null $heapIx) — the result stays nullable
   } else {
     wU8(100) // blocktype: (ref $heapIx) — the non-null result
   }
   wSLEB(heapIx)
   ctrlEnter()
-  if emitExpr(body, e.binLeft, fnIx) < 0 {
+  if emitExprExpect(body, e.binLeft, fnIx, lhsCtx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
   wU8(214) // 0xd6 br_on_non_null
@@ -19612,6 +19621,31 @@ function emitCoalesceNulRef(
   wU8(11) // 0x0b end
   ctrlLeave()
   0
+}
+
+// The core above for the nullable STRUCT (`S | null`) and the nullable COLLECTIONS
+// (`i32[] | null`, `string[] | null`, `i32[][] | null`, …): the lhs takes the AMBIENT seeds
+// (these reps have no self-recovering read) and the block type is THE DEFAULT'S NULL-NESS
+// (`coalesceDefaultNullable`), not a constant — a NON-null default collapses the read to
+// `(ref $heapIx)`, a NULLABLE one leaves it nullable and the block must say so, else the
+// default arm's legitimately-null ref meets a non-null block type. `br_on_non_null` works
+// under either — it branches with `(ref $heapIx)`, a subtype of both.
+function emitCoalesceNulRef(
+  body: i32[],
+  e: BinExpr,
+  heapIx: i32,
+  defCtx: ExpCtx,
+  fnIx: i32,
+) {
+  emitCoalesceNulRefCtx(
+    body,
+    e,
+    heapIx,
+    coalesceDefaultNullable(e.binRight, fnIx),
+    expCtxHere(),
+    defCtx,
+    fnIx,
+  )
 }
 
 function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
@@ -19801,42 +19835,38 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       fnIx,
     )
   }
-  // `<e> ?? d` over a `string | null` NICHE (an ident binding OR a `string | null`
-  // struct FIELD, code 20): the nullable raw-array ref — a VALUE-typed `if` on
-  // `ref.is_null` (the else arm reads `e` as a non-null value). `pendingRawNullRead`
-  // keeps the test read raw. Generic in `e.binLeft`, so it covers a member field too.
+  // `<e> ?? d` over a `string | null` NICHE (an ident binding, a `string | null` struct FIELD
+  // (code 20), or a `(string | null)[]` ELEMENT read): the cell is a `(ref null $sTypeIdx)`,
+  // so it takes the SAME `br_on_non_null` core as the nullable struct / collections — ONE
+  // evaluation of the place, and the narrow is the branch.
+  //
+  // IT USED TO RE-READ, and that is the whole of D7. The old shape was `ref.is_null` + a
+  // value-typed `if` whose ELSE arm emitted `e.binLeft` a SECOND time under a recovering
+  // context; every rep whose read honours `rawNullRead` narrowed there, and the LIST INDEX —
+  // whose `array.get` off a `(array (mut (ref null $str)))` backing must stay nullable under
+  // EVERY context, because the element legitimately holds null — did not. It handed the raw
+  // `(ref null $str)` into a block declared `(ref $str)`: `vl check` rc 0, `.wasm` written,
+  // engine refuses with `type mismatch: expected (ref $type), found (ref null $type)`.
+  // Re-reading was also a SECOND EVALUATION of the index — `xs[f()] ?? d` emitted `call $f`
+  // twice — so eliminating the re-read closes both, where narrowing it would close one.
+  //
+  // THE LHS IS READ RAW (`rawNullRead`), which is what the old shape's NULL TEST already did:
+  // a `string | null` read recovers itself otherwise and traps on the very null `??` answers
+  // for. The DEFAULT arm follows the block type (`coalesceNulStrArmCtx`) — raw only when the
+  // result stays nullable, else a nullable default's `ref.null` meets a non-null block.
   if lhsReEval && exprNullableString(e.binLeft, fnIx) {
     const rawCtx = expCtxHere()
     rawCtx.rawNullRead = true
-    // the raw nullable ref
-    if emitExprExpect(body, e.binLeft, fnIx, rawCtx) < 0 { return -1 }
-    wU8(209) // 0xd1 ref.is_null → 1 if null
-    wU8(4)   // 0x04 if
     const coNul = coalesceNulStrStaysNullable(exprIx, fnIx)
-    if coNul {
-      wU8(99) // blocktype: (ref null $aTypeIdx) — the result stays nullable
-    } else {
-      wU8(100) // blocktype: (ref $sTypeIdx) — non-null string result
-    }
-    wSLEB(sTypeIdx)
-    ctrlEnter()
-    // EACH ARM READS UNDER THE BLOCK TYPE THIS LOWERING JUST DECLARED, EXPLICITLY
-    // (`coalesceNulStrArmCtx`). The arm reads otherwise run under whatever the CONSUMER
-    // seeded, so a raw consumer over a NON-null default left a `(ref null $array)` in a
-    // `(ref $array)` block — the declared result type and the arm bytes disagreeing, which is
-    // invalid wasm rather than a wrong answer. The DEFAULT arm follows the block (raw only
-    // when the result is nullable); the LHS arm is non-null on every path, since it is
-    // reached only when `ref.is_null` said no, and a `(ref $a)` fits a nullable block too.
-    if emitExprExpect(body, e.binRight, fnIx, coalesceNulStrArmCtx(coNul)) < 0 {
-      return -1 // d (a string, nullable only when the block is)
-    }
-    fbElse() // 0x05 else
-    if emitExprExpect(body, e.binLeft, fnIx, coalesceNulStrArmCtx(false)) < 0 {
-      return -1 // e recovered non-null
-    }
-    fbEnd() // 0x0b end
-    ctrlLeave()
-    return 0
+    return emitCoalesceNulRefCtx(
+      body,
+      e,
+      sTypeIdx,
+      coNul,
+      rawCtx,
+      coalesceNulStrArmCtx(coNul),
+      fnIx,
+    )
   }
   // `x ?? d` over a binding seeded by a BOOLEAN-list `.pop()`: the i32 cell holds 0/1 or the
   // niche sentinel 2 (`null`) — the same branching `if` the `boolean | null` arm above uses,

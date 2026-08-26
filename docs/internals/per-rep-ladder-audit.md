@@ -206,6 +206,17 @@ out of 198 and a reaching program in the same grid:
   supported on a map index get` for every litunion spelling (4 cells) and
   check-clean INVALID WASM for the `(string | null)[]` control (1 cell), which is
   the worse verdict and is pre-existing.
+  **[CLOSED 2026-08-25 for the `(string | null)[]` control — the invalid-wasm half.]**
+  The `string | null` `??` re-read its LHS in the else arm to narrow it, and the index
+  read is the one lhs of that rep whose read cannot narrow (the element legitimately
+  holds null). It now takes the `br_on_non_null` block the other nullable-ref niches
+  use — one evaluation, and the narrow is the branch, which also closed a second
+  evaluation of the index expression. Pin:
+  `tests/cases/lists/nullable-elem-list-coalesce.vl`. **The 4 LITUNION cells are
+  still the loud emit reject**, as are `(i32 | null)[]` / `(f64 | null)[]` / a
+  nullable-closure element at the same position — `emitCoalesce` has no INDEX arm for
+  the boxed value union, the i32 atom sentinel or the closure, only an ident arm and a
+  call arm. Loud, so none of them is in the silent population.
 * **`print(<numeric litunion | null>)`** — `type N = 1 | 2` ; `N | null` is a
   clean checker reject at 19 of its 33 shapes ("print of a union value (1 | 2?) is
   type-valid but not yet supported by codegen") and check-clean invalid wasm at 3

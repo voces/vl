@@ -1,0 +1,210 @@
+// @run
+// @log aa
+// @log DD
+// @log DD
+// @log aa
+// @log DD
+// @log 1
+// @log aa
+// @log 0
+// @log DD
+// @log 1
+// @log bb
+// @log dd
+// @log bb
+// @log DD
+// @log aa
+// @log aa
+// @log NUL
+// @log zz
+// @log aa
+// @log DD
+// @log aa
+// @log DD
+// @log aa
+// @log NUL
+// @log aa
+// @log DD
+// @log aa
+// @log DD
+// @log aa
+// @log DD
+// @log aa
+// @log DD
+// @log aa
+// @log bb
+// @hint redundant type annotation: `returnsStr` is inferred as `string`
+// `??` over a `(string | null)[]` ELEMENT READ — the `string | null` niche reached through a
+// LIST INDEX, which was the one sink of this rep that did not narrow.
+//
+// WHAT IT PINS. `xs[i] ?? d` used to lower to `ref.is_null` plus a value-typed `if` whose ELSE
+// arm RE-READ `xs[i]`. Every other lhs of this rep narrows on that re-read (the value arm clears
+// `rawNullRead`, and an ident / field read then recovers itself), but the INDEX read must stay
+// `(ref null $str)` under EVERY context — the backing is `(array (mut (ref null $str)))` and the
+// element legitimately holds null, so no read arm may recover it. The raw nullable ref therefore
+// met a block declared `(ref $str)`: `vl check` rc 0, `.wasm` written, engine refuses with
+// `type mismatch: expected (ref $type), found (ref null $type)`. The re-read was ALSO a second
+// evaluation of the index expression — `xs[f()] ?? d` emitted `call $f` twice — so the two
+// defects had one cause. Both close together because the lowering is now the `br_on_non_null`
+// block every other nullable-REF niche already used: the place is evaluated ONCE and the narrow
+// IS the branch. (Was `tests/cases/soundness/xfail-miscompile-nulstr-list-coalesce.vl`.)
+//
+// BOTH LIST POSITIONS on every shape — the present element takes the branch, the null element
+// the default — because a lowering can be wrong on either arm alone.
+
+// ── the element read at both positions ──
+function elemBoth(i: i32) {
+  const xs = ["aa", null]
+  print(xs[i] ?? "DD")
+}
+elemBoth(0) // aa
+elemBoth(1) // DD
+
+// A NAMED index, and an index that is an ARITHMETIC EXPRESSION.
+function elemVarIdx(i: i32) {
+  const xs = ["aa", null]
+  print(xs[i] ?? "DD")
+  print(xs[i - 1] ?? "DD")
+}
+elemVarIdx(1) // DD, aa
+
+// ── ONE EVALUATION of the index, which the re-read shape got wrong ──
+let ticks = 0
+
+function idx(n: i32) {
+  ticks = ticks + 1
+  n
+}
+
+function computedIdx() {
+  const xs = ["aa", null]
+  print(xs[idx(1)] ?? "DD")
+  print(ticks)
+}
+computedIdx() // DD, then 1 — not 2
+
+// ── SHORT-CIRCUIT: the default is reached only on the null path ──
+let sides = 0
+
+function loud() {
+  sides = sides + 1
+  "DD"
+}
+
+function shortCircuit() {
+  const xs = ["aa", null]
+  print(xs[0] ?? loud())
+  print(sides) // 0 — the present element never reaches the default
+  print(xs[1] ?? loud())
+  print(sides) // 1
+}
+shortCircuit()
+
+// ── CHAINED: `a ?? b ?? d` re-associates to `a ?? (b ?? d)`, so the inner `??` is the outer's
+// default arm and each block's `br_on_non_null` targets its own block. ──
+function chained(i: i32, j: i32) {
+  const xs = [null, "bb"]
+  print(xs[i] ?? xs[j] ?? "dd")
+}
+chained(0, 1) // bb — first null, second present
+chained(0, 0) // dd — both null
+chained(1, 0) // bb — first present
+
+// ── a NESTED list: `xs[0][1] ?? d` ──
+function nested() {
+  const xs = [["aa", null]]
+  print(xs[0][1] ?? "DD")
+  print(xs[0][0] ?? "DD")
+}
+nested() // DD, aa
+
+// ── the result type follows the DEFAULT: a NULLABLE default keeps the block nullable, so the
+// default arm's legitimately-null ref has somewhere to land. ──
+function nulDefault(i: i32, d: string | null) {
+  const xs = ["aa", null]
+  const v = xs[i] ?? d
+  if v != null { print(v) } else { print("NUL") }
+}
+nulDefault(0, null) // aa
+nulDefault(1, null) // NUL
+nulDefault(1, "zz") // zz
+
+// ── the CONSUMER positions: an argument, a non-null return, a nullable return ──
+function takesStr(s: string) { print(s) }
+
+function asArgument(i: i32) {
+  const xs = ["aa", null]
+  takesStr(xs[i] ?? "DD")
+}
+asArgument(0) // aa
+asArgument(1) // DD
+
+function returnsStr(i: i32): string {
+  const xs = ["aa", null]
+  return xs[i] ?? "DD"
+}
+print(returnsStr(0)) // aa
+print(returnsStr(1)) // DD
+
+function returnsNulStr(i: i32, d: string | null): string | null {
+  const xs = ["aa", null]
+  return xs[i] ?? d
+}
+const kept = returnsNulStr(0, null) // the present element, kept through a nullable return
+if kept != null {
+  print(kept) // aa — this arm
+} else {
+  print("NUL")
+}
+const gone = returnsNulStr(1, null) // the null element and a null default: still null
+if gone != null {
+  print(gone)
+} else {
+  print("NUL") // NUL — this arm
+}
+
+// ── THE CONTROLS, which must keep answering exactly as they always did ──
+//
+// Bind the element FIRST, then coalesce: the same rep through an IDENT lhs. It shares the
+// lowering with the index form now, so a regression in one is a regression in both.
+function bindFirst(i: i32) {
+  const xs = ["aa", null]
+  const a = xs[i]
+  print(a ?? "DD")
+}
+bindFirst(0) // aa
+bindFirst(1) // DD
+
+// A `string | null` struct FIELD (code 20) — the other re-readable place.
+type Holder = { s: string | null }
+
+function fieldLhs(h: Holder) { print(h.s ?? "DD") }
+fieldLhs({ s: "aa" }) // aa
+fieldLhs({ s: null }) // DD
+
+// A CALL lhs, which cannot be re-read at all and keeps its own stash-based arm.
+function mkStr(n: i32): string | null {
+  if n == 0 { return null }
+  return "aa"
+}
+
+function callLhs(n: i32) { print(mkStr(n) ?? "DD") }
+callLhs(1) // aa
+callLhs(0) // DD
+
+// `??` over a MAP index get — the fused get-with-default, a different lowering, unchanged.
+function mapGet() {
+  const m: {[string]: string} = Map()
+  m["k"] = "aa"
+  print(m["k"] ?? "DD")
+  print(m["q"] ?? "DD")
+}
+mapGet() // aa, DD
+
+// A NON-nullable element list is not this shape at all and must not acquire it.
+function plainElems() {
+  const ys = ["aa", "bb"]
+  print(ys[0])
+  print(ys[1])
+}
+plainElems() // aa, bb
