@@ -77,7 +77,7 @@ counts.
 | check-clean SILENTLY WRONG output, reached | 0 + 26 (C4) |
 | ... closed | 26 (C4) |
 | spurious LOUD reject of a valid program, reached | 7 ladders + 47 cells (C4) + 56 cells (C5) |
-| ... closed | 56 (C5) |
+| ... closed | 56 (C5) + **R2** (2026-08-25 — its own 174 sweep cells) |
 | DANGEROUS-UNPROVEN (no reaching program found) | 5 |
 
 No silently-wrong cell was found *by this sweep*, and the reason is a blind spot
@@ -336,7 +336,9 @@ both forms.
   store, `??` and the pin family together, and the measured surface is unknown —
   it wants its own grid (alias vs inline x 11 niches x position).
 
-### R2. DANGEROUS -> SAFE-LOUD in practice — `f32` is the rep with no typed-IR path at all
+### R2. [CLOSED 2026-08-25] was DANGEROUS -> SAFE-LOUD in practice — `f32` had no typed-IR path at all
+
+**CLOSED 2026-08-25** (silent-class inventory D14). Was:
 
 `tyIsF32Array` is `tyKindOf(tyIx) == 21` and `tyKindOf` deliberately carries no
 f32-array kind (a float LITERAL types f64), so `tyIsF32Array` is **identically
@@ -347,16 +349,44 @@ fast paths reading the checker's NARROWED type.
 
 * Reached by: `function mk(): f32[] | null { return [1.5] }` then
   `const w: f32[] | null = mk(); if w != null { print(w.length) }`.
-* Actual: LOUD — `emitProgram: field access but no struct type declared`. Also
+* Was: LOUD — `emitProgram: field access but no struct type declared`. Also
   loud on `xs[0] = e`, `.push`, `for-in`, `.slice`, `.filter`, `.map`: **7 of 9
   ops** in the grid above, against 0 for the other three nullable scalar lists.
-  Declaring a struct with a `length` field does not change the verdict (checked) —
-  it stays loud.
-* Not fixed: the honest fix is a NARROW typed-IR arm keyed on the pair (declared
-  kind `nulf32list`, recorded node type = the non-null `f32[]`), since only the
-  narrowed read records the non-null form. Making `exprF32Array` claim the
-  binding unconditionally would trade a loud reject for possible invalid wasm on
-  the UN-narrowed read, so it needs the un-narrowed control rows measured first.
+  Declaring a struct with a `length` field did not change the verdict (checked) —
+  it stayed loud.
+
+**HOW IT CLOSED, and where this row's own prescription was half right.** The row
+proposed "a NARROW typed-IR arm keyed on the pair (declared kind `nulf32list`,
+recorded node type = the non-null `f32[]`)". The pair turned out to be
+unnecessary: the recorded type ALONE is the discriminator, because an
+un-narrowed read keeps its `TyNullable` recorded type and is declined by the same
+test. So the fix is one structural arena predicate — `tyIsF32ArrayShape`, reading
+`TyArray` -> `TyPrim "f32"` out of the arena, which is the only working arena test
+for this rep and already existed as `callResTyIsF32Array` scoped to curried-call
+results — read at the END of `exprF32Array`'s Ident ladder and in its Member arm.
+The dead `tyIsF32Array` is deleted rather than left reading like a fast path.
+
+The row's caution was right about the DIRECTION of the risk and wrong about where
+it lands. It is not the un-narrowed read that breaks (that one still declines);
+it is putting the same test at the TOP of the function, where it pre-empts two
+arms that must answer first. Both were measured, and both are pinned fixtures:
+an `ArrayLit` in a union context records the union's `f32[]` arm while still
+BUILDING the f64 list (`unions/f32-list-union-member.vl`, `wasm trap: cast
+failure`), and an `Index` takes its rep from the container's interned row, whose
+inferred-empty nested-array synthesis declines an `f32[]` leaf on purpose
+(`arrays/nested-array-inferred-empty-unsupported-leaf.vl`, a pinned loud decline
+turning into check-clean invalid wasm).
+
+* Measured: the sweep's `list_f32` rep goes **76 -> 250 correct of 340**, exact
+  parity with `list_f64` (0 differing cells of 340 when the two are joined on
+  their coordinate). All 174 movers are `loud_emit_reject -> correct`; the rep's
+  silent total stays 0. On the FULL 9,126-cell grid exactly those 174 cells move
+  and nothing else does. Corpus byte-identity 2,229 / 2,230.
+* This row's OWN op grid, re-probed one program per op against the `f64` twin:
+  `.length`, `xs[0] = e`, `.push`, `for-in`, `.slice`, `.filter`, `.map` were all
+  LOUD and all now run; the bare index read `w[0]`, the one op that already
+  worked, still does. `f64` was clean on all of them before and after.
+* Pin: `tests/cases/arrays/nullable-f32-list-narrowed-positions.vl`.
 
 ### R3. SAFE-LOUD — `letInitCellKind` has no if-expression / niche arms
 
