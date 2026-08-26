@@ -2139,6 +2139,14 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
 
 **CLOSED 2026-08-26.** The filed program above runs and prints `8` / `4`.
 
+* **TWO CLAIMS IN THE FILING ARE OVERTURNED BY THE CLOSE, and the filed text is left standing
+  above so the correction is legible.** (i) *"the two tables never cross-dedup"* is true but
+  is NOT the mechanism — nothing here needed the two rows to merge; the defect is that ONE
+  index was read through BOTH tables. (ii) *"THE UNION HAS TO BE INSTANTIATED TOO"* is an
+  artifact of the witness. What is required is that `Circle` be a REGISTERED variant and that
+  the struct table be non-empty; the union instance was merely how this program achieved the
+  second. And *"not pinned in the corpus"* no longer holds — the LOUD spelling of the same
+  root is an `@run` fixture, which is what made it pinnable.
 * **IT IS NOT ABOUT `reduce`, NOT ABOUT THE MONOMORPHIZER, AND NOT ABOUT TWO INSTANCES.**
   The root is `letInitReboxesToVariant` (`compiler/emit_classify.vl`, #1010), the one
   predicate that can veto `letIsVariant`. It compared the two heap tables:
@@ -2192,7 +2200,10 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   `unions/call-struct-arm-into-union-global-cell.vl`,
   `unions/declared-union-struct-arm-call-positions.vl`,
   `unions/inline-union-struct-arm-call-positions.vl`) — and `sHeapIdx[ssi]` out of range in
-  all 12. The guard's only live effect was this defect.
+  all 12. The guard's only live effect was this defect. **AND FROM THE EMISSION SIDE**: of the
+  2,254 `tests/cases/**/*.vl`, 1,829 compile under both master's seed and this one, and all
+  1,829 are BYTE-IDENTICAL — 0 differ, 0 lost the ability to compile, and exactly 2 gained it
+  (the two fixtures this close adds). Not one byte moves anywhere the guard was consulted.
 * **GRID, 240 cells** (accumulator pairing x consumption x std-`reduce`/hand-written generic
   x declaration order x 2-or-3 instances), master vs branch:
 
