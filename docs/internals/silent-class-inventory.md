@@ -46,6 +46,7 @@ repro rather than a paraphrase:**
 | D17 D18 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below; one root, one change) |
 | D14 | loud emit reject | **runs — CLOSED 2026-08-25** (below) |
 | D9 D12 D13 D15 D19 | various | as filed, still live |
+| D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14, because it is what D14's residue turned out to be (360 cells, every list rep, not f32-specific) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -943,6 +944,9 @@ fixtures at their pinned verdicts and still moves all 174 cells.
 the other way and the rep's SILENT total stayed 0. Joined coordinate-for-coordinate against
 `list_f64` the two reps now differ on **0 of 340** cells — the residue (capture, loopvar,
 mapval, the two `*_place` check rejects) is shared with `f64` and is therefore not this row.
+**That residue is now filed as D20**, re-probed per (position, rep): it is a nullable-list
+niche with no rep at three positions, 360 cells across every list rep, and nothing in this
+fix touches it.
 Corpus byte-identity across the whole `tests/cases` tree: **2,229 of 2,230 identical**, the
 single mover being the new fixture, which the old compiler cannot emit at all.
 
@@ -1182,6 +1186,52 @@ Control — the SAME seven lines inside a function print `1` / `absent`:
 * Deliberately NOT pinned in the corpus: `maps/numlit-value-annotated-miss.vl` carries the
   control inside a function and names this row in a comment, because pinning a trap freezes
   it as contract.
+
+---
+
+### D20 — a NULLABLE LIST is a loud emit reject at `capture`, `loopvar` and `mapval` — for every list rep
+**loud emit reject · 360 cells over the nullable leg of the six list reps · filed 2026-08-25 while closing D14, because it is what D14's residue turned out to be**
+
+Repro:
+
+    function mk(): f64[] | null { return [1.5, 2.5] }
+    function body() {
+      const w: f64[] | null = mk()
+      const f = () => {
+        if w != null { print(w.length) } else { print("N") }
+      }
+      f()
+    }
+    body()
+    // vl check rc 0; vl run: emitProgram: bare null needs a struct-typed context
+
+Controls, both correct: the same capture with the list made NON-nullable (`f64[]`); the same
+capture over the SHARED-backing `i32[] | null`, which is clean at this position.
+
+**THIS IS NOT D14 AND IT IS NOT f32-SPECIFIC**, which is the whole reason it is filed
+separately. When D14 closed, `list_f32` reached exact parity with `list_f64` — 0 differing
+cells of 340 — and the cells that stayed loud stayed loud in BOTH. Re-probed one program per
+(position, rep) against the current compiler:
+
+| position | `i32[]` | `S[]` | `string[]` | `i64[]` | `f64[]` | `f32[]` | message |
+|---|---|---|---|---|---|---|---|
+| capture | runs | runs | LOUD | LOUD | LOUD | LOUD | `bare null needs a struct-typed context` |
+| loopvar | runs | LOUD | LOUD | LOUD | LOUD | LOUD | `bare null needs a struct-typed context` |
+| mapval | LOUD | LOUD | LOUD | LOUD | LOUD | LOUD | `unsupported map value type` |
+
+* **Flat on**: the list's ELEMENT type, except that the shared i32-list backing escapes at
+  `capture` and `loopvar` (and `S[]` escapes at `capture` only). `mapval` declines for every
+  rep including `i32[]`, and its message is an explicit capability decline — *"no rep for a
+  union-member struct, a nullable list, or a nullable litunion-result closure"*.
+* **Varies on**: nullability. The non-nullable list is clean at all three positions.
+* Grid counts, nullable leg only: capture **96**, loopvar **120**, mapval **144** loud-emit
+  cells. Message split across the three: 144 `unsupported map value type`, 144 `bare null
+  needs a struct-typed context`, 72 `` `is` test but no union type declared`` — three messages
+  for one axis, which is §3's message-identity warning again.
+* **Do not read the size of this row as difficulty.** It is bigger than D14 was and it is a
+  different shape: D14 was one classifier missing an arm its twin had, and this is a niche
+  with no rep at three specific positions. Nothing in D14's fix touches it — the D14 branch
+  moved 174 cells and not one of them was at these positions.
 
 ---
 
