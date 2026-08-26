@@ -2641,8 +2641,8 @@ Two more that run, isolating the axis: the call taken through a binding
 
 ---
 
-### D32 — a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table when a layout twin exists
-**check-clean invalid wasm · found by D26's 240-cell grid (16 cells, the `list` consumption) · filed 2026-08-26 while closing D26 · pre-existing, identical on master (`c99838a8` and `7fe81e5b`) and on D26's branch — same 16 cells, same message · a DIFFERENT rung from D26 and unmoved by its fix**
+### D32 — [CLOSED 2026-08-26] a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table when a layout twin exists
+**CLOSED 2026-08-26 — the repro now RUNS (prints `8` / `1` / `3`). Was: check-clean invalid wasm · found by D26's 240-cell grid (16 cells, the `list` consumption) · filed 2026-08-26 while closing D26 · pre-existing, identical on master (`c99838a8` and `7fe81e5b`) and on D26's branch — same 16 cells, same message · a DIFFERENT rung from D26 and unmoved by its fix**
 
 Repro:
 
@@ -2739,6 +2739,120 @@ and on master, same program shape, only the list spelling varying:
   programs — every one of them a both-decline today, i.e. exactly the -1 the variant route
   depends on"). This is the seam ROADMAP charters as repOf item (e), the variant/struct-table
   seam, whose LOUD half is already recorded there.
+
+#### THE CLOSE — one predicate, read in two directions
+
+`rlElemStructRow` now declines for an element name that is a registered union VARIANT and
+not a registered plain struct:
+
+    const ln = nonNulBaseOf(rlElemName[slot])
+    const bn = structIndexByName(ln)
+    if bn < 0 && variantIndexOf(ln) >= 0 { return -1 }   // <- added
+
+That is the EXACT COMPLEMENT of the READ side's gate, which had stated the rule from the
+consumer's end since the `{f: boolean}[]` fuzz finding: `exprVariantIndex`'s `Index` arm is
+`if structIndexByName(ren) < 0 { return variantIndexOf(ren) }`. One predicate, two
+directions — the array a `Cat[]` read unpacks through `uVarHeap` is now the array this side
+types. Both of `mAssignTypeIndices`' passes ask the one function, so the SIG pass and the
+HEAP pass moved in lock-step by construction; the six other `rlElemStructRow` consumers
+(element STORE, PUSH, `__array_new__`, `rlSlotsLayoutTwin`) all treat -1 as "no struct hint",
+which is already their default for every non-struct element kind.
+
+**THE ANSWERING RUNG WAS MEASURED, NOT INFERRED.** A probe printing all three rungs at the
+site, on the row's own filed program:
+
+    ELEMROWPROBE slot=0 name=Circle arena=-1 byname=-1 canon=0 vi=0
+
+Rungs 1 and 2 decline (a variant arm has no `sNames` row); rung 3 — `repRowOfTyStruct`, the
+canon-key structural bridge — answers `Dot`'s row 0, while the variant table held the right
+answer (`vi=0`) the whole time.
+
+**THE DISASSEMBLY IS ONE TYPE INDEX.** `wasm-tools print` on the filed witness, master vs
+this branch, everything else in `circleList` byte-for-byte identical:
+
+    master   (type (;8;) (array (mut (ref null 0))))   ; 0 = Dot, the standalone row
+    branch   (type (;8;) (array (mut (ref null 1))))   ; 1 = uVarHeap[Circle]
+
+with `struct.new 1` pushing a `(ref 1)` into it in both — which is precisely the engine's
+"expected (ref null $type), found (ref $type)", two DIFFERENT heap types behind one
+placeholder.
+
+**GRID — 480 cells, master `a80c6717` vs this branch.** Axes: twin presence (none / exact
+layout twin / same-arity different-field-NAME / same-field different-TYPE / minted only by a
+`std:array` generic instance) × consumption (element read / element written via `push` /
+nested `Circle[][]` / map value / struct field / parameter / return / captured) ×
+declaration order (4 placements of the twin block relative to the arms and the union) ×
+arity (one twin / two twins / a twin that is itself an arm of a second union).
+
+| | master | branch |
+|---|---|---|
+| runs | 280 | **420** |
+| check-clean invalid wasm | 140 | **0** |
+| loud check reject | 60 | 60 |
+| loud emit reject / compiler trap / trap / wrong value | 0 | 0 |
+
+**140 cells moved, every one `check-clean invalid wasm → runs`; 0 moved backward**, and the
+branch has ZERO silent cells on the grid. The axes reproduce the filed controls exactly:
+
+* **twin presence** — `exact` 56/96 and `stdmint` 84/96 fail on master; `namediff`,
+  `typediff` and `notwin` are **0/96 each**. It is a LAYOUT bridge, not a name coincidence.
+* **consumption** — 20/60 at each of the seven ref-list consumptions and **0/60 at the map
+  VALUE**, which is a loud checker reject (``member access '.r' on non-object Circle | null``)
+  identically on both sides. The 60 loud cells are the same 60 files in both baselines.
+* **declaration order** — FLAT, 35/120 at each of the four orders. Unlike D1, order is not
+  load-bearing here.
+* **arity** — the cross-tab is the mechanism restated: `exact` fails at `one` 28/32 and
+  `two` 28/32 but **`armtwin` 0/32**, because promoting `Dot` to an arm of a second union
+  REMOVES its `sNames` row and so removes the very row the canon rung was finding. `stdmint`
+  is 28/32 at all three, because the monomorphizer's anonymous `#anonN` row is not something
+  a declaration can take away.
+
+**CORPUS BYTE-IDENTITY.** 1,834 of the 2,258 `tests/cases/*.vl` compile under both master's
+seed and this branch's, and all 1,834 are **BYTE-IDENTICAL**: 0 byte-different, 0 lost the
+ability to compile, 0 gained it. The gate fires where the defect was and nowhere else.
+
+Pinned as `tests/cases/unions/variant-element-list-beside-layout-twin.vl` (seven
+consumptions, no import and no generic) and, for the `std:array` mint, by
+`tests/cases/std/array-reduce-narrowed-variant-init.vl`.
+
+#### THE CENSUS THE CLOSE OWED — one rung here, and a SECOND live rung at D26's source
+
+D26 was a VARIANT index read through the STRUCT table. D32 is **not that mechanism**: no
+index crosses a namespace here, a *lookup* does — a structural canon key resolving a nominal
+question. Both are "asked the wrong table", at different rungs. Both patterns were swept:
+
+* **`sHeapIdx[x] != uVarHeap[y]` comparisons** — three sites survive D26's deletion
+  (`emit_classify.structIdxHasReboxVariant`, `wasmEmit`'s `emitUnionCoerce` rebox arm at
+  ~4016, `wasmEmit.emitUnionBoxArg` at ~4458). All three are reachable, and two of them take
+  their `ssi` from `structIndexOfExpr`.
+* **`structIndexOfExpr`'s Call arm still reads the polymorphic slot UN-GATED.** D26 deleted
+  the one bad CONSUMER; the PRODUCER is unchanged. `fRetStructIdx` holds four different
+  namespaces by kind — a struct row (`struct`/`nulstruct`), a VARIANT index
+  (`variant`/`nulvariant`, where `retAnnKindChain` leaves `fRetKind` at `"i32"`), a ref-list
+  SLOT (`reflist`) and a map SHAPE (`map`) — and every other reader is kind-gated
+  (`cloRetValSlot`'s two arms, `capturedVariantIndex`, the `fnsig` result at ~13073, whose
+  comment says *"Kind-GATED like every other reader on the polymorphic companion slot"*).
+  `fnRetStructIndexSid` was the one that was not.
+* **MEASURED, not argued:** an in-compiler probe firing when `fnRetStructIndexSid` answers
+  `>= 0` for a non-struct kind reaches **11 of the 2,258 corpus files** today —
+  `soundness/call-result-union-arg.vl`, `soundness/call-result-union-binding.vl`,
+  `std/array-reduce-narrowed-variant-init.vl`, `types/display-render-is-nominal.vl`,
+  `types/variant-as-value.vl`, `unions/call-struct-arm-into-union-global-cell.vl`,
+  `unions/declared-union-struct-arm-call-positions.vl`,
+  `unions/inline-union-struct-arm-call-positions.vl`,
+  `unions/inline-union-struct-arm-standalone-positions.vl`,
+  `unions/unannotated-bind-variant-call-beside-plain-struct.vl` (D26's own pin) and
+  `unions/variant-annotated-global-floor.vl`. Every one is a `: Circle`-annotated variant
+  return whose VARIANT index is handed to `structIndexOfExpr`'s ~40 struct-namespace
+  consumers. They all compile correctly today because each consumer happens to decline —
+  which is exactly the state D26 was in until one consumer stopped declining.
+* **The gate is in this change, and it is byte-neutral.** `fnRetStructIndexSid` now returns
+  -1 unless `fRetKind` is `struct`/`nulstruct`. Measured over the same 2,258 files against
+  the D32-fix-only compiler: 1,834 compile under both, **0 byte-different, 0 lost, 0
+  gained**, and the 480-cell grid is identical (420/0/60). It is a HARDENING with zero
+  observed behaviour change, not a fix for an observed defect — it removes the D26 mechanism
+  at its source instead of at one consumer, and brings the last un-gated reader of the
+  polymorphic slot in line with the convention the other four already state.
 
 ---
 

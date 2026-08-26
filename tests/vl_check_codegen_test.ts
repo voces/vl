@@ -225,14 +225,31 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // 0x493, and NO `emit error` marker — every property the three assertions below need. Pinned
 // as `tests/cases/soundness/xfail-miscompile-map-return-if-arm-tail-caller.vl`.
 //
-// THE NEXT SPECIMEN IS NAMED HERE RATHER THAN LEFT TO BE RE-DERIVED. When D30 closes, take
-// `silent-class-inventory.md` **D32** — a `Circle[]` whose element is a union MEMBER resolves
-// the LIST's element heap through the struct table whenever a layout twin of the arm exists,
-// and ONE `reduce` at a union accumulator mints that twin. It needs no import and no generic
-// to reproduce (`type Dot = { r: i32 }` beside `type Shape = Circle | Sq` is the whole
-// witness), it was found by D26's own 240-cell grid, and it is the seam ROADMAP charters as
-// repOf item (e). It has no `@no-instantiate` pin yet, so pin it in the same commit or the
-// tripwire at the foot of this file goes red.
+// THE NAMED SUCCESSOR — `silent-class-inventory.md` **D32**, a `Circle[]` whose element is a
+// union MEMBER resolving the LIST's element heap through the struct table — IS CLOSED, and it
+// closed BEFORE the specimen it was queued behind. `rlElemStructRow`'s canon-key rung now
+// declines for a name the variant table claims, which is the exact complement of the gate
+// `exprVariantIndex`'s `Index` arm has always carried; 140 of a 480-cell grid moved from
+// check-clean-invalid to running and 0 moved backward. Graduated to
+// `tests/cases/unions/variant-element-list-beside-layout-twin.vl`, which RUNS and therefore
+// needs no `@no-instantiate` pin.
+//
+// SO THIS CONSTANT HAS NO NAMED SUCCESSOR FOR THE FIRST TIME, and that is a finding rather
+// than an oversight. `silent-class-inventory.md` grades 32 rows, 31 of them `runs`; the ONE
+// remaining `silent_invalid_wasm` is D30, which is what stands above. When D30 closes the
+// inventory holds no check-clean-invalid program at all, and the three assertions below lose
+// the thing they exist to prove.
+//
+// DO NOT WEAKEN THEM AND DO NOT INVENT A SPECIMEN. What these three tests actually cover is
+// the `--codegen` VALIDATION PLUMBING — that the codegen-free path stays quiet, that the
+// validator's refusal is rendered as `not valid wasm` with the engine's own reason and
+// WITHOUT an `emit error` marker, and that `--no-validate` opts out. Pinning that plumbing to
+// whichever miscompile happens to be live is why this constant has now been swapped six
+// times, and each swap has been a race against the fix. The successor question is therefore a
+// DESIGN one — most likely a deliberate emit hook that produces one wrong type index on
+// demand, so the diagnostic is exercised whether or not a defect exists — and it belongs to
+// whoever closes D30, in consultation, rather than being decided here by the row that got
+// out first.
 const INVALID_MODULE_SRC = `type S = { a: i32 }\n` +
   `function mkR(v: i32): {[string]: S} {\n` +
   `  const m: {[string]: S} = Map()\n` +

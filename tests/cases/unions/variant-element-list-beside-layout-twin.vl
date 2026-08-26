@@ -1,0 +1,147 @@
+// Regression (silent-class-inventory D32): a `Circle[]` ref list whose element is a
+// declared union MEMBER, in a module that also declares a standalone struct of the SAME
+// LAYOUT. `Dot` below is the whole trigger — delete it and every cell here already ran.
+//
+// The ref-list element's heap type is resolved by `rlElemStructRow`, a three-rung ladder:
+// the arena sidecar, the exact NAME (`structIndexByName`), then the CANON-KEY structural
+// bridge (`repRowOfTyStruct`). A variant arm has no `sNames` row — `collectS` skips a
+// `TypeDecl` that `variantIndexOf` claims — so rungs 1 and 2 decline and rung 3 answered,
+// bridging the arm's SHAPE onto `Dot`'s standalone row. Measured at the site on this file's
+// own witness: `arena=-1 byname=-1 canon=0 vi=0`.
+//
+// Both passes of `mAssignTypeIndices` ask that one function — the dedup SIGNATURE pass and
+// the element-HEAP pass — so the backing array was emitted `(array (mut (ref null $Dot)))`
+// while the value stored was `(ref $uVarHeap[Circle])`. `vl check` rc 0 and the engine
+// refuses the module: "type mismatch: expected (ref null $type), found (ref $type)", the two
+// `$type`s being two DIFFERENT heap types behind one placeholder.
+//
+// THE PRODUCER AND THE CONSUMER DISAGREED ARM FOR ARM, which is what the fix restores.
+// `exprVariantIndex`'s `Index` arm — the READ side — already stated the rule from the other
+// end: `if structIndexByName(ren) < 0 { return variantIndexOf(ren) }`, i.e. an element name
+// that is not a registered plain struct reads through `uVarHeap`. `rlElemStructRow` now
+// declines on exactly that predicate, so the array a `Cat[]` read unpacks through the
+// variant heap is the array this side types.
+//
+// VARIANTS ARE NOMINAL HERE and the fix leans on it: the two rows are genuinely distinct
+// heap types and must NOT dedup. The gate is keyed on the NAME, because `repRowOfTyStruct`
+// is structural by construction and no tightening of it could tell `Circle` from `Dot`.
+//
+// THE REACH IS EVERY `Circle[]` IN THE PROGRAM, not one spelling — a 480-cell grid moved
+// 140 cells here, 20 at each of seven consumptions and 0 at the eighth (a map VALUE, which
+// is a loud checker reject and stays one). The seven are below.
+//
+// THE TWIN NEED NOT BE THE CALLER'S OWN TYPE: ONE `std:array` `reduce` at a declared-UNION
+// accumulator mints an anonymous `{r:i32}` row (the monomorphizer spells the union
+// structurally in `f: (A, T) => A` and `internFuncTypeShapesTy` interns each arm), and that
+// row is the same trigger. That spelling is pinned in
+// `std/array-reduce-narrowed-variant-init.vl`; this file needs no import and no generic.
+//
+// THE CONTROLS THAT ALREADY RAN, each one line different from the above: `Dot` deleted;
+// `type Dot = { q: i32 }` (same arity, different field NAME); `type Dot = { r: string }`
+// (same field name, different TYPE); and `Dot` promoted to an arm of a second union, which
+// removes its `sNames` row and so removes the bridge. All four are 0/96 on master.
+// @run
+// @log 8
+// @log 8
+// @log 8
+// @log 8
+// @log 8
+// @log 8
+// @log 8
+// @log 1
+// @log 3
+// Every `: i32` return below is DECLARED rather than deleted: an un-annotated return takes
+// `computeRetInference` instead of the annotation ladder, which is a different classifier
+// and not the one under test here.
+// @hint redundant type annotation: `elemRead` is inferred as `i32`
+// @hint redundant type annotation: `elemPush` is inferred as `i32`
+// @hint redundant type annotation: `nestedList` is inferred as `i32`
+// @hint redundant type annotation: `structField` is inferred as `i32`
+// @hint redundant type annotation: `take` is inferred as `i32`
+// @hint redundant type annotation: `viaParam` is inferred as `i32`
+// @hint redundant type annotation: `viaReturn` is inferred as `i32`
+// @hint redundant type annotation: `captured` is inferred as `i32`
+// @hint redundant type annotation: `useShape` is inferred as `i32`
+// The BINDING annotations are the subject of the file, not noise: `const xs: Circle[]` is
+// the spelling that resolved the wrong element heap, so each is DECLARED here rather than
+// deleted to quiet the hint tier.
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `xs` is inferred as `Circle[]`
+// @hint redundant type annotation: `ys` is inferred as `Circle[][]`
+// @hint redundant type annotation: `b` is inferred as `{items: Circle[]}`
+type Dot = { r: i32 }
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+type Bag = { items: Circle[] }
+
+function mkDot(): Dot { return { r: 3 } }
+
+// (a) the ARRAY LITERAL — the filed witness.
+function elemRead(): i32 {
+  const c: Circle = { r: 8 }
+  const xs: Circle[] = [c]
+  return xs[0].r
+}
+
+// (b) an empty list WRITTEN through `push` (the literal is not the trigger — the slot is).
+function elemPush(): i32 {
+  const c: Circle = { r: 8 }
+  const xs: Circle[] = []
+  xs.push(c)
+  return xs[0].r
+}
+
+// (c) a NESTED `Circle[][]` — the inner slot's element heap is the same resolution.
+function nestedList(): i32 {
+  const c: Circle = { r: 8 }
+  const xs: Circle[] = [c]
+  const ys: Circle[][] = [xs]
+  return ys[0][0].r
+}
+
+// (d) a `Circle[]` STRUCT FIELD.
+function structField(): i32 {
+  const c: Circle = { r: 8 }
+  const b: Bag = { items: [c] }
+  return b.items[0].r
+}
+
+// (e) a `Circle[]` PARAMETER.
+function take(xs: Circle[]): i32 { return xs[0].r }
+function viaParam(): i32 {
+  const c: Circle = { r: 8 }
+  return take([c])
+}
+
+// (f) a `Circle[]` RETURN.
+function mkList(): Circle[] {
+  const c: Circle = { r: 8 }
+  return [c]
+}
+function viaReturn(): i32 { return mkList()[0].r }
+
+// (g) a `Circle[]` read through a CAPTURE.
+function captured(): i32 {
+  const c: Circle = { r: 8 }
+  const xs: Circle[] = [c]
+  const f = () => xs[0].r
+  return f()
+}
+
+// The union instance itself, so `Circle` really is a registered variant.
+function useShape(): i32 {
+  const s: Shape = { r: 1 }
+  if s is Circle { return s.r }
+  return -2
+}
+
+print(elemRead())
+print(elemPush())
+print(nestedList())
+print(structField())
+print(viaParam())
+print(viaReturn())
+print(captured())
+print(useShape())
+print(mkDot().r)

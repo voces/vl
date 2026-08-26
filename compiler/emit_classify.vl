@@ -7538,10 +7538,52 @@ export function unMemRefArrArmSlot(m: i32): i32 {
 // this row is a store/push struct index, where a leniently-matched row is a wrong heap
 // type — the same asymmetry method note 27 draws around layout twins, in reverse.
 export function rlElemStructRow(slot: i32): i32 {
-  const ar = rlElemStructIdxAt(slot)
-  if ar >= 0 { return ar }
   const ln = nonNulBaseOf(rlElemName[slot])
   const bn = structIndexByName(ln)
+  // THE NOMINAL FLOOR, AND THE EXACT COMPLEMENT OF THE READ SIDE'S GATE. A ref-list
+  // element whose name is a registered union VARIANT and NOT a registered plain struct
+  // has NO struct-table row — its heap is `uVarHeap[vi]` — so every rung below must
+  // decline rather than resolve one. `exprVariantIndex`'s `Index` arm states the same
+  // rule from the consumer's end (`if structIndexByName(ren) < 0 { return
+  // variantIndexOf(ren) }`), and the two are now one predicate read in two directions:
+  // the array a `Cat[]` read unpacks through `uVarHeap` is the array this side types.
+  //
+  // WITHOUT IT the CANON-KEY rung below bridged the variant's SHAPE onto a standalone
+  // struct row (silent-class-inventory D32): `type Dot = {r:i32}` beside a `Shape =
+  // Circle | Sq` made every `Circle[]` in the program resolve `Dot`'s row, so the
+  // backing array was emitted `(array (mut (ref null $Dot)))` while the value stored was
+  // `(ref $uVarHeap[Circle])` — `vl check` rc 0 and a module the engine refuses with
+  // "type mismatch: expected (ref null $type), found (ref $type)", the two `$type`s being
+  // two DIFFERENT heap types behind one placeholder. Measured at this site on the filed
+  // witness: `arena=-1 byname=-1 canon=0 vi=0` — the structural rung was the answering
+  // one, and the variant table held the right answer the whole time.
+  //
+  // VARIANTS ARE NOMINAL HERE and that is what makes the gate cheap: the fix is not to
+  // stop the two rows deduping (they are genuinely distinct heap types), it is to ask
+  // the table that owns the name. The gate is keyed on the NAME rather than the shape
+  // for the same reason — `repRowOfTyStruct` is structural by construction, so no
+  // tightening of it could tell `Circle` from `Dot`. That is the RULING, not a local
+  // preference: `DECISIONS.md` records "the variant⇄struct-TABLE seam … stays nominal —
+  // chartered as repOf item (e), wanting the #911 declared-twin gate at the variant
+  // resolvers", and separately refuses a `tySame`-based membership test precisely because
+  // it "would reach the nominal reps too (`{r:i32}` matching the `Circle` arm)".
+  // `variantIndexOf`'s own header says the same thing from the other side ("VARIANTS ARE
+  // NOMINAL, and B104 shipped this with a structural rung that is wrong"). This is that
+  // declared-twin gate, taken at one resolver.
+  //
+  // TIMING-INDEPENDENT, which `rlSlotsLayoutTwin` needs: `variantIndexOf` is a name scan
+  // over `uVariants` and `structIndexByName` reads `sNames` — both collect-populated, and
+  // neither consults a heap index, so this stays queryable before `mAssignTypeIndices`
+  // assigns anything.
+  //
+  // AND IT GATES THE ARENA RUNG TOO, ahead of it rather than after: `structIndexOfTy` is
+  // a type-index sidecar, so a program in which the variant arm and the standalone struct
+  // share one interned `TyObj` index would answer a row there instead. Measured 0 times
+  // on the corpus, gated anyway — a nominal question must not be settled by whichever
+  // structural rung happens to fire first.
+  if bn < 0 && variantIndexOf(ln) >= 0 { return -1 }
+  const ar = rlElemStructIdxAt(slot)
+  if ar >= 0 { return ar }
   if bn >= 0 { return bn }
   repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
 }
@@ -22492,6 +22534,30 @@ function declaredStructIndex(name: string) {
 function fnRetStructIndexSid(sid: i32) {
   const i = fnIndexOfSid(sid)
   if i < 0 { return -1 }
+  // KIND-GATED, like every other reader of the polymorphic companion slot. `fRetStructIdx`
+  // holds FOUR different namespaces selected by `fRetKind`: a struct-table row
+  // (`struct`/`nulstruct`), a VARIANT index (`variant`/`nulvariant` — and a `: Circle`
+  // annotation leaves the kind at `"i32"`, see `retAnnKindChain`), a ref-list SLOT
+  // (`reflist`), and a map SHAPE (`map`). `cloRetValSlot`'s two arms, `capturedVariantIndex`
+  // and the `$fnsig` result reader all gate on the kind before reading it; this one did not,
+  // and it is the entry point of `structIndexOfExpr`'s CALL arm — so a `: Circle`-returning
+  // call handed a VARIANT index to every struct-namespace consumer downstream of it.
+  //
+  // THAT IS D26'S MECHANISM AT ITS SOURCE. D26 (#1940) deleted the one CONSUMER that
+  // misread it (`letInitReboxesToVariant`, which compared `sHeapIdx[ssi] != uVarHeap[vi]`
+  // with `ssi` from the variant namespace and whose `< sHeapIdx.length` test was a BOUNDS
+  // check standing in for a namespace one). The producer was left as it was, and a probe
+  // firing here on a non-struct kind still reaches 11 of the 2,258 `tests/cases/*.vl` — every
+  // one a `: Circle`-annotated variant return. They are all correct today only because each
+  // of the ~40 downstream consumers happens to decline, which is exactly the state D26 was in
+  // until one stopped declining.
+  //
+  // MEASURED INERT: with this gate, 1,834 corpus files compile under both compilers and 0 are
+  // byte-different, 0 lost the ability to compile, 0 gained it, and D32's 480-cell grid is
+  // identical. It is a hardening — the namespace question answered where the slot is read,
+  // rather than re-asked at each consumer — not a fix for an observed miscompile.
+  const k = fRetKind[i]
+  if k != "struct" && k != "nulstruct" { return -1 }
   fRetStructIdx[i]
 }
 
