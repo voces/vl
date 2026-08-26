@@ -52,10 +52,11 @@ repro rather than a paraphrase:**
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 | D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class. THREE roots at three layers, separated by an ABLATION and not by argument — a missing BOX, a misplaced one failing in the opposite direction at the same seam, and the monomorphizer's pin a whole layer earlier) |
-| D25 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the specimen hunt that closed the three above: a NARROWED argument's type does not ride the monomorphization pin. Needs a ruling on which channel owns it, not an arm |
+| D25 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the ruling is in `DECISIONS.md`. The row named ONE cell and a 187-cell grid found **53**: neither filed option won — the argument-node channel moved 6 cells loud→silent, the annotation channel left 8. Two rungs, 0 silent) |
 | D26 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the `std-api-reviewer` pass over D24's retirement: a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in ONE program. No narrowing, no nullability — the heap-type TWIN at a monomorphized instance's result |
 | D27 D28 D29 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root — `fnAssignKindGuard`, a five-entry decline list whose `null` restored the caller's `i32` default. Four of its five recorded reasons were false and the fifth named a condition that was already available. The guard is deleted; 220 cells of three grids moved, every one forward) |
 | D30 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D27/D28/D29 by the if-arm-join grid that closed them: the CALLER's view of an inferred ref-valued map return, 16 cells the same change could not reach from the callee side |
+| D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -2114,6 +2115,17 @@ six deliveries · four callee shapes — graded on the real outcome vocabulary:
   `P[] | null` and a narrowed nullable CLOSURE whose generic RESULT is then indexed / called
   give `emitProgram: field access receiver is not a struct` and `emitProgram: callee is not a
   function name`. Both were check-clean invalid wasm before.
+* **IT ROUTED A CORPUS CONTROL ONTO A SEPARATE ROOT, WHICH IS FILED AS D31 AND FIXED IN THE
+  SAME COMMIT.** Closing the pin put `generics/mono-nullable-arg-pin.vl`'s own `narrowed`
+  control on a generics-free master defect — a call ARGUMENT inheriting the enclosing
+  RETURN's nullable expectation. The two are independent (D31's witness has no generic in
+  it) and neither closes the other; they ship together only because the corpus reaches D31
+  through D25's fix.
+* **RE-MEASURED ON `d26c4421`** after #1938 closed D27/D28/D29 by deleting `fnAssignKindGuard`,
+  since that change touched `wasmEmit.vl`'s nullable-string return seeding, which is adjacent
+  to D31's fix. The whole 187-cell grid is **byte-identical at both baselines**: 53 silent on
+  `c99838a8` and 53 silent on `d26c4421`, 0 cells moved between them, and 0 silent with the
+  fix at either. The five loud-floor cells below are the same five, with the same messages.
 * Retired: `xfail-miscompile-generic-roundtrip-nulvariant.vl`. Graduated:
   `tests/cases/soundness/generic-narrowed-arg-pin.vl` (24 cells). `INVALID_MODULE_SRC` moved
   to D26 — see that row.
@@ -2490,7 +2502,7 @@ the only change, correct.
 
 ---
 
-### D30 — [CLOSED 2026-08-26] a call ARGUMENT inherits the enclosing RETURN's nullable expectation
+### D31 — [CLOSED 2026-08-26] a call ARGUMENT inherits the enclosing RETURN's nullable expectation
 **CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · filed 2026-08-26 by D25's grid, which routed `generics/mono-nullable-arg-pin.vl`'s own `narrowed` control onto it · pre-existing, measured on this exact program against master's compiler**
 
 Repro:

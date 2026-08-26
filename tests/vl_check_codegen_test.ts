@@ -214,6 +214,18 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // same call inline (`return reduce(…).r`) runs, because with no binding there is no second
 // resolution to disagree with. `silent-class-inventory.md` D26; pinned as
 // `tests/cases/soundness/xfail-miscompile-reduce-union-and-member-struct-accum.vl`.
+//
+// THE NEXT SPECIMEN IS NAMED HERE RATHER THAN LEFT TO BE RE-DERIVED, because D26 is being
+// worked on and this constant has twice ended up naming a program someone was already
+// repairing. When it closes, take `silent-class-inventory.md` **D30** — the CALLER's view of
+// an inferred REF-VALUED map return from an if-arm TAIL assignment, 16 cells of a 192-cell
+// grid, filed by #1938 and deliberately NOT fixed there (routing `fnRetMapShapeSid` through
+// `inferredRetMapSlot` opens an unbounded recursion, so it needs a visited-set of its own).
+// It was RUN against this tree, not assumed: `vl check` rc 0 with two redundant-annotation
+// hints, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref null $type),
+// found (ref $type)` at offset 0x493, and NO `emit error` marker — which is every property
+// the three assertions below need. It has no `@no-instantiate` pin yet, so pin it in the
+// same commit or the tripwire at the foot of this file goes red.
 const INVALID_MODULE_SRC = `import { reduce } from "std:array"\n` +
   `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
