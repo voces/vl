@@ -1754,6 +1754,13 @@ drifted, not a missing inference.
   cannot pass on alone) and `tests/cases/functions/tail-assign-variant-cell-reject.vl`.
   `tests/cases/closures/capture-nullable-niche-storage-class.vl` is the ANNOTATED control
   the first is measured against — the two must not diverge again.
+* **WHAT THE `variant` RESULT OPENED, filed as D27 / D28 / D29.** Lifting that decline proved
+  `fnAssignKindGuard`'s `null` is not a no-answer but an `i32`. The four SURVIVING declines
+  were then each lifted ALONE over a 192-cell grid that is identical on master and on this
+  branch: **all 76 of its check-clean-invalid-wasm cells are caused by a decline**, 70
+  becoming correct programs and 6 a trap, 0 backward. Four of the five recorded reasons are
+  refuted by that measurement; only `nulstr`'s survives. Not fixed here — removing them
+  touches every consumer of the guard and needs its own before/after.
 
 ---
 
@@ -1896,7 +1903,7 @@ Control — the SAME call with a NON-nullable `Circle` parameter boxes correctly
 
 ---
 
-### D25 — a `closure` cell at an implicit-return assignment: the guard declines, the result valtype falls back to `i32`
+### D27 — a `closure` cell at an implicit-return assignment: the guard declines, the result valtype falls back to `i32`
 **check-clean invalid wasm · 18 of a 192-cell guard-decline grid, plus 16 of the 432-cell implicit-return assignment grid · filed 2026-08-26 while closing D21 · pre-existing, identical on master's `vl-compiler.wasm` and on D21's branch (same offset, same message)**
 
 Repro:
@@ -1967,8 +1974,8 @@ Second control — the SAME program with an ANNOTATED return, correct. An annota
 
 ---
 
-### D26 — a `map` / `nulmap` cell at an implicit-return assignment, same root as D25
-**check-clean invalid wasm · 40 of a 192-cell guard-decline grid (32 `map`, 8 `nulmap`) · filed 2026-08-26 beside D25 · pre-existing, identical on master and on D21's branch**
+### D28 — a `map` / `nulmap` cell at an implicit-return assignment, same root as D27
+**check-clean invalid wasm · 40 of a 192-cell guard-decline grid (32 `map`, 8 `nulmap`) · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch**
 
 Repro:
 
@@ -1998,7 +2005,7 @@ Control — the SAME program with the straight-line tail spelling instead of
     }
     // prints 0
 
-* **SAME ROOT AS D25** — `fnAssignKindGuard` declines `map`, the result valtype falls back
+* **SAME ROOT AS D27** — `fnAssignKindGuard` declines `map`, the result valtype falls back
   to `i32`, the body pushes `(ref $mapStruct)`. Lifting `if k == "map"` alone moves all 32
   `map` cells `check-clean invalid wasm → runs`, 0 backward; lifting `if k == "nulmap"` alone
   moves its 8 the same way. Neither lift disturbs the other's cells, which is what makes the
@@ -2020,8 +2027,8 @@ Control — the SAME program with the straight-line tail spelling instead of
 
 ---
 
-### D27 — a `nulstr` cell at an implicit-return assignment: the one decline measurement CONFIRMS
-**check-clean invalid wasm · 6 of a 192-cell guard-decline grid · filed 2026-08-26 beside D25 · pre-existing, identical on master and on D21's branch · NOT the same disposition as D25/D26**
+### D29 — a `nulstr` cell at an implicit-return assignment: the one decline measurement CONFIRMS
+**check-clean invalid wasm · 6 of a 192-cell guard-decline grid · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch · NOT the same disposition as D27/D28**
 
 Repro:
 
@@ -2048,7 +2055,7 @@ correct:
 Second control — the SAME program with the annotation dropped, a loud CHECK reject
 (`cannot assign null to string`), because the un-annotated cell is `str` and not `nulstr`.
 
-* **THE MECHANISM IS D25's** — the guard declines `nulstr`, the result valtype falls back to
+* **THE MECHANISM IS D27's** — the guard declines `nulstr`, the result valtype falls back to
   `i32`. **THE DISPOSITION IS NOT.** Lifting `if k == "nulstr"` alone moves these 6 cells to
   `wasm trap: null reference`, not to `runs` — exactly what the guard's own comment predicts
   ("makes the module VALID and it then TRAPS on `g = null`"). Of the five surviving-decline
