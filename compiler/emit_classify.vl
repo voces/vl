@@ -1415,13 +1415,56 @@ export function nulVariantIdxOfLet(letIx: i32, fnIx: i32) {
   -1
 }
 
+// The VARIANT-table index of a CAPTURED `Circle | null` cell of `fnIx`, or -1 — the
+// kind-gated reader on the companion-slot index space, beside `capturedStructIndex` /
+// `capturedRefListSlot` / `capturedNulMapShape`. The env FIELD was typed from this very
+// number, so the narrowed read and the field cannot name two different heap types.
+function capturedNulVariantIdx(fnIx: i32, name: string) {
+  if capturedKindOf(fnIx, name) != "nulvariant" { return -1 }
+  capturedCompanionSlot(fnIx, name)
+}
+
+// The NON-NULL twin of the reader above: the VARIANT-table index of a CAPTURED kind-8
+// `v: Circle` cell, or -1. Same index space, same kind gate, and it exists for the same
+// reason — `exprVariantIndex`'s Ident arm had param / declared / global legs and no
+// capture leg, so a captured variant handed to a union parameter was never boxed.
+function capturedVariantIndex(fnIx: i32, name: string) {
+  if capturedKindOf(fnIx, name) != "variant" { return -1 }
+  capturedCompanionSlot(fnIx, name)
+}
+
 // The variant index behind a nullable-variant EXPRESSION (an `as?` cast, a call, an
-// ident), or -1 — the initializer half of `nulVariantIdxOfLet`.
+// ident), or -1 — the initializer half of `nulVariantIdxOfLet`, and THE INDEX TWIN of
+// `exprNullableVariant`, built ARM FOR ARM against it:
+//
+//   twin arm                | index source here
+//   ------------------------|---------------------------------------------------------
+//   `exprIx < 0` → false    | -1
+//   `Paren`                 | recurse on `parInner` (identical)
+//   `AsExpr`                | `nulVariantIndexOf(exprIx)` — the arena rung that
+//                           | `retNulVariantFlag` IS, so the two read one source
+//   `Call`, `Ident` callee  | `cloRetValSlot(cfe)` under `cloRetValKind`; a CLOSURE-VALUE
+//                           | callee through `calleeCloSigKeySid` + `sigKeyRetSlot`
+//   `Call`, `Member` callee | `cloRetValSlot(ffe)` under `cloRetValKind`
+//   `Ident` param           | `nulVariantIndexOf(paramTypeNode(…))`
+//   `Ident` declared local  | `localStructIdx[slot]` under `localIsRef[slot]`
+//   `Ident` CAPTURE         | `capturedNulVariantIdx`
+//   `Ident` global          | the annotation, else recurse into the init
+//
+// THE KIND GATE ON EACH ARM IS THE CONTRACT, not a belt-and-braces. Every caller reads the
+// KIND and this SLOT as a pair (`addLocalName`'s `"nulvariant"`, the field read's
+// `uVarHeap[nvi]`, the argument box's `uTags[nvi]`), and `cloRetValSlot` is POLYMORPHIC over
+// five kinds — so the ungated call arm handed a `: P | null`-returning callee's STRUCT row
+// back as a variant index, a number in the wrong index space. `variantIndexOf(e.asTy)` had
+// the same shape one arm up: it answered for a NON-null `x as Circle`, which is not this
+// question at all. Both callers gated externally, which is why neither ever fired; the
+// argument-boxing caller (`emitUnionBoxArg`, D24) gates the same way and the arms now agree
+// with the twin on their own.
 export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is Paren { return nulVariantIdxOfExpr(e.parInner, fnIx) }
-  if e is AsExpr { return variantIndexOf(e.asTy) }
+  if e is AsExpr { return nulVariantIndexOf(exprIx) }
   // A CALL of a `: Circle | null`-returning function — the callee's own annotation owns
   // the index, which is what an INFERRED binding (`const c = h(true)`) has to read: it
   // has no annotation of its own, and its slot is declared from this answer.
@@ -1429,11 +1472,23 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const cfe = fnIndexOfSid(sidOfNode(e.callFn))
-      if cfe >= 0 { return cloRetValSlot(cfe) }
+      if cfe >= 0 {
+        if cloRetValKind(cfe) == "nulvariant" { return cloRetValSlot(cfe) }
+        return -1
+      }
+      // A CLOSURE-VALUE callee (`const f = mk; f()`), which `fnIndexOfSid` misses — the
+      // twin's third rung. `calleeCloSigKeySid` is the key it reads its KIND from and
+      // `sigKeyRetSlot` is that same key's slot digit, the pairing that parser's own
+      // header requires.
+      const nvck = calleeCloSigKeySid(sidOfNode(e.callFn), fnIx)
+      if sigKeyRetKind(nvck) == "nulvariant" { return sigKeyRetSlot(nvck) }
+      return -1
     }
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return cloRetValSlot(ffe) }
+      if ffe >= 0 {
+        if cloRetValKind(ffe) == "nulvariant" { return cloRetValSlot(ffe) }
+      }
     }
     return -1
   }
@@ -1450,6 +1505,10 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
       const pa = nulVariantIndexOf(pt)
       if pa >= 0 { return pa }
     }
+    // The CAPTURE arm of the twin, which this had no counterpart for: a `Circle | null`
+    // cell read from an enclosing frame's env is the same `(ref null $uVarHeap[vi])` niche.
+    const cnv = capturedNulVariantIdx(fnIx, e.identName)
+    if cnv >= 0 { return cnv }
     const gi = globalLetOf(e.identName)
     if gi >= 0 {
       const g = P.nodes[gi]
@@ -22328,6 +22387,18 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     if pvi >= 0 { return pvi }
     const dvi = declaredVariantIndex(e.identName)
     if dvi >= 0 { return dvi }
+    // THE CAPTURE LEG — the fourth storage class, and the one this ladder lacked while its
+    // boolean-and-nullable siblings (`exprNullableVariant`, `capturedStructIndex`) each
+    // carry it. `captureValKind` types a `v: Circle` env field "variant" and
+    // `captureValStructIdx` puts the VARIANT index in its companion slot, so the fact is
+    // already banked; only the reader was missing. Without it a captured variant read
+    // answered -1 here, `emitUnionBoxArg` did not box it, and `area(v)` inside a nested
+    // function handed a raw `(ref $Circle)` to a `(ref $uBox)` parameter — `vl check` rc 0
+    // and a module the engine refuses, in the lambda spelling as much as the named-nested
+    // one. Kind-GATED like every other reader on the polymorphic companion slot, so a
+    // ref-list or struct capture's number cannot be read as a variant row.
+    const cvi = capturedVariantIndex(fnIx, e.identName)
+    if cvi >= 0 { return cvi }
     // A module GLOBAL whose cell is the kind-8 raw variant — the global twin of the
     // `declaredVariantIndex` LOCAL leg above, and the leg every member-read site
     // (`o.field`) needs to pick `uVarHeap` over `sHeapIdx` for a variant receiver.

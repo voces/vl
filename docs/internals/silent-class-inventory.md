@@ -51,6 +51,9 @@ repro rather than a paraphrase:**
 | D19 | check-clean invalid wasm (mis-graded; it LOADS then traps) | **runs — CLOSED 2026-08-26** (below, with the scope axis that measured the whole class: 38 silent cells, all module scope) |
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
+| D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class. THREE roots at three layers, separated by an ABLATION and not by argument — a missing BOX, a misplaced one failing in the opposite direction at the same seam, and the monomorphizer's pin a whole layer earlier) |
+| D25 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the specimen hunt that closed the three above: a NARROWED argument's type does not ride the monomorphization pin. Needs a ruling on which channel owns it, not an arm |
+| D26 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the `std-api-reviewer` pass over D24's retirement: a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in ONE program. No narrowing, no nullability — the heap-type TWIN at a monomorphized instance's result |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -1764,8 +1767,8 @@ drifted, not a missing inference.
 
 ---
 
-### D22 — an object LITERAL as the argument to a `Circle | null` parameter is boxed into a niche slot
-**check-clean invalid wasm · filed 2026-08-26 while fixing the call-argument non-null recover ladder · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset 252)**
+### D22 — [CLOSED 2026-08-26] an object LITERAL as the argument to a `Circle | null` parameter is boxed into a niche slot
+**CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · filed 2026-08-26 while fixing the call-argument non-null recover ladder · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset 252)**
 
 Repro:
 
@@ -1801,13 +1804,27 @@ parameter, both run. It is the third combination that has no arm:
   earlier function, so the module never reached this one. Only fixing the narrow half surfaced
   it — the reason a grid takes the whole cross product instead of stopping at the first red
   cell.
-* Pinned as `tests/cases/soundness/xfail-miscompile-nulvariant-literal-arg.vl`, which is also
+* Pinned as `tests/cases/soundness/xfail-miscompile-nulvariant-literal-arg.vl`, which was also
   `tests/vl_check_codegen_test.ts`'s live `INVALID_MODULE_SRC` specimen.
+
+**CLOSED 2026-08-26.** The ARGUMENT position never learned the niche's non-null half. The LET
+position seeds the variant index from its annotation (`letAnnVariantIdx`) and the RETURN
+position seeds the identical pair (`retNulVariantFlag` + `nulVariantIndexOf`); `emitDirectCall`
+had only the null half (`cParamNulVariantHeap`, armed for a bare `null` argument), so an object
+literal fell to `emitObj`'s union-program default. `cParamNulVariantIdx` is the third rung of
+that pairing, seeded exactly as the kind-8 `cVi` seed beside it is.
+
+The grid found the SAME root at one more position, and it is fixed here too: a local
+ASSIGNMENT (`let c: Circle | null = null; c = { r: 5 }`) had no niche seed at all, while the
+DECLARATION of the same binding did — two spellings of one binding disagreeing.
+
+Graduated to `tests/cases/soundness/nulvariant-call-boundary.vl` (`@run`, 9 cells), which also
+carries D24's direction. The xfail is deleted and `INVALID_MODULE_SRC` now names D25 below.
 
 ---
 
-### D23 — a monomorphized parameter's rep pin answers `i32` for a narrowed nullable ref
-**check-clean invalid wasm · 8 of a 192-cell call-argument grid · filed 2026-08-26 beside D22 · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset 235)**
+### D23 — [CLOSED 2026-08-26] a monomorphized parameter's rep pin answers `i32` for a narrowed nullable ref
+**CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · 8 of a 192-cell call-argument grid · filed 2026-08-26 beside D22 · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset 235)**
 
 Repro:
 
@@ -1853,10 +1870,38 @@ Control — the SAME call against a NON-generic callee runs, and that is the who
 * Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid module",
   and the class already has its live specimen in D22.
 
+**CLOSED 2026-08-26, and the filing under-counted it.** A 26-cell rep grid over one
+`dstGen<T>(x: T, k: i32)` destination found **7** silent cells, not 4: the three `nulvariant`
+deliveries and the `nulreflist` field read as filed, the two `u8[]` spellings the row's own
+prose predicted — and **the NON-NULL `variant` itself**, which the filing does not mention.
+`x: Circle` handed to a generic was `vl check` rc 0 and `expected i32, found (ref $type)`.
+
+The fix is the row's own diagnosis taken literally, in two parts:
+
+* **A pin for the reps that have one.** `monoAnnPinName` claimed a struct, a union, the
+  composite-list / scalar spellings and the nullable form of each, and NOT a declared union
+  ARM — `isSName` declines a variant by construction (a variant has no struct row). One arm
+  (`variantIndexOf(name) >= 0`) covers `Circle`, and because `monoNulAnnName` delegates its
+  base to that same ladder, `Circle | null` comes with it. 4 cells → **runs**.
+* **A FLOOR for the reps that do not**, because the catch-all is the defect: `""` fails the
+  call loudly (`monomorphize: unsupported argument type for …`) instead of minting an i32
+  instance over a `(ref …)`. Three floors, each measured silent-wrong first —
+  `exprNullableVariant`, `exprNullableRefArray`, `exprU8Array` — plus the propagation of `""`
+  through the un-annotated-let arm, without which `const xs = o.xs` re-entered the catch-all
+  one binding later. 3 cells → **loud emit reject**.
+
+  Deliberately narrow: the other nullable niches (`nullist`, `nulmap`, `nulstr`, `nulclosure`,
+  the scalar lists, `boolean | null`) were measured RUNNING through the annotation channels,
+  and a floor can only fire where the answer would have been `"i32"` — so an unmeasured
+  widening could turn a working cell loud. D-SHAPEFIELD's rule, one ladder over.
+
+Graduated to `tests/cases/soundness/nulvariant-generic-pin.vl` (`@run`); the two floors are
+pinned as `…/error-generic-nulreflist-field-pin.vl` and `…/error-generic-u8-list-pin.vl`.
+
 ---
 
-### D24 — a narrowed nullable union ARM handed to a UNION parameter is passed raw, never boxed
-**check-clean invalid wasm · filed 2026-08-26 by the std review of the commit that retired the narrowed-callback carve-out · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset)**
+### D24 — [CLOSED 2026-08-26] a narrowed nullable union ARM handed to a UNION parameter is passed raw, never boxed
+**CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · filed 2026-08-26 by the std review of the commit that retired the narrowed-callback carve-out · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset)**
 
 Repro:
 
@@ -1900,6 +1945,179 @@ Control — the SAME call with a NON-nullable `Circle` parameter boxes correctly
   a narrowed `c` and a `Shape`-accumulating `bump` reproduces it while importing only std. A
   plain STRUCT accumulator in the same shape runs; the same narrowed variant as `indexOf`'s
   `needle` gets an honest emit refusal instead.
+
+**CLOSED 2026-08-26, and THE TWIN WAS ALREADY WRITTEN.** The row asked for an
+`exprNulVariantIndex` built arm for arm against `exprNullableVariant`; `nulVariantIdxOfExpr`
+already existed and was that twin, three arms short and two arms divergent. Completing it beat
+minting a second home for one question, and completing it was the fix:
+
+| `exprNullableVariant` arm | `nulVariantIdxOfExpr` before | after |
+|---|---|---|
+| `exprIx < 0` → false | -1 | unchanged |
+| `Paren` → recurse | recurse | unchanged |
+| `AsExpr` → `retNulVariantFlag(exprIx)` | `variantIndexOf(e.asTy)` — a NAME test that also answered for a NON-null `as Circle` | `nulVariantIndexOf(exprIx)`, the arena rung the flag IS |
+| `Call`, `Ident` callee | `cloRetValSlot(cfe)` UNGATED — polymorphic over five kinds, so a `: P \| null` callee's STRUCT row came back as a variant index | gated on `cloRetValKind(cfe) == "nulvariant"` |
+| `Call`, closure-VALUE callee (`calleeRetKindSid`) | **missing** | `calleeCloSigKeySid` + `sigKeyRetSlot`, gated on `sigKeyRetKind` |
+| `Call`, `Member` callee | `cloRetValSlot(ffe)` ungated | gated on `cloRetValKind(ffe)` |
+| `Ident` param | `nulVariantIndexOf(paramTypeNode(…))` | unchanged |
+| `Ident` declared local | `localStructIdx[slot]` under `localIsRef` | unchanged |
+| `Ident` CAPTURE | **missing** | `capturedNulVariantIdx`, the kind-gated reader on the companion-slot index space |
+| `Ident` global | annotation, else recurse into the init | unchanged |
+
+`emitUnionBoxArg` then gains one rung beside its `exprVariantIndex` rung, gated on the BOOLEAN
+twin so the kind and the slot cannot come from different questions. The box's payload field is
+`anyref`, so the niche rides it in the same three bytes the non-null variant ref does, and the
+narrow that reached the position is what makes it sound.
+
+**IT WAS NOT ONE POSITION.** A 20-cell POSITION grid (11 cells of this direction, 9 of D22's)
+found the same missing box at every box-typed destination — the call argument, return,
+annotated let, list element, `push`, map value, struct field, local assignment, if-expression
+arm, nested argument, global cell. **10 of the 11** the `emitUnionBoxArg` rung fixed outright,
+because they already route through it. The ELEVENTH — a struct FIELD — did not: the three
+code-16 field sites (construct at `wasmEmit.vl:1274`, variant payload at `:1864`, field store
+at `:13800`) called `emitUnionCoerce` directly, and a field cell IS the `(ref $uBox)`, so all
+three now use the wrapper like every other box-typed position. That also fixed the NON-NULL
+variant into a struct field, which was broken in the same way and is not a nullable question
+at all (grid cell `variantIntoField`).
+
+**AND ONE MORE STORAGE CLASS.** `exprVariantIndex` — the non-null twin — had param / declared /
+global legs and no CAPTURE leg, while `captureValKind` types a `v: Circle` env field "variant"
+and `captureValStructIdx` banks the index beside it. A captured variant handed to a union
+parameter was never boxed, in the named-nested and the lambda spelling alike. `capturedVariantIndex`
+is that reader, beside the `nulvariant` one the twin table above adds.
+
+Graduated to `tests/cases/soundness/nulvariant-call-boundary.vl` (`@run`, 9 cells) together
+with D22. `std/array.vl`'s live-`reduce`-cell paragraph is retired.
+
+---
+
+### D25 — a NARROWED argument's type does not ride the monomorphization pin
+**check-clean invalid wasm · filed 2026-08-26 by the specimen hunt that followed D22/D23/D24 · pre-existing, measured ON THE FILED FILE against the parent commit (rc 0 / rc 1 there too, with the pin's older `expected (ref $type), found i32`)**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    export function area(sh: Shape) {
+      if sh is Circle { return sh.r }
+      return 0
+    }
+    function idg<T>(x: T): T {
+      return x
+    }
+    function mkc(): Circle | null {
+      return { r: 5 }
+    }
+    function go(c: Circle | null) {
+      if c is Circle { return area(idg(c)) }
+      return -1
+    }
+    print(go(mkc()))
+    // vl check rc 0, no diagnostic at any severity; the engine refuses the module:
+    //   type mismatch: expected (ref $type), found (ref null $type)
+
+Control — the same round trip on a NON-nullable variant runs and prints 5, and so does the
+same narrowed value handed to a generic that does not return it (`dstGen<T>(x: T, k: i32)`):
+
+    function go2(v: Circle) { return area(idg(v)) }     // prints 5
+    function go3(c: Circle | null) {
+      if c is Circle { return dstGen(c, 7) }            // prints 7
+      return -1
+    }
+
+* **TWO CHANNELS, ONE CALL, TWO ANSWERS.** Inside `if c is Circle` the checker types `c` as
+  `Circle`. The monomorphizer's argument pin reads the PARAMETER's declared annotation, which
+  is still `Circle | null`, so the instance is minted `(x: Circle | null): Circle | null` —
+  correct for the question it was asked. The value coming back therefore keeps the niche's
+  `(ref null $uVarHeap[vi])` valtype while the checker has already typed the expression
+  `Circle` and `area`'s parameter wants the `(ref $uBox)`.
+* **IT IS NOT A MISSING ARM, which is why it is filed rather than fixed beside D22/D23/D24.**
+  Those three are each "what rep does this position want, and does the classifier deciding
+  know about the niche". This one needs a RULING on which channel owns a narrowed argument's
+  type — the annotation the pin ladder trusts everywhere else (because mid-mono every `expr*`
+  classifier is blind: `buildLocals` has not run), or the checker's recorded type on the
+  argument NODE, which knows the narrow but is unreliable for the shapes the annotation arms
+  exist to cover. Only the generic RESULT positions can see the difference; a pin whose type
+  parameter does not appear in the result is unaffected, which is why the `dstGen` control runs.
+* **THE FAILURE MOVED WHEN D23 CLOSED, THE OUTCOME DID NOT.** On the parent commit the same
+  file is `vl check` rc 0 and `expected (ref $type), found i32` at offset 0xe3 — the pin's old
+  `T := i32` answer. On this commit it is rc 0 and `expected (ref $type), found (ref null
+  $type)` at 0xe4. Same cell, same silence, one rung along.
+* Pinned as `tests/cases/soundness/xfail-miscompile-generic-roundtrip-nulvariant.vl` and it is
+  `tests/vl_check_codegen_test.ts`'s live `INVALID_MODULE_SRC` specimen — the ninth.
+
+---
+
+### D26 — a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in one program
+**check-clean invalid wasm · filed 2026-08-26 by the `std-api-reviewer` pass over the D24 retirement, which went looking for the CROSS cell the retirement's own pin did not have · pre-existing, measured on this exact file against master's compiler (identical rejection, identical offset 0x29e)**
+
+Repro:
+
+    import { reduce } from "std:array"
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function bumpC(acc: Circle, x: i32): Circle { return { r: acc.r + x } }
+    function bump(acc: Shape, x: i32): Shape {
+      if acc is Circle { return { r: acc.r + x } }
+      return acc
+    }
+    function circleFold(): i32 {
+      const c: Circle = { r: 5 }
+      const out = reduce([1, 2], bumpC, c)
+      return out.r
+    }
+    function shapeFold(): i32 {
+      const s: Shape = { r: 1 }
+      const out = reduce([1, 2], bump, s)
+      if out is Circle { return out.r }
+      return -2
+    }
+    print(circleFold())
+    print(shapeFold())
+    // vl check rc 0, no diagnostic at any severity; the engine refuses the module:
+    //   wasm[0]::function[16]::circleFold$m0 … type mismatch: expected (ref $type), found (ref $type)
+
+Controls, all of which RUN — the reviewer's own axis table, each cell executed:
+
+* either accumulator ALONE (`circleFold` without `shapeFold`, or the reverse);
+* two DISTINCT struct accumulators (`Circle` + `Sq`) with no union in the program;
+* the union accumulator beside a NON-MEMBER struct accumulator (`Other`);
+* the same pair with the member-struct result taken as `return reduce(…).r` instead of
+  through a `const out` binding.
+
+* **NO NARROWING AND NO NULLABILITY ANYWHERE**, which is what separates it from D22/D23/D24
+  (all three need the `nulvariant` niche) and from D25 (which needs a narrowed argument
+  riding a generic RESULT). It is the heap-type TWIN at a monomorphized instance's RESULT,
+  and the disassembly says so rather than the message shape — `wasm-tools print` of
+  `circleFold`:
+
+      (func (;16;) (type 14) (param structref) (result i32)
+        (local (ref 2) (ref 0) (ref 9))     ;; local 1 = the Circle VALUE, local 2 = `out`
+        i32.const 5
+        struct.new 2                        ;; the literal builds heap type 2
+        local.set 1
+        …
+        call 8                              ;; the A = Circle instance: (ref 2) -> (ref 2)
+        local.set 2                         ;; …into a local DECLARED (ref 0)
+        local.get 2
+        struct.get 0 0                      ;; and read back through heap type 0
+
+  Types 0 and 2 are both `(struct (field (mut i32)))` and are distinct heap types: the plain
+  struct row (`sHeapIdx`) and the union-arm row (`uVarHeap`), which the two tables never
+  cross-dedup. The instance's parameter, body and result agree with each other on `(ref 2)`;
+  it is the `const out` BINDING's slot that resolved `Circle` through the other table. That
+  is why the same call consumed inline (`return reduce(…).r`) runs — with no binding there is
+  no second resolution to disagree with.
+* **THE UNION HAS TO BE INSTANTIATED TOO.** With only the `Circle` instance the program
+  runs; the union instance is what makes `Circle` resolve through `uVarHeap` at one end.
+  This is precisely the interaction a single-instance grid cannot see, and it is the third
+  time `std/array.vl`'s ledger has recorded a diagonal standing in for a cross product.
+* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid
+  module", and the class already has its live specimen in D25.
+  `tests/cases/std/array-reduce-narrowed-variant-init.vl` instantiates `reduce` at four
+  accumulator types on purpose and says in its header which fifth one is missing and why.
 
 ---
 
