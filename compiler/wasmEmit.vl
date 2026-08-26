@@ -192,6 +192,7 @@ import {
   aUsed,
   armPreludeBlocks,
   arrNewScratchBase,
+  atomStageSlot,
   ba8TypeIdx,
   ba8Used,
   bl8TypeIdx,
@@ -222,6 +223,7 @@ import {
   fl64TypeIdx,
   fnListEqRSlots,
   fnStmts,
+  fnUsesAtomStage,
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
@@ -13957,7 +13959,13 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
       const isU8 = exprU8Array(callee.memObj, fnIx)
       // A LITERAL-UNION array push (`xs.push("a")` over `xs: K[]`) rides the i32-list spine, but the
       // pushed member literal must lower as its atom id — seed `pendingLitUnion` for the value emit.
-      const isLitArr = nodeArrayElemIsLitUnion(callee.memObj)
+      //
+      // THROUGH THE DECLARATION FALLBACK (`arrElemLitUnionTy`), the same widening the indexed
+      // STORE took at #1917 and for the same reason: in a MONOMORPHIZED instance the receiver
+      // Ident is a node SHARED with the generic body, so it still records the type VARIABLE
+      // and the direct probe answers FALSE for a list the instance's own `const out: U[]`
+      // annotation declares litunion-elemented. `std:array.mapIndexed` is that shape exactly.
+      const isLitArr = arrElemLitUnionTy(callee.memObj, fnIx) >= 0
       // A `(boolean | null)[]` push (`p.push(null)`) also rides the i32-list spine, but a `null`
       // value must lower as the sentinel 2 — seed `pendingNulBool` for the value emit.
       const isNbArr = nodeArrayElemIsNulBool(callee.memObj)
@@ -14105,9 +14113,18 @@ function emitPush(body: i32[], callIx: i32, fnIx: i32) {
           const pnCtx = refElemValueCtx(pushNestSlot)
           if emitExprExpect(body, c.callArgs[0], fnIx, pnCtx) < 0 { return -1 }
         } else if isLitArr {
-          const pluCtx = expCtxHere()
-          pluCtx.litUnion = 1
-          if emitExprExpect(body, c.callArgs[0], fnIx, pluCtx) < 0 { return -1 }
+          if litPushNeedsDestNarrow(c.callArgs[0], fnIx) {
+            const dTy = arrElemLitUnionTy(callee.memObj, fnIx)
+            if emitDestStrToAtom(body, c.callArgs[0], fnIx, dTy) < 0 {
+              return -1
+            }
+          } else {
+            const pluCtx = expCtxHere()
+            pluCtx.litUnion = 1
+            if emitExprExpect(body, c.callArgs[0], fnIx, pluCtx) < 0 {
+              return -1
+            }
+          }
         } else if isNbArr {
           const pnbCtx = expCtxHere()
           pnbCtx.nulBool = true
@@ -17810,6 +17827,111 @@ function emitStrToAtomChain(
   if emitStrEqCore(body) < 0 { return -1 }
   fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
   0
+}
+
+// ── the DESTINATION-DRIVEN narrow, for a value whose own type cannot answer ───────────────
+//
+// `emitStrToAtom` above asks the VALUE for its members and refuses a value it cannot re-read.
+// Both bounds are exactly wrong at one boundary: a `.push` into a literal-union array inside a
+// MONOMORPHIZED instance. There the value is the callback's result — a CALL, so not a place —
+// and every leaf expression in the instance is a node SHARED with the generic body, so its
+// recorded type is still the type VARIABLE and `strReppedLitUnionAt` declines it.
+//
+// The DESTINATION knows both missing facts. `out.push(v)` over a `const out: U[]` whose
+// annotation mono substituted to `("a" | "b")[]` names the member set, and membership is
+// checker-guaranteed at a store into a `K[]` exactly as it is at a `K` binding — the same
+// totality `emitStrToAtom`'s last-member default already relies on. So the members come from
+// the array's element type, and a non-place value is STAGED (`atomStageSlot`) instead of
+// refused: evaluated once into the slot, then re-read per member. That is `emitAtomToStr`'s
+// id stash, mirrored — one evaluation, N-1 reads — and the slot is reserved by the same body
+// walk that reserves the push quad (`pushStagesAtomNarrow`), so scan and handler cannot
+// disagree about which pushes have one.
+//
+// A re-readable value takes the re-reading tower and needs no slot, which is the shape the
+// non-generic spelling already had.
+//
+// TWO SIBLING DESTINATIONS STILL REFUSE A NON-PLACE VALUE, and both were measured to be
+// unchanged by this — they are the same boundary one destination over, not a regression:
+//
+//   const xs: ("a" | "b")[] = [toAB(0), toAB(1)]   // an array LITERAL element
+//   xs[1] = toAB(1)                                // an INDEXED store
+//
+// Each is `emitProgram: literal-union atom narrowing needs a re-readable receiver`, i.e. a
+// LOUD refusal and never an invalid module, and each would close by routing its value emit
+// through this function the way `emitPush` now does. They are left because a staged narrow
+// costs a reserved slot and the reservation has to be hung on a walk that cannot miss the
+// site (see `pushStagesAtomNarrow`) — `stmtPushBits` is that walk for a `.push`, and the
+// array-literal and indexed-store paths would each need their own.
+function emitDestStrToAtom(body: i32[], valIx: i32, fnIx: i32, luTy: i32) {
+  const texts = tyLitMemberTexts(luTy)
+  if texts.length == 0 {
+    return emitFail("emitProgram: literal-union atom narrowing with no members")
+  }
+  if !aUsed {
+    return emitFail(
+      "emitProgram: literal-union atom narrowing but array type not collected",
+    )
+  }
+  const ix = unwrapParen(valIx)
+  if unionEqOperandOk(ix) {
+    // A PLACE: re-read it per member, no slot.
+    const savedRR = pendingLitUnion
+    pendingLitUnion = 0
+    const rr = emitStrToAtomChain(body, ix, texts, 0, fnIx)
+    pendingLitUnion = savedRR
+    return rr
+  }
+  if !fnUsesAtomStage {
+    // The reservation scan claims a strict SUPERSET of what this arm stages, so reaching here
+    // means the two have drifted. Fail loudly rather than `local.set` an index the locals
+    // vector never declared — that is invalid wasm with `vl check` rc 0.
+    return emitFail(
+      "emitProgram: literal-union atom narrowing needs a staging slot that was not reserved",
+    )
+  }
+  const savedLU = pendingLitUnion
+  pendingLitUnion = 0
+  const rv = emitExpr(body, ix, fnIx)
+  pendingLitUnion = savedLU
+  if rv < 0 { return -1 }
+  fbLocalSet(atomStageSlot)
+  emitStagedStrToAtomChain(body, texts, 0, fnIx)
+}
+
+// `emitStrToAtomChain` over the STAGED value: member `i`'s interned id if the slot
+// string-equals member `i`, else the chain for `i+1`, last member the unconditional default.
+function emitStagedStrToAtomChain(
+  body: i32[],
+  texts: string[],
+  i: i32,
+  fnIx: i32,
+) {
+  if i >= texts.length - 1 {
+    fbI32Const(internAtom(quoteLex(texts[i])))
+    return 0
+  }
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  if emitStagedStrToAtomChain(body, texts, i + 1, fnIx) < 0 { return -1 }
+  fbLocalGet(atomStageSlot)
+  if emitExpr(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
+  if emitStrEqCore(body) < 0 { return -1 }
+  fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
+  0
+}
+
+// Does a `.push` VALUE into a literal-union array need the destination-driven narrow? Only
+// when the existing atom context has no answer for it — an atom-repped value and a member
+// string LITERAL both lower correctly under `pendingLitUnion`, and a string-repped litunion
+// the value's OWN type claims takes `emitStrToAtom` unchanged (byte-identical). Everything
+// else is the boundary above.
+function litPushNeedsDestNarrow(valIx: i32, fnIx: i32) {
+  if exprIsLitAtom(valIx, fnIx) { return false }
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is StrLit { return false }
+  if strReppedLitUnionAt(valIx, fnIx) {
+    if unionEqOperandOk(valIx) { return false }
+  }
+  true
 }
 
 // True when `ix` is a literal-union value whose REP is its member STRING rather than the

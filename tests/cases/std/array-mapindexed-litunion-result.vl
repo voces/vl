@@ -1,0 +1,150 @@
+// @run
+// @log b
+// @log b
+// @log b
+// @log y
+// @log 2
+// @log 7
+// @log c
+// @log d
+// @log b
+// @log b
+// @log 0
+// The `i32`-result row annotates a return type inference would give it anyway; the
+// annotation is what states the grid axis, so the hint is declared rather than dodged.
+// @hint redundant type annotation: `abToI` is inferred as `i32` — remove it to lean on inference
+// GRADUATED from `xfail-miscompile-mapindexed-litunion-result.vl`. `std:array`'s
+// `mapIndexed` with a STRING literal-union result `U` used to be `vl check` rc 0 — the only
+// command that missed it — and the engine refusing the module at load —
+//
+//   type mismatch: expected (ref $type), found (ref $type)
+//
+// — for every `T`, because the receiver's element type was never the predicate. The whole
+// `T` x `U` grid that xfail's header carried is a row here, so the file that pinned the
+// defect and the file that pins the fix cover the same cells.
+//
+// THE MECHANISM WAS TWO SPELLINGS OF ONE `U` IN ONE INSTANCE. A monomorphized body's
+// annotated locals were bound from the pin's NAME while the instance's RETURN annotation was
+// bound from the ARGUMENT's arena row, and those disagree at exactly one parameter shape: a
+// FUNCTION-TYPE parameter, whose pin name renders the type parameter's SOFTENED spelling
+// (`(i32, i32) => string`) where the argument's row carries the literal union itself. So
+// `U[]` recorded `("a"|"b")[]` at the signature — an i32 ATOM-backed list, `ctxKeepsLitUnion`
+// preserving members at `RC_ELEM` — and `string[]` on the body's `const out: U[]`.
+//
+// The second half is the value: the callback's result reps as a string ref (`RC_ROOT`
+// softens), so filling an atom-backed list needs the atom NARROW, and the narrow's `select`
+// tower re-reads its operand once per member — which a CALL cannot be. `.push` now stages a
+// non-place value in `atomStageSlot` and re-reads the slot, the mirror of the widen's id
+// stash.
+//
+// EVERY ROW BELOW WAS INVALID WASM before that pair, except the two NUMERIC/`i32` controls
+// (rows 5 and 6), which were already correct and must stay byte-for-byte correct: they say
+// the fix is keyed on the STRING family and did not reach across it.
+import { mapIndexed } from "std:array"
+
+// Row 1 — `T = i32[]`, `U = "a" | "b"`. The receiver's element type is IRRELEVANT, which is
+// why the original pin was written over an `i32[]`: `i32` is on `std/array.vl`'s ADMITTED
+// list, so a reader who took that list at face value concluded this program was fine.
+function toAB(x: i32, i: i32): "a" | "b" {
+  if x + i > 0 { return "b" }
+  "a"
+}
+
+const ns = [0, 1]
+print(ns.mapIndexed(toAB)[1])
+
+// Row 2 — `T = string[]`, same `U`.
+function sToAB(x: string, i: i32): "a" | "b" {
+  if x.length + i > 1 { return "b" }
+  "a"
+}
+
+const strs = ["p", "q"]
+print(strs.mapIndexed(sToAB)[1])
+
+// Row 3 — `T = ("a" | "b")[]`, `U` the SAME union. Receiver and result agree.
+function abToAB(x: "a" | "b", i: i32): "a" | "b" {
+  if i > 0 { return "b" }
+  return x
+}
+
+const abs: ("a" | "b")[] = ["a", "a"]
+print(abs.mapIndexed(abToAB)[1])
+
+// Row 4 — `T = ("a" | "b")[]`, `U` a DIFFERENT union. The two member sets must not be
+// confused for one another: the result list interns `"x"`/`"y"`, not `"a"`/`"b"`.
+function abToXY(x: "a" | "b", i: i32): "x" | "y" {
+  if x == "a" && i > 0 { return "y" }
+  "x"
+}
+
+print(abs.mapIndexed(abToXY)[1])
+
+// Row 5 — the NUMERIC control. A numeric literal union is not an interned atom at all, so it
+// never crossed the seam and always ran; it is here to keep saying so.
+function to12(x: i32, i: i32): 1 | 2 {
+  if x + i > 0 { return 2 }
+  1
+}
+
+print(ns.mapIndexed(to12)[1])
+
+// Row 6 — the `i32`-result control over a litunion RECEIVER: the direction that was already
+// fine, and the one that proves the predicate is `U` and not `T`.
+function abToI(x: "a" | "b", i: i32): i32 {
+  if x == "a" && i > 0 { return 7 }
+  3
+}
+
+print(abs.mapIndexed(abToI)[1])
+
+// Row 7 — a THREE-member `U`. The narrow tower is one `select` per member past the first, so
+// member count is the axis the two-member rows above cannot exercise.
+function to3(x: i32, i: i32): "a" | "b" | "c" {
+  if x + i > 3 { return "c" }
+  if x + i > 1 { return "b" }
+  "a"
+}
+
+print([0, 1, 2].mapIndexed(to3)[2])
+
+// Row 8 — a FIVE-member `U`.
+function to5(x: i32, i: i32): "a" | "b" | "c" | "d" | "e" {
+  if x + i == 8 { return "e" }
+  if x + i == 6 { return "d" }
+  if x + i == 4 { return "c" }
+  if x + i == 2 { return "b" }
+  "a"
+}
+
+print([0, 1, 2, 3, 4].mapIndexed(to5)[3])
+
+// Row 9 — `U` as a declared ALIAS. This spelling was the `mapIndexed` half of the numbered
+// carve-out `std/array.vl` used to call CARVE-OUT 2 (an EMIT refusal, "literal-union string
+// widening with no members"; that header carries no numbered labels any more). It graduates
+// with the inline one: the alias reps as the atom on BOTH sides, so once the body's `U[]` is
+// bound from the argument's row there is no seam left to cross. `reduce`'s accumulator `A`
+// is the half that does NOT close here — see
+// `tests/cases/std/error-array-litunion-alias-tyaram.vl`.
+type K = "a" | "b"
+
+function toK(x: i32, i: i32): K {
+  if x + i > 0 { return "b" }
+  return "a"
+}
+
+print(ns.mapIndexed(toK)[1])
+
+// Row 10 — the callback as a LAMBDA rather than a named function. A lambda is lifted and
+// baked by the same path, but it is the spelling a caller reaches for first.
+print(
+  ns.mapIndexed((x: i32, i: i32): "a" | "b" => {
+    if x + i > 0 { return "b" }
+    return "a"
+  })[1],
+)
+
+// Row 11 — an EMPTY receiver. The list is built and returned without the narrow ever
+// running, so the SIGNATURE's element rep is all that is under test here.
+const empty: i32[] = []
+print(empty.mapIndexed(toAB).length)

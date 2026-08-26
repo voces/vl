@@ -13008,7 +13008,7 @@ print(fNamed() == null)
 // rep kind already rides the global ladder (`nulstr`, `union`, struct, list, closure …);
 // `nulmap` was the one missing arm, and its absence typed the cell i32 while the start
 // function stored the map ref into it: INVALID WASM, with `vl check` reporting no errors
-// and `vl build` reporting success.
+// and only `vl check` missing it (`vl build` validates and exits 1).
 
 function empty(): {[string]: i32} | null {
   return null
