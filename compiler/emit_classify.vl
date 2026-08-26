@@ -21728,16 +21728,23 @@ function unionOfVariant(vi: i32) {
 // the index — the name form never noticed because it reads the spelling off the same node and the
 // spelling IS `A|B`.
 //
-// This function is correct as written and still has no caller: its consumers are param sites, and
-// the node they would pass is the one that misreports.
-//
 // Named `variantRowOfTy` rather than `variantIndexOfTy` because `variantIndexOfTypeName` already
 // exists and the two would read as a pair they are not: that one takes a spelling.
-// B107 settled why this has no caller, and it is NOT the query-node confusion B106
+//
+// B107 SETTLED WHY THIS HAD NO CALLER FOR SO LONG, and it is NOT the query-node confusion B106
 // suspected: for a union of structurally identical arms the arena legitimately holds arm
 // 0's type (member dedup is structural), so this answers "arm 0" where the truth is "the
-// union". See the corpus census on `paramVariantIndex`. Correct as written; unsafe at
-// exactly the sites that would want it.
+// union". See the corpus census on `paramVariantIndex`. That refusal is about a UNION-annotated
+// PARAM site and is unchanged.
+//
+// IT HAS TWO CALLERS NOW AND BOTH ARE OUTSIDE THAT REFUSAL, which is the distinction worth
+// keeping rather than deleting: the `$fnsig` variant-result reader (`emit_sections`, its first),
+// and `shapeNominalOfTy`, which asks it of a function-type PART during monomorphizer
+// substitution. Neither hands over a union-annotated param node — the second asks about an ARM
+// reaching a type parameter, where "arm 0" is not a wrong answer but the only one. Adding that
+// second caller closed `silent-class-inventory` D33: without it, a NOMINAL question was settled
+// by whichever of two STRUCTURAL field-set scans fired first, and an exact layout twin is
+// claimed by both. Correct as written the whole time; the hazard is in the QUERY NODE, not here.
 export function variantRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   let i = 0
@@ -22484,8 +22491,10 @@ function paramStructIndex(fnIx: i32, name: string) {
 // `tests/cases/soundness/union-same-shape-discriminant-sound.vl` and
 // `tests/cases/types/struct-union-same-shape.vl`; both reach this rung.
 //
-// `variantRowOfTy` is correct as written and deliberately has NO CALLER: its only
-// consumers would be param sites, and this is the param site.
+// `variantRowOfTy` is correct as written and this param site is the one place it must NOT be
+// trusted. It has callers elsewhere — the `$fnsig` variant-result reader and, since D33,
+// `shapeNominalOfTy` — and neither is a param site, which is exactly the partition this
+// paragraph draws.
 //
 // B109 CONFIRMED THIS BY EXPERIMENT, and corrected the reason. The checker's collapse is
 // SOUND — VL is structurally typed, so `Cat | Dog` really is one shape. What the spelling
@@ -30633,6 +30642,51 @@ export function shapeNominalOfTy(ty: i32): string {
   }
   const si = structIndexOfTy(ty)
   if si >= 0 { return sNames[si] }
+  // THE ARENA'S VARIANT RUNG, AND THE EXACT COMPLEMENT OF THE STRUCT RUNG ABOVE IT — the
+  // second half of a NOMINAL question that had only ever asked one of the two tables that
+  // own a name. `structIndexOfTy` is `sTyRow[ty]`, a per-arena-index sidecar banked when
+  // the struct declaration was collected; `variantRowOfTy` is `uVarTyIx[i] == ty`, the same
+  // identity over the VARIANT declarations (`declTyIxOfName` resolves each arm, so the index
+  // IS that declaration's identity). Both answer by DECLARATION IDENTITY. Neither guesses.
+  //
+  // WITHOUT IT the two rungs below decided it, and they are both STRUCTURAL — a field-set
+  // scan of the struct table and a field-set scan of the variant table, in that fixed order.
+  // A union arm beside a standalone struct of its exact layout is claimed by both, so the
+  // order was the whole answer (silent-class-inventory D33). Measured at this site on the
+  // filed witness, `mk(x: i32, i: i32): Circle` handed to `mapIndexed`:
+  //
+  //   SHAPENOM ty=40 arenaS=-1 arenaV=0 fsS=0 fsV=0 render={r:i32}
+  //
+  // — `Circle`'s own arena row was 0 in the VARIANT table the whole time, and `fsS=0` (`Dot`)
+  // is what answered. `nominalizeFnTypeOfTy` then rendered `mk` as `(i32,i32)=>Dot`,
+  // `monoArgFnTypeName` bound `U := Dot` from it, and `mapIndexed`'s minted `const out: U[]`
+  // took `Dot`'s heap while the callback's functype result stayed `(ref $uVarHeap[Circle])`:
+  // `vl check` rc 0 with no diagnostics at all and a module the engine refuses with
+  // "type mismatch: expected (ref $type), found (ref $type)", the two `$type`s being two
+  // DIFFERENT heap types behind one placeholder.
+  //
+  // THE BINDING COLUMN IS WHY THE RECEIVER SPELLINGS RAN. The same wrong render is produced
+  // for `xss.sorted(byR)` over a `Circle[][]` with `byR(a: Circle[], b: Circle[])` — probed,
+  // `nom=[(Dot[],Dot[])=>boolean]` — and that program runs, because `T` is already bound at
+  // `self: T[]` by the time the comparator is matched. A callback merely MENTIONING the type
+  // is not the trigger; being where the type parameter is FIRST BOUND is.
+  //
+  // NOMINAL BY RULING, and the same one D32 was placed under: `DECISIONS.md` records the
+  // variant/struct-table seam "stays nominal", and `variantRowOfTy`'s own header refuses a
+  // structural rung for itself because "two variants with the SAME FIELD SET are different
+  // variants". The gate D32 added to `rlElemStructRow` is this predicate read through the
+  // NAME table (`if bn < 0 && variantIndexOf(ln) >= 0`); this is the same predicate read
+  // through the ARENA, which is why it sits immediately after the arena struct rung and not
+  // ahead of it: struct-row identity still wins where it exists, exactly as there.
+  //
+  // AND IT CANNOT PICK THE WRONG ARM. `variantRowOfTy` matches arena-index identity, never a
+  // shape, so B107's refusal — "for a union of structurally identical arms the arena
+  // legitimately holds arm 0's type" — is a hazard of the QUERY node at a union-annotated
+  // PARAM site, not of this one: a `TyUnion` index is never in `uVarTyIx`, and where a
+  // union-annotated callback param does hand over an arm's index the two structural rungs
+  // below already answered that arm (or, with a twin declared, the twin) before this landed.
+  const av = variantRowOfTy(ty)
+  if av >= 0 { return uVariants[av] }
   const fs = structRowOfObjFieldSet(ty)
   if fs >= 0 { return sNames[fs] }
   const vr = variantRowOfObjFieldSet(ty)

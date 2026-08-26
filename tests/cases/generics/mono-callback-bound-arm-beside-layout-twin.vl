@@ -1,0 +1,258 @@
+// Regression (silent-class-inventory D33): a type parameter FIRST BOUND through a CALLBACK'S
+// ANNOTATION, bound to a declared union ARM, in a module that also declares a standalone
+// struct of that arm's EXACT layout. `Dot` below is the whole trigger and is never mentioned
+// again — delete it and every cell here already ran.
+//
+// The monomorphizer binds a generic's function-type parameter by RENDERING the argument's
+// recorded type (`monoArgFnTypeName` → `nominalizeFnTypeOfTy` → `shapeNominalOfTy`), which
+// maps each part's structural shape back to a nominal NAME. That resolver had two ARENA
+// rungs' worth of nominal truth available and consulted only one of them: `structIndexOfTy`,
+// the struct-table sidecar. `Circle` is a union arm, so it has no struct row and the arena
+// rung declined — and the two rungs BELOW it are both STRUCTURAL, a field-set scan of the
+// struct table and then a field-set scan of the variant table. A layout twin is claimed by
+// both, so the ORDER was the whole answer. Measured at the site on this file's own witness:
+//
+//   SHAPENOM ty=40 arenaS=-1 arenaV=0 fsS=0 fsV=0 render={r:i32}
+//
+// `arenaV=0` is `variantRowOfTy` — `Circle`'s own row, by DECLARATION IDENTITY
+// (`uVarTyIx[i] == ty`), correct and unconsulted. `fsS=0` is `Dot`, and `Dot` is what
+// answered. `mk` then rendered as `(i32,i32)=>Dot`, `U` bound to `Dot`, and `mapIndexed`'s
+// minted `const out: U[]` took `Dot`'s heap while the callback's functype result stayed
+// `(ref $uVarHeap[Circle])`. Disassembled, master vs branch, every other instruction equal:
+//
+//   master   (type (;8;) (array (mut (ref null 0))))   ; 0 = Dot's standalone row
+//   branch   (type (;8;) (array (mut (ref null 1))))   ; 1 = uVarHeap[Circle]
+//
+// with `mk` emitting `struct.new 1` and `(result (ref 1))` under BOTH — which is exactly the
+// engine's "type mismatch: expected (ref $type), found (ref $type)": two DIFFERENT heap types
+// behind one placeholder. `vl check` was rc 0 with NO diagnostics at all, not even a hint.
+//
+// THE FIX IS THE ARENA'S VARIANT RUNG, AND IT IS THE EXACT COMPLEMENT OF THE STRUCT RUNG
+// ABOVE IT — `variantRowOfTy`, which had been written, documented as correct, and reachable
+// for three rungs of this family without this consumer. It is the same predicate D32 added to
+// `rlElemStructRow` (`if bn < 0 && variantIndexOf(ln) >= 0`) read through the ARENA instead of
+// through the NAME table, which is why it sits immediately AFTER the arena struct rung: struct
+// identity still wins where it exists, exactly as there. Variants are NOMINAL by ruling
+// (`DECISIONS.md`), so the answer had to come from the table that owns the name, not from a
+// better structural tiebreak — no tightening of a field-set scan can tell `Circle` from `Dot`.
+//
+// THE DECIDING PROPERTY IS THE BINDING COLUMN, NOT THE POSITION NAME, and the word FIRST in
+// it is load-bearing. The receiver cells at the foot of this file produce the SAME wrong
+// render — probed, `sorted`'s comparator nominalizes to `(Dot[],Dot[])=>boolean` on master —
+// and they RAN anyway, because `T` is already bound at `self: T[]` by the time the callback is
+// matched. A callback merely MENTIONING the type is not the trigger; being where the type
+// parameter is FIRST BOUND is. They are kept here as controls with the trigger HELD CONSTANT.
+//
+// IT IS NOT std'S AND NOT `mapIndexed`'S: the hand-written cells below import nothing and
+// carry the same two spellings. `std:array` is only where a caller meets both.
+//
+// THE PARAMETER-ORDER PAIR IS DELIBERATE. `std/array.vl`'s litunion-accumulator carve-out had
+// already found this column at a different rep ("the deciding property is PARAMETER ORDER —
+// `A` is first bound at the CALLBACK parameter; move `init: A` ahead of `f` and the identical
+// body runs"), so both orders are RUN here: pinning both running is what says the axis is gone
+// rather than merely quiet.
+//
+// 34 of a 360-cell grid moved, every one toward `runs` (28 from check-clean invalid wasm, 6
+// from a loud emit refusal) and 0 backward. Corpus byte-identity vs `235b365b`: 1,837 of 2,262
+// compile under both seeds, 2 byte-different and 1 gained — all three this row's own pins.
+// @run
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 7
+// @log 7
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// THE `: Circle` / `Circle[]` ANNOTATIONS ARE LOAD-BEARING — they are what make the value a
+// union ARM rather than an inferred inline shape — so their hints are DECLARED rather than
+// silenced. The `Circle$m0` suffix leaking into a user-facing diagnostic is the pre-existing
+// defect #1942 recorded; declared verbatim so the tree notices when it is fixed.
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `c` is inferred as `{r: i32}`
+// @hint redundant type annotation: `o` is inferred as `Circle$m0[]`
+// @hint redundant type annotation: `a` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `b` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `css` is inferred as `Circle$m0[][]`
+// @hint redundant type annotation: `one` is inferred as `{r: i32}`
+// @hint redundant type annotation: `p` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `q` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `xss` is inferred as `Circle$m0[][]`
+// @hint redundant type annotation: `p` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `q` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `xss` is inferred as `Circle$m0[][]`
+// @hint redundant type annotation: `p` is inferred as `{r: i32}[]`
+// @hint redundant type annotation: `xss` is inferred as `Circle$m0[][]`
+import { mapIndexed, reduce, reverse, sorted } from "std:array"
+
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+type Dot = { r: i32 }
+
+// ── the two REACHED positions: a type parameter FIRST BOUND at a callback annotation ──
+
+// `U` at the callback RESULT, through `std:array`.
+function mk(x: i32, i: i32): Circle { return { r: x + i } }
+
+// `A` at the callback's ACCUMULATOR parameter, through `std:array`.
+function addTo(acc: Circle[], x: i32): Circle[] {
+  const c: Circle = { r: x }
+  acc.push(c)
+  return acc
+}
+
+// The same two with NO import — the root is the compiler's, not this module's.
+function myMap<T, U>(xs: T[], f: (T, i32) => U): U[] {
+  const out: U[] = []
+  let i = 0
+  while i < xs.length {
+    out.push(f(xs[i], i))
+    i = i + 1
+  }
+  return out
+}
+
+// PARAMETER ORDER, both ways: `A` first bound at the CALLBACK …
+function myReduce<T, A>(xs: T[], f: (A, T) => A, init: A): A {
+  let a = init
+  let i = 0
+  while i < xs.length {
+    a = f(a, xs[i])
+    i = i + 1
+  }
+  return a
+}
+
+// … and `A` first bound at `init`, ahead of the callback.
+function myReduceInit<T, A>(xs: T[], init: A, f: (A, T) => A): A {
+  let a = init
+  let i = 0
+  while i < xs.length {
+    a = f(a, xs[i])
+    i = i + 1
+  }
+  return a
+}
+
+// `T` first bound at a callback PARAMETER — the column `std:array` has no export for. At
+// `T = Circle` the ARRAY parameter is refused first (`monomorphize: expected an array
+// argument`), so the reachable spelling is `T = Circle[]` over a `Circle[][]`; that cell is
+// check-clean invalid wasm on master at the exact-twin and twin-declared-after coordinates
+// and runs at the other four, which is the twin axis stated from this column.
+function myPick<T>(f: (T) => boolean, xs: T[]) {
+  let i = 0
+  while i < xs.length {
+    if f(xs[i]) { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+// One type parameter reaching TWO columns at once, the callback first.
+function myBoth<T>(f: (T) => T, x: T): T { return f(x) }
+
+function isSeven(cs: Circle[]) { return cs[0].r == 7 }
+
+// Read the `Circle[]` cells through an ANNOTATED parameter. Reading `out[0].r` off the
+// un-annotated binding is refused LOUDLY (`emitProgram: field access receiver is not a
+// struct`) at the init-first order only — an unrelated, already-loud inference gap, kept out
+// of this file's way rather than pinned here.
+function rdList(v: Circle[]) { return v[0].r }
+
+function idc(c: Circle): Circle { return c }
+
+function mapIndexedResult() {
+  const out = mapIndexed([1, 2], mk)
+  return out[0].r
+}
+
+function reduceAccumList() {
+  const seed: Circle[] = []
+  const out = reduce([1, 2], addTo, seed)
+  return rdList(out)
+}
+
+function handMapResult() {
+  const out = myMap([1, 2], mk)
+  return out[0].r
+}
+
+function handReduceCallbackFirst() {
+  const hseed: Circle[] = []
+  const out = myReduce([1, 2], addTo, hseed)
+  return rdList(out)
+}
+
+// THE INIT-FIRST CELL IS SEEDED ON PURPOSE, and the reason is a SECOND axis this row's own
+// grid held constant: an EMPTY `Circle[]` seed in the INIT-FIRST order is check-clean invalid
+// wasm on master AND on this branch, and it does NOT need the twin (`Dot` deleted, same
+// failure) — a different root, filed as D37 rather than folded in here. The CALLBACK-first
+// order with the same empty seed is D33 and runs below, which is what separates them.
+function handReduceInitFirst() {
+  const out = myReduceInit([1, 2], mkSeed(7), addTo)
+  return rdList(out)
+}
+
+function mkSeed(i: i32): Circle[] {
+  const c: Circle = { r: i }
+  const o: Circle[] = [c]
+  return o
+}
+
+function handCallbackParam() {
+  const a: Circle[] = [{ r: 9 }]
+  const b: Circle[] = [{ r: 7 }]
+  const css: Circle[][] = [a, b]
+  return myPick(isSeven, css) + 6
+}
+
+function handTwoColumns() {
+  const one: Circle = { r: 1 }
+  const out = myBoth(idc, one)
+  return out.r
+}
+
+// ── the RECEIVER controls, trigger HELD CONSTANT ────────────────────────────────
+// The same `Circle[]` type reaching a type parameter through `self: T[]` instead of through a
+// callback annotation, with `Dot` still declared and `Circle` still an arm. These RAN on
+// master, and `sorted`'s is the sharpest: its comparator ANNOTATES `Circle[]` outright.
+
+function byR(a: Circle[], b: Circle[]) { return a[0].r < b[0].r }
+
+function receiverSorted() {
+  const p: Circle[] = [{ r: 2 }]
+  const q: Circle[] = [{ r: 1 }]
+  const xss: Circle[][] = [p, q]
+  const out = xss.sorted(byR)
+  return out[0][0].r
+}
+
+function receiverReverse() {
+  const p: Circle[] = [{ r: 2 }]
+  const q: Circle[] = [{ r: 1 }]
+  const xss: Circle[][] = [p, q]
+  const out = xss.reverse()
+  return out[0][0].r
+}
+
+function receiverReduce() {
+  const p: Circle[] = [{ r: 1 }]
+  const xss: Circle[][] = [p]
+  return reduce(xss, total, 0)
+}
+
+function total(acc: i32, xs: Circle[]) { return acc + xs[0].r }
+
+print(mapIndexedResult())
+print(reduceAccumList())
+print(handMapResult())
+print(handReduceCallbackFirst())
+print(handReduceInitFirst())
+print(handCallbackParam())
+print(handTwoColumns())
+print(receiverSorted())
+print(receiverReverse())
+print(receiverReduce())

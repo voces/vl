@@ -318,8 +318,27 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   unions (each push minted its own heap type) is the degenerate twin and now
   emits once. The variant⇄struct-TABLE seam (a declared struct twin in a
   variant-arm position) stays nominal — chartered as repOf item (e), wanting
-  the #911 declared-twin gate at the variant resolvers. (structural slot dedup,
-  variant layer)
+  the #911 declared-twin gate at the variant resolvers. **That gate is now taken
+  at two resolvers and the pair is worth reading together, because it is ONE
+  predicate in two spellings.** `rlElemStructRow` declines for an element NAME the
+  variant table claims and the struct table does not (D32); `shapeNominalOfTy`
+  asks the variant table by ARENA IDENTITY (`variantRowOfTy`) where it already
+  asked the struct table that way (D33). Same rule, one keyed on the name and one
+  on the arena index, each placed AFTER its struct-table twin so struct-row
+  identity still wins where it exists. **What both are for is the same thing: a
+  NOMINAL question must not be settled by whichever STRUCTURAL rung happens to
+  fire first.** A layout twin is claimed by every structural rung by construction,
+  so rung ORDER was the whole answer in both — which is why neither fix is a
+  tightening of the structural matcher. No tightening could work: `repRowOfTyStruct`
+  and the field-set scans cannot tell `Circle` from `Dot`, and that is the point of
+  keeping the seam nominal rather than a shortcoming of theirs. The declines this
+  buys are exactly the ones the `tySame`-membership refusal below asks for.
+  **The residue is where NEITHER table owns the name**: an ANONYMOUS shape has no
+  declaration identity, both arena rungs correctly decline, and the structural
+  scans decide it with nothing to break the tie (D36). That is a real remaining
+  cell of the class and it is not reachable by a third rung of this shape — it
+  needs the seam to answer a question about a value with no nominal identity at
+  all. (structural slot dedup, variant layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
   LAYOUT table — two structurally-identical checker types can lower to DIFFERENT

@@ -244,52 +244,72 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `xfail-miscompile-list-elem-struct-twin.vl` is DELETED, which is that file's own written
 // instruction for the day it starts passing.
 //
-// THE SUCCESSOR WAS NOT LEFT TO BE RE-DERIVED, AND IT DID NOT COME FROM THE INVENTORY. The
-// note this paragraph replaces said D30 and D32 were the last two live rows and that there
-// might be no live member of the class left — which was true of the FILED rows and false of
-// the tree. The `std-api-reviewer` pass over D32's own retirement went looking for the cross
-// cell that retirement had no fixture for and found one. That is the third consecutive time
-// that review has produced the closing change's next piece of work — D26 from the ninth
-// retirement's review, D32's understatement from D26's, and a whole row from D32's — and only
-// the first and third of those are rows, which is the honest form of the pattern:
-// `silent-class-inventory.md` **D33** — a type parameter first
-// bound through a CALLBACK'S ANNOTATION resolving a union ARM onto a declared standalone
-// struct of that arm's exact layout. The constant below is its `mapIndexed` spelling
-// (`(T, i32) => Circle`); `reduce`'s accumulator at `A = Circle[]` is the same row and is
-// pinned beside it. The row was first written up as "the callback-RESULT position" and the
-// review's SECOND pass corrected it to the property, with the control that decides it: the
-// same `Circle[]` reaching a type parameter through the RECEIVER runs, twin and all.
+// THE D33 SPECIMEN THAT STOOD HERE — a type parameter FIRST BOUND through a CALLBACK'S
+// ANNOTATION resolving a union ARM onto a declared standalone struct of that arm's exact
+// layout — IS CLOSED, and it went the way its two predecessors did: the rule the fix needed
+// was already written and simply not consulted. `shapeNominalOfTy` maps a structural shape
+// back to a nominal NAME through four rungs, and only ONE of them was nominal by
+// construction (`structIndexOfTy`, the struct-table arena sidecar). Its twin —
+// `variantRowOfTy`, matching `uVarTyIx[i] == ty`, i.e. the arm DECLARATION's own identity —
+// existed, was documented as correct, and was not asked. Below it sat two STRUCTURAL
+// field-set scans, one per table, and a layout twin is claimed by both, so their fixed order
+// was the whole answer. Probed on the row's own witness: `arenaS=-1 arenaV=0 fsS=0 fsV=0`.
+// One rung, placed where D32 placed its own — after the arena struct rung, so struct identity
+// still wins where it exists. 34 of a 360-cell grid moved, 28 from check-clean invalid wasm
+// and 6 from a LOUD emit refusal (`std:array`'s last live carve-out, `A = Circle` beside an
+// exact twin, retired in the same predicate), and none moved backward. Graduated to
+// `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl` — ten cells including
+// both `reduce` parameter orders and the three RECEIVER controls that make the row a property
+// rather than a list of positions — and the two `xfail-miscompile-mono-*-twin.vl` pins are
+// DELETED, which is those files' own written instruction for the day they start passing.
 //
-// IT IS THE SAME FAMILY AS D32 AND A DIFFERENT RUNG, which is why D32's gate does not reach
-// it: the element NAME of the instance's minted `U[]` is not `Circle` at all — a probe at
-// `rlElemStructRow` reads `name=[Dot] arena=0 byname=0 canon=0 vi=-1`, so the monomorphizer's
-// substitution had already resolved `U`'s structural spelling onto the declared twin's
-// NOMINAL name, and every rung below is answering correctly for the name it was given.
-// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
-// diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref
-// $type), found (ref $type)`, and NO `emit error` marker — every property the three
-// assertions below need. Pre-existing and byte-identical on `a80c6717`. Pinned as
-// `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl`.
+// THE SUCCESSOR AGAIN DID NOT COME FROM THE INVENTORY, and this time it came from the GRID
+// built to close the predecessor. D33's 360-cell grid crossed (binding column x substituted
+// type x twin) and left 42 cells silent under BOTH compilers — flat across the twin axis,
+// which is what said they were a different root. Four rows came out of that residue and out
+// of the constructed controls beside it (`silent-class-inventory.md` D34-D37). The one below
+// is **D36**: an anonymous `{r: i32}` object literal in a LAMBDA's inferred LIST return, in a
+// module that declares BOTH a union arm of that layout and a standalone struct twin of it.
+// It needs no import and no generic, it is 14 lines, and it is byte-identical on `235b365b`
+// and on the D33 branch — a pin rather than a regression.
 //
-// THE STANDING NOTE ABOUT WHAT TO DO IF THE CLASS EMPTIES IS UNCHANGED AND WAS NEARLY NEEDED.
-// This test needs a program that type-checks clean and whose module the engine refuses, and
-// only a real miscompile is one — a synthesized module cannot come out of `vl check`. If the
-// class is genuinely empty, that is a decision to take deliberately (leave one row open with
-// the reason stated here, or retire these three assertions and say what replaced them), not
-// one to make by loosening `INVALID_MODULE_SRC` until something matches. What the last two
-// swaps add to that note is where to look BEFORE concluding it is empty: the inventory grades
-// only the rows someone filed, and the std review of the closing change has now out-produced
-// the inventory three times running.
-const INVALID_MODULE_SRC = `import { mapIndexed } from "std:array"\n` +
-  `\n` +
-  `type Circle = { r: i32 }\n` +
+// Its controls, each ONE line different and each measured rather than inherited: `Dot`
+// DELETED is LOUD (`emitProgram: field access but no struct type declared`), and deleting
+// `Sq`/`Shape` so `Circle` is not an arm RUNS and prints 7. So it needs BOTH tables to claim
+// the layout, which is the family resemblance to D32 and D33 — and it is a DIFFERENT rung
+// from both, because the shape here is ANONYMOUS: there is no declared arm being resolved
+// onto a twin, there is an inline literal being resolved onto an arm.
+//
+// Re-RUN against this tree at the swap rather than inherited, which is every property the
+// three assertions below need: `vl check` rc 0 with NO diagnostics at all — not even a hint —
+// `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref null $type), found
+// (ref $type)`, and NO `emit error` marker. Pinned as
+// `tests/cases/soundness/xfail-miscompile-lambda-list-anon-elem-arm-twin.vl`.
+//
+// THE STANDING NOTE ABOUT WHAT TO DO IF THE CLASS EMPTIES IS UNCHANGED. This test needs a
+// program that type-checks clean and whose module the engine refuses, and only a real
+// miscompile is one — a synthesized module cannot come out of `vl check`. If the class is
+// genuinely empty, that is a decision to take deliberately (leave one row open with the
+// reason stated here, or retire these three assertions and say what replaced them), not one
+// to make by loosening `INVALID_MODULE_SRC` until something matches. What the last three
+// swaps add is where to look BEFORE concluding it is empty: the inventory grades only the
+// rows someone filed; the std review of the closing change has out-produced it three times
+// running; and the GRID built to close a row is now the fourth source, having produced four
+// more rows than the row it was built for.
+const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
   `\n` +
-  `function mk(x: i32, i: i32): Circle { return { r: x + i } }\n` +
+  `function f() {\n` +
+  `  const g = (n: i32) => {\n` +
+  `    const o = [{ r: n }]\n` +
+  `    return o\n` +
+  `  }\n` +
+  `  return g(7)[0].r\n` +
+  `}\n` +
   `\n` +
-  `print(mapIndexed([1, 2], mk)[0].r)\n`;
+  `print(f())\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
