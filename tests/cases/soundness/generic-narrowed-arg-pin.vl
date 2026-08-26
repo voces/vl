@@ -1,0 +1,254 @@
+// @run
+// A NARROWED argument's type RIDES the monomorphization pin — `silent-class-inventory` D25,
+// and the ruling that closed it (`DECISIONS.md`, "which channel owns a narrowed argument's
+// type").
+//
+// TWO CHANNELS, ONE CALL. `pinned` (the pin NAMES, from `monoArgTyName`) and `pinTys` (the
+// ARGUMENT NODE's arena rows) are both per-parameter columns of one instance. The parameter
+// slot and the body's bindings were built from the NAME; the RETURN annotation's
+// substitution was built from the argument's ROW. Inside `if c is Circle` those two
+// disagree — the annotation is still `Circle | null`, the checker has already typed the
+// node `Circle` — so one instance was minted `(param (ref null $uVarHeap[vi])) (result (ref
+// $uVarHeap[vi]))`: `vl check` rc 0 and a module the engine refuses at load.
+//
+// THE INSTANCE REGISTRY IS KEYED ON THE NAMES ALONE, which is what made this an
+// ORDER-DEPENDENCE and not merely a wrong type. Two call sites that key to ONE instance
+// could demand two different ones, and whichever the walker reached first won — measured on
+// one program with two function declarations swapped (`owfWide`/`owfNarrow` against
+// `onfNarrow2`/`onfWide2` below, which is why both orders are here).
+//
+// THE RULING, in two rungs:
+//   1. the RESULT's substitution takes `letTyCol` — the same column the parameter slot and
+//      the body's bindings take — so an instance is a function of its registry key;
+//   2. a narrowed argument's pin NAME is the narrowed spelling, where the checker's
+//      recorded type renders a name that is one of the annotation's OWN members and that
+//      `monoAnnPinName` claims unchanged.
+//
+// Rung 2 is gated on MEMBERSHIP rather than taken outright because the node's render is
+// unreliable exactly where the annotation arms exist: a literal union softens to `string`,
+// a nominal `P` renders `{x:i32}`, a closure renders an arrow where the pin needs a
+// `$fnsig` marker. Pinning the render unconditionally moved 6 grid cells from a loud
+// outcome to a silent one and 21 from `runs` to invalid wasm; the membership gate moves
+// none. Where it declines (the nominal reps), rung 1 alone keeps the instance consistent.
+//
+// @hint Intentionally-unused parameter `_y` (leading `_` marks it unused)
+// @hint Intentionally-unused parameter `_x` (leading `_` marks it unused)
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+
+export function area(sh: Shape) {
+  if sh is Circle { return sh.r }
+  return 0
+}
+
+function idg<T>(x: T): T { return x }
+
+function two<T, U>(x: T, _y: U): T { return x }
+
+function dstGen<T>(_x: T, k: i32) { return k }
+
+function fwd<T>(x: T): T { return idg(x) }
+
+function mkc(): Circle | null { return { r: 5 } }
+
+// ── D25's own filed program: the `nulvariant` niche, narrowed, round-tripped ───
+// The pin read `Circle | null` and the result came back `Circle`. Both are now
+// `Circle` — the annotation a NON-generic `takeC(x: Circle): Circle` already lowers
+// end to end, argument coercion and result box included.
+function d25(c: Circle | null) {
+  if c is Circle { return area(idg(c)) }
+  return -1
+}
+
+// ── the same niche through every delivery the argument can arrive by ───────────
+function viaBinding(c: Circle | null) {
+  if c is Circle {
+    const b = c
+    return area(idg(b))
+  }
+  return -1
+}
+
+function viaNested(c: Circle | null) {
+  if c is Circle { return area(idg(idg(c))) }
+  return -1
+}
+
+function viaCallResult() {
+  const c = mkc()
+  if c is Circle { return area(idg(c)) }
+  return -1
+}
+
+// The RESULT's own onward positions — a field read and a binding, both of which were
+// `emitProgram: field access but no struct type declared` while the instance returned
+// the niche the checker had already narrowed away.
+function resultField(c: Circle | null) {
+  if c is Circle { return idg(c).r }
+  return -1
+}
+
+function resultBinding(c: Circle | null) {
+  if c is Circle {
+    const y = idg(c)
+    return y.r
+  }
+  return -1
+}
+
+// ── the NON-NULLABLE half: a UNION parameter narrowed to an ARM ────────────────
+// No nullability anywhere. The annotation channel says `Shape` (the union BOX), the
+// checker channel says `Circle` (the `(ref $uVarHeap[vi])` variant), and the two heap
+// types are both `(struct (field (mut i32)))` — which is why the engine's message reads
+// `expected (ref $type), found (ref $type)`.
+function unionArm(sh: Shape) {
+  if sh is Circle { return area(idg(sh)) }
+  return -1
+}
+
+// The narrow and the WIDE use in one body, narrowed site FIRST. Under the old column
+// the second call registry-hit the first's instance and inherited its result.
+function unionArmElse(sh: Shape) {
+  if sh is Circle { return area(idg(sh)) }
+  return area(idg(sh))
+}
+
+// The narrowed value handed on at the WIDE type inside the narrow.
+function unionArmRewiden(sh: Shape) {
+  if sh is Circle {
+    const w: Shape = idg(sh)
+    return area(w)
+  }
+  return -1
+}
+
+// ── THE ORDER PROBE, both ways round ──────────────────────────────────────────
+// One program, two declaration orders. Wide-first ran and narrow-first did not; the
+// key (`Shape`) is identical in both, so nothing about the call sites distinguishes
+// them except which one the walker reached first.
+function owfWide(sh: Shape) { return area(idg(sh)) }
+function owfNarrow(sh: Shape) {
+  if sh is Circle { return area(idg(sh)) }
+  return -1
+}
+function onfNarrow2(sh: Shape) {
+  if sh is Circle { return two(area(idg(sh)), 1) }
+  return -1
+}
+function onfWide2(sh: Shape) { return two(area(idg(sh)), 1) }
+
+// ── the OTHER REPS, narrowed by `!= null` ─────────────────────────────────────
+type P = { x: i32 }
+
+function nulStruct(p: P | null) {
+  if p != null { return idg(p).x }
+  return -1
+}
+
+function nulString(s: string | null) {
+  if s != null { return idg(s).length }
+  return -1
+}
+
+function nulI32(n: i32 | null) {
+  if n != null { return idg(n) + 0 }
+  return -1
+}
+
+function nulScalarList(xs: i32[] | null) {
+  if xs != null { return idg(xs)[0] }
+  return -1
+}
+
+function nulMap(m: {[string]: i32} | null) {
+  if m != null { return idg(m).size }
+  return -1
+}
+
+function mk5(): {[string]: i32} {
+  const m = Map()
+  m["a"] = 5
+  return m
+}
+
+// ── the CALLEE axis: two type parameters, a forwarder, a non-result-bearing pin ─
+function twoParams(c: Circle | null) {
+  if c is Circle { return area(two(c, 1)) }
+  return -1
+}
+
+function forwarded(c: Circle | null) {
+  if c is Circle { return area(fwd(c)) }
+  return -1
+}
+
+function notInResult(c: Circle | null) {
+  if c is Circle { return dstGen(c, 7) }
+  return -1
+}
+
+// ── CONTROLS: the `| null` still RIDES the pin where nothing narrowed it ───────
+// `mono-nullable-arg-pin.vl` is the fixture for this half; these two cells are here
+// because rung 2 must not fire without a narrow, and because both instances of ONE
+// generic have to coexist in ONE program.
+function unnarrowed(c: Circle | null) {
+  const y = idg(c)
+  if y is Circle { return y.r }
+  return -1
+}
+
+function bothInstances(c: Circle | null) {
+  // the narrowed instance (`Circle`) and the wide one (`Circle | null`), one program
+  if c is Circle { return area(idg(c)) + unnarrowed(mkc()) }
+  return -1
+}
+
+// @log 5
+print(d25(mkc()))
+// @log 5
+print(viaBinding({ r: 5 }))
+// @log 5
+print(viaNested({ r: 5 }))
+// @log 5
+print(viaCallResult())
+// @log 5
+print(resultField({ r: 5 }))
+// @log 5
+print(resultBinding({ r: 5 }))
+// @log 5
+print(unionArm({ r: 5 }))
+// @log 0
+print(unionArmElse({ s: 9 }))
+// @log 5
+print(unionArmRewiden({ r: 5 }))
+// @log 5
+print(owfNarrow({ r: 5 }))
+// @log 0
+print(owfWide({ s: 9 }))
+// @log 5
+print(onfNarrow2({ r: 5 }))
+// @log 0
+print(onfWide2({ s: 9 }))
+// @log 5
+print(nulStruct({ x: 5 }))
+// @log 5
+print(nulString("hello"))
+// @log 5
+print(nulI32(5))
+// @log 5
+print(nulScalarList([5]))
+// @log 1
+print(nulMap(mk5()))
+// @log 5
+print(twoParams({ r: 5 }))
+// @log 5
+print(forwarded({ r: 5 }))
+// @log 7
+print(notInResult({ r: 5 }))
+// @log 5
+print(unnarrowed(mkc()))
+// @log -1
+print(unnarrowed(null))
+// @log 10
+print(bothInstances({ r: 5 }))

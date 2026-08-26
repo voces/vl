@@ -52,10 +52,11 @@ repro rather than a paraphrase:**
 | D20 | loud emit reject | **NEW 2026-08-25** — filed while closing D14. Its `capture` leg WAS D9 and is closed; **264 cells remain** at `loopvar` + `mapval`, and the repro is re-filed on `loopvar`. Three legs, three sites — proven by D9's fix reaching exactly one |
 | D21 | loud emit reject | **NEW 2026-08-25** — filed while closing D9: the one capture BINDING FORM its fix does not reach (an un-annotated local), 168 of a 728-cell population, flat across every rep |
 | D22 D23 D24 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the `nulvariant` CALL-BOUNDARY class. THREE roots at three layers, separated by an ABLATION and not by argument — a missing BOX, a misplaced one failing in the opposite direction at the same seam, and the monomorphizer's pin a whole layer earlier) |
-| D25 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the specimen hunt that closed the three above: a NARROWED argument's type does not ride the monomorphization pin. Needs a ruling on which channel owns it, not an arm |
+| D25 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the ruling is in `DECISIONS.md`. The row named ONE cell and a 187-cell grid found **53**: neither filed option won — the argument-node channel moved 6 cells loud→silent, the annotation channel left 8. Two rungs, 0 silent) |
 | D26 | check-clean invalid wasm | **NEW 2026-08-26** — filed by the `std-api-reviewer` pass over D24's retirement: a UNION accumulator and a MEMBER-STRUCT accumulator, two `reduce` instances in ONE program. No narrowing, no nullability — the heap-type TWIN at a monomorphized instance's result |
 | D27 D28 D29 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root — `fnAssignKindGuard`, a five-entry decline list whose `null` restored the caller's `i32` default. Four of its five recorded reasons were false and the fifth named a condition that was already available. The guard is deleted; 220 cells of three grids moved, every one forward) |
 | D30 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D27/D28/D29 by the if-arm-join grid that closed them: the CALLER's view of an inferred ref-valued map return, 16 cells the same change could not reach from the callee side |
+| D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -2014,8 +2015,8 @@ with D22. `std/array.vl`'s live-`reduce`-cell paragraph is retired.
 
 ---
 
-### D25 — a NARROWED argument's type does not ride the monomorphization pin
-**check-clean invalid wasm · filed 2026-08-26 by the specimen hunt that followed D22/D23/D24 · pre-existing, measured ON THE FILED FILE against the parent commit (rc 0 / rc 1 there too, with the pin's older `expected (ref $type), found i32`)**
+### D25 — [CLOSED 2026-08-26] a NARROWED argument's type does not ride the monomorphization pin
+**CLOSED 2026-08-26 — the repro RUNS (prints 5). Was: check-clean invalid wasm · filed 2026-08-26 by the specimen hunt that followed D22/D23/D24 · pre-existing, measured ON THE FILED FILE against the parent commit (rc 0 / rc 1 there too, with the pin's older `expected (ref $type), found i32`)**
 
 Repro:
 
@@ -2069,6 +2070,65 @@ same narrowed value handed to a generic that does not return it (`dstGen<T>(x: T
   $type)` at 0xe4. Same cell, same silence, one rung along.
 * Pinned as `tests/cases/soundness/xfail-miscompile-generic-roundtrip-nulvariant.vl` and it is
   `tests/vl_check_codegen_test.ts`'s live `INVALID_MODULE_SRC` specimen — the ninth.
+
+**CLOSED 2026-08-26, AND THE RULING IS IN `DECISIONS.md`** ("which channel owns a NARROWED
+argument's type at a monomorphization pin"). Read it there; what belongs here is the size of
+the row and what it cost to grade.
+
+**THE ROW NAMED ONE CELL AND THE GRID FOUND 53.** A 187-cell grid over generic-call shapes —
+type parameter in the result vs not · `is` / `!= null` / no narrow · fifteen argument reps ·
+six deliveries · four callee shapes — graded on the real outcome vocabulary:
+
+| | runs | loud check | loud emit | check-clean INVALID WASM | blockers (loud→silent) |
+|---|---|---|---|---|---|
+| master | 94 | 33 | 7 | **53** | — |
+| (a) the annotation owns it | 134 | 33 | 12 | **8** | 0 |
+| (b) the argument node owns it | 98 | 33 | 10 | **46** | **6** |
+| (c) shipped | **146** | 33 | 8 | **0** | 0 |
+
+* **THE `nulvariant` NICHE IS NOT THE AXIS.** `P | null`, `P[] | null`, `i32[] | null`,
+  `string | null`, `i32 | null`, `f64 | null`, `{[K]:V} | null` and a nullable CLOSURE all sit
+  in the same 53, and so does a shape with no nullability at all: a `Shape` PARAMETER narrowed
+  to the ARM `Circle` (`expected (ref $type), found (ref $type)` — the union BOX against the
+  variant row).
+* **IT WAS AN ORDER DEPENDENCE.** The registry is keyed on the pin NAMES; the RESULT was
+  substituted through the argument NODE's arena row, which the key does not carry. One
+  program, two function declarations swapped, nothing else changed: wide-call-first RUNS,
+  narrow-call-first is check-clean invalid wasm. The `Circle | null` twin moves between
+  running and a loud emit failure the same way. Both orders are in the graduated fixture.
+* **OPTION (b) IS DISQUALIFIED BY MEASUREMENT, NOT BY TASTE** — 6 cells loud→silent, which is
+  the blocker rule, plus 21 `runs`→invalid-wasm. Its breakage is exactly where this row
+  warned the node type is unreliable: a literal union's render softens to `string`, a nominal
+  `P` renders `{r:i32}`, a closure renders an arrow where the pin needs a `$fnsig` marker.
+* **WHAT SHIPPED IS TWO RUNGS**: the instance's RESULT substitutes through the same column its
+  parameter slot and body bindings take (so an instance is a function of its key), and a
+  narrowed argument pins the NARROWED spelling where that spelling is a top-level MEMBER of
+  the annotation's own union/nullable spelling and `monoAnnPinName` echoes it back unchanged.
+  The membership gate is what admits the narrow and excludes (b)'s breakage by construction.
+* **THE SAFETY PROPERTY WAS MEASURED, NOT ASSUMED.** A pin becomes the instance's parameter
+  annotation, so the question is whether a NON-generic function with that annotation already
+  lowers the same program. `function takeN(x: N): N` called with a `W` value narrowed to `N`
+  RUNS ON MASTER for all ten reps in the grid — the call boundary emits the `ref.as_non_null`
+  and the result is boxed for a union consumer. Pinning the WIDE spelling is equally legal and
+  lands the RESULT off that path, which is the whole of option (a)'s residue.
+* **FIVE CELLS ARE NOW LOUD RATHER THAN RUNNING**, and that is the intended floor: a narrowed
+  `P[] | null` and a narrowed nullable CLOSURE whose generic RESULT is then indexed / called
+  give `emitProgram: field access receiver is not a struct` and `emitProgram: callee is not a
+  function name`. Both were check-clean invalid wasm before.
+* **IT ROUTED A CORPUS CONTROL ONTO A SEPARATE ROOT, WHICH IS FILED AS D31 AND FIXED IN THE
+  SAME COMMIT.** Closing the pin put `generics/mono-nullable-arg-pin.vl`'s own `narrowed`
+  control on a generics-free master defect — a call ARGUMENT inheriting the enclosing
+  RETURN's nullable expectation. The two are independent (D31's witness has no generic in
+  it) and neither closes the other; they ship together only because the corpus reaches D31
+  through D25's fix.
+* **RE-MEASURED ON `d26c4421`** after #1938 closed D27/D28/D29 by deleting `fnAssignKindGuard`,
+  since that change touched `wasmEmit.vl`'s nullable-string return seeding, which is adjacent
+  to D31's fix. The whole 187-cell grid is **byte-identical at both baselines**: 53 silent on
+  `c99838a8` and 53 silent on `d26c4421`, 0 cells moved between them, and 0 silent with the
+  fix at either. The five loud-floor cells below are the same five, with the same messages.
+* Retired: `xfail-miscompile-generic-roundtrip-nulvariant.vl`. Graduated:
+  `tests/cases/soundness/generic-narrowed-arg-pin.vl` (24 cells). `INVALID_MODULE_SRC` moved
+  to D26 — see that row.
 
 ---
 
@@ -2137,8 +2197,11 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   runs; the union instance is what makes `Circle` resolve through `uVarHeap` at one end.
   This is precisely the interaction a single-instance grid cannot see, and it is the third
   time `std/array.vl`'s ledger has recorded a diagonal standing in for a cross product.
-* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid
-  module", and the class already has its live specimen in D25.
+* **PINNED 2026-08-26, AND IT IS NOW THE LIVE SPECIMEN.** D25 closed, so this row inherited
+  `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC` — the tenth. Its file is
+  `tests/cases/soundness/xfail-miscompile-reduce-union-and-member-struct-accum.vl`
+  (`@no-instantiate`), and the row was re-run verbatim against the D25 fix first: identical
+  rejection, identical offset 0x29e, so the pin closure did not move it.
   `tests/cases/std/array-reduce-narrowed-variant-init.vl` instantiates `reduce` at four
   accumulator types on purpose and says in its header which fifth one is missing and why.
 
@@ -2436,6 +2499,49 @@ the only change, correct.
   function being asked about does not: `let g = h()` beside `function h() { g = h() }` would
   recur without bound. The existing cycle through `mapRetExprShape` has no such leg. Needs a
   visited-set or a depth bound, which is a separate change with its own witness.
+
+---
+
+### D31 — [CLOSED 2026-08-26] a call ARGUMENT inherits the enclosing RETURN's nullable expectation
+**CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · filed 2026-08-26 by D25's grid, which routed `generics/mono-nullable-arg-pin.vl`'s own `narrowed` control onto it · pre-existing, measured on this exact program against master's compiler**
+
+Repro:
+
+    function takeS(x: string): string { return x }
+    function narrowed(x: string | null): string | null {
+      if x != null { return takeS(x) }
+      return null
+    }
+    print(1)
+    // vl check rc 0, no diagnostic at any severity; the engine refuses the module:
+    //   type mismatch: expected (ref $type), found (ref null $type)
+
+Control — the SAME call in the SAME function with a CONCRETE enclosing return, the only
+change, and it prints `1`:
+
+    function narrowed(x: string | null): string { … return "zz" }
+
+Two more that run, isolating the axis: the call taken through a binding
+(`const y = takeS(x); return y`), and the call not in return position (`return takeS(x).length`).
+
+* **NO GENERICS ANYWHERE**, which is what separates it from D25. The callee is an ordinary
+  function; the two boundaries are its PARAMETER and the CALLER's RETURN.
+* **`expCtxHere()` SNAPSHOTS THE AMBIENT SEEDS.** `emitDirectCall` builds each argument's
+  context from it, and at a `return f(x)` those seeds are the RETURN boundary's. The four
+  nullable seeds were set only ever TO TRUE — `if cParamNulString { argCtx.nulString = true }`
+  — never cleared, so a `string | null` RESULT expectation reached the ARGUMENT of a call whose
+  parameter is a plain `string`, and the narrowed value kept its `(ref null $s)` rep under a
+  `(ref $s)` param.
+* **THE ONE-BIT DIFF IS THE WITNESS**, not an inference from the message: disassembled, the
+  concrete-return control carries `local.get 0 ; ref.as_non_null ; return_call` and the filed
+  shape carries `local.get 0 ; return_call`, on the same argument of the same call to the same
+  function.
+* **THE FIX IS ASSIGNMENT, NOT AN OR.** All four seeds (`nulBool`, `nulString`, `nulClosure`,
+  `nulList`) now take the PARAMETER's answer and only the parameter's. The other four reps
+  (`struct`, non-null list, `closure`, `variant`) already had their own explicit recover arms
+  below; the seeded four had none because the seed was supposed to BE the answer.
+* Graduated: `tests/cases/soundness/nullable-return-arg-seed.vl`. It reproduces on the parent
+  commit and runs on this one.
 
 ---
 
