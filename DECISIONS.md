@@ -803,3 +803,126 @@ instance consistent — which is why the two rungs ship together and neither is 
   nullable closure whose generic RESULT is then indexed / called. Both are honest emit
   refusals (`field access receiver is not a struct`, `callee is not a function name`), both
   were check-clean invalid wasm before, and a loud floor beats a wrong instance.
+
+## A REFUSAL the checker holds must ride the pin, and a deferred constraint belongs to ONE body
+
+**A rule enforced at `vl check` and lost at monomorphization is not a rule — it is a rule
+about spellings.** `checkBinary`'s equality arm asks two questions of the operands
+(`isEquatable`, `eqCmpKindOfTy`); of a `T` they answer "equatable" and "OPAQUE", which is
+correct about a type VARIABLE and useless about the instance. Nothing re-asked once the pin
+was known, so `xs.indexOf(n)` over a `Circle[][]` was `vl check` rc 0 over a module the engine
+refuses while the identical `a == b` was a clean checker error. (D35, #1946)
+
+This is the third instance in three days of one shape — **information present at one layer and
+silently dropped at the next** — after D25's "an instance is a function of its registry key"
+and #1938's "a classifier's no-answer sentinel is not neutral when the caller has a default".
+The transferable form: **when a checker rule consults a TYPE, ask what it answers for a type
+VARIABLE, and whether anything asks again at the pin.** An answer that is merely *true* of a
+`TyVar` is not an answer about the instance.
+
+### Where the question is asked, and why not at emit
+
+At the CALL SITE, through the deferred binary-op constraint (`noteBinCstr` /
+`validateBinCstrs` / `binOpDefinedFor`) that already carried exactly this shape of question
+from a generic body to its callers — its `==` arm asked only mutual compatibility, and now
+asks both gates off one home (`eqRefusals`) that `checkBinary` also calls. The alternative was
+a check inside `emit_mono`, which reaches the same programs; it was rejected because **`vl
+check` is what an editor runs**, and a soundness rule that only the CLI's run path states is
+invisible where the code is written. It also keeps ONE home: two places answering "is this
+comparable" is the two-guesses shape the `eqCmpKindOfTy` header was written to end.
+
+### The constraint list was a global keyed on a NAME, and that was already a defect
+
+`substTyDeep` matches TyVars by name, so an unscoped constraint list makes every `<T>` in the
+program one namespace. On master, `function addT<T>(a: T, b: T) { return a + b }` anywhere in
+a file made `idT(c)` — a generic that adds nothing — report `operator '+' is not defined for
+Circle and Circle`. **A false reject that predates this change, and the reason the equality
+gate could not be stated without fixing it**: `indexOf`'s `self[i] == needle` would otherwise
+have refused `xs.reverse()` over the same receiver.
+
+Constraints now carry the DECLARATION that recorded them, and a call adjudicates only its own
+callee's. A call site knows its callee to three degrees and each gets its own answer:
+
+* a **declared** callee adjudicates its own body's constraints;
+* a callee with **no declaration** consults everything, as before — but must not RE-RECORD.
+  `validateBinCstrs` re-records a partially-substituted constraint under the hole it lands on,
+  stamping the body it stands in as the new owner; with the whole list in scope, a HOF's inner
+  `f(self[i], i)` re-recorded a sibling generic's `T == T` onto the HOF's own `T`, which is how
+  `xs.mapIndexed(toI)` came to report `==` over an element type nothing in the program
+  compares. **The re-deferral inherits the scoping bug of whatever it re-records**, so a fix
+  that scopes only the direct read leaves the leak intact one hop away — and, symmetrically, a
+  fix that scopes the read too far breaks something else (below);
+* **no callee at all** — `genericFnAssignable` instantiates a function VALUE from its TYPE —
+  consults everything, unchanged.
+
+An owner-less constraint (module scope) always applies, so the scoping can only remove
+cross-generic false rejects, never silence one that fires today.
+
+### The callee's own DELIVERY is an axis, and holding it constant cost a round
+
+The first draft scoped the unnamed callee to the ENCLOSING BODY, on the reasoning that a name
+with no declaration is a closure parameter whose holes are the enclosing generic's own. **That
+reasoning is persuasive and false**: it is also `const f = addT  f(c, c)`, where the holes are
+`addT`'s, and the draft turned a loud `operator '+' is not defined for Circle and Circle` into
+check-clean invalid wasm — a loud→silent move produced by the fix for loud→silent moves.
+
+It survived a 1514-cell grid, because that grid crossed the NEEDLE's delivery and the
+RECEIVER's delivery at five values each and spelled the callee `f(x)` in every cell.
+**Enumerate the delivery of everything a call site names, not just the arguments.** The rule
+that shipped withholds only the re-record from an unnamed callee, which is the narrower thing
+the HOF case actually needed; the callee axis is now in the grid and in
+`tests/cases/generics/error-deferred-constraint-true-positives.vl`.
+
+### `validateBinCstrs` reached only the direct-call spelling
+
+`xs.indexOf(nd)` never reached it. The same asymmetry the `u8[]`-meets-a-generic rule had, for
+the same reason: **`self` arrives AHEAD of the argument loop the rule sits in.** Any rule
+placed in that loop must be placed twice, and the UFCS half is now there.
+
+### The measurement, and the one direction that needed defending
+
+1712 cells, re-measured cell-for-cell after #1945 merged and identical in every column (T
+binding × equatability of `T` over the rep vocabulary the grid enumerated × operation × route ×
+needle delivery × receiver delivery × callee delivery × alias-vs-spelled-out). 225 moved, **0
+genuine loud→silent**: 132 `check-clean invalid wasm → loud check reject`, 49 `loud emit → loud
+check` (the same refusal one stage earlier), 18 `runs → loud check`, and 26 that LEFT a loud
+outcome — every one of those the cross-generic false reject being removed, each with a master
+diagnostic of `operator '+' is not defined for X and X` from a sibling generic the cell never
+calls at that type, and each confirmed by deleting that sibling and re-running master.
+
+The 18 are all `T = ("a"|"b")[]`, the cell D35 itself called its sharpest, and they are the
+point rather than the cost. **A program that works because the emitter happens to hold a
+comparison for one rep, while the checker refuses the identical comparison spelled out, is
+relying on a coincidence one rep table away from changing.** The direct spelling has always
+been `K[] isn't equatable`; the pin now says the same. `std/array.vl`'s ledger records this as
+its first entry cleared by making a spelling LOUDER.
+
+### The message goes in FRONT of the refusal, not behind it
+
+The pin reports the direct spelling's sentence verbatim, so the two are greppable as one rule
+— but the attribution is a PREFIX (`` `indexOf` compares its type parameter with `==` here: ``)
+rather than the suffix the generic operator message uses. The reader is standing at
+`xs.indexOf(n)`: they wrote no `==` and no `Circle[]`. The generic sentence can take
+` (the call's argument types)` behind it because it ENDS on the two types; the equatability one
+ends on a remedy clause (`— define a `==` operator for it`), and a suffix after that reads as
+an instruction to define the operator *for the call's argument types*.
+
+### What this does NOT reach, measured rather than assumed
+
+* A NULLABLE `T` whose compare the checker ACCEPTS and correctly lowers — `string | null`,
+  `i32[] | null` — is D35's MIRROR and is untouched: `eqCmpKindOfTy` answers `"nulstr"` /
+  `"nullist"`, a compare core exists, the direct spelling runs and is right. There is no
+  refusal to lose, so `eqRefusals` is correct to stay silent; the defect is that the PIN drops
+  an acceptance. **D42**, 96 cells.
+* **Whether the refusal being propagated is itself right.** For `T = ("a"|"b")[]` its first
+  sentence says "a field is not value-comparable", and the field is `K` — `K == K` runs and is
+  correct, as does `string[] == string[]`. So D35's close makes the pin state a refusal that is
+  over-broad about its own reason, and the 18 cells it costs are not purely a caller's luck.
+  **The fix is still the right call** — two spellings of one call answering with two severities
+  is not a capability, and the silent answer was the permissive one — but the other half is
+  filed as **D45** rather than absorbed into a sentence about coincidence.
+* **The remedy clause it prints.** `— define a `==` operator for it` cannot be followed: a
+  `function "=="` declaration parses, type-checks, and is silently discarded. **D46.** Left
+  alone here on purpose: the clause lives in `eqRefusals`, the ONE home, so changing it changes
+  both spellings, and choosing between "implement the dispatch" and "delete the clause" is a
+  language-design call rather than a rider on this one.
