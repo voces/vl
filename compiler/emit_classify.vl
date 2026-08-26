@@ -4022,14 +4022,27 @@ export function nulRefMapValInnerOf(valName: string): string {
   // nullable-value map. A top-level arrow on the RAW member would be a function RETURNING a
   // nullable (never produced by `splitUnionAtoms`, which only yields depth-0 `|` members).
   if annArrowAt(peelGroupParens(inner)) >= 0 { return inner }
-  // A LIST member (`{f: f64}[] | null`) has NO niche rep yet — the vals slot would need
-  // the list's WRAPPER element, not the element struct's. Excluded BEFORE the struct
-  // probe: `structIndexByValName`'s field-name parse ignores the trailing `[]`, so
-  // `{f: f64}[]` matched the ELEMENT struct `{f: f64}` and the slot minted kind 1 —
-  // the list store then pushed a `(ref $rlWrap)` into a `(ref null $struct)` vals
-  // element, INVALID-WASM (fuzz frontier seed 615401451 d6 --branching, p2c
-  // `{[string]: {f: f64}[] | null}`). Returning "" keeps the -3 loud-reject path.
-  if nameIsArray(inner) { return "" }
+  // A LIST member (`i32[] | null`, `{f: f64}[] | null`) rides the SAME vals rep its
+  // non-null twin does — a ref-valued map's vals element is `(ref null <elem>)` for every
+  // value kind, which is what lets a MISS read as null — so the niche needs no new slot
+  // shape, only the WRAPPER element rather than the element struct's.
+  //
+  // ANSWERED HERE, ABOVE THE STRUCT PROBE, AND THE ORDER IS THE WHOLE POINT:
+  // `structIndexByValName`'s field-name parse ignores a trailing `[]`, so `{f: f64}[]`
+  // matches the ELEMENT struct `{f: f64}` and would mint a kind-1 slot — the list store
+  // then pushes a `(ref $rlWrap)` into a `(ref null $struct)` vals element, INVALID WASM
+  // at `vl check` rc 0 (fuzz frontier seed 615401451 d6 --branching, p2c
+  // `{[string]: {f: f64}[] | null}`, pinned by
+  // `tests/cases/maps/nullable-struct-list-valued-map.vl`).
+  //
+  // The two predicates are `mvValKindOfName`'s own kind-6 pair, so the niche covers
+  // exactly the element reps the non-null value covers and no more: a `u8[] | null`
+  // value matches neither and keeps the -3 loud reject.
+  if nameIsArray(inner) {
+    if scalarListKindOfName(inner) >= 0 { return inner }
+    if nameIsRefArray(inner) { return inner }
+    return ""
+  }
   if structIndexByValName(inner) >= 0 { return inner }
   ""
 }
@@ -4178,9 +4191,9 @@ function mvValLowersTy(ty: i32): i32 {
   // Chosen by census, like B186: 8 of the 15 remaining sites are plain 2- and 3-member unions.
   // A NULLABLE map value with a single REF inner — the `nulRefMapValInnerOf` branch of the
   // guard, which is a LOWERING branch, not a rejecting one: a string inner is kind 3, a map
-  // inner 6, and anything else with a ref inner is kind 1 (the niche rides its non-null twin's
-  // vals rep). Only two shapes in that branch reject, and BOTH are excluded here rather than
-  // reproduced:
+  // or LIST inner 6, and anything else with a ref inner is kind 1 (the niche rides its
+  // non-null twin's vals rep). Only two shapes in that branch reject, and BOTH are excluded
+  // here rather than reproduced:
   //
   //   · a CLOSURE inner whose RESULT is a literal union (-3) — deciding it needs the arrow's
   //     return spelling, so `TyFunc` is left out entirely
@@ -4310,10 +4323,11 @@ export function mvValKindOfName(valName: string): i32 {
   //     (`{f: {[string]: f64}} | {w: i32} | null`) is a BOX union: `null` boxes as
   //     the null-tagged box at the store (`emitUnionCoerce`'s NullLit arm), so the
   //     vals element itself is never null — it falls to the union arm below.
-  //   · a SINGLE list / closure / bare-string member + null has no nullable-value
-  //     rep yet (`string | null` is not a value union — no box is ever minted; a
-  //     list/closure niche needs its own wrapper slot): reject loudly at every op
-  //     site, never invalid wasm.
+  //   · a SINGLE LIST member + null joins the first bullet: the vals element is the list
+  //     WRAPPER ref and it is `(ref null <wrapper>)` already, so the niche rides its
+  //     non-null twin exactly as the struct and map ones do. The remainder is a list whose
+  //     ELEMENT rep this ladder's kind-6 pair does not name (`u8[] | null`), which rejects
+  //     loudly at every op site, never invalid wasm.
   if unionSetHasNull(valName) {
     const nin = nulRefMapValInnerOf(valName)
     if nin != "" {
@@ -4340,6 +4354,14 @@ export function mvValKindOfName(valName: string): i32 {
         if nameIsLitUnionType(nret.slice(nri, nret.length)) { return -3 }
         return 14
       }
+      // A NULLABLE LIST value (`{[string]: f64[] | null}`, `{[string]: S[] | null}`): kind 6,
+      // the SAME kind the non-null list value gets — the vals element is the list WRAPPER
+      // ref and it is already `(ref null <wrapper>)`, so a stored `null` is `ref.null` of
+      // that wrapper and the read binds the matching nullable list local. The two
+      // predicates are this ladder's own kind-6 pair below, so the niche and its non-null
+      // twin cover the same element reps.
+      if scalarListKindOfName(nin) >= 0 { return 6 }
+      if nameIsRefArray(nin) { return 6 }
       return 1
     }
     const nulAtoms: string[] = []
@@ -4884,6 +4906,26 @@ export function mvListValKind(slot: i32): VKind | null {
     return "reflist" // struct-list value → a ref list
   }
   return null
+}
+
+// The NICHE twin of `mvListValKind` — the nullable VKind a `{[K]: T[] | null}` value binds,
+// or null when the slot's value is not a list. Composed on `mvListValKind` rather than
+// re-reading `rlElemKindTbl`, so the element-kind→rep mapping has one home and the two
+// answers can never name different backings.
+//
+// The consumer is the `.values()` loop var, and it is HALF of a pair: the loop var binds the
+// niche here and `emitForInStmt` must leave the element read RAW. The two move together — a
+// niche kind whose element is still recovered non-null is check-clean invalid wasm, and a
+// non-null kind over a slot that stores null TRAPS on the stored null.
+export function mvNulListValKind(slot: i32): VKind | null {
+  const k = mvListValKind(slot)
+  if k == "list" { return "nullist" }
+  if k == "strlist" { return "nulstrlist" }
+  if k == "f64list" { return "nulf64list" }
+  if k == "i64list" { return "nuli64list" }
+  if k == "f32list" { return "nulf32list" }
+  if k == "reflist" { return "nulreflist" }
+  null
 }
 
 // The mv slot of a `m[k]` / `m[k] ?? d` read over a struct-LIST-valued map (the value is a
@@ -7543,9 +7585,13 @@ export function mvValNulRefNicheAt(slot: i32): i32 {
   }
   if it is TyMap { return 1 }
   if it is TyFunc { return 1 }
-  // A LIST member has no niche rep (the vals slot would need the list WRAPPER) — the
-  // name path excludes it BEFORE its struct probe, and so does this.
-  if it is TyArray { return 0 }
+  // A LIST member IS a niche now, but only for the element reps the name path's kind-6 pair
+  // names (`scalarListKindOfName` / `nameIsRefArray`) — a `u8[] | null` value is still the
+  // loud reject. That distinction lives in INTERN STATE and in the array-name grammar, not
+  // in the shape, so this DECLINES rather than reproducing it: -1 keeps the caller on the
+  // rendered-name test, which is the one that already knows the answer. Claiming 1 here
+  // would make the arena and the name path disagree for exactly the shape that rejects.
+  if it is TyArray { return -1 }
   if it is TyObj {
     if structIndexOfTy(inner) >= 0 { return 1 }
     return -1
@@ -11015,7 +11061,16 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
             // VALUE LIST, exactly as a nested-array `for row in g` over `i32[][]` does — its
             // loop-var kind is the value-list's rep (`mvListValKind` → 2/7/12/20/21, or 5 for a
             // struct/ref list). The `#l` temp is the vals ref-list wrapper (`forInMapValsSlot`).
-            if mvValKind[vsl] == 6 { return mvListValKind(vsl) }
+            // A NULLABLE list value (`{[string]: f64[] | null}`) rides the same vals list its
+            // non-null twin does — the vals element slot is `(ref null $wrapper)` either way —
+            // so only the LOOP VAR differs: the niche kind, exactly as `const v = m[k]` binds.
+            // The non-null loop var recovers each element `ref.as_non_null` and would TRAP on a
+            // stored null, and its `v != null` finds no nullable rep to test. The `nulstr` and
+            // `nulstruct` arms above state the same rule for the other two value families.
+            if mvValKind[vsl] == 6 {
+              if mvSlotNullable(vsl) { return mvNulListValKind(vsl) }
+              return mvListValKind(vsl)
+            }
             // A UNION-BOX value (`{[string]: i32 | null}`, `{[string]: C | S}`, a numeric
             // litunion `{[string]: 1 | 2 | null}`): the vals element IS `$uBox`, so the loop
             // var binds as a kind-4 union-box local — the SAME arm the ref-list ladder below
@@ -11083,10 +11138,25 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       if rlElemIsNulNiche(rslot) { return "nullist" }
       return "list"
     }
-    if rlElemKindTbl[rslot] == 6 { return "strlist" }
-    if rlElemKindTbl[rslot] == 7 { return "f64list" }
-    if rlElemKindTbl[rslot] == 8 { return "i64list" }
+    // The four DISTINCT-BACKING inner lists (`string[][]` 6 / `f64[][]` 7 / `i64[][]` 8 /
+    // `f32[][]` 10). A `(T[] | null)[]` element keeps the `| null` in its slot exactly as the
+    // kind-4 niche above does, so the loop var is the matching nullable-list kind — the same
+    // rep `const e = xs[i]` binds. `emitForInStmt` must leave these elements RAW (no
+    // `ref.as_non_null`), which is why the niche kinds are absent from its recover set.
+    if rlElemKindTbl[rslot] == 6 {
+      if rlElemIsNulNiche(rslot) { return "nulstrlist" }
+      return "strlist"
+    }
+    if rlElemKindTbl[rslot] == 7 {
+      if rlElemIsNulNiche(rslot) { return "nulf64list" }
+      return "f64list"
+    }
+    if rlElemKindTbl[rslot] == 8 {
+      if rlElemIsNulNiche(rslot) { return "nuli64list" }
+      return "i64list"
+    }
     if rlElemKindTbl[rslot] == 10 {
+      if rlElemIsNulNiche(rslot) { return "nulf32list" }
       return "f32list" // f32-inner list -> an f32-list local (kind 21)
     }
     // A CLOSURE-element ref list (`((i32) => i32)[]`, element kind 5): the loop var binds as a
@@ -11098,7 +11168,11 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
     // INNER REF LIST — a kind-5 ref-list local carrying the inner slot. `for row in g { … row[j]
     // … }` then indexes/iterates it. The element read recovers the inner wrapper non-null; the
     // `#l` temp is the outer ref-list wrapper. Recurses (the inner slot may itself be kind 9).
-    if rlElemKindTbl[rslot] == 9 { return "reflist" }
+    // A `(S[] | null)[]` element is the kind-18 nullable ref list, the same niche rule.
+    if rlElemKindTbl[rslot] == 9 {
+      if rlElemIsNulNiche(rslot) { return "nulreflist" }
+      return "reflist"
+    }
     return null
   }
   // An f64 element list (`f64[]`): the loop var binds as a scalar f64 local (code 11, the
