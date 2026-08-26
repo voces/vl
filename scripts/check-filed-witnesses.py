@@ -16,6 +16,13 @@ you nothing about the row.
 USAGE
     python3 scripts/check-filed-witnesses.py docs/internals/silent-class-inventory.md
     python3 scripts/check-filed-witnesses.py --json out.json <doc>...
+    python3 scripts/check-filed-witnesses.py --self-test
+
+`--self-test` proves the outcome vocabulary can be made to fire on demand, on three
+specimens whose outcome is known by construction. A classifier that has never been seen
+to distinguish two outcomes is not known to distinguish them — the same discipline
+`scripts/silent-sweep/sabotage.py` applies to the sweep grader, and the reason the
+`trap_loads` column below exists at all.
 
 Exit 0 when every row still behaves as filed; 1 when any row has MOVED (which is a
 prompt to re-grade the doc, not necessarily a regression — a row that moved because it
@@ -46,6 +53,16 @@ COMPILER = "build/vl-compiler.wasm"
 # which is how the doc got eight stale rows in the first place.
 DECLARED = [
     ("closed",                     "runs"),
+    # LOADS THEN TRAPS — added because the vocabulary had no state for it and D19 was
+    # graded `silent_invalid_wasm` while its prose said the opposite. A module that
+    # exists and a non-zero run rc are TWO outcomes, not one: the engine can refuse the
+    # module (nothing runs, no output) or accept it and have the PROGRAM trap (it loads,
+    # prints its earlier lines, then dies). Conflating them makes a run-time miscompile
+    # read as a build-time one, which is the wrong layer to go looking in. Listed ahead
+    # of the `check-clean …` phrases so a status line naming both is read as the more
+    # specific one.
+    ("loads then traps",           "trap_loads"),
+    ("trap after load",            "trap_loads"),
     ("check-clean invalid wasm",   "silent_invalid_wasm"),
     ("check-clean silently wrong", "silent_wrong_value"),
     ("check-clean wrong evaluation", "silent_wrong_evalcount"),
@@ -60,6 +77,20 @@ def declared_outcome(status_line):
         if needle in low:
             return outcome
     return None
+
+# The same marker vocabulary `scripts/silent-sweep/grade.py` separates its `invalid_wasm`
+# and `trap` columns with, so the two graders answer the same question the same way.
+INVALID_MARKERS = (
+    "Invalid input WebAssembly code",
+    "wasm validation",
+    "failed to parse",
+    "type mismatch: expected",
+    "WebAssembly translation error",
+    "validation error",
+)
+TRAP_MARKERS = ("wasm trap", "unreachable", "out of bounds", "divide by zero",
+                "null reference", "cast failure", "integer overflow")
+
 
 def run_program(src):
     """Classify what the compiler does with `src`, on the same three channels the
@@ -78,13 +109,50 @@ def run_program(src):
         err = (run.stdout + run.stderr).strip()
         if "emit error" in err:
             return "emit_reject", err[:200]
-        # No module at all vs a module the engine refuses.
+        # No module at all vs a module that exists.
         out = os.path.join(td, "w.wasm")
         bld = subprocess.run([VL, "build", f, "--compiler", COMPILER, "-o", out],
                              capture_output=True, text=True, timeout=120)
         if bld.returncode != 0 and not os.path.exists(out):
             return "compiler_trap", err[:200]
+        # A module WAS written, and TWO different outcomes used to share this name.
+        # The engine REFUSING it (nothing runs) and the engine LOADING it and the
+        # PROGRAM trapping (it runs, prints, then dies) are different defects in
+        # different layers; `silent_invalid_wasm` for both sent readers to the emitter
+        # when the miscompile was in what the emitted code DOES.
+        if any(m in err for m in INVALID_MARKERS):
+            return "silent_invalid_wasm", err[:200]
+        if any(m in err for m in TRAP_MARKERS):
+            return "trap_loads", err[:200]
         return "silent_invalid_wasm", err[:200]
+
+
+# Specimens whose outcome is known BY CONSTRUCTION, for `--self-test`. Predicted here,
+# in source, ahead of the run — the point is to be able to see the vocabulary fire, not
+# to record whatever it happens to say.
+SELF_TEST = [
+    ("runs", "print(6 * 7)\n"),
+    ("check_reject", "const x: i32 = \"nope\"\nprint(x)\n"),
+    # A VALID module that LOADS, prints, and then traps on an out-of-bounds index.
+    # Before `trap_loads` existed this graded `silent_invalid_wasm`, which is what D19
+    # sat behind.
+    ("trap_loads", "const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])\n"),
+]
+
+
+def self_test():
+    print("outcome-vocabulary self-test (prediction stated in source, before the run)")
+    bad = 0
+    for want, src in SELF_TEST:
+        got, detail = run_program(src)
+        ok = got == want
+        if not ok:
+            bad += 1
+        print(f"  want {want:20s} got {got:20s} {'ok' if ok else '** WRONG **'}")
+        if not ok:
+            print(f"      {detail.splitlines()[0] if detail else ''}")
+    print(f"{len(SELF_TEST)} specimens · {len(SELF_TEST)-bad} routed correctly · {bad} wrong")
+    return 1 if bad else 0
 
 SEC = re.compile(r"^#{2,4}\s+(D\d+[A-Za-z]?|[A-Z]\d+)\s+[—-]\s+(.*)$")
 
@@ -127,6 +195,7 @@ def main(argv):
     it = iter(argv)
     for a in it:
         if a == "--json": out_json = next(it)
+        elif a == "--self-test": return self_test()
         else: docs.append(a)
     if not docs:
         print(__doc__); return 2
