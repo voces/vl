@@ -2214,7 +2214,7 @@ Second control — the SAME program with an ANNOTATED return, correct. An annota
   invalid module". **THAT IS NO LONGER TRUE OF THIS ROW, AND THE PIN AND THE FIX ARE THE SAME
   CHANGE** — the cells RUN now, so `tests/cases/statements/tail-assign-cell-kinds.vl` holds
   them as an `@run` with real `@log` values. That fixture is check-clean invalid wasm on
-  master (`type mismatch: expected i32, found (ref $type)`, offset 2215) and prints its nine
+  master (`type mismatch: expected i32, found (ref $type)`, offset 2241) and prints its ten
   lines on the branch.
 
 **CLOSING EVIDENCE (#1938).** `fnAssignKindGuard` is DELETED, not shortened;
