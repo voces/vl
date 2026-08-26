@@ -1692,6 +1692,54 @@ Control — the SAME call against a NON-generic callee runs, and that is the who
 
 ---
 
+### D24 — a narrowed nullable union ARM handed to a UNION parameter is passed raw, never boxed
+**check-clean invalid wasm · filed 2026-08-26 by the std review of the commit that retired the narrowed-callback carve-out · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset)**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function area(sh: Shape) {
+      if sh is Circle { return sh.r }
+      return 0
+    }
+    function go(c: Circle | null) {
+      if c is Circle { return area(c) }
+      return -1
+    }
+    print(go({ r: 5 }))
+    // vl check rc 0, no diagnostic at any severity; the engine refuses the module:
+    //   type mismatch: expected (ref $type), found (ref null $type)
+
+Control — the SAME call with a NON-nullable `Circle` parameter boxes correctly and prints `5`:
+
+    function go2(c: Circle) { return area(c) }
+    print(go2({ r: 5 }))
+
+* **THE ARGUMENT IS NOT BOXED AT ALL** — disassembled, `go` does `local.get 0 ; return_call
+  $area` with no `struct.new $uBox` between them, handing a `(ref null $Circle)` niche to a
+  parameter typed `(ref $uBox)`. So the message names a nullability mismatch and the defect is
+  a missing BOX; the two `$type`s are different heap types.
+* **IT IS NOT THE CALL-ARGUMENT RECOVER LADDER**, which is why fixing that ladder's `closure`
+  and `variant` arms did not reach it. `emitDirectCall` routes a union-typed parameter through
+  its own `cUNm != ""` branch to `emitUnionBoxArg`, which returns BEFORE the ladder's recovers
+  run. Inside, `exprVariantIndex` answers -1 for a kind-19 `nulvariant` — it has arms for the
+  kind-8 param, the declared local and the global, and none for the nullable niche — so the
+  value falls through to `emitUnionCoerce` and is passed through raw.
+* **THE FIX NEEDS AN ARM-FOR-ARM TWIN, not a one-arm patch.** `exprNullableVariant` answers
+  this question across param / declared-local / global / call-result / field / index arms; an
+  `exprNulVariantIndex` that covers only the param arm would close the witness below and leave
+  the rest, which is the diagonal-for-a-cross-product mistake this repo keeps paying for. That
+  scoping is why this row is filed rather than fixed in the commit that found it.
+* **REACHABLE THROUGH `std:array`**, which is why the module header names it: `reduce`'s
+  `init: A` is the only generic non-array parameter in std, and `reduce([1, 2], bump, c)` with
+  a narrowed `c` and a `Shape`-accumulating `bump` reproduces it while importing only std. A
+  plain STRUCT accumulator in the same shape runs; the same narrowed variant as `indexOf`'s
+  `needle` gets an honest emit refusal instead.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
