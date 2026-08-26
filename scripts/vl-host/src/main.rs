@@ -2733,6 +2733,167 @@ const CMD_TEST_COLLECT: i32 = 8;
 const CMD_TEST_RUN: i32 = 9;
 const CMD_VALIDATE: i32 = 10;
 
+// ── TEST-ONLY fault injection ($VL_FAULT_INJECT) ──────────────────────────────
+//
+// One host-side seam, corrupted on demand, so the validate-and-render path can be
+// exercised WITHOUT a live compiler bug.
+//
+// The path `vl check --codegen` takes when a module does not validate — emit →
+// CMD_VALIDATE → `Module::validate` → `cliResult` → `cliValidateCommit(0)` →
+// cli.vl's positionless `invalid-module` diagnostic → a non-zero exit — could
+// previously only be reached by a program the compiler MISCOMPILES. Its test
+// therefore had to name a live defect, and every fix to that defect reddened the
+// test and forced someone to find another one; over one day that constant was
+// re-pointed five times. Both ways out of that are bad: loosen the assertion until
+// something matches, or leave a real defect unfixed to feed a test.
+//
+// So the corruption is injected BETWEEN emission and validation. The emitter really
+// ran, the bytes really came off the `rbyte` channel, wasmtime's real validator
+// really rejects them, its real message really crosses back through `cliResult`,
+// and cli.vl really renders and really exits non-zero. Only the REASON the bytes
+// are bad is synthetic. A test that called the renderer with a canned string, or a
+// host that validated a hand-authored `.wasm` handed to it directly, would prove
+// none of that wiring — see the design note in tests/vl_check_codegen_test.ts.
+//
+// It cannot be reached by accident: an unmistakable variable name AND a named
+// value, neither of which any normal invocation sets. With the variable unset —
+// which is every real run — `fault_injection` returns `None` before touching
+// anything, and the seam at CMD_VALIDATE is a single `if` over that `None`.
+//
+// An UNRECOGNIZED value is a hard error, not a silent no-op. A typo in the value
+// would otherwise leave the injecting test measuring nothing while exiting exactly
+// the way an uninjected run does — the "test that passes by looking at nothing"
+// failure this whole change exists to remove.
+
+/// The recognized `$VL_FAULT_INJECT` faults. One variant, one seam: the enum exists
+/// so an unknown value has something to be checked against, not as a framework.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// Corrupt the module CMD_VALIDATE is about to hand `Module::validate`.
+    CorruptValidateBytes,
+}
+
+/// Read `$VL_FAULT_INJECT`. Unset or empty is `None` (the state every real run is
+/// in); anything else unrecognized is an error naming what IS recognized.
+///
+/// Called ONCE, before the pump loop, so a bad value fails the invocation
+/// immediately rather than at whatever file first happens to reach the seam.
+fn fault_injection() -> Result<Option<Fault>> {
+    let Some(raw) = std::env::var_os("VL_FAULT_INJECT") else {
+        return Ok(None);
+    };
+    match raw.to_str() {
+        None | Some("") => Ok(None),
+        Some("corrupt-validate-bytes") => Ok(Some(Fault::CorruptValidateBytes)),
+        Some(other) => bail!(
+            "vl: unrecognized $VL_FAULT_INJECT fault `{other}` — the only value this binary \
+             knows is `corrupt-validate-bytes`. $VL_FAULT_INJECT is a TEST-ONLY hook for \
+             exercising the module-validation path; unset it."
+        ),
+    }
+}
+
+/// Read a u32 LEB128 at `*p`, advancing `*p`. `None` on a truncated or over-long
+/// encoding, which the caller turns into a named error rather than a wrong offset.
+fn leb_u32(bytes: &[u8], p: &mut usize) -> Option<u32> {
+    let mut out: u32 = 0;
+    let mut shift = 0;
+    loop {
+        let b = *bytes.get(*p)?;
+        *p += 1;
+        out |= ((b & 0x7f) as u32).checked_shl(shift)?;
+        if b & 0x80 == 0 {
+            return Some(out);
+        }
+        shift += 7;
+        if shift > 31 {
+            return None;
+        }
+    }
+}
+
+/// Rewrite the FIRST function body in `bytes` so the module still DECODES and fails
+/// VALIDATION with a TYPE error — the same shape of rejection a real emit bug
+/// produces, so the diagnostic the test asserts on is the one a real miscompile
+/// renders, rather than a truncation the validator rejects at the header.
+///
+/// The rewrite is length-preserving, so no section or body size LEB is re-encoded:
+/// the body becomes `00` (no local declaration groups), `6a` (`i32.add` against an
+/// empty operand stack — a function body always starts with one, so this is a
+/// guaranteed type mismatch whatever that function's signature is), `00` filler
+/// (`unreachable`, which decodes), and `0b` (`end`).
+///
+/// EVERY precondition below is an error rather than a fallback, and that is the
+/// point: this function doubles as the injecting test's proof that REAL emitted
+/// bytes reached the seam. Had the host instead SUBSTITUTED a hand-authored invalid
+/// blob, a broken `rbyte` channel handing back nothing would still have produced a
+/// validation failure and the test would still have passed — green over a dead
+/// channel. Mutating what actually arrived cannot do that.
+fn corrupt_first_function_body(bytes: &mut [u8]) -> Result<()> {
+    if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+        bail!(
+            "VL_FAULT_INJECT=corrupt-validate-bytes: the {} bytes on the `rbyte` channel are \
+             not a wasm module (no `\\0asm` magic) — the emitter or the readback is broken, \
+             which is a real failure and not something to inject a fault into",
+            bytes.len()
+        );
+    }
+    let total = bytes.len();
+    let mut p = 8;
+    while p < total {
+        let id = bytes[p];
+        p += 1;
+        let Some(size) = leb_u32(bytes, &mut p) else {
+            bail!("VL_FAULT_INJECT=corrupt-validate-bytes: bad section size LEB at {p}");
+        };
+        let sec_end = p + size as usize;
+        if sec_end > total {
+            bail!(
+                "VL_FAULT_INJECT=corrupt-validate-bytes: section {id} runs past the end of \
+                 the {total}-byte module"
+            );
+        }
+        if id != 10 {
+            p = sec_end;
+            continue;
+        }
+        // The code section. Walk its bodies for the first with room for the rewrite.
+        let Some(count) = leb_u32(bytes, &mut p) else {
+            bail!("VL_FAULT_INJECT=corrupt-validate-bytes: bad code-section function count");
+        };
+        for _ in 0..count {
+            let Some(body_size) = leb_u32(bytes, &mut p) else {
+                bail!("VL_FAULT_INJECT=corrupt-validate-bytes: bad function body size LEB");
+            };
+            let (start, body_end) = (p, p + body_size as usize);
+            if body_end > sec_end {
+                bail!(
+                    "VL_FAULT_INJECT=corrupt-validate-bytes: a function body runs past the \
+                     code section"
+                );
+            }
+            if body_size >= 3 {
+                bytes[start] = 0x00; // zero local declaration groups
+                bytes[start + 1] = 0x6a; // i32.add, stack empty → type mismatch
+                for b in &mut bytes[(start + 2)..(body_end - 1)] {
+                    *b = 0x00; // unreachable — decodable filler
+                }
+                bytes[body_end - 1] = 0x0b; // end
+                return Ok(());
+            }
+            p = body_end;
+        }
+        bail!(
+            "VL_FAULT_INJECT=corrupt-validate-bytes: no function body of 3+ bytes in the code \
+             section — nothing to corrupt"
+        );
+    }
+    bail!(
+        "VL_FAULT_INJECT=corrupt-validate-bytes: the {total}-byte module has no code section \
+         — nothing to corrupt"
+    );
+}
+
 /// The host↔seed contract generation this binary speaks. Checked against the seed's
 /// exported `hostAbi()` before the seed is trusted; a mismatch is a hard error.
 ///
@@ -2841,6 +3002,12 @@ fn cli_pump(args: &[String]) -> Result<()> {
         i += 1;
     }
     let compiler = resolve_compiler(compiler);
+
+    // TEST-ONLY, and `None` on every real run — see the `$VL_FAULT_INJECT` block
+    // above CMD_VALIDATE. Read HERE rather than at the seam so an unrecognized
+    // value fails the invocation up front instead of at whichever file first
+    // validates (and never, on a run that validates nothing).
+    let fault = fault_injection()?;
 
     // A COLLECTING collector, unlike the one-shot compile paths. The pump drives one
     // compiler instance across every file a directory walk finds, so its garbage grows
@@ -3090,7 +3257,13 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // never issues it — still runs under this host.
                 let validate_commit =
                     inst.get_typed_func::<i32, i32>(&mut store, "cliValidateCommit")?;
-                let bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
+                let mut bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
+                // THE SEAM. Between the emitter's bytes and the engine's verdict,
+                // and nowhere else — everything below this line is the real path.
+                // `fault` is `None` unless $VL_FAULT_INJECT named this fault.
+                if fault == Some(Fault::CorruptValidateBytes) {
+                    corrupt_first_function_body(&mut bytes)?;
+                }
                 match Module::validate(&engine, &bytes) {
                     Ok(()) => {
                         validate_commit.call(&mut store, 1)?;

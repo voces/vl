@@ -17,17 +17,41 @@
 // `--codegen` over a program that cannot load — was invisible at the gate that
 // promises the program lowers.
 //
-// The fixture is a `Box` with a nullable-list field (`xs: i64[] | null`): the type
-// is well-formed (fast path clean) but a nullable list has no rep in a struct field,
-// so the emitter rejects. This is a live rep-fuzz baseline gap (nullable-list-locals
-// family) — if it graduates, swap in any other shape that type-checks clean but
-// emit-errors. (The native emitter reports it as `only i32 / boolean / string /
-// array struct fields are supported` + the `(emit error)` summary marker. We assert
-// the exit-code contract + that emit-stage marker, not the host-specific wording.)
+// THAT SECOND INVARIANT IS TESTED TWICE, ON PURPOSE, AND THE SPLIT IS THE POINT OF
+// THIS FILE'S SHAPE:
+//
+//   * the MECHANISM — validator runs, the `invalid-module` diagnostic renders with
+//     the engine's own reason, the exit code goes non-zero — is exercised by the
+//     host's TEST-ONLY fault injection ($VL_FAULT_INJECT, scripts/vl-host/src/main.rs).
+//     It needs no compiler bug, so it is PERMANENT.
+//   * the end-to-end PAIRING — a real VL program `vl check` calls clean and
+//     `--codegen` catches — can only be tested with a live miscompile, because a
+//     synthesized module cannot come out of `vl check`. `INVALID_MODULE_SRC` below
+//     is that specimen, and it is only ever as permanent as the defect it rides.
+//
+// Before the split, `INVALID_MODULE_SRC` carried BOTH jobs, which meant this file
+// could only assert anything at all while a live miscompile existed. The genealogy
+// above that constant is what that cost: the constant was re-pointed at a fresh
+// defect at least five times in one day, each swap needing someone to go find
+// another one, and the two ways out were both bad — loosen the assertion until
+// something matches, or leave a real defect unfixed to feed a test. The mechanism
+// half no longer participates in that. The pairing half still does, and when the
+// class is empty that is now a DECLARED, corpus-CHECKED state (see the standing
+// note and the tripwire) rather than a silent gap.
+//
+// The emit-error fixture (`EMIT_ERROR_SRC`) is a closure whose result struct carries
+// a nullable REF-list field — well-formed as a type (fast path clean), with no
+// lowerable rep, so the emitter rejects. If it graduates, swap in any other shape
+// that type-checks clean but emit-errors; that class is not scarce, and unlike
+// `INVALID_MODULE_SRC` the emitter names its own error. (The native emitter reports
+// it with an `error [line:col]` diagnostic plus the `(emit error)` summary marker.
+// We assert the exit-code contract + that emit-stage marker, not the wording.)
 //
 // This is the native counterpart to the retired tests/cli_codegen_test.ts.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
+// The fault-injected tests take the SAME gate — they drive the same binary over the
+// same seed, so there is nothing extra for them to skip on.
 
 const exists = (p: string): boolean => {
   try {
@@ -47,9 +71,16 @@ if (GATED && !ENABLED) {
   console.warn("[vl-check-codegen] skipped — missing vl binary or seed wasm.");
 }
 
+// `VL_FAULT_INJECT: ""` is pinned rather than left inherited, and that is not
+// tidiness: an empty value is the host's explicit "no fault", so every test here
+// that expects an UNINJECTED run gets one even if the surrounding shell has the
+// variable set. Without the pin, one stray export in a developer's environment
+// would turn the controls below green-for-the-wrong-reason and the injected tests
+// into tests of nothing.
 const check = async (
   source: string,
   flags: string[] = [],
+  env: Record<string, string> = {},
 ): Promise<{ code: number; err: string }> => {
   const dir = await Deno.makeTempDir({ prefix: "vl_check_cg_" });
   const file = `${dir}/probe.vl`;
@@ -59,7 +90,7 @@ const check = async (
       args: ["check", file, "--concise", "--compiler", COMPILER, ...flags],
       stdout: "null",
       stderr: "piped",
-      env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+      env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_FAULT_INJECT: "", ...env },
     }).output();
     return { code, err: new TextDecoder().decode(stderr) };
   } finally {
@@ -246,57 +277,88 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 //
 // THE D33 SPECIMEN THAT STOOD HERE — a type parameter FIRST BOUND through a CALLBACK'S
 // ANNOTATION resolving a union ARM onto a declared standalone struct of that arm's exact
-// layout — IS CLOSED, and it went the way its two predecessors did: the rule the fix needed
-// was already written and simply not consulted. `shapeNominalOfTy` maps a structural shape
-// back to a nominal NAME through four rungs, and only ONE of them was nominal by
-// construction (`structIndexOfTy`, the struct-table arena sidecar). Its twin —
-// `variantRowOfTy`, matching `uVarTyIx[i] == ty`, i.e. the arm DECLARATION's own identity —
-// existed, was documented as correct, and was not asked. Below it sat two STRUCTURAL
-// field-set scans, one per table, and a layout twin is claimed by both, so their fixed order
-// was the whole answer. Probed on the row's own witness: `arenaS=-1 arenaV=0 fsS=0 fsV=0`.
-// One rung, placed where D32 placed its own — after the arena struct rung, so struct identity
-// still wins where it exists. 34 of a 360-cell grid moved, 28 from check-clean invalid wasm
-// and 6 from a LOUD emit refusal (`std:array`'s last live carve-out, `A = Circle` beside an
-// exact twin, retired in the same predicate), and none moved backward. Graduated to
-// `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl` — ten cells including
-// both `reduce` parameter orders and the three RECEIVER controls that make the row a property
-// rather than a list of positions — and the two `xfail-miscompile-mono-*-twin.vl` pins are
-// DELETED, which is those files' own written instruction for the day they start passing.
+// layout — IS CLOSED (#1944), and it went the way its two predecessors did: the rule the fix
+// needed was already written and simply not consulted. `shapeNominalOfTy` maps a structural
+// shape back to a nominal NAME over four rungs, and only ONE was nominal by construction
+// (`structIndexOfTy`, the struct-table arena sidecar). Its twin — `variantRowOfTy`, matching
+// `uVarTyIx[i] == ty`, the arm DECLARATION's own identity — existed, was documented as
+// correct, and was not asked. Below it sat two STRUCTURAL field-set scans, one per table, and
+// a layout twin is claimed by both, so their fixed order was the whole answer. Probed on the
+// row's own witness: `arenaS=-1 arenaV=0 fsS=0 fsV=0`. One rung, placed where D32 placed its
+// own. 34 of a 360-cell grid moved, 28 from check-clean invalid wasm and 6 from a LOUD emit
+// refusal (`std:array`'s last live carve-out, retired by the same predicate), none backward.
+// Graduated to `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl`, and the
+// two `xfail-miscompile-mono-*-twin.vl` pins are DELETED.
 //
-// THE SUCCESSOR AGAIN DID NOT COME FROM THE INVENTORY, and this time it came from the GRID
-// built to close the predecessor. D33's 360-cell grid crossed (binding column x substituted
-// type x twin) and left 42 cells silent under BOTH compilers — flat across the twin axis,
-// which is what said they were a different root. Four rows came out of that residue and out
-// of the constructed controls beside it (`silent-class-inventory.md` D34-D37). The one below
-// is **D36**: an anonymous `{r: i32}` object literal in a LAMBDA's inferred LIST return, in a
-// module that declares BOTH a union arm of that layout and a standalone struct twin of it.
-// It needs no import and no generic, it is 14 lines, and it is byte-identical on `235b365b`
-// and on the D33 branch — a pin rather than a regression.
+// THE SUCCESSOR AGAIN DID NOT COME FROM THE INVENTORY, and this time it did not come from the
+// std review either — it came from the GRID built to close the predecessor, which is a fourth
+// source and the first that is a by-product of the closing change rather than a reading of it.
+// D33's grid crossed (binding column x substituted type x twin) and left 42 of 360 cells
+// silent under BOTH compilers, flat across the twin axis — which is what said they were a
+// different root rather than a residue. Four rows came out of that residue and out of the
+// constructed controls beside it (`silent-class-inventory.md` D34-D37).
 //
-// Its controls, each ONE line different and each measured rather than inherited: `Dot`
-// DELETED is LOUD (`emitProgram: field access but no struct type declared`), and deleting
-// `Sq`/`Shape` so `Circle` is not an arm RUNS and prints 7. So it needs BOTH tables to claim
-// the layout, which is the family resemblance to D32 and D33 — and it is a DIFFERENT rung
-// from both, because the shape here is ANONYMOUS: there is no declared arm being resolved
-// onto a twin, there is an inline literal being resolved onto an arm.
+// The one below is **D36**: an anonymous `{ r: i32 }` object literal in a LAMBDA's inferred
+// LIST return, in a module that declares BOTH a union arm of that layout and a standalone
+// struct twin of it. No import, no generic, 14 lines. Its controls, each ONE line different
+// and each measured: `Dot` DELETED is LOUD (`emitProgram: field access but no struct type
+// declared`); deleting `Sq`/`Shape` so `Circle` is not an arm RUNS and prints 7; ANNOTATING
+// the element (`const o: Circle[] = [{ r: n }]`) RUNS and prints 7. The third names the axis —
+// the ANONYMOUS spelling is the trigger, not the list and not the lambda.
 //
-// Re-RUN against this tree at the swap rather than inherited, which is every property the
-// three assertions below need: `vl check` rc 0 with NO diagnostics at all — not even a hint —
-// `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref null $type), found
-// (ref $type)`, and NO `emit error` marker. Pinned as
-// `tests/cases/soundness/xfail-miscompile-lambda-list-anon-elem-arm-twin.vl`.
+// IT IS THE SAME FAMILY AS D32 AND D33 WITH THE DIRECTION REVERSED, which is why neither fix
+// reaches it and why it is a real successor rather than a near-miss of the one just closed.
+// Both of those are "a DECLARED arm resolved onto a struct row". Here the expression holds no
+// declared arm at all: an INLINE literal is resolved, and a real struct row and a real arm
+// both claim its layout. At D33's own site this program probes `arenaS=-1 arenaV=-1 fsS=0
+// fsV=0` — **both arena rungs correctly decline**, because an anonymous shape has no
+// declaration identity, so nothing in the arena can break the tie. That is recorded in D33's
+// census rather than discovered afterwards.
 //
-// THE STANDING NOTE ABOUT WHAT TO DO IF THE CLASS EMPTIES IS UNCHANGED. This test needs a
-// program that type-checks clean and whose module the engine refuses, and only a real
-// miscompile is one — a synthesized module cannot come out of `vl check`. If the class is
-// genuinely empty, that is a decision to take deliberately (leave one row open with the
-// reason stated here, or retire these three assertions and say what replaced them), not one
-// to make by loosening `INVALID_MODULE_SRC` until something matches. What the last three
-// swaps add is where to look BEFORE concluding it is empty: the inventory grades only the
-// rows someone filed; the std review of the closing change has out-produced it three times
-// running; and the GRID built to close a row is now the fourth source, having produced four
-// more rows than the row it was built for.
-const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
+// diagnostics at all — not even a hint — `--codegen` rc 1 with `not valid wasm` + `type
+// mismatch: expected (ref null $type), found (ref $type)`, and NO `emit error` marker.
+// Pre-existing and byte-identical on `235b365b` and on D33's branch. Pinned as
+// `tests/cases/soundness/xfail-miscompile-lambda-list-anon-elem-arm-twin.vl` per the REFILLS
+// procedure below, in the same commit that swapped this constant.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
+//
+// The genealogy above is the record of a constant that could only ever name a live
+// compiler bug, re-pointed at a fresh one at least five times in a single day. What
+// changed is not that record but what depends on it: the MECHANISM this file exists
+// to prove (validator runs, `invalid-module` renders with the engine's reason, exit
+// goes non-zero) moved to the fault-injected tests above and is permanent. This
+// constant now carries ONE job — the end-to-end pairing, "a real VL program that
+// `vl check` calls clean and `--codegen` catches" — which a synthesized module
+// genuinely cannot stand in for, because a synthesized module cannot come out of
+// `vl check`. That job is worth keeping while a specimen exists and is worth nothing
+// faked.
+//
+// WHAT TO DO WHEN THE CLASS REFILLS OR EMPTIES — the whole procedure, in one place:
+//
+//   * EMPTIES (the defect you just closed was the last one). Set this constant to
+//     `null` and delete the `@no-instantiate` directives in the SAME commit. The
+//     three specimen tests below deactivate, the file says so out loud at load, and
+//     the tripwire at the foot CHECKS that the corpus agrees. Add a paragraph to the
+//     genealogy saying what closed. Do NOT comment the tests out, and do NOT loosen
+//     an assertion until something matches — that is the failure this structure
+//     exists to make impossible.
+//   * REFILLS (a new check-clean-invalid-wasm shape lands, or you find one). Set
+//     this constant to it, and pin it `@no-instantiate` in the SAME commit — #1939:
+//     an unpinned successor reddens the tripwire, and the tripwire is now what makes
+//     "the class is empty" a checkable claim instead of a comment.
+//
+// BEFORE CONCLUDING IT IS EMPTY, look past the inventory: it grades only the rows
+// someone filed, and the std review of the closing change has out-produced it three
+// times running. That advice is unchanged and it was nearly needed twice.
+//
+// Exactly one of the two states above is legal at any time, and which one holds is
+// CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
+// state can be entered halfway.
+// ─────────────────────────────────────────────────────────────────────────────
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
@@ -310,6 +372,31 @@ const INVALID_MODULE_SRC = `type Circle = { r: i32 }\n` +
   `}\n` +
   `\n` +
   `print(f())\n`;
+
+/// Whether a live specimen is named. Gates the three tests below, and is the left
+/// half of the tripwire's biconditional.
+const HAVE_SPECIMEN = INVALID_MODULE_SRC !== null;
+
+// Reaching this with no specimen means the `ignore` gate below is wrong — a wiring
+// bug in this file, not a fact about the tree — so it throws rather than skipping.
+const specimen = (): string => {
+  if (INVALID_MODULE_SRC === null) {
+    throw new Error("a specimen test ran with no specimen — its `ignore` gate is wrong");
+  }
+  return INVALID_MODULE_SRC;
+};
+
+// An inactive test is announced, never silent. The distinction being drawn here is
+// the one that matters to whoever reads the run: the mechanism is still covered, the
+// pairing is not, and that is a state someone chose and the tripwire verified.
+if (ENABLED && !HAVE_SPECIMEN) {
+  console.warn(
+    "[vl-check-codegen] the check-clean-invalid-wasm class is EMPTY — the three end-to-end " +
+      "specimen tests are INACTIVE. The MECHANISM (validator runs → `invalid-module` renders " +
+      "→ non-zero exit) stays covered by the fault-injected tests. What is not covered is the " +
+      "PAIRING. See the standing note above INVALID_MODULE_SRC for what to do when it refills.",
+  );
+}
 
 // --- emit-erroring file ------------------------------------------------------
 
@@ -350,22 +437,139 @@ Deno.test({
   },
 });
 
+// --- the validate-and-render path, without a live compiler bug ---------------
+//
+// `$VL_FAULT_INJECT=corrupt-validate-bytes` makes the host rewrite the first
+// function body of the module CMD_VALIDATE is about to validate, so the bytes fail
+// the engine's validator with a TYPE error. The seam is BETWEEN emission and
+// validation, so everything downstream of it is the real path: wasmtime's real
+// `Module::validate`, its real message crossing back on the real `cliResult`
+// channel, cli.vl's real positionless `invalid-module` diagnostic, the real exit
+// code. Only the reason the bytes are bad is synthetic.
+//
+// The host mutates the bytes that ARRIVED rather than substituting a hand-authored
+// blob, and refuses to inject into anything that is not a module. That refusal is
+// what stops these tests going green over a dead `rbyte` channel: with a
+// substitution, an emitter that produced nothing would still have failed validation
+// and these would still have passed.
+//
+// ALTERNATIVES REJECTED, because the reasons are the design:
+//   * a hand-authored invalid `.wasm` handed to the host directly — covers
+//     `Module::validate` and wasmtime's wording, and NOTHING of the CMD_VALIDATE
+//     round-trip, `cliValidateCommit`, the cli.vl rendering or `cliExitCode`, which
+//     is nearly all of the wiring these tests exist to prove;
+//   * calling the renderer with a canned string — never runs the engine at all;
+//   * a test-only branch in `compiler/*.vl` — would change emitted bytes and
+//     pollute the byte-exact seed fixpoint. The host is deliberately outside it;
+//   * a bare CLI flag — reachable by a user, and a documented flag is API. The hook
+//     needs an unmistakable variable name AND a named value, and an unrecognized
+//     value is a hard error (asserted below) so a typo cannot silently disarm it.
+const FAULT_INVALID_MODULE = { VL_FAULT_INJECT: "corrupt-validate-bytes" };
+
+Deno.test({
+  name: "vl-check-codegen --codegen (fault-injected): the engine's refusal renders as `invalid-module`",
+  ignore: !ENABLED,
+  fn: async () => {
+    // THE CONTROL IS IN THE SAME TEST, over the SAME source and the SAME flags, so
+    // the pair cannot drift apart: the only difference between these two runs is
+    // one environment variable. If the uninjected run were ever non-zero, the
+    // injected run's non-zero would prove nothing.
+    const control = await check(CLEAN_SRC, ["--codegen"]);
+    if (control.code !== 0) {
+      throw new Error(
+        `the control run must be clean or the injected run proves nothing, got ${control.code}:\n${control.err}`,
+      );
+    }
+    const { code, err } = await check(CLEAN_SRC, ["--codegen"], FAULT_INVALID_MODULE);
+    if (code === 0) {
+      throw new Error(`expected non-zero exit — the injected module does not validate:\n${err}`);
+    }
+    // Same three properties the specimen test below asserts, which is what makes
+    // this a real replacement for its MECHANISM half: the wording that says the
+    // program is not at fault, the engine's own reason passed through, and NO
+    // emit-stage marker (the emitter ran to completion; the corruption is after it).
+    if (!err.includes("not valid wasm")) {
+      throw new Error(`expected the invalid-module diagnostic, got:\n${err}`);
+    }
+    if (!err.includes("type mismatch")) {
+      throw new Error(`expected the engine's own reason to be passed through, got:\n${err}`);
+    }
+    if (err.includes("emit error")) {
+      throw new Error(`expected no emit-stage error — the emitter succeeded:\n${err}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-check-codegen (fault-injected, no --codegen): still exits 0 — the seam is never reached",
+  ignore: !ENABLED,
+  fn: async () => {
+    // THE HONESTY CHECK ON THE CODEGEN-FREE PATH. The plain-`vl check` tests assert
+    // exit 0 because that path never emits. With the fault armed, that claim becomes
+    // POSITIVELY testable rather than assumed: the injection lives at CMD_VALIDATE,
+    // the codegen-free path issues no CMD_VALIDATE, so the 0 here is the same 0 for
+    // the same reason. If `check` ever started emitting on the fast path, this goes
+    // red — and it is the only test in this file that would.
+    const { code, err } = await check(CLEAN_SRC, [], FAULT_INVALID_MODULE);
+    if (code !== 0) {
+      throw new Error(
+        `the codegen-free path must not reach the validate seam, got ${code}:\n${err}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-check-codegen (fault-injected, --no-validate): exits 0 — the opt-out is upstream of the seam",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { code, err } = await check(
+      CLEAN_SRC,
+      ["--codegen", "--no-validate"],
+      FAULT_INVALID_MODULE,
+    );
+    if (code !== 0) {
+      throw new Error(`--no-validate must skip the validate seam entirely, got ${code}:\n${err}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-check-codegen: an unrecognized $VL_FAULT_INJECT value is a hard error, not a no-op",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The failure mode this forecloses: a typo in the fault NAME leaves the injecting
+    // test above exiting exactly the way an uninjected run does. That test would then
+    // fail on the exit code, but only after someone spent a while wondering why the
+    // injection "didn't work" — so the host names it instead.
+    const { code, err } = await check(CLEAN_SRC, ["--codegen"], {
+      VL_FAULT_INJECT: "corupt-validate-bytes",
+    });
+    if (code === 0) {
+      throw new Error(`an unknown fault must not be silently ignored, got ${code}:\n${err}`);
+    }
+    if (!err.includes("unrecognized $VL_FAULT_INJECT")) {
+      throw new Error(`expected the host to name the bad fault value, got:\n${err}`);
+    }
+  },
+});
+
 // --- a module the emitter accepts and the engine refuses ---------------------
 
 Deno.test({
   name: "vl-check-codegen (no --codegen): an invalid-module file exits 0 (no emit at all)",
-  ignore: !ENABLED,
+  ignore: !ENABLED || !HAVE_SPECIMEN,
   fn: async () => {
-    const { code } = await check(INVALID_MODULE_SRC);
+    const { code } = await check(specimen());
     if (code !== 0) throw new Error(`expected exit 0 on the codegen-free path, got ${code}`);
   },
 });
 
 Deno.test({
   name: "vl-check-codegen --codegen: an invalid module is an `invalid-module` error",
-  ignore: !ENABLED,
+  ignore: !ENABLED || !HAVE_SPECIMEN,
   fn: async () => {
-    const { code, err } = await check(INVALID_MODULE_SRC, ["--codegen"]);
+    const { code, err } = await check(specimen(), ["--codegen"]);
     if (code === 0) {
       throw new Error("expected non-zero exit — the module does not validate");
     }
@@ -388,9 +592,9 @@ Deno.test({
 
 Deno.test({
   name: "vl-check-codegen --no-validate: the same file exits 0 (the opt-out works)",
-  ignore: !ENABLED,
+  ignore: !ENABLED || !HAVE_SPECIMEN,
   fn: async () => {
-    const { code } = await check(INVALID_MODULE_SRC, ["--codegen", "--no-validate"]);
+    const { code } = await check(specimen(), ["--codegen", "--no-validate"]);
     if (code !== 0) {
       throw new Error(`--no-validate should restore the old emit-only path, got ${code}`);
     }
@@ -448,7 +652,10 @@ Deno.test({
         args: ["check", "--codegen", "--concise", dir, "--compiler", COMPILER],
         stdout: "piped",
         stderr: "piped",
-        env: { RUST_BACKTRACE: "0", NO_COLOR: "1" },
+        // `VL_FAULT_INJECT: ""` for the same reason `check` pins it: with the hook
+        // armed in the surrounding shell, EVERY file in these directories would flag
+        // `not valid wasm` and this gate would report the whole corpus as the class.
+        env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_FAULT_INJECT: "" },
       }).output();
       for (const line of (dec.decode(stdout) + dec.decode(stderr)).split("\n")) {
         if (!line.includes("not valid wasm")) continue;
@@ -479,6 +686,32 @@ Deno.test({
     // files this test READ; whether any of them is marked is the finding, not the precondition.
     if (scanned === 0) {
       throw new Error("the @no-instantiate sweep walked no case files — check the directories");
+    }
+    // THE CLASS-EMPTY DECLARATION IS A CHECKABLE CLAIM, not a comment. #1939 recorded
+    // that a successor specimen must be pinned in the SAME commit or this gate goes
+    // red; read from the other end, `INVALID_MODULE_SRC` being non-null and the marked
+    // set being non-empty are the SAME FACT stated in two files, so they can be
+    // cross-checked. Each half alone is a state someone can enter by accident:
+    //   * a specimen named but never pinned — the gate above then never sees it, and
+    //     the corpus has no frozen record of the shape;
+    //   * the constant left pointing at a program that now RUNS, while the pins that
+    //     would have caught that are already gone.
+    // Before this check, "the class is empty" was a sentence in a comment that nobody
+    // could grade. Now it is the only state in which this passes with no pins.
+    //
+    // It binds to the SCAN's two directories, which is where every pin has ever lived.
+    // Pin a specimen somewhere else and this reddens — add that directory to `dirs`
+    // above, which the note there already asks for on its own terms.
+    if (HAVE_SPECIMEN !== (marked.size > 0)) {
+      throw new Error(
+        HAVE_SPECIMEN
+          ? "INVALID_MODULE_SRC names a live specimen but NOTHING in the scanned " +
+            "directories is marked @no-instantiate. Pin the specimen in this commit " +
+            "(#1939), or set INVALID_MODULE_SRC = null if the class is really empty."
+          : "INVALID_MODULE_SRC is null — this file declares the check-clean-invalid-wasm " +
+            `class EMPTY — but the corpus still pins ${JSON.stringify([...marked].sort())}. ` +
+            "One of those is the next specimen; name it, or drop the directives.",
+      );
     }
   },
 });
