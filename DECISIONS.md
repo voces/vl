@@ -881,7 +881,8 @@ placed in that loop must be placed twice, and the UFCS half is now there.
 
 ### The measurement, and the one direction that needed defending
 
-1712 cells (T binding × equatability of `T` over the full rep vocabulary × operation × route ×
+1712 cells, re-measured cell-for-cell after #1945 merged and identical in every column (T
+binding × equatability of `T` over the rep vocabulary the grid enumerated × operation × route ×
 needle delivery × receiver delivery × callee delivery × alias-vs-spelled-out). 225 moved, **0
 genuine loud→silent**: 132 `check-clean invalid wasm → loud check reject`, 49 `loud emit → loud
 check` (the same refusal one stage earlier), 18 `runs → loud check`, and 26 that LEFT a loud
@@ -912,16 +913,16 @@ an instruction to define the operator *for the call's argument types*.
   `i32[] | null` — is D35's MIRROR and is untouched: `eqCmpKindOfTy` answers `"nulstr"` /
   `"nullist"`, a compare core exists, the direct spelling runs and is right. There is no
   refusal to lose, so `eqRefusals` is correct to stay silent; the defect is that the PIN drops
-  an acceptance. **D39**, 96 cells.
+  an acceptance. **D42**, 96 cells.
 * **Whether the refusal being propagated is itself right.** For `T = ("a"|"b")[]` its first
   sentence says "a field is not value-comparable", and the field is `K` — `K == K` runs and is
   correct, as does `string[] == string[]`. So D35's close makes the pin state a refusal that is
   over-broad about its own reason, and the 18 cells it costs are not purely a caller's luck.
   **The fix is still the right call** — two spellings of one call answering with two severities
   is not a capability, and the silent answer was the permissive one — but the other half is
-  filed as **D42** rather than absorbed into a sentence about coincidence.
+  filed as **D45** rather than absorbed into a sentence about coincidence.
 * **The remedy clause it prints.** `— define a `==` operator for it` cannot be followed: a
-  `function "=="` declaration parses, type-checks, and is silently discarded. **D43.** Left
+  `function "=="` declaration parses, type-checks, and is silently discarded. **D46.** Left
   alone here on purpose: the clause lives in `eqRefusals`, the ONE home, so changing it changes
   both spellings, and choosing between "implement the dispatch" and "delete the clause" is a
   language-design call rather than a rider on this one.

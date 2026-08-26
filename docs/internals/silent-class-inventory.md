@@ -3353,7 +3353,11 @@ alias-vs-spelled-out):
 | | runs | loud check | loud emit | check-clean INVALID WASM |
 |---|---|---|---|---|
 | master `f2064bec` | 958 | 130 | 383 | **241** |
+| master `b5dfc64c` (after #1945 merged) | 958 | 130 | 383 | **241** |
 | branch | 956 | 303 | 340 | **113** |
+
+Re-measured cell-for-cell after merging #1945 (the D36/D38 close): **every column and every
+one of the 225 transitions is identical**, so nothing below is that change's.
 
 **225 cells moved, 0 in a genuine loud→silent direction.**
 
