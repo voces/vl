@@ -55,7 +55,7 @@ repro rather than a paraphrase:**
 | D25 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the ruling is in `DECISIONS.md`. The row named ONE cell and a 187-cell grid found **53**: neither filed option won — the argument-node channel moved 6 cells loud→silent, the annotation channel left 8. Two rungs, 0 silent) |
 | D26 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; NOT the heap-type twin the filing named. `letInitReboxesToVariant` read a VARIANT index through the STRUCT table, and its `< sHeapIdx.length` test was a BOUNDS check standing in for a namespace check — it only ever declined while the struct table was EMPTY. Guard retired; 32 of 240 grid cells moved, all forward, and 1,832 corpus files emit byte-identically) |
 | D27 D28 D29 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root — `fnAssignKindGuard`, a five-entry decline list whose `null` restored the caller's `i32` default. Four of its five recorded reasons were false and the fifth named a condition that was already available. The guard is deleted; 220 cells of three grids moved, every one forward) |
-| D30 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D27/D28/D29 by the if-arm-join grid that closed them: the CALLER's view of an inferred ref-valued map return, 16 cells the same change could not reach from the callee side |
+| D30 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the call site was asking a DIFFERENT question than the callee and now asks the callee's own — `fnRetMapShapeAt` → `inferredRetMapSlot`. The recursion the row filed as a blocker is GUARDED, not avoided: its unguarded symptom is a compiler HANG, not a trap, and the answer on re-entry is the checker's recorded type rather than the mono map, which is what keeps the self-referential case fixed too. 1,215 grid cells, 383 moved, none backward) |
 | D32 | check-clean invalid wasm | **NEW 2026-08-26** — filed while closing D26 by its 240-cell grid: a `Circle[]` whose element is a union MEMBER resolves the list's ELEMENT heap through the struct table whenever a layout twin exists, and ONE `reduce` at a union accumulator mints that twin. 16 cells; needs no import and no generic to reproduce |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
@@ -2382,7 +2382,7 @@ Second control — the SAME program with an ANNOTATED return, correct. An annota
 | grid | cells | silent (master) | silent (branch) | moved | backward |
 |---|---|---|---|---|---|
 | straight-line (`g = e` / `return (g = e)`) | 192 | 76 | **0** | 76 | 0 |
-| if-arm join (both spellings) | 192 | 108 | 16 (D30) | 92 | 0 |
+| if-arm join (both spellings) | 192 | 108 | 16 (D30, since CLOSED) | 92 | 0 |
 | lambda producer (`cloRetValKind`) | 144 | 44 | **0** | 52 | 0 |
 
 Every one of the 220 moves is `check-clean invalid wasm → runs`, except 8 lambda cells that
@@ -2537,8 +2537,8 @@ Pinned by the `gs` row of `tests/cases/statements/tail-assign-cell-kinds.vl`.
 
 ---
 
-### D30 — the CALLER's view of an inferred REF-VALUED map return from an if-arm tail assignment
-**check-clean invalid wasm · 16 of a 192-cell if-arm-join grid · filed 2026-08-26 by the if-arm-join grid built to measure D27/D28/D29 · pre-existing (silent on master too, with the older `expected i32` message the guard's `i32` default produced)**
+### D30 — [CLOSED 2026-08-26] the CALLER's view of an inferred REF-VALUED map return from an if-arm tail assignment
+**CLOSED 2026-08-26 — the repro RUNS. Was: check-clean invalid wasm · 16 of a 192-cell if-arm-join grid · filed 2026-08-26 by the if-arm-join grid built to measure D27/D28/D29 · pre-existing (silent on master too, with the older `expected i32` message the guard's `i32` default produced)**
 
 Repro:
 
@@ -2587,14 +2587,49 @@ the only change, correct.
   same program at offset 1137 with `expected i32, found (ref $type)` — the decline's `i32`
   default — and the branch at 1171 with `expected (ref null $type), found (ref $type)`. Both
   are `vl check` rc 0 with a module the engine refuses.
-* **THE OBVIOUS FIX IS A RECURSION HAZARD, WHICH IS WHY IT IS FILED RATHER THAN TAKEN.**
-  Routing `fnRetMapShapeSid` through `inferredRetMapSlot` closes it, and opens the cycle
-  `fnRetMapShapeSid → inferredRetMapSlot → fnAssignRetSlot → fnAssignCellMapShape →
-  letMapShapeOf → mapShapeOfExpr → fnRetMapShapeSid`. An ANNOTATED cell short-circuits at
-  `letMapShapeOf`'s annotation arm, but an un-annotated one whose initializer calls the very
-  function being asked about does not: `let g = h()` beside `function h() { g = h() }` would
-  recur without bound. The existing cycle through `mapRetExprShape` has no such leg. Needs a
-  visited-set or a depth bound, which is a separate change with its own witness.
+* **THE FIX IS THE ONE THE ROW NAMED, AND THE RECURSION IS GUARDED RATHER THAN AVOIDED.**
+  The call site now asks the callee's own function (`fnRetMapShapeAt` →
+  `inferredRetMapSlot`), so the two ladders cannot name different structs. That opens the
+  cycle this row filed — `fnRetMapShapeAt → inferredRetMapSlot → fnAssignRetSlot →
+  fnAssignCellMapShape → letMapShapeOf → mapShapeOfExpr → fnRetMapShapeAt` — because an
+  UN-ANNOTATED cell's shape is its INITIALIZER's, and an initializer that calls the function
+  being resolved asks the question again. An ANNOTATED cell short-circuits at
+  `letMapShapeOf`'s annotation arm and never reaches it.
+* **THE CYCLE COULD NOT BE CUT, AND THE UNGUARDED SYMPTOM IS A HANG, NOT A TRAP.** Three cuts
+  were weighed and each fails: preferring the CHECKER's recorded type at the call site is a
+  behaviour change over every map-returning call, and `letMapShapeOf`'s own header measures
+  the two spellings disagreeing on 128 of 2,097 corpus entries; precomputing a per-function
+  table in `computeRetInference` needs the same fixed point to fill the table, so the
+  visited-set only moves; and restricting the new rung to `fnRetExprOf < 0` narrows the
+  population without removing the cycle (a tail `if` whose cell's initializer calls the
+  function still walks it). MEASURED BY ABLATION, and the failure mode depends on how much of
+  the guard is missing: with the in-flight check deleted, `let g = f(true)` beside
+  `function f(c) { if c { g = mkR(9) } else { g = mkR(8) } }`, its straight-line twin and a
+  two-function chain each fail in **under 3s** with `the call stack was exhausted — most
+  often unbounded recursion` (rc 1); with NO guard machinery at all — the first build of the
+  fix — `vl check --codegen` on the straight-line twin ran **317s with no output and no
+  diagnostic** before it was killed. The unbounded recursion is the same; only the loudness
+  differs, and the silent form is the one a reader meets first.
+* **THE ANSWER ON RE-ENTRY IS THE CHECKER'S, NOT -1.** Returning the mono map on re-entry —
+  the value master's declining `fnRetExprOf` produced — would reintroduce this very defect
+  for exactly the self-referential programs the guard exists for. `shape(f) = shape(g) =
+  shape(f)` has no syntactic ground, but the checker already solved it (that is how
+  `let g = f(true)` typed at all) and banked the answer on the CALL node.
+  `mapFindShapeOfNodeTy` over that node is the rung both call sites already fall through to
+  for "a call whose callee the syntactic path misses", so the guarded answer needs no new
+  sentinel and no new ladder. The guard is the house idiom (`cnSetNarrow`'s `cnRecording`);
+  push and pop are balanced by construction, `inferredRetMapSlot` being a wrapper with no
+  early return.
+* **GRID: 1,215 cells, 383 moved, none backward.** 450 cells (tail shape x map value type x
+  consumption x arm agreement x annotated/inferred cells) moved 104, all
+  `check-clean invalid wasm` → `runs`; a 750-cell extension over the assignment target's
+  STORAGE CLASS (global / local / param) and five further value types moved 270, all the same
+  way; 15 self-reference cells moved 9 — 6 to `runs` and 3 to `program_trap`, those three
+  being programs that read a global before its own initializer completes or recurse without
+  bound, whose trap is correct behaviour that the invalid module used to mask. No cell moved
+  from a loud outcome to a silent one and no `runs` cell changed its output. Graduated to
+  `tests/cases/maps/inferred-map-return-if-arm-tail-caller.vl`, whose last section is the
+  recursion witness.
 
 ---
 
@@ -2797,8 +2832,16 @@ branch has ZERO silent cells on the grid. The axes reproduce the filed controls 
 * **twin presence** — `exact` 56/96 and `stdmint` 84/96 fail on master; `namediff`,
   `typediff` and `notwin` are **0/96 each**. It is a LAYOUT bridge, not a name coincidence.
 * **consumption** — 20/60 at each of the seven ref-list consumptions and **0/60 at the map
-  VALUE**, which is a loud checker reject (``member access '.r' on non-object Circle | null``)
-  identically on both sides. The 60 loud cells are the same 60 files in both baselines.
+  VALUE**. The 60 map-value cells are a loud checker reject identically on both sides, and
+  **that zero is the grid measuring the wrong coordinate, not a limit of the fix.** The cell
+  generated a map whose value type is a bare `Circle`, which has no map-value rep at all and
+  never reaches a ref-list slot. A `Circle[]` map VALUE does, and it is a D32 cell the grid
+  therefore never held: `{[string]: Circle[]}` narrowed with `!= null` is invalid wasm at
+  offset 568 on master and prints `8 / 1 / 3` on this branch. Found by the `std-api-reviewer`
+  pass, not by the grid — the inventory's own coverage-gaps section states the rule this
+  broke ("**read the generator before quoting a zero**: a coordinate that is not generated and
+  a defect that is not present produce the same number"), and this is that rule catching an
+  under-claim rather than an over-claim for once.
 * **declaration order** — FLAT, 35/120 at each of the four orders. Unlike D1, order is not
   load-bearing here.
 * **arity** — the cross-tab is the mechanism restated: `exact` fails at `one` 28/32 and
@@ -2865,6 +2908,65 @@ question. Both are "asked the wrong table", at different rungs. Both patterns we
   observed behaviour change, not a fix for an observed defect — it removes the D26 mechanism
   at its source instead of at one consumer, and brings the last un-gated reader of the
   polymorphic slot in line with the convention the other four already state.
+
+---
+
+### D33 — a MONOMORPHIZED instance's minted result list takes its element heap from a DECLARED layout twin
+**check-clean invalid wasm · found by the `std-api-reviewer` pass over D32's OWN retirement, looking for the cross cell that retirement had no fixture for · filed 2026-08-26 · pre-existing, byte-identical on master (`a80c6717`) and on D32's branch · the SAME FAMILY as D32 and a DIFFERENT RUNG, unmoved by its fix**
+
+Repro:
+
+    import { mapIndexed } from "std:array"
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+
+    function mk(x: i32, i: i32): Circle { return { r: x + i } }
+
+    print(mapIndexed([1, 2], mk)[0].r)
+    // vl check rc 0 with NO diagnostics at all — not even a hint; vl run:
+    //   Invalid input WebAssembly code at offset 485:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+Controls, each RUN, each ONE line different from the above:
+
+* `Dot` DELETED — `Dot` is never mentioned below the type declarations, and it is the whole
+  trigger;
+* `type Dot = { q: i32 }` (same arity, different field NAME — not a layout twin);
+* a plain non-arm struct as the callback result, so no variant namespace is involved.
+
+* **IT IS NOT `mapIndexed`'S AND NOT std'S.** A hand-written `myMap<T, U>` importing nothing
+  reproduces it. `mapIndexed` is where a caller of `std:array` meets it, which is why that
+  module's header names it.
+* **IT IS A DIFFERENT RUNG FROM D32, AND THE PROBE IS WHAT SAYS SO** rather than the
+  resemblance. D32 was `rlElemStructRow` bridging a variant arm's SHAPE onto a standalone
+  row, and its fix is a NOMINAL gate — decline for an element name the variant table claims.
+  Here the element name is not `Circle` for that gate to catch. The same probe at the same
+  site, on this row's own filed program:
+
+      ELEMROWPROBE slot=0 name=[Dot] ln=[Dot] arena=0 byname=0 canon=0 vi=-1
+
+  against `name=[Circle] … vi=0` on the `Dot`-deleted control. So `rlElemStructRow` is
+  answering CORRECTLY for the name it was handed, every rung agreeing, and the structural
+  resolution that crossed the nominal boundary happened EARLIER — the monomorphizer
+  substituted `U` (bound to `Circle` by `mk`'s return type) and resolved its spelling onto the
+  declared twin's NOMINAL name. **Widening D32's gate cannot reach this**; the fix belongs at
+  the substitution, and that is why the row is filed rather than folded into D32's close.
+* **THE DISASSEMBLY IS THE SAME TWO-TABLES SHAPE.** The backing array is
+  `(array (mut (ref null $Dot)))` — `Dot`'s standalone row — while `mapIndexed$m1`'s functype
+  result is `(ref $uVarHeap[Circle])`.
+* **IT IS THE SPECIMEN.** `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC` names it,
+  pinned as `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl`. It has
+  every property those three assertions need, re-run at the swap rather than inherited:
+  `vl check` rc 0 with no diagnostics, `--codegen` rc 1 with `not valid wasm` + `type
+  mismatch`, and no `emit error` marker.
+* **HOW IT WAS FOUND IS THE REUSABLE PART.** The note it replaced in that test file said D30
+  and D32 were the last two live rows and the class might be empty — true of the FILED rows
+  and false of the tree. The inventory grades only what someone filed; the `std-api-reviewer`
+  pass over the closing change has now out-produced it three times running (D26 from the
+  ninth retirement's review, D32's understatement from D26's, this from D32's).
 
 ---
 

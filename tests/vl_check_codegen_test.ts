@@ -214,55 +214,75 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // a namespace check. Graduated to `tests/cases/unions/unannotated-bind-variant-call-beside-plain-struct.vl`
 // and to the fifth accumulator of `tests/cases/std/array-reduce-narrowed-variant-init.vl`.
 //
-// THIS SPECIMEN IS THE ONE THAT CONSTANT NAMED AS ITS OWN SUCCESSOR, which is the practice
-// that made the swap a two-line edit instead of a re-derivation: `silent-class-inventory.md`
-// **D30** — the CALLER's view of an inferred REF-VALUED map return from an if-arm TAIL
-// assignment, 16 cells of a 192-cell grid, filed by #1938 and deliberately NOT fixed there
-// (routing `fnRetMapShapeSid` through `inferredRetMapSlot` opens an unbounded recursion, so
-// it needs a visited-set of its own). Re-RUN against this tree at the swap rather than
-// inherited: `vl check` rc 0 with two redundant-annotation hints, `--codegen` rc 1 with `not
-// valid wasm` + `type mismatch: expected (ref null $type), found (ref $type)` at offset
-// 0x493, and NO `emit error` marker — every property the three assertions below need. Pinned
-// as `tests/cases/soundness/xfail-miscompile-map-return-if-arm-tail-caller.vl`.
+// THE D30 SPECIMEN THAT STOOD HERE — the CALLER's view of an inferred REF-VALUED map
+// return from an if-arm TAIL assignment — IS CLOSED. It was the one this constant had
+// NAMED as its own successor, which is the practice that keeps the swap a two-line edit
+// instead of a re-derivation, and it went the same way: the call site was asking a
+// different question than the callee. #1938 gave the CALLEE's result valtype its map SHAPE
+// (`inferredRetMapSlot`); the CALL SITE resolved the same function through
+// `mapRetExprShape(fnRetExprOf(...))`, and `fnRetExprOf` reads the body's last STATEMENT,
+// which for a tail `if` is not an expression at all. The call site now asks the callee's own
+// function. What kept the row FILED rather than fixed was real and is handled rather than
+// dodged: routing the call site there opens a cycle through an un-annotated cell's
+// initializer, ablated to measure rather than argued about — under 3s to `the call stack was
+// exhausted` with the in-flight check deleted, and 317s of silent hang with no guard
+// machinery at all. The guard's answer on re-entry is the CHECKER's recorded type on the call
+// node, not the mono map — returning the mono map would have reintroduced the very defect for
+// the self-referential case. Graduated
+// to `tests/cases/maps/inferred-map-return-if-arm-tail-caller.vl`, 1,215 grid cells of which
+// 383 moved and none moved backward, and it reddened this file exactly as intended.
 //
-// THE NAMED SUCCESSOR — `silent-class-inventory.md` **D32**, a `Circle[]` whose element is a
-// union MEMBER resolving the LIST's element heap through the struct table — IS CLOSED, and it
-// closed BEFORE the specimen it was queued behind. `rlElemStructRow`'s canon-key rung now
-// declines for a name the variant table claims, which is the exact complement of the gate
-// `exprVariantIndex`'s `Index` arm has always carried; 140 of a 480-cell grid moved from
-// check-clean-invalid to running and 0 moved backward. Graduated to
-// `tests/cases/unions/variant-element-list-beside-layout-twin.vl`, which RUNS and therefore
-// needs no `@no-instantiate` pin.
+// THE D32 SPECIMEN THAT STOOD HERE — a `Circle[]` ref-list ELEMENT resolving its heap through
+// the STRUCT table whenever a LAYOUT TWIN of the element type exists — LASTED ONE COMMIT, and
+// it was pinned and closed by two branches open at the same time. `rlElemStructRow`'s
+// canon-key rung now declines for a name the variant table claims, which is the exact
+// COMPLEMENT of the gate `exprVariantIndex`'s `Index` arm had carried all along: one
+// predicate, read in two directions, so the array a `Cat[]` read unpacks through `uVarHeap`
+// is the array the heap pass types. 140 of a 480-cell grid moved and none moved backward.
+// Graduated to `tests/cases/unions/variant-element-list-beside-layout-twin.vl` — seven
+// consumptions rather than the one this constant needed — and
+// `xfail-miscompile-list-elem-struct-twin.vl` is DELETED, which is that file's own written
+// instruction for the day it starts passing.
 //
-// SO THIS CONSTANT HAS NO NAMED SUCCESSOR FOR THE FIRST TIME, and that is a finding rather
-// than an oversight. `silent-class-inventory.md` grades 32 rows, 31 of them `runs`; the ONE
-// remaining `silent_invalid_wasm` is D30, which is what stands above. When D30 closes the
-// inventory holds no check-clean-invalid program at all, and the three assertions below lose
-// the thing they exist to prove.
+// THE SUCCESSOR WAS NOT LEFT TO BE RE-DERIVED, AND IT DID NOT COME FROM THE INVENTORY. The
+// note this paragraph replaces said D30 and D32 were the last two live rows and that there
+// might be no live member of the class left — which was true of the FILED rows and false of
+// the tree. The `std-api-reviewer` pass over D32's own retirement went looking for the cross
+// cell that retirement had no fixture for and found one, which is the third consecutive time
+// that review has produced the next row: `silent-class-inventory.md` **D33** — `std:array`'s
+// `mapIndexed` whose callback returns a union MEMBER (`(T, i32) => Circle`), in a program that
+// also declares a standalone struct of that arm's exact layout.
 //
-// DO NOT WEAKEN THEM AND DO NOT INVENT A SPECIMEN. What these three tests actually cover is
-// the `--codegen` VALIDATION PLUMBING — that the codegen-free path stays quiet, that the
-// validator's refusal is rendered as `not valid wasm` with the engine's own reason and
-// WITHOUT an `emit error` marker, and that `--no-validate` opts out. Pinning that plumbing to
-// whichever miscompile happens to be live is why this constant has now been swapped six
-// times, and each swap has been a race against the fix. The successor question is therefore a
-// DESIGN one — most likely a deliberate emit hook that produces one wrong type index on
-// demand, so the diagnostic is exercised whether or not a defect exists — and it belongs to
-// whoever closes D30, in consultation, rather than being decided here by the row that got
-// out first.
-const INVALID_MODULE_SRC = `type S = { a: i32 }\n` +
-  `function mkR(v: i32): {[string]: S} {\n` +
-  `  const m: {[string]: S} = Map()\n` +
-  `  m["a"] = { a: v }\n` +
-  `  return m\n` +
-  `}\n` +
-  `let g: {[string]: S} = mkR(3)\n` +
-  `let h: {[string]: S} = mkR(3)\n` +
-  `function f(c: boolean) {\n` +
-  `  if c { g = mkR(9) } else { h = mkR(9) }\n` +
-  `}\n` +
-  `const r = f(true)\n` +
-  `print(r.size)\n`;
+// IT IS THE SAME FAMILY AS D32 AND A DIFFERENT RUNG, which is why D32's gate does not reach
+// it: the element NAME of the instance's minted `U[]` is not `Circle` at all — a probe at
+// `rlElemStructRow` reads `name=[Dot] arena=0 byname=0 canon=0 vi=-1`, so the monomorphizer's
+// substitution had already resolved `U`'s structural spelling onto the declared twin's
+// NOMINAL name, and every rung below is answering correctly for the name it was given.
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
+// diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref
+// $type), found (ref $type)`, and NO `emit error` marker — every property the three
+// assertions below need. Pre-existing and byte-identical on `a80c6717`. Pinned as
+// `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl`.
+//
+// THE STANDING NOTE ABOUT WHAT TO DO IF THE CLASS EMPTIES IS UNCHANGED AND WAS NEARLY NEEDED.
+// This test needs a program that type-checks clean and whose module the engine refuses, and
+// only a real miscompile is one — a synthesized module cannot come out of `vl check`. If the
+// class is genuinely empty, that is a decision to take deliberately (leave one row open with
+// the reason stated here, or retire these three assertions and say what replaced them), not
+// one to make by loosening `INVALID_MODULE_SRC` until something matches. What the last two
+// swaps add to that note is where to look BEFORE concluding it is empty: the inventory grades
+// only the rows someone filed, and the std review of the closing change has now out-produced
+// the inventory three times running.
+const INVALID_MODULE_SRC = `import { mapIndexed } from "std:array"\n` +
+  `\n` +
+  `type Circle = { r: i32 }\n` +
+  `type Sq = { s: i32 }\n` +
+  `type Shape = Circle | Sq\n` +
+  `type Dot = { r: i32 }\n` +
+  `\n` +
+  `function mk(x: i32, i: i32): Circle { return { r: x + i } }\n` +
+  `\n` +
+  `print(mapIndexed([1, 2], mk)[0].r)\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

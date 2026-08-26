@@ -1,0 +1,59 @@
+// @no-instantiate
+// MISCOMPILE, pinned: a MONOMORPHIZED instance's minted result list (`const out: U[]` inside
+// `std:array`'s `mapIndexed`) takes its element heap from the DECLARED struct that shares the
+// substituted type's layout, instead of from the type actually bound to `U`. `vl check` exits
+// 0 with NO diagnostics at all — not even a hint — and is the ONLY command that misses it;
+// `vl check --codegen` exits 1, `vl build` writes the `.wasm` and exits 1, `vl run` exits 1:
+//
+//   the emitted module is not valid wasm … type mismatch:
+//   expected (ref $type), found (ref $type)
+//
+// `Dot` is the whole trigger and it is never mentioned below the type declarations. `Circle`
+// is an arm of `Shape`, so its heap type lives in the VARIANT namespace (`uVarHeap`) and it
+// has no `sNames` row of its own; `Dot` has the identical layout `{ r: i32 }` and does have
+// one. `mk` returns `Circle`, so `U := Circle` — but the emitted backing array is
+// `(array (mut (ref null $Dot)))` while `mapIndexed$m1`'s functype result is
+// `(ref $uVarHeap[Circle])`.
+//
+// IT IS THE SAME FAMILY AS D32 AND A DIFFERENT RUNG, which is the reason it survived D32's
+// close and the reason it is filed rather than folded in. D32 was the ELEMENT-HEAP resolver
+// (`rlElemStructRow`) bridging a variant arm's SHAPE onto a standalone row, and its fix is a
+// nominal gate: decline for an element name the variant table claims. Here the element name
+// is not `Circle` for that gate to catch — a probe at the same site reads
+//
+//   ELEMROWPROBE slot=0 name=[Dot] ln=[Dot] arena=0 byname=0 canon=0 vi=-1
+//
+// so `rlElemStructRow` is answering CORRECTLY for the name it was given, and the structural
+// resolution that crossed the nominal boundary happened EARLIER, when the monomorphizer
+// substituted `U` and resolved its spelling onto the declared twin's nominal name. Widening
+// D32's gate cannot reach it; the fix belongs at the substitution.
+//
+// CONTROLS, all of which RUN, each ONE line different from this file:
+//   · `Dot` DELETED — the same probe then reads `name=[Circle] … vi=0` and the module loads;
+//   · `type Dot = { q: i32 }` (same arity, different field NAME — not a layout twin);
+//   · a plain non-arm struct as the callback result (so no variant namespace is involved).
+//
+// It is NOT std's root and not `mapIndexed`'s: a hand-written `myMap<T, U>` importing nothing
+// reproduces it. `mapIndexed` is where a caller meets it, which is why `std/array.vl`'s header
+// names it.
+//
+// It is `silent-class-inventory.md` D33, and it is NOT a regression: byte-identical on master
+// (`a80c6717`) and on D32's branch, same function, same message. It was found by the
+// `std-api-reviewer` pass over D32's own retirement, looking for the cross cell that
+// retirement had no fixture for — the third consecutive time that review produced the next
+// row, and the reason `tests/vl_check_codegen_test.ts` had a successor to name at all.
+//
+// WHEN IT IS FIXED this file starts failing (the module instantiates), which is the point:
+// delete it, graduate a `@run` row, and swap `INVALID_MODULE_SRC` for another live member of
+// the class. READ THE NOTE IN `tests/vl_check_codegen_test.ts` BEFORE DOING THAT — including
+// what it says about where to look before concluding the class is empty.
+import { mapIndexed } from "std:array"
+
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+type Dot = { r: i32 }
+
+function mk(x: i32, i: i32): Circle { return { r: x + i } }
+
+print(mapIndexed([1, 2], mk)[0].r)
