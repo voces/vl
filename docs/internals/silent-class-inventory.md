@@ -3181,8 +3181,8 @@ Controls, each RUN, each ONE line different from the above (verified on BOTH spe
 
 ---
 
-### D34 — a map VALUE typed at a union ARM is invalid wasm at the STORE, once anything READS the map
-**check-clean invalid wasm · found 2026-08-26 by D33's own 360-cell grid (24 of its 42 flat-across-twin residue cells) · pre-existing, byte-identical on `235b365b` and on D33's branch · NO generic, NO import, NO layout twin**
+### D34 — [CLOSED 2026-08-26] a map VALUE typed at a union ARM is invalid wasm at the STORE, once anything READS the map
+**CLOSED 2026-08-26 — the repro now RUNS (prints `7`). Was: check-clean invalid wasm · found by D33's own 360-cell grid (24 of its 42 flat-across-twin residue cells) · pre-existing, byte-identical on `235b365b`, `f2064bec` and on D33's branch · NO generic, NO import, NO layout twin · a DIFFERENT ROOT from D37, which was closed in the same change**
 
 Repro:
 
@@ -3551,8 +3551,8 @@ Repro:
 
 ---
 
-### D37 — a generic in the INIT-FIRST parameter order with an EMPTY list-of-arm seed
-**check-clean invalid wasm · found 2026-08-26 while building D33's graduated fixture, by an axis D33's own grid held constant · pre-existing, byte-identical on `235b365b` and on D33's branch · NO layout twin · NOT reachable through `std:array`, whose `reduce` is callback-first**
+### D37 — [CLOSED 2026-08-26] a generic in the INIT-FIRST parameter order with an ANNOTATED list-of-arm seed
+**CLOSED 2026-08-26 — the repro now RUNS (prints `1`). Was: check-clean invalid wasm · found while building D33's graduated fixture, by an axis D33's own grid held constant · pre-existing, byte-identical on `235b365b`, `f2064bec` and on D33's branch · NO layout twin · NOT reachable through `std:array`, whose `reduce` is callback-first · TITLE CORRECTED: the trigger is the ANNOTATION on the seed, not its emptiness — see below · a DIFFERENT ROOT from D34, which was closed in the same change**
 
 Repro:
 
