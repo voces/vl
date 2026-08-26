@@ -1,0 +1,52 @@
+// @no-instantiate
+// MISCOMPILE, pinned: an object LITERAL as the argument to a `Circle | null` parameter, where
+// `Circle` is a union ARM. `vl check` exits 0 with no diagnostic at any severity and is the ONLY
+// command that misses it — `vl build` writes the `.wasm` and exits 1, `vl check --codegen` exits
+// 1, `vl run` exits 1. The engine refuses the module at load —
+//
+//   (wasmtime) type mismatch: expected (ref null $type), found (ref $type)
+//
+// (the two `$type`s are different heap types; the disassembler prints both by the same
+// placeholder, which is why the message reads like a nullability complaint and is not one.)
+//
+// THE MECHANISM IS THE BOX, NOT THE NULL. `Circle | null` is the `nulvariant` NICHE — a single
+// struct plus `null` has one non-null member, so it stays a `(ref null $uVarHeap[vi])` rather
+// than allocating a `{tag, value}` box. The ARGUMENT position does not agree: an object literal
+// meeting that parameter takes the union-BOX path, because the program declares a union at all,
+// and emits `struct.new $Circle ; struct.new $unionBox` into a slot typed for the bare niche.
+// Disassembled, the caller pushes the box and the callee's param is `(ref null $Circle)`.
+//
+// The `null` argument to the SAME parameter is fine (it takes the niche's `ref.null` seed), and
+// so is the same literal handed to a `Shape` parameter (that one genuinely wants the box). It is
+// the third combination — a literal, into the niche — that has no arm.
+//
+// PRE-EXISTING, MEASURED IN THAT DIRECTION rather than inferred: run against master's PUBLISHED
+// compiler (`scripts/fetch-seed.sh`, `seed-latest`) and against the branch's own build, `vl
+// check` is rc 0 on both with the identical engine rejection at the identical byte offset 252.
+// So it is discovery, not regression.
+//
+// FOUND BY GRIDDING THE CALL-ARGUMENT BOUNDARY, and it was MASKED: the same file's narrowed
+// `Circle | null` pass-through failed FIRST, in an earlier function, so the module never got far
+// enough to report this one. Only when the narrow half was fixed did the literal half surface —
+// the reason a grid takes the whole cross product instead of stopping at the first red cell.
+//
+// It is also `tests/vl_check_codegen_test.ts`'s live specimen of the check-clean-invalid-module
+// class. WHEN IT IS FIXED this file starts failing (the module instantiates), which is the
+// point: delete it, graduate a `@run` row, and swap `INVALID_MODULE_SRC` for another live member
+// of the class — the instruction that file has carried through seven specimens.
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+
+export function area(sh: Shape) {
+  if sh is Circle { return sh.r }
+  return 0
+}
+
+function go(v: Circle | null) {
+  if v is Circle { return v.r }
+  return -1
+}
+
+print(go(null))
+print(go({ r: 3 }))

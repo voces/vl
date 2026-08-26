@@ -1601,6 +1601,97 @@ consumer's granularity, not the ladder's.
 
 ---
 
+### D22 — an object LITERAL as the argument to a `Circle | null` parameter is boxed into a niche slot
+**check-clean invalid wasm · filed 2026-08-26 while fixing the call-argument non-null recover ladder · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset 252)**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    export function area(sh: Shape) {
+      if sh is Circle { return sh.r }
+      return 0
+    }
+    function go(v: Circle | null) {
+      if v is Circle { return v.r }
+      return -1
+    }
+    print(go(null))
+    print(go({ r: 3 }))
+    // vl check rc 0, no diagnostic at any severity; the engine refuses the module:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+Control — a `null` argument to the SAME parameter, and the SAME literal to a `Shape`
+parameter, both run. It is the third combination that has no arm:
+
+    print(go(null))          // fine — the niche's `ref.null` seed
+    print(area({ r: 3 }))    // fine — a `Shape` param genuinely wants the box
+
+* **THE MECHANISM IS THE BOX, NOT THE NULL.** `Circle | null` is the `nulvariant` NICHE — one
+  non-null member, so no `{tag, value}` allocation — but an object literal in that argument
+  position takes the union-BOX path because the program declares a union at all, and emits
+  `struct.new $Circle ; struct.new $unionBox` into a slot typed `(ref null $Circle)`. The two
+  `$type`s in the message are different heap types; the disassembler prints both by the same
+  placeholder, which is why it reads like a nullability complaint and is not one.
+* **IT WAS MASKED.** The same file's narrowed-`Circle | null` pass-through failed FIRST, in an
+  earlier function, so the module never reached this one. Only fixing the narrow half surfaced
+  it — the reason a grid takes the whole cross product instead of stopping at the first red
+  cell.
+* Pinned as `tests/cases/soundness/xfail-miscompile-nulvariant-literal-arg.vl`, which is also
+  `tests/vl_check_codegen_test.ts`'s live `INVALID_MODULE_SRC` specimen.
+
+---
+
+### D23 — a monomorphized parameter's rep pin answers `i32` for a narrowed nullable ref
+**check-clean invalid wasm · 8 of a 192-cell call-argument grid · filed 2026-08-26 beside D22 · pre-existing, measured against master's published `seed-latest` (identical rejection, identical byte offset 235)**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    export function area(sh: Shape) {
+      if sh is Circle { return sh.r }
+      return 0
+    }
+    function useGen<T>(x: T, k: i32): i32 {
+      return k
+    }
+    function go(v: Circle | null) {
+      if v is Circle { return useGen(v, 7) }
+      return -1
+    }
+    print(go(null))
+    // vl check rc 0 (one unused-parameter warning); the engine refuses the module:
+    //   type mismatch: expected i32, found (ref null $type)
+
+Control — the SAME call against a NON-generic callee runs, and that is the whole difference:
+
+    function useIt(x: Circle, k: i32): i32 { return k }
+    function go2(v: Circle | null) {
+      if v is Circle { return useIt(v, 7) }
+      return -1
+    }
+
+* **A DIFFERENT ROOT FROM THE NON-GENERIC TWIN, AND THE MESSAGE SAYS SO.** The non-generic
+  spelling reported `expected (ref $type), found (ref null $type)` — a missing coercion at a
+  correctly-typed parameter, fixed by giving the call-argument recover ladder its `closure` and
+  `variant` arms. This one reports `expected i32`: the monomorphizer's argument-type pin never
+  learned the `nulvariant` rep, its cascade fell through to the catch-all, and the INSTANCE was
+  emitted with an `i32` parameter. No coercion bridges that; the instance itself is wrong.
+* **THE CATCH-ALL IS THE DEFECT, NOT THE MISSING ARM.** A cascade that answers `i32` when it
+  does not recognise a rep will always mint a wrong instance silently; one that answers "no"
+  gets the honest emit refusal the `readFile`-shaped `u8[]` spelling already produced. The
+  same catch-all is what made a `u8[]` receiver pick the i32-list wrapper.
+* **8 cells, and they are exactly the generic half of two reps**: `nulvariant` at direct /
+  binding / nested delivery, and `nulreflist` reached through a struct FIELD read, each under
+  both `is` and `!= null`. The other 184 cells of that grid run.
+* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid module",
+  and the class already has its live specimen in D22.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
