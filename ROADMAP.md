@@ -556,12 +556,25 @@ in-language GC knobs.
      migrate `vtKindOfType`/the valtype ladders onto `repTreeVKind` and delete the flat
      `RepDesc` when its last consumer moves.
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
-     litunion/union-element arrays — subsumed by Stage B above); (e) the variant⇄struct-table seam: a DECLARED struct twin
-     flowing into a variant-arm position (`pickU(k: Kot)` where `U = Cat | Dog`, `Kot`≅`Cat`)
-     still fails validation — the box/`is` resolution is nominal (`variantIndexOf`) and
-     `uVarHeap`/`sHeapIdx` do not dedup across the two tables — and an inline-shape union arm
-     (`type U = {m:i32} | Dog`) rejects a declared-name `is` spelling (`u is Cat`); both are
-     loud, and the fix wants the #911 declared-twin-gated bridge at the variant resolvers.
+     litunion/union-element arrays — subsumed by Stage B above); (e) the variant⇄struct-table
+     seam, **re-measured 2026-08-26 while closing `silent-class-inventory` D32, and this row was
+     wrong in one direction and right in the other**. Its SILENT rung is now CLOSED: a
+     `Circle[]` whose element is a union ARM resolved the LIST's element heap through
+     `rlElemStructRow`'s canon-key bridge onto whatever standalone struct shared the arm's
+     layout, `vl check`-clean and refused at load. That rung now declines for a name the
+     variant table claims — the exact complement of `exprVariantIndex`'s `Index` arm — which is
+     the #911 declared-twin gate this item asks for, taken at ONE resolver. The seam is
+     otherwise as follows, each re-run on this tree and identically on master (`a80c6717`):
+     the "DECLARED struct twin flowing into a variant-arm position still fails validation"
+     clause did **NOT** reproduce — `pickU(k: Kot)` calling `takeU(u: U)` with `U = Cat | Dog`
+     and `Kot`≅`Cat` prints `7`, as does the `const u: U = k` binding spelling. That is a
+     PARAPHRASE of this row's sketch, not a filed program, so read it as "the nearest spelling
+     runs, and this row needs a filed witness before it is scheduled" rather than as a close.
+     The second clause DOES reproduce and is unchanged: an inline-shape union arm
+     (`type U = {m:i32} | Dog`) rejects a declared-name `is` spelling (`u is Cat`) with
+     `emitProgram: `is` names a declared union member with no interned arm representation`,
+     loud on both compilers. The remaining fix wants the same declared-twin gate at the `is`
+     resolver.
 - ✅ **Kill the TS host. DONE — the TWO COMPILERS are now one.** The TS compiler core
   (`compiler/*.ts` front end + `cli.ts` + the `checker-parity-sweep.ts` oracle) is DELETED; the
   self-hosted `compiler/*.vl` (the wasm seed) is the sole compiler. Got here in stages:

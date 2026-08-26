@@ -232,51 +232,64 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // to `tests/cases/maps/inferred-map-return-if-arm-tail-caller.vl`, 1,215 grid cells of which
 // 383 moved and none moved backward, and it reddened this file exactly as intended.
 //
-// THIS SPECIMEN IS THE ONE THAT CONSTANT NAMED AS ITS SUCCESSOR: `silent-class-inventory.md`
-// **D32** — a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table whenever
-// a LAYOUT TWIN of the element type exists (`type Dot = { r: i32 }` beside `type Shape =
-// Circle | Sq` is the whole witness), and one `std:array` `reduce` at a union accumulator
-// mints that twin without the caller writing one. It needs no import and no generic, it was
-// found by D26's own 240-cell grid, and it is the seam ROADMAP charters as repOf item (e).
-// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with four
-// redundant-annotation hints, `--codegen` rc 1 with `not valid wasm` + `type mismatch:
-// expected (ref null $type), found (ref $type)` at offset 0x15c, and NO `emit error` marker —
-// every property the three assertions below need. Pinned as
-// `tests/cases/soundness/xfail-miscompile-list-elem-struct-twin.vl`.
+// THE D32 SPECIMEN THAT STOOD HERE — a `Circle[]` ref-list ELEMENT resolving its heap through
+// the STRUCT table whenever a LAYOUT TWIN of the element type exists — LASTED ONE COMMIT, and
+// it was pinned and closed by two branches open at the same time. `rlElemStructRow`'s
+// canon-key rung now declines for a name the variant table claims, which is the exact
+// COMPLEMENT of the gate `exprVariantIndex`'s `Index` arm had carried all along: one
+// predicate, read in two directions, so the array a `Cat[]` read unpacks through `uVarHeap`
+// is the array the heap pass types. 140 of a 480-cell grid moved and none moved backward.
+// Graduated to `tests/cases/unions/variant-element-list-beside-layout-twin.vl` — seven
+// consumptions rather than the one this constant needed — and
+// `xfail-miscompile-list-elem-struct-twin.vl` is DELETED, which is that file's own written
+// instruction for the day it starts passing.
 //
-// THERE IS NO NAMED SUCCESSOR AFTER IT, AND THAT IS THE FINDING RATHER THAN AN OVERSIGHT.
-// D30 and D32 were the last two live rows in `silent-class-inventory.md` and they were closed
-// in parallel; every other row there grades `runs`. A 1,215-cell grid over the map-return
-// family and twelve hand-written probes over its adjacent hosts (a nullable map cell, an
-// i32-keyed map, a Set, a lambda host, a nested function, a struct field / list element / map
-// value receiver, a tail loop, a generic callee, an else-less tail `if`, an explicit
-// `return (g = ...)`) turned up NO further member of this class: every cell is `runs`, a loud
-// check reject, or a loud emit reject.
+// THE SUCCESSOR WAS NOT LEFT TO BE RE-DERIVED, AND IT DID NOT COME FROM THE INVENTORY. The
+// note this paragraph replaces said D30 and D32 were the last two live rows and that there
+// might be no live member of the class left — which was true of the FILED rows and false of
+// the tree. The `std-api-reviewer` pass over D32's own retirement went looking for the cross
+// cell that retirement had no fixture for and found one. That is the third consecutive time
+// that review has produced the closing change's next piece of work — D26 from the ninth
+// retirement's review, D32's understatement from D26's, and a whole row from D32's — and only
+// the first and third of those are rows, which is the honest form of the pattern:
+// `silent-class-inventory.md` **D33** — a type parameter first
+// bound through a CALLBACK'S ANNOTATION resolving a union ARM onto a declared standalone
+// struct of that arm's exact layout. The constant below is its `mapIndexed` spelling
+// (`(T, i32) => Circle`); `reduce`'s accumulator at `A = Circle[]` is the same row and is
+// pinned beside it. The row was first written up as "the callback-RESULT position" and the
+// review's SECOND pass corrected it to the property, with the control that decides it: the
+// same `Circle[]` reaching a type parameter through the RECEIVER runs, twin and all.
 //
-// So when D32 closes, the honest move is NOT to reach for a weaker assertion. This test needs
-// a program that type-checks clean and whose module the engine refuses, and only a real
-// miscompile is one — a synthesized module cannot come out of `vl check`. If the class is
-// genuinely empty, that is a decision to take deliberately (leave one row open with the
-// reason stated here, or retire these three assertions and say what replaced them), not one
-// to make by loosening `INVALID_MODULE_SRC` until something matches.
-const INVALID_MODULE_SRC = `type Dot = { r: i32 }\n` +
+// IT IS THE SAME FAMILY AS D32 AND A DIFFERENT RUNG, which is why D32's gate does not reach
+// it: the element NAME of the instance's minted `U[]` is not `Circle` at all — a probe at
+// `rlElemStructRow` reads `name=[Dot] arena=0 byname=0 canon=0 vi=-1`, so the monomorphizer's
+// substitution had already resolved `U`'s structural spelling onto the declared twin's
+// NOMINAL name, and every rung below is answering correctly for the name it was given.
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
+// diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref
+// $type), found (ref $type)`, and NO `emit error` marker — every property the three
+// assertions below need. Pre-existing and byte-identical on `a80c6717`. Pinned as
+// `tests/cases/soundness/xfail-miscompile-mono-result-list-elem-twin.vl`.
+//
+// THE STANDING NOTE ABOUT WHAT TO DO IF THE CLASS EMPTIES IS UNCHANGED AND WAS NEARLY NEEDED.
+// This test needs a program that type-checks clean and whose module the engine refuses, and
+// only a real miscompile is one — a synthesized module cannot come out of `vl check`. If the
+// class is genuinely empty, that is a decision to take deliberately (leave one row open with
+// the reason stated here, or retire these three assertions and say what replaced them), not
+// one to make by loosening `INVALID_MODULE_SRC` until something matches. What the last two
+// swaps add to that note is where to look BEFORE concluding it is empty: the inventory grades
+// only the rows someone filed, and the std review of the closing change has now out-produced
+// the inventory three times running.
+const INVALID_MODULE_SRC = `import { mapIndexed } from "std:array"\n` +
+  `\n` +
   `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
-  `function mkD(): Dot { return { r: 3 } }\n` +
-  `function useShape(): i32 {\n` +
-  `  const s: Shape = { r: 1 }\n` +
-  `  if s is Circle { return s.r }\n` +
-  `  return -2\n` +
-  `}\n` +
-  `function circleList(): i32 {\n` +
-  `  const c: Circle = { r: 8 }\n` +
-  `  const xs: Circle[] = [c]\n` +
-  `  return xs[0].r\n` +
-  `}\n` +
-  `print(circleList())\n` +
-  `print(useShape())\n` +
-  `print(mkD().r)\n`;
+  `type Dot = { r: i32 }\n` +
+  `\n` +
+  `function mk(x: i32, i: i32): Circle { return { r: x + i } }\n` +
+  `\n` +
+  `print(mapIndexed([1, 2], mk)[0].r)\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 
