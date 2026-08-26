@@ -18,13 +18,16 @@ re-validated first (`sabotage.py` → 12 wrong_value / 8 wrong_evalcount / 6 tra
 correct, exactly as published). **The queue below is substantially stale, in one
 direction: fixed rows still read as live.**
 
-| | as filed | 2026-08-25 |
-|---|---|---|
-| check-clean **silently wrong value** | 2 | **0** |
-| check-clean **wrong evaluation count** | 4 | **0** |
-| **compiler trap** (no diagnostic, no module) | 4 | **0** |
-| check-clean **invalid wasm** | 97 | **23** |
-| **SILENT TOTAL** | **107** / 9,345 (1.14%) | **23** / 9,126 (0.25%) |
+| | as filed | 2026-08-25 | end of 2026-08-25 |
+|---|---|---|---|
+| check-clean **silently wrong value** | 2 | **0** | **0** |
+| check-clean **wrong evaluation count** | 4 | **0** | **0** |
+| **compiler trap** (no diagnostic, no module) | 4 | **0** | **0** |
+| check-clean **invalid wasm** | 97 | **23** | **0** |
+| **SILENT TOTAL** | **107** / 9,345 (1.14%) | **23** / 9,126 (0.25%) | **0** / 9,126 |
+
+The third column is after the day's four fixes (#1921 closure slot reps, #1922 D16, #1924
+D7, and D6); the before/after for the last two is the table in "SILENT TOTAL 6 → 0" below.
 
 Declaration-order grid: **0 silent** (was D1's family). The two categories that produce a
 WRONG ANSWER rather than a failure are now **zero** — every survivor is invalid wasm, which
@@ -39,8 +42,8 @@ repro rather than a paraphrase:**
 | row | filed | today |
 |---|---|---|
 | D1 D2 D3 D4 D5 D8 D10 D11 | various | **runs — CLOSED** |
-| D16 D7 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
-| D6 D9 D12 D13 D14 D15 | various | as filed, still live |
+| D16 D7 D6 | check-clean invalid wasm | **runs — CLOSED 2026-08-25** (below) |
+| D9 D12 D13 D14 D15 | various | as filed, still live |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -69,6 +72,60 @@ cells (c08730-c08733). D7's own two cells (c08570 / c08571) grade `correct` with
 evaluation-count oracle at 1. Pins: `tests/cases/closures/error-is-functype-slot-rep-reject.vl`,
 `error-fn-slot-rep-differs-reject.vl`, and — for the shape the cells were aimed at —
 `nullable-closure-is-narrow-positions.vl`.
+
+## SILENT TOTAL 6 → 0 (2026-08-25, D7 and D6 closed)
+
+**THE SWEEP IS AT ZERO.** Every run below is the same 9,126 cells and the same harness; the
+grader was re-validated against the final compiler first (`sabotage.py` → 12 wrong_value /
+8 wrong_evalcount / 6 trap / 4 correct, exactly as published).
+
+| | `c31e9fae` | D6 alone | merged (D7 #1924 + D6) |
+|---|---|---|---|
+| correct | 6,895 | 6,907 | **6,909** |
+| check-clean invalid wasm | 6 | 2 | **0** |
+| loud check reject | 1,199 | 1,199 | 1,199 |
+| loud emit reject | 1,026 | 1,018 | **1,018** |
+| **SILENT TOTAL** | **6** | **2** | **0** |
+
+Cell-by-cell against `c31e9fae`, **14 cells moved and every one of them improved** — 6
+`invalid_wasm → correct` and 8 `loud_emit_reject → correct`. Nothing moved the other way,
+in either change:
+
+| cells | rep · position · construct | was | now |
+|---|---|---|---|
+| `c08570` `c08571` | `string` · `elem_place` · `??` | invalid wasm | correct (D7) |
+| `c08730`–`c08733` | `numlit` · `mapget` · `!= null` / `== null`-else | invalid wasm | correct (D6) |
+| `c08734` `c08735` `c08738` `c08739` | `numlit` · `mapget` · `is` / `??` | loud emit reject | correct (D6) |
+| `c02568` `c02569` `c02572` `c02573` | `numlit` · `mapval` · `is` / `??` | loud emit reject | correct (D6) |
+
+The two changes are disjoint in both the cells they move and the files they touch (D7 is
+`wasmEmit.vl`'s list-index `??`; D6 is `emit_classify.vl` / `emit_collect.vl`'s map read),
+and the merged run is a real re-run on the rebased tree rather than an addition of two
+deltas.
+
+**A WARNING ABOUT MEASURING THE BASELINE — IT COST TWO WRONG SWEEPS IN ONE SESSION.** The
+host caches a compiled seed as `build/vl-compiler.wasm.<hash>.cwasm` NEXT TO the seed, and
+**a SYMLINKED seed is not re-keyed when you retarget the link**: point the symlink at a
+different seed and the run silently reuses the cached module for the previous target.
+Proven both ways — with the symlink moved to the OLD seed and the NEW seed's `.cwasm` still
+present the sweep behaved as the new compiler; `rm` the `.cwasm` files and the identical
+setup behaved as the old one.
+
+**THE PRECONDITION IS THE SYMLINK, and the original wording here omitted it — re-measured
+2026-08-25 because an unconditional claim would make every `cp`-based A/B look untrustworthy.**
+Overwriting a real FILE re-keys correctly, both at an arbitrary path and at
+`build/vl-compiler.wasm` itself: `cp <old-seed> build/vl-compiler.wasm` then re-running the
+D6 repro reproduces the defect, and copying the fixed seed back makes it pass again, with no
+`rm` of any `.cwasm`. Retargeting a SYMLINK over the same two seeds keeps answering as the
+first target. So `cp` is safe and `ln -sfn` is not — which is worth knowing precisely,
+because the safe method is the cheaper one.
+
+Both failures were quiet and both looked like results. The first "before" sweep reported
+SILENT 2 — *no change at all* — and the first post-rebase "after" sweep reported SILENT 6,
+i.e. the change had vanished. Each is a plausible number; neither is a crash. **Run each
+side from a SEPARATE root with its own `build/` holding a real COPY of that seed**, and
+sanity-probe one known cell (`runcell.sh` on the cell the fix targets) before spending
+twenty minutes on 9,126.
 
 **Do not re-derive this by hand.** `python3 scripts/check-filed-witnesses.py <doc>` runs
 every filed repro and prints which have moved; it exits non-zero when any row no longer
@@ -510,8 +567,8 @@ Second control (the non-nullable map, same loop — correct).
 
 ---
 
-### D6 — a NUMERIC-LITUNION map value, read by index and narrowed, emits invalid wasm
-**check-clean INVALID WASM · 4 cells of 12 in the `mapget` × numlit grid**
+### D6 — [CLOSED 2026-08-25] a NUMERIC-LITUNION map value, read by index and narrowed, emits invalid wasm
+**CLOSED 2026-08-25 — the repro now RUNS. Was: check-clean INVALID WASM · 4 cells of 12 in the `mapget` × numlit grid**
 
 Repro:
 
@@ -534,6 +591,31 @@ DECLARED-nullable value type `{[string]: N2 | null}`.
 * **Varies on**: the value rep. `i32`/`i64`/`f64`/`f32` value types give a LOUD reject at
   the identical position (D11 below); the numeric litunion is the one that gets a bad
   module instead.
+
+CLOSED BY THE ROOT-E CORRECTION §3 ALREADY NAMED, taken one step further than the row did.
+Two rungs, and neither is new machinery:
+
+1. `mapReadScalarBoxKind*` EXCLUDED the numeric litunion, on the claim — written into both
+   twins' headers — that a nullable numeric litunion rides the `-1` sentinel the way
+   `K | null` does. It does not: the `-1` niche is the STRING litunion's, because a string
+   litunion's rep is an interned atom ID and every negative is spare, while a numeric
+   litunion's rep is THE NUMBER (#1866) and no bit pattern is spare at all.
+   `nulNumLitUnionBaseName`'s own header states the true rule — `1 | 2 | null` reps as
+   `<base> | null`, WHICH IS THE VALUE-UNION BOX — and the disassembly of an `N | null`
+   param agrees. So the read takes #1901's conditional box at the base scalar's atom.
+2. `synthNullableAnn` then handed the RECORDED type over under a spelling that does not
+   denote it: `tyToEmitName` renders the REP, so `N2 | null` renders `i32|null`. The
+   annotation node's row was therefore unmatchable by `unRowOfCanon`, `letUnionNameOf`
+   answered "" for a binding whose union NAME was registered, and the narrowed read skipped
+   its unbox. A SOURCE `const v: N2 | null` never hit this because CANON rewrites that
+   spelling and rebanks the row in the same move.
+
+**THE ROW UNDERSTATED THE SEVERITY, and the understatement was in the filed program.** With
+the binding ANNOTATED — `const v: N2 | null = m[k]` — the same map compiled and RAN, and a
+MISSING key printed `0`: `emitMapGet`'s "rep's empty value" boxed under the PRESENT tag.
+That is #1899's silent wrong answer, in the value rep #1901 excluded, and it is check-clean
+and runs. Now `N`. Pins: `tests/cases/maps/numlit-value-read-narrow.vl`,
+`numlit-value-annotated-miss.vl`, `numlit-value-read-shapes.vl`.
 
 ---
 
@@ -941,6 +1023,51 @@ D16 seed is what makes them lower.
 
 ---
 
+### D19 — a MISS on a DECLARED-nullable numeric-litunion map, read at MODULE SCOPE, traps
+**check-clean invalid wasm as the witness checker grades it — but the module LOADS and the miss TRAPS at run time · found while closing D6, filed unfixed · module scope only**
+
+Repro:
+
+    type N2 = 1 | 2
+    const d: {[string]: N2 | null} = Map()
+    d["a"] = 1
+    const dhit = d["a"]
+    if dhit != null { print(dhit) } else { print("absent") }
+    const dmiss = d["nope"]
+    if dmiss != null { print(dmiss) } else { print("absent") }
+    // vl check rc 0; module written and LOADED; prints `1`, then:
+    //   wasm trap: null reference
+    //   note: a null value was used where a non-null one was required.
+
+Control — the SAME seven lines inside a function print `1` / `absent`:
+
+    function body() {
+      const d: {[string]: N2 | null} = Map()
+      d["a"] = 1
+      const dhit = d["a"]
+      if dhit != null { print(dhit) } else { print("absent") }
+      const dmiss = d["nope"]
+      if dmiss != null { print(dmiss) } else { print("absent") }
+    }
+    body()
+
+* **PRE-EXISTING, measured in both directions.** Byte-identical modules before and after the
+  D6 fix (`md5 ac93932e`, 3354 bytes), so this change neither caused nor cures it.
+* **The classifier cannot say what this is.** `check-filed-witnesses.py`'s outcome vocabulary
+  has no "loads then traps" — a module that exists and a non-zero run rc grades
+  `silent_invalid_wasm`. The status line above is worded so the row grades as filed while the
+  prose says what actually happens; a trap-loads outcome is the honest addition to make to
+  that vocabulary when someone next touches it.
+* **The value type is DECLARED nullable**, so this is not D6's implicit-`T?` seam: the map
+  stores boxes and the miss arm hands back a `ref.null` that the module-scope read path
+  dereferences without the recover the function-scope path applies. The axis is the STORAGE
+  CLASS of the binding, not the value rep — which is D9's axis, not Root E's.
+* Deliberately NOT pinned in the corpus: `maps/numlit-value-annotated-miss.vl` carries the
+  control inside a function and names this row in a comment, because pinning a trap freezes
+  it as contract.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
@@ -994,11 +1121,22 @@ identity and root identity are independent in this compiler, in both directions,
 sweep shows both directions in the same table.
 
 ### Root E — the map-index read's implicit `T?` has no rep for the numeric reps
+**[BOTH CLOSED — D10 by #1901/#1903/#1904, D6 on 2026-08-25.]**
 **D6** (invalid wasm, numeric litunion) and **D10** (loud, `i32`/`i64`/`f64`/`f32`) are one
 site with two severities. The evidence is the shared control: declaring the map's value type
 as `T | null` fixes both, and `??`/`.values()` on the same map are correct in both. So the
 defect is not the numeric rep and not the narrowing — it is that the type the index read
 SYNTHESISES is not the type `T | null` interns to.
+
+**THE GROUPING WAS RIGHT AND THE SAME RUNG CLOSED BOTH, one release apart, which is the
+useful part of the record.** D10's fix (`emitMapGetScalarBox`) made the read's box
+conditional on the probe; it then EXCLUDED the numeric litunion from its own predicate, on a
+claim that a nullable numeric litunion rides the `-1` sentinel. It does not — the `-1` niche
+is the STRING litunion's, whose rep is an interned atom ID with every negative spare, while a
+numeric litunion reps as THE NUMBER and `1 | 2 | null` is the value-union box. Admitting the
+family at the base scalar's atom is the whole of rung 1 of D6's fix. **The exclusion that
+survives a fix is the part of it worth re-reading**: this one was written into three headers
+and one corpus fixture, all four of which asserted the false half.
 
 ### Not shared, though it looks it
 `f32[] | null` (D14) is NOT part of Root A or D despite also being a nullable niche: its

@@ -1,0 +1,108 @@
+// @run
+// @log present
+// @log absent
+// @log 1
+// @log 1
+// @log 9
+// @log 2
+// @log 1
+// @log absent
+// @log 2
+// @log true
+// @log false
+// @log 1
+// @log 2
+// @log 1
+// @log absent
+
+// EVERY READ SHAPE of a NUMERIC-LITUNION-valued map, at one place. D6 was filed on ONE of
+// them (`const v = m[k]` then `if v != null`); this file is the rest of the position axis,
+// so a later change to the read's lowering cannot fix one spelling and quietly move another.
+//
+// THREE OF THESE WERE NOT MERELY WRONG, THEY DID NOT COMPILE, and they came back with the
+// same rung rather than three patches — which is the evidence that the box was the missing
+// piece and not a per-spelling accident:
+//
+//   * `if m[k] != null` with no binding    — was `expected (ref null $type), found i32`
+//   * `if v is N2`                         — was `emitProgram: `is` names a type that is
+//                                            not a union variant`
+//   * `m[k] as! N2`                        — was `emitProgram: `as N2` is supported for a
+//                                            value-union arm or a struct-variant arm; this
+//                                            arm is neither`
+//
+// `??`, `.has` and `.values()` were correct throughout and are here as the inverted control:
+// all three probe the entry table instead of synthesising a `V | null`, which is exactly why
+// they never had this defect. Their bytes are unchanged by the fix.
+
+type N2 = 1 | 2
+
+// THE BARE COMPARE, no binding. `m[k] != null` asks precisely the question the probe
+// answers, so this lowers to the probe and allocates nothing (#1904's arm) — the numeric
+// litunion reaches it now that the predicate admits the family.
+function bareCompare(k: string) {
+  const m: {[string]: N2} = Map()
+  m["k"] = 1
+  if m[k] != null { print("present") } else { print("absent") }
+}
+bareCompare("k") // present
+bareCompare("zz") // absent
+
+// `??` with a NON-MEMBER default, and with a MEMBER default. Both correct before this
+// change; both must stay so.
+function coalesce(k: string) {
+  const m: {[string]: N2} = Map()
+  m["k"] = 1
+  print(m[k] ?? 9)
+  print(m[k] ?? 2)
+}
+coalesce("k") // 1 (non-member default unused), then 1 (member default unused)
+coalesce("zz") // 9, then 2
+
+// The `is` NARROW of the inferred binding — the same read as the filed repro, tested by
+// arm rather than against `null`.
+function isNarrow(k: string) {
+  const m: {[string]: N2} = Map()
+  m["k"] = 1
+  const v = m[k]
+  if v is N2 { print(v) } else { print("absent") }
+}
+isNarrow("k") // 1
+isNarrow("zz") // absent
+
+// `m[k] as! N2` — the ASSERTED read. It needs no box (the arm is asserted, so only presence
+// is in question) and lowers to the probe plus an `unreachable` on a miss, which is what
+// `as!` MEANS. Only the present key is exercised: a miss is a deliberate trap.
+function asserted() {
+  const m: {[string]: N2} = Map()
+  m["k"] = 2
+  print(m["k"] as! N2)
+}
+asserted() // 2
+
+// `.has` — the probe, spelled directly.
+function has() {
+  const m: {[string]: N2} = Map()
+  m["k"] = 1
+  print(m.has("k"))
+  print(m.has("zz"))
+}
+has() // true, false
+
+// `.values()` — an iteration never synthesises a nullable at all.
+function values() {
+  const m: {[string]: N2} = Map()
+  m["a"] = 1
+  m["b"] = 2
+  for v in m.values() { print(v) }
+}
+values() // 1, 2
+
+// MODULE SCOPE. The start function has no `FuncDecl` body, so several of the emitter's
+// name-keyed resolutions take a different arm there; this is the filed repro with the
+// enclosing function removed.
+const g: {[string]: N2} = Map()
+g["k"] = 1
+const gv = g["k"]
+if gv != null { print(gv) } else { print("absent") }
+const gmiss = g["zz"]
+if gmiss != null { print(gmiss) } else { print("absent") }

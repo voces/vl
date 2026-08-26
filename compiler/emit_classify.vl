@@ -11061,10 +11061,12 @@ export function mapIsSetExpr(exprIx: i32, fnIx: i32) {
 // `tests/cases/soundness/xfail-miscompile-map-scalar-miss-narrows-present.vl`.
 //
 // THE NICHE-BEARING VALUES ARE NOT HERE, and that is the whole shape of the predicate.
-// `boolean` (the `2` sentinel), a litunion and `K | null` (the `-1` sentinel), `string`
-// and a struct (`ref.null`) all have a spare value that MEANS absent, so their miss
-// already narrows correctly and their read must keep today's lowering. What is left is
-// exactly the four widths with no spare bit pattern: `i32`, `i64`, `f64`, `f32`.
+// `boolean` (the `2` sentinel), a STRING litunion and `K | null` (the `-1` sentinel),
+// `string` and a struct (`ref.null`) all have a spare value that MEANS absent, so their
+// miss already narrows correctly and their read must keep today's lowering. What is left
+// is every rep with no spare bit pattern: `i32`, `i64`, `f64`, `f32` — and the NUMERIC
+// litunion, which this header used to place on the niche side of that line and which D6
+// moved back (`numLitUnionBoxKind` below carries the correction and its evidence).
 //
 // TWO SHAPES, because a scalar map is stored two ways. `i64`/`f64`/`f32` values intern an
 // mv slot (kinds 10/11/13); a plain `i32` value has NO mv slot at all — it rides the
@@ -11085,6 +11087,49 @@ export function mapIsSetExpr(exprIx: i32, fnIx: i32) {
 // hides itself.
 //
 // The exclusions are the same set and stated once, in the sibling below.
+//
+// The value-atom KIND a NUMERIC literal union reps as inside the union box — `1 | 2` -> 0
+// (i32), `1.5 | 2.5` -> 4 (f64) — or -1 for everything else, including a numeric litunion
+// whose base is not one of the three the box carries.
+//
+// D6, AND THE CORRECTION BOTH TWINS BELOW WERE BUILT ON. They used to EXCLUDE this family
+// outright, on a claim their own headers stated: that a nullable numeric litunion rides the
+// `-1` sentinel the way `K | null` does. IT DOES NOT, and `nulNumLitUnionBaseName`'s header
+// two files over states the true rule — `1 | 2 | null` reps as `<base> | null`, WHICH IS THE
+// VALUE-UNION BOX. The disassembly of a `N | null` param agrees: `{tag 0, $vbI32{1}}`, with
+// the null arm `{tag 6, ref.null}`.
+//
+// The `-1` sentinel belongs to the STRING litunion and cannot be lent to the numeric one:
+// a string litunion's rep is an interned atom ID, so every negative is spare, while a
+// numeric litunion's rep is THE NUMBER (#1866) and no bit pattern is spare at all. That is
+// the whole reason the two families split here, and why `tyIsLitUnion` — string-only by
+// construction — could never have answered for this one.
+//
+// So a `{[string]: N}` read needs exactly the conditional box every other no-spare-value
+// scalar needs, tagged with the BASE scalar's atom, which is the tag `N | null` is built
+// with at every other position.
+function numLitUnionBoxKind(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const bn = numLitUnionBaseName(ty)
+  if bn == "i32" { return 0 }
+  if bn == "i64" { return 3 }
+  if bn == "f64" { return 4 }
+  -1
+}
+
+// `numLitUnionBoxKind` asked of a map READ expression, from the recorded types alone — the
+// one place the numeric-litunion rule is applied, so the two twins below cannot drift.
+function mapReadNumLitBoxKind(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is Index) { return -1 }
+  const rt = nodeTyIxOf(e.idxArr)
+  if rt < 0 { return -1 }
+  const r = T.tys[rt]
+  if !(r is TyMap) { return -1 }
+  numLitUnionBoxKind(r.mVal)
+}
+
 export function mapReadScalarBoxKindTy(exprIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[unwrapParen(exprIx)]
@@ -11097,6 +11142,13 @@ export function mapReadScalarBoxKindTy(exprIx: i32) {
   if v < 0 { return -1 }
   // Every niche-bearing value carries its own "absent" and must keep today's lowering.
   if tyIsLitUnion(v) { return -1 }
+  // The NUMERIC litunion has no niche (see `numLitUnionBoxKind` above) — it takes the box,
+  // at its base scalar's atom. Asked BEFORE `tyScalarBaseIs`, which answers the base for it
+  // and would otherwise route it through the plain-scalar arms at the same kind; the answer
+  // would agree today, but the two questions are different and only this one is stable if a
+  // numeric litunion ever stops repping as its base.
+  const nlk = numLitUnionBoxKind(v)
+  if nlk >= 0 { return nlk }
   if numLitUnionHasBase(v) { return -1 }
   if tyScalarBaseIs(v, "boolean") { return -1 }
   if tyScalarBaseIs(v, "i32") { return 0 }
@@ -11111,12 +11163,13 @@ export function mapReadScalarBoxKind(exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if !(e is Index) { return -1 }
   if !exprMap(e.idxArr, fnIx) { return -1 }
-  // A NUMERIC LITERAL UNION value is excluded FIRST, because neither test below can see
-  // it: it reps as its BASE SCALAR (#1866) so it interns an ordinary f64/i32 mv slot,
-  // while its NULLABLE is the `-1` niche rather than the value box — and the litunion
-  // exclusions further down are string-only by construction (`tyIsLitUnion` requires every
-  // member to be `litKind == "str"`). Measured: without this a `{[string]: N}` read claims
-  // f64 and the narrow becomes `literal is over a struct union is not supported`.
+  // A NUMERIC LITERAL UNION value is decided FIRST, because neither test below can see it:
+  // it reps as its BASE SCALAR (#1866), so it interns an ordinary f64/i32 mv slot, and the
+  // litunion exclusions further down are string-only by construction (`tyIsLitUnion`
+  // requires every member to be `litKind == "str"`). Its read TAKES THE BOX — the shared
+  // `numLitUnionBoxKind` above carries why, and why this arm used to be a blanket -1.
+  const nlk = mapReadNumLitBoxKind(exprIx)
+  if nlk >= 0 { return nlk }
   if nodeTyMapValIsNumLitUnion(e.idxArr) { return -1 }
   const sl = mapShapeOfExpr(e.idxArr, fnIx)
   if sl >= 0 {
