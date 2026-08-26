@@ -2445,8 +2445,9 @@ function fnParamNodeOf(fnIx: i32, name: string) {
 //   * `addLocalName`'s companion SLOT arguments (`nulMapShapeOf`, `nulVariantIdxOfLet`,
 //     `letMapShapeOf`, …). This function answers the KIND column only; the two consumers
 //     source the slot themselves — `captureValStructIdx` from its own kind-keyed mirror,
-//     `fnAssignRetSlot` from `fnAssignCellSlot` — and `fnAssignKindGuard` DECLINES every kind
-//     whose companion slot its consumer cannot mint.
+//     `fnAssignRetSlot` from `fnAssignCellSlot` and `fnAssignCellMapShape`, each read from
+//     the SAME binding this function read, so the kind and its payload cannot be minted
+//     from two different facts.
 //
 // THE ORDER IS `collectLocals`' ORDER, comments and all, because every one of its arms is
 // placed against a specific miscompile. Read them there; the short form is that a litunion
@@ -2554,105 +2555,6 @@ function letCellKind(letIx: i32, fnIx: i32): VKind {
   "i32"
 }
 
-// The kinds an implicit-return assignment DECLINES to name, whatever storage class the
-// target cell lives in.
-//
-// `null` IS NOT A NEUTRAL ANSWER, AND THIS COMMENT USED TO SAY IT WAS. It read "`null`
-// meaning *no answer, leave every classifier exactly as it was*". It is an answer:
-// `fnAssignRetKind` returns `null`, `emit_sections`' inferred-return arm falls through to
-// its `i32` default, and an `i32` result valtype under a body that pushes a ref is
-// check-clean INVALID WASM — `type mismatch: expected i32, found (ref $type)`, where the
-// `expected i32` is this function's own fallback. Every decline below therefore has to be
-// justified against `i32`, not against "whatever master did".
-//
-// MEASURED, ONE DECLINE AT A TIME (#1935). Each surviving entry was lifted ALONE and the
-// 192-cell guard-decline grid re-graded — 6 reps × 4 storage classes (module global /
-// parameter / annotated local / un-annotated local) × 2 assignment shapes × 2 consumption
-// modes × 2 inputs. 76 of its cells are check-clean invalid wasm, and ALL 76 are caused by
-// a decline here: each disappears when, and only when, its own entry is lifted, and no
-// experiment moved a single cell backward.
-//
-//     decline lifted   cells moved   outcome after      filed as
-//     `nulstr`              6        wasm trap          D29  — reason CONFIRMED
-//     `closure`            18        runs               D27  — reason refuted
-//     `nulclosure`         12        runs               D27  — reason refuted
-//     `map`                32        runs               D28  — reason refuted
-//     `nulmap`              8        runs               D28  — reason refuted
-//
-// SO FOUR OF THE FIVE KINDS DECLINED BELOW ARE KNOWN-WRONG, AND THEY ARE KEPT ONLY BECAUSE
-// REMOVING THEM IS A SEPARATE CHANGE with its own gates — it touches every consumer of this guard and
-// deserves a clean before/after rather than riding along on a closed defect. The recorded
-// reasons are kept verbatim so the next reader can see exactly which claim failed:
-//
-//   `nulstr` — a `string | null` cell does not read back as its cell. `emitIdentNode`'s
-//     kind-16 arm applies `ref.as_non_null` UNCONDITIONALLY (the "`string | null` READ
-//     RULE", stated at `emitMem`'s field read), so the re-read pushes `(ref $array)` over
-//     a cell that may hold null. Answering `"nulstr"` makes the module VALID and it then
-//     TRAPS (`wasm trap: null reference`) on `g = null`; answering `"str"` is the same
-//     trap. A trap is worse than a reject, so this stays the loud invalid-wasm reject it
-//     is on master, at ALL THREE storage classes. THE ROOT IS THE UNCONDITIONAL RECOVER IN
-//     `wasmEmit.emitIdentNode` (~12740), not here — a store-then-re-read cannot be sound
-//     while the re-read force-recovers non-null.
-//       MEASURED, AND THE ONLY REASON HERE THAT SURVIVED: lifting this entry alone turns
-//       its 6 cells into `wasm trap: null reference`, precisely as predicted. But what it
-//       preserves is NOT “the loud invalid-wasm reject” — check-clean invalid wasm is a
-//       SILENT class (`vl check` rc 0), so the trade is a loud trap for a silent failure,
-//       not a trap for a reject. Filed as D29; the root named above is still the fix.
-//
-//   `closure` / `nulclosure` — `fnReturnsClosure` already owns the closure result at both
-//     functype producers, ahead of every kind this could supply; naming it here would only
-//     race that owner.
-//       REFUTED. `fnReturnsClosure` owns a tail that IS a function value; this tail is an
-//       ASSIGNMENT, so nothing owns it and the decline hands the position to the `i32`
-//       default. Lifting `closure` alone moves 18 cells invalid-wasm → runs, `nulclosure`
-//       alone another 12, both with 0 backward. There is no owner to race. Filed as D27.
-//
-//   `map` / `nulmap` — `emit_sections`' INFERRED-return arm resolves an `infSlot` for
-//     `struct` / `nulstruct` / `reflist` / `map` only, and its `map` arm reads the SHAPE
-//     off the return EXPRESSION (`mapRetExprShape` over `fnRetExprOf`), which for this
-//     shape is the assignment node, not a map expression. A named kind whose companion
-//     slot cannot be minted from the same binding would declare a result valtype over the
-//     wrong heap type; `null` keeps the master outcome instead.
-//       REFUTED ON THE SHAPE IT NAMES. A mono map's shape is -1, so only a REF-VALUED map
-//       has an mv slot to get wrong — the grid carries both `{[string]: i32}` and
-//       `{[string]: S}`, and lifting `map` alone moves all 32 cells (16 of each) to `runs`,
-//       `nulmap` alone another 8, 0 backward. And `null` does not keep the master outcome:
-//       the master outcome IS the invalid wasm this produces. Filed as D28.
-//
-// AND THE COMPLEMENT — the kinds that are NOT here, each because DECLINING them is what
-// makes the outcome worse. A kind whose slot cannot be minted is better NAMED, because
-// `fbValtype`'s out-of-bounds guard then turns the missing slot into `emitProgram: ref
-// valtype with no interned shape` — a loud emit reject, where `null` gives silent invalid
-// wasm.
-//
-//   `nulreflist` — the original instance of that rule, pinned by
-//     `tests/cases/functions/tail-assign-nullable-reflist-reject.vl`.
-//
-//   `variant` — WAS declined here beside `map` / `nulmap`, on the shared "no `infSlot` arm"
-//     reasoning, and #1935's grid showed the reasoning applies to `map` and not to this.
-//     A variant needs a `uVarHeap` row that `fnAssignRetSlot` does not mint, so it takes
-//     exactly the `nulreflist` route: named, slot -1, loud reject. Measured over the
-//     432-cell implicit-return assignment grid — the four `variantann` cells (an ANNOTATED
-//     `Circle` local, a `bare` tail assignment under `return (g = e)` and under a tail
-//     `if`) were check-clean INVALID WASM on master through this very decline, and are a
-//     loud emit reject with it lifted. Nothing else in the grid moved, in either direction.
-//
-//   `nulvariant` / `nullist` / `nulstrlist` / `nulf64list` / `nuli64list` / `nulf32list` /
-//     `nulbool` / the i32-backed litunion niches — all newly reachable here since #1935
-//     widened `letInitCellKind`, and NONE of them moved a cell of that grid. The nullable
-//     ones are mostly unreachable by construction: `typecheck` refuses a NAMED function an
-//     inferred nullable return outright ("type-valid, but an inferred return of this shape
-//     is not"), so only the LAMBDA producer reaches them, and there the same OOB guard
-//     already answers loudly. Declining them would trade those loud answers for the `i32`
-//     default. `nulbool` and the litunion niches ARE the i32 default, so naming them is a
-//     no-op at this consumer by construction.
-function fnAssignKindGuard(k: VKind): VKind | null {
-  if k == "nulstr" { return null }
-  if k == "closure" || k == "nulclosure" { return null }
-  if k == "map" || k == "nulmap" { return null }
-  k
-}
-
 // ── the assignment TARGET CELL, by name ──────────────────────────────────────────────
 // The three resolvers below are the STORAGE-CLASS DISPATCH itself, keyed on a cell NAME
 // rather than on a function: a body `let` (`parentLetOf`, which is function-scoped and
@@ -2670,20 +2572,57 @@ function fnAssignKindGuard(k: VKind): VKind | null {
 // question of EACH ARM's target before it can answer for the function at all; one home,
 // asked N times, is what keeps the arms and the straight-line tail from drifting apart.
 
-// The guarded `fbValtype` KIND of the cell named `nm` inside function `fnIx`, or `null`
-// when no storage class claims the name (or `fnAssignKindGuard` declines the kind).
+// The `fbValtype` KIND of the cell named `nm` inside function `fnIx`, or `null` when no
+// storage class claims the name. `null` means exactly ONE thing here — there is no such
+// cell — and that is the whole reason the DECLINE LIST this function used to route through
+// is gone.
+//
+// THERE WAS A `fnAssignKindGuard` BETWEEN EACH ARM AND ITS ANSWER, AND IT DECLINED FIVE
+// KINDS BY RETURNING `null` (#1938 deleted it). Its own header called `null` "no answer,
+// leave every classifier exactly as it was". It is an answer: `fnAssignRetKind` returns
+// `null`, `emitFunctionSection`'s inferred-return arm falls through to its `i32` default,
+// and an `i32` result valtype under a body that pushes a ref is check-clean INVALID WASM
+// — `type mismatch: expected i32, found (ref $type)`, where the `expected i32` is the
+// guard's own fallback. A decline is therefore not a refusal to answer; it is a CLAIM that
+// `i32` is the better answer, and every entry has to be measured against `i32`.
+//
+// ALL FIVE WERE. Each was lifted ALONE and three grids re-graded — 192 straight-line cells
+// (6 reps x 4 storage classes x 2 assignment shapes x 2 consumption modes x 2 inputs), 192
+// if-arm-join cells (the same, with both arms assigning, to the same cell and to two cells
+// of one kind), and 144 lambda-producer cells (`cloRetValKind` / `cloRetValSlot`). FOUR OF
+// THE FIVE recorded reasons were false:
+//
+//   `closure` / `nulclosure` — "`fnReturnsClosure` already owns the closure result".
+//     It owns a tail that IS a function value; this tail is an ASSIGNMENT, so nothing
+//     owned it and the decline handed the position to the `i32` default (D27).
+//   `map` / `nulmap` — "the companion slot cannot be minted from the same binding".
+//     `map` is not in `fbValtype`'s guarded-kind list at all, and the slot IS mintable
+//     from the same binding — `fnAssignCellMapShape`, which this change adds (D28).
+//   `nulstr` — the one whose stated MECHANISM held: `emitIdentNode`'s kind-16 arm recovers
+//     non-null, so a store-then-re-read of a `string | null` cell trapped. But the recover
+//     is already CONDITIONAL (`nulStrReadStaysRaw`), and the missing condition was that
+//     this position never declared itself a nullable-string target. `emitReturnValue` now
+//     seeds `retNulString` from `fnAssignRetKind` — the same fact the functype result is
+//     minted from — and the 6 cells run rather than trap (D29).
+//
+// WHAT A DECLINE WOULD STILL BUY, and why none is here: a kind whose slot cannot be minted
+// is better NAMED, because `fbValtype`'s out-of-bounds guard then turns the missing slot
+// into `emitProgram: ref valtype with no interned shape` — a loud emit reject, where `null`
+// gives silent invalid wasm. `nulreflist` is the pinned instance
+// (`tests/cases/functions/tail-assign-nullable-reflist-reject.vl`) and `variant` the
+// measured one (`tail-assign-variant-cell-reject.vl`, #1935). Both are LOUD by being named.
 function fnAssignCellKind(fnIx: i32, nm: string): VKind | null {
   if nm == "" { return null }
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     const li = parentLetOf(fn.fnBody, nm)
-    if li >= 0 { return fnAssignKindGuard(letCellKind(li, fnIx)) }
+    if li >= 0 { return letCellKind(li, fnIx) }
     const pi = fnParamNodeOf(fnIx, nm)
-    if pi >= 0 { return fnAssignKindGuard(vtKindOfParam(pi)) }
+    if pi >= 0 { return vtKindOfParam(pi) }
   }
   const gi = globalLetOf(nm)
   if gi < 0 { return null }
-  fnAssignKindGuard(globalCellKind(gi))
+  globalCellKind(gi)
 }
 
 // The STRUCT-TABLE index of the cell named `nm` inside function `fnIx`, or -1 — the raw
@@ -2700,6 +2639,34 @@ function fnAssignCellSlot(fnIx: i32, nm: string) {
   const gi = globalLetOf(nm)
   if gi < 0 { return -1 }
   globalCellStructIdx(gi)
+}
+
+// The map SHAPE of the cell named `nm` inside function `fnIx` at cell kind `k`, or -1 —
+// the payload column a `map` / `nulmap` result valtype needs, exactly as `fnAssignCellSlot`
+// is the one a `struct` needs. `fbValtype`'s map arms resolve `mapTypeIdxOf(shape)`, so a
+// wrong shape names the MONO `$mapStruct` over a ref-valued map: `expected (ref $type),
+// found (ref $type)`, `vl check` rc 0.
+//
+// READ FROM THE SAME BINDING THE KIND CAME FROM, per storage class, like every other column
+// here — `letMapShapeOf` / `nulMapShapeOf` for a local or a global (a global IS a `LetDecl`,
+// resolved at frame -1 exactly as `fnAssignCellElem` resolves its element name),
+// `paramMapShape` over the param annotation for a parameter.
+function fnAssignCellMapShape(fnIx: i32, nm: string, k: VKind) {
+  if nm == "" { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const li = parentLetOf(fn.fnBody, nm)
+    if li >= 0 {
+      if k == "nulmap" { return nulMapShapeOf(li, fnIx) }
+      return letMapShapeOf(li, fnIx)
+    }
+    const pi = fnParamNodeOf(fnIx, nm)
+    if pi >= 0 { return paramMapShape(fnIx, nm) }
+  }
+  const gi = globalLetOf(nm)
+  if gi < 0 { return -1 }
+  if k == "nulmap" { return nulMapShapeOf(gi, -1) }
+  letMapShapeOf(gi, -1)
 }
 
 // The DECLARED TYPE SPELLING of the `LetDecl` at `letIx`, or "" when un-annotated (its
@@ -2832,9 +2799,9 @@ function ifTailFirstAssignName(ifIx: i32) {
 
 // True if the two cell names resolve, inside function `fnIx`, to the same result identity
 // (kind + struct slot + ref-list element + declared type spelling). A name no storage class
-// claims — or one whose kind `fnAssignKindGuard` declines — never agrees, so a declined
-// kind keeps its master outcome through the join exactly as it does through the
-// straight-line tail. Two UN-annotated cells carry "" for the spelling and are separated by
+// claims never agrees, so an unresolvable name keeps its master outcome through the join
+// exactly as it does through the straight-line tail. Two UN-annotated cells carry "" for
+// the spelling and are separated by
 // the other three columns alone (`letInitCellKind` is their one home, so equal kind + slot
 // + element there IS equal rep).
 function fnAssignCellEq(fnIx: i32, a: string, b: string) {
@@ -2898,9 +2865,14 @@ function ifTailAssignName(ifIx: i32, fnIx: i32) {
 // said the local answer "needs the two ladders proved equal first"; the proof is that the
 // two ladders now have ONE ANNOTATED HOME (`vtKindOfType`, which `collectLocals`'
 // annotation arms and this one both ride) and ONE UN-ANNOTATED HOME (`letInitCellKind`),
-// plus the per-kind DECLINES in `fnAssignKindGuard` for every kind whose payload column
-// `emit_sections` cannot mint from the same binding.
-function fnAssignRetKind(fe: i32): VKind | null {
+// with every payload column beside the kind (`fnAssignCellSlot`, `fnAssignCellElem`,
+// `fnAssignCellMapShape`) read from the SAME binding the kind came from.
+//
+// EXPORTED for `emitReturnValue`, which needs the same answer to decide whether the tail
+// assignment's re-read keeps its raw nullable ref (the `nulstr` seed, #1938). One fact,
+// two readers — the alternative is the functype and the value disagreeing, which is what
+// this family's whole history is made of.
+export function fnAssignRetKind(fe: i32): VKind | null {
   const nm = fnAssignRetTargetName(fe)
   if nm == "" { return null }
   fnAssignCellKind(fnStmts[fe], nm)
@@ -2922,8 +2894,39 @@ function fnAssignRetSlot(fe: i32) {
   const k = fnAssignRetKind(fe)
   if k == null { return -1 }
   if k == "reflist" { return rlSlotByName(fnAssignRetElemName(fe)) }
+  // A MAP cell's slot is its VALUE SHAPE (`fnAssignCellMapShape`), not a struct index. This
+  // arm had to land beside the lifted `map` / `nulmap` declines, not after them: with the
+  // decline in place `cloRetValKind` never reached its assignment-cell arm for a map, so
+  // `cloRetValSlot` fell through to `mapRetExprShape` and a LAMBDA `() => { g = mkR(9) }`
+  // over a `{[string]: S}` cell resolved the right `$mapStruct`. Naming the KIND without
+  // naming the SHAPE points that cell at the MONO map instead — measured `runs ->
+  // check-clean invalid wasm`, the one cell of the whole change that moved backward.
+  if k == "map" || k == "nulmap" {
+    return fnAssignCellMapShape(fnStmts[fe], fnAssignRetTargetName(fe), k)
+  }
   if k != "struct" && k != "nulstruct" { return -1 }
   fnAssignCellSlot(fnStmts[fe], fnAssignRetTargetName(fe))
+}
+
+// The map SHAPE beside an INFERRED `map` / `nulmap` result valtype — the ASSIGNMENT CELL's
+// shape when the implicit return is an assignment (the same fact `fnAssignRetKind` minted
+// the kind from), else the return EXPRESSION's (`mapRetExprShape`). ONE home, because the
+// two consumers that need it — `emitFunctionSection`'s inferred-return arm, which writes
+// the functype result, and `emitReturnValue`'s inferred-map seed, which builds a bare
+// `Map()` into it — must not answer separately: a disagreement between them is invalid
+// wasm inside the returning function itself.
+//
+// The expression rung is unreachable for an IF-ARM tail: `fnRetExprOf` reads the body's last
+// STATEMENT, which is the `if`, so it answers -1 and the shape defaulted to the mono map. That
+// is 32 cells of the 192-cell if-arm-join grid (a `{[string]: S}` cell at all four storage
+// classes x both join spellings x both consumption modes x both inputs), check-clean invalid
+// wasm on master and on every intermediate build of #1938 until the cell rung above.
+export function inferredRetMapSlot(ti: i32) {
+  const ark = fnAssignRetKind(ti)
+  if ark == "map" || ark == "nulmap" { return fnAssignRetSlot(ti) }
+  const mrx = fnRetExprOf(fnStmts[ti])
+  if mrx >= 0 { return mapRetExprShape(mrx, ti) }
+  -1
 }
 
 // The ref-list ELEMENT TYPE-NAME beside `fnAssignRetKind`'s `reflist` answer — the column

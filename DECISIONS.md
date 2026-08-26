@@ -537,6 +537,23 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   has to own that choice; shipping one would give it a trap to avoid rather than
   work to save. (`docs/internals/numeric-intrinsics.md`)
 
+- **A classifier's "no answer" sentinel is NOT neutral when the caller has a
+  default — so a DECLINE LIST is a set of testable claims, and each entry must be
+  measured by lifting it ALONE.** `fnAssignKindGuard` returned `null` for five
+  cell kinds under a header that called `null` "no answer, leave every classifier
+  exactly as it was". Its caller's default was `i32`, so every decline was really
+  a claim that an `i32` result valtype beats the named one — and under a body
+  pushing a ref that is check-clean invalid wasm, not a no-op. Four of the five
+  recorded reasons were false once each was lifted on its own and the grid
+  re-graded; the fifth named a real mechanism but a false premise about it. The
+  transferable rule: state a decline against the DEFAULT the caller will fall back
+  to, never against "whatever the code did before", and measure entries one at a
+  time — a list measured as a block cannot tell you which entry is carrying it.
+  The corollary is that a decline is worth keeping only when it is LOUDER than the
+  default: `nulreflist` and `variant` are NOT declined precisely because naming
+  them reaches `fbValtype`'s out-of-bounds guard and a loud reject. (#1938, D27 /
+  D28 / D29; `docs/internals/silent-class-inventory.md`)
+
 ## Parser, distribution & bootstrapping
 
 - **Hand-written parser over a generator.** Dropped antlr4 (Java/Gradle build
