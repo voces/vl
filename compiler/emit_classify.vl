@@ -2190,7 +2190,7 @@ export function mapRetExprShape(rx: i32, fe: i32) {
       // mono sentinel. (A Set is a boolean-valued map, so it is mono either way; WHICH mono
       // is still the key's to say, and the `-1` / `-4` pair is two different structs.)
       if callee.identName != "Map" && callee.identName != "Set" {
-        return fnRetMapShapeSid(sidOfNode(e.callFn))
+        return fnRetMapShapeAt(sidOfNode(e.callFn), u)
       }
     }
   }
@@ -2207,7 +2207,7 @@ export function mapRetExprShape(rx: i32, fe: i32) {
   // The mint side (`mvShapeOfMapNodeTy`, through `collectA`) reads this same recorded
   // type, so the slot found here is the one the type section interned — which is what
   // keeps the functype RESULT valtype (`emitFunctionSection`'s inferred-map arm) and the
-  // caller's receiver shape (`mapShapeOfExpr` → `fnRetMapShapeSid`) naming one struct.
+  // caller's receiver shape (`mapShapeOfExpr` → `fnRetMapShapeAt`) naming one struct.
   if nodeTyIsMap(u) { return mapFindShapeOfNodeTy(u) }
   -1
 }
@@ -2928,7 +2928,21 @@ function fnAssignRetSlot(fe: i32) {
 // `fnRetExprOf` is -1 and the return seed therefore never fires: check-clean invalid wasm on
 // master (offset 422), correct here. If that ever stops holding, route the seed through this
 // function rather than growing a second ladder.
+//
+// TWO CONSUMERS NOW, and the second one is why this is a WRAPPER. The CALL SITE resolves the
+// same function's shape (`fnRetMapShapeAt`), and routing it here is what closed D30 — but the
+// cell rung below can walk back into a caller through an un-annotated cell's initializer, so
+// the answer is computed under the `retMapFlight` guard (its header carries the cycle and the
+// re-entry ruling). Push and pop sit here rather than in `…Core` so they are balanced by
+// construction: every rung that can decline early is in the half below.
 export function inferredRetMapSlot(ti: i32) {
+  retMapFlight.push(ti)
+  const sh = inferredRetMapSlotCore(ti)
+  retMapFlight.pop()
+  sh
+}
+
+function inferredRetMapSlotCore(ti: i32) {
   const ark = fnAssignRetKind(ti)
   if ark == "map" || ark == "nulmap" { return fnAssignRetSlot(ti) }
   const mrx = fnRetExprOf(fnStmts[ti])
@@ -14421,20 +14435,99 @@ function paramMapShape(fnIx: i32, name: string) {
   -1
 }
 
-// The map SHAPE a function `name` RETURNS (its return annotation's value type), or -1 (the mono
-// map / an un-annotated return whose shape is not annotation-derived). Lets a caller resolve the
-// VALUE type of `mk()[k]` over a `string`-valued map factory.
-function fnRetMapShapeSid(sid: i32) {
+// ── the RE-ENTRANCY GUARD on an INFERRED map return's shape ───────────────────────────
+// The `fnStmts` positions whose inferred map-return shape is currently being resolved.
+// A STACK rather than a flag: a chain of map factories (`a` returns `b()` returns `c()`)
+// nests legitimately, and only a position ALREADY on the stack is a cycle.
+//
+// WHY A GUARD IS NEEDED AT ALL. `fnRetMapShapeAt`'s un-annotated rung is
+// `inferredRetMapSlot`, whose FIRST rung is the tail-assignment CELL's shape — it has to
+// be, because `fnRetExprOf` reads the body's last STATEMENT and a tail `if` is not an
+// expression, so there is no return expression to read (D30). That rung walks
+// `fnAssignRetSlot → fnAssignCellMapShape → letMapShapeOf`, and an UN-ANNOTATED cell's
+// shape is its INITIALIZER's (`mapShapeOfExpr`), which for a call comes straight back
+// here. So `let g = f(true)` beside `function f(c) { if c { g = mk(9) } else { g = mk(8) } }`
+// asks for f's shape in order to answer f's shape. An ANNOTATED cell short-circuits at
+// `letMapShapeOf`'s annotation arm and never reaches this; an un-annotated one does.
+//
+// MEASURED BY ABLATION, AND THE FAILURE MODE DEPENDS ON HOW MUCH OF THE GUARD IS MISSING —
+// which is why the quiet half is worth writing down. With the routing taken and NO guard
+// machinery at all (the first build of this change), `vl check --codegen` on `let g = h()`
+// beside `function h() { g = mkR(1) }` ran **317s with no output and no diagnostic** and was
+// killed at the cap: a SILENT hang, which is the shape a reader meets first. With this
+// stack in place and only the in-flight CHECK below deleted, that program and two others
+// (the tail-`if` witness above, and a two-function chain through `function j() { return g }`)
+// each fail in under 3s with `the call stack was exhausted — most often unbounded
+// recursion`, rc 1. Either way the recursion is unbounded; only the loudness differs.
+//
+// THE ANSWER ON RE-ENTRY IS THE CHECKER'S, AND IT IS NOT -1. Returning the mono map (-1 —
+// the value master's declining `fnRetExprOf` produced) would reintroduce D30 for exactly
+// the self-referential programs the guard exists for. The equation `shape(f) = shape(g) =
+// shape(f)` has no syntactic ground, but it is not unsolved: the CHECKER already solved it
+// (that is how `let g = f(true)` typed at all), and it banked the answer on the CALL node.
+// `mapFindShapeOfNodeTy` over that node is the same rung both call sites below already
+// fall through to for "a map-returning call whose callee the syntactic path misses" — a
+// re-entrant call IS that case, which is why the guarded answer needs no new sentinel and
+// no new ladder.
+//
+// The idiom is the house one — `cnSetNarrow`'s `cnRecording`, whose own comment records a
+// recursion that exhausted the COMPILER's stack on a program as small as a captured
+// `const u = "hi"`. Push and pop are BALANCED BY CONSTRUCTION: `inferredRetMapSlot` is a
+// wrapper with no early return, and every rung that can decline lives in its `…Core` half.
+// `resetRetMapFlight` clears it per program anyway, beside `emitProgram`'s other
+// arena-keyed columns — a `fnStmts` position is exactly the kind of index that block exists
+// to stop leaking across programs on one instance.
+let retMapFlight: i32[] = []
+
+// Drop any in-flight map-return resolution. Called from `emitProgram`'s state block.
+export function resetRetMapFlight() {
+  retMapFlight = []
+  0
+}
+
+// True when `fe`'s inferred map-return shape is already being resolved further up the stack.
+function retMapInFlight(fe: i32) {
+  let i = 0
+  while i < retMapFlight.length {
+    if retMapFlight[i] == fe { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The map shape the CHECKER recorded on the call node at `callIx`, or -1 — the re-entry
+// answer, and the same rung `mapShapeOfExpr` / `mapRetExprShape` fall through to when the
+// syntactic path cannot name the callee.
+function mapRecordedCallShape(callIx: i32) {
+  if callIx >= 0 {
+    if nodeTyIsMap(callIx) { return mapFindShapeOfNodeTy(callIx) }
+  }
+  -1
+}
+
+// The map SHAPE a function `name` RETURNS, as seen from the CALL at `callIx`: its return
+// annotation's value type, else the INFERRED shape its own result valtype is minted from
+// (`inferredRetMapSlot` — the callee's authority, so the two cannot disagree), else -1 (the
+// mono map). Lets a caller resolve the VALUE type of `mk()[k]` over a `string`-valued map
+// factory.
+//
+// `callIx` is the CALL node, carried only for the re-entrant case — see `retMapFlight`.
+//
+// IT IS THE CALLEE'S OWN FUNCTION BECAUSE THE TWO MUST NAME ONE STRUCT (D30). Before this,
+// the un-annotated rung here was `mapRetExprShape(fnRetExprOf(...))` alone, and
+// `fnRetExprOf` reads the body's last STATEMENT: for a tail `if` that is not an expression,
+// so it answered -1 and `collectLocals` typed the receiving `const r` at the MONO
+// `$mapStruct` while the call pushed the ref-valued one — `vl check` rc 0, a module the
+// engine refuses. That expression rung is still reached, one level down, as
+// `inferredRetMapSlot`'s second rung.
+function fnRetMapShapeAt(sid: i32, callIx: i32) {
   const fe = fnIndexOfSid(sid)
   if fe >= 0 {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
       if fn.fnRet >= 0 { return mapAnnShape(fn.fnRet) }
-      // An UN-annotated map return (`function passthru(m) { return m }`): derive the shape from
-      // the returned expression (a map param/local/`Map()`), so a caller of a `string`-valued
-      // map factory resolves the value type.
-      const rx = fnRetExprOf(fnStmts[fe])
-      if rx >= 0 { return mapRetExprShape(rx, fe) }
+      if retMapInFlight(fe) { return mapRecordedCallShape(callIx) }
+      return inferredRetMapSlot(fe)
     }
   }
   -1
@@ -27703,7 +27796,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       // A map-returning function yields its declared map SHAPE (mono ⇒ -1, or a `string`-valued
       // map's mv slot); a `Map()` constructor is the mono map (-1).
       const fe = fnIndexOfSid(sidOfNode(e.callFn))
-      if fe >= 0 { return fnRetMapShapeSid(sidOfNode(e.callFn)) }
+      if fe >= 0 { return fnRetMapShapeAt(sidOfNode(e.callFn), exprIx) }
     }
     // An i32-KEYED constructor / factory result: the KEY comes off the CALL's own
     // recorded type, since a bare `Map()` carries no spelling. It is the other half of

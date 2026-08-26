@@ -214,38 +214,69 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // a namespace check. Graduated to `tests/cases/unions/unannotated-bind-variant-call-beside-plain-struct.vl`
 // and to the fifth accumulator of `tests/cases/std/array-reduce-narrowed-variant-init.vl`.
 //
-// THIS SPECIMEN IS THE ONE THAT CONSTANT NAMED AS ITS OWN SUCCESSOR, which is the practice
-// that made the swap a two-line edit instead of a re-derivation: `silent-class-inventory.md`
-// **D30** — the CALLER's view of an inferred REF-VALUED map return from an if-arm TAIL
-// assignment, 16 cells of a 192-cell grid, filed by #1938 and deliberately NOT fixed there
-// (routing `fnRetMapShapeSid` through `inferredRetMapSlot` opens an unbounded recursion, so
-// it needs a visited-set of its own). Re-RUN against this tree at the swap rather than
-// inherited: `vl check` rc 0 with two redundant-annotation hints, `--codegen` rc 1 with `not
-// valid wasm` + `type mismatch: expected (ref null $type), found (ref $type)` at offset
-// 0x493, and NO `emit error` marker — every property the three assertions below need. Pinned
-// as `tests/cases/soundness/xfail-miscompile-map-return-if-arm-tail-caller.vl`.
+// THE D30 SPECIMEN THAT STOOD HERE — the CALLER's view of an inferred REF-VALUED map
+// return from an if-arm TAIL assignment — IS CLOSED. It was the one this constant had
+// NAMED as its own successor, which is the practice that keeps the swap a two-line edit
+// instead of a re-derivation, and it went the same way: the call site was asking a
+// different question than the callee. #1938 gave the CALLEE's result valtype its map SHAPE
+// (`inferredRetMapSlot`); the CALL SITE resolved the same function through
+// `mapRetExprShape(fnRetExprOf(...))`, and `fnRetExprOf` reads the body's last STATEMENT,
+// which for a tail `if` is not an expression at all. The call site now asks the callee's own
+// function. What kept the row FILED rather than fixed was real and is handled rather than
+// dodged: routing the call site there opens a cycle through an un-annotated cell's
+// initializer, ablated to measure rather than argued about — under 3s to `the call stack was
+// exhausted` with the in-flight check deleted, and 317s of silent hang with no guard
+// machinery at all. The guard's answer on re-entry is the CHECKER's recorded type on the call
+// node, not the mono map — returning the mono map would have reintroduced the very defect for
+// the self-referential case. Graduated
+// to `tests/cases/maps/inferred-map-return-if-arm-tail-caller.vl`, 1,215 grid cells of which
+// 383 moved and none moved backward, and it reddened this file exactly as intended.
 //
-// THE NEXT SPECIMEN IS NAMED HERE RATHER THAN LEFT TO BE RE-DERIVED. When D30 closes, take
-// `silent-class-inventory.md` **D32** — a `Circle[]` whose element is a union MEMBER resolves
-// the LIST's element heap through the struct table whenever a layout twin of the arm exists,
-// and ONE `reduce` at a union accumulator mints that twin. It needs no import and no generic
-// to reproduce (`type Dot = { r: i32 }` beside `type Shape = Circle | Sq` is the whole
-// witness), it was found by D26's own 240-cell grid, and it is the seam ROADMAP charters as
-// repOf item (e). It has no `@no-instantiate` pin yet, so pin it in the same commit or the
-// tripwire at the foot of this file goes red.
-const INVALID_MODULE_SRC = `type S = { a: i32 }\n` +
-  `function mkR(v: i32): {[string]: S} {\n` +
-  `  const m: {[string]: S} = Map()\n` +
-  `  m["a"] = { a: v }\n` +
-  `  return m\n` +
+// THIS SPECIMEN IS THE ONE THAT CONSTANT NAMED AS ITS SUCCESSOR: `silent-class-inventory.md`
+// **D32** — a `Circle[]` ref-list ELEMENT resolves its heap through the STRUCT table whenever
+// a LAYOUT TWIN of the element type exists (`type Dot = { r: i32 }` beside `type Shape =
+// Circle | Sq` is the whole witness), and one `std:array` `reduce` at a union accumulator
+// mints that twin without the caller writing one. It needs no import and no generic, it was
+// found by D26's own 240-cell grid, and it is the seam ROADMAP charters as repOf item (e).
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with four
+// redundant-annotation hints, `--codegen` rc 1 with `not valid wasm` + `type mismatch:
+// expected (ref null $type), found (ref $type)` at offset 0x15c, and NO `emit error` marker —
+// every property the three assertions below need. Pinned as
+// `tests/cases/soundness/xfail-miscompile-list-elem-struct-twin.vl`.
+//
+// THERE IS NO NAMED SUCCESSOR AFTER IT, AND THAT IS THE FINDING RATHER THAN AN OVERSIGHT.
+// D30 and D32 were the last two live rows in `silent-class-inventory.md` and they were closed
+// in parallel; every other row there grades `runs`. A 1,215-cell grid over the map-return
+// family and twelve hand-written probes over its adjacent hosts (a nullable map cell, an
+// i32-keyed map, a Set, a lambda host, a nested function, a struct field / list element / map
+// value receiver, a tail loop, a generic callee, an else-less tail `if`, an explicit
+// `return (g = ...)`) turned up NO further member of this class: every cell is `runs`, a loud
+// check reject, or a loud emit reject.
+//
+// So when D32 closes, the honest move is NOT to reach for a weaker assertion. This test needs
+// a program that type-checks clean and whose module the engine refuses, and only a real
+// miscompile is one — a synthesized module cannot come out of `vl check`. If the class is
+// genuinely empty, that is a decision to take deliberately (leave one row open with the
+// reason stated here, or retire these three assertions and say what replaced them), not one
+// to make by loosening `INVALID_MODULE_SRC` until something matches.
+const INVALID_MODULE_SRC = `type Dot = { r: i32 }\n` +
+  `type Circle = { r: i32 }\n` +
+  `type Sq = { s: i32 }\n` +
+  `type Shape = Circle | Sq\n` +
+  `function mkD(): Dot { return { r: 3 } }\n` +
+  `function useShape(): i32 {\n` +
+  `  const s: Shape = { r: 1 }\n` +
+  `  if s is Circle { return s.r }\n` +
+  `  return -2\n` +
   `}\n` +
-  `let g: {[string]: S} = mkR(3)\n` +
-  `let h: {[string]: S} = mkR(3)\n` +
-  `function f(c: boolean) {\n` +
-  `  if c { g = mkR(9) } else { h = mkR(9) }\n` +
+  `function circleList(): i32 {\n` +
+  `  const c: Circle = { r: 8 }\n` +
+  `  const xs: Circle[] = [c]\n` +
+  `  return xs[0].r\n` +
   `}\n` +
-  `const r = f(true)\n` +
-  `print(r.size)\n`;
+  `print(circleList())\n` +
+  `print(useShape())\n` +
+  `print(mkD().r)\n`;
 
 // --- emit-erroring file ------------------------------------------------------
 

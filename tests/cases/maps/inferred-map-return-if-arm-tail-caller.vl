@@ -1,0 +1,165 @@
+// @run
+// @log 1
+// @log 9
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 1
+// @log 8
+// @hint redundant type annotation: `g` is inferred as `{[string]: S}`
+// @hint redundant type annotation: `h` is inferred as `{[string]: S}`
+// @hint redundant type annotation: `r3` is inferred as `{[string]: S}`
+// THE CALLER AND THE CALLEE MUST ASK ONE QUESTION about an INFERRED map return, and this
+// file is the grid where they used to answer differently. It is `silent-class-inventory.md`
+// **D30**, graduated: it was pinned here as
+// `tests/cases/soundness/xfail-miscompile-map-return-if-arm-tail-caller.vl`, the
+// `@no-instantiate` specimen `tests/vl_check_codegen_test.ts` named, and it is CLOSED.
+//
+// A function body's last statement may be an ASSIGNMENT, which is an expression
+// (DECISIONS: assignment-as-expression) — so `function f(c) { if c { g = mkR(9) } else { … } }`
+// has a value RETURN, of a map type nobody wrote down. #1938 gave the CALLEE's result
+// valtype its map SHAPE (`inferredRetMapSlot`, via `fnAssignRetSlot`). The CALL SITE
+// resolved the same function through a DIFFERENT ladder — `mapRetExprShape(fnRetExprOf(…))`
+// — and `fnRetExprOf` reads the body's last STATEMENT, which for a tail `if` is not an
+// expression at all. It answered -1, so `collectLocals` typed the receiving `const r` at the
+// MONO `$mapStruct` while the call pushed the ref-valued one: `vl check` rc 0 and
+// `type mismatch: expected (ref null $type), found (ref $type)` from the engine.
+//
+// The call site now asks the callee's own function (`fnRetMapShapeAt` →
+// `inferredRetMapSlot`), so the two cannot name different structs. Measured over a
+// 450-cell grid (tail shape x map value type x consumption x arm agreement x whether the
+// cells are annotated): 104 cells moved, every one `check-clean invalid wasm` → `runs`, and
+// none moved the other way. A 750-cell extension over the assignment target's STORAGE CLASS
+// (global / local / param) and five further value types moved 270 the same way.
+//
+// WHAT THE ROW WAS WAITING ON — the cycle, and it is what the last section pins. Routing the
+// call site through `inferredRetMapSlot` opens `fnRetMapShapeAt → inferredRetMapSlot →
+// fnAssignRetSlot → fnAssignCellMapShape → letMapShapeOf → mapShapeOfExpr → fnRetMapShapeAt`:
+// an UN-ANNOTATED cell's shape is its INITIALIZER's, and an initializer that calls the very
+// function being resolved asks the question again. Measured by ABLATION: with the in-flight
+// check deleted this program fails in under 3s with `the call stack was exhausted`, and with
+// no guard machinery at all the first build of the change ran 317s on the straight-line
+// twin with no output and no diagnostic — a silent hang. The guard's answer on re-entry is
+// the CHECKER's recorded type on the call node, NOT the mono map: returning -1 there would
+// reintroduce this defect for exactly the self-referential programs the guard exists for.
+type S = { a: i32 }
+
+function mkR(v: i32): {[string]: S} {
+  const m: {[string]: S} = Map()
+  m["a"] = { a: v }
+  return m
+}
+
+// ── THE ROW ITSELF ────────────────────────────────────────────────────────────────────
+// The annotations on `g` / `h` are the filed program's, hints and all: this is the repro
+// verbatim, not a paraphrase of it.
+let g: {[string]: S} = mkR(3)
+let h: {[string]: S} = mkR(3)
+
+function f(c: boolean) {
+  if c { g = mkR(9) } else { h = mkR(9) }
+}
+
+const r = f(true)
+print(r.size)
+
+// The VALUE the caller's binding names, not just its shape — the miscompile was a type
+// mismatch, so a module that loads is most of the assertion, but the ref value has to
+// survive the call too.
+const rv = r["a"]
+if rv != null { print(rv.a) }
+
+// ── CONSUMPTION ───────────────────────────────────────────────────────────────────────
+// The receiving binding is where the wrong shape landed, so every way of receiving it is a
+// cell. `none` (the third filed control) is below, with the other two.
+let r2 = f(true)
+print(r2.size)
+r2 = f(false)
+print(r2.size)
+
+const r3: {[string]: S} = f(true)
+print(r3.size)
+
+print(f(true).size)
+
+function useM(m: {[string]: S}) { return m.size }
+
+print(useM(f(true)))
+
+function outer(c: boolean) { return f(c) }
+
+print(outer(true).size)
+
+// ── THE THREE FILED CONTROLS, which RAN on master and still run ───────────────────────
+// A MONO value type: the shapes coincide at the mono `$mapStruct`, so the two ladders
+// could not disagree.
+function mkI(v: i32): {[string]: i32} {
+  const m: {[string]: i32} = Map()
+  m["a"] = v
+  return m
+}
+
+let gi = mkI(3)
+let hi = mkI(3)
+
+function fi(c: boolean) {
+  if c { gi = mkI(9) } else { hi = mkI(9) }
+}
+
+const ri = fi(true)
+print(ri.size)
+
+// A STRAIGHT-LINE tail: there `fnRetExprOf` IS the assignment node and `mapRetExprShape`
+// falls through to its recorded type.
+let gl = mkR(3)
+
+function fl(v: i32) { gl = mkR(v) }
+
+const rl = fl(9)
+print(rl.size)
+
+// The result left UNCONSUMED: the callee's own valtype was already right (#1938), so
+// nothing asked the caller's question.
+f(true)
+print(g.size)
+
+// ── STORAGE CLASSES of the assigned cell ──────────────────────────────────────────────
+// `fnAssignCellMapShape` dispatches over the target's storage class, and the caller's
+// ladder has to agree with the callee's at each of them, not just at a global.
+function fLocal(c: boolean) {
+  let m = mkR(1)
+  let n = mkR(2)
+  if c { m = mkR(9) } else { n = mkR(9) }
+}
+
+const rloc = fLocal(true)
+print(rloc.size)
+
+function fParam(c: boolean, m: {[string]: S}, n: {[string]: S}) {
+  if c { m = mkR(9) } else { n = mkR(9) }
+}
+
+const rpar = fParam(true, mkR(1), mkR(2))
+print(rpar.size)
+
+// ── THE RECURSION WITNESS ─────────────────────────────────────────────────────────────
+// The cell `gc` is UN-ANNOTATED and its initializer calls `fc` — the very function whose
+// inferred map-return shape resolving `gc` requires. That is the cycle in the header, and
+// this file's job is to keep it TERMINATING: without the `retMapFlight` guard this program
+// hangs the compiler, and with a guard that answers -1 on re-entry it is the D30 miscompile
+// again. It has to both compile and be RIGHT, which is why it prints a value.
+let gc = fc(true)
+
+function fc(c: boolean) {
+  if c { gc = mkR(8) } else { gc = mkR(7) }
+}
+
+const gcv = gc["a"]
+if gcv != null { print(gcv.a) }
