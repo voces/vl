@@ -52,6 +52,15 @@ COMPILER = "build/vl-compiler.wasm"
 # grade clean, the non-zero exit would fire forever, and the signal would be ignored —
 # which is how the doc got eight stale rows in the first place.
 DECLARED = [
+    # A CLOSED ROW WHOSE RIGHT OUTCOME IS A REFUSAL. Most closes turn a silent cell into a
+    # working program, and `closed -> runs` covered every row until D35: there the checker
+    # ALREADY refused the direct spelling and the defect was that the refusal did not survive
+    # a type parameter, so the fix makes the filed witness a LOUD CHECK REJECT and `runs`
+    # would grade the fix as a failure. These two phrases must precede the bare `closed`
+    # entry — first match wins — and a row using one is asserting that the refusal is the
+    # outcome, not that the grader was talked out of an inconvenient answer.
+    ("now a loud check reject",    "check_reject"),
+    ("now a loud emit reject",     "emit_reject"),
     ("closed",                     "runs"),
     # LOADS THEN TRAPS — added because the vocabulary had no state for it and D19 was
     # graded `silent_invalid_wasm` while its prose said the opposite. A module that
@@ -72,6 +81,10 @@ DECLARED = [
 ]
 
 def declared_outcome(status_line):
+    """First LIST match wins, not first match by position — so a status line must not use
+    a vocabulary word about some OTHER row. A live row reading "deliberately NOT closed by
+    D35" graded as `closed`/`runs` and reported itself MOVED; the fix is the wording, but
+    the trap is worth naming here because the failure looks like a regression."""
     low = status_line.lower()
     for needle, outcome in DECLARED:
         if needle in low:

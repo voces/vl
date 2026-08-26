@@ -704,6 +704,28 @@ let escJoinWho: string[] = []
 let binCstrLt: i32[] = []
 let binCstrOp: string[] = []
 let binCstrRt: i32[] = []
+// The FuncDecl node that OWNS each constraint — the body it was recorded in, or -1 at
+// module scope. Without it the list is keyed on the TyVar NAME alone and every generic in
+// the program shares one namespace: `function addT<T>(a: T, b: T) { return a + b }`
+// anywhere in the file made `idT(c)` — a generic that never adds — report "operator '+' is
+// not defined for Circle and Circle", because `substTyDeep` maps ANY `T` to the call's
+// binding. That was already a false reject before this column existed, and it is what makes
+// the EQUALITY capability (`binOpDefinedFor`'s `==` arm) safe to state here at all: without
+// the owner, `indexOf`'s `self[i] == needle` would refuse `xs.reverse()` over the same
+// receiver. `validateBinCstrs` / `binCstrsHold` filter on it, falling back to the whole list
+// whenever either end is unknown (-1) so no constraint that fires today stops firing.
+let binCstrFn: i32[] = []
+// The FuncDecl node whose body is being checked, innermost LAST — the owner stamped onto
+// each recorded constraint. Only TOP-LEVEL registered decls are pushed (`fnDeclIx`), so a
+// constraint recorded inside a nested lambda is owned by the enclosing named function, which
+// is the decl a call site can name.
+let cstrOwnerStack: i32[] = []
+// How much a call site knows about its callee, for `cstrOwnedBy`: a DECLARED callee is its
+// own node index; `CSTR_NODECL` is a name with no declaration (a closure parameter called
+// inside a generic body); `CSTR_ANYFN` is no callee at all (a function VALUE instantiated
+// from its type by `genericFnAssignable`).
+const CSTR_NODECL = -1
+const CSTR_ANYFN = -2
 
 // DEFERRED call-argument constraints over un-annotated-param holes: inside a generic
 // body a HOLE flowed as an argument into a CONCRETE parameter (`function f(x) { g(x) }`
@@ -2868,6 +2890,8 @@ export function initChecker() {
   binCstrLt = []
   binCstrOp = []
   binCstrRt = []
+  binCstrFn = []
+  cstrOwnerStack = []
   argCstrAt = []
   argCstrExp = []
   argCstrWho = []
@@ -6697,14 +6721,16 @@ function fnTyHasHole(tyIx: i32) {
 // Do every deferred binary-op constraint THIS binding resolves hold (the capability check, as a
 // pure boolean — `validateBinCstrs` is the diagnostic-emitting twin)? A constraint still touching
 // an unbound hole defers (true here).
-function binCstrsHold(bNames: string[], bTys: i32[]) {
+function binCstrsHold(bNames: string[], bTys: i32[], calleeFn: i32) {
   let ci = 0
   while ci < binCstrOp.length {
-    const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
-    const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
-    if !tyIsHole(clt) {
-      if !tyIsHole(crt) {
-        if !binOpDefinedFor(binCstrOp[ci], clt, crt) { return false }
+    if cstrOwnedBy(binCstrFn[ci], calleeFn) {
+      const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
+      const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
+      if !tyIsHole(clt) {
+        if !tyIsHole(crt) {
+          if !binOpDefinedFor(binCstrOp[ci], clt, crt) { return false }
+        }
       }
     }
     ci = ci + 1
@@ -6735,7 +6761,10 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
         if !assignable(dp[i], sp[i]) { return false }
         i = i + 1
       }
-      if !binCstrsHold(bNames, bTys) { return false }
+      // -1: a function VALUE names no declaration here, so every constraint is still
+      // consulted — `cstrOwnedBy`'s unknown-callee fallback keeps this path exactly as it
+      // was rather than guessing an owner from a `TyFunc`.
+      if !binCstrsHold(bNames, bTys, CSTR_ANYFN) { return false }
       if !argCstrsHold(bNames, bTys) { return false }
       return assignable(substTyDeep(s.fnRet, bNames, bTys), d.fnRet)
     }
@@ -14074,6 +14103,68 @@ export function nodeEqCmpKind(ix: i32): EqCmpKind {
   eqCmpKindOfTy(nodeTyIxOf(ix))
 }
 
+// ── THE ONE HOME for "may these two operands be `==`/`!=`, and if not, what do we say" ──
+//
+// Two gates, in the order the direct spelling has always run them: the STRUCTURAL soundness
+// gate (`isEquatable` — a plain object/array defaults to field-by-field equality, which is
+// sound only when every component is value-comparable) and the EMITTER-CAPABILITY gate
+// (`eqCmpKindOfTy` — a rep with no compare core must not pass `vl check`). Both refusals are
+// appended, because a type can fail both and the direct spelling prints both: a literal-union
+// LIST (`("a"|"b")[]`) is non-equatable AND has no list core.
+//
+// WHY IT IS A FUNCTION RATHER THAN TWO INLINE GATES. The refusal did not survive a type
+// parameter: `checkBin` asks these questions of `T`, which is a `TyVar` — `isEquatable`
+// answers TRUE and `eqCmpKindOfTy` answers "" (OPAQUE) — so a generic body comparing its own
+// `needle: T` type-checks, and the monomorphized instance re-emits the compare at the pinned
+// type with nobody left to ask. `binOpDefinedFor` / `validateBinCstrs` now put the SAME
+// question at the CALL SITE under the substituted type, which is the only place the concrete
+// type and the refusal are both in scope. One home, so "the checker rejects" and "the pin
+// rejects" cannot drift into two answers. (`silent-class-inventory` D35.)
+//
+// `structural` is the caller's answer to "are these operands mutually assignable at all" —
+// `checkBin` has already reported `cannot compare X with Y` when they are not, and the
+// structural gate is inside that `else` because a mismatched pair has no structural compare
+// to be unsound about. `unsup` receives 1 for a refusal belonging on the
+// unsupported-lowering channel (`tErrUnsupported`) and 0 for a plain type error.
+export function eqRefusals(
+  op: string,
+  lt: i32,
+  rt: i32,
+  structural: boolean,
+  msgs: string[],
+  unsup: i32[],
+) {
+  if structural && lt >= 0 {
+    const lT = T.tys[lt]
+    let isStruct = false
+    if lT is TyObj { isStruct = true }
+    else if lT is TyArray { isStruct = true }
+    if isStruct {
+      const seen: i32[] = []
+      if !isEquatable(lt, seen) {
+        msgs.push(
+          tyToStr(lt) +
+            " isn't equatable (a field is not value-comparable) — define a `==` operator for it",
+        )
+        unsup.push(0)
+      }
+    }
+  }
+  // A null TEST is exempt — it is not a value compare, and `emitNulIsNullTest` owns it for
+  // every rep.
+  if !isNullTy(lt) && !isNullTy(rt) {
+    const eqLk = eqCmpKindOfTy(lt)
+    const eqRk = eqCmpKindOfTy(rt)
+    if eqLk == "none" || eqRk == "none" {
+      let eqBad = lt
+      if eqLk != "none" { eqBad = rt }
+      msgs.push("`" + op + "` over " + tyToStr(eqBad) + " has no lowering")
+      unsup.push(1)
+    }
+  }
+  0
+}
+
 // ── structural assignability: is `src` assignable to `dst`? ──────────────────
 // Both are type-arena indices. The error type is assignable in both directions
 // (so one failure doesn't cascade). Primitives match by name. An object is
@@ -15303,20 +15394,57 @@ function tyIsHole(tyIx: i32) {
   false
 }
 
+// The body whose constraints are being recorded — the innermost TOP-LEVEL declaration on the
+// checking stack, or -1 at module scope.
+function cstrOwnerTop() {
+  if cstrOwnerStack.length == 0 { return -1 }
+  cstrOwnerStack[cstrOwnerStack.length - 1]
+}
+
+// Does constraint `owner` belong to the body a call to `calleeFn` will instantiate?
+//
+// A DECLARED callee (`calleeFn >= 0`) adjudicates its own body's constraints and nobody
+// else's. An owner-less constraint (recorded at module scope) always applies. A call that
+// cannot NAME its callee — `CSTR_NODECL` for a name with no declaration, `CSTR_ANYFN` for
+// `genericFnAssignable` working from a TYPE — consults everything, exactly as before.
+//
+// SCOPING THE UNNAMED CALLEE TO THE ENCLOSING BODY WAS TRIED AND IS WRONG, and the witness is
+// worth keeping because the reasoning for it is persuasive and false. A call through a name
+// with no declaration is USUALLY a closure parameter inside a generic HOF, whose holes are the
+// enclosing body's own — but it is also `const f = addT  f(c, c)`, where the holes are
+// `addT`'s and restricting to the caller's body turns a LOUD `operator '+' is not defined for
+// Circle and Circle` into check-clean invalid wasm. That is a loud-to-silent move, i.e. exactly
+// the class this whole change exists to close, produced by the fix for it. The grid missed it
+// because it varied the NEEDLE's and the RECEIVER's delivery and held the CALLEE's at "by
+// name"; `tests/cases/generics/error-deferred-constraint-true-positives.vl` holds it now.
+//
+// What the unnamed callee must NOT do is RE-RECORD (see `validateBinCstrs`), and that is the
+// narrower rule the HOF case actually needed.
+function cstrOwnedBy(owner: i32, calleeFn: i32) {
+  if owner < 0 { return true }
+  if calleeFn == CSTR_ANYFN { return true }
+  if calleeFn == CSTR_NODECL { return true }
+  owner == calleeFn
+}
+
 // Record a deferred binary-op constraint when either operand is a hole — the body can't yet decide
-// the operator's form, so the generic call-site validates it under substitution.
+// the operator's form, so the generic call-site validates it under substitution. Stamped with the
+// OWNING declaration: the constraint speaks about THAT body's type parameters, and a `T` in some
+// other generic is a different `T` even though `substTyDeep` matches on the name.
 function noteBinCstr(lt: i32, op: string, rt: i32) {
   if tyIsHole(lt) || tyIsHole(rt) {
+    const owner = cstrOwnerTop()
     let k = 0
     while k < binCstrOp.length {
       if binCstrLt[k] == lt && binCstrOp[k] == op && binCstrRt[k] == rt {
-        return 0
+        if binCstrFn[k] == owner { return 0 }
       }
       k = k + 1
     }
     binCstrLt.push(lt)
     binCstrOp.push(op)
     binCstrRt.push(rt)
+    binCstrFn.push(owner)
   }
   0
 }
@@ -15348,7 +15476,19 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     if isNullTy(lt) || isNullTy(rt) { return true }
     const eqL = nomErasedTyIx(lt)
     const eqR = nomErasedTyIx(rt)
-    return assignable(eqL, eqR) || assignable(eqR, eqL)
+    if !assignable(eqL, eqR) && !assignable(eqR, eqL) { return false }
+    // THE PINNED TYPE MEETS THE SAME TWO GATES THE DIRECT SPELLING MEETS. Mutual
+    // compatibility was the only question asked here, so a `T` the checker will not `==`
+    // lost its refusal on the way through a type parameter: inside the body `T` is a
+    // `TyVar`, which `isEquatable` calls equatable and `eqCmpKindOfTy` calls OPAQUE, and
+    // the monomorphized instance re-emitted the compare with nobody left to ask. The
+    // consequence was decided DOWNSTREAM by luck — `Circle[]` and `{[string]: i32}` became
+    // check-clean invalid wasm, `("a"|"b")[]` quietly ran — where the direct spelling of
+    // every one of them is a loud checker error. (`silent-class-inventory` D35.)
+    const pinMsgs: string[] = []
+    const pinChan: i32[] = []
+    eqRefusals(op, lt, rt, true, pinMsgs, pinChan)
+    return pinMsgs.length == 0
   }
   const lArr = T.tys[lt]
   const rArr = T.tys[rt]
@@ -15608,6 +15748,7 @@ function solveUnannotParams(fnIx: i32) {
       binCstrLt.pop()
       binCstrOp.pop()
       binCstrRt.pop()
+      binCstrFn.pop()
     }
     while argCstrAt.length > savedArgN {
       argCstrAt.pop()
@@ -15795,28 +15936,71 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
 // RE-DEFERRAL, exactly as in `validateArgCstrs`: an operand that substituted to
 // ANOTHER hole is re-recorded under that hole, so `function gb(v) { return v.bar + 1 }`
 // reached through `function go(w) { print(gb(w)) }` still rejects `go({bar: "s"})`.
-function validateBinCstrs(bNames: string[], bTys: i32[], ix: i32) {
+// SCOPED to the callee (`cstrOwnedBy`): a constraint speaks about ONE body's type parameters,
+// and `substTyDeep` matches TyVars by NAME, so an unscoped list makes every `<T>` in the
+// program one namespace.
+function validateBinCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+) {
   const nOrigB = binCstrOp.length
   let ci = 0
   while ci < nOrigB {
-    const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
-    const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
-    if clt != binCstrLt[ci] || crt != binCstrRt[ci] {
-      if tyIsHole(clt) || tyIsHole(crt) { noteBinCstr(clt, binCstrOp[ci], crt) }
-    }
-    if !tyIsHole(clt) {
-      if !tyIsHole(crt) {
-        if !binOpDefinedFor(binCstrOp[ci], clt, crt) {
-          tErr(
-            "operator '" +
-              binCstrOp[ci] +
-              "' is not defined for " +
-              tyToStr(clt) +
-              " and " +
-              tyToStr(crt) +
-              " (the call's argument types)",
-            ix,
-          )
+    if cstrOwnedBy(binCstrFn[ci], calleeFn) {
+      const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
+      const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
+      // RE-RECORD only when the callee is NAMED. A re-record stamps a NEW owner — the body
+      // this call stands in — and a call that cannot name its callee has no standing to
+      // reassign ownership: inside a generic HOF, `f(self[i], i)` binds `f`'s `T` to the
+      // HOF's own element hole, and with the whole list in scope that re-recorded a SIBLING
+      // generic's `T == T` as the HOF's own. `xs.mapIndexed(toI)` then reported `==` over an
+      // element type nothing in the program compares. The VALIDATION above stays unscoped for
+      // an unnamed callee (`cstrOwnedBy`, and the witness in its header); only the ownership
+      // transfer is withheld.
+      if calleeFn >= 0 {
+        if clt != binCstrLt[ci] || crt != binCstrRt[ci] {
+          if tyIsHole(clt) || tyIsHole(crt) {
+            noteBinCstr(clt, binCstrOp[ci], crt)
+          }
+        }
+      }
+      if !tyIsHole(clt) {
+        if !tyIsHole(crt) {
+          // THE EQUALITY REFUSAL RIDES THE PIN, in the direct spelling's own words. The
+          // generic sentence below names the operator and the two types; for `==` the reader
+          // needs the REASON, which is the same one they would have got had they written the
+          // comparison out (``==` over Circle[] has no lowering`). Reported instead
+          // of the generic sentence, never beside it.
+          const pMsgs: string[] = []
+          const pChan: i32[] = []
+          if binCstrOp[ci] == "==" || binCstrOp[ci] == "!=" {
+            eqRefusals(binCstrOp[ci], clt, crt, true, pMsgs, pChan)
+          }
+          if pMsgs.length > 0 {
+            let pm = 0
+            while pm < pMsgs.length {
+              const pTxt = pMsgs[pm] + " (the call's argument types)"
+              if pChan[pm] == 1 {
+                tErrUnsupported(pTxt, ix)
+              } else {
+                tErr(pTxt, ix)
+              }
+              pm = pm + 1
+            }
+          } else if !binOpDefinedFor(binCstrOp[ci], clt, crt) {
+            tErr(
+              "operator '" +
+                binCstrOp[ci] +
+                "' is not defined for " +
+                tyToStr(clt) +
+                " and " +
+                tyToStr(crt) +
+                " (the call's argument types)",
+              ix,
+            )
+          }
         }
       }
     }
@@ -16851,6 +17035,17 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         )
       }
       i = i + 1
+    }
+    // THE UFCS HALF of the deferred-constraint re-validation, which lived in the
+    // direct-call path alone. `xs.indexOf(nd)` and `indexOf(xs, nd)` are the same call and
+    // must answer the same way; without this the UFCS spelling — the one the module
+    // documents — skipped every constraint the callee's body recorded. The same asymmetry
+    // the `u8[]`-meets-a-generic rule had, for the same reason: `self` arrives AHEAD of the
+    // argument loop the rule sat in.
+    if !inferQuiet {
+      if bNames.length > 0 {
+        validateBinCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL)
+      }
     }
     if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
     return retTy
@@ -18062,7 +18257,9 @@ function checkCallNode(n: Call, ix: i32) {
     // `functions/inferred-return-soundness.vl` rejecting).
     if bNames.length > 0 {
       const dBeforeC = T.diags.length
-      validateBinCstrs(bNames, bTys, ix)
+      let cstrCallee = CSTR_NODECL
+      if cfn is Ident { cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL }
+      validateBinCstrs(bNames, bTys, ix, cstrCallee)
       validateArgCstrs(bNames, bTys, ix)
       // The escaped-join reject is the FALLBACK, not an additional voice: when this
       // same site already reported a precise operand/argument-flow diagnostic, that
@@ -18771,6 +18968,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   narFnEpoch = narFnEpoch + 1
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
+  // OWN the deferred constraints this body records, so a call site can tell whose type
+  // parameters they speak about (`cstrOwnedBy`). Only a REGISTERED top-level declaration is
+  // pushed: a nested function or lambda has no `fnDeclIx` entry for a call site to match
+  // against, so its constraints stay owned by the enclosing named function — which is the
+  // decl a call to it names.
+  let cstrOwnerPushed = false
+  if n.fnName != "" {
+    if (fnDeclIx[n.fnName] ?? -1) == fnIx {
+      cstrOwnerStack.push(fnIx)
+      cstrOwnerPushed = true
+    }
+  }
   // Keep the function's TYPE PARAMETERS in scope for the WHOLE body, so a body
   // annotation that names one — a local `const out: T[]`, `const x: T` — resolves it
   // (to an opaque `TyVar`, like the param signatures) instead of failing "unknown type
@@ -18992,6 +19201,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     tpEnvTys.pop()
     tpPop = tpPop + 1
   }
+  if cstrOwnerPushed { cstrOwnerStack.pop() }
   popScope()
   if !inferQuiet {
     // Mark only the registered TOP-LEVEL decl (not a nested/shadowing namesake).
@@ -26831,6 +27041,7 @@ export function monoInferListElem(
     binCstrOp.pop()
     binCstrLt.pop()
     binCstrRt.pop()
+    binCstrFn.pop()
   }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
@@ -26945,6 +27156,7 @@ export function monoInferLocalScalar(
     binCstrOp.pop()
     binCstrLt.pop()
     binCstrRt.pop()
+    binCstrFn.pop()
   }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
@@ -27886,47 +28098,27 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     // genuine values already fired above, before the equality arms.
     const nomEqLit = nomNameOfTy(lt) != nomNameOfTy(rt) &&
       !nomBinMixes(lt, rt, n.binLeft, n.binRight)
-    if !assignable(lt, rt) && !assignable(rt, lt) && !nomEqLit {
+    const eqMutual = assignable(lt, rt) || assignable(rt, lt) || nomEqLit
+    if !eqMutual {
       tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
-    } else {
-      // SOUNDNESS: a STRUCTURAL `==`/`!=` on a plain object (or array) defaults
-      // to field-by-field equality, which is sound only when every field is
-      // itself value-comparable. A non-discriminated union/nullable/map field is
-      // not — so reject the default structural compare and ask for an explicit
-      // `==`. (Unions/nullables compared DIRECTLY — value-union equality, `==
-      // null` nullness tests — never reach here: only an object/array operand is
-      // tested, matching the host's anonymous-object structural fallback.)
-      const lT = T.tys[lt]
-      let structural = false
-      if lT is TyObj { structural = true }
-      else if lT is TyArray { structural = true }
-      if structural {
-        const seen: i32[] = []
-        if !isEquatable(lt, seen) {
-          tErr(
-            tyToStr(lt) +
-              " isn't equatable (a field is not value-comparable) — define a `==` operator for it",
-            ix,
-          )
-        }
-      }
     }
-    // THE EMITTER-CAPABILITY GATE, off the ONE comparability home (`eqCmpKindOfTy`). A rep
-    // with no compare core must not pass `vl check`: every one of them was check-clean
-    // INVALID WASM, because the emitter's `==` ladder has no arm for it and falls through to
-    // the i32 tail, which emits `i32.eq` over two refs. A null TEST is exempt — it is not a
-    // value compare and `emitNulIsNullTest` owns it for every rep.
-    if !isNullTy(lt) && !isNullTy(rt) {
-      const eqLk = eqCmpKindOfTy(lt)
-      const eqRk = eqCmpKindOfTy(rt)
-      if eqLk == "none" || eqRk == "none" {
-        let eqBad = lt
-        if eqLk != "none" { eqBad = rt }
-        tErrUnsupported(
-          "`" + op + "` over " + tyToStr(eqBad) + " has no lowering",
-          ix,
-        )
+    // BOTH `==` gates, off their ONE home (`eqRefusals`): the STRUCTURAL soundness rule (a
+    // plain object/array compares field-by-field, which needs every component
+    // value-comparable) and the EMITTER-CAPABILITY rule (a rep with no compare core must not
+    // pass `vl check` — every one of them was check-clean INVALID WASM, because the `==`
+    // ladder falls through to the i32 tail and emits `i32.eq` over two refs). The same
+    // function answers at a monomorphization PIN, which is where the refusal used to be lost.
+    const eqMsgs: string[] = []
+    const eqChan: i32[] = []
+    eqRefusals(op, lt, rt, eqMutual, eqMsgs, eqChan)
+    let eqM = 0
+    while eqM < eqMsgs.length {
+      if eqChan[eqM] == 1 {
+        tErrUnsupported(eqMsgs[eqM], ix)
+      } else {
+        tErr(eqMsgs[eqM], ix)
       }
+      eqM = eqM + 1
     }
     return TY_BOOL
   }
