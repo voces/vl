@@ -1,0 +1,252 @@
+// @run
+// @log 2
+// @log NUL
+// @log 2
+// @log NUL
+// @log 2
+// @log NUL
+// @log 2
+// @log NUL
+// @log 2
+// @log NUL
+// @log 2
+// @log NUL
+// @log 3
+// @log NUL
+// @log 1
+// @log NUL
+// @log FN
+// @log NUL
+// @log 7
+// @log NUL
+// D21: an UN-ANNOTATED local captured by a nested function keeps its `| null`, for every
+// nullable rep. Was a loud `emitProgram: bare null needs a struct-typed context` on all of
+// them but `S | null`.
+//
+// IT WAS NEVER A REP AXIS, IT WAS THE ANNOTATION. Measured over four capture binding forms
+// (outer param / annotated local / un-annotated local / two frames deep) x thirteen reps x
+// seven narrowing constructs x two runtime inputs: the param, annotated-local and two-deep
+// forms were clean and the un-annotated form was loud, 14 cells per rep, flat. After the
+// fix all four forms score identically (166 runs / 14 / 2 of 182 each) — which is the
+// statement "the annotation no longer decides", and the only way to make it.
+//
+// THE ROOT WAS A DIVERGENT HAND-COPY. `captureValKind` types an ANNOTATED env field through
+// `vtKindOfType` and an un-annotated one through `letInitCellKind`, whose header claimed to
+// classify "through the same per-`let` predicates `collectLocals` types the binding with, in
+// the same order". It did not: `collectLocals` has eight nullable arms plus the bare-map-read
+// family, `letInitCellKind` had ONE (`letIsNulRef` -> `nulstruct`). "Loud for every rep except
+// plain `S`" and "the only nullable arm is `nulstruct`" are the same fact.
+//
+// BOTH HALVES OF THE PAIR WERE NEEDED, and the `S[] | null` rep below is why this file used
+// to be an `@emit-error`: with only the KIND arm added, `captureValStructIdx` still had no
+// `letIsNulRefArray` arm, so the slot came back -1 and `fbValtype`'s out-of-bounds guard
+// swapped one loud message for another (`ref valtype with no interned shape`). A kind
+// without its companion index is not half a fix, it is a different reject.
+//
+// The ANNOTATED spellings of these same reps live in
+// `capture-nullable-niche-storage-class.vl`; that file is the control this one is measured
+// against, and the two must not diverge again.
+//
+// Nested function names are distinct across the file on purpose — capture analysis is
+// name-keyed module-wide, and two same-named inner functions report `captured variable not
+// found in enclosing frame`.
+
+type S = { a: i32 }
+
+function mkI32(p: boolean): i32[] | null {
+  if p { return [1, 2] }
+  null
+}
+
+function mkStr(p: boolean): string | null {
+  if p { return "hi" }
+  null
+}
+
+function mkStrList(p: boolean): string[] | null {
+  if p { return ["a", "bb"] }
+  null
+}
+
+function mkF64List(p: boolean): f64[] | null {
+  if p { return [1.5, 2.5] }
+  null
+}
+
+function mkI64List(p: boolean): i64[] | null {
+  if p { return [10, 20] }
+  null
+}
+
+function mkF32List(p: boolean): f32[] | null {
+  if p { return [1.25, 2.25] }
+  null
+}
+
+function mkStructs(p: boolean): S[] | null {
+  if p { return [{ a: 3 }] }
+  null
+}
+
+function mkMap(p: boolean): {[string]: i32} | null {
+  if p {
+    const m: {[string]: i32} = Map()
+    m["a"] = 1
+    return m
+  }
+  null
+}
+
+function mkClo(p: boolean): ((i32) => i32) | null {
+  if p { return (x) => x + 1 }
+  null
+}
+
+function mkStruct(p: boolean): S | null {
+  if p { return { a: 7 } }
+  null
+}
+
+// `i32[] | null` — the shared i32 backing (kind 15).
+function i32ListBody(p: boolean) {
+  const v = mkI32(p)
+  function inI32List() {
+    if v != null { print(v.length) } else { print("NUL") }
+  }
+  inI32List()
+}
+
+i32ListBody(true)
+i32ListBody(false)
+
+// `string | null` (kind 16), read through `.length` — the rep whose READ RULE recovers
+// non-null unconditionally, so the capture must carry the nullable cell or the compare
+// tests an already-recovered ref.
+function strBody(p: boolean) {
+  const v = mkStr(p)
+  function inStr() {
+    if v == null { print("NUL") } else { print(v.length) }
+  }
+  inStr()
+}
+
+strBody(true)
+strBody(false)
+
+// `string[] | null` — a DISTINCT-backing leaf list, narrowed by `is` rather than by a null
+// compare (the same ladder reached through the caller that reports the other message).
+function strListBody(p: boolean) {
+  const v = mkStrList(p)
+  function inStrList() {
+    if v is string[] { print(v.length) } else { print("NUL") }
+  }
+  inStrList()
+}
+
+strListBody(true)
+strListBody(false)
+
+// `f64[] | null`, narrowed inside a `while` guard.
+function f64ListBody(p: boolean) {
+  const v = mkF64List(p)
+  function inF64List() {
+    let n = 0
+    while v != null && n < 1 {
+      print(v.length)
+      n = n + 1
+    }
+    if n == 0 { print("NUL") }
+  }
+  inF64List()
+}
+
+f64ListBody(true)
+f64ListBody(false)
+
+// `i64[] | null`, narrowed by a `match` on `null` — the third spelling of the null question.
+function i64ListBody(p: boolean) {
+  const v = mkI64List(p)
+  function inI64List() {
+    print(match v {
+      null => "NUL"
+      _ => "2"
+    })
+  }
+  inI64List()
+}
+
+i64ListBody(true)
+i64ListBody(false)
+
+// `f32[] | null`, through a post-guard early return (the narrowing that applies to the REST
+// of the block rather than to a branch).
+function f32ListBody(p: boolean) {
+  const v = mkF32List(p)
+  function inF32List() {
+    if v == null {
+      print("NUL")
+      return 0
+    }
+    print(v.length)
+    0
+  }
+  inF32List()
+}
+
+f32ListBody(true)
+f32ListBody(false)
+
+// `S[] | null` (kind 18) — THE REP THIS FILE WAS FILED FOR, and the one that needed the
+// `captureValStructIdx` half as well as the `letInitCellKind` half.
+function refArrayBody(p: boolean) {
+  const u = mkStructs(p)
+  function inUnann() {
+    if u != null { print(u[0].a) } else { print("NUL") }
+  }
+  inUnann()
+}
+
+refArrayBody(true)
+refArrayBody(false)
+
+// `{[string]: i32} | null` — the nullable map, whose companion index is the mv SHAPE slot
+// and not a struct row.
+function mapBody(p: boolean) {
+  const v = mkMap(p)
+  function inMap() {
+    if v != null { print(v.size) } else { print("NUL") }
+  }
+  inMap()
+}
+
+mapBody(true)
+mapBody(false)
+
+// `((i32) => i32) | null` — the closure niche. Only the null TEST is pinned: CALLING a
+// captured closure is a separate gap that fails for a NON-nullable capture too, so a call
+// here would pin the wrong defect (the sibling file states the same carve-out).
+function cloBody(p: boolean) {
+  const v = mkClo(p)
+  function inClo() {
+    if v != null { print("FN") } else { print("NUL") }
+  }
+  inClo()
+}
+
+cloBody(true)
+cloBody(false)
+
+// `S | null` — the ONE rep that already worked, because `nulstruct` was the ladder's single
+// nullable arm. It stays here as the control: if a future edit breaks the eight above it
+// alone will keep passing, and that asymmetry is exactly what the original filing looked
+// like.
+function structBody(p: boolean) {
+  const v = mkStruct(p)
+  function inStruct() {
+    if v != null { print(v.a) } else { print("NUL") }
+  }
+  inStruct()
+}
+
+structBody(true)
+structBody(false)

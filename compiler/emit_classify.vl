@@ -296,6 +296,7 @@ import {
   letInfStrListByUse,
   letIsF32,
   letIsNulBoolAnn,
+  letIsNulClosure,
   letIsNulList,
   letIsSet,
   paramArray,
@@ -2366,25 +2367,115 @@ function fnParamNodeOf(fnIx: i32, name: string) {
 // the ONE home of that ladder, shared by the captured-variable resolver
 // (`captureValKind`) and the implicit-return assignment target (`letCellKind`). `"i32"`
 // when no arm claims it, which is also the ladder's own trailing default.
+//
+// THE MIRROR IS ARM FOR ARM AND THE HEADER USED TO LIE ABOUT IT. Until #1935 this ladder
+// had ONE nullable arm (`letIsNulRef`) where `collectLocals` has ELEVEN — two of them kind
+// FAMILIES (`letNulMapReadValKind`, `letNulScalarListKind`) — and that omission IS defect
+// D21: `const v = mk()` over a `T | null`-returning call typed its env field at the NON-NULL
+// kind, `capturedKindOf` answered the non-null kind to every classifier that asked, and the
+// null test found no nullable rep — `emitProgram: bare null needs a struct-typed context` on
+// a program `vl check` accepts. Thirteen arms were missing in all, six more were present but
+// UNGATED, and `letIsUnion` sat hoisted above the scalar-list arms it now gates instead.
+//
+// TWO ARMS OF `collectLocals` ARE DELIBERATELY NOT MIRRORED, and both are no-ops here:
+//
+//   * the `letAnnIsUninternedShape` REJECT that gates its `letIsStruct` arm reads the
+//     ANNOTATION, and this ladder is only ever reached for a binding with NO annotation
+//     (`letCellKind` and `captureValKind` both test `letType >= 0` first). There is also no
+//     `emitFail` to make from a `VKind`-returning classifier.
+//   * `addLocalName`'s companion SLOT arguments (`nulMapShapeOf`, `nulVariantIdxOfLet`,
+//     `letMapShapeOf`, …). This function answers the KIND column only; the two consumers
+//     source the slot themselves — `captureValStructIdx` from its own kind-keyed mirror,
+//     `fnAssignRetSlot` from `fnAssignCellSlot` — and `fnAssignKindGuard` DECLINES every kind
+//     whose companion slot its consumer cannot mint.
+//
+// THE ORDER IS `collectLocals`' ORDER, comments and all, because every one of its arms is
+// placed against a specific miscompile. Read them there; the short form is that a litunion
+// must precede `letIsVariant`/`letIsUnion` (its members register as value-union variants) AND
+// `letIsString` (its checker type is a `string` subtype, which would store an i32 atom into a
+// `(ref $array)` cell), each nullable arm must precede its non-null twin (whose init fallback
+// would else claim the binding and make a later `x = null` invalid), and the scalar-list arms
+// carry `!letIsUnion` / `!letIsNulRefArray` gates that are how `collectLocals` spells the
+// "a value union wins over a scalar-list INIT" rule this ladder used to spell by hoisting
+// `letIsUnion` above them.
 function letInitCellKind(letIx: i32, fnIx: i32): VKind {
+  // A literal-union binding is an i32-backed interned ATOM, not a value-union box — FIRST,
+  // ahead of `letIsVariant` / `letIsUnion` / `letIsString`.
+  if letIsLitUnion(letIx) || letInitIsLitAtom(letIx, fnIx) { return "i32" }
+  // The `K | null` NICHE: the same i32 atom with the spare `-1` for null. BEFORE
+  // `letIsNulString` (a litunion softens to `string`).
+  if letNulLitUnion(letIx, fnIx) { return "i32" }
+  // A NULLABLE map, BEFORE `letIsMap` (whose `(ref $mapStruct)` cell cannot hold null).
+  if letIsNulMap(letIx, fnIx) { return "nulmap" }
+  // A bare `const t = m[k]` read of a LIST- or nested-MAP-valued map binds the value's
+  // ESTABLISHED nullable kind, and a UNION-valued one the shared box. Both BEFORE `letIsMap`.
+  const nmrK = letNulMapReadValKind(letIx, fnIx)
+  if nmrK != null { return nmrK }
+  if letNulMapReadUnionBox(letIx, fnIx) { return "union" }
   if letIsMap(letIx, fnIx) { return "map" }
+  // The nullable VARIANT niche, BEFORE `nulstruct`: `collectS` refuses a variant its own
+  // struct row, so the two cannot share an index space.
+  if letIsNulVariant(letIx, fnIx) { return "nulvariant" }
   if letIsNulRef(letIx, fnIx) { return "nulstruct" }
-  // A value union wins over a scalar-list INIT (`f64[] | string = [1.5]`) — see the
-  // local-decl chain. Checked before the scalar-list cases for that reason.
+  // The nullable lists, each BEFORE its non-null twin.
+  if letIsNulListInfer(letIx, fnIx) { return "nullist" }
+  const nulSLK = letNulScalarListKind(letIx, fnIx)
+  if nulSLK != null { return nulSLK }
+  if (
+    letIsStringArray(letIx, fnIx) &&
+    !letIsUnion(letIx, fnIx) &&
+    !letIsNulRefArray(letIx, fnIx)
+  ) {
+    return "strlist"
+  }
+  if (
+    letIsU8Array(letIx, fnIx) &&
+    !letIsUnion(letIx, fnIx) &&
+    !letIsNulRefArray(letIx, fnIx)
+  ) {
+    return "u8list"
+  }
+  if (
+    letIsF32Array(letIx, fnIx) &&
+    !letIsUnion(letIx, fnIx) &&
+    !letIsNulRefArray(letIx, fnIx)
+  ) {
+    return "f32list"
+  }
+  if (
+    letIsF64Array(letIx, fnIx) &&
+    !letIsUnion(letIx, fnIx) &&
+    !letIsNulRefArray(letIx, fnIx)
+  ) {
+    return "f64list"
+  }
+  if (
+    letIsI64Array(letIx, fnIx) &&
+    !letIsUnion(letIx, fnIx) &&
+    !letIsNulRefArray(letIx, fnIx)
+  ) {
+    return "i64list"
+  }
+  if letIsNulRefArray(letIx, fnIx) { return "nulreflist" }
+  if letIsRefArray(letIx, fnIx) && !letIsUnion(letIx, fnIx) { return "reflist" }
+  // The nullable closure fat-pointer, BEFORE `letIsUnion` (the `fn | null` annotation reads
+  // as a union name) and BEFORE the non-null closure.
+  if letIsNulClosure(letIx, fnIx) || letInfersNulClosure(letIx, fnIx) {
+    return "nulclosure"
+  }
+  if letIsVariant(letIx, fnIx) { return "variant" }
   if letIsUnion(letIx, fnIx) { return "union" }
-  if letIsStringArray(letIx, fnIx) { return "strlist" }
-  if letIsU8Array(letIx, fnIx) { return "u8list" }
-  if letIsF32Array(letIx, fnIx) { return "f32list" }
-  if letIsF64Array(letIx, fnIx) { return "f64list" }
-  if letIsI64Array(letIx, fnIx) { return "i64list" }
-  if letIsRefArray(letIx, fnIx) { return "reflist" }
   if letIsStruct(letIx, fnIx) { return "struct" }
   if letIsArray(letIx, fnIx) { return "list" }
+  if letIsNulString(letIx, fnIx) { return "nulstr" }
   if letIsString(letIx, fnIx) { return "str" }
   if letIsI64(letIx, fnIx) { return "i64" }
   if letIsF32(letIx) || letInfersF32(letIx, fnIx) { return "f32" }
   if letIsF64(letIx, fnIx) { return "f64" }
   if letIsClosure(letIx, fnIx) { return "closure" }
+  // The `boolean | null` niche — a plain i32 to `fbValtype`, but a DEDICATED kind so the
+  // sentinel-2 rep is reachable and a later `x = null` stays valid.
+  if letNulBool(letIx, fnIx) { return "nulbool" }
   "i32"
 }
 
@@ -2422,19 +2513,45 @@ function letCellKind(letIx: i32, fnIx: i32): VKind {
 //     functype producers, ahead of every kind this could supply; naming it here would only
 //     race that owner.
 //
-//   `map` / `nulmap` / `variant` — `emit_sections`' INFERRED-return arm resolves an
-//     `infSlot` for `struct` / `nulstruct` / `reflist` / `map` only, and its `map` arm
-//     reads the SHAPE off the return EXPRESSION (`mapRetExprShape` over `fnRetExprOf`),
-//     which for this shape is the assignment node, not a map expression. A named kind
-//     whose companion slot cannot be minted from the same binding would declare a result
-//     valtype over the wrong heap type; `null` keeps the master outcome instead.
-//     (`nulreflist` is NOT in this list on purpose: `emit_sections` rejects it at
-//     `fbValtype` with a loud emit error, which is strictly better than invalid wasm —
-//     the outcome `tests/cases/functions/tail-assign-nullable-reflist-reject.vl` pins.)
+//   `map` / `nulmap` — `emit_sections`' INFERRED-return arm resolves an `infSlot` for
+//     `struct` / `nulstruct` / `reflist` / `map` only, and its `map` arm reads the SHAPE
+//     off the return EXPRESSION (`mapRetExprShape` over `fnRetExprOf`), which for this
+//     shape is the assignment node, not a map expression. A named kind whose companion
+//     slot cannot be minted from the same binding would declare a result valtype over the
+//     wrong heap type; `null` keeps the master outcome instead.
+//
+// AND THE COMPLEMENT — the kinds that are NOT here, each because DECLINING them is what
+// makes the outcome worse. `null` is not a neutral answer: it restores the classifier's
+// default, which for an inferred return is `i32`, and an `i32` result valtype under a body
+// that pushes a ref is check-clean INVALID WASM. A kind whose slot cannot be minted is
+// better NAMED, because `fbValtype`'s out-of-bounds guard then turns the missing slot into
+// `emitProgram: ref valtype with no interned shape` — a loud emit reject.
+//
+//   `nulreflist` — the original instance of that rule, pinned by
+//     `tests/cases/functions/tail-assign-nullable-reflist-reject.vl`.
+//
+//   `variant` — WAS declined here beside `map` / `nulmap`, on the shared "no `infSlot` arm"
+//     reasoning, and #1935's grid showed the reasoning applies to `map` and not to this.
+//     A variant needs a `uVarHeap` row that `fnAssignRetSlot` does not mint, so it takes
+//     exactly the `nulreflist` route: named, slot -1, loud reject. Measured over the
+//     432-cell implicit-return assignment grid — the four `variantann` cells (an ANNOTATED
+//     `Circle` local, a `bare` tail assignment under `return (g = e)` and under a tail
+//     `if`) were check-clean INVALID WASM on master through this very decline, and are a
+//     loud emit reject with it lifted. Nothing else in the grid moved, in either direction.
+//
+//   `nulvariant` / `nullist` / `nulstrlist` / `nulf64list` / `nuli64list` / `nulf32list` /
+//     `nulbool` / the i32-backed litunion niches — all newly reachable here since #1935
+//     widened `letInitCellKind`, and NONE of them moved a cell of that grid. The nullable
+//     ones are mostly unreachable by construction: `typecheck` refuses a NAMED function an
+//     inferred nullable return outright ("type-valid, but an inferred return of this shape
+//     is not"), so only the LAMBDA producer reaches them, and there the same OOB guard
+//     already answers loudly. Declining them would trade those loud answers for the `i32`
+//     default. `nulbool` and the litunion niches ARE the i32 default, so naming them is a
+//     no-op at this consumer by construction.
 function fnAssignKindGuard(k: VKind): VKind | null {
   if k == "nulstr" { return null }
   if k == "closure" || k == "nulclosure" { return null }
-  if k == "map" || k == "nulmap" || k == "variant" { return null }
+  if k == "map" || k == "nulmap" { return null }
   k
 }
 
@@ -3708,12 +3825,33 @@ export function captureValStructIdx(fe: i32, name: string) {
       // un-annotated arm makes, and for the same reason: `letIsMap` / `letIsNulRef` /
       // `letIsRefArray` all forward `pf` to `P.nodes[pf]`.
       const pf = parentBindingFrameArenaOf(fe, name)
-      // The kind-specific companion index, mirroring `captureValKind`'s ladder:
-      // a map capture carries its mv SHAPE slot, a nullable-struct / struct
-      // capture its struct table index, a ref-list capture its ref-list slot.
+      // The kind-specific companion index, arm for arm with `letInitCellKind` above and
+      // with the SLOT ARGUMENTS `collectLocals` passes `addLocalName` for the same
+      // bindings: a map capture carries its mv SHAPE slot, a nullable-map the same shape,
+      // a bare map READ the value's slot argument, a variant / nullable-variant its
+      // `uVarHeap` row, a nullable-struct / struct capture its struct table index, a
+      // ref-list (nullable or not) its ref-list wrapper slot.
+      //
+      // A KIND WITHOUT ITS SLOT IS A LOUD REJECT, NOT A FALLBACK: `fbValtype`'s
+      // out-of-bounds guard turns `structIdx == -1` on any of the six ref kinds into
+      // `emitProgram: ref valtype with no interned shape`. That is what the `nulreflist`
+      // half of D21 was until #1935 — the KIND arm alone moved the un-annotated `S[] | null`
+      // capture from one loud message to another, and it takes both halves to make it run.
+      // Every kind absent from this ladder needs no slot (the scalars, the leaf scalar
+      // lists and their nullable twins, `str` / `nulstr`, `list`, `u8list`, `union`,
+      // `closure` / `nulclosure`, `nulbool`, and the i32-backed litunion niches).
+      if letIsNulMap(b, pf) { return nulMapShapeOf(b, pf) }
+      if letNulMapReadValKind(b, pf) != null {
+        return letNulMapReadSlotArg(b, pf)
+      }
       if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
+      if letIsNulVariant(b, pf) { return nulVariantIdxOfLet(b, pf) }
       if letIsNulRef(b, pf) { return nulRefStructIdxOfLet(b, pf) }
-      if letIsRefArray(b, pf) { return letRefListSlot(b, pf) }
+      if letIsNulRefArray(b, pf) { return nulRefArrayInnerSlotOfLet(b, pf) }
+      if letIsRefArray(b, pf) && !letIsUnion(b, pf) {
+        return letRefListSlot(b, pf)
+      }
+      if letIsVariant(b, pf) { return variantIndexOfLet(b, pf) }
       const iv = P.nodes[bn.letInit]
       if iv is ObjLit { return structIndexOfExpr(bn.letInit, pf) }
     }

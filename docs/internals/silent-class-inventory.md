@@ -1560,7 +1560,7 @@ now behaves exactly like the value it wraps.
 ---
 
 ### D21 — an UN-ANNOTATED captured local loses its `| null` for EVERY nullable rep
-**loud emit reject · 168 of a 728-cell capture population · filed 2026-08-25 while closing D9, because D9's fix reaches every capture form EXCEPT this one**
+**CLOSED 2026-08-26 (#1935) — the repro now RUNS. Was: loud emit reject · 168 of a 728-cell capture population · filed 2026-08-25 while closing D9, because D9's fix reaches every capture form EXCEPT this one**
 
 Repro:
 
@@ -1598,6 +1598,52 @@ also `letCellKind`'s initializer arm, which feeds `criClassify` / `fnAssignRetKi
 `nulreflist` at those consumers with a recorded reason per kind (a named `nulstr` there
 converts a reject into a TRAP). A nullable kind admitted here has to be admitted at a
 consumer's granularity, not the ladder's.
+
+**HOW IT CLOSED (#1935), and the framing above that was half wrong.** It needed no design
+change: `vl check` on `const v = mk(); print(v.length)` already reports `member access
+'.length' on non-object i32[] | null`, so the checker knew the binding was nullable all
+along, and the same un-annotated binding read UNCAPTURED already ran — `collectLocals`
+handles it. The divergence was confined to the capture path and was a hand-copy that had
+drifted, not a missing inference.
+
+* **The arm diff, confirmed.** `collectLocals` (`emit_collect.vl:2454`) has eight nullable
+  arms — `letNulLitUnion`, `letIsNulMap`, `letIsNulVariant`, `letIsNulRef`,
+  `letIsNulListInfer`, `letNulScalarListKind`, `letIsNulRefArray`, `letIsNulClosure` /
+  `letInfersNulClosure`, `letIsNulString`, `letNulBool` — plus the bare-map-read family
+  (`letNulMapReadValKind` / `letNulMapReadUnionBox`). `letInitCellKind` had ONE
+  (`letIsNulRef` → `nulstruct`). "Loud for every rep except plain `S`" and "the only
+  nullable arm is `nulstruct`" are the same fact.
+* **Fixed in two commits.** (1) `captureValKind` / `captureValStructIdx` were handing the
+  `letIs*` family an `fnStmts` POSITION where it wants an ARENA index — filed in
+  `captureValKind`'s own header, byte-neutral over 1825 corpus programs, and it had to land
+  first because widening the ladder is what makes the mismatch live. (2) the ladder widened
+  arm for arm to `collectLocals`, `captureValStructIdx`'s companion-index ladder widened to
+  match, and `fnAssignKindGuard` lost its `variant` decline.
+* **Both halves of the KIND/SLOT pair were needed.** With the kind arm alone, the
+  `S[] | null` capture moved from one loud message (`bare null needs a struct-typed
+  context`) to another (`ref valtype with no interned shape`), because
+  `captureValStructIdx` had no `letIsNulRefArray` arm and answered slot -1.
+* **The guard question, measured rather than reasoned.** Over a 432-cell implicit-return
+  assignment grid (20 reps × 4 assignment shapes × 2–3 consumption modes × 2 inputs): 32
+  cells moved, ALL improvements, 0 regressions. The only new decline decision that mattered
+  ran the other way — `variant` was DECLINED and had to stop being, because `null` from that
+  guard restores the `i32` default and an `i32` result valtype under a body pushing a
+  `(ref $uVarHeap[vi])` is check-clean INVALID WASM. Four `variantann` cells were exactly
+  that on master and are a loud emit reject now, pinned as
+  `tests/cases/functions/tail-assign-variant-cell-reject.vl`. The `nulstr` decline, newly
+  REACHED from the un-annotated local, delivered what it promised: 12 cells to `runs`.
+* **The capture population after the fix: perfect annotation parity.** All four binding
+  forms score identically, 166 `runs` / 14 loud emit reject / 2 loud check reject of 182
+  each; 126 cells moved, every one `loud emit reject → runs`. The residual 14 per form is
+  `nulvariant`, which is loud in ALL FOUR forms and therefore not this axis (see D22–D24);
+  the 2 per form is `match` over a literal-member union, a checker limitation, also flat.
+* **No collateral.** 1825 of 2247 corpus programs compile under both seeds and all 1825 are
+  BYTE-IDENTICAL; the only two files that differ are the two fixtures this change adds.
+* Pins: `tests/cases/closures/capture-unannotated-nullable-reps.vl` (nine reps that moved
+  plus `S | null`, the one that already worked, kept as the control that a future half-fix
+  cannot pass on alone) and `tests/cases/functions/tail-assign-variant-cell-reject.vl`.
+  `tests/cases/closures/capture-nullable-niche-storage-class.vl` is the ANNOTATED control
+  the first is measured against — the two must not diverge again.
 
 ---
 
