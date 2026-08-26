@@ -1673,7 +1673,7 @@ now behaves exactly like the value it wraps.
 ---
 
 ### D21 — an UN-ANNOTATED captured local loses its `| null` for EVERY nullable rep
-**loud emit reject · 168 of a 728-cell capture population · filed 2026-08-25 while closing D9, because D9's fix reaches every capture form EXCEPT this one**
+**CLOSED 2026-08-26 (#1935) — the repro now RUNS. Was: loud emit reject · 168 of a 728-cell capture population · filed 2026-08-25 while closing D9, because D9's fix reaches every capture form EXCEPT this one**
 
 Repro:
 
@@ -1711,6 +1711,77 @@ also `letCellKind`'s initializer arm, which feeds `criClassify` / `fnAssignRetKi
 `nulreflist` at those consumers with a recorded reason per kind (a named `nulstr` there
 converts a reject into a TRAP). A nullable kind admitted here has to be admitted at a
 consumer's granularity, not the ladder's.
+
+**HOW IT CLOSED (#1935), and the framing above that was half wrong.** It needed no design
+change: `vl check` on `const v = mk(); print(v.length)` already reports `member access
+'.length' on non-object i32[] | null`, so the checker knew the binding was nullable all
+along, and the same un-annotated binding read UNCAPTURED already ran — `collectLocals`
+handles it. The divergence was confined to the capture path and was a hand-copy that had
+drifted, not a missing inference.
+
+* **The arm diff, confirmed.** `collectLocals` (`emit_collect.vl:2454`) has eight nullable
+  arms — `letNulLitUnion`, `letIsNulMap`, `letIsNulVariant`, `letIsNulRef`,
+  `letIsNulListInfer`, `letNulScalarListKind`, `letIsNulRefArray`, `letIsNulClosure` /
+  `letInfersNulClosure`, `letIsNulString`, `letNulBool` — plus the bare-map-read family
+  (`letNulMapReadValKind` / `letNulMapReadUnionBox`). `letInitCellKind` had ONE
+  (`letIsNulRef` → `nulstruct`). "Loud for every rep except plain `S`" and "the only
+  nullable arm is `nulstruct`" are the same fact.
+* **Fixed in two commits.** (1) `captureValKind` / `captureValStructIdx` were handing the
+  `letIs*` family an `fnStmts` POSITION where it wants an ARENA index — filed in
+  `captureValKind`'s own header, byte-neutral over 1825 corpus programs, and it had to land
+  first because widening the ladder is what makes the mismatch live. (2) the ladder widened
+  arm for arm to `collectLocals`, `captureValStructIdx`'s companion-index ladder widened to
+  match, and `fnAssignKindGuard` lost its `variant` decline.
+* **Both halves of the KIND/SLOT pair were needed.** With the kind arm alone, the
+  `S[] | null` capture moved from one loud message (`bare null needs a struct-typed
+  context`) to another (`ref valtype with no interned shape`), because
+  `captureValStructIdx` had no `letIsNulRefArray` arm and answered slot -1.
+* **The guard question, measured rather than reasoned.** Over a 432-cell implicit-return
+  assignment grid (20 reps × 4 assignment shapes × 2–3 consumption modes × 2 inputs): 32
+  cells moved, ALL improvements, 0 regressions. The only new decline decision that mattered
+  ran the other way — `variant` was DECLINED and had to stop being, because `null` from that
+  guard restores the `i32` default and an `i32` result valtype under a body pushing a
+  `(ref $uVarHeap[vi])` is check-clean INVALID WASM. Four `variantann` cells were exactly
+  that on master and are a loud emit reject now, pinned as
+  `tests/cases/functions/tail-assign-variant-cell-reject.vl`. The `nulstr` decline, newly
+  REACHED from the un-annotated local, delivered what it promised: 12 cells to `runs`.
+* **The capture population after the fix: perfect annotation parity.** All four binding
+  forms score identically — **180 `runs` / 0 loud emit reject / 2 loud check reject of 182
+  each**, 140 cells moved and every one `loud emit reject → runs`. The only residual in the
+  whole 728-cell grid is 8 cells: `match` over a literal-member union, a checker limitation,
+  flat across all four forms and so not an annotation axis at all.
+* **THE `nulvariant` RESIDUAL CLOSED, AND IT TOOK BOTH FIXES — measured, not assumed.** When
+  this row was first written the residual was 14 per form at `Circle | null`, attributed to
+  the D22–D24 call-boundary class rather than to the annotation axis. #1937 closed that class.
+  Re-run on the merged base, the un-annotated `nulvariant` cells are a 2x2 over the two
+  branches:
+
+      neither fix   (master ea8e59aa)     14 cells loud emit reject
+      D21 fix only  (branch pre-#1937)    14 cells loud emit reject
+      #1937 only    (master 2788d76f)     14 cells loud emit reject
+      BOTH          (branch merged)       14 cells RUN
+
+  Neither fix alone moves a single one of them. The nullable-variant NICHE is resolved by the
+  call-boundary ladders #1937 repaired, and reaching those ladders at all needs the capture
+  ladder this row repairs — so the attribution was right and the two changes compose exactly.
+  Pinned at the foot of `capture-unannotated-nullable-reps.vl`, where deleting either half
+  restores `bare null needs a struct-typed context`.
+* **No collateral.** Re-measured against each master this branch was merged onto; on
+  `2788d76f` the figure is in the commit that merged it. Every corpus program that compiles
+  under both seeds is BYTE-IDENTICAL under both; the only files that differ are the fixtures
+  this change adds.
+* Pins: `tests/cases/closures/capture-unannotated-nullable-reps.vl` (nine reps that moved,
+  `Circle | null` for the two-fix composition above, and `S | null` — the one that already
+  worked — kept as the control that a future half-fix cannot pass on alone) and `tests/cases/functions/tail-assign-variant-cell-reject.vl`.
+  `tests/cases/closures/capture-nullable-niche-storage-class.vl` is the ANNOTATED control
+  the first is measured against — the two must not diverge again.
+* **WHAT THE `variant` RESULT OPENED, filed as D27 / D28 / D29.** Lifting that decline proved
+  `fnAssignKindGuard`'s `null` is not a no-answer but an `i32`. The four SURVIVING declines
+  were then each lifted ALONE over a 192-cell grid that is identical on master and on this
+  branch: **all 76 of its check-clean-invalid-wasm cells are caused by a decline**, 70
+  becoming correct programs and 6 a trap, 0 backward. Four of the five recorded reasons are
+  refuted by that measurement; only `nulstr`'s survives. Not fixed here — removing them
+  touches every consumer of the guard and needs its own before/after.
 
 ---
 
@@ -2065,6 +2136,179 @@ Controls, all of which RUN — the reviewer's own axis table, each cell executed
   module", and the class already has its live specimen in D25.
   `tests/cases/std/array-reduce-narrowed-variant-init.vl` instantiates `reduce` at four
   accumulator types on purpose and says in its header which fifth one is missing and why.
+
+---
+
+### D27 — a `closure` cell at an implicit-return assignment: the guard declines, the result valtype falls back to `i32`
+**check-clean invalid wasm · 18 of a 192-cell guard-decline grid, plus 16 of the 432-cell implicit-return assignment grid · filed 2026-08-26 while closing D21 · pre-existing, identical on master's `vl-compiler.wasm` and on D21's branch (same offset, same message)**
+
+Repro:
+
+    function mkF(): (i32) => i32 { return (x) => x + 1 }
+    function mkG(): (i32) => i32 { return (x) => x + 5 }
+
+    let g: (i32) => i32 = mkF()
+
+    function f() {
+      g = mkG()
+    }
+
+    f()
+    print(0)
+    // vl check rc 0 (one redundant-annotation hint); vl run:
+    //   Invalid input WebAssembly code at offset 262:
+    //   type mismatch: expected i32, found (ref $type)
+
+Control — the SAME shape over a cell kind the guard does NOT decline (`struct` for
+`closure`, the only change), correct:
+
+    type S = { a: i32 }
+    function mkS(v: i32): S { return { a: v } }
+
+    let g: S = mkS(3)
+
+    function f() {
+      g = mkS(9)
+    }
+
+    f()
+    print(0)
+    // prints 0
+
+Second control — the SAME program with an ANNOTATED return, correct. An annotation takes
+`emit_sections`' `fn.fnRet >= 0` branch and the guard is never consulted:
+
+    function f(): (i32) => i32 {
+      g = mkG()
+    }
+
+* **THE `expected i32` IN THE MESSAGE IS THE GUARD'S OWN FALLBACK.** `fnAssignKindGuard`
+  returns `null` for `closure`, `fnAssignRetKind` therefore answers "no kind", and
+  `emit_sections`' inferred-return arm writes the `i32` default result valtype while the body
+  pushes `(ref $cloStructIdx)`. The guard's header called `null` *"no answer, leave every
+  classifier exactly as it was"*; it is not that. It is an answer, and the answer is `i32`.
+* **MEASURED BY LIFTING THE ONE DECLINE.** With `if k == "closure"` removed from
+  `fnAssignKindGuard` and NOTHING else changed, 18 of the 192 grid-3 cells move
+  `check-clean invalid wasm → runs` and 0 move backward; in grid 2 the same single change
+  moves 10 cells the same way. The decline is the cause, not an incidental bystander.
+* **THE RECORDED REASON DOES NOT HOLD FOR THIS SHAPE.** It reads "`fnReturnsClosure` already
+  owns the closure result at both functype producers, ahead of every kind this could supply".
+  `fnReturnsClosure` owns a tail that IS a function value; this tail is an ASSIGNMENT, so
+  nothing owns it and the decline hands the position to the `i32` default instead.
+* **Flat on all four storage classes** — module global, parameter, annotated local,
+  un-annotated local — and on both assignment shapes (`g = e`, `return (g = e)`), 16 cells.
+  The `nulclosure` sibling adds 12 more with its own decline lifted, and 2 more cells filed
+  under `nulclosure` in the grid are actually `closure` cells (their un-annotated initializer
+  is non-null) and move with this one.
+* **Varies on CONSUMPTION, and that is the silent/loud line**: with the result UNCONSUMED
+  (`f()`) it is invalid wasm; with it bound and called (`const r = f()  print(r(4))`) it is a
+  loud `emitProgram: call to unknown function` — a different, already-known gap. The
+  unconsumed half is silent because the checker never types the result, so nothing downstream
+  notices the disagreement.
+* Not pinned in the corpus: an `@error`/`@run` row cannot express "check-clean invalid
+  module", and the class already has live specimens in D22 and `tests/vl_check_codegen_test.ts`.
+
+---
+
+### D28 — a `map` / `nulmap` cell at an implicit-return assignment, same root as D27
+**check-clean invalid wasm · 40 of a 192-cell guard-decline grid (32 `map`, 8 `nulmap`) · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch**
+
+Repro:
+
+    function mkM(v: i32): {[string]: i32} {
+      const m: {[string]: i32} = Map()
+      m["a"] = v
+      return m
+    }
+
+    let g: {[string]: i32} = mkM(3)
+
+    function f() {
+      return (g = mkM(9))
+    }
+
+    f()
+    print(0)
+    // vl check rc 0 (one redundant-annotation hint); vl run:
+    //   Invalid input WebAssembly code at offset 1061:
+    //   type mismatch: expected i32, found (ref $type)
+
+Control — the SAME program with the straight-line tail spelling instead of
+`return (g = …)`, the only change, correct:
+
+    function f() {
+      g = mkM(9)
+    }
+    // prints 0
+
+* **SAME ROOT AS D27** — `fnAssignKindGuard` declines `map`, the result valtype falls back
+  to `i32`, the body pushes `(ref $mapStruct)`. Lifting `if k == "map"` alone moves all 32
+  `map` cells `check-clean invalid wasm → runs`, 0 backward; lifting `if k == "nulmap"` alone
+  moves its 8 the same way. Neither lift disturbs the other's cells, which is what makes the
+  attribution per-decline rather than shared.
+* **THE RECORDED REASON WAS TESTED ON THE SHAPE IT NAMES, AND IT DOES NOT HOLD.** The guard
+  says the `map` arm "reads the SHAPE off the return EXPRESSION (`mapRetExprShape` over
+  `fnRetExprOf`), which for this shape is the assignment node, not a map expression", which
+  would only have a slot to get wrong for a REF-VALUED map (a mono map's shape is -1). The
+  grid carries both: `{[string]: i32}` (mono) and `{[string]: S}` (mv slot ≥ 0). **All 16
+  cells of each move to `runs`.** The mv-slot hazard the reason describes is not reachable
+  from this position.
+* **The `map` half varies on the ASSIGNMENT SHAPE and not on the storage class**: the
+  straight-line tail runs at all four classes and `return (g = e)` is invalid wasm at all
+  four. The `nulmap` half varies on the VALUE instead — `g = null` is invalid wasm at all
+  four classes while `g = mkN(true)` is a loud check reject (`'f' infers the nullable return
+  type … not yet supported by codegen`). That second asymmetry is `fnAssignRetTargetName`'s
+  own filed note about the checker typing `x = e` as `e`'s UN-coerced type: a `null` RHS
+  types as `null` and slips past the gate that catches the nullable one.
+
+---
+
+### D29 — a `nulstr` cell at an implicit-return assignment: the one decline measurement CONFIRMS
+**check-clean invalid wasm · 6 of a 192-cell guard-decline grid · filed 2026-08-26 beside D27 · pre-existing, identical on master and on D21's branch · NOT the same disposition as D27/D28**
+
+Repro:
+
+    let g: string | null = "hi"
+
+    function f() {
+      g = null
+    }
+
+    f()
+    print(0)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 256:
+    //   type mismatch: expected i32, found (ref $type)
+
+Control — the SAME program assigning a non-null value instead of `null`, the only change,
+correct:
+
+    function f() {
+      g = "bye"
+    }
+    // prints 0
+
+Second control — the SAME program with the annotation dropped, a loud CHECK reject
+(`cannot assign null to string`), because the un-annotated cell is `str` and not `nulstr`.
+
+* **THE MECHANISM IS D27's** — the guard declines `nulstr`, the result valtype falls back to
+  `i32`. **THE DISPOSITION IS NOT.** Lifting `if k == "nulstr"` alone moves these 6 cells to
+  `wasm trap: null reference`, not to `runs` — exactly what the guard's own comment predicts
+  ("makes the module VALID and it then TRAPS on `g = null`"). Of the five surviving-decline
+  experiments this is the only one whose recorded reason survived measurement.
+* **BUT THE COMMENT MIS-NAMES WHAT IT PRESERVES.** It says the decline keeps "the loud
+  invalid-wasm reject it is on master". Check-clean invalid wasm is a SILENT class by this
+  document's vocabulary — `vl check` says rc 0 — so the decline is trading a loud runtime
+  trap for a silent one, not a trap for a reject. Whether that is the right trade is a real
+  question; the comment currently answers a different one.
+* **THE ROOT IS NOT THE GUARD**, and the comment already says where it is: `emitIdentNode`'s
+  kind-16 arm applies `ref.as_non_null` UNCONDITIONALLY, so a store-then-re-read of a
+  `string | null` cell cannot be sound whatever the guard answers. Fixing that arm is what
+  turns these 6 cells into `runs`; until then neither disposition is correct and the choice
+  is between two failure classes.
+* **Flat on the three ANNOTATED storage classes** (global, parameter, annotated local) × both
+  assignment shapes, unconsumed. The un-annotated local is a loud check reject instead (see
+  the second control), and every CONSUMED cell is a loud check reject.
 
 ---
 
