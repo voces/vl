@@ -355,7 +355,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   and a render of `{r:i32}` are the same string.
   **What stays open at that seam is slot IDENTITY, not the heap.** An arm-valued and a
   twin-struct-valued map in one program still share ONE mv slot, because the slot's key
-  is that same render (D40); the dedup layer below it is arm-gated for the day they
+  is that same render (D43); the dedup layer below it is arm-gated for the day they
   separate, measured 0 times and kept for the reason #1942 kept its own.
   (structural slot dedup, variant layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`

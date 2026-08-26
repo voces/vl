@@ -16507,6 +16507,55 @@ export function arrLitIsF64(arrIx: i32, fnIx: i32) {
   false
 }
 
+// The union VARIANT an OBJECT-LITERAL-element array literal boxes its elements under, or
+// "" — the ONE home of the rule `arrLitElemName`, `arrLitElemKind` and `arrLitElemHintTy`
+// each need an arm for, so the three cannot drift on it (their headers already require
+// them to agree ARM FOR ARM; before this they each carried their own copy of the scan).
+//
+// TWO GATES, AND THE SECOND IS THE ONE THAT WAS MISSING.
+//
+// `objVariantName` is a global FIELD-NAME-SET scan of the variant table. Asked on its own
+// it answers `Circle` for an ANONYMOUS `{ r: n }` in any program that declares
+// `Shape = Circle | Sq`, and the three arms then widened that to the whole union — so
+// `const o = [{ r: n }]` built a kind-2 BOX list. Every CONSUMER of the same anonymous
+// shape resolves it to a nominal ROW instead and none of them widens: `structIndexOfObj`
+// at a field read, `shapeNominalOfTy` at the monomorphizer's pin. Two `vl check`-clean
+// invalid modules came out of exactly that disagreement — silent-class-inventory D36 and
+// D38 — where the producer stored `(ref $uBox)` into an array the consumer had typed
+// `(ref null $Dot)` / `(ref null $uVarHeap[Circle])`, two DIFFERENT heap types behind one
+// `$type` placeholder.
+//
+// `arrLitBoxElemName` IS THE COMPLEMENT, AND IT ALREADY EXISTED. It asks the ARENA —
+// `nodeTyIxOf(arrIx)`'s `TyArray` element `is TyUnion`, a non-literal union with two or
+// more members — and its own header states the rule this rung needed: "asked of the ARENA
+// rather than inferred from the render, because the render is shared — a struct / map /
+// closure / nested-array element also answers a non-`""` name and none of those is a union
+// to register". It was written for `collectU`'s registration and for the scalar
+// classifiers, and had no caller on the object-literal path. Measured at the site:
+//
+//   D36  vn=[Circle]     box=[]          si=0   -> was widened to `Shape`
+//   D38  vn=[Circle$m0]  box=[]          si=-1  -> was widened to `Shape$m0`
+//   het  vn=[Circle]     box=[Circle|Sq] si=-1  -> `Shape`, and CORRECTLY so
+//
+// The third is `const xs = [{ r: 1 }, { s: 2 }]`, where the checker really did record a
+// union element; it keeps master's answer, box and all.
+//
+// VARIANTS ARE NOMINAL HERE, the same ruling D32 and D33 were placed under: the fix is not
+// to stop the arm and the anonymous shape sharing a layout — they genuinely do — it is to
+// stop a STRUCTURAL scan answering a question the checker had already answered.
+export function arrLitObjElemBoxVariant(arrIx: i32): string {
+  if !uDeclared { return "" }
+  if arrLitBoxElemName(arrIx) == "" { return "" }
+  const a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length >= 1 {
+      const e0 = P.nodes[a.arrElems[0]]
+      if e0 is ObjLit { return objVariantName(a.arrElems[0]) }
+    }
+  }
+  ""
+}
+
 // The ref-element kind of the array literal at `arrIx` (assumes `arrLitIsRef`): `2`
 // when the FIRST element is a union variant (boxes into the union), else `1` (a direct
 // struct element). Per-element-type: a `Tok[]` literal whose element is a plain struct
@@ -16532,9 +16581,9 @@ export function arrLitElemKind(arrIx: i32) {
       }
       if e0 is ObjLit {
         // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
-        if uDeclared {
-          if objVariantName(a.arrElems[0]) != "" { return 2 }
-        }
+        // ARM FOR ARM with `arrLitElemName`'s object arm — one predicate, so a literal this
+        // one calls a BOX is exactly the one that one keys under a union alias.
+        if arrLitObjElemBoxVariant(arrIx) != "" { return 2 }
         return 1
       }
     }
@@ -16647,16 +16696,18 @@ export function arrLitElemHintTy(arrIx: i32) {
       // Arm 2 — the coarse nested-list bucket.
       if e0 is ArrayLit { return -1 }
       if e0 is ObjLit {
-        if uDeclared {
-          const vn = objVariantName(a.arrElems[0])
-          if vn != "" {
-            // THE VARIANT ARM, 112 of 112. The name is `unNames[u]`; the row is that
-            // table's own `unTyIx[u]`, resolved from that very name at mint.
-            const u = unionOfVariant(variantIndexOf(vn))
-            if u < 0 { return -1 }
-            if u >= unTyIx.length { return -1 }
-            return unTyIx[u]
-          }
+        // ARM FOR ARM with the two classifiers above — the hint must denote the row the
+        // NAME arm picked, so it asks the same predicate. A literal whose object element
+        // resolves to a struct row or to a bare ARM falls past this into the struct arm,
+        // which declines the hint (-1) for the arm case rather than guessing a row.
+        const vn = arrLitObjElemBoxVariant(arrIx)
+        if vn != "" {
+          // THE VARIANT ARM, 112 of 112. The name is `unNames[u]`; the row is that
+          // table's own `unTyIx[u]`, resolved from that very name at mint.
+          const u = unionOfVariant(variantIndexOf(vn))
+          if u < 0 { return -1 }
+          if u >= unTyIx.length { return -1 }
+          return unTyIx[u]
         }
         // THE STRUCT ARM, 813 of 813 once two row classes are excluded. The name is
         // `sNames[si]`; the faithful row is that table's own `sTyIx[si]`.
@@ -16781,12 +16832,25 @@ export function arrLitElemName(arrIx: i32) {
         return "i32[]"
       }
       if e0 is ObjLit {
-        if uDeclared {
-          const vn = objVariantName(a.arrElems[0])
-          if vn != "" { return unionNameOfVariant(variantIndexOf(vn)) }
-        }
+        // THE UNION WIDENING IS `arrLitObjElemBoxVariant`'s, NOT A BARE FIELD-SET SCAN'S —
+        // one home for the rule, so this arm, `arrLitElemKind`'s and `arrLitElemHintTy`'s
+        // cannot drift.
+        const vn = arrLitObjElemBoxVariant(arrIx)
+        if vn != "" { return unionNameOfVariant(variantIndexOf(vn)) }
         const si = structIndexOfObj(a.arrElems[0])
         if si >= 0 { return sNames[si] }
+        // THE ARM'S OWN NAME, NOT ITS UNION — the fall-through the gate needs, in the same
+        // ladder order every consumer already uses (struct row, then variant row: see
+        // `shapeNominalOfTy`). A concrete-variant element list has no `sNames` row, so
+        // `rlElemLitStructRow` declines and the array-literal lowering seeds
+        // `variantIndexOf(name)` instead, building the BARE variant struct — the unboxed
+        // `(ref null $uVarHeap[Circle])` element the reader was already expecting. Without
+        // this line an anonymous element whose only claimant is an ARM has no name here at
+        // all and the literal falls to the i32 list (silent-class-inventory D38).
+        if uDeclared {
+          const av = objVariantName(a.arrElems[0])
+          if av != "" { return av }
+        }
       }
     }
     // The checker-typed UNION element (`arrLitIsRef`'s last rung): the registered

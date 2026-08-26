@@ -298,29 +298,46 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // different root rather than a residue. Four rows came out of that residue and out of the
 // constructed controls beside it (`silent-class-inventory.md` D34-D37).
 //
-// The one below is **D36**: an anonymous `{ r: i32 }` object literal in a LAMBDA's inferred
-// LIST return, in a module that declares BOTH a union arm of that layout and a standalone
-// struct twin of it. No import, no generic, 14 lines. Its controls, each ONE line different
-// and each measured: `Dot` DELETED is LOUD (`emitProgram: field access but no struct type
-// declared`); deleting `Sq`/`Shape` so `Circle` is not an arm RUNS and prints 7; ANNOTATING
-// the element (`const o: Circle[] = [{ r: n }]`) RUNS and prints 7. The third names the axis —
-// the ANONYMOUS spelling is the trigger, not the list and not the lambda.
+// THE D36 SPECIMEN THAT STOOD HERE — an anonymous `{ r: i32 }` object literal in a LAMBDA's
+// inferred LIST return, beside a union arm of that layout and a standalone struct twin of it —
+// IS CLOSED, together with D38, and they were ONE root. It went the way its three predecessors
+// did: the rule the fix needed was already written and simply not consulted. Three classifiers
+// that must agree ARM FOR ARM (`arrLitElemName`, `arrLitElemKind`, `arrLitElemHintTy`) each
+// carried their own un-gated copy of `objVariantName`, a global FIELD-NAME-SET scan of the
+// variant table — so an anonymous `{ r: n }` matched `Circle` structurally and the arms
+// WIDENED that to the whole union, building a kind-2 BOX list under a reader that unboxes.
+// `arrLitBoxElemName` is the complement: it asks the ARENA whether the CHECKER recorded the
+// array's element as a union, was written for `collectU`'s registration, and had no caller on
+// the object-literal path. Probed at the site: `vn=[Circle] box=[] si=0` on D36,
+// `vn=[Circle$m0] box=[] si=-1` on D38, and `vn=[Circle] box=[Circle|Sq] si=-1` on the
+// heterogeneous control that must keep boxing. 37 of a 900-cell grid moved, 28 from
+// check-clean invalid wasm and 9 from a loud emit refusal, none backward; the moved cells are
+// `anon` 37 of 37 on the producer axis and `list` 37 of 37 on the container axis, which is
+// what says the two rows are one root rather than two — while the twin axis SPREADS (none 9,
+// namediff 9, armtwin 9, exact 5, after 5) and decides only which failure the cell had first. Graduated to
+// `tests/cases/unions/anon-objlit-list-elem-beside-arm.vl` and
+// `…/anon-objlit-list-elem-arm-no-twin.vl`, and
+// `xfail-miscompile-lambda-list-anon-elem-arm-twin.vl` is DELETED, which is that file's own
+// written instruction for the day it starts passing.
 //
-// IT IS THE SAME FAMILY AS D32 AND D33 WITH THE DIRECTION REVERSED, which is why neither fix
-// reaches it and why it is a real successor rather than a near-miss of the one just closed.
-// Both of those are "a DECLARED arm resolved onto a struct row". Here the expression holds no
-// declared arm at all: an INLINE literal is resolved, and a real struct row and a real arm
-// both claim its layout. At D33's own site this program probes `arenaS=-1 arenaV=-1 fsS=0
-// fsV=0` — **both arena rungs correctly decline**, because an anonymous shape has no
-// declaration identity, so nothing in the arena can break the tie. That is recorded in D33's
-// census rather than discovered afterwards.
+// THE SUCCESSOR IS THAT CHANGE'S OWN RESIDUE, which is a fifth source and the most honest one
+// available: the closing grid left 8 of its 900 cells silent under BOTH compilers, at the same
+// coordinates, and this is their minimal witness. `function mk(n: i32): Circle[] { const o =
+// [{ r: n }]  return o }` beside `type Dot = { r: i32 }` — eleven lines, no import, no
+// generic, no lambda. The anonymous element resolves to `Dot`'s row (struct table first, the
+// ladder every consumer uses) while the function's declared `Circle[]` RESULT says
+// `uVarHeap[Circle]`, because the checker does not push a return annotation into an
+// un-annotated local. It is `silent-class-inventory.md` D39.
 //
-// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
-// diagnostics at all — not even a hint — `--codegen` rc 1 with `not valid wasm` + `type
-// mismatch: expected (ref null $type), found (ref $type)`, and NO `emit error` marker.
-// Pre-existing and byte-identical on `235b365b` and on D33's branch. Pinned as
-// `tests/cases/soundness/xfail-miscompile-lambda-list-anon-elem-arm-twin.vl` per the REFILLS
-// procedure below, in the same commit that swapped this constant.
+// Its axis is one line: DROP the return annotation and it runs. So do each of `Dot` deleted,
+// `Sq`/`Shape` deleted, a same-arity different-NAME twin, and annotating the local — five
+// controls, all measured, all RUN. Re-RUN against this tree at the swap rather than inherited:
+// `vl check` rc 0 with NO diagnostics at all — not even a hint — `--codegen` rc 1 with `not
+// valid wasm` + `type mismatch: expected (ref $type), found (ref $type)`, and NO `emit error`
+// marker. Pre-existing: silent on `f2064bec` too, same message; what the D36/D38 change moved
+// is its BYTES, not its outcome. Pinned as
+// `tests/cases/soundness/xfail-miscompile-annotated-list-return-anon-elem-twin.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
@@ -363,15 +380,12 @@ const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
   `\n` +
-  `function f() {\n` +
-  `  const g = (n: i32) => {\n` +
-  `    const o = [{ r: n }]\n` +
-  `    return o\n` +
-  `  }\n` +
-  `  return g(7)[0].r\n` +
+  `function mk(n: i32): Circle[] {\n` +
+  `  const o = [{ r: n }]\n` +
+  `  return o\n` +
   `}\n` +
   `\n` +
-  `print(f())\n`;
+  `print(mk(7)[0].r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
