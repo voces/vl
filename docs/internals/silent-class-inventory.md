@@ -74,7 +74,11 @@ coordinate (same container / spelling / construct / pairing / order, `Circle` si
 union member): on master the three arm legs differ from their control on **93 / 84 / 93** of
 their 192 shared coordinates; on the branch, **0 / 0 / 0**. The `plain` leg itself is
 UNCHANGED (171 `correct` / 21 loud / 0 silent, master and branch), which is the negative
-control. Every residual failure sits at one of the 128 pairing=1 coordinates that have no
+control — and stronger than outcome parity: all **171** of its cells that emit a module at
+all are **BYTE-IDENTICAL** under master and the branch (0 differ; the other 21 emit no module
+on either side, and are the container limits `nested arrays are not supported` and the
+nested-map `for`-in). A program with no union arm in it compiles to the same bytes it did.
+Every residual failure sits at one of the 128 pairing=1 coordinates that have no
 arm-free control by construction — a layout twin has to be declared for them to exist at all
 — i.e. exactly D93/D94's territory. The composition is invisible to an outcome-class grader
 and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the same column, and their message changes from `unsupported map value type` to D50's own `field access receiver is not a struct` / `field access but no struct type declared` — the set of message-movers-that-FULL-makes-`correct` is SET-IDENTICAL to the 34) |
