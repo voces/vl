@@ -56,3 +56,35 @@ arm's?
 
 The 10 `loud emit reject` cells are `arm`/`armdiff` x `route=none`, where no declared struct
 names the layout and the mv layer's `-3` floor fires. They are identical on both sides.
+
+## What it reported at D139's CLOSE (base `54780e0b` vs the D139 branch)
+
+The probe that paragraph named was run, and it answered in one column: the local's binding
+already carried the deciding annotation (`letType=37`, `{[string]:Circle}`) and the global's
+did not (`letType=-1`), because D81's `synthDstPinAnns` walked `fnStmts` only. The fix is
+that pass's module run.
+
+| side | runs | loud emit reject | check-clean invalid wasm |
+|---|---|---|---|
+| base `54780e0b` | 15 | 10 | 11 |
+| D139 branch | 18 | 8 | 10 |
+
+**3 cells moved, 0 backward** — `armtwin x mapval x none x global` check-clean invalid wasm
+to runs, and `arm x mapval x none x global` + `armdiff x mapval x none x global`
+**loud emit reject to runs**. THIS GRID IS THE ONLY ONE THAT SEES THE ROW: the 2,850-cell
+D88/D100 and 1,114-cell D112 grids both move 0, because every cell of both builds the map as
+a function LOCAL. That is the whole reason this grid exists, stated as a measurement.
+
+The 10 remaining SILENT cells are filed with runnable witnesses, and they partition exactly:
+**D155** is the 1 cell at `armtwin x mapval x none x callres` (now the specimen), **D156**
+the 3 at `armtwin x nestedmap x none x {local,global,callres}`, and **D157** the 6 at
+`route=std` (3 `mapval`, 3 `nestedmap`).
+The 8 remaining LOUD cells are the documented `-3` floor and are unchanged: they are
+`arm`/`armdiff` x `route=none`, where no declared struct names the layout, and a floor is
+the outcome that row is supposed to have.
+
+**The `bind` axis does NOT discriminate D155**, which is the second thing this grid bought:
+that row is silent at `local`, `global` and `callres` alike, and the axis that does
+discriminate it is whether the producing function's RESULT is annotated. So the grid
+separated D139 from its residue and then said its own axis is not the residue's axis —
+which is exactly what a grid built to vary one held-constant coordinate is for.

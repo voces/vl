@@ -627,6 +627,57 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // so: 44 of the D88 cells and 12 of the D112 cells survive, and after these two rows they
 // are ONE family — every survivor is `decl=armtwin`.
 //
+// ── D139 (#PR) — the specimen's own row closed, and the class did not empty ───────────────
+//
+// D139 was the program above: an arm-valued map bound at MODULE scope beside a standalone
+// struct of the arm's exact layout. It RUNS now, and what closed it is the pattern this
+// genealogy keeps landing on — a complement already written and never called.
+//
+// THE FILED DIAGNOSIS WAS HALF RIGHT AND THE PROBE IS WHAT SPLIT IT. The row said the two mv
+// slots hold two genuinely different heaps (`uVarHeap[Circle]` and `sHeapIdx[Dot]`) and that
+// merging them would be wrong. Both true, both untouched. It also said the residue was a
+// binding-RESOLUTION problem and named the cheapest next probe — "why does the module-scope
+// binding resolve the render's slot where the local resolves the arm's?". Run, that probe
+// answered in one column:
+//
+//   function scope:  letMapShapeOf ix=18 fn=30 letType=37 ({[string]:Circle})  -> shape 0
+//   module   scope:  letMapShapeOf ix=18 fn=-1 letType=-1                      -> shape 1
+//
+// The local ALREADY CARRIED THE ANNOTATION. D81's `synthDstPinAnns` pins an un-annotated
+// `Map()` from the annotation of every destination it is delivered to, and it walked
+// `fnStmts` only — so a module-scope binding, which has no `fnStmts` row and never reaches
+// `collectLocals` either, reached the mv layer un-annotated. The fix is that pass's module
+// run over `globalStmts` with the PROGRAM node as the scope, sharing the destination scan and
+// the disagreement gate rather than copying them. The row's own guess — "most likely a THIRD
+// member of the `synthRetPinAnn` / `synthEmptyListAnn` family" — is refuted: the third member
+// is `synthDstPinAnn`, it already accepted a bare `Map()` initializer and an arm-valued map
+// annotation, and what it was missing was a caller.
+//
+// FOUR GRIDS RE-GRADED AND ALL FOUR STAY AT 0: D52 (9,450), D75/D81/D82 (3,144),
+// D111/D117 (1,710), D131 (1,732) — 0 moved, 0 backward, 0 silent on each. The two grids the
+// row lived on move 0 as well (D88/D100 2,850; D112 1,114), which is the finding rather than
+// a null result: EVERY cell of both builds the map as a function LOCAL, so neither could ever
+// have seen this row. The 36-cell binding-storage-class grid that CAN
+// (`scripts/silent-sweep/d139/`) moves 3 — one `check-clean invalid wasm` -> `runs` and two
+// `loud emit reject` -> `runs`, 0 backward.
+//
+// THE ABLATION BASE IS PROVEN AGAIN: stripping the change out of the branch reproduces
+// `54780e0b` byte-for-byte at 1,452,568 bytes, and the three OTHER candidates that were
+// built and measured beside it are NOT in this commit — see D156 for why. One of them moved
+// 70 D88 cells forward and FOUR D112 cells backward (`runs` -> check-clean invalid wasm),
+// which is the whole reason the ablation was run per-candidate rather than on the sum.
+//
+// THE SUCCESSOR IS THE SAME PROGRAM WITH THE MAP RETURNED FROM A CALL. Twelve lines, no
+// import, no generic, no lambda, no `??`, one nesting level. Its seven controls were built
+// and RUN: deleting `Dot` and a non-twin `Dot` are both LOUD, deleting the union runs,
+// annotating the local runs, ANNOTATING THE RESULT runs (which is what names the channel),
+// binding the map directly runs (that is D139's close), and wrapping the call site in a
+// function is STILL SILENT — so unlike D139 this one is storage-class INDEPENDENT and the
+// `bind` axis does not discriminate it. Pre-existing on `54780e0b`, same message at the same
+// offset. It is `silent-class-inventory.md` D155, pinned as
+// `tests/cases/soundness/xfail-miscompile-arm-valued-map-from-a-call-result.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // THE SUCCESSOR IS THAT FAMILY'S MINIMAL WITNESS: NINE LINES, no import, no generic, no
 // lambda, no `??`, one nesting level. An arm-valued map beside a standalone struct of the
 // arm's exact layout — the render `{r:i32}` resolves to the twin through the struct table
@@ -643,7 +694,9 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // same message, and its module is byte-identical across the change. It is
 // `silent-class-inventory.md` D139, pinned as
 // `tests/cases/soundness/xfail-miscompile-arm-valued-map-beside-struct-twin.vl` per the
-// REFILLS procedure below, in the same commit that swapped this constant.
+// REFILLS procedure below, in the same commit that swapped this constant. (That row is
+// CLOSED as of the paragraph below; the file graduated to
+// `tests/cases/soundness/arm-valued-map-beside-struct-twin.vl`, `@run` + three `@log 7`.)
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
@@ -686,9 +739,12 @@ const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
   `function thru(x: {[string]: Circle}) { return x }\n` +
-  `const c = Map()\n` +
-  `c["o"] = { r: 7 }\n` +
-  `thru(c)\n` +
+  `function mkm() {\n` +
+  `  const c = Map()\n` +
+  `  c["o"] = { r: 7 }\n` +
+  `  return c\n` +
+  `}\n` +
+  `thru(mkm())\n` +
   `print(7)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left

@@ -1,0 +1,75 @@
+// @run
+// @log 7
+// @log 7
+// @log 7
+// GRADUATED from `@no-instantiate` (silent-class-inventory D139, 2026-08-27). This file was
+// the check-clean-invalid-wasm SPECIMEN — `tests/vl_check_codegen_test.ts`'s
+// `INVALID_MODULE_SRC` — and program 1 below is that constant verbatim. It printed
+// `type mismatch: expected (ref $type), found (ref $type)` out of a `vl check` that exited 0
+// with no diagnostics at all. It runs.
+//
+// WHAT WAS WRONG WAS NOT THE MINT, AND THE PROBE IS WHAT SAID SO. The filed diagnosis was
+// that two mv slots hold two genuinely different heaps — `uVarHeap[Circle]` for the arm and
+// `sHeapIdx[Dot]` for the render — and that is TRUE and MUST STAY TRUE: `DECISIONS.md` keeps
+// the variant and struct tables in two namespaces on purpose, and `rlSlotsLayoutTwin`
+// correctly declines to merge them. Dumped on `54780e0b`, program 1 and its function-scope
+// sibling intern the SAME two slots over the SAME two ref-list rows and emit BYTE-IDENTICAL
+// type sections:
+//
+//   mv slot=0 name=Circle   kind=1 rl=0 rlnm=Circle rlheap=1 rlwrap=9   mapTy=15
+//   mv slot=1 name={r:i32}  kind=1 rl=1 rlnm=Dot    rlheap=0 rlwrap=11  mapTy=16
+//
+// The ONLY difference is which of the two the BINDING's `Map()` resolves — `struct.new 15`
+// at function scope, `struct.new 16` at module scope — and one column explains it:
+//
+//   function scope:  letMapShapeOf ix=18 fn=30 letType=37 ({[string]:Circle})  -> shape 0
+//   module   scope:  letMapShapeOf ix=18 fn=-1 letType=-1                      -> shape 1
+//
+// AT FUNCTION SCOPE THE CONTEXT WAS ALREADY BEING CARRIED, BY A CARRIER THAT NEVER RAN OVER
+// THE MODULE. D81's `synthDstPinAnns` pins an un-annotated `Map()` local from the annotation
+// of every destination it is delivered to — `thru(x: {[string]: Circle})` is one — and it
+// walked `fnStmts` only. A module-scope binding has no `fnStmts` row and never reaches
+// `collectLocals` either, which is the same structural gap `synthGlobalEmptyListAnns` exists
+// to close one family over. The fix is that pass's module run, with the PROGRAM node as the
+// scope identifiers resolve in; the destination scan, the disagreement gate and the four
+// legs are shared rather than copied.
+//
+// SO IT WAS D39'S CHANNEL PROBLEM AS FILED — an anonymous `{ r: 7 }` with two nominal
+// claimants that only the CONTEXT separates — but NOT a missing channel. The channel was
+// written, and the row's own guess that the fix would be "a third member of the
+// `synthRetPinAnn` / `synthEmptyListAnn` family" is refuted: the third member is
+// `synthDstPinAnn`, it already handles a bare `Map()` initializer and an arm-valued map
+// annotation, and what it was missing was a caller.
+//
+// THE CLASS IS NOT EMPTY AND THIS FILE IS NOT THE PROOF OF ANYTHING BROADER. The successor
+// specimen is `xfail-miscompile-arm-valued-map-from-a-call-result.vl` beside it — the same
+// program with the map returned from a call — and D156 / D157 / D158 carry three more live
+// shapes with runnable witnesses.
+
+// 1 — the former specimen, verbatim: the map bound at MODULE scope and handed to a callee
+// whose parameter names the arm. The value is never read back, which is the whole point of
+// keeping it unchanged: the mismatch was at the `Map()` construction, not at a read.
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+type Dot = { r: i32 }
+function thru(x: {[string]: Circle}) { return x }
+const c = Map()
+c["o"] = { r: 7 }
+thru(c)
+print(7)
+
+// 2 — the same binding with the value READ BACK through the map, so the pin covers the round
+// trip and not only the construction. `thru`'s result is the pinned map.
+const c2 = Map()
+c2["o"] = { r: 7 }
+print((thru(c2)["o"] ?? { r: 0 }).r)
+
+// 3 — the FUNCTION-scope sibling, which ran before this change and must keep running: the
+// module run must not disturb the walk it was added beside.
+function mk(n: i32) {
+  const c3 = Map()
+  c3["o"] = { r: n }
+  return thru(c3)
+}
+print((mk(7)["o"] ?? { r: 0 }).r)

@@ -113,7 +113,11 @@ two rows disjoint roots rather than one stated twice.
 
 The residue is **44 cells, all `decl=armtwin` x `src=declname`** (`bare x std` 2,
 `mapval x std` 6, `nestedmap x gen` 12, `nestedmap x none` 12, `nestedmap x std` 12), filed
-as **D139**. With an exact struct twin declared, the render `{r:i32}` resolves to it through
+as **D139** — RE-FILED 2026-08-27 as **D156** (36 cells, `cont=nestedmap`) and **D157**
+(8 cells, `route=std`), because D139 CLOSED and moves **0 of this grid**: every cell here
+builds the map as a function LOCAL and D139 is the MODULE-scope binding. The lumping is the
+lesson — the row claimed all 44 and the fix reached none of them. With an exact struct twin
+declared, the render `{r:i32}` resolves to it through
 the struct table before anything can ask for an arm, so the two mv slots hold two genuinely
 different heaps and D123's merge correctly declines them.
 
