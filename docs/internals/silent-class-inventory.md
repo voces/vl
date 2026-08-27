@@ -4592,8 +4592,8 @@ spellings, plus the literal-union pair that separates the two roots).
 
 ---
 
-### D45 — `isEquatable` refuses a LITERAL-UNION element although that element compares correctly
-**loud check reject · found 2026-08-26 by the `std-api-reviewer` pass over D35's retirement — the FIFTH consecutive time that review has produced the closing change's next row · pre-existing, byte-identical on `f2064bec` and on D35's branch · NOT silent, and filed anyway because D35's close is what put it in a caller's way**
+### D45 — [CLOSED 2026-08-26] `isEquatable` refuses a LITERAL-UNION element although that element compares correctly
+**CLOSED 2026-08-26 — the repro now RUNS and prints `false`. Was: loud check reject · found 2026-08-26 by the `std-api-reviewer` pass over D35's retirement — the FIFTH consecutive time that review has produced the closing change's next row · pre-existing, byte-identical on `f2064bec` and on D35's branch · NOT silent, and filed anyway because D35's close is what put it in a caller's way**
 
 Repro:
 
@@ -4636,6 +4636,47 @@ Repro:
 * Fixing it is a language-design question, not a rider on D35: either `isEquatable` grows a
   literal-union arm (and `eqCmpKindOfArrayElem` a core to match), or the refusal stays and the
   MESSAGE stops naming a field that is comparable.
+
+#### The close (2026-08-26, #D45)
+
+**BOTH, AND THE BACKING DECIDES WHICH.** The row offered two exits and the answer is that they
+are not alternatives: the first sentence is wrong for EVERY literal union and the second is
+right for exactly one backing, so the arm and the message correction are the same change read
+at two severities.
+
+* **THE COMPLEMENT WAS ALREADY WRITTEN, ONE OPERATOR OVER.** `concatRefusal`'s
+  `concatElemIsI32Backed` / `tyUnionAllLits` decide "is this element one i32 cell" for list
+  `+`, accept the whole literal family, and say so in their own header — *"`eqCmpKindOfArrayElem`
+  is NOT that set — it answers "none" for a literal-union element, and a `("a"|"b")[] +
+  ("a"|"b")[]` concatenates correctly today"*. The `==` home had the note pointing AT it and
+  never called it. `isEquatable` now asks `tyUnionAllLits` (which also covers the `| null`
+  member — the atom's spare `-1`), and a bare `TyLit` answers true for the same reason.
+* **THE LOWERING HALF IS SPLIT BY BACKING, and the split is the honest half of the row's second
+  sentence.** `eqCmpKindOfArrayElem` spells its accept set as two prim names; a literal-union
+  element is the third member of it when the backing is i32 — the interned ATOM for a string
+  union (`tyIsLitUnion`), the BASE SCALAR for a numeric one (`numLitUnionBaseName == "i32"`).
+  An `f64`- or `i64`-based numeric union rides its own list wrapper, whose `==` has no core at
+  all, so `F[]` stays refused. The `TyArray` arm's inner check took the same two tests one hop
+  down, which is what admits `K[][]` as the ref list of i32 lists it is.
+* **THE `f64` CELLS ARE THE MESSAGE DIFF, and an outcome-class count cannot see them.** 10 of
+  the grid's cells are `loud_check_reject` on both sides and moved MESSAGE only: from
+  `F[] isn't equatable (a field is not value-comparable) — compare a projection whose
+  components are…` to `` `==` over F[] has no lowering ``. That is the row's second exit taken
+  for the cells the first one does not reach — the sentence stops naming a comparable field
+  and names the missing lowering instead.
+* **26 GRID CELLS, every one `loud check reject` → `runs`**, across `K` / `N` element types x
+  `list` / `listlist` / `nullist` containers x `direct ==` / `direct !=` / a hand-written
+  `eqT<T>` / `indexOf` / `includes`. 0 moved to any silent outcome; the `eqRefusals` trade the
+  row warns about was checked by RUNNING every admitted cell, not by reading the ladder.
+* Graduated: `tests/cases/literal-unions/litunion-list-equality.vl` (the compiler-side pin,
+  importing nothing — list, `!=`, LENGTH, numeric base, `K[][]`, and a struct with a `K` FIELD,
+  which is the structural gate's own shape) and `tests/cases/std/array-litunion-list-needle.vl`
+  (all four `needle: T` exports at both backings, each pinned to a different answer). The `K[]`
+  rows of `tests/cases/std/error-array-needle-not-equatable.vl` — the fixture that PINNED this
+  refusal — graduated out of it and were replaced by an `F[]` row, which is the half that was
+  true. `std/array.vl`'s ledger gained a `needle: T` at a LITERAL-UNION LIST row (RETIRED) and
+  its `f64` sibling (compiler floor, symmetric); the module's live carve-out count is unmoved
+  at **zero silent, one loud**, re-measured rather than carried over.
 
 ---
 
@@ -5238,8 +5279,8 @@ recognised the operands at all.
 
 ---
 
-### D58 — a GENERIC function passed as a closure ARGUMENT is a loud emit reject at every instantiation
-**loud emit reject · found 2026-08-26 by the D42/D44/D46 grid's callee-delivery axis (105 of its 741 cells, every one of them) · pre-existing and IDENTICAL on `c0873a06` and on that branch · NOT silent, filed for the same reason D43 is: it is why a whole axis value of that grid could not be graded on its own question**
+### D58 — [CLOSED 2026-08-26] a GENERIC function passed as a closure ARGUMENT is a loud emit reject at every instantiation
+**CLOSED 2026-08-26 — the repro now RUNS and prints `false`. Was: loud emit reject · found 2026-08-26 by the D42/D44/D46 grid's callee-delivery axis (105 of its 741 cells, every one of them) · pre-existing and IDENTICAL on `c0873a06` and on that branch · NOT silent, filed for the same reason D43 is: it is why a whole axis value of that grid could not be graded on its own question**
 
 Repro:
 
@@ -5269,6 +5310,49 @@ Repro:
 * Not a member of this file's silent classes — it is a clean emit reject with a message naming
   the unsupported position. Filed so the next grid over the callee-delivery axis does not spend
   a fifth of its cells discovering it again.
+
+#### The close (2026-08-26, #D58)
+
+**THE TITLE IS ONE AXIS TOO WIDE, AND THE CONTROLS ARE WHAT NARROW IT.** "Passed as a closure
+argument" is not the trigger — the RECEIVER is. Each of these is one line different from the
+repro and each RAN on master `8bf0f20f`:
+
+| control | outcome on master |
+|---|---|
+| `hof(g: (i32,i32)=>boolean, …)` — the receiver CONCRETE | runs |
+| `hof<U,R>(…)` with a CONCRETE `opC` argument | runs |
+| `hof<R>(g: (i32,i32)=>R, …)` — only the arrow's RESULT rides a type param | runs |
+| `const f = opT  hof(f, a, b)` through a concrete `hof` | runs |
+
+The trigger is a GENERIC function value flowing into a parameter whose annotation is an ARROW
+riding the RECEIVER's own type parameters. Both halves are required, which is why a grid that
+holds either fixed cannot see it.
+
+**IT IS AN ORDER, NOT A MISSING RESOLVER — the first row in this file's 2026-08-26 run that is
+neither the standing "call the complement" lead nor D39's channel.** `monoWalk`'s coercion loop
+hands the receiver's DECLARED parameter type to `monoCoerceFnValue`, which is sound only while
+that type is a function type; `(U, U) => R` is not one yet. `monoFnTypeAnnParamsName` split it
+into the pin names `["U", "U"]` and `monoInstanceFor` minted an instance of `opT` whose
+parameters are SPELLED `U` — a type variable of a different function, which
+`emitOneFuncType`'s parameter ladder correctly refuses. The main binding loop then compounded
+it: it binds a type parameter at its FIRST use in declaration order, `U`'s first use is `g`,
+and the only thing there to read it off is the argument's own declaration (`(T, T) => boolean`),
+so `U` bound to `T`.
+
+Three edits, and the middle one is the whole fix:
+
+| edit | site | what it does |
+|---|---|---|
+| the gate | `monoWalk`'s coercion loop + `monoFnParamAnnRidesTyParam` | skip the eager coercion when the parameter's annotation mentions the receiver's own type parameters — a receiver with none answers false, so every concrete call is untouched |
+| the ORDER | `monoInstantiate`'s pre-binding pass + `monoCallGenFnToTyParamArrow` | bind the type parameters from the NON-arrow arguments first, so the arrow substitutes to a function type that exists. Gated on a generic function actually being on its way into such a parameter — the two orders can only disagree when one of them answers with a type VARIABLE |
+| the deferred call | `monoInstantiate`'s composite-arrow branch | `monoCoerceFnValueName(args[i], pinC, …)` at the SUBSTITUTED pin, which is the coercion `monoWalk` skipped |
+
+**12 GRID CELLS, every one `loud emit reject` → `runs`** — `arg_gentv` and `arg_gen2` x a
+generic callee x `i32` / `f64` / `string` x 0 and 1 EXTRA generics in the file. 0 in any other
+direction, and the `arg_concrete` / `arg_genret` / `direct` / `bound` / `field` / `ret` columns
+are byte-for-byte unmoved. Graduated:
+`tests/cases/generics/generic-fn-as-generic-hof-argument.vl`, which carries all four arrow
+shapes and the three controls above.
 
 ---
 
@@ -5539,8 +5623,8 @@ the CALLBACK'S RETURN) still holds and is unchanged.
 
 ---
 
-### D51 — an un-annotated function returning a bare struct-SHAPED local with no `sNames` row
-**loud emit reject · found 2026-08-26 by the D39/D40/D41 grid, and it is the largest single family in that grid's residue (34 of 72 cells) · LOUD on master `6bb5d46f` and on the closing branch alike, and 4 of its cells moved silent → LOUD in that change · it is also what D66 reduces to once that row stops being a carve-out**
+### D51 — [CLOSED 2026-08-26] an un-annotated function returning a bare struct-SHAPED local with no `sNames` row
+**CLOSED 2026-08-26 — the repro now RUNS and prints `7`. Was: loud emit reject · found 2026-08-26 by the D39/D40/D41 grid, and it is the largest single family in that grid's residue (34 of 72 cells) · LOUD on master `6bb5d46f` and on the closing branch alike, and 4 of its cells moved silent → LOUD in that change · it is also what D66 reduces to once that row stops being a carve-out**
 
 Repro:
 
@@ -5583,6 +5667,60 @@ Repro:
   annotation on the binding, so the read floors instead of the result valtype) and 2 at
   `emitProgram: binding's inline-shape type has an unsupported field` (an inline-shape LOCAL
   annotation beside a declared struct of that layout, D53's sibling spelling).
+
+#### The close (2026-08-26, #D51)
+
+**THE PREDICTION WAS RIGHT ABOUT THE ROUTE AND WRONG ABOUT THE COUNT, AND THE COUNT IS THE
+ROW.** D52 shipped the `retKindPri` tier, the `infSlot` arm and one rung, so the three pieces
+this row's own text named were already in the tree; what was left was the RESOLVER and the fact
+that FOUR separate sites mint the pair `("struct", -1)`, not one. Fixing them one at a time is
+a sequence of half-fixes each of which an outcome-class grader scores as no progress — which is
+exactly the trap D52's close records, met again on the same row.
+
+**THE RESOLVER: the object-literal leg `exprVariantIndex` deliberately lacks, asked under the
+opposite precondition.** `letObjLitVariantIdx` / `objLitVariantIdxNoStructRow` answer
+`objVariantName`'s field-set match, and ONLY where `structIndexOfObj` says the struct table has
+no row for that field set. That is what separates this from D39's channel and it is checkable
+rather than asserted: D39's two claimants exist only when a `Dot` does, and where a `Dot` does
+the gate declines and the struct path answers, as it should. **The `-1` gate makes the whole
+change inert on every program that emits a module today** — the pair it fires on is
+`fbValtype`'s bounds guard, so there is nothing running to break.
+
+| edit | site | what it does |
+|---|---|---|
+| the resolver | `objLitVariantIdxNoStructRow` + `letObjLitVariantIdx` | the field-set answer, gated on the struct table having no row |
+| the RETURNED-LOCAL rung | `criClassify`'s `letIsStruct` arm | `const c = { r: n }  const o = c  return o` |
+| the RETURN-EXPRESSION rung | `criClassify`'s `exprStruct(rx)` arm | `return { r: n }`, no local at all — a two-line spelling the rung above cannot see |
+| the LOCAL's own slot | `collectLocals`' struct arm | the locals VECTOR, where the reject moved to when only the functype was fixed |
+| **the emit SEED** | `wasmEmit`'s LetDecl + un-annotated-return `pendingVariantIdx` | the slot-kind twin of `letAnnVariantIdx`, exactly as the `nulstruct` seed beside it is `letAnnStructIdx`'s |
+
+**THE FIFTH EDIT WAS FOUND BY DISASSEMBLING AND IT WAS A LOUD → SILENT MOVE, which is this
+file's blocker condition.** With the first four in place the repro was no longer a reject and
+was not correct either:
+
+    (type 0) (struct (field (mut i32)))        Circle's variant heap
+    (type 2) (struct (field i32) (field anyref))   the union BOX
+    (func (result (ref 0)) (local (ref 0) …)
+      i32.const 0  local.get 0  struct.new 0  struct.new 2  local.set 1   ← invalid
+
+`emitObjLitNode` has three arms — a seeded `pendingVariantIdx`, a matching standalone struct,
+and `uDeclared` → BOX — and the seed was read only from the ANNOTATION, so every binding
+classified from its INIT fell to the box. `vl check` rc 0 and a module the engine refuses,
+strictly worse than the reject it replaced. Reported as a grid count alone the stage looks like
+a fix.
+
+**GRID: 12 of the 434 shared cells, every one `loud emit reject` → `runs`, 0 in any other
+direction** — `decl=arm` x `objlit` source x `direct` / `local` / `alias` bindings x `ret` /
+`retann` / `read` consumption. Graduated:
+`tests/cases/unions/inferred-arm-local-return.vl` (five spellings including the no-local one
+and a SECOND arm, so the field-set match is choosing between rows rather than finding the only
+one). Beside it, `inferred-arm-local-return-beside-layout-twin.vl` is a CONTROL and not a
+graduation — every row in it already ran on master `8bf0f20f` and its module is byte-identical
+under both compilers, which is the point: it is the declaration state where the struct table
+HAS the row and the new rung must DECLINE, and a file pinning only the failing state cannot
+tell an inert gate from an over-eager one. `std/array.vl`'s ledger row
+`bare container, const c: Circle | LOUD | LOUD | RETIRED (D66/D51)` is re-measured to
+`RUNS | RUNS`, with and without the twin, and an UN-annotated row added beside it.
 
 ---
 
@@ -5730,8 +5868,8 @@ that file's own written instruction for the day it starts passing.
 
 ---
 
-### D53 — an INLINE-SHAPE parameter in a program that also declares a struct of that layout
-**loud emit reject · found 2026-08-26 while building D41's graduated fixture, by bisecting a whole-program interaction · LOUD on master `6bb5d46f` and on the closing branch alike · unrelated to D39/D40/D41; it is here because it silently decides what a fixture may contain**
+### D53 — [CLOSED 2026-08-26] an INLINE-SHAPE parameter in a program that also declares a struct of that layout
+**CLOSED 2026-08-26 — the repro now RUNS and prints `7`. Was: loud emit reject · found 2026-08-26 while building D41's graduated fixture, by bisecting a whole-program interaction · LOUD on master `6bb5d46f` and on the closing branch alike · unrelated to D39/D40/D41; it is here because it silently decides what a fixture may contain**
 
 Repro:
 
@@ -5752,6 +5890,45 @@ Repro:
 * Found the way whole-program interactions get found: a five-cell fixture failed while every
   one of its cells passed alone, and the pairwise bisect named the pair. That is why the D41
   fixture spells its param cell `c: Boxed` — a fixture must fail for the row it pins.
+
+#### The close (2026-08-26, #D53)
+
+**IT IS NOT TWO CLAIMANTS — IT IS ONE CLAIMANT AND A RESOLVER THAT COULD NOT REACH IT.** The
+grouping guessed a channel; the measurement says a call. `internInlineShapeTy` ends in
+`annShapeIndexOf`, which DEDUPS the inline shape onto the declared row and pushes **no `sNames`
+entry** for `{r:i32}` — correct, and it leaves `structIndexByName("{r:i32}")` with nothing to
+find. So the shape has exactly one row and one name, and the name is `Boxed`.
+
+**THE FUNCTYPE FOR THE SAME NODE ALREADY RESOLVED IT, which is how the asymmetry was found
+rather than reasoned to.** Disassembled, `function f(c: { r: i32 })` with the parameter unused
+emits `(func (param (ref 0)) (result i32))` where type 0 IS `Boxed`'s row — `annValtypeSlotOf`
+→ `retStructIndex` → `repSlotOfTy`'s structural→declared bridge. `paramStructIndex` asked
+`structIndexByName` and nothing else, so the member READ (`emitProgram: field access receiver
+is not a struct`) and the inferred RETURN (`ref valtype with no interned shape`) both answered
+-1 for a parameter whose own valtype was already correct. `annValtypeSlotOf`'s header names
+this failure in advance: *"a SHORTENED MIRROR of this ladder is a `ref valtype with no interned
+shape` reject for exactly the kinds it never learned"*.
+
+**THE RUNG IS LAST AND UNDER TWO MORE GUARDS, and this is a site that RETRACTED an arena rung
+once.** That retraction put `structIndexOfTy` FIRST and it won with the wrong row for a generic
+original. Placed LAST it speaks only where the name says nothing — today a -1 — so every call
+the retraction measured (15,922 corpus, 294 self-compile) keeps its answer by construction. The
+other two guards each answer a recorded failure: **inline shapes only**
+(`nameIsShapeSpanEnds` + not a registered variant), because `repSlotOfTy`'s bridge would
+otherwise hand a union ARM the row of an exact layout twin — the D63/D75 collapse, in the one
+namespace this resolver's header forbids it to enter; and **not a generic original**
+(`fn.fnTyParams.length == 0`), which is the retraction's own counterexample and IS an inline
+shape, so the shape guard alone does not exclude it (`error-param-shadow-tyaram-nullable-elem.vl`
+is the pin).
+
+Also measured, and it is why the arena rung is `repSlotOfTy` and not `structIndexOfTy`: the
+rung the retraction removed answers **-1** on this shape. The bridge is the leg that answers.
+
+**GRID: 16 of the 434 shared cells, every one `loud emit reject` → `runs`, 0 in any other
+direction** — `inlineparam` source x every `decl` level x `direct` / `local` / `alias` x `ret`
+/ `retann` / `read`. Graduated:
+`tests/cases/structs/inline-shape-param-beside-declared-twin.vl` (six rows: the three resolvers
+that answered -1, both result-annotation spellings, and the nominal control).
 
 ---
 
@@ -5885,6 +6062,57 @@ Repro:
   rung reaches the annotated local at the `fn` and `std` routes and does not reach it here.
 * Not pinned: D81 is the specimen and one live `@no-instantiate` member is what the tripwire's
   biconditional wants.
+
+---
+
+### D99 — [CLOSED 2026-08-26] a VARIANT-typed PARAMETER re-bound to a LOCAL and returned from an un-annotated function, beside an EXACT layout twin
+**CLOSED 2026-08-26 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-26 by the D45/D51/D53/D58 ablation grid, as the ONLY silent cells that 434-cell grid held (2 of them, `local` and `alias`) · pre-existing and byte-identical on master `8bf0f20f` and on all four single-fix ablation compilers**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function mk(c: Circle) {
+      const o = c
+      return o
+    }
+    print(mk({ r: 7 }).r)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 176:
+    //   type mismatch: expected i32, found (ref $type)
+    // (Offset quoted against a seed rebuilt from master `8bf0f20f`'s own sources, 1,438,562
+    //  bytes; the `alias` spelling — one more `const p = o` — is the same message at 183.)
+
+* **THE TWIN ROUTES AROUND A LOUD FLOOR, which is D63's sentence one storage class over.**
+  Delete `type Dot` and the same program is the LOUD `emitProgram: field access but no struct
+  type declared`; give the twin a same-arity DIFFERENT field name (`type Dot = { q: i32 }`) and
+  it is the LOUD `emitProgram: field access receiver is not a struct`. Both controls measured
+  one file each on master. So the exact layout twin is required and it is strictly worse than
+  the floor it replaces.
+* **THE `direct` SPELLING ALREADY RAN**, and the gap between it and this one is the whole row:
+  `function mk(c: Circle) { return c }` is D52's `exprVariantIndex` return-EXPRESSION rung
+  (#1951), and ONE binding hop was enough to leave that ladder. The RESULT-annotated spelling
+  ran too (D39).
+* **THE COMPLEMENT WAS ALREADY WRITTEN AND EXPORTED — the eighth rung of that family.**
+  `criClassify`'s returned-local block calls `structIndexOfLet` for the struct half and called
+  only `letAnnVariantIdx` — the ANNOTATION alone — for the variant half, while
+  `variantIndexOfLet` is `structIndexOfLet`'s arm-for-arm twin (annotation, then
+  `exprVariantIndex` of the initializer) with no caller on this path. Asked FIRST, which is
+  load-bearing and is D57's measured ordering rather than a symmetry: `structIndexOfLet` falls
+  through to `structIndexOfExpr`, whose non-kind-gated legs resolve the variant parameter to
+  the TWIN's struct row, so storage class has to beat a structural twin.
+* Safe by `exprVariantIndex`'s own documented property rather than by inspection: every arm of
+  it is REP-AUTHORITATIVE, and it carries no object-literal field-set leg — so a bare
+  `return { r: n }` is still not answered there and still falls to the struct arm, where `Dot`
+  is the right answer when `Dot` is what the program means. `letAnnVariantIdx` stays in front
+  of it so D52's `Circle | null` coverage is unchanged.
+* **6 GRID CELLS: 4 `loud emit reject` → `runs` and 2 `check-clean invalid wasm` → `runs`.**
+  It is the only one of the five candidates in that ablation whose moves include a silent
+  outcome, and it takes the grid's silent total to 0. Pairwise-disjoint from all four others.
+* Graduated: `tests/cases/unions/variant-param-local-return-beside-layout-twin.vl` (one hop,
+  two hops, the no-local row that already ran, and the annotated control).
 
 ## 3. Shared-root analysis
 

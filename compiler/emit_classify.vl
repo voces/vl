@@ -3276,7 +3276,26 @@ export function criClassify(rx0: i32, i: i32) {
     // `exprStruct` would (wrongly) also classify as a plain struct return — the union
     // kind dominates, so don't claim `"struct"`/`fRetStructIdx` (a conflicting rep).
     if criSetRetKind(i, "struct") {
-      fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+      const rsx = structIndexOfExpr(rx, fnStmts[i])
+      // D51 WITH NO LOCAL AT ALL — `function mk(n: i32) { return { r: n } }` beside
+      // `type Shape = Circle | Sq`. Same root, same `-1` gate, THIRD classifier site: the
+      // returned-local rung below cannot see this shape because there is no local to hand it,
+      // and a fix that reaches only that rung leaves the two-line spelling loud. (The count of
+      // sites is what D52's close warns about: three classifiers and one emit seed mint the
+      // pair `("struct", -1)`, and each one that stays behind is a cell the grader cannot
+      // distinguish from no progress.)
+      if rsx < 0 {
+        const rov = objLitVariantIdxNoStructRow(rx)
+        if rov >= 0 {
+          fRetKind[i] = "variant"
+          criChanged = true
+          fRetStructIdx[i] = rov
+        } else {
+          fRetStructIdx[i] = rsx
+        }
+      } else {
+        fRetStructIdx[i] = rsx
+      }
     }
   }
   // A returned LOCAL `let` of a REF kind (`const c: Ctx = {…}; return c`,
@@ -3332,7 +3351,29 @@ export function criClassify(rx0: i32, i: i32) {
     // runs. `letAnnVariantIdx` is the nominal half alone — and it covers `Circle | null`
     // too, seeding the same concrete arm the bare spelling does. The un-annotated half of
     // this rung is D51, which is LOUD and stays filed.
-    const rlv = letAnnVariantIdx(rll)
+    let rlv = letAnnVariantIdx(rll)
+    // THE INIT'S OWN REP, WHEN THE ANNOTATION HAS NOTHING TO SAY — `variantIndexOfLet` is
+    // `structIndexOfLet`'s twin, written arm for arm (annotation, then `exprVariantIndex` of
+    // the initializer), and the struct arm below has called ITS half all along while this one
+    // asked only the annotation. (`silent-class-inventory` D99.)
+    //
+    // ASKED FIRST, AND THAT ORDER IS THE ROW. `function mk(c: Circle) { const o = c  return o }`
+    // beside `type Dot = { r: i32 }` is check-clean INVALID WASM on master: `structIndexOfLet`
+    // falls through to `structIndexOfExpr`, whose NON-kind-gated legs resolve the variant
+    // param to the TWIN's struct row, so the functype promised `(ref $Dot)` over a body
+    // yielding `(ref $uVarHeap[Circle])`. Delete the twin and the same program is the LOUD
+    // `field access but no struct type declared`; give the twin a different field name and it
+    // is the LOUD `field access receiver is not a struct` — the twin was walking round a floor
+    // that was already there, which is D63/D75's signature. Storage class beats a structural
+    // twin, which is verbatim the ordering D57 measured for `emitStructEq`'s two ladders.
+    //
+    // SAFE BY `exprVariantIndex`'S OWN DOCUMENTED PROPERTY, not by inspection here: every arm
+    // of it is REP-AUTHORITATIVE rather than a shape match (its header says so), and it
+    // carries NO object-literal field-set leg — so a bare `return { r: n }` is still not
+    // answered there and still falls to the struct arm, where `Dot` is the right answer when
+    // `Dot` is what the program means. That is the same argument #1951 shipped
+    // `fnRetVariantIndexSid` on and #1953 the eq dispatch.
+    if rlv < 0 { rlv = variantIndexOfLet(rll, fnStmts[i]) }
     if (
       rlv >= 0 &&
       fRetKind[i] != "union" &&
@@ -3353,7 +3394,35 @@ export function criClassify(rx0: i32, i: i32) {
       // first field-shape match, so `const c: Ctx = {…}` returns Ctx even when
       // another declared struct shares its field names.
       if criSetRetKind(i, "struct") {
-        fRetStructIdx[i] = structIndexOfLet(rll, fnStmts[i])
+        const rsi = structIndexOfLet(rll, fnStmts[i])
+        // THE UN-ANNOTATED HALF OF THE ARM ABOVE, which that arm's own note filed as D51.
+        // `const c = { r: n }` beside `type Shape = Circle | Sq` has NO struct row at all —
+        // `collectS` skips a `type X = {…}` that is a union member (D57's root), so `Circle`
+        // lives in the variant table and `structIndexOfLet` answers -1 while `letIsStruct`
+        // still claims the binding through `exprStruct`'s ObjLit arm. The pair `("struct",
+        // -1)` is `fbValtype`'s bounds guard — `emitProgram: ref valtype with no interned
+        // shape`, 34 of the D39/D40/D41 grid's 72 residue cells.
+        //
+        // THE `-1` IS THE GATE, and it is what separates this from D39's channel. Where the
+        // struct table HAS a row the answer is unchanged, byte for byte: this arm can only
+        // fire on a pair that is a LOUD REJECT today, so no program that emits a module can
+        // move. Where it has none, `objVariantName` is the ONLY claimant and the call was
+        // simply never made — the seam D52 closed for the ANNOTATED spelling, one storage
+        // class over. The kind is overwritten directly for the reason the union arm above
+        // is: `"variant"` SHARES `"struct"`'s `retKindPri` tier (a return is a plain struct
+        // or an arm, never both), so `criSetRetKind` cannot land the write.
+        if rsi < 0 {
+          const rov = letObjLitVariantIdx(rll)
+          if rov >= 0 {
+            fRetKind[i] = "variant"
+            criChanged = true
+            fRetStructIdx[i] = rov
+          } else {
+            fRetStructIdx[i] = rsi
+          }
+        } else {
+          fRetStructIdx[i] = rsi
+        }
       }
     }
     // A returned local ANNOTATED as the STRING primitive. The block header above says the
@@ -23147,6 +23216,44 @@ export function variantIndexOfLet(letIx: i32, fnIx: i32) {
   -1
 }
 
+// The union-VARIANT row the UN-ANNOTATED object-literal initializer of the `LetDecl` at
+// `letIx` denotes — `objVariantName`'s field-set match, and nothing else — or -1.
+//
+// THE LEG `exprVariantIndex` DELIBERATELY LACKS, AND THE GATE THAT MAKES IT SAFE. That
+// ladder is REP-AUTHORITATIVE at every arm and carries no object-literal field-set leg by
+// design (D39/D52): a bare `{ r: n }` beside `type Dot = { r: i32 }` has TWO nominal
+// claimants — `structIndexOfObj` finds `Dot`, `objVariantName` finds the arm — and with no
+// annotation at all `Dot` is the RIGHT answer, so a field-set claim there would be the
+// miscompile D39 proved. **This asks the SAME question under the opposite precondition**:
+// the caller has already had `structIndexOfLet` answer -1, and this re-states that as
+// `structIndexOfObj(...) < 0` rather than trusting it, so the struct table has NO row for
+// the field set and the arm is the only claimant left. One claimant, so it is a missing
+// CALL and not D39's channel. (`silent-class-inventory` D51.)
+export function objLitVariantIdxNoStructRow(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const oi = unwrapParen(exprIx)
+  const e = P.nodes[oi]
+  if e is ObjLit {
+    if structIndexOfObj(oi) >= 0 { return -1 }
+    const vn = objVariantName(oi)
+    if vn == "" { return -1 }
+    return variantIndexOf(vn)
+  }
+  -1
+}
+
+// The same answer for a `LetDecl`'s INITIALIZER, and only for an UN-annotated binding:
+// an ANNOTATED one is `letAnnVariantIdx`'s (D52), whose nominal answer must not be
+// second-guessed by a field-set scan in either direction.
+export function letObjLitVariantIdx(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    return objLitVariantIdxNoStructRow(d.letInit)
+  }
+  -1
+}
+
 // ── multi-struct index resolution ─────────────────────────────────────────────
 // Parallel to the boolean `exprStruct` family, these return the STRUCT TABLE INDEX a
 // struct-typed expression / param / local / return produces, so a field read/write
@@ -23207,6 +23314,47 @@ function paramStructIndex(fnIx: i32, name: string) {
               if psi >= 0 { return psi }
               const pnb = nulBaseStructRow(p.parType, ty.tyName)
               if pnb >= 0 { return pnb }
+              // THE INLINE-SHAPE RUNG — `annValtypeSlotOf`'s, verbatim, and this position was
+              // its SHORTENED MIRROR. That home's own header names the failure: "a SHORTENED
+              // MIRROR of this ladder is a `ref valtype with no interned shape` reject for
+              // exactly the kinds it never learned". The kind never learned here is an inline
+              // shape whose row a DECLARED struct of the same layout already owns
+              // (`silent-class-inventory` D53): `internInlineShapeTy` ends in
+              // `annShapeIndexOf`, which DEDUPS onto that declared row and pushes no `sNames`
+              // entry for `{r:i32}` — so `structIndexByName` above has nothing to find, while
+              // the functype for the very same node resolves through `retStructIndex`'s
+              // `repSlotOfTy` bridge and emits `(ref $Boxed)`. One node, two resolvers, one of
+              // them a row short: `function f(c: { r: i32 })` beside `type Boxed = { r: i32 }`
+              // was `vl check` rc 0 and a loud emit reject, and DELETING the declared struct
+              // made it run.
+              //
+              // THREE GUARDS, AND EACH ONE ANSWERS A RECORDED FAILURE rather than being
+              // defensive in general:
+              //
+              //  ·  LAST, after both name rungs. This is not the arena rung this site
+              //     RETRACTED (see the note above): that one went FIRST and won with the
+              //     wrong row. Placed last it can only speak where the name says nothing,
+              //     which today is a -1 — so every call the retraction measured (15,922
+              //     corpus, 294 self-compile) keeps its answer by construction.
+              //  ·  AN INLINE SHAPE ONLY. `nameIsShapeSpanEnds` is the whole population: a
+              //     NOMINAL param spelling (`c: Circle`) that the name cannot resolve is a
+              //     variant or a non-struct, and `repSlotOfTy`'s structural bridge would hand
+              //     a union ARM the row of an exact layout TWIN — the D63/D75 collapse, in the
+              //     one namespace this function's own header forbids it to enter.
+              //  ·  NOT A GENERIC ORIGINAL. `f<T>(v: { g: (T | null)[] })` is the retraction's
+              //     counterexample, and it IS an inline shape, so the shape guard alone does
+              //     not exclude it. Its shape is never interned (`shapeFieldsRideTyParam`), the
+              //     instances re-collect over SUBSTITUTED names, and the original is not
+              //     emitted — so the declaration's own type parameters are the exact test.
+              //     `error-param-shadow-tyaram-nullable-elem.vl` is the pin.
+              if fn.fnTyParams.length == 0 {
+                if nameIsShapeSpanEnds(ty.tyName) {
+                  if variantIndexOf(ty.tyName) < 0 {
+                    const pbr = repSlotOfTy(nodeRepTyIxOf(p.parType))
+                    if pbr >= 0 { return pbr }
+                  }
+                }
+              }
             }
           }
           return -1
