@@ -3302,6 +3302,48 @@ export function criClassify(rx0: i32, i: i32) {
       }
     }
   }
+  // A RETURNED NESTED-STRUCT FIELD READ WHOSE CHAIN ROOTS AT A **LOCAL** — the MEMBER twin of
+  // the returned-local rungs below, blind for the identical reason, and filed as
+  // `silent-class-inventory` D131.
+  //
+  //     type Holder = { h: { r: i32 } }
+  //     function mk(n: i32) { const o: Holder = { h: { r: n } }  return o.h }
+  //
+  // `exprNullableStruct`'s Member arm ALREADY classifies a code-15 field read as the
+  // `(ref null $S)` it physically is, and it answers for every OTHER receiver storage class: a
+  // PARAM (`function mk(o: Holder) { return o.h }`), a module GLOBAL and a CALL result all RUN
+  // on master. It cannot answer for a LOCAL receiver, because it resolves that receiver through
+  // `structIndexOfExpr`, whose Ident arm reads `declaredStructIndex` — the per-function table
+  // `buildLocals` fills long AFTER this GLOBAL pass. So the slot kept the `"i32"` default while
+  // the body pushed the field's ref: `vl check` rc 0, `type mismatch: expected i32, found
+  // (ref null $type)`. The RECEIVER's storage class is the whole axis, which is why the row's
+  // own controls found the same read at MODULE scope running, and `return o.h.r` — an i32 leaf,
+  // matching the default — running too.
+  //
+  // `"nulstruct"` AND NOT `"struct"`, because that is the answer the three receiver shapes that
+  // already work produce, and it is the one the REP supports: the lowering codes fold `inner: S`
+  // and `inner: S | null` onto ONE code-15 hop (`tyPeelNul`'s header says so), the slot is
+  // `(ref null $S)` either way, and the consumer recovers non-null at its own field read.
+  // Claiming `"struct"` would declare `(ref $S)` over that same nullable read — which is
+  // verbatim the SECOND sentence D131 records, the one an explicit non-null return annotation
+  // still prints.
+  //
+  // AHEAD OF THE RETURNED-LOCAL BLOCK, and the order is the second half of the row. For
+  // `const c = o.h  return c` the block below asks `letIsStruct`, which answers TRUE through
+  // `exprStruct`'s fall-through to `exprNullableStruct` — so the RESULT was minted `(ref $S)`
+  // while `collectLocals`, asking the SAME predicate of the same initializer, built the cell
+  // `(ref null $S)`. Two classifiers, one binding, opposite nullability: `expected (ref $type),
+  // found (ref null $type)`, `vl check` rc 0. Claiming the binding here first makes the block's
+  // `!= "nulstruct"` guard decline it, and the result and the cell agree by construction.
+  //
+  // GATED ON THE SLOT STILL BEING THE DEFAULT, exactly as the last-resort rung below is: every
+  // function any arm above claimed keeps that answer, so this can only ever fill a hole.
+  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
+    const rnf = criRetNestedFieldStructIdx(rx, i)
+    if rnf >= 0 {
+      if criSetRetKind(i, "nulstruct") { fRetStructIdx[i] = rnf }
+    }
+  }
   // A returned LOCAL `let` of a REF kind (`const c: Ctx = {…}; return c`,
   // `const xs = [[1,2]]; return xs`): during this GLOBAL pass the function's
   // locals are not collected, so the `expr*` Ident cases above miss it and the
@@ -3539,6 +3581,70 @@ function retLocalCellKind(rx: i32, i: i32): VKind | null {
     }
   }
   null
+}
+
+// The struct-table row a NESTED-STRUCT (code-15) FIELD-READ CHAIN yields, resolved with the
+// LOCAL receivers this GLOBAL return pass cannot otherwise see. The descent is
+// `structIndexOfExpr`'s OWN Member arm, one hop at a time, so a two-level read (`o.h.g`)
+// resolves by the same rule its one-level parent does; only the ROOT rung differs, and it
+// differs in exactly one way — after `structIndexOfExpr` declines, the root ident is resolved
+// through its `let` DECLARATION (`retLocalLetOfBlock` + `structIndexOfLet`), the shared pair the
+// returned-local rungs already use for the same before-`buildLocals` reason.
+//
+// NOTHING BUT A CODE-15 HOP IS FOLLOWED. A leaf of any other code is not a struct ref and its
+// kind is decided by the arms above; answering here would name a struct index for a value that
+// is not one, which is the `("struct", wrong-index)` pairing D52's close warns about.
+function criRetMemberChainStructIdx(rx: i32, i: i32): i32 {
+  const u = unwrapParen(rx)
+  const e = P.nodes[u]
+  if e is Member {
+    const psi = criRetMemberChainStructIdx(e.memObj, i)
+    if psi < 0 { return -1 }
+    const pfi = sFieldIndex(psi, e.memProp)
+    if pfi < 0 { return -1 }
+    if sFieldTypeAt(psi, pfi) != 15 { return -1 }
+    return sFieldTgtStructIdx(psi, pfi)
+  }
+  const si = structIndexOfExpr(u, fnStmts[i])
+  if si >= 0 { return si }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    const li = retLocalLetOfBlock(fn.fnBody, u)
+    if li >= 0 { return structIndexOfLet(li, fnStmts[i]) }
+  }
+  -1
+}
+
+// The struct row a returned value's code-15 NESTED-STRUCT FIELD SLOT targets, for the two
+// spellings `criClassify`'s D131 rung answers: the field read ITSELF (`return o.h`), and a
+// returned LOCAL bound to one (`const c = o.h  return c`). -1 for everything else.
+//
+// THE LOCAL LEG TAKES ONLY AN **UN-ANNOTATED** `let`. An annotated one already has a claimant —
+// `letAnnVariantIdx` / `structIndexOfLet` read the annotation, and the CELL `collectLocals`
+// builds is that annotation's, not the initializer's — so answering here would put a second
+// classifier on a binding that already has one.
+function criRetNestedFieldStructIdx(rx: i32, i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const u = unwrapParen(rx)
+  const e = P.nodes[u]
+  if e is Member { return criRetMemberChainStructIdx(u, i) }
+  if e is Ident {
+    const fn = P.nodes[fnStmts[i]]
+    if fn is FuncDecl {
+      const li = retLocalLetOfBlock(fn.fnBody, u)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if d.letType < 0 {
+            const iv = unwrapParen(d.letInit)
+            const ivn = P.nodes[iv]
+            if ivn is Member { return criRetMemberChainStructIdx(iv, i) }
+          }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // Walk a block's statements classifying every `return <e>` under the SAME
