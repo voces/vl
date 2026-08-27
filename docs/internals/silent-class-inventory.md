@@ -5110,24 +5110,34 @@ recognised the operands at all.
   struct-first read a `(ref null $uVarHeap[vi])` through `sHeapIdx` and stayed check-clean
   invalid wasm (`expected (ref null $type), found (ref null $type)`, identical on `a97c9ae1`).
   `arm-struct-equality-nullable-niche.vl` carries that cell.
-* **THE GRID: 656 cells, the PRELUDE as a varied axis** — 7 preludes (none · declared-unused ·
+* **THE GRID: 770 cells, the PRELUDE as a varied axis** — 7 preludes (none · declared-unused ·
   declared-and-used · two unions containing the struct · union + exact layout twin · a union NOT
   containing it · no union + a twin) x 3 declaration ORDERS (before the structs, between them
-  and the compare, after the compare) x 20 operand/route shapes x `==`/`!=`. **264 cells moved,
-  every one of them toward `runs`**: 234 from check-clean invalid wasm and 30 from a loud emit
-  reject. **0 cells moved from a loud outcome to a silent one, 0 lost the ability to run, and 0
-  produced a different value from the same cell's no-union oracle.** The DECLARATION-ORDER axis
-  is inert — all three orders agree in every one of the 656 cells, before and after.
-* **D45 IS NOT WIDENED, and it is checkable rather than asserted.** The change adds an
-  ACCEPTANCE rung and no refusal: across the grid, loud check rejects held at 38, loud emit
-  rejects went 188 -> 158 (all 30 toward `runs`), and no cell gained a diagnostic. On the 2,278
-  file corpus, 1,850 compile under both compilers, **0 are byte-different, 0 lost the ability to
-  compile and 0 gained it** — the change is inert on everything that already emitted and active
-  only on what previously fell through.
-* Corpus witnesses: `tests/cases/unions/arm-struct-equality.vl` (seven storage classes),
-  `tests/cases/unions/arm-struct-equality-nullable-niche.vl`,
-  `tests/cases/unions/error-arm-struct-equality-mixed.vl`,
-  `tests/cases/std/array-needle-union-arm.vl` (the four `std:array` needle routes).
+  and the compare, after the compare) x 23 operand/route shapes x `==`/`!=`. **324 cells moved,
+  every one of them FORWARD**: 270 check-clean invalid wasm -> `runs`, 30 loud emit reject ->
+  `runs`, and 24 check-clean invalid wasm -> LOUD (the cross-arm shape, loud in EVERY prelude
+  including `none`, so the union's presence no longer changes it). **0 cells moved from a loud
+  outcome to a silent one, 0 lost the ability to run, 0 produced a different value from the same
+  cell's no-union oracle, and 0 check-clean invalid cells remain.** The DECLARATION-ORDER axis is
+  inert — all three orders agree in every one of the 770 cells, before and after.
+* **D45 IS NOT WIDENED, and it is checkable rather than asserted.** No cell that RAN stopped
+  running and no rep lost an acceptance: loud check rejects held at 50, and the only cells that
+  gained a diagnostic are the 24 cross-arm ones, whose no-union control gives that same
+  diagnostic. On the 2,282-file corpus, 1,850 compile under both compilers, **0 are
+  byte-different, 0 lost the ability to compile, and the only 3 that gained it are this change's
+  own new cases** — inert on everything that already emitted, active only on what fell through.
+  (The master side of that comparison is a seed rebuilt from `a97c9ae1`'s own sources at
+  1,436,302 bytes, NOT the shared `build/vl-compiler.wasm`, which a concurrent agent had
+  refreshed mid-session; measured against the shared one, a D52 fixture read as a regression
+  that the true master seed shows is not one.)
+* Corpus witnesses: `tests/cases/unions/arm-struct-equality.vl` (seven storage classes, plus an
+  arm carrying one field of EVERY supported code — i32 · string · `i32[]` · boolean · f64 ·
+  nested struct · function value — which is the shape the reservation half needed),
+  `tests/cases/unions/arm-struct-equality-nullable-niche.vl` (the niche, including the
+  global-beside-a-twin ordering cell), `tests/cases/unions/error-arm-struct-equality-mixed.vl`
+  and `.../error-arm-struct-equality-cross-arm.vl` (the two disagreement shapes, one file each
+  because emit reports the first failure), `tests/cases/std/array-needle-union-arm.vl` (the four
+  `std:array` needle routes, each pinned to a DIFFERENT answer).
 
 ---
 
