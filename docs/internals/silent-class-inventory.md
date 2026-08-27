@@ -5914,6 +5914,15 @@ Repro:
   gsto = alias` was still silent until that skip. The ASSIGNMENT arm is deliberately NOT
   symmetric: `let o = { r: 0 }` … `o = c` over an un-annotated `o` is a genuine destination
   whose cell is already committed by its own literal, so there the veto is right.
+* **THE ENCLOSING FUNCTION'S DECLARED RESULT IS A DESTINATION TOO, and it is there for the
+  GATE rather than for the pin.** `function mk(n: i32): Dot { const c = { r: n }  gsto = c
+  return c }` has an arm-typed GLOBAL destination and a plain-struct RESULT over one literal;
+  neither spelling satisfies both. Without that rung the scan pinned `Circle` and moved the
+  failure from the `global.set` to the return — check-clean invalid wasm on both sides, which
+  an OUTCOME-CLASS grader scores as no change and only a MESSAGE diff catches (the offset
+  moved 191 -> 195 and nothing else did). With it the cell is byte-for-byte master's. An
+  UN-annotated result records nothing: an inferred return is not a nominal claim — it is what
+  D52's rung derives FROM the binding — and recording it would veto this row's own population.
 * Graduated to `tests/cases/unions/anon-objlit-into-arm-typed-destination.vl` (eight cells:
   all four destinations, the generic hop, the list-element destination, the alias hop, and
   the DISAGREEMENT gate that keeps master's behaviour where two destinations name different
