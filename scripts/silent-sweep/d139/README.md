@@ -75,9 +75,10 @@ to runs, and `arm x mapval x none x global` + `armdiff x mapval x none x global`
 D88/D100 and 1,114-cell D112 grids both move 0, because every cell of both builds the map as
 a function LOCAL. That is the whole reason this grid exists, stated as a measurement.
 
-The 10 remaining SILENT cells are filed with runnable witnesses as **D155**
-(`armtwin x mapval x none x callres` — now the specimen), **D156** (`cont=nestedmap`, 6
-cells) and **D157** (`route=std`, 3 more `mapval` cells plus the `nestedmap x std` ones).
+The 10 remaining SILENT cells are filed with runnable witnesses, and they partition exactly:
+**D155** is the 1 cell at `armtwin x mapval x none x callres` (now the specimen), **D156**
+the 3 at `armtwin x nestedmap x none x {local,global,callres}`, and **D157** the 6 at
+`route=std` (3 `mapval`, 3 `nestedmap`).
 The 8 remaining LOUD cells are the documented `-3` floor and are unchanged: they are
 `arm`/`armdiff` x `route=none`, where no declared struct names the layout, and a floor is
 the outcome that row is supposed to have.
