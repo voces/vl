@@ -597,7 +597,7 @@ import {
   mapRetExprShape,
   mapShapeOfExpr,
   mapSlotTag,
-  memberUnionFieldName,
+  memberUnionFieldNameRead,
   memIsNarrowed,
   memNarrowVariantIndex,
   mfCallbackCloKey,
@@ -3014,7 +3014,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       // box (recovering a nullable receiver first) and compare its tag — the
       // member-path narrowing's runtime test.
       if vrecv is Member {
-        if memberUnionFieldName(unwrapParen(ndv.isObj), fnIx) != "" {
+        if memberUnionFieldNameRead(unwrapParen(ndv.isObj), fnIx) != "" {
           // The receiver is itself a NARROWED union arm (`v.f`, `v` narrowed to a
           // variant carrying the value-union field): the field box rides the variant
           // tables, so read it through the narrowed-member path (which yields the box —
@@ -3028,17 +3028,43 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
             fbI32Bin(70)            // 0x46 i32.eq
             return 0
           }
+          // BOUND-GUARDED. `structIndexOfExpr` answers -1 for a receiver with no row in
+          // the standalone struct table — a DECLARED union ARM is exactly that — and
+          // `sHeapIdx[-1]` is not a message, it is `wasm trap: out of bounds array
+          // access` from inside the compiler (silent-class-inventory D220). The guard
+          // and the arm below are one change: without the arm the guard would only move
+          // the trap to a loud reject, and without the guard the arm is unreachable for
+          // the very receiver it is written for.
           const msi = structIndexOfExpr(vrecv.memObj, fnIx)
-          const mfi = sFieldIndex(msi, vrecv.memProp)
-          if emitExpr(body, vrecv.memObj, fnIx) < 0 { return -1 }
-          if exprNullableStruct(vrecv.memObj, fnIx) {
-            wU8(212) // 0xd4 ref.as_non_null
+          if msi >= 0 {
+            const mfi = sFieldIndex(msi, vrecv.memProp)
+            if mfi >= 0 {
+              if emitExpr(body, vrecv.memObj, fnIx) < 0 { return -1 }
+              if exprNullableStruct(vrecv.memObj, fnIx) {
+                wU8(212) // 0xd4 ref.as_non_null
+              }
+              fbStructGet(sHeapIdx[msi], mfi) // the field's box
+              fbStructGet(uBoxIdx, 0)         // field 0: tag
+              fbI32Const(armTag)
+              fbI32Bin(70)                    // 0x46 i32.eq
+              return 0
+            }
           }
-          fbStructGet(sHeapIdx[msi], mfi) // the field's box
-          fbStructGet(uBoxIdx, 0)         // field 0: tag
-          fbI32Const(armTag)
-          fbI32Bin(70)                    // 0x46 i32.eq
-          return 0
+          // A DECLARED union-ARM receiver reads its field off the arm's own
+          // `uVarHeap` row — the same read `emitMem`'s variant arm makes, and the
+          // reason this site could not use the struct table at all.
+          const aivi = exprVariantIndex(vrecv.memObj, fnIx)
+          if aivi >= 0 {
+            const aifi = variantFieldIndex(aivi, vrecv.memProp)
+            if aifi >= 0 {
+              if emitExpr(body, vrecv.memObj, fnIx) < 0 { return -1 }
+              fbStructGet(uVarHeap[aivi], aifi) // the field's box
+              fbStructGet(uBoxIdx, 0)           // field 0: tag
+              fbI32Const(armTag)
+              fbI32Bin(70)                      // 0x46 i32.eq
+              return 0
+            }
+          }
         }
       }
       // `x?.y is i32` — an OPTIONAL-CHAIN receiver folds its null test into the
@@ -5151,6 +5177,44 @@ function emitSharedFieldRecv(body: i32[], recvIx: i32, fnIx: i32, slot: i32) {
   emitExpr(body, recvIx, fnIx)
 }
 
+// THE ONE HOME for "a code-16 (value-union box) field read whose member PATH is narrowed
+// to a single scalar atom unboxes to that atom's rep". The receiver's own shape decides
+// which `struct.get` produced the box — the plain struct table, the arm's `uVarHeap` row,
+// or the nullable form of the same — but the unbox after it is one sequence, and it was
+// written once per receiver shape until a receiver shape appeared that did not have it.
+//
+// `narrowedValueAtomOf`, not the raw `narrowVariantFor`/`valueAtomKind` pair: a
+// litunion-alias narrow (`o.f is K0`, `type K0 = "a"|"b"`) must unbox as the STRING ref the
+// box stores its member as, which is the ident READ discipline and the reason the struct
+// site was corrected to it. An un-narrowed read yields the box unchanged, so a "" atom
+// emits nothing.
+function emitUnionFieldNarrowUnbox(memIx: i32) {
+  const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
+  if mAtom == "" { return 0 }
+  // D-UNION-ATOM-KIND: the narrowed atom's ABI code decides both arms, exactly as it does
+  // at the VARIANT-field twin of this read (`emitNarrowedMem` — same three instructions,
+  // same two arms); `vbHeapIdxOfAtom` re-derived it a second time here, and
+  // `mAtom == "string"` was code 2 asked in spelling form.
+  const mfk = valueAtomKind(mAtom)
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  if mfk == 2 {
+    if !aUsed {
+      return emitFail(
+        "emitProgram: narrowed string union field read but array type not collected",
+      )
+    }
+    fbRefCast(sTypeIdx) // the payload IS the string array ref
+    return 0
+  }
+  const mvb = vbHeapIdxOfKind(mfk)
+  if mvb < 0 {
+    return emitFail("emitProgram: narrowed union field atom has no value box")
+  }
+  fbRefCast(mvb)
+  fbStructGet(mvb, 0) // the scalar payload
+  0
+}
+
 function emitMem(body: i32[], memIx: i32, fnIx: i32) {
   // A field read on a NARROWED union identifier downcasts through the box (G1).
   if memIsNarrowed(memIx) { return emitNarrowedMem(body, memIx, fnIx) }
@@ -5168,6 +5232,13 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       }
       if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
       fbStructGet(uVarHeap[pvi], pvfi) // 0xfb 0x02 <variant struct ht> <field index>
+      // A code-16 (value-union box) field of the arm, read while its member PATH is
+      // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
+      // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
+      // i32 consumer: check-clean INVALID WASM (silent-class-inventory D219).
+      if variantFieldTypeAt(pvi, pvfi) == 16 {
+        if emitUnionFieldNarrowUnbox(memIx) < 0 { return -1 }
+      }
       return 0
     }
     // THE NULLABLE FORM of the same read (`c: Circle | null`, inside its `!= null`
@@ -5186,6 +5257,9 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
         if emitExpr(body, m0.memObj, fnIx) < 0 { return -1 }
         fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
         fbStructGet(uVarHeap[nvi], nvfi)
+        if variantFieldTypeAt(nvi, nvfi) == 16 {
+          if emitUnionFieldNarrowUnbox(memIx) < 0 { return -1 }
+        }
         return 0
       }
     }
@@ -5352,32 +5426,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
     // ref the box stores its member as — mirroring the ident READ discipline (else the
     // raw box flowed where the string array was expected: invalid wasm).
     if sFieldTypeAt(si, idx) == 16 {
-      const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
-      if mAtom != "" {
-        // D-UNION-ATOM-KIND: the narrowed atom's ABI code decides both arms, exactly
-        // as it already does at the VARIANT-field twin of this read (`emitNarrowedMem`
-        // — same three instructions, same two arms); `vbHeapIdxOfAtom` re-derived it a
-        // second time here, and `mAtom == "string"` was code 2 asked in spelling form.
-        const mfk = valueAtomKind(mAtom)
-        fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-        if mfk == 2 {
-          if !aUsed {
-            return emitFail(
-              "emitProgram: narrowed string union field read but array type not collected",
-            )
-          }
-          fbRefCast(sTypeIdx) // the payload IS the string array ref
-        } else {
-          const mvb = vbHeapIdxOfKind(mfk)
-          if mvb < 0 {
-            return emitFail(
-              "emitProgram: narrowed union field atom has no value box",
-            )
-          }
-          fbRefCast(mvb)
-          fbStructGet(mvb, 0) // the scalar payload
-        }
-      }
+      if emitUnionFieldNarrowUnbox(memIx) < 0 { return -1 }
     }
     return 0
   }

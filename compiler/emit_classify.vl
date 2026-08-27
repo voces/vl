@@ -5463,7 +5463,14 @@ export function mvValArmSigOf(slot: i32): i32 {
 // False for a name that is not a registered arm at all, so a caller may ask it of any
 // spelling.
 export function armLayoutContested(armName: string): boolean {
-  const vi = variantIndexOf(armName)
+  armLayoutContestedAt(variantIndexOf(armName))
+}
+
+// The INDEX-taking primitive. `armFieldUnionName` (D219) already holds the variant index its
+// caller resolved, and re-rendering it to a name only to look the name back up is the round
+// trip this codebase keeps finding on the wrong side of a seam. -1 (not an arm at all) is
+// NOT contested, which is what lets any caller ask it unconditionally.
+export function armLayoutContestedAt(vi: i32): boolean {
   if vi < 0 { return false }
   if vi >= uVarTyIx.length { return false }
   repSlotOfTy(uVarTyIx[vi]) >= 0
@@ -9785,6 +9792,143 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
   ""
 }
 
+// The value-union NAME of a code-16 field read whose RECEIVER is a DECLARED union ARM
+// (`const g: Circle = …; g.r`, a `Circle` parameter, a `Circle`-returning call, a
+// `Circle[]` element, an arm-valued map read) — the storage-class ladder
+// `memberUnionFieldName` above does not have, and "" for everything else.
+//
+// THE GAP IS THE ARM'S OWN TABLE, not the receiver's spelling. `memberUnionFieldName`
+// resolves its field through `structIndexOfExpr`, and a union arm has NO row in the
+// standalone struct table — `collectS` skips a `type X = {…}` that is a union member
+// (`exprVariantIndex`'s header spends its length on the same seam). Its second rung covers
+// a NARROWED arm receiver via `memNarrowVariantIndex`; nothing covered a receiver that is
+// an arm BY DECLARATION, which needs no narrowing to be one. `exprVariantIndex` is the
+// existing answer to "which arm is this expression" across all five storage classes, so
+// this is that resolver joined to the variant field tables the narrowed rung already reads.
+//
+// GATED ON THE ARM'S LAYOUT BEING UNCONTESTED, and the gate is MEASURED, not argued. With a
+// declared struct of the arm's exact field set in the same module (`type Dot = {r: i32|null}`
+// beside `type Circle = {r: i32|null}`), the rep layer still conflates the two one container
+// out: the ELEMENT slot of a `Circle[]` is typed from the twin's `sHeapIdx` row while this
+// read produces the arm's `uVarHeap` one, so naming the field union here completes half a
+// chain and the halves disagree — `expected (ref $type), found (ref $type)`, check-clean.
+// Un-gated, the census's block A moves **384 cells from a loud emit reject into check-clean
+// invalid wasm**, every one at `declness=byname, pval=nullfield, rep=nul`, and the 624-cell
+// position grid this change was FIRST designed against contained none of them because it
+// declared no layout twin — the grid's SHAPE decided what it could measure, and the census
+// is what saw the class. (That axis is in the grid now: 1,664 cells, 257 moved, all
+// forward.) `armLayoutContested` is #1966's own predicate for exactly this split
+// (D171: a half-pinned chain is worse than an un-pinned one), asked here by INDEX because
+// the caller already holds one.
+//
+// WITNESS (silent-class-inventory D219): `type Circle = { r: i32 | null }` with a
+// `type Shape = Circle | Sq` anywhere in the module, then `if g.r != null`. Delete the
+// union and `Circle` re-enters the struct table, the first rung answers and the program
+// runs — which is why the census's `union=unused` column is the one that moved.
+// THE GATE, AND IT IS STRICTER THAN `armLayoutContested` BY EXACTLY ONE RUNG. #1966's
+// predicate asks whether a declared STRUCT row carries the arm's layout, because that is the
+// ambiguity its own peel had to avoid. The census answers a second one: **another ARM** of the
+// same canonical layout is equally fatal here and is invisible to that question, because
+// `collectS` skips a union member so no struct row exists for it to find. Block B's 66
+// backward cells are all `twin=armtwin` — a second union (`type DotU = Dot | DotB`) whose
+// first arm is `Circle`'s layout twin — and `claim` is NOT the ingredient: the same witness
+// with its two container aliases deleted still reproduces.
+//
+// Kept as a SEPARATE predicate rather than widened into `armLayoutContested`: that one gates
+// #1966's peel, whose 92 cells re-grade green on its own 1,188-cell grid, and widening it
+// would move a population this change did not measure.
+function armLayoutAmbiguousAt(vi: i32): boolean {
+  if vi < 0 { return false }
+  if vi >= uVarTyIx.length { return false }
+  if armLayoutContestedAt(vi) { return true }
+  const key = repCanonId(uVarTyIx[vi])
+  if key < 0 { return false }
+  let j = 0
+  while j < uVarTyIx.length {
+    if j != vi {
+      if repCanonId(uVarTyIx[j]) == key { return true }
+    }
+    j = j + 1
+  }
+  false
+}
+
+// Does the RECEIVER's own storage actually hold the bare arm? A REF-LIST ELEMENT read
+// (`xs[i].r`, with no binding in between) is declined, and the decline is a measured loud
+// FLOOR rather than a capability gap this change could close.
+//
+// THE MODULE IS ALREADY INVALID BEFORE THE READ. An un-annotated `[{r: 7}, {r: null}]` is two
+// DIFFERENT anonymous shapes, so the list is minted over the union BOX rep; a `Circle[][]`
+// annotation one container out then wants a list of Circles, and the mismatch is at the
+// `array.new_fixed` that builds the outer list. Nothing at the read can see it — the read's
+// own slot is the annotation's, and it agrees with itself. What the field read was doing was
+// stopping emission first, so the invalid construction was never written; an emitter that has
+// recorded a failure keeps emitting, and this is the other half of that rule. Filed as
+// **D223**, with the witness, and closing it is what lets this decline come off.
+//
+// MEASURED BOTH WAYS, on the census's own named sets. Without the decline, block E moves 96
+// cells and block B 66 from a loud emit reject INTO check-clean invalid wasm. With it, both
+// sets return to master's class exactly (0 moved), and the cost is the ref-list-element
+// receiver class: of the cells the change moves forward, block A keeps 708 of 1,062, block C
+// 600 of 1,320 and block E 984 of 2,232 — the rest revert to the loud reject they already had.
+// The 1,664-cell position grid is UNCHANGED at 257 forward / 0 backward, because its list
+// receivers bind to a local first (`const g = xs[0]`) and a binding is not an element read.
+//
+// A NARROWER GATE WAS BUILT AND REFUTED: asking the receiver's ref-list slot for its ELEMENT
+// KIND (`rlElemKindTbl[slot] != 2`, "the list physically holds boxes") does not fire, because
+// the slot the read resolves IS the annotation's — the mis-minted one belongs to the inner
+// literal's own binding, one container away and not reachable from here.
+function armRecvHoldsBareArm(recvIx: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(recvIx)]
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) { return false }
+  }
+  true
+}
+
+function armFieldUnionName(memIx: i32, fnIx: i32) {
+  const m = P.nodes[memIx]
+  if m is Member {
+    const avi = exprVariantIndex(m.memObj, fnIx)
+    if armLayoutAmbiguousAt(avi) { return "" }
+    if !armRecvHoldsBareArm(m.memObj, fnIx) { return "" }
+    if avi >= 0 {
+      const afi = variantFieldIndex(avi, m.memProp)
+      if afi >= 0 {
+        if variantFieldTypeAt(avi, afi) == 16 {
+          return variantFieldElemName(avi, afi)
+        }
+      }
+    }
+  }
+  ""
+}
+
+// THE READ-SIDE composite: `memberUnionFieldName` first, then the declared-arm rung. The
+// three READ classifiers (`exprUnion`, `unionNameOfExpr`, `memberUnionReadKind`) ask this;
+// the `is`-NARROWING PUSH sites keep asking `memberUnionFieldName` directly, and the split
+// is MEASURED rather than stylistic.
+//
+// Widening `memberUnionFieldName` itself was built and graded first, over a 288-cell grid
+// (3 field unions x arm/no-arm x 6 receiver storage classes x 8 consumers). It moves 84
+// cells forward and **6 `runs` cells to a COMPILER TRAP** (`wasm trap: out of bounds array
+// access`), plus 12 more loud->trap: a declared-arm receiver is a BARE variant ref, and the
+// member-path narrowing a `g.r is i32` push installs is lowered by `emitNarrowedMem`, which
+// unconditionally unwraps a BOX (`struct.get $uBox 1` + `ref.cast`) it has not got. The
+// pushes therefore stay declined, and that hole is filed as its own row (D220) rather than
+// half-opened here — half-opening it is exactly the shape of the regression this change
+// closes.
+//
+// Widening only `exprUnion` was graded too: 84 forward and **6 cells loud emit reject ->
+// check-clean INVALID WASM**, because the binding `const q = g.r` then classifies as a box
+// with no union NAME, so its narrowed read never unboxes. The three read classifiers are
+// one decision and must widen together.
+export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
+  const r = memberUnionFieldName(memIx, fnIx)
+  if r != "" { return r }
+  armFieldUnionName(memIx, fnIx)
+}
+
 // Record a distinct (kind, ref-list slot) source frame requirement.
 export function mfRecordSrc(kind: MfKind, slot: i32) {
   let i = 0
@@ -11747,7 +11891,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     // narrowing key is the path string `o.y`; `emitMem` unboxes under it).
     const mrecv = P.nodes[unwrapParen(c.isObj)]
     if mrecv is Member {
-      if memberUnionFieldName(unwrapParen(c.isObj), fnIx) != "" {
+      if memberUnionFieldNameRead(unwrapParen(c.isObj), fnIx) != "" {
         const mk = memberPathKeyOf(unwrapParen(c.isObj))
         if mk != "" {
           pushNarrowIs(mk, c.isVariant, condIx)
@@ -11858,7 +12002,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   const mnull = nullCmpRefOf(condIx)
   if mnull >= 0 {
     if P.nodes[mnull] is Member {
-      const mfn = memberUnionFieldName(mnull, fnIx)
+      const mfn = memberUnionFieldNameRead(mnull, fnIx)
       if mfn != "" && isValueUnionName(mfn) {
         const mk = memberPathKeyOf(mnull)
         if mk != "" {
@@ -12016,7 +12160,7 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       return true
     }
     if mrecv is Member {
-      const mun = memberUnionFieldName(unwrapParen(c.isObj), fnIx)
+      const mun = memberUnionFieldNameRead(unwrapParen(c.isObj), fnIx)
       if mun != "" {
         const mk = memberPathKeyOf(unwrapParen(c.isObj))
         if mk != "" {
@@ -25122,7 +25266,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // the code-16 read path in emitMem), so it is no longer a union here — same as the
   // narrowed IDENT case above; a sub-union narrowing keeps the box (stays a union).
   if e is Member {
-    if memberUnionFieldName(exprIx, fnIx) == "" { return false }
+    if memberUnionFieldNameRead(exprIx, fnIx) == "" { return false }
     const mAtom = narrowVariantFor(memberPathKeyOf(exprIx))
     const mk = valueAtomKind(mAtom)
     if mk >= 0 && mk != 6 { return false }
@@ -25570,7 +25714,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     const mAtom = narrowVariantFor(memberPathKeyOf(mix))
     const mk = valueAtomKind(mAtom)
     if mk >= 0 && mk != 6 { return "" }
-    return memberUnionFieldName(mix, fnIx)
+    return memberUnionFieldNameRead(mix, fnIx)
   }
   ""
 }
@@ -25796,7 +25940,7 @@ function unionIdentReadKind(exprIx: i32, fnIx: i32) {
 function memberUnionReadKind(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is Member {
-    if memberUnionFieldName(exprIx, fnIx) != "" {
+    if memberUnionFieldNameRead(exprIx, fnIx) != "" {
       const a = narrowedValueAtomOf(memberPathKeyOf(exprIx))
       if a != "" { return valueAtomKind(a) }
       return -2

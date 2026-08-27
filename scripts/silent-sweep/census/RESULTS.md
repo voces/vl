@@ -478,3 +478,67 @@ On D181's branch the `claim` family is **0** and `claim,cont` is **0**.
    later run of the same byte-identical seed. `vl --compiler X` caches its Cranelift image in
    a `.cwasm` sidecar beside X, and a cold fan-out races to write it; prewarm serially before
    any parallel grading, which is what `scripts/silent-sweep/d181/twin181.py` does and why.
+
+---
+
+## AFTER-PASS — D219/D211, `e44ef5e6` → the D211 branch, all five blocks, 2026-08-27
+
+The gate-6 protocol run in full: ONE generated cell directory graded against two seeds, each
+built from its own commit's `compiler/*.vl` and each proved a self-compilation fixed point —
+`e44ef5e6` at **1,456,371** bytes (byte-identical to `16d5c6e7`; #1971 touched no compiler
+file) and the branch at **1,457,262**. `delta.py` per block.
+
+**The before-pass reproduces this file's own `e44ef5e6` figures on every block** (A 6,520 /
+B 1,604 / C 1,616 / D 67 / E 894 — the "on D181's branch" column of the table above, which is
+what `16d5c6e7` merged), which validates the rebuilt seed, the regenerated cells and the
+grader in one measurement.
+
+| block | cells | `runs` → not-runs | → SILENT | `runs` gained | silent before → after |
+|---|---|---|---|---|---|
+| A | 150,224 | **0** | **0** | 708 | 6,520 → 6,472 |
+| B | 28,590 | **0** | **0** | 0 | 1,604 → 1,604 |
+| C | 43,200 | **0** | **0** | 600 | 1,616 → 1,616 |
+| D | 9,000 | **0** | **0** | 0 | 67 → 67 |
+| E | 19,224 | **0** | **0** | 984 | 894 → 894 |
+| **all** | **250,238** | **0** | **0** | **2,292** | **10,701 → 10,653** |
+
+`loud check reject` is unchanged in every block. D211's own graded cell `a008328` is named in
+block A's *moved OUT OF a silent class* group, with the expected output `0`.
+
+### THE PART WORTH KEEPING: the grid said 0 backward and was wrong THREE TIMES
+
+The change was designed against a 1,664-cell position grid (4 field unions × arm/no-arm ×
+layout-twin/no-twin × 8 receiver storage classes × 13 consumer spellings). That grid reports
+**257 moved / 0 backward** for the ungated fix and for all three gated variants alike. The
+census found three classes it cannot contain, in three separate re-grades:
+
+* **384 cells (block A)** — a declared STRUCT twin of the arm's layout. The first grid the fix
+  was designed against declared no twin at all.
+* **66 cells (block B)** — another ARM of the same canonical layout, invisible to the
+  predicate that closed the first one, because `collectS` skips a union member so there is no
+  struct row to find. All at `twin=armtwin`; `claim` is not the ingredient.
+* **96 cells (block E)** — a ref-list ELEMENT receiver over an un-annotated list of
+  DISAGREEING anonymous shapes, where the module is already invalid at the outer
+  `array.new_fixed` and the field read was the only stage stopping emission first (D223).
+
+Each was found only by re-running the FULL census after the previous one was gated. **A
+per-class histogram would have understated all three**: on the un-gated build block A's
+SILENT TOTAL moved 6,520 → 6,808, a net of +288 — 384 cells in and 96 out — so two thirds of
+the regression was cancelled inside the one number a histogram prints. That is the same
+arithmetic that hid D211 (a −126 loud-emit column that was 186 out and 72 in), one instrument
+later.
+
+### The cheap re-grade sets — how each gate was priced
+
+`delta.py` names both the backward set and the forward set of a run; copying each into its own
+cell directory (with the manifest subsetted) makes them re-gradeable against a new seed in
+seconds, which is what turned each gate from a guess into a measurement. The sets this pass
+used were 66 and 96 cells backward (blocks B and E) and 1,062 / 1,320 / 2,232 forward
+(A / C / E) — small enough that a candidate compiler is priced in under a minute against
+both, where the full census is ~35 min a seed. They are NOT committed, for the reason the
+cells are not: they regenerate from a graded pair.
+
+Pricing the block-E gate is the worked example. It is a deliberate loud floor, and it declines
+354 of block A's 1,062 forward cells, 720 of C's 1,320 and 1,248 of E's 2,232 — every one
+reverting to the loud reject it already had, none to a silent class. That number is the
+argument for closing D223 rather than for widening the gate.
