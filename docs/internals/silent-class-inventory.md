@@ -63,7 +63,9 @@ repro rather than a paraphrase:**
 | D36 D38 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE root, and the grid is what says so. Three classifiers that must agree ARM FOR ARM each carried their own un-gated `objVariantName` field-set scan, so an ANONYMOUS `{r: n}` matched a union arm structurally and the arms WIDENED it to the whole union — a kind-2 BOX list under a reader that unboxes. `arrLitBoxElemName`, which asks the ARENA whether the CHECKER recorded a union element, was written for `collectU` and had no caller on this path. 37 of 900 grid cells moved, 28 from silent and 9 from LOUD, none backward) |
 | D39 | check-clean invalid wasm | **NEW 2026-08-26** — filed from D36/D38's own closing grid, which left 8 of its 900 cells silent under BOTH compilers at the same coordinates. An anonymous element bound to an UN-ANNOTATED local and returned from a function whose RETURN is annotated `Circle[]`, beside an exact layout twin. Eleven lines, no import, no generic, no lambda; it is the new `INVALID_MODULE_SRC` |
 | D37 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; ONE ARM, and its complement is three lines up in the same function — `monoStructAnnName` has had both a BARE and a LIST rung since it was written, and D23's union-arm arm took only the bare one, so `Circle[]` had no home and the cascade's `"i32"` catch-all claimed it. The filed "EMPTY seed" axis is REFUTED by its own cross product: the trigger is the ANNOTATION, flat across empty / literal / call-result seeds and absent from both un-annotated ones. 12 of 120 grid cells moved, all to `runs`) |
-| D47 D48 D49 D50 | — | **NEW 2026-08-26** — four rows the D34/D37 grids and the census produced (renumbered from D39-D47 when #1945 landed first and took those three). D47: the INLINE map-annotation spelling of an arm-valued map keeps the LOUD `-3` floor while the ALIAS spelling now lowers. D48: an arm-valued map and a layout-TWIN struct-valued map in ONE program share a single mv slot (silent, master and branch). D49: `type C = Circle[]` — the array-ALIAS spelling of an arm-element list — is check-clean invalid wasm where the direct `Circle[]` spelling runs (silent, master and branch). D50: a `for` loop over an arm-valued container binds no variant loop var — LOUD on both, list and map spellings alike |
+| D47 D48 D49 D50 | — | **NEW 2026-08-26** — four rows the D34/D37 grids and the census produced (renumbered from D39-D47 when #1945 landed first and took those three). D47: the INLINE map-annotation spelling of an arm-valued map keeps the LOUD `-3` floor while the ALIAS spelling now lowers. D48: an arm-valued map and a layout-TWIN struct-valued map in ONE program share a single mv slot (silent, master and branch). D49: `type C = Circle[]` — the array-ALIAS spelling of an arm-element list — is check-clean invalid wasm where the direct `Circle[]` spelling runs (silent, master and branch) — **CLOSED 2026-08-26**, see its own line below. D50: a `for` loop over an arm-valued container binds no variant loop var — LOUD on both, list and map spellings alike |
+| D49 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the complement is a RENDERER, not a predicate. `singleAliasMemberTyIx`'s array arm was gated on `arrSpineIsScalar`, whose own header says it is "the exact condition under which `tyToEmitName` renders the type name-faithfully" — a property of the renderer. `tyToNominalName` is that renderer's name-faithful twin, already written, already documented correct, and with **no consumer in emitted output at all**. 240 of 910 grid cells moved, 44 out of silent (22 to `runs`, 22 to LOUD) and 174 loud→`runs`; **0 `correct` cells moved anywhere**, and every one of the 218 is an ALIAS cell — no `direct` / `inline` / `inferred` cell moves. Ten cells go LOUD→silent and all ten land EXACTLY on their alias-free control's MASTER verdict, which is the alias ceasing to be a dialect rather than acquiring one; the two shapes they land in are filed as D63 and D64) |
+| D48 | check-clean invalid wasm | **STILL OPEN 2026-08-26** — re-measured, and its witness module is **byte-identical** under this change. One candidate fix was built and REFUTED by ablation (below): parity at the slot-identity FIND separates the two slots and the downstream heap wiring does not follow — the failure moves from `mkD` to `mkC` and a two-ARM control that runs on master becomes invalid wasm. A sibling one container over is filed as D64 |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
@@ -3902,8 +3904,8 @@ Repro:
 
 ---
 
-### D40 — an UN-ANNOTATED local holding a list of a DECLARED union arm, returned under an annotated `Circle[]`
-**check-clean invalid wasm · found 2026-08-26 in D36/D38's closing grid — the largest single population in its residue (135 `named`-producer cells, 64 more at the `call` producer) · pre-existing and byte-identical on `f2064bec` · NO twin, NO generic, NO import, NO anonymous shape**
+### D40 — an UN-ANNOTATED local holding a list of a DECLARED union arm, returned under an annotated `Circle[]` — **now a loud emit reject 2026-08-26**
+**was check-clean invalid wasm, now a loud emit reject · found 2026-08-26 in D36/D38's closing grid — the largest single population in its residue (135 `named`-producer cells, 64 more at the `call` producer) · pre-existing and byte-identical on `f2064bec` · NO twin, NO generic, NO import, NO anonymous shape**
 
 Repro:
 
@@ -3998,6 +4000,23 @@ header, and its engine MESSAGE differs, which is recorded rather than smoothed o
   twin profile and is very likely the same root by `arrLitIsRef`'s own account — an IDENT and a
   CALL miss the same first-element probes. It is recorded as a sibling rather than folded in,
   because it was not separately reduced to a witness.
+
+**BOTH LIST SPELLINGS ARE LOUD AS OF D49's CLOSE, AND THE BARE ONE IS NOT — so the two
+containers this row deliberately kept together really were two rungs.** The missing VARIANT
+arm in the array-literal i32 fallback (see D65) floors the list container at both spellings:
+
+    import-free witness   `emitProgram: union-arm array elements are not supported in this position`
+    through `mapIndexed`  the same message, at the callback's own `const o = [c]`
+
+The BARE container (`const o = c`, no list) is UNMOVED and byte-identical
+(`expected (ref $type), found i32` at offset 479 through `mapIndexed`, `vl check` rc 0), so it
+is re-filed on its own as **D66**. The "different engine messages, one rung or two is OPEN"
+question above is thereby ANSWERED for the pair it was asked about: both LIST spellings share
+the array-literal floor, and the BARE container does not reach it at all.
+
+The two `std:array` carve-outs this row supplied are now ONE (`std/array.vl`'s ledger is
+updated with the same measurement). What is still owed is the REP, not the floor — an inferred
+arm-element list should reach the ref-list path the annotated one does; see D65.
 
 ---
 
@@ -4118,8 +4137,8 @@ Repro:
 
 ---
 
-### D43 — a type ALIAS for a LIST OF STRUCT is opaque: neither assignable from its own body nor a list
-**loud check reject · found 2026-08-26 while building D35's grid (its `type E = Circle[]` cells) · pre-existing, byte-identical on `f2064bec` and on D35's branch · NOT silent, filed because it is the reason nine grid cells could not be graded on their own axis**
+### D43 — a type ALIAS for a LIST OF STRUCT is opaque: neither assignable from its own body nor a list — **CLOSED 2026-08-26**
+**closed · was a loud check reject · found 2026-08-26 while building D35's grid (its `type E = Circle[]` cells) · pre-existing, byte-identical on `f2064bec` and on D35's branch · NOT silent, filed because it is the reason nine grid cells could not be graded on their own axis**
 
 Repro:
 
@@ -4148,6 +4167,24 @@ Repro:
   `structlist`, `maplist` and `litunionlist` — fail inside the MAKER for this reason and
   measure nothing about the comparison they were written for. The same three bindings spelled
   out do reach the comparison and are LOUD after D35's close, measured.
+
+**RETIREMENT — THIS IS D49 IN ITS LOUD HALF, and the two rows were filed a day apart from two
+different grids without either noticing the other.** **`check-filed-witnesses.py` is what
+found it, not review**: D49's change was written against D49's witness alone, the grader was
+re-run over the whole doc afterwards as the bulk-edit discipline requires, and this row came
+back `check_reject → runs` unprompted. Reading the diff would not have surfaced it — nothing
+in the change mentions `.length`, and the two rows share no message, no container and no
+grid. That is the whole argument for grading the doc after every change rather than reviewing
+what the change appears to touch. D49's own bullet called the reading side
+"a second, independent alias gap"; it is not independent and it is not second. One predicate
+decides the alias on BOTH sides — `declaredTyOfName` (the checker, which produced this row's
+two messages) and `singleMemberAliasTyIx` (the emitter, which produced D49's invalid wasm) read
+the same `singleAliasMemberTyIx` arm. Admitting a NOMINAL array leaf there closes both: this
+repro now prints `1`, and `type E = Circle[]` where `Circle` is a plain declared struct — which
+is exactly this row — was ALSO the loud `emitProgram: struct array elements are not supported`
+on the emit side, the control D49's row filed as "runs".
+
+Its nine ungradeable `std:array` grid cells are therefore gradeable now.
 
 ---
 
@@ -4387,10 +4424,48 @@ Repro:
 * Ranked below D47 because the outcome is unchanged (silent on both sides), but it is the
   strictly worse row: the reject in D47 is loud.
 
+**RE-MEASURED 2026-08-26 WHILE CLOSING D49, AND ONE CANDIDATE FIX IS REFUTED BY ABLATION.**
+The witness module above is **byte-identical** under D49's change (`wasm-tools print`, 4,003
+bytes both sides), and 0 of the 130 `mapval` / `nestedmap` cells of D49's 910-cell grid move —
+so the two are TWO ROOTS and the mv layer is untouched by that change.
+
+The candidate, built and swept as its own compiler:
+
+* `mvSlotOfTyK` gains the ARM half of the slot's identity — the same parity question
+  `repMapValSlotsTwin`'s kind-1 arm already asks at the DEDUP layer, asked at the FIND. Both
+  sides are arena types, so `variantRowOfTy` is askable there.
+* the mint keys an arm's slot on the ARM'S DECLARATION index (`armTy`) rather than on the
+  re-resolved render, and banks the same index, so the parity round-trips through a re-find.
+* the mint's NAME-scan rung — the seam the arena rung cannot close, since an arm and its
+  layout twin render the same string — enforces the same parity where the caller knows the
+  value's type.
+
+**It separates the slots and the downstream wiring does not follow.** The repro's failure
+MOVES from `mkD` to `mkC` (offset 543), and a control that RUNS on master — two maps whose
+values are arms of two DIFFERENT unions — becomes check-clean invalid wasm. So the slot
+identity is necessary and not sufficient: `mvRlSlot` / `mvMapTypeIdx` and the op-boundary
+finds that hold no arena type still resolve through the render. **On the 910-cell grid the
+candidate moves ZERO cells**, which is also a coverage finding — that grid cannot see it, and
+the hand control is what refuted it.
+
+What remains, precisely: **every name the mv layer holds is a RENDER**, and the fix has to
+stop that being the slot's identity, not patch a parity test onto it. The nominal channel
+exists at the mint (`armTy`, #1947) and at the routed op finds (`nodeMapValTyIx`); it does
+NOT exist at `mvSlotByValNameK`, at `mvSlotOfValNameTyK`, or at any un-hinted
+`mvShapeOfMapName` caller, and those three are where the second slot goes wrong. The cheaper
+interim — a LOUD floor at the map-store seed (`wasmEmit`'s `svVi = mvValVariantOf(mslot)`
+site, which already reads the slot's arm) — has to compare HEAPS and not names, or it reddens
+the two-arm control above, which runs today.
+
+**THE CENSUS GATE'S STATED REASON IS UNCHANGED, and this row is still it.**
+`repMapValSlotsTwin`'s parity branch needs two distinct kind-1 slots agreeing on canon id and
+key rep; that pair still cannot exist because this row still collapses it. D49's fix does not
+move it — the byte-identity above is the witness, and no `mapval` grid cell moved.
+
 ---
 
-### D49 — the array-ALIAS spelling of an arm-element list is invalid wasm where the direct spelling runs
-**check-clean invalid wasm · found 2026-08-26 by D34's 300-cell grid (6 of its 6 residual silent cells, flat at 2 per arm-ness across `arm_notwin` / `arm_twin` / `arm_namediff`) · pre-existing and IDENTICAL on `f2064bec` and on D34's branch · NO generic, NO import, NO twin needed**
+### D49 — the array-ALIAS spelling of an arm-element list is invalid wasm where the direct spelling runs — **CLOSED 2026-08-26**
+**check-clean invalid wasm · found 2026-08-26 by D34's 300-cell grid (6 of its 6 residual silent cells, flat at 2 per arm-ness across `arm_notwin` / `arm_twin` / `arm_namediff`) · pre-existing and IDENTICAL on `f2064bec` and on D34's branch · NO generic, NO import, NO twin needed · CLOSED by #1948 — `arrSpineIsNominal` + `tyToNominalName`**
 
 Repro:
 
@@ -4418,13 +4493,79 @@ Repro:
 * **THE ALIAS IS THE WHOLE TRIGGER.** Spelling the same two annotations `Circle[]` directly —
   `function mk(i: i32): Circle[]` and `const l: Circle[] = [c]`, `type C` deleted — RUNS and
   prints `1`, on both compilers.
-* Controls, each ONE line different, all measured: `Sq`/`Shape` deleted so `Circle` is a plain
-  struct → runs; a `Dot` twin present or absent → no change (flat 2/2 at every arm-ness that
-  has an arm, 0/2 at `plain` and at a non-member struct); declaration order → flat.
+* Controls, each ONE line different, all measured: ~~`Sq`/`Shape` deleted so `Circle` is a
+  plain struct → runs~~ — **THIS ONE DOES NOT REPRODUCE AND THE CORRECTED VALUE IS THE ROW'S
+  SECOND HALF.** Run verbatim on `c0873a06`, `Sq`/`Shape` deleted is the LOUD
+  `emitProgram: struct array elements are not supported`, not `runs`: the array alias was
+  broken for a PLAIN declared-struct element too, loudly there and silently for an arm. A
+  filed control that does not reproduce is a row that was never fully run, so the rest of this
+  line is re-stated as re-measured rather than inherited: a `Dot` twin present or absent → no
+  change (flat 2/2 at every arm-ness that has an arm, 0/2 at a NON-MEMBER struct); declaration
+  order → flat.
 * **IT IS NOT D34's ROOT AND ITS SIGNATURE SAYS SO**: `expected i32, found (ref $type)` is a
   rep-class collapse, not two heap types for one shape — the same signature D37 had, one layer
   down. The remaining cells of D34's grid at `listelem` READ positions are a LOUD checker
   reject (`cannot index non-array C`), which is a second, independent alias gap.
+
+**RETIREMENT — the trigger is filed correctly and the ROOT is one layer above where the row
+looks.** The array alias never reaches the emitter's ref-list layer at all: `nameIsRefArray`
+and every rung under it key on the DECLARED SPELLING, and `C` is not `X[]`. What was supposed
+to have already rewritten it is `canonEmitTypeNames`, which rewrites every `TypeRef.tyName`
+into the emitter's own vocabulary and DOES resolve a transparent one-member alias
+(`type Id = i32`, `type L = i32[]`, `type M = {[string]: i32}`) through
+`singleAliasMemberTyIx`. That function's `TyArray` arm is gated on `arrSpineIsScalar`.
+
+**THE COMPLEMENT IS A RENDERER, NOT A PREDICATE — and `arrSpineIsScalar`'s own header says
+so.** It reads: *"the exact condition under which `tyToEmitName` renders the type
+name-faithfully"*. `tyToEmitName` re-renders an array's element, so `Cat[]` comes out
+`{n:i32}[]` and the declared name the emitter's element tables key on is dropped —
+#1137's "nominal emit route to lose", pinned from the losing side by
+`tests/cases/types/array-alias-nominal-element-stays-opaque.vl`. The gate is a property of
+that renderer, not of the language. `tyToNominalName` is its name-faithful twin: written,
+documented correct, and carrying the line **"NOTHING consumes this in emitted output yet —
+it is a byte-identical foundation"**. Under it the member renders `Cat[]`, which is the
+DIRECT annotation character for character. **Fifth for five: every rung of this family has
+been closed by a predicate (here a producer) that already existed and was not consulted.**
+
+* **THE PREDICTED SABOTAGE DOES NOT FIRE, AND THAT IS THE MEASUREMENT THAT MATTERS.** The
+  opaque pin's header said "widening the arm to every `TyArray` turns this file red". Widened
+  and paired with the nominal renderer it is GREEN — the route is kept. Its header now records
+  the retirement and keeps the file as the other direction's witness (substituting the
+  STRUCTURAL render still reddens it).
+* **ONE PREDICATE, BOTH SIDES.** `declaredTyOfName` (the checker) and `singleMemberAliasTyIx`
+  (the emitter) read the same arm, so the filed *"second, independent alias gap"* — the loud
+  `cannot index non-array C` / `field 'length' is not on every member of C` at every READING
+  use — is the SAME root and closes with it. It was not independent.
+* **THE FILED `plain` CONTROL WAS WRONG, AND THE CORRECTION IS THE INTERESTING HALF.** The row
+  says "`Sq`/`Shape` deleted so `Circle` is a plain struct → runs". Run verbatim on
+  `c0873a06` it is a LOUD `emitProgram: struct array elements are not supported`. So the alias
+  spelling was broken for a plain declared-struct element too — loudly there and silently for
+  an arm, which is the same defect wearing the loud floor the arm falls through.
+* **THE DISASSEMBLY IS THE WHOLE MODULE.** Master's `mk` builds the i32 list — `array.new_fixed
+  3` over `(array (mut i32))`, `struct.new 6`, `(result i32)`, and a local typed `(ref 2)`
+  (the value-union box) — while types 7/8 (`(array (mut (ref null 0)))` and its wrapper) sit
+  interned and unused. On the branch the whole module is **byte-identical to the DIRECT-spelling
+  control's**: `array.new_fixed 7`, `struct.new 8`, `(result (ref 8))`, local `(ref 8)`.
+  (Seeds: master `c0873a06` 1,429,387 bytes; branch 1,429,949 bytes.)
+* **THE TEN LOUD→SILENT CELLS ARE ACCOUNTED FOR CELL BY CELL, and none of them is new silent
+  surface.** Six are D63 (the alias / alias-of-alias spellings of `listelem`, `listoflist`,
+  `structfield` at `iterate`) and four are D64 (`store` / `storeread` at the twinpair struct
+  field). For all ten, the DIRECT-spelling control is ALREADY that row on `c0873a06`, at the
+  same byte offset with the same message, and **both rows' filed repros contain no array alias
+  at all** — so the shape is reachable without the alias and the alias joined a class that was
+  already counted. Ablating the new array-literal floor on its own moves **0 of the 10**: they
+  build through the ref-list path, so the i32 fallback the floor stands in is never entered.
+  The three questions (covered? reachable without the alias? floor-takeable?) were each
+  answered by re-reading the graded sweeps, not by argument.
+* **A SECOND, SMALLER ROOT WITH THE SAME SIGNATURE RIDES ALONG, and it is the missing loud
+  floor.** The `inferred` spelling (`const l = [c]`, no annotation for the ref-list layer to
+  key on) reaches the array-literal i32 fallback, whose ladder already floors an ARRAY element,
+  a STRUCT element and a MAP element — the map arm's comment even writes D49's exact sentence,
+  *"expected i32, found (ref $type), invalid wasm"*. There was no VARIANT arm, and the two
+  namespaces are exclusive so `exprStruct` declines for an arm by construction. Adding it moves
+  **22 grid cells silent → LOUD** and 0 `correct` cells anywhere: on that backing a
+  `(ref $uVarHeap[arm])` element has no rep at all, so the floor cannot turn a running program
+  loud. Filed as D65 for the rep the inferred spelling still does not reach.
 
 ---
 
@@ -4466,6 +4607,177 @@ the wrong namespace.
   map row and a list row.
 * Reading the same element OUT of the loop runs on D34's branch (`l[0].r`,
   `m["k"]` narrowed) — the loop VAR's storage class is the whole difference.
+
+---
+
+### D63 — a `for` over an arm-element list beside an EXACT LAYOUT TWIN is SILENT where D50 is loud
+**check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function cell(): i32 {
+      const c: Circle = { r: 7 }
+      const l: Circle[] = [c]
+      let t = 0
+      for v in l { t = t + v.r }
+      return t
+    }
+    print(cell())
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 334:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **THE CONTROL IS ONE LINE: DELETE `type Dot = { r: i32 }`.** Without the twin the same
+  program is D50's LOUD `emitProgram: field access but no struct type declared`; with a
+  same-arity DIFFERENT-FIELD-NAME neighbour (`type Dot = { q: i32 }`) it is the loud
+  `emitProgram: field access receiver is not a struct`; with `Sq`/`Shape` deleted, or with
+  `Circle` a NON-member of the union, it RUNS. So arm-ness AND an exact layout twin are both
+  required, and the twin is what turns D50's floor off.
+* **IT IS THE FAMILY'S SIGNATURE, NOT D50'S.** `expected (ref $type), found (ref $type)` is
+  two heap types for one shape — D26/D32/D33/D34's message — where D50's is a located emit
+  reject. So `forInElemKind`'s missing `"variant"` arm is the LOUD half and something one
+  layer down resolves the twin's row before that arm is reached.
+* Strictly worse than D50 at the same coordinate: the loud floor exists and the twin routes
+  around it. Ranked accordingly.
+* **IT IS THE DESTINATION OF SIX OF D49's TEN LOUD→SILENT CELLS, and the accounting is the
+  reason to read that as inherited rather than created.** Those six are the ALIAS and
+  ALIAS-OF-ALIAS spellings of the three containers above; the DIRECT and INLINE spellings of
+  the same three coordinates are already this row on `c0873a06`, at the same offsets and with
+  the same message, and the repro above contains **no array alias at all**. So the shape is
+  reachable without the alias, and D49's close moved the alias spelling onto a defect that was
+  already counted rather than growing the silent surface. The alias's own previous verdict was
+  the checker reject `for` could not get past, which is a LID in the sense
+  `array-alias-return-unread.vl` describes.
+* D49's new array-literal floor does NOT reach these: measured by ablating the floor alone (a
+  D49-without-floor compiler against D49-with-floor), **0 of the 6 move**. The list is built
+  through the REF-LIST path here — that is what D49's fix does — so the i32-list fallback the
+  floor stands in is never entered, and the failure is a layer later at the loop var.
+
+---
+
+### D64 — an arm-element list in a STRUCT FIELD beside a layout-twin struct is invalid wasm
+**check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (8 of its 24 residual silent cells: `store` + `storeread`, `arm_notwin` and `arm_twin` alike, direct and alias spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · D48's shape ONE CONTAINER OVER — no map anywhere**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    type Box = { xs: Circle[] }
+    type Box2 = { xs: Dot[] }
+    function mkC(): i32 {
+      const c: Circle = { r: 7 }
+      const xs: Circle[] = [c]
+      const b: Box = { xs: xs }
+      const l = b
+      return 1
+    }
+    function mkD(): i32 {
+      const c: Dot = { r: 9 }
+      const xs: Dot[] = [c]
+      const b: Box2 = { xs: xs }
+      const l = b
+      return 1
+    }
+    print(mkC())
+    print(mkD())
+    // vl check rc 0 (two unused-variable warnings); vl run:
+    //   Invalid input WebAssembly code at offset 368 in mkD:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **THE PAIRING IS THE TRIGGER AND A ONE-CONTAINER GRID CANNOT SEE IT** — the same blind spot
+  that hid D48. Either function ALONE runs; `Circle` a plain struct (delete `Sq`/`Shape`) runs;
+  `Dot` with a different field name runs.
+* **IT IS D48 AT THE STRUCT-FIELD ELEMENT ROW RATHER THAN THE MAP-VALUE SLOT.** Two
+  layout-twin field element rows resolve to one ref-list slot whose element heap is
+  `uVarHeap[Circle]`, and `Box2.xs` stores a `(ref $Dot)` into it. `sFieldElemName` /
+  `sFieldElemTyIx` and `rlSlotByNameTy`'s struct-twin rung are the layer, and the nominal
+  channel is on the FIELD's own recorded element type — the same shape as D48's `armTy`.
+  Filed separately because the layer is different and the ablation has not been run;
+  grouped with D48 in intent.
+* The failure is in the SECOND function, as D48's is — whichever declaration comes second
+  loses. Declaration order swaps which function fails and does not change the count.
+* **IT IS THE DESTINATION OF THE OTHER FOUR OF D49's TEN LOUD→SILENT CELLS.** Those four are
+  the ALIAS spellings of `store` and `storeread` at `arm_notwin` and `arm_twin`; their DIRECT
+  twins are already this row on `c0873a06` at the same offsets, and the repro above spells
+  every type out — **no array alias anywhere**. Reachable without the alias, therefore
+  inherited by it and not created for it.
+* D49's array-literal floor does not reach these either: ablated on its own, **0 of the 4
+  move**. Both field element lists are annotated, so they take the ref-list path and the i32
+  fallback the floor stands in is never entered.
+
+---
+
+### D65 — an INFERRED arm-element list has no rep, and now says so
+**loud emit reject · found 2026-08-26 by D49's 910-cell grid (19 of its 46 post-D49 silent cells) · was check-clean invalid wasm on `c0873a06`; now a loud emit reject · NO generic, NO import, NO alias, NO twin**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function cell() {
+      const c: Circle = { r: 7 }
+      const l = [c]
+      return 1
+    }
+    print(cell())
+    // vl check rc 0 (one unused-variable warning); vl run:
+    //   emitProgram: union-arm array elements are not supported in this position
+    // on c0873a06 the same program was:
+    //   Invalid input WebAssembly code at offset 255: type mismatch: expected i32, found (ref $type)
+
+* **THE ANNOTATION IS THE WHOLE TRIGGER, IN THE OPPOSITE DIRECTION FROM D49'S.** Writing
+  `const l: Circle[] = [c]` RUNS; leaving it off drops the list into the i32 backing, because
+  the ref-list layer keys on a declared spelling and an inferred local has none.
+* The floor added while closing D49 is the ladder's missing VARIANT arm, beside the ARRAY,
+  STRUCT and MAP arms that were already there — the map one's own comment writes this row's
+  master message verbatim. It cannot redden a running program: on the i32 backing a
+  `(ref $uVarHeap[arm])` element has no rep at all.
+* **WHAT IS STILL OWED IS THE REP, NOT THE FLOOR.** The inferred spelling should reach the
+  ref-list path the annotated one does; the channel is the checker's recorded type on the
+  array-literal node (`arrLitArenaElemRow`, which already exists), not a spelling.
+* Flat across arm-ness (`arm_notwin` / `arm_twin` / `arm_namediff`) and across `listelem` /
+  `structfield`; `plain` and `nonmember` run.
+
+---
+
+### D66 — the BARE-container half of D40: a callback result bound through an un-annotated local, silent only through `std:array`
+**check-clean invalid wasm · split out of D40 on 2026-08-26 when the LIST half went loud · pre-existing and byte-identical on `c0873a06` (same offset, same message) · a genuine `std:array` CARVE-OUT by the routing test — the same producer called directly is LOUD**
+
+Repro:
+
+    import { mapIndexed } from "std:array"
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+
+    function mk(n: i32, _i: i32) {
+      const c: Circle = { r: n }
+      const o = c
+      return o
+    }
+
+    print(mapIndexed([7], mk)[0].r)
+    // vl check rc 0, no diagnostics; vl run:
+    //   failed to compile: …::mapIndexed$m1
+    //   Invalid input WebAssembly code at offset 479: type mismatch: expected (ref $type), found i32
+
+* **THE ROUTING IS THE CARVE-OUT TEST AND IT PASSES IT.** The same body called DIRECTLY is the
+  loud `emitProgram: field access but no struct type declared`; routing it through
+  `mapIndexed` turns that refusal into silence. That is D35's property at a third position.
+* **IT DOES NOT SHARE D40's FIX, WHICH IS WHY IT IS ITS OWN ROW NOW.** D40's list half is
+  floored by the array-literal ladder's new VARIANT arm (D65); this one builds no array
+  literal at all, so that ladder is never reached. The message says so too — `expected
+  (ref $type), found i32`, the rep-class collapse, not an element-type mismatch.
+* Remedy that HOLDS, measured: annotate the CALLBACK'S RETURN (`: Circle`). Annotating the
+  local does not. That asymmetry is D40's own note and is unchanged.
 
 ---
 
