@@ -5023,8 +5023,8 @@ the wrong namespace.
   `m["k"]` narrowed) — the loop VAR's storage class is the whole difference.
 
 
-### D57 — a STRUCT `==` goes check-clean invalid wasm the moment a UNION that contains that struct is DECLARED
-**check-clean invalid wasm · found 2026-08-26 by the D42/D44/D46 grid (20 of its 741 cells, every one of them in that grid's prelude) · pre-existing, byte-identical on `c0873a06` and on the D42/D44/D46 branch · NO generic, NO import, NO twin, and the union is NEVER USED**
+### D57 — [CLOSED 2026-08-26] a STRUCT `==` goes check-clean invalid wasm the moment a UNION that contains that struct is DECLARED
+**CLOSED 2026-08-26 — the repro now RUNS. Was: check-clean invalid wasm · found 2026-08-26 by the D42/D44/D46 grid (20 of its 741 cells, every one of them in that grid's prelude) · pre-existing, byte-identical on `c0873a06` and on the D42/D44/D46 branch · NO generic, NO import, NO twin, and the union is NEVER USED**
 
 Repro:
 
@@ -5067,6 +5067,67 @@ Repro:
 * **20 CELLS of the D42/D44/D46 grid, and they are that grid's whole remaining silent column.**
   Every one has `Circle` or `Shape` on at least one side of a `==`/`!=` and a `Shape` in the
   prelude; the grid's OTHER 721 cells are unaffected by the union's presence.
+
+**THE FIX (#D57, 2026-08-26).** The neighbourhood named above was right and the reading under it
+was one layer off: `structIndexOfExpr` does not resolve `Circle` to the WRONG table index — it
+resolves it to NONE. `collectS` SKIPS a `type X = {…}` that is a union member, so declaring the
+union DELETES `Circle`'s `sNames` row and mints a variant row instead; `declaredStructIndex` is
+kind-gated on `localIsRef[slot] == "struct"` and the slot is now kind-8 `"variant"`. Both rungs
+answered -1, the `eqLsi >= 0 || eqRsi >= 0` gate was false, and the compare fell PAST the
+struct/closure arms into the i32 tail at the bottom of `emitBin` — `i32.eq` over two
+`(ref $Circle)`. That is why it was silent rather than loud: nothing refused, because nothing
+recognised the operands at all.
+
+* **THE COMPLEMENT WAS ALREADY WRITTEN — the same shape most of this file's 2026-08-26 closes
+  had.** `exprVariantIndex` is `structIndexOfExpr`'s storage-class twin, built arm for arm —
+  param, declared local, capture, module global, `: T`-returning call, ref-list element, bare
+  map read, `?? default`, `as` cast — with every leg kind-gated so the two cannot both answer
+  for one binding. No channel was needed: this is not D39's two-equally-valid-claimants shape,
+  because the two ladders name two TABLES and the storage class already decides which.
+* **ONE CORE, TWO TABLES — the EQ ROW.** `emitStructEqRec` / `emitStructEqField` /
+  `emitChainRead` now take an eq ROW (`>= 0` a struct-table row, `< 0` variant `-1 - row`)
+  rather than a struct index, reading through `eqRowFieldCount` / `eqRowFieldTypeAt` /
+  `eqRowHeapIdx` / `eqRowTgtStructIdx`. Only the ROOT of a chain can be a variant — a code-15
+  nested field resolves through `uFieldTgtStructIdx`, which answers in the STRUCT namespace —
+  so the encoding never survives a descent. The field-code ladder, its five supported codes and
+  its one loud floor are untouched and shared.
+* **THE VARIANT RUNG IS ASKED FIRST, AND ON AGREEMENT ONLY.** Both operands must resolve to the
+  SAME variant row; a mixed pair (an arm against a standalone twin) still gets the existing
+  `emitProgram: struct equality is not supported yet`
+  (`tests/cases/unions/error-arm-struct-equality-mixed.vl` is that control). FIRST is
+  load-bearing and was measured, not assumed: with an exact layout twin in the module,
+  `structIndexOfExpr`'s two NON-kind-gated legs (the `Index` arena rung, the global's
+  `structIndexOfLet`) resolve a variant operand to the TWIN's row, so struct-first left
+  `xs[0] == xs[1]` and `ga == gb` invalid wasm — 12 cells that only variant-first fixes. Storage
+  class beats a structural twin.
+* **THE NULLABLE HALF WENT WITH IT.** `emitNulStructEq` asked the same one ladder, so
+  `Circle | null == Circle | null` was the loud `struct equality over a non-struct operand`
+  while the non-null compare had just learned to run — the exact drift `emitEqNonNullCore`'s
+  header names. It now asks `nulVariantIdxOfExpr` (the niche's own arm-for-arm twin) under the
+  same agreement condition and in the same ORDER — niche rung first — and that order was
+  measured on its own witness rather than copied for symmetry: a `Circle | null` MODULE GLOBAL
+  beside an exact layout twin resolves through the non-kind-gated `structIndexOfLet`, so
+  struct-first read a `(ref null $uVarHeap[vi])` through `sHeapIdx` and stayed check-clean
+  invalid wasm (`expected (ref null $type), found (ref null $type)`, identical on `a97c9ae1`).
+  `arm-struct-equality-nullable-niche.vl` carries that cell.
+* **THE GRID: 656 cells, the PRELUDE as a varied axis** — 7 preludes (none · declared-unused ·
+  declared-and-used · two unions containing the struct · union + exact layout twin · a union NOT
+  containing it · no union + a twin) x 3 declaration ORDERS (before the structs, between them
+  and the compare, after the compare) x 20 operand/route shapes x `==`/`!=`. **264 cells moved,
+  every one of them toward `runs`**: 234 from check-clean invalid wasm and 30 from a loud emit
+  reject. **0 cells moved from a loud outcome to a silent one, 0 lost the ability to run, and 0
+  produced a different value from the same cell's no-union oracle.** The DECLARATION-ORDER axis
+  is inert — all three orders agree in every one of the 656 cells, before and after.
+* **D45 IS NOT WIDENED, and it is checkable rather than asserted.** The change adds an
+  ACCEPTANCE rung and no refusal: across the grid, loud check rejects held at 38, loud emit
+  rejects went 188 -> 158 (all 30 toward `runs`), and no cell gained a diagnostic. On the 2,278
+  file corpus, 1,850 compile under both compilers, **0 are byte-different, 0 lost the ability to
+  compile and 0 gained it** — the change is inert on everything that already emitted and active
+  only on what previously fell through.
+* Corpus witnesses: `tests/cases/unions/arm-struct-equality.vl` (seven storage classes),
+  `tests/cases/unions/arm-struct-equality-nullable-niche.vl`,
+  `tests/cases/unions/error-arm-struct-equality-mixed.vl`,
+  `tests/cases/std/array-needle-union-arm.vl` (the four `std:array` needle routes).
 
 ---
 
@@ -5420,6 +5481,55 @@ Repro:
 * Found the way whole-program interactions get found: a five-cell fixture failed while every
   one of its cells passed alone, and the pairwise bisect named the pair. That is why the D41
   fixture spells its param cell `c: Boxed` — a fixture must fail for the row it pins.
+
+---
+
+### D75 — a MODULE GLOBAL of a union ARM, through a GENERIC `==`, beside an EXACT layout twin
+**check-clean invalid wasm · found 2026-08-26 while grading D57's 656-cell grid, at a coordinate that grid did NOT vary and a hand-written combination did (module-global delivery x generic route x exact layout twin) · pre-existing and byte-identical on `a97c9ae1` and on D57's branch, same offset and same sentence · NOT D57: the compare is reached, the ARGUMENT is not**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+
+    function eqT<T>(x: T, y: T): boolean {
+      return x == y
+    }
+
+    const c1: Circle = { r: 1 }
+    const c2: Circle = { r: 1 }
+    print(eqT(c1, c2))
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 238:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // (offset from the seed built at this row's filing, build/vl-compiler.wasm 1436642 bytes;
+    //  the master seed at 1436302 bytes gives the same offset and the same sentence)
+
+* **THE ONE-LINE CONTROL IS `type Dot`, AND IT TURNS A LOUD FLOOR OFF.** Delete it and the same
+  program is the loud `emitProgram: monomorphize: unsupported argument type for `x` in a call to
+  `eqT``. Give the twin the same arity and a DIFFERENT field name (`type Dot = { q: i32 }`) and
+  the loud floor comes back. So an EXACT layout twin is required, and D63's sentence applies one
+  layer up: the loud floor exists and the twin routes around it.
+* **A SECOND ONE-LINE CONTROL RUNS.** Delete `type Shape = Circle | Sq` instead and the program
+  prints `true` — the twin alone is harmless. Both the arm-ness and the twin are required, which
+  is D63/D64's signature, not D57's.
+* **IT IS NOT D57, and the ablation says so rather than the neighbourhood.** Move the two
+  operands from module globals into LOCALS of a function and the identical program runs on
+  D57's branch (it was invalid wasm before it). The compare inside `eqT$m1` is fixed; what is
+  still wrong is the INSTANCE'S PARAMETER TYPE. Disassembled, the module has THREE structurally
+  identical `(struct (field (mut i32)))` types in one rec group: the global's cell is typed
+  `(ref 1)` and `eqT$m1` is declared `(param (ref 0) (ref 0))` — two heap types for one shape,
+  never merged, so the `call` is what fails to validate, not the `==` in the body.
+* **THE FAMILY IS `uVarTwin` / `sTwin`, NOT `structIndexOfExpr`.** The twin columns exist
+  precisely to collapse a variant and a same-shaped struct onto one heap type; here they did not,
+  and the monomorphizer's argument classifier — which refuses an arm argument outright without
+  the twin — accepts it WITH the twin and pins the wrong row. Reachable neighbourhood:
+  `mAssignTypeIndices` (`uVarTwin`) and the monomorphizer's argument-type resolution.
+* Ranked as a silent row strictly worse than the loud floor it replaces, and left for the agent
+  holding D48/D63/D64 — the heap-slot / twin-collapse region — rather than reached from the
+  equality path, which has no say in either table's index assignment.
 
 ## 3. Shared-root analysis
 
