@@ -14092,17 +14092,31 @@ function isEquatable(ty: i32, seen: i32[]) {
   // Found by the `std-api-reviewer` pass. `tyUnionIsOneLitCell` is the narrower question this
   // gate actually asks, and `eqCmpKindOfArrayElem` asks the same two tests below.
   //
-  // NO `| null` CLAIM. A draft of this note said `tyUnionAllLits` "covers the `| null` member
-  // too (the atom's spare `-1`)". It does not fire: the `| null` spelling resolves to a
-  // `TyNullable`, inline and through an alias alike, and this arm is on `TyUnion` — measured,
-  // `(K | null)[] == (K | null)[]` still takes both sentences at both spellings. That residue
-  // is filed as `silent-class-inventory` D101 rather than described as covered here.
+  // THE `| null` CLAIM IS NOW AN ARM AND NOT A COMMENT, and the difference is D101. A draft of
+  // this note said `tyUnionAllLits` "covers the `| null` member too (the atom's spare `-1`)";
+  // it never fired, because the `| null` spelling resolves to a `TyNullable` and the arm above
+  // is on `TyUnion`. The arm below is that claim written where it fires, at BOTH spellings.
   //
+  // AN I32-SENTINEL NULLABLE IS VALUE-COMPARABLE FOR THE SAME REASON ITS BASE IS: it is one
+  // i32 cell with the null folded INTO the value space, not a second discriminant that has to
+  // be tested first. `K | null` is the atom id with the spare `-1` and `boolean | null` the
+  // 0/1 with the spare `2`, so a plain `i32.eq` answers `null == null` true and `null == "a"`
+  // false with no guard at all — which is exactly why the header's blanket "a NULLABLE field
+  // is NOT value-comparable" was too wide. Every OTHER nullable keeps that rule: a
+  // `(ref null …)` niche and a value BOX both need the variant discriminated first.
+  if t is TyNullable {
+    if tyIsI32SentinelNullable(ty) { return true }
+  }
   // The EMITTER-CAPABILITY half is separate and stays separate: `eqCmpKindOfArrayElem` decides
   // whether a LIST of these has a compare core, and an i64/f64-based numeric union has none.
   // This gate answers only the SOUNDNESS question, exactly as its header says.
   if t is TyUnion {
     if tyUnionIsOneLitCell(ty) { return true }
+    // The EXPANDED sentinel spelling — `"a" | "b" | null` written out, inline or through an
+    // alias, is a `TyUnion` with a null member rather than a `TyNullable`, and it is the same
+    // one i32 cell. MEASURED at both spellings; an UN-annotated `["a", null]` is NOT this
+    // shape (it infers as `string | null`, the ref niche) — see `tyIsI32SentinelNullable`.
+    if tyIsI32SentinelNullable(ty) { return true }
   }
   // A single LITERAL type (`type S = "a"`, a narrowed `1`) reps as its BASE scalar — a string
   // or a number — so it is value-comparable for the same reason its union is, and it cannot be
@@ -14198,13 +14212,14 @@ function unionSoleNonNullMember(ty: i32) {
 // one, whose members rep as a single base scalar (`numLitUnionHasBase` — `i32`, `i64` or
 // `f64`, and it answers "" the moment two members disagree).
 //
-// DELIBERATELY NARROWER THAN THE `+` HOME'S `tyUnionAllLits`, and the difference is a shape
-// both of them reach: `type M = "a" | 1` is all-literals and is NOT one cell — its members rep
-// as a string ref and an i32, so it is a value-union BOX. That predicate's own header says it
-// "DEFAULTS TO ACCEPT, deliberately", which is right for a rule that only ever loses a
-// capability; this gate decides SOUNDNESS, where accepting too much is the direction that
-// costs. (`silent-class-inventory` D45; the mixed-base cell was found by the `std-api-reviewer`
-// pass over that close.)
+// WIDER THAN `tyLitUnionIsI32Backed`, WHICH IS THE LOWERING QUESTION, and the two are next to
+// each other on purpose: this one admits an `i64`- or `f64`-based union because SOUNDNESS does
+// not care which scalar the single cell is, while the lowering split does — there is a compare
+// core for the i32 backing and none for the other two. `type M = "a" | 1` fails BOTH: it is
+// all-literals and is NOT one cell, because its members rep as a string ref and an i32, so it
+// is a value-union BOX. (`silent-class-inventory` D45; the mixed-base cell was found by the
+// `std-api-reviewer` pass over that close. The `+` home's `tyUnionAllLits`, which this note
+// used to contrast against, accepted every literal BASE and is gone — D102.)
 function tyUnionIsOneLitCell(ty: i32) {
   if tyIsLitUnion(ty) { return true }
   numLitUnionHasBase(ty)
@@ -14239,9 +14254,34 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
     // accept set as two prim names; this is the third member of it, and it is the SAME
     // question one hop down, so it is asked with the same two tests rather than a new one.
     if i2 is TyUnion {
-      if tyIsLitUnion(ie) { return "reflist" }
-      if numLitUnionBaseName(ie) == "i32" { return "reflist" }
+      if tyLitUnionIsI32Backed(ie) { return "reflist" }
+      // The EXPANDED `("a" | "b" | null)[][]` spelling, whose inner element is a `TyUnion`
+      // with a null member rather than a `TyNullable`.
+      if tyIsI32SentinelNullable(ie) { return "reflist" }
     }
+    // `(K | null)[][]` and `(boolean | null)[][]` are ref lists of i32 LISTS for the same
+    // reason `K[][]` is — the sentinel niche makes the inner list that very i32 list, which
+    // `tyScalarBackedListKind` states and CHECKED (all three spellings share `i32[]`'s
+    // wrapper). Same question one hop down, asked with the same predicate. (D101.)
+    if i2 is TyNullable {
+      if tyIsI32SentinelNullable(ie) { return "reflist" }
+    }
+    return "none"
+  }
+  // AN I32-SENTINEL NULLABLE ELEMENT RIDES THE SAME i32 LIST its base does, and this arm is
+  // D101: `tyScalarBackedListKind` — the emitter's own wrapper ladder — has answered `"list"`
+  // for `K[]`, `(K | null)[]` and `(boolean | null)[]` all along, off a measurement its header
+  // records (a program binding all eight spellings side by side gives the three the SAME
+  // wrapper as `i32[]`). The `==` home grew the litunion arm in D45 and not its two nullable
+  // siblings, so a valid program was refused for "a field that is not value-comparable" about
+  // a cell that is one i32 — while `(K | null)[] + (K | null)[]` ran, off the `+` home which
+  // had the arm. The complement was written; this is the call.
+  //
+  // The BOX- and ref-niche nullables stay "none": `(i32 | null)[]` and `(f64 | null)[]` are
+  // BOX lists and `(string | null)[]` is the string wrapper — `tyScalarBackedListKind` claims
+  // exactly boolean and string in its nullable arm, and this claims exactly its `"list"` half.
+  if e is TyNullable {
+    if tyIsI32SentinelNullable(elem) { return "list" }
     return "none"
   }
   // A LITERAL-UNION element rides the SAME i32 list `i32[]` and `boolean[]` do — a string
@@ -14260,8 +14300,9 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   // note listed f32 beside i64/f64 as though it were a measured decision; it is not one, and
   // saying so is the difference between a rule and a coincidence. (`std-api-reviewer`, D45.)
   if e is TyUnion {
-    if tyIsLitUnion(elem) { return "list" }
-    if numLitUnionBaseName(elem) == "i32" { return "list" }
+    if tyLitUnionIsI32Backed(elem) { return "list" }
+    // The EXPANDED `("a" | "b" | null)[]` spelling of the sentinel niche. (D101.)
+    if tyIsI32SentinelNullable(elem) { return "list" }
     return "none"
   }
   "none"
@@ -14469,19 +14510,23 @@ export function eqRefusals(
 // and a pure literal union (interned atom ids are i32) are i32 lists as much as `i32[]` is,
 // while `i32 | null` is a value-union BOX and is not.
 //
-// **THIS PARAGRAPH USED TO END "`eqCmpKindOfArrayElem` is NOT that set — it answers "none" for
-// a literal-union element", AND THAT CLAUSE IS GONE BECAUSE BOTH HALVES OF IT MOVED.** The
-// `==` home grew the literal family in D45 — so it IS that set now for the STRING and
-// i32-based unions — and this one turns out to be WIDER than its own sentence claimed, in a
-// direction that is a defect rather than a capability: `tyUnionAllLits` accepts EVERY literal
-// base, so `concatElemIsI32Backed` claims an `f64`-backed union as an i32 list and
-// `type F = 1.5 | 2.5;  F[] + F[]` writes a module the engine refuses at `vl check` rc 0.
-// Pre-existing — check-clean invalid wasm on master `8bf0f20f` at the same offset — and filed
-// as `silent-class-inventory` D102 rather than fixed here, because narrowing a `+` rule that
-// "DEFAULTS TO ACCEPT, deliberately" is a change to a different operator with its own
-// population to measure. The `==` side is now the NARROW one (`tyUnionIsOneLitCell` plus the
-// i32-backing split), so the two are still written out separately and the reason is recorded
-// rather than asserted. (`std-api-reviewer` pass over D45.)
+// **THIS PARAGRAPH HAS BEEN WRONG IN BOTH DIRECTIONS AND BOTH ARE NOW FIXED.** It used to end
+// "`eqCmpKindOfArrayElem` is NOT that set — it answers "none" for a literal-union element",
+// which D45 falsified from the `==` side; the replacement then said this home was WIDER than
+// its own sentence claimed and filed that as D102 rather than fixing it. D102 is fixed here,
+// and it was one arm wider than the row: `tyUnionAllLits` accepted every literal BASE (so
+// `type F = 1.5 | 2.5` was claimed as an i32 list) AND the `TyLit` arm accepted every single
+// literal (so `type G = 1.5` and `type BIG = 9999999999` were too) AND the `TyNullable` arm
+// asked `tyUnionAllLits` of its inner (so `(N | null)` and `(F | null)` were). Three
+// check-clean invalid-wasm cells and four loud-emit ones.
+//
+// THE TWO HOMES NOW ASK ONE PREDICATE for this family — `tyLitUnionIsI32Backed` and
+// `tyIsI32SentinelNullable`, both beside `tyIsNullableLitUnion` — so `+` and `==` can no
+// longer answer differently about the same cell. That is the drift both headers exist to
+// prevent, and each of them reproduced it once. `tyUnionAllLits` has no caller and is deleted.
+// The SOUNDNESS gate stays separate and stays wider (`tyUnionIsOneLitCell` admits an i64/f64
+// base, which has a cell but no compare core) — one question per gate, shared where the
+// question is the same.
 //
 // DEFAULTS TO ACCEPT, deliberately. A rep this predicate has not measured keeps today's
 // behaviour, which is `binOpDefinedFor`'s own stated convention: a rule that over-refuses
@@ -14496,38 +14541,27 @@ function concatElemIsI32Backed(elem: i32, depth: i32): boolean {
     return true // still a hole — the call that pins it asks again
   }
   if e is TyErr { return true }
-  if e is TyLit { return true }
+  // THE BACKING SPLIT, NOT "IS A LITERAL" — this arm is HALF of D102. `type G = 1.5` is a
+  // `TyLit` whose base is f64 and `type BIG = 9999999999` one whose base is i64; neither is
+  // the i32 backing `emitListConcatI` copies into, and `G[] + G[]` was check-clean invalid
+  // wasm at the same offset the row's `F[] + F[]` was. The row named only the union arm.
+  if e is TyLit { return tyLitIsI32Backed(e) }
   if e is TyPrim { return e.primName == "i32" || e.primName == "boolean" }
-  if e is TyNullable {
-    // ONLY THE SENTINEL NULLABLES stay i32. A `boolean | null` is the i32 value 2 and a
-    // `K | null` the atom id -1; every other nullable is a `(ref null …)` niche or a box.
-    const inner = T.tys[nomErasedTyIx(e.nInner)]
-    if inner is TyPrim { return inner.primName == "boolean" }
-    if inner is TyUnion { return tyUnionAllLits(e.nInner) }
-    return false
-  }
-  if e is TyUnion { return tyUnionAllLits(nomErasedTyIx(elem)) }
-  false
-}
-
-// Every member of the union at `ty` is a LITERAL (or the `null` type) — the interned-atom /
-// scalar-literal family whose storage is one i32. `tyIsLitUnion` is the STRING-only twin and
-// cannot stand in: `type N = 1 | 2` concatenates exactly as `type K = "a" | "b"` does.
-function tyUnionAllLits(ty: i32) {
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length < 1 { return false }
-    let i = 0
-    while i < t.uMembers.length {
-      const m = T.tys[t.uMembers[i]]
-      let ok = false
-      if m is TyLit { ok = true }
-      if isNullTy(t.uMembers[i]) { ok = true }
-      if !ok { return false }
-      i = i + 1
-    }
-    return true
+  // ONLY THE SENTINEL NULLABLES stay i32. A `boolean | null` is the i32 value 2 and a
+  // `K | null` the atom id -1; every other nullable is a `(ref null …)` niche or a box —
+  // which is what `repOfNullable` decides, off the very predicate asked here. This arm used
+  // to ask `tyUnionAllLits` of the inner, which admitted the NUMERIC litunions too, so
+  // `(N | null)[]` and `(F | null)[]` were accepted into a backing neither has; both were a
+  // loud `emitProgram` on master and are now refused at `vl check` with the honest sentence.
+  if e is TyNullable { return tyIsI32SentinelNullable(nomErasedTyIx(elem)) }
+  // THE OTHER HALF OF D102. `tyUnionAllLits` accepted EVERY literal base, so an f64-backed
+  // `type F = 1.5 | 2.5` was claimed as an i32 list. The `==` home split by BACKING in D45
+  // and this one did not; they now ask ONE predicate, so the two operators can no longer
+  // answer differently about the same cell. `tyUnionAllLits` has no caller left and is gone.
+  if e is TyUnion {
+    const ue = nomErasedTyIx(elem)
+    if tyLitUnionIsI32Backed(ue) { return true }
+    return tyIsI32SentinelNullable(ue)
   }
   false
 }
@@ -26724,6 +26758,77 @@ export function tyIsNullableLitUnion(ty: i32): boolean {
   }
   false
 }
+
+// ── THE ONE HOME for "does a value of this type occupy ONE i32 CELL" ──────────────────
+// Two questions, because the two families are decided by different machinery, and both are
+// asked by three homes that used to spell them out privately: the `==` element ladder
+// (`eqCmpKindOfArrayElem`), the `+` element ladder (`concatElemIsI32Backed`) and the
+// emitter's wrapper ladder (`tyScalarBackedListKind`). One i32 cell is exactly the storage
+// `emitListConcatI`'s `$aTypeIdx` backing and `emitListEqICore`'s element read both assume,
+// so a home that answers this question differently from another writes a module the engine
+// refuses — which is `silent-class-inventory` D101 (a home that answered NO where the other
+// two said yes) and D102 (a home that answered YES where the rep is an f64).
+
+// A `| null` whose rep is an I32 SENTINEL NICHE rather than a `(ref null …)` niche or a
+// value BOX — the two families `repOfNullable` niches into a spare i32: `boolean | null`
+// (the spare 2, `rdNul` 2) and a STRING literal union `K | null` (the spare -1 below the
+// >= 0 atom ids, `rdNul` 3). It is asked here rather than re-derived so that the rep home
+// and the comparability home read ONE function: `repOfNullable` decides the sentinel off
+// `tyIsLitUnion` / the boolean prim, and this is that same pair.
+//
+// FOUR ARENA SPELLINGS OF THE ATOM ONE AND TWO OF THE BOOLEAN, ALL MEASURED, because a
+// coverage claim about exactly this predicate family is what D101 was filed for. The
+// two-part `K | null` — inline, and through `type L = K | null` — is a `TyNullable`. The
+// EXPANDED `"a" | "b" | null` — inline, and through an alias — is a `TyUnion` with a null
+// member, which `tyIsNullableLitUnion` carries as its second arm. All four run;
+// `boolean | null` has only the `TyNullable` form and both its spellings run.
+//
+// **AN UN-ANNOTATED `["a", null]` IS NOT ONE OF THEM**, and `tyIsNullableLitUnion`'s own
+// header says it is: "its INFERRED element type (`["a", null]` → the union of the elements'
+// types) gives the expanded `TyUnion` form". Measured at this close, that element infers as
+// `string | null` — a bare string literal softens to `string` with no annotation to pin the
+// atom — so the list is the ref niche and is refused on BOTH sides, unchanged. The claim is
+// true of the name-level path that header is really about and false of the `==` path; it is
+// recorded here rather than corrected there because the two are different questions and
+// only this one was re-run.
+//
+// NOT THE NUMERIC LITERAL UNIONS, and that is measured rather than assumed. `repOfNullable`
+// asks `tyIsLitUnion`, which is STRING-only, so `N | null` over `type N = 1 | 2` is a
+// value-union BOX and `F | null` likewise — `nulNumLitUnionBaseName`'s own header says so
+// in as many words. Both are refused at `==` and a loud emit at `+` on master, and this
+// predicate is what keeps them there while the sentinel pair moves.
+export function tyIsI32SentinelNullable(ty: i32): boolean {
+  if tyIsNullableLitUnion(ty) { return true }
+  isNulBoolTy(ty)
+}
+
+// A literal UNION that reps as ONE i32 cell: an all-STRING union, whose members are interned
+// i32 ATOMS, or an all-NUMERIC one whose single base is `i32`. This is the pair of tests
+// `eqCmpKindOfArrayElem` already wrote out TWICE — once for the element, once for the inner
+// element of a 2-D `K[][]` — and the split D45's close introduced there but did not carry to
+// the `+` home, which is D102: an `i64`- or `f64`-based union is a DIFFERENT wrapper with no
+// i32 backing, so `tyUnionAllLits`' "every member is a `TyLit`" admitted `type F = 1.5 | 2.5`
+// as an i32 list and `F[] + F[]` wrote a module the engine refuses at `vl check` rc 0.
+//
+// NO `f32` ARM, and it is unreachable rather than declined: `litBaseTy` answers only
+// `str` / `f64` / `i32` / `i64`, so a pure literal union can never HAVE an f32 base.
+export function tyLitUnionIsI32Backed(ty: i32): boolean {
+  if tyIsLitUnion(ty) { return true }
+  numLitUnionBaseName(ty) == "i32"
+}
+
+// A SINGLE literal type (`type H = "a"`, `type J = 1`) that reps as one i32 cell — a string
+// literal interns as its atom and an in-range integer as its `i32` base. The other two bases
+// `litBaseTy` can answer are NOT one i32 cell: `type G = 1.5` is an f64 and
+// `type BIG = 9999999999` an i64, each with its own list wrapper. Measured at `+`: the first
+// two run and read their elements back correctly, and `G[] + G[]` is check-clean INVALID WASM
+// on master at the same offset `F[] + F[]` is — the same D102 defect one arm over, which the
+// row named only for the union.
+export function tyLitIsI32Backed(t: TyLit): boolean {
+  const b = litBaseTy(t)
+  b == TY_STR || b == TY_I32
+}
+
 // True if type-arena entry `ty` is a NULLABLE NUMERIC literal union — `1 | 2 | null`, or the
 // two-part `Z | null` over `type Z = 1 | 2` — and, if so, WHICH base scalar its non-null
 // members rep as (`"i32"` / `"i64"` / `"f64"`); "" for everything else. The numeric twin of
