@@ -25,6 +25,52 @@ self-contained: **every defect below carries its minimal program and its working
 in full**, and every number carries its denominator, so nothing here depends on the scripts
 surviving the worktree.
 
+## 0a. THIS FILE HAS NEVER BEEN GRADED, AND TEN OF ITS FOURTEEN ROWS ARE STALE
+
+**Filed 2026-08-27, from the D156 close. Not fixed here — read this before quoting any row
+below.**
+
+`scripts/check-filed-witnesses.py` re-runs each row's own program and reports which no longer
+behave as filed. It could not parse a single row of THIS file, and so has never graded one:
+its parser required a `Repro:` lead-in, and this file writes the program directly under the
+status line (see the header above — *"every defect below carries its minimal program and its
+working control pasted in full"*). All 14 rows reported as `not graded`, in a column that did
+not affect the exit code, so the file has read as fully live since it was written.
+
+The parser now accepts this file's shape. Graded for the first time, **10 of the 14 rows no
+longer reproduce**:
+
+| row | filed | today |
+|---|---|---|
+| D1 | compiler trap | **runs** (`1`) |
+| D2 | compiler trap | **runs** (`0`) |
+| D4 | check-clean invalid wasm | **runs** (`aa`) |
+| D5 | check-clean invalid wasm | **runs** (`2`) |
+| D6 | check-clean invalid wasm | **runs** (`1.5`) |
+| D7 | check-clean invalid wasm | **runs** (`1`) |
+| D9 | loud emit reject | **runs** (`2`) |
+| D12 | loud emit reject | **runs** (`1`) |
+| D13 | loud emit reject | **runs** (`2`) |
+| D14 | loud emit reject | **runs** |
+
+That is the one-directional staleness `CLAUDE.md` warns about, at its full extent: a fixed
+defect keeps reading as live because the inventory is not the file the fixer edits — and here
+the instrument that would have caught it was structurally unable to see the file at all.
+
+**Re-grading these ten is its own change** and is deliberately not folded into the D156 close
+that found them. Two things are owed with it:
+
+* **D3's status line WRAPS onto a second line.** The grader now joins a wrapped status line,
+  so that no longer blocks it — but D3 declares `check-clean SILENTLY WRONG VALUE`, and the
+  grader requires such a row to carry the wrong output as a `// PRINTS <text>` line inside its
+  own repro (a wrong VALUE is invisible on the three channels it reads). D3's repro says
+  `// vl check rc 0.   Output: 0        <- WRONG` instead, so it stays ungradeable until that
+  line is added.
+* **Once the ten are re-graded, add this file to `DOCS` in `tests/vl_inventory_rows_test.ts`**,
+  which enforces the structural half of the row discipline on every PR. It is scoped to
+  inventory #1 today precisely so that this file's pre-existing debt does not red the tree for
+  an author who is not editing it.
+
 ## 0. What was measured
 
 | | |

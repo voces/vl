@@ -60,7 +60,7 @@ For any doc whose rows are `### <ID> — <title>` + a `**<status>**` line + a `R
 that is one command:
 
 ```sh
-python3 scripts/check-filed-witnesses.py docs/internals/silent-class-inventory.md
+python3 scripts/check-filed-witnesses.py --strict docs/internals/silent-class-inventory.md
 ```
 
 It runs each row's OWN filed program — never a paraphrase, which is a different program —
@@ -68,3 +68,19 @@ and prints which rows no longer behave as filed; non-zero exit means at least on
 It found **eight of sixteen** rows already fixed on first use. Grade the doc against it
 rather than against memory, and **run the repro verbatim**: a hand-retyped witness that
 differs in one type tells you nothing about the row.
+
+**Pass `--strict`, and read all FOUR columns.** Without it a row the checker cannot grade at
+all — no `Repro:` block, or a status line naming no outcome in its vocabulary — is reported
+in the fourth column and the script still **exits 0**. So `94 graded · 94 as filed · 0 MOVED
+· 2 not graded` and `… · 0 not graded` are the same exit code, and a summary quoting the
+first three numbers reads identically either way. `--strict` makes an ungradeable row a
+failure and names the fix.
+
+**A row whose defect is only reachable under a change that was REFUSED is still gradeable** —
+file it as a REFUTATION PIN: the witness is the program that must keep RUNNING, with the
+status `runs today and must keep running`, so it flips the day someone lands the refused
+change. D171/D172/D173 are that shape.
+
+`tests/vl_inventory_rows_test.ts` enforces the structural half of this on every PR (a
+known-outcome status line and a real repro BLOCK, not just a `Repro:` label) in ~15ms,
+without running any program.
