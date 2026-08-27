@@ -353,14 +353,28 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   a nominal question reaches a layer that only has a render, the fix is upstream of the
   layer, and adding a rung to the layer is guaranteed not to work — a render of `Circle`
   and a render of `{r:i32}` are the same string.
-  **What stays open at that seam is slot IDENTITY, not the heap.** An arm-valued and a
-  twin-struct-valued map in one program still share ONE mv slot, because the slot's key
-  is that same render (D48); the dedup layer below it is arm-gated for the day they
-  separate. That gate's zero is split into its two halves rather than reported as one: the
-  enclosing arm is LIVE (46 calls over 25 corpus files, so the counter is not #1944's unproven
-  kind) and the parity branch is NOT REACHABLE today, because D48 is the very reason the two
-  slots it would discriminate never both exist. Kept as a structural guard, for the reason
-  #1942 kept its own.
+  **Slot IDENTITY is now closed at that seam too, and the arm is its THIRD component**
+  (D48, 2026-08-26). The pair (key rep, value type) left an arm-valued and a twin-struct-
+  valued map sharing ONE mv slot, because both components read the render. The arm is
+  carried the way this entry prescribes — from the node that still has it — but as a
+  TRI-STATE, and the third state is the whole of why a two-value parity was not enough:
+  `MV_ARM_NOHINT` (no type to ask; matches any slot, which is what every un-hinted entry
+  point passes and why none of them moved), `-1` (a RESOLVED type that is not an arm; the
+  state that stops the twin's mint from finding the arm's slot), and the arm's own row. A
+  hint FILTERS the two find rungs and never creates a match, so it sits under a MINT without
+  violating D-MAPNODETY: the mint runs in strictly more cases and is skipped in none.
+  **The dedup gate below it was arm-gated for this day and its test was wrong in one
+  direction.** Its zero is no longer a reachability zero: over a 1,070-cell grid the kind-1
+  arm's cross rung (one arm, one struct → refuse) fires 22 times and the both-arms rung 10,
+  while the corpus enters the arm 46 times over 25 files and takes the STRUCT rung on every
+  one. And the branch shipped as an IDENTITY test where the question is a HEAP one: two arms
+  of two DIFFERENT unions over one field set are `uVarTwin` layout twins and therefore one
+  variant heap, so their maps DO share a map struct — refusing that merge cost 2 grid cells
+  `runs` → check-clean invalid wasm. It now asks `repVariantSlotsTwin`, the variant layer's
+  pairwise twin relation (the `repStructSlotsTwin` sibling); cross-table is a flat 0 because
+  a variant struct and a struct row are never one heap. The `both arms, NOT heap twins` rung
+  reads 0 on grid, corpus and a hand attempt — reported, not deleted, on the standing rule
+  that an unreached rung is not a wrong one.
   (structural slot dedup, variant layer)
 - **The shape-INTERN table keys on field CODES (layout), not `repCanonKey`
   (structure); the two are deliberately separate layers.** `annShapeIndexOf` is a
