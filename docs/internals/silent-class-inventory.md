@@ -5514,8 +5514,9 @@ Repro:
     // vl check rc 0; vl run:
     //   Invalid input WebAssembly code at offset 238:
     //   type mismatch: expected (ref $type), found (ref $type)
-    // (offset from the seed built at this row's filing, build/vl-compiler.wasm 1436642 bytes;
-    //  the master seed at 1436302 bytes gives the same offset and the same sentence)
+    // (SAME OFFSET ON BOTH SEEDS, which is why one is quoted at all: D57's branch fixpoint
+    //  at 1437160 bytes and a master `a97c9ae1` seed rebuilt from its own sources at
+    //  1436302 bytes give byte 238 and the identical sentence)
 
 * **THE ONE-LINE CONTROL IS `type Dot`, AND IT TURNS A LOUD FLOOR OFF.** Delete it and the same
   program is the loud `emitProgram: monomorphize: unsupported argument type for `x` in a call to
