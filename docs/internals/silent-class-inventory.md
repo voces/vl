@@ -4745,7 +4745,7 @@ Fixture: `tests/cases/objects/error-equality-not-overloadable.vl` (all four spel
 ---
 
 ### D47 — [CLOSED 2026-08-26] the INLINE map-annotation spelling of an arm-valued map keeps the LOUD `-3` floor the ALIAS spelling no longer hits
-**CLOSED 2026-08-26 — the repro now RUNS (prints `7`). Was: loud emit reject · found 2026-08-26 by D34's own retirement, which had to explain why the pinned `error-map-value-struct-in-union.vl` still errors · pre-existing and IDENTICAL on `f2064bec` and on D34's branch · the ACCEPTABLE class (loud both sides), filed for the SPELLING-dependence, not for the reject · CLOSED by #D47D50 — the mv slot is keyed by the ARM'S OWN NAME, read off the caller's recorded type, which is the one channel BOTH spellings have**
+**CLOSED 2026-08-26 — the repro now RUNS (prints `7`). Was: loud emit reject · found 2026-08-26 by D34's own retirement, which had to explain why the pinned `error-map-value-struct-in-union.vl` still errors · pre-existing and IDENTICAL on `f2064bec` and on D34's branch · the ACCEPTABLE class (loud both sides), filed for the SPELLING-dependence, not for the reject · CLOSED by #1954 — the mv slot is keyed by the ARM'S OWN NAME, read off the caller's recorded type, which is the one channel BOTH spellings have**
 
 Repro:
 
@@ -5097,7 +5097,7 @@ been closed by a predicate (here a producer) that already existed and was not co
 ---
 
 ### D50 — [CLOSED 2026-08-26] a `for` loop over an ARM-valued container binds no variant loop var
-**CLOSED 2026-08-26 — the repro now RUNS (prints `7`). Was: loud emit reject · found 2026-08-26 by D34's 300-cell grid (6 cells moved silent → LOUD by its fix) · the LIST spelling is loud on `f2064bec` too; the MAP spelling was silent there and is loud now · CLOSED by #D47D50 — `forInRefArrayVariantIdx`, whose BOTH rungs were already written as REFUSALS in the struct half**
+**CLOSED 2026-08-26 — the repro now RUNS (prints `7`). Was: loud emit reject · found 2026-08-26 by D34's 300-cell grid (6 cells moved silent → LOUD by its fix) · the LIST spelling is loud on `f2064bec` too; the MAP spelling was silent there and is loud now · CLOSED by #1954 — `forInRefArrayVariantIdx`, whose BOTH rungs were already written as REFUSALS in the struct half**
 
 Repro (the LIST spelling — loud on both compilers):
 
@@ -5361,7 +5361,7 @@ Repro:
 ---
 
 ### D63 — [CLOSED 2026-08-26 — now RUNS] a `for` over an arm-element list beside an EXACT LAYOUT TWIN is SILENT where D50 is loud
-**NOW RUNS (prints `7`) — D50 lifted in #D47D50 and this coordinate lifted with it, which is what "the floor was there all along and the twin was walking round it" predicted; the fixture below graduated from a floor pin to `@run`. Was, between #1952 and then: a loud emit reject (`emitProgram: field access receiver is not a struct`) — the twin no longer routes around D50's floor, and D50 is what both spellings now take. Was originally: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed · CLOSED by #1952 — the nominal floor `rlElemStructRow` already carried, at the SECOND copy of that ladder**
+**NOW RUNS (prints `7`) — D50 lifted in #1954 and this coordinate lifted with it, which is what "the floor was there all along and the twin was walking round it" predicted; the fixture below graduated from a floor pin to `@run`. Was, between #1952 and then: a loud emit reject (`emitProgram: field access receiver is not a struct`) — the twin no longer routes around D50's floor, and D50 is what both spellings now take. Was originally: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed · CLOSED by #1952 — the nominal floor `rlElemStructRow` already carried, at the SECOND copy of that ladder**
 
 Repro:
 
