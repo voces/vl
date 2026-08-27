@@ -216,6 +216,7 @@ import {
   f32PushScratchBase,
   f64PushScratchBase,
   fRetKind,
+  fRetStructIdx,
   fRetVoid,
   fa32TypeIdx,
   fa32Used,
@@ -15541,7 +15542,26 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // variant too, matching the then-arm's narrowed variant rep.
     if fn.fnRet < 0 {
       const rvi = cbRetVariantIdx(fnPos)
-      if rvi >= 0 { pendingVariantIdx = rvi }
+      if rvi >= 0 {
+        pendingVariantIdx = rvi
+      } else if fnPos >= 0 && fnPos < fRetKind.length {
+        // THE CLASSIFIED PAIR, WHEN THE COLLAPSE ARM HAS NOTHING — the same fact
+        // `emitOneFuncType`'s inferred `variant` arm emits the RESULT VALTYPE from, so reading
+        // it here makes the literal and the functype agree by construction rather than by two
+        // ladders happening to cover the same shapes. `function mk(n: i32) { return { r: n } }`
+        // beside `type Shape = Circle | Sq` is the shape that needed it (D51, the no-local
+        // spelling): `criClassify` now stamps `("variant", vi)` for it, and without this seed
+        // the literal still took `emitObjLitNode`'s `uDeclared` arm and built the `{tag, value}`
+        // BOX into a `(ref $uVarHeap[vi])` result — check-clean invalid wasm, which is worse
+        // than the reject it replaced. Gated on the collapse arm having declined, so every
+        // program it already claimed is byte-identical.
+
+        if fRetKind[fnPos] == "variant" {
+          if fnPos < fRetStructIdx.length {
+            pendingVariantIdx = fRetStructIdx[fnPos]
+          }
+        }
+      }
     }
     pendingListKind = tyAnnRefListKind(fn.fnRet)
     pendingListSlot = tyAnnRefListSlot(fn.fnRet)
@@ -16456,6 +16476,20 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // A `const c: Cat = { … }` variant-typed binding seeds the VARIANT index so the object
   // literal builds the bare variant struct (kind 8) instead of boxing into the union.
   pendingVariantIdx = letAnnVariantIdx(stmtIx)
+  // THE SLOT-KIND TWIN OF THE LINE ABOVE, exactly as the `nulstruct` seed is the slot-kind
+  // twin of `letAnnStructIdx` twenty lines up — and the same argument: the ANNOTATION is one
+  // route to a kind-8 cell and `collectLocals` is the other, so a seed that reads only the
+  // annotation is blind to every binding classified from its INIT. `const c = { r: n }`
+  // beside `type Shape = Circle | Sq` is that binding (D51): its slot is `("variant", vi)`
+  // and the literal, unseeded, fell to `emitObjLitNode`'s `uDeclared` arm and built the
+  // `{tag, value}` BOX into a `(ref $uVarHeap[vi])` cell — check-clean INVALID WASM, which is
+  // strictly worse than the loud reject the un-classified slot used to give. Gated on the
+  // annotation having declined, so an annotated binding is byte-identical.
+  if pendingVariantIdx < 0 {
+    if localIsRef[slot] == "variant" {
+      pendingVariantIdx = localStructIdx[slot]
+    }
+  }
   // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
   // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
   if letIsMap(stmtIx, fnIx) { pendingMapSlot = letMapShapeOf(stmtIx, fnIx) }

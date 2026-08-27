@@ -3422,10 +3422,8 @@ function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32, ctx: i32) {
 // `fnStmts[fe]`, and its params carry the PINNED annotations, which is exactly the concrete
 // function type this answer is for.
 function monoFnParamTypeAt(fe: i32, i: i32) {
-  if fe < 0 { return -1 }
-  if fe >= fnStmts.length { return -1 }
-  let declIx = fnStmts[fe]
-  if fe < monoOrigNode.length { declIx = monoOrigNode[fe] }
+  const declIx = monoFnDeclNodeAt(fe)
+  if declIx < 0 { return -1 }
   const fn = P.nodes[declIx]
   if fn is FuncDecl {
     const ps = fn.fnParams
@@ -3435,6 +3433,82 @@ function monoFnParamTypeAt(fe: i32, i: i32) {
     }
   }
   -1
+}
+
+// The DECLARATION node whose parameter annotations `monoFnParamTypeAt` reads — the captured
+// ORIGINAL for a template slot, the slot itself for an APPENDED instance (which has no
+// separate original and carries the pinned annotations). Split out of that function so a
+// caller can ask about the declaration's TYPE PARAMETERS through the same resolution rather
+// than re-deriving it, and so the `monoOrigNode`-length bound its header describes is stated
+// once. -1 for a slot outside `fnStmts`.
+function monoFnDeclNodeAt(fe: i32) {
+  if fe < 0 { return -1 }
+  if fe >= fnStmts.length { return -1 }
+  if fe < monoOrigNode.length { return monoOrigNode[fe] }
+  fnStmts[fe]
+}
+
+// Does parameter `i` of the declaration at `fe` carry an annotation that mentions that
+// declaration's OWN type parameters — `g: (U, U) => R` on `hof<U, R>`, or a plain `a: U`?
+//
+// THE QUESTION `monoWalk`'S COERCION LOOP HAD TO ASK AND DID NOT (`silent-class-inventory`
+// D58). That loop hands the receiver's DECLARED parameter type to `monoCoerceFnValue` so a
+// generic function argument materializes at it — sound when the declaration is CONCRETE
+// (`apply(f: (i32,i32)=>i32)`), and nonsense when it is not: `monoFnTypeAnnParamsName` split
+// `(U, U) => R` into the pin names `["U", "U"]` and `monoInstanceFor` minted an instance of
+// the argument whose parameters are spelled `U` — a type VARIABLE of a different function,
+// which no valtype ladder can lower (`emitProgram: only i32, i64, f64, f32, boolean, struct,
+// union, array, or string parameters are supported`, at EVERY instantiation, 105 of the
+// D42/D44/D46 grid's 741 cells). A receiver with no type parameters answers false here, so
+// every concrete call keeps its coercion untouched.
+function monoFnParamAnnRidesTyParam(fe: i32, i: i32) {
+  const pty = monoFnParamTypeAt(fe, i)
+  if pty < 0 { return false }
+  const declIx = monoFnDeclNodeAt(fe)
+  if declIx < 0 { return false }
+  const fn = P.nodes[declIx]
+  if fn is FuncDecl {
+    if fn.fnTyParams.length == 0 { return false }
+    const ann = monoDeclAnnName(pty, tyNameOf(pty), fn.fnTyParams)
+    return monoAnnHasTyParam(ann, fn.fnTyParams)
+  }
+  false
+}
+
+// Does this call hand a GENERIC function VALUE to a parameter whose annotation is an ARROW
+// riding the callee's own type parameters (`hof(opT, a, b)` into `hof<U, R>(g: (U,U)=>R, …)`)?
+// The trigger for the pre-binding pass in `monoInstantiate`, and it is asked so that pass
+// changes NOTHING anywhere else: the two binding orders can only disagree when one parameter
+// says `U = T` (a type variable read off a generic argument's own declaration) and another
+// says `U = i32`, and the generic argument is the only way the first answer exists.
+function monoCallGenFnToTyParamArrow(
+  params: i32[],
+  args: i32[],
+  typarams: string[],
+  ctx: i32,
+) {
+  if typarams.length == 0 { return false }
+  let i = 0
+  while i < args.length && i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+        if annArrowAt(ann) >= 1 && monoAnnHasTyParam(ann, typarams) {
+          const ax = unwrapParen(args[i])
+          const av = P.nodes[ax]
+          if av is Ident {
+            const gfe = monoFnFeOfIdent(ax, av.identName, ctx)
+            if gfe >= 0 && gfe < monoGen.length {
+              if monoGen[gfe] == 1 { return true }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Instantiate (or reuse) the instance of generic `origFe` for the call at
@@ -3465,6 +3539,47 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       // from the ARGUMENT's recorded type, and consumed only as a FALLBACK where the pinned
       // NAME does not resolve (`recordClonedNodeTyFb`). -1 = nothing known.
       const pinTys: i32[] = []
+      // PRE-BIND FROM THE VALUE ARGUMENTS, and only when a generic function VALUE is on its
+      // way into an arrow parameter that rides these type parameters (`silent-class-inventory`
+      // D58). The main loop binds a type parameter at its FIRST use in declaration order, and
+      // `hof<U, R>(g: (U, U) => R, a: U, b: U)` uses `U` first at `g` — where the only thing
+      // to read it off is the ARGUMENT's own function type, which for a generic argument is
+      // that argument's declaration verbatim (`(T, T) => boolean`). So `U` bound to `T`, the
+      // instance emitted `a: T`, and the parameter ladder refused a type variable at every
+      // instantiation. The VALUE arguments carry a real type at the call site; binding from
+      // them first makes the arrow parameter SUBSTITUTE to a function type that exists.
+      //
+      // GATED, AND THE GATE IS WHAT KEEPS THE ORDER CHANGE INERT. Where the argument is a
+      // concrete function the two orders agree — the checker has already proved the call
+      // well-typed, so `g`'s function type and `a`'s type name the same `U`, and first-use
+      // wins either way. They can only differ when one of them is a type VARIABLE, which is
+      // exactly what `monoCallGenFnToTyParamArrow` looks for.
+      if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
+        let pb = 0
+        while pb < args.length {
+          const pbp = P.nodes[params[pb]]
+          if pbp is Param {
+            if pbp.parType >= 0 {
+              const pbAnn = monoDeclAnnName(
+                pbp.parType,
+                tyNameOf(pbp.parType),
+                fn.fnTyParams,
+              )
+              // The ARROW parameters are the ones whose binding is in question; every other
+              // annotation reads its type off the argument the call actually passes.
+              if annArrowAt(pbAnn) < 1 {
+                if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
+                  const pbConc = monoArgPinName(args[pb], ctx)
+                  if pbConc != "" {
+                    monoBindFromAnn(pbAnn, pbConc, fn.fnTyParams, tvN, tvV)
+                  }
+                }
+              }
+            }
+          }
+          pb = pb + 1
+        }
+      }
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]
@@ -3537,6 +3652,16 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                       fn.fnName +
                       "`",
                   )
+                }
+                // THE COERCION `monoWalk` DEFERRED. Its loop skips a parameter whose
+                // annotation rides these type parameters, because at that point the pin
+                // names would be the type variables themselves; `pinC` is the SUBSTITUTED
+                // spelling, which is the concrete function type that parameter actually
+                // takes, so the generic argument materializes at it here instead. A
+                // non-generic argument is a no-op (`monoCoerceFnValueName`'s `monoGen`
+                // gate), so this is inert on everything but D58's shape.
+                if annArrowAt(ann) >= 1 {
+                  if monoCoerceFnValueName(args[i], pinC, ctx) < 0 { return -1 }
                 }
                 pinned.push(pinC)
                 pinTys.push(monoArgPinTyIx(args[i], ctx))
@@ -3882,12 +4007,20 @@ function monoWalk(ix: i32, ctx: i32) {
       // definition form is not an axis — `monoFnFeOfIdent` reaches a `function` declaration and an
       // arrow bound to a `const`/`let` alike, and each declares its parameters the same way.
       // Resolved ONCE for the whole argument list rather than per argument.
+      //
+      // ONLY WHERE THE DECLARATION IS CONCRETE. A parameter type that mentions the
+      // receiver's OWN type parameters is not a function type yet — coercing to it pins the
+      // argument's instance at the type VARIABLE's spelling (`monoFnParamAnnRidesTyParam`'s
+      // header has the measurement). Those are deferred to `monoInstantiate`, which coerces
+      // at the SUBSTITUTED annotation once the call's concrete arguments have bound it.
       const dfe = monoFnFeOfIdent(n.callFn, callee.identName, ctx)
       let ca = 0
       while ca < args.length {
         const pty = monoFnParamTypeAt(dfe, ca)
         if pty >= 0 {
-          if monoCoerceFnValue(args[ca], pty, ctx) < 0 { return -1 }
+          if !monoFnParamAnnRidesTyParam(dfe, ca) {
+            if monoCoerceFnValue(args[ca], pty, ctx) < 0 { return -1 }
+          }
         }
         ca = ca + 1
       }
