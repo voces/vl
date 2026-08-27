@@ -94,6 +94,7 @@ Every residual failure sits at one of the 128 pairing=1 coordinates that have no
 arm-free control by construction — a layout twin has to be declared for them to exist at all
 — i.e. exactly D93/D94's territory. The composition is invisible to an outcome-class grader
 and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the same column, and their message changes from `unsupported map value type` to D50's own `field access receiver is not a struct` / `field access but no struct type declared` — the set of message-movers-that-FULL-makes-`correct` is SET-IDENTICAL to the 34) |
+| D88 D100 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; TWO roots, and the ablation says so — 24 cells and 18 cells, pairwise intersection **0**, and the union of the singles is SET-IDENTICAL to the full branch on a 2,850-cell grid. Both fixes are a complement that was already written. D88: `monoArgTyName` pinned a generic's parameter from `nodeTyMapName`, whose renderer spells a declared union ARM STRUCTURALLY, so the clone's annotation named a fresh anonymous arena index and `collectA` minted a SECOND mv slot for one map; `shapeNominalOfTy` already recurses through `TyArray` for a LIST element and the MAP was the one container it never grew. D100: filed as D39's CHANNEL case, and the measurement its own row named and did not take REFUTES that — `repStructSlotsTwin(Circle, Dot)` is 1, so the two "claimants" are ONE heap type and `repSlotOfTy`'s bridge was asking for a unique ROW where soundness needs a unique HEAP TYPE. **The 9,450-cell D52 grid goes 50 silent → 0**, the first time that population has been empty; the 3,144-cell D75/D82 grid moves 0 cells; corpus byte-identical bar the two graduated fixtures) |
 | D93 D94 | check-clean invalid wasm | **NEW 2026-08-26** — two rows the D47/D50 grid produced, both PRE-EXISTING on master and both the layout-twin collapse one container further out than D48/D64 reached. D93: a NESTED arm-valued map (`{[string]: {[string]: Circle}}`) beside its layout twin — silent on master at the ALIAS spelling, and D47's convergence brings the other three spellings to the same verdict. D94: a struct literal bound with NO annotation, beside two layout-twin declared rows whose FIELD elements differ in arm-ness — silent on master at 5 of its 6 cells |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 | D52 D66 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; D52 is D39's seam read from the other end and it needed NO channel — the annotation is on the LOCAL, `criRetLocalLet` already hands the result-valtype pass that binding, and `letAnnVariantIdx` was written, exported and documented correct with no caller on this path. What was missing is the ROUTE: `fRetKind` had no inferred `"variant"` tier and `emitOneFuncType`'s inferred `infSlot` ladder had no `variant` arm — the three items D51's row predicted in writing. A FOURTH edit was needed and the disassembly is what found it: with only the functype corrected, `mk` validated and the CALLER did not (`struct.get 0 0` over a `(ref 1)` receiver), so the engine's message moved function and changed one word. 180 of a 9,450-cell grid moved, 0 backward — 84 silent → runs and 96 loud → runs; silent 200 → 116. Corpus: 1,850 of 1,851 co-emitted files byte-identical, the one difference being D52's own pin. D66 rides the same rung and its filed asymmetry — "annotate the CALLBACK'S RETURN; annotating the local does not" — is retired) |
@@ -6470,8 +6471,8 @@ Repro:
 
 ---
 
-### D100 — an INLINE-SHAPE parameter where TWO declared structs share that layout
-**loud emit reject · found 2026-08-26 by the D53 close's own grid, as the 9 cells that close does NOT move (`plaintwin` x direct/local/alias x ret/retann/read) · pre-existing and IDENTICAL on master `8bf0f20f` and on the D53 branch · NOT silent, and filed because it is the exact boundary of D53's fix**
+### D100 — [CLOSED 2026-08-26] an INLINE-SHAPE parameter where TWO declared structs share that layout
+**CLOSED 2026-08-26 — the repro now RUNS and prints `7`. Was: loud emit reject · found 2026-08-26 by the D53 close's own grid, as the 9 cells that close does NOT move (`plaintwin` x direct/local/alias x ret/retann/read) · pre-existing and IDENTICAL on master `8bf0f20f`, on the D53 branch and on `764ad0dd` · NOT silent, and filed because it is the exact boundary of D53's fix**
 
 Repro:
 
@@ -6508,6 +6509,60 @@ Repro:
   `repStructSlotsTwin` (the CONJUNCTION, not `structFieldCodesEq` alone) as the predicate to
   ask.
 * Ranked below D99: it is LOUD at every cell, on both sides, and no spelling of it is silent.
+
+#### The close (2026-08-26, #D100)
+
+**IT IS NOT D39's CHANNEL. THE ROW NAMED THE MEASUREMENT THAT REFUTES IT AND DID NOT TAKE
+IT.** The bullet above reads *"Worth checking first, and NOT checked here: `sTwin` merges
+exact layout twins onto ONE heap type, so if `Circle` and `Dot` are `repStructSlotsTwin` the
+two answers emit the same module and a 'first row wins' rule would be sound without a channel
+at all. That is a measurement, not an argument."* Taken, with a probe at `repSlotOfTy`'s
+declining rung on the filed witness:
+
+    N=2 rows=Circle(0/rep0) Dot(1/rep0)[twin0=1]
+
+Both rows carry `repStructSlotRep` **0** and `repStructSlotsTwin(0, 1)` is **1**. The two
+"equally valid claimants" are ONE WasmGC heap type, so there is no answer to choose between
+and nothing for a channel to carry. What declined was a UNIQUENESS TEST STRONGER THAN
+SOUNDNESS NEEDS — `repSlotKeyN[key] == 1` asks for a unique ROW where the question is a
+unique HEAP TYPE — and the predicate that asks the weaker one was already written, exported
+and documented "queryable PAIRWISE (independent of `buildStructTwins` having run)".
+
+**SO IT IS THE COMPLEMENT PATTERN, NOT THE CHANNEL PATTERN, AND THAT IS THE REUSABLE PART.**
+Two of today's three patterns look identical from a resolver's seat: "two claimants, only
+context separates them" and "one answer, nobody called the function that knows it". The
+discriminator is not the count of claimants — it is whether the claimants DIFFER IN THE
+OUTPUT. Here they do not, and the row's own filed verdict was wrong for the whole day it
+stood. A row that names its own refuting measurement should have it taken before the row is
+scheduled, not after the fix is designed.
+
+* **THE PREDICATE IS THE CONJUNCTION THE ROW NAMED**, not `structFieldCodesEq` alone:
+  `repStructSlotsTwin` is the `slotCanonId` key AND the field-code layout guard. Asked
+  against the bucket's FIRST (smallest) row, which is what makes the accepted answer that
+  row — if every member is a twin of the smallest, `repStructSlotRep` of every member IS the
+  smallest, so the choice is deterministic and agrees with the `$fnsig` canonicalization.
+* **GENUINE AMBIGUITY STILL DECLINES**, and that arm is kept rather than removed: two rows
+  sharing a canonical key but NOT a layout — the atom-vs-plain collision `repRowOfTyStruct`
+  refuses to guess through — fail the guard and the bridge answers -1 exactly as before.
+  Nothing reaches the VARIANT namespace either: D53's caller still gates on
+  `variantIndexOf(ty.tyName) < 0`, so the D63/D75 collapse is unreachable from the widened
+  rung too.
+* **ORDER WAS CHECKED, NOT ASSUMED.** The new column (`repSlotKeyFirst`) is arena-only and
+  is filled in the same loop as the two existing ones, so it cannot see a later `sNames`
+  growth that they do not; the twin test itself runs at QUERY time over row-local tables
+  (`sFieldCount` / `sFieldTypes` / `sFieldElemName`), never inside the cache build, so no
+  field-code answer is frozen at an epoch where the codes are not yet filled.
+* **18 GRID CELLS, every one `loud emit reject` → `runs`, 0 in any other direction** —
+  `plaintwin` x `inline` x `bare` x all three routes x direct/local/param/paramlocal/retann
+  x `ann0` x both declaration orders. Pairwise-DISJOINT from D88 (intersection 0), and the
+  union of the two singles is set-identical to the full branch.
+* **AND 18 MORE MOVED LOUD → A DIFFERENT LOUD, which no outcome-class count can see.** The
+  `ann1` siblings stop reporting the positionless `ref valtype with no interned shape` and
+  start reporting an anchored `emitProgram: binding's inline-shape type has an unsupported
+  field`. That second sentence is a THIRD resolver asking D53's question — filed as D111 —
+  and it is graded WIDER than this row, so it is not this row's residue.
+* Graduated: `tests/cases/structs/inline-shape-param-beside-two-declared-twins.vl`
+  (D53's own six-row delivery chain, so the two fixtures are comparable).
 
 ---
 
@@ -6775,8 +6830,8 @@ Repro:
 
 ---
 
-### D88 — an ARM-VALUED MAP handed to a hand-written GENERIC
-**check-clean invalid wasm · found 2026-08-26 as D87's own closing residue — 20 of that row's 96 cells · pre-existing on `933e2cbf` with the same sentence, so NOT a regression from the change that filed it · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+### D88 — [CLOSED 2026-08-26] an ARM-VALUED MAP handed to a hand-written GENERIC
+**CLOSED 2026-08-26 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-26 as D87's own closing residue — 20 of that row's 96 cells · pre-existing on `933e2cbf` and `764ad0dd` with the same sentence, so NOT a regression from the change that filed it · was THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, now swapped to D112**
 
 Repro:
 
@@ -6817,6 +6872,161 @@ Repro:
   the instance's parameter is typed through.
 * Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-through-generic.vl`,
   `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+
+#### The close (2026-08-26, #D88)
+
+**THE PIN RENDERS THE ARM STRUCTURALLY, AND THE COMPLEMENT WAS ALREADY WRITTEN ONE CONTAINER
+OVER.** `monoArgTyName`'s map arm names a generic's argument with `nodeTyMapName`, which is
+`tyToEmitName` of the CHECKER's recorded type — and that renderer's nominal-first rung is
+`structNameOfTy`, which a declared union ARM cannot satisfy, because `collectS` SKIPS a
+`type X = {…}` that is a union member and the arm has no `sNames` row. So an instance whose
+every other channel calls the parameter `{[string]: Circle}` was cloned with the annotation
+`{[string]:{r:i32}}`.
+
+**PROBED AT BOTH ENDS RATHER THAN REASONED TO** — at `collectA`'s map arm and at the mv mint,
+on the filed witness:
+
+    {[string]:Circle}   armTy=40  slot=0     MINT slot=0 name=Circle   armH=0
+    {[string]:{r:i32}}  armTy=68  slot=1     MINT slot=1 name={r:i32}  armH=-1
+
+Arena index 68 is the RENDER's own fresh anonymous resolution, not `Circle`'s 40, so
+`variantRowOfTy` correctly answers -1 ("resolved, and NOT an arm"), `mvArmKeyName`'s re-key
+to the arm's own name never fires, and `collectA` mints a SECOND mv slot. Disassembled, the
+module carries two map structs — the caller's vals list `(ref null $uVarHeap[Circle])` and
+the instance's `(ref null ${r:i32})` — which is what "expected (ref $type), found (ref
+$type)" is hiding: two different heap types behind one placeholder.
+
+**THE MISSING COMPLEMENT IS A CONTAINER, NOT A RUNG.** `shapeNominalOfTy` is the arm-aware
+nominal ladder — banked struct row, then `variantRowOfTy` by DECLARATION identity, then two
+field-set scans — and it already recurses through `TyArray`, so a LIST element that is a
+declared arm is spelled `Circle` wherever a consumer asks (`arrElemNominalOfTy` is that
+consumer, written for D40). **The MAP is the one container the ladder never grew.**
+`nodeMapArmNominalName` is that twin.
+
+* **`variantRowOfTy` AND NOTHING ELSE**, which is the narrowing to keep. The ladder's two
+  FIELD-SET rungs are structural, and a map value that is a plain declared struct is ALREADY
+  correct — `tyToEmitName` finds its `sNames` row and spells `{[string]: Dot}` — so a
+  structural rung here could only re-decide a cell that already works, which is the D33/D75
+  collapse this seam is nominal to prevent. Measured: with the value spelled `Dot` instead of
+  `Circle` the same program RAN on master.
+* **THE KEY HALF IS SUBSTITUTED, NOT REBUILT.** Only the VALUE text changes; the key comes
+  off `tyToEmitName`'s own render through the map grammar's home cut (`mapSpellKeyName`), so
+  the pin is character-for-character the spelling an annotated `{[K]: Circle}` parameter
+  carries — `monoScalarAnnName`'s exact-name safety property, which is what puts the instance
+  on a path a NON-generic function already lowers end to end rather than beside it.
+* **NOT AN ORDER (D58's pattern), AND THAT WAS CHECKED EXPLICITLY** because the row involves
+  a generic: `collectU` is the FIRST entry in the pass table and `monomorphize` runs long
+  after it, so `uVarTyIx` is populated and `variantRowOfTy` answers at the pin.
+  `shapeNominalOfTy` is already consulted at this point in the pipeline
+  (`nominalizeFnTypeOfTy`, D33) — the same rung reaching the same table one container over.
+* **THE ROW'S OWN THREE CONTROLS RE-RUN ON `764ad0dd`, and the fourth is the one that
+  fires.** Delete `idg` → ran even before (the axis). Delete `type Dot` → still silent (NOT
+  the twin family). Annotate the local → still silent (NOT D87's channel). **Delete
+  `type Shape = Circle | Sq` → RUNS** — the ARM-ness is the requirement, which is what
+  `tyToEmitName`'s nominal-first rung says it should be.
+* **24 GRID CELLS, every one `check-clean invalid wasm` → `runs`, 0 in any other direction**
+  — `cont=mapval` x `route=gen` x `src=declname` x `decl` in {`arm`, `armtwin`, `armdiff`} x
+  {`param`, `paramlocal`} x both annotations x both declaration orders. That `armdiff` moves
+  is the twin control again: the twin is not required.
+* **AND IT TAKES THE 9,450-CELL D52 GRID TO ZERO SILENT CELLS — 50 moved, 0 backward** — the
+  first time that population has been empty. Master `764ad0dd` grades 50 silent there, which
+  reproduces D87's own closing number exactly; all 50 are `decl=arm` x `cont=mapval` x
+  `cons=pass` x `route=gen`. The 3,144-cell D75/D81/D82 grid moves **0 cells** (0 outcome, 0
+  message), so the fix is inert wherever it is not the answer.
+* Its pin is DELETED and graduates to
+  `tests/cases/unions/arm-valued-map-through-generic.vl`; `INVALID_MODULE_SRC` moves to D112
+  below, the first specimen in that genealogy with no declared type in it.
+
+
+### D111 — an INLINE-SHAPE LOCAL beside a declared struct of that layout: D53's question at a THIRD resolver
+**loud emit reject · found 2026-08-26 by MESSAGE-diffing the D100 close, not by an outcome-class count — 18 cells move from a positionless sentence to this anchored one · pre-existing and LOUD on master `764ad0dd` at every cell, on both sides**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function mk(n: i32) {
+      const c: { r: i32 } = { r: n }
+      return c
+    }
+
+    print(mk(7).r)
+    // vl check rc 0 — but NOT diagnostic-free: it emits the redundant-annotation HINT
+    //   `c` is inferred as `{r: i32}` — remove it to lean on inference
+    // which is the checker telling the author to write the exact spelling that RUNS.
+    // vl run rc 1:
+    //   emitProgram: binding's inline-shape type has an unsupported field
+
+* **THE ONE-LINE CONTROL IS THE DECLARATION, exactly as in D53.** Delete `type Circle` and
+  the program prints 7; spell the local `c: Circle` and it prints 7. The inline shape is
+  supported — it is `annShapeIndexOf`-deduped onto `Circle`'s row — and the guard that
+  rejects it is named for the case where it is not.
+* **IT IS D53's MECHANISM AT A THIRD RESOLVER.** `internInlineShapeTy` ends in
+  `annShapeIndexOf`, which dedups the inline shape onto the declared row and pushes NO
+  `sNames` entry for `{r:i32}`, leaving `structIndexByName("{r:i32}")` with nothing to find.
+  D53 taught `paramStructIndex` to fall through to `repSlotOfTy`'s structural→declared
+  bridge. `letAnnIsUninternedShape` — the LOCAL-annotation twin, and a SOUNDNESS GUARD whose
+  false side rejects — still ends in `structIndexByName(nm) < 0` and nothing else.
+* **WIDER THAN D100, WHICH IS WHY IT IS ITS OWN ROW AND NOT THAT CLOSE'S RESIDUE.** Graded
+  per `decl` level it fires at `plain` (ONE declared claimant) as readily as at `plaintwin`
+  (two) and `armtwin`; it RUNS at `nodecl`, at `arm` (no plain struct of the layout) and at
+  `armdiff`. D100's axis is the SECOND claimant; this row's axis is the first.
+* **THE OBVIOUS WIDENING IS MEASURED AND IT IS REFUSED — this is the row's most useful
+  content.** Falling through to `repSlotOfTy(nodeRepTyIxOf(d.letType))`, i.e. the same
+  complement D53 called, was built and swept against the 2,850-cell D88/D100 grid: **64 cells
+  move `loud emit reject` → `runs` and 19 move `loud emit reject` → `check-clean invalid
+  wasm`.** All 19 are `route=gen` ∧ `ann1`, every one of them. So the guard is doing real work
+  beyond the un-internable-field case it is named for: with it lifted, the local becomes a
+  struct local whose row disagrees with the pin `monoArgTyName` mints for the same binding —
+  D88's shape in the STRUCT container instead of the map one.
+* Reachable neighbourhood, in the order the measurement implies: fix the mono PIN for an
+  inline-shape-annotated local FIRST (the `{r:i32}` spelling resolving to a fresh anonymous
+  index is the same divergence D88 closed one container over), then the guard's fall-through
+  is inert in the generic route and the 19 become part of the 64. Doing the guard alone is a
+  loud→silent trade and is not licensed.
+* **NOT REACHABLE FROM D53's THREE GUARDS.** `annIsSpelledInlineShape` already establishes a
+  literal `{…}` spelling, so the variant namespace is unreachable and no shape guard is
+  needed; the generic-original guard does not apply either, because the binding here is not
+  in a generic original at all — the generic is the CONSUMER.
+
+---
+
+### D112 — a NESTED MAP whose INNER value is an ANONYMOUS object shape
+**check-clean invalid wasm · found 2026-08-26 as the smallest surviving silent cell of the D88/D100 grid, while re-specimening `INVALID_MODULE_SRC` · pre-existing and byte-identical on `764ad0dd` and on the D88/D100 branch, same sentence · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+
+Repro:
+
+    function mk(n: i32) {
+      const i0 = Map()
+      i0["k"] = { r: n }
+      const c = Map()
+      c["o"] = i0
+      return c
+    }
+    print((((mk(7))["o"] ?? Map())["k"] ?? { r: 0 }).r)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **NOT ONE DECLARED TYPE IN IT, and that is why it was chosen as the specimen.** Every axis
+  the last five `INVALID_MODULE_SRC` specimens turned on is absent: no union, no ARM, no exact
+  layout twin, no hand-written generic, no import, no lambda, no list, no declaration order.
+  Eight lines.
+* **THE MESSAGE DIFFERS IN NULLABILITY, NOT IN HEAP TYPE** — `expected (ref null $type),
+  found (ref $type)` — which is the tell that it is a vals-CELL nullability seam and not the
+  two-heap-types family every recent specimen came from. Worth stating because the family
+  resemblance of the sentence is what made three earlier rows get grouped wrongly.
+* **TWO CONTROLS BRACKET THE AXIS, both run verbatim on `764ad0dd` and on the branch.** One
+  nesting level less RUNS (`{[string]: {r:i32}}` built and read the same way prints 7); the
+  same nested map with a MONO inner value RUNS (`{[string]: {[string]: i32}}` prints 7). So
+  the trigger is the inner map's REF value cell reached through the outer map's read, not
+  nesting as such and not the anonymous shape as such.
+* **IT IS THE LARGEST REMAINING SILENT FAMILY ON THE D88/D100 GRID** — 570 of the 1,169
+  not-`runs` cells are `cont=nestedmap`, spread across every route, every delivery and both
+  declaration orders. Sized rather than guessed, and the size is the argument for ranking it.
+* Pinned as `tests/cases/soundness/xfail-miscompile-nested-map-anon-shape-value.vl`,
+  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+
+---
 
 ## 3. Shared-root analysis
 
