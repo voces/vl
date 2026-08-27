@@ -362,6 +362,7 @@ import {
   anonFieldCode,
   anonFieldElemKeyI32,
   anonFieldElemName,
+  armLayoutContested,
   arrElemIsClosureTy,
   arrElemNominalOfTy,
   arrLitElemHintTy,
@@ -977,6 +978,53 @@ export function synthNullableAnn(letIx: i32) {
   0
 }
 
+// The value spelling at the BOTTOM of a chain of map spellings — `Circle` for both
+// `{[string]: Circle}` and `{[string]: {[string]: Circle}}` — or "" when `name` is not a map
+// at all. `mapValNameOf` is one cut; this is the transitive closure of it, which is what the
+// two arm-pin gates below need (silent-class-inventory D156).
+//
+// TERMINATION IS STRUCTURAL, not the bound: every cut strictly shortens the spelling. The
+// hop limit is the same recursion guard `dstPinSrcIsAt` carries and for the same reason —
+// the spelling is not this pass's to trust.
+//
+// `mapValNameOf`'s own documented hazard needs no extra fence: it accepts
+// `{[string]:i32}|null` and returns the garbled `"i32}|nul"`, which is not a map spelling, so
+// the loop stops on it and the `variantIndexOf` gate at every caller rejects it.
+function mapLeafValName(name: string) {
+  let cur = mapValNameOf(name)
+  if cur == "" { return "" }
+  let hops = 0
+  while hops < 8 {
+    const nxt = mapValNameOf(cur)
+    if nxt == "" { return cur }
+    cur = nxt
+    hops = hops + 1
+  }
+  cur
+}
+
+// Does `name` — a spelling ONE cut below a map annotation — reach a union ARM through
+// FURTHER map hops, at a depth the one-cut rung above cannot see, AND is that arm's layout
+// UNCONTESTED?
+//
+// THE GATE IS MEASURED, NOT ARGUED (silent-class-inventory D171). Un-gated, the deeper rung
+// moves 32 `loud emit reject` cells of the D156 position grid to `runs` with 0 backward
+// where no layout twin is declared, and 20 silent cells to `runs` at the cost of 12
+// `runs` -> check-clean invalid wasm where one is. The contested half is not a weaker
+// version of the same win: it needs the pin CHAIN complete at every position, including
+// across an un-annotated parameter and across a call, and a half-pinned chain is worse than
+// an un-pinned one because the un-pinned one rides the arm/twin conflation the mv and
+// ref-list layers still carry. `armLayoutContested` is D39's own channel question — "does
+// this anonymous shape have two nominal claimants" — asked of the arm rather than of the
+// literal.
+function pinArmDeepUncontested(name: string) {
+  if name == "" { return false }
+  const leaf = mapLeafValName(name)
+  if leaf == "" { return false }
+  if variantIndexOf(leaf) < 0 { return false }
+  !armLayoutContested(leaf)
+}
+
 // THE ONE HOME for "does this type ANNOTATION name a concrete union ARM a literal must be
 // pinned onto" — the gate `synthRetPinAnn` was written with, and `synthDstPinAnn` re-reads
 // it for two more destinations. A bare arm (`Circle`) or a ref-list OF one (`Circle[]`);
@@ -1009,6 +1057,13 @@ function armPinAnnName(tyIx: i32) {
   const mvn = mapValNameOf(tyNameOf(tyIx))
   if mvn != "" {
     if variantIndexOf(mvn) >= 0 { return tyNameOf(tyIx) }
+    // …AND AT EVERY DEPTH, not one (silent-class-inventory D156). `mapValNameOf` is a single
+    // cut, so `{[string]: {[string]: Circle}}` answered `{[string]:Circle}` — a spelling the
+    // variant table can never claim — and the rung DECLINED. Declining here is not neutral:
+    // `dstPinPushAnn` records the "" as a destination DISAGREEMENT, so ONE nested-map
+    // delivery vetoes the pin every other delivery of that binding agreed on. 36 of the D88
+    // grid's 44 surviving silent cells were exactly that.
+    if pinArmDeepUncontested(mvn) { return tyNameOf(tyIx) }
   }
   ""
 }
@@ -1274,6 +1329,7 @@ function dstPinAnnIn(
       if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
     }
     s.letType = pinTy
+    dstPinFired = dstPinFired + 1
   }
   0
 }
@@ -1719,9 +1775,13 @@ function dstPinMapValue(
               }
             }
             if mapAnn >= 0 {
+              // The VALUE cut of the receiver's annotation, gated on the value naming an
+              // arm OR reaching one through further map hops — the D156 peel, needed on this
+              // side too: `c["o"] = i0` over `c: {[string]: {[string]: Circle}}` delivers a
+              // MAP to the value cell, and the inner binding's pin is that map's spelling.
               const vn = mapValNameOf(tyNameOf(mapAnn))
               if vn != "" {
-                if variantIndexOf(vn) >= 0 {
+                if variantIndexOf(vn) >= 0 || pinArmDeepUncontested(vn) {
                   outN.push(vn)
                   outT.push(-1)
                 }
@@ -1789,6 +1849,24 @@ function dstPinCallArgs(
   0
 }
 
+// How many bindings THIS round of `synthDstPinAnns` pinned — the fixpoint counter, and the
+// reason the pass below is a loop rather than a single walk (silent-class-inventory D171).
+//
+// A DESTINATION READS THE RECEIVER'S ANNOTATION, so a pin can CREATE a destination for a
+// binding the same walk already passed over: `const i0 = Map()  const c = Map()` with
+// `c["o"] = i0` and `thru(c)` is the shape — in source order `i0` is visited while `c` is
+// still un-annotated and records no destination, then `c` is pinned from `thru`'s parameter.
+//
+// IT MOVES 0 CELLS ON ITS OWN, ON ALL THREE GRIDS, AND IT IS LOAD-BEARING. Measured against
+// `1559d80c`: the loop alone is 0 forward / 0 backward on the 2,850-cell D88/D100 grid, the
+// 1,114-cell D112 grid and the 1,188-cell D156 position grid alike, while the D156 peel alone
+// is +16 / **-4** on the position grid — four `bindann x param x arm x notwin` cells that
+// RUN on master and do not with a chain the single walk leaves half-pinned. Together they are
+// +32 / 0 there. That is the D111 finding in its other direction: a composition is a
+// DIRECTION, not a cell count, and a candidate whose own column is all zeroes can still be
+// the half that makes the other one safe.
+let dstPinFired = 0
+
 // The PRE-MONOMORPHIZATION run of `synthDstPinAnn`, over every function body — and the
 // ordering is a requirement, not a convenience.
 //
@@ -1825,22 +1903,47 @@ function dstPinCallArgs(
 // literal's own arena type is the anonymous `{r:i32}` and resolves the RENDER's slot
 // (`struct.new 16`) where the local resolves the ARM's (`struct.new 15`). That is why the
 // residue is a binding-RESOLUTION problem: the mint is identical on both sides.
+//
+// AND IT RUNS TO A FIXPOINT (silent-class-inventory D171), which is what makes the D156 peel
+// above safe rather than merely bigger. See `dstPinFired`.
 export function synthDstPinAnns(rootIx: i32) {
-  let fe = 0
-  while fe < fnStmts.length {
-    const fnIx = fnStmts[fe]
-    const fn = P.nodes[fnIx]
-    if fn is FuncDecl { dstPinSynthWalk(fn.fnBody, fn.fnBody, fnIx, rootIx) }
-    fe = fe + 1
-  }
-  // The module run walks `globalStmts` rather than the statement list, for the reason
-  // `synthGlobalEmptyListAnns` does: those ARE the module's bindings, already collected,
-  // and a top-level `let` nested in an `if` is not one (it is a start-function local, and
-  // `collectLocals` reaches it).
-  let gi = 0
-  while gi < globalStmts.length {
-    synthGlobalDstPinAnn(globalStmts[gi], rootIx)
-    gi = gi + 1
+  // TO A FIXPOINT. The bound is a guard, not a policy — each round either pins at least
+  // one binding or stops, and a binding is pinned at most once (the `letType >= 0` guard
+  // on entry), so the loop cannot run more rounds than the module has un-annotated
+  // bindings, and a round that pins nothing exits immediately.
+  //
+  // 32 AND NOT 8, AND THE NUMBER IS DERIVED RATHER THAN PICKED. A round is consumed per
+  // level of the pin DEPENDENCY chain — for a nested map that is one per container — and
+  // TRUNCATING the loop is exactly the half-pinned chain this whole change exists to avoid
+  // (D171): the outer levels annotated, the inner one not, which is measurably worse than
+  // pinning none of them. The deepest chain the gates can pin at all is bounded by
+  // `mapLeafValName`'s own 8-cut cap, so anything past ~10 rounds is already declining for
+  // a different reason; 32 puts the loop's ceiling far above the rung's and makes the
+  // truncation unreachable rather than merely unlikely. It costs nothing when it is not
+  // needed — the `dstPinFired == 0` exit fires on round 2 for every cell of all seven grids,
+  // and the bound-8 variant this row's numbers were first taken on measures identically on
+  // every one of them.
+  let round = 0
+  while round < 32 {
+    dstPinFired = 0
+    let fe = 0
+    while fe < fnStmts.length {
+      const fnIx = fnStmts[fe]
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { dstPinSynthWalk(fn.fnBody, fn.fnBody, fnIx, rootIx) }
+      fe = fe + 1
+    }
+    // The module run walks `globalStmts` rather than the statement list, for the reason
+    // `synthGlobalEmptyListAnns` does: those ARE the module's bindings, already collected,
+    // and a top-level `let` nested in an `if` is not one (it is a start-function local, and
+    // `collectLocals` reaches it).
+    let gi = 0
+    while gi < globalStmts.length {
+      synthGlobalDstPinAnn(globalStmts[gi], rootIx)
+      gi = gi + 1
+    }
+    if dstPinFired == 0 { return 0 }
+    round = round + 1
   }
   0
 }

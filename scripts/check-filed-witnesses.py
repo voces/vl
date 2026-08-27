@@ -16,6 +16,7 @@ you nothing about the row.
 USAGE
     python3 scripts/check-filed-witnesses.py docs/internals/silent-class-inventory.md
     python3 scripts/check-filed-witnesses.py --json out.json <doc>...
+    python3 scripts/check-filed-witnesses.py --strict <doc>...
     python3 scripts/check-filed-witnesses.py --self-test
 
 `--self-test` proves the outcome vocabulary can be made to fire on demand, on three
@@ -27,6 +28,16 @@ to distinguish two outcomes is not known to distinguish them — the same discip
 Exit 0 when every row still behaves as filed; 1 when any row has MOVED (which is a
 prompt to re-grade the doc, not necessarily a regression — a row that moved because it
 was FIXED is the common case and the whole point).
+
+`--strict` ALSO fails on a row this cannot grade at all. Without it an UNGRADED row is
+reported in the fourth column and exits 0, so a doc can gain rows with no witness and every
+gate in the ladder stays green — the row discipline was enforced by nothing. That is the same
+shape as the defects this file exists to catch: a real condition that no instrument reports.
+It is a FLAG rather than the default because `silent-class-inventory-2.md` currently has ten
+rows whose filed behaviour no longer reproduces, and a gate that reds for pre-existing debt in
+a doc the author is not editing gets bypassed rather than obeyed. The per-PR enforcement lives
+in `tests/vl_inventory_rows_test.ts`, which asserts the STRUCTURE (a known-outcome status line
+and a repro block) without running anything.
 
 DOC SHAPE IT READS
     ### <ID> — <title>
@@ -177,6 +188,15 @@ def self_test():
     return 1 if bad else 0
 
 SEC = re.compile(r"^#{2,4}\s+(D\d+[A-Za-z]?|[A-Z]\d+)\s+[—-]\s+(.*)$")
+# ANY heading, row or not. A row's scope has to END at one: `SEC` alone only closes a row at
+# the NEXT ROW, so the last row of a doc absorbed everything after it — in
+# `silent-class-inventory.md` that is the whole of `## 3. Shared-root analysis`, whose
+# `### Root A — …` headings are deliberately not rows. Harmless while every row led with an
+# explicit `Repro:` (the lead-in came first, so the right block won); the moment the FIRST
+# INDENTED BLOCK is accepted as a fallback it stops being harmless, because the last row
+# would take a program out of the analysis prose and grade THAT. Found by sabotage: deleting
+# a row's repro entirely left it still reporting as gradeable.
+ANYHEAD = re.compile(r"^#{1,6}\s")
 
 def parse(doc):
     """Yield (id, title, declared_status_line, repro_source) per section."""
@@ -189,15 +209,46 @@ def parse(doc):
             cur = {"id": m.group(1), "title": m.group(2).strip(),
                    "status": None, "repro": None, "doc": doc, "line": i + 1}
             continue
+        if ANYHEAD.match(ln):
+            # A non-row heading CLOSES the row it follows; see `ANYHEAD`.
+            if cur: rows.append(cur)
+            cur = None
+            continue
         if not cur:
             continue
-        if cur["status"] is None and ln.startswith("**") and ln.rstrip().endswith("**"):
-            cur["status"] = ln.strip("*").strip()
-        if cur["repro"] is None and re.match(r"^Repro\b", ln):
+        # A status line may WRAP (inventory #2's D3 does), and a wrapped one is still a
+        # status line: joining it is the difference between grading that row and reporting
+        # it as `not graded` forever. Bounded, and it must actually close — an unterminated
+        # `**` opener is left alone rather than swallowing the section.
+        if cur["status"] is None and ln.startswith("**"):
+            if ln.rstrip().endswith("**") and len(ln.rstrip()) > 2:
+                cur["status"] = ln.strip("*").strip()
+            else:
+                parts, k = [ln], i + 1
+                while k < len(lines) and k - i <= 5:
+                    parts.append(lines[k])
+                    if lines[k].rstrip().endswith("**"):
+                        cur["status"] = " ".join(parts).strip("*").strip()
+                        break
+                    if not lines[k].strip():
+                        break
+                    k += 1
+        # A `Repro:` LEAD-IN, or — where a doc does not use one — the FIRST INDENTED
+        # BLOCK after the status line. `silent-class-inventory-2.md` writes every row that
+        # way ("every defect below carries its minimal program ... pasted in full", its own
+        # header), and requiring the lead-in meant this could not parse a single one of its
+        # 14 rows: they reported as `not graded` and that file has read as live ever since.
+        # Taking the FIRST block is what keeps a row's `**Control**` program from being
+        # mistaken for its defect program — the defect's always comes first.
+        if cur["repro"] is None and (
+            re.match(r"^Repro\b", ln)
+            or (cur["status"] is not None and ln.startswith("    "))
+        ):
             # The `Repro:` lead-in may WRAP onto further prose lines before the block
             # (D16 does). Scan forward for the first indented line, bounded so a section
-            # with no block at all cannot swallow the next one's.
-            body, j = [], i + 1
+            # with no block at all cannot swallow the next one's. When the INDENTED LINE
+            # is itself the trigger the scan starts AT it, not after it.
+            body, j = [], (i if ln.startswith("    ") else i + 1)
             scanned = 0
             while j < len(lines) and scanned < 6 and not lines[j].startswith("    "):
                 if lines[j].strip() and re.match(r"^#{2,4}\s", lines[j]):
@@ -213,10 +264,11 @@ def parse(doc):
     return rows
 
 def main(argv):
-    out_json, docs = None, []
+    out_json, docs, strict = None, [], False
     it = iter(argv)
     for a in it:
         if a == "--json": out_json = next(it)
+        elif a == "--strict": strict = True
         elif a == "--self-test": return self_test()
         else: docs.append(a)
     if not docs:
@@ -268,10 +320,24 @@ def main(argv):
         for r in moved:
             print(f"  {r['doc']}:{r['line']}  {r['id']} — {r['title']}")
             print(f"      filed {r['declared']}, now {r['actual']}: {r['detail'].splitlines()[0] if r['detail'] else ''}")
+    # AN UNGRADED ROW IS THE FAILURE THIS FILE EXISTS TO PREVENT, and until `--strict` it
+    # was the one condition the exit code could not express: `2 not graded` and `0 not
+    # graded` both exited 0, so the fourth column was the only thing separating them and a
+    # summary quoting the first three read identically either way.
+    if ungradable and strict:
+        print("\nRows this cannot grade - a filed row must carry a witness the checker RUNS:")
+        for r, why in ungradable:
+            print(f"  {r['doc']}:{r['line']}  {r['id']} - {r['title']}")
+            print(f"      {why}")
+        print("      fix: give it a `Repro:` block and a status line naming one of "
+              + ", ".join(sorted({o for _, o in DECLARED})) + ".")
+        print("      a defect reachable only under a change that was REFUSED is a "
+              "refutation pin: file the program that must keep RUNNING, with the status "
+              "`runs today and must keep running`.")
     if out_json:
         Path(out_json).write_text(json.dumps(results, indent=2))
         print(f"\nwrote {out_json}")
-    return 1 if moved else 0
+    return 1 if (moved or (ungradable and strict)) else 0
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
