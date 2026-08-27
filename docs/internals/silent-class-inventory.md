@@ -8954,8 +8954,8 @@ Repro:
 
 ---
 
-### D211 — the nullable-field nested map that D156's peel turned from a LOUD refusal into invalid wasm
-**check-clean invalid wasm · 12 cells of block A's 150,224 · a LOUD→SILENT move introduced by `1e81b0f3` (#1966, D156) and STILL LIVE on `16d5c6e7` · found by block A's after-pass, 2026-08-27**
+### D211 — [CLOSED 2026-08-27] the nullable-field nested map that D156's peel turned from a LOUD refusal into invalid wasm
+**closed 2026-08-27 — the filed cell RUNS · 8 of the 12 run, the 4 at `twin=armtwin` are D224 · was `check-clean invalid wasm` · 12 cells of block A's 150,224 · a LOUD→SILENT move introduced by `1e81b0f3` (#1966, D156), live from `1e81b0f3` through `e44ef5e6`, found by block A's after-pass**
 
 Repro (census block A cell `a008328`, verbatim — the graded cell, not a retyping):
 
@@ -8971,11 +8971,13 @@ Repro (census block A cell `a008328`, verbatim — the graded cell, not a retypi
     const g0 = (c)["k0"] ?? Map()
     const g1 = (g0)["k0"] ?? { r: null }
     if (g1).r != null { print(7) } else { print(0) }
-    // vl check rc 0 with no diagnostics, at all three seeds below.
+    // NOW PRINTS 0 — `r` is null, so the else arm is the right answer.
+    // vl check rc 0 with no diagnostics, at all four seeds below.
     // 1559d80c: vl run -> emit error  emitProgram: ref valtype with no interned shape
     // 1e81b0f3: vl run -> Invalid input WebAssembly code at offset 2213:
     //                     type mismatch: expected i32, found (ref null $type)
     // 88f21245: byte-identical to 1e81b0f3
+    // e44ef5e6: byte-identical to 1e81b0f3 — still live on the census's own merge
 
 * **THE MOVE, MEASURED AT FIVE SEEDS, EACH BUILT FROM ITS OWN COMMIT'S SOURCE AND EACH PROVED A
   SELF-COMPILATION FIXED POINT** (so the byte size identifies the commit rather than being
@@ -9044,10 +9046,35 @@ Repro (census block A cell `a008328`, verbatim — the graded cell, not a retypi
   a population that contained these 12 cells was never consulted. Nothing in the gate ladder
   required it. The same shape appears in #1952's and #1954's reports. The standing check this
   argues for is in `scripts/silent-sweep/census/README.md` under *Grading a MERGED change*.
-* **NOT FIXED HERE, DELIBERATELY.** Filed for #1966's author to see the measurement first.
-  D171 is the neighbouring row from the same peel and is `check-clean invalid wasm` too, but it
-  is filed as PRE-EXISTING on `ff04d74b` and its witness carries a non-nullable `Circle = { r:
-  i32 }`; this row is a cell that the peel MOVED, and the nullable field is what separates them.
+* **CLOSED FORWARD, NOT BY REVERTING #1966 — AND ITS THREE RUNGS ARE ALL INNOCENT.** Ablated by
+  stripping, each of #1966's rungs ALONE restores the loud floor, and two different messages
+  separate them: strip the `armPinAnnName` peel and the program stops at `ref valtype with no
+  interned shape` (the pre-#1966 message), strip the `dstPinMapValue` peel or the
+  `synthDstPinAnns` fixpoint and it stops at `unsupported map value type`. Only all three
+  together reach the silent state — because together they complete the pin chain CORRECTLY, and
+  what the completed chain reaches is a field read the classifier ladder had no rung for. The
+  root has no map in it at all: `type Circle = { r: i32 | null }` beside a `type Shape` and
+  `if g.r != null` is a loud emit reject at every storage class, five lines, no annotation.
+  That is **D219**, and closing it moves these 12 cells to `runs` while #1966 keeps all 92 of
+  its own.
+* **D171 IS THE NEIGHBOURING ROW AND IS STILL OPEN, WHICH IS NOW LOAD-BEARING.** It is filed as
+  PRE-EXISTING on `ff04d74b`, its witness carries a non-nullable `Circle = { r: i32 }`, and it
+  is the CONTESTED half — a declared struct twin of the arm's layout. D219's fix is GATED on
+  `armLayoutContested` for exactly that reason: un-gated it moved 384 census cells from a loud
+  emit reject into check-clean invalid wasm, all at `declness=byname, pval=nullfield, rep=nul`,
+  because the rep layer still conflates arm and twin one container out. The nullable field is
+  what separates this row from D171; the layout twin is what separates what could be fixed from
+  what could not. Two more gates followed from the same re-grade and are listed under D219 —
+  an ARM twin (block B, 66 cells) and a ref-list ELEMENT receiver (block E, 96 cells, D223) —
+  and none of the three was visible to the 1,664-cell position grid, which reported 0 backward
+  for all of them.
+* **EIGHT OF THE TWELVE RUN; THE OTHER FOUR ARE THE ARM-TWIN QUARTER, AND THEY ARE D224.**
+  The cross splits exactly on `twin`: all four `twin=none` cells and all four
+  `twin=samearity` cells now run and print `0`; the four `twin=armtwin` cells keep the class
+  they had on `e44ef5e6` (`check-clean invalid wasm`, message byte-identical), because R10's
+  arm-twin gate declines for them. They are not a regression of this change — they are the
+  part of this family that lives in D171's contested territory, and they get their own row so
+  that "D211 is closed" cannot be read as covering them.
 
 ---
 
@@ -9609,6 +9636,244 @@ program where a union also exists — prints 7 on this tree and on `1e81b0f3`):
   fixes: claiming the ARM's variant row for a program that means the plain STRUCT of the same
   layout. `variantRowOfTy` matches by arena index only, so it declines here — and this pin is
   what says so by running rather than by argument.
+
+---
+
+### D219 — [CLOSED 2026-08-27] a value-union FIELD of a DECLARED union ARM: the three read classifiers had no rung for the receiver
+**closed 2026-08-27 · was `loud emit reject` (`bare null needs a struct-typed context`) on `16d5c6e7` · the ROOT under D211's twelve census cells**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    const g1: Circle = { r: null }
+    if (g1).r != null { print(7) } else { print(0) }
+    // PRINTS 0 — `r` is null. `16d5c6e7`: emit error, `bare null needs a struct-typed context`.
+
+* **THE GAP IS THE ARM'S OWN TABLE.** `Circle` is a union member, so `collectS` gives it NO
+  row in the standalone struct table and `structIndexOfExpr` answers -1 for it at every
+  storage class. `memberUnionFieldName` resolved a code-16 field through exactly two rungs —
+  that table, and a NARROWED arm (`memNarrowVariantIndex`) — and had none for a receiver that
+  is an arm BY DECLARATION, which needs no narrowing to be one. So `exprUnion`,
+  `unionNameOfExpr` and `memberUnionReadKind` all answered "not a union field", the `!= null`
+  test fell out of `emitNulIsNullTest` past every arm, and the bare `null` reached the scalar
+  compare with nothing to type it.
+* **DELETE `type Shape` AND IT ALREADY RAN.** That is the whole family's signature and the
+  reason D211's twelve census cells are all at `union=used` / `union=unused` and never
+  `union=nounion`: the moment `Circle` is not a union member it re-enters the struct table,
+  the first rung answers, and only the ARM spelling was ever broken.
+* **THE FIX IS `exprVariantIndex` JOINED TO THE VARIANT FIELD TABLES** — the existing answer
+  to "which arm is this expression" across all five storage classes, read into the same
+  `variantFieldIndex` / `variantFieldTypeAt` / `variantFieldElemName` columns the narrowed
+  rung already uses. It ships as `armFieldUnionName`, behind a READ-side composite
+  (`memberUnionFieldNameRead`) rather than inside `memberUnionFieldName`, and that split is
+  measured: see D220.
+* **THREE GATES, EVERY ONE OF THEM FOUND BY THE CENSUS AND NOT BY THE GRID.** The rung as
+  first written is right about the classifier and wrong about how far the rep layer can
+  follow it, and each gate is a class the position grid could not contain:
+  1. **A DECLARED STRUCT TWIN of the arm's layout** (`type Dot = {r: i32|null}` beside
+     `Circle`). The rep layer conflates the two ONE CONTAINER OUT — a `Circle[]` element slot
+     is typed from the twin's `sHeapIdx` row while this read produces the arm's `uVarHeap`
+     one — so naming the field union completes half a chain whose halves disagree. Un-gated,
+     block A moved **384 cells** loud → check-clean invalid wasm, all at `declness=byname,
+     pval=nullfield, rep=nul`. `armLayoutContested` is #1966's own predicate for this split
+     (D171), asked by INDEX through a new `armLayoutContestedAt`.
+  2. **ANOTHER ARM of the same canonical layout** (`type DotU = Dot | DotB` where `Dot` is
+     `Circle`'s twin). Invisible to (1), because `collectS` skips a union member so there is
+     no struct row to find. Block B's **66 cells**, all `twin=armtwin`; `claim` is NOT the
+     ingredient — the same witness with its two container aliases deleted still reproduces.
+     `armLayoutAmbiguousAt` is (1) plus a `repCanonId` scan of `uVarTyIx`, kept SEPARATE from
+     `armLayoutContested` so #1966's peel keeps the predicate its own 92 cells were measured on.
+  3. **A REF-LIST ELEMENT receiver** (`xs[i].r`, no binding in between). Block E's **96
+     cells**, all `cont=listlist` × `pval=mixed`. This one is a LOUD FLOOR rather than a
+     capability gap: the module is already invalid at the outer `array.new_fixed`, and what
+     the field read used to do was stop emission before anyone saw it. Filed as **D223**.
+* **MEASURED, on a 1,664-cell grid** (4 field unions × arm/no-arm × layout-twin/no-twin ×
+  8 receiver storage classes × 13 consumer spellings): **257 cells move, every one forward** —
+  164 check-clean invalid wasm → runs, 74 loud emit reject → runs, 19 check-clean invalid
+  wasm → loud emit reject (D221's, an improvement). 0 `runs` lost, 0 into a silent class,
+  0 output values changed. **And that grid said 0 backward for all three gates above**, which
+  is the row's other finding: a grid holds constant the axes it was not chasing, and the
+  three classes are a layout twin, an arm twin and a list-element receiver — none of which it
+  declared. Only the cell-matched census re-grade saw them.
+
+---
+
+### D220 — [CLOSED 2026-08-27] `is` over a union-typed FIELD read `sHeapIdx[-1]`, which is a COMPILER TRAP, not a message
+**now a loud emit reject · was `compiler trap` (`wasm trap: out of bounds array access`) on `16d5c6e7` · found while widening D219's classifier, on a program that already reproduced without it**
+
+Repro (the receiver is PARENTHESISED, which is what made this reachable on master):
+
+    type Circle = { r: i32 | boolean }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f(v: Shape) {
+      if v is Circle {
+        if (v).r is i32 { print(7) } else { print(0) }
+      }
+    }
+    f({ r: 5 })
+    // `16d5c6e7`: wasm trap: out of bounds array access — the COMPILER dies.
+    // Now: emitProgram: field access but no struct type declared (D222 is why it is not `runs`).
+
+* **THE READ IS UNGUARDED.** The `x.y is i32` lowering resolved its receiver with
+  `structIndexOfExpr` and then indexed `sHeapIdx[msi]` and `sFieldIndex(msi, …)` with no
+  bound test. `structIndexOfExpr` answers -1 for any receiver with no standalone-struct row,
+  and `sHeapIdx[-1]` is not a diagnostic — it is an out-of-bounds array access inside the
+  compiler. This is the `emitFail` discipline's other half: a table read one line past a
+  resolver that is allowed to answer -1.
+* **IT IS WHY D219's FIX IS A COMPOSITE AND NOT A ONE-LINE WIDENING.** Widening
+  `memberUnionFieldName` itself — the obvious edit, and the first one built — routes the `is`
+  push for a DECLARED-arm receiver straight into this read. Graded on a 288-cell grid that
+  candidate moves **6 `runs` cells to a compiler trap** and 12 more loud→trap. The read
+  classifiers therefore ask a composite and the `is` channel got the guard plus an arm of its
+  own (`uVarHeap[avi]`, the same read `emitMem`'s variant arm makes), which is what turns the
+  same 18 cells forward instead.
+* **THE GUARD AND THE ARM ARE ONE CHANGE.** The guard alone would only move the trap to a
+  loud reject; the arm alone is unreachable for the receiver it is written for, because the
+  unguarded read claims it first.
+
+---
+
+### D221 — [CLOSED 2026-08-27] `vbHeapIdxOfKind` answered heap type **0** for an UNMINTED value box, and every caller's `< 0` guard was dead
+**now a loud emit reject · was `check-clean invalid wasm` on `16d5c6e7` · no union declared anywhere in the witness, so it is not the D219 seam**
+
+Repro:
+
+    type Circle = { r: f64 | null }
+    const g: Circle = { r: 5.0 }
+    if g.r is i32 { print(g.r) } else { print(0) }
+    // `16d5c6e7`: vl check rc 0, then Invalid input WebAssembly code at offset 245:
+    //             type mismatch: expected i32, found (ref $type)
+    // Now: emitProgram: narrowed union field atom has no value box
+
+* **`vb*Idx` INITIALISES TO 0 AND IS ASSIGNED ONLY WHEN `mAssignTypeIndices` SEES `vb*Used`.**
+  A module whose value unions never use a rep therefore answered heap type **0** for that
+  rep's box — a real type in every module, and the wrong one. `ref.cast (ref 0)` +
+  `struct.get 0 0` shipped where a message was intended.
+* **EVERY CALLER ALREADY HAD THE GUARD.** All eight sites test `< 0` and take a loud reject on
+  it; none could distinguish "box 0" from "no box", so the guard was dead for exactly the case
+  it was written for. `vbHeapIdxOfKind` now reads back the mint's own condition (`vb*Used`)
+  and answers -1, and the guards start working.
+* **THE WITNESS IS THE PLAIN-STRUCT LEG, DELIBERATELY.** `Circle` is not a union member here,
+  so this reproduces with no arm seam at all — which is what separates it from D219 and D220
+  and is why it is a third row rather than a bullet under either.
+
+---
+
+### D224 — D211's ARM-TWIN quarter: the same cell with a second union whose first arm is `Circle`'s layout twin
+**check-clean invalid wasm · 4 of D211's 12 cells (`twin=armtwin`), live after D219 · the class D219's R10 gate deliberately declines**
+
+Repro (census block A cell `a099944`, verbatim — D211's own cell plus one union):
+
+    type Circle = { r: i32 | null }
+    type Dot = { r: i32 | null }
+    type DotB = { db: i32 }
+    type DotU = Dot | DotB
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function sink(_x: {[string]: {[string]: Circle}}) { }
+    const lv1 = Map()
+    lv1["k0"] = { r: null }
+    const c = Map()
+    c["k0"] = lv1
+    sink(c)
+    const g0 = (c)["k0"] ?? Map()
+    const g1 = (g0)["k0"] ?? { r: null }
+    if (g1).r != null { print(7) } else { print(0) }
+    // vl check rc 0. Invalid input WebAssembly code at offset 2217:
+    //   type mismatch: expected i32, found (ref null $type)
+    // Delete `type Dot` / `type DotB` / `type DotU` and it is D211's cell, which RUNS.
+
+* **THE DELTA FROM D211 IS THREE LINES AND ONE OF THEM IS THE DEFECT.** `Dot` has `Circle`'s
+  exact layout and is a member of a DIFFERENT union, so `collectS` skips it — there is no
+  struct row, and `armLayoutContested` (which asks the struct table) answers false. The
+  arm-vs-arm twin is a second ambiguity with the same consequence and its own predicate,
+  `armLayoutAmbiguousAt`, which is what D219's rung is gated on.
+* **THE GATE IS WHY THIS ROW EXISTS RATHER THAN 66 SILENT CELLS.** Un-gated, D219's rung
+  claims these receivers and block B moves 66 cells from a loud emit reject INTO check-clean
+  invalid wasm. Gated, they keep exactly the class they had before — which for D211's four is
+  already `check-clean invalid wasm`, so those four stay where they were rather than moving
+  either way.
+* **WHAT WOULD CLOSE IT is D171's root, not another classifier rung.** The read resolves the
+  arm correctly; what disagrees is one container out, where the element slot is minted from
+  whichever claimant the rep layer reached first. That is the same "two nominal claimants, one
+  heap type" seam D39/D100 describe, asked of two ARMS instead of an arm and a struct.
+
+---
+
+### D223 — an un-annotated list literal of DISAGREEING anonymous shapes mints a BOX list, and the outer annotation's construction is already invalid
+**loud emit reject · live on `e44ef5e6` and after D219 · the module was ALWAYS invalid; only an unrelated floor stopped emission first**
+
+Repro (census block E cell `e002074`, verbatim):
+
+    type Circle = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function rd() {
+      const lv1 = [{ r: 7 }, { r: null }]
+      const c: Circle[][] = [lv1]
+      const g0 = c
+      if g0.length > 0 {
+        const g1 = g0[0]
+        if g1.length > 0 {
+          if (g1[0]).r != null { print(7) } else { print(0) }
+        } else { print(0) }
+      } else { print(0) }
+    }
+    rd()
+    // emitProgram: bare null needs a struct-typed context — the floor that has always
+    // masked it, and which D219 keeps here on purpose.
+
+* **THE TWO ELEMENTS ARE DIFFERENT ANONYMOUS SHAPES.** `{ r: 7 }` is `{r: i32}` and
+  `{ r: null }` is not, so the un-annotated `lv1` is minted over the union BOX rep (element
+  kind 2) rather than over `Circle`. The `Circle[][]` annotation one container out then wants
+  a list of Circles, and the mismatch lands on the outer `array.new_fixed`:
+  `expected (ref null $type), found (ref $type)` at the CONSTRUCTION, before any read.
+* **ONE WORD MOVES IT, IN EITHER DIRECTION.** Annotate the inner list (`const lv1: Circle[] =
+  …`) and it runs; make the two elements agree (`[{ r: 7 }, { r: 8 }]`) and it runs. Both are
+  checked and both print `7`.
+* **IT IS FILED BECAUSE D219 HAD TO DECLINE FOR IT.** `armFieldUnionName` refuses a ref-list
+  ELEMENT receiver precisely so that this program keeps the loud floor it has today — the
+  read is the only stage that stops emission, and an emitter that has recorded a failure keeps
+  emitting, so removing the read's floor writes the invalid module instead of diagnosing it.
+  96 census cells of block E are this shape. **Closing this row is what lets that decline come
+  off**, and it is worth a measurement: the decline costs 354 of block A's 1,062 forward cells,
+  720 of block C's 1,320 and 1,248 of block E's 2,232 — every one of them reverting to the loud
+  reject it already had, none of them to a silent class.
+
+---
+
+### D222 — a narrowed union receiver in PARENTHESES resolves no variant, and the read floors
+**loud emit reject · live on `16d5c6e7` and after D219/D220/D221 · one paren is the whole difference**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f(v: Shape) {
+      if v is Circle { print((v).r) }
+    }
+    f({ r: 7 })
+    // emitProgram: field access but no struct type declared.
+    // Delete the parentheses — `print(v.r)` — and it PRINTS 7.
+
+* **`memIsNarrowed`, `memNarrowVariantIndex` AND `emitNarrowedMem` ALL READ `m.memObj` RAW.**
+  Every one of them does `P.nodes[m.memObj]` and tests `is Ident`, so a `Paren` receiver is
+  not an Ident and not a Member, and all three answer "not narrowed". The rest of the emitter
+  unwraps parens everywhere (`unwrapParen` appears at the head of most classifier arms), so
+  this is a missing call, not a design position.
+* **IT IS THE REASON D220's WITNESS IS LOUD RATHER THAN `runs`.** With the paren removed that
+  program runs on `16d5c6e7` too; with it, the receiver reaches the `is`-on-a-field lowering
+  as an un-narrowed member and used to index `sHeapIdx[-1]`. Fixing D222 is a separate change
+  — `unwrapParen` at three sites, plus whatever the narrowed VALUE read then needs — and it is
+  filed rather than folded in because it moves a different population and this one was already
+  measured against a 1,664-cell grid it does not appear in.
+* **NOT A SILENT ROW.** The outcome is a diagnosed refusal at every spelling probed, which is
+  why it is filed with a `loud emit reject` status: it is a capability gap standing next to a
+  silent one, and the value of filing it is that the two share a receiver shape.
 
 ---
 
