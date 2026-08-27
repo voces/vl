@@ -95,8 +95,13 @@ in this family were re-run against the same pair of seeds rather than carried ov
 | grid | master `89f88840` | branch | moved | backward | message-only |
 |---|---|---|---|---|---|
 | D111/D117, 1,710 cells | 1157 runs / 16 loud emit / **24 silent** | 1181 / 16 / **0** | **24** | 0 | 0 |
-| D52, 9,450 cells | see the table in `silent-class-inventory` D131 | | | | |
-| D87, 3,144 cells | | | | | |
+| D52, 9,450 cells | 7620 runs / 1830 loud emit / **0 silent** | 7620 / 1830 / **0** | **0** | 0 | 0 |
+| D87, 3,144 cells | 3126 runs / 18 loud emit / **0 silent** | 3126 / 18 / **0** | **0** | 0 | 0 |
+
+Corpus, on the same pair of seeds: **2,312 files, 2 differ in emitted-module sha256 and both
+are the fixtures this change adds; 0 differ in `vl check` diagnostics.** Those two are also the
+probe's positive control — base cannot emit a valid module for either, so a 0 here would have
+meant the instrument measured nothing.
 
 The D111 grid's entire 24-cell `invalid_wasm` residue — the population D131 was filed out of —
 closes, and closes under patch **A alone**; patch B moves 0 cells on that grid, which is what
