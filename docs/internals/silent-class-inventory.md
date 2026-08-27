@@ -8740,18 +8740,18 @@ invalid wasm, and only with both does it run):
     const c0: Circle = { r: 7 }
     via((_n: i32) => c0)
 
-* **THE FIVE-COMPILER ABLATION, on a 28-cell hand grid** (each built from `1e81b0f3` with the
+* **THE FIVE-COMPILER ABLATION, on a 32-cell hand grid** (each built from `1e81b0f3` with the
   other candidates stripped; stripping ALL THREE reproduces that seed byte-for-byte at
   1,453,931 bytes):
 
   | compiler | bytes | RUNS | SILENT | LOUD |
   |---|---|---|---|---|
-  | none (== `1e81b0f3`) | 1,453,931 | 7 | 13 | 8 |
-  | D195/D197 only | 1,454,068 | 15 | 10 | 3 |
-  | D196 only | 1,454,017 | 8 | 12 | 8 |
-  | the arm-parameter floor only | 1,454,592 | **7** | 12 | 9 |
-  | D195 + D196 | 1,454,154 | 22 | 5 | 1 |
-  | all three | 1,454,815 | 22 | **0** | 6 |
+  | none (== `1e81b0f3`) | 1,453,931 | 7 | 15 | 10 |
+  | D195/D197 only | 1,454,068 | 15 | 14 | 3 |
+  | D196 only | 1,454,017 | 8 | 14 | 10 |
+  | the arm-parameter floor only | 1,454,526 | **7** | 12 | 13 |
+  | D195 + D196 | 1,454,154 | 22 | 9 | 1 |
+  | all three (shipped) | 1,454,749 | 22 | **0** | 10 |
 
 * **Pairwise intersections are ALL EMPTY.** D195 moves 8 cells to `runs`, D196 moves 1, and
   the floor moves **0**. **Set identity fails in the useful direction**: the union of the
@@ -8760,12 +8760,14 @@ invalid wasm, and only with both does it run):
   `$fnsig` and D195 repairs the binding that receives its result. A count would have scored
   D196 at "1 cell" and dropped it.
 * **AND THE FLOOR IS THE CASE A COUNT CANNOT SEE AT ALL.** It moves 0 cells to `runs`; its
-  whole contribution is the SILENT column, `5 → 0`. Read as a count it is inert; read as a
-  direction it is what keeps five cells D196 uncovered out of silence.
+  whole contribution is the SILENT column. Read as a count it is inert. Read as a
+  DIRECTION: **D195+D196 alone push SIX cells of this grid INTO silence** (`v0`, `v3`, `v4`,
+  `v6`, `w1`, `w2` — every one a value that reps as the box or as a bare literal meeting an
+  arm-typed closure parameter), and the floor takes the grid's silent column to **0**.
 * **THE DISGUISE CHANGES UNDER D196 ALONE**: this row's witness moves from `trap_loads` to
   `check-clean invalid wasm` — same defect, different column — which is why the ablation is
   read on all four instruments and never on the outcome count alone.
-* **0 `runs` cells lost, 0 cells became silent**, on the full branch.
+* **0 `runs` cells lost, 0 cells became silent**, on the shipped branch.
 
 ---
 
