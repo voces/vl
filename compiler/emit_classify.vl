@@ -490,14 +490,18 @@ import {
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
 import {
+  MV_ARM_NOHINT,
   declTyIxOfName,
   fieldElemTyIxOfName,
   hcShapeSetId,
   mapShapeKeyI32,
   msAtomIdOf,
+  mvSlotArmMatches,
   mvSlotKeyI32,
   mvSlotOfTyK,
+  mvSlotOfTyKArm,
   mvSlotOfValNameTyK,
+  mvSlotOfValNameTyKArm,
   mvValTyIxOfNameRow,
   nodeMapValTyIx,
   recordMvValTyIx,
@@ -4999,10 +5003,26 @@ function canonLitUnionArms(name: string): string {
 // spelling and are two layouts, so a key-blind scan would hand the second map the first
 // one's struct (a string-ref keys list read as an i32 list — invalid wasm).
 export function mvSlotByValNameK(valName: string, keyI32: boolean): i32 {
+  mvSlotByValNameKArm(valName, keyI32, MV_ARM_NOHINT)
+}
+
+// THE NAME RUNG'S HALF OF THE ARM COMPONENT (D48). Both rungs of an mv slot's identity
+// have to carry it or neither does: a spelling is a RENDER here, so an arm and its
+// layout twin record the SAME `mvValName` and the arena rung's new filter would only
+// move the collapse one line down. Tri-state exactly as `mvSlotOfTyKArm` documents —
+// `MV_ARM_NOHINT` matches any parity and is what every un-hinted entry point passes, so
+// their resolution is byte-identical to master's.
+export function mvSlotByValNameKArm(
+  valName: string,
+  keyI32: boolean,
+  armHint: i32,
+): i32 {
   let i = 0
   while i < mvValName.length {
     if mvValName[i] == valName {
-      if mvSlotKeyI32(i) == keyI32 { return i }
+      if mvSlotKeyI32(i) == keyI32 {
+        if mvSlotArmMatches(i, armHint) { return i }
+      }
     }
     i = i + 1
   }
@@ -5179,6 +5199,20 @@ export function mvValVariantOf(slot: i32): i32 {
   mvValVariantIdx[slot]
 }
 
+// The tri-state arm hint a caller's recorded value type produces (D48): `MV_ARM_NOHINT`
+// when there is no type to ask, else `variantRowOfTy`'s answer — the arm's DECLARATION
+// row, or -1 for a resolved type that is not an arm. The distinction between "no type"
+// and "a type that is not an arm" is the whole content of the hint: only the second may
+// refuse an arm's slot, and only the first must behave as master does.
+//
+// `variantRowOfTy` is the resolver, for the reason its own header gives — variants are
+// NOMINAL, so the structural rungs that make the render collapse cannot answer this and
+// no tightening of them could.
+export function mvArmHintOfTy(ty: i32): i32 {
+  if ty < 0 { return MV_ARM_NOHINT }
+  variantRowOfTy(ty)
+}
+
 function mvValArmName(ty: i32): string {
   const vr = variantRowOfTy(ty)
   if vr < 0 { return "" }
@@ -5228,9 +5262,17 @@ export function mvShapeOfValNameArmTy(
   // consumed in place, because the row this call may go on to push records the very same
   // index (see `recordMvValTyIx` below).
   const vTy = mvValTyIxOfNameRow(valNameIn, rowTy)
-  const aSh = mvSlotOfTyK(vTy, keyI32)
+  // THE ARM IS PART OF WHAT IS BEING LOOKED UP (D48). `armTy` is the caller's recorded
+  // value type and it has been threaded here since #1947 for one question — "is this an
+  // arm, and which" — asked only AFTER the mint had been decided on. Asking it at the two
+  // FIND rungs is not the "better answer at a mint rung" D-MAPNODETY forbids: it never
+  // makes a find SUCCEED where it failed, only decline a slot whose arm is not this
+  // value's, so the mint below runs in strictly more cases and is skipped in none. A
+  // caller with no type hands `MV_ARM_NOHINT` and both rungs behave exactly as before.
+  const armH = mvArmHintOfTy(armTy)
+  const aSh = mvSlotOfTyKArm(vTy, keyI32, armH)
   if aSh >= 0 { return aSh }
-  const nmSh = mvSlotByValNameK(valName, keyI32)
+  const nmSh = mvSlotByValNameKArm(valName, keyI32, armH)
   if nmSh >= 0 { return nmSh }
   // A kind-6 (ref-VALUE: nested map / list) value forces the i32-list + map types, and a
   // MAP value also interns its INNER value shape first (so a ref-valued inner map's struct
@@ -14773,10 +14815,20 @@ export function mapAnnShape(tyIx: i32) {
         // the name bridge, unchanged and in its old position.
         let aAn = -1
         const vtAn = nodeMapValTyIx(tyIx)
-        if vtAn >= 0 { aAn = mvSlotOfTyK(vtAn, kAn) }
-        if aAn < 0 { aAn = mvSlotOfValNameTyK(vn, kAn) }
+        // …AND THE ARM COMPONENT OF THE SLOT'S IDENTITY OFF THE SAME NODE (D48). This is
+        // the annotation resolver every FUNCTION BOUNDARY reads — `fn.fnRet`, a param's
+        // `parType`, a `let`'s `letType` — so it decides the map-struct heap in the
+        // SIGNATURE. Without the arm the mint could separate two twin-valued maps' slots
+        // and both functions still returned the FIRST one's map struct: measured on D48's
+        // own witness, two map structs in the rec group and `(result (ref $first))` on
+        // both `mkC` and `mkD`. `vn` is a RENDER (`mapValNameOf` of an emit-rendered
+        // spelling), so neither name rung below can tell the arm from its layout twin
+        // either; `vtAn` is the checker's own type for this node and answers nominally.
+        const armAn = mvArmHintOfTy(vtAn)
+        if vtAn >= 0 { aAn = mvSlotOfTyKArm(vtAn, kAn, armAn) }
+        if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vn, kAn, armAn) }
         if aAn >= 0 { return aAn }
-        const nmAn = mvSlotByValNameK(vn, kAn)
+        const nmAn = mvSlotByValNameKArm(vn, kAn, armAn)
         if nmAn >= 0 { return nmAn }
         // A mono-repped value spelling the two scans above never intern (a literal-union
         // atom, a nullable atom) still resolves by KEY alone.
@@ -15424,6 +15476,28 @@ export function structIdxOfElemName(name: string) {
   // Nominal exact-name match first (unambiguous, byte-identical, cheap).
   const sbn = structIndexByName(n)
   if sbn >= 0 { return sbn }
+  // THE NOMINAL FLOOR, THE SAME ONE `rlElemStructRow` CARRIES, AT THE SECOND COPY OF
+  // THIS LADDER (D63). An element name that is a registered union VARIANT and not a
+  // registered plain struct has NO struct-table row — its heap is `uVarHeap[vi]` — so
+  // every structural rung below must DECLINE rather than bridge the arm's shape onto a
+  // standalone struct row. `rlElemStructRow` states the ruling in full (D32's fix, and
+  // `DECISIONS.md`'s "the variant⇄struct-TABLE seam … stays nominal"); this resolver is
+  // the SLOT-LESS twin of it — same three rungs, same order, and until now no gate.
+  //
+  // THE GATE WENT ON ONE OF TWO COPIES, which is the D36/D38 shape. The consequence is
+  // the whole of D63: `for v in l` over a `Circle[]` beside a layout twin
+  // `type Dot = {r:i32}` resolved DOT'S row for the loop var through `repRowOfName`
+  // below, so `declareForInLocals` typed the var `(ref $Dot)` while the element read
+  // yields `(ref $uVarHeap[Circle])` — `vl check` rc 0 and "type mismatch: expected
+  // (ref $type), found (ref $type)", two heap types behind one placeholder. WITHOUT the
+  // twin the same program takes D50's LOUD `field access but no struct type declared`,
+  // so the floor was already there and the twin routed around it; this closes that
+  // route and leaves D50's reject as the floor for both spellings.
+  //
+  // AHEAD of the structural rungs and AFTER the nominal one, exactly as the sibling
+  // orders it: a nominal question must not be settled by whichever structural rung
+  // happens to fire first, and a name that IS a struct row answers on its own identity.
+  if variantIndexOf(n) >= 0 { return -1 }
   // NODE ROUTE (rep-slot-layer p2): the element NAME here is the row name
   // `arrLitElemName`/`structIndexOfObj` recorded for the list-element literal — the
   // FAITHFUL spelling of the element's ADOPTED type (its same-fieldset ambiguity is
@@ -17821,11 +17895,31 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
     // wrapper heaps is invalid wasm at the OTHER map's store — measured on a two-map witness,
     // `expected (ref null $type), found (ref $type)` in `mkD`.
     //
-    // The parity test is the whole gate: same arm (or neither an arm) is required before the
-    // struct-row question is even asked, which is the `mvSlotKeyI32` discipline this function
-    // opens with — a half of the LAYOUT the value-side guards cannot see.
-    if mvValVariantOf(a) != mvValVariantOf(b) { return 0 }
-    if mvValVariantOf(a) >= 0 { return 1 }
+    // The arm test is the whole gate: which TABLE the vals element heap comes from is
+    // decided first, and only then is the row question asked of that table. It is the
+    // `mvSlotKeyI32` discipline this function opens with — a half of the LAYOUT the
+    // value-side guards cannot see.
+    //
+    // …AND IT IS THE HEAPS, NOT THE ARM IDENTITIES (D48). The branch shipped as an
+    // IDENTITY test (`mvValVariantOf(a) != mvValVariantOf(b)`) because it was unreachable:
+    // D48 collapsed every twin pair before two distinct kind-1 slots could exist, so no
+    // program could tell the two readings apart. With the arm now part of the slot's
+    // identity the pair exists, and the identity reading is WRONG in one direction:
+    // `Circle` of `Shape` and `Dot` of `Other`, two arms of two DIFFERENT unions over one
+    // field set, are `uVarTwin` layout twins and therefore ONE heap type (`collectU`
+    // gives a twin the representative variant heap), so their maps DO share a struct.
+    // Refusing that merge emitted two identical map structs and a `pass`-onward boundary
+    // that resolved one of them for a value of the other — measured, 2 cells of this
+    // row.s grid moving `runs` to check-clean invalid wasm.
+    //
+    // `repVariantSlotsTwin` is the variant layer.s own pairwise twin relation, the same
+    // equivalence `buildVariantTwins` banks; the struct half keeps `repStructSlotsTwin`.
+    // Cross-table (one arm, one struct) is never one heap — the variant structs are minted
+    // ahead of every struct row — so that case is a flat 0.
+    const mva = mvValVariantOf(a)
+    const mvb = mvValVariantOf(b)
+    if (mva >= 0) != (mvb >= 0) { return 0 }
+    if mva >= 0 { return repVariantSlotsTwin(mva, mvb) }
     return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b])
   }
   if k == 6 { return rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) }
@@ -20550,6 +20644,21 @@ function variantFieldLayoutEq(a: i32, b: i32): i32 {
 // audit's hot-path anti-pattern); a non-participating slot (-1 key — an
 // unresolvable spelling) is always its own representative. Called from
 // `mAssignTypeIndices` before the variant heap indices allocate.
+// True when variants `a` and `b` share ONE WasmGC heap type — the `uVarTwin` equivalence,
+// queryable PAIRWISE and independent of `buildVariantTwins` having run, exactly as
+// `repStructSlotsTwin` is the pairwise form of `buildStructTwins` for the struct layer.
+// Same two gates in the same order: the canonical structural key of the arm.s declared
+// name, then the emitted field-LAYOUT guard.
+export function repVariantSlotsTwin(a: i32, b: i32): i32 {
+  if a == b { return 1 }
+  if a < 0 || b < 0 { return 0 }
+  if a >= uVariants.length || b >= uVariants.length { return 0 }
+  const ka = repNameCanonId(uVariants[a])
+  if ka < 0 { return 0 }
+  if ka != repNameCanonId(uVariants[b]) { return 0 }
+  variantFieldLayoutEq(a, b)
+}
+
 export function buildVariantTwins() {
   const keys: i32[] = []
   let i = 0
@@ -28403,7 +28512,22 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
         // Routing this site is a behaviour change, not a refactor — it needs the alias identity
         // in the emit spelling, or an mv layer keyed structurally at the value. The four
         // conflict-free node sites are routed; this one is not.
-        if nodeTyIsMap(d.letType) { return mvShapeOfMapName(lt.tyName) }
+        //
+        // …AND THE ARM-ONLY HINT IS NOT THAT ROUTING, WHICH IS WHY IT GOES THROUGH (D48).
+        // The refusal above is about the FIND rung taking the node type as its KEY: a
+        // better answer there lands on a different slot, which is the 128 measured
+        // disagreements. `armTy` is not a key — `mvShapeOfMapNameArmTy` documents it as
+        // "used for exactly ONE question", and since D48 that question also FILTERS the
+        // two find rungs by arm parity. A filter can only make a find DECLINE a slot whose
+        // arm is not this value.s; it can never make one match where the render did not,
+        // so no slot this site resolves today can move and no mint it performs can be
+        // skipped. What it buys is the annotated map local — `const m: DM = Map()`, the
+        // spelling in D48.s own witness — no longer taking the FIRST twin.s slot for its
+        // `Map()` construction while its function signature (routed at `mapAnnShape`)
+        // names the second.s map struct.
+        if nodeTyIsMap(d.letType) {
+          return mvShapeOfMapNameArmTy(lt.tyName, nodeMapValTyIx(d.letType))
+        }
       }
     }
     return mapShapeOfExpr(d.letInit, fnIx)
@@ -28638,11 +28762,16 @@ export function mvSlotOfMapValNameOrMonoKTy(
 ): i32 {
   const iv = mvCanonValName(ivIn)
   if mvValKindOfName(iv) == -1 { return -1 }
+  // THE FIND'S HALF OF THE ARM COMPONENT (D48) — the same tri-state the mint threads.
+  // `valTy` is the checker's recorded map-VALUE type at this op, so it answers the
+  // nominal question directly; where the caller has none, `MV_ARM_NOHINT` keeps every
+  // rung exactly as master resolves it.
+  const armMo = mvArmHintOfTy(valTy)
   let aMo = -1
-  if valTy >= 0 { aMo = mvSlotOfTyK(valTy, keyI32) }
-  if aMo < 0 { aMo = mvSlotOfValNameTyK(ivIn, keyI32) }
+  if valTy >= 0 { aMo = mvSlotOfTyKArm(valTy, keyI32, armMo) }
+  if aMo < 0 { aMo = mvSlotOfValNameTyKArm(ivIn, keyI32, armMo) }
   if aMo >= 0 { return aMo }
-  const nmMo = mvSlotByValNameK(iv, keyI32)
+  const nmMo = mvSlotByValNameKArm(iv, keyI32, armMo)
   if nmMo >= 0 { return nmMo }
   // A TYPED value name (kind != -1) with NO interned slot: the map was reached through a
   // seam whose collect pass missed it. Returning the mono `-1` here silently lowered the
