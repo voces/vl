@@ -62,20 +62,25 @@ add("tl_idx", "const xs: i32[] = [1, 2]\nprint(7)\nprint(xs[9])\n", "7")
 add("tl_idx2", 'const xs: string[] = ["a"]\nprint(7)\nprint(xs[5])\n', "7")
 add("tl_idx3", "const xs: f64[] = [1.5]\nprint(7)\nprint(xs[3])\n", "7")
 
-# ── check-clean invalid wasm (3): D155's live specimen and two census cells ───
-add("iw_d155", '''type Circle = { r: i32 }
-type Sq = { s: i32 }
-type Shape = Circle | Sq
-type Dot = { r: i32 }
-function thru(x: {[string]: Circle}) { return x }
-function mkm() {
-  const c = Map()
-  c["o"] = { r: 7 }
-  return c
-}
-thru(mkm())
-print(7)
-''', "7")
+# ── check-clean invalid wasm (3): three LIVE census cells ────────────────────
+#
+# TWO SPECIMENS WERE RETIRED 2026-08-27 BECAUSE THEIR DEFECTS CLOSED, and that is the
+# maintenance this file's own rule demands — a sabotage whose stated counts it does not
+# reproduce is worse than none, and a column whose specimens have all been fixed is a zero
+# that proves nothing.  `iw_d155` (an arm-valued map returned by an un-annotated `mkm` and
+# handed to `thru`) went `check-clean invalid wasm` -> `runs` at #1965; `iw_alias` (a
+# `type Box1 = {[string]: Circle}[]` alias plus one unread value of it — D181) at the
+# array-of-map alias close.  Both are now `runs` and are replaced here rather than deleted
+# quietly.  The replacements are the inventory's own D182 and D186, whose filed witnesses
+# `scripts/check-filed-witnesses.py` still grades AS FILED.
+add("iw_nulfield", '''type Circle = { r: i32 | null }
+type WS1 = { f: {[string]: Circle} }
+const lv1 = Map()
+lv1["k0"] = { r: null }
+const c: WS1 = { f: lv1 }
+const g1 = (c.f)["k0"] ?? { r: null }
+if g1.r != null { print(7) } else { print(0) }
+''', "0")
 add("iw_listlist", '''type Circle = { r: i32 }
 type Dot = { r: i32 }
 type Sq = { s: i32 }
@@ -87,16 +92,17 @@ function rd() {
 }
 rd()
 ''', "7")
-add("iw_alias", '''type Circle = { r: i32 }
-type Box1 = {[string]: Circle}[]
-const _sp1: Box1 = []
-function rd() {
-  const lv1 = Map()
-  lv1["k0"] = { r: 7 }
-  const c: {[string]: Circle}[] = [lv1]
-  print((c[0]["k0"] ?? { r: 0 }).r)
-}
-rd()
+add("iw_lomarm", '''type Cir2 = { c2: i32 }
+type Sq2 = { s2: i32 }
+type Shape2 = Cir2 | Sq2
+const lv1 = Map()
+lv1["k0"] = { r: { c2: 1 } }
+const c: {[string]: {r: Shape2}}[] = [lv1]
+const g0 = c
+if g0.length > 0 {
+  const g1 = (g0[0])["k0"] ?? { r: { s2: 1 } }
+  if (g1).r is Cir2 { print(7) } else { print(0) }
+} else { print(0) }
 ''', "7")
 
 # ── loud emit reject (3) ──────────────────────────────────────────────────────

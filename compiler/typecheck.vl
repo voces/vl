@@ -12109,6 +12109,13 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
         // union ARM it is `expected i32, found (ref $type)` — the i32-list catch-all
         // taking a `(ref $Circle)` element, `vl check` rc 0.
         if arrSpineIsNominal(m0) { return m0 }
+        // D-ALIASARRMAP: the MAP leaf, admitted for the reason the bare `TyMap` arm
+        // directly below is admitted with NO gate — see `arrSpineIsMap`. The two arms
+        // ask ONE question about the same construction (`{[K]:V}` renders as itself),
+        // and the array layers on top of it re-render their element, so the answer
+        // cannot differ by depth. `{[string]: i32}[]`, `{[string]: Cat}[][]`,
+        // `{[string]: i32[]}[]` are all this arm.
+        if arrSpineIsMap(m0) { return m0 }
       }
       if mt is TyMap { return m0 }
       if mt is TyObj {
@@ -12244,27 +12251,47 @@ function nulAliasMemberFaithful(ty: i32) {
 // exact condition under which `tyToEmitName` renders the type name-faithfully, because every
 // rung it walks (`T[]`, and a `TyPrim`'s own spelling) is the spelling the annotation had.
 // Any other leaf — a declared or inline object, a map, a union, a nullable, a function — is
-// rendered structurally or softened, so the render is NOT a faithful substitute for the alias
-// and the member stays opaque. Bounded by the arena walk itself: an array's element is always
-// a strictly earlier construction, so the spine cannot cycle.
+// rendered structurally or softened by THAT renderer, so it is not a faithful substitute
+// under it and this predicate declines. Two of those leaves have since been claimed by a
+// SIBLING predicate rather than by widening this one, because each is faithful under a
+// DIFFERENT renderer: `arrSpineIsNominal` (a declared struct, under `tyToNominalName`) and
+// `arrSpineIsMap` (a map, whose render is the annotation's own spelling whichever renderer
+// produces it). The residue is the INLINE OBJECT SHAPE leaf, filed as D188.
 function arrSpineIsScalar(ty: i32) {
+  const leaf = arrSpineLeafTy(ty)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyPrim { return true }
+  false
+}
+
+// THE SPINE PEEL ITSELF, with the leaf test lifted out of it — the ONE walk the three
+// `arrSpineIs*` predicates share (`arrSpineIsScalar` above, `arrSpineIsNominal` and
+// `arrSpineIsMap` below). Each of them is a property of ONE leaf kind and of the renderer
+// that is faithful for it; the peel is not a property of any of them, and it would have
+// been written out a THIRD time when the map leaf was added. Returns the arena index of
+// the element reached by removing every `TyArray` layer — `ty` itself when `ty` is not an
+// array — or -1 for an absent type.
+//
+// The factoring is not free-standing tidying: it is proven behaviour-preserving by its own
+// ablation compiler. Built with `arrSpineIsMap` DEFINED and never called, it moves 0 cells
+// of the 1,200-cell D181 grid and 0 of the 1,088-cell alias-vs-inline twin table — which is
+// what says the two rewritten predicates answer exactly what their loops answered.
+//
+// Bounded by the arena walk itself: an array's element is always a strictly earlier
+// construction, so the spine cannot cycle.
+function arrSpineLeafTy(ty: i32) {
   let cur = ty
   let going = true
-  let ans = false
   while going {
     if cur < 0 {
       going = false
     } else {
       const t = T.tys[cur]
-      if t is TyArray {
-        cur = t.aElem
-      } else {
-        if t is TyPrim { ans = true }
-        going = false
-      }
+      if t is TyArray { cur = t.aElem } else { going = false }
     }
   }
-  ans
+  cur
 }
 
 // True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a DECLARED
@@ -12280,23 +12307,43 @@ function arrSpineIsScalar(ty: i32) {
 // grid. Unclaimed is what it already is; widening this leaf test is the next slice, not
 // this one.
 function arrSpineIsNominal(ty: i32) {
-  let cur = ty
-  let going = true
-  let ans = false
-  while going {
-    if cur < 0 {
-      going = false
-    } else {
-      const t = T.tys[cur]
-      if t is TyArray {
-        cur = t.aElem
-      } else {
-        if structNameOfTy(cur) != "" { ans = true }
-        going = false
-      }
-    }
-  }
-  ans
+  const leaf = arrSpineLeafTy(ty)
+  if leaf < 0 { return false }
+  structNameOfTy(leaf) != ""
+}
+
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is a MAP —
+// `arrSpineIsScalar`'s and `arrSpineIsNominal`'s third twin, and the ONE leaf kind for
+// which the faithfulness question has ALREADY been answered, one arm below in
+// `singleAliasMemberTyIx`: the bare `TyMap` member is claimed there with NO GATE AT ALL,
+// and D-ALIASMAP's header says why in a sentence that is about the MAP and not about the
+// wrapper — *"a map alias has no nominal route to lose because a map name is never a
+// route"*. `tyToEmitNameGo`'s map arm emits `{[K]:V}` for every value there is, so the
+// render of `{[string]: Cat}` is what canon leaves the DIRECT spelling as, and putting an
+// array layer or three on top of it does not create a name to drop: the array arm
+// re-renders its element, and the element's render is already the annotation's own
+// spelling.
+//
+// SO THE ARRAY ARM'S GATE WAS A PROPERTY OF THE LEAF AND THE MAP LEAF HAD NO ARM.
+// `arrSpineIsScalar` claims a `TyPrim` leaf (faithful under `tyToEmitName`),
+// `arrSpineIsNominal` a declared-struct leaf (faithful under `tyToNominalName`) — and a
+// MAP leaf, which is faithful under the SAME renderer as the scalar one, fell through
+// both and stayed opaque. `arrSpineIsNominal`'s header names the leaf it deliberately
+// leaves unclaimed (a union alias) and does not name this one, because nobody had asked:
+// `{[string]: T}[]` is only spellable as an alias body since #1201, and the census is the
+// first grid that crossed a container alias with a list-of-map container.
+//
+// The cost of the gap was `collectU` minting the alias a one-variant union ROW —
+// `uDeclared`, the shared `{tag, anyref}` box, and `isUName` claiming every
+// `Box1`-annotated binding for that box while the initializer lowered a list wrapper.
+// `vl check` rc 0, INVALID WASM at the `global.set` / `local.set`: **D181**, the largest
+// single rescue family in the census (2,254 silent coordinates, all at `cont=list_of_map`).
+function arrSpineIsMap(ty: i32) {
+  const leaf = arrSpineLeafTy(ty)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyMap { return true }
+  false
 }
 
 // The ARENA TYPE a declared one-member union ALIAS denotes TRANSPARENTLY (`type Id = i32`,
@@ -12490,8 +12537,19 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
   // A SCALAR-leaf array is untouched: `arrSpineIsNominal` declines for a `TyPrim` leaf,
   // and the two renderers agree there anyway (`i32[]` either way), which is what
   // `arrSpineIsScalar`'s header means by name-faithful.
+  //
+  // D-ALIASARRMAP TAKES THE SAME LEG, AND ITS SHARE OF IT IS MEASURED RATHER THAN
+  // INHERITED. A MAP leaf renders identically under both renderers for every SCALAR value
+  // (`{[string]:i32}[]` either way) and for a litunion-alias value (both preserve `K0`),
+  // so the leg is a no-op for all but one value kind: a DECLARED-STRUCT value, where
+  // `tyToEmitNameAt` spells `{[string]:{n:i32}}[]` and the nominal renderer spells
+  // `{[string]:Cat}[]` — the direct annotation, character for character. Without it the
+  // alias-vs-inline twin table loses THREE cells that ran on the parent, all four bodies
+  // at `unionmem` (`f(x: L | i32)`): `emitProgram: array value does not match any array
+  // member of the union`, the union's array member being keyed on the dropped name. With
+  // it, all four land on the inline control.
   if mt is TyArray {
-    if arrSpineIsNominal(smt) {
+    if arrSpineIsNominal(smt) || arrSpineIsMap(smt) {
       const anr = tyToNominalNameAt(smt, ctx)
       if anr != "" {
         // The nominal renderer's own width bank, handed over exactly as the two arms

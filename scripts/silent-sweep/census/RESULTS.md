@@ -261,3 +261,42 @@ structfield    twin  -      -      decl       172      928  18.5%
 bare           twin  union  claim  decl       171     4174   4.1%
 structfield2   twin  -      -      decl       164      992  16.5%
 ```
+
+---
+
+## RE-GRADED 2026-08-27 on master `1e81b0f3` (seed 1,453,931) — D181's leg
+
+The numbers above are `1559d80c`'s. **This file goes stale one-directionally**, so the whole
+grid was regenerated and re-graded against master two commits later, and against the branch
+that closes D181. Regenerate + re-run with the commands in `README.md`; the analysis is
+`scripts/silent-sweep/d181/README.md`.
+
+| block | cells | silent at `1559d80c` | silent at `1e81b0f3` | silent on D181's branch |
+|---|---|---|---|---|
+| A | 150,224 | 12,673 | 12,277 | **9,814** |
+| B | 28,590 | 3,141 | 3,023 | **2,564** |
+| C | 43,200 | 3,885 | 3,765 | **3,115** |
+| D | 9,000 | 155 | 155 | 155 |
+| E | 19,224 | 1,911 | 1,911 | **1,539** |
+| **all** | **250,238** | **21,765** | **21,131** | **17,187** |
+
+`loud check reject` is 68,258 and `loud emit reject` 52,482 on BOTH of the 2026-08-27 legs,
+identical to the cell in every block — so the 3,944 cells that move do so from
+`check-clean invalid wasm` to `runs`, with nothing lateral and nothing backward.
+
+`rescue.py` re-derived on `1e81b0f3` reports the SAME family sizes as the published run —
+`claim` 2,254 at the same witness (`cellsA/a002167.vl`), `claim,cont` 1,296 at
+`cellsC/c039831.vl`. On the branch the `claim` family is **0** and `claim,cont` is **320**
+(filed as D189, and reproducible with no alias in the program).
+
+**TWO CAVEATS FOR ANYONE RE-RUNNING THIS FILE'S OWN INSTRUMENTS.**
+
+1. `sabcensus.py`'s stated counts had already drifted on master: two of its three
+   `check-clean invalid wasm` specimens no longer fire — `iw_d155` stopped at #1965 and
+   `iw_alias` was D181 itself. Both were replaced (by the inventory's D182 and D186
+   witnesses) and the file reproduces its counts exactly again. A sabotage whose stated
+   counts it does not reproduce is worse than none, and that is this file's own rule.
+2. Two block-D cells (D179's `compiler trap` pair) report a different MESSAGE on any two
+   compilers of different sizes, because their "message" is a wasm backtrace of the compiler
+   and its function indices shift. They are not a behaviour change; a message-channel diff
+   over the census will always show them.
