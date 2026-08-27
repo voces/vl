@@ -8857,7 +8857,17 @@ if (dd).r == 7 { print(7) } else { print(0) }
   **Repairing the key moves the disagreement from the type section to the argument** — the
   D52 half-fix shape — and without a floor exactly ONE census cell of 250,238
   (`cellsB/b000061.vl`) moves `loud emit reject` → `check-clean invalid wasm`. The floor is
-  in this PR; the UNBOXING is not.
+  in this PR; the arm-building is not.
+* **AN `ObjLit` EXEMPTION WAS BUILT INTO THAT FLOOR AND A WITNESS REFUTED IT** — recorded
+  because the refutation is the method. The reasoning was that `exprVariantIndex` has no
+  object-literal arm by design, so a bare `f({ r: 7 })` would be rejected needlessly; the
+  evidence offered was "the corpus is byte-identical with the exemption in place". **That
+  evidence proved nothing** — by this row's own sibling D201 the corpus contains no program
+  in this family, so it could not have contained the disagreement. Built as a program,
+  `f({ r: 7 })` into an arm-typed closure parameter with NO layout twin went `loud emit
+  reject` → `check-clean invalid wasm` under the exemption: a cell falling INTO silence,
+  the exact failure the floor exists to prevent. There is no exemption; the witness is
+  `tests/cases/unions/arm-param-value-call-objlit-arg-floor.vl`.
 
 ---
 
