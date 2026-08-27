@@ -774,6 +774,18 @@ function retKindPri(k: VKind) {
   if k == "list" { return 2 }
   if k == "union" { return 3 }
   if k == "struct" { return 4 }
+  // THE CONCRETE VARIANT SHARES `struct`'s TIER, and the sharing is the guard. A return is
+  // a plain struct or a union ARM, never both — the two tables refuse each other a row
+  // (`collectS` skips a `TypeDecl` that `variantIndexOf` claims) — so neither fact may
+  // overwrite the other, and `criSetRetKind`'s STRICT `>` is exactly that refusal. Same
+  // reasoning `u8list` shares `f32list`'s tier on, and for the same stated reason: two
+  // mutually exclusive facts about one return need no order between them.
+  //
+  // NOT IN THE HISTORICAL CHAIN, because nothing ever inferred it: `retAnnKindChain`'s own
+  // header records that a `: Cat` ANNOTATION stays `"i32"` with its index in
+  // `fRetStructIdx`, so the annotated path never wrote `"variant"` here and the tier cannot
+  // reorder a ladder it was never in.
+  if k == "variant" { return 4 }
   if k == "nulstruct" { return 5 }
   if k == "reflist" { return 6 }
   if k == "strlist" { return 7 }
@@ -928,6 +940,13 @@ export function cloRetValSlot(fe: i32) {
     const srk = fRetKind[fe]
     if srk == "struct" { return fRetStructIdx[fe] }
     if srk == "nulstruct" { return fRetStructIdx[fe] }
+    // The INFERRED concrete-variant result, from the same companion column — the twin of
+    // `emitOneFuncType`'s inferred `variant` arm. `cloRetValKind` returns `"variant"` here
+    // the moment `criClassify`'s annotated-arm rung stamps it, and `cloRetKeySuffix` already
+    // keys a `variant` result by this slot; without the arm the `$fnsig` and the function's
+    // own functype would be minted from two different facts, which is the drift the
+    // variant-collapse arm above exists to prevent.
+    if srk == "variant" { return fRetStructIdx[fe] }
     // An INFERRED map return (`() => (h)` over a captured/local map) — the map SHAPE from the
     // return expression (`mapRetExprShape`, capture-aware), so the `$fnsig` result matches the
     // returned map value's typed `$mapStruct`.
@@ -3186,7 +3205,15 @@ export function criClassify(rx0: i32, i: i32) {
     // the inferred-result valtype declares a struct ref over a body that yields the union
     // box. Lambda-gated: only the lambda value-if path (above) hits this order, and a named
     // function's classification must stay byte-identical.
-    if fRetKind[i] == "struct" && criFnIsAnonLambda(i) {
+    // `"variant"` rides here for the same reason and by the same argument: the returned-local
+    // rung below can stamp a concrete ARM from one `return`'s annotation while a SECOND
+    // return hands back the union box, and the arm shares `struct`'s tier so a plain
+    // `criSetRetKind` would refuse to lower it. A union return subsumes a per-arm answer
+    // whichever table the arm came from.
+    if (
+      (fRetKind[i] == "struct" || fRetKind[i] == "variant") &&
+      criFnIsAnonLambda(i)
+    ) {
       fRetKind[i] = "union"
       criChanged = true
     } else {
@@ -3202,10 +3229,42 @@ export function criClassify(rx0: i32, i: i32) {
       fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
     }
   }
+  // A RETURN EXPRESSION that already yields a CONCRETE variant — the expression-level twin
+  // of the annotated-local rung below, and the SAME missing call one storage class over.
+  // `exprVariantIndex` answers for a variant-typed PARAM (`paramVariantIndex`), a declared
+  // local, a CAPTURE, a module GLOBAL, a `: Cat`-returning CALL, a `Cat[]` element and an
+  // `as Cat` cast — seven legs, all written, none of them reachable from this pass before.
+  //
+  // Six lines, no local at all: `function thru(x: Circle) { return x }` beside
+  // `type Shape = Circle | Sq` minted `(result i32)` over a body pushing `(ref $type)` —
+  // `vl check` rc 0, `type mismatch: expected i32, found (ref $type)`. It is D52's seam at
+  // the PARAMETER, and it needs no twin at all: `Circle` being an arm is the whole trigger,
+  // because the struct arm below correctly declines a name the struct table has no row for
+  // and nothing else claimed it.
+  //
+  // SAFE BY THE LADDER'S OWN DOCUMENTED PROPERTY, not by inspection here. Every arm of
+  // `exprVariantIndex` is REP-AUTHORITATIVE rather than a shape match — its own header says
+  // so, and says a future non-authoritative arm "would want a rep check". There is no
+  // object-literal field-set leg in it, so this rung cannot make the structural claim D39
+  // proved wrong: a bare `return { r: n }` is not answered here and still falls to the
+  // struct arm below, where `Dot` is the right answer when `Dot` is what the program means.
   if (
     fRetKind[i] != "struct" &&
     fRetKind[i] != "nulstruct" &&
     fRetKind[i] != "union" &&
+    fRetKind[i] != "variant" &&
+    !retKindIsList(fRetKind[i])
+  ) {
+    const rvx = exprVariantIndex(rx, fnStmts[i])
+    if rvx >= 0 {
+      if criSetRetKind(i, "variant") { fRetStructIdx[i] = rvx }
+    }
+  }
+  if (
+    fRetKind[i] != "struct" &&
+    fRetKind[i] != "nulstruct" &&
+    fRetKind[i] != "union" &&
+    fRetKind[i] != "variant" &&
     exprStruct(rx, fnStmts[i])
   ) {
     // GUARD `!= "union"`: an INFERRED struct-union return (`Cat | Dog`) stores `"union"`
@@ -3234,10 +3293,55 @@ export function criClassify(rx0: i32, i: i32) {
         }
       }
     }
+    // A returned local ANNOTATED AT A CONCRETE UNION ARM (`const c: Circle = { r: n }`,
+    // `Circle` an arm of a declared union) — BEFORE the struct arm below, whose
+    // `structIndexOfLet` has no row for an arm and falls through to a FIELD-SET SCAN of the
+    // initializer that contradicts the annotation it just failed to resolve.
+    //
+    // THE DEFECT (silent-class-inventory D52). Eleven lines, no import, no generic, no
+    // lambda, no list: an un-annotated `mk` returning that local, beside an exact layout
+    // twin `type Dot = { r: i32 }`, is `vl check` rc 0 — one redundant-annotation HINT, no
+    // error — and a module the engine refuses with `type mismatch: expected (ref $type),
+    // found (ref $type)`. Disassembled, the two are one heap type apart:
+    //
+    //     (type (;0;) (struct (field (mut i32))))   Dot's standalone row
+    //     (type (;1;) (struct (field (mut i32))))   uVarHeap[Circle]
+    //     (func (param i32) (result (ref 0)))       ← the functype
+    //       (local (ref 1))  struct.new 1  local.get 1  return
+    //
+    // `collectLocals` reads the annotation and builds the arm; this pass took the twin.
+    // Delete `Dot` and the SAME field-set scan finds `Circle`'s own row and the program
+    // runs, which is why the twin is the axis and the annotation alone is not enough.
+    //
+    // IT IS THE MIRROR OF D39 AND IT NEEDS NO CHANNEL. There the annotation was on the
+    // RESULT and the local never saw it, and an anonymous `{ r: n }` has TWO nominal
+    // claimants (`structIndexOfObj` finds `Dot`, `objVariantName` finds `Circle`) that only
+    // the context separates — so `synthRetPinAnn` had to CARRY it. Here the annotation is
+    // on the LOCAL, `criRetLocalLet` already hands this pass that very binding, and
+    // `letAnnVariantIdx` — written, exported, documented "the union-VARIANT table index a
+    // `LetDecl`'s annotation names" — reads one unambiguous nominal answer straight off it.
+    // There is nothing to carry; the call was simply not made.
+    //
+    // THE ANNOTATION, NOT `letIsVariant`. That predicate's second leg infers a variant from
+    // the INIT's own rep, which for a bare object literal is the field-set scan D39 proved
+    // can be wrong: with no annotation at all `Dot` is the RIGHT answer and the program
+    // runs. `letAnnVariantIdx` is the nominal half alone — and it covers `Circle | null`
+    // too, seeding the same concrete arm the bare spelling does. The un-annotated half of
+    // this rung is D51, which is LOUD and stays filed.
+    const rlv = letAnnVariantIdx(rll)
+    if (
+      rlv >= 0 &&
+      fRetKind[i] != "union" &&
+      fRetKind[i] != "nulstruct" &&
+      !retKindIsList(fRetKind[i])
+    ) {
+      if criSetRetKind(i, "variant") { fRetStructIdx[i] = rlv }
+    }
     if (
       fRetKind[i] != "struct" &&
       fRetKind[i] != "nulstruct" &&
       fRetKind[i] != "union" &&
+      fRetKind[i] != "variant" &&
       !retKindIsList(fRetKind[i]) &&
       letIsStruct(rll, fnStmts[i])
     ) {
@@ -23038,6 +23142,27 @@ function fnRetVariantIndexSid(sid: i32) {
         if retVariantFlag(fn.fnRet) != 1 { return -1 }
         const rt = P.nodes[fn.fnRet]
         if rt is TypeRef { return variantIndexOf(rt.tyName) }
+        return -1
+      }
+      // THE UN-ANNOTATED CALLEE, BY THE RULE THE ARM ABOVE STATES. Its gate is "the same
+      // predicate the callee's own functype result is emitted from, so the call site and the
+      // callee agree by construction" — and when there is no annotation that predicate is
+      // `fRetKind` / `fRetStructIdx`, the pair `criClassify`'s annotated-arm rung stamps and
+      // `emitOneFuncType`'s inferred `variant` arm emits. Reading the same pair here is the
+      // same agreement, not a second opinion.
+      //
+      // WITHOUT IT THE FIX IS HALF A FIX AND LOOKS LIKE A WHOLE ONE (D52). With only the
+      // functype corrected, `mk` itself validates and the CALLER does not: `print(mk(7).r)`
+      // lowered `struct.get 0 0` — the layout twin's row — over a `(ref 1)` receiver, so the
+      // engine's complaint moved from `mk` to the start function and changed one word
+      // (`expected (ref null $type)`). A grader that reads only "still invalid_wasm" cannot
+      // tell that apart from no progress, and a grader that reads only "mk validates" cannot
+      // tell it from a fix.
+      //
+      // KIND-GATED like every other reader of the polymorphic companion slot
+      // (`fnRetStructIndexSid`'s own header enumerates the four namespaces it holds).
+      if fe < fRetKind.length {
+        if fRetKind[fe] == "variant" { return fRetStructIdx[fe] }
       }
     }
   }
