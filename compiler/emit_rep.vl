@@ -69,6 +69,7 @@ import {
   mvKeyI32,
   mvValName,
   mvValTyIx,
+  mvValVariantIdx,
   sFieldCount,
   sFieldElemKeyI32,
   sFieldElemName,
@@ -1029,6 +1030,38 @@ export function mapShapeKeyI32(sh: i32): boolean {
 // a `{[i32]: S}` would resolve its `{[string]: S}` twin's struct (a string-ref keys list
 // read as an i32 list: invalid wasm that `vl check` cannot see).
 export function mvSlotOfTyK(ty: i32, keyI32: boolean): i32 {
+  mvSlotOfTyKArm(ty, keyI32, MV_ARM_NOHINT)
+}
+
+// ── THE ARM: THE THIRD COMPONENT OF AN mv SLOT'S IDENTITY (D48) ──────────────
+// The pair (key rep, value type) is not the whole of a slot's identity, for the same
+// reason the KEY had to be added to it: `{[string]: Circle}` where `Circle` is a
+// declared union ARM and `{[string]: Dot}` over its exact layout twin are two DIFFERENT
+// vals element heaps — `uVarHeap[Circle]` and `$Dot`, in two tables that never merge
+// (`DECISIONS.md`: the variant⇄struct-TABLE seam stays nominal) — and they agree on both
+// existing components. Every name the mv layer holds is a RENDER (`tyToEmitName` spells
+// a declared arm `{r:i32}`) and re-resolving it mints one shared anonymous arena index,
+// so the value-TYPE component cannot see the difference either. The arm is the component
+// that can, and #1947 already banks it per slot (`mvValVariantIdx`, `variantRowOfTy` —
+// nominal by construction, no structural rung).
+//
+// THREE STATES, AND THE THIRD IS THE WHOLE REASON THIS IS NOT #1948's REFUTED CANDIDATE.
+// That one asked arm PARITY of two slots; a find has only ONE slot and a caller, and the
+// caller falls into three cases, not two:
+//
+//   `MV_ARM_NOHINT` (-2)  the caller holds no type — it must match a slot of ANY parity,
+//                         which is today's behaviour byte for byte. Every un-hinted
+//                         entry point passes this, so nothing they resolve moves.
+//   -1                    the caller's type IS resolved and is NOT an arm — it must match
+//                         only a non-arm slot. This is the state a two-value parity has
+//                         no room for, and it is the one that stops the TWIN's mint from
+//                         finding the arm's slot.
+//   >= 0                  the caller's type is that arm — match only that arm's slot.
+//
+// A hint is a FILTER on the existing rungs and never a new match: a slot rejected here is
+// one the caller would have taken by structure alone, so the ladder below it (the name
+// rung, then the mint) runs exactly as it does today.
+export function mvSlotOfTyKArm(ty: i32, keyI32: boolean, armHint: i32): i32 {
   if ty < 0 { return -1 }
   // THE INTERNED ID, not a rebuilt spelling. Both sides of this comparison are ARENA
   // INDICES; master rendered each to a full structural STRING and compared the strings —
@@ -1049,12 +1082,28 @@ export function mvSlotOfTyK(ty: i32, keyI32: boolean): i32 {
   while i < mvValTyIx.length {
     if mvValTyIx[i] >= 0 {
       if mvSlotKeyI32(i) == keyI32 {
-        if repMvValId(mvValTyIx[i]) == k { return i }
+        if mvSlotArmMatches(i, armHint) {
+          if repMvValId(mvValTyIx[i]) == k { return i }
+        }
       }
     }
     i = i + 1
   }
   -1
+}
+
+// "No arm hint" — the caller holds no type to ask `variantRowOfTy` of, so it matches a
+// slot of any arm parity. Distinct from -1, which is a RESOLVED "not an arm".
+export const MV_ARM_NOHINT = 0 - 2
+
+// Does mv slot `slot` satisfy the caller's arm hint? The read side of the tri-state
+// above, bounds-guarded like every other parallel-table accessor (a slot whose column
+// never resolved reads -1, i.e. "not an arm", which is what an uncovered row means).
+export function mvSlotArmMatches(slot: i32, armHint: i32): boolean {
+  if armHint == MV_ARM_NOHINT { return true }
+  let sv = 0 - 1
+  if slot >= 0 && slot < mvValVariantIdx.length { sv = mvValVariantIdx[slot] }
+  sv == armHint
 }
 
 // The VALUE type of a map type `ty`, or -1 when `ty` is not a `TyMap` — the
@@ -1108,7 +1157,17 @@ export function tyMapKeyIsI32(ty: i32): boolean {
 // (`ensureRefElemTy`'s map-ELEMENT arm) is blocked on COVERAGE, not disagreement — its
 // hint is present at 34 of 271 entries because most `ensureRefElem` callers pass no type.
 export function mvSlotOfValNameTyK(nm: string, keyI32: boolean): i32 {
-  mvSlotOfTyK(fieldElemTyIxOfName(nm), keyI32)
+  mvSlotOfValNameTyKArm(nm, keyI32, MV_ARM_NOHINT)
+}
+
+// The arm-hinted form of the name bridge — the same resolution, filtered by the caller's
+// arm state (see `mvSlotOfTyKArm`). The un-hinted entry point above is unchanged.
+export function mvSlotOfValNameTyKArm(
+  nm: string,
+  keyI32: boolean,
+  armHint: i32,
+): i32 {
+  mvSlotOfTyKArm(fieldElemTyIxOfName(nm), keyI32, armHint)
 }
 
 // The ARENA TYPE a map-value spelling denotes — the rung the bridge above sits on, and
@@ -2810,9 +2869,42 @@ function repFieldElemTyIx(si: i32, fi: i32): i32 {
 const sfceStkA: i32[] = []
 const sfceStkB: i32[] = []
 
+// The field CODES whose emitted storage is a `(ref [null] <heap>)` the code alone does
+// NOT name — the heap comes from the field's own recorded element spelling
+// (`sFieldElemName` / the D5 `sFieldElemTyIx` sidecar), so two rows may agree on every
+// top-level code and still store DIFFERENT heap types. Every one of them needs the
+// referenced-layer descent below before its rows may share a WasmGC type.
+//
+//   15  a nested struct / nullable struct  — `(ref null $S)`
+//    5  a struct / union / closure ref LIST — `(ref $rlWrapper)` over the element heap
+//   28  the `S[] | null` niche             — `(ref null $rlWrapper)`, same element
+//
+// CODE 15 WAS THE ONLY ONE GATED, AND D64 IS WHAT THE OTHER TWO COST. `type Box =
+// {xs: Circle[]}` beside `type Box2 = {xs: Dot[]}`, with `Circle` an arm of a declared
+// union and `Dot` its exact layout twin, canon-key-match and code-match at the top
+// level; the ref-list layer keeps them APART (two slots, element heaps
+// `uVarHeap[Circle]` and `$Dot`) while this test merged the two Box rows onto one heap
+// type, so `Box2`'s `struct.new` pushed a `(ref $DotListWrapper)` into a field typed
+// `(ref $CircleListWrapper)`: `vl check` rc 0, "type mismatch: expected (ref $type),
+// found (ref $type)". The `| null` spelling of the same field (code 28) is the same
+// defect at the same coordinate and was measured separately (`Circle[] | null` beside
+// `Dot[] | null`, identical message).
+//
+// THE OTHER NAMED-HEAP CODES ARE NOT HERE BECAUSE THEY CANNOT REACH THIS TEST TODAY.
+// A map-valued field (19) and its niche (29) over a union arm are a LOUD reject before
+// any row is merged ("unsupported map value type … no rep for a union-member struct"),
+// and a code-15 field over an arm is the equally loud "only i32 / boolean / string /
+// array struct fields are supported" — measured, one file each. Adding them would be an
+// unwitnessed widening of a MERGE gate, which is exactly the direction that cannot be
+// graded; they belong here the day a witness reaches the test.
+function fieldCodeRefsElemHeap(code: i32): boolean {
+  code == 15 || code == 5 || code == 28
+}
+
 // True when struct slots `a` and `b` have an IDENTICAL emitter field-code list
 // (same count, same per-field wasm code in order), with the referenced-layer
-// guard on code-15 fields (below). A layout guard on top of the structural key:
+// guard on every field code whose storage heap is NAMED rather than pinned by the
+// code (`fieldCodeRefsElemHeap`, below). A layout guard on top of the structural key:
 // `repCanonKey` equality guarantees the CHECKER structure is the same, but a key
 // collision whose EMITTED layout would differ (e.g. an atom-backed litunion
 // field `type K="a"|"b"` vs an inline `"a"|"b"`, coded differently by the
@@ -2825,9 +2917,9 @@ function structFieldCodesEq(a: i32, b: i32): i32 {
     if sFieldTypes[sFieldStart[a] + i] != sFieldTypes[sFieldStart[b] + i] {
       return 0
     }
-    if sFieldTypes[sFieldStart[a] + i] == 15 {
-      // A NESTED-STRUCT field (code 15) stores a `(ref null <elem heap>)` — the
-      // code alone does NOT pin the layout; the referenced rows must share one
+    if fieldCodeRefsElemHeap(sFieldTypes[sFieldStart[a] + i]) {
+      // A NAMED-HEAP field stores a `(ref [null] <elem heap>)` — the code alone
+      // does NOT pin the layout; the referenced rows must share one
       // heap type too (the `variantFieldLayoutEq` referenced-layer discipline,
       // which the struct layer lacked). Same key + same TOP-LEVEL codes is NOT
       // enough: an `#anon` row's canon-key sidecar carries the literal's

@@ -4787,8 +4787,8 @@ Repro:
 
 ---
 
-### D48 — an arm-valued map and a LAYOUT-TWIN struct-valued map in one program share a single mv slot
-**check-clean invalid wasm · found 2026-08-26 by the census extension D34's change required · pre-existing on `f2064bec` and NOT fixed by D34 — the branch fails in the OTHER function · NO generic, NO import**
+### D48 — [CLOSED 2026-08-26] an arm-valued map and a LAYOUT-TWIN struct-valued map in one program share a single mv slot
+**CLOSED 2026-08-26 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the census extension D34's change required · pre-existing on `f2064bec` and NOT fixed by D34 — the branch fails in the OTHER function · NO generic, NO import · CLOSED by #1952 — the ARM is the THIRD component of an mv slot's identity, threaded as a TRI-STATE hint**
 
 Repro:
 
@@ -4872,10 +4872,66 @@ interim — a LOUD floor at the map-store seed (`wasmEmit`'s `svVi = mvValVarian
 site, which already reads the slot's arm) — has to compare HEAPS and not names, or it reddens
 the two-arm control above, which runs today.
 
-**THE CENSUS GATE'S STATED REASON IS UNCHANGED, and this row is still it.**
-`repMapValSlotsTwin`'s parity branch needs two distinct kind-1 slots agreeing on canon id and
-key rep; that pair still cannot exist because this row still collapses it. D49's fix does not
-move it — the byte-identity above is the witness, and no `mapval` grid cell moved.
+**THE CENSUS GATE'S STATED REASON HAS NOW EXPIRED, AND THE GATE ITSELF WAS WRONG IN ONE
+DIRECTION.** It read: `repMapValSlotsTwin`'s parity branch needs two distinct kind-1 slots
+agreeing on canon id and key rep, and that pair cannot exist because this row collapses it.
+Closing the row creates the pair, so the branch is now REACHABLE — measured with a
+three-rung counter (arm entered / cross / both-arms) over 1,070 grid cells and the 2,282-file
+corpus, **re-run on the post-#1951 base** because that change moved variant index resolution
+and this predicate is a heap-twin question over exactly that machinery (grid counters
+identical to the pre-merge run, call for call):
+
+| rung | grid | corpus | first witness |
+|---|---|---|---|
+| kind-1 arm entered | 34 calls / 30 files | 49 / 26 | — |
+| `cross` (one arm, one struct → refuse) | **22 / 20** | 2 / 1 | `maps/arm-valued-map-beside-layout-twin.vl` |
+| both arms, heap twins → **allow** | **10 / 10** | 1 / 1 | `maps/arm-valued-map-beside-layout-twin.vl` |
+| both arms, NOT heap twins → refuse | 0 | 0 | none — see below |
+| neither an arm (the old struct rung) | 2 | 46 / 25 | `arrays/empty-hole-pinned-by-container-position.vl` |
+
+**The corpus's 46 pre-existing entries all take the STRUCT rung**, unchanged — the
+arm-valued-map population was exactly the one no test wrote, which is why this could sit
+mis-stated. The three corpus calls on the two live rungs are this row's own new fixture, so
+the two branches that decide the heap now have a corpus witness where they had none. **And the shipped test was an IDENTITY test (`mvValVariantOf(a) !=
+mvValVariantOf(b)`) where the question is a HEAP one.** Two arms of two DIFFERENT unions over
+one field set are `uVarTwin` layout twins and therefore ONE variant heap type, so their maps
+DO share a map struct; refusing that merge emitted two identical map structs and a
+`pass`-onward boundary that resolved one of them for a value of the other — **2 grid cells
+moving `runs` → check-clean invalid wasm**, caught by the grid and not by argument. The arm
+half now asks `repVariantSlotsTwin` (the variant layer's own pairwise twin relation, the
+`repStructSlotsTwin` sibling), and cross-table is a flat 0 because a variant struct and a
+struct row are never one heap.
+
+The `both arms, NOT heap twins` rung reads **0** on both populations and on a hand attempt
+(two arms whose field is an atom-backed litunion vs an inline one — they came out heap
+twins). Reported rather than deleted, on this file's own standard: an unreached rung is not a
+wrong one, and it is the conservative half of a heap-equality test whose other half is
+measured live.
+
+**WHAT ACTUALLY CLOSED IT, AND WHY #1948's CANDIDATE WAS ONE STATE SHORT.** That candidate
+asked arm PARITY of two SLOTS at `mvSlotOfTyK`. A find has one slot and a caller, and the
+caller falls into THREE cases, not two:
+
+* `MV_ARM_NOHINT` — the caller holds no type. Matches any parity; this is what every
+  un-hinted entry point passes, so nothing they resolve moves. **This is the state a
+  two-value parity has no room for**, and its absence is why the refuted candidate's repro
+  merely moved its failure to the other function.
+* `-1` — the caller's type IS resolved and is NOT an arm. The state that stops the TWIN's
+  mint from finding the arm's slot.
+* `>= 0` — the caller's type is that arm.
+
+A hint is a FILTER on the existing rungs and never a new match, which is what lets it sit
+under a MINT without violating D-MAPNODETY: a find can only DECLINE a slot whose arm is not
+this value's, so the mint runs in strictly more cases and is skipped in none. Four sites
+supply it — the mint (`mvShapeOfValNameArmTy`, off `armTy`), the routed op find
+(`mvSlotOfMapValNameOrMonoKTy`, off `valTy`), `mapAnnShape` (off `nodeMapValTyIx`, and this
+is the one that types every FUNCTION BOUNDARY: without it the slots separated and both `mkC`
+and `mkD` still returned the FIRST map struct), and `letMapShapeOf` (whose header refuses to
+route its node type at the FIND rung, for 128 measured disagreements — the arm-only hint is
+not that routing, and it is the one that reached D48's own alias-spelled witness).
+
+Regression fixture: `tests/cases/maps/arm-valued-map-beside-layout-twin.vl` (both declaration
+orders plus the two-arms-of-two-unions control).
 
 ---
 
@@ -5178,8 +5234,8 @@ Repro:
 
 ---
 
-### D63 — a `for` over an arm-element list beside an EXACT LAYOUT TWIN is SILENT where D50 is loud
-**check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed**
+### D63 — [CLOSED 2026-08-26 — now a loud emit reject] a `for` over an arm-element list beside an EXACT LAYOUT TWIN is SILENT where D50 is loud
+**now a loud emit reject (`emitProgram: field access receiver is not a struct`) — the twin no longer routes around D50's floor, and D50 is what both spellings now take. Was: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed · CLOSED by #1952 — the nominal floor `rlElemStructRow` already carried, at the SECOND copy of that ladder**
 
 Repro:
 
@@ -5225,10 +5281,34 @@ Repro:
   through the REF-LIST path here — that is what D49's fix does — so the i32-list fallback the
   floor stands in is never entered, and the failure is a layer later at the loop var.
 
+**THE COMPLEMENT WAS ALREADY WRITTEN AND WENT ON ONE OF TWO COPIES — the D36/D38 shape.**
+`forInRefArrayStructIdx`'s LIST path calls `structIdxOfElemName`, which is the slot-less twin
+of `rlElemStructRow`: the same three rungs (nominal `structIndexByName`, the canon-key row,
+the fieldset scan) in the same order. `rlElemStructRow` grew a nominal floor for **D32** — *a
+ref-list element whose name is a registered union VARIANT and not a registered plain struct
+has NO struct-table row, so every rung below must decline* — and `structIdxOfElemName` never
+did. The canon-key rung under it then bridged `Circle`'s SHAPE onto `Dot`'s row and
+`declareForInLocals` typed the loop var `(ref $Dot)` while the element read yields
+`(ref $uVarHeap[Circle])`. The MAP half of the very same function had the equivalent gate
+since D34 (`if mvValVariantOf(mvs) >= 0 { return -1 }`); the list half did not.
+
+The fix is that one line, placed AFTER the nominal rung and AHEAD of the structural ones —
+the ordering `rlElemStructRow` documents ("a nominal question must not be settled by
+whichever structural rung happens to fire first"). `structIdxOfElemName` has exactly one
+caller, so the blast radius is this resolver.
+
+**GRID: 24 cells, every one `check-clean invalid wasm` → `loud emit reject`, 0 in any other
+direction.** All 24 are `iterate` at `twin=exact`, across `listelem` / `listoflist` /
+`forinvar` and both pairings and declaration orders. **D50 STILL FIRES for its own shape**
+after the change (`emitProgram: field access but no struct type declared`, verbatim repro,
+unchanged), which is the point: the floor was there all along and the twin was walking round
+it. Regression fixture (a FLOOR pin — flip it when D50 lifts):
+`tests/cases/lists/arm-elem-forin-beside-layout-twin.vl`.
+
 ---
 
-### D64 — an arm-element list in a STRUCT FIELD beside a layout-twin struct is invalid wasm
-**check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (8 of its 24 residual silent cells: `store` + `storeread`, `arm_notwin` and `arm_twin` alike, direct and alias spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · D48's shape ONE CONTAINER OVER — no map anywhere**
+### D64 — [CLOSED 2026-08-26] an arm-element list in a STRUCT FIELD beside a layout-twin struct is invalid wasm
+**CLOSED 2026-08-26 — the repro now RUNS (prints `1` / `1`). Was: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (8 of its 24 residual silent cells: `store` + `storeread`, `arm_notwin` and `arm_twin` alike, direct and alias spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · D48's shape ONE CONTAINER OVER — no map anywhere · CLOSED by #1952 — `structFieldCodesEq`'s referenced-layer guard, which existed for ONE of the three field codes that need it**
 
 Repro:
 
@@ -5278,6 +5358,47 @@ Repro:
 * D49's array-literal floor does not reach these either: ablated on its own, **0 of the 4
   move**. Both field element lists are annotated, so they take the ref-list path and the i32
   fallback the floor stands in is never entered.
+
+**THE ABLATION THIS ROW ASKED FOR WAS RUN, AND IT SAYS D48 AND D64 ARE TWO ROOTS.** One
+compiler per candidate, all three swept against one 1,070-cell grid: D63's fix moves 24
+cells, D64's 24, D48's 21, the three sets are **pairwise disjoint**, their union is exactly
+the 69 cells the full branch moves, and the full branch's verdict equals each single's on
+every cell it moves. No cell needs two patches. Same shape, three layers, three roots.
+
+Re-established on the **post-#1951 base** (five compilers rebuilt, five sweeps re-run):
+every one of the 1,070 cells holds the same verdict under all five as it did pre-merge —
+`master` 0 differ, `A` 0, `B` 0, `C` 0, `FULL` 0 — so the verdict is a property of the tree
+that ships, not of the base it was first measured on.
+
+**AND THE LAYER IS NOT THE mv ONE AT ALL — it is the STRUCT-ROW DEDUP.** The ref-list layer
+kept `Circle[]` and `Dot[]` apart correctly (two slots, element heaps `uVarHeap[Circle]` and
+`$Dot`). What merged was `Box` and `Box2` themselves: `buildStructTwins` matches on
+`slotCanonId` (canon renders the arm structurally, so they agree) plus `structFieldCodesEq`,
+whose per-field test compares only the top-level CODE — both fields are code 5, a
+struct/union ref list — and the two rows collapsed onto one WasmGC struct type. `Box2`'s
+`struct.new` then pushed a `(ref $DotListWrapper)` into a field typed
+`(ref $CircleListWrapper)`.
+
+**THE GUARD WAS ALREADY WRITTEN, ON ONE ARM OF THREE.** `structFieldCodesEq` carries a
+referenced-layer descent for code 15 (a nested struct): distinct element names must resolve
+to rows that are twins themselves, and an unresolvable element name DECLINES the merge. That
+is exactly the test code 5 needs, and code 28 (`S[] | null`) too — measured as its own
+witness, `type NBox = {xs: Circle[] | null}` beside `type NBox2 = {xs: Dot[] | null}`,
+identical message. `fieldCodeRefsElemHeap` now names the set {15, 5, 28} — "the field codes
+whose emitted storage is a `(ref [null] <heap>)` the code alone does not name". For an arm
+element the descent declines because an arm has no `sNames` row at all, which is the correct
+answer and the nominal one.
+
+The other named-heap codes (19 a map field, 29 its niche) are deliberately NOT in the set:
+over a union arm they are a LOUD reject long before any row is merged (`unsupported map value
+type …`), measured one file each, so adding them would be an unwitnessed widening of a MERGE
+gate — the direction that cannot be graded.
+
+**GRID: 24 cells, every one `check-clean invalid wasm` → `runs`, 0 in any other direction.**
+All 24 are `structfield` at `pairing=twinpair, twin=exact`, across `store` / `read` /
+`storeread` / `pass` and all three spellings and both declaration orders — the pairing axis
+is the trigger, which is why a one-container grid could see neither this row nor D48.
+Regression fixture: `tests/cases/structs/arm-elem-list-field-beside-layout-twin.vl`.
 
 ---
 
