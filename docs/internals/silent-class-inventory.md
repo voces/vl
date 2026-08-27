@@ -4169,7 +4169,13 @@ Repro:
   out do reach the comparison and are LOUD after D35's close, measured.
 
 **RETIREMENT — THIS IS D49 IN ITS LOUD HALF, and the two rows were filed a day apart from two
-different grids without either noticing the other.** D49's own bullet called the reading side
+different grids without either noticing the other.** **`check-filed-witnesses.py` is what
+found it, not review**: D49's change was written against D49's witness alone, the grader was
+re-run over the whole doc afterwards as the bulk-edit discipline requires, and this row came
+back `check_reject → runs` unprompted. Reading the diff would not have surfaced it — nothing
+in the change mentions `.length`, and the two rows share no message, no container and no
+grid. That is the whole argument for grading the doc after every change rather than reviewing
+what the change appears to touch. D49's own bullet called the reading side
 "a second, independent alias gap"; it is not independent and it is not second. One predicate
 decides the alias on BOTH sides — `declaredTyOfName` (the checker, which produced this row's
 two messages) and `singleMemberAliasTyIx` (the emitter, which produced D49's invalid wasm) read
@@ -4487,9 +4493,15 @@ Repro:
 * **THE ALIAS IS THE WHOLE TRIGGER.** Spelling the same two annotations `Circle[]` directly —
   `function mk(i: i32): Circle[]` and `const l: Circle[] = [c]`, `type C` deleted — RUNS and
   prints `1`, on both compilers.
-* Controls, each ONE line different, all measured: `Sq`/`Shape` deleted so `Circle` is a plain
-  struct → runs; a `Dot` twin present or absent → no change (flat 2/2 at every arm-ness that
-  has an arm, 0/2 at `plain` and at a non-member struct); declaration order → flat.
+* Controls, each ONE line different, all measured: ~~`Sq`/`Shape` deleted so `Circle` is a
+  plain struct → runs~~ — **THIS ONE DOES NOT REPRODUCE AND THE CORRECTED VALUE IS THE ROW'S
+  SECOND HALF.** Run verbatim on `c0873a06`, `Sq`/`Shape` deleted is the LOUD
+  `emitProgram: struct array elements are not supported`, not `runs`: the array alias was
+  broken for a PLAIN declared-struct element too, loudly there and silently for an arm. A
+  filed control that does not reproduce is a row that was never fully run, so the rest of this
+  line is re-stated as re-measured rather than inherited: a `Dot` twin present or absent → no
+  change (flat 2/2 at every arm-ness that has an arm, 0/2 at a NON-MEMBER struct); declaration
+  order → flat.
 * **IT IS NOT D34's ROOT AND ITS SIGNATURE SAYS SO**: `expected i32, found (ref $type)` is a
   rep-class collapse, not two heap types for one shape — the same signature D37 had, one layer
   down. The remaining cells of D34's grid at `listelem` READ positions are a LOUD checker
@@ -4535,6 +4547,16 @@ been closed by a predicate (here a producer) that already existed and was not co
   interned and unused. On the branch the whole module is **byte-identical to the DIRECT-spelling
   control's**: `array.new_fixed 7`, `struct.new 8`, `(result (ref 8))`, local `(ref 8)`.
   (Seeds: master `c0873a06` 1,429,387 bytes; branch 1,429,949 bytes.)
+* **THE TEN LOUD→SILENT CELLS ARE ACCOUNTED FOR CELL BY CELL, and none of them is new silent
+  surface.** Six are D63 (the alias / alias-of-alias spellings of `listelem`, `listoflist`,
+  `structfield` at `iterate`) and four are D64 (`store` / `storeread` at the twinpair struct
+  field). For all ten, the DIRECT-spelling control is ALREADY that row on `c0873a06`, at the
+  same byte offset with the same message, and **both rows' filed repros contain no array alias
+  at all** — so the shape is reachable without the alias and the alias joined a class that was
+  already counted. Ablating the new array-literal floor on its own moves **0 of the 10**: they
+  build through the ref-list path, so the i32 fallback the floor stands in is never entered.
+  The three questions (covered? reachable without the alias? floor-takeable?) were each
+  answered by re-reading the graded sweeps, not by argument.
 * **A SECOND, SMALLER ROOT WITH THE SAME SIGNATURE RIDES ALONG, and it is the missing loud
   floor.** The `inferred` spelling (`const l = [c]`, no annotation for the ref-list layer to
   key on) reaches the array-literal i32 fallback, whose ladder already floors an ARRAY element,
@@ -4621,6 +4643,19 @@ Repro:
   layer down resolves the twin's row before that arm is reached.
 * Strictly worse than D50 at the same coordinate: the loud floor exists and the twin routes
   around it. Ranked accordingly.
+* **IT IS THE DESTINATION OF SIX OF D49's TEN LOUD→SILENT CELLS, and the accounting is the
+  reason to read that as inherited rather than created.** Those six are the ALIAS and
+  ALIAS-OF-ALIAS spellings of the three containers above; the DIRECT and INLINE spellings of
+  the same three coordinates are already this row on `c0873a06`, at the same offsets and with
+  the same message, and the repro above contains **no array alias at all**. So the shape is
+  reachable without the alias, and D49's close moved the alias spelling onto a defect that was
+  already counted rather than growing the silent surface. The alias's own previous verdict was
+  the checker reject `for` could not get past, which is a LID in the sense
+  `array-alias-return-unread.vl` describes.
+* D49's new array-literal floor does NOT reach these: measured by ablating the floor alone (a
+  D49-without-floor compiler against D49-with-floor), **0 of the 6 move**. The list is built
+  through the REF-LIST path here — that is what D49's fix does — so the i32-list fallback the
+  floor stands in is never entered, and the failure is a layer later at the loop var.
 
 ---
 
@@ -4667,6 +4702,14 @@ Repro:
   grouped with D48 in intent.
 * The failure is in the SECOND function, as D48's is — whichever declaration comes second
   loses. Declaration order swaps which function fails and does not change the count.
+* **IT IS THE DESTINATION OF THE OTHER FOUR OF D49's TEN LOUD→SILENT CELLS.** Those four are
+  the ALIAS spellings of `store` and `storeread` at `arm_notwin` and `arm_twin`; their DIRECT
+  twins are already this row on `c0873a06` at the same offsets, and the repro above spells
+  every type out — **no array alias anywhere**. Reachable without the alias, therefore
+  inherited by it and not created for it.
+* D49's array-literal floor does not reach these either: ablated on its own, **0 of the 4
+  move**. Both field element lists are annotated, so they take the ref-list path and the i32
+  fallback the floor stands in is never entered.
 
 ---
 
