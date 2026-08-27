@@ -595,6 +595,56 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-nullable-map-value-spelling-twin.vl` per the
 // REFILLS procedure below, in the same commit that swapped this constant.
 //
+// THAT D124 SPECIMEN IS CLOSED, together with D123, and an ABLATION says they are TWO
+// ROOTS rather than one — which the resemblance (both are "one map layout, two mv slots")
+// could not. Three candidate edits, one compiler per candidate, both grids swept with one
+// host binary: the niche peel in the twin's canonical identity moves 49 of the 1,114 D112
+// cells and 0 of the 2,850 D88 cells; the two D123 edits move 56 D88 cells and 0 D112
+// cells; the pairwise intersection is 0 and the union is set-identical to the full branch.
+// The ablation baseline is PROVEN rather than assumed this time: stripping all three
+// candidates out of the branch reproduces `89f88840` byte-for-byte (1,451,224 bytes).
+//
+// D124 went the way most of this genealogy has: the rule was already written, in the
+// header of the very function whose peel the mint already takes. `nulRefMapValInnerOf`
+// says a `{[K]: V | null}` value "resolves its struct/map identity — and keys its vals
+// ref-list slot — through the single non-null member, so the slot SHARES the vals rep (and
+// the heap dedup) with the non-null twin". The mint honoured the first half;
+// `repMapValSlotsTwin` keyed on `mvValCanonId`, which reads the value's own arena index,
+// and a `TyNullable`'s `repCanonId` is by construction not its inner's. Probed at the mint:
+// `slot=0 {[string]:i32} canon=2 rl=0 rlwrap=5` beside `slot=1 {[string]:i32}|null canon=3
+// rl=0 rlwrap=5` — the same vals slot, the same wrapper, and `canon` the only column that
+// differs.
+//
+// D123 was TWO EDITS AND ONE ROOT, and the ablation is what separates that from two roots:
+// the comparator rung alone moves 8 cells, the value-row read alone moves 0 (and 0 corpus
+// files), and the two together move 56. `repMapValSlotsTwin`'s kind-1 arm asked a PROXY —
+// D34's arm-identity split — for a question `rlSlotsLayoutTwin` answers directly and that
+// the kind-6 arm one branch down already asks; and once the slots merge, the value SEEDS
+// still read `mvValVariantIdx` / `mvValStructIdx` off the slot the spelling minted, so they
+// join the three consumers that already canonicalize through `mvCanonRepOf`.
+//
+// AND THE CLASS DID NOT EMPTY, for the third close running, and the grid is again what says
+// so: 44 of the D88 cells and 12 of the D112 cells survive, and after these two rows they
+// are ONE family — every survivor is `decl=armtwin`.
+//
+// THE SUCCESSOR IS THAT FAMILY'S MINIMAL WITNESS: NINE LINES, no import, no generic, no
+// lambda, no `??`, one nesting level. An arm-valued map beside a standalone struct of the
+// arm's exact layout — the render `{r:i32}` resolves to the twin through the struct table
+// before anything can ask whether an arm of that layout exists, so the two slots hold two
+// genuinely different heaps and the D123 merge correctly declines them. Its six controls
+// were built and RUN, not reasoned: delete `type Dot` → LOUD; a non-twin `Dot` → LOUD;
+// delete the union → runs; annotate the map → runs; wrap the two statements in a function
+// → runs (the SCOPE axis, D19's); the two-level sibling → silent with the `ref null`
+// sentence. Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0
+// with NO diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch:
+// expected (ref $type), found (ref $type)` — note NO `ref null` this time, the first
+// specimen in four whose sentence does not even look like a nullability defect —
+// `--codegen --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `89f88840`,
+// same message, and its module is byte-identical across the change. It is
+// `silent-class-inventory.md` D139, pinned as
+// `tests/cases/soundness/xfail-miscompile-arm-valued-map-beside-struct-twin.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -631,12 +681,14 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
 // state can be entered halfway.
 // ─────────────────────────────────────────────────────────────────────────────
-const INVALID_MODULE_SRC: string | null = `const z = Map()\n` +
-  `z["z"] = 1\n` +
-  `const l2 = Map()\n` +
-  `l2["a"] = z\n` +
-  `const c: {[string]: {[string]: {[string]: i32} | null}} = Map()\n` +
-  `c["k"] = l2\n` +
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
+  `type Sq = { s: i32 }\n` +
+  `type Shape = Circle | Sq\n` +
+  `type Dot = { r: i32 }\n` +
+  `function thru(x: {[string]: Circle}) { return x }\n` +
+  `const c = Map()\n` +
+  `c["o"] = { r: 7 }\n` +
+  `thru(c)\n` +
   `print(7)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left

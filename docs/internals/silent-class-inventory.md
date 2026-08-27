@@ -99,6 +99,8 @@ and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the sa
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 | D52 D66 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; D52 is D39's seam read from the other end and it needed NO channel — the annotation is on the LOCAL, `criRetLocalLet` already hands the result-valtype pass that binding, and `letAnnVariantIdx` was written, exported and documented correct with no caller on this path. What was missing is the ROUTE: `fRetKind` had no inferred `"variant"` tier and `emitOneFuncType`'s inferred `infSlot` ladder had no `variant` arm — the three items D51's row predicted in writing. A FOURTH edit was needed and the disassembly is what found it: with only the functype corrected, `mk` validated and the CALLER did not (`struct.get 0 0` over a `(ref 1)` receiver), so the engine's message moved function and changed one word. 180 of a 9,450-cell grid moved, 0 backward — 84 silent → runs and 96 loud → runs; silent 200 → 116. Corpus: 1,850 of 1,851 co-emitted files byte-identical, the one difference being D52's own pin. D66 rides the same rung and its filed asymmetry — "annotate the CALLBACK'S RETURN; annotating the local does not" — is retired) |
 | D111 D117 | loud emit reject | **runs — CLOSED 2026-08-27** (below; TWO roots and THREE edits, and the ablation says so — one compiler per candidate over one 1,710-cell grid, all three pairwise intersections **0**. Both roots are a complement already written and never called at the sibling rung. D111 needs TWO of the edits and the ORDER is measured: `letAnnIsUninternedShape`'s D53 bridge ALONE moves 16 cells to `runs` and **8 BACKWARD to check-clean invalid wasm**, because the lifted guard makes the binding a struct local whose row disagrees with the pin `monoAnnPinName` mints — that ladder had a `{…}[]` ELEMENT rung and no BARE inline-shape rung, so the argument fell to the `"i32"` catch-all. Disassembled: with the guard alone the instance is `(func (param i32) (result i32))` and `mk` `return_call`s into it from a `(result (ref 0))` frame. The pin rung alone moves 8 (`ann2` x `global` x `gen`, a MODULE-SCOPE binding where the `LetDecl`-local guard never fires). **The union of the three singles' moved sets IS set-identical to the full branch's (8 + 24 + 40 = 72) — the composition is a DIRECTION, not a cell count**, and that is the thing a union check does not say on its own: the full branch disagrees with the guard-alone compiler on exactly the 8 cells that compiler sends to `invalid_wasm`, every one of them `ann1` x `local` x `gen`. D117: `recordElemRepArrayLit` sits ABOVE `assignableExpr`'s `assignable` short-circuit precisely because a niche-element literal is covariantly assignable, and it already descends into an ObjLit's FIELD values — the ARRAY destination never grew the matching ELEMENT-wise descent, so an inner `[null]` kept its self-inferred `null[]` and every niche seed in the null-rep table stayed empty. 40 cells, and it is the three NICHES only: `(i32 | null)[][]` and `(S | null)[][]` already ran. **72 of 1,710 cells moved, all `loud emit reject` → `runs`, 0 backward, 0 same-class MESSAGE moves, 0 `runs`→`runs` value moves.** The 9,450-cell D52 grid moves **196 more cells to `runs`, 0 backward**, and keeps its silent population at 0; the 3,144-cell D75/D81/D82 grid moves **0** cells and 0 messages, so the change is inert where it is not the answer. **Every number here is the RE-MEASUREMENT on merged master `e67347aa`** — all five ablation compilers rebuilt on that base, not carried over from `7b600b57`; #1960 moves none of these 1,710 cells, and stripping all three patches out of the merged tree reproduces `e67347aa` BYTE-IDENTICALLY, which is what says the three are the whole compiler delta) |
+| D123 D124 | check-clean invalid wasm | **runs — CLOSED 2026-08-27** (below; TWO roots and THREE edits, and an ABLATION says so where the resemblance could not — both rows are "one map layout, two mv slots", and their moved sets are disjoint on BOTH grids. D124's peel moves 49 of the 1,114 D112 cells and 0 of the 2,850 D88 cells; D123's pair moves 56 D88 cells and 0 D112 cells; pairwise intersection 0 each way and the union set-identical to the branch. **The ablation baseline is PROVEN rather than assumed**: stripping all three candidates out of the branch reproduces `89f88840` byte-for-byte at 1,451,224 bytes. D124 is the rule already written in `nulRefMapValInnerOf`'s own header — a niche-nullable value shares its vals rep "and the heap dedup" with the non-null twin, and the mint honoured the first half while `repMapValSlotsTwin` keyed on an arena canon id that a `TyNullable` cannot share. **D123's TITLE AND REPRO ARE RE-FILED**: the filed mechanism (a missing `TyMap` rung in `shapeNominalOfTy`) explains none of its 100 cells — the mint never reaches a nominal question, `armTy=58 vrow=-1` — and the row's own witness turned out to be in the OTHER half of its population, now D139. What D123 is: `repMapValSlotsTwin`'s kind-1 arm asked D34's arm-identity PROXY for a question `rlSlotsLayoutTwin` answers directly one branch down, and then the value-row columns had to follow the merge through `mvCanonRepOf`. Comparator alone 8 cells, value-row read alone 0 (and 0 corpus bytes), together 56 — a COMPOSITION. The PAIRING axis is what sized the second rung: each cell passed alone and two in one file did not. 0 backward and 0 to a silent class on either grid; the 9,450-cell D52 and 3,144-cell D75/D81/D82 grids each move 0 and stay at 0 silent) |
+| D139 | check-clean invalid wasm | **NEW 2026-08-27** — the whole residue of D123/D124 and, after them, EVERY surviving silent cell on both grids: 44 of 2,850 and 12 of 1,114, all `decl=armtwin`. An arm-valued map beside a standalone struct of the arm's exact layout — the render `{r:i32}` resolves to the twin through the struct table before anything can ask for an arm, so the two slots hold two genuinely different heaps and D123's merge correctly declines. It is D39's CHANNEL problem at the map-VALUE position: the deciding annotation is on a callee's parameter and the literal's own arena type is anonymous. Nine lines, module scope, one nesting level; the function-scope sibling RUNS |
 | D131 | check-clean invalid wasm | **NEW 2026-08-27** — the whole residue of the D111/D117 grid, 24 of 1,710 cells and unmoved by that change. A nested-struct FIELD read RETURNED from an UN-ANNOTATED function: the callee's functype says `i32` and the body pushes the field's `(ref null $S)`. It is NOT about the inline shape — a NOMINALLY-typed field reproduces it — and not about the twin: it fires at `decl=nodecl` too. `return o.h` and `const c = o.h; return c` are both loud; `return o.h.r` and the same read at MODULE scope both run |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
@@ -7153,25 +7155,35 @@ Repro:
 
 ---
 
-### D123 — the ARM-NOMINAL map rung is a ONE-LEVEL special case, not a rung in the recursive ladder
-**check-clean invalid wasm · found 2026-08-27 in D112's closing residue, by re-grading the D88/D100 grid rather than by reading the inventory · pre-existing on `7b600b57`, same sentence**
+### D123 — two mv slots that interned ONE vals ref-list slot are ONE map struct
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-27 in D112's closing residue, by re-grading the D88/D100 grid rather than by reading the inventory · pre-existing on `7b600b57`, same sentence**
+
+**THE TITLE AND THE REPRO ARE BOTH RE-FILED, AND THE MEASUREMENT IS WHY.** The row was
+filed as "the ARM-NOMINAL map rung is a ONE-LEVEL special case, not a rung in the recursive
+`shapeNominalOfTy` ladder", and a probe at the mint REFUTED that for its own witness: the
+object literal's recorded arena type is a FRESH anonymous `TyObj` (`armTy=58 vrow=-1`), so a
+`TyMap` rung inside `shapeNominalOfTy` would decline it exactly as every existing rung does.
+The row's 100 D88 cells are TWO mechanisms, separated by whether the two spellings interned
+the same vals ref-list slot: 56 did (this row) and 44 did not (**D139**, where the layout
+twin gives the render a struct-table row of its own and the two heaps are genuinely
+different). The originally-filed witness is in the 44, so it is now D139's, and the repro
+below is the `arm x mapval x std x param` cell this row closes. See "WHAT THE ORIGINAL
+FILING GOT WRONG" below for the full accounting.
 
 Repro:
 
+    import { reverse } from "std:array"
     type Circle = { r: i32 }
     type Sq = { s: i32 }
     type Shape = Circle | Sq
-    type Dot = { r: i32 }
-    function thru(x: {[string]: {[string]: Circle}}) { return x }
+    function thru(x: {[string]: Circle}) { return x }
     function mk(n: i32) {
-      const i0 = Map()
-      i0["k"] = { r: n }
       const c = Map()
-      c["o"] = i0
-      return thru(c)
+      c["k"] = { r: n }
+      return reverse([thru(c)])[0]
     }
-    print((((mk(7))["o"] ?? Map())["k"] ?? { r: 0 }).r)
-    // vl check rc 0 with NO diagnostics at all; vl run:
+    print(((mk(7))["k"] ?? { r: 0 }).r)
+    // was: vl check rc 0 with NO diagnostics at all; vl run:
     //   type mismatch: expected (ref null $type), found (ref $type)
 
 * **IT IS D88's MECHANISM ONE CONTAINER FURTHER IN.** D88 taught the emitter to spell a map
@@ -7238,10 +7250,78 @@ Repro:
   neighbouring widening at this same layer that moves 64 cells to `runs` and 19 to SILENT.
   Sweep it against the D112 and D88 grids BOTH before landing it.
 
+**THE CLOSE (2026-08-27), AND THE FIRST THING IT DID WAS REFUTE THE ROW'S OWN TITLE.**
+
+* **A PROBE AT THE MINT, NOT A READING OF THE MESSAGE.** The two mv slots for one map value
+  were dumped with their kind, canonical id, vals ref-list slot and wrapper, beside the
+  ref-list table itself. On the `arm x mapval x std x param` cell:
+
+      slot=0 name=Circle   kind=1 canon=1 rl=0 rlwrap=9 rep=0
+      slot=1 name={r:i32}  kind=1 canon=1 rl=0 rlwrap=9 rep=1
+      rl=0 nm=Circle k=1 heap=1 wrap=9
+
+  ONE ref-list slot, ONE wrapper, and `rep=1` — a refusal to merge two map structs that are
+  byte-identical by construction. On the `armtwin` sibling the same dump reads `rl=0
+  nm=Circle heap=1 wrap=9` against `rl=1 nm=Dot heap=0 wrap=11`: two rows, two heaps, and
+  the refusal is correct there. That single column is the whole partition.
+* **THE PATTERN IS "COMPLEMENT ALREADY WRITTEN AND NEVER CALLED", and it is called ONE
+  BRANCH DOWN.** What decides whether two mv slots emit one map struct is the vals list
+  WRAPPER, and `rlSlotsLayoutTwin` is the ref-list table's own pairwise equivalence for
+  exactly that — exported, imported, and already the kind-6 arm's guard inside the same
+  function. The kind-1 arm asked a PROXY instead: D34's arm-identity split
+  (`(mvValVariantOf(a) >= 0) != (mvValVariantOf(b) >= 0)` → refuse), which is stricter than
+  the layout wherever the two slots interned the same ref-list row. The rung is ADDITIVE and
+  asked first; D48's arm-TWIN merge stays as the fall-through, because two arms of two
+  different unions over one field set are DISTINCT ref-list rows that only the variant layer
+  can equate.
+* **RUNG 2: THE VALUE-ROW COLUMNS HAD TO FOLLOW THE MERGE, and it measures ZERO alone.**
+  With the slots merged, `mvValVariantIdx` / `mvValStructIdx` are still recorded at the MINT
+  off the ONE spelling that minted the row, so eleven consumers — the map STORE seed, the
+  `??` DEFAULT seed, the `?.` field read, three struct-row resolvers and the `for-in` value
+  walk — kept answering with the render's inline row. Disassembled on the nested cell: the
+  store emitted `struct.new 0` (the inline `{r:i32}` row) into an array of `(ref null 1)`
+  (`uVarHeap[Circle]`), and a later field read emitted `struct.get 0 0` over a `(ref 1)`
+  receiver. Both columns now read through `mvCanonRepOf`, the chokepoint the heap mint, the
+  union-box tag and the arm-slot guard already share; `mvValVariantRawOf` is the one raw
+  reader, and it is structural — `mvCanonRepOf` calls the comparator, so the comparator
+  cannot canonicalize.
+* **TWO EDITS, ONE ROOT, AND THE ABLATION IS WHAT SAYS SO.** Over the 2,850-cell D88/D100
+  grid: the comparator rung alone moves **8** cells, the value-row read alone moves **0**
+  (and **0** of 2,312 corpus modules change a byte), and the two together move **56**. A
+  union of singles far smaller than the pair is the shape a COMPOSITION has and a shared
+  root does not — the same reading #1957's D39/D40/D41 ablation used.
+* **THE PAIRING AXIS FOUND THE SECOND RUNG'S REAL SIZE.** With only the store/`??`/`?.`
+  seeds converted, each grid cell passed ALONE and two of them in ONE FILE did not: the
+  field-read resolvers (`structIndexOfExpr`'s two map arms, `forInRefArrayStructIdx`) still
+  read the raw column, so their D34 "an arm value has no `sNames` row — decline" gate never
+  fired for an arm-valued slot spelled structurally. A one-program-per-cell grid
+  structurally cannot see that, which is the warning `scripts/silent-sweep/d87/README.md`
+  already carries about its own `arm2` level.
+* **56 of the 2,850-cell D88/D100 grid, every one `check-clean invalid wasm` → `runs`, 0
+  backward, 0 to a silent class, 0 same-class message changes.** The moved cells are
+  `decl` in {`arm`, `armdiff`} x `src=declname` x {`mapval x std`, `nestedmap x gen`,
+  `nestedmap x std`} x {`param`, `paramlocal`, `retann`}.
+* **AND 0 OF THE 1,114-CELL D112 GRID, WHICH IS WHAT SEPARATES IT FROM D124.** The two rows
+  are disjoint on both grids: D124's peel moves 49 D112 cells and 0 D88 cells, this row's
+  pair moves 56 D88 cells and 0 D112 cells, pairwise intersection 0 on each.
+* **WHAT THE ORIGINAL FILING GOT WRONG, stated so the next reader does not inherit it.**
+  (a) The mechanism sentence — a missing `TyMap` rung in `shapeNominalOfTy` — does not
+  explain any of the 100 cells; the mint never reaches a nominal question, because the
+  literal's arena type is anonymous at every one of them. (b) "28 of the 1,114 D112-grid
+  cells too, at `decl` in {`arm`, `armtwin`}" double-counts with D124's "33 … all `depth=3`
+  x `nul` x `ann=outer`": those two sets overlap, the D112 grid's 61 survivors are 49 D124
+  cells + 12 D139 cells, and this row owns none of them. (c) The `armtwin x bare x std`
+  pair the row flagged as "the one coordinate this sentence does not cover" is indeed not
+  covered — it is D139's, along with every other `armtwin` cell.
+* **THE THREE OLD GRIDS ALL STAYED AT ZERO.** The 9,450-cell D52 grid and the 3,144-cell
+  D75/D81/D82 grid each move 0 cells and still grade 0 silent; 2,312 corpus modules are
+  byte-identical except the seven map files whose duplicate map structs this deletes (all
+  shrink) and the two fixtures this change adds.
+
 ---
 
 ### D124 — a `{[K]: V | null}` value spelling mints a SECOND map slot for a layout that already has one
-**check-clean invalid wasm · found 2026-08-27 in D112's closing residue, on the depth-3 nullable axis of that row's own grid · pre-existing on `7b600b57`, same sentence · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-27 in D112's closing residue, on the depth-3 nullable axis of that row's own grid · pre-existing on `7b600b57`, same sentence · was THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, now swapped to D139**
 
 Repro:
 
@@ -7252,7 +7332,7 @@ Repro:
     const c: {[string]: {[string]: {[string]: i32} | null}} = Map()
     c["k"] = l2
     print(7)
-    // vl check rc 0 with NO diagnostics at all; vl run:
+    // was: vl check rc 0 with NO diagnostics at all; vl run:
     //   type mismatch: expected (ref null $type), found (ref $type)
 
 * **SEVEN LINES, ONE ANNOTATION, AND NO `??` AT ALL** — no function, no union, no generic,
@@ -7282,6 +7362,116 @@ Repro:
   kind does not matter (`anon`, `scalar`, `str`, `list` and `monomap` all appear) — which is
   what says this is the map-slot identity and not the value's rep.
 * Pinned as `tests/cases/soundness/xfail-miscompile-nullable-map-value-spelling-twin.vl`,
+  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+
+**THE CLOSE (2026-08-27), AND FOR ONCE THE ROW'S OWN READING SURVIVED IT.**
+
+* **THE RULE WAS ALREADY WRITTEN, IN THE HEADER OF THE FUNCTION WHOSE PEEL THE MINT ALREADY
+  TAKES.** `nulRefMapValInnerOf` states the contract in full: a `{[K]: V | null}` value
+  "resolves its struct/map identity — and keys its vals ref-list slot — through the single
+  non-null member, so the slot SHARES the vals rep (AND THE HEAP DEDUP) with the non-null
+  twin". `mvShapeOfValNameArmTy` honours the first half — it peels to `bare` before
+  `structIndexByValName` and before `ensureRefElemTy` — and the second half was never wired:
+  `repMapValSlotsTwin` keyed on `mvValCanonId`, which reads the value's OWN arena index, and
+  a `TyNullable`'s `repCanonId` is by construction not its inner's. So the comparator refused
+  a pair whose vals slot the mint had itself made identical.
+* **PROBED AT THE MINT, NOT READ OFF THE MESSAGE.** On this row's own witness:
+
+      slot=0 name={[string]:i32}      kind=6 canon=2 rl=0 rlwrap=5 rep=0
+      slot=1 name={[string]:i32}|null kind=6 canon=3 rl=0 rlwrap=5 rep=1
+
+  The SAME vals ref-list slot and the SAME wrapper — which is why `$11` and `$12` came out
+  field-for-field equal — and `canon` is the only column that differs. `rep=1` is the
+  refusal. One line: the comparator asks `mvValTwinCanonId`, which peels the niche the same
+  way `mvSlotNullable` asks it and otherwise is `mvValCanonId` unchanged.
+* **THE MERGE IS INTERLOCKED RATHER THAN TRUSTED.** `mAssignTypeIndices` already fails
+  LOUDLY when two claimed twins resolve different vals wrappers ("map-value layout twins
+  resolved different vals wrappers"), so an over-merged kind 1/2/6/14 pair is a compiler
+  error and never a silent alias.
+* **49 of the 1,114-cell D112 grid, every one `check-clean invalid wasm` → `runs`, 0
+  backward, 0 to a silent class.** Every moved cell is `depth=3` x `nul` x `ann=outer`, at
+  every leaf kind (`anon` 37, `list`/`monomap`/`scalar`/`str` 3 each) — which is what says
+  it is the map-slot identity and not the value's rep, exactly as filed. **0 of the
+  2,850-cell D88/D100 grid**, so it is disjoint from D123 on both grids (pairwise
+  intersection 0 each way).
+* **TWO SAME-CLASS MESSAGE CHANGES, and they are progress rather than noise.** Two
+  `d3 x armtwin x nul x coalvar` cells stayed `check-clean invalid wasm` and their engine
+  message moved from `function[N]::mk` to the start function — the in-`mk` mismatch is gone
+  and the module-scope one is not. Those two are D139 cells; no outcome-class count can see
+  the difference, which is the instrument the D112 close named and this one re-ran.
+* **THE ROW'S OWN CELL COUNT WAS 33 AND THE MEASURED FIGURE IS 49.** The filing counted
+  `depth=3 x nul x ann=outer` cells that were silent AND not attributed elsewhere; the peel
+  also reaches 16 cells D123's filing had claimed at `decl` in {`arm`, `armtwin`}. The two
+  rows' filed cell sets overlapped; their MOVED sets do not.
+
+---
+
+### D139 — an ARM-valued map beside a standalone struct of the arm's EXACT layout
+**check-clean invalid wasm · found 2026-08-27 as the whole residue of D123/D124 — 44 of the 2,850-cell D88/D100 grid and 12 of the 1,114-cell D112 grid, and after those two rows EVERY surviving silent cell on both grids · pre-existing on `89f88840`, same message, module byte-identical across that change · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function thru(x: {[string]: Circle}) { return x }
+    const c = Map()
+    c["o"] = { r: 7 }
+    thru(c)
+    print(7)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **NINE LINES, no import, no generic, no lambda, no `??`, ONE nesting level.** And note the
+  message has NO `ref null` in it: after three specimens running whose sentence named
+  nullability over a two-heap-type mechanism, this one does not even look like a nullability
+  defect. It is the same mechanism as those three.
+* **IT IS D123's OTHER HALF, AND ONE COLUMN SEPARATES THEM.** D123 merges two mv slots that
+  interned the SAME vals ref-list slot. Here they did not:
+
+      slot=0 name=Circle   kind=1 canon=1 rl=0 rlwrap=9   (rl=0 nm=Circle heap=1)
+      slot=1 name={r:i32}  kind=1 canon=1 rl=1 rlwrap=11  (rl=1 nm=Dot    heap=0)
+
+  With `Dot` declared, `structIndexByValName("{r:i32}")` finds it before anything asks
+  whether an arm of that layout exists, so the render gets a struct-table row of its own and
+  the two slots hold two genuinely different heaps — `uVarHeap[Circle]` and `sHeapIdx[Dot]`,
+  which `DECISIONS.md` keeps in two namespaces on purpose. Merging them would be WRONG, and
+  `rlSlotsLayoutTwin` correctly declines (its struct tail refuses a row whose
+  `rlElemStructRow` is -1, which is every registered variant — D32's gate).
+* **THE DECIDING INFORMATION EXISTS AND IS NOT AT THE MINT — this is D39's CHANNEL problem
+  at the map-VALUE position.** `thru`'s annotation says the value is `Circle`; the literal's
+  own recorded arena type is a FRESH anonymous `TyObj` (`variantRowOfTy` = -1,
+  `structIndexOfTy` = -1, probed), so nothing the mv layer is handed can pick between
+  `Circle` and `Dot`. D39's own sentence applies verbatim: "an anonymous `{ r: n }` has two
+  nominal claimants and only the CONTEXT separates them." The two shapes that already carry
+  a context to an un-annotated binding — `synthRetPinAnn`, `synthEmptyListAnn` — do not
+  reach a map's value cell.
+* **A LOUD FLOOR IS NOT THE ANSWER AND THAT IS MEASURED, not argued.** D93's header records
+  the experiment at this exact layer: a `-3` refusal at the mint scored 866/148/10 against
+  894/112/18, buying 8 fewer silent cells for 28 fewer working programs, six of them
+  `correct` on master. The number that decides a floor is the count of `correct` cells LOST.
+* **SIX CONTROLS, ALL BUILT AND RUN against `89f88840` and against the D123/D124 branch,
+  same answers on both:**
+
+  | change to the repro | outcome |
+  |---|---|
+  | (none — the repro as filed) | check-clean invalid wasm |
+  | delete `type Dot` | **LOUD emit reject** (`unsupported map value type`) |
+  | `type Dot = { q: i32 }` (a non-twin) | **LOUD emit reject** (same message) |
+  | delete `type Shape = Circle \| Sq` | **RUNS** |
+  | annotate `c: {[string]: Circle}` | **RUNS** |
+  | wrap the two statements in a function | **RUNS** — the SCOPE axis (D19's) |
+  | the same program at TWO nesting levels | check-clean invalid wasm, `ref null` sentence |
+
+  So the EXACT layout twin is required (both non-twin controls are loud, not silent), the
+  union is required, and at ONE level only MODULE scope reaches it — the function-scope
+  sibling is `armtwin x mapval x none x param` on the D88 grid and it runs.
+* **THE RESIDUE IS ONE FAMILY ON BOTH GRIDS.** D88/D100: all 44 survivors are `decl=armtwin`
+  x `src=declname` — `bare x std` 2, `mapval x std` 6, `nestedmap x gen` 12, `nestedmap x
+  none` 12, `nestedmap x std` 12. D112: all 12 are `armtwin` x `declname` x `leaf=anon` x
+  `read=coalvar`, 6 at depth 2 and 6 at depth 3.
+* Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-beside-struct-twin.vl`,
   `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
 
 ---

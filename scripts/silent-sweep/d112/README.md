@@ -88,3 +88,47 @@ first of their two `?? Map()` sites went from the mono struct to the typed one a
 store-side twin mismatch stayed. A partial fix inside one outcome class is invisible to the
 grader of that class; `cmp` the modules across the fix, or a half-moved family reads as an
 untouched one.
+
+
+## The 2026-08-27 re-grade (D123 / D124's close)
+
+Re-run against master `89f88840` and the D123/D124 branch with `grade88.py`, one host
+binary, both sides:
+
+| side | runs | loud emit reject | check-clean invalid wasm |
+|---|---|---|---|
+| base `89f88840` | 761 | 292 | 61 |
+| D123/D124 branch | 810 | 292 | 12 |
+
+**49 cells moved, every one `check-clean invalid wasm` → `runs`; 0 backward, 0 to a silent
+class.** Every moved cell is `depth=3` x `nul` x `ann=outer`, at every leaf kind — which is
+what says D124 is the map-SLOT identity and not the value's rep, exactly as the row filed
+it. All 49 belong to **D124** alone: the ablation's D123 compilers move **0** cells here.
+
+**Two same-class MESSAGE changes**, both `d3 x armtwin x nul x coalvar`: the engine's
+complaint moved from `function[N]::mk` to the start function. The in-`mk` mismatch is gone
+and the module-scope one is not — progress no outcome-class count can see, which is the
+instrument this grid's own close named.
+
+The residue is **12 cells, all `armtwin` x `declname` x `leaf=anon` x `read=coalvar`**
+(6 at depth 2, 6 at depth 3), filed as **D139**: an arm-valued map beside a standalone
+struct of the arm's exact layout, where the two mv slots hold two genuinely different heaps
+and merging them would be wrong.
+
+### The ablation
+
+Three candidate edits, one compiler per candidate, built by STRIPPING the others out of the
+branch — and stripping ALL of them reproduces `89f88840` **byte-for-byte** (1,451,224
+bytes), so the base column is proven rather than assumed.
+
+| candidate | this grid | D88/D100 grid |
+|---|---|---|
+| A — `rlSlotsLayoutTwin` in `repMapValSlotsTwin`'s kind-1 arm | 0 | 8 |
+| B — the niche peel in the twin's canonical identity | **49** | 0 |
+| C — the value-row columns read through `mvCanonRepOf` | 0 | 0 |
+| A + C | 0 | **56** |
+| A + B + C (the branch) | 49 | 56 |
+
+`A ∩ B = 0` and `(A+C) ∩ B = 0` on both grids; `(A+C) ∪ B` is set-identical to the branch's
+moved set on both. A and C are ONE root in two edits (their union alone is 8, the pair is
+56); B is a second root.

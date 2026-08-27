@@ -90,3 +90,48 @@ a one-level special case rather than a rung in the recursive `shapeNominalOfTy` 
 residue is a DIFFERENT root from D112: D112's fix changed those cells' wasm (their
 `?? Map()` site moved to the right struct) and the failure relocated to the store, so the
 outcome class never moved and only a module `cmp` saw it.
+
+
+## The 2026-08-27 re-grade (D123 / D124's close)
+
+Re-run against master `89f88840` and the D123/D124 branch with `grade88.py`, one host
+binary, both sides:
+
+| side | runs | loud emit reject | check-clean invalid wasm |
+|---|---|---|---|
+| base `89f88840` | 2,178 | 572 | 100 |
+| D123/D124 branch | 2,234 | 572 | 44 |
+
+**56 cells moved, every one `check-clean invalid wasm` → `runs`; 0 backward, 0 to a silent
+class, 0 same-class message changes.** The moved cells are `decl` in {`arm`, `armdiff`} x
+`src=declname` x {`mapval x std`, `nestedmap x gen`, `nestedmap x std`} x {`param`,
+`paramlocal`, `retann`} — i.e. every level of this grid's residue EXCEPT `armtwin`.
+
+All 56 belong to **D123**; D124's compiler moves **0** cells here, which is what makes the
+two rows disjoint roots rather than one stated twice.
+
+The residue is **44 cells, all `decl=armtwin` x `src=declname`** (`bare x std` 2,
+`mapval x std` 6, `nestedmap x gen` 12, `nestedmap x none` 12, `nestedmap x std` 12), filed
+as **D139**. With an exact struct twin declared, the render `{r:i32}` resolves to it through
+the struct table before anything can ask for an arm, so the two mv slots hold two genuinely
+different heaps and D123's merge correctly declines them.
+
+### What the ablation reported (second ablation, this grid)
+
+Built by STRIPPING candidates out of the branch; stripping all three reproduces `89f88840`
+**byte-for-byte** (1,451,224 bytes).
+
+| candidate | moved here | moved on the D112 grid |
+|---|---|---|
+| A — `rlSlotsLayoutTwin` in `repMapValSlotsTwin`'s kind-1 arm | 8 | 0 |
+| B — the niche peel in the twin's canonical identity (D124) | 0 | 49 |
+| C — the value-row columns read through `mvCanonRepOf` | 0 | 0 |
+| A + C | **56** | 0 |
+| A + B + C (the branch) | 56 | 49 |
+
+A alone moves 8 and C alone moves 0 (and 0 corpus modules change a byte), while A+C moves
+56: a COMPOSITION, not a shared root — the same reading the D39/D40/D41 ablation used. The
+PAIRING axis is what sized C: with only three of its eleven consumer sites converted, every
+cell passed ALONE and two of them in ONE FILE did not, because the field-read resolvers
+still read the raw value-row column. A one-program-per-cell grid structurally cannot see
+that, which is the warning this file already carries about its own `arm2`/`decl` levels.
