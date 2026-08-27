@@ -88,3 +88,32 @@ that row is silent at `local`, `global` and `callres` alike, and the axis that d
 discriminate it is whether the producing function's RESULT is annotated. So the grid
 separated D139 from its residue and then said its own axis is not the residue's axis —
 which is exactly what a grid built to vary one held-constant coordinate is for.
+
+## What it reported at D155's CLOSE (base `1559d80c` vs the D155 branch)
+
+The paragraph above says this grid's own axis is not D155's axis, and that stayed true —
+the axis that IS D155's is where the deciding annotation sits, one SCOPE out. But the grid is
+still the only one of the seven that contains the row, so it is the only one that can grade
+it, which is the second job a small held-constant-coordinate grid does.
+
+| side | runs | loud emit reject | check-clean invalid wasm |
+|---|---|---|---|
+| base `1559d80c` | 18 | 8 | 10 |
+| D155 branch | 21 | 6 | 9 |
+
+**3 cells moved, every one FORWARD, 0 backward, 0 to a silent class** —
+`armtwin x mapval x none x callres` check-clean invalid wasm to runs, and
+`arm x mapval x none x callres` + `armdiff x mapval x none x callres` **loud emit reject to
+runs**. The other six grids move 0 cells and 0 messages: D52 (9,450), D75/D81/D82 (3,144),
+D88/D100 (2,850), D111/D117 (1,710), D131 (1,732), D112 (1,114).
+
+There is also **1 same-class MESSAGE move**, at `armtwin x mapval x std x callres`: the pin
+now fires there and the cell stays silent because a SECOND root (inventory D163 — the list
+literal's element row) holds it. An outcome-class count cannot see that; it is the "same
+class, different message" disguise, and it is the reason the message diff is run on every
+grid rather than only on the ones whose totals moved.
+
+The 9 remaining SILENT cells are `armtwin x {mapval x std, nestedmap x *}` at all three
+bindings — **D156** owns the six `nestedmap` cells, **D157**/**D163** the three
+`mapval x std` ones. The 6 remaining LOUD cells are the documented `-3` floor at
+`arm`/`armdiff` x `nestedmap` x `none`, unchanged.

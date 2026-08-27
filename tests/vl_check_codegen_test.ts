@@ -678,6 +678,60 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-arm-valued-map-from-a-call-result.vl` per the
 // REFILLS procedure below, in the same commit that swapped this constant.
 //
+// ── D155 (#PR) — the call site was a destination the scan never had ───────────────────────
+//
+// D155 was the program above: an arm-valued map built and RETURNED by `mkm`, handed to
+// `thru(x: {[string]: Circle})` at a call site in another scope. It RUNS now, and the
+// mechanism is the one this genealogy keeps landing on — the channel exists, and it stopped
+// one hop short of its own population.
+//
+// THE ROW'S DIAGNOSIS IS CONFIRMED AND ITS "CHEAPEST NEXT PROBE" IS NOT WHAT ANSWERED. The
+// row proposed asking whether `computeRetInference` already knows `mkm` returns a
+// `{[string]: Circle}`. It does not need to: the deciding annotation is `thru`'s PARAMETER
+// and it is at the CALL SITE, one scope out of the body `dstPinAnnIn` scans. Probed at the
+// pin on `1559d80c` the dump is one line — `DPA let=18 name=c ret=-1 n=0`, no destinations at
+// all — against `n=1 [0]=<{[string]:Circle}>` for the function-scoped sibling.
+//
+// THE FIX IS ONE RUNG AND ONE SCAN. `dstPinSrcIsAt` learns that an ordinary call to an
+// UN-ANNOTATED callee is transparent to the binding that callee hands back
+// (`dstPinCalleeRetLet`, using the same `retLocalLetOfBlock` alias walk every other rung of
+// this family uses), and `dstPinCallerDests` runs the same `dstPinScan` over every other
+// function body and over the module — but ONLY for a binding that is its own function's tail
+// value, which is what keeps this from being a whole-program scan per binding. A DECLARED
+// result answers -1 and is not a hop: it is the destination, `dstPinRetDest` already records
+// it from inside the callee, and a caller must not overrule it.
+//
+// SIX GRIDS RE-GRADED, ALL AT 0: D52 (9,450), D75/D81/D82 (3,144), D88/D100 (2,850),
+// D111/D117 (1,710), D131 (1,732), D112 (1,114) — 0 moved, 0 backward, 0 to a silent class,
+// 0 same-class message changes on each. The 36-cell binding-storage-class grid
+// (`scripts/silent-sweep/d139/`) moves 3, every one forward: `armtwin x mapval x none x
+// callres` check-clean invalid wasm → runs, and `arm` / `armdiff` at the same coordinate
+// loud emit reject → runs.
+//
+// THE ABLATION BASE IS PROVEN AGAIN: stripping the change out of the branch reproduces
+// `1559d80c` byte-for-byte at 1,452,766 bytes, and TWO OTHER CANDIDATES (C1 and C2) WERE
+// BUILT AND MEASURED AND ARE NOT IN THIS COMMIT — see D157. Together they make the D157 pin
+// fire with the right name (probed) and move ZERO cells, because a SECOND root then keeps
+// every one of them silent; separately each moves nothing at all, so they are a COMPOSITION
+// whose composed effect is still 0 forward and 4 same-class message moves. A candidate that
+// only changes a message is not a fix, and this genealogy has been fooled by that disguise
+// before.
+//
+// THE SUCCESSOR IS THE SAME SEAM REACHED THROUGH A LIST CONDUIT. Ten lines, one import, no
+// lambda, no `??`, one nesting level: an arm-shaped literal whose only nominal claim is the
+// enclosing function's DECLARED RESULT, delivered through `reverse([c])[0]`. Its eight
+// controls were built and RUN and are identical on `1559d80c` and on this tree: deleting the
+// conduit runs, annotating the local runs, deleting `Dot` runs, a non-twin `Dot` runs,
+// deleting the union runs, binding the list as `const xs: Circle[] = [c]` runs — and a
+// HAND-WRITTEN `rv<T>(xs: T[]): T[]` in place of `reverse` fails identically, so the class is
+// not std-bound. Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0
+// with NO diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch:
+// expected (ref $type), found (ref $type)`, `--codegen --no-validate` rc 0, and NO `emit
+// error` marker. Pre-existing on `1559d80c`, same sentence. It is
+// `silent-class-inventory.md` D157, pinned as
+// `tests/cases/soundness/xfail-miscompile-arm-literal-through-a-list-conduit.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // THE SUCCESSOR IS THAT FAMILY'S MINIMAL WITNESS: NINE LINES, no import, no generic, no
 // lambda, no `??`, one nesting level. An arm-valued map beside a standalone struct of the
 // arm's exact layout — the render `{r:i32}` resolves to the twin through the struct table
@@ -734,18 +788,16 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
 // state can be entered halfway.
 // ─────────────────────────────────────────────────────────────────────────────
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
+const INVALID_MODULE_SRC: string | null = `import { reverse } from "std:array"\n` +
+  `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
-  `function thru(x: {[string]: Circle}) { return x }\n` +
-  `function mkm() {\n` +
-  `  const c = Map()\n` +
-  `  c["o"] = { r: 7 }\n` +
-  `  return c\n` +
+  `function mk(n: i32): Circle {\n` +
+  `  const c = { r: n }\n` +
+  `  return reverse([c])[0]\n` +
   `}\n` +
-  `thru(mkm())\n` +
-  `print(7)\n`;
+  `print((mk(7)).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
