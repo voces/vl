@@ -5925,8 +5925,16 @@ Also measured, and it is why the arena rung is `repSlotOfTy` and not `structInde
 rung the retraction removed answers **-1** on this shape. The bridge is the leg that answers.
 
 **GRID: 16 of the 434 shared cells, every one `loud emit reject` → `runs`, 0 in any other
-direction** — `inlineparam` source x every `decl` level x `direct` / `local` / `alias` x `ret`
-/ `retann` / `read`. Graduated:
+direction** — `inlineparam` source x `decl` levels `nodecl` / `plain` / `arm` / `armtwin` /
+`armdiff` x `direct` / `local` / `alias` x `ret` / `retann` / `read`.
+
+**THE RESIDUE IS THE SIXTH `decl` LEVEL AND IT IS D39'S CASE AFTER ALL — filed as D100.** With
+TWO declared structs of the same layout the bridge's uniqueness guard (`repSlotKeyN[key] == 1`)
+declines and the reject stands, on the branch exactly as on master: 9 cells, `plaintwin` x the
+same 3 x 3. That is not a gap in this fix, it is the boundary of what a resolver can decide —
+`Circle` and `Dot` are two equally valid answers for `{r:i32}` and only the context that WROTE
+the annotation knows which. So the grouping's guess ("two claimants for one shape") was right
+about a shape D53's own repro does not contain and wrong about D53. Graduated:
 `tests/cases/structs/inline-shape-param-beside-declared-twin.vl` (six rows: the three resolvers
 that answered -1, both result-annotation spellings, and the nominal control).
 
@@ -6113,6 +6121,47 @@ Repro:
   outcome, and it takes the grid's silent total to 0. Pairwise-disjoint from all four others.
 * Graduated: `tests/cases/unions/variant-param-local-return-beside-layout-twin.vl` (one hop,
   two hops, the no-local row that already ran, and the annotated control).
+
+---
+
+### D100 — an INLINE-SHAPE parameter where TWO declared structs share that layout
+**loud emit reject · found 2026-08-26 by the D53 close's own grid, as the 9 cells that close does NOT move (`plaintwin` x direct/local/alias x ret/retann/read) · pre-existing and IDENTICAL on master `8bf0f20f` and on the D53 branch · NOT silent, and filed because it is the exact boundary of D53's fix**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Dot = { r: i32 }
+
+    function mk(c: { r: i32 }) {
+      const o = c
+      return o
+    }
+
+    print(mk({ r: 7 }).r)
+    // vl check rc 0 (no diagnostics at all); vl run:
+    //   emitProgram: ref valtype with no interned shape
+
+* **TWO ONE-LINE CONTROLS, EACH RUNNING, AND THEY BRACKET THE AXIS.** Give the second struct a
+  DIFFERENT field name (`type Dot = { q: i32 }`) and it prints 7 — that is D53, closed. Spell
+  the parameter `c: Circle` and it prints 7. So the trigger is the COUNT of declared rows with
+  this layout, not the presence of one.
+* **IT IS D39'S SHAPE, NOT D53'S, AND THAT IS THE WHOLE ROW.** D53's fix is `repSlotOfTy`'s
+  structural→declared BRIDGE, which by construction answers only when the twin is UNIQUE
+  (`repSlotKeyN[key] == 1`). Two rows and it declines — correctly: `Circle` and `Dot` are two
+  equally valid readings of `{r:i32}` and nothing at a resolver's position can separate them.
+  This is the case D39 needed a CHANNEL for, one storage class over.
+* **THE INFORMATION EXISTS AND IS DISCARDED, which is where a channel would go.**
+  `internInlineShapeTy` ends in `annShapeIndexOf`, which PICKED a row when it deduped this
+  annotation — nothing records WHICH, so the answer cannot be read back at query time. A
+  sidecar keyed by the annotation node (the shape `sTyIx` / `recordSRowDeclOfName` already take
+  for the rows they mint) is the reachable neighbourhood.
+* Worth checking first, and NOT checked here: `sTwin` merges exact layout twins onto ONE heap
+  type, so if `Circle` and `Dot` are `repStructSlotsTwin` the two answers emit the same module
+  and a "first row wins" rule would be sound without a channel at all. That is a measurement,
+  not an argument — `structIndexOfLet`'s arena rung carries the same caveat and names
+  `repStructSlotsTwin` (the CONJUNCTION, not `structFieldCodesEq` alone) as the predicate to
+  ask.
+* Ranked below D99: it is LOUD at every cell, on both sides, and no spelling of it is silent.
 
 ## 3. Shared-root analysis
 
