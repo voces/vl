@@ -148,3 +148,43 @@ is the 36-cell grid that varies `bind` (`local` / `global` / `callres`) instead,
 closing D123 for the reason #1962 gave when D131's four filed controls all agreed and none
 of them separated anything. Measured there: D123's fix is storage-class INDEPENDENT (12 cells
 moved, 4 at each binding, 0 backward), and D139 is not.
+
+## The 2026-08-27 re-grade (D155's close, and a candidate that moves 0)
+
+Re-run against `1559d80c` and the D155 branch with `grade88.py`, one host binary, both sides:
+
+| side | runs | loud emit reject | check-clean invalid wasm |
+|---|---|---|---|
+| base `1559d80c` | 2,234 | 572 | 44 |
+| D155 branch | 2,234 | 572 | 44 |
+
+**0 cells moved and 0 messages changed**, which is the finding rather than a null result:
+D155 is a binding returned from a CALL and every cell of this grid returns its binding
+directly from `mk`, so this population cannot contain the row. `scripts/silent-sweep/d139/`
+is the grid that can, and it moves 3.
+
+### The 44-cell residue, re-partitioned by MEASUREMENT
+
+The residue is unchanged in size and its filing is not. Two candidates were built for
+**D157** — C1, an open generic position is one whose spelling MENTIONS a type parameter
+(`reverse`'s `xs: T[]` was read as a concrete destination and pushed the `""` that vetoed the
+pin); C2, `dstPinSrcIs` crossing an `Index` over an element-preserving conduit — and swept
+here on the proven base:
+
+| candidate | moved | same-class MESSAGE moves |
+|---|---|---|
+| C1 alone | 0 | 0 |
+| C2 alone | 0 | 0 |
+| C1 + C2 | **0** | **4** (`armtwin x declname x {bare,mapval} x std x retann x ann0 x {norm,rev}`) |
+
+Neither half alone changes even a message and together they change four — a COMPOSITION
+whose composed effect is still zero cells. Probed, the pin then fires with the RIGHT name
+(`DPA … n=1 [0]=<Circle>` against the base's `n=1 [0]=<>`), so the halves are correct and
+insufficient: a SECOND root holds the cells, filed as **D163**. Neither candidate is in the
+tree.
+
+That measurement also re-partitions the 44. D157 owns **4** (`{bare,mapval} x std x retann`);
+D163 owns **4** more (`mapval x std x {param,paramlocal}`) on its own — the pin already fires
+for those on `1559d80c`, so no conduit rung can be their answer — and D156 owns the 36
+`nestedmap` cells. The row's earlier claim that C1+C2 would move the 8 `nestedmap x gen`
+cells "to a different message" is refuted: they move 0 cells and 0 messages there.

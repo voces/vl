@@ -1189,7 +1189,7 @@ export function synthRetPinAnn(letIx: i32, fnIx: i32) {
 // syntheses cannot drift about which annotations qualify.
 //
 // Returns 0 always; the mutation is `s.letType`, in place — the family's contract.
-export function synthDstPinAnn(letIx: i32, fnIx: i32) {
+export function synthDstPinAnn(letIx: i32, fnIx: i32, rootIx: i32) {
   if fnIx < 0 { return 0 }
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
@@ -1204,7 +1204,7 @@ export function synthDstPinAnn(letIx: i32, fnIx: i32) {
     // offset moved 191 -> 195). An UN-annotated result records nothing: an inferred
     // return is not a nominal claim, it is what D52's rung derives FROM the binding, and
     // recording -1 here would veto every ordinary cell in this row's own population.
-    return dstPinAnnIn(letIx, fn.fnBody, fn.fnRet)
+    return dstPinAnnIn(letIx, fn.fnBody, fn.fnRet, fnIx, rootIx)
   }
   0
 }
@@ -1218,11 +1218,13 @@ export function synthDstPinAnn(letIx: i32, fnIx: i32) {
 // a node the caller holds and the callee cannot derive. `fnStmts` has no row for the module
 // and `globalStmts` holds the BINDINGS, not the statement list the deliveries live in.
 //
-// THERE IS NO RESULT DESTINATION AT MODULE SCOPE, hence `-1`: the module does not return,
-// and its start function's result is synthesized rather than declared, so there is no
-// annotation to disagree with.
+// THERE IS NO RESULT DESTINATION AT MODULE SCOPE, hence the first `-1`: the module does
+// not return, and its start function's result is synthesized rather than declared, so
+// there is no annotation to disagree with. AND A GLOBAL IS RETURNED BY NOTHING, hence the
+// second: `dstPinCallerDests` is gated on the binding being some function's tail value,
+// and a top-level binding is not one, so there is no enclosing function to hand it.
 function synthGlobalDstPinAnn(letIx: i32, rootIx: i32) {
-  dstPinAnnIn(letIx, rootIx, -1)
+  dstPinAnnIn(letIx, rootIx, -1, -1, rootIx)
 }
 
 // The shared body of both entry points: pin `letIx`'s annotation from the destinations it
@@ -1230,7 +1232,13 @@ function synthGlobalDstPinAnn(letIx: i32, rootIx: i32) {
 // annotation (-1 where the scope has none). Split out for D139 — the two scopes differ in
 // nothing but those two arguments, and a copy would be the second place the disagreement
 // gate could drift.
-function dstPinAnnIn(letIx: i32, bodyIx: i32, retIx: i32) {
+function dstPinAnnIn(
+  letIx: i32,
+  bodyIx: i32,
+  retIx: i32,
+  fnIx: i32,
+  rootIx: i32,
+) {
   const s = P.nodes[letIx]
   if s is LetDecl {
     if s.letType >= 0 { return 0 }
@@ -1239,6 +1247,7 @@ function dstPinAnnIn(letIx: i32, bodyIx: i32, retIx: i32) {
     const dstT: i32[] = []
     if retIx >= 0 { dstPinRetDest(bodyIx, retIx, letIx, dstN, dstT) }
     dstPinScan(bodyIx, bodyIx, letIx, dstN, dstT)
+    dstPinCallerDests(letIx, fnIx, rootIx, dstN, dstT)
     if dstN.length == 0 { return 0 }
     const pinName = dstN[0]
     if pinName == "" { return 0 }
@@ -1265,6 +1274,74 @@ function dstPinAnnIn(letIx: i32, bodyIx: i32, retIx: i32) {
       if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
     }
     s.letType = pinTy
+  }
+  0
+}
+
+// THE CALL SITE IS A DESTINATION TOO, for a binding its function RETURNS
+// (silent-class-inventory D155). `function mkm() { const c = Map()  c["o"] = { r: 7 }
+// return c }` with `thru(mkm())` beside it has NO destination inside `mkm` at all — the
+// scan above collects nothing, `dstN.length == 0`, and the binding reaches the mv layer
+// un-annotated while its directly-bound sibling (D139's repro) reaches it pinned. The
+// deciding annotation exists and sits one scope out.
+//
+// THREE GATES, AND EACH ONE IS WHAT KEEPS THIS FROM BEING A WHOLE-PROGRAM SCAN PER
+// BINDING:
+//   · the enclosing function's result is UN-ANNOTATED — a declared result is the
+//     destination, already recorded by `dstPinRetDest`, and a caller must not overrule it;
+//   · the binding IS the value that function hands back (`retLocalLetOfBlock`, through an
+//     un-annotated alias chain, exactly as every other rung of this family reads it);
+//   · a scope is scanned only for a binding that passed both.
+//
+// EVERY CALLER SCOPE, NOT ONLY THE MODULE. `mkm` may be called from another function as
+// easily as from top level, and D155's own last control — "wrap the call site in a
+// function" — is silent at both, which is precisely what separates this row from D139
+// (whose function-scope sibling RAN). The scan is the same `dstPinScan`, with each scope
+// as its own `bodyIx`, so identifier resolution stays local to the scope being walked and
+// a same-named binding in the caller cannot be mistaken for this one: `letIx` is an arena
+// index, and `retLocalLetOfBlock(callerBody, ident)` answers with the CALLER's node.
+//
+// THE DISAGREEMENT GATE IS UNCHANGED AND DOES THE SAFETY WORK. Two call sites delivering
+// `mkm()` to two differently-annotated destinations push two names and the pin declines,
+// which is the same rule that already covers one binding delivered to two destinations
+// inside one body. Measured: `thru(mkm())` beside `thrud(x: {[string]: Dot})` is
+// check-clean invalid wasm at the SAME message and the SAME offset as master — untouched.
+//
+// AND THE COST IS MEASURED, NOT ASSUMED, because the shape of this scan is quadratic if the
+// gates ever stop biting: self-compiling `compiler/entry.vl` takes 10.6s with this and 10.9s
+// without it, i.e. inside the noise. The gates are why — a binding must be an un-annotated
+// function's tail value AND pass `armPinLitInit` before any other scope is walked.
+function dstPinCallerDests(
+  letIx: i32,
+  fnIx: i32,
+  rootIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  if fnIx < 0 { return 0 }
+  if rootIx < 0 { return 0 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return 0 }
+    const rx = fnRetExprOf(fnIx)
+    if rx < 0 { return 0 }
+    if retLocalLetOfBlock(fn.fnBody, rx) != letIx { return 0 }
+    let fe = 0
+    while fe < fnStmts.length {
+      const ofx = fnStmts[fe]
+      if ofx != fnIx {
+        const ofn = P.nodes[ofx]
+        if ofn is FuncDecl {
+          dstPinScan(ofn.fnBody, ofn.fnBody, letIx, outN, outT)
+        }
+      }
+      fe = fe + 1
+    }
+    // The MODULE's own statements, with the program node as the scope — the same shape
+    // `synthGlobalDstPinAnn` uses and for the same reason: `dstPinScan` skips a `FuncDecl`
+    // child, so the top-level walk sees the module's statements and no function's body
+    // twice.
+    dstPinScan(rootIx, rootIx, letIx, outN, outT)
   }
   0
 }
@@ -1437,8 +1514,48 @@ function dstPinSrcIsAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32) {
     if j >= 0 && j < n.callArgs.length {
       return dstPinSrcIsAt(bodyIx, n.callArgs[j], letIx, depth + 1)
     }
+    // AN ORDINARY CALL IS TRANSPARENT TO THE BINDING IT HANDS BACK
+    // (silent-class-inventory D155). `mkm()` is not an identity-forwarding generic and
+    // `dstPinFwdArg` is right to decline it, but the value it produces IS this binding:
+    // `mkm`'s result is un-annotated, so nothing in the callee restates the value's type
+    // and the only nominal claim on it is the one at the CALL SITE. Gated on the callee's
+    // result being un-annotated because a DECLARED result is its own destination — it is
+    // recorded by `dstPinRetDest` inside the callee and would be the annotation to
+    // disagree with, not a hop to see through.
+    if dstPinCalleeRetLet(u) == letIx { return true }
   }
   false
+}
+
+// The binding an ordinary UN-ANNOTATED callee hands back, or -1 (silent-class-inventory
+// D155). `retLocalLetOfBlock` is the same "which binding actually supplies this value"
+// lookup `dstPinSrcIsAt` and `synthRetPinAnn` make of a body's tail value, asked of the
+// CALLEE's body instead of the caller's — so an alias chain inside the callee is walked
+// by the same rule, and a callee whose tail value is anything but a binding answers -1.
+//
+// A DECLARED RESULT ANSWERS -1 rather than the binding. That case is not a hop: the
+// annotation IS the destination, `dstPinRetDest` already records it from inside the
+// callee, and reading through it would let a caller's annotation overrule a nominal
+// claim the callee makes about its own result.
+function dstPinCalleeRetLet(callIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cf = P.nodes[unwrapParen(c.callFn)]
+    if cf is Ident {
+      const cfe = fnIndexOf(cf.identName)
+      if cfe >= 0 && cfe < fnStmts.length {
+        const cix = fnStmts[cfe]
+        const cfn = P.nodes[cix]
+        if cfn is FuncDecl {
+          if cfn.fnRet >= 0 { return -1 }
+          const crx = fnRetExprOf(cix)
+          if crx < 0 { return -1 }
+          return retLocalLetOfBlock(cfn.fnBody, crx)
+        }
+      }
+    }
+  }
+  -1
 }
 
 // The argument position a CALL forwards its own value from, or -1: the callee's return
@@ -1713,7 +1830,7 @@ export function synthDstPinAnns(rootIx: i32) {
   while fe < fnStmts.length {
     const fnIx = fnStmts[fe]
     const fn = P.nodes[fnIx]
-    if fn is FuncDecl { dstPinSynthWalk(fn.fnBody, fn.fnBody, fnIx) }
+    if fn is FuncDecl { dstPinSynthWalk(fn.fnBody, fn.fnBody, fnIx, rootIx) }
     fe = fe + 1
   }
   // The module run walks `globalStmts` rather than the statement list, for the reason
@@ -1731,17 +1848,17 @@ export function synthDstPinAnns(rootIx: i32) {
 // Every `LetDecl` lexically inside one function body — nested `if` / loop blocks included,
 // since a wasm local is function-scoped, and NOT descending into a nested `FuncDecl`, which
 // has its own `fnStmts` row and is walked as its own body.
-function dstPinSynthWalk(ix: i32, bodyIx: i32, fnIx: i32) {
+function dstPinSynthWalk(ix: i32, bodyIx: i32, fnIx: i32, rootIx: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if ix != bodyIx {
     if n is FuncDecl { return 0 }
   }
-  if n is LetDecl { synthDstPinAnn(ix, fnIx) }
+  if n is LetDecl { synthDstPinAnn(ix, fnIx, rootIx) }
   const kids = nodeChildren(ix)
   let k = 0
   while k < kids.length {
-    dstPinSynthWalk(kids[k], bodyIx, fnIx)
+    dstPinSynthWalk(kids[k], bodyIx, fnIx, rootIx)
     k = k + 1
   }
   0
@@ -3266,7 +3383,13 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         synthEmptyListAnn(stmts[i])
         synthNullableAnn(stmts[i])
         synthRetPinAnn(stmts[i], fnIx)
-        synthDstPinAnn(stmts[i], fnIx)
+        // `-1` for the program root: the LATE run has no module scope to hand over and
+        // must not acquire one. It reaches the START function's blocks and the bodies
+        // monomorphization minted, both of which are already past the point where a
+        // caller's annotation could re-aim an instance's signature — which is the whole
+        // reason `synthDstPinAnns` runs before `monomorphize`. Every binding the
+        // pre-mono pass pinned is declined here by the `letType >= 0` guard on entry.
+        synthDstPinAnn(stmts[i], fnIx, -1)
         // Classify the init type BEFORE binding the name, then allocate a fresh slot and
         // bind `name → slot` so a LATER reference (or a shadowing inner `let`) resolves to
         // THIS slot. `slot` is the new slot's declared-local position.

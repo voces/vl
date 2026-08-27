@@ -101,7 +101,8 @@ and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the sa
 | D111 D117 | loud emit reject | **runs — CLOSED 2026-08-27** (below; TWO roots and THREE edits, and the ablation says so — one compiler per candidate over one 1,710-cell grid, all three pairwise intersections **0**. Both roots are a complement already written and never called at the sibling rung. D111 needs TWO of the edits and the ORDER is measured: `letAnnIsUninternedShape`'s D53 bridge ALONE moves 16 cells to `runs` and **8 BACKWARD to check-clean invalid wasm**, because the lifted guard makes the binding a struct local whose row disagrees with the pin `monoAnnPinName` mints — that ladder had a `{…}[]` ELEMENT rung and no BARE inline-shape rung, so the argument fell to the `"i32"` catch-all. Disassembled: with the guard alone the instance is `(func (param i32) (result i32))` and `mk` `return_call`s into it from a `(result (ref 0))` frame. The pin rung alone moves 8 (`ann2` x `global` x `gen`, a MODULE-SCOPE binding where the `LetDecl`-local guard never fires). **The union of the three singles' moved sets IS set-identical to the full branch's (8 + 24 + 40 = 72) — the composition is a DIRECTION, not a cell count**, and that is the thing a union check does not say on its own: the full branch disagrees with the guard-alone compiler on exactly the 8 cells that compiler sends to `invalid_wasm`, every one of them `ann1` x `local` x `gen`. D117: `recordElemRepArrayLit` sits ABOVE `assignableExpr`'s `assignable` short-circuit precisely because a niche-element literal is covariantly assignable, and it already descends into an ObjLit's FIELD values — the ARRAY destination never grew the matching ELEMENT-wise descent, so an inner `[null]` kept its self-inferred `null[]` and every niche seed in the null-rep table stayed empty. 40 cells, and it is the three NICHES only: `(i32 | null)[][]` and `(S | null)[][]` already ran. **72 of 1,710 cells moved, all `loud emit reject` → `runs`, 0 backward, 0 same-class MESSAGE moves, 0 `runs`→`runs` value moves.** The 9,450-cell D52 grid moves **196 more cells to `runs`, 0 backward**, and keeps its silent population at 0; the 3,144-cell D75/D81/D82 grid moves **0** cells and 0 messages, so the change is inert where it is not the answer. **Every number here is the RE-MEASUREMENT on merged master `e67347aa`** — all five ablation compilers rebuilt on that base, not carried over from `7b600b57`; #1960 moves none of these 1,710 cells, and stripping all three patches out of the merged tree reproduces `e67347aa` BYTE-IDENTICALLY, which is what says the three are the whole compiler delta) |
 | D123 D124 | check-clean invalid wasm | **runs — CLOSED 2026-08-27** (below; TWO roots and THREE edits, and an ABLATION says so where the resemblance could not — both rows are "one map layout, two mv slots", and their moved sets are disjoint on BOTH grids. D124's peel moves 49 of the 1,114 D112 cells and 0 of the 2,850 D88 cells; D123's pair moves 56 D88 cells and 0 D112 cells; pairwise intersection 0 each way and the union set-identical to the branch. **The ablation baseline is PROVEN rather than assumed**: stripping all three candidates out of the branch reproduces merged master `89d01c97` byte-for-byte at 1,452,441 bytes, and every number here is re-measured on that base with all five ablation compilers rebuilt on it — 0 cells differ from the pre-merge measurement, so #1962 moves none of this population. D124 is the rule already written in `nulRefMapValInnerOf`'s own header — a niche-nullable value shares its vals rep "and the heap dedup" with the non-null twin, and the mint honoured the first half while `repMapValSlotsTwin` keyed on an arena canon id that a `TyNullable` cannot share. **D123's TITLE AND REPRO ARE RE-FILED**: the filed mechanism (a missing `TyMap` rung in `shapeNominalOfTy`) explains none of its 100 cells — the mint never reaches a nominal question, `armTy=58 vrow=-1` — and the row's own witness turned out to be in the OTHER half of its population, now D139. What D123 is: `repMapValSlotsTwin`'s kind-1 arm asked D34's arm-identity PROXY for a question `rlSlotsLayoutTwin` answers directly one branch down, and then the value-row columns had to follow the merge through `mvCanonRepOf`. Comparator alone 8 cells, value-row read alone 0 (and 0 corpus bytes), together 56 — a COMPOSITION. The PAIRING axis is what sized the second rung: each cell passed alone and two in one file did not. 0 backward and 0 to a silent class on either grid; the 9,450-cell D52 and 3,144-cell D75/D81/D82 grids each move 0 and stay at 0 silent) |
 | D139 | check-clean invalid wasm | **runs — CLOSED 2026-08-27** (below; ONE root, ONE caller. The channel diagnosis is CONFIRMED and the row's guess about the fix is REFUTED: the deciding annotation is a context an existing carrier already delivers — D81's `synthDstPinAnns` — and that pass walked `fnStmts` only, so a MODULE-scope binding never reached it. Probed at the mint, the module-scope program and its running function-scope sibling intern the SAME two mv slots over the SAME two ref-list rows and emit byte-identical type sections; the one column that differs is `letMapShapeOf`'s input, `letType=37` against `letType=-1`. The two heaps stay two — merging them is still wrong and `rlSlotsLayoutTwin` still declines. **Its own 36-cell binding-storage-class grid moves 3 (1 silent → runs, 2 loud → runs), 0 backward**; the D88/D100 and D112 grids move **0**, which is the finding rather than a null result — every cell of both builds the map as a function LOCAL, so neither could ever see this row. D52 (9,450), D75/D81/D82 (3,144), D111/D117 (1,710) and D131 (1,732) all re-graded: 0 moved, 0 backward, 0 silent. **The ablation base is PROVEN**: stripping the change out of the branch reproduces `54780e0b` byte-for-byte at 1,452,568 bytes. THREE MORE CANDIDATES WERE BUILT AND MEASURED AND ARE NOT IN THE COMMIT — see D156) |
-| D155 D156 D157 D158 | check-clean invalid wasm | **NEW 2026-08-27** — D139's residue, split by MEASUREMENT rather than by resemblance: its filing lumped 44 D88 cells and 12 D112 cells under one row and the fix moves none of them. Four distinct channels, four runnable witnesses. D155 (the SPECIMEN) the map returned from a CALL; D156 a NESTED arm-valued map; D157 a std/generic CONDUIT between the binding and its destination; D158 the deciding annotation at the READ site |
+| D155 | check-clean invalid wasm | **runs — CLOSED 2026-08-27** (below; ONE root, and the channel is D139's with the destination one SCOPE out rather than one hop. `mkm`'s result is un-annotated, so `dstPinRetDest` never runs and the four legs find nothing inside `mkm`: probed, `DPA let=18 name=c ret=-1 n=0` — not a WRONG destination, NO destination. The fix is one rung (`dstPinCalleeRetLet`: an ordinary call to an UN-ANNOTATED callee is transparent to the binding it hands back) plus `dstPinCallerDests`, the same `dstPinScan` over every OTHER function body and the module, gated on the binding being its own function's tail value — a DECLARED result answers -1 and is not a hop. **Its own 36-cell grid moves 3, all forward (1 silent→runs, 2 loud→runs), 0 backward**, plus 1 same-class MESSAGE move that is D163 showing through. **All six earlier grids re-graded at 0**: D52 (9,450), D75/D81/D82 (3,144), D88/D100 (2,850), D111/D117 (1,710), D131 (1,732), D112 (1,114). **The ablation base is PROVEN**: stripping all three candidates reproduces `1559d80c` byte-for-byte at 1,452,766. TWO MORE CANDIDATES (C1, C2) WERE BUILT AND MEASURED AND ARE NOT IN THE COMMIT — see D157: together they make that row's pin fire with the right name and still move 0 cells) |
+| D156 D157 D158 D163 | check-clean invalid wasm | **NEW 2026-08-27** — D139's residue, split by MEASUREMENT rather than by resemblance: its filing lumped 44 D88 cells and 12 D112 cells under one row and the fix moved none of them. D156 a NESTED arm-valued map; D157 (the SPECIMEN) an element-preserving LIST conduit between the binding and its destination — RE-FILED with TWO roots, and "std" was the generator's spelling rather than the axis (a hand-written `rv<T>(xs: T[]): T[]` fails identically); D158 the deciding annotation at the READ site; **D163** the second root under D157 and the whole of 4 more cells — a LIST LITERAL keys its element row off the CHECKER's structural record, so an exact layout twin claims it through the struct table while the element expression's committed rep is the arm's |
 | D131 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **runs — CLOSED 2026-08-27** (below; TWO roots, and the ablation says so — 120 cells and 240 cells on one 1,732-cell confirmation grid, pairwise intersection **0**, union SET-IDENTICAL to the full branch's 360, and every one of the 360 moves to `runs`. **The axis the row's four controls did NOT separate is the RECEIVER's storage class**: a PARAM, a module GLOBAL and a CALL result as the receiver of the same field read all RUN on master, and only a LOCAL does not — `exprNullableStruct`'s Member arm already classifies a code-15 read as the `(ref null $S)` it is, but resolves the receiver through `structIndexOfExpr`, whose Ident arm reads `declaredStructIndex`, a table `buildLocals` fills long after the GLOBAL return pass. Root two is the row's own SECOND sentence and it is receiver-BLIND: the RETURN is a kind-9 use site and the only one that never grew the `ref.as_non_null` a field access, a call ARGUMENT, an annotated `let` initializer and a nested-struct field STORE all emit — its control has no field read at all (`function pick(p: Circle | null, d: Circle): Circle { if p != null { return p } return d }` is check-clean invalid wasm on master). The whole 24-cell D111/D117 residue closes, under root ONE alone. D52's 9,450 cells and D87's 3,144 move **0**; corpus 2,312 files, **2** differ and both are the fixtures this change adds) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
@@ -7562,7 +7563,7 @@ Repro:
 ---
 
 ### D155 — an arm-valued map that comes back from a CALL
-**check-clean invalid wasm · found 2026-08-27 in D139's closing residue, on the `bind=callres` level of that row's own grid · pre-existing on `54780e0b`, same message at the same offset · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-27 in D139's closing residue, on the `bind=callres` level of that row's own grid · pre-existing on `54780e0b` and on `1559d80c`, same message at the same offset · was THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, now swapped to D157**
 
 Repro:
 
@@ -7607,13 +7608,79 @@ Repro:
   THIS ROW FROM D139.** D139 was storage-class DEPENDENT (its function-scope sibling ran);
   this one is silent at BOTH scopes, so `scripts/silent-sweep/d139/`'s `bind` axis does not
   discriminate it and the axis that does is where the ANNOTATION sits.
-* **THE CHEAPEST NEXT PROBE** is whether `computeRetInference` already knows `mkm` returns a
-  `{[string]: Circle}` — i.e. whether this is another complement already written. If it does,
-  the pin needs a rung that reads an INFERRED result the way `dstPinRetDest` reads a declared
-  one; if it does not, the channel genuinely stops at the call.
-* Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-from-a-call-result.vl`,
-  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+* **THE CHEAPEST NEXT PROBE WAS NOT WHAT ANSWERED, AND THE PIN'S OWN DUMP WAS.** The row
+  proposed asking whether `computeRetInference` already knows `mkm` returns a
+  `{[string]: Circle}`. It does not need to. A compiler carrying a dump of every
+  `dstPinAnnIn` decision answered in one line on `1559d80c`:
 
+      D155 (the repro)               `function mk(n) { … return thru(c) }`, which RUNS
+      DPA let=18 name=c ret=-1 n=0    CA callee=thru j=0 pty=<{[string]:Circle}>
+                                                        pushed=<{[string]:Circle}>
+                                      DPA let=20 name=c ret=-1 n=1 [0]=<{[string]:Circle}>
+
+  `n=0` — not a WRONG destination, no destination AT ALL. `mkm`'s result is un-annotated, so
+  `dstPinRetDest` is never called (`retIx = -1`), and the four legs find nothing inside
+  `mkm`'s body because the only nominal claim in the program is at a call site in another
+  scope. The pin declines on `dstN.length == 0` and the binding reaches the mv layer bare.
+* **THE FIX — ONE RUNG AND ONE SCAN, both inside the pass that already carries this
+  context.** `dstPinSrcIsAt` grows a rung: an ordinary call to a callee whose result is
+  UN-ANNOTATED is transparent to the binding that callee hands back (`dstPinCalleeRetLet`,
+  which asks `retLocalLetOfBlock` of the CALLEE's body — the same "which binding actually
+  supplies this value" walk `synthRetPinAnn` and `dstPinSrcIsAt` already make of the
+  caller's). `dstPinCallerDests` then runs the SAME `dstPinScan` over every other function
+  body and over the module root, with each scope as its own `bodyIx` so identifier
+  resolution stays local to the scope being walked.
+  **THREE GATES KEEP IT FROM BEING A WHOLE-PROGRAM SCAN PER BINDING**: the enclosing
+  function's result must be un-annotated, the binding must BE that function's tail value, and
+  only a binding that passed both is scanned for elsewhere. A DECLARED result answers -1 and
+  is deliberately not a hop — it is the destination, `dstPinRetDest` already records it from
+  inside the callee, and a caller must not overrule a nominal claim the callee makes about
+  its own result.
+* **THE DISAGREEMENT GATE IS UNCHANGED AND IT IS THE SAFETY PROPERTY, measured rather than
+  argued.** `thru(mkm())` beside `thrud(x: {[string]: Dot})` pushes two names, the pin
+  declines, and the program is check-clean invalid wasm at the SAME message and the SAME
+  offset (1316) on `1559d80c` and on this tree — untouched, not "fixed differently".
+* **MEASURED, FOUR INSTRUMENTS, IN ORDER.** Corpus `cmp` FIRST — every one of the 2,316
+  `tests/cases/**.vl` modules built with both seeds and sha256-compared: **1 differs**, and
+  it is the `@run` fixture this change graduates (the new `@no-instantiate` specimen is
+  byte-identical on both sides, as it must be). Then the grids, then the message diffs, then
+  disassembly of the moved cells. `scripts/silent-sweep/d139/` moves **3 of 36, every one forward, 0 backward,
+  0 to a silent class**: `armtwin x mapval x none x callres` check-clean invalid wasm →
+  runs, `arm x mapval x none x callres` and `armdiff x mapval x none x callres` loud emit
+  reject → runs. There is also **1 same-class MESSAGE move**, at
+  `armtwin x mapval x std x callres` — the pin now fires there and D163 keeps the cell
+  silent, which is the "same class, different message" disguise caught by the instrument
+  rather than by the outcome count. **All six earlier grids re-graded and all six move 0
+  cells, 0 messages, 0 backward, 0 silent**: D52 (9,450), D75/D81/D82 (3,144),
+  D88/D100 (2,850), D111/D117 (1,710), D131 (1,732), D112 (1,114).
+* **THE ABLATION BASE IS PROVEN.** The single-candidate compilers are produced by STRIPPING
+  candidates out of the branch; stripping all three reproduces `1559d80c`'s
+  `compiler/emit_collect.vl` textually and compiles to **1,452,766 bytes byte-identical to
+  the base seed**, and the stripper's full build is byte-identical to the hand-built branch
+  (1,454,620). Per candidate, over the three grids that could see anything:
+
+  | candidate | D139 (36) | D88/D100 (2,850) | D112 (1,114) |
+  |---|---|---|---|
+  | A — the caller-destination scan + callee-return rung (this row) | **3 moved, 0 backward** (+1 message) | 0 | 0 |
+  | C1 — an open generic position is one whose spelling MENTIONS a type param (D157) | 0 | 0 | 0 |
+  | C2 — `dstPinSrcIs` crosses an indexed element-preserving conduit (D157) | 0 | 0 | 0 |
+  | C1 + C2 | 0 | 0 moved, **4 same-class MESSAGE moves** | 0 |
+  | A + C1 + C2 | 3 moved (+1 message) | 0 moved, 4 message moves | 0 |
+
+  Pairwise intersection **0** every way; A alone is set-identical to the composed branch on
+  the only grid that moves. **C1 and C2 are a COMPOSITION that still moves nothing** — each
+  alone changes not even a message, together they change four — and they are NOT in the
+  commit. See D157.
+* **THE SCAN'S COST IS MEASURED, NOT ASSUMED.** Its shape is quadratic if the three gates
+  ever stop biting, so it was timed on the largest program in the tree: self-compiling
+  `compiler/entry.vl` is **10.6s with the change and 10.9s without**, i.e. inside the noise.
+* **A LOUD FLOOR WAS NOT CONSIDERED AND DOES NOT APPLY**: two of the three moved cells were
+  ALREADY loud and moved to `runs`, so the `correct`-cells-lost number D93 records is 0 in
+  the good direction.
+* The old pin GRADUATED to `tests/cases/soundness/arm-valued-map-from-a-call-result.vl`,
+  `@run` + four `@log 7` (the former specimen verbatim, a read-back, the call site inside a
+  FUNCTION — the control that separated this row from D139 — and two AGREEING call sites).
+  The specimen is now D157's.
 ---
 
 ### D156 — a NESTED arm-valued map, and the naive peel that closes 70 cells and breaks 4
@@ -7685,8 +7752,8 @@ Repro:
 
 ---
 
-### D157 — a std or generic CONDUIT between the binding and its destination
-**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · 8 of the 44 surviving D88/D100 cells (`bare x std x retann` 2, `mapval x std` 6), plus 10 of D156's 36 that the peel does not reach — 8 `nestedmap x gen` it moves only as far as a DIFFERENT MESSAGE and 2 `nestedmap x std x retann` it does not move · pre-existing on `54780e0b`**
+### D157 — an element-preserving LIST CONDUIT between the binding and its destination
+**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · 4 of the 44 surviving D88/D100 cells (`bare x std x retann` 2, `mapval x std x retann` 2) · pre-existing on `54780e0b` and on `1559d80c` · RE-FILED 2026-08-27: TWO ROOTS, and the four cells the row also claimed at `mapval x std x {param,paramlocal}` are D163's alone · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
 
 Repro:
 
@@ -7707,21 +7774,158 @@ Repro:
   is filed apart from D155/D156 even though it shares their grid coordinate. Delete the
   `reverse(...)` and `return c` runs: the destination is the declared result `: Circle` and
   `dstPinRetDest` finds it.
-* **THE CONDUIT IS THE WHOLE OF IT.** `dstPinSrcIs` recognises exactly one transparent hop —
-  `dstPinFwdArg`, a callee whose result annotation names one of its own type parameters and
-  that has a parameter annotated with the same one. `reverse([c])[0]` is an `Index` over a
-  `Call` over an `ArrayLit`, and `dstPinPushAnn`'s ArrayLit arm looks at the delivered
-  expression, not through an index into a call's result.
-* **THE GENERIC HALF IS THE SAME ROW ONE STEP ON.** With B1+B2 applied, the 8
-  `nestedmap x gen x {param,paramlocal}` cells stop being unmoved and become **the same class
-  with a different message** — the failing function moves from `mk` to the monomorphized
-  instance. That is the "same class, different message" disguise, and it says the pin now
-  fires and the CLONE is off the un-pinned row. `synthDstPinAnns` runs before `monomorphize`
-  exactly so this cannot happen, so the remaining hop is that the conduit's own body is not
-  re-pinned.
-* Not pinned as a fixture: D155 holds the corpus pin for the class and a second
-  `@no-instantiate` file would add nothing the tripwire does not already assert.
+* **THE TITLE IS RE-FILED: "std" WAS THE GENERATOR'S SPELLING, NOT THE AXIS.** A HAND-WRITTEN
+  `function rv<T>(xs: T[]): T[] { return xs }` in place of `reverse` — nine lines, NO import —
+  fails identically. What the conduit has to be is ELEMENT-PRESERVING: a callee whose result
+  annotation is spelled exactly as one of its parameters' and whose spelling mentions a type
+  parameter, read back with an index. The D88 grid's `route=gen` level spells its conduit
+  `idg(x)` (a WHOLE-value hop, which `dstPinFwdArg` already crosses), which is why no `gen`
+  cell is in this row's population and why the axis reads as "std" from that grid alone.
+* **EIGHT CONTROLS, BUILT AND RUN, IDENTICAL ON `1559d80c` AND ON THIS TREE:**
 
+  | change to the repro | outcome |
+  |---|---|
+  | (none — the repro as filed) | check-clean invalid wasm |
+  | `return c` (delete the conduit) | **RUNS** |
+  | annotate `const c: Circle` | **RUNS** |
+  | delete `type Dot` | **RUNS** |
+  | `type Dot = { q: i32 }` (a non-twin) | **RUNS** |
+  | delete `type Shape = Circle \| Sq` | **RUNS** |
+  | a hand-written `rv<T>(xs: T[]): T[]` conduit | check-clean invalid wasm |
+  | bind the list first: `const xs: Circle[] = [c]` | **RUNS** |
+
+  The EXACT LAYOUT TWIN is required (controls 4 and 5 both RUN — the opposite of D139/D155,
+  where both twin-free spellings were LOUD), and **the last control is the one that names the
+  SECOND root**: annotating the LIST makes it run, so what the emitter is missing is the list
+  literal's element row, not only the pin.
+* **ROOT ONE — THE PIN. TWO HALVES, BOTH BUILT, AND THEY ARE A COMPOSITION.**
+  * **C1** — `dstPinCallArgs` treats a parameter as an open generic position only when its
+    spelling IS a type parameter (`dstPinIsTyParam`). `reverse`'s `xs: T[]` therefore read as
+    a CONCRETE destination: `armPinAnnName("T[]")` cuts the element `T`, `variantIndexOf("T")`
+    declines, and the position pushed `""` — a destination DISAGREEMENT that VETOED the pin
+    the declared result was carrying. The rule the narrow test was reaching for is the one
+    that leg's own header states, and `monoAnnHasTyParam` is the monomorphizer's own
+    predicate for it.
+  * **C2** — `dstPinSrcIs` recognises exactly one transparent hop (`dstPinFwdArg`, a
+    whole-VALUE identity conduit). `reverse([c])[0]` is an `Index` over a `Call` over an
+    `ArrayLit`, and `dstPinPushAnn`'s ArrayLit arm looks at the delivered expression, not
+    through an index into a call's result. Widening `dstPinFwdArg` to `T[] -> T[]` would be
+    WRONG — it would claim a `Circle` destination for a `Circle[]` value — so the element hop
+    needs its own predicate (`dstPinElemFwdArg`) that only an `Index` may consume.
+* **THE PROBE THAT SAID SO, verbatim** (a compiler carrying a dump of every `dstPinAnnIn`
+  decision and of every `dstPinCallArgs` push; the repro on `1559d80c` and on C1+C2):
+
+      1559d80c   CA callee=reverse j=0 pty=<T[]> pushed=<>
+                 DPA let=913 name=c ret=909 n=1 [0]=<>          <- a VETO, not a miss
+      C1 + C2    DPA let=913 name=c ret=909 n=1 [0]=<Circle>    <- the pin fires, correctly
+
+* **ROOT TWO IS D163, AND IT IS WHY C1+C2 MOVE ZERO CELLS.** Disassembled on the A+C1+C2
+  compiler (the type indices below are that build's, 2,239 bytes) with the pin firing,
+  `mk$m0` builds `struct.new 1` (the `Circle` variant heap) into local 2 declared `(ref 1)` —
+  correct — and then `array.new_fixed 8 1` into type 8, `(array (mut (ref null 0)))`, the
+  `Dot` struct heap. The list literal's ELEMENT ROW still comes from the checker's structural
+  record. Against the hand-annotated sibling (`const c: Circle`) built by the SAME compiler,
+  which RUNS, the two modules are the same size and differ in exactly TWO LINES: type 8's
+  element and one local in `reverse$m0`. That is D163.
+* **MEASURED PER CANDIDATE, ON THE PROVEN BASE** (stripping every candidate reproduces
+  `1559d80c` byte-for-byte at 1,452,766):
+
+  | candidate | D139 (36) | D88/D100 (2,850) | D112 (1,114) |
+  |---|---|---|---|
+  | C1 alone | 0 moved, 0 messages | 0 moved, 0 messages | 0 |
+  | C2 alone | 0 moved, 0 messages | 0 moved, 0 messages | 0 |
+  | C1 + C2 | 0 moved, 0 messages | 0 moved, **4 same-class MESSAGE moves** | 0 moved, 0 messages |
+
+  The four are `armtwin x declname x {bare,mapval} x std x retann x ann0 x {norm,rev}` — this
+  row's own population, exactly. **NEITHER HALF ALONE CHANGES EVEN A MESSAGE**: C1 lifts the
+  veto but leaves no destination to collect, C2 finds the destination but the veto still kills
+  it. A composition, and its composed effect is still 0 cells.
+* **C1 AND C2 ARE NOT IN THE TREE**, for D156's reason and by its precedent: a candidate that
+  moves 0 cells and changes 4 messages is not a fix, and shipping it would spend ~90 lines and
+  five changed diagnostics for nothing measurable. They are recorded here so they are not
+  re-derived: C1 is one line (`dstPinIsTyParam` → `monoAnnHasTyParam` in `dstPinCallArgs`'s
+  `open` test, plus the import); C2 is an `Index` arm in `dstPinSrcIsAt` plus
+  `dstPinElemFwdArg` / `dstPinElemIsAt`. **LAND THEM WITH D163, NOT BEFORE IT.**
+* **THE ROW'S OWN THIRD BULLET IS REFUTED.** It said that with the (D156) peel applied, the 8
+  `nestedmap x gen x {param,paramlocal}` cells "become the same class with a different
+  message", and claimed them plus 2 `nestedmap x std x retann` as this row's residue. Measured
+  here, C1+C2 move NOTHING on any `nestedmap` cell and 0 messages there; the `nestedmap`
+  population is D156's, and the 4 `mapval x std x {param,paramlocal}` cells this row also
+  claimed are D163's alone — the pin ALREADY fires for them on `1559d80c`
+  (`DPA let=917 name=c ret=-1 n=1 [0]=<{[string]:Circle}>`), so no conduit rung can be their
+  answer.
+* Pinned as `tests/cases/soundness/xfail-miscompile-arm-literal-through-a-list-conduit.vl`,
+  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+
+---
+
+### D163 — a LIST LITERAL keys its element row off the checker's shape, not off the element's committed rep
+**check-clean invalid wasm · found 2026-08-27 measuring D157 · 4 of the 44 surviving D88/D100 cells (`armtwin x declname x mapval x std x {param,paramlocal} x ann0 x {norm,rev}`), and the second root under all 4 of D157's · pre-existing on `54780e0b` and on `1559d80c`**
+
+Repro:
+
+    import { reverse } from "std:array"
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function thru(x: {[string]: Circle}) { return x }
+    function mk(n: i32) {
+      const c = Map()
+      c["k"] = { r: n }
+      return reverse([thru(c)])[0]
+    }
+    print(((mk(7))["k"] ?? { r: 0 }).r)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE PIN IS NOT THE PROBLEM HERE AND THE DUMP SAYS SO.** On `1559d80c`, un-patched, the
+  destination pin already fires for `c` and already picks the right spelling:
+  `CA callee=thru j=0 pty=<{[string]:Circle}> pushed=<{[string]:Circle}>` then
+  `DPA let=917 name=c ret=-1 n=1 [0]=<{[string]:Circle}>`. The binding is annotated and the
+  program is still check-clean invalid wasm — which is what separates this row from D157,
+  whose pin is vetoed.
+* **THE FAILING INSTRUCTION, DISASSEMBLED** (`wasm-tools validate`: `func 15 failed to
+  validate … at offset 0x67a`; the module is 3,644 bytes, built with `--no-validate` on the
+  `1559d80c` seed — the offset and every type index below are that seed's):
+
+      (;@67a ;) array.new_fixed 12 1        <- the one-element list `[thru(c)]`
+
+      (type (;9;)  (array (mut (ref null 1))))   1 = Circle's VARIANT heap
+      (type (;11;) (array (mut (ref null 0))))   0 = Dot's STRUCT heap
+      (type (;21;) (struct (field … (ref 9)) …)) the Circle-valued map struct
+      (type (;22;) (struct (field … (ref 11)) …)) the Dot-valued map struct
+      (type (;12;) (array (mut (ref null 22))))  the LIST the literal builds
+      (func (;14;) … (result (ref 21)))          thru$m0 returns the Circle-valued map
+
+  `array.new_fixed 12 1` pushes a `(ref 21)` into an `array (mut (ref null 22))`. One map
+  layout, two mv slots again — but the disagreement is between the LIST LITERAL's element row
+  and the element EXPRESSION's committed rep, one container further out than D123's.
+* **THE MECHANISM.** `arrLitElemName` names a literal's element row from its FIRST element
+  when that element is an object or list literal, and otherwise from the checker's recorded
+  `TyArray.aElem` (`arrLitNominalElemName` → `shapeNominalOfTy`, or `arrLitMapElemName`).
+  That record is a STRUCTURAL shape, and `shapeNominalOfTy` asks the struct table before the
+  variant table — so with an exact layout twin declared it answers `Dot`, exactly the two
+  nominal claimants D39 filed, at the list-element position. The element expression's own
+  committed rep — a pinned binding's `letType`, or a callee's declared parameter/result — is
+  never consulted.
+* **IT IS D39's CHANNEL PROBLEM AT A REP-INTERNING KEY, WHICH IS WHY IT IS NOT A PIN.** The
+  three sites that must agree per slot say so in their own headers: `arrLitElemName` (the
+  key), `arrLitElemKind` (the wrapper) and `arrLitElemHintTy` (the row) are "one home for the
+  rule … the two must agree per slot", and `arrLitElemHintTy`'s nominal arm DECLINES on
+  purpose ("a declined hint is a parse, a wrong hint is a silently wrong rep key"). Any fix
+  here is a rep-key change and takes `scripts/rep-fuzz-check.sh` with it.
+* **THE CONTROL THAT ISOLATES IT**: bind the list to an annotated local first
+  (`const xs: Circle[] = [c]` / `const xs: {[string]: Circle}[] = [thru(c)]`) and it RUNS —
+  the source annotation gives the CHECKER the element type, so the same code path answers
+  correctly. The pin cannot do that: it is an emit-time synthesis, and `nodeTyIx` is written
+  by the checker and has no emit-side writer.
+* **WHY IT IS FILED SEPARATELY FROM D157** rather than as its second bullet: it has a
+  MASTER-reproducible witness of its own (above) in which no pin is missing, it gates 4 cells
+  D157 does not, and its fix is in a different file at a different layer (`emit_classify`'s
+  ref-list keying, not `emit_collect`'s pin).
+* Not pinned as a fixture: D157 holds the corpus pin for the class and a second
+  `@no-instantiate` file would add nothing the tripwire does not already assert.
 ---
 
 ### D158 — the deciding annotation is at the READ site, not at any delivery
