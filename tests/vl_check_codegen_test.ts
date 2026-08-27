@@ -425,6 +425,50 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-anon-objlit-into-arm-typed-global.vl` per the
 // REFILLS procedure below, in the same commit that swapped this constant.
 //
+// THAT D81 SPECIMEN IS CLOSED, together with D75 and D82, and the ablation splits the three
+// filed rows into FOUR roots rather than three. One compiler per candidate, all swept over
+// one 3,144-cell grid: the monomorphizer's variant pin moves 276 cells and closes D75 and
+// D82 TOGETHER (one rung, two rows), while D81's destination channel is THREE separate legs
+// moving 36 / 36 / 108. All six pairwise intersections are EMPTY and the union of the
+// singles is set-identical to the composed branch's 456 — so no leg closes another's cells
+// and, unlike D39/D40/D41, no cell needs two patches. 456 moved, every one FORWARD, and the
+// grid's check-clean-invalid-wasm count goes 264 -> 0.
+//
+// D81 IS STILL THE EXCEPTION IT CLAIMED TO BE, and D75/D82 are still the rule. D75's
+// complement was already written — `exprVariantIndex` is `structIndexOfExpr`'s storage-class
+// twin arm for arm and `monoArgTyName` simply never asked it — which makes it the ninth rung
+// of this family to close on an un-called call. D81 had no such predicate: an anonymous
+// `{ r: n }` has two nominal claimants, neither scan is wrong, and only the DESTINATION's
+// annotation separates them, so the annotation had to be carried. Its one new fact is the
+// PASS ORDER: the carry has to happen BEFORE monomorphization, because a hand-written
+// generic between the literal and its destination is otherwise cloned off the very row the
+// un-annotated literal resolved to, and by `collectLocals` time the instance's signature is
+// already wrong. 30 grid cells separated the late position from the early one.
+//
+// THE SUCCESSOR IS NOT THIS CHANGE'S RESIDUE — this change has none, and that is exactly the
+// state the note below warns about. It came from RE-RUNNING AN OLDER GRID: D52's own
+// 9,450-cell population, which master `8bf0f20f` grades at 212 silent where #1951 reported
+// 116. The extra 96 are one family, `cont=mapval`, and they are a REGRESSION with a bisect:
+// they RAN on `6ac49ac9` (seed rebuilt from that commit's own sources, 1,437,150 bytes,
+// reproducing the size that PR reported) and are check-clean invalid wasm on `2ea654d2`
+// (1,437,704 bytes) and every commit since. #1952's own 770-cell grid had no map-valued
+// container, so it could not see them. It is `silent-class-inventory.md` D87.
+//
+// Its axis is one line: DELETE `Dot` and the same program is a LOUD `only i32, i64, f64,
+// f32, boolean, struct, union, array, or string parameters are supported`. ANNOTATE the map
+// local and it is a DIFFERENT loud floor (`unsupported map value type …`), so it is not the
+// annotated-map path. Re-RUN against this tree at the swap rather than inherited: `vl check`
+// rc 0 with NO diagnostics at all — not even a hint — `--codegen` rc 1 with `not valid wasm`
+// + `type mismatch: expected (ref $type), found (ref $type)`, and NO `emit error` marker.
+// Pinned as
+// `tests/cases/soundness/xfail-miscompile-arm-valued-map-local-into-map-param.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
+// AND IT ADDS A SIXTH SOURCE TO THE LIST BELOW, earned rather than guessed: when a closing
+// change leaves NO residue, re-grade an EARLIER change's grid against today's master. The
+// inventory grades only the rows someone filed, and a grid grades only the axes it varied —
+// but an old grid re-run is a population large enough to catch what a new one held constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -465,14 +509,13 @@ const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
-  `let gsto: Circle = { r: 0 }\n` +
+  `function thru(x: {[string]: Circle}) { return x }\n` +
   `function mk(n: i32) {\n` +
-  `  const c = { r: n }\n` +
-  `  gsto = c\n` +
-  `  return n\n` +
+  `  const c = Map()\n` +
+  `  c["k"] = { r: n }\n` +
+  `  return thru(c)\n` +
   `}\n` +
-  `mk(7)\n` +
-  `print((gsto).r)\n`;
+  `print(((mk(7))["k"] ?? { r: 0 }).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.

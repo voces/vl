@@ -125,6 +125,7 @@ import {
   WhileStmt,
   annTsOf,
   i32ToStr,
+  nodeChildren,
   tsKind,
 } from "./ast"
 import {
@@ -162,6 +163,7 @@ import {
   nulLitUnionInnerName,
   nullablePartOf,
   parenUnionArrElemName,
+  parentLetOf,
   retBoolFlag,
   shapeInnerFieldSplit,
   strContains,
@@ -397,6 +399,7 @@ import {
   fieldRefElemName,
   fieldTypeCode,
   fieldValueFeOf,
+  fnIndexOf,
   fnIndexOfSid,
   fnRetExprOf,
   fnReturnsClosure,
@@ -413,6 +416,7 @@ import {
   funcTypeShapeLowerable,
   gaeEnsure,
   genTyParamArr,
+  globalLetOf,
   ifExprNliName,
   internInlineShapeTy,
   internShapeAs,
@@ -970,6 +974,45 @@ export function synthNullableAnn(letIx: i32) {
   0
 }
 
+// THE ONE HOME for "does this type ANNOTATION name a concrete union ARM a literal must be
+// pinned onto" — the gate `synthRetPinAnn` was written with, and `synthDstPinAnn` re-reads
+// it for two more destinations. A bare arm (`Circle`) or a ref-list OF one (`Circle[]`);
+// "" for everything else, which is the whole of "this seam does not apply".
+//
+// `retVariantFlag` is the predicate a variant PARAM/RESULT cell is emitted from (its own
+// header: "feeds the `kind == 8` (concrete variant struct ref) branch of `pushVT`"), so
+// gating on it is the same agreement-by-construction rule `fnRetVariantIndexSid` states:
+// the pin fires exactly where the destination's own cell is the unboxed variant ref.
+function armPinAnnName(tyIx: i32) {
+  if tyIx < 0 { return "" }
+  if retVariantFlag(tyIx) == 1 { return tyNameOf(tyIx) }
+  if retRefArrFlag(tyIx) == 1 {
+    const rae = retRefArrElemName(tyIx)
+    if rae != "" {
+      if variantIndexOf(rae) >= 0 { return tyNameOf(tyIx) }
+    }
+  }
+  ""
+}
+
+// A LITERAL producer, bare or one list deep — the second half of the shared gate, for the
+// reason `synthRetPinAnn`'s header gives: an object literal's row is chosen by a field-set
+// SCAN, so it is the one producer an annotation may re-aim without contradicting a decision
+// made elsewhere. A local initialized from a CALL, an IDENT or a param already carries its
+// producer's committed rep, and re-pinning it would move a value rather than name it.
+function armPinLitInit(initIx: i32) {
+  if initIx < 0 { return false }
+  const iv = P.nodes[unwrapParen(initIx)]
+  if iv is ObjLit { return true }
+  if iv is ArrayLit {
+    if iv.arrElems.length >= 1 {
+      const e0 = P.nodes[unwrapParen(iv.arrElems[0])]
+      if e0 is ObjLit { return true }
+    }
+  }
+  false
+}
+
 // SYNTHESIZE the RETURN ANNOTATION onto an un-annotated local that IS the function's
 // returned value and whose initializer is an anonymous object literal — the third member of
 // the `synthEmptyListAnn` / `synthNullableAnn` family, here for the reason their headers
@@ -1023,15 +1066,10 @@ export function synthRetPinAnn(letIx: i32, fnIx: i32) {
     if fn is FuncDecl {
       if fn.fnRet < 0 { return 0 }
       // THE GATE: a concrete-variant return, bare or as a ref-list element. Anything else
-      // either bridges structurally already or is not this seam.
-      let pinName = ""
-      if retVariantFlag(fn.fnRet) == 1 { pinName = tyNameOf(fn.fnRet) }
-      if retRefArrFlag(fn.fnRet) == 1 {
-        const rae = retRefArrElemName(fn.fnRet)
-        if rae != "" {
-          if variantIndexOf(rae) >= 0 { pinName = tyNameOf(fn.fnRet) }
-        }
-      }
+      // either bridges structurally already or is not this seam. `armPinAnnName` is the
+      // one home for it, shared with `synthDstPinAnn` below — the two syntheses differ in
+      // WHICH annotation they read, never in which annotations qualify.
+      const pinName = armPinAnnName(fn.fnRet)
       if pinName == "" { return 0 }
       // THE RETURNED LOCAL: the function's tail value (or its first valued `return`) is a
       // bare ident that resolves — through an UN-ANNOTATED alias chain — to THIS binding.
@@ -1045,16 +1083,7 @@ export function synthRetPinAnn(letIx: i32, fnIx: i32) {
       if rx < 0 { return 0 }
       if retLocalLetOfBlock(fn.fnBody, rx) != letIx { return 0 }
       // A LITERAL producer, bare or one list deep.
-      const iv = P.nodes[unwrapParen(s.letInit)]
-      let lit = false
-      if iv is ObjLit { lit = true }
-      if iv is ArrayLit {
-        if iv.arrElems.length >= 1 {
-          const e0 = P.nodes[unwrapParen(iv.arrElems[0])]
-          if e0 is ObjLit { lit = true }
-        }
-      }
-      if !lit { return 0 }
+      if !armPinLitInit(s.letInit) { return 0 }
       const pinTy = synthTypeRefTy(pinName, -1, nodeTyIxOf(fn.fnRet))
       // The ref-list ROW, banked on the new node at its mint — this synthesis postdates
       // the last `collectA` run, exactly as `synthEmptyListAnn`'s does, so the intern
@@ -1065,6 +1094,449 @@ export function synthRetPinAnn(letIx: i32, fnIx: i32) {
       if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
       s.letType = pinTy
     }
+  }
+  0
+}
+
+// SYNTHESIZE THE DESTINATION'S ANNOTATION onto an un-annotated local whose initializer is
+// an anonymous object literal — `synthRetPinAnn`'s sibling at the destinations a `return`
+// is not (silent-class-inventory D81).
+//
+// THE DEFECT. Twelve lines, no import, no generic, no lambda, no list:
+//
+//     type Circle = { r: i32 }   type Sq = { s: i32 }
+//     type Shape = Circle | Sq   type Dot = { r: i32 }
+//     let gsto: Circle = { r: 0 }
+//     function mk(n: i32) { const c = { r: n }  gsto = c  return n }
+//     mk(7)   print((gsto).r)
+//
+// `vl check` rc 0 with one redundant-annotation HINT and no error, and a module the engine
+// refuses: `type mismatch: expected (ref $type), found (ref $type)`.
+//
+// IT IS D39'S CHANNEL PROBLEM AND THE ANSWER IS THE SAME ONE. An anonymous `{ r: n }` has
+// TWO nominal claimants — `structIndexOfObj` scans the STRUCT table by field set and finds
+// `Dot`, `objVariantName` scans the VARIANT table and finds `Circle` — and NEITHER SCAN IS
+// WRONG: delete `Dot` and the same program is a LOUD `ref valtype with no interned shape`,
+// delete the union and it RUNS on `Dot`'s row. So this cannot be fixed by reordering the
+// ladder and it cannot be fixed by finding an un-called complement; only the CONTEXT
+// separates the two claimants, and the context is an annotation the literal never sees.
+// That is the one exception the eight preceding rungs of this family did not need, and
+// `synthRetPinAnn`'s header states the test it is recognised by.
+//
+// FOUR DESTINATIONS, NOT TWO, AND THE ROW ONLY HAD THE TWO ITS GRID VARIED. D81 filed the
+// module GLOBAL (48 cells) and the callee PARAM (40) because the D52 grid's `cons` axis
+// had exactly those two levels. Measured on the same master seed, an ANNOTATED LOCAL is
+// the same sentence at the same class in both its spellings — `const o: Circle = c` and
+// `let o: Circle = { r: 0 }` … `o = c`. All four are one question asked of one node kind
+// or the other, so they are one scan:
+//
+//     gsto = c            a module GLOBAL assignment      -> the global's `letType`
+//     thru(c)             a callee PARAM                  -> that parameter's `parType`
+//     const o: Circle = c an annotated LOCAL binding      -> the binding's `letType`
+//     o = c               an annotated LOCAL assignment   -> that binding's `letType`
+//
+// A STRUCT FIELD is NOT among them and that is measured, not assumed: `const b: Box = { c: c }`
+// over `type Box = { c: Circle }` is the LOUD `only i32 / boolean / string / array struct
+// fields are supported` on master — a different floor, a different row, and re-aiming the
+// literal would not reach it.
+//
+// EVERY DESTINATION MUST AGREE, WHICH IS THE SAFETY PROPERTY. VL is structurally typed, so
+// one `{ r: n }` may legally be delivered to a `Circle` global AND to a `Dot`-annotated
+// parameter; pinning either spelling would break the other. The scan therefore collects
+// EVERY delivery of the binding and declines unless all of them name the same arm — a
+// destination whose annotation is a plain struct answers "" through `armPinAnnName` and so
+// disagrees by construction. A binding with no delivery at all is left exactly as master
+// has it.
+//
+// SCOPED TO THE STRUCT/VARIANT SEAM, the same scoping `synthRetPinAnn` carries and for the
+// same reason: two DECLARED structs of one layout merge at the heap layer (`sTwin`), so a
+// `: Dot` destination over a literal that resolved to a same-shape row runs today; a union
+// ARM does not merge with a struct row and must not, because `DECISIONS.md` records that
+// seam as NOMINAL. `armPinAnnName` is that gate, shared with `synthRetPinAnn` so the two
+// syntheses cannot drift about which annotations qualify.
+//
+// Returns 0 always; the mutation is `s.letType`, in place — the family's contract.
+export function synthDstPinAnn(letIx: i32, fnIx: i32) {
+  if fnIx < 0 { return 0 }
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 { return 0 }
+    if !armPinLitInit(s.letInit) { return 0 }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const dstN: string[] = []
+      const dstT: i32[] = []
+      dstPinScan(fn.fnBody, fn.fnBody, letIx, dstN, dstT)
+      if dstN.length == 0 { return 0 }
+      const pinName = dstN[0]
+      if pinName == "" { return 0 }
+      let i = 1
+      while i < dstN.length {
+        if dstN[i] != pinName { return 0 }
+        i = i + 1
+      }
+      // The annotation's OWN recorded type is handed over rather than re-resolved from the
+      // spelling (`emit_rewrite`'s rule, and `synthRetPinAnn`'s): the spelling denotes
+      // exactly the type being handed, and `nameToTy` does not hash-cons, so a re-parse
+      // would mint a structurally duplicate arena row. `-1` is the ELEMENT pin, where the
+      // spelling is a CUT of the destination's annotation rather than the annotation
+      // itself — `synthTypeRefTy(n, p, -1)` is exactly `synthTypeRef`, its own header.
+      let pinTyIx = -1
+      if dstT[0] >= 0 { pinTyIx = nodeTyIxOf(dstT[0]) }
+      const pinTy = synthTypeRefTy(pinName, -1, pinTyIx)
+      // The ref-list ROW for a `Circle[]` destination, banked at the mint for the reason
+      // `synthRetPinAnn` banks its own: this synthesis postdates the last `collectA` run,
+      // so the intern pass cannot cover the node, and the row must be the one the
+      // DESTINATION's annotation already interned or the two wrappers are two slots.
+      if dstT[0] >= 0 {
+        const pinSlot = tyAnnRefListSlot(dstT[0])
+        if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
+      }
+      s.letType = pinTy
+    }
+  }
+  0
+}
+
+// Collect, into the parallel `outN` / `outT`, the pin NAME every destination inside `ix`
+// demands of the binding at `letIx`, and the annotation node to source its recorded type
+// from (-1 = mint from the name). `bodyIx` is the enclosing function body — the scope
+// identifier chains resolve in, and the recursion's root.
+//
+// A destination that carries NO nominal claim pushes `""`, which the caller reads as a
+// DISAGREEMENT and declines on. That is the conservative direction on purpose: VL is
+// structurally typed, so one `{ r: n }` may legally reach a `Circle` global and a
+// `Dot`-annotated parameter, and pinning either spelling would break the other.
+//
+// IT DOES NOT DESCEND INTO A NESTED `FuncDecl`. `parentLetOf` resolves against `bodyIx`, so
+// an identifier inside a nested function that SHADOWS the outer binding would resolve to
+// the outer one and register a delivery that does not exist. The cost is that a delivery
+// made from inside a lambda is not seen; the alternative is a false pin, and this family's
+// standing rule is that the coarse direction must be the safe one (`monoNameIsAssigned`).
+//
+// `nodeChildren` is `ast.vl`'s one home for "the child arena indices of this node", which
+// is what makes the walk total: a node kind added to the AST is covered here the moment it
+// is covered there, rather than being silently skipped by a hand-written child set.
+function dstPinScan(
+  ix: i32,
+  bodyIx: i32,
+  letIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if ix != bodyIx {
+    if n is FuncDecl { return 0 }
+  }
+  // THREE LEGS, THREE FUNCTIONS, and the split is what the ablation is run over: each was
+  // built as its own compiler and swept against one grid, so "these are one root" is a
+  // measurement here rather than a resemblance (the D39/D40/D41 precedent is that a
+  // resemblance in this family is refuted as often as confirmed). The measurement says
+  // they are THREE: the three moved sets are pairwise disjoint and their union is the
+  // composed branch's exactly, so no leg closes another's cells and no cell needs two.
+  dstPinGlobalAssign(ix, bodyIx, letIx, outN, outT)
+  dstPinLocalDest(ix, bodyIx, letIx, outN, outT)
+  dstPinCallArgs(ix, bodyIx, letIx, outN, outT)
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    dstPinScan(kids[k], bodyIx, letIx, outN, outT)
+    k = k + 1
+  }
+  0
+}
+
+// Record what the destination annotated `annIx` demands of `letIx`, given that `srcExpr`
+// is the expression delivered to it. Nothing is recorded unless the binding actually
+// reaches this destination — a destination fed by something else is not this binding's
+// business and must not veto its pin.
+//
+// TWO DELIVERY SHAPES, and the second is why this is a function rather than a push. A
+// WHOLE-VALUE delivery (`gsto = c`) wants the destination's own spelling. An ELEMENT
+// delivery (`const xs: Circle[] = [c]`) wants the ELEMENT's: the binding holds the element
+// and the LIST is built at the destination, so pinning `Circle[]` onto a local holding one
+// object would be a different program. `retRefArrElemName` is the cut, gated on the
+// element actually naming an arm — which is `armPinAnnName`'s own ref-list rung, asked for
+// the element instead of the container.
+function dstPinPushAnn(
+  annIx: i32,
+  srcExpr: i32,
+  bodyIx: i32,
+  letIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  if srcExpr < 0 { return 0 }
+  if dstPinSrcIs(bodyIx, srcExpr, letIx) {
+    outN.push(armPinAnnName(annIx))
+    outT.push(annIx)
+    return 0
+  }
+  const av = P.nodes[unwrapParen(srcExpr)]
+  if av is ArrayLit {
+    let i = 0
+    while i < av.arrElems.length {
+      if dstPinSrcIs(bodyIx, av.arrElems[i], letIx) {
+        let en = ""
+        if retRefArrFlag(annIx) == 1 {
+          const rae = retRefArrElemName(annIx)
+          if rae != "" {
+            if variantIndexOf(rae) >= 0 { en = rae }
+          }
+        }
+        outN.push(en)
+        outT.push(-1)
+        return 0
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Does the value of `ex` COME FROM the binding at `letIx`?
+//
+// `retLocalLetOfBlock` is the SAME "which binding actually supplies this value" lookup
+// `criRetLocalLet` and `synthRetPinAnn` make, shared rather than copied: it walks an
+// UN-ANNOTATED alias chain and stops at the first annotated link, which is what puts the
+// question on the let that holds the LITERAL rather than on an intermediate that merely
+// names it.
+//
+// AN IDENTITY-FORWARDING GENERIC IS TRANSPARENT, and it has to be or the channel stops one
+// hop short of its own population: `gsto = idg(c)` over `function idg<T>(x: T): T` is the
+// identical defect with a conduit in the middle, and it was 24 of the grid's residue cells
+// until this rung. `dstPinFwdArg` is the test — the callee's RESULT annotation is one of
+// its own type parameters and some parameter is annotated with that SAME parameter — so
+// the conduit is recognised by its signature rather than by its name, and a callee that
+// transforms its argument is not one. Depth-bounded because the arena is not this pass's
+// to trust; four hops is far past any spelling measured.
+function dstPinSrcIs(bodyIx: i32, ex: i32, letIx: i32) {
+  dstPinSrcIsAt(bodyIx, ex, letIx, 0)
+}
+
+function dstPinSrcIsAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32) {
+  if ex < 0 { return false }
+  if depth > 4 { return false }
+  if retLocalLetOfBlock(bodyIx, ex) == letIx { return true }
+  const u = unwrapParen(ex)
+  const n = P.nodes[u]
+  if n is Call {
+    const j = dstPinFwdArg(u)
+    if j >= 0 && j < n.callArgs.length {
+      return dstPinSrcIsAt(bodyIx, n.callArgs[j], letIx, depth + 1)
+    }
+  }
+  false
+}
+
+// The argument position a CALL forwards its own value from, or -1: the callee's return
+// annotation names one of its own type PARAMETERS, and some parameter is annotated with
+// that same one (`function idg<T>(x: T): T`). First match wins.
+function dstPinFwdArg(callIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cf = P.nodes[unwrapParen(c.callFn)]
+    if cf is Ident {
+      const cfe = fnIndexOf(cf.identName)
+      if cfe >= 0 && cfe < fnStmts.length {
+        const cfn = P.nodes[fnStmts[cfe]]
+        if cfn is FuncDecl {
+          if cfn.fnRet < 0 { return -1 }
+          const rn = tyNameOf(cfn.fnRet)
+          if rn == "" { return -1 }
+          if !dstPinIsTyParam(rn, cfn.fnTyParams) { return -1 }
+          let j = 0
+          while j < cfn.fnParams.length {
+            const pp = P.nodes[cfn.fnParams[j]]
+            if pp is Param {
+              if pp.parType >= 0 {
+                if tyNameOf(pp.parType) == rn { return j }
+              }
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+function dstPinIsTyParam(name: string, typarams: string[]) {
+  let i = 0
+  while i < typarams.length {
+    if typarams[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// LEG 1 — `gsto = c`, a module GLOBAL assignment. The target must NOT resolve to a
+// function-scoped binding: a local of the same name SHADOWS the global, which is the
+// order `monoGlobalLetOf` declines in for exactly this reason, and leg 2 owns that case.
+function dstPinGlobalAssign(
+  ix: i32,
+  bodyIx: i32,
+  letIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const tg = P.nodes[unwrapParen(n.binLeft)]
+      if tg is Ident {
+        if parentLetOf(bodyIx, tg.identName) < 0 {
+          const gli = globalLetOf(tg.identName)
+          if gli >= 0 {
+            const gd = P.nodes[gli]
+            if gd is LetDecl {
+              dstPinPushAnn(gd.letType, n.binRight, bodyIx, letIx, outN, outT)
+            }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// LEG 2 — an ANNOTATED LOCAL destination, in both its spellings: the binding
+// `const o: Circle = c` and the assignment `let o: Circle = { r: 0 }` … `o = c`. One leg
+// because both read the same node's `letType`, and the D52 grid varied neither.
+function dstPinLocalDest(
+  ix: i32,
+  bodyIx: i32,
+  letIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const tg = P.nodes[unwrapParen(n.binLeft)]
+      if tg is Ident {
+        const lli = parentLetOf(bodyIx, tg.identName)
+        if lli >= 0 {
+          const ld = P.nodes[lli]
+          if ld is LetDecl {
+            dstPinPushAnn(ld.letType, n.binRight, bodyIx, letIx, outN, outT)
+          }
+        }
+      }
+    }
+  }
+  if n is LetDecl {
+    if ix != letIx {
+      dstPinPushAnn(n.letType, n.letInit, bodyIx, letIx, outN, outT)
+    }
+  }
+  0
+}
+
+// LEG 3 — `thru(c)`, a callee PARAMETER. Positional, and a call with more arguments than
+// the callee declares contributes nothing rather than reading past the parameter list.
+//
+// AN OPEN POSITION IS SKIPPED RATHER THAN VETOED. A parameter annotated with the callee's
+// own type PARAMETER, or not annotated at all, carries no NOMINAL claim — the
+// monomorphizer pins it FROM the argument, so re-aiming the argument re-aims the instance
+// with it. Recording `""` for such a position would make every generic hop disagree with
+// the real destination beyond it and the channel would decline on its own conduit.
+function dstPinCallArgs(
+  ix: i32,
+  bodyIx: i32,
+  letIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Ident {
+      const cfe = fnIndexOf(cf.identName)
+      if cfe >= 0 && cfe < fnStmts.length {
+        const cfn = P.nodes[fnStmts[cfe]]
+        if cfn is FuncDecl {
+          const ps = cfn.fnParams
+          let j = 0
+          while j < n.callArgs.length {
+            if j < ps.length {
+              const pp = P.nodes[ps[j]]
+              if pp is Param {
+                let open = pp.parType < 0
+                if !open {
+                  open = dstPinIsTyParam(tyNameOf(pp.parType), cfn.fnTyParams)
+                }
+                if !open {
+                  dstPinPushAnn(
+                    pp.parType,
+                    n.callArgs[j],
+                    bodyIx,
+                    letIx,
+                    outN,
+                    outT,
+                  )
+                }
+              }
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// The PRE-MONOMORPHIZATION run of `synthDstPinAnn`, over every function body — and the
+// ordering is a requirement, not a convenience.
+//
+// `synthRetPinAnn`'s home is `collectLocals`, which runs LONG after `monomorphize`. That is
+// fine for a destination the value reaches directly, and wrong the moment a hand-written
+// generic sits between the literal and its destination: by then `idg<T>(x: T): T` has
+// already been cloned as `idg$m0(x: Dot): Dot`, pinned off the very row the un-annotated
+// literal resolved to. The conduit then reads as a CONCRETE `Dot` destination — it vetoes
+// the real one, and even if it did not, the instance's own signature is already wrong.
+// 30 of the grid's residue cells were exactly that shape (`route=gen`, every destination),
+// and they close here and nowhere else.
+//
+// The pass sits BEFORE `monomorphize` and after `collectU` / `buildFnMap`, which are the
+// three edges it actually has: `variantIndexOf` reads `uVariants` (collectU), `fnIndexOf`
+// and `globalLetOf` read the function/global maps (collectFns, via buildFnMap). Being
+// pre-`collectA#2` is a bonus rather than a hazard — the annotation nodes it mints are
+// covered by that intern pass instead of having to bank their own row, which is the one
+// thing `synthRetPinAnn`'s late position forces it to do by hand.
+//
+// `collectLocals` STILL CALLS IT, and the second call is not redundant: that walk reaches
+// the START function's blocks and the bodies monomorphization mints, and every binding this
+// pass already pinned is declined there by the `letType >= 0` guard on entry.
+export function synthDstPinAnns() {
+  let fe = 0
+  while fe < fnStmts.length {
+    const fnIx = fnStmts[fe]
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { dstPinSynthWalk(fn.fnBody, fn.fnBody, fnIx) }
+    fe = fe + 1
+  }
+  0
+}
+
+// Every `LetDecl` lexically inside one function body — nested `if` / loop blocks included,
+// since a wasm local is function-scoped, and NOT descending into a nested `FuncDecl`, which
+// has its own `fnStmts` row and is walked as its own body.
+function dstPinSynthWalk(ix: i32, bodyIx: i32, fnIx: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if ix != bodyIx {
+    if n is FuncDecl { return 0 }
+  }
+  if n is LetDecl { synthDstPinAnn(ix, fnIx) }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    dstPinSynthWalk(kids[k], bodyIx, fnIx)
+    k = k + 1
   }
   0
 }
@@ -2579,6 +3051,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         synthEmptyListAnn(stmts[i])
         synthNullableAnn(stmts[i])
         synthRetPinAnn(stmts[i], fnIx)
+        synthDstPinAnn(stmts[i], fnIx)
         // Classify the init type BEFORE binding the name, then allocate a fresh slot and
         // bind `name → slot` so a LATER reference (or a shadowing inner `let`) resolves to
         // THIS slot. `slot` is the new slot's declared-local position.

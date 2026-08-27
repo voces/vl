@@ -5755,8 +5755,8 @@ Repro:
 
 ---
 
-### D75 — a MODULE GLOBAL of a union ARM, through a GENERIC `==`, beside an EXACT layout twin
-**check-clean invalid wasm · found 2026-08-26 while grading D57's 770-cell grid, at a coordinate that grid did NOT vary and a hand-written combination did (module-global delivery x generic route x exact layout twin) · pre-existing and byte-identical on `a97c9ae1` and on D57's branch, same offset and same sentence · NOT D57: the compare is reached, the ARGUMENT is not**
+### D75 — [CLOSED 2026-08-26] a MODULE GLOBAL of a union ARM, through a GENERIC `==`, beside an EXACT layout twin
+**closed · one root with D82, and the complement was already written · found 2026-08-26 while grading D57's 770-cell grid, at a coordinate that grid did NOT vary and a hand-written combination did (module-global delivery x generic route x exact layout twin) · pre-existing and byte-identical on `a97c9ae1` and on D57's branch, same offset and same sentence · NOT D57: the compare is reached, the ARGUMENT is not**
 
 Repro:
 
@@ -5810,11 +5810,37 @@ Repro:
 * Ranked as a silent row strictly worse than the loud floor it replaces, and left for whoever
   next works the heap-slot / twin-collapse region rather than reached from the equality path,
   which has no say in either table's index assignment.
+* **CLOSED 2026-08-26 (#D87PR). THE ROW'S OWN DIAGNOSIS WAS RIGHT ABOUT THE COORDINATE AND
+  WRONG ABOUT THE FAMILY.** It is not `uVarTwin` / `sTwin`: the two heap types are supposed
+  to stay distinct (`DECISIONS.md` keeps the struct/variant seam NOMINAL) and collapsing them
+  would be the bug. What was wrong is which of the two the INSTANCE was pinned to.
+  `monoArgTyName`'s struct arm asked `structIndexOfExpr` and returned `sNames[si]`; with
+  `Dot` in the module the un-kind-gated legs (the `Index` arena rung, the global's
+  `structIndexOfLet`) answered DOT'S row, so the pin was the literal string `Dot` — measured
+  at the pin with a probe, not inferred from the message. That is D57's root exactly one
+  layer out: `collectS` skips a union-member `type X = {…}`, so `Circle` has no `sNames` row
+  to be found and only a twin's row is there to be found instead.
+* **THE COMPLEMENT WAS ALREADY WRITTEN — the ninth rung of that family.** `exprVariantIndex`
+  is `structIndexOfExpr`'s storage-class twin arm for arm (param, declared local, capture,
+  module global, `: T`-returning call, ref-list element, bare map read, `?? default`, `as`
+  cast), every leg kind-gated so the two cannot both answer, and this ladder never asked it.
+  The fix is that call plus `monoAnnPinName` — the ONE membership list for "which annotation
+  name can serve as a pin", which already carried the variant rung.
+* **D82 IS THE SAME ROOT AND THE ABLATION SAYS SO.** One rung moves 276 of a 3,144-cell grid
+  and closes both rows; see D82. The no-twin LOUD floor goes with it (`unsupported argument
+  type for \`x\``) — 102 of those 276 are loud→runs.
+* Disassembly, both sides, one seed each: master `8bf0f20f` (1438562 bytes) emits
+  `(global (mut (ref 1)))` with `eqT$m1 (param (ref 0) (ref 0))` and `struct.get 0 0`; the
+  branch emits `(param (ref 1) (ref 1))` and `struct.get 1 0`. Type 0 is `Dot`'s standalone
+  row, type 1 is `uVarHeap[Circle]`, and the rec group holds three structurally identical
+  `(struct (field (mut i32)))` rows that are never merged.
+* Fixture: `tests/cases/unions/module-global-arm-through-generic-eq.vl`, four cells (the two
+  filed rows plus the LOCAL and PARAMETER storage classes either side of them).
 
 ---
 
-### D81 — an anonymous object literal delivered to an ARM-TYPED DESTINATION that is not a `return`
-**check-clean invalid wasm · found 2026-08-26 by the D52 grid, and it is 88 of the 116 cells that grid leaves silent · pre-existing: silent on master `a97c9ae1` with the same message · twelve lines, no import, no generic, no lambda, no list · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+### D81 — [CLOSED 2026-08-26] an anonymous object literal delivered to an ARM-TYPED DESTINATION that is not a `return`
+**closed · a CHANNEL, as the row predicted — and its two legs are TWO roots, plus two more the grid did not have · found 2026-08-26 by the D52 grid, and it is 88 of the 116 cells that grid leaves silent · pre-existing: silent on master `a97c9ae1` with the same message · twelve lines, no import, no generic, no lambda, no list · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
 
 Repro:
 
@@ -5852,11 +5878,44 @@ Repro:
   is a different row. A retyped minimisation that dropped them measured the other program.
 * Pinned as `tests/cases/soundness/xfail-miscompile-anon-objlit-into-arm-typed-global.vl`,
   `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+* **CLOSED 2026-08-26 (#D87PR). THE ROW WAS RIGHT THAT IT IS A CHANNEL** — the one exception
+  in a family whose other nine rungs closed on an un-called complement. The test it is
+  recognised by is the one D39/D52 established: the site has TWO equally valid nominal
+  claimants and only context to separate them, so there is no unasked predicate to call and
+  the annotation has to be carried. `synthDstPinAnn` is that carry, `synthRetPinAnn`'s
+  sibling at the destinations a `return` is not, sharing its gate (`armPinAnnName`) and its
+  literal-producer test (`armPinLitInit`) rather than copying them.
+* **THE ROW'S "NO ABLATION SEPARATES ITS TWO LEGS" IS NOW MEASURED, AND IT SEPARATES THEM.**
+  One compiler per leg over one 3,144-cell grid: the module-GLOBAL leg moves 36 cells, the
+  callee-PARAM leg 36, and their intersection is EMPTY. Neither closes the other's cells.
+  The row's caution was right for the reason it gave and the answer went the other way.
+* **AND THERE WERE FOUR DESTINATIONS, NOT TWO.** An annotated LOCAL is the same sentence at
+  the same class in both its spellings (`const o: Circle = c`, and `let o: Circle` … `o = c`)
+  — 108 more cells, disjoint from the other two. The D52 grid's `cons` axis had only the two
+  levels it filed, which is how they were missed. A struct FIELD is NOT one of them, and that
+  is measured: `const b: Box = { c: c }` is the LOUD `only i32 / boolean / string / array
+  struct fields are supported`, a different floor.
+* **THE ONE GENUINELY NEW FACT IS THE PASS ORDER.** `synthRetPinAnn` lives in
+  `collectLocals`, which runs long after `monomorphize`. That is too late the moment a
+  hand-written generic sits between the literal and its destination: `idg<T>(x: T): T` has
+  already been cloned as `idg$m0(x: Dot): Dot`, pinned off the very row the un-annotated
+  literal resolved to, so the conduit reads as a concrete `Dot` destination, vetoes the real
+  one, and its own signature is wrong regardless. `synthDstPinAnns` is therefore a PASS,
+  ordered `> collectU buildFnMap dispatchRewrite` and before `monomorphize`; the
+  `collectLocals` hook stays for the start function and the bodies mono mints. 30 grid cells
+  separate the late position from the early one.
+* Disassembly, both sides: master emits `(local (ref 0))` + `struct.new 0` into a
+  `(mut (ref 1))` global cell; the branch emits `(local (ref 1))` + `struct.new 1`.
+* Graduated to `tests/cases/unions/anon-objlit-into-arm-typed-destination.vl` (seven cells:
+  all four destinations, the generic hop, the list-element destination, and the
+  DISAGREEMENT gate that keeps master's behaviour where two destinations name different
+  claimants). The `xfail-` pin is DELETED, which is that file's own written instruction, and
+  `INVALID_MODULE_SRC` moves to D87 below.
 
 ---
 
-### D82 — a MONOMORPHIZED hand-written generic instance beside a layout twin
-**check-clean invalid wasm · found 2026-08-26 by the D52 grid, and it is 28 of the 116 cells that grid leaves silent · pre-existing: silent on master `a97c9ae1` · the ONE residue family whose cells survive with the local ANNOTATED, which is what separates it from D81**
+### D82 — [CLOSED 2026-08-26] a MONOMORPHIZED hand-written generic instance beside a layout twin
+**closed · ONE root with D75, closed by one rung · found 2026-08-26 by the D52 grid, and it is 28 of the 116 cells that grid leaves silent · pre-existing: silent on master `a97c9ae1` · the ONE residue family whose cells survive with the local ANNOTATED, which is what separates it from D81**
 
 Repro:
 
@@ -5885,6 +5944,69 @@ Repro:
   rung reaches the annotated local at the `fn` and `std` routes and does not reach it here.
 * Not pinned: D81 is the specimen and one live `@no-instantiate` member is what the tripwire's
   biconditional wants.
+* **CLOSED 2026-08-26 (#D87PR), AND IT IS THE SAME ROOT AS D75 — the row's "a separate root
+  from D81" was right and its implied separateness from D75 was not tested.** The pin probe
+  answers `Dot` for BOTH: `idg(thru(c))`'s argument is a call result, D75's is a module
+  global, and `monoArgTyName`'s struct arm reaches the twin's `sNames` row from either. One
+  `exprVariantIndex` rung closes both, and the ablation confirms it rather than assuming it —
+  the single-candidate compiler that carries only that rung moves 276 cells and the two rows'
+  own witnesses are among them.
+* The distinguishing observation the row DID make holds and is worth keeping: `route=gen`
+  only, and every annotated-local cell in the residue was here rather than in D81. That is
+  what makes the two rows different POPULATIONS even though they are one root — D81's channel
+  moves none of D82's cells and vice versa (intersection 0 in the ablation).
+* Fixture: `tests/cases/unions/module-global-arm-through-generic-eq.vl`, the `mk`/`idg`/`thru`
+  cell, kept beside D75's in one file because they are one root.
+
+---
+
+### D87 — an UN-ANNOTATED map local whose value is an ARM, handed to a map PARAMETER, beside a layout twin
+**check-clean invalid wasm · a REGRESSION with a bisect: it RAN on `6ac49ac9` and is silent from `2ea654d2` (#1952) onward · found 2026-08-26 by RE-RUNNING D52's own 9,450-cell grid against today's master, which grades it 212 silent where #1951 reported 116 · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function thru(x: {[string]: Circle}) { return x }
+    function mk(n: i32) {
+      const c = Map()
+      c["k"] = { r: n }
+      return thru(c)
+    }
+    print(((mk(7))["k"] ?? { r: 0 }).r)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   Invalid input WebAssembly code at offset 1162:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // (The offset is NOT the identifier — it moves with the seed. The sentence is.)
+
+* **IT IS A REGRESSION AND THE BISECT NAMES THE COMMIT.** Three compilers, each rebuilt from
+  its own commit's sources rather than from a shared artifact: `6ac49ac9` (#1951, 1,437,150
+  bytes — the size that PR itself reported, so the seed is self-verifying) RUNS this program
+  and prints `7`; `2ea654d2` (#1952, 1,437,704 bytes) and `8bf0f20f` (1,438,562 bytes) are
+  both check-clean invalid wasm. So #1952's mv find/mint rewrite turned a running program
+  silent, in the direction that matters most.
+* **ITS OWN GRID COULD NOT SEE IT, WHICH IS THE REUSABLE PART.** #1952 reported 0 loud→silent
+  and 0 runs lost over a 770-cell grid — truthfully, because that grid had no MAP-VALUED
+  container. This is 96 cells of the 9,450-cell D52 grid, every one `cont=mapval`, spread
+  across all three routes and both declaration orders. A grid grades only the axes it varied;
+  when a closing change leaves no residue of its own, re-grade an EARLIER change's grid
+  against today's master. That is how this was found and it is a sixth source to add to the
+  list `tests/vl_check_codegen_test.ts` keeps.
+* **THE TWIN IS THE AXIS AND IT TURNS A LOUD FLOOR OFF** — D63's signature, one container
+  over. Delete `type Dot` and the same program is the LOUD `emitProgram: only i32, i64, f64,
+  f32, boolean, struct, union, array, or string parameters are supported`.
+* **IT IS NOT THE ANNOTATED-MAP PATH.** Annotate the local `const c: {[string]: Circle} =
+  Map()` and the outcome is a DIFFERENT loud floor — `emitProgram: unsupported map value type
+  (no rep for a union-member struct …)` — on `6ac49ac9`, on master and on the branch alike.
+  Run the repro verbatim; the annotated spelling is a different program.
+* **NOT FIXED BY THE CHANGE THAT FILED IT, ON PURPOSE.** The mv find/mint sites are the region
+  #1952 rewrote and the region D47 (the inline map-annotation spelling of an arm-valued map)
+  is open in; the D75/D81/D82 work this row ships beside is the struct/variant PIN seam and
+  moves none of these 96 cells in either direction (measured: 96 silent on both sides).
+* Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-local-into-map-param.vl`,
+  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
 
 ## 3. Shared-root analysis
 
