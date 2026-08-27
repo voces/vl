@@ -527,7 +527,74 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `764ad0dd` with the same
 // sentence. It is `silent-class-inventory.md` D112, pinned as
 // `tests/cases/soundness/xfail-miscompile-nested-map-anon-shape-value.vl` per the REFILLS
-// procedure below, in the same commit that swapped this constant.//
+// procedure below, in the same commit that swapped this constant.
+//
+// THAT D112 SPECIMEN CLOSED — AND ITS OWN FILED READING OF THE MESSAGE WAS WRONG, WHICH IS
+// THE PART OF THIS ENTRY WORTH KEEPING. The row above says the sentence "differs in
+// NULLABILITY, not in heap type" and calls that "the tell that it is a vals-CELL
+// nullability seam and not the two-heap-types family every recent specimen came from."
+// Disassembled, it is exactly that family: `(ref null $12)` expected, `(ref $11)` found,
+// two DIFFERENT map structs behind one placeholder, and the `ref null` is the vals ARRAY
+// ELEMENT's own type, not a nullability defect. Probed at the site rather than read off
+// the text:
+//
+//   D112PROBE mslot=1 valKind=6 valName={[string]:{r:i32}} rlSlot=1 elemKind=3
+//             isMap=T innerShape=0 ctxMapSlot=-1 pendingMapSlot=-1 nullable=F
+//             innerMapTypeIdx=12 monoMapTypeIdx=11
+//
+// `isMap` and `innerShape` already answered; nothing seeded the context; `nullable=F`.
+// THREE specimens running now have carried a nullability-sounding sentence over a
+// two-heap-type mechanism. Disassemble. Never grade a specimen by its message.
+//
+// THE FIX IS THE COMPLEMENT ALREADY WRITTEN, for the eleventh time: `emitMapValDefault`
+// — the `??` DEFAULT boundary for a ref-valued map — had an arm for every value kind
+// (scalar, union box, struct list, string/f64/i64/f32 list, struct, nullable niche) except
+// a NESTED MAP, so `emitMapNew` read the ambient `pendingMapSlot` (-1) and built the MONO
+// map struct. `mvValIsMap` / `mvInnerMapShape` is the map STORE's own pair, called one line
+// away in `emitMapSetV` and never called here. Seven `Map()` boundaries had each been
+// taught this separately — let, global-init, return, struct field, variant field,
+// assignment, store — and the `??` default is the one nobody came back for. A RUNG 2 came
+// out of the neighbourhood sweep: `mvInnerMapShape` did not peel `| null` while its
+// ref-list twin `rlElemMapShape` always had, so BOTH its callers were wrong together on a
+// `{[K]: {[K2]: V} | null}` value and one line fixed both.
+//
+// 452 of a 1,114-cell D112 grid and 430 of the 2,850-cell D88/D100 grid, every one
+// `check-clean invalid wasm` → `runs`, 0 backward and 0 same-class message changes. The
+// sixth source stayed inert where it should: the 9,450-cell D52 grid and the 3,144-cell
+// D75/D82 grid both moved 0 cells and both still grade 0 silent.
+//
+// AND THE CLASS DID NOT EMPTY — the grid is what says so, and it is the reason this entry
+// is a REFILLS and not the `null` branch. 61 cells of the D112 grid and 100 of the D88 grid
+// survive as `check-clean invalid wasm`, in TWO families and neither of them D112's:
+// **D123**, the nominal ladder (`nodeMapArmNominalName` is a ONE-LEVEL special case, not a
+// rung inside the recursive `shapeNominalOfTy`, so an arm-valued map nested in a map or in
+// a list is spelled structurally), and **D124**, the mv layer minting a SECOND slot for the
+// `{[K]: V | null}` spelling of a layout that already has one, which `mvTwin` does not
+// merge. Both are pre-existing and both were found by the grid, not by the inventory —
+// which is the standing advice below, honoured rather than quoted.
+//
+// AN EIGHTH SOURCE, AND IT IS THE ONE THAT KEPT THIS HONEST: a PARTIAL fix inside one
+// outcome class is invisible to the grader of that class. The D124 cells contain two
+// `?? Map()` sites; this change moved the first to the right struct and left the second
+// disagreeing with the store, so the cells stayed `check-clean invalid wasm` while their
+// WASM changed under them (`struct.new $10` → `$12` on one site only). No outcome-class
+// count can see that. `cmp` the modules across the fix and disassemble the survivors, or a
+// half-moved family reads as an untouched one.
+//
+// THE SUCCESSOR IS D124'S OWN MINIMAL WITNESS, and it is the shortest specimen this
+// genealogy has carried: SEVEN LINES, no function, no union, no generic, no import, no
+// lambda, no `??`, one annotation. Its three controls were built and RUN, not reasoned:
+// drop the `| null` and it runs; make the inner map MONO and it runs; annotate `l2` with
+// the outer's own nullable-valued spelling and it runs. Disassembled, `$11` and `$12` are
+// byte-identical struct definitions at two indices — so this specimen's sentence mentions
+// nullability too, and its mechanism is two heap types AGAIN. Re-RUN against this tree at
+// the swap rather than inherited: `vl check` rc 0 with NO diagnostics at all, `--codegen`
+// rc 1 with `not valid wasm` + `type mismatch: expected (ref null $type), found (ref
+// $type)`, `--codegen --no-validate` rc 0, and NO `emit error` marker. Pre-existing on
+// `7b600b57` with the same sentence. It is `silent-class-inventory.md` D124, pinned as
+// `tests/cases/soundness/xfail-miscompile-nullable-map-value-spelling-twin.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -564,14 +631,13 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
 // state can be entered halfway.
 // ─────────────────────────────────────────────────────────────────────────────
-const INVALID_MODULE_SRC: string | null = `function mk(n: i32) {\n` +
-  `  const i0 = Map()\n` +
-  `  i0["k"] = { r: n }\n` +
-  `  const c = Map()\n` +
-  `  c["o"] = i0\n` +
-  `  return c\n` +
-  `}\n` +
-  `print((((mk(7))["o"] ?? Map())["k"] ?? { r: 0 }).r)\n`;
+const INVALID_MODULE_SRC: string | null = `const z = Map()\n` +
+  `z["z"] = 1\n` +
+  `const l2 = Map()\n` +
+  `l2["a"] = z\n` +
+  `const c: {[string]: {[string]: {[string]: i32} | null}} = Map()\n` +
+  `c["k"] = l2\n` +
+  `print(7)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.

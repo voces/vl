@@ -5785,13 +5785,23 @@ export function mvValIsMap(slot: i32) {
 // value's own mv slot when it has one, else the MONO shape of the INNER map's key. Only
 // meaningful when `mvValIsMap(slot)`.
 //
+// IT PEELS ONE `| null`, which its ref-list twin `rlElemMapShape` has always done and
+// this side never did. A `{[K]: {[K2]: V} | null}` value rides the SAME vals element as
+// its non-null twin — one map struct, nullable only in the slot — so the `Map()` that
+// fills that cell builds the same struct either way. Unpeeled, the arena leg saw a
+// `TyNullable` and the name leg a `…|null` spelling, both declined, and the MONO fallback
+// answered: `struct.new` of the mono map into a typed vals element, `vl check` rc 0,
+// engine refuses. Both callers were wrong together — the map STORE (`emitMapSetV`) and
+// the `??` DEFAULT — because they share this one home, which is also why one line fixes
+// both. Silently right only for a mono inner map, where the fallback IS the answer.
+//
 // Before the i32-keyed rep this question had a silent right answer at one of its two
 // call sites and a silent WRONG one at the other: an inner mono `{[string]: i32}` is the
 // `-1` every unseeded `Map()` already builds, so the store/read never had to seed it,
 // while an inner `{[string]: string}` built the mono struct into a typed vals slot —
 // invalid wasm on master, `vl check` clean. Naming the shape fixes both halves at once.
 export function mvInnerMapShape(slot: i32): i32 {
-  const inner = mvValInnerMvSlot(slot)
+  const inner = mvValNulInnerMvSlot(slot)
   if inner >= 0 { return inner }
   mapMonoShapeOfKey(rlElemMapKeyI32(mvRlSlot[slot]))
 }
@@ -8610,13 +8620,25 @@ export function mvValInnerRlSlotAt(slot: i32): i32 {
 // the arena leg answers ONLY a real slot (>= 0); every negative — uncovered, not a map
 // type, no row claims the inner value — falls through to the name path. No caller can
 // see the arena's miss value, so an arena miss can never be read as "mono".
-export function mvValInnerMvSlotAt(slot: i32): i32 {
+export function mvValInnerMvSlotAt(slot: i32, peelNul: boolean): i32 {
   const ty = mvValTyIxAt(slot)
   if ty < 0 { return -1 }
+  let b = ty
   const t = T.tys[ty]
-  // NOT peeled through a `| null`: `mapValNameOf` requires a bare `{[K]:V}` spelling
-  // too (it answers "" for a nullable map name), so both legs decline together.
-  if t is TyMap { return mvSlotOfValTyK(t.mVal, tyMapKeyIsI32(ty)) }
+  // `peelNul` strips ONE `TyNullable` hop, the arena reading of the `nulMapInnerName`
+  // peel — the SAME parameter, with the same meaning, its ref-list twin
+  // `rlElemMapValMvSlotAt` has carried since the list-of-maps composition needed it.
+  // WITHOUT it both legs decline together (`mapValNameOf` answers "" for a nullable map
+  // name), which is correct for a consumer asking "is this value a bare map" and WRONG
+  // for one asking "what struct does this cell hold": a `{[K2]: V} | null` value rides
+  // its non-null twin's vals element, so the `Map()` that fills it builds the same
+  // struct. That difference is the whole of rung 2 — see `mvInnerMapShape`.
+  if peelNul {
+    if t is TyNullable { b = t.nInner }
+  }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyMap { return mvSlotOfValTyK(bt.mVal, tyMapKeyIsI32(b)) }
   -1
 }
 
@@ -8819,9 +8841,23 @@ export function mvValInnerRlSlot(slot: i32): i32 {
 // `repMvValKey` lookup), and ONLY for a real slot: the name resolver's `-1` (mono)
 // and `-3` (unsupported) answers are its own, never the arena's miss.
 export function mvValInnerMvSlot(slot: i32): i32 {
-  const ar = mvValInnerMvSlotAt(slot)
+  const ar = mvValInnerMvSlotAt(slot, false)
   if ar >= 0 { return ar }
   mvSlotOfMapName(mvValName[slot])
+}
+
+// `mvValInnerMvSlot` for a slot whose VALUE may be a NULLABLE map: the arena leg peels
+// one `TyNullable`, the name leg the `nulMapInnerName` spelling, before asking for the
+// inner value's slot. Same sentinel discipline. The exact mirror of
+// `rlElemNulMapValMvSlot`, which the ref-list side has had all along — the map-VALUE
+// side is where the peel was never written.
+export function mvValNulInnerMvSlot(slot: i32): i32 {
+  const ar = mvValInnerMvSlotAt(slot, true)
+  if ar >= 0 { return ar }
+  let vn = mvValName[slot]
+  const vnn = nulMapInnerName(vn)
+  if vnn != "" { vn = vnn }
+  mvSlotOfMapName(vn)
 }
 
 // Does a BOXED-union map value admit `null` (destringify D5-final (b))? ARENA first
