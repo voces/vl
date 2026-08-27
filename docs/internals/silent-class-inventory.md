@@ -7068,7 +7068,7 @@ Repro:
 ---
 
 ### D112 — a NESTED MAP whose INNER value is an ANONYMOUS object shape
-**check-clean invalid wasm · found 2026-08-26 as the smallest surviving silent cell of the D88/D100 grid, while re-specimening `INVALID_MODULE_SRC` · pre-existing and byte-identical on `764ad0dd` and on the D88/D100 branch, same sentence · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-26 as the smallest surviving silent cell of the D88/D100 grid, while re-specimening `INVALID_MODULE_SRC` · pre-existing and byte-identical on `764ad0dd` and on the D88/D100 branch, same sentence · was THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, now swapped to D124**
 
 Repro:
 
@@ -7099,7 +7099,189 @@ Repro:
 * **IT IS THE LARGEST REMAINING SILENT FAMILY ON THE D88/D100 GRID** — 570 of the 1,169
   not-`runs` cells are `cont=nestedmap`, spread across every route, every delivery and both
   declaration orders. Sized rather than guessed, and the size is the argument for ranking it.
-* Pinned as `tests/cases/soundness/xfail-miscompile-nested-map-anon-shape-value.vl`,
+* Pin GRADUATED to `tests/cases/maps/nested-map-anon-shape-value-coalesce-default.vl`
+  (`@run`), which keeps the witness and all three bracketing controls in one file;
+  `INVALID_MODULE_SRC` moves to D124.
+
+**THE CLOSE (2026-08-27), AND THE FIRST THING IT DID WAS REFUTE THE BULLET ABOVE IT.**
+
+* **THE NULLABILITY IN THE MESSAGE WAS A RED HERRING, and the "vals-CELL nullability seam"
+  reading was wrong.** Disassembled, the module says `expected (ref null $12), found (ref
+  $11)` — TWO DIFFERENT MAP STRUCTS behind one `$type` placeholder, `$12` the inner map's
+  own struct and `$11` the mono one — and the `ref null` is the vals ARRAY ELEMENT's own
+  type, which every mv slot has. It is the two-heap-types family after all. Probed at the
+  site rather than read off the sentence:
+
+      D112PROBE mslot=1 valKind=6 valName={[string]:{r:i32}} rlSlot=1 elemKind=3
+                isMap=T innerShape=0 elemHeap=12 valsWrap=8
+                ctxMapSlot=-1 pendingMapSlot=-1 nullable=F
+                innerMapTypeIdx=12 monoMapTypeIdx=11
+
+  `isMap=T` and `innerShape=0` say the two questions the fix needs were ALREADY answered
+  here; `ctxMapSlot=-1` / `pendingMapSlot=-1` say nothing seeded the constructor;
+  `nullable=F` says the slot is not nullable at all. Grading a specimen by its message has
+  now misled three times running.
+* **THE PATTERN IS "COMPLEMENT ALREADY WRITTEN AND NEVER CALLED", and the complement is one
+  line away in the same file.** `emitMapValDefault` — the `??` DEFAULT boundary for a
+  ref-valued map slot — carries an arm for every value kind it lowers (scalar, union box,
+  struct list, string/f64/i64/f32 list, struct, nullable niche) and had none for a NESTED
+  MAP, so `emitMapNew` read the ambient `pendingMapSlot` (-1) and built the mono struct.
+  `mvValIsMap` / `mvInnerMapShape` is the map STORE's own pair (`emitMapSetV`), already
+  exported and already imported into `wasmEmit.vl`. Seven `Map()` boundaries had each been
+  taught this separately — let, global-init, return, struct field, variant field,
+  assignment, store — and the `??` default is the one nobody came back for. The assignment
+  boundary's own comment records this row's exact sentence, `type mismatch: expected (ref
+  null $type), found (ref $type)` with `vl check` clean, for its own half of the family.
+* **RUNG 2 CAME OUT OF THE NEIGHBOURHOOD SWEEP, not out of the row.** `mvInnerMapShape` did
+  not peel one `| null`, while its ref-list twin `rlElemMapShape` always had. A
+  `{[K]: {[K2]: V} | null}` value rides the SAME vals element as its non-null twin, so both
+  its callers — the STORE and the `??` DEFAULT — were wrong together, and one line fixed
+  both. Pinned at `tests/cases/maps/nullable-nested-map-value-map-ctor.vl`.
+* **452 of a purpose-built 1,114-cell grid and 430 of the 2,850-cell D88/D100 grid, every
+  one `check-clean invalid wasm` → `runs`, 0 backward, 0 to a silent class, 0 same-class
+  message changes.** The generator is `scripts/silent-sweep/d112/gen112.py`; its axes are
+  nesting depth (1/2/3) x leaf value kind x declaredness (claimant count 0/1/2 and arm-ness)
+  x how the annotation spells the leaf x which levels are annotated x nullability of the
+  crossed value cell x how the read is spelled (`?? Map()` / `?? <named>` / `.get(k) ??` /
+  `?.`) x declaration order.
+* **THE TWO OLD GRIDS BOTH STAYED AT ZERO.** The 9,450-cell D52 grid and the 3,144-cell
+  D75/D81/D82 grid each move 0 cells, 0 backward, and each still grades 0 silent — the fix
+  is inert everywhere it is not the answer.
+* **IT DID NOT EMPTY THE CLASS, and this row's own grid is what says so** — see D123 and
+  D124, which are 61 of the 1,114 cells and 100 of the 2,850, in two families and neither
+  of them this one.
+
+---
+
+### D123 — the ARM-NOMINAL map rung is a ONE-LEVEL special case, not a rung in the recursive ladder
+**check-clean invalid wasm · found 2026-08-27 in D112's closing residue, by re-grading the D88/D100 grid rather than by reading the inventory · pre-existing on `7b600b57`, same sentence**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function thru(x: {[string]: {[string]: Circle}}) { return x }
+    function mk(n: i32) {
+      const i0 = Map()
+      i0["k"] = { r: n }
+      const c = Map()
+      c["o"] = i0
+      return thru(c)
+    }
+    print((((mk(7))["o"] ?? Map())["k"] ?? { r: 0 }).r)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **IT IS D88's MECHANISM ONE CONTAINER FURTHER IN.** D88 taught the emitter to spell a map
+  VALUE that is a declared union ARM nominally (`nodeMapArmNominalName`), because
+  `tyToEmitName` renders an arm structurally — an arm has no `sNames` row, since `collectS`
+  SKIPS a `type X = {…}` that is a union member. But `nodeMapArmNominalName` asks
+  `variantRowOfTy(t.mVal)` of ONE `TyMap` and stops. It is not a rung inside
+  `shapeNominalOfTy`, which is the ladder that DOES recurse (through `TyArray`), and
+  `shapeNominalOfTy` has no `TyMap` arm at all. So a map nested in a map, or a map nested in
+  a list, falls back to the structural render and a second mv slot is minted for one layout.
+  Disassembled on the repro, `mk`'s inner local `i0` is the anonymous row's map struct while
+  the outer map's vals element is typed to `Circle`'s — two heap types behind one `$type`.
+* **SIX CONTROLS, EVERY ONE BUILT AND RUN AGAINST THIS TREE. Two of them refuted the first
+  draft of this row**, which had been written from a NEIGHBOURING program:
+
+  | change to the repro | outcome |
+  |---|---|
+  | (none — the repro as filed) | check-clean invalid wasm |
+  | delete `type Shape = Circle \| Sq` | **RUNS** |
+  | delete `type Dot` (the exact layout twin) | **LOUD emit reject** |
+  | `type Dot = { q: i32 }` instead (a non-twin) | **LOUD emit reject** |
+  | annotate the inner local `i0: {[string]: Circle}` | **RUNS** |
+  | one nesting level less (`{[string]: Circle}`) | **RUNS** |
+  | replace the whole read with `print(7)` | check-clean invalid wasm |
+
+  So ARM-NESS is the requirement (as in D88), the `??` read is NOT (the last row is silent
+  without it — the failure is the STORE `c["o"] = i0`, not the read), and at this route the
+  EXACT LAYOUT TWIN is required, without which the same program is loud. The first draft of
+  this row claimed the opposite on both of the bolded rows because it was measured on the
+  `decl=arm` program, which is a different program.
+* **THE TWIN REQUIREMENT IS ROUTE-DEPENDENT, and the grid is where that shows.** The
+  100 surviving cells of the 2,850-cell D88/D100 grid, all `src=declname`:
+
+      decl      cont        route  n
+      arm       mapval      std     6
+      arm       nestedmap   gen    10
+      arm       nestedmap   std    12
+      armdiff   mapval      std     6
+      armdiff   nestedmap   gen    10
+      armdiff   nestedmap   std    12
+      armtwin   bare        std     2
+      armtwin   mapval      std     6
+      armtwin   nestedmap   gen    12
+      armtwin   nestedmap   none   12
+      armtwin   nestedmap   std    12
+
+  `route=none` appears at `armtwin` ONLY — matching the control table above — while `gen`
+  and `std` reach it at `arm` and `armdiff` too, so the generic and std hops do not need the
+  twin. The two `armtwin x bare x std` cells are the one coordinate this sentence does not
+  cover and should be re-derived before they are assumed to belong here.
+* **BOTH CONTAINERS ARE THE SAME ROOT.** The `route=std` cells reach it through a LIST
+  (`reverse([thru(c)])[0]` over `{[string]: Circle}[]`), where `shapeNominalOfTy`'s
+  `TyArray` arm recurses into a `TyMap` and finds no arm; the `cont=nestedmap` cells reach
+  it through a map. One missing `TyMap` rung explains both, and the list form reproduces at
+  ONE nesting level — so depth is not the axis, the container walk is.
+* **28 of the 1,114 D112-grid cells too**, at `decl` in {`arm`, `armtwin`}.
+* **NOT REACHABLE FROM D112's FIX, and that was measured, not assumed.** D112's seed DID
+  change these cells' wasm — the `?? Map()` site moved from the mono struct to the typed one
+  — and the failure simply relocated to `c["o"] = i0`. `cmp` across the fix, then
+  disassemble; the outcome class never moved.
+* **THE OBVIOUS WIDENING IS NOT COSTED YET.** Adding a `TyMap` arm to `shapeNominalOfTy`
+  that recurses on the value is the shape the mechanism implies, but this seam is NOMINAL by
+  ruling (`DECISIONS.md`: the variant/struct-TABLE seam stays nominal) and D111 records a
+  neighbouring widening at this same layer that moves 64 cells to `runs` and 19 to SILENT.
+  Sweep it against the D112 and D88 grids BOTH before landing it.
+
+---
+
+### D124 — a `{[K]: V | null}` value spelling mints a SECOND map slot for a layout that already has one
+**check-clean invalid wasm · found 2026-08-27 in D112's closing residue, on the depth-3 nullable axis of that row's own grid · pre-existing on `7b600b57`, same sentence · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+
+Repro:
+
+    const z = Map()
+    z["z"] = 1
+    const l2 = Map()
+    l2["a"] = z
+    const c: {[string]: {[string]: {[string]: i32} | null}} = Map()
+    c["k"] = l2
+    print(7)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **SEVEN LINES, ONE ANNOTATION, AND NO `??` AT ALL** — no function, no union, no generic,
+  no import, no lambda. The whole program is two map builds and a store.
+* **THE NULLABILITY IS IN THE SENTENCE AND IS NOT THE MECHANISM — for the third specimen
+  running.** Disassembled, the two `$type`s are `$11` and `$12`, whose struct definitions
+  are BYTE-IDENTICAL:
+
+      (type $11 (struct (field (mut (ref $9))) (field (mut (ref $5))) … ))
+      (type $12 (struct (field (mut (ref $9))) (field (mut (ref $5))) … ))
+
+  `$11` is `l2`'s INFERRED `{[string]: {[string]: i32}}` and `$12` is the annotation's
+  `{[string]: {[string]: i32} | null}` value. One map layout, two heap types, and
+  `c["k"] = l2` stores across them. `mvTwin` exists for exactly this ("twins share ONE
+  `mvMapTypeIdx`") and does not merge these two.
+* **THE AXIS IS THE SECOND SPELLING, not the nullability and not the nesting. Three
+  controls, all run verbatim.** Drop the `| null` from the annotation → RUNS. Make the inner
+  map MONO (`{[string]: i32}`, whose struct is the shared one, so there is no second slot to
+  mint) → RUNS. Annotate `l2` with the outer's own nullable-valued spelling → RUNS. It needs
+  one layout named twice, once bare and inferred, once `| null` and annotated.
+* **NOT D112's ROOT, and the wasm diff is the proof.** D112's fix moved the first of these
+  cells' two `?? Map()` sites to the right struct (`struct.new $10` → `$12`) and left the
+  store-side twin mismatch, so every one of them stayed `check-clean invalid wasm` while its
+  module changed underneath. A partial fix inside one outcome class is invisible to the
+  grader of that class; only `cmp` found this.
+* **33 of the 1,114 D112 cells**, all `depth=3` x `nul` x `ann=outer`, and the LEAF value
+  kind does not matter (`anon`, `scalar`, `str`, `list` and `monomap` all appear) — which is
+  what says this is the map-slot identity and not the value's rep.
+* Pinned as `tests/cases/soundness/xfail-miscompile-nullable-map-value-spelling-twin.vl`,
   `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
 
 ---
