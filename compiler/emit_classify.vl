@@ -413,6 +413,7 @@ import {
   mvKeyI32,
   mvMapTypeIdx,
   mvRlSlot,
+  mvValArmSig,
   mvValKind,
   mvValName,
   mvValStructIdx,
@@ -501,7 +502,6 @@ import {
   msAtomIdOf,
   mvSlotArmMatches,
   mvSlotKeyI32,
-  mvSlotOfTyK,
   mvSlotOfTyKArm,
   mvSlotOfValNameTyK,
   mvSlotOfValNameTyKArm,
@@ -5294,6 +5294,15 @@ export function mvValVariantOf(slot: i32): i32 {
   mvValVariantIdx[slot]
 }
 
+// The read side of the ARM-SIGNATURE column (D93), bounds-guarded like every other
+// parallel-table accessor: an uncovered slot reads -1, which is "reaches no arm" and is
+// what every row meant before the column existed.
+export function mvValArmSigOf(slot: i32): i32 {
+  if slot < 0 { return -1 }
+  if slot >= mvValArmSig.length { return -1 }
+  mvValArmSig[slot]
+}
+
 // The tri-state arm hint a caller's recorded value type produces (D48): `MV_ARM_NOHINT`
 // when there is no type to ask, else `variantRowOfTy`'s answer — the arm's DECLARATION
 // row, or -1 for a resolved type that is not an arm. The distinction between "no type"
@@ -5303,9 +5312,63 @@ export function mvValVariantOf(slot: i32): i32 {
 // `variantRowOfTy` is the resolver, for the reason its own header gives — variants are
 // NOMINAL, so the structural rungs that make the render collapse cannot answer this and
 // no tightening of them could.
+// THE TYPED-FIND ENTRY POINT — and every caller of the mv slot find holds the value's
+// TYPE (D93). The un-hinted `mvSlotOfTyK` it replaces took the map value's arena type and
+// passed `MV_ARM_NOHINT` anyway, so it
+// matches a slot of ANY arm parity and lands on the first slot of that structural key. The
+// hint it is missing is a pure function of the argument it already has.
+//
+// THE SIXTH SITE OF D48'S HINT, and it is what made D93 DECLARATION-ORDER dependent. With
+// the mv slots correctly separated, `rlElemMapValMvSlot` still asked this un-hinted for the
+// map ELEMENT of a nested map's vals list: `{[string]: Circle}`'s element resolved to
+// whichever of the two same-canon inner slots was minted first, so the arm-valued nested
+// map worked when the ARM was declared first and emitted the twin's map struct when the
+// twin was. Measured on the grid: the residue was exactly the 12 `order=b` cells.
+//
+// A FIND, THEREFORE SAFE, which is the rule D48's own header states: a hint can only make a
+// find DECLINE a slot whose arm is not this value's, never make one succeed where it
+// failed, so the mint below runs in strictly more cases and is skipped in none. A caller
+// with no type at all does not reach this rung; `mvSlotOfTyKArm` keeps the tri-state for
+// the three sites that thread a caller-supplied hint.
+export function mvSlotOfValTyK(valTy: i32, keyI32: boolean): i32 {
+  mvSlotOfTyKArm(valTy, keyI32, mvArmHintOfTy(valTy))
+}
+
 export function mvArmHintOfTy(ty: i32): i32 {
   if ty < 0 { return MV_ARM_NOHINT }
-  variantRowOfTy(ty)
+  mvArmSigOfTy(ty)
+}
+
+// The ARM SIGNATURE of a map-value type: the variant row the value IS, or — one container
+// further out — the variant row its transitive MAP value is, or -1 for a resolved type
+// that reaches no arm at all (D93).
+//
+// `variantRowOfTy` alone answers the first question and D48 threads it as the slot's third
+// identity component. It cannot answer the second: for `{[string]: Circle}` the value is a
+// `TyMap`, so the hint reads -1 for it and for `{[string]: Dot}` alike and the two OUTER
+// maps of a nested pair share one slot. The rung below is the same nominal question asked
+// through the map hop the render flattens.
+//
+// NOMINAL AT EVERY DEPTH, which is what makes this a signature and not a shape test:
+// `variantRowOfTy` matches arena-index identity against the ARM DECLARATIONS and has no
+// structural rung *because variants are nominal* (#1942), so an anonymous
+// `{[string]: {r:i32}}` reaches no arm at any depth and keeps the -1 it has always had.
+export function mvArmSigOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const v = variantRowOfTy(ty)
+  if v >= 0 { return v }
+  mvDeepArmOfTy(ty, 8)
+}
+
+// The NAME-side twin of the rung above, for the mint's fallback: the arm a rendered map
+// value SPELLING reaches through its own value. `mapValNameOf` peels one `{[K]: V}` hop
+// and `variantIndexOf` is the same nominal table lookup `variantRowOfTy` reaches by index.
+function mvArmSigOfName(nm: string, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const direct = variantIndexOf(nm)
+  if direct >= 0 { return direct }
+  if !nameIsMap(nm) { return -1 }
+  mvArmSigOfName(mapValNameOf(nm), depth - 1)
 }
 
 function mvValArmName(ty: i32): string {
@@ -5356,7 +5419,112 @@ export function mvShapeOfValNameRowTy(
 function mvArmKeyName(valNameIn: string, armTy: i32): string {
   const an = mvValArmName(armTy)
   if an != "" { return an }
+  const dn = mvDeepArmKeyName(armTy)
+  if dn != "" { return dn }
+  const dd = mvDeepDeclKeyName(armTy)
+  if dd != "" { return dd }
   valNameIn
+}
+
+// The variant row a MAP value type reaches through its OWN value, or -1 — the arm the
+// render drops at a depth `mvValArmName` cannot see, because that one asks whether the
+// value IS an arm and this one asks whether the value CONTAINS one.
+//
+// Depth-bounded on the `tyReachesUnion` discipline: a recursive alias
+// (`type M = {[string]: M}`) is a cycle in the arena and an unbounded descent traps the
+// compiler rather than answering it. The bound is a decline, which is the safe degenerate
+// here — a declined key is the render the layer has always used.
+function mvDeepArmOfTy(ty: i32, depth: i32): i32 {
+  if ty < 0 { return -1 }
+  if depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyMap {
+    const v = variantRowOfTy(t.mVal)
+    if v >= 0 { return v }
+    return mvDeepArmOfTy(t.mVal, depth - 1)
+  }
+  -1
+}
+
+// The mv table's key for a MAP-valued map whose transitive value is a declared ARM (D93)
+// — `mvArmKeyName`'s own rewrite ONE CONTAINER OUT.
+//
+// D47 keyed an arm-valued map's slot on the ARM'S OWN NAME because the two spellings of
+// that map reach this layer as two different renders and only one resolves. A NESTED
+// arm-valued map has the same disease at the outer slot and D47's rewrite cannot reach it:
+// the outer value is a `TyMap`, not an arm, so `mvValArmName` answers "" and the key stays
+// `tyToEmitName`'s render — which drops the arm at EVERY depth. `{[string]: Circle}` and
+// `{[string]: Dot}` therefore both render `{[string]:{r:i32}}`, the two OUTER maps key one
+// mv slot, one vals element heap is minted, and whichever inner map struct loses is stored
+// into a field typed for the other: `vl check` rc 0, "type mismatch: expected
+// (ref null $type), found (ref $type)".
+//
+// A KEY, NOT A KIND RUNG AND NOT A FLOOR, and that is what lets this row close where two
+// measured candidates could not. Both of those tried to make the layer REFUSE — the FIND
+// discriminating on the arm (701 -> 609 correct, 17 -> 57 silent) and a loud `-3` at the
+// mint (866/148/10 against 894/112/18, buying 8 fewer silent cells for 28 fewer working
+// programs, six of them `correct` on master). Both had to decide "would a second,
+// differently-armed value later claim this slot?", which is a property of the PAIR that a
+// mint minting one slot at a time cannot see, so every shape-level approximation of it
+// fired on SINGLE-UNIT programs whose only sin was an unused `type Dot = {r:i32}`.
+//
+// A key does not have to see the pair. It is computed per claimant from information that
+// already distinguishes them, mint and find compute it the same way, and a single-unit
+// program merely gets its slot under a different name — no refusal, no floor, no dialect.
+//
+// NOMINAL, AND NARROWLY SO. `tyToNominalName` is the renderer that keeps the identity
+// `tyToEmitName` drops, and swapping the mv layer's value renderer wholesale is the change
+// D-MAPNODETY refused with 128 measured slot moves. This is not that swap: the gate is
+// `mvDeepArmOfTy >= 0`, so a map whose transitive value is not a declared ARM is untouched
+// and keeps the render it has always keyed. `variantRowOfTy` has no structural rung
+// *because variants are nominal* (#1942), so a genuinely anonymous `{[string]:
+// {[string]: {r:i32}}}` never reaches this rewrite at all.
+//
+// SEPARATION NEEDS ONLY ONE SIDE TO MOVE, which is why the gate can be this narrow: in the
+// pair that collapses, `{[string]: Circle}` is the arm side and `{[string]: Dot}` is not,
+// so rewriting the arm side alone already gives two distinct keys.
+function mvDeepArmKeyName(armTy: i32): string {
+  if mvDeepArmOfTy(armTy, 8) < 0 { return "" }
+  tyToNominalName(armTy)
+}
+
+// The OTHER SIDE OF THE SAME PAIR (D93). The rung above rewrites the ARM side's key; this
+// one rewrites the side that is a declared STRUCT, and both are needed because the two
+// spellings have to stop meeting ANYWHERE, not just at the mv table.
+//
+// Rewriting only the arm side separates the mv slots and the ref-list element slots, and
+// then the last mile fails: `{[string]: Dot}`'s key stays the RENDER `{[string]:{r:i32}}`,
+// the render RE-RESOLVES through `resolveAnnot`, and the arena — which dedups a `TyObj`
+// structurally — hands back the very index `Circle`'s declaration owns. Every arena-keyed
+// rung below the mv table then reads unit B's inner map value as `Circle`. The render does
+// not merely fail to name `Dot`; it resolves to `Circle`, so no filter downstream can undo
+// it. Measured: with the arm side alone the outer mv slots and the rl element slots are two
+// each and `rlElemMapValMvSlot` still answers `Circle`'s slot for both.
+//
+// `tyToNominalName` is the renderer that keeps what `tyToEmitName` drops, and the gate here
+// is DECLAREDNESS at the map's transitive value — a struct row (`structIndexOfTy`) or an
+// arm (`variantRowOfTy`), the two rungs `shapeNominalOfTy` pairs. A genuinely anonymous
+// `{[string]: {r:i32}}` reaches neither and keeps the render it has always keyed, so an
+// alias stays TRANSPARENT (D-ALIASMAP): `type IMB = {[string]: Dot}` and an inline
+// `{[string]: Dot}` both key `{[string]:Dot}`, which is the agreement that rule requires.
+function mvDeepDeclKeyName(armTy: i32): string {
+  if mvDeepDeclOfTy(armTy, 8) == 0 { return "" }
+  tyToNominalName(armTy)
+}
+
+// True when a MAP type's transitive value is a DECLARED type — an arm or a struct row.
+// Depth-bounded on the `tyReachesUnion` discipline: a recursive alias is a cycle in the
+// arena and an unbounded descent traps the compiler rather than answering it.
+function mvDeepDeclOfTy(ty: i32, depth: i32): i32 {
+  if ty < 0 { return 0 }
+  if depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyMap {
+    if variantRowOfTy(t.mVal) >= 0 { return 1 }
+    if structIndexOfTy(t.mVal) >= 0 { return 1 }
+    return mvDeepDeclOfTy(t.mVal, depth - 1)
+  }
+  0
 }
 
 export function mvShapeOfValNameArmTy(
@@ -5488,6 +5656,15 @@ export function mvShapeOfValNameArmTy(
   let mvVarRow = variantRowOfTy(armTy)
   if mvVarRow < 0 { mvVarRow = variantIndexOf(valName) }
   mvValVariantIdx.push(mvVarRow)
+  // THE ARM-SIGNATURE HALF (D93), pushed in the same breath so the row stays one row.
+  // Same two sources as the column above and in the same order — the caller's recorded
+  // type first, the KEY's own spelling for the un-hinted caller the rewrite cannot reach
+  // — asked through the map hop `variantRowOfTy` stops at. Both are pure table scans over
+  // arena indices and names; neither interns, which is what the parallel-table discipline
+  // requires of anything sitting between two pushes.
+  let mvSigRow = mvArmSigOfTy(armTy)
+  if mvSigRow < 0 { mvSigRow = mvArmSigOfName(valName, 8) }
+  mvValArmSig.push(mvSigRow)
   if kind == 1 {
     // THE KIND-1 SITE IS DELIBERATELY UNHINTED, AND THE REASON IS A SIDECAR WITH TWO
     // PRODUCERS. It interns `sNames[vsi]`, not `valName`, so the obvious hint is that
@@ -7859,7 +8036,7 @@ export function uFieldRowKeyI32(row: i32): boolean {
 // naming WHICH mono struct it means (`mapMonoShapeOfKey`), which is the whole point.
 export function sFieldMapShape(si: i32, fi: i32): i32 {
   const ki = sFieldElemKeyI32At(si, fi)
-  const a = mvSlotOfTyK(sFieldElemTyIxAt(si, fi), ki)
+  const a = mvSlotOfValTyK(sFieldElemTyIxAt(si, fi), ki)
   if a >= 0 { return a }
   const s = mvSlotOfValNameFindK(sFieldElemNameAt(si, fi), ki)
   if s == -1 { return mapMonoShapeOfKey(ki) }
@@ -7870,7 +8047,7 @@ export function sFieldMapShape(si: i32, fi: i32): i32 {
 // `uFieldElemKeyI32` sidecars (the `uFieldTgtStructIdx` / `variantFieldRefSlot` shape).
 export function uFieldMapShape(vi: i32, fj: i32): i32 {
   const ki = uFieldElemKeyI32At(vi, fj)
-  const a = mvSlotOfTyK(uFieldElemTyIxAt(vi, fj), ki)
+  const a = mvSlotOfValTyK(uFieldElemTyIxAt(vi, fj), ki)
   if a >= 0 { return a }
   const s = mvSlotOfValNameFindK(variantFieldElemName(vi, fj), ki)
   if s == -1 { return mapMonoShapeOfKey(ki) }
@@ -8320,7 +8497,7 @@ export function rlElemMapValMvSlotAt(slot: i32, peelNul: boolean): i32 {
   if b < 0 { return -1 }
   const bt = T.tys[b]
   // The slot's KEY comes off the SAME `TyMap` its value does — one hop, both halves.
-  if bt is TyMap { return mvSlotOfTyK(bt.mVal, tyMapKeyIsI32(b)) }
+  if bt is TyMap { return mvSlotOfValTyK(bt.mVal, tyMapKeyIsI32(b)) }
   -1
 }
 
@@ -8433,7 +8610,7 @@ export function mvValInnerMvSlotAt(slot: i32): i32 {
   const t = T.tys[ty]
   // NOT peeled through a `| null`: `mapValNameOf` requires a bare `{[K]:V}` spelling
   // too (it answers "" for a nullable map name), so both legs decline together.
-  if t is TyMap { return mvSlotOfTyK(t.mVal, tyMapKeyIsI32(ty)) }
+  if t is TyMap { return mvSlotOfValTyK(t.mVal, tyMapKeyIsI32(ty)) }
   -1
 }
 
@@ -13361,6 +13538,92 @@ export function variantRowOfObjFieldSet(ty: i32): i32 {
   -1
 }
 
+// The DECLARATION-IDENTITY name of an arena type — `shapeNominalOfTy`'s two ARENA rungs,
+// lifted out so this file's other nominal questions can ask them WITHOUT the two
+// field-set scans that follow them there. Both rungs answer by declaration identity and
+// neither guesses: `structIndexOfTy` is the `sTyIx` sidecar banked when the struct
+// declaration was collected, `variantRowOfTy` the same identity over the ARM declarations.
+// "" when the type is not a declared row — which is the answer every anonymous shape
+// gets, and the reason a caller may read a non-empty result as a nominal FACT.
+//
+// The two field-set rungs are deliberately NOT here. They are structural scans, they
+// re-enter `structRowOfObjFieldSet`, and D33 is the row that records what happens when a
+// nominal question is settled by whichever of them fires first.
+export function declNominalOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  const si = structIndexOfTy(ty)
+  if si >= 0 { return sNames[si] }
+  const av = variantRowOfTy(ty)
+  if av >= 0 { return uVariants[av] }
+  ""
+}
+
+// `emit_rep.fieldCodeRefsElemHeap`, which is private to its own module and is the set
+// this file needs for the same reason: 15 a nested struct, 5 a ref list, 28 its `| null`
+// niche — the field codes whose emitted storage is a `(ref [null] <heap>)` the code alone
+// does not name, and therefore the exact set on which two rows can field-set match,
+// code-match and canon-match while emitting different layouts.
+function fieldCodeRefsElemHeapC(code: i32): boolean {
+  code == 15 || code == 5 || code == 28
+}
+
+// That field's ELEMENT, asked of the QUERY side's arena type: a ref list peels its
+// `TyArray`, the `| null` niche peels the nullable first, and a nested struct IS its own
+// element. -1 for every other code and for a type that does not have the peeled shape.
+function fieldElemTyOfQueryTy(ty: i32, code: i32): i32 {
+  if ty < 0 { return -1 }
+  if code == 15 { return ty }
+  let base = ty
+  if code == 28 {
+    const n = T.tys[ty]
+    if n is TyNullable { base = n.nInner } else { return -1 }
+  }
+  if base < 0 { return -1 }
+  const b = T.tys[base]
+  if b is TyArray { return b.aElem }
+  -1
+}
+
+// Are the query field's element and struct row `si` field `fj`'s recorded element PROVEN
+// to be different DECLARATIONS? Nominal on both sides and refutation-only: each side must
+// resolve to a declared row's name for the question to be decidable at all, and an
+// unresolvable side is never a conflict. The ARENA sidecar answers the row side where it
+// covers the row (destringify D5), the recorded NAME where it does not.
+//
+// NOMINAL IS THE WHOLE POINT AND CANON WOULD ANSWER THE WRONG QUESTION. The code-15
+// tightening beside this one compares `repCanonId`s, which is right for its question —
+// two INLINE nested shapes differ iff their structures differ. Here the pair that
+// collapses is `Circle` (a union arm) beside `Dot` (its exact layout twin): ONE canon key,
+// TWO declarations. `DECISIONS.md` keeps the variant/struct-table seam nominal, and this
+// is that seam read from the field-ELEMENT side.
+function fieldElemDeclConflict(qElemTy: i32, si: i32, fj: i32): boolean {
+  const qn = declNominalOfTy(qElemTy)
+  if qn == "" { return false }
+  let rn = declNominalOfTy(sFieldElemTyIxAt(si, fj))
+  if rn == "" { rn = sFieldElemNameAt(si, fj) }
+  if rn == "" { return false }
+  qn != rn
+}
+
+// Does struct row `si` carry a PROVEN element-declaration conflict against the query
+// object type's fields, on any of the named-heap field codes?
+function rowElemDeclConflicts(si: i32, fnames: string[], ftys: i32[]): boolean {
+  let k = 0
+  while k < fnames.length {
+    const fj = sFieldIndex(si, fnames[k])
+    if fj >= 0 {
+      const code = sFieldTypeAt(si, fj)
+      if fieldCodeRefsElemHeapC(code) {
+        if fieldElemDeclConflict(fieldElemTyOfQueryTy(ftys[k], code), si, fj) {
+          return true
+        }
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
 export function structRowOfObjFieldSet(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
@@ -13368,6 +13631,8 @@ export function structRowOfObjFieldSet(ty: i32): i32 {
     const fnames = t.objFieldNames
     const ftys = t.objFieldTypes
     const lim = sScanLim()
+    let first = -1
+    let firstExact = -1
     let si = 0
     while si < lim {
       if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
@@ -13417,10 +13682,35 @@ export function structRowOfObjFieldSet(ty: i32): i32 {
           }
           k = k + 1
         }
-        if ok { return si }
+        if ok {
+          // THE ELEMENT-DECLARATION PREFERENCE (D94). This scan is a FIELD-SET match with
+          // per-field CODE tightening, and a named-heap field's code is not its layout:
+          // two declared rows `{xs: Circle[]}` and `{xs: Dot[]}` agree on field set, on
+          // field code (5) and on canon key (canon renders the arm structurally), so
+          // first-match handed BOTH un-annotated literals the FIRST row and the second
+          // literal's `struct.new` pushed a `(ref $DotListWrapper)` into a field typed
+          // `(ref $CircleListWrapper)`. The channel is on the arena at the node this rung
+          // already holds: the query field's element type resolves to a DECLARATION, and
+          // so does the row's recorded element.
+          //
+          // A PREFERENCE, NOT A REFUTATION, and that distinction is the whole safety
+          // argument. Refuting the conflicting row could return -1 where a row matched,
+          // and a -1 here sends the caller on to `firstSi` — a strictly worse guess than
+          // the conflicting row it just declined. So the conflicting row stays a match and
+          // is merely OUTRANKED: with no conflict anywhere `first` IS `firstExact` and the
+          // answer is byte-identical; where a conflict exists the answer is a row that
+          // already field-set matched. It can never resolve where it did not, and never
+          // decline where it did.
+          if first < 0 { first = si }
+          if firstExact < 0 {
+            if !rowElemDeclConflicts(si, fnames, ftys) { firstExact = si }
+          }
+        }
       }
       si = si + 1
     }
+    if firstExact >= 0 { return firstExact }
+    return first
   }
   -1
 }
@@ -15145,10 +15435,16 @@ export function mapAnnShape(tyIx: i32) {
         // spelling), so neither name rung below can tell the arm from its layout twin
         // either; `vtAn` is the checker's own type for this node and answers nominally.
         const armAn = mvArmHintOfTy(vtAn)
+        // …AND THE SAME KEY REWRITE THE MINT APPLIES (D93). A find that keys a
+        // DIFFERENT name from the mint's is a miss, and a miss here lands on whichever
+        // twin-valued map DID key the render. `mvArmKeyName` is a pure function of
+        // (rendered name, recorded type) and this site holds both, so mint and find
+        // compute one key.
+        const vnA = mvArmKeyName(vn, vtAn)
         if vtAn >= 0 { aAn = mvSlotOfTyKArm(vtAn, kAn, armAn) }
-        if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vn, kAn, armAn) }
+        if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vnA, kAn, armAn) }
         if aAn >= 0 { return aAn }
-        const nmAn = mvSlotByValNameKArm(vn, kAn, armAn)
+        const nmAn = mvSlotByValNameKArm(vnA, kAn, armAn)
         if nmAn >= 0 { return nmAn }
         // A mono-repped value spelling the two scans above never intern (a literal-union
         // atom, a nullable atom) still resolves by KEY alone.
@@ -29159,7 +29455,12 @@ export function mvSlotOfMapValNameOrMonoKTy(
   keyI32: boolean,
   valTy: i32,
 ): i32 {
-  const iv = mvCanonValName(ivIn)
+  // THE SAME KEY REWRITE THE MINT APPLIES (D47's arm name, D93's nested-arm render).
+  // `mvArmKeyName` is a pure function of (rendered name, recorded value type) and this
+  // rung holds both, so the op find keys exactly what the mint keyed. Where the caller
+  // hands no type it is the identity and every rung resolves as master does.
+  const ivK = mvArmKeyName(ivIn, valTy)
+  const iv = mvCanonValName(ivK)
   if mvValKindOfName(iv) == -1 { return -1 }
   // THE FIND'S HALF OF THE ARM COMPONENT (D48) — the same tri-state the mint threads.
   // `valTy` is the checker's recorded map-VALUE type at this op, so it answers the
@@ -29168,7 +29469,7 @@ export function mvSlotOfMapValNameOrMonoKTy(
   const armMo = mvArmHintOfTy(valTy)
   let aMo = -1
   if valTy >= 0 { aMo = mvSlotOfTyKArm(valTy, keyI32, armMo) }
-  if aMo < 0 { aMo = mvSlotOfValNameTyKArm(ivIn, keyI32, armMo) }
+  if aMo < 0 { aMo = mvSlotOfValNameTyKArm(ivK, keyI32, armMo) }
   if aMo >= 0 { return aMo }
   const nmMo = mvSlotByValNameKArm(iv, keyI32, armMo)
   if nmMo >= 0 { return nmMo }

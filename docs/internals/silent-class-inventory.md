@@ -95,7 +95,7 @@ arm-free control by construction — a layout twin has to be declared for them t
 — i.e. exactly D93/D94's territory. The composition is invisible to an outcome-class grader
 and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the same column, and their message changes from `unsupported map value type` to D50's own `field access receiver is not a struct` / `field access but no struct type declared` — the set of message-movers-that-FULL-makes-`correct` is SET-IDENTICAL to the 34) |
 | D88 D100 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; TWO roots, and the ablation says so — 24 cells and 18 cells, pairwise intersection **0**, and the union of the singles is SET-IDENTICAL to the full branch on a 2,850-cell grid. Both fixes are a complement that was already written. D88: `monoArgTyName` pinned a generic's parameter from `nodeTyMapName`, whose renderer spells a declared union ARM STRUCTURALLY, so the clone's annotation named a fresh anonymous arena index and `collectA` minted a SECOND mv slot for one map; `shapeNominalOfTy` already recurses through `TyArray` for a LIST element and the MAP was the one container it never grew. D100: filed as D39's CHANNEL case, and the measurement its own row named and did not take REFUTES that — `repStructSlotsTwin(Circle, Dot)` is 1, so the two "claimants" are ONE heap type and `repSlotOfTy`'s bridge was asking for a unique ROW where soundness needs a unique HEAP TYPE. **The 9,450-cell D52 grid goes 50 silent → 0**, the first time that population has been empty; the 3,144-cell D75/D82 grid moves 0 cells; corpus byte-identical bar the two graduated fixtures) |
-| D93 D94 | check-clean invalid wasm | **NEW 2026-08-26** — two rows the D47/D50 grid produced, both PRE-EXISTING on master and both the layout-twin collapse one container further out than D48/D64 reached. D93: a NESTED arm-valued map (`{[string]: {[string]: Circle}}`) beside its layout twin — silent on master at the ALIAS spelling, and D47's convergence brings the other three spellings to the same verdict. D94: a struct literal bound with NO annotation, beside two layout-twin declared rows whose FIELD elements differ in arm-ness — silent on master at 5 of its 6 cells |
+| D93 D94 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **NEW 2026-08-26** — two rows the D47/D50 grid produced, both PRE-EXISTING on master and both the layout-twin collapse one container further out than D48/D64 reached. D93: a NESTED arm-valued map (`{[string]: {[string]: Circle}}`) beside its layout twin — silent on master at the ALIAS spelling, and D47's convergence brings the other three spellings to the same verdict. D94: a struct literal bound with NO annotation, beside two layout-twin declared rows whose FIELD elements differ in arm-ness — silent on master at 5 of its 6 cells |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 | D52 D66 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; D52 is D39's seam read from the other end and it needed NO channel — the annotation is on the LOCAL, `criRetLocalLet` already hands the result-valtype pass that binding, and `letAnnVariantIdx` was written, exported and documented correct with no caller on this path. What was missing is the ROUTE: `fRetKind` had no inferred `"variant"` tier and `emitOneFuncType`'s inferred `infSlot` ladder had no `variant` arm — the three items D51's row predicted in writing. A FOURTH edit was needed and the disassembly is what found it: with only the functype corrected, `mk` validated and the CALLER did not (`struct.get 0 0` over a `(ref 1)` receiver), so the engine's message moved function and changed one word. 180 of a 9,450-cell grid moved, 0 backward — 84 silent → runs and 96 loud → runs; silent 200 → 116. Corpus: 1,850 of 1,851 co-emitted files byte-identical, the one difference being D52's own pin. D66 rides the same rung and its filed asymmetry — "annotate the CALLBACK'S RETURN; annotating the local does not" — is retired) |
 
@@ -7124,8 +7124,8 @@ sharper classifier found no other row hiding behind the conflation** — D22, D2
   five items in §4d — the `optchain` construct's 0-of-132 and the closure-alias 54 both
   tripped it.
 
-### D93 — a NESTED arm-valued map beside its layout twin collapses onto one mv slot
-**check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (12 of its 1,024 cells: `nestedmap` x `arm_twin` x pairing=1, across all four spellings) · PRE-EXISTING on `8bf0f20f` at the ALIAS spelling (4 of the 12, byte-identical message and offset) · D47's convergence brings the other 8 to the alias's verdict — D49's accounting, and the two rows it produced that way were D63 and D64 · NO generic, NO import · D48's shape ONE CONTAINER OUT**
+### D93 — [CLOSED 2026-08-27] a NESTED arm-valued map beside its layout twin collapses onto one mv slot
+**CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (12 of its 1,024 cells: `nestedmap` x `arm_twin` x pairing=1, across all four spellings) · PRE-EXISTING on `8bf0f20f` at the ALIAS spelling (4 of the 12, byte-identical message and offset) · D47's convergence brings the other 8 to the alias's verdict — D49's accounting, and the two rows it produced that way were D63 and D64 · NO generic, NO import · D48's shape ONE CONTAINER OUT · CLOSED by #1958 — the mv key goes NOMINAL at every depth and the sixth typed find takes D48's hint, and neither half is the answer alone**
 
 Repro:
 
@@ -7209,10 +7209,100 @@ Repro:
   swapping the mv layer's value renderer is the change D-MAPNODETY refused with 128 measured
   slot moves. That is the shape of the fix and the reason it is its own row.
 
+**WHAT CLOSED IT, AND THE BULLET ABOVE IS RIGHT ABOUT THE RENDERER AND WRONG ABOUT THE
+SCOPE.** The fix IS `tyToNominalName`, and it is not a renderer SWAP: it is the mv table's
+KEY, rewritten only where the render drops a DECLARATION. `mvArmKeyName` — D47's rewrite,
+which answered only for a value that IS an arm — grows two rungs, both gated on the map's
+TRANSITIVE value being declared (`mvDeepArmOfTy` for an arm, `mvDeepDeclOfTy` for a struct
+row). A genuinely anonymous `{[string]: {r:i32}}` reaches neither and keeps the render it
+has always keyed, so the 128 slot moves the wholesale swap measured do not happen.
+
+**AND A KEY IS WHY THE PAIR NEVER HAD TO BE OBSERVED.** Both refuted candidates above had
+to answer "will a second, differently-armed value later claim this slot?" — a property of
+the PAIR that a mint minting one slot at a time cannot see, which is why every shape-level
+approximation of it fired on SINGLE-UNIT programs. A key is computed per claimant from what
+already distinguishes them; mint and find compute it the same way; a single-unit program
+merely gets its slot under a different name. No refusal, no floor, no new dialect.
+
+**THREE MORE THINGS WERE NEEDED AND EACH ONE IS THE SAME SENTENCE ONE RUNG DOWN.**
+
+* **The typed FINDS must key what the mint keyed.** `mapAnnShape` (every function
+  boundary) and `mvSlotOfMapValNameOrMonoKTy` (the routed op find) both hold the rendered
+  name AND the recorded type, so both now call `mvArmKeyName` themselves. A find that keys
+  a different name from the mint's is a miss, and a miss lands on whichever twin-valued map
+  DID key the render.
+* **The slot's ARM component had to widen to an ARM SIGNATURE.** D48 made "is this value a
+  declared arm" the third component of a slot's identity; for a nested map the value is a
+  `TyMap` and `variantRowOfTy` answers -1 on both sides. `mvValArmSig` is a SECOND column
+  beside `mvValVariantIdx`, not a widening of it — that one's readers are the map-store
+  seed, the `??` default seed, the optional-chain field resolver, the kind-1 dedup guard
+  and six classifiers, and every one reads `>= 0` as "the VALUE is an arm".
+* **The SIXTH typed find was un-hinted, and it is what made the row DECLARATION-ORDER
+  dependent.** `mvSlotOfTyK` took the map value's arena type and passed `MV_ARM_NOHINT`, so
+  it matched a slot of any arm parity. With the slots correctly separated,
+  `rlElemMapValMvSlot` still asked it for the map ELEMENT of a nested map's vals list and
+  got whichever same-canon inner slot was minted FIRST: the arm-valued nested map worked
+  when the arm was declared first and emitted the twin's map struct when the twin was.
+  Measured, the residue was exactly the 12 `order=b` cells of the grid below. The
+  un-hinted two-argument form is DELETED rather than deprecated — every one of its six
+  callers held the type, so the hint is a pure function of an argument they already had.
+
+**THE ABLATION, and it is a COMPOSITION rather than three roots.** One compiler per
+candidate, all swept against one 300-cell grid, master `8d070d46`:
+
+| compiler | what it adds | runs | loud emit | invalid wasm | moved |
+|---|---|---|---|---|---|
+| master | `8d070d46`                                  | 252 | 15 | 33 | — |
+| `LA` | D94's element-declaration preference          | 258 | 15 | 27 |  6 |
+| `LB` | the nominal mv KEY + the slot's ARM SIGNATURE  | 267 | 15 | 18 | 15 |
+| `LD` | the sixth typed find's hint                    | 252 | 15 | 33 | **0** |
+| `LBD` | `LB` + `LD`                                   | 279 | 15 |  6 | 27 |
+| full | all three                                      | **285** | 15 | **0** | 33 |
+
+Every pairwise intersection is EMPTY, the union of `LA` and `LBD` is set-identical to the
+full branch's 33 and the full branch agrees with each on every cell it moves. **`LD` moves
+ZERO cells alone and is not redundant**: `LBD` − `LB` is 12 cells that need BOTH, so this is
+the D39/D40/D41 shape (a composition) and not D48/D63/D64's (three disjoint roots). 33
+cells moved, every one to `runs`, **0 backward and 0 message-only**.
+
+**THE CLAIMANTS ARE TWO HEAP TYPES, NOT ONE — D100's discriminator, taken on master
+`8d070d46` before anything was built.** D100 was filed as a channel case and refuted by
+exactly this measurement, so it was run here first:
+
+    HEAP mv slots Circle(0,k1,ty17) {[string]:{r:i32}}(1,k6,ty18) {r:i32}(2,k1,ty19)
+    HEAP rl slot 0 Circle heap=1   ·   HEAP rl slot 2 Dot heap=0
+
+Three mv slots for FOUR maps — the twin's outer map has no slot of its own — and the two
+inner values sit in two different element heaps. So there was a pair to observe, D100's
+"one heap type, therefore ask for heap uniqueness" shortcut does not apply here, and the
+answer had to make the two claimants key differently rather than make a predicate smarter.
+
+**TWO FURTHER CANDIDATES WERE BUILT AND ARE RECORDED BECAUSE THEY ARE THE OBVIOUS ONES.**
+
+* **The rep-key VARIANT rung at the map-value position** — `repElemKey` / `repMvValKey` /
+  the shared hash-cons walk keying a declared ARM `V<n>` where they key a declared struct
+  `S<n>`. It is a real asymmetry (an arm has no `sNames` row, so it fell into the structural
+  expansion and is character-for-character an anonymous `{r:i32}`), and it moves **0 cells
+  alone and 0 in composition** with everything above. Dropped as speculative.
+* **The same rung in the `TyObj` arm itself**, where the heap argument applies just as
+  well. That version DOES close the 12 order-b cells on its own — and it REDDENS a working
+  corpus program: `generics/mono-callback-bound-arm-beside-layout-twin.vl` becomes
+  `emitProgram: function-value call arity has no interned signature`. Diagnosed rather than
+  guessed at — the call site keys `[r1;r1;>i]` against an interned `[r0;r0;>i]`, i.e. two
+  ref-list slots that are layout twins get two different `$fnsig` digits. `repSigSlotTokOfKind`
+  canonicalises a STRUCT slot digit through `repStructSlotRep` and its own header says the
+  other kinds "index their OWN tables and pass through unchanged" — the reflist complement
+  is not written. That is the row the next attempt starts from, and it is a widening that
+  must be swept on its own before it rides along.
+
+Regression fixture: `tests/cases/maps/nested-arm-valued-map-beside-layout-twin.vl` (both
+declaration orders plus the single-unit function-boundary control the refuted floors
+reddened).
+
 ---
 
-### D94 — an UN-ANNOTATED struct literal beside two layout-twin declared rows whose field elements differ in arm-ness
-**check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (6 of its 1,024 cells: `structfield` x `inferred` x `arm_twin` x pairing=1) · PRE-EXISTING on `8bf0f20f` at **5 of the 6** — every construct and both declaration orders except `forin`/order-a, where D50's floor fired first and hid it · NO generic, NO import · D64's shape at the LITERAL'S ROW PICK rather than at the field-code dedup**
+### D94 — [CLOSED 2026-08-27] an UN-ANNOTATED struct literal beside two layout-twin declared rows whose field elements differ in arm-ness
+**CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (6 of its 1,024 cells: `structfield` x `inferred` x `arm_twin` x pairing=1) · PRE-EXISTING on `8bf0f20f` at **5 of the 6** — every construct and both declaration orders except `forin`/order-a, where D50's floor fired first and hid it · NO generic, NO import · D64's shape at the LITERAL'S ROW PICK rather than at the field-code dedup · CLOSED by #1958 — the field ELEMENT's declaration identity, PREFERRED rather than refuted, at the rung the ambiguity arm already falls to**
 
 Repro:
 
@@ -7266,6 +7356,50 @@ Repro:
   variant loop var when the receiver is a struct field of an un-annotated literal — a
   condition on the failing CELL, not on the loop. D50's floor was masking this, not guarding
   it.
+
+**WHAT CLOSED IT, AND THE ROW'S OWN "the candidate fix is a rung, not a channel" IS
+CORRECT — the rung is one further down than the row names.** `shapeFieldTypeCompat` is
+never reached: `fieldCodeForMatch({xs: Circle[]}'s field)` answers **5**, so the scan takes
+its `want >= 0` leg, the row's code is 5 too, and the code-15 canon tightening that lives
+in the `else` leg cannot fire. Probed at the site on master, both literals:
+
+    PROBE sioc obj=27 matches=2 first=1 strictC=2 nodeTyIsObj=T repRow=-1 fieldSet=1
+    PROBE sioc obj=47 matches=2 first=1 strictC=2 nodeTyIsObj=T repRow=-1 fieldSet=1
+
+`repRow=-1` is **D64's guard doing its job** — `repRowOfTyStruct` declines because the two
+canon-key twins have divergent emitted layouts — and `fieldSet=1` is the first-match GUESS
+that follows it, handed to BOTH literals. So the layer is `structRowOfObjFieldSet`, whose
+per-field tightening had a rung for code 15 and none for the named-heap codes beside it.
+
+**THE CHANNEL IS ON THE ARENA AT THE NODE THAT RUNG ALREADY HOLDS**, and it is NOMINAL, not
+canonical. The query field's element type resolves to a DECLARATION — `structIndexOfTy` for
+a struct, `variantRowOfTy` for an arm, the two rungs `shapeNominalOfTy` pairs and D33 is the
+row for pairing them — and the row side has the same fact in `sFieldElemTyIx` /
+`sFieldElemName`. Canon would answer the wrong question: `Circle` and `Dot` are ONE canon
+key and TWO declarations. `declNominalOfTy` is those two arena rungs lifted out of
+`shapeNominalOfTy` WITHOUT its two field-set scans, which would re-enter this resolver.
+
+**A PREFERENCE, NOT A REFUTATION, and that is the whole safety argument.** A conflicting row
+stays a match and is merely outranked, so the scan can never return -1 where it returned a
+row — and a -1 here sends the caller on to `firstSi`, a strictly worse guess than the
+conflicting row it just declined. With no conflict anywhere `first` IS `firstExact` and the
+answer is byte-identical.
+
+**THE CLAIMANTS ARE TWO HEAP TYPES, NOT ONE** (D100's discriminator, master `8d070d46`):
+
+    HEAP struct rows BoxA(1) BoxB(2) canonEq=1 codesEq=0 twin=0 sTwin=1/2
+
+`repStructSlotsTwin` already answers **0** and is already CALLED — through
+`repRowOfTyStruct`'s decline. Unlike D100 the pairwise predicate was not the missing piece;
+the missing piece is that the rung the decline falls through to had no element test at all.
+
+**GRID: 6 cells, every one `check-clean invalid wasm` → `runs`, 0 in any other direction**,
+disjoint from D93's 27 (see D93's ablation table). All 6 are `structfield` x `inferred`,
+which is the coordinate the row names, at both declaration orders.
+
+Regression fixture: `tests/cases/structs/unannotated-literal-beside-arm-elem-field-twins.vl`
+(both declaration orders plus the two-arms-of-two-unions control a future tightening of this
+rung into a refutation would move).
 
 ---
 
