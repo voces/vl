@@ -492,6 +492,42 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-arm-valued-map-through-generic.vl` per the
 // REFILLS procedure below, in the same commit that swapped this constant.
 //
+// THAT D88 SPECIMEN CLOSED, AND THE SUCCESSOR IS THE FIRST ONE IN THIS GENEALOGY WITH NO
+// DECLARED TYPE IN IT. D88 was the monomorphizer meeting an arm-valued map: `monoArgTyName`
+// pinned the instance from `nodeTyMapName`, whose renderer spells a declared union ARM
+// STRUCTURALLY, so the clone's annotation named a fresh anonymous arena index and `collectA`
+// minted a SECOND mv slot for one map. The complement was already written one container over
+// — `shapeNominalOfTy` recurses through `TyArray` for a LIST element and the MAP was the one
+// container it never grew — and the fix is that missing twin. It moves 24 cells of this
+// change's 2,850-cell grid and takes the 9,450-cell D52 grid to **0 silent cells**, which is
+// the first time that population has been empty.
+//
+// THE SIXTH SOURCE EARNED ITS KEEP AGAIN, and this time in the OTHER direction: re-grading
+// D52's grid is what confirmed D88 was that grid's last silent family, and re-grading the
+// 3,144-cell D75/D82 grid (0 moved, 0 backward) is what said the fix was inert everywhere it
+// was not the answer. Neither number was available from this change's own grid.
+//
+// A SEVENTH SOURCE, AND IT IS THE ONE THAT FOUND THE SUCCESSOR'S NEIGHBOUR: diff the
+// MESSAGES, not only the outcome classes. Closing D100 moved 18 cells from a positionless
+// `ref valtype with no interned shape` to an anchored `binding's inline-shape type has an
+// unsupported field` — loud to a DIFFERENT loud, invisible to every outcome-class count —
+// and that second sentence is `letAnnIsUninternedShape` asking `structIndexByName` where
+// D53 taught `paramStructIndex` to ask the bridge. Filed as D111, with the measurement that
+// says the obvious widening is NOT the fix (it moves 64 cells to `runs` and 19 to SILENT).
+//
+// THE SUCCESSOR IS A NESTED MAP WHOSE INNER VALUE IS AN ANONYMOUS SHAPE, and it is chosen
+// for what it does NOT contain: no union, no arm, no exact layout twin, no generic, no
+// import, no declared type at all — every axis the last five specimens turned on. Its
+// message differs in NULLABILITY (`expected (ref null $type), found (ref $type)`) rather
+// than in heap type, so it is a different seam as well as a different program. Two controls
+// bracket it, both re-RUN against this tree: one nesting level less RUNS, and the same
+// nested map with a MONO inner value RUNS. Re-RUN against this tree at the swap rather than
+// inherited: `vl check` rc 0 with NO diagnostics at all, `--codegen` rc 1 with `not valid
+// wasm` + `type mismatch: expected (ref null $type), found (ref $type)`, `--codegen
+// --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `764ad0dd` with the same
+// sentence. It is `silent-class-inventory.md` D112, pinned as
+// `tests/cases/soundness/xfail-miscompile-nested-map-anon-shape-value.vl` per the REFILLS
+// procedure below, in the same commit that swapped this constant.//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -528,18 +564,14 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
 // state can be entered halfway.
 // ─────────────────────────────────────────────────────────────────────────────
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
-  `type Sq = { s: i32 }\n` +
-  `type Shape = Circle | Sq\n` +
-  `type Dot = { r: i32 }\n` +
-  `function idg<T>(x: T): T { return x }\n` +
-  `function thru(x: {[string]: Circle}) { return x }\n` +
-  `function mk(n: i32) {\n` +
+const INVALID_MODULE_SRC: string | null = `function mk(n: i32) {\n` +
+  `  const i0 = Map()\n` +
+  `  i0["k"] = { r: n }\n` +
   `  const c = Map()\n` +
-  `  c["k"] = { r: n }\n` +
-  `  return idg(thru(c))\n` +
+  `  c["o"] = i0\n` +
+  `  return c\n` +
   `}\n` +
-  `print(idg(((mk(7))["k"] ?? { r: 0 }).r))\n`;
+  `print((((mk(7))["o"] ?? Map())["k"] ?? { r: 0 }).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
