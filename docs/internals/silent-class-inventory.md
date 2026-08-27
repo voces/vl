@@ -7125,7 +7125,7 @@ sharper classifier found no other row hiding behind the conflation** — D22, D2
   tripped it.
 
 ### D93 — [CLOSED 2026-08-27] a NESTED arm-valued map beside its layout twin collapses onto one mv slot
-**CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (12 of its 1,024 cells: `nestedmap` x `arm_twin` x pairing=1, across all four spellings) · PRE-EXISTING on `8bf0f20f` at the ALIAS spelling (4 of the 12, byte-identical message and offset) · D47's convergence brings the other 8 to the alias's verdict — D49's accounting, and the two rows it produced that way were D63 and D64 · NO generic, NO import · D48's shape ONE CONTAINER OUT · CLOSED by #1958 — the mv key goes NOMINAL at every depth and the sixth typed find takes D48's hint, and neither half is the answer alone**
+**CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (12 of its 1,024 cells: `nestedmap` x `arm_twin` x pairing=1, across all four spellings) · PRE-EXISTING on `8bf0f20f` at the ALIAS spelling (4 of the 12, byte-identical message and offset) · D47's convergence brings the other 8 to the alias's verdict — D49's accounting, and the two rows it produced that way were D63 and D64 · NO generic, NO import · D48's shape ONE CONTAINER OUT · CLOSED by #1959 — the mv key goes NOMINAL at every depth and the sixth typed find takes D48's hint, and neither half is the answer alone**
 
 Repro:
 
@@ -7302,7 +7302,7 @@ reddened).
 ---
 
 ### D94 — [CLOSED 2026-08-27] an UN-ANNOTATED struct literal beside two layout-twin declared rows whose field elements differ in arm-ness
-**CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (6 of its 1,024 cells: `structfield` x `inferred` x `arm_twin` x pairing=1) · PRE-EXISTING on `8bf0f20f` at **5 of the 6** — every construct and both declaration orders except `forin`/order-a, where D50's floor fired first and hid it · NO generic, NO import · D64's shape at the LITERAL'S ROW PICK rather than at the field-code dedup · CLOSED by #1958 — the field ELEMENT's declaration identity, PREFERRED rather than refuted, at the rung the ambiguity arm already falls to**
+**CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (6 of its 1,024 cells: `structfield` x `inferred` x `arm_twin` x pairing=1) · PRE-EXISTING on `8bf0f20f` at **5 of the 6** — every construct and both declaration orders except `forin`/order-a, where D50's floor fired first and hid it · NO generic, NO import · D64's shape at the LITERAL'S ROW PICK rather than at the field-code dedup · CLOSED by #1959 — the field ELEMENT's declaration identity, PREFERRED rather than refuted, at the rung the ambiguity arm already falls to**
 
 Repro:
 
