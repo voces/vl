@@ -24185,9 +24185,67 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     return globalVariantIndexSid(sidOfNode(exprIx))
   }
   // A call to a `: Cat`-returning function yields the concrete variant ref.
+  //
+  // THE THREE CALLEE FORMS, TAKEN FROM THE NULLABLE TWIN ARM FOR ARM. `nulVariantIdxOfExpr`
+  // — whose header tabulates this very correspondence — resolves a `Call` through THREE
+  // rungs: a DECLARED function (`fnIndexOfSid`), a CLOSURE VALUE (`calleeCloSigKeySid` +
+  // `sigKeyRetSlot`), and a closure-valued FIELD (`fieldClosureFeOfRecv`). This ladder had
+  // only the first, so every arm delivered through a lambda binding, a function value, a
+  // `holder.go(…)` field closure or a closure PARAM answered -1 — and -1 here is not
+  // "unknown", it is the whole kind decision: `globalKind`'s variant arm IS
+  // `exprVariantIndex(...) >= 0`, and `letIsVariant`'s header says "THE INIT'S REP IS
+  // `exprVariantIndex`'S ANSWER, AND NOTHING SECOND-GUESSES IT". So a -1 fell through to
+  // `exprStruct` / `structIndexOfExpr`, which names the STANDALONE struct table — a table a
+  // union arm has no row in, because `collectS` skips a `type X = {…}` that is a union
+  // member.
+  //
+  // WHAT THAT COSTS DEPENDS ON WHETHER THE ARM HAS A LAYOUT TWIN, and both outcomes are
+  // wrong: with a plain struct of the same field set in the program (`type Dot = {r:
+  // string}` beside `type Circle = {r: string}`) the struct scan MATCHES the twin and hands
+  // back its `sHeapIdx` row — a DIFFERENT heap type from the arm's `uVarHeap` one, so the
+  // cell is declared `(ref null $Dot)` and the call returns `(ref $Circle)`: check-clean,
+  // INVALID WASM (`expected (ref null $type), found (ref $type)`). With no twin the scan
+  // answers -1 and `fbValtype`'s bounds guard converts it to the loud `ref valtype with no
+  // interned shape`. Same root, two disguises — which is why the loud half is not evidence
+  // the silent half is absent.
+  //
+  // THE HEAPS ARE TWO, AND THEY MUST STAY TWO. Probed on the census cell
+  // `cellsA/a038675.vl`: `sRow 0 name=Dot heap=0` and `uRow 0 name=Circle heap=1`. Delete
+  // the union from that program and `Circle` re-enters the struct table as `sRow 2 … heap=1
+  // sTwin=1` — a structural twin of `Dot`, SHARING its heap, which is exactly why removing
+  // the union rescues these programs. The fix is to name the arm's own row while the union
+  // stands, never to merge the namespaces (`DECISIONS.md`: `uVarHeap` and `sHeapIdx` are
+  // two namespaces on purpose).
+  //
+  // KIND-GATED ON EVERY RUNG, for the reason the twin's header spends its length on:
+  // `cloRetValSlot` and the `$fnsig` result digit are POLYMORPHIC over five kinds, so an
+  // ungated read hands a struct row / ref-list slot / map shape back as a variant index —
+  // a number in the wrong table.
   if e is Call {
     const callee = P.nodes[e.callFn]
-    if callee is Ident { return fnRetVariantIndexSid(sidOfNode(e.callFn)) }
+    if callee is Ident {
+      const cvsid = sidOfNode(e.callFn)
+      // A DECLARED function keeps its own richer resolution (the `: Cat` annotation, then
+      // the inferred `fRetKind`/`fRetStructIdx` pair) — unchanged, and asked first so no
+      // named-callee answer moves.
+      if fnIndexOfSid(cvsid) >= 0 { return fnRetVariantIndexSid(cvsid) }
+      // A CLOSURE-VALUE callee (`const f = (x: Circle) => x; f(c)`, `const f = idc; f(c)`,
+      // a closure PARAM `f(c)`), which `fnIndexOfSid` misses by construction. The resolved
+      // `$fnsig` key is the SAME key `emitCallRef` casts the call through, so the slot this
+      // reads and the functype the call site emits come from one fact.
+      const cvk = calleeCloSigKeySid(cvsid, fnIx)
+      if sigKeyRetKind(cvk) == "variant" { return sigKeyRetSlot(cvk) }
+      return -1
+    }
+    // A closure-valued FIELD callee (`holder.go(c)`) — the twin's third rung, same gate.
+    if callee is Member {
+      const cvfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+      if cvfe >= 0 {
+        if cloRetValKind(cvfe) == "variant" { return cloRetValSlot(cvfe) }
+      }
+      return -1
+    }
+    return -1
   }
   // An index into a `Cat[]` variant-element ref list yields the bare variant struct.
   if e is Index {
@@ -29534,7 +29592,153 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
         }
       }
     }
-    return mapShapeOfExpr(d.letInit, fnIx)
+    // THE DESTINATION AN UN-ANNOTATED `Map()` NEVER HAD (D203) — see `letMapDestShape`.
+    //
+    // IT REFINES AN ANSWER, IT NEVER SUPPLIES A MISSING ONE, and that bound is measured.
+    // The destination is consulted only where the initializer's own resolution already
+    // named a slot: the rung then corrects WHICH slot, which is the silent half of the
+    // family. Where the initializer resolves the `-3` unsupported floor the binding keeps
+    // it, even though the destination could name a slot — because that floor is the LOUD
+    // half, and handing it a slot moves the disagreement one layer in rather than
+    // resolving it. Ungated, census block C moves 2,254 loud cells to `runs` and **620
+    // from a loud reject to check-clean invalid wasm**, every one of them at
+    // `cont=list_of_map` with `claim >= 1` — a container ALIAS plus a spare value of it,
+    // which is D181's open row, reached because the map now resolves and the alias's
+    // second claim on the same layout still does not. Block B is the same shape at 85
+    // cells. `runs` LOST is 0 either way; this bound is about the loud->silent direction,
+    // which this programme treats as a blocker in its own right.
+    const ish = mapShapeOfExpr(d.letInit, fnIx)
+    if ish >= 0 {
+      const dsh = letMapDestShape(letIx, fnIx)
+      if dsh >= 0 { return dsh }
+    }
+    return ish
+  }
+  -1
+}
+
+// THE MAP SHAPE THE BINDING'S DESTINATION DECLARES, or -1 (D203).
+//
+// An un-annotated `const lv1 = Map()` takes its VALUE type from the checker's inference at
+// the first key write — `lv1["k0"] = { r: 7 }` pins `{r: i32}`, the object literal's own
+// type. That inference never looks forward, so when the binding is then stored into a
+// DECLARED destination whose value type is a map of something else
+// (`const c: {[string]: {[string]: Circle}} = Map()` with `type Circle = { r: Shape2 }`),
+// the emitter has two map structs for one map: the binding's local/global cell is typed
+// from the inferred value and the destination's vals element from the declaration.
+// `vl check` is clean and the module is invalid — "type mismatch: expected (ref $type),
+// found (ref $type)" at the store.
+//
+// THIS IS A *FIND*, NOT A MINT, WHICH IS THE WHOLE SAFETY ARGUMENT (D-MAPNODETY's rule).
+// Every slot this returns was already interned by the DESTINATION'S OWN annotation walk —
+// `{[string]: {[string]: Circle}}` mints the inner map's slot through `mvShapeOfMapName`'s
+// kind-6 recursion, `{[string]: Circle}[]` through `rlInternName`'s map-element arm, and a
+// struct field through `collectS`. So this rung can only make the binding land on a slot
+// that exists; it interns nothing and cannot skip a mint.
+//
+// THREE DESTINATION FORMS, one per container family the census's `cont` axis separates,
+// because the language spells them three ways and no one of them subsumes the others:
+//   · `dst[k] = m` — the nested-map store (`cont=nestedmap`, `map3`). The destination's
+//     own shape resolves, and its VALUE is the map this binding must be.
+//   · `const c: {[string]: V}[] = [m]` — the list-of-maps literal (`cont=list_of_map`).
+//     The annotation's ref-list slot names a map ELEMENT; that element's value slot is it.
+//   · `const c: W = { f: m }` — the struct field (`cont=structfield`, `structfield2`). The
+//     annotation's struct row and the field name give the field's recorded (KEY, VALUE).
+//
+// NAME-SCOPED OVER THE WHOLE ARENA, on `letInfStrListByUse`'s precedent — the usage-driven
+// element inference for an un-annotated empty `[]` does exactly this scan for exactly this
+// reason. First match wins.
+function letMapDestShape(letIx: i32, fnIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const ini = P.nodes[unwrapParen(d.letInit)]
+    // Only a BARE `Map()` constructor. A passthrough initializer already names another
+    // binding's shape and must keep it.
+    let bare = false
+    if ini is Call {
+      const cf = P.nodes[ini.callFn]
+      if cf is Ident {
+        if cf.identName == "Map" { bare = true }
+      }
+    }
+    if !bare { return -1 }
+    const nm = d.letName
+    let i = 0
+    while i < P.nodes.length {
+      const nd = P.nodes[i]
+      // (a) `dst[k] = nm`
+      if nd is BinExpr {
+        if nd.binOp == "=" {
+          const rhs = P.nodes[unwrapParen(nd.binRight)]
+          if rhs is Ident {
+            if rhs.identName == nm {
+              const lhs = P.nodes[unwrapParen(nd.binLeft)]
+              if lhs is Index {
+                const os = mapShapeOfExpr(lhs.idxArr, fnIx)
+                if os >= 0 {
+                  if mvValIsMap(os) {
+                    const inner = rlElemMapValMvSlot(mvRlSlot[os])
+                    if inner >= 0 { return inner }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      // (b) `const c: {[string]: V}[] = [nm]`  ·  (c) `const c: W = { f: nm }`
+      if nd is LetDecl {
+        if nd.letType >= 0 && nd.letInit >= 0 {
+          const dini = P.nodes[unwrapParen(nd.letInit)]
+          if dini is ArrayLit {
+            let ei = 0
+            while ei < dini.arrElems.length {
+              const el = P.nodes[unwrapParen(dini.arrElems[ei])]
+              if el is Ident {
+                if el.identName == nm {
+                  const rs = letAnnRefListSlot(i)
+                  if rs >= 0 && rs < rlElemKindTbl.length {
+                    if rlElemKindTbl[rs] == 3 {
+                      const iv = rlElemMapValMvSlot(rs)
+                      if iv >= 0 { return iv }
+                    }
+                  }
+                }
+              }
+              ei = ei + 1
+            }
+          }
+          if dini is ObjLit {
+            const dsi = letAnnStructIdx(i)
+            if dsi >= 0 {
+              let fj = 0
+              while fj < dini.objFields.length {
+                const ff = P.nodes[dini.objFields[fj]]
+                if ff is FieldInit {
+                  const fv = P.nodes[unwrapParen(ff.fiValue)]
+                  if fv is Ident {
+                    if fv.identName == nm {
+                      const fi2 = sFieldIndex(dsi, ff.fiName)
+                      if fi2 >= 0 {
+                        const fc = sFieldTypeAt(dsi, fi2)
+                        if fc == 19 || fc == 29 {
+                          const fs = sFieldMapShape(dsi, fi2)
+                          if fs >= 0 { return fs }
+                        }
+                      }
+                    }
+                  }
+                }
+                fj = fj + 1
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
   }
   -1
 }
@@ -30589,11 +30793,45 @@ function annSigKey(name: string) {
 //     litunion split below it distinguishes a declared ALIAS (keys the i32 atom) from an
 //     inline litunion (which really is a string). That is `sigKeyOfTy`'s own
 //     `unionAliasDeclNameOfTy` subtlety and carries an invalid-wasm witness.
-//   * OBJECTS — the row lookup needs `structIndexOfTy`, whose `sTyRow` reverse map B248
-//     measured as NOT covering inline-shape rows that the name path field-set-matches.
+//   * OBJECTS — the STRUCT row lookup needs `structIndexOfTy`, whose `sTyRow` reverse map
+//     B248 measured as NOT covering inline-shape rows that the name path field-set-matches.
+//     **A UNION ARM IS THE ONE OBJECT THIS NOW ANSWERS FOR (D196), and it is the opposite
+//     situation**: the name path does not merely under-cover it, it answers WRONG — the
+//     render softens `Circle` to `{r: i32}` and `structIndexOfTypeName` field-set-matches
+//     the arm's plain-struct layout twin. An arm's identity is its DECLARATION, so only the
+//     arena can answer, and `variantRowOfTy` is index-only, so it cannot claim a struct.
 //   * FUNCTIONS and NULLABLES — the name arm reads a paren-wrapped rendering.
 //
 // Dual-written inside `sigKeyOfTy` over the corpus: **152 agree, 0 disagree, 3 decline.**
+// True when variant row `vi` has an EARLIER LAYOUT TWIN — another arm that will share its
+// `uVarHeap` heap type once `buildVariantTwins` runs. `repVariantSlotsTwin` is the pairwise
+// form of that pass and is deliberately "independent of `buildVariantTwins` having run", so
+// this is answerable at `$fnsig` INTERN time, which is where it has to be.
+//
+// WHY THE `$fnsig` KEY PRODUCERS BELOW HAVE TO ASK. `repSigSlotTokOfKind` canonicalises a
+// STRUCT slot through `repStructSlotRep` for exactly this reason and passes a VARIANT slot
+// through unchanged, so two layout-twin arms key TWO different `$fnsig`s (`V0;>V0;` and
+// `V1;>V1;`) while sharing ONE heap type. Two structurally identical functypes at two
+// indices of ONE rec group are DISTINCT types in WasmGC, so the `call_indirect` type
+// operand and the callee's declared functype disagree: the module VALIDATES and traps at
+// run time with `indirect call type mismatch`. Measured — `type A = {v:i32}` beside
+// `type B = {v:i32}` in one union, one closure parameter each, went `loud emit reject` to
+// `trap_loads` before this decline existed.
+//
+// DECLINING rather than canonicalising is deliberate and is the smaller claim: the caller
+// falls through to the NAME classifier, which is the behaviour on `1e81b0f3`, so a twinned
+// arm is no worse than it was. Canonicalising the variant slot is the real fix and belongs
+// with the OTHER key producers (`cloRetKeySuffix`, `cloParamTok`, `annParamKind`), which key
+// it raw today — all four have to move together or they disagree again.
+function variantRowHasEarlierTwin(vi: i32): boolean {
+  let j = 0
+  while j < vi {
+    if repVariantSlotsTwin(j, vi) == 1 { return true }
+    j = j + 1
+  }
+  false
+}
+
 function paramTokOfTy(ty: i32) {
   if ty < 0 { return "" }
   const t = T.tys[ty]
@@ -30616,6 +30854,31 @@ function paramTokOfTy(ty: i32) {
       if en == "f64" { return repSigTokOfKind("f64list") }
       if en == "i64" { return repSigTokOfKind("i64list") }
       if en == "f32" { return repSigTokOfKind("f32list") }
+    }
+    return ""
+  }
+  // THE CONCRETE UNION-ARM ARM, and it is here rather than in the name classifier because
+  // the QUESTION IS NOMINAL and the name path cannot answer it. The OBJECTS decline above
+  // is about a struct ROW, whose identity is structural; a union ARM's identity is its
+  // DECLARATION (`variantRowOfTy`: "NO STRUCTURAL RUNG. Two variants with the SAME FIELD SET
+  // are different variants"). Handed the render instead, `annParamKind` asks
+  // `structIndexByName` (no row — `collectS` skips an arm), then `variantIndexOf` on a
+  // spelling the render has already softened to the structural `{r: string}`, and finally
+  // `structIndexOfTypeName`, which FIELD-SET-MATCHES the arm's plain-struct layout twin and
+  // hands back its `sHeapIdx` row. The `$fnsig` then declares `(ref $Dot)` where the lambda's
+  // own functype declares `(ref $Circle)` — check-clean INVALID WASM at the value call, with
+  // the loud `ref valtype with no interned shape` as the no-twin disguise of the same root.
+  //
+  // `variantRowOfTy` MATCHES BY ARENA INDEX ONLY, so this cannot claim a plain struct (row
+  // -1, decline, name path unchanged) and cannot claim an INLINE `{r: string}` spelling
+  // (its own arena row, which is not the arm's declaration). A `TyUnion` param never reaches
+  // here — it is not a `TyObj` — so a `(Shape) => …` annotation keeps the `u` box token the
+  // name classifier's `isUName` arm gives it.
+  if t is TyObj {
+    const vrow = variantRowOfTy(ty)
+    if vrow >= 0 {
+      if variantRowHasEarlierTwin(vrow) { return "" }
+      return repSigSlotTokOfKind("variant", vrow)
     }
     return ""
   }
@@ -30659,6 +30922,17 @@ function retTokOfTy(ty: i32) {
     // of 595, 48%). Dual-written: **275 agree, 0 disagree.**
     const rslot = rlSlotOfTy(t.aElem)
     if rslot >= 0 { return ">" + repSigSlotTokOfKind("reflist", rslot) }
+    return ""
+  }
+  // The RESULT twin of `paramTokOfTy`'s union-arm arm — same nominal reader, same gate, and
+  // it must be added WITH it: a `(Circle) => Circle` annotation keys BOTH halves, and half a
+  // key is a `$fnsig` that still disagrees with the lambda's own functype on the other half.
+  if t is TyObj {
+    const vrow = variantRowOfTy(ty)
+    if vrow >= 0 {
+      if variantRowHasEarlierTwin(vrow) { return "" }
+      return ">" + repSigSlotTokOfKind("variant", vrow)
+    }
     return ""
   }
   ""
