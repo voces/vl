@@ -469,6 +469,29 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // inventory grades only the rows someone filed, and a grid grades only the axes it varied —
 // but an old grid re-run is a population large enough to catch what a new one held constant.
 //
+// THAT D87 SPECIMEN LASTED ONE ROUND OF REVIEW, and it closed rather than moved: #1954
+// landed while the branch was in review and turned the annotated spelling
+// (`const c: {[string]: Circle} = Map()`) from a loud floor into a RUNNING program. The
+// moment that control flipped, D87 stopped being "the mv region's problem" and became the
+// same destination channel this change already carried, one producer over — an empty
+// `Map()` commits no value rep at its initializer, exactly the property that licenses an
+// object literal to be re-aimed. Two helper widenings (`armPinAnnName` accepts a map whose
+// VALUE names an arm; `armPinLitInit` accepts a bare `Map()`/`Set()`) and it closes, moving
+// 76 of its 96-cell family and 0 cells of the 3,144-cell grid — inert where it is not the
+// answer, which is what says it belongs to this change rather than beside it.
+//
+// THE SUCCESSOR IS THAT FIX'S OWN RESIDUE, the fifth source again: the 20 cells it does not
+// reach are ONE family and every control that separates its neighbours is inert on them.
+// Delete the generic hop and they RUN; delete the layout twin and they do NOT (so it is not
+// the twin family); annotate the local and they do NOT (so it is not D87's channel). What is
+// left is the MONOMORPHIZER meeting an arm-valued map. Re-RUN against this tree at the swap
+// rather than inherited: `vl check` rc 0 with NO diagnostics at all, `--codegen` rc 1 with
+// `not valid wasm` + `type mismatch: expected (ref $type), found (ref $type)`,
+// `--codegen --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `933e2cbf`
+// with the same sentence. It is `silent-class-inventory.md` D88, pinned as
+// `tests/cases/soundness/xfail-miscompile-arm-valued-map-through-generic.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -509,13 +532,14 @@ const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
+  `function idg<T>(x: T): T { return x }\n` +
   `function thru(x: {[string]: Circle}) { return x }\n` +
   `function mk(n: i32) {\n` +
   `  const c = Map()\n` +
   `  c["k"] = { r: n }\n` +
-  `  return thru(c)\n` +
+  `  return idg(thru(c))\n` +
   `}\n` +
-  `print(((mk(7))["k"] ?? { r: 0 }).r)\n`;
+  `print(idg(((mk(7))["k"] ?? { r: 0 }).r))\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.

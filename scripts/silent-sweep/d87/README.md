@@ -1,7 +1,7 @@
 # The D75 / D81 / D82 grid, and its ablation
 
-The 3,144-cell grid that closed `silent-class-inventory.md` **D75, D81 and D82**. Kept
-because the closing numbers in that document — **528 moved, 0 backward, silent 306 → 0** —
+The 3,144-cell grid that closed `silent-class-inventory.md` **D75, D81, D82 and D87**. Kept
+because the closing numbers in that document — **456 moved, 0 backward, silent 306 → 0** —
 and the five-way root split are only claims if the population cannot be re-run.
 
 ```sh
@@ -50,29 +50,39 @@ full branch's. A resemblance in this family is refuted as often as confirmed (D3
 split three ways and needed a composition; D48/D63/D64 split three ways and did not), so
 "these are one root" is a measurement and not a reading.
 
-The verdict, measured against master `922d52eb`, base `N9` = master plus the two inert
+The verdict, measured against master `933e2cbf`, base `NZ` = master plus the two inert
 refactors and the new pass registered with no legs enabled:
 
 | compiler | what it adds | runs | loud emit | invalid wasm | moved |
 |---|---|---|---|---|---|
-| `N9` | nothing (inert)                     | 2586 | 252 | 306 | — |
-| `B9` | the `exprVariantIndex` pin rung      | 2898 | 138 | 108 | 312 |
-| `C9` | `synthDstPinAnn` leg 1 (global)      | 2622 | 234 | 288 |  36 |
-| `D9` | `synthDstPinAnn` leg 3 (param)       | 2622 | 234 | 288 |  36 |
-| `E9` | `synthDstPinAnn` leg 2 (local)       | 2694 | 198 | 252 | 108 |
-| `F9` | `synthDstPinAnn` leg 4 (map value)   | 2622 | 234 | 288 |  36 |
-| `P`  | all five                             | 3114 |  30 | **0** | 528 |
+| `NZ` | nothing (inert)                     | 2670 | 168 | 306 | — |
+| `BZ` | the `exprVariantIndex` pin rung      | 2982 |  54 | 108 | 312 |
+| `CZ` | `synthDstPinAnn` leg 1 (global)      | 2694 | 162 | 288 |  24 |
+| `DZ` | `synthDstPinAnn` leg 3 (param)       | 2694 | 162 | 288 |  24 |
+| `EZ` | `synthDstPinAnn` leg 2 (local)       | 2742 | 150 | 252 |  72 |
+| `FZ` | `synthDstPinAnn` leg 4 (map value)   | 2694 | 162 | 288 |  24 |
+| `Q`  | all five                             | 3126 |  18 | **0** | 456 |
 
-All TEN pairwise intersections are EMPTY and 312+36+36+108+36 = 528 = |P moved|,
+All TEN pairwise intersections are EMPTY and 312+24+24+72+24 = 456 = |Q moved|,
 set-identical — so no leg closes another's cells and, unlike D39/D40/D41, **no cell needs two
-patches**. `N9` vs master is 0 cells and 0 MESSAGES, which is what makes the refactors
+patches**. `NZ` vs master is 0 cells and 0 MESSAGES, which is what makes the refactors
 provably inert.
 
-**The base moved under the measurement, so it was re-run rather than carried over.** #1954
-landed mid-review and this grid grades `922d52eb` at 306 silent where `8bf0f20f` gave 264 —
-42 cells moved from a loud floor into the silent class, 18 of them a destination this branch
-then grew a fifth leg for. Re-running the whole set against the new base is the only reason
-those 18 are in the table at all.
+**THE BASE MOVED UNDER THIS MEASUREMENT TWICE, and both times it was re-run rather than
+carried over.** #1954 landed mid-review: this grid grades `922d52eb` at 306 silent where
+`8bf0f20f` gave 264, because 42 cells moved from a loud floor INTO the silent class — a
+destination the branch then grew a fifth leg for. #1955 landed next and moved the per-leg
+counts again (36/36/108 → 24/24/72) by closing some of those cells itself. Neither shift is
+visible from the old table; the only way to know was to rebuild every compiler and re-sweep.
+
+**That is also the reusable caution.** A "0 backward" or "N backward" number is a property of
+the GRID that produced it, not of the compiler: #1954's own grid measured its loud→silent
+cost at 9 and this one measures it at 42, and both are honest. Quote a backward count with
+the population it was taken over.
+
+**D87's fix is measured here too, and it is invisible in this table on purpose**: it moves
+**0** of these 3,144 cells (0 outcome, 0 message) while moving 76 of its own 96-cell family.
+Inert where it is not the answer is what said it belonged inside this change.
 
 **`ablate87.py` diffs MESSAGES, not just outcome classes.** D57's stage B moved 36 cells from
 one `check-clean invalid wasm` mechanism to another; the outcome-class grader scored them

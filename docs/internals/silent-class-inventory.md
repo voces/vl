@@ -6341,8 +6341,8 @@ Repro:
 
 ---
 
-### D87 — an UN-ANNOTATED map local whose value is an ARM, handed to a map PARAMETER, beside a layout twin
-**check-clean invalid wasm · a REGRESSION with a bisect: it RAN on `6ac49ac9` and is silent from `2ea654d2` (#1952) onward · found 2026-08-26 by RE-RUNNING D52's own 9,450-cell grid against today's master, which grades it 212 silent where #1951 reported 116 · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+### D87 — [CLOSED 2026-08-26] an UN-ANNOTATED map local whose value is an ARM, handed to a map PARAMETER, beside a layout twin
+**closed · it was #1952's regression, and #1954 turned it into the DESTINATION CHANNEL's problem by flipping its own control · a REGRESSION with a bisect: it RAN on `6ac49ac9` and is silent from `2ea654d2` (#1952) onward · found 2026-08-26 by RE-RUNNING D52's own 9,450-cell grid against today's master, which grades it 212 silent where #1951 reported 116 · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
 
 Repro:
 
@@ -6391,6 +6391,31 @@ Repro:
   which is exactly why the row's identifier is the sentence and not the offset.
 * Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-local-into-map-param.vl`,
   `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+* **CLOSED 2026-08-26 (#1956), AND THE CONTROL THAT DECIDED IT FLIPPED UNDER THE ROW.** When
+  this was filed, annotating the map local (`const c: {[string]: Circle} = Map()`) was a
+  DIFFERENT loud floor — which is exactly what said "not the destination channel, leave it to
+  the mv seam". #1954 then taught the arm-valued map to lower under the inline spelling and
+  that same control began to **RUN**. Re-measured rather than inherited, and the answer
+  reversed: with the annotated spelling working and the un-annotated one silent, this is the
+  ordinary shape of `synthDstPinAnn`'s family — an annotation the producer never saw.
+* **TWO HELPER WIDENINGS, NO NEW LEG.** `armPinAnnName` accepts a MAP whose VALUE names an
+  arm (the third container beside the bare arm and the ref-list of one); `armPinLitInit`
+  accepts a bare `Map()` / `Set()`, by the rule its own header states rather than by
+  resemblance — an EMPTY map commits no value rep at its initializer, so its slot is chosen
+  by later use and an annotation can re-aim it without contradicting a decision made
+  elsewhere. A map-RETURNING call is not admitted, which is why the test is the constructor
+  NAME and not `exprMap`.
+* **MEASURED, NOT ESTIMATED, BECAUSE BOTH HELPERS ARE SHARED** with `synthRetPinAnn` and all
+  four legs: 76 of its own 96-cell family move to `runs`; **0 cells of the 3,144-cell grid
+  move at all** (0 outcome, 0 message); the 9,450-cell D52 grid goes 278 -> 50 silent with
+  330 moved and 0 backward; and the corpus is 1,868 of 1,868 byte-identical. Inert wherever
+  it is not the answer, which is what said it belongs inside this change rather than beside
+  it.
+* **THE 20 IT DOES NOT REACH ARE A DIFFERENT ROOT AND ARE FILED AS D88** — `route=gen` only,
+  and every control that separates the neighbours is inert on them.
+* Its pin is DELETED and graduates to
+  `tests/cases/unions/arm-valued-map-local-into-map-param.vl`; `INVALID_MODULE_SRC` moves to
+  D88 below.
 
 ---
 
@@ -6568,6 +6593,51 @@ Repro:
   same trade D57's stage D made.
 * The comment at `concatRefusal`'s header that asserted the opposite ("`eqCmpKindOfArrayElem`
   is NOT that set") is corrected on D45's branch and names this row.
+
+---
+
+### D88 — an ARM-VALUED MAP handed to a hand-written GENERIC
+**check-clean invalid wasm · found 2026-08-26 as D87's own closing residue — 20 of that row's 96 cells · pre-existing on `933e2cbf` with the same sentence, so NOT a regression from the change that filed it · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function idg<T>(x: T): T { return x }
+    function thru(x: {[string]: Circle}) { return x }
+    function mk(n: i32) {
+      const c = Map()
+      c["k"] = { r: n }
+      return idg(thru(c))
+    }
+    print(idg(((mk(7))["k"] ?? { r: 0 }).r))
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // (The offset moves with the seed — 1234 on `933e2cbf`, 1236 on the branch that filed
+    //  this. The sentence is the identifier.)
+
+* **THE GENERIC HOP IS THE AXIS AND IT IS THE ONLY ONE.** Three controls, all measured on
+  the tree this was filed from, and the two that would place it in a neighbouring row are
+  both INERT:
+
+      delete `idg`, call `thru(c)` directly       RUNS           <- the axis
+      delete `type Dot` (the layout twin)         still silent   <- NOT the twin family
+      annotate the local `: {[string]: Circle}`   still silent   <- NOT D87's channel
+
+* **SO IT IS NEITHER OF ITS NEIGHBOURS, AND THAT IS WHY IT IS ITS OWN ROW.** D75/D82 is a pin
+  resolved onto a layout twin's `sNames` row — no twin is needed here. D87 is an
+  un-annotated map local that never saw its destination's annotation — annotating it does
+  not help here. What is left is the MONOMORPHIZER meeting an arm-valued map:
+  `monoArgTyName`'s map arm names the argument by its `{[K]: V}` spelling (`nodeTyMapName`),
+  and the instance it mints does not agree with the caller about the VALUE's heap type. That
+  is the same layer D75/D82 were fixed in, one container out, and the fix there was an
+  un-called complement — so the first question to ask is whether the map layer has one too.
+* Reachable neighbourhood: `monoArgTyName`'s `nodeTyMapName` arm, and the mv-slot resolvers
+  the instance's parameter is typed through.
+* Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-through-generic.vl`,
+  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
 
 ## 3. Shared-root analysis
 
