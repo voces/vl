@@ -1191,54 +1191,80 @@ export function synthRetPinAnn(letIx: i32, fnIx: i32) {
 // Returns 0 always; the mutation is `s.letType`, in place — the family's contract.
 export function synthDstPinAnn(letIx: i32, fnIx: i32) {
   if fnIx < 0 { return 0 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    // THE ENCLOSING FUNCTION'S DECLARED RESULT IS A DESTINATION TOO, and it is handed to
+    // the shared body rather than recorded in `dstPinScan` because it is one annotation
+    // for the whole body however many `return`s reach it. It exists for the DISAGREEMENT
+    // gate, not to pin: `function mk(n: i32): Dot { const c = { r: n }  gsto = c
+    // return c }` has an arm-typed global destination and a plain-struct RESULT, and
+    // pinning either spelling breaks the other. Without this the scan pinned `Circle` and
+    // moved the failure from the `global.set` to the return — silent to silent, which an
+    // outcome-class grader scores as no change and only a message diff catches (the
+    // offset moved 191 -> 195). An UN-annotated result records nothing: an inferred
+    // return is not a nominal claim, it is what D52's rung derives FROM the binding, and
+    // recording -1 here would veto every ordinary cell in this row's own population.
+    return dstPinAnnIn(letIx, fn.fnBody, fn.fnRet)
+  }
+  0
+}
+
+// THE MODULE-SCOPE TWIN (silent-class-inventory D139). A top-level binding is delivered to
+// exactly the same four destinations a function-scoped one is, and the scan that finds them
+// needs only a SCOPE to resolve identifiers in — so this is the same body with the PROGRAM
+// node as that scope and no result annotation, not a second implementation.
+//
+// WHY IT IS A SEPARATE ENTRY POINT AND NOT A `fnIx < 0` ARM ON THE ONE ABOVE: the scope is
+// a node the caller holds and the callee cannot derive. `fnStmts` has no row for the module
+// and `globalStmts` holds the BINDINGS, not the statement list the deliveries live in.
+//
+// THERE IS NO RESULT DESTINATION AT MODULE SCOPE, hence `-1`: the module does not return,
+// and its start function's result is synthesized rather than declared, so there is no
+// annotation to disagree with.
+function synthGlobalDstPinAnn(letIx: i32, rootIx: i32) {
+  dstPinAnnIn(letIx, rootIx, -1)
+}
+
+// The shared body of both entry points: pin `letIx`'s annotation from the destinations it
+// is delivered to WITHIN the scope `bodyIx`, with `retIx` the scope's declared result
+// annotation (-1 where the scope has none). Split out for D139 — the two scopes differ in
+// nothing but those two arguments, and a copy would be the second place the disagreement
+// gate could drift.
+function dstPinAnnIn(letIx: i32, bodyIx: i32, retIx: i32) {
   const s = P.nodes[letIx]
   if s is LetDecl {
     if s.letType >= 0 { return 0 }
     if !armPinLitInit(s.letInit) { return 0 }
-    const fn = P.nodes[fnIx]
-    if fn is FuncDecl {
-      const dstN: string[] = []
-      const dstT: i32[] = []
-      // THE ENCLOSING FUNCTION'S DECLARED RESULT IS A DESTINATION TOO, and it is recorded
-      // here rather than in `dstPinScan` because it is one annotation for the whole body
-      // however many `return`s reach it. It exists for the DISAGREEMENT gate, not to pin:
-      // `function mk(n: i32): Dot { const c = { r: n }  gsto = c  return c }` has an
-      // arm-typed global destination and a plain-struct RESULT, and pinning either spelling
-      // breaks the other. Without this the scan pinned `Circle` and moved the failure from
-      // the `global.set` to the return — silent to silent, which an outcome-class grader
-      // scores as no change and only a message diff catches (the offset moved 191 -> 195).
-      // An UN-annotated result records nothing: an inferred return is not a nominal claim,
-      // it is what D52's rung derives FROM the binding, and recording -1 here would veto
-      // every ordinary cell in this row's own population.
-      if fn.fnRet >= 0 { dstPinRetDest(fn.fnBody, fn.fnRet, letIx, dstN, dstT) }
-      dstPinScan(fn.fnBody, fn.fnBody, letIx, dstN, dstT)
-      if dstN.length == 0 { return 0 }
-      const pinName = dstN[0]
-      if pinName == "" { return 0 }
-      let i = 1
-      while i < dstN.length {
-        if dstN[i] != pinName { return 0 }
-        i = i + 1
-      }
-      // The annotation's OWN recorded type is handed over rather than re-resolved from the
-      // spelling (`emit_rewrite`'s rule, and `synthRetPinAnn`'s): the spelling denotes
-      // exactly the type being handed, and `nameToTy` does not hash-cons, so a re-parse
-      // would mint a structurally duplicate arena row. `-1` is the ELEMENT pin, where the
-      // spelling is a CUT of the destination's annotation rather than the annotation
-      // itself — `synthTypeRefTy(n, p, -1)` is exactly `synthTypeRef`, its own header.
-      let pinTyIx = -1
-      if dstT[0] >= 0 { pinTyIx = nodeTyIxOf(dstT[0]) }
-      const pinTy = synthTypeRefTy(pinName, -1, pinTyIx)
-      // The ref-list ROW for a `Circle[]` destination, banked at the mint for the reason
-      // `synthRetPinAnn` banks its own: this synthesis postdates the last `collectA` run,
-      // so the intern pass cannot cover the node, and the row must be the one the
-      // DESTINATION's annotation already interned or the two wrappers are two slots.
-      if dstT[0] >= 0 {
-        const pinSlot = tyAnnRefListSlot(dstT[0])
-        if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
-      }
-      s.letType = pinTy
+    const dstN: string[] = []
+    const dstT: i32[] = []
+    if retIx >= 0 { dstPinRetDest(bodyIx, retIx, letIx, dstN, dstT) }
+    dstPinScan(bodyIx, bodyIx, letIx, dstN, dstT)
+    if dstN.length == 0 { return 0 }
+    const pinName = dstN[0]
+    if pinName == "" { return 0 }
+    let i = 1
+    while i < dstN.length {
+      if dstN[i] != pinName { return 0 }
+      i = i + 1
     }
+    // The annotation's OWN recorded type is handed over rather than re-resolved from the
+    // spelling (`emit_rewrite`'s rule, and `synthRetPinAnn`'s): the spelling denotes
+    // exactly the type being handed, and `nameToTy` does not hash-cons, so a re-parse
+    // would mint a structurally duplicate arena row. `-1` is the ELEMENT pin, where the
+    // spelling is a CUT of the destination's annotation rather than the annotation
+    // itself — `synthTypeRefTy(n, p, -1)` is exactly `synthTypeRef`, its own header.
+    let pinTyIx = -1
+    if dstT[0] >= 0 { pinTyIx = nodeTyIxOf(dstT[0]) }
+    const pinTy = synthTypeRefTy(pinName, -1, pinTyIx)
+    // The ref-list ROW for a `Circle[]` destination, banked at the mint for the reason
+    // `synthRetPinAnn` banks its own: this synthesis postdates the last `collectA` run,
+    // so the intern pass cannot cover the node, and the row must be the one the
+    // DESTINATION's annotation already interned or the two wrappers are two slots.
+    if dstT[0] >= 0 {
+      const pinSlot = tyAnnRefListSlot(dstT[0])
+      if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
+    }
+    s.letType = pinTy
   }
   0
 }
@@ -1668,13 +1694,36 @@ function dstPinCallArgs(
 // `collectLocals` STILL CALLS IT, and the second call is not redundant: that walk reaches
 // the START function's blocks and the bodies monomorphization mints, and every binding this
 // pass already pinned is declined there by the `letType >= 0` guard on entry.
-export function synthDstPinAnns() {
+//
+// AND IT RUNS OVER THE MODULE TOO (silent-class-inventory D139), which is the half D81 did
+// not have. `fnStmts` has no row for module scope and `collectLocals` never sees a global —
+// the same structural gap `synthGlobalEmptyListAnns` exists to close one family over — so a
+// top-level `const c = Map()` delivered to `thru(x: {[string]: Circle})` reached the mv
+// layer with NO annotation while its function-scoped sibling reached it pinned. Probed on
+// `54780e0b`, the two programs intern the SAME two mv slots over the SAME two ref-list rows
+// (`rl=0 nm=Circle heap=1 wrap=9`, `rl=1 nm=Dot heap=0 wrap=11`) and emit byte-identical
+// type sections; the ONLY difference is `letMapShapeOf`'s input — `letType=37`
+// (`{[string]:Circle}`, this pin) at function scope against `letType=-1` at module scope,
+// which sends the un-annotated global down `mapShapeOfExpr`'s recorded-type leg where the
+// literal's own arena type is the anonymous `{r:i32}` and resolves the RENDER's slot
+// (`struct.new 16`) where the local resolves the ARM's (`struct.new 15`). That is why the
+// residue is a binding-RESOLUTION problem: the mint is identical on both sides.
+export function synthDstPinAnns(rootIx: i32) {
   let fe = 0
   while fe < fnStmts.length {
     const fnIx = fnStmts[fe]
     const fn = P.nodes[fnIx]
     if fn is FuncDecl { dstPinSynthWalk(fn.fnBody, fn.fnBody, fnIx) }
     fe = fe + 1
+  }
+  // The module run walks `globalStmts` rather than the statement list, for the reason
+  // `synthGlobalEmptyListAnns` does: those ARE the module's bindings, already collected,
+  // and a top-level `let` nested in an `if` is not one (it is a start-function local, and
+  // `collectLocals` reaches it).
+  let gi = 0
+  while gi < globalStmts.length {
+    synthGlobalDstPinAnn(globalStmts[gi], rootIx)
+    gi = gi + 1
   }
   0
 }

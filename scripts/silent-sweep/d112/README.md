@@ -112,7 +112,10 @@ and the module-scope one is not — progress no outcome-class count can see, whi
 instrument this grid's own close named.
 
 The residue is **12 cells, all `armtwin` x `declname` x `leaf=anon` x `read=coalvar`**
-(6 at depth 2, 6 at depth 3), filed as **D139**: an arm-valued map beside a standalone
+(6 at depth 2, 6 at depth 3), filed as **D139** and RE-FILED 2026-08-27 as **D158** —
+D139 closed and moves **0 of this grid**; all 12 survivors take their only nominal claim
+from the `?? d1` READ site rather than from any delivery, which is a different channel.
+D139 was: an arm-valued map beside a standalone
 struct of the arm's exact layout, where the two mv slots hold two genuinely different heaps
 and merging them would be wrong.
 
