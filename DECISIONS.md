@@ -366,8 +366,10 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   **The dedup gate below it was arm-gated for this day and its test was wrong in one
   direction.** Its zero is no longer a reachability zero: over a 1,070-cell grid the kind-1
   arm's cross rung (one arm, one struct → refuse) fires 22 times and the both-arms rung 10,
-  while the corpus enters the arm 46 times over 25 files and takes the STRUCT rung on every
-  one. And the branch shipped as an IDENTITY test where the question is a HEAP one: two arms
+  while the corpus's 46 pre-existing entries over 25 files take the STRUCT rung on every one
+  (re-measured on the post-#1951 base, which moved variant index resolution; the grid
+  counters are identical call for call, and the two live rungs now have a corpus witness in
+  `tests/cases/maps/arm-valued-map-beside-layout-twin.vl`). And the branch shipped as an IDENTITY test where the question is a HEAP one: two arms
   of two DIFFERENT unions over one field set are `uVarTwin` layout twins and therefore one
   variant heap, so their maps DO share a map struct — refusing that merge cost 2 grid cells
   `runs` → check-clean invalid wasm. It now asks `repVariantSlotsTwin`, the variant layer's

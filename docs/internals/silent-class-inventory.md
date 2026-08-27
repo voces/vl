@@ -4876,20 +4876,23 @@ the two-arm control above, which runs today.
 DIRECTION.** It read: `repMapValSlotsTwin`'s parity branch needs two distinct kind-1 slots
 agreeing on canon id and key rep, and that pair cannot exist because this row collapses it.
 Closing the row creates the pair, so the branch is now REACHABLE — measured with a
-three-rung counter (arm entered / cross / both-arms) over 1,070 grid cells and 2,278 corpus
-files:
+three-rung counter (arm entered / cross / both-arms) over 1,070 grid cells and the 2,282-file
+corpus, **re-run on the post-#1951 base** because that change moved variant index resolution
+and this predicate is a heap-twin question over exactly that machinery (grid counters
+identical to the pre-merge run, call for call):
 
 | rung | grid | corpus | first witness |
 |---|---|---|---|
-| kind-1 arm entered | 34 calls / 30 files | 46 / 25 | — |
-| `cross` (one arm, one struct → refuse) | **22 / 20** | 0 / 0 | `mapval_twinpair_exact_pass_alias_armfirst` |
-| both arms, heap twins → **allow** | **10 / 10** | 0 / 0 | `mapval_twinpair_armtwin_pass_alias_armfirst` |
+| kind-1 arm entered | 34 calls / 30 files | 49 / 26 | — |
+| `cross` (one arm, one struct → refuse) | **22 / 20** | 2 / 1 | `maps/arm-valued-map-beside-layout-twin.vl` |
+| both arms, heap twins → **allow** | **10 / 10** | 1 / 1 | `maps/arm-valued-map-beside-layout-twin.vl` |
 | both arms, NOT heap twins → refuse | 0 | 0 | none — see below |
-| neither an arm (the old struct rung) | 2 | 46 | `arrays/empty-hole-pinned-by-container-position.vl` |
+| neither an arm (the old struct rung) | 2 | 46 / 25 | `arrays/empty-hole-pinned-by-container-position.vl` |
 
-The corpus enters the arm 46 times and takes the STRUCT rung every one of them, so the
-arm-valued-map population is exactly the one no test wrote — which is why this could sit
-mis-stated. **And the shipped test was an IDENTITY test (`mvValVariantOf(a) !=
+**The corpus's 46 pre-existing entries all take the STRUCT rung**, unchanged — the
+arm-valued-map population was exactly the one no test wrote, which is why this could sit
+mis-stated. The three corpus calls on the two live rungs are this row's own new fixture, so
+the two branches that decide the heap now have a corpus witness where they had none. **And the shipped test was an IDENTITY test (`mvValVariantOf(a) !=
 mvValVariantOf(b)`) where the question is a HEAP one.** Two arms of two DIFFERENT unions over
 one field set are `uVarTwin` layout twins and therefore ONE variant heap type, so their maps
 DO share a map struct; refusing that merge emitted two identical map structs and a
@@ -5283,11 +5286,16 @@ Repro:
   move**. Both field element lists are annotated, so they take the ref-list path and the i32
   fallback the floor stands in is never entered.
 
-**THE ABLATION D THIS ROW ASKED FOR WAS RUN, AND IT SAYS D48 AND D64 ARE TWO ROOTS.** One
+**THE ABLATION THIS ROW ASKED FOR WAS RUN, AND IT SAYS D48 AND D64 ARE TWO ROOTS.** One
 compiler per candidate, all three swept against one 1,070-cell grid: D63's fix moves 24
 cells, D64's 24, D48's 21, the three sets are **pairwise disjoint**, their union is exactly
 the 69 cells the full branch moves, and the full branch's verdict equals each single's on
 every cell it moves. No cell needs two patches. Same shape, three layers, three roots.
+
+Re-established on the **post-#1951 base** (five compilers rebuilt, five sweeps re-run):
+every one of the 1,070 cells holds the same verdict under all five as it did pre-merge —
+`master` 0 differ, `A` 0, `B` 0, `C` 0, `FULL` 0 — so the verdict is a property of the tree
+that ships, not of the base it was first measured on.
 
 **AND THE LAYER IS NOT THE mv ONE AT ALL — it is the STRUCT-ROW DEDUP.** The ref-list layer
 kept `Circle[]` and `Dot[]` apart correctly (two slots, element heaps `uVarHeap[Circle]` and
