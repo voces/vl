@@ -69,6 +69,7 @@ import {
   anyLitUnionUsed,
   canonRewroteNode,
   canonTyIxOf,
+  eqCoreKindOfTyToken,
   fusedMapReadRecvIx,
   inferRetBearsNull,
   inferRetNameByNode,
@@ -4692,6 +4693,19 @@ function mvValLowersTy(ty: i32): i32 {
   // the ladder's shape suggests, since the union arms are the intricate ones.
   if t is TyObj {
     if isStructOfTy(ty) { return 1 }
+    // THE NOMINAL HALF, PAIRED WITH THE NAME LADDER'S (D47). `isStructOfTy` is the registry
+    // question asked of the type, and it answers NO for a union ARM for the same reason
+    // `structIndexByValName` does — `collectS` SKIPS a `type X = {…}` that is a union member,
+    // so the arm has a `uVariants` row and no `sNames` one. `variantRowOfTy` is the other
+    // registry, asked by DECLARATION identity (nominal, no structural rung).
+    //
+    // THIS GATE AND THE INTERNER MUST NOT DRIFT, which is this function's whole contract:
+    // `retMapFlag` reads it to decide a map param/return's VALTYPE while `mvShapeOfValName`
+    // interns the slot the body builds. Teaching only the interner made an arm-valued map
+    // LOCAL lower while its `{[string]: Circle}`-returning function kept the i32 mono result
+    // valtype — check-clean invalid wasm at the return seam ("expected i32, found (ref
+    // $type)"), 15 grid cells, the exact drift the header above predicts.
+    if variantRowOfTy(ty) >= 0 { return 1 }
   }
   // A UNION-valued map with NO null member. `mvValKindOfName`'s -3 producer is the nullable
   // guard, and that guard is entered only when `unionSetHasNull(valName)` — so a union carrying
@@ -4961,6 +4975,16 @@ export function mvValKindOfName(valName: string): i32 {
     kind = 14
   } else {
     if structIndexByValName(valName) >= 0 { kind = 1 }
+    // THE NOMINAL HALF OF THAT RUNG (D47). `structIndexByValName` is a `sNames` lookup and
+    // `collectS` SKIPS a `type X = {…}` that is a union MEMBER, so an arm spelled by its own
+    // name has no struct row and this ladder answered the `-3` unsupported sentinel for a
+    // value the layer lowers perfectly well under its render. The arm's rep IS the kind-1
+    // ref-value spine — `mvCanonValName` rewrites the spelling to that render before the
+    // interner ever gets here, so this arm is reached only by the FIVE name-keyed GATES
+    // (`mapValKindLowerable` and its siblings), which do not canon and must not disagree
+    // with the interner about whether a map lowers. Nominal, not structural: an exact
+    // `uVariants` name lookup, never a shape scan.
+    if kind < 0 && variantIndexOf(valName) >= 0 { kind = 1 }
   }
   if kind < 0 { return -3 }
   kind
@@ -5299,12 +5323,47 @@ export function mvShapeOfValNameRowTy(
   mvShapeOfValNameArmTy(valNameIn, keyI32, rowTy, rowTy)
 }
 
+// The mv table's key for a value the caller's type says is a declared union ARM: the ARM'S
+// OWN NAME, whatever the caller spelled (D47).
+//
+// TWO SPELLINGS OF ONE MAP REACH THIS LAYER AS TWO DIFFERENT NAMES, and only one of them
+// resolves. `const a: {[string]: Circle} = Map()` written INLINE hands over the source text
+// `Circle`; hoisted into `type CM = {[string]: Circle}` the SAME map hands over `{r:i32}`,
+// because a TypeRef's emit spelling for an alias is `tyToEmitName` of the resolved type and
+// that renderer spells a declared arm structurally. Measured on the two programs: six mv
+// asks each, every one MINT-path and every one carrying D34's arm hint — the alias asks
+// `{r:i32}` six times, the inline asks `Circle` four times and `{r:i32}` twice, and the
+// `-3` floor is whichever spelling the struct table cannot name (`structIndexByValName`
+// scans `sNames`, and `collectS` SKIPS a `type X = {…}` that is a union member).
+//
+// `DECISIONS.md`'s D-ALIASMAP — a type alias becomes TRANSPARENT, an alias must not be a
+// dialect — is the standard, and it does not say which spelling wins, only that they must
+// agree. THE ARM'S NAME IS THE KEY THAT CAN BE COMPUTED FROM EITHER: `variantRowOfTy` reads
+// the caller's recorded type by DECLARATION identity, so both channels produce `Circle`,
+// while the render is reachable from only one of them and its struct row is an INCIDENTAL
+// intern — declaring the alias without USING it does not mint that row, measured, which is
+// the correction to this row's filed mechanism.
+//
+// NOMINAL, WHICH IS WHAT #1942'S RULING REQUIRES IN THIS DIRECTION TOO. The rewrite asks
+// nothing structurally: `variantRowOfTy` has no structural rung *because variants are
+// nominal*, so a genuinely anonymous `{[string]: {r:i32}}` — whose value type is not a
+// declaration — is untouched and keeps the render it has always keyed.
+//
+// AND IT CANNOT MOVE A NON-ARM SLOT: `mvValArmName` returns "" for every value that is not
+// a declared arm, which is every program with no arm-valued map.
+function mvArmKeyName(valNameIn: string, armTy: i32): string {
+  const an = mvValArmName(armTy)
+  if an != "" { return an }
+  valNameIn
+}
+
 export function mvShapeOfValNameArmTy(
-  valNameIn: string,
+  valNameInRaw: string,
   keyI32: boolean,
   rowTy: i32,
   armTy: i32,
 ) {
+  const valNameIn = mvArmKeyName(valNameInRaw, armTy)
   const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
   if kind == -1 { return -1 }
@@ -5421,7 +5480,12 @@ export function mvShapeOfValNameArmTy(
   // `variantRowOfTy` is a pure scan over `uVarTyIx` — it interns nothing, which is the
   // property the parallel-table discipline three comments up requires of anything sitting
   // between two pushes.
-  mvValVariantIdx.push(variantRowOfTy(armTy))
+  // …WITH THE NAME AS ITS SECOND SOURCE, for the un-hinted caller the key rewrite cannot
+  // reach (D47). `variantIndexOf` is the same nominal lookup over the same table, and the
+  // two cannot disagree: when `armTy` resolves an arm, the key IS that arm's name.
+  let mvVarRow = variantRowOfTy(armTy)
+  if mvVarRow < 0 { mvVarRow = variantIndexOf(valName) }
+  mvValVariantIdx.push(mvVarRow)
   if kind == 1 {
     // THE KIND-1 SITE IS DELIBERATELY UNHINTED, AND THE REASON IS A SIDECAR WITH TWO
     // PRODUCERS. It interns `sNames[vsi]`, not `valName`, so the obvious hint is that
@@ -5450,7 +5514,14 @@ export function mvShapeOfValNameArmTy(
     // `rlElemStructRow` to decline a name that is a registered variant and not a registered
     // struct, and `rlElemVariantHeap` then supplies `uVarHeap[vi]`. The complement was
     // already written — it just had a struct-table row handed to it instead of the arm.
-    const armNm = mvValArmName(armTy)
+    // …AND THE ARM'S NAME IS ALSO REACHABLE FROM THE KEY ITSELF (D47). The key is rewritten
+    // to the arm's spelling above, so a caller that handed NO type still arrives here with
+    // `valName` == the arm's own name — and `vsi` is then -1, because `collectS` SKIPS a
+    // union member, so `sNames[vsi]` would be an out-of-bounds read inside the compiler.
+    // Ask the variant table by that name (nominal, an exact `uVariants` lookup) before
+    // falling back to the struct row.
+    let armNm = mvValArmName(armTy)
+    if armNm == "" && variantIndexOf(valName) >= 0 { armNm = valName }
     if armNm != "" {
       mvRlSlot.push(rlInternName(armNm, 1))
     } else {
@@ -7013,18 +7084,6 @@ export function eqCmpKindOfOperand(exprIx: i32, fnIx: i32): EqCmpKind {
   exprNulNicheKind(exprIx, fnIx)
 }
 
-// One `eqCmpKindOfTy` token → its compare core. The nullable niche and its non-null base share
-// a core by construction (that IS the null guard's contract), so both spellings map to one
-// number here.
-function eqCoreKindOfTyToken(k: EqCmpKind) {
-  if k == "list" || k == "nullist" { return 0 }
-  if k == "strlist" || k == "nulstrlist" { return 3 }
-  if k == "reflist" || k == "nulreflist" { return 4 }
-  if k == "str" || k == "nulstr" { return 5 }
-  if k == "closure" || k == "nulclosure" { return 6 }
-  -1
-}
-
 // True if the layout at EQ ROW `row` carries a function-typed field (code 14), looking
 // through nested-struct fields (code 15). `seen` guards recursive shapes, and holds eq rows
 // rather than struct indices — the encoding is injective, so a struct row and a variant row
@@ -8170,6 +8229,26 @@ export function rlElemStructRow(slot: i32): i32 {
   if ar >= 0 { return ar }
   if bn >= 0 { return bn }
   repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
+}
+
+// THE VARIANT-TABLE ROW OF THE SAME ELEMENT — the OTHER SIDE of the floor above, written
+// as one predicate so the two cannot disagree about which table owns a name. The gate in
+// `rlElemStructRow` says "a registered variant that is not a registered struct has no
+// struct row"; this says which row it DOES have. -1 for a plain struct element, for an
+// unregistered name, and for a name the struct table claims (struct precedence, the same
+// `bn < 0` ordering the floor uses).
+//
+// NOMINAL BY CONSTRUCTION, for the reason `variantIndexOf`'s own header gives and
+// `DECISIONS.md` charters: the variant⇄struct-TABLE seam stays nominal, so this is a name
+// scan over `uVariants` with no structural rung — a `{r:i32}` render must NOT match the
+// `Circle` arm here any more than it may in the other direction.
+//
+// TIMING-INDEPENDENT, like the floor: `uVariants` and `sNames` are both collect-populated
+// and neither consults a heap index, so this is queryable before `mAssignTypeIndices`.
+export function rlElemVariantRow(slot: i32): i32 {
+  const ln = nonNulBaseOf(rlElemName[slot])
+  if structIndexByName(ln) >= 0 { return -1 }
+  variantIndexOf(ln)
 }
 
 // The array-LITERAL element's struct row: the same arena leg, but the fall-through is
@@ -11969,6 +12048,14 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
             // `"struct"` loop var recovers each element and its `v != null` reached the
             // structural struct-equality path instead of a null test.
             if mvSlotNullable(vsl) { return "nulstruct" }
+            // A UNION-ARM value (`{[string]: Circle}` where `Circle` is a member of a
+            // declared `Shape`): the loop var is the kind-8 VARIANT local, not the kind-1
+            // struct one — the arm's layout lives in `uVarHeap`, and `collectS` SKIPS a
+            // union member so there is no struct row for the struct arm to bind (D50).
+            // The map half of `forInRefArrayStructIdx` has DECLINED this coordinate since
+            // D34; declining without a variant arm here is what left the loop var typed
+            // from a -1 struct index.
+            if mvValVariantOf(vsl) >= 0 { return "variant" }
             return "struct" // struct value
           }
           return "i32"
@@ -12003,6 +12090,14 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       // binds as a kind-9 niche (`for e in xs { if e != null { … e.v … } }`), and the element
       // read stays nullable (no `ref.as_non_null`). A plain `S[]` is the non-null kind 1.
       if rlElemIsNulNiche(rslot) { return "nulstruct" }
+      // An ARM-ELEMENT ref list (`Circle[]` where `Circle` is a member of a declared
+      // `Shape`): the loop var binds as the kind-8 VARIANT local over `uVarHeap[vi]`, the
+      // element heap this slot already carries. The LIST twin of the map arm above, and
+      // the same reason: `structIdxOfElemName`'s nominal floor declines an arm, so the
+      // kind-1 leg had no index to give (D50, and D63 once the twin stopped routing
+      // around it). The nullable niche is checked FIRST and keeps its own kind — a
+      // `(Circle | null)[]` is not this shape.
+      if rlElemVariantRow(rslot) >= 0 { return "variant" }
       return "struct"
     }
     // A UNION-box element ref list (`(C | S)[]`, kind 2): the loop var binds as a kind-4
@@ -12169,6 +12264,26 @@ export function forInRefArrayStructIdx(iterIx: i32, fnIx: i32) {
   // Strip a `| null` niche suffix (`(P | null)[]` → "P") so the nullable-struct loop var
   // carries P's struct index.
   structIdxOfElemName(refListElemNameOfExpr(iterIx, fnIx))
+}
+
+// THE VARIANT ROW OF THE SAME LOOP VAR — `forInRefArrayStructIdx`'s storage-class twin,
+// built ARM FOR ARM against it (D50). Both container spellings, in the same order:
+//
+//   · an ARM-VALUED MAP's `.values()` walk — the answer the struct half DECLINES with
+//     (`if mvValVariantOf(mvs) >= 0 { return -1 }`, the gate D34 put there). That decline
+//     names the row it is declining to hand back; this returns it.
+//   · an arm-ELEMENT ref list — the answer `structIdxOfElemName`'s nominal floor declines
+//     with (`if variantIndexOf(n) >= 0 { return -1 }`, the gate D63 put there), through
+//     `rlElemVariantRow`, the one home for that side of the seam.
+//
+// BOTH HALVES ALREADY EXISTED AS REFUSALS. Every rung of this function is a gate some
+// other rung of the struct half already computes and throws away, which is why the loop
+// var could be typed `(ref $uVarHeap[vi])` the whole time and nothing asked.
+export function forInRefArrayVariantIdx(iterIx: i32, fnIx: i32) {
+  const mvs = forInMapValsSlot(iterIx, fnIx)
+  if mvs >= 0 { return mvValVariantOf(mvs) }
+  if !exprRefArray(iterIx, fnIx) { return -1 }
+  rlElemVariantRow(refListSlotOfExpr(iterIx, fnIx))
 }
 
 // True if the map-typed expression at `exprIx` is a SET (`Set()`-seeded binding or

@@ -14082,21 +14082,32 @@ function isEquatable(ty: i32, seen: i32[]) {
   // two `K` bindings compare correctly at every spelling, which is what says the refusal named
   // a component that is fine rather than a real hole.
   //
-  // THE PREDICATE IS THE `+` HOME'S, not a second one. `concatElemIsI32Backed` /
-  // `tyUnionAllLits` already decide "is this element one i32 cell" for list concatenation and
-  // already accept exactly this family; asking a differently-shaped question here is how the
-  // two operators drift. `tyUnionAllLits` covers the `| null` member too (the atom's spare
-  // `-1`), which is the same value-comparable cell.
+  // ONE BACKING, NOT MERELY ALL-LITERALS — and this is where the question DIVERGES from the
+  // `+` home's `tyUnionAllLits`, which is the predicate a first draft of this arm reused. That
+  // one accepts a MIXED-base union (`type M = "a" | 1`: every member is a `TyLit`, and the two
+  // members rep as a string ref and an i32), which is a value-union BOX and not one cell at
+  // all. Reusing it moved `{ m: M }`'s compare from a plain `vl check` ERROR to
+  // `emitProgram: unsupported struct field type in equality` — loud both sides, so not this
+  // file's blocker class, but a severity downgrade for a shape that was correctly refused.
+  // Found by the `std-api-reviewer` pass. `tyUnionIsOneLitCell` is the narrower question this
+  // gate actually asks, and `eqCmpKindOfArrayElem` asks the same two tests below.
+  //
+  // NO `| null` CLAIM. A draft of this note said `tyUnionAllLits` "covers the `| null` member
+  // too (the atom's spare `-1`)". It does not fire: the `| null` spelling resolves to a
+  // `TyNullable`, inline and through an alias alike, and this arm is on `TyUnion` — measured,
+  // `(K | null)[] == (K | null)[]` still takes both sentences at both spellings. That residue
+  // is filed as `silent-class-inventory` D101 rather than described as covered here.
   //
   // The EMITTER-CAPABILITY half is separate and stays separate: `eqCmpKindOfArrayElem` decides
   // whether a LIST of these has a compare core, and an i64/f64-based numeric union has none.
   // This gate answers only the SOUNDNESS question, exactly as its header says.
   if t is TyUnion {
-    if tyUnionAllLits(ty) { return true }
+    if tyUnionIsOneLitCell(ty) { return true }
   }
-  // A single LITERAL type (`type S = "aa"`, a narrowed `1`) reps as its BASE scalar — a
-  // string or a number — so it is value-comparable for the same reason its union is. The
-  // `+` home's `TyLit` arm says the same thing about the same cell.
+  // A single LITERAL type (`type S = "a"`, a narrowed `1`) reps as its BASE scalar — a string
+  // or a number — so it is value-comparable for the same reason its union is, and it cannot be
+  // mixed-base because it has one member. The `+` home's `TyLit` arm says the same thing about
+  // the same cell.
   if t is TyLit { return true }
   // TyUnion / TyNullable / TyMap: not structurally value-comparable.
   false
@@ -14181,6 +14192,24 @@ function unionSoleNonNullMember(ty: i32) {
   -1
 }
 
+// Every member of the union at `ty` is a LITERAL **and they all share ONE BACKING** — the
+// single cell an `==` compares and a list of which is one wasm array. Two shapes qualify: an
+// all-STRING union, whose members are interned i32 ATOMS (`tyIsLitUnion`), and an all-NUMERIC
+// one, whose members rep as a single base scalar (`numLitUnionHasBase` — `i32`, `i64` or
+// `f64`, and it answers "" the moment two members disagree).
+//
+// DELIBERATELY NARROWER THAN THE `+` HOME'S `tyUnionAllLits`, and the difference is a shape
+// both of them reach: `type M = "a" | 1` is all-literals and is NOT one cell — its members rep
+// as a string ref and an i32, so it is a value-union BOX. That predicate's own header says it
+// "DEFAULTS TO ACCEPT, deliberately", which is right for a rule that only ever loses a
+// capability; this gate decides SOUNDNESS, where accepting too much is the direction that
+// costs. (`silent-class-inventory` D45; the mixed-base cell was found by the `std-api-reviewer`
+// pass over that close.)
+function tyUnionIsOneLitCell(ty: i32) {
+  if tyIsLitUnion(ty) { return true }
+  numLitUnionHasBase(ty)
+}
+
 // The `==` token for an ARRAY whose element type is `elem`. The emitter has exactly three
 // list-compare cores — `emitListEqICore` (i32/boolean backing), `emitListEqSCore` (string
 // elements) and `emitListEqRCore` (a ref list of i32/boolean lists) — so this is a CLOSED
@@ -14220,10 +14249,16 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   // so `emitListEqICore` is its core and the answer is `"list"`, not "none"
   // (`silent-class-inventory` D45; `tyAnnRefListKind`'s litunion arms are where the i32
   // wrapper is chosen). The i32 backing is the WHOLE accept set and the numeric bases split
-  // it: only the `i32` base rides that list. An `i64`/`f64` base rides its own wrapper, whose
-  // `==` has no core at all (`f64[] == f64[]` is itself check-clean invalid wasm today), and
-  // an `f32` base is not one of the three names `numLitUnionBaseName` answers with — both
-  // stay "none", which is the honest half of this row's second sentence.
+  // it: only the `i32` base rides that list. An `i64` or `f64` base rides its own wrapper,
+  // whose `==` has no core at all — `f64[] == f64[]` is refused written directly, in the same
+  // sentence, and `type L = 9999999999 | 1` is the `i64` twin — so both stay "none", which is
+  // the honest half of this row's second sentence.
+  //
+  // NO `f32` ARM, and it is UNREACHABLE rather than declined: `litBaseTy` answers only
+  // `str` / `f64` / `i32` / `i64`, so a pure literal union can never HAVE an f32 base and
+  // `numLitUnionBaseName` cannot return `"f32"` for any shape this arm sees. A draft of this
+  // note listed f32 beside i64/f64 as though it were a measured decision; it is not one, and
+  // saying so is the difference between a rule and a coincidence. (`std-api-reviewer`, D45.)
   if e is TyUnion {
     if tyIsLitUnion(elem) { return "list" }
     if numLitUnionBaseName(elem) == "i32" { return "list" }
@@ -14266,6 +14301,24 @@ function eqCmpKindOfNulInner(inner: i32): EqCmpKind {
 // checker banked for it. The emitter's whole view of the comparability question.
 export function nodeEqCmpKind(ix: i32): EqCmpKind {
   eqCmpKindOfTy(nodeTyIxOf(ix))
+}
+
+// One `eqCmpKindOfTy` token → its compare CORE. The nullable niche and its non-null base share
+// a core by construction (that IS the null guard's contract), so both spellings map to one
+// number here; a token with no core of its own (a scalar, a struct, OPAQUE, "none") is -1.
+//
+// MOVED HERE FROM `emit_classify` BY THE `std-api-reviewer` PASS OVER D45, and the move is the
+// ONE-HOME rule this file's `==` section is built on. `eqCoreKindOfBin` picks the core the
+// emitter reserves a frame for; `eqRefusals` now asks the same question of the two OPERANDS,
+// and a checker that decided "which core" from a different map than the emitter's is exactly
+// the two-guesses shape `eqCmpKindOfTy`'s own header was written to end.
+export function eqCoreKindOfTyToken(k: EqCmpKind) {
+  if k == "list" || k == "nullist" { return 0 }
+  if k == "strlist" || k == "nulstrlist" { return 3 }
+  if k == "reflist" || k == "nulreflist" { return 4 }
+  if k == "str" || k == "nulstr" { return 5 }
+  if k == "closure" || k == "nulclosure" { return 6 }
+  -1
 }
 
 // ── THE ONE HOME for "may these two operands be `==`/`!=`, and if not, what do we say" ──
@@ -14346,6 +14399,51 @@ export function eqRefusals(
       if eqLk != "none" { eqBad = rt }
       msgs.push("`" + op + "` over " + tyToStr(eqBad) + " has no lowering")
       unsup.push(1)
+    } else {
+      // THE PAIR, NOT EACH OPERAND — and until D45 nothing had to ask, which is why the gate
+      // above reads one side at a time. Both operands answering a token is not the same as
+      // both answering the SAME token: `emitEqNonNullCore` runs ONE core, chosen from the
+      // LEFT operand and falling back to the right (`eqCoreKindOfBin`), so a mutually
+      // assignable pair whose reps take two different cores lowers one of them over the
+      // other's storage.
+      //
+      // D45 IS WHAT MADE IT REACHABLE, and the row's own clearance could not see it: a
+      // literal-union element used to answer "none" whatever the other operand was, so `K[]`
+      // was loud on either side; admitting it as the i32 list left `K[] == string[]` — `K` is
+      // a subtype of `string`, so the two ARE mutually assignable and `checkBin` has nothing
+      // to say — with `"list"` (the i32 core, interned atoms) against `"strlist"` (the string
+      // core). `vl check` rc 0, INVALID WASM. The grid that cleared D45 varied element type x
+      // container x route and held the OTHER OPERAND'S TYPE constant, which is `std/array.vl`'s
+      // twentieth ledger entry ("a population measurement is only as wide as its axes")
+      // reproduced in the change that cites it. Found by the `std-api-reviewer` pass — the
+      // EIGHTH consecutive time that review has produced the closing change's next correction.
+      //
+      // THE COMPILER ALREADY OWNS THIS REFUSAL ONE BOUNDARY OVER: the same pair at an ARGUMENT
+      // position is the loud element-storage message below ("a container's wasm type is fixed
+      // by its element's storage, so these are unrelated types"), and `==` was the only
+      // boundary not asking. The sentence here says the same thing in this section's grammar.
+      //
+      // CORES, NOT TOKENS, and that is what keeps the good half: `N[] == i32[]`
+      // (`type N = 1 | 2`) is two tokens — the numeric literal union reps as its i32 base —
+      // but ONE core, and it runs and is correct. A storage-CLASS predicate would refuse it.
+      // The `nul*` niches fold onto their base's core here for the same reason
+      // `eqCoreKindOfTyToken` folds them: the guard runs the base's core.
+      const eqLc = eqCoreKindOfTyToken(eqLk)
+      const eqRc = eqCoreKindOfTyToken(eqRk)
+      if eqLc >= 0 && eqRc >= 0 && eqLc != eqRc {
+        msgs.push(
+          "`" +
+            op +
+            "` over " +
+            tyToStr(lt) +
+            " and " +
+            tyToStr(rt) +
+            " has no lowering: the two are mutually assignable but store their elements " +
+            "differently, and one compare core cannot read both — compare two values of the " +
+            "same type, or convert one container to the other's element type first",
+        )
+        unsup.push(1)
+      }
     }
   }
   0
@@ -14369,10 +14467,21 @@ export function eqRefusals(
 // THE ACCEPT SET IS THE i32 BACKING, and it is measured rather than derived — the two
 // SENTINEL-repped nullables (`boolean | null` rides the i32 value 2, `K | null` the value -1)
 // and a pure literal union (interned atom ids are i32) are i32 lists as much as `i32[]` is,
-// while `i32 | null` is a value-union BOX and is not. `eqCmpKindOfArrayElem` is NOT that set —
-// it answers "none" for a literal-union element, and a `("a"|"b")[] + ("a"|"b")[]` concatenates
-// correctly today — so the `==` boundary cannot stand in for this one and the two are written
-// out separately.
+// while `i32 | null` is a value-union BOX and is not.
+//
+// **THIS PARAGRAPH USED TO END "`eqCmpKindOfArrayElem` is NOT that set — it answers "none" for
+// a literal-union element", AND THAT CLAUSE IS GONE BECAUSE BOTH HALVES OF IT MOVED.** The
+// `==` home grew the literal family in D45 — so it IS that set now for the STRING and
+// i32-based unions — and this one turns out to be WIDER than its own sentence claimed, in a
+// direction that is a defect rather than a capability: `tyUnionAllLits` accepts EVERY literal
+// base, so `concatElemIsI32Backed` claims an `f64`-backed union as an i32 list and
+// `type F = 1.5 | 2.5;  F[] + F[]` writes a module the engine refuses at `vl check` rc 0.
+// Pre-existing — check-clean invalid wasm on master `8bf0f20f` at the same offset — and filed
+// as `silent-class-inventory` D102 rather than fixed here, because narrowing a `+` rule that
+// "DEFAULTS TO ACCEPT, deliberately" is a change to a different operator with its own
+// population to measure. The `==` side is now the NARROW one (`tyUnionIsOneLitCell` plus the
+// i32-backing split), so the two are still written out separately and the reason is recorded
+// rather than asserted. (`std-api-reviewer` pass over D45.)
 //
 // DEFAULTS TO ACCEPT, deliberately. A rep this predicate has not measured keeps today's
 // behaviour, which is `binOpDefinedFor`'s own stated convention: a rule that over-refuses
