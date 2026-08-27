@@ -5906,9 +5906,17 @@ Repro:
   separate the late position from the early one.
 * Disassembly, both sides: master emits `(local (ref 0))` + `struct.new 0` into a
   `(mut (ref 1))` global cell; the branch emits `(local (ref 1))` + `struct.new 1`.
-* Graduated to `tests/cases/unions/anon-objlit-into-arm-typed-destination.vl` (seven cells:
-  all four destinations, the generic hop, the list-element destination, and the
-  DISAGREEMENT gate that keeps master's behaviour where two destinations name different
+* **AN UN-ANNOTATED BINDING ON THE PATH IS A LINK, NOT A DESTINATION** — a distinction the
+  grid does not contain and code review caught. `retLocalLetOfBlock` walks THROUGH an
+  un-annotated alias to the binding that actually supplies the value, so `const alias = c`
+  sits on the path from the literal to its real destination; recorded as a destination it
+  answers "" and vetoes the pin it is a link of. `const c = { r: n }  const alias = c
+  gsto = alias` was still silent until that skip. The ASSIGNMENT arm is deliberately NOT
+  symmetric: `let o = { r: 0 }` … `o = c` over an un-annotated `o` is a genuine destination
+  whose cell is already committed by its own literal, so there the veto is right.
+* Graduated to `tests/cases/unions/anon-objlit-into-arm-typed-destination.vl` (eight cells:
+  all four destinations, the generic hop, the list-element destination, the alias hop, and
+  the DISAGREEMENT gate that keeps master's behaviour where two destinations name different
   claimants). The `xfail-` pin is DELETED, which is that file's own written instruction, and
   `INVALID_MODULE_SRC` moves to D87 below.
 
