@@ -722,6 +722,7 @@ import {
   variantFieldTypeAt,
   variantIndexOf,
   vtKindOfParam,
+  vtKindOfType,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
 import {
@@ -15510,6 +15511,28 @@ function emitForInList(
   emitExpr(body, iterIx, fnIx)
 }
 
+// True when the function's declared RESULT VALTYPE is a NON-NULL struct / variant ref — the
+// half of `emitReturnValue`'s recover guard that reads the FUNCTYPE, asked of the SAME two
+// sources `emitOneFuncType` writes it from (`vtKindOfType` of the annotation, else the
+// classified `fRetKind` slot), so the recover and the result it repairs cannot drift apart.
+//
+// `fnPos` is the caller's already-hoisted `fnStmts` position, valid only on the un-annotated
+// path — which is exactly where the second source is consulted.
+function retNonNullRefResult(fnIx: i32, fnPos: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      const rk = vtKindOfType(fn.fnRet)
+      return rk == "struct" || rk == "variant"
+    }
+    if fnPos >= 0 && fnPos < fRetKind.length {
+      const ik = fRetKind[fnPos]
+      return ik == "struct" || ik == "variant"
+    }
+  }
+  false
+}
+
 // Lower a RETURN-VALUE expression `retArg` for function `fnIx`: seed the return context
 // from the function's return type (struct / ref-list / union / nullable-niche / numeric
 // widening), emit through the matching helper, then reset the pending seeds. Does NOT emit
@@ -15937,6 +15960,37 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       retCtx.litUnion = 1
     }
     if emitExprExpect(body, retArg, fnIx, retCtx) < 0 { return -1 }
+    // THE RETURN IS A KIND-9 USE SITE, AND IT IS THE ONE THAT NEVER GREW THE RECOVER.
+    // A nullable-struct / nullable-variant READ deliberately stays the RAW `(ref null $S)` —
+    // `emitCapturedReadRecover`'s header states the rule in as many words ("a nullable STRUCT
+    // (kind 9) keeps nullable reads and the USE site recovers"), and every other use site
+    // obeys it: a field access, a call ARGUMENT, an annotated `let` initializer and a
+    // nested-struct field STORE all recover and all run. Returning that value into a NON-NULL
+    // struct result did not, so the functype promised `(ref $S)` over a `(ref null $S)` on the
+    // stack — `vl check` rc 0, `type mismatch: expected (ref $type), found (ref null $type)`.
+    //
+    // FOUR SPELLINGS, ONE MISS, and the narrowed one is why this is not a nested-field row:
+    // `function pick(p: Circle | null, d: Circle): Circle { if p != null { return p } return d }`
+    // has no field read anywhere and is check-clean invalid wasm on master. The others are the
+    // code-15 nested-struct field read at all three receiver storage classes under an explicit
+    // non-null return annotation — D131's SECOND sentence, which its own row records as a
+    // separate rung and which the inferred-kind fix beside it deliberately does not touch.
+    //
+    // WHAT THE GUARD CAN REACH, STATED EXACTLY RATHER THAN GENEROUSLY. It is "the RESULT
+    // VALTYPE is a non-null ref" AND "the value classifies as the nullable niche", and those
+    // two together ARE the validation failure — for every value whose emitted rep really is
+    // the raw `(ref null $S)`, which is what a kind-9 read leaves on the stack. The one other
+    // shape inside the guard is a value some INNER path already recovered: there the extra
+    // `ref.as_non_null` is a validated no-op on an operand that is already non-null, so it
+    // costs a byte and cannot fail. Measured, that set is empty where it can be measured:
+    // over 2,312 corpus files, 0 change their emitted-module sha256.
+    //
+    // AND IT CANNOT TRAP WHERE THE OLD CODE WORKED. `ref.as_non_null` traps only on an actual
+    // null, and an actual null here is a value the CHECKER typed non-null — a soundness hole
+    // that today produces a module the engine refuses to load at all. Loud either way.
+    if retNonNullRefResult(fnIx, fnPos) {
+      if exprNullableRefNiche(retArg, fnIx) { fbRefAsNonNull() }
+    }
   }
   pendingStructIdx = -1
   pendingVariantIdx = -1
