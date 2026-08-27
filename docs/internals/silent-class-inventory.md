@@ -6748,9 +6748,11 @@ only the STRING one.
 distinction matters because an offset is a property of the module: every cell in that table is
 the same four-line body under one shared nine-line prelude, which is what makes 332-vs-337
 comparable at all. This row's own two-line repro is offset **255**. All quoted against a seed
-rebuilt from master `764ad0dd`'s own sources, **1,448,639 bytes** — never the shared
-`build/vl-compiler.wasm`. The SENTENCE is the identifier; the offset only separates F/G from
-BIG within one program shape.
+rebuilt from master `8d070d46`'s own sources, **1,449,387 bytes** — never the shared
+`build/vl-compiler.wasm` — and re-run there after merging: every offset and every sentence in
+the table is unchanged from the `764ad0dd` measurement, so #1957 is orthogonal to this row.
+The SENTENCE is the identifier; the offset only separates F/G from BIG within one program
+shape.
 
 * **THE WIN DIRECTION WAS CHECKED, NOT ASSUMED.** `f64[] + f64[]` and `i64[] + i64[]` are loud
   check rejects written directly, and `emitListConcatI` is hard-wired to the i32 wrapper — so
@@ -6785,7 +6787,7 @@ BIG within one program shape.
 ---
 
 ### D117 — an ALL-`null` INNER array literal under a NESTED niche annotation is a loud emit reject
-**loud emit reject · found 2026-08-26 as D101's closing residue, by the probe VALUE its shape grid used · pre-existing and IDENTICAL on master `764ad0dd` and on D101's branch at every one of fourteen cells · NO `==`, NO `+`, NO generic, NO import, two lines**
+**loud emit reject · found 2026-08-26 as D101's closing residue, by the probe VALUE its shape grid used · pre-existing and IDENTICAL on master `764ad0dd`, on master `8d070d46` after the merge, and on D101's branch at every one of fourteen cells · NO `==`, NO `+`, NO generic, NO import, two lines**
 
 Repro:
 
