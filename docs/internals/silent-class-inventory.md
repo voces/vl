@@ -4787,7 +4787,7 @@ Repro:
 ---
 
 ### D48 — [CLOSED 2026-08-26] an arm-valued map and a LAYOUT-TWIN struct-valued map in one program share a single mv slot
-**CLOSED 2026-08-26 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the census extension D34's change required · pre-existing on `f2064bec` and NOT fixed by D34 — the branch fails in the OTHER function · NO generic, NO import · CLOSED by #PRNUM — the ARM is the THIRD component of an mv slot's identity, threaded as a TRI-STATE hint**
+**CLOSED 2026-08-26 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the census extension D34's change required · pre-existing on `f2064bec` and NOT fixed by D34 — the branch fails in the OTHER function · NO generic, NO import · CLOSED by #1952 — the ARM is the THIRD component of an mv slot's identity, threaded as a TRI-STATE hint**
 
 Repro:
 
@@ -5158,7 +5158,7 @@ Repro:
 ---
 
 ### D63 — [CLOSED 2026-08-26 — now a loud emit reject] a `for` over an arm-element list beside an EXACT LAYOUT TWIN is SILENT where D50 is loud
-**now a loud emit reject (`emitProgram: field access receiver is not a struct`) — the twin no longer routes around D50's floor, and D50 is what both spellings now take. Was: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed · CLOSED by #PRNUM — the nominal floor `rlElemStructRow` already carried, at the SECOND copy of that ladder**
+**now a loud emit reject (`emitProgram: field access receiver is not a struct`) — the twin no longer routes around D50's floor, and D50 is what both spellings now take. Was: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (12 of its 24 residual silent cells: `listelem` / `listoflist` / `structfield` x all four spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · NO generic, NO import, NO alias needed · CLOSED by #1952 — the nominal floor `rlElemStructRow` already carried, at the SECOND copy of that ladder**
 
 Repro:
 
@@ -5231,7 +5231,7 @@ it. Regression fixture (a FLOOR pin — flip it when D50 lifts):
 ---
 
 ### D64 — [CLOSED 2026-08-26] an arm-element list in a STRUCT FIELD beside a layout-twin struct is invalid wasm
-**CLOSED 2026-08-26 — the repro now RUNS (prints `1` / `1`). Was: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (8 of its 24 residual silent cells: `store` + `storeread`, `arm_notwin` and `arm_twin` alike, direct and alias spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · D48's shape ONE CONTAINER OVER — no map anywhere · CLOSED by #PRNUM — `structFieldCodesEq`'s referenced-layer guard, which existed for ONE of the three field codes that need it**
+**CLOSED 2026-08-26 — the repro now RUNS (prints `1` / `1`). Was: check-clean invalid wasm · found 2026-08-26 by D49's 910-cell grid (8 of its 24 residual silent cells: `store` + `storeread`, `arm_notwin` and `arm_twin` alike, direct and alias spellings) · pre-existing and IDENTICAL on `c0873a06` and on D49's branch · D48's shape ONE CONTAINER OVER — no map anywhere · CLOSED by #1952 — `structFieldCodesEq`'s referenced-layer guard, which existed for ONE of the three field codes that need it**
 
 Repro:
 
