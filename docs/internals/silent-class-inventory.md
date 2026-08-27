@@ -98,6 +98,8 @@ and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the sa
 | D93 D94 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **NEW 2026-08-26** — two rows the D47/D50 grid produced, both PRE-EXISTING on master and both the layout-twin collapse one container further out than D48/D64 reached. D93: a NESTED arm-valued map (`{[string]: {[string]: Circle}}`) beside its layout twin — silent on master at the ALIAS spelling, and D47's convergence brings the other three spellings to the same verdict. D94: a struct literal bound with NO annotation, beside two layout-twin declared rows whose FIELD elements differ in arm-ness — silent on master at 5 of its 6 cells |
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 | D52 D66 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; D52 is D39's seam read from the other end and it needed NO channel — the annotation is on the LOCAL, `criRetLocalLet` already hands the result-valtype pass that binding, and `letAnnVariantIdx` was written, exported and documented correct with no caller on this path. What was missing is the ROUTE: `fRetKind` had no inferred `"variant"` tier and `emitOneFuncType`'s inferred `infSlot` ladder had no `variant` arm — the three items D51's row predicted in writing. A FOURTH edit was needed and the disassembly is what found it: with only the functype corrected, `mk` validated and the CALLER did not (`struct.get 0 0` over a `(ref 1)` receiver), so the engine's message moved function and changed one word. 180 of a 9,450-cell grid moved, 0 backward — 84 silent → runs and 96 loud → runs; silent 200 → 116. Corpus: 1,850 of 1,851 co-emitted files byte-identical, the one difference being D52's own pin. D66 rides the same rung and its filed asymmetry — "annotate the CALLBACK'S RETURN; annotating the local does not" — is retired) |
+| D111 D117 | loud emit reject | **runs — CLOSED 2026-08-27** (below; TWO roots and THREE edits, and the ablation says so — one compiler per candidate over one 1,710-cell grid, all three pairwise intersections **0**. Both roots are a complement already written and never called at the sibling rung. D111 needs TWO of the edits and the ORDER is measured: `letAnnIsUninternedShape`'s D53 bridge ALONE moves 16 cells to `runs` and **8 BACKWARD to check-clean invalid wasm**, because the lifted guard makes the binding a struct local whose row disagrees with the pin `monoAnnPinName` mints — that ladder had a `{…}[]` ELEMENT rung and no BARE inline-shape rung, so the argument fell to the `"i32"` catch-all. Disassembled: with the guard alone the instance is `(func (param i32) (result i32))` and `mk` `return_call`s into it from a `(result (ref 0))` frame. The pin rung alone moves 8 (`ann2` x `global` x `gen`, a MODULE-SCOPE binding where the `LetDecl`-local guard never fires). **The union of the three singles' moved sets IS set-identical to the full branch's (8 + 24 + 40 = 72) — the composition is a DIRECTION, not a cell count**, and that is the thing a union check does not say on its own: the full branch disagrees with the guard-alone compiler on exactly the 8 cells that compiler sends to `invalid_wasm`, every one of them `ann1` x `local` x `gen`. D117: `recordElemRepArrayLit` sits ABOVE `assignableExpr`'s `assignable` short-circuit precisely because a niche-element literal is covariantly assignable, and it already descends into an ObjLit's FIELD values — the ARRAY destination never grew the matching ELEMENT-wise descent, so an inner `[null]` kept its self-inferred `null[]` and every niche seed in the null-rep table stayed empty. 40 cells, and it is the three NICHES only: `(i32 | null)[][]` and `(S | null)[][]` already ran. **72 of 1,710 cells moved, all `loud emit reject` → `runs`, 0 backward, 0 same-class MESSAGE moves, 0 `runs`→`runs` value moves.** The 9,450-cell D52 grid moves **196 more cells to `runs`, 0 backward**, and keeps its silent population at 0; the 3,144-cell D75/D81/D82 grid moves **0** cells and 0 messages, so the change is inert where it is not the answer. **Every number here is the RE-MEASUREMENT on merged master `e67347aa`** — all five ablation compilers rebuilt on that base, not carried over from `7b600b57`; #1960 moves none of these 1,710 cells, and stripping all three patches out of the merged tree reproduces `e67347aa` BYTE-IDENTICALLY, which is what says the three are the whole compiler delta) |
+| D131 | check-clean invalid wasm | **NEW 2026-08-27** — the whole residue of the D111/D117 grid, 24 of 1,710 cells and unmoved by that change. A nested-struct FIELD read RETURNED from an UN-ANNOTATED function: the callee's functype says `i32` and the body pushes the field's `(ref null $S)`. It is NOT about the inline shape — a NOMINALLY-typed field reproduces it — and not about the twin: it fires at `decl=nodecl` too. `return o.h` and `const c = o.h; return c` are both loud; `return o.h.r` and the same read at MODULE scope both run |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -6786,8 +6788,8 @@ shape.
 
 ---
 
-### D117 — an ALL-`null` INNER array literal under a NESTED niche annotation is a loud emit reject
-**loud emit reject · found 2026-08-26 as D101's closing residue, by the probe VALUE its shape grid used · pre-existing and IDENTICAL on master `764ad0dd`, on master `8d070d46` after the merge, and on D101's branch at every one of fourteen cells · NO `==`, NO `+`, NO generic, NO import, two lines**
+### D117 — [CLOSED 2026-08-27] an ALL-`null` INNER array literal under a NESTED niche annotation
+**CLOSED 2026-08-27 — the repro RUNS and prints `1`. Was: loud emit reject · found 2026-08-26 as D101's closing residue, by the probe VALUE its shape grid used · pre-existing and IDENTICAL on master `764ad0dd`, on master `8d070d46` after the merge, and on D101's branch at every one of fourteen cells · NO `==`, NO `+`, NO generic, NO import, two lines**
 
 Repro:
 
@@ -6829,6 +6831,37 @@ Repro:
   emitter floor is reached by several unrelated shapes (`per-rep-ladder-audit`,
   `rep-fuzz-findings`, and #1806's `u8[] | null`), so a fix here should be scoped to the
   literal seed rather than to the floor's message.
+* **CLOSED, AND THE SEED IS WHERE THE ROW PREDICTED — but the missing complement is one
+  function earlier than "the array-literal element seed" suggests.** The inner literal's
+  build kind is not threaded at all; what is missing is its RECORDED TYPE.
+  `assignableExpr` short-circuits on `assignable(srcTy, dstTy)` before the literal-aware
+  adoption block, and `null[][]` IS covariantly assignable to `(K | null)[][]`, so the
+  inner `[null]` keeps its self-inferred `null[]`. `recordElemRepArrayLit` is the
+  function that exists to run ABOVE that short-circuit for exactly this reason — its own
+  header says so — and it already DESCENDS into an ObjLit's FIELD values for the sibling
+  container (`{f: [null]}` against `{f: (K | null)[] | null}`). The ARRAY destination has
+  the identical short-circuit and never grew the matching ELEMENT-wise descent. Adding it
+  (same `depth - 1` bound, same `tyDeeperThan` recursion guard as the field-wise walk) is
+  the whole fix, and it serves every storage class at once because `assignableExpr` is
+  the one seam a binding / argument / return / field / element all flow through.
+* **THE MECHANISM SENTENCE, WITH THE TABLE THAT PROVES IT.** Instrumented at the reject —
+  every seed in `emitNullLitNode`'s null-rep table plus the ref-list ELEMENT row the outer
+  literal resolved:
+
+      (K | null)[][]        PLK=0 PLU=0 PNLU=0 PNB=0 PSI=-1  [rslot=0 nest=4 nul=0 nm=i32[]]
+      (boolean | null)[][]  PLK=0 PLU=0 PNLU=0 PNB=0 PSI=-1  [rslot=0 nest=4 nul=0 nm=i32[]]
+      (string | null)[][]   PLK=3 PLU=0 PNLU=0 PNB=0 PSI=-1  [rslot=0 nest=6 nul=0 nm=string[]]
+      (K | null)[][][]      [rslot=1 nest=9 nm=(K|null)[][]] [rslot=0 nest=4 nul=0 nm=i32[]]
+
+  The element row is interned under its REP name, so `i32[]` FOLDS the three i32-backed
+  inner lists (`i32[]`, `(boolean|null)[]`, `(K|null)[]`) onto element kind 4 and
+  `string[]` folds two more onto kind 6 — and `elemNest` is all the seed at
+  `emitArr`'s ref-lit element loop reads. The row's arena sidecar `rlElemTyIx` still knows;
+  seeding from the RECORDED TYPE upstream means nothing here has to.
+* Graduates to `tests/cases/arrays/nested-niche-all-null-inner-literal.vl` — the three
+  niches, the inline and EXPANDED (`"a" | "b" | null`, a `TyUnion` rather than a
+  `TyNullable`) litunion spellings, depths 2 and 3, five storage classes, and the two
+  BOX/struct controls that ran on master and must keep running.
 
 ---
 
@@ -6940,8 +6973,8 @@ consumer, written for D40). **The MAP is the one container the ladder never grew
   below, the first specimen in that genealogy with no declared type in it.
 
 
-### D111 — an INLINE-SHAPE LOCAL beside a declared struct of that layout: D53's question at a THIRD resolver
-**loud emit reject · found 2026-08-26 by MESSAGE-diffing the D100 close, not by an outcome-class count — 18 cells move from a positionless sentence to this anchored one · pre-existing and LOUD on master `764ad0dd` at every cell, on both sides**
+### D111 — [CLOSED 2026-08-27] an INLINE-SHAPE LOCAL beside a declared struct of that layout: D53's question at a THIRD resolver
+**CLOSED 2026-08-27 — the repro RUNS and prints `7`. Was: loud emit reject · found 2026-08-26 by MESSAGE-diffing the D100 close, not by an outcome-class count — 18 cells move from a positionless sentence to this anchored one · pre-existing and LOUD on master `764ad0dd` at every cell, on both sides**
 
 Repro:
 
@@ -6990,6 +7023,47 @@ Repro:
   literal `{…}` spelling, so the variant namespace is unreachable and no shape guard is
   needed; the generic-original guard does not apply either, because the binding here is not
   in a generic original at all — the generic is the CONSUMER.
+* **CLOSED IN THE ORDER THIS ROW NAMED, AND THE ABLATION CONFIRMS THE ORDERING RATHER THAN
+  ASSUMING IT.** The reachable-neighbourhood bullet above says "fix the mono PIN for an
+  inline-shape-annotated local FIRST … then the guard's fall-through is inert in the
+  generic route". Measured on a 1,710-cell grid (shape source x storage class x annotation
+  depth x probe value x route x element type x declaration order), one compiler per
+  candidate:
+
+  | candidate | moved | -> `runs` | BACKWARD to silent |
+  |---|---|---|---|
+  | the mono PIN rung alone      |  8 |  8 | 0 |
+  | the guard fall-through alone | 24 | 16 | **8** |
+  | both                         | 32 | 32 | 0 |
+
+  The two solo MOVED sets are DISJOINT and their union with D117's is set-identical to the
+  full branch's (8 + 24 + 40 = 72). **So the composition is a DIRECTION and not a cell
+  count** — which is exactly what a "union of the singles" check cannot say on its own. The
+  full branch disagrees with the guard-alone compiler on precisely the 8 cells that compiler
+  sends to `invalid_wasm`: `ann1` x `local` x `gen`, at every `decl` level that declares the
+  layout at all, `armdiff` included. The pin's own 8 are `ann2` x `global` x `gen` — a
+  MODULE-SCOPE nullable inline shape, where the guard, a `LetDecl` LOCAL classifier, never
+  fires.
+* **THE PIN'S COMPLEMENT IS ONE LINE BELOW WHERE IT WAS MISSING.** `monoAnnPinName`'s
+  `monoCompositeListAnnName` rung claims a shape ELEMENT (`{r: i32}[]`, its
+  `nameIsBraceSpanEnds` arm) and nothing claimed the bare `{r: i32}` one container in —
+  the same `P` / `P[]` pair `monoStructAnnName` holds BOTH rungs of, missing its first.
+  `isSName` cannot answer for the bare shape BY CONSTRUCTION, which is this row's own
+  premise. The pin is the caller's OWN spelling, and it lands on a path that already
+  works: `paramStructIndex`'s inline-shape rung is D53's fix.
+* **DISASSEMBLED, NOT INFERRED FROM THE MESSAGE.** `type Circle = { r: i32 }` +
+  `const c: { r: i32 } = { r: n }` + `return idg(c)`, one seed apart:
+
+      guard alone   (func (param i32) (result i32))          ... return_call 4
+      both          (func (param (ref 0)) (result (ref 0)))  ... return_call 4
+
+  `struct.new 0` is the DECLARED `Circle` heap type on BOTH — the inline shape really is
+  deduped onto that row, which is the row's premise in bytes — and with the guard alone
+  `mk` `return_call`s a `(result (ref 0))` frame into an `i32`-returning instance.
+* Graduates to `tests/cases/structs/inline-shape-local-beside-declared-twin.vl`, whose
+  `gen` rows are the composition cells and whose `mkNominal` row is the one-line control.
+  The grid, the ablation and the two re-graded populations are
+  `scripts/silent-sweep/d111/` — regenerated from source, never carried over.
 
 ---
 
@@ -7486,6 +7560,67 @@ sharper classifier found no other row hiding behind the conflation** — D22, D2
   reps and both inputs was read by hand before being filed. That rule is what caught all
   five items in §4d — the `optchain` construct's 0-of-132 and the closure-alias 54 both
   tripped it.
+
+### D131 — a nested-struct FIELD read RETURNED from an UN-ANNOTATED function
+**check-clean invalid wasm · found 2026-08-27 as the ENTIRE `invalid_wasm` residue of the D111/D117 grid — 24 of 1,710 cells, unmoved by every one of that change's five ablation compilers · pre-existing and byte-identical on master `7b600b57`, on master `e67347aa` after #1960, and on the D111/D117 branch before and after that merge — the SAME 24 cells by name and the same sentence at each**
+
+Repro:
+
+    type Holder = { h: { r: i32 } }
+
+    function mk(n: i32) {
+      const o: Holder = { h: { r: n } }
+      return o.h
+    }
+
+    print(mk(7).r)
+    // vl check rc 0 with NO diagnostics at all; vl run:
+    //   Invalid input WebAssembly code at offset 176: type mismatch: expected i32,
+    //   found (ref null $type)
+    // (The offset moves with the seed — 176 for this spelling on `7b600b57`, 183 with the
+    //  local hop below. The sentence is the identifier.)
+
+* **IT IS NOT THE INLINE SHAPE, WHICH IS THE CONTROL WORTH RECORDING BECAUSE THE GRID FOUND
+  IT NEXT TO D111.** Spelling the field NOMINALLY reproduces it exactly:
+  `type Circle = { r: i32 }` + `type Holder = { h: Circle }` + the same body is the same
+  sentence at the same offset. It is not the twin axis either — it fires at `decl=nodecl`,
+  with no second claimant for the layout anywhere in the program.
+* **THE AXIS IS THE RETURN, AND THREE ONE-LINE CONTROLS SAY SO.** `return o.h.r` (read the
+  scalar out first) RUNS. The identical read at MODULE scope (`const c = o.h; print(c.r)`)
+  RUNS. Binding through a local first (`const c = o.h; return c`) is the SAME reject, so the
+  local hop is not the axis — the un-annotated function's RESULT type is. The callee's
+  functype says `i32` and the body pushes the field's `(ref null $S)`.
+* **AN EXPLICIT RETURN ANNOTATION DOES NOT FIX IT, IT MOVES THE SENTENCE** —
+  `function mk(n: i32): { r: i32 }` gives `expected (ref $type), found (ref null $type)`, the
+  NULLABILITY rather than the kind. So there are plausibly two rungs here: the inferred
+  result KIND (which reads i32) and the nested-struct field's `(ref null)` nullability at a
+  non-null result. Both are `vl check` rc 0.
+* **WHAT ELSE IS IN THAT RESIDUE, AND WHICH KIND OF THING IT IS** — recorded because a
+  documented DECLINE and an unfiled DEFECT read identically in a residue paragraph, and
+  one of them is a row somebody owes. Besides these 24, the grid's final tree holds 16
+  `loud emit reject` cells (`ann2` x `std`) and 513 `loud check reject` cells, and
+  **every one of the 529 is a DELIBERATE REFUSAL, not a row**:
+  - the 16 are `emitProgram: a nullable-{r:i32} list element has no rep; use a non-null
+    element type`, reached by the grid's own `std` harness line
+    (`const xs: ({r:i32} | null)[]`). `collectA`'s kind-2 arm rejects it on purpose —
+    its header says why in full (*"has no list rep: the box lowering would emit the
+    element's raw value (invalid wasm). Reject cleanly"*) and the message carries the
+    remedy. A DOCUMENTED DECLINE.
+  - 189 of the check rejects are `cannot compare X with null` on the grid's `bare`
+    (non-nullable) control rows — the checker correctly refusing a `null` in a
+    non-nullable list, i.e. the grid's own assertion that it still does.
+  - 108 are `'mk' infers the nullable return type {r: i32} | null`, the checker's own
+    documented decline for an inferred nullable inline-shape return, and the reason
+    `ann2` x `ret` never reaches the emitter at all.
+  - The `loud check reject` set is **513 on all six ablation compilers, cell for cell**,
+    so none of it moved either.
+* Reachable neighbourhood: this is D51/D52's family read at a FIELD source — `fRetKind`'s
+  inferred tier and `emitOneFuncType`'s `infSlot` ladder are where those two rows added a
+  `variant` arm, and a code-15 nested-struct field read is the shape neither added. The field
+  row already resolves (`sFieldTgtStructIdx` is the chokepoint and it answers), so this is a
+  ROUTE question rather than a resolution one, exactly as D52's was.
+
+---
 
 ### D93 — [CLOSED 2026-08-27] a NESTED arm-valued map beside its layout twin collapses onto one mv slot
 **CLOSED 2026-08-27 — the repro now RUNS (prints `7` / `9`). Was: check-clean invalid wasm · found 2026-08-26 by the D47/D50 grid (12 of its 1,024 cells: `nestedmap` x `arm_twin` x pairing=1, across all four spellings) · PRE-EXISTING on `8bf0f20f` at the ALIAS spelling (4 of the 12, byte-identical message and offset) · D47's convergence brings the other 8 to the alias's verdict — D49's accounting, and the two rows it produced that way were D63 and D64 · NO generic, NO import · D48's shape ONE CONTAINER OUT · CLOSED by #1959 — the mv key goes NOMINAL at every depth and the sixth typed find takes D48's hint, and neither half is the answer alone**
