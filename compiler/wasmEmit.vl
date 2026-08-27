@@ -17128,6 +17128,7 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     backTy = mkArrIdx
   } else if (
     ek == "struct" ||
+    ek == "variant" ||
     ek == "union" ||
     ek == "nulstruct" ||
     ek == "list" ||
@@ -17289,6 +17290,7 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if (
     ek == "str" ||
     ek == "struct" ||
+    ek == "variant" ||
     ek == "union" ||
     ek == "list" ||
     ek == "strlist" ||
@@ -20853,14 +20855,43 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           if mvValKind[omSl] != 1 {
             return emitFail("emitProgram: `?.` needs a struct-valued map")
           }
-          const omSi = mvValStructIdx[omSl]
-          const omFi = sFieldIndex(omSi, lhs.omProp)
+          // …AND THE **VARIANT** HALF OF THE VALUE ROW, the same either/or the store seed
+          // and the `??` default seed have carried since D34 (D47 made this site
+          // reachable). `mvValStructIdx` is -1 for an arm-valued map — `collectS` SKIPS a
+          // union member, so the arm has a `uVariants` row and no `sNames` one — and the
+          // three things this site needs off that row all have written twins:
+          // `variantFieldIndex` / `variantFieldTypeAt` / `uVarHeap`, each the arm-for-arm
+          // counterpart of the struct accessor beside it. Without the branch the field
+          // lookup answered -1 and the reject claimed "field is not on the map's value
+          // struct" about a field that IS on it — a loud message that names the wrong
+          // cause, which is the failure mode a wrong table produces at every rung of this
+          // family. The two columns are mutually exclusive, so this is an either/or.
+          let omHeap = -1
+          let omFi = -1
+          let omCode = -1
+          const omVi = mvValVariantOf(omSl)
+          if omVi >= 0 {
+            omFi = variantFieldIndex(omVi, lhs.omProp)
+            if omFi >= 0 {
+              omHeap = uVarHeap[omVi]
+              omCode = variantFieldTypeAt(omVi, omFi)
+            }
+          } else {
+            const omSi = mvValStructIdx[omSl]
+            // `sFieldIndex` bounds its own index (a -1 row answers -1), so the heap read
+            // below is reached only for a row that named the field.
+            omFi = sFieldIndex(omSi, lhs.omProp)
+            if omFi >= 0 {
+              omHeap = sHeapIdx[omSi]
+              omCode = sFieldTypeAt(omSi, omFi)
+            }
+          }
           if omFi < 0 {
             return emitFail(
               "emitProgram: `?.` field is not on the map's value struct",
             )
           }
-          if sFieldTypeAt(omSi, omFi) != 0 {
+          if omCode != 0 {
             return emitFail(
               "emitProgram: `?.` over a map read supports only i32/boolean fields",
             )
@@ -20868,19 +20899,19 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           if emitMapPrep(body, omInner.idxArr, omInner.idxIndex, fnIx) < 0 {
             return -1
           }
-          pushMapScr(body, 5)               // entry
-          fbIf(127)                         // if (entry != 0 → hit), i32 blocktype
+          pushMapScr(body, 5)          // entry
+          fbIf(127)                    // if (entry != 0 → hit), i32 blocktype
           pushMapVals(body)
-          fbStructGet(cmValsWrap(), 0)      // vals backing
-          pushMapScr(body, 5)               // entry
+          fbStructGet(cmValsWrap(), 0) // vals backing
+          pushMapScr(body, 5)          // entry
           fbI32Const(1)
-          fbI32Bin(107)                     // i32.sub (entry - 1)
-          fbArrayGet(cmValsBack())          // (ref null <value struct>)
-          fbRefAsNonNull()                  // a live entry's value is non-null
-          fbStructGet(sHeapIdx[omSi], omFi) // .f
-          fbElse()                          // else
+          fbI32Bin(107)                // i32.sub (entry - 1)
+          fbArrayGet(cmValsBack())     // (ref null <value struct>)
+          fbRefAsNonNull()             // a live entry's value is non-null
+          fbStructGet(omHeap, omFi)    // .f — the arm's `uVarHeap` row or the struct's
+          fbElse()                     // else
           if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-          fbEnd()                           // end (if)
+          fbEnd()                      // end (if)
           return 0
         }
       }
