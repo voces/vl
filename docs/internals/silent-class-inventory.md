@@ -68,7 +68,19 @@ repro rather than a paraphrase:**
 | D47 D48 D49 D50 | — | **NEW 2026-08-26** — four rows the D34/D37 grids and the census produced (renumbered from D39-D47 when #1945 landed first and took those three). D47: the INLINE map-annotation spelling of an arm-valued map keeps the LOUD `-3` floor while the ALIAS spelling now lowers. D48: an arm-valued map and a layout-TWIN struct-valued map in ONE program share a single mv slot (silent, master and branch). D49: `type C = Circle[]` — the array-ALIAS spelling of an arm-element list — is check-clean invalid wasm where the direct `Circle[]` spelling runs (silent, master and branch) — **CLOSED 2026-08-26**, see its own line below. D50: a `for` loop over an arm-valued container binds no variant loop var — LOUD on both, list and map spellings alike |
 | D49 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; the complement is a RENDERER, not a predicate. `singleAliasMemberTyIx`'s array arm was gated on `arrSpineIsScalar`, whose own header says it is "the exact condition under which `tyToEmitName` renders the type name-faithfully" — a property of the renderer. `tyToNominalName` is that renderer's name-faithful twin, already written, already documented correct, and with **no consumer in emitted output at all**. 240 of 910 grid cells moved, 44 out of silent (22 to `runs`, 22 to LOUD) and 174 loud→`runs`; **0 `correct` cells moved anywhere**, and every one of the 218 is an ALIAS cell — no `direct` / `inline` / `inferred` cell moves. Ten cells go LOUD→silent and all ten land EXACTLY on their alias-free control's MASTER verdict, which is the alias ceasing to be a dialect rather than acquiring one; the two shapes they land in are filed as D63 and D64) |
 | D48 | check-clean invalid wasm | **STILL OPEN 2026-08-26** — re-measured, and its witness module is **byte-identical** under this change. One candidate fix was built and REFUTED by ablation (below): parity at the slot-identity FIND separates the two slots and the downstream heap wiring does not follow — the failure moves from `mkD` to `mkC` and a two-ARM control that runs on master becomes invalid wasm. A sibling one container over is filed as D64 |
-| D47 D50 | loud emit reject | **runs — CLOSED 2026-08-26** (below; TWO ROOTS, and the ablation says so — one compiler per candidate over one 1,024-cell grid, moved sets **PAIRWISE DISJOINT** at the outcome level (D50 160, D47 180, intersection **0**) with **34 further cells needing BOTH**, every one of them a `mapval` x `for`-in. D50's complement was already written as two REFUSALS, one per container, in `forInRefArrayStructIdx`; D47 is D-ALIASMAP — the INLINE spelling hands the mv layer the arm's NAME and the ALIAS hands it `tyToEmitName`'s structural render, so the two key different rungs and only one resolves. 374 of 1,024 cells moved, **365 to `runs`**, **0 `correct` cells moved anywhere**; 9 go LOUD→silent and every one has a ONE-AXIS control already holding that exact verdict on master. **ARM-NESS IS NO LONGER OBSERVABLE AT ANY COORDINATE THAT HAS AN ARM-FREE CONTROL** — the
+| D47 D50 | loud emit reject | **runs — CLOSED 2026-08-26** (below; TWO ROOTS, and the ablation says so — one compiler per candidate over one 1,024-cell grid, moved sets **PAIRWISE DISJOINT** at the outcome level (D50 160, D47 180, intersection **0**) with **34 further cells needing BOTH**, every one of them a `mapval` x `for`-in. D50's complement was already written as two REFUSALS, one per container, in `forInRefArrayStructIdx`; D47 is D-ALIASMAP — the INLINE spelling hands the mv layer the arm's NAME and the ALIAS hands it `tyToEmitName`'s structural render, so the two key different rungs and only one resolves. 374 of 1,024 cells moved, **365 to `runs`**, **0 `correct` cells moved anywhere**; 9 go LOUD→silent and every one has a ONE-AXIS control already holding that exact verdict on master. **THE TRADE, NAMED RATHER THAN ABSORBED.** This change moves 365 cells to `runs` and takes
+the SILENT total from 9 to 18, i.e. the inventory from three silent rows to five. Both are
+true and the second is movement against the metric that matters most, so it was measured
+rather than argued: **holding those 9 loud was built as its own compiler and REFUSED by the
+grid.** A floor on the shape costs 28 working programs, 6 of them `correct` on master today,
+and still leaks 4 of the 9 — the numbers and the reason are on D93. D94's is not separable
+at all: its `index` sibling reaches the same defect on master with no `for` in the program,
+so D50's rung was masking that row rather than guarding it. Parity does not by itself say
+which direction to converge; what says it here is that every available floor is a bigger
+dialect (an unused `type Dot = {r:i32}` deciding whether a program compiles) than the one it
+removes.
+
+**ARM-NESS IS NO LONGER OBSERVABLE AT ANY COORDINATE THAT HAS AN ARM-FREE CONTROL** — the
 grid's cleanest statement of the result. Graded against the `plain` leg coordinate by
 coordinate (same container / spelling / construct / pairing / order, `Circle` simply not a
 union member): on master the three arm legs differ from their control on **93 / 84 / 93** of
@@ -6321,6 +6333,26 @@ Repro:
   costs far more elsewhere: the same 1,024-cell grid goes 701 → 609 `correct` and 17 → 57
   `invalid_wasm`. Reverted unmeasured-widening-first, and recorded here so the next attempt
   does not re-derive it.
+* **A SECOND CANDIDATE WAS BUILT AND REFUTED, and it is the one worth recording, because it
+  is the obvious one: hold the LOUD floor instead of fixing the collapse.** Guard at the mv
+  mint — refuse (`-3`) a kind-6 value whose transitive value is a declared arm with an
+  exact-layout DECLARED twin (`mvDeepArmOfTy` + a `structIndexOfTypeName` twin test gated on
+  `nameIsStructDecl`, so an inline-shape row minted from the arm's own render cannot answer).
+  Measured over the same 1,024 cells: **866 `correct` / 148 loud / 10 silent**, against the
+  branch's 894 / 112 / 18 and master's 529 / 486 / 9. It buys 8 fewer silent cells for **28
+  fewer working programs**, and **6 of those 28 are `correct` on MASTER** —
+  `arm_twin` x `nestedmap` x `alias` at pairing 0 and 2, which are SINGLE-unit programs where
+  no collapse is possible at all. It also LEAKS: 4 of the 8 cells it exists to hold
+  (`inferred` index/values at pairing 1) still go silent.
+* **AND THAT REFUTATION GENERALISES, WHICH IS THE REASON THIS ROW IS NOT CLOSED BY A FLOOR.**
+  The condition that would be correct is *"two distinct inner map value types would collapse
+  onto one mv slot"*, and that is a property of the PAIR, not of any one map's shape. Every
+  shape-level approximation available at the mint fires on single-unit programs, because
+  `mvShapeOfValNameArmTy` mints ONE slot at a time and cannot see whether a second,
+  differently-armed value will later claim it. The place both claimants exist is the FIND
+  rung — and making the find rung discriminate is the first refuted candidate above (57
+  silent). A floor here is a NEW DIALECT (`type Dot = {r:i32}`, declared and never mentioned,
+  would decide whether a nested arm-valued map compiles) traded for a smaller one.
 * **THE GENERAL STATEMENT IS A RENDERER, NOT A HINT.** "The nominal identity the render
   dropped" is exactly what `tyToNominalName` computes — D49's note calls it "already
   written, already documented correct, with no consumer in emitted output at all" — but
@@ -6377,6 +6409,13 @@ Repro:
 * **THE ONE CELL THIS CHANGE MOVES ONTO IT** is `forin`/order-a, whose order-b twin and whose
   `index` and `passon` siblings are all already silent on master at the same offset and
   message. Inherited, not created.
+* **AND ITS FLOOR IS NOT SEPARABLE FROM D50'S FIX, because the same rung does not decide
+  both — D50's rung is not involved at all.** The `index` sibling reaches this defect on
+  master with NO `for` in the program, which is the proof: the wrong row is picked when the
+  literal is bound, before any loop exists. Holding the one cell loud would mean refusing a
+  variant loop var when the receiver is a struct field of an un-annotated literal — a
+  condition on the failing CELL, not on the loop. D50's floor was masking this, not guarding
+  it.
 
 ---
 
