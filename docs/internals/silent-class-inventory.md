@@ -8709,7 +8709,7 @@ Repro (on `1e81b0f3`: `vl check` clean, invalid wasm):
 
 ---
 
-### D198 — the composition: D196 alone moves ONE cell, and six more only move with D195
+### D198 — the composition: D196 alone moves ONE cell, the floor moves NONE, and six more move only together
 **CLOSED (this PR) · this row exists because the ablation's direction check, not its count, is what justified shipping D196**
 
 Repro (`p5_i32arg` — the cell that a per-candidate COUNT calls inert and the composition
@@ -8727,24 +8727,32 @@ invalid wasm, and only with both does it run):
     const c0: Circle = { r: 7 }
     via((_n: i32) => c0)
 
-* **THE FOUR-COMPILER ABLATION, on the 21-cell hand grid** (each built from a named sha, and
-  stripping BOTH reproduces the `1e81b0f3` seed byte-for-byte at 1,453,931 bytes):
+* **THE FIVE-COMPILER ABLATION, on a 28-cell hand grid** (each built from `1e81b0f3` with the
+  other candidates stripped; stripping ALL THREE reproduces that seed byte-for-byte at
+  1,453,931 bytes):
 
-  | compiler | bytes | cells RUNS |
-  |---|---|---|
-  | neither (== `1e81b0f3`) | 1,453,931 | 6 |
-  | D195/D197 only | 1,454,068 | 13 |
-  | D196 only | 1,454,017 | 7 |
-  | both | 1,454,154 | 20 |
+  | compiler | bytes | RUNS | SILENT | LOUD |
+  |---|---|---|---|---|
+  | none (== `1e81b0f3`) | 1,453,931 | 7 | 13 | 8 |
+  | D195/D197 only | 1,454,068 | 15 | 10 | 3 |
+  | D196 only | 1,454,017 | 8 | 12 | 8 |
+  | the arm-parameter floor only | 1,454,592 | **7** | 12 | 9 |
+  | D195 + D196 | 1,454,154 | 22 | 5 | 1 |
+  | all three | 1,454,815 | 22 | **0** | 6 |
 
-* **Pairwise intersection: EMPTY.** D195 moves 7 cells, D196 moves 1, and no cell is moved by
-  both. **Set identity fails in the useful direction**: the union of the singles is 8 and the
-  pair moves 14, so **six cells move only when both are present** — the closure-PARAM and
-  annotated-closure-result shapes, where D196 fixes the `$fnsig` and D195 fixes the binding
-  that receives its result. A count would have scored D196 at "1 cell" and dropped it.
-* **AND THE DISGUISE CHANGES UNDER D196 ALONE**: this witness moves from `trap_loads` to
+* **Pairwise intersections are ALL EMPTY.** D195 moves 8 cells to `runs`, D196 moves 1, and
+  the floor moves **0**. **Set identity fails in the useful direction**: the union of the
+  singles is 9 and the branch moves 15, so **six cells move only when more than one edit is
+  present** — the closure-PARAM and annotated-closure-result shapes, where D196 repairs the
+  `$fnsig` and D195 repairs the binding that receives its result. A count would have scored
+  D196 at "1 cell" and dropped it.
+* **AND THE FLOOR IS THE CASE A COUNT CANNOT SEE AT ALL.** It moves 0 cells to `runs`; its
+  whole contribution is the SILENT column, `5 → 0`. Read as a count it is inert; read as a
+  direction it is what keeps five cells D196 uncovered out of silence.
+* **THE DISGUISE CHANGES UNDER D196 ALONE**: this row's witness moves from `trap_loads` to
   `check-clean invalid wasm` — same defect, different column — which is why the ablation is
-  read on all four instruments and not on the outcome count alone.
+  read on all four instruments and never on the outcome count alone.
+* **0 `runs` cells lost, 0 cells became silent**, on the full branch.
 
 ---
 
