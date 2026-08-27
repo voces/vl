@@ -39,6 +39,13 @@ B is **not** a second spelling of A. Its own control has no field read at all �
 `function pick(p: Circle | null, d: Circle): Circle { if p != null { return p } return d }` is
 check-clean invalid wasm on master — and it fires at a PARAM receiver, where A never does.
 
+B's guard is stated exactly rather than generously: "the RESULT VALTYPE is a non-null ref" AND
+"the value classifies as the nullable niche" together ARE the validation failure, for every
+value whose emitted rep really is the raw `(ref null $S)`. The one other shape inside it is a
+value some INNER path already recovered, where the extra `ref.as_non_null` is a validated no-op
+on an already-non-null operand — a byte, not a failure. Measured, that set is empty where it
+can be measured (see the corpus line below).
+
 ## The ablation
 
 Measured against master **`89f88840`** (fixpoint 1451224 bytes). **Stripping both patches out
