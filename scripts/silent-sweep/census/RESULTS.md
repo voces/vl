@@ -261,3 +261,54 @@ structfield    twin  -      -      decl       172      928  18.5%
 bare           twin  union  claim  decl       171     4174   4.1%
 structfield2   twin  -      -      decl       164      992  16.5%
 ```
+
+---
+
+## RE-GRADED 2026-08-27 on merged master `e04b1567` (seed 1,456,293) — D181's leg
+
+The numbers above are `1559d80c`'s. **This file goes stale one-directionally**, so the whole
+grid was regenerated and re-graded against master three commits later, and against the branch
+that closes D181. Regenerate + re-run with the commands in `README.md`; the analysis is
+`scripts/silent-sweep/d181/README.md`.
+
+| block | cells | silent at `1559d80c` | at `1e81b0f3` | at `e04b1567` | on D181's branch |
+|---|---|---|---|---|---|
+| A | 150,224 | 12,673 | 12,277 | 8,983 | **6,520** |
+| B | 28,590 | 3,141 | 3,023 | 2,115 | **1,604** |
+| C | 43,200 | 3,885 | 3,765 | 2,596 | **1,616** |
+| D | 9,000 | 155 | 155 | 67 | 67 |
+| E | 19,224 | 1,911 | 1,911 | 1,422 | **894** |
+| **all** | **250,238** | **21,765** | **21,131** | **15,183** | **10,701** |
+
+`loud check reject` is 68,258 and `loud emit reject` 52,190 on BOTH `e04b1567` legs,
+identical to the cell in every block — so the 4,482 cells that move do so from
+`check-clean invalid wasm` to `runs`, with nothing lateral and nothing backward.
+`runs but wrong value` and `trap_loads` are 0 on both; `compiler trap` is 2 on both (D179).
+
+**DO NOT QUOTE A FAMILY SIZE FROM THIS FILE — RE-DERIVE IT.** `rescue.py`'s families moved
+under every landing this week, in both directions, because the family key is the SET of axes
+that rescue a cell and closing one axis moves cells BETWEEN families:
+
+| family | `1559d80c` | `1e81b0f3` | `e04b1567` |
+|---|---|---|---|
+| `claim` | 2,254 | 2,254 | 2,254 |
+| `cont` | 1,992 | 2,032 | 1,982 |
+| `union` | 1,896 | 1,518 | 1,084 |
+| `claim,cont` | 1,296 | 1,296 | 1,430 |
+
+On D181's branch the `claim` family is **0** and `claim,cont` is **0**.
+
+**THREE CAVEATS FOR ANYONE RE-RUNNING THIS FILE'S OWN INSTRUMENTS.**
+
+1. `sabcensus.py`'s `check-clean invalid wasm` column is PERISHABLE and lost four specimens
+   in one day: `iw_d155` at #1965, `iw_alias` at D181, and the two chosen to replace those —
+   D182's and D186's witnesses — at #1969, before D181's branch could merge. It now carries
+   D180's and D183's, and its own header says re-checking them is the maintenance instruction.
+2. Two block-D cells (D179's `compiler trap` pair) report a different MESSAGE on any two
+   compilers of different sizes, because their "message" is a wasm backtrace of the compiler
+   and its function indices shift. They are not a behaviour change; a message-channel diff
+   over the census will always show them.
+3. `scripts/mono-tyaram-grid.sh` reported 157 OK / 104 REJECT once and 156 / 105 on every
+   later run of the same byte-identical seed. `vl --compiler X` caches its Cranelift image in
+   a `.cwasm` sidecar beside X, and a cold fan-out races to write it; prewarm serially before
+   any parallel grading, which is what `scripts/silent-sweep/d181/twin181.py` does and why.
