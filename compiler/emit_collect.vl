@@ -500,8 +500,11 @@ import {
   registerValueUnionName,
   restoreNarrow,
   retAnnKindChain,
+  retLocalLetOfBlock,
   retRefArrElemName,
+  retRefArrFlag,
   retStructIndex,
+  retVariantFlag,
   rlElemInnerSlot,
   rlElemMapKeyI32,
   rlElemMapValMvSlotAt,
@@ -530,6 +533,7 @@ import {
   structNameIxReset,
   structTyIxReset,
   synthTypeRefTy,
+  tyAnnRefListSlot,
   uFieldElemKeyI32At,
   uFieldElemTyIxRow,
   uFieldRowKeyI32,
@@ -961,6 +965,105 @@ export function synthNullableAnn(letIx: i32) {
       let synTyIx = nty
       if nulNumLitUnionBaseName(nty) != "" { synTyIx = -1 }
       s.letType = synthTypeRefTy(nm, -1, synTyIx)
+    }
+  }
+  0
+}
+
+// SYNTHESIZE the RETURN ANNOTATION onto an un-annotated local that IS the function's
+// returned value and whose initializer is an anonymous object literal — the third member of
+// the `synthEmptyListAnn` / `synthNullableAnn` family, here for the reason their headers
+// give: "an annotation is the ONE input every downstream path reads, so writing the inferred
+// type back as one makes the slot classifier agree without teaching it to re-infer".
+//
+// THE DEFECT (silent-class-inventory D39). `function mk(n: i32): Circle { const o = { r: n }
+// return o }`, in a program declaring `type Shape = Circle | Sq` beside an exact layout twin
+// `type Dot = { r: i32 }`, is `vl check` rc 0 with NO diagnostics and a module the engine
+// refuses: `type mismatch: expected (ref $type), found (ref $type)`. Eleven lines, no import,
+// no generic, no lambda. The `[{ r: n }]` list spelling is the same row.
+//
+// AN ANONYMOUS SHAPE HAS TWO NOMINAL CLAIMANTS AND ONLY THE CONTEXT SEPARATES THEM.
+// `structIndexOfObj` scans the STRUCT table by field set and finds `Dot`; `objVariantName`
+// scans the VARIANT table and finds `Circle`; the ladder every consumer walks asks the struct
+// table first, so the local builds `Dot`'s row while the RESULT boundary — driven by the
+// annotation, which is nominal and unambiguous — declares `uVarHeap[Circle]`. Neither scan is
+// wrong: with no annotation at all (`function mk(n: i32) { … }`) `Dot` is the right answer and
+// the program RUNS, which is why this cannot be fixed by reordering the ladder. It is the
+// ANNOTATION that decides, and the un-annotated local never saw it.
+//
+// SCOPED TO THE STRUCT/VARIANT SEAM, WHICH IS THE ONLY ONE THAT CANNOT BRIDGE. Two DECLARED
+// structs of the same layout merge at the heap layer (`sTwin`), so `: Dot` over a literal that
+// resolved to a same-shape `Circle` row runs today and is untouched here — measured as D39's
+// own `Sq`/`Shape`-deleted control, which RUNS. A union ARM does not merge with a struct row
+// and must not: `DECISIONS.md` records that seam as NOMINAL, and D32/D33/D34 are the three
+// rungs already placed under that ruling. So the gate is exactly "the return annotation names
+// a CONCRETE VARIANT, or a list of one" — the pin fires only where a structural bridge is
+// unavailable by ruling.
+//
+// AND ONLY OVER A LITERAL. The initializer must be an object literal (or a list whose first
+// element is one): those are the producers whose row is chosen by a field-set scan and so are
+// the ones an annotation can re-aim without contradicting a decision made elsewhere. A local
+// initialized from a CALL, an IDENT or a param already carries its producer's committed rep,
+// and re-pinning it would move a value rather than name it.
+//
+// The synthesized node hands the annotation's OWN recorded type over (`synthTypeRefTy`)
+// rather than re-resolving its spelling, which is `emit_rewrite`'s rule for this move: the
+// spelling denotes exactly the type being handed, and `nameToTy` does not hash-cons, so a
+// re-parse would mint a structurally duplicate row.
+//
+// Returns 0 always; the mutation is `s.letType`, in place — the same contract as its two
+// siblings.
+export function synthRetPinAnn(letIx: i32, fnIx: i32) {
+  if fnIx < 0 { return 0 }
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 { return 0 }
+    if s.letInit < 0 { return 0 }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if fn.fnRet < 0 { return 0 }
+      // THE GATE: a concrete-variant return, bare or as a ref-list element. Anything else
+      // either bridges structurally already or is not this seam.
+      let pinName = ""
+      if retVariantFlag(fn.fnRet) == 1 { pinName = tyNameOf(fn.fnRet) }
+      if retRefArrFlag(fn.fnRet) == 1 {
+        const rae = retRefArrElemName(fn.fnRet)
+        if rae != "" {
+          if variantIndexOf(rae) >= 0 { pinName = tyNameOf(fn.fnRet) }
+        }
+      }
+      if pinName == "" { return 0 }
+      // THE RETURNED LOCAL: the function's tail value (or its first valued `return`) is a
+      // bare ident that resolves — through an UN-ANNOTATED alias chain — to THIS binding.
+      // `retLocalLetOfBlock` is the same lookup `criRetLocalLet` makes for the result-valtype
+      // pass, shared rather than copied so the two cannot disagree about which binding
+      // supplies the returned value. The chain is what puts the pin on the let that holds the
+      // LITERAL rather than on an intermediate that merely names it: `const o0 = { r: n }
+      // const o = o0  return o` needs `o0` pinned, since annotating `o` alone would ask for
+      // a coercion between two heap types that has no adapter.
+      const rx = fnRetExprOf(fnIx)
+      if rx < 0 { return 0 }
+      if retLocalLetOfBlock(fn.fnBody, rx) != letIx { return 0 }
+      // A LITERAL producer, bare or one list deep.
+      const iv = P.nodes[unwrapParen(s.letInit)]
+      let lit = false
+      if iv is ObjLit { lit = true }
+      if iv is ArrayLit {
+        if iv.arrElems.length >= 1 {
+          const e0 = P.nodes[unwrapParen(iv.arrElems[0])]
+          if e0 is ObjLit { lit = true }
+        }
+      }
+      if !lit { return 0 }
+      const pinTy = synthTypeRefTy(pinName, -1, nodeTyIxOf(fn.fnRet))
+      // The ref-list ROW, banked on the new node at its mint — this synthesis postdates
+      // the last `collectA` run, exactly as `synthEmptyListAnn`'s does, so the intern
+      // pass cannot cover the node. The row is the one the RETURN annotation already
+      // interned for the same spelling, which is what makes the local's wrapper and the
+      // function's result wrapper one slot rather than two.
+      const pinSlot = tyAnnRefListSlot(fn.fnRet)
+      if pinSlot > 0 { recordAnnRlSlot(pinTy, pinSlot, 0) }
+      s.letType = pinTy
     }
   }
   0
@@ -2475,6 +2578,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
       if s is LetDecl {
         synthEmptyListAnn(stmts[i])
         synthNullableAnn(stmts[i])
+        synthRetPinAnn(stmts[i], fnIx)
         // Classify the init type BEFORE binding the name, then allocate a fresh slot and
         // bind `name → slot` so a LATER reference (or a shadowing inner `let`) resolves to
         // THIS slot. `slot` is the new slot's declared-local position.

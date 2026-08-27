@@ -339,6 +339,42 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-annotated-list-return-anon-elem-twin.vl` per the
 // REFILLS procedure below, in the same commit that swapped this constant.
 //
+// THAT D39 SPECIMEN IS CLOSED, together with D40 and D41, and the three were THREE INDEPENDENT
+// ROOTS rather than one — which an ABLATION says and a resemblance could not. One compiler per
+// candidate fix, each swept against the same 480-cell grid: the alias-hop patch fixes 40 cells,
+// the array-element patch 60, the return-annotation pin 16, and the three moved sets are
+// PAIRWISE DISJOINT (0 ∩ 0 ∩ 0). Twelve further cells need TWO of them together — an alias of a
+// list of a `: Circle`-annotated value, which needs the lookup to reach the right `let` AND that
+// `let`'s literal to classify as a ref list — so the union of the singles (116) is smaller than
+// the branch's 128, which is the shape a COMPOSITION has and a shared root does not. 132 of 480
+// cells moved, 0 backward; silent 90 → 20.
+//
+// D39 itself went the way its predecessors did, except in one respect worth recording: for the
+// first time in this genealogy the complement was NOT already written. The rule an anonymous
+// `{ r: n }` needs is which of its two nominal claimants the CONTEXT wants — `structIndexOfObj`
+// finds `Dot` by field set, `objVariantName` finds `Circle` by field set, and with no annotation
+// at all `Dot` is the RIGHT answer and the program runs. So there was no unasked predicate to
+// call; the annotation had to be carried to the local that never saw it, which is what
+// `synthEmptyListAnn` and `synthNullableAnn` already do for two other inferences and what
+// `synthRetPinAnn` now does for this one.
+//
+// THE SUCCESSOR IS AGAIN THAT CHANGE'S OWN RESIDUE, and this time the grid names its axis
+// outright: all 20 surviving silent cells are `decl=arm`, and 16 of them are `twin=exact`. The
+// minimal witness is eleven lines with no list and no result annotation — `const c: Circle =
+// { r: n }  return c` beside `type Dot = { r: i32 }`. The local's own cell resolves the ARM
+// (its annotation is nominal and unambiguous) while the INFERRED result valtype takes `Dot`'s
+// row from the structural ladder, and the two `$type`s in the engine's message are those two
+// heap types. It is `silent-class-inventory.md` D52.
+//
+// Its axis is one line: DELETE `Dot` and it runs. So do a same-arity different-NAME twin,
+// `Sq`/`Shape` deleted, and annotating the RESULT — four controls, all measured, all RUN.
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with one
+// redundant-annotation HINT and no error, `--codegen` rc 1 with `not valid wasm` +
+// `type mismatch: expected (ref $type), found (ref $type)`, `--codegen --no-validate` rc 0, and
+// NO `emit error` marker. Pre-existing: silent on master `c0873a06` too, same message. Pinned as
+// `tests/cases/soundness/xfail-miscompile-annotated-arm-local-beside-layout-twin.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -380,12 +416,12 @@ const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
   `\n` +
-  `function mk(n: i32): Circle[] {\n` +
-  `  const o = [{ r: n }]\n` +
-  `  return o\n` +
+  `function mk(n: i32) {\n` +
+  `  const c: Circle = { r: n }\n` +
+  `  return c\n` +
   `}\n` +
   `\n` +
-  `print(mk(7)[0].r)\n`;
+  `print(mk(7).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
