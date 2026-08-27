@@ -7276,9 +7276,10 @@ Repro:
   can equate.
 * **RUNG 2: THE VALUE-ROW COLUMNS HAD TO FOLLOW THE MERGE, and it measures ZERO alone.**
   With the slots merged, `mvValVariantIdx` / `mvValStructIdx` are still recorded at the MINT
-  off the ONE spelling that minted the row, so eleven consumers — the map STORE seed, the
-  `??` DEFAULT seed, the `?.` field read, three struct-row resolvers and the `for-in` value
-  walk — kept answering with the render's inline row. Disassembled on the nested cell: the
+  off the ONE spelling that minted the row, so its ELEVEN call sites — the map STORE seed,
+  the `??` DEFAULT seed, the `?.` field read, two `structIndexOfExpr` map arms,
+  `forInRefArrayStructIdx` and its variant twin, and four sibling variant resolvers — kept
+  answering with the render's inline row. Disassembled on the nested cell: the
   store emitted `struct.new 0` (the inline `{r:i32}` row) into an array of `(ref null 1)`
   (`uVarHeap[Circle]`), and a later field read emitted `struct.get 0 0` over a `(ref 1)`
   receiver. Both columns now read through `mvCanonRepOf`, the chokepoint the heap mint, the
