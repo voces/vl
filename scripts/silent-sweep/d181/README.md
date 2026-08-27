@@ -52,16 +52,19 @@ reps, which have no object shape to declare), `twin=none`, `union=nounion`, `del
 
 ## The result that closed the row
 
-Master `1e81b0f3` (seed 1,453,931) vs the branch (seed 1,454,009):
+Merged master `e04b1567` (seed 1,456,293) vs the branch (seed 1,456,371). **Every number in
+this file is re-measured on the MERGED base**: this branch was cut at `1e81b0f3` and two
+census-cluster landings (#1969 `88f21245`, #1968 `e04b1567`) came in underneath it, so
+nothing here is carried over.
 
-| | `1e81b0f3` | branch |
+| | `e04b1567` | branch |
 |---|---|---|
-| runs | 294 | **882** |
-| check-clean invalid wasm | 660 | **72** |
+| runs | 296 | **888** |
+| check-clean invalid wasm | 658 | **66** |
 | loud check reject | 132 | 132 |
 | loud emit reject | 114 | 114 |
 
-**588 cells move, every one `check-clean invalid wasm` → `runs`. 0 backward, 0 lateral, and
+**592 cells move, every one `check-clean invalid wasm` -> `runs`. 0 backward, 0 lateral, and
 both loud columns are unchanged to the cell.**
 
 **THE ALIAS AXIS IS INERT AFTER THE FIX, IN THE MESSAGE AS WELL AS THE CLASS.** Pair every
@@ -69,19 +72,39 @@ both loud columns are unchanged to the cell.**
 
 | | same class | same message | different |
 |---|---|---|---|
-| `1e81b0f3` | 212 | 164 | **588** |
+| `e04b1567` | 208 | 164 | **592** |
 | branch | **800** | **800** | **0** |
 
-The `claim × annpat` table says the same thing a second way — after the fix the silent count
-at `claim=1` and `claim=2` equals the `claim=0` count at every one of the five `annpat`
-levels (3 / 2 / 8 / 3 / 8), where before it was (52 / 54 / 80 / 52 / 80).
+The `claim` x `annpat` table says the same thing a second way — after the fix the silent
+count at `claim=1` and `claim=2` equals the `claim=0` count at every one of the five
+`annpat` levels (2 / 2 / 8 / 2 / 8), where before it was (52 / 54 / 80 / 52 / 80).
+
+**WHAT THE TWO LANDINGS UNDERNEATH THIS BRANCH OWN, PER COORDINATE.** "Did my count change"
+is the wrong question — #1968's author found #1969 had closed 220 of its 1,518 with ZERO
+coordinate overlap. Graded per cell on both bases and both legs:
+
+| | cells |
+|---|---|
+| the landings close, with this fix ABSENT | **2** |
+| this fix closes on `1e81b0f3` | 588 |
+| this fix closes on `e04b1567` | **592** |
+| …of which close ONLY on the merged base — a COMPOSITION | **4** |
+| …lost to the landings | **0** |
+| overlap between the landings' 2 and this fix's 592 | **0** |
+
+So `letMapDestShape` (#1969, which closed 2,644 census cells and census rows D182 / D185 /
+D186) and the closure-arm fix (#1968) own two cells of this grid and this fix owns 592, with
+nothing in common — and four more cells run only with both, having been silent under either
+alone. #1969's own residue note says the same thing from the other side: its pure-`cont`
+remainder is 735/1,297 **at `cont=list_of_map` with a container ALIAS present**, which is
+this grid.
 
 ## The residue, and what it is NOT
 
-72 silent cells remain, **24 at each of `claim` 0, 1 and 2** — so they are not this row's:
+66 silent cells remain, **22 at each of `claim` 0, 1 and 2** — so they are not this row's:
 they are the population a no-alias program already had. Their coordinates are
-`rep ∈ {arm, f64lit, numlit}` only, concentrated at `annpat ∈ {inner, all}`, and the smallest
-is 291 bytes with no alias in it at all:
+`rep` in {`arm`, `f64lit`, `numlit`} only, concentrated at `annpat` in {`inner`, `all`}, and
+the smallest has no alias in it at all:
 
 ```
 type N = 1 | 2
@@ -90,68 +113,77 @@ function rd() {
   const lv1: {[string]: Circle} = Map()
   lv1["k0"] = { r: 1 }
   const c = [lv1]
-  …
+  ...
 }
 ```
 
-**48 of the 72 changed MESSAGE without changing class** — from a module-level
+**44 of the 66 changed MESSAGE without changing class** — from a module-level
 `type mismatch: expected (ref $type), found (ref $type)` at the global cell to a function-body
-`Invalid input WebAssembly code … expected (ref null $type), found (ref $type)`. Those 48 are
-exactly the `claim=1` and `claim=2` cells, and their new message is character-for-character
-their `claim=0` twin's: the alias stopped changing the failure, it did not stop the failure.
-Recorded because "same class, different message" is one of the four disguises a count-only
-reading misses.
+`Invalid input WebAssembly code ... expected (ref null $type), found (ref $type)`. Those 44
+are exactly the `claim=1` and `claim=2` cells, 22 each, and their new message is
+character-for-character their `claim=0` twin's: the alias stopped changing the failure, it
+did not stop the failure. Recorded because "same class, different message" is one of the four
+disguises a count-only reading misses.
 
-## The CENSUS itself, re-graded on both legs
+## The CENSUS itself, re-graded on both legs of the MERGED base
 
 The full 250,238-cell census (`scripts/silent-sweep/census/`) was regenerated and graded
-against `1e81b0f3` and against the branch. **It is the channel that sizes the family, and it
+against `e04b1567` and against the branch. **It is the channel that sizes the family, and it
 is not blind to it the way the corpus is.**
 
-| block | cells | silent, `1e81b0f3` | silent, branch | loud check | loud emit |
+| block | cells | silent, `e04b1567` | silent, branch | loud check | loud emit |
 |---|---|---|---|---|---|
-| A | 150,224 | 12,277 | **9,814** | 49,715 both | 27,513 both |
-| B | 28,590 | 3,023 | **2,564** | 9,621 both | 7,757 both |
-| C | 43,200 | 3,765 | **3,115** | 7,200 both | 8,562 both |
-| D | 9,000 | 155 | 155 | 832 both | 944 both |
-| E | 19,224 | 1,911 | **1,539** | 890 both | 7,706 both |
-| **all** | **250,238** | **21,131** | **17,187** | 68,258 both | 52,482 both |
+| A | 150,224 | 8,983 | **6,520** | 49,715 both | 27,225 both |
+| B | 28,590 | 2,115 | **1,604** | 9,621 both | 7,753 both |
+| C | 43,200 | 2,596 | **1,616** | 7,200 both | 8,562 both |
+| D | 9,000 | 67 | 67 | 832 both | 944 both |
+| E | 19,224 | 1,422 | **894** | 890 both | 7,706 both |
+| **all** | **250,238** | **15,183** | **10,701** | 68,258 both | 52,190 both |
 
-**3,944 cells move. Every one `check-clean invalid wasm` → `runs`. 0 backward, 0 lateral —
+**4,482 cells move. Every one `check-clean invalid wasm` -> `runs`. 0 backward, 0 lateral —
 both loud columns are identical to the cell in every block**, and `runs` rises by exactly
-3,944 (108,367 → 112,311).
+4,482 (114,607 -> 119,089). `runs but wrong value` and `trap_loads` are **0** on both legs,
+and `compiler trap` is 2 on both (D179, untouched) — which is the column to read if a fix in
+this area were to make a module validate and then TRAP, the failure mode #1968 hit with two
+`$fnsig`s over one `uVarHeap`. Nothing here does.
 
-Every moved coordinate is at `cont=list_of_map`, at `annpat=outer`, at `claim ∈ {1, 2}`, and
-they spread over every level of the other ten axes — 1,175 `store=local` to 493 `param`,
-1,606 `escope=fn` to 423 `mod`, `declness` 1,545 / 1,387 / 992, all five `twin` levels, all
-three `union` levels, all five `annpos`, six of seven `deliv`, all six `pval`, both `order`,
-and fifteen `rep`s.
+Over the 247,427 DISTINCT coordinates, **4,434 move, all `check-clean invalid wasm` ->
+`runs`, 0 backward**. Every one is at `cont=list_of_map`, at `annpat=outer`, at
+`claim` in {1, 2}, and they spread over every level of the other ten axes — `store` 1,381
+`local` down to 569 `param`, `escope` 2,010 `fn` down to 434 `mod`, `declness` 1,867 / 1,545 /
+1,022, all five `twin` levels, all three `union` levels, all five `annpos`, six of seven
+`deliv`, all six `pval`, both `order`, and fifteen `rep`s.
 
-### The families, re-derived on `1e81b0f3` rather than read from the published run
+### The families, RE-DERIVED on `e04b1567` rather than read from any published run
 
-`rescue.py`'s grouping was re-derived from this tree's own grading, so the family sizes are
-this commit's and not `1559d80c`'s (they are the same numbers, and that is a reading rather
-than an assumption):
+`rescue.py`'s grouping was re-derived from this tree's own grading of the merged base. **Do
+not quote a census family size; measure it** — every agent that re-derived one this week found
+it had moved (1,896 -> 1,518 -> 1,084 for `union`; 1,992 -> 2,032 -> 1,982 for `cont`).
 
-| family (rescuing axes) | cells | → runs | → loud | still silent |
+| family (rescuing axes) | cells on `e04b1567` | -> runs | -> loud | still silent |
 |---|---|---|---|---|
 | **`claim`** | **2,254** | **2,254** | 0 | **0** |
-| `cont` | 2,032 | 425 | 0 | 1,607 |
-| `union` | 1,518 | 0 | 0 | 1,518 |
-| `twin,union` | 1,436 | 0 | 0 | 1,436 |
-| **`claim,cont`** | **1,296** | **976** | 0 | **320** |
-| `cont,union` | 890 | 0 | 0 | 890 |
+| `cont` | 1,982 | 481 | 0 | 1,501 |
+| **`claim,cont`** | **1,430** | **1,430** | 0 | **0** |
+| `union` | 1,084 | 0 | 0 | 1,084 |
+| `twin,union` | 668 | 0 | 0 | 668 |
+| `cont,twin,union` | 476 | 0 | 0 | 476 |
 
-**The `claim` family closes entirely.** Of `claim,cont`, 976 close and **320 remain — and
-they are not this row's**: the structural spelling with `type Box1` deleted reproduces them
-identically on both compilers, class, message and byte offset. Filed as **D189**.
+**Both alias families close entirely.** The `claim` family is 2,254 on the merged base as it
+was on `1e81b0f3` — a re-derivation that came back the same, which is a reading and not an
+assumption. `claim,cont` GREW from 1,296 to 1,430 underneath this branch, because #1969
+rescued `cont` siblings and a family keyed on the SET of rescuing axes gains members when
+another axis starts rescuing; all 1,430 close here. The 320-cell residue this branch measured
+inside `claim,cont` on `1e81b0f3` — filed as D189, a second claimant over a union arm with a
+declared twin — is closed by #1969's `letMapDestShape`, and D189 is now the refutation pin for
+that pair.
 
 ### The message channel over the census
 
-**1,390 cells keep their class and change their message.** 1,388 are at `cont=list_of_map` —
+**842 coordinates keep their class and change their message.** 840 are at `cont=list_of_map` —
 cells where the union box was one of two problems and removing it exposed the other, the
-diagnostic moving from a module-level `type mismatch: expected (ref $type), found (ref
-$type)` at the global cell to a function-body `Invalid input WebAssembly code … expected
+diagnostic moving from a module-level `type mismatch: expected (ref $type), found (ref $type)`
+at the global cell to a function-body `Invalid input WebAssembly code ... expected
 (ref null $type), found (ref $type)`. **The other 2 are D179's compiler traps**, whose
 "message" is a wasm backtrace of the COMPILER — its function indices shift because the seed
 changed size, and both cells stay `compiler trap`. Recorded because a message diff that is an
@@ -166,9 +198,9 @@ anything at all. On this grid the two candidates ablate as:
 | candidate | moved |
 |---|---|
 | the refactor alone (`arrSpineLeafTy` + `arrSpineIsMap` defined, uncalled) | **0** |
-| the claim alone (`singleAliasMemberTyIx`) | 588 |
+| the claim alone (`singleAliasMemberTyIx`) | 592 |
 | the nominal-render leg alone (`transparentMemberEmitName`) | **0** |
-| both | 588 — **set-identical to the claim alone** |
+| both | 592 — **set-identical to the claim alone** |
 
 so this grid reports the leg as inert and it is not. The channel that sees it is the
 alias-vs-inline twin table (17 positions × 8 map value kinds × 4 alias bodies × {alias,

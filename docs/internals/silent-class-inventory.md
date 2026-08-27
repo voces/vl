@@ -106,8 +106,8 @@ and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the sa
 | D171 D172 D173 | check-clean invalid wasm | **NEW 2026-08-27** — filed out of D156's ablation, and D156's own prescribed ORDER ("close the kind-6 twin first, then land the peel") is **REFUTED** by it: the arm/twin conflation the twin question would remove is LOAD-BEARING for every chain the pin cannot complete, so removing it first moves cells BACKWARD. Three rungs, three compilers, each measured alone. D171 the CONTESTED half of the peel (a half-pinned chain is worse than an un-pinned one); D172 an mv slot minted AFTER `mAssignTypeIndices`, so `mvMapTypeIdx` stays 0 and the map's `struct.new` names heap type 0; D173 the ref-list ELEMENT key conflating a union ARM with its declared layout twin one container out |
 | D131 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **runs — CLOSED 2026-08-27** (below; TWO roots, and the ablation says so — 120 cells and 240 cells on one 1,732-cell confirmation grid, pairwise intersection **0**, union SET-IDENTICAL to the full branch's 360, and every one of the 360 moves to `runs`. **The axis the row's four controls did NOT separate is the RECEIVER's storage class**: a PARAM, a module GLOBAL and a CALL result as the receiver of the same field read all RUN on master, and only a LOCAL does not — `exprNullableStruct`'s Member arm already classifies a code-15 read as the `(ref null $S)` it is, but resolves the receiver through `structIndexOfExpr`, whose Ident arm reads `declaredStructIndex`, a table `buildLocals` fills long after the GLOBAL return pass. Root two is the row's own SECOND sentence and it is receiver-BLIND: the RETURN is a kind-9 use site and the only one that never grew the `ref.as_non_null` a field access, a call ARGUMENT, an annotated `let` initializer and a nested-struct field STORE all emit — its control has no field read at all (`function pick(p: Circle | null, d: Circle): Circle { if p != null { return p } return d }` is check-clean invalid wasm on master). The whole 24-cell D111/D117 residue closes, under root ONE alone. D52's 9,450 cells and D87's 3,144 move **0**; corpus 2,312 files, **2** differ and both are the fixtures this change adds) |
 
-| D181 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **runs — CLOSED 2026-08-27** (below; the census's LARGEST single rescue family — 2,254 silent coordinates whose only one-step rescue is `claim=0`, all at `cont=list_of_map` — and **the row's own title is refuted**: the claimant COUNT is not the ingredient, an ARRAY-OF-MAP ALIAS BODY is, and the alias must be USED at a binding nobody READS for the failure to be silent rather than loud. ONE root, PATTERN ONE (the complement was already written): `singleAliasMemberTyIx`'s `TyArray` arm had a leaf test for a `TyPrim` and one for a declared struct and none for a MAP, so `collectU` minted the alias a one-variant union ROW and `isUName` claimed every alias-annotated cell for the `{tag, anyref}` box while the initializer lowered a list wrapper. The heap probe says no key and no channel were needed — the cell took the union box and the value the i32-list catch-all, and NEITHER was the list-of-map wrapper, so there was no pair of legitimate heaps to keep apart. A new 1,200-cell grid crosses `claim` with `annpat`, the axis the census holds constant across the whole family (`scripts/silent-sweep/d181/`): **588 move, all `check-clean invalid wasm` → `runs`, 0 backward, both loud columns unchanged**, silent 660 → 72, and the alias axis becomes INERT — 0 of 800 `claim>0`-vs-`claim=0` twin pairs differ afterwards, in message as well as class, against 588 before. A second candidate (the nominal render for a declared-struct map value) moves **0 cells on that grid** and is load-bearing on the 1,088-cell alias-vs-inline twin table, where the claim alone is +446 / **−3** and the pair is +447 / **0**; it is filed as D187. **The whole 250,238-cell census re-graded on both legs: silent 21,131 → 17,187, all 3,944 moved cells `check-clean invalid wasm` → `runs`, 0 backward, both loud columns identical to the cell in every block — and all 2,254 cells of the `claim` family close.** The adjacent `claim,cont` family goes 1,296 → 320 and its survivors are D189, which has no alias in it) |
-| D187 D188 D189 | — | **NEW 2026-08-27** — filed out of D181's ablation and its census re-grade. **D187** a REFUTATION PIN: the array-of-map alias must render NOMINALLY, and the candidate it refuses (claim the map leaf, leave the renderer alone) was BUILT — it moves 0 cells on the 1,200-cell grid and turns 3 twin-table cells from `runs` into a loud emit reject. **D188** the FOURTH array-spine leaf kind, an inline object shape, LOUD in all four positions where the direct spelling runs and at parity between master and the branch — with no silent form at all, because the assignability check refuses the empty literal before any emitter sees it. **D189** the `claim` axis firing FOR REAL: a second binding of the same list-of-map layout where the map's value is a union arm with a declared twin, no alias anywhere, ten controls all identical on both compilers |
+| D181 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **runs — CLOSED 2026-08-27** (below; the census's LARGEST single rescue family — 2,254 silent coordinates whose only one-step rescue is `claim=0`, all at `cont=list_of_map` — and **the row's own title is refuted**: the claimant COUNT is not the ingredient, an ARRAY-OF-MAP ALIAS BODY is, and the alias must be USED at a binding nobody READS for the failure to be silent rather than loud. ONE root, PATTERN ONE (the complement was already written): `singleAliasMemberTyIx`'s `TyArray` arm had a leaf test for a `TyPrim` and one for a declared struct and none for a MAP, so `collectU` minted the alias a one-variant union ROW and `isUName` claimed every alias-annotated cell for the `{tag, anyref}` box while the initializer lowered a list wrapper. The heap probe says no key and no channel were needed — the cell took the union box and the value the i32-list catch-all, and NEITHER was the list-of-map wrapper, so there was no pair of legitimate heaps to keep apart. A new 1,200-cell grid crosses `claim` with `annpat`, the axis the census holds constant across the whole family (`scripts/silent-sweep/d181/`): **592 move, all `check-clean invalid wasm` → `runs`, 0 backward, both loud columns unchanged**, silent 658 → 66, and the alias axis becomes INERT — 0 of 800 `claim>0`-vs-`claim=0` twin pairs differ afterwards, in message as well as class, against 592 before. A second candidate (the nominal render for a declared-struct map value) moves **0 cells on that grid** and is load-bearing on the 1,088-cell alias-vs-inline twin table, where the claim alone is +446 / **−3** and the pair is +447 / **0**; it is filed as D187. **The whole 250,238-cell census re-graded on both legs of merged master `e04b1567`: silent 15,183 → 10,701, all 4,482 moved cells `check-clean invalid wasm` → `runs`, 0 backward, both loud columns identical to the cell in every block — and all 2,254 cells of the `claim` family close, as do all 1,430 of `claim,cont`.**) |
+| D187 D188 D189 | — | **NEW 2026-08-27** — filed out of D181's ablation and its census re-grade. **D187** a REFUTATION PIN: the array-of-map alias must render NOMINALLY, and the candidate it refuses (claim the map leaf, leave the renderer alone) was BUILT — it moves 0 cells on the 1,200-cell grid, and dropping it turns 3 twin-table cells from `runs` into a loud emit reject. **D188** the FOURTH array-spine leaf kind, an inline object shape, LOUD in all four positions where the direct spelling runs and at parity between master and the branch — with no silent form at all, because the assignability check refuses the empty literal before any emitter sees it. **D189** the `claim` axis firing FOR REAL — a second binding of the same list-of-map layout over a union arm with a declared twin, no alias anywhere — filed live off the `1e81b0f3` measurement and CLOSED BY #1969 before this branch could merge, so it ships as the REFUTATION PIN both fixes must hold |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -8187,7 +8187,7 @@ claimant COUNT is not the ingredient and the second declaration decides nothing.
 ingredient is the ALIAS BODY — an ARRAY whose leaf element is a MAP — and this six-program
 control table separates the two readings:
 
-| program | on `1e81b0f3` |
+| program | on merged master `e04b1567` |
 |---|---|
 | `type Box1 = {[string]: i32}[]` declared and NEVER annotated onto anything | **runs** |
 | …annotated onto a binding that is then READ (`const c: Box1 = [m]; print(c.length)`) | **LOUD check reject** — `field 'length' is not on every member of Box1` |
@@ -8216,7 +8216,7 @@ wrapper. Both halves of the mismatch sit in one line of the witness's `wasm-dis`
 declared heap type and its INITIALIZER's, printed side by side (`$1` is the union box,
 `$6` the i32-list wrapper, `$10` the list-of-map wrapper):
 
-* on `1e81b0f3`: `(global $global$2 (mut (ref $1)) (struct.new $6 …))`
+* on `e04b1567`: `(global $global$2 (mut (ref $1)) (struct.new $6 …))`
 * on the branch: `(global $global$2 (mut (ref $10)) (struct.new $10 …))`
 
 `$10` is the SAME heap type the program's own `{[string]: i32}[]` globals carry, so after the
@@ -8256,13 +8256,17 @@ the same nominal-render leg `arrSpineIsNominal` already takes in
   different rep for the same cell.
 * Census population: **2,254 cells whose ONLY one-step rescue is `claim=0`**, all at
   `cont=list_of_map` — the largest single rescue-set family in the census.
-* **RE-GRADED ON BOTH LEGS, ALL 250,238 CELLS.** The family was re-derived from this tree's
-  own grading rather than read from the published run (same 2,254, same witness), and
-  **every one of the 2,254 now RUNS**. Census-wide: silent **21,131 → 17,187**, all 3,944
-  moved cells `check-clean invalid wasm` → `runs`, **0 backward and 0 lateral — both loud
-  columns identical to the cell in all five blocks**. The adjacent `claim,cont` family goes
-  1,296 → 320, and its 320 survivors are **D189**, which the structural spelling reproduces
-  with no alias in the program at all. Numbers and the per-axis spread:
+* **RE-GRADED ON BOTH LEGS OF MERGED MASTER `e04b1567`, ALL 250,238 CELLS.** The family was
+  re-derived from this tree's own grading of the merged base rather than read from any
+  published run — same 2,254, same witness — and **every one of the 2,254 now RUNS**.
+  Census-wide: silent **15,183 → 10,701**, all **4,482** moved cells `check-clean invalid
+  wasm` → `runs`, **0 backward and 0 lateral — both loud columns identical to the cell in all
+  five blocks**, and `runs but wrong value` / `trap_loads` are 0 on both legs. The adjacent
+  `claim,cont` family is **1,430** on the merged base (it GREW from 1,296 because #1969
+  rescued `cont` siblings and this family's key is the SET of rescuing axes) and **all 1,430
+  close too**. The 320-cell residue measured inside it on `1e81b0f3` was filed as D189 and is
+  closed by #1969's `letMapDestShape`; D189 is now the refutation pin for that pair. Numbers,
+  the per-axis spread and the per-coordinate interaction with the two landings:
   `scripts/silent-sweep/d181/README.md`.
 
 ---
@@ -8494,7 +8498,7 @@ Repro:
     print(which(mk()))
     // PRINTS 3
 
-* **THREE COMPILERS, ONE PROGRAM.** On `1e81b0f3` it is **check-clean invalid wasm** (the
+* **THREE COMPILERS, ONE PROGRAM.** On merged master `e04b1567` it is **check-clean invalid wasm** (the
   alias is opaque, so `LC` is a union row and the `LC | i32` parameter takes the box).
   With the claim alone it becomes a **LOUD EMIT REJECT** — `emitProgram: array value does not
   match any array member of the union (leaf-scalar widening across a nested array is
@@ -8520,7 +8524,7 @@ Repro:
 ---
 
 ### D188 — an array alias whose LEAF is an INLINE OBJECT SHAPE is loud in every position where the direct spelling runs
-**loud check reject · filed 2026-08-27 out of D181's leaf census · the FOURTH array-spine leaf kind, unmoved by D181's fix and at parity between `1e81b0f3` and the branch**
+**loud check reject · filed 2026-08-27 out of D181's leaf census · the FOURTH array-spine leaf kind, unmoved by D181's fix and at parity between merged master `e04b1567` and the branch**
 
 Repro:
 
@@ -8534,10 +8538,10 @@ Repro:
   prints `7`. The alias spelling is a dialect of its own here, which is the exact condition
   D-ALIASARR, D-ALIASARRNOM and D-ALIASARRMAP each removed for one other leaf kind.
 * **THE LEAF LADDER, MEASURED RATHER THAN READ OFF THE SOURCE.** Thirteen leaf kinds, each
-  spelled once through a `type L = <leaf>[]` alias and once inline, on `1e81b0f3` and on the
+  spelled once through a `type L = <leaf>[]` alias and once inline, on `e04b1567` and on the
   branch:
 
-  | array-spine leaf | `1e81b0f3` alias | branch alias | inline control |
+  | array-spine leaf | `e04b1567` alias | branch alias | inline control |
   |---|---|---|---|
   | `i32`, `string` | runs | runs | runs |
   | declared struct (`Cat`) | runs | runs | runs |
@@ -8566,8 +8570,8 @@ Repro:
 
 ---
 
-### D189 — a SECOND binding of the same list-of-map layout, where the map's value is a union ARM with a declared twin
-**check-clean invalid wasm · filed 2026-08-27 out of D181's census re-grade · PRE-EXISTING and UNMOVED — every cell of the control table below is identical on `1e81b0f3` and on D181's branch · this is the `claim` axis firing for real, at the coordinate D181's alias was only the census's SPELLING of**
+### D189 — a SECOND binding of the same list-of-map layout, over a union ARM with a declared twin
+**runs today and must keep running (REFUTATION PIN) · filed 2026-08-27 as a LIVE `check-clean invalid wasm` row out of D181's census re-grade on `1e81b0f3`, and CLOSED BY #1969 before that branch could merge — it is kept as the control both fixes must hold, because it is the coordinate where the `claim` axis really does fire and the one this programme kept mis-attributing**
 
 Repro:
 
@@ -8581,20 +8585,18 @@ Repro:
     const c: {[string]: Circle}[] = [lv1]
     const g1 = (c[0])["k0"] ?? { r: 0 }
     if g1.r == 7 { print(7) } else { print(0) }
-    // vl check rc 0 with NO diagnostics; vl run:
-    //   Invalid input WebAssembly code: type mismatch:
-    //     expected (ref null $type), found (ref $type)
+    // PRINTS 7
 
-* **NO ALIAS ANYWHERE, AND THAT IS THE FINDING.** The census reaches this coordinate through
-  its `claim` axis, which spells the second claimant as `type Box1 = {[string]: Circle}[]`
-  plus `const _sp1: Box1 = []` — so on `1e81b0f3` it was entangled with D181 and moved with
-  it. Re-graded on D181's branch, 320 of the 1,296-cell `claim,cont` family stay silent, and
-  the STRUCTURAL spelling above reproduces them with `type Box1` deleted: **identical class,
-  identical message, identical byte offset (1189)**. D181 was the alias; this is the
-  claimant.
-* **TEN CONTROLS, EVERY ONE IDENTICAL ON BOTH COMPILERS:**
+* **NO ALIAS ANYWHERE, AND THAT WAS THE FINDING.** The census reaches this coordinate through
+  its `claim` axis, which spells the second claimant as `type Box1 = {[string]: Circle}[]` plus
+  `const _sp1: Box1 = []` — so on `1e81b0f3` it was entangled with D181 and the two had to be
+  separated by hand. Deleting `type Box1` leaves the STRUCTURAL spelling above, and on
+  `1e81b0f3` that reproduced the same class, the same message and the same byte offset (1189):
+  D181 was the alias, this was the claimant.
+* **TEN CONTROLS, ALL MEASURED ON `1e81b0f3` AND ALL IDENTICAL ON D181's BRANCH THERE** — which
+  is what said the two rows were different roots:
 
-  | change | outcome |
+  | change | outcome on `1e81b0f3` |
   |---|---|
   | (none — the repro as filed) | **check-clean invalid wasm** |
   | delete `const _sp1` (the second claimant) | RUNS |
@@ -8607,18 +8609,21 @@ Repro:
   | annotate `const lv1: {[string]: Circle}` | RUNS |
   | drop the LIST layer — a bare `{[string]: Circle}` spare beside a bare map | RUNS |
 
-* **IT IS D185'S INGREDIENT SET ONE CONTAINER OVER, PLUS A CLAIMANT.** D185 is `structfield`
-  over a map of a union arm and needs no second binding; this is `list_of_map` and needs one.
-  The twin control is D185's exactly — *deleting `type Dot` makes the program LOUD, not
-  correct*, with the same `unsupported map value type` message — so whatever closes that
-  refusal must be graded against this row too. **The EMPTINESS of the spare is not the
-  ingredient** (a non-empty one is identical), which is what separates this from D181: there
-  the empty `[]` mattered because the union box had to be filled with something, here the
-  second binding matters whatever it holds.
-* Census population: **320 cells of the 1,296-cell `claim,cont` family** on the branch, all
-  at `cont=list_of_map`, `declness=byname`, `annpos=binding`, `annpat=outer`, `twin ∈
-  {exact, late}`, `union ∈ {unused, used}`, `claim ∈ {1, 2}` — 160 at each claimant count,
-  which is the axis reading as a count for the first time in this family.
+* **THE LAST-BUT-ONE CONTROL IS WHY #1969 OWNS IT.** `lv1` is an un-annotated `Map()`, and
+  annotating it rescued the program on `1e81b0f3` — which is `letMapDestShape`'s whole subject.
+  D203's fix gives that binding the DECLARED destination it is stored into, and this coordinate
+  falls out with it: on `e04b1567` the repro prints `7`. The twin and the union are not the
+  root; the un-annotated intermediate map is, exactly as D203 measured for five other
+  containers.
+* **AND THE `claim,cont` FAMILY IS NOW EMPTY.** Re-derived on `e04b1567`, that family is 1,430
+  coordinates (it was 1,296 on `1e81b0f3` — #1969 rescued `cont` siblings, which moves cells
+  INTO a family whose key is the SET of rescuing axes), and D181's fix closes **all 1,430**.
+  There is no residue left to file, which is why this row is a pin rather than a defect.
+* **IT IS KEPT BECAUSE IT PINS TWO FIXES AT ONCE.** Restoring D203's blindness reddens it, and
+  so does any future change that re-introduces a second claimant's slot into the list-of-map
+  layout. The row that was going to be filed as this programme's fourth "the claimant count is
+  the ingredient" story is the one place where a second claimant genuinely mattered — and even
+  there the root was one container in.
 
 ---
 
