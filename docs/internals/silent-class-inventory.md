@@ -4330,6 +4330,29 @@ cross-generic leak goes. **The grid missed it because every cell had ONE generic
 the same axis-holding mistake #1946 records for the callee's delivery, one level up: enumerate
 the SIBLINGS as well as the deliveries.
 
+
+**THE GRID'S CALLEE-DELIVERY AXIS HAS FOUR VALUES AND ONLY THREE OF THEM MEASURE ANYTHING, and
+saying so is the point of listing it.** #1946 records that holding the CALLEE's delivery constant
+cost it a round, so this grid varied it — `f(x)` by name, `const f = g  f(x)`, a HOF's closure
+PARAMETER, and a struct FIELD. Measured on both compilers:
+
+| callee delivery | what the 105 cells at that value do |
+|---|---|
+| direct `a op b` | live — 45 runs / 54 loud check / 4 invalid wasm / 2 loud emit |
+| `f(x)` by name | live — 45 / 54 / 2 / 4 |
+| `const f = g  f(x)` | live — 43 / 54 / 2 / 6, and this is the delivery #1946's own regression rode |
+| struct FIELD | live at CHECK (54 loud check, 4 of this change's 61 moves), refused at EMIT for the other 51 |
+| HOF closure PARAMETER | **refused at EMIT in all 105, on master and on the branch alike** |
+
+The last two hit floors that have nothing to do with this change and are identical on `c0873a06`:
+`emitProgram: function-value call arity has no interned signature` for the field, and
+`emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are
+supported` for the HOF parameter — **a generic function VALUE cannot be a closure argument at
+all today**, filed as **D58**. So the honest reading is that this change is measured across
+THREE live callee deliveries plus the check-stage half of a fourth, not four; an axis whose value
+is loud at every cell on both compilers is a column of nothing, and reporting it as coverage is
+the shape D43 was filed to stop.
+
 Fixture: `tests/cases/generics/error-list-concat-no-core.vl` (four element reps at both
 spellings, plus the literal-union pair that separates the two roots).
 
@@ -4674,11 +4697,15 @@ Repro:
   identical program prints `true`. `Shape` is declared and never mentioned again — no value of
   it is built, no function takes one, nothing is narrowed — so the trigger is the DECLARATION,
   not any use.
-* **THREE SPELLINGS, ONE TRIGGER, measured one file each.** All three are `vl check` rc 0 and
-  invalid wasm with the union declared, and all three run with the line deleted:
-  a direct `Circle == Circle`; a `Shape == Shape` over two `Circle` values; and
-  `xs.indexOf(nd)` over a `Circle[]` with a `Circle` needle (which fails inside `indexOf$m1`,
-  so it is the same site reached through the pin rather than a second defect).
+* **THREE SPELLINGS, ONE TRIGGER, measured one file each — and only TWO of them can carry the
+  one-line control, which is worth saying rather than rounding up.** All three are `vl check`
+  rc 0 and invalid wasm with the union declared: a direct `Circle == Circle`; `xs.indexOf(nd)`
+  over a `Circle[]` with a `Circle` needle (which fails inside `indexOf$m1`, so it is the same
+  site reached through the pin rather than a second defect); and a `Shape == Shape` over two
+  `Circle` values. The FIRST TWO run with the `type Shape` line deleted. **The third cannot
+  have that control by construction** — delete the union and the program has no `Shape` to
+  annotate — so it is listed as a third silent spelling of the same site, not as a third cell
+  of the ablation.
 * **THE INITIALIZER FORM IS NOT AN AXIS**, which is what says the compare and not the operand is
   the site: an object LITERAL (`const a: Circle = { r: 1 }`) and a CALL RESULT
   (`const a: Circle = mkcirc()`) both reproduce, and both run with the union deleted.
@@ -4691,6 +4718,40 @@ Repro:
 * **20 CELLS of the D42/D44/D46 grid, and they are that grid's whole remaining silent column.**
   Every one has `Circle` or `Shape` on at least one side of a `==`/`!=` and a `Shape` in the
   prelude; the grid's OTHER 721 cells are unaffected by the union's presence.
+
+---
+
+### D58 — a GENERIC function passed as a closure ARGUMENT is a loud emit reject at every instantiation
+**loud emit reject · found 2026-08-26 by the D42/D44/D46 grid's callee-delivery axis (105 of its 741 cells, every one of them) · pre-existing and IDENTICAL on `c0873a06` and on that branch · NOT silent, filed for the same reason D43 is: it is why a whole axis value of that grid could not be graded on its own question**
+
+Repro:
+
+    function opT<T>(a: T, b: T): boolean { a == b }
+    function hof<U, R>(g: (U, U) => R, a: U, b: U): R { g(a, b) }
+
+    function cell(): boolean {
+      const a: i32 = 1
+      const b: i32 = 2
+      return hof(opT, a, b)
+    }
+
+    print(cell())
+    // vl check rc 0; vl run:
+    //   emitProgram: only i32, i64, f64, f32, boolean, struct, union, array, or string
+    //   parameters are supported
+
+* **THE PIN IS FINE AND THE VALUE IS NOT.** `opT` at `T = i32` is the most ordinary
+  instantiation in the language; called by NAME (`opT(a, b)`) the identical program prints
+  `false`. The refusal is about handing the generic over as a function VALUE to a parameter.
+* **IT IS LOUD AT EVERY CELL OF ITS AXIS**, which is the whole reason to file it: all 105 cells
+  of the D42/D44/D46 grid's HOF-parameter column answer this, at every `T` in the rep vocabulary
+  and every operator, so that column measures the delivery and never reaches the comparison it
+  was written for. The struct-FIELD column has the same shape at emit
+  (`emitProgram: function-value call arity has no interned signature`) but its CHECK half is
+  live, so it is graded and this one is not.
+* Not a member of this file's silent classes — it is a clean emit reject with a message naming
+  the unsupported position. Filed so the next grid over the callee-delivery axis does not spend
+  a fifth of its cells discovering it again.
 
 ---
 
