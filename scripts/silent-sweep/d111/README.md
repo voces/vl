@@ -46,11 +46,17 @@ the per-candidate moved set split BY DIRECTION, every pairwise intersection, whe
 of the singles is set-identical to the full branch's, and cells whose OUTCOME is unchanged and
 whose MESSAGE is not.
 
-Measured against master `7b600b57`:
+Measured against master **`e67347aa`** (fixpoint 1451054 bytes). Every compiler in this
+table was REBUILT on that base rather than carried over from the `7b600b57` run this
+grid was first taken on — #1960 landed in between and moved 882 cells across two other
+grids. **Stripping all three patches out of the merged tree reproduces `e67347aa`
+byte-for-byte**, which is what says the three are the whole compiler delta and that the
+`base` column below is master and not an approximation of it. Every number is unchanged
+from the pre-merge run, cell for cell.
 
 | compiler | what it adds | runs | loud emit | invalid wasm | moved | to `runs` | to SILENT |
 |---|---|---|---|---|---|---|---|
-| `base` | master `7b600b57`                              | 1085 | 88 | 24 | — | — | — |
+| `base` | master `e67347aa`                              | 1085 | 88 | 24 | — | — | — |
 | `A1`   | `monoAnnPinName`'s bare inline-shape rung       | 1093 | 80 | 24 |  8 |  8 | 0 |
 | `A2`   | `letAnnIsUninternedShape`'s D53 bridge          | 1101 | 64 | 32 | 24 | 16 | **8** |
 | `B`    | `recordElemRepArrayLit`'s array-element descent | 1125 | 48 | 24 | 40 | 40 | 0 |
@@ -69,26 +75,40 @@ checker's refusals are untouched.
 
 ## The residue, filed rather than left
 
-- **24 `invalid_wasm`, all `d111_*_ann1_field_*`** and unmoved by any candidate: a
-  nested-struct FIELD read RETURNED from an un-annotated function. Filed as **D131**. It is
-  not the inline shape (a nominally-typed field reproduces it) and not the twin (it fires at
-  `decl=nodecl`).
-- **16 `loud_emit_reject`, all `ann2 × std`**: `emitProgram: a nullable-{r:i32} list element
-  has no rep; use a non-null element type` — a documented emitter decline reached by this
-  grid's own `std` harness line (`const xs: ({r:i32} | null)[]`), not by the row under test.
-- **108 of the `loud_check_reject`s** are `'mk' infers the nullable return type
-  {r: i32} | null` — the checker's own documented decline for an inferred nullable
-  inline-shape return, and the reason `ann2 × ret` never reaches the emitter.
+Each item says which KIND of thing it is, because a documented DECLINE and an unfiled
+DEFECT read identically in a residue paragraph and one of them is a row somebody owes.
+
+- **A ROW — 24 `invalid_wasm`, all `d111_*_ann1_field_*`**, unmoved by every one of the
+  five candidates and by the #1960 merge (the same 24 cells by name before and after):
+  a nested-struct FIELD read RETURNED from an un-annotated function. Filed as **D131**.
+  It is not the inline shape (a nominally-typed field reproduces it) and not the twin
+  (it fires at `decl=nodecl`).
+- **A DOCUMENTED DECLINE — 16 `loud_emit_reject`, all `ann2 × std`**: `emitProgram: a
+  nullable-{r:i32} list element has no rep; use a non-null element type`, reached by this
+  grid's own `std` harness line (`const xs: ({r:i32} | null)[]`) rather than by the row
+  under test. `collectA`'s kind-2 arm rejects it on purpose — *"has no list rep: the box
+  lowering would emit the element's raw value (invalid wasm). Reject cleanly"* — and the
+  message carries the remedy.
+- **DOCUMENTED DECLINES / GRID CONTROLS — all 513 `loud_check_reject`s**: 189 are
+  `cannot compare X with null` on the `bare` rows, which is the grid asserting that the
+  checker still refuses a `null` in a non-nullable list; 108 are `'mk' infers the nullable
+  return type {r: i32} | null`, the checker's documented decline for an inferred nullable
+  inline-shape return and the reason `ann2 × ret` never reaches the emitter; the rest are
+  the `bare` field/return assignability refusals. The set is **513 on all six compilers,
+  cell for cell**.
 
 ## Re-graded populations
 
 A backward count is a property of the GRID that produced it, so the two larger populations in
 this family were re-run against the same pair of seeds rather than carried over:
 
-| grid | master `7b600b57` | branch | moved | backward | message-only |
+| grid | master `e67347aa` | branch | moved | backward | message-only |
 |---|---|---|---|---|---|
 | D52, 9,450 cells  | 7424 runs / 2026 loud / **0 silent** | 7620 / 1830 / **0** | **196** | 0 | 0 |
 | D87, 3,144 cells  | 3126 runs / 18 loud / **0 silent**   | 3126 / 18 / **0**   | **0**   | 0 | 0 |
+
+Both were re-run against the merged pair of seeds, not carried over; both are identical
+to the `7b600b57` run.
 
 D52's silent population has been empty since #1957 and stays empty; 196 more of its loud cells
 close. D87's grid moves nothing at all, which is what says the change is inert where it is not
