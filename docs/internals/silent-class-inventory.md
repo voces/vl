@@ -99,7 +99,7 @@ and a MESSAGE diff is what exposes it: D47 alone leaves those 34 cells in the sa
 | D31 | check-clean invalid wasm | **runs — CLOSED 2026-08-26** (below; filed while closing D25, whose fix routes a corpus control onto it. A call ARGUMENT inherited the enclosing RETURN's nullable expectation — `expCtxHere()` snapshots the ambient seeds and the four nullable ones were never cleared. NO generics anywhere) |
 | D52 D66 | check-clean invalid wasm / loud emit reject | **runs — CLOSED 2026-08-26** (below; D52 is D39's seam read from the other end and it needed NO channel — the annotation is on the LOCAL, `criRetLocalLet` already hands the result-valtype pass that binding, and `letAnnVariantIdx` was written, exported and documented correct with no caller on this path. What was missing is the ROUTE: `fRetKind` had no inferred `"variant"` tier and `emitOneFuncType`'s inferred `infSlot` ladder had no `variant` arm — the three items D51's row predicted in writing. A FOURTH edit was needed and the disassembly is what found it: with only the functype corrected, `mk` validated and the CALLER did not (`struct.get 0 0` over a `(ref 1)` receiver), so the engine's message moved function and changed one word. 180 of a 9,450-cell grid moved, 0 backward — 84 silent → runs and 96 loud → runs; silent 200 → 116. Corpus: 1,850 of 1,851 co-emitted files byte-identical, the one difference being D52's own pin. D66 rides the same rung and its filed asymmetry — "annotate the CALLBACK'S RETURN; annotating the local does not" — is retired) |
 | D111 D117 | loud emit reject | **runs — CLOSED 2026-08-27** (below; TWO roots and THREE edits, and the ablation says so — one compiler per candidate over one 1,710-cell grid, all three pairwise intersections **0**. Both roots are a complement already written and never called at the sibling rung. D111 needs TWO of the edits and the ORDER is measured: `letAnnIsUninternedShape`'s D53 bridge ALONE moves 16 cells to `runs` and **8 BACKWARD to check-clean invalid wasm**, because the lifted guard makes the binding a struct local whose row disagrees with the pin `monoAnnPinName` mints — that ladder had a `{…}[]` ELEMENT rung and no BARE inline-shape rung, so the argument fell to the `"i32"` catch-all. Disassembled: with the guard alone the instance is `(func (param i32) (result i32))` and `mk` `return_call`s into it from a `(result (ref 0))` frame. The pin rung alone moves 8 (`ann2` x `global` x `gen`, a MODULE-SCOPE binding where the `LetDecl`-local guard never fires). **The union of the three singles' moved sets IS set-identical to the full branch's (8 + 24 + 40 = 72) — the composition is a DIRECTION, not a cell count**, and that is the thing a union check does not say on its own: the full branch disagrees with the guard-alone compiler on exactly the 8 cells that compiler sends to `invalid_wasm`, every one of them `ann1` x `local` x `gen`. D117: `recordElemRepArrayLit` sits ABOVE `assignableExpr`'s `assignable` short-circuit precisely because a niche-element literal is covariantly assignable, and it already descends into an ObjLit's FIELD values — the ARRAY destination never grew the matching ELEMENT-wise descent, so an inner `[null]` kept its self-inferred `null[]` and every niche seed in the null-rep table stayed empty. 40 cells, and it is the three NICHES only: `(i32 | null)[][]` and `(S | null)[][]` already ran. **72 of 1,710 cells moved, all `loud emit reject` → `runs`, 0 backward, 0 same-class MESSAGE moves, 0 `runs`→`runs` value moves.** The 9,450-cell D52 grid moves **196 more cells to `runs`, 0 backward**, and keeps its silent population at 0; the 3,144-cell D75/D81/D82 grid moves **0** cells and 0 messages, so the change is inert where it is not the answer. **Every number here is the RE-MEASUREMENT on merged master `e67347aa`** — all five ablation compilers rebuilt on that base, not carried over from `7b600b57`; #1960 moves none of these 1,710 cells, and stripping all three patches out of the merged tree reproduces `e67347aa` BYTE-IDENTICALLY, which is what says the three are the whole compiler delta) |
-| D131 | check-clean invalid wasm | **NEW 2026-08-27** — the whole residue of the D111/D117 grid, 24 of 1,710 cells and unmoved by that change. A nested-struct FIELD read RETURNED from an UN-ANNOTATED function: the callee's functype says `i32` and the body pushes the field's `(ref null $S)`. It is NOT about the inline shape — a NOMINALLY-typed field reproduces it — and not about the twin: it fires at `decl=nodecl` too. `return o.h` and `const c = o.h; return c` are both loud; `return o.h.r` and the same read at MODULE scope both run |
+| D131 | ~~check-clean invalid wasm~~ **CLOSED 2026-08-27** | **runs — CLOSED 2026-08-27** (below; TWO roots, and the ablation says so — 120 cells and 240 cells on one 1,732-cell confirmation grid, pairwise intersection **0**, union SET-IDENTICAL to the full branch's 360, and every one of the 360 moves to `runs`. **The axis the row's four controls did NOT separate is the RECEIVER's storage class**: a PARAM, a module GLOBAL and a CALL result as the receiver of the same field read all RUN on master, and only a LOCAL does not — `exprNullableStruct`'s Member arm already classifies a code-15 read as the `(ref null $S)` it is, but resolves the receiver through `structIndexOfExpr`, whose Ident arm reads `declaredStructIndex`, a table `buildLocals` fills long after the GLOBAL return pass. Root two is the row's own SECOND sentence and it is receiver-BLIND: the RETURN is a kind-9 use site and the only one that never grew the `ref.as_non_null` a field access, a call ARGUMENT, an annotated `let` initializer and a nested-struct field STORE all emit — its control has no field read at all (`function pick(p: Circle | null, d: Circle): Circle { if p != null { return p } return d }` is check-clean invalid wasm on master). The whole 24-cell D111/D117 residue closes, under root ONE alone. D52's 9,450 cells and D87's 3,144 move **0**; corpus 2,312 files, **2** differ and both are the fixtures this change adds) |
 
 **THE LARGEST REMAINING FAMILY WAS NOT IN THIS DOCUMENT — AND IT IS NOW CLOSED. SILENT
 TOTAL 23 → 6.** 17 of the 23 were one unfiled shape, and the note that filed it named it
@@ -7561,8 +7561,8 @@ sharper classifier found no other row hiding behind the conflation** — D22, D2
   five items in §4d — the `optchain` construct's 0-of-132 and the closure-alias 54 both
   tripped it.
 
-### D131 — a nested-struct FIELD read RETURNED from an UN-ANNOTATED function
-**check-clean invalid wasm · found 2026-08-27 as the ENTIRE `invalid_wasm` residue of the D111/D117 grid — 24 of 1,710 cells, unmoved by every one of that change's five ablation compilers · pre-existing and byte-identical on master `7b600b57`, on master `e67347aa` after #1960, and on the D111/D117 branch before and after that merge — the SAME 24 cells by name and the same sentence at each**
+### D131 — [CLOSED 2026-08-27] a nested-struct FIELD read RETURNED from an UN-ANNOTATED function
+**CLOSED 2026-08-27 — the repro now RUNS (prints `7`). Was: check-clean invalid wasm · found 2026-08-27 as the ENTIRE `invalid_wasm` residue of the D111/D117 grid — 24 of 1,710 cells, unmoved by every one of that change's five ablation compilers · pre-existing and byte-identical on master `7b600b57`, on master `e67347aa` after #1960, and on the D111/D117 branch before and after that merge — the SAME 24 cells by name and the same sentence at each · CLOSED by TWO edits whose moved sets are DISJOINT, and neither is a variation of the other**
 
 Repro:
 
@@ -7619,6 +7619,88 @@ Repro:
   `variant` arm, and a code-15 nested-struct field read is the shape neither added. The field
   row already resolves (`sFieldTgtStructIdx` is the chokepoint and it answers), so this is a
   ROUTE question rather than a resolution one, exactly as D52's was.
+
+**CLOSED 2026-08-27 — TWO ROOTS, AND THE AXIS THE FOUR CONTROLS DID NOT SEPARATE IS THE
+RECEIVER'S STORAGE CLASS.** The row's neighbourhood note above was right that this is D51/D52's
+family at a FIELD source and right that it is a ROUTE question, and it named the wrong route:
+`fRetKind` needed no new tier and `infSlot` no new arm — `"nulstruct"` and its slot were both
+already there. What was missing is that nothing could RESOLVE the read.
+
+* **ROOT ONE — the inferred result KIND, and the receiver is the axis.** `exprNullableStruct`'s
+  Member arm already classifies a code-15 field read as the `(ref null $S)` it physically is,
+  and it ANSWERS for every other receiver storage class: `function mk(o: Holder) { return o.h }`
+  (a PARAM), the same read off a module GLOBAL, and the same read off a CALL result all RUN on
+  master. It cannot answer for a LOCAL receiver, because it resolves that receiver through
+  `structIndexOfExpr`, whose Ident arm reads `declaredStructIndex` — the per-function table
+  `buildLocals` fills long AFTER the GLOBAL return pass this classification runs in. That is the
+  same blindness `criRetLocalLet` and `retIsMapLocal` were written for, at the one expression
+  shape neither covers. The new rung resolves the chain with the receiver's own `let`
+  declaration (`retLocalLetOfBlock` + `structIndexOfLet`) and descends by `structIndexOfExpr`'s
+  OWN Member rule, so `o.h.g` resolves by the rule `o.h` does.
+* **`"nulstruct"` AND NOT `"struct"`, and the local hop is why the ORDER matters.** The lowering
+  codes fold `inner: S` and `inner: S | null` onto ONE code-15 hop, so the slot is
+  `(ref null $S)` either way and the three receiver shapes that already worked all classify
+  `nulstruct`. The rung also has to run AHEAD of the returned-local block: for
+  `const c = o.h  return c` that block asks `letIsStruct`, which answers TRUE through
+  `exprStruct`'s fall-through to `exprNullableStruct`, so the RESULT was minted `(ref $S)` while
+  `collectLocals` — asking the SAME predicate of the same initializer — built the cell
+  `(ref null $S)`. Two classifiers, one binding, opposite nullability.
+* **ROOT TWO — the RETURN BOUNDARY's missing recover, and it is RECEIVER-BLIND.** This is the
+  row's own second sentence, and measuring it refuted the reading that it is the same defect
+  under an annotation. A kind-9 read deliberately stays the raw `(ref null $S)` and the USE site
+  recovers — `emitCapturedReadRecover`'s header states the rule in as many words — and a field
+  access, a call ARGUMENT, an annotated `let` initializer and a nested-struct field STORE all do
+  and all run on master. The RETURN into a non-null struct result never grew it. Its own control
+  contains **no field read at all**: `function pick(p: Circle | null, d: Circle): Circle
+  { if p != null { return p } return d }` is `vl check` rc 0 and `expected (ref $type), found
+  (ref null $type)` on master, and it fires at a PARAM receiver where root one never does.
+* **DISASSEMBLED RATHER THAN INFERRED, both of them.** Root one: on master `mk` is
+  `(func (param i32) (result i32))` over a body ending `struct.get 1 0` / `return`, with
+  `Holder` = `(struct (field (mut (ref null 0))))`; on the branch the functype is
+  `(result (ref null 0))`, the BODY is byte-identical, and the CALLER grew the
+  `ref.as_non_null` its field read already knew how to emit. Root two: the functype
+  `(param (ref 1)) (result (ref 0))` is unchanged, the caller is byte-identical, and the delta
+  is one instruction inside the callee — `struct.get 1 0` / `ref.as_non_null` / `return`.
+* **THE GRID (`scripts/silent-sweep/d131/`), 1,732 cells**, axes read depth x executing body x
+  return annotation x field type x RECEIVER STORAGE CLASS x claimant count x declaration order.
+  Base is master `89f88840` and **stripping both patches out of the branch reproduces its
+  1451224-byte fixpoint BYTE-FOR-BYTE**, which is what makes the base column provable.
+
+  | compiler | bytes | runs | loud emit | loud check | invalid wasm | moved | to `runs` | to SILENT |
+  |---|---|---|---|---|---|---|---|---|
+  | `base` master `89f88840` | 1451224 | 692 | 376 | 304 | 360 | — | — | — |
+  | `A` the classifier rung  | 1452172 | 812 | 376 | 304 | 240 | 120 | 120 | 0 |
+  | `B` the return recover   | 1451493 | 932 | 376 | 304 | 120 | 240 | 240 | 0 |
+  | `FULL` both              | 1452441 | 1052 | 376 | 304 | **0** | 360 | 360 | 0 |
+
+  Pairwise intersection **EMPTY**; 120 + 240 = 360 = |FULL moved|, set-identical; FULL disagrees
+  with neither single on a cell that single moves. **The axis split IS the mechanism**: A's 120
+  are `ann=none` x `recv in {local, hop}` and nothing else — `param` and `global` are ABSENT
+  because they already ran — while B's 240 are `ann=nonnul` spread EVENLY over all four receiver
+  storage classes (60 each). The `leaf` (`o.h.r`) and `mod` (module-scope) rows move **zero** on
+  every compiler, which is two of the row's own controls still holding, and `claim=c0` moves 24
+  under A, which is the third.
+* **THE 24-CELL D111/D117 RESIDUE THIS ROW WAS FILED OUT OF GOES TO ZERO, UNDER ROOT ONE ALONE.**
+  Re-run on the same four compilers: base 1157 runs / 24 invalid wasm, A and FULL 1181 / **0**,
+  and **B moves 0 cells on that grid** — each patch is inert where it is not the answer.
+* **RE-GRADED POPULATIONS, both inert.** D52's 9,450 cells: 7620 runs / 1830 loud emit / **0
+  silent** on base AND branch, **0 moved**. D87's 3,144 cells: 3126 / 18 / **0 silent** on both,
+  **0 moved**. **Corpus: 2,312 files, 2 differ in emitted-module sha256 and both are the
+  fixtures this change adds; 0 differ in `vl check` diagnostics.** Every loud bucket on both
+  grids is set-identical AND message-identical across all four compilers, so there are no
+  same-class message moves hiding behind the outcome counts.
+* **RESIDUE, filed rather than left.** The grid's 376 `loud_emit_reject` are every `field=arm`
+  cell: `emitProgram: only i32 / boolean / string / array struct fields are supported` — a
+  struct field whose type is a union ARM has no supported lowering and the message says so, a
+  DOCUMENTED DECLINE. Of the 304 `loud_check_reject`, 208 are `'mk' infers the nullable return
+  type … — not yet supported by codegen; annotate the return type` (the checker's own documented
+  decline, the same one D111's residue lists) and 96 are `return type mismatch: expected Circle,
+  got Circle | null` — the checker correctly refusing a nullable field read into a non-null
+  annotated result, i.e. the grid's own assertion that it still does.
+* Pins: `tests/cases/structs/nested-field-read-returned-from-unannotated-fn.vl` (root one, with
+  the two running controls and both already-working receiver shapes beside it) and
+  `tests/cases/structs/nullable-slot-value-returned-into-nonnull-result.vl` (root two, with the
+  no-field-read narrowed control). Grid + ablation reader kept at `scripts/silent-sweep/d131/`.
 
 ---
 
