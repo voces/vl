@@ -2339,13 +2339,63 @@ function retIsMapLocal(rx: i32, fnIx: i32) {
 // body, or -1 (the return is not an ident, or the name is a param / global —
 // `parentLetOf` only finds body-declared `let`s). The lookup half of the
 // returned-LOCAL classification in `criClassify`, mirroring `retIsMapLocal`.
-function criRetLocalLet(rx: i32, i: i32) {
+//
+// THE ALIAS HOP IS PART OF THE LOOKUP, and it is here rather than in the classifiers for
+// the reason the rung's own header gives: this pass is GLOBAL, so no local has been
+// collected yet and `exprStruct`'s / `exprRefArray`'s Ident arms — which answer for a
+// param, a global and a capture — have nothing to read for a body-declared local. That is
+// exactly why `criRetLocalLet` exists at all; an INIT that is itself a bare local ident is
+// the same miss one hop further in, and it took the result valtype to the `"i32"` default
+// over a body handing back a ref (silent-class-inventory D41: seven lines, no type
+// declaration at all). `const c = { r: n }  const o = c  return o` — `vl check` rc 0 with
+// no diagnostics, `expected i32, found (ref $type)` at instantiation.
+//
+// ONLY AN UN-ANNOTATED LINK IS FOLLOWED. An annotation on the alias PINS the cell's rep
+// (`letIsStruct`, `letIsRefArray` and `structIndexOfLet` all read it first), so following
+// past one would answer about the initializer where the declaration already decided. The
+// hop is therefore transparent by construction: every let on the chain is un-annotated, so
+// each one's rep IS the next one's, down to the declaration that has an answer.
+//
+// The step bound is a recursion guard, not a policy — `const a = b  const b = a` is not a
+// program the checker accepts, but the lookup must terminate on a node arena it did not
+// build.
+// ONE HOME for the lookup, because TWO passes need the same answer and must not drift
+// about it: `criRetLocalLet` below, and `emit_collect`'s `synthRetPinAnn`, which pins an
+// un-annotated returned local from the enclosing RETURN ANNOTATION. Both ask "which
+// binding actually supplies this function's returned value", and an alias chain is the
+// same chain from either side.
+export function retLocalLetOfBlock(bodyIx: i32, rx: i32) {
   const u = unwrapParen(rx)
   const e = P.nodes[u]
   if e is Ident {
-    const fn = P.nodes[fnStmts[i]]
-    if fn is FuncDecl { return parentLetOf(fn.fnBody, e.identName) }
+    let li = parentLetOf(bodyIx, e.identName)
+    let hops = 0
+    while li >= 0 && hops < 8 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType >= 0 { return li }
+        const iv = P.nodes[unwrapParen(d.letInit)]
+        if iv is Ident {
+          const nx = parentLetOf(bodyIx, iv.identName)
+          if nx < 0 { return li }
+          if nx == li { return li }
+          li = nx
+          hops = hops + 1
+        } else {
+          return li
+        }
+      } else {
+        return li
+      }
+    }
+    return li
   }
+  -1
+}
+
+function criRetLocalLet(rx: i32, i: i32) {
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl { return retLocalLetOfBlock(fn.fnBody, rx) }
   -1
 }
 
@@ -16473,6 +16523,12 @@ export function arrLitIsRef(arrIx: i32) {
     // above misses it and the literal was falling to the i32 list, where the guard in
     // `emitArr` refuses the map-struct ref element loudly.
     if arrLitMapElemName(arrIx) != "" { return true }
+    // A checker-typed OBJECT-SHAPED element the first-element probes cannot see — an IDENT
+    // (`[c]`) or a CALL (`[mkC(n)]`) whose recorded element is a declared struct or a union
+    // ARM (`arrLitNominalElemName`). LAST, beside the union and map rungs and for the same
+    // stated reason: it only ever claims a literal that was falling through to the i32
+    // default.
+    if arrLitNominalElemName(arrIx) != "" { return true }
   }
   false
 }
@@ -16615,6 +16671,63 @@ export function arrLitObjElemBoxVariant(arrIx: i32): string {
   ""
 }
 
+// The DECLARED ROW an array literal's element denotes when NO first-element syntax probe
+// can see it — the fourth home of the same rule `arrLitIsRef`, `arrLitElemName` and
+// `arrLitElemKind` must agree on, added for the same reason the union and map rungs were:
+// those three classify a literal from its FIRST ELEMENT's syntax, and an IDENT (`[c]`) or
+// a CALL (`[mkC(n)]`) is none of the shapes they probe for.
+//
+// THE RECORDED ELEMENT IS THE COMPLEMENT, AND IT IS THE SAME ONE THE UNION AND MAP RUNGS
+// ALREADY USE. `nodeArrayElemName`'s own header states the rule: "the emitter's
+// first-element SYNTAX probe cannot see such an element: a CALL (`[pick(true)]`) and an
+// IDENT (`[w]`) are neither an object literal nor a nested literal, so with no recorded
+// name the literal fell to the i32 list". It says that of a value UNION element and
+// installed `arrLitUnionElemName` for it. One type-class in — a union ARM, or a plain
+// DECLARED STRUCT — nothing answered, and the literal fell to the i32 list with a
+// `(ref $type)` element stored into it: `vl check` rc 0 and `expected i32, found
+// (ref $type)` at instantiation (silent-class-inventory D40), or the i32 path's loud floor
+// `struct array elements are not supported` where no union is declared at all.
+//
+// `arrElemNominalOfTy` IS THAT ANSWER AND IT ALREADY EXISTED, written for
+// `synthEmptyListAnn`'s element-name synthesis: peel the array's recorded `TyArray` and ask
+// `shapeNominalOfTy` — banked struct row, then `variantRowOfTy` (arm-DECLARATION identity),
+// then the two field-set scans. It is the ladder D33 installed and the one every CONSUMER
+// of a struct-shaped element already walks, so the name this yields is exactly the name
+// `refArrElemName` yields for the ANNOTATED `Circle[]` spelling and the two intern ONE slot.
+//
+// GATED ON A `TyObj` ELEMENT, and the gate is what keeps the answer a KIND-1 element rather
+// than a guess. `shapeNominalOfTy` recurses through `TyArray` and would spell a nested list
+// `Circle[]`, which is element kind 9 and a different slot shape; a scalar, a closure, a map
+// and a union element are all answered by rungs that already exist above this one. Only the
+// object-shaped element has no home, and only it is claimed here.
+//
+// THE THREE SYNTAX SHAPES ARE EXCLUDED BY NAME, so `arrLitIsRef`'s stated invariant holds
+// unchanged: "every literal that classifies by its FIRST ELEMENT keeps exactly the
+// classification it had". An `ObjLit` element is D36/D38's population and its ladder
+// (`arrLitObjElemBoxVariant`, then `structIndexOfObj`, then the arm's own name) decides it;
+// a nested `ArrayLit` and a `FuncDecl` have their own rungs. This one only ever claims a
+// literal that was falling through to the i32 default.
+export function arrLitNominalElemName(arrIx: i32): string {
+  const a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return "" }
+    const e0 = P.nodes[a.arrElems[0]]
+    if e0 is ObjLit { return "" }
+    if e0 is ArrayLit { return "" }
+    if e0 is FuncDecl { return "" }
+    const aty = nodeTyIxOf(arrIx)
+    if aty < 0 { return "" }
+    const at = T.tys[aty]
+    if at is TyArray {
+      if at.aElem < 0 { return "" }
+      const el = T.tys[at.aElem]
+      if !(el is TyObj) { return "" }
+      return shapeNominalOfTy(at.aElem)
+    }
+  }
+  ""
+}
+
 // The ref-element kind of the array literal at `arrIx` (assumes `arrLitIsRef`): `2`
 // when the FIRST element is a union variant (boxes into the union), else `1` (a direct
 // struct element). Per-element-type: a `Tok[]` literal whose element is a plain struct
@@ -16657,6 +16770,16 @@ export function arrLitElemKind(arrIx: i32) {
     // would otherwise claim a map literal as a union box in any program that declares a
     // union at all.
     if arrLitMapElemName(arrIx) != "" { return 3 }
+    // The checker-typed OBJECT-SHAPED element (`arrLitIsRef`'s new last rung): a DIRECT
+    // struct element, kind 1 — the same kind `arrLitElemName`'s object arm gives a plain
+    // struct and a bare ARM, and the same one `refArrElemKind` gives the annotated
+    // `Circle[]` spelling. ARM FOR ARM with that name arm: a literal this one calls kind 1
+    // is exactly the one that one keys under the element's own nominal row.
+    //
+    // BEFORE the `uDeclared` fall-through, which would otherwise box an arm-element literal
+    // into the union in any program that declares one — the kind-2 rep a reader that
+    // unboxes cannot meet, which is D36/D38's failure at this position.
+    if arrLitNominalElemName(arrIx) != "" { return 1 }
   }
   if uDeclared { return 2 }
   1
@@ -16797,6 +16920,16 @@ export function arrLitElemHintTy(arrIx: i32) {
     // element — read off `nodeTyIxOf`, the column that renderer reads, not
     // `nodeRepTyIxOf`.
     if arrLitUnionElemName(arrIx) != "" { return arrLitArenaElemRow(arrIx) }
+    // THE NOMINAL-ELEMENT ARM DECLINES, and it declines deliberately rather than by
+    // omission. `arrLitNominalElemName` names a row found in a TABLE (`sNames[si]` /
+    // `uVariants[vi]`), exactly as the two object-literal arms above do — and this
+    // function's own header states the rule for that case: "EACH ARM MUST USE ITS OWN
+    // SOURCE … their faithful row is the same table's own TYPE column", never the array's
+    // recorded element, which for these literals is the checker's structural shape. The
+    // variant half has no measured hint at all (`arrLitElemHintTy`'s struct arm already
+    // declines for a bare ARM rather than guessing a row), so -1 is the answer that keeps
+    // the four classifiers agreeing: a declined hint is a parse, a wrong hint is a
+    // silently wrong rep key.
   }
   -1
 }
@@ -16922,6 +17055,15 @@ export function arrLitElemName(arrIx: i32) {
     // spellings intern ONE kind-3 row, and the row carries the KEY as well as the value.
     const amn = arrLitMapElemName(arrIx)
     if amn != "" { return amn }
+    // The checker-typed OBJECT-SHAPED element (`arrLitIsRef`'s new last rung): the DECLARED
+    // ROW's own name is the table key — the same string `refArrElemName` yields for the
+    // annotated `Circle[]` spelling, whether that row is a struct or a union ARM, so the
+    // inferred literal and the annotation intern ONE kind-1 slot. A variant row has no
+    // `sNames` entry, so `rlElemLitStructRow` declines and the lowering seeds
+    // `variantIndexOf(name)` — the bare variant struct, exactly as the object-literal arm's
+    // own arm fall-through does.
+    const ann = arrLitNominalElemName(arrIx)
+    if ann != "" { return ann }
   }
   ""
 }
