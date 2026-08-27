@@ -94,12 +94,13 @@ outcome class never moved and only a module `cmp` saw it.
 
 ## The 2026-08-27 re-grade (D123 / D124's close)
 
-Re-run against master `89f88840` and the D123/D124 branch with `grade88.py`, one host
-binary, both sides:
+Re-run against master `89d01c97` and the D123/D124 branch with `grade88.py`, one host
+binary, both sides (re-measured on the merged base after #1962 landed; **0 cells differ
+from the pre-merge measurement on `89f88840`**, and #1962 moves none of these cells):
 
 | side | runs | loud emit reject | check-clean invalid wasm |
 |---|---|---|---|
-| base `89f88840` | 2,178 | 572 | 100 |
+| base `89d01c97` | 2,178 | 572 | 100 |
 | D123/D124 branch | 2,234 | 572 | 44 |
 
 **56 cells moved, every one `check-clean invalid wasm` → `runs`; 0 backward, 0 to a silent
@@ -118,8 +119,8 @@ different heaps and D123's merge correctly declines them.
 
 ### What the ablation reported (second ablation, this grid)
 
-Built by STRIPPING candidates out of the branch; stripping all three reproduces `89f88840`
-**byte-for-byte** (1,451,224 bytes).
+Built by STRIPPING candidates out of the branch; stripping all three reproduces `89d01c97`
+**byte-for-byte** (1,452,441 bytes).
 
 | candidate | moved here | moved on the D112 grid |
 |---|---|---|
@@ -135,3 +136,11 @@ PAIRING axis is what sized C: with only three of its eleven consumer sites conve
 cell passed ALONE and two of them in ONE FILE did not, because the field-read resolvers
 still read the raw value-row column. A one-program-per-cell grid structurally cannot see
 that, which is the warning this file already carries about its own `arm2`/`decl` levels.
+
+### The axis this grid does not vary
+
+Every one of its 2,850 cells builds the map as a function LOCAL. `scripts/silent-sweep/d139/`
+is the 36-cell grid that varies `bind` (`local` / `global` / `callres`) instead, added while
+closing D123 for the reason #1962 gave when D131's four filed controls all agreed and none
+of them separated anything. Measured there: D123's fix is storage-class INDEPENDENT (12 cells
+moved, 4 at each binding, 0 backward), and D139 is not.

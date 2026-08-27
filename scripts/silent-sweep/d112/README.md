@@ -92,12 +92,13 @@ untouched one.
 
 ## The 2026-08-27 re-grade (D123 / D124's close)
 
-Re-run against master `89f88840` and the D123/D124 branch with `grade88.py`, one host
-binary, both sides:
+Re-run against master `89d01c97` and the D123/D124 branch with `grade88.py`, one host
+binary, both sides (re-measured on the merged base after #1962 landed; **0 cells differ
+from the pre-merge measurement on `89f88840`**, and #1962 moves none of these cells):
 
 | side | runs | loud emit reject | check-clean invalid wasm |
 |---|---|---|---|
-| base `89f88840` | 761 | 292 | 61 |
+| base `89d01c97` | 761 | 292 | 61 |
 | D123/D124 branch | 810 | 292 | 12 |
 
 **49 cells moved, every one `check-clean invalid wasm` → `runs`; 0 backward, 0 to a silent
@@ -118,8 +119,9 @@ and merging them would be wrong.
 ### The ablation
 
 Three candidate edits, one compiler per candidate, built by STRIPPING the others out of the
-branch — and stripping ALL of them reproduces `89f88840` **byte-for-byte** (1,451,224
-bytes), so the base column is proven rather than assumed.
+branch — and stripping ALL of them reproduces `89d01c97` **byte-for-byte** (1,452,441
+bytes, the same number the coordinator proved independently), so the base column is proven
+rather than assumed.
 
 | candidate | this grid | D88/D100 grid |
 |---|---|---|
