@@ -5939,9 +5939,10 @@ Repro:
   cast), every leg kind-gated so the two cannot both answer, and this ladder never asked it.
   The fix is that call plus `monoAnnPinName` — the ONE membership list for "which annotation
   name can serve as a pin", which already carried the variant rung.
-* **D82 IS THE SAME ROOT AND THE ABLATION SAYS SO.** One rung moves 276 of a 3,144-cell grid
-  and closes both rows; see D82. The no-twin LOUD floor goes with it (`unsupported argument
-  type for \`x\``) — 102 of those 276 are loud→runs.
+* **D82 IS THE SAME ROOT AND THE ABLATION SAYS SO.** One rung moves 312 of a 3,144-cell grid
+  (276 against the `8bf0f20f` base this was first measured on) and closes both rows; see D82.
+  The no-twin LOUD floor goes with it (`unsupported argument type for \`x\``) — 114 of those
+  312 are loud→runs.
 * Disassembly, both sides, one seed each: master `8bf0f20f` (1438562 bytes) emits
   `(global (mut (ref 1)))` with `eqT$m1 (param (ref 0) (ref 0))` and `struct.get 0 0`; the
   branch emits `(param (ref 1) (ref 1))` and `struct.get 1 0`. Type 0 is `Dot`'s standalone
@@ -6036,8 +6037,21 @@ Repro:
   moved 191 -> 195 and nothing else did). With it the cell is byte-for-byte master's. An
   UN-annotated result records nothing: an inferred return is not a nominal claim — it is what
   D52's rung derives FROM the binding — and recording it would veto this row's own population.
-* Graduated to `tests/cases/unions/anon-objlit-into-arm-typed-destination.vl` (eight cells:
-  all four destinations, the generic hop, the list-element destination, the alias hop, and
+* **A FIFTH DESTINATION ARRIVED WHILE THIS WAS IN REVIEW, and it is #1954's doing rather
+  than this row's.** An arm-valued MAP's value slot (`m["k"] = c`) was a LOUD floor on
+  `8bf0f20f`, so it was never in D81's silent population at all; #1954 taught the arm-valued
+  map to lower under the inline spelling, the floor went, and 18 grid cells came out
+  check-clean invalid wasm on `922d52eb`. Same channel one destination further — annotating
+  the local makes them run there, which is what says the LITERAL's row is wrong and not the
+  map's slot — so `dstPinMapValue` is the fifth leg, and it is disjoint from the other four
+  like all the rest.
+* RE-MEASURED AGAINST `922d52eb` after merging it, because the base moved under the row: the
+  grid's silent count is 306 there (not 264 — #1954 moved 42 loud cells into the silent class
+  on this population) and the branch takes it to **0**. 528 cells moved, every one forward,
+  0 backward, 0 message-only. The five candidates move 312 / 36 / 36 / 108 / 36, all TEN
+  pairwise intersections empty, union set-identical to 528.
+* Graduated to `tests/cases/unions/anon-objlit-into-arm-typed-destination.vl` (nine cells:
+  all five destinations, the generic hop, the list-element destination, the alias hop, and
   the DISAGREEMENT gate that keeps master's behaviour where two destinations name different
   claimants). The `xfail-` pin is DELETED, which is that file's own written instruction, and
   `INVALID_MODULE_SRC` moves to D87 below.
@@ -6079,7 +6093,7 @@ Repro:
   answers `Dot` for BOTH: `idg(thru(c))`'s argument is a call result, D75's is a module
   global, and `monoArgTyName`'s struct arm reaches the twin's `sNames` row from either. One
   `exprVariantIndex` rung closes both, and the ablation confirms it rather than assuming it —
-  the single-candidate compiler that carries only that rung moves 276 cells and the two rows'
+  the single-candidate compiler that carries only that rung moves 312 cells and the two rows'
   own witnesses are among them.
 * The distinguishing observation the row DID make holds and is worth keeping: `route=gen`
   only, and every annotated-local cell in the residue was here rather than in D81. That is
@@ -6135,6 +6149,9 @@ Repro:
   #1952 rewrote and the region D47 (the inline map-annotation spelling of an arm-valued map)
   is open in; the D75/D81/D82 work this row ships beside is the struct/variant PIN seam and
   moves none of these 96 cells in either direction (measured: 96 silent on both sides).
+* **IT SURVIVES #1954**, which had to be checked because that PR closed D47/D50 in this very
+  region: on `922d52eb` the repro is the same sentence at a different offset (1162 -> 1214),
+  which is exactly why the row's identifier is the sentence and not the offset.
 * Pinned as `tests/cases/soundness/xfail-miscompile-arm-valued-map-local-into-map-param.vl`,
   `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
 
