@@ -995,6 +995,34 @@ variable means the question was never answered. A gate on the empty ANSWER rathe
 REASON would have wrapped a null guard around compares that already null-test correctly — the
 `fnAssignKindGuard` shape from #1938, where a "no answer" sentinel is not neutral.
 
+### State the admission on the MECHANISM'S boundary, not on the grid's enumeration
+
+The closing grid contained `string | null` and `i32[] | null`, and the first draft of every
+paragraph about this change named those two. **The fix is `eqCmpKindOfNulInner`'s whole niche
+family** — `string[] | null`, `boolean[] | null`, `i32[][] | null` and a nullable CLOSURE moved
+with them, inline and through a declared alias, measured one file per cell on both compilers.
+A grid enumerates CELLS; a fix has a BOUNDARY, and the boundary is stateable here because the
+compiler already names it in one function.
+
+The cost of getting this backwards is not symmetric. Naming two reps where five moved
+UNDER-promises, which is the direction `std/array.vl`'s ledger has been wrong in exactly once
+before and calls out as the one that "cost a caller a capability it already had". It also hides
+a failure-kind fact: the two the grid ran were `check-clean invalid wasm`, and the `nulreflist`
+and `nulclosure` cells were a check-clean runtime TRAP, so "all invalid wasm → runs" is true of
+those sixteen cells and is not the family's shape.
+
+**And the sixth token is a compound-claim trap.** A draft filed `Circle | null` beside
+`i32 | null` as "a BOX and a struct-eq shape, not niches with compare cores" — false for the
+first, and false against three readings of this change's own diff (`eqCmpKindOfNulInner` answers
+`"nulstruct"`, `eqKindIsNulNiche` lists it, and the new second channel has an explicit
+`nulstruct` arm). Two `Circle | null` bindings compared directly run and are correct; what
+refuses the generic route is `emitProgram: ref valtype with no interned shape`, isolated by a
+hand-written generic **containing no `==` at all** that fails identically and RUNS at
+`T = Circle`. A nullable STRUCT cannot be a generic ARGUMENT and the compare is never reached.
+**Two cells failing by two mechanisms were given one shared reason.** Both found by the
+`std-api-reviewer` pass, which is the sixth consecutive time it has produced the closing
+change's next correction on this module.
+
 ### Both consumers of the answer must get the channel, and the measurement says so
 
 A `==` needs two decisions: whether there is a GUARD (`binEqNulNiche`) and which CORE goes
@@ -1074,10 +1102,22 @@ Two rules follow, and the second is the one that makes this a close rather than 
   spelling (`function ==(…)`) and the quoted one (`function "=="(…)`) converge on one `name` —
   one home, four spellings with `!=`;
 * **the diagnostic changed in the same commit.** `— define a `==` operator for it` became
-  `— compare a projection whose components are`. Leaving the old clause beside the new reject
-  would be strictly worse than the state the row was filed against: a message recommending a
-  declaration the compiler now refuses. **A prescription and its implementation are one
-  change.**
+  `— compare a projection whose components are value-comparable, and only one that no two
+  distinct values share`. Leaving the old clause beside the new reject would be strictly worse
+  than the state the row was filed against: a message recommending a declaration the compiler
+  now refuses. **A prescription and its implementation are one change.**
+
+**A REPLACEMENT PRESCRIPTION INHERITS THE ORIGINAL'S QUALIFIERS, and the first draft dropped
+them along with the sentence's predicate.** `std/array.vl`'s ledger has one entry it calls its
+worst-shaped — the only one that ever printed a WRONG ANSWER rather than a wrong claim — and it
+is this remedy stated UNQUALIFIED ("project to a key and search that", where a first element is
+not a key). A diagnostic that imports the unqualified half hands the defect to every caller, and
+for `==` it is worse than for a search: two distinct values sharing a projection compare EQUAL
+rather than merely being found at the wrong index. The same draft also ended on "…whose
+components are" and stopped — **a sentence with no predicate that passed every gate**, because
+`@error` matches a SUBSTRING and the fixture's directive stopped before the clause. One
+directive now runs to the end of the sentence. **A message is a claim, so it needs a test that
+reads all of it.**
 
 Nothing in the tree declares a `==` or `!=` operator function, so the reject costs no
 capability. The 12 grid cells it moves `runs → loud check` are an `i32` comparison beside an

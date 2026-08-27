@@ -4188,9 +4188,46 @@ one-channel consumer that predates it.
 `needle: T` exports x receiver delivery — moves **16 cells `check-clean invalid wasm -> runs`**,
 every one correct against a hand-computed answer: eight `string | null` and eight `i32[] | null`,
 across `indexOf` / `lastIndexOf` / `includes` / `count` and both a bound and a call-result
-receiver. `i32 | null` and `Circle | null` stay LOUD EMIT at every route, unchanged and honest —
-they are a BOX and a struct-eq shape, not niches with cores. **No cell of this family moved to a
-refusal**, which is the grading this row requires.
+receiver. **No cell of this family moved to a refusal**, which is the grading this row requires.
+
+**THE GRID ENUMERATED TWO REPS AND THE FIX HAS A BOUNDARY, and the difference is a finding
+rather than a rounding.** `eqCmpKindOfNulInner` names SIX niche tokens and `exprNulNicheKind`
+mirrors all six, so the admission is the whole family and not the two cells the grid happened to
+contain. Measured after the fact, one file per cell, on both compilers — every one
+`vl check` rc 0 on master and correct on the branch:
+
+| `T` | token | master | branch |
+|---|---|---|---|
+| `string \| null` | `nulstr` | check-clean invalid wasm | **runs, right** |
+| `i32[] \| null`, `boolean[] \| null` | `nullist` | check-clean invalid wasm | **runs, right** |
+| `string[] \| null` | `nulstrlist` | check-clean invalid wasm | **runs, right** |
+| `i32[][] \| null` | `nulreflist` | check-clean **runtime TRAP** (`null reference`) | **runs, right** |
+| `((i32) => i32) \| null` | `nulclosure` | check-clean **runtime TRAP** | **runs, right** |
+| `type L = i32[] \| null` (ALIAS spelling) | `nullist` | check-clean invalid wasm | **runs, right** |
+
+Two of them were a TRAP rather than invalid wasm, so "16 cells, all `invalid wasm -> runs`" is
+true of the sixteen and is **not** the family's failure kind. A row stated on the enumeration
+would have let three of these five regress silently and would have under-promised the change;
+the fixture now pins all five plus the alias.
+
+**THE SIXTH TOKEN IS `nulstruct`, AND ITS REFUSAL IS NOT ABOUT COMPARING.** A draft of this
+paragraph filed `Circle | null` beside `i32 | null` as "a BOX and a struct-eq shape, not niches
+with cores", and that is false twice over: `eqCmpKindOfNulInner` answers `"nulstruct"` for it,
+`eqKindIsNulNiche` lists it, this change's own second channel has an explicit `nulstruct` arm,
+and two `Circle | null` bindings compared DIRECTLY run and are correct. What refuses the generic
+route is `emitProgram: ref valtype with no interned shape`, and the ablation is one file: a
+hand-written generic **containing no `==` at all** fails identically at `T = Circle | null` and
+RUNS at `T = Circle`. A nullable STRUCT cannot be a generic ARGUMENT and the compare is never
+reached. `i32 | null` is the genuine eq BOX (`emitProgram: `==` over a struct union is not
+supported yet`), unchanged. **Two cells failing by two mechanisms had been given one shared
+reason, and the reason was false for one of them** — caught by the `std-api-reviewer` pass, the
+sixth consecutive time that review has produced the closing change's next correction.
+
+**A NEEDLE THAT IS `null` FINDS THE FIRST NULL ELEMENT** — `null == null` is true at every rep
+here, as it is written directly. Measured: `[null, "b"]` searched for `null` gives `indexOf` 0,
+`lastIndexOf` 0, `includes` true, `count` 1. The remedy this retirement retires ("project to a
+non-null key and search that") had no spelling for that search at all, so this is a capability
+the close ADDS rather than one it restores.
 
 Fixture: `tests/cases/std/array-needle-nullable-niche.vl` (both niches, all four exports, a
 hand-written generic off std's surface, and the direct control).
@@ -4513,10 +4550,22 @@ quoted spelling gets this sentence rather than the generic "must be an operator"
 
 **THE DIAGNOSTIC IS RECONCILED IN THE SAME CHANGE, which is the half that makes this a close
 rather than a move.** `eqRefusals` no longer ends ``— define a `==` operator for it``; it ends
-`— compare a projection whose components are`, the idiom `std/array.vl` already prescribes for
-the same shape. Leaving the old clause beside the new reject would have been strictly worse than
-the state this row was filed against: a diagnostic recommending a declaration the compiler
-refuses.
+`— compare a projection whose components are value-comparable, and only one that no two distinct
+values share`, the idiom `std/array.vl` already prescribes for the same shape. Leaving the old
+clause beside the new reject would have been strictly worse than the state this row was filed
+against: a diagnostic recommending a declaration the compiler now refuses.
+
+**THE QUALIFIER IS LOAD-BEARING AND THE FIRST DRAFT DROPPED IT, along with the sentence's
+predicate.** `std/array.vl`'s ledger has one entry it calls its worst-shaped — the only one that
+ever printed a WRONG ANSWER rather than a wrong claim — and it is exactly this remedy stated
+UNQUALIFIED: "project to a key and search that", where a first element is not a key. Importing
+the unqualified half into a diagnostic hands every caller that defect, and for `==` it is worse
+than for a search: two distinct values sharing a projection compare EQUAL. The first draft also
+ended on "…whose components are" and stopped there — **a sentence with no predicate that every
+gate passed**, because `@error` matches a SUBSTRING and the fixture's directive stopped before
+the clause. `error-array-needle-not-equatable.vl` now carries one directive that runs to the end
+of the sentence, which is the cheapest thing that would have caught it. Both found by the
+`std-api-reviewer` pass over this change.
 
 **THE COST IN CELLS, STATED HONESTLY.** 12 grid cells move `runs -> loud check reject`: an `i32`
 comparison beside an inert `==`/`!=` declaration, at every declaration form the grid enumerates
