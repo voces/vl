@@ -7760,6 +7760,364 @@ Repro:
 
 ---
 
+### D179 — a COMPILER TRAP: `for-in` over an undeclared list whose element field holds a union arm
+**compiler trap · found 2026-08-27 by the CENSUS grid (`scripts/silent-sweep/census/`), block D · the ONLY `compiler trap` in the inventory's live population, and the first program-level witness that column has ever had**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    const c = [{ r: { c2: 1 } }]
+    let hit = 0
+    for zz in c {
+      if zz.r is Cir2 { hit = 7 }
+    }
+    print(hit)
+    // vl check rc 0 with NO diagnostics; vl run AND vl build:
+    //   wasm trap: out of bounds array access   (inside the COMPILER)
+    // `vl build -o` writes NO module, which is what separates this from a program trap.
+
+* **NINE LINES, no annotation, no twin, no alias, no map, no import, no generic.** The only
+  declarations are the union the payload's field is an arm of.
+* **THE COMPILER'S OWN ARENA READ IS OUT OF BOUNDS**, so this is not an emitted-program
+  defect at all — it is `emitFail does not halt` territory: a recorded failure followed by
+  continued emission over a parallel table. The third `vl build` stage is what says so; the
+  run stage alone cannot tell a compiler trap from a program trap.
+* **SEVEN CONTROLS, each one change from the repro:**
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **compiler trap** |
+  | wrap the statements in `function rd() { … }` and call it | **compiler trap** (both scopes) |
+  | `if c[0].r is Cir2 { … }` instead of `for-in` | loud emit reject (`ref valtype with no interned shape`) |
+  | build the container as a map and read `c["k"] ?? …` | loud emit reject (same message) |
+  | declare `type Circle = { r: Shape2 }` and annotate `const c: Circle[]` | RUNS |
+  | `type Inner = { q: i32 }` field instead of a union arm | RUNS |
+  | `const c = [{ c2: 1 }]` — the arm directly, not nested in a struct | RUNS |
+
+* **THE `for-in` CONTROL IS THE ONE THAT NAMES THE SITE.** The index read reaches a guarded
+  path that refuses loudly; `for-in` reaches the same shape through a lowering that does not
+  consult the guard, and the unguarded read is the trap. That is the same asymmetry Root B
+  records for the map view, one container out.
+* Population in the census: 2 cells (both spellings of the same program), out of 250,238.
+  The class is narrow — but it is the only `compiler trap` the tree has, and the column was
+  previously believed unprovokable from source.
+
+---
+
+### D180 — a nested list built through un-annotated intermediate locals, with NOTHING declared
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block D and block C · the first row in this inventory with no `type` declaration, no union, no map and no object anywhere in the program**
+
+Repro:
+
+    function rd() {
+      const lv1 = ["seven"]
+      const c = [lv1]
+      const g0 = c
+      if g0.length > 0 {
+        const g1 = g0[0]
+        if g1.length > 0 {
+          if (g1[0]) == "seven" { print(7) } else { print(0) }
+        } else { print(0) }
+      } else { print(0) }
+    }
+    rd()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected i32, found (ref $type)
+
+* **THE WHOLE PROGRAM IS A LIST OF LISTS OF `string`.** There is no nominal identity in it to
+  get wrong, which is why no grid in this programme could contain it: every one of them
+  declared a shape in order to have a shape to twin.
+* **THE DECIDING AXIS IS *WHICH* LEVEL CARRIES THE ANNOTATION, and no earlier grid varied it.**
+  `annpos` (this inventory's axis) only ever annotated the OUTERMOST binding. The census's
+  `annpat` axis annotates intermediate levels, and at depth three it is the MIDDLE one that
+  matters:
+
+  | depth-3 spelling (`string[][][]`, outer always annotated) | outcome |
+  |---|---|
+  | no intermediate annotation | **check-clean invalid wasm** |
+  | innermost annotated (`lv2: string[]`) | **check-clean invalid wasm** |
+  | middle annotated (`lv1: string[][]`) | RUNS |
+  | both annotated | RUNS |
+  | one nested literal `[[["seven"]]]`, no intermediates | RUNS |
+
+* **AT DEPTH TWO THE ROW IS THE UN-ANNOTATED SPELLING**, and the controls invert:
+
+  | depth-2 spelling | outcome |
+  |---|---|
+  | nothing annotated (the repro) | **check-clean invalid wasm** |
+  | `lv1: string[]` only | **check-clean invalid wasm** |
+  | `c: string[][]` only | RUNS |
+  | both | RUNS |
+  | one nested literal `[["seven"]]` | RUNS |
+  | the same at MODULE scope | loud emit reject (`nested arrays are not supported`) |
+  | `i32` elements instead of `string` | loud emit reject (same message) |
+
+* **THE LAST TWO CONTROLS ARE THE ROW'S BOUNDARY AND ALSO ITS WARNING.** `nested arrays are
+  not supported` is the loud refusal this shape is meant to get; it fires at module scope and
+  for `i32`, and does not fire for a `string` element inside a function. So the refusal
+  exists and has a hole in it, and the hole is a miscompile — the same relationship Root A
+  records between the seven narrowing forms.
+* Census population: the `expected i32, found (ref $type)` cluster is **552 cells whose only
+  two constants are `declness=nodecl` and `rep=string`** — this row's own signature — plus
+  120 more in the monomorphized variant of the same message. Across the WHOLE census the
+  subset with nothing declared and no twin, union or alias is **120 silent cells of 7,105**.
+
+---
+
+### D181 — a container type ALIAS plus one value of it, with no twin and no union
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, blocks A and C · the `claimant count` axis firing ALONE, which D88's grid could not show because its claimant levels were entangled with arm-ness**
+
+Repro:
+
+    type Box1 = {[string]: i32}[]
+    const _sp1: Box1 = []
+    const lv1 = Map()
+    lv1["k0"] = 7
+    const c: {[string]: i32}[] = [lv1]
+    function rd() {
+      const g0 = c
+      if g0.length > 0 {
+        const g1 = (g0[0])["k0"] ?? 0
+        if (g1) == 7 { print(7) } else { print(0) }
+      } else { print(0) }
+    }
+    rd()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **THE PAYLOAD IS `i32`.** No object shape, no union, no twin, no `Circle`, no arm — so the
+  nominal-identity story that D155–D158 share cannot be this row's, and the ingredient is
+  the SECOND DECLARATION OF THE SAME CONTAINER LAYOUT.
+* **BOTH HALVES ARE REQUIRED, AND EACH ALONE IS HARMLESS:**
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | delete the alias AND the spare | RUNS |
+  | keep `type Box1 = …`, delete `const _sp1` | RUNS |
+  | keep `const _sp1: {[string]: i32}[] = []`, delete the alias | RUNS |
+  | a SECOND identical alias and spare (`Box2`) | check-clean invalid wasm (same) |
+  | annotate `const lv1: {[string]: i32}` | check-clean invalid wasm (does NOT rescue) |
+  | drop the list layer — a bare `{[string]: i32}` with its own alias and spare | RUNS |
+
+* **THE LIST-OF-MAP LAYER IS PART OF IT.** The same alias-plus-spare over a bare map runs;
+  it is the map inside a list that makes the second declaration of the layout decide a
+  different rep for the same cell.
+* Census population: **2,254 cells whose ONLY one-step rescue is `claim=0`**, all at
+  `cont=list_of_map` — the largest single rescue-set family in the census.
+
+---
+
+### D182 — a struct with a NULLABLE FIELD, stored in a container and read back
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, all blocks · `pval=nullfield` is the highest-rate level of any axis level in the census (3,724 of 8,448 cells in block A alone)**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    type WS1 = { f: {[string]: Circle} }
+    const lv1 = Map()
+    lv1["k0"] = { r: null }
+    const c: WS1 = { f: lv1 }
+    const g1 = (c.f)["k0"] ?? { r: null }
+    if g1.r != null { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // (the correct answer is `0` — the field IS null)
+
+* **NO TWIN, NO UNION, NO ALIAS, NO CALL, NO CONDUIT.** Seven lines. The nullability is on
+  the STRUCT FIELD, not on the container's value cell, and the container is a struct whose
+  field holds a map.
+* **FIVE CONTROLS:**
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | annotate `const lv1: {[string]: Circle}` | RUNS |
+  | `type Circle = { r: i32 }` and store `{ r: 7 }` | RUNS |
+  | drop the struct wrapper — a bare `{[string]: Circle}` | RUNS |
+  | a list of maps instead of a struct of a map | check-clean invalid wasm (same) |
+
+* **IT IS THE UN-ANNOTATED INTERMEDIATE MAP AGAIN**, the same ingredient as D180's
+  intermediate locals and D181's inner map — but here the trigger is the nullable FIELD,
+  not the container's depth: the identical program with a non-nullable field runs.
+* Do NOT group it with D19 or the nullable-value-cell rows: the map's value type here is
+  `Circle`, not `Circle | null`, and the read is a hit, not a miss.
+
+---
+
+### D183 — a `string[]` round-tripped through `reverse([c])[0]`, inside a function
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block A · D157's conduit at a coordinate with NO nominal shape anywhere in the program**
+
+Repro:
+
+    import { reverse } from "std:array"
+    function rd() {
+      const c = ["seven"]
+      const dd = reverse([c])[0]
+      let hit = 0
+      for zz in dd {
+        if zz == "seven" { hit = 7 }
+      }
+      print(hit)
+    }
+    rd()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   wasm[0]::function[N]::rd$m0 … type mismatch: expected (ref $type), found (ref $type)
+
+* **THE FAILING FUNCTION IS THE MONOMORPHIZED INSTANCE `rd$m0`**, which is the "same class,
+  different message" disguise D157's second half names — except D157's repro declares
+  `Circle`, `Sq`, `Shape` and `Dot`, and this one declares nothing at all.
+* **THE UNION AND THE DESTINATION WERE BOTH IN THE CENSUS CELL AND NEITHER IS REQUIRED.**
+  The cell the census produced (`a007648`) carried an unrelated `type Shape = Ua | Sq` and a
+  `sink(c)` destination; deleting each in turn leaves the program silent. That refutation is
+  recorded because the first draft of this row was written around the union.
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | annotate `const c: string[]` | check-clean invalid wasm |
+  | annotate `const dd: string[]` | check-clean invalid wasm |
+  | `if dd[0] == "seven"` instead of `for-in` | check-clean invalid wasm |
+  | `reverse(c)` — no wrapping list | RUNS |
+  | `idg(c)` with `function idg<T>(x: T): T` instead of the std call | RUNS |
+  | `const dd = c` — no conduit | RUNS |
+  | the same statements at MODULE scope | loud emit reject (`nested arrays are not supported`) |
+  | `i32` elements | loud emit reject (same) |
+
+* **THE `reverse(c)` CONTROL SEPARATES THE CONDUIT FROM THE WRAPPING LIST.** It is not the
+  std export: it is `[c]` — a list built around a list, handed to a generic, indexed back
+  out — and the generic spelling of the same hop runs, so the std instance and the
+  hand-written one do not monomorphize alike.
+* Census population: **759 silent cells whose failing function carries the `$m0` suffix**,
+  spread over 7 containers and 5 reps.
+
+---
+
+### D184 — a LIST of lists of a declared union arm with an exact twin
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block C · D156's ingredients in a LIST container, which no grid in this programme has ever built**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    const lv1 = [{ r: 7 }]
+    const c: Circle[][] = [lv1]
+    const g0 = c
+    if g0.length > 0 {
+      const g1 = g0[0]
+      if g1.length > 0 {
+        if g1[0].r == 7 { print(7) } else { print(0) }
+      } else { print(0) }
+    } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **EVERY EARLIER GRID FOR THIS CLASS USED A MAP.** `d52`, `d88`, `d94`, `d111`, `d112`,
+  `d131` and `d139` all build the container as `Map()`; the list spelling of the same
+  coordinate was never generated, and it is silent.
+* **ALL THREE NOMINAL INGREDIENTS ARE REQUIRED, AND SO IS THE UN-ANNOTATED INNER LOCAL:**
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | delete `type Dot` | RUNS |
+  | `type Dot = { q: i32 }` (same arity, different field) | RUNS |
+  | delete `type Shape = Circle \| Sq` | RUNS |
+  | annotate `const lv1: Circle[]` | RUNS |
+  | one nested literal `[[{ r: 7 }]]` | RUNS |
+  | a flat `Circle[]` | RUNS |
+
+* Census population: **144 cells rescued only by `{twin, union, pval, cont}`, all at
+  `cont=listlist`**, plus a further 457 at `listlist` with the full ingredient set.
+
+---
+
+### D185 — a struct field over a map of a union arm: LOUD without the twin, SILENT with it
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block C · a `loud emit reject` → `check-clean invalid wasm` move produced by ADDING a declaration, which is the direction this programme treats as a blocker**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    type WS1 = { f: {[string]: Circle} }
+    const lv1 = Map()
+    lv1["k0"] = { r: 7 }
+    const c: WS1 = { f: lv1 }
+    const g1 = (c.f)["k0"] ?? { r: 0 }
+    if g1.r == 7 { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **DELETING `type Dot` MAKES THE PROGRAM LOUD, NOT CORRECT.** That is the row:
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | delete `type Dot` | **loud emit reject** — `unsupported map value type (no rep for a union-member struct…)` |
+  | `type Dot = { q: i32 }` (a non-twin) | **loud emit reject** (same message) |
+  | delete `type Shape = Circle \| Sq` | RUNS |
+  | delete both the twin and the union | RUNS |
+  | annotate `const lv1: {[string]: Circle}` | RUNS |
+
+* **THE REFUSAL EXISTS AND THE TWIN ROUTES AROUND IT.** `unsupported map value type` is the
+  emitter's own statement that it has no rep for a union-member struct in a map value; with
+  an exact layout twin present it stops firing and the module is emitted anyway. Whatever
+  closes D156's peel must be graded against this control, because a peel that only widens
+  what the pin accepts will widen the hole rather than the refusal.
+* Census population: 1,154 silent cells at `cont=structfield` with the full ingredient set
+  and 404 with twin+union but no alias; the paired loud population is larger.
+
+---
+
+### D186 — a list of maps whose value is an UNDECLARED struct over a union arm
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block D · the `list_of_map` container is the census's hottest, silent in 20–45% of cells at every nominal-ingredient combination including the empty one**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    const lv1 = Map()
+    lv1["k0"] = { r: { c2: 1 } }
+    const c: {[string]: {r: Shape2}}[] = [lv1]
+    const g0 = c
+    if g0.length > 0 {
+      const g1 = (g0[0])["k0"] ?? { r: { s2: 1 } }
+      if (g1).r is Cir2 { print(7) } else { print(0) }
+    } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **THE STRUCT THAT HOLDS THE ARM IS NEVER DECLARED** — it is spelled `{r: Shape2}` inline at
+  the one annotation the program has — and DECLARING it does not help:
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | `type Circle = { r: Shape2 }` and annotate with the name | check-clean invalid wasm (does NOT rescue) |
+  | annotate `const lv1: {[string]: {r: Shape2}}` | RUNS |
+  | drop the list layer — a bare `{[string]: {r: Shape2}}` | RUNS |
+  | `i32` map values instead of the arm-holding struct | RUNS |
+
+* **THE DECLARED-NAME CONTROL IS WHAT SEPARATES IT FROM D155/D156/D184.** In those rows the
+  nominal name is the thing the pin cannot find; here supplying the name changes nothing and
+  only the INNER MAP's annotation does. Group it with D181 (the inner map of a list of maps)
+  before grouping it with the arm rows.
+* It may share a root with D179: both hold an anonymous struct whose field is a union-arm
+  value, and both are rescued by the same annotation. They are filed apart because one is a
+  compiler trap through `for-in` and the other invalid wasm through a list of maps, and no
+  measurement here ties them.
+* Census population: **the `list_of_map` container carries 3,439 of block A's 12,673 silent
+  cells (27%)** on 8.5% of its cells, the highest of the twelve containers.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
