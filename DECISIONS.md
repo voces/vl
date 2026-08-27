@@ -949,3 +949,138 @@ an instruction to define the operator *for the call's argument types*.
   alone here on purpose: the clause lives in `eqRefusals`, the ONE home, so changing it changes
   both spellings, and choosing between "implement the dispatch" and "delete the clause" is a
   language-design call rather than a rider on this one.
+
+## An ACCEPTANCE must ride the pin too, and it does not ride the same channel a refusal does
+
+**D35's rule — "a rule enforced at `vl check` and lost at monomorphization is a rule about
+spellings" — has a mirror, and the mirror needs a different layer.** `xs.indexOf(nd)` at
+`T = string | null` was `vl check` rc 0 over a module the engine refuses while the identical
+`a == b` written directly ran and was correct. Same sentence as D35, opposite sign: not a
+refusal the pin dropped, an ACCEPTANCE it dropped. (D42, #TBD)
+
+`binEqNulNiche` decides whether a `==` needs the null-guarded lowering, and it asked one
+channel: the type the CHECKER banked on the operand node. `monoCloneBody` rebuilds only an
+instance's STATEMENT SPINE and **shares every leaf expression**, so one `self[i] == needle`
+node serves every instantiation of `indexOf<T>` and the type on it is `T` however the instance
+was pinned. `eqCmpKindOfTy` answers `""` for a `TyVar`, which is correct about the type
+variable and says nothing about `string | null`.
+
+### Why the deferred constraint is the WRONG channel here
+
+D35's fix rode `noteBinCstr` / `validateBinCstrs` and placed the gate at `vl check` **because
+`vl check` is what an editor runs**. That reasoning is about a RULE. This row has no rule to
+state — the checker is right to accept, `eqRefusals` is right to stay silent, and there is
+nothing a call-site gate could say. What is missing is a LOWERING, and a lowering can only be
+chosen where the instance exists, which is emit. **The transferable form: "state the rule at
+the earliest layer that can see the instance" and "choose the lowering at the layer that emits
+it" are the same principle, and they land in different files.** Checking whether the existing
+channel fits before building one is the step, not assuming it does because the previous row's
+did.
+
+### The second channel was already written, and so was the precedent for asking it
+
+The emitter's rep classifiers — `exprNullableString`, `exprNullableRefNiche`, `exprNulClosure`,
+`exprNullableList`, `exprNulScalarListKind`, `exprNullableRefArray` — are `fnIx`-SCOPED, and a
+monomorphized instance IS its own emitted function with its own parameter kinds, so they answer
+per instance where the node cannot. `isNumRecvBaseName`, in the same file, has exactly this
+two-channel shape for an `is` receiver and its header already says why: *gating on the node's
+banked type alone cannot see an instance at all.* `binEqNulNiche` was a one-channel consumer
+that predates it. **The `*OfTy` twin was written; the question was which caller had not asked.**
+
+`eqCmpKindOfOperand` is the one home, and it is **gated on `nodeTyIsTyVar`, not on "the first
+channel said nothing"**. `eqCmpKindOfTy` answers `""` for six different reasons and five of
+them mean *the existing dispatch owns this rep and is already correct* (a literal, a literal
+union, a value-union box, the two SENTINEL-repped nullables, the error hole). Only the type
+variable means the question was never answered. A gate on the empty ANSWER rather than on its
+REASON would have wrapped a null guard around compares that already null-test correctly — the
+`fnAssignKindGuard` shape from #1938, where a "no answer" sentinel is not neutral.
+
+### Both consumers of the answer must get the channel, and the measurement says so
+
+A `==` needs two decisions: whether there is a GUARD (`binEqNulNiche`) and which CORE goes
+under it (`eqCoreKindOfBin`). A first cut wired the channel into the guard alone, and
+`i32[] | null` then reached `emitNulNicheEq` with the core selection still answering -1: eight
+`std:array` cells became a loud `emitProgram: `==` over this operand rep has no compare core`.
+Silent → loud where silent → **runs** was the win, which is the failure this row's grading is
+written to catch. Both read the one home now, which also keeps the frame-reservation scan
+(`leqNoteBin`) in agreement with the emitter by construction, as its own header requires.
+
+## A capability rule the pin states must be a rule SOMEBODY holds
+
+D35's `==` gate re-asked a question the checker already answered. **`binOpDefinedFor`'s `+` arm
+was doing something different and worse: stating a rule at the pin that existed at neither
+spelling.** "Any two arrays are a list concat" is not what the emitter does — there is exactly
+ONE concat core, `emitListConcatI`, the i32 backing — so `Circle[] + Circle[]` was
+check-clean invalid wasm through a generic, and written directly it fell past the list arm into
+the NUMERIC tail and emitted `i32.add` over two refs. (D44, #TBD)
+
+`concatRefusal` is the one home, read by `checkBinary`'s concat arm, by `binOpDefinedFor` and by
+the emitter's floor (`binConcatHasNoLowering`, the `+` twin of `binEqHasNoLowering`). Three
+things about it are worth keeping:
+
+* **Its accept set is not the `==` one, and reusing that would have removed a capability.**
+  `eqCmpKindOfArrayElem` answers "none" for a literal-union element, and
+  `("a"|"b")[] + ("a"|"b")[]` concatenates correctly today. Two operators, two boundaries, two
+  functions. The `boolean | null` / `i32 | null` pair makes the same point inside one type
+  constructor: the first is the i32 sentinel 2 and concatenates, the second is a value-union
+  BOX and does not, so "a nullable element" is not the axis.
+* **It DEFAULTS TO ACCEPT**, which is `binOpDefinedFor`'s own stated convention. Every rep it
+  refuses was RUN at both spellings first; a rep it has not measured keeps today's behaviour.
+  An over-refusing capability rule removes something a caller has.
+* **The pin's arm must mirror `checkBinary`'s ORDER, not just its answers.** `binOpDefinedFor`
+  softened literal unions before its string test and `checkBinary` softens after both the
+  string and array arms, so `T = "a"|"b"` was admitted at the pin and refused written out. Two
+  functions computing "the same" predicate in a different order are two predicates.
+
+### The false reject a capability rule widens, and the axis that hid it
+
+Tightening `+` made a **pre-existing** leak fire in a new place: a call through a bound local
+names no callee, so it adjudicates EVERY generic's constraints, and `substTyDeep` matches
+TyVars by NAME. On master, `const g = idT  g(structList)` already reports `myIndexOf`'s `==`
+refusal — a generic that compares nothing, refused for a comparison in a function it never
+calls. That is #1946's rung 2 at the one callee delivery its fix could not reach. A local bound
+to a bare Ident naming a declared function now NAMES that declaration (`fnAliasScopes`, a table
+separate from `fnDeclScopes` because a function VALUE must keep its exact-arity gate), so
+`const f = addT  f(c, c)` keeps its own true positive and only the cross-generic leak goes. A
+closure PARAMETER has no initializer to resolve and is deliberately untouched.
+
+**The 741-cell grid did not find it; a fixture did.** #1946 records that holding the CALLEE's
+delivery constant cost it a round. This grid varied the callee's delivery at five values and
+held something else constant: **every cell had ONE generic in the file.** A cross-generic leak
+is invisible to a grid with no siblings. The transferable form is one level up from #1946's —
+enumerate what the PROGRAM contains, not only what the call site says.
+
+## `==` and `!=` are NOT overloadable, and the diagnostic that asked for one is retired with it
+
+A `function "=="` declaration parsed, type-checked, and was silently discarded: `checkBinary`
+returns on the equality arm before the operator-dispatch tail and `drwDispatchOp` excludes
+`==`/`!=` at the emitter, so the structural compare ran and the program printed the answer the
+declaration was written to change. Meanwhile `eqRefusals` ended its refusal with
+`— define a `==` operator for it`. **A `vl check`-clean WRONG VALUE, with a diagnostic
+prescribing the thing that produces it.** (D46, #TBD)
+
+**Rejected rather than implemented, and the deciding measurement is who the diagnostic's
+customer is.** The clause fires on a CONTAINER — `K[]`, `Circle[]` — and a container's compare
+recurses through `emitStructEqRec`, `emitListEqRCore` and `emitListEqSCore`, three cores with
+no per-element dispatch hook, and through `isEquatable`, std's four `needle: T` exports and the
+map key. Honouring the top-level struct case alone would leave the message still prescribing
+something inert one container deep, and would create a NEW silent class: a user `==` that some
+consumers honour and others do not. **A half-implemented dispatch is worse than none, because
+the half that works is what makes the reader trust the half that does not.**
+
+Two rules follow, and the second is the one that makes this a close rather than a move:
+
+* the reject lives in the PARSER, at `parseFuncHead`, because that is where the symbol-token
+  spelling (`function ==(…)`) and the quoted one (`function "=="(…)`) converge on one `name` —
+  one home, four spellings with `!=`;
+* **the diagnostic changed in the same commit.** `— define a `==` operator for it` became
+  `— compare a projection whose components are`. Leaving the old clause beside the new reject
+  would be strictly worse than the state the row was filed against: a message recommending a
+  declaration the compiler now refuses. **A prescription and its implementation are one
+  change.**
+
+Nothing in the tree declares a `==` or `!=` operator function, so the reject costs no
+capability. The 12 grid cells it moves `runs → loud check` are an `i32` comparison beside an
+inert declaration: the answer was right, and it was right only because the declaration did
+nothing.
+

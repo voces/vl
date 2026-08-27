@@ -1,5 +1,6 @@
 import {
   EqCmpKind,
+  concatRefusal,
   flattenVariantsInto,
   fsArgIsU8List,
   fsIntrinsicArity,
@@ -471,6 +472,7 @@ import {
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
   envSlotShift,
+  eqCmpKindOfOperand,
   eqCoreKindOfBin,
   exprArray,
   exprF32Array,
@@ -9937,15 +9939,32 @@ function eqKindIsNulNiche(k: EqCmpKind) {
 //
 // A bare `null` operand is excluded — `x == null` is the null TEST, not a value compare, and
 // `emitNulIsNullTest` owns it further down this same dispatch.
-function binEqNulNiche(binIx: i32): EqCmpKind {
+//
+// TWO CHANNELS, AND THE SECOND IS THE INSTANCE'S. A node whose banked type is a TYPE VARIABLE
+// has no answer on the first channel and cannot get one: `monoCloneBody` shares every leaf
+// expression across an instance's siblings, so one `self[i] == needle` node serves every
+// instantiation of `indexOf<T>` and the type on it is `T` however it was pinned. That is D35's
+// sentence one layer down — an answer that is merely true of a `TyVar` is not an answer about
+// the instance — and it left `T = string | null` lowering its compare through the plain string
+// path, feeding a `(ref null $array)` into the core's `(ref $array)` slot: `vl check` rc 0,
+// module refused at load. `exprNulNicheKind` is the emitter's OWN `fnIx`-scoped name for the
+// same six niches, and a monomorphized instance is its own function with its own parameter
+// kinds, so it answers per instance. (`silent-class-inventory` D42.)
+//
+// GATED ON `nodeTyIsTyVar`, NOT ON "the first channel said nothing". The five other reasons
+// `eqCmpKindOfTy` answers "" — a literal, a literal union, a value-union box, the two
+// SENTINEL-repped nullables, the error hole — all mean "the existing dispatch owns this rep and
+// is already correct", and claiming them here would wrap a guard around a compare that already
+// null-tests correctly. Only the type variable means the question was never answered.
+function binEqNulNiche(binIx: i32, fnIx: i32): EqCmpKind {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
       if P.nodes[unwrapParen(e.binLeft)] is NullLit { return "" }
       if P.nodes[unwrapParen(e.binRight)] is NullLit { return "" }
-      const lk = nodeEqCmpKind(e.binLeft)
+      const lk = eqCmpKindOfOperand(e.binLeft, fnIx)
       if eqKindIsNulNiche(lk) { return lk }
-      const rk = nodeEqCmpKind(e.binRight)
+      const rk = eqCmpKindOfOperand(e.binRight, fnIx)
       if eqKindIsNulNiche(rk) { return rk }
     }
   }
@@ -9963,6 +9982,26 @@ function binEqHasNoLowering(binIx: i32) {
     if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
     return nodeEqCmpKind(e.binLeft) == "none" ||
       nodeEqCmpKind(e.binRight) == "none"
+  }
+  false
+}
+
+// The `+` twin of `binEqHasNoLowering`: TRUE when a LIST concat's element rep has no concat
+// core. The checker rejects these off the same one home (`concatRefusal`), so this is the
+// FLOOR — unreachable from accepted source, and the difference between a loud `emitProgram:`
+// failure and the numeric tail emitting `i32.add` over two refs, which is what every element
+// rep `listOpKindOfBin` does not claim used to do. (`silent-class-inventory` D44.)
+//
+// READ OFF THE CHECKER'S BANKED TYPES, and it is right that the type-variable gate D42 needed
+// is absent here: a monomorphized `a + b` has been adjudicated at the CALL SITE by
+// `binOpDefinedFor`, which reads this same home under the SUBSTITUTED types. The floor exists
+// for a spelling that reached emit without passing either, not as a second pin.
+function binConcatHasNoLowering(binIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp != "+" { return false }
+    return concatRefusal("+", nodeTyIxOf(e.binLeft), nodeTyIxOf(e.binRight)) !=
+      ""
   }
   false
 }
@@ -19111,7 +19150,7 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           "` over this operand rep has no lowering",
       )
     }
-    const nulNiche = binEqNulNiche(exprIx)
+    const nulNiche = binEqNulNiche(exprIx, fnIx)
     if nulNiche != "" {
       if emitNulNicheEq(body, exprIx, fnIx, nulNiche) < 0 { return -1 }
       if e.binOp == "!=" {
@@ -19119,6 +19158,13 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       }
       return 0
     }
+  }
+  // The `+` half of the same floor: a list concat whose element rep has no core. Above the
+  // string/list dispatch below for the reason its `==` twin is — every classifier there reads
+  // an operand by a rep it may not have — and above the NUMERIC tail, which is what a list the
+  // classifiers do not claim used to reach.
+  if binConcatHasNoLowering(exprIx) {
+    return emitFail("emitProgram: `+` over this operand rep has no lowering")
   }
   // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
   // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity

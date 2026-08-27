@@ -782,6 +782,26 @@ let constScopes: {[string]: boolean}[] = []
 // is unchanged, exactly like `constScopes`.
 let fnDeclScopes: {[string]: i32}[] = []
 
+// The function-ALIAS chain, PARALLEL to `T.scopes` and to the two above: each frame records,
+// for a binding whose initializer is a BARE IDENT naming a declared function (`const f = addT`),
+// the arena node of that declaration. `fnDeclScopes` deliberately answers -1 for such a name —
+// a local that shadows or wraps a function is a function VALUE, and the call must keep the
+// exact-arity gate a value call has — so this is a SECOND question about the same name and
+// gets its own table rather than loosening that one.
+//
+// IT HAS EXACTLY ONE CONSUMER: deferred-constraint OWNERSHIP (`cstrOwnedBy`). A call site that
+// cannot NAME its callee consults EVERY generic's constraints, and `substTyDeep` matches TyVars
+// by name, so `const g = idT  g(structList)` reported `myIndexOf`'s `==` refusal — a generic
+// that compares nothing, refused for a comparison in a function it never calls. That is the
+// same false reject #1946 removed for a DECLARED callee, at the one delivery its fix could not
+// see, and it is why a `const f = addT` still adjudicates `addT`'s own constraint: the alias
+// resolves, so the true positive keeps firing and only the cross-generic leak goes.
+//
+// A CLOSURE PARAMETER IS DELIBERATELY NOT HERE. `f` inside a HOF has no initializer to resolve,
+// so it stays unnamed and keeps consulting everything — which is what the HOF case needs, and
+// what #1946's header records as the reason the enclosing-body rule was reverted.
+let fnAliasScopes: {[string]: i32}[] = []
+
 // UN-INFERRED EMPTY-COLLECTION FLOOR (mirrors the host's `reportUninferredBinding`
 // in `compiler/typecheck.ts`): an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream
@@ -2957,6 +2977,8 @@ export function initChecker() {
   constScopes.push(Map())
   fnDeclScopes = []
   fnDeclScopes.push(Map())
+  fnAliasScopes = []
+  fnAliasScopes.push(Map())
   pendNames = []
   pendTys = []
   pendAts = []
@@ -5510,6 +5532,7 @@ function pushScope(owner: i32) {
   T.scopes.push(Map())
   constScopes.push(Map())
   fnDeclScopes.push(Map())
+  fnAliasScopes.push(Map())
   npFrames.push(npKeys.length)
   asgDeclFrames.push(asgDeclKeys.length)
   if symEnabled != 0 {
@@ -5527,6 +5550,7 @@ function popScope() {
   T.scopes.pop()
   constScopes.pop()
   fnDeclScopes.pop()
+  fnAliasScopes.pop()
   if npFrames.length > 0 {
     const base = npFrames[npFrames.length - 1]
     npFrames.pop()
@@ -6090,6 +6114,21 @@ function declareFnDeclNode(name: string, nodeIx: i32) {
   const top = fnDeclScopes.length - 1
   if top >= 0 { fnDeclScopes[top][name] = nodeIx }
   0
+}
+
+// The declaration a BINDING of `name` aliases, or -1 — `fnAliasScopes` read under the scope
+// chain's own shadowing rule, exactly like `isConstName` and `lookupFnDeclNode`. Its ONE
+// consumer is deferred-constraint ownership; see the table's header for why it is separate.
+function lookupFnAliasNode(name: string) {
+  let i = T.scopes.length - 1
+  while i >= 0 {
+    if T.scopes[i].has(name) {
+      if i < fnAliasScopes.length { return fnAliasScopes[i][name] ?? -1 }
+      return -1
+    }
+    i = i - 1
+  }
+  -1
 }
 
 // The `FuncDecl` node `name` currently resolves to, or -1 when it resolves to
@@ -14142,9 +14181,18 @@ export function eqRefusals(
     if isStruct {
       const seen: i32[] = []
       if !isEquatable(lt, seen) {
+        // THE REMEDY CLAUSE NAMES SOMETHING THAT EXISTS. It used to read "— define a `==`
+        // operator for it", and doing exactly that changed nothing: the declaration parsed,
+        // type-checked and was discarded, so the same two errors came back and a struct with
+        // one printed the structural compare's answer. A diagnostic prescribing an
+        // unimplemented remedy is the loud-message counterpart of this file's silent classes.
+        // `==` is now REFUSED at the declaration (`parser.vl`'s `parseFuncHead`), and the two
+        // sentences have to agree or the trap has only moved. What replaces it is the idiom
+        // `std/array.vl` already prescribes for the same shape: compare a projection whose
+        // components ARE value-comparable. (`silent-class-inventory` D46.)
         msgs.push(
           tyToStr(lt) +
-            " isn't equatable (a field is not value-comparable) — define a `==` operator for it",
+            " isn't equatable (a field is not value-comparable) — compare a projection whose components are",
         )
         unsup.push(0)
       }
@@ -14163,6 +14211,105 @@ export function eqRefusals(
     }
   }
   0
+}
+
+// ── THE ONE HOME for "may these two LISTS be `+`-concatenated" — the `+` twin of the
+//    `==` home one function up ──────────────────────────────────────────────────────────
+//
+// `a + b` over two lists is `emitListConcatI` AND NOTHING ELSE. `listOpKindOfBin` names three
+// list kinds and the emitter's `+` arm refuses two of them outright; every element rep that
+// classifier does not claim at all — an f64/f32/i64/u8 list, a struct list, a map list, a
+// closure list, a boxed-nullable list — falls PAST the list arm into the numeric tail and emits
+// `i32.add` over two refs. Check-clean INVALID WASM, never a diagnostic.
+//
+// So `binOpDefinedFor`'s `+` arm ("any two arrays are a list concat") was not a rule the
+// checker held and the pin dropped — it was a rule NOBODY held, stated at the pin as though
+// somebody did. `a + b` at `T = Circle[]` spelled out is a loud emit reject and through
+// `addT<T>` is check-clean invalid wasm: one decision, two severities, chosen by the spelling.
+// (`silent-class-inventory` D44.)
+//
+// THE ACCEPT SET IS THE i32 BACKING, and it is measured rather than derived — the two
+// SENTINEL-repped nullables (`boolean | null` rides the i32 value 2, `K | null` the value -1)
+// and a pure literal union (interned atom ids are i32) are i32 lists as much as `i32[]` is,
+// while `i32 | null` is a value-union BOX and is not. `eqCmpKindOfArrayElem` is NOT that set —
+// it answers "none" for a literal-union element, and a `("a"|"b")[] + ("a"|"b")[]` concatenates
+// correctly today — so the `==` boundary cannot stand in for this one and the two are written
+// out separately.
+//
+// DEFAULTS TO ACCEPT, deliberately. A rep this predicate has not measured keeps today's
+// behaviour, which is `binOpDefinedFor`'s own stated convention: a rule that over-refuses
+// removes a capability, and every rep it does refuse below was RUN at both spellings first.
+function concatElemIsI32Backed(elem: i32, depth: i32): boolean {
+  if depth > 4 { return true }
+  if elem < 0 {
+    return true // an un-pinned `[]` takes the i32 backing
+  }
+  const e = T.tys[nomErasedTyIx(elem)]
+  if e is TyVar {
+    return true // still a hole — the call that pins it asks again
+  }
+  if e is TyErr { return true }
+  if e is TyLit { return true }
+  if e is TyPrim { return e.primName == "i32" || e.primName == "boolean" }
+  if e is TyNullable {
+    // ONLY THE SENTINEL NULLABLES stay i32. A `boolean | null` is the i32 value 2 and a
+    // `K | null` the atom id -1; every other nullable is a `(ref null …)` niche or a box.
+    const inner = T.tys[nomErasedTyIx(e.nInner)]
+    if inner is TyPrim { return inner.primName == "boolean" }
+    if inner is TyUnion { return tyUnionAllLits(e.nInner) }
+    return false
+  }
+  if e is TyUnion { return tyUnionAllLits(nomErasedTyIx(elem)) }
+  false
+}
+
+// Every member of the union at `ty` is a LITERAL (or the `null` type) — the interned-atom /
+// scalar-literal family whose storage is one i32. `tyIsLitUnion` is the STRING-only twin and
+// cannot stand in: `type N = 1 | 2` concatenates exactly as `type K = "a" | "b"` does.
+function tyUnionAllLits(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return false }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      let ok = false
+      if m is TyLit { ok = true }
+      if isNullTy(t.uMembers[i]) { ok = true }
+      if !ok { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// The refusal for a list `+` whose element rep has no concat core, or "" when it has one.
+// ONE HOME, read by `checkBinary`'s concat arm AND by the monomorphization pin
+// (`binOpDefinedFor`) AND — as the emitter's floor — by `binConcatHasNoLowering`, so the three
+// cannot answer with three severities. The sentence is `eqRefusals`' verbatim, with the
+// operator substituted, which is what keeps the `==` and `+` rules greppable as one shape.
+export function concatRefusal(op: string, lt: i32, rt: i32) {
+  // BOUND-CHECKED BEFORE THE ARENA READ, because one of the three callers hands it an index
+  // that is DOCUMENTED to be absent: `binConcatHasNoLowering` reads `nodeTyIxOf`, which answers
+  // -1 for a node the checker banked nothing on. `T.tys[-1]` is not a null answer, it is an
+  // out-of-bounds array access — a COMPILER TRAP with no diagnostic, which is what nine corpus
+  // fixtures with no `+` in them reported the first time this shipped.
+  if (lt < 0 || rt < 0) { return "" }
+  const lA = T.tys[lt]
+  if lA is TyArray {
+    const rA = T.tys[rt]
+    if rA is TyArray {
+      if !concatElemIsI32Backed(lA.aElem, 0) {
+        return "`" + op + "` over " + tyToStr(lt) + " has no lowering"
+      }
+      if !concatElemIsI32Backed(rA.aElem, 0) {
+        return "`" + op + "` over " + tyToStr(rt) + " has no lowering"
+      }
+    }
+  }
+  ""
 }
 
 // ── structural assignability: is `src` assignable to `dst`? ──────────────────
@@ -15495,15 +15642,24 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     eqRefusals(op, lt, rt, true, pinMsgs, pinChan)
     return pinMsgs.length == 0
   }
-  const lArr = T.tys[lt]
-  const rArr = T.tys[rt]
   if op == "+" {
-    if isStringTy(lt) && isStringTy(rt) {
+    // THE UNSOFTENED TYPES, because `checkBinary`'s `+` arm softens AFTER its string and array
+    // arms and this one softened BEFORE them. A literal union is `string`/`i32` once softened,
+    // so `T = "a" | "b"` reached the string-concat arm here and was accepted at the pin while
+    // the direct spelling — which reaches its own softening only after string concat and list
+    // concat have both declined — reports `operator '+' is not defined for string and string`.
+    // Mirroring the order is the whole of that half of D44. (The ordering comparisons and the
+    // remaining arithmetic below DO soften first, exactly as `checkBinary` does.)
+    if isStringTy(lt0) && isStringTy(rt0) {
       return true // string concat
     }
-    if lArr is TyArray {
-      if rArr is TyArray {
-        return true // list concat (element agreement checked in the body)
+    const lArr0 = T.tys[lt0]
+    if lArr0 is TyArray {
+      const rArr0 = T.tys[rt0]
+      if rArr0 is TyArray {
+        // Element agreement is `checkBinary`'s (`cannot concat X and Y`); the LOWERING is this
+        // one home's, and the pin states it because there is no later stage that will.
+        return concatRefusal(op, lt0, rt0) == ""
       }
     }
     return isNumeric(lt) && isNumeric(rt)
@@ -15985,23 +16141,47 @@ function validateBinCstrs(
           // in the bare sentence says why the callee's type parameter is being discussed.
           // The generic sentence below can take ` (the call's argument types)` as a SUFFIX
           // because it ends on the two types; the equatability one ends on a REMEDY CLAUSE
-          // (`— define a `==` operator for it`), and a suffix after that reads as if the
-          // operator should be defined FOR the call's argument types. Prefixing keeps the
-          // remedy clause terminal and leaves the refusal sentence byte-identical to the
-          // direct spelling's, which is what makes the two greppable as one rule.
+          // (`— compare a projection whose components are`), and a suffix after that reads as
+          // an instruction about the CALL'S argument types rather than about the operand's
+          // components. Prefixing keeps the remedy clause terminal and leaves the refusal
+          // sentence byte-identical to the direct spelling's, which is what makes the two
+          // greppable as one rule. (The clause used to read `— define a `==` operator for
+          // it`; that prescribed a declaration the compiler silently ignored, so both were
+          // retired in one change — `silent-class-inventory` D46. The PLACEMENT argument is
+          // unchanged by the rewording, which is why it survived it.)
+          //
+          // THE `+` ARM IS THE SAME SENTENCE ONE OPERATOR OVER, off its own one home
+          // (`concatRefusal`). Its element boundary is not the `==` one — a literal-union list
+          // concatenates and does not compare — so the two questions are two functions, but
+          // the SHAPE is identical: state the direct spelling's refusal verbatim, prefixed
+          // with who is asking. Only the verb changes. (`silent-class-inventory` D44.)
           const pMsgs: string[] = []
           const pChan: i32[] = []
+          let pVerb = "compares"
+          let pVerbEd = "compared"
           if binCstrOp[ci] == "==" || binCstrOp[ci] == "!=" {
             eqRefusals(binCstrOp[ci], clt, crt, true, pMsgs, pChan)
+          } else if binCstrOp[ci] == "+" {
+            const cMsg = concatRefusal(binCstrOp[ci], clt, crt)
+            if cMsg != "" {
+              pVerb = "concatenates"
+              pVerbEd = "concatenated"
+              pMsgs.push(cMsg)
+              pChan.push(1)
+            }
           }
           if pMsgs.length > 0 {
-            let pWho = "a type parameter is compared with `" +
+            let pWho = "a type parameter is " +
+              pVerbEd +
+              " with `" +
               binCstrOp[ci] +
               "` here: "
             if who != "" {
               pWho = "`" +
                 who +
-                "` compares its type parameter with `" +
+                "` " +
+                pVerb +
+                " its type parameter with `" +
                 binCstrOp[ci] +
                 "` here: "
             }
@@ -18293,6 +18473,16 @@ function checkCallNode(n: Call, ix: i32) {
       let cstrWho = ""
       if cfn is Ident {
         cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+        // A LOCAL BOUND TO A DECLARED GENERIC NAMES THAT DECLARATION. Without this rung the
+        // call falls to `CSTR_NODECL` and adjudicates every generic in the program, and
+        // `substTyDeep` matches TyVars by NAME — so `const g = idT  g(structList)` reported a
+        // sibling's `==` refusal. Same false reject #1946 removed for the direct spelling, at
+        // the delivery its grid held constant; `const f = addT  f(c, c)` keeps its own true
+        // positive because the alias resolves to `addT`.
+        if cstrCallee == CSTR_NODECL {
+          const aliasIx = lookupFnAliasNode(cfn.identName)
+          if aliasIx >= 0 { cstrCallee = aliasIx }
+        }
         cstrWho = cfn.identName
       }
       validateBinCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
@@ -24597,6 +24787,24 @@ export function nodeTyIsNulString(ix: i32) {
   }
   false
 }
+// STRUCTURAL: node `ix`'s recorded type IS A TYPE VARIABLE — an annotated generic parameter
+// (`needle: T`) or the derived hole an un-annotated parameter gets.
+//
+// WHY THE EMITTER ASKS THIS. `eqCmpKindOfTy` answers "" for a `TyVar` and for five other
+// reasons (a literal, a value-union box, the error hole, …), and the five mean "this rep does
+// not decide the compare — the existing dispatch keeps it" while the `TyVar` means "there is
+// nothing here to decide it with". Inside a MONOMORPHIZED instance the operand nodes are
+// SHARED with the generic template (`monoCloneBody` rebuilds only the statement spine), so the
+// banked type is still `T` and the answer is correct about the type VARIABLE and useless about
+// the instance — D35's sentence, one layer down. This predicate is what lets a consumer tell
+// the two apart and ask its own `fnIx`-scoped channel instead. (`silent-class-inventory` D42.)
+export function nodeTyIsTyVar(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  false
+}
 // STRUCTURAL: node `ix`'s type is `boolean | null` (the i32 sentinel-2 niche) — a
 // `TyNullable` whose inner is the `boolean` prim. Lets `exprNulBool` recover the niche
 // from the checker's recorded type for an expression whose syntactic form it can't trace
@@ -28270,6 +28478,15 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
       if rta is TyArray {
         constrainEmpty(rt, lt)
         constrainEmpty(lt, rt)
+        // THE EMITTER-CAPABILITY GATE, off the ONE home the pin also reads. There is exactly
+        // one concat core and it is the i32 backing; every other element rep used to reach
+        // either a loud `emitProgram:` reject or — for the reps `listOpKindOfBin` does not
+        // claim at all — the numeric tail, emitting `i32.add` over two refs. (D44.)
+        const cMsg = concatRefusal(op, lt, rt)
+        if cMsg != "" {
+          tErrUnsupported(cMsg, ix)
+          return TY_ERR
+        }
         if assignable(rt, lt) { return lt }
         if assignable(lt, rt) { return rt }
         tErr("cannot concat " + tyToStr(lt) + " and " + tyToStr(rt), ix)
@@ -28622,6 +28839,21 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // lambda never runs. A PARAMETER of that name is untouched — it is never a callee.
   checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
+  // `const f = addT` — record which DECLARATION this binding aliases, for deferred-constraint
+  // ownership alone (`fnAliasScopes`' header). A bare Ident initializer that names a declared
+  // function is the whole rung: anything else (a lambda, a call result, a field read) leaves
+  // the binding unnamed, which is the answer the closure-parameter case needs.
+  if n.letInit >= 0 {
+    const aInit = P.nodes[n.letInit]
+    if aInit is Ident {
+      const aDecl = fnDeclIx[aInit.identName] ??
+        lookupFnDeclNode(aInit.identName)
+      if aDecl >= 0 {
+        const atop = fnAliasScopes.length - 1
+        if atop >= 0 { fnAliasScopes[atop][n.letName] = aDecl }
+      }
+    }
+  }
   if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
   if n.letKw == "const" {
     const ctop = constScopes.length - 1

@@ -4050,8 +4050,10 @@ Repro:
 
 ---
 
-### D42 — a `needle: T` the checker WILL `==` loses that ACCEPTANCE in the instantiation
-**check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (96 cells, the largest of three residue families) · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO struct, NO layout twin, NO hand-written generic needed (though every route reproduces)**
+### D42 — [CLOSED 2026-08-26] a `needle: T` the checker WILL `==` loses that ACCEPTANCE in the instantiation
+**CLOSED 2026-08-26 — the repro now RUNS and prints the right index (`1`). Was: check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (96 cells, the largest of three residue families) · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO struct, NO layout twin, NO hand-written generic needed (though every route reproduces)**
+
+**THE DIRECTION THAT COUNTS AS A WIN HERE IS `runs`, NOT LOUD**, and it is worth saying before the mechanism because the neighbouring row's win is the opposite. D42 is an ACCEPTANCE lost; a fix that made these cells loud would be D35's over-broad twin, which is already filed as **D45**. The close is graded against `runs`: 16 of the grid's cells moved `check-clean invalid wasm → runs`, none of this family moved to a refusal.
 
 Repro:
 
@@ -4116,6 +4118,64 @@ Repro:
   discriminated before it can be searched for at all. Unlike D35's, this remedy DOES expire —
   the direct compare works, so the pin is expected to grow the same rep one day.
 
+#### The close
+
+**WHERE THE ACCEPTANCE WAS LOST, exactly, and why it is NOT where D35's refusal was.**
+`binEqNulNiche` decides whether a `==` needs the null-guarded lowering, and it asked ONE
+channel: `nodeEqCmpKind`, the type the CHECKER banked on the operand node. `monoCloneBody`
+rebuilds only the STATEMENT SPINE of an instance and SHARES every leaf expression, so one
+`self[i] == needle` node serves every instantiation of `indexOf<T>` and the type on it is `T`
+however the instance was pinned. `eqCmpKindOfTy` answers `""` for a `TyVar` — correct about the
+type variable, silent about `string | null` — the guard was skipped, and the plain string
+compare fed a `(ref null $array)` into a `(ref $array)` slot.
+
+**SO THE DEFERRED CONSTRAINT IS THE WRONG CHANNEL HERE, and that was worth checking rather than
+assuming.** D35's fix rode `noteBinCstr` / `validateBinCstrs` because it had a REFUSAL to carry
+to the call site. This row has no refusal — the checker is right to accept — so there is nothing
+for `eqRefusals` to say and nothing for a `vl check` gate to state. The answer has to arrive at
+EMIT, where the instance exists. **D35's "place the gate at `vl check`, not `emit_mono`" holds
+for a RULE; it does not apply to a LOWERING.**
+
+**THE SECOND CHANNEL WAS ALREADY WRITTEN, AND SO WAS THE PRECEDENT FOR ASKING IT.**
+`exprNullableString`, `exprNullableRefNiche`, `exprNulClosure`, `exprNullableList`,
+`exprNulScalarListKind` and `exprNullableRefArray` are the emitter's own rep classifiers, all
+`fnIx`-SCOPED — and a monomorphized instance IS its own emitted function with its own parameter
+kinds, so they answer per instance where the node cannot. `isNumRecvBaseName` in the same file
+has EXACTLY this two-channel shape for an `is` receiver, and its header already says why:
+"gating on the node's banked type alone cannot see an instance at all". `binEqNulNiche` was a
+one-channel consumer that predates it.
+
+**THREE RUNGS.**
+
+1. `exprNulNicheKind` — the emitter's own name for the six niches, `eqCmpKindOfNulInner`'s six
+   tokens read off the classifiers instead of off the arena. Exactly the six whose NON-NULL core
+   exists, because that is the contract `emitNulNicheEq` is written against.
+2. `eqCmpKindOfOperand` — ONE HOME asking the banked type first and the classifiers second,
+   **gated on `nodeTyIsTyVar` rather than on "the first channel said nothing"**. The five other
+   reasons `eqCmpKindOfTy` answers `""` (a literal, a literal union, a value-union box, the two
+   SENTINEL-repped nullables, the error hole) all mean "the existing dispatch owns this rep and
+   is already correct", and claiming them would wrap a guard around a compare that already
+   null-tests correctly. Only the type variable means the question was never answered.
+3. **BOTH CONSUMERS ASK IT, and a first cut that gave the channel only to the GUARD is the
+   measurement that says so.** `binEqNulNiche` decides whether there is a guard;
+   `eqCoreKindOfBin` decides which CORE goes under it. With the channel on the guard alone,
+   `i32[] | null` reached `emitNulNicheEq` with the core selection still answering -1 and the
+   eight std cells became ``emitProgram: `==` over this operand rep has no compare core`` —
+   silent → loud instead of silent → runs. Wiring the same home into the core selection also
+   keeps the frame-reservation scan (`leqNoteBin`, which reads `eqCoreKindOfBin`) in agreement
+   with the emitter by construction, which its own header requires.
+
+**THE MEASUREMENT.** The `std:array` half of the grid — `T` over the rep vocabulary x all four
+`needle: T` exports x receiver delivery — moves **16 cells `check-clean invalid wasm -> runs`**,
+every one correct against a hand-computed answer: eight `string | null` and eight `i32[] | null`,
+across `indexOf` / `lastIndexOf` / `includes` / `count` and both a bound and a call-result
+receiver. `i32 | null` and `Circle | null` stay LOUD EMIT at every route, unchanged and honest —
+they are a BOX and a struct-eq shape, not niches with cores. **No cell of this family moved to a
+refusal**, which is the grading this row requires.
+
+Fixture: `tests/cases/std/array-needle-nullable-niche.vl` (both niches, all four exports, a
+hand-written generic off std's surface, and the direct control).
+
 ---
 
 ### D43 — a type ALIAS for a LIST OF STRUCT is opaque: neither assignable from its own body nor a list
@@ -4151,8 +4211,10 @@ Repro:
 
 ---
 
-### D44 — the SAME lost refusal one operator over: a `+` the checker will not lower survives the pin
-**check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (6 cells, its `+` control column) · pre-existing, byte-identical on `f2064bec` and on D35's branch · deliberately OUT OF SCOPE for D35, whose gate covers `==`/`!=` only**
+### D44 — [CLOSED 2026-08-26] the SAME lost refusal one operator over: a `+` the checker will not lower survives the pin
+**CLOSED 2026-08-26 — the repro is NOW A LOUD CHECK REJECT (`` `addT` concatenates its type parameter with `+` here: `+` over Circle[] has no lowering ``), and so is the direct spelling. Was: check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (6 cells, its `+` control column) · pre-existing, byte-identical on `f2064bec` and on D35's branch · deliberately OUT OF SCOPE for D35, whose gate covers `==`/`!=` only**
+
+**THE DIRECTION THAT COUNTS AS A WIN HERE IS `silent → loud`** — the opposite of D42's, one row up, and the two shipped together. This is a REFUSAL lost, so a running cell would be the failure.
 
 Repro:
 
@@ -4199,6 +4261,78 @@ Repro:
   union softens before the operator arm sees it. That is a diagnostic-quality note, not a
   second defect, and it is recorded so a future reader does not chase it as one.
 
+#### The close
+
+**TWO ROOTS, AND THE ELEMENT TYPE IS WHAT DISCRIMINATED THEM.** A literal union goes through the
+first, a list element through the second, and neither fix reaches the other's cells.
+
+**ROOT ONE — THE PIN SOFTENED BEFORE ITS STRING ARM AND `checkBinary` SOFTENS AFTER.**
+`binOpDefinedFor` ran `softenLitTy` on both operands and THEN asked `isStringTy`, so at
+`T = "a" | "b"` it saw two `string`s and admitted a concat, while the direct spelling reaches its
+own softening only after string concat and list concat have both declined. One decision, two
+severities, chosen by the spelling — and the pin's was the permissive one, over a module the
+engine refuses. The `+` arm now uses the UNSOFTENED types for its string and array tests and the
+softened ones for the numeric tail, which is `checkBinary`'s order exactly. The ordering
+comparisons and the remaining arithmetic soften first, as they already did and as `checkBinary`
+does.
+
+**ROOT TWO — "ANY TWO ARRAYS ARE A LIST CONCAT" WAS A RULE NOBODY HELD, not a rule the pin
+dropped.** There is exactly ONE concat core, `emitListConcatI`, the i32 backing.
+`listOpKindOfBin` names three list kinds and the emitter's `+` arm refuses two of them outright;
+every element rep that classifier does not claim at all fell PAST the list arm into the NUMERIC
+tail and emitted `i32.add` over two refs. So this half is worse than D35's shape: the refusal
+existed at NEITHER spelling for the reps that mattered, and the pin stated its absence as though
+somebody held it.
+
+`concatRefusal` is the one home, read by `checkBinary`'s concat arm, by `binOpDefinedFor` and by
+the emitter's floor (`binConcatHasNoLowering`, the `+` twin of `binEqHasNoLowering`).
+
+**THE ACCEPT SET IS THE i32 BACKING, AND IT WAS MEASURED RATHER THAN DERIVED.**
+`eqCmpKindOfArrayElem` is NOT that set and cannot stand in for it — it answers "none" for a
+literal-union element, and `("a"|"b")[] + ("a"|"b")[]` concatenates correctly today. Every
+element rep below was RUN at both spellings before the rule was written:
+
+| element | direct, master | through `addT<T>`, master | both, branch |
+|---|---|---|---|
+| `i32`, `boolean` | runs | runs | **runs (unchanged)** |
+| `K = "a"\|"b"`, `N = 1\|2` | runs | runs | **runs (unchanged)** |
+| `Id = new i32` | runs | runs | **runs (unchanged)** |
+| `boolean \| null`, `K \| null` (i32 SENTINELS) | runs | runs | **runs (unchanged)** |
+| `Circle` | loud emit | **invalid wasm** | loud check |
+| `{[string]: i32}` | loud emit | **invalid wasm** | loud check |
+| `string[]` | loud emit | **invalid wasm** | loud check |
+| `f64`, `f32`, `i64` | **invalid wasm** | **invalid wasm** | loud check |
+| `u8` | **invalid wasm** | loud emit | loud check |
+| `string`, `i32[]`, `new string` | loud emit | loud emit | loud check |
+| closure, struct union, `i32 \| null`, `f64 \| null`, `Circle \| null`, `i32[] \| null` | loud emit / invalid wasm | loud emit / invalid wasm | loud check |
+
+Note the `i32 | null` / `boolean | null` split: the first is a value-union BOX and the second the
+i32 value 2, so "a nullable element" is not the axis and a rule written on it would have removed
+a working capability. **The predicate DEFAULTS TO ACCEPT** — a rep it has not measured keeps
+today's behaviour, which is `binOpDefinedFor`'s own stated convention. The one row it leaves
+alone deliberately is `"x" | 7`, a MIXED literal union: loud at both spellings today, so refusing
+it would buy nothing and mis-stating it could cost something.
+
+**THE MEASUREMENT.** In the 741-cell grid, **19 cells move `check-clean invalid wasm -> loud
+check reject`** and **12 `loud emit -> loud check`** (the same refusal one stage earlier). The
+row's own 6 cells are inside the first number. Nothing in this family moved toward `runs`, which
+is the grading this row requires — the opposite of D42's, one row up.
+
+**A LEAK THIS GATE WOULD HAVE WIDENED, FOUND BY A FIXTURE AND NOT BY THE GRID, AND CLOSED WITH
+IT.** `error-deferred-constraint-true-positives.vl` began reporting `addT`'s `+` refusal at a
+call to `myIndexOf` through a bound local. A call site that cannot NAME its callee consults EVERY
+generic's constraints and `substTyDeep` matches TyVars by NAME, so the leak is #1946's rung 2 at
+the one callee delivery its fix could not reach — and it is **pre-existing**: on master,
+`const g = idT  g(structList)` already reports `myIndexOf`'s `==` refusal, for a generic that
+compares nothing. A local bound to a bare Ident naming a declared function now NAMES that
+declaration (`fnAliasScopes`), so `const f = addT  f(c, c)` keeps its own true positive and the
+cross-generic leak goes. **The grid missed it because every cell had ONE generic in the file** —
+the same axis-holding mistake #1946 records for the callee's delivery, one level up: enumerate
+the SIBLINGS as well as the deliveries.
+
+Fixture: `tests/cases/generics/error-list-concat-no-core.vl` (four element reps at both
+spellings, plus the literal-union pair that separates the two roots).
+
 ---
 
 ### D45 — `isEquatable` refuses a LITERAL-UNION element although that element compares correctly
@@ -4216,8 +4350,12 @@ Repro:
 
     print(cell())
     // vl check rc 1, TWO errors:
-    //   K[] isn't equatable (a field is not value-comparable) — define a `==` operator for it
+    //   K[] isn't equatable (a field is not value-comparable) — compare a projection whose
+    //     components are
     //   `==` over K[] has no lowering
+    // (The remedy clause read "— define a `==` operator for it" when this row was filed. It
+    //  prescribed a declaration the compiler silently ignored and was retired with D46 on
+    //  2026-08-26; the refusal itself — which is what THIS row is about — is unchanged.)
 
 * **THE FIRST SENTENCE IS FACTUALLY WRONG ABOUT THE FIELD, and that is the row.** `isEquatable`
   answers false for a `TyUnion`, so a list whose element is a literal union is "not
@@ -4244,8 +4382,10 @@ Repro:
 
 ---
 
-### D46 — a `function "=="` declaration parses, type-checks, and is SILENTLY IGNORED — and a diagnostic tells you to write one
-**check-clean SILENTLY WRONG VALUE · found 2026-08-26 by the `std-api-reviewer` pass over D35's retirement · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO generic, NO import, six lines**
+### D46 — [CLOSED 2026-08-26] a `function "=="` declaration parses, type-checks, and is SILENTLY IGNORED — and a diagnostic tells you to write one
+**CLOSED 2026-08-26 — the declaration is now a loud check reject, raised at the PARSE stage so `vl check` reports it as `(parse error)` (`` `==` is not overloadable — every type compares structurally, and a `function "=="` declaration would be ignored ``) at all four spellings, and the diagnostic that recommended writing one no longer does. Was: check-clean SILENTLY WRONG VALUE · found 2026-08-26 by the `std-api-reviewer` pass over D35's retirement · pre-existing, byte-identical on `f2064bec` and on D35's branch · NO generic, NO import, six lines**
+
+**THE DECISION IS REJECT, NOT HONOUR**, and the reasoning is at the foot of this row. This is the FIRST ROW IN THIS FILE whose filed outcome was a check-clean WRONG VALUE, and the witness grader's newest rung is what graded it honestly.
 
 Repro:
 
@@ -4287,6 +4427,49 @@ Repro:
 * Two ways out, and they are not the same size: implement the dispatch (`==` joins the
   B13/B14 operator-function set), or delete the clause from the message. The second is a
   one-line change and is what the message should do until the first exists.
+
+#### The close
+
+**THE DECISION IS REJECT, and the deciding measurement is who the diagnostic's customer is.**
+`eqRefusals`' clause fires on a CONTAINER — `K[]`, `Circle[]` — and a container's compare
+recurses through `emitStructEqRec`, `emitListEqRCore` and `emitListEqSCore`, three cores with no
+per-element dispatch hook, and through `isEquatable`, std's four `needle: T` exports and the map
+key. **Honouring the top-level struct case alone would leave the message still prescribing
+something inert one container deep**, which moves the trap rather than removing it — and would
+create a NEW silent class: a user `==` that some of those honour and others do not. Implementing
+the dispatch properly is a language-design change to six lowerings, not a rider on this row.
+
+**THE COST IS ZERO AND IT WAS CHECKED, NOT ASSUMED.** Nothing in `compiler/`, `std/`, `tests/`,
+`bench/`, `playground/` or `reference/` declares a `==` or `!=` operator function. The only
+operator declaration in the whole tree is `tests/cases/objects/operator-self-method.vl`'s
+`function +`, which is untouched.
+
+**FOUR SPELLINGS, ONE HOME.** The symbol-token name (`function ==(…)`) and the quoted name
+(`function "=="(…)`) converge on the same `name` in `parseFuncHead`, so one test covers both, and
+`!=` is the same rule — measured, and its witness printed `true` where the declaration said
+`false`. The reject is at the PARSER because that is where both spellings meet and because it is
+the earliest place an editor sees it; `isStrFuncName` still ACCEPTS the two names so that the
+quoted spelling gets this sentence rather than the generic "must be an operator" list.
+
+**THE DIAGNOSTIC IS RECONCILED IN THE SAME CHANGE, which is the half that makes this a close
+rather than a move.** `eqRefusals` no longer ends ``— define a `==` operator for it``; it ends
+`— compare a projection whose components are`, the idiom `std/array.vl` already prescribes for
+the same shape. Leaving the old clause beside the new reject would have been strictly worse than
+the state this row was filed against: a diagnostic recommending a declaration the compiler
+refuses.
+
+**THE COST IN CELLS, STATED HONESTLY.** 12 grid cells move `runs -> loud check reject`: an `i32`
+comparison beside an inert `==`/`!=` declaration, at every declaration form the grid enumerates
+(quoted, symbol-token, `!=`, wrong arity, wrong types, no `self` parameter). Their ANSWER was
+right, and it was right only because the declaration did nothing — the same reading D35's 18
+`("a"|"b")[]` cells got. Nothing moved to a silent outcome.
+
+**A DECLARATION FORM THAT IS NOT THIS ROW.** An operator CLOSURE FIELD (`{ "==": … }`) is a
+different mechanism and is untouched: `isEquatable` already refuses a struct with a
+function-typed field, so that spelling is loud at both ends today and rejecting a FIELD NAME
+would be over-broad.
+
+Fixture: `tests/cases/objects/error-equality-not-overloadable.vl` (all four spellings).
 
 ---
 
@@ -4466,6 +4649,48 @@ the wrong namespace.
   map row and a list row.
 * Reading the same element OUT of the loop runs on D34's branch (`l[0].r`,
   `m["k"]` narrowed) — the loop VAR's storage class is the whole difference.
+
+
+### D57 — a STRUCT `==` goes check-clean invalid wasm the moment a UNION that contains that struct is DECLARED
+**check-clean invalid wasm · found 2026-08-26 by the D42/D44/D46 grid (20 of its 741 cells, every one of them in that grid's prelude) · pre-existing, byte-identical on `c0873a06` and on the D42/D44/D46 branch · NO generic, NO import, NO twin, and the union is NEVER USED**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+
+    function cell(): boolean {
+      const a: Circle = { r: 1 }
+      const b: Circle = { r: 1 }
+      return a == b
+    }
+
+    print(cell())
+    // vl check rc 0; vl run:
+    //   failed to compile: …::cell — type mismatch: expected i32, found (ref $type)
+
+* **THE CONTROL IS ONE LINE AND IT IS THE THIRD.** Delete `type Shape = Circle | Sq` and the
+  identical program prints `true`. `Shape` is declared and never mentioned again — no value of
+  it is built, no function takes one, nothing is narrowed — so the trigger is the DECLARATION,
+  not any use.
+* **THREE SPELLINGS, ONE TRIGGER, measured one file each.** All three are `vl check` rc 0 and
+  invalid wasm with the union declared, and all three run with the line deleted:
+  a direct `Circle == Circle`; a `Shape == Shape` over two `Circle` values; and
+  `xs.indexOf(nd)` over a `Circle[]` with a `Circle` needle (which fails inside `indexOf$m1`,
+  so it is the same site reached through the pin rather than a second defect).
+* **THE INITIALIZER FORM IS NOT AN AXIS**, which is what says the compare and not the operand is
+  the site: an object LITERAL (`const a: Circle = { r: 1 }`) and a CALL RESULT
+  (`const a: Circle = mkcirc()`) both reproduce, and both run with the union deleted.
+* **IT IS NOT D42/D44/D46's, and it is not D33's or D34's.** It is silent on `c0873a06` and on
+  the branch that closes those three, at the same offset and with the same message; there is no
+  layout twin (`Sq`'s field set differs from `Circle`'s), no map, no list-of-arm and no callback.
+  The neighbourhood to look in is `emitStructEq` → `structIndexOfExpr`, which resolves `Circle`
+  to a table index — the same STRUCT-table-versus-VARIANT-table namespace question D26, D32 and
+  D33 each settled at a different site.
+* **20 CELLS of the D42/D44/D46 grid, and they are that grid's whole remaining silent column.**
+  Every one has `Circle` or `Shape` on at least one side of a `==`/`!=` and a `Shape` in the
+  prelude; the grid's OTHER 721 cells are unaffected by the union's presence.
 
 ---
 

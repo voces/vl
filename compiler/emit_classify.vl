@@ -121,6 +121,7 @@ import {
   nodeTyIsPureLitUnion,
   nodeTyIsStruct,
   nodeTyIsStructArray,
+  nodeTyIsTyVar,
   nodeTyIsUnion,
   nodeTyIsUnionAlias,
   nodeTyIsVariant,
@@ -6570,12 +6571,70 @@ export function eqCoreKindOfBin(binIx: i32, fnIx: i32) {
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
         return 6
       }
-      const tl = eqCoreKindOfTyToken(nodeEqCmpKind(e.binLeft))
+      const tl = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binLeft, fnIx))
       if tl >= 0 { return tl }
-      return eqCoreKindOfTyToken(nodeEqCmpKind(e.binRight))
+      return eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binRight, fnIx))
     }
   }
   -1
+}
+
+// ── THE EMITTER'S OWN NAME for a nullable REF NICHE, `fnIx`-SCOPED ───────────────────────
+// The SECOND CHANNEL of `binEqNulNiche`, and the six arms are `eqCmpKindOfNulInner`'s six
+// tokens read off the emitter's rep classifiers instead of off the checker's banked type.
+//
+// WHY A SECOND CHANNEL EXISTS AT ALL. Inside a MONOMORPHIZED instance the operand nodes are
+// SHARED with the generic template — `monoCloneBody` rebuilds the statement spine and shares
+// every leaf expression, so two instances of `indexOf<T>` read one `self[i] == needle` node —
+// and the type banked on that node is therefore the TYPE VARIABLE, never the instance's type.
+// `eqCmpKindOfTy` answers "" for it, which is correct about `T` and says nothing about
+// `T = string | null`; the guard was skipped and the plain string compare lowered a
+// `(ref null $array)` into a `(ref $array)` slot. The classifiers below are keyed on `fnIx`,
+// and a monomorphized instance IS its own emitted function with its own parameter kinds, so
+// they answer per instance where the node cannot. (`silent-class-inventory` D42.)
+//
+// THE SAME TWO-CHANNEL SHAPE `isNumRecvBaseName` ALREADY USES for an `is` receiver, for the
+// same reason its header gives: gating on the node's banked type alone cannot see an instance.
+//
+// EXACTLY THE SIX NICHES WHOSE NON-NULL CORE EXISTS, because that is the contract
+// `emitNulNicheEq` is written against — it lowers the rep's OWN core under a null guard, so a
+// niche with no core would reach `emitEqNonNullCore`'s loud floor instead of a compare. The
+// `nulmap` and distinct-backing scalar-list niches are deliberately absent for that reason,
+// and `eqCmpKindOfNulInner` answers "none" for them on the other channel.
+export function exprNulNicheKind(exprIx: i32, fnIx: i32): EqCmpKind {
+  if exprIx < 0 { return "" }
+  if exprNullableString(exprIx, fnIx) { return "nulstr" }
+  // `exprNullableRefNiche`, not the struct-only twin: a nullable union VARIANT is a
+  // `(ref null $uVarHeap[vi])` whose arena type is a `TyObj`, so the OTHER channel names it
+  // `nulstruct` too, and a channel that answered differently would be a second guess.
+  if exprNullableRefNiche(exprIx, fnIx) { return "nulstruct" }
+  if exprNulClosure(exprIx, fnIx) { return "nulclosure" }
+  if exprNullableList(exprIx, fnIx) { return "nullist" }
+  if exprNulScalarListKind(exprIx, fnIx) == "nulstrlist" { return "nulstrlist" }
+  if exprNullableRefArray(exprIx, fnIx) {
+    const slot = refListSlotOfExpr(exprIx, fnIx)
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      if rlElemKindTbl[slot] == 4 { return "nulreflist" }
+    }
+  }
+  ""
+}
+
+// ── THE ONE HOME for one `==` operand's lowering token, ACROSS BOTH CHANNELS ──────────────
+// The checker's banked type first (`nodeEqCmpKind`), the emitter's own `fnIx`-scoped rep
+// classifiers when — and only when — the banked type is a TYPE VARIABLE.
+//
+// BOTH CONSUMERS ASK THIS, and they must: `binEqNulNiche` decides whether the compare needs a
+// null GUARD and `eqCoreKindOfBin` decides which CORE goes under it. A channel added to one and
+// not the other produced a guard with no core to run (`emitProgram: `==` over this operand rep
+// has no compare core`, measured on `(i32[] | null)` through `indexOf`) — the same
+// "a rep answered in only one of two ladders" failure `emitNulIsNullTest`'s header names, and
+// the reason this is a function rather than two copies of the gate. (D42.)
+export function eqCmpKindOfOperand(exprIx: i32, fnIx: i32): EqCmpKind {
+  const k = nodeEqCmpKind(exprIx)
+  if k != "" { return k }
+  if !nodeTyIsTyVar(exprIx) { return "" }
+  exprNulNicheKind(exprIx, fnIx)
 }
 
 // One `eqCmpKindOfTy` token → its compare core. The nullable niche and its non-null base share
