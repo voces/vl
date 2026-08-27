@@ -6686,18 +6686,129 @@ function exprIsUnionStrEq(binIx: i32, fnIx: i32) {
   false
 }
 
-// True if `binIx` is a same-shape STRUCT `==`/`!=` (a field-wise compare). Its
-// string/array field compares stage operands in the string-op scratch frame, so
-// it counts as a string op for frame reservation.
-function exprIsStructEq(binIx: i32, fnIx: i32) {
+// ── THE EQ LAYOUT ROW ─────────────────────────────────────────────────────────
+// A field-wise compare walks a LAYOUT, and this emitter has TWO tables that hold one: the
+// standalone struct table (`sNames` / `sField*` / `sHeapIdx`) and the union-VARIANT table
+// (`uVariants` / `uField*` / `uVarHeap`). They are disjoint BY CONSTRUCTION and the split
+// is invisible in the source: `collectS` SKIPS a `type X = {…}` that is a union member, so
+// the instant `type Shape = Circle | Sq` is declared — used or not — `Circle` LOSES its
+// `sNames` row and gains a variant one. Nothing about the compare changes; the table its
+// operands live in does. (`silent-class-inventory` D57.)
+//
+// An eq ROW names one of the two: `row >= 0` is a struct-table row, `row < 0` is variant
+// `-1 - row`. Only the ROOT of a chain can be a variant — a nested-struct field (code 15)
+// resolves through `uFieldTgtStructIdx` / `sFieldTgtStructIdx`, both of which answer in the
+// STRUCT namespace — so the encoding never has to survive a descent.
+//
+// NOTE THE ONE PLACE `-1` IS AMBIGUOUS: it is variant row 0, so an eq row cannot double as
+// "no answer". Every resolver below therefore returns a TABLE index (`-1` = none) and the
+// caller encodes; no function returns a bare eq row plus a sentinel.
+export function eqRowOfVariant(vi: i32) { -1 - vi }
+
+// Field COUNT of an eq row, from whichever table owns it.
+export function eqRowFieldCount(row: i32) {
+  if row < 0 { return uFieldCount[-1 - row] }
+  sFieldCount[row]
+}
+
+// The wasm-type CODE of an eq row's field `fi`. The two tables share one code vocabulary
+// (0 i32/boolean · 3 string · 4 `i32[]` · 14 closure · 15 nested struct · 17 f64 · …), so
+// the compare's field ladder is written once and its one loud floor catches the
+// unsupported codes whichever table the row came from.
+export function eqRowFieldTypeAt(row: i32, fi: i32) {
+  if row < 0 { return variantFieldTypeAt(-1 - row, fi) }
+  sFieldTypeAt(row, fi)
+}
+
+// The HEAP TYPE an eq row's values are physically read through. A variant's cell is
+// `(ref $uVarHeap[vi])` — a DIFFERENT heap type from any same-shaped `sHeapIdx` twin, and
+// reading one through the other is the `expected (ref $type), found (ref $type)` family.
+export function eqRowHeapIdx(row: i32) {
+  if row < 0 { return uVarHeap[-1 - row] }
+  sHeapIdx[row]
+}
+
+// The struct-table row an eq row's code-15 field targets — a STRUCT row from either table,
+// or -1 (the loud "no interned shape" floor) when the target is itself an arm.
+export function eqRowTgtStructIdx(row: i32, fi: i32) {
+  if row < 0 { return uFieldTgtStructIdx(-1 - row, fi) }
+  sFieldTgtStructIdx(row, fi)
+}
+
+// ── THE ONE ROW RESOLUTION for a `==`/`!=`, in three namespaces ──────────────────────────
+// READ BY THE FRAME-RESERVATION SCAN (`exprIsStructEq`, `cloEqNoteBin`) AND BY THE CORE
+// EMITTER (`emitBinExprNode`'s struct rung, `emitNulStructEq`), for the reason
+// `eqCoreKindOfBin`'s header states about its own pairing: **a compare the scan does not
+// know about is a compare emitted against locals the function never declared** — `vl check`
+// clean and a module the engine refuses. D57's first fix taught the EMITTER the variant
+// table and left the scan behind, and an arm with an `i32[]` or function-valued field went
+// straight into that vein — `unknown local 4` / `unknown local 5`, the compare's counters
+// read out of a frame nobody claimed.
+//
+// AND THE OUTCOME CLASS DID NOT MOVE WHILE THAT WAS TRUE, which is the part worth keeping.
+// Those cells were check-clean invalid wasm BEFORE the dispatch fix (D57's i32 tail) and
+// check-clean invalid wasm after it (this), so a grader that scores the CLASS saw a fix land
+// and 36 cells not move; only the MESSAGE separated them. A partial fix inside one silent
+// class is invisible to the instrument that measures the class — the reason the ablation
+// diffs messages, and the reason the corpus witness carries an arm with one field of every
+// supported code rather than the single `i32` field every grid cell had.
+//
+// FOUR sites, THREE resolvers, so they cannot drift again — with one stated exception:
+// `cloEqNoteBin`'s STRUCT leg keeps its historical left-operand-only test, which
+// over-reserves and may, where these under-reserve and may not. Its own header says why.
+//
+// EACH ANSWERS ON AGREEMENT ONLY — both operands the same row. A mixed pair is refused by
+// the dispatch rather than guessed at, because the two tables' heap types are distinct
+// however alike the field sets look.
+
+// The union-VARIANT row both operands of a `==`/`!=` resolve to, or -1.
+export function binEqVariantRow(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const lvi = exprVariantIndex(e.binLeft, fnIx)
+      if lvi >= 0 && lvi == exprVariantIndex(e.binRight, fnIx) { return lvi }
+    }
+  }
+  -1
+}
+
+// The NULLABLE-niche variant row both operands resolve to, or -1 — the `Circle | null`
+// twin of the above, off `nulVariantIdxOfExpr`. Kept SEPARATE from it rather than laddered
+// into one resolver: the two reach different emitters (`emitNulStructEq` puts a null guard
+// around the core) and a resolver that answered for both would let the unguarded dispatch
+// claim a niche pair if the guard's own dispatch ever stopped running first.
+export function binEqNulVariantRow(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const lvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
+      if lvi >= 0 && lvi == nulVariantIdxOfExpr(e.binRight, fnIx) { return lvi }
+    }
+  }
+  -1
+}
+
+// The STRUCT-table row both operands resolve to, or -1.
+export function binEqStructRow(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
       const lsi = structIndexOfExpr(e.binLeft, fnIx)
-      if lsi >= 0 { return lsi == structIndexOfExpr(e.binRight, fnIx) }
+      if lsi >= 0 && lsi == structIndexOfExpr(e.binRight, fnIx) { return lsi }
     }
   }
-  false
+  -1
+}
+
+// True if `binIx` is a same-layout field-wise `==`/`!=` — over a standalone STRUCT or over
+// a union ARM, non-null or through the nullable niche. Its string/array field compares
+// stage operands in the string-op scratch frame, so it counts as a string op for frame
+// reservation.
+function exprIsStructEq(binIx: i32, fnIx: i32) {
+  if binEqStructRow(binIx, fnIx) >= 0 { return true }
+  if binEqVariantRow(binIx, fnIx) >= 0 { return true }
+  binEqNulVariantRow(binIx, fnIx) >= 0
 }
 
 // ── list `==`/`!=`/`+` detection (which functions need the list-op frames) ────
@@ -6845,21 +6956,23 @@ function eqCoreKindOfTyToken(k: EqCmpKind) {
   -1
 }
 
-// True if struct shape `si` carries a function-typed field (code 14), looking
-// through nested-struct fields (code 15). `seen` guards recursive shapes.
-function shapeHasCloField(si: i32, seen: i32[]) {
+// True if the layout at EQ ROW `row` carries a function-typed field (code 14), looking
+// through nested-struct fields (code 15). `seen` guards recursive shapes, and holds eq rows
+// rather than struct indices — the encoding is injective, so a struct row and a variant row
+// can share the list without colliding.
+function shapeHasCloField(row: i32, seen: i32[]) {
   let k = 0
   while k < seen.length {
-    if seen[k] == si { return false }
+    if seen[k] == row { return false }
     k = k + 1
   }
-  seen.push(si)
+  seen.push(row)
   let fi = 0
-  while fi < sFieldCount[si] {
-    const code = sFieldTypeAt(si, fi)
+  while fi < eqRowFieldCount(row) {
+    const code = eqRowFieldTypeAt(row, fi)
     if code == 14 { return true }
     if code == 15 {
-      const nsi = sFieldTgtStructIdx(si, fi)
+      const nsi = eqRowTgtStructIdx(row, fi)
       if nsi >= 0 {
         if shapeHasCloField(nsi, seen) { return true }
       }
@@ -6869,9 +6982,14 @@ function shapeHasCloField(si: i32, seen: i32[]) {
   false
 }
 
-// Note one BinExpr's function-identity equality site (`f == g`, or a struct
-// equality whose shape carries a function-typed field) into `fnUsesCloEq` — the
-// compare stages both operands in the 2-slot closure-eq frame.
+// Note one BinExpr's function-identity equality site (`f == g`, or a field-wise equality
+// whose shape carries a function-typed field) into `fnUsesCloEq` — the compare stages both
+// operands in the 2-slot closure-eq frame.
+//
+// ALL THREE NAMESPACES, off the shared resolvers, for the reason their header gives: this is
+// a RESERVATION scan, and a layout it cannot see is a `local.set` into a slot the function
+// never declared. A union ARM with a closure field is the same compare as a standalone
+// struct with one, and only the table changed.
 export function cloEqNoteBin(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
@@ -6880,10 +6998,26 @@ export function cloEqNoteBin(binIx: i32, fnIx: i32) {
         fnUsesCloEq = true
         return 0
       }
+      // THE STRUCT LEG STAYS LEFT-ONLY, deliberately, and it is NOT `binEqStructRow`.
+      // A reservation scan may over-reserve and may not under-reserve, and this one has
+      // over-reserved since it was written: it fires on the LEFT operand's row alone, so a
+      // pair the emitter will refuse still reserves the frame. Tightening it to the shared
+      // agreement resolver moved BYTES in four corpus closure cases (the frame vanishes and
+      // every later local index shifts) for no defect — so the historical form is kept and
+      // the variant leg is added BESIDE it rather than through it.
       const si = structIndexOfExpr(e.binLeft, fnIx)
       if si >= 0 {
         const seen: i32[] = []
         if shapeHasCloField(si, seen) { fnUsesCloEq = true }
+        return 0
+      }
+      // The variant leg IS agreement-gated, because that is exactly when the emitter emits
+      // a variant compare — reserve for the compare that will be produced, no wider.
+      let vi = binEqVariantRow(binIx, fnIx)
+      if vi < 0 { vi = binEqNulVariantRow(binIx, fnIx) }
+      if vi >= 0 {
+        const vseen: i32[] = []
+        if shapeHasCloField(eqRowOfVariant(vi), vseen) { fnUsesCloEq = true }
       }
     }
   }

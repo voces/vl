@@ -442,6 +442,9 @@ import {
   arrLitIsStr,
   arrNewIntrKind,
   asExprIsUnionCast,
+  binEqNulVariantRow,
+  binEqStructRow,
+  binEqVariantRow,
   binMixHardF64,
   calleeReturnsVoid,
   callIsArrSlice,
@@ -475,6 +478,11 @@ import {
   envSlotShift,
   eqCmpKindOfOperand,
   eqCoreKindOfBin,
+  eqRowFieldCount,
+  eqRowFieldTypeAt,
+  eqRowHeapIdx,
+  eqRowOfVariant,
+  eqRowTgtStructIdx,
   exprArray,
   exprF32Array,
   exprF64Array,
@@ -9712,7 +9720,7 @@ function emitListConcatI(body: i32[], leftIx: i32, rightIx: i32, fnIx: i32) {
 }
 
 // Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
-// expression, then one `struct.get` per (struct, field) pair in the path arrays.
+// expression, then one `struct.get` per (row, field) pair in the path arrays.
 // Every step is a pure re-read (the equality compare re-walks chains per field).
 function emitChainRead(
   body: i32[],
@@ -9724,7 +9732,7 @@ function emitChainRead(
   if emitExpr(body, rootIx, fnIx) < 0 { return -1 }
   let k = 0
   while k < pathSi.length {
-    fbStructGet(sHeapIdx[pathSi[k]], pathFi[k]) // 0xfb 0x02 <struct ht> <field>
+    fbStructGet(eqRowHeapIdx(pathSi[k]), pathFi[k]) // 0xfb 0x02 <ht> <field>
     k = k + 1
   }
   0
@@ -9905,8 +9913,38 @@ function emitNulNicheEq(body: i32[], binIx: i32, fnIx: i32, niche: EqCmpKind) {
 function emitNulStructEq(body: i32[], binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
-    const si = structIndexOfExpr(e.binLeft, fnIx)
-    if si < 0 {
+    // THE SAME TWO NAMESPACES the non-null dispatch asks, off the SAME shared resolvers and
+    // in the same ORDER (the niche rung first, on agreement). Asking only the struct one
+    // here is how the NULLABLE half of a rep drifts out of the non-null half's capability,
+    // which is the failure `emitEqNonNullCore`'s header names: with `Circle` a union arm,
+    // `Circle | null == Circle | null` was `emitProgram: struct equality over a non-struct
+    // operand` while the identical non-null compare one screen down had just learned to run.
+    //
+    // NICHE-FIRST IS MEASURED HERE TOO, not copied for symmetry. A `Circle | null` MODULE
+    // GLOBAL beside an exact layout twin resolves through `structIndexOfLet`, which is not
+    // kind-gated, so the struct rung answers the TWIN's row and the compare reads a
+    // `(ref null $uVarHeap[vi])` through `sHeapIdx` — check-clean invalid wasm, the same
+    // `expected (ref null $type), found (ref null $type)` the non-null globals gave before
+    // their rung was ordered. Storage class beats a structural twin in both halves.
+    //
+    // THE FOUND FLAG IS NOT DECORATION. An eq row is `>= 0` struct / `< 0` variant, so `-1`
+    // is variant row 0 and cannot double as "no answer"; the resolvers hand back a TABLE
+    // index and the encoding happens here.
+    let si = -1
+    let siFound = false
+    const nvi = binEqNulVariantRow(binIx, fnIx)
+    if nvi >= 0 {
+      si = eqRowOfVariant(nvi)
+      siFound = true
+    }
+    if !siFound {
+      const nsSi = structIndexOfExpr(e.binLeft, fnIx)
+      if nsSi >= 0 {
+        si = nsSi
+        siFound = true
+      }
+    }
+    if !siFound {
       return emitFail("emitProgram: struct equality over a non-struct operand")
     }
     fbBlock(127) // block i32 — $out
@@ -10034,19 +10072,19 @@ function binConcatHasNoLowering(binIx: i32) {
 // scalars, the string-eq loop for string fields, a length+element loop for `i32[]`
 // fields, and recursion through NESTED struct fields (code 15). Both operands must
 // be PURE re-reads (names / field chains): every field compare re-evaluates the
-// full chain from its root. The two shapes match (same struct table index) — the
-// checker proved the operands comparable.
-function emitStructEq(body: i32[], binIx: i32, fnIx: i32) {
+// full chain from its root. The two shapes match (`row` is the ONE eq row both
+// operands resolved to) — the checker proved the operands comparable.
+//
+// TAKES THE ROW rather than re-deriving it, and that is the fix's shape: the caller has
+// already asked BOTH namespaces and knows which one answered, so re-asking here could
+// only lose that (and did — `structIndexOfExpr` alone answers -1 for a variant operand).
+function emitStructEq(body: i32[], binIx: i32, fnIx: i32, row: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
-    const si = structIndexOfExpr(e.binLeft, fnIx)
-    if si < 0 {
-      return emitFail("emitProgram: struct equality over a non-struct operand")
-    }
     const pathSi: i32[] = []
     const pathFi: i32[] = []
     if (
-      emitStructEqRec(body, e.binLeft, e.binRight, si, pathSi, pathFi, fnIx) <
+      emitStructEqRec(body, e.binLeft, e.binRight, row, pathSi, pathFi, fnIx) <
       0
     ) {
       return -1
@@ -10059,9 +10097,11 @@ function emitStructEq(body: i32[], binIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a struct equality")
 }
 
-// One struct SHAPE's field-wise compare at path (`pathSi`/`pathFi` from the roots),
+// One SHAPE's field-wise compare at path (`pathSi`/`pathFi` from the roots),
 // leaving 0/1: an and-chain of per-field compares lowered as nested value-typed
 // `if`s (compare; if → next field … ; else → 0), so a first mismatch short-circuits.
+// `si` is an EQ ROW (see `eqRowOfVariant`), so one core serves a standalone struct and a
+// union arm — the two differ only in which table holds the layout.
 function emitStructEqRec(
   body: i32[],
   lRoot: i32,
@@ -10071,7 +10111,7 @@ function emitStructEqRec(
   pathFi: i32[],
   fnIx: i32,
 ) {
-  const cnt = sFieldCount[si]
+  const cnt = eqRowFieldCount(si)
   if cnt == 0 {
     fbI32Const(1)
     return 0
@@ -10138,7 +10178,7 @@ function emitStructEqFieldInner(
   pathFi: i32[],
   fnIx: i32,
 ) {
-  const code = sFieldTypeAt(si, fi)
+  const code = eqRowFieldTypeAt(si, fi)
   if code == 0 {
     // Scalar (i32 / boolean): a native compare.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
@@ -10166,7 +10206,7 @@ function emitStructEqFieldInner(
   }
   if code == 15 {
     // Nested struct: recurse one level deeper along the chain.
-    const nsi = sFieldTgtStructIdx(si, fi)
+    const nsi = eqRowTgtStructIdx(si, fi)
     if nsi < 0 {
       return emitFail(
         "emitProgram: nested struct field equality with no interned shape",
@@ -19242,12 +19282,67 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // (`emitStructEq` — scalars native, strings via the eq loop, `i32[]` via a
     // length+element loop, nested structs recursively, function-valued fields
     // by identity via `emitCloEqCore`).
-    const eqLsi = structIndexOfExpr(e.binLeft, fnIx)
-    const eqRsi = structIndexOfExpr(e.binRight, fnIx)
-    if eqLsi >= 0 || eqRsi >= 0 {
-      if eqLsi >= 0 && eqLsi == eqRsi {
-        return emitStructEq(body, exprIx, fnIx)
-      }
+    // THE VARIANT RUNG — the SECOND namespace, asked with the ladder that was already
+    // written for it. `structIndexOfExpr` and `exprVariantIndex` are storage-class twins
+    // (param / declared local / capture / global / `: T`-returning call / ref-list element
+    // / map read / `??` / `as` — the same nine legs, each kind-gated so the two cannot both
+    // answer for one binding), and this dispatch asked only the first. Declaring `type
+    // Shape = Circle | Sq` moves a `const a: Circle` from the kind-1 struct slot to the
+    // kind-8 variant slot (`collectS` skips an arm, so `Circle` has no `sNames` row at
+    // all), both rungs answered -1, and the compare FELL THROUGH to the i32 tail at the
+    // bottom of this function: `i32.eq` over two `(ref $Circle)` — `vl check` rc 0 and a
+    // module the engine refuses, from a union declaration with no use site
+    // (`silent-class-inventory` D57).
+    //
+    // BOTH RUNGS COME OFF `binEq*Row`, WHICH THE RESERVATION SCAN ALSO READS. That sharing
+    // is the fix's second part and it was not optional: the first version taught only this
+    // dispatch, `exprIsStructEq` kept asking the struct table alone, and an arm with an
+    // `i32[]` or function-valued field compiled its field compare against frame slots the
+    // function never reserved — `unknown local N`, check-clean, exactly the vein
+    // `eqCoreKindOfBin`'s header warns about. Measured on the merge base, that state left 36
+    // of the grid's 770 cells check-clean invalid — the SAME outcome class they had before
+    // the dispatch rung, with only the message changed, so the class grader scored the
+    // partial fix as complete. `binEq*Row`'s header carries that story.
+    //
+    // ON AGREEMENT ONLY — both operands the SAME row. A mixed pair (one arm, one standalone
+    // struct) falls to the refusal below rather than guessing which table's heap type to
+    // read the other side through, and `error-arm-struct-equality-mixed.vl` is that control.
+    //
+    // AND THE VARIANT ROW IS TRIED FIRST, WHICH WAS MEASURED RATHER THAN CHOSEN. A draft put
+    // it BELOW the struct rung, on the argument that "only pairs that already failed can
+    // reach it" — true, and 12 grid cells say it is not enough. `structIndexOfExpr` has two
+    // legs that are NOT kind-gated (the `Index` arena rung, the global's
+    // `structIndexOfLet`), so with an exact layout twin in the module they resolve a VARIANT
+    // operand to the TWIN's struct row: the struct rung then agrees on a row whose
+    // `sHeapIdx` is a different heap type from `uVarHeap[vi]`, and `xs[0] == xs[1]` /
+    // `ga == gb` stayed check-clean invalid wasm. The variant answer is a statement about
+    // the operand's STORAGE CLASS and the struct one, there, about a structural lookalike —
+    // so storage class wins.
+    const eqVi = binEqVariantRow(exprIx, fnIx)
+    if eqVi >= 0 {
+      return emitStructEq(body, exprIx, fnIx, eqRowOfVariant(eqVi))
+    }
+    const eqSi = binEqStructRow(exprIx, fnIx)
+    if eqSi >= 0 { return emitStructEq(body, exprIx, fnIx, eqSi) }
+    // THE REFUSAL KEEPS ITS OWN GATE, AND IT NOW SPANS BOTH TABLES. Either side naming a
+    // layout — in either namespace — without the two AGREEING is a compare this emitter will
+    // not guess at, and it has to say so rather than fall through: an operand that is a
+    // `(ref $uVarHeap[vi])` reaching the i32 tail below is the same check-clean invalid
+    // module D57 is about.
+    //
+    // THE CELL THIS ADDS IS TWO ARMS OF ONE UNION WITH THE SAME LAYOUT — `type Shape =
+    // Circle | Dot` and `a: Circle == b: Dot`. Both sides resolve, to DIFFERENT variant
+    // rows, so the agreement rung above declines; neither has an `sNames` row, so the old
+    // struct-only gate was false and the compare fell into the tail (silent on `a97c9ae1`
+    // too). The win direction is the CONTROL's: delete the union and `Circle == Dot` is two
+    // struct rows that disagree, which is this exact refusal — so matching it is what makes
+    // the union's presence stop changing the outcome, which is D57's whole claim.
+    if (
+      structIndexOfExpr(e.binLeft, fnIx) >= 0 ||
+      structIndexOfExpr(e.binRight, fnIx) >= 0 ||
+      exprVariantIndex(e.binLeft, fnIx) >= 0 ||
+      exprVariantIndex(e.binRight, fnIx) >= 0
+    ) {
       return emitFail("emitProgram: struct equality is not supported yet")
     }
     // Function-value `==`/`!=`: IDENTITY — the same lifted function (the id
