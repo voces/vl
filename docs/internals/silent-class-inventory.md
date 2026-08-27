@@ -7819,13 +7819,14 @@ Repro:
                  DPA let=913 name=c ret=909 n=1 [0]=<>          <- a VETO, not a miss
       C1 + C2    DPA let=913 name=c ret=909 n=1 [0]=<Circle>    <- the pin fires, correctly
 
-* **ROOT TWO IS D163, AND IT IS WHY C1+C2 MOVE ZERO CELLS.** With the pin firing, `mk$m0`
-  builds `struct.new 1` (the `Circle` variant heap) into local 2 declared `(ref 1)` — correct
-  — and then `array.new_fixed 8 1` into type 8, `(array (mut (ref null 0)))`, the `Dot`
-  struct heap. The list literal's ELEMENT ROW still comes from the checker's structural
-  record. Disassembled against the hand-annotated sibling (`const c: Circle`), which RUNS,
-  the two modules are the SAME SIZE and differ in exactly TWO LINES: type 8's element and one
-  local in `reverse$m0`. That is D163.
+* **ROOT TWO IS D163, AND IT IS WHY C1+C2 MOVE ZERO CELLS.** Disassembled on the A+C1+C2
+  compiler (the type indices below are that build's, 2,239 bytes) with the pin firing,
+  `mk$m0` builds `struct.new 1` (the `Circle` variant heap) into local 2 declared `(ref 1)` —
+  correct — and then `array.new_fixed 8 1` into type 8, `(array (mut (ref null 0)))`, the
+  `Dot` struct heap. The list literal's ELEMENT ROW still comes from the checker's structural
+  record. Against the hand-annotated sibling (`const c: Circle`) built by the SAME compiler,
+  which RUNS, the two modules are the same size and differ in exactly TWO LINES: type 8's
+  element and one local in `reverse$m0`. That is D163.
 * **MEASURED PER CANDIDATE, ON THE PROVEN BASE** (stripping every candidate reproduces
   `1559d80c` byte-for-byte at 1,452,766):
 
@@ -7885,7 +7886,8 @@ Repro:
   program is still check-clean invalid wasm — which is what separates this row from D157,
   whose pin is vetoed.
 * **THE FAILING INSTRUCTION, DISASSEMBLED** (`wasm-tools validate`: `func 15 failed to
-  validate … at offset 0x67a`; the module built with `--no-validate` on the `1559d80c` seed):
+  validate … at offset 0x67a`; the module is 3,644 bytes, built with `--no-validate` on the
+  `1559d80c` seed — the offset and every type index below are that seed's):
 
       (;@67a ;) array.new_fixed 12 1        <- the one-element list `[thru(c)]`
 
