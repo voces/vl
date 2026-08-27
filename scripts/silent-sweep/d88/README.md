@@ -37,10 +37,13 @@ than `runs`.
   declared structs of the layout — `plaintwin` is D100's coordinate) and ARM-NESS
   (`arm` / `armtwin` / `armdiff` — `arm` is D88's, and that `armdiff` moves with it is what
   says the layout twin is NOT required).
+  **The `arm` / `armtwin` / `armdiff` levels are also the whole of this grid's SURVIVING
+  residue** (filed 2026-08-27 as D123): after D112 closed, all 100 remaining silent cells
+  are at those three levels and at `src=declname`.
 - **`cont`** (`bare` / `mapval` / `nestedmap` / `listelem` / `structfield`) — the container
   the payload crosses in. **`mapval` is D88's coordinate and `nestedmap` exists because a
-  one-level grid cannot see a recursion gap**; it is where the largest surviving silent
-  family (D112, 570 cells) lives.
+  one-level grid cannot see a recursion gap**; it is where the largest silent family lived
+  (D112, 570 cells), and D112 CLOSED on 2026-08-27 — see the re-grade below.
 - **`route`** (`none` / `gen` / `std`) — no generic, a hand-written `idg<T>`, and
   `std:array`'s `reverse<T>`. `gen` is D88's coordinate; `none` and `std` are what proved
   D100 is route-independent (6 cells each way).
@@ -70,3 +73,20 @@ reorderable lines.
 
 Pairwise intersection **0**; union of the singles **set-identical** to the full branch. Two
 roots, and 0 cells moved backward or to a silent class in any candidate.
+
+## The 2026-08-27 re-grade (D112's close)
+
+Re-run against `7b600b57` and the D112 branch with `grade88.py`, one host binary, both sides:
+
+| side | runs | loud emit reject | check-clean invalid wasm |
+|---|---|---|---|
+| base `7b600b57` | 1,669 | 651 | 530 |
+| D112 branch | 2,099 | 651 | 100 |
+
+**430 cells moved, every one `check-clean invalid wasm` → `runs`; 0 backward, 0 to a silent
+class, 0 same-class message changes.** The residue is 100 cells, all `src=declname` x
+`decl` in {`arm`, `armtwin`, `armdiff`}, filed as **D123** — the arm-nominal map rung being
+a one-level special case rather than a rung in the recursive `shapeNominalOfTy` ladder. That
+residue is a DIFFERENT root from D112: D112's fix changed those cells' wasm (their
+`?? Map()` site moved to the right struct) and the failure relocated to the store, so the
+outcome class never moved and only a module `cmp` saw it.
