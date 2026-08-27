@@ -57,6 +57,7 @@ The verdict, measured against master `8d070d46`:
 | `LB` | D93's nominal mv KEY + the slot's ARM SIGNATURE | 267 | 15 | 18 | 15 |
 | `LD` | the sixth typed find's arm hint                 | 252 | 15 | 33 | **0** |
 | `LBD` | `LB` + `LD`                                    | 279 | 15 |  6 | 27 |
+| `LB'` | `LBD` minus the declared-STRUCT half of the key | 261 | 15 | 24 |  9 |
 | full | all three                                       | **285** | 15 | **0** | 33 |
 
 Every pairwise intersection is EMPTY; the union of `LA` and `LBD` is set-identical to the
@@ -64,6 +65,11 @@ full branch's 33; the full branch agrees with each single on every cell that sin
 **`LD` moves ZERO cells alone and is still load-bearing** — `LBD` − `LB` is 12 cells that
 need both — so D93 is a COMPOSITION (the D39/D40/D41 shape) and not three disjoint roots
 (D48/D63/D64's). D94 is its own root, disjoint from all of it.
+
+`LB'` is the same ablation applied INSIDE a leg: `LB` rewrites the mv key on both the ARM
+side and the declared-STRUCT side, and dropping the second costs **18 cells** — because the
+twin's render does not merely fail to name `Dot`, it RE-RESOLVES through `resolveAnnot` to
+the index `Circle`'s declaration owns, so nothing downstream can undo it.
 
 **A leg that moves 0 cells is not thereby droppable, and a leg that moves 0 cells in
 composition too IS.** Two further candidates were built and swept here: the rep-key VARIANT

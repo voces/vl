@@ -7257,6 +7257,7 @@ candidate, all swept against one 300-cell grid, master `8d070d46`:
 | `LB` | the nominal mv KEY + the slot's ARM SIGNATURE  | 267 | 15 | 18 | 15 |
 | `LD` | the sixth typed find's hint                    | 252 | 15 | 33 | **0** |
 | `LBD` | `LB` + `LD`                                   | 279 | 15 |  6 | 27 |
+| `LB'` | `LBD` MINUS the declared-STRUCT half of the key | 261 | 15 | 24 |  9 |
 | full | all three                                      | **285** | 15 | **0** | 33 |
 
 Every pairwise intersection is EMPTY, the union of `LA` and `LBD` is set-identical to the
@@ -7264,6 +7265,13 @@ full branch's 33 and the full branch agrees with each on every cell it moves. **
 ZERO cells alone and is not redundant**: `LBD` − `LB` is 12 cells that need BOTH, so this is
 the D39/D40/D41 shape (a composition) and not D48/D63/D64's (three disjoint roots). 33
 cells moved, every one to `runs`, **0 backward and 0 message-only**.
+
+**BOTH SIDES OF THE KEY ARE LOAD-BEARING, and `LB'` is the row that says so.** Rewriting
+only the ARM side separates the two outer mv slots and then the last mile fails: the twin's
+key stays the RENDER, that render re-resolves through `resolveAnnot`, and the arena — which
+dedups a `TyObj` structurally — hands back the very index the ARM's declaration owns. The
+render does not merely fail to name `Dot`; it RESOLVES to `Circle`, so no filter downstream
+can undo it. **18 cells**, which is the difference between `LB'` and `LBD`.
 
 **THE CLAIMANTS ARE TWO HEAP TYPES, NOT ONE — D100's discriminator, taken on master
 `8d070d46` before anything was built.** D100 was filed as a channel case and refuted by
