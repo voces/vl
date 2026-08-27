@@ -7429,11 +7429,11 @@ merely gets its slot under a different name. No refusal, no floor, no new dialec
   callers held the type, so the hint is a pure function of an argument they already had.
 
 **THE ABLATION, and it is a COMPOSITION rather than three roots.** One compiler per
-candidate, all swept against one 300-cell grid, master `8d070d46`:
+candidate, all swept against one 300-cell grid, master `8d1670aa`:
 
 | compiler | what it adds | runs | loud emit | invalid wasm | moved |
 |---|---|---|---|---|---|
-| master | `8d070d46`                                  | 252 | 15 | 33 | — |
+| master | `8d1670aa`                                  | 252 | 15 | 33 | — |
 | `LA` | D94's element-declaration preference          | 258 | 15 | 27 |  6 |
 | `LB` | the nominal mv KEY + the slot's ARM SIGNATURE  | 267 | 15 | 18 | 15 |
 | `LD` | the sixth typed find's hint                    | 252 | 15 | 33 | **0** |
@@ -7455,7 +7455,7 @@ render does not merely fail to name `Dot`; it RESOLVES to `Circle`, so no filter
 can undo it. **18 cells**, which is the difference between `LB'` and `LBD`.
 
 **THE CLAIMANTS ARE TWO HEAP TYPES, NOT ONE — D100's discriminator, taken on master
-`8d070d46` before anything was built.** D100 was filed as a channel case and refuted by
+`8d1670aa` before anything was built.** D100 was filed as a channel case and refuted by
 exactly this measurement, so it was run here first:
 
     HEAP mv slots Circle(0,k1,ty17) {[string]:{r:i32}}(1,k6,ty18) {r:i32}(2,k1,ty19)
@@ -7476,13 +7476,11 @@ answer had to make the two claimants key differently rather than make a predicat
 * **The same rung in the `TyObj` arm itself**, where the heap argument applies just as
   well. That version DOES close the 12 order-b cells on its own — and it REDDENS a working
   corpus program: `generics/mono-callback-bound-arm-beside-layout-twin.vl` becomes
-  `emitProgram: function-value call arity has no interned signature`. Diagnosed rather than
-  guessed at — the call site keys `[r1;r1;>i]` against an interned `[r0;r0;>i]`, i.e. two
-  ref-list slots that are layout twins get two different `$fnsig` digits. `repSigSlotTokOfKind`
-  canonicalises a STRUCT slot digit through `repStructSlotRep` and its own header says the
-  other kinds "index their OWN tables and pass through unchanged" — the reflist complement
-  is not written. That is the row the next attempt starts from, and it is a widening that
-  must be swept on its own before it rides along.
+  `emitProgram: function-value call arity has no interned signature`. **Filed as D105 with
+  its own witness, and the first diagnosis of it was WRONG** — see that row. It is not a
+  twin-canonicalisation gap in `repSigSlotTokOfKind`; it is this same family's disease at
+  the `$fnsig` layer, and the arm's ref-list slot is found today only because its rep key
+  happens to BE the render. A widening that must be swept on its own before it rides along.
 
 Regression fixture: `tests/cases/maps/nested-arm-valued-map-beside-layout-twin.vl` (both
 declaration orders plus the single-unit function-boundary control the refuted floors
@@ -7574,7 +7572,7 @@ row — and a -1 here sends the caller on to `firstSi`, a strictly worse guess t
 conflicting row it just declined. With no conflict anywhere `first` IS `firstExact` and the
 answer is byte-identical.
 
-**THE CLAIMANTS ARE TWO HEAP TYPES, NOT ONE** (D100's discriminator, master `8d070d46`):
+**THE CLAIMANTS ARE TWO HEAP TYPES, NOT ONE** (D100's discriminator, master `8d1670aa`):
 
     HEAP struct rows BoxA(1) BoxB(2) canonEq=1 codesEq=0 twin=0 sTwin=1/2
 
@@ -7589,6 +7587,71 @@ which is the coordinate the row names, at both declaration orders.
 Regression fixture: `tests/cases/structs/unannotated-literal-beside-arm-elem-field-twins.vl`
 (both declaration orders plus the two-arms-of-two-unions control a future tightening of this
 rung into a refutation would move).
+
+### D105 — a union ARM's ref-list `$fnsig` digit is found only because its rep key IS the render
+**runs today and must keep running · found 2026-08-27 while closing D93, as the measured cost of a WIDER candidate · NOT a defect on master — the witness below prints `1` on `8d1670aa` and on the D93/D94 branch alike · filed as the REFUTATION PIN for the rung D93's close deliberately did not take, and because the first diagnosis of it was wrong**
+
+Repro:
+
+    import { sorted } from "std:array"
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+
+    function byR(a: Circle[], b: Circle[]) { return a[0].r < b[0].r }
+
+    function cell() {
+      const p: Circle[] = [{ r: 2 }]
+      const q: Circle[] = [{ r: 1 }]
+      const xss: Circle[][] = [p, q]
+      const out = xss.sorted(byR)
+      return out[0][0].r
+    }
+
+    print(cell())
+    // vl run: 1   — on master and on the branch
+    // under the WIDER rep-key rung (see below):
+    //   emitProgram: function-value call arity has no interned signature
+
+* **THE CANDIDATE THIS PINS.** `repElemKey` / `repMvValKey` key a declared STRUCT nominally
+  (`repSlotOfTyDecl` → `S<n>`) and have no VARIANT rung, so a union ARM — which has no
+  `sNames` row at all, `collectS` skipping a union member — falls into the structural field
+  expansion and is character-for-character an anonymous `{r:i32}`. Giving that arm `V<n>` is
+  the obvious complement, the heap argument is sound (an arm's elements live in
+  `uVarHeap[vi]`), and it closes the 12 `order=b` cells D93 needed a second rung for. It
+  also turns this program into a loud emit reject, so it was DROPPED.
+* **THE FIRST DIAGNOSIS WAS WRONG AND A PROBE IS WHAT SAID SO.** It read: two ref-list slots
+  that are LAYOUT TWINS get two different `$fnsig` digits, because `repSigSlotTokOfKind`
+  canonicalises a struct slot digit through `repStructSlotRep` while "other slot kinds
+  (reflist / variant / map) index their OWN tables and pass through unchanged". Plausible,
+  and it names a real asymmetry — but it is not this. Dumping the ref-list table on BOTH
+  compilers for this program says so directly:
+
+      master 8d1670aa:  RL0 Circle key=1 wrap=9 heap=1 · RL1 Dot key=2 wrap=11 heap=0
+      wider rung:       RL0 Circle key=2 wrap=9 heap=1 · RL1 Dot key=3 wrap=11 heap=0
+      call site keys [r1;r1;>i] · interned [r0;r0;>i]
+
+  `Circle` and `Dot` are **already two slots on master**, with different wrappers and
+  different heaps — they are NOT layout twins and the wider rung does not split them. All it
+  changes is `Circle`'s rep KEY, from the structural `{r:i32,}` to `V0`.
+* **WHAT ACTUALLY HAPPENS IS THIS FAMILY'S DISEASE AT THE `$fnsig` LAYER.** The comparator
+  `byR(a: Circle[], b: Circle[])` interns its signature with `r0;`, the arm's own slot. The
+  CALL SITE resolves its element through a rung holding a RENDER, and the render of a union
+  arm is `{r:i32}` — its layout twin's spelling. On master that render IS slot 0's rep key,
+  so the lookup lands on the arm's slot **by accident**; make the arm's key nominal and the
+  render no longer matches it, the rung falls through, and the render resolves to `Dot`'s
+  row: `r1;`, a signature nothing interned. So the program is correct today for the same
+  reason D47's alias spelling worked before it was fixed — an incidental key collision.
+* **WHICH IS WHY IT IS A PIN AND NOT A "TODO".** The fix is not a canonicalisation of the
+  reflist digit; it is finding the call-site rung that holds a render for a `$fnsig`
+  reflist element and giving it the nominal channel, exactly as D47 did for the mv key and
+  D94 for the field element. Until that rung is found and measured, the wider rep-key rung
+  cannot land — and this row is the thing that will say so loudly rather than in review.
+* Pinned in the corpus by `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl`
+  (its `receiverSorted` leg), which is the program this repro minimises; no new fixture,
+  because the guard already exists and already fires.
 
 ---
 

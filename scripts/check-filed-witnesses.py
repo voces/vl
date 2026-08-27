@@ -61,6 +61,15 @@ DECLARED = [
     # outcome, not that the grader was talked out of an inconvenient answer.
     ("now a loud check reject",    "check_reject"),
     ("now a loud emit reject",     "emit_reject"),
+    # A REFUTATION PIN — a row whose witness is a program that RUNS CORRECTLY today and
+    # whose filing is "a proposed change reddens this, so the change is refused". The
+    # vocabulary had no state for it and the file had no way to grade one: such controls
+    # lived as prose inside other rows ("the control the fix must not redden"), unrun. A
+    # pin is exactly the thing that must be re-run — its whole value is that it flips when
+    # someone lands the refused change — so it gets a status of its own rather than
+    # borrowing `closed`, which would file a non-defect as a fixed defect. Listed ahead of
+    # the bare `closed` entry, like the two above it: first match wins.
+    ("runs today and must keep running", "runs"),
     ("closed",                     "runs"),
     # LOADS THEN TRAPS — added because the vocabulary had no state for it and D19 was
     # graded `silent_invalid_wasm` while its prose said the opposite. A module that

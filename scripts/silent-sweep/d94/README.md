@@ -48,11 +48,11 @@ separately — cells whose OUTCOME is equal and whose MESSAGE is not. D57's stag
 cells between two `check-clean invalid wasm` mechanisms and an outcome-class grader scored
 them unchanged, so the message diff is not optional.
 
-The verdict, measured against master `8d070d46`:
+The verdict, measured against master `8d1670aa`:
 
 | compiler | what it adds | runs | loud emit | invalid wasm | moved |
 |---|---|---|---|---|---|
-| master | `8d070d46`                                   | 252 | 15 | 33 | — |
+| master | `8d1670aa`                                   | 252 | 15 | 33 | — |
 | `LA` | D94's element-declaration preference           | 258 | 15 | 27 |  6 |
 | `LB` | D93's nominal mv KEY + the slot's ARM SIGNATURE | 267 | 15 | 18 | 15 |
 | `LD` | the sixth typed find's arm hint                 | 252 | 15 | 33 | **0** |
@@ -75,7 +75,9 @@ the index `Circle`'s declaration owns, so nothing downstream can undo it.
 composition too IS.** Two further candidates were built and swept here: the rep-key VARIANT
 rung at the map-value position (0 alone, 0 in composition — dropped as speculative) and the
 same rung in `repElemKey`'s `TyObj` arm (closes the 12 order-b cells on its own and REDDENS
-`generics/mono-callback-bound-arm-beside-layout-twin.vl`, loudly). Both are recorded on D93.
+`generics/mono-callback-bound-arm-beside-layout-twin.vl`, loudly). Both are recorded on D93,
+and the second has its own row — **D105**, filed after its first diagnosis was refuted by a
+table dump rather than shipped as a plausible sentence.
 
 ## The larger grids, re-graded
 
@@ -84,3 +86,9 @@ Both are 0-moved and 0-message-diff under the full branch on the merged base:
 (7424 / 2026 / 0, either side). A backward-move count is only as wide as the grid's axes, so
 the branch is graded against the two largest populations this programme has as well as its
 own.
+
+**Every table on this page was re-measured against master `8d1670aa` after #1958 merged**,
+not carried over from the `764ad0dd` run that produced them. #1958 touched the `==` and `+`
+predicate homes and the litunion rep spellings and moved **0** of these 300 cells and 0 of
+either larger grid — but that is a measurement, and the reason to take it is that #1955
+silently moved another change's per-leg counts without touching its files.
