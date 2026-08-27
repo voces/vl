@@ -145,6 +145,7 @@ import {
   reExpName,
   reExpTarget,
   sNames,
+  uVariants,
 } from "./emit_state"
 import { emitFail } from "./emit_bytes"
 import {
@@ -170,6 +171,7 @@ import {
   exprStruct,
   exprU8Array,
   exprUnion,
+  exprVariantIndex,
   fieldValueFeOf,
   fnHasUnannotatedParam,
   fnIndexOf,
@@ -1073,6 +1075,46 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   }
   if exprUnion(ix, fnIx) { return "" }
   if exprNullableStruct(ix, fnIx) { return "" }
+  // THE VARIANT TABLE, ASKED BEFORE THE STRUCT ONE — and the reason is D57's root, one
+  // layer out. `collectS` SKIPS a `type X = {…}` that is a union member, so declaring
+  // `type Shape = Circle | Sq` DELETES `Circle`'s `sNames` row and mints a VARIANT row
+  // instead. `structIndexOfExpr` then has legs that are NOT kind-gated (the `Index` arena
+  // rung, the global's `structIndexOfLet`), so with an exact layout TWIN in the module a
+  // `Circle` argument resolved to `Dot`'s struct row and this arm pinned the twin's NAME:
+  // the instance declared `(param (ref $Dot))` while the caller's cell is
+  // `(ref $uVarHeap[Circle])` — two heap types for one shape, never merged because
+  // `DECISIONS.md` keeps that seam NOMINAL. `vl check` rc 0, `type mismatch: expected
+  // (ref $type), found (ref $type)` at load (silent-class-inventory D75, and D82 one
+  // position over — a call RESULT rather than a module global, same pin, same twin).
+  //
+  // WITHOUT the twin `structIndexOfExpr` answers -1 and this arm's `return ""` is the loud
+  // `monomorphize: unsupported argument type` floor, so the twin is what routes around the
+  // floor — D63's sentence, one layer up.
+  //
+  // `exprVariantIndex` IS `structIndexOfExpr`'S STORAGE-CLASS TWIN, written arm for arm
+  // (param, declared local, capture, module global, a `: Cat`-returning call, a `Cat[]`
+  // element, a bare arm-valued map read, `?? default`, an `as` cast) and each leg
+  // kind-gated on the polymorphic companion slot, so the two cannot both answer for one
+  // binding. It had no caller on this path. Asked BEFORE the struct arm for the reason
+  // D57's dispatch asks it first: the un-kind-gated struct legs are precisely the ones a
+  // layout twin captures, so struct-first is what loses the arm.
+  //
+  // THE TWO FLOORS ABOVE KEEP THEIR PRIORITY. A genuinely UNION-typed argument
+  // (`exprUnion`) and a nullable struct still take their existing refusal; this rung only
+  // claims a value whose cell already IS the concrete kind-8 variant.
+  //
+  // The pin goes through `monoAnnPinName`, which is THE one membership list for "which
+  // annotation NAME can serve as a pin" and already carries the variant rung
+  // (`variantIndexOf(name) >= 0`) with its safety property stated: `x: Circle` is an
+  // annotation a NON-generic function lowers end to end today, so the instance lands on
+  // the working path rather than beside it. Routing through it rather than returning
+  // `uVariants[avi]` raw is what keeps a spelling this compiler would RENAME from becoming
+  // a pin.
+  const avi = exprVariantIndex(ix, fnIx)
+  if avi >= 0 && avi < uVariants.length {
+    const avn = monoAnnPinName(uVariants[avi])
+    if avn != "" { return avn }
+  }
   if exprStruct(ix, fnIx) {
     const si = structIndexOfExpr(ix, fnIx)
     if si >= 0 { return sNames[si] }

@@ -1,0 +1,156 @@
+// Regression (silent-class-inventory D81), graduated from
+// `soundness/xfail-miscompile-anon-objlit-into-arm-typed-global.vl`.
+//
+// An UN-ANNOTATED anonymous object literal (`const c = { r: n }`) delivered to a
+// destination annotated at a union ARM, in a module that also declares a standalone struct
+// of that arm's exact layout (`Dot`). On master `8bf0f20f` every cell below was `vl check`
+// rc 0 — one redundant-annotation HINT, no error — and a module the engine refuses:
+//
+//   type mismatch: expected (ref $type), found (ref $type)
+//
+// The two `$type`s are two DIFFERENT heap types behind one placeholder, and the disassembly
+// is where that shows — the literal is built on the TWIN's row and stored into a cell typed
+// at the arm's:
+//
+//   master   (local (ref 0))   struct.new 0   global.set 0   ; global is (mut (ref 1))
+//   branch   (local (ref 1))   struct.new 1   global.set 0
+//     ; type 0 is Dot's standalone row, type 1 is uVarHeap[Circle]
+//
+// IT IS D39's CHANNEL PROBLEM AT THE DESTINATIONS `synthRetPinAnn` DOES NOT REACH, and it
+// is the one shape in this family that genuinely needs a channel rather than an un-called
+// complement. An anonymous `{ r: n }` has TWO nominal claimants — `structIndexOfObj` finds
+// `Dot` by field set, `objVariantName` finds `Circle` by field set — and NEITHER SCAN IS
+// WRONG: delete `Dot` and the same programs are a LOUD `ref valtype with no interned shape`,
+// delete the union and they RUN on `Dot`'s row. Only the CONTEXT decides, and the context
+// is an annotation the literal never sees. `synthDstPinAnn` carries it.
+//
+// FOUR DESTINATIONS, NOT THE TWO THE ROW FILED, and each is a SEPARATE root by measurement:
+// built as one compiler per leg and swept over one 3,144-cell grid, the three legs move
+// 36 / 36 / 108 cells, all six pairwise intersections are EMPTY, and the union of the
+// singles is set-identical to the composed branch's 456. No leg closes another's cells.
+//
+//   gsto = c              a module GLOBAL assignment      leg 1
+//   thru(c)               a callee PARAMETER              leg 3
+//   const o: Circle = c   an annotated LOCAL binding      leg 2
+//   o = c                 an annotated LOCAL assignment   leg 2
+//
+// A STRUCT FIELD is deliberately NOT among them, and that is measured: `const b: Box = { c: c }`
+// over `type Box = { c: Circle }` is the LOUD `only i32 / boolean / string / array struct
+// fields are supported` on master — a different floor and a different row.
+// @run
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @hint redundant type annotation: `gsto` is inferred as `{r: i32}`
+// @hint redundant type annotation: `o` is inferred as `{r: i32}`
+// @hint redundant type annotation: `xs` is inferred as `{r: i32}[]`
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+type Dot = { r: i32 }
+
+function idg<T>(x: T): T { return x }
+function thru(x: Circle) { return x }
+function sink(x: Circle) { return x.r }
+
+// LEG 1 — the module GLOBAL. Byte-for-byte D81's own filed repro.
+let gsto: Circle = { r: 0 }
+function mkGlobal(n: i32) {
+  const c = { r: n }
+  gsto = c
+  return n
+}
+mkGlobal(7)
+print((gsto).r)
+
+// LEG 3 — the callee PARAMETER, D81's second filed leg.
+function mkParam(n: i32) {
+  const c = { r: n }
+  return thru(c)
+}
+print((mkParam(7)).r)
+
+// LEG 2 — an annotated LOCAL, both spellings.
+function mkBind(n: i32) {
+  const c = { r: n }
+  const o: Circle = c
+  return o.r
+}
+print(mkBind(7))
+
+function mkAssign(n: i32) {
+  const c = { r: n }
+  let o: Circle = { r: 0 }
+  o = c
+  return o.r
+}
+print(mkAssign(7))
+
+// THE GENERIC HOP, which is why the pin runs BEFORE monomorphization. By `collectLocals`
+// time `idg<T>(x: T): T` has already been cloned as `idg$m0(x: Dot): Dot`, pinned off the
+// very row the un-annotated literal resolved to — so the conduit reads as a concrete `Dot`
+// destination, vetoes the real one, and its own signature is already wrong.
+function mkThroughGeneric(n: i32) {
+  const c = { r: n }
+  return sink(idg(c))
+}
+print(mkThroughGeneric(7))
+
+// THE LIST-ELEMENT destination: the binding holds the ELEMENT and the list is built at the
+// destination, so the pin is `Circle` and not `Circle[]`.
+function mkListElem(n: i32) {
+  const c = { r: n }
+  const xs: Circle[] = [c]
+  return xs[0].r
+}
+print(mkListElem(7))
+
+// THE ALIAS HOP. An UN-ANNOTATED binding on the path is a LINK, not a destination:
+// `retLocalLetOfBlock` walks through it to the binding that supplies the value, so the scan
+// must SKIP it rather than record it as a destination with no nominal claim — recorded, it
+// answers "" and vetoes the very pin it sits on the path of.
+function mkAlias(n: i32) {
+  const c = { r: n }
+  const alias = c
+  const o: Circle = alias
+  return o.r
+}
+print(mkAlias(7))
+
+// THE ARM-VALUED MAP's value slot, the newest destination of the five. On `8bf0f20f` this
+// shape was a LOUD floor and so was never in D81's silent population; #1954 taught the
+// arm-valued map to lower under the inline spelling, which removed the floor and left it
+// check-clean invalid wasm on `922d52eb`. Annotating the local makes it run there, which is
+// what says the LITERAL's row is what is wrong and not the map's slot.
+function mkMapVal(n: i32) {
+  const c = { r: n }
+  const m: {[string]: Circle} = Map()
+  m["k"] = c
+  return (m["k"] ?? { r: 0 }).r
+}
+print(mkMapVal(7))
+
+// THE DECLARED RESULT IS A DESTINATION TOO, and it exists for the gate rather than for the
+// pin: an arm-typed global and a plain-struct RESULT over one literal cannot both be
+// satisfied, so the scan declines and the cell keeps master's behaviour exactly. Without
+// this rung the pin moved the failure from the `global.set` to the return — silent to
+// silent, which an outcome-class grader scores as no change.
+//
+// THE DISAGREEMENT GATE. VL is structurally typed, so one `{ r: n }` may legally reach a
+// `Circle` destination AND a `Dot`-annotated one; the scan collects EVERY delivery and
+// declines unless they all name the same arm. This cell keeps master's behaviour on
+// purpose — `Dot` wins the field-set scan and both destinations accept it.
+function takesDot(x: Dot) { return x.r }
+function mkAmbiguous(n: i32) {
+  const c = { r: n }
+  const a = takesDot(c)
+  const b = takesDot(c)
+  return a + b - n
+}
+print(mkAmbiguous(7))
