@@ -8717,8 +8717,30 @@ Repro (on `1e81b0f3`: `vl check` clean, invalid wasm):
   `cloRetValKind` / `cloRetValSlot` for exactly this shape. Same gate, same slot, the other
   column.
 * Kept as its own fixture (`tests/cases/unions/arm-through-closure-field-call.vl`) because a
-  `{ go: … }` literal beside a SECOND lambda in the same union program is D199, a different
-  and still-open hole — folding them would make this fixture pin that one instead.
+  `{ go: … }` literal beside a SECOND lambda in the same union program is a different,
+  still-open hole — folding them would make this fixture pin that one instead. That hole,
+  in full, because it has no row of its own:
+
+      type Shape = Circle | Sq
+      type Sq = { s: i32 }
+      type Dot = { r: i32 }
+      type Circle = { r: i32 }
+      const c: Circle = { r: 7 }
+      const lamc = (x: Circle) => x
+      const viaLambda = lamc(c)
+      print(viaLambda.r)
+      const holder = { go: (x: Circle) => x }
+      const viaField = holder.go(c)
+      print(viaField.r)
+
+  `globalKind`'s `ObjLit` arm is `if structIndexOfObj >= 0 { struct }; if uDeclared
+  { union }`, and `{ go: <closure> }` matches no struct row once a SECOND lambda has
+  perturbed the anonymous-shape interning — so the literal routes to the union BOX and the
+  emitter rejects it for a missing variant field. **Remove the second lambda and the same
+  literal interns its own anonymous row and runs**, which is why this row's fixture holds it
+  alone. This PR moved that program from `check-clean invalid wasm` on `1e81b0f3` to a loud
+  `emitProgram: object literal is missing a union-variant field` — the direction the
+  inventory wants, but the program is well-typed and should run.
 
 ---
 
@@ -8751,7 +8773,7 @@ invalid wasm, and only with both does it run):
   | D196 only | 1,454,017 | 8 | 14 | 10 |
   | the arm-parameter floor only | 1,454,526 | **7** | 12 | 13 |
   | D195 + D196 | 1,454,154 | 22 | 9 | 1 |
-  | all three (shipped) | 1,454,749 | 22 | **0** | 10 |
+  | all three (shipped, 1,454,829 after D199's decline) | 1,454,829 | 22 | **0** | 10 |
 
 * **Pairwise intersections are ALL EMPTY.** D195 moves 8 cells to `runs`, D196 moves 1, and
   the floor moves **0**. **Set identity fails in the useful direction**: the union of the
@@ -8771,32 +8793,47 @@ invalid wasm, and only with both does it run):
 
 ---
 
-### D199 — an object literal of a CLOSURE-valued field, beside a second lambda, in a union program
-**OPEN · now a loud emit reject (it was check-clean invalid wasm on `1e81b0f3`) · uncovered by this PR's ablation; NOT closed by it**
+### D199 — the `$fnsig` key mints one per variant ROW, but layout-twin arms share ONE heap
+**OPEN · loud emit reject on `1e81b0f3` AND on this branch · found by BUILDING D196's first shape rather than reasoning about it, and it is the second refutation of the day**
 
-Repro (on this tree: `emitProgram: object literal is missing a union-variant field`; on
-`1e81b0f3`: `vl check` clean and `Invalid input WebAssembly code` in the start function):
+Repro (`emitProgram: field access but no struct type declared` on `1e81b0f3` and on this
+branch — and `wasm trap: indirect call type mismatch`, AFTER printing `7`, under D196's
+first shape):
 
-    type Shape = Circle | Sq
-    type Sq = { s: i32 }
-    type Dot = { r: i32 }
-    type Circle = { r: i32 }
-    const c: Circle = { r: 7 }
-    const lamc = (x: Circle) => x
-    const viaLambda = lamc(c)
-    print(viaLambda.r)
-    const holder = { go: (x: Circle) => x }
-    const viaField = holder.go(c)
-    print(viaField.r)
+    type A = { v: i32 }
+    type B = { v: i32 }
+    type U = A | B
+    const a0: A = { v: 7 }
+    const b0: B = { v: 7 }
+    function viaA(f: (A) => A, x: A) { print(f(x).v) }
+    function viaB(f: (B) => B, x: B) { print(f(x).v) }
+    viaA((p: A) => p, a0)
+    viaB((q: B) => q, b0)
 
-* `globalKind`'s `ObjLit` arm is `if structIndexOfObj(initIx) >= 0 { struct } ; if uDeclared {
-  union }`. `{ go: <closure> }` matches no struct row once a SECOND lambda has perturbed the
-  anonymous-shape interning, so the literal is routed to the union BOX and the emitter
-  rejects it for missing a variant field. **Remove the second lambda and the same literal
-  interns its own anonymous row and runs** — which is why D197's fixture holds it alone.
-* This PR moved it from SILENT to LOUD, which is the direction the inventory wants, but the
-  program is well-typed and should run. The missing arm is a closure-valued anonymous shape
-  in a union program, not anything about the arm resolution D195 fixed.
+* **D196 keyed the arm RAW, so `A` interns `V0;>V0;` and `B` interns `V1;>V1;` — two
+  `$fnsig`s — while `buildVariantTwins` gives them ONE `uVarHeap` heap type** (their field
+  sets match). The two functypes are then structurally identical at two indices of ONE rec
+  group, and **in WasmGC that makes them DISTINCT types**: the `call_indirect` type operand
+  and the callee's declared functype disagree, the module VALIDATES, and it traps at run
+  time.
+* **`loud emit reject` → `trap_loads`, which is a cell moving INTO silence.** No count in
+  the ablation would have surfaced it: it moves 0 cells to `runs` in either direction, and
+  the whole grid's `runs` column is identical with and without the decline. Only building
+  the program found it — the sixth time in this family that a witness refuted a tidy
+  explanation.
+* **`repSigSlotTokOfKind` ALREADY canonicalises a STRUCT slot** through `repStructSlotRep`,
+  for exactly this reason, and passes a VARIANT slot through unchanged. Canonicalising the
+  variant slot is the real fix and belongs WITH the other three key producers
+  (`cloRetKeySuffix`, `cloParamTok`, `annParamKind`), which key it raw today — **all four
+  have to move together or they disagree again**, which is the same arm-for-arm rule D195
+  turns on.
+* Until then the arena arm DECLINES on a layout-twinned arm (`repVariantSlotsTwin` — the
+  pairwise form of `buildVariantTwins`, and deliberately "independent of
+  `buildVariantTwins` having run", so it is answerable at `$fnsig` INTERN time). The caller
+  falls through to the name classifier, i.e. the behaviour on `1e81b0f3`, so a twinned arm
+  is **no worse than it was** and an untwinned one keeps the fix.
+* Fixture: `tests/cases/unions/arm-layout-twin-fnsig-decline.vl`, to flip when the four
+  producers canonicalise together.
 
 ---
 
