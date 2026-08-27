@@ -8959,6 +8959,16 @@ null $type), found (ref $type)`):
   -1, `fbValtype`'s bounds guard fires, and the same root is the LOUD `emitProgram: ref
   valtype with no interned shape`. A grader reading only the loud half would call the silent
   half absent.
+* **AND IT WAS RE-DERIVED A THIRD TIME, ON THE MERGED BASE, BECAUSE #1969 LANDED IN
+  ADJACENT TERRITORY.** Re-grading the same 1,518 cells against master `88f21245`: **220 of
+  them now RUN** — closed by #1969 — and the merged branch runs **400**, so this fix adds
+  **180 on top**, with **0 overlap and 0 lost in either direction**. The two are strictly
+  complementary and their coordinates do not touch: #1969's 220 are
+  `cont=structfield2`/`nestedmap` × `deliv=calleedeliv`/`structread` × `annpos=readsite`,
+  and these 180 are CONSTANT at `cont=bare` × `deliv=closurearg` × `annpos=binding`. **The
+  number did not move** — it was 180 before the merge and is 180 after — which is a
+  measurement, not a coincidence: both roots end at "the emitter has a different type for
+  this cell than the checker does", and they are still different holes.
 * **THE CLUSTER, RE-DERIVED RATHER THAN QUOTED.** `RESULTS.md` reports 1,896 cells rescued
   only by `union=nounion`, measured at `1559d80c`. Re-running the whole census against
   `1e81b0f3` and re-deriving `rescue.py`'s grouping gives **20,804 silent coordinates (not
