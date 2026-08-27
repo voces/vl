@@ -29534,7 +29534,153 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
         }
       }
     }
-    return mapShapeOfExpr(d.letInit, fnIx)
+    // THE DESTINATION AN UN-ANNOTATED `Map()` NEVER HAD (D203) — see `letMapDestShape`.
+    //
+    // IT REFINES AN ANSWER, IT NEVER SUPPLIES A MISSING ONE, and that bound is measured.
+    // The destination is consulted only where the initializer's own resolution already
+    // named a slot: the rung then corrects WHICH slot, which is the silent half of the
+    // family. Where the initializer resolves the `-3` unsupported floor the binding keeps
+    // it, even though the destination could name a slot — because that floor is the LOUD
+    // half, and handing it a slot moves the disagreement one layer in rather than
+    // resolving it. Ungated, census block C moves 2,254 loud cells to `runs` and **620
+    // from a loud reject to check-clean invalid wasm**, every one of them at
+    // `cont=list_of_map` with `claim >= 1` — a container ALIAS plus a spare value of it,
+    // which is D181's open row, reached because the map now resolves and the alias's
+    // second claim on the same layout still does not. Block B is the same shape at 85
+    // cells. `runs` LOST is 0 either way; this bound is about the loud->silent direction,
+    // which this programme treats as a blocker in its own right.
+    const ish = mapShapeOfExpr(d.letInit, fnIx)
+    if ish >= 0 {
+      const dsh = letMapDestShape(letIx, fnIx)
+      if dsh >= 0 { return dsh }
+    }
+    return ish
+  }
+  -1
+}
+
+// THE MAP SHAPE THE BINDING'S DESTINATION DECLARES, or -1 (D203).
+//
+// An un-annotated `const lv1 = Map()` takes its VALUE type from the checker's inference at
+// the first key write — `lv1["k0"] = { r: 7 }` pins `{r: i32}`, the object literal's own
+// type. That inference never looks forward, so when the binding is then stored into a
+// DECLARED destination whose value type is a map of something else
+// (`const c: {[string]: {[string]: Circle}} = Map()` with `type Circle = { r: Shape2 }`),
+// the emitter has two map structs for one map: the binding's local/global cell is typed
+// from the inferred value and the destination's vals element from the declaration.
+// `vl check` is clean and the module is invalid — "type mismatch: expected (ref $type),
+// found (ref $type)" at the store.
+//
+// THIS IS A *FIND*, NOT A MINT, WHICH IS THE WHOLE SAFETY ARGUMENT (D-MAPNODETY's rule).
+// Every slot this returns was already interned by the DESTINATION'S OWN annotation walk —
+// `{[string]: {[string]: Circle}}` mints the inner map's slot through `mvShapeOfMapName`'s
+// kind-6 recursion, `{[string]: Circle}[]` through `rlInternName`'s map-element arm, and a
+// struct field through `collectS`. So this rung can only make the binding land on a slot
+// that exists; it interns nothing and cannot skip a mint.
+//
+// THREE DESTINATION FORMS, one per container family the census's `cont` axis separates,
+// because the language spells them three ways and no one of them subsumes the others:
+//   · `dst[k] = m` — the nested-map store (`cont=nestedmap`, `map3`). The destination's
+//     own shape resolves, and its VALUE is the map this binding must be.
+//   · `const c: {[string]: V}[] = [m]` — the list-of-maps literal (`cont=list_of_map`).
+//     The annotation's ref-list slot names a map ELEMENT; that element's value slot is it.
+//   · `const c: W = { f: m }` — the struct field (`cont=structfield`, `structfield2`). The
+//     annotation's struct row and the field name give the field's recorded (KEY, VALUE).
+//
+// NAME-SCOPED OVER THE WHOLE ARENA, on `letInfStrListByUse`'s precedent — the usage-driven
+// element inference for an un-annotated empty `[]` does exactly this scan for exactly this
+// reason. First match wins.
+function letMapDestShape(letIx: i32, fnIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const ini = P.nodes[unwrapParen(d.letInit)]
+    // Only a BARE `Map()` constructor. A passthrough initializer already names another
+    // binding's shape and must keep it.
+    let bare = false
+    if ini is Call {
+      const cf = P.nodes[ini.callFn]
+      if cf is Ident {
+        if cf.identName == "Map" { bare = true }
+      }
+    }
+    if !bare { return -1 }
+    const nm = d.letName
+    let i = 0
+    while i < P.nodes.length {
+      const nd = P.nodes[i]
+      // (a) `dst[k] = nm`
+      if nd is BinExpr {
+        if nd.binOp == "=" {
+          const rhs = P.nodes[unwrapParen(nd.binRight)]
+          if rhs is Ident {
+            if rhs.identName == nm {
+              const lhs = P.nodes[unwrapParen(nd.binLeft)]
+              if lhs is Index {
+                const os = mapShapeOfExpr(lhs.idxArr, fnIx)
+                if os >= 0 {
+                  if mvValIsMap(os) {
+                    const inner = rlElemMapValMvSlot(mvRlSlot[os])
+                    if inner >= 0 { return inner }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      // (b) `const c: {[string]: V}[] = [nm]`  ·  (c) `const c: W = { f: nm }`
+      if nd is LetDecl {
+        if nd.letType >= 0 && nd.letInit >= 0 {
+          const dini = P.nodes[unwrapParen(nd.letInit)]
+          if dini is ArrayLit {
+            let ei = 0
+            while ei < dini.arrElems.length {
+              const el = P.nodes[unwrapParen(dini.arrElems[ei])]
+              if el is Ident {
+                if el.identName == nm {
+                  const rs = letAnnRefListSlot(i)
+                  if rs >= 0 && rs < rlElemKindTbl.length {
+                    if rlElemKindTbl[rs] == 3 {
+                      const iv = rlElemMapValMvSlot(rs)
+                      if iv >= 0 { return iv }
+                    }
+                  }
+                }
+              }
+              ei = ei + 1
+            }
+          }
+          if dini is ObjLit {
+            const dsi = letAnnStructIdx(i)
+            if dsi >= 0 {
+              let fj = 0
+              while fj < dini.objFields.length {
+                const ff = P.nodes[dini.objFields[fj]]
+                if ff is FieldInit {
+                  const fv = P.nodes[unwrapParen(ff.fiValue)]
+                  if fv is Ident {
+                    if fv.identName == nm {
+                      const fi2 = sFieldIndex(dsi, ff.fiName)
+                      if fi2 >= 0 {
+                        const fc = sFieldTypeAt(dsi, fi2)
+                        if fc == 19 || fc == 29 {
+                          const fs = sFieldMapShape(dsi, fi2)
+                          if fs >= 0 { return fs }
+                        }
+                      }
+                    }
+                  }
+                }
+                fj = fj + 1
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
   }
   -1
 }
