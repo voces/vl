@@ -8581,6 +8581,287 @@ declared, prints `7` on this tree):
 
 ---
 
+### D195 — an un-annotated binding of a CLOSURE-VALUE call whose result is a union ARM
+**CLOSED (this PR) · found 2026-08-27 from the census's own `union`-rescued cluster witness `cellsA/a038675.vl` · the arm's LAYOUT TWIN is what makes it silent; without one the same root is a loud emit reject**
+
+Repro (the census cell `scratch-silent/census/cellsA/a038675.vl`, verbatim — on `1e81b0f3`
+this is `vl check` clean and `Invalid input WebAssembly code … type mismatch: expected (ref
+null $type), found (ref $type)`):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: string }
+    type Circle = { r: string }
+    const c: Circle = { r: "seven" }
+    const lamc = (x: Circle) => x
+    const dd = lamc(c)
+    if (dd).r == "seven" { print(7) } else { print(0) }
+
+* **`exprVariantIndex`'s `Call` arm had ONE callee form: a DECLARED function
+  (`fnRetVariantIndexSid` → `fnIndexOfSid`).** Its NULLABLE twin `nulVariantIdxOfExpr` — whose
+  header tabulates the correspondence arm by arm — has carried THREE for as long as it has
+  existed: the declared function, a CLOSURE VALUE (`calleeCloSigKeySid` + `sigKeyRetSlot`),
+  and a closure-valued FIELD (`fieldClosureFeOfRecv`). This is the twelve-times-proven
+  pattern: **the complement was already written, arm for arm, and never called from the
+  non-null side.**
+* **-1 HERE IS NOT "UNKNOWN", IT IS THE WHOLE KIND DECISION.** `globalKind`'s variant arm
+  *is* `exprVariantIndex(initIx, -1) >= 0`, and `letIsVariant`'s header says "THE INIT'S REP
+  IS `exprVariantIndex`'S ANSWER, AND NOTHING SECOND-GUESSES IT" — so one -1 decides the
+  module-global cell, the local slot, and `globalCellStructIdx`'s companion slot together.
+  The fall-through is `exprStruct` / `structIndexOfExpr`, which names the STANDALONE struct
+  table — a table a union arm has no row in, because `collectS` skips a `type X = {…}` that
+  is a union member (D57's root).
+* **THE PROBE, and it is what settles that the two heaps must stay two.** Instrumenting
+  `mAssignTypeIndices` and the un-annotated leg of `globalCellStructIdx` on the cell above:
+
+      sRow 0 name=Dot  heap=0 sTwin=0 tyIx=42
+      uRow 0 name=Circle heap=1 uTwin=0
+      uRow 1 name=Sq   heap=2 uTwin=1
+      gcsi let=24 globalKind=struct exprVariantIndex=-1 nulVariantIdxOfExpr=-1 structIndexOfExpr=0
+
+  `Circle` has **no `sNames` row at all**; the struct resolver answers **Dot's** row 0 and the
+  variant resolver answers -1. **The claimants differ in the output** — heap 0 and heap 1 are
+  distinct wasm types — so this is the #1959 shape (two heaps), not #1957's (one).
+* **DELETE THE UNION AND THE SAME PROBE EXPLAINS THE RESCUE.** `Circle` re-enters the struct
+  table as `sRow 2 name=Circle heap=1 sTwin=1`, a structural twin of `Dot` **sharing its
+  heap**, so the wrong row still yields the right heap. That is exactly why `union=nounion`
+  is the census's only one-step rescue for this cluster — and exactly why suppressing the
+  variant row is NOT the fix (`DECISIONS.md` keeps `uVarHeap` and `sHeapIdx` in two
+  namespaces on purpose).
+* **THE TWIN DECIDES THE DISGUISE, NOT THE DEFECT.** Drop `Dot` and the struct scan answers
+  -1, `fbValtype`'s bounds guard fires, and the same root is the LOUD `emitProgram: ref
+  valtype with no interned shape`. A grader reading only the loud half would call the silent
+  half absent.
+* **THE `store=capture` POSITION IS A DIFFERENT, LOUD LIMITATION AND NOT THIS ROW.** Calling a
+  captured closure BINDING from a nested lambda is `emitProgram: call to unknown function` —
+  and it rejects identically with no union, no struct and no twin anywhere (`function
+  outer2() { const lamc = (x: i32) => x; const inner = () => { print(lamc(7)) }; inner() }`).
+  The union-arm spelling of that program looks like a member of this family and is not; it is
+  loud on both compilers, so the silent census cannot grade it at all.
+* Fixture: `tests/cases/unions/arm-through-closure-value-call.vl` (lambda binding, function
+  value, lambda-with-no-parameter, and the same at function scope).
+
+---
+
+### D196 — a union ARM named inside a function-TYPE ANNOTATION keys the `$fnsig` off its layout twin
+**CLOSED (this PR) · found 2026-08-27 by ablating D195 (its fix moved 7 of 21 hand cells and left 6 standing) · the `$fnsig` half of the same root**
+
+Repro (on `1e81b0f3`: `vl check` clean, `Invalid input WebAssembly code … type mismatch`
+inside `via`):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    function via(f: (Circle) => Circle, c: Circle) {
+      const dd = f(c)
+      print(dd.r)
+    }
+    const c0: Circle = { r: 7 }
+    via((x: Circle) => x, c0)
+
+* **`sigKeyOfTy` walks the arena spine and classifies each LEAF with `paramTokOfTy` /
+  `retTokOfTy`, falling back to RENDERING the leaf and asking the name classifier.** Both
+  arena readers declined every object type by design; the render then reaches
+  `annParamKind`, whose last rung is `structIndexOfTypeName` — a FIELD-SET match, which
+  claims the arm's plain-struct layout twin.
+* **THE PROBE NAMED IT IN ONE LINE.** Dumping the interned key set for the program above:
+
+      sigKey 0 key=cV0;>v   repFe=0
+      sigKey 1 key=V0;>V0;  repFe=1     ← the lambda's OWN functype: the variant heap
+      sigKey 2 key=s0;>s0;  repFe=-1    ← synthesized from the ANNOTATION: Dot's struct heap
+
+  Two `$fnsig`s for one signature. The `call_indirect` casts through the second and the
+  callee is declared with the first — `expected (ref $type), found (ref $type)`.
+* **THE QUESTION IS NOMINAL AND ONLY THE ARENA CAN ANSWER IT.** `variantRowOfTy`'s own header:
+  "NO STRUCTURAL RUNG. Two variants with the SAME FIELD SET are different variants … SO
+  VARIANTS ARE NOMINAL, like unions and unlike structs." Fixed by giving `paramTokOfTy` and
+  `retTokOfTy` a `TyObj → variantRowOfTy` arm — index-only, so it cannot claim a plain struct
+  (declines, name path unchanged) nor an INLINE `{r: i32}` spelling (its own arena row), and a
+  `TyUnion` never reaches it, so a `(Shape) => …` annotation keeps its `u` box token.
+* **BOTH HALVES OR NEITHER**: a `(Circle) => Circle` annotation keys both, and half a key is a
+  `$fnsig` that still disagrees on the other half.
+* Fixture: `tests/cases/unions/arm-in-closure-annotation-fnsig.vl`.
+
+---
+
+### D197 — the closure-FIELD callee rung: `holder.go(c)` returning a union arm
+**CLOSED (this PR) · the third rung of D195's `Call` arm, missing entirely rather than merely narrow**
+
+Repro (on `1e81b0f3`: `vl check` clean, invalid wasm):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    const c: Circle = { r: 7 }
+    const holder = { go: (x: Circle) => x }
+    const viaField = holder.go(c)
+    print(viaField.r)
+
+* `exprVariantIndex`'s `Call` arm tested `callee is Ident` and nothing else, so a `Member`
+  callee fell straight past. `nulVariantIdxOfExpr` reads `fieldClosureFeOfRecv` →
+  `cloRetValKind` / `cloRetValSlot` for exactly this shape. Same gate, same slot, the other
+  column.
+* Kept as its own fixture (`tests/cases/unions/arm-through-closure-field-call.vl`) because a
+  `{ go: … }` literal beside a SECOND lambda in the same union program is D199, a different
+  and still-open hole — folding them would make this fixture pin that one instead.
+
+---
+
+### D198 — the composition: D196 alone moves ONE cell, and six more only move with D195
+**CLOSED (this PR) · this row exists because the ablation's direction check, not its count, is what justified shipping D196**
+
+Repro (`p5_i32arg` — the cell that a per-candidate COUNT calls inert and the composition
+calls load-bearing; on `1e81b0f3` it LOADS AND TRAPS, with D196 alone it becomes check-clean
+invalid wasm, and only with both does it run):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    function via(f: (i32) => Circle) {
+      const dd = f(1)
+      print(dd.r)
+    }
+    const c0: Circle = { r: 7 }
+    via((_n: i32) => c0)
+
+* **THE FOUR-COMPILER ABLATION, on the 21-cell hand grid** (each built from a named sha, and
+  stripping BOTH reproduces the `1e81b0f3` seed byte-for-byte at 1,453,931 bytes):
+
+  | compiler | bytes | cells RUNS |
+  |---|---|---|
+  | neither (== `1e81b0f3`) | 1,453,931 | 6 |
+  | D195/D197 only | 1,454,068 | 13 |
+  | D196 only | 1,454,017 | 7 |
+  | both | 1,454,154 | 20 |
+
+* **Pairwise intersection: EMPTY.** D195 moves 7 cells, D196 moves 1, and no cell is moved by
+  both. **Set identity fails in the useful direction**: the union of the singles is 8 and the
+  pair moves 14, so **six cells move only when both are present** — the closure-PARAM and
+  annotated-closure-result shapes, where D196 fixes the `$fnsig` and D195 fixes the binding
+  that receives its result. A count would have scored D196 at "1 cell" and dropped it.
+* **AND THE DISGUISE CHANGES UNDER D196 ALONE**: this witness moves from `trap_loads` to
+  `check-clean invalid wasm` — same defect, different column — which is why the ablation is
+  read on all four instruments and not on the outcome count alone.
+
+---
+
+### D199 — an object literal of a CLOSURE-valued field, beside a second lambda, in a union program
+**OPEN · now a loud emit reject (it was check-clean invalid wasm on `1e81b0f3`) · uncovered by this PR's ablation; NOT closed by it**
+
+Repro (on this tree: `emitProgram: object literal is missing a union-variant field`; on
+`1e81b0f3`: `vl check` clean and `Invalid input WebAssembly code` in the start function):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    const c: Circle = { r: 7 }
+    const lamc = (x: Circle) => x
+    const viaLambda = lamc(c)
+    print(viaLambda.r)
+    const holder = { go: (x: Circle) => x }
+    const viaField = holder.go(c)
+    print(viaField.r)
+
+* `globalKind`'s `ObjLit` arm is `if structIndexOfObj(initIx) >= 0 { struct } ; if uDeclared {
+  union }`. `{ go: <closure> }` matches no struct row once a SECOND lambda has perturbed the
+  anonymous-shape interning, so the literal is routed to the union BOX and the emitter
+  rejects it for missing a variant field. **Remove the second lambda and the same literal
+  interns its own anonymous row and runs** — which is why D197's fixture holds it alone.
+* This PR moved it from SILENT to LOUD, which is the direction the inventory wants, but the
+  program is well-typed and should run. The missing arm is a closure-valued anonymous shape
+  in a union program, not anything about the arm resolution D195 fixed.
+
+---
+
+### D200 — a MODULE-GLOBAL union arm passed as a union-BOX ARGUMENT, beside its layout twin
+**OPEN · check-clean invalid wasm on `1e81b0f3` AND on this branch · the residue this PR's own probe found and did NOT close: a THIRD struct-only resolver, on the argument-boxing path**
+
+Repro (seven lines — `vl check` clean, `Invalid input WebAssembly code … type mismatch:
+expected (ref null $type), found (ref $type)` at the start function, on both compilers):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    function area(s: Shape) { if s is Circle { return s.r } else { return 0 } }
+    const c: Circle = { r: 7 }
+    print(area(c))
+
+* **THE SAME SHAPE AS D195 AND THE SAME TWIN GATE, AT A RESOLVER D195 DOES NOT REACH.** The
+  argument here is a bare `Ident`, not a call, so `exprVariantIndex`'s `Ident` arm — which
+  already has param / declared / capture / global legs — answers correctly; the wrong answer
+  is produced further down the boxing path.
+* **THE THREE CONTROLS THAT BOUND IT**, each one edit from the repro and each measured on
+  this branch:
+  * delete `type Dot` (no layout twin) — **runs**;
+  * move the binding inside a `function` (a LOCAL, not a module global) — **runs**;
+  * pass the literal directly (`area({ r: 7 })`) — **runs**.
+
+  So the coordinate is `store=global × twin=exact × deliv=box-argument`, and it is a genuine
+  silent cell that neither of this PR's two edits touches.
+* **FOUND BY PROBING THE RESIDUE RATHER THAN BY ASSUMING IT WAS EMPTY.** After D195/D196 the
+  eight other consumers of the struct answer were re-run on a closure-delivered arm (struct
+  equality, list element, map value, struct field, return position, assignment, `as`, and
+  this one). Seven were already correct or moved; this one did not move, and its NAMED-callee
+  control is silent too — which is what says it is not D195 wearing a different coat.
+
+---
+
+### D201 — the corpus cannot witness this family at all
+**A REFUTATION PIN: it runs today and must keep running · the population note this PR's byte-identity rests on**
+
+Repro (a union arm delivered through a DECLARED function — the one callee form the corpus
+does exercise, and the control that proves the corpus channel is live rather than empty):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    function idc(x: Circle): Circle { x }
+    const c: Circle = { r: 7 }
+    const dd = idc(c)
+    print(dd.r)
+
+* **All 2,317 `tests/cases/**/*.vl` build BYTE-IDENTICALLY under `1e81b0f3` and under this
+  PR's compiler: 1,889 SAME, 428 neither-builds, 0 DIFF, 0 LOST, 0 GAINED.** That is a
+  no-regression reading and **not** a liveness one: the corpus contains no program in the
+  D195/D196 family, so agreement there could not have contained the disagreement. Liveness
+  comes from the census delta and the hand grid, never from this number.
+* The witness above is the nearest corpus-shaped program to the family — same union, same
+  arm, same twin, same un-annotated binding — and it runs on both compilers, which is what
+  makes "the corpus is silent about this" a measurement rather than an excuse.
+
+---
+
+### D202 — an ARM-typed closure PARAMETER whose ARGUMENT is a plain struct twin
+**A REFUTATION PIN: it runs today and must keep running · the control D196's nominal key must not redden**
+
+Repro (the plain-struct twin flowing through a closure annotation that names the STRUCT, in a
+program where a union also exists — prints 7 on this tree and on `1e81b0f3`):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 }
+    type Circle = { r: i32 }
+    function via(f: (Dot) => Dot, d: Dot) {
+      const dd = f(d)
+      print(dd.r)
+    }
+    const d0: Dot = { r: 7 }
+    via((x: Dot) => x, d0)
+
+* D196 adds a NOMINAL rung (`variantRowOfTy`) ahead of a STRUCTURAL fall-through in the
+  `$fnsig` key producer. The failure mode it could introduce is the mirror of the one it
+  fixes: claiming the ARM's variant row for a program that means the plain STRUCT of the same
+  layout. `variantRowOfTy` matches by arena index only, so it declines here — and this pin is
+  what says so by running rather than by argument.
+
+---
+
 ## 3. Shared-root analysis
 
 ### Root A — one floor, seven callers, four of which do not stand on it
