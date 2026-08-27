@@ -8202,8 +8202,8 @@ Repro:
 
 ---
 
-### D182 — a struct with a NULLABLE FIELD, stored in a container and read back
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, all blocks · `pval=nullfield` is the highest-rate level of any axis level in the census (3,724 of 8,448 cells in block A alone)**
+### D182 — [CLOSED 2026-08-27 by D203] a struct with a NULLABLE FIELD, stored in a container and read back
+**check-clean invalid wasm, closed 2026-08-27 by D203's destination rung · found 2026-08-27 by the CENSUS grid, all blocks · `pval=nullfield` is the highest-rate level of any axis level in the census (3,724 of 8,448 cells in block A alone)**
 
 Repro:
 
@@ -8328,8 +8328,8 @@ Repro:
 
 ---
 
-### D185 — a struct field over a map of a union arm: LOUD without the twin, SILENT with it
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block C · a `loud emit reject` → `check-clean invalid wasm` move produced by ADDING a declaration, which is the direction this programme treats as a blocker**
+### D185 — [CLOSED 2026-08-27 by D203] a struct field over a map of a union arm: LOUD without the twin, SILENT with it
+**check-clean invalid wasm, closed 2026-08-27 by D203's destination rung · found 2026-08-27 by the CENSUS grid, block C · a `loud emit reject` → `check-clean invalid wasm` move produced by ADDING a declaration, which is the direction this programme treats as a blocker**
 
 Repro:
 
@@ -8367,8 +8367,8 @@ Repro:
 
 ---
 
-### D186 — a list of maps whose value is an UNDECLARED struct over a union arm
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block D · the `list_of_map` container is the census's hottest, silent in 20–45% of cells at every nominal-ingredient combination including the empty one**
+### D186 — [CLOSED 2026-08-27 by D203] a list of maps whose value is an UNDECLARED struct over a union arm
+**check-clean invalid wasm, closed 2026-08-27 by D203's destination rung · found 2026-08-27 by the CENSUS grid, block D · the `list_of_map` container is the census's hottest, silent in 20–45% of cells at every nominal-ingredient combination including the empty one**
 
 Repro:
 
@@ -8407,6 +8407,333 @@ Repro:
   measurement here ties them.
 * Census population: **the `list_of_map` container carries 3,439 of block A's 12,673 silent
   cells (27%)** on 8.5% of its cells, the highest of the twelve containers.
+
+---
+
+### D203 — [CLOSED 2026-08-27] an un-annotated `Map()` never saw the DECLARED destination it is stored into
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid's `cont`-only rescue family (1,992 cells) · closed by the destination rung in `letMapShapeOf` (`letMapDestShape`)**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    const lv1 = Map()
+    lv1["k0"] = { r: { c2: 1 } }
+    const c: {[string]: {[string]: Circle}} = Map()
+    c["k0"] = lv1
+    const g0 = (c)["k0"] ?? Map()
+    const g1 = (g0)["k0"] ?? { r: { s2: 1 } }
+    if (g1).r is Cir2 { print(7) } else { print(0) }
+    // before: vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **THE ROOT IS ONE DIRECTION OF INFERENCE.** `const lv1 = Map()` takes its VALUE type from
+  the checker at the FIRST key write, and that inference never looks forward:
+  `lv1["k0"] = { r: {c2: 1} }` pins the object literal's own type, `{r: {c2: i32}}`. The
+  destination `c` then declares `{[string]: Circle}`, the checker accepts the store (the
+  literal's field type is a strict SUBTYPE of `Shape2`), and the emitter is left with two map
+  structs for one map — the binding's cell keyed on the render, the destination's vals element
+  on the declaration.
+* **THE CONTAINER AXIS IS NOT ABOUT CONTAINERS.** Every silent cell in the census's
+  `cont`-only family has an UN-ANNOTATED MAP holding the payload: `nestedmap`, `map3`,
+  `list_of_map`, `structfield`, `structfield2`. The five containers that RUN — `bare`,
+  `list`, `listlist`, `mapval`, `map_of_list`, `forin` — either have no map at all or have the
+  map at the OUTERMOST binding, where `annpos=binding` annotates it. `annpat=inner` (annotate
+  the innermost intermediate level) rescues every one of the five, and `annpat=mid` rescues
+  none: the discriminator is the annotation on the map binding, not the container's shape.
+* **THE CONTAINER-BY-CONTAINER TABLE IS WHAT SHOWS IT IS ONE ROOT AND NOT EIGHT.** Asked of
+  each `cont` level, "which rung answers the payload's rep/nominal identity for an
+  INTERMEDIATE binding, and does it consult the destination":
+
+  | `cont` | layers | intermediate binding | rung that answers the payload's identity | base, `rep=arm` |
+  |---|---|---|---|---|
+  | `bare` | — | none | the binding's own annotation | runs |
+  | `list` | L | none | `arrLitElemName` → `structIndexOfObj` | runs |
+  | `listlist` | L,L | inner `ArrayLit`, INLINE | `arrLitElemName`, nested arm | runs |
+  | `list3` | L,L,L | — | — | loud (`nested arrays are not supported`) |
+  | `mapval` | M | none — the map IS the annotated binding | `letMapShapeOf`, annotation arm | runs |
+  | `forin` | L | none | `arrLitElemName` | runs |
+  | `map_of_list` | M,L | inner `ArrayLit`, INLINE | `arrLitElemName` under the outer map's annotation | runs |
+  | `nestedmap` | M,M | **an un-annotated `Map()`** | `letMapShapeOf` → `mapFindShapeOfNodeTy` | **silent** |
+  | `map3` | M,M,M | **two un-annotated `Map()`s** | same | **silent** |
+  | `list_of_map` | L,M | **an un-annotated `Map()`** | same | **silent** |
+  | `structfield` | S,M | **an un-annotated `Map()`** | same | **silent** |
+  | `structfield2` | S,S,M | **an un-annotated `Map()`** | same | **silent** |
+
+  Two rungs, not eight. `arrLitElemName` answers with `sNames[structIndexOfObj(elems[0])]` —
+  the row the literal is BUILT as — and `mapFindShapeOfNodeTy` answers with
+  `tyToEmitName` of what the CHECKER inferred. **The list is not immune, it is lucky**: its
+  destination's element slot is keyed by the same `structIndexOfObj` adoption, so the two
+  sides agree by construction. Where a list has no destination either, the luck runs out —
+  that is D209.
+* Census population: **2,032 cells whose ONLY one-step rescue is `cont`**, re-graded on
+  `1e81b0f3` (the census filed 1,992 on `1559d80c`), witness `cellsB/b024546.vl` at 226
+  bytes — the smallest in the family. Blocks B/C/D/E, 100,014 cells, move **2,644, every one
+  `check-clean invalid wasm` → `runs`**: 0 into a silent class and 0 `runs` lost, silent
+  8,854 → 6,210.
+* **THE REP AXIS DECIDES LOUD vs SILENT, AND IT IS THE SUBTYPING STEP.** Over the 192-cell
+  `rep × cont` matrix at `pval=single`, the five containers fail at exactly three reps — the
+  three where the literal's inferred field type is a strict subtype of the declared one:
+  `arm` (`{c2: 1}` against `Shape2`) is check-clean invalid wasm, `nul` (`7` against
+  `i32 | null`) and `i64` (`7` against `i64`) are the LOUD `-3` floor
+  ("unsupported map value type … interned no mv slot"). At `rep=i32` the two coincide
+  structurally and every cell runs.
+* **THE FIX IS A FIND, NOT A MINT** (D-MAPNODETY's rule). Every slot `letMapDestShape`
+  returns was already interned by the DESTINATION'S OWN annotation walk, so the rung can only
+  land the binding on a slot that exists; it interns nothing and skips no mint.
+* **AND IT REFINES AN ANSWER RATHER THAN SUPPLYING A MISSING ONE.** The destination is
+  consulted only where the initializer's own resolution already named a slot — the rung
+  corrects WHICH slot, which is this silent half. The LOUD `-3` half is D207, and the bound
+  is measured there rather than argued here.
+* Fixture: `tests/cases/maps/inferred-map-destination-shape.vl` (all five containers, both
+  reps, plus the nothing-annotated control).
+
+---
+
+### D204 — [CLOSED 2026-08-27] the same root through a LIST-OF-MAPS destination
+**check-clean invalid wasm, closed 2026-08-27 · found 2026-08-27 by the CENSUS grid, block C · D203's second destination SPELLING, which no single rung covers**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    const lv1 = Map()
+    lv1["k0"] = { r: { c2: 1 } }
+    const c: {[string]: Circle}[] = [lv1]
+    const g0 = c
+    if g0.length > 0 {
+      const g1 = (g0[0])["k0"] ?? { r: { s2: 1 } }
+      if (g1).r is Cir2 { print(7) } else { print(0) }
+    } else { print(0) }
+    // before: vl check rc 0; vl run: type mismatch: expected (ref $type), found (ref $type)
+
+* **THE DESTINATION IS AN ARRAY LITERAL UNDER A REF-ARRAY ANNOTATION**, not an index store,
+  so D203's `dst[k] = m` arm cannot see it. The rung reads the annotation's ref-list slot
+  (`letAnnRefListSlot`), checks the element kind is a MAP (`rlElemKindTbl == 3`), and takes
+  that element's own value slot.
+* Filed apart from D203 because the two arms are independently ablatable and each moves its
+  own cells: deleting this arm alone leaves `cont=list_of_map` silent while `nestedmap`
+  runs.
+
+---
+
+### D205 — [CLOSED 2026-08-27] the same root through a STRUCT FIELD destination
+**check-clean invalid wasm, closed 2026-08-27 · found 2026-08-27 by the CENSUS grid, block B (`b024546`, the family's smallest witness at 226 bytes) · D203's third destination SPELLING**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    type WS1 = { f: {[string]: Circle} }
+    const lv1 = Map()
+    lv1["k0"] = { r: { c2: 1 } }
+    const c: WS1 = { f: lv1 }
+    const g1 = ((c).f)["k0"] ?? { r: { s2: 1 } }
+    if (g1).r is Cir2 { print(7) } else { print(0) }
+    // before: vl check rc 0; vl run: type mismatch: expected (ref $type), found (ref $type)
+
+* **A STRUCT-FIELD DESTINATION IS ALWAYS ANNOTATED** — an object-literal struct binding must
+  name its type (`gencensus.py` records this as a structural entanglement) — which is why
+  `structfield` / `structfield2` are the only two containers in this family that are silent
+  even at `annpat=none`: their outer binding carries an annotation whatever the axis says.
+* The rung reads `letAnnStructIdx` for the annotated let, `sFieldIndex` for the field the
+  binding is written into, and takes the field row's recorded (KEY, VALUE) through
+  `sFieldMapShape` — the same column the CONSTRUCT and the type section read.
+
+---
+
+### D206 — [CLOSED 2026-08-27] the same root at depth THREE, where the middle map is un-annotated too
+**check-clean invalid wasm, closed 2026-08-27 · found 2026-08-27 by the CENSUS grid, block C · the deepest cell of the family and the last one a KEY-level fix could not reach**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    const lv2 = Map()
+    lv2["k0"] = { r: { c2: 1 } }
+    const lv1 = Map()
+    lv1["k0"] = lv2
+    const c: {[string]: {[string]: {[string]: Circle}}} = Map()
+    c["k0"] = lv1
+    const g0 = (c)["k0"] ?? Map()
+    const g1 = (g0)["k0"] ?? Map()
+    const g2 = (g1)["k0"] ?? { r: { s2: 1 } }
+    if (g2).r is Cir2 { print(7) } else { print(0) }
+    // before: vl check rc 0; vl run: type mismatch: expected (ref $type), found (ref $type)
+
+* **TWO UN-ANNOTATED MAPS IN A CHAIN**, and the rung resolves them in order: `lv1`'s
+  destination is `c`'s declared value, and `lv2`'s destination is `lv1` — whose shape the
+  rung has just decided. The recursion is the existing `mapShapeOfExpr` one, so no new
+  descent was written.
+* **THIS IS THE CELL THAT REFUTED THE KEY-LEVEL FIX.** A first cut re-keyed the mv table
+  entry from the render to the adopted struct row's name; on this program it re-keyed the
+  middle map's value while the outer slot's parallel arrays were mid-push and the COMPILER
+  TRAPPED out of bounds on seven of the fourteen `rep`s at `cont=map3`. See D210.
+
+---
+
+### D207 — the LOUD half of the same root: the `-3` map-value floor, DELIBERATELY not taken
+**loud emit reject · found 2026-08-27 by the CENSUS grid's `rep × cont` matrix · the same seam as D203 reported through the mv layer's unsupported-value sentinel instead of through invalid wasm — and the half D203's rung is BOUNDED away from, measured**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    const lv1 = Map()
+    lv1["k0"] = { r: 7 }
+    const c: {[string]: {[string]: Circle}} = Map()
+    c["k0"] = lv1
+    const g0 = (c)["k0"] ?? Map()
+    const g1 = (g0)["k0"] ?? { r: 0 }
+    if (g1).r != null { print(7) } else { print(0) }
+    // before: vl run:
+    //   emitProgram: unsupported map value type (no rep for a union-member struct, a
+    //   nullable list over an unnamed element rep, or a nullable litunion-result closure;
+    //   any other value type here interned no mv slot)
+
+* **THE MESSAGE'S OWN TAIL CLAUSE NAMES IT CORRECTLY**: "any other value type here interned
+  no mv slot" — a compiler gap, not a language limit. `structIndexByValName("{r:i32}")`
+  refutes `Circle`'s row (the render's field code is 0, the row's is the union box), so the
+  layer has no kind at all for a value it lowers perfectly well under the destination's name.
+* **D203'S RUNG COULD ANSWER IT AND IS BOUNDED AWAY FROM DOING SO, ON A MEASUREMENT.** The
+  destination is consulted only where the initializer's own resolution already named a slot,
+  so the rung corrects WHICH slot and never supplies a missing one. Un-bounded it takes this
+  half too — 2,254 loud cells of census block C to `runs` — at the cost of **620 cells moving
+  from a loud reject to check-clean invalid wasm**, every one at `cont=list_of_map` with
+  `claim >= 1`: a container ALIAS plus a spare value of it, which is D181, still open, and
+  reached only because the map now resolves while the alias's second claim on the same layout
+  does not. Block B is the same shape at 85 cells and block E at 184.
+  **Closing D181 is what unblocks this row**, and the bound is the one line to delete when it
+  is: `letMapShapeOf`'s `if ish >= 0`.
+* **THE SMALLEST WITNESS NEEDS NO CONTAINER AT ALL** and is worth keeping separate, because
+  it shows the adoption is upstream of every container:
+
+      type Circle = { r: i32 | null }
+      const lv1 = Map()
+      lv1["k0"] = { r: 7 }
+      print(lv1.size)
+
+  Delete the `type Circle` line and it runs. `structIndexOfObjCtx` adopts the literal onto
+  Circle's row through `anonValueFitsField`'s union-box leniency, which also SUPPRESSES the
+  `#anon` row `collectAnonShapes` would have minted (its gate is `structIndexOfObj(ai) < 0`),
+  and the mv layer then asks under a render that names nothing. **That witness is still a
+  loud reject and is filed OPEN as D209** — D207 closes only the half with a destination.
+* Census population: this rep half is the `loud emit reject` column of the family — 24 of
+  the 36 cells an UNBOUNDED D203 moves in a 770-cell `annpat × cont × rep` probe, against 12
+  `SILENT → runs`. The shipped rung takes the 12.
+
+---
+
+### D208 — an un-annotated map of LISTS, with nothing annotated anywhere
+**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid's `annpat` axis · the residue of D203's family: the ONE container × `annpat` corner the destination rung cannot reach, because there is no declared destination to read**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    const lv1 = [{ r: { c2: 1 } }]
+    const c = Map()
+    c["k0"] = lv1
+    const g0 = (c)["k0"] ?? []
+    const g1 = g0
+    if g1.length > 0 {
+      if (g1[0]).r is Cir2 { print(7) } else { print(0) }
+    } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **NO ANNOTATION EXISTS ANYWHERE IN THE PROGRAM**, so D203's rung correctly declines: there
+  is no declared destination whose shape could be adopted. The two identities that disagree
+  are both inferred — the LIST's element (which `arrLitElemName` resolves through
+  `structIndexOfObj` to `Circle`'s row) and the map's VALUE (which the checker renders
+  `{r:{c2:i32}}`).
+* **THIS IS THE `arrLitElemName` SIDE OF THE SAME ADOPTION.** The array-literal element name
+  is `sNames[structIndexOfObj(elems[0])]`, i.e. the row the literal is BUILT as; the map value
+  name is `tyToEmitName` of what the CHECKER inferred. D203 aligned the map with a
+  destination; nothing aligns these two with each other.
+* Reached at exactly 3 of 770 cells in the `annpat × cont × rep` probe — `annpat=none ×
+  cont=map_of_list × rep ∈ {arm, f64lit, numlit}` — and unmoved by the D203 fix in either
+  direction.
+
+---
+
+### D209 — a declared struct CAPTURES an anonymous literal the checker never widened
+**check-clean invalid wasm · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all and unfixed by D203's destination rung**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    const lv1 = [{ r: 7 }]
+    print((lv1[0]).r)
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected i32, found (ref $type)
+
+* **DELETE THE `type Circle` LINE AND IT PRINTS 7.** The declaration is not used, not
+  annotated onto anything, and not mentioned by the binding — its mere presence changes how
+  the literal is emitted. `structIndexOfObjCtx` resolves `{ r: 7 }` by field-name set with
+  `anonValueFitsField`'s refutation-only widening (a union-BOX field accepts every atom), so
+  the literal takes Circle's row and its `r` is emitted BOXED. The CHECKER meanwhile types
+  the binding `{r: i32}[]` — provable in one line: `if (lv1[0]).r != null { … }` is a LOUD
+  "cannot compare i32 with null".
+* **THE ADOPTION ALSO SUPPRESSES THE ROW THAT WOULD HAVE AGREED.** `collectAnonShapes`
+  interns an `#anon` row only `if structIndexOfObj(ai) < 0`, so the shape the checker named
+  is never interned at all and no downstream layer can find it.
+* **NOT CLOSED BY D203, AND DELIBERATELY NOT ATTEMPTED HERE.** Tightening the adoption is a
+  behaviour change at a resolver every literal in every program passes through; the direction
+  that makes this witness run (build the literal at its OWN inferred shape) breaks the
+  currently-RUNNING program `const c: Circle[][] = [lv1]` over the same two lines, where the
+  annotation makes Circle the right row. The two directions need a destination, which is what
+  D203 supplies for maps and what the list element has no rung for.
+* The list is incidental — a `mapval` spelling of the same two lines is the D207 witness's
+  smaller sibling and is a LOUD reject rather than invalid wasm.
+
+---
+
+### D210 — the nothing-annotated nested map that a value-NAME-keyed fix reddens
+**runs today and must keep running · a REFUTATION PIN, measured 2026-08-27 against the first cut of D203's fix**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    const lv1 = Map()
+    lv1["k0"] = { r: { c2: 1 } }
+    const c = Map()
+    c["k0"] = lv1
+    const g0 = (c)["k0"] ?? Map()
+    const g1 = (g0)["k0"] ?? { r: { s2: 1 } }
+    if (g1).r is Cir2 { print(7) } else { print(0) }
+
+* **THIS IS D203'S WITNESS WITH THE ANNOTATION DELETED, AND IT RUNS.** Both maps key on the
+  checker's render, they agree with each other, and the program is correct. That is the floor
+  any fix for D203 has to clear.
+* **THE FIRST CUT OF THE FIX DID NOT.** It re-keyed the mv slot from the render
+  (`{r:{c2:i32}}`) to the DECLARED row the layer's own `structIndexByValName` already
+  resolves (`Circle`) — a pure function of the value NAME, so mint and find compute it
+  identically. It closed 11 silent cells and moved **9 cells from `runs` to check-clean
+  invalid wasm**, every one of them at `annpat=none` over `nestedmap` / `map3` /
+  `list_of_map` at `rep ∈ {arm, f64lit, numlit}`. A gated variant (fire only when the
+  caller banked a value type) traded that for a corpus regression instead —
+  `tests/cases/maps/infer-in-object-literal-field.vl` went from running to
+  `emitProgram: map value type has no interned slot`, because the mint and the find no
+  longer computed the same key.
+* **WHY NO KEY CAN SEPARATE THEM.** D203's witness and this pin differ in exactly one place:
+  whether a THIRD binding carries an annotation. Nothing about this map's own value — its
+  render, its arena type, its row, its canon id — differs between the two programs, so a
+  key computed per value is provably unable to tell them apart. That is D93's "a property of
+  the PAIR that a mint minting one slot at a time cannot see", and it is why D203's fix reads
+  the DESTINATION instead.
 
 ---
 
