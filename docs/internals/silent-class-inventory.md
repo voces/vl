@@ -8632,6 +8632,19 @@ null $type), found (ref $type)`):
   -1, `fbValtype`'s bounds guard fires, and the same root is the LOUD `emitProgram: ref
   valtype with no interned shape`. A grader reading only the loud half would call the silent
   half absent.
+* **THE CLUSTER, RE-DERIVED RATHER THAN QUOTED.** `RESULTS.md` reports 1,896 cells rescued
+  only by `union=nounion`, measured at `1559d80c`. Re-running the whole census against
+  `1e81b0f3` and re-deriving `rescue.py`'s grouping gives **20,804 silent coordinates (not
+  21,436) and 1,518 in that cluster (not 1,896)** — 378 had already closed with D155/D156.
+  Against that baseline the branch moves **180 of the 1,518 to `runs`, 0 to loud, 0
+  backward**, and the split is a COORDINATE rather than a fraction: the 180 are CONSTANT at
+  `deliv=closurearg` while varying over every `store` (all five), every `escope` (all four),
+  `twin`, `union` and `claim` — and `deliv=closurearg` does not appear in the 1,338-cell
+  residue at all, whose own levels are `std`/`boundlocal`/`structread`/`calleedeliv` and
+  whose containers are `map_of_list` and `annpos=readsite` (D157/D158 territory). Across
+  EVERY union-containing cluster (6,496 cells) the branch moves 192, of which 12 are the
+  whole of the `deliv,union` cluster; the `twin,union` (1,436) and `cont,union` (890)
+  neighbours move 0, so they are different roots.
 * **THE `store=capture` POSITION IS A DIFFERENT, LOUD LIMITATION AND NOT THIS ROW.** Calling a
   captured closure BINDING from a nested lambda is `emitProgram: call to unknown function` —
   and it rejects identically with no union, no struct and no twin anywhere (`function
