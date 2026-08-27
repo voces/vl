@@ -8777,11 +8777,12 @@ Repro (on this tree: `emitProgram: object literal is missing a union-variant fie
 
 ---
 
-### D200 — a MODULE-GLOBAL union arm passed as a union-BOX ARGUMENT, beside its layout twin
+### D200 — the union-BOX ↔ bare-ARM seam at a CALL boundary, in both directions
 **OPEN · check-clean invalid wasm on `1e81b0f3` AND on this branch · the residue this PR's own probe found and did NOT close: a THIRD struct-only resolver, on the argument-boxing path**
 
-Repro (seven lines — `vl check` clean, `Invalid input WebAssembly code … type mismatch:
-expected (ref null $type), found (ref $type)` at the start function, on both compilers):
+Repro — direction 1, arm value into a union PARAMETER (seven lines; `vl check` clean,
+`Invalid input WebAssembly code … type mismatch: expected (ref null $type), found (ref
+$type)` at the start function, on both compilers):
 
     type Shape = Circle | Sq
     type Sq = { s: i32 }
@@ -8802,12 +8803,40 @@ expected (ref null $type), found (ref $type)` at the start function, on both com
   * pass the literal directly (`area({ r: 7 })`) — **runs**.
 
   So the coordinate is `store=global × twin=exact × deliv=box-argument`, and it is a genuine
-  silent cell that neither of this PR's two edits touches.
+  silent cell that neither of this PR's two arm-resolution edits touches.
 * **FOUND BY PROBING THE RESIDUE RATHER THAN BY ASSUMING IT WAS EMPTY.** After D195/D196 the
   eight other consumers of the struct answer were re-run on a closure-delivered arm (struct
   equality, list element, map value, struct field, return position, assignment, `as`, and
   this one). Seven were already correct or moved; this one did not move, and its NAMED-callee
   control is silent too — which is what says it is not D195 wearing a different coat.
+
+**Second witness — direction 2, a BOX value into an arm-typed closure PARAMETER.** Not the
+graded program above (a row grades one), but runnable and reproducible, and it is what the
+third edit in this PR exists to keep LOUD. On `1e81b0f3` it is `emitProgram: ref valtype
+with no interned shape`; with D196 alone it becomes check-clean INVALID WASM; on this branch
+it is `emitProgram: value-call union-ARM parameter given a value that is not that arm`:
+
+```vl
+type Circle = { r: i32 }
+type Sq = { s: i32 }
+type Shape = Circle | Sq
+const c = { r: 7 }              // un-annotated in a union program ⇒ reps as the BOX
+const lamc = (x: Circle) => x   // an arm-typed closure PARAMETER
+const dd = lamc(c)
+if (dd).r == 7 { print(7) } else { print(0) }
+```
+
+* `emitCallRef` has a `union`-parameter arm (`emitUnionBoxArg`, boxes an un-boxed member) and
+  had **no `variant`-parameter arm at all**, so a value that reps as the box was pushed raw
+  into a `(ref $uVarHeap[vi])` slot. The DIRECT-call twin handles the same three lines
+  correctly — replace the lambda with `function idc(x: Circle): Circle { x }` and it runs —
+  so this is a value-call ABI gap, not an arm-resolution one.
+* Until D196 the `(Circle) => Circle` key named a struct row that does not exist, so
+  `fbValtype`'s bounds guard rejected one stage earlier and this call site was never built.
+  **Repairing the key moves the disagreement from the type section to the argument** — the
+  D52 half-fix shape — and without a floor exactly ONE census cell of 250,238
+  (`cellsB/b000061.vl`) moves `loud emit reject` → `check-clean invalid wasm`. The floor is
+  in this PR; the UNBOXING is not.
 
 ---
 
