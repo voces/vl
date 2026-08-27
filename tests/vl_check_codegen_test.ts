@@ -375,6 +375,56 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-annotated-arm-local-beside-layout-twin.vl` per the
 // REFILLS procedure below, in the same commit that swapped this constant.
 //
+// THAT D52 SPECIMEN IS CLOSED, and it went the way all but one of its predecessors did: the
+// rule the fix needed was already written and simply not consulted. D39 -- the same seam read
+// from the other end -- was the exception that needed a CHANNEL, because an anonymous
+// `{ r: n }` has two nominal claimants and only the CONTEXT separates them. D52 is not that
+// case, and the distinction is worth keeping: the annotation is on the LOCAL, `criRetLocalLet`
+// already hands the result-valtype pass that very binding, and `letAnnVariantIdx` -- exported,
+// documented "the union-VARIANT table index a `LetDecl`'s annotation names" -- reads one
+// unambiguous nominal answer off it. There was nothing to carry. What WAS missing is the
+// ROUTE the answer travels: `fRetKind` had no inferred `"variant"` tier and
+// `emitOneFuncType`'s inferred `infSlot` ladder had no `variant` arm -- the three items D51's
+// row had predicted in writing.
+//
+// THE HALF-FIX IS WORTH RECORDING BECAUSE IT LOOKED LIKE A WHOLE ONE. With only the functype
+// corrected, `mk` validated and the CALLER did not: `print(mk(7).r)` lowered `struct.get 0 0`,
+// the layout twin's row, over a `(ref 1)` receiver. The engine's complaint moved from `mk` to
+// the start function and changed one word (`expected (ref null $type)`). A grader reading only
+// "still invalid_wasm" cannot tell that from no progress; the disassembly can, and did.
+// `fnRetVariantIndexSid`'s un-annotated arm is the other half, and it follows that function's
+// own stated rule -- gate on the predicate the callee's functype result is emitted from.
+//
+// 180 of a 9,450-cell grid moved and NONE moved backward: 84 check-clean invalid wasm and 96
+// loud emit rejects, all to `runs`. D66 closed with it, moving loud -> runs and retiring the
+// asymmetry its own row recorded ("annotate the CALLBACK'S RETURN; annotating the local does
+// not"). Corpus: of 2,278 files, 1,851 emit under both compilers and 1,850 are byte-identical
+// -- the single difference is this specimen's own predecessor pin. Graduated to
+// `tests/cases/unions/annotated-arm-local-return-beside-layout-twin.vl`, five cells including
+// the PARAMETER storage class, and
+// `xfail-miscompile-annotated-arm-local-beside-layout-twin.vl` is DELETED, which is that
+// file's own written instruction for the day it starts passing.
+//
+// THE SUCCESSOR IS AGAIN THAT CHANGE'S OWN RESIDUE -- the fifth source, and the closing grid
+// names its axis outright. All 116 surviving silent cells are `decl=arm` and every one has an
+// exact-layout twin; 104 of them carry NO annotation on the local, which is what says they are
+// D39's channel problem rather than D52's missing call. The largest single leg is the module
+// GLOBAL destination (48 cells), its twin is a callee PARAM (40): an anonymous `{ r: n }`
+// whose nominal claimant is decided by the DESTINATION's annotation, at a destination
+// `synthRetPinAnn` does not reach. It is `silent-class-inventory.md` D81.
+//
+// Its axis is one line: DELETE `Dot` and it runs. So does annotating the local `: Circle`,
+// which is the D52 rung this change installed. Re-RUN against this tree at the swap rather
+// than inherited: `vl check` rc 0 with one redundant-annotation HINT and no error, `--codegen`
+// rc 1 with `not valid wasm` + `type mismatch: expected (ref $type), found (ref $type)`,
+// `--codegen --no-validate` rc 0, and NO `emit error` marker. Pre-existing: silent on master
+// `a97c9ae1` too, same message. ONE WARNING carried from the pin: the `return n` and the
+// top-level read are LOAD-BEARING -- a retyped minimisation that drops them is a LOUD
+// `emitProgram: ref valtype with no interned shape`, which is a different program and a
+// different row. Pinned as
+// `tests/cases/soundness/xfail-miscompile-anon-objlit-into-arm-typed-global.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -415,13 +465,14 @@ const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
-  `\n` +
+  `let gsto: Circle = { r: 0 }\n` +
   `function mk(n: i32) {\n` +
-  `  const c: Circle = { r: n }\n` +
-  `  return c\n` +
+  `  const c = { r: n }\n` +
+  `  gsto = c\n` +
+  `  return n\n` +
   `}\n` +
-  `\n` +
-  `print(mk(7).r)\n`;
+  `mk(7)\n` +
+  `print((gsto).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
