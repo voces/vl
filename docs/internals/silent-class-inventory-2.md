@@ -25,51 +25,85 @@ self-contained: **every defect below carries its minimal program and its working
 in full**, and every number carries its denominator, so nothing here depends on the scripts
 surviving the worktree.
 
-## 0a. THIS FILE HAS NEVER BEEN GRADED, AND TEN OF ITS FOURTEEN ROWS ARE STALE
+## 0a. THIS FILE WAS NEVER GRADED UNTIL 2026-08-27 — TEN ROWS ARE NOW CLOSED, AND THE ROW THAT COUNTED THEM WAS ITSELF WRONG
 
-**Filed 2026-08-27, from the D156 close. Not fixed here — read this before quoting any row
-below.**
+**Filed 2026-08-27 from the D156 close; RE-GRADED and closed out 2026-08-27 against master
+`88f21245`, seed 1,455,395 bytes (a self-compilation fixed point, so the seed identifies the
+commit rather than being asserted to).**
 
 `scripts/check-filed-witnesses.py` re-runs each row's own program and reports which no longer
-behave as filed. It could not parse a single row of THIS file, and so has never graded one:
+behave as filed. It could not parse a single row of THIS file, and so had never graded one:
 its parser required a `Repro:` lead-in, and this file writes the program directly under the
 status line (see the header above — *"every defect below carries its minimal program and its
 working control pasted in full"*). All 14 rows reported as `not graded`, in a column that did
-not affect the exit code, so the file has read as fully live since it was written.
+not affect the exit code, so the file read as fully live from the day it was written until the
+parser fix shipped in #1966.
 
-The parser now accepts this file's shape. Graded for the first time, **10 of the 14 rows no
-longer reproduce**:
+### What the first grading said, and what re-measuring it found
 
-| row | filed | today |
-|---|---|---|
-| D1 | compiler trap | **runs** (`1`) |
-| D2 | compiler trap | **runs** (`0`) |
-| D4 | check-clean invalid wasm | **runs** (`aa`) |
-| D5 | check-clean invalid wasm | **runs** (`2`) |
-| D6 | check-clean invalid wasm | **runs** (`1.5`) |
-| D7 | check-clean invalid wasm | **runs** (`1`) |
-| D9 | loud emit reject | **runs** (`2`) |
-| D12 | loud emit reject | **runs** (`1`) |
-| D13 | loud emit reject | **runs** (`2`) |
-| D14 | loud emit reject | **runs** |
+The table below is the ORIGINAL §0a filing, kept verbatim as evidence. **Two of its rows are
+wrong, and both errors run in the direction that flatters the instrument** — which is the
+point worth keeping:
+
+| row | filed | first §0a grading said | RE-MEASURED 2026-08-27 |
+|---|---|---|---|
+| D1 | compiler trap | **runs** (`1`) | runs (`1`) — confirmed |
+| D2 | compiler trap | **runs** (`0`) | runs (`0`) — confirmed |
+| D4 | check-clean invalid wasm | **runs** (`aa`) | runs (`aa`) — confirmed |
+| D5 | check-clean invalid wasm | **runs** (`2`) | runs (`2`) — confirmed |
+| D6 | check-clean invalid wasm | **runs** (`1.5`) | runs (`1.5`) — confirmed |
+| D7 | check-clean invalid wasm | **runs** (`1`) | runs (`1`) — confirmed |
+| D9 | loud emit reject | **runs** (`2`) | runs (`2`) — confirmed |
+| D12 | loud emit reject | **runs** (`1`) | runs (`1`) — confirmed |
+| D13 | loud emit reject | **runs** (`2`) | runs (`2`) — confirmed |
+| D14 | loud emit reject | **runs** | **NOT A MEASUREMENT — see below** |
+| D3 | check-clean silently wrong | *(listed as merely ungradeable)* | **runs (`false`) — it was FIXED** |
+
+* **D14 was never graded, so "runs" was not read off any instrument.** D14 carries no program
+  at all — it is a four-shape summary table — so the checker reported it `not graded (no Repro
+  block)` then and reports it now. The first §0a nevertheless printed a `today` value for it,
+  and that value is half wrong: re-measured shape by shape, D14's **26 loud-emit-reject cells
+  are gone** but its **14 loud-check-reject cells stand unchanged**. D14 is a LIVE row. It has
+  been given a witness — see the row itself.
+* **D3 was fixed and nobody had run it.** §0a listed D3 only as blocked on a missing `// PRINTS`
+  line, so it read as live. Run by hand it prints `false` where the row records `0`. That
+  matters past its own two cells: D3 was the tree's last recorded *silently wrong value*, and
+  the census (`scripts/silent-sweep/census/RESULTS.md`) found **0 wrong values in 250,238
+  cells**. D3's death is what lets that headline stand rather than merely being unwitnessed.
+* **And the tree already knew.** `ROADMAP.md` records, dated **2026-08-22 / `be49bfcc`** — five
+  days before §0a was written — *"the same re-run retired D3 and D4 from
+  `silent-class-inventory-2.md`, D4 being that document's largest filed silent family"*. So the
+  fix was measured, and written down, in a DIFFERENT file, and this one never learned it. That
+  is the sharpest available statement of the one-directional-staleness rule: the failure is not
+  that nobody ran the witness, it is that **running it did not write back to the row**. A
+  correction recorded only in the file the fixer happened to have open is indistinguishable,
+  from the inventory's side, from no correction at all.
+
+So the honest count is **ten rows CLOSED — D1 D2 D3 D4 D5 D6 D7 D9 D12 D13** — not the ten
+§0a named (which included D14 and omitted D3), and not eleven. Four rows stay LIVE: **D8, D10,
+D11** (all loud, as filed) and **D14** (its check-reject half).
 
 That is the one-directional staleness `CLAUDE.md` warns about, at its full extent: a fixed
 defect keeps reading as live because the inventory is not the file the fixer edits — and here
-the instrument that would have caught it was structurally unable to see the file at all.
+the instrument that would have caught it was structurally unable to see the file at all. The
+second-order lesson is the D14 row above: **once an instrument exists, a hand-written summary of
+its output gets trusted as if the instrument had produced it.** D14's `runs` was a guess in a
+table of measurements, and it was indistinguishable from one.
 
-**Re-grading these ten is its own change** and is deliberately not folded into the D156 close
-that found them. Two things are owed with it:
+### The two debts §0a recorded, both now paid
 
-* **D3's status line WRAPS onto a second line.** The grader now joins a wrapped status line,
-  so that no longer blocks it — but D3 declares `check-clean SILENTLY WRONG VALUE`, and the
-  grader requires such a row to carry the wrong output as a `// PRINTS <text>` line inside its
-  own repro (a wrong VALUE is invisible on the three channels it reads). D3's repro says
-  `// vl check rc 0.   Output: 0        <- WRONG` instead, so it stays ungradeable until that
-  line is added.
-* **Once the ten are re-graded, add this file to `DOCS` in `tests/vl_inventory_rows_test.ts`**,
-  which enforces the structural half of the row discipline on every PR. It is scoped to
-  inventory #1 today precisely so that this file's pre-existing debt does not red the tree for
-  an author who is not editing it.
+* **D3 has its `// PRINTS` line.** The grader requires a row declaring `check-clean SILENTLY
+  WRONG VALUE` to carry the wrong output as a `// PRINTS <text>` line inside its own repro (a
+  wrong VALUE is invisible on the three channels it reads). D3's repro now carries the line —
+  recording `false`, the value it produces TODAY — and the row is closed, so the grader wants
+  `runs` and gets it.
+* **This file is now in `DOCS` in `tests/vl_inventory_rows_test.ts`**, which enforces the
+  structural half of the row discipline on every PR. It was scoped to inventory #1 precisely so
+  that this file's pre-existing debt did not red the tree for an author who is not editing it;
+  closing the debt is what lets it in.
+
+`python3 scripts/check-filed-witnesses.py --strict docs/internals/silent-class-inventory-2.md`
+now reports **14 graded · 14 as filed · 0 MOVED · 0 not graded**.
 
 ## 0. What was measured
 
@@ -223,7 +257,9 @@ single-rep.
 ---
 
 ### D1 — an i32-keyed MAP captured by a nested function TRAPS INSIDE THE COMPILER
-**COMPILER TRAP · 8 cells of 8 reachable · check-clean, no diagnostic, no module written**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `1`. FILED AS: COMPILER TRAP · 8
+cells of 8 reachable · check-clean, no diagnostic, no module written. The program below is
+unchanged; what moved is the compiler.**
 
     function body() {
       const m: {[i32]: string} = Map()
@@ -285,7 +321,9 @@ single-rep.
 ---
 
 ### D2 — an empty array literal returned from an ANNOTATED lambda kills `vl check` itself
-**COMPILER TRAP · already filed in `CHANGELOG.md`, re-measured and re-rooted here**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `0`. FILED AS: COMPILER TRAP ·
+already filed in `CHANGELOG.md`, re-measured and re-rooted here. The program below is
+unchanged; what moved is the compiler.**
 
     function body() {
       const fq: () => i32[] = () => { return [] }
@@ -311,8 +349,16 @@ single-rep.
 ---
 
 ### D3 — `print` of a BOOLEAN ARRAY ELEMENT inside a GENERIC body prints `1` / `0`
-**check-clean SILENTLY WRONG VALUE · 2 cells of 2 reachable in the grid, one per input; widened
-by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `false`, the correct value. FILED
+AS: check-clean SILENTLY WRONG VALUE · 2 cells of 2 reachable in the grid, one per input;
+widened by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry. The program
+below is unchanged; what moved is the compiler.**
+
+**This row is why the census's `0 wrong values in 250,238 cells` headline holds.** D3 was the
+tree's last recorded silently-wrong VALUE. §0a listed it as merely ungradeable — blocked on the
+missing `// PRINTS` line below — so nobody had run it, and it read as live while the census was
+reporting that column empty. Running it is what turns that zero from an unwitnessed absence
+into a reading.
 
     function gtake<T>(x: T) {
       print(x[0][1])
@@ -322,8 +368,10 @@ by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
       gtake(xs)
     }
     body()
-    // vl check rc 0.   Output: 0        <- WRONG, must be `false`
-    // with [[false, true]] the output is 1, must be `true`
+    // vl check rc 0.   Output: 0        <- WRONG, must be `false`   [AS FILED 2026-08-27]
+    // with [[false, true]] the output is 1, must be `true`          [AS FILED 2026-08-27]
+    // Measured again 2026-08-27 on master 88f21245: prints the CORRECT value.
+    // PRINTS false
 
 **Control** (the identical body with a CONCRETE parameter — prints `false`):
 
@@ -365,11 +413,26 @@ by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
 * At the same position `set_*` / `map_*` / `flat_*` / `nt_struct` are a LOUD check reject
   (`member access '.length' on non-object T`, 14 cells) — so an unbounded `T` refuses member
   access but *admits* indexing, which is the inconsistency that lets this through (see D14).
+* **RE-MEASURED 2026-08-27, master `88f21245`, all four spellings run verbatim from this file:**
+
+  | spelling | filed | today |
+  |---|---|---|
+  | the repro above, `[[true, false]]` | `0` | **`false`** |
+  | the same with `[[false, true]]` | `1` | **`true`** |
+  | the concrete control (`take(x: boolean[][])`) | `false` | `false` — unchanged |
+  | one dimension down, `gtake2` over `boolean[]` | `1` | **`true`** |
+
+  The wrong-value axis is gone in every spelling the row carries. **The inconsistency the last
+  bullet names is NOT gone**: indexing is still admitted on an unbounded `T` (that is why these
+  programs run at all) while `.length` is still refused, so D14's actionable claim survives D3's
+  fix and D14 stays open on exactly that point.
 
 ---
 
 ### D4 — a generic call whose ARGUMENT is an annotated local, a field read or an element read silently emits an i32 parameter
-**check-clean INVALID WASM · 34 cells, the largest silent family, flat across 7 reps × 3 argument forms**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `aa`. FILED AS: check-clean INVALID
+WASM · 34 cells, the largest silent family, flat across 7 reps × 3 argument forms. The program
+below is unchanged; what moved is the compiler.**
 
     function gid<T>(x: T): T { return x }
     function body() {
@@ -441,7 +504,9 @@ by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
 ---
 
 ### D5 — a generic function forwarding its own type-parameter-typed parameter to a second generic call
-**check-clean INVALID WASM · 8 cells · same root as D4, different branch, DIFFERENT MESSAGE**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `2`. FILED AS: check-clean INVALID
+WASM · 8 cells · same root as D4, different branch, DIFFERENT MESSAGE. The program below is
+unchanged; what moved is the compiler.**
 
     function gid<T>(x: T): T { return x }
     function gwrap<T>(x: T): T { return gid(x) }
@@ -479,7 +544,8 @@ by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
 ---
 
 ### D6 — a generic `T[]` parameter given an ARRAY LITERAL of `f32` elements
-**check-clean INVALID WASM · 2 cells**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `1.5`. FILED AS: check-clean
+INVALID WASM · 2 cells. The program below is unchanged; what moved is the compiler.**
 
     function gfirst<T>(xs: T[]): T { return xs[0] }
     function body() {
@@ -520,7 +586,8 @@ by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
 ---
 
 ### D7 — an i32-keyed SET passed as a PARAMETER and captured by a nested function
-**check-clean INVALID WASM · 2 cells**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `1`. FILED AS: check-clean INVALID
+WASM · 2 cells. The program below is unchanged; what moved is the compiler.**
 
     function mk(): {[i32]: boolean} {
       const s: {[i32]: boolean} = Set()
@@ -595,7 +662,9 @@ by hand to the 1-dimensional `boolean[]`, a rep the grid did not carry**
 ---
 
 ### D9 — a NESTED ARRAY captured by a nested function is a loud emit reject
-**loud emit reject · 360 cells — the largest loud family in the sweep**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `2`. FILED AS: loud emit reject ·
+360 cells — the largest loud family in the sweep. The program below is unchanged; what moved is
+the compiler.**
 
     function body(xs: i32[][]) {
       function inner() { print(xs[0][1]) }
@@ -687,7 +756,8 @@ in-place narrow over a **plain** `i32[]` field prints `2`:
 ---
 
 ### D12 — a nullable MAP or SET captured by a nested function: one axis, three messages
-**loud emit reject · 128 cells**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `1`. FILED AS: loud emit reject ·
+128 cells. The program below is unchanged; what moved is the compiler.**
 
     function mk(): {[string]: i32} | null {
       const m: {[string]: i32} = Map()
@@ -723,7 +793,8 @@ in-place narrow over a **plain** `i32[]` field prints `2`:
 ---
 
 ### D13 — a NESTED ARRAY as a map VALUE, and an i32-keyed map/set as a map value
-**loud emit reject · 88 cells**
+**CLOSED 2026-08-27 — the filed program now RUNS and prints `2`. FILED AS: loud emit reject ·
+88 cells. The program below is unchanged; what moved is the compiler.**
 
     function src(): i32[][] { return [[1, 2]] }
     function body() {
@@ -752,19 +823,54 @@ in-place narrow over a **plain** `i32[]` field prints `2`:
 ---
 
 ### D14 — the `garr` / `gbody` generic shapes over container and record reps
-**loud emit reject 26 cells + loud check reject 14 cells**
+**loud check reject · 14 of this row's original 40 cells — the `x.length` half, re-measured
+2026-08-27 on master `88f21245` and unchanged. The other 26 cells (both `gfirst<T>(xs: T[])`
+shapes and the literal-union `print`) now RUN; see the shape-by-shape table below.**
 
-| shape | reps | verdict |
-|---|---|---|
-| `gfirst<T>(xs: T[])` | the nine nested arrays | `emitProgram: nested arrays are not supported` (18) |
-| `gfirst<T>(xs: T[])` | `flat_rec`, `flat_nest`, `new {x:i32}` | `emitProgram: struct array elements are not supported` (6) |
-| `function gtake<T>(x: T) { print(x.length) }` | both maps, both sets, both flats, `new {x:i32}` | `[ERROR]: member access '.length' on non-object T` (14) |
-| the same body | `new ("p"\|"q")` | `emitProgram: print of a literal-union atom whose type carries no member texts` (2) |
+**This row had no program until 2026-08-27, and that is how it got mis-graded.** D14 was filed
+as a four-shape SUMMARY TABLE with no repro, so `check-filed-witnesses.py` reported it
+`not graded (no Repro block)` — then and now. §0a's first grading nevertheless printed
+`D14 | loud emit reject | runs` for it, which no instrument had produced. Measured shape by
+shape it is half right: the emit-reject half is gone, the check-reject half stands. The witness
+below is the half that is still live, written 2026-08-27 to make the row gradeable — it is a
+NEW program, not the row's original evidence, and it is labelled as such.
+
+Repro (the `x.length` half — a loud check reject, as filed):
+
+    function gtake<T>(x: T) { print(x.length) }
+    function body() {
+      const m: {[string]: i32} = Map()
+      m["a"] = 1
+      gtake(m)
+    }
+    body()
+    // vl check rc 1:  [ERROR]: member access '.length' on non-object T
+
+| shape | reps | verdict AS FILED | RE-MEASURED 2026-08-27 |
+|---|---|---|---|
+| `gfirst<T>(xs: T[])` | the nine nested arrays | `emitProgram: nested arrays are not supported` (18) | **runs** (`2`) |
+| `gfirst<T>(xs: T[])` | `flat_rec`, `flat_nest`, `new {x:i32}` | `emitProgram: struct array elements are not supported` (6) | **runs** (`1`) |
+| `function gtake<T>(x: T) { print(x.length) }` | both maps, both sets, both flats, `new {x:i32}` | `[ERROR]: member access '.length' on non-object T` (14) | **unchanged — still that exact check reject** |
+| the same body | `new ("p"\|"q")` | `emitProgram: print of a literal-union atom whose type carries no member texts` (2) | **runs** (`p`) for `print(x)`; `print(x.length)` gives the row-3 check reject instead |
+
+The programs behind that last column are `scratch`-only and were run verbatim against master's
+seed; each is the minimal spelling of its table row (`gfirst<T>(xs: T[]): T { return xs[0] }`
+applied to `i32[][]` and to `{a: i32}[]`; `gtake<T>` applied to a `{[string]: i32}` and to
+`type NtK = new ("p" | "q")`). **The bound on that re-measurement, stated rather than left to
+be assumed**: row 1 was checked at **three of its nine** nested-array reps (`i32[][]` → `2`,
+`string[][]` → `b`, `f64[][]` → `2.5`), not all nine; rows 2–4 were checked at one rep each,
+which is all they have. So "26 cells now run" is an inference from 3+1+1 measured spellings,
+not 26 measured cells — enough to retire the row's emit-reject half, not enough to call the
+count exact. The 14 check-reject cells are the half this row still asserts, and the witness
+above is one of them.
 
 Controls: the concrete (non-generic) twin of each is correct. `gtake<T>` is arguably by design
 (an unbounded `T` has no members) — but note that `x[0][1]` **is** admitted on an unbounded `T`,
-which is how D3 gets through. The two decisions disagree with each other, and that disagreement
-is the actionable part.
+which is how D3 got through. The two decisions disagree with each other, and that disagreement
+is the actionable part. **D3's fix did not settle it**: D3 now prints the right value, but it
+still runs, so indexing is still admitted while `.length` is still refused. The inconsistency is
+exactly as wide as when it was filed — which is why this row stays open after its emit-reject
+half closed.
 
 ---
 

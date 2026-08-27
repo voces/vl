@@ -8954,6 +8954,103 @@ Repro:
 
 ---
 
+### D211 — the nullable-field nested map that D156's peel turned from a LOUD refusal into invalid wasm
+**check-clean invalid wasm · 12 cells of block A's 150,224 · a LOUD→SILENT move introduced by `1e81b0f3` (#1966, D156) and STILL LIVE on `16d5c6e7` · found by block A's after-pass, 2026-08-27**
+
+Repro (census block A cell `a008328`, verbatim — the graded cell, not a retyping):
+
+    type Circle = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function sink(_x: {[string]: {[string]: Circle}}) { }
+    const lv1 = Map()
+    lv1["k0"] = { r: null }
+    const c = Map()
+    c["k0"] = lv1
+    sink(c)
+    const g0 = (c)["k0"] ?? Map()
+    const g1 = (g0)["k0"] ?? { r: null }
+    if (g1).r != null { print(7) } else { print(0) }
+    // vl check rc 0 with no diagnostics, at all three seeds below.
+    // 1559d80c: vl run -> emit error  emitProgram: ref valtype with no interned shape
+    // 1e81b0f3: vl run -> Invalid input WebAssembly code at offset 2213:
+    //                     type mismatch: expected i32, found (ref null $type)
+    // 88f21245: byte-identical to 1e81b0f3
+
+* **THE MOVE, MEASURED AT FIVE SEEDS, EACH BUILT FROM ITS OWN COMMIT'S SOURCE AND EACH PROVED A
+  SELF-COMPILATION FIXED POINT** (so the byte size identifies the commit rather than being
+  asserted about it):
+
+  | seed bytes | commit | what is in it | outcome for all 12 |
+  |---|---|---|---|
+  | 1,452,766 | `1559d80c` | the census's published base | **loud emit reject**, `ref valtype with no interned shape` |
+  | 1,453,528 | `c55269c9` | **the census's MERGE commit** — #1965 (D155) already in | **loud emit reject** — unchanged |
+  | 1,453,931 | `1e81b0f3` | #1966, the D156 peel | **check-clean invalid wasm** ← THE MOVE IS HERE |
+  | 1,455,395 | `88f21245` | #1969, D203–D206 | check-clean invalid wasm, message byte-identical |
+  | 1,456,293 | `e04b1567` | #1968, D195–D198 | check-clean invalid wasm |
+  | 1,456,371 | `16d5c6e7` | #1970, D181 — **current master** | check-clean invalid wasm — **STILL LIVE**, message byte-identical |
+
+* **ATTRIBUTION IS #1966, NOT #1969, AND THE OBVIOUS READING IS WRONG.** The witness is
+  textbook D203 shape — an un-annotated `Map()` with a DECLARED destination (`sink`) — so the
+  natural story is that #1969's `letMapDestShape` rung supplied a shape the emitter then
+  mis-lowered. It did not: all 12 cells are already invalid wasm at `1e81b0f3`, one commit
+  BEFORE that rung existed, and the validator message does not change across #1969. The shape
+  of a defect is not evidence of which change caused it; the seed ladder is.
+* **AND THE RIGHT BASE IS `c55269c9`, NOT `1559d80c`.** The census PUBLISHED its numbers against
+  `1559d80c` but MERGED as `c55269c9`, with #1965 (D155) landing in between and editing
+  `emit_collect.vl` — so `RESULTS.md`'s figures were already one compiler change stale on the
+  day they merged. Pinning the middle rung matters: without the `c55269c9` seed the 12 cells
+  could equally have been #1965's, and "the census's base" is an ambiguous phrase that names two
+  different compilers. They are loud at `c55269c9`, so #1965 is cleared and #1966 is not.
+* **#1965 IS CLEARED OVER THE WHOLE CENSUS, NOT JUST OVER THESE 12.** Grading every block at
+  `c55269c9` as well makes each merge separable cell-by-cell: **#1965 moves 356 cells (222 in A,
+  134 in B, zero in C/D/E), all forward; #1966 moves 1,350, of which these 12 go backward;
+  #1969 moves 5,746, all forward.** Without the block-A-at-`c55269c9` pass, a cell that #1965
+  moved backward and #1966 moved forward again would have been invisible inside the combined
+  `1559d80c` → `1e81b0f3` span — the same net-hides-the-move error one level up. There are
+  none, but that is a measurement here rather than an assumption.
+* **RE-CONFIRMED LIVE ON `16d5c6e7` (#1970, D181).** #1970 moved 4,482 census cells
+  `invalid wasm → runs`; none of them is one of these 12, whose class AND validator message are
+  byte-identical to `e04b1567`. Re-checked with the 12-cell subset directory rather than a
+  census run — ~10 `vl` invocations — which is the cheap standing check a named backward set
+  earns. **The seed-ladder rows above are spans between FIXED commits and are unaffected by
+  later merges; only this liveness line needs re-running as master moves.**
+* **THE FAMILY IS A FULL 2 × 3 × 2 CROSS** — `store ∈ {global, callres}` × `twin ∈ {none,
+  samearity, armtwin}` × `union ∈ {unused, used}` = exactly 12, with nine axes held constant:
+  `escope=mod`, `declness=byname`, `claim=0`, `cont=nestedmap`, `annpos=dest`, `deliv=direct`,
+  `pval=nullfield`, `order=norm`, `rep=nul`. Every cell that satisfies those nine moved; no
+  cell outside them did. The deciding ingredients are the NULLABLE FIELD (`r: i32 | null`
+  written as `{ r: null }`) and the nested un-annotated map with a declared destination.
+* **MINIMISING THE WITNESS DESTROYS IT.** Deleting the never-referenced `type Sq` / `type Shape`
+  gives a program invalid at `1559d80c` too, so the reduced program is a different, pre-existing
+  defect. **Unused declarations that are inert to the program and load-bearing to the regression**
+  is the trap: the two type aliases are never mentioned again, so every instinct says strike
+  them, and striking them moves the cell from `union=unused` to `union=nounion` — a coordinate
+  that was ALREADY silent at the base. The minimised program still reproduces "check-clean
+  invalid wasm", which is what makes it dangerous: it looks like a successful reduction and it
+  is a different defect. The instinct to minimise a witness is otherwise correct and would have
+  produced a wrong row here. This row is therefore filed with the graded cell verbatim, and the
+  check that catches the mistake is cheap — **run the reduced witness against the BEFORE seed as
+  well, and require it to be loud there.**
+* **WHY IT COUNTS AS BACKWARD THOUGH NO WORKING PROGRAM WAS LOST.** `runs` is untouched — this
+  cell never ran. What changed is that a DIAGNOSED refusal became an undiagnosed invalid
+  module: `vl check` is clean and `vl run` produces a validator error naming wasm offsets
+  instead of a compiler message naming the construct. That is precisely the transition the
+  census exists to count, and it is why `0 runs lost` is not on its own a sufficient after-pass
+  result.
+* **HOW IT SURVIVED, WHICH IS THE PART WORTH FIXING.** #1966 reported "0 backward" and that was
+  TRUE of the grids it ran — its own 1,188-cell position grid and the D112/D131/D88 grids. The
+  census existed by then (it merged as `c55269c9`, one commit earlier) and was not re-graded, so
+  a population that contained these 12 cells was never consulted. Nothing in the gate ladder
+  required it. The same shape appears in #1952's and #1954's reports. The standing check this
+  argues for is in `scripts/silent-sweep/census/README.md` under *Grading a MERGED change*.
+* **NOT FIXED HERE, DELIBERATELY.** Filed for #1966's author to see the measurement first.
+  D171 is the neighbouring row from the same peel and is `check-clean invalid wasm` too, but it
+  is filed as PRE-EXISTING on `ff04d74b` and its witness carries a non-nullable `Circle = { r:
+  i32 }`; this row is a cell that the peel MOVED, and the nullable field is what separates them.
+
+---
+
 ### D171 — the CONTESTED half of D156's peel: a half-pinned chain is worse than an un-pinned one
 **check-clean invalid wasm · found 2026-08-27 in D156's ablation · D156's own filed witness, plus 12 cells of the 1,188-cell position grid and 4 of the 1,114-cell D112 grid · pre-existing on merged master `ff04d74b`**
 

@@ -4,7 +4,14 @@ Every number below is the verbatim output of the script named above it, re-runna
 the commands in `README.md`.  Cell programs and per-cell results are not committed
 (250,238 files, ~180 MB); they regenerate.
 
-## Per block
+## Per block — measured at `1559d80c`, seed 1,452,766 bytes
+
+**This table describes ONE compiler and says which.** It is now several merges behind master
+(#1965, #1966, #1969, #1968, #1970 have all landed since), and that is fine — a census figure is
+a fact about the tree it was measured at, and stays correct as long as it names it. What is NOT
+fine is an unlabelled figure: the census MERGED as `c55269c9`, one compiler change after this
+table was taken, so "the census base" named two different compilers and cost an extra seed to
+disambiguate. See `README.md` §*Every census figure names the commit it was measured at*.
 
 | block | cells | runs | loud check reject | loud emit reject | check-clean invalid wasm | compiler trap | SILENT |
 |---|---|---|---|---|---|---|---|
@@ -18,6 +25,165 @@ the commands in `README.md`.  Cell programs and per-cell results are not committ
 `runs but wrong value` = 0 and `trap_loads` = 0 across the whole census.  Both columns are
 proved able to fire on demand by `sabcensus.py` (4 and 3 respectively), so these are
 readings, not blind spots.
+
+## BLOCK A's AFTER-PASS — `1559d80c` → `88f21245`, graded 2026-08-27
+
+Block A is 60% of the census and was the one block with no after-pass: #1969 graded B/C/D/E
+and its report records block A as *"still grading at hand-off"*.  This is that pass.  Method:
+ONE generated cell directory, graded against THREE seeds each built from source at its own
+commit and each self-verifying as a self-compilation fixed point — `1559d80c` at 1,452,766
+bytes, `1e81b0f3` at 1,453,931, `88f21245` at 1,455,395.  Nothing is graded against a
+working-tree `build/vl-compiler.wasm`.
+
+**The before-pass reproduces this file's ENTIRE published table on all six columns** — all five
+blocks, 250,238 cells, from seeds and cell directories regenerated from scratch (A 150,224 /
+60,197 / 49,715 / 27,639 / 12,673 / 0, and B, C, D, E each exact including block D's two
+compiler traps). That validates the rebuilt seed, the regenerated cells and the grader in one
+measurement rather than assuming any of the three, and it is what makes the deltas below
+attributable to the compiler rather than to the harness.
+
+| | cells | runs | loud check | loud emit | check-clean invalid wasm | SILENT | rate |
+|---|---|---|---|---|---|---|---|
+| before `1559d80c` | 150,224 | 60,197 | 49,715 | 27,639 | 12,673 | 12,673 | 8.44% |
+| after `88f21245` | 150,224 | 63,821 | 49,715 | 27,513 | 9,175 | 9,175 | **6.11%** |
+| delta | 0 | **+3,624** | 0 | −126 | **−3,498** | −3,498 | −2.33pt |
+
+### The cell-level transition matrix — `delta.py`, which is why the net is not the answer
+
+**Per-PR, cell-matched.** The span `1559d80c` → `88f21245` covers TWO compiler merges, so the
+span delta cannot name which one moved a cell. Split at `1e81b0f3`:
+
+```
+1559d80c -> 1e81b0f3   (#1965 D155 + #1966 D156)   moved 606 of 150,224
+     336  check-clean invalid wasm -> runs                       (forward)
+     186  loud emit reject         -> runs                       (forward)
+      72  check-clean invalid wasm -> loud emit reject           (forward)
+      12  loud emit reject         -> check-clean invalid wasm   <== BACKWARD
+
+1e81b0f3 -> 88f21245   (#1969 D203-D206 ALONE)      moved 3,102 of 150,224
+    3102  check-clean invalid wasm -> runs                       (forward)
+#1969 backward: 0.  #1969 into-silent: 0.  Every cell it moved, it moved forward.
+```
+
+**#1969 is clean on block A** — the same shape its own report claims for B/C/D/E, now measured
+on the block that was outstanding. The 12 backward cells belong to the earlier span, and graded
+against a `c55269c9` seed (1,453,528 bytes, #1965 in and #1966 not) they are still LOUD, so
+#1965 is cleared and #1966 owns them.
+
+A per-class histogram is a NET.  A block can hold its silent total exactly while cells fall
+out of `runs` and different cells fall in.  `delta.py` matches cells BY NAME across the two
+gradings, so the unit is the cell:
+
+```
+unchanged: 146516 of 150224 (97.53%)   moved: 3708
+   3438  check-clean invalid wasm -> runs                       (forward)
+    186  loud emit reject         -> runs                       (forward)
+     72  check-clean invalid wasm -> loud emit reject           (forward)
+     12  loud emit reject         -> check-clean invalid wasm   <== BACKWARD
+```
+
+**N cells moved backward (`runs` before, NOT `runs` after): 0.**  No working program was lost.
+
+**N cells moved INTO a silent class: 12**, and they are the finding.  They are filed as **D211**
+in `docs/internals/silent-class-inventory.md`.  Three things about them:
+
+* They are a full **2 × 3 × 2 cross** — `store ∈ {global, callres}` × `twin ∈ {none, samearity,
+  armtwin}` × `union ∈ {unused, used}` — with nine axes held constant (`cont=nestedmap`,
+  `annpos=dest`, `pval=nullfield`, `rep=nul`, `escope=mod`, `declness=byname`, `claim=0`,
+  `deliv=direct`, `order=norm`).  A loud `emitProgram: ref valtype with no interned shape`
+  became a check-clean module the engine rejects.
+* **They belong to #1966 (`1e81b0f3`), not #1969.**  Graded against a third seed they are
+  already invalid wasm one commit before #1969's rung existed, with a byte-identical validator
+  message.  The witness is textbook D203 shape — an un-annotated `Map()` with a declared
+  destination — so the obvious attribution is the wrong one, and only the seed ladder separates
+  them.
+* **#1966 never had a census after-pass of its own.**  #1969's B/C/D/E figures are measured
+  from `1e81b0f3`, not from this file's base: its report's before-silent for those four blocks
+  is 8,854 where this file's table gives 9,092.  That 238-cell gap IS #1966's effect on
+  B/C/D/E, and it was never graded in either direction.  Whether it too contains a loud→silent
+  move is open — this pass measured block A, not B/C/D/E.
+
+### Grader validation, re-run against the compilers actually measured with
+
+`scripts/silent-sweep/sabotage.py` reproduces its published counts exactly on the `88f21245`
+seed: **15 wrong_value / 10 wrong_evalcount / 8 trap / 5 correct**.
+
+`sabcensus.py` as it stood at `1559d80c` reproduced its published counts exactly there, and read
+**2 invalid-wasm / 5 runs** from `c55269c9` onward: its `iw_d155` cell was fixed by **#1965
+(D155)**, the row it was modelled on.  #1970 has since refreshed the specimens, and the CURRENT
+file reproduces its predicted **4 / 4 / 3 / 3 / 3 / 3 exactly on `16d5c6e7`** — re-run here, not
+inherited.  Caveat 1 below tracks the full churn.
+
+The two columns the census's zeros actually depend on — `runs but wrong value` (4) and
+`trap_loads` (3) — fired unchanged on **all six** seeds tested (1,452,766 / 1,453,528 /
+1,453,931 / 1,455,395 / 1,456,293 / 1,456,371), so the grader's discriminating power is stable
+even while the perishable REFUSAL columns move.
+
+`delta.py`'s backward detector was shown to FIRE, not just to report zero: inverting the two
+gradings turns the same `iw_d155` cell into a `runs` LOST.
+
+## THE WHOLE CENSUS, PER PR — and the base that named two compilers
+
+Extending the after-pass to B/C/D/E (100,014 cells) against the census's MERGE base makes
+every merged change since the census gradeable separately.  **`c55269c9` is that base, not
+`1559d80c`**: the census published its table against `1559d80c` and merged as `c55269c9`, with
+**#1965 (D155) landing in between and editing `emit_collect.vl`**.  So the per-block table at
+the top of this file never described the tree the census merged into — block B alone differs by
++129 `runs` and −112 silent between those two commits.  Every later report that says "against
+the census base" inherits that ambiguity, and pinning the middle rung is what separates #1965
+from #1966.
+
+| span | who | block A moved | A: `runs` lost | **A: → silent** | B/C/D/E moved | BCDE lost | BCDE → silent |
+|---|---|---|---|---|---|---|---|
+| `1559d80c` → `c55269c9` | #1965 D155 | 222 | 0 | 0 | 134 | 0 | 0 |
+| `c55269c9` → `1e81b0f3` | **#1966 D156** | 384 | 0 | **12** ← D211 | 966 | 0 | 0 |
+| `1e81b0f3` → `88f21245` | #1969 D203–D206 | 3,102 | 0 | 0 | 2,644 | 0 | 0 |
+| | **all three** | **3,708** | **0** | **12** | **3,744** | **0** | **0** |
+
+**These spans are between FIXED commits, so they are historical and are NOT invalidated by later
+merges** — #1968 and #1970 have landed since and change nothing above. Only a LIVENESS claim
+("D211 is still silent") is about a moving head; that one is re-run per head and is re-confirmed
+at `16d5c6e7` (seed 1,456,371), where all 12 cells are still `check-clean invalid wasm` with a
+byte-identical validator message despite #1970 moving 4,482 census cells forward.
+
+Every figure above is CELL-MATCHED — `delta.py` over two gradings of ONE generated cell
+directory — not a difference of two per-class histograms.  The distinction is not academic:
+block A's #1966 row shows 0 `runs` lost and 12 cells into a silent class simultaneously, and
+its loud-emit column moved by −180 (168 out to `runs`, 72 in from invalid wasm, 12 out to
+invalid wasm), so the 12 are arithmetically invisible in any column delta.
+
+**#1966's whole-census effect is 12 backward cells, and all 12 are in block A.**  B/C/D/E are
+clean in both directions for it (966 cells moved: 840 `loud emit reject → runs`, 121
+`invalid wasm → runs`, 5 `invalid wasm → loud emit reject`).  Block D moved nothing at all.
+That is exactly why block A mattered — it is 60% of the census and the only block carrying the
+`cont=nestedmap × annpos=dest × pval=nullfield × rep=nul` corner D211 lives in.
+
+**#1965 is clean everywhere** (222 cells in block A, 134 in B — C, D and E move ZERO cells
+for it — all forward), which is what clears it of
+D211 over the whole block rather than over the 12-cell subset alone.  That distinction had to be
+measured: without block A graded at `c55269c9`, a cell #1965 moved backward and #1966 moved
+forward again would have been invisible inside the combined `1559d80c` → `1e81b0f3` span — the
+same net-hides-the-move error, one level up.  There are none.
+
+**INDEPENDENTLY CROSS-VALIDATED AGAINST #1970.**  That PR re-graded the whole census for D181
+and published its own `1e81b0f3` column.  Two separately built seeds, two separately generated
+cell directories, two runs — and every block agrees exactly:
+
+| silent at `1e81b0f3` | A | B | C | D | E | total |
+|---|---|---|---|---|---|---|
+| #1970's table | 12,277 | 3,023 | 3,765 | 155 | 1,911 | 21,131 |
+| this after-pass | 12,277 | 3,023 | 3,765 | 155 | 1,911 | 21,131 |
+
+Agreement over a population that COULD have disagreed is worth more than either run alone: the
+two used different seed files on disk and different generated cells, so a harness-side error
+would have had to hit both identically.
+
+**#1969's published figures reproduce EXACTLY**, independently, from seeds built here:
+2,644 cells moved across B/C/D/E (898 + 1,169 + 88 + 489), every one `check-clean invalid wasm →
+runs`, silent **8,854 → 6,210**, 0 backward, 0 into silent — and block A adds 3,102 more, also
+all forward.  #1969 measured from `1e81b0f3`, which genuinely WAS its merge base; its report is
+accurate and its "0 into a silent class" now holds over the whole census rather than four
+blocks of it.
 
 ## coverage.py — the guarantee, re-derived from the generated manifests
 

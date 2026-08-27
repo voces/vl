@@ -37,6 +37,23 @@ The PR gate has more parts than `deno task test`. In order:
 4. `scripts/rep-fuzz-check.sh` — **mandatory** for anything touching the rep layer or the
    interner; the corpus, the suites and the fixpoint are all blind to REJECT→MISMATCH
 5. `scripts/mono-tyaram-grid.sh` for monomorphizer changes
+6. **The census after-pass — mandatory for an emit/rep lowering change.** Re-grade the census
+   CELL-MATCHED against the change's MERGE BASE and report two numbers: **`runs → not-runs`**
+   and **`→ silent`**. `scripts/silent-sweep/census/delta.py` prints both, plus the transition
+   matrix. Protocol and the seed discipline it needs:
+   `scripts/silent-sweep/census/README.md` §*Grading a MERGED change*.
+
+   **A per-row grid's "0 backward" does not cover this, and saying so is not pedantry** — it is
+   what #1952, #1954 and #1966 each reported truthfully before a wider population showed
+   otherwise. A grid holds constant the axes it was not chasing. **Nor do per-class column
+   deltas**: block A lost 0 `runs` and still moved 12 cells loud→silent while its loud-emit
+   column moved by −126 (186 out, 72 in), so the regression was arithmetically invisible in the
+   histogram. Only a cell-matched matrix answers *did any individual cell get worse*.
+
+   It is ~35 min at `JOBS=4` and deliberately NOT part of `deno task test`; run it unattended
+   beside the other gates. **Do not substitute a sample** — the families this finds are ~12
+   cells in 150,224, and catching one at 95% needs 22% of the block (a 1-cell regression needs
+   95%), so no affordable sample is sufficient. Full run or nothing.
 
 **Read a gate by its exit code or its summary line, never by `tail -1`.** `lint-self.sh`
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a
