@@ -5167,6 +5167,44 @@ recognised the operands at all.
   struct-first read a `(ref null $uVarHeap[vi])` through `sHeapIdx` and stayed check-clean
   invalid wasm (`expected (ref null $type), found (ref null $type)`, identical on `a97c9ae1`).
   `arm-struct-equality-nullable-niche.vl` carries that cell.
+* **THE FIX IS THREE PARTS, AND AN ABLATION ON THE MERGE BASE SEPARATES THEM.** One compiler
+  per cumulative stage, each built from its own sources, all four graded over the same 770
+  cells. **A** = master `2ea654d2`. **B** = the DISPATCH rung alone. **C** = B + the
+  FRAME-RESERVATION scan. **D** = C + the REFUSAL gate (the branch).
+
+  | stage | runs | check-clean invalid | loud emit | loud check |
+  | --- | --: | --: | --: | --: |
+  | A master `2ea654d2` | 224 | 294 | 202 | 50 |
+  | B + dispatch | 488 | 60 | 172 | 50 |
+  | C + reservation scan | 524 | 24 | 172 | 50 |
+  | D + refusal gate | **524** | **0** | 196 | 50 |
+
+  The stages are DISJOINT: A→B moves 264 cells (234 silent→runs, 30 loud→runs), B→C moves 36
+  (silent→runs), C→D moves 24 (silent→LOUD), and no cell moves twice.
+* **WHAT THE DISPATCH ALONE DID IS NOT WHAT A FIRST DRAFT OF THIS ROW SAID, AND THE ABLATION IS
+  WHAT CORRECTED IT.** The claim was "the dispatch alone created a NEW silent cell". It did not:
+  A→B has **0 loud→silent moves**. What it did is worse to detect and better to know — on 36
+  cells it **swapped one silent mechanism for another**. They are check-clean invalid wasm in A
+  and check-clean invalid wasm in B, so the outcome-class grader scores them IDENTICAL and the
+  A→B diff shows nothing; only the MESSAGE moved, from D57's own
+  `type mismatch: expected i32, found (ref $type)` (the i32 tail) to
+  `unknown local 4` / `unknown local 5` (a compare emitted against locals the function never
+  declared). All 36 are the `richfields` and `clofield` shapes — an arm carrying an `i32[]` or
+  a function-valued field, whose compare stages operands in a frame `exprIsStructEq` had to
+  claim first and, still asking only the struct table, did not. **A partial fix inside one
+  silent class is invisible to a grader that reads the class**, which is why the row carries the
+  message diff and not just the counts, and why the corpus witness carries an arm with one field
+  of every supported code. It is verbatim the vein `eqCoreKindOfBin`'s own header names.
+* **AND A THIRD DISAGREEMENT SHAPE: TWO DIFFERENT ARMS OF ONE UNION.** `type Shape = Circle |
+  Ext` with `a: Circle == b: Ext` resolved on both sides, to two variant rows, so the agreement
+  rung declined; neither had an `sNames` row, so the refusal gate — struct-table only — was
+  false and the compare fell into the same i32 tail. Silent on `a97c9ae1`, on `6ac49ac9` and on
+  `2ea654d2`, all at the same offset, and still silent at stage C. The gate now spans both
+  tables and the cell is LOUD, which is the CONTROL's answer: delete the union and
+  `Circle == Ext` is two struct rows that disagree, giving exactly `emitProgram: struct equality
+  is not supported yet`. The win direction here is a refusal and D45 is still not widened —
+  nothing that ran stops running; a silent cell became the diagnostic its no-union twin already
+  gave. Found by the `std-api-reviewer`, not by the grid.
 * **THE GRID: 770 cells, the PRELUDE as a varied axis** — 7 preludes (none · declared-unused ·
   declared-and-used · two unions containing the struct · union + exact layout twin · a union NOT
   containing it · no union + a twin) x 3 declaration ORDERS (before the structs, between them
@@ -5761,9 +5799,17 @@ Repro:
   and the monomorphizer's argument classifier — which refuses an arm argument outright without
   the twin — accepts it WITH the twin and pins the wrong row. Reachable neighbourhood:
   `mAssignTypeIndices` (`uVarTwin`) and the monomorphizer's argument-type resolution.
-* Ranked as a silent row strictly worse than the loud floor it replaces, and left for the agent
-  holding D48/D63/D64 — the heap-slot / twin-collapse region — rather than reached from the
-  equality path, which has no say in either table's index assignment.
+* **#1952 CLOSED ITS NEIGHBOURS AND DID NOT REACH IT, which is the handoff.** D48, D63 and D64
+  are the same layout-twin / heap-slot family and all three are closed on `2ea654d2`; this row
+  is not, and the ablation says so rather than the neighbourhood: the repro is byte-identical
+  and at the SAME offset on `a97c9ae1`, on `6ac49ac9`, on `2ea654d2` and on all three stages of
+  D57's own fix. So neither `structIdxOfElemName`'s new rungs, nor the mv find/mint sites, nor
+  `repVariantSlotsTwin` touch it — the twin that is not collapsing here is the one between a
+  MONOMORPHIZED INSTANCE'S PARAMETER and a module global's cell, which is a coordinate none of
+  those three sites reads. Start there, not at the container sites #1952 rewrote.
+* Ranked as a silent row strictly worse than the loud floor it replaces, and left for whoever
+  next works the heap-slot / twin-collapse region rather than reached from the equality path,
+  which has no say in either table's index assignment.
 
 ---
 
