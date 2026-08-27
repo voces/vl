@@ -6511,8 +6511,8 @@ Repro:
 
 ---
 
-### D101 — a `| null` LITERAL UNION still takes D45's corrected sentence, because the arm is on `TyUnion` and the spelling is a `TyNullable`
-**loud check reject · found 2026-08-26 by the `std-api-reviewer` pass over D45's close, checking a coverage claim in that close's own comment · pre-existing and IDENTICAL on master `8bf0f20f` and on D45's branch · NOT silent, and filed because a comment said it was covered**
+### D101 — [CLOSED 2026-08-26] a `| null` LITERAL UNION still takes D45's corrected sentence, because the arm is on `TyUnion` and the spelling is a `TyNullable`
+**CLOSED 2026-08-26 — the repro RUNS and prints `true`. The `==` ladders grew the arm the emitter's own wrapper ladder already had, at THREE rungs: `isEquatable` (soundness), `eqCmpKindOfArrayElem` (the list core, 1-D and 2-D) and `emitStructEqFieldInner` (field codes 21/30 join the `i32.eq` scalar arm). The `boolean | null` TWIN had the identical divergence and moved with it. Was: loud check reject · found 2026-08-26 by the `std-api-reviewer` pass over D45's close, checking a coverage claim in that close's own comment · pre-existing and IDENTICAL on master `8bf0f20f` and on D45's branch · NOT silent, and filed because a comment said it was covered**
 
 Repro:
 
@@ -6551,10 +6551,84 @@ Repro:
   precisely because it is the last shape printing BOTH sentences, and the directive must be
   MOVED to another two-sentence row rather than deleted.
 
+**HOW IT CLOSED — THE COMPLEMENT WAS WRITTEN AND HAD NO CALLER ON THIS PATH.**
+`tyScalarBackedListKind` in `emit_classify.vl` — the EMITTER's own wrapper ladder — has
+answered `"list"` for `K[]`, `(K | null)[]` and `(boolean | null)[]` all along, off a
+measurement its header records (a program binding all eight list spellings side by side gives
+those three the same wrapper `i32[]` gets). The rep home `repOfNullable` decides the two
+i32-sentinel niches off `tyIsLitUnion` / the boolean prim; `tyIsNullableLitUnion` already
+carried BOTH arena spellings of the atom one. So every fact the `==` home needed was already
+written down, in the file next door, and the fix is the call. **Pattern 1 — the complement
+already written**, the tenth rung closed on it.
+
+* **TWO SENTINEL FAMILIES, NOT ONE.** The row names `K | null`; grepping for the OTHER
+  spelling of the same rep found `boolean | null` with the identical divergence — `+` runs,
+  `==` refuses with both sentences. Both are in the fix and both are pinned.
+* **THE ROW'S OWN "reachable neighbourhood" NAMED TWO OF THE THREE RUNGS** — the `isEquatable`
+  arm and the matching one in `eqCmpKindOfArrayElem`, both correct. The third is the one a
+  prediction made from the repro could not see, because the repro is a LIST and the rung is a
+  struct FIELD.
+* **THE THIRD RUNG IS ONLY REACHABLE ONCE THE FIRST LANDS, and skipping it would have been
+  invisible to an outcome count.** `{ f: K | null } == …` was a loud CHECK reject; teaching
+  `isEquatable` alone would have moved it to `emitProgram: unsupported struct field type in
+  equality` — loud to loud, no outcome class changed, and a severity downgrade for a shape
+  that is soundly comparable. Field codes 21 and 30 are declared with the same `0x7f i32`
+  storagetype code 0 is, so they join its arm and the cell RUNS.
+* **RUNG THREE DOES NOT REACH A 2-D LIST FIELD, AND ONE CELL DID TAKE THE DOWNGRADE THE BULLET
+  ABOVE SAYS WAS AVOIDED.** `{ f: (K | null)[][] }` and its `boolean | null` twin were a loud
+  CHECK reject on master and are now `emitProgram: unsupported struct field type in equality` —
+  the soundness gate learned the sentinel, the field-code arm is about a SCALAR field, and
+  nothing in between covers a 2-D list one. Found by the `std-api-reviewer` pass over this
+  close, by running a shape the fix's own grid did not carry; the bullet above is corrected
+  rather than deleted because the 1-D cell it describes does run.
+  **It is SYMMETRIC and it is the base type's own floor**, which is why it stands:
+  `{ f: i32[][] }`, `{ f: K[][] }` and `{ f: boolean[][] }` give that identical sentence on
+  BOTH seeds, so the sentinel now agrees with the type it niches into — D102's "one rule, both
+  directions" arriving at the same answer from the other side. Recorded in `std/array.vl`'s
+  field-ladder scope line too, because the cell is reachable from `indexOf`.
+* **FOUR SPELLINGS OF THE ATOM SENTINEL, NOT TWO, AND THE FIRST GRID CONTAINED HALF OF THEM.**
+  The row names the two-part form (`K | null` inline, and through an alias) — a `TyNullable`.
+  The EXPANDED form `"a" | "b" | null`, written inline and through an alias, is a `TyUnion`
+  with a null member: a different arena shape for the same rep, which `tyIsNullableLitUnion`
+  already carried and which a grid built from the row's own two spellings could not contain.
+  It moves too (`runs`, correct answers), and had the fix missed it the first grid would have
+  reported the row closed with half its surface untested. **`std/array.vl`'s twentieth ledger
+  entry — "a population measurement is only as wide as its axes" — self-inflicted and caught
+  by widening rather than by a gate.** The un-annotated `["a", null]` is NOT a fifth spelling:
+  it infers as `(string | null)[]`, the ref niche, and is refused on both sides — measured,
+  because `tyIsNullableLitUnion`'s own header cites that spelling as the expanded form's
+  source.
+* Grid: **245 shape cells** (37 type spellings x 7 operation shapes), **42 moved: 32 forward,
+  10 into D117's artifact** (see below). Ablated to this row alone: **32 outcome cells, 34
+  counting message-only moves.** 1,568-cell pair grid: **12 moved, all `loud check reject` →
+  `runs`, 0 backward.** Every newly-running cell is graded on its ANSWER and every one is
+  correct, including `null`-vs-value and LENGTH.
+* **THE 10 "BACKWARD" CELLS ARE THE PROBE'S VALUE, NOT THE FIX, and both readings were run.**
+  Every one is a 2-D cell whose second value is a bare `[[null]]` — which is a loud
+  `emitProgram` on master with no `==` in the program at all (D117, filed below). The `==`
+  refusal had been masking it; closing the refusal lets the program reach emit. Re-run with a
+  NON-null second value, the same 8 rows are `loud check reject` → **`runs`** and answer
+  correctly. So the cells are loud→loud on programs that are independently unbuildable, and
+  **0 cells moved to any silent outcome, 0 lost the ability to run, 0 produced a different
+  value.**
+* **D45's TRAP DID NOT REPEAT, and the reason is D45's own fix.** `(K | null)[] == string[]`
+  is the exact analogue of the cell that made D45's first draft emit invalid wasm. It is LOUD
+  here, in `eqRefusals`' core-pair sentence — because that rule refuses on differing CORES and
+  the widening flows through it. The predecessor's fix is what made the successor safe.
+* Graduated: `tests/cases/literal-unions/nullable-litunion-list-equality.vl` (the
+  compiler-side pin, importing nothing — both sentinel families, both spellings of each,
+  `!=`, LENGTH, the struct FIELD, and the `+` twin kept beside the `==` it diverged from) and
+  the eight `(K | null)` / `(boolean | null)` rows added to
+  `tests/cases/std/array-litunion-list-needle.vl` (all four `needle: T` exports at both
+  sentinels, each pinned to a different answer). **The full-clause directive MOVED, as this
+  row required** — from `(K | null)[]` to `(N | null)[]`, the numeric twin whose spelling is
+  identical and whose rep is a value-union BOX, so the two adjacent rows now state the
+  boundary rather than merely occupy it.
+
 ---
 
-### D102 — a list `+` over an `f64`-backed LITERAL UNION is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-26 by the `std-api-reviewer` pass over D45's close, checking the `+` home cited as that close's authority · pre-existing and IDENTICAL on master `8bf0f20f` and on D45's branch, same offset and same sentence**
+### D102 — [CLOSED 2026-08-26] a list `+` over an `f64`-backed LITERAL UNION is check-clean invalid wasm
+**CLOSED 2026-08-26 — now a loud check reject, and the win direction is loud rather than runs because `f64[] + f64[]` is itself a loud check reject: there is exactly ONE concat core (`emitListConcatI`, hard-wired to `$lTypeIdx`/`$aTypeIdx`), so the literal spelling now says what its own BASE type says. THE ROW WAS ONE ARM TOO NARROW — three spellings were check-clean invalid wasm, not one. Was: check-clean invalid wasm · found 2026-08-26 by the `std-api-reviewer` pass over D45's close, checking the `+` home cited as that close's authority · pre-existing and IDENTICAL on master `8bf0f20f` and on D45's branch, same offset and same sentence**
 
 Repro:
 
@@ -6593,6 +6667,111 @@ Repro:
   same trade D57's stage D made.
 * The comment at `concatRefusal`'s header that asserted the opposite ("`eqCmpKindOfArrayElem`
   is NOT that set") is corrected on D45's branch and names this row.
+
+**HOW IT CLOSED — AND THE ROW'S OWN ONE-LINE FIX WOULD HAVE CLOSED ONE THIRD OF IT.**
+The row named the `TyUnion` arm. `concatElemIsI32Backed` over-accepts at **three** arms, and
+the element axis run cell by cell says so:
+
+    element spelling            master                 branch
+    type F = 1.5 | 2.5          INVALID WASM (off 332) loud check `+` over F[] has no lowering
+    type G = 1.5                INVALID WASM (off 332) loud check `+` over G[] has no lowering
+    type BIG = 9999999999       INVALID WASM (off 337) loud check `+` over BIG[] has no lowering
+    type I = 9999999999 | 1     loud emit              loud check
+    type M = "a" | 1            loud emit              loud check
+    (N | null)                  loud emit              loud check
+    (F | null)                  loud emit              loud check
+    i32 · boolean · K · N · H="a" · J=1 · (K|null) · (boolean|null)   runs -> runs, same values
+
+`type G = 1.5` and `type BIG = 9999999999` are the **`TyLit` arm** (`if e is TyLit { return
+true }`), not the union arm — and `BIG[]` fails at a DIFFERENT offset with a DIFFERENT sentence
+(`expected (ref $type), found (ref $type)` rather than `expected i32, found (ref $type)`), so
+it is not the same cell wearing another name. The `TyNullable` arm was over-broad too: it asked
+`tyUnionAllLits` of the inner, which admits the NUMERIC litunions, and `repOfNullable` niches
+only the STRING one.
+
+**THE OFFSETS ABOVE ARE THE ELEMENT-AXIS PROBE'S OWN PROGRAMS, NOT THIS ROW'S REPRO**, and the
+distinction matters because an offset is a property of the module: every cell in that table is
+the same four-line body under one shared nine-line prelude, which is what makes 332-vs-337
+comparable at all. This row's own two-line repro is offset **255**. All quoted against a seed
+rebuilt from master `764ad0dd`'s own sources, **1,448,639 bytes** — never the shared
+`build/vl-compiler.wasm`. The SENTENCE is the identifier; the offset only separates F/G from
+BIG within one program shape.
+
+* **THE WIN DIRECTION WAS CHECKED, NOT ASSUMED.** `f64[] + f64[]` and `i64[] + i64[]` are loud
+  check rejects written directly, and `emitListConcatI` is hard-wired to the i32 wrapper — so
+  the `+` OPERATOR has no lowering for an f64-backed literal union, and giving it one would
+  need a new concat core, which is `f64[]`'s capability and not this row's. Loud is the CORRECT
+  loud: D45 made `K[]` say what `i32[]` says (runs); D102 makes `F[]` say what `f64[]` says
+  (loud). One rule, both directions.
+* **"THE OPERATOR", NOT "THE TYPE" — AND THE FIRST DRAFT OF THE BULLET ABOVE SAID THE WRONG
+  ONE.** It read "an f64-backed literal union cannot legitimately concatenate", which a
+  ten-line program falsifies: `std:array`'s `concat` is an ordinary `push` loop over `T`, so it
+  inherits the element's own storage instead of assuming one, and `a.concat(b)` over two `F[]`
+  lists prints `2 / 1.5 / 2.5` — on this branch AND on master. Found by the `std-api-reviewer`
+  pass over this close. What this row removes is a spelling that wrote a bad module; the
+  CAPABILITY was never absent, and after this change `concat` is the only working spelling for
+  those element types, which `concat`'s own doc block now says.
+* **NARROWING A "DEFAULTS TO ACCEPT" PREDICATE NEEDS THE OTHER DIRECTION MEASURED**, and it
+  was, per cell: the eight spellings that ran still run and still read back the same VALUES —
+  a `.length` check alone would not have caught a concat that wrote the right count into the
+  wrong backing. `tests/cases/literal-unions/litunion-list-concat-backing.vl` is that accept
+  set written down, so a later over-refusal goes red instead of quietly removing a capability.
+* Ablated on the 245-cell grid: **10 outcome cells, 20 counting message-only moves.**
+  **The intersection with D101 is EMPTY at both grades and the union of the two singles is
+  set-identical to the branch at both grades — so this is TWO ROOTS, and the discriminator
+  is that D101-only leaves both invalid-wasm cells standing while D102-only leaves the
+  `runs` count unmoved at 84.** One under-accepts on `==`, the other over-accepts on `+`;
+  they share two predicates and no cells.
+* `tyUnionAllLits` has no caller left and is deleted. The `+` and `==` homes now share
+  `tyLitUnionIsI32Backed` and `tyIsI32SentinelNullable`, so the two operators can no longer
+  answer differently about the same cell — which is the drift both headers exist to prevent
+  and which each of them had reproduced once.
+
+---
+
+### D117 — an ALL-`null` INNER array literal under a NESTED niche annotation is a loud emit reject
+**loud emit reject · found 2026-08-26 as D101's closing residue, by the probe VALUE its shape grid used · pre-existing and IDENTICAL on master `764ad0dd` and on D101's branch at every one of fourteen cells · NO `==`, NO `+`, NO generic, NO import, two lines**
+
+Repro:
+
+    type K = "a" | "b"
+    const c: (K | null)[][] = [[null]]
+    print(c.length)
+    // vl check rc 0; vl run:
+    //   emitProgram: bare null needs a struct-typed context
+
+* **THE OUTER ANNOTATION DOES NOT REACH THE INNER LITERAL, and the inner literal has nothing
+  else to infer from.** One member changes it: `[["a", null]]` RUNS and prints 1, because the
+  non-null member types the inner literal and the `null` then coerces to that element's niche.
+  So the axis is ALL-`null` inner, not `null`-anywhere, and it is the seeding of the inner
+  literal's element type rather than the niche itself.
+* **IT IS THE THREE NICHES AND NOT THE BOXES**, which is the discriminator worth recording
+  because it is the opposite of what the sentence suggests. Measured, one file per cell:
+  `(K | null)[][]` (the atom sentinel), `(boolean | null)[][]` (the i32 sentinel 2) and
+  `(string | null)[][]` (the ref niche) are all loud; `(i32 | null)[][]` and `(S | null)[][]`
+  both RUN. The fallback the emitter reaches when nothing seeded the element is a
+  struct-typed null, which the two BOX/struct shapes can absorb and the three niches cannot.
+* Every 1-D form RUNS — `(K | null)[] = [null]`, and the same for all five inner types — so it
+  is the NESTING and not the bare `null`. `(K | null)[][][] = [[[null]]]` reproduces, so it is
+  not a depth-2 special case either.
+* **THE ONE-LINE WORKAROUND, and it is what two fixtures in this change use**: bind the inner
+  list to an ANNOTATED local and put the local in the outer literal
+  (`const r: (K | null)[] = [null];  const c: (K | null)[][] = [r]`) — RUNS. That is also the
+  evidence the emitter can lower the value perfectly well once the element type is known.
+* **NOT MOVED BY D101, and the fourteen-cell control set says so at every cell** — identical
+  outcome and identical sentence on master `764ad0dd` and on the branch that filed this. D101
+  merely made it REACHABLE in a shape grid: `[[null]] == [[null]]` had been refused at `vl
+  check` for a different reason, and closing that refusal let the program get as far as emit.
+  A grid whose 2-D nullable rows used a bare `null` as their second value therefore reads 8
+  cells as `loud check` → `loud emit`; with a non-null value the same 8 rows are `loud check`
+  → `runs`. The probe VALUE decided which of those two a reader would have seen, which is why
+  both were run.
+* Reachable neighbourhood: the array-literal element seed. `exprArray` pins an empty `[]` from
+  its annotation and the 1-D nullable forms are seeded correctly; the NESTED case is where the
+  outer annotation's element type is not pushed into the inner literal's own pin. The same
+  emitter floor is reached by several unrelated shapes (`per-rep-ladder-audit`,
+  `rep-fuzz-findings`, and #1806's `u8[] | null`), so a fix here should be scoped to the
+  literal seed rather than to the floor's message.
 
 ---
 
