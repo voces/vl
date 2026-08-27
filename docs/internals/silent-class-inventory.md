@@ -5124,13 +5124,15 @@ recognised the operands at all.
 * **D45 IS NOT WIDENED, and it is checkable rather than asserted.** No cell that RAN stopped
   running and no rep lost an acceptance: loud check rejects held at 50, and the only cells that
   gained a diagnostic are the 24 cross-arm ones, whose no-union control gives that same
-  diagnostic. On the 2,282-file corpus, 1,850 compile under both compilers, **0 are
+  diagnostic. On the 2,284-file corpus, 1,851 compile under both compilers, **0 are
   byte-different, 0 lost the ability to compile, and the only 3 that gained it are this change's
   own new cases** — inert on everything that already emitted, active only on what fell through.
-  (The master side of that comparison is a seed rebuilt from `a97c9ae1`'s own sources at
-  1,436,302 bytes, NOT the shared `build/vl-compiler.wasm`, which a concurrent agent had
-  refreshed mid-session; measured against the shared one, a D52 fixture read as a regression
-  that the true master seed shows is not one.)
+  (The master side of that comparison is a seed rebuilt from the merge base's OWN sources —
+  `6ac49ac9`, 1,437,150 bytes — not the shared `build/vl-compiler.wasm`. That distinction is
+  not pedantry: a concurrent agent refreshed the shared artifact mid-session, and measured
+  against it a D52 fixture read as a regression this change had not caused. Re-run against a
+  seed built from a named commit, both the grid and the corpus diff are unchanged from the
+  `a97c9ae1` run: same 324 cells, same 0 byte-different.)
 * Corpus witnesses: `tests/cases/unions/arm-struct-equality.vl` (seven storage classes, plus an
   arm carrying one field of EVERY supported code — i32 · string · `i32[]` · boolean · f64 ·
   nested struct · function value — which is the shape the reservation half needed),
@@ -5614,9 +5616,9 @@ Repro:
     // vl check rc 0; vl run:
     //   Invalid input WebAssembly code at offset 238:
     //   type mismatch: expected (ref $type), found (ref $type)
-    // (SAME OFFSET ON BOTH SEEDS, which is why one is quoted at all: D57's branch fixpoint
-    //  at 1437160 bytes and a master `a97c9ae1` seed rebuilt from its own sources at
-    //  1436302 bytes give byte 238 and the identical sentence)
+    // (THE OFFSET IS QUOTED ONLY BECAUSE IT IS STABLE ACROSS EVERY SEED MEASURED: a master
+    //  `a97c9ae1` seed rebuilt from its own sources (1436302 bytes), the same for `6ac49ac9`,
+    //  and both of D57's branch fixpoints all give byte 238 and the identical sentence.)
 
 * **THE ONE-LINE CONTROL IS `type Dot`, AND IT TURNS A LOUD FLOOR OFF.** Delete it and the same
   program is the loud `emitProgram: monomorphize: unsupported argument type for `x` in a call to
