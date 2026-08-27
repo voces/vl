@@ -112,6 +112,20 @@ The PUBLISHED grader was re-validated against the same compiler first:
 `scripts/silent-sweep/sabotage.py` → **15 wrong_value / 10 wrong_evalcount / 8 trap / 5
 correct**, exactly as `REPRODUCE.md` publishes.
 
+> **`sabcensus.py`'s `check-clean invalid wasm` column is PERISHABLE — a specimen chosen to model
+> a live defect stops modelling it the day that defect closes.** Measured: the file as it stood
+> at `1559d80c` reproduced 3 invalid-wasm / 4 runs there, and **2 / 5** from `c55269c9` onward,
+> because its `iw_d155` cell was fixed by **#1965 (D155)** — the very row it was modelled on.
+> #1970 refreshed the specimens; the CURRENT file reproduces its predicted **4 / 4 / 3 / 3 / 3 /
+> 3 exactly on `16d5c6e7`** (re-run 2026-08-27). `RESULTS.md`'s caveat 1 tracks the full
+> churn — four specimens lost in one day.
+>
+> The lesson that survives each refresh: **the two columns the census's zeros actually rest on,
+> `runs but wrong value` and `trap_loads`, fired unchanged on every seed tested** (1,452,766 /
+> 1,453,528 / 1,453,931 / 1,455,395 / 1,456,293 / 1,456,371), so the grader's discriminating
+> power is stable even while the REFUSAL columns move. Quote a sabotage count with the seed it
+> came from, or it is not a count.
+
 ## Running it
 
     bash scripts/agent-setup.sh                     # seed must be 1,452,766 bytes at 1559d80c
@@ -137,6 +151,131 @@ correct**, exactly as `REPRODUCE.md` publishes.
 `JOBS` defaults to 4 and nothing here raises it (`vl check` peaks around 650 MB RSS). The
 cell programs and result files are NOT committed — 250,238 files, ~180 MB; everything
 regenerates. Total wall time at `JOBS=4` is about 35 minutes.
+
+## Grading a MERGED change — the after-pass protocol (`delta.py`)
+
+An after-pass asks a different question from the census itself: not *how large is the surface*
+but *did this change move anything the wrong way*. Two rules, both learned by getting them
+wrong:
+
+**Grade COMMITS, never a working tree.** Build one seed per commit from that commit's own
+`compiler/*.vl` and let `refresh-compiler.sh --prove-fixpoint` prove each is a self-compilation
+fixed point — the byte size then IDENTIFIES the commit instead of being asserted about it. A
+shared checkout's `build/vl-compiler.wasm` is refreshed after every merge, so an agent grading
+against it mid-session reads unrelated churn as a regression. Restoring the tree afterwards has
+a trap of its own: `git checkout <sha> -- compiler/` STAGES those files, so it needs a
+`git reset -- compiler/` and a `cmp` of the seed before anything else is believed.
+
+**Generate the cells ONCE and grade that one directory against every seed.** Two directories
+generated at two commits are two populations, and a per-cell diff across them is meaningless.
+`delta.py` refuses to paper over this: it matches cells by name and prints a POPULATION
+MISMATCH line if either side has a cell the other lacks.
+
+    for S in <sha1> <sha2>; do ... build seed from that commit ... ; done
+    python3 scripts/silent-sweep/census/gencensus.py scratch-silent/census/cellsA --block A
+    JOBS=4 python3 .../gradecensus.py scratch-silent/census/cellsA seed-<sha1>.wasm before.json
+    JOBS=4 python3 .../gradecensus.py scratch-silent/census/cellsA seed-<sha2>.wasm after.json
+    python3 scripts/silent-sweep/census/delta.py scratch-silent/census/cellsA before.json after.json
+
+**Read the transition matrix, not the two histograms.** A per-class count is a NET: a block can
+hold its silent total exactly while cells fall out of `runs` and different cells fall in.
+`delta.py` leads with the two numbers a merged change can be invalidated by — `runs` LOST and
+moved INTO a silent class — and only then prints the matrix. Block A's own after-pass is why the
+second number is reported separately: it lost **0** `runs` and still moved **12** cells from a
+loud emit reject into check-clean invalid wasm, which the histograms hid entirely (the loud
+column moved by −126, a net of 186 out and 72 in).
+
+**Prewarm the seed's `.cwasm` sidecar before any parallel fan-out.** `vl --compiler X` caches a
+Cranelift image beside `X`, and a cold parallel start races to write it (`RESULTS.md` caveat 3,
+where it cost `mono-tyaram-grid.sh` a reproducible count). Grade a handful of cells serially
+against a freshly built seed before opening it to `JOBS=4`. The after-pass here was warm by
+accident rather than design — every seed had been used by a small serial grade first — and the
+evidence it did not bite is that all five blocks reproduced the published table exactly; the
+12-cell backward set was additionally re-graded at `JOBS=1` and agreed with the parallel run.
+
+**A detector that has only ever printed zero is not known to work.** Inverting the two gradings
+turns every forward move into a backward one, which is a free way to watch the backward column
+fire before trusting it.
+
+**Attribute to a COMMIT, not to a span.** Two merges between the census base and master means a
+delta over the span cannot name which one moved a cell — and the shape of a defect is not
+evidence. Block A's 12 backward cells look exactly like the row #1969 fixed and belong to #1966;
+the seed ladder settled it in twelve `vl` invocations, because the backward set can be copied
+into its own tiny cell directory (with its manifest subsetted) rather than re-grading 150,224
+cells. **Pin the intermediate rungs**: "the census's base" named two different compilers here —
+it PUBLISHED against `1559d80c` and MERGED as `c55269c9`, with #1965 in between — and without
+the middle seed the 12 cells were equally attributable to #1965.
+
+### EVERY CENSUS FIGURE NAMES THE COMMIT IT WAS MEASURED AT — IN THE DOCUMENT
+
+**This is the root cause of the whole base-ambiguity finding, so it is a rule and not a
+remark.** A census number is a fact about ONE compiler. Written without its commit it silently
+becomes a fact about "the census", which readers then resolve to whatever master happens to be —
+and the two are the same sentence.
+
+`RESULTS.md` published its table against `1559d80c` and the census MERGED as `c55269c9`, one
+compiler change later (#1965). Nothing in the document said so, so four later PRs each measured
+"against the census base" and at least two different compilers answered to that phrase. It cost
+a whole extra seed to work out that D211 belonged to #1966 rather than #1965.
+
+Concretely:
+
+* **Every table gets the commit AND the seed byte size in its own heading or caption**, not only
+  in the commit message that introduced it. A commit message is not readable from the table.
+* **The seed size is the check on the commit name**, because it is reproducible: build from that
+  commit's source, let `refresh-compiler.sh --prove-fixpoint` prove it self-compiles, and the
+  size then IDENTIFIES the tree rather than being asserted about it. Five seeds are pinned this
+  way in `RESULTS.md`; each was confirmed by rebuilding, not by trusting a filename.
+* **A figure whose commit is unknown is not stale, it is unusable** — there is no way to tell
+  which of the two failure modes it is in. Prefer deleting it to leaving it unlabelled.
+* **The table goes stale the moment the next compiler change merges, and that is FINE** as long
+  as it says which tree it describes. `RESULTS.md`'s per-block table now describes a compiler
+  four merges back (#1965, #1966, #1969, #1968, #1970); it is still correct, because it names
+  `1559d80c`. What was never correct was the reader's ability to know that.
+
+The same rule holds for a defect ROW: an attribution span between two named commits is
+historical and never needs re-deriving, but a LIVENESS claim ("still live on X") is about a
+moving head and must name it and be re-run. D211 separates the two explicitly for that reason.
+
+### THE STANDING REQUIREMENT
+
+**A change to the emit / rep lowering path re-grades the census cell-matched against its MERGE
+BASE, and reports two numbers explicitly: `runs → not-runs` and `→ silent`.** Not histogram
+deltas. Block A's own after-pass is the argument: it lost 0 `runs` and still moved 12 cells from
+a loud emit reject into check-clean invalid wasm, and the per-class columns could not show it —
+the loud-emit column moved by −126, which is 186 cells out and 72 cells in, and the 12 are
+arithmetically invisible inside that net. A column delta answers "how many cells are in each
+class"; only a cell-matched matrix answers "did any individual cell get worse".
+
+This is what three merged PRs missed. #1952, #1954 and #1966 each reported "0 backward" that was
+TRUE of the grids they ran and silent about the wider population, because a per-row grid holds
+constant the axes it was not chasing.
+
+**Why it is NOT a `deno task test` gate, and why sampling cannot rescue it.** The full run is
+250,238 cells and ~35 minutes at `JOBS=4` — too slow to require on every PR, and a gate nobody
+can afford to run gets bypassed rather than obeyed. The tempting escape is to grade a random
+subset, and the arithmetic kills it. To catch a family of size *k* in a block of 150,224 with
+95% confidence you must grade `1 − 0.05^(1/k)` of it:
+
+| family size | sample needed for 95% | for 99% |
+|---|---|---|
+| 1 cell | **95.0%** | 99.0% |
+| 3 cells | 63.2% | 78.5% |
+| **12 cells (D211)** | **22.1%** | 31.9% |
+| 72 cells | 4.1% | 6.2% |
+
+The families this instrument exists to find are small — D211 is 12 cells, 0.008% of block A — so
+any sample cheap enough to be worth taking is too small to see them. **There is no cheap
+sufficient subset.** The honest options are the full run or nothing, so it is filed as a
+mandatory pre-merge STEP for emit/rep changes (it runs unattended in the background beside the
+other gates, so its wall-clock cost is low even though its CPU cost is not), rather than as a
+per-PR test. That is the same reasoning that made `--strict` a flag on
+`check-filed-witnesses.py` rather than a default.
+
+**The cheap thing that IS worth doing per-PR** is the subset check after the fact: once a full
+run has named a backward set, that set copies into its own cell directory and re-grades against
+any new seed in seconds (12 cells, ~10 `vl` invocations). Use it to answer "is D211 still live?"
+without re-running 150,224 cells — it is how this row was confirmed live on `e04b1567`.
 
 ## Resource discipline
 

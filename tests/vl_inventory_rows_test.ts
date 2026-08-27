@@ -29,16 +29,21 @@
 // No assertion library, per CLAUDE.md: every failure below is a `throw new Error` naming
 // want and got.
 
-// SCOPED TO INVENTORY #1 — the doc CLAUDE.md names and the one a PR touching this family
-// edits. `silent-class-inventory-2.md` is deliberately NOT here: until this change its rows
-// could not be parsed at all (it writes the program with no `Repro:` lead-in), so none of
-// its 14 was ever graded, and grading them now reports **10 of the 14 as MOVED** — fixed
-// long ago, still filed as live. That is a real finding and it is filed, not worked around;
-// re-grading another doc's rows is its own change, and a gate that reds for pre-existing
-// debt in a file the author is not editing gets bypassed rather than obeyed. Add it here in
-// the same breath as that re-grade.
+// BOTH INVENTORIES. Inventory #2 was held out until 2026-08-27: until #1966 its rows could
+// not be parsed at all (it writes the program with no `Repro:` lead-in), so none of its 14
+// was ever graded, and the first grading reported 9 MOVED + 2 ungradeable — fixed long ago,
+// still filed as live. A gate that reds for pre-existing debt in a file the author is not
+// editing gets bypassed rather than obeyed, so the debt was closed FIRST — ten rows re-graded
+// to CLOSED against their measured behaviour, D3 given the `// PRINTS` line the grader needs,
+// D14 given the witness it had never had — and the doc admitted here in the same change. Both
+// now report `... · 0 MOVED · 0 not graded` under `--strict`.
+//
+// Adding a doc here is cheap and it is the point: this test is what stops a NEW row landing
+// without a runnable witness. A doc of this shape that is not in this list is enforced by
+// nothing.
 const DOCS = [
   "docs/internals/silent-class-inventory.md",
+  "docs/internals/silent-class-inventory-2.md",
 ];
 const CHECKER = "scripts/check-filed-witnesses.py";
 
