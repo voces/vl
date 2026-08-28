@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Rebuild the distilled corpus from every graded census snapshot on disk.
+"""Rebuild the DERIVED half of the distilled corpus from every graded census snapshot on disk.
 
-The corpus is one representative per BEHAVIOURAL EQUIVALENCE CLASS: two census cells belong
-to the same class when every graded snapshot in the history gave them the identical
+`cells/` is one representative per BEHAVIOURAL EQUIVALENCE CLASS: two census cells belong to
+the same class when every graded snapshot in the history gave them the identical
 `(outcome, message)`. Collapsing 250,238 cells that way leaves 1,477 — see README.md for the
 redundancy table and the coverage validation that licenses the collapse.
+
+**`named/` is NOT touched by this script and must not be.** It holds the exact cells that some
+real regression NAMED, and a collapse cannot derive them: D272's 72-cell runs-lost set is all
+`runs` on today's compiler, indistinguishable from thousands of neighbours, so a behavioural
+collapse of its grid (34 reps) and an axis floor over its four axes (285 reps) each covered
+ZERO of the 72. What makes a named cell worth keeping is what a candidate DID to it, which no
+rule reading current behaviour can see.
 
 Run this after a full census sweep. The corpus is only as good as the history it was
 collapsed from, so a new sweep is exactly when the classes should be re-derived: a compiler
@@ -105,6 +112,7 @@ def main():
         print("--dry-run: nothing written")
         return 0
 
+    # Only `cells/` is derived. `named/` is curated and is never rebuilt or removed here.
     out = os.path.join(HERE, "cells")
     if os.path.isdir(out):
         shutil.rmtree(out)
@@ -120,6 +128,9 @@ def main():
               open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
     json.dump(index, open(os.path.join(HERE, "expected.json"), "w"), indent=1, sort_keys=True)
     print(f"wrote {out}/*.vl ({len(staged)} cells), cells/manifest.json and expected.json")
+    ncur = len(glob.glob(os.path.join(HERE, "named", "*.vl")))
+    if ncur:
+        print(f"named/ left untouched: {ncur} curated cells")
     print("now re-baseline:  python3 regress.py <seed.wasm> --write-baseline")
     return 0
 
