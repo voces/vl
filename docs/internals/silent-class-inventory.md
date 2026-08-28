@@ -8058,51 +8058,55 @@ Repro:
 ### D179 — [CLOSED 2026-08-27] a COMPILER TRAP: `for-in` over an undeclared list whose element field holds a union arm
 **now a loud emit reject · was `compiler trap` on `a19a3db7` · found 2026-08-27 by the CENSUS grid (`scripts/silent-sweep/census/`), block D · the ONLY `compiler trap` the inventory's live population ever had, and the first program-level witness that column ever got**
 
-Repro:
+Repro (MINIMISED at the close — see the correction below; the originally filed nine-line
+program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-bearing):
 
     type Cir2 = { c2: i32 }
-    type Sq2 = { s2: i32 }
-    type Shape2 = Cir2 | Sq2
+    type Shape2 = Cir2 | i32
     const c = [{ r: { c2: 1 } }]
     let hit = 0
     for zz in c {
-      if zz.r is Cir2 { hit = 7 }
+      hit = 7
     }
     print(hit)
-    // `a19a3db7`: vl check rc 0 with NO diagnostics; vl run AND vl build:
+    // `75eb1f17`: vl check rc 0 with NO diagnostics; vl run AND vl build:
     //   wasm trap: out of bounds array access   (inside the COMPILER)
     // `vl build -o` wrote NO module, which is what separated this from a program trap.
     // Now: emitProgram: ref valtype with no interned shape — the SAME message the index
     // spelling of this program has always given, so the two spellings finally agree.
 
-* **NINE LINES, no annotation, no twin, no alias, no map, no import, no generic.** The only
-  declarations are the union the payload's field is an arm of.
+* **THE ROW'S ORIGINAL REPRO OVERSTATED ITS OWN SHAPE, AND THE CORRECTION IS THE FINDING.**
+  As filed it read *"NINE LINES … the only declarations are the union the payload's field is
+  an arm of"*, with the trap demonstrated through `if zz.r is Cir2`. Building the controls
+  showed **the `is` is not load-bearing at all** — delete that line, leave a body of
+  `hit = 7`, and the compiler traps identically, same backtrace, same frame. The second arm
+  `Sq2` is not load-bearing either; `Cir2 | i32` is enough. The trap is in the loop's
+  BINDING, not in any read of the element, so the witness above is the true minimum at seven
+  lines. The original program still traps — it is a superset — but it pointed at the wrong
+  half of itself.
 * **THE COMPILER'S OWN ARENA READ IS OUT OF BOUNDS**, so this is not an emitted-program
   defect at all — it is `emitFail does not halt` territory: a recorded failure followed by
   continued emission over a parallel table. The third `vl build` stage is what says so; the
   run stage alone cannot tell a compiler trap from a program trap.
-* **ELEVEN CONTROLS, each one change from the repro** (the last four added by the close, and
-  the first of them refutes the shape the repro implies):
+* **ELEVEN CONTROLS, each one change from the MINIMISED repro above**, every one built and
+  run rather than reasoned:
 
-  | change | outcome on `a19a3db7` |
+  | change | outcome on `75eb1f17` |
   |---|---|
-  | (none — the repro as filed) | **compiler trap** |
+  | (none — the minimised repro) | **compiler trap** |
+  | put the `if zz.r is Cir2 { hit = 7 }` body back, and a second arm `Sq2` | **compiler trap** (the originally filed nine-line program) |
   | wrap the statements in `function rd() { … }` and call it | **compiler trap** (both scopes) |
   | `if c[0].r is Cir2 { … }` instead of `for-in` | loud emit reject (`ref valtype with no interned shape`) |
   | build the container as a map and read `c["k"] ?? …` | loud emit reject (same message) |
   | declare `type Circle = { r: Shape2 }` and annotate `const c: Circle[]` | RUNS |
   | `type Inner = { q: i32 }` field instead of a union arm | RUNS |
   | `const c = [{ c2: 1 }]` — the arm directly, not nested in a struct | RUNS |
-  | **delete the `if … is Cir2` line entirely — a loop body of just `hit = 7`** | **compiler trap** |
-  | delete all three `type` lines (no union declared anywhere) | RUNS |
+  | delete the `type` lines (no union declared anywhere) | RUNS |
   | declare `Cir2` but NOT the union (`type Cir2 = { c2: i32 }` alone) | RUNS |
   | add any second, unrelated ref list (`const pad: Other[] = [{ o: 1 }]`) | loud emit reject |
 
-* **THE `is` IS NOT LOAD-BEARING, AND BUILDING THE CONTROL IS WHAT SAID SO.** Control 8 deletes
-  the narrowing test altogether and traps identically, same backtrace — so the trap is in the
-  loop's *binding*, not in any read of the element, and the row's nine-line repro carries two
-  lines it does not need. What IS load-bearing is control 10: the payload's inner layout must
-  match an arm of a DECLARED union. That is `collectS` skipping a union member again — `Cir2`
+* **WHAT IS LOAD-BEARING, since the `is` is not.** The payload's inner layout must match an
+  arm of a DECLARED union. That is `collectS` skipping a union member again — `Cir2`
   gets no `sNames` row, so nothing interns the nested shape.
 
 * **THE `for-in` CONTROL IS THE ONE THAT NAMES THE SITE.** The index read reaches a guarded
@@ -8167,18 +8171,23 @@ Repro:
   at `a19a3db7` (150,224 cells) and contains **zero** `compiler trap` cells, which is what
   makes block D the right target for a cheap re-grade rather than a guess.
 
-* **THE CLOSE, MEASURED — census block D re-graded cell-matched, 9,000 cells,
-  `a19a3db7` (seed 1,457,262) → this branch (seed 1,457,305):**
+* **THE CLOSE, MEASURED — census block D re-graded cell-matched, 9,000 cells, on the MERGED
+  base: `75eb1f17` (seed 1,457,423) → this branch merged (seed 1,457,466):**
 
       0 runs → not-runs · 0 → silent · 2 compiler trap → loud emit reject
-      8,998 of 9,000 unchanged · compiler trap column 2 → 0 · SILENT TOTAL 67 → 65
+      8,998 of 9,000 unchanged · compiler trap column 2 → 0 · SILENT TOTAL 55 → 53
 
-  Block D's `67` reproduces this file's own published figure for `a19a3db7`, which validates
-  the rebuilt seed, the regenerated cells and the grader in one measurement. The two cells are
-  `cont=forin, rep=arm, declness=nodecl, twin=none` — D179's coordinates exactly. The FULL
-  census after-pass was deliberately NOT run on this branch (the integrator runs it once on
-  the merged result); block A's before-grade and block D's matched pair are what this row
-  rests on, and blocks B / C / E are ungraded on the branch side.
+  **THE TWO TRAP CELLS SURVIVED #1973**, which is why the measurement was re-taken on the
+  merged base rather than inherited: #1973 moved block D's `check-clean invalid wasm` 65 → 53
+  and its `runs` 7,157 → 7,187 (D180/D183), and left both `compiler trap` cells exactly where
+  they were. The same two cells, the same coordinates —
+  `cont=forin, rep=arm, declness=nodecl, twin=none`, D179's exactly. Measured first against
+  `a19a3db7` (1,457,262 → 1,457,305) with the identical result: 0 / 0 / 2.
+
+  The FULL census after-pass is NOT run on this branch — `CLAUDE.md` item 6 now has the
+  integrator run it once on the merged result. Block A's base grade and block D's matched pair
+  are what this row rests on; **blocks B, C and E are ungraded on the branch side and this row
+  does not claim them.**
 
 ---
 
@@ -9976,7 +9985,9 @@ Repro:
   (`uDeclared` mints the box, `vbI32Used` its i32 value box), so a program whose collect walk
   never registered the union fails loudly instead of emitting `struct.new` on index 0" —
   describing a `vbI32Used` gate that `vbHeapIdxOfKind` did not consult. The prose documented
-  the intended code; #1972 is what made the sentence true.
+  the intended code; #1972 is what made the sentence true. **A comment asserting a guard that
+  is not there is worse than no comment** — it is what stops the next reader checking, and it
+  sat directly above the one call site whose argument made the guard unfireable.
 
 * **HOW MANY ARE LIVE TODAY: 2 OF 10 HAVE A WITNESS, AND 8 HAVE NONE.** Measured on
   `a19a3db7`, by matching each guard's message across every population available:
@@ -10055,7 +10066,7 @@ Repro (census block A cell `a099944`, verbatim — D211's own cell plus one unio
 ---
 
 ### D227 — [CLOSED 2026-08-27] D179's SECOND site: `.slice` / `.filter` read `rlElemName[0]` INSIDE the resolver, where no caller's guard can reach
-**now a loud emit reject · was `compiler trap` on `a19a3db7`, and STILL trapping after D179's own fix · found 2026-08-27 by ablating D179's guard against every other operation that reaches the same resolver**
+**now a loud emit reject · was `compiler trap` on `a19a3db7` and on `75eb1f17`, and STILL trapping after D179's own fix · found 2026-08-27 by ablating D179's guard against every other operation that reaches the same resolver**
 
 Repro (FOUR lines, and it needs no `for-in` at all):
 
@@ -10063,8 +10074,10 @@ Repro (FOUR lines, and it needs no `for-in` at all):
     type Shape2 = Cir2 | i32
     const c = [{ r: { c2: 1 } }]
     print(c.slice(0, 1)[0].r.c2)
-    // `a19a3db7` AND the D179-only compiler: vl check rc 0, no diagnostics; then
+    // `75eb1f17` AND the D179-only compiler: vl check rc 0, no diagnostics; then
     //   wasm trap: out of bounds array access   (inside the COMPILER)
+    // (Re-verified on the merged base: traps on 1,457,423 and on 1,457,450 — D179's rung
+    //  alone — and is loud only with both rungs, at 1,457,466.)
     // `vl build -o` writes NO module, which is what separates it from a program trap.
     // Now: emitProgram: ref valtype with no interned shape
 
@@ -10102,25 +10115,30 @@ Repro (FOUR lines, and it needs no `for-in` at all):
   | `[{ c2: 1 }]` — the arm directly, not nested | RUNS, prints `1` |
 
 * **THE COMPOSITION IS LOAD-BEARING IN BOTH DIRECTIONS, MEASURED.** On a 288-cell grid
-  (`op × decl × shape × pad × store`) `a19a3db7` has **8 compiler-trap cells, every one at
+  (`op × decl × shape × pad × store`) master has **8 compiler-trap cells, every one at
   `decl=armunion, shape=nested, pad=nopad`** and nothing else. D179's guard alone fixes **2**
   (`op=forin`); this one alone fixes **3** (`op=slice` ×2, `op=filter/fn`); together they fix
   **8**. **The union of the singles is 5 and the whole is 8** — the three extra are
-  `op=sliceforin` and `op=filterforin`, which reach BOTH sites in sequence, so guarding either
-  one alone just moves the trap to the other. Neither rung is droppable, and a solo count
-  would have understated both.
+  `sliceforin/mod`, `sliceforin/fn` and `filterforin/fn`, which reach BOTH sites in sequence,
+  so guarding either one alone just moves the trap to the other. Neither rung is droppable,
+  and a solo count would have understated both.
+
+  Re-measured on the MERGED base after #1973 and **identical on every cell**: 8 traps at
+  `75eb1f17` (1,457,423), 6 with R1 alone (1,457,450), 5 with R2 alone (1,457,439), **0 with
+  both** (1,457,466); `runs` 228 and `check-clean invalid wasm` 8 unchanged across all four.
+  Stripping both rungs reproduces `75eb1f17` **byte-for-byte at 1,457,423**.
 
 ---
 
 ### D228 — `is i32` is the ONE non-arm spelling the checker admits, and #1972 turned the program it admits from `runs` into a loud emit reject
-**loud emit reject · live on `a19a3db7` · RAN and printed the right answer on `16d5c6e7` — a `runs` → not-runs move introduced by #1972's D221 rung, on a program no census cell contains**
+**loud emit reject · live on `a19a3db7` and on `75eb1f17` · RAN and printed the right answer on `16d5c6e7` — a `runs` → not-runs move introduced by #1972's D221 rung, on a program no census cell contains**
 
 Repro (TWO lines):
 
     const g: f64 | null = 5.0
     if g is i32 { print(g) } else { print(0) }
     // `16d5c6e7`: runs, prints `0` — which is the CORRECT answer (`g` holds 5.0, not an i32).
-    // `a19a3db7`: vl check rc 0, then
+    // `a19a3db7` and `75eb1f17`: vl check rc 0, then
     //   emitProgram: narrowed union atom has no value box
     // Add `const h: i32 | null = 3` anywhere in the module and it RUNS again, printing `0`.
 
