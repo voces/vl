@@ -599,6 +599,7 @@ import {
   mapSlotTag,
   memberUnionFieldNameRead,
   memIsNarrowed,
+  memReadBoxedAtomKind,
   memReadUnboxAtomKind,
   memNarrowVariantIndex,
   mfCallbackCloKey,
@@ -700,6 +701,7 @@ import {
   unionClosureArmName,
   unionClosureArmTy,
   unionEqAtomOf,
+  unionHasAtomK,
   unionHasAtomTy,
   unionHasCollapsedStringMapArm,
   unionHasMapArmSlot,
@@ -711,6 +713,7 @@ import {
   unionRefArrayArmSlotForElem,
   unionRefArrayArmSlotForMapElem,
   unionSetHasNull,
+  unionStoreAtomKind,
   unMemAtomKind,
   unMemIsFunc,
   unMemIsMap,
@@ -729,7 +732,6 @@ import { sidOfNode } from "./symbols"
 import {
   atomEqOpcodeOfKind,
   mapShapeKeyI32,
-  msHasValKind,
   msIsValueUnion,
   msMemberValKindsOf,
   msSoloValKind,
@@ -4319,8 +4321,17 @@ export function emitUnionCoerce(
   // BOX-WANTING consumers (union binding, another code-16 field, a union param, a union
   // return) — invisible to the 1,260-cell `d272` grid, whose `unis` cells pin the payload
   // at `7` and so only ever exercise the i32 default that happens to be right.
+  //
+  // D291 — AND THE ATOM IS TAKEN ONLY WHERE **THIS** DESTINATION STORES IT AS ITSELF.
+  // The read delivers the atom the CHECKER typed its consumers against; where the read's
+  // own field widened the payload on the way in, the destination here widens it again on
+  // the way out, and taking the delivered atom raw would tag the box `i32` over a slot
+  // whose only numeric arm is `i64` — VALID wasm, and `is i64` silently false. Asking
+  // `unionStoreAtomKind` is what makes the two sides of the round trip inverses: where the
+  // destination stores the delivered atom unchanged this rung fires exactly as before,
+  // and where it does not, the ladder below re-applies the SAME promotion the read undid.
   const d209k = memReadUnboxAtomKind(bareIx, fnIx)
-  if d209k >= 0 {
+  if d209k >= 0 && unionStoreAtomKind(unionName, d209k) == d209k {
     cak = d209k
   } else if exprString(exprIx, fnIx) {
     cak = 2 // "string"
@@ -4355,51 +4366,33 @@ export function emitUnionCoerce(
   } else if exprIsBool(exprIx, fnIx) {
     cak = 1 // "boolean"
   } else {
-    // D-VALKIND: ONE set resolution for both arm tests, each answered from the
-    // banked kind column. Resolved HERE rather than beside the alias peel above, so
-    // a coercion that never reaches this arm pays nothing.
-    const usid = msSetOfText(unionName)
-    if (
-      !unionHasAtomK(usid, unionName, "i32", 0) &&
-      unionHasAtomK(usid, unionName, "i64", 3)
-    ) {
-      cak = 3 // "i64"
-    }
+    // THE UNION'S OWN PROMOTION of an i32-classified value: no `i32` arm but a wider
+    // numeric one, so the value is stored AS that arm. `unionStoreAtomKind` is that
+    // ladder's one home — the same function the un-narrowed READ asks to learn which
+    // value box the payload it is looking at was stored in (D291). Open-coding it here
+    // and re-deriving it there is exactly the two-ends-of-one-box split D209 closed.
+    //
+    // THE HALF THAT WAS MISSING BEFORE IT WAS ONE FUNCTION. The i32 default promoted to
+    // `i64` only; an integer flowing into a union whose only numeric atom is a FLOAT
+    // stayed `cak = 0` and boxed an i32 into the f64/f32 value box (`const x: f64 | null
+    // = 1` was `vl check`-clean INVALID WASM, "expected anyref, found i32", in the
+    // global, local AND argument positions). f64 before f32, matching the list arm.
+    const usw = unionStoreAtomKind(unionName, 0)
+    if usw >= 0 { cak = usw }
     if bare is NumLit {
       if !numLexFitsI32(bare.numText) {
         cak = 3 // "i64"
       }
     }
-    // THE MISSING HALF OF THIS LADDER'S OWN LIST TWIN. The i32 default above promotes to
-    // `i64` when the union has no i32 atom — but the LIST arm below (`cak == 7`) promotes
-    // an i32-element list to i64[] / f64[] / f32[], THREE targets, on exactly the same
-    // reasoning. The scalar arm was taught only the first, so an integer flowing into a
-    // union whose only numeric atom is a FLOAT stayed `cak = 0` and boxed an i32 into the
-    // f64/f32 value box: `const x: f64 | null = 1` is `vl check`-clean INVALID WASM on
-    // master ("expected anyref, found i32") in the global, local AND argument positions,
-    // while `const x: i64 | null = 1` (the taught half) and `const x: f64 | null = 1.0`
-    // (a float literal, which classifies `cak = 4` up the ladder) both run. Verified
-    // against master before the fix. Ordered f64-before-f32 to match the list arm.
-    if cak == 0 && !unionHasAtomK(usid, unionName, "i32", 0) {
-      if unionHasAtomK(usid, unionName, "f64", 4) {
-        cak = 4 // "f64"
-      } else if unionHasAtomK(usid, unionName, "f32", 5) {
-        cak = 5 // "f32"
-      }
-    }
   }
   // A float literal types f64 by default, but if the union's float atom is f32 (`f32 | string`,
   // no f64) the literal re-encodes at f32 — pick the f32 atom so it boxes into the f32 value box.
-  // D-VALKIND: the `cak == 4` gate is hoisted out of the `&&` chain so the set
-  // resolution below is paid only by a float-classified value, not by every coercion.
+  // The same promotion ladder, entered at f64 instead of i32.
+  // D-VALKIND: the `cak == 4` gate is hoisted out of the call below so the set
+  // resolution is paid only by a float-classified value, not by every coercion.
   if cak == 4 {
-    const fsid = msSetOfText(unionName)
-    if (
-      !unionHasAtomK(fsid, unionName, "f64", 4) &&
-      unionHasAtomK(fsid, unionName, "f32", 5)
-    ) {
-      cak = 5 // "f32"
-    }
+    const fsw = unionStoreAtomKind(unionName, 4)
+    if fsw >= 0 { cak = fsw }
   }
   // An INT-element list whose union has no `i32[]` member but an `i64[]`/`f64[]` one
   // (`i64[] | boolean = [670563]` — the elements are small int literals, so the list
@@ -4794,12 +4787,6 @@ function emitUnionEqOther(body: i32[], otherIx: i32, k: i32, fnIx: i32) {
 // set the pool or the kind bank does not cover, and the legacy path answers those
 // unchanged — including its LOUD `emitFail` on an unregistered row, which the bank can
 // never mask (a covered set is a registered row by construction).
-function unionHasAtomK(s: i32, nm: string, kw: string, k: i32): boolean {
-  const b = msHasValKind(s, k)
-  if b >= 0 { return b == 1 }
-  unionHasAtomTy(nm, kw, false)
-}
-
 // union == concrete (either operand order — equality is symmetric): the box's
 // tag must select the arm whose rep matches the other side, then the unboxed
 // payload value-compares it. A rep with no arm is statically unequal (`==` 0 /
@@ -5227,15 +5214,58 @@ function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
     // the value. Deliver the atom the checker's consumers were typed against — and the
     // CONSUMER side agrees because `exprUnion` asks this very predicate and stops
     // calling the read a union value, so a box-typed position re-boxes it.
+    //
+    // D291 — AND THE PAYLOAD IS NOT ALWAYS AT THAT ATOM. `type Circle = { r: i64 | null }`
+    // beside `const lv1 = [{ r: 7 }]` has THREE sources: the field's declared member is
+    // i64, so the STORE widened `7` and boxed `struct.new $vbI64`, while the checker still
+    // types the read `i32`. Cast the payload to what the store actually put there
+    // (`memReadBoxedAtomKind`), then NARROW it back to what the consumers were typed
+    // against. The two are one function's two answers, so they cannot disagree, and the
+    // widening is invertible for exactly the values the checker's atom admits.
     const ck = memReadUnboxAtomKind(memIx, fnIx)
     if ck < 0 { return 0 }
-    return emitUnboxToAtomKind(ck)
+    const bk = memReadBoxedAtomKind(memIx, fnIx)
+    if emitUnboxToAtomKind(bk) < 0 { return -1 }
+    return emitNarrowStoredAtomKind(bk, ck)
   }
   // D-UNION-ATOM-KIND: the narrowed atom's ABI code decides both arms, exactly as it does
   // at the VARIANT-field twin of this read (`emitNarrowedMem` — same three instructions,
   // same two arms); `vbHeapIdxOfAtom` re-derived it a second time here, and
   // `mAtom == "string"` was code 2 asked in spelling form.
   emitUnboxToAtomKind(valueAtomKind(mAtom))
+}
+
+// D291 — the INVERSE of the store's widening: a payload that was boxed at kind `from`
+// because the union's arm is wider, delivered at the kind `to` the checker typed the read's
+// consumers against. Nothing at all when the two agree, which is every read the D209 rung
+// fired on before this. The four conversions are exactly the four promotions
+// `unionStoreAtomKind` performs, and each is exact over the source atom's whole range — an
+// i32 that went in comes back out bit-for-bit. A pair that ladder cannot produce is a loud
+// reject rather than a guess, because reaching here with one means the two ends have
+// already disagreed.
+function emitNarrowStoredAtomKind(from: i32, to: i32) {
+  if from == to { return 0 }
+  if to == 0 {
+    if from == 3 {
+      fbI32WrapI64()
+      return 0
+    }
+    if from == 4 {
+      fbI32TruncF64S()
+      return 0
+    }
+    if from == 5 {
+      fbI32TruncF32S()
+      return 0
+    }
+  }
+  if to == 4 && from == 5 {
+    fbF64PromoteF32()
+    return 0
+  }
+  emitFail(
+    "emitProgram: union field read stored at an atom the checker's atom cannot be recovered from",
+  )
 }
 
 // The unbox SEQUENCE for a value-union box payload at atom kind `mfk`: `struct.get $uBox

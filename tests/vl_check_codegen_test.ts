@@ -866,9 +866,62 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // assuming the class refilled — and if it has not, set this constant to `null` and let the
 // announced-inactive path below do its job rather than reaching for a program that is not
 // really in the class.
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: i64 | null }\n` +
-  `const lv1 = [{ r: 7 }]\n` +
-  `print((lv1[0]).r)\n`;
+//
+// SWAPPED AGAIN 2026-08-28 (silent-class-inventory D291). The three-source specimen this
+// constant carried is CLOSED and graduated to
+// `tests/cases/soundness/adopted-read-widened-store-narrows-back.vl`, `@run` + eight `@log 7`.
+// The census above was RE-RUN before assuming anything, exactly as it asked: all **138** rows'
+// own filed programs graded against the closing tree, and the class had NOT emptied — **D300**
+// is check-clean invalid wasm and was already so on the merge base. So the constant moves
+// rather than going null, and the previous entry's instruction is what found the successor.
+//
+// The census rule held on its second use, which is one more data point than it had. Its
+// predecessor rules each failed within a day BECAUSE they reasoned about mechanisms; this one
+// only asks which programs are in the class today, and re-asking it is cheap (one command,
+// ~90 s). Note what it also caught: D291's own row header said the class had one member when
+// D300 had already joined it, because that header was written before D300 was filed. The
+// command is the population; a sentence about the population is a snapshot.
+//
+// D300 is D224's REMAINING PRICE spelled without the twin: 27 census-block-B coordinates whose
+// `Box1`/`Box2` container aliases put two heap types behind one placeholder. Re-RUN against
+// this tree at the swap rather than inherited: `vl check` rc 0 (four HINTs, no errors),
+// `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref $type), found (ref
+// $type)`, `--codegen --no-validate` rc 0, `vl build` writes the `.wasm` and exits 1, and NO
+// `emit error` marker. Its module is BYTE-IDENTICAL across this change (3,392 bytes,
+// `cmp`-equal, same offset). Pinned as
+// `tests/cases/soundness/xfail-miscompile-twinfree-nullable-arm-read.vl` per the REFILLS
+// procedure above, in the same commit that swapped this constant.
+//
+// AND THE CAVEAT, because every previous entry that skipped one was wrong within a day: this
+// specimen is NOT out of reach. It IS D224's price, and D300's own row says closing those 27
+// takes that price to zero — so the change most likely to close this file is one someone is
+// already working toward rather than one nobody has thought of. It survives on the size of a
+// measured population, not on nobody having tried.
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 | null }\n` +
+  `type Sq = { s: i32 }\n` +
+  `type Shape = Circle | Sq\n` +
+  `type Box1 = {[string]: Circle}\n` +
+  `type Box2 = {[string]: Circle}\n` +
+  `type GW = { g: {[string]: Circle} }\n` +
+  `function useShape(s: Shape): i32 { if s is Sq { return 1 } return 0 }\n` +
+  `const sqv: Sq = { s: 1 }\n` +
+  `const _sp1: Box1 = Map()\n` +
+  `const _sp2: Box2 = Map()\n` +
+  `function mkcall() {\n` +
+  `  const cc = Map()\n` +
+  `  cc["k0"] = { r: null }\n` +
+  `  return cc\n` +
+  `}\n` +
+  `function outer() {\n` +
+  `  const lam = () => {\n` +
+  `    const wv: GW = { g: mkcall() }\n` +
+  `    if useShape(sqv) > 99 { print(0) }\n` +
+  `    const g0 = (wv.g)["k0"] ?? { r: null }\n` +
+  `    if (g0).r != null { print(7) } else { print(0) }\n` +
+  `  }\n` +
+  `  lam()\n` +
+  `}\n` +
+  `outer()\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.

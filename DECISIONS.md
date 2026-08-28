@@ -10,6 +10,29 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A UNION BOX's WIDENING is a function, and both ends of the box ask it** (2026-08-28,
+  silent-class-inventory D291). `emitUnionCoerce` widens an i32 value into a union whose only
+  numeric arm is `i64` / `f64` / `f32`, and an f64 into an `f32`-only one — the STORE's own
+  promotion ladder. That ladder is now `unionStoreAtomKind(unionName, kind)` and the
+  un-narrowed code-16 READ asks the same function to learn which value box the payload it is
+  looking at was put in. **The alternative considered and rejected was to let the read DELIVER
+  the atom the box holds** rather than the atom the checker typed the consumers against: that
+  is the larger change, because every consumer classifier (`print` alone reads four) would then
+  have to learn the predicate, and the un-taught ones fail SILENTLY. Keeping the delivered atom
+  as the contract means the conversion is confined to the read, and it is exact — the payload
+  can only have been widened FROM the checker's atom, which is what the ladder answering a
+  different kind means.
+
+- **A promotion ladder that two sites re-derive is a defect waiting for its second half**
+  (2026-08-28, D291). Before this, three places decided which arm of a union a scalar is stored
+  under: `emitUnionCoerce` (the full ladder, i64 then f64 then f32), `unionEqAtomOf` (the i64
+  branch only) and `memReadUnboxAtomKind`'s condition 3 (plain membership, no promotion at all).
+  The i32→f64 half of `unionEqAtomOf` had been missing since the coerce ladder was taught it, and
+  the symptom was `runs but wrong value`: `const v: C = { r: 7 }` over `{ r: f64 | null }` made
+  `(v).r == 7` silently false. **The rule is not "share the code because duplication is bad" —
+  it is that a store and a read of the same box are one decision, and a copy is a place for them
+  to disagree that no test names.**
+
 - **Structural identity ignores FIELD ORDER — except for flat types** (owner ruling
   2026-08-19). `{a: i32, b: i32}` and `{b: i32, a: i32}` are the same type, and the
   emitter's shape dedup keys on a sid-SORTED `(field name, field code, element, map-key
