@@ -339,6 +339,21 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   cell of the class and it is not reachable by a third rung of this shape — it
   needs the seam to answer a question about a value with no nominal identity at
   all.
+  **HALF OF THAT RESIDUE IS NOW CLOSED, AND SPLITTING IT IS THE POINT** (D280 then
+  D282, 2026-08-28). The paragraph above is about RESOLVERS — *which nominal name
+  does this value take* — and that half is still open and still correctly declined
+  (D209 is its filed witness). The other half is not a resolver question at all: it is
+  *do the two nominal answers land on ONE WasmGC heap type*, and by the very rule the
+  struct layer is built on they must, because the checker accepts either wherever the
+  other is expected. `uVarSTwin` (`variantStructHeapTwinAt`) is that merge across the
+  variant⇄struct seam; its first key, `repSlotOfTy(uVarTyIx[vi])`, sees DECLARED rows
+  only, so it was extended with the arena-keyed whole-table scan `repRowOfTyStruct`,
+  which reaches an interned `#anonN` row through `slotCanonId`'s `sTyIx` rung. Both
+  resolvers above are UNTOUCHED and stay nominal; what changes is that when they
+  disagree, the disagreement no longer produces two heap types. Measured over
+  `tests/cases`: the declared key answers 73 times, the anonymous one 304. **The
+  charter's sentence — "the variant⇄struct-TABLE seam stays nominal" — was read for a
+  year as licensing two HEAP TYPES, and those are different claims.**
   **AND THERE IS A THIRD PLACE FOR THE SAME RULE THAT IS NOT A RESOLVER RUNG AT ALL:
   a layer whose ONLY view of the value is a RENDER.** The map-VALUE layer holds
   `tyToEmitName(t.mVal)`, and that render spells a declared arm `{r:i32}` — the same

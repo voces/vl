@@ -9621,7 +9621,7 @@ Repro (four lines, and the third is the whole pin):
 ---
 
 ### D209 — a declared struct CAPTURES an anonymous literal the checker never widened
-**check-clean invalid wasm · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · OPEN, and now with TWO candidate fixes BUILT AND MEASURED AND BOTH REFUSED — the RESOLVER side (pin D271) and the READ side (pin D272), each refuted by a program it takes from `runs` to check-clean invalid wasm · its RESOLVER half is SEPARABLE and shipped 2026-08-27 as D208's close, which is measured NOT to move this row; D158 is a different root (measured — neither changed line is reached on its program)**
+**check-clean invalid wasm · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · THE SPECIMEN as of 2026-08-28 — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `tests/cases/soundness/xfail-miscompile-declared-struct-captures-anon-list-element.vl`, chosen because it DECLARES NO UNION (the variant⇄struct seam behind D33/D139/D156/D158/D171/D280/D282 is counted at `entries=0` on it) and because two candidate fixes have been built, priced and declined · OPEN, and now with TWO candidate fixes BUILT AND MEASURED AND BOTH REFUSED — the RESOLVER side (pin D271) and the READ side (pin D272), each refuted by a program it takes from `runs` to check-clean invalid wasm · its RESOLVER half is SEPARABLE and shipped 2026-08-27 as D208's close, which is measured NOT to move this row; D158 is a different root (measured — neither changed line is reached on its program)**
 
 Repro:
 
@@ -12250,12 +12250,21 @@ Repro:
   merge changed, and it is the direct measurement behind "a candidate moving 0 alone can be
   load-bearing": strip this rung from the shipped composition and every instrument still reads
   106 forward / 0 backward / 0 `runs` lost while this program goes silent.
+* **AND IT NOW HAS A PRICE, MEASURED THE NEXT DAY BY A POPULATION BUILT FOR A DIFFERENT QUESTION
+  (D282).** The 324-cell D282 grid carries a `use=boxarm` axis — read a value back out and box it
+  into the union — which is exactly the shape the sentence above says no population had. Strip
+  this rung from MASTER and **30 of those 324 go `runs` → check-clean invalid wasm**, every one at
+  `use=boxarm × claim=decl`. Six MORE go with them under D282's own merge
+  (`mapparam × boxarm × claim=none`), which is that merge making this arm reachable at six new
+  coordinates. All 36 are kept whole at `scripts/silent-sweep/distilled/named/d282_*.vl`, so the
+  gate can now score a rung every derived population reads as zero. The claim above is unchanged
+  and is now dated: no grid that EXISTED could have found it.
 * Pinned as program 4 of `tests/cases/soundness/arm-and-its-layout-twin-share-one-heap.vl`.
 
 ---
 
 ### D282 — the read's `??` DEFAULT is the only nominal claim, and the container was filled through an un-annotated PARAMETER
-**check-clean invalid wasm · found 2026-08-28 as the residue of D280 · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · pre-existing on `28425535` and byte-identical across this change · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**[CLOSED 2026-08-28] the repro below RUNS and prints `7`. Was: check-clean invalid wasm on `474b6a1b` and on every generation before it · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · it was THE SPECIMEN (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`), now re-pointed at D209**
 
 Repro (ten lines, and NO layout twin is declared anywhere):
 
@@ -12269,32 +12278,99 @@ Repro (ten lines, and NO layout twin is declared anywhere):
     fill(c, 7)
     const dleaf: Circle = { r: 0 }
     print((((c)["k1"] ?? dleaf)).r)
-    // vl check rc 0 (one redundant-annotation HINT, no errors); vl run:
+    // `474b6a1b`: vl check rc 0 (one redundant-annotation HINT, no errors); vl run:
     //   Invalid input WebAssembly code at offset 1258:
     //   type mismatch: expected (ref null $type), found (ref $type)
 
-* **THE ONE-LINE CONTROL IS D173's PIN, and the pair names the coordinate exactly.** Move the SAME
-  annotation from the read's default to the container binding —
-  `const m: {[string]: Circle} = c` then `print((((m)["k1"] ?? { r: 0 })).r)` — and the program
-  RUNS, on this tree and on the base. A claim at the container is a DELIVERY the pin family reads;
-  a claim at the read is a CONSUMPTION it cannot. That is D158's content, here at the coordinate
-  D158's own witness did not occupy.
-* **BOTH OF THE MECHANISMS THAT CLOSED THIS FAMILY ARE INAPPLICABLE BY CONSTRUCTION**, which is why
-  it is the specimen and not a loose end: no delivery exists for the pin family, and no second
-  claimant of `Circle`'s layout is declared, so `armLayoutContested` is false,
-  `variantStructHeapTwinAt` answers -1 and `uVarTwin` has no second arm to collapse. Choosing a
-  successor specimen against BOTH mechanisms is a tightening of the selection rule in
-  `tests/vl_check_codegen_test.ts`, whose previous choice was made for stability against the pin
-  family alone and was closed by something else.
-* **PRE-EXISTING, MEASURED RATHER THAN INHERITED.** Graded `check-clean invalid wasm` on the base
-  seed (1,461,851) and on the shipped seed (1,463,065), same sentence, same offset 1258.
-* **WHAT IS LEFT IS THE ANONYMOUS SHAPE, and `DECISIONS.md` already names it as the residue of this
-  whole seam**: "The residue is where NEITHER table owns the name: an ANONYMOUS shape has no
-  declaration identity, both arena rungs correctly decline, and the structural scans decide it with
-  nothing to break the tie (D36)." `{ r: n }` inside `fill` is that shape, and its element resolves
-  before `dleaf`'s annotation is anywhere in scope. Not reachable by a third rung of the D32/D33
-  shape and not reachable by a heap merge — nothing is being merged, there is one claimant.
-* Pinned as `tests/cases/soundness/xfail-miscompile-read-default-annotation-through-unannotated-param.vl`.
+* **IT IS D280's ARGUMENT AT AN ANONYMOUS CLAIMANT, AND THE FILING'S OWN "no second claimant is
+  declared" WAS THE MISTAKE.** That sentence is true and it is not the question. `Circle`'s
+  layout has a second claimant here: the interned `#anonN` row `collectAnonShapes` mints for
+  `{ r: n }` inside `fill`, where no context can name it. `variantStructHeapTwinAt` keys on
+  `repSlotOfTy(uVarTyIx[vi])`, and that bridge answers only for a DECLARED row — its cache scan
+  is gated `sRowDecl[si] == 1` — so the anonymous claimant is invisible to it and the arm mints a
+  SECOND heap type for a checker type that has one. The checker says they are one type OUT LOUD,
+  exactly as it did on D280: ``redundant type annotation: `dleaf` is inferred as `{r: i32}` `` on
+  a binding annotated `Circle`.
+* **THE COMPLEMENT WAS ALREADY WRITTEN — pattern 1, for the sixth time in this family.**
+  `repRowOfTyStruct` is the SAME double gate (`slotCanonId` key + `structFieldCodesEq` layout)
+  lifted to a whole-table scan keyed on an ARENA TYPE instead of a second slot, its header says
+  so, and `slotCanonId`'s arena rung (`sTyIx` → `repCanonId`) covers precisely the `#anon` rows
+  the name path cannot resolve at all. It declines a genuinely AMBIGUOUS bucket (two canon-key
+  twins whose emitted layouts differ) rather than guessing — the same never-merged degenerate
+  `variantStructHeapTwinAt`'s own field-code guard takes. **ONE confirm-only line**, second, so
+  the declared answer is untouched: the widening can only turn a -1 into a row.
+* **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS.** On the base the rec group carries THREE identical
+  `(struct (field (mut i32)))` — `$0` the `#anon` row the map's value slot uses, `$1` `Circle`'s
+  variant heap, `$2` `Sq`'s — and the module reads
+
+      (global $global$2 (mut (ref $1)) (struct.new $1 (i32.const 0)))   ;; dleaf, at Circle
+      (local $17 (ref null $0))                                        ;; the `??` result
+      (else (local.set $17 (global.get $global$2)))                    ;; (ref $1) into (ref null $0)
+
+  On the shipped seed the rec group carries TWO, `global$2` is `(mut (ref $0))`, and the
+  identical `global.get` is well typed. One heap type fewer, and nothing else in the module moves.
+* **THE COUNTERS SAY THE LINE IS REACHED AND ANSWERS**, probed at the site
+  (`entries / declAnswered / anonReach / anonAnswered / merged`):
+
+  | program | counters |
+  |---|---|
+  | this row's repro | `2 / 0 / 2 / 1 / 1` — the declared bridge answers ZERO times; the new rung answers once |
+  | D280's repro (a DECLARED twin) | `2 / 1 / 1 / 0 / 1` — inert; the new rung is not reached for that arm |
+  | the same program with the parameter ANNOTATED (no `#anon` row is minted) | `2 / 0 / 2 / 0 / 0` — reached, correctly DECLINES |
+  | with `type Shape` deleted (no union at all) | `0 / 0 / 0 / 0 / 0` |
+  | **the whole of `tests/cases` (1,954 files that reach the emitter)** | **1,075 / 73 / 1,002 / 304 / 321** |
+
+  The declared rung answers 73 times over the corpus and the anonymous one 304 — **4.2x** — which
+  is the size of the half D280 could not see.
+* **THE TRADE, and `runs` LOST is ZERO on every population measured**: **6 of 1,188** on the D156
+  annotation-position grid, cell-matched, all six `check-clean invalid wasm → runs` and all six
+  the cells this row names; **24 of 324** on the purpose-built D282 grid
+  (`scripts/silent-sweep/d282/`), every one `prod=mapparam × claim=none`; **7 behavioural classes
+  / 312 census cells forward, 0 `runs` lost, 0 → silent** on the distilled corpus standing for
+  250,517 cells; and **0 corpus modules LOST, 0 GAINED, 135 byte-DIFF** over 2,338 `tests/cases`
+  files. D209, D224, D271, D272 and D173 all still behave exactly as filed.
+* **THE ABLATION SAYS THIS IS A COMPOSITION, NOT A RUNG — and it is the first population to
+  PRICE D281.** Four compilers, each a distinct size (1,463,065 base · 1,463,113 shipped ·
+  1,463,046 this rung with D281's stripped · 1,462,998 base with D281's stripped), all four
+  cell-matched on the 324-cell grid:
+
+  | compiler | silent | `runs` lost vs base |
+  |---|---|---|
+  | base (`474b6a1b`) | 24 | — |
+  | **base with D281's rung STRIPPED** | **54** | **30** |
+  | **this rung ALONE, D281's stripped** | **36** | **36** |
+  | shipped (both) | **0** | **0** |
+
+  **Direction one — a candidate that scored 0 on every population when it landed is load-bearing
+  here.** D281's rung moved 0 cells on all four per-row grids (5,188), 0 classes on the distilled
+  corpus and 0 on census block B when it shipped, and its own row says why: *"none of those
+  populations boxes a plain declared struct into a union."* This grid's `use=boxarm` axis does,
+  and stripping that rung from MASTER loses 30 running programs — all 30 at
+  `use=boxarm × claim=decl`. **Direction two — either half alone is a catastrophe.** This rung
+  alone is strictly WORSE than the base (24 silent → 36): it fixes its 24 and breaks 36, of which
+  30 are D281's and **6 are new** — `mapparam × boxarm × claim=none`, the coordinates where only
+  the anonymous merge makes `emitUnionCoerce`'s equal-heap arm reachable. Stripping this rung
+  reproduces the base **byte for byte at 1,463,065**.
+* **THE 36 ARE A NAMED SET AND THEY ARE NOW IN THE GATE.** Coordinates at
+  `scripts/silent-sweep/census/d282-d281-price.json`, materialised by
+  `scripts/silent-sweep/d243/mkset.py` (36 `vl` invocations; the histogram must read `runs 36`
+  and nothing else — it reads `check-clean invalid wasm 36` on the ablated compiler), and the
+  cells kept WHOLE at `scripts/silent-sweep/distilled/named/d282_*.vl`, where `regress.py`
+  exits 1 with `36 behavioural class(es) stopped running` against that compiler. They are the third instance of the shape #1979 and #1981 were landed for, and the
+  first reached from an ABLATION rather than a refusal: no derived rule can score a rung that
+  every derived population reads as zero.
+* Pinned as programs 1–4 of `tests/cases/soundness/arm-and-an-anon-row-of-its-layout-share-one-heap.vl`
+  (`@run`, four `@log 7`), whose program 1 is this repro verbatim, program 2 is the six new
+  D281 coordinates, program 3 is the depth-2 sibling and program 4 is the inertness control.
+  `xfail-miscompile-read-default-annotation-through-unannotated-param.vl` is DELETED, which is
+  that file's own written instruction for the day it starts passing.
+* **THE SPECIMEN MOVED TO D209**, and the selection rule moved with it. The previous rule
+  ("choose against both mechanisms of this family") held on every one of its three facts —
+  `armLayoutContested` false, `variantStructHeapTwinAt` -1, `uVarTwin` with no second arm — and
+  the close came from making `variantStructHeapTwinAt` ANSWER where it had answered -1. Choosing
+  against the mechanisms a family HAS is choosing against the candidates again, one level up. The
+  successor therefore leaves the family by a CHECKABLE property rather than an argued one: D209
+  declares no union at all, so `uVariants` is empty and this whole seam is counted at `entries=0`.
 
 ---
 
