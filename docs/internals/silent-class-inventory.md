@@ -11616,10 +11616,10 @@ specimen graduated verbatim out of `INVALID_MODULE_SRC`.
 
 ---
 
-### D301 — the NESTED map beside a FLAT one of the same value layout: two declared names, two vals rows, two outer map structs
-**check-clean invalid wasm · found 2026-08-28 while building D300's regression fixture — the two sections pass alone and are invalid TOGETHER · unmoved by D300's landing (identical validator sentence at the identical offset before and after, on `ada42128` and on `42b5ab37` alike) and unmoved by D300's refused wide candidate · the SECOND live member of the `--codegen` specimen class and its NAMED SUCCESSOR**
+### D301 — [CLOSED 2026-08-28] the SECOND declared name of one layout: two `rlInternName` rows, one wrapper, two map structs
+**closed 2026-08-28 — the filed repro RUNS and prints `0 0` · was `check-clean invalid wasm` byte-identically on `ada42128`, `42b5ab37`, the D300 landing and `34f473ab` (validator sentence and offset 2809 unchanged across all four) · closed by ONE rung, `W`, which every derived population prices at ZERO — 0 of 1,477 behavioural classes, 0 of 250,767 census cells, and all 1,913 buildable corpus modules `cmp` byte-IDENTICAL — while the counters put it at 6,562 reaches / 950 answers · it was the `--codegen` specimen's NAMED SUCCESSOR and that hand-off is now spent**
 
-Repro (two independent sections, each of which RUNS on its own):
+Repro (the filed two-section program, verbatim):
 
     type Circle = { r: i32 | null }
     type CircleN = { r: i32 | null }
@@ -11643,41 +11643,165 @@ Repro (two independent sections, each of which RUNS on its own):
       if (n1).r != null { print(7) } else { print(0) }
     }
     nested()
-    // `ada42128`, `42b5ab37` AND the D300 landing, byte-identically: vl check rc 0,
-    // no diagnostics, then
+    // `ada42128`, `42b5ab37`, the D300 landing AND `34f473ab`, byte-identically:
+    //   vl check rc 0, no diagnostics, then
     //   Invalid input WebAssembly code at offset 2809:
     //     type mismatch: expected (ref $type), found (ref $type)
-    // Delete either section and the other RUNS. Rename `CircleN` to `Circle` (one declared
-    // name instead of two layout twins) and both RUN.
+    // Now: runs, prints `0` then `0` — the right answers (`r` is `null` in both halves).
 
-* **IT IS D300's SEAM WITH THE MERGE BLOCKED ONE LAYER DOWN.** Probed at the mint:
+* **TWO FILED CLAIMS WERE WRONG, AND BOTH ARE CORRECTED HERE.** Re-run verbatim on
+  `34f473ab` before anything was designed:
 
-      slot=0 name={r:null}             kind=1 canon=1  rl=0 rlwrap=8  sidx=0  heap=16
-      slot=1 name=CircleN              kind=1 canon=4  rl=1 rlwrap=8  sidx=1  heap=17
-      slot=3 name=Circle               kind=1 canon=4  rl=0 rlwrap=8  sidx=0  heap=17
-      slot=2 name={[string]:CircleN}   kind=6 canon=10 rl=2 rlwrap=10         heap=18
-      slot=4 name={[string]:{r:null}}  kind=6 canon=9  rl=3 rlwrap=12         heap=19
+  | filed claim | measured |
+  |---|---|
+  | "two independent sections, each of which RUNS on its own" | **only the FLAT one does.** Delete the nested half → runs. Delete the flat half (with or without `mkflat`) → **still check-clean invalid wasm** |
+  | "rename `CircleN` to `Circle` … and both RUN" | holds — one declared name, both halves run |
+  | "D300's REFUSED wide candidate … was built and run on this witness verbatim: **still check-clean invalid wasm**" | **false.** Built as master + the wide hoist (1,464,911 bytes) and run on the filed repro: **RUNS, prints `0 0`** |
 
-  The two outer (kind-6) slots are the invalid pair, and they cannot merge because their
-  vals elements are ref-list rows 2 and 3, whose own value slots are `CircleN` (1) and
-  `{r:null}` (0) — a pair that agrees on NEITHER of D300's two rungs: their canonical keys
-  differ (1 vs 4, the same `{r:null}` vs `{r: i32 | null}` split D300 names) **and** their
-  ref-list slots differ (1 vs 0), because two DECLARED names of one layout intern two
-  `rlInternName` rows. `rlTwin` collapses those two rows to one wrapper (8 = 8) at mint
-  time, but that is timing-DEPENDENT and `repMapValSlotsTwin` may not read it.
+  The first correction is the mechanism. The pairing of containers is NOT the ingredient —
+  a **second declared name of one layout** is. Delete `type Circle`, which nothing in the
+  nested half references, and the nested half runs on master.
 
-* **NEITHER D300 CANDIDATE REACHES IT, WHICH IS WHY IT IS ITS OWN ROW.** D300's shipped
-  kind-1 rung is ref-list slot EQUALITY and declines (0 ≠ 1). Its REFUSED wide candidate —
-  the same rung asked through `rlSlotsLayoutTwin`, whose struct arm would answer
-  `repStructSlotsTwin(0, 1) = 1` — was built and run on this witness verbatim: **still
-  check-clean invalid wasm**, so the 21-cell price that candidate carries does not even buy
-  this row. The missing rung is a THIRD one, in the same family: a timing-independent
-  "same wrapper" relation over two ref-list rows whose element STRUCT rows are twins.
+* **THE MINIMAL WITNESS IS EIGHT LINES AND USES NO FUNCTION AT ALL:**
 
-* **WHAT MAKES IT WORTH FILING SEPARATELY.** Both sections run alone, so no single-family
-  grid can see it; it needs two declared layout twins AND one flat + one nested container in
-  one module. The census's `twin` axis crosses declaration twins, but its `cont` axis picks
-  ONE container per cell, so no census coordinate carries both.
+      type Circle = { r: i32 | null }
+      type CircleN = { r: i32 | null }
+      const iv = Map()
+      iv["k0"] = { r: null }
+      const om = Map()
+      om["k0"] = iv
+      const dd: {[string]: {[string]: CircleN}} = om
+      print(dd.size)
+
+  One change each, all measured: drop `type Circle` → runs · annotate with `Circle`
+  (the FIRST declared name) instead of `CircleN` → runs · make the field `r: i32` instead
+  of `r: i32 | null` → runs · drop the `{[string]:` outer container → runs.
+
+* **THE MECHANISM, PROBED AT THE MINT** (a temporary counter/`emitFail` probe inside
+  `mAssignTypeIndices`, on the eight-line witness):
+
+      RL0 nm=Circle                k=1 twin=0 wrap=8
+      RL1 nm={[string]:{r:null}}   k=3 twin=1 wrap=10
+      RL2 nm=CircleN               k=1 twin=0 wrap=8
+      RL3 nm={[string]:CircleN}    k=3 twin=3 wrap=12
+      MV0 nm={r:null}              k=1 rl=0 rlwrap=8  rep=0
+      MV1 nm={[string]:{r:null}}   k=6 rl=1 rlwrap=10 rep=1
+      MV2 nm=CircleN               k=1 rl=2 rlwrap=8  rep=2
+      MV3 nm={[string]:CircleN}    k=6 rl=3 rlwrap=12 rep=3
+
+  `MV0` and `MV2` hold **different ref-list slots (0 and 2) that resolve the SAME wrapper
+  (8)** — `rlTwin` merged `RL0` onto `RL2`'s class because a struct element's `rlSig` is
+  `"h:" + sHeapIdx[rlElemStructRow(row)]` and the struct table had already deduped `Circle`
+  against `CircleN`. **D300's kind-1 rung asks slot EQUALITY (`mvRlSlot[a] == mvRlSlot[b]`),
+  which is exactly blind to that**: two declared names of one layout intern two
+  `rlInternName` rows, so the slots differ and the rung declines. `rep=0` and `rep=2` — two
+  map structs over one vals wrapper. The kind-6 pair then cannot merge either: its guard's
+  kind-3 element recursion bottoms out in `repMapValSlotsTwin(MV0, MV2)`, which just said no.
+
+* **THE RUNG, `W`.** In `repMapValSlotsTwin`, one branch after D300's `R`:
+
+      if k == 1 {
+        const wa = mvValsElemStructRow(a)
+        const wb = mvValsElemStructRow(b)
+        if wa >= 0 && wb >= 0 && repStructSlotsTwin(wa, wb) == 1 { return 1 }
+      }
+
+  The vals half of a map struct's identity is the **wrapper**, and two ref-list rows are one
+  wrapper exactly when `rlTwin` merges them — which for a struct element is
+  `sHeapIdx[rlElemStructRow(row)]` equality, i.e. `repStructSlotsTwin`, the `sTwin`
+  equivalence queryable pairwise. **Timing-independence is a hard requirement here and is
+  why it is not asked of `rlTwin`/`rlWrapIdx` directly**: `rlSig`'s own map-element arm calls
+  `mvCanonRepOf` → `repMapValSlotsTwin` *while* `rlTwin` is being built and before
+  `rlWrapIdx` exists at all. `repStructSlotsTwin` reads only `slotCanonId` +
+  `structFieldCodesEq`, both final before the ref-list loop starts.
+
+  **ASKED AS THE STRUCT-ROW LEG, NOT THROUGH `rlSlotsLayoutTwin`** — see the refusal below.
+
+* **THE DISASSEMBLY.** On master the eight-line witness emits **five** map structs; `$16`
+  and `$18` are field-for-field equal (`(struct (field (mut (ref 14))) (field (mut (ref 8)))
+  (field (mut (ref 3))) (field (mut (ref 3))) (field (mut i32)) (field (mut i32))
+  (field (mut (ref 3)))))`, and so are the outer `$17`/`$19` modulo their vals arrays'
+  element index. Under the landing there are **three**, and the two `(array (mut (ref null
+  16)))` / `(array (mut (ref null 18)))` vals arrays are one.
+
+* **ABLATION BY STRIPPING, all sixteen compositions of `{R, W, X, T}`.** Strip all four and
+  the tree reproduces the pre-D300 base **byte-for-byte at 1,464,576 (md5 12f7ae65)**, and
+  `R+X+T` reproduces `34f473ab` **byte-for-byte at 1,464,824 (md5 2179a42c)** — every one of
+  D300's eight cells re-taken here and identical.
+
+  | kept | bytes | md5 | D301 repro | `inferred-map-destination-shape.vl` |
+  |---|---|---|---|---|
+  | — | 1,464,576 | 12f7ae65 | invalid wasm | ok |
+  | R | 1,464,699 | 9a44b305 | invalid wasm | **COMPILER TRAP** |
+  | W | 1,464,727 | e7e9ed72 | invalid wasm | ok |
+  | X | 1,464,663 | 6392e023 | invalid wasm | ok |
+  | T | 1,464,614 | a751b2eb | invalid wasm | ok |
+  | R+W | 1,464,850 | f5e3eaf2 | invalid wasm | ok |
+  | R+X | 1,464,786 | 8fe46456 | invalid wasm | **COMPILER TRAP** |
+  | R+T | 1,464,737 | 920ad086 | invalid wasm | ok |
+  | **W+X** | 1,464,814 | 9c3f1ed1 | **runs** | ok |
+  | W+T | 1,464,765 | 5cb6cf9b | invalid wasm | ok |
+  | X+T | 1,464,701 | c8efed70 | invalid wasm | ok |
+  | R+W+X | 1,464,937 | c47f848d | **runs** | ok |
+  | R+W+T | 1,464,888 | 36b4bc4b | invalid wasm | ok |
+  | R+X+T (`34f473ab`) | 1,464,824 | 2179a42c | invalid wasm | ok |
+  | W+X+T | 1,464,852 | ecc84fac | **runs** | ok |
+  | **R+W+X+T (shipped)** | 1,464,975 | 78472179 | **runs** | ok |
+
+  **`W` AND `X` ARE ONE LANDING, exactly as `R` and `X` were at D300.** `W` alone leaves the
+  witness check-clean invalid wasm and so does `X` alone; only `W+X` runs. `W` merges the
+  inner kind-1 pair and `X` is what carries that merge one container out.
+
+  **`R` IS NOT SUBSUMED BY `W`, measured in both instruments.** Stripping `R` from the
+  landing (`W+X+T`) loses **58 behavioural classes** `runs` → check-clean invalid wasm on the
+  distilled corpus, and the corpus `cmp` names the module: `W+X+T` vs the shipped tree is
+  1,912 IDENT / **1 RCDIFF**, `tests/cases/soundness/twinfree-nullable-arm-read-through-an-inferred-return.vl`.
+  Slot equality still answers pairs whose ref-list rows have no struct row (a registered
+  variant element, where `rlElemStructRow` is -1 by D32's nominal floor).
+
+  **`T` STAYS, and on this branch nothing measures it — which is the point D300 already
+  made.** `R+W+X` vs the shipped tree is 1,913 IDENT / 0 DIFF / 0 RCDIFF and 0 of 2,008
+  graded cells move. Note what changed anyway: on `34f473ab`'s `R+X` the missing `T` is a
+  **compiler trap**, and with `W` present that trap is gone (`R+W+X` is ok on the same file).
+  `W` happening to restore transitivity on one program is not an argument that the relation
+  is transitive — `W` is a layout-only rung and breaks the same premise `R` does — so the
+  chained `mvCanonRepOf` is what keeps the invariant, not luck.
+
+* **THE REFUSED CANDIDATE AND ITS PRICE: the same wide hoist D300 refused.** Asking the
+  kind-1 question through the whole `rlSlotsLayoutTwin` (1,464,911 bytes) **does close D301**
+  — which is the third filed claim corrected above — and costs **4 behavioural classes / 21
+  census cells `runs` → `loud emit reject`** (`b021395` [4], `b021396` [3], `b021398` [9],
+  `b021399` [5], all `emitProgram: bare null needs a struct-typed context`), cell-identical
+  to the price D300 measured for it. The mechanism is that relation's CROSS-TABLE arm, which
+  merges a registered arm slot with a plain-struct slot and carries `mvValStructIdxOf` /
+  `mvValVariantOf` with it. `W` asks only the struct-row leg — the wrapper question and
+  nothing else — and costs **zero**. Priced in
+  `scripts/silent-sweep/census/d301-rung-price.json`.
+
+* **FOUR INSTRUMENTS.** Corpus `cmp` (shipped vs `34f473ab`): **1,913 IDENT / 0 DIFF / 0
+  RCDIFF** over 2,346 modules (433 are deliberate rejects that fail on both). Distilled
+  census: **0 classes moved, 0 `runs` LOST, 0 into silent** across 1,477 representatives
+  standing for 250,767 cells plus 529 curated. Disassembly: five map structs become three.
+  Counters, swept over the corpus: `W` **reaches 6,562 times in 23 files and ANSWERS 950
+  times in 5** (`inferred-map-destination-shape.vl` 628, `map-value-twin-relation-stays-transitive.vl`
+  302, `variant-twin-map-elem-list-field.vl` 6, `object-shape-identical-alias-flows.vl` 3,
+  `map-value-twin-heap.vl` 11) — live everywhere and byte-identical everywhere, so **only the
+  named cells can price it**.
+
+* **WHAT NOTHING DERIVED COULD HAVE FOUND, kept whole in `distilled/named/`.** The census's
+  `twin` axis crosses declaration twins and its `cont` axis picks ONE container per cell, so
+  no coordinate carries a second declared layout twin beside a nested container. The two
+  programs are `d301w_second_declared_name_of_one_layout` (the eight-line witness) and
+  `d301f_flat_beside_nested_two_declared_names` (this row's own filed repro, kept whole so
+  the flat/nested asymmetry stays measurable). The corpus fixture is
+  `tests/cases/maps/map-value-twin-second-declared-name-of-one-layout.vl`.
+
+* **THE `--codegen` SPECIMEN.** This row was D311's NAMED SUCCESSOR in
+  `tests/vl_check_codegen_test.ts`. D311 is still live on this tree (its pin,
+  `tests/cases/soundness/xfail-miscompile-adopted-string-atom-print-route.vl`, still fails
+  identically), so the slot is untouched here and the successor hand-off is spent: the next
+  swap has to re-run the census rather than inherit a name. That is the fourth hand-off in a
+  row to expire because the named row was closed first.
 
 ---
 
