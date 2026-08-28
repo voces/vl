@@ -625,7 +625,9 @@ WASM · 2 cells. The program below is unchanged; what moved is the compiler.**
 ---
 
 ### D8 — assigning to a struct FIELD inside the block where that field is narrowed non-null
-**loud check reject · 46 cells · flat across 23 of 23 reps**
+**CLOSED 2026-08-28 — the filed program now RUNS and prints `bb`. FILED AS: loud check reject ·
+46 cells · flat across 23 of 23 reps. TWO OF THE ROW'S OWN CLAIMS WERE WRONG, and one of the
+corrections is the mechanism.**
 
     type W = { f: string | null }
     function src(): string | null { return "bb" }
@@ -647,17 +649,55 @@ WASM · 2 cells. The program below is unchanged; what moved is the compiler.**
     w.f = src()
     print(w.f == null)
 
-* **Flat on**: **every rep in the grid, 23 of 23**, 2 cells each — sets, maps, all eight
-  newtypes, all nine nested-array shapes, both flat records. The rendered type differs per rep
-  (`cannot assign {[i32]: boolean}? to {[i32]: boolean}`,
-  `cannot assign {value: i32, tt: i32, pad: i32}? to {value: i32, tt: i32, pad: i32}`, …) but
-  the shape is one.
-* **Varies on**: the assigned value's type. Assigning a non-nullable `T` inside the block is
-  accepted, so the check is against the **flow-narrowed** type rather than the declared one.
-* This is inventory #1's D8 (`cannot assign null to string` for a *binding*) re-measured at
-  the **struct-field-assignment** position, which #1 listed as a coverage gap. Still live, and
-  now with a flat-across-every-rep count. Assignment should be checked against the field's
-  DECLARED type; narrowing constrains reads, not writes.
+**FALSE CLAIM 1 — the filed message, and the prescription built on it.** The row records
+`cannot assign string? to string` and concludes *"Assignment should be checked against the
+field's DECLARED type; narrowing constrains reads, not writes."* Run verbatim on `4bdfcc67`
+the program says something else:
+
+    [ERROR]: 'w.f' was narrowed by a guard, but the assignment on line 6 can write it
+             — re-test 'w.f' after the assignment
+
+The **assignment was already accepted** — `writeStorageTy` widens a narrowed place's write
+back to its storage type, and deleting the read (`d8_writeonly`, the same program with
+`print(w.f)` moved below the block) compiles and runs on master. What refused is the **READ
+after** it. The row's prescription was already implemented and describes the wrong half of
+the program.
+
+**FALSE CLAIM 2 — "flat across 23 of 23 reps" is true of the outcome and false of the
+mechanism.** Re-measured on a rebuilt 46-cell grid, the reps split 42/4: 42 got the
+narrowed-by-a-guard READ error and 4 — both sets — got the filed `cannot assign` message.
+The discriminator is **not the rep**. Both halves of `write-storage-ty-survives-an-opaque-rhs-callee.vl`
+are the same `{[string]: i32}` field; only the RHS callee's body differs, and the one that
+calls a METHOD is rejected while the one that assigns through an index is accepted. The grid
+saw it only on Sets because a `Set()` can only be filled with `.add`, which is a method call.
+
+**THE MECHANISM, in two independent halves.**
+
+*The read (42 cells).* A retired BARE-NAME narrowing leaves the name readable at its DECLARED
+type; the property-PATH spelling refused outright, and `typecheck.vl`'s own header gave the
+reason — *"a path narrowing also dies to an ALIASED write through a call, which the emitter
+has no relation to detect"*. That covers half the `npInvBy` column. A direct `w.f = e` is a
+statement the emit walk passes over exactly as it passes over `f = e`, so the refusal is split
+by CAUSE (`pathRetiredByAssign`): a Call keeps it, an assignment reads at the declared type.
+The emit half retires the same write (`emit_classify`'s write-retirement grew a Member arm);
+without it four scalar-newtype cells emit `bare null needs a struct-typed context`, which is
+the ablation's proof that the two sides are one landing.
+
+*The write (4 cells).* An ORDERING BUG inside one statement. `lt` is read off the target
+before the RHS is checked, so it is the narrowed type; the RHS is then checked and an opaque
+callee retires the path (`noteCallInvalidations`); and `writeStorageTy`, asked afterwards, saw
+`npInvBy[slot] >= 0` and declined — leaving `asgLt` at a type the storage never had. It now
+answers for a retired narrowing too, and `retireNarrowingsForWrite` overwrites a call's
+attribution with the write's so the read below names the assignment. Either rung alone leaves
+all four cells rejected, with different messages: they are ONE landing.
+
+* **Grade after the close**: 44 of 46 cells `runs`, matching the position's own controls
+  cell for cell. The 2 residual are `new ("p" | "q")`, whose CONTROL also fails
+  (`emitProgram: literal-union string widening with no members`) — a language limit the
+  harness excludes by name, not a residue of this row.
+* Entombed by `tests/cases/soundness/direct-write-retires-path-narrowing-and-reads-declared.vl`
+  and `tests/cases/soundness/write-storage-ty-survives-an-opaque-rhs-callee.vl`. The call
+  cause keeps its five existing must-error fixtures, unchanged.
 
 ---
 
@@ -693,7 +733,8 @@ the compiler.**
 ---
 
 ### D10 — PLACE-NARROWING a nullable struct field, then using it, is a loud emit reject for container reps
-**loud emit reject · 104 cells · two messages, one axis**
+**CLOSED 2026-08-28 — the filed program now RUNS and prints `2`. FILED AS: loud emit reject ·
+104 cells · two messages, one axis. The count and both messages were exactly right.**
 
     type W = { f: i32[][] | null }
     function src(): i32[][] | null { return [[1, 2]] }
@@ -717,16 +758,39 @@ in-place narrow over a **plain** `i32[]` field prints `2`:
     if w.f != null { print(w.f.length) } else { print("NUL") }
 
 * **Flat on**: all four narrowing constructs and both inputs.
-* **Varies on**: the field's rep. In-place field narrowing is **correct** for all eight
-  newtypes (8/8 each), both flat records (8/8), and a plain `i32[]`; it is a **loud emit
-  reject** for the nine nested arrays (64 cells, `index receiver is not an array or string`)
-  and for both maps, both sets and `{a:i32}[][]` (40 cells,
-  `field access receiver is not a struct`). Two messages, one axis.
+* **Varies on**: the field's rep — and the row's split was right. Re-measured on a rebuilt
+  184-cell grid: 72 correct before, 104 loud emit reject, in the two messages the row names.
+
+**THE MECHANISM IS ONE MISSING RUNG, TWICE — and both times the twin was already written.**
+The CHECKER narrows the path correctly (the position is check-clean); the EMITTER's expression
+classifiers answer from the field's DECLARED code and never learned the nullable one.
+
+* `exprRefArray`'s **Ident** arm carries three nullable rungs — `declaredKind ==
+  "nulreflist"`, `paramNulRefArray`, `globalIsNulRefArraySid` — each added when a storage
+  class was found missing. Its **Member** arm had exactly one test, `memFieldTypeCode == 5`
+  (the NON-nullable ref-list field code). Code 28, the `T[] | null` field, reached nothing.
+* `exprMap` is the same shape one classifier over: its Ident arm ends `return
+  exprNullableMap(exprIx, fnIx)`, its Member arm tested only code 19, and code 29 reached
+  nothing.
+
+Both nullable twins ALREADY had the Member arm — `exprNullableRefArray` tests
+`memberFieldCode == 28`, `exprNullableMap` tests `memFieldTypeCode == 29` — so each fix is one
+line asking the twin rather than re-deriving the code. Ablation: rung 1 alone moves the nine
+nested arrays (72 cells), rung 2 alone the maps and sets (32); neither reaches the other's, so
+they are two landings, not one.
+
+* **Grade after the close**: 176 of 184 cells `runs`, matching the position's controls exactly
+  — cell and control now have the same outcome vector for every rep. The 8 residual are
+  `new ("p" | "q")`, whose control fails too (a language limit, excluded by name).
+* Disassembled: the in-place read is the temp-binding control's, instruction for instruction —
+  `ref.as_non_null (struct.get $0 0 …)` then the ordinary list index. No box, no re-hash.
+* Entombed by `tests/cases/objects/place-narrowed-nullable-container-field.vl`.
 
 ---
 
-### D11 — PLACE-NARROWING an array ELEMENT, then using it, is a loud CHECK reject for all but the niche reps
-**loud check reject · 162 cells of 184**
+### D11 — PLACE-NARROWING an array ELEMENT is a loud CHECK reject — for EVERY rep, not 162 of 184
+**loud check reject · re-measured 2026-08-28 as 184 of 184, not 162 · a candidate was built,
+MEASURED and REFUSED; its price is `scripts/silent-sweep/census/d341-index-place-price.json`**
 
     function src(): i32[][] | null { return [[1, 2]] }
     function body() {
@@ -734,24 +798,75 @@ in-place narrow over a **plain** `i32[]` field prints `2`:
       if xs[0] != null { print(xs[0][0][1]) } else { print("NUL") }
     }
     body()
-    // [ERROR]: cannot index non-array i32[][]?
+    // [ERROR]: cannot index non-array i32[][] | null
 
 **Control** (bind the element, then narrow — prints `2`):
 
     const t = xs[0]
     if t != null { print(t[0][1]) } else { print("NUL") }
 
-* **Flat on**: all four constructs and both inputs.
-* **Varies on**: the rep, and the split is the *narrowing story*, not the message. In-place
-  element narrowing **works** for `new string` (8/8) and `new boolean` (8/8) — the reps whose
-  nullable is a NICHE — and fails for everything else: the four box newtypes report
-  ``[ERROR]: `as` supports numeric conversions only`` (the narrow did not happen, so the
-  `as` unwrap sees `NtI32?`), the nine nested arrays report `cannot index non-array …?`, and
-  maps, sets, `new { x: i32 }` and both flat records report
-  `member access '.length' on non-object …?`. **Three messages, one axis.** So this is not
-  "index place-narrowing is unimplemented" — it is implemented and reaches only the niche reps.
+**FALSE CLAIM — "it is implemented and reaches only the niche reps" is backwards.** The row
+grades `new string` and `new boolean` 8/8 and concludes that in-place element narrowing works
+for the reps whose nullable is a niche. Both halves of that are artefacts of the USE SITE, and
+one probe separates them. Take the `new string` cell and change ONE thing — replace
+`print(xs[0])` with a call `take(xs[0])` whose parameter is declared `NtStr`:
+
+    [ERROR]: argument 1: expected NtStr, got NtStr | null
+
+and delete the guard entirely — `print(xs[0])` with no `if` at all — and it still RUNS and
+prints `aa`. So the guard was never doing anything for those cells: `print` of a nullable
+string is simply allowed. **The narrowing does not happen for ANY rep.** D11 is one mechanism,
+flat across 23 of 23, and its denominator is **184 of 184** once the use site is one that
+actually consumes the narrowed type. The "three messages, one axis" reading is three
+use-site tolerances, not three narrowing stories.
+
+**THE MECHANISM.** An index place is not a keyable place. `placeKeyOf` has arms for Ident,
+Member and OptMember and returns `""` for an Index — its own header says so — so
+`pushNarrowFact` drops the fact and nothing downstream exists to consult.
+
+**A CANDIDATE WAS BUILT AND REFUSED.** Four checker rungs make `xs[0] != null` narrow `xs[0]`:
+`placeKeyOf` keys an integer-literal index; `placeCurTy` grows an Index arm (`placeElemTy`,
+the index twin of `placeFieldTy`); `checkIndexNode` consults the overlay the way
+`checkMemberNode` does; and `isPathKey` — which decides overlay-entry vs scope-shadow, and
+tested only for `.` — also accepts `[`. **The first three alone move NOTHING**: counters put
+the fact at `pk:ans xs[0]` and `pnf:ans xs[0]` and the read at `cix:reach xs[0] ov=-1`, because
+`applyNarrows` had classified `xs[0]` as a bare name and installed a scope SHADOW no reader
+asks for. That fourth rung is the whole difference between "no effect" and the numbers below.
+
+*It buys*: 72 of 184 cells `loud check reject` -> `runs`, and 40 more -> `loud emit reject`.
+
+*It costs*, and this is why it is refused:
+
+* **48 cells `loud check reject` -> `check-clean INVALID WASM`** (`type mismatch: expected
+  i32, found (ref $type)`) — the four scalar newtypes and the two three-deep arrays. The
+  EMITTER has no index-place narrowing channel at all: `memberPathKeyOf` is Member-shaped,
+  `memIsNarrowed` / `memNarrowVariantIndex` only ever look at a Member receiver, and the
+  narrowed READ arms live in `emitMem`.
+* **THREE check-clean programs that TRAP at run time** — the `program TRAP` column the census
+  records as ZERO across 250,238 cells. Each is a retirement rule the existing machinery says
+  it does not need *because* index places are unkeyable; `writeRetiresNarrowing`'s header
+  states the invariant the candidate breaks — *"An unkeyable target (`xs[i] = …`) names no
+  place and retires nothing — and no narrowing can key one either, so both sides stay
+  consistent."* The three ways it breaks: a VARIABLE-index write (`xs[i] = null`) keys `""`
+  and retires nothing; a ROOT rebind (`xs = [null]`) misses because the prefix leg matches
+  `tgtKey + "."` and never `tgtKey + "["`; an ALIASING CALL (`clr(xs)`, body `ys[0] = null`)
+  misses because `callInvalidatesReal` tests `key == ak` and `keyHasPrefix(key, ak + ".")`,
+  and the write-effect summaries record no index sub-path.
+
+**The price is a NAMED SET**, all 51 cells kept whole in `distilled/named/` with their
+coordinates in `scripts/silent-sweep/census/d341-index-place-price.json`. Validated by
+re-grading the corpus against the candidate: **51 of 51 move loud -> silent and the 1,477
+derived classes see 0 of it**, so no derived rule could have found them.
+
+**What closing it would take**: the four checker rungs, PLUS an emitter index-place channel
+(key, push, retire, and a narrowed index-read arm), PLUS the three retirement rungs and an
+index sub-path vocabulary for the write-effect summaries. A second landing the size of this
+whole PR, and one that trades a loud reject for a silent class if any part is missing.
+`tests/cases/soundness/index-place-is-not-narrowable-refusal-pin.vl` is the standing pin.
+
 * Inventory #1 measured `elem_place` at 150 loud check of 204 on scalar reps; this is the same
-  family on the gap reps, at 162 of 184.
+  family on the gap reps, and both counts are floors for the same reason — the use site, not
+  the narrowing, decides which cells look correct.
 
 ---
 
@@ -871,6 +986,49 @@ is the actionable part. **D3's fix did not settle it**: D3 now prints the right 
 still runs, so indexing is still admitted while `.length` is still refused. The inconsistency is
 exactly as wide as when it was filed — which is why this row stays open after its emit-reject
 half closed.
+
+---
+
+### D341 — an ALIASING CALL cannot retire an index-place narrowing, because there is no index sub-path to record
+**loud check reject · REFUTATION PIN for D11's refused candidate: this program must keep
+REJECTING, and flips to a check-clean runtime TRAP the day index places become keyable
+without the retirement half**
+
+    function src(): i32[] | null { return [1, 2] }
+    function clr(ys: (i32[] | null)[]) { ys[0] = null }
+    function body() {
+      const xs: (i32[] | null)[] = [src()]
+      if xs[0] != null {
+        clr(xs)
+        print(xs[0].length)
+      } else {
+        print(0)
+      }
+    }
+    body()
+    // [ERROR]: member access '.length' on non-object i32[] | null
+
+**Control** (the identical program with the aliasing call deleted — still a loud check reject
+today, because no index place narrows at all; it is the *reason* that differs, and D11 is the
+row for that):
+
+    if xs[0] != null { print(xs[0].length) } else { print(0) }
+
+* This is the sharpest third of the price D11's refused candidate measured, and the only third
+  with **no local spelling**: rules 1 and 2 (a variable-index write, a root rebind) are
+  visible inside the guarded block, while an aliasing call never mentions the write at all.
+  Under the candidate this program is **check-clean** and dies `wasm trap: null reference` —
+  the `program TRAP` column the census records as **zero** across 250,238 cells.
+* `callInvalidatesReal` tests `key == ak` and `keyHasPrefix(key, ak + ".")` against each
+  argument place, and `fnWriteEffects`' summaries are `,`-terminated FIELD sub-paths. An
+  index write records nothing in either, by design: `placeSubPath`'s header says *"an index
+  target keys nothing, and no narrowing key can name one either, so the two sides stay
+  consistent"*. Keying an index place is what breaks that consistency.
+* Filed as a row rather than only as a fixture because the fixture cannot carry the
+  denominator: all 51 priced cells are in `distilled/named/` and their coordinates in
+  `scripts/silent-sweep/census/d341-index-place-price.json`. Re-graded against the candidate,
+  **51 of 51 move loud -> silent while the 1,477 derived classes see 0 of it.**
+* Standing fixture: `tests/cases/soundness/index-place-is-not-narrowable-refusal-pin.vl`.
 
 ---
 

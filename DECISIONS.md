@@ -52,6 +52,46 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   loudness belongs to a spelling rather than to the class; the argument against, which wins, is
   this programme's own standing rule that loud → silent is a blocker in its own right. The 24
   coordinates are committed so the trade can be re-made in one command the day D361 closes.
+- **A narrowing's retirement is split by CAUSE, not by SPELLING — a direct write reads at the
+  declared type, an aliased write through a call still refuses** (2026-08-28,
+  silent-class-inventory-2 D8). A retired BARE-NAME narrowing has always left the name readable
+  at its declared type; the property-PATH spelling refused outright, and the reason on record
+  was "a path narrowing also dies to an ALIASED write through a call, which the emitter has no
+  relation to detect". That is a true statement about ONE of the two things `npInvBy` records.
+  A direct `w.f = e` is a statement the emit walk passes over exactly as it passes over
+  `f = e`, so the emit side can retire it and does; the call cause cannot be seen and keeps the
+  refusal. Splitting by cause rather than by spelling is what makes the two sides agree — and
+  the emitter's Member write-retirement arm is not optional: without it eight scalar-newtype
+  cells emit `bare null needs a struct-typed context`, because the checker widened the read
+  while the emit stack still held the narrowed rep. **A general rule this instance is worth
+  keeping for**: when a refusal is justified by what the emitter cannot see, check whether the
+  refusal is wider than the blindness. Here it was exactly twice as wide.
+
+- **What a place ACCEPTS is its storage type even after the narrowing has been retired, and
+  asking otherwise made a write-effect summary look like a rep axis** (2026-08-28,
+  silent-class-inventory-2 D8). `writeStorageTy` declined for a slot whose `npInvBy` was
+  already set. Inside one assignment statement that is an ordering bug: `lt` is read off the
+  target BEFORE the right-hand side is checked, so it is the narrowed type; the RHS is then
+  checked and an opaque callee retires the path; and the storage question, asked afterwards,
+  sees the retirement and declines — leaving the write checked against a type the storage never
+  had. The observable was `cannot assign {[string]: i32} | null to {[string]: i32}` when the
+  RHS callee's body used a METHOD call and clean when it used an index write, which inventory-2
+  filed as a property of the SET rep. Answering for a retired narrowing is also right on its
+  own terms: a retired narrowing means the place reads at its declared type from there on.
+
+- **An INDEX place is deliberately not narrowable, and the retirement machinery is written
+  against that** (2026-08-28, silent-class-inventory-2 D11/D341). Making `xs[0] != null` narrow
+  `xs[0]` takes four checker rungs and buys 72 of 184 cells. It is REFUSED because the rest of
+  the system states the invariant it breaks: `writeRetiresNarrowing`'s header reads "An
+  unkeyable target (`xs[i] = …`) names no place and retires nothing — and no narrowing can key
+  one either, so both sides stay consistent". Keying one breaks all three retirement paths — a
+  variable-index write keys `""`, a root rebind misses because the prefix leg matches
+  `tgtKey + "."` and never `tgtKey + "["`, and an aliasing call misses because the write-effect
+  summaries have no index sub-path vocabulary — and the emitter has no index-place narrowing
+  channel at all, so 48 loud rejects become check-clean invalid wasm. Measured price:
+  `scripts/silent-sweep/census/d341-index-place-price.json`. **Closing it is a whole landing of
+  its own, and a PARTIAL one is strictly worse than today**: every missing part converts a loud
+  reject into a silent class.
 
 - **A read that stops being a BOX must stop being one in every classifier that answers for it,
   and "how many consumers would have to learn it" is a count, not an argument** (2026-08-28,

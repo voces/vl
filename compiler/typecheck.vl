@@ -974,10 +974,16 @@ let tyStrAtoms = 1
 // lowered against the stale UNBOXED rep. The emitter retires the same write now
 // (`narrowRetired`, emit_state.vl), so the two agree and the read lowers.
 //
-// THE PROPERTY-PATH SPELLING STILL REFUSES (`pathInvalidatedErr`), and the asymmetry is the
-// difference in what the emitter can see: a bare-name write is a statement the emit walk
-// passes over, while a path narrowing also dies to an ALIASED write through a call, which
-// the emitter has no relation to detect.
+// THE PROPERTY-PATH SPELLING NOW MATCHES IT for the same CAUSE, and the split is by cause
+// rather than by spelling (`pathRetiredByAssign`). The asymmetry used to be total, and the
+// reason given for it covered only half the column: "a path narrowing also dies to an
+// ALIASED write through a call, which the emitter has no relation to detect". True of a
+// CALL; false of a direct `w.f = e`, which is a statement the emit walk passes over exactly
+// as it passes over `f = e`. So the direct write retires on both sides
+// (`emit_classify`'s write-retirement grew a Member arm) and the read below it asks the
+// storage; only the CALL cause still refuses (`pathInvalidatedErr`), which is where the
+// emitter really is blind. Inventory #2 D8's 46 cells, flat across 23 of 23 reps, were the
+// whole of that half.
 //
 // `narFnEpoch` counts FUNCTION BODIES CHECKED, and every narrowing — bank entry or path
 // overlay slot — records the count at install. A closure created inside a guarded region
@@ -4142,7 +4148,23 @@ function writeStorageTy(ix: i32) {
     const key = placeKeyOf(ix)
     if key == "" { return -1 }
     const slot = narrowedPathIx(key)
-    if slot < 0 || npInvBy[slot] >= 0 { return -1 }
+    if slot < 0 { return -1 }
+    // AN ALREADY-RETIRED NARROWING STILL ANSWERS, and the `npInvBy[slot] >= 0` bail that
+    // used to stand here was an ORDERING BUG inside a single statement. `lt` is read off
+    // the target BEFORE the right-hand side is checked, so it is the NARROWED type; the
+    // RHS is then checked and an opaque callee retires the path
+    // (`noteCallInvalidations`); and this question, asked afterwards, saw the retirement
+    // and declined — leaving `asgLt` at a narrowed type the storage never had.
+    // `if w.f != null { w.f = mk() }` was `cannot assign {[string]: i32} | null to
+    // {[string]: i32}` when `mk`'s body used a METHOD call and clean when it used an
+    // index write, which is the write-effect summary showing through as if it were a rep
+    // axis (inventory-2 D8 filed exactly that message and read it as flat across reps).
+    //
+    // Answering is also the RIGHT answer on its own terms: a retired narrowing means the
+    // place reads at its declared type, so the storage type is what the write is against
+    // either way. The two remaining guards stay — they bound the widening to narrowings
+    // this function body installed (`npEpochs`) and outside a re-execution barrier
+    // (`npInsideBarrier`), neither of which the retirement changes.
     if npEpochs[slot] != narFnEpoch { return -1 }
     if !npInsideBarrier(slot) { return -1 }
     const noNames: string[] = []
@@ -4197,10 +4219,17 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
   if tgtKey == "" { return 0 }
   let i = 0
   while i < npKeys.length {
-    if npInvBy[i] < 0 {
-      if writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i]) {
-        npInvBy[i] = atIx
-      }
+    // THE WRITE'S ATTRIBUTION WINS OVER A CALL'S, and the overwrite is what makes the
+    // read below legible. `w.f = mk()` is ONE statement whose right-hand side is checked
+    // first, so an opaque `mk` marks the path through `noteCallInvalidations` and the
+    // write that follows found the slot already taken — leaving the read after it
+    // reported as "the call to 'mk' … can write it" when the assignment on the same line
+    // is what actually replaced the field. The CAUSE is what `pathRetiredByAssign` reads
+    // to decide whether the emitter can see the retirement, and the emitter can see this
+    // one: it retires the same write. A call-only retirement keeps the call's node,
+    // because nothing overwrites it.
+    if writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i]) {
+      npInvBy[i] = atIx
     }
     i = i + 1
   }
@@ -4254,6 +4283,29 @@ function calleeNameOf(callIx: i32) {
     if cf is Member { return cf.memProp }
   }
   "?"
+}
+
+// DID AN ASSIGNMENT, RATHER THAN A CALL, RETIRE THIS NARROWING? Both causes write the
+// same `npInvBy` column and they need different answers, so the question has one home.
+//
+// A retired BARE-NAME narrowing leaves the name readable AT ITS DECLARED TYPE (see the
+// `narFnEpoch` note above); the property-path spelling of the identical program refused
+// outright. The asymmetry was real but its stated reason covers only half the column —
+// "a path narrowing also dies to an ALIASED write through a call, which the emitter has
+// no relation to detect". A DIRECT `w.f = e` is not that: it is a statement the emit walk
+// passes over exactly as it passes over `f = e`, and the emit half retires it now
+// (`emit_classify`'s write-retirement grew the Member arm alongside this). So the CALL
+// cause keeps the refusal — that is where the emitter really is blind — and the
+// ASSIGNMENT cause reads at the declared type like its bare-name twin.
+//
+// THE PREFIX LEG STAYS SAFE WITHOUT A SECOND TEST. `o = null` retires `o.v` through
+// `writeRetiresNarrowing`'s prefix leg, and falling through here re-checks the RECEIVER —
+// whose own narrowing the same write retired by exact match — so `o.v` is refused by the
+// ordinary nullable-receiver rule instead of by this one. The overlay used to answer
+// before the receiver was ever checked; that is what made the early return load-bearing.
+function pathRetiredByAssign(byIx: i32) {
+  if byIx < 0 { return false }
+  !(P.nodes[byIx] is Call)
 }
 
 // The diagnostic for reading a path whose narrowing a write retired. It names the
@@ -30573,7 +30625,9 @@ function checkMemberNode(n: Member, ix: i32) {
     const mOv = narrowedPathTy(mKey)
     if mOv >= 0 { return symMem(ix, mOv) }
     const mInv = narrowedPathInvBy(mKey)
-    if mInv >= 0 { return pathInvalidatedErr(mKey, mInv, ix) }
+    if mInv >= 0 && !pathRetiredByAssign(mInv) {
+      return pathInvalidatedErr(mKey, mInv, ix)
+    }
   }
   const objTy = checkNode(n.memObj)
   // A NEGATIVE receiver type is an unpinned inference hole (the `-1` element
@@ -30997,7 +31051,9 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
     const omOv = narrowedPathTy(omKey)
     if omOv >= 0 { return symMem(ix, omOv) }
     const omInv = narrowedPathInvBy(omKey)
-    if omInv >= 0 { return pathInvalidatedErr(omKey, omInv, ix) }
+    if omInv >= 0 && !pathRetiredByAssign(omInv) {
+      return pathInvalidatedErr(omKey, omInv, ix)
+    }
   }
   const recv = checkNode(n.omObj)
   // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).

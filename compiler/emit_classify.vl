@@ -12752,25 +12752,9 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   if s is BinExpr {
     if s.binOp == "=" {
       const tgt = P.nodes[s.binLeft]
+      const rhsNullable = writeRhsIsNullBearing(s.binRight, fnIx)
       if tgt is Ident {
-        // NULL-BEARING RIGHT-HAND SIDE, off the CHECKER's banked node type rather than the
-        // registered-union member scan: the scan resolves a value union's rendered name and
-        // answers "" for every NICHE rep (`string | null`, `boolean | null`, a nullable
-        // collection), whose guard narrowings need retiring just as much. A bare `null`
-        // literal is typed `null`, not `T?`, so it keeps its own leg.
-        const rhs = P.nodes[unwrapParen(s.binRight)]
-        let rhsNullable = nodeTyIsNullable(unwrapParen(s.binRight))
-        if rhs is NullLit { rhsNullable = true }
         const un = unionNameOfIdentSid(sidOfNode(s.binLeft), fnIx)
-        if !rhsNullable {
-          const rn = unionNameOfExpr(s.binRight, fnIx)
-          if rn != "" {
-            // NOT migrated: the RHS union name here is never a covered member SET
-            // on any measured surface (0 of 1,269 corpus files, 0 of 25,200 fuzz
-            // programs), so it keeps the member-name scan (method note 6).
-            if unionHasAtom(rn, "null") { rhsNullable = true }
-          }
-        }
         if rhsNullable {
           retireNarrowFor(tgt.identName)
         } else if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
@@ -12780,9 +12764,53 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
           }
         }
       }
+      // THE MEMBER TARGET, which this arm never had. `w.f = maybeNull()` retires the
+      // `w.f` PATH narrowing exactly as `x = maybeNull()` retires the bare name's — the
+      // key is the same path string `setNarrowFromCond` pushed for the guard's member
+      // channel, so one stack and one `retireNarrowFor` serve both spellings.
+      //
+      // It was INERT while the checker refused every read after such a write
+      // (`typecheck.pathInvalidatedErr`), so nothing downstream could observe the stale
+      // entry. The checker now reads those at the DECLARED type — the answer it has
+      // always given the bare-name spelling — and without this arm the emit stack would
+      // still claim the NARROWED rep for them, which is the boxed-read-as-unboxed shape
+      // the Ident arm's own header records. The two sides retire the same write or they
+      // disagree about the rep, and only one of those is a compiler.
+      //
+      // No complement PUSH on the non-null branch, unlike the Ident arm: a member path is
+      // not a `narrowBareIdentOnly` name and `pushNarrowRep` would decline it anyway
+      // inside the post-guard window, so a push here would be a rung with no reader.
+      if tgt is Member {
+        if rhsNullable {
+          const mtk = memberPathKeyOf(s.binLeft)
+          if mtk != "" { retireNarrowFor(mtk) }
+        }
+      }
     }
   }
   0
+}
+
+// IS THE VALUE WRITTEN BY `rhsIx` NULL-BEARING? Read off the CHECKER's banked node type
+// rather than the registered-union member scan: the scan resolves a value union's
+// rendered name and answers "" for every NICHE rep (`string | null`, `boolean | null`, a
+// nullable collection), whose guard narrowings need retiring just as much. A bare `null`
+// literal is typed `null`, not `T?`, so it keeps its own leg.
+//
+// The union-NAME leg is NOT migrated to the member-set machinery: the RHS union name is
+// never a covered member SET on any measured surface (0 of 1,269 corpus files, 0 of
+// 25,200 fuzz programs), so it keeps the member-name scan (method note 6).
+//
+// One home for the question because both assignment targets ask it — the bare name and
+// the member path — and a write that retires one spelling's narrowing must retire the
+// other's.
+function writeRhsIsNullBearing(rhsIx: i32, fnIx: i32) {
+  const rhs = P.nodes[unwrapParen(rhsIx)]
+  if rhs is NullLit { return true }
+  if nodeTyIsNullable(unwrapParen(rhsIx)) { return true }
+  const rn = unionNameOfExpr(rhsIx, fnIx)
+  if rn == "" { return false }
+  unionHasAtom(rn, "null")
 }
 
 export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
@@ -28204,6 +28232,7 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
   // list wrapper ref — so `.length` / indexing / assignment treat it as a ref list.
   if e is Member {
     if memFieldTypeCode(exprIx, fnIx) == 5 { return true }
+    if exprNullableRefArray(exprIx, fnIx) { return true }
   }
   // Indexing a NESTED ref array (`g[i]` where `g: S[][]`, kind-9 elements): each element IS the
   // inner ref list, so the index yields a ref array. Recurses — `g[i][j]` over `S[][][]` is a ref
@@ -30004,6 +30033,7 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   // map member/index ops on it route to the existing map lowering.
   if e is Member {
     if memFieldTypeCode(exprIx, fnIx) == 19 { return true }
+    if exprNullableMap(exprIx, fnIx) { return true }
   }
   // `outer[k] ?? d` over a NESTED map (value kind 6) yields the inner Map ref — so a
   // chained `(outer[k] ?? d)[j]` routes through the map lowering.
