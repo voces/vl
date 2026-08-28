@@ -29,6 +29,8 @@ import os
 import subprocess
 import sys
 
+from cellmap import dump_cells, load_cells
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 GRADER = os.path.join(ROOT, "scripts/silent-sweep/census/gradecensus.py")
@@ -36,6 +38,10 @@ CELLS = os.path.join(HERE, "cells")
 NAMED = os.path.join(HERE, "named")
 
 SILENT = ("runs but wrong value", "check-clean invalid wasm", "compiler trap", "trap_loads")
+
+# The five census blocks are the DERIVED half; every other block name is a curated named
+# set, and `named/sources.json` says which regression named it and what it cost.
+DERIVED_BLOCKS = frozenset("ABCDE")
 
 
 def arg(flag, default=None):
@@ -47,7 +53,7 @@ def main():
         print(__doc__.strip())
         return 2
     seed = sys.argv[1]
-    baseline = arg("--baseline", os.path.join(HERE, "baseline.json"))
+    baseline = arg("--baseline", os.path.join(HERE, "baseline.jsonl"))
     out = arg("--json", os.path.join(HERE, ".last.json"))
 
     env = dict(os.environ)
@@ -65,12 +71,12 @@ def main():
         now.update(json.load(open(tmp)))
     json.dump(now, open(out, "w"), indent=1, sort_keys=True)
     if "--write-baseline" in sys.argv:
-        json.dump(now, open(baseline, "w"), indent=1, sort_keys=True)
+        dump_cells(baseline, now)
         print(f"distilled: wrote baseline for {len(now)} cells from {seed}")
         return 0
 
-    before = json.load(open(baseline))
-    idx = json.load(open(os.path.join(HERE, "expected.json")))
+    before = load_cells(baseline)
+    idx = load_cells(os.path.join(HERE, "expected.jsonl"))
 
     lost, into_silent, other = [], [], []
     for c, v in sorted(now.items()):
@@ -95,8 +101,7 @@ def main():
         if len(rows) > 12:
             print(f"      … and {len(rows) - 12} more")
 
-    ncur = sum(1 for c in now if idx.get(c, {}).get("represents", 0) == 1
-               and "source" in idx.get(c, {}))
+    ncur = sum(1 for c in now if idx.get(c, {}).get("block", "A") not in DERIVED_BLOCKS)
     print(f"distilled corpus: {len(now) - ncur} representatives standing for {pop} census "
           f"cells, plus {ncur} curated cells from named regression sets")
     show("runs -> NOT-RUNS  (blocking)", lost)

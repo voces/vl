@@ -167,3 +167,25 @@ misses in 17 trials, which is strong evidence and not a proof — and D272 is th
 the risk was real, since the deciding axis was not in the population at all. Re-distilling
 after each full sweep, and adding every named backward set to `named/`, is what keeps that risk
 falling instead of growing.
+
+## File format — one line per cell, and why it is not a storage question
+
+`baseline.jsonl` and `expected.jsonl` are rewritten by nearly every defect PR, so their
+serialisation is a REVIEW and MERGE concern rather than a disk one. Pretty-printed JSON spent
+four lines on each cell: a 207-cell change arrived as an 860-line diff, and a rebase resolved
+cell boundaries wrongly **without saying so** — twice in one day, once silently corrupting the
+baseline. One JSON object per line, sorted by cell, makes a changed cell exactly one changed
+line and keeps a conflict inside the cell it belongs to. `cellmap.py` is the only reader and
+writer; use it rather than `json.load`.
+
+The same rule applies to a named set's coordinate JSON under `census/`: one line per cell.
+Those seven files were 9,147 lines for 572 cells and are now 615.
+
+Nothing reads a cell's `coords` from this directory. `redistil.py` sources coordinates from the
+census block manifests, and `gradecensus.py` reads only `manifest.json`'s `expect` map — so the
+copies that used to sit in `expected.json` and in both `manifest.json` files were written and
+never read back, three times over. They are gone; the census manifests remain the one source.
+
+Provenance for a curated set lives once in `named/sources.json`, keyed by set name, instead of
+being repeated verbatim on all 529 curated cells. A cell is curated exactly when its `block` is
+not one of the five census blocks `A`–`E`.
