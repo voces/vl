@@ -684,6 +684,7 @@ import {
   sigKeyPinPayload,
   sigParamCoerceKind,
   sigParamKindAt,
+  sigParamSlotAt,
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObj,
@@ -3375,7 +3376,10 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
     // Resolve the variant from the RECEIVER's own active narrowing (not a global slot) —
     // so two simultaneously-narrowed locals each downcast to THEIR variant.
     let recvVar = ""
-    const recvN = P.nodes[m.memObj]
+    // Unwrapped for D222, in lock-step with the two classifier twins `memIsNarrowed` /
+    // `memNarrowVariantIndex` — all three read the same receiver and all three missed a
+    // `Paren`.
+    const recvN = P.nodes[unwrapParen(m.memObj)]
     if recvN is Ident { recvVar = narrowVariantFor(recvN.identName) }
     // A nested union-FIELD receiver (`t.v.a`): resolve the variant from its path key.
     if recvN is Member {
@@ -13409,47 +13413,62 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
             )
           }
         }
-        // THE ARM-PARAMETER FLOOR, AND IT IS HERE BECAUSE OF WHAT D196 UNCOVERED. A
-        // `variant` parameter (`(Circle) => Circle`) demands ONE heap type — `uVarHeap[vi]`
-        // — and this ladder has no coercion into it: the arm above BOXES an un-boxed member
-        // for a `union` parameter, and nothing produces a bare arm for a `variant` one. So
-        // an argument that does not itself resolve to a variant (`exprVariantIndex` -1: an
-        // un-annotated `const c = { r: 7 }` in a union program reps as the BOX) is pushed
-        // raw into a `(ref $Circle)` slot.
+        // THE ARM-PARAMETER ARM, AND IT IS THE DIRECT TWIN'S TWO LINES (silent-class-inventory
+        // D269 — direction 2 of D200). A `variant` parameter (`(Circle) => Circle`) demands ONE
+        // heap type, `uVarHeap[vi]`, and this ladder had NO coercion into it: the arm above
+        // boxes an un-boxed member for a `union` parameter, and nothing produced a bare arm for
+        // a `variant` one, so the reject below was a FLOOR keeping a raw push out of a
+        // `(ref $Circle)` slot rather than a statement about the language.
         //
-        // IT IS A FLOOR RATHER THAN A FIX BECAUSE OF WHERE THE REJECT USED TO LIVE. Until
-        // D196 the `(Circle) => Circle` annotation keyed a struct row that does not exist,
-        // so `fbValtype`'s bounds guard rejected the program LOUDLY one stage earlier and
-        // this call site was never built at all. Repairing the key moves the disagreement
-        // from the type section to the argument — the D52 half-fix shape — and without a
-        // floor ONE census cell of 250,238 (`cellsB/b000061.vl`) moves `loud emit reject` →
-        // `check-clean invalid wasm`. A cell moving INTO silence is a blocker whatever its
-        // count, so the reject stays loud and **zero cells move into silence**; no `runs`
-        // cell is lost, because every program this can fire on was already a reject.
+        // WHAT THE FLOOR WAS STANDING IN FOR IS ALREADY WRITTEN, SIX THOUSAND LINES DOWN, IN
+        // `emitCall`. The direct call handles the whole shape with exactly two seeds, which is
+        // why `function idc(x: Circle): Circle` + `idc(s)` runs today and the lambda spelling of
+        // the same five lines did not:
+        //   * `argCtx.variantIdx = cVi` — an object LITERAL argument builds the bare variant
+        //     struct (kind 8) instead of guessing a struct row (`emitObj` consumes the seed);
+        //   * `if exprUnion(arg) { struct.get $uBox 1 ; ref.cast $uVarHeap[cVi] }` — a value
+        //     that IS the box is unboxed against the declared arm. A NARROW DOES NOT RE-REP A
+        //     BINDING: `s` is still `{tag, value}` at the call site, the `is` proves which arm
+        //     rides the payload, and these are the same two instructions `emitNarrowedMem` uses
+        //     to reach that payload for a READ.
+        // Ported here rather than re-derived: the SLOT comes off the resolved `$fnsig` KEY
+        // (`sigParamSlotAt`), which is the row the `call_ref`'s cast functype actually declares
+        // for this position, so the cast target cannot disagree with the bytes — the same
+        // discipline the union-box arm above states for its kind.
         //
-        // AN `ObjLit` EXEMPTION WAS BUILT HERE AND THE WITNESS REFUTED IT — recorded because
-        // the refutation is the method, not the footnote. The reasoning was "`exprVariantIndex`
-        // has no object-literal arm by design, so a bare `f({r: 7})` would be rejected
-        // needlessly", and the evidence offered was "the corpus is byte-identical with the
-        // exemption in place". THAT EVIDENCE PROVED NOTHING: the corpus contains no program in
-        // this family at all (D201), so it could not have contained the disagreement. Built as
-        // a program instead, `f({ r: 7 })` with an arm-typed closure parameter and NO layout
-        // twin went `loud emit reject` -> `check-clean invalid wasm` under the exemption —
-        // a cell falling INTO silence, which is the exact failure this floor exists to
-        // prevent. There is no exemption: an argument that cannot be named as the arm is
-        // rejected, literal or not.
-        //
-        // The DIRECT-call twin already handles the whole shape, which is why `function
-        // idc(x: Circle): Circle` + `const c = { r: 7 }` + `idc(c)` runs today and the
-        // lambda spelling of the same three lines does not — D203 is the row for that.
+        // THE FLOOR STAYS FOR EVERYTHING ELSE, and the reason is a witness, not caution. An
+        // `ObjLit` EXEMPTION — decline the reject for a literal and let it fall through to the
+        // RAW `emitExpr` — was built here once and refuted: `f({ r: 7 })` with an arm-typed
+        // closure parameter and no layout twin went `loud emit reject` -> `check-clean invalid
+        // wasm`, a cell falling INTO silence. The evidence offered for it ("the corpus is
+        // byte-identical") proved nothing, because the corpus contains no program in this
+        // family at all (D201). The difference now is that the literal is BUILT as the arm
+        // instead of exempted from the check; an argument that is neither the arm, nor a box
+        // holding it, nor a literal that can be built as it is still rejected.
+        let cvSlot = -1
         if sigParamKindAt(ckey, i) == "variant" {
-          if exprVariantIndex(args[i], fnIx) < 0 {
+          cvSlot = sigParamSlotAt(ckey, i)
+          const cvArg = P.nodes[unwrapParen(args[i])]
+          const cvBuildable = cvSlot >= 0 &&
+            (exprUnion(args[i], fnIx) || cvArg is ObjLit)
+          if exprVariantIndex(args[i], fnIx) < 0 && !cvBuildable {
             return emitFail(
               "emitProgram: value-call union-ARM parameter given a value that is not that arm — a value call does not yet build one (annotate the binding as the arm, or call it as a named function)",
             )
           }
         }
-        if cuNm != "" {
+        if cvSlot >= 0 && exprVariantIndex(args[i], fnIx) < 0 {
+          // The two ported seeds. `exprVariantIndex >= 0` means the argument already IS the
+          // arm — the historical path, byte-identical — so neither fires on it.
+          const cvCtx = expCtxHere()
+          cvCtx.variantIdx = cvSlot
+          if emitExprExpect(body, args[i], fnIx, cvCtx) < 0 { return -1 }
+          pendingVariantIdx = -1
+          if exprUnion(args[i], fnIx) {
+            fbStructGet(uBoxIdx, 1)     // 0xfb 0x02 <box ht> field 1: value (anyref)
+            fbRefCast(uVarHeap[cvSlot]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+          }
+        } else if cuNm != "" {
           if emitUnionBoxArg(body, cuNm, args[i], fnIx) < 0 { return -1 }
         } else if (
           sigParamKindAt(ckey, i) == "str" &&

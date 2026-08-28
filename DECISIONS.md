@@ -716,6 +716,56 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   them reaches `fbValtype`'s out-of-bounds guard and a loud reject. (#1938, D27 /
   D28 / D29; `docs/internals/silent-class-inventory.md`)
 
+## A `$fnsig` KEY must render the row whose HEAP TYPE the functype carries — and the token CHAR is a second contract
+
+`$fnsig` interning gives two closures one functype exactly when their keys match. The keys
+are minted by five producers (`cloParamTok`, `cloRetKeySuffix`, `annParamKind`,
+`paramTokOfTy`, `retTokOfTy`) and the BYTES are streamed from the key's representative
+through `fbValtype`, which reads `sHeapIdx[slot]` / `uVarHeap[slot]`. So the KEY and the
+BYTES are two functions of the same slot, and the ruling is: **the key renders the row the
+byte writer will land on, never the row the resolver happened to name.**
+
+`repSigSlotTokOfKind` has always done this for a STRUCT slot (`repStructSlotRep`, the
+`sTwin`-canonical representative, computed timing-independently so the intern-time and
+emit-time renders agree). It did NOT for a VARIANT slot, and that asymmetry is
+silent-class-inventory **D199**: two layout-twin arms share one `uVarHeap` heap type and
+keyed `V0;>V0;` and `V1;>V1;`. Two structurally identical functypes at two indices of one rec
+group are DISTINCT types in WasmGC, so a closure value crossing between them validates and
+traps at run time — `indirect call type mismatch`, after the program has already printed.
+`repVariantSlotRep` closes it, and `repSigVariantTok` is the one place the digit is minted so
+the five producers cannot drift apart again.
+
+### The token CHAR is NOT free to change, and that is why D351 stays open
+
+The obvious next step is to fold across the two tables: a union arm whose layout a DECLARED
+struct also claims already shares that struct's heap type (D280), so rendering the arm's slot
+as `s<row>;` would make the two sides key one functype and close 12 live `trap_loads` cells.
+
+**It was built and refused, on a measurement.** `sigParamKindAt` reports the token CHARACTER,
+and `emitCallRef` reads that character to decide how to coerce an argument: `"variant"`
+selects the arm coercion (unbox the box, build the literal as the arm), `"struct"` selects
+none. An arm parameter spelled `s…;` therefore stops being an arm parameter at the coercion
+ladder, and six programs that this landing makes RUN go check-clean invalid wasm. Buying 12
+silent cells with 6 new ones is not a trade this family takes.
+
+The rule the refusal establishes: **a slot token's CHARACTER is a coercion contract, not
+merely a namespace tag.** Two kinds may share a heap type and still need distinct tokens,
+because a consumer reads the token to decide what to do with the VALUE, not only where the
+type lives. Sharing a functype between two kinds is therefore a job for the `$fnsig` POOL —
+dedup at intern time on the rendered bytes — and not for the key producers. Both halves of
+the trade are kept as a named set (`scripts/silent-sweep/census/d351-crossfold-price.json`)
+so the next candidate re-grades them instead of re-discovering them.
+
+### The corresponding rule on the read side: unwrap the node, not only its receiver
+
+`memberPathKeyOf` is the narrowing stack's member-path KEY, and three emitter readers ask it
+about a receiver. It peeled a `Paren` off its receiver and not off its own node, so
+`(t.v).r` keyed `""` while `(t).v` keyed `t.v` — the same function, two behaviours, one
+paren apart. **D222** is that, plus the three readers' own raw `is Ident` tests. The rule is
+the one the rest of the emitter already follows and this key did not: **a syntactic
+classifier peels parens at its ENTRY, so no caller has to remember to.** Fixing it at the
+three callers instead would have been three more places to forget.
+
 ## Parser, distribution & bootstrapping
 
 - **Hand-written parser over a generator.** Dropped antlr4 (Java/Gradle build
