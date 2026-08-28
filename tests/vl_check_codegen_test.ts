@@ -778,16 +778,46 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // `tests/cases/soundness/xfail-miscompile-read-default-annotation-through-unannotated-param.vl`
 // per the REFILLS procedure above, and filed as silent-class-inventory D282, in the same
 // commit that swapped this constant.
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
-  `type Sq = { s: i32 }\n` +
-  `type Shape = Circle | Sq\n` +
-  `function fill(c, n: i32) {\n` +
-  `  c["k1"] = { r: n }\n` +
-  `}\n` +
-  `const c = Map()\n` +
-  `fill(c, 7)\n` +
-  `const dleaf: Circle = { r: 0 }\n` +
-  `print((((c)["k1"] ?? dleaf)).r)\n`;
+//
+// SWAPPED AGAIN 2026-08-28 (silent-class-inventory D282). The un-annotated-parameter
+// specimen this constant carried is CLOSED and graduated to
+// `tests/cases/soundness/arm-and-an-anon-row-of-its-layout-share-one-heap.vl`, `@run` +
+// four `@log 7`. It went the way D280 went, one position out: the arm's layout claimant
+// was an interned `#anonN` row rather than a declared struct, and `variantStructHeapTwinAt`
+// keys on `repSlotOfTy`, whose bridge scans DECLARED rows only. `repRowOfTyStruct` is the
+// same double gate keyed on an arena type instead of a second slot, it already covers the
+// `#anon` rows through `slotCanonId`'s arena rung, and it was simply not asked.
+//
+// AND THE PREDECESSOR'S OWN SELECTION RULE IS WHAT FAILED, WHICH IS THE LESSON THIS ENTRY
+// ADDS. That one was chosen against BOTH mechanisms of the variant⇄struct family —
+// `armLayoutContested` false, `variantStructHeapTwinAt` -1, `uVarTwin` with no second arm
+// to collapse — and every one of those three facts stayed true; the merge that closed it
+// made `variantStructHeapTwinAt` answer where it had answered -1. Choosing against the
+// mechanisms a family HAS is choosing against the candidates again, one abstraction up.
+//
+// SO THE SUCCESSOR LEAVES THE FAMILY, and this time that is checkable rather than argued:
+// it DECLARES NO UNION. `uVariants` is empty, `variantStructHeapTwinAt` and `uVarSTwin` are
+// never called (counted at the site: `entries=0`), `emitUnionCoerce` is unreachable, and
+// `armLayoutContested` is false for want of an arm. Every mechanism that has closed a
+// specimen in this genealogy since D33 is structurally inapplicable rather than untried.
+// It is `silent-class-inventory.md` D209 — the most-attacked open row in that document,
+// with TWO candidate fixes BUILT, MEASURED and REFUSED (the resolver side and the read
+// side), each refuted by a program it reddens and each pinned as its own refutation row
+// (D271, D272). Two candidates that were built, priced and declined is evidence about the
+// SPECIMEN; "stable so far" is only ever evidence about the candidates.
+//
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
+// diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected
+// i32, found (ref $type)`, `--codegen --no-validate` rc 0, `vl build` writes the `.wasm`
+// and exits 1, and NO `emit error` marker. Pre-existing on this change's merge base
+// (1,463,065), and its module is BYTE-IDENTICAL across the change. Pinned as
+// `tests/cases/soundness/xfail-miscompile-declared-struct-captures-anon-list-element.vl`
+// per the REFILLS procedure above, in the same commit that swapped this constant. Its own
+// NAMED successor, so the next swap is a two-line edit: `silent-class-inventory.md` D224,
+// whose fix is likewise built and refused at a measured 207 census cells.
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 | null }\n` +
+  `const lv1 = [{ r: 7 }]\n` +
+  `print((lv1[0]).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
