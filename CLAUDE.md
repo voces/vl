@@ -43,11 +43,12 @@ The parts, and what each is for:
 4. `scripts/rep-fuzz-check.sh` — **mandatory** for anything touching the rep layer or the
    interner; the corpus, the suites and the fixpoint are all blind to REJECT→MISMATCH
 5. `scripts/mono-tyaram-grid.sh` for monomorphizer changes
-6. **`scripts/silent-sweep/distilled/regress.py` — the census's content, in ~8 seconds.**
-   1,477 programs, one per behavioural equivalence class of the 250,238-cell census. It exits
-   non-zero **only** on `runs → not-runs`; `→ silent` and every other movement is printed and
-   read, not blocked on. A program that did not work before and does not work now has not
-   regressed in the sense a gate should stop the world for.
+6. **`scripts/silent-sweep/distilled/regress.py` — the census's content, in ~7 seconds.**
+   Two halves. `cells/` is DERIVED: 1,477 programs, one per behavioural equivalence class of
+   the 250,238-cell census. `named/` is CURATED: the exact cells some real regression NAMED,
+   kept whole. It exits non-zero **only** on `runs → not-runs`; `→ silent` and every other
+   movement is printed and read, not blocked on. A program that did not work before and does
+   not work now has not regressed in the sense a gate should stop the world for.
 
    **Why a subset is sound here when the census README says it isn't.** That README proves a
    *random sample* cannot see a 12-cell family — catching D211 at 95% needs 22% of block A —
@@ -76,11 +77,23 @@ The corpus is only as good as the history it was collapsed from; re-distilling i
 the one real risk (a compiler that splits a class no earlier compiler split) falling rather
 than growing.
 
+**WHEN A GRID OR A REFUSED CANDIDATE NAMES A SET, THE SET GOES IN `named/`** — not a collapse
+of it, and not the whole grid. A derived rule provably cannot find these, and there are two
+worked instances from a single day: D272's 72 `runs`-lost cells and D224's 207-cell price were
+each covered **0 times** by every derived rule tried (behavioural collapse of their own grid, an
+axis floor over its axes, an axis floor over the census's twelve). The reason is the same both
+times — on today's compiler those cells behave exactly like their class-mates, and what makes
+them worth keeping is what a *candidate* did to them, which nothing reading current behaviour
+can see. **Every refused candidate that named its price is a named set**, and the price is the
+thing worth keeping: it stops the next person paying it again without noticing. Commit the
+coordinate JSON under `scripts/silent-sweep/census/`, materialise with `d243/mkset.py`, and add
+the cells to `distilled/named/` so the standing gate carries them.
+
 Two habits the full runs earned, still worth keeping: report `runs → not-runs` and `→ silent`
 explicitly rather than histogram deltas — block A once lost 0 `runs` and still moved 12 cells
 loud→silent while its loud-emit column moved −126, so the regression was arithmetically
-invisible. And once a run has NAMED a backward set, keep it under
-`scripts/silent-sweep/census/` — it re-grades against any new seed in ~10 invocations.
+invisible. And a named set re-grades against any new seed in ~10 invocations, so use one rather
+than rebuilding its grid.
 
 **Read a gate by its exit code or its summary line, never by `tail -1`.** `lint-self.sh`
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a
