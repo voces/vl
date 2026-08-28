@@ -52,6 +52,32 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   loudness belongs to a spelling rather than to the class; the argument against, which wins, is
   this programme's own standing rule that loud → silent is a blocker in its own right. The 24
   coordinates are committed so the trade can be re-made in one command the day D361 closes.
+  **D361 is now closed, and the re-grade says the trade is free**: the BARE lift still costs
+  exactly those 24 (re-measured on `1e598e2b`, set-identical to the committed coordinates),
+  and on top of D361's landing the same lift moves 852 block-E cells, all 852 loud → `runs`,
+  0 → silent, with all 24 among them. The 24 were D361's silence, not the lift's price.
+
+- **The recorded UNION of a list literal's elements is a JOIN of their SHAPES; the box
+  decision is about their ROWS, and the two are not the same question** (2026-08-28,
+  silent-class-inventory D361). `arrLitObjElemBoxVariant` — the one home of the
+  object-literal widening rule, asked by all three element classifiers — fired whenever the
+  arena said the array's element was a non-literal union of two or more members, and then
+  widened element 0's variant to that variant's union. Its own header already argued the
+  narrower version of this point (a structural field-name scan must not answer a question
+  the checker answered) and stopped one step short. `[{ r: {c2:1} }, { r: {s2:1} }]` over
+  `type Circle = { r: Shape2 }` joins to `{r:Cir2}|{r:Sq2}` because the two `r` VALUES have
+  different shapes, while both literals are the one arm `Circle` by field-name set — so the
+  literal minted a box list, a declared `Circle[]` destination wanted the arm's struct, and
+  the module was `vl check` rc 0 and refused by the engine. The rung asks the arm's own
+  predicate of EVERY element instead of element 0, and declines the widening when they all
+  answer one name. It never looks at the destination: **the literal was wrong standing
+  alone**, which is what the row's own filed diagnosis ("the fix has to reach the
+  destination") had backwards. Its bounds are two or more elements, all object literals, all
+  naming the same row — and the last two are load-bearing, measured: dropping "all object
+  literals" takes `[{ r: 7 }, c]` from `runs` to a loud emit reject, dropping "the same row"
+  stops a corpus fixture compiling at all. **The grid the landing was priced on separates
+  none of the three**; only the corpus and two hand-built witnesses do.
+
 - **A narrowing's retirement is split by CAUSE, not by SPELLING — a direct write reads at the
   declared type, an aliased write through a call still refuses** (2026-08-28,
   silent-class-inventory-2 D8). A retired BARE-NAME narrowing has always left the name readable
@@ -165,7 +191,6 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   `{v: i32}` on demand — rather than the compiler choosing one level for them. *(The
   local-spelling renderer and the depth affordance are both unbuilt; the merge itself is
   live.)*
-
 
 - **Fully typed, no `dynamic`.** Types are hidden by aggressive inference, but
   `Unknown`/`Infer` are inference _holes that resolve_ to concrete types — there
@@ -300,7 +325,6 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   with `expected () => void, got () => i32` — without disturbing the
   assignment-is-an-expression rule below, which is what produces the `i32`.
   (#1435, ROADMAP `:746`)
-
 
 - **Variance and exactness: inferred, with no annotation surface in v1.**
   Parameters are Inexact by default and values Exact (A8); `Readable`/
@@ -1477,4 +1501,3 @@ Nothing in the tree declares a `==` or `!=` operator function, so the reject cos
 capability. The 12 grid cells it moves `runs → loud check` are an `i32` comparison beside an
 inert declaration: the answer was right, and it was right only because the declaration did
 nothing.
-

@@ -8494,7 +8494,7 @@ load-bearing):
   interns the nested shape". Add a NON-VARIANT twin of the arm's layout and the whole
   program runs on master, unchanged otherwise:
 
-  | change to the repro | on master (`7ff0f5a8`) |
+  | change to the repro | on master (`1e598e2b`) |
   |---|---|
   | (none) | loud emit reject |
   | `+ type Cir2b = { c2: i32 }`, declared and USED | **RUNS** |
@@ -8637,7 +8637,7 @@ load-bearing):
   its own corpus `cmp` caught a `runs` → loud regression (`[c, d]` over two arms of one union)
   that **none of its grids moved a single cell on**.
 
-* **THE 2026-08-28 CLOSE, MEASURED ON FIVE INSTRUMENTS** (base `7ff0f5a8` (#1994), seed
+* **THE 2026-08-28 CLOSE, MEASURED ON FIVE INSTRUMENTS** (base `1e598e2b` (#1994), seed
   1,467,280 → this landing, seed 1,468,887; re-taken in full after the rebase, which is the
   one thing a rebase always invalidates):
 
@@ -8670,9 +8670,9 @@ load-bearing):
   `tests/cases/unions/anon-nested-arm-layout-polymorphic.vl`.
 
 * **ABLATION.** Stripping both rungs reproduces master **byte-for-byte** —
-  `md5 b170eec7bce19ee05e69fee46bdb71af`, 1,467,280 bytes — built FROM THE CANDIDATE'S OWN
+  `md5 e5a5ab490dbaff4cab97803a7abe79d7`, 1,468,887 bytes — built FROM THE CANDIDATE'S OWN
   SEED, so it is a source-identity check and not a rebuild of the same input, and the same
-  seed `refresh-compiler.sh` builds from `7ff0f5a8`. The two rungs are not independent:
+  seed `refresh-compiler.sh` builds from `1e598e2b`. The two rungs are not independent:
   `anonNestFieldMono` is a CONDITION inside `anonNestNeedsRow`, so the ladder is
   {none, R1, R1+R2} and R1 alone is the refused candidate above.
 
@@ -11677,11 +11677,11 @@ Repro:
   and is why it is a third row rather than a bullet under either.
 
 * **CORRECTION 1, 2026-08-28 — G6's FUNCTION MOVED, AND IT NOW HAS TWO CALLERS.** The table
-  above names `emitUnionFieldNarrowUnbox` at G6. On `7ff0f5a8` the guard is in
+  above names `emitUnionFieldNarrowUnbox` at G6. On `1e598e2b` the guard is in
   `emitUnboxToAtomKind` (`wasmEmit.vl:5289`), the shared unbox SEQUENCE that
   `emitUnionFieldNarrowUnbox` and D209's un-narrowed read both call — so "which of the two
   same-message sites" is no longer the same question the row settled with a throwaway probe
-  compiler. Re-counted mechanically on `7ff0f5a8`: **still exactly ten call sites, all in
+  compiler. Re-counted mechanically on `1e598e2b`: **still exactly ten call sites, all in
   `wasmEmit.vl`, every one testing `< 0`**, at lines 3429 / 3603 / 3811 / 4467 / 4751 / 5289
   / 6938 / 7172 / 20987 / 21124, and G2's argument is still the literal `0`.
 
@@ -11689,13 +11689,13 @@ Repro:
   `2 OF 10`.** The row's two witnessed guards were G6 (this row's own filed program) and G3
   (`const g: f64 | null = 5.0` / `if g is i32 { … }`, filed as D228). #1992's
   `isWidenNotVariant` closes the implicit-widening `is` edge at the CHECKER, and that edge
-  was the only channel either witness used: run verbatim on `7ff0f5a8`, **both are now loud
+  was the only channel either witness used: run verbatim on `1e598e2b`, **both are now loud
   check rejects and neither reaches emit**. So every one of the ten guards is unwitnessed
   today. Re-measured rather than inherited:
 
   | population | programs | cells reaching ANY of the ten guards |
   |---|---|---|
-  | census block D, graded in full on `7ff0f5a8` and on the #1996 seed | 9,000 ×2 | **0** |
+  | census block D, graded in full on `1e598e2b` and on the #1996 seed | 9,000 ×2 | **0** |
   | the distilled corpus (1,477 derived + 753 curated) | 2,230 | **0** |
   | thirteen hand-built programs, one per guard construct | 13 | **0** |
 
@@ -11711,7 +11711,7 @@ Repro:
 * **CORRECTION 3, MINOR.** "all five print `5`" is wrong for one of the five: the
   `boolean | null` twin prints `true`. The claim it is making — that every spelling whose
   check type really IS a variant of the field's union still lowers and runs — holds on all
-  five, re-run verbatim on `7ff0f5a8`.
+  five, re-run verbatim on `1e598e2b`.
 
 * **AND D221 IS NOT PART OF THE D179/D227 FAMILY**, which #1996 grouped it with and then
   measured apart. Different layer (the checker, not `collectAnonShapes`), different
@@ -12538,15 +12538,42 @@ Repro (census block E cell `e002074`, verbatim):
   KIND the literal minted (union box, 2) rather than in which slot names it. That is D361's
   landing, not a gate here.
 
-* Filed rather than fixed: closing **D361** is what lets `armRecvHoldsBareArm`'s decline come
-  off, and the 828 cells are what it is worth.
+* **THE PRICE IS NOW ZERO — D361 CLOSED, AND BOTH LEGS RE-MEASURED ON `1e598e2b`
+  (2026-08-28).** The 24 were the only thing standing in the way, and they are gone: their
+  silence was D361's, not the lift's. THREE compilers built from `1e598e2b`'s own source and
+  graded cell-matched over the whole of census block E (19,224 cells) — the base, the BARE
+  lift, and the lift on top of D361's landing:
+
+  | | the bare lift | the lift with D361 landed |
+  |---|---|---|
+  | cells the lift moves | 852 | **852** |
+  | loud emit reject → runs | 828 | **852** |
+  | loud emit reject → **check-clean invalid wasm** | **24** | **0** |
+  | `runs` LOST | 0 | **0** |
+  | block E's silent total, base 96 → | **120** | **0** |
+
+  The bare-lift column reproduces this row's filed numbers exactly, and **the 24 cells it
+  silences are set-identical to the committed `d223-lift-price` coordinates** — so the
+  refusal was priced on the right cells. Under D361 + the lift all 24 of them `run`. Note the
+  silent totals: the lift ALONE takes block E from 96 silent cells to 120; D361 first takes
+  it to 0 and the lift keeps it there.
+
+  The 24 named cells still grade `loud emit reject` on the landed compiler (the decline is
+  still there), so `d361-landed` and `d223-lift-price` are both live and they now say
+  opposite things: the first must RUN, the second is the tripwire that flips to `runs` the
+  day the lift lands.
+
+* Filed rather than fixed **only because the lift's remaining exposure is unmeasured outside
+  block E**: D219 priced it on blocks B and E, and only E has been re-graded since. The
+  decision this row refused is now a measurement away — regrade blocks B and C against the
+  lifted compiler and, if they hold, take the decline off and 852 cells forward with it.
 
 ---
 
-### D361 — an un-annotated list literal of DISAGREEING anonymous shapes STORED INTO A DECLARED MAP VALUE is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-28 while refuting D223, which had this mechanism in its title and a different program under it · SILENT ON MASTER with no compiler change at all**
+### D361 — [CLOSED 2026-08-28] an un-annotated list literal of DISAGREEING anonymous shapes STORED INTO A DECLARED MAP VALUE is check-clean invalid wasm
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` on `1e598e2b` with no compiler change at all · **the row's own diagnosis named the wrong layer**: the destination was never needed — the literal was already wrong on its own terms, because the checker's recorded union is a JOIN of the element SHAPES and the box decision is about their ROWS · it is the WHOLE of census block E's silent column, 96 cells, and the distilled corpus sees none of them**
 
-Repro:
+Repro (now `runs`):
 
     type Cir2 = { c2: i32 }
     type Sq2 = { s2: i32 }
@@ -12566,35 +12593,148 @@ Repro:
       } else { print(0) }
     }
     rd()
-    // vl check rc 0 with NO diagnostics; vl run:
+    // was: vl check rc 0 with NO diagnostics; vl run:
     //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
 
-* **THIS IS D223's TITLE ATTACHED TO THE PROGRAM IT IS ACTUALLY TRUE OF.** `{ r: {c2: 1} }`
-  and `{ r: {s2: 1} }` are different anonymous shapes, so the un-annotated `lv1` is minted
-  over the union BOX element kind; the `{[string]: Circle[]}` destination wants a list of
-  `Circle`s, and the two meet at the store. D223's own witness has no map in it and none of
-  this applies to it — see that row for the nine controls that separate them.
+* **THE ROW SAID THE FIX HAD TO REACH THE DESTINATION. IT DID NOT.** The filed reading —
+  "`letRefListDestSlot` … the fix has to reach `letAnnRefListKind` / the literal's own
+  construction" — is half right and the half it gets wrong is the half that matters. No rung
+  of the landing looks at the map, the annotation or any destination: **the literal is
+  already wrong standing alone**, and the destination is only what makes the wrongness
+  observable. The three filed ingredients all reproduce (annotate the inner list → runs;
+  make the two elements agree → runs; delete the map layer → runs) and all three are
+  properties of THIS program, not of the class: 12 of the 96 census cells the landing moves
+  have **no map in them at all** (`cont=listlist`).
 
-* **THREE INGREDIENTS, EACH ONE WORD.** Measured on `4a6c1e52`:
-  annotate the inner list (`const lv1: Circle[] = …`) → **runs**; make the two elements
-  agree → **runs**; delete the map layer (bind `lv1` straight to a `Circle[]`) → **runs**.
-  The `?? []` default is NOT an ingredient — a bound empty default and a non-empty default
-  both reproduce it.
+* **THE MECHANISM: THE CHECKER'S UNION IS A JOIN OF SHAPES, THE BOX DECISION IS ABOUT ROWS.**
+  `arrLitObjElemBoxVariant` is the one home of the object-literal widening rule (all three
+  element classifiers ask it). It fires when the ARENA says the array's element is a
+  non-literal `TyUnion` of two or more members, and then widens element 0's variant to that
+  variant's union. Both halves of its gate hold here and the conclusion is still wrong:
+  `{ r: {c2:1} }` and `{ r: {s2:1} }` join to `{r:Cir2}|{r:Sq2}` because the two `r` VALUES
+  have different shapes, while **both literals are the one arm `Circle` by field-name set**.
+  `arrLitObjElemsOneVariant` asks the arm's own predicate (`objVariantName`, the same one) of
+  EVERY element; when they all answer one name the widening declines, and the three
+  classifiers land on kind 1 under that arm's own name — the slot the annotated `Circle[]`
+  spelling already interns, so the two spellings stay one row.
 
-* **IT IS THE 24-CELL RESIDUE OF D223's REFUSED LIFT, AND IT IS ALREADY SILENT WITHOUT IT.**
-  The witness above uses `const e0 = g1[0]`; a binding is not an element read, so
-  `armRecvHoldsBareArm`'s decline never fires and the module is written on master as it
-  stands. Spell the same read as `(g1[0]).r` and the decline makes it a loud emit reject —
-  which is the only thing lifting that decline would take away. Census block E holds **24**
-  such cells, all `cont=map_of_list × pval=mixed × claim=0`
-  (`scripts/silent-sweep/census/d223-lift-price.json`).
+* **READ OFF THE DISASSEMBLY, not inferred.** On `1e598e2b` the witness's module carries TWO
+  list types: `$9 = (array (mut (ref null $4)))` over the union box `$4 = (struct (field i32)
+  (field anyref))` for `lv1`, and `$11 = (array (mut (ref null $2)))` over `Circle` for the
+  map's value. `(local $0 (ref $10))` is the box list, `(local $22 (ref null $12))` the
+  Circle list, and the store is `(local.set $22 (local.get $0))` — the engine's `expected
+  (ref null $type), found (ref $type)`, two different indices behind one placeholder name.
+  After the landing the box array and its wrapper are **gone from the module**, the elements
+  are built `struct.new $2` with `r` boxed as a `Shape2`, and `$0` and `$22` are one type.
 
-* **THE OBVIOUS LANDING WAS BUILT AND DOES NOT CLOSE IT.** `letRefListDestSlot` — an
-  un-annotated list-literal binding taking the ref-list slot of the declared map value it is
-  stored into, the exact shape of `letMapDestShape` (D203) one container over — leaves all
-  eight controls unchanged. The slot the read resolves is already the annotation's; what
-  disagrees is the element KIND the literal minted. The fix has to reach
-  `letAnnRefListKind` / the literal's own construction, and it wants its own grid.
+* **CELL-MATCHED, CENSUS BLOCK E, all 19,224 cells, generated once and graded on both
+  compilers.** `1e598e2b` → the landing:
+
+  | | |
+  |---|---|
+  | cells moved | **96** |
+  | **check-clean invalid wasm → runs** | **96** |
+  | `runs` LOST | **0** |
+  | → silent | **0** |
+  | block E's silent total, before → after | **96 → 0** |
+
+  The 96 are `pval=mixed × rep ∈ {arm (36), nul (60)} × cont ∈ {map_of_list (84),
+  listlist (12)}`, spread over every `claim`, `twin`, `union` and `order` value. Committed
+  as `scripts/silent-sweep/census/d361-landed.json` and carried whole by the standing gate
+  as `d361-landed`: **the distilled `cells/` half is blind to all 96** — `regress.py` on the
+  landed compiler reports 0 moved classes — so a collapse of current behaviour cannot stand
+  in for them.
+
+* **THE SPELLING THE CENSUS CANNOT REACH, MEASURED TOO.** D361's own witness binds the
+  element (`const e0 = g1[0]`) where every census cell reads it (`(g1[0]).r`), and the
+  binding is why `armRecvHoldsBareArm`'s decline does not fire. `scripts/silent-sweep/d361/
+  genbind.py` respells block E's whole `pval=mixed` slice that way — 1,424 cells — and the
+  landing moves **104, every one check-clean invalid wasm → runs, 0 `runs` lost, 0 → silent**.
+
+* **FOUR ABLATIONS, AND BLOCK E — THE POPULATION THE LANDING WAS MEASURED ON — CANNOT
+  SEPARATE ANY OF THEM.** Each sub-rung stripped alone, each seed self-compiled from
+  `1e598e2b`'s base:
+
+  | ablation | seed | block E vs base | corpus `cmp` vs the landing | probe reaches | separating witness |
+  |---|---|---|---|---|---|
+  | the landing | `4249a50f`, 1,469,283 B | 96 → runs, 0 lost, 0 silent | (vs BASE) 1,928 of 1,930 SAME | reach 641, ans 39 (corpus) | — |
+  | strip the rung WHOLE (helper **and** gate) | `e5a5ab49` = the base | 0 moved | identical binary | — | the witness stays SILENT |
+  | strip the `>= 2 elements` bound | `61df9d53`, 1,469,257 B | **96 → runs, identical** | **1,930 SAME, 0 DIFFER** | `one=0` on the corpus, on block E and on the 1,424-cell grid | **none found** |
+  | strip "every element is an `ObjLit`" | `b8454e0c`, 1,469,281 B | **96 → runs, identical** | 3 DIFFER **+ `arrays/inferred-list-objlit-beside-ident-arm.vl` stops compiling** | `nonobj=110` corpus reaches | that fixture (`[{ r: 7 }, c]` with `c: Sq`): **`runs` → not-runs** |
+  | strip "all elements name the SAME row" | `723e800f`, 1,469,260 B | **96 → runs, identical** | 9 DIFFER **+ `unions/anon-objlit-list-elem-beside-arm.vl` stops compiling** | `last=400` corpus reaches | that fixture: **`runs` → not-runs** |
+
+  Stripping the rung whole reproduces `1e598e2b`'s seed **byte-for-byte** —
+  `md5 e5a5ab490dbaff4cab97803a7abe79d7`, 1,468,887 bytes — and the helper had to come out
+  with the gate for that to be true: a dead function is still a function in the compiler's
+  own module, and leaving it behind lands 1,469,266 bytes instead. **Two of the three
+  sub-rungs are load-bearing and the grid the landing was priced on scores all four the
+  same**; only the corpus and two hand-built witnesses tell them apart, and the third
+  sub-rung scores **0 on every population measured** and is kept on the rule's own statement
+  (a one-element literal has no disagreement for the checker to have joined). The
+  `ObjLit`-beside-ident separator is now a corpus fixture
+  (`tests/cases/arrays/inferred-list-objlit-beside-ident-arm.vl`); nothing covered it before.
+
+* **AND IT MAKES D223's REFUSED LIFT FREE — MEASURED, BOTH LEGS, ON THIS BASE.** D223 refused
+  lifting `armRecvHoldsBareArm`'s ref-list-element decline because it cost 24 block-E cells
+  loud → silent, and said "the day D361 closes they are what says the lift is now free". The
+  BARE lift on `1e598e2b` still costs exactly those 24 (set-identical to the committed
+  `d223-lift-price` coordinates, and block E's silent total goes 96 → **120**); on top of
+  this landing the same lift moves **852 cells, all 852 loud emit reject → runs, `runs` LOST
+  0, → silent 0**, and block E's silent total stays at 0. See D223.
+
+### D381 — an un-annotated list literal of ONE arm flowing into a DECLARED UNION-ELEMENT destination is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-28 while ablating D361's rung · D361's MIRROR: there the literal was too WIDE for its destination, here it is too NARROW, and the same landing cannot answer both**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const lv1 = [{ r: 7 }]
+      const c: Shape[] = lv1
+      if c.length > 0 {
+        const e0 = c[0]
+        if e0 is Circle { print(e0.r) } else { print(0) }
+      } else { print(0) }
+    }
+    f()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 221: type mismatch: expected (ref $type), found (ref $type)
+
+* **IT IS THE OTHER DIRECTION OF D361's SEAM AND IT IS NOT CLOSED BY IT.** D361's literal
+  minted the union BOX where the destination wanted the arm; this one mints the ARM where
+  the destination wants the box. `[{ r: 7 }]` has one element, so the checker records
+  `{r:i32}[]` and no union at all — `arrLitBoxElemName` returns `""`, the widening site is
+  never reached, and the literal is a kind-1 list of `Circle`. The `Shape[]` binding then
+  reads a box list. All four D361 ablations grade this witness identically, which is how it
+  was found.
+
+* **FIVE CONTROLS, each one word, measured on the D361 landing and on all four of its ablations:**
+
+  | control | outcome |
+  |---|---|
+  | the repro as filed | **check-clean invalid wasm** |
+  | annotate the literal (`const lv1: Shape[] = …`) | **runs**, prints 7 |
+  | give it a SECOND element naming the other arm (`[{ r: 7 }, { s: 2 }]`) | **runs**, prints 7 |
+  | put a map between them (`c: {[string]: Shape[]}`, `c["k0"] = lv1`) | check-clean invalid wasm (same) |
+  | delete `type Shape` and make the destination `Circle[]` | **runs**, prints 7 |
+
+  So the container is NOT an ingredient — unlike D361's filed reading, which named a map its
+  class does not need either. The ingredients are: the destination's element is a declared
+  UNION, the literal is un-annotated, and its elements name exactly one arm.
+
+* **WHY D361's RUNG IS NOT THE ANSWER.** That rung DECLINES a widening the arena already
+  proposed; there is nothing here to decline — the arena proposes nothing, because a
+  one-element literal of one shape has no join to make. The landing this wants is the
+  reverse lookup D203's `letMapDestShape` does for maps: an un-annotated list-literal
+  binding taking the ref-list slot of the declared destination it flows into, which
+  `letRefListDestSlot` was built for and #1992 measured as not moving D361. **D361 was the
+  wrong row to test it against.** This is the row it was written for.
+
+* Filed rather than fixed: it wants its own grid (the census has no `pval=single ×
+  union-element destination` coordinate) and `letRefListDestSlot` already exists to be
+  re-graded against it.
 
 ---
 
