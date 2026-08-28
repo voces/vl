@@ -9861,9 +9861,10 @@ Repro:
   | **`R + X + B`** (shipped) | **1,463,730** | **+24** | **0** | **+25** | **0** |
 
   **DIRECTION CHECK 1 — a rung that scores ZERO on every population and is still load-bearing.**
-  `B` alone moves **0 of 1,974 cells in either direction**, on both grids. Strip it from the
-  landing and 8 cells redden. A per-rung "it moves nothing" is not a reason to drop a rung; it
-  is a reason to ask what it holds up.
+  `B` alone moves **0 of 1,974 cells in either direction** on the two grids, AND its corpus is
+  byte-identical on **1,907 of 1,907** buildable modules — a complete no-op on every population
+  this change measures. Strip it from the landing and 8 cells redden. A per-rung "it moves
+  nothing" is not a reason to drop a rung; it is a reason to ask what it holds up.
 
   **DIRECTION CHECK 2 — one alone is a catastrophe.** `X` alone loses 60 cells and gains
   **nothing**: the classifier stops calling the read a union while the read still emits the box,
