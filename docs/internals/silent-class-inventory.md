@@ -7823,10 +7823,59 @@ PRESCRIPTION IS REFUTED.**
   candidates failed. **Every number in this row was RE-TAKEN on `ff04d74b` after #1965 landed
   in the same file**; the rejected candidates below keep the commit they were measured on.
 
+**THE CONTESTED HALF, RE-MEASURED 2026-08-27 ON MERGED MASTER `a19a3db7` (seed 1,457,262).
+IT IS REACHABLE — AND BOTH HALVES OF D171's PRESCRIPTION ARE REFUTED.**
+
+* **THE GATE IS THE WHOLE OF WHAT IS LEFT, AND LIFTING IT CLOSES THIS ROW'S OWN WITNESS.** On
+  top of the D157/D163 composition, deleting `armLayoutContested` from
+  `pinArmDeepUncontested` (candidate **U**) makes the repro above **RUN and print `7`**, and
+  D171's witness — which is this repro verbatim — with it. Cell-matched against the stripped-
+  all base:
+
+  | candidate (all over E+C1+C2) | D88/D100 (2,850) | D112 (1,114) | D156 (1,188) | D139 (36) |
+  |---|---|---|---|---|
+  | — (the shipped composition) | 8 fwd / 0 back | 0 / 0 | 0 / 0 | 4 / 0 |
+  | **P** — the ARGUMENT→PARAMETER hop (D171's named carrier) | 6 / 0 | 0 / 0 | 2 / 0 | 4 / 0 |
+  | **U** — the peel un-gated | 34 / 0 | 2 / **4** | 16 / **16** | 8 / 0 |
+  | **P + U** | 34 / 0 | 2 / **4** | 18 / **16** | 8 / 0 |
+  | **P + U + N** (N = the arm-nominal element key, D173) | 30 / **46** | 4 / **20** | 18 / **14** | 8 / 0 |
+  | **P + U + R + N** (R = D158's read leg) | 30 / **46** | 8 / **20** | 42 / **14** | 8 / 0 |
+
+* **D171 NAMES THE WRONG CARRIER, AND THE ABLATION IS WHAT SAYS SO.** That row states: "what
+  would close it is a carrier the pin family does not have — the ARGUMENT→PARAMETER hop". It
+  was BUILT (`synthArgParamAnns`, inside the `synthDstPinAnns` fixpoint so a parameter pinned
+  this round creates destinations for the same round's binding walk). It does **not** close
+  this repro on its own, and — the decisive number — it **does not remove a single one of U's
+  backward cells**: `U` and `P + U` have the IDENTICAL 4-cell D112 and 16-cell D156 backward
+  sets. The carrier is real and it is not the thing the gate is standing in for.
+* **AND THE INVERTED ORDER IS REFUTED TOO.** D171's own correction of D156's original
+  prescription reads "complete the chain, THEN make the arm honest". With the chain complete
+  (P) the arm-nominal element key is **46 backward on D88 and 20 on D112** — WORSE than
+  D173's own 40 / 0 re-measurement without it. Completing the chain does not make the key
+  safe; it moves the conflation's load onto a wider population.
+* **THE COMPOSITION THAT CLOSES ALL FOUR ROWS EXISTS AND IS REFUSED, WITH A PRICE.**
+  `E + C1 + C2 + P + U + R + N` makes **every one of the seven witnesses in this family run** —
+  D156, D157, D158, D163, D171, and both refutation pins D172 and D173. It costs **80 `runs`
+  cells across the three grids** (46 + 20 + 14), every one of them `arm` or `armdiff` at an
+  UN-ANNOTATED position, which is D171's "the conflation is load-bearing" measured from the
+  other side. `runs` is the win direction and a `runs` → not-runs move is a blocker whatever
+  the net, so it is recorded here and not committed. Its own refutation pin is **D236**.
+* **WHAT IS ACTUALLY LEFT IS ONE SEAM, NOT A CARRIER.** Every candidate above either leaves the
+  chain incomplete or completes it onto a ref-list layer that gives `{[string]: Circle}` and
+  `{[string]: {r:i32}}` ONE row. Probed on `P + U + R`, this row's own dump reappears with the
+  chain fully pinned: `PIN let=24 -> {[string]:{[string]:Circle}}`,
+  `PIN let=14 -> {[string]:Circle}`, and `MV slot=3 name={[string]:Circle} twin=1` twinning
+  onto slot 1 `{[string]:{r:i32}}`, whose ref-list row is the only one either spelling has.
+  The residue of this row is D173's key, and D173 is not shippable — measured twice now.
+* **THE RESIDUE, NAMED.** After the D157/D163 composition the D88/D100 grid's silent
+  population is **36 cells, every one `armtwin x declname x nestedmap`** (the 44 it had at
+  `a19a3db7` minus this PR's 8), and the D139 grid's is **4, every one
+  `armtwin x nestedmap`**. That is this row's contested half and nothing else.
+
 ---
 
 ### D157 — an element-preserving LIST CONDUIT between the binding and its destination
-**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · 4 of the 44 surviving D88/D100 cells (`bare x std x retann` 2, `mapval x std x retann` 2) · pre-existing on `54780e0b` and on `1559d80c` · RE-FILED 2026-08-27: TWO ROOTS, and the four cells the row also claimed at `mapval x std x {param,paramlocal}` are D163's alone · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-27 in D139's closing residue · 4 of the 44 surviving D88/D100 cells (`bare x std x retann` 2, `mapval x std x retann` 2) · pre-existing on `54780e0b`, on `1559d80c` and on merged master `a19a3db7` · RE-FILED 2026-08-27: TWO ROOTS, and the four cells the row also claimed at `mapval x std x {param,paramlocal}` are D163's alone · was THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, now swapped to D158**
 
 Repro:
 
@@ -7927,13 +7976,60 @@ Repro:
   claimed are D163's alone — the pin ALREADY fires for them on `1559d80c`
   (`DPA let=917 name=c ret=-1 n=1 [0]=<{[string]:Circle}>`), so no conduit rung can be their
   answer.
-* Pinned as `tests/cases/soundness/xfail-miscompile-arm-literal-through-a-list-conduit.vl`,
-  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+* **THE CLOSE (2026-08-27, against merged master `a19a3db7`, seed 1,457,262). C1 AND C2 SHIP
+  WITH D163, AND THE ORDER IS MEASURED RATHER THAN OBEYED.** The row said "LAND THEM WITH
+  D163, NOT BEFORE IT" and that instruction is now a reading of a grid instead of a deduction
+  from one disassembly. One compiler per candidate, produced by STRIPPING candidates out of
+  the branch source; stripping all reproduces `a19a3db7`'s `compiler/*.vl` textually and
+  compiles to a seed **byte-identical to it at 1,457,262 bytes**, and the stripper's full
+  build is byte-identical to the hand-built branch. Cell-matched on the 2,850-cell D88/D100
+  grid:
+
+  | candidate | D88/D100 (2,850) | D112 (1,114) | D156 (1,188) | D139 (36) |
+  |---|---|---|---|---|
+  | C1 — an open generic position is one whose spelling MENTIONS a type param | 0 moved, 0 messages | 0 | 0 | 0 |
+  | C2 — `dstPinSrcIs` crosses an INDEXED element-preserving conduit | 0 moved, 0 messages | 0 | 0 | 0 |
+  | C1 + C2 | 0 moved, **4 same-class MESSAGE moves** | 0 | 0 | 0 |
+  | E — the element row off the element's COMMITTED rep (D163) | **2 moved**, 0 backward | 0 | 0 | **4 moved** |
+  | E + C1 + C2 | **6 moved**, 0 backward | 0 | 0 | 4 moved |
+
+  **The union of the singles is 2 and the composition is 6**, and the four extra cells are
+  EXACTLY C1+C2's four message cells (`armtwin x declname x {bare,mapval} x std x retann x
+  ann0 x {norm,rev}` — this row's own filed population). Pairwise intersection is 0 every way.
+  So the composition is a DIRECTION and not a count, in the shape #1972 warns about: a summing
+  ablation would have dropped both halves of the pin as inert, and they are the reason four of
+  the six cells move at all.
+* **THE FOUR INSTRUMENTS, IN ORDER, AND `cmp` FOUND A REAL REGRESSION THE GRIDS DID NOT.**
+  Corpus `cmp` FIRST — all 2,327 `tests/cases/**.vl` built with both seeds and sha256-compared:
+  the FIRST build of this change differed on **5** modules and one of them,
+  `tests/cases/arrays/inferred-union-element-literal.vl`, went from `runs` to
+  `emitProgram: unknown variant field in field access`. `const xs = [c, d]` over two ARMS of
+  ONE union is a union-BOX list, and the committed-rep rung read only the FIRST element. Two
+  positions fixed it — the rung moved BELOW the checker-typed union element, and the bank now
+  requires EVERY element to commit to the same name — and the grids moved not one cell either
+  way across that fix, which is the whole argument for running `cmp` first. The shipped
+  composition differs on **3**: the fixture this change graduates, plus two that RUN
+  identically on both sides and were interrogated rather than counted (below).
+* **THE TWO REMAINING CORPUS DIFFERENCES ARE INTERROGATED, NOT COUNTED (#1962's lesson).**
+  `maps/arm-valued-map-slot-layout-twin-of-its-render.vl` prints `7 7 7 7` on both sides and
+  its disassembly differs in **LOCAL INDICES ONLY** — same line count, and no line present on
+  one side once integers are normalised. `unions/anon-objlit-into-arm-typed-destination.vl`
+  prints `7` nine times on both and its module is **two lines SHORTER**: one
+  `(array (mut (ref null N)))` backing and its three-field wrapper struct are no longer
+  minted, because the literal's element row now resolves the annotation's existing row instead
+  of interning a duplicate. That is the change's intended effect, read off the bytes.
+* **RE-GRADED AND CLEAN EVERYWHERE ELSE**: D112 (1,114), D156 (1,188), D111/D117 (1,710),
+  D131 (1,732), D181 (1,200) — **0 moved, 0 backward, 0 message moves on every one**. The
+  census subsets named below likewise: **0 moved of 720 + 4,302**.
+* The pin GRADUATED to `tests/cases/soundness/arm-literal-through-a-list-conduit.vl`, `@run` +
+  five `@log 7` (the former specimen verbatim, the hand-written `rv<T>(xs: T[]): T[]` conduit,
+  the annotated-list control that always ran, D163's own map-valued witness, and the
+  DISAGREEING two-arm literal that the corpus `cmp` above caught). The specimen is now D158's.
 
 ---
 
 ### D163 — a LIST LITERAL keys its element row off the checker's shape, not off the element's committed rep
-**check-clean invalid wasm · found 2026-08-27 measuring D157 · 4 of the 44 surviving D88/D100 cells (`armtwin x declname x mapval x std x {param,paramlocal} x ann0 x {norm,rev}`), and the second root under all 4 of D157's · pre-existing on `54780e0b` and on `1559d80c`**
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-27 measuring D157 · 4 of the 44 surviving D88/D100 cells (`armtwin x declname x mapval x std x {param,paramlocal} x ann0 x {norm,rev}`), and the second root under all 4 of D157's · pre-existing on `54780e0b`, on `1559d80c` and on merged master `a19a3db7` · the `paramlocal` half needed one more rung and is filed as D235**
 
 Repro:
 
@@ -7997,12 +8093,56 @@ Repro:
   MASTER-reproducible witness of its own (above) in which no pin is missing, it gates 4 cells
   D157 does not, and its fix is in a different file at a different layer (`emit_classify`'s
   ref-list keying, not `emit_collect`'s pin).
-* Not pinned as a fixture: D157 holds the corpus pin for the class and a second
-  `@no-instantiate` file would add nothing the tripwire does not already assert.
+* **THE CLOSE — the mechanism CONFIRMED by probe, and the fix is a BANK rather than a rung.**
+  A compiler carrying a dump at the ref-list intern site answered in one line, on `a19a3db7`:
+
+      D163's repro (`[thru(c)]`)          D157's repro (`[c]`)
+      ALEN name=<{[string]:{r:i32}}>      ALEN name=<Dot>
+           kind=3 hint=-1                      kind=1 hint=-1
+           cen=<{[string]:{r:i32}}>            cen=<{r: i32}>
+           mapn=<{[string]:{r:i32}}>           nom=<Dot>
+
+  — the checker's structural record at both, through `arrLitMapElemName` at one and
+  `arrLitNominalElemName` at the other. And the two spellings do NOT collide at the key: the
+  same probe printed `repElemIdOfNameTy("{[string]:{r:i32}}") = 4` against
+  `repElemIdOfNameTy("{[string]:Circle}") = 5`, with a ref-list row for the first and NONE for
+  the second. So the row was not merged — it was never asked for.
+* **WHY A BANK AND NOT A RUNG, and it is forced rather than stylistic.** The three classifiers
+  (`arrLitElemName` / `arrLitElemKind` / `arrLitElemHintTy`) must "agree per slot" and are
+  called from TWO places with different information: `collectA`'s ARENA WALK, which has no
+  enclosing scope, and `wasmEmit`'s literal lowering, which has one. A rung asking
+  `parentLetOf` would answer at the second and decline at the first, and ONE literal would key
+  TWO rows — this row's own defect, in the other direction. `scanArrLitCommit` resolves the
+  committed name ONCE, with scope, into a per-ArrayLit-node sidecar (`arrLitCommitName`,
+  `annRlSlot`'s idiom), and all three classifiers read the bank.
+* **FOUR SOURCES, EVERY ONE AN ANNOTATION** — a bound local's (the destination pin's included),
+  a PARAMETER's, a callee's DECLARED result, and a callee's inferred result read through the
+  binding that supplies it (`fnRetExprOf`, the hop `dstPinCalleeRetLet` already makes). Never
+  an inference: an inference IS the structural record this row exists to stop trusting.
+* **THREE GATES, and the second was bought by a corpus regression.** The banked name must
+  reach a union ARM (D39's contested seam — everything else keeps the classification it had);
+  EVERY element must commit to the SAME name; and the rung sits BELOW the checker-typed UNION
+  element, which is a stronger claim than any one element's. Without the last two,
+  `const xs = [c, d]` over two arms of one union keyed the list under the first arm and
+  `tests/cases/arrays/inferred-union-element-literal.vl` went from `runs` to
+  `emitProgram: unknown variant field in field access`. See D157's close for the instrument.
+* **POSITION: BEFORE `monomorphize`, and it is the requirement `synthDstPinAnns` has** — the
+  destination pin runs there, so the committed name must be read AFTER it. Node indices are
+  the originals; a body the monomorphizer clones is simply not banked, which is a decline and
+  the conservative direction at a rep key. The HINT still declines (-1) for this arm, for the
+  reason `arrLitElemHintTy`'s own header states: its name is a spelling the ELEMENT committed
+  to, never a row this function looked up, so there is no faithful arena twin to hand over.
+* **MEASURED**: 2 of the 4 filed cells move (`param x {norm,rev}`), 4 more on the 36-cell D139
+  grid, 0 backward anywhere, 0 into a silent class. The other 2 filed cells (`paramlocal`)
+  needed the conduit to cross an un-annotated intermediate alias and are **D235**, closed in
+  the same commit. Full ablation, instruments and re-grades in D157's close.
+* Not pinned as a fixture of its own: the graduated
+  `tests/cases/soundness/arm-literal-through-a-list-conduit.vl` carries this row's witness as
+  its program 4.
 ---
 
 ### D158 — the deciding annotation is at the READ site, not at any delivery
-**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · all 12 surviving D112 cells · pre-existing on `54780e0b`, on `1559d80c` and on merged master `ff04d74b` · OPEN, and ABLATED AWAY FROM D156: two roots, not one**
+**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · all 12 surviving D112 cells · pre-existing on `54780e0b`, on `1559d80c`, on merged master `ff04d74b` and on `a19a3db7` · OPEN, and ABLATED AWAY FROM D156: two roots, not one · ITS CARRIER IS NOW BUILT AND MEASURED (2026-08-27) — see the close below: the leg is complete and correct, and the two things under it are D156's contested gate and D173's key · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
 
 Repro:
 
@@ -8051,7 +8191,150 @@ Repro:
   the class in this family, and `read` is its worst coordinate. That is the shape of a
   CHANNEL defect measured rather than argued, and it is the population any future carrier for
   this row has to move.
-* Not pinned as a fixture, for D157's reason.
+* **THE CARRIER IS BUILT, IT IS CORRECT, AND IT IS NOT WHAT IS MISSING (2026-08-27, on
+  `a19a3db7`).** `dstPinMapRead` — LEG 5, the coalesced map READ — is the shape this row asks
+  for, and it is the first leg of the five that is a CONSUMPTION rather than a delivery. The
+  direction is inverted and that is the whole leg: a delivery says "the value goes somewhere
+  spelled A, so spell it A"; a read says "something spelled A comes OUT of this map at this
+  key, so the map's VALUE is A" — the claim is one container further IN and the binding's own
+  spelling is the claim WRAPPED, not cut, which is why it cannot be a rung of
+  `dstPinPushAnn`, whose two shapes both cut.
+* **AN ABSENT CLAIM IS NOT A DISAGREEMENT AT A READ**, and that is the second way the leg
+  differs from the other four. A DESTINATION with no nominal claim genuinely constrains the
+  binding, so `dstPinPushAnn` pushes `""` and the pin declines. A read constrains nothing —
+  `m["k"] ?? Map()` is legal whatever the value spelling is — so a read whose default commits
+  to nothing is SILENT rather than a veto. Two reads that each claim, and claim differently,
+  still disagree and still decline.
+* **THE PROBE, VERBATIM, AND IT NAMES THE BLOCKER EXACTLY.** A compiler carrying a dump of
+  every `dstPinCallerDests` gate and every `dstPinMapRead` rung, on this row's own repro:
+
+      CD let=24 fn=33 ret=-1
+      CD  rx=30 rll=24
+      CD  GATES PASSED, scanning other scopes
+      MR let=24 coalesce at ix=46
+      MR  left is Index
+      MR  key is StrLit; srcIs=1
+      MR  dn=<{[string]:Circle}>
+      MR  wrapped=<{[string]:{[string]:Circle}}> gate=0      <- armLayoutContested
+      DPA let=24 n=0
+
+  The leg reaches the read three statements and one scope away, crosses `mk`'s un-annotated
+  result through `dstPinCalleeRetLet`, reads `d1`'s annotation off the `??` default, and
+  computes **exactly the right pin**. It is then refused by `armLayoutContested` — D156's
+  contested gate, and D171's. The row's "two roots" is right and the second root is now
+  NAMED: it is not a missing carrier, it is the gate.
+* **AND LIFTING THE GATE IS STILL NOT ENOUGH — the THIRD root, measured.** With the peel
+  un-gated the leg fires, the gate passes, and the WHOLE CHAIN PINS: `PIN let=24 ->
+  {[string]:{[string]:Circle}}` and `PIN let=14 -> {[string]:Circle}`. The program STILL
+  fails, and the same dump says why — `MV slot=3 name={[string]:Circle} twin=1`, twinning onto
+  slot 1 `{[string]:{r:i32}}`, because the ref-list interner gave the two map spellings ONE
+  row. That is D173, one container out, exactly as D171 describes it. Adding D173's rung makes
+  this row's repro **RUN** — and costs 46 `runs` cells on the D88 grid and 20 on D112, so it
+  is refused. **Eighteen candidate compilers have now been graded against this witness** (the
+  fourteen this row already records, plus the committed-rep element row, the pin's two conduit
+  halves and the argument→parameter hop); the only two that move it are the two that are
+  refused, and the composition that closes it is filed as **D236**.
+* THE SPECIMEN, from this PR: pinned as
+  `tests/cases/soundness/xfail-miscompile-read-site-annotation-nested-map.vl`,
+  `@no-instantiate`, kept byte-for-byte identical to `INVALID_MODULE_SRC` below its header.
+  It was chosen for STABILITY and not only for liveness — its program has NO delivery
+  anywhere, so the whole pin family misses it by construction rather than by omission, which
+  is what the five swaps in one day recorded in that file's genealogy were missing.
+
+---
+
+### D235 — the element-preserving conduit whose body hands its parameter back through an UN-ANNOTATED ALIAS
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. Was: check-clean invalid wasm · found 2026-08-27 in D163's closing residue · the 2 `paramlocal` cells of D163's own filed 4 (`armtwin x declname x mapval x std x paramlocal x ann0 x {norm,rev}`) · pre-existing on `54780e0b`, on `1559d80c` and on merged master `a19a3db7`**
+
+Repro (the D88/D100 grid cell `armtwin_declname_mapval_std_paramlocal_ann0_norm`, verbatim):
+
+    import { reverse } from "std:array"
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function thru(x: {[string]: Circle}) {
+      const y = x
+      return y
+    }
+    function mk(n: i32) {
+      const c = Map()
+      c["k"] = { r: n }
+      return reverse([thru(c)])[0]
+    }
+    print(((mk(7))["k"] ?? { r: 0 }).r)
+
+* **IT IS D163's REPRO WITH ONE LINE ADDED, and the line is `const y = x`.** D163's committed-
+  rep walk crosses an un-annotated CALLEE result by asking which binding supplies it
+  (`fnRetExprOf`, the hop `dstPinCalleeRetLet` already makes) — and then stopped, because
+  `alcCommitName`'s `Ident` arm answered `""` for a binding with no annotation of its own.
+  `y` has none; `x` has the one that decides the program.
+* **AN UN-ANNOTATED BINDING IS A LINK IN THE CHAIN, NOT THE END OF IT.** That is
+  `dstPinLocalDest`'s own stated rule — "recorded as a destination it would answer `""`
+  through `armPinAnnName` and veto the pin the link exists to carry" — and
+  `retLocalLetOfBlock` is the family's shared implementation of it. The fix is the same rule
+  at the committed-rep walk: an un-annotated binding recurses into its INITIALIZER. An alias
+  RE-NAMES a value; it does not re-rep one.
+* **MEASURED AS ITS OWN RUNG, on the proven ablation base.** Over the D157/D163 composition it
+  is **+2 on the 2,850-cell D88/D100 grid and 0 everywhere else, 0 backward, 0 into a silent
+  class, 0 message moves** — D111/D117 (1,710), D131 (1,732), D181 (1,200), D112 (1,114),
+  D156 (1,188), D139 (36) all unmoved, and the corpus `cmp` is byte-identical to the
+  composition without it on all 2,327 modules.
+* **WHY IT IS FILED RATHER THAN FOLDED INTO D163**: it has a master-reproducible witness of its
+  own, it gates 2 cells D163's own fix does not, and D163's row published those 2 cells as its
+  population — a close that quietly moved only half of a filed set would be the
+  one-directional staleness this document exists to prevent.
+* Not pinned as a fixture of its own: the graduated
+  `tests/cases/soundness/arm-literal-through-a-list-conduit.vl` carries the conduit class.
+
+---
+
+### D236 — A REFUTATION PIN: the composition that closes all four rows of this family costs 80 working programs
+**A REFUTATION PIN: it runs today and must keep running · found 2026-08-27 closing D157/D163 · the witness below is one of 80 `runs` cells that redden under `P + U + R + N`, the only composition measured that makes D156, D157, D158, D163, D171, D172 and D173 all run · the composition is REFUSED, so this program is the tripwire on it**
+
+Repro (the D88/D100 grid cell `arm_declname_mapval_std_local_ann1_norm`, verbatim — eleven
+lines, NO layout twin declared, prints `7` on this tree):
+
+    import { reverse } from "std:array"
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function mk(n: i32) {
+      const c: {[string]: Circle} = Map()
+      c["k"] = { r: n }
+      const d = c
+      return reverse([d])[0]
+    }
+    print(((mk(7))["k"] ?? { r: 0 }).r)
+    // vl run on this tree: 7
+    // vl run under `E + C1 + C2 + P + U + R + N`:
+    //   Invalid input WebAssembly code at offset 1589:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **WHY A PIN AND NOT A DEFECT REPRO.** There is no twin in this program and no ambiguity in
+  it at all: `c` is annotated, `d` aliases it, and the list round-trips through a generic
+  conduit. It is well-typed at the wasm level only because `Circle` and the anonymous
+  `{r:i32}` share ONE ref-list row — the conflation D171 records as load-bearing. Give the arm
+  its own key (D173's rung) and the two stop meeting, and this program stops emitting. **This
+  is D173's own finding at a WIDER population**: D173 measured 40 backward on this grid with
+  the chain incomplete; with the chain COMPLETE (the argument→parameter hop, the un-gated
+  peel and the read leg) it is **46**.
+* **THE WHOLE PRICE, cell-matched against `a19a3db7` (stripped-all seed 1,457,262).** 80 `runs`
+  cells lost: **46** on the 2,850-cell D88/D100 grid, **20** on the 1,114-cell D112 grid, **14**
+  on the 1,188-cell D156 position grid; 0 on the 36-cell D139 grid. Every one of the 46 is
+  `arm` or `armdiff` at an UN-ANNOTATED position (20 `arm x declname`, 20 `armdiff x declname`,
+  6 `armtwin x declname`). Against 30 + 4 + 42 forward — a net that is positive on the count
+  and negative on the only number that decides a floor (D93's rule: the count of `correct`
+  cells LOST).
+* **WHAT IT PINS, precisely.** The day someone lands the arm-nominal element key — with or
+  without the chain completed — this program flips, and the flip is the signal that the
+  variant/struct ref-list seam has moved without the un-annotated positions being carried
+  first. D172 and D173 pin the same seam from the un-gated peel's side; this one pins it from
+  the FULL composition's side, which is the only side on which every witness in the family
+  runs.
+* Not pinned as a fixture: the grid file above regenerates from
+  `scripts/silent-sweep/d88/gen88.py` and a corpus copy would freeze one cell of a population
+  the grid re-derives in full.
 
 ---
 
@@ -9317,6 +9600,15 @@ Repro (D156's own, verbatim — it declares the layout twin, which is what makes
 * The gate that ships instead is `armLayoutContested` — no declared struct row of the arm's
   exact layout — and it is a MEASURED boundary, not a soundness argument: the peel's forward
   and backward halves fall on opposite sides of it with nothing crossing.
+* **THE NAMED CARRIER WAS BUILT AND IT IS NOT THE ANSWER (2026-08-27, on `a19a3db7`).**
+  `synthArgParamAnns` — an un-annotated PARAMETER pinned from the committed spelling every call
+  site's argument offers, inside the `synthDstPinAnns` fixpoint, gated on all sites agreeing
+  and on the spelling reaching an arm — moves 2 cells of the 1,188-cell position grid and 0 of
+  the other three, does NOT close this row's witness on its own, and **does not remove one of
+  the 12 backward cells the gate exists to prevent**: the un-gated peel with and without it
+  has the IDENTICAL backward set. What DOES close this witness is lifting the gate, and what
+  is under the gate is D173's ref-list key, re-measured at **46 backward on D88** once the
+  chain is complete. Full table and the seven-witness composition: D156's close, and D236.
 
 ---
 
