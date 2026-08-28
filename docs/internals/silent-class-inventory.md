@@ -10903,60 +10903,8 @@ Repro:
 
 ---
 
-### D224 — D211's ARM-TWIN quarter: the same cell with a second union whose first arm is `Circle`'s layout twin
-**check-clean invalid wasm · STILL OPEN, and now for a MEASURED reason rather than an unexamined one: the fix was BUILT, it works, and it costs 207 · 4 of D211's 12 cells (`twin=armtwin`), live after D219 and after D280 · the class D219's R10 gate deliberately declines**
-
-**THE ROOT IS RIGHT AND IT IS NOT SUFFICIENT (2026-08-28, on `28425535`).** This row's own
-prescription said "WHAT WOULD CLOSE IT is D171's root, not another classifier rung". D171's
-root is D280's two-heap seam, and it landed — **and this repro is UNMOVED by it**. Graded on
-the base seed (1,461,851) and on the shipped seed (1,463,065) the outcome is `check-clean
-invalid wasm` both times with the IDENTICAL sentence at the IDENTICAL offset: `Invalid input
-WebAssembly code at offset 2217: type mismatch: expected i32, found (ref null $type)`. That is
-the nullable-niche read, not this family's `(ref null $type)` / `(ref $type)` sentence, and it
-was already this row's filed message. The rung is where the rest of it lands after all.
-
-* **THE CANDIDATE, BUILT AND FIXPOINTED (1,463,120).** `armLayoutAmbiguousAt` has two rungs and
-  both were written as *is there a SECOND claimant of this arm's layout*, because a second
-  claimant meant a second HEAP TYPE. After `uVarSTwin` a struct claimant no longer implies one,
-  and the ARM claimant never did — `uVarTwin` has merged structural arm twins since the variant
-  layer got its twin column, so this row's own `Dot`-of-`DotU` is ALREADY one heap with `Circle`
-  and the gate is declining on a pair that cannot disagree. Re-asking each rung whether the other
-  claimant's heap actually DIFFERS — through the two pairwise, timing-independent relations
-  (`repVariantSlotsTwin` and `variantStructHeapTwinAt`) — closes this witness: it RUNS and prints
-  `0`, which is the correct answer, verified against its D211 sibling (the same program with the
-  three `Dot*` lines deleted), which prints `0` on the base too.
-* **AND IT COSTS 207. NEITHER THE PER-ROW GRIDS NOR THE DISTILLED CORPUS CAN SEE IT, WHICH IS THE
-  POINT.** The candidate moves **0 cells in either direction on all four per-row grids** —
-  D88/D100 (2,850), D112 (1,114), D156 (1,188), D139 (36) — so on that evidence it is a free win.
-  Cell-matched on **census block B (28,590 cells)** it moves **207 cells from a `loud emit reject`
-  into `check-clean invalid wasm`**, 0 `runs` lost. Four working programs bought with 207 honest
-  refusals turned silent is refused on the standing rule.
-* **THE DISTILLED CORPUS REPORTS `→ silent 0 classes` FOR THIS CANDIDATE, AND IT IS WRONG BY 207
-  CELLS.** Graded against the same candidate, `scripts/silent-sweep/distilled/regress.py` prints
-  `-> silent (report) 0 classes (0 of 250310 census cells)` — and it STILL does after #1979 added
-  its 72 curated named cells. **NOT ONE of the 207 is a distilled representative**, checked by
-  name against `distilled/cells/`; the generator is deterministic (all 526 block-B
-  representatives re-generate byte-identical), so the comparison is sound. The 207 are a sharply
-  defined family — `pval=nullfield, declness=byname, rep=nul, order=norm`, at `twin=exact` (142)
-  and `twin=armtwin` (65) — and their equivalence classes' representatives do not move under it.
-  **This is a second, independent instance of the shape #1979 was landed for**, and it says the
-  curated half needs one more entry rather than that the collapse is unsound: `regress.py` is a
-  `runs → not-runs` tripwire and is sound as that, but its `→ silent` column is not a substitute
-  for a block when the transition is new to the 19-snapshot history the collapse was built from.
-  Whoever owns the distilled corpus should consider adding this set to `named/` — it is already
-  materialisable from `d224-cost.json`.
-* **THE 207 ARE A NAMED SET**, at `scripts/silent-sweep/census/d224-cost.json`, materialised by
-  the `scripts/silent-sweep/d243/mkset.py` already in the tree (names and coordinates, not copies
-  of the generated programs — `mkset.py` refuses if the generator has moved under the set). It
-  re-grades against any future seed in ~414 `vl` invocations instead of a census, and on the
-  shipped seed it prints `loud emit reject 207` and nothing else. Re-graded under the candidate
-  built on THIS PR's base: **199** go silent and 8 now RUN, #1978 having closed those from the
-  other side. 199 or 207, the refusal is the same.
-* **WHAT WOULD ACTUALLY CLOSE IT** is therefore not the gate but the 207's own root: a receiver
-  whose arm the classifier declines to claim is a LOUD floor today, and lifting the floor without
-  first making those receivers lower correctly is what turns them silent. That is D223's shape
-  ("the module is already invalid before the read") asked of the arm-twin class, and it wants its
-  own grid.
+### D224 — [CLOSED 2026-08-28] D211's ARM-TWIN quarter: the arm rung declined on a pair that `buildVariantTwins` had already merged into ONE heap
+**closed 2026-08-28 — the filed cell RUNS · was `check-clean invalid wasm` on `21f48747` · 4 of D211's 12 cells (`twin=armtwin`) · the 199 this row was refused at was a BUNDLE of two independent rungs; only one of them closes this, and its own price is 27**
 
 Repro (census block A cell `a099944`, verbatim — D211's own cell plus one union):
 
@@ -10975,24 +10923,180 @@ Repro (census block A cell `a099944`, verbatim — D211's own cell plus one unio
     const g0 = (c)["k0"] ?? Map()
     const g1 = (g0)["k0"] ?? { r: null }
     if (g1).r != null { print(7) } else { print(0) }
-    // vl check rc 0. Invalid input WebAssembly code at offset 2217:
-    //   type mismatch: expected i32, found (ref null $type)
-    // Delete `type Dot` / `type DotB` / `type DotU` and it is D211's cell, which RUNS.
+    // NOW PRINTS 0 — `r` is null, so the else arm is the right answer.
+    // `474b6a1b` (1,463,065) and `21f48747` (1,463,113), byte-identically: vl check rc 0, then
+    //   Invalid input WebAssembly code at offset 2217:
+    //     type mismatch: expected i32, found (ref null $type)
+    // Delete `type Dot` / `type DotB` / `type DotU` and it is D211's cell, which RAN on both.
 
-* **THE DELTA FROM D211 IS THREE LINES AND ONE OF THEM IS THE DEFECT.** `Dot` has `Circle`'s
+Regression: `tests/cases/unions/arm-field-read-beside-a-second-unions-layout-twin.vl`.
+
+* **THE DELTA FROM D211 IS THREE LINES AND ONE OF THEM WAS THE DEFECT.** `Dot` has `Circle`'s
   exact layout and is a member of a DIFFERENT union, so `collectS` skips it — there is no
   struct row, and `armLayoutContested` (which asks the struct table) answers false. The
   arm-vs-arm twin is a second ambiguity with the same consequence and its own predicate,
-  `armLayoutAmbiguousAt`, which is what D219's rung is gated on.
-* **THE GATE IS WHY THIS ROW EXISTS RATHER THAN 66 SILENT CELLS.** Un-gated, D219's rung
-  claims these receivers and block B moves 66 cells from a loud emit reject INTO check-clean
-  invalid wasm. Gated, they keep exactly the class they had before — which for D211's four is
-  already `check-clean invalid wasm`, so those four stay where they were rather than moving
-  either way.
-* **WHAT WOULD CLOSE IT is D171's root, not another classifier rung.** The read resolves the
-  arm correctly; what disagrees is one container out, where the element slot is minted from
-  whichever claimant the rep layer reached first. That is the same "two nominal claimants, one
-  heap type" seam D39/D100 describe, asked of two ARMS instead of an arm and a struct.
+  `armLayoutAmbiguousAt`, whose arm-claimant loop is what D219's rung was gated on.
+* **THE FIX IS ONE CONJUNCT, AND THE OLD QUESTION WAS THE WRONG ONE.**
+  `repCanonId(uVarTyIx[j]) == key` reads "is there a second ARM of this canonical layout",
+  and the rung was written when that implied a second HEAP TYPE. It has not since D48 gave
+  the variant layer its twin column: `buildVariantTwins` merges two arms of one canonical
+  key and one emitted field layout into ONE heap index, so `Dot`-of-`DotU` and the arm
+  `Circle` are already the same heap and the gate was declining on a pair that cannot
+  disagree. The loop now asks `repVariantSlotsTwin(vi, j) == 0` — that column's own
+  pairwise, timing-independent relation, the same two gates in the same order
+  `buildVariantTwins` keys on. **Stripping that one conjunct rebuilds `21f48747`'s seed
+  byte-for-byte at 1,463,113**; with it the seed is 1,463,129 and the whole disassembly diff
+  is a SINGLE hunk — one `if` condition in one function turned into a short-circuiting
+  `(if (result i32) … (call $repVariantSlotsTwin))`.
+
+* **THE 199 WAS THE PRICE OF A BUNDLE. THE TWO RUNGS ARE SEPARABLE, ADDITIVE, AND ONLY ONE OF
+  THEM CLOSES THIS ROW.** The refused candidate re-asked BOTH of `armLayoutAmbiguousAt`'s
+  rungs of the heap. Built separately on `21f48747` and graded cell-matched on census block B
+  (28,590 cells, base seed vs each candidate seed):
+
+  | candidate | seed | block B moved | → runs | runs LOST | → silent | closes D224? |
+  |---|---|---|---|---|---|---|
+  | **arm rung** (`repVariantSlotsTwin`, shipped) | 1,463,129 | 346 | **319** | 0 | **27** | **yes** |
+  | struct rung (`variantStructHeapTwinAt`, D280's merge) | 1,463,127 | 521 | 387 | 0 | 134 | **no** |
+  | both (the refused candidate) | 1,463,143 | 867 | 706 | 0 | **161** | yes |
+
+  **Movers intersect in 0 cells; the union of the singles IS the branch, cell-identical — 0 of
+  867 disagree with the single-candidate prediction.** So the refusal's number was
+  134 + 27, and the 134 buy nothing here: the struct rung cannot close this witness at all,
+  because the witness's `Dot` is a union member and `armLayoutContestedAt` answers false for
+  it. On the named 207-cell cost set the shipped candidate prints `loud emit reject 142 /
+  runs 38 / check-clean invalid wasm 27`; the both-rung candidate prints `runs 46 /
+  check-clean invalid wasm 161`. **Three forms of the arm rung were built** — the
+  `repVariantSlotsTwin` re-ask, the same question off the banked arena key
+  (`variantFieldLayoutEq(vi, j) == 0`), and deleting the rung outright — and all three were
+  **cell-identical on all 28,590 block-B cells and byte-identical on the corpus**, so the
+  strictest was shipped.
+
+* **THE PRICE IS NOT A LOST REFUSAL, AND IT FELL 65 → 27 IN ONE MERGE WITHOUT THE FIX
+  CHANGING.** Measured on `474b6a1b` this cut cost **65**; re-derived on `21f48747` after
+  #1984 (D282) it costs **27**, and the 38 that stopped being a price now RUN. Nothing in the
+  candidate moved. That is the mechanism, demonstrated rather than argued: every backward cell
+  is a cell whose TWIN-FREE spelling is already `check-clean invalid wasm`, so closing the
+  twin-free defect retires the price one for one.
+* **THE GRID THAT SEPARATES IT, BECAUSE BLOCK B CANNOT.** Block B crosses `twin` only at its
+  three CORNERS, so `twin=armtwin` there always carries `claim=2`/`union=used` and the price
+  cannot be attributed inside it at all. `scripts/silent-sweep/d224/` builds a **2,484-cell**
+  grid — each of the 65 coordinates and D211's 4 armtwin wins, crossed fully against
+  `twin × claim × union` with the other nine axes held at that cell's own values:
+  1. the change moves **only** `twin=armtwin` cells: 0 at `none`, `exact` and `samearity`,
+     and 0 anywhere at `union=nounion`;
+  2. all **138** backward cells land on the **byte-identical validator sentence their own
+     `twin=none` sibling already produces on `21f48747`** (138 of 138, offsets normalised),
+     and the loud message they lose is `emitProgram: bare null needs a struct-typed context`
+     — this predicate's own refusal, not a diagnosis of the program;
+  3. `claim` is causal for the SIZE and not for the class: 15 backward at `claim=0`, 27 at
+     `claim=1` and `claim=2`, and the same counts are already silent at `twin=none`;
+  4. the 65 armtwin cells split 38 `runs` / 27 silent under the change and their twin-free
+     siblings split 38 `runs` / 27 silent on master — **65 of 65 agree, cell by cell**.
+
+  **The law, in one line: under this change `twin=armtwin` grades identically to `twin=none`
+  on 621 of 621 grid cells (and to `samearity` on 621 of 621), where master disagrees on 334
+  of each.** A second, unrelated union whose first arm happens to share `Circle`'s field
+  layout becomes inert. That is the correct semantics, and what is left of the price is the
+  part that was already broken without the twin — filed forward as **D300**.
+
+* **REACHED AND ANSWERING, COUNTED.** A probe compiler that raises a distinct `emitFail` on
+  the LIFT branch fires on **348 of the 621** `twin=armtwin` grid cells and on **0 of the
+  1,863** others; every one of the 334 cells the change moves is among the 348. On the filed
+  witness it fires; on D211's sibling (the same program with the three `Dot*` lines deleted)
+  it does not.
+
+* **ZERO ON EVERY POPULATION THE LADDER ROUTINELY RUNS, AND LOAD-BEARING ANYWAY.** The change
+  is **byte-identical on 1,906 of 1,906 corpus modules that build on both sides** (the only
+  RCDIFF is this row's own new regression case, which master refuses), and moves **0 cells in
+  either direction on all four per-row grids** — D88/D100 (2,850), D112 (1,114), D156 (1,188),
+  D139 (36). That is the direction check worth keeping: a candidate can score zero on every
+  population the gate ladder runs and still be the whole fix.
+
+* **WHY THE FIRST RE-ASK LOOKED LIKE A NON-FIX, AND THE MEASUREMENT ERROR WORTH RECORDING.**
+  A build labelled "both rungs" was byte-identical to the struct rung alone — the patcher
+  matched its mode string by substring and `"R2" in "R12"` is false — so the arm rung was
+  never in it, and the first reading was "the heap re-ask does not lift the arm rung".
+  **Two seeds of the same byte size are the same compiler; two seeds of DIFFERENT size can
+  still be the same edit.** `md5sum` on the stashed seeds is what caught it.
+
+* **WHAT IS LEFT IS NOT THIS PREDICATE.** The remaining 27 are programs that are check-clean
+  invalid wasm on `21f48747` with **no twin declaration anywhere**; see D300. Closing them
+  makes this change's price zero, and #1984 already did it for 38 of the original 65.
+
+---
+
+### D300 — D224's price, spelled without the twin: 27 nullable-field arm reads that are invalid wasm with NO twin declaration anywhere
+**check-clean invalid wasm · found 2026-08-28 by de-confounding D224's `twin` axis · 27 live of an original 65 census-block-B coordinates — #1984 retired 38 of them · silent on `21f48747` and on D224's branch alike · the population D224's arm-twin gate was an accidental loud floor over, and the exact size of that row's remaining price**
+
+Repro (grid-T cell `t000188` — census block B cell `b008898`'s coordinate with its three
+`Dot*` lines deleted, i.e. `twin=none`, which is the point: nothing nominal is contested here):
+
+    type Circle = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Box1 = {[string]: Circle}
+    type Box2 = {[string]: Circle}
+    type GW = { g: {[string]: Circle} }
+    function useShape(s: Shape): i32 { if s is Sq { return 1 } return 0 }
+    const sqv: Sq = { s: 1 }
+    const _sp1: Box1 = Map()
+    const _sp2: Box2 = Map()
+    function mkcall() {
+      const cc = Map()
+      cc["k0"] = { r: null }
+      return cc
+    }
+    function outer() {
+      const lam = () => {
+        const wv: GW = { g: mkcall() }
+        if useShape(sqv) > 99 { print(0) }
+        const g0 = (wv.g)["k0"] ?? { r: null }
+        if (g0).r != null { print(7) } else { print(0) }
+      }
+      lam()
+    }
+    outer()
+    // `21f48747` (1,463,113) AND D224's branch (1,463,129), byte-identically: vl check rc 0,
+    // no diagnostics, then
+    //   Invalid input WebAssembly code at offset 1362:
+    //     type mismatch: expected (ref $type), found (ref $type)
+    // Put `type Dot = { r: i32 | null }` / `type DotB = { db: i32 }` /
+    // `type DotU = Dot | DotB` back and `21f48747` turns LOUD instead
+    // (`emitProgram: bare null needs a struct-typed context`) — the declaration the program
+    // never mentions again is the only thing diagnosing it, which is D224's whole finding.
+
+* **HOW IT WAS FOUND, AND WHY NO PER-ROW GRID COULD.** D224's candidate moves block-B cells
+  from a loud emit reject into check-clean invalid wasm, and the obvious reading is that the
+  change breaks them. A 2,484-cell grid that crosses `twin × claim × union` against each of
+  those coordinates says otherwise: **all 138 of that grid's backward cells land on the
+  byte-identical validator sentence their own `twin=none` sibling already produces on
+  master**, 138 of 138 with offsets normalised. The armtwin declaration was not preventing an
+  invalid module; it was preventing the module from being WRITTEN, by making a classifier
+  decline. Delete it and master emits the same invalid module.
+* **THE 1:1 IS MEASURED ACROSS A MERGE, NOT ASSERTED.** On `474b6a1b` 65 of these siblings
+  were silent and D224's cut cost 65. #1984 (D282) landed, 38 of them started running, and the
+  same unchanged cut now costs 27 — the armtwin cells split 38 `runs` / 27 silent and their
+  twin-free siblings split 38 / 27, **agreeing cell by cell on all 65**. Closing the rest
+  takes D224's price to zero.
+* **THE INGREDIENTS ARE D88/D100's, NOT D219's.** `claim` is causal for the size: 15 of the
+  coordinates are already silent at `claim=0`, 27 at `claim=1` and `claim=2`. `Box1`/`Box2`
+  are container ALIASES of the same map layout — D88's claimant count — and the sentence is
+  ONE sentence across all 27, `type mismatch: expected (ref $type), found (ref $type)`: two
+  different heap types behind one placeholder, D39/D100's seam and not this family's
+  field-read message. The `union` axis is required (0 cells move
+  at `union=nounion`) and `pval=nullfield`, `rep=nul`, `declness=byname`, `order=norm` are
+  constant across all of them.
+* **THE SET IS NAMED AND IT IS IN THE STANDING GATE.** The coordinates are
+  `scripts/silent-sweep/census/d300-twinfree.json` — the `twin=armtwin` half of
+  `d224-cost.json` with `twin` set to `none`, one entry per armtwin cell it is the sibling of
+  — and all 65 programs are curated into `scripts/silent-sweep/distilled/named/` as
+  `d300b*.vl`, so `scripts/gate.sh` re-grades them in seconds on every PR. All 65 rather than
+  the live 27: the 38 #1984 closed are `runs` now, which makes them BLOCKING tripwires, and
+  losing one would be exactly the regression this row exists to price. That follows the
+  standing rule (`CLAUDE.md`, #1982): a derived collapse cannot find these — they are a set a
+  GRID named, and what makes them worth keeping is a candidate's price, which nothing reading
+  current behaviour can see.
 
 ---
 
