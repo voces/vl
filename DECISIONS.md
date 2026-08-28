@@ -346,6 +346,24 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   relation is a union of guards, not the first hit.** Chaining is inert until such a
   rung exists (byte-identical on 1,945 of 1,945 corpus modules alone) and is the
   difference between a landing and a dead compiler once one does.
+  **And the layout question is about the WRAPPER, not the slot** (D301, 2026-08-28).
+  Slot equality is the tightest evidence of one wrapper and it is not the widest true
+  statement of it: two DECLARED names of one layout intern two `rlInternName` rows, which
+  `rlTwin` then gives one wrapper because a struct element's signature is
+  `"h:" + sHeapIdx[rlElemStructRow(row)]`. Slot equality is blind to exactly that, so
+  `type Circle` beside `type CircleN` of the same shape kept two map structs over one vals
+  wrapper and the nested store between them was invalid wasm. The rung asks
+  `repStructSlotsTwin` over the two rows' element struct rows — the `sTwin` equivalence the
+  ref-list signature is itself built from. **It is asked as that LEG and not through
+  `rlSlotsLayoutTwin`**, whose cross-table arm merges a registered arm with a plain-struct
+  row and carries `mvValStructIdxOf`/`mvValVariantOf` with it: measured twice now, at D300
+  and again here, that costs 21 census cells of `bare null needs a struct-typed context`
+  and closes nothing the leg does not. **The constraint that picks the spelling is TIMING**:
+  `rlSig`'s own map-element arm calls `mvCanonRepOf` while `rlTwin` is being built and
+  before `rlWrapIdx` exists, so the wrapper cannot be read from the table that holds it —
+  only from the pairwise, memoized relation the table's signature is derived from. A
+  chokepoint consulted DURING the construction of the table it describes must be answerable
+  from that table's inputs, never from the table.
   VARIANT structs complete the slot layers, deduping by the same two layers
   (`buildVariantTwins` → `uVarTwin`/`uVarHeap`: the canonical variant key via
   `repNameCanonKey` + a per-field storage guard whose ref-bearing field codes

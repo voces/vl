@@ -923,6 +923,16 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // before taking it — three hand-offs in a row expired because the row they named was closed
 // first, and D301 is squarely in a family under active work.
 //
+// THE SUCCESSOR EXPIRED THE SAME DAY IT WAS NAMED (2026-08-28, silent-class-inventory D301,
+// #1989). That is the FOURTH hand-off in a row to be spent before it was taken, and the
+// paragraph above predicted it in the sentence that named it. D301 is CLOSED — the second
+// declared name of one layout interns two ref-list rows that resolve one wrapper, and the
+// map-value twin gate now asks the wrapper question — so this slot has no named successor
+// again and the next swap has to re-run the census rather than inherit a name. The
+// specimen constant is deliberately UNTOUCHED here: D311 is still live on that tree, its
+// pin still fails identically, and pinning the member of the family this change just
+// closed is the exact failure mode the entries above document.
+//
 // AND THE CAVEAT, because every previous entry that skipped one was wrong within a day: this
 // specimen is NOT out of reach. D209's landing already built the predicate the consumer
 // classifiers would have to ask, and D311's row states the repair as a known contract. It
