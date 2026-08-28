@@ -10933,19 +10933,21 @@ with the decline removed and the digits left raw):
   `twin=arm`. **0 runs lost, 0 → silent** on the grid, on the distilled corpus (1,477 classes
   standing for 250,808 census cells plus 570 curated) and on a 1,923-module corpus `cmp`,
   which is byte-identical apart from the three fixtures this landing flips.
-* **THE RESIDUE IS D351, AND IT IS THE SAME SEAM ONE TABLE OVER.** An arm whose layout a
+* **THE RESIDUE WAS D351, AND IT IS THE SAME SEAM ONE TABLE OVER.** An arm whose layout a
   DECLARED struct also claims shares that struct's heap type (D280) while keying `V…;` against
-  its `s…;` — 12 live `trap_loads` cells. The fold that closes them was built and REFUSED with
-  a price; see D351.
+  its `s…;` — 12 `trap_loads` cells this landing left standing. The fold at the PRODUCER was
+  built and REFUSED with a price of six `runs` cells; #1994 closed the 12 at the POOL instead,
+  where a rendered functype has no second meaning. See D351.
 * Fixture: `tests/cases/unions/arm-layout-twin-fnsig-decline.vl`, flipped to `@run`.
 
 ---
 
-### D351 — the SAME `$fnsig` seam one table over: an arm and its DECLARED struct twin share a heap type and key TWO functypes
-**loads then traps (`wasm trap: indirect call type mismatch`) on `4bdfcc67` and on this branch · a SILENT class, found by BUILDING D199's grid rather than by any count · the fold that would close it was built, graded and REFUSED with a price of six `runs` cells · 12 of the 210-cell D199 grid, kept whole as a named set**
+### D351 — [CLOSED 2026-08-28] the SAME `$fnsig` seam one table over: an arm and its DECLARED struct twin share a heap type and key TWO functypes
+**closed · the filed repro RUNS and prints `7` · was: loads then traps (`wasm trap: indirect call type mismatch`) on `4bdfcc67`, on `4a6c1e52` and on `7d3698a4` · the close is a fold of the `$fnsig` POOL on RENDERED BYTES, not of any producer's key — the producer fold stays REFUSED with its measured price of six `runs` cells**
 
-Repro (eight lines; `vl check` rc 0, the module LOADS, then `wasm trap: indirect call type
-mismatch` inside `viaC` — nothing is printed):
+Repro (eight lines; `vl check` rc 0 with two redundant-annotation hints, prints `7`. Was:
+the module LOADED and then trapped `indirect call type mismatch` inside `viaC` with nothing
+printed):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -10956,39 +10958,78 @@ mismatch` inside `viaC` — nothing is printed):
     const g: (Dot) => Dot = (q: Dot) => q
     viaC(g, c0)
 
-* **IT IS D199's MECHANISM ACROSS D280's MERGE.** D199 was two ARMS of one layout keying
+* **IT WAS D199's MECHANISM ACROSS D280's MERGE.** D199 was two ARMS of one layout keying
   `V0;` and `V1;` over one `uVarHeap` row; this is one ARM and one declared STRUCT of that
   layout keying `V0;` and `s0;` over one heap type, because `mAssignTypeIndices`'
   `uVarSTwinAt` arm gives the arm the struct's `sHeapIdx` row (D280). Two structurally
   identical functypes at two indices of one rec group are DISTINCT types in WasmGC, so the
   `call_indirect` operand and the callee's declared functype disagree.
-* **THE CONTROL IS ONE LINE AWAY AND IT RUNS.** Give each closure its OWN callee —
-  `viaC((p: Circle) => p, c0)` beside `viaD((q: Dot) => q, d0)` — and the program prints `7`
-  twice on every compiler, because the two `$fnsig`s never have to agree. It is only when a
-  closure VALUE crosses from one spelling to the other that the redundant functype becomes a
-  trap. That control is `hof2_decl` / `hofret_decl` in the grid, 12 cells, `runs` throughout.
-* **THE OBVIOUS FIX WAS BUILT AND REFUSED, AND THE REFUSAL IS THE MEASUREMENT.** Fold the arm
-  token onto the struct row — `repSigVariantTok` returning
-  `repSigSlotTokOfKind("struct", variantStructHeapTwinAt(rep))` — and all 12 `trap_loads`
-  cells go to `runs`. It also takes **six `runs` cells to check-clean invalid wasm**
-  (`vcall_narrow_decl`, all three `fld` legs and both `order` legs), every one of them a
-  program THIS landing makes run. The cause is direct: the token CHAR is what
-  `sigParamKindAt` reports, so an arm parameter spelled `s…;` stops being a `variant`
-  parameter and D269's value-call arm coercion never fires on it — the box goes raw into a
-  `(ref $heap)` slot. A cell falling into silence is not a trade this family takes.
-* **WHAT WOULD ACTUALLY CLOSE IT** is dedup at the INTERN level rather than at the key —
-  `internCloSigKey` sharing one slot between two keys whose rendered functypes are
-  byte-identical — which is a change to the `$fnsig` pool, not to a producer, and is out of
-  this landing's scope. The alternative (making the STRUCT side key `V…;`) is strictly worse
-  and was rejected without a build: it turns every declared-struct closure parameter into a
-  `variant` one at `sigParamKindAt`, i.e. runs LOST rather than a cell into silence.
-* **THE NAMED SET IS BOTH HALVES**, kept whole at
-  `scripts/silent-sweep/distilled/named/d199_{hofcross,bindcross,vcall_narrow}_decl_*.vl`
-  (18 cells), coordinates at `scripts/silent-sweep/census/d351-crossfold-price.json`. The 12
-  are the tripwires; the 6 are the price, and keeping them is what stops the next candidate
-  paying it without noticing. **No derived population can find either half**: the distilled
-  corpus moves 0 cells for every rung of this family and the corpus `cmp` is byte-identical
-  (D201).
+* **THE CLOSE IS `cloSigTwin`, AND IT IS NOT A SIXTH PRODUCER.** Every fold this family has
+  tried lives in the KEY — `repStructSlotRep` for the struct table, `repVariantSlotRep` for
+  the variant table (D199) — and a key is read by two audiences: the pool, which wants
+  identity, and `sigParamKindAt`, which wants the arm's KIND. That is exactly why the
+  cross-table fold cost six cells. The pool's own question has only one audience. As
+  `emitTypeSection` writes each `$fnsig`, it compares the bytes it has just written against
+  every entry already written (`wRangeEq` over the section buffer — one render per entry, no
+  scratch copy) and records the smallest byte-identical position in `cloSigTwin`.
+  `cloSigTypeIdxAt` is then the ONE place a pool position becomes a type index, and the four
+  sites that used to write `cloSigBase + p` go through it.
+* **THE FOUR SITES ARE ONE LANDING AND THE GRID PROVES IT, ARITHMETICALLY INVISIBLY.** Ablate
+  the DECLARED functype (`fnSigIdxOfFn`, the function section) and the 210-cell D199 grid
+  reads **198 runs / 12 trap_loads — the base histogram exactly** — while **24 cells have
+  moved**: D351's 12 bought and twelve `hof2_decl`/`hofret_decl` cells LOST. Ablate the value
+  call instead and the grid reads 186/24, the same 12 lost and nothing bought. Those 12 are
+  now a named set (`census/d351-halfroute-price.json`), because a partial routing is the one
+  way this landing can make a working program trap.
+* **DISASSEMBLED, THE FIX IS ONE BYTE.** The repro's type section is UNCHANGED — `$5`…`$9`
+  with `$6`, `$7` and `$9` all `(func (param structref (ref $1)) (result (ref $1)))`, three
+  identical functypes at three indices — and the only difference in the whole 300-byte module
+  is `call_indirect (type $7)` becoming `(type $6)`, which is the type `func $1` is declared
+  with. Collapsing the EMISSION too would mean collapsing the ALLOCATION, and the pool's size
+  would then depend on the typed-map value structs `mAssignTypeIndices` mints after it; a
+  duplicate functype nobody references costs a few bytes and keeps the type section byte-stable.
+* **THE PRODUCER FOLD STAYS REFUSED AND ITS PRICE IS STILL THE POINT.** Folding the arm token
+  onto the struct row — `repSigVariantTok` returning
+  `repSigSlotTokOfKind("struct", variantStructHeapTwinAt(rep))` — buys the same 12 and takes
+  **six `runs` cells to check-clean invalid wasm** (`vcall_narrow_decl`, all three `fld` legs
+  and both `order` legs), because the token CHAR is what `sigParamKindAt` reports. Under the
+  pool fold those six do not move at all: the keys are untouched, so `sigParamKindAt` still
+  answers `variant` and D269's value-call arm coercion still fires.
+* **MEASURED, ALL FOUR INSTRUMENTS.** Corpus `cmp` over 1,934 buildable modules: **1,925
+  identical, 9 DIFF, 0 LOST, 0 GAINED**, and every one of the nine is the same shape — a
+  functype index replaced by a lower byte-identical one at both the declaration and its call,
+  with the module SIZE unchanged. Two of the nine are the fixtures this row owns, and — read
+  off the disassembly — NOT ONE of the other seven is the arm⇄struct case: six merge over a
+  LIST WRAPPER (`{(ref array), i32, i32}`, two `>rN;` keys whose wrappers `rlTwin` had already
+  collapsed) and the seventh over the 7-field MAP struct, which is why byte identity is the
+  right level: it is the union of every table's fold plus the merges between them. D199 grid:
+  **198 → 210 runs, 0 runs LOST, 0 → silent**. Distilled corpus: the 12 named cells move
+  `trap_loads → runs` and **0 of 1,487 derived classes move** — which is D201 holding, not the
+  rung being dead: the reach/ans probe answers on 24 distilled modules and 6 corpus modules
+  and changes nothing observable there.
+* **COUNTERS.** Over 1,926 buildable `tests/cases` modules the pool holds 2,157 entries of
+  which **12 are duplicates, in 9 modules**. `Dreach=8472 Dans=26` (8 modules),
+  `Vreach=1454 Vans=9` (6), `Areach=4 Aans=0`, `Mreach=9 Mans=1`. **`M` scores 0 on every
+  population that existed before this landing and is load-bearing anyway** —
+  `tests/cases/closures/map-callback-value-fnsig-pool-twin.vl` RUNS on master and TRAPS with
+  the `.map` site alone unrouted, and it is the ONE module in the tree that reaches that site
+  with a duplicate, which is why it had to be written. **`A` cannot currently be witnessed at
+  all**: the all-i32 arity key `i*ar>i` is the ONLY key the token alphabet can spell that
+  renders `(structref, i32*ar) -> i32`, so it is always its own representative. It is routed
+  for the invariant, and that is stated rather than claimed.
+* **ABLATION.** All rungs stripped reproduces master's OUTPUT byte for byte on all 1,934
+  corpus modules and the same 198/12 grid, and master's own seed rebuilds at md5
+  `8ae09ea5d0888321f09028a3f86fb97d` from `7d3698a4`'s sources. The ablated seed is not
+  md5-equal to it only because the landing's now-dead code is still compiled in; the
+  behavioural form of the claim is the corpus `cmp`.
+* Fixtures: `tests/cases/unions/arm-decl-twin-fnsig-pool-dedup.vl` (this repro) and
+  `tests/cases/closures/map-callback-value-fnsig-pool-twin.vl` (the fourth consumer).
+* **THE NAMED SETS ARE BOTH HALVES AND THERE ARE NOW TWO.**
+  `census/d351-crossfold-price.json` — 18 cells, the 12 this close buys plus the 6 the
+  REFUSED producer fold costs; all 18 run today. `census/d351-halfroute-price.json` — the 12
+  `hof2_decl`/`hofret_decl` cells a partial routing costs. **No derived population can find
+  any of them**: the distilled corpus moves 0 derived classes for this landing and the corpus
+  `cmp` is byte-identical apart from seven modules whose behaviour is unchanged (D201).
 
 ---
 

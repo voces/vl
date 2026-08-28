@@ -818,7 +818,7 @@ traps at run time — `indirect call type mismatch`, after the program has alrea
 `repVariantSlotRep` closes it, and `repSigVariantTok` is the one place the digit is minted so
 the five producers cannot drift apart again.
 
-### The token CHAR is NOT free to change, and that is why D351 stays open
+### The token CHAR is NOT free to change, so cross-table identity is the POOL's question
 
 The obvious next step is to fold across the two tables: a union arm whose layout a DECLARED
 struct also claims already shares that struct's heap type (D280), so rendering the arm's slot
@@ -828,16 +828,65 @@ as `s<row>;` would make the two sides key one functype and close 12 live `trap_l
 and `emitCallRef` reads that character to decide how to coerce an argument: `"variant"`
 selects the arm coercion (unbox the box, build the literal as the arm), `"struct"` selects
 none. An arm parameter spelled `s…;` therefore stops being an arm parameter at the coercion
-ladder, and six programs that this landing makes RUN go check-clean invalid wasm. Buying 12
+ladder, and six programs that D269's landing makes RUN go check-clean invalid wasm. Buying 12
 silent cells with 6 new ones is not a trade this family takes.
 
 The rule the refusal establishes: **a slot token's CHARACTER is a coercion contract, not
 merely a namespace tag.** Two kinds may share a heap type and still need distinct tokens,
 because a consumer reads the token to decide what to do with the VALUE, not only where the
-type lives. Sharing a functype between two kinds is therefore a job for the `$fnsig` POOL —
-dedup at intern time on the rendered bytes — and not for the key producers. Both halves of
-the trade are kept as a named set (`scripts/silent-sweep/census/d351-crossfold-price.json`)
-so the next candidate re-grades them instead of re-discovering them.
+type lives. Both halves of the trade are kept as a named set
+(`scripts/silent-sweep/census/d351-crossfold-price.json`) so the next candidate re-grades them
+instead of re-discovering them.
+
+### D351's close: the pool folds on RENDERED BYTES, and the row's own prescription named the wrong MOMENT
+
+The paragraph above ends by saying the fold belongs to the `$fnsig` POOL, and that is right.
+The D351 row then said where: *"dedup at the INTERN level — `internCloSigKey` sharing one slot
+between two keys whose rendered functypes are byte-identical."* **That cannot be built, and
+the reason is the whole shape of the fix.** At intern time there are no rendered functypes:
+`collectCloSigs` runs before `mAssignTypeIndices`, which is where `sHeapIdx` / `uVarHeap` /
+`rlWrapIdx` are minted, and the entire content of the question "are these two functypes
+byte-identical" is which heap INDEX each slot resolves to. An intern-time comparison would
+have to re-derive the whole index assignment, which is the thing whose answer it needs.
+
+So the fold happens where the bytes exist: **as `emitTypeSection` writes the pool.** Each
+entry is rendered exactly once (`emitCloSigFunctype`), straight into the section buffer, and
+compared against the entries already written (`wRangeEq` over ranges of that same buffer —
+no scratch copy, no second render). The smallest byte-identical position goes in `cloSigTwin`,
+and `cloSigTypeIdxAt` becomes the one place a pool position turns into a type index.
+
+Three consequences worth stating, because each is a choice:
+
+- **The emission does not collapse, only the references.** Skipping a twin's bytes would mean
+  skipping its ALLOCATION in `mAssignTypeIndices`, and the pool's size would then depend on
+  the typed-map value structs that pass mints AFTER the pool — circular. A duplicate functype
+  nobody references costs a handful of bytes and keeps the type section byte-identical, which
+  is also what makes the corpus diff for this landing legible: nine modules changed, every
+  one of them a functype index and nothing else, all nine the same SIZE as before.
+- **This is the general rule the per-table folds were approximating.** `repStructSlotRep`,
+  `repVariantSlotRep` and `rlTwin` each canonicalise ONE table's slots inside the key. Byte
+  identity is the union of all of them plus the cross-table merges, in one comparison — and
+  read off the disassembly, NOT ONE of the seven pre-existing corpus modules it moves is the
+  arm⇄struct case D351 names. Six merge functypes over a LIST WRAPPER (`{(ref array), i32,
+  i32}` — two `>rN;` keys whose wrappers `rlTwin` had already collapsed) and the seventh over
+  the 7-field MAP struct. Each of those is a table with its own key-level fold, and none of
+  those folds reaches across to the others.
+- **All four consumers move together or the landing is worse than nothing.** Route the
+  declaration and not the call (or the reverse) and twelve `hof2_decl`/`hofret_decl` programs
+  that run on every compiler start trapping. Under the first of those the grid's histogram is
+  IDENTICAL to the base while 24 cells have moved, so only a cell-matched grade sees it. Those
+  12 are `scripts/silent-sweep/census/d351-halfroute-price.json`.
+
+One consumer, `.map`/`.filter`'s closure-VALUE callback, scores **zero on every population the
+repo had** — the 210-cell grid never reaches it, the distilled corpus never reaches it, and
+over the whole `tests/cases` tree its answer changed on nothing. It is load-bearing regardless,
+and `tests/cases/closures/map-callback-value-fnsig-pool-twin.vl` is the program that says so:
+it runs on master, traps with that one site unrouted, and is now the single module in the tree
+whose `.map` site sees a duplicate. The fourth,
+the all-i32 arity fallback, **cannot be witnessed at all** — `i*ar>i` is the only key the token
+alphabet can spell that renders `(structref, i32*ar) -> i32`, so it is always its own
+representative. It is routed for the invariant, and the difference between those two cases is
+recorded rather than smoothed over.
 
 ### The corresponding rule on the read side: unwrap the node, not only its receiver
 

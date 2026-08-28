@@ -121,6 +121,7 @@ import {
   capCacheOn,
   cloSigKeys,
   cloSigRepFn,
+  cloSigTwin,
   ctrlDepth,
   curBuf,
   emitCurFnIx,
@@ -344,7 +345,9 @@ import {
   mapTypeIdxOf,
   nulScalarListWrapHeap,
   wBytes,
+  wLen,
   wName,
+  wRangeEq,
   wSLEB,
   wSection,
   wTarget,
@@ -4409,6 +4412,47 @@ function synthSigIdxAt(key: string, i: i32, outNext: i32[]) {
 // to the encoders without this parser skipping its digits correctly.
 function synthSigTokHasIdx(c: i32) { repSigTokHasSlot(repKindOfSigTok(c)) }
 
+// Emit ONE `$fnsig` functype — pool position `sai`'s bytes, and nothing else. Split out
+// of `emitTypeSection`'s pool loop so that loop can render an entry, MEASURE it, and
+// compare it against the entries already written (D351's twin column) without a second
+// render or a scratch copy.
+function emitCloSigFunctype(sai: i32) {
+  const repFe = cloSigRepFn[sai]
+  // A union-arm / annotation signature with NO concrete closure (`collectCloSigs`
+  // interned it from a bare `(…)=>…` type) carries the -1 rep sentinel: synthesize
+  // its functype from the KEY string (byte-identical to the rep path for that key).
+  if repFe < 0 { return emitSynthCloSig(cloSigKeys[sai]) }
+  const rep = P.nodes[fnStmts[repFe]]
+  if rep is FuncDecl {
+    const rparams = rep.fnParams
+    wU8(96)                   // 0x60 func
+    wULEB(rparams.length + 1) // env + declared params
+    wU8(107)                  // param 0 env: structref (0x6b)
+    let pj = 0
+    while pj < rparams.length {
+      fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
+      pj = pj + 1
+    }
+    // The RESULT must byte-match the rep function's own functype result so
+    // the call site's `call_indirect $fnsig` signature check accepts the callee:
+    // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
+    // (`>sN;`) yields the struct ref exactly as the function functype does.
+    if fRetVoid[repFe] == 1 {
+      wU8(0) // 0 results — the `>v` write-trap sig
+    } else {
+      wU8(1) // 1 result
+      // The result valtype the rep function's OWN functype emits — scalar (i32/f64/
+      // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
+      // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
+      const rrk = cloRetValKind(repFe)
+      let rrkCode: VKind = "i32"
+      if rrk != null { rrkCode = rrk }
+      fbValtype(rrkCode, cloRetValSlot(repFe))
+    }
+  }
+  0
+}
+
 // Emit ONE `$fnsig` functype SYNTHESIZED purely from its interned KEY string — the path
 // for a signature interned from a bare union-arm / annotation function type that has NO
 // concrete closure (`cloSigRepFn` sentinel -1), so the rep-function-node reader cannot
@@ -5000,48 +5044,35 @@ function emitTypeSection(
     wU8(127) // field 1 id: 0x7f i32 — identity token AND dispatch index
     wU8(0)   // immutable
     // One env-leading `$fnsig` functype per distinct eligible SIGNATURE, in
-    // `cloSigKeys` order: `(structref, params...) -> ret`, the param/result valtypes
-    // read off the representative function (`cloSigRepFn` — every function sharing
-    // the key has byte-identical kinds, by construction of the key).
+    // `cloSigKeys` order (`emitCloSigFunctype`), and — as each one is written — the
+    // pool's TWIN COLUMN: the smallest earlier entry whose bytes are identical
+    // (silent-class-inventory D351, `cloSigTwin`'s header for why the KEY cannot answer
+    // this). The comparison is over the section buffer the entry has just been rendered
+    // into, so every entry is rendered EXACTLY ONCE and the emitted bytes are unchanged —
+    // a duplicate functype is still emitted at its own index, it simply stops being
+    // referenced. Collapsing the emission too would mean collapsing the ALLOCATION in
+    // `mAssignTypeIndices`, and the pool's size would then depend on the typed-map value
+    // structs that pass mints AFTER it.
+    cloSigTwin = []
+    const poolAt: i32[] = []
+    const poolLen: i32[] = []
     let sai = 0
     while sai < cloSigKeys.length {
-      const repFe = cloSigRepFn[sai]
-      // A union-arm / annotation signature with NO concrete closure (`collectCloSigs`
-      // interned it from a bare `(…)=>…` type) carries the -1 rep sentinel: synthesize
-      // its functype from the KEY string (byte-identical to the rep path for that key).
-      if repFe < 0 {
-        emitSynthCloSig(cloSigKeys[sai])
-        sai = sai + 1
-        continue
-      }
-      const rep = P.nodes[fnStmts[repFe]]
-      if rep is FuncDecl {
-        const rparams = rep.fnParams
-        wU8(96)                   // 0x60 func
-        wULEB(rparams.length + 1) // env + declared params
-        wU8(107)                  // param 0 env: structref (0x6b)
-        let pj = 0
-        while pj < rparams.length {
-          fbValtype(vtKindOfParam(rparams[pj]), paramStructIdxOf(rparams[pj]))
-          pj = pj + 1
+      const start = wLen()
+      emitCloSigFunctype(sai)
+      const nb = wLen() - start
+      let twin = sai
+      let pj = 0
+      while pj < sai {
+        if poolLen[pj] == nb && wRangeEq(poolAt[pj], start, nb) {
+          twin = pj
+          pj = sai // stop at the first (smallest) twin
         }
-        // The RESULT must byte-match the rep function's own functype result so
-        // the call site's `call_indirect $fnsig` signature check accepts the callee:
-        // a VOID field-closure sig (`>v`) has 0 results; a STRUCT-returning one
-        // (`>sN;`) yields the struct ref exactly as the function functype does.
-        if fRetVoid[repFe] == 1 {
-          wU8(0) // 0 results — the `>v` write-trap sig
-        } else {
-          wU8(1) // 1 result
-          // The result valtype the rep function's OWN functype emits — scalar (i32/f64/
-          // i64), string, an i32/string/f64 list, a union box, a nullable scalar/struct,
-          // or a struct ref (`cloRetValKind`/`cloRetValSlot`, the shared mapping).
-          const rrk = cloRetValKind(repFe)
-          let rrkCode: VKind = "i32"
-          if rrk != null { rrkCode = rrk }
-          fbValtype(rrkCode, cloRetValSlot(repFe))
-        }
+        pj = pj + 1
       }
+      cloSigTwin.push(twin)
+      poolAt.push(start)
+      poolLen.push(nb)
       sai = sai + 1
     }
     // One env struct per CAPTURING lifted function (`fnEnvIdx[fe] >= 0`), in `fnStmts`
