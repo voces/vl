@@ -99,16 +99,35 @@ what a specific candidate DID to them**, and no rule that reads current behaviou
 candidate that breaks one exits non-zero. `redistil.py` rebuilds `cells/` from scratch and
 never touches `named/`.
 
-**The discipline this establishes:** when a purpose-built grid names a backward set, the set
-goes in `named/` — not a collapse of it, and not the grid. That is the same reasoning
-`CLAUDE.md` already gives for keeping named sets around; this just makes the standing gate the
-place they live.
+### A second instance, the same day — this is the norm, not the exception
+
+D224's refused candidate closes its witness and costs **207 block-B cells**, every one
+`loud emit reject → check-clean invalid wasm`. Checked by name against the corpus: **0 of the
+207 is a distilled representative.** Block B has 526 of them, and all 207 collapse into classes
+whose representative is some other cell — because on today's compiler these 207 behave exactly
+like their class-mates, and only that one candidate separates them.
+
+Two independent instances in a day, from two different agents on two different families, is
+enough to treat it as the standing shape rather than a curiosity. **Every refused candidate
+that named its price is a named set**, and the price is the thing worth keeping: it is what
+stops the next person paying it again without noticing.
+
+These 207 are `loud emit reject`, not `runs`, so they can only ever produce the `→ silent`
+REPORT and never the non-zero exit. That is the correct ranking — but a report nobody can
+generate is not a report, and before this entry the gate could not generate it.
+
+### The rule
+
+**When a grid or a refused candidate NAMES a set, the set goes in `named/`** — not a collapse
+of it, and not the whole grid. `CLAUDE.md` already said to keep named sets around; this makes
+the standing gate the place they live, so keeping one stops being a thing someone has to
+remember to re-run.
 
 ## Cost
 
 ```
 full census   ~35 min   (~500,000 vl invocations)
-distilled       ~7 s    (3,098 vl invocations, JOBS=6: 1,477 derived + 72 curated)
+distilled       ~7 s    (3,512 vl invocations, JOBS=6: 1,477 derived + 279 curated)
 ```
 
 It is therefore IN the gate (`scripts/gate.sh`), not beside it.
