@@ -10799,12 +10799,12 @@ invalid wasm, and only with both does it run):
 
 ---
 
-### D199 — the `$fnsig` key mints one per variant ROW, but layout-twin arms share ONE heap
-**OPEN · loud emit reject on `1e81b0f3` AND on this branch · found by BUILDING D196's first shape rather than reasoning about it, and it is the second refutation of the day**
+### D199 — [CLOSED 2026-08-28] the `$fnsig` key mints one per variant ROW, but layout-twin arms share ONE heap
+**closed 2026-08-28 · the filed repro RUNS and prints `7` twice · was `loud emit reject` on `1e81b0f3`, on `322c07f2` and on `4bdfcc67` · the row's OWN prediction was CONFIRMED, which is the rarer outcome in this family: built with the decline removed and the digits still raw, the program prints `7` and then traps `indirect call type mismatch` · 24 of the 210-cell D199 grid, and the residue it left is D351**
 
-Repro (`emitProgram: field access but no struct type declared` on `1e81b0f3` and on this
-branch — and `wasm trap: indirect call type mismatch`, AFTER printing `7`, under D196's
-first shape):
+Repro (now `runs`; `emitProgram: field access but no struct type declared` on `1e81b0f3`,
+`322c07f2` and `4bdfcc67` — and `wasm trap: indirect call type mismatch`, AFTER printing `7`,
+with the decline removed and the digits left raw):
 
     type A = { v: i32 }
     type B = { v: i32 }
@@ -10833,13 +10833,115 @@ first shape):
   (`cloRetKeySuffix`, `cloParamTok`, `annParamKind`), which key it raw today — **all four
   have to move together or they disagree again**, which is the same arm-for-arm rule D195
   turns on.
-* Until then the arena arm DECLINES on a layout-twinned arm (`repVariantSlotsTwin` — the
-  pairwise form of `buildVariantTwins`, and deliberately "independent of
-  `buildVariantTwins` having run", so it is answerable at `$fnsig` INTERN time). The caller
-  falls through to the name classifier, i.e. the behaviour on `1e81b0f3`, so a twinned arm
-  is **no worse than it was** and an untwinned one keeps the fix.
-* Fixture: `tests/cases/unions/arm-layout-twin-fnsig-decline.vl`, to flip when the four
-  producers canonicalise together.
+* **THE FIX IS THE CANONICALISATION THE DECLINE WAS STANDING IN FOR, AND ALL FIVE PRODUCERS
+  MOVE BECAUSE THERE IS NOW ONE PLACE TO MOVE.** `repVariantSlotRep` is the variant layer's
+  `repStructSlotRep` — the smallest `repVariantSlotsTwin`-equivalent row, computed on demand
+  and NOT memoized, so the render at `$fnsig` INTERN time (`collectCloSigs`, before
+  `buildVariantTwins` has filled `uVarTwin`) and the render at emit time agree. `repSigVariantTok`
+  is the only place a `V<slot>;` digit is minted, and `cloParamTok`, `cloRetKeySuffix`,
+  `annParamKind`, `paramTokOfTy` and `retTokOfTy` all call it. The row said "all four have to
+  move together"; there are FIVE, and putting the digit behind one function is what makes that
+  a property of the code rather than of a reviewer.
+* **IT LIVES IN `emit_classify`, NOT IN `repSigSlotTokOfKind`, AND THE REASON IS LAYERING** —
+  `repSigSlotTokOfKind` is in `emit_rep`, and the variant twin relation reads
+  `variantFieldLayoutEq`, whose ref-list / nested-struct / map-value rungs are all in
+  `emit_classify`, ABOVE it. The struct half stays where it is.
+* **THE ROW'S PREDICTION WAS BUILT AND CONFIRMED, WHICH IS WHY THE DECLINE COULD BE DELETED
+  RATHER THAN WIDENED.** With `variantRowHasEarlierTwin` removed and the digits still raw, the
+  repro prints `7` and then traps: the disassembly has THREE structurally identical functypes
+  (`$5`, `$6`, `$7`), `viaB`'s lambda is declared `$6` while `viaB` `call_indirect`s `(type $7)`.
+  With the canonicalisation there is ONE (`$4`), both lambdas declare it and both
+  `call_indirect`s name it.
+* **COUNTERS**: on this repro `Vreach=116 Vans=54` — the mint is reached 116 times and the
+  canonical row differs from the raw one 54 of them. On the control `hof2_decl` (`Circle`
+  beside a declared `Dot`) it is `Vreach=58 Vans=0`, and that program's bytes do not move.
+* **THE GRID SAYS WHAT ONLY THIS RUNG BUYS**: ablate it from the landing and 24 of the
+  210-cell D199 grid go back — `hof2`, `hofret`, `hofcross`, `bindcross`, every one at
+  `twin=arm`. **0 runs lost, 0 → silent** on the grid, on the distilled corpus (1,477 classes
+  standing for 250,808 census cells plus 570 curated) and on a 1,923-module corpus `cmp`,
+  which is byte-identical apart from the three fixtures this landing flips.
+* **THE RESIDUE IS D351, AND IT IS THE SAME SEAM ONE TABLE OVER.** An arm whose layout a
+  DECLARED struct also claims shares that struct's heap type (D280) while keying `V…;` against
+  its `s…;` — 12 live `trap_loads` cells. The fold that closes them was built and REFUSED with
+  a price; see D351.
+* Fixture: `tests/cases/unions/arm-layout-twin-fnsig-decline.vl`, flipped to `@run`.
+
+---
+
+### D351 — the SAME `$fnsig` seam one table over: an arm and its DECLARED struct twin share a heap type and key TWO functypes
+**loads then traps (`wasm trap: indirect call type mismatch`) on `4bdfcc67` and on this branch · a SILENT class, found by BUILDING D199's grid rather than by any count · the fold that would close it was built, graded and REFUSED with a price of six `runs` cells · 12 of the 210-cell D199 grid, kept whole as a named set**
+
+Repro (eight lines; `vl check` rc 0, the module LOADS, then `wasm trap: indirect call type
+mismatch` inside `viaC` — nothing is printed):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    const c0: Circle = { r: 7 }
+    function viaC(f: (Circle) => Circle, x: Circle) { print(f(x).r) }
+    const g: (Dot) => Dot = (q: Dot) => q
+    viaC(g, c0)
+
+* **IT IS D199's MECHANISM ACROSS D280's MERGE.** D199 was two ARMS of one layout keying
+  `V0;` and `V1;` over one `uVarHeap` row; this is one ARM and one declared STRUCT of that
+  layout keying `V0;` and `s0;` over one heap type, because `mAssignTypeIndices`'
+  `uVarSTwinAt` arm gives the arm the struct's `sHeapIdx` row (D280). Two structurally
+  identical functypes at two indices of one rec group are DISTINCT types in WasmGC, so the
+  `call_indirect` operand and the callee's declared functype disagree.
+* **THE CONTROL IS ONE LINE AWAY AND IT RUNS.** Give each closure its OWN callee —
+  `viaC((p: Circle) => p, c0)` beside `viaD((q: Dot) => q, d0)` — and the program prints `7`
+  twice on every compiler, because the two `$fnsig`s never have to agree. It is only when a
+  closure VALUE crosses from one spelling to the other that the redundant functype becomes a
+  trap. That control is `hof2_decl` / `hofret_decl` in the grid, 12 cells, `runs` throughout.
+* **THE OBVIOUS FIX WAS BUILT AND REFUSED, AND THE REFUSAL IS THE MEASUREMENT.** Fold the arm
+  token onto the struct row — `repSigVariantTok` returning
+  `repSigSlotTokOfKind("struct", variantStructHeapTwinAt(rep))` — and all 12 `trap_loads`
+  cells go to `runs`. It also takes **six `runs` cells to check-clean invalid wasm**
+  (`vcall_narrow_decl`, all three `fld` legs and both `order` legs), every one of them a
+  program THIS landing makes run. The cause is direct: the token CHAR is what
+  `sigParamKindAt` reports, so an arm parameter spelled `s…;` stops being a `variant`
+  parameter and D269's value-call arm coercion never fires on it — the box goes raw into a
+  `(ref $heap)` slot. A cell falling into silence is not a trade this family takes.
+* **WHAT WOULD ACTUALLY CLOSE IT** is dedup at the INTERN level rather than at the key —
+  `internCloSigKey` sharing one slot between two keys whose rendered functypes are
+  byte-identical — which is a change to the `$fnsig` pool, not to a producer, and is out of
+  this landing's scope. The alternative (making the STRUCT side key `V…;`) is strictly worse
+  and was rejected without a build: it turns every declared-struct closure parameter into a
+  `variant` one at `sigParamKindAt`, i.e. runs LOST rather than a cell into silence.
+* **THE NAMED SET IS BOTH HALVES**, kept whole at
+  `scripts/silent-sweep/distilled/named/d199_{hofcross,bindcross,vcall_narrow}_decl_*.vl`
+  (18 cells), coordinates at `scripts/silent-sweep/census/d351-crossfold-price.json`. The 12
+  are the tripwires; the 6 are the price, and keeping them is what stops the next candidate
+  paying it without noticing. **No derived population can find either half**: the distilled
+  corpus moves 0 cells for every rung of this family and the corpus `cmp` is byte-identical
+  (D201).
+
+---
+
+### D352 — the CHECKER's narrowing path key is paren-blind too, and it is a loud check reject
+**loud check reject (`field 'r' is not on every member of Shape`) on `4bdfcc67` and on this branch · found while writing D222's fixture: the emitter half moved and this spelling did not**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Holder = { v: Shape }
+    function parenInner(t: Holder) { if t.v is Circle { print((t).v.r) } }
+    parenInner({ v: { r: 7 } })
+
+* **IT IS D222 ON THE OTHER SIDE OF THE PIPELINE.** D222 closed six paren-blind reads in the
+  EMITTER — three receiver tests plus `memberPathKeyOf`'s own node — and this program is
+  refused a stage earlier, by the CHECKER, which never reaches them. Delete the parens
+  (`t.v.r`) and it prints `7`; parenthesise the whole receiver instead (`(t.v).r`) and it
+  prints `7` too, on this branch, which is D222. Only the INNER link is still refused.
+* **NOT A SILENT ROW**, and filed anyway for the reason D222 was: it is a capability gap
+  standing beside a family of silent ones, and what makes it worth a row is that the two
+  halves share a key derivation. The fix is the checker's own member-path key, not the
+  emitter's — a different file and a different measurement.
+* Pinned in prose at the head of `tests/cases/unions/paren-narrowed-receiver-read.vl`, where
+  the working spellings sit, so the fixture says why the seventh one is absent.
 
 ---
 
@@ -11095,10 +11197,10 @@ Repro:
 
 ---
 
-### D269 — direction 2 of D200: the shapes still under the value-call arm floor
-**loud emit reject (`emitProgram: value-call union-ARM parameter given a value that is not that arm`) on `322c07f2` and on this branch · D200's second witness, re-filed as its own row because D244 removed one of its three shapes and the floor's coverage must not shrink silently**
+### D269 — [CLOSED 2026-08-28] direction 2 of D200: the shapes still under the value-call arm floor
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · was `loud emit reject` (`emitProgram: value-call union-ARM parameter given a value that is not that arm`) on `322c07f2` and on `4bdfcc67` · the row's own "THE FLOOR IS THE RIGHT OUTCOME TODAY" was right about the floor and wrong about what it was standing in for: the coercion it needed was already written in the DIRECT twin, six thousand lines down · 36 of the 210-cell D199 grid**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -11122,7 +11224,35 @@ Repro:
   (`arm-param-value-call-narrowed-arg-floor.vl`, added in the same landing) are still floored,
   and each now has a file so the population is countable rather than prose.
 * **THE DIRECT-CALL TWIN OF THESE FIVE LINES RUNS** — replace the lambda with `function idc(x:
-  Circle): Circle { x }` — so this is a value-call ABI gap, not an arm-resolution one.
+  Circle): Circle { x }` — so this is a value-call ABI gap, not an arm-resolution one. **AND
+  THAT SENTENCE WAS THE FIX.** `emitCall` handles the whole shape with exactly two seeds, and
+  both port over unchanged:
+  * `argCtx.variantIdx = cVi` — an object LITERAL argument builds the bare variant struct
+    (kind 8), consumed by `emitObj`. That is the `objlit` shape.
+  * `if exprUnion(arg) { struct.get $uBox 1 ; ref.cast $uVarHeap[cVi] }` — a value that IS the
+    box is unboxed against the declared arm. That is the `narrowed` shape, and the two
+    instructions are the ones `emitNarrowedMem` already uses to reach the same payload for a
+    READ.
+* **THE SLOT COMES OFF THE `$fnsig` KEY, NOT THE ARENA** (`sigParamSlotAt`, the param dual of
+  `sigKeyRetSlot`), because the digit IS the row the `call_ref`'s cast functype declares for
+  that position — the same "kind from the key, identity from the arena" interlock the
+  union-box arm one line up already states. It needed one new decoder and the param-spine walk
+  is now shared by both projections, so the kind and the slot cannot disagree about where a
+  token ends.
+* **THE FLOOR STAYS, AND THE `ObjLit` REFUTATION STILL STANDS.** The refuted exemption declined
+  the reject and fell through to a RAW `emitExpr`, which is why it turned a loud cell silent.
+  The literal is now BUILT as the arm; an argument that is neither the arm, nor a box holding
+  it, nor a literal that can be built as it is still rejected loudly.
+* **COUNTERS**: `Creach=1 Cans=1` on the repro and on the `objlit` spelling; `Creach=1 Cans=0`
+  on the `vcall_bind` control (an arm-ANNOTATED binding already resolves to the arm, so the
+  new arm is reached and declines, and the bytes do not move).
+* **THE GRID**: ablate this rung and 36 of the 210 cells go back — every `vcall_narrow` and
+  every `vcall_objlit`, at all three `twin` legs. **0 runs lost, 0 → silent** on every
+  population. The `dcall_narrow` control — the direct twin these two seeds were taken from —
+  runs on all 18 of its cells under every ablation.
+* Both fixtures flipped to `@run`: `arm-param-value-call-narrowed-arg-floor.vl` and
+  `arm-param-value-call-objlit-arg-floor.vl`. Their headers keep the floor's history, because
+  the refuted exemption is the reason the fix has the shape it has.
 
 ---
 
@@ -11188,7 +11318,7 @@ Repro:
 ---
 
 ### D220 — [CLOSED 2026-08-27] `is` over a union-typed FIELD read `sHeapIdx[-1]`, which is a COMPILER TRAP, not a message
-**now a loud emit reject · was `compiler trap` (`wasm trap: out of bounds array access`) on `16d5c6e7` · found while widening D219's classifier, on a program that already reproduced without it**
+**now `runs` and prints `7` · was `compiler trap` (`wasm trap: out of bounds array access`) on `16d5c6e7`, then a loud emit reject until D222 closed on 2026-08-28 · found while widening D219's classifier, on a program that already reproduced without it**
 
 Repro (the receiver is PARENTHESISED, which is what made this reachable on master):
 
@@ -11202,7 +11332,8 @@ Repro (the receiver is PARENTHESISED, which is what made this reachable on maste
     }
     f({ r: 5 })
     // `16d5c6e7`: wasm trap: out of bounds array access — the COMPILER dies.
-    // Now: emitProgram: field access but no struct type declared (D222 is why it is not `runs`).
+    // Then: emitProgram: field access but no struct type declared (D222 was why it was not `runs`).
+    // Now: runs, prints 7 — D222 closed 2026-08-28 and this row's own prediction came true.
 
 * **THE READ IS UNGUARDED.** The `x.y is i32` lowering resolved its receiver with
   `structIndexOfExpr` and then indexed `sHeapIdx[msi]` and `sFieldIndex(msi, …)` with no
@@ -12000,10 +12131,10 @@ Repro (census block E cell `e002074`, verbatim):
 
 ---
 
-### D222 — a narrowed union receiver in PARENTHESES resolves no variant, and the read floors
-**loud emit reject · live on `16d5c6e7` and after D219/D220/D221 · one paren is the whole difference**
+### D222 — [CLOSED 2026-08-28] a narrowed union receiver in PARENTHESES resolves no variant, and the read floors
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · was `loud emit reject` on `16d5c6e7`, after D219/D220/D221, and on `4bdfcc67` · **the row's "`unwrapParen` at three sites" was HALF the count**: three FUNCTIONS, six paren-blind reads, and the second three all land in `memberPathKeyOf` · 54 of the 210-cell D199 grid, and it moved D220 too**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -12020,6 +12151,16 @@ Repro:
   not an Ident and not a Member, and all three answer "not narrowed". The rest of the emitter
   unwraps parens everywhere (`unwrapParen` appears at the head of most classifier arms), so
   this is a missing call, not a design position.
+* **AND THAT COUNT WAS HALF THE DEFECT — THREE FUNCTIONS, SIX READS.** Each of the three also
+  hands the SAME raw receiver to `memberPathKeyOf`, which peeled a `Paren` off its RECEIVER but
+  not off its own node, so `(t.v).r` under `if t.v is Circle` stayed loud with the first three
+  unwraps in place. Measured, not reasoned: the grid's `read_paren_path` leg — 18 cells — is
+  unmoved by the receiver unwrap alone, and the counter build reads `Preach=9 Pans=0
+  Kreach=10 Kans=10` on it. The receiver rung is REACHED and answers nothing; the PATH KEY is
+  what answers. Fixed once, in the key, rather than three more times at the callers.
+* **IT MOVED D220, WHICH THIS ROW PREDICTED IN WRITING.** D220's witness is
+  `if (v).r is i32` — the same parenthesised receiver — and its row already said "D222 is why
+  it is not `runs`". It now prints `7`; D220's status line is updated in place.
 * **IT IS THE REASON D220's WITNESS IS LOUD RATHER THAN `runs`.** With the paren removed that
   program runs on `16d5c6e7` too; with it, the receiver reaches the `is`-on-a-field lowering
   as an un-narrowed member and used to index `sHeapIdx[-1]`. Fixing D222 is a separate change
@@ -12027,8 +12168,20 @@ Repro:
   filed rather than folded in because it moves a different population and this one was already
   measured against a 1,664-cell grid it does not appear in.
 * **NOT A SILENT ROW.** The outcome is a diagnosed refusal at every spelling probed, which is
-  why it is filed with a `loud emit reject` status: it is a capability gap standing next to a
+  why it WAS filed with a `loud emit reject` status: it is a capability gap standing next to a
   silent one, and the value of filing it is that the two share a receiver shape.
+* **THE GRID**: ablate the receiver rung and 54 of the 210 cells go back (`read_paren`,
+  `read_paren2`, `read_paren_path`); ablate only the key rung and 18 do (`read_paren_path`).
+  K's set is a SUBSET of P's, which is the measured sense in which these two are one landing
+  and the other rungs are not. **0 runs lost, 0 → silent** on every population; `read_bare`
+  and `read_bare_path` run under every ablation with all counters at zero.
+* **THE INNER LINK IS A DIFFERENT DEFECT AND STAYS OPEN.** `(t).v.r` under
+  `if t.v is Circle` is a LOUD CHECK reject — `field 'r' is not on every member of Shape` —
+  on `4bdfcc67` and on this branch alike, because the CHECKER's own path key is paren-blind
+  in the same way the emitter's was. Filed as D352.
+* Fixture: `tests/cases/unions/paren-narrowed-receiver-read.vl`, six spellings each beside
+  its unparenthesized control. `paren-is-narrow.vl` beside it pins the parens in the
+  CONDITION, which is a different set of readers.
 
 ---
 

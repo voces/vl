@@ -568,7 +568,10 @@ function cloParamTok(paramIx: i32) {
   // the param SHAPES match, not just the kind. `nulstruct` carries the SAME
   // struct slot as its non-null twin — `repSigTokHasSlot` names both, and
   // `paramStructIdxOf` resolves a `S | null` annotation to S's row.
-  if k == "struct" || k == "variant" || k == "reflist" || k == "nulstruct" {
+  // A VARIANT slot renders its layout-twin REPRESENTATIVE (`repSigVariantTok` — D199),
+  // because that is the row whose `uVarHeap` index the functype BYTES carry.
+  if k == "variant" { return repSigVariantTok(paramStructIdxOf(paramIx)) }
+  if k == "struct" || k == "reflist" || k == "nulstruct" {
     return repSigSlotTokOfKind(k, paramStructIdxOf(paramIx))
   }
   // A NULLABLE-closure param (`((i32) => i32) | null`) stays OUTSIDE the value-call ABI
@@ -983,7 +986,8 @@ function cloRetKeySuffix(fe: i32) {
   // The slot-CARRYING result kinds: a struct / nullable-struct result keyed by
   // its struct index, a concrete-VARIANT result by its variant index — so two
   // callbacks share a sig iff they return the SAME shape.
-  if k == "struct" || k == "nulstruct" || k == "variant" {
+  if k == "variant" { return ">" + repSigVariantTok(cloRetValSlot(fe)) }
+  if k == "struct" || k == "nulstruct" {
     return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe))
   }
   // A MAP result carries its map SHAPE slot (`cloRetValSlot` → the mv slot; mono = -1), so
@@ -9743,11 +9747,20 @@ export function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32) {
 
 // True if the member access at `memIx` reads a field of a CURRENTLY-narrowed union
 // identifier (the receiver `Ident` has an active binding on the narrowing stack).
+//
+// THE RECEIVER IS UNWRAPPED (silent-class-inventory D222). `(v).r` parses the receiver as a
+// `Paren`, which is neither an `Ident` nor a `Member`, so this and its two twins
+// (`memNarrowVariantIndex`, `emitNarrowedMem`) all answered "not narrowed" and the read fell
+// to the plain-struct path — `emitProgram: field access but no struct type declared` on a
+// program that prints `7` with the parentheses deleted. The rest of the emitter unwraps
+// parens everywhere (`unwrapParen` heads most classifier arms), so this was a missing call,
+// not a design position. The NESTED-path half of the same blindness is one call further in,
+// in `memberPathKeyOf`, which each of the three also hands a raw receiver.
 export function memIsNarrowed(memIx: i32) {
   if narrowTop == 0 { return false }
   const m = P.nodes[memIx]
   if m is Member {
-    const recv = P.nodes[m.memObj]
+    const recv = P.nodes[unwrapParen(m.memObj)]
     if recv is Ident {
       if narrowVariantFor(recv.identName) != "" { return true }
     }
@@ -9769,7 +9782,9 @@ export function memIsNarrowed(memIx: i32) {
 export function memNarrowVariantIndex(memIx: i32) {
   const m = P.nodes[memIx]
   if m is Member {
-    const recv = P.nodes[m.memObj]
+    // Unwrapped for D222, in lock-step with `memIsNarrowed` — a predicate that says
+    // "narrowed" and an index that says -1 is the worse of the two failures.
+    const recv = P.nodes[unwrapParen(m.memObj)]
     if recv is Ident { return variantIndexOf(narrowVariantFor(recv.identName)) }
     if recv is Member {
       const pk = memberPathKeyOf(m.memObj)
@@ -11476,14 +11491,23 @@ export function sigParamCoerceKind(key: string, idx: i32): VKind | null {
 // from the checker type — `cloCallParamUnionName`. Kind from the key, identity from the
 // arena; each from the only side that has it.)
 export function sigParamKindAt(key: string, idx: i32): VKind | null {
+  const ti = sigParamTokIx(key, idx)
+  if ti < 0 { return null }
+  repKindOfSigTok(key[ti])
+}
+
+// The CHARACTER INDEX where parameter `idx`'s token starts, or -1 (the walk met the `>`
+// result separator or ran out of key). THE ONE param-spine walk: the kind projection above
+// and the slot projection below both read it, so the two cannot disagree about where a
+// token ends — which is the drift `repSigTokHasSlot`'s header exists to prevent.
+function sigParamTokIx(key: string, idx: i32): i32 {
   let i = 0
   let p = 0
   while i < key.length {
     const c = key[i]
-    if c == '>' { return null }
-    const k = repKindOfSigTok(c)
-    if p == idx { return k }
-    if repSigTokHasSlot(k) {
+    if c == '>' { return -1 }
+    if p == idx { return i }
+    if repSigTokHasSlot(repKindOfSigTok(c)) {
       while i < key.length && key[i] != ';' { i = i + 1 }
       i = i + 1
     } else {
@@ -11491,7 +11515,16 @@ export function sigParamKindAt(key: string, idx: i32): VKind | null {
     }
     p = p + 1
   }
-  null
+  -1
+}
+
+// The interned SLOT of parameter `idx` — the `;`-terminated decimal a slot-carrying token
+// carries (`s3;`, `V0;`, `r1;`) — or -1 for a slot-free kind or no such parameter. The
+// PARAM dual of `sigKeyRetSlot`, and the same interlock argument: the digit IS the table row
+// whose heap type the `call_ref`'s cast functype declares for that position, so a coercion
+// decided from it cannot disagree with the bytes.
+export function sigParamSlotAt(key: string, idx: i32): i32 {
+  sigSlotAtTok(key, sigParamTokIx(key, idx))
 }
 
 // The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
@@ -22191,6 +22224,55 @@ export function repVariantSlotsTwin(a: i32, b: i32): i32 {
   variantFieldLayoutEq(a, b)
 }
 
+// The canonical (smallest layout-twin) representative of variant row `vi` — THE VARIANT
+// LAYER'S `repStructSlotRep`, and the row whose heap index `mAssignTypeIndices` folds
+// `vi`'s onto (`uVarTwin[vi] < vi` ⇒ `uVarHeap.push(uVarHeap[uVarTwin[vi]])`).
+//
+// WHY THE `$fnsig` PRODUCERS RENDER THIS AND NOT THE RAW ROW (silent-class-inventory
+// D199). `repSigSlotTokOfKind` canonicalises a STRUCT slot through `repStructSlotRep` for
+// exactly this reason and passes a VARIANT slot through unchanged, so two layout-twin arms
+// keyed TWO `$fnsig`s (`V0;>V0;` and `V1;>V1;`) while sharing ONE `uVarHeap` heap type.
+// Two structurally identical functypes at two indices of ONE rec group are DISTINCT types
+// in WasmGC, so the `call_indirect` type operand and the callee's declared functype
+// disagree: the module VALIDATES and traps at run time with `indirect call type mismatch`.
+// Measured, not reasoned — `type A = {v:i32}` beside `type B = {v:i32}` in one union, one
+// closure parameter each, prints `7` and then traps with the raw digit.
+//
+// Computed on demand from `repVariantSlotsTwin` rather than read out of `uVarTwin`, and
+// deliberately NOT memoized: the producers render it at `$fnsig` INTERN time
+// (`collectCloSigs`, before `buildVariantTwins` has filled `uVarTwin`) and again at emit
+// time, and the two must agree — which is the same timing-independence discipline
+// `repStructSlotRep`'s header states, reached by the same route.
+export function repVariantSlotRep(vi: i32): i32 {
+  if vi < 0 || vi >= uVariants.length { return vi }
+  let j = 0
+  while j < vi {
+    if repVariantSlotsTwin(j, vi) == 1 { return j }
+    j = j + 1
+  }
+  vi
+}
+
+// The `$fnsig` SLOT TOKEN of a union-ARM param/result — the ONE place a `V<slot>;` digit is
+// minted, so the five producers (`cloParamTok`, `cloRetKeySuffix`, `annParamKind`,
+// `paramTokOfTy`, `retTokOfTy`) cannot disagree on it. It lives HERE rather than inside
+// `repSigSlotTokOfKind` (emit_rep, where the struct twin's canonicalisation lives) purely by
+// layering: the variant twin relation reads `variantFieldLayoutEq`, whose ref-list /
+// nested-struct / map-value rungs are all in this module, ABOVE emit_rep.
+//
+// IT DOES NOT FOLD ACROSS THE STRUCT TABLE, AND THAT REFUSAL IS MEASURED (D351). An arm
+// whose layout a DECLARED struct also claims shares that struct's heap type (D280's
+// cross-table merge) while keying `V…;` against the struct's `s…;` — the same distinct-type
+// trap one table over, and 12 live `trap_loads` cells of the D199 grid. Folding to
+// `repSigSlotTokOfKind("struct", variantStructHeapTwinAt(rep))` buys all 12 and costs SIX
+// `runs` -> check-clean invalid wasm: the token char is what `sigParamKindAt` reports, so an
+// arm parameter spelled `s…;` stops being a `variant` parameter and the value-call arm
+// coercion below never fires on it. A cell falling into silence is not a trade this family
+// takes.
+export function repSigVariantTok(vi: i32): string {
+  repSigSlotTokOfKind("variant", repVariantSlotRep(vi))
+}
+
 export function buildVariantTwins() {
   const keys: i32[] = []
   let i = 0
@@ -31360,7 +31442,7 @@ function annParamKind(t: string) {
   if si >= 0 { return repSigSlotTokOfKind("struct", si) }
   // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
   const vti = variantIndexOf(t)
-  if vti >= 0 { return repSigSlotTokOfKind("variant", vti) }
+  if vti >= 0 { return repSigVariantTok(vti) }
   // A ref-LIST param (`S[]`, `(C|D)[]`, a closure / nested list) — the recursive dual of
   // `annRetKind`'s ref-list result and `cloParamTok`'s ref-list param. BEFORE the arrow
   // case so a closure-ELEMENT array's nested `=>` is not misread as a single closure. The
@@ -31576,35 +31658,6 @@ function annSigKey(name: string) {
 //   * FUNCTIONS and NULLABLES — the name arm reads a paren-wrapped rendering.
 //
 // Dual-written inside `sigKeyOfTy` over the corpus: **152 agree, 0 disagree, 3 decline.**
-// True when variant row `vi` has an EARLIER LAYOUT TWIN — another arm that will share its
-// `uVarHeap` heap type once `buildVariantTwins` runs. `repVariantSlotsTwin` is the pairwise
-// form of that pass and is deliberately "independent of `buildVariantTwins` having run", so
-// this is answerable at `$fnsig` INTERN time, which is where it has to be.
-//
-// WHY THE `$fnsig` KEY PRODUCERS BELOW HAVE TO ASK. `repSigSlotTokOfKind` canonicalises a
-// STRUCT slot through `repStructSlotRep` for exactly this reason and passes a VARIANT slot
-// through unchanged, so two layout-twin arms key TWO different `$fnsig`s (`V0;>V0;` and
-// `V1;>V1;`) while sharing ONE heap type. Two structurally identical functypes at two
-// indices of ONE rec group are DISTINCT types in WasmGC, so the `call_indirect` type
-// operand and the callee's declared functype disagree: the module VALIDATES and traps at
-// run time with `indirect call type mismatch`. Measured — `type A = {v:i32}` beside
-// `type B = {v:i32}` in one union, one closure parameter each, went `loud emit reject` to
-// `trap_loads` before this decline existed.
-//
-// DECLINING rather than canonicalising is deliberate and is the smaller claim: the caller
-// falls through to the NAME classifier, which is the behaviour on `1e81b0f3`, so a twinned
-// arm is no worse than it was. Canonicalising the variant slot is the real fix and belongs
-// with the OTHER key producers (`cloRetKeySuffix`, `cloParamTok`, `annParamKind`), which key
-// it raw today — all four have to move together or they disagree again.
-function variantRowHasEarlierTwin(vi: i32): boolean {
-  let j = 0
-  while j < vi {
-    if repVariantSlotsTwin(j, vi) == 1 { return true }
-    j = j + 1
-  }
-  false
-}
-
 function paramTokOfTy(ty: i32) {
   if ty < 0 { return "" }
   const t = T.tys[ty]
@@ -31649,10 +31702,7 @@ function paramTokOfTy(ty: i32) {
   // name classifier's `isUName` arm gives it.
   if t is TyObj {
     const vrow = variantRowOfTy(ty)
-    if vrow >= 0 {
-      if variantRowHasEarlierTwin(vrow) { return "" }
-      return repSigSlotTokOfKind("variant", vrow)
-    }
+    if vrow >= 0 { return repSigVariantTok(vrow) }
     return ""
   }
   ""
@@ -31702,10 +31752,7 @@ function retTokOfTy(ty: i32) {
   // key is a `$fnsig` that still disagrees with the lambda's own functype on the other half.
   if t is TyObj {
     const vrow = variantRowOfTy(ty)
-    if vrow >= 0 {
-      if variantRowHasEarlierTwin(vrow) { return "" }
-      return ">" + repSigSlotTokOfKind("variant", vrow)
-    }
+    if vrow >= 0 { return ">" + repSigVariantTok(vrow) }
     return ""
   }
   ""
@@ -32588,9 +32635,14 @@ function calleeIsIndexedRefArrayCall(callIx: i32, fnIx: i32): boolean {
 // result kind carries no slot (`repSigTokHasSlot`, the encode side's own predicate) or
 // the digits are malformed. The ONE result-slot digit parser; callers gate on
 // `sigKeyRetKind` for WHICH table the slot indexes (struct / variant / ref-list / map).
-function sigKeyRetSlot(k: string) {
-  const ti = sigKeyRetTokIx(k)
-  if ti < 0 { return -1 }
+function sigKeyRetSlot(k: string) { sigSlotAtTok(k, sigKeyRetTokIx(k)) }
+
+// The `;`-terminated decimal SLOT of the token starting at `ti`, or -1 when `ti` names no
+// token or that kind carries no slot / malformed digits. The ONE slot-digit parse, read by
+// both key decoders that want one (`sigKeyRetSlot` for the result token, `sigParamSlotAt`
+// for the param spine).
+function sigSlotAtTok(k: string, ti: i32): i32 {
+  if ti < 0 || ti >= k.length { return -1 }
   if !repSigTokHasSlot(repKindOfSigTok(k[ti])) { return -1 }
   let j = ti + 1
   let acc = 0
