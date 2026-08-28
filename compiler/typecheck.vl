@@ -12116,6 +12116,11 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
         // cannot differ by depth. `{[string]: i32}[]`, `{[string]: Cat}[][]`,
         // `{[string]: i32[]}[]` are all this arm.
         if arrSpineIsMap(m0) { return m0 }
+        // D188: the INLINE OBJECT SHAPE leaf, the FOURTH and last leaf kind of the array
+        // spine — see `arrSpineIsObj`. It is faithful under the SAME renderer the scalar
+        // leaf is for a leaf of plain fields, and under the NOMINAL one for a leaf that
+        // names a declared struct — see `transparentMemberEmitName`'s array leg.
+        if arrSpineIsObj(m0) { return m0 }
       }
       if mt is TyMap { return m0 }
       if mt is TyObj {
@@ -12346,6 +12351,49 @@ function arrSpineIsMap(ty: i32) {
   false
 }
 
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is an INLINE
+// OBJECT SHAPE — the FOURTH `arrSpineIs*` twin, and the residue
+// `arrSpineIsScalar`'s header named as D188. Same walk, same bound; only the leaf test
+// differs, which is the whole content of the distinction.
+//
+// IT TAKES THE NOMINAL LEG, AND THE PREDICTION THAT IT WOULD NOT WAS BUILT AND REFUTED.
+// The reasoning that says it should not is sound as far as it goes: an inline shape has no
+// declared name to drop, so `tyToEmitName` renders `{n:i32}[]`, which is the annotation
+// character for character. Both variants were built and graded on the 322-cell
+// alias-vs-inline twin table below — `transparentMemberEmitName` falling through to
+// `tyToEmitNameAt`, and the same predicate added to its `tyToNominalNameAt` leg beside
+// `arrSpineIsNominal` / `arrSpineIsMap`. The two differ on exactly **2 of 322 cells** and
+// the nominal leg wins both: `type L = {p: Cat}[]` at an UNREAD binding and at a UNION
+// MEMBER is `emitProgram: only i32[] arrays and struct/union element arrays are supported`
+// under the structural render and RUNS under the nominal one. The reason is one rung in:
+// the shape is inline but its FIELD is a declared struct, `tyToEmitNameAt` re-renders that
+// field to `{p:{n:i32}}[]`, and the emitter's element tables key on the name canon leaves
+// the DIRECT spelling with — `{p:Cat}[]`. So the leaf's own name is not the only name an
+// array leaf can drop, and the renderer question is about the whole leaf, not its head.
+//
+// THE DECLARED-STRUCT LEAF IS EXCLUDED, and it has to be even though `arrSpineIsNominal`
+// is tested first. The two predicates are read INDEPENDENTLY by
+// `transparentMemberEmitName`, which has no ordering to lean on: were this one to answer
+// true for a `Cat` leaf, the `||` there would still hand `Cat[]` to the nominal renderer
+// (the left disjunct wins) but the predicate itself would have stopped being a statement
+// about ONE leaf kind, which is the property the whole family is built on. `structNameOfTy`
+// is the same test `arrSpineIsNominal` makes, read the other way round.
+//
+// THE CANONICALIZED INTERSECTION IS CLAIMED HERE, AND MEASURED RATHER THAN REASONED.
+// `type AB = {a:i32} & {b:i32}` interns as a NAMED struct (`unionStructAliasShape`), so
+// `structNameOfTy` answers `AB` for it and the exclusion above sends `type L = AB[]` to
+// `arrSpineIsNominal` — not here. That is the same hand-off the bare `TyObj` arm's
+// `isPlainAliasRef` gate makes one arm below, reached by a different road: there the gate
+// is syntactic because the arena cannot tell the intersection from a plain reference, here
+// the LEAF's own arena entry answers it directly.
+function arrSpineIsObj(ty: i32) {
+  const leaf = arrSpineLeafTy(ty)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyObj { return structNameOfTy(leaf) == "" }
+  false
+}
+
 // The ARENA TYPE a declared one-member union ALIAS denotes TRANSPARENTLY (`type Id = i32`,
 // `type Name = string`, `type Y = Box<i32>`, `type M = {[string]: i32}`), or -1 when `name`
 // is not such an alias (`singleAliasMemberTyIx` is the rule). Such an alias denotes its
@@ -12548,8 +12596,17 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
   // at `unionmem` (`f(x: L | i32)`): `emitProgram: array value does not match any array
   // member of the union`, the union's array member being keyed on the dropped name. With
   // it, all four land on the inline control.
+  //
+  // D188 (`arrSpineIsObj`) IS THE THIRD SHARER OF THIS LEG, and it is here on a
+  // measurement rather than on the analogy. An INLINE-SHAPE leaf has no name of its own
+  // to drop, so the expectation was that it would fall through to the structural render
+  // like a scalar leaf does; the twin table says otherwise on 2 of its 322 cells, both
+  // `type L = {p: Cat}[]` — the leaf's FIELD names a declared struct, and
+  // `tyToEmitNameAt` re-renders it to `{p:{n:i32}}[]` while canon leaves the DIRECT
+  // spelling `{p:Cat}[]`. The element tables key on the latter. Read `arrSpineIsObj`'s
+  // header for the two cells and the messages.
   if mt is TyArray {
-    if arrSpineIsNominal(smt) || arrSpineIsMap(smt) {
+    if arrSpineIsNominal(smt) || arrSpineIsMap(smt) || arrSpineIsObj(smt) {
       const anr = tyToNominalNameAt(smt, ctx)
       if anr != "" {
         // The nominal renderer's own width bank, handed over exactly as the two arms
@@ -30810,6 +30867,62 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
 // narrowing of `x` to `T` happens in the THEN branch of an enclosing `if` (see the
 // IfStmt case); used elsewhere it is just a boolean test.
 
+// D228 — `chkTy` REACHES `baseTy` ONLY BY A NUMERIC WIDENING, so it is not a variant of
+// it and `x is chkTy` can never hold. The soundness gate below asks `assignable`, and
+// `assignable` permits the implicit widening lattice (`numWidensName`: i32→i64, i32→f64,
+// f32→f64) — which is the right question for a STORE and the wrong one for a TAG TEST.
+// A widening is a CONVERSION: codegen inserts a real instruction at the boundary, so the
+// value in the slot is not of the source type and no runtime tag says it is.
+//
+// THE HOLE IS THE LATTICE, NOT ONE SPELLING. D228 filed it as "`is i32` is the ONE non-arm
+// spelling the checker admits" on an `f64 | null`; measured, it is one edge of three and
+// every edge is admitted — `f64|null is i32` (i32→f64), **`f64|null is f32`** (f32→f64),
+// `i64|null is i32` (i32→i64), and `f64|string is i32` through a union member rather than
+// a nullable inner. The row's own control table probed `i64`, `boolean` and `string`, which
+// are the three spellings that do NOT widen, so it read a lattice as a special case.
+//
+// WHAT THE ADMITTED TEST DID. Three of the four RAN, printing the `else` value — correct by
+// construction, because the test is always false and the `then` branch is dead. The fourth
+// is D228 itself: `collectThenNarrows` narrows the binding to `i32` VERBATIM in that dead
+// branch, the emitter lowers a value-box read for it, and in a module that mints no i32 box
+// `vbHeapIdxOfKind` answers -1 and the build stops — `emitProgram: narrowed union atom has
+// no value box`. So the same hole is a dead branch, an emit reject or (pre-#1972) a
+// `ref.cast (ref 0)` on dead code, depending on what else the module happens to declare.
+// The gate's own header names the shape it is guarding against: *"an ungated test hands
+// the branch a binding of a type the value provably does not have. That is a LAUNDER."*
+//
+// SAME-PRIMITIVE IS ALWAYS A VARIANT, and on the UNION arm that has to be said in NAMES
+// rather than in arena indices. `numWidensName`'s first line is `if sn == dn { return
+// false }`, so the nullable arm below gets the rule for free from `numWidens`; the union
+// arm never calls it — it decides membership by scanning `uMembers` — so the name compare
+// there is that same line, written where the scan can see it. A second arena index over
+// one `Ty` (a newtype brand) is the shape that makes identity insufficient and the name
+// sufficient. That population is EMPTY through this predicate today: `assignable` already
+// refuses a plain `i32` against a `new i32` brand in this direction (`type Id = new i32`
+// with `g is i32` on a `Id | null` is a check reject on master and after), so the compare
+// is a belt with nothing yet to hold — kept because the rule it states is the lattice's
+// own and costs one comparison.
+function isWidenNotVariant(chkTy: i32, baseTy: i32) {
+  const cn = primNameOf(chkTy)
+  if cn == null { return false }
+  if chkTy == baseTy { return false }
+  const b = T.tys[baseTy]
+  if b is TyUnion {
+    const ms = b.uMembers
+    let i = 0
+    while i < ms.length {
+      if chkTy == ms[i] { return false }
+      if cn == primNameOf(ms[i]) { return false }
+      i = i + 1
+    }
+    // `assignable` said yes and no member is this primitive, so the route it found was a
+    // widening edge into one of them.
+    return true
+  }
+  if cn == primNameOf(baseTy) { return false }
+  numWidens(chkTy, baseTy)
+}
+
 // Extracted from `checkNodeReal`'s `IsExpr` arm (C3: thin the dispatcher).
 function checkIsExprNode(n: IsExpr, ix: i32) {
   const objTy = checkNode(n.isObj)
@@ -30849,7 +30962,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
       inUnion = true
       baseTy = ot.nInner
     }
-    if !assignable(chkTy, baseTy) {
+    if !assignable(chkTy, baseTy) || isWidenNotVariant(chkTy, baseTy) {
       if inUnion {
         tErr(
           "`is` check type '" +

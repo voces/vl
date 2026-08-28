@@ -1509,6 +1509,36 @@ function parseTypeDecl(flatAt: i32) {
     }
   }
   expectClose("RBRACE")
+  // D188 — AN ARRAY SUFFIX ON A `{ … }` BODY, WHICH WAS SILENTLY DROPPED. `type L =
+  // {n: i32}[]` reached here with `[` `]` still on the stream, no continuation arm
+  // claimed them, and the declaration was completed as the plain STRUCT `{n: i32}`;
+  // the two tokens were then re-lexed as the NEXT statement, an empty array literal.
+  // `vl fmt` printed the parse back verbatim — `type L = {n: i32}; []` — which is
+  // what named the mechanism after a counter build read `reach=0` at the alias
+  // transparency arm the row had blamed.
+  //
+  // BOTH OUTCOMES ARE WRONG AND ONE OF THEM IS SILENT. Reading the alias as an array
+  // (`const c: L = [{n: 7}]`) is a loud check reject at every position — D188 as
+  // filed. Reading it as the STRUCT it was misparsed into (`const c: L = {n: 7}`)
+  // COMPILES AND PRINTS, so the declaration silently means something other than what
+  // it says. The loud half is the one that got filed because it is the half a
+  // programmer writing an array alias hits first.
+  //
+  // The suffix is consumed HERE rather than in a continuation arm because it binds
+  // tighter than `&` and `|`: `{a: i32}[] | null` is a nullable ARRAY, and the union
+  // loop below must see `{a:i32}[]` as its first member. `atTypeCont` is
+  // `parseTypeAtom`'s own suffix test (`pendingGt == 0 && LBRACK`), so the two
+  // grammars cannot disagree about what a `[]` suffix is, and NO newline is skipped
+  // ahead of it — a `[` on the next line opens a statement, exactly as it does after
+  // any other annotation.
+  let arrSuffix = 0
+  let asGoing = atTypeCont("LBRACK")
+  while asGoing {
+    advance()             // "["
+    expectClose("RBRACK") // "]"
+    arrSuffix = arrSuffix + 1
+    asGoing = atTypeCont("LBRACK")
+  }
   // Object-type structural intersection `type AB = { … } & { … }`, or a
   // union whose FIRST variant is an inline object: the struct body was only the
   // first operand. Re-encode the RHS as a `UnionDecl` over synthetic names —
@@ -1526,7 +1556,7 @@ function parseTypeDecl(flatAt: i32) {
   // sequence this newly accepts was previously a hard parse error.
   const afterBrace = P.pos
   skipNewlines()
-  if peekKind() == "AMPERSAND" || peekKind() == "PIPE" {
+  if arrSuffix > 0 || peekKind() == "AMPERSAND" || peekKind() == "PIPE" {
     let first = "{" + synth + "}"
     // The same object, as a spelling: a `TS_FIELD` per field over the type root
     // the field already recorded, under one `TS_OBJ`. `tsToName` renders it back
@@ -1542,6 +1572,19 @@ function parseTypeDecl(flatAt: i32) {
       fk = fk + 1
     }
     let firstRoot = tsMkKids(TS_OBJ, "", fkids)
+    // …and the `[]`s the suffix loop above counted, appended to the synthetic name
+    // and wrapped around the spelling root in the SAME order `parseTypeAtom` does
+    // (`name + "[]"`, then `TS_ARR` over the node so far), so `tsToName` renders
+    // this member back to exactly the characters `first` holds. Off-stack, because
+    // the root is already popped — the case `tsMkKids`' own header names.
+    let asLeft = arrSuffix
+    while asLeft > 0 {
+      first = first + "[]"
+      const arrKid: i32[] = []
+      arrKid.push(firstRoot)
+      firstRoot = tsMkKids(TS_ARR, "", arrKid)
+      asLeft = asLeft - 1
+    }
     let igoing = peekKind() == "AMPERSAND"
     // The `&` operands join the object under a `TS_ISECT`, mirroring the `"&"`
     // the name is built with.

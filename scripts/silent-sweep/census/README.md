@@ -349,11 +349,20 @@ far more often than into or out of `runs`. It is worth one level, not four.
 Named and counted, because a silent cap reads as "covered everything":
 
 1. **32 axis-value pairs are structurally impossible** and are printed by `coverage.py`.
-2. **`claim` × list-outermost containers × an inline-object payload** is unreachable: the
+2. ~~**`claim` × list-outermost containers × an inline-object payload** is unreachable: the
    alias spelling does not parse past one `[]` and the alias is not assignable from its own
-   structural type. Both limits are LOUD, both are recorded above, and the axis is still
-   covered over map, struct and bare containers (D181 is at `list_of_map`, whose alias
-   spelling `{[string]: T}[]` does parse).
+   structural type.~~ **CLOSED 2026-08-28 (#1992, D188).** Both limits were one defect and
+   both are gone. `type L = {n: i32}[]` did not "not parse past one `[]`" — it parsed as the
+   STRUCT `{n: i32}` with the suffix silently dropped and re-lexed as the next statement
+   (`vl fmt` printed `type L = {n: i32}; []`), which is also why the two-deep spelling read
+   as `expected an expression but found RBRACK`; and "not assignable from its own structural
+   type" was the same misparse seen from the annotation side. `parseTypeDecl` now consumes
+   the suffix and `arrSpineIsObj` claims the leaf. The derived corpus measures the reach:
+   `a001558`/`b000965` (11,552 cells) go `loud check reject → runs` and `a001560`/`b003230`
+   (12,288 cells) go from the parse error to the language's own answer for a three-deep
+   array. The remaining unclaimed leaf is one that is itself a DECLARED ALIAS (a litunion,
+   a declared union, a canonicalized intersection) — filed as D362, with a check-clean
+   invalid-wasm cell at the intersection.
 3. **`pval=empty` and `pval=nestedempty` at `annpos=none`** are loud check rejects
    (`cannot infer a type for 'lv1'`): an empty container needs an annotation to have a type.
    About 14,000 cells.
