@@ -7688,7 +7688,7 @@ Repro:
 ---
 
 ### D156 — a NESTED arm-valued map, and the naive peel that closes 70 cells and breaks 4
-**check-clean invalid wasm — STILL, for the repro below, and deliberately: it declares the layout twin, which is the CONTESTED half, now filed as D171. The UNCONTESTED half SHIPPED 2026-08-27: the peel, gated on the arm having no declared layout twin, plus the `synthDstPinAnns` fixpoint. 92 cells across three grids move `loud emit reject` → `runs`, 0 backward, 0 to a silent class, silent populations unchanged at 44 / 12 / 66 · found 2026-08-27 in D139's closing residue · 36 of the 44 surviving D88/D100 cells · pre-existing on `54780e0b`, on `1559d80c` and on merged master `ff04d74b`**
+**[CLOSED 2026-08-28] the repro below RUNS and prints `7` — see THE CONTESTED HALF, CLOSED at the foot of this row; the close is D280's variant⇄struct HEAP MERGE and not a carrier. Was: check-clean invalid wasm for the repro below, and deliberately, because it declares the layout twin, which is the CONTESTED half, filed as D171. The UNCONTESTED half SHIPPED 2026-08-27: the peel, gated on the arm having no declared layout twin, plus the `synthDstPinAnns` fixpoint. 92 cells across three grids move `loud emit reject` → `runs`, 0 backward, 0 to a silent class, silent populations unchanged at 44 / 12 / 66 · found 2026-08-27 in D139's closing residue · 36 of the 44 surviving D88/D100 cells · pre-existing on `54780e0b`, on `1559d80c` and on merged master `ff04d74b`**
 
 Repro:
 
@@ -7871,6 +7871,63 @@ IT IS REACHABLE — AND BOTH HALVES OF D171's PRESCRIPTION ARE REFUTED.**
   population is **36 cells, every one `armtwin x declname x nestedmap`** (the 44 it had at
   `a19a3db7` minus this PR's 8), and the D139 grid's is **4, every one
   `armtwin x nestedmap`**. That is this row's contested half and nothing else.
+
+**THE CONTESTED HALF, CLOSED 2026-08-28 ON `28425535` (base seed 1,461,851; shipped seed
+1,463,065). IT IS NOT A CARRIER AND IT IS NOT THE GATE. IT IS ONE HEAP TYPE.**
+
+* **THE GATE WAS NEVER THE QUESTION.** Every candidate this row and D171 measured — the peel
+  un-gated (U), the argument→parameter hop (P), the read leg (R), the arm-nominal element key
+  (N) — asked *which carrier can complete the pin chain*, and each traded `runs` cells because
+  a half-named chain crosses two heap types. `armLayoutContestedAt(vi)` is literally
+  `repSlotOfTy(uVarTyIx[vi]) >= 0` — "does a declared struct row carry this arm's layout" — so
+  the gate that shipped is exactly the predicate that DETECTS the two-heap pair. The fix is to
+  stop declining on it and make the pair ONE heap. Filed as **D280**, with a seven-line witness
+  that has no map, no list, no pin and no conduit in it at all.
+* **WHAT SHIPPED — three rungs, and each was graded ALONE by stripping.** `uVarSTwin`, the
+  cross-table twin column (**X1**); the BOX an already-merged payload still needs (**X2**,
+  filed as **D281**); and the ref-list / map-value pairwise twin relations learning the
+  cross-table equivalence (**X3**). Stripping all three reproduces `28425535`'s compiler
+  sources BYTE-FOR-BYTE (`diff -r`, and the seed builds to 1,461,851, master's own fixpoint).
+* **THE TRADE, cell-matched on FOUR populations, and `runs` LOST is zero on every one.**
+
+  | population | forward | `runs` LOST | → silent |
+  |---|---|---|---|
+  | D88/D100 (2,850) + D112 (1,114) + D156 (1,188) + D139 (36) = 5,188 | **106** (+36/+12/+54/+4) | **0** | **0** |
+  | the distilled census corpus, 1,477 reps for **250,310** cells + 72 curated | **62 classes / 2,108 cells** | **0** | **0** |
+  | census block B, 28,590 cells | **341** | **0** | **0** |
+  | `tests/cases` corpus, 2,338 modules | 1 gained, 30 byte-DIFF | **0 lost** | — |
+
+  The grids' silent population goes 112 → 6: ZERO on D88/D100 (was 36), on D112 (was 12) and
+  on D139 (was 4), and 60 → 6 on the D156 position grid; block B's silent population goes 1,475 → 1,134
+  (5.16% → 3.97%) with its two loud columns unmoved at 9,621 and 7,756.
+  **The standing price to beat was D236's 80 `runs` cells. This loses none**, and all three
+  refutation pins (D172, D173, D236) still RUN on the shipped seed.
+* **BLOCK B ALSO MOVED 7 CELLS WITHIN THE SILENT CLASS, and they are reported rather than
+  netted away**: `expected (ref null $type), found (ref $type)` → `... found (ref null $type)`
+  on 7 cells that were silent before and are silent after. That is the nullable-niche residue
+  D224 sits on, surfacing in a message; no cell left a loud class for it.
+* **THE ABLATION IS WHAT SAYS ALL THREE RUNGS ARE LOAD-BEARING, AND IT SAYS SO IN TWO
+  DIFFERENT DIRECTIONS.** X2 moves **0** cells on all 5,188 grid cells, **0** classes on the
+  distilled corpus and **0** on block B, so no population this programme owns can price it —
+  and strip it from the shipped composition and D281's program goes from `runs` to check-clean
+  invalid wasm while every one of those instruments still reads 106 forward / 0 backward. That
+  is the direction check for a rung that scores zero. X3 gets the opposite one: WITHOUT X1 it
+  is not neutral, it is a catastrophe — 81 behavioural classes / **1,907 census cells**
+  `runs → not-runs` and 42 `runs` cells lost on the grids — because it claims a cross-table
+  twin whose heaps have not been merged. X1 and X3 are ONE landing, not two cuts.
+* **A FOURTH RUNG WAS BUILT AND IS REFUSED, WITH THE NUMBER (D224).** Re-asking D219's
+  `armLayoutAmbiguousAt` of the HEAP rather than of the layout closes D224's witness and moves
+  **0 cells in either direction on all four per-row grids** — and **207 census-block-B cells
+  from a `loud emit reject` into `check-clean invalid wasm`**. See D224.
+* **AND IT DOES NOT TOUCH WHAT D172, D173 AND D236 PIN.** The arm gets no nominal element key;
+  `repElemKeyGo` and `repElemIdGo` are untouched, and `armLayoutContested` still gates
+  `pinArmDeepUncontested` exactly as it did. D173's finding stands as filed: the conflation IS
+  load-bearing, so the arm must NOT be given its own key — and the way to make the arm honest
+  without one is to make the twin share its heap, which is the opposite move.
+* **THE RESIDUE.** Six cells of the position grid, all `read x param x arm x notwin x
+  d{1,2,3} x {norm,rev}` — the annotation at a CONSUMPTION with no twin declared anywhere.
+  That is D158's coordinate with neither mechanism applicable; filed as **D282** and pinned as
+  the new `@no-instantiate` specimen.
 
 ---
 
@@ -8142,7 +8199,7 @@ Repro:
 ---
 
 ### D158 — the deciding annotation is at the READ site, not at any delivery
-**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · all 12 surviving D112 cells · pre-existing on `54780e0b`, on `1559d80c`, on merged master `ff04d74b`, on `a19a3db7` and on `322c07f2` · OPEN, and ABLATED AWAY FROM D156: two roots, not one · ITS CARRIER IS NOW BUILT AND MEASURED (2026-08-27) — see the close below: the leg is complete and correct, and the two things under it are D156's contested gate and D173's key · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**[CLOSED 2026-08-28 for the repro below — it RUNS and prints `7`] and the close is NOT this row's: it is **D280**'s variant⇄struct heap merge, which no candidate graded against this row was looking for. This row's own count — "EIGHTEEN candidate compilers, NOTHING moves the witness" — was true and was measuring the wrong axis: all eighteen were CARRIERS (a pin, a hop, a read leg, an element key) and the defect was a TABLE. "Stable against every candidate so far" is evidence about the candidates, not about the specimen. All 12 of its D112 cells are `runs` on the shipped seed. **THE POSITION SURVIVES WITHOUT THE TWIN**: the same annotation position with NO layout twin declared anywhere is still check-clean invalid wasm, filed as **D282** and now the `@no-instantiate` SPECIMEN in this row's place. Was: check-clean invalid wasm · found 2026-08-27 in D139's closing residue · all 12 surviving D112 cells · pre-existing on `54780e0b`, on `1559d80c`, on merged master `ff04d74b`, on `a19a3db7` and on `322c07f2` · OPEN, and ABLATED AWAY FROM D156: two roots, not one · ITS CARRIER IS NOW BUILT AND MEASURED (2026-08-27) — see the close below: the leg is complete and correct, and the two things under it are D156's contested gate and D173's key · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
 
 Repro:
 
@@ -8370,6 +8427,16 @@ lines, NO layout twin declared, prints `7` on this tree):
 * Not pinned as a fixture: the grid file above regenerates from
   `scripts/silent-sweep/d88/gen88.py` and a corpus copy would freeze one cell of a population
   the grid re-derives in full.
+* **THE FAMILY CLOSED WITHOUT PAYING THIS (2026-08-28, D280). THE PIN HELD AND IT IS WHY.**
+  D156, D157, D158, D163 and D171 all RUN on the shipped seed, at **106 forward / 0 backward**
+  across 5,188 grid cells and **0 `runs` lost across 250,310 census cells** — against this
+  composition's 80 `runs` cells lost. This program is one of the 80 and it still prints `7`.
+  What the three pins (D172, D173, this one) were collectively saying is that the arm must not
+  be given its own ELEMENT KEY, because the un-annotated positions ride the conflation; they
+  were read as "so the family cannot close". The unexamined third option is that the arm and
+  the twin become ONE HEAP, at which point there is no conflation left to be load-bearing.
+  This row stays a pin: `repElemKeyGo` and `repElemIdGo` are untouched and `P + U + R + N`
+  costs exactly what it cost.
 
 ---
 
@@ -9872,7 +9939,7 @@ Repro (census block A cell `a008328`, verbatim — the graded cell, not a retypi
 ---
 
 ### D171 — the CONTESTED half of D156's peel: a half-pinned chain is worse than an un-pinned one
-**check-clean invalid wasm · found 2026-08-27 in D156's ablation · D156's own filed witness, plus 12 cells of the 1,188-cell position grid and 4 of the 1,114-cell D112 grid · pre-existing on merged master `ff04d74b`**
+**[CLOSED 2026-08-28] the repro below RUNS and prints `7` — and NOT by any carrier this row names. A half-pinned chain is worse than an un-pinned one because the two halves cross TWO HEAP TYPES for one checker type; **D280** merges them and the distinction disappears. **THIS ROW'S OWN CONCLUSION IS CONFIRMED, NOT OVERTURNED**: "the conflation is load-bearing" is exactly what rules the fix OUT of the element key and INTO the heap, and `repElemKeyGo` / `repElemIdGo` are untouched. The peel is still gated on `armLayoutContested`, unchanged. Was: check-clean invalid wasm · found 2026-08-27 in D156's ablation · D156's own filed witness, plus 12 cells of the 1,188-cell position grid and 4 of the 1,114-cell D112 grid · pre-existing on merged master `ff04d74b`**
 
 Repro (D156's own, verbatim — it declares the layout twin, which is what makes it contested):
 
@@ -9948,6 +10015,16 @@ Repro (D156's own, verbatim — it declares the layout twin, which is what makes
   has the IDENTICAL backward set. What DOES close this witness is lifting the gate, and what
   is under the gate is D173's ref-list key, re-measured at **46 backward on D88** once the
   chain is complete. Full table and the seven-witness composition: D156's close, and D236.
+* **RE-RUN 2026-08-28 ON THE D280 SEED (1,463,065): THE WITNESS RUNS, AND THIS ROW'S FINDING IS
+  WHAT CHOSE THE FIX.** "The conflation is load-bearing" is CONFIRMED and is the constraint that
+  ruled the element key out and the heap merge in: if the arm may not have its own key, then the
+  only way to make a half-named chain consistent is for the arm and the twin to SHARE the heap
+  the key already conflates them onto. Measured on the ablation ladder, this row's witness is
+  still check-clean invalid wasm under the heap merge ALONE (X1) and under the merge plus the box
+  rung (X1+X2); it needs X3 — the ref-list and map-value pairwise relations learning the
+  cross-table equivalence — which is the layer this row's own dump named
+  (`MV slot=3 name={[string]:Circle} twin=1` onto `{[string]:{r:i32}}`). D156's family closed at
+  106 forward / 0 backward on 5,188 grid cells and 0 `runs` lost on 250,310 census cells.
 
 ---
 
@@ -10498,7 +10575,18 @@ program where a union also exists — prints 7 on this tree and on `1e81b0f3`):
 ---
 
 ### D267 — the same five box destinations fed by a CALL: `structIndexOfExpr`'s CALL arm has no kind gate either
-**check-clean invalid wasm on `322c07f2` and on this branch · D200's cut is the `Ident` arm's gate and this is the arm beside it · found 2026-08-27 by block Q, the producer × destination cross D200's three controls held fixed**
+**[CLOSED 2026-08-28 by D280] the repro below RUNS and prints `7` · was: check-clean invalid wasm on `322c07f2`, on `28425535` and on the branch that filed it · D200's cut is the `Ident` arm's gate and this is the arm beside it · found 2026-08-27 by block Q, the producer × destination cross D200's three controls held fixed**
+
+* **NOT CLOSED BY A KIND GATE — the missing piece was one heap type.** Graded across the D280
+  ablation ladder: silent on the base seed (1,461,851), `runs` under the cross-table heap merge
+  **alone** (`uVarSTwin`, seed 1,462,840), and `runs` on the shipped seed. The destination and
+  the producer disagreed because `uVarHeap[Circle]` and `sHeapIdx[Dot]` were two WasmGC heap
+  types for one checker type; nothing on the CALL arm changed and no gate was added.
+* **OWNERSHIP NOTE.** This row belongs to another agent's landing (#1978). The status is
+  corrected because `check-filed-witnesses.py --strict` is a PR gate and a stale row reddens it;
+  the MECHANISM recorded below is left exactly as that agent filed it, and whoever owns it should
+  decide on its own merits whether the CALL arm still wants its kind gate now that the heap
+  question is gone.
 
 Repro:
 
@@ -10537,7 +10625,16 @@ Repro:
 ---
 
 ### D268 — an INFERRED-result callee returns the struct TWIN into an ARM-typed position, with no box anywhere
-**check-clean invalid wasm on `322c07f2` and on this branch · found 2026-08-27 by block Q · NOT D267: there is no union box in the emitted module at all, so `emitUnionBoxArg` is not on the path**
+**[CLOSED 2026-08-28 by D280] the repro below RUNS and prints `7` · was: check-clean invalid wasm on `322c07f2`, on `28425535` and on the branch that filed it · found 2026-08-27 by block Q · NOT D267: there is no union box in the emitted module at all, so `emitUnionBoxArg` is not on the path**
+
+* **AND THAT OBSERVATION IS EXACTLY WHY THE HEAP MERGE IS THE CLOSE.** With no box anywhere,
+  the only thing that could disagree was the heap type of the bare struct against the heap type
+  of the arm — which is D280. Graded across the ablation ladder: silent on the base seed
+  (1,461,851), `runs` under the cross-table merge **alone** (seed 1,462,840), `runs` on the
+  shipped seed.
+* **OWNERSHIP NOTE.** Another agent's row (#1978); the status is corrected because
+  `check-filed-witnesses.py --strict` is a PR gate and a stale row reddens it. The mechanism
+  below is left as filed.
 
 Repro:
 
@@ -10807,7 +10904,59 @@ Repro:
 ---
 
 ### D224 — D211's ARM-TWIN quarter: the same cell with a second union whose first arm is `Circle`'s layout twin
-**check-clean invalid wasm · 4 of D211's 12 cells (`twin=armtwin`), live after D219 · the class D219's R10 gate deliberately declines**
+**check-clean invalid wasm · STILL OPEN, and now for a MEASURED reason rather than an unexamined one: the fix was BUILT, it works, and it costs 207 · 4 of D211's 12 cells (`twin=armtwin`), live after D219 and after D280 · the class D219's R10 gate deliberately declines**
+
+**THE ROOT IS RIGHT AND IT IS NOT SUFFICIENT (2026-08-28, on `28425535`).** This row's own
+prescription said "WHAT WOULD CLOSE IT is D171's root, not another classifier rung". D171's
+root is D280's two-heap seam, and it landed — **and this repro is UNMOVED by it**. Graded on
+the base seed (1,461,851) and on the shipped seed (1,463,065) the outcome is `check-clean
+invalid wasm` both times with the IDENTICAL sentence at the IDENTICAL offset: `Invalid input
+WebAssembly code at offset 2217: type mismatch: expected i32, found (ref null $type)`. That is
+the nullable-niche read, not this family's `(ref null $type)` / `(ref $type)` sentence, and it
+was already this row's filed message. The rung is where the rest of it lands after all.
+
+* **THE CANDIDATE, BUILT AND FIXPOINTED (1,463,120).** `armLayoutAmbiguousAt` has two rungs and
+  both were written as *is there a SECOND claimant of this arm's layout*, because a second
+  claimant meant a second HEAP TYPE. After `uVarSTwin` a struct claimant no longer implies one,
+  and the ARM claimant never did — `uVarTwin` has merged structural arm twins since the variant
+  layer got its twin column, so this row's own `Dot`-of-`DotU` is ALREADY one heap with `Circle`
+  and the gate is declining on a pair that cannot disagree. Re-asking each rung whether the other
+  claimant's heap actually DIFFERS — through the two pairwise, timing-independent relations
+  (`repVariantSlotsTwin` and `variantStructHeapTwinAt`) — closes this witness: it RUNS and prints
+  `0`, which is the correct answer, verified against its D211 sibling (the same program with the
+  three `Dot*` lines deleted), which prints `0` on the base too.
+* **AND IT COSTS 207. NEITHER THE PER-ROW GRIDS NOR THE DISTILLED CORPUS CAN SEE IT, WHICH IS THE
+  POINT.** The candidate moves **0 cells in either direction on all four per-row grids** —
+  D88/D100 (2,850), D112 (1,114), D156 (1,188), D139 (36) — so on that evidence it is a free win.
+  Cell-matched on **census block B (28,590 cells)** it moves **207 cells from a `loud emit reject`
+  into `check-clean invalid wasm`**, 0 `runs` lost. Four working programs bought with 207 honest
+  refusals turned silent is refused on the standing rule.
+* **THE DISTILLED CORPUS REPORTS `→ silent 0 classes` FOR THIS CANDIDATE, AND IT IS WRONG BY 207
+  CELLS.** Graded against the same candidate, `scripts/silent-sweep/distilled/regress.py` prints
+  `-> silent (report) 0 classes (0 of 250310 census cells)` — and it STILL does after #1979 added
+  its 72 curated named cells. **NOT ONE of the 207 is a distilled representative**, checked by
+  name against `distilled/cells/`; the generator is deterministic (all 526 block-B
+  representatives re-generate byte-identical), so the comparison is sound. The 207 are a sharply
+  defined family — `pval=nullfield, declness=byname, rep=nul, order=norm`, at `twin=exact` (142)
+  and `twin=armtwin` (65) — and their equivalence classes' representatives do not move under it.
+  **This is a second, independent instance of the shape #1979 was landed for**, and it says the
+  curated half needs one more entry rather than that the collapse is unsound: `regress.py` is a
+  `runs → not-runs` tripwire and is sound as that, but its `→ silent` column is not a substitute
+  for a block when the transition is new to the 19-snapshot history the collapse was built from.
+  Whoever owns the distilled corpus should consider adding this set to `named/` — it is already
+  materialisable from `d224-cost.json`.
+* **THE 207 ARE A NAMED SET**, at `scripts/silent-sweep/census/d224-cost.json`, materialised by
+  the `scripts/silent-sweep/d243/mkset.py` already in the tree (names and coordinates, not copies
+  of the generated programs — `mkset.py` refuses if the generator has moved under the set). It
+  re-grades against any future seed in ~414 `vl` invocations instead of a census, and on the
+  shipped seed it prints `loud emit reject 207` and nothing else. Re-graded under the candidate
+  built on THIS PR's base: **199** go silent and 8 now RUN, #1978 having closed those from the
+  other side. 199 or 207, the refusal is the same.
+* **WHAT WOULD ACTUALLY CLOSE IT** is therefore not the gate but the 207's own root: a receiver
+  whose arm the classifier declines to claim is a LOUD floor today, and lifting the floor without
+  first making those receivers lower correctly is what turns them silent. That is D223's shape
+  ("the module is already invalid before the read") asked of the arm-twin class, and it wants its
+  own grid.
 
 Repro (census block A cell `a099944`, verbatim — D211's own cell plus one union):
 
@@ -11976,6 +12125,176 @@ Repro:
   This is the inventory going stale one-directionally *inside a single PR*, which is a
   sharper version of the failure `CLAUDE.md` already warns about — the doc was accurate when
   the row was drafted and wrong by the time it merged.
+
+---
+
+### D280 — a union ARM and a declared STRUCT of its exact layout are TWO WasmGC heap types, and the checker says they are ONE type
+**[CLOSED 2026-08-28] the repro below RUNS and prints `7`. Was: check-clean invalid wasm on `28425535` and on every generation before it · SEVEN LINES — no map, no list, no generic, no pin, no conduit · found 2026-08-27 by asking D156's family what its GATE was a proxy for · the ROOT of D156, D158, D171 and D224's half, and the ingredient D157's own control table already isolated ("the EXACT LAYOUT TWIN is required")**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    const d: Dot = { r: 7 }
+    const c: Circle = d
+    print(c.r)
+    // `28425535`: vl check rc 0 (one redundant-annotation HINT, no errors); vl run:
+    //   Invalid input WebAssembly code at offset 180:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE CHECKER SAYS THEY ARE ONE TYPE AND IT SAYS SO OUT LOUD.** `vl check` on the repro emits
+  ``redundant type annotation: `c` is inferred as `Dot` `` — on a binding annotated `Circle`.
+  That is the acceptance `DECISIONS.md` derives the struct layer's whole slot-dedup discipline
+  from: "`type A = {v:i32}` and `type B = {v:i32}` are THE SAME type (the checker accepts a `B`
+  wherever an `A` is expected), so they MUST share one heap type. Minting a distinct heap type
+  per declared alias was an active soundness bug."
+* **FOUR LAYERS CLOSED THAT BUG AND THE FIFTH SEAM WAS CHARTERED OPEN.** `sTwin` (struct),
+  `rlTwin` (ref-list), `mvTwin` (map-value) and `uVarTwin` (variant) each dedup WITHIN their
+  table. `DECISIONS.md` records the exception: "The variant⇄struct-TABLE seam (a declared struct
+  twin in a variant-arm position) stays nominal — chartered as repOf item (e)". **That charter's
+  REASON is about RESOLVER RUNG ORDER** — "a NOMINAL question must not be settled by whichever
+  STRUCTURAL rung happens to fire first", which D32 and D33 correctly fixed by ordering rungs —
+  **and it was silently read as licensing two HEAP TYPES.** Those are different claims: the
+  resolvers must stay nominal (they still are; nothing here touches `rlElemStructRow`'s D32
+  floor, and `uVarHeap` / `sHeapIdx` remain two namespaces), and the two nominal answers must
+  nevertheless land on ONE heap, exactly as `type A` / `type B` do.
+* **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS.** On the base the rec group carries THREE identical
+  `(struct (field (mut i32)))` — `$1` is `Dot`'s struct row, `$2` is `Circle`'s variant heap,
+  `$3` is `Sq`'s — and the module reads
+
+      (global $global$0 (mut (ref $1))      (struct.new $1 (i32.const 7)))
+      (global $global$1 (mut (ref null $2)) (ref.null none))
+      (global.set $global$1 (global.get $global$0))     ;; (ref $1) into a (ref null $2) cell
+
+  On the shipped seed the rec group carries TWO, `global$1` is `(mut (ref null $1))`, and the
+  identical `global.set` is well typed. One heap type fewer, and nothing else in the module moves.
+* **FOUR CONTROLS, each one change from the repro, all built and run:**
+
+  | change | outcome |
+  |---|---|
+  | (none — the repro as filed) | **check-clean invalid wasm** |
+  | `const d: Dot = c` (the reverse direction) | check-clean invalid wasm |
+  | `function takeC(x: Circle)` and `takeC(d)` (across a parameter) | check-clean invalid wasm |
+  | delete `type Shape = Circle \| Sq` — two plain twins `A`/`B` | **RUNS** (this is `sTwin`) |
+  | the same pair as a map VALUE (`{[string]: Dot}` into `{[string]: Circle}`) | check-clean invalid wasm |
+
+  The fourth row is the control that makes this a SEAM and not a general defect: the identical
+  program with the union deleted has always run, because that pair is inside ONE table.
+* **PATTERN 4 — A KEY THAT NEED NOT SEE THE PAIR.** `uVarSTwin[vi]` is computed per claimant from
+  `repSlotOfTy(uVarTyIx[vi])`, the bridge `armLayoutContestedAt` already asks, plus a
+  field-storage layout guard. The MINT (`mAssignTypeIndices`) and every pairwise FIND
+  (`rlSlotsLayoutTwin`, `repMapValSlotsTwin`) evaluate the same function of `vi` and agree
+  without either observing the other — which is what keeps it TIMING-INDEPENDENT, the property
+  `rlSlotsLayoutTwin`'s header requires of anything it consults. No channel was needed and none
+  was added.
+* **THE LAYOUT GUARD DECLINES A REF-BEARING FIELD OUTRIGHT** (codes 5 / 15 / 28 / 19 / 29) rather
+  than descending into the referenced layer the way `variantFieldLayoutEq` does. Never-merged is
+  the safe degenerate; the whole of this family is fixed-storage arms; and the narrow guard is
+  also what keeps the compiler's own hundreds of variants out of the change, which is why the
+  self-compile fixpoint holds at the first rung. Widening it is a separate measurement.
+* **THE TRADE, and `runs` LOST is ZERO on every population measured**: 106 forward / 0 backward /
+  0 same-class message moves on 5,188 per-row grid cells; **62 behavioural classes / 2,108 census
+  cells forward, 0 `runs` lost, 0 → silent** on the distilled corpus standing for 250,310 cells;
+  341 forward / 0 `runs` lost / 0 → silent on census block B (28,590), with 7 same-class message
+  moves inside the silent class; and **0 corpus modules LOST, 1 GAINED, 30 byte-DIFF** over 2,338
+  `tests/cases` files. The standing price to beat was D236's 80 `runs` cells; this loses none, and
+  D172, D173 and D236 all still run.
+* **THE COUNTER SAYS THE BYTES MOVED FOR THIS REASON AND NO OTHER.** Across the 30 byte-DIFF
+  corpus modules the emitted struct heap types go **322 → 255 (−67)**, and **30 of the 30** lose at
+  least one. Not one module moved bytes without losing a heap type.
+* Pinned as programs 1–3 of `tests/cases/soundness/arm-and-its-layout-twin-share-one-heap.vl`
+  (`@run`, four `@log 7`), whose program 1 is the graduated D158 specimen verbatim.
+
+---
+
+### D281 — the BOX a merged heap still needs: one test read as two questions
+**[CLOSED 2026-08-28, in the same landing that created it] the repro below RUNS and prints `7` · A REGRESSION THIS PR'S OWN FIRST RUNG CREATED AND ITS SECOND REMOVED, filed because the latent defect is older than the rung that exposed it and because NO GRID AND NO CENSUS COULD HAVE FOUND IT**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    const d: Dot = { r: 7 }
+    const s: Shape = d
+    if s is Circle { print(7) } else { print(0) }
+    // `28425535`: runs, prints 7.  With D280's heap merge and WITHOUT this rung:
+    //   vl check rc 0, then type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE FUSED TEST.** `emitUnionCoerce` asked `sHeapIdx[rbSsi] != uVarHeap[rbVi]` and used the
+  answer for two different questions: *must the PAYLOAD be rebuilt onto another heap type* and
+  *is this value already box-shaped*. Its own comment states the intent — "Gated on the heaps
+  DIFFERING so an already-deduped shape keeps the byte-identical raw pass" — and the
+  fall-through it guards is a RAW PASS with no box at all.
+* **IT WAS UNREACHABLE, WHICH IS WHY IT WAS WRONG AND INVISIBLE.** `sHeapIdx` and `uVarHeap` never
+  cross-deduped, so for any arm-matching struct row the heaps ALWAYS differed and the equal branch
+  could not be entered. D280 makes it reachable, and the raw pass drops a bare `(ref $arm)` into a
+  `(ref null $uBox)` cell.
+* **THE DISASSEMBLY, three ways.** Master rebuilds then boxes —
+  `struct.new $4 (i32.const 0) (struct.new $2 (struct.get $1 0 (global.get $global$0))))`. The
+  merge WITHOUT this rung emits `global.set $global$1 (global.get $global$0)` — no box at all.
+  The shipped composition emits `struct.new $3 (i32.const 0) (global.get $global$0))` — the box
+  and no rebuild, which is also one allocation fewer than master.
+* **THE FIX IS THE COMPLEMENT ALREADY WRITTEN THREE HUNDRED LINES AWAY** (pattern 1).
+  `emitUnionBoxArg`'s own fall-through is exactly the three instructions the merged case wants —
+  `i32.const <tag>` / the expression / `struct.new uBoxIdx` — because the payload needs no
+  REBUILD, only the BOX. `emitUnionBoxArg` was already correct for this; only `emitUnionCoerce`
+  fused the two questions.
+* **NO GRID AND NO CENSUS COULD HAVE FOUND IT, AND THAT IS THE REASON THIS ROW EXISTS.** The rung
+  moves **0 cells on all four per-row grids (5,188)**, **0 classes on the distilled corpus
+  (250,310 census cells)** and **0 on census block B (28,590)** — none of those populations boxes
+  a plain declared struct into a union. It was found by a hand probe built to ask what the heap
+  merge changed, and it is the direct measurement behind "a candidate moving 0 alone can be
+  load-bearing": strip this rung from the shipped composition and every instrument still reads
+  106 forward / 0 backward / 0 `runs` lost while this program goes silent.
+* Pinned as program 4 of `tests/cases/soundness/arm-and-its-layout-twin-share-one-heap.vl`.
+
+---
+
+### D282 — the read's `??` DEFAULT is the only nominal claim, and the container was filled through an un-annotated PARAMETER
+**check-clean invalid wasm · found 2026-08-28 as the residue of D280 · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · pre-existing on `28425535` and byte-identical across this change · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+
+Repro (ten lines, and NO layout twin is declared anywhere):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function fill(c, n: i32) {
+      c["k1"] = { r: n }
+    }
+    const c = Map()
+    fill(c, 7)
+    const dleaf: Circle = { r: 0 }
+    print((((c)["k1"] ?? dleaf)).r)
+    // vl check rc 0 (one redundant-annotation HINT, no errors); vl run:
+    //   Invalid input WebAssembly code at offset 1258:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE ONE-LINE CONTROL IS D173's PIN, and the pair names the coordinate exactly.** Move the SAME
+  annotation from the read's default to the container binding —
+  `const m: {[string]: Circle} = c` then `print((((m)["k1"] ?? { r: 0 })).r)` — and the program
+  RUNS, on this tree and on the base. A claim at the container is a DELIVERY the pin family reads;
+  a claim at the read is a CONSUMPTION it cannot. That is D158's content, here at the coordinate
+  D158's own witness did not occupy.
+* **BOTH OF THE MECHANISMS THAT CLOSED THIS FAMILY ARE INAPPLICABLE BY CONSTRUCTION**, which is why
+  it is the specimen and not a loose end: no delivery exists for the pin family, and no second
+  claimant of `Circle`'s layout is declared, so `armLayoutContested` is false,
+  `variantStructHeapTwinAt` answers -1 and `uVarTwin` has no second arm to collapse. Choosing a
+  successor specimen against BOTH mechanisms is a tightening of the selection rule in
+  `tests/vl_check_codegen_test.ts`, whose previous choice was made for stability against the pin
+  family alone and was closed by something else.
+* **PRE-EXISTING, MEASURED RATHER THAN INHERITED.** Graded `check-clean invalid wasm` on the base
+  seed (1,461,851) and on the shipped seed (1,463,065), same sentence, same offset 1258.
+* **WHAT IS LEFT IS THE ANONYMOUS SHAPE, and `DECISIONS.md` already names it as the residue of this
+  whole seam**: "The residue is where NEITHER table owns the name: an ANONYMOUS shape has no
+  declaration identity, both arena rungs correctly decline, and the structural scans decide it with
+  nothing to break the tie (D36)." `{ r: n }` inside `fill` is that shape, and its element resolves
+  before `dleaf`'s annotation is anywhere in scope. Not reachable by a third rung of the D32/D33
+  shape and not reachable by a heap merge — nothing is being merged, there is one claimant.
+* Pinned as `tests/cases/soundness/xfail-miscompile-read-default-annotation-through-unannotated-param.vl`.
 
 ---
 

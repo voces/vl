@@ -752,78 +752,42 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CLOSED as of the paragraph below; the file graduated to
 // `tests/cases/soundness/arm-valued-map-beside-struct-twin.vl`, `@run` + three `@log 7`.)
 //
-// SWAPPED AGAIN 2026-08-27 (silent-class-inventory D157 + D163). The
-// `reverse([c])[0]` conduit specimen this constant carried is CLOSED and graduated to
-// `tests/cases/soundness/arm-literal-through-a-list-conduit.vl`, `@run` + five `@log 7`.
-// Its two roots are why it needed one commit: the pin's halves move 0 cells and change 4
-// messages, and the list literal's element row keeps every one of them silent until it is
-// keyed off the element's COMMITTED rep instead of the checker's structural record.
+// SWAPPED AGAIN 2026-08-28 (silent-class-inventory D280 / D156 / D158 / D171). The
+// read-site-annotation specimen this constant carried is CLOSED and graduated to
+// `tests/cases/soundness/arm-and-its-layout-twin-share-one-heap.vl`, `@run` + four `@log 7`.
+// What closed it is not a nineteenth carrier: it is ONE HEAP TYPE. A union ARM and a
+// declared STRUCT of its exact layout were two WasmGC heap types in two tables that never
+// cross-deduped, while the checker accepts either wherever the other is expected — which is
+// the same "they MUST share one heap type" argument `DECISIONS.md` derives the struct
+// layer's own `sTwin` from. The predecessor's "eighteen candidate compilers have been graded
+// against it without moving it" was true and was measuring the wrong axis: every one of the
+// eighteen was a CARRIER (a pin, a hop, a read leg, an element key) and the defect was a
+// TABLE. That is the lesson this genealogy entry adds — "stable against every candidate so
+// far" is evidence about the candidates, not about the specimen.
 //
-// THE SUCCESSOR IS CHOSEN FOR STABILITY, not only for liveness, and that is a change of
-// selection rule this genealogy earns: five swaps in one day happened because each
-// successor was the newest thing found, and the newest thing found is by construction the
-// one a rung is about to close. D158 is the opposite shape — its program has NO delivery
-// anywhere, so the whole `synthRetPinAnn` / `synthEmptyListAnn` / `synthDstPinAnn` family
-// cannot reach it by construction rather than by omission, and EIGHTEEN candidate compilers
-// have now been graded against it without moving it (the fourteen recorded under D158, plus
-// the four graded beside this swap). Re-RUN against this tree at the swap rather than
-// inherited: `vl check` rc 0 with NO diagnostics at all, `--codegen` rc 1 with `not valid
-// wasm` + `type mismatch: expected (ref null $type), found (ref $type)`, `--codegen
-// --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `54780e0b`, `1559d80c`,
-// `ff04d74b` and `a19a3db7`, same message, and its module is byte-identical across the
-// change this file ships with. Pinned as
-// `tests/cases/soundness/xfail-miscompile-read-site-annotation-nested-map.vl` per the
-// REFILLS procedure below, in the same commit that swapped this constant.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
-//
-// The genealogy above is the record of a constant that could only ever name a live
-// compiler bug, re-pointed at a fresh one at least five times in a single day. What
-// changed is not that record but what depends on it: the MECHANISM this file exists
-// to prove (validator runs, `invalid-module` renders with the engine's reason, exit
-// goes non-zero) moved to the fault-injected tests above and is permanent. This
-// constant now carries ONE job — the end-to-end pairing, "a real VL program that
-// `vl check` calls clean and `--codegen` catches" — which a synthesized module
-// genuinely cannot stand in for, because a synthesized module cannot come out of
-// `vl check`. That job is worth keeping while a specimen exists and is worth nothing
-// faked.
-//
-// WHAT TO DO WHEN THE CLASS REFILLS OR EMPTIES — the whole procedure, in one place:
-//
-//   * EMPTIES (the defect you just closed was the last one). Set this constant to
-//     `null` and delete the `@no-instantiate` directives in the SAME commit. The
-//     three specimen tests below deactivate, the file says so out loud at load, and
-//     the tripwire at the foot CHECKS that the corpus agrees. Add a paragraph to the
-//     genealogy saying what closed. Do NOT comment the tests out, and do NOT loosen
-//     an assertion until something matches — that is the failure this structure
-//     exists to make impossible.
-//   * REFILLS (a new check-clean-invalid-wasm shape lands, or you find one). Set
-//     this constant to it, and pin it `@no-instantiate` in the SAME commit — #1939:
-//     an unpinned successor reddens the tripwire, and the tripwire is now what makes
-//     "the class is empty" a checkable claim instead of a comment.
-//
-// BEFORE CONCLUDING IT IS EMPTY, look past the inventory: it grades only the rows
-// someone filed, and the std review of the closing change has out-produced it three
-// times running. That advice is unchanged and it was nearly needed twice.
-//
-// Exactly one of the two states above is legal at any time, and which one holds is
-// CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
-// state can be entered halfway.
-// ─────────────────────────────────────────────────────────────────────────────
+// THE SUCCESSOR IS CHOSEN AGAINST BOTH MECHANISMS, which is a tightening of the previous
+// selection rule (that one chose for stability against the pin family alone, and the thing
+// that closed it came from elsewhere). This one has no delivery for the pin family to read
+// AND declares no second claimant of the arm's layout for the heap merge to merge:
+// `armLayoutContested` is false on it, `variantStructHeapTwinAt` answers -1, and `uVarTwin`
+// has no second arm to collapse. Re-RUN against this tree at the swap rather than inherited:
+// `vl check` rc 0 (one redundant-annotation HINT, no errors), `--codegen` rc 1 with `not
+// valid wasm` + `type mismatch: expected (ref null $type), found (ref $type)`, `--codegen
+// --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `28425535` with the SAME
+// sentence at the SAME offset across the change. Pinned as
+// `tests/cases/soundness/xfail-miscompile-read-default-annotation-through-unannotated-param.vl`
+// per the REFILLS procedure above, and filed as silent-class-inventory D282, in the same
+// commit that swapped this constant.
 const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
-  `type Dot = { r: i32 }\n` +
-  `function mk(n: i32) {\n` +
-  `  const l1 = Map()\n` +
-  `  l1["k1"] = { r: n }\n` +
-  `  const c = Map()\n` +
-  `  c["k2"] = l1\n` +
-  `  return c\n` +
+  `function fill(c, n: i32) {\n` +
+  `  c["k1"] = { r: n }\n` +
   `}\n` +
-  `const d1: {[string]: Circle} = Map()\n` +
-  `print(((((mk(7))["k2"] ?? d1))["k1"] ?? { r: 0 }).r)\n`;
+  `const c = Map()\n` +
+  `fill(c, 7)\n` +
+  `const dleaf: Circle = { r: 0 }\n` +
+  `print((((c)["k1"] ?? dleaf)).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.

@@ -474,6 +474,7 @@ import {
   uFieldStart,
   uFieldTypes,
   uVarHeap,
+  uVarSTwin,
   uVarTwin,
   uVarTyIx,
   uVariants,
@@ -5444,6 +5445,15 @@ export function mvValStructIdxOf(slot: i32): i32 {
   if c < 0 { return -1 }
   if c >= mvValStructIdx.length { return -1 }
   mvValStructIdx[c]
+}
+
+// The bounds-guarded read of the cross-table twin column (every parallel-table
+// accessor in this file carries one): an uncovered variant reads -1, which is "no
+// cross-table merge" and is what every site meant before the column existed.
+export function uVarSTwinAt(vi: i32): i32 {
+  if vi < 0 { return -1 }
+  if vi >= uVarSTwin.length { return -1 }
+  uVarSTwin[vi]
 }
 
 // The read side of the ARM-SIGNATURE column (D93), bounds-guarded like every other
@@ -18999,6 +19009,23 @@ export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
   const sa = rlElemStructRow(a)
   const sb = rlElemStructRow(b)
   if sa >= 0 && sb >= 0 { return repStructSlotsTwin(sa, sb) }
+  // THE CROSS-TABLE ARM. This function's own header says "a variant element only twins
+  // with ITSELF (the variant table is the next name-keyed layer; UNTIL IT DEDUPS, distinct
+  // indices are distinct heaps)" — and `uVarSTwin` is that layer deduping, against the
+  // struct table. `rlElemStructRow` answers -1 for a registered arm BY DESIGN (D32's
+  // nominal floor, which stays exactly as it is: the question is not whether the arm has a
+  // struct ROW, it is whether it has the same HEAP). Asked through `variantStructHeapTwinAt`
+  // the answer is a struct slot or -1, and `repStructSlotsTwin(-1, …)` is 0, so a
+  // non-merging arm declines exactly as before. TIMING-INDEPENDENT, which this layer
+  // requires: no heap index is consulted on either side.
+  const va = rlElemVariantRow(a)
+  if va >= 0 && sb >= 0 {
+    return repStructSlotsTwin(variantStructHeapTwinAt(va), sb)
+  }
+  const vb = rlElemVariantRow(b)
+  if vb >= 0 && sa >= 0 {
+    return repStructSlotsTwin(sa, variantStructHeapTwinAt(vb))
+  }
   0
 }
 
@@ -19132,7 +19159,22 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
     // ahead of every struct row — so that case is a flat 0.
     const mva = mvValVariantRawOf(a)
     const mvb = mvValVariantRawOf(b)
-    if (mva >= 0) != (mvb >= 0) { return 0 }
+    if (mva >= 0) != (mvb >= 0) {
+      // "Cross-table (one arm, one struct) is never one heap — the variant structs are
+      // minted ahead of every struct row — so that case is a flat 0." THAT PREMISE IS THE
+      // ONE `uVarSTwin` RETIRES: an arm whose layout is a declared struct's now takes that
+      // row's heap index rather than minting ahead of it, so the pair CAN be one heap and
+      // the flat 0 emits two map structs over one vals wrapper. Asked per claimant — each
+      // side resolves to a struct slot or -1 without observing the other — so the mint and
+      // this find agree by computing the same function.
+      if mva >= 0 {
+        return repStructSlotsTwin(
+          variantStructHeapTwinAt(mva),
+          mvValStructIdx[b],
+        )
+      }
+      return repStructSlotsTwin(mvValStructIdx[a], variantStructHeapTwinAt(mvb))
+    }
     if mva >= 0 { return repVariantSlotsTwin(mva, mvb) }
     return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b])
   }
@@ -21897,6 +21939,55 @@ export function buildVariantTwins() {
     uVarTwin.push(rep)
     i = i + 1
   }
+  uVarSTwin = []
+  i = 0
+  while i < uVariants.length {
+    uVarSTwin.push(variantStructHeapTwinAt(i))
+    i = i + 1
+  }
+}
+
+// THE CROSS-TABLE HEAP TWIN: the declared STRUCT slot variant `vi` shares a WasmGC heap
+// type with, or -1 (silent-class-inventory D280).
+//
+// WHY THIS EXISTS AT ALL. `DECISIONS.md` states the rule the struct layer was built on:
+// `type A = {v:i32}` and `type B = {v:i32}` "are THE SAME type (the checker accepts a `B`
+// wherever an `A` is expected), so they MUST share one heap type", and minting two was "an
+// active soundness bug". The checker applies that same acceptance across the variant⇄struct
+// seam — a `Dot = {r:i32}` IS accepted where the arm `Circle = {r:i32}` is expected — and
+// the two tables never merged, so the seam kept the bug the other three layers closed.
+// `armLayoutContestedAt` is the predicate that DETECTS the unmerged pair, and every gate
+// in the D156 family is a decline standing where this merge belongs.
+//
+// PATTERN 4 — A KEY THAT NEED NOT SEE THE PAIR. Both claimants derive their heap from the
+// arm's own declared arena type through `repSlotOfTy`, the bridge `armLayoutContestedAt`
+// already asks; the mint (`mAssignTypeIndices`) and every pairwise find compute the SAME
+// function of `vi` and agree without either observing the other. That is what keeps it
+// TIMING-INDEPENDENT, which `rlSlotsLayoutTwin`'s header requires of anything it consults.
+//
+// THE LAYOUT GUARD IS DELIBERATELY CONSERVATIVE AND THE NARROWNESS IS MEASURED, not
+// assumed: a field whose emitted storage is a `(ref [null] <heap>)` the CODE does not name
+// (5 / 15 / 28 a ref list, a nested struct and the list's niche; 19 / 29 a map) declines
+// the merge outright rather than descending into the referenced layer the way
+// `variantFieldLayoutEq` does. Never-merged is the safe degenerate (the `""`-key
+// discipline `structFieldCodesEq` states), the whole D156/D158/D171 family is
+// fixed-storage arms, and widening it is a separate measurement.
+export function variantStructHeapTwinAt(vi: i32): i32 {
+  if vi < 0 { return -1 }
+  if vi >= uVarTyIx.length { return -1 }
+  if vi >= uFieldCount.length { return -1 }
+  const si = repSlotOfTy(uVarTyIx[vi])
+  if si < 0 { return -1 }
+  if si >= sFieldCount.length { return -1 }
+  if uFieldCount[vi] != sFieldCount[si] { return -1 }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    const cv = uFieldTypes[uFieldStart[vi] + fi]
+    if cv != sFieldTypes[sFieldStart[si] + fi] { return -1 }
+    if cv == 5 || cv == 15 || cv == 28 || cv == 19 || cv == 29 { return -1 }
+    fi = fi + 1
+  }
+  si
 }
 
 // The structural signature of variant `vi` — its field names joined with `,` (a
