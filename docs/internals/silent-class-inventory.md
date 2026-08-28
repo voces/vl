@@ -9577,6 +9577,14 @@ Repro (three lines, and the third is the whole pin):
   program — its predicate is not even reached, because nothing here READS the adopted field.
   The pin's fixture is one of the three corpus modules the close's `cmp` moves, and it still
   prints all six of its `7`s.
+* **NOR BY D291's (2026-08-28), and the WIDENED spelling of this pin was added rather than
+  assumed.** `type Circle = { r: i64 | null }` over the same three lines — the shape D291's row
+  had predicted would have to be paid for — runs on master and after, `reach=0` on the same
+  counter build. It is program 7 of
+  `tests/cases/soundness/adopted-read-widened-store-narrows-back.vl`, and its `is i64` sibling
+  (program 9) is the witness that REFUTES this row's own proposed close: the store's widening
+  is what makes that program right, so declining the adoption is not available as a fix for
+  D291 either.
 * Pinned as a fixture: programs 2 and 3 of
   `tests/cases/soundness/anon-literal-adopted-by-a-declared-box-field.vl` (the `Circle[][]`
   spelling and the `Circle[]` one).
@@ -9618,6 +9626,12 @@ Repro (four lines, and the third is the whole pin):
   grid, `d156` (1,188), `d88` (2,850) or `d112` (1,114)** — 57,492 cells, every one of which
   reads the field BARE. The corpus `cmp` cannot see it either: it is byte-identical because
   the corpus holds no program of this shape.
+* **D291 CLOSED 2026-08-28 AND ALL 72 STILL RUN, re-graded cell by cell against that seed.**
+  That close widens the very predicate this pin is about — the i64/f64 half of these 72 is
+  exactly the population it moves — so the set was re-run rather than argued about: 72 `runs`
+  before, 72 `runs` after, 0 moved. The rung that keeps them is `W`, the coercion taking the
+  read's delivered atom only where the destination stores that atom as itself; strip it and 36
+  of these 72 go loud, which is this pin doing its job.
 * **D209 CLOSED 2026-08-28 AND THIS PIN STILL RUNS — all 72 of them.** The close pairs the
   read-site unbox with `exprUnion` and with the coercion's atom pick, so the read delivers the
   atom and the consumer boxes it again; disassembled, `global.set` here now receives
@@ -9636,7 +9650,7 @@ Repro (four lines, and the third is the whole pin):
 ---
 
 ### D209 — a declared struct CAPTURES an anonymous literal the checker never widened
-**[CLOSED 2026-08-28] the filed repro RUNS and prints `7` · was `check-clean invalid wasm` · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · closed by THREE rungs on ONE predicate, and all seven partial compositions were built and graded — the row's own predicted two-rung close (read site + `exprUnion`) is measurably NOT sufficient, and the 8 cells it costs are pinned as D290 · the i64/f64 sub-family is DELIBERATELY not closed and is filed as D291 · both refutation pins (D271 resolver-side, D272 read-side) still run · **IT WAS THE SPECIMEN** (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `xfail-miscompile-declared-struct-captures-anon-list-element.vl`, chosen 2026-08-28 because it DECLARES NO UNION and the variant⇄struct family's mechanisms were therefore structurally inapplicable to it — a property that HELD; the close came from the code-16 READ, which that family does not reach). That pin is deleted here, the program graduated to `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl`, and the slot is re-pointed at **D291**, chosen because a re-run of all 136 rows' own filed programs makes it the ONLY live member of the class.**
+**[CLOSED 2026-08-28] the filed repro RUNS and prints `7` · was `check-clean invalid wasm` · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · closed by THREE rungs on ONE predicate, and all seven partial compositions were built and graded — the row's own predicted two-rung close (read site + `exprUnion`) is measurably NOT sufficient, and the 8 cells it costs are pinned as D290 · the i64/f64 sub-family was DELIBERATELY not closed and was filed as D291, **which CLOSED 2026-08-28** by naming the STORE's own promotion ladder and asking it at both ends of the box · both refutation pins (D271 resolver-side, D272 read-side) still run · **IT WAS THE SPECIMEN** (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `xfail-miscompile-declared-struct-captures-anon-list-element.vl`, chosen 2026-08-28 because it DECLARES NO UNION and the variant⇄struct family's mechanisms were therefore structurally inapplicable to it — a property that HELD; the close came from the code-16 READ, which that family does not reach). That pin is deleted here, the program graduated to `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl`, and the slot is re-pointed at **D291**, chosen because a re-run of all 136 rows' own filed programs makes it the ONLY live member of the class.**
 
 Repro:
 
@@ -9770,13 +9784,19 @@ Repro:
   ladder's numeric default and `struct.new $vbI32` was applied to a string ref. The coercion's
   ATOM PICK is a third end of the same channel. Pinned as **D290**.
 
-* **THE i64/f64 SUB-FAMILY, where THREE atoms disagree.** `type Circle = { r: i64 | null }`
-  beside the same `const lv1 = [{ r: 7 }]`: the field's declared member is i64, the emitter
-  stores the payload as i64 (tag 3, `struct.new $vbI64`, `print` routed to `__print_i64__`),
-  and the CHECKER types the read i32. Under the read-side candidate those 18 cells become a
-  loud `narrowed union field atom has no value box (kind 0)` rather than running, because the
-  i32 value box the read would ask for was never minted. Any future close has to pick which of
-  the three sources wins; the row above is why picking at the read alone is not available.
+* **THE i64/f64 SUB-FAMILY, where THREE atoms disagree — FILED AS D291 AND CLOSED THE SAME
+  DAY (see that row).** `type Circle = { r: i64 | null }` beside the same
+  `const lv1 = [{ r: 7 }]`: the field's declared member is i64, the emitter stores the payload
+  as i64 (tag 3, `struct.new $vbI64`), and the CHECKER types the read i32. Under the read-side
+  candidate those 18 cells become a loud `narrowed union field atom has no value box (kind 0)`
+  rather than running, because the i32 value box the read would ask for was never minted.
+  **The sentence this bullet ended with — "any future close has to pick which of the three
+  sources wins" — was the wrong frame, and D291 records the correction: none of the three has
+  to lose.** The store widened the payload because the declared member said so, and that
+  widening is INVERTIBLE, so the read casts to the atom the store used and narrows back to the
+  atom the checker's consumers were typed against. The condition this rung declines on stays
+  exactly as strict; what changed is that the question it asks (`unionStoreAtomKind`) is now
+  the STORE's own ladder rather than a plain membership test.
 
 * **ABLATION BY STRIPPING.** Two candidates were built against this row: `C` (the read rung)
   and `G` (the resolver rung this row's D208 half needs). Stripping BOTH reproduces
@@ -9814,9 +9834,13 @@ Repro:
   **THE PREDICATE HAS THREE CONDITIONS AND THE THIRD IS THE ONE THE REFUSED CANDIDATE LACKED.**
   (1) the read is UN-narrowed — the narrowed path has its own unbox and `exprUnion` already
   declines for it; (2) the CHECKER banked a primitive value atom at the read node — the D209
-  asymmetry itself; (3) **the box can actually HOLD that atom** (`unionHasAtom` over the field's
-  own member set). Condition 3 is why `C` lost 72 cells and `R` loses 36: without it the
-  i64/f64 sub-family unboxes to an atom the store never boxed. See D291.
+  asymmetry itself; (3) **the box can actually HOLD that atom.** Condition 3 is why `C` lost 72
+  cells and `R` loses 36: without it the i64/f64 sub-family unboxes to an atom the store never
+  boxed. **D291 then generalised condition 3 without weakening it**: `unionHasAtom` over the
+  field's member set became `unionStoreAtomKind`, the STORE's own promotion ladder, which
+  answers for a WIDENED payload too and still declines everywhere no arm could have carried the
+  atom. Dropping the condition is still the refused candidate `C`; asking it of the ladder is
+  D291's close.
 
 * **MEASURED — FOUR INSTRUMENTS, and the corpus `cmp` first.**
 
@@ -9934,6 +9958,10 @@ Repro (four lines, and the difference from D272's pin is one atom):
   box-wanting consumers. All 60 run under the shipped three-rung composition. They are named in
   `scripts/silent-sweep/d290/runs-lost.txt` and `scripts/silent-sweep/census/d290-channel-price.json`,
   and kept whole in `scripts/silent-sweep/distilled/named/`.
+* **RE-GRADED AGAINST D291's CLOSE (2026-08-28): all 85 named cells still run, 0 moved.** That
+  close touches the same three sites this pin is about, so the set was re-run rather than
+  reasoned about — and the grid it came from moved **+16 → runs, 0 lost, 0 into silent**, four
+  of the sixteen out of `runs but wrong value`.
 * Pinned as a fixture: programs 3 and 4 of
   `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl` (the binding consumer and the
   union-PARAM one, which take different emitter paths).
@@ -9941,68 +9969,206 @@ Repro (four lines, and the difference from D272's pin is one atom):
 ---
 
 ### D291 — the i64/f64 sub-family of the adopted read, where THREE sources disagree
-**check-clean invalid wasm · found 2026-08-27 inside D209, left OPEN by its close 2026-08-28 and deliberately so · 36 of the d272 grid's 1,260 cells and 0 of the d290 grid's (its `shape` axis declines them by construction) · pre-existing on `322c07f2`, on `474b6a1b`, on `f6fda728` and after D209's close, with the module BYTE-IDENTICAL across it (274 bytes) · **THE SPECIMEN as of 2026-08-28** — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `tests/cases/soundness/xfail-miscompile-adopted-read-three-source-atom.vl`**
+**[CLOSED 2026-08-28] the filed repro RUNS and prints `7`, and so does the `f64` spelling · was `check-clean invalid wasm` · found 2026-08-27 inside D209, left open by its close on a MEASURED decline (`reach=1 ans=0`) and closed here by asking the declining condition's question from the other end · 18 of the d272 grid's 1,260 cells and 16 of the d290 grid's 714, four of which were `runs but wrong value` · closed by THREE rungs on ONE ladder plus a FOURTH, separable one, with every partial composition built and graded · the row's OWN prediction — "the only source that can be made right is the STORE" — is REFUTED with a witness · both refutation pins (D271 resolver-side, D272 read-side) still run, all 72 of D272's named cells and all 85 of D290's · **IT WAS THE SPECIMEN** (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `xfail-miscompile-adopted-read-three-source-atom.vl`); that pin is deleted here, the program graduated to `tests/cases/soundness/adopted-read-widened-store-narrows-back.vl`, and the slot is re-pointed at **D300** — the census the previous swap ORDERED was re-run and the class had not emptied**
 
 Repro (D209's repro with ONE token changed — `i32` becomes `i64`):
 
     type Circle = { r: i64 | null }
     const lv1 = [{ r: 7 }]
     print((lv1[0]).r)
-    // vl check rc 0 with NO diagnostics; vl run:
-    //   Invalid input WebAssembly code: type mismatch
+    // `ada42128`: vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
+    // Now: 7
 
 * **THREE SOURCES, NOT TWO.** D209 is a disagreement between the emitter's rep (a box) and the
   checker's type (`i32`). Here a third joins: the field's DECLARED member is `i64`, so the store
   boxes the payload as tag 3 / `struct.new $vbI64`, and the checker still types the read `i32`.
   Whichever of the three the read is made to believe, one of the other two is wrong — unbox to
   i32 and the `ref.cast $vbI32` faces an `$vbI64` payload; unbox to i64 and `print`, typed `i32`
-  by the checker, gets an i64.
-* **D209'S CLOSE DECLINES IT ON PURPOSE, AND THE DECLINE IS MEASURED.** The channel predicate's
+  by the checker, gets an i64. The `f64 | null` spelling is the same row and moves with it.
+* **D209'S CLOSE DECLINED IT ON PURPOSE, AND THE DECLINE WAS MEASURED.** The channel predicate's
   third condition — the box can actually hold the checker's atom — is exactly this test, and a
-  counter build reads `reach=1 ans=0` on this program: the rung SEES the read and refuses. Drop
-  the condition and the composition becomes the refused candidate `C`, which lost 72 cells: the
-  36 `nuli64`/`nulf64` cells of the d272 grid are the half condition 3 rescues (`R` alone loses
-  36, not 72).
-* **SO THE FIX IS NOT AT THE READ EITHER, and this row is where that is recorded.** Closing it
-  means picking which source wins, and the only source that can be made right for all three is
-  the STORE — i.e. the adoption, which is D271's refused resolver side. This row is the residue
-  D209's close leaves behind, filed so the family's remaining surface is not carried in prose
-  inside a CLOSED row.
-* The `f64 | null` spelling is the same row (`const lv1 = [{ r: 7 }]` under
-  `type Circle = { r: f64 | null }`), unmoved in either direction by D209's close.
+  counter build read `reach=1 ans=0` on this program: the rung SAW the read and refused.
+  Dropping the condition turns the composition into the refused candidate `C`, which lost 72
+  cells. **That price is still real and this close does not pay it** — in the ablation below the
+  widened predicate landing ALONE loses 64 running programs, which is the same refusal
+  re-measured on this tree.
 
-* **IT IS THE `--codegen` SPECIMEN, AND THE PROPERTY IT IS CHOSEN ON IS A CENSUS RATHER THAN AN
-  ARGUMENT.** The slot had turned over twice in one day — D282 → D209 (#1984) → D224 (recorded,
-  then CLOSED by #1985 before it could be taken) — so this time the successor was picked by
-  RUNNING every row in this document rather than by reasoning about families. All **136** rows'
-  own filed programs were graded against `f6fda728`'s seed; exactly **ONE** is `check-clean
-  invalid wasm`, and it is D209, which this commit closes. **This row is the only live member of
-  the class that remains**, and the corpus agrees: after D209's pin is deleted, the
-  `@no-instantiate` directive appears on no file at all. So it is not chosen over alternatives —
-  it is what is left, which is the one selection rule that cannot be wrong about the population.
-* **THE PROPERTIES, ALL CHECKABLE, ALL RE-RUN AT THE SWAP RATHER THAN INHERITED.** `vl check` rc 0
-  with **ZERO diagnostics**; `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected
-  i32, found (ref $type)`; `--codegen --no-validate` rc 0; `vl build` writes the `.wasm` and exits
-  1; NO `emit error` marker; the module is byte-identical across this change at 274 bytes. It
-  DECLARES NO UNION, so it inherits the structural property #1984 chose D209 for — `uVariants` is
-  empty and the whole variant⇄struct family (D33 / D139 / D156 / D158 / D171 / D224 / D280 / D282)
-  is inapplicable to it.
-* **AND THE HONEST CAVEAT, because the last two selection rules each failed within a day.** This
-  specimen is NOT out of reach of the mechanism that just closed its sibling: the channel
-  predicate SEES it and declines, counted at the site as `reach=1 ans=0`. Drop the predicate's
-  third condition and this row closes — and 36 d272 cells redden, which is exactly the `R alone`
-  column of D209's ablation. It survives on a MEASURED refusal, which is the same class of
-  evidence D224 had when its 199-cell price turned out to be a bundle. Read the price, not the
-  silence. **If it closes and nothing replaces it, the class is empty**: set `INVALID_MODULE_SRC =
-  null` and let the announced-inactive path in that file do its job, rather than reaching for a
-  program that is not really in the class.
-* **AND IT HAS A `runs but wrong value` FORM, which is the worse half.** The d290 grid's four
-  `f64nul_eqlit_*` cells — `if (v).r == 7 { print(7) } else { print(0) }` over the same
-  adoption — LOAD and print `0`, on master and after the close alike. The store widened the
-  payload to f64 and the compare is emitted against the checker's i32, so the union `==`
-  silently answers false: no diagnostic, a valid module, a wrong answer. Any close for this row
-  has to move that cell too, and a fix graded only on `check-clean invalid wasm` would not see
-  it.
+* **THE ROW'S OWN PREDICTION WAS WRONG, AND THE WITNESS IS ONE LINE.** This row said: *"the only
+  source that can be made right for all three is the STORE — i.e. the adoption, which is D271's
+  refused resolver side."* Built as a question and answered NO. Add a destination and the store's
+  widening is not a mistake at all:
+
+      type Circle = { r: i64 | null }
+      const lv1 = [{ r: 7 }]
+      const c: Circle[] = lv1
+      if (c[0]).r is i64 { print(7) } else { print(0) }   // runs and prints 7, on master too
+
+  Make the store box `7` at the checker's `i32` and that program silently prints `0`; decline
+  the adoption instead and it is invalid wasm — D271's pin, at the widened atom, which runs on
+  master too and is now program 7 of the fixture. **The store is RIGHT**: `7` genuinely is the
+  `i64` member of `i64 | null`, and what was missing is that the widening is **invertible** and
+  nobody had asked the ladder that performed it from the other end. Program 9 of the fixture is
+  that witness, kept so the next attempt does not have to re-derive it.
+
+* **THE CLOSE — THREE RUNGS ON ONE LADDER (2026-08-28).** `unionStoreAtomKind(unionName, vk)`
+  answers *the value atom a value of atom kind `vk` is ACTUALLY STORED as when it is boxed into
+  this union*. It is `emitUnionCoerce`'s own promotion ladder — no `i32` arm but a wider numeric
+  one, take that one — lifted into a function and asked at BOTH ends of the box, which is
+  D209's lesson one classifier further in:
+
+  | rung | site | what it does |
+  |---|---|---|
+  | **P** | `memReadBoxedAtomKind` (`emit_classify`) | the channel predicate's condition 3 becomes *"the ladder can name the atom the store used"* instead of *"the box holds the checker's atom"*, so a WIDENED store is claimed. `exprUnion` follows for free — it asks the same predicate |
+  | **R** | `emitUnionFieldNarrowUnbox` (`wasmEmit`) | the read casts the payload to the STORED atom and NARROWS it back to the delivered one — `i32.wrap_i64`, `i32.trunc_f64_s`, `i32.trunc_f32_s`, `f64.promote_f32`: the four inverses of the four promotions and no others |
+  | **W** | `emitUnionCoerce`'s `cak` ladder (`wasmEmit`) | the read's delivered atom is taken only where THIS destination stores that atom as itself; where the destination widens too, the ladder below re-applies the same promotion the read just undid |
+  | **E** | `unionEqAtomOf` (`emit_classify`) | the union-`==` arm pick comes off the same ladder. SEPARABLE and priced alone (see the table): it is not part of the three-rung interlock |
+
+  **THE CONTRACT IS UNCHANGED, AND THAT IS WHY ONLY THREE SITES MOVE.** `memReadUnboxAtomKind`
+  still answers *the atom the read DELIVERS*, which is the atom the checker typed every consumer
+  against — so `print`'s import ladder, the arithmetic widenings and the assignment boundaries
+  are all right with no teaching at all. The alternative — deliver the atom the box HOLDS — was
+  considered and is a strictly larger change: every consumer classifier would have to learn the
+  predicate, and `print` alone reads four of them. (What that alternative would have fixed for
+  free is D311, which this close does NOT move.)
+
+  **THE CONVERSION IS EXACT, not a truncation that happens to work.** The payload can only have
+  been widened FROM the checker's atom — that is what `unionStoreAtomKind` answering a different
+  kind means — so an i32 that went in comes back out bit-for-bit. A pair the ladder cannot
+  produce is a loud reject rather than a guess.
+
+* **MEASURED — FOUR INSTRUMENTS, and the corpus `cmp` first.**
+
+  | instrument | population | `runs` LOST | into silent | forward |
+  |---|---|---|---|---|
+  | corpus `cmp`, byte-for-byte | **1,909 modules built** of 2,341 files | — | — | **1,908 identical, and ZERO pre-existing modules move.** The single mover is this row's own specimen pin (274 → 286 bytes) |
+  | the **d272 READ grid** | 1,260 | **0** | **0** | **+18** `check-clean invalid wasm → runs`, and all 72 of its named `runs-lost` cells still run |
+  | the **d290 CHANNEL grid** | 714 | **0** | **0** | **+16** — 12 `check-clean invalid wasm → runs` and **4 `runs but wrong value` → runs**; all 85 of its named cells still run |
+  | the **DISTILLED census** (1,477 representatives + 465 curated) | 1,942 | **0** | **0** | 0 — *no cell changed class* |
+
+  **THE DISASSEMBLY, in this row.** Base hands `struct.get $C1 0` — a `(ref $uBox)` — straight
+  to `__print_i32__`. After: `struct.get $C1 0` · `struct.get $uBox 1` · `ref.cast (ref $vbI64)`
+  · `struct.get $vbI64 0` · **`i32.wrap_i64`**, and the `f64 | null` spelling is the same five
+  with `$vbF64` and `i32.trunc_f64_s`. The STORE is untouched in both — the global still builds
+  `i32.const 3` · `i64.const 7` · `struct.new $vbI64`. On a box-WANTING consumer
+  (`const q: i64 | null = (v).r`) the round trip is visible and is the landing's whole cost:
+  `i32.wrap_i64` · `i64.extend_i32_s` · `struct.new $vbI64` · `struct.new $uBox`, where base
+  passed the box straight through.
+
+  **THE COUNTERS, which is why the corpus `cmp` is a mechanism and not a coincidence.** A
+  counter build over the whole corpus: with conditions 1 and 2 held, the ladder is asked **36
+  times across 3 files**, and its WIDENED answer — the only new behaviour — fires **2 times in
+  exactly ONE file**, which is the one module `cmp` moves. Per program: this row's repro
+  `reach=2 ans=2 widen=2 readfire=1`, the `f64` spelling identical; **D209's own repro
+  `widen=0`**, untouched; **D271's pin `reach=0`** — the predicate is not even reached, so this
+  close provably cannot move that row; **D272's pin shape at the widened atom
+  `widen=5 readfire=1 wdecline=1`**, the read narrowing AND the coercion's guard declining, both
+  new rungs firing on the program that would otherwise silently break.
+
+* **ABLATION BY STRIPPING — every composition, and both direction checks.** `S` is the ladder
+  itself (`unionStoreAtomKind` plus `emitUnionCoerce`'s two promotion arms re-pointed at it), a
+  pure refactor and the one part that cannot be "stripped" — so it is proved inert by OUTPUT
+  rather than by size: **`S` alone emits 1,909 of 1,909 corpus modules byte-identical to
+  master**, and moves 0 of the 1,974 grid cells in either direction.
+
+  | compiler | bytes | d272 →runs | d272 runs LOST | d290 →runs | d290 runs LOST |
+  |---|---|---|---|---|---|
+  | base (strip S, P, R, W, E) | 1,464,744 | — | — | — | — |
+  | `S` alone | 1,464,630 | 0 | 0 | 0 | 0 |
+  | `S+R` | 1,464,660 | 0 | 0 | 0 | 0 |
+  | `S+W` | 1,464,646 | 0 | 0 | 0 | 0 |
+  | `S+R+W` | 1,464,676 | 0 | 0 | 0 | 0 |
+  | `S+E` | 1,464,687 | 0 | 0 | **+4** | 0 |
+  | `S+P` | 1,464,473 | 0 | **36** | 0 | **28** |
+  | `S+P+R` | 1,464,503 | +18 | **36** | +14 | **24** |
+  | `S+P+W` | 1,464,489 | 0 | **36** | 0 | **28** |
+  | `S+P+R+W` | 1,464,519 | +18 | **0** | +14 | **0** |
+  | **`S+P+R+W+E`** (shipped) | **1,464,576** | **+18** | **0** | **+16** | **0** |
+
+  **DIRECTION CHECK 1 — two rungs that score ZERO on every population and are both
+  load-bearing.** `R` alone, `W` alone and `R+W` each move **0 of 1,974 cells in either
+  direction**; strip `W` from the landing and 64 running cells go loud, strip `R` and 32 more
+  join them. They are inert until `P` is present, which is the mechanical form of "a per-rung
+  zero is a reason to ask what the rung holds up, not a reason to drop it".
+
+  **DIRECTION CHECK 2 — one alone is a catastrophe.** `P` alone loses 64 running cells and gains
+  **nothing**: the predicate claims the widened read while the read still casts to the checker's
+  atom, so `vbHeapIdxOfKind` is asked for a value box that was never minted.
+
+  **THE BUNDLE TEST (D224's), RUN IN FULL — and it separates the landing into two parts, which
+  is the answer that test exists to produce.** Over both grids, `P` loses 64, `P+R` 60, `P+W`
+  64, and `R` / `W` / `R+W` lose 0 while gaining 0; only the whole of `{P, R, W}` gains 32 and
+  loses 0, and `S+P+W`'s moved set is **cell-identical** to `S+P`'s (54 = 54 on d272, 42 = 42 on
+  d290) while `S+P+R`'s differs from it only in where the gained cells LAND. So `{P, R, W}` is
+  atomic: no strict subset is loss-free, and neither `R` nor `W` is independently priceable.
+  **`E` is the opposite and is reported as such**: alone it gains 4 and loses 0, and its 4
+  strictly CONTAIN the 2 that `{P, R, W}` reaches by a different route (bypassing the union-`==`
+  path entirely). It ships in the same commit because it is the same ladder's fourth reader, not
+  because it could not be priced.
+
+* Fixture: `tests/cases/soundness/adopted-read-widened-store-narrows-back.vl` — nine programs,
+  and it passes ONLY on the full composition: base, `S`, `S+E`, `S+R`, `S+W`, `S+R+W`, `S+P`,
+  `S+P+R` and `S+P+W` all fail it, and `S+P+R+W` prints eight `7`s and a `0`. D271's and D272's
+  own fixtures are unchanged and still run.
+* **THE ROW'S OWN POPULATION NUMBER WAS WRONG AND IS CORRECTED HERE.** The header said "36 of
+  the d272 grid's 1,260 cells"; graded on `ada42128` it is **18** — `fld ∈ {nuli64, nulf64}` ×
+  `read = bare` × `cont ∈ {bare, forin, list}` × `annpat ∈ {none, dest, destdeep}`. The 36 was
+  D272's PRICE at those two field spellings (the `tounion`/`tofld` cells a partial composition
+  reddens), a different set this row inherited by transcription from the sentence that named it.
+  Both are now in `scripts/silent-sweep/census/d291-widened-store-price.json` with their roles —
+  **64 `partial-price` and 34 `gained`** — and all 98 are whole in
+  `scripts/silent-sweep/distilled/named/`, so `scripts/gate.sh` re-grades them.
+* **THE `runs but wrong value` FORM, which was the worse half, is CLOSED — and it took the
+  FOURTH reader of the ladder.** The d290 grid's four `f64nul_eqlit_*` cells —
+  `if (v).r == 7 { print(7) } else { print(0) }` over the same adoption — LOADED and printed
+  `0`. The two at `annpat=none` close through the channel: the read is no longer a union value,
+  so the union-`==` path is never entered and the compare is a plain i32 one. The two at
+  `annpat=bind` are **not this row's mechanism at all** — there the binding is annotated, the
+  checker types the read as the union honestly, and the miss was `unionEqAtomOf` carrying its
+  own copy of the promotion ladder with only the `i64` half of it (`!i32 && i64`), so an integer
+  compared against `f64 | null` selected the box's i32 arm and answered false. Rung `E` points
+  that arm at `unionStoreAtomKind`; program 8 of the fixture is the annotated spelling.
+
+---
+
+### D311 — the STRING atom the adopted read DELIVERS, which `print` routes by a classifier that never asks
+**check-clean invalid wasm · found 2026-08-28 while closing D291, as 5 of the d290 grid's 714 cells · UNMOVED by that close in either direction and the counter says why (`widen=0` — no widening is involved, so the ladder is never the question here) · pre-existing on `ada42128` and on the shipped seed alike**
+
+Repro (three lines; the `i32` arm is what makes it silent rather than loud):
+
+    type Circle = { r: string | i32 }
+    const v = { r: "7" }
+    print((v).r)
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
+
+* **IT IS THE FOURTH END OF D209'S CHANNEL, and the first three are all working here.**
+  `structIndexOfObjCtx` adopts `Circle`'s row, the store boxes `"7"` under the string tag, the
+  channel predicate FIRES (`reach=2 ans=2`), the read delivers a bare `(ref $sTypeIdx)` and
+  `exprUnion` correctly stops calling it a union value. Every one of those is right. What is
+  wrong is one step later: `print`'s import ladder picks its overload from `exprString` /
+  `exprIsF32` / `exprIsF64` / `exprIsI64` / `exprIsBool`, **none of which asks the predicate** —
+  each reads an un-narrowed code-16 member as the BOX and declines — so the value falls to
+  `__print_i32__` and a string ref lands in an `(i32) -> ()` call.
+* **THE `isnar` CELL IS THE PROOF THAT THE READ IS NOT AT FAULT.**
+  `if (lv1[0]).r is string { print((lv1[0]).r) }` is invalid wasm too, and there the read takes
+  the NARROWED path — `emitUnionFieldNarrowUnbox`'s original arm, which has unboxed to the
+  string ref correctly since long before D209. The consumer classifier is the only thing the
+  two spellings share.
+* **THE POPULATION, and it is small because the checker rejects most of the neighbourhood.**
+  5 of the d290 grid: `shape=stri32` × `annpat=none` × (`print` × {bare, list}, `local` ×
+  {bare, list}, `isnar` × {list}). `stri32_isnar_bare_none` RUNS — the bare receiver's narrow
+  installs a member-path binding the print site can see — which is the axis pair that separates
+  the two. Every `annpat=bind` sibling is a loud check reject.
+* **WHY IT IS FILED RATHER THAN FIXED HERE.** The repair is the OTHER contract for the channel:
+  make the predicate's answer reach the consumer classifiers instead of making the read deliver
+  the checker's atom. D291's close deliberately kept the existing contract because it is the one
+  that needs no consumer taught — see that row. Moving five classifiers is a change with its own
+  grid (`cons` × `shape`, and `print` alone reads four of them), and half-opening it is the
+  shape of regression `memberUnionFieldNameRead`'s header already records at D220.
+* Named in `scripts/silent-sweep/census/d291-widened-store-price.json`? **No** — these five
+  cells do not move under any composition D291 built, so they are not that set. They are the
+  d290 grid's own coordinates and regenerate from `scripts/silent-sweep/d290/gen290.py`.
 
 ---
 
@@ -11258,7 +11424,7 @@ Regression: `tests/cases/unions/arm-field-read-beside-a-second-unions-layout-twi
 ---
 
 ### D300 — D224's price, spelled without the twin: 27 nullable-field arm reads that are invalid wasm with NO twin declaration anywhere
-**check-clean invalid wasm · found 2026-08-28 by de-confounding D224's `twin` axis · 27 live of an original 65 census-block-B coordinates — #1984 retired 38 of them · silent on `21f48747` and on D224's branch alike · the population D224's arm-twin gate was an accidental loud floor over, and the exact size of that row's remaining price**
+**check-clean invalid wasm · found 2026-08-28 by de-confounding D224's `twin` axis · 27 live of an original 65 census-block-B coordinates — #1984 retired 38 of them · silent on `21f48747`, on D224's branch and on `ada42128` alike, with the module BYTE-IDENTICAL (3,392 bytes, same offset) across D291's close · the population D224's arm-twin gate was an accidental loud floor over, and the exact size of that row's remaining price · **THE SPECIMEN as of 2026-08-28** — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `tests/cases/soundness/xfail-miscompile-twinfree-nullable-arm-read.vl`, taken at D291's landing, when a re-run of all 139 rows' own filed programs made this the only live member of the class**
 
 Repro (grid-T cell `t000188` — census block B cell `b008898`'s coordinate with its three
 `Dot*` lines deleted, i.e. `twin=none`, which is the point: nothing nominal is contested here):

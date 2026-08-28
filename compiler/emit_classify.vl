@@ -503,6 +503,7 @@ import {
   hcShapeSetId,
   mapShapeKeyI32,
   msAtomIdOf,
+  msHasValKind,
   mvSlotArmMatches,
   mvSlotKeyI32,
   mvSlotOfTyKArm,
@@ -9714,16 +9715,28 @@ export function unionEqAtomOf(otherIx: i32, unionName: string, fnIx: i32) {
   } else if exprIsBool(otherIx, fnIx) {
     atom = "boolean"
   } else {
-    if (
-      !unionHasAtomTy(unionName, "i32", false) &&
-      unionHasAtomTy(unionName, "i64", false)
-    ) {
-      atom = "i64"
-    }
+    // THE UNION'S OWN PROMOTION, asked of the same ladder the STORE used
+    // (`unionStoreAtomKind`) rather than re-derived here. This arm knew only the i64 half
+    // — `!i32 && i64` — so an integer compared against a union whose only numeric arm is a
+    // FLOAT stayed `"i32"` and read the box's numeric payload under the wrong arm:
+    // `type C = { r: f64 | null }` beside `const v: C = { r: 7 }` made `(v).r == 7`
+    // silently FALSE, a valid module with a wrong answer (D291's `runs but wrong value`
+    // half; the d290 grid's `f64nul_eqlit_*_bind` cells). It is the identical omission
+    // `emitUnionCoerce`'s ladder had before it was taught, which is the argument for the
+    // two asking one function instead of each carrying a copy.
+    const eqw = unionStoreAtomKind(unionName, 0)
+    if eqw >= 0 { atom = valueAtomNameOfKind(eqw) }
     const bare = P.nodes[unwrapParen(otherIx)]
     if bare is NumLit {
       if !numLexFitsI32(bare.numText) { atom = "i64" }
     }
+  }
+  // The f64 -> f32 re-encode, the coerce ladder's twin of the same entry one atom up: a float
+  // value against a union whose only float arm is `f32` is STORED in the f32 box, so the
+  // compare has to select that arm.
+  if atom == "f64" {
+    const eqw4 = unionStoreAtomKind(unionName, 4)
+    if eqw4 >= 0 { atom = valueAtomNameOfKind(eqw4) }
   }
   atom
 }
@@ -10057,15 +10070,41 @@ export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
 //   2. the CHECKER banked a primitive value ATOM at the read node. That is the D209
 //      asymmetry itself: `structIndexOfObjCtx` adopted a declared row whose field is a
 //      union box, while the checker never widened the literal and still says `i32`;
-//   3. **THE BOX CAN ACTUALLY HOLD THAT ATOM** (`unionHasAtom` over the field's own
-//      member set). Without it the i64/f64 sub-family unboxes to the WRONG atom:
-//      `type Circle = { r: i64 | null }` beside `const lv1 = [{ r: 7 }]` stores tag 3
-//      / `struct.new $vbI64`, and the checker says `i32` — so a kind-0 unbox casts the
-//      payload to `$vbI32`, which is a runtime trap where that box exists and a loud
-//      "no value box" where it does not. THREE sources disagree there (declared member,
-//      stored payload, checker type) and a read site is not the place to pick between
-//      them, so the rung declines and those cells keep exactly today's behaviour.
+//   3. **THE BOX ACTUALLY HOLDS A PAYLOAD THAT ATOM CAN BE RECOVERED FROM**
+//      (`unionStoreAtomKind` — the STORE's own ladder, asked here). The box does not
+//      have to hold the checker's atom itself: where the union's only numeric arm is
+//      WIDER (`i64 | null` / `f64 | null` beside `{ r: 7 }`) the store widened the
+//      payload on the way in, and the read narrows it back on the way out. What the
+//      condition refuses is a union with no arm the atom could have been stored as at
+//      all — there the box's payload is unrelated to the checker's atom and a read site
+//      is not the place to invent one. See D291.
 export function memReadUnboxAtomKind(memIx: i32, fnIx: i32): i32 {
+  if memReadBoxedAtomKind(memIx, fnIx) < 0 { return -1 }
+  memReadCheckerAtomKind(memIx)
+}
+
+// The value atom the CHECKER banked at an un-narrowed code-16 read — condition 2 of the
+// channel predicate on its own, with no union anywhere in it. -1 when the checker typed
+// the node as anything but a non-`null` value atom.
+function memReadCheckerAtomKind(memIx: i32): i32 {
+  const cty = nodeTyIxOf(memIx)
+  if cty < 0 { return -1 }
+  const t = T.tys[cty]
+  if t is TyPrim {
+    const k = valueAtomKind(t.primName)
+    if k < 0 || k == 6 { return -1 }
+    return k
+  }
+  -1
+}
+
+// THE OTHER HALF OF THE CHANNEL — the atom the box the read yields ACTUALLY HOLDS, which
+// is not always the atom the read DELIVERS. D291: `type Circle = { r: i64 | null }` beside
+// `const lv1 = [{ r: 7 }]` has THREE sources — the field's declared member (i64), the
+// payload the store boxed (i64, because the store widened) and the checker's type for the
+// read (i32) — and the read site has to know both ends to bridge them. -1 wherever the
+// predicate declines, so the two answers can only be asked as a pair.
+export function memReadBoxedAtomKind(memIx: i32, fnIx: i32): i32 {
   const un0 = memberUnionFieldNameRead(memIx, fnIx)
   if un0 == "" { return -1 }
   if narrowedValueAtomOf(memberPathKeyOf(memIx)) != "" { return -1 }
@@ -10075,8 +10114,64 @@ export function memReadUnboxAtomKind(memIx: i32, fnIx: i32): i32 {
   if t is TyPrim {
     const k = valueAtomKind(t.primName)
     if k < 0 || k == 6 { return -1 }
-    if !unionHasAtom(unionMemberSetOf(un0), t.primName) { return -1 }
-    return k
+    return unionStoreAtomKind(un0, k)
+  }
+  -1
+}
+
+// MEMBERSHIP of a scalar value atom in the union `nm`, answered from the banked KIND
+// column where the pool covers the set and from the member-NAME path where it does not.
+// Lifted out of `wasmEmit.vl` (where it was private) so the STORE ladder below and the
+// READ predicate above ask one function rather than two spellings of one question.
+export function unionHasAtomK(s: i32, nm: string, kw: string, k: i32): boolean {
+  const b = msHasValKind(s, k)
+  if b >= 0 { return b == 1 }
+  unionHasAtomTy(nm, kw, false)
+}
+
+// The SPELLING of a value-atom kind — `valueAtomKind`'s inverse over the seven SCALAR
+// keywords it is a bijection on (codes 0-6). "" for every other code: the list codes fold
+// several spellings into one (7 is `i32[]` AND `boolean[]` AND a litunion `K[]`), so there
+// is no single name to hand back and a caller that wants one is asking the wrong question.
+export function valueAtomNameOfKind(k: i32): string {
+  if k == 0 { return "i32" }
+  if k == 1 { return "boolean" }
+  if k == 2 { return "string" }
+  if k == 3 { return "i64" }
+  if k == 4 { return "f64" }
+  if k == 5 { return "f32" }
+  if k == 6 { return "null" }
+  ""
+}
+
+// ── D291 — THE STORE'S OWN LADDER, NAMED ─────────────────────────────────────
+// The value-atom KIND a value whose own atom is `atom`/`vk` is ACTUALLY STORED as when it
+// is boxed into the value union `unionName`. -1 when the union carries no arm that can
+// hold it at all.
+//
+// This is `emitUnionCoerce`'s promotion ladder read forward, and it is a FUNCTION rather
+// than an open-coded chain because BOTH ENDS of the box ask it: the coercion, to pick the
+// tag it stores under, and the un-narrowed read (`memReadBoxedAtomKind`), to know which
+// value box to cast the payload to. D209's lesson one classifier further in — the two ends
+// of a box cannot be allowed to derive the same answer twice.
+//
+// The promotions are exactly the ones the coercion performs and no others: an i32 value
+// into a union whose numeric arm is only wider takes that arm (`i64`, else `f64`, else
+// `f32`), and an f64 value into a union whose only float arm is `f32` re-encodes. Every
+// one of them is INVERTIBLE for the values the source atom admits, which is what lets the
+// read narrow back.
+export function unionStoreAtomKind(unionName: string, vk: i32): i32 {
+  const atom = valueAtomNameOfKind(vk)
+  if atom == "" { return -1 }
+  const s = msSetOfText(unionName)
+  if unionHasAtomK(s, unionName, atom, vk) { return vk }
+  if vk == 0 {
+    if unionHasAtomK(s, unionName, "i64", 3) { return 3 }
+    if unionHasAtomK(s, unionName, "f64", 4) { return 4 }
+    if unionHasAtomK(s, unionName, "f32", 5) { return 5 }
+  }
+  if vk == 4 {
+    if unionHasAtomK(s, unionName, "f32", 5) { return 5 }
   }
   -1
 }
