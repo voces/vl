@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Grade the DISTILLED census corpus against a seed and diff it cell-matched against the baseline.
 
-The distilled corpus is one representative per BEHAVIOURAL EQUIVALENCE CLASS of the
-250,238-cell census: two cells are in the same class when all 19 graded compiler snapshots
-in the census history gave them the identical (outcome, message). 250,238 collapses to
-1,477 that way — 99.41% of the population is redundant, and the collapse is measured, not
-assumed. See README.md for the leave-one-out result that licenses it.
+The corpus has TWO halves and they are collapsed by different rules.
+
+`cells/` is DERIVED: one representative per BEHAVIOURAL EQUIVALENCE CLASS of the 250,238-cell
+census — two cells are in the same class when all 19 graded compiler snapshots in the census
+history gave them the identical (outcome, message). 250,238 collapses to 1,477 that way, and
+the collapse is measured, not assumed. `redistil.py` rebuilds it from scratch.
+
+`named/` is CURATED and never auto-derived: the exact cells some real regression NAMED. It
+exists because a collapse can only separate what its history separated. D272's 72-cell
+runs-lost set proved that from both directions — a behavioural collapse of that grid (34 reps)
+and an axis floor over its four axes (285 reps) each covered ZERO of the 72, because on today'"'"'s
+compiler all 72 simply `run` like thousands of their neighbours. What makes them worth keeping
+is not how they behave now but what a specific candidate DID to them. Nothing derived from
+current behaviour can know that, so the named set is kept whole.
 
     python3 regress.py <seed.wasm> [--baseline F] [--write-baseline] [--json OUT]
 
@@ -14,6 +23,7 @@ REPORTED, not blocking: a program that did not work before and does not work now
 regressed in the sense a gate should stop, and ranking it as though it had is what made
 this check cost 35 minutes instead of 9 seconds.
 """
+import glob
 import json
 import os
 import subprocess
@@ -23,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 GRADER = os.path.join(ROOT, "scripts/silent-sweep/census/gradecensus.py")
 CELLS = os.path.join(HERE, "cells")
+NAMED = os.path.join(HERE, "named")
 
 SILENT = ("runs but wrong value", "check-clean invalid wasm", "compiler trap", "trap_loads")
 
@@ -41,13 +52,18 @@ def main():
 
     env = dict(os.environ)
     env.setdefault("JOBS", "6")
-    rc = subprocess.run([sys.executable, GRADER, CELLS, seed, out],
-                        cwd=ROOT, env=env, stdout=subprocess.DEVNULL).returncode
-    if rc != 0:
-        print(f"distilled: the grader itself failed (rc={rc})")
-        return rc
-
-    now = json.load(open(out))
+    now = {}
+    for part in (CELLS, NAMED):
+        if not os.path.isdir(part) or not glob.glob(os.path.join(part, "*.vl")):
+            continue
+        tmp = out + "." + os.path.basename(part)
+        rc = subprocess.run([sys.executable, GRADER, part, seed, tmp],
+                            cwd=ROOT, env=env, stdout=subprocess.DEVNULL).returncode
+        if rc != 0:
+            print(f"distilled: the grader itself failed on {os.path.basename(part)}/ (rc={rc})")
+            return rc
+        now.update(json.load(open(tmp)))
+    json.dump(now, open(out, "w"), indent=1, sort_keys=True)
     if "--write-baseline" in sys.argv:
         json.dump(now, open(baseline, "w"), indent=1, sort_keys=True)
         print(f"distilled: wrote baseline for {len(now)} cells from {seed}")
@@ -79,7 +95,10 @@ def main():
         if len(rows) > 12:
             print(f"      … and {len(rows) - 12} more")
 
-    print(f"distilled corpus: {len(now)} representatives standing for {pop} census cells")
+    ncur = sum(1 for c in now if idx.get(c, {}).get("represents", 0) == 1
+               and "source" in idx.get(c, {}))
+    print(f"distilled corpus: {len(now) - ncur} representatives standing for {pop} census "
+          f"cells, plus {ncur} curated cells from named regression sets")
     show("runs -> NOT-RUNS  (blocking)", lost)
     show("-> silent  (report)", into_silent)
     show("other movement", other)

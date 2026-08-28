@@ -69,11 +69,46 @@ distil from 18 snapshots, hold the 19th out, check the held-out compiler's trans
 17 held-out compilers, 1468 distinct transition kinds, 0 missed (0.0%)
 ```
 
+## The half a collapse CANNOT derive — `named/`
+
+A collapse can only separate what its history separated, and there is a shape of regression it
+provably cannot reach. **D272 is the worked example, and it says so from both directions.**
+
+A candidate fix for D209 read **0 backward on 57,492 cells** — census block C, census block D,
+a 140-cell adoption grid, `d156`, `d88`, `d112` — and the corpus `cmp` was byte-identical. It
+then lost **72 running programs, 36 of them into a silent class.** The axis that found it was
+`read` (bare / isnar / nullcmp / **tounion** / **tofld**), and the census does not have that
+axis at all: its twelve are `twin union claim store escope annpos cont declness deliv order
+pval rep`, and every one of them reads the field **bare**.
+
+So no compression of the census could have caught it — not because the compression is lossy,
+but because the population never varied the deciding dimension. Two candidate repairs were
+measured and **both scored zero**:
+
+| rule | reps | of the 72 named cells, covered |
+|---|---|---|
+| behavioural collapse of the D272 grid (1 snapshot) | 34 | **0** |
+| axis floor over its four axes | 285 | **0** |
+| an axis floor over the census's own 12 axes | 8,311 (5.6x, ~103 s) | would not apply — no `read` axis |
+
+The reason is the same in every row: on today's compiler all 72 cells simply `run`, exactly
+like thousands of neighbours. **What makes them worth keeping is not how they behave now but
+what a specific candidate DID to them**, and no rule that reads current behaviour can see that.
+
+`named/` therefore holds those 72 cells **whole**. They are `runs` on master, so a future
+candidate that breaks one exits non-zero. `redistil.py` rebuilds `cells/` from scratch and
+never touches `named/`.
+
+**The discipline this establishes:** when a purpose-built grid names a backward set, the set
+goes in `named/` — not a collapse of it, and not the grid. That is the same reasoning
+`CLAUDE.md` already gives for keeping named sets around; this just makes the standing gate the
+place they live.
+
 ## Cost
 
 ```
 full census   ~35 min   (~500,000 vl invocations)
-distilled       ~8 s    (2,954 vl invocations, JOBS=6)
+distilled       ~7 s    (3,098 vl invocations, JOBS=6: 1,477 derived + 72 curated)
 ```
 
 It is therefore IN the gate (`scripts/gate.sh`), not beside it.
@@ -84,6 +119,8 @@ It is therefore IN the gate (`scripts/gate.sh`), not beside it.
 python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
 python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --write-baseline
 ```
+
+Both halves are graded, `cells/` and `named/`, and reported together.
 
 Exit code is 1 **only** for `runs -> not-runs`. Everything else is reported and not blocking:
 a program that did not work before and does not work now has not regressed in the sense a gate
@@ -107,5 +144,7 @@ python3 scripts/silent-sweep/distilled/redistil.py
 
 The corpus is only as good as the history it was collapsed from. A change in a genuinely
 untouched area could split a class that all 19 compilers agreed on; leave-one-out scored 0
-misses in 17 trials, which is strong evidence and not a proof. Re-distilling after each full
-sweep is what keeps that risk falling instead of growing.
+misses in 17 trials, which is strong evidence and not a proof — and D272 is the instance where
+the risk was real, since the deciding axis was not in the population at all. Re-distilling
+after each full sweep, and adding every named backward set to `named/`, is what keeps that risk
+falling instead of growing.
