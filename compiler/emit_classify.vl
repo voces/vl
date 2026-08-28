@@ -335,6 +335,7 @@ import {
   cloSigBase,
   cloSigKeys,
   cloSigTagNames,
+  cloSigTwin,
   cnFe,
   cnName,
   cnRecording,
@@ -1228,6 +1229,31 @@ export function cloSigPosOfKey(key: string) {
   -1
 }
 
+// THE ONE PLACE A POOL POSITION BECOMES A TYPE INDEX (silent-class-inventory D351).
+// `cloSigBase + pos` was written at four sites — the function section's declared type,
+// the value call's `call_indirect` operand, the `.map`/`.filter` closure-value callback,
+// and the arity fallback — and each of them has to agree with the others or a closure is
+// DECLARED with one functype and CALLED at another. That is not hypothetical: two pool
+// entries can render byte-identical functypes (a union ARM and the DECLARED struct whose
+// heap type D280 merged it with key `V…;` and `s…;` over ONE heap index), and two
+// identical functypes at two indices of one rec group are DISTINCT types in WasmGC. The
+// module VALIDATES, LOADS, and traps `indirect call type mismatch` on the first call.
+//
+// So every position resolves through the pool's twin column: the SMALLEST position whose
+// rendered bytes match. Both sides of any call move together because there is one
+// resolution, and the fold is invisible to the KEY — `cloSigPosOfKey`, `sigParamKindAt`
+// and every coercion decision still read the original key text, which is what the refused
+// key-level fold could not preserve.
+//
+// The identity fallback is the pre-D351 answer and covers every window in which the
+// column is not yet in lock-step with `cloSigKeys` (it is filled at the pool's own emit,
+// after `mAssignTypeIndices` has minted every heap index a functype can name).
+export function cloSigTypeIdxAt(pos: i32) {
+  if pos < 0 { return -1 }
+  if cloSigTwin.length != cloSigKeys.length { return cloSigBase + pos }
+  cloSigBase + cloSigTwin[pos]
+}
+
 // The `$fnsig` type index for lifted function `fe`'s own signature, or -1 when its
 // signature is not value-eligible / not interned. The EXTENDED key (`cloSigKeyExt`)
 // equals the value-ABI key for an eligible sig; a void / struct-returning FIELD
@@ -1237,9 +1263,7 @@ export function cloSigPosOfKey(key: string) {
 export function fnSigIdxOfFn(fe: i32) {
   const key = cloSigKeyExt(fe)
   if key == "" { return -1 }
-  const p = cloSigPosOfKey(key)
-  if p < 0 { return -1 }
-  cloSigBase + p
+  cloSigTypeIdxAt(cloSigPosOfKey(key))
 }
 
 // The type index of the all-i32 `$fnsig` functype for value-call arity `ar`
@@ -1252,9 +1276,7 @@ export function fnSigIdxForArity(ar: i32) {
     key = key + repSigTokOfKind("i32")
     i = i + 1
   }
-  const p = cloSigPosOfKey(key + ">" + repSigTokOfKind("i32"))
-  if p < 0 { return -1 }
-  cloSigBase + p
+  cloSigTypeIdxAt(cloSigPosOfKey(key + ">" + repSigTokOfKind("i32")))
 }
 
 // The wasm global index for the symbol `sid`, or -1 if no top-level global has that
@@ -22293,15 +22315,22 @@ export function repVariantSlotRep(vi: i32): i32 {
 // layering: the variant twin relation reads `variantFieldLayoutEq`, whose ref-list /
 // nested-struct / map-value rungs are all in this module, ABOVE emit_rep.
 //
-// IT DOES NOT FOLD ACROSS THE STRUCT TABLE, AND THAT REFUSAL IS MEASURED (D351). An arm
-// whose layout a DECLARED struct also claims shares that struct's heap type (D280's
-// cross-table merge) while keying `V…;` against the struct's `s…;` — the same distinct-type
-// trap one table over, and 12 live `trap_loads` cells of the D199 grid. Folding to
-// `repSigSlotTokOfKind("struct", variantStructHeapTwinAt(rep))` buys all 12 and costs SIX
-// `runs` -> check-clean invalid wasm: the token char is what `sigParamKindAt` reports, so an
-// arm parameter spelled `s…;` stops being a `variant` parameter and the value-call arm
-// coercion below never fires on it. A cell falling into silence is not a trade this family
-// takes.
+// IT DOES NOT FOLD ACROSS THE STRUCT TABLE, AND THAT REFUSAL IS MEASURED AND STILL STANDS
+// (D351). An arm whose layout a DECLARED struct also claims shares that struct's heap type
+// (D280's cross-table merge) while keying `V…;` against the struct's `s…;`. Folding to
+// `repSigSlotTokOfKind("struct", variantStructHeapTwinAt(rep))` buys the 12 `trap_loads`
+// cells that seam had and costs SIX `runs` -> check-clean invalid wasm: the token char is
+// what `sigParamKindAt` reports, so an arm parameter spelled `s…;` stops being a `variant`
+// parameter and the value-call arm coercion below never fires on it. A cell falling into
+// silence is not a trade this family takes, and the six cells are kept whole as
+// `scripts/silent-sweep/census/d351-crossfold-price.json` so the price is paid knowingly.
+//
+// THE 12 CELLS ARE CLOSED ANYWAY, one layer down: two `$fnsig` pool entries whose functypes
+// render BYTE-IDENTICALLY now share one type index (`cloSigTwin`). That is the same fold
+// stated where it has no second meaning — a rendered functype is read by nothing but the
+// engine's signature check, where a KEY token is also `sigParamKindAt`'s answer. So this
+// function stays a per-table canonicalisation of the KEY, and cross-table identity is the
+// pool's question, not its.
 export function repSigVariantTok(vi: i32): string {
   repSigSlotTokOfKind("variant", repVariantSlotRep(vi))
 }

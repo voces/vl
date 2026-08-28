@@ -74,15 +74,51 @@ is exactly `order=norm` vs `order=rev`. Which row of a twin pair is declared fir
 whether the mismatched `$fnsig` reaches the type section or is refused a stage earlier, so a
 grid without the axis would have reported one of the two outcomes as the family's.
 
-## The residue, and the refusal that named it
+## The residue, the refusal that named it, and the close that came from somewhere else
 
-12 cells are still `trap_loads` after the landing: `hofcross_decl` and `bindcross_decl`, the
+12 cells were still `trap_loads` after that landing: `hofcross_decl` and `bindcross_decl`, the
 variant⇄STRUCT-table half of D199's seam. **D351** is the row. Its obvious fix was built and
 graded here: folding the arm's `$fnsig` slot onto the declared struct row buys all 12 and
 costs **6 `runs` → check-clean invalid wasm** (`vcall_narrow_decl`), because the token CHAR is
 what `sigParamKindAt` reports and an arm parameter spelled `s…;` stops being a `variant`
-parameter. All 18 are kept whole at `scripts/silent-sweep/distilled/named/d199_*_decl_*.vl`;
-their coordinates are `scripts/silent-sweep/census/d351-crossfold-price.json`.
+parameter. That refusal stands, and its 18 cells are kept whole at
+`scripts/silent-sweep/distilled/named/d199_*_decl_*.vl` (coordinates:
+`census/d351-crossfold-price.json`).
+
+**#1994 closed the 12 without paying the 6**, by folding the `$fnsig` POOL rather than any
+key: two entries whose functypes render byte-identically now share one type index
+(`cloSigTwin`), so `sigParamKindAt` still reads `V…;` and the value-call arm coercion still
+fires. On this grid: **210 runs, 0 trap_loads, 0 runs LOST, 0 → silent.** On the corpus it
+moves seven pre-existing modules and not one of them is this seam — six are list-WRAPPER twins
+and one is a map-struct twin, which is the argument for doing it at the byte level rather than
+one table pair at a time.
+
+## The grid's second measurement: four sites, one landing
+
+Four sites turn a `$fnsig` pool position into a type index, and this grid is what shows they
+cannot be routed separately.
+
+| seed | runs | trap_loads | cells MOVED vs base | note |
+|---|---|---|---|---|
+| base = master `7d3698a4` | 198 | 12 | — | md5 `8ae09ea5d0888321f09028a3f86fb97d` |
+| all rungs ablated | 198 | 12 | 0 | output byte-identical to base on all 1,934 corpus modules |
+| twin COMPARISON ablated | 198 | 12 | 0 | the column is filled with the identity |
+| DECLARED functype unrouted | 198 | 12 | **24** | 12 bought, **12 `runs` LOST** — the histogram is the base's |
+| value call unrouted | 186 | 24 | 12 | **12 `runs` LOST**, nothing bought |
+| arity fallback unrouted | 210 | 0 | 12 | 0 — the site is never reached on this grid |
+| `.map` callback unrouted | 210 | 0 | 12 | 0 — the site is never reached on this grid |
+| the landing | 210 | 0 | 12 | 12 bought, 0 lost |
+
+**Read the fourth row twice.** Its histogram is the base's, exactly, and 24 cells have moved
+underneath it. A histogram delta would have called that landing a no-op.
+
+The two rungs that score 0 here are not equal. `.map`'s is reached by nothing in this grid and
+nothing in the distilled corpus, and over the whole `tests/cases` tree its answer changes on
+exactly ONE module — `closures/map-callback-value-fnsig-pool-twin.vl`, which had to be written
+for it. That module runs on master and traps with the `.map` site alone unrouted, so the rung
+is load-bearing at a score of zero everywhere else. The arity fallback's cannot be witnessed at
+all, because `i*ar>i` is the only key the token alphabet can spell that renders
+`(structref, i32*ar) -> i32`, so that entry is always its own representative.
 
 ## Named sets out of this grid
 
@@ -94,8 +130,10 @@ JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/set <seed.wasm> /
 
 - `census/d199-rungs.json` — 15 cells: nine that one named rung and only that rung buys, plus
   six controls that must never move.
-- `census/d351-crossfold-price.json` — 18 cells kept WHOLE: the 12 the refused fold buys and
-  the 6 it costs.
+- `census/d351-crossfold-price.json` — 18 cells kept WHOLE: the 12 the refused key fold buys
+  and the 6 it costs. All 18 run today.
+- `census/d351-halfroute-price.json` — the 12 `hof2_decl`/`hofret_decl` cells a PARTIAL routing
+  of the pool costs. Two of them are already `d199-rungs` controls and stay in that block.
 
 Cells are named by COORDINATE (`d199_hof2_arm_i32_norm`), not by index, so a named set keeps
 its names when a later axis is added and `mkset.py`'s staleness check means what it says.
