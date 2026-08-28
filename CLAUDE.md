@@ -24,7 +24,13 @@ signature, name, or documented behaviour.
 
 ## Gates
 
-The PR gate has more parts than `deno task test`. In order:
+**`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
+independent once the seed is built, so it fans them out and reports a per-gate table of wall
+time and exit code. **68 seconds** for all nine on a loaded box. A merge gate that takes longer
+than a coffee stops being run, so treat that as the budget it has to keep — if a gate is added
+that pushes it over a couple of minutes, the gate is what needs rethinking, not the budget.
+
+The parts, and what each is for:
 
 1. `deno task test`
 2. `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts` — the `ci-native` job, **not** part of the above
@@ -37,23 +43,44 @@ The PR gate has more parts than `deno task test`. In order:
 4. `scripts/rep-fuzz-check.sh` — **mandatory** for anything touching the rep layer or the
    interner; the corpus, the suites and the fixpoint are all blind to REJECT→MISMATCH
 5. `scripts/mono-tyaram-grid.sh` for monomorphizer changes
-6. **The census after-pass — mandatory for an emit/rep lowering change.** Re-grade the census
-   CELL-MATCHED against the change's MERGE BASE and report two numbers: **`runs → not-runs`**
-   and **`→ silent`**. `scripts/silent-sweep/census/delta.py` prints both, plus the transition
-   matrix. Protocol and the seed discipline it needs:
-   `scripts/silent-sweep/census/README.md` §*Grading a MERGED change*.
+6. **`scripts/silent-sweep/distilled/regress.py` — the census's content, in ~8 seconds.**
+   1,477 programs, one per behavioural equivalence class of the 250,238-cell census. It exits
+   non-zero **only** on `runs → not-runs`; `→ silent` and every other movement is printed and
+   read, not blocked on. A program that did not work before and does not work now has not
+   regressed in the sense a gate should stop the world for.
 
-   **A per-row grid's "0 backward" does not cover this, and saying so is not pedantry** — it is
-   what #1952, #1954 and #1966 each reported truthfully before a wider population showed
-   otherwise. A grid holds constant the axes it was not chasing. **Nor do per-class column
-   deltas**: block A lost 0 `runs` and still moved 12 cells loud→silent while its loud-emit
-   column moved by −126 (186 out, 72 in), so the regression was arithmetically invisible in the
-   histogram. Only a cell-matched matrix answers *did any individual cell get worse*.
+   **Why a subset is sound here when the census README says it isn't.** That README proves a
+   *random sample* cannot see a 12-cell family — catching D211 at 95% needs 22% of block A —
+   and then concludes there is no cheap sufficient subset. **That step does not follow, and
+   believing it cost this repo a 35-minute merge gate.** A random sample is blind because it
+   does not know which cells are alike; an equivalence-class collapse is built out of exactly
+   that knowledge. D211's 12 cells are not 12 chances to get lucky, they are ONE class, and a
+   representative of it is in the corpus by construction.
 
-   It is ~35 min at `JOBS=4` and deliberately NOT part of `deno task test`; run it unattended
-   beside the other gates. **Do not substitute a sample** — the families this finds are ~12
-   cells in 150,224, and catching one at 95% needs 22% of the block (a 1-cell regression needs
-   95%), so no affordable sample is sufficient. Full run or nothing.
+   Measured, not asserted: over 19 graded compilers, block A's 150,224 programs produce only
+   **212 distinct answers** and **4.09 bits** of entropy each — the entire block is ~75 KiB of
+   signal. It collapses to 343 classes, and the census as a whole to **1,477 (99.41%
+   redundant, 169×)**. Validation is in `scripts/silent-sweep/distilled/README.md`: **2,699 of
+   2,699** transition events across every snapshot pair are covered, including 938 loud→silent
+   and 856 runs→not-runs, and leave-one-out over 17 held-out compilers missed **0 of 1,468**
+   transition kinds.
+
+**The full census is a DISCOVERY instrument, not a gate.** Run
+`scripts/silent-sweep/census/` when you want a new population measured — a new axis, a new
+outcome, a suspicion that a family exists that nothing has named yet. It is ~35 min at
+`JOBS=4` with the box to itself, so run it deliberately and alone: three agents running it
+concurrently is six full passes on 24 cores, which is what turned a one-hour change into a
+three-hour one (measured: load 114, a single `vl run` costing 0.037s). **After any full sweep,
+re-distil** — `scripts/silent-sweep/distilled/redistil.py`, then `regress.py --write-baseline`.
+The corpus is only as good as the history it was collapsed from; re-distilling is what keeps
+the one real risk (a compiler that splits a class no earlier compiler split) falling rather
+than growing.
+
+Two habits the full runs earned, still worth keeping: report `runs → not-runs` and `→ silent`
+explicitly rather than histogram deltas — block A once lost 0 `runs` and still moved 12 cells
+loud→silent while its loud-emit column moved −126, so the regression was arithmetically
+invisible. And once a run has NAMED a backward set, keep it under
+`scripts/silent-sweep/census/` — it re-grades against any new seed in ~10 invocations.
 
 **Read a gate by its exit code or its summary line, never by `tail -1`.** `lint-self.sh`
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a

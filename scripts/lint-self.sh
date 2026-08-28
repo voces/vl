@@ -17,7 +17,9 @@
 # (compiler/, std/, scripts/) — only `.vl` files are gathered, so the `.ts`/`.sh`
 # alongside scripts/ are ignored. `tests/` is excluded by construction (the
 # deliberately-malformed fixture corpus is never fmt-clean and is not source we
-# ship). Unlike the lint above, fmt is PER-FILE (it needs no cross-file
+# ship), and `scripts/silent-sweep/distilled/cells/` is PRUNED for exactly that
+# reason: it is a GENERATED corpus of deliberately odd programs — being un-idiomatic
+# is what each cell is for — and it is graded by `distilled/regress.py`, not shipped. Unlike the lint above, fmt is PER-FILE (it needs no cross-file
 # resolution), so the files fan out over the cores (`xargs -P`) — the formatter
 # is the dominant cost of this gate and every file is independent — while the
 # module-graph check runs concurrently in the background. Same files, same
@@ -58,7 +60,9 @@ GRAPH_PID=$!
 # the script; only the order of reporting changed.
 echo "== fmt-check: compiler/ std/ scripts/ (parallel per file) =="
 FMT_RC=0
-find compiler std scripts -name '*.vl' -print0 \
+find compiler std scripts \
+    -path scripts/silent-sweep/distilled/cells -prune -o \
+    -name '*.vl' -print0 \
   | xargs -0 -n 1 -P "$(nproc)" "$VL" fmt --check || FMT_RC=$?
 
 echo "== self-lint: the compiler module graph (result) =="
