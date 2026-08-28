@@ -265,12 +265,34 @@ subset, and the arithmetic kills it. To catch a family of size *k* in a block of
 | 72 cells | 4.1% | 6.2% |
 
 The families this instrument exists to find are small — D211 is 12 cells, 0.008% of block A — so
-any sample cheap enough to be worth taking is too small to see them. **There is no cheap
-sufficient subset.** The honest options are the full run or nothing, so it is filed as a
-mandatory pre-merge STEP for emit/rep changes (it runs unattended in the background beside the
-other gates, so its wall-clock cost is low even though its CPU cost is not), rather than as a
-per-PR test. That is the same reasoning that made `--strict` a flag on
-`check-filed-witnesses.py` rather than a default.
+any sample cheap enough to be worth taking is too small to see them.
+
+> ### CORRECTION — "there is no cheap sufficient subset" was WRONG, and it cost 35 minutes a merge
+>
+> That is what this section used to conclude, and the conclusion does not follow from the
+> arithmetic above it. The table proves a **random sample** cannot see a small family. It says
+> nothing about a subset chosen with knowledge of which cells are alike, and the difference is
+> the whole game: D211's 12 cells are not twelve chances to get lucky, they are **one
+> behavioural class**, and one representative of that class finds it with certainty.
+>
+> Measured over the 19 graded snapshots this directory has accumulated: block A's 150,224
+> programs produce only **212 distinct answers** and carry **4.09 bits** of entropy each — the
+> whole block is about **75 KiB** of signal, with `runs` alone accounting for 60,197 cells.
+> Collapse cells that no compiler in the history ever separated and block A becomes **343**
+> classes; the full census becomes **1,477 (99.41% redundant, 169×)**. Block A has **zero
+> singletons** — not one program behaves unlike every other.
+>
+> `scripts/silent-sweep/distilled/` is that collapse, and it covers **2,699 of 2,699**
+> transition events across every snapshot pair (938 loud→silent, 856 runs→not-runs), with
+> leave-one-out over 17 held-out compilers missing **0 of 1,468** transition kinds. It runs in
+> **~8 seconds** and is now gate 6.
+>
+> So the census is a **discovery** instrument again, not a merge gate. Run it to measure a new
+> population; re-distil afterwards.
+
+The full run remains the honest option when the question is *how many* cells a change moved,
+which a representative cannot answer — that is a reporting number, not a gate. Filing it as a
+mandatory pre-merge step for every emit/rep change was the error, not the instrument.
 
 **The cheap thing that IS worth doing per-PR** is the subset check after the fact: once a full
 run has named a backward set, that set copies into its own cell directory and re-grades against
