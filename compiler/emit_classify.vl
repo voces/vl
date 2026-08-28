@@ -26300,6 +26300,15 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     const mAtom = narrowVariantFor(memberPathKeyOf(mix))
     const mk = valueAtomKind(mAtom)
     if mk >= 0 && mk != 6 { return "" }
+    // D311 — THE MIRROR MUST CARRY D209'S ARM TOO. `exprUnion`'s Member case declines a
+    // read the READ SITE unboxes; this resolver did not, so an un-annotated binding over
+    // such a read (`const z = (v).r`) was REGISTERED as a union binding — and
+    // `unionIdentReadKind`'s "un-narrowed union ident is the box" rule then overrode
+    // `exprString` to false at every later read of `z`. The slot was already a string ref
+    // (`letIsString` reads the init), so `print(z)` handed that ref to `__print_i32__`.
+    // The three read classifiers are ONE decision (`memberUnionFieldNameRead`'s header
+    // states it for the widening direction); this is the same rule in the other direction.
+    if memReadUnboxAtomKind(mix, fnIx) >= 0 { return "" }
     return memberUnionFieldNameRead(mix, fnIx)
   }
   ""
@@ -26523,12 +26532,34 @@ function unionIdentReadKind(exprIx: i32, fnIx: i32) {
 // single atom's kind when the member PATH is narrowed (the read unboxes to that
 // atom's rep), -2 for an un-narrowed box read, -3 when the expression is not a
 // union-field member at all.
+//
+// D311 — THE FOURTH END OF D209'S CHANNEL. An un-narrowed read is NOT always the box:
+// where the channel predicate fires the read site unboxes and delivers the bare ATOM
+// (`memReadUnboxAtomKind`, the same predicate `exprUnion` asks to stop calling the read
+// a union value). Answering -2 there told `exprString` "this is a box" about a value the
+// read had already turned into a `(ref $sTypeIdx)`, so `print`'s import ladder fell past
+// every string arm to `__print_i32__` and a string ref landed in an `(i32) -> ()` call —
+// `vl check` rc 0, "type mismatch: expected i32, found (ref $type)".
+//
+// THE STRING ATOM IS THE ONLY ONE THAT WAS WRONG, and the asymmetry is structural rather
+// than accidental: `exprIsF32` / `exprIsF64` / `exprIsI64` / `exprIsBool` each open with a
+// typed-IR fast path (`tyKindOf(nodeTyIxOf(ix))`, `nodeTyWidenedRepName`) that answers
+// from the CHECKER's type for the node — which is exactly the atom this channel delivers —
+// so they were already right. `exprString` has no such fast path ON PURPOSE (canon SOFTENS
+// a literal union to the spelling `string` while its rep is an interned i32 atom, so the
+// fast path would mis-claim it — `letIsString`'s header records the same refusal), and its
+// Member arm's answer is this function. Measured over the corpus and the d290 grid: this
+// rung's answer is non-negative at 269 reaches, of which **28 are the string atom**; a
+// Member arm on each of the other four scored `ans=0` at 31,062 corpus reaches and 623 grid
+// reaches, so they are not written.
 function memberUnionReadKind(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is Member {
     if memberUnionFieldNameRead(exprIx, fnIx) != "" {
       const a = narrowedValueAtomOf(memberPathKeyOf(exprIx))
       if a != "" { return valueAtomKind(a) }
+      const d = memReadUnboxAtomKind(exprIx, fnIx)
+      if d >= 0 { return d }
       return -2
     }
   }

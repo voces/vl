@@ -10030,7 +10030,7 @@ Repro (D209's repro with ONE token changed — `i32` becomes `i64`):
   are all right with no teaching at all. The alternative — deliver the atom the box HOLDS — was
   considered and is a strictly larger change: every consumer classifier would have to learn the
   predicate, and `print` alone reads four of them. (What that alternative would have fixed for
-  free is D311, which this close does NOT move.)
+  free is D311, closed later the same day and which this close does NOT move.)
 
   **THE CONVERSION IS EXACT, not a truncation that happens to work.** The payload can only have
   been widened FROM the checker's atom — that is what `unionStoreAtomKind` answering a different
@@ -10131,44 +10131,76 @@ Repro (D209's repro with ONE token changed — `i32` becomes `i64`):
 
 ---
 
-### D311 — the STRING atom the adopted read DELIVERS, which `print` routes by a classifier that never asks
-**check-clean invalid wasm · found 2026-08-28 while closing D291, as 5 of the d290 grid's 714 cells · UNMOVED by that close in either direction and the counter says why (`widen=0` — no widening is involved, so the ladder is never the question here) · pre-existing on `ada42128` and on the shipped seed alike**
+### D311 — [CLOSED 2026-08-28] the STRING atom the adopted read DELIVERS, which two READ classifiers still called a BOX
+**closed 2026-08-28 — the filed repro RUNS and prints `7`, and so do all 5 cells of its population · was `check-clean invalid wasm` · 5 of the d290 grid's 714 cells, all `shape=stri32 × annpat=none` · closed by TWO rungs on the SAME predicate D209 built, with both singleton compositions built and graded · the whole corpus is BYTE-IDENTICAL across the change except this row's own specimen (2,347 files, `cmp`) · **IT WAS THE `--codegen` SPECIMEN** and the class is now EMPTY — `INVALID_MODULE_SRC = null`, measured, see below**
 
 Repro (three lines; the `i32` arm is what makes it silent rather than loud):
 
     type Circle = { r: string | i32 }
     const v = { r: "7" }
     print((v).r)
-    // vl check rc 0 with NO diagnostics; vl run:
+    // was: vl check rc 0 with NO diagnostics; vl run:
     //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
 
-* **IT IS THE FOURTH END OF D209'S CHANNEL, and the first three are all working here.**
-  `structIndexOfObjCtx` adopts `Circle`'s row, the store boxes `"7"` under the string tag, the
-  channel predicate FIRES (`reach=2 ans=2`), the read delivers a bare `(ref $sTypeIdx)` and
-  `exprUnion` correctly stops calling it a union value. Every one of those is right. What is
-  wrong is one step later: `print`'s import ladder picks its overload from `exprString` /
-  `exprIsF32` / `exprIsF64` / `exprIsI64` / `exprIsBool`, **none of which asks the predicate** —
-  each reads an un-narrowed code-16 member as the BOX and declines — so the value falls to
-  `__print_i32__` and a string ref lands in an `(i32) -> ()` call.
-* **THE `isnar` CELL IS THE PROOF THAT THE READ IS NOT AT FAULT.**
-  `if (lv1[0]).r is string { print((lv1[0]).r) }` is invalid wasm too, and there the read takes
-  the NARROWED path — `emitUnionFieldNarrowUnbox`'s original arm, which has unboxed to the
-  string ref correctly since long before D209. The consumer classifier is the only thing the
-  two spellings share.
-* **THE POPULATION, and it is small because the checker rejects most of the neighbourhood.**
-  5 of the d290 grid: `shape=stri32` × `annpat=none` × (`print` × {bare, list}, `local` ×
-  {bare, list}, `isnar` × {list}). `stri32_isnar_bare_none` RUNS — the bare receiver's narrow
-  installs a member-path binding the print site can see — which is the axis pair that separates
-  the two. Every `annpat=bind` sibling is a loud check reject.
-* **WHY IT IS FILED RATHER THAN FIXED HERE.** The repair is the OTHER contract for the channel:
-  make the predicate's answer reach the consumer classifiers instead of making the read deliver
-  the checker's atom. D291's close deliberately kept the existing contract because it is the one
-  that needs no consumer taught — see that row. Moving five classifiers is a change with its own
-  grid (`cons` × `shape`, and `print` alone reads four of them), and half-opening it is the
-  shape of regression `memberUnionFieldNameRead`'s header already records at D220.
-* Named in `scripts/silent-sweep/census/d291-widened-store-price.json`? **No** — these five
-  cells do not move under any composition D291 built, so they are not that set. They are the
-  d290 grid's own coordinates and regenerate from `scripts/silent-sweep/d290/gen290.py`.
+* **THE FILING WAS RIGHT ABOUT THE END AND WRONG ABOUT THE ORGAN, and the correction is the
+  mechanism.** It named five consumer classifiers — `exprString` / `exprIsF32` / `exprIsF64` /
+  `exprIsI64` / `exprIsBool` — and said none of them asks the channel predicate. Literally true,
+  and **four of the five did not need to**: each of those four opens with a TYPED-IR FAST PATH
+  (`tyKindOf(nodeTyIxOf(ix))`, `nodeTyWidenedRepName`) that answers from the CHECKER's type for
+  the node, which is exactly the atom the channel delivers. A Member arm was written on all four
+  as a counter probe and scored **`ans=0` at 31,062 corpus reaches and 623 grid reaches**, so
+  none of them is in the fix. `exprString` has no such fast path ON PURPOSE — canon SOFTENS a
+  literal union to the spelling `string` while its rep is an interned i32 atom, and
+  `letIsString`'s own header records the same refusal for the same reason — so it is the one
+  classifier whose Member answer has to be derived, and it derives it from
+  `memberUnionReadKind`.
+* **RUNG S — `memberUnionReadKind` answers the DELIVERED atom, not -2.** The function's
+  documented contract is "the atom KIND a union-typed field read currently reads as"; D209 made
+  that contract false for an un-narrowed read the read site unboxes, and nobody updated it. It
+  now asks `memReadUnboxAtomKind` before falling back to -2. Alone: **3 of the 5 cells**
+  (`print` × {bare, list}, `isnar` × list), 0 backward.
+* **RUNG N — `unionNameOfExpr`'s Member arm declines a channel-unboxed read**, which is
+  `exprUnion`'s D209 arm written in the mirror that was left behind. Without it `const z =
+  (v).r` REGISTERED `z` as a union binding, and `unionIdentReadKind`'s "an un-narrowed union
+  ident is the BOX" rule then overrode `exprString` at every later read of `z` — while the
+  binding's SLOT was already a string ref, because `letIsString` reads the init through
+  `exprString` and rung S had just fixed that. So the two ends of one binding disagreed.
+  **Alone it moves NOTHING** — 0 of 714 grid cells, and the corpus is byte-identical (2,347
+  files, `cmp`, over 1,334 reaches at which it never fires). It is load-bearing only in
+  COMPOSITION with S, which is the shape `memberUnionFieldNameRead`'s header already states for
+  the widening direction: **the three read classifiers are ONE decision**.
+* **THE AXIS PAIR THAT SEPARATED THE FIVE FROM THEIR RUNNING SIBLING, and it is a property of
+  `memberPathKeyOf`.** `stri32_isnar_bare_none` — `if (v).r is string { print((v).r) }` — RAN
+  all along, because a BARE receiver's path key is `v.r` and the narrow installs a member-path
+  binding the print site reads. `(lv1[0]).r` has an Index receiver, `memberPathKeyOf` answers
+  `""`, nothing is installed, and the read inside the guard is the UN-NARROWED one. The counter
+  build says so at the site: the control is **`S reach=0`** and cannot be moved by rung S at
+  all, while every failing cell is `S reach=2..4 ans=2..4 k2=all`. It still runs.
+* **THE ABLATION, and the base is proven.** Stripping BOTH rungs rebuilds the merge base
+  **byte-for-byte** (`md5 7847217908832c72194bb8c8ee7048b2`, 1,464,975 bytes). `S` alone 3 of 5,
+  `N` alone 0 of 5, `S+N` 5 of 5; **0 `runs` lost and 0 cells `→ silent` in every composition**,
+  on the d290 grid's full 714.
+* **THE CHANNELS.** Corpus `cmp` byte-identity over 2,347 files: `S+N` differs on exactly ONE
+  file, this row's own specimen (1,814 → 1,905 bytes, invalid wasm → prints `7`); `N` alone
+  differs on none. Counter build over the corpus: rung S is `reach=71 ans=21` with **`k2=2`**,
+  and those two are the specimen's own two sites — so the corpus contained exactly one program
+  in this class, which is the same answer the census gave from the other end.
+* **IT WAS THE `--codegen` SPECIMEN AND THE CLASS IS NOW EMPTY.** `INVALID_MODULE_SRC` in
+  `tests/vl_check_codegen_test.ts` held this program; its pin
+  (`tests/cases/soundness/xfail-miscompile-adopted-string-atom-print-route.vl`) is deleted and
+  the program graduated to `tests/cases/soundness/adopted-string-atom-print-route.vl`, `@run` +
+  eight `@log 7`. The census that slot's own note demands was re-run before assuming anything:
+  **all 140 rows of this document and all 14 of `silent-class-inventory-2.md` had their OWN
+  filed programs graded against the closing tree — 125 run, 10 loud emit rejects, 5 loud check
+  rejects, ZERO check-clean invalid wasm.** The named successor (D301) had closed hours earlier
+  in #1989, the fourth hand-off in a row to expire; rather than name a fifth, this takes the
+  `null` branch that note wrote the instruction for. The corpus now carries no
+  `@no-instantiate` directive at all, and the biconditional at the bottom of that file makes
+  "the class is empty" a graded claim rather than a sentence.
+* Named set: `scripts/silent-sweep/census/d311-print-route.json`, the 5 moved cells plus the
+  control, materialised into `scripts/silent-sweep/distilled/named/` so `scripts/gate.sh`
+  re-grades them. A derived rule cannot find them — on today's compiler all six behave exactly
+  like their class-mates.
 
 ---
 
@@ -11797,11 +11829,13 @@ Repro (the filed two-section program, verbatim):
   `tests/cases/maps/map-value-twin-second-declared-name-of-one-layout.vl`.
 
 * **THE `--codegen` SPECIMEN.** This row was D311's NAMED SUCCESSOR in
-  `tests/vl_check_codegen_test.ts`. D311 is still live on this tree (its pin,
-  `tests/cases/soundness/xfail-miscompile-adopted-string-atom-print-route.vl`, still fails
-  identically), so the slot is untouched here and the successor hand-off is spent: the next
-  swap has to re-run the census rather than inherit a name. That is the fourth hand-off in a
-  row to expire because the named row was closed first.
+  `tests/vl_check_codegen_test.ts`. D311 was still live on this tree (its pin,
+  `tests/cases/soundness/xfail-miscompile-adopted-string-atom-print-route.vl`, still failed
+  identically), so the slot was untouched here and the successor hand-off was spent: the next
+  swap had to re-run the census rather than inherit a name. That is the fourth hand-off in a
+  row to expire because the named row was closed first — and it was the LAST, because D311
+  closed hours later the same day and the re-run census found the class EMPTY. The slot is
+  `INVALID_MODULE_SRC = null` now; see D311.
 
 ---
 

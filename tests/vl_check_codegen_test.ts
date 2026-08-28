@@ -939,9 +939,41 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // survives on nobody having moved the consumer side yet — a fact about work not done, which
 // is weaker evidence than the measured refusal D291 had, and weaker than the measured
 // population D300 had. Expect it to close sooner than either.
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: string | i32 }\n` +
-  `const v = { r: "7" }\n` +
-  `print((v).r)\n`;
+// SWAPPED TO `null` 2026-08-28 (silent-class-inventory D311). The adopted-string-atom
+// specimen this constant carried is CLOSED and graduated to
+// `tests/cases/soundness/adopted-string-atom-print-route.vl`, `@run` + eight `@log 7`; its pin,
+// `tests/cases/soundness/xfail-miscompile-adopted-string-atom-print-route.vl`, is deleted in
+// the same commit. What closed it is the ONE sentence the entry above already contained: the
+// predicate `exprUnion` learned at D209 was never taught to the two READ classifiers beside
+// it. `memberUnionReadKind` answered -2 ("a box") about a read the read site had already
+// unboxed, so `exprString` was false and the print ladder fell to `__print_i32__`; and
+// `unionNameOfExpr` still NAMED the union, so a binding over such a read registered as a union
+// binding and `unionIdentReadKind` overrode `exprString` at every later read of it.
+//
+// AND THE PARAGRAPH ABOVE WAS RIGHT ABOUT THE TIMING, which is the only prediction in this
+// genealogy that has held: it said "expect it to close sooner than either" and named the
+// reason (the predicate already existed, so what the specimen survived on was work not done).
+// That is a better selection signal than any of the four failed rules, and it is the one worth
+// carrying forward — grade a candidate specimen by whether the machinery its repair needs is
+// ALREADY BUILT, not by which family it belongs to.
+//
+// THE CENSUS WAS RE-RUN AND THE CLASS IS EMPTY. All **140** rows of
+// `docs/internals/silent-class-inventory.md` and all **14** of `silent-class-inventory-2.md`
+// had their OWN filed programs graded against the closing tree
+// (`python3 scripts/check-filed-witnesses.py --json …`): 125 run, 10 loud emit rejects, 5 loud
+// check rejects, and **ZERO check-clean invalid wasm** — D311 was the last live member, and
+// after its pin is deleted the corpus carries no `@no-instantiate` directive at all. So this
+// takes the `null` branch the entry two paragraphs up wrote the instruction for, rather than
+// reaching for a fifth successor: the previous FOUR named hand-offs each expired before they
+// could be taken, and naming a program that is not really in the class is the failure those
+// four instructions were each written to prevent.
+//
+// WHEN IT REFILLS: set this constant to the new program, pin it under `tests/cases/soundness/`
+// (or `tests/cases/std/`) with `@no-instantiate` IN THE SAME COMMIT — the biconditional at the
+// bottom of this file enforces that pairing — and add an entry here saying how the specimen
+// was chosen. Re-run the census rather than trusting a row's own status line: a row filed as
+// silent that has since been fixed reads identically to a live one.
+const INVALID_MODULE_SRC: string | null = null;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
