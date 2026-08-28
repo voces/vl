@@ -12633,7 +12633,22 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // var as a code-`1` struct local. (Union-box (`2`) / map-array ref lists are not
   // yet supported here — they fall through to the unsupported -1.)
   if exprRefArray(iterIx, fnIx) {
+    // BOUND-GUARDED, and the guard is `forInIterUnionElemName`'s verbatim — the sibling
+    // one screenful down that asks THIS resolver the same question about the same slot
+    // and has tested it since it was written. `refListSlotOfExpr` does not answer -1 on a
+    // miss: it CLAMPS to `0` (`if s < 0 { return 0 }`), so the miss is indistinguishable
+    // from slot 0 and the bound that matters is the TABLE's, not the sign. With no ref
+    // list interned at all `rlElemKindTbl` is EMPTY, and `rlElemKindTbl[0]` is not a
+    // diagnostic — it is `wasm trap: out of bounds array access` from inside the compiler
+    // (silent-class-inventory D179, the only `compiler trap` the census found). Falling
+    // through to `return null` takes the loud `unsupported for-in iterable` that every
+    // other unresolvable iterable already takes. What the user SEES is usually earlier
+    // than that — `fbValtype`'s own bound guard has normally already recorded
+    // `ref valtype with no interned shape`, the message the INDEX spelling of the same
+    // program has always given — because `emitFail` records without halting and the
+    // first recorded failure is the one reported. The trap was all that kept it hidden.
     const rslot = refListSlotOfExpr(iterIx, fnIx)
+    if rslot < 0 || rslot >= rlElemKindTbl.length { return null }
     if rlElemKindTbl[rslot] == 1 {
       // A NULLABLE-struct element ref list (`(P | null)[]`, slot key "P | null"): the loop var
       // binds as a kind-9 niche (`for e in xs { if e != null { … e.v … } }`), and the element
@@ -27760,8 +27775,20 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
           }
         }
       }
+      // BOUND-GUARDED, the same idiom the six sibling reads in this function already
+      // spell. `mfResultSlotOf`'s `.slice` / `.filter` arms hand back
+      // `refListSlotOfExpr`'s answer, which CLAMPS a miss to `0` rather than answering
+      // -1 — so `ms >= 0` alone cannot see a miss, and on a module that interns no ref
+      // list at all `rlElemName` is EMPTY and `rlElemName[0]` is an out-of-bounds read
+      // inside the compiler (silent-class-inventory D227, D179's second site).
+      //
+      // THIS ONE IS WORSE-PLACED THAN D179's. It traps INSIDE `refListElemNameOfExpr`,
+      // which `refListSlotOfExpr` itself calls — so it fires before any caller has a
+      // slot to bound-test, and no caller-side guard (D179's included) can cover it.
+      // Three independent routes reach it: `exprHasStrOp`, `globalPromotable` and
+      // `forInElemKind`'s own `refListSlotOfExpr` call.
       const ms = mfResultSlotOf(exprIx, fnIx)
-      if ms >= 0 { return rlElemName[ms] }
+      if ms >= 0 && ms < rlElemName.length { return rlElemName[ms] }
     }
     // A struct-FIELD closure call (`v.f(1)` — the callee is a Member) or an INDEXED
     // closure-array element call (`v[0](1)` — the callee is an Index) whose result is a

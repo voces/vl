@@ -542,3 +542,91 @@ Pricing the block-E gate is the worked example. It is a deliberate loud floor, a
 354 of block A's 1,062 forward cells, 720 of C's 1,320 and 1,248 of E's 2,232 — every one
 reverting to the loud reject it already had, none to a silent class. That number is the
 argument for closing D223 rather than for widening the gate.
+
+## D179 / D227 — the two compiler traps, and the cheap substitute run at THREE successive bases
+
+Measured 2026-08-27, and **re-measured in full at each of three bases** as master moved under
+the branch. Every figure below is the CURRENT base, **`811f8102`**, seed **1,461,131** bytes;
+branch seed **1,461,174**. Both proved self-compilation fixed points (`native-fixpoint.sh`:
+stage3 == stage4), each built from its own commit's `compiler/*.vl` via `git archive` — which
+also sidesteps `git checkout <sha> -- compiler/`'s staging trap. The two ablation seeds are
+**1,461,158** (D179's rung alone) and **1,461,147** (D227's rung alone); all four sizes differ,
+which is the check that no two "different" seeds are the same bytes under different names.
+
+**THE FULL CENSUS AFTER-PASS IS NOT RUN ON THIS BRANCH** — `CLAUDE.md` item 6 now has the
+integrator run it once on the merged result. What a branch runs instead:
+
+| instrument | population | result |
+|---|---|---|
+| census block A, graded at base | 150,224 | **0 `compiler trap` cells** — which is what makes block D the right target rather than a guess |
+| census **block D**, cell-matched base → branch | 9,000 | **0 `runs` → not-runs · 0 → silent** · 2 `compiler trap` → loud emit reject · 8,998 unchanged |
+| the D179/D227 grid, cell-matched, ablated four ways | 288 | **0 `runs` → not-runs · 0 → silent** · 8 `compiler trap` → loud emit reject |
+| **corpus module `cmp`**, base vs branch | 2,332 files | **0 byte differences, 0 rc differences**; 1,898 identical modules, 432 identical messages, and exactly 2 intended moves (this change's own two fixtures) |
+| grid module `cmp`, base vs branch | 288 cells | 236 emit a module, **all byte-identical**; 52 emit none on either seed |
+
+**Blocks B, C and E are UNGRADED on the branch side.** This branch cannot rule out a backward
+move those blocks would contain, and does not claim to.
+
+### The same measurement at three bases, which is the point
+
+| base | base seed | branch seed | block D | grid traps base → branch |
+|---|---|---|---|---|
+| `a19a3db7` | 1,457,262 | 1,457,305 | 0 / 0 / 2 · silent 67 → 65 | 8 → 0 |
+| `75eb1f17` (after #1973) | 1,457,423 | 1,457,466 | 0 / 0 / 2 · silent 55 → 53 | 8 → 0 |
+| `811f8102` (after #1975) | 1,461,131 | 1,461,174 | 0 / 0 / 2 · silent 55 → 53 | 8 → 0 |
+
+#1973 and #1975 both changed list-literal element handling — the same neighbourhood as this
+change's root (`refListSlotOfExpr` clamping a miss to `0`) — so the numbers were re-taken at
+each base rather than inherited. #1973 moved block D's `check-clean invalid wasm` 65 → 53 and
+its `runs` 7,157 → 7,187; **#1975 moved no block-D cell at all**; and **neither touched either
+`compiler trap` cell**, which is why both were still there to close.
+
+Block D's base grade reproduces this file's published figure at each base, which validates the
+rebuilt seed, the regenerated cells and the grader in one measurement.
+
+### The ablation, and the direction check that a solo count would have got backwards
+
+The 288-cell grid crosses `op × decl × shape × pad × store`. On every base it has **8
+`compiler trap` cells and every one is `decl=armunion, shape=nested, pad=nopad`** — the two
+ingredients, and nothing else in the grid traps.
+
+| seed | bytes | compiler trap | loud emit reject | runs | invalid wasm |
+|---|---|---|---|---|---|
+| base `811f8102` — both rungs stripped | 1,461,131 | **8** | 44 | 228 | 8 |
+| R1 only (`forInElemKind`) | 1,461,158 | 6 | 46 | 228 | 8 |
+| R2 only (`refListElemNameOfExpr`) | 1,461,147 | 5 | 47 | 228 | 8 |
+| **both** | 1,461,174 | **0** | 52 | 228 | 8 |
+
+Stripping BOTH rungs reproduces `811f8102` **byte-for-byte at 1,461,131**.
+
+**THE UNION OF THE SINGLES IS 5 AND THE WHOLE IS 8** — the opposite sign from #1972's case,
+and the reason neither rung can be dropped on its solo count:
+
+* R1 alone fixes **2**: `op=forin` (both stores) — D179's own operation.
+* R2 alone fixes **3**: `op=slice` ×2, `op=filter/fn` — D227's operations.
+* **3 are composition-only**: `sliceforin/mod`, `sliceforin/fn`, `filterforin/fn`. They reach
+  BOTH sites in sequence, so guarding either one alone just moves the trap to the other.
+  Verified by cell identity, not by subtracting histograms — and identical at all three bases.
+
+### An instrument bug worth recording, because it produced a false finding twice
+
+The first corpus `cmp` reported 2, then 3, `MSGDIFF` files. **One and then two of those were
+the script's own doing**: the two runs write `<n>.b.wasm` and `<n>.a.wasm`, `vl build` echoes
+the path it wrote and quotes it again in the validation error, so a byte-IDENTICAL module was
+reported as a message difference purely because of the temp names. Caught by hand-comparing
+the modules both times, then normalised out of the script so the count is clean rather than
+hand-corrected. A comparison instrument that embeds its own inputs in the thing it compares
+will manufacture differences; the fix is to normalise before comparing, not to remember.
+
+### The `vbHeapIdxOfKind` guard-liveness census (D221)
+
+`vbHeapIdxOfKind` has **ten** call sites, not the eight D221 recorded, and only nine are
+separable by message (G1 and G6 share one). Across block A, block D and the corpus — **not one
+program reaches any of the ten guards**. The classifier was proved to fire on demand against
+each message text before the sweep, so the zero is a reading rather than a blind spot.
+
+Two were then made to fire by hand: **G6** (this is D221's own witness — settled against G1 by
+a throwaway probe compiler that tags the two same-message sites apart) and **G3**, whose
+program RAN correctly before #1972 and is now a loud emit reject (filed as **D228**). The other
+eight remain unwitnessed. Re-taken at `811f8102` after #1973 and #1975 both touched
+list-literal element handling: **no guard became reachable**, so D228's story is unchanged.

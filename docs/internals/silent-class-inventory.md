@@ -8338,49 +8338,156 @@ lines, NO layout twin declared, prints `7` on this tree):
 
 ---
 
-### D179 — a COMPILER TRAP: `for-in` over an undeclared list whose element field holds a union arm
-**compiler trap · found 2026-08-27 by the CENSUS grid (`scripts/silent-sweep/census/`), block D · the ONLY `compiler trap` in the inventory's live population, and the first program-level witness that column has ever had**
+### D179 — [CLOSED 2026-08-27] a COMPILER TRAP: `for-in` over an undeclared list whose element field holds a union arm
+**now a loud emit reject · was `compiler trap` on `a19a3db7` · found 2026-08-27 by the CENSUS grid (`scripts/silent-sweep/census/`), block D · the ONLY `compiler trap` the inventory's live population ever had, and the first program-level witness that column ever got**
 
-Repro:
+Repro (MINIMISED at the close — see the correction below; the originally filed nine-line
+program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-bearing):
 
     type Cir2 = { c2: i32 }
-    type Sq2 = { s2: i32 }
-    type Shape2 = Cir2 | Sq2
+    type Shape2 = Cir2 | i32
     const c = [{ r: { c2: 1 } }]
     let hit = 0
     for zz in c {
-      if zz.r is Cir2 { hit = 7 }
+      hit = 7
     }
     print(hit)
-    // vl check rc 0 with NO diagnostics; vl run AND vl build:
+    // `811f8102`: vl check rc 0 with NO diagnostics; vl run AND vl build:
     //   wasm trap: out of bounds array access   (inside the COMPILER)
-    // `vl build -o` writes NO module, which is what separates this from a program trap.
+    // `vl build -o` wrote NO module, which is what separated this from a program trap.
+    // Now: emitProgram: ref valtype with no interned shape — the SAME message the index
+    // spelling of this program has always given, so the two spellings finally agree.
 
-* **NINE LINES, no annotation, no twin, no alias, no map, no import, no generic.** The only
-  declarations are the union the payload's field is an arm of.
+* **THE ROW'S ORIGINAL REPRO OVERSTATED ITS OWN SHAPE, AND THE CORRECTION IS THE FINDING.**
+  As filed it read *"NINE LINES … the only declarations are the union the payload's field is
+  an arm of"*, with the trap demonstrated through `if zz.r is Cir2`. Building the controls
+  showed **the `is` is not load-bearing at all** — delete that line, leave a body of
+  `hit = 7`, and the compiler traps identically, same backtrace, same frame. The second arm
+  `Sq2` is not load-bearing either; `Cir2 | i32` is enough. The trap is in the loop's
+  BINDING, not in any read of the element, so the witness above is the true minimum at seven
+  lines. The original program still traps — it is a superset — but it pointed at the wrong
+  half of itself.
 * **THE COMPILER'S OWN ARENA READ IS OUT OF BOUNDS**, so this is not an emitted-program
   defect at all — it is `emitFail does not halt` territory: a recorded failure followed by
   continued emission over a parallel table. The third `vl build` stage is what says so; the
   run stage alone cannot tell a compiler trap from a program trap.
-* **SEVEN CONTROLS, each one change from the repro:**
+* **ELEVEN CONTROLS, each one change from the MINIMISED repro above**, every one built and
+  run rather than reasoned:
 
-  | change | outcome |
+  | change | outcome on `811f8102` |
   |---|---|
-  | (none — the repro as filed) | **compiler trap** |
+  | (none — the minimised repro) | **compiler trap** |
+  | put the `if zz.r is Cir2 { hit = 7 }` body back, and a second arm `Sq2` | **compiler trap** (the originally filed nine-line program) |
   | wrap the statements in `function rd() { … }` and call it | **compiler trap** (both scopes) |
   | `if c[0].r is Cir2 { … }` instead of `for-in` | loud emit reject (`ref valtype with no interned shape`) |
   | build the container as a map and read `c["k"] ?? …` | loud emit reject (same message) |
   | declare `type Circle = { r: Shape2 }` and annotate `const c: Circle[]` | RUNS |
   | `type Inner = { q: i32 }` field instead of a union arm | RUNS |
   | `const c = [{ c2: 1 }]` — the arm directly, not nested in a struct | RUNS |
+  | delete the `type` lines (no union declared anywhere) | RUNS |
+  | declare `Cir2` but NOT the union (`type Cir2 = { c2: i32 }` alone) | RUNS |
+  | add any second, unrelated ref list (`const pad: Other[] = [{ o: 1 }]`) | loud emit reject |
+
+* **WHAT IS LOAD-BEARING, since the `is` is not.** The payload's inner layout must match an
+  arm of a DECLARED union. That is `collectS` skipping a union member again — `Cir2`
+  gets no `sNames` row, so nothing interns the nested shape.
 
 * **THE `for-in` CONTROL IS THE ONE THAT NAMES THE SITE.** The index read reaches a guarded
   path that refuses loudly; `for-in` reaches the same shape through a lowering that does not
   consult the guard, and the unguarded read is the trap. That is the same asymmetry Root B
   records for the map view, one container out.
-* Population in the census: 2 cells (both spellings of the same program), out of 250,238.
-  The class is narrow — but it is the only `compiler trap` the tree has, and the column was
-  previously believed unprovokable from source.
+
+* **THE SITE, from a SYMBOLIC backtrace.** `vl build --names` embeds the wasm name section, so
+  building the compiler with that flag and running the repro under `--compiler` prints
+  `forInElemKind ← declareForInLocals ← collectStartLocals ← emitStartFnCode` in place of
+  `<wasm function 1861>`. The read is `rlElemKindTbl[rslot]` in `forInElemKind`. Worth knowing
+  generally: any compiler trap in this inventory can be localised this way in two commands.
+
+* **THE MISS SENTINEL IS `0`, NOT -1, AND THAT IS THE WHOLE DEFECT.** `refListSlotOfExpr`
+  CLAMPS a miss (`const s = rlSlotByName(nm); if s < 0 { return 0 }`), so a receiver with no
+  interned ref-list slot is indistinguishable from slot 0 and **no `< 0` test at any of its 32
+  call sites can ever find it**. With no ref list interned anywhere in the module
+  `rlElemKindTbl` is EMPTY, and `rlElemKindTbl[0]` is an out-of-bounds array access inside the
+  compiler. Control 11 is the proof: intern any other ref list and index 0 is in bounds, the
+  ladder proceeds, and the program takes a loud reject instead. This is D211's mechanism and
+  D221's — a "no answer" sentinel that collides with a real value — one table over.
+
+* **PATTERN 1, THE COMPLEMENT ALREADY WRITTEN AND NEVER CALLED — AND THE TREE HAD ALREADY
+  WRITTEN THE MECHANISM DOWN.** `forInIterUnionElemName`, one screenful down the same file,
+  asks THIS resolver the same question about the same slot and has carried the exact guard
+  since it was written: `if slot < 0 || slot >= rlElemKindTbl.length { return "" }`. The fix
+  is that line, in `forInElemKind`, falling through to `return null`. It is not a guard anyone
+  had to reason out: `emit_classify.vl` line 29328 already says it in full, verbatim —
+
+  > `refListSlotOfExpr` falls back to slot 0 for an UN-INTERNED element name (the ref-list
+  > tables can be empty when the only ref-array-shaped type is never interned — e.g. a
+  > nullable array-of-map field of a union arm). Bound-check before the read, the idiom the
+  > sibling ref-list classifiers already use — else `rlElemKindTbl[0]` on an empty table is a
+  > compiler-internal OOB trap. (Same guard added to the `.pop()` twin above.)
+
+* **A STATIC CENSUS OF THE FAMILY: 22 OF 32 CALL SITES ALREADY BOUND-TEST.** Of
+  `refListSlotOfExpr`'s 32 call sites in `emit_classify.vl`, 22 carry the
+  `slot >= 0 && slot < rl*.length` idiom inline; the rest hand the slot straight to a callee.
+  Both closure-side callees bound-test internally (`cloArrSlotSigKey` and `cloArrSlotRetName`
+  each open `if slot < 0 || slot >= rlElemName.length { return "" }`). **`rlElemVariantRow`
+  does NOT** — it reads `rlElemName[slot]` on its first line — but its only for-in caller,
+  `forInRefArrayVariantIdx`, runs solely under `fiEk == "variant"`, and after this fix
+  `forInElemKind` cannot answer `"variant"` on an empty table, so that leg is gated rather
+  than guarded. `forInElemKind` was the one site that indexed the table raw. The defect was
+  therefore never a missing idea — it is one site that never got the idiom the file had
+  already standardised around it, which is why it survived to be found by a 250,238-cell grid
+  rather than by review.
+
+* **THE FIX CANNOT MOVE A WORKING PROGRAM, BY CONSTRUCTION.** `rslot` is never negative (the
+  clamp), and any `rslot > 0` came from `rlSlotByName` and is therefore in bounds — so the new
+  guard fires **iff `rlElemKindTbl` is empty**, which is exactly and only the state in which
+  every read below it already trapped. The census is what confirms it rather than the argument.
+
+* **THE LOUD MESSAGE WAS ALREADY RECORDED; THE TRAP ONLY PREVENTED IT BEING PRINTED.** The close
+  reports `ref valtype with no interned shape`, not the `unsupported for-in iterable` that
+  `declareForInLocals` raises on a `null` element kind — `fbValtype`'s guard had already
+  recorded its failure in an earlier section, and `emitFail` records without halting. That is
+  the discipline's exact shape: a recorded failure, emission continuing, and one unbounded
+  table read downstream reaching the process first.
+* Population in the census: 2 cells (both spellings of the same program), out of 250,238 —
+  **both in block D, and block D is the only block that has one**: block A was graded in full
+  at `a19a3db7` (150,224 cells) and contains **zero** `compiler trap` cells, which is what
+  makes block D the right target for a cheap re-grade rather than a guess.
+
+* **THE CLOSE, MEASURED — census block D re-graded cell-matched, 9,000 cells, on the current
+  base: `811f8102` (seed 1,461,131) → this branch merged (seed 1,461,174):**
+
+      0 runs → not-runs · 0 → silent · 2 compiler trap → loud emit reject
+      8,998 of 9,000 unchanged · compiler trap column 2 → 0 · SILENT TOTAL 55 → 53
+
+  **THE TWO TRAP CELLS SURVIVED #1973 AND #1975**, which is why this was re-measured at each
+  base rather than inherited — both of those landings changed list-literal element handling,
+  the same neighbourhood as this row's root. Measured three times, on three bases, with the
+  identical result **0 / 0 / 2** every time:
+
+  | base | seed | branch seed | block D result |
+  |---|---|---|---|
+  | `a19a3db7` | 1,457,262 | 1,457,305 | 0 / 0 / 2 · silent 67 → 65 |
+  | `75eb1f17` (after #1973) | 1,457,423 | 1,457,466 | 0 / 0 / 2 · silent 55 → 53 |
+  | `811f8102` (after #1975) | 1,461,131 | 1,461,174 | 0 / 0 / 2 · silent 55 → 53 |
+
+  #1973 moved block D's `check-clean invalid wasm` 65 → 53 and its `runs` 7,157 → 7,187
+  (D180/D183); **#1975 moved no block-D cell at all**; and neither touched either
+  `compiler trap` cell. Same two cells throughout, same coordinates —
+  `cont=forin, rep=arm, declness=nodecl, twin=none`, D179's exactly.
+
+  The FULL census after-pass is NOT run on this branch — `CLAUDE.md` item 6 now has the
+  integrator run it once on the merged result. Block A's base grade, block D's matched pair
+  and the corpus `cmp` are what this row rests on; **blocks B, C and E are ungraded on the
+  branch side and this row does not claim them.**
+
+* **CORPUS `cmp`, THE INSTRUMENT A GRID CANNOT SUBSTITUTE FOR.** Every `tests/cases` program
+  built with both seeds and the MODULES compared byte-for-byte: **2,332 files, 0 byte
+  differences, 0 rc differences**, 1,898 byte-identical modules and 432 identical failure
+  messages. The only two files that move are this row's own fixture and D227's, each
+  `compiler trap` → loud emit reject. #1975 is why this is stated separately from the grids:
+  its own corpus `cmp` caught a `runs` → loud regression (`[c, d]` over two arms of one union)
+  that **none of its grids moved a single cell on**.
 
 ---
 
@@ -10145,10 +10252,93 @@ Repro:
   A module whose value unions never use a rep therefore answered heap type **0** for that
   rep's box — a real type in every module, and the wrong one. `ref.cast (ref 0)` +
   `struct.get 0 0` shipped where a message was intended.
-* **EVERY CALLER ALREADY HAD THE GUARD.** All eight sites test `< 0` and take a loud reject on
+* **EVERY CALLER ALREADY HAD THE GUARD.** Every site tests `< 0` and takes a loud reject on
   it; none could distinguish "box 0" from "no box", so the guard was dead for exactly the case
   it was written for. `vbHeapIdxOfKind` now reads back the mint's own condition (`vb*Used`)
   and answers -1, and the guards start working.
+
+* **CORRECTION, 2026-08-27 — THERE ARE TEN CALLERS, NOT EIGHT, AND THEY WERE HALF-DEAD RATHER
+  THAN DEAD.** This row shipped saying "all eight sites". Counted at `16d5c6e7` (the pre-fix
+  commit) and at `a19a3db7` alike, `vbHeapIdxOfKind` has **ten** call sites, all in
+  `wasmEmit.vl`, and every one of them tests `< 0`:
+
+  | # | line (`a19a3db7`) | enclosing function | message |
+  |---|---|---|---|
+  | G1 | 3422 | `emitNarrowedMem` | narrowed union field atom has no value box |
+  | G2 | 3596 | `emitOptMemberValue` | `?.` yields a nullable scalar but its union box was not collected |
+  | G3 | 3804 | `emitUnionUnboxTail` | narrowed union atom has no value box |
+  | G4 | 4440 | `emitUnionCoerce` | union atom has no value box |
+  | G5 | 4724 | `emitUnionPayloadUnbox` | union `==` atom has no value box |
+  | G6 | 5209 | `emitUnionFieldNarrowUnbox` | narrowed union field atom has no value box |
+  | G7 | 6858 | `emitMapGetOrUnionBox` | scalar\|null map value has no value box |
+  | G8 | 7092 | `emitMapGetScalarBox` | scalar map read has no value-box type |
+  | G9 | 20898 | `emitCoalesce` | union call atom has no value box |
+  | G10 | 21035 | `emitCoalesce` | union field atom has no value box |
+
+  The two `emitCoalesce` rows are two distinct sites in one function; G1 and G6 share a
+  message, so only **nine of the ten are separable by message alone** from outside the
+  compiler.
+
+* **AND "DEAD" WAS TOO STRONG — THE DEAD HALF IS THE VALUE-ATOM KINDS.** Pre-fix,
+  `vbHeapIdxOfKind` was `if k == 0 || k == 1 { return vbI32Idx }` … with a trailing `-1`. The
+  `-1` fall-through was reachable the whole time — every kind that is NOT one of the four
+  boxed scalars (string, null, the five list flavours, closure, and `k == -1` itself) came
+  back -1 and fired the guard normally. What could never fire was the guard's *intended* case:
+  `k` IS a boxed scalar and its box was never minted. So each of the ten guards had a live leg
+  and a dead leg, and the dead leg is precisely the one each was written for.
+
+* **G2 IS THE ONE THAT WAS UNCONDITIONALLY DEAD, AND ITS COMMENT ALREADY CLAIMED THE FIX.**
+  `emitOptMemberValue` calls `vbHeapIdxOfKind(0)` — a literal constant, never -1 pre-fix — so
+  its `ovb < 0` disjunct could not fire under any program and only `!uDeclared` was doing any
+  work. The comment two lines above it read, at `16d5c6e7`, "Both heap types are usage-gated
+  (`uDeclared` mints the box, `vbI32Used` its i32 value box), so a program whose collect walk
+  never registered the union fails loudly instead of emitting `struct.new` on index 0" —
+  describing a `vbI32Used` gate that `vbHeapIdxOfKind` did not consult. The prose documented
+  the intended code; #1972 is what made the sentence true. **A comment asserting a guard that
+  is not there is worse than no comment** — it is what stops the next reader checking, and it
+  sat directly above the one call site whose argument made the guard unfireable.
+
+* **HOW MANY ARE LIVE TODAY: 2 OF 10 HAVE A WITNESS, AND 8 HAVE NONE.** Measured on
+  `a19a3db7`, by matching each guard's message across every population available:
+
+  | population | base measured at | programs | cells reaching ANY of the ten guards |
+  |---|---|---|---|
+  | census block A, graded in full | `a19a3db7` | 150,224 | **0** |
+  | census block D, graded in full | `a19a3db7` and again at `811f8102` | 9,000 | **0** both times |
+  | the `tests/cases` corpus | `a19a3db7` (2,327) and again at `811f8102` | 2,332 | **0** both times |
+  | **total distinct programs** | | **161,556** | **0** |
+
+  The zero is a reading and not a blind spot: the classifier was proved to fire on demand
+  against each message text before the sweep, and it correctly declines an unrelated message.
+  What the populations do not contain, they do not contain — block A's emit-reject column is
+  dominated by `unsupported map value type` (9,545) and `nested arrays are not supported`
+  (8,866) and never reaches a value-box path at all.
+
+  **RE-TAKEN AFTER #1973 AND #1975**, both of which changed list-literal element handling:
+  block D and the corpus were swept again at `811f8102` and **no guard became reachable**, so
+  D228's story is unchanged by either landing. Block A was graded at `a19a3db7` only; the
+  integrator's own block-A pass covers `a19a3db7` → `811f8102` and supersedes a branch-side
+  re-grade of it. **Two caveats stated rather than buried**: 58 of the 2,332 corpus files hit
+  the sweep's 20s timeout, but a guard fire is an EMIT-time failure that returns immediately,
+  so a program still executing at 20s has necessarily passed emission and cannot contain one;
+  and blocks B, C and E were never swept for this at all.
+
+  For a denominator: block A's silent total is **6,472 at `a19a3db7`** (integrator's
+  measurement), against 12,673 published at `1559d80c`. These ten sites reach none of it.
+
+  Two guards were then made to fire by hand-building a program from the guard list:
+
+  * **G6** (`emitUnionFieldNarrowUnbox`) — this row's own filed witness. Which of the two
+    same-message sites it is was settled by a THROWAWAY probe compiler that tags G1 and G6
+    apart; the answer is G6, and **G1 still has no witness**.
+  * **G3** (`emitUnionUnboxTail`) — `const g: f64 | null = 5.0` / `if g is i32 { … }`. That
+    program RAN correctly before #1972 and is a loud emit reject after it; it is filed
+    separately as **D228**, because its root is a checker hole, not this guard.
+
+  So the honest statement is not "the guards now work" but: **the sentinel is fixed, two of
+  the ten guards have been shown to fire, and the other eight remain unwitnessed on every
+  population this tree can currently sweep.** A guard that cannot be made to fire is not
+  evidence of safety — it is an unmeasured guard, and eight of these still are.
 * **THE WITNESS IS THE PLAIN-STRUCT LEG, DELIBERATELY.** `Circle` is not a union member here,
   so this reproduces with no arm seam at all — which is what separates it from D219 and D220
   and is why it is a third row rather than a bullet under either.
@@ -10193,6 +10383,125 @@ Repro (census block A cell `a099944`, verbatim — D211's own cell plus one unio
   arm correctly; what disagrees is one container out, where the element slot is minted from
   whichever claimant the rep layer reached first. That is the same "two nominal claimants, one
   heap type" seam D39/D100 describe, asked of two ARMS instead of an arm and a struct.
+
+---
+
+### D227 — [CLOSED 2026-08-27] D179's SECOND site: `.slice` / `.filter` read `rlElemName[0]` INSIDE the resolver, where no caller's guard can reach
+**now a loud emit reject · was `compiler trap` on `a19a3db7`, `75eb1f17` and `811f8102`, and STILL trapping after D179's own fix · found 2026-08-27 by ablating D179's guard against every other operation that reaches the same resolver**
+
+Repro (FOUR lines, and it needs no `for-in` at all):
+
+    type Cir2 = { c2: i32 }
+    type Shape2 = Cir2 | i32
+    const c = [{ r: { c2: 1 } }]
+    print(c.slice(0, 1)[0].r.c2)
+    // `811f8102` AND the D179-only compiler: vl check rc 0, no diagnostics; then
+    //   wasm trap: out of bounds array access   (inside the COMPILER)
+    // (Re-verified on the merged base: traps on 1,461,131 and on 1,461,158 — D179's rung
+    //  alone — and is loud only with both rungs, at 1,461,174.)
+    // `vl build -o` writes NO module, which is what separates it from a program trap.
+    // Now: emitProgram: ref valtype with no interned shape
+
+* **SAME TWO INGREDIENTS AS D179, DIFFERENT SITE.** An anonymous object literal whose layout
+  matches an arm of a DECLARED union (so `collectS` skips the arm and nothing interns the
+  shape), plus an otherwise EMPTY ref-list table. `.filter` is the same defect:
+  `const d = c.filter((z) => true)` then `d[0].r.c2` traps identically.
+
+* **THE READ.** `refListElemNameOfExpr` (`emit_classify.vl`) ended its `Member`-callee arm
+  with `const ms = mfResultSlotOf(exprIx, fnIx)` / `if ms >= 0 { return rlElemName[ms] }`.
+  `mfResultSlotOf`'s `.slice` and `.filter` arms hand back `refListSlotOfExpr`'s answer, which
+  CLAMPS a miss to `0` — so `ms >= 0` cannot see a miss, and `rlElemName[0]` on an empty table
+  is an out-of-bounds read. **It was the only `rlElemName[…]` read in that function with no
+  upper bound; the six around it all spell `if rs >= 0 && rs < rlElemName.length`.**
+
+* **IT IS WORSE-PLACED THAN D179's, AND THAT IS THE POINT OF FILING IT SEPARATELY.** The trap
+  fires INSIDE `refListElemNameOfExpr`, which `refListSlotOfExpr` itself calls — so it happens
+  **before any caller has a slot to bound-test**, and no caller-side guard, D179's included,
+  can cover it. Three independent routes reach the same frame: `startFnDetectScratch →
+  exprHasStrOp → … → structIndexOfExpr`; `globalPromotable → globalCellKind → exprNulClosure
+  → refListSlotOfExpr`; and `collectStartLocals → declareForInLocals → forInElemKind →
+  refListSlotOfExpr` — i.e. through D179's own fixed function.
+
+* **THE DISCRIMINATORS, each one change from the repro** (all run, all verbatim):
+
+  | change | outcome on `a19a3db7` |
+  |---|---|
+  | (none — the repro as filed) | **compiler trap** |
+  | `.filter((z) => true)` bound to a local, then `d[0].r.c2` | **compiler trap** |
+  | `c[0].r.c2` — drop the `.slice` | loud emit reject |
+  | `.map((z) => z)` instead of `.slice` | loud emit reject |
+  | add `type Other = { o: i32 }` + `const pad: Other[] = [{ o: 1 }]` | loud emit reject |
+  | delete the two `type` lines | RUNS, prints `1` |
+  | declare `Cir2` but NOT the union | RUNS, prints `1` |
+  | `[{ c2: 1 }]` — the arm directly, not nested | RUNS, prints `1` |
+
+* **THE COMPOSITION IS LOAD-BEARING IN BOTH DIRECTIONS, MEASURED.** On a 288-cell grid
+  (`op × decl × shape × pad × store`) master has **8 compiler-trap cells, every one at
+  `decl=armunion, shape=nested, pad=nopad`** and nothing else. D179's guard alone fixes **2**
+  (`op=forin`); this one alone fixes **3** (`op=slice` ×2, `op=filter/fn`); together they fix
+  **8**. **The union of the singles is 5 and the whole is 8** — the three extra are
+  `sliceforin/mod`, `sliceforin/fn` and `filterforin/fn`, which reach BOTH sites in sequence,
+  so guarding either one alone just moves the trap to the other. Neither rung is droppable,
+  and a solo count would have understated both.
+
+  Re-measured on the merged base after #1973, and again after #1975, **identical on every
+  cell both times**: 8 traps at `811f8102` (1,461,131), 6 with R1 alone (1,461,158), 5 with
+  R2 alone (1,461,147), **0 with both** (1,461,174); `runs` 228 and `check-clean invalid
+  wasm` 8 unchanged across all four. Stripping both rungs reproduces `811f8102`
+  **byte-for-byte at 1,461,131**. #1973 and #1975 both changed list-literal element handling,
+  which is why this was re-taken rather than inherited — and neither moved a single cell of
+  this family.
+
+---
+
+### D228 — `is i32` is the ONE non-arm spelling the checker admits, and #1972 turned the program it admits from `runs` into a loud emit reject
+**loud emit reject · live on `a19a3db7`, `75eb1f17` and `811f8102` · RAN and printed the right answer on `16d5c6e7` — a `runs` → not-runs move introduced by #1972's D221 rung, on a program no census cell contains**
+
+Repro (TWO lines):
+
+    const g: f64 | null = 5.0
+    if g is i32 { print(g) } else { print(0) }
+    // `16d5c6e7`: runs, prints `0` — which is the CORRECT answer (`g` holds 5.0, not an i32).
+    // `a19a3db7`, `75eb1f17` and `811f8102`: vl check rc 0, then
+    //   emitProgram: narrowed union atom has no value box
+    // Add `const h: i32 | null = 3` anywhere in the module and it RUNS again, printing `0`.
+
+* **THE CHECKER HAS A ONE-SPELLING HOLE, AND THAT IS THE ROOT.** On the same `g: f64 | null`,
+  three of the four non-arm spellings are a loud CHECK reject —
+  ``​`is` check type 'i64' is not a variant of f64 | null``, and the same for `boolean` and
+  `string`. **Only `i32` passes.** A literal union rejects it too (`type K = 1 | 2`, `k is i32`
+  → ``​`is` check type 'i32' is not a variant of K``). So the emit-time guard is a SECOND ERROR
+  CHANNEL doing the checker's job, and the row that should exist is a check reject.
+
+* **WHAT #1972 ACTUALLY CHANGED, AND WHY IT LOOKS LIKE A REGRESSION.** Pre-#1972
+  `vbHeapIdxOfKind(0)` answered heap type **0** for the unminted i32 box, so the arm emitted
+  `ref.cast (ref 0)` on a branch the tag test never takes. The module was VALID and the
+  program printed the right answer — it worked BY LUCK, because the nonsense cast sat on dead
+  code. #1972 made the sentinel -1, the `< 0` guard woke up, and the program stopped building.
+  **#1972 was right to stop emitting nonsense; it is the checker hole that makes the program
+  reach emit at all.**
+
+* **THE MINT IS THE DISCRIMINATOR, WHICH IS WHAT PROVES THE MECHANISM.** `vbI32Idx` is
+  assigned only when `mAssignTypeIndices` sees `vbI32Used`. A module with no i32 value union
+  mints no i32 box, so `vbHeapIdxOfKind(0)` answers -1 and the guard fires. One unrelated
+  `const h: i32 | null = 3` sets the flag and the SAME `g is i32` line runs again. The class is
+  therefore `f64 | null` + `is i32` + *no i32 value box anywhere in the module* — not
+  "nullable scalar union" generally: `const g: i64 | null = 5` with `g is i32` RUNS on both
+  compilers.
+
+* **NOT FIXED HERE, DELIBERATELY.** The fix belongs in the checker's `is`-variant test, which
+  the literal-union path shares, and a checker change that turns emit rejects into check
+  rejects needs a census pass this branch was explicitly descoped from running. Filed with the
+  witness set rather than landed unmeasured.
+
+* **NO CENSUS CELL CONTAINS IT**, which is why #1972's all-blocks after-pass reported 0
+  `runs` → not-runs truthfully. Measured: across **150,224** block-A cells, **9,000** block-D
+  cells and **2,332** corpus files — 161,556 programs — **not one** reaches any of
+  `vbHeapIdxOfKind`'s ten guards. The class had to be constructed by hand from the guard list.
+  Re-swept at `811f8102` after #1973 and #1975: still none. **This row is the first regression
+  found this session OUTSIDE the census population, which is a standing limit on what item 6
+  can promise** — a full cell-matched after-pass can report 0 `runs` → not-runs truthfully and
+  still miss a two-line program, because the grid has no cell shaped like it.
 
 ---
 
@@ -11098,8 +11407,8 @@ Repro:
 
 ---
 
-### D245 — a LIST whose element is an arm-valued MAP delivered through a parameter
-**check-clean invalid wasm · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N) · the map/list CROSS that no grid had: the seven earlier grids build the container as a map and read it directly, never as the ELEMENT of a list**
+### D245 — [CLOSED 2026-08-27 — see the re-grade note] a LIST whose element is an arm-valued MAP delivered through a parameter
+**closed · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N) · the map/list CROSS that no grid had: the seven earlier grids build the container as a map and read it directly, never as the ELEMENT of a list**
 
 Repro:
 
@@ -11124,6 +11433,24 @@ Repro:
   grid built at all.
 * Grid population: 6 of the 18 cells still silent in block N after this PR, all `elem=map`,
   module scope, `deliv` ∈ {param, ident, call}.
+
+* **RE-GRADE NOTE, 2026-08-27 (#1974) — THIS ROW WAS ALREADY STALE ON `811f8102`, ITS OWN
+  MERGE COMMIT.** `check-filed-witnesses.py --strict` run against **master's own copy of this
+  file** and **master's own seed** (`811f8102`, 1,461,131 bytes, proved fixpoint) reports it
+  MOVED: the repro above runs and prints `7`. So the staleness predates #1974 and is not
+  caused by it — #1974's own two rungs are bound tests on an EMPTY ref-list table and this
+  program interns one.
+
+  **The mechanism was NOT investigated here**, deliberately: this is #1975's row, filed in the
+  same landing that closed D157/D163, and the likeliest reading is that the row was written
+  against a pre-fix measurement and its own PR then closed it. Someone who owns that landing
+  should confirm which rung did it and whether the block-N population figure above still
+  holds. The status is corrected so the gate reflects the tree; the causal claim is left open
+  rather than guessed.
+
+  This is the inventory going stale one-directionally *inside a single PR*, which is a
+  sharper version of the failure `CLAUDE.md` already warns about — the doc was accurate when
+  the row was drafted and wrong by the time it merged.
 
 ---
 
