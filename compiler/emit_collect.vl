@@ -140,6 +140,7 @@ import {
   isVariantBoxUnion,
   isVariantBoxUnionAtoms,
   mapValNameOf,
+  monoAnnHasTyParam,
   nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsF32Array,
@@ -500,6 +501,7 @@ import {
   objVariantName,
   pushPostGuardNarrow,
   recordAnnRlSlot,
+  recordArrLitCommitName,
   recordRefPushSlot,
   refArrElemKind,
   refArrElemName,
@@ -1580,7 +1582,101 @@ function dstPinSrcIsAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32) {
     // disagree with, not a hop to see through.
     if dstPinCalleeRetLet(u) == letIx { return true }
   }
+  // AN ELEMENT-PRESERVING CONDUIT, READ BACK WITH AN INDEX (silent-class-inventory D157).
+  // `reverse([c])[0]` hands back the very object `c` holds, through a callee whose result
+  // is spelled exactly as one of its parameters and whose spelling mentions a type
+  // parameter — `rv<T>(xs: T[]): T[]`, and `std:array`'s `reverse` is that signature. The
+  // value at the index IS this binding, so the destination the index is delivered to is
+  // this binding's destination.
+  //
+  // ONLY AN `Index` MAY CONSUME IT, and that gate is the whole difference from widening
+  // `dstPinFwdArg`. That predicate answers "the CALL's own value comes from argument j";
+  // this one answers "the call's ELEMENTS come from argument j's elements", which is a
+  // different claim about a different value. Read without the index, `reverse([c])` is a
+  // `Circle[]` and pinning `c` — one object — from a `Circle[]` destination would be a
+  // different program.
+  if n is Index {
+    const ia = P.nodes[unwrapParen(n.idxArr)]
+    if ia is Call {
+      const ej = dstPinElemFwdArg(unwrapParen(n.idxArr))
+      if ej >= 0 && ej < ia.callArgs.length {
+        return dstPinElemIsAt(bodyIx, ia.callArgs[ej], letIx, depth + 1)
+      }
+    }
+  }
   false
+}
+
+// Does the LIST at `ex` have this binding among its ELEMENTS? The element half of
+// `dstPinSrcIsAt`, and it is deliberately narrow: an `ArrayLit` whose elements the whole-
+// value test claims, or a further element-preserving conduit. A bare identifier naming a
+// list is NOT one — `const xs = [c]  rv(xs)[0]` reaches the binding through a list BINDING
+// whose own row is already committed, which is the control D157 files as RUNNING and which
+// this must not re-aim.
+function dstPinElemIsAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32): boolean {
+  if ex < 0 { return false }
+  if depth > 4 { return false }
+  const u = unwrapParen(ex)
+  const n = P.nodes[u]
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      if dstPinSrcIsAt(bodyIx, n.arrElems[i], letIx, depth + 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is Call {
+    const ej = dstPinElemFwdArg(u)
+    if ej >= 0 && ej < n.callArgs.length {
+      return dstPinElemIsAt(bodyIx, n.callArgs[ej], letIx, depth + 1)
+    }
+  }
+  false
+}
+
+// The argument position a CALL forwards its ELEMENTS from, or -1: the callee's return
+// annotation is spelled EXACTLY as one of its parameters' and that spelling MENTIONS one of
+// the callee's own type parameters (`function rv<T>(xs: T[]): T[]`, and `std:array`'s
+// `reverse`, `sorted`, `filtered`). First match wins.
+//
+// THE ELEMENT TWIN of `dstPinFwdArg`, and the difference is one line: that one requires the
+// result to BE a type parameter (`(x: T): T`, a whole-value identity), this one requires
+// only that the two spellings AGREE and mention one. A callee that returns a DIFFERENT
+// container of the same element (`(xs: T[]): T`) is not one — the spellings differ — and
+// neither is a concrete `(xs: Circle[]): Circle[]`, whose result is its own nominal claim.
+function dstPinElemFwdArg(callIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cf = P.nodes[unwrapParen(c.callFn)]
+    if cf is Ident {
+      const cfe = fnIndexOf(cf.identName)
+      if cfe >= 0 && cfe < fnStmts.length {
+        const cfn = P.nodes[fnStmts[cfe]]
+        if cfn is FuncDecl {
+          if cfn.fnRet < 0 { return -1 }
+          const rn = tyNameOf(cfn.fnRet)
+          if rn == "" { return -1 }
+          if !monoAnnHasTyParam(rn, cfn.fnTyParams) { return -1 }
+          // A WHOLE-VALUE conduit is `dstPinFwdArg`'s and not this one's: it is already
+          // crossed above, and claiming it here too would let an `Index` read one hop it
+          // has no business reading.
+          if dstPinIsTyParam(rn, cfn.fnTyParams) { return -1 }
+          let j = 0
+          while j < cfn.fnParams.length {
+            const pp = P.nodes[cfn.fnParams[j]]
+            if pp is Param {
+              if pp.parType >= 0 {
+                if tyNameOf(pp.parType) == rn { return j }
+              }
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // The binding an ordinary UN-ANNOTATED callee hands back, or -1 (silent-class-inventory
@@ -1826,7 +1922,17 @@ function dstPinCallArgs(
               if pp is Param {
                 let open = pp.parType < 0
                 if !open {
-                  open = dstPinIsTyParam(tyNameOf(pp.parType), cfn.fnTyParams)
+                  // A POSITION IS OPEN WHEN ITS SPELLING *MENTIONS* A TYPE PARAMETER, not
+                  // only when it IS one (silent-class-inventory D157). `xs: T[]` carries no
+                  // more nominal claim than `x: T` does — the monomorphizer pins both FROM
+                  // the argument — yet the narrow test read it as CONCRETE, cut the element
+                  // `T` through `armPinAnnName`, found no variant of that name and pushed
+                  // `""`. That is a destination DISAGREEMENT, so an element-preserving
+                  // conduit VETOED the pin every other delivery of the binding agreed on.
+                  // `monoAnnHasTyParam` is the monomorphizer's OWN predicate for the rule
+                  // this leg's header already states, and it covers the array, map, union
+                  // and function-type grammars this one never learned.
+                  open = monoAnnHasTyParam(tyNameOf(pp.parType), cfn.fnTyParams)
                 }
                 if !open {
                   dstPinPushAnn(
@@ -1866,6 +1972,192 @@ function dstPinCallArgs(
 // DIRECTION, not a cell count, and a candidate whose own column is all zeroes can still be
 // the half that makes the other one safe.
 let dstPinFired = 0
+
+// ── scanArrLitCommit — the list literal's element row, keyed off the element's own
+// COMMITTED rep rather than off the checker's shape (silent-class-inventory D163) ────────
+//
+// THE DEFECT. `arrLitElemName` names a literal's element row from the checker's recorded
+// `TyArray.aElem` whenever the first element is not itself a literal, and that record is a
+// STRUCTURAL shape. `shapeNominalOfTy` resolves one by asking the struct table before the
+// variant table, so with `type Dot = {r:i32}` declared beside a `Circle` arm of the same
+// layout the row keys `Dot` — while the element EXPRESSION builds the arm. Disassembled:
+// `array.new_fixed` pushes a `(ref <Circle's heap>)` into an `(array (mut (ref null
+// <Dot's heap>)))`, from a module `vl check` passes with no diagnostics at all.
+//
+// IT IS D39's CHANNEL AT A REP-INTERNING KEY, so the answer is not another pin: the
+// deciding information is at the ELEMENT, and the row is keyed at the LIST. What this pass
+// does is carry the one to the other, once, in a scope.
+//
+// A SEPARATE PASS AND NOT A RUNG, and the reason is the classifiers' own contract. The
+// three of them (`arrLitElemName`, `arrLitElemKind`, `arrLitElemHintTy`) "must agree per
+// slot", and they are called from TWO places with different information: `collectA`'s
+// arena walk has no enclosing scope, `wasmEmit`'s literal lowering has one. A rung that
+// asked `parentLetOf` would answer at the second and decline at the first, and one literal
+// would key two rows — the exact failure this row is about, in the other direction.
+//
+// THE GATE IS D39's OWN QUESTION, asked of the committed name: it is banked only when the
+// name reaches a union ARM, bare or through the map grammar. Everything else keeps the
+// classification it had, so the blast radius is the contested seam and not every list
+// literal in the language.
+//
+// BEFORE `monomorphize`, which is the same requirement `synthDstPinAnns` has and for a
+// stronger reason: the destination pin runs there, so the committed name must be read
+// AFTER it, and a generic conduit cloned first would have its parameter pinned off the very
+// row the un-annotated literal resolved. Node indices are the originals, and a body the
+// monomorphizer clones is simply not banked — a decline, which is the conservative
+// direction at a rep key.
+export function scanArrLitCommit(rootIx: i32) {
+  let fe = 0
+  while fe < fnStmts.length {
+    const fnIx = fnStmts[fe]
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { alcWalk(fn.fnBody, fn.fnBody, fnIx) }
+    fe = fe + 1
+  }
+  // The module's own statements, with the program node as the scope — the shape
+  // `synthGlobalDstPinAnn` uses, and for its reason: `plScanStmt` has a `Program` arm and
+  // no `FuncDecl` one, so a function's locals cannot leak into the module's map.
+  if rootIx >= 0 { alcWalk(rootIx, rootIx, -1) }
+  0
+}
+
+// Every `ArrayLit` lexically inside one scope, NOT descending into a nested `FuncDecl`
+// (which has its own `fnStmts` row and is walked as its own body — the same totality
+// `dstPinSynthWalk` gets from `nodeChildren`, and the same reason).
+function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if ix != bodyIx {
+    if n is FuncDecl { return 0 }
+  }
+  if n is ArrayLit {
+    if n.arrElems.length >= 1 {
+      // EVERY element must commit to the SAME name, and the gate is not fastidiousness —
+      // `const xs = [c, d]` over two ARMS of one union is a UNION-BOX list, and reading only
+      // the first element would key it under one arm and emit `unknown variant field in
+      // field access` for the other. `arrLitObjElemBoxVariant` already widens the literal
+      // arm of the classifier for exactly that reason; this is the same rule at the
+      // committed-rep rung. A heterogeneous literal has no single committed rep, so the
+      // bank stays empty and the checker-typed union rung — which is the right answer
+      // there — keeps it.
+      const cn = alcCommitName(n.arrElems[0], bodyIx, fnIx, 0)
+      let agree = alcNamesArm(cn)
+      let ei = 1
+      while ei < n.arrElems.length {
+        if alcCommitName(n.arrElems[ei], bodyIx, fnIx, 0) != cn {
+          agree = false
+        }
+        ei = ei + 1
+      }
+      if agree { recordArrLitCommitName(ix, cn) }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    alcWalk(kids[k], bodyIx, fnIx)
+    k = k + 1
+  }
+  0
+}
+
+// Does `name` reach a union ARM — bare, or through the map grammar at any depth? The gate,
+// and it is `armPinAnnName`'s question asked of a NAME instead of an annotation node:
+// D39's "this anonymous shape has two nominal claimants" is the only seam where the
+// checker's structural record and the element's committed rep can name different heaps.
+function alcNamesArm(name: string): boolean {
+  if name == "" { return false }
+  if variantIndexOf(name) >= 0 { return true }
+  const leaf = mapLeafValName(name)
+  if leaf == "" { return false }
+  variantIndexOf(leaf) >= 0
+}
+
+// The type-NAME the expression at `ex` has already COMMITTED its rep to, or "".
+//
+// FOUR SOURCES, and every one of them is an ANNOTATION a user wrote or a pin synthesized —
+// never an inference, because an inference is the structural record this pass exists to
+// stop trusting. A bound local (its annotation, the destination pin's included), a
+// PARAMETER, a callee's DECLARED result, and a callee's inferred result read through the
+// binding that supplies it — the same `retLocalLetOfBlock` hop `dstPinCalleeRetLet` makes,
+// asked here for a spelling rather than for a binding.
+//
+// Depth-bounded for `dstPinSrcIsAt`'s reason: the arena is not this pass's to trust, and
+// four hops is far past any spelling measured.
+function alcCommitName(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): string {
+  if ex < 0 { return "" }
+  if depth > 4 { return "" }
+  const u = unwrapParen(ex)
+  const n = P.nodes[u]
+  if n is Ident {
+    const lli = parentLetOf(bodyIx, n.identName)
+    if lli >= 0 {
+      const ld = P.nodes[lli]
+      if ld is LetDecl {
+        if ld.letType >= 0 { return tyNameOf(ld.letType) }
+        // AN UN-ANNOTATED BINDING IS A LINK IN THE CHAIN, NOT THE END OF IT —
+        // `dstPinLocalDest`'s own rule, and `retLocalLetOfBlock` is the family's shared
+        // implementation of it. `function thru(x: {[string]: Circle}) { const y = x
+        // return y }` commits its result through `x`, and stopping at `y` loses that for
+        // no reason: the alias RE-NAMES a value, it does not re-rep one.
+        return alcCommitName(ld.letInit, bodyIx, fnIx, depth + 1)
+      }
+      return ""
+    }
+    const pn = alcParamAnnName(fnIx, n.identName)
+    if pn != "" { return pn }
+    const gli = globalLetOf(n.identName)
+    if gli >= 0 {
+      const gd = P.nodes[gli]
+      if gd is LetDecl {
+        if gd.letType >= 0 { return tyNameOf(gd.letType) }
+      }
+    }
+    return ""
+  }
+  if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Ident {
+      const cfe = fnIndexOf(cf.identName)
+      if cfe >= 0 && cfe < fnStmts.length {
+        const cix = fnStmts[cfe]
+        const cfn = P.nodes[cix]
+        if cfn is FuncDecl {
+          // A DECLARED result is the commitment; nothing inside the callee can overrule
+          // the claim it makes about its own result.
+          if cfn.fnRet >= 0 { return tyNameOf(cfn.fnRet) }
+          const crx = fnRetExprOf(cix)
+          if crx < 0 { return "" }
+          return alcCommitName(crx, cfn.fnBody, cix, depth + 1)
+        }
+      }
+    }
+    return ""
+  }
+  ""
+}
+
+// The annotation spelling of parameter `name` of the function at `fnIx`, or "". The
+// parameter half of the lookup above: `parentLetOf` answers for a function's LOCALS and a
+// parameter is not one, yet it is the commitment an identity conduit's body hands back.
+function alcParamAnnName(fnIx: i32, name: string): string {
+  if fnIx < 0 { return "" }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let j = 0
+    while j < fn.fnParams.length {
+      const pp = P.nodes[fn.fnParams[j]]
+      if pp is Param {
+        if pp.parName == name {
+          if pp.parType >= 0 { return tyNameOf(pp.parType) }
+          return ""
+        }
+      }
+      j = j + 1
+    }
+  }
+  ""
+}
 
 // The PRE-MONOMORPHIZATION run of `synthDstPinAnn`, over every function body — and the
 // ordering is a requirement, not a convenience.

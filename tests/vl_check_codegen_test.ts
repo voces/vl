@@ -752,6 +752,29 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CLOSED as of the paragraph below; the file graduated to
 // `tests/cases/soundness/arm-valued-map-beside-struct-twin.vl`, `@run` + three `@log 7`.)
 //
+// SWAPPED AGAIN 2026-08-27 (silent-class-inventory D157 + D163). The
+// `reverse([c])[0]` conduit specimen this constant carried is CLOSED and graduated to
+// `tests/cases/soundness/arm-literal-through-a-list-conduit.vl`, `@run` + five `@log 7`.
+// Its two roots are why it needed one commit: the pin's halves move 0 cells and change 4
+// messages, and the list literal's element row keeps every one of them silent until it is
+// keyed off the element's COMMITTED rep instead of the checker's structural record.
+//
+// THE SUCCESSOR IS CHOSEN FOR STABILITY, not only for liveness, and that is a change of
+// selection rule this genealogy earns: five swaps in one day happened because each
+// successor was the newest thing found, and the newest thing found is by construction the
+// one a rung is about to close. D158 is the opposite shape — its program has NO delivery
+// anywhere, so the whole `synthRetPinAnn` / `synthEmptyListAnn` / `synthDstPinAnn` family
+// cannot reach it by construction rather than by omission, and EIGHTEEN candidate compilers
+// have now been graded against it without moving it (the fourteen recorded under D158, plus
+// the four graded beside this swap). Re-RUN against this tree at the swap rather than
+// inherited: `vl check` rc 0 with NO diagnostics at all, `--codegen` rc 1 with `not valid
+// wasm` + `type mismatch: expected (ref null $type), found (ref $type)`, `--codegen
+// --no-validate` rc 0, and NO `emit error` marker. Pre-existing on `54780e0b`, `1559d80c`,
+// `ff04d74b` and `a19a3db7`, same message, and its module is byte-identical across the
+// change this file ships with. Pinned as
+// `tests/cases/soundness/xfail-miscompile-read-site-annotation-nested-map.vl` per the
+// REFILLS procedure below, in the same commit that swapped this constant.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // THE STANDING NOTE, REWRITTEN ONCE — this is now the PAIRING half only.
 //
@@ -788,16 +811,19 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // CROSS-CHECKED against the corpus — see the biconditional in the tripwire. Neither
 // state can be entered halfway.
 // ─────────────────────────────────────────────────────────────────────────────
-const INVALID_MODULE_SRC: string | null = `import { reverse } from "std:array"\n` +
-  `type Circle = { r: i32 }\n` +
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 }\n` +
   `type Sq = { s: i32 }\n` +
   `type Shape = Circle | Sq\n` +
   `type Dot = { r: i32 }\n` +
-  `function mk(n: i32): Circle {\n` +
-  `  const c = { r: n }\n` +
-  `  return reverse([c])[0]\n` +
+  `function mk(n: i32) {\n` +
+  `  const l1 = Map()\n` +
+  `  l1["k1"] = { r: n }\n` +
+  `  const c = Map()\n` +
+  `  c["k2"] = l1\n` +
+  `  return c\n` +
   `}\n` +
-  `print((mk(7)).r)\n`;
+  `const d1: {[string]: Circle} = Map()\n` +
+  `print(((((mk(7))["k2"] ?? d1))["k1"] ?? { r: 0 }).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.
