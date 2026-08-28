@@ -10,6 +10,49 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **`x is T` asks a TAG question, so `assignable` is the wrong predicate for it — a numeric
+  WIDENING is not a variant** (2026-08-28, silent-class-inventory D228). The soundness gate on
+  `is` asks whether the check type can flow into the receiver's non-null part, which is the
+  right question for a STORE and the wrong one for a runtime tag test: the widening lattice
+  (i32→i64, i32→f64, f32→f64) is a set of CONVERSIONS, and codegen emits a real instruction at
+  each boundary, so the value in the slot is not of the source type and no tag says it is. The
+  alternative considered was leaving it to the emitter's `vbHeapIdxOfKind` guards, which is what
+  the tree did: the test was admitted, the then-branch narrowed the binding VERBATIM, and the
+  emitter either lowered a value-box read for a box the module never minted (a loud reject since
+  #1972, a `ref.cast (ref 0)` on dead code before it) or let a dead branch through. Rejected
+  because a second error channel doing the checker's job is the shape this gate's own header
+  names as a LAUNDER, and because the outcome depended on what ELSE the module declared — one
+  unrelated `const h: i32 | null = 3` mints the box and the same line builds. **The price is 44
+  programs that ran**, all with an always-false test and a dead `then`; it is a named set
+  (`d228-is-widen`) rather than a reason to keep the hole. Same-primitive pairs are never a
+  widening, stated in NAMES rather than arena indices so a newtype brand cannot slip through
+  identity.
+
+- **A `{`-leading type-declaration body owns its `[]` SUFFIX, at the declaration fork rather
+  than at any later reader** (2026-08-28, silent-class-inventory D188). `parseTypeDecl` sends a
+  `{`-leading body to the struct path and tested only for `&` and `|` after the closing brace; a
+  `[` matched nothing, so `type L = {n: i32}[]` declared the struct `{n: i32}` and the two
+  brackets became the next STATEMENT — an empty array literal, accepted silently. The suffix is
+  consumed at the fork, ahead of the `&`/`|` continuation, because it binds tighter than both:
+  `{a: i32}[] | null` is a nullable ARRAY and the union loop must see `{a:i32}[]` as its first
+  member. `atTypeCont` is `parseTypeAtom`'s own suffix test, so the two grammars cannot disagree
+  about what a `[]` suffix is, and no newline is skipped ahead of it — a `[` on the next line
+  opens a statement, exactly as after any other annotation. The rung MUST NOT land alone: with
+  the parser producing an array alias the transparency rule has no arm for, nine programs of
+  this family go from a loud check reject to check-clean invalid wasm (`d188-rung-price`).
+
+- **A loud floor over a defect that is silent at the neighbouring spelling is still worth
+  keeping, until the defect closes** (2026-08-28, silent-class-inventory D223/D361).
+  `armRecvHoldsBareArm` declines a ref-list ELEMENT receiver, and both it and D223 justified the
+  decline as "the module is already invalid before the read". That is refuted — lift the decline
+  and D223's own witness RUNS and prints the right answer, and the decline costs **828** census
+  block-E cells that go loud → `runs` with 0 `runs` lost. It is kept anyway, for the **24** cells
+  the lift takes loud → check-clean invalid wasm. The argument for lifting is that those 24 are
+  already silent on master one binding away (`const e0 = g1[0]` instead of `(g1[0]).r`), so the
+  loudness belongs to a spelling rather than to the class; the argument against, which wins, is
+  this programme's own standing rule that loud → silent is a blocker in its own right. The 24
+  coordinates are committed so the trade can be re-made in one command the day D361 closes.
+
 - **A read that stops being a BOX must stop being one in every classifier that answers for it,
   and "how many consumers would have to learn it" is a count, not an argument** (2026-08-28,
   silent-class-inventory D311). D209 made an un-narrowed code-16 read DELIVER a bare atom where

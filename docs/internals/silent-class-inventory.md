@@ -9097,50 +9097,123 @@ Repro:
 
 ---
 
-### D188 — an array alias whose LEAF is an INLINE OBJECT SHAPE is loud in every position where the direct spelling runs
-**loud check reject · filed 2026-08-27 out of D181's leaf census · the FOURTH array-spine leaf kind, unmoved by D181's fix and at parity between merged master `e04b1567` and the branch**
+### D188 — [CLOSED 2026-08-28] an array alias whose LEAF is an INLINE OBJECT SHAPE is loud in every position where the direct spelling runs
+**CLOSED 2026-08-28 — the repro now RUNS and prints `7`, and the module it builds is BYTE-IDENTICAL to the direct spelling's. Was: `loud check reject` · filed 2026-08-27 out of D181's leaf census as the FOURTH array-spine leaf kind · THE ROW'S FILED MECHANISM WAS WRONG — the transparency arm it blamed reads `reach=0` on its own witness, because `type L = {n: i32}[]` never became an array at all**
 
 Repro:
 
     type L = {n: i32}[]
     const c: L = [{ n: 7 }]
     print(c[0].n)
-    // vl check rc 1:
+    // PRINTS 7. Was `vl check` rc 1:
     //   [ERROR]: cannot assign {n: i32}[] to 'c' of type L
 
-* **THE CONTROL IS ONE CHARACTER SET SHORTER AND RUNS**: `const c: {n: i32}[] = [{ n: 7 }]`
-  prints `7`. The alias spelling is a dialect of its own here, which is the exact condition
-  D-ALIASARR, D-ALIASARRNOM and D-ALIASARRMAP each removed for one other leaf kind.
-* **THE LEAF LADDER, MEASURED RATHER THAN READ OFF THE SOURCE.** Thirteen leaf kinds, each
-  spelled once through a `type L = <leaf>[]` alias and once inline, on `e04b1567` and on the
-  branch:
+* **IT IS A PARSE, AND `vl fmt` PRINTS THE PARSE BACK VERBATIM.** `parseTypeDecl` sends a
+  `{`-leading declaration body to the STRUCT path (everything but an index-signature map),
+  parses the field list, and then tests only for `&` and `|` after the closing brace. A `[`
+  matched no arm, so the declaration completed as the plain struct `{n: i32}` and the two
+  bracket tokens were re-lexed as the NEXT STATEMENT — an empty array literal. On master,
+  `vl fmt` on the repro above prints:
 
-  | array-spine leaf | `e04b1567` alias | branch alias | inline control |
-  |---|---|---|---|
-  | `i32`, `string` | runs | runs | runs |
-  | declared struct (`Cat`) | runs | runs | runs |
-  | litunion alias (`K0`), numeric litunion alias (`Z`), declared union (`U1`) | runs | runs | runs |
-  | **map** (`{[string]: i32}`), **map of struct**, **array of map** | **check-clean invalid wasm** | **runs** | runs |
-  | **inline object shape** (`{n: i32}`) | **loud check reject** | **loud check reject** | **runs** |
-  | `i32 \| null`, `Cat \| null`, `(i32) => i32` | loud check reject | loud check reject | loud check reject (parity) |
+      type L = {n: i32}; []
 
-* **IT IS LOUD IN ALL FOUR POSITIONS, WITH FOUR DIFFERENT MESSAGES** — including the one
-  spelling that is SILENT for the map leaf. `cannot assign {n: i32}[] to 'c' of type L` at a
-  binding · `cannot index non-array L` at a parameter · `return type mismatch: expected L,
-  got {n: i32}[]` at a return · and **`cannot assign _[] to '_sp1' of type L` at the UNREAD
-  `const _sp1: L = []` binding**, which is exactly D181's silent spelling. So this leaf has
-  no silent form at all: the assignability check refuses the empty literal before any
-  emitter sees it, where for a map leaf the same line was accepted and mis-repped. That is
-  why D188 is a LOUD row and D181 was a silent one, and it is the reason the leaf ladder had
-  to be measured rather than read off the diff — the two leaves fail at different layers.
-  Declaring a struct of the same shape beside it does NOT rescue it.
-* **A TWO-DEEP INLINE-SHAPE BODY IS A PARSE ERROR**, not this row: `type L = {n: i32}[][]` is
-  `expected an expression but found RBRACK` — the same bound `scripts/silent-sweep/census/README.md`
-  records under *What the census could NOT reach*.
-* Why it is filed rather than fixed here: the leaf test would be "the leaf is a `TyObj` with
-  no declared name", and `transparentMemberEmitName`'s object arm is `isPlainAliasRef`-gated
-  precisely so a canonicalized intersection keeps its named-struct route. That gate's
-  interaction with an ARRAY spine is a second population and wants its own twin table.
+  **A COUNTER BUILD IS WHAT NAMED IT.** The row's own closing paragraph proposed the fix as
+  "the leaf test would be a `TyObj` with no declared name" in `singleAliasMemberTyIx`. That
+  predicate was written (`arrSpineIsObj`), built, and **moved 0 of 322 grid cells**: a probe
+  compiler raising a distinct diagnostic at the `mt is TyArray` arm reads **`reach=0`** on
+  this repro, because there is no array in the declaration for the arm to see. The same
+  probe reads `reach=1 ans=0` on `type L = AB[]` over an intersection, which is how the arm
+  was shown to be alive and simply not on this road.
+
+* **BOTH READINGS OF THE MISPARSE WERE WRONG AND ONE OF THEM WAS SILENT.** The filed witness
+  uses `L` as the array it says it is and is loud. Use it as the STRUCT it was misparsed
+  into and it **compiles and prints**:
+
+      type L = {n: i32}[]
+      const c: L = { n: 7 }
+      print(c.n)          // master: PRINTS 7
+
+  So the declaration silently meant something other than what it said, at every use. The
+  loud half is the half that got filed because it is the one an author writing an array
+  alias hits first.
+
+* **AND THE ROW'S "TWO-DEEP IS A PARSE ERROR" BULLET WAS THE SAME MECHANISM READ AS A
+  BOUND.** `type L = {n: i32}[][]` is `expected an expression but found RBRACK` on master
+  because the dropped suffix lexes as `[]` followed by an index with no expression in it.
+  `scripts/silent-sweep/census/README.md` recorded that as one of two reasons the census
+  *could not reach* `claim` × list containers × an inline-object payload; **both halves of
+  that bound are closed here**, and the derived corpus sees it — `a001560` and `b003230`,
+  12,288 census cells, move from that parse error to the language's own answer for a
+  three-deep array (`nested arrays are not supported`, which the DIRECT spelling gives too).
+
+* **THREE RUNGS, ABLATED, AND R1 ALONE IS A REGRESSION.** Stripping all three reproduces
+  master's seed **byte-for-byte** (`md5 41fff4cd…`, both 1,465,575 bytes). On the 322-cell
+  alias-vs-inline twin grid (23 array-spine leaf kinds × 7 positions × {alias, alias-free
+  control}), graded on the RUN:
+
+  | ablation | vs master (moved / →runs / runs LOST / →silent) | vs the branch |
+  |---|---|---|
+  | the branch | 70 / 63 / 0 / 0 | — |
+  | strip **R1** (`parseTypeDecl`'s `[]` suffix) | **0 / 0 / 0 / 0** | 70 differ, 63 runs lost |
+  | strip **R2** (`arrSpineIsObj` in `singleAliasMemberTyIx`) | 19 / 8 / 0 / **9** | 60 differ |
+  | strip **R3** (`arrSpineIsObj` on `transparentMemberEmitName`'s nominal leg) | 70 / 61 / 0 / 0 | **2** differ |
+  | strip **R2+R3** | 19 / 8 / 0 / **9** | 60 differ |
+  | strip **R4** (D228's, in this same PR) | 70 / 63 / 0 / 0 | **0 — identical** |
+
+  · **R1 is the gate**: with it stripped the grid is master exactly, so nothing downstream
+  can fire. · **R1 WITHOUT R2 IS A CATASTROPHE**: nine cells go from a loud check reject to
+  **check-clean INVALID WASM** — all nine at the `unread` position, which is D181's silent
+  spelling. The parser starts producing an array alias the transparency rule has no arm for,
+  `collectU` mints it a one-variant union row, and the cell takes the `{tag, anyref}` box
+  while the initializer lowers a list wrapper: `expected (ref $type), found (ref $type)`,
+  `vl check` rc 0. **Two rungs, one landing.** The nine are the named set
+  `d188-rung-price`; nothing derived from current behaviour can find them, because on the
+  shipped tree all nine simply run. · **R3 IS LOAD-BEARING FOR 2 CELLS AND THE PREDICTION
+  WAS THAT IT WOULD BE FOR 0.** An inline shape has no declared name to drop, so the
+  expectation was that `tyToEmitNameAt` would be faithful; it is not when the shape's FIELD
+  names a declared struct — `type L = {p: Cat}[]` renders `{p:{n:i32}}[]` structurally
+  while canon leaves the direct spelling `{p:Cat}[]`, and the element tables key on the
+  latter. Without R3 those two cells are `emitProgram: only i32[] arrays and struct/union
+  element arrays are supported` where the control runs. · **R4 scores 0 here**, which is why
+  it has its own grid — see D228.
+
+* **RE-TAKEN ON `4a6c1e52` AFTER #1991, AND EVERY CELL OF THE TABLE ABOVE IS UNMOVED.**
+  #1991 landed D199/D222/D269 between this branch's first measurement and its merge, and it
+  touched the same emitter neighbourhood (`repVariantSlotRep`, `repSigVariantTok`,
+  `sigParamSlotAt`, and D222's paren unwrap). Both grids were rebuilt and all six ablation
+  seeds recompiled against the new base: the alias grid's 70/63/0/0 and every strip row are
+  **identical cell for cell**, the `is` grid's 72/44 is identical, and the D223 block-E
+  measurement below reproduces at 852/828/0/24 with the SAME 24 coordinates. The only figure
+  that moved is the strip-all control itself — master's seed is `md5 41fff4cd…` at 1,465,575
+  bytes where it was `28d8dbf4…` at 1,465,013 — which is what makes re-taking it necessary
+  rather than optional: the control is the thing a rebase invalidates, not the deltas.
+
+* **THE LEAF LADDER, RE-MEASURED, AND THE ROW'S OWN TABLE HAD IT WRONG FOR THREE LEAVES.**
+  The filed table reports `litunion alias (K0)`, `numeric litunion alias (Z)` and
+  `declared union (U1)` as **runs / runs / runs**. Measured over all seven positions rather
+  than the one D181's census used, they are a **loud check reject at six of seven** while
+  the inline control runs at all seven — the filed reading is true only at the `unread`
+  position, where nothing reads the alias at all. That is a separate residue: a leaf that is
+  itself a declared alias, which `arrSpineIsNominal`'s header names as deliberately
+  unclaimed. Filed as **D362**.
+
+* **THE INTERSECTION LEAF IS UNMOVED AND HAS A SILENT CELL OF ITS OWN.** `type AB = {a:i32}
+  & {b:i32}` interns as a NAMED struct, so `structNameOfTy` answers `AB` and
+  `arrSpineIsObj`'s exclusion hands `type L = AB[]` to `arrSpineIsNominal` — which also
+  declines, because at that point `AB` is a `TyUnion` placeholder rather than a `TyObj`.
+  All 7 of its positions are identical on master and on the branch, and one of them —
+  `unread` — is **check-clean invalid wasm on both**. Filed with D362.
+
+* **CORPUS: `cmp` BYTE-IDENTICAL.** 1,920 of 1,920 pre-existing buildable `tests/cases` modules build to
+  the identical bytes under master and the branch; 430 fail on both (the error fixtures), and the one one-sided file is this row's own new fixture, which cannot build on master by construction;
+  **0 DIFFER, 0 one-sided**. Distilled corpus: 0 `runs` lost, 0 → silent, 4 classes moved
+  (23,840 census cells) — 11,552 `loud check reject → runs`, 12,288 `loud check reject →
+  loud emit reject` (the nested-array parse error above, landing on the direct spelling's
+  own floor).
+
+* Fixed by **`arrSpineIsObj`** (`compiler/typecheck.vl`, the fourth `arrSpineIs*` twin) plus
+  the array-suffix arm in **`parseTypeDecl`** (`compiler/parser.vl`). Fixtures:
+  `tests/cases/types/array-alias-inline-shape-element.vl`.
 
 ---
 
@@ -11355,7 +11428,7 @@ Repro (the receiver is PARENTHESISED, which is what made this reachable on maste
 ---
 
 ### D221 — [CLOSED 2026-08-27] `vbHeapIdxOfKind` answered heap type **0** for an UNMINTED value box, and every caller's `< 0` guard was dead
-**now a loud emit reject · was `check-clean invalid wasm` on `16d5c6e7` · no union declared anywhere in the witness, so it is not the D219 seam**
+**now a loud check reject — RE-FILED 2026-08-28, one layer up · was `loud emit reject` from #1972 to #1991 and `check-clean invalid wasm` on `16d5c6e7` · no union declared anywhere in the witness, so it is not the D219 seam**
 
 Repro:
 
@@ -11364,7 +11437,19 @@ Repro:
     if g.r is i32 { print(g.r) } else { print(0) }
     // `16d5c6e7`: vl check rc 0, then Invalid input WebAssembly code at offset 245:
     //             type mismatch: expected i32, found (ref $type)
-    // Now: emitProgram: narrowed union field atom has no value box
+    // #1972..#1990: emitProgram: narrowed union field atom has no value box
+    // Now: `is` check type 'i32' is not a variant of f64 | null
+
+* **RE-FILED 2026-08-28 AT THE CHECKER, WHICH IS WHERE D228 SAID IT BELONGED.** `i32` is not
+  a variant of `f64 | null`; it reaches it only by the implicit widening edge i32→f64, and
+  D228's `isWidenNotVariant` closes that hole in `checkIsExprNode`. So this witness no longer
+  reaches emit at all, and G1's guard is not what stops it. **The guard is unchanged and the
+  row's finding stands** — what moved is which layer reports this particular program. Every
+  spelling whose check type really IS a variant of the field's union still lowers and runs
+  (`f64 | null` with `is f64`, `f64 | string` with `is f64`, and the i64/f32/boolean twins:
+  all five print `5` on `16d5c6e7` and on master alike), so the ten guards below are still
+  the emitter's floor for a module that mints no box — they are simply no longer reachable
+  through an `is` whose check type widens.
 
 * **`vb*Idx` INITIALISES TO 0 AND IS ASSIGNED ONLY WHEN `mAssignTypeIndices` SEES `vb*Used`.**
   A module whose value unions never use a rep therefore answered heap type **0** for that
@@ -12038,59 +12123,94 @@ Repro (FOUR lines, and it needs no `for-in` at all):
 
 ---
 
-### D228 — `is i32` is the ONE non-arm spelling the checker admits, and #1972 turned the program it admits from `runs` into a loud emit reject
-**loud emit reject · live on `a19a3db7`, `75eb1f17` and `811f8102` · RAN and printed the right answer on `16d5c6e7` — a `runs` → not-runs move introduced by #1972's D221 rung, on a program no census cell contains**
+### D228 — [CLOSED 2026-08-28] `is i32` was one edge of the WIDENING LATTICE, not one spelling, and the checker admitted every edge
+**now a loud check reject — ``` `is` check type 'i32' is not a variant of f64 | null ``` · was `loud emit reject` (`emitProgram: narrowed union atom has no value box`) on `a19a3db7` .. `4bdfcc67`, and `runs` on `16d5c6e7` and `e44ef5e6` · THE DIRECTION IS MEASURED, NOT INFERRED: three historical compilers were built and graded, and #1972 is the commit · TWO of the row's claims were wrong — the hole is three lattice edges wide, and the `runs` → not-runs move needs a READ of the narrowed binding that the row's control table did not vary**
 
 Repro (TWO lines):
 
     const g: f64 | null = 5.0
     if g is i32 { print(g) } else { print(0) }
-    // `16d5c6e7`: runs, prints `0` — which is the CORRECT answer (`g` holds 5.0, not an i32).
-    // `a19a3db7`, `75eb1f17` and `811f8102`: vl check rc 0, then
+    // now: vl check rc 1, ``\`is\` check type 'i32' is not a variant of f64 | null``.
+    // `a19a3db7` .. `4a6c1e52`: vl check rc 0, then
     //   emitProgram: narrowed union atom has no value box
-    // Add `const h: i32 | null = 3` anywhere in the module and it RUNS again, printing `0`.
+    // `16d5c6e7` and `e44ef5e6`: runs, prints `0`.
 
-* **THE CHECKER HAS A ONE-SPELLING HOLE, AND THAT IS THE ROOT.** On the same `g: f64 | null`,
-  three of the four non-arm spellings are a loud CHECK reject —
-  ``​`is` check type 'i64' is not a variant of f64 | null``, and the same for `boolean` and
-  `string`. **Only `i32` passes.** A literal union rejects it too (`type K = 1 | 2`, `k is i32`
-  → ``​`is` check type 'i32' is not a variant of K``). So the emit-time guard is a SECOND ERROR
-  CHANNEL doing the checker's job, and the row that should exist is a check reject.
+* **THE DIRECTION, GRADED RATHER THAN READ OFF THE ROW.** Compilers were built at
+  `16d5c6e7`, `e44ef5e6` and `a19a3db7` by self-compiling each commit's own
+  `compiler/` + `std/` with a current seed, and the witness was run against all three. It
+  RUNS on the first two and stops at `a19a3db7` — **#1972**, whose diff carries the D221
+  rung verbatim (`vbHeapIdxOfKind` gaining a `vb*Used` test so an unminted box answers -1
+  instead of heap type 0). The row named the right PR; `e44ef5e6` sat between the two
+  commits it quoted and had never been graded, so the attribution was one commit wide.
+  **The turn was a deliberate price, not an unnoticed cost**: #1972 stopped the emitter
+  writing `ref.cast (ref 0)` on a branch the tag test never takes, and the module only
+  loaded before because that nonsense sat on dead code.
 
-* **WHAT #1972 ACTUALLY CHANGED, AND WHY IT LOOKS LIKE A REGRESSION.** Pre-#1972
-  `vbHeapIdxOfKind(0)` answered heap type **0** for the unminted i32 box, so the arm emitted
-  `ref.cast (ref 0)` on a branch the tag test never takes. The module was VALID and the
-  program printed the right answer — it worked BY LUCK, because the nonsense cast sat on dead
-  code. #1972 made the sentinel -1, the `< 0` guard woke up, and the program stopped building.
-  **#1972 was right to stop emitting nonsense; it is the checker hole that makes the program
-  reach emit at all.**
+* **THE HOLE IS THE LATTICE.** The gate is `assignable(chkTy, baseTy)` in
+  `checkIsExprNode`, and `assignable` permits the implicit widening edges
+  (`numWidensName`: **i32→i64, i32→f64, f32→f64**). Every one of them is admitted:
 
-* **THE MINT IS THE DISCRIMINATOR, WHICH IS WHAT PROVES THE MECHANISM.** `vbI32Idx` is
-  assigned only when `mAssignTypeIndices` sees `vbI32Used`. A module with no i32 value union
-  mints no i32 box, so `vbHeapIdxOfKind(0)` answers -1 and the guard fires. One unrelated
-  `const h: i32 | null = 3` sets the flag and the SAME `g is i32` line runs again. The class is
-  therefore `f64 | null` + `is i32` + *no i32 value box anywhere in the module* — not
-  "nullable scalar union" generally: `const g: i64 | null = 5` with `g is i32` RUNS on both
-  compilers.
+  | receiver | `is i32` | `is f32` | `is i64` / `boolean` / `string` |
+  |---|---|---|---|
+  | `f64 \| null` | **admitted** (i32→f64) | **admitted** (f32→f64) | check reject |
+  | `i64 \| null` | **admitted** (i32→i64) | check reject | check reject |
+  | `f64 \| string` | **admitted**, through a union MEMBER | **admitted** | check reject |
+  | `f32 \| null`, `string \| null`, `boolean \| null` | check reject | — | check reject |
 
-* **NOT FIXED HERE, DELIBERATELY.** The fix belongs in the checker's `is`-variant test, which
-  the literal-union path shares, and a checker change that turns emit rejects into check
-  rejects needs a census pass this branch was explicitly descoped from running. Filed with the
-  witness set rather than landed unmeasured.
+  The row's control table probed `i64`, `boolean` and `string` on an `f64 | null` — the
+  three spellings that do NOT widen — and read one edge of a lattice as a special case.
+  **`f64 | null` + `is f32` is a second admitted spelling on the row's own receiver.**
 
-* **NO CENSUS CELL CONTAINS IT**, which is why #1972's all-blocks after-pass reported 0
-  `runs` → not-runs truthfully. Measured: across **150,224** block-A cells, **9,000** block-D
-  cells and **2,332** corpus files — 161,556 programs — **not one** reaches any of
-  `vbHeapIdxOfKind`'s ten guards. The class had to be constructed by hand from the guard list.
-  Re-swept at `811f8102` after #1973 and #1975: still none. **This row is the first regression
-  found this session OUTSIDE the census population, which is a standing limit on what item 6
-  can promise** — a full cell-matched after-pass can report 0 `runs` → not-runs truthfully and
-  still miss a two-line program, because the grid has no cell shaped like it.
+* **THE READ IS THE OTHER MISSING AXIS, AND IT SEPARATES THE TWO HALVES.** With a CONSTANT
+  in the then-branch (`if g is i32 { print(1) }`) every admitted non-variant test RUNS on
+  every compiler back to `16d5c6e7`, including today's. #1972's move needs the narrowed
+  binding to be READ there, which is what installs the value-box lowering. Measured
+  cell-matched on a 720-cell grid (10 receiver unions × 6 checked primitives × 2 positions ×
+  3 mint states × {read the binding, print a constant}): **`e44ef5e6` → master moves exactly
+  28 cells, all `readg`, all `runs` → loud emit reject.** Every one of the 692 others is
+  unmoved. The full set is `f64|null`, `f64|string`, `i64|null`, `i64|string` × `is i32` and
+  (for the two f64 receivers) `is f32`.
+
+* **THE MINT IS THE DISCRIMINATOR — FOR THE `i32` EDGE ONLY.** `const h: i32 | null = 3`
+  anywhere in the module sets `vbI32Used`, the box is minted, `vbHeapIdxOfKind(0)` answers a
+  real index and the same `g is i32` line runs again. `const h: i64 | null = 3` does not
+  rescue it. But the **`is f32`** spelling regresses at ALL THREE mint states, because
+  neither spare value union mints an f32 box — so the row's "add `const h: i32 | null = 3`
+  anywhere and it RUNS again" is true of the spelling it was written for and of no other.
+
+* **THE FIX IS THE ROW'S OWN PROPOSAL, IN THE CHECKER.** `isWidenNotVariant` runs beside the
+  `assignable` gate: a check type that is a numeric primitive and reaches the receiver only
+  by a widening edge is not a variant of it. A widening is a CONVERSION — codegen emits a
+  real instruction at the boundary — so the value in the slot is not of the source type and
+  no runtime tag says it is. The test can never hold, and the then-branch narrows the
+  binding to the check type VERBATIM, which is the LAUNDER the gate's own header says it
+  exists to prevent. Every real arm keeps narrowing
+  (`tests/cases/types/is-real-variant-still-narrows.vl`).
+
+* **THE PRICE IS 44 PROGRAMS THAT RAN, AND EVERY ONE OF THEM HAD A DEAD `then`.** Of the 72
+  grid cells the rung moves, 28 are the emit rejects above and **44 are `runs` → check
+  reject**: the same tests with a constant in the then-branch, which printed the `else`
+  value because the test is always false. All 72 are kept whole as the named set
+  `d228-is-widen` — no census cell contains any of them.
+
+* **CORPUS AND CORPUS-DERIVED: ZERO.** `cmp` byte-identity over `tests/cases`: 1,920
+  identical, 430 fail on both, **0 DIFFER**. Distilled corpus: this rung moves **0 of 1,477
+  derived classes and 0 of the 537 pre-existing curated cells** — `strip R4` is byte-for-byte
+  identical to the branch on D188's 322-cell grid too. A rung scoring 0 on every standing
+  population, load-bearing on a grid built for it: the reason the named set exists.
+
+* **NO CENSUS CELL CONTAINS IT**, re-confirmed. Across 150,224 block-A cells, 9,000 block-D
+  cells and 2,332 corpus files not one reaches any of `vbHeapIdxOfKind`'s ten guards, which
+  is why #1972's all-blocks after-pass reported 0 `runs` → not-runs truthfully. **A
+  cell-matched after-pass can be honest and still miss a two-line program**, because the
+  grid has no cell shaped like it — the standing limit on what the distilled gate can
+  promise, and the reason this close ships with a hand-built named set rather than a census
+  slice.
 
 ---
 
-### D223 — an un-annotated list literal of DISAGREEING anonymous shapes mints a BOX list, and the outer annotation's construction is already invalid
-**loud emit reject · live on `e44ef5e6` and after D219 · the module was ALWAYS invalid; only an unrelated floor stopped emission first**
+### D223 — a REF-LIST ELEMENT receiver of a declared union ARM's field: one decline, and the "already invalid" reading of it is refuted
+**loud emit reject · live on `4a6c1e52` · THE ROW AS FILED WAS WRONG IN THREE PLACES and the corrected reading is a pure DECLINE: lift `armRecvHoldsBareArm`'s ref-list-element refusal and the witness RUNS and prints `7` · the lift is REFUSED here, and its price is measured and named**
 
 Repro (census block E cell `e002074`, verbatim):
 
@@ -12109,25 +12229,181 @@ Repro (census block E cell `e002074`, verbatim):
       } else { print(0) }
     }
     rd()
-    // emitProgram: bare null needs a struct-typed context — the floor that has always
-    // masked it, and which D219 keeps here on purpose.
+    // emitProgram: bare null needs a struct-typed context
 
-* **THE TWO ELEMENTS ARE DIFFERENT ANONYMOUS SHAPES.** `{ r: 7 }` is `{r: i32}` and
-  `{ r: null }` is not, so the un-annotated `lv1` is minted over the union BOX rep (element
-  kind 2) rather than over `Circle`. The `Circle[][]` annotation one container out then wants
-  a list of Circles, and the mismatch lands on the outer `array.new_fixed`:
-  `expected (ref null $type), found (ref $type)` at the CONSTRUCTION, before any read.
-* **ONE WORD MOVES IT, IN EITHER DIRECTION.** Annotate the inner list (`const lv1: Circle[] =
-  …`) and it runs; make the two elements agree (`[{ r: 7 }, { r: 8 }]`) and it runs. Both are
-  checked and both print `7`.
-* **IT IS FILED BECAUSE D219 HAD TO DECLINE FOR IT.** `armFieldUnionName` refuses a ref-list
-  ELEMENT receiver precisely so that this program keeps the loud floor it has today — the
-  read is the only stage that stops emission, and an emitter that has recorded a failure keeps
-  emitting, so removing the read's floor writes the invalid module instead of diagnosing it.
-  96 census cells of block E are this shape. **Closing this row is what lets that decline come
-  off**, and it is worth a measurement: the decline costs 354 of block A's 1,062 forward cells,
-  720 of block C's 1,320 and 1,248 of block E's 2,232 — every one of them reverting to the loud
-  reject it already had, none of them to a silent class.
+* **THE MODULE IS NOT ALREADY INVALID, AND THAT WAS THE ROW'S LOAD-BEARING CLAIM.** Both
+  this row and `armRecvHoldsBareArm`'s own header say *"the module is already invalid before
+  the read"* — the outer `array.new_fixed` wanting a list of `Circle`s and getting the union
+  BOX rep the disagreeing literal minted. Built: with `armRecvHoldsBareArm` returning true
+  for a ref-list element receiver, **the witness above RUNS and prints `7`**, the correct
+  answer. The construction is fine; there was nothing for the floor to be a floor over.
+  Delete the read instead of the decline and master builds it too — replace the `!= null`
+  test with `print(c.length)` and master runs it, printing `1`.
+
+* **"ONE WORD MOVES IT, IN EITHER DIRECTION" IS FALSE IN BOTH DIRECTIONS.** Measured on
+  `4a6c1e52`, each control one word from the repro:
+
+  | control | on master |
+  |---|---|
+  | the repro as filed | loud emit reject |
+  | **annotate the inner list** (`const lv1: Circle[] = …`) | **loud emit reject** (identical message, identical offset) |
+  | **make the two elements AGREE** (`[{ r: 7 }, { r: 8 }]`) | **loud emit reject** (same) |
+  | ONE element, either one | loud emit reject (same) |
+  | the elements swapped | loud emit reject (same) |
+  | at MODULE scope | loud emit reject (same) |
+  | drop the outer list layer (`const c: Circle[] = lv1`) | loud emit reject (same) |
+  | **delete `type Shape`** | **RUNS**, prints 7 |
+  | **remove the READ** (`print(c.length)`) | **RUNS**, prints 1 |
+
+  So the DISAGREEING SHAPES are not the ingredient and neither is the outer annotation. The
+  ingredients are the two D219 already named: `Circle` is a union ARM, and the receiver is a
+  ref-list ELEMENT. The row's title describes a real mechanism that belongs to a different
+  program — see D361.
+
+* **THE DECLINE'S POPULATION HAS MOVED SINCE IT WAS MEASURED.** D219 priced it as "block E
+  moves 96 cells and block B 66 from a loud emit reject INTO check-clean invalid wasm", at
+  `cont=listlist × pval=mixed`. Re-graded cell-matched on `4a6c1e52` over the whole of
+  census block E (**19,224 cells**, generated and graded on both compilers):
+
+  | | |
+  |---|---|
+  | cells the lift moves | **852** |
+  | **loud emit reject → runs** | **828**, `runs` LOST **0** |
+  | **loud emit reject → check-clean invalid wasm** | **24** |
+  | the 96 `cont=listlist × pval=mixed` cells the decline was WRITTEN for | in the **828**, not the 24 |
+
+  The 24 are all `cont=map_of_list × pval=mixed × claim=0`, spread evenly over
+  `twin`/`union`/`order`, and they are a **different defect** — see D361. The decline's
+  benefit shrank 4× and changed coordinate; its cost is 828 cells in this block alone.
+
+* **AND THE 24 ARE ALREADY SILENT ON MASTER, ONE BINDING AWAY.** The same cell with
+  `const e0 = g1[0]` in front of the field read — a binding is not an element read, so the
+  decline does not fire — is **check-clean invalid wasm on master**, with the decline in
+  place. The loudness the decline buys is a property of one SPELLING of a class that is
+  silent at its neighbour.
+
+* **THE LIFT IS REFUSED HERE ANYWAY, AND THE PRICE IS A NAMED SET.** 24 cells loud → silent
+  is a regression in its own right by this programme's own standing rule (`letMapDestShape`
+  states it: *"`runs` LOST is 0 either way; this bound is about the loud→silent direction,
+  which this programme treats as a blocker in its own right"*). The 24 coordinates are
+  committed as `scripts/silent-sweep/census/d223-lift-price.json` and carried by the
+  standing gate as `d223-lift-price`: they must stay LOUD, and the day D361 closes they are
+  what says the lift is now free. **The distilled corpus is blind to the whole trade** —
+  regress.py on the lifted compiler reports 0 moved classes and 0 moved curated cells, which
+  is why the block had to be generated.
+
+* **A NARROWER GATE WAS BUILT AND REFUTED TOO.** Giving an un-annotated list-literal binding
+  the ref-list slot of the declared map value it is stored into — `letRefListDestSlot`, the
+  exact shape of `letMapDestShape` (D203) one container over — does **not** move the 24: the
+  slot the read resolves is already the annotation's, and the disagreement is in the element
+  KIND the literal minted (union box, 2) rather than in which slot names it. That is D361's
+  landing, not a gate here.
+
+* Filed rather than fixed: closing **D361** is what lets `armRecvHoldsBareArm`'s decline come
+  off, and the 828 cells are what it is worth.
+
+---
+
+### D361 — an un-annotated list literal of DISAGREEING anonymous shapes STORED INTO A DECLARED MAP VALUE is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-28 while refuting D223, which had this mechanism in its title and a different program under it · SILENT ON MASTER with no compiler change at all**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Circle = { r: Shape2 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function rd() {
+      const lv1 = [{ r: { c2: 1 } }, { r: { s2: 1 } }]
+      const c: {[string]: Circle[]} = Map()
+      c["k0"] = lv1
+      const g0 = (c)["k0"] ?? []
+      const g1 = g0
+      if g1.length > 0 {
+        const e0 = g1[0]
+        if e0.r is Cir2 { print(7) } else { print(0) }
+      } else { print(0) }
+    }
+    rd()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
+
+* **THIS IS D223's TITLE ATTACHED TO THE PROGRAM IT IS ACTUALLY TRUE OF.** `{ r: {c2: 1} }`
+  and `{ r: {s2: 1} }` are different anonymous shapes, so the un-annotated `lv1` is minted
+  over the union BOX element kind; the `{[string]: Circle[]}` destination wants a list of
+  `Circle`s, and the two meet at the store. D223's own witness has no map in it and none of
+  this applies to it — see that row for the nine controls that separate them.
+
+* **THREE INGREDIENTS, EACH ONE WORD.** Measured on `4a6c1e52`:
+  annotate the inner list (`const lv1: Circle[] = …`) → **runs**; make the two elements
+  agree → **runs**; delete the map layer (bind `lv1` straight to a `Circle[]`) → **runs**.
+  The `?? []` default is NOT an ingredient — a bound empty default and a non-empty default
+  both reproduce it.
+
+* **IT IS THE 24-CELL RESIDUE OF D223's REFUSED LIFT, AND IT IS ALREADY SILENT WITHOUT IT.**
+  The witness above uses `const e0 = g1[0]`; a binding is not an element read, so
+  `armRecvHoldsBareArm`'s decline never fires and the module is written on master as it
+  stands. Spell the same read as `(g1[0]).r` and the decline makes it a loud emit reject —
+  which is the only thing lifting that decline would take away. Census block E holds **24**
+  such cells, all `cont=map_of_list × pval=mixed × claim=0`
+  (`scripts/silent-sweep/census/d223-lift-price.json`).
+
+* **THE OBVIOUS LANDING WAS BUILT AND DOES NOT CLOSE IT.** `letRefListDestSlot` — an
+  un-annotated list-literal binding taking the ref-list slot of the declared map value it is
+  stored into, the exact shape of `letMapDestShape` (D203) one container over — leaves all
+  eight controls unchanged. The slot the read resolves is already the annotation's; what
+  disagrees is the element KIND the literal minted. The fix has to reach
+  `letAnnRefListKind` / the literal's own construction, and it wants its own grid.
+
+---
+
+### D362 — an array-spine leaf that is itself a DECLARED ALIAS is a dialect of its own in every position that READS it
+**loud check reject · found 2026-08-28 re-measuring D188's leaf ladder over all seven positions instead of the one D181's census used · the FIFTH and last unclaimed array-spine leaf kind**
+
+Repro:
+
+    type K0 = "a" | "b"
+    type L = K0[]
+    const c: L = ["a"]
+    if c[0] == "a" { print(7) } else { print(0) }
+    // vl check rc 1:
+    //   [ERROR]: cannot index non-array L
+
+* **THE CONTROL IS THE SAME PROGRAM WITHOUT THE ALIAS AND IT PRINTS `7`**: `const c: K0[] =
+  ["a"]`. Three leaf kinds behave this way and D188's filed table recorded all three as
+  `runs`, because it graded them at the ONE position D181's census cell uses — an UNREAD
+  `const _sp1: L = []` binding, where nothing asks `L` to be an array:
+
+  | array-spine leaf | alias, 6 reading positions | alias, `unread` | inline control |
+  |---|---|---|---|
+  | litunion alias `K0` | **loud check reject** | runs | runs |
+  | numeric litunion alias `Z` | **loud check reject** | runs | runs |
+  | declared union `U1` | **loud check reject** | loud emit reject | loud emit reject |
+  | intersection alias `AB` (`{a:i32} & {b:i32}`) | **loud check reject** | **check-clean INVALID WASM** | runs |
+
+  (positions: a binding, a function local, a parameter, a return annotation, a struct field,
+  a union member.)
+
+* **THE INTERSECTION LEAF HAS A SILENT CELL.** `type AB = {a:i32} & {b:i32}` with
+  `type L = AB[]`, an unread `const _sp1: L = []` and a structurally-spelled twin carrying
+  the reads is `vl check` rc 0 and a module the engine refuses — D181's shape, at the one
+  leaf kind D181's fix and D188's both leave unclaimed.
+
+* **IT IS THE LEAF `arrSpineIsNominal`'s HEADER DECLINES BY NAME.** *"A UNION-ALIAS leaf
+  (`type L = Shape[]`) is deliberately NOT claimed here… `unionAliasDeclNameOfTy` carries
+  the numeric-litunion exception and the emitter's element tables treat a union element as
+  the BOX kind — a second population with its own grid."* A probe build reads
+  **`reach=1 ans=0`** at `singleAliasMemberTyIx`'s array arm for `type L = AB[]`: the arm
+  sees the array and every leaf test declines, because at that point the leaf is the
+  alias's `TyUnion` placeholder rather than a `TyObj`. So the fifth twin is not
+  `arrSpineIsObj` widened — it is a predicate that has to ask the leaf's DECLARATION, and
+  the numeric-litunion exception says the answer is not uniform across the union kinds.
+
+* Filed rather than fixed: it is the residue D188's close names, it needs the twin table
+  D188's own header describes for a second population, and the intersection cell means the
+  grid has to be graded on the RUN and not on an exit code.
 
 ---
 
