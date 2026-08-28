@@ -25,3 +25,5 @@ cannot see its consumer. That is D272, filed as a refutation pin.
 
 `runs-lost.txt` names the 72 cells, so a future D209 candidate re-grades **that set** in ~72
 invocations instead of rebuilding the grid. Keep it current if the grid changes.
+
+**SUPERSEDED IN ONE AXIS, not retired.** D209 closed 2026-08-28 and this grid reads **+24 → runs, 0 lost, 0 into silent** on that close — but the close needed a THIRD rung this grid cannot see, because every cell here pins the literal payload per field spelling. `scripts/silent-sweep/d290` crosses (field union × payload) with ten consumers and found the 8 cells the two-rung composition loses. Grade both.

@@ -815,7 +815,58 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // per the REFILLS procedure above, in the same commit that swapped this constant. Its own
 // NAMED successor, so the next swap is a two-line edit: `silent-class-inventory.md` D224,
 // whose fix is likewise built and refused at a measured 207 census cells.
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 | null }\n` +
+//
+// SWAPPED AGAIN 2026-08-28 (silent-class-inventory D209). The declared-struct-captures-an-
+// anonymous-literal specimen this constant carried is CLOSED and graduated to
+// `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl`, `@run` + seven `@log 7`.
+//
+// AND THE SELECTION RULE FAILED AGAIN, ONE ABSTRACTION UP FROM LAST TIME. That one was chosen
+// for being OUTSIDE the variant⇄struct heap-merge family — a checkable property, and it HELD:
+// `uVariants` stayed empty, `variantStructHeapTwinAt` was never called, and nothing in that
+// family closed it. What closed it came from a place that family does not reach: the code-16
+// READ, where the emitter's rep (a box the adoption produced) and the checker's type (a bare
+// atom it never widened) disagree. **Leaving a family is not leaving the reach of every future
+// argument**, and "no mechanism I can name applies" is still a statement about the mechanisms
+// someone had already named. Its own recorded successor, D224, was CLOSED by #1985 the same day
+// — before this swap could take it — so that hand-off expired too.
+//
+// THREE FAILED SELECTION RULES IS ENOUGH TO STOP CHOOSING. This successor was picked by a
+// CENSUS instead: every one of `silent-class-inventory.md`'s 136 rows had its OWN filed program
+// run against this tree (`vl check` rc 0 and a non-zero `vl run` that is not an emit error).
+// Exactly ONE row is check-clean invalid wasm — D209, the row this commit closes — and after
+// its pin is deleted the corpus carries no `@no-instantiate` directive at all. **So this is not
+// a choice between candidates; it is the only live member of the class**, which is the one
+// selection rule that cannot be wrong about the population.
+//
+// It is `silent-class-inventory.md` D291, D209's own residue: the same three lines with one
+// token changed, `i32` to `i64`. That token makes the adoption WIDEN — the field's declared
+// member is i64 so the store boxes tag 3 / `struct.new $vbI64`, while the checker still types
+// the read `i32` — so THREE sources disagree and no two agree. It inherits the property D209
+// was chosen for: it declares no union, `uVariants` is empty, and the whole variant⇄struct
+// family is structurally inapplicable.
+//
+// THE CAVEAT IS STATED RATHER THAN GLOSSED. This one is NOT out of reach of the mechanism that
+// just closed its sibling: D209's channel predicate SEES it and declines, counted at the site
+// as `reach=1 ans=0`, on its third condition ("the box can actually hold the checker's atom").
+// Drop that condition and this row closes and 36 `d272` cells redden with it — the `R alone`
+// column of D209's own ablation. It survives on a MEASURED refusal, the same class of evidence
+// D224 had when its 199-cell price turned out to be a bundle of 134 + 65.
+//
+// Re-RUN against this tree at the swap rather than inherited: `vl check` rc 0 with NO
+// diagnostics at all, `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected i32,
+// found (ref $type)`, `--codegen --no-validate` rc 0, `vl build` writes the `.wasm` and exits 1,
+// and NO `emit error` marker. Pre-existing on this change's merge base (1,463,129) and on its
+// shipped seed (1,463,730), and its module is BYTE-IDENTICAL across the change (274 bytes,
+// `cmp`-equal). Pinned as
+// `tests/cases/soundness/xfail-miscompile-adopted-read-three-source-atom.vl` per the REFILLS
+// procedure above, in the same commit that swapped this constant.
+//
+// THERE IS NO NAMED SUCCESSOR THIS TIME, and that is the honest state rather than an omission:
+// the census above found no second live member. WHEN THIS CLOSES, re-run that census before
+// assuming the class refilled — and if it has not, set this constant to `null` and let the
+// announced-inactive path below do its job rather than reaching for a program that is not
+// really in the class.
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: i64 | null }\n` +
   `const lv1 = [{ r: 7 }]\n` +
   `print((lv1[0]).r)\n`;
 
