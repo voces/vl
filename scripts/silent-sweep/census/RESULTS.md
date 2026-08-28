@@ -542,3 +542,67 @@ Pricing the block-E gate is the worked example. It is a deliberate loud floor, a
 354 of block A's 1,062 forward cells, 720 of C's 1,320 and 1,248 of E's 2,232 — every one
 reverting to the loud reject it already had, none to a silent class. That number is the
 argument for closing D223 rather than for widening the gate.
+
+## D179 / D227 — the two compiler traps, and the FIRST branch to run the cheap substitute instead of the full pass
+
+Measured 2026-08-27. Base **`a19a3db7`**, seed **1,457,262** bytes; branch seed **1,457,305**.
+Both seeds built from their own `compiler/*.vl` and proved self-compilation fixed points
+(`native-fixpoint.sh`: stage3 == stage4). The two intermediate ablation seeds are
+**1,457,289** (D179's rung alone) and **1,457,278** (D227's rung alone).
+
+**THE FULL CENSUS AFTER-PASS WAS NOT RUN ON THIS BRANCH, BY INSTRUCTION** — three agents were
+each running a base pass and a branch pass against the same 24 cores (load 114, a single
+`vl run` at 0.037s), so the protocol moved: the integrator runs the census once on the merged
+result, and a parallel agent runs the cheap substitute. What this branch ran instead:
+
+| instrument | population | result |
+|---|---|---|
+| census block A, graded at base | 150,224 | **0 `compiler trap` cells** — which is what makes block D the right target rather than a guess |
+| census **block D**, cell-matched base → branch | 9,000 | **0 `runs` → not-runs · 0 → silent** · 2 `compiler trap` → loud emit reject · 8,998 unchanged |
+| the D179/D227 grid, cell-matched, ablated four ways | 288 | **0 `runs` → not-runs · 0 → silent** · 8 `compiler trap` → loud emit reject |
+| corpus module `cmp`, base vs branch | 2,328 files | **0 byte differences, 0 rc differences** |
+| grid module `cmp`, base vs branch | 288 cells | 236 emit a module, **all byte-identical**; 52 emit none on either seed |
+
+Block D's base grade reproduces this file's own published `67` for `a19a3db7`, which validates
+the rebuilt seed, the regenerated cells and the grader in one measurement.
+
+**Blocks B, C and E are UNGRADED on the branch side.** This branch cannot rule out a backward
+move those blocks would contain, and does not claim to.
+
+### The ablation, and the direction check that a solo count would have got backwards
+
+The 288-cell grid crosses `op × decl × shape × pad × store`. On the base seed it has **8
+`compiler trap` cells and every one is `decl=armunion, shape=nested, pad=nopad`** — the two
+ingredients, and nothing else in the grid traps.
+
+| seed | bytes | compiler trap | loud emit reject | runs | invalid wasm |
+|---|---|---|---|---|---|
+| base `a19a3db7` — both rungs stripped | 1,457,262 | **8** | 44 | 228 | 8 |
+| R1 only (`forInElemKind`) | 1,457,289 | 6 | 46 | 228 | 8 |
+| R2 only (`refListElemNameOfExpr`) | 1,457,278 | 5 | 47 | 228 | 8 |
+| **both** | 1,457,305 | **0** | 52 | 228 | 8 |
+
+Stripping BOTH rungs reproduces `a19a3db7` **byte-for-byte at 1,457,262** (built from a
+`git archive` export, which avoids `git checkout -- compiler/`'s staging trap entirely).
+
+**THE UNION OF THE SINGLES IS 5 AND THE WHOLE IS 8** — the opposite sign from #1972's case,
+and the reason neither rung can be dropped on its solo count:
+
+* R1 alone fixes **2**: `op=forin` (both stores) — D179's own operation.
+* R2 alone fixes **3**: `op=slice` ×2, `op=filter/fn` — D227's operations.
+* **3 are composition-only**: `op=sliceforin` ×2 and `op=filterforin/fn`. They reach BOTH
+  sites in sequence, so guarding either one alone just moves the trap to the other. Verified
+  by cell identity, not by subtracting histograms.
+
+### The `vbHeapIdxOfKind` guard-liveness census (D221)
+
+`vbHeapIdxOfKind` has **ten** call sites, not the eight D221 recorded, and only nine are
+separable by message (G1 and G6 share one). Across **161,551** programs — block A's 150,224
+cells, block D's 9,000 and the 2,327-file corpus — **not one reaches any of the ten guards**.
+The classifier was proved to fire on demand against each message before the sweep, so the zero
+is a reading rather than a blind spot.
+
+Two were then made to fire by hand: **G6** (this is D221's own witness — settled against G1 by
+a throwaway probe compiler that tags the two same-message sites apart) and **G3**, whose
+program RAN correctly before #1972 and is now a loud emit reject (filed as **D228**). The
+other eight remain unwitnessed.
