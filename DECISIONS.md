@@ -10,6 +10,53 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **PARENTHESES ARE NOT PART OF A PLACE, and the peel goes at the HEAD of the key rather
+  than at its callers** (2026-08-28, silent-class-inventory D352). `placeKeyOf` is the
+  checker's narrowing key and has fifteen callers — the member read, the fact collector, the
+  assignment retirement, the write barrier, the dead-`??` hint. Teaching each caller to
+  `unwrapParen` its own argument was the alternative and is rejected for the reason D222's
+  emitter half already paid for: three callers were taught there and the SIXTH read, in the
+  key itself, kept the defect alive. `Member` and `OptMember` reach their receivers through
+  `placeKeyOf` itself, so one arm at the head covers the node, its receiver and every link.
+  **The third arm is a DECLINE and it must land with the other two**: `placeHasOptionalHop`
+  is what stops an else-branch refining a place behind a `?.`, and with the key peeling and
+  that predicate raw it answers FALSE for `(x?.y)` — a soundness rule sold for 28 cells. It
+  moves 0 cells on every derived population; its two witnesses are kept whole.
+
+- **The fifth `arrSpineIs*` twin asks the leaf's DECLARATION, and repeats none of the
+  renderer's exceptions** (2026-08-28, silent-class-inventory D362). A declared alias at an
+  array leaf is a one-member `TyUnion` in the arena, never its own constructor, so all four
+  declared-alias leaf kinds decline all four existing predicates at once.
+  `arrSpineIsUnionAlias` gates on `unionAliasDeclNameOfTy` being non-empty and stops there.
+  The alternative considered — repeating the numeric-litunion exception the sibling
+  predicates' headers warn about (`type Z = 0 | 1` must render `i32[]`, never `Z[]`) — is
+  rejected because `tyToNominalNameGo` already short-circuits such an alias to its base
+  scalar, so a copy here would be a second home for one rule and the two could drift. The
+  claim and the render leg are ONE landing: the leg moves 0 of 322 grid cells, 0 of 1,477
+  derived classes and 0 corpus bytes on its own, and without it the intersection leaf the
+  claim buys goes straight back to a loud emit reject.
+
+- **`.length` on an unbounded type parameter is ADMITTED, and the disagreement it resolves is
+  with `x[i]` rather than with anything about `T`** (2026-08-28, silent-class-inventory-2
+  D14). VL has no bounds, so neither operation can be justified from the type alone; what
+  decides it is that `checkIndexNode` already admits `x[i]` for every type variable while
+  `checkMemberNode` admitted `.length` only for the `?`-prefixed inference hole, and nothing
+  wrote down that they should differ. Resolving toward the STRICT side was the other option
+  and is rejected because it would refuse `x[i]`, which D3 and the corpus depend on. The
+  price is named and paid in MESSAGES, not in silence: seven of fifteen argument reps move
+  from a positioned check reject to a positioned emit reject, and `memFloorMsg` makes that
+  message say `.length` instead of naming a struct field. **The permissive side is not
+  copied wholesale** — `print(x[0])` through an unbounded `T` over a list-of-list is
+  check-clean invalid wasm on three reps and is filed as D401 rather than matched.
+
+- **A compiler probe reports through `tErr`, never `print`** (2026-08-28, learned twice in
+  one session). A compiler run under `--compiler` has no `__print_*` imports wired, so a
+  `print`-based probe build dies with `unknown import: imports::__print_i32__` before it
+  compiles anything — and the harness reads that as **reach=0 at every site**, which is
+  indistinguishable from "the arm is never reached". Two probe builds were thrown away to it
+  while measuring D362. The diagnostic channel is always live, accumulates rather than
+  throwing, and prints positioned.
+
 - **`x is T` asks a TAG question, so `assignable` is the wrong predicate for it — a numeric
   WIDENING is not a variant** (2026-08-28, silent-class-inventory D228). The soundness gate on
   `is` asks whether the check type can flow into the receiver's non-null part, which is the
