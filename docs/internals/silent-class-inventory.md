@@ -8142,7 +8142,7 @@ Repro:
 ---
 
 ### D158 — the deciding annotation is at the READ site, not at any delivery
-**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · all 12 surviving D112 cells · pre-existing on `54780e0b`, on `1559d80c`, on merged master `ff04d74b` and on `a19a3db7` · OPEN, and ABLATED AWAY FROM D156: two roots, not one · ITS CARRIER IS NOW BUILT AND MEASURED (2026-08-27) — see the close below: the leg is complete and correct, and the two things under it are D156's contested gate and D173's key · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
+**check-clean invalid wasm · found 2026-08-27 in D139's closing residue · all 12 surviving D112 cells · pre-existing on `54780e0b`, on `1559d80c`, on merged master `ff04d74b`, on `a19a3db7` and on `322c07f2` · OPEN, and ABLATED AWAY FROM D156: two roots, not one · ITS CARRIER IS NOW BUILT AND MEASURED (2026-08-27) — see the close below: the leg is complete and correct, and the two things under it are D156's contested gate and D173's key · THE SPECIMEN — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`**
 
 Repro:
 
@@ -8240,6 +8240,41 @@ Repro:
   It was chosen for STABILITY and not only for liveness — its program has NO delivery
   anywhere, so the whole pin family misses it by construction rather than by omission, which
   is what the five swaps in one day recorded in that file's genealogy were missing.
+
+* **RE-GRADED ON `322c07f2` AND STILL EXACTLY AS FILED (2026-08-27), and this row now carries
+  a PROGRAM-level ablation of its own ingredients rather than only a compiler-level one.** The
+  eighteen candidate compilers above vary the FIX; these four vary the WITNESS, one
+  declaration at a time, every one built and run:
+
+  | change to the repro | outcome on `322c07f2` |
+  |---|---|
+  | (none — the filed repro) | **check-clean invalid wasm** |
+  | delete `type Dot = { r: i32 }` (the layout twin) | **loud emit reject** — `unsupported map value type (no rep for a union-member struct …)` |
+  | delete the union (`Circle`/`Dot` both plain structs, no `Shape`) | **runs**, prints 7 |
+  | delete both (`Circle` alone) | **runs**, prints 7 |
+
+  **BOTH ingredients are load-bearing and neither alone produces the class.** Without the twin
+  the same program takes the LOUD floor, so the twin is not incidental colour — it is the row
+  the emitter keys instead of `Circle`, which `collectS`'s union-member skip left with no
+  `sNames` row at all. Without the union `Circle` has its own row and the two sides agree. That
+  is D171/D173's seam stated as a property of the PROGRAM, and it is why this row's answer is
+  the arm-nominal element key and why that key is priced at 80 `runs` cells (**D236**).
+
+* **NOT MOVED BY D208's CLOSE, NOR BY EITHER D209 CANDIDATE, and that is measured rather than
+  assumed (2026-08-27).**
+  D209 is a sibling adoption defect at the same resolver, so the question had to be asked. It
+  is a different root: probed on this row's own repro the single-match arm reports
+  `SIO1 first=0 nm=Dot noderow=0 tyname={r: i32}` — the checker's recorded type and the adopted
+  row AGREE here (both name the twin's row), where D209's whole content is that they disagree.
+  Graded: **0 of `d156`'s 1,188 cells move in any direction** — including all 60 of its silent
+  ones — and this row's witness is byte-identical under the two compilers on the corpus `cmp`.
+
+  **AND THE MECHANISM, WHICH IS STRONGER THAN THE GRID'S ZERO.** A counter build of the
+  merged compiler, run on this row's own filed repro, reports `c=0 cdec=0 r4=0 r4ans=0`:
+  the read rung is not even REACHED (no code-16 field read exists in the program) and
+  `rlElemStructRow` never reaches its restored rung. **Neither changed line executes on
+  D158's program at all**, so the row cannot move under this change for a reason that does
+  not depend on the population a grid happened to sample.
 
 ---
 
@@ -8845,8 +8880,9 @@ Repro:
         if g1[0].r == 7 { print(7) } else { print(0) }
       } else { print(0) }
     } else { print(0) }
-    // vl check rc 0 with NO diagnostics; vl run:
+    // `322c07f2`: vl check rc 0 with NO diagnostics; vl run:
     //   type mismatch: expected (ref null $type), found (ref $type)
+    // Now: 7
 
 * **EVERY EARLIER GRID FOR THIS CLASS USED A MAP.** `d52`, `d88`, `d94`, `d111`, `d112`,
   `d131` and `d139` all build the container as `Map()`; the list spelling of the same
@@ -9155,7 +9191,7 @@ Repro:
   `tyToEmitName` of what the CHECKER inferred. **The list is not immune, it is lucky**: its
   destination's element slot is keyed by the same `structIndexOfObj` adoption, so the two
   sides agree by construction. Where a list has no destination either, the luck runs out —
-  that is D209.
+  that is D209 (still OPEN — two candidate fixes built and both refuted; see that row).
 * Census population: **2,032 cells whose ONLY one-step rescue is `cont`**, re-graded on
   `1e81b0f3` (the census filed 1,992 on `1559d80c`), witness `cellsB/b024546.vl` at 226
   bytes — the smallest in the family. Blocks B/C/D/E, 100,014 cells, move **2,644, every one
@@ -9311,16 +9347,19 @@ Repro:
   Delete the `type Circle` line and it runs. `structIndexOfObjCtx` adopts the literal onto
   Circle's row through `anonValueFitsField`'s union-box leniency, which also SUPPRESSES the
   `#anon` row `collectAnonShapes` would have minted (its gate is `structIndexOfObj(ai) < 0`),
-  and the mv layer then asks under a render that names nothing. **That witness is still a
-  loud reject and is filed OPEN as D209** — D207 closes only the half with a destination.
+  and the mv layer then asks under a render that names nothing. **That witness is filed as
+  D209** — D207 closes only the half with a destination. D209 is still OPEN (both of its
+  candidate fixes were built and refuted, 2026-08-27); re-run against D208's shipped resolver
+  rung, this `mapval` spelling is UNMOVED, still the same loud reject, because its failure is
+  the mv layer's missing slot and not the element row that rung resolves.
 * Census population: this rep half is the `loud emit reject` column of the family — 24 of
   the 36 cells an UNBOUNDED D203 moves in a 770-cell `annpat × cont × rep` probe, against 12
   `SILENT → runs`. The shipped rung takes the 12.
 
 ---
 
-### D208 — an un-annotated map of LISTS, with nothing annotated anywhere
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid's `annpat` axis · the residue of D203's family: the ONE container × `annpat` corner the destination rung cannot reach, because there is no declared destination to read**
+### D208 — [CLOSED 2026-08-27] an un-annotated map of LISTS, with nothing annotated anywhere
+**closed 2026-08-27 — the filed repro RUNS and prints `7` · was `check-clean invalid wasm` · found 2026-08-27 by the CENSUS grid's `annpat` axis · IT IS D209's ADOPTION ONE CONTAINER OUT, and the row's own "the destination rung cannot reach it" was right for the wrong reason: it needs no destination at all, it needs the resolver rung that was deleted from one of two twins**
 
 Repro:
 
@@ -9336,8 +9375,9 @@ Repro:
     if g1.length > 0 {
       if (g1[0]).r is Cir2 { print(7) } else { print(0) }
     } else { print(0) }
-    // vl check rc 0 with NO diagnostics; vl run:
+    // `322c07f2`: vl check rc 0 with NO diagnostics; vl run:
     //   type mismatch: expected (ref null $type), found (ref $type)
+    // Now: 7
 
 * **NO ANNOTATION EXISTS ANYWHERE IN THE PROGRAM**, so D203's rung correctly declines: there
   is no declared destination whose shape could be adopted. The two identities that disagree
@@ -9350,12 +9390,171 @@ Repro:
   destination; nothing aligns these two with each other.
 * Reached at exactly 3 of 770 cells in the `annpat × cont × rep` probe — `annpat=none ×
   cont=map_of_list × rep ∈ {arm, f64lit, numlit}` — and unmoved by the D203 fix in either
-  direction.
+  direction. **The close moves 12 of census block D's 9,000, and the constants across all 12
+  are exactly that coordinate** (`cont=map_of_list, annpat=none`, four storage/scope spellings
+  × the three reps) — the filed population, re-found by a wider grid.
+
+* **THE CHAIN, PROBED END TO END rather than argued** (a compiler carrying a dump of the
+  ref-list slot table, on this row's own repro):
+
+      SIO1 ix=14 nf=1 first=0 nm=Circle repty=45 noderow=-1 tyname={r: {c2: i32}}
+      RL 0 nm=Circle         kind=1 row=0  heap=0 twin=0 wrap=9  sig=h:0  sitn=0
+      RL 1 nm={r:{c2:i32}}   kind=1 row=-1 heap=0 twin=1 wrap=11 sig=u:1  sitn=0
+      RL 2 nm={r:{c2:i32}}[] kind=9 row=-1 heap=11 twin=2 wrap=13 sig=9:1 sitn=-1
+
+  1. `structIndexOfObjCtx` adopts `Circle` for `{ r: { c2: 1 } }` (D209 — the union-BOX field
+     accepts every atom, and it is the ONLY match, so no resolver above it ever runs).
+  2. The adoption SUPPRESSES the `#anon` row: `collectAnonShapes`' gate is
+     `structIndexOfObj(ai) < 0`, so `{r:{c2:i32}}` is never interned as a struct row.
+  3. `rlElemStructRow(slot 1)` therefore declines on all THREE of its rungs — arena identity,
+     nominal name, canon key — **correctly**, because the row genuinely does not exist.
+  4. `mAssignTypeIndices` writes `rlElemHeap[1] = 0` for an unresolved element. **That
+     sentinel is also a real type index**, and in this program type 0 IS Circle's heap, so the
+     backing comes out well-formed — while `rlTwin`'s signature for the same slot stayed
+     `u:1`, the never-merged degenerate.
+  5. Two slots, ONE element heap, TWO wrappers (`wrap=9` and `wrap=11`). That is exactly the
+     invariant `rlTwin`'s own header states — *"two ref-list slots emit byte-identical
+     (backing, wrapper) pairs iff they resolve to the same element heap"* — violated because
+     the signature pass and the heap pass disagreed about whether the element resolved at all.
+     The map's vals list (`RL 2`) then keys `wrap=11` while the value delivered is `wrap=9`:
+     `expected (ref null $type), found (ref $type)`.
+
+* **THE CLOSE IS ONE RUNG, AND IT WAS ALREADY WRITTEN — on the OTHER copy of this ladder.**
+  `structIdxOfElemName` is `rlElemStructRow`'s SLOT-LESS twin, "same three rungs, same order",
+  and it ends with a fourth: `structIndexOfTypeName`, the `shapeFieldTypeCompat`-tightened
+  field-name-set scan. `rlElemStructRow` DELETED that rung, on a measurement that was true and
+  whose population could not contain this case: *the answering rung 0 times over 1,243 corpus
+  files and 100,800 fuzz programs*. `sitn=0` in the dump above is that rung answering — and
+  answering with **exactly the row the literal was BUILT as**, because it is the NAME-keyed
+  twin of the very fieldset scan that adopted it. Restored as rung 4, after the three that
+  decline, i.e. reached only where the alternative is the `rlElemHeap = 0` sentinel.
+
+* **THE VARIANT NOMINAL FLOOR IS UNTOUCHED and stays ahead of every rung** (`bn < 0 &&
+  variantIndexOf(ln) >= 0 → -1`), so D32 and `DECISIONS.md`'s "the variant⇄struct-TABLE seam
+  stays nominal" are unaffected: this rung can only resolve a name the STRUCT table owns.
+
+* **MEASURED, AND THE RUNG SHIPS ALONE.** Base `cd44be39` (seed **1,461,831**, a
+  self-compilation fixed point, and re-derived by STRIPPING this rung out of the final tree —
+  which reproduces it **byte-for-byte**, so the base column is proved rather than assumed);
+  branch **1,461,851**, this rung and nothing else.
+
+  | population | cells | `runs` LOST | into silent | forward |
+  |---|---|---|---|---|
+  | the **DISTILLED census** — 1,477 representatives standing for every cell of blocks A–E | **250,238** | **0** | **0** | **+116** — `a031791` (104 cells, block **A**) and block D's four classes (12) |
+  | census **block D** (`annpat × cont × rep`), cell-matched IN FULL | 9,000 | **0** | **0** | **+12**, every one at `cont=map_of_list, annpat=none` — this row's filed coordinate |
+  | census **block C** (`rep × cont` fully crossed × the core quartet), cell-matched IN FULL | 43,200 | **0** | **0** | 0 — 100.00% unchanged |
+  | the **union-box READ grid** (`fld × read × cont × annpat`, built for D209) | 1,260 | **0** | **0** | 0 — *nothing moves* |
+  | the **adoption grid** (`fld × cont × annpat`) | 140 | **0** | **0** | **+1**, `arm_map_of_list_none` — this row's own cell, and the ONLY one |
+  | `d156` · `d88`/`d100` · `d112` | 1,188 · 2,850 · 1,114 | **0** | **0** | 0 — *nothing moves* |
+  | corpus `cmp`, byte-for-byte | 2,346 modules | — | — | **2,345 identical**; the one mover is this PR's own new fixture |
+
+  Blocks C and D were ALSO graded cell-matched in full against `322c07f2` before the rebase,
+  with the identical answer; the distilled corpus is what carries blocks **A, B and E**, which
+  no earlier reading of this rung covered — and block A is where the largest forward move is.
+
+* **273 CELLS KEEP THEIR CLASS AND CHANGE THEIR MESSAGE, and that is the row's OTHER HALF
+  showing rather than noise.** Six distilled classes stay `check-clean invalid wasm` while the
+  diagnostic moves from *expected `(ref null $type)`, found `(ref $type)`* to *expected
+  `(ref $type)`, found `(ref $type)`*. That is precisely what this rung is supposed to do and
+  no more: with the `rlElemHeap = 0` sentinel gone the SIGNATURE and the HEAP stop disagreeing
+  about the element, so the wrapper's nullability stops disagreeing — and what remains is the
+  box-vs-plain disagreement of the ADOPTION itself, which is D209 and is still open. A rung
+  that closed the adoption would have taken these to `runs`; this one is not that rung, and the
+  message is what says so.
+
+  **THE COUNTERS SAY WHY THE CORPUS CANNOT MOVE, so the byte-identity is a mechanism and not
+  a coincidence.** A counter build of this branch, over the whole corpus: `rlElemStructRow`
+  **reaches** rung 4 **133 times across 104 files** and rung 4 **answers 2 times, in exactly
+  one file** — this PR's new fixture. On the pre-existing corpus it answers **zero** times,
+  which is the original deletion measurement reproduced from the other side: the rung is free
+  everywhere the deletion was measured, and load-bearing exactly on the shape that measurement
+  could not contain. On D209's own program the counter reads `r4=0 r4ans=0` — the rung is not
+  even reached — which is why closing this row does not close that one.
+
+  Nothing here is ungraded by the old scheduling rule: `scripts/silent-sweep/distilled` (#1977)
+  replaced the 35-minute after-pass, and the row above quotes it for all five blocks.
+
+---
+
+### D271 — A REFUTATION PIN: the destination one un-annotated binding away, which the RESOLVER-side fix for D209 reddens
+**A REFUTATION PIN: it runs today and must keep running · found 2026-08-27 while attempting D209 · it printed `7` on `322c07f2` and prints `7` now; it goes check-clean INVALID WASM under the candidate that declines D209's adoption at `structIndexOfObjCtx` · its sibling pin for D209's OTHER candidate is D272**
+
+Repro (three lines, and the third is the whole pin):
+
+    type Circle = { r: i32 | null }
+    const lv1 = [{ r: 7 }]
+    const c: Circle[] = lv1
+    print(c.length + 6)
+
+* **WHY A PIN AND NOT A DEFECT REPRO.** Nothing here is wrong: `lv1`'s literal genuinely IS a
+  `Circle`, because a declared destination three tokens later says so, and the emitter builds
+  it boxed for exactly that reason. The program is well-typed at the wasm level only because
+  `structIndexOfObjCtx` adopted Circle's row for an un-annotated literal — the same adoption
+  D209 records as a defect when no destination exists.
+* **IT IS D209'S WITNESS WITH ONE LINE ADDED, and no per-node key can tell the two apart.**
+  Probed with a dump of the resolver's single-match arm, the defect and this pin produce
+  **byte-identical** output: `SIO1 nf=1 first=0 nm=Circle noderow=-1 tyname={r: i32}`. The
+  checker records `{r: i32}` in BOTH, because `recordRepTyAdopt`'s walk has a `Paren` arm, an
+  `ObjLit` arm and an `ArrayLit` arm — and no `Ident` one — so the adoption never crosses the
+  un-annotated binding that separates the literal from its destination.
+* **WHAT IT PINS, precisely.** The day someone tightens the adoption at
+  `structIndexOfObjCtx` — by canon-id disagreement, by field-code disagreement, or by any
+  other property of the literal's own node — this program flips, and the flip is the signal
+  that the tightening went in without the destination first being carried to the literal. The
+  `Circle[][]` spelling (`const c: Circle[][] = [lv1]`) is the same pin one container out and
+  flips with it; the two ANNOTATED controls (`const lv1: Circle[] = …` and
+  `const c: Circle[] = [{ r: 7 }]`) do NOT flip, which is what says the missing input is the
+  `Ident` hop and not the tightening itself.
+* Pinned as a fixture: programs 2 and 3 of
+  `tests/cases/soundness/anon-literal-adopted-by-a-declared-box-field.vl` (the `Circle[][]`
+  spelling and the `Circle[]` one).
+
+---
+
+### D272 — A REFUTATION PIN: the box read whose CONSUMER wants the box, which the READ-side fix for D209 reddens
+**A REFUTATION PIN: it runs today and must keep running · found 2026-08-27 building D209's SECOND candidate, as 72 of a 1,260-cell read-form grid · it printed `7` on `322c07f2` and prints `7` now; it goes check-clean INVALID WASM under the candidate that unboxes an un-narrowed code-16 field read on the CHECKER's recorded atom · its sibling pin for D209's OTHER candidate is D271**
+
+Repro (four lines, and the third is the whole pin):
+
+    type Circle = { r: i32 | null }
+    const v = { r: 7 }
+    const q: i32 | null = (v).r
+    if q is i32 { print(q) } else { print(0) }
+
+* **WHY A PIN AND NOT A DEFECT REPRO.** Nothing here is wrong. `structIndexOfObjCtx` adopts
+  `Circle`'s row for the un-annotated `{ r: 7 }` — D209's adoption, exactly — so `r` is stored
+  BOXED; and the consumer three tokens later is a union slot that WANTS the box.
+  `emitUnionCoerce` opens with `if exprUnion(exprIx, fnIx) { return emitExpr(…) }`, the
+  pass-through that is right for precisely this reason, and the program has run on every
+  compiler this repo has shipped.
+* **WHAT IT PINS, precisely.** The day someone unboxes a code-16 field read at the READ site
+  on the strength of the checker's recorded type, this flips. The checker types `(v).r` as
+  `i32` here — the SAME asymmetry D209 files as a defect — so a rung keyed on that type fires
+  on this program too, and pushes a bare `i32` into a `(ref $uBox)` slot: `vl check` rc 0,
+  `expected (ref null $type), found i32`. The read site cannot see its consumer; that is the
+  whole content of the pin.
+* **THE SECOND CONSUMER, and why ONE pin is not enough.** `const w: Box2 = { s: (v).r }` into
+  another code-16 field flips with it and takes a DIFFERENT emitter path — an object-literal
+  field store rather than a binding init — so a fix that repairs the binding init alone still
+  reddens this one. Both are pinned.
+* **THE POPULATION IT STANDS FOR, and what could not see it.** Under D209's read-side
+  candidate, **72 of the union-box READ grid's 1,260 cells go from `runs` to not-runs, and 36
+  of the 72 land in a SILENT class** (36 into `check-clean invalid wasm`, 36 into a loud emit
+  reject). They are exactly `read ∈ {tounion, tofld}` × `fld ∈ {i32|null, i64|null, f64|null,
+  i32|string}`, 18 apiece, across every container and every annotation pattern. **Zero of them
+  are visible to census block C (43,200 cells), census block D (9,000), the 140-cell adoption
+  grid, `d156` (1,188), `d88` (2,850) or `d112` (1,114)** — 57,492 cells, every one of which
+  reads the field BARE. The corpus `cmp` cannot see it either: it is byte-identical because
+  the corpus holds no program of this shape.
+* Pinned as a fixture: programs 4 and 5 of
+  `tests/cases/soundness/anon-literal-adopted-by-a-declared-box-field.vl`. The grid is
+  `scripts/silent-sweep/d272/gen272.py` and the 72 cells are named in `runs-lost.txt` beside
+  it; re-grade THAT set against any new D209 candidate before rebuilding anything.
 
 ---
 
 ### D209 — a declared struct CAPTURES an anonymous literal the checker never widened
-**check-clean invalid wasm · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all and unfixed by D203's destination rung**
+**check-clean invalid wasm · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · OPEN, and now with TWO candidate fixes BUILT AND MEASURED AND BOTH REFUSED — the RESOLVER side (pin D271) and the READ side (pin D272), each refuted by a program it takes from `runs` to check-clean invalid wasm · its RESOLVER half is SEPARABLE and shipped 2026-08-27 as D208's close, which is measured NOT to move this row; D158 is a different root (measured — neither changed line is reached on its program)**
 
 Repro:
 
@@ -9375,16 +9574,139 @@ Repro:
 * **THE ADOPTION ALSO SUPPRESSES THE ROW THAT WOULD HAVE AGREED.** `collectAnonShapes`
   interns an `#anon` row only `if structIndexOfObj(ai) < 0`, so the shape the checker named
   is never interned at all and no downstream layer can find it.
-* **NOT CLOSED BY D203, AND DELIBERATELY NOT ATTEMPTED HERE.** Tightening the adoption is a
-  behaviour change at a resolver every literal in every program passes through; the direction
-  that makes this witness run (build the literal at its OWN inferred shape) breaks the
-  currently-RUNNING program `const c: Circle[][] = [lv1]` over the same two lines, where the
-  annotation makes Circle the right row. The two directions need a destination, which is what
-  D203 supplies for maps and what the list element has no rung for.
+* **NOT CLOSED BY D203, and the reason was written here before it was measured.** Tightening
+  the adoption is a behaviour change at a resolver every literal in every program passes
+  through; the direction that makes this witness run (build the literal at its OWN inferred
+  shape) breaks the currently-RUNNING program `const c: Circle[][] = [lv1]` over the same two
+  lines, where the annotation makes Circle the right row. The two directions need a
+  destination, which is what D203 supplies for maps and what the list element has no rung for.
+  **That prediction was then built and confirmed — candidate 1 below, pin D271.**
 * The list is incidental — a `mapval` spelling of the same two lines is the D207 witness's
-  smaller sibling and is a LOUD reject rather than invalid wasm.
+  smaller sibling and is a LOUD reject rather than invalid wasm. **Re-run under D208's shipped
+  rung and under both refused candidates: STILL that loud reject, unmoved in either
+  direction.**
 
----
+* **CANDIDATE 1 — THE RESOLVER SIDE. BUILT, AND REFUSED BY A PROGRAM IT REDDENS (pin D271).**
+  The bullet above predicted this and it is now measured rather than reasoned. A candidate
+  that declines the single-match adoption on a PROVEN canon-id disagreement
+  (`repRowDisagreesWithNode`: both sides resolve a `repCanonId` and the two differ) closes
+  this repro and moves these:
+
+  | program | `322c07f2` | resolver-side candidate |
+  |---|---|---|
+  | this row's repro | check-clean invalid wasm | **runs** |
+  | `const c: Circle[][] = [lv1]` after the same two lines | runs | **check-clean invalid wasm** |
+  | `const c: Circle[] = lv1` after the same two lines | runs | **check-clean invalid wasm** |
+  | `const lv1: Circle[] = [{ r: 7 }]` (annotated binding) | runs | runs |
+  | `const c: Circle[] = [{ r: 7 }]` (annotated container) | runs | runs |
+
+  The split is exact and it names the missing input: where the annotation is on the literal's
+  OWN binding or its own container the checker ADOPTS and `nodeRepTyIxOf` already agrees with
+  the row, so the candidate correctly declines to decline. Where the destination is one
+  UN-ANNOTATED binding away, `recordRepTyAdopt` never reaches the literal — its walk has a
+  `Paren`, an `ObjLit` and an `ArrayLit` arm and no `Ident` one — and nothing about the
+  literal's own node differs between the two programs. Probed, and this is the whole finding:
+  the dump is **identical** for the defect and for the control that must keep running —
+  `SIO1 nf=1 first=0 nm=Circle noderow=-1 tyname={r: i32}` in both. **A per-node key is
+  provably unable to separate them**, which is D93's rule at this resolver. Pinned as **D271**.
+
+* **CANDIDATE 2 — THE READ SIDE. BUILT, IT FIXES THE WITNESS, AND IT LOSES 72 RUNNING
+  PROGRAMS (pin D272).** `emitMem`'s plain-struct arm already calls
+  `emitUnionFieldNarrowUnbox` for a code-16 field, and that function's header says *"an
+  un-narrowed read yields the box unchanged, so a `""` atom emits nothing"*. The candidate
+  adds a second rung: where the read is un-narrowed and `unMemAtomKind(nodeTyIxOf(memIx))`
+  names a concrete value ATOM, unbox to that atom. It works on this row's program —
+  disassembled, `struct.get $Circle 0` handed `(ref $uBox)` straight to `__print_i32__`
+  before, and after it is `struct.get $Circle 0` · `struct.get $uBox 1` ·
+  `ref.cast (ref $vbI32)` · `struct.get $vbI32 0`, the same three instructions the narrowed
+  read already emits. **And it is wrong**, for a reason its own header argued it could not be:
+
+      type Circle = { r: i32 | null }
+      const v = { r: 7 }
+      const q: i32 | null = (v).r          // runs today, prints 7
+      if q is i32 { print(q) } else { print(0) }
+
+  The claim was *"a program whose box read is CORRECT is typed by the checker as the union,
+  so `unMemAtomKind` answers -1"*. It does not. **The checker types this read `i32` — the
+  same adoption asymmetry the row is about — while the CONSUMER is a union slot and the box
+  is the CORRECT rep.** `emitUnionCoerce` opens with
+  `if exprUnion(exprIx, fnIx) { return emitExpr(…) }`, a pass-through that is right precisely
+  because the member read yields the box; unbox it and a bare `i32` lands in a `(ref $uBox)`
+  slot: `vl check` rc 0, `expected (ref null $type), found i32`. So the consumer decides, the
+  read site cannot see the consumer, and **the read site is the wrong place** — the mirror of
+  candidate 1, where the literal site could not see the destination.
+
+* **THE READ-SIDE CANDIDATE, MEASURED — and the four populations that CANNOT see it.** All
+  of this was graded against `322c07f2`, where the candidate was built (seed 1,461,174, base
+  re-derived by stripping and `cmp`-proved byte-identical to master's own build).
+
+  | population | cells | `runs` LOST | into silent | forward |
+  |---|---|---|---|---|
+  | the **union-box READ grid** (`fld × read × cont × annpat`, below) | 1,260 | **72** | **36** | +24 silent→runs, +18 silent→loud |
+  | census **block C** (`rep × cont` fully crossed × the core quartet) | 43,200 | 0 | 0 | 0 — 100.00% unchanged |
+  | census **block D** (`annpat × cont × rep`) | 9,000 | 0 | 0 | 0 (block D's +12 are D208's rung, not this one) |
+  | the **adoption grid** (`fld × cont × annpat`) | 140 | 0 | 0 | +19 silent→runs, +18 silent→loud |
+  | `d156` · `d88`/`d100` · `d112` | 1,188 · 2,850 · 1,114 | 0 | 0 | 0 |
+  | corpus `cmp`, byte-for-byte | 2,342 modules | — | — | 2,341 identical |
+
+  **53,502 cells across four grids read ZERO backward, and the class is real.** Every one of
+  them holds the READ FORM fixed: the census's `rep` axis varies the field's TYPE and reads it
+  bare, and the 140-cell adoption grid reads every cell bare too. The 72 lost cells are
+  exactly `read ∈ {tounion, tofld}` — the two consumers that WANT the box — at
+  `fld ∈ {i32|null, i64|null, f64|null, i32|string}`, 18 apiece, across every `cont` and every
+  `annpat`. This is `CLAUDE.md`'s *"a grid holds constant the axes it was not chasing"* caught
+  in the act, and the corpus `cmp` cannot substitute: it is byte-identical because the corpus
+  contains no program of this shape at all.
+
+* **THE UNION-BOX READ GRID** — 1,260 cells, and the axis is the one nothing else varies:
+  `fld` (the code-16 field's union spelling — `i32|null`, `i64|null`, `f64|null`,
+  `boolean|null`, `string|null`, `i32|string`, a declared arm union, a litunion, `i32[]|null`)
+  × `read` (**bare** un-narrowed · **isnar** `is <atom>` · **nullcmp** `!= null` · **tounion**
+  the read stored into a union-typed binding · **tofld** the read stored into ANOTHER code-16
+  field) × `cont` (bare, list, listlist, mapval, map_of_list, list_of_map, forin) × `annpat`
+  (none, bind, dest, destdeep). Every cell prints `7`. `tounion` and `tofld` are the two
+  levels that earn it: they are the consumers that want the box, and no grid before this one
+  had either. Regenerates from `scripts/silent-sweep/d272/gen272.py`, and the 72 cells the
+  candidate loses are NAMED in `runs-lost.txt` beside it — so the next attempt at this row
+  re-grades that set in ~72 invocations instead of rebuilding the grid.
+
+* **WHAT WOULD CLOSE IT, and why it is not one rung.** Both candidates fail on the same
+  missing input — the read's REP claim and the checker's TYPE for it disagree, and each fix
+  patches one end while the other end still believes the old answer. A close has to move them
+  together: `exprUnion` (the classifier every box consumer asks) and the read site would both
+  have to answer from the checker's recorded type, so that a read typed as a bare atom unboxes
+  AND re-boxes at the coercion. That is a channel decision at a classifier with 28 call sites,
+  not a rung, and it wants its own grid — with `read` on it.
+
+* **THE i64/f64 SUB-FAMILY, where THREE atoms disagree.** `type Circle = { r: i64 | null }`
+  beside the same `const lv1 = [{ r: 7 }]`: the field's declared member is i64, the emitter
+  stores the payload as i64 (tag 3, `struct.new $vbI64`, `print` routed to `__print_i64__`),
+  and the CHECKER types the read i32. Under the read-side candidate those 18 cells become a
+  loud `narrowed union field atom has no value box (kind 0)` rather than running, because the
+  i32 value box the read would ask for was never minted. Any future close has to pick which of
+  the three sources wins; the row above is why picking at the read alone is not available.
+
+* **ABLATION BY STRIPPING.** Two candidates were built against this row: `C` (the read rung)
+  and `G` (the resolver rung this row's D208 half needs). Stripping BOTH reproduces
+  `322c07f2` byte-for-byte at **1,461,174** — proved by `cmp` against master's own
+  `build/vl-compiler.wasm`, not assumed. `G` alone is 1,461,194, `C` alone 1,461,415, `C + G`
+  1,461,435, and the sizes are additive. (The SHIPPED rung was then re-derived on the rebased
+  base `cd44be39`: stripping it out of the final tree reproduces that base byte-for-byte at
+  **1,461,831**, branch **1,461,851**, and every population above was re-graded there with the
+  same answer.)
+
+  | compiler | D209 | D208 | D272's pin |
+  |---|---|---|---|
+  | base | invalid wasm | invalid wasm | runs |
+  | `C` alone | **runs** | invalid wasm | **check-clean invalid wasm** |
+  | `G` alone | invalid wasm | **runs** | runs |
+  | `C + G` | **runs** | **runs** | **check-clean invalid wasm** |
+
+  Set-identity on the 140-cell adoption grid: `C` moves 36 cells, `G` moves exactly 1
+  (`arm_map_of_list_none`, D208's own coordinate), **the two sets are DISJOINT and their union
+  is exactly the 37 cells `C + G` moves**, with no cell where the pair's class differs from
+  the single's. No interaction in either direction — which is what licenses shipping `G`
+  alone. **`G` shipped; `C` did not.**
 
 ### D210 — the nothing-annotated nested map that a value-NAME-keyed fix reddens
 **runs today and must keep running · a REFUTATION PIN, measured 2026-08-27 against the first cut of D203's fix**
