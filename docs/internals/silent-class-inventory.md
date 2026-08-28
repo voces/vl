@@ -8101,8 +8101,42 @@ Repro:
 
 ---
 
-### D180 — a nested list built through un-annotated intermediate locals, with NOTHING declared
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block D and block C · the first row in this inventory with no `type` declaration, no union, no map and no object anywhere in the program**
+### D180 — [CLOSED 2026-08-27] a nested list built through un-annotated intermediate locals, with NOTHING declared
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`; ONE ROOT WITH D183, and the root is a missing rung in `arrLitIsRef`. Was: check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block D and block C · the first row in this inventory with no `type` declaration, no union, no map and no object anywhere in the program**
+
+**THE ROOT: `arrLitIsRef` classifies a list literal from its FIRST ELEMENT'S NODE, and its
+nested arm is gated on `e0 is ArrayLit`.** `const c = [lv1]` where `lv1` is a `string[]` LOCAL
+puts an IDENT there — no object literal, no nested literal, no lambda, no map, no declared
+shape — so every rung declined, no ref-list row was interned, the literal built on the i32
+backing, and a `(ref $strlist)` element went into an `(array (mut i32))`. That is the identical
+hole the UNION, MAP and NOMINAL rungs each closed for their own element kind ("a checker-typed
+element the first-element probes cannot see — an IDENT (`[c]`) or a CALL"), at the last element
+kind that still had it.
+
+**THE PREDICATE WAS ALREADY WRITTEN AND CALLED FROM ONE PLACE.** `arrLitNestedElemName` /
+`arrLitNestedElemKind` were added for the EMPTY-literal half of this same hole
+(`const outer = []` + `outer.push(inner)`) and are asked only inside
+`collectA`'s `nd.arrElems.length == 0` branch. Reading them as the fourth last rung of
+`arrLitIsRef` / `arrLitElemName` / `arrLitElemKind` — arm for arm, as those three require —
+closes the non-empty half; `collectA`'s existing `arrLitIsRef` branch then interns the row and
+flips the same wrapper/backing flags with no change of its own.
+
+**THE LOUD FLOOR HAD NO RUNG EITHER, WHICH IS WHY THIS WAS SILENT AND THE `i32` CONTROL WAS
+NOT.** The i32-list fallback's floor ladder refuses an array element (`exprArray` /
+`exprRefArray`), a struct element, a union-ARM element and a MAP element — and has nothing for
+a `string[]` / `f64[]` / `i64[]` element. `exprArray` claims the i32 case, which is exactly why
+`i32` elements were the loud control and every other leaf was silent.
+
+**BOUNDED BY `tyNestedArrLeafSupported`, deliberately.** An `f32[]` leaf and a doubly-nested
+`string[][]` leaf still decline, because that predicate's header records the set where
+`arrLitNestedElemKind` and `refArrElemKind(<elem>[])` agree; outside it the two disagree and the
+outer backing would be typed against the wrong wrapper. Both declined leaves keep the LOUD
+outcome master gives them, re-measured on this tree: `const c: f32[] = [1.5]  const dd = [c]`
+is `emitProgram: index receiver is not an array or string` and the depth-3 all-inferred
+`[[["seven"]]]` chain is `emitProgram: nested arrays are not supported`, before and after.
+
+Fixture: `tests/cases/arrays/nested-list-elem-from-ident.vl` (this repro, D183's, the
+hand-written generic conduit, depth 3, the f64 leaf, and the two controls that already ran).
 
 Repro:
 
@@ -8308,8 +8342,24 @@ Repro:
 
 ---
 
-### D183 — a `string[]` round-tripped through `reverse([c])[0]`, inside a function
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block A · D157's conduit at a coordinate with NO nominal shape anywhere in the program**
+### D183 — [CLOSED 2026-08-27] a `string[]` round-tripped through `reverse([c])[0]`, inside a function
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`; the SAME ROOT as D180 and the ablation is what says so. Was: check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block A · D157's conduit at a coordinate with NO nominal shape anywhere in the program**
+
+**IT IS NOT THE CONDUIT, IT IS `[c]`** — and the row's own `reverse(c)` control said so before
+the root was found. The wrapping list is a list literal whose element is a `string[]` delivered
+by IDENT, which is D180's coordinate exactly; `arrLitIsRef` declined it, and `reverse$m0`'s
+parameter came out `(ref $i32list)` while a `(ref $strlist)` was handed to it. The engine
+message filed on this row (`expected (ref $type), found (ref $type)`) is stale — re-run
+verbatim on `a19a3db7` it is **`expected i32, found (ref $type)`**, byte-for-byte D180's, which
+is the tell the two rows share a root.
+
+**THE ABLATION, on the 2,224-cell list grid described under D180's fix:** the one rung moves
+338 cells and this row with them, and the D184 rung beside it moves 9 disjoint cells and moves
+neither this row nor D180 (`R1 ∩ R3 = 0`, set-identity of the union against the whole).
+
+Fixture: `tests/cases/arrays/nested-list-elem-from-ident.vl` — this repro as `d183()` plus the
+hand-written-generic sibling `d183Gen()`, which was silent for the same reason and which the
+row's `idg(c)` control (no wrapping list) could not see.
 
 Repro:
 
@@ -8356,8 +8406,39 @@ Repro:
 
 ---
 
-### D184 — a LIST of lists of a declared union arm with an exact twin
-**check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block C · D156's ingredients in a LIST container, which no grid in this programme has ever built**
+### D184 — [CLOSED 2026-08-27] a LIST of lists of a declared union arm with an exact twin
+**CLOSED 2026-08-27 — the repro now RUNS and prints `7`. ONE CUT: the ELEMENT arm of `dstPinPushAnn` was asking rung ONE of `armPinAnnName` where it needed rung TWO. Was: check-clean invalid wasm · found 2026-08-27 by the CENSUS grid, block C · D156's ingredients in a LIST container, which no grid in this programme has ever built**
+
+**THE DIAGNOSIS WAS VERIFIED BY PROBE, NOT INHERITED.** An instrumented compiler
+(`emitFail` at the end of `synthDstPinAnns`, accumulating one line per rung reach) prints for
+this repro exactly one line: `ELEM ann=Circle[][] rae=Circle[] raf=1 en=`. So the WHOLE-VALUE
+branch is never taken — `armPinAnnName` is not called at all on this program — and gate B
+(`dstPinPushAnn`'s ELEMENT arm) is the one and only cut the row reaches.
+
+**THE CUT.** `retRefArrElemName(Circle[][])` is `Circle[]`; the arm arm asks
+`variantIndexOf("Circle[]")`, the variant table holds `Circle`, so the lookup declined and `en`
+came back `""`. `dstPinAnnIn` records `""` as a destination DISAGREEMENT, so that one delivery
+vetoes the pin the binding would otherwise get. Un-pinned, `lv1` resolves through
+`structIndexOfObj` — which finds the layout twin `Dot`, since a union member has no `sNames`
+row for `Circle` to claim — while the annotated destination declares `uVarHeap[Circle]`.
+`pinArmListName` is that question asked by NAME (`arrLeafNameOf` then `variantIndexOf`), which
+is the form the element arm can call: it holds a STRING, not a node, which is why it
+hand-inlined rung 1 in the first place.
+
+**THE `armPinAnnName` HALF WAS BUILT AND THEN DECLINED ON MEASUREMENT.** Widening that
+function's OWN ref-list rung to `pinArmListName` is reachable — a reach probe (the rung
+replaced by an `emitFail` marker, run over 10,882 files: every `tests/cases`, `std` and `bench`
+program plus every census cell in blocks C and D containing a `[][]` spelling) fires on three
+corpus fixtures. It moves NOTHING: 0 of the four filed witnesses, 0 corpus bytes (1,989 modules
+re-built and `cmp`-identical against the rung below it), and **0 cells either way on the
+2,224-cell list grid** (`R2` column of the lattice, `moved=0`). Its callers explain why:
+`dstPinAnnIn` and `synthRetPinAnn` both require `armPinLitInit`, whose widest producer is an
+ArrayLit with an OBJECT-LITERAL first element — a value of depth ONE, which the existing
+`variantIndexOf` rung already claims. It is recorded as a decline on the rung itself rather
+than shipped.
+
+Fixture: `tests/cases/unions/arm-list-of-lists-dst-pin-element.vl` (this repro, the flat
+`Circle[]` control, and the in-function sibling).
 
 Repro:
 
@@ -9100,10 +9181,30 @@ Repro (D156's own, verbatim — it declares the layout twin, which is what makes
     // vl check rc 0 with NO diagnostics at all; vl run:
     //   type mismatch: expected (ref null $type), found (ref $type)
 
-* **THE PIN WORKS AND THE PROGRAM STILL FAILS, AND THAT IS THE ROW.** With D156's peel
-  un-gated the whole chain IS pinned — probed, `PIN let=24 name={[string]:{[string]:Circle}}`
-  and `PIN let=14 name={[string]:Circle}`, both with a resolved arena type — and the same
-  program written with those two annotations BY HAND runs. What is left is not the carrier.
+* **RE-GRADED 2026-08-27 ON `a19a3db7`, AND THE CLAUSE BELOW IS REFUTED. The pin now DOES
+  close it.** Deleting the `!armLayoutContested(leaf)` conjunct from `pinArmDeepUncontested`
+  — the whole of the gate, nothing else — and self-compiling (1,457,432 bytes) makes this
+  row's own filed witness RUN and print `7`. So the carrier is complete after all; what
+  finished it is the FIXPOINT loop and the merges since this row was written (#1965, #1966,
+  #1969, #1968, #1970, #1971, #1972), and the numbers below were taken on `1559d80c`, before
+  all of them.
+* **WHAT STILL REFUSES IT IS D172's PIN, MEASURED ON THE SAME BUILD.** Under the un-gated peel
+  D172's witness — a program that RUNS on master — goes to `check-clean invalid wasm`. That is
+  the refutation pin doing exactly its job, and it is the one thing standing between this row
+  and closure. **D172's own filed COUNTERFACTUAL message has moved with the tree**: it records
+  `expected array type at index 0, found (struct (mut i32))` under the un-gated peel and the
+  build above produces the ordinary `expected (ref null $type), found (ref $type)`. D173's pin
+  is unaffected (it pins a different change) and keeps running.
+* **AND D172's OWN PRESCRIBED COMPLEMENT DOES NOT RESCUE IT — BUILT, NOT REASONED.** Adding the
+  name-side arm hint at `mvShapeOfValNameArmTy`'s two FIND rungs (`mvArmSigOfName(valName, 8)`,
+  taken ONLY over `MV_ARM_NOHINT` and only when it resolves an arm, so it is strictly narrower
+  than the variant D172's row measured) composed with the un-gated peel: 1,457,464 bytes, D171
+  runs, D173 runs, **D172 still `check-clean invalid wasm`**. So "complete the chain, THEN make
+  the arm honest" is now half-verified — the chain IS complete — and the remaining work is
+  D172's pass-ordering root (`mvMapTypeIdx` pushed as 0 at a mint that postdates
+  `mAssignTypeIndices`), not the hint.
+* **The clause this replaces, kept for the record and now known to be stale:** "the pin works
+  and the program still fails … what is left is not the carrier".
 * **A HALF-PINNED CHAIN IS MEASURABLY WORSE THAN AN UN-PINNED ONE, and the un-pinned one is
   riding a CONFLATION.** On master an arm-valued map spelling and its layout twin's render
   resolve the SAME ref-list row and the SAME mv slot at every level, so a chain that is
@@ -10642,6 +10743,95 @@ Repro:
 * Pinned in the corpus by `tests/cases/generics/mono-callback-bound-arm-beside-layout-twin.vl`
   (its `receiverSorted` leg), which is the program this repro minimises; no new fixture,
   because the guard already exists and already fires.
+
+---
+
+### D243 — the ELEMENT scan of `dstPinPushAnn` is ONE list level deep, so a `Circle[][][]` destination pins nothing
+**check-clean invalid wasm · found 2026-08-27 while closing D184, by asking the SAME question one container further out · the rung D184 added answers for this spelling and never sees it, so this is the SCAN's depth and not the predicate's**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    const lv1 = [{ r: 7 }]
+    const c: Circle[][][] = [[lv1]]
+    if ((c[0])[0])[0].r == 7 { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **IT IS D184 WITH ONE MORE `[]`, AND D184's FIX DOES NOT REACH IT.** `dstPinPushAnn`'s
+  element arm iterates `av.arrElems` of the destination's initializer and asks
+  `dstPinSrcIs(bodyIx, av.arrElems[i], letIx)` of each. For `[[lv1]]` the single element is
+  the ArrayLit `[lv1]`, which is not the binding, so the loop finds nothing and no
+  destination is recorded at all. `pinArmListName` — which would answer `true` for the
+  element spelling `Circle[][]`, since `arrLeafNameOf` peels to the leaf — is never called.
+* **SO THE CUT IS THE SCAN, NOT THE PREDICATE**, and that is why it is filed rather than
+  folded into D184: the element arm would need to RECURSE into a nested ArrayLit element,
+  tracking how many `[]` it has descended so the pinned spelling matches the depth the
+  binding actually holds. D184's own fix is one cut and needs no such bookkeeping.
+* Boundary, both re-measured on `a19a3db7` and on this PR's seed: the depth-2 form
+  (`const c: Circle[][] = [lv1]`) is D184 and now RUNS; the depth-3 form above is unchanged
+  in both directions, so this row is neither caused nor moved by that change.
+
+---
+
+### D244 — an ARM-shaped object literal bound to a local and put in a list, with NOTHING annotated and NO twin
+**check-clean invalid wasm · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N), at a coordinate with no annotation anywhere in the program · six lines, and the arm is the ONLY claimant**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    const iv = { r: 7 }
+    const c = [iv]
+    if (c)[0].r == 7 { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THERE IS NO ANNOTATION AND NO LAYOUT TWIN, so neither the pin family nor the
+  arm/twin conflation is in it.** `arrLitIsRef`'s nominal rung claims `[iv]` (the checker
+  typed the element as the ARM `Circle`), the literal builds a kind-1 ref list, and the
+  element the reader gets is the wrong heap. The un-annotated LOCAL between the object
+  literal and the list is load-bearing: `const c = [{ r: 7 }]` — the literal written inline
+  — RUNS, which is `arrLitElemName`'s object arm reaching `objVariantName` where the IDENT
+  arm reaches `arrLitNominalElemName` instead.
+* **IT IS NOT D40 AND THE CONTROL SEPARATES THEM.** D40's fixture
+  (`unions/arm-element-list-from-ident-or-call.vl`) is this shape WITH the result
+  annotation that makes the pin fire; strip the annotation and the program is this row.
+* Grid population: 12 of the 18 cells still silent in the 640-cell block N after this PR,
+  all `elem=bare`, module scope, at every one of the four nominal-ingredient levels.
+
+---
+
+### D245 — a LIST whose element is an arm-valued MAP delivered through a parameter
+**check-clean invalid wasm · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N) · the map/list CROSS that no grid had: the seven earlier grids build the container as a map and read it directly, never as the ELEMENT of a list**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function thru(x: {[string]: Circle}) { x }
+    const iv = Map()
+    iv["k"] = { r: 7 }
+    const c = [thru(iv)]
+    if (((c)[0])["k"] ?? { r: 0 }).r == 7 { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE PARAMETER IS THE CARRIER AND IT IS D171's HOP.** `thru`'s annotation is the only
+  place `Circle` appears as a map value, and it reaches `iv` through the ARGUMENT→PARAMETER
+  direction D171 records as the missing half. Without the `thru` hop
+  (`const c = [iv]`) the same program is a different cell.
+* **IT IS THE `list_of_map` CONTAINER WITH A NOMINAL VALUE**, which is the cross the census's
+  own block C covers by rep but not against the arm/twin ingredients, and which no per-row
+  grid built at all.
+* Grid population: 6 of the 18 cells still silent in block N after this PR, all `elem=map`,
+  module scope, `deliv` ∈ {param, ident, call}.
 
 ---
 
