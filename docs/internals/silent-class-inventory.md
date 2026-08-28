@@ -8440,11 +8440,16 @@ lines, NO layout twin declared, prints `7` on this tree):
 
 ---
 
-### D179 — [CLOSED 2026-08-27] a COMPILER TRAP: `for-in` over an undeclared list whose element field holds a union arm
-**now a loud emit reject · was `compiler trap` on `a19a3db7` · found 2026-08-27 by the CENSUS grid (`scripts/silent-sweep/census/`), block D · the ONLY `compiler trap` the inventory's live population ever had, and the first program-level witness that column ever got**
+### D179 — [CLOSED 2026-08-28] a COMPILER TRAP, then a loud reject, and now it RUNS: `for-in` over an undeclared list whose element field holds a union arm
+**CLOSED 2026-08-28 — the repro RUNS and prints `7`; ONE LANDING WITH D227, whose four-line
+`.slice` witness the same single rung buys · was a loud emit reject from #1972 to #1996, and
+a `compiler trap` on `a19a3db7` before that · found 2026-08-27 by the CENSUS grid
+(`scripts/silent-sweep/census/`), block D · the ONLY `compiler trap` the inventory's live
+population ever had**
 
-Repro (MINIMISED at the close — see the correction below; the originally filed nine-line
-program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-bearing):
+Repro (MINIMISED at the 2026-08-27 close — see the correction below; the originally filed
+nine-line program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is
+load-bearing):
 
     type Cir2 = { c2: i32 }
     type Shape2 = Cir2 | i32
@@ -8457,8 +8462,49 @@ program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-beari
     // `811f8102`: vl check rc 0 with NO diagnostics; vl run AND vl build:
     //   wasm trap: out of bounds array access   (inside the COMPILER)
     // `vl build -o` wrote NO module, which is what separated this from a program trap.
-    // Now: emitProgram: ref valtype with no interned shape — the SAME message the index
-    // spelling of this program has always given, so the two spellings finally agree.
+    // #1972..#1996: emitProgram: ref valtype with no interned shape.
+    // Now: prints 7.
+
+* **THE 2026-08-28 CLOSE, AND WHY THE ROW NEEDED A SECOND ONE.** #1972 bound-checked the
+  unguarded table read and turned the trap into a loud reject. That was the right safety
+  move and it is untouched here — but a loud reject is not a working program, and
+  everything below this bullet describes the TRAP, not the reject that outlived it. The
+  reject has a different root, in a different pass, and one rung closes it.
+
+* **THE ROOT OF THE LOUD REJECT: `collectAnonShapes` DENIES AN ANONYMOUS ROW TO A LITERAL
+  NOTHING BOXES.** Its gate is `structIndexOfObj(ai) < 0 && objVariantName(ai) == ""`, and
+  `objVariantName` is a GLOBAL scan with no context — its own header says so, and
+  `unionArmVariantForObj` exists precisely because of it. It answers "SOME union arm
+  somewhere in this program has this field-name set", not "this literal is boxed into that
+  union". The skip is right for a literal the emitter really does box (a row would make
+  `emitObjLitNode`'s `structIndexOfObj` arm build a bare struct where a `{tag, value}` box
+  was expected). It is wrong for `{ c2: 1 }` sitting as the field value of `{ r: … }`: the
+  checker types that literal `{c2: i32}` — measured, not assumed — nothing boxes it, and
+  with no row `anonFieldElemName` records `""` for the owner's code-15 field, so
+  `anonFieldCode` declines and the OWNER gets no row either. The program then reaches emit
+  with no interned shape and no ref-list row at all.
+
+* **THE FIX** is `anonNestNeedsRow` in `emit_collect.vl`: a literal a variant CLAIMS still
+  gets a row when it is the field value of a literal that is itself an anonymous-row
+  candidate — under one further condition, `anonNestFieldMono`, which is not optional and
+  is priced below.
+
+* **THE ROW'S FILED ROOT IS TRUE, AND A ONE-LINE CONTROL IT DID NOT HAVE PROVES IT.** The
+  row says "`collectS` skipping a union member — `Cir2` gets no `sNames` row, so nothing
+  interns the nested shape". Add a NON-VARIANT twin of the arm's layout and the whole
+  program runs on master, unchanged otherwise:
+
+  | change to the repro | on master (`7ff0f5a8`) |
+  |---|---|
+  | (none) | loud emit reject |
+  | `+ type Cir2b = { c2: i32 }`, declared and USED | **RUNS** |
+  | `+ type Cir2b = { c2: i32 }`, declared and never used | **RUNS** |
+  | `+ type Cir2b = { c2: i32 }  type Own = { r: Cir2b }` and a value of it | **RUNS** |
+
+  So the missing STATE is exactly the one the row named. What the row did not name is the
+  pass that supplies that state when no declaration does — `collectS` must keep skipping
+  the arm (interning it standalone would re-shape every union program), and
+  `collectAnonShapes` is the site with the fixable gate.
 
 * **THE ROW'S ORIGINAL REPRO OVERSTATED ITS OWN SHAPE, AND THE CORRECTION IS THE FINDING.**
   As filed it read *"NINE LINES … the only declarations are the union the payload's field is
@@ -8590,6 +8636,45 @@ program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-beari
   `compiler trap` → loud emit reject. #1975 is why this is stated separately from the grids:
   its own corpus `cmp` caught a `runs` → loud regression (`[c, d]` over two arms of one union)
   that **none of its grids moved a single cell on**.
+
+* **THE 2026-08-28 CLOSE, MEASURED ON FIVE INSTRUMENTS** (base `7ff0f5a8` (#1994), seed
+  1,467,280 → this landing, seed 1,468,887; re-taken in full after the rebase, which is the
+  one thing a rebase always invalidates):
+
+  | instrument | reading |
+  |---|---|
+  | corpus `cmp`, modules byte-for-byte | **2,358 files · 2,356 byte-identical · 0 modules changed · 0 lost** — the two that move are this row's fixture and D227's, each GAINING a module |
+  | census block D, cell-matched, 9,000 cells | **8 moved · 8 → runs · 0 runs LOST · 0 → silent** · SILENT TOTAL 0 → 0 |
+  | distilled corpus (`regress.py`) | 4 classes / 23 census cells `loud emit reject` → `runs`; 0 runs lost, 0 → silent |
+  | counters (`reach` and `ans`) | corpus: 764 literals in 223 programs are skipped by the old gate, 30 of them nested, **4 reach the rung and 2 answer** (the fourth reach is the new polymorphic fixture, declined). Block D: 900 skipped, all nested, **52 reach, 20 answer** — the other 32 are declined by `anonNestFieldMono` |
+  | `wasm-dis` on D227's module | `$0 (struct (field (mut i32)))` is the newly interned nested shape, `$1 (struct (field (mut (ref null $0))))` the owner, `$4 (array (mut (ref null $1)))` the ref-list slot whose table was empty — and the global builds `struct.new $5 (array.new_fixed $4 1 (struct.new $1 (struct.new $0 …)))`. The union box `$2 (struct (field i32) (field anyref))` and the variant struct `$3` are still emitted beside them, untouched |
+
+  The 8 block-D cells are `cont=list` ×4 and `cont=forin` ×4, every one at
+  `rep=arm, declness=nodecl, annpat=none` — D179's own coordinate and its index twin.
+  **Block D holds 0 `compiler trap` cells on master**, which is #1972 still holding.
+
+* **THE REFUSED FIRST CUT AND ITS PRICE — 16 CELLS, AND NO DERIVED POPULATION COULD SEE
+  THEM.** `anonNestNeedsRow` without `anonNestFieldMono` buys the same 8 cells and moves
+  **16 more from `loud emit reject` to `check-clean invalid wasm`**: a loud reject turned
+  into a silent class. All 16 are map containers (`mapval`, `nestedmap`, `map3`,
+  `list_of_map`) holding BOTH arms of one union. `structIndexOfObj` matches a literal to a
+  row by field-NAME set, so two owner literals that share a set and disagree about the
+  nested layout collapse onto ONE row; `wasm-dis` on the three-line witness shows the
+  second global built as `(struct.new $4 …)` — the union box — into a field typed
+  `(ref null $1)`, and wasmtime says `type mismatch: expected (ref null $type), found (ref
+  $type)`. **The distilled corpus scores the refused candidate IDENTICALLY to the shipped
+  one** (4 classes, 23 cells, `→ silent 0`), and the corpus `cmp` is byte-identical on
+  2,356 of 2,358 files under both — so the price is kept whole as a named set:
+  `scripts/silent-sweep/census/d179-anonrow-price.json`, the cells in
+  `distilled/named/`, and the three-line witness pinned as **D391** and as
+  `tests/cases/unions/anon-nested-arm-layout-polymorphic.vl`.
+
+* **ABLATION.** Stripping both rungs reproduces master **byte-for-byte** —
+  `md5 b170eec7bce19ee05e69fee46bdb71af`, 1,467,280 bytes — built FROM THE CANDIDATE'S OWN
+  SEED, so it is a source-identity check and not a rebuild of the same input, and the same
+  seed `refresh-compiler.sh` builds from `7ff0f5a8`. The two rungs are not independent:
+  `anonNestFieldMono` is a CONDITION inside `anonNestNeedsRow`, so the ladder is
+  {none, R1, R1+R2} and R1 alone is the refused candidate above.
 
 ---
 
@@ -11469,7 +11554,11 @@ Repro (the receiver is PARENTHESISED, which is what made this reachable on maste
 ---
 
 ### D221 — [CLOSED 2026-08-27] `vbHeapIdxOfKind` answered heap type **0** for an UNMINTED value box, and every caller's `< 0` guard was dead
-**now a loud check reject — RE-FILED 2026-08-28, one layer up · was `loud emit reject` from #1972 to #1991 and `check-clean invalid wasm` on `16d5c6e7` · no union declared anywhere in the witness, so it is not the D219 seam**
+**now a loud check reject — RE-FILED 2026-08-28, one layer up · was `loud emit reject` from
+#1972 to #1991 and `check-clean invalid wasm` on `16d5c6e7` · no union declared anywhere in
+the witness, so it is not the D219 seam · RE-GRADED 2026-08-28 (#1996): the witness is
+still the check reject, and the guard census below moved — see the two corrections at the
+end of the row**
 
 Repro:
 
@@ -11586,6 +11675,50 @@ Repro:
 * **THE WITNESS IS THE PLAIN-STRUCT LEG, DELIBERATELY.** `Circle` is not a union member here,
   so this reproduces with no arm seam at all — which is what separates it from D219 and D220
   and is why it is a third row rather than a bullet under either.
+
+* **CORRECTION 1, 2026-08-28 — G6's FUNCTION MOVED, AND IT NOW HAS TWO CALLERS.** The table
+  above names `emitUnionFieldNarrowUnbox` at G6. On `7ff0f5a8` the guard is in
+  `emitUnboxToAtomKind` (`wasmEmit.vl:5289`), the shared unbox SEQUENCE that
+  `emitUnionFieldNarrowUnbox` and D209's un-narrowed read both call — so "which of the two
+  same-message sites" is no longer the same question the row settled with a throwaway probe
+  compiler. Re-counted mechanically on `7ff0f5a8`: **still exactly ten call sites, all in
+  `wasmEmit.vl`, every one testing `< 0`**, at lines 3429 / 3603 / 3811 / 4467 / 4751 / 5289
+  / 6938 / 7172 / 20987 / 21124, and G2's argument is still the literal `0`.
+
+* **CORRECTION 2, AND IT IS THE READING THAT MATTERS — THE COUNT IS NOW `0 OF 10`, NOT
+  `2 OF 10`.** The row's two witnessed guards were G6 (this row's own filed program) and G3
+  (`const g: f64 | null = 5.0` / `if g is i32 { … }`, filed as D228). #1992's
+  `isWidenNotVariant` closes the implicit-widening `is` edge at the CHECKER, and that edge
+  was the only channel either witness used: run verbatim on `7ff0f5a8`, **both are now loud
+  check rejects and neither reaches emit**. So every one of the ten guards is unwitnessed
+  today. Re-measured rather than inherited:
+
+  | population | programs | cells reaching ANY of the ten guards |
+  |---|---|---|
+  | census block D, graded in full on `7ff0f5a8` and on the #1996 seed | 9,000 ×2 | **0** |
+  | the distilled corpus (1,477 derived + 753 curated) | 2,230 | **0** |
+  | thirteen hand-built programs, one per guard construct | 13 | **0** |
+
+  **THE ZERO IS A READING, PROVED BY A SABOTAGE.** A compiler whose `vbHeapIdxOfKind` opens
+  with `return -1` takes a guard's loud reject on **6 of 9** of those hand-built programs —
+  G4 (`narrowed union atom has no value box`), G5 / G10 (`union atom has no value box`),
+  G7 (`scalar|null map value has no value box`), G9 (`union call atom has no value box`) and
+  the plain `f64 | null` field read — so the classifier is live and a fire would have been
+  seen. The other three (`emitNarrowedMem`, `emitOptMemberValue`, `emitMapGetScalarBox`
+  spellings) still RUN under the sabotage, i.e. those programs never reach a
+  `vbHeapIdxOfKind` call at all — a fact about the probes, not about the guards.
+
+* **CORRECTION 3, MINOR.** "all five print `5`" is wrong for one of the five: the
+  `boolean | null` twin prints `true`. The claim it is making — that every spelling whose
+  check type really IS a variant of the field's union still lowers and runs — holds on all
+  five, re-run verbatim on `7ff0f5a8`.
+
+* **AND D221 IS NOT PART OF THE D179/D227 FAMILY**, which #1996 grouped it with and then
+  measured apart. Different layer (the checker, not `collectAnonShapes`), different
+  mechanism (a sentinel collision, not a context-free skip), and — the deciding difference —
+  **its witness must NOT be made to run**. `i32` is not a variant of `f64 | null`; it reaches
+  it only across the implicit widening edge D228 ruled on. Making this program run would
+  re-open D228, so the row's right end state is the loud check reject it has.
 
 ---
 
@@ -12096,8 +12229,26 @@ Repro (the filed two-section program, verbatim):
 
 ---
 
-### D227 — [CLOSED 2026-08-27] D179's SECOND site: `.slice` / `.filter` read `rlElemName[0]` INSIDE the resolver, where no caller's guard can reach
-**now a loud emit reject · was `compiler trap` on `a19a3db7`, `75eb1f17` and `811f8102`, and STILL trapping after D179's own fix · found 2026-08-27 by ablating D179's guard against every other operation that reaches the same resolver**
+### D227 — [CLOSED 2026-08-28] D179's SECOND TRAP site — and, once the traps were guarded, the SAME loud reject, closed by ONE rung with D179
+**CLOSED 2026-08-28 — the repro RUNS and prints `1`; ONE LANDING WITH D179 · was a loud emit
+reject from #1972 to #1996, and a `compiler trap` on `a19a3db7`, `75eb1f17` and `811f8102`
+before that · found 2026-08-27 by ablating D179's guard against every other operation that
+reaches the same resolver**
+
+* **"D179's SECOND SITE" WAS TRUE OF THE TRAP AND FALSE OF THE REJECT, AND THE CORRECTION IS
+  THE CLOSE.** Two bound checks really were needed to stop the compiler dying — this one
+  fires INSIDE `refListElemNameOfExpr`, which `refListSlotOfExpr` itself calls, so no
+  caller-side guard could cover it, and the 288-cell grid below measured the composition
+  honestly (2 + 3 singles, 8 together). But the LOUD REJECT the two guards left behind has
+  **one** root, not two. Rescuing the nested literal in `collectAnonShapes` (D179's close)
+  makes `for-in`, `c[0]`, `.slice(0,1)[0]` and `.filter(…)[0]` all run at once; there is no
+  second rung, and no `.slice`-specific code was written. Measured: the four-line repro
+  above prints `1` on a compiler whose ONLY change is D179's rung, and the whole family's
+  block-D movement is the 8 cells D179 reports — 4 `cont=list`, 4 `cont=forin`.
+* Both fixtures are now `@run`: `tests/cases/arrays/slice-arm-layout-nested-field-empty-
+  reflist-table.vl` reads the shape four ways (index, `.slice`, `.filter`, an un-annotated
+  intermediate local) and `tests/cases/loops/for-in-arm-layout-nested-field-empty-reflist-
+  table.vl` three ways.
 
 Repro (FOUR lines, and it needs no `for-in` at all):
 
@@ -12105,12 +12256,13 @@ Repro (FOUR lines, and it needs no `for-in` at all):
     type Shape2 = Cir2 | i32
     const c = [{ r: { c2: 1 } }]
     print(c.slice(0, 1)[0].r.c2)
+    // Now: prints 1.
     // `811f8102` AND the D179-only compiler: vl check rc 0, no diagnostics; then
     //   wasm trap: out of bounds array access   (inside the COMPILER)
     // (Re-verified on the merged base: traps on 1,461,131 and on 1,461,158 — D179's rung
     //  alone — and is loud only with both rungs, at 1,461,174.)
     // `vl build -o` writes NO module, which is what separates it from a program trap.
-    // Now: emitProgram: ref valtype with no interned shape
+    // #1972..#1996: emitProgram: ref valtype with no interned shape
 
 * **SAME TWO INGREDIENTS AS D179, DIFFERENT SITE.** An anonymous object literal whose layout
   matches an arm of a DECLARED union (so `collectS` skips the arm and nothing interns the
@@ -12161,6 +12313,52 @@ Repro (FOUR lines, and it needs no `for-in` at all):
   **byte-for-byte at 1,461,131**. #1973 and #1975 both changed list-literal element handling,
   which is why this was re-taken rather than inherited — and neither moved a single cell of
   this family.
+
+---
+
+### D391 — a REFUTATION PIN: two owner literals sharing a field-name set and disagreeing about the nested layout must KEEP the union box
+**loud emit reject, and it must stay one — the price of D179/D227's rung without its
+`anonNestFieldMono` condition, pinned so the day someone drops that condition this row
+flips · filed 2026-08-28 by #1996's own ablation**
+
+Repro:
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    const p = { r: { c2: 1 } }
+    const q = { r: { s2: 1 } }
+    print(1)
+    // emitProgram: object literal matches no union variant
+    // Without `anonNestFieldMono`: check-clean, and the module does not parse.
+
+* **WHY A LOUD REJECT IS THE RIGHT ANSWER HERE AND NOT A DEFECT.** `structIndexOfObj`
+  matches a literal to an interned row by field-NAME set. Both literals set `{r}`, so one
+  row would have to hold both — and their nested values match DIFFERENT arms of the
+  declared union. D179's rung mints an anonymous row for a nested literal a union arm
+  claims; applied here it gives `p`'s nested `{c2: 1}` a row, `q` then matches `p`'s owner
+  row, and `q`'s nested literal — still on the union-box path — is built as
+  `(struct.new $uBox …)` into a field typed `(ref null $anonCir)`. `wasm-dis` shows exactly
+  that, and wasmtime answers `type mismatch: expected (ref null $type), found (ref $type)`.
+  **That is `check-clean invalid wasm` where a loud reject stood**, which is the worst trade
+  available, so the rung declines instead.
+* **THE PRICE IS MEASURED AND KEPT WHOLE: 16 census-block-D cells** (`mapval`, `nestedmap`,
+  `map3`, `list_of_map` at `rep=arm, declness=nodecl, annpat=none`) plus this program.
+  `scripts/silent-sweep/census/d179-anonrow-price.json` carries the coordinates; the cells
+  are in `scripts/silent-sweep/distilled/named/` so the standing gate re-grades them.
+* **NOTHING DERIVED CAN FIND THEM.** `regress.py` reports the refused candidate and the
+  shipped one identically — 4 classes, 23 census cells, all `loud emit reject → runs`, and
+  `→ silent 0 classes` — and the corpus `cmp` is byte-identical on 2,356 of 2,358 files under
+  both. On the shipped tree these 17 programs behave exactly like their class-mates; what
+  names them is what the CANDIDATE did to them.
+* **THE OPEN QUESTION THIS PIN PARKS.** Making the polymorphic pair work needs
+  `structIndexOfObj` to discriminate a code-15 field by its TARGET, not just by the field
+  name — the `strict` bookkeeping is already computed in `structIndexOfObjCtxGo` and is
+  used only as an ambiguity tiebreak, deliberately, to keep the lenient resolution
+  byte-identical. Promoting it is a separate landing with its own price, and this pin is
+  what will say whether that landing worked.
+
+Fixture: `tests/cases/unions/anon-nested-arm-layout-polymorphic.vl`.
 
 ---
 

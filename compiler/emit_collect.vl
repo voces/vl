@@ -164,6 +164,7 @@ import {
   noteFuncName,
   nulLitUnionInnerName,
   nullablePartOf,
+  objFieldVal,
   parenUnionArrElemName,
   parentLetOf,
   retBoolFlag,
@@ -6578,11 +6579,41 @@ export function collectAnnShapes() {
 // then fails loudly downstream (never a trap). Must run AFTER `collectU` (variant
 // shapes are the union's, not standalone structs).
 function collectAnonShapes() {
+  // THE OWNER MAP: for every object literal that is another literal's FIELD VALUE, the
+  // owning literal's node index. Built in one linear pass, and only when the program
+  // DECLARES a union variant — with no variants `objVariantName` is "" everywhere, no
+  // literal is skipped, and there is nothing for the gate below to rescue.
+  const nestOwner: i32[] = []
+  if uVariants.length > 0 {
+    while nestOwner.length < P.nodes.length { nestOwner.push(0 - 1) }
+    let pi = 0
+    while pi < P.nodes.length {
+      const pn = P.nodes[pi]
+      if pn is ObjLit {
+        let pk = 0
+        while pk < pn.objFields.length {
+          const pf = P.nodes[pn.objFields[pk]]
+          if pf is FieldInit {
+            const pv = unwrapParen(pf.fiValue)
+            if pv >= 0 && pv < nestOwner.length {
+              const pvn = P.nodes[pv]
+              if pvn is ObjLit { nestOwner[pv] = pi }
+            }
+          }
+          pk = pk + 1
+        }
+      }
+      pi = pi + 1
+    }
+  }
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
     if an is ObjLit {
-      if structIndexOfObj(ai) < 0 && objVariantName(ai) == "" {
+      if (
+        structIndexOfObj(ai) < 0 &&
+        (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
+      ) {
         const fields = an.objFields
         // Does this literal carry a FUNCTION-valued field? An operator/index
         // TRAP MAKER (`{ "*": fn, x: x, y: y }`) mixes closures with plain
@@ -6671,6 +6702,130 @@ function collectAnonShapes() {
     ai = ai + 1
   }
   0
+}
+
+// The literal that owns `objIx` as one of its FIELD VALUES, read out of the owner map
+// `nestOwner` built by `collectAnonShapes` — or -1 when the literal is not nested in
+// another one. Split out so the gate below reads as one question.
+function anonNestOwnerOf(objIx: i32, nestOwner: i32[]) {
+  if objIx < 0 { return -1 }
+  if objIx >= nestOwner.length { return -1 }
+  nestOwner[objIx]
+}
+
+// SHOULD a literal that `objVariantName` CLAIMED still get an anonymous row?
+//
+// `objVariantName` is a GLOBAL scan with no context (its own header says so, and
+// `unionArmVariantForObj` exists because of it): it answers "some union arm somewhere in
+// this program has this field-name set", not "this literal is boxed into that union". The
+// skip is right for a literal the emitter really does box — minting a row would make
+// `emitObjLitNode`'s `structIndexOfObj` arm claim it and build a bare struct where a
+// `{tag, value}` box was expected. It is WRONG for a literal in a position nothing boxes.
+//
+// The position this recognises is the one a 250,238-cell census found and D179/D227 filed:
+// the literal is the FIELD VALUE of another literal that is itself getting an anonymous row.
+// That owner's field type is whatever this literal infers to — the checker renders it as the
+// inline shape `{c2: i32}`, never as the union — so nothing boxes it, and with no row
+// `anonFieldElemName` records "" for the owner's code-15 field. The owner then fails to
+// classify too, and `const c = [{ r: { c2: 1 } }]` beside `type Shape2 = Cir2 | i32` reached
+// emit with NO interned shape at all: `emitProgram: ref valtype with no interned shape`,
+// on a program that runs the moment the union declaration is deleted.
+//
+// The owner's own candidacy is asked as the two conditions that gate the loop below, not as
+// "did it get a row": whether it gets one depends on THIS literal's field code, so asking
+// the full question here is circular. An owner that then declines for an unrelated field
+// fails loudly as before — the extra row is unreachable, because a literal whose owner
+// interns nothing is never constructed.
+function anonNestNeedsRow(objIx: i32, nestOwner: i32[]) {
+  const ow = anonNestOwnerOf(objIx, nestOwner)
+  if ow < 0 { return false }
+  if structIndexOfObj(ow) >= 0 { return false }
+  if objVariantName(ow) != "" { return false }
+  const fname = anonNestFieldNameOf(ow, objIx)
+  if fname == "" { return false }
+  anonNestFieldMono(ow, fname, objIx)
+}
+
+// The field NAME under which `inner` sits in `ow`. "" when it does not (which
+// `anonNestOwnerOf` has already ruled out, so the empty answer is a decline, not a case).
+function anonNestFieldNameOf(ow: i32, inner: i32) {
+  const o = P.nodes[ow]
+  if o is ObjLit {
+    let i = 0
+    while i < o.objFields.length {
+      const f = P.nodes[o.objFields[i]]
+      if f is FieldInit {
+        if unwrapParen(f.fiValue) == inner { return f.fiName }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// Do two object literals set the SAME field names? The key `structIndexOfObj` matches a
+// literal to a row on, asked between two literals.
+function anonObjFieldSetEq(aIx: i32, bIx: i32) {
+  const a = P.nodes[aIx]
+  const b = P.nodes[bIx]
+  if a is ObjLit {
+    if b is ObjLit {
+      if a.objFields.length != b.objFields.length { return false }
+      let i = 0
+      while i < a.objFields.length {
+        const f = P.nodes[a.objFields[i]]
+        if f is FieldInit {
+          if objFieldVal(bIx, f.fiName) < 0 { return false }
+        } else {
+          return false
+        }
+        i = i + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// WOULD THE OWNER'S ROW BE MONOMORPHIC AT THIS FIELD — the condition that makes minting the
+// nested row safe, and the one the first cut of this rung was missing.
+//
+// `structIndexOfObj` matches a literal to a row by field-NAME set. So the moment TWO literals
+// share the owner's field-name set and disagree about the nested layout at `fname`, they
+// cannot both have an anonymous row: the second matches the first's and builds `{s2: …}`
+// against a `{c2: …}` field. That disagreement is exactly what the union box exists for, and
+// those literals must keep taking it.
+//
+// MEASURED, not reasoned: without this condition census block D moved **16 cells from
+// `loud emit reject` to `check-clean invalid wasm`** — a loud reject turned into a silent
+// class, the worst trade available. All 16 were map containers holding both arms of one
+// union (`c["k0"] = { r: { c2: 1 } }` beside `?? { r: { s2: 1 } }`), and the two-line
+// `const p = { r: { c2: 1 } }` / `const q = { r: { s2: 1 } }` is the whole witness.
+//
+// The scan runs only when the rung has already fired every other condition (a variant-named
+// literal nested in an anonymous-row owner), which is why a linear pass over the arena is
+// affordable here: a program with no such literal never reaches it.
+function anonNestFieldMono(ow: i32, fname: string, inner: i32) {
+  let qi = 0
+  while qi < P.nodes.length {
+    if qi != ow {
+      const qn = P.nodes[qi]
+      if qn is ObjLit {
+        if anonObjFieldSetEq(qi, ow) {
+          const qv = unwrapParen(objFieldVal(qi, fname))
+          if qv < 0 { return false }
+          const qvn = P.nodes[qv]
+          if qvn is ObjLit {
+            if !anonObjFieldSetEq(qv, inner) { return false }
+          } else {
+            return false
+          }
+        }
+      }
+    }
+    qi = qi + 1
+  }
+  true
 }
 
 // The type name to record for one generic-alias field: the annotation as CANON'd, except

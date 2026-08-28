@@ -327,6 +327,58 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   consumers, and the annotation is additive, so it waits. (A8, A9)
 
 
+## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
+
+`collectAnonShapes` mints an anonymous struct row for every object literal that names no
+declared struct. It skips one that `objVariantName` claims, on the reading "this literal
+will be boxed into the union, and a row would make `emitObjLitNode`'s `structIndexOfObj` arm
+build a bare struct where a `{tag, value}` box was expected". That reading is right about
+the literals it was written for and wrong about the question it asks: `objVariantName` is a
+GLOBAL scan over every declared variant with no context at all — its own header says so, and
+`unionArmVariantForObj` exists because of it. It answers *some union arm somewhere in this
+program has this field-name set*.
+
+The gap that opens is a nested literal. In `const c = [{ r: { c2: 1 } }]` beside
+`type Shape2 = Cir2 | i32`, the checker types the inner `{ c2: 1 }` as the inline shape
+`{c2: i32}` — measured, not assumed — and nothing boxes it: it is the field value of an
+anonymous literal whose field type IS that shape. Denied a row, it leaves
+`anonFieldElemName` with `""` for the owner's code-15 field, so the OWNER declines too, and
+a program whose only ref-array-shaped type is that list interns nothing at all. That is
+silent-class-inventory D179 and D227.
+
+**The rule taken: rescue the literal when its OWNER is itself getting an anonymous row, and
+only when the owner's row would be MONOMORPHIC at that field.** Both halves are load-bearing
+and the second was found by measurement, not by review.
+
+- The owner test is what keeps a genuinely boxed literal on the box path. A literal the
+  context adopts into a union (`const x: U = { r: { c2: 1 } }`) has an owner that
+  `objVariantName` claims, or one that matches a declared row, and neither is an
+  anonymous-row candidate.
+- The monomorphism test is what keeps a LOUD REJECT from becoming a SILENT CLASS.
+  `structIndexOfObj` matches a literal to a row by field-NAME set, so two owner literals
+  that share a set and disagree about the nested layout cannot both have an anonymous row:
+  the second matches the first's and builds a union box into a field typed as the first's
+  nested struct. Without the test, census block D moved **16 cells from `loud emit reject`
+  to `check-clean invalid wasm`**. That is the worst trade this project makes, and the
+  reason the condition is not an optimisation.
+
+**Why the fix is not in `collectS`.** The state D179 is missing really is the `sNames` row
+`collectS` withholds from a union arm — declare a non-variant twin of the arm's layout, even
+unused, and the whole program runs on master. But interning the arm as a standalone struct
+re-shapes every union program (the arm's variant struct and the standalone struct are
+distinct heap types by design, and `structIdxMatchesVariantIdx` exists to bridge them).
+`collectAnonShapes` is the pass whose job is exactly *supply a shape when no declaration
+does*, so that is where the missing row belongs.
+
+**What is deliberately NOT done.** Making the polymorphic pair work needs
+`structIndexOfObj` to discriminate a code-15 field by its TARGET rather than by the field
+name alone. The bookkeeping is already there — `structIndexOfObjCtxGo` computes a `strict`
+count beside its lenient one — and it is used only as an ambiguity tiebreak, deliberately,
+to keep the lenient resolution byte-identical. Promoting it is a separate landing with its
+own price. `docs/internals/silent-class-inventory.md` D391 is the pin that will say whether
+it worked.
+
+
 ## Memory, runtime & object model
 
 - **A `string` is UTF-8 BYTES behind a slice header, and the surface is
