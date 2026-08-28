@@ -10,6 +10,32 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A read that stops being a BOX must stop being one in every classifier that answers for it,
+  and "how many consumers would have to learn it" is a count, not an argument** (2026-08-28,
+  silent-class-inventory D311). D209 made an un-narrowed code-16 read DELIVER a bare atom where
+  its channel predicate fires, and taught `exprUnion` — the classifier every box consumer asks —
+  to stop calling such a read a union value. Two functions that answer the same question were
+  left behind: `memberUnionReadKind` (the member dual of `unionIdentReadKind`, whose documented
+  contract is "the atom KIND this read currently reads as") kept answering `-2` for "a box", and
+  `unionNameOfExpr`'s Member arm kept NAMING the union, so a binding over such a read was
+  registered as a union binding. Both are now gated on the same `memReadUnboxAtomKind` the read
+  site and `exprUnion` ask. `memberUnionFieldNameRead`'s header already stated the rule for the
+  WIDENING direction — *the three read classifiers are one decision and must widen together* —
+  and this is the same rule in the other direction, which nothing had written down.
+
+  **The entry above this one estimated the cost of that as "every consumer classifier (`print`
+  alone reads four) would then have to learn the predicate, and the un-taught ones fail
+  SILENTLY". The count was right and the inference was wrong, and the correction is worth
+  keeping**: four of the five classifiers `print` dispatches on — `exprIsF32` / `exprIsF64` /
+  `exprIsI64` / `exprIsBool` — open with a typed-IR FAST PATH reading the CHECKER's recorded type
+  for the node, and the atom this channel delivers IS the checker's type for the node, so they
+  were already correct and a Member arm on each measured `ans=0` at 31,062 corpus reaches.
+  `exprString` is the exception and it is a principled one: canon SOFTENS a literal union to the
+  spelling `string` while its rep is an interned i32 atom, so a fast path there would mis-claim
+  it (`letIsString`'s own header refuses the same substitution for the same reason). **The
+  number of consumers a contract change touches is measurable before it is argued about — build
+  the arm on each, count `reach` and `ans`, and let the ones that score zero stay unwritten.**
+
 - **A UNION BOX's WIDENING is a function, and both ends of the box ask it** (2026-08-28,
   silent-class-inventory D291). `emitUnionCoerce` widens an i32 value into a union whose only
   numeric arm is `i64` / `f64` / `f32`, and an f64 into an `f32`-only one — the STORE's own
