@@ -8352,7 +8352,7 @@ program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-beari
       hit = 7
     }
     print(hit)
-    // `75eb1f17`: vl check rc 0 with NO diagnostics; vl run AND vl build:
+    // `811f8102`: vl check rc 0 with NO diagnostics; vl run AND vl build:
     //   wasm trap: out of bounds array access   (inside the COMPILER)
     // `vl build -o` wrote NO module, which is what separated this from a program trap.
     // Now: emitProgram: ref valtype with no interned shape — the SAME message the index
@@ -8374,7 +8374,7 @@ program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-beari
 * **ELEVEN CONTROLS, each one change from the MINIMISED repro above**, every one built and
   run rather than reasoned:
 
-  | change | outcome on `75eb1f17` |
+  | change | outcome on `811f8102` |
   |---|---|
   | (none — the minimised repro) | **compiler trap** |
   | put the `if zz.r is Cir2 { hit = 7 }` body back, and a second arm `Sq2` | **compiler trap** (the originally filed nine-line program) |
@@ -8454,23 +8454,40 @@ program had a `Sq2` arm and an `if zz.r is Cir2` body, and neither is load-beari
   at `a19a3db7` (150,224 cells) and contains **zero** `compiler trap` cells, which is what
   makes block D the right target for a cheap re-grade rather than a guess.
 
-* **THE CLOSE, MEASURED — census block D re-graded cell-matched, 9,000 cells, on the MERGED
-  base: `75eb1f17` (seed 1,457,423) → this branch merged (seed 1,457,466):**
+* **THE CLOSE, MEASURED — census block D re-graded cell-matched, 9,000 cells, on the current
+  base: `811f8102` (seed 1,461,131) → this branch merged (seed 1,461,174):**
 
       0 runs → not-runs · 0 → silent · 2 compiler trap → loud emit reject
       8,998 of 9,000 unchanged · compiler trap column 2 → 0 · SILENT TOTAL 55 → 53
 
-  **THE TWO TRAP CELLS SURVIVED #1973**, which is why the measurement was re-taken on the
-  merged base rather than inherited: #1973 moved block D's `check-clean invalid wasm` 65 → 53
-  and its `runs` 7,157 → 7,187 (D180/D183), and left both `compiler trap` cells exactly where
-  they were. The same two cells, the same coordinates —
-  `cont=forin, rep=arm, declness=nodecl, twin=none`, D179's exactly. Measured first against
-  `a19a3db7` (1,457,262 → 1,457,305) with the identical result: 0 / 0 / 2.
+  **THE TWO TRAP CELLS SURVIVED #1973 AND #1975**, which is why this was re-measured at each
+  base rather than inherited — both of those landings changed list-literal element handling,
+  the same neighbourhood as this row's root. Measured three times, on three bases, with the
+  identical result **0 / 0 / 2** every time:
+
+  | base | seed | branch seed | block D result |
+  |---|---|---|---|
+  | `a19a3db7` | 1,457,262 | 1,457,305 | 0 / 0 / 2 · silent 67 → 65 |
+  | `75eb1f17` (after #1973) | 1,457,423 | 1,457,466 | 0 / 0 / 2 · silent 55 → 53 |
+  | `811f8102` (after #1975) | 1,461,131 | 1,461,174 | 0 / 0 / 2 · silent 55 → 53 |
+
+  #1973 moved block D's `check-clean invalid wasm` 65 → 53 and its `runs` 7,157 → 7,187
+  (D180/D183); **#1975 moved no block-D cell at all**; and neither touched either
+  `compiler trap` cell. Same two cells throughout, same coordinates —
+  `cont=forin, rep=arm, declness=nodecl, twin=none`, D179's exactly.
 
   The FULL census after-pass is NOT run on this branch — `CLAUDE.md` item 6 now has the
-  integrator run it once on the merged result. Block A's base grade and block D's matched pair
-  are what this row rests on; **blocks B, C and E are ungraded on the branch side and this row
-  does not claim them.**
+  integrator run it once on the merged result. Block A's base grade, block D's matched pair
+  and the corpus `cmp` are what this row rests on; **blocks B, C and E are ungraded on the
+  branch side and this row does not claim them.**
+
+* **CORPUS `cmp`, THE INSTRUMENT A GRID CANNOT SUBSTITUTE FOR.** Every `tests/cases` program
+  built with both seeds and the MODULES compared byte-for-byte: **2,332 files, 0 byte
+  differences, 0 rc differences**, 1,898 byte-identical modules and 432 identical failure
+  messages. The only two files that move are this row's own fixture and D227's, each
+  `compiler trap` → loud emit reject. #1975 is why this is stated separately from the grids:
+  its own corpus `cmp` caught a `runs` → loud regression (`[c, d]` over two arms of one union)
+  that **none of its grids moved a single cell on**.
 
 ---
 
@@ -10284,18 +10301,30 @@ Repro:
 * **HOW MANY ARE LIVE TODAY: 2 OF 10 HAVE A WITNESS, AND 8 HAVE NONE.** Measured on
   `a19a3db7`, by matching each guard's message across every population available:
 
-  | population | programs | cells reaching ANY of the ten guards |
-  |---|---|---|
-  | census block A, graded in full | 150,224 | **0** |
-  | census block D, graded in full | 9,000 | **0** |
-  | the `tests/cases` corpus | 2,327 | **0** |
-  | **total** | **161,551** | **0** |
+  | population | base measured at | programs | cells reaching ANY of the ten guards |
+  |---|---|---|---|
+  | census block A, graded in full | `a19a3db7` | 150,224 | **0** |
+  | census block D, graded in full | `a19a3db7` and again at `811f8102` | 9,000 | **0** both times |
+  | the `tests/cases` corpus | `a19a3db7` (2,327) and again at `811f8102` | 2,332 | **0** both times |
+  | **total distinct programs** | | **161,556** | **0** |
 
   The zero is a reading and not a blind spot: the classifier was proved to fire on demand
   against each message text before the sweep, and it correctly declines an unrelated message.
   What the populations do not contain, they do not contain — block A's emit-reject column is
   dominated by `unsupported map value type` (9,545) and `nested arrays are not supported`
   (8,866) and never reaches a value-box path at all.
+
+  **RE-TAKEN AFTER #1973 AND #1975**, both of which changed list-literal element handling:
+  block D and the corpus were swept again at `811f8102` and **no guard became reachable**, so
+  D228's story is unchanged by either landing. Block A was graded at `a19a3db7` only; the
+  integrator's own block-A pass covers `a19a3db7` → `811f8102` and supersedes a branch-side
+  re-grade of it. **Two caveats stated rather than buried**: 58 of the 2,332 corpus files hit
+  the sweep's 20s timeout, but a guard fire is an EMIT-time failure that returns immediately,
+  so a program still executing at 20s has necessarily passed emission and cannot contain one;
+  and blocks B, C and E were never swept for this at all.
+
+  For a denominator: block A's silent total is **6,472 at `a19a3db7`** (integrator's
+  measurement), against 12,673 published at `1559d80c`. These ten sites reach none of it.
 
   Two guards were then made to fire by hand-building a program from the guard list:
 
@@ -10358,7 +10387,7 @@ Repro (census block A cell `a099944`, verbatim — D211's own cell plus one unio
 ---
 
 ### D227 — [CLOSED 2026-08-27] D179's SECOND site: `.slice` / `.filter` read `rlElemName[0]` INSIDE the resolver, where no caller's guard can reach
-**now a loud emit reject · was `compiler trap` on `a19a3db7` and on `75eb1f17`, and STILL trapping after D179's own fix · found 2026-08-27 by ablating D179's guard against every other operation that reaches the same resolver**
+**now a loud emit reject · was `compiler trap` on `a19a3db7`, `75eb1f17` and `811f8102`, and STILL trapping after D179's own fix · found 2026-08-27 by ablating D179's guard against every other operation that reaches the same resolver**
 
 Repro (FOUR lines, and it needs no `for-in` at all):
 
@@ -10366,10 +10395,10 @@ Repro (FOUR lines, and it needs no `for-in` at all):
     type Shape2 = Cir2 | i32
     const c = [{ r: { c2: 1 } }]
     print(c.slice(0, 1)[0].r.c2)
-    // `75eb1f17` AND the D179-only compiler: vl check rc 0, no diagnostics; then
+    // `811f8102` AND the D179-only compiler: vl check rc 0, no diagnostics; then
     //   wasm trap: out of bounds array access   (inside the COMPILER)
-    // (Re-verified on the merged base: traps on 1,457,423 and on 1,457,450 — D179's rung
-    //  alone — and is loud only with both rungs, at 1,457,466.)
+    // (Re-verified on the merged base: traps on 1,461,131 and on 1,461,158 — D179's rung
+    //  alone — and is loud only with both rungs, at 1,461,174.)
     // `vl build -o` writes NO module, which is what separates it from a program trap.
     // Now: emitProgram: ref valtype with no interned shape
 
@@ -10415,22 +10444,25 @@ Repro (FOUR lines, and it needs no `for-in` at all):
   so guarding either one alone just moves the trap to the other. Neither rung is droppable,
   and a solo count would have understated both.
 
-  Re-measured on the MERGED base after #1973 and **identical on every cell**: 8 traps at
-  `75eb1f17` (1,457,423), 6 with R1 alone (1,457,450), 5 with R2 alone (1,457,439), **0 with
-  both** (1,457,466); `runs` 228 and `check-clean invalid wasm` 8 unchanged across all four.
-  Stripping both rungs reproduces `75eb1f17` **byte-for-byte at 1,457,423**.
+  Re-measured on the merged base after #1973, and again after #1975, **identical on every
+  cell both times**: 8 traps at `811f8102` (1,461,131), 6 with R1 alone (1,461,158), 5 with
+  R2 alone (1,461,147), **0 with both** (1,461,174); `runs` 228 and `check-clean invalid
+  wasm` 8 unchanged across all four. Stripping both rungs reproduces `811f8102`
+  **byte-for-byte at 1,461,131**. #1973 and #1975 both changed list-literal element handling,
+  which is why this was re-taken rather than inherited — and neither moved a single cell of
+  this family.
 
 ---
 
 ### D228 — `is i32` is the ONE non-arm spelling the checker admits, and #1972 turned the program it admits from `runs` into a loud emit reject
-**loud emit reject · live on `a19a3db7` and on `75eb1f17` · RAN and printed the right answer on `16d5c6e7` — a `runs` → not-runs move introduced by #1972's D221 rung, on a program no census cell contains**
+**loud emit reject · live on `a19a3db7`, `75eb1f17` and `811f8102` · RAN and printed the right answer on `16d5c6e7` — a `runs` → not-runs move introduced by #1972's D221 rung, on a program no census cell contains**
 
 Repro (TWO lines):
 
     const g: f64 | null = 5.0
     if g is i32 { print(g) } else { print(0) }
     // `16d5c6e7`: runs, prints `0` — which is the CORRECT answer (`g` holds 5.0, not an i32).
-    // `a19a3db7` and `75eb1f17`: vl check rc 0, then
+    // `a19a3db7`, `75eb1f17` and `811f8102`: vl check rc 0, then
     //   emitProgram: narrowed union atom has no value box
     // Add `const h: i32 | null = 3` anywhere in the module and it RUNS again, printing `0`.
 
@@ -10464,8 +10496,12 @@ Repro (TWO lines):
 
 * **NO CENSUS CELL CONTAINS IT**, which is why #1972's all-blocks after-pass reported 0
   `runs` → not-runs truthfully. Measured: across **150,224** block-A cells, **9,000** block-D
-  cells and **2,327** corpus files — 161,551 programs — **not one** reaches any of
+  cells and **2,332** corpus files — 161,556 programs — **not one** reaches any of
   `vbHeapIdxOfKind`'s ten guards. The class had to be constructed by hand from the guard list.
+  Re-swept at `811f8102` after #1973 and #1975: still none. **This row is the first regression
+  found this session OUTSIDE the census population, which is a standing limit on what item 6
+  can promise** — a full cell-matched after-pass can report 0 `runs` → not-runs truthfully and
+  still miss a two-line program, because the grid has no cell shaped like it.
 
 ---
 
@@ -11371,8 +11407,8 @@ Repro:
 
 ---
 
-### D245 — a LIST whose element is an arm-valued MAP delivered through a parameter
-**check-clean invalid wasm · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N) · the map/list CROSS that no grid had: the seven earlier grids build the container as a map and read it directly, never as the ELEMENT of a list**
+### D245 — [CLOSED 2026-08-27 — see the re-grade note] a LIST whose element is an arm-valued MAP delivered through a parameter
+**closed · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N) · the map/list CROSS that no grid had: the seven earlier grids build the container as a map and read it directly, never as the ELEMENT of a list**
 
 Repro:
 
@@ -11397,6 +11433,24 @@ Repro:
   grid built at all.
 * Grid population: 6 of the 18 cells still silent in block N after this PR, all `elem=map`,
   module scope, `deliv` ∈ {param, ident, call}.
+
+* **RE-GRADE NOTE, 2026-08-27 (#1974) — THIS ROW WAS ALREADY STALE ON `811f8102`, ITS OWN
+  MERGE COMMIT.** `check-filed-witnesses.py --strict` run against **master's own copy of this
+  file** and **master's own seed** (`811f8102`, 1,461,131 bytes, proved fixpoint) reports it
+  MOVED: the repro above runs and prints `7`. So the staleness predates #1974 and is not
+  caused by it — #1974's own two rungs are bound tests on an EMPTY ref-list table and this
+  program interns one.
+
+  **The mechanism was NOT investigated here**, deliberately: this is #1975's row, filed in the
+  same landing that closed D157/D163, and the likeliest reading is that the row was written
+  against a pre-fix measurement and its own PR then closed it. Someone who owns that landing
+  should confirm which rung did it and whether the block-N population figure above still
+  holds. The status is corrected so the gate reflects the tree; the causal claim is left open
+  rather than guessed.
+
+  This is the inventory going stale one-directionally *inside a single PR*, which is a
+  sharper version of the failure `CLAUDE.md` already warns about — the doc was accurate when
+  the row was drafted and wrong by the time it merged.
 
 ---
 
