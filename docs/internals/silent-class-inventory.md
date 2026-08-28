@@ -10015,8 +10015,8 @@ first shape):
 
 ---
 
-### D200 — the union-BOX ↔ bare-ARM seam at a CALL boundary, in both directions
-**OPEN · check-clean invalid wasm on `1e81b0f3` AND on this branch · the residue this PR's own probe found and did NOT close: a THIRD struct-only resolver, on the argument-boxing path**
+### D200 — [CLOSED 2026-08-27 at its filed coordinate] the union-BOX ↔ bare-ARM seam at a CALL boundary, in both directions
+**closed · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` on `1e81b0f3` and on `322c07f2` · the residue #1968's probe found and did NOT close: a THIRD struct-only resolver, on the argument-boxing path · direction 2 (the value-call ABI gap) is still floored and now has its own row**
 
 Repro — direction 1, arm value into a union PARAMETER (seven lines; `vl check` clean,
 `Invalid input WebAssembly code … type mismatch: expected (ref null $type), found (ref
@@ -10086,6 +10086,42 @@ if (dd).r == 7 { print(7) } else { print(0) }
   the exact failure the floor exists to prevent. There is no exemption; the witness is
   `tests/cases/unions/arm-param-value-call-objlit-arg-floor.vl`.
 
+* **CLOSED 2026-08-27 — THE THIRD RESOLVER WAS THE ONE STORAGE CLASS WITH NO KIND GATE.**
+  The wrong answer is `structIndexOfExpr`'s `Ident` arm, through `globalStructIndexSid`.
+  Its three siblings all gate on the CELL's kind before reading a struct row —
+  `declaredStructIndex` on `localIsRef[slot]`, `capturedStructIndex` on `capturedKindOf`,
+  `paramStructIndex` on the annotation alone — and this reader's own VARIANT twin
+  `globalVariantIndexSid` states the contract for the pair in its header: *"gated on the cell
+  actually BEING the kind-8 variant so the two never both answer for one binding"*. With only
+  one half gated the two DID both answer. `structIndexOfLet`'s arena rung (`structIndexOfTy`,
+  whose own header warns it "finds the first row denoting this TYPE, which may be a
+  structurally identical TWIN") returned `Dot`'s row for a `: Circle` cell;
+  `emitUnionBoxArg`'s layout-twin test then compared `sHeapIdx[Dot]` with
+  `uVarHeap[Circle]`, found them different **by construction** — two namespaces on purpose —
+  and re-emitted the value field by field FROM `Dot`'s heap type. Disassembled on `322c07f2`:
+  `global.get 0` is `(ref $uVarHeap[Circle])` and the next instruction is `struct.get $Dot 0`.
+  The fix is one kind gate, in the shape the three siblings already have.
+* **THE ROW FILED ONE DESTINATION AND THERE ARE FIVE.** Block Q
+  (`scripts/silent-sweep/d243/genbox.py --block Q`, producer × destination × layout twin,
+  160 cells) crosses the axis the row's three controls held fixed. At
+  `src=global-annotated × twin=exact`, **five** destinations were silent, not one: the union
+  PARAMETER this row files, a union-typed module GLOBAL assignment, a union-typed LOCAL, a
+  `Shape[]` ELEMENT and a `{[string]: Shape}` VALUE. All five close on the one gate, all five
+  are pinned in `tests/cases/unions/arm-global-into-box-position-twin.vl`.
+* **MEASURED.** Block Q: the gate ALONE moves **5** cells (`check-clean invalid wasm → runs`),
+  **0** `runs` lost, **0** into silence. Block P (3,200 list-container cells): **0** either
+  way — it is load-bearing in exactly one of the two populations, which is why the direction
+  check matters and a candidate that moves 0 in one block is not thereby inert. Corpus: 0
+  bytes attributable to this cut. D202, the refutation pin whose whole content is that a
+  plain-struct twin must keep flowing through a closure annotation that names the STRUCT,
+  still RUNS — a `: Dot` global is a `struct` cell, so the gate passes it.
+* **WHAT IS NOT CLOSED, and it is two roots rather than one residue.** Direction 2 (a BOX
+  value into an arm-typed closure PARAMETER) is still the floor `emitProgram: value-call
+  union-ARM parameter given a value that is not that arm`; its remaining reachable shapes are
+  **D269**. The same five box destinations fed by a CALL rather than by a global are
+  **D267**. An INFERRED-result callee returning the struct twin into an arm-typed position is
+  **D268**.
+
 ---
 
 ### D201 — the corpus cannot witness this family at all
@@ -10136,6 +10172,109 @@ program where a union also exists — prints 7 on this tree and on `1e81b0f3`):
   fixes: claiming the ARM's variant row for a program that means the plain STRUCT of the same
   layout. `variantRowOfTy` matches by arena index only, so it declines here — and this pin is
   what says so by running rather than by argument.
+
+---
+
+### D267 — the same five box destinations fed by a CALL: `structIndexOfExpr`'s CALL arm has no kind gate either
+**check-clean invalid wasm on `322c07f2` and on this branch · D200's cut is the `Ident` arm's gate and this is the arm beside it · found 2026-08-27 by block Q, the producer × destination cross D200's three controls held fixed**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function mkc(): Circle { { r: 7 } }
+    function area(s: Shape) { if s is Circle { return s.r } else { return 0 } }
+    if area(mkc()) == 7 { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE SAME SEAM AND THE SAME WRONG ANSWER, ONE ARM OVER.** Disassembled on this branch the
+  start function is `call $mkc ; struct.get $Dot 0 ; struct.new $uVarHeap[Circle] ;
+  struct.new $uBox` — `mkc`'s functype result is `(ref $uVarHeap[Circle])` and the field is
+  read out of it as `Dot`. That is `emitUnionBoxArg`'s layout-twin test again, but the row it
+  compares against comes from `structIndexOfExpr`'s **`Call`** arm, which D200's gate does not
+  touch: `fnRetStructIndexSid` is kind-gated and declines, and the `nodeTyIsObj` fallback
+  ladder below it then resolves the call's recorded `{r: i32}` through `repRowOfTyStruct` to
+  `Dot`'s row.
+* **THE POPULATION IS FIVE CELLS, the same five D200's own gate closed for a global**: the
+  union PARAMETER above, a union-typed module GLOBAL assignment, a union-typed LOCAL, a
+  `Shape[]` element and a `{[string]: Shape}` value (block Q `q00027`, `q00059`, `q00075`,
+  `q00091`, `q00107`, all `src=call × twin=exact`).
+* **THE TWIN IS THE DISGUISE, MEASURED**: delete `type Dot` and every one of the five RUNS,
+  which is why no corpus program witnesses this (D201's population note).
+* **NOT FIXED HERE, AND THE REASON IS THAT THE GATE HAS NO COLUMN TO READ.** `globalCellKind`
+  is the very function that writes the global's cell, so gating on it makes the reader and
+  the cell agree by construction; a CALL has no cell, and the candidate discriminator —
+  "`exprVariantIndex` already answered from a REP-authoritative source, so the twin test
+  cannot be right" — is exactly the claim `letIsVariant`'s header makes about the guard D26
+  DELETED, and applying it here would need the population that makes `emitUnionBoxArg`'s twin
+  test right in the first place to be named. It is one `if`; it is not one measurement.
+
+---
+
+### D268 — an INFERRED-result callee returns the struct TWIN into an ARM-typed position, with no box anywhere
+**check-clean invalid wasm on `322c07f2` and on this branch · found 2026-08-27 by block Q · NOT D267: there is no union box in the emitted module at all, so `emitUnionBoxArg` is not on the path**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Dot = { r: i32 }
+    function mkc() { { r: 7 } }
+    function idc(x: Circle): Circle { x }
+    if idc(mkc()).r == 7 { print(7) } else { print(0) }
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **THE DISASSEMBLY IS WHAT SEPARATES IT FROM D267.** `mkc`'s functype is `(func (result (ref
+  $Dot)))` and `idc`'s is `(func (param (ref $uVarHeap[Circle])) (result (ref
+  $uVarHeap[Circle])))`. Two direct calls, one argument, and no `$uBox` in the module: the
+  INFERRED return resolved the anonymous `{ r: 7 }` through the struct table (`Dot`) while the
+  consumer's annotation names the arm. D267's module has the box and the field-copy; this one
+  has neither.
+* **IT IS D39's CHANNEL AT THE INFERRED-RETURN POSITION.** The anonymous shape has two nominal
+  claimants and only the CONTEXT separates them; `criClassify`'s inferred-return rung has no
+  context, so it takes the struct table's answer. `synthRetPinAnn` is the pin that exists for
+  exactly this and it declines here, because `mkc` has no result ANNOTATION to pin from —
+  annotate it `: Circle` and the program is D267 instead, which is the control that says the
+  two rows are two.
+* **THREE CELLS, all `src=callinf × twin=exact`**: the arm-typed PARAMETER above (`q00125`), a
+  `Circle[]` element (`q00157`), and an arm-typed parameter whose function RETURNS the union
+  (`q00045`). Delete `type Dot` and all three RUN.
+
+---
+
+### D269 — direction 2 of D200: the shapes still under the value-call arm floor
+**loud emit reject (`emitProgram: value-call union-ARM parameter given a value that is not that arm`) on `322c07f2` and on this branch · D200's second witness, re-filed as its own row because D244 removed one of its three shapes and the floor's coverage must not shrink silently**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    const lamc = (x: Circle) => x
+    function m3(s: Shape) { if s is Circle { lamc(s).r } else { 0 } }
+    print(m3({ r: 7 }))
+
+* **THE FLOOR IS THE RIGHT OUTCOME TODAY AND THE ROW IS THE LIFT.** `emitCallRef` has a
+  `union`-parameter arm (`emitUnionBoxArg`, which boxes an un-boxed member) and no
+  `variant`-parameter arm at all, so a value that reps as the box would be pushed raw into a
+  `(ref $uVarHeap[Circle])` slot. Without the floor that is check-clean INVALID WASM, which is
+  why the floor was added rather than the reject being called a bug.
+* **A NARROW DOES NOT RE-REP A BINDING**, which is what this shape adds over the other two: `s`
+  is still the `{tag, value}` box at the call site; the `is` proves WHICH arm rides the
+  payload, and the value-call has no arm to hand it to.
+* **THE THREE SHAPES THE FLOOR NAMED ARE NOW TWO.** D244 stopped an un-annotated module global
+  repping as the box, so `const c = { r: 7 }` + `lamc(c)` RUNS and
+  `arm-param-value-call-box-arg-floor.vl` graduated to `@run`. The bare object LITERAL argument
+  (`arm-param-value-call-objlit-arg-floor.vl`) and the narrowed binding above
+  (`arm-param-value-call-narrowed-arg-floor.vl`, added in the same landing) are still floored,
+  and each now has a file so the population is countable rather than prose.
+* **THE DIRECT-CALL TWIN OF THESE FIVE LINES RUNS** — replace the lambda with `function idc(x:
+  Circle): Circle { x }` — so this is a value-call ABI gap, not an arm-resolution one.
 
 ---
 
@@ -11347,8 +11486,8 @@ Repro:
 
 ---
 
-### D243 — the ELEMENT scan of `dstPinPushAnn` is ONE list level deep, so a `Circle[][][]` destination pins nothing
-**check-clean invalid wasm · found 2026-08-27 while closing D184, by asking the SAME question one container further out · the rung D184 added answers for this spelling and never sees it, so this is the SCAN's depth and not the predicate's**
+### D243 — [CLOSED 2026-08-27] the ELEMENT scan of `dstPinPushAnn` is ONE list level deep, so a `Circle[][][]` destination pins nothing
+**closed · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` on `322c07f2` · found 2026-08-27 while closing D184, by asking the SAME question one container further out · the rung D184 added answers for this spelling and never sees it, so this is the SCAN's depth and not the predicate's**
 
 Repro:
 
@@ -11376,10 +11515,39 @@ Repro:
   (`const c: Circle[][] = [lv1]`) is D184 and now RUNS; the depth-3 form above is unchanged
   in both directions, so this row is neither caused nor moved by that change.
 
+* **CLOSED 2026-08-27 — the scan became a DEPTH.** `dstPinPushAnn`'s element arm is now
+  `dstPinElemDepthAt`, which answers *how many list levels below the destination the binding
+  sits*, and `dstPinElemAnnName`, which cuts the destination's annotation that many times
+  (`retRefArrElemName` takes the first cut, which has a node to read; `arrElemNameRaw` — the
+  one home of the string cut — takes the rest). The pinned SPELLING has to match the level or
+  the pin is a different program, which is why it is a depth and not a boolean.
+* **THE SECOND WAY DOWN A LEVEL HAD NO GRID BEHIND IT.** A nested `ArrayLit` (`[[lv1]]`) is
+  the one this row was filed on. The other is an UN-ANNOTATED BINDING whose initializer is a
+  list literal (`const mid = [lv1]` … `const c: Circle[][] = [mid]`) — `dstPinLocalDest`'s
+  `letType >= 0` guard already kept such a binding from recording a `""` DISAGREEMENT, so it
+  also contributed no destination and the binding it links had **none at all**. That is the
+  same "an un-annotated binding is a LINK in the chain, not the end of it" rule the
+  whole-value alias walk has always applied, asked one container out. 18 of the 69 cells this
+  cut moves are that shape and no earlier grid generated one.
+* **MEASURED.** Block P (3,200 cells, `scripts/silent-sweep/d243/genbox.py --block P`): the
+  cut ALONE moves **69** cells, all `check-clean invalid wasm → runs`, **0** `runs` lost and
+  **0** into silence. Block Q (160): 0 either way. Corpus: 2,330 of 2,332 modules
+  byte-identical (the two that move are the two floor fixtures the PR graduates, neither
+  from this cut). Fixtures: `tests/cases/unions/arm-list-elem-pin-at-depth.vl`, whose three
+  cells are generated cells `p01102` (this repro), `p01194` (depth 4 — a bound at 3 cannot
+  tell "fixed" from "fixed one level further out") and `p01154` (the binding conduit).
+* **#1973's DROPPED GATE A STILL HAS NO WITNESSES, re-measured against this deeper cut.**
+  Widening `armPinAnnName`'s own ref-list rung to `pinArmListName(rae)` — dropped by #1973 as
+  reachable but inert — moves **0 of 3,200** block-P cells, **0 of 160** block-Q cells and
+  **0 of 2,332** corpus modules with A+B+C in place. The reason it stays inert is now
+  written down at the rung: this cut lands on the ELEMENT side (`dstPinElemAnnName`, which
+  carries `pinArmListName` already), and gate A is the WHOLE-VALUE side, whose producer set
+  (`armPinLitInit`) is unchanged.
+
 ---
 
-### D244 — an ARM-shaped object literal bound to a local and put in a list, with NOTHING annotated and NO twin
-**check-clean invalid wasm · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N), at a coordinate with no annotation anywhere in the program · six lines, and the arm is the ONLY claimant**
+### D244 — [CLOSED 2026-08-27] an ARM-shaped object literal bound to a local and put in a list, with NOTHING annotated and NO twin
+**closed · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` on `322c07f2` · found 2026-08-27 by the LIST-CONTAINER grid built for D184 (block N), at a coordinate with no annotation anywhere in the program · six lines, and the arm is the ONLY claimant**
 
 Repro:
 
@@ -11404,6 +11572,41 @@ Repro:
   annotation that makes the pin fire; strip the annotation and the program is this row.
 * Grid population: 12 of the 18 cells still silent in the 640-cell block N after this PR,
   all `elem=bare`, module scope, at every one of the four nominal-ingredient levels.
+
+* **CLOSED 2026-08-27 — AND THE ROW'S OWN MECHANISM CLAIM WAS HALF RIGHT.** `arrLitIsRef`'s
+  nominal rung does claim `[iv]` and the literal does build a kind-1 arm list; what the row
+  called "the element the reader gets is the wrong heap" is, disassembled, the PRODUCER's
+  heap: `iv` is a module GLOBAL whose cell is the `{tag, value}` BOX, and `array.new_fixed`
+  pushes that box into an `(array (mut (ref null $uVarHeap[Circle])))`. The un-annotated LOCAL
+  the row identified as load-bearing is load-bearing for that reason — **`escope` is the
+  axis**, and the function-scope twin of these six lines has always RUN.
+* **THE CUT IS THE THIRD STORAGE CLASS OF A RULE THE OTHER TWO ALREADY CARRIED (D51).**
+  `collectLocals` asks `structIndexOfLet < 0 && letObjLitVariantIdx >= 0` and binds the kind-8
+  ARM; `criClassify`'s return rung asks it of a function result. `globalKind`'s `ObjLit` arm
+  asked neither and fell to `if uDeclared { return "union" }`. It now asks the same question
+  through the same helper (`objLitVariantIdxNoStructRow`, whose header already states the
+  precondition that makes a field-set claim safe: the struct table has NO row for the shape,
+  so the arm is the only nominal claimant), and `globalCellStructIdx`'s un-annotated leg reads
+  the SAME helper so the cell's kind and its slot cannot drift. **Where a layout twin IS
+  declared nothing moves** — `structIndexOfObj` answers first and the cell stays a `struct`,
+  which is D39's own ruling.
+* **MEASURED.** Block P: the cut ALONE moves **12** cells (`check-clean invalid wasm → runs`),
+  **0** `runs` lost, **0** into silence. Block Q: **2** more, one of them `loud emit reject →
+  runs`. **9 of the 12 block-P cells are ALSO closed by D243's cut alone** — at depth ≥ 3 the
+  program runs either because the producer stops repping as the box or because the pin names
+  the arm — and the two compose without cancelling (`|A ∪ B| = 72 = |A+B+C|`, set-identical).
+* **IT LIFTS TWO FLOOR PINS, both of which asked to be flipped in their own headers**:
+  `tests/cases/unions/arm-param-value-call-box-arg-floor.vl` ("flip this file to `@run` when
+  the value call learns to build the arm" — it is now handed one instead) and
+  `variant-fieldset-twin-anon-shape-floor.vl` ("flip it when the floor lifts"). The
+  load-bearing `collectAnonShapes` guard whose deletion reddens 7 `@run` corpus rows is
+  **untouched**: the repair gives the CELL the variant context, not the anon pass. The first
+  floor's other two shapes are still floored and now have a file each — the ObjLit argument
+  (pre-existing) and the `is`-NARROWED union binding
+  (`arm-param-value-call-narrowed-arg-floor.vl`, added so the floor's coverage could not
+  shrink silently). Regression fixture:
+  `tests/cases/unions/arm-objlit-global-cell-no-twin.vl` (generated cell `p00192`, its
+  function-scope control, and the LOUD disguise of the same root).
 
 ---
 

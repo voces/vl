@@ -277,6 +277,18 @@ run has named a backward set, that set copies into its own cell directory and re
 any new seed in seconds (12 cells, ~10 `vl` invocations). Use it to answer "is D211 still live?"
 without re-running 150,224 cells — it is how this row was confirmed live on `e04b1567`.
 
+**The named sets live here.** A per-row grid works the same way once it has named its movers:
+`d243-moved.json` is the 79 cells D243/D244/D200's landing moved (every one `-> runs`, so a
+later seed that does not run one of them has LOST it), materialised by
+`scripts/silent-sweep/d243/mkset.py` and graded by `gradecensus.py` like any other block in
+~158 invocations. A named set is a list of COORDINATES the generator reproduces, never a copy
+of its output — `mkset.py` re-checks each name against the grid's own manifest and refuses if
+the generator has changed under it, which is the drift a committed copy would hide.
+
+**A named set is not the after-pass and does not stand in for it.** It answers "did the cells
+this change fixed stay fixed", which is the forward direction; the after-pass answers "did any
+cell get worse", over a population the row's own grid does not contain.
+
 ## Resource discipline
 
 Four concurrent `vl` invocations, the same bound `scripts/silent-sweep/REPRODUCE.md` fixes.
