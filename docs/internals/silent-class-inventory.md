@@ -12598,7 +12598,7 @@ Repro:
 ---
 
 ### D282 — the read's `??` DEFAULT is the only nominal claim, and the container was filled through an un-annotated PARAMETER
-**[CLOSED 2026-08-28] the repro below RUNS and prints `7`. Was: check-clean invalid wasm on `474b6a1b` and on every generation before it · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · it was THE SPECIMEN (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`), now re-pointed at D209**
+**[CLOSED 2026-08-28] the repro below RUNS and prints `7`. Was: check-clean invalid wasm on `474b6a1b` and on every generation before it · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · it was THE SPECIMEN (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`), re-pointed at D209 — and re-pointed TWICE more the same day, at D224 when D209 closed and at **D291** when D224 closed too; the slot's genealogy now records THREE selection rules that each failed within a day of being written, and the fourth is a census rather than a choice**
 
 Repro (ten lines, and NO layout twin is declared anywhere):
 
@@ -12705,6 +12705,15 @@ Repro (ten lines, and NO layout twin is declared anywhere):
   against the mechanisms a family HAS is choosing against the candidates again, one level up. The
   successor therefore leaves the family by a CHECKABLE property rather than an argued one: D209
   declares no union at all, so `uVariants` is empty and this whole seam is counted at `entries=0`.
+
+  **AND THAT RULE FAILED TOO, WITHIN A DAY — the property HELD and the row closed anyway.**
+  `uVariants` stayed empty on D209 and nothing in this family touched it; what closed it was a
+  three-rung CHANNEL at the code-16 READ (D209's own row), which this family does not reach.
+  Leaving a family is not leaving the reach of every future argument. The slot's fourth rule
+  stops choosing: every one of this document's rows now has its OWN filed program run against the
+  tree at each swap, and the successor is whichever row is the only remaining member of the class
+  — a census, which cannot be wrong about the population even when it is uninformative about
+  durability.
 
 ---
 
