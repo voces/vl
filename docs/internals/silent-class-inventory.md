@@ -9572,6 +9572,11 @@ Repro (three lines, and the third is the whole pin):
   flips with it; the two ANNOTATED controls (`const lv1: Circle[] = …` and
   `const c: Circle[] = [{ r: 7 }]`) do NOT flip, which is what says the missing input is the
   `Ident` hop and not the tightening itself.
+* **NOT MOVED BY D209's CLOSE (2026-08-28), and that is a mechanism rather than a grid's
+  zero.** The close is a READ-side channel; a counter build of it reads `reach=0` on this
+  program — its predicate is not even reached, because nothing here READS the adopted field.
+  The pin's fixture is one of the three corpus modules the close's `cmp` moves, and it still
+  prints all six of its `7`s.
 * Pinned as a fixture: programs 2 and 3 of
   `tests/cases/soundness/anon-literal-adopted-by-a-declared-box-field.vl` (the `Circle[][]`
   spelling and the `Circle[]` one).
@@ -9613,23 +9618,34 @@ Repro (four lines, and the third is the whole pin):
   grid, `d156` (1,188), `d88` (2,850) or `d112` (1,114)** — 57,492 cells, every one of which
   reads the field BARE. The corpus `cmp` cannot see it either: it is byte-identical because
   the corpus holds no program of this shape.
+* **D209 CLOSED 2026-08-28 AND THIS PIN STILL RUNS — all 72 of them.** The close pairs the
+  read-site unbox with `exprUnion` and with the coercion's atom pick, so the read delivers the
+  atom and the consumer boxes it again; disassembled, `global.set` here now receives
+  `struct.new $uBox (i32.const 0) (struct.new $vbI32 (struct.get $vbI32 0 (ref.cast …)))` where
+  master passed the box through. The whole 1,260-cell grid moves **+24 `check-clean invalid
+  wasm` → `runs`, 0 lost, 0 into silent**. The counter build reads
+  `reach=4 ans=4 readfire=1 exprdecl=2 coercefire=1` on this program: all three ends fire on the
+  program that refuted the last candidate, and it runs.
 * Pinned as a fixture: programs 4 and 5 of
   `tests/cases/soundness/anon-literal-adopted-by-a-declared-box-field.vl`. The grid is
   `scripts/silent-sweep/d272/gen272.py` and the 72 cells are named in `runs-lost.txt` beside
-  it; re-grade THAT set against any new D209 candidate before rebuilding anything.
+  it; re-grade THAT set against any new D209 candidate before rebuilding anything. **Its
+  successor is `scripts/silent-sweep/d290`**, which adds the axis this grid holds fixed — the
+  literal PAYLOAD beside the field spelling — and found 8 cells this one could not.
 
 ---
 
 ### D209 — a declared struct CAPTURES an anonymous literal the checker never widened
-**check-clean invalid wasm · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · THE SPECIMEN as of 2026-08-28 — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `tests/cases/soundness/xfail-miscompile-declared-struct-captures-anon-list-element.vl`, chosen because it DECLARES NO UNION (the variant⇄struct seam behind D33/D139/D156/D158/D171/D280/D282 is counted at `entries=0` on it) and because two candidate fixes have been built, priced and declined · OPEN, and now with TWO candidate fixes BUILT AND MEASURED AND BOTH REFUSED — the RESOLVER side (pin D271) and the READ side (pin D272), each refuted by a program it takes from `runs` to check-clean invalid wasm · its RESOLVER half is SEPARABLE and shipped 2026-08-27 as D208's close, which is measured NOT to move this row; D158 is a different root (measured — neither changed line is reached on its program)**
+**[CLOSED 2026-08-28] the filed repro RUNS and prints `7` · was `check-clean invalid wasm` · found 2026-08-27 while minimising D203 · the ROOT the whole family sits on, reachable with no container at all · closed by THREE rungs on ONE predicate, and all seven partial compositions were built and graded — the row's own predicted two-rung close (read site + `exprUnion`) is measurably NOT sufficient, and the 8 cells it costs are pinned as D290 · the i64/f64 sub-family is DELIBERATELY not closed and is filed as D291 · both refutation pins (D271 resolver-side, D272 read-side) still run · **IT WAS THE SPECIMEN** (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `xfail-miscompile-declared-struct-captures-anon-list-element.vl`, chosen 2026-08-28 because it DECLARES NO UNION and the variant⇄struct family's mechanisms were therefore structurally inapplicable to it — a property that HELD; the close came from the code-16 READ, which that family does not reach). That pin is deleted here, the program graduated to `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl`, and the slot is re-pointed at **D291**, chosen because a re-run of all 136 rows' own filed programs makes it the ONLY live member of the class.**
 
 Repro:
 
     type Circle = { r: i32 | null }
     const lv1 = [{ r: 7 }]
     print((lv1[0]).r)
-    // vl check rc 0 with NO diagnostics; vl run:
+    // `f6fda728`: vl check rc 0 with NO diagnostics; vl run:
     //   type mismatch: expected i32, found (ref $type)
+    // Now: 7
 
 * **DELETE THE `type Circle` LINE AND IT PRINTS 7.** The declaration is not used, not
   annotated onto anything, and not mentioned by the binding — its mere presence changes how
@@ -9737,13 +9753,22 @@ Repro:
   candidate loses are NAMED in `runs-lost.txt` beside it — so the next attempt at this row
   re-grades that set in ~72 invocations instead of rebuilding the grid.
 
-* **WHAT WOULD CLOSE IT, and why it is not one rung.** Both candidates fail on the same
-  missing input — the read's REP claim and the checker's TYPE for it disagree, and each fix
-  patches one end while the other end still believes the old answer. A close has to move them
-  together: `exprUnion` (the classifier every box consumer asks) and the read site would both
-  have to answer from the checker's recorded type, so that a read typed as a bare atom unboxes
-  AND re-boxes at the coercion. That is a channel decision at a classifier with 28 call sites,
-  not a rung, and it wants its own grid — with `read` on it.
+* **WHAT WOULD CLOSE IT, and why it is not one rung — the prediction, kept verbatim, and it
+  was HALF RIGHT.** Both candidates fail on the same missing input — the read's REP claim and
+  the checker's TYPE for it disagree, and each fix patches one end while the other end still
+  believes the old answer. A close has to move them together: `exprUnion` (the classifier every
+  box consumer asks) and the read site would both have to answer from the checker's recorded
+  type, so that a read typed as a bare atom unboxes AND re-boxes at the coercion. That is a
+  channel decision at a classifier with 28 call sites, not a rung, and it wants its own grid —
+  with `read` on it.
+
+  **THE GRID WAS BUILT AND THE PAIRING IS NOT ENOUGH.** `read site + exprUnion` — exactly the
+  two ends named above — loses **8 running programs** on the 714-cell channel grid below, every
+  one at `string | i32`. Re-boxing "at the coercion" is not a consequence of `exprUnion`
+  answering false: `emitUnionCoerce`'s atom ladder classifies the EXPRESSION, and every arm of
+  it still reads an un-narrowed code-16 member as the box and declines, so the value fell to the
+  ladder's numeric default and `struct.new $vbI32` was applied to a string ref. The coercion's
+  ATOM PICK is a third end of the same channel. Pinned as **D290**.
 
 * **THE i64/f64 SUB-FAMILY, where THREE atoms disagree.** `type Circle = { r: i64 | null }`
   beside the same `const lv1 = [{ r: 7 }]`: the field's declared member is i64, the emitter
@@ -9774,6 +9799,212 @@ Repro:
   is exactly the 37 cells `C + G` moves**, with no cell where the pair's class differs from
   the single's. No interaction in either direction — which is what licenses shipping `G`
   alone. **`G` shipped; `C` did not.**
+
+* **THE CLOSE — THREE RUNGS ON ONE PREDICATE (2026-08-28).** `memReadUnboxAtomKind(memIx, fnIx)`
+  answers *the value ATOM an un-narrowed code-16 field read is DELIVERED as*, or -1 for "the box
+  unchanged". Three sites ask it and none of them re-derives it, which is the whole point — the
+  two refused candidates each moved one end while the others kept believing the old answer:
+
+  | rung | site | what it does |
+  |---|---|---|
+  | **R** | `emitUnionFieldNarrowUnbox` (`wasmEmit`) | the read UNBOXES to that atom — `struct.get $uBox 1`, `ref.cast`, `struct.get`, the same three instructions the NARROWED read already emits |
+  | **X** | `exprUnion`'s `Member` arm (`emit_classify`) | the read is no longer a union VALUE, so every box consumer knows it must box |
+  | **B** | `emitUnionCoerce`'s `cak` ladder (`wasmEmit`) | the box's atom comes from the predicate, not from re-classifying an expression the ladder cannot see |
+
+  **THE PREDICATE HAS THREE CONDITIONS AND THE THIRD IS THE ONE THE REFUSED CANDIDATE LACKED.**
+  (1) the read is UN-narrowed — the narrowed path has its own unbox and `exprUnion` already
+  declines for it; (2) the CHECKER banked a primitive value atom at the read node — the D209
+  asymmetry itself; (3) **the box can actually HOLD that atom** (`unionHasAtom` over the field's
+  own member set). Condition 3 is why `C` lost 72 cells and `R` loses 36: without it the
+  i64/f64 sub-family unboxes to an atom the store never boxed. See D291.
+
+* **MEASURED — FOUR INSTRUMENTS, and the corpus `cmp` first.**
+
+  | instrument | population | `runs` LOST | into silent | forward |
+  |---|---|---|---|---|
+  | corpus `cmp`, byte-for-byte | **1,909 modules built** of 2,341 files | — | — | **1,906 identical, and ZERO pre-existing modules move.** The three movers are all this change's own: its new fixture, D271/D272's pin fixture (bytes change, behaviour does not — still six `7`s), and the `--codegen` specimen pin it deletes |
+  | the **d272 READ grid** — the axis that refuted the last candidate | 1,260 | **0** | **0** | **+24** `check-clean invalid wasm → runs` |
+  | the **d290 CHANNEL grid** (`shape × cons × cont × annpat`), built for this cut | 714 | **0** | **0** | **+25** `check-clean invalid wasm → runs` |
+  | the **DISTILLED census** (1,477 representatives for 250,703 cells) + its `named/` half (380 curated, incl. D272's 72, D224's 207, D282's 36 and D300's 65) | 1,857 | **0** | **0** | 0 — *no cell changed class* |
+
+  **THE DISASSEMBLY, in this row.** On this row's own repro, `base` hands
+  `struct.get $C1 0` — a `(ref $uBox)` — straight to `__print_i32__`. After:
+  `struct.get $C1 0` · `struct.get $uBox 1` · `ref.cast (ref $vbI32)` · `struct.get $vbI32 0`.
+  On **D272's pin** the same read unboxes and the consumer RE-BOXES it —
+  `struct.new $uBox (i32.const 0) (struct.new $vbI32 (struct.get $vbI32 0 (ref.cast … )))` where
+  base passed the box through. That round trip is the landing's whole cost, and it is one
+  allocation at an adopted read whose consumer wants a box.
+
+  **THE COUNTERS, which is why the corpus `cmp` is a mechanism and not a coincidence.** A
+  counter build over the whole corpus: the predicate is **REACHED 502 times across 81 files**
+  and **ANSWERS 27 times in exactly THREE files** — and those three are, cell for cell, the
+  three modules `cmp` moves. The rung answers nowhere else in 2,341 files, so the byte-identity
+  is a consequence rather than a coincidence. Per program: this row's repro `reach=1 ans=1 readfire=1 exprdecl=0 coercefire=0`;
+  **D271's pin `reach=0`** — the predicate is not even reached, so this close provably cannot
+  move that row; D272's pin `reach=4 ans=4 readfire=1 exprdecl=2 coercefire=1`, all three ends
+  firing on the program the last candidate reddened; the i64 spelling `reach=1 ans=0` — reached
+  and DECLINED by condition 3, the guard proving itself.
+
+* **ABLATION BY STRIPPING — all seven compositions, and both direction checks.** Stripping all
+  three rungs reproduces master `f6fda728` **byte-for-byte at 1,463,129**, `cmp`-proved against
+  the tree's own build rather than assumed.
+
+  | compiler | bytes | d272 →runs | d272 runs LOST | d290 →runs | d290 runs LOST |
+  |---|---|---|---|---|---|
+  | base (strip all) | 1,463,129 | — | — | — | — |
+  | `R` alone | 1,463,690 | +24 | **36** | +15 | **60** |
+  | `X` alone | 1,463,667 | 0 | **36** | 0 | **60** |
+  | `B` alone | 1,463,675 | 0 | 0 | 0 | 0 |
+  | `R + B` | 1,463,714 | +24 | **36** | +15 | **60** |
+  | `X + B` | 1,463,691 | 0 | **36** | 0 | **60** |
+  | `R + X` | 1,463,706 | +24 | **0** | +25 | **8** |
+  | **`R + X + B`** (shipped) | **1,463,730** | **+24** | **0** | **+25** | **0** |
+
+  **DIRECTION CHECK 1 — a rung that scores ZERO on every population and is still load-bearing.**
+  `B` alone moves **0 of 1,974 cells in either direction** on the two grids, AND its corpus is
+  byte-identical on **1,907 of 1,907** buildable modules — a complete no-op on every population
+  this change measures. Strip it from the landing and 8 cells redden. A per-rung "it moves
+  nothing" is not a reason to drop a rung; it is a reason to ask what it holds up.
+
+  **DIRECTION CHECK 2 — one alone is a catastrophe.** `X` alone loses 60 cells and gains
+  **nothing**: the classifier stops calling the read a union while the read still emits the box,
+  which is the refused read-side candidate with the sign flipped.
+
+  **IT IS NOT A BUNDLE, AND THAT IS THE SAME TEST D224 FAILED — WITH THE OPPOSITE SIGN (D300 /
+  #1985).** The failure mode there was a composition priced as a unit whose parts were
+  separable: its two rungs' movers intersected in **0** cells and *the union of the singles WAS
+  the pair, cell-identical*, so the 199 was really 134 + 65. Run the identical check here:
+
+  * **No strict subset is loss-free.** Over both grids together `R` loses 96, `X` 96, `R+B` 96,
+    `X+B` 96, `R+X` 8, `B` 0-but-moves-nothing; only the whole of `{R, X, B}` loses 0. The
+    minimal loss-free composition IS the landing.
+  * **`R+B`'s moved set is CELL-IDENTICAL to `R`'s, and `X+B`'s to `X`'s** (60 = 60 and 36 = 36
+    on d272; 87 = 87 and 60 = 60 on d290). So `B` is not an independently priceable part — it
+    is provably inert until both of the other two are present, which is the mechanical form of
+    direction check 1.
+  * **The union of the singles is NOT the pair.** `|R ∪ X|` is 60 on d272 and 87 on d290 while
+    the PAIR moves 24 and 33 — the two rungs' movers overlap in 36 and 60 cells respectively,
+    and those are cells each single BREAKS and the other REPAIRS. D224's bundle was additive;
+    this is strongly interactive in the opposite direction, which is exactly why no partial
+    landing is available.
+
+* Fixture: `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl` — seven programs, and
+  it passes ONLY on the three-rung composition (base, `R`, `X` and `R + X` all fail it).
+  D271/D272's own fixture is unchanged and still runs.
+* The grid is `scripts/silent-sweep/d290/gen290.py`; the 60 cells any partial composition costs
+  (8 of them under the two-rung pairing) and the 25 the close buys are named in
+  `runs-lost.txt` beside it, in `scripts/silent-sweep/census/d290-channel-price.json`, and whole
+  in `scripts/silent-sweep/distilled/named/` — so `scripts/gate.sh` re-grades them.
+
+---
+### D290 — A REFUTATION PIN: the STRING atom through the adopted read, which D209's own predicted TWO-RUNG close reddens
+**A REFUTATION PIN: it runs today and must keep running · found 2026-08-28 closing D209, as 8 of a 714-cell channel grid · it printed `7` on `474b6a1b`, on `f6fda728` and prints `7` now; it goes check-clean INVALID WASM under the composition `read site + exprUnion` that D209's row named as the close**
+
+Repro (four lines, and the difference from D272's pin is one atom):
+
+    type Circle = { r: string | i32 }
+    const v = { r: "7" }
+    const q: string | i32 = (v).r
+    if q is string { print(q) } else { print(0) }
+
+* **WHY A PIN AND NOT A DEFECT REPRO.** Nothing here is wrong. The adoption boxes `r` as the
+  string arm, the consumer is a union slot, and the program has run on every compiler this repo
+  has shipped. D209's close makes the READ deliver the bare string ref and the CONSUMER box it
+  again, and the round trip is transparent — *provided the consumer knows the atom is `string`*.
+* **WHAT IT PINS, precisely.** `emitUnionCoerce`'s `cak` ladder classifies the EXPRESSION
+  (`exprString`, `exprIsI64`, `exprIsBool`, …), and every one of those arms reads an un-narrowed
+  code-16 member as the BOX and declines. With `exprUnion` no longer claiming the read, the value
+  falls past the whole ladder to its numeric default `cak = 0` and `struct.new $vbI32` is applied
+  to a string ref: `vl check` rc 0, *expected i32, found (ref $type)*. **The day someone moves the
+  read site and `exprUnion` without moving the coercion's atom pick, this flips.**
+* **IT IS THE SAME SHAPE AS D272, ONE CLASSIFIER FURTHER OUT, and that is the finding.** D272 said
+  the read cannot see its consumer. This says the consumer, having been told the value is not a
+  box, still cannot see *what atom it is* — because the only place that knows is the predicate the
+  read used. Three sites, one answer, or a cell reddens; two of the three is not "most of the way".
+* **THE POPULATION IT STANDS FOR.** Under `read + exprUnion`, **8 of the channel grid's 714 cells
+  go from `runs` to `check-clean invalid wasm`**, all 8 in a silent class: `shape=string|i32` ×
+  `cons ∈ {tounion, tofld, arg, ret}` × `cont ∈ {bare, list}` × `annpat=none`. **Zero of them are
+  visible to the 1,260-cell d272 grid** — its `unis` level is `i32 | string` with the payload
+  pinned at `7`, so every one of its cells exercises the i32 default that happens to be right —
+  nor to census blocks C or D, nor to the corpus `cmp`, which is byte-identical because the corpus
+  holds no program of this shape.
+* **AND THE WIDER SET: 60 cells that ANY partial composition costs.** `R` alone, `X` alone, `R+B`
+  and `X+B` each take the same **60** cells from `runs` to check-clean invalid wasm — the 8 above
+  plus `shape ∈ {i32|null, i32|string, i32|i64, boolean|i32, f64|string}` at the same five
+  box-wanting consumers. All 60 run under the shipped three-rung composition. They are named in
+  `scripts/silent-sweep/d290/runs-lost.txt` and `scripts/silent-sweep/census/d290-channel-price.json`,
+  and kept whole in `scripts/silent-sweep/distilled/named/`.
+* Pinned as a fixture: programs 3 and 4 of
+  `tests/cases/soundness/adopted-box-field-read-is-a-channel.vl` (the binding consumer and the
+  union-PARAM one, which take different emitter paths).
+
+---
+
+### D291 — the i64/f64 sub-family of the adopted read, where THREE sources disagree
+**check-clean invalid wasm · found 2026-08-27 inside D209, left OPEN by its close 2026-08-28 and deliberately so · 36 of the d272 grid's 1,260 cells and 0 of the d290 grid's (its `shape` axis declines them by construction) · pre-existing on `322c07f2`, on `474b6a1b`, on `f6fda728` and after D209's close, with the module BYTE-IDENTICAL across it (274 bytes) · **THE SPECIMEN as of 2026-08-28** — `tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`, pinned as `tests/cases/soundness/xfail-miscompile-adopted-read-three-source-atom.vl`**
+
+Repro (D209's repro with ONE token changed — `i32` becomes `i64`):
+
+    type Circle = { r: i64 | null }
+    const lv1 = [{ r: 7 }]
+    print((lv1[0]).r)
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code: type mismatch
+
+* **THREE SOURCES, NOT TWO.** D209 is a disagreement between the emitter's rep (a box) and the
+  checker's type (`i32`). Here a third joins: the field's DECLARED member is `i64`, so the store
+  boxes the payload as tag 3 / `struct.new $vbI64`, and the checker still types the read `i32`.
+  Whichever of the three the read is made to believe, one of the other two is wrong — unbox to
+  i32 and the `ref.cast $vbI32` faces an `$vbI64` payload; unbox to i64 and `print`, typed `i32`
+  by the checker, gets an i64.
+* **D209'S CLOSE DECLINES IT ON PURPOSE, AND THE DECLINE IS MEASURED.** The channel predicate's
+  third condition — the box can actually hold the checker's atom — is exactly this test, and a
+  counter build reads `reach=1 ans=0` on this program: the rung SEES the read and refuses. Drop
+  the condition and the composition becomes the refused candidate `C`, which lost 72 cells: the
+  36 `nuli64`/`nulf64` cells of the d272 grid are the half condition 3 rescues (`R` alone loses
+  36, not 72).
+* **SO THE FIX IS NOT AT THE READ EITHER, and this row is where that is recorded.** Closing it
+  means picking which source wins, and the only source that can be made right for all three is
+  the STORE — i.e. the adoption, which is D271's refused resolver side. This row is the residue
+  D209's close leaves behind, filed so the family's remaining surface is not carried in prose
+  inside a CLOSED row.
+* The `f64 | null` spelling is the same row (`const lv1 = [{ r: 7 }]` under
+  `type Circle = { r: f64 | null }`), unmoved in either direction by D209's close.
+
+* **IT IS THE `--codegen` SPECIMEN, AND THE PROPERTY IT IS CHOSEN ON IS A CENSUS RATHER THAN AN
+  ARGUMENT.** The slot had turned over twice in one day — D282 → D209 (#1984) → D224 (recorded,
+  then CLOSED by #1985 before it could be taken) — so this time the successor was picked by
+  RUNNING every row in this document rather than by reasoning about families. All **136** rows'
+  own filed programs were graded against `f6fda728`'s seed; exactly **ONE** is `check-clean
+  invalid wasm`, and it is D209, which this commit closes. **This row is the only live member of
+  the class that remains**, and the corpus agrees: after D209's pin is deleted, the
+  `@no-instantiate` directive appears on no file at all. So it is not chosen over alternatives —
+  it is what is left, which is the one selection rule that cannot be wrong about the population.
+* **THE PROPERTIES, ALL CHECKABLE, ALL RE-RUN AT THE SWAP RATHER THAN INHERITED.** `vl check` rc 0
+  with **ZERO diagnostics**; `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected
+  i32, found (ref $type)`; `--codegen --no-validate` rc 0; `vl build` writes the `.wasm` and exits
+  1; NO `emit error` marker; the module is byte-identical across this change at 274 bytes. It
+  DECLARES NO UNION, so it inherits the structural property #1984 chose D209 for — `uVariants` is
+  empty and the whole variant⇄struct family (D33 / D139 / D156 / D158 / D171 / D224 / D280 / D282)
+  is inapplicable to it.
+* **AND THE HONEST CAVEAT, because the last two selection rules each failed within a day.** This
+  specimen is NOT out of reach of the mechanism that just closed its sibling: the channel
+  predicate SEES it and declines, counted at the site as `reach=1 ans=0`. Drop the predicate's
+  third condition and this row closes — and 36 d272 cells redden, which is exactly the `R alone`
+  column of D209's ablation. It survives on a MEASURED refusal, which is the same class of
+  evidence D224 had when its 199-cell price turned out to be a bundle. Read the price, not the
+  silence. **If it closes and nothing replaces it, the class is empty**: set `INVALID_MODULE_SRC =
+  null` and let the announced-inactive path in that file do its job, rather than reaching for a
+  program that is not really in the class.
+* **AND IT HAS A `runs but wrong value` FORM, which is the worse half.** The d290 grid's four
+  `f64nul_eqlit_*` cells — `if (v).r == 7 { print(7) } else { print(0) }` over the same
+  adoption — LOAD and print `0`, on master and after the close alike. The store widened the
+  payload to f64 and the compare is emitted against the checker's i32, so the union `==`
+  silently answers false: no diagnostic, a valid module, a wrong answer. Any close for this row
+  has to move that cell too, and a fix graded only on `check-clean invalid wasm` would not see
+  it.
+
+---
 
 ### D210 — the nothing-annotated nested map that a value-NAME-keyed fix reddens
 **runs today and must keep running · a REFUTATION PIN, measured 2026-08-27 against the first cut of D203's fix**
@@ -12368,7 +12599,7 @@ Repro:
 ---
 
 ### D282 — the read's `??` DEFAULT is the only nominal claim, and the container was filled through an un-annotated PARAMETER
-**[CLOSED 2026-08-28] the repro below RUNS and prints `7`. Was: check-clean invalid wasm on `474b6a1b` and on every generation before it · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · it was THE SPECIMEN (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`), now re-pointed at D209**
+**[CLOSED 2026-08-28] the repro below RUNS and prints `7`. Was: check-clean invalid wasm on `474b6a1b` and on every generation before it · 6 of the 1,188-cell position grid (`read x param x arm x notwin x d{1,2,3} x {norm,rev}`) and the WHOLE of that grid's surviving silent population · it was THE SPECIMEN (`tests/vl_check_codegen_test.ts`'s `INVALID_MODULE_SRC`), re-pointed at D209 — and re-pointed TWICE more the same day, at D224 when D209 closed and at **D291** when D224 closed too; the slot's genealogy now records THREE selection rules that each failed within a day of being written, and the fourth is a census rather than a choice**
 
 Repro (ten lines, and NO layout twin is declared anywhere):
 
@@ -12475,6 +12706,15 @@ Repro (ten lines, and NO layout twin is declared anywhere):
   against the mechanisms a family HAS is choosing against the candidates again, one level up. The
   successor therefore leaves the family by a CHECKABLE property rather than an argued one: D209
   declares no union at all, so `uVariants` is empty and this whole seam is counted at `entries=0`.
+
+  **AND THAT RULE FAILED TOO, WITHIN A DAY — the property HELD and the row closed anyway.**
+  `uVariants` stayed empty on D209 and nothing in this family touched it; what closed it was a
+  three-rung CHANNEL at the code-16 READ (D209's own row), which this family does not reach.
+  Leaving a family is not leaving the reach of every future argument. The slot's fourth rule
+  stops choosing: every one of this document's rows now has its OWN filed program run against the
+  tree at each swap, and the successor is whichever row is the only remaining member of the class
+  — a census, which cannot be wrong about the population even when it is uninformative about
+  durability.
 
 ---
 

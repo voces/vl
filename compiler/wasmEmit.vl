@@ -599,6 +599,7 @@ import {
   mapSlotTag,
   memberUnionFieldNameRead,
   memIsNarrowed,
+  memReadUnboxAtomKind,
   memNarrowVariantIndex,
   mfCallbackCloKey,
   mfCallbackFe,
@@ -4308,7 +4309,20 @@ export function emitUnionCoerce(
   // literal compares can produce 0–5, and codes 7 / 8 / 9 / 10 / 12 / 13 name one list backing
   // each. Each arm's comment names the atom it stands for.
   let cak = 0 // "i32"
-  if exprString(exprIx, fnIx) {
+  // D209 — THE THIRD END OF THE SAME CHANNEL. When the read site delivered the ATOM
+  // rather than the box (`memReadUnboxAtomKind`, the predicate `exprUnion` also asks),
+  // the value's atom is that predicate's answer and not this ladder's classification of
+  // the expression: every arm below reads the read as a code-16 BOX and declines, so a
+  // `string | i32` field read fell to the numeric default and `struct.new $vbI32` was
+  // applied to a string ref — `vl check` rc 0, "expected i32, found (ref $type)".
+  // Measured: 8 of this rung's own 714-cell grid, all at `string | i32`, all at the four
+  // BOX-WANTING consumers (union binding, another code-16 field, a union param, a union
+  // return) — invisible to the 1,260-cell `d272` grid, whose `unis` cells pin the payload
+  // at `7` and so only ever exercise the i32 default that happens to be right.
+  const d209k = memReadUnboxAtomKind(bareIx, fnIx)
+  if d209k >= 0 {
+    cak = d209k
+  } else if exprString(exprIx, fnIx) {
     cak = 2 // "string"
   } else if exprStringArray(exprIx, fnIx) {
     cak = 9 // "string[]" — a list member rides as a wrapper ref (like a string)
@@ -5204,14 +5218,30 @@ function emitSharedFieldRecv(body: i32[], recvIx: i32, fnIx: i32, slot: i32) {
 // box stores its member as, which is the ident READ discipline and the reason the struct
 // site was corrected to it. An un-narrowed read yields the box unchanged, so a "" atom
 // emits nothing.
-function emitUnionFieldNarrowUnbox(memIx: i32) {
+function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
   const mAtom = narrowedValueAtomOf(memberPathKeyOf(memIx))
-  if mAtom == "" { return 0 }
+  if mAtom == "" {
+    // D209 — THE UN-NARROWED READ THE CHECKER TYPED AS A BARE ATOM. The box is the
+    // adoption's rep, not the program's: `structIndexOfObjCtx` took a declared row for
+    // an un-annotated literal, so the field is code 16 while the checker never widened
+    // the value. Deliver the atom the checker's consumers were typed against — and the
+    // CONSUMER side agrees because `exprUnion` asks this very predicate and stops
+    // calling the read a union value, so a box-typed position re-boxes it.
+    const ck = memReadUnboxAtomKind(memIx, fnIx)
+    if ck < 0 { return 0 }
+    return emitUnboxToAtomKind(ck)
+  }
   // D-UNION-ATOM-KIND: the narrowed atom's ABI code decides both arms, exactly as it does
   // at the VARIANT-field twin of this read (`emitNarrowedMem` — same three instructions,
   // same two arms); `vbHeapIdxOfAtom` re-derived it a second time here, and
   // `mAtom == "string"` was code 2 asked in spelling form.
-  const mfk = valueAtomKind(mAtom)
+  emitUnboxToAtomKind(valueAtomKind(mAtom))
+}
+
+// The unbox SEQUENCE for a value-union box payload at atom kind `mfk`: `struct.get $uBox
+// 1` and then the atom's own recovery. One home, so the narrowed read and D209's
+// un-narrowed one cannot emit different instructions for the same atom.
+function emitUnboxToAtomKind(mfk: i32) {
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   if mfk == 2 {
     if !aUsed {
@@ -5253,7 +5283,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
       // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
       // i32 consumer: check-clean INVALID WASM (silent-class-inventory D219).
       if variantFieldTypeAt(pvi, pvfi) == 16 {
-        if emitUnionFieldNarrowUnbox(memIx) < 0 { return -1 }
+        if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
       return 0
     }
@@ -5274,7 +5304,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
         fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
         fbStructGet(uVarHeap[nvi], nvfi)
         if variantFieldTypeAt(nvi, nvfi) == 16 {
-          if emitUnionFieldNarrowUnbox(memIx) < 0 { return -1 }
+          if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
         }
         return 0
       }
@@ -5442,7 +5472,7 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
     // ref the box stores its member as — mirroring the ident READ discipline (else the
     // raw box flowed where the string array was expected: invalid wasm).
     if sFieldTypeAt(si, idx) == 16 {
-      if emitUnionFieldNarrowUnbox(memIx) < 0 { return -1 }
+      if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
     }
     return 0
   }
