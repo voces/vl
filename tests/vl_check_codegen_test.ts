@@ -882,46 +882,56 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // D300 had already joined it, because that header was written before D300 was filed. The
 // command is the population; a sentence about the population is a snapshot.
 //
-// D300 is D224's REMAINING PRICE spelled without the twin: 27 census-block-B coordinates whose
-// `Box1`/`Box2` container aliases put two heap types behind one placeholder. Re-RUN against
-// this tree at the swap rather than inherited: `vl check` rc 0 (four HINTs, no errors),
-// `--codegen` rc 1 with `not valid wasm` + `type mismatch: expected (ref $type), found (ref
-// $type)`, `--codegen --no-validate` rc 0, `vl build` writes the `.wasm` and exits 1, and NO
-// `emit error` marker. Its module is BYTE-IDENTICAL across this change (3,392 bytes,
-// `cmp`-equal, same offset). Pinned as
-// `tests/cases/soundness/xfail-miscompile-twinfree-nullable-arm-read.vl` per the REFILLS
+// SWAPPED AGAIN 2026-08-28 (silent-class-inventory D300). The twin-free nullable-arm specimen
+// this constant carried is CLOSED and graduated to
+// `tests/cases/soundness/twinfree-nullable-arm-read-through-an-inferred-return.vl`, `@run` +
+// one `@log 0` and its four hints. Its pin,
+// `tests/cases/soundness/xfail-miscompile-twinfree-nullable-arm-read.vl`, is deleted in the
+// same commit.
+//
+// THE CENSUS WAS RE-RUN BEFORE ASSUMING ANYTHING, as the entry above asked — and this time it
+// answered something the previous two runs did not: **the class has TWO live members, not
+// one**. All 140 rows' own filed programs graded against the closing tree; `D311` and `D301`
+// are both check-clean invalid wasm. So the rule that "the only live member" picks the
+// specimen has finally hit the case it did not cover, and the tie is broken on the ONE
+// property those three failed selection rules were all reaching for and never made checkable:
+// **do not pin the member that lives in the family this very commit just closed.** D301 is
+// that member — it is the map-value heap-twin layer, its own row names the missing rung, and
+// pinning it would re-run the failure mode the entries above document three times over. D311
+// is the other end of D209's channel, untouched by anything here.
+//
+// THAT IS STILL A JUDGEMENT, and it is recorded as one. The census is what makes it a
+// judgement between two KNOWN members rather than a guess about a population.
+//
+// D311 is the fourth end of D209's channel with the first three all working: the adoption
+// boxes `"7"` under the string tag, the predicate fires, the read delivers a bare
+// `(ref $sTypeIdx)`, and then `print`'s import ladder — `exprString` / `exprIsF32` /
+// `exprIsF64` / `exprIsI64` / `exprIsBool`, none of which asks that predicate — reads the
+// un-narrowed code-16 member as the BOX, declines on every arm, and falls through to
+// `__print_i32__`. Re-RUN against this tree at the swap rather than inherited: `vl check`
+// rc 0 with NO diagnostics at all (not even a hint — the first specimen in this slot's
+// history with a completely silent check), `--codegen` rc 1 with `not valid wasm` +
+// `type mismatch: expected i32, found (ref $type)`, `--codegen --no-validate` rc 0, `vl build`
+// writes the `.wasm` and exits 1, and NO `emit error` marker. Pre-existing on this change's
+// merge base (1,464,576) and on its shipped seed (1,464,824), and its module is
+// BYTE-IDENTICAL across the change (1,814 bytes, `cmp`-equal). Pinned as
+// `tests/cases/soundness/xfail-miscompile-adopted-string-atom-print-route.vl` per the REFILLS
 // procedure above, in the same commit that swapped this constant.
 //
+// THE NAMED SUCCESSOR IS **D301**, and for once it is named from a census rather than from an
+// argument: it is the other live member, measured on this tree. Re-run the census anyway
+// before taking it — three hand-offs in a row expired because the row they named was closed
+// first, and D301 is squarely in a family under active work.
+//
 // AND THE CAVEAT, because every previous entry that skipped one was wrong within a day: this
-// specimen is NOT out of reach. It IS D224's price, and D300's own row says closing those 27
-// takes that price to zero — so the change most likely to close this file is one someone is
-// already working toward rather than one nobody has thought of. It survives on the size of a
-// measured population, not on nobody having tried.
-const INVALID_MODULE_SRC: string | null = `type Circle = { r: i32 | null }\n` +
-  `type Sq = { s: i32 }\n` +
-  `type Shape = Circle | Sq\n` +
-  `type Box1 = {[string]: Circle}\n` +
-  `type Box2 = {[string]: Circle}\n` +
-  `type GW = { g: {[string]: Circle} }\n` +
-  `function useShape(s: Shape): i32 { if s is Sq { return 1 } return 0 }\n` +
-  `const sqv: Sq = { s: 1 }\n` +
-  `const _sp1: Box1 = Map()\n` +
-  `const _sp2: Box2 = Map()\n` +
-  `function mkcall() {\n` +
-  `  const cc = Map()\n` +
-  `  cc["k0"] = { r: null }\n` +
-  `  return cc\n` +
-  `}\n` +
-  `function outer() {\n` +
-  `  const lam = () => {\n` +
-  `    const wv: GW = { g: mkcall() }\n` +
-  `    if useShape(sqv) > 99 { print(0) }\n` +
-  `    const g0 = (wv.g)["k0"] ?? { r: null }\n` +
-  `    if (g0).r != null { print(7) } else { print(0) }\n` +
-  `  }\n` +
-  `  lam()\n` +
-  `}\n` +
-  `outer()\n`;
+// specimen is NOT out of reach. D209's landing already built the predicate the consumer
+// classifiers would have to ask, and D311's row states the repair as a known contract. It
+// survives on nobody having moved the consumer side yet — a fact about work not done, which
+// is weaker evidence than the measured refusal D291 had, and weaker than the measured
+// population D300 had. Expect it to close sooner than either.
+const INVALID_MODULE_SRC: string | null = `type Circle = { r: string | i32 }\n` +
+  `const v = { r: "7" }\n` +
+  `print((v).r)\n`;
 
 /// Whether a live specimen is named. Gates the three tests below, and is the left
 /// half of the tripwire's biconditional.

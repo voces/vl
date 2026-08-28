@@ -19271,6 +19271,29 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   if mvSlotKeyI32(a) != mvSlotKeyI32(b) { return 0 }
   const k = mvValKind[a]
   if k != mvValKind[b] { return 0 }
+  // ── THE DIRECT LAYOUT QUESTION, ASKED BEFORE THE CANONICAL-KEY PROXY (D300) ──
+  // The map struct's identity is exactly `(keys wrapper, vals wrapper)` — every other
+  // field is constant across all seven of them (`emitTypeSection`'s map loop). The key
+  // half is the test above; the vals half is `mvValsWrapOf`, which for a ref value IS
+  // `rlWrapIdx[mvRlSlot[slot]]`. So two kind-1 slots that interned the SAME vals
+  // ref-list slot emit BYTE-IDENTICAL map structs, whatever the checker says about their
+  // value types — and the canonical-key gate below, a TYPE identity, refused exactly that
+  // pair. `{r: null}` (what a `Map()` infers at its first key write) and `Circle`
+  // (`{r: i32 | null}`, the declared destination) resolve one struct row and one vals
+  // slot and are two different `repCanonId`s, so master minted two map structs and the
+  // store of one into the other was `expected (ref $type), found (ref $type)`.
+  // Asked as `mvRlSlot[a] == mvRlSlot[b]` rather than through `rlSlotsLayoutTwin`: slot
+  // EQUALITY is the tightest possible evidence of one wrapper and it is an equivalence on
+  // its own, where the layout relation's cross-table arm merges an ARM slot with a struct
+  // slot and takes `mvValStructIdxOf`/`mvValVariantOf` with it — 21 cells of D203's
+  // `bare null needs a struct-typed context`, measured, for zero extra cells closed.
+  if k == 1 && mvRlSlot[a] >= 0 && mvRlSlot[a] == mvRlSlot[b] { return 1 }
+  // THE NESTED-MAP HALF, and it is the SAME hoist one container out. A `{[K]: {[K]: V}}`
+  // value is kind 6, its own arm below IS `rlSlotsLayoutTwin`, and that arm's kind-3
+  // element recursion bottoms out in the pair the rung above just merged — so without
+  // this the inner merge lands and the OUTER map keeps two structs. Hoisted rather than
+  // widened: the arm is unchanged, only the canonical-key precondition is dropped.
+  if k == 6 && rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) == 1 { return 1 }
   const ka = mvValTwinCanonId(a)
   if ka < 0 { return 0 }
   if ka != mvValTwinCanonId(b) { return 0 }
@@ -19368,22 +19391,49 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   0
 }
 
-// The canonical REPRESENTATIVE map-value slot for `slot`: the smallest slot that
-// is a `repMapValSlotsTwin` layout twin (the equivalence is transitive — key
-// equality composes, and every guard layer is itself a canonical-key + layout
-// equivalence — so first-twin picks one stable representative per class). The
-// heap mint (`mAssignTypeIndices`), the union-box tag (`mapSlotTag`), and the
-// arm-slot guard (`unionHasMapArmSlot`) all canonicalize through this ONE
-// chokepoint, so a twin-spelled map arm boxes, tags, and casts as its
-// representative. A negative slot (mono `-1` / unsupported `-3`) passes through.
+// The canonical REPRESENTATIVE map-value slot for `slot`: the smallest slot reachable
+// from it through `repMapValSlotsTwin`. The heap mint (`mAssignTypeIndices`), the
+// union-box tag (`mapSlotTag`), and the arm-slot guard (`unionHasMapArmSlot`) all
+// canonicalize through this ONE chokepoint, so a twin-spelled map arm boxes, tags, and
+// casts as its representative. A negative slot (mono `-1` / unsupported `-3`) passes
+// through.
+//
+// IT FOLLOWS THE CHAIN, AND THAT IS NOT A REFINEMENT — IT IS THE INVARIANT (D300). This
+// read `return t` at the FIRST twin, on the header's own premise that "the equivalence is
+// transitive — key equality composes, and every guard layer is itself a canonical-key +
+// layout equivalence". A layout-only rung breaks that premise: the relation stays SOUND
+// (every `1` still means one wrapper) but stops being TRANSITIVE, because the union of
+// two equivalences is not one. `A ~canon B` and `B ~layout C` with `A !~ C` then makes
+// first-twin disagree with itself — `mAssignTypeIndices`'s heap mint chains
+// (`mvMapTypeIdx[i] = mvMapTypeIdx[rep]`, itself already resolved) while `rlSig`'s
+// map-element arm keys on a single `mvCanonRepOf` hop, so two ref-list slots the mint
+// treats as one got two wrappers and the "map-value layout twins resolved different vals
+// wrappers" interlock fired. That interlock is `emitFail`, which does NOT halt: the
+// -1 it returns became `typeOffset` and the emit walked off a parallel table — a COMPILER
+// TRAP on `tests/cases/maps/inferred-map-destination-shape.vl`.
+//
+// Chaining restores the invariant instead of restricting the rung, and it is the closure
+// the mint was already computing. Sound for the same reason the mint is: each hop's `1`
+// means equal (keys, vals) wrappers, and wrapper equality composes. Terminating because
+// `cur` strictly decreases. INERT until a non-transitive rung exists — byte-identical on
+// 1,945 of 1,945 corpus modules and 0 of 2,006 graded cells moved without one.
 export function mvCanonRepOf(slot: i32): i32 {
   if slot < 0 { return slot }
-  let t = 0
-  while t < slot {
-    if repMapValSlotsTwin(t, slot) == 1 { return t }
-    t = t + 1
+  let cur = slot
+  let moved = true
+  while moved {
+    moved = false
+    let t = 0
+    while t < cur {
+      if repMapValSlotsTwin(t, cur) == 1 {
+        cur = t
+        moved = true
+        t = cur
+      }
+      t = t + 1
+    }
   }
-  slot
+  cur
 }
 
 // True if a `+` expression has a string LITERAL anywhere in its chain — the syntactic

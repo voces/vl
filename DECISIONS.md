@@ -324,6 +324,28 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   silently miss its `{[string]: A}` carrier once the heaps merged, so tag
   identity and heap identity move together. (structural slot dedup, map-value
   layer)
+  **The map-value layer's canonical key is now a FALL-THROUGH, not a precondition,
+  and the representative is a CLOSURE rather than a first hit** (D300, 2026-08-28).
+  A map struct's identity is exactly `(keys wrapper, vals wrapper)` — its other five
+  fields are constant — so ref-list slot EQUALITY already proves two slots are one
+  heap type, whatever the checker says about their value TYPES. `{r: null}` (what an
+  un-annotated `Map()` infers at its first key write) and a declared `{r: i32|null}`
+  resolve one struct row and one vals slot and are two different `repCanonId`s, so the
+  key-first order minted two identical map structs and the store between them was
+  invalid wasm. The layout question is therefore asked FIRST for the two rl-backed
+  kinds, and the key survives as the fall-through for pairs the layout cannot see
+  (D48's arm twins, whose ref-list rows are distinct). **The consequence worth
+  recording is the one that is not local:** a layout rung is sound but NOT transitive
+  — the union of two equivalences is not one — and `mvCanonRepOf` returned the FIRST
+  twin on a stated premise of transitivity while `mAssignTypeIndices`'s mint already
+  CHAINED. Any layout-only rung therefore makes those two disagree, which trips the
+  "twins resolved different vals wrappers" interlock; and because `emitFail` does not
+  halt, the interlock's -1 becomes `typeOffset` and the emit walks off a parallel
+  table — a compiler trap rather than a diagnostic. **The rule: a chokepoint that
+  picks a representative must compute the transitive closure whenever the underlying
+  relation is a union of guards, not the first hit.** Chaining is inert until such a
+  rung exists (byte-identical on 1,945 of 1,945 corpus modules alone) and is the
+  difference between a landing and a dead compiler once one does.
   VARIANT structs complete the slot layers, deduping by the same two layers
   (`buildVariantTwins` → `uVarTwin`/`uVarHeap`: the canonical variant key via
   `repNameCanonKey` + a per-field storage guard whose ref-bearing field codes
