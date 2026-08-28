@@ -77,6 +77,13 @@ The corpus is only as good as the history it was collapsed from; re-distilling i
 the one real risk (a compiler that splits a class no earlier compiler split) falling rather
 than growing.
 
+**Generated corpus files are ONE LINE PER CELL.** `baseline.jsonl`, `expected.jsonl` and a
+named set's coordinate JSON under `census/` are rewritten by nearly every defect PR, so their
+format is a review and merge concern. Pretty-printed, a 207-cell change was an 860-line diff and
+a rebase merged cell boundaries wrongly **without saying so** — twice in one day, once silently
+corrupting the baseline. Read and write them through `distilled/cellmap.py`, never `json.load`.
+Do not add a field nothing reads: `coords` was stored three times and read from none of them.
+
 **WHEN A GRID OR A REFUSED CANDIDATE NAMES A SET, THE SET GOES IN `named/`** — not a collapse
 of it, and not the whole grid. A derived rule provably cannot find these, and there are two
 worked instances from a single day: D272's 72 `runs`-lost cells and D224's 207-cell price were

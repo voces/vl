@@ -30,6 +30,8 @@ import os
 import shutil
 import sys
 
+from cellmap import dump_cells
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 DEFAULT_GLOB = ROOT + "/.claude/worktrees/*/scratch-silent/census/**/*.json"
@@ -76,8 +78,7 @@ def main():
         if src is None:
             print(f"block {b.upper()}: no generated cell directory on disk — SKIP", file=sys.stderr)
             continue
-        coords = man["coords"]
-        cells = sorted(coords)
+        cells = sorted(man["coords"])  # the census manifest's cell list
         cs = set(cells)
         files = [(f, d) for (f, d) in snaps[b] if set(d) == cs]
         if not files:
@@ -102,7 +103,7 @@ def main():
             staged.append((os.path.join(src, c + ".vl"), c))
             expect[c] = man["expect"][c]
             index[c] = {"block": b.upper(), "class": sig[c][-1][0], "msg": sig[c][-1][1],
-                        "represents": len(groups[sig[c]]), "coords": coords[c]}
+                        "represents": len(groups[sig[c]])}
 
     n = sum(t[1] for t in totals)
     d = sum(t[3] for t in totals)
@@ -120,14 +121,13 @@ def main():
     for srcf, c in staged:
         shutil.copyfile(srcf, os.path.join(out, c + ".vl"))
     json.dump({"expect": expect,
-               "coords": {c: index[c]["coords"] for c in index},
                "block": "distilled",
                "generated": len(index),
                "meta": {"note": "one representative per behavioural equivalence class "
                                 "of the census; rebuilt by redistil.py"}},
               open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
-    json.dump(index, open(os.path.join(HERE, "expected.json"), "w"), indent=1, sort_keys=True)
-    print(f"wrote {out}/*.vl ({len(staged)} cells), cells/manifest.json and expected.json")
+    dump_cells(os.path.join(HERE, "expected.jsonl"), index)
+    print(f"wrote {out}/*.vl ({len(staged)} cells), cells/manifest.json and expected.jsonl")
     ncur = len(glob.glob(os.path.join(HERE, "named", "*.vl")))
     if ncur:
         print(f"named/ left untouched: {ncur} curated cells")
