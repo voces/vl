@@ -1100,6 +1100,17 @@ function armPinAnnName(tyIx: i32) {
       // producer is an ArrayLit with an OBJECT-LITERAL first element — a value of depth ONE,
       // which this rung already claims through `variantIndexOf`. A depth-2 annotation over a
       // depth-1 producer is a type error the checker refuses first.
+      //
+      // RE-MEASURED AGAINST THE DEEPER CUT (silent-class-inventory D243), because "0
+      // witnesses today" is a fact about the population and D243 was the reason to suspect
+      // the population had grown: `dstPinPushAnn`'s element scan now descends to any depth,
+      // so a `Circle[][][]` destination really does reach the pin. It reaches it through
+      // `dstPinElemAnnName`, the ELEMENT side, which carries `pinArmListName` already. This
+      // rung is the WHOLE-VALUE side and its caller's producer set is unchanged, so the
+      // decline still holds — and it is measured, not argued: with A+B+C in place, adding
+      // `if pinArmListName(rae) { return tyNameOf(tyIx) }` here moves 0 of 3,200 cells on
+      // the list-container block P, 0 of 160 on the box/arm block Q, and 0 of 2,332 corpus
+      // modules (every one `cmp`-identical). Widen it only with a program that moves.
     }
   }
   // A MAP whose VALUE names an arm (`{[string]: Circle}`), the third container the seam
@@ -1576,36 +1587,124 @@ function dstPinPushAnn(
     outT.push(annIx)
     return 0
   }
-  const av = P.nodes[unwrapParen(srcExpr)]
-  if av is ArrayLit {
-    let i = 0
-    while i < av.arrElems.length {
-      if dstPinSrcIs(bodyIx, av.arrElems[i], letIx) {
-        let en = ""
-        if retRefArrFlag(annIx) == 1 {
-          const rae = retRefArrElemName(annIx)
-          if rae != "" {
-            if variantIndexOf(rae) >= 0 {
-              en = rae
-            } else if pinArmListName(rae) {
-              // The ELEMENT is itself a ref-list of an arm (`Circle[]` cut from a
-              // `Circle[][]` destination) — the rung this arm is a hand-inlined copy of, at
-              // depth (D184). This is the cut D184's own witness reaches: `const c:
-              // Circle[][] = [lv1]` delivers `lv1` as an ELEMENT, and the element spelling
-              // `Circle[]` is exactly the one the row's `flat Circle[] RUNS` control shows
-              // the pin already handles once it is written down.
-              en = rae
-            }
-          }
-        }
-        outN.push(en)
-        outT.push(-1)
-        return 0
-      }
-      i = i + 1
-    }
+  // THE ELEMENT DELIVERY, AT WHATEVER DEPTH THE BINDING ACTUALLY SITS AT
+  // (silent-class-inventory D243). This arm used to iterate `av.arrElems` ONCE and ask
+  // `dstPinSrcIs` of each, so it saw exactly one list level: `const c: Circle[][][] =
+  // [[lv1]]` has the single element `[lv1]`, which is not the binding, the loop found
+  // nothing, NO destination was recorded, and the pin never ran. The predicate was already
+  // right — `pinArmListName` answers `true` for the element spelling `Circle[][]` — so the
+  // cut is the SCAN's depth and not the gate's, which is why D184's one-cut fix could not
+  // reach it.
+  //
+  // A DEPTH AND NOT A BOOLEAN, because the pinned SPELLING has to match the level the
+  // binding is at: at depth 1 the destination's element is `Circle[][]`, at depth 2 it is
+  // `Circle[]`, and pinning either onto a value holding the other is a different program.
+  const ed = dstPinElemDepthAt(bodyIx, srcExpr, letIx, 0)
+  if ed > 0 {
+    outN.push(dstPinElemAnnName(annIx, ed))
+    outT.push(-1)
   }
   0
+}
+
+// How many LIST levels below `ex` the binding at `letIx` sits, or -1 when it is not among
+// its elements at any depth. Never 0: the WHOLE-VALUE delivery is the caller's own first
+// question, and asking it twice would pay for `dstPinSrcIs`'s alias walk twice.
+//
+// TWO WAYS DOWN A LEVEL, AND THE SECOND IS THE ONE WITH NO GRID BEHIND IT. A nested
+// `ArrayLit` (`[[lv1]]`) is the obvious one. The other is an UN-ANNOTATED BINDING whose
+// initializer is a list literal (`const mid = [lv1]` … `const c: Circle[][] = [mid]`) —
+// the same "an un-annotated binding is a LINK in the chain, not the end of it" rule
+// `dstPinLocalDest` already applies to a whole-value alias and `retLocalLetOfBlock`
+// implements for it, asked one container out. `dstPinLocalDest`'s `letType >= 0` guard
+// already keeps such a binding from recording a "" DISAGREEMENT; without this rung it also
+// contributed no destination, so the binding it links had none at all.
+//
+// AN ANNOTATED intermediate is NOT followed, and that is the same boundary the alias walk
+// stops at: an annotation is its own nominal claim about the value, so it is a destination
+// to agree with rather than a level to descend through.
+//
+// Depth-bounded for `dstPinSrcIsAt`'s reason — the arena is not this pass's to trust, and
+// four levels is far past any spelling measured. The IDENT rung recurses at the SAME depth
+// (the binding is not itself a container level; its initializer's elements are), so the
+// bound is still consumed only by real `[]` levels and a `const a = [b]  const b = [a]`
+// pair terminates on it.
+function dstPinElemDepthAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32): i32 {
+  if ex < 0 { return -1 }
+  if depth > 4 { return -1 }
+  if depth > 0 {
+    if dstPinSrcIs(bodyIx, ex, letIx) { return depth }
+  }
+  const u = unwrapParen(ex)
+  const n = P.nodes[u]
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      const d = dstPinElemDepthAt(bodyIx, n.arrElems[i], letIx, depth + 1)
+      if d > 0 { return d }
+      i = i + 1
+    }
+    return -1
+  }
+  if n is Ident {
+    const li = dstPinUnannListLet(bodyIx, n.identName)
+    if li >= 0 && li != letIx {
+      const ld = P.nodes[li]
+      if ld is LetDecl {
+        return dstPinElemDepthAt(bodyIx, ld.letInit, letIx, depth)
+      }
+    }
+  }
+  -1
+}
+
+// The binding `name` resolves to, when it is UN-ANNOTATED and its initializer is a list
+// LITERAL — the one shape the depth walk above may descend through — else -1. Local first
+// then global, which is the order every storage-class dispatch in this family uses so a
+// binding SHADOWING a same-named global answers for the cell that actually holds the value.
+function dstPinUnannListLet(bodyIx: i32, name: string): i32 {
+  let li = parentLetOf(bodyIx, name)
+  if li < 0 { li = globalLetOf(name) }
+  if li < 0 { return -1 }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const iv = P.nodes[unwrapParen(d.letInit)]
+    if iv is ArrayLit { return li }
+  }
+  -1
+}
+
+// The destination annotation's ELEMENT spelling `dep` list levels in, gated on that
+// spelling naming an arm — bare, or a ref-list of one — exactly as the one-level rung this
+// generalises was. "" is the DISAGREEMENT the caller records, not a decline: a destination
+// that cannot name the element's arm must veto the pin, which is what makes every-
+// destination-agrees the safety property (`dstPinAnnIn`).
+//
+// `retRefArrElemName` TAKES THE FIRST CUT AND `arrElemNameRaw` THE REST, and the split is
+// forced rather than stylistic: the first cut has a NODE to read (the annotation), and
+// every cut after it holds only a string. `arrElemNameRaw` is the one home of that cut
+// (`emit_base`'s array-name grammar header), so the deeper levels cannot drift from the
+// first.
+function dstPinElemAnnName(annIx: i32, dep: i32) {
+  if retRefArrFlag(annIx) != 1 { return "" }
+  let nm = retRefArrElemName(annIx)
+  let k = 1
+  while k < dep {
+    if nm == "" { return "" }
+    nm = arrElemNameRaw(nm)
+    k = k + 1
+  }
+  if nm == "" { return "" }
+  if variantIndexOf(nm) >= 0 { return nm }
+  // The ELEMENT is itself a ref-list of an arm (`Circle[]` cut from a `Circle[][]`
+  // destination) — the rung this is a hand-inlined copy of, at depth (D184). `const c:
+  // Circle[][] = [lv1]` delivers `lv1` as an ELEMENT, and the element spelling `Circle[]`
+  // is exactly the one that row's `flat Circle[] RUNS` control shows the pin already
+  // handles once it is written down.
+  if pinArmListName(nm) { return nm }
+  ""
 }
 
 // Does the value of `ex` COME FROM the binding at `letIx`?

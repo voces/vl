@@ -62,3 +62,11 @@ Transition matrix for the shipped pair: 188 `loud emit reject → runs`, 125
 module-scope conduit cells reaching `monomorphize: unsupported argument type`, a refusal the
 classification hole was routing around). 18 cells remain silent, all in block N, and they are
 filed as **D243**, **D244** and **D245**.
+
+**All three are closed as of 2026-08-27**, and block N could see only part of why. D245 was
+already stale on its own merge commit (see its re-grade note); D243 and D244 closed on two
+separate cuts, each measured on a SUCCESSOR block that promotes three axes this one holds
+constant — `escope` (block N is `escope=["mod"]`, and 30 of the successor's 72 silent cells
+are in a function), `depth` (this one stops at 3; 27 of the 72 are depth 4) and `nest`
+(no grid before it ever wrote a container level as a nested LITERAL rather than as its own
+binding; 54 of the 72 are that shape). `scripts/silent-sweep/d243/README.md` is that block.
