@@ -11,7 +11,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 ## Types & semantics
 
 - **A REFUSAL IS A CLAIM ABOUT AN ANSWER SET, AND THE SET IS USUALLY "WAYS TO MAKE IT RUN"**
-  (2026-08-28, silent-class-inventory D411 / #2007). D411 was filed as "a REFUSAL, not a gap"
+  (2026-08-28, silent-class-inventory D411 / #2008). D411 was filed as "a REFUSAL, not a gap"
   and enumerated three fixes — a checker variance rule, a store-side coercion, a binding
   split. All three were re-tested and all three still stand refused, one of them now with a
   price attached (the variance rule reddens D381's own subject, 7 measured control cells).
@@ -23,7 +23,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   loud — and closing it as a SILENT class is a real close even when the defect stays.
 
 - **A LENIENCY THAT MAKES A RESOLVER AGREE WITH ITS TWIN MUST BE A SECOND PASS, NOT A WIDER
-  FIRST ONE** (2026-08-28, silent-class-inventory D461 / #2007). `structIndexOfObjCtx` (node
+  FIRST ONE** (2026-08-28, silent-class-inventory D461 / #2008). `structIndexOfObjCtx` (node
   input) and `structIndexOfTypeName` (name input) answer the same question — which struct row
   a literal builds at — and differed by exactly one arm: a union-BOX field accepts every atom
   on the node side and was a proven mismatch on the name side. Adding that arm to the name
@@ -37,7 +37,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   a rule about the types.**
 
 - **AN ARITY TEST OVER SPELLINGS IS A DISTINCTNESS TEST, AND WRITING IT AS `length == 1` HIDES
-  A WHOLE DECLARATION FORM** (2026-08-28, silent-class-inventory D446 / #2007).
+  A WHOLE DECLARATION FORM** (2026-08-28, silent-class-inventory D446 / #2008).
   `unionStructAliasShape` gated the struct-alias path on `variants.length == 1`, which is right
   for the intersection spelling it was written for (`&` concatenates into one variant string)
   and wrong for `type AB = {a,b} | {a,b}`, which denotes exactly one struct and reads 2 because
