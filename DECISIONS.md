@@ -1629,6 +1629,129 @@ of the four deliveries that worked. A single-position fixture over a feature who
 position-dependent is not coverage, which is the same finding #1995 records for D188's leaf
 table and #1996 for the anonymous-row rung.
 
+## A declaration nothing can reach is refused AT ITSELF, and the reject is DERIVED from the dispatch predicate rather than restated (D444/D445)
+
+**The tree already refused two shapes of unreachable operator declaration and was silent about
+two more, and the four had drifted into four different opinions about the same question.**
+`parseFuncHead` refuses a quoted NON-operator name (`function "shout"`) because it "would let a
+declaration take a name no reference could ever be written for"; the pass-1 hoist refuses a
+mis-arity `"[]"` "so a malformed declaration is reported once, at itself, rather than at every
+use site that fails to resolve"; `indexOpDeclName` refuses an un-annotated `self` because the
+declaration name cannot be minted without it. D444 (any arity but 2 on a binary operator) and
+D445 (a `"[]"` over a built-in indexable receiver) are the same sentence and were `vl check`
+rc 0 with the built-in's answer coming back. **The ruling is that "no reference could ever be
+written for it" is one rule with four sites, not four rules.**
+
+### Which SEAM a gate belongs at is decided by what the predicate needs to read
+
+**D444's gate is syntactic and D445's is not, and getting that backwards was the standing
+belief.** D425's row records D46's parser home as unable to host a declaration-site reject
+because "that arm has the NAME spelling and not the resolved type of `self`". That is exactly
+right for the index operators — an ALIAS (`type Xs = i32[]`) and a NEWTYPE (`type Xs = new
+i32[]`) are both swallowed and neither is spelled `i32[]`, and a generic `function
+"[]"<T>(self: T[], i: i32)` is swallowed too — so D445 sits at the pass-1 hoist beside the
+arity check, keyed on `hpt[0]`. It is exactly *wrong* for the unary case: arity is a property
+of the token stream, `parseFuncTail` already holds the parameter list because
+`indexOpDeclName` inspects it there, and no resolved type is involved. **So D444 was never
+blocked behind D402 and D445 never could have been parser-resident.** Ask what the predicate
+reads before deciding where it lives; "the other half of this family lives over there" is not
+an argument.
+
+### The reject must be the NEGATION of the dispatch gate, spelled by calling it
+
+**D445's gate calls `tyBuiltinIndexable` — the same function `checkIndexNode` consults to
+decide the swallow — rather than re-listing arrays, maps and strings.** The set refused is then
+by construction the set the checker walks past, and the two cannot drift: a receiver added to
+the swallow becomes refusable in the same edit. Re-listing would have produced a second opinion
+about the same question, which is precisely the failure the four sites above had accumulated.
+
+**It subtracts exactly the two arms the dispatch predicate answers `true` for out of CAUTION
+rather than knowledge.** `tyBuiltinIndexable` returns true for an un-pinned hole and for the
+error type because at a USE site the conservative answer is "leave it to the built-in arms". At
+a DECLARATION site the polarity inverts: refusing must require *knowing* the declaration is
+dead. A hole is a live receiver (`function "[]"<T>(self: T, i: i32)` dispatches for every
+non-built-in receiver, measured) and an error type has already been reported at the annotation.
+**A predicate reused across a polarity flip needs its caution arms named and removed, not
+inherited.**
+
+### A row's TITLE is not its population, and the grid is what says so
+
+**D445 was filed as "a `"[]"` declaration over a non-object `self` is silently ignored" and a
+gate written from that sentence would have condemned six working receivers.** Measured over 15
+receivers, `i32`, `f64`, `i64`, `boolean`, `new i32` and the union `i32 | string` all dispatch
+correctly and print the declaration's answer; only arrays, maps, strings and aliases/newtypes
+over them are swallowed. The six are kept in `distilled/named/` as boundary cells for that
+reason. The same round corrected the brief that scheduled the work, which read the row's "std
+declares four index operators" as "std's four index operators are inert" — they are nominal
+structs (`new { base, length }`), they dispatch, and the emitted module calls them
+(`(return_call $26)` into `getI32`). **The row said std was a live CUSTOMER a gate must agree
+with; that is a different sentence from "std is broken", and only running it separates them.**
+
+**THE COMPRESSION IS THE FAILURE MODE, NOT THE ROW.** The row said `"[]"` is inert at
+`self: i32[]` and `self: string` — built-in indexable receivers — and that the STRUCT control
+dispatches. std's views are structs. Compressing that into "std ships four inert operators"
+inverted which half of the row std was on, and then supplied the reason to prioritise the work.
+A one-sentence summary of a row that distinguishes a population from its control cannot be
+trusted to have kept the distinction: **re-derive the population from the row, and then run
+it.** `tests/cases/std/buffer-view-bracket.vl` was already in the tree and prints
+`1.5 2.5 7 9 3.25 11 6 4` — cross-module dispatch on the nominal brand, both spellings,
+compound writes. The refutation cost one command.
+
+**This was the second brief-level premise refuted the same day by an agent running the code
+instead of reading about it**, which is the point worth keeping: a premise arrives with the
+authority of whoever wrote it and none of the evidence, and the cheapest moment to test it is
+before any work is scheduled on it.
+
+### The runs-lost override, and what the boundary half of a named set is for
+
+73 grid cells go `runs` -> loud check reject, and the four-term conjunction above holds: they
+run by coincidence (each cell's own body says 99 and the program printed the built-in's
+answer — the `check-clean silently wrong` class the census records ZERO of in 250,238 cells),
+the loss is loud at the declaration's line, the price is named, and the reversal is
+instrumented. **The instrumentation detail worth copying is the EXPECTATION.** Each named cell's
+expected stdout is the DECLARATION's answer, never the built-in's, so the cell's grade answers
+"did dispatch happen?" rather than "did the program run?". Two consequences follow, both
+wanted: a price cell whose reject is ever lifted grades `runs but wrong value` — silent, and
+reported — instead of quietly reading `runs`; and the eight D425-inert boundary cells baseline
+as `runs but wrong value` rather than `runs`, so the day D425 lands its own gate they REPORT
+instead of BLOCKING on eight runs-lost. The neighbouring `d425c*` set records the built-in's
+answer and so baselines as `runs`; that is the older convention and this set deliberately
+departs from it.
+
+**36 of the 111 named cells did not move at all, and they are the more important half.** A
+price set says what a candidate cost; only a boundary set says the candidate stopped where it
+was supposed to. Here one comparison carries it: `d444_lt_a2_obj` grades `runs:true` (the
+declaration's answer, dispatch) against `d444_lt_a2_i32` at `runs:false` (the native answer,
+D425's inertness).
+
+### The grid was wrong twice, and both times it looked fully populated
+
+**Neither bug produced a gap, an error or an odd column. Each produced a complete table of
+plausible verdicts answering a different question from the one asked** — which is the only
+failure mode of a probe that a green-looking run cannot distinguish from success.
+
+**(1) The use site was held constant while the declared operator varied.** The first generator
+carried a per-RECEIVER use expression (`print(a - b)` for the struct row) and looped the
+operator over `-`, `+`, `*`, `/`, `<`. The `<` cells declared `function <(self: V, other: V)`
+and then measured `a - b`. All of them graded; none graded its own declaration. This is
+#2001's `cell(): i32` wrapper one level out — there the harness's return type reported the
+mismatch instead of the operator's, here the harness's operator did. **The tell is structural:
+a cell's source should not require finding the operator in two places to read.**
+
+**(2) The `<` body returned the answer the built-in already gives.** Every operand pair is
+`7 <op> 1`, so native `<` is `false` — and the declaration returned `false` too. The two cells
+that are the entire arity-2 dispatch/inertness discriminator, `d444_lt_a2_obj` (must dispatch)
+and `d444_lt_a2_i32` (must not), both graded `runs:false`. Twelve cells were reporting a
+measurement they could not have made. Changing the body to `true` is the whole fix, and it is
+what turned the boundary half of the named set from decoration into evidence.
+
+**BOTH BREAK ONE RULE: a cell's expected answer must differ from the answer it would give if
+the thing under test did nothing.** That is why `grade()` records `runs:<stdout>` rather than a
+bare `runs`, and why every cell's body disagrees with the built-in on its own operands — the
+discipline D425's row already recorded costing its grid eight cells, applied one axis further
+in. A grid that cannot fail is not a measurement, and neither of these announced itself.
+
+
 ## An ACCEPTANCE must ride the pin too, and it does not ride the same channel a refusal does
 
 **D35's rule — "a rule enforced at `vl check` and lost at monomorphization is a rule about

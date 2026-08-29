@@ -13704,6 +13704,32 @@ Repro:
   — see D444). And the binary predicate cannot be spelled honestly until D402's root is
   fixed, because "`self` must be an object type" is a false sentence for `self: AB`.
 
+  **TWO OF THESE THREE LANDED ON 2026-08-28 (#2005), and the third is the one this row is.**
+  D444 built the ARITY gate in `parseFuncTail` — the unary case turned out not to need a
+  resolved type at all, so D46's home objection was true of `"[]"` and false of unary — and
+  D445 built the `"[]"`/`"[]="` gate at the pass-1 hoist, routed through
+  `tyBuiltinIndexable` so the reject cannot drift from the swallow, with std untouched
+  because its receivers are nominal structs. Neither moved a single `d425c*` cell. What
+  remains is exactly the BINARY gate over a built-in `self`, and the two landings are worked
+  precedents for how to spell it: key it on the resolved type at the hoist, and derive it
+  from the dispatch predicate rather than restating it.
+
+  **DO NOT READ THIS "TWO OF THREE" AS D443's.** They are different threes and they sit six
+  rows apart. D443's is D402's ROOT closing two of the five things that row predicted; this
+  one is D425's three declaration-site GATES. The overlap is only that both say two.
+
+  **AND #2004 DID NOT MOVE THIS ROW'S BLOCKER, measured on both sides rather than inferred
+  from the root's landing.** The blocking sentence is *"`self` must be an object type" is
+  false for `self: AB`*, and the direct probe — `type AB = {a:i32} & {b:i32}` +
+  `function "+"(self: AB, other: AB)` + `x + y` — is `operator '+' is not defined for AB and
+  AB` on the pre-#2004 seed `638d4fa4` and **the identical message** on the post-#2004 seed
+  `228ea9f8`, while its plain-struct twin `{a:i32,b:i32}` dispatches and prints 99 on both.
+  D402's root is the EMITTER's shape interning; `checkBinary`'s `if odsp is TyObj` is a
+  different gate and still declines an intersection alias. D441's row states the same
+  conclusion from #2004's own measurement ("both operator gates still refuse"); this is the
+  independent confirmation, and it is why the blocker is stated as a live one and not as a
+  paid one.
+
 * **WHY IT STAYS OPEN.** The reject is right and its CAPABILITY cost is still zero at the
   binary operators — nothing in `compiler/`, `std/`, `tests/`, `bench/`, `playground/` or
   `reference/` declares a binary operator with a non-object `self`, re-verified 2026-08-28;
@@ -14046,8 +14072,8 @@ Repro:
 
 ---
 
-### D444 — a ONE-PARAMETER operator declaration is inert at EVERY receiver, and `lint.vl` believes it dispatches
-**check-clean silently wrong · found 2026-08-28 by D425's operator-family grid · pre-existing and IDENTICAL on master `f9275d20` and on this branch · STRICTLY STRONGER THAN D425: no `self` type makes this one work**
+### D444 — [CLOSED 2026-08-28] an operator declaration at ANY arity but 2 is inert at every receiver, and `lint.vl` believed it dispatched
+**now a loud check reject · closed by a declaration-site gate in `parseFuncTail` · filed as ONE parameter, and the measurement widened it to arity 0, 1 and 3 · STRICTLY STRONGER THAN D425: no `self` type made this one work**
 
 Repro:
 
@@ -14057,40 +14083,125 @@ Repro:
 
     const a: i32 = 7
     print(-a)
-    // vl check rc 0. The declared operator returns 99 unconditionally, so a dispatch
-    // would print 99.
-    // PRINTS -7
+    // WAS: vl check rc 0, PRINTED -7. The declared operator returns 99
+    // unconditionally, so a dispatch would print 99.
+    // NOW: operator `-` takes 2 parameters (self, other), got 1 — operator
+    // dispatch is binary only, so this declaration could never fire
 
-* **THERE IS NO UNARY DISPATCH PATH AT ALL.** `checkUnaryNode` (`typecheck.vl:30757`) handles
+* **THERE WAS NO UNARY DISPATCH PATH AT ALL, and there still is none — the
+  declaration is refused instead.** `checkUnaryNode` (`typecheck.vl:30757`) handles
   `!`, `p+`/`p-` and `-`, and for `-` asks only `isNumeric(arg)`; it never looks for an
   operator function. `opSelfFnTy` cannot answer either — it requires
-  `d.fnParams.length == 2`. So a one-parameter declaration is unreachable from both ends.
+  `d.fnParams.length == 2`. So a one-parameter declaration was unreachable from both
+  ends, and no receiver changed that.
 
-* **THE OBJECT RECEIVER — the one the user meant — IS LOUD, AND WRONG.**
-  `type V = { x: i32 }` + `function -(self: V): i32 { return 99 }` + `-a` over `a: V` is
-  `unary '-' expects a numeric type, got V`. The two-parameter control dispatches:
-  `function -(self: V, b: V)` + `a - b` prints 99. So the arity, not the receiver, is what
-  makes it inert — and `function +(self: V)`, `function *(self: V)`, `function <(self: V)`
-  are equally inert (each declares fine and does nothing).
+* **THE ROW FILED ARITY 1; THE GRID FOUND 0 AND 3 TOO.** `function *(): i32 { 99 }`
+  and `function /(self, b, c): i32 { 99 }` declared exactly as cleanly and did exactly
+  as little — `print(3 * 4)` returned 12, `print(a - 1)` returned 6. The gate's
+  predicate is therefore `params.length != 2`, which is `opSelfFnTy`'s own requirement,
+  so the reject's boundary IS the dispatch's boundary rather than a hand-drawn subset.
+  120 grid cells (5 operators x 4 arities x 3 receivers x quoted/symbol spelling); 60
+  moved `runs` -> loud check reject and the receiver column is flat, which is the row's
+  "strictly stronger than D425" claim measured rather than asserted.
 
-* **THE PARSER ACCEPTS IT AND THE LINTER ASSUMES IT WORKS.** `isOpFuncName` accepts the `-`
-  token and `isStrFuncName` accepts `"-"`, so both spellings declare. `compiler/lint.vl:1328`
-  says in its own words *"An operator method (`-x` → `function -(self)`) dispatches by
-  operator name"* and adds `n.unOp` to the reference set on that belief — so the declaration
-  is not even reported as unused. Three components in the tree disagree about whether this
-  feature exists.
+* **THE OBJECT RECEIVER — the one the user meant — WAS LOUD, AND WRONG.**
+  `type V = { x: i32 }` + `function -(self: V): i32 { return 99 }` + `-a` over `a: V`
+  was `unary '-' expects a numeric type, got V`. The two-parameter control dispatches:
+  `function -(self: V, b: V)` + `a - b` prints 99. The arity, not the receiver, was
+  what made it inert.
 
-* **PRICE.** Same D46 shape and the same choice: implement unary dispatch (a
-  `checkUnaryNode` arm mirroring `checkBinary`'s `if odsp is TyObj` plus an emitter path) or
-  reject the declaration. The reject is the cheaper half and is keyed on ARITY plus the
-  operator name, both of which `parseFuncTail` has — so unlike D425's binary case this one is
-  NOT blocked behind D402's root, because it needs no resolved type. Nothing in the tree
-  declares a one-parameter operator, so the reject costs no capability.
+* **THE PARSER ACCEPTED IT AND THE LINTER ASSUMED IT WORKED.** `isOpFuncName` accepts
+  the `-` token and `isStrFuncName` accepts `"-"`, so both spellings declared.
+  `compiler/lint.vl:1328` said in its own words *"An operator method (`-x` →
+  `function -(self)`) dispatches by operator name"* and added `n.unOp` to the reference
+  set on that belief — so the dead declaration was not even reported as unused. Three
+  components in the tree disagreed about whether this feature existed. **That comment is
+  the third rung of this landing and it is corrected, not deleted**: the `refNamesAdd`
+  call stays (it can only ever be handed `-`/`!`/`p+`/`p-`, none of which names a
+  declaration this linter tracks) and the comment now says why.
+
+* **THE DISASSEMBLY, which is what settles "inert" over "wrong".** On master the witness
+  emits TWO functions: `$0` is the declaration, `(func $0 (param i32) (result i32)
+  (return (i32.const 99)))`, compiled and present in the module; `$1` is the start,
+  and its body is `(i32.sub (local.get $0) (i32.const 1))` — the native subtraction,
+  with `$0` never called. A whole function shipped into the binary that nothing could
+  ever reach.
+
+* **REJECTED RATHER THAN IMPLEMENTED, on D46's own test: who is the customer?** Nothing
+  in the tree, in `std`, or in the 2,766-cell distilled corpus declares an operator at
+  any arity but 2 — the reject costs no capability. Building unary dispatch instead is a
+  new language feature (a `checkUnaryNode` arm, an emitter path, and a rep decision for
+  `-x` over a struct), and this row is not evidence anyone wants one; it is evidence the
+  compiler accepted a name no reference could ever be written for. `-` is not an
+  identifier so no call can be spelled (`-(3)` parses as unary minus on 3, measured),
+  and `a.-()` is a parse error, and the quoted form mints the identical name. That is
+  exactly what `index/operator-quoted-name-not-an-operator.vl` already refuses for
+  `function "shout"` and what `index/operator-arity.vl` already refuses for a mis-arity
+  `"[]"`. This was the third shape of the same reject and the only silent one.
+
+* **HOME: `parseFuncTail`, not the checker's hoist where D445's twin lives.** The brief
+  that opened this row recorded D46's `parseFuncHead` as unable to host a declaration-
+  site gate because "it sees spelling, not resolved type". **That is true of D445 and
+  false of D444**: arity is syntactic, and `parseFuncTail` already holds the parameter
+  list — it is where `indexOpDeclName` inspects it. No resolved type is needed, so
+  unlike D425 this row was never blocked behind D402.
+
+* **THE PRICE, AND THE VETO OVERRIDE.** 60 grid cells go `runs` -> loud check reject.
+  Every one of them ran *by coincidence rather than by rule*: the cell's own body says
+  the answer is 99 (or `true`) and the program printed the built-in's answer, which is
+  the `check-clean silently wrong` class the census records ZERO of in 250,238 cells.
+  The loss is LOUD, at the declaration's own line, and it is named and reversible —
+  `distilled/named/d444_*` carries all of it, with each cell's expectation set to the
+  DECLARATION's answer so that a future lift of the reject grades `runs but wrong value`
+  (silent, reported) rather than quietly reading `runs`. Outside the grid the price is
+  zero: **0 of 1,477 derived classes and 0 of the 2,655 pre-existing corpus cells moved,
+  and the corpus `cmp` is byte-identical on all 1,954 buildable modules** — re-measured
+  against master `5625840c` after #2004, where every number came back the same.
+
+* **THE GRID THAT DECIDED THIS ROW WAS WRONG TWICE, AND BOTH TIMES IT LOOKED FULLY
+  POPULATED.** Neither bug produced a gap, an error or an odd-looking column; each produced a
+  complete table of plausible verdicts that answered a different question from the one asked.
+  They are written down here because the next person building an operator grid will write
+  both.
+
+  **(1) The use site was held constant while the declared operator varied.** The first
+  generator carried a per-RECEIVER use expression — `print(a - b)` for the struct row — and
+  looped the operator over `-`, `+`, `*`, `/`, `<`. So the `<` cells DECLARED `function <(self:
+  V, other: V)` and then MEASURED `a - b`. Every one of them graded, none of them graded the
+  operator in its own declaration. The fix is one line — build the use site from `op` — and
+  the tell is that a cell's source should not be readable without finding the operator in two
+  places. This is #2001's `cell(): i32` wrapper one level out: there the harness's return type
+  reported the mismatch instead of the operator's, here the harness's operator did.
+
+  **(2) The `<` body returned the answer the built-in already gives.** Every operand pair in
+  the grid is `7 <op> 1`, so native `<` is `false` — and the declaration also returned `false`.
+  `d444_lt_a2_obj` (a struct receiver, which MUST dispatch) and `d444_lt_a2_i32` (a built-in
+  receiver, which must NOT) both graded `runs:false`, and the two are the only cells in the
+  whole grid that separate dispatch from inertness at arity 2. Twelve cells were reporting a
+  measurement they could not have made. Changing the body to `true` is the whole fix and it is
+  what turned the boundary half of the named set from decoration into evidence.
+
+  **THE RULE BOTH BREAK IS THE SAME ONE: a cell's expected answer must differ from the answer
+  it would give if the thing under test did nothing.** That is why `grade()` records
+  `runs:<stdout>` rather than a bare `runs`, and why every cell's body disagrees with the
+  built-in on its own operands — the discipline D425's row already recorded costing its grid
+  eight cells, applied one axis further in.
+
+* **WHAT THIS GATE DELIBERATELY DOES NOT TOUCH.** Arity 2 over a built-in receiver is
+  D425, still open and still blocked behind D402: `function -(self: i32, other: i32)` +
+  `print(a - 1)` still returns 6. All 40 `d425c*` refutation-pin cells are unmoved, and
+  22 arity-2 boundary cells are carried in `named/` to say so — including the one
+  comparison that separates dispatch from inertness at this seam, `d444_lt_a2_obj`
+  (`runs:true`, the declaration's answer) against `d444_lt_a2_i32` (`runs:false`, the
+  native one).
+
+Fixture: `tests/cases/objects/error-operator-arity-not-binary.vl`.
+Grid: `scripts/silent-sweep/d444/opgrid.py` (`--mkset` / `--verify`).
 
 ---
 
-### D445 — D425's shape at the INDEX operators: a `"[]"` declaration over a non-object `self` is silently ignored
-**check-clean silently wrong · found 2026-08-28 by D425's operator-family grid — the position the row's own price never counted · pre-existing and IDENTICAL on master `f9275d20` and on this branch**
+### D445 — [CLOSED 2026-08-28] a `"[]"` declaration over a BUILT-IN INDEXABLE `self` is silently ignored — and the swallow was already a contract
+**now a loud check reject · closed by a declaration-site gate at the pass-1 hoist, keyed on the RESOLVED receiver type · the filed title said "a non-object `self`" and that was WRONG: six non-object receivers dispatch correctly**
 
 Repro:
 
@@ -14100,27 +14211,122 @@ Repro:
 
     const xs: i32[] = [1, 2]
     print(xs[0])
-    // vl check rc 0. The declared index operator returns 99 unconditionally, so a
+    // WAS: vl check rc 0, PRINTED 1. The declared index operator returns 99
+    // unconditionally, so a dispatch would print 99.
+    // NOW: operator "[]" for i32[] can never dispatch: indexing i32[] is the
+    // language's own, never a user operator's
+
+* **THE FILED TITLE WAS WRONG AND THE CORRECTION IS THE ROW.** "A non-object `self`" is
+  not the population. The swallowed set is exactly `tyBuiltinIndexable`: arrays, maps,
+  strings, and aliases and newtypes over them. Measured over 15 receivers, six NON-OBJECT
+  ones **dispatch correctly today** and print the declaration's 99 — `i32`, `f64`, `i64`,
+  `boolean`, `new i32`, and the union `i32 | string`. A gate written from the filed title
+  would have condemned all six. They are kept in `named/` as `d445_{i32,f64,i64,bool,
+  new_i32,union}` precisely so the next reader cannot re-derive the wrong boundary.
+
+* **THE SWALLOW IS DELIBERATE, DOCUMENTED AND FIXTURE-LOCKED; it was only silent at the
+  DECLARATION.** `checkIndexNode` asks `tyBuiltinIndexable(arrTy)` before it ever looks
+  for an operator, and that function's own comment names it: *"A type whose indexing is
+  the LANGUAGE's, never a user operator's… **The swallow lives here** — a receiver that
+  answers true reaches the built-in arms exactly as it does with no operator declared
+  anywhere."* `tests/cases/index/operator-builtin-unaffected.vl` asserts it from the use
+  side as a contract. So this was never a dispatch that failed; it was one the language
+  had already decided would never happen, with nothing saying so. The close is therefore
+  not a new rule — it is the existing rule, said at the declaration.
+
+* **THE GATE ROUTES THROUGH `tyBuiltinIndexable` ITSELF** rather than re-listing its arms,
+  so the reject and the swallow cannot drift apart: the set refused is by construction the
+  set `checkIndexNode` walks past. It subtracts the two arms that function answers `true`
+  for out of CAUTION rather than knowledge — an un-pinned hole and the error type. A hole
+  is a LIVE receiver (`function "[]"<T>(self: T, i: i32)` dispatches for every
+  non-built-in receiver) and an error type is already reported at the annotation, so
+  refusing either would be a false reject on a line that already has one.
+
+* **IT CANNOT LIVE IN THE PARSER, and that is the difference from D444's twin.** An ALIAS
+  (`type Xs = i32[]`) and a NEWTYPE (`type Xs = new i32[]`) are both swallowed, and
+  neither is spelled `i32[]`; a generic `function "[]"<T>(self: T[], i: i32)` is swallowed
+  too. Only the resolved type separates them, so the gate sits at the pass-1 hoist beside
+  the arity check that is already there — whose own comment gives the reason: *"checking
+  it here means a malformed declaration is reported once, at itself, rather than at every
+  use site that fails to resolve."*
+
+* **STD IS NOT BROKEN AND NEVER WAS — the brief that opened this row said it was.** The
+  claim under grade was that `std/buffer.vl`'s four `"[]"`/`"[]="` exports are inert, so
+  "the standard library ships a capability that silently does not work". **They work.**
+  `F32View` and `I32View` are `new { base: i32, length: i32 }` — nominal STRUCTS, which
+  are not built-in indexable — so they are the row's own dispatching control, not its
+  population. Measured directly (`v[0] = 11; print(v[0])` over an `i32view`, cross-checked
+  against `b.loadI32(12)`), confirmed by the tree's OWN committed fixture
+  `tests/cases/std/buffer-view-bracket.vl` — cross-module dispatch on the nominal brand, both
+  spellings, compound writes — which prints `1.5 2.5 7 9 3.25 11 6 4`, exactly its `@log`
+  expectations, on this landing's seed; and confirmed in the emitted wasm: `$30` is `"[]" for I32View`
+  and its body is `(return_call $26)` into `getI32`, `$31` is `"[]=" for I32View` calling
+  `setI32`, and the start body calls all four. That is exactly the "one-line forward is a
+  real frame at the unoptimized rung" the module header documents. **The row's own text
+  never claimed std was broken** — it said std is a live CUSTOMER a declaration-site gate
+  must agree with, which is a different sentence and the correct one.
+
+* **ZERO CUSTOMERS FOR THE REJECTED SHAPE.** All 45 index-operator declarations in the
+  tree (std, tests, benches) have a named struct, newtype or generic receiver. Not one
+  has a built-in indexable `self`. The 46th, `index/operator-unannotated-self.vl`, is
+  already refused by the parser for a different reason (the declaration name cannot be
+  minted without the receiver's annotation).
+
+* **THE DISASSEMBLY IS THE ONE-VARIABLE COMPARISON.** Same program, one annotation
+  changed. With `self: i32[]` the index site emits `(array.get $0 …)` and the declared
+  function is emitted but never called — the dead `(i32.const 99)` body is still in the
+  module. With `self: i32` it emits `(call $0 …)`. `array.get` against `call` is the
+  swallow and the dispatch, in bytes.
+
+* **THE PRICE, AND THE VETO OVERRIDE.** 15 grid cells move: 13 `runs` -> loud check
+  reject and 2 `loud emit reject` -> loud check reject (a `"[]="` over a string, which was
+  already refused, only later and worse). The 13 ran by coincidence rather than by rule —
+  each printed the built-in's answer while its own body said 99 — the loss is loud at the
+  declaration, and `distilled/named/d445_*` carries all 30 cells of the family including
+  the 14 that must NOT move. Outside the grid: 0 of 1,477 derived classes, 0 of the 2,655
+  pre-existing corpus cells, and corpus `cmp` byte-identical on 1,954 modules.
+
+Fixture: `tests/cases/index/operator-builtin-receiver-rejected.vl`.
+Grid: `scripts/silent-sweep/d444/opgrid.py` (`--mkset` / `--verify`).
+
+---
+
+### D471 — an arity-2 operator whose first parameter is NOT named `self` is inert at every receiver
+**check-clean silently wrong · found 2026-08-28 by D444's grid, filed not fixed · the last shape of the operator-declaration family that is still silent and NOT blocked behind D402**
+
+Repro:
+
+    function -(z: i32, b: i32): i32 {
+      return 99
+    }
+
+    const a: i32 = 7
+    print(a - 1)
+    // vl check rc 0. The declared operator returns 99 unconditionally, so a
     // dispatch would print 99.
-    // PRINTS 1
+    // PRINTS 6
 
-* **THE SAME AT EVERY NON-OBJECT RECEIVER WITH A NATIVE INDEX.** `self: string` over
-  `s[0]` prints **97** (the native char code), and `"[]="` over an `i32[]` writes natively
-  (`xs[0] = 5` then `xs[0]` prints **5**, not the declaration's value). Control: `"[]"` and
-  `"[]="` over a declared struct dispatch — a `Box` with a `d: i32[]` field prints 99 for the
-  read and 105 for the read-after-write through a declaration that adds 100.
+* **IT IS THE POLLUTION RULE, AND IT IS RECEIVER-INDEPENDENT.** `opSelfFnTy` requires
+  `p0.parName == "self"` and returns -1 before it consults any type — its own comment
+  calls this "the pollution rule". So unlike D425, whose answer depends on whether the
+  receiver is a `TyObj`, this one is inert at EVERY receiver including a struct:
+  `function -(z: V, b: V)` over `type V = { x: i32 }` is a loud
+  `field access receiver is not a struct`, and over `i32` it silently returns the native
+  answer. That makes it D444's shape (a syntactic predicate, no resolved type, not
+  blocked behind D402) rather than D425's.
 
-* **THE POPULATION IS REAL, WHICH IS WHY IT IS FILED SEPARATELY FROM D425.** `std/buffer.vl`
-  exports four index operators (`"[]"`/`"[]="` over `F32View` and `I32View`) and five
-  fixtures declare more. D425's price rested on "nothing in the tree declares one"; that is
-  true of the BINARY operators and false here, so a declaration-site gate has a live std
-  customer to agree with and cannot be written from the binary rule alone.
+* **DELIBERATELY NOT CLOSED WITH D444, and the reason is that it is a different
+  question.** D444's predicate is arity, which `opSelfFnTy` requires for a mechanical
+  reason. The `self` NAME requirement is a language DESIGN choice about namespace
+  pollution, and refusing a declaration for violating it means deciding that
+  `function -(z, b)` is not a legal ordinary function either — which is true today only
+  because `-` cannot be spelled as a call. Folding it into an arity gate would have
+  shipped that decision without stating it.
 
-* **THE DISPATCH IT MISSES IS A DIFFERENT ONE.** Index dispatch resolves by the RECEIVER'S
-  TYPE through `opIdxBindGen` / the `"[]"` lookup in `typecheck.vl`, not through
-  `checkBinary`'s `if odsp is TyObj`. So the reachability predicate for a `"[]"` declaration
-  is its own question and its own measurement — the second of the three D425's corrected
-  price counts.
+* **PRICE, MEASURED.** Zero customers: no operator declaration in the tree, in `std`, or
+  in the 2,763-cell distilled corpus has a non-`self` first parameter (scanned, 58
+  declarations). The gate is one clause beside D444's in `parseFuncTail`, so the
+  implementation cost is a line; what is unpriced is the design decision above.
 
 ---
 
