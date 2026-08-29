@@ -15,7 +15,10 @@ neither grid crosses and one nobody had looked at:
         index receiver, D471's `self` name, D425's `self` type, D491/D521's deadness —
         lives in `checkProgram`'s pass-1 hoist, which walks `gRootStmts` ONLY. A
         `function "+"` nested inside a function body escaped all six, at BOTH `self`
-        spellings, and it can never dispatch at any receiver.
+        spellings, and it can never dispatch at any receiver. The axis has THREE values,
+        not two: a declaration in a top-level `if true { … }` BLOCK is equally outside
+        that list and was equally silent, which is only visible because the position was
+        written down as an axis rather than assumed to mean "inside a function".
 
 EVERY CELL SHIPS WITH ITS OWN DO-NOTHING CONTROL — the cell's program with the
 DECLARATION DELETED and nothing else changed, so it IS, by construction, the answer the
@@ -60,7 +63,7 @@ OPN = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "rem", "^": "pow",
        "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
 SPELL = {"tok": "{op}", "quo": '"{op}"'}
 ANN = {"unannot": "", "annot": "i32"}
-POS = ("top", "nest")
+POS = ("top", "nest", "blk")
 RECV = ("i32", "obj")
 
 
@@ -98,11 +101,23 @@ def cell_src(op, spell, ann, pos, recv, with_decl=True):
         if with_decl:
             lines.append(d)
         lines += [ba, bb, "print(a %s b)" % op]
-    else:
+    elif pos == "nest":
         lines.append("function outer() {")
         if with_decl:
             lines.append("  " + d)
         lines += ["  " + ba, "  " + bb, "  return a %s b" % op, "}", "print(outer())"]
+    else:
+        # THE BLOCK POSITION — the SAME gap, and NOT the same nesting. A top-level
+        # `if true { … }` body is as far outside `gRootStmts` as a function body is, and
+        # it was silent on `042624e1` too. It is its own axis value because the rule's
+        # test is membership of that list, not "is inside a function": the first cut's
+        # message said the latter and was simply wrong here, which is what this row
+        # found by writing the axis down instead of assuming the two were one.
+        lines.append("if true {")
+        if with_decl:
+            lines.append("  " + d)
+        lines.append("}")
+        lines += [ba, bb, "print(a %s b)" % op]
     return "\n".join(lines) + "\n"
 
 
@@ -202,15 +217,16 @@ def d425_blind(k, v):
 # `comparison expects numeric operands`), so these run ONLY because the declaration
 # fired — the strongest form of the do-nothing rule this family has.
 #
-# PRICE — D541's forty: a nested declaration at an i32 receiver, at both `self`
-# spellings, which RAN and printed the built-in's answer on `042624e1` and is a loud
-# check reject on the landing. Nothing in the standing corpus declares an operator
+# PRICE — D541's eighty: a declaration below module scope at an i32 receiver, at both
+# `self` spellings and at BOTH nestings (a function body and a top-level `if` block),
+# which RAN and printed the built-in's answer on `042624e1` and is a loud check reject on
+# the landing. Nothing in the standing corpus declares an operator
 # below module scope (measured: zero `.vl` under tests/, std/, compiler/ or
 # distilled/), so this price costs the gate nothing — which is exactly why it has to be
 # written down here instead, or the next lift pays it back invisibly.
 BOUNDARY = [cell_id(op, sp, "unannot", "top", "obj") for op in OPS for sp in SPELL]
-PRICE_NEST = [cell_id(op, sp, an, "nest", "i32")
-              for op in OPS for sp in SPELL for an in ANN]
+PRICE_NEST = [cell_id(op, sp, an, ps, "i32")
+              for op in OPS for sp in SPELL for an in ANN for ps in ("nest", "blk")]
 
 
 def grade_one(src, seed):

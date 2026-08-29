@@ -31,6 +31,10 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   and the class stayed silent through six landings. **The question that finds this is not
   "is the predicate right" but "over what population is it evaluated" — and it is cheap:
   the answer was one grep for an indented operator declaration and one four-line program.**
+  The same question fired again one level down: writing the POSITION as a grid axis rather than
+  assuming it meant "inside a function" is what showed a top-level `if` BLOCK is equally
+  outside `gRootStmts` — and that the fix's own first message was false of half the
+  population it catches.
 
 - **A REACH PROBE ON ONE SITE MEASURES A NUMBER; IT DOES NOT MEASURE A CAUSE — PUT THE
   SAME PROBE ON THE CALLERS** (2026-08-29, silent-class-inventory D501 / #2012). D411's

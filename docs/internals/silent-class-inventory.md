@@ -14900,7 +14900,7 @@ Repro (now a loud check reject):
   inert. That is the older ledger's axes failing the do-nothing rule `d471/opdeclgrid.py`
   later mechanised. Term (c) is still decidable for them and it is decided by RUNNING a
   distinguishing TWIN (the same program returning `true`, measured inert), reported in
-  its own column. The new grid uses `7, 1` and **0 of its 160 cells are blind**.
+  its own column. The new grid uses `7, 1` and **0 of its 240 cells are blind**.
 
 * **A SECOND FILED CLAIM IS FALSE, AND IT IS IN THE COMPILER'S OWN COMMENT.** The row
   said *"`binOpDeadSelf` lists the un-annotated `self` as its OWN subtraction, separate
@@ -14934,10 +14934,11 @@ Repro (now a loud check reject):
   `bankUn=1 siteTake=0 siteDecl=1 endUn=1` — reach and answer, both channels.
 
 * **0 DISPATCH CELLS LOST, over a grid that crosses the axis both ways.**
-  `scripts/silent-sweep/d521/unannotgrid.py` is 160 cells — 10 operators x 2 name
-  spellings x annotated/un-annotated `self` x top-level/nested x i32/object receiver,
-  each with its own do-nothing control. Base: `dispatch=40, inert=60, loud=60`. Landing:
-  `dispatch=40, inert=0, loud=120`. **The 40 dispatching cells are the same 40**, and 20
+  `scripts/silent-sweep/d521/unannotgrid.py` is 240 cells — 10 operators x 2 name
+  spellings x annotated/un-annotated `self` x top-level/nested/block x i32/object
+  receiver, each with its own do-nothing control. Base: `dispatch=40, inert=100,
+  loud=100`. Landing: `dispatch=40, inert=0, loud=200`. **The 40 dispatching cells are
+  the same 40**, and 20
   of them are un-annotated `self` at an object receiver — the population this rung is
   licensed to spare, now kept whole in `named/` as `d521-unannot-self-dispatch` with a
   control that is LOUD at all ten operators, so they run only because the declaration
@@ -14978,8 +14979,8 @@ Repro (now a loud check reject):
     print(outer())
     // was: vl check rc 0, PRINTS 10 — the built-in's answer, not the declaration's 99.
     // Now: operator `+` can never dispatch: a binary operator must be declared at
-    //   MODULE SCOPE, and this declaration is nested inside a function — move it to
-    //   the top level
+    //   MODULE SCOPE, and this one is nested inside a function body or block — move
+    //   it to the top level
 
 * **FIVE GATES, ONE POSITION, AND NONE OF THEM LOOK AT IT.** D444's arity, D445's index
   receiver, D471's `self` name, D425's `self` type and D491/D521's whole-program deadness
@@ -14998,10 +14999,20 @@ Repro (now a loud check reject):
   agrees: the nested declaration compiles to an empty closure body
   `(func $1 (param structref))` that nothing calls, while the site emits `i32.add`.
 
-* **THE PRICE IS 40 GRID CELLS AND ZERO CORPUS CELLS, AND THAT IS THE REASON TO WRITE IT
+* **THE POSITION AXIS HAS THREE VALUES, NOT TWO, AND THE THIRD CAUGHT THIS ROW'S OWN
+  MESSAGE BEING WRONG.** A declaration inside a top-level `if true { … }` BLOCK is as far
+  outside `gRootStmts` as one inside a function body, and it was silent on `042624e1`
+  too — `if true { function "+"(self: i32, other: i32): i32 { return 99 } }` beside
+  `print(a + b)` is rc 0 and prints 10. The first cut's sentence, *"this declaration is
+  nested inside a function"*, was therefore false of half the population the rule catches.
+  It was found by writing the position down as a grid AXIS rather than assuming the two
+  nestings were one thing — the cheap version of the same question that found the row:
+  **over what population is this evaluated?**
+
+* **THE PRICE IS 80 GRID CELLS AND ZERO CORPUS CELLS, AND THAT IS THE REASON TO WRITE IT
   DOWN.** No `.vl` under `tests/`, `std/`, `compiler/` or the distilled corpus declares a
   binary operator below module scope — so the standing gate is BLIND to this price and a
-  later lift would pay it back invisibly. The 40 are in `named/` whole as
+  later lift would pay it back invisibly. The 80 are in `named/` whole as
   `d541-nested-operator-declaration`, each with the DECLARATION's answer recorded, so a
   lift that makes them dispatch grades `runs` and one that makes them inert again grades
   `runs but wrong value` rather than quietly reading `runs`.
