@@ -15353,10 +15353,21 @@ Repro (now a loud check reject):
   found it.
 
 * **IT IS NOT ABOUT OPERATORS, and the grid that found it said so** — the witness declares no
-  overload. But it IS one landing with D532's third rung: see that row. With D532's
+  overload. But the LANDING is inseparable from D532's third rung: see that row. With D532's
   annotated-body bound still in place, the constraint is handed the no-dispatch answer and
   two corpus modules false-reject; the bound is removed here and D532's eight filed residue
-  cells RUN as a consequence.
+  cells RUN as a consequence. "Not about operators" is true of the DEFECT and false of the
+  FIX, and only building the fix said so.
+
+* **THE ONE FALSE CLAIM THIS ROW CARRIED, corrected by measuring it.** It said closing the row
+  "would close the four `d532x_*_retobj_i32pin_typar` cells … reached through an ordering
+  operator". Both halves are wrong, and the row's own header had the right answer two lines
+  up. The **four ordering** cells (`lt le gt ge`) were already LOUD on master — there was
+  nothing silent to close; they are `check` -> `check` and only the MESSAGE moves, from the
+  body's own `return type mismatch: expected V, got boolean` to the pin's, positioned at the
+  call. What actually closes is the **six** arithmetic cells (`add sub mul div rem xor`), the
+  exact set the header named, `invalid` -> `check`. The ordering operators were a red herring
+  twice over: they are what the grid's block was ABOUT, not what was silent in it.
 
 * **FOUR RUNGS, ABLATED ONE AT A TIME** on `d551/retgrid.py` (612 cells; `STRIP_ALL`
   reproduces the base seed byte-for-byte, md5 `027e4b71…`):
