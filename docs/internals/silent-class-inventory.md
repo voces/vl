@@ -15711,57 +15711,111 @@ Repro (now a loud check reject):
   the destination (D581) and a BUILTIN collection method's argument (D582). Everything else
   probed closes: a map value write, an object literal's field, a nested field write, an
   un-annotated relay of either literal, and the two-level relay above. The grid's `residue`
-  list is empty and derived, not asserted.
+  list is empty and derived, not asserted. **BOTH ARE CLOSED (2026-08-29), AND ONE OF THE TWO
+  DIAGNOSES ABOVE IS WRONG**: the array literal does NOT adopt the annotation and this
+  table's constraint IS recorded for it — see D581, where the mechanism turned out to be
+  `assignableExpr`'s element read and a THIRD mechanism (the element join dropping the hole)
+  that only a grid found.
 
 ---
 
-### D581 — an ARRAY LITERAL adopts its destination's element type, so a hole-typed ELEMENT inside it is never compared
-**check-clean invalid wasm · found 2026-08-29 as the measured residue of D572's close · the
-one destination D572's table cannot reach because the mismatch never becomes a TYPE**
+### D581 — [CLOSED 2026-08-29] an ARRAY LITERAL's ELEMENT was compared against the element's own NODE type, which at the pin still holds the UN-SUBSTITUTED hole
+**closed 2026-08-29 · the filed repro is now a loud check reject — `cannot assign i32[] to
+'xs' of type string[] (the body of `g` at the call's argument types)` · was `check-clean
+invalid wasm` · found 2026-08-29 as the measured residue of
+D572's close · 427 cells of `scripts/silent-sweep/d581/litgrid.py` moved, 389 of them
+silent -> a loud reject; 593 cells + twins kept whole in `distilled/named/` · closed in ONE
+PR with D582, which the ablation shows is a SEPARATE landing**
 
-Repro:
+Repro (now a loud check reject):
 
     function g<T>(self: T): string {
       const xs: string[] = [self]
       return xs[0]
     }
     print(g(6))
-    // vl check rc 0. vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found i32
+    // vl check rc 1:
+    //   cannot assign i32[] to 'xs' of type string[] (the body of `g` at the call's
+    //   argument types)
 
-* **IT IS NOT D572 WITH A RUNG MISSING — THE SEAM IS ASKED AND ANSWERS YES.** `seedExpected`
-  contextually types the initializer against the annotation BEFORE it is checked, so the
-  array literal adopts `string[]` and `initTy` is `string[]` with no hole anywhere in it.
-  `assignableExpr(string[], string[])` is true, `noteLetCstr`'s gate sees no hole, and
-  nothing is recorded. The i32 is inside the literal, one level below the type the
-  destination compares. The direct spelling is a loud `cannot assign i32[] to 'xs' of type
-  string[]` — the literal's own element type, because there is no annotation to adopt.
+* **THE FILED MECHANISM WAS WRONG, AND THE REAL ONE IS ONE LEVEL DEEPER.** The row said
+  `seedExpected` contextually types the initializer against the annotation so the literal
+  ADOPTS `string[]` and `initTy` carries no hole. It does not. `seedExpected`'s `ArrayLit`
+  arm only recurses into the elements against `et.aElem`, and an Ident element takes nothing
+  from it; `checkArrayLitNode` returns `mkArrayTy(T)`, so **`initTy` is `T[]` and
+  `tyHasHole` answers YES**. The constraint IS recorded and IS re-asked. A `PROBE-LET` /
+  `PROBE-PIN` pair reads `initTy=T[] hole=YES` at the declaration and
+  `lg=i32[] lw=string[] gHole=no wHole=no assignableExpr=YES` at the pin — the substituted
+  pair reaches the pin correctly and **the PREDICATE throws the substitution away**.
 
-* **THE OBJECT LITERAL IS NOT SUBJECT TO THIS ROW, AND THAT SEPARATES THE TWO.** It was
-  silent on the base like everything else in D572's family, and D572 CLOSED it: `const b: Bx = { v:
-  self }` is a loud reject there (`cannot assign {v: i32} to 'b' of type Bx`), because
-  `assignableExpr`'s field-wise object-literal recursion compares the field and refuses, so
-  the mismatch survives as a type and D572's table records it. Routing the array literal
-  through an UN-annotated binding first also closes it — `const tmp = [self]  const xs:
-  string[] = tmp` is a loud reject on the landing — which is the executable proof that the
-  contextual adoption, not the seam, is the mechanism.
+* **`assignableExpr`'s ARRAY-LITERAL RECURSION READ THE ELEMENT'S NODE, ITS OBJLIT SIBLING
+  READS THE CONTAINER, AND THAT ASYMMETRY IS THE WHOLE ROW.** The array arm asked
+  `assignableExpr(elem, nodeTyIxOf(elem), d.aElem)` — the element NODE's own recorded type,
+  which is the precise answer at the body's first ask and is STALE at the pin: it still says
+  `T`, so `assignable(T, string)` waves every element past. Twenty lines up the ObjLit arm
+  asks `objFieldType(srcTy, name)` — off the SUBSTITUTED container the caller handed in. So
+  the row's claim that "the object literal is not subject to this and that separates the
+  two" is TRUE, and its stated reason is not: D572's table records BOTH (`PROBE-PIN` on
+  `const b: Bx = { v: self }` reads `lg={v: i32} lw=Bx assignableExpr=no`). What separates
+  them is which side of the recursion reads the substituted type. `litElemSrcTy` makes the
+  array arm read the same way — the container's element WHENEVER the node's own record is
+  hole-bearing and the container's is not, which is exactly the pin's condition and never
+  the body's.
 
-* **BOTH SPELLINGS OF THE DESTINATION, and they are the same cell.** `const xs: string[] =
-  [self]` and `xs = [self]` are both silent for the one reason; the write seam adopts the
-  destination's element type exactly as the declaration seam does.
+* **A THIRD MECHANISM THE ROW DID NOT NAME, AND ONLY A GRID FOUND IT.** `[true, self]` joins
+  `boolean` with `T` through `joinTys`; a hole is permissively assignable BOTH ways, so the
+  mutual-assignability collapse keeps `boolean` and **DROPS the hole entirely**. `initTy` is
+  a hole-free `boolean[]`, nothing is recorded, and no predicate fix can help — 38 grid cells
+  (`shape=arr2`), including two that VALIDATE and print `false` for an i32. It is the same
+  soundness note `joinRetTys` carries for the return accumulator ("a HOLE must not collapse
+  HERE"), at the array literal's element join, where nobody had asked it. Asked per SLOT
+  (`noteLitElemCstrs`), and only where the container-level pair carried no hole.
 
-* **THE ASK IS THE ELEMENT, NOT THE COLLECTION.** A fix records the ELEMENT pair
-  (`self`'s hole against the destination's element type) at the point the literal adopts the
-  annotation, and re-asks it under substitution — a per-element constraint, not a sixth
-  entry in D572's table, because the type the table would record has already agreed.
+* **THE ROW'S OWN SUGGESTED FIX WAS WRITTEN, MEASURED AND REFUSED.** "Record the ELEMENT
+  pair at the point the literal adopts the annotation" is right for the join-dropped case and
+  wrong as the general rule; the OTHER candidate — reconstruct the dropped union through
+  `joinRetTys` and record `(boolean | T)[]` as the container's type, which reproduces the
+  direct spelling's sentence VERBATIM — is `scratch`-buildable as
+  `REFUSED.wasm` (md5 `30f1c618…`) and costs two cells that RUN CORRECTLY:
+  `const xs: i32[] = [0, self]` at `g(true)` prints `1` through the A7 coercion, and with the
+  union recorded the pin hands every element the JOIN of all of them and refuses it.
+  `d581_arr2_i32_bool_*` is that price, it is in `named/`, and `litgrid.py --verify` scores it.
+
+* **EVERY RUNG ABLATED, BUILT WITH ONE FIXED SEED SO THE ONLY VARIABLE IS THE SOURCE.** R1
+  (the element read) buys 161 cells, R2 (D582's table) buys 196, R3 (the slot walk) buys 32,
+  and the three are **exactly additive** — 181 + 210 + 36 = 427 moved, with every pair and the
+  triple hitting the sum on the nose. That additivity is the measurement that says D581 and
+  D582 are TWO landings in one PR and not one: their moved sets are disjoint. `STRIP` — all
+  three rungs and both helpers out — reproduces the base compiler BYTE FOR BYTE (md5
+  `262dce49…`, 1,500,155 bytes), and the stripped SOURCE is textually identical to the base's.
+
+* **THE PRICE IS 38 CELLS AND IT IS EXACTLY THE WRONG-VALUE SET.** Every cell this landing
+  takes ran on the base printing a value its own declaration contradicts — an i32 into a
+  `boolean[]` printing `false`, a boolean into an `f64[]` printing `1` — and every one has a
+  LOUD direct twin. Measured, not asserted: `runs lost = 38`, `wrong value fixed = 38`, and
+  the two sets are equal with an empty symmetric difference. The four terms hold: they run by
+  coincidence of rep, the loss is loud and says what the direct spelling says, and
+  `litgrid.py --price` re-checks all 38 against any seed (rc 2 wrong seed by md5, rc 1 veto,
+  rc 0 held; it FAILS on an empty population).
+
+* **WHAT IS STILL SILENT AFTER THIS, DERIVED RATHER THAN ASSUMED.** The grid's `residue` list
+  — cells still silent beside a LOUD direct twin — is **empty**. Five cells still disagree
+  with their twin and all five are accounted for: D571's forge (deliberate), two whose DIRECT
+  spelling is itself a miscompile (D591, which this landing does not touch), and two where an
+  un-annotated relay of a struct array meets `emitProgram: struct array elements are not
+  supported` — a LOUD emit reject beside a running direct twin, which is a capability gap and
+  not a silent one. Corpus `cmp`: **1,966 identical, 0 DIFFER, 0 LOST** over the whole module
+  graph.
 
 ---
 
-### D582 — a BUILTIN collection method's argument is never re-asked at the pin, because `argCstr` only covers a callee it can NAME
-**check-clean invalid wasm · found 2026-08-29 as the measured residue of D572's close · the
-second of the two destinations that survive it**
+### D582 — [CLOSED 2026-08-29] a BUILTIN collection method's argument was never re-asked at the pin, because `argCstr` only covers a callee it can NAME
+**closed 2026-08-29 · the filed repro is now a loud check reject — `push: cannot add i32 to
+string[] (the body of `g` at the call's argument types)` · was `check-clean invalid wasm` · found 2026-08-29 as the measured residue of D572's close · the
+SEVENTH deferred table (`bmCstr*`), 196 cells of `scripts/silent-sweep/d581/litgrid.py`
+blocks B and S · closed in ONE PR with D581, which the ablation shows is a SEPARATE landing**
 
-Repro:
+Repro (now a loud check reject):
 
     function g<T>(self: T): string {
       const xs: string[] = []
@@ -15769,26 +15823,122 @@ Repro:
       return xs[0]
     }
     print(g(6))
+    // vl check rc 1:
+    //   push: cannot add i32 to string[] (the body of `g` at the call's argument types)
+
+* **THE FILED MECHANISM IS RIGHT AND THE FILED WIDTH WAS AN UNDER-COUNT BY SEVEN.** The row
+  said "at least two builtins"; block B grades the whole surface and finds **fourteen argument
+  arms over three receiver kinds**, every one silent beside a loud direct twin: array
+  `push` / `get`(index) / `slice`(bound); map `set`(key AND value) / `get` / `has` / `delete`;
+  set `add`; and the six string methods that take a typed argument — `indexOf`, `includes`,
+  `charCodeAt`, `slice` (both bounds), `cpAt`, `isCharBoundary`. The row's note that
+  `xs.unshift` does not exist is correct and is why the surface was measured over the
+  builtins that DO exist. `xs[0] = self` and `m["k"] = self` are NOT part of it: those are
+  D572's own element and map writes and were already loud.
+
+* **THE SEVENTH TABLE, AND WHY IT COULD NOT BE THE FIFTH.** `argCstrAt`/`argCstrExp` is
+  recorded from the user-function call path and its pin asks plain `assignable` with no
+  argument NODE in hand. Both are disqualifying here: a builtin has no `FuncDecl` to be the
+  owner, and three of the fourteen arms ask `assignableExpr`, so a plain-predicate pin would
+  refuse `xs.push(self)` over an `i32[]` at `g(true)` — a program that RUNS and prints `1` on
+  every seed through the A7 coercion, which is D551's first cut repeated one callee kind over.
+  `bmCstr*` carries the argument node, and `bmArgPred` keys the predicate off the sentence
+  FORM: `assignableExpr` for `push` and `set`'s value, `assignable` + the newtype retry for
+  `set`'s key, plain `assignable` for the other ten. Asking the expression predicate where the
+  arm asks the plain one leaks the other way — `"abc".charCodeAt(self)` at `g(true)` is a loud
+  `charCodeAt expects an i32 index, got boolean` directly and would slip past through the same
+  coercion.
+
+* **THE MESSAGE IS THE ARM'S OWN, IN ONE HOME.** `bmArgMsg` renders all twelve sentence forms
+  and BOTH the arm and the pin call it — `letAssignMsg`'s discipline, for the reason D492/D493
+  paid for: a second copy of a diagnostic drifts. `validateArgCstrs`' generic "argument of type
+  X flows into `f` expecting Y" was the cheaper option and was not taken, because the direct
+  spellings here say fourteen different things and the pin repeating them verbatim is what
+  makes the parity argument checkable rather than plausible.
+
+* **BOTH SIDES OF THE GATE, AND BOTH CALLERS, FROM THE START.** #2019 found the re-deferral
+  gate at `validateRetCstrs` and `validateLetCstrs` asking only whether the BODY side still
+  held a hole, so a want-side widening evaporated across one relay; this table's gate asks
+  `tyHasHole(bg) || tyHasHole(bw)` and the mirror (`function g<T>(xs: T[], v: i32) {
+  xs.push(v) }`) is a standing cell. Both PINS are wired — the direct-call one and the UFCS
+  one — and the counter probe reads `pinPlain=1 pinUfcs=0` for `g(p)` and `pinPlain=0
+  pinUfcs=1` for `p.g()`, so the asymmetry D401, D551 and D572 each had to fix after the fact
+  is measured absent rather than assumed.
+
+* **`std` IS A HEAVY USER OF COLLECTION METHODS AND PAYS NOTHING.** Corpus `cmp` over the
+  whole module graph: **1,966 identical, 0 DIFFER, 0 LOST**. The counter probe on `std/str.vl`
+  reads `slot reach=23 note=0` and `bm note=0` — the new walks run over real std code and
+  record nothing, because nothing there stores through a hole.
+
+* **ONE COMPILER TRAP WAS FOUND BY THE CORPUS INSTRUMENT AND BY NOTHING ELSE.** The slot walk's
+  destination peel read `T.tys[dtix]` before testing the index, and `let x = null` binds
+  `mkNullableTy(-1)` — a nullable whose inner is not yet a type, which `tyHasHole` answers
+  FALSE for. One peel takes the index to `-1` and the second read TRAPS the compiler: 33 corpus
+  modules, `tests/cases/types/infer-null-reassign.vl` first. Every grid cell, every histogram
+  and every `runs`/`not-runs` column was unmoved; only `cmp`'s LOST column saw it.
+
+---
+
+### D591 — a NON-generic array literal joining `boolean` with `i32` is accepted element-wise and then built as the joined union
+**check-clean invalid wasm · found 2026-08-29 by `scripts/silent-sweep/d581/litgrid.py`'s
+`arr2` block, in the DIRECT twin column · unmoved by D581/D582's landing, and reproduces
+identically on the base seed**
+
+Repro:
+
+    const b = true
+    const xs: i32[] = [0, b]
+    print(xs[1])
     // vl check rc 0. vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found i32
+    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
 
-* **THE DEFERRED ARGUMENT TABLE IS FOR DECLARED CALLEES.** `argCstrAt`/`argCstrExp` is
-  recorded from the user-function call path and adjudicated by `validateArgCstrs`; a builtin
-  method has no `FuncDecl`, so its argument check is the builtin's own arm and there is
-  nothing to defer. The direct spelling is a loud `push: cannot add i32 to string[]`, which
-  is that arm speaking — under a hole, `assignable(T, string)` waves the value past it and
-  the arm never fires.
+* **NO GENERIC IS INVOLVED, WHICH IS WHY IT IS ITS OWN ROW.** `checkArrayLitNode` joins the
+  element types to `i32 | boolean`, so `assignable((i32|boolean)[], i32[])` is false — and
+  `assignableExpr`'s ARRAY-LITERAL recursion then accepts the literal element-wise, because
+  each element on its own fits (`0` is an i32; `b` takes the A7 boolean-into-i32 coercion).
+  The literal is accepted with the JOINED element type still recorded on its node, and the
+  emitter builds the union list into an `i32[]` slot.
 
-* **AT LEAST TWO BUILTINS, and the second has a different message.** `m.set("k", self)` into
-  a `{[string]: string}` is the same silent outcome beside a loud `set: expected string, got
-  i32`. Both are unmoved by D572's landing, which is what says the table cannot reach them.
-  (`xs.unshift` does not exist — `no method '.unshift' on array string[]` on every seed —
-  so the family's width is measured over the builtins that DO exist, not assumed.)
+* **IT IS WHAT MAKES TWO CELLS OF D581'S GRID DISAGREE IN THE OTHER DIRECTION.**
+  `d581_arr2_i32_bool_*` are generic programs that RUN and print `1` — the right answer —
+  beside a DIRECT twin that is this defect. They are in `named/` as `deliberate`, and the
+  third rung was chosen per-SLOT partly so the generic spelling keeps agreeing with what the
+  direct spelling MEANS rather than with what it currently does.
 
-* **IT IS THE SAME SHAPE AS D401, ONE CALLEE KIND OVER.** D401 is the deferred PRINT
-  capability, which exists precisely because `print` is not a declared callee either. A
-  builtin-argument constraint is the same construction: record the pair keyed on the builtin
-  and the argument position, re-ask it under `substTyDeep`.
+* **THE FIX IS PROBABLY THE ELEMENT-WISE ACCEPTANCE RECORDING WHAT IT ACCEPTED.** The
+  recursion returns `ok` without re-stamping the literal's node type to the destination array
+  the way the litunion and niche arms do; a `recordRepTyAdopt` on the accepted path is the
+  shape to try. Not attempted here: it is an emitter-rep question on a NON-generic path, and
+  the two rows this PR closes are both about the pin.
+
+---
+
+### D592 — an UN-ANNOTATED return whose value is read out of a hole-typed local array is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-29 while building D581/D582's control fixture ·
+unmoved by their landing, and reproduces identically on the base seed**
+
+Repro:
+
+    function g<T>(self: T) {
+      const xs: T[] = [self]
+      return xs[0]
+    }
+    print(g("s"))
+    // vl check rc 0. vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
+
+* **ONE TOKEN SEPARATES IT FROM A PROGRAM THAT RUNS.** Declaring the return —
+  `function g<T>(self: T): T` — makes the identical body run and print `s`. So the defect is
+  in the RETURN INFERENCE off a derived-hole element read (`?elem.T`), not in the local or
+  the literal: the inferred return reaches the emitter as an i32-repped hole while the
+  instance returns a `(ref $type)`.
+
+* **IT IS NOT D581's AND NOT D551's.** D581 is the destination seam and this program's
+  destination is correct at every instance (`T[]` fed the hole itself — it is D581's own
+  `okhole` control). D551/D561 are about a DECLARED return, and this row is about the absence
+  of one. `tests/cases/generics/literal-and-builtin-hole-at-pin-keeps.vl` declares the `: T`
+  return on both `okhole` lines FOR THIS REASON, and says so, so the control cannot import
+  this defect and read as a regression of the pin.
 
 ---
 
