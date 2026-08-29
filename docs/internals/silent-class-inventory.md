@@ -9649,8 +9649,8 @@ Repro:
 
 ---
 
-### D207 — the LOUD half of the same root: the `-3` map-value floor, DELIBERATELY not taken
-**loud emit reject · found 2026-08-27 by the CENSUS grid's `rep × cont` matrix · the same seam as D203 reported through the mv layer's unsupported-value sentinel instead of through invalid wasm — and the half D203's rung is BOUNDED away from, measured**
+### D207 — [CLOSED 2026-08-28] the LOUD half of the same root: the `-3` map-value floor, and the bound another row's fix paid off
+**closed 2026-08-28 — the filed repro RUNS and prints `7` · was `loud emit reject` (`emitProgram: unsupported map value type`) · found 2026-08-27 by the CENSUS grid's `rep × cont` matrix · THE ROW WAS RIGHT ABOUT ITS OWN UNBLOCKER AND WRONG ABOUT NOTHING ELSE: it named "closing D181 is what unblocks this row", D181 closed the next day, and the 889-cell price it was refused for is now measured at ZERO**
 
 Repro:
 
@@ -9662,44 +9662,116 @@ Repro:
     const g0 = (c)["k0"] ?? Map()
     const g1 = (g0)["k0"] ?? { r: 0 }
     if (g1).r != null { print(7) } else { print(0) }
-    // before: vl run:
-    //   emitProgram: unsupported map value type (no rep for a union-member struct, a
+    // now: runs, prints `7`.
+    // was: emitProgram: unsupported map value type (no rep for a union-member struct, a
     //   nullable list over an unnamed element rep, or a nullable litunion-result closure;
     //   any other value type here interned no mv slot)
 
-* **THE MESSAGE'S OWN TAIL CLAUSE NAMES IT CORRECTLY**: "any other value type here interned
-  no mv slot" — a compiler gap, not a language limit. `structIndexByValName("{r:i32}")`
-  refutes `Circle`'s row (the render's field code is 0, the row's is the union box), so the
-  layer has no kind at all for a value it lowers perfectly well under the destination's name.
-* **D203'S RUNG COULD ANSWER IT AND IS BOUNDED AWAY FROM DOING SO, ON A MEASUREMENT.** The
-  destination is consulted only where the initializer's own resolution already named a slot,
-  so the rung corrects WHICH slot and never supplies a missing one. Un-bounded it takes this
-  half too — 2,254 loud cells of census block C to `runs` — at the cost of **620 cells moving
-  from a loud reject to check-clean invalid wasm**, every one at `cont=list_of_map` with
-  `claim >= 1`: a container ALIAS plus a spare value of it, which is D181, still open, and
-  reached only because the map now resolves while the alias's second claim on the same layout
-  does not. Block B is the same shape at 85 cells and block E at 184.
-  **Closing D181 is what unblocks this row**, and the bound is the one line to delete when it
-  is: `letMapShapeOf`'s `if ish >= 0`.
-* **THE SMALLEST WITNESS NEEDS NO CONTAINER AT ALL** and is worth keeping separate, because
-  it shows the adoption is upstream of every container:
+* **THE FIX IS THE ONE LINE THE ROW NOMINATED**, `letMapShapeOf`'s `if ish >= 0` becoming
+  `if ish >= 0 || ish == -3`, so the `-3` unsupported floor consults `letMapDestShape` like
+  every resolved slot already did. Nothing else moved; stripping it reproduces the base
+  compiler **byte-for-byte** (`742635755f0b40ac9932cc46aef6a469` at `f9275d20`, re-proved on this base at
+  `29af1c0a8e3a649b0faef6fb61721e9a`).
+* **THE PRICE WAS REAL WHEN IT WAS MEASURED AND IS GONE NOW — RE-MEASURED, NOT ARGUED.**
+  The bound was taken because the ungated lift moved **620 block-C cells from a loud reject
+  to check-clean INVALID WASM** (85 in B, 184 in E), every one at `cont=list_of_map` with
+  `claim >= 1`: a container ALIAS plus a spare value of it, which is **D181**. D181 CLOSED
+  2026-08-27 (`singleAliasMemberTyIx`'s `TyArray` arm gaining its MAP leaf). Re-graded
+  cell-matched against `95be9e74`:
 
-      type Circle = { r: i32 | null }
-      const lv1 = Map()
-      lv1["k0"] = { r: 7 }
-      print(lv1.size)
+  | census block | cells | `loud emit reject` → `runs` | `runs` LOST | → ANY silent class |
+  |---|---:|---:|---:|---:|
+  | B | 28,590 | **+1,076** | 0 | **0** |
+  | C | 43,200 | **+3,414** | 0 | **0** |
+  | D | 9,000 | **+176** | 0 | **0** |
+  | E | 19,224 | **+1,362** | 0 | **0** |
+  | **total** | **100,014** | **+6,028** | **0** | **0** |
 
-  Delete the `type Circle` line and it runs. `structIndexOfObjCtx` adopts the literal onto
-  Circle's row through `anonValueFitsField`'s union-box leniency, which also SUPPRESSES the
-  `#anon` row `collectAnonShapes` would have minted (its gate is `structIndexOfObj(ai) < 0`),
-  and the mv layer then asks under a render that names nothing. **That witness is filed as
-  D209** — D207 closes only the half with a destination. D209 is still OPEN (both of its
-  candidate fixes were built and refuted, 2026-08-27); re-run against D208's shipped resolver
-  rung, this `mapval` spelling is UNMOVED, still the same loud reject, because its failure is
-  the mv layer's missing slot and not the element row that rung resolves.
-* Census population: this rep half is the `loud emit reject` column of the family — 24 of
-  the 36 cells an UNBOUNDED D203 moves in a 770-cell `annpat × cont × rep` probe, against 12
-  `SILENT → runs`. The shipped rung takes the 12.
+  The old price's own coordinate — block C, `cont=list_of_map`, `claim >= 1` — now moves
+  **740 cells loud → `runs` and none to invalid wasm**. Both of the row's filed numbers have
+  moved: the win is larger than the filed 2,254 and the price is not 620 but zero.
+* **STILL A *FIND*, AND THE BOUND IS NOW A PROGRAM RATHER THAN A CONDITION.**
+  `letMapDestShape` interns nothing — every slot it returns was already minted by the
+  destination's own annotation walk — so admitting `-3` can only land a binding on a slot
+  that EXISTS. **The destination-free half is the proof and it did not move**: the same floor
+  with no destination at all is still a loud reject, and a `tErr` probe on the closing
+  compiler reads `reach=1` / `ans=0` on it — the rung is entered and finds nothing. It is
+  kept as `scripts/silent-sweep/distilled/named/d207nodest.vl`, and the day it starts running
+  the rung has stopped finding and started minting.
+* **THIS ROW'S OWN CITATION WAS STALE, AND GRADING IT IS WHAT FOUND THAT.** The row said the
+  destination-free witness "is filed as D209 … D209 is still OPEN". Both halves are false on
+  `95be9e74`: D209 CLOSED 2026-08-28, and its filed repro is the *list* spelling
+  (`const lv1 = [{ r: 7 }]`), a different program that now runs. The map spelling was in
+  neither inventory. It is filed here as **D461**.
+* **ATTRIBUTION IS 100%, NOT INFERRED FROM THE HISTOGRAM.** On 200 sampled moved block-C
+  cells the probe reads **reach=200 / ans=200**; on 200 sampled cells that stayed loud it
+  reads **reach=44 / ans=23** — those 23 get their slot and are still blocked further down,
+  which is why **705 cells across B/C/D/E keep the class `loud emit reject` and change
+  MESSAGE**, every one from the `-3` floor text to a more specific downstream reason. A
+  class-level diff cannot see those, and they are the movement worth naming.
+* **THE RUNG IS STRICTLY ADDITIVE, PROVED ON BYTES AND NOT ON GRADES.** Corpus `cmp`:
+  **1,954 modules identical, 0 DIFFER, 0 LOST**. And on the census population, where a
+  `runs → runs` cell is not a transition any grade column reports, 300 sampled cells that
+  run under both compile **byte-identical, 300 of 300**. There is no program in either
+  population that builds under both and builds differently.
+* **THE FULL UNGATE BUYS NOTHING EXTRA, WHICH IS WHY ONLY THE FLOOR OPENS.** Deleting the
+  gate outright (so the mono/set sentinels −1/−2/−5 consult the destination too) was built
+  and graded: **behaviourally IDENTICAL on all 43,200 block-C cells**, 100.00% unchanged.
+  The narrower spelling ships because it is the smaller surface at the same measured value.
+* **WHAT IT DOES NOT CLOSE.** D461 — the same floor with no destination — is OPEN, and so are
+  the 16 map-container cells D391's price set keeps; **D207's rung does not rescue those
+  either, verified cell by cell on the combined compiler.**
+
+Named set: `scripts/silent-sweep/census/d207-listmap-tripwire.json` (740 coordinates) plus
+`d207dest` / `d207nodest` / `d207listmap` in `scripts/silent-sweep/distilled/named/`.
+
+---
+
+### D461 — the `-3` map-value floor with NO destination: D207's other half, and it was never actually filed
+**loud emit reject · `emitProgram: unsupported map value type` · found 2026-08-28 while closing D207, by GRADING the claim that this witness was "filed as D209" — it is not, and was not**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    const lv1 = Map()
+    lv1["k0"] = { r: 7 }
+    print(lv1.size)
+    // vl run: emitProgram: unsupported map value type (no rep for a union-member struct, a
+    //   nullable list over an unnamed element rep, or a nullable litunion-result closure;
+    //   any other value type here interned no mv slot)
+
+* **THE BOOKKEEPING ERROR THIS ROW EXISTS TO CORRECT.** D207's row said of this program
+  "**That witness is filed as D209** — D207 closes only the half with a destination. D209 is
+  still OPEN". Graded on `95be9e74`, both halves of that are false: **D209 CLOSED 2026-08-28**,
+  and D209's own filed repro is the *list* spelling (`const lv1 = [{ r: 7 }]`, which now runs
+  and prints 7) — a different program. The map spelling was never a row in either inventory;
+  `grep` for it returns nothing. It had been standing behind another row's ID, which is
+  exactly the failure mode `CLAUDE.md` opens with: the inventory is not the file the fixer
+  edits, so a row goes stale one-directionally and a *second* row inherits the staleness by
+  citation. Re-running the citation is what caught it.
+* **DELETE THE `type Circle` LINE AND IT RUNS**, printing `1`. The declaration is unused,
+  unannotated and unmentioned; its mere presence changes how the literal is emitted. That is
+  D209's mechanism one container over: `structIndexOfObjCtx` adopts `{ r: 7 }` onto Circle's
+  row through `anonValueFitsField`'s union-box leniency, which also SUPPRESSES the `#anon`
+  row `collectAnonShapes` would have minted (its gate is `structIndexOfObj(ai) < 0`), and the
+  mv layer then asks for a rep under a render that names nothing.
+* **WHY D207's LANDING DOES NOT REACH IT, MEASURED RATHER THAN ARGUED.** D207 admitted the
+  `-3` floor to `letMapDestShape`, which is a **FIND** — it interns nothing, so it can only
+  land a binding on a slot the destination's own annotation walk already minted. Here there
+  is no destination, so there is no slot. A `tErr` probe on the closing compiler reads
+  **`reach=1` / `ans=0`** on this program: the rung IS entered and answers nothing. That is
+  the whole difference between this row and D207, and it is why closing D207 moved 6,028
+  census cells without moving this one.
+* **IT IS ALSO THE BOUND, KEPT AS A CELL.**
+  `scripts/silent-sweep/distilled/named/d207nodest.vl` is this program, and it must keep
+  LOUD-REJECTING until this row is closed on purpose. If it starts running without this row
+  moving, D207's rung has stopped finding and started MINTING — which is the discipline
+  D-MAPNODETY pays 128 measured slot moves to keep.
+* Closing it needs what D209's close needed one container in: the adoption suppressing the
+  `#anon` row is upstream of every container, so the fix is at the adoption or at the
+  interning gate, not in the mv layer that reports it. Both of D209's original candidate
+  fixes were built and refuted on 2026-08-27 against the map spelling specifically; that
+  work is not re-litigated here.
 
 ---
 
@@ -12481,10 +12553,12 @@ Repro (FOUR lines, and it needs no `for-in` at all):
 
 ---
 
-### D391 — a REFUTATION PIN: two owner literals sharing a field-name set and disagreeing about the nested layout must KEEP the union box
-**loud emit reject, and it must stay one — the price of D179/D227's rung without its
-`anonNestFieldMono` condition, pinned so the day someone drops that condition this row
-flips · filed 2026-08-28 by #1996's own ablation**
+### D391 — [CLOSED 2026-08-28] two owner literals sharing a field-name set and disagreeing about the nested layout each get their OWN anonymous row
+**CLOSED 2026-08-28 — the filed repro RUNS and prints `1` · was `loud emit reject`
+(`emitProgram: object literal matches no union variant`), filed 2026-08-28 by #1996's own
+ablation as a REFUTATION PIN · THE PIN DID ITS JOB AND THE ROW'S OWN DIAGNOSIS WAS WRONG:
+the fix needed no new discriminator, because the discriminator already existed and was
+starved by ORDER**
 
 Repro:
 
@@ -12494,36 +12568,64 @@ Repro:
     const p = { r: { c2: 1 } }
     const q = { r: { s2: 1 } }
     print(1)
-    // emitProgram: object literal matches no union variant
-    // Without `anonNestFieldMono`: check-clean, and the module does not parse.
+    // now: runs, prints `1`.
+    // was: emitProgram: object literal matches no union variant
 
-* **WHY A LOUD REJECT IS THE RIGHT ANSWER HERE AND NOT A DEFECT.** `structIndexOfObj`
-  matches a literal to an interned row by field-NAME set. Both literals set `{r}`, so one
-  row would have to hold both — and their nested values match DIFFERENT arms of the
-  declared union. D179's rung mints an anonymous row for a nested literal a union arm
-  claims; applied here it gives `p`'s nested `{c2: 1}` a row, `q` then matches `p`'s owner
-  row, and `q`'s nested literal — still on the union-box path — is built as
-  `(struct.new $uBox …)` into a field typed `(ref null $anonCir)`. `wasm-dis` shows exactly
-  that, and wasmtime answers `type mismatch: expected (ref null $type), found (ref $type)`.
-  **That is `check-clean invalid wasm` where a loud reject stood**, which is the worst trade
-  available, so the rung declines instead.
-* **THE PRICE IS MEASURED AND KEPT WHOLE: 16 census-block-D cells** (`mapval`, `nestedmap`,
-  `map3`, `list_of_map` at `rep=arm, declness=nodecl, annpat=none`) plus this program.
-  `scripts/silent-sweep/census/d179-anonrow-price.json` carries the coordinates; the cells
-  are in `scripts/silent-sweep/distilled/named/` so the standing gate re-grades them.
-* **NOTHING DERIVED CAN FIND THEM.** `regress.py` reports the refused candidate and the
-  shipped one identically — 4 classes, 23 census cells, all `loud emit reject → runs`, and
-  `→ silent 0 classes` — and the corpus `cmp` is byte-identical on 2,356 of 2,358 files under
-  both. On the shipped tree these 17 programs behave exactly like their class-mates; what
-  names them is what the CANDIDATE did to them.
-* **THE OPEN QUESTION THIS PIN PARKS.** Making the polymorphic pair work needs
-  `structIndexOfObj` to discriminate a code-15 field by its TARGET, not just by the field
-  name — the `strict` bookkeeping is already computed in `structIndexOfObjCtxGo` and is
-  used only as an ambiguity tiebreak, deliberately, to keep the lenient resolution
-  byte-identical. Promoting it is a separate landing with its own price, and this pin is
-  what will say whether that landing worked.
+* **THE PIN'S OWN CLAIM REPRODUCED EXACTLY, AND IT IS WHAT MADE THE CLOSE SAFE.** Ablating
+  `anonNestFieldMono` (the D179/D227 condition) does turn this program into check-clean
+  invalid wasm, and `wasm-dis` shows the filed line verbatim: `$2` is the shared owner row
+  with field `(mut (ref null $1))`, `$1` is `p`'s nested `{c2:i32}` row, `$4` is the union
+  box `(struct (field i32) (field anyref))` — and `q`'s global is
+  `(struct.new $2 (struct.new $4 (i32.const 1) (struct.new $3 (i32.const 1))))`, a box built
+  into a field typed for `$1`. So the row was right that the naive rung is the worst trade
+  available, and right to refuse it.
+* **BUT THE ROW'S PARKED OPEN QUESTION NAMED THE WRONG FIX.** It asked for
+  `structIndexOfObj` to "discriminate a code-15 field by its TARGET", by promoting
+  `structIndexOfObjCtxGo`'s `strict` bookkeeping from an ambiguity tiebreak to a real
+  discriminator. **`strict` was never the missing piece and this close does not touch it.**
+  That discrimination is already written, in `anonValueFitsField`'s `vc == 15 && anonRow`
+  arm — and its own comment states the real bound: *"Both target names must be known to
+  refute — an un-interned inner literal records "" and keeps the lenient match."*
+* **THE DEFECT WAS A CIRCULARITY IN NODE ORDER.** A target name is
+  `sNames[structIndexOfObj(inner)]`, so it is `""` for a nested literal with no row yet:
+  `p`'s nested gets `#anon0`, `p`'s owner records it, and then `q`'s nested is SKIPPED
+  because `anonNestNeedsRow` asks `structIndexOfObj(ow) >= 0` of `q`'s owner — which by
+  then matches `p`'s row, leniently, *precisely because `q`'s nested has no name yet*. The
+  circle closes on itself, and `anonNestFieldMono` could only cut it by declining the whole
+  rung, which is what kept the pair a loud reject.
+* **THE CONTROL THAT NAMES THE MECHANISM: DELETE THE UNION AND THE PAIR ALREADY WORKED.**
+  With `type Shape2` removed, `p` and `q` get separate owner rows on *every* compiler
+  including master — `(ref null $1)` and `(ref null $2)` in the disassembly. The union case
+  differed in one respect only: its arm-claimed nested literals are minted LATE. So the fix
+  is order, not a new rule — `anonNestPolyPremint` mints the nested rows of a polymorphic
+  owner field set BEFORE any owner row exists, and the existing code-15 arm then separates
+  the owners by itself. The closing disassembly is the no-union one, type for type.
+* **SCOPED TO EXACTLY THE CASE THAT DECLINED, AND MEASURED AS SUCH.** The pre-pass fires
+  only where `anonNestFieldMono` is false, so every other program keeps its `#anonN`
+  numbering: the corpus `cmp` is **byte-identical on all 1,954 buildable modules**, and
+  census block D moves **0 of 9,000 cells** at the class level. A reach/ans probe separates
+  the gate from a vacuous one — the polymorphic pair reads `reach=2 ans=2`, its monomorphic
+  control `{r:{c2:1}}` / `{r:{c2:2}}` reads `reach=2 ans=0`.
+* **WHAT IT DOES NOT CLOSE, AND THE ROW SHOULD NOT BE READ AS CLOSING IT.** The 16
+  census-block-D cells the pin kept whole are the MAP-container form
+  (`cont ∈ {mapval, nestedmap, map3, list_of_map}`, `rep=arm, declness=nodecl,
+  annpat=none` — coordinates re-verified). They stay `loud emit reject`; their remaining
+  blocker is the map-value rep layer, where one mv slot cannot hold two owner reps. They
+  changed MESSAGE only — `emitProgram: unsupported map value type` → `emitProgram: object
+  literal is missing a struct field`. **AND D207'S LANDING DOES NOT RESCUE THEM EITHER** —
+  graded cell by cell on the combined compiler, all 16 are still `loud emit reject` there,
+  so the two landings that touch this shape are orthogonal and neither closes it. Read the
+  "their blocker is D207" reading as REFUTED: it was the obvious inference and it is wrong.
+* **AND THAT MESSAGE MOVE IS WHY THE NAMED SET EARNS ITS WIDTH.** Block D's class
+  histogram, a cell-matched diff on the CLASS column, and `regress.py`'s blocking check all
+  read **completely flat** across this landing; only the message column showed the 16. The
+  set's own guard direction has flipped for one member: `d179nestpoly` is now a TRIPWIRE
+  that must keep RUNNING.
 
-Fixture: `tests/cases/unions/anon-nested-arm-layout-polymorphic.vl`.
+Fixture: `tests/cases/unions/anon-nested-arm-layout-polymorphic.vl` — rewritten from an
+`@emit-error` pin into a `runs` fixture that READS both nested fields (`p.r.c2`, `q.r.s2`),
+which is a strictly stronger guard: a row collapse is invalid wasm, and the old fixture
+asserted a message and so could not see a wrong LAYOUT at all.
 
 ---
 
