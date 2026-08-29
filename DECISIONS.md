@@ -10,6 +10,39 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A binding's CELL and its initializer's BUILD are ONE landing, so a destination-driven
+  element rep has to reach both rungs or it is a new invalid module** (2026-08-28,
+  silent-class-inventory D381). An un-annotated `const lv1 = [{ r: 7 }]` types its list from
+  its own elements; `letRefListDestSlot` corrects that from the declared destination the
+  binding flows into (`letMapDestShape`'s D203 shape, one container over), and the row that
+  filed it prescribed exactly that. What the row did not say is that `collectLocals` picks the
+  local's valtype through `letRefListSlot` while `emitLetDeclStmt` seeds the literal's
+  construction through `pendingListKind`/`pendingListSlot`: give the destination to one and
+  not the other and the binding stores an arm list into a box cell, which is the same
+  check-clean invalid wasm at a new offset. `letListBuildKind`/`letListBuildSlot` is the pair,
+  and it is one function precisely so the two halves cannot drift. The same rule chose the map
+  arm's input: reading the destination map's INTERNED shape (`mvRlSlot[mapShapeOfExpr(…)]`,
+  the obvious route and the one `letMapDestShape` uses) answers only after the map's value
+  slot exists, so with the literal declared BEFORE the map the CELL half got -1 and the BUILD
+  half got the slot — measured, not feared. The shipped arm reads the map's ANNOTATION, which
+  the annotation walk interns ahead of both. The rung is a FIND: every slot it returns was
+  already interned by the destination's own annotation, so it can move a binding onto an
+  existing slot and can never mint one or skip a mint.
+
+- **A loud floor whose whole justification is refuted comes OFF, and the price it was kept for
+  is re-measured on every block that ever priced it** (2026-08-28, silent-class-inventory
+  D223). Reverses the entry above: `armRecvHoldsBareArm`'s ref-list-element decline is deleted.
+  Its stated reason — "the module is already invalid before the read" — is refuted in the type
+  section (the inner list is `array.new_fixed` of the `Circle` STRUCT and the outer of that
+  list's own wrapper; the construction was well-typed and the decline was stopping emission
+  first), and the 24 cells it was kept for were D361's silence rather than its own price. Held
+  to the standard the refusal set: D219 priced the decline on blocks B and E, #1995 re-graded
+  only E, and the close re-graded **B, C, D and E — 100,014 cells, cell-matched** — for
+  **1,329 cells moved, all `loud emit reject` → `runs`, `runs` LOST 0, → silent 0**. Block A is
+  not re-graded and the gap is stated rather than implied: no loud→silent move was ever priced
+  there. The named set `d223-lift-price` is kept, with its baseline flipped from `loud emit
+  reject` to `runs` — a tripwire that fired is worth more as a landed set than as a deleted one.
+
 - **PARENTHESES ARE NOT PART OF A PLACE, and the peel goes at the HEAD of the key rather
   than at its callers** (2026-08-28, silent-class-inventory D352). `placeKeyOf` is the
   checker's narrowing key and has fifteen callers — the member read, the fact collector, the
@@ -103,6 +136,8 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   exactly those 24 (re-measured on `1e598e2b`, set-identical to the committed coordinates),
   and on top of D361's landing the same lift moves 852 block-E cells, all 852 loud → `runs`,
   0 → silent, with all 24 among them. The 24 were D361's silence, not the lift's price.
+  **SUPERSEDED 2026-08-28** — the decline is off; see the D223 entry at the top of this
+  section for the four-block re-grade that took it.
 
 - **The recorded UNION of a list literal's elements is a JOIN of their SHAPES; the box
   decision is about their ROWS, and the two are not the same question** (2026-08-28,
