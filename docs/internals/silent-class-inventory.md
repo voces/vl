@@ -6892,11 +6892,16 @@ shape.
 `f64[]` says, and `f64[] + f64[]` has no concat core.** Re-run verbatim on master `777f7848`:
 the filed program is a loud check reject (`` `+` over F[] has no lowering ``).
 
-**THE ELEMENT AXIS WAS RE-MEASURED AT BOTH SPELLINGS, 13 bindings × `+` × direct-vs-generic,
-and it holds with NO silent cell in the direct column** — `i32`, `boolean`, `K = "a"|"b"` and
-`N = 1|2` concatenate and read back correctly; `Circle`, `{[string]: i32}`, `Circle[]`, `f64`,
-`i64`, `F = 1.5|2.5`, `string`, `string[]` and a struct union are refused. So
-`concatElemIsI32Backed` neither over- nor under-accepts on this vocabulary.
+**THE ELEMENT AXIS WAS RE-MEASURED AT BOTH OPERATORS OVER 28 ELEMENT REPS — this row's own
+table plus every rep it does not name — and there are ZERO silent cells in 56.** `i32`,
+`boolean`, `K`, `N` and the two i32-SENTINEL nullables (`boolean | null`, `K | null`)
+concatenate and read back correctly; `u8`, `f32`, `f64`, `i64`, `string`, `Id = new i32`,
+`NS = new string`, `G = 1.5`, `H = "a"`, `J = 1`, `BIG`, `I`, `M = "a" | 1`, `F`, a struct, a
+map, `i32[]` and the five BOX/ref-niche nullables are refused, each in its own sentence. So
+`concatElemIsI32Backed` neither over- nor under-accepts on a vocabulary twice the width of the
+one the row was closed on, and `eqCmpKindOfArrayElem` agrees with it wherever the two questions
+coincide. Identical on master `8f583820` and on this branch — the direct spelling is untouched
+by D421's rungs, which is why that had to be checked rather than assumed.
 
 **THE ONE THING THAT MOVED IS THE SPELLING, NOT THE ELEMENT**: through
 `addL<T>(a: T[], b: T[])` the same six refused element reps were check-clean invalid wasm,
