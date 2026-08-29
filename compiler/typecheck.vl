@@ -110,6 +110,7 @@ import {
 } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
+import { isBinOpFuncName } from "./ast"
 // The parser's SPELLING TREE (D-PARSETY, #1117) — what `parseTypeName` saw,
 // before it concatenated it into a name. `tsToTy` resolves from this instead of
 // re-parsing the concatenation.
@@ -17645,6 +17646,64 @@ function opIdxDeadRecv(ty: i32) {
   tyBuiltinIndexable(ty)
 }
 
+// Does type `ty` DENOTE an object — the one left-operand shape `checkBinary`'s
+// operator dispatch admits (`if odsp is TyObj`)?
+//
+// LOOKING THROUGH THE ONE-MEMBER ALIAS BOX is the entire reason this is a function
+// rather than `is TyObj` written a second time, and it is what D425 was blocked on.
+// `declaredTyOfName` keeps a canonicalized INTERSECTION (`type AB = {a} & {b}`) as
+// an OPAQUE one-member `TyUnion`: `singleAliasMemberTyIx`'s `TyObj` arm is gated on
+// `isPlainAliasRef`, which an intersection's right-hand side is not, so that the
+// EMITTER may intern `AB` as a named struct. That opacity is a fact about the
+// emitter's NAMING, not about the language — `AB` is an object, its fields are
+// merged by `intersectTy` into a real `TyObj`, and the site's refusal to dispatch
+// over it is D402's root rather than a rule. So the sentence "`self` must be an
+// object type", which D425 filed as FALSE for `self: AB` and stayed open for, is
+// false only of the test that cannot see through the box. This one can.
+//
+// The DECLARATION is the only place this look-through is taken. Doing it at the
+// SITE would collapse the box the emitter's `singleMemberAliasTyIx` twin still
+// reads, which is exactly the divergence `declaredTyOfName`'s comment warns about;
+// closing D402 is that row's job. Here it only ever WIDENS what is accepted, so a
+// box this cannot see through costs a missing reject and never a false one.
+function tyDenotesObj(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyObj { return true }
+  if t is TyUnion {
+    if t.uMembers.length == 1 {
+      const m = T.tys[t.uMembers[0]]
+      if m is TyObj { return true }
+    }
+  }
+  false
+}
+
+// A `self` ANNOTATION that can never be the LEFT OPERAND of an operator dispatch,
+// so a binary operator declared over it can never fire — the D425 gate, and the
+// third of the three declaration-site gates that row named (D444's arity and
+// D445's index receiver landed as #2005).
+//
+// DERIVED FROM THE DISPATCH GATE, not restated beside it, for the reason D445's
+// `opIdxDeadRecv` is routed through `tyBuiltinIndexable`: the set refused here is
+// by construction the complement of the set `checkBinary` dispatches over, so the
+// reject and the swallow cannot drift. Three annotations are subtracted, each one
+// measured DISPATCHING today and so a false reject if it were included:
+//   - an UN-ANNOTATED `self` (`ty < 0`), the spelling
+//     `tests/cases/objects/operator-self-method.vl` uses;
+//   - anything carrying a HOLE — `function "+"<T>(self: T, other: T)` is silent at
+//     an i32 site and DISPATCHES at an object one, so the type variable is decided
+//     per call site and not here;
+//   - the ERROR type, already reported at the annotation, where a second
+//     diagnostic would be noise on a line that already has one.
+function binOpDeadSelf(ty: i32) {
+  if ty < 0 { return false }
+  if tyHasHole(ty) { return false }
+  const t = T.tys[ty]
+  if t is TyErr { return false }
+  !tyDenotesObj(ty)
+}
+
 // The index-operator function `op` dispatches to for a receiver of type
 // `recvTy` — the FIRST declaration whose `self` parameter accepts it — or "" when
 // the program declares none that fits.
@@ -22212,6 +22271,44 @@ function checkProgramNode(n: Program) {
         } else {
           opIdxOps.push(opk)
           opIdxFns.push(s.fnName)
+        }
+      }
+      // THE SWALLOW AT THE BINARY OPERATORS, SAID OUT LOUD (D425) — the twin of the
+      // index gate directly above, and the last of the three declaration-site gates
+      // that row named. `checkBinary` reaches `opSelfFnTy` only under
+      // `if odsp is TyObj` over the LEFT operand's type, so a declaration whose
+      // `self` is not an object is not a dispatch that fails to happen, it is one
+      // the language has already decided will never happen: `function "+"(self:
+      // i32, other: i32) { return 99 }` beside `print(1 + 2)` is `vl check` rc 0 and
+      // prints 3.
+      //
+      // KEYED ON THE RESOLVED TYPE, which is why it cannot live beside the parser's
+      // D444/D471 gates: an alias (`type Id = i32`), a newtype (`type Id = new
+      // i32`) and an intersection (`type AB = {a} & {b}`) all have to be resolved
+      // before the question can be asked, and the three answer differently.
+      //
+      // THE FIRST-PARAMETER NAME IS D471's and is checked in the parser, so the two
+      // rejects are disjoint by construction: a declaration that fails both gets
+      // the NAME diagnostic only, which is the one that says what to change.
+      if isBinOpFuncName(s.fnName) {
+        if hp.length == 2 {
+          let selfNamed = false
+          const bp0 = P.nodes[hp[0]]
+          if bp0 is Param {
+            if bp0.parName == "self" { selfNamed = true }
+          }
+          if selfNamed {
+            if binOpDeadSelf(hpt[0]) {
+              tErr(
+                "operator `" +
+                  s.fnName +
+                  "` can never dispatch: `self` is the LEFT OPERAND and dispatch needs an object, but " +
+                  tyToStr(hpt[0]) +
+                  " is not one",
+                stmts[hi],
+              )
+            }
+          }
         }
       }
       // Collect un-annotated returns (hoisted as the `-2` pending sentinel) for the

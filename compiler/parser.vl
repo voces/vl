@@ -42,7 +42,7 @@
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay PRIVATE to this module.
 import { TokKind } from "./lexer"
-import { mkMatch } from "./ast"
+import { isBinOpFuncName, mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14) — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
@@ -1903,6 +1903,46 @@ function parseFuncTail(
           at: nameTok,
         },
       )
+    } else {
+      // THE POLLUTION RULE, SAID OUT LOUD (silent-class-inventory D471). At the
+      // right arity, `opSelfFnTy` still returns -1 unless the FIRST parameter is
+      // NAMED `self` — before it consults any type, which its own comment calls
+      // "the pollution rule". So an arity-2 declaration whose first parameter is
+      // named anything else is inert at EVERY receiver, an object one included:
+      // measured over 380 cells (`scripts/silent-sweep/d471-opdecl-grid.py`),
+      // ZERO of them dispatch, against 60 that do the moment the parameter is
+      // renamed `self`.
+      //
+      // WHY THIS IS A REJECT AND NOT A DESIGN QUESTION LEFT OPEN. The worry the
+      // row filed was that refusing here decides `function -(z, b)` is not a legal
+      // ordinary FUNCTION either. It is not one, and that is measured rather than
+      // argued: `-` is not an identifier, so `-(7, 1)` is a parse error and the
+      // quoted spelling mints the identical name — there is no call syntax for it
+      // at any arity. The declaration is exactly "a name no reference could ever
+      // be written for", which is the criterion the arity gate above already
+      // applies, which `indexOpDeclName` below already applies to `"[]"`/`"[]="`
+      // (a non-`self` first parameter there is a hard parse error today), and
+      // which this file already applies to a quoted NON-operator
+      // (`function "shout"`). This is the last of those four shapes that was silent.
+      //
+      // SYNTACTIC, so it belongs here and not at the checker's hoist: the rule is
+      // about the parameter's NAME. D425's twin — an arity-2 `self` whose TYPE can
+      // never be a dispatch receiver — needs the resolved type and lives there.
+      const bp0 = P.nodes[params[0]]
+      if bp0 is Param {
+        if bp0.parName != "self" {
+          P.diags.push(
+            {
+              msg: "operator `" +
+                name +
+                "`'s first parameter must be named `self`, got `" +
+                bp0.parName +
+                "` — operator dispatch binds the LEFT operand to `self`, so this declaration could never fire",
+              at: nameTok,
+            },
+          )
+        }
+      }
     }
   }
   let ret = -1
@@ -2006,26 +2046,9 @@ function isOpFuncName(kind: TokKind) {
     kind == "NE"
 }
 
-// The operator names whose DISPATCH is binary — `isStrFuncName` minus the two
-// BRACKET operators, whose arity is the index rule's `(self, index[, value])` and
-// is checked at the hoist against the resolved receiver, and minus `==`/`!=`,
-// which `parseFuncHead` already refuses BY NAME (D46). Listing those two here as
-// well would put a second diagnostic on one declaration for one mistake.
-function isBinOpFuncName(name: string) {
-  name == "+" ||
-    name == "-" ||
-    name == "*" ||
-    name == "/" ||
-    name == "%" ||
-    name == "^" ||
-    name == ">" ||
-    name == ">=" ||
-    name == "<" ||
-    name == "<="
-}
-
-// The operator names a QUOTED function name may spell — the symbol-token set
-// above plus the two BRACKET operators, which have no token spelling at all.
+// The operator names a QUOTED function name may spell — `isBinOpFuncName`'s
+// symbol-token set (`ast.vl`) plus the two BRACKET operators, which have no token
+// spelling at all.
 function isStrFuncName(name: string) {
   name == OP_INDEX_GET ||
     name == OP_INDEX_SET ||

@@ -13824,8 +13824,13 @@ any built-in lowering).
 
 ---
 
-### D425 — an operator declaration whose `self` can never be an OBJECT parses, type-checks, and is SILENTLY IGNORED
-**check-clean silently wrong · found 2026-08-28 by the operator grid built for D424 — the same shape D46 rejected for `==`/`!=`, at the NINE other operators · pre-existing and IDENTICAL on master `777f7848`, on master `f9275d20` and on this branch · LEFT OPEN DELIBERATELY: the reject's PLACEMENT is a real decision, and the 2026-08-28 re-grade found the filed PRICE understated by a factor of three — three dispatch paths, not one gate, and the honest predicate is blocked behind D402's root. (The status line avoids the word this file uses for a fixed row on purpose — `check-filed-witnesses.py` matches its vocabulary as a SUBSTRING and a live row reading "not c-l-o-s-e-d" graded as fixed. CONFIRMED BY EXPERIMENT here, including a SILENT half the docstring did not record — and FIXED meanwhile by #1999, which REFUSES a negated match rather than inverting it, so the wording this row uses is still the one it needs. See the last bullet.)**
+### D425 — [CLOSED 2026-08-28] an operator declaration whose `self` can never be an OBJECT parses, type-checks, and is SILENTLY IGNORED
+**CLOSED 2026-08-28 — the repro is NOW A LOUD CHECK REJECT at the declaration
+(`operator `+` can never dispatch: `self` is the LEFT OPERAND and dispatch needs an object,
+but i32 is not one`). Was: check-clean silently wrong · found 2026-08-28 by the operator
+grid built for D424 — the same shape D46 rejected for `==`/`!=`, at the NINE other
+operators · left open twice, the second time on a BLOCKER that turned out to be a property
+of the TEST rather than of the language (see the intersection bullet)**
 
 Repro:
 
@@ -13840,157 +13845,183 @@ Repro:
     }
 
     print(cell())
-    // vl check rc 0, no error and no warning about the declaration being inert (the two
-    // warnings it does raise are `Unused parameter self` / `other`, which say something
-    // else). The declared operator returns 99 unconditionally, so a dispatch would print 99.
-    // PRINTS 3
+    // NOW: vl check rc 1, `operator `+` can never dispatch: `self` is the LEFT OPERAND
+    // and dispatch needs an object, but i32 is not one`. WAS: rc 0 with only two
+    // `Unused parameter` warnings, and PRINTED 3 while the body said 99.
 
-* **IT IS D46's EXACT SHAPE.** D46 rejected `function "=="` because the declaration parsed,
-  type-checked and did nothing, and because a diagnostic was recommending it. This is the
-  same inertness at every OTHER operator, selected not by the operator but by the `self`
-  parameter's TYPE.
+* **IT WAS D46's EXACT SHAPE.** D46 rejected `function "=="` because the declaration
+  parsed, type-checked and did nothing. This was the same inertness at every OTHER
+  operator, selected not by the operator but by the `self` parameter's TYPE.
 
-* **THE INERTNESS IS PROVABLE, not merely observed.** `checkBinary` (`typecheck.vl:29118`)
-  reaches `opSelfFnTy` only under `if odsp is TyObj` where `odsp = T.tys[lt]` is the LEFT
-  OPERAND's type at the site, and `opSelfFnTy` then requires `assignable(lt, params[0])`.
+* **THE BLOCKER WAS A PROPERTY OF THE TEST, NOT OF THE LANGUAGE — and this is the whole
+  reason the row stayed open.** The filed sentence was: *"`self` must be an object type" is
+  FALSE for `self: AB`* where `type AB = {a:i32} & {b:i32}`, because `AB` is an object and
+  the site refuses to dispatch over it anyway (D402's root). Re-run verbatim on master
+  `2f1f0621`, on `aa2350a7` and on `2ce75377`, the probe still reproduces on all three: `operator '+' is
+  not defined for AB and AB`,
+  while the plain-struct twin dispatches and prints 99. **So the blocker did not move, and
+  the row closed anyway** — because the mechanism, once looked up rather than inferred, is
+  not that the checker cannot know `AB` is an object. `intersectTy` merges the two shapes
+  into a real `TyObj`; `declaredTyOfName` then hands the checker an OPAQUE one-member
+  `TyUnion` box for it, because `singleAliasMemberTyIx`'s `TyObj` arm is gated on
+  `isPlainAliasRef` (false for an intersection's right-hand side) **so that the EMITTER can
+  intern `AB` as a named struct**. That opacity is a fact about the emitter's naming. The
+  member is one field access away, and `tyDenotesObj` takes it — **at the DECLARATION only**,
+  where a look-through can merely widen what is accepted and never narrow it. Collapsing
+  the box at the SITE would diverge from the emitter's `singleMemberAliasTyIx` twin, which
+  is what `declaredTyOfName`'s own comment warns about; that is still D402's job and is
+  untouched here.
 
-* **40 OF 40 GRID CELLS NOW PROVED IGNORED — the filed 8 blind cells are closed.** The row
-  filed "32 of 40 proved, 8 blind": `<` and `<=` had been given `1 < 2`, where the
-  declaration and the built-in agree. Re-run with a DISAGREEING pair (`2 < 1`, declaration
-  `return true`, native `false`) all 8 answer natively too. Ten operators × two name
-  spellings (`function "+"` / `function +`) × two annotation forms, every pair chosen so the
-  declaration and the built-in differ: **40 ignored, 0 fired, 0 not-runs.**
+* **AND "MAKE IT LOUD" DOES NOT APPLY TO THE INTERSECTION — a different sentence from
+  "blocked behind D402", and the one this row should carry.** D411 closed on the observation
+  that being unable to make a class RUN is not the same as having to leave it SILENT, so the
+  same question was put here: is a positioned reject available at the DECLARATION for
+  `self: AB`? **No — and not because the reject is hard to spell, but because there is
+  nothing silent to make loud.** Measured on this landing's seed: WITH a use site,
+  `type AB = {a} & {b}` + `function "+"(self: AB, other: AB)` + `print(x + y)` is already a
+  positioned loud reject (`operator '+' is not defined for AB and AB`, rc 1); WITHOUT one,
+  the declaration alone runs and prints exactly what it says (`print(1)` → 1). Neither is a
+  silent wrong value. **The intersection is the one case in this row where the DECLARATION is
+  RIGHT and the SITE is the defect** — refusing the declaration would be a false reject that
+  states something false, and it would have to be withdrawn the day D402 lands. That is why
+  `tyDenotesObj` looks through the box instead of the row waiting: this gate is not blocked
+  on D402, it is INDEPENDENT of it, and `d471_pin_inter` is the cell that holds the two
+  apart.
 
-* **FIVE `self` TYPES ARE SILENT, NOT ONE — AND THE ROW'S OWN LIST WAS HALF WRONG.** The
-  filed sentence named "`i32`, `string`, `f64`, `K = "a" | "b"`, `Circle[]`" as one class.
-  Measured over 12 `self` types at a bare top-level `print(a + b)` site (so the only thing
-  varying between a cell and its control is the `self` annotation — the first cut of this
-  measurement was confounded by a `cell(): i32` wrapper that reported the HARNESS's return
-  mismatch for every non-i32 case):
+* **THE BOX IS A NAME-VS-ARENA SPLIT, WHICH IS D461's SHAPE — but a DELIBERATE one, and that
+  is the difference.** D461's two struct-row resolvers disagreed about one adopted literal and
+  the disagreement was the bug. Here `isPlainAliasRef` answers from a NAME list
+  (`cPlainAliasNames`) while the arena holds a real `TyObj` for the same alias, and for a
+  canonicalized intersection the two give opposite answers — but both are right about their
+  own question (the name says "the body is not a plain reference"; the arena says "the member
+  is an object"), the asymmetry is documented at `singleAliasMemberTyIx`, and the emitter's
+  `unionStructAliasShape` route depends on it. What makes it feel like D461 is the third
+  consumer: `checkBinary` reads the answer that says "no". **That consequence is D402's row,
+  not a new one** — recorded here because the comparison is the fastest way to see why the
+  look-through belongs at the declaration and nowhere else.
 
-  | `self` type | outcome |
-  |---|---|
-  | `i32` `i64` `f64` `f32` `string` | **SILENT** — the native answer, declaration ignored |
-  | `boolean` | loud: `operator '+' is not defined for boolean and boolean` |
-  | `K = "a"\|"b"` | loud: `operator '+' is not defined for string and string` |
-  | `Circle[]` | loud: `` `+` over Circle[] has no lowering `` (D421's new reject) |
-  | `i32[]` `{[string]:i32}` `(i32) => i32` `Circle \| null` | loud: `operator '+' is not defined …` |
-  | `Circle` / `{r: i32}` (controls) | **DISPATCHES** — prints 99 |
+* **THE GATE IS THE NEGATION OF THE DISPATCH GATE, not a restatement beside it** — D445's
+  `tyBuiltinIndexable` routing, applied to the binary family. `binOpDeadSelf` subtracts
+  exactly three annotations, each measured DISPATCHING today and so a false reject if
+  included: an UN-ANNOTATED `self` (`operator-self-method.vl`'s spelling), anything
+  carrying a HOLE (a generic `self: T` is silent at an i32 site and DISPATCHES at an object
+  one, so the type variable is decided per call site), and the ERROR type (already reported
+  at the annotation).
 
-  So `K` and `Circle[]`, two of the row's five examples, are LOUD. The silent class is
-  exactly "a `self` type that has a native lowering for the operator".
+* **A PREDICATE THAT LOOKED RIGHT AND IS NOT, recorded so nobody re-derives it.** The row's
+  own measurement said "the silent class is exactly a `self` type that has a native
+  lowering for the operator", and `binOpDefinedFor` is precisely that predicate, already
+  written and already the single home for "`checkBinary`'s accepted forms". It is the wrong
+  polarity: its documented default for an operator it does not model is `true` (`no false
+  reject`), which is safe when a `true` PERMITS and unsafe when a `true` REFUSES. Gating
+  the reject on it refuses `function "^"(self: V, other: V)` over a struct — a program that
+  dispatches today — and says something false about `^` over `string` besides.
 
-* **THE SHAPE EXTENDS TO THE INDEX OPERATORS, WHICH THE ROW NEVER MEASURED — AND std
-  DECLARES FOUR OF THEM.** `function "[]"(self: i32[], i: i32): i32 { return 99 }` beside
-  `xs[0]` over an `i32[]` prints **1**, not 99; `self: string` prints **97**; `"[]="` over
-  `i32[]` writes natively (**5**). Control: `"[]"` over a declared struct dispatches (99).
-  `std/buffer.vl` exports `function "[]"(self: F32View, …)`, `"[]="(self: F32View, …)`,
-  `"[]"(self: I32View, …)`, `"[]="(self: I32View, …)`, and five fixtures declare more
-  (`tests/cases/index/operator-read-write.vl`,
-  `tests/cases/index/operator-in-function-bodies.vl`,
-  `tests/cases/modules/index-operator-import/{lib,entry}.vl`,
-  `tests/cases/memory/flat-fused-row-brands-dont-cross.vl`,
-  `tests/cases/numerics/f32-contextual-integer-literal.vl`). **The row's sentence "the only
-  operator declarations in the tree are `operator-self-method.vl`'s and D424's new fixture"
-  is false**, and it is the sentence the price rested on.
+* **PLACEMENT (A), THE DECLARATION, and the row's own three "must not break" programs all
+  pass.** `function "+"(self: i32, other: i32): i32 { return self + other }` is refused —
+  at the DECLARATION, which is the line the row said was the bug — while
+  `function unrelated(): i32 { return 40 + 2 }` beside it still prints 42, and the tree's
+  `function +(self, b) { x: self.x + b.x, … }` with two i32 `+` sites inside a `+`
+  operator's body still prints 4. Those three are what killed PLACEMENT (B), the call-site
+  reject, and PLACEMENT (A) does not touch any of them.
 
-* **A THIRD CASE: `self: T`.** `function "+"<T>(self: T, other: T): i32 { return 99 }` is
-  SILENT at an i32 site (prints 3) and **DISPATCHES at an object site** (prints 99). A
-  declaration-site gate phrased "`self` must be an object type" refuses a declaration that
-  works.
+* **THE FILED PRICE OF "THREE GATES" WAS RIGHT AND ALL THREE ARE NOW BUILT.** #2005 built
+  D444's arity gate in `parseFuncTail` and D445's index-receiver gate at the pass-1 hoist.
+  This is the third, the BINARY one, at the same hoist and keyed the same way — on the
+  resolved type, derived from the dispatch predicate. (**Still not D443's "two of five".**
+  Different threes, six rows apart.)
 
-* **A FOURTH: `self: AB` where `AB` is a declared INTERSECTION is a LOUD FALSE REJECT.**
-  `type AB = {a:i32} & {b:i32}` + `function "+"(self: AB, other: AB)` over `AB` operands is
-  `operator '+' is not defined for AB and AB`, while `function "+"(self: {a:i32,b:i32}, …)`
-  over structurally-typed operands DISPATCHES. `AB` is not a `TyObj` at the gate. **This is
-  D402's root and it sequences the two rows** — see D402's last bullet.
+* **PRICE, MEASURED AND ARGUED.** 115 cells move and **all 115 are `runs` -> loud check
+  reject**: 110 grid cells plus 5 pins (a declaration with no use site at all — the shape
+  that reaches the gate on its own). Each ran ONLY because its own declaration was dead,
+  so each was producing a wrong value. Zero dispatching cells lost, zero -> silent, zero ->
+  runs. In the standing corpus the price is 40 cells: the 20 `d425c*` representatives this
+  row's own named set was built to hold (its `sources.json` entry said in advance "they
+  RUN today and must keep running until D425's declaration-site reject lands, at which
+  point every one of them becomes a check reject, which is exactly the price worth having
+  written down") and the 20 `d444_*_a2_*` arity-2 boundary cells #2005 filed as "D425's
+  territory, not this gate's". Outside that: corpus `cmp` byte-identical on all 1,841
+  buildable `@run` modules, 0 of 1,477 derived classes moved, and an instrumented compiler
+  puts the gate's **reach at 8 and its fire at 0** over the tree's 2,536 pre-existing `.vl` files (this change's own fixtures excluded) —
+  all 8 arity-2 `self`-named binary operator declarations take an object or a hole.
 
-* **PLACEMENT (B), THE CALL SITE: over-broad, and now priced with programs rather than
-  argued.** The narrowest phrasing that catches this row is "an `op` site whose LEFT type is
-  assignable to a declared operator's non-object `self`". Three programs it must not break
-  and would: `function "+"(self: i32, other: i32): i32 { return self + other }` runs today
-  (prints 3) and **its own body is an i32 `+` site**, so the reject refuses the declaration
-  it is complaining about; `function unrelated(): i32 { return 40 + 2 }` in the same program
-  runs today (prints 42) and is refused for something in another function; and the tree's own
-  fixture `function +(self, b) { x: self.x + b.x, … }` has two i32 `+` sites inside a `+`
-  operator's body. It also points at the wrong line: the site is fine, the declaration is the
-  bug.
+* **WHAT IT DOES NOT CLOSE, filed as D491.** A GENERIC `self` — `function "+"<T>(self: T,
+  other: T): i32 { return 99 }` — is still silent at a built-in site (prints 3, not 99),
+  19 grid cells. It is deliberately left: the same declaration DISPATCHES at an object
+  site, so the hole is decided per call site and a declaration-site reject cannot be right
+  for both. The 19 are in `distilled/named/` with their expectation set to the
+  declaration's answer, so they read `runs but wrong value` rather than a quiet `runs`.
 
-* **PLACEMENT (A), THE DECLARATION: right layer, and the price is THREE gates, not one.**
-  D46's home (`parseFuncHead`) cannot host it — that arm has the NAME spelling and not the
-  resolved type of `self`, which is what decides here. The honest predicate is *the negation
-  of the dispatch gate*, and there are three dispatch gates with three different answers:
-  **binary** wants `TyObj`-or-hole-or-type-variable (and must keep `self: T` and the
-  un-annotated `function +(self, b)` — both measured working); **`"[]"`/`"[]="`** resolve by
-  the RECEIVER'S type through `opIdxBindGen`, a different rule with std as a live customer;
-  **unary** has no dispatch path at all (`checkUnaryNode`, `typecheck.vl:30757`, never looks
-  — see D444). And the binary predicate cannot be spelled honestly until D402's root is
-  fixed, because "`self` must be an object type" is a false sentence for `self: AB`.
+#### PRICE PAID — 115 `runs` cells, and the veto that was overridden to pay it
 
-  **TWO OF THESE THREE LANDED ON 2026-08-28 (#2005), and the third is the one this row is.**
-  D444 built the ARITY gate in `parseFuncTail` — the unary case turned out not to need a
-  resolved type at all, so D46's home objection was true of `"[]"` and false of unary — and
-  D445 built the `"[]"`/`"[]="` gate at the pass-1 hoist, routed through
-  `tyBuiltinIndexable` so the reject cannot drift from the swallow, with std untouched
-  because its receivers are nominal structs. Neither moved a single `d425c*` cell. What
-  remains is exactly the BINARY gate over a built-in `self`, and the two landings are worked
-  precedents for how to spell it: key it on the resolved type at the hoist, and derive it
-  from the dispatch predicate rather than restating it.
+**THIS RUNG LOSES 115 RUNNING CELLS** — 110 grid cells (`d471_*_self_*` over a non-object
+`self`) plus 5 PINS, and the two halves need separate arguments because a pin has no operator
+site at all. The 129 that D471's rung loses are DISJOINT from these: the ablation measured
+overlap **0**, and 129 + 115 = 244 is the whole price of the change. Stated here rather than
+inferred from a clean gate.
 
-  **DO NOT READ THIS "TWO OF THREE" AS D443's.** They are different threes and they sit six
-  rows apart. D443's is D402's ROOT closing two of the five things that row predicted; this
-  one is D425's three declaration-site GATES. The overlap is only that both say two.
+**WHAT ONE OF EACH IS**, source and both answers:
 
-  **AND #2004 DID NOT MOVE THIS ROW'S BLOCKER, measured on both sides rather than inferred
-  from the root's landing.** The blocking sentence is *"`self` must be an object type" is
-  false for `self: AB`*, and the direct probe — `type AB = {a:i32} & {b:i32}` +
-  `function "+"(self: AB, other: AB)` + `x + y` — is `operator '+' is not defined for AB and
-  AB` on the pre-#2004 seed `638d4fa4` and **the identical message** on the post-#2004 seed
-  `228ea9f8`, while its plain-struct twin `{a:i32,b:i32}` dispatches and prints 99 on both.
-  D402's root is the EMITTER's shape interning; `checkBinary`'s `if odsp is TyObj` is a
-  different gate and still declines an intersection alias. D441's row states the same
-  conclusion from #2004's own measurement ("both operator gates still refuse"); this is the
-  independent confirmation, and it is why the blocker is stated as a live one and not as a
-  paid one.
+    function +(self: i32, other: i32): i32 { return 99 }
+    const a: i32 = 7
+    const b: i32 = 1
+    print(a + b)
+    // WAS: vl check rc 0, PRINTED 8 — its do-nothing control also prints 8.
+    // NOW: vl check rc 1, `operator `+` can never dispatch: `self` is the LEFT
+    //      OPERAND and dispatch needs an object, but i32 is not one`
 
-* **WHY IT STAYS OPEN.** The reject is right and its CAPABILITY cost is still zero at the
-  binary operators — nothing in `compiler/`, `std/`, `tests/`, `bench/`, `playground/` or
-  `reference/` declares a binary operator with a non-object `self`, re-verified 2026-08-28;
-  the only binary declarations are `tests/cases/objects/operator-self-method.vl`,
-  `tests/cases/objects/operator-self-method-function-local-receiver.vl` and D46's
-  `error-equality-not-overloadable.vl`, and all take an object or a hole. What is NOT settled
-  is the predicate, and the filed price ("one checker gate, one diagnostic sentence, one
-  fixture") is a third of the real one. **This row now states that price; it is a
-  language-design decision with a sequencing constraint, not an unwritten patch.**
+    function "+"(self: i32, other: i32): i32 { return 99 }
+    print(1)
+    // WAS: vl check rc 0, PRINTED 1 — and so does the same program with the
+    //      declaration deleted. The declaration contributed NOTHING at all.
+    // NOW: the same declaration-site reject.
 
-* **THE GRADER BUG THIS ROW'S WORDING DODGES WAS REAL, ITS SILENT HALF WAS WORSE THAN THE
-  DOCSTRING RECORDED, AND #1999 HAS SINCE FIXED IT.** Before #1999,
-  `check-filed-witnesses.py`'s `declared_outcome` matched its vocabulary as a SUBSTRING
-  (`("closed", "runs")` is the fourth entry, and first LIST match wins, not first by
-  position). Three specimen rows with the SAME repro, differing only in wording, graded:
+**WHY THE OVERRIDE IS ARGUED RATHER THAN ASSUMED**, in the four terms:
 
-  | status wording | declared | actual | verdict | exit |
-  |---|---|---|---|---|
-  | `check-clean silently wrong · left open deliberately` (this row's) | `silent_wrong_value` | `silent_wrong_value` | as filed | 0 |
-  | `check-clean silently wrong · deliberately NOT closed …` | **`runs`** | `runs` | **"as filed"** | **0** |
-  | `loud check reject · deliberately NOT closed by D35` | `runs` | `check_reject` | MOVED | 1 |
+1. **They run by COINCIDENCE, not by rule — verified PER CELL.** All 110 grid cells were
+   re-graded against the base seed with their own do-nothing controls, and **110 of 110**
+   ran, printed exactly their control's output, and printed something DIFFERENT from their
+   own declaration's answer. Each was therefore **producing a wrong value**: the source says
+   99 and the program said 8. **Zero were correct programs**, checked by the same executable
+   `--price` mode D471's section names rather than by argument. For the 5 PINS the term is not
+   weaker but STRONGER: they have no operator site, so deleting the declaration changes
+   nothing whatsoever about what the program prints — "runs by coincidence" is not an
+   inference there, it is the definition. What they lost is the acceptance of a declaration
+   that could not have been used.
+2. **The loss is LOUD.** A positioned checker diagnostic at the DECLARATION's line, naming
+   the resolved type (`i32`, `Bid`, `U` — the annotation as it resolves, not as it is
+   spelled). The grid's `→ silent` column is **0** and its `→ runs` column is **0**.
+3. **The price is NAMED, and part of it was named in advance by this row's own set.** The
+   115 are in `distilled/named/`. In the standing corpus 40 more cells move, and both groups
+   were written down before this landing: the 20 `d425c*` representatives whose
+   `sources.json` entry said *"they RUN today and must keep running until D425's
+   declaration-site reject lands, at which point every one of them becomes a check reject,
+   which is exactly the price worth having written down"*, and the 20 `d444_*_a2_*` cells
+   #2005 filed as "D425's territory, not this gate's". Both entries are updated to record a
+   price PAID rather than one owed. Baseline delta asserted: **328 added / 0 removed / 40
+   CHANGED**, with every changed cell named.
+4. **It is REVERSIBLE and the reversal is instrumented.** Deleting `binOpDeadSelf`'s call at
+   the hoist restores all 115; the ablation measured that direction too. **What buys them
+   back for real is D402**: if the site's dispatch gate widens to accept receivers it refuses
+   today, the declaration-site predicate — which is that gate's negation, not a copy of it —
+   narrows with it, and cells stop being refused without anyone editing this row. The
+   tripwire in the other direction is `d471_pin_inter`: it declares an operator over
+   `type AB = {a} & {b}` and never uses it, it is the ONLY cell of 770 that sees the
+   declaration gate by itself, and it goes `runs → not-runs` — which `regress.py` BLOCKS on —
+   the moment anyone narrows `tyDenotesObj` back to a bare `is TyObj`.
 
-  The docstring recorded only the third, which is LOUD. **The second is the dangerous one and
-  it was not on record**: a live `check-clean silently wrong` row whose status merely CONTAINS
-  "closed" was declared `runs`, its program does run, and it graded **green** —
-  indistinguishable from a fixed row, with the `// PRINTS` machinery built to catch exactly
-  this skipped entirely (it runs only under `want == "silent_wrong_value"`).
+**READ THIS AS AN OVERRIDE, NOT A LICENCE.** All four terms have to hold together;
+`DECISIONS.md` carries the general form.
 
-  **#1999 closes both halves**, and the same three specimens re-run against it read
-  `1 graded · 1 as filed · 0 MOVED · 2 not graded`, exit 1 under `--strict` — X2 and X3 are
-  REFUSED rather than inverted, and the failure names the row and the fix. One consequence
-  worth knowing before wording a status: the refusal short-circuits the whole vocabulary
-  (`declared_outcome` returns `None` at the first negated match rather than trying the next
-  entry), so X2 is ungradeable even though its status ALSO carries an un-negated
-  `check-clean silently wrong`. Deliberate — the commit chose refusing over guessing a
-  negation's scope — but it means a status may not mention another row's outcome under a
-  negation even when it names its own plainly. This row's wording is therefore still the
-  wording it needs.
+* Fixture: `tests/cases/objects/error-operator-dead-self-type.vl`.
+
+* **THE GRADER BUG THIS ROW'S OLD WORDING DODGED WAS REAL AND #1999 FIXED IT.** Before
+  #1999, `check-filed-witnesses.py`'s `declared_outcome` matched its vocabulary as a
+  SUBSTRING, so a live `check-clean silently wrong` row whose status merely CONTAINED
+  "closed" was declared `runs`, its program did run, and it graded green —
+  indistinguishable from a fixed row. #1999 REFUSES a negated match rather than inverting
+  it, which also means a status may not mention another row's outcome under a negation.
+  This row's status now names its own outcome plainly, which is what a closed row should.
 
 ---
 
@@ -14514,8 +14545,11 @@ Grid: `scripts/silent-sweep/d444/opgrid.py` (`--mkset` / `--verify`).
 
 ---
 
-### D471 — an arity-2 operator whose first parameter is NOT named `self` is inert at every receiver
-**check-clean silently wrong · found 2026-08-28 by D444's grid, filed not fixed · the last shape of the operator-declaration family that is still silent and NOT blocked behind D402**
+### D471 — [CLOSED 2026-08-28] an arity-2 operator whose first parameter is NOT named `self` is inert at every receiver
+**CLOSED 2026-08-28 — the repro is NOW A LOUD CHECK REJECT at the declaration
+(`operator `-`'s first parameter must be named `self`, got `z` — …`). Was: check-clean
+silently wrong · found 2026-08-28 by D444's grid, filed not fixed · the last shape of the
+operator-declaration family that was still silent and NOT blocked behind D402**
 
 Repro:
 
@@ -14525,31 +14559,294 @@ Repro:
 
     const a: i32 = 7
     print(a - 1)
-    // vl check rc 0. The declared operator returns 99 unconditionally, so a
-    // dispatch would print 99.
-    // PRINTS 6
+    // NOW: vl check rc 1, `operator `-`'s first parameter must be named `self`, got `z`
+    // — operator dispatch binds the LEFT operand to `self`, so this declaration could
+    // never fire`. WAS: rc 0, PRINTED 6 while the declaration's body said 99.
 
 * **IT IS THE POLLUTION RULE, AND IT IS RECEIVER-INDEPENDENT.** `opSelfFnTy` requires
   `p0.parName == "self"` and returns -1 before it consults any type — its own comment
-  calls this "the pollution rule". So unlike D425, whose answer depends on whether the
-  receiver is a `TyObj`, this one is inert at EVERY receiver including a struct:
+  calls this "the pollution rule". Measured over the 760-cell grid
+  (`scripts/silent-sweep/d471/opdeclgrid.py`, 19 `self` types x 10 operators x 2 name
+  spellings x the parameter name): **ZERO of the 380 `z`-named cells dispatch**, against
+  60 that do the moment the parameter is renamed `self` and nothing else changes.
+
+* **THE ROW'S OWN PROSE HAD ONE FALSE SENTENCE, found by running it.** It said
   `function -(z: V, b: V)` over `type V = { x: i32 }` is a loud
-  `field access receiver is not a struct`, and over `i32` it silently returns the native
-  answer. That makes it D444's shape (a syntactic predicate, no resolved type, not
-  blocked behind D402) rather than D425's.
+  `field access receiver is not a struct`. It is not, on any of the masters this branch
+  was rebased through (`2f1f0621`, `aa2350a7`, `2ce75377`): it is
+  `operator '-' is not defined for V and V`, a CHECKER reject at the site, not an emitter
+  one. The class is unchanged — inert at every receiver — but the message named was an
+  emitter message for a program the checker already refuses.
 
-* **DELIBERATELY NOT CLOSED WITH D444, and the reason is that it is a different
-  question.** D444's predicate is arity, which `opSelfFnTy` requires for a mechanical
-  reason. The `self` NAME requirement is a language DESIGN choice about namespace
-  pollution, and refusing a declaration for violating it means deciding that
-  `function -(z, b)` is not a legal ordinary function either — which is true today only
-  because `-` cannot be spelled as a call. Folding it into an arity gate would have
-  shipped that decision without stating it.
+* **THE DESIGN QUESTION IT WAS LEFT OPEN FOR ANSWERS ITSELF, AND THE ANSWER IS MEASURED.**
+  The filed worry was that refusing here decides `function -(z, b)` is not a legal ordinary
+  FUNCTION either — "true today only because `-` cannot be spelled as a call". That
+  conditional is the whole argument, and it holds: `-(7, 1)` is a **parse error**
+  (measured), the quoted spelling `function "-"` mints the identical name (measured, same
+  inertness), and un-annotated and generic forms behave identically (measured). There is no
+  call syntax for the name at any arity under any spelling. So the declaration is exactly
+  "a name no reference could ever be written for" — D444's own criterion, one clause above
+  it in `parseFuncTail`; the criterion `indexOpDeclName` has always applied to
+  `"[]"`/`"[]="`, where a non-`self` first parameter is a hard parse error; and the
+  criterion this file applies to a quoted NON-operator (`function "shout"`). It was the
+  fourth shape of one reject and the only one still silent.
 
-* **PRICE, MEASURED.** Zero customers: no operator declaration in the tree, in `std`, or
-  in the 2,763-cell distilled corpus has a non-`self` first parameter (scanned, 58
-  declarations). The gate is one clause beside D444's in `parseFuncTail`, so the
-  implementation cost is a line; what is unpriced is the design decision above.
+* **CONSISTENT WITH #2005 BECAUSE THE MECHANISM IS, not because consistency is a rule.**
+  D444's predicate is `params.length != 2` — `opSelfFnTy`'s own arity requirement. This
+  one is `p0.parName != "self"` — `opSelfFnTy`'s own name requirement, read off the same
+  three lines. Both are SYNTACTIC and both live in `parseFuncTail`; D425's, which needs the
+  resolved type, lives at the hoist. The two parser clauses are disjoint by construction:
+  a declaration that fails both gets the NAME diagnostic only.
+
+* **PRICE, MEASURED AND ARGUED.** 379 grid cells move, of which **129 are `runs` -> loud
+  check reject**; the other 250 were already loud at their site and now carry the
+  declaration diagnostic ahead of it. Every one of the 129 was producing a WRONG VALUE —
+  its body says 99 (or the opposite of the native relational answer) and the program
+  printed the built-in's — which is the same override #2005 argued for its 73. Zero
+  dispatching cells lost, zero cells moved to silent, zero moved to runs. Outside the grid
+  the price is zero: corpus `cmp` byte-identical on all 1,841 buildable `@run` modules,
+  0 of 1,477 derived corpus classes moved, and an instrumented compiler puts the gate's
+  **reach at 10 and its fire at 0** over the tree's 2,536 pre-existing `.vl` files (this change's own fixtures excluded) — so the clean
+  corpus is the predicate answering no, not dead code. The 129 are kept whole in
+  `distilled/named/` (`d471-d425-binary-operator-declaration`), expectations set to the
+  DECLARATION's answer so a future lift grades `runs but wrong value` rather than `runs`.
+
+* **THE DO-NOTHING RULE HAD TO BE MADE EXECUTABLE, AND THIS GRID IS THE PROOF.**
+  `DECISIONS.md` already carried it — *a cell's expected answer must differ from the answer
+  it would give if the thing under test did nothing* — written down precisely because
+  #2005's grids broke it twice. **This grid broke it again anyway**, written by someone who
+  had just read the rule: the string and literal-union rows had ASCENDING operands while the
+  numeric ones descended, so `"ab" < "cd"` is natively `true` and the `<` declarations
+  returned `true` too. **32 cells could not have distinguished dispatch from inertness**, and
+  nothing about the table looked wrong. The fix is not a better habit, it is a different
+  instrument: every cell now ships a DO-NOTHING CONTROL — its own program with the
+  DECLARATION DELETED and nothing else changed — and `--verify` grades all 770 controls and
+  REFUSES any cell whose control answer equals its declaration answer. It caught the 32 on
+  the first run. It also upgrades the verdict: `inert` is now an observed equality with the
+  declaration-free program rather than an inference from a remembered native answer. **If you
+  are writing the next grid over this family, this is the paragraph to copy.**
+
+#### PRICE PAID — 129 `runs` cells, and the veto that was overridden to pay it
+
+**THIS RUNG LOSES 129 RUNNING CELLS**, which is the condition `CLAUDE.md` makes the standing
+gate exit non-zero on. They are the `d471_*_z_*` cells in `distilled/named/`, regenerated by
+`scripts/silent-sweep/d471/opdeclgrid.py --mkset`. The override is stated HERE, where the next
+person reads the row — never inferred from a clean gate.
+
+**WHAT ONE OF THEM IS**, source and both answers, rather than a description:
+
+    function -(z: i32, other: i32): i32 { return 99 }
+    const a: i32 = 7
+    const b: i32 = 1
+    print(a - b)
+    // WAS: vl check rc 0, PRINTED 6 — and its do-nothing control, the identical
+    //      program with the declaration DELETED, also prints 6.
+    // NOW: vl check rc 1, `operator `-`'s first parameter must be named `self`,
+    //      got `z` — operator dispatch binds the LEFT operand to `self`, so this
+    //      declaration could never fire`
+
+**WHY THE OVERRIDE IS ARGUED RATHER THAN ASSUMED**, in the four terms it has to be argued in:
+
+1. **They run by COINCIDENCE, not by rule — verified PER CELL, not per argument.** Each of the
+   129 was re-graded against the base seed together with its own do-nothing control, and all
+   three properties hold for **129 of 129**: it ran; its output equalled its CONTROL's output
+   (so the declaration contributed nothing to what the program did); and its output DIFFERED
+   from the declaration's own answer. The third is the one that matters — the program printed
+   6 while its own source says the answer is 99, so it was **producing a wrong value**, not a
+   right one. **Zero of the 129 were correct programs**, which is what would have made this a
+   veto rather than a price. (The same check over D425's rung: also 0.) **The check is
+   EXECUTABLE, not a claim in a PR body**:
+   `python3 scripts/silent-sweep/d471/opdeclgrid.py --price <base-seed.wasm>` re-runs all
+   three terms over all 244 and exits non-zero if any cell fails one — on master
+   `2ce75377` it prints `0 fail / 0 fail / 0 fail` and
+   `split: D471 129 + D425 110 + pins 5 = 244`.
+2. **The loss is LOUD.** A positioned diagnostic at the DECLARATION's own line, naming the
+   offending parameter and the one-word fix. Nothing moves to a silent class: the grid's
+   `→ silent` column is **0**, and so is its `→ runs`.
+3. **The price is NAMED and it is the whole set, not a collapse of it.** All 129 are kept
+   whole in `distilled/named/` (`d471-d425-binary-operator-declaration`), each with its
+   expectation set to the **DECLARATION's** answer — so a future lift grades them
+   `runs but wrong value` rather than quietly reading `runs`, which is the difference between
+   the record #2005 left for D444 and the weaker one the older `d425c*` set had.
+4. **It is REVERSIBLE and the reversal is instrumented.** Deleting the `else` clause in
+   `parseFuncTail` restores all 129 exactly; the ablation measured that direction as well as
+   this one. **What buys them back for real is not a revert but a language change**: dropping
+   the pollution rule from `opSelfFnTy` so a non-`self` first parameter DISPATCHES. That is a
+   new feature, and the 129 named cells are its tripwire — they flip to `runs` (the
+   declaration's answer, 99) the day someone lands it, and to `runs but wrong value` if
+   someone lifts the reject without building the dispatch.
+
+**READ THIS AS AN OVERRIDE, NOT A LICENCE.** `runs → not-runs` remains the veto; what makes it
+overridable here is the conjunction — coincidental pass, loud loss, named price, instrumented
+reversal — and all four have to hold. `DECISIONS.md` carries the general form.
+
+* Fixture: `tests/cases/objects/error-operator-self-name-required.vl`.
+
+---
+
+### D491 — a GENERIC `self` is the one binary operator declaration still silently ignored at a built-in site
+**check-clean silently wrong · found 2026-08-28 as the measured RESIDUE of D425's close (#2007), the
+19 cells of that row's grid its gate deliberately does not take · pre-existing and IDENTICAL on
+master `2ce75377` and after D425's landing · kept whole in `distilled/named/` as 19 cells whose
+expectation is the DECLARATION's answer, so the standing gate reads them `runs but wrong value`
+rather than a quiet `runs`**
+
+Repro:
+
+    function "+"<T>(self: T, other: T): i32 {
+      return 99
+    }
+
+    const a: i32 = 7
+    const b: i32 = 1
+    print(a + b)
+    // vl check rc 0. The declared operator returns 99 unconditionally, so a dispatch
+    // would print 99.
+    // PRINTS 8
+
+* **IT IS THE SUBTRACTION D425's GATE HAD TO MAKE, and it is not an oversight.** The
+  IDENTICAL declaration DISPATCHES at an object receiver — `type V = {x: i32}` plus
+  `const a: V = {x: 1}` and `print(a + b)` prints 99, measured on the landing seed. So
+  `binOpDeadSelf` cannot refuse a `self` that carries a hole without refusing a
+  declaration that works. `checkBinary`'s gate is `if odsp is TyObj` over the SITE's left
+  operand, and a type variable is whatever the site pins it to; the declaration does not
+  know, and neither can a declaration-site rule.
+
+* **ALL TEN OPERATORS, BOTH NAME SPELLINGS — 19 of 20 cells, not a corner.** The grid's
+  `typaram` row at `p0 == "self"` is silent for `+ - * / % ^ < <= > >=` under both
+  `function "+"` and `function +`; the twentieth is loud for an unrelated reason. Same
+  shape at every built-in `self` the hole can pin to.
+
+* **"MAKE IT LOUD" IS THE RIGHT QUESTION HERE — D411's reframe — AND THE ANSWER IS
+  MEASURED, NOT ASSUMED.** Being unable to make this class DISPATCH is not the same as
+  having to leave it SILENT, so: where could a positioned reject go? Not the DECLARATION —
+  the same declaration dispatches at an object receiver, so the answer is not known there.
+  That leaves the CALL SITE, where the narrowest predicate is *"a site whose LEFT type is
+  assignable to a declared generic operator's `self`, and is not an object"*. **That is
+  PLACEMENT (B)'s predicate, and it is refuted by a program that runs today** — an
+  unconstrained `T` is assignable FROM EVERYTHING, so the reject does not stop at the cell:
+
+      type V = { x: i32 }
+      function "+"<T>(self: T, other: T): i32 { return 99 }
+      function unrelated(): i32 { return 40 + 2 }
+      function objsite(p: V, q: V): i32 { p + q }
+      const a: i32 = 7
+      const b: i32 = 1
+      print(a + b)          // 8  — THIS row's cell, the one a reject would want
+      print(unrelated())    // 42 — refused for something in another function
+      print(objsite(...))   // 99 — the SAME declaration dispatching; must not break
+
+  All three run, measured on this landing's seed. A site reject that catches the first also
+  catches the second — the exact over-broadness that killed PLACEMENT (B) for D425 — and it
+  has to leave the third alone. The remaining home is the MONOMORPHIZER, where a `<T>` pinned
+  at `i32` becomes a concrete signature while the struct instantiation still has to dispatch,
+  and that is strictly more work than either gate this row's parent built. **So no positioned
+  reject is available at either layer today, which is a stronger and more useful statement
+  than "blocked". This row is the price, not an unwritten patch.**
+
+* **IT IS NOT D492/D493, AND THE DIFFERENCE IS WHICH END IS GENERIC.** This row is a generic
+  DECLARATION that never fires — the operator is unreachable and the site is fine. D492 and
+  D493 are a generic USE SITE whose refusal is dropped on the way through a type parameter:
+  the declaration there is the language's own. The two live in different files
+  (`checkBinary`'s dispatch gate versus `binOpDefinedFor`'s pin adjudication) and neither
+  fix touches the other.
+
+* **THE `d471_*_typaram_self_*` CELLS ARE ITS WITNESS SET** and they are already in the
+  standing gate, so the day this closes the movement is visible without anyone rebuilding
+  a grid: `scripts/silent-sweep/d471/opdeclgrid.py --verify` re-grades them in one pass.
+
+---
+
+### D492 — `^` through a TYPE PARAMETER keeps an acceptance the direct spelling is refused for, and the module is invalid
+**check-clean invalid wasm · found 2026-08-28 while pricing D425's rejected runner-up predicate
+(#2007), by asking what `binOpDefinedFor` answers for an operator it does not model · the
+UNMODELLED half of the pair D493 is the modelled half of · pre-existing and IDENTICAL on
+masters `2f1f0621`, `aa2350a7` and `2ce75377` and on this branch, which touches neither**
+
+Repro:
+
+    function g<T>(a: T, b: T): i32 { return a ^ b }
+    const s: string = "x"
+    const t: string = "y"
+    print(g(s, t))
+    // vl check rc 0, no error and no warning. vl run:
+    //   Invalid input WebAssembly code at offset 280: type mismatch: expected i32,
+    //   found (ref $type)
+
+* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the annotation.** `function g(a: string, b:
+  string): i32 { return a ^ b }` with the same body, the same call and the same operands is a
+  LOUD checker reject: `operator '^' is not defined for string and string`. Change `string`
+  to `T` and the refusal is gone. **That is D35's sentence exactly** — "a rule enforced at
+  `vl check` and lost at monomorphization is a rule about spellings" — at an operator D35's
+  own fix does not cover.
+
+* **THE MECHANISM IS A DOCUMENTED DEFAULT READ IN THE WRONG DIRECTION.**
+  `validateBinCstrs` adjudicates the deferred hole constraint through `binOpDefinedFor`,
+  whose header states: *"Operators not modelled here return true (no false reject)."* `^` is
+  not modelled — the function's arms cover `== != + - * / % < > <= >=` and nothing else — so
+  the pin is accepted for EVERY operand type. The default is correct for the consumer it was
+  written for, where `true` PERMITS and a wrong `true` costs a missed reject; there is simply
+  no second consumer today for which `true` means something else.
+
+* **IT IS NOT D491, AND THE DIFFERENCE IS WHICH END IS GENERIC.** D491 is a generic
+  DECLARATION (`function "+"<T>(self: T, other: T)`) that never fires. This is a generic USE
+  whose refusal is dropped. One is an operator that cannot be reached; the other is an
+  operator site that should have been refused and was not. Neither row's fix touches the
+  other's code.
+
+* **NOT D461's SHAPE, checked rather than assumed.** D461 was two resolvers disagreeing about
+  one pairing (`structIndexOfObjCtx` said Circle, `structIndexOfTypeName` said -1). This is
+  ONE predicate under-covering: `binOpDefinedFor` reads the type arena only — `softenLitTy`,
+  `isNumeric`, `isStringTy`, `concatRefusal` — and consults no name-keyed resolver at all, so
+  there is no second answer to disagree with. The fault is coverage and polarity, not a split.
+  (The name-vs-arena split in this neighbourhood is `isPlainAliasRef`'s, and it belongs to
+  D402 — see D425.)
+
+* **PRICE OF THE FIX, UNMEASURED ON PURPOSE.** Modelling `^` in `binOpDefinedFor` means
+  deciding what `^` IS — `checkBinary` routes it through the integer-only arm with the
+  bitwise operators, so the honest arm is `isNumeric && integer`, and that is a statement
+  about the language a defect row should not make on its own. **Filed, not fixed.** The same
+  edit closes D493.
+
+---
+
+### D493 — `%` over `f64` through a TYPE PARAMETER reaches the EMITTER, where the direct spelling is a checker reject
+**`vl check` rc 0 then a loud emit reject · found 2026-08-28 alongside D492 (#2007) · the MODELLED
+half of the pair, and the more surprising one: `binOpDefinedFor` has a `%` arm and the arm is
+wrong · pre-existing and IDENTICAL on masters `2f1f0621`, `aa2350a7` and `2ce75377` and on this
+branch, which touches neither**
+
+Repro:
+
+    function g<T>(a: T, b: T): T { return a % b }
+    const s: f64 = 7.5
+    const t: f64 = 1.5
+    print(g(s, t))
+    // vl check rc 0, no error and no warning. vl run:
+    //   emitProgram: operator '%' has no f64 form
+
+* **THE CONTROL AGAIN DIFFERS IN ONE THING.** `function g(a: f64, b: f64): f64 { return a % b }`
+  is `operator '%' is integer-only, got f64 and f64` — a positioned CHECKER reject. Replace
+  the two `f64` annotations with `T` and the same program reaches the emitter.
+
+* **THE ARM EXISTS AND ASKS THE WRONG QUESTION.** `binOpDefinedFor`'s `% ` case is
+  `isNumeric(lt) && isNumeric(rt)`, and `isNumeric` is true of `f64`. `checkBinary` rejects
+  float remainder separately, further down, in the arm that handles the bitwise operators —
+  and its comment says `%` is there *for a different reason than the bitwise ops*, which is
+  exactly the sentence that did not get mirrored. So this is not the unmodelled default D492
+  is; it is a modelled arm that does not match the thing it claims to mirror ("Mirrors
+  `checkBinary`'s accepted forms").
+
+* **LOUDER THAN D492 AND STILL WRONG-LAYER.** An `emitProgram:` reject is not a silent class,
+  so this is filed for the LAYER rather than for the invisibility: the message names no source
+  construct the reader chose, arrives after `vl check` said the file was fine, and is
+  unreachable from an editor. D492's twin of the same bug is check-clean INVALID WASM, which
+  is why the two are filed separately even though one edit closes both.
+
+* **FIX, AND WHY IT IS NOT TAKEN HERE.** Mirror `checkBinary`'s integer-only rule into the
+  `%` arm and model `^` (D492) beside it. That is a change to a predicate the pin validation
+  reads at every generic call site, so it wants its own grid and its own price — the ROOT is
+  named, the patch is not written. **Filed, not fixed.**
 
 ---
 
