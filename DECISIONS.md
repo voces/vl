@@ -10,6 +10,43 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A REFUSAL IS A CLAIM ABOUT AN ANSWER SET, AND THE SET IS USUALLY "WAYS TO MAKE IT RUN"**
+  (2026-08-28, silent-class-inventory D411 / #2007). D411 was filed as "a REFUSAL, not a gap"
+  and enumerated three fixes — a checker variance rule, a store-side coercion, a binding
+  split. All three were re-tested and all three still stand refused, one of them now with a
+  price attached (the variance rule reddens D381's own subject, 7 measured control cells).
+  **What the enumeration left out is that a program the compiler cannot lower is a LOUD
+  REJECT.** Turning 68 check-clean invalid modules into 68 positioned emit errors costs
+  nothing that runs and is strictly better, which is the same move `Root A` describes for the
+  86-cell union-box family. So the rule for this inventory: when a row's refusal enumerates
+  only ways to make the witness RUN, it has not yet been asked whether the class can be made
+  loud — and closing it as a SILENT class is a real close even when the defect stays.
+
+- **A LENIENCY THAT MAKES A RESOLVER AGREE WITH ITS TWIN MUST BE A SECOND PASS, NOT A WIDER
+  FIRST ONE** (2026-08-28, silent-class-inventory D461 / #2007). `structIndexOfObjCtx` (node
+  input) and `structIndexOfTypeName` (name input) answer the same question — which struct row
+  a literal builds at — and differed by exactly one arm: a union-BOX field accepts every atom
+  on the node side and was a proven mismatch on the name side. Adding that arm to the name
+  side in ONE pass is a regression, measured: first-match-wins then hands every single-field
+  render the first BOX row rather than the exact row later in the table, and
+  `tests/cases/maps/inferred-map-destination-shape.vl` stops building. Running the strict scan
+  first and the lenient scan only for a render that placed NOWHERE keeps every existing answer
+  byte-identical and adds an answer only where the caller had none. **Generalise it: a
+  leniency added to reconcile two resolvers belongs strictly below the answers that already
+  exist, because what makes the twin's answer right is the adoption that already happened, not
+  a rule about the types.**
+
+- **AN ARITY TEST OVER SPELLINGS IS A DISTINCTNESS TEST, AND WRITING IT AS `length == 1` HIDES
+  A WHOLE DECLARATION FORM** (2026-08-28, silent-class-inventory D446 / #2007).
+  `unionStructAliasShape` gated the struct-alias path on `variants.length == 1`, which is right
+  for the intersection spelling it was written for (`&` concatenates into one variant string)
+  and wrong for `type AB = {a,b} | {a,b}`, which denotes exactly one struct and reads 2 because
+  nothing on the declaration route dedups. The declaration was therefore invisible to the
+  entire struct-alias path including #2004's R2/R3. **The arity of a variant list is a proxy;
+  the question is how many DISTINCT arms there are.** Kept spelling-distinct rather than
+  type-distinct on purpose: two arms of one type may be spelled two ways, and collapsing those
+  is a nominal question (#1942) this predicate has no standing to settle.
+
 - **THE GATE'S CRITERION AND THE SHIPPING CRITERION ARE ONE CRITERION, and letting them drift
   cost this repo a large net win for a day** (2026-08-28, silent-class-inventory-2 D11 /
   #1993 → #2003). `scripts/silent-sweep/distilled/regress.py` blocks on `runs → not-runs` and

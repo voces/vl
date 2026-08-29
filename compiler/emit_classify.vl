@@ -496,7 +496,7 @@ import {
   vbI32Used,
   vbI64Used,
 } from "./emit_state"
-import { emitFail } from "./emit_bytes"
+import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   MV_ARM_NOHINT,
   declTyIxOfName,
@@ -14449,45 +14449,68 @@ export function structIndexOfTypeName(name: string) {
     const fnames: string[] = []
     const ftypes: string[] = []
     shapeFieldParse(name, fnames, ftypes)
-    let si2 = 0
-    const sLimB = sScanLim()
-    while si2 < sLimB {
-      // Skip a struct whose per-field ROWS are not yet fully appended. `internInlineShape`
-      // pushes the struct HEADER (`sNames`/`sFieldStart`/`sFieldCount`) BEFORE populating its
-      // `sFieldNames`/`sFieldTypes`/`sFieldElemName` rows one field at a time, and a code-5
-      // ref-list field's element-name computation (`refArrElemName` → `shapeElemDeclaredStructIdx`)
-      // RE-ENTERS this scanner mid-field-loop. Reading `sFieldElemNameAt` for the (not-yet-pushed)
-      // trailing fields of that half-built struct is an OUT-OF-BOUNDS COMPILER CRASH. The struct
-      // being interned was not resolvable before this point anyway, so making it invisible until
-      // its rows are complete is behavior-preserving. (`sFieldElemName` is the last row pushed per
-      // field, so it is the shortest of the three detail arrays mid-construction.) fuzz sweep
-      // zq0NPY multiobs, seed 24438928 (`{a: {…, z: f64[] | null}[], …} | string | {q: i64}`).
-      if sFieldStart[si2] + sFieldCount[si2] > sFieldElemName.length {
-        si2 = si2 + 1
-        continue
-      }
-      if sFieldCount[si2] == fnames.length {
-        let ok = true
-        let k = 0
-        while k < fnames.length {
-          const fj = sFieldIndex(si2, fnames[k])
-          if fj < 0 {
-            ok = false
-          } else if (
-            !shapeFieldTypeCompat(
-              ftypes[k],
-              sFieldTypeAt(si2, fj),
-              sFieldElemNameAt(si2, fj),
-            )
-          ) {
-            ok = false
-          }
-          k = k + 1
-        }
-        if ok { return si2 }
-      }
+    // TWO PASSES, AND THE FIRST ONE IS THE OLD FUNCTION (D461). The strict pass is
+    // byte-for-byte the scan every caller has always run, so a render that placed before
+    // places on the same row now. Only a render that placed NOWHERE reaches the second,
+    // which re-scans with `anonValueFitsField`'s union-box leniency — the one pairing where
+    // the NODE resolver adopts a declared row and this one refuses it, leaving the shape
+    // with no row at all after the adoption suppressed its `#anon`. Ordering the two is the
+    // whole safety argument: run as ONE lenient pass it hands a single-field render the
+    // FIRST box row rather than the exact one, which is a corpus module lost.
+    const strictSi = shapeRowScanK(fnames, ftypes, false)
+    if strictSi >= 0 { return strictSi }
+    return shapeRowScanK(fnames, ftypes, true)
+  }
+  -1
+}
+
+// The row scan `structIndexOfTypeName` runs, at one leniency (D461). Split out of that
+// function verbatim so the two passes cannot drift; `boxLenient` is threaded to
+// `shapeFieldTypeCompatK` and changes nothing else.
+function shapeRowScanK(
+  fnames: string[],
+  ftypes: string[],
+  boxLenient: boolean,
+): i32 {
+  let si2 = 0
+  const sLimB = sScanLim()
+  while si2 < sLimB {
+    // Skip a struct whose per-field ROWS are not yet fully appended. `internInlineShape`
+    // pushes the struct HEADER (`sNames`/`sFieldStart`/`sFieldCount`) BEFORE populating its
+    // `sFieldNames`/`sFieldTypes`/`sFieldElemName` rows one field at a time, and a code-5
+    // ref-list field's element-name computation (`refArrElemName` → `shapeElemDeclaredStructIdx`)
+    // RE-ENTERS this scanner mid-field-loop. Reading `sFieldElemNameAt` for the (not-yet-pushed)
+    // trailing fields of that half-built struct is an OUT-OF-BOUNDS COMPILER CRASH. The struct
+    // being interned was not resolvable before this point anyway, so making it invisible until
+    // its rows are complete is behavior-preserving. (`sFieldElemName` is the last row pushed per
+    // field, so it is the shortest of the three detail arrays mid-construction.) fuzz sweep
+    // zq0NPY multiobs, seed 24438928 (`{a: {…, z: f64[] | null}[], …} | string | {q: i64}`).
+    if sFieldStart[si2] + sFieldCount[si2] > sFieldElemName.length {
       si2 = si2 + 1
+      continue
     }
+    if sFieldCount[si2] == fnames.length {
+      let ok = true
+      let k = 0
+      while k < fnames.length {
+        const fj = sFieldIndex(si2, fnames[k])
+        if fj < 0 {
+          ok = false
+        } else if (
+          !shapeFieldTypeCompatK(
+            ftypes[k],
+            sFieldTypeAt(si2, fj),
+            sFieldElemNameAt(si2, fj),
+            boxLenient,
+          )
+        ) {
+          ok = false
+        }
+        k = k + 1
+      }
+      if ok { return si2 }
+    }
+    si2 = si2 + 1
   }
   -1
 }
@@ -14607,6 +14630,18 @@ function mvValNamesCompat(va: string, ve: string): boolean {
 // (code 19) is additionally tightened by its VALUE rep (`mvValNamesCompat` against the
 // slot's recorded `elem` name) — the code alone is value-blind.
 function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
+  shapeFieldTypeCompatK(t, code, elem, false)
+}
+
+// The `boxLenient` form (D461). `false` is every caller's historical behaviour and the only
+// one `variantIndexOfTypeName` ever asks for; `true` is `structIndexOfTypeName`'s SECOND
+// pass, run only for a render the strict pass could not place at all. See the arm below.
+function shapeFieldTypeCompatK(
+  t: string,
+  code: i32,
+  elem: string,
+  boxLenient: boolean,
+): boolean {
   const want = nameFieldCode(t)
   if want < 0 || code < 0 {
     // A NESTED-STRUCT candidate field (code 15) whose spelled type `nameFieldCode`
@@ -14679,6 +14714,25 @@ function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
     return true
   }
   if want != code {
+    // THE UNION-BOX FIELD ACCEPTS EVERY ATOM — the NAME resolver's half of the leniency
+    // `anonValueFitsField` has always applied on the NODE side (D461), and the two answer
+    // ONE question: which struct row does a `{r: 7}` literal build at.
+    // `structIndexOfObjCtx` matches it onto a declared `type Circle = { r: i32 | null }`
+    // (`sc == 16 { return true }`, its second line) and that adoption SUPPRESSES the
+    // `#anon` row `collectAnonShapes` would have minted for the shape the checker named —
+    // so the shape has exactly one row and it is Circle's. This resolver refused that same
+    // pairing as a proven code mismatch (`want` 0 for the spelled `i32`, `code` 16 for the
+    // box), and the render `{r: i32}` named NO row at all.
+    //
+    // IT IS A SECOND-PASS LENIENCY AND THAT IS NOT A DETAIL — `boxLenient` is false on the
+    // pass every caller has always run, and true only on a re-scan the caller reaches when
+    // the strict pass answered -1. Applied in ONE pass it is a REGRESSION, measured:
+    // `tests/cases/maps/inferred-map-destination-shape.vl` stops building, because its
+    // section 1 declares `type Circle = { r: Shape2 }` (an arm field, code 16) BEFORE
+    // section 7's `type CircleG = { r: i32 }`, and first-match-wins then hands every
+    // single-field-`r` render the box row instead of the exact one. The leniency is only
+    // ever right as a fallback for a render that names nothing at all.
+    if boxLenient && code == 16 { return true }
     // The AMBIGUOUS nullable-closure render: a code-22 field (`f: (() => i64) | null`)
     // RENDERS ungrouped (`()=>i64|null` — the checker drops a union member's grouping
     // parens), which `nameFieldCode` reads as a top-level arrow (code 14) returning a
@@ -29007,6 +29061,44 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
 // NAME-SCOPED OVER THE WHOLE ARENA, on `letMapDestShape`'s and `letInfStrListByUse`'s
 // precedent. First match wins.
 export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
+  const box = letRefListDestSlotK(letIx, fnIx, 2)
+  // TWO DESTINATIONS OF DIFFERENT ELEMENT KINDS ARE A LOUD REJECT, NOT A SLOT PICK (D411).
+  // The scan below is a KIND-2 filter, so it cannot even see a `Circle[]` destination
+  // standing beside the `Shape[]` one it answers with — it steps past it and mints the
+  // literal at the box. That is not a tie-break this rung could get right by ordering:
+  // a list value has ONE element rep and the two destinations demand two, so whichever
+  // slot is returned, the OTHER store is a type mismatch. D381's landing moved which
+  // binding is wrong (offset 224 -> 226) and D411 filed that as a REFUSAL.
+  //
+  // WHAT THE REFUSAL ENUMERATED WAS THREE WAYS TO MAKE IT RUN, and all three still stand
+  // refused — a variance rule reddens `const c: Shape[] = lv1`, which is D381's whole
+  // subject and RUNS; a store-side coercion is a per-element rebuild loop the emitter has
+  // nowhere; splitting the binding is a rewrite pass. The fourth answer is not on that
+  // list: say so. A program the compiler cannot lower is a LOUD REJECT, and turning 96
+  // check-clean invalid modules into 96 loud ones costs nothing that runs — measured on
+  // `scripts/silent-sweep/d411/`, where all 7 single-destination controls keep running.
+  //
+  // ASKED ONLY WHEN THE BOX ANSWER EXISTS, so the kind-1 scan runs on the programs this
+  // rung already scanned the arena for and on no others.
+  if box >= 0 {
+    if letRefListDestSlotK(letIx, fnIx, 1) >= 0 {
+      emitFailAt(
+        "emitProgram: one un-annotated list literal is bound to TWO declared destinations " +
+          "whose elements are stored differently (a union-box element list and a " +
+          "plain-struct element list); a list value has one element storage, so annotate " +
+          "the literal at the type it must be, or build a second literal for the second " +
+          "destination",
+        letIx,
+      )
+    }
+  }
+  box
+}
+
+// The kind-parameterised scan (D411). `want` 2 is the union BOX — the only kind this rung
+// ever ANSWERS with, and the behaviour every caller had before — and `want` 1 is the plain
+// struct-row element list, asked only by the conflict detector above.
+function letRefListDestSlotK(letIx: i32, fnIx: i32, want: i32): i32 {
   // THE SCAN IS O(ARENA), AND THIS IS THE O(1) NECESSARY CONDITION THAT KEEPS IT OFF MOST
   // PROGRAMS: the rung can only ever return a kind-2 (union BOX) row, and a module with no
   // declared union has none. The obvious second gate — scan `rlElemKindTbl` for a kind-2 row
@@ -29041,7 +29133,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
           // (a) `const c: Shape[] = nm`
           if dini is Ident {
             if dini.identName == nm {
-              const rs = letAnnDestBoxListSlot(i)
+              const rs = letAnnDestKindListSlot(i, want)
               if rs >= 0 { return rs }
             }
           }
@@ -29053,7 +29145,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
               const el = P.nodes[unwrapParen(dini.arrElems[ei])]
               if el is Ident {
                 if el.identName == nm {
-                  const iv = rlInnerBoxListSlot(letAnnRefListSlot(i))
+                  const iv = rlInnerKindListSlot(letAnnRefListSlot(i), want)
                   if iv >= 0 { return iv }
                 }
               }
@@ -29075,7 +29167,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
                       const fi2 = sFieldIndex(dsi, ff.fiName)
                       if fi2 >= 0 {
                         const rs = rlSlotByName(sFieldElemNameAt(dsi, fi2))
-                        if rlSlotIsBoxList(rs) { return rs }
+                        if rlSlotIsKindList(rs, want) { return rs }
                       }
                     }
                   }
@@ -29098,7 +29190,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
               if lhs is Index {
                 const mapN = P.nodes[unwrapParen(lhs.idxArr)]
                 if mapN is Ident {
-                  const iv = mapValBoxListSlot(mapN.identName, fnIx)
+                  const iv = mapValKindListSlot(mapN.identName, fnIx, want)
                   if iv >= 0 { return iv }
                 }
               }
@@ -29108,7 +29200,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
               if lhs is Ident {
                 const li = destLetOf(lhs.identName, fnIx)
                 if li >= 0 {
-                  const rs = letAnnDestBoxListSlot(li)
+                  const rs = letAnnDestKindListSlot(li, want)
                   if rs >= 0 { return rs }
                 }
               }
@@ -29125,7 +29217,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
             const arg = P.nodes[unwrapParen(nd.callArgs[ai])]
             if arg is Ident {
               if arg.identName == nm {
-                const rs = fnParamBoxListSlot(callee.identName, ai)
+                const rs = fnParamKindListSlot(callee.identName, ai, want)
                 if rs >= 0 { return rs }
               }
             }
@@ -29144,9 +29236,9 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
               if fnIx >= 0 {
                 const fnd = P.nodes[fnIx]
                 if fnd is FuncDecl {
-                  if tyAnnRefListKind(fnd.fnRet) == 2 {
+                  if tyAnnRefListKind(fnd.fnRet) == want {
                     const rs = tyAnnRefListSlot(fnd.fnRet)
-                    if rlSlotIsBoxList(rs) { return rs }
+                    if rlSlotIsKindList(rs, want) { return rs }
                   }
                 }
               }
@@ -29160,12 +29252,12 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The kind-2 (union BOX) ref-list slot a `LetDecl`'s annotation names, or -1 — the
-// destination test forms (a) and (b) of `letRefListDestSlot` both reduce to it.
-function letAnnDestBoxListSlot(letIx: i32): i32 {
-  if letAnnRefListKind(letIx) != 2 { return -1 }
+// The ref-list slot of element kind `want` that a `LetDecl`'s annotation names, or -1 —
+// the destination test forms (a), (b) and (g) of `letRefListDestSlot` all reduce to it.
+function letAnnDestKindListSlot(letIx: i32, want: i32): i32 {
+  if letAnnRefListKind(letIx) != want { return -1 }
   const rs = letAnnRefListSlot(letIx)
-  if rlSlotIsBoxList(rs) { return rs }
+  if rlSlotIsKindList(rs, want) { return rs }
   -1
 }
 
@@ -29193,7 +29285,7 @@ function destLetOf(name: string, fnIx: i32): i32 {
 // whole intern pass — gets the slot for its BUILD, so the two halves of one landing
 // disagree and the module is invalid at a NEW offset. The annotation's own ref-list row is
 // interned by the annotation walk, ahead of both.
-function mapValBoxListSlot(name: string, fnIx: i32): i32 {
+function mapValKindListSlot(name: string, fnIx: i32, want: i32): i32 {
   const li = destLetOf(name, fnIx)
   if li < 0 { return -1 }
   const d = P.nodes[li]
@@ -29206,7 +29298,7 @@ function mapValBoxListSlot(name: string, fnIx: i32): i32 {
           const en = refArrElemNameIf(vn)
           if en != "" {
             const rs = rlSlotByName(en)
-            if rlSlotIsBoxList(rs) { return rs }
+            if rlSlotIsKindList(rs, want) { return rs }
           }
         }
       }
@@ -29215,23 +29307,32 @@ function mapValBoxListSlot(name: string, fnIx: i32): i32 {
   -1
 }
 
-// The kind-2 (union BOX) ref-list slot NESTED inside `slot`, or -1: a list-of-lists row
-// (element kind 9) holds its inner list's slot, and that inner list is the destination
+// The ref-list slot of element kind `want` NESTED inside `slot`, or -1: a list-of-lists
+// row (element kind 9) holds its inner list's slot, and that inner list is the destination
 // forms (b) and (c) hand this binding.
-function rlInnerBoxListSlot(slot: i32): i32 {
+function rlInnerKindListSlot(slot: i32, want: i32): i32 {
   if slot < 0 { return -1 }
   if slot >= rlElemKindTbl.length { return -1 }
   if rlElemKindTbl[slot] != 9 { return -1 }
   const iv = rlElemInnerSlot(slot)
-  if rlSlotIsBoxList(iv) { return iv }
+  if rlSlotIsKindList(iv, want) { return iv }
   -1
 }
 
-// True when `slot` is a live ref-list row whose element kind is the union BOX (2).
-function rlSlotIsBoxList(slot: i32): boolean {
+// True when `slot` is a live ref-list row whose element kind is `want` — 2 is the union
+// BOX, 1 a plain struct-row element.
+//
+// IT TAKES THE KIND RATHER THAN HARD-CODING 2 (D411). Every destination helper in this
+// cluster ends in this test, and the two-destination conflict detector needs the SAME
+// seven destination forms read at kind 1 as `letRefListDestSlot` reads at kind 2. Asking
+// them with a parameter is what keeps the two readings arm for arm: a form covered in one
+// is covered in the other by construction, and a form added later cannot reach only one of
+// them. (The five `…BoxListSlot` wrappers this replaces were deleted with their gates
+// rather than kept — after the parameter every one of them had zero callers.)
+function rlSlotIsKindList(slot: i32, want: i32): boolean {
   if slot < 0 { return false }
   if slot >= rlElemKindTbl.length { return false }
-  rlElemKindTbl[slot] == 2
+  rlElemKindTbl[slot] == want
 }
 
 // THE (kind, slot) PAIR A `LetDecl`'s LIST INITIALIZER BUILDS WITH — its own annotation's,
@@ -29255,11 +29356,12 @@ export function letListBuildSlot(letIx: i32, fnIx: i32): i32 {
   letAnnRefListSlot(letIx)
 }
 
-// The kind-2 ref-list slot parameter `argIx` of the named function declares, or -1. There
-// is no function-by-name index in the arena, so this scans — reached only from
-// `letRefListDestSlot` form (d) and only once a call argument already matched the
-// binding's name, which bounds it by that binding's call sites rather than by arena size.
-function fnParamBoxListSlot(fnName: string, argIx: i32): i32 {
+// The ref-list slot of element kind `want` that parameter `argIx` of the named function
+// declares, or -1. There is no function-by-name index in the arena, so this scans —
+// reached only from `letRefListDestSlot` form (d) and only once a call argument already
+// matched the binding's name, which bounds it by that binding's call sites rather than by
+// arena size.
+function fnParamKindListSlot(fnName: string, argIx: i32, want: i32): i32 {
   let i = 0
   while i < P.nodes.length {
     const nd = P.nodes[i]
@@ -29268,9 +29370,9 @@ function fnParamBoxListSlot(fnName: string, argIx: i32): i32 {
         if argIx < nd.fnParams.length {
           const p = P.nodes[nd.fnParams[argIx]]
           if p is Param {
-            if tyAnnRefListKind(p.parType) == 2 {
+            if tyAnnRefListKind(p.parType) == want {
               const rs = tyAnnRefListSlot(p.parType)
-              if rlSlotIsBoxList(rs) { return rs }
+              if rlSlotIsKindList(rs, want) { return rs }
             }
           }
         }
@@ -30994,10 +31096,21 @@ export function letMapShapeOf(letIx: i32, fnIx: i32) {
     // annotation walk. So admitting `-3` lets the binding land on a slot that EXISTS and can
     // still supply none — `scripts/silent-sweep/distilled/named/d207nodest.vl` is a `-3` floor
     // with no destination at all, it reaches this rung (`reach=1`) and gets no answer
-    // (`ans=0`), and it must stay a loud reject. That cell is the bound, and it is a program
-    // rather than a condition. The mono/set sentinels (-1, -2, -5) stay out because nothing
-    // measured moves under them: the full ungate was built and graded, and it is behaviourally
-    // IDENTICAL to this one on all 43,200 block-C cells.
+    // (`ans=0`). That cell is the bound, and it is a program rather than a condition. The
+    // mono/set sentinels (-1, -2, -5) stay out because nothing measured moves under them: the
+    // full ungate was built and graded, and it is behaviourally IDENTICAL to this one on all
+    // 43,200 block-C cells.
+    //
+    // **THE BOUND WAS PAID OFF FROM THE OTHER SIDE, AND THE PREDICTION ATTACHED TO IT WAS
+    // WRONG (D461, 2026-08-28).** The cell was filed with "if it starts running without this
+    // row moving, D207's rung has stopped finding and started MINTING". It now RUNS and this
+    // rung is untouched and still a find: the mint it was missing was refused one container
+    // UP, at `structIndexOfTypeName`, which refused the very struct row `structIndexOfObjCtx`
+    // had already adopted the literal onto — so `mvValKindOfName` read `-3` for a shape whose
+    // row existed. The general lesson the cell was carrying survives with a correction: a
+    // `-3` here means the value's REP was never resolved, and that can be because the mint
+    // was skipped OR because the mint was never possible, and only the second is this rung's
+    // business.
     const ish = mapShapeOfExpr(d.letInit, fnIx)
     if ish >= 0 || ish == -3 {
       const dsh = letMapDestShape(letIx, fnIx)

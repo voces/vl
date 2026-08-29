@@ -9727,51 +9727,82 @@ Named set: `scripts/silent-sweep/census/d207-listmap-tripwire.json` (740 coordin
 
 ---
 
-### D461 — the `-3` map-value floor with NO destination: D207's other half, and it was never actually filed
-**loud emit reject · `emitProgram: unsupported map value type` · found 2026-08-28 while closing D207, by GRADING the claim that this witness was "filed as D209" — it is not, and was not**
+### D461 — [CLOSED 2026-08-28] the `-3` map-value floor with NO destination: D207's other half, and it was never actually filed
+**closed 2026-08-28 · the filed repro RUNS and prints `1` · was a `loud emit reject` (`emitProgram: unsupported map value type`) · found 2026-08-28 while closing D207, by GRADING the claim that this witness was "filed as D209" — it is not, and was not · the root is TWO STRUCT-ROW RESOLVERS THAT DISAGREE about an adopted literal, and the row's own prescription ("the fix is at the adoption or at the interning gate") was wrong in both halves**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 | null }
     const lv1 = Map()
     lv1["k0"] = { r: 7 }
     print(lv1.size)
-    // vl run: emitProgram: unsupported map value type (no rep for a union-member struct, a
+    // was: emitProgram: unsupported map value type (no rep for a union-member struct, a
     //   nullable list over an unnamed element rep, or a nullable litunion-result closure;
     //   any other value type here interned no mv slot)
+    // Now: 1
 
-* **THE BOOKKEEPING ERROR THIS ROW EXISTS TO CORRECT.** D207's row said of this program
-  "**That witness is filed as D209** — D207 closes only the half with a destination. D209 is
-  still OPEN". Graded on `95be9e74`, both halves of that are false: **D209 CLOSED 2026-08-28**,
-  and D209's own filed repro is the *list* spelling (`const lv1 = [{ r: 7 }]`, which now runs
-  and prints 7) — a different program. The map spelling was never a row in either inventory;
-  `grep` for it returns nothing. It had been standing behind another row's ID, which is
-  exactly the failure mode `CLAUDE.md` opens with: the inventory is not the file the fixer
-  edits, so a row goes stale one-directionally and a *second* row inherits the staleness by
-  citation. Re-running the citation is what caught it.
-* **DELETE THE `type Circle` LINE AND IT RUNS**, printing `1`. The declaration is unused,
-  unannotated and unmentioned; its mere presence changes how the literal is emitted. That is
-  D209's mechanism one container over: `structIndexOfObjCtx` adopts `{ r: 7 }` onto Circle's
-  row through `anonValueFitsField`'s union-box leniency, which also SUPPRESSES the `#anon`
-  row `collectAnonShapes` would have minted (its gate is `structIndexOfObj(ai) < 0`), and the
-  mv layer then asks for a rep under a render that names nothing.
-* **WHY D207's LANDING DOES NOT REACH IT, MEASURED RATHER THAN ARGUED.** D207 admitted the
-  `-3` floor to `letMapDestShape`, which is a **FIND** — it interns nothing, so it can only
-  land a binding on a slot the destination's own annotation walk already minted. Here there
-  is no destination, so there is no slot. A `tErr` probe on the closing compiler reads
-  **`reach=1` / `ans=0`** on this program: the rung IS entered and answers nothing. That is
-  the whole difference between this row and D207, and it is why closing D207 moved 6,028
-  census cells without moving this one.
-* **IT IS ALSO THE BOUND, KEPT AS A CELL.**
-  `scripts/silent-sweep/distilled/named/d207nodest.vl` is this program, and it must keep
-  LOUD-REJECTING until this row is closed on purpose. If it starts running without this row
-  moving, D207's rung has stopped finding and started MINTING — which is the discipline
-  D-MAPNODETY pays 128 measured slot moves to keep.
-* Closing it needs what D209's close needed one container in: the adoption suppressing the
-  `#anon` row is upstream of every container, so the fix is at the adoption or at the
-  interning gate, not in the mv layer that reports it. Both of D209's original candidate
-  fixes were built and refuted on 2026-08-27 against the map spelling specifically; that
-  work is not re-litigated here.
+* **THE BOOKKEEPING ERROR THIS ROW EXISTS TO CORRECT (unchanged, and it is why the row
+  exists).** D207's row said of this program "**That witness is filed as D209** — D207 closes
+  only the half with a destination. D209 is still OPEN". Both halves were false: **D209 CLOSED
+  2026-08-28**, and D209's own filed repro is the *list* spelling (`const lv1 = [{ r: 7 }]`),
+  a different program. The map spelling was never a row in either inventory. Re-running the
+  citation is what caught it.
+
+* **THE MECHANISM — ONE QUESTION, TWO RESOLVERS, DIFFERENT ANSWERS.** Which struct row does
+  `{ r: 7 }` build at?
+
+  | resolver | input | on `{r:i32}` vs `type Circle = {r: i32 | null}` |
+  |---|---|---|
+  | `structIndexOfObjCtx` (the NODE side) | the `ObjLit` | **Circle** — `anonValueFitsField`'s second line is `if sc == 16 { return true }`, "a union BOX field accepts every atom by construction" |
+  | `structIndexOfTypeName` (the NAME side) | the render `{r: i32}` | **-1** — `shapeFieldTypeCompat` reads `want` 0 for the spelled `i32` against `code` 16 and calls it a PROVEN mismatch |
+
+  The adoption also SUPPRESSES the `#anon` row `collectAnonShapes` would have minted (its gate
+  is `structIndexOfObj(ai) < 0`), so after it there is exactly ONE row for that shape and it is
+  Circle's — and the name resolver refuses to name it. `mvValKindOfName` reads that -1 as its
+  `-3` unsupported sentinel, so `mvShapeOfMapNodeTy` mints no mv slot (`kind < 0 { return -3 }`
+  at `mvShapeOfValNameArmTy`'s fifth line), the FIND falls to the same `-3`, and `emitMapNew`
+  reports it. **The mint was CALLED and declined**, which is worth stating because
+  `emit_collect`'s own comment at that call site claims the un-annotated-map hole is closed —
+  it is closed only for value names the kind ladder can classify without a struct row.
+
+* **THE ROW'S OWN PRESCRIPTION WAS WRONG, MEASURED BOTH WAYS.** It said *"the adoption
+  suppressing the `#anon` row is upstream of every container, so the fix is at the adoption or
+  at the interning gate, not in the mv layer that reports it."*
+  * At the **adoption**: declining it is D209's candidate 1, refused and pinned as **D271** —
+    the identical per-node dump for the defect and for the control means a per-node key
+    provably cannot separate them.
+  * At the **interning gate**: minting the `#anon` row anyway gives the map's vals element a
+    row the STORE does not build at, i.e. it trades a loud reject for check-clean invalid
+    wasm. Not built, because the direction is refuted by the table above: the value is
+    emitted at Circle's row, so Circle's row is the only right answer for the vals element.
+  * The fix is at NEITHER: it is at the name resolver, which is the one of the two that is
+    WRONG about a question the other has already answered.
+
+* **THE LANDING — ONE SECOND PASS, AND THE ORDERING IS THE WHOLE SAFETY ARGUMENT.**
+  `structIndexOfTypeName` now runs its field-set scan TWICE: the strict pass is byte-for-byte
+  the scan every caller has always run, and only a render that placed NOWHERE reaches a second
+  pass carrying `anonValueFitsField`'s union-box leniency (`shapeFieldTypeCompatK`'s
+  `boxLenient` arm). **Run as ONE lenient pass it is a regression and that is measured, not
+  feared**: `tests/cases/maps/inferred-map-destination-shape.vl` stops building, because its
+  section 1 declares `type Circle = { r: Shape2 }` (an arm field, code 16) BEFORE section 7's
+  `type CircleG = { r: i32 }`, and first-match-wins then hands every single-field-`r` render
+  the box row instead of the exact one. That candidate is the refused one; the ordered pair is
+  what shipped.
+
+* **MEASURED.** Corpus `cmp` 2,393 modules · 0 DIFFER · 0 LOST. Distilled corpus: **0 `runs`
+  lost, 0 cells into any silent class, and 708 census cells `loud emit reject` -> `runs`** —
+  `d207nodest` (this row's own bound) plus two block-E classes standing for 106 and 601 cells.
+  Census **block E graded whole**, cell-matched (see the table in `CHANGELOG.md`). The
+  read-back also works: `print((lv1["k0"] ?? { r: 0 }).r)` prints `7`, because D209's
+  `memReadUnboxAtomKind` unboxes the adopted field — pinned as
+  `tests/cases/maps/adopted-anon-shape-is-the-map-value-row.vl`.
+
+* **THE BOUND IT PAID OFF, ON PURPOSE.** `scripts/silent-sweep/distilled/named/d207nodest.vl`
+  IS this program, filed by #2006 as a cell that must keep LOUD-REJECTING, with the reasoning
+  "if it starts running without this row moving, D207's rung has stopped finding and started
+  MINTING". This row moved, and D207's rung is untouched and still a find — the mint it was
+  missing was refused one container up. The cell keeps its place with its polarity flipped: it
+  must now RUN and print `1`, and `letMapShapeOf`'s header carries the correction.
 
 ---
 
@@ -13048,10 +13079,10 @@ Repro (now `runs`):
 
 ---
 
-### D411 — ONE un-annotated list literal with TWO declared destinations of different element KINDS is check-clean invalid wasm, and no reverse lookup can fix it
-**check-clean invalid wasm · found 2026-08-28 closing D381, as the residue its rung provably cannot reach · a REFUSAL, not a gap: the two destinations demand two element reps of one list value, so the landing moves WHICH binding is wrong and cannot make both right**
+### D411 — [CLOSED 2026-08-28 as a SILENT class] ONE un-annotated list literal with TWO declared destinations of different element KINDS — the refusal SURVIVED, and the row had enumerated only the answers that make it run
+**now a loud emit reject · was `check-clean invalid wasm` · found 2026-08-28 closing D381, as the residue its rung provably cannot reach · the filed REFUSAL is UPHELD on all three of its own grounds and is not the whole question: a program the compiler cannot lower is a LOUD REJECT**
 
-Repro:
+Repro (now a loud emit reject):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -13064,31 +13095,121 @@ Repro:
       if c2.length > 0 { print(1) } else { print(0) }
     }
     f()
-    // vl check rc 0 with NO diagnostics; vl run:
+    // was: vl check rc 0 with NO diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 226: type mismatch: expected (ref $type), found (ref $type)
+    // Now: emitProgram: one un-annotated list literal is bound to TWO declared destinations
+    //   whose elements are stored differently …
 
-* **THE BYTES SAY THE SAME THING FROM BOTH SIDES.** On `8939d435` the literal builds
-  `struct.new $5` over `(array (mut (ref null $1)))` — a list of the `Circle` struct — and
-  `const c2: Shape[]` is a `(ref $7)` box-list cell, so the SECOND store is the mismatch.
-  With D381's `letRefListDestSlot` landed the literal builds `struct.new $7` over the box
-  array and it is the FIRST store, `const c: Circle[] = lv1`, that mismatches. Neither
-  answer is available to a rung that reads destinations: a list value has one element rep,
-  and `Circle[]` and `Shape[]` are two.
+* **THE BYTES SAY THE SAME THING FROM BOTH SIDES (unchanged, and re-confirmed on
+  `2f1f0621`).** The literal builds `struct.new $6` over the box array and it is the FIRST
+  store, `const c: Circle[] = lv1`, that mismatches; before D381 it was the second. Neither
+  answer is available to a rung that reads destinations: a list value has one element rep, and
+  `Circle[]` and `Shape[]` are two.
 
-* **IT IS NOT A REGRESSION AND IT IS NOT NEW.** The cell is `check-clean invalid wasm` on
-  both compilers, the same class with the same shape of message; only the offset moves
-  (224 → 226). D381's landing is graded on it and it stays put.
+* **THE REFUSAL SURVIVED CONTACT, ON ALL THREE GROUNDS, AND ONE OF THEM IS NOW MEASURED
+  RATHER THAN ARGUED.**
+  (a) the CHECKER: array assignability is plainly COVARIANT (`assignableGo`'s `TyArray` arm is
+  `assignable(sTail.aElem, d.aElem)`, with no mutability qualification), and the loud-reject
+  machine for exactly this failure — `objShapeAdapterless` + its
+  *"changes how the ELEMENT is stored"* message — IS reached by this program and declines for
+  one reason: `containerElemClassDiffers` folds "plain struct element" and "all-ref union
+  element" into one class, `ESC_REF`. Splitting that class makes this loud AND reddens
+  `const c: Shape[] = lv1`, which is D381's whole subject and RUNS — **and the grid prices it:
+  all 7 single-destination controls, kept in `named/`.** So the checker answer costs 7 running
+  spellings to buy 68, and it is refused.
+  (b) a COERCION at the store: still nowhere. Every `fbArrayCopy` in the emitter is
+  same-heap-to-same-heap; the only per-element boxing is `emitArr`'s loop over SYNTACTIC
+  `arrElems` at literal build time. There is no pass that iterates an existing list value.
+  (c) splitting the binding: still a rewrite pass, and it changes aliasing for programs that
+  run today.
 
-* **THE THREE PLACES A REAL FIX COULD LIVE, none of them this rung.** (a) the CHECKER:
-  `Circle[]` is not soundly assignable to `Shape[]` under a mutable array anyway, so a
-  variance rule would make this a loud reject — and would also redden `const c: Shape[] =
-  lv1`, which is D381's whole subject and RUNS. (b) a COERCION at the store, which is a
-  per-element rebuild loop the emitter has nowhere today. (c) splitting the binding, which is
-  a rewrite pass. Each is a language decision, not a slot lookup, which is why this is filed
-  rather than attempted.
+* **WHAT THE ROW DID NOT ENUMERATE, AND IT IS THE ANSWER.** All three entries are ways to make
+  this RUN. The fourth is to make it LOUD — the same move `Root A` describes as *"one predicate
+  away from turning 86 silent cells into 86 loud ones, which is strictly better even before
+  anyone wires the capture"*. `letRefListDestSlot`'s gate is a KIND-2 filter, so it cannot see
+  the `Circle[]` destination beside the `Shape[]` one it answers with; the six destination
+  helpers it stands on are now KIND-TAKING (`rlSlotIsKindList` and friends, one parameter, the
+  five kind-2 wrappers deleted with their gates), so the same seven forms can be asked at kind
+  1. Where both answer, the binding is refused with a message that names the workaround.
 
-* Nothing in the census reaches it: blocks B, C, D and E have no cell with two annotated
-  destinations for one un-annotated literal, so the coordinate would have to be built.
+* **THE GRID, WHICH HAD TO BE BUILT** — `scripts/silent-sweep/d411/gen411.py`, committed with
+  `--verify`. `d2` (the union destination's spelling) x `d1` (the struct destination's
+  spelling, or `none`) x `order`, over the seven forms `letRefListDestSlot` enumerates: 103
+  cells. Nothing in the census reaches this class — blocks B/C/D/E have no cell with two
+  annotated destinations for one un-annotated literal — which is why the cells are in
+  `named/` whole rather than distilled.
+
+  | | base | landing |
+  |---|---|---|
+  | check-clean invalid wasm | 96 | **28** |
+  | loud emit reject | 0 | **68** |
+  | runs (the `__none__` controls) | 7 | **7** |
+  | `runs` LOST | — | **0** |
+  | -> silent | — | **0** |
+
+  `order` moves nothing in either direction, which is what says the rung is a kind FILTER and
+  not a tie-break the landing got lucky with.
+
+* **THE 28-CELL RESIDUE IS BOUNDED BY *REACH*, NOT BY THE PREDICATE — probed, and the two sets
+  are IDENTICAL.** A `tErr` probe on the conflict site reads `reach=0` for exactly 28 cells and
+  `reach=1` for exactly the other 75, and the 28 are exactly the 28 that stay silent: every
+  cell the rung is asked about, it answers. They are `d1=ret` (12) and `d2 ∈ {mapstore,
+  structfield}` (16) — `letRefListDestSlot` is never consulted for the literal at all in those
+  spellings, so no predicate inside it can reach them. Filed as **D501**. (The first probe
+  build measured nothing and said so: `emitFail` keeps the FIRST message, so an ungated probe
+  reported whichever binding was queried first — `const gU = mU["k"] ?? []`, not the literal.
+  The gated re-build is the one above.)
+
+* Corpus `cmp` 2,393 modules · 0 DIFFER · 0 LOST; distilled corpus 0 `runs` lost and 0 cells
+  into any silent class, this rung alone moving nothing there at all (the class is not in the
+  census). Pinned as `tests/cases/unions/error-list-literal-two-destination-kinds.vl`.
+
+---
+
+### D501 — the two-destination conflict is not REACHED for a `mapstore`/`structfield` union destination, nor for a `ret` struct destination
+**check-clean invalid wasm · found 2026-08-28 closing D411, by probing the rung it landed on and finding `reach=0` on exactly the cells that did not move · 28 cells of `scripts/silent-sweep/d411/`, kept whole in `distilled/named/`**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const lv1 = [{ r: 7 }]
+      const mU: {[string]: Shape[]} = Map()
+      mU["k"] = lv1
+      const cS: Circle[] = lv1
+      const gU = mU["k"] ?? []
+      if gU.length > 0 { print(gU.length) } else { print(0) }
+      if cS.length > 0 { print(cS[0].r) } else { print(0) }
+    }
+    f()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 520: type mismatch: expected (ref null $type), found (ref $type)
+
+* **IT IS D411's CLASS AND D411's LANDING DOES NOT SEE IT.** Two declared destinations of
+  different element kinds for one un-annotated list literal, exactly as D411 — but where
+  D411's conflict detector fires on 68 of the grid's 96 silent cells, these 28 never enter it.
+  A `tErr` probe gated to the literal's own binding reads **`reach=0`** at
+  `letRefListDestSlot` for all 28 and `reach=1` for all 75 others; the reach split and the
+  moved/unmoved split are the SAME partition, so the predicate is not what is missing.
+
+* **THE COORDINATES ARE EXACT.** `d1 = ret` (12 cells: the plain-struct destination is a
+  `return` annotation) and `d2 ∈ {mapstore, structfield}` (16 cells: the union destination is
+  a declared map's value or a declared struct's field). Removing the SECOND destination makes
+  each of them run — `d411_mapstore__none__u_first` and `d411_structfield__none__u_first` both
+  probe `reach=1` and both RUN — so the binding stops being routed through
+  `letRefListDestSlot` precisely when the second destination is added.
+
+* **WHERE TO LOOK, NOT YET MEASURED.** Something upstream claims the literal's element row
+  before the destination rung is consulted; `arrLitCommitName` / `scanArrLitCommit` (D157/D163,
+  #1975) is the pass that commits an `ArrayLit`'s element rep and is the first place to probe.
+  The question to answer first is which site answers for the literal in these spellings, since
+  that is where the conflict has to be asked — this row is not a claim that the fix belongs in
+  `letRefListDestSlot`.
+
+* The 28 cells are in `scripts/silent-sweep/distilled/named/` as `d411_*`, so the day the
+  reach changes the standing gate says so.
 
 ---
 
@@ -14432,10 +14553,10 @@ Repro:
 
 ---
 
-### D446 — a DEGENERATE union alias (`{a,b} | {a,b}`) in D442's position is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-28 by the declaration axis of D442's fix grid, as the one of its seven alias-naming declarations that landing does not close · pre-existing and IDENTICAL on master `1a43607c` and after #2004 · kept whole at `distilled/named/d402_uniontwin_field_alias.vl`**
+### D446 — [CLOSED 2026-08-28] a DEGENERATE union alias (`{a,b} | {a,b}`) in D442's position is check-clean invalid wasm
+**closed 2026-08-28 · the filed repro RUNS and prints `1` then `2` · was `check-clean invalid wasm` · found 2026-08-28 by the declaration axis of D442's fix grid, as the one of its seven alias-naming declarations that landing does not close · kept whole at `distilled/named/d402_uniontwin_field_alias.vl`**
 
-Repro:
+Repro (now `runs`):
 
     type AB = {a:i32, b:i32} | {a:i32, b:i32}
     type W = { xs: {a:i32, b:i32}[] }
@@ -14443,26 +14564,50 @@ Repro:
     const w: W = { xs: q }
     print(w.xs[0].a)
     print(w.xs[0].b)
-    // vl check rc 0; vl run:
+    // was: vl check rc 0; vl run:
     //   Invalid input WebAssembly code at offset N:
     //   type mismatch: expected (ref $type), found (ref $type)
+    // Now: 1, 2
 
-* **IT IS NOT D442's ROOT, WHICH IS WHY D442's FIX DOES NOT REACH IT.** Off `wasm-tools
-  print`, `AB[]` here is a UNION-BOX element list — `(type 2 (struct (field i32) (field
-  anyref)))` with the payload struct built underneath it (`struct.new 0` then `struct.new 2`)
-  — while `W.xs` is a plain struct-element list. The two are genuinely different reps, and no
-  amount of struct-row twinning makes them one; the hole is that the CHECKER calls the two
-  spellings the same type and no coercion is emitted.
+* **"IT ESCAPES R2" WAS RIGHT AND UNDERSTATED: IT ESCAPES ALL THREE RUNGS, AT ONE GATE.**
+  `unionStructAliasShape` answers the shape of a struct-alias union decl and its arity test was
+  `variants.length == 1`. `parseTypeDecl` pushes one variant STRING per `|` arm and dedups
+  nothing — the checker's `fillTypeDeclAt` pushes every resolved member and dedups nothing
+  either, which `typecheck.vl` itself records as the control ("the DECLARATION route never had
+  this hole ... `type U = A | B` does not dedup at all"). So `{a,b} | {a,b}` reads 2, and
+  `internShapeAs` — which is where #2004's R2 and R3 both live — is **never entered**. R1's
+  site is moot for the same reason: there is no struct row named `AB` to find, and
+  `nameIsStructDecl("AB")` is false because `collectU` put `AB` in `unNames`.
 
-* **THE DEGENERACY IS LOAD-BEARING.** `{a:i32,b:i32} | {a:i32,b:i32}` has two identical arms.
-  A union of two DIFFERENT shapes in the same position is not assignable to a
-  `{a:i32,b:i32}[]` field at all, so the checker refuses it loudly; this one is accepted
-  because every arm is the field's element type, and then lowered as a box.
+* **WHY THAT MAKES INVALID WASM, off `wasm-tools print`.** `collectU` claims the alias, so
+  `refArrElemKind("AB[]")` takes its `unNames` arm and returns kind 2: the literal builds
+  `struct.new 0` (the `{a,b}` struct) then `struct.new 2` (the union box) into an
+  `(array (mut (ref null 2)))`. `W.xs` is spelled inline, takes no `unNames` arm, and is kind 1
+  over `(array (mut (ref null 0)))`. The store `struct.new 1` wants `(ref 4)` and is handed
+  `(ref 6)`. **The intersection sibling D442 was a twinning MISS; this is a rep MISMATCH** —
+  no amount of struct-row twinning reaches it, which is exactly why #2004's landing did not.
 
-* **THE FIX IS A CHECKER QUESTION, NOT AN EMITTER ONE**, and it is unbuilt: either a
-  one-arm-after-dedup union alias canonicalizes to its arm (which would make this row
-  disappear into D442's family) or the assignment is refused. The cell is in the standing gate
-  so whichever lands is graded against it.
+* **THE LANDING — ASK THE ARITY QUESTION OF THE DISTINCT ARMS.** A union whose arms are all one
+  spelling IS that arm; the degeneracy is the only thing separating `type AB = {a,b} | {a,b}`
+  from `type AB = {a,b}`, which has always been a plain struct. `unionStructAliasShape` now
+  reduces the variant list to its sole distinct spelling first, so `collectS` interns the row,
+  `collectU` skips it (both call the same predicate, so they cannot disagree), `AB[]` is kind 1,
+  and R2 — which had never been reachable here — records the SHAPE's arena type at the mint so
+  the row twins like any other. **Spelling-distinct, deliberately not type-distinct**: two arms
+  of one type may still be spelled two ways (`Circle` beside `{r:i32}`), and collapsing those
+  is a nominal question this predicate has no standing to settle (#1942).
+
+* **THE ROW ALSO PREDICTED THE OTHER HALF OF WHAT THIS FIXES.** `collectU` pushed BOTH
+  identical arms into `uVariants`, and `variantIndexOf` is a first-match linear scan, so the
+  second row was unreachable by name — two variant heap types and two tags for one layout.
+  Skipping the decl removes that too, at no extra cost.
+
+* **MEASURED.** Corpus `cmp` 2,393 modules · 0 DIFFER · 0 LOST. Distilled corpus: **0 `runs`
+  lost, 0 cells into any silent class, exactly ONE class moves** —
+  `d402_uniontwin_field_alias  check-clean invalid wasm -> runs`, this row's own cell.
+  `type AB = {a,b} | {a,b}` standing ALONE (`const q: AB[] = [{a,b}]; print(q[0].a)`) ran
+  before and runs after; what changed is that it now rides the struct rep rather than the box.
+  Pinned as `tests/cases/unions/degenerate-union-alias-is-its-arm.vl`.
 
 ---
 
