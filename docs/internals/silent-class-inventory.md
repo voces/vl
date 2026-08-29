@@ -15401,6 +15401,16 @@ Repro (now a loud check reject):
   where the one-token-different spelling has always been a reject, and four of those twelve
   printed that wrong value out loud.
 
+* **IT IS NOT SINGLE-FILE-ONLY, and that was measured rather than inherited.** D532's whole
+  landing is bounded to one file because an operator DECLARATION does not reach across a
+  module boundary (ROADMAP **A-OPMOD**), and this row sits beside it — so the same bound was
+  the obvious assumption. It does not hold: with an unrelated `import { startsWith } from
+  "std:str"` prepended, all three rungs fire exactly as they do in a single file (the plain
+  pin, the UFCS pin, and the relay), each landing on its direct control's own answer, and on
+  the base seed all three of those same programs are `check-clean invalid wasm`
+  (`wasm[0]::function[29]::g$m0`). Nothing here rides an operator declaration, which is what
+  A-OPMOD bounds.
+
 * **WHAT THE 8 REMAINING DISAGREEMENTS ARE.** Two are D561's residue; two are the refused
   rung's price cells, kept deliberately; four are `d551_obj_elem_obj_*` — a generic over a
   `V[]` returning `V`, which is `emitProgram: monomorph…` on BOTH seeds while its direct twin
