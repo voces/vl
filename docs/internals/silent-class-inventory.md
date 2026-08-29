@@ -14847,6 +14847,15 @@ Repro (now a loud check reject):
   `expected an identifier but found \`<<\``. Its `quo` twin is one of the 19. The operator
   `<` in token spelling simply cannot be followed by a generic parameter list.
 
+* **THE ONE PLACE THE CELL SURVIVES, MEASURED RATHER THAN ASSUMED: MODULE MODE.** With the
+  declaration in an imported file, `driver.vl`'s per-module rename mangles it to `+$mN`,
+  `isBinOpFuncName` declines that name, nothing is banked and nothing is refused — the
+  program prints `8` on the base and `8` on the landing, unchanged. That is not a hole this
+  rung could close by widening: user-defined operator DISPATCH is itself dead in module
+  mode, loudly (`operator '+' is not defined for V and V` the moment any `import` line is
+  added to a program that printed 99 without one), so there is nothing there to be right
+  about yet. Filed as ROADMAP **A-OPMOD**; it bounds this whole declaration-site family.
+
 * Fixture `tests/cases/objects/error-operator-typaram-self-never-dispatches.vl`. The
   reject anchors at the FuncDecl node and therefore renders at the declaration's closing
   brace — the same position D425's sibling reject has had since it landed, not a new
