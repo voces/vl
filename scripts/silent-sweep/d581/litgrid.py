@@ -75,6 +75,15 @@ THE ONE-OFF CELLS, each because a trap or a filed row moved it:
            element whose only rep signal is the recorded destination type. A rung that
            changes which type the element recursion reads must not move it.
 
+TWO OF ITS THREE `deliberate` CELLS ARE NO LONGER DISAGREEING, AND THAT IS D591 CLOSING.
+`d581_arr2_i32_bool_{plain,ufcs}_typar` RUN and print `1` beside a DIRECT twin that was
+`check-clean invalid wasm` — the direct spelling was itself a miscompile, filed as D591 and
+closed on 2026-08-29, so the twin now runs and prints `1` too. `lists.json` is a record of
+what THIS grid measured against ITS base seed (`scratch-int/d581/BASE.wasm`, md5
+`262dce49…`), and `--verify` re-grades against that seed, so both stay correct as written —
+but do not read the `deliberate` list as a claim about today's compiler. `d581o_forge_typar`
+(D571's own witness) is the one that still disagrees.
+
     python3 scripts/silent-sweep/d581/litgrid.py [seed.wasm]      grade to stdout
     python3 scripts/silent-sweep/d581/litgrid.py --table          by shape x dst x arg
     python3 scripts/silent-sweep/d581/litgrid.py --emit <dir>     write the cells

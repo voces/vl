@@ -10,6 +10,55 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A CHECK THAT ACCEPTS A LITERAL ELEMENT-WISE MUST SAY SO ON THE LITERAL, BECAUSE THE
+  EMITTER CLASSIFIES A LIST FROM THE CHECKER'S COLUMN AND NOT FROM THE REP SIDECAR**
+  (2026-08-29, silent-class-inventory D591 / #2021). `assignableExpr`'s array-literal
+  recursion accepts `[0, b]` into `i32[]` element by element while the literal's own type
+  stays the join `(i32 | boolean)[]`. The row proposed `recordRepTyAdopt` on the accepted
+  path; it was ALREADY there and already recorded `i32[]`. **`nodeRepTyIx` and `nodeTyIx` are
+  two columns and the list classifier reads the second one** — `nodeArrayElemName` says so in
+  its own header — so a rep sidecar cannot answer a question the name path asks. The rung is
+  therefore a `nodeTyIx` re-stamp beside the litunion and niche arms that were already there
+  for the same reason, keyed on the mismatch rather than on the destination: the JOIN
+  produced a union and the destination has none. A destination that IS a union is excluded,
+  so the union-arm adoption below it keeps deciding for itself.
+
+- **AN UN-ANNOTATED RETURN IS ONE QUESTION, NOT A WHITELIST OF SHAPES** (2026-08-29,
+  silent-class-inventory D592 / #2021). `monoMakeInstance` substituted the type argument into
+  the return only when an annotation existed, and matched return-expression SHAPES otherwise
+  — a `Call` through a closure-pinned param, an `Index` over a param pinned to `f64[]`, an
+  `Ident` naming a local. Four spellings the grid found silent are four node kinds and one
+  question, and the next spelling nobody has written down is the same question again. The
+  ladder now falls through to a re-check that asks the return EXPRESSION its own type.
+  **Binding the TYPE parameters is what makes that re-check answer at all**: `checkFuncDecl`
+  keeps a generic's type parameters in scope bound to an opaque `mkTyVar`, so `const xs: T[]`
+  resolves to a hole however concretely the VALUE parameters are pinned — the first cut
+  returned "" everywhere and the probe read `nret` unchanged. It is FILTERED to the reps the
+  i32 default gets wrong, so an i32/boolean/u8 return still mints nothing and stays
+  byte-identical.
+
+- **THE STRUCT ARM OF THAT FALL-THROUGH IS REFUSED, AND THE PRICE IS MODULES RATHER THAN
+  CELLS** (2026-08-29, silent-class-inventory D592 / #2021). Extending the re-check to a
+  STRUCT return buys six more cells and kills FOUR corpus modules: it mints an annotation
+  naming an inline shape nothing registered, and the emitter answers `emitProgram: ref
+  valtype with no interned shape`. Every grid column stayed flat under it — 22 cells
+  `invalid -> runs`, 0 lost, 0 wrong value — so the veto term was one no cell grade could
+  report. `joingrid.py --refused <seed>` keeps the refusal executable against the four
+  modules; the candidate re-derives from `scratch-int/d591/mkvariant.py R1R0R2R3`.
+
+- **AN "INERT" REFACTOR OF AN ISOLATED RE-CHECK IS A BEHAVIOURAL CLAIM, AND THE READ HAS TO
+  STAY INSIDE THE ISOLATION** (2026-08-29, #2021). `monoInferListElem` and
+  `monoInferLocalScalar` were two copies of one 90-line isolated body re-check differing only
+  in what they read back, and D592 needed a third reader. A first extraction returned the
+  arena ROW and let each wrapper render it afterwards — with the scope popped and
+  `inferQuiet` / `symEnabled` restored — and THREE corpus modules stopped building
+  ("type mismatch: expected f64, found i32"), while every grid column, every histogram and
+  every `runs`/`not-runs` grade stayed flat. Split into `monoRecheckBegin` /
+  `monoRecheckEnd` around each caller's own read, it measures 1,967 identical · 0 DIFFER ·
+  0 LOST. **The saved state is an ARRAY both halves index in one order**, because the two
+  halves have to agree on the SET of eighteen tables and a forgotten one leaks emit-time
+  speculation into the column the emitter still reads.
+
 - **A PIN THAT RE-ASKS A BODY'S QUESTION MUST BE HANDED THE SUBSTITUTED TYPE, NOT ONLY THE
   SUBSTITUTED PAIR** (2026-08-29, silent-class-inventory D581 / #2020). D551's rule was "call
   the function the body called"; this is its other half. `validateLetCstrs` handed
