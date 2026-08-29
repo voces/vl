@@ -10,6 +10,30 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A DEFERRED TYPE IS A TYPE NOTHING IN THE BODY CHECKS, SO THE DEFERRAL HAS TO STOP WHERE
+  A CHECK WOULD HAVE RUN** (2026-08-29, silent-class-inventory D532 / #2016). `HD_BINOP`
+  hands a generic body's `a op b` a hole instead of an answer, which is right precisely
+  because the body cannot decide it. But an ANNOTATED return is a check the body *can* run,
+  and a hole is permissively `assignable` to anything: with the deferral inside one,
+  `function g<T>(a: T, b: T): V { return a < b }` stops being a loud `return type mismatch`
+  and becomes check-clean invalid wasm at an `i32` pin. Both readings are defensible and only
+  one was measured — 4 cells — so the rung is bounded to un-annotated bodies and the
+  remainder is filed as D551 rather than argued about. **Deferring an answer is not free; it
+  costs every check that would have consumed the answer, and those are enumerable.**
+
+- **THE ADJUDICATOR A ROW NAMES IS NOT NECESSARILY THE ADJUDICATOR** (2026-08-29, D532 /
+  #2016). The row filed a stated obstacle — "no positioned reject is available at either
+  layer as the code stands", because "the pin's adjudicator (`binOpDefinedFor`) returns a
+  BOOLEAN with no channel to correct a recorded type". The sentence is TRUE of
+  `binOpDefinedFor` and the conclusion is still false: the pin's adjudicator is
+  `validateBinCstrs`, which emits positioned diagnostics at the call, and the layer that
+  decides a hole's answer per pin is `substHoleTy`, which returns TYPES and has had a
+  four-kind derivation table since W6. The obstacle was a fact about one function read as a
+  fact about a layer. **Re-derive an inherited obstacle against the code, not against the
+  sentence** — the capability the row called "strictly more work than either gate this row's
+  parent built" was one derivation kind wide.
+
+
 - **A ROW'S HEADLINE IS A HYPOTHESIS ABOUT THE CAUSE; THE GRID NEEDS AN AXIS THAT CAN
   REFUTE IT** (2026-08-29, silent-class-inventory D511 / #2015). The row said an operator
   overload lowers "only when the call's LEFT argument is SPELLED like the parameter", and
