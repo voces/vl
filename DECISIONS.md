@@ -1837,6 +1837,55 @@ body's `T` — monomorphization decides its rep at the call site, and the concre
 gated there)"*. Nothing gated it there. A comment that names another site as the one holding
 an invariant is a claim with a witness attached, and running it costs seconds.
 
+### The seam is an AXIS of the deferred-constraint question, and holding it fixed hid four of them
+
+**D551, D561 and D572 are one question asked at five places, and the first two grids fixed the
+place.** `retgrid.py` varies the declared return type, the body shape, the argument type, the
+call spelling and whether the result is printed — five axes, and the DESTINATION is a `return`
+in every one of its 630 cells. Vary that coordinate instead and the same defect is at a local
+declaration, a re-assignment, a struct field write and an array element write, on both sides of
+the hole; `letgrid.py` finds 171 moving cells where `retgrid.py` finds none, because none of
+them is a `return`. This is D401's lesson arriving a second time in the same family — **a grid's
+fixed coordinate is where its blind spot is** — and it is worth stating separately because the
+fixed coordinate here was not an obvious parameter at all. Nobody chose "the destination is a
+return"; it was simply what the row that started the family happened to say.
+
+**THE SHARP FORM: a deferred-constraint table answers for ONE seam, so ask what the OTHER seams
+do with the same vacuous predicate.** `assignable(i32, T)` is vacuous wherever it is asked, and
+by the time D572 landed there were six tables — `binCstr`, `argCstr`, `printCstr`, `escJoin`,
+`retCstr`, `letCstr` — each covering one place a hole meets a concrete requirement. Two more are
+filed (D581, D582) and both were found by *enumerating the destinations a value can reach*, not
+by another sweep.
+
+**AND A GATE INSIDE ONE TABLE HAD THE SAME SHAPE, WHICH IS WHY THE ABLATION EARNED ITS KEEP.**
+`validateRetCstrs`' re-deferral — re-record a constraint whose hole substituted to another hole —
+asked `tyHasHole(rg)`, the BODY side. That was the entire question when D551 recorded body-side
+holes only. D561 widened the TABLE to the declared side and left the gate alone, so its widening
+evaporated across one level of relay: `inner<T>` reached through `outer<U>` stayed check-clean
+invalid wasm on D561's own landing, beside a one-call spelling that was already loud. **The grid
+that owned that table could not see it**, because its `relay` axis puts the hole on the side that
+already worked. The transferable check: **when a table is widened to a new side, every gate that
+reads the table has to be re-asked about that side** — a widening is not one condition.
+
+### An override whose lost cell prints the RIGHT value needs a different fourth term, and saying so is the honest move
+
+**D561 exempted rather than overrode because its brand cell prints ten right values, and the
+coincidence term is the one an override cannot argue around.** D572 met the same shape at the
+same seam one node over — `d572o_brandlet_typar`, D561's branded accessor with the return
+laundered through a hole-typed local — and it printed `1032`, which is right. It was OVERRIDDEN
+anyway, and the difference is not a softer bar: **no capability is lost, only a second spelling
+of a capability that remains.** `rowAt` still builds byte-identically through D561's own
+exemption; corpus `cmp` is 0 DIFFER / 0 LOST where D561's widening cost two modules; and the
+laundered spelling is precisely what D572's row was filed to warn is a relocation rather than a
+repair. Exempting it would have doubled D571's residue — the forge reaching a local, a field and
+an element as well as a return — and made the eventual `as A` landing bigger rather than smaller.
+
+**The rule this leaves: when the lost cell's VALUE is right, do not stretch the coincidence term
+to fit. State which term fails, and carry the override on a named replacement** — here, that the
+capability survives, executably, on a line of a `keeps` fixture and in `d551/retgrid.py --price`.
+An override argued on four terms where one plainly does not hold is how a bar stops meaning
+anything.
+
 ## The `runs → not-runs` veto is overridable, and the override must be ARGUED IN THE ROW
 
 **`CLAUDE.md` makes `runs → not-runs` the one condition the standing gate stops the world for,
