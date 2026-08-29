@@ -12,12 +12,12 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **THE GATE'S CRITERION AND THE SHIPPING CRITERION ARE ONE CRITERION, and letting them drift
   cost this repo a large net win for a day** (2026-08-28, silent-class-inventory-2 D11 /
-  #1993 → #2001). `scripts/silent-sweep/distilled/regress.py` blocks on `runs → not-runs` and
+  #1993 → #2003). `scripts/silent-sweep/distilled/regress.py` blocks on `runs → not-runs` and
   on nothing else, for a reason it states: *a program that did not work before and does not
   work now has not regressed in the sense a gate should stop the world for*. The shipping bar
   drifted stricter than that without anyone deciding it should, and #1993 refused a candidate
   that bought **72 cells `loud check reject` → `runs`** and lost **zero** running programs,
-  because it also moved 48 cells loud→silent. Re-measured and landed at #2001 the same
+  because it also moved 48 cells loud→silent. Re-measured and landed at #2003 the same
   candidate buys 86 and 40 and still loses zero. **The rule now written down: refuse on a
   `runs` cell lost, on a new COMPILER trap, or on a corpus module that stops building.
   Loud→silent is a PRICE to measure and to keep whole in `distilled/named/` — that is what

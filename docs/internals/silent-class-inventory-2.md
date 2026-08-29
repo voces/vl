@@ -789,7 +789,7 @@ they are two landings, not one.
 ---
 
 ### D11 — PLACE-NARROWING an array ELEMENT is a loud CHECK reject — for EVERY rep, not 162 of 184
-**CLOSED 2026-08-28 (#2001) — the filed program now RUNS and prints `2`. FILED AS: loud
+**CLOSED 2026-08-28 (#2003) — the filed program now RUNS and prints `2`. FILED AS: loud
 check reject · re-measured as 184 of 184, not 162. The program below is unchanged; what
 moved is the compiler. Its price is `scripts/silent-sweep/census/d341-index-place-price.json`
 and its residue is D451/D452.**
@@ -1020,7 +1020,7 @@ was written on 2026-08-27 to make the row gradeable and is what closed here.
 ---
 
 ### D341 — an ALIASING CALL cannot retire an index-place narrowing, because there is no index sub-path to record
-**CLOSED 2026-08-28 (#2001) — now a loud check reject, with a different reason. FILED AS: a
+**CLOSED 2026-08-28 (#2003) — now a loud check reject, with a different reason. FILED AS: a
 REFUTATION PIN for D11's refused candidate, "must keep rejecting or it flips to a check-clean
 runtime TRAP". D11 landed and the pin did not flip: the retirement rung this row named landed
 with it.**
@@ -1076,7 +1076,7 @@ only the *reason* differed.
 ---
 
 ### D451 — the EMITTER has no index-place narrowing channel: 56 cells check-clean, INVALID WASM
-**check-clean INVALID WASM · 56 of D11's 184 cells · the measured price of #2001, recorded in
+**check-clean INVALID WASM · 56 of D11's 184 cells · the measured price of #2003, recorded in
 `scripts/silent-sweep/census/d341-index-place-price.json`**
 
     type NtI32 = new i32

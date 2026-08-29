@@ -5,7 +5,7 @@ constructs x 2 runtime inputs = 184 cells, every cell narrowing `xs[0]` IN PLACE
 then reading it.
 
 WHY THIS FILE EXISTS AT ALL.  #1993 built this grid, priced a candidate against it and
-then threw the generator away, so #2001 had to rebuild it from the 51 cells that had
+then threw the generator away, so #2003 had to rebuild it from the 51 cells that had
 been kept in `distilled/named/`.  It is committed now, and `--verify` re-derives those
 51 and asserts they are byte-identical to the copies under `distilled/named/` — so the
 grid the price was measured on and the grid a later reader regenerates are provably the

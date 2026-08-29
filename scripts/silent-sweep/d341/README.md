@@ -12,7 +12,7 @@ JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py <outdir> <seed.wasm> o
 ## Why it is committed
 
 #1993 built this grid, priced a candidate against it, refused the candidate — and threw the
-generator away, keeping only the 51 cells that made up the price. #2001 had to rebuild it
+generator away, keeping only the 51 cells that made up the price. #2003 had to rebuild it
 from those 51 files to re-measure. `--verify` is the guard against that costing a third
 person: it re-derives every cell that also exists under `distilled/named/` and asserts the
 two are **byte-identical**, so a regenerated grid is provably the same programs and not a
@@ -38,7 +38,7 @@ are byte-identical to the ones #1993 filed.
 | seed | runs | loud check | loud emit | check-clean invalid wasm | trap |
 |---|---|---|---|---|---|
 | `053fcf64` (base) | 0 | **184** | 0 | 0 | 0 |
-| #2001 (landed) | **86** | 2 | 40 | **56** | 0 |
+| #2003 (landed) | **86** | 2 | 40 | **56** | 0 |
 
 0 `runs` lost, 0 wrong values. The 2 residual loud cells are `match` over a literal union — a
 language limit whose control fails too, excluded by name. The 56 are D451, kept whole in
