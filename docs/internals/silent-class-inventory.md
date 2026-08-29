@@ -15936,6 +15936,12 @@ Repro (now `runs`):
   and it FAILS when a price cell becomes CORRECT, so the day D601 closes this ledger is
   re-derived rather than trusted).
 
+  **AND THAT DAY WAS THE NEXT ONE — PAID 2026-08-29, REPAID 2026-08-29 (#2022).** D601
+  closed, all ten went `runs`/`true` → `runs` printing the byte they declare, and `--price`
+  did exactly what it was built to do: rc 1 on all ten, "NOW CORRECT (D601 closed?)". The
+  ledger is re-derived in place — same ten cells, now asserting the REPAYMENT — rather than
+  deleted, because what is worth keeping is that this price existed and what settled it.
+
 * **CORPUS `cmp`: 1,966 identical, 1 DIFFER, 0 LOST.** The one differing module is
   `tests/cases/arrays/f32-array-literal-self-classifies.vl`, whose own header names the
   spelling that moves — `const mi: f32[] = [a, 1]` types `(f32 | i32)[]`, which is precisely
@@ -16025,37 +16031,75 @@ Repro (now `runs`):
 
 ---
 
-### D601 — a `u8[]` element read takes its print overload from the initialiser literal, not from the declared byte
-**check-clean silently wrong · found 2026-08-29 by `scripts/silent-sweep/d591/joingrid.py`'s
-twin column while grading D591 · reproduces identically on the base seed, with no mixed
-literal involved · owns the ten cells D591's landing pays for**
+### D601 — [CLOSED 2026-08-29] a `u8[]` element read takes its print overload from the initialiser literal, not from the declared byte
+**closed 2026-08-29 · the filed repro RUNS and prints `1` · was `check-clean silently wrong` ·
+found 2026-08-29 by `scripts/silent-sweep/d591/joingrid.py`'s twin column while grading D591 ·
+18 cells of that grid, kept whole in `distilled/named/` · closed as ONE rung, and it REPAYS
+D591's ten-cell price**
 
-Repro:
+Repro (now `runs`):
 
     const b: boolean = true
     const c: u8[] = [b]
     print(c[0])
-    // PRINTS true
-    // `u8` is one byte read back as an i32 in 0..255, so the declaration says `1` —
-    // and the `assign` spelling of the SAME coercion (`let d: u8[] = []; d = [b];
-    // print(d[0])`) does print `1`.
+    // now: 1 — `u8` is one byte read back as an i32 in 0..255, so the declaration says
+    // `1`, which is also what `let d: u8[] = []; d = [b]; print(d[0])` said all along.
 
-* **THE TWO SPELLINGS DISAGREE, AND THE DECLARATION SAYS WHICH IS WRONG.** A `u8` is one
-  byte read back through `array.get_u` as an i32 in 0..255, so `print` of it must print a
-  number. The `assign` and `ret` spellings do; the `let` and three-element ones print
-  `true`, taking the print overload from the initialiser literal's first element instead of
-  from the annotation. `assignableExpr`'s `u8` arm is not implicated — the STORE is correct
-  either way and the byte in memory is 1.
+* **THE FILED MECHANISM WAS RIGHT ABOUT THE SITE AND WRONG ABOUT THE LEAD.** The row said to
+  "find what `assign`/`ret` consult that `let` does not". Measured, they consult NOTHING
+  extra: all four spellings reach the same one predicate, `listElemIsBool` in
+  `emit_classify.vl`, with the same two inputs — the DECLARED element name
+  (`arrElemNameRaw(listAnnNameOf(...))`) and, if that rung declines, the binding's
+  INITIALIZER. The rung claimed `i32` alone and said so in its own comment: "`i32` is the
+  only element spelling that needs claiming: it is the sole destination the coercion has."
+  It is not the sole one. `assignableExpr` admits a boolean SOURCE at exactly two
+  destinations — the A7 arm (`primNameOf(dstTy) == "i32"`, typecheck.vl) and the `u8` arm
+  above it, whose source set is `i32 | u8 | boolean`. `u8` fell through the rung to the
+  initializer, which for a `let`/three-element spelling is an `ArrayLit` whose first element
+  is a boolean. The fix is ONE token: `if annElem == "i32" || annElem == "u8"`.
 
-* **IT IS WHY D591's LANDING HAS A PRICE.** Ten `u8[]` cells whose literal begins with a
-  boolean went from a module the engine refuses to a module that runs and prints `true`; each
-  is this row's coordinate, and closing this row fixes all ten.
-  `joingrid.py --price` FAILS when one of them becomes correct, so the ledger is re-derived
-  the day this closes rather than staying green with a stale exemption; `D601_WRONG` in the
-  same file lists the eight cells that are already wrong on the base and fails the same way.
+* **`assign` AND `ret` WERE RIGHT BY ACCIDENT, NOT BY A BETTER INPUT, AND EACH BY A DIFFERENT
+  ACCIDENT.** The probe counts (`reach` = the rung fires, `flip` = it changes the answer) say
+  it exactly: `let` and `three` read `reach=1 flip=1`; `assign` (`let d: u8[] = []`) reads
+  `reach=1 flip=0` because its initializer is the EMPTY literal, and the ArrayLit arm answers
+  `false` for zero elements; `ret` (`const e = f()`) reads `reach=0` — with no annotation on
+  the binding, `listAnnNameOf` returns "" and the rung is never even asked. Give the `assign`
+  spelling a NON-empty initializer and it was wrong too: `let ca: u8[] = [flag]; ca = [flag];
+  print(ca[0])` printed `true` on the base. The two-right-two-wrong split was never about
+  consulting the declaration.
 
-* **NOT ATTEMPTED HERE.** It is a print-classification question on the READ side, and the two
-  rows this PR closes are both about what the emitter BUILDS.
+* **THE STORE WAS NEVER IMPLICATED, AND THE DISASSEMBLY SAYS SO.** `wasm-dis` of the `let`
+  and `assign` spellings shows the same `(array.new_fixed $4 1 (local.get $0))` over
+  `(i32.const 1)` into the same `(type $4 (array (mut i8)))`, read back by the same
+  `(array.get_u $4 ...)`. The ONLY difference in either module is the print import:
+  `call $fimport$1` (`__print_bool__`) against `call $fimport$0` (`__print_i32__`). The byte
+  in memory was 1 in both, exactly as filed.
+
+* **D591's PRICE IS REPAID, AND THE LEDGER SAID SO BEFORE ANYTHING ELSE DID.**
+  `joingrid.py --price` was written to FAIL the day a price cell became correct, and that is
+  the first thing that happened: rc 1, "NOW CORRECT (D601 closed?)" on all ten. It is
+  re-derived here rather than exempted — the same ten cells, now asserting the REPAYMENT
+  (each must RUN and print the value its declaration endorses), with a second wrong-seed arm
+  keyed on this landing's own base md5. Both sides checked: rc 0 on the shipped seed, rc 2 on
+  the pre-D601 base by md5, rc 1 (VETO) on a compiler built with the rung stripped and one
+  unrelated diagnostic reworded so the binary differs.
+
+* **NO PRICE OF ITS OWN, AND THAT IS MEASURED.** Over the grid's 3,480 cells: 18 moved, ALL
+  of them `runs` printing `true` → `runs` printing the declared number, `runs` LOST = 0,
+  `→ silent` = 0, new wrong values = 0. Corpus `cmp` is 1,969 identical · 0 DIFFER · 0 LOST —
+  and the probe says why that is not a blind instrument: the rung is REACHED 102 times across
+  14 corpus modules (`std/utf8.vl`, `std/fs.vl`, `std/args.vl`,
+  `tests/cases/arrays/u8-packed-list.vl`, …) and FLIPS the answer in none of them. The rung
+  is live over real code and agrees with the base everywhere the corpus goes; the population
+  it changes is a `u8[]` initialised from a literal whose first element is a boolean, which
+  the corpus did not contain until this landing added it to
+  `tests/cases/arrays/u8-packed-list.vl`.
+
+* **STRIP REPRODUCES THE BASE BYTE FOR BYTE.** One rung, so the ablation has two rows: R1 is
+  the shipped compiler (md5 `0407ec5b…`, 1,506,863 bytes) and STRIP — the rung back to `i32`
+  alone, from the same builder — is md5 `c34c3c27…` at 1,506,849 bytes, which IS the base
+  compiler. The diff contains the rung and nothing else. No helper was added, so none needed
+  removing.
 
 ---
 

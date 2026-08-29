@@ -74,7 +74,7 @@ THE AXES:
     python3 joingrid.py B.wasm --delta C.wasm      B = BASE (positional), C = AFTER
     python3 joingrid.py --write-lists C.wasm B.wasm [--refused S]
     python3 joingrid.py --verify B.wasm            B = the BASE seed
-    python3 joingrid.py --price S                  the landing's price
+    python3 joingrid.py --price S                  the landing's price, REPAID by D601
     python3 joingrid.py --refused S                the refused sub-rung's price
     python3 joingrid.py --mkset                    materialise into distilled/named/
     python3 joingrid.py --coerce                   re-derive JCOERCE from the twins
@@ -98,6 +98,11 @@ JOBS = int(os.environ.get("JOBS", "6"))
 # broke a price cell": on the base every price cell RUNS, so behaviour alone cannot separate
 # the two answers and only the seed's IDENTITY can.
 BASE_MD5 = "3c39ab42aa2618f517ce10d91796456f"
+# The seed D601's landing branched from (master e6865598 — #2021's landing, 1,506,849 bytes),
+# i.e. this grid's own base PLUS D591/D592. `--price` reads it for the same reason: on that
+# compiler all ten repaid cells RUN and print `true`, so "they all fail" is a second
+# wrong-seed signature that behaviour alone cannot tell from a real veto.
+D601_BASE_MD5 = "c34c3c2764c82b1c6cd1497baa58e4b5"
 
 INVALID = ("Invalid input WebAssembly code", "WebAssembly translation error",
            "wasm validation", "failed to parse", "failed to compile")
@@ -394,6 +399,13 @@ JCOERCE = {
 # LISTED, NOT SUPPRESSED. `--verify` skips these four in its expectation check AND FAILS IF
 # ONE OF THEM IS NO LONGER WRONG — so the day D601 closes, this ledger flips instead of
 # quietly staying green with a stale exemption. The same discipline a refutation pin uses.
+#
+# D601 CLOSED (#2022) AND THE EXEMPTION DID EXACTLY THAT — it flipped, on `--price` first.
+# It STAYS, and it stays TRUE, because `--verify` grades ONE FROZEN COMPILER by md5: the
+# pre-D591 base `3c39ab42`, on which every cell below still prints `true`. This list is a
+# statement about that historical seed, not about the tree — the tree's statement is
+# `--price` below, which now asserts the REPAYMENT. Read the two together: these eight are
+# where the contradiction was first measured, and the ten in `price` are what it cost.
 D601_WRONG = [
     "d591_let_u8_bool__bool_l_r0",
     "d591_let_u8_bool__bool_l_r1",
@@ -947,55 +959,75 @@ def main():
         return 0 if not bad else 1
 
     if "--price" in args:
-        # THE LANDING'S OWN PRICE, EXECUTABLE. These cells RAN on the base and do not now,
-        # so each must (a) still not run and (b) AGREE with the twin the language endorses
-        # — which is the whole justification for having taken it. A cell that starts
-        # running again is a silent re-opening.
-        price = L.get("price", [])
-        if not require("price", price):
+        # THE LANDING'S PRICE, RE-DERIVED THE DAY IT WAS REPAID (#2022).
+        #
+        # It read, until D601 closed: these ten cells RAN on the pre-D591 base and do not
+        # now, so each must (a) still not run and (b) agree with the twin the language
+        # endorses. It FAILED BY DESIGN the moment a cell became correct — "NOW CORRECT
+        # (D601 closed?)" on all ten — which is the whole reason it was written that way,
+        # and it is why this ledger is re-derived here rather than exempted.
+        #
+        # WHAT IT ASSERTS NOW IS THE REPAYMENT, and it is a STRONGER claim than the one it
+        # replaced. D591 bought these ten from `the engine refuses this module` to `runs,
+        # printing true`; D601's rung took them the rest of the way to the value their own
+        # declaration endorses. So each must now (a) RUN and print `want_of` — the answer
+        # its one-element twin gives — and (b) still be inside D601's coordinate, which is
+        # what says the population did not drift out from under the claim. A cell that
+        # stops running, or starts printing `true` again, is a re-opening and fails here.
+        #
+        # THE KEY KEEPS ITS NAME AND THE MODE CHANGES ITS CLAIM. `price` is what
+        # `--write-lists` DERIVES (the cells a candidate cost), `named_set` reads it, and a
+        # second name would need all three kept in step for no gain. What a reader must not
+        # miss is that the debt is settled, so every line this mode prints says REPAID.
+        # Note what is no longer re-derivable: run `--write-lists` against the same pair
+        # today and the derivation yields NOTHING, because these ten now run and print
+        # correctly on the candidate. The ledger is history, and history is why it is kept.
+        repaid = L.get("price", [])
+        if not require("price (repaid)", repaid):
             return 1
-        missing = [n for n in price
+        missing = [n for n in repaid
                    if not os.path.exists(os.path.join(NAMED, n + ".vl"))]
         if missing:
             print("price: %d cells are MISSING from named/ (%s...) — the population this "
                   "check is about does not exist. FAILURE." % (len(missing), missing[0]))
             return 1
         # WRONG SEED IS A DISTINCT ANSWER FROM VETO, decided by the seed's own IDENTITY
-        # before anything is graded. On the base every one of these cells RUNS, so "they
-        # all fail" IS this file's wrong-seed signature — and reporting that as a veto
-        # would read as "the landing broke N cells" when it means "you handed me the
-        # pre-landing compiler".
-        if BASE_MD5 == seed_md5(seed):
-            print("price cells: %d   seed %s (md5 %s)"
-                  % (len(price), os.path.basename(seed), seed_md5(seed)))
-            print("price: this IS the base seed (3d5f33b6, md5 %s), where every one of "
-                  "these cells is a module the engine REFUSES — so term (a) fails on all "
-                  "ten and the report would read as `the landing broke ten cells` when it "
-                  "means `you handed me the pre-landing compiler`. Behaviour cannot "
-                  "separate those two answers; the seed's identity can. Re-run against "
-                  "build/vl-compiler.wasm from this branch." % BASE_MD5)
-            return 2
+        # before anything is graded — and there are now TWO wrong seeds, one per landing,
+        # each of which fails all ten for its own reason. Reporting either as a veto would
+        # read as "the landing broke ten cells" when it means "you handed me a compiler
+        # from before the fix". Behaviour cannot separate those answers; md5 can.
+        for md5, what in ((BASE_MD5, "the pre-D591 base (3d5f33b6), where every one of "
+                                     "these cells is a module the engine REFUSES"),
+                          (D601_BASE_MD5, "the pre-D601 base (e6865598), where every one "
+                                          "of these cells RUNS and prints `true`")):
+            if md5 == seed_md5(seed):
+                print("price cells (REPAID by D601, #2022): %d   seed %s (md5 %s)"
+                      % (len(repaid), os.path.basename(seed), seed_md5(seed)))
+                print("price: this IS %s — so term (a) fails on all ten and the report "
+                      "would read as `the landing broke ten cells`. Re-run against "
+                      "build/vl-compiler.wasm from this branch." % what)
+                return 2
         wv = set(wrongvalue(base))
         bad_a, bad_b = [], []
-        for n in price:
+        for n in repaid:
             v = base[n]
-            # (a) EACH PRICE CELL IS STILL EXACTLY WHAT WAS PAID FOR: a `runs` printing a
-            #     value its declaration contradicts. A cell that stopped running would be a
-            #     different (worse) outcome than the one recorded; a cell that started
-            #     printing the RIGHT value means D601 closed and this ledger is stale —
-            #     which must FAIL and be re-derived, not pass quietly.
+            # (a) EACH CELL IS REPAID: it RUNS and prints the value its own declaration
+            #     endorses. Not running is the outcome D591 bought it out of; running and
+            #     printing something else is the outcome D601 bought it out of. Either is
+            #     a re-opening of a closed row, and neither may pass quietly.
             if v["class"] != "runs":
                 bad_a.append((n, "NO LONGER RUNS -> " + v["class"], v["msg"][:40]))
-            elif n not in wv:
-                bad_a.append((n, "NOW CORRECT (D601 closed?)", v["msg"][:40]))
+            elif n in wv:
+                bad_a.append((n, "RUNS BUT WRONG (D601 re-opened?) want "
+                              + str(want_of(n)), v["msg"][:40]))
             # (b) AND IT IS STILL INSIDE THE COORDINATE THE ROW OWNS: a `u8` destination
-            #     whose literal's FIRST element is a boolean. A price cell that drifts out
-            #     of D601's coordinate is a price this landing did not argue for.
+            #     whose literal's FIRST element is a boolean. A cell that drifts out of
+            #     D601's coordinate is not evidence about D601 either way.
             elif not _is_d601_coord(n):
                 bad_b.append((n, "OUTSIDE D601's COORDINATE", v["msg"][:40]))
-        print("price cells: %d   seed %s (md5 %s)"
-              % (len(price), os.path.basename(seed), seed_md5(seed)))
-        print("  (a) still a `runs` printing a value its declaration contradicts : %d fail"
+        print("price cells (REPAID by D601, #2022): %d   seed %s (md5 %s)"
+              % (len(repaid), os.path.basename(seed), seed_md5(seed)))
+        print("  (a) RUNS and prints the value its declaration endorses          : %d fail"
               % len(bad_a))
         print("  (b) still inside D601's coordinate (`u8[]`, boolean first)      : %d fail"
               % len(bad_b))
@@ -1003,8 +1035,9 @@ def main():
             for r in rows[:10]:
                 print("  %s %s" % (lbl, r))
         ok = not (bad_a or bad_b)
-        print("price: %s" % ("held — every cell this landing pays for is a `u8[]` whose "
-                             "literal begins with a boolean, which is D601's own coordinate"
+        print("price: %s" % ("held — every cell D591 paid for is a `u8[]` whose literal "
+                             "begins with a boolean, which is D601's own coordinate, and "
+                             "every one of them now prints the byte it declares"
                              if ok else "VETO"))
         return 0 if ok else 1
 

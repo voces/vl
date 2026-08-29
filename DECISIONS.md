@@ -10,6 +10,21 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A RUNG THAT CLAIMS "THE SOLE DESTINATION" MUST BE CHECKED AGAINST THE COERCION, NOT
+  AGAINST THE ONE DESTINATION SOMEBODY HAD IN HAND** (2026-08-29, silent-class-inventory
+  D601 / #2022). `listElemIsBool` lets a DECLARED element name outvote the answer derived
+  from the binding's initializer, because the boolean→number coercion adapts an array
+  literal element-wise and the annotation is what every `e[i]` read is typed as. The rung
+  claimed `i32` and said in its own comment that `i32` was the only spelling that needed
+  claiming, "the sole destination the coercion has". `assignableExpr` has TWO: the A7 arm
+  (`i32`) and the `u8` arm above it, whose source set is `i32 | u8 | boolean`. So
+  `const c: u8[] = [b]` printed `true` for a byte holding 1, while `let d: u8[] = []; d =
+  [b]` printed `1` — not because the second consulted anything better, but because its
+  initializer was the EMPTY literal and the fall-through has nothing to read there. **The
+  set is CLOSED at two, and that is a property of `assignableExpr`, not of this file**:
+  every other element name either is `boolean` or is not a destination a boolean can reach,
+  so the initializer can never hand it a boolean to outvote.
+
 - **A CHECK THAT ACCEPTS A LITERAL ELEMENT-WISE MUST SAY SO ON THE LITERAL, BECAUSE THE
   EMITTER CLASSIFIES A LIST FROM THE CHECKER'S COLUMN AND NOT FROM THE REP SIDECAR**
   (2026-08-29, silent-class-inventory D591 / #2021). `assignableExpr`'s array-literal
