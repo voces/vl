@@ -20,6 +20,7 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyObj,
   bindGenWalk,
   flatConstOfNameProp,
   i32TyIx,
@@ -36,6 +37,7 @@ import {
   nodeTyNestedElemIsBoolPrim,
   recordClonedNodeTy,
   substTyDeep,
+  tyExcludesNull,
   tyHasTyVar,
   tyIsLitUnionArray,
   tyRenderSoftensLits,
@@ -75,6 +77,7 @@ import {
   mkAsExpr,
   mkBinary,
   mkBlock,
+  mkCall,
   mkCallN,
   mkCompoundAssign,
   mkFieldInit,
@@ -108,6 +111,7 @@ import {
   annFnDecompose,
   annObjFieldSplit,
   annRetNameOf,
+  drwDispatchOp,
   monoAnnHasTyParam,
   monoBindFromAnn,
   monoBindOf,
@@ -129,7 +133,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { paramTypeNode } from "./emit_query"
-import { recordedParamPinName } from "./emit_rewrite"
+import { drwSelfFnOf, recordedParamPinName } from "./emit_rewrite"
 import {
   fnDispNames,
   fnParent,
@@ -2084,6 +2088,267 @@ function monoCloneGenericCalls(ix: i32) {
 // Every failure is loud and names the binding, because the checker could not: it
 // saw `T`, not `TValue`, so "is it flat" and "does it have this member" are
 // questions only an instance can answer.
+
+// ── the two questions `dispatchRewrite` had to ask of a HOLE, re-asked at the PIN ──
+// `dispatchRewrite` runs BEFORE monomorphization (the pass table's own edge: "so a
+// rewritten call instantiates per receiver shape"), so inside a GENERIC body its
+// `BinExpr` arm asks both of its questions of an operand whose type is still a type
+// parameter. Both degrade to "no" on a hole, and both answers are wrong once the hole
+// is pinned:
+//
+//   D511  `nodeTyIsObj(binLeft)` is false of a `TyVar`, so an operator OVERLOAD is not
+//         dispatched and `a ^ b` falls to the numeric tail: `i32.xor` over two
+//         `(ref $type)` — `vl check` rc 0, INVALID WASM. The only reason ANY pinned
+//         cell dispatches today is a NAME leak one rung down —
+//         `structIndexOfExpr`'s `Ident` arm asks `declaredStructIndex(name)`, a bare
+//         MODULE-scope lookup with no scope test, so a `const a: V` at module scope
+//         answers for a parameter that merely happens to be spelled `a`. That is the
+//         row's witness: rename the two constants and the same program goes from
+//         printing `99` to invalid wasm.
+//   D512  `nodeTyExcludesNull(binLeft)` is false of a `TyVar`, so the `??` node is not
+//         folded away and reaches the emitter's own reject — where the DIRECT spelling
+//         of the same program runs. A capability lost through a type parameter: on the
+//         base seed the pin disagrees with its direct twin on 15 of the 16 operand types
+//         a hole can be pinned to, and 12 of those 15 agree after this rung. The three
+//         that do not are `mixunion`, which the monomorphizer refuses to pin at all
+//         (`unsupported argument type`, the same message `==` gets at the same pin), so
+//         they are that limit and not this one.
+//
+// ONE RUNG, because it is one mechanism: the question was asked of the hole instead of
+// the pin. Asked here, per instance, it is asked of the pinned type — and this is the
+// only place that type exists, which is why the answer cannot be moved back upstream.
+//
+// ONE RUNG IS NOT ONE EDIT, AND THE ABLATION SAYS SO. The two arms below are separately
+// load-bearing: with the `??` arm stripped, D511's 8 cells move and D512's 58 do not;
+// with the object arm stripped, the reverse; with both stripped the traversal moves ZERO
+// cells and every one of the 2,410 corpus modules is byte-identical. Do not collapse
+// them on the assumption that one implies the other.
+//
+// COPY-ON-WRITE, like every other per-instance body rung in this file: a body with no
+// binary operator over a pinned parameter returns the SAME node index, so instances
+// share the arena exactly as they did and a program with no such operator emits
+// byte-identical bytes.
+//
+// THE PIN IS READ OFF `pinnedTyIx`, the column the clone loop already resolved — not
+// re-parsed from the pin's SPELLING, for `monoMakeInstance`'s own recorded reason
+// (`nameToTy` does not hash-cons, so a re-resolution appends a duplicate row).
+//
+// THE ARM SET IS `monoFoldTyParamLayout`'s, ARM FOR ARM, and deliberately so: a missing
+// arm in a walker of this shape is SILENT — `const xs = [a ?? b]` would simply keep its
+// `??` node and reach the emitter's reject with nothing to say why. That file's own
+// `monoAnnMentionsTyParam` header records what a missing shape arm cost once already.
+
+// The PINNED type row of a body expression that reads a monomorphized PARAMETER, or -1.
+//
+// TWO gates, and the second is the scope test the leak this closes never had: the name
+// must match a parameter of the instance, AND the checker's recorded type at that node
+// must still carry a type VARIABLE. A local that SHADOWS the parameter is typed
+// concretely by the checker, so it fails the second gate and the pin is not applied to
+// it — which a bare name match (the shape of `declaredStructIndex`) cannot distinguish.
+function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
+  if ix < 0 { return -1 }
+  const e = P.nodes[ix]
+  if e is Ident {
+    if !tyHasTyVar(nodeTyIxOf(ix)) { return -1 }
+    let i = 0
+    while i < pNames.length {
+      if pNames[i] == e.identName {
+        if i < pTys.length { return pTys[i] }
+        return -1
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// `drwWalk`'s `BinExpr` arm, re-run over ONE instance body with the pin in hand. The two
+// rewrites are the SAME two `drwWalk` makes — the `??` fold to the left operand and the
+// `op(a, b)` self-function dispatch — so a pinned cell reaches exactly the lowering its
+// DIRECT twin reaches, which is what the rows are graded against.
+//
+// The FIELD-closure dispatch route (`(a."op")(b)`) is deliberately NOT here: it needs the
+// emitter's struct TABLE row, not a type, and `structIndexOfExpr` cannot be asked for one
+// from a pin. `binOpDefinedFor`'s `objOpDispatchTy` does defer such a receiver, so that
+// combination stays exactly as invalid as it is today — no cell moves either way, and it
+// is named as residue rather than left to be discovered.
+function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
+  if ix < 0 { return ix }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    // A COMPOUND assignment shares its TARGET node between the read and the write, so its
+    // limbs cannot be rebuilt independently — left whole, exactly as `monoFoldTyParamLayout`
+    // leaves it. `a ^= b` over an overload is not a form the direct spelling lowers either.
+    if n.binCompound != "" { return ix }
+    const bl = monoPinBinOps(n.binLeft, pNames, pTys)
+    const br = monoPinBinOps(n.binRight, pNames, pTys)
+    const plt = monoPinnedOperandTy(n.binLeft, pNames, pTys)
+    if plt >= 0 {
+      // D512: the pin PROVABLY admits no null, so `??` is the identity on its left
+      // operand — `tyExcludesNull` is the same predicate `nodeTyExcludesNull` asks of a
+      // node, shared so the two homes cannot disagree about which operands make a `??`
+      // redundant.
+      if n.binOp == "??" {
+        if tyExcludesNull(plt) { return bl }
+      }
+      // D511: an OBJECT pin with a free `self`-function named for the operator.
+      if drwDispatchOp(n.binOp) {
+        const pot = T.tys[plt]
+        if pot is TyObj {
+          if drwSelfFnOf(n.binOp, 2) >= 0 {
+            const oargs: i32[] = []
+            oargs.push(bl)
+            oargs.push(br)
+            return mkCall(mkIdent(n.binOp, -1), oargs, -1)
+          }
+        }
+      }
+    }
+    if bl == n.binLeft && br == n.binRight { return ix }
+    return mkBinary(n.binOp, bl, br, n.pos)
+  }
+  if n is Block {
+    const ns: i32[] = []
+    let bchanged = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoPinBinOps(n.blkStmts[i], pNames, pTys)
+      ns.push(cs)
+      if cs != n.blkStmts[i] { bchanged = true }
+      i = i + 1
+    }
+    if !bchanged { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is LetDecl {
+    const ci = monoPinBinOps(n.letInit, pNames, pTys)
+    if ci == n.letInit { return ix }
+    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  if n is RetStmt {
+    const ca = monoPinBinOps(n.retArg, pNames, pTys)
+    if ca == n.retArg { return ix }
+    return mkReturn(ca, n.pos)
+  }
+  if n is IfStmt {
+    const cc = monoPinBinOps(n.ifCond, pNames, pTys)
+    const ct = monoPinBinOps(n.ifThen, pNames, pTys)
+    const ce = monoPinBinOps(n.ifElse, pNames, pTys)
+    if cc == n.ifCond && ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(cc, ct, ce, n.pos)
+  }
+  if n is WhileStmt {
+    const wc = monoPinBinOps(n.whileCond, pNames, pTys)
+    const wb = monoPinBinOps(n.whileBody, pNames, pTys)
+    if wc == n.whileCond && wb == n.whileBody { return ix }
+    return mkWhile(wc, wb, n.whileLabel, n.pos)
+  }
+  if n is ForRange {
+    const ff = monoPinBinOps(n.frFrom, pNames, pTys)
+    const ft = monoPinBinOps(n.frTo, pNames, pTys)
+    const fs = monoPinBinOps(n.frStep, pNames, pTys)
+    const fb = monoPinBinOps(n.frBody, pNames, pTys)
+    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
+      return ix
+    }
+    return mkForRange(n.frVar, ff, ft, fs, fb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const fi = monoPinBinOps(n.fiIter, pNames, pTys)
+    const fbi = monoPinBinOps(n.fiBody, pNames, pTys)
+    if fi == n.fiIter && fbi == n.fiBody { return ix }
+    return mkForIn(n.fiVar, fi, fbi, n.fiLabel, n.pos)
+  }
+  if n is Call {
+    const cf = monoPinBinOps(n.callFn, pNames, pTys)
+    let changed = cf != n.callFn
+    const nargs: i32[] = []
+    let ai = 0
+    while ai < n.callArgs.length {
+      const ca2 = monoPinBinOps(n.callArgs[ai], pNames, pTys)
+      nargs.push(ca2)
+      if ca2 != n.callArgs[ai] { changed = true }
+      ai = ai + 1
+    }
+    if !changed { return ix }
+    return mkCallN(cf, nargs, n.callArgNames, n.pos)
+  }
+  if n is Unary {
+    // A POSTFIX `x++`/`x--` rides a `Unary` over the assignment whose operand IS the
+    // mutated target — left whole for the compound form's reason.
+    if n.unOp == "p+" || n.unOp == "p-" { return ix }
+    const ua = monoPinBinOps(n.unArg, pNames, pTys)
+    if ua == n.unArg { return ix }
+    return mkUnary(n.unOp, ua, n.pos)
+  }
+  if n is Paren {
+    const pi = monoPinBinOps(n.parInner, pNames, pTys)
+    if pi == n.parInner { return ix }
+    return mkParen(pi, n.pos)
+  }
+  if n is Member {
+    const mo = monoPinBinOps(n.memObj, pNames, pTys)
+    if mo == n.memObj { return ix }
+    return mkMember(mo, n.memProp, n.pos)
+  }
+  if n is OptMember {
+    const oo = monoPinBinOps(n.omObj, pNames, pTys)
+    if oo == n.omObj { return ix }
+    return mkOptMember(oo, n.omProp, n.pos)
+  }
+  if n is Index {
+    const ia = monoPinBinOps(n.idxArr, pNames, pTys)
+    const ii = monoPinBinOps(n.idxIndex, pNames, pTys)
+    if ia == n.idxArr && ii == n.idxIndex { return ix }
+    return mkIndex(ia, ii, n.pos)
+  }
+  if n is IsExpr {
+    const io = monoPinBinOps(n.isObj, pNames, pTys)
+    if io == n.isObj { return ix }
+    if n.isNeg == 1 { return mkIsExprNeg(io, n.isVariant, n.pos) }
+    return mkIsExpr(io, n.isVariant, n.pos)
+  }
+  if n is AsExpr {
+    const ao = monoPinBinOps(n.asObj, pNames, pTys)
+    if ao == n.asObj { return ix }
+    return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+  }
+  if n is ArrayLit {
+    const es: i32[] = []
+    let echanged = false
+    let ei = 0
+    while ei < n.arrElems.length {
+      const ce = monoPinBinOps(n.arrElems[ei], pNames, pTys)
+      es.push(ce)
+      if ce != n.arrElems[ei] { echanged = true }
+      ei = ei + 1
+    }
+    if !echanged { return ix }
+    return mkArrayLit(es, n.pos)
+  }
+  if n is ObjLit {
+    const fl: i32[] = []
+    let ochanged = false
+    let oi = 0
+    while oi < n.objFields.length {
+      let nf = n.objFields[oi]
+      const f = P.nodes[nf]
+      if f is FieldInit {
+        const cv = monoPinBinOps(f.fiValue, pNames, pTys)
+        if cv != f.fiValue {
+          nf = mkFieldInit(f.fiName, cv, f.pos)
+          ochanged = true
+        }
+      }
+      fl.push(nf)
+      oi = oi + 1
+    }
+    if !ochanged { return ix }
+    return mkObjLit(fl, n.pos)
+  }
+  ix
+}
+
 function monoFoldTyParamLayout(
   ix: i32,
   typarams: string[],
@@ -3067,7 +3332,11 @@ function monoMakeInstance(
     const instBody3 = monoCloneGenericCalls(instBody2)
     // Per-instance layout constants for the type parameters this body reads
     // (`i * T.size`) — folded HERE because the binding is what makes them exist.
-    const instBody = monoFoldTyParamLayout(instBody3, fn.fnTyParams, tvN, tvV)
+    const instBody4 = monoFoldTyParamLayout(instBody3, fn.fnTyParams, tvN, tvV)
+    // The two questions `dispatchRewrite` had to ask of a HOLE, re-asked at the PIN
+    // (D511/D512). Last in the chain, so it sees the body every rung above produced;
+    // copy-on-write, so a body with no such operator is the same node index.
+    const instBody = monoPinBinOps(instBody4, pElemNames, pinnedTyIx)
     const nfn = mkFunc(instName, noTyParams, nps, nret, instBody, -1)
     if count == 0 {
       // First instance: keep the bare name and the original's wasm index.

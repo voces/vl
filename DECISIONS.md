@@ -10,6 +10,52 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A ROW'S HEADLINE IS A HYPOTHESIS ABOUT THE CAUSE; THE GRID NEEDS AN AXIS THAT CAN
+  REFUTE IT** (2026-08-29, silent-class-inventory D511 / #2015). The row said an operator
+  overload lowers "only when the call's LEFT argument is SPELLED like the parameter", and
+  the witness it shipped was consistent with that: rename the two constants and the program
+  breaks. It was still the wrong cause — the constants in that witness are BOTH the call's
+  arguments and the module's bindings, so the witness cannot separate them. The separating
+  cell adds an unused `const a: V` beside `p`/`q` and passes `p`/`q`: it RUNS, so what is
+  consulted is `structIndexOfExpr`'s bare `declaredStructIndex(name)` — a module-scope
+  lookup with no scope test — and the call never enters it. **When a row's witness varies
+  two things at once, the axis that holds one of them fixed is the whole instrument**, and
+  it belongs in the grid rather than in the prose.
+
+- **A GRID CAN BE STRUCTURALLY BLIND TO A DEFECT BECAUSE OF WHAT ITS CELLS ARE NAMED**
+  (2026-08-29, D511 / #2015). `d492/pingrid.py` names every module constant `a`/`b`, which
+  are the generic's own parameter names — so every one of its `objop` cells dispatches
+  through the name leak, and the leak is invisible in all 894 of them. The grid was not
+  wrong; a naming convention chosen for readability pinned an axis nobody knew existed.
+  **A new defect found in a grid's residue deserves a new population, not a re-grade of the
+  old one** — the residue is exactly where the old grid's fixed choices show.
+
+- **ONE MECHANISM AND ONE HOME IS NOT THE SAME CLAIM AS ONE EDIT, AND THE ABLATION IS WHAT
+  SEPARATES THEM** (2026-08-29, D511/D512 / #2015). #2010 asked whether one edit closed its
+  pair and measured YES: stripping a single arm restored all 168 cells. The same question
+  here measures NO. D511 and D512 are one mechanism (a question asked of a hole instead of a
+  pin), share one home (a per-instance body rung), and share a traversal that is worth ZERO
+  cells and zero corpus bytes on its own — but each row needs its OWN arm, and stripping
+  either leaves the other open. Reporting "one edit" would have been the natural summary and
+  it would have been false. **Ask the question of each row separately; the shared rung's own
+  score is a third measurement, not an average of the two.**
+
+- **A `--price` CHECK THAT CANNOT RUN IS THE RIGHT OUTCOME WHEN THERE IS NO PRICE**
+  (2026-08-29, #2015). `pingrid2.py --price` exits 1 with "EMPTY POPULATION … This is a
+  FAILURE, not a pass" on this landing, and that is correct rather than a defect: the
+  landing lost 0 `runs` cells, so there is no override to validate. #2011 made an empty
+  population a failure because a missing ledger printed three `0 fail` lines and "override
+  holds"; the same rule read the other way says **a landing with no price should never
+  produce a green `--price` line**, and a reviewer who sees one should ask which ledger was
+  read.
+
+- **THE PREDICATE A NEW SITE NEEDS IS OFTEN ALREADY EXPORTED, WITH ITS HEADER SAYING WHY**
+  (2026-08-29, D512 / #2015). `tyExcludesNull` was already split out of
+  `nodeTyExcludesNull` and exported, its header stating it is "shared so the CHECKER (which
+  holds a type, not a node) and the emit-time fold (which holds a node) cannot disagree".
+  The pin is a third holder of a TYPE, and it reads the same predicate rather than a fourth
+  copy of the rule. Grep for the type-taking twin before writing one — the reason it exists
+  is usually the reason you need it.
 - **A PRICE LEDGER'S OWN CELLS CAN BE BLIND, AND A `--price` CHECK MUST SAY SO RATHER
   THAN COUNT THEM AS PASSES** (2026-08-29, silent-class-inventory D521 / #2014). The
   runs-lost override turns on term (c): the lost cell printed a value its own source
