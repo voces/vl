@@ -102,8 +102,14 @@ def main():
         for c in reps:
             staged.append((os.path.join(src, c + ".vl"), c))
             expect[c] = man["expect"][c]
-            index[c] = {"block": b.upper(), "class": sig[c][-1][0], "msg": sig[c][-1][1],
-                        "represents": len(groups[sig[c]])}
+            # NO `class`/`msg` HERE. They were written from the last graded snapshot and
+            # nothing refreshed them when a landing moved the baseline, so they rotted
+            # structurally: measured 2026-08-29, 1,593 of 3,671 cells (43%) disagreed with
+            # `baseline.jsonl`, and an agent nearly graded a row off the stale copy. Unlike
+            # the `coords` blob removed in #1988, these read as authoritative. Current
+            # behaviour lives in `baseline.jsonl`, which `--write-baseline` keeps honest;
+            # this file carries only what `regress.py` reads — `represents` and `block`.
+            index[c] = {"block": b.upper(), "represents": len(groups[sig[c]])}
 
     n = sum(t[1] for t in totals)
     d = sum(t[3] for t in totals)
