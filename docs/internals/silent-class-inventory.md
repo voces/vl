@@ -15184,13 +15184,13 @@ Repro (now a loud check reject):
 
 ---
 
-### D511 — an operator OVERLOAD at a pinned hole lowers only when the call's LEFT argument is SPELLED like the parameter
-**check-clean invalid wasm · found 2026-08-29 as the measured RESIDUE of D492/D493's close, the
-2 of that grid's 894 pinned cells the landing deliberately leaves · pre-existing and IDENTICAL
-on master `f7a0bfba` and after the landing, which touches neither cell · kept whole in
-`distilled/named/` as `d492_xor_objop_ret_typar` and `d492_rem_objop_ret_typar`**
+### D511 — [CLOSED 2026-08-29] an operator OVERLOAD at a pinned hole does not lower, and a module binding merely SPELLED like the parameter is what hid it
+**closed 2026-08-29 · the filed repro RUNS and prints `99` · was `check-clean invalid wasm` ·
+the fix is a per-instance rewrite in `emit_mono.vl` (`monoPinBinOps`), which asks at the PIN the
+question `dispatchRewrite` had to ask of a HOLE · 8 cells of `scripts/silent-sweep/d511/pingrid2.py`
+moved, 0 `runs` lost · residue: D532 (the un-annotated return) and D531 (the checker's half)**
 
-Repro:
+Repro (now `runs`, prints `99`):
 
     type V = { x: i32 }
     function "^"(self: V, other: V): i32 { return 99 }
@@ -15201,92 +15201,198 @@ Repro:
     const p: V = { x: 6 }
     const q: V = { x: 3 }
     print(g(p, q))
-    // vl check rc 0, no error. vl run:
+    // was: vl check rc 0, no error; vl run:
     //   Invalid input WebAssembly code at offset 198: type mismatch: expected i32,
     //   found (ref $type)
+    // Now: 99
 
-* **THE CONTROL DIFFERS IN THE NAMES OF TWO CONSTANTS AND IN NOTHING ELSE.** Rename `p` and
-  `q` to `a` and `b` — the same identifiers the generic's parameters use — and the identical
-  program RUNS and prints `99`, the declaration's own answer. Measured on the same seed, in
-  both directions, with `vl run`. **It is the LEFT operand's name that decides**: constants
-  named `a`/`q` called as `g(a, q)` RUN, and constants named `p`/`b` called as `g(p, b)` are
-  invalid wasm. So the monomorphized instance is resolving the operator's left operand against
-  the MODULE scope rather than the parameter, and finds the object only when the spellings
-  happen to coincide.
+* **THE ROW'S OWN HEADLINE WAS THE FALSE CLAIM, and correcting it IS the mechanism.** It said
+  the deciding input is "the call's LEFT argument". It is not: the call's arguments never enter
+  it. `dispatchRewrite` runs BEFORE monomorphization — the pass table's own edge, "so a
+  rewritten call instantiates per receiver shape" — so inside a generic body its `BinExpr` arm
+  asks `structIndexOfExpr(binLeft)` of an operand still typed `T`. That helper's `Ident` arm
+  asks `paramStructIndex`, then **`declaredStructIndex(name)` — a bare MODULE-scope lookup with
+  no scope test**. So a `const a: V` at module scope answers for a PARAMETER spelled `a`, and
+  that coincidence is the only reason any pinned cell ever dispatched.
 
-* **IT IS NOT D492, AND THE SEPARATION IS THE POINT.** D492 was `binOpDefinedFor` accepting a
-  pin the language refuses — a CHECKER question, closed. This is the EMITTER failing to lower
-  a pin the language accepts, at a declaration that dispatches correctly at the direct
-  spelling (`function g(a: V, b: V): i32 { return a ^ b }` prints 99 with any names). Closing
-  D492 without this one is what makes it visible: before the landing these two cells sat
-  inside 102 that looked the same.
+* **THE DISCRIMINATING CELL, and it is in the grid rather than in this prose.** `pingrid2.py`'s
+  `spell` axis has three values: `match` (the constants are `a`/`b` and are what the call
+  passes), `nomatch` (`p`/`q`), and **`decoy` — `p`/`q` ARE passed, and an unused `const a: V`
+  also sits at module scope**. If the call's argument decided, `decoy` would behave like
+  `nomatch`. It behaves like `match`. Measured in both directions on the base seed, with three
+  more controls that each move exactly one thing: a decoy of the WRONG TYPE (`const a: i32`)
+  does not dispatch, a decoy on the RIGHT operand's name (`const b: V`, no `a`) does not, and a
+  module FUNCTION named `a` does not — so what is consulted is a module-scope BINDING of the
+  left operand's spelling, and its type.
 
-* **ONE OF THE TWO IS D492's PRICE, and it is recorded as such rather than discovered later.**
-  `d492_xor_objop_ret_typar` was already this shape on master. `d492_rem_objop_ret_typar` was
-  a loud check reject and the landing made it silent — the single `loud → silent` cell of a
-  207-cell movement — because `objOpDispatchTy` now defers `%` on a dispatching object exactly
-  as `^` was always deferred. That is a PRICE under `CLAUDE.md`'s rule and not a veto, and it
-  bought 21 cells: 18 objects with NO dispatch went `invalid wasm` → loud reject, and 3 more
-  that a blanket object deferral would have made silent stayed loud. The family is now
-  uniform, which is what makes ONE row able to name the whole of it.
+* **THE FIX ASKS THE SAME QUESTION OF THE PIN.** `monoPinBinOps` is a fifth per-instance body
+  rung beside `monoCloneBody` / `monoPinMapLambdas` / `monoBakeCallback` /
+  `monoFoldTyParamLayout`, copy-on-write like all four, reading the pin off `pinnedTyIx` — the
+  column the clone loop already resolved — rather than re-parsing the pin's spelling. Its guard
+  is the scope test the leak never had: the name must match a parameter of THIS instance AND
+  the checker's recorded type at that node must still carry a type variable, so a local that
+  shadows the parameter is typed concretely and fails it.
 
-* **THE FIX IS NOT IN THE CHECKER.** `binOpDefinedFor` answers `true` here and should: the
-  dispatch exists and the direct spelling lowers it. A reject at the pin would refuse a
-  program whose only fault is which identifiers it uses. The home is wherever the monomorphized
-  instance resolves the operator's operands — the same layer D491's row names as "strictly more
-  work than either gate this row's parent built". **Filed, not fixed**, and the two cells are in
-  the standing gate so the day it closes the movement is visible without rebuilding a grid.
+* **`vl check` NEVER REJECTED THIS AND SHOULD NOT.** `binOpDefinedFor` answers `true` here
+  through `objOpDispatchTy`, correctly: the dispatch exists and the direct spelling lowers it.
+  This was an EMITTER gap, which is what the row said when it was filed and what stayed true.
 
-* **THE CONTROL'S SPELLING IS PINNED BY A FIXTURE**, because it is fragile in a way a reader
-  would not expect: `tests/cases/generics/binop-pin-integer-only-keeps.vl` names the constants
-  `va`/`vb` to match the parameters, and says why. A first draft of that fixture named them
-  `a`/`b` beside an unrelated i32 generic whose parameters were also `a`/`b`, and the i32
-  instantiation picked up the OBJECT constants — the fixture failed loudly, which is how this
-  row's left-operand refinement was measured rather than guessed.
+* **THE RESIDUE IS NAMED, NOT LEFT TO BE FOUND.** Six cells of the grid still disagree with
+  their direct twin: `%` and `^` over an object, with the generic's RETURN un-annotated. Those
+  now dispatch (`wasm-tools print` shows `local.get 0 / local.get 1 / return_call 4` against a
+  `(result i32)`), and what remains is that the CHECKER typed the call as the OPERAND type —
+  `checkBinary`'s tail is `return lt` and `lt` is a `TyVar`, so the substituted return is `V`
+  and the global takes `(ref null 0)` while the instance hands it an i32. **D532.** The eight
+  operators still refused at the pin are **D531**.
 
 ---
 
-### D512 — `??` through a TYPE PARAMETER loses a capability the direct spelling has, and the reject arrives at the EMITTER
-**`vl check` rc 0 then a loud emit reject · found 2026-08-29 by the `??` row of D492's grid,
-which carries every operator `noteBinCstr` records rather than only the family under test ·
-pre-existing and IDENTICAL on master `f7a0bfba` and after that landing, which touches neither ·
-44 of the grid's 894 pinned cells, across 15 of the 16 operand types the `??` row carries**
+### D512 — [CLOSED 2026-08-29] `??` through a TYPE PARAMETER loses a capability the direct spelling has
+**closed 2026-08-29 · the filed repro RUNS and prints `6` · was a loud emit reject · the same
+`monoPinBinOps` rung as D511, second arm · 58 cells of `scripts/silent-sweep/d511/pingrid2.py`
+and 41 of `d492/pingrid.py` moved emit → runs, 0 `runs` lost · 4 of the row's 44 stay refused by
+two pre-existing limits that name their own cause and never mention `??`**
 
-Repro:
+Repro (now `runs`, prints `6`):
 
     function g<T>(a: T, b: T): T { return a ?? b }
     const s: i32 = 6
     const t: i32 = 3
     print(g(s, t))
-    // vl check rc 0, no error. vl run:
+    // was: vl check rc 0, no error; vl run:
     //   emitProgram: `??` over this nullable value is not supported yet — narrow it
     //   first, e.g. `if v != null { … }`
+    // Now: 6
 
-* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the annotation.** `function g(a: i32, b: i32):
-  i32 { return a ?? b }` with the same body, the same call and the same operands RUNS and
-  prints `6`. Change `i32` to `T` and it is an emit reject.
+* **ONE RUNG WITH D511, AND THE ABLATION SAYS IT IS NOT ONE EDIT.** Both rows are
+  `dispatchRewrite`'s `BinExpr` arm asking a question of a hole: D511 asks `nodeTyIsObj`, this
+  row asks `nodeTyExcludesNull`, and a `TyVar` answers "no" to both. The shared traversal, the
+  pin resolution and the call site are one home — and worth **zero cells on their own**
+  (`R1`: 0 moved, and 0 DIFFER / 0 LOST on the 2,410-module corpus `cmp`). But stripping either
+  ARM leaves the other row open, measured: `R1+R2` moves D511's 8 and none of D512's 58,
+  `R1+R3` moves D512's 58 and none of D511's 8, and the landing moves exactly 66 — additive to
+  the cell. So: one mechanism, one home, **two arms** — not one edit.
 
-* **THE POLARITY IS THE OPPOSITE OF D492/D493's, which is why it needs its own row.** Those two
-  were a REFUSAL lost on the way through a type parameter — the pin accepted what the direct
-  spelling rejects. This is a CAPABILITY lost: the direct spelling runs and the pin does not.
-  Nothing in `binOpDefinedFor` is involved (`??` falls to its `true` tail and that answer is
-  correct); the message comes from the emitter, so the pinned instance has lost the operand's
-  non-nullability somewhere between substitution and lowering.
+* **THE PREDICATE IS NOT A NEW ONE.** `tyExcludesNull` is already exported for exactly this
+  reason — its own header says it is "shared so the CHECKER (which holds a type, not a node)
+  and the emit-time fold (which holds a node) cannot disagree about which left operands make a
+  `??` redundant". The pin is a third holder of a type, and it reads the same predicate.
 
-* **BROAD, AND FLAT ACROSS THE TYPE AXIS — counted, because the first draft of this bullet
-  guessed and was wrong about `map`.** The grid's `??` row is 48 pinned cells over 16 operand
-  types × 3 deliveries. **3 agree, and all three are `nullable`** (`i32 | null`, where `??` is
-  meaningful and lowers). 44 are this row's class, `loud emit reject` at the pin against `runs`
-  at the direct spelling: i32, i64, f64, f32, string, boolean, an object, a `new i32` newtype,
-  an alias, a numeric union, a string literal union, an array, a MAP, a function type and a
-  mixed union. The 48th (`d492_coal_numunion_ret_typar`) is excluded because its direct twin is
-  itself loud for an unrelated reason — an inferred union return the emitter does not support —
-  and `pingrid.py`'s confound rule is what named it. So this is one mechanism, not a
-  rep-by-rep gap.
+* **THE AXIS TABLE, RE-COUNTED — the row's own first draft was wrong about `map` and this one
+  was re-run rather than inherited.** On the base seed the `??` row disagrees with its direct
+  twin on 15 of 16 operand types; only `nullable` agrees. After the landing 12 of those 15
+  agree. The three that do not are `mixunion` (`i32 | string`), refused by
+  `emitProgram: monomorphize: unsupported argument type` — the same message `==` gets at the
+  same pin, so it is the monomorphizer's value-union limit and not `??` — and in `d492`'s grid
+  one more, `map` at the `fnval` delivery, refused because a function VALUE may not take a map
+  parameter. Both are loud, both name their own cause, neither mentions the operator.
 
-* **Filed, not fixed.** It was found by a grid built for another family and is not that
-  family's root; taking it needs the emitter's nullability question asked at the pin, which is
-  a different layer from the predicate D492 and D493 share.
+* **`numunion` AT THE `ret`/UNANNOTATED SHAPE IS A CONFOUND AND IS DECLARED AS ONE.** Its
+  direct twin is itself a loud check reject — an inferred union return the emitter does not
+  support — so it is not a control for `??`. `pingrid2.py --verify` fails on any loud direct
+  twin whose message does not name the operator unless it is listed in `lists.json`; these two
+  are, and they are the only two.
+
+---
+
+### D531 — `binOpDefinedFor` mirrors `checkBinary`'s dispatch-arm ORDER at ONE arm of three, so eight operator OVERLOADS are refused at the pin
+**loud check reject · found 2026-08-29 as the measured residue of D511/D512's close · 72 cells
+of `scripts/silent-sweep/d511/pingrid2.py`, kept whole in `distilled/named/` · the direct
+spelling of every one RUNS and prints the declaration's own answer**
+
+Repro:
+
+    type V = { x: i32 }
+    function "+"(self: V, other: V): i32 { return 99 }
+    function g<T>(a: T, b: T): i32 {
+      const r = a + b
+      return r
+    }
+    const p: V = { x: 6 }
+    const q: V = { x: 3 }
+    print(g(p, q))
+    // vl check:
+    //   [ERROR]: operator '+' is not defined for V and V (the call's argument types)
+
+* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the annotation.** `function g(a: V, b: V): i32`
+  with the same body, the same constants and the same call RUNS and prints `99`.
+
+* **IT IS #2010's OWN MECHANISM, ONE ARM UP.** That landing found `binOpDefinedFor` mirroring
+  neither `checkBinary`'s predicate nor its ORDER for the integer-only family, and fixed the
+  order there with `objOpDispatchTy` — "`checkBinary` reaches the integer-only rule only AFTER
+  the operator-dispatch arm, so an object receiver with a `^` overload is decided there and does
+  lower". The identical sentence is true of the ORDERING arm and of `+`: `checkBinary`'s
+  dispatch arm precedes both. `objOpDispatchTy` is called from one arm of `binOpDefinedFor` and
+  the language's rule is that it belongs before all of them.
+
+* **THE SHAPE OF THE FIX, AND WHY IT IS A ROW RATHER THAN PART OF D511's.** Hoisting
+  `objOpDispatchTy(op, lt)` to a single gate ahead of every operator arm is the DRY mirror, and
+  it would make the family uniform: 72 cells across `+ - * / < <= > >=`, every one `check` at
+  the pin and `runs` direct. It is deferred because it is a CHECKER change that makes a new
+  statement about which operators an object pin may use, where D511 was an emitter gap under a
+  pin `binOpDefinedFor` already accepted, and because a hoisted gate needs a decision the
+  int-only arm never had to make: `objOpDispatchTy` also answers for an operator FIELD, and an
+  object carrying a field literally named `"??"` would be accepted at the pin where
+  `checkBinary` returns before its dispatch arm. That is a false TRUE, which leaves a cell as
+  silent as it is — but it is a decision, not an oversight, and it wants its own grid.
+
+* **D511's LANDING IS THE PRECONDITION, and that is why this is worth taking next.** Before it,
+  hoisting the gate would have accepted a pin the emitter could not lower. `monoPinBinOps`
+  dispatches every declarable operator from the pin, not only the two the integer-only arm let
+  through, so the emitter half is already done and this is the remaining half.
+
+---
+
+### D532 — an un-annotated generic RETURN through an operator overload is typed as the OPERAND type
+**check-clean invalid wasm · found 2026-08-29 as the measured residue of D511's close · 6 cells
+of `scripts/silent-sweep/d511/pingrid2.py`, kept whole in `distilled/named/` · the two cells
+D492's landing left (`d492_xor_objop_ret_typar`, `d492_rem_objop_ret_typar`) are this row, not
+D511 — a counter probe reads `pbBin=0` on them, so the dispatch rung is never even entered**
+
+Repro:
+
+    type V = { x: i32 }
+    function "^"(self: V, other: V): i32 { return 99 }
+    function g<T>(a: T, b: T) {
+      return a ^ b
+    }
+    const p: V = { x: 6 }
+    const q: V = { x: 3 }
+    const z = g(p, q)
+    print(1)
+    // vl check rc 0, no error. vl run:
+    //   Invalid input WebAssembly code at offset 213: type mismatch:
+    //   expected (ref null $type), found i32
+
+* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the return annotation.** Add `: i32` to `g` and
+  the identical program RUNS. So the operand types, the dispatch and the call are all fine; the
+  return type is the whole of it.
+
+* **OFF `wasm-tools print`, AND THE MODULE SAYS WHICH SIDE IS WRONG.** The instance is
+  `(func (param (ref 0) (ref 0)) (result i32) local.get 0 / local.get 1 / return_call 4)` —
+  it dispatches, and returns the overload's `i32`. The CALL SITE is
+  `global.get 0 / global.get 1 / call 5 / global.set 2` into a global declared
+  `(mut (ref null 0))`. The emitter is right and the checker's recorded type for the call is
+  wrong.
+
+* **THE MECHANISM IS `checkBinary`'s TAIL.** `checkBinary` returns the overload's return type
+  only from its dispatch arm, under `T.tys[lt] is TyObj`. In the generic body `lt` is a
+  `TyVar`, so that arm is skipped and the walk falls to the tail, `return lt` — the operand
+  type. `g`'s inferred return is therefore `T`, and substituting `T := V` at the pin gives `V`.
+
+* **IT IS LOUD WHENEVER THE RESULT IS USED, which is why the silent form is narrow.**
+  `print(g(p, q))` is a positioned `print of V is type-valid but unsupported`, and
+  `const z: i32 = g(p, q)` is `cannot assign V to 'z'`. Only an UN-annotated binding of the
+  result reaches the emitter, and there the two sides disagree with nobody left to ask.
+
+* **NO POSITIONED REJECT IS AVAILABLE AT EITHER LAYER AS THE CODE STANDS**, which is a stronger
+  statement than "blocked". The checker types the body once, in the generic frame, where `T ^ T`
+  really is `T` for every non-object pin — refusing there would refuse `function add<T>(a: T,
+  b: T) { return a + b }`. And the pin's adjudicator (`binOpDefinedFor`) returns a BOOLEAN: it
+  has no channel to correct a type the body already recorded. Closing this needs the result
+  type of a deferred binary op to be re-derived per pin, which is a type-system capability
+  rather than a gate — the same layer D491's row calls "strictly more work than either gate
+  this row's parent built".
 
 ---
 
