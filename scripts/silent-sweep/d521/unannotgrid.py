@@ -419,6 +419,19 @@ def main():
         for r in blind:
             print("  BLIND-BUT-INERT (twin decides) %s" % (r,))
         ok = not (bad_a or bad_b or bad_c)
+        # WRONG SEED IS A DISTINCT ANSWER FROM VETO, and saying "VETO" for it would be
+        # this check telling a reader the override failed when what actually happened is
+        # that they handed it the compiler the cells no longer run on. Every price cell
+        # failing term (a) and none failing anything else is exactly that signature — the
+        # rungs' own landing — so it is named rather than scored.
+        if bad_a and len(bad_a) == len(ledger) + len(nest):
+            print("price: NOT A VETO — every cell fails (a) and nothing else, which is "
+                  "the signature of grading the LANDING seed. This check must be run "
+                  "against the seed the cells still RAN on (`042624e1`, "
+                  "f490fb1d7c00c26cbbacba4b7710e7bd): build it with "
+                  "`git archive 042624e1 compiler std | tar -x -C <tmp>` + a self-compile, "
+                  "and pass it as the argument.")
+            return 1
         print("price: %s" % ("every lost cell ran by coincidence and printed a WRONG "
                              "value — override holds" if ok else "VETO"))
         return 0 if ok else 1
