@@ -151,6 +151,7 @@ import {
   cpsToUtf8,
   decodeStr,
   directArgsBad,
+  indexPathKeyOf,
   inferNicheNullByName,
   isLitVariantName,
   litLexIsMember,
@@ -564,6 +565,8 @@ import {
   ifExprRefKind,
   ifExprRefSlot,
   ifExprValtype,
+  indexElemUnionName,
+  indexPlaceNonNull,
   internAtom,
   isNulScalarListFieldCode,
   isNulScalarListKind,
@@ -9090,8 +9093,33 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       // `ref.as_non_null` recover (the bound `e` is the niche the caller narrows with `e != null`).
       // `listElemStaysNullable` is the shared answer: the `.map`/`.filter` element step asks it too,
       // and a rep answered in only one of the two is a recover that traps in the other.
-      if listElemStaysNullable(nd.idxArr, fnIx) { return 0 }
+      if listElemStaysNullable(nd.idxArr, fnIx) {
+        // …UNLESS the index PLACE itself is narrowed non-null (D451). The niche half of the
+        // channel: nothing to unbox, but the value must stop being `(ref null …)` or it
+        // reaches a `(ref …)` consumer as one. The guard is what makes the recovery safe,
+        // exactly as the kind-18 receiver recovery twenty lines above is.
+        if indexPlaceNonNull(idxIx) {
+          wU8(212) // 0xd4 ref.as_non_null
+        }
+        return 0
+      }
       wU8(212) // 0xd4 ref.as_non_null (recover the non-null element)
+      // A union-BOX cell whose index PLACE is currently narrowed to one scalar atom unboxes
+      // HERE (D451) — the index twin of `emitNarrowedMem`'s code-16 tail, and the last rung
+      // of the channel: without it the checker proves `xs[0]` non-null, every classifier
+      // above calls the read an `i32`, and this arm still leaves the raw `(ref $uBox)` on the
+      // stack for an `(i32) -> ()` consumer. `vl check` rc 0, invalid wasm.
+      //
+      // Routed through `emitUnionUnboxTail`, the ONE home the narrowed IDENT read
+      // (`emitValueUnionUnboxRead`) and the union `as` cast already share, rather than a
+      // fifth open-coded `struct.get 1` + `ref.cast` + `struct.get 0`.
+      const iuAtom = narrowedValueAtomOf(indexPathKeyOf(idxIx))
+      if iuAtom != "" {
+        if indexElemUnionName(idxIx, fnIx) != "" {
+          const iuk = valueAtomKind(iuAtom)
+          if iuk >= 0 && iuk != nullValKind() { return emitUnionUnboxTail(iuk) }
+        }
+      }
       return 0
     }
     // A `(string | null)[]` `xs[i]` → the SAME string backing, but the element legitimately holds
@@ -9115,6 +9143,12 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
         emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
       }
       fbArrayGet(mkArrIdx) // 0xfb 0x0b <string backing> — kept `(ref null $sTypeIdx)` (nullable)
+      // A narrowed index PLACE recovers non-null here for the same reason the ref-list arm
+      // above does — this is the `(new string | null)[]` rep, eight of D451's 56 cells, and
+      // the one the row's "box rather than a niche" mechanism mis-classified.
+      if indexPlaceNonNull(idxIx) {
+        wU8(212) // 0xd4 ref.as_non_null
+      }
       return 0
     }
     // A STRING list `xs[i]` → unwrap to its `(ref null $sTypeIdx)` string backing,

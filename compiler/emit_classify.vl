@@ -222,6 +222,7 @@ import {
   gaeApplyFieldTy,
   gaeParamShadowed,
   gaeSplitArgs,
+  indexPathKeyOf,
   inferNicheNullByName,
   isBuiltinFnName,
   litLexIsMember,
@@ -6183,7 +6184,17 @@ function pushNarrowRep(name: string, variant: string, ty: i32, set: i32) {
   // arm is deliberate: this is the single push every narrowing channel bottoms out at, so
   // one test covers the `is` member path, the `w.f != null` member path and any channel
   // added later — a per-arm gate would silently miss the next one.
-  if narrowBareIdentOnly && name.indexOf(".") >= 0 { return narrowTop }
+  //
+  // A PATH KEY IS ANY KEY WITH A SEPARATOR, NOT JUST A DOTTED ONE (D451). The test read `.`
+  // alone, so an INDEX key (`xs[0]`) — which carries no dot — walked straight through the
+  // window this gate exists to close, and the emitter would have kept a cell narrowing the
+  // checker's own `isPathKey` bars there. That is the emitter twin of #2003's `isPathKey`
+  // rung, which also had to learn `[` beside `.`; the two stages now spell "is this a path"
+  // the same way.
+  if narrowBareIdentOnly {
+    if name.indexOf(".") >= 0 { return narrowTop }
+    if name.indexOf("[") >= 0 { return narrowTop }
+  }
   if narrowTop < narrowNames.length {
     narrowNames[narrowTop] = name
     narrowVariants[narrowTop] = variant
@@ -12179,6 +12190,125 @@ function pushDiscrimNarrow(
   true
 }
 
+// The VALUE-union name of an INDEX read `xs[0]` whose receiver is a ref list with a
+// union-BOX element (element kind 2), or "" for any other receiver. The index twin of
+// `memberUnionFieldNameRead`, and the ONE gate every index narrowing channel asks before it
+// mints a key — so the push side and the read side cannot disagree about which cells hold a
+// box. Factored out of `unionNameOfExpr`'s Index arm rather than re-derived: a second copy
+// of "which element kind is a box" is exactly the drift this file's headers keep warning
+// about.
+export function indexElemUnionName(idxIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(idxIx)]
+  if e is Index {
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+      }
+    }
+  }
+  ""
+}
+
+// The NULLABLE-REF-ARRAY element name of an INDEX read `xs[0]` — `"i32[][][] | null"` for
+// `xs: (i32[][][] | null)[]` — or "" when the element is not a nullable ref array.
+//
+// THIS IS THE OTHER HALF OF D451, AND IT IS A DIFFERENT SYMPTOM FROM THE BOX ONE. A
+// nullable ref-array element is a NICHE, not a box: `array.get` + `ref.as_non_null` already
+// leaves exactly the right value on the stack, so nothing needs unboxing. What fails is the
+// CLASSIFIER — `refListElemNameOfExpr`'s Index arm gates on `nameIsArray(outer)`, which is
+// false for a name ending `| null`, so the arm declines, `refListSlotOfExpr` coerces its
+// `rlSlotByName` miss to slot 0, and the next link of `xs[0][0][0]` addresses whatever list
+// happens to sit in that slot. Measured: `(i32[][][] | null)[]` picked the `i32[][]` wrapper
+// and stored a `(ref $i32[][][])` into a `(ref null $i32[][])` local — `vl check` rc 0,
+// "expected (ref null $type), found (ref $type)". The `| null` peel is only sound under the
+// guard, which is why it hangs off the narrowing rather than off the name.
+export function indexElemNulRefArrayName(idxIx: i32, fnIx: i32) {
+  const ix = unwrapParen(idxIx)
+  const e = P.nodes[ix]
+  if e is Index {
+    if exprNullableRefArray(ix, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemName.length {
+        const np = nullablePartOf(rlElemName[slot])
+        if np != "" && nameIsRefArray(np) { return np }
+      }
+    }
+  }
+  ""
+}
+
+// PUSH the narrowing for an INDEX place whose cell is a NICHE — a nullable reference the
+// read leaves `(ref null …)` rather than a tagged box. Returns true when it pushed.
+//
+// THE 56 CELLS ARE NOT ONE REP FAMILY, WHICH THE ROW GOT WRONG. It filed them as "the reps
+// whose nullable is a BOX rather than a niche"; measured, only four of the seven are boxes
+// (`new i32`/`i64`/`f32`/`f64`). `new string` is a nullable-STRING niche and the two
+// three-deep arrays are nullable-REF-ARRAY niches, and each fails with its own wasm error.
+// A niche needs no unbox — the value on the stack is already the right one — so all the
+// entry has to say is "not null", which is what the read's `ref.as_non_null` recovery and
+// (for a ref array) `refListElemNameOfExpr`'s inner-row lookup ask of it.
+function pushIndexNicheNarrow(idxIx: i32, fnIx: i32) {
+  const ik = indexPathKeyOf(idxIx)
+  if ik == "" { return false }
+  // A nullable REF ARRAY cell carries its PEELED NAME as the variant, because the guarded
+  // reads resolve the inner ref-list row from it.
+  const np = indexElemNulRefArrayName(idxIx, fnIx)
+  if np != "" {
+    pushNarrow(ik, np)
+    return true
+  }
+  // A nullable STRING cell — the variant only has to be a non-`null` spelling, and `string`
+  // is the atom the recovered ref actually holds.
+  const e = P.nodes[unwrapParen(idxIx)]
+  if e is Index {
+    if exprNulStrArray(e.idxArr, fnIx) {
+      pushNarrow(ik, "string")
+      return true
+    }
+  }
+  false
+}
+
+// Retire every live narrowing whose KEY is a cell of the receiver keyed `root` — the
+// emitter twin of `retireNarrowingsForWrite`'s `keyHasPrefix(key, tgtKey + "[")` leg and of
+// its variable-index branch, which are one rule in the checker and are one here.
+//
+// THREE `runs` PROGRAMS TURNED INTO TRAPS WITHOUT IT, and the reason they were reachable at
+// all is the same reason the emitter's other retire arms exist: the checker retires and then
+// types the reads after the write at the DECLARED rep, which for a NICHE cell (`(string |
+// null)[]`) is a rep `print` renders perfectly well — so the program stays check-clean and
+// the stale emit-side entry is the only thing wrong with it. The BOX reps hid this: their
+// declared rep has no `print` lowering, so the checker refuses the read and the emitter is
+// never asked. `ns[0] = nul()`, `ns = [nul()]` and `ns[i] = nul()` each printed `null` before
+// this change and each trapped on the `ref.as_non_null` the narrowed read now emits.
+function retireNarrowForIndexCells(root: string) {
+  if root == "" { return 0 }
+  const pfx = root + "["
+  let i = 0
+  while i < narrowTop {
+    const k = narrowNames[i]
+    if k.length > pfx.length {
+      if k.slice(0, pfx.length) == pfx { narrowRetired[i] = 1 }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True when the INDEX place `xs[0]` carries a live narrowing that excludes `null` — the
+// question a NICHE read asks before recovering non-null. Deliberately NOT
+// `narrowExcludesNull`, which needs an arena type behind the entry (`narrowSlotTy >= 0`); a
+// niche push banks a rendered spelling only, so that predicate would answer false for every
+// one of them.
+export function indexPlaceNonNull(idxIx: i32) {
+  const k = indexPathKeyOf(idxIx)
+  if k == "" { return false }
+  const v = narrowVariantFor(k)
+  if v == "" { return false }
+  v != "null"
+}
+
 // If the `if` condition at `condIx` is `n is Variant` over a bare union identifier
 // `n`, PUSH the narrowing (`narrowNames`/`narrowVariants`) so the then-branch's
 // `n.field` reads downcast through the box, and return true. Otherwise leave the
@@ -12213,6 +12343,21 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
           return true
         }
       }
+    }
+    // `xs[0] is T` over a union-BOX ELEMENT narrows the index PLACE — the index twin of the
+    // member channel directly above, and keyed `xs[0]` exactly as the checker's `placeKeyOf`
+    // spells it. The niche leg beside it is the nullable-ref-array cell, which narrows for
+    // its NAME rather than for an unboxing (see `indexElemNulRefArrayName`).
+    if mrecv is Index {
+      const iix = unwrapParen(c.isObj)
+      if indexElemUnionName(iix, fnIx) != "" {
+        const ik = indexPathKeyOf(iix)
+        if ik != "" {
+          pushNarrowIs(ik, c.isVariant, condIx)
+          return true
+        }
+      }
+      if pushIndexNicheNarrow(iix, fnIx) { return true }
     }
     // `s.kind is KC` — THE DISCRIMINANT. A test on a struct union's FIELD refines the
     // RECEIVER, which is the whole reason a tag is written: the arms differ in it so that
@@ -12333,6 +12478,42 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
               return true
             }
           }
+        }
+      }
+    }
+  }
+  // `xs[0] == null` / `xs[0] != null` — the INDEX twin of the member channel above, and the
+  // spelling that carries most of D451's 56 cells. Same key grammar, and the member set comes
+  // from the ELEMENT's own declared union for the same reason it does there:
+  // `currentNarrowSetOf`'s `unionNameOfIdent` fallback cannot resolve a path key.
+  if mnull >= 0 {
+    if P.nodes[mnull] is Index {
+      const ifn = indexElemUnionName(mnull, fnIx)
+      if ifn != "" && isValueUnionName(ifn) {
+        const ik = indexPathKeyOf(mnull)
+        if ik != "" {
+          const icn = P.nodes[condIx]
+          if icn is BinExpr {
+            if icn.binOp == "==" {
+              // Pinning the cell to `null` is not a strip.
+              if narrowStripNullOnly { return false }
+              pushNarrow(ik, "null")
+              return true
+            }
+            const irest = removeAtomFromSet(unionMemberSetOf(ifn), "null")
+            if irest != "" {
+              pushNarrow(ik, irest)
+              return true
+            }
+          }
+        }
+      }
+      // The nullable-ref-array cell (`(i32[][][] | null)[]`) — a NICHE, so only the `!=`
+      // sense narrows anything the reads can use.
+      const incn = P.nodes[condIx]
+      if incn is BinExpr {
+        if incn.binOp == "!=" {
+          if pushIndexNicheNarrow(mnull, fnIx) { return true }
         }
       }
     }
@@ -12473,6 +12654,38 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     // exactly the branches the checker already typed as narrowed and nothing else.
     if pushDiscrimNarrow(unwrapParen(c.isObj), condIx, fnIx, true) {
       return true
+    }
+    // The INDEX dual of the member complement below: the else of `xs[0] is T` subtracts `T`
+    // from the cell's set, which is what unboxes `match xs[0] { null => … T => … }`'s second
+    // arm (the parser mints each `match` type pattern as a real `IsExpr`, so the four
+    // constructs D451 grids are two spellings times two branch senses here).
+    if mrecv is Index {
+      const eiix = unwrapParen(c.isObj)
+      const eiun = indexElemUnionName(eiix, fnIx)
+      if eiun != "" {
+        const eik = indexPathKeyOf(eiix)
+        if eik != "" {
+          let eicur = ""
+          let eisid = -1
+          const eislot = narrowSlotOf(eik)
+          if eislot >= 0 {
+            eicur = narrowVariants[eislot]
+            eisid = narrowSets[eislot]
+          } else {
+            eicur = unionMemberSetOf(eiun)
+            eisid = msSetOfText(eicur)
+          }
+          if pushNarrowComplement(eik, eisid, c.isVariant) != "" { return true }
+          const eirst = removeAtomFromSet(eicur, c.isVariant)
+          if eirst != "" {
+            pushNarrow(eik, eirst)
+            return true
+          }
+        }
+      }
+      if c.isVariant == "null" {
+        if pushIndexNicheNarrow(eiix, fnIx) { return true }
+      }
     }
     if mrecv is Member {
       const mun = memberUnionFieldNameRead(unwrapParen(c.isObj), fnIx)
@@ -12661,6 +12874,39 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       }
     }
   }
+  // The INDEX dual, and the reason both senses of both spellings had to land together: in
+  // the else of `xs[0] != null` the cell IS `null`; in the else of `xs[0] == null` it is the
+  // non-null member set, which is what unboxes the else-arm's reads. `if xs[0] == null { … }
+  // else { print(xs[0]) }` is one of the four constructs D451's grid measures, and without
+  // this leg it stays check-clean invalid wasm while its `!=` sibling is correct.
+  if emnull >= 0 {
+    if P.nodes[emnull] is Index {
+      const eifn = indexElemUnionName(emnull, fnIx)
+      if eifn != "" && isValueUnionName(eifn) {
+        const eik = indexPathKeyOf(emnull)
+        if eik != "" {
+          const eicn = P.nodes[condIx]
+          if eicn is BinExpr {
+            if eicn.binOp == "!=" {
+              pushNarrow(eik, "null")
+              return true
+            }
+            const eirest = removeAtomFromSet(unionMemberSetOf(eifn), "null")
+            if eirest != "" {
+              pushNarrow(eik, eirest)
+              return true
+            }
+          }
+        }
+      }
+      const eincn = P.nodes[condIx]
+      if eincn is BinExpr {
+        if eincn.binOp == "==" {
+          if pushIndexNicheNarrow(emnull, fnIx) { return true }
+        }
+      }
+    }
+  }
   // The struct-union dual: in the else of `v != null` the value IS `null`; in the
   // else of `v == null` it is the non-null variant set.
   const snm = structUnionNullCmpName(condIx, fnIx)
@@ -12791,10 +13037,17 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
       // write reaches neither arm below, and `writeRhsIsNullBearing`'s third leg is a
       // `unionNameOfExpr` scan — so hoisting it above this test would put that scan on
       // every index assignment in the program for an answer nothing asks for.
-      const tgtIsPlace = tgt is Ident || tgt is Member
+      const tgtIsPlace = tgt is Ident || tgt is Member || tgt is Index
       const rhsNullable = tgtIsPlace && writeRhsIsNullBearing(s.binRight, fnIx)
       if tgt is Ident {
         const un = unionNameOfIdentSid(sidOfNode(s.binLeft), fnIx)
+        // A ROOT REBIND KILLS ITS CELLS, and UNCONDITIONALLY — `writeRetiresNarrowing`'s
+        // prefix leg returns true without consulting the written type, because the new array
+        // is a different array and says nothing about the old one's cells. So this sits
+        // OUTSIDE the `rhsNullable` gate: `ns = [nul()]` writes a value the emitter's
+        // null-bearing proxy calls non-null (an array type is not nullable) while the cell it
+        // replaces is null.
+        retireNarrowForIndexCells(tgt.identName)
         if rhsNullable {
           retireNarrowFor(tgt.identName)
         } else if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
@@ -12824,6 +13077,36 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         if rhsNullable {
           const mtk = memberPathKeyOf(s.binLeft)
           if mtk != "" { retireNarrowFor(mtk) }
+        }
+      }
+      // THE INDEX TARGET, which no arm here ever had — the write shape the header two
+      // paragraphs up singles out as reaching neither arm. It is the third of the emitter
+      // twins of #2003's checker rungs, and the only one of the three whose absence is
+      // observable: `xs[i] = v` and `xs[0] = v`.
+      //
+      // A LITERAL subscript names its cell, so the exact key retires — and only that key,
+      // because `indexPathKeyOf` mints no key whose receiver is itself an index (`xs[0][1]`
+      // keys ""), so no nested key can exist for a prefix leg to catch. If that grammar ever
+      // grows a nested arm, this needs `retireNarrowForIndexCells(indexPathKeyOf(...))` too.
+      //
+      // A VARIABLE subscript names NO cell and therefore may have hit any of them, so it
+      // retires the receiver's whole family — the checker says the same thing in the same
+      // words at `retireNarrowingsForWrite`'s `tgtKey == ""` branch. Unconditional there;
+      // gated on `rhsNullable` here only because that IS the emitter's reading of the value
+      // leg, and a `ns[i] = "z"` write the narrowing still admits must not retire it or the
+      // two stages disagree in the other direction.
+      if tgt is Index {
+        if rhsNullable {
+          const itk = indexPathKeyOf(s.binLeft)
+          if itk != "" {
+            retireNarrowFor(itk)
+          } else {
+            const iroot = P.nodes[unwrapParen(tgt.idxArr)]
+            if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
+            if iroot is Member {
+              retireNarrowForIndexCells(memberPathKeyOf(tgt.idxArr))
+            }
+          }
         }
       }
     }
@@ -26155,6 +26438,12 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       // union-arm rebind receiver resolves no slot; OOB otherwise).
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot < 0 || slot >= rlElemKindTbl.length { return false }
+      // A cell NARROWED to one scalar atom unboxes at the read (D451), exactly as the
+      // Member arm below declines a narrowed field read — so it is no longer a union VALUE
+      // here. A sub-union narrowing (kind 6 = `null`, or no atom kind at all) keeps the box.
+      const iAtom = narrowVariantFor(indexPathKeyOf(exprIx))
+      const iak = valueAtomKind(iAtom)
+      if iak >= 0 && iak != 6 { return false }
       return rlElemKindTbl[slot] == 2
     }
     // A bare `m[k]` over a UNION-valued map yields the value union box.
@@ -26606,7 +26895,16 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     if exprRefArray(e.idxArr, fnIx) {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemKindTbl.length {
-        if rlElemKindTbl[slot] == 2 { return rlElemName[slot] }
+        if rlElemKindTbl[slot] == 2 {
+          // The name-typed half of `exprUnion`'s D451 decline: a cell narrowed to one
+          // scalar atom is unboxed by the read, so it carries no union name either. The two
+          // must answer together — `exprUnion` false with a name still resolving is exactly
+          // the split D311 records one classifier over.
+          const iAtom = narrowVariantFor(indexPathKeyOf(exprIx))
+          const iak = valueAtomKind(iAtom)
+          if iak >= 0 && iak != 6 { return "" }
+          return rlElemName[slot]
+        }
       }
     }
     // `t0[i]` where `t0` is a UNION binding whose ref-array arm has a value-union element with
@@ -26896,6 +27194,27 @@ function memberUnionReadKind(exprIx: i32, fnIx: i32) {
       if a != "" { return valueAtomKind(a) }
       const d = memReadUnboxAtomKind(exprIx, fnIx)
       if d >= 0 { return d }
+      return -2
+    }
+  }
+  -3
+}
+
+// The INDEX-place dual of `unionIdentReadKind` / `memberUnionReadKind`: the atom KIND a
+// union-BOX ELEMENT read (`xs[0]`) currently reads as — the narrowed single atom's kind
+// when the index PLACE is narrowed (the read unboxes to that atom's rep), -2 for an
+// un-narrowed box read, -3 when the expression is not a union-element index at all.
+//
+// THE THIRD END OF THE SAME CHANNEL, and it is wired into exactly one consumer for the
+// reason `memberUnionReadKind`'s header measured: only `exprString` lacks a typed-IR fast
+// path, so only the string atom was ever classified wrong. Wiring the other four would be a
+// rung that scores `ans=0` everywhere, and this file already carries that measurement.
+function indexUnionReadKind(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[exprIx]
+  if e is Index {
+    if indexElemUnionName(exprIx, fnIx) != "" {
+      const a = narrowedValueAtomOf(indexPathKeyOf(exprIx))
+      if a != "" { return valueAtomKind(a) }
       return -2
     }
   }
@@ -28712,6 +29031,22 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   // of `g`'s element list — strip ONE `[]` off `g`'s element name (`S[]` → `S`). Recurses for
   // deeper nesting (`g[i][j]` over `S[][][]`).
   if e is Index {
+    // A NARROWED index place over a nullable-ref-array element (D451). The recursion below
+    // gates on `nameIsArray(outer)`, which is FALSE for an element name ending `| null`, so
+    // the arm declined and `refListSlotOfExpr` turned its `rlSlotByName` miss into slot 0 —
+    // a real row, addressed by mistake. The narrowing is what makes the `| null` peel sound
+    // (outside the guard the CHECKER refuses the read), so the answer hangs off the stack
+    // entry rather than off the name, and resolves through the same `nulRefArrayInnerSlot`
+    // the `??` leg below uses so the two spellings round-trip to one row.
+    // GATED ON THE REF-ARRAY SHAPE, not on the narrowing alone: the same key is pushed for a
+    // nullable-STRING cell, whose receiver is not a ref list at all — `nulRefArrayInnerSlot`
+    // would then take `refListSlotOfExpr`'s slot-0 fallback and hand back an unrelated row.
+    if indexElemNulRefArrayName(unwrapParen(exprIx), fnIx) != "" {
+      if narrowVariantFor(indexPathKeyOf(exprIx)) != "" {
+        const nin = nulRefArrayInnerSlot(unwrapParen(exprIx), fnIx)
+        if nin >= 0 && nin < rlElemName.length { return rlElemName[nin] }
+      }
+    }
     const outer = refListElemNameOfExpr(e.idxArr, fnIx)
     if outer != "" && nameIsArray(outer) { return refArrElemName(outer) }
   }
@@ -31748,6 +32083,16 @@ export function exprString(exprIx: i32, fnIx: i32) {
   // string-array check is the only string-producing index form.)
   if e is Index {
     if exprStringArray(e.idxArr, fnIx) { return true }
+    // A union-BOX CELL narrowed to the `string` atom unboxes to the string ref — the index
+    // dual of the Member leg below, and the one atom that needs it for the same structural
+    // reason `memberUnionReadKind`'s header records: `exprIsI64`/`exprIsF64`/`exprIsF32`/
+    // `exprIsBool` each open with a typed-IR fast path off the CHECKER's node type, which
+    // already carries the narrowed atom, while `exprString` deliberately has none (canon
+    // SOFTENS a literal union to the spelling `string` while its rep is an interned i32).
+    // Without this leg `print(xs[0])` over a `(new string | null)[]` cell picked
+    // `__print_i32__` for a `(ref $sTypeIdx)`.
+    const iuk = indexUnionReadKind(exprIx, fnIx)
+    if iuk != -3 { return iuk == 2 }
   }
   // A field read `p.f` where `f` is a STRING struct field yields a string ref (gap #2:
   // `let k = t.kind` must give `k` the string type, not i32).

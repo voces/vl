@@ -1,0 +1,109 @@
+// @run
+// @log 7
+// @log 7
+// @log 7
+// @log 7
+// @log aa
+// @log 2
+// @log 7
+// @log aa
+// @log z
+// @hint redundant type annotation: `xs` is inferred as `(NtI32 | null)[]`
+// @hint redundant type annotation: `ss` is inferred as `(NtStr | null)[]`
+// @hint redundant type annotation: `ts` is inferred as `(i32[][][] | null)[]`
+// @hint redundant type annotation: `xs` is inferred as `(NtI32 | null)[]`
+// @hint redundant type annotation: `bs` is inferred as `(string | i32 | null)[]`
+// THE EMITTER SIDE of an index-place narrowing (inventory-2 D451). The CHECKER learned to
+// narrow `xs[0]` at #2003; the emitter kept reading the cell at the UN-narrowed rep, so 56
+// cells of that landing's own grid were `vl check` rc 0 over a module the engine refuses.
+//
+// THE 56 ARE NOT ONE REP FAMILY, and the row said they were ("the reps whose nullable is a
+// BOX rather than a niche"). Measured, they are three families with three different wasm
+// errors, and each needs a different rung:
+//
+//   BOX      `new i32` / `i64` / `f32` / `f64` — a tagged `(struct i32 anyref)`. The read
+//            handed the whole box to an `(i32) -> ()` consumer:
+//            `expected i32, found (ref $type)`. Needs the UNBOX tail, which is the same
+//            `emitUnionUnboxTail` the narrowed IDENT read already used.
+//   NICHE    `new string` — a nullable STRING, `(ref null $str)`. Nothing to unbox; the
+//            value is right and merely still nullable: `expected (ref $type), found
+//            (ref null $type)`. Needs the `ref.as_non_null` recovery.
+//   NICHE    `i32[][][]` / `string[][][]` — a nullable REF ARRAY. Also nothing to unbox,
+//            and the failure is not even at this read: `refListElemNameOfExpr`'s Index arm
+//            gates on `nameIsArray(outer)`, false for a name ending `| null`, so it
+//            declined and `refListSlotOfExpr` turned its miss into slot 0 — the NEXT link
+//            of `xs[0][0][0]` then addressed an unrelated list. Needs the narrowed inner-row
+//            lookup. `i32[][]` runs on the base compiler and `i32[][][]` does not, which is
+//            what says the depth is doing the work rather than the nullability.
+//
+// The last two functions are the reps the 184-cell grid has no column for, because it only
+// ever reads the cell directly: an un-annotated BINDING taken from the narrowed cell, and a
+// value union whose STRING arm is a real box arm (`nt_str` in that grid is `new string`,
+// which is the niche above, not a box).
+type NtI32 = new i32
+type NtStr = new string
+
+function srcI(): NtI32 | null { return 7 }
+function srcS(): NtStr | null { return "aa" }
+function srcT(): i32[][][] | null { return [[[1, 2]]] }
+function srcB(): string | i32 | null { return "aa" }
+
+// All four narrowing constructs over the BOX rep, which is the whole `!=`/`==`-else/`is`/
+// `match` axis of the grid in one function.
+function boxRep() {
+  const xs: (NtI32 | null)[] = [srcI()]
+  if xs[0] != null { print(xs[0]) } else { print("NUL") }
+  if xs[0] == null { print("NUL") } else { print(xs[0]) }
+  if xs[0] is NtI32 { print(xs[0]) } else { print("NUL") }
+  match xs[0] {
+    null => print("NUL")
+    NtI32 => print(xs[0])
+  }
+}
+
+function nulStrRep() {
+  const ss: (NtStr | null)[] = [srcS()]
+  if ss[0] != null { takeS(ss[0]) } else { print("NUL") }
+}
+function takeS(v: NtStr) { print(v) }
+
+function nulRefArrayRep() {
+  const ts: (i32[][][] | null)[] = [srcT()]
+  if ts[0] != null { print(ts[0][0][0][1]) } else { print("NUL") }
+}
+
+// An un-annotated binding FROM the narrowed cell: the read unboxes, so the binding is the
+// ATOM and not the union box. Both classifiers have to say so or the cell and the read
+// disagree about the rep.
+function bindingFromCell() {
+  const xs: (NtI32 | null)[] = [srcI()]
+  if xs[0] != null {
+    const z = xs[0]
+    print(z)
+  } else { print("NUL") }
+}
+
+// A boxed STRING arm — the one atom whose read classification has no typed-IR fast path to
+// fall back on, so it needs its own index leg (`exprString`).
+function boxedStringArm() {
+  const bs: (string | i32 | null)[] = [srcB()]
+  if bs[0] is string { print(bs[0]) } else { print("NO") }
+}
+
+// A write the narrowing ADMITS keeps it — the other direction of the retirement rule, and
+// check-clean invalid wasm on the base compiler for the same reason the reads above were.
+function admittedWrite() {
+  const ns: (string | null)[] = ["a"]
+  if ns[0] != null {
+    ns[0] = "z"
+    takeStr(ns[0])
+  } else { print("NUL") }
+}
+function takeStr(v: string) { print(v) }
+
+boxRep()
+nulStrRep()
+nulRefArrayRep()
+bindingFromCell()
+boxedStringArm()
+admittedWrite()
