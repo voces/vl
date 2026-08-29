@@ -15518,7 +15518,9 @@ Repro (now a loud check reject):
 * **THE REWRITES, MEASURED.** `const r: A = self.base + i * 4; return r` makes the fixture
   build under the full widening — and it is not a rewrite, it is the same defect one node
   over: the concrete twin `const r: A1 = …` is a loud `` i32 doesn't fit in A1 … write
-  `x as A1` ``. Filed as D572. The one LEGITIMATE rewrite declares the return `i32` and casts
+  `x as A1` ``. Filed as D572 and CLOSED 2026-08-29 — that spelling is now a loud reject
+  through the destination seam's own pin, so the relocation is no longer available at all.
+  The one LEGITIMATE rewrite declares the return `i32` and casts
   at each call site (`rowAt(st, 2) as TVAddr`), which type-checks with only writable spellings
   and deletes the property the module exists to demonstrate — a branded accessor. Neither is
   a reason to refuse the module.
@@ -15591,46 +15593,203 @@ Repro (runs today, prints `3`, and its direct twin is a loud reject):
   rule is already here, at the validate site, and it does not separate the brand cell from
   the defect (the brand cell's `A` IS in a parameter position).
 
+* **THE RESIDUE IS CONFINED TO THE RETURN, AND SINCE 2026-08-29 THAT IS EXACT RATHER THAN
+  APPROXIMATE.** "Inside a generic returning a bare type parameter" was the intended bound
+  and not the measured one: `const r: A = self.base + i * 4  return r` forged the same brand
+  through a hole-typed LOCAL, and a field write and an element write did too. D572's landing
+  closes all four — `d572o_brandlet_typar` is that cell and it is in the price ledger — so
+  the forge is now reachable only through the `return` this row is about. The choice was
+  deliberate: exempting there instead would have widened THIS row to four seams and made the
+  `as A` landing below bigger. What the exemption still buys is unchanged, and
+  `d551/retgrid.py --price` and `--verify`'s `deliberate` list both pass on that landing.
+
 ---
 
-### D572 — the DECLARED type of a LOCAL may be a hole its initializer cannot check, and no pin re-asks it
-**check-clean invalid wasm · found 2026-08-29 while pricing D561's rewrites · unmoved by every
-D561 candidate, the full widening included**
+### D572 — [CLOSED 2026-08-29] the DECLARED type of a LOCAL may be a hole its initializer cannot check, and no pin re-asks it
+**closed 2026-08-29 · the filed repro is now a loud check reject · was `check-clean invalid
+wasm` · found 2026-08-29 while pricing D561's rewrites · 247 cells + twins of
+`scripts/silent-sweep/d572/letgrid.py`, kept whole in `distilled/named/` as
+`d572-destination-seam` · standing gates:
+`tests/cases/generics/error-declared-local-hole-at-pin.vl`,
+`declared-local-hole-at-pin-keeps.vl`, `error-hole-relay-declared-side-at-pin.vl`**
 
-Repro:
+Repro (now a loud check reject):
 
     function g<T>(self: T, n: i32): T {
       const r: T = n + 1
       return r
     }
     print(g("s", 2))
+    // now: vl check rc 1 — cannot assign i32 to 'r' of type string
+    //   (the body of `g` at the call's argument types)
+
+* **A SIXTH DEFERRED TABLE, NOT A WIDENING OF THE FIFTH, AND THE ROW WAS RIGHT ABOUT WHY.**
+  The `return r` is clean by construction — `r`'s declared type is the hole `T`, which
+  substitutes to `string` at the pin and matches the declared return exactly — so
+  `validateRetCstrs` has nothing to say and every D561 seed graded this cell `check-clean
+  invalid wasm`. `letCstrGot`/`Want`/`Ix`/`Fn`/`Name` records the pair from
+  `checkLetDeclNode`'s PASSING branch and `validateLetCstrs` re-asks it at both pins,
+  exactly as `retCstr` does one node over.
+
+* **THE PIN ASKS `assignableExpr`, AND THAT IS THE WHOLE SOUNDNESS ARGUMENT.** It is the
+  SAME function the body asked, handed the same expression, so the pin agrees with the
+  one-token-different direct spelling by construction rather than by a second rule that can
+  drift. `assignable` alone is not that function: the A7 coercion (a boolean-typed value
+  into an `i32` slot) lives at the EXPRESSION seam, so a pin asking the plain predicate
+  invents a false reject for `const r: i32 = self` at `g(true)` — which runs and prints `1`
+  in both spellings on every seed ever graded. That is D551's first cut, available again one
+  node over; `d572o_a7_*` and the `asI32` line of `declared-local-hole-at-pin-keeps.vl` are
+  what refuse it.
+
+* **THE ROW UNDER-COUNTED THE FAMILY BY FOUR SEAMS AND ONE SIDE, and the grid is what said
+  so.** Filed as the declaration seam with a want-side hole; measured, it is FOUR
+  destinations — a local declaration, a re-assignment, a struct field write and an array
+  element write — on BOTH sides of the hole. The last three are ONE gate
+  (`checkBinExprNodeReal`'s `=` arm), which is why the landing is two recording sites and
+  not four. The mirror nobody had filed — `function g<T>(self: T): i32 { const r: i32 =
+  self  return r }` at `g("s")` — was the same check-clean invalid wasm beside a loud
+  `cannot assign string to 'r' of type i32`.
+
+* **THE WORST CELLS ARE NEITHER REJECTS NOR INVALID WASM, AND THIS IS THE THIRD TIME.** At
+  `T = boolean` the store is rep-compatible, so `g(true, -1)` VALIDATED and printed `false`
+  for an argument that was `true` — 24 such cells across the four seams and both sides,
+  every one beside a loud direct twin. `pingrid2` could not see a wrong value at all
+  (#2016), D561's grid printed `1` at every cell and scored its own fix as a regression
+  (#2018), and `letgrid.py`'s first `want_of` blessed `false` as this family's right answer
+  before the sentinel replaced it. The grid prints the result and `HOLEVAL` has an entry
+  only where the DIRECT spelling accepts the store.
+
+* **THE 25 `runs` LOST ARE AN OVERRIDE, AND 24 OF THEM ARE THE STANDARD FOUR TERMS.** They
+  run by COINCIDENCE (the one-token twin is a loud reject and the value printed contradicts
+  the declaration), the loss is LOUD (a positioned message repeating the direct spelling's
+  own sentence), and the price is NAMED and REVERSIBLE (`distilled/named/`, two recording
+  sites). `letgrid.py --price` re-checks all 25 against any seed: rc 2 wrong seed by md5,
+  rc 1 veto, rc 0 held, and it FAILS on an empty population.
+
+* **THE 25th IS `d572o_brandlet_typar` AND IT FAILS THE COINCIDENCE TERM — SAY SO PLAINLY.**
+  It printed `1032`, which is the RIGHT answer, so the argument that carries it is a
+  different one: **no capability is lost, only a second spelling of a capability that
+  remains.** It is D561's branded accessor with the return laundered through a hole-typed
+  local (`const r: A = self.base + i * 4  return r`) — the "rewrite" this row was filed to
+  warn about. `rowAt` itself still builds through D561's own exemption, byte-identically,
+  and `d551/retgrid.py --price` and `--verify`'s `deliberate` list both pass on this landing;
+  the `rowAt` line of `declared-local-hole-at-pin-keeps.vl` is the executable form of that
+  claim. Exempting it instead would have DOUBLED D571's residue — the forge would reach a
+  local and a field write as well as a return — and made the eventual `as A` landing bigger.
+  Corpus `cmp` is what made the choice available at all: **0 DIFFER, 0 LOST over 1,965
+  buildable modules**, where D561's own widening cost two.
+
+* **AND THE ANSWER TO "DOES THIS CHANGE WHAT D561/D571 ADVISE": IT STRENGTHENS THEM.** D571
+  asks for `as A` — a deferred CAST constraint — and its residue is stated as "inside a
+  generic returning a bare type parameter". That sentence is now TRUE rather than
+  approximate: the forge cannot be reached through a local, a field or an element, so D571's
+  surface is exactly the return, and the three priced options in its row are unchanged.
+
+* **A GATE THAT WAS WANT-SIDE-BLIND AT BOTH TABLES, WHICH NOTHING HAD GRADED.** The
+  RE-DEFERRAL — a constraint whose hole substitutes to another hole, re-recorded under the
+  caller — asked only whether the BODY side still held a hole. That was the whole question
+  when D551 landed; D561 widened the return TABLE to the declared side and left the gate
+  where it was, so the widening EVAPORATED across one level of relay and
+  `function inner<T>(self: T, n: i32): T { return n + 1 }` reached through `outer<U>` stayed
+  check-clean invalid wasm on D561's own landing. `d551/retgrid.py` is structurally blind to
+  it — its `relay` axis puts the hole on the body side — and this landing fixes the one
+  condition in both `validateRetCstrs` and `validateLetCstrs`. `d572o_retrelay_*`,
+  `d572o_letrelay_*`, and `error-hole-relay-declared-side-at-pin.vl`.
+
+* **EVERY RUNG ABLATED, AND THE MESSAGE REFACTOR GRADED RATHER THAN ASSERTED.** Built with
+  one fixed compiling seed so the only variable is the source: R1 (declaration) buys 44
+  cells, R2 (the write gate: re-assignment, field, element) buys 126, R3 (re-deferral) buys
+  exactly 2 and both are named above. `STRIP` — every rung and the helper out — reproduces
+  the base compiler byte for byte (md5 `7205c310…`, 1,498,138 bytes), and `REFACTOR` —
+  `letAssignMsg` alone, the three declaration sentences and the one write sentence in a
+  single home — moves 0 of 488 grid cells and 0 corpus bytes while being 91 bytes larger,
+  which is the function itself.
+
+* **WHAT IS STILL SILENT AFTER THIS, MEASURED RATHER THAN ASSUMED.** Two destination
+  spellings survive, both `check-clean invalid wasm` beside loud direct twins, and both have
+  a mechanism this landing's table cannot reach: an ARRAY LITERAL contextually typed against
+  the destination (D581) and a BUILTIN collection method's argument (D582). Everything else
+  probed closes: a map value write, an object literal's field, a nested field write, an
+  un-annotated relay of either literal, and the two-level relay above. The grid's `residue`
+  list is empty and derived, not asserted.
+
+---
+
+### D581 — an ARRAY LITERAL adopts its destination's element type, so a hole-typed ELEMENT inside it is never compared
+**check-clean invalid wasm · found 2026-08-29 as the measured residue of D572's close · the
+one destination D572's table cannot reach because the mismatch never becomes a TYPE**
+
+Repro:
+
+    function g<T>(self: T): string {
+      const xs: string[] = [self]
+      return xs[0]
+    }
+    print(g(6))
     // vl check rc 0. vl run:
     //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found i32
 
-* **IT IS D561 AT A DIFFERENT NODE, AND D561's LANDING DOES NOT REACH IT.** The `return r` is
-  clean by construction — `r`'s declared type is the hole `T`, which substitutes to `string`
-  at the pin and matches the declared return exactly, so `validateRetCstrs` has nothing to
-  complain about. The i32 entered at `const r: T = n + 1`, where `assignable(i32, T)` is
-  vacuous and NOTHING records the pair. Graded on all four D561 seeds (base, `ABL_ADD_R5`,
-  the newtype-exemption cut, and the landing): `check-clean invalid wasm` on every one.
+* **IT IS NOT D572 WITH A RUNG MISSING — THE SEAM IS ASKED AND ANSWERS YES.** `seedExpected`
+  contextually types the initializer against the annotation BEFORE it is checked, so the
+  array literal adopts `string[]` and `initTy` is `string[]` with no hole anywhere in it.
+  `assignableExpr(string[], string[])` is true, `noteLetCstr`'s gate sees no hole, and
+  nothing is recorded. The i32 is inside the literal, one level below the type the
+  destination compares. The direct spelling is a loud `cannot assign i32[] to 'xs' of type
+  string[]` — the literal's own element type, because there is no annotation to adopt.
 
-* **THE DIRECT TWIN IS LOUD AND IT IS A DIFFERENT SENTENCE FROM D561's.**
-  `const r: string = n + 1` is `cannot assign i32 to 'r' of type string` — the local-declaration
-  seam, not the return seam — so the pin this row wants is `checkConstDecl`'s, and a sixth
-  deferred table entry rather than a widening of the fifth.
+* **THE OBJECT LITERAL IS NOT SUBJECT TO THIS ROW, AND THAT SEPARATES THE TWO.** It was
+  silent on the base like everything else in D572's family, and D572 CLOSED it: `const b: Bx = { v:
+  self }` is a loud reject there (`cannot assign {v: i32} to 'b' of type Bx`), because
+  `assignableExpr`'s field-wise object-literal recursion compares the field and refuses, so
+  the mismatch survives as a type and D572's table records it. Routing the array literal
+  through an UN-annotated binding first also closes it — `const tmp = [self]  const xs:
+  string[] = tmp` is a loud reject on the landing — which is the executable proof that the
+  contextual adoption, not the seam, is the mechanism.
 
-* **IT IS ALSO THE REWRITE PEOPLE WILL REACH FOR, WHICH IS WHY IT MATTERS NOW.** Under
-  `ABL_ADD_R5`, `flat-generic-rows-branded.vl` builds again if `rowAt` is rewritten
-  `const r: A = self.base + i * R.size; return r` — measured, ten right values. That reads
-  like a legitimate coercion point and is not one: it launders the value through an
-  unchecked assignment, and the concrete twin `const r: A1 = …` is a loud
-  `` i32 doesn't fit in A1 — the conversion is lossy and must be made explicit with `as` ``.
-  Anyone who "fixes" a D561 reject this way has relocated it, not repaired it.
+* **BOTH SPELLINGS OF THE DESTINATION, and they are the same cell.** `const xs: string[] =
+  [self]` and `xs = [self]` are both silent for the one reason; the write seam adopts the
+  destination's element type exactly as the declaration seam does.
 
-* **THE FAMILY IS PROBABLY WIDER THAN TWO SEAMS.** Return and local declaration are the two
-  measured; a field write, an array element write and a re-assignment to an already-declared
-  hole-typed local are the obvious next places to look, and none has been graded. A grid over
-  the DESTINATION seam — the mirror of `retgrid.py`'s BODY seam — is what would say.
+* **THE ASK IS THE ELEMENT, NOT THE COLLECTION.** A fix records the ELEMENT pair
+  (`self`'s hole against the destination's element type) at the point the literal adopts the
+  annotation, and re-asks it under substitution — a per-element constraint, not a sixth
+  entry in D572's table, because the type the table would record has already agreed.
+
+---
+
+### D582 — a BUILTIN collection method's argument is never re-asked at the pin, because `argCstr` only covers a callee it can NAME
+**check-clean invalid wasm · found 2026-08-29 as the measured residue of D572's close · the
+second of the two destinations that survive it**
+
+Repro:
+
+    function g<T>(self: T): string {
+      const xs: string[] = []
+      xs.push(self)
+      return xs[0]
+    }
+    print(g(6))
+    // vl check rc 0. vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found i32
+
+* **THE DEFERRED ARGUMENT TABLE IS FOR DECLARED CALLEES.** `argCstrAt`/`argCstrExp` is
+  recorded from the user-function call path and adjudicated by `validateArgCstrs`; a builtin
+  method has no `FuncDecl`, so its argument check is the builtin's own arm and there is
+  nothing to defer. The direct spelling is a loud `push: cannot add i32 to string[]`, which
+  is that arm speaking — under a hole, `assignable(T, string)` waves the value past it and
+  the arm never fires.
+
+* **AT LEAST TWO BUILTINS, and the second has a different message.** `m.set("k", self)` into
+  a `{[string]: string}` is the same silent outcome beside a loud `set: expected string, got
+  i32`. Both are unmoved by D572's landing, which is what says the table cannot reach them.
+  (`xs.unshift` does not exist — `no method '.unshift' on array string[]` on every seed —
+  so the family's width is measured over the builtins that DO exist, not assumed.)
+
+* **IT IS THE SAME SHAPE AS D401, ONE CALLEE KIND OVER.** D401 is the deferred PRINT
+  capability, which exists precisely because `print` is not a declared callee either. A
+  builtin-argument constraint is the same construction: record the pair keyed on the builtin
+  and the argument position, re-ask it under `substTyDeep`.
+
 ---
 
 ### D531 — [CLOSED 2026-08-29] `binOpDefinedFor` mirrored `checkBinary`'s dispatch-arm ORDER at ONE arm of three, so eight operator OVERLOADS were refused at the pin
