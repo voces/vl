@@ -11,7 +11,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 ## Types & semantics
 
 - **A REACH PROBE ON ONE SITE MEASURES A NUMBER; IT DOES NOT MEASURE A CAUSE — PUT THE
-  SAME PROBE ON THE CALLERS** (2026-08-29, silent-class-inventory D501 / #PRNUM). D411's
+  SAME PROBE ON THE CALLERS** (2026-08-29, silent-class-inventory D501 / #2012). D411's
   close probed `letRefListDestSlot`, got `reach=0` on exactly the 28 cells that did not
   move, and filed a row whose whole content was that partition. The number reproduced
   EXACTLY on an independent rebuild — and the cause the row inferred from it
@@ -24,7 +24,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   wider probe: one extra tag per call site in the same build.**
 
 - **A SAFETY PROPERTY IS ONLY AS COMPLETE AS THE THINGS ITS SCAN CAN SEE** (2026-08-29,
-  D501 / #PRNUM). The arm pin's rule is *"every destination must agree"*, and it is right.
+  D501 / #2012). The arm pin's rule is *"every destination must agree"*, and it is right.
   Its holes are not in the rule: `dstPinMapValue` **skips** a map whose value spelling names
   no arm instead of pushing the `""` that every other leg pushes, there is no leg for a
   struct FIELD (measured as a loud floor for an OBJECT literal, which a LIST field is not),
@@ -34,7 +34,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   push* is a hole, where a leg that *pushes a decline* is not.
 
 - **A REFUSAL THAT NAMES TWO LAYERS HAS NOT NAMED EVERY LAYER** (2026-08-29,
-  silent-class-inventory D491 / #PRNUM). #2007 refuted a declaration-site rule (the same
+  silent-class-inventory D491 / #2012). #2007 refuted a declaration-site rule (the same
   generic operator dispatches at an object receiver) and a call-site rule (an unconstrained
   `T` is assignable from everything, so the reject spreads to `40 + 2` in another function)
   and concluded *"no positioned reject is available at either layer today"*. Both
@@ -47,7 +47,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   where the two halves MEET, not whether a third layer has both.**
 
 - **A ROW'S PROPOSED MECHANISM IS THE PART TO RE-MEASURE, EVEN WHEN THE ROW IS RIGHT TO
-  REFUSE** (2026-08-29, D491 / #PRNUM). The row's remaining candidate was the monomorphizer,
+  REFUSE** (2026-08-29, D491 / #2012). The row's remaining candidate was the monomorphizer,
   *"where a `<T>` pinned at `i32` becomes a concrete signature while the struct instantiation
   still has to dispatch"*. There is no `i32` instantiation: `dispatchRewrite` never rewrites
   `a + b` into a call, so `monoInstantiate` is not entered and the declaration is replaced by
@@ -58,7 +58,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   false reason attached, and the false reason is what the next person builds against.**
 
 - **NARROW A GATE BY THE POPULATION THAT BLOCKS, AND FILE THE POPULATION** (2026-08-29,
-  D491 / D521 / #PRNUM). D491's first cut keyed on "the `self` type carries a hole", which is
+  D491 / D521 / #2012). D491's first cut keyed on "the `self` type carries a hole", which is
   true of an UN-annotated `self` too — a parameter with no annotation is a fresh type
   variable. Measured, that costs 20 `runs` cells (`d425c001`..`d425c039` odd) whose recorded
   expectation is the BUILT-IN's `10`: the corpus calls them correct programs, so the gate

@@ -13196,8 +13196,10 @@ Repro (now a loud emit reject):
 * **THE FILED REACH PARTITION REPRODUCED, AND A SECOND PROBE SITE SAYS WHAT IT MEANS.** The
   row claimed `reach=0` at `letRefListDestSlot` on exactly the 28 unmoved cells and
   `reach=1` on exactly the other 75, and an independently rebuilt probe reads exactly that:
-  **89 of 103 cells enter it (68 with a kind-1 destination in hand, 21 without), and the 28
-  never do.** What the row inferred from that number — *"something upstream claims the
+  **75 of 103 cells enter it — the 68 with a kind-1 destination in hand plus the 7
+  `__none__` controls — and the 28 never do.** (89 is the CALL count, not the cell count:
+  a control is asked three times, once per caller, which is exactly the fact the next
+  bullet turns on.) What the row inferred from that number — *"something upstream claims the
   literal's element row … `arrLitCommitName` / `scanArrLitCommit` (D157/D163) is the first
   place to probe"* — is **wrong**, and the wrongness was visible only because the probe was
   put on the CALLERS as well as the callee. All three callers ARE entered for `lv1` in all
