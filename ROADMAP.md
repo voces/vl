@@ -674,11 +674,19 @@ in-language GC knobs.
   scheduling.** The four behaviours above are measured.
 
   It is LOUD, so it is a capability gap and not a silent class — but it bounds the whole
-  operator-declaration family (D444/D445/D471/D425/D491): today those rules only ever
-  matter in single-file programs. It is also why D491's landing is inert in module mode:
-  `isBinOpFuncName` declines a mangled name, so the imported declaration is neither
+  operator-declaration family (D444/D445/D471/D425/D491/D521/D541): today those rules only
+  ever matter in single-file programs. It is also why D491's landing is inert in module
+  mode: `isBinOpFuncName` declines a mangled name, so the imported declaration is neither
   refused nor dispatched, and the silent cell survives there. Measured as unchanged
   base -> landing.
+
+  **D521's landing is inert there for the SAME reason, and that was measured rather than
+  inherited** (#2014): prepend one unrelated `import` to `function "+"(self, other) { return
+  99 }` beside `print(a + b)` and it is `vl check` rc 0 printing 8 again, with an
+  instrumented compiler reading `bankUn=0` — the declaration is never banked, so the
+  whole-program verdict has nothing to refuse. Every row this list bounds should be checked
+  in module mode before its reach is described; this one behaves differently there and the
+  difference is the mangled name, not the rule.
 
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);

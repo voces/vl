@@ -1853,6 +1853,7 @@ let opIdxSiteFn: string[] = []
 // granularity at which a site and a declaration can be said to be about each other.
 let opBinHoleDeclName: string[] = []
 let opBinHoleDeclNode: i32[] = []
+let opBinHoleDeclAnn: boolean[] = []
 let opBinDispatched: string[] = []
 let opBinDeclined: string[] = []
 let inferStack: string[] = []
@@ -2988,6 +2989,7 @@ export function initChecker() {
   opIdxSiteFn = []
   opBinHoleDeclName = []
   opBinHoleDeclNode = []
+  opBinHoleDeclAnn = []
   opBinDispatched = []
   opBinDeclined = []
   moduleGlobals = Map()
@@ -3468,6 +3470,57 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
     )
   }
   0
+}
+
+// A BINARY OPERATOR DECLARED BELOW MODULE SCOPE CAN NEVER DISPATCH (D541), and it is
+// the twin of the check directly above: a definition that would never run, refused at
+// the definition rather than silently meaning something else at the site.
+//
+// EVERY OTHER GATE IN THIS FAMILY LIVES IN `checkProgram`'s PASS-1 TOP-LEVEL HOIST —
+// D444's arity, D445's index receiver, D471's `self` name, D425's `self` type, D491's
+// and D521's whole-program deadness — and the hoist walks `gRootStmts` only. So this
+// position escaped all five, and it is the same class at both `self` spellings and
+// at BOTH nestings: measured on `042624e1`, `function outer(): i32 { function "+"(self:
+// i32, other: i32): i32 { return 99 }  … return a + b }` is `vl check` rc 0 and prints
+// 10, and so is the same declaration inside a top-level `if true { … }` block. The
+// message names both, because `gRootStmts` membership is what is actually tested and a
+// block body is as far outside it as a function body is.
+//
+// IT IS DEAD AT EVERY RECEIVER, not just the ones D425 subtracts. `opSelfFnTy` resolves
+// through `lookup(op)`, and a nested `function "+"` is bound in its ENCLOSING scope by
+// `declareFnDeclNode` — a node table, not the type scope `lookup` reads — so an OBJECT
+// receiver in the same body is already the loud `operator '+' is not defined for V and
+// V`, positioned at the site and blaming the user for not declaring what they declared
+// three lines up. So there is no receiver for which a nested declaration fires, no cell
+// to preserve, and the reject can be unconditional: it is a POSITION rule, not a type
+// rule, which is why it needs neither the resolved `self` type nor the site bank.
+//
+// Zero cost, measured rather than assumed: no `.vl` anywhere under `tests/`, `std/`,
+// `compiler/` or the distilled corpus declares a binary operator below module scope.
+function checkNotNestedBinOpDecl(name: string, at: i32) {
+  if !isBinOpFuncName(name) { return 0 }
+  if isTopLevelStmt(at) { return 0 }
+  tErr(
+    "operator `" +
+      name +
+      "` can never dispatch: a binary operator must be declared at MODULE SCOPE, and " +
+      "this one is nested inside a function body or block — move it to the top level",
+    at,
+  )
+  0
+}
+
+// Is `ix` one of the program's own TOP-LEVEL statements? `gRootStmts` is the `Program`
+// node's statement list, stamped at the head of `checkProgram`, so this is the exact
+// population the pass-1 hoist walks rather than a scope-depth heuristic. Scanned only
+// for an operator-named declaration, which is why a linear walk is the right shape.
+function isTopLevelStmt(ix: i32) {
+  let i = 0
+  while i < gRootStmts.length {
+    if gRootStmts[i] == ix { return true }
+    i = i + 1
+  }
+  false
 }
 
 // ── scope chain ──────────────────────────────────────────────────────────────
@@ -17808,15 +17861,24 @@ function tyDenotesObj(ty: i32) {
 // DERIVED FROM THE DISPATCH GATE, not restated beside it, for the reason D445's
 // `opIdxDeadRecv` is routed through `tyBuiltinIndexable`: the set refused here is
 // by construction the complement of the set `checkBinary` dispatches over, so the
-// reject and the swallow cannot drift. Three annotations are subtracted, each one
-// measured DISPATCHING today and so a false reject if it were included:
-//   - an UN-ANNOTATED `self` (`ty < 0`), the spelling
-//     `tests/cases/objects/operator-self-method.vl` uses;
-//   - anything carrying a HOLE — `function "+"<T>(self: T, other: T)` is silent at
-//     an i32 site and DISPATCHES at an object one, so the type variable is decided
-//     per call site and not here;
+// reject and the swallow cannot drift. TWO shapes are subtracted, each measured
+// DISPATCHING today and so a false reject if it were included:
+//   - anything carrying a HOLE. This is BOTH `function "+"<T>(self: T, other: T)`
+//     AND the un-annotated `function "+"(self, other)`: a parameter with no
+//     annotation hoists through `unannotParamTy` -> `mkTyVar`, so it is a type
+//     VARIABLE and `tyHasHole` is true of it. Either way the type is decided per
+//     call site and not here — silent at an i32 site, DISPATCHING at an object one.
 //   - the ERROR type, already reported at the annotation, where a second
 //     diagnostic would be noise on a line that already has one.
+//
+// THE `ty < 0` GUARD IS A BOUNDS CHECK, NOT A THIRD SUBTRACTION, and the comment
+// that called it one was wrong for as long as D521 was open (corrected #2014). It
+// named the un-annotated `self` as its case, which made the two spellings look
+// distinguished HERE when they are not distinguished here at all — the only thing
+// that separates them is `selfAnn`, the `parType >= 0` test at the call site below.
+// Measured with an instrumented compiler over the whole operator fixture set: this
+// arm is taken ZERO times, including on `operator-self-method.vl`, the very file it
+// claimed to be about, which reads `neg=0 hole=1`.
 function binOpDeadSelf(ty: i32) {
   if ty < 0 { return false }
   if tyHasHole(ty) { return false }
@@ -19891,10 +19953,15 @@ function checkProgramEndOpDecls() {
     const nm = opBinHoleDeclName[i]
     if !listHasStr(opBinDispatched, nm) {
       if listHasStr(opBinDeclined, nm) {
+        let why = "`self` has NO ANNOTATION, so its type is inferred and whether it fires is "
+        if opBinHoleDeclAnn[i] {
+          why = "`self` is a TYPE PARAMETER, so whether it fires is "
+        }
         tErr(
           "operator `" +
             nm +
-            "` never dispatches: `self` is a TYPE PARAMETER, so whether it fires is " +
+            "` never dispatches: " +
+            why +
             "decided at each site — and every `" +
             nm +
             "` site in this program took the language's own lowering. Annotate `self` " +
@@ -20203,6 +20270,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // that silently means something else. Anchored on the decl node, so the pass-1 hoist
   // and this pass report the SAME (message, anchor) pair and `tErrCoded` dedups them.
   checkNotEmitterIntrinsic(n.fnName, fnIx)
+  checkNotNestedBinOpDecl(n.fnName, fnIx)
   // Bind the name to THIS declaration node in the ENCLOSING scope (the body's
   // own scope is pushed further down), so a call inside that scope can recover
   // the parameter list — and its DEFAULTS. A top-level function is already
@@ -22494,21 +22562,27 @@ function checkProgramNode(n: Program) {
               // this declaration ever fires is decided at the SITES, so the answer is
               // `checkProgramEndOpDecls`' and not this pass's.
               //
-              // THE ANNOTATION IS REQUIRED, AND THE 20 CELLS IT COSTS ARE WHY (D521).
-              // `binOpDeadSelf` subtracts THREE annotations and the un-annotated `self`
-              // is its own subtraction, separate from the hole: `function "+"(self,
-              // other)` types its parameter as a fresh type VARIABLE, so it carries a
-              // hole too and the wider bank claims it. Measured, that costs 20 `runs`
-              // cells (`d425c001`..`d425c039` odd, in `named/` with the built-in's `10`
-              // recorded as their expectation) and it is a different ruling — the
-              // spelling with no annotation at all is filed as D521 with that price,
-              // not smuggled in under this row.
-              if selfAnn {
-                if hpt[0] >= 0 {
-                  if tyHasHole(hpt[0]) {
-                    opBinHoleDeclName.push(s.fnName)
-                    opBinHoleDeclNode.push(stmts[hi])
-                  }
+              // BOTH HOLE SPELLINGS ARE BANKED, AND THE PRICE OF THE SECOND WAS PAID
+              // (D521, #2014). `function "+"(self, other)` hoists its parameter as a
+              // fresh type VARIABLE, so `tyHasHole` is true of it exactly as it is of
+              // `self: T` — the two are ONE population to every test above, and the
+              // `parType >= 0` narrowing that used to sit here was a corpus decision,
+              // not a type one. It cost 20 `runs` cells (`d425c001`..`d425c039` odd,
+              // in `named/` with the BUILT-IN's `10` recorded as their expectation, so
+              // the standing gate scored them as correct programs). Re-measured on
+              // `042624e1` the price was exactly that and nothing else, and every one
+              // of the 20 printed a value its own source contradicts — so the veto was
+              // overridden rather than disputed, executably, by
+              // `scripts/silent-sweep/d521/unannotgrid.py --price`.
+              //
+              // `selfAnn` SURVIVES AS THE MESSAGE'S DISCRIMINATOR, banked rather than
+              // judged: a declaration with no type parameter must not be told that
+              // `self` is one.
+              if hpt[0] >= 0 {
+                if tyHasHole(hpt[0]) {
+                  opBinHoleDeclName.push(s.fnName)
+                  opBinHoleDeclNode.push(stmts[hi])
+                  opBinHoleDeclAnn.push(selfAnn)
                 }
               }
             }
