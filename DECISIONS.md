@@ -2263,3 +2263,97 @@ for a declaration that is entirely about an object. **D402's root is a prerequis
 neighbour** — which is why D425 stays open with a price rather than closing with a patch, and
 why D444 does not: its predicate is arity plus the operator name, both of which the parser
 already has.
+
+
+---
+
+## A MIRROR is a claim about ORDER as well as about predicates (D492, D493)
+
+`binOpDefinedFor`'s header has said, since it was written, that it "Mirrors `checkBinary`'s
+accepted forms". For the integer-only family it mirrored neither the predicate nor the order,
+and the two failures had different outcome classes — which is why D492 and D493 were two rows
+and one edit.
+
+**The predicate half.** `checkBinary` rejects `& | ^ << >> >>>` and `%` on a float operand in
+one arm, under a comment beginning "BITWISE / SHIFT / REMAINDER are INTEGER-ONLY" and a 12-line
+rationale for why float remainder cannot be lowered by the `a - trunc(a / b) * b` identity. The
+pin's copy of that rule had `%` in the plain arithmetic arm asking `isNumeric` alone (true of
+`f64`, D493) and had no arm at all for the six bitwise/shift names, which therefore fell to the
+function's documented `true` tail (D492). **The rule was written twice and one copy was wrong.**
+`binIntOnlyOp` and `binFloatOperandPair` now hold it once, read by `checkBinary`'s reject and by
+the pin's mirror, so adding an operator to the family reaches both sites or neither.
+
+**The blocker was the row's own false sentence, and it is the transferable part.** D492 refused
+to take the fix because modelling `^` "means deciding what `^` IS … a statement about the
+language a defect row should not make on its own". That sentence is what kept the row open, and
+it was wrong: `checkBinary` had already decided, in writing, with a rationale. **When a row
+declines a fix as a language question, check whether some other layer has already answered it —
+a mirror that is out of date is not a design decision waiting to be made.** The cost of the
+mistake was one PR, and the same mistake in the other direction (taking a real language question
+in passing) would have been worse, so the check is the cheap half of the discipline rather than
+an argument against caution.
+
+**The ORDER half, which a predicate-only mirror gets wrong.** `checkBinary` reaches the
+integer-only rule only AFTER its operator-dispatch arm, so an object receiver with a `^`
+overload is decided there and never asks this question — and it lowers: a
+`function "^"(self: V, other: V)` at a pinned hole prints its own answer today. A mirror that
+copies the predicate and not the position is a FALSE REJECT for those programs, and the ablation
+priced it at 6 grid cells. This is the second time this exact shape has been recorded in this
+one function: the `+` arm carries a comment explaining that it must read the UNSOFTENED types
+because `checkBinary` softens AFTER its string and array arms (D44). **Two arms, same lesson —
+mirroring a decision procedure means mirroring where in it the question is asked.**
+
+`objOpDispatchTy` is that deferral, and its shape is deliberate. `checkBinary` asks
+`opSelfFnTy`, which takes the right operand's NODE index, emits diagnostics and can re-enter
+`checkNode` — none of which belongs in a pure predicate. So the deferral asks the same two
+routes (a free `self`-function whose first parameter is named `self`, or an operator FIELD) from
+TYPES ALONE, and stops before every condition that exists only to produce a diagnostic. That
+makes it **deliberately the weaker question — "a dispatch is available", not "the dispatch
+type-checks" — and the asymmetry is the whole justification**: a false TRUE leaves a cell exactly
+as silent as it already was, a false FALSE is a check reject for a program that runs. When a
+pure predicate has to approximate an impure one, approximate in the direction whose errors are
+the ones you already have.
+
+### #2007's runner-up predicate was right about the danger and wrong about the conclusion
+
+The parent PR rejected `binOpDefinedFor` as D425's reject-gate because "gating the reject on it
+refuses `function "^"(self: V, other: V)` over a struct — which dispatches today". That
+observation is correct and it is exactly the veto this landing had to route around. What did not
+follow is that the predicate was therefore unfixable: the polarity problem is a property of
+using it as a REJECT gate for a different question, not of the predicate. Reading the same six
+lines with the opposite question — what is this default currently ANSWERING? — produced D492 and
+D493; measuring what a naive fix would cost produced `objOpDispatchTy`. **A predicate that is
+wrong to reuse can still be wrong on its own terms, and those are two separate readings.**
+
+### The census cannot see this family, and that is checkable rather than probable
+
+`gencensus.py` emits exactly ONE generic declaration across all 250,238 cells —
+`function idg<T>(x: T): T { return x }` — and its body contains no binary operator. So no census
+cell records a deferred constraint, none reaches `binOpDefinedFor`, and block D (9,000 cells,
+graded on both compilers) and the distilled corpus (1,477 representatives) each moved zero cells
+at this landing. **A zero from a population that structurally cannot contain the family is not
+evidence of safety, and the difference is one `grep` away** — `grep -n "<T>" gencensus.py` is one
+line. Report the grep beside the zero; a reader who sees only the zero will read it as coverage.
+
+### The price, and why the override holds
+
+36 cells went `runs` → loud check reject: the bitwise and shift operators over `boolean` and over
+a string literal union, through a type parameter. They ran on the REPRESENTATION rather than on a
+rule — `true ^ false` printed `true` because the boolean rep is an i32, and `"b" ^ "a"` printed
+`a` because the literal union rides two interning indices and `i32.xor` of them lands on a member
+— while the direct spelling of every one of them has always been
+`operator '^' is not defined for boolean and boolean`. There is no spelling in which a programmer
+could have chosen this behaviour; it was reachable only by writing the operand type as a type
+parameter. The override is `pingrid.py --price`, which asserts per cell that (a) it ran, (b) its
+direct twin is loud, and (c) the twin's refusal names that operator — 36 of 36, and a cell whose
+twin RUNS would be a veto rather than a price.
+
+### A grid axis can hide a `runs` cell, and the absence looks identical to safety
+
+The grid's cells come in two BODY shapes: `bind` writes the operator's result to an unused local
+and returns a constant, `ret` returns the result. They were expected to be equivalent. They are
+not: with an operator overload on the left operand, `bind` RUNS and prints the declaration's
+answer while `ret` is check-clean invalid wasm. A one-shape grid would have reported the veto
+cell as absent — with `ret` only it never appears, and with `bind` only the residue never does.
+**When two spellings of "the same" program are available and cheap, run both; a grid reports a
+missing axis as a clean column.**

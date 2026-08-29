@@ -16428,11 +16428,77 @@ function noteBinCstr(lt: i32, op: string, rt: i32) {
   0
 }
 
+// THE INTEGER-ONLY OPERATORS — the bitwise ops, the shifts, and `%`. ONE list, read by
+// `checkBinary`'s reject and by `binOpDefinedFor`'s pin mirror, because those are the two
+// homes that have to agree about it and they drifted apart precisely by holding the list
+// twice: `checkBinary` had all seven names and the pin had none of them (D492's `^`) or the
+// wrong half of the rule (D493's `%`). A shared predicate makes the mirror STRUCTURAL —
+// adding an operator to the family now reaches both sites or neither.
+function binIntOnlyOp(op: string) {
+  op == "&" ||
+    op == "|" ||
+    op == "^" ||
+    op == "<<" ||
+    op == ">>" ||
+    op == ">>>" ||
+    op == "%"
+}
+
+// Is either operand a FLOAT primitive? The other half of the integer-only rule, in one home
+// for the same reason. `f32` and `f64` both, and asked of the SOFTENED types at both call
+// sites so a float literal union answers as its base scalar.
+function binFloatOperandPair(lt: i32, rt: i32) {
+  primNameOf(lt) == "f64" ||
+    primNameOf(lt) == "f32" ||
+    primNameOf(rt) == "f64" ||
+    primNameOf(rt) == "f32"
+}
+
+// Does an OBJECT left operand have an operator dispatch for `op` — either of the two routes
+// `checkBinary`'s dispatch arm takes BEFORE it ever reaches the numeric tail (a free
+// `self`-function named for the operator, or an operator FIELD on the object)? Asked from
+// TYPES ALONE, because `binOpDefinedFor` is a pure predicate: `opSelfFnTy` takes the right
+// operand's NODE index, reports diagnostics and can re-enter `checkNode`, and none of that is
+// available or wanted here.
+//
+// SO THIS IS DELIBERATELY THE WEAKER QUESTION — "a dispatch is available", not "the dispatch
+// type-checks" — and the asymmetry is the point. A false TRUE leaves a cell exactly as silent
+// as it is today; a false FALSE is a check reject for a program that RUNS. `assignable` is
+// asked in the direction `opSelfFnTy` asks it, and every other condition it applies before
+// its first diagnostic is mirrored; the ones that only produce diagnostics are not.
+function objOpDispatchTy(op: string, lt: i32) {
+  const ot = T.tys[lt]
+  if ot is TyObj {
+    if objFieldType(ot, op) >= 0 { return true }
+  } else {
+    return false
+  }
+  const fnTy = lookup(op)
+  if fnTy < 0 { return false }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length != 2 { return false }
+    const dIx = fnDeclIx[op] ?? -1
+    if dIx < 0 { return false }
+    const d = P.nodes[dIx]
+    if d is FuncDecl {
+      if d.fnParams.length == 2 {
+        const p0 = P.nodes[d.fnParams[0]]
+        if p0 is Param {
+          if p0.parName == "self" { return assignable(lt, ft.fnParamTypes[0]) }
+        }
+      }
+    }
+  }
+  false
+}
+
 // Whether the EMITTER can lower `lt op rt` for two CONCRETE operand types — the soundness criterion
 // the generic call-site checks after substituting a hole to its argument type. A still-unresolved
 // operand (`TyVar`, a nested generic) DEFERS (true — the outer call validates it). Mirrors
-// `checkBinary`'s accepted forms; an operator OVERLOAD (`opSelfFnTy`) would also satisfy it but does
-// not yet lower, so it stays a clean reject. Operators not modelled here return true (no false
+// `checkBinary`'s accepted forms; an operator OVERLOAD (`opSelfFnTy`) satisfies it only through the
+// integer-only arm's `objOpDispatchTy` deferral, and stays a clean reject at the arithmetic and
+// ordering arms, which is where it does not lower. Operators not modelled here return true (no false
 // reject — they keep today's behaviour).
 function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   const lt = softenLitTy(lt0)
@@ -16491,8 +16557,28 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     }
     return isNumeric(lt) && isNumeric(rt)
   }
-  if op == "-" || op == "*" || op == "/" || op == "%" {
+  if op == "-" || op == "*" || op == "/" {
     return isNumeric(lt) && isNumeric(rt)
+  }
+  if binIntOnlyOp(op) {
+    // THE INTEGER-ONLY FAMILY, mirroring `checkBinary`'s ORDER and not only its predicates.
+    // `%` reached the arithmetic arm above and asked `isNumeric` alone, which is TRUE of
+    // `f64` — so `function g<T>(a: T, b: T) { return a % b }` pinned at `f64` was accepted
+    // here and rejected by the EMITTER (D493), where the direct spelling is a positioned
+    // checker error. `^ & | << >> >>>` were not modelled at all and fell to the `true` at
+    // the bottom, so `a ^ b` pinned at `string` was accepted here and emitted an i32 opcode
+    // over two refs: check-clean INVALID WASM (D492). One family, one rule, both closed.
+    //
+    // THE OBJECT DEFERRAL IS THE ORDER HALF, and without it the mirror is a FALSE REJECT.
+    // `checkBinary` reaches its integer-only rule only AFTER the operator-dispatch arm, so an
+    // object receiver with a dispatch is decided there and never asks this question — and it
+    // really does lower: `function "^"(self: V, other: V)` dispatches through a pinned hole
+    // and prints its own answer on today's compiler. Six cells of `d492/pingrid.py` prove
+    // that, and a blanket `is TyObj` reject would have taken all six. This is the same
+    // mistake the `+` arm above records for softening ORDER (D44), one arm down.
+    if objOpDispatchTy(op, lt) { return true }
+    if !isNumeric(lt) || !isNumeric(rt) { return false }
+    return !binFloatOperandPair(lt, rt)
   }
   if op == "<" || op == ">" || op == "<=" || op == ">=" {
     if isStringTy(lt) && isStringTy(rt) { return true }
@@ -29754,21 +29840,13 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   // shift-and-subtract helper, and when it lands it belongs where every other float
   // operation with no operator spelling already lives — a float intrinsic, beside
   // `sqrt`/`trunc`/`copysign`. Until then this rejects, which stays correct either way.
-  if (
-    op == "&" ||
-    op == "|" ||
-    op == "^" ||
-    op == "<<" ||
-    op == ">>" ||
-    op == ">>>" ||
-    op == "%"
-  ) {
-    if (
-      primNameOf(lt) == "f64" ||
-      primNameOf(lt) == "f32" ||
-      primNameOf(rt) == "f64" ||
-      primNameOf(rt) == "f32"
-    ) {
+  //
+  // THE FAMILY AND THE FLOAT TEST ARE `binIntOnlyOp` / `binFloatOperandPair`, shared with
+  // `binOpDefinedFor`'s pin mirror rather than spelled out twice here. They were written
+  // twice, and the copy at the pin had none of these names (D492) and the wrong half of the
+  // rule for `%` (D493). Same behaviour at this site, one home for the rule.
+  if binIntOnlyOp(op) {
+    if binFloatOperandPair(lt, rt) {
       tErr(
         "operator '" +
           op +
