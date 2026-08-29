@@ -13352,11 +13352,17 @@ Repro:
   `tests/cases/objects/operator-self-method.vl` declares `function +(self, b)` and every
   binding in it is a module global. One position, and the fixture sat at the working one —
   the same shape D188's table had, which is what #1995 records for D362.
-* **THE ROOT IS A PASS-ORDER QUESTION, NOT A CLASSIFIER GAP.** `drwWalk`'s dispatch arm gates
-  on `structIndexOfExpr(n.binLeft, ctx) >= 0`, and that function's `Ident` arm knows a PARAM
-  (`paramStructIndex`), a module-declared binding (`declaredStructIndex`, off the local slot
-  table), a GLOBAL and a CAPTURE. A function-body local's slot is minted by the emit pass
-  that runs AFTER this rewrite, so the table is empty when the question is asked.
+* **THE ROOT IS A PASS-ORDER QUESTION, NOT A CLASSIFIER GAP, and the ordering is checkable
+  rather than inferred.** `drwWalk`'s dispatch arm gates on
+  `structIndexOfExpr(n.binLeft, ctx) >= 0`, and that function's `Ident` arm has four rungs:
+  `paramStructIndex` (AST-backed, answers), `declaredStructIndex` (the EMIT pass's local slot
+  table — `localNames` / `localStructIdx`, which `buildLocals` resets and fills per function
+  during body lowering), `globalStructIndexSid` (a module-scope table built earlier, answers)
+  and `capturedStructIndex` (answers). `dispatchRewrite` is a NAMED PASS whose own recorded
+  ordering constraint is `dispatchRewrite > buildFnMap computeRetInference`, and body lowering
+  is downstream of all of them — so at the moment the rewrite asks, the local slot table is
+  the one thing in that ladder that has not been built. Three rungs answer and the fourth
+  cannot, which is exactly the set of deliveries the grid separates.
 * **THE SEVERITY SPLITS BY RESULT TYPE, which is why half of it was invisible.** Over an
   80-cell grid (operator × quoted-vs-symbol-token name × annotated-vs-bare parameters ×
   receiver), a function-body-local receiver gives:
