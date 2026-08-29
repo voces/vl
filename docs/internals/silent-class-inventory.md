@@ -14762,8 +14762,8 @@ Repro:
 was `check-clean invalid wasm` · found 2026-08-28 while pricing D425's rejected runner-up
 predicate (#2007), by asking what `binOpDefinedFor` answers for an operator it does not model ·
 the UNMODELLED half of the pair D493 is the modelled half of · ONE edit closed both, measured
-rather than inherited · 630 files of `scripts/silent-sweep/d492/pingrid.py` kept whole in
-`distilled/named/`**
+rather than inherited · 315 cells of `scripts/silent-sweep/d492/pingrid.py` and their DIRECT
+twins kept whole in `distilled/named/` (525 distinct files — one twin serves two deliveries)**
 
 Repro (now a loud check reject):
 
