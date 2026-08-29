@@ -14863,44 +14863,161 @@ Repro (now a loud check reject):
 
 ---
 
-### D521 — an UN-ANNOTATED `self` is the same dead binary operator declaration as D491's generic one, and closing it costs 20 running cells
-**check-clean silently wrong · found 2026-08-29 closing D491, as the population the narrowed rung deliberately does not take · 20 cells already in `distilled/named/` as `d425c001`…`d425c039` odd, whose recorded expectation is the BUILT-IN's answer**
+### D521 — [CLOSED 2026-08-29] an UN-ANNOTATED `self` is the same dead binary operator declaration as D491's generic one, and the 20-cell price was re-measured and PAID
+**now a loud check reject at the declaration's own line · was `check-clean silently wrong` · the row's price claim was RE-MEASURED on `042624e1` and is exactly right — 20 cells, `d425c001`…`d425c039` odd, nothing else moved · the row's "what is missing is the RULING" is the one claim that was WRONG: the index side of the same family already rules on this spelling · 0 dispatch cells lost, measured over a 160-cell grid**
 
-Repro:
+Repro (now a loud check reject):
 
     function "+"(self, other) { return 99 }
     const a: i32 = 7
     const b: i32 = 1
     print(a + b)
-    // vl check rc 0 (two unused-parameter warnings). The declared operator returns 99
-    // unconditionally, so a dispatch would print 99.
-    // PRINTS 8
+    // was: vl check rc 0 (two unused-parameter warnings), PRINTS 8 — the declared
+    //   operator returns 99 unconditionally, so a dispatch would print 99.
+    // Now: operator `+` never dispatches: `self` has NO ANNOTATION, so its type is
+    //   inferred and whether it fires is decided at each site — and every `+` site in
+    //   this program took the language's own lowering. …
 
-* **IT IS D491's CELL WITH THE ANNOTATION DELETED, AND THE COMPILER CANNOT TELL THEM
-  APART BY TYPE.** An un-annotated parameter is typed as a fresh type VARIABLE, so
-  `tyHasHole` is true for it exactly as it is for `self: T` — which is why D491's first
-  cut claimed this population too, and why the narrowing is a `parType >= 0` test on the
-  Param node rather than a type test. `binOpDeadSelf` lists the un-annotated `self` as its
-  OWN subtraction, separate from the hole, so the two are already distinguished at the
-  gate this row would extend.
+* **THE FILED PRICE IS REAL AND IT WAS RE-MEASURED BEFORE IT WAS PAID.** The number was
+  several merges old and it was the only thing holding the row open, so the wider
+  candidate was rebuilt on `042624e1` and re-graded: **exactly the 20**
+  (`d425c001`, `c003` … `c039`), `runs` -> `loud check reject`, **0 into any silent
+  class, 0 other movement**, corpus `cmp` 2,408 modules · 0 DIFFER with the only two
+  `LOST` being this change's own must-error fixtures. Two rows this week were refused on
+  prices that had evaporated; this one had not.
 
-* **THE PRICE IS MEASURED, NOT ESTIMATED: 20 `runs` cells.** The wider candidate was built
-  and graded. `d425c001`, `d425c003` … `d425c039` — the odd half of D425's own named set,
-  `function "+"(self, other) { return 99 }` beside `return a + b` at i32 — go `runs` ->
-  `loud check reject`, and `regress.py` **blocks** on them: their manifest expectation is
-  `10`, the BUILT-IN's answer, so the standing corpus records them as correct programs.
-  That is the difference from D491's 19, whose expectation is the DECLARATION's answer and
-  which the gate therefore never scored as `runs`.
+* **IT IS OVERRIDDEN, NOT DISPUTED, AND THE OVERRIDE IS EXECUTABLE.**
+  `python3 scripts/silent-sweep/d521/unannotgrid.py --price <seed>` re-runs every lost
+  cell beside its own do-nothing control and asserts (a) it ran, (b) its output equals
+  the control's — the declaration contributed nothing — and (c) its output DIFFERS from
+  the declaration's own answer, so the program was printing a value its own source
+  contradicts. All three hold for all 60 price cells (D521's 20 plus D541's 40), and the
+  check FAILS on an empty population in either half.
 
-* **THE OVERRIDE TERMS DO HOLD, WHICH IS WHY THIS IS A ROW AND NOT A REFUSAL.** Each of the
-  20 ran only because its own declaration was dead — it prints `10` where its own source
-  says `99`, so it is a WRONG value, not a right one. What is missing is not the argument
-  but the RULING: `tests/cases/objects/operator-self-method.vl` is written in exactly this
-  spelling and dispatches, so the language currently treats "no annotation" as the ordinary
-  way to write an operator, and D425's row records the subtraction as deliberate. Deciding
-  that an un-annotated `self` must also be refused when no site takes it is a language
-  decision with a corpus cost, and it belongs to whoever makes it — with the 20 cells and
-  their recorded `10` as the thing to re-record.
+* **FOUR OF THE TWENTY ARE BLIND, AND THE CHECK SAYS SO RATHER THAN COUNTING THEM.**
+  `d425c033`/`c035`/`c037`/`c039` are `>` and `>=` at `1, 2` — natively `false`, with
+  bodies that also return `false` — so their own stdout cannot separate dispatch from
+  inert. That is the older ledger's axes failing the do-nothing rule `d471/opdeclgrid.py`
+  later mechanised. Term (c) is still decidable for them and it is decided by RUNNING a
+  distinguishing TWIN (the same program returning `true`, measured inert), reported in
+  its own column. The new grid uses `7, 1` and **0 of its 160 cells are blind**.
+
+* **A SECOND FILED CLAIM IS FALSE, AND IT IS IN THE COMPILER'S OWN COMMENT.** The row
+  said *"`binOpDeadSelf` lists the un-annotated `self` as its OWN subtraction, separate
+  from the hole, so the two are already distinguished at the gate this row would
+  extend"*, quoting that function's header, which names an UN-ANNOTATED `self` (`ty < 0`)
+  as one of three subtractions. **That arm is never taken.** An un-annotated parameter
+  hoists through `unannotParamTy` -> `mkTyVar`, which is a real arena index, so the
+  spelling is subtracted by `tyHasHole` — the SAME test as the type parameter — and the
+  two were never distinguished there at all. Instrumented and measured over the whole
+  operator fixture set, including `operator-self-method.vl`, the file the comment claims
+  to be about: `neg=0` everywhere, `hole=1` where a hole exists. The only thing that ever
+  separated the spellings is `selfAnn`, the `parType >= 0` test at the bank. Comment
+  corrected in the same change.
+
+* **THE ROW'S "WHAT IS MISSING IS THE RULING" IS THE FALSE CLAIM, AND THE RULING ALREADY
+  EXISTS ONE OPERATOR FAMILY OVER.** `tests/cases/index/operator-unannotated-self.vl` is
+  a shipped must-error fixture: *an index operator needs an annotated `self` parameter*,
+  because "an un-annotated `self` is an inference hole that would accept every receiver".
+  The language already refuses this spelling OUTRIGHT on the index side. What landed here
+  is strictly weaker — the declaration is refused only when **no site dispatched to it
+  while at least one took the built-in** — so it is not a new language decision, it is
+  D491's decision with its `parType >= 0` narrowing removed.
+
+* **`operator-self-method.vl` IS SPARED BY THE SITE BANK, NOT BY THE DECLARATION GATE,
+  AND THAT DISTINCTION IS MEASURED.** The row worried that the tree's own un-annotated
+  operator fixture makes this spelling ordinary. It does, and it keeps dispatching — but
+  on an instrumented compiler it BANKS exactly like the cells that are refused
+  (`bankUn=1` on both the fixture and the repro above); what separates them is entirely
+  the CALLER column, `siteTake=3` against `siteTake=0`. Probing only the declaration
+  would have read the two as one cell. The same probe reads the 20 refused cells as
+  `bankUn=1 siteTake=0 siteDecl=1 endUn=1` — reach and answer, both channels.
+
+* **0 DISPATCH CELLS LOST, over a grid that crosses the axis both ways.**
+  `scripts/silent-sweep/d521/unannotgrid.py` is 160 cells — 10 operators x 2 name
+  spellings x annotated/un-annotated `self` x top-level/nested x i32/object receiver,
+  each with its own do-nothing control. Base: `dispatch=40, inert=60, loud=60`. Landing:
+  `dispatch=40, inert=0, loud=120`. **The 40 dispatching cells are the same 40**, and 20
+  of them are un-annotated `self` at an object receiver — the population this rung is
+  licensed to spare, now kept whole in `named/` as `d521-unannot-self-dispatch` with a
+  control that is LOUD at all ten operators, so they run only because the declaration
+  fired.
+
+* **THE LANDING IS INERT IN MODULE MODE, measured, exactly as D491's is.** Prepend one
+  unrelated `import` to the repro and it is `vl check` rc 0 printing 8 again, with the
+  probe reading `bankUn=0`: `driver.vl`'s rename map mangles the declaration to `+$mN`,
+  `isBinOpFuncName` declines the mangled name, and nothing is banked. That is
+  ROADMAP **A-OPMOD**, which bounds this whole family, and it is why the silent cell
+  survives there.
+
+* **THE DISASSEMBLY SAYS THE SAME THING FROM THE EMITTER'S END.** On the base seed the
+  repro's declaration is `(func $0 (type $2))` — empty and void, the prune stub — and the
+  site emits `(i32.add …)` with no `call` anywhere. Its object twin, the SAME
+  un-annotated declaration, is `(func $0 (param (ref $1) (ref $1)) (result i32) (return
+  (i32.const 99)))` and the site is `(call $0 …)`. The receiver is what decides, which is
+  why no declaration-site rule can be right for both and why the verdict has to be read
+  at the end of `checkProgram`.
+
+Fixture: `tests/cases/objects/error-operator-unannot-self-never-dispatches.vl`.
+Grid: `scripts/silent-sweep/d521/unannotgrid.py` (`--verify` proves the grid is
+distinguishing and that it regenerates the 40 legacy `d425c*` cells byte-for-byte).
+
+---
+
+### D541 — [CLOSED 2026-08-29] a binary operator declared INSIDE A FUNCTION BODY escaped every gate in the family, because all five live in the top-level hoist
+**now a loud check reject at the declaration's own line · was `check-clean silently wrong` · found 2026-08-29 closing D521, by asking where the family's gates actually run · 40 cells in `distilled/named/` as `d521_*_nest_i32_*`, a price the standing corpus cannot carry**
+
+Repro (now a loud check reject):
+
+    function outer(): i32 {
+      function "+"(self: i32, other: i32): i32 { return 99 }
+      const a: i32 = 8
+      const b: i32 = 2
+      return a + b
+    }
+    print(outer())
+    // was: vl check rc 0, PRINTS 10 — the built-in's answer, not the declaration's 99.
+    // Now: operator `+` can never dispatch: a binary operator must be declared at
+    //   MODULE SCOPE, and this declaration is nested inside a function — move it to
+    //   the top level
+
+* **FIVE GATES, ONE POSITION, AND NONE OF THEM LOOK AT IT.** D444's arity, D445's index
+  receiver, D471's `self` name, D425's `self` type and D491/D521's whole-program deadness
+  are all raised from `checkProgram`'s pass-1 hoist, and that hoist walks `gRootStmts` —
+  the `Program` node's own statement list. A `function "+"` one level down is not in it,
+  so the nested position was outside all five at **both** `self` spellings and at every
+  receiver. Measured on `042624e1`: 40 of the grid's cells are `runs` and silently wrong.
+
+* **IT IS DEAD AT EVERY RECEIVER, WHICH IS WHY THE REJECT NEEDS NO TYPE.** `opSelfFnTy`
+  resolves the operator through `lookup(op)` on the type scope; a nested declaration is
+  recorded by `declareFnDeclNode` into a node table instead, so an OBJECT receiver three
+  lines below it is already the loud `operator '+' is not defined for V and V` —
+  positioned at the site and blaming the reader for not declaring what they just
+  declared. So there is no receiver for which a nested declaration fires, no cell to
+  preserve, and the rule is a POSITION rule rather than a type rule. The disassembly
+  agrees: the nested declaration compiles to an empty closure body
+  `(func $1 (param structref))` that nothing calls, while the site emits `i32.add`.
+
+* **THE PRICE IS 40 GRID CELLS AND ZERO CORPUS CELLS, AND THAT IS THE REASON TO WRITE IT
+  DOWN.** No `.vl` under `tests/`, `std/`, `compiler/` or the distilled corpus declares a
+  binary operator below module scope — so the standing gate is BLIND to this price and a
+  later lift would pay it back invisibly. The 40 are in `named/` whole as
+  `d541-nested-operator-declaration`, each with the DECLARATION's answer recorded, so a
+  lift that makes them dispatch grades `runs` and one that makes them inert again grades
+  `runs but wrong value` rather than quietly reading `runs`.
+
+* **THE NESTED INDEX OPERATOR IS NOT IN THIS CLASS, AND THAT IS MEASURED RATHER THAN
+  ASSUMED.** `function "[]"(self: Box, k: i32)` inside a body is already the loud
+  `cannot index non-array Box` on both seeds, so the position gap is binary-only and the
+  rule is scoped to `isBinOpFuncName`.
+
+* **THE GATE FIRES TWICE PER DECLARATION AND REPORTS ONCE.** `checkFuncDeclNode` is
+  re-entered for the same node by demand inference, so the instrumented counter reads
+  `nest=2` for one un-annotated declaration; `tErrCoded`'s exact-repeat drop (same
+  message, same anchor) is what makes that one diagnostic. This is the same property
+  `checkNotEmitterIntrinsic` next door already relies on.
+
+Fixture: `tests/cases/objects/error-operator-nested-declaration.vl`.
 
 ---
 

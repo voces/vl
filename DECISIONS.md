@@ -10,6 +10,28 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A PRICE LEDGER'S OWN CELLS CAN BE BLIND, AND A `--price` CHECK MUST SAY SO RATHER
+  THAN COUNT THEM AS PASSES** (2026-08-29, silent-class-inventory D521 / #2014). The
+  runs-lost override turns on term (c): the lost cell printed a value its own source
+  CONTRADICTS. Four of D521's twenty could not answer it — `>` and `>=` at `1, 2` are
+  natively `false` and their bodies also return `false`, so stdout cannot separate dispatch
+  from inert. They passed (c) silently, because `output != declaration answer` is false in
+  exactly the same way for a blind cell as for a correct one. **The do-nothing rule applies
+  to the cells a check READS, not only to the ones a grid GENERATES** — an older ledger's
+  axes are not re-derivable and cannot be fixed in place. The fix is a distinguishing TWIN
+  the check runs (the same program returning the other constant) and its own reported
+  column, never a fold into the pass count.
+
+- **WHEN EVERY GATE IN A FAMILY IS RAISED FROM ONE PASS, THAT PASS'S POPULATION IS AN
+  UNEXAMINED AXIS** (2026-08-29, silent-class-inventory D541 / #2014). Five separate
+  declaration-site rules — D444, D445, D471, D425, D491/D521 — were each argued on the
+  right predicate and each raised from `checkProgram`'s pass-1 hoist, which walks
+  `gRootStmts`. Nothing was wrong with any of the predicates; the shared blind spot was
+  that a `function "+"` one level down is not in that list, so all five missed it at once
+  and the class stayed silent through six landings. **The question that finds this is not
+  "is the predicate right" but "over what population is it evaluated" — and it is cheap:
+  the answer was one grep for an indented operator declaration and one four-line program.**
+
 - **A REACH PROBE ON ONE SITE MEASURES A NUMBER; IT DOES NOT MEASURE A CAUSE — PUT THE
   SAME PROBE ON THE CALLERS** (2026-08-29, silent-class-inventory D501 / #2012). D411's
   close probed `letRefListDestSlot`, got `reach=0` on exactly the 28 cells that did not
