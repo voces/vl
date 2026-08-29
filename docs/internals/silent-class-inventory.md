@@ -15295,12 +15295,55 @@ Repro (now `runs`, prints `6`):
 
 ---
 
-### D531 — `binOpDefinedFor` mirrors `checkBinary`'s dispatch-arm ORDER at ONE arm of three, so eight operator OVERLOADS are refused at the pin
-**loud check reject · found 2026-08-29 as the measured residue of D511/D512's close · 72 cells
-of `scripts/silent-sweep/d511/pingrid2.py`, kept whole in `distilled/named/` · the direct
-spelling of every one RUNS and prints the declaration's own answer**
+### D551 — a generic's DECLARED return type is never re-checked against the body's type at the pin
+**check-clean invalid wasm · found 2026-08-29 by the non-dispatching-pin block of
+`scripts/silent-sweep/d532/opretgrid.py` · 6 cells there (`d532x_{add,sub,mul,div,rem,xor}_retobj_i32pin_typar`),
+kept whole in `distilled/named/` · the direct spelling of every one is a positioned
+`return type mismatch`**
 
 Repro:
+
+    type V = { x: i32 }
+    function g<T>(a: T): V {
+      return a
+    }
+    const p: i32 = 6
+    const z = g(p)
+    print(1)
+    // vl check rc 0, no error. vl run:
+    //   Invalid input WebAssembly code at offset 164: type mismatch:
+    //   expected (ref $type), found i32
+
+* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the type parameter.** `function g(a: i32): V`
+  with the same body and the same call is `return type mismatch: expected V, got i32`, a
+  positioned checker error. Nothing else changes.
+
+* **IT IS NOT ABOUT OPERATORS**, and the grid that found it says so: the block that surfaced
+  it declares an operator overload, and the witness above declares none and still reproduces.
+  The overload is a red herring — what the six cells share is a generic whose DECLARED return
+  contradicts what its body produces at the pin.
+
+* **THE MECHANISM.** In the generic frame the body's type is a `TyVar`, which is permissively
+  `assignable` to the declared return, so the body-level check passes; at the call site
+  `substTyDeep` substitutes the DECLARED return and hands it out as the call's type, and
+  nothing compares it against the substituted BODY type. Both layers are individually
+  reasonable and neither asks the question.
+
+* **IT IS THE ROW D532's THIRD RUNG WORKS AROUND.** That rung keeps a deferred binary-op
+  result out of an annotated body precisely because the annotation would go unchecked, and it
+  says so in front. Closing this row is what would let the bound go — and would close the four
+  `d532x_*_retobj_i32pin_typar` cells at the same time, which are this same defect reached
+  through an ordering operator rather than through a bare parameter.
+
+---
+
+### D531 — [CLOSED 2026-08-29] `binOpDefinedFor` mirrored `checkBinary`'s dispatch-arm ORDER at ONE arm of three, so eight operator OVERLOADS were refused at the pin
+**closed 2026-08-29 · the filed repro RUNS and prints `99` · was `loud check reject` · found
+2026-08-29 as the measured residue of D511/D512's close · 72 cells of
+`scripts/silent-sweep/d511/pingrid2.py`, all 72 `check` -> `runs`, kept whole in
+`distilled/named/` · closed as ONE landing with D532, which is its precondition**
+
+Repro (now `runs`):
 
     type V = { x: i32 }
     function "+"(self: V, other: V): i32 { return 99 }
@@ -15311,45 +15354,58 @@ Repro:
     const p: V = { x: 6 }
     const q: V = { x: 3 }
     print(g(p, q))
-    // vl check:
-    //   [ERROR]: operator '+' is not defined for V and V (the call's argument types)
+    // now: vl check rc 0, vl run prints `99` — the declaration's own answer, and the
+    // same one `function g(a: V, b: V): i32` printed all along.
 
-* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the annotation.** `function g(a: V, b: V): i32`
-  with the same body, the same constants and the same call RUNS and prints `99`.
+* **THE FIX IS THE ORDER, NOT A NEW PREDICATE.** `objOpSelfDispatchTy(op, lt)` is now a single
+  gate in `binOpDefinedFor`, placed exactly where `checkBinary` places its dispatch arm —
+  after `==`/`!=` and before ordering, `+` concat, arithmetic and the integer-only family.
+  It used to sit INSIDE the integer-only arm, one arm of seven, which is why `^` and `%`
+  dispatched at a pin and `+ - * / < <= > >=` did not. #2010 fixed the same mirror one arm
+  down and this is the rest of it.
 
-* **IT IS #2010's OWN MECHANISM, ONE ARM UP.** That landing found `binOpDefinedFor` mirroring
-  neither `checkBinary`'s predicate nor its ORDER for the integer-only family, and fixed the
-  order there with `objOpDispatchTy` — "`checkBinary` reaches the integer-only rule only AFTER
-  the operator-dispatch arm, so an object receiver with a `^` overload is decided there and does
-  lower". The identical sentence is true of the ORDERING arm and of `+`: `checkBinary`'s
-  dispatch arm precedes both. `objOpDispatchTy` is called from one arm of `binOpDefinedFor` and
-  the language's rule is that it belongs before all of them.
+* **THE FALSE TRUE THE ROW PREDICTED IS REAL, AND THE HOIST SIDESTEPS IT BY ASKING A
+  DIFFERENT QUESTION.** `objOpDispatchTy` answers TRUE for an operator FIELD as well as a
+  `self`-function, and hoisting THAT would accept at the pin what `monoPinBinOps` cannot
+  lower from one (it rewrites through `drwSelfFnOf` and declines the field-closure route for
+  want of a struct table row) — new SILENT cells, not new capability. The hoisted gate asks
+  only the self-function route, which is the route the emitter takes. The integer-only arm
+  keeps its own wider `objOpDispatchTy` call, because subtracting the field route there
+  would move cells no grid measured either.
 
-* **THE SHAPE OF THE FIX, AND WHY IT IS A ROW RATHER THAN PART OF D511's.** Hoisting
-  `objOpDispatchTy(op, lt)` to a single gate ahead of every operator arm is the DRY mirror, and
-  it would make the family uniform: 72 cells across `+ - * / < <= > >=`, every one `check` at
-  the pin and `runs` direct. It is deferred because it is a CHECKER change that makes a new
-  statement about which operators an object pin may use, where D511 was an emitter gap under a
-  pin `binOpDefinedFor` already accepted, and because a hoisted gate needs a decision the
-  int-only arm never had to make: `objOpDispatchTy` also answers for an operator FIELD, and an
-  object carrying a field literally named `"??"` would be accepted at the pin where
-  `checkBinary` returns before its dispatch arm. That is a false TRUE, which leaves a cell as
-  silent as it is — but it is a decision, not an oversight, and it wants its own grid.
+  The row's other worry — an object with a field named `"??"` — was not real: `??` is not
+  modelled in `binOpDefinedFor` at all and falls to the `true` at the bottom, so it was
+  already accepted and the hoist cannot change it.
 
-* **D511's LANDING IS THE PRECONDITION, and that is why this is worth taking next.** Before it,
-  hoisting the gate would have accepted a pin the emitter could not lower. `monoPinBinOps`
-  dispatches every declarable operator from the pin, not only the two the integer-only arm let
-  through, so the emitter half is already done and this is the remaining half.
+* **D532 IS THE PRECONDITION, MEASURED.** The candidate that hoists this gate WITHOUT D532's
+  deferred result type was built and graded (`ABL_NO_R1`): it buys 60 of pingrid2's cells and
+  sends 12 from a loud check reject to check-clean invalid wasm — the un-annotated return
+  still typed as the OPERAND. `opretgrid.py` adds four more that pingrid2 is structurally
+  blind to: `< <= > >=` with an un-annotated return produce a module that VALIDATES and
+  prints `true` where the declaration says `99`. Both halves, or neither.
+
+* **KEPT AS A REFUSED CANDIDATE'S PRICE.** Those cells are in `distilled/named/` and the
+  standing gate now BLOCKS that candidate — 40 classes `runs` -> not-runs, including four
+  graded `runs but wrong value`. `scripts/silent-sweep/d532/opretgrid.py --price` re-checks
+  all fourteen price cells against the seed handed in.
+
+* **SINGLE-FILE MODE ONLY, AND THAT BOUND IS OLDER THAN EITHER ROW.** Prepend one unrelated
+  `import` to the repro and it is `operator '^' is not defined for V and V` again, on this
+  landing and on master alike (ROADMAP **A-OPMOD**): the operator DECLARATION does not reach
+  the dispatch in module mode at all, so it gates before anything these two rows touch.
+  Measured both ways — the same file without the import goes `check` -> `runs` here, with
+  the import it is a loud reject on both seeds.
 
 ---
 
-### D532 — an un-annotated generic RETURN through an operator overload is typed as the OPERAND type
-**check-clean invalid wasm · found 2026-08-29 as the measured residue of D511's close · 6 cells
-of `scripts/silent-sweep/d511/pingrid2.py`, kept whole in `distilled/named/` · the two cells
-D492's landing left (`d492_xor_objop_ret_typar`, `d492_rem_objop_ret_typar`) are this row, not
-D511 — a counter probe reads `pbBin=0` on them, so the dispatch rung is never even entered**
+### D532 — [CLOSED 2026-08-29] an un-annotated generic RETURN through an operator overload was typed as the OPERAND type
+**closed 2026-08-29 · the filed repro RUNS and prints `1` · was `check-clean invalid wasm` ·
+found 2026-08-29 as the measured residue of D511's close · 6 cells of
+`scripts/silent-sweep/d511/pingrid2.py` plus the two D492's landing left
+(`d492_xor_objop_ret_typar`, `d492_rem_objop_ret_typar`), all 8 `invalid` -> `runs`, kept
+whole in `distilled/named/`**
 
-Repro:
+Repro (now `runs`):
 
     type V = { x: i32 }
     function "^"(self: V, other: V): i32 { return 99 }
@@ -15360,39 +15416,61 @@ Repro:
     const q: V = { x: 3 }
     const z = g(p, q)
     print(1)
-    // vl check rc 0, no error. vl run:
-    //   Invalid input WebAssembly code at offset 213: type mismatch:
-    //   expected (ref null $type), found i32
+    // now: vl check rc 0, vl run prints `1`. `print(z)` in place of `print(1)` prints
+    // `99`, and the same generic called at `g(6, 3)` in the same program prints `5`.
 
-* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the return annotation.** Add `: i32` to `g` and
-  the identical program RUNS. So the operand types, the dispatch and the call are all fine; the
-  return type is the whole of it.
+* **THE CONTROL DIFFERED IN EXACTLY ONE THING — the return annotation**, and it still does:
+  `: i32` on `g` and the identical program ran before this landing too. The operand types,
+  the dispatch and the call were always fine; the return type was the whole of it.
 
-* **OFF `wasm-tools print`, AND THE MODULE SAYS WHICH SIDE IS WRONG.** The instance is
-  `(func (param (ref 0) (ref 0)) (result i32) local.get 0 / local.get 1 / return_call 4)` —
-  it dispatches, and returns the overload's `i32`. The CALL SITE is
-  `global.get 0 / global.get 1 / call 5 / global.set 2` into a global declared
-  `(mut (ref null 0))`. The emitter is right and the checker's recorded type for the call is
-  wrong.
+* **THE MECHANISM WAS `checkBinary`'s TAIL, AND THE ROW HAD IT RIGHT.** `checkBinary` returns
+  the overload's return type only from its dispatch arm, under `T.tys[lt] is TyObj`. In the
+  generic body `lt` is a `TyVar`, that arm is skipped, and the walk falls to `return lt` —
+  the operand type. `g`'s inferred return was `T`, and `T := V` at the pin gave `V` while the
+  instance returned the overload's `i32`.
 
-* **THE MECHANISM IS `checkBinary`'s TAIL.** `checkBinary` returns the overload's return type
-  only from its dispatch arm, under `T.tys[lt] is TyObj`. In the generic body `lt` is a
-  `TyVar`, so that arm is skipped and the walk falls to the tail, `return lt` — the operand
-  type. `g`'s inferred return is therefore `T`, and substituting `T := V` at the pin gives `V`.
+* **THE "NO CHANNEL EXISTS" OBSTACLE DID NOT SURVIVE — the row named the wrong adjudicator.**
+  It said the pin's adjudicator `binOpDefinedFor` "returns a BOOLEAN: it has no channel to
+  correct a type the body already recorded". True of that function, and not the point: the
+  pin's adjudicator is `validateBinCstrs`, which emits POSITIONED diagnostics at the call,
+  and the layer that decides a hole's answer per pin is `substHoleTy`, which has returned
+  TYPES since the derived-hole table was built. The capability the row called "strictly more
+  work than either gate this row's parent built" was already there, one derivation kind wide.
 
-* **IT IS LOUD WHENEVER THE RESULT IS USED, which is why the silent form is narrow.**
-  `print(g(p, q))` is a positioned `print of V is type-valid but unsupported`, and
-  `const z: i32 = g(p, q)` is `cannot assign V to 'z'`. Only an UN-annotated binding of the
-  result reaches the emitter, and there the two sides disagree with nobody left to ask.
+* **THE FIX IS A FIFTH DERIVED-HOLE KIND, `HD_BINOP`.** A binary operator's result type is
+  deferred to the pin exactly as `?ret.` and `?elem.` already defer a return-of and an
+  element-of: the row carries the operator (`hdField`) and the answer the body computed with
+  no dispatch (`hdInner`), over the left operand's hole (`hdBase`). `substHoleTy` resolves it
+  — the overload's return type at an object pin that dispatches, the body's own answer
+  substituted anywhere else — so ONE generic instantiated at two types gets two answers:
+  `print(g(p, q))` prints `99` through the overload and `print(g(6, 3))` prints `5` through
+  `i32.xor`, in the same program.
 
-* **NO POSITIONED REJECT IS AVAILABLE AT EITHER LAYER AS THE CODE STANDS**, which is a stronger
-  statement than "blocked". The checker types the body once, in the generic frame, where `T ^ T`
-  really is `T` for every non-object pin — refusing there would refuse `function add<T>(a: T,
-  b: T) { return a + b }`. And the pin's adjudicator (`binOpDefinedFor`) returns a BOOLEAN: it
-  has no channel to correct a type the body already recorded. Closing this needs the result
-  type of a deferred binary op to be re-derived per pin, which is a type-system capability
-  rather than a gate — the same layer D491's row calls "strictly more work than either gate
-  this row's parent built".
+* **THE MINT IS GATED ON ITS OWN EXACT PRECONDITION, WHICH IS WHY THE CORPUS IS BYTE-
+  IDENTICAL.** A hole can resolve to anything but the body's answer only through a DECLARED
+  top-level `self`-function named for the operator, so `mkBinOpRetTy` mints nothing without
+  one. Measured: 1,955 of 2,401 `tests/cases` programs build byte-identically under this
+  landing (the other 446 fail to build under both seeds), 0 differ, 0 build-moved.
+
+* **AND ONLY INSIDE A BODY WITH NO RETURN ANNOTATION.** A deferred type is a type nothing in
+  the body checks, and an annotated body has exactly one such check. Stripping that bound
+  (`ABL_NO_R3`) sends four cells from a loud `return type mismatch: expected V, got boolean`
+  to check-clean invalid wasm at an `i32` pin, where the answer really is `boolean`:
+
+      type V = { x: i32 }
+      function "<"(self: V, other: V): V { return self }
+      function g<T>(a: T, b: T): V { return a < b }
+      print(g(6, 3).x)
+
+  Deciding that per pin needs the annotation re-checked against the RESOLVED body type at the
+  call, which is D551 — the row whose close would let this bound go.
+
+* **THE RESIDUE THIS LEAVES, NAMED.** An ANNOTATED body still gets the body's own answer, so
+  `function g<T>(a: T, b: T): V { return a < b }` at a `V` pin is a loud `return type
+  mismatch` where the direct spelling runs — a false reject, unchanged from master, and the
+  eight `d532_*_retobj_ann_*_typar` cells of `opretgrid.py` are it. The operator-FIELD route
+  at a pin is likewise unchanged (`monoPinBinOps` does not rewrite it), exactly as D511's row
+  filed it.
 
 ---
 

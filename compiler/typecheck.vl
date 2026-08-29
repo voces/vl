@@ -616,9 +616,10 @@ let holeAltHoleIx: i32[] = []
 // a parsable string, and it is now a DATA STRUCTURE: one row per derivation, in
 // the parallel-array style every other side table here uses.
 //
-//   hdKind[r]   HD_FLD | HD_RET | HD_ELEM | HD_GALT
-//   hdField[r]  HD_FLD: the property read. "" otherwise.
-//   hdInner[r]  HD_GALT: the type the guarded branch contributes (arena ix). -1 otherwise.
+//   hdKind[r]   HD_FLD | HD_RET | HD_ELEM | HD_GALT | HD_BINOP
+//   hdField[r]  HD_FLD: the property read. HD_BINOP: the OPERATOR. "" otherwise.
+//   hdInner[r]  HD_GALT: the type the guarded branch contributes (arena ix).
+//               HD_BINOP: the type the BODY decided with no dispatch (arena ix). -1 otherwise.
 //   hdAlt[r]    HD_GALT: the guard's tested type (arena ix). -1 otherwise.
 //   hdBase[r]   the hole this derivation READS FROM (arena ix) — itself possibly derived.
 //   hdDepth[r]  how many derivation layers stack here, so the re-basing budget
@@ -629,10 +630,23 @@ let holeAltHoleIx: i32[] = []
 // shapes, array demands and the alternative rows are all keyed by it. Rendering a
 // type is allowed; parsing one back is what this retires. Nothing reads a `?fld.`
 // prefix any more — the structure is authoritative from the moment it is minted.
+//
+// HD_BINOP IS THE ONE DERIVATION THAT IS NOT A MEMBER READ, and it is here because it
+// is the same shape: a type the BODY cannot decide, named by what it reads off a hole.
+// `a ^ b` inside `function g<T>(a: T, b: T)` has one answer per PIN — the operand type
+// at every non-object pin, and the OVERLOAD's return type at an object pin that
+// dispatches — and `checkBinExprNode` reaches the overload only through its
+// `T.tys[lt] is TyObj` arm, which a `TyVar` left operand never enters. So the body
+// recorded the operand type (`return lt`), the emitter's instance returned the
+// overload's `i32`, and the two disagreed with nobody left to ask: check-clean invalid
+// wasm (`silent-class-inventory` D532). Deferring the answer to `substHoleTy` is the
+// per-pin re-derivation that row said this needed, in the layer that already does it
+// for `?ret.` and `?elem.`.
 const HD_FLD = 0
 const HD_RET = 1
 const HD_ELEM = 2
 const HD_GALT = 3
+const HD_BINOP = 4
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -16559,33 +16573,70 @@ function objOpDispatchTy(op: string, lt: i32) {
   } else {
     return false
   }
+  objOpSelfFnRetTy(op, lt) >= 0
+}
+
+// `checkBinary`'s DISPATCH ARM, asked of a type: does `lt op …` resolve to a free
+// `self`-function overload, and to what RESULT type? -1 = it does not. The `is TyObj` gate
+// is the arm's own (`odsp is TyObj`) and it is load-bearing rather than incidental: a
+// receiver that is not an object takes the language's own lowering and consults no
+// declaration at all, so an `i32` receiver beside a `function "+"(self: i32, …)` must
+// answer -1 here just as it falls straight through the arm there.
+//
+// ONE HOME for the two callers that must agree about it — `binOpDefinedFor`'s hoisted gate
+// (which decides whether the PIN accepts) and `substHoleTy`'s `HD_BINOP` arm (which decides
+// what the pin's RESULT TYPE is). They drifted apart once already at the level below
+// (D492/D493: the same rule written twice), and here a disagreement is worse than a wrong
+// answer — accepting a pin whose result type is derived by the other rule is exactly the
+// check-clean invalid wasm both rows name.
+function objOpSelfDispatchTy(op: string, lt: i32) {
+  const ot = T.tys[lt]
+  if !(ot is TyObj) { return -1 }
+  objOpSelfFnRetTy(op, lt)
+}
+
+// The SELF-FUNCTION half of `objOpDispatchTy`, answering with the overload's RETURN TYPE
+// (arena ix) instead of a boolean — one home, because the predicate and the type must agree
+// about which receivers dispatch and they are the same walk. -1 = no dispatch.
+//
+// THE TWO CALLERS ASK DIFFERENT QUESTIONS OF IT AND THAT IS DELIBERATE. `objOpDispatchTy`
+// wants "is a dispatch AVAILABLE", and adds the operator-FIELD route on top because a false
+// TRUE there costs nothing it does not already cost (its own header argues this). The
+// per-pin RESULT TYPE (`HD_BINOP`) wants only what the EMITTER actually lowers from a pin,
+// and that is exactly this route: `monoPinBinOps` rewrites through `drwSelfFnOf(op, 2)` and
+// declines the field-closure route for want of a struct table row. Resolving a pin through a
+// field the emitter will not rewrite would record a type the instance does not return —
+// which is the very defect `HD_BINOP` exists to close, one route over.
+function objOpSelfFnRetTy(op: string, lt: i32) {
   const fnTy = lookup(op)
-  if fnTy < 0 { return false }
+  if fnTy < 0 { return -1 }
   const ft = T.tys[fnTy]
   if ft is TyFunc {
-    if ft.fnParamTypes.length != 2 { return false }
+    if ft.fnParamTypes.length != 2 { return -1 }
     const dIx = fnDeclIx[op] ?? -1
-    if dIx < 0 { return false }
+    if dIx < 0 { return -1 }
     const d = P.nodes[dIx]
     if d is FuncDecl {
       if d.fnParams.length == 2 {
         const p0 = P.nodes[d.fnParams[0]]
         if p0 is Param {
-          if p0.parName == "self" { return assignable(lt, ft.fnParamTypes[0]) }
+          if p0.parName == "self" {
+            if assignable(lt, ft.fnParamTypes[0]) { return ft.fnRet }
+          }
         }
       }
     }
   }
-  false
+  -1
 }
 
 // Whether the EMITTER can lower `lt op rt` for two CONCRETE operand types — the soundness criterion
 // the generic call-site checks after substituting a hole to its argument type. A still-unresolved
 // operand (`TyVar`, a nested generic) DEFERS (true — the outer call validates it). Mirrors
-// `checkBinary`'s accepted forms; an operator OVERLOAD (`opSelfFnTy`) satisfies it only through the
-// integer-only arm's `objOpDispatchTy` deferral, and stays a clean reject at the arithmetic and
-// ordering arms, which is where it does not lower. Operators not modelled here return true (no false
-// reject — they keep today's behaviour).
+// `checkBinary`'s accepted forms AND ITS ARM ORDER: an operator OVERLOAD (`opSelfFnTy`) is
+// decided by the hoisted dispatch gate below, in the position `checkBinary` decides it —
+// after `==`/`!=` and before everything else. Operators not modelled here return true (no
+// false reject — they keep today's behaviour).
 function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   const lt = softenLitTy(lt0)
   const rt = softenLitTy(rt0)
@@ -16621,6 +16672,29 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     eqRefusals(op, lt, rt, true, pinMsgs, pinChan)
     return pinMsgs.length == 0
   }
+  // ── THE OBJECT-DISPATCH GATE, WHERE `checkBinary` PUTS IT ────────────────────────────
+  // `checkBinary`'s arm order is `??` → `==`/`!=` → OPERATOR DISPATCH → ordering → `+`
+  // concat → arithmetic → integer-only, and mirroring only the PREDICATES and not that
+  // ORDER is what D492/D493 were: a rule that reads the same and fires in a different
+  // place is a different rule. This gate used to sit inside the integer-only arm — one arm
+  // of seven, reached only by `^ & | << >> >>> %` — so `+ - * / < <= > >=` on an object
+  // pin were refused HERE while the direct spelling of every one of them dispatches and
+  // prints the declaration's own answer (`silent-class-inventory` D531, 72 cells).
+  //
+  // IT IS THE SELF-FUNCTION ROUTE ONLY, and that is the decision D531's row said a hoisted
+  // gate would have to make. `objOpDispatchTy` also answers TRUE for an operator FIELD, and
+  // hoisting THAT would accept at the pin what the emitter cannot lower from one
+  // (`monoPinBinOps` rewrites through `drwSelfFnOf` and declines the field-closure route for
+  // want of a struct table row) — a false TRUE, which is a new SILENT cell rather than a new
+  // capability. Asking the route the emitter actually takes is what makes the hoist a
+  // capability and not a trade. The integer-only arm keeps its own wider `objOpDispatchTy`
+  // call below: subtracting the field route there would move cells this row did not measure.
+  //
+  // D532 IS THE PRECONDITION, exactly as D511's emitter half was. Before `HD_BINOP` deferred
+  // a binary op's RESULT type to the pin, accepting these operators here bought 48 cells and
+  // sent 24 more from a loud check reject to check-clean INVALID WASM — the un-annotated
+  // return would still have been typed as the OPERAND. Both halves, or neither.
+  if objOpSelfDispatchTy(op, lt0) >= 0 { return true }
   if op == "+" {
     // THE UNSOFTENED TYPES, because `checkBinary`'s `+` arm softens AFTER its string and array
     // arms and this one softened BEFORE them. A literal union is `string`/`i32` once softened,
@@ -16664,6 +16738,14 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     // cells to it (`d492_xor_objop_bind_typar` and `_bind_fnval`) and gains none of the two a
     // dispatching `%` overload buys. This is the same mistake the `+` arm above records for
     // softening ORDER (D44), one arm down.
+    //
+    // THE SELF-FUNCTION HALF OF THIS IS NOW THE HOISTED GATE'S (D531) and this call is what
+    // is LEFT: the operator-FIELD route, which `objOpDispatchTy` answers TRUE for and the
+    // hoisted gate deliberately does not. It stays here and is not hoisted with the rest,
+    // because widening it to `+ - * / < <= > >=` would accept at the pin what
+    // `monoPinBinOps` does not rewrite — new silent cells, on an axis neither row measured.
+    // Subtracting it from THIS arm is the same unmeasured move in the other direction, so
+    // it keeps the behaviour D492's grid graded.
     if objOpDispatchTy(op, lt) { return true }
     if !isNumeric(lt) || !isNumeric(rt) { return false }
     return !binFloatOperandPair(lt, rt)
@@ -17424,6 +17506,12 @@ function hdRenderName(
   if kind == HD_FLD { return "?fld." + field + "." + baseName }
   if kind == HD_RET { return "?ret." + baseName }
   if kind == HD_ELEM { return "?elem." + baseName }
+  // The FALLBACK type rides the name for the same reason the guarded form's two arena
+  // indices do: two `a ^ b` sites over the same hole whose bodies decided DIFFERENT
+  // no-dispatch answers are different holes, and the name is the hole's identity.
+  if kind == HD_BINOP {
+    return "?binop." + field + "." + i32ToStr(inner) + "." + baseName
+  }
   "?galt." + i32ToStr(inner) + "." + i32ToStr(alt) + "." + baseName
 }
 
@@ -17533,6 +17621,22 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
       return rebaseDerivedHole(row, inner)
     }
     return -1
+  }
+  // A DEFERRED BINARY-OP RESULT (`mkBinOpRetTy`). The pin decides which of the two answers
+  // `checkBinExprNode` can give is the right one: an OBJECT receiver with a `self`-function
+  // overload takes the overload's return type — the arm a `TyVar` left operand never
+  // entered — and every other receiver keeps the answer the body already computed, with its
+  // own holes substituted. Mirrors `checkBinExprNode`'s dispatch arm exactly, including its
+  // `is TyObj` gate: a non-object pin is not a dispatch, it is the language's own lowering.
+  if kind == HD_BINOP {
+    const innerB = substHoleTy(hdBase[row], bNames, bTys)
+    if innerB < 0 { return -1 }
+    if tyIsHole(innerB) { return rebaseDerivedHole(row, innerB) }
+    const dTy = objOpSelfDispatchTy(hdField[row], innerB)
+    if dTy >= 0 { return dTy }
+    // NO DISPATCH — the body's own answer, which may itself name this hole (`return lt`
+    // for the arithmetic tail) or be concrete (`TY_BOOL` for an ordering comparison).
+    return substTyDeep(hdInner[row], bNames, bTys)
   }
   // The element of an indexed hole (`self[i]`): resolve the hole to its pinned
   // argument; an array yields its element, a string an i32 code point. Mirrors the
@@ -29355,8 +29459,77 @@ function nomBinMixes(lt: i32, rt: i32, lx: i32, rx: i32) {
   true
 }
 
-// Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
+// THE ONE PLACE A BINARY EXPRESSION'S TYPE IS HANDED OUT, so it is the one place the
+// answer can be DEFERRED to the pin. `checkBinExprNodeReal` has ten return points and a
+// hole left operand can reach four of them; wrapping is what makes "every answer this
+// function can give" a checkable claim rather than a list someone has to keep current.
+//
+// `ltOut` carries the LEFT OPERAND's type out rather than re-reading `nodeTyIx[n.binLeft]`,
+// and that is not a style preference: `checkNode` records a node type only when
+// `!inferQuiet`, and a nested binary on the right would have overwritten a module-level
+// slot before this returns. The out-column is the only reading that is exact under both.
 function checkBinExprNode(n: BinExpr, ix: i32) {
+  const ltOut: i32[] = []
+  const bTy = checkBinExprNodeReal(n, ix, ltOut)
+  if ltOut.length == 0 { return bTy }
+  mkBinOpRetTy(n, bTy, ltOut[0])
+}
+
+// A BINARY OPERATOR'S RESULT TYPE, DEFERRED TO THE PIN when the body cannot decide it
+// (`silent-class-inventory` D532). See `HD_BINOP`'s note at the derivation table.
+//
+// THE GATE IS THE EXACT PRECONDITION OF THE CORRECTION, not a heuristic cut. The hole can
+// resolve to anything but `bTy` only through `objOpSelfFnRetTy`, which resolves only a
+// DECLARED top-level `self`-function named for the operator — so a program that declares no
+// operator overload mints nothing and records exactly the types it recorded before. That is
+// what makes the whole corpus (and the compiler itself) byte-identical under this rung.
+function mkBinOpRetTy(n: BinExpr, bTy: i32, lt: i32) {
+  if bTy < 0 { return bTy }
+  if bTy == TY_ERR { return bTy }
+  // A COMPOUND assignment shares its target node between the read and the write, and
+  // `monoPinBinOps` leaves it whole for that reason — an `a ^= b` over an overload is not a
+  // form the direct spelling lowers either, so there is no second answer to defer to.
+  if n.binCompound != "" { return bTy }
+  const op = n.binOp
+  // Only an operator a USER CAN DECLARE can carry an overload, so nothing else has a
+  // second answer at a pin. (`ast.vl:isBinOpFuncName` — the same ten names the parser
+  // admits in a declaration.)
+  if !isBinOpFuncName(op) { return bTy }
+  if (fnDeclIx[op] ?? -1) < 0 { return bTy }
+  if !tyIsHole(lt) { return bTy }
+  // ONLY INSIDE A BODY WITH NO RETURN ANNOTATION, and this bound is MEASURED, not
+  // cautious. A deferred type is a type nothing in the body checks, and a body with a
+  // declared return has exactly one such check: `return a < b` under `: V` is
+  // `return type mismatch: expected V, got boolean` today, and handing that `return` a hole
+  // makes it permissively assignable to anything. At a `V` pin the deferral is RIGHT (the
+  // overload really does return `V`) and at an `i32` pin it is wrong — and the wrong one is
+  // check-clean INVALID WASM, a new silent cell traded for a false reject.
+  //
+  //     function "<"(self: V, other: V): V { return self }
+  //     function g<T>(a: T, b: T): V { return a < b }
+  //     print(g(6, 3).x)
+  //
+  // Deciding that per pin needs the annotation re-checked against the RESOLVED body type at
+  // the call — strictly more than this rung, and not what either row is about: D532 is an
+  // UN-ANNOTATED return by its own title, and D531's annotated cells never needed the
+  // deferral (an annotated `: i32` decides the instance's result and the pin's alike). So
+  // the annotated form keeps master's answer exactly, false reject and all, and that
+  // remainder is filed as this row's residue rather than left to be discovered.
+  const owner = cstrOwnerTop()
+  if owner < 0 { return bTy }
+  const od = P.nodes[owner]
+  if od is FuncDecl {
+    if od.fnRet >= 0 { return bTy }
+  } else {
+    return bTy
+  }
+  const d = mkDerivedHole(HD_BINOP, op, bTy, -1, lt)
+  if d < 0 { return bTy }
+  d
+}
+
+// Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
+function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   const op = n.binOp
   // `a && b` / `a || b`: the LEFT side's narrowings hold while CHECKING the
   // right (`p != null && p.x > 0` checks `p.x` under a non-null `p`; for `||`
@@ -29396,6 +29569,7 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     if wtgt is Ident { daWriteTarget = n.binLeft }
   }
   let lt = checkNode(n.binLeft)
+  ltOut.push(lt)
   daWriteTarget = savedWriteTarget
   // Contextual typing for an assignment RHS (`m[k] = (x) => …` over a `{[…]: (i32)=>i32}`
   // map, `xs[i] = (n) => …`, `f = (n) => …`): seed the LHS type so an un-annotated lambda
