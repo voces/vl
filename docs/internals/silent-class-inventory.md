@@ -13184,9 +13184,7 @@ Repro:
 ---
 
 ### D402 — a declared INTERSECTION makes the STRUCTURAL spelling of its own shape a loud emit reject at an ARRAY ELEMENT
-**loud emit reject (`emitProgram: only i32[] arrays and struct/union element arrays are
-supported`) on `777f7848` and on this branch · found 2026-08-28 while separating D362's
-residue from D362 itself**
+**loud emit reject (`emitProgram: only i32[] arrays and struct/union element arrays are supported`) on `777f7848`, on master `f9275d20` and on this branch · found 2026-08-28 while separating D362's residue from D362 itself · SETTLED 2026-08-28: CORRECTLY LOUD, and it is a PINNED gate rather than an unexamined defect — `tests/cases/structs/struct-alias-union-inline-elem-array-floor.vl` is the `@emit-error` fixture that exists to keep it. The filed mechanism was inverted; two SILENT SIBLINGS behind it are now D441 and D442; the lift candidate is priced below and REFUSED.**
 
 Repro:
 
@@ -13196,25 +13194,94 @@ Repro:
     // vl check rc 0 (one HINT); vl run:
     //   emitProgram: only i32[] arrays and struct/union element arrays are supported
 
-* **DELETE THE `type AB` LINE AND IT RUNS**, and so does the same program with the alias
-  declared as a plain struct (`type AB = {a: i32, b: i32}`). The intersection DECLARATION is
-  the ingredient, the array ELEMENT is the position, and the alias is never mentioned by the
-  annotation that fails. Four-cell control table on `777f7848`:
+* **THE FILED FOUR-CELL TABLE REPRODUCES VERBATIM** on master `f9275d20`, all four cells.
+  Deleting the `type AB` line runs; declaring it as a plain struct runs; using the
+  intersection as well as declaring it does not change the reject.
 
-  | declaration | `{a:i32,b:i32}[]` element | bare `{a:i32,b:i32}` |
+* **THE ROW HAD NOT NAMED ITS OWN PIN, AND THAT IS THE CORRECTION THAT MATTERS.** The reject
+  is not an oversight anybody is free to lift: `tests/cases/structs/struct-alias-union-inline-elem-array-floor.vl`
+  is a `@emit-error` fixture whose header records that a destringify slice already opened this
+  gate once (`sRowDecl` banks `cUserTypes.has(nm)`, which holds UNION declarations, where
+  `nameIsStructDecl` requires a `TypeDecl` node) and that the dual-run licensing that swap read
+  1,029 agree / 0 disagree while being *blind*, because no corpus file paired a struct-alias
+  union with an inline spelling of its own shape. Read as filed the row invited a re-lift; the
+  pin is the first thing a closer has to grade.
+
+* **THE MECHANISM IS THE OPPOSITE OF THE ONE FILED.** The row said "the emitter's element
+  tables then hold two rows for one layout". There is **ONE** row for the layout — the dedup
+  is the ingredient, not the symptom — and the reject fires because that one row's NAME fails
+  a declared-STRUCT gate. A `tErr`-channel probe folding the resolution into `checkArrName`'s
+  own message reads, for every rejecting cell:
+
+      PROBE checkArrName name={a:i32,b:i32}[] base={a:i32,b:i32} row=AB via=bridge NOTDECL
+      PROBE checkArrName name={a:i32,b:i32,c:i32}[] base={a:i32,b:i32,c:i32} row=ABC via=bridge NOTDECL
+      PROBE checkArrName name={a:i32,b:string}[] base={a:i32,b:string} row=AB via=bridge NOTDECL
+
+  `nameIsRefArray`'s `structIndexByName(base)` misses because the row is named `AB`;
+  `shapeElemDeclaredStructIdx`'s bridge FINDS it (`via=bridge` — the arena rung `repRowOfName`
+  declines every time, so it decides nothing here) and its trailing
+  `nameIsStructDecl(sNames[si])` gate closes, because a canonicalized object intersection is a
+  one-variant `UnionDecl` interned as a struct row by `internShapeAs(s.udName, …)`, not a
+  `TypeDecl`. Five of the nine probed cells never reach the reject at all (`reach=0`).
+
+* **THE INGREDIENT IS NARROWER THAN FILED: the intersection's MERGED LAYOUT must equal the
+  structural spelling.** `type XY = {x:i32} & {y:i32}` beside `{a:i32,b:i32}[]` RUNS — an
+  intersection of a different shape is inert. `type ABC = {a:i32} & {b:i32} & {c:i32}` beside
+  `{a:i32,b:i32,c:i32}[]` REJECTS, so arity is not the axis. `type P = {a:i32}` +
+  `type AB = P & {b:i32}` rejects too, so a named arm is not the axis. And a same-layout PLAIN
+  struct twin **RESCUES** it: `type AB = {a:i32} & {b:i32}` + `type CD = {a: i32, b: i32}` +
+  the structural array RUNS, because the bridge then lands on a `TypeDecl` row.
+
+* **THE POSITION IS NARROWER THAN FILED TOO.** Over 16 positions × 5 declarations (80 cells),
+  the reject reaches `const` / `let` / a param / a return / a local / `[][]` / `.length` /
+  `.push`, and does NOT reach two: a struct FIELD of the inline shape's list
+  (`type W = { xs: {a:i32, b:i32}[] }`) and an un-annotated `const c = [{a:1,b:2}]`. Both run
+  and both print the RIGHT values, including under a REVERSED intersection
+  (`type BA = {b:i32} & {a:i32}`) and with mixed field types (`{a:i32} & {b:string}`).
+
+* **NO SILENT CELL IN THE FILED NEIGHBOURHOOD, TWO ONE STEP OUT.** 28 cells crossing the
+  admitted field position with reversed arm order, reversed field order, write-then-read,
+  cross-function flow and mixed field types produce **0 silent wrong values** — every cell
+  either runs with the right answer or is loudly rejected. The two silent siblings need a
+  SECOND declaration or a SECOND spelling in the same program and are filed as **D441** (two
+  intersection aliases of one layout, both as ref lists) and **D442** (an alias ref list
+  assigned into a structurally-spelled field list). Neither is moved by the candidate below.
+
+* **THE REFUSED CANDIDATE, PRICED.** Lifting the `nameIsStructDecl` gate in
+  `shapeElemDeclaredStructIdx` (seed `943a21fe…`, 1,473,279 bytes vs base `742635755f…`,
+  1,473,330, both re-taken after the rebase onto `f9275d20`):
+
+  | instrument | base | candidate |
   |---|---|---|
-  | none | runs | runs |
-  | `type AB = {a:i32} & {b:i32}` | **loud emit reject** | runs |
-  | `type AB = {a: i32, b: i32}` | runs | runs |
-  | the intersection, also USED | **loud emit reject** | runs |
+  | corpus `cmp` (2,378 modules) | — | **1,945 identical · 0 DIFFER · 0 LOST** |
+  | distilled corpus | — | **0 runs lost · 0 → silent · +399 census cells** loud emit reject → runs (classes `a000426` 270 cells, `b021090` 129 cells, plus this PR's own `d402_reject_const_arr`) |
+  | 103-cell cell-matched grid | 2 silent | **21 moved · 21 → runs (all with the RIGHT answer) · 0 runs LOST · 0 → SILENT** · 2 silent, unchanged |
+  | nine-gate ladder | green | **6 of 9 green**; `deno task test` 2526 passed / **1 failed** — the PIN itself; `ci-native` the same file; `filed witnesses` reports D402 MOVED |
 
-* **NOT SILENT, AND UNMOVED BY D362.** `unionStructAliasShape` interns the intersection as a
-  named struct shape and the emitter's element tables then hold two rows for one layout;
-  D362's landing touches the alias's TRANSPARENCY and does not merge them. Filed rather than
-  folded in because it is a different table and a different measurement — and because it is
-  the reason D362's own filed spelling of its silent cell (the alias beside a
-  STRUCTURALLY-spelled twin) still reads `emit_reject` after D362 closed, while the same cell
-  with an `AB[]` twin runs.
+  **The pin's stated harm did not reproduce on any population reachable without a full
+  census.** The fixture header names "a shape-armed union (`t is {f: boolean}[]` over an
+  inferred closure-call binding)"; that cell is `emit_reject` on base AND on the candidate,
+  because with no declared twin `shapeElemDeclaredStructIdx` finds no row at all and the gate
+  never fires. The gate only bites when a row EXISTS whose name is not a `TypeDecl` — which,
+  on everything measured here, is exactly the intersection alias.
+
+  **NOT LANDED, and the reason is the layer, not the number.** This is an emitter accept-set
+  widening over a gate with a fixture and a header; it owes its own rep-fuzz, its own mono
+  grid and a re-derived census, not a rider on a row-settling PR. What is banked instead is
+  the measurement plus the six-cell named set `d402-intersection-elem-gate`
+  (`distilled/named/d402_*.vl`), so the next attempt starts from it rather than re-deriving
+  it — and so the gate carries the boundary (the bite, the plain-twin rescue, the
+  other-layout inert cell, the admitted field position) and both silent siblings.
+
+* **SHARED ROOT WITH D425 AND D443.** `type X = A & B` is a one-variant `UnionDecl`, and
+  every "is this an object / a declared struct" gate in the tree answers NO for it. Measured
+  at nine gates against the plain-struct twin, five diverge: this row's array element, a
+  structurally-spelled struct PARAM (D443), an `is AB` narrow, an operator declaration
+  `self: AB` (D425's bullet), and an operator declared over the structural spelling with
+  `AB` operands. Four agree: a field read, an aliased param, an `AB[]` ref list, a bare
+  struct. **The order is decided by that**: a D425-style declaration-site reject phrased
+  "`self` must be an object type" would freeze a factually false sentence into the compiler
+  for `self: AB`, so this root has to be right first.
 
 ---
 
@@ -13487,7 +13554,7 @@ any built-in lowering).
 ---
 
 ### D425 — an operator declaration whose `self` can never be an OBJECT parses, type-checks, and is SILENTLY IGNORED
-**check-clean silently wrong · found 2026-08-28 by the operator grid built for D424 — the same shape D46 rejected for `==`/`!=`, at the NINE other operators · pre-existing and IDENTICAL on master `777f7848` and on this branch · LEFT OPEN DELIBERATELY: the reject's PLACEMENT is a real decision and this row states its price. (The status line avoids the word this file uses for a fixed row on purpose — `check-filed-witnesses.py` matches its vocabulary as a SUBSTRING and a live row reading "not c-l-o-s-e-d" grades as fixed, which is the trap its own docstring records.)**
+**check-clean silently wrong · found 2026-08-28 by the operator grid built for D424 — the same shape D46 rejected for `==`/`!=`, at the NINE other operators · pre-existing and IDENTICAL on master `777f7848`, on master `f9275d20` and on this branch · LEFT OPEN DELIBERATELY: the reject's PLACEMENT is a real decision, and the 2026-08-28 re-grade found the filed PRICE understated by a factor of three — three dispatch paths, not one gate, and the honest predicate is blocked behind D402's root. (The status line avoids the word this file uses for a fixed row on purpose — `check-filed-witnesses.py` matches its vocabulary as a SUBSTRING and a live row reading "not c-l-o-s-e-d" graded as fixed. CONFIRMED BY EXPERIMENT here, including a SILENT half the docstring did not record — and FIXED meanwhile by #1999, which REFUSES a negated match rather than inverting it, so the wording this row uses is still the one it needs. See the last bullet.)**
 
 Repro:
 
@@ -13502,39 +13569,131 @@ Repro:
     }
 
     print(cell())
-    // vl check rc 0, no warning about the declaration. The declared operator returns 99
-    // unconditionally, so a dispatch would print 99.
+    // vl check rc 0, no error and no warning about the declaration being inert (the two
+    // warnings it does raise are `Unused parameter self` / `other`, which say something
+    // else). The declared operator returns 99 unconditionally, so a dispatch would print 99.
     // PRINTS 3
 
 * **IT IS D46's EXACT SHAPE.** D46 rejected `function "=="` because the declaration parsed,
   type-checked and did nothing, and because a diagnostic was recommending it. This is the
   same inertness at every OTHER operator, selected not by the operator but by the `self`
   parameter's TYPE.
-* **THE INERTNESS IS PROVABLE, not merely observed.** `checkBinary` reaches `opSelfFnTy` only
-  under `if odsp is TyObj`, and `opSelfFnTy` then requires `assignable(lt, params[0])`. A
-  `self` annotated with anything that is not an object type — `i32`, `string`, `f64`,
-  `K = "a" | "b"`, `Circle[]` — can therefore never be reached by any program.
-* **32 of 40 grid cells PROVED ignored, and the other 8 are the probe's own blind spot.**
-  At an `i32` receiver the declaration is discarded and the native answer comes back for
-  `+ - * / % ^ > >=` at both name spellings and both annotation forms; `<` and `<=` were
-  given a pair (`1 < 2`) where the declaration and the built-in agree, so those 8 cells
-  measure nothing. Re-running them with a disagreeing pair is ~10 invocations and is the
-  first thing the closer should do.
-* **WHY IT IS NOT CLOSED AS A RIDER, and the reasoning is the placement.** The reject has to
-  be at the DECLARATION: a USE-site reject is over-broad by construction, because the body of
-  a legitimate struct `+` operator adds its fields with the built-in `+` and would refuse
-  itself. And the declaration-site test needs the `self` annotation's RESOLVED type, not its
-  spelling — `self: K` and `self: Circle[]` are inert for exactly the reason `self: i32` is —
-  while D46's twin reject lives in `parseFuncHead`, which has only the spelling. So this is a
-  new gate in the CHECKER beside `opSelfFnTy`, phrased as D46's sentence is, plus a decision
-  about the un-annotated spelling (`function +(self, b)`, which the tree's own fixture uses
-  and which must stay accepted — its `self` is a hole that binds to an object per call).
-  **Price: one checker gate, one diagnostic sentence, one fixture; the tree declares no such
-  operator, so the reject costs no capability — the same zero D46 measured.**
-* Nothing in `compiler/`, `std/`, `tests/`, `bench/`, `playground/` or `reference/` declares
-  an operator function with a non-object `self`; the only operator declarations in the tree
-  are `tests/cases/objects/operator-self-method.vl`'s and D424's new fixture, and both take
-  an object.
+
+* **THE INERTNESS IS PROVABLE, not merely observed.** `checkBinary` (`typecheck.vl:29118`)
+  reaches `opSelfFnTy` only under `if odsp is TyObj` where `odsp = T.tys[lt]` is the LEFT
+  OPERAND's type at the site, and `opSelfFnTy` then requires `assignable(lt, params[0])`.
+
+* **40 OF 40 GRID CELLS NOW PROVED IGNORED — the filed 8 blind cells are closed.** The row
+  filed "32 of 40 proved, 8 blind": `<` and `<=` had been given `1 < 2`, where the
+  declaration and the built-in agree. Re-run with a DISAGREEING pair (`2 < 1`, declaration
+  `return true`, native `false`) all 8 answer natively too. Ten operators × two name
+  spellings (`function "+"` / `function +`) × two annotation forms, every pair chosen so the
+  declaration and the built-in differ: **40 ignored, 0 fired, 0 not-runs.**
+
+* **FIVE `self` TYPES ARE SILENT, NOT ONE — AND THE ROW'S OWN LIST WAS HALF WRONG.** The
+  filed sentence named "`i32`, `string`, `f64`, `K = "a" | "b"`, `Circle[]`" as one class.
+  Measured over 12 `self` types at a bare top-level `print(a + b)` site (so the only thing
+  varying between a cell and its control is the `self` annotation — the first cut of this
+  measurement was confounded by a `cell(): i32` wrapper that reported the HARNESS's return
+  mismatch for every non-i32 case):
+
+  | `self` type | outcome |
+  |---|---|
+  | `i32` `i64` `f64` `f32` `string` | **SILENT** — the native answer, declaration ignored |
+  | `boolean` | loud: `operator '+' is not defined for boolean and boolean` |
+  | `K = "a"\|"b"` | loud: `operator '+' is not defined for string and string` |
+  | `Circle[]` | loud: `` `+` over Circle[] has no lowering `` (D421's new reject) |
+  | `i32[]` `{[string]:i32}` `(i32) => i32` `Circle \| null` | loud: `operator '+' is not defined …` |
+  | `Circle` / `{r: i32}` (controls) | **DISPATCHES** — prints 99 |
+
+  So `K` and `Circle[]`, two of the row's five examples, are LOUD. The silent class is
+  exactly "a `self` type that has a native lowering for the operator".
+
+* **THE SHAPE EXTENDS TO THE INDEX OPERATORS, WHICH THE ROW NEVER MEASURED — AND std
+  DECLARES FOUR OF THEM.** `function "[]"(self: i32[], i: i32): i32 { return 99 }` beside
+  `xs[0]` over an `i32[]` prints **1**, not 99; `self: string` prints **97**; `"[]="` over
+  `i32[]` writes natively (**5**). Control: `"[]"` over a declared struct dispatches (99).
+  `std/buffer.vl` exports `function "[]"(self: F32View, …)`, `"[]="(self: F32View, …)`,
+  `"[]"(self: I32View, …)`, `"[]="(self: I32View, …)`, and five fixtures declare more
+  (`tests/cases/index/operator-read-write.vl`,
+  `tests/cases/index/operator-in-function-bodies.vl`,
+  `tests/cases/modules/index-operator-import/{lib,entry}.vl`,
+  `tests/cases/memory/flat-fused-row-brands-dont-cross.vl`,
+  `tests/cases/numerics/f32-contextual-integer-literal.vl`). **The row's sentence "the only
+  operator declarations in the tree are `operator-self-method.vl`'s and D424's new fixture"
+  is false**, and it is the sentence the price rested on.
+
+* **A THIRD CASE: `self: T`.** `function "+"<T>(self: T, other: T): i32 { return 99 }` is
+  SILENT at an i32 site (prints 3) and **DISPATCHES at an object site** (prints 99). A
+  declaration-site gate phrased "`self` must be an object type" refuses a declaration that
+  works.
+
+* **A FOURTH: `self: AB` where `AB` is a declared INTERSECTION is a LOUD FALSE REJECT.**
+  `type AB = {a:i32} & {b:i32}` + `function "+"(self: AB, other: AB)` over `AB` operands is
+  `operator '+' is not defined for AB and AB`, while `function "+"(self: {a:i32,b:i32}, …)`
+  over structurally-typed operands DISPATCHES. `AB` is not a `TyObj` at the gate. **This is
+  D402's root and it sequences the two rows** — see D402's last bullet.
+
+* **PLACEMENT (B), THE CALL SITE: over-broad, and now priced with programs rather than
+  argued.** The narrowest phrasing that catches this row is "an `op` site whose LEFT type is
+  assignable to a declared operator's non-object `self`". Three programs it must not break
+  and would: `function "+"(self: i32, other: i32): i32 { return self + other }` runs today
+  (prints 3) and **its own body is an i32 `+` site**, so the reject refuses the declaration
+  it is complaining about; `function unrelated(): i32 { return 40 + 2 }` in the same program
+  runs today (prints 42) and is refused for something in another function; and the tree's own
+  fixture `function +(self, b) { x: self.x + b.x, … }` has two i32 `+` sites inside a `+`
+  operator's body. It also points at the wrong line: the site is fine, the declaration is the
+  bug.
+
+* **PLACEMENT (A), THE DECLARATION: right layer, and the price is THREE gates, not one.**
+  D46's home (`parseFuncHead`) cannot host it — that arm has the NAME spelling and not the
+  resolved type of `self`, which is what decides here. The honest predicate is *the negation
+  of the dispatch gate*, and there are three dispatch gates with three different answers:
+  **binary** wants `TyObj`-or-hole-or-type-variable (and must keep `self: T` and the
+  un-annotated `function +(self, b)` — both measured working); **`"[]"`/`"[]="`** resolve by
+  the RECEIVER'S type through `opIdxBindGen`, a different rule with std as a live customer;
+  **unary** has no dispatch path at all (`checkUnaryNode`, `typecheck.vl:30757`, never looks
+  — see D444). And the binary predicate cannot be spelled honestly until D402's root is
+  fixed, because "`self` must be an object type" is a false sentence for `self: AB`.
+
+* **WHY IT STAYS OPEN.** The reject is right and its CAPABILITY cost is still zero at the
+  binary operators — nothing in `compiler/`, `std/`, `tests/`, `bench/`, `playground/` or
+  `reference/` declares a binary operator with a non-object `self`, re-verified 2026-08-28;
+  the only binary declarations are `tests/cases/objects/operator-self-method.vl`,
+  `tests/cases/objects/operator-self-method-function-local-receiver.vl` and D46's
+  `error-equality-not-overloadable.vl`, and all take an object or a hole. What is NOT settled
+  is the predicate, and the filed price ("one checker gate, one diagnostic sentence, one
+  fixture") is a third of the real one. **This row now states that price; it is a
+  language-design decision with a sequencing constraint, not an unwritten patch.**
+
+* **THE GRADER BUG THIS ROW'S WORDING DODGES WAS REAL, ITS SILENT HALF WAS WORSE THAN THE
+  DOCSTRING RECORDED, AND #1999 HAS SINCE FIXED IT.** Before #1999,
+  `check-filed-witnesses.py`'s `declared_outcome` matched its vocabulary as a SUBSTRING
+  (`("closed", "runs")` is the fourth entry, and first LIST match wins, not first by
+  position). Three specimen rows with the SAME repro, differing only in wording, graded:
+
+  | status wording | declared | actual | verdict | exit |
+  |---|---|---|---|---|
+  | `check-clean silently wrong · left open deliberately` (this row's) | `silent_wrong_value` | `silent_wrong_value` | as filed | 0 |
+  | `check-clean silently wrong · deliberately NOT closed …` | **`runs`** | `runs` | **"as filed"** | **0** |
+  | `loud check reject · deliberately NOT closed by D35` | `runs` | `check_reject` | MOVED | 1 |
+
+  The docstring recorded only the third, which is LOUD. **The second is the dangerous one and
+  it was not on record**: a live `check-clean silently wrong` row whose status merely CONTAINS
+  "closed" was declared `runs`, its program does run, and it graded **green** —
+  indistinguishable from a fixed row, with the `// PRINTS` machinery built to catch exactly
+  this skipped entirely (it runs only under `want == "silent_wrong_value"`).
+
+  **#1999 closes both halves**, and the same three specimens re-run against it read
+  `1 graded · 1 as filed · 0 MOVED · 2 not graded`, exit 1 under `--strict` — X2 and X3 are
+  REFUSED rather than inverted, and the failure names the row and the fix. One consequence
+  worth knowing before wording a status: the refusal short-circuits the whole vocabulary
+  (`declared_outcome` returns `None` at the first negated match rather than trying the next
+  entry), so X2 is ungradeable even though its status ALSO carries an un-negated
+  `check-clean silently wrong`. Deliberate — the commit chose refusing over guessing a
+  negation's scope — but it means a status may not mention another row's outcome under a
+  negation even when it names its own plainly. This row's wording is therefore still the
+  wording it needs.
 
 ---
 
@@ -13587,6 +13746,210 @@ Repro:
   **The cheap intermediate is a REFUSAL**: a lambda parameter whose type mentions the
   enclosing generic's `T` is a loud emit reject, which turns 2 measured silent shapes loud
   and matches what the other bodies already do.
+
+---
+
+### D441 — TWO intersection aliases of ONE layout, both as ref LISTS, are check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-28 by D402's neighbourhood grid, one step out of that row's own family · pre-existing and IDENTICAL on master `f9275d20` and on this branch · NOT moved by D402's refused lift candidate · kept whole at `distilled/named/d402_silent_two_inters.vl`**
+
+Repro:
+
+    type AB = {a:i32} & {b:i32}
+    type CD = {a:i32} & {b:i32}
+    const p: AB[] = [{a:1,b:2}]
+    const q: CD[] = [{a:3,b:4}]
+    print(p[0].a)
+    print(q[0].b)
+    // vl check rc 0 (two HINTs); vl run:
+    //   Invalid input WebAssembly code at offset 329:
+    //   type mismatch: expected (ref null $type), found (ref $type)
+
+* **BOTH INGREDIENTS ARE NECESSARY AND EACH IS ONE TOKEN.** `int + plain`, `plain + int` and
+  `plain + plain` all RUN with the right answers, so BOTH names must be intersections. Either
+  list alone runs (`AB[]` + a bare `CD`, or a bare `AB` + `CD[]`), so BOTH must be ref lists.
+  Two intersections of DIFFERENT layouts run. A third same-layout intersection reproduces it,
+  so it is not an arity effect.
+
+* **THE MECHANISM IS OFF THE DISASSEMBLY** (`wasm-tools print`, the module the emitter does
+  write):
+
+      (rec
+        (type (;0;) (struct (field (mut i32)) (field (mut i32))))
+        (type (;1;) (struct (field (mut i32)) (field (mut i32))))
+        (type (;2;) (array (mut (ref null 0))))
+        (type (;3;) (struct (field (mut (ref 2))) (field (mut i32)) (field (mut i32)))))
+      …
+        array.get 2
+        ref.as_non_null
+        struct.get 1 1
+
+  The STRUCT table mints one row per intersection alias NAME — `type 0` for `AB`, `type 1`
+  for `CD`, identical layouts and, in wasm GC, distinct heap types. The REF-LIST table dedups
+  on LAYOUT and mints only `type 2`, whose element is `(ref null 0)`. So `q[0]` reads a
+  `(ref 0)` out of the shared backing and `.b` applies `struct.get 1 1` to it. Two tables,
+  two different keys, one program.
+
+* **NOT D402, AND THE OTHER DIRECTION FROM IT.** D402 is a loud reject that fires because ONE
+  row serves two spellings; this is a silent miscompile that fires because TWO rows serve one
+  layout while their element table holds one. Lifting D402's `nameIsStructDecl` gate does not
+  touch it (measured: unchanged under that candidate).
+
+* **PRICE, UNBUILT.** The fix is at the intern layer — either the struct table dedups two
+  same-layout struct-alias unions onto one row (which changes what `structNameOfTy` answers
+  for each and is a rep-layer change owing `rep-fuzz-check.sh`), or the ref-list table keys on
+  the ELEMENT ROW rather than the layout, which mints a second array type per alias and costs
+  module size on every same-layout pair. Neither was built here; the cell is in the standing
+  gate so whichever lands is graded against it.
+
+---
+
+### D442 — an intersection alias's ref LIST assigned into a STRUCTURALLY-spelled field list is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-28 by D402's neighbourhood grid · pre-existing and IDENTICAL on master `f9275d20` and on this branch · NOT moved by D402's refused lift candidate · kept whole at `distilled/named/d402_silent_field_from_alias.vl`**
+
+Repro:
+
+    type AB = {a:i32} & {b:i32}
+    type W = { xs: {a:i32, b:i32}[] }
+    const q: AB[] = [{a:5,b:6}]
+    const w: W = { xs: q }
+    print(w.xs[0].a)
+    print(w.xs[0].b)
+    // vl check rc 0 — and one of the HINTs says `w` is inferred as `{xs: AB[]}`, i.e. the
+    // checker considers the two spellings the same type. vl run:
+    //   Invalid input WebAssembly code at offset 223:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **THREE INGREDIENTS, EACH REMOVABLE ALONE.** With the alias declared as a plain struct it
+  RUNS. With the field spelled `AB[]` instead of `{a:i32, b:i32}[]` it RUNS. With the literal
+  written inline (`const w: W = { xs: [{a:5,b:6}] }`, no intermediate binding) it RUNS. The
+  bare-struct twin of every one of those runs too.
+
+* **THE MECHANISM IS OFF THE DISASSEMBLY.** Two struct rows of one layout (`type 0`, the
+  anonymous inline shape; `type 1`, `AB`) each get their OWN ref-list wrapper —
+  `type 4` over `(array (mut (ref null 0)))` and `type 6` over `(array (mut (ref null 1)))`.
+  `W.xs` is typed `(ref 4)`; the global `q` is a `(ref 6)`; `struct.new 2` is handed the
+  wrong one and there is no coercion between two wrappers the CHECKER calls one type.
+
+* **THE POSITION IS D402's ONE ADMITTED POSITION.** The struct FIELD is the one place of
+  seven where D402's `checkArrName` reject does not fire, so it is exactly where a silent cell
+  can live: the loud row's coverage stops one position short of it. That is the general shape
+  worth carrying — **a loud reject's boundary is where its family's silent cells sit.**
+
+---
+
+### D443 — a value of an intersection ALIAS handed to a STRUCTURALLY-spelled struct param is a loud emit reject
+**loud emit reject (`emitProgram: ref valtype with no interned shape`) · found 2026-08-28 by the nine-gate object probe built to sequence D402 against D425 · pre-existing and IDENTICAL on master `f9275d20` and on this branch**
+
+Repro:
+
+    type AB = {a:i32} & {b:i32}
+    function f(v: {a:i32,b:i32}): i32 { return v.b }
+    const x: AB = {a:1,b:2}
+    print(f(x))
+    // vl check rc 0; vl run:
+    //   emitProgram: ref valtype with no interned shape
+
+* **THE PLAIN-STRUCT TWIN RUNS**, printing 2, and so does the reverse direction (an
+  `{a:i32,b:i32}`-typed value handed to a `v: AB` param) on BOTH declarations.
+
+* **IT IS D402's ROOT AT A THIRD GATE.** `type X = A & B` canonicalizes to a one-variant
+  `UnionDecl`, and the "is this an object / a declared struct" gates do not recognise it.
+  Measured at nine gates against the plain-struct twin, five diverge and four agree:
+
+  | gate | intersection | plain struct twin |
+  |---|---|---|
+  | field read `x.a` | runs | runs |
+  | param typed `AB` | runs | runs |
+  | `AB[]` ref list | runs | runs |
+  | bare struct annotation | runs | runs |
+  | **param typed `{a:i32,b:i32}`** | **loud emit reject** (this row) | runs |
+  | **`{a:i32,b:i32}[]` element** | **loud emit reject** (D402) | runs |
+  | **`if t is AB` narrow** | **loud emit reject** (`` `is` names a declared union member with no interned arm representation ``) | runs |
+  | **`function "+"(self: AB, …)`** | **loud check reject** (`operator '+' is not defined for AB and AB`) | runs |
+  | **`function "+"(self: {a:i32,b:i32}, …)` over `AB` operands** | **loud check reject** | runs |
+
+* **ALL FIVE ARE LOUD, WHICH IS THE POINT OF FILING THEM TOGETHER.** The root produces a
+  family of refusals, not a family of miscompiles; the two silent cells it does own (D441,
+  D442) need a second declaration or a second spelling on top. A fix at the root closes all
+  five at once, and it is the prerequisite D425's declaration-site reject is waiting on.
+
+---
+
+### D444 — a ONE-PARAMETER operator declaration is inert at EVERY receiver, and `lint.vl` believes it dispatches
+**check-clean silently wrong · found 2026-08-28 by D425's operator-family grid · pre-existing and IDENTICAL on master `f9275d20` and on this branch · STRICTLY STRONGER THAN D425: no `self` type makes this one work**
+
+Repro:
+
+    function -(self: i32): i32 {
+      return 99
+    }
+
+    const a: i32 = 7
+    print(-a)
+    // vl check rc 0. The declared operator returns 99 unconditionally, so a dispatch
+    // would print 99.
+    // PRINTS -7
+
+* **THERE IS NO UNARY DISPATCH PATH AT ALL.** `checkUnaryNode` (`typecheck.vl:30757`) handles
+  `!`, `p+`/`p-` and `-`, and for `-` asks only `isNumeric(arg)`; it never looks for an
+  operator function. `opSelfFnTy` cannot answer either — it requires
+  `d.fnParams.length == 2`. So a one-parameter declaration is unreachable from both ends.
+
+* **THE OBJECT RECEIVER — the one the user meant — IS LOUD, AND WRONG.**
+  `type V = { x: i32 }` + `function -(self: V): i32 { return 99 }` + `-a` over `a: V` is
+  `unary '-' expects a numeric type, got V`. The two-parameter control dispatches:
+  `function -(self: V, b: V)` + `a - b` prints 99. So the arity, not the receiver, is what
+  makes it inert — and `function +(self: V)`, `function *(self: V)`, `function <(self: V)`
+  are equally inert (each declares fine and does nothing).
+
+* **THE PARSER ACCEPTS IT AND THE LINTER ASSUMES IT WORKS.** `isOpFuncName` accepts the `-`
+  token and `isStrFuncName` accepts `"-"`, so both spellings declare. `compiler/lint.vl:1328`
+  says in its own words *"An operator method (`-x` → `function -(self)`) dispatches by
+  operator name"* and adds `n.unOp` to the reference set on that belief — so the declaration
+  is not even reported as unused. Three components in the tree disagree about whether this
+  feature exists.
+
+* **PRICE.** Same D46 shape and the same choice: implement unary dispatch (a
+  `checkUnaryNode` arm mirroring `checkBinary`'s `if odsp is TyObj` plus an emitter path) or
+  reject the declaration. The reject is the cheaper half and is keyed on ARITY plus the
+  operator name, both of which `parseFuncTail` has — so unlike D425's binary case this one is
+  NOT blocked behind D402's root, because it needs no resolved type. Nothing in the tree
+  declares a one-parameter operator, so the reject costs no capability.
+
+---
+
+### D445 — D425's shape at the INDEX operators: a `"[]"` declaration over a non-object `self` is silently ignored
+**check-clean silently wrong · found 2026-08-28 by D425's operator-family grid — the position the row's own price never counted · pre-existing and IDENTICAL on master `f9275d20` and on this branch**
+
+Repro:
+
+    function "[]"(self: i32[], i: i32): i32 {
+      return 99
+    }
+
+    const xs: i32[] = [1, 2]
+    print(xs[0])
+    // vl check rc 0. The declared index operator returns 99 unconditionally, so a
+    // dispatch would print 99.
+    // PRINTS 1
+
+* **THE SAME AT EVERY NON-OBJECT RECEIVER WITH A NATIVE INDEX.** `self: string` over
+  `s[0]` prints **97** (the native char code), and `"[]="` over an `i32[]` writes natively
+  (`xs[0] = 5` then `xs[0]` prints **5**, not the declaration's value). Control: `"[]"` and
+  `"[]="` over a declared struct dispatch — a `Box` with a `d: i32[]` field prints 99 for the
+  read and 105 for the read-after-write through a declaration that adds 100.
+
+* **THE POPULATION IS REAL, WHICH IS WHY IT IS FILED SEPARATELY FROM D425.** `std/buffer.vl`
+  exports four index operators (`"[]"`/`"[]="` over `F32View` and `I32View`) and five
+  fixtures declare more. D425's price rested on "nothing in the tree declares one"; that is
+  true of the BINARY operators and false here, so a declaration-site gate has a live std
+  customer to agree with and cannot be written from the binary rule alone.
+
+* **THE DISPATCH IT MISSES IS A DIFFERENT ONE.** Index dispatch resolves by the RECEIVER'S
+  TYPE through `opIdxBindGen` / the `"[]"` lookup in `typecheck.vl`, not through
+  `checkBinary`'s `if odsp is TyObj`. So the reachability predicate for a `"[]"` declaration
+  is its own question and its own measurement — the second of the three D425's corrected
+  price counts.
 
 ---
 
