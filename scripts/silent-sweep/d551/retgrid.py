@@ -33,11 +33,41 @@ THE AXES, and why each is separate:
     use      `val` prints the result, `drop` binds and drops it (`print(1)`). `val` is what
              makes a wrong VALUE visible; `drop` is the silent form D551's row could file.
 
-THE `wanthole` BLOCK IS A REFUSED RUNG'S PRICE, not a fix list. Recording the constraint when
-only the DECLARED side carries a hole (`function g<T>(self: T, n: i32): T { return n + 1 }`)
-closes those cells too — and refuses `tests/cases/memory/flat-generic-rows-branded.vl`, a
-module that RUNS correctly, because `as T` over a type parameter is not a spelling the
-language has. Refused; the cells are kept whole in `named/` and filed as D561.
+THE `wanthole` BLOCK WAS A REFUSED RUNG'S PRICE AND IS NOW THE LANDING'S OWN (D561).
+Recording the constraint when only the DECLARED side carries a hole (`function g<T>(self: T,
+n: i32): T { return n + 1 }`) closes those cells — and the FULL widening also refuses
+`tests/cases/memory/flat-generic-rows-branded.vl`, a module that RUNS correctly, because
+`as A` over a type parameter is not a spelling the language has. What ships is the widening
+MINUS one exemption: a want-side-only constraint whose destination is a newtype BRAND the
+body's type already fits UNBRANDED is deferred, because that is the one mismatch with no
+writable repair. Five blocks below exist to hold that line, and each was built because a
+candidate moved it:
+
+    wv       THE WANT BLOCK GRADED BY VALUE. The original block prints `1` at every cell,
+             so a cell that RUNS while its direct twin rejects looked like a healthy
+             `runs` — and `d551w_bool_typar` is exactly that: `g(true, -1)` returns the
+             i32 `0` into a `boolean` slot and prints `false`. A grid that drops the value
+             cannot see it, and the standing gate scored its loss as a REGRESSION.
+    xbrand   TWO BRANDS OVER ONE BASE. `function g<A>(a: A, b: Meters): A { return b }` at
+             `g(feet, meters)` RAN, printing `10` — a Meters handed back as a Feet, which
+             is the confusion `new` exists to catch. The exemption must not reach it, and
+             it does not: `Meters` is not assignable to `i32`, so the base test fails.
+    bhole    THE MIRROR THE EXEMPTION MUST NOT TOUCH. `function g<T>(self: T): A1 { return
+             self }` is a hole on the BODY side under a CONCRETE newtype, where `return
+             self as A1` IS writable and D551 already rejects it. A first cut asked the
+             newtype question of EVERY return constraint and took this cell from a loud
+             reject to `runs` printing `6`. The `wOnly` column is what separates them.
+    phantom  THE DISTINGUISHER THAT WAS PROPOSED AND DOES NOT EXIST. "Refuse when the hole
+             appears in a PARAMETER position; admit the phantom brand" reads well and is
+             two things at once wrong: `rowAt<R, A>(self: Rows<R, A>)` names `A` in a
+             parameter position (its own header says so — the brand is a FIELD, and that
+             is the whole difference), and a hole that really IS unbound already defers,
+             at `validateRetCstrs` rather than at the gate. This cell is the second half
+             stated executably: it RUNS on every seed here, including the full widening.
+    forge    THE RESIDUE THE EXEMPTION BUYS, filed as D571. `function g<T>(a: T, n: i32): T
+             { return n + 1 }` at a `TVAddr` argument hands back an unbranded i32 wearing
+             the brand. Rep-correct, value-correct, nominally forged — and the price of
+             keeping the corpus module. It RUNS on the base seed and on the landing.
 
     python3 scripts/silent-sweep/d551/retgrid.py [seed.wasm]     grade to stdout
     python3 scripts/silent-sweep/d551/retgrid.py --table         by ret x body x arg
@@ -62,9 +92,11 @@ VL = os.path.join(R, "scripts/vl-host/target/release/vl")
 NAMED = os.path.join(R, "scripts/silent-sweep/distilled/named")
 LISTS = os.path.join(HERE, "lists.json")
 JOBS = int(os.environ.get("JOBS", "6"))
-# The seed this landing branched from (master 8a3b5c5b, 1,496,055 bytes). `--price` reads it
-# to tell "you handed me the pre-landing compiler" from "a candidate broke a price cell".
-BASE_MD5 = "027e4b71f283bcdb6dc3a2049ca538f9"
+# The seed the CURRENT landing branched from (master 3d8734bb, 1,497,679 bytes — D551's own
+# landing, which is D561's base). `--price` reads it to tell "you handed me the pre-landing
+# compiler" from "a candidate broke a price cell". D551's base was 8a3b5c5b / md5
+# 027e4b71f283bcdb6dc3a2049ca538f9; the price cells run on both, so only the id separates them.
+BASE_MD5 = "8496f0496ceae29aa2e7c8eee14c24d8"
 
 
 def seed_md5(p):
@@ -175,6 +207,105 @@ def want_id(arg, delivery):
     return "d551w_%s_%s" % (arg, delivery)
 
 
+# THE SAME BLOCK, PRINTED. `n = -1` rather than `2` so the returned i32 is `0`: at `T =
+# boolean` that renders `false` while the argument is `true`, which is the fact a `print(1)`
+# cell cannot carry. Every cell here returns `n + 1`, so the value a cell prints when it
+# legitimately runs is that ONE i32 rendered at the declared return type — `WVAL` is that
+# sentence and nothing else.
+WVAL = {"i32": "0", "f64": "0", "bool": "false"}
+
+
+def wval_src(arg, delivery):
+    aty, alit = ARGS[arg]
+    sig = "<T>(self: T, n: i32)" if delivery == "typar" else "(self: %s, n: i32)" % aty
+    # `print` of an object is not a thing, so the OBJECT row reads a FIELD off the result.
+    # Printing the whole `z` there made the cell `print of V is not supported` on both
+    # spellings — an AGREEING cell that measures the printer rather than the pin.
+    return "\n".join(_preamble() + [
+        "function g%s: %s { return n + 1 }" % (sig, "T" if delivery == "typar" else aty),
+        "const p: %s = %s" % (aty, alit),
+        "const z = g(p, -1)",
+        "print(%s)" % ("z.x" if arg == "obj" else "z"),
+    ]) + "\n"
+
+
+def wval_id(arg, delivery):
+    return "d551wv_%s_%s" % (arg, delivery)
+
+
+# TWO BRANDS OVER ONE BASE, and the pin must not confuse them. The direct twin is a loud
+# `return type mismatch: expected Feet, got Meters`; the pin RAN, printing `10`.
+def xbrand_src(delivery):
+    sig = "<A>(a: A, b: Meters)" if delivery == "typar" else "(a: Feet, b: Meters)"
+    ty = "A" if delivery == "typar" else "Feet"
+    return "\n".join([
+        "type Meters = new i32",
+        "type Feet = new i32",
+        "function g%s: %s { return b }" % (sig, ty),
+        "const f: Feet = 3",
+        "const m: Meters = 10",
+        "print(g(f, m) as i32)",
+    ]) + "\n"
+
+
+# A HOLE ON THE BODY SIDE UNDER A CONCRETE NEWTYPE — D551's own shape, with a newtype in the
+# declared position. `return self as A1` is writable here, so the pin holds the author to it
+# and this cell must stay a loud reject. It is the control that refuted the exemption's
+# first cut.
+def bhole_src(delivery):
+    sig = "<T>(self: T)" if delivery == "typar" else "(self: i32)"
+    return "\n".join([
+        "type A1 = new i32",
+        "function g%s: A1 { return self }" % sig,
+        "const p: i32 = 6",
+        "print(g(p) as i32)",
+    ]) + "\n"
+
+
+# A TYPE PARAMETER THAT REALLY IS PHANTOM — named in the signature, absent from the alias
+# BODY, so no call can bind it. `validateRetCstrs` defers on a substituted side that still
+# carries a hole, so this RUNS under every candidate in this file, the full widening
+# included. Its `direct` twin is a DELIBERATE disagreement: writing the parameter out is
+# exactly what stops it being phantom, so the twin is a different question.
+def phantom_src(delivery):
+    sig = "<A>(self: Rows<A>, i: i32)" if delivery == "typar" else "(self: Rows<A1>, i: i32)"
+    ty = "A" if delivery == "typar" else "A1"
+    return "\n".join([
+        "type A1 = new i32",
+        "type Rows<A> = { base: i32 }",
+        "function rowAt%s: %s {" % (sig, ty),
+        "  return self.base + i * 4",
+        "}",
+        "const st: Rows<A1> = { base: 1024 }",
+        "print(rowAt(st, 2) as i32)",
+    ]) + "\n"
+
+
+# THE RESIDUE, filed as D571: a brand forged from its own unbranded base through a type
+# parameter. The exemption admits it deliberately, so it RUNS on the base seed and on the
+# landing while its direct twin is a loud reject on both. The third deliberate disagreement.
+def forge_src(delivery):
+    sig = "<T>(a: T, n: i32)" if delivery == "typar" else "(a: TVAddr, n: i32)"
+    ty = "T" if delivery == "typar" else "TVAddr"
+    return "\n".join([
+        "type TVAddr = new i32",
+        "function g%s: %s { return n + 1 }" % (sig, ty),
+        "const p: TVAddr = 0",
+        "print(g(p, 2) as i32)",
+    ]) + "\n"
+
+
+# id -> (source builder, the value it prints when it runs). One row per one-off cell, so
+# `cells()` and `want_of` read the SAME table and a new cell cannot reach one without the
+# other.
+ONEOFFS = {
+    "xbrand": (xbrand_src, "10"),
+    "bhole": (bhole_src, "6"),
+    "phantom": (phantom_src, "1032"),
+    "forge": (forge_src, "3"),
+}
+
+
 # The BRAND cell, which is the corpus module's shape reduced to eight lines: a `new i32`
 # newtype reached through a type parameter the caller pins. It RUNS on the landing and its
 # direct twin is LOUD — the one pair in this file where agreement with the twin is NOT the
@@ -210,8 +341,11 @@ def cells():
     for arg in ARGS:
         for d in ("typar", "direct"):
             out[want_id(arg, d)] = want_src(arg, d)
+            out[wval_id(arg, d)] = wval_src(arg, d)
     for d in ("typar", "direct"):
         out[brand_id(d)] = brand_src(d)
+        for nm, (mk, _v) in ONEOFFS.items():
+            out["d551w_%s_%s" % (nm, d)] = mk(d)
     return out
 
 
@@ -230,6 +364,11 @@ def want_of(cid):
     the DIRECT TWIN on the seed under test. Never consulted for a cell that is not `runs`."""
     if cid.startswith("d551w_brand_"):
         return "1032"
+    for nm, (_mk, v) in ONEOFFS.items():
+        if cid.startswith("d551w_%s_" % nm):
+            return v
+    if cid.startswith("d551wv_"):
+        return WVAL.get(cid.split("_")[1], "0")
     if cid.startswith("d551w_"):
         return "1"
     parts = cid.split("_")
@@ -308,7 +447,8 @@ def named_set(L):
     # are D561's witnesses, and a future change that closes or worsens them should be visible
     # in the standing gate rather than only in this grid.
     return sorted(set(L.get("fix", []) + L.get("price", []) + L.get("control", [])
-                      + L.get("residue", [])))
+                      + L.get("residue", []) + L.get("refute", [])
+                      + L.get("deliberate", [])))
 
 
 def require(name, rows):
@@ -375,6 +515,7 @@ def main():
         # candidate, so it can only ever be written by running one.
         cand = sys.argv[sys.argv.index("--write-lists") + 1]
         after = grade_all(cand, cs)
+        aft_agr = agreement(after)
         moved = sorted(n for n in base
                        if (base[n]["class"], base[n]["msg"]) !=
                           (after[n]["class"], after[n]["msg"]))
@@ -385,8 +526,9 @@ def main():
         SILENT = ("invalid", "trap", "emit")
         refused = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--refused"]
         price, whopaid = set(), {}
+        REFGRADE = {rs: grade_all(rs, cs) for rs in refused}
         for rs in refused:
-            rg = grade_all(rs, cs)
+            rg = REFGRADE[rs]
             for n in cs:
                 if not n.endswith("_typar"):
                     continue
@@ -398,6 +540,33 @@ def main():
                 if worse and okhere:
                     price.add(n)
                     whopaid.setdefault(os.path.basename(rs), []).append(n)
+        # REFUTE: cells a refused candidate made WORSE IN THE OTHER DIRECTION — a loud reject
+        # on the base AND on the landing, agreeing with its direct twin on both, that the
+        # candidate turned into a `runs`. `price` cannot see these: it only counts a LOST
+        # `runs`, and a candidate that INVENTS one is invisible to it. The exemption's first
+        # cut is exactly that shape — asked of every return constraint rather than only of a
+        # want-side-only one, it took `d551w_bhole_typar` from a positioned reject to `runs`
+        # printing `6`, which is a D551 cell re-opening.
+        refute = set()
+        for rs in refused:
+            rg = REFGRADE[rs]
+            for n in cs:
+                if not n.endswith("_typar"):
+                    continue
+                if base[n]["class"] == "check" and after[n]["class"] == "check":
+                    if agr[n] == "agree" and rg[n]["class"] == "runs":
+                        refute.add(n)
+                        whopaid.setdefault(os.path.basename(rs) + " (invented a runs)",
+                                           []).append(n)
+        # DELIBERATE: cells that RUN on the landing while their DIRECT twin is a loud reject
+        # — the exemption's whole surface, stated as a list rather than as a paragraph. Every
+        # other `_typar` cell in this file is graded by agreement with its twin; these three
+        # are the ones where agreement is NOT the criterion, and a fourth appearing here is a
+        # leak that nothing else in the file would report.
+        deliberate = sorted(n for n in cs
+                            if n.endswith("_typar") and base[n]["class"] == "runs"
+                            and after[n]["class"] == "runs"
+                            and aft_agr.get(n) == "DISAGREE")
         # RESIDUE: pinned cells the LANDING still leaves silent beside a LOUD direct twin.
         # Derived, not listed by hand, so a landing cannot quietly stop naming one.
         residue = sorted(n for n in cs
@@ -408,12 +577,15 @@ def main():
                "refused": {k: sorted(v) for k, v in whopaid.items()},
                "fix": fix,
                "price": sorted(price),
+               "refute": sorted(refute),
+               "deliberate": deliberate,
                "residue": residue,
                "control": control}
         json.dump(out, open(LISTS, "w"), indent=1, sort_keys=True)
-        print("wrote %d fix + %d price (from %d refused candidates) + %d residue + %d "
-              "control to %s"
-              % (len(fix), len(price), len(refused), len(residue), len(control), LISTS))
+        print("wrote %d fix + %d price + %d refute + %d deliberate (from %d refused "
+              "candidates) + %d residue + %d control to %s"
+              % (len(fix), len(price), len(refute), len(deliberate), len(refused),
+                 len(residue), len(control), LISTS))
         return 0
 
     if "--delta" in sys.argv:
@@ -481,6 +653,19 @@ def main():
             print("  %-22s %s/%s" % (arg, base[n]["class"], base[twin(n)]["class"]))
         n = brand_id("typar")
         print("  %-22s %s/%s" % ("brand", base[n]["class"], base[twin(n)]["class"]))
+        print()
+        print("== the same block PRINTED (`n = -1`, so the returned i32 is 0)")
+        for arg in ARGS:
+            n = wval_id(arg, "typar")
+            print("  %-22s %s/%s   pin printed %r, twin %r"
+                  % (arg, base[n]["class"], base[twin(n)]["class"],
+                     base[n]["msg"][:24], base[twin(n)]["msg"][:24]))
+        print()
+        print("== the one-off cells the exemption is drawn around")
+        for nm in ONEOFFS:
+            n = "d551w_%s_typar" % nm
+            print("  %-22s %s/%s   pin printed %r"
+                  % (nm, base[n]["class"], base[twin(n)]["class"], base[n]["msg"][:24]))
         nd = sum(1 for g in agr.values() if g == "DISAGREE")
         wv = wrongvalue(base)
         print("\n%d of %d pinned cells DISAGREE with their direct twin" % (nd, len(agr)))
@@ -541,6 +726,37 @@ def main():
         print("expectations: %d of %d twin-endorsed `runs` cells print something want_of "
               "does not predict" % (len(badexp), len(endorsed)))
         if badexp:
+            rc = 1
+        # THE REFUTATION CELLS, RE-ASKED. Each must be a LOUD reject on the seed under test
+        # and must AGREE with its direct twin there — that is the whole content of "the
+        # exemption does not reach a body-side hole". An empty list is a failure like every
+        # other population here.
+        ref = L.get("refute", [])
+        if not require("refute", ref):
+            rc = 1
+        badref = [n for n in ref if base[n]["class"] != "check" or agr.get(n) != "agree"]
+        for n in badref[:20]:
+            print("REFUTATION CELL MOVED (must be an agreeing loud reject): %s  %s/%s"
+                  % (n, base[n]["class"], agr.get(n)))
+        print("refute: %d of %d refutation cells are not agreeing loud rejects"
+              % (len(badref), len(ref)))
+        if badref:
+            rc = 1
+        # THE DELIBERATE DISAGREEMENTS, ENUMERATED. Each must still RUN and must still
+        # DISAGREE with its twin: a member that starts AGREEING has had its exemption
+        # withdrawn (D561 closing further), and a member that stops running is the corpus
+        # module's shape breaking. Both are movements a reader must be told about, and
+        # neither is visible in the headline DISAGREE count, which nets them off.
+        dlb = L.get("deliberate", [])
+        if not require("deliberate", dlb):
+            rc = 1
+        baddlb = [n for n in dlb if base[n]["class"] != "runs" or agr.get(n) != "DISAGREE"]
+        for n in baddlb[:20]:
+            print("DELIBERATE CELL MOVED (must be a DISAGREEING `runs`): %s  %s/%s"
+                  % (n, base[n]["class"], agr.get(n)))
+        print("deliberate: %d of %d exempted cells are not disagreeing `runs`"
+              % (len(baddlb), len(dlb)))
+        if baddlb:
             rc = 1
         want = named_set(L)
         if not require("named/", want):
@@ -612,7 +828,7 @@ def main():
         # "they all fail" is not available as a wrong-seed signature in either direction. An
         # md5 says which compiler this was; nothing about behaviour can.
         if BASE_MD5 == seed_md5(seed):
-            print("price: this IS the base seed (8a3b5c5b, md5 %s). These cells run there "
+            print("price: this IS the base seed (3d8734bb, md5 %s). These cells run there "
                   "too, so a pass here says only that the base is intact — re-run against "
                   "build/vl-compiler.wasm from this branch to grade the landing." % BASE_MD5)
             return 2

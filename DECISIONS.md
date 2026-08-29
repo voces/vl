@@ -22,16 +22,39 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   and `binOpDefinedFor` did (D492/D493). The recorded column is therefore the returned
   EXPRESSION's node, not a position for the diagnostic.
 
-- **A REJECT IS NOT AVAILABLE WHEN THE PROGRAM IT WOULD DEMAND CANNOT BE WRITTEN**
-  (2026-08-29, silent-class-inventory D561 / #2017). D551's rule generalises one column over
-  — a concrete body under a type-parameter RETURN is the same silent module beside the same
-  loud direct twin — and that widening was still refused. It costs
+- **A REJECT IS NOT AVAILABLE WHEN THE PROGRAM IT WOULD DEMAND CANNOT BE WRITTEN — SO DRAW
+  THE RULE AROUND THAT PROGRAM RATHER THAN DROPPING IT** (2026-08-29, silent-class-inventory
+  D561 / #2017, revised by D561's close). D551's rule generalises one column over — a
+  concrete body under a type-parameter RETURN is the same silent module beside the same loud
+  direct twin — and the widening ALONE was refused, because it costs
   `tests/cases/memory/flat-generic-rows-branded.vl`, where a generic hands back an `i32`
-  address as a phantom `new i32` brand: the direct spelling is a loud `return type mismatch`,
-  so the pin would be RIGHT, but `(self.base + i * 4) as A` is `` `as` supports numeric
-  conversions only ``. **"Make it loud" is only an answer when the author has a spelling for
-  what they meant.** Filed with an executable price rather than argued about, so the day
-  `as T` exists the bound goes.
+  address as a `new i32` brand: the direct spelling is a loud `return type mismatch`, so the
+  pin would be RIGHT, but `(self.base + i * 4) as A` is `` `as` supports numeric conversions
+  only ``. **"Make it loud" is only an answer when the author has a spelling for what they
+  meant** — and the converse also holds: **the absence of a spelling bounds ONE mismatch, not
+  the whole rule.** What ships is the widening minus `retNomOnlyAtHole`, which defers exactly
+  the mismatch with no writable repair (a want-side-only constraint whose destination is a
+  newtype BRAND over a base the body's type already fits). Four cells close and the corpus is
+  byte-identical. The residue is D571; the day `as A` exists it goes with the exemption.
+
+- **THE HOLE'S SIDE DECIDES WHICH RULE ADJUDICATES IT, AND ONE PREDICATE FOR BOTH RE-OPENS
+  THE ROW BELOW IT** (2026-08-29, silent-class-inventory D561 / #2017). `retCstr` now records
+  which side carried the hole. A hole on the BODY side sits under a declaration the author
+  SPELLED, so the repair is writable and D551 holds them to it; a hole on the DECLARED side
+  is a destination named `A`, and there is no cast to hold anyone to. Asking the newtype
+  exemption of both took `function g<T>(self: T): A1 { return self }` from D551's positioned
+  reject to `runs` printing `6`. **A candidate that INVENTS a passing program is invisible to
+  a price ledger, which counts lost `runs`** — so the grid grew a second ledger (`refute`)
+  and the tree a must-reject fixture.
+
+- **A GRID THAT DROPS THE VALUE CANNOT SEE A REP-COMPATIBLE TYPE ERROR, AND WILL SCORE ITS
+  FIX AS A REGRESSION** (2026-08-29, silent-class-inventory D561 / #2017). The `wanthole`
+  block printed `1` at every cell, so `d551w_bool_typar` — `function g<T>(self: T, n: i32): T
+  { return n + 1 }` at a `boolean` — read as a healthy `runs`, and the standing gate blocked
+  the fix that closed it. Printed, it is `false` for an argument that was `true`: i32 and
+  boolean share a rep, so there was no invalid wasm to trip over and only the VALUE says
+  anything. Second time in one week (`pingrid2` could not see wrong values at all).
+  **Where a row is a type mismatch, print the result.**
 
 - **A DEFERRED TYPE IS A TYPE NOTHING IN THE BODY CHECKS, SO THE DEFERRAL HAS TO STOP WHERE
   A CHECK WOULD HAVE RUN — AND THE CHECK IS BUILDABLE** (2026-08-29, silent-class-inventory

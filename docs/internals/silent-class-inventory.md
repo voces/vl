@@ -15430,50 +15430,207 @@ Repro (now a loud check reject):
 
 ---
 
-### D561 — the DECLARED return may still be a hole the body cannot check, and there is no `as T` to write instead
-**check-clean invalid wasm · found 2026-08-29 as the measured, REFUSED price of D551's
-want-side rung · 2 cells (`d551w_{obj,str}_typar`) of `scripts/silent-sweep/d551/retgrid.py`,
-kept whole in `distilled/named/` with the 2 price cells the close would cost**
+### D561 — [CLOSED 2026-08-29] the DECLARED return was a hole the body could not check, and the widening had to be drawn AROUND the one destination `as` cannot spell
+**closed 2026-08-29 · the filed repro is now a loud check reject · was `check-clean invalid
+wasm` · found 2026-08-29 as the measured, REFUSED price of D551's want-side rung · 7 cells of
+`scripts/silent-sweep/d551/retgrid.py` move — 4 `invalid` -> `check` and 3 `runs` -> `check`,
+DISAGREE-with-the-direct-twin 14 -> 7 — with 2 price cells, 1 refutation cell and 3 deliberate
+disagreements kept whole in `distilled/named/` · corpus 2,412 modules, 1,964 identical,
+0 DIFFER, 0 LOST**
 
-Repro:
+Repro (now a loud check reject):
 
     function g<T>(a: T, n: i32): T {
       return n + 1
     }
     print(g("s", 2))
+    // now: vl check rc 1 — return type mismatch: expected string, got i32
+    //   (the return of `g` at the call's argument types)
+
+* **THE MECHANISM IS D551's EXACTLY, ONE COLUMN OVER.** D551 is a hole on the BODY side under
+  a concrete declaration; this is a concrete body under a hole DECLARATION, and
+  `assignable(i32, T)` is vacuous for the same reason `assignable(T, V)` was. `noteRetCstr`'s
+  gate is now `tyHasHole(got) || tyHasHole(want)` and `validateRetCstrs` re-asks the pair
+  under substitution as before.
+
+* **THE FULL WIDENING WAS REFUSED, AND IT IS STILL REFUSED.** `ABL_ADD_R5` — the gate widened
+  and nothing else — stops TWO corpus modules building:
+  `tests/cases/memory/flat-generic-rows-branded.vl` (webcraft P1.2, ten correct values) and
+  `tests/cases/generics/declared-return-vs-body-at-pin-keeps.vl`, the fixture D551 added to
+  hold this very price. The filed row named one; `corpuscmp.py` named both, which is the
+  difference between reading a row and running one.
+
+* **THE OBSTACLE IS A MISSING SPELLING, AND IT IS NARROWER THAN `as T`.** The body computes
+  an `i32` address and hands it back as the brand `A`. `(self.base + i * 4) as A` is
+  `` `as` supports numeric conversions only `` — but `as A1` over the CONCRETE newtype WORKS
+  and always has (`primNameOf(A1)` is `i32`, so the numeric ladder admits it). What is missing
+  is not `as` over a type parameter in general; it is `as` over a type parameter whose binding
+  the pin already knows. That is a deferred CAST constraint, the same shape as the five
+  deferred tables already in `typecheck.vl`.
+
+* **SO THE GATE SHIPS MINUS ONE PREDICATE.** `retNomOnlyAtHole` defers a constraint that is
+  (a) want-side-ONLY, (b) whose substituted destination is a newtype BRAND, and (c) whose body
+  type already fits that brand's UNBRANDED base. Same rep, same value, the brand the one thing
+  missing — and the only mismatch in the family with no writable repair. Both corpus modules
+  build byte-identically; the whole corpus does.
+
+* **THE `wOnly` TERM IS LOAD-BEARING AND A CANDIDATE PROVED IT.** Asked of EVERY return
+  constraint, the same predicate takes `function g<T>(self: T): A1 { return self }` at `g(6)`
+  from D551's positioned reject to `runs` printing `6` — a body-side hole under a CONCRETE
+  newtype, where `return self as A1` is writable and D551 already holds the author to it.
+  That is D551 re-opening, and `price` could not have seen it: `price` counts a LOST `runs`
+  and this candidate INVENTED one. `lists.json:refute` is the ledger that does see it, and
+  `tests/cases/generics/declared-return-newtype-body-hole-rejects.vl` is the standing gate.
+
+* **THE GRID WAS BLIND TO A THIRD CELL, AND IT WAS THE WORST ONE.** The `wanthole` block
+  printed `1` at every cell, so `d551w_bool_typar` — which RUNS — scored as a healthy `runs`
+  and the standing gate scored its loss as a REGRESSION. Printed, it is
+  `print(g(true, -1))` -> **`false`**: the returned i32 `0` rendered at the declared
+  `boolean`, for an argument that was `true`, beside a direct twin that is a loud
+  `return type mismatch: expected boolean, got i32` on every seed ever graded. The `d551wv_*`
+  block is that block with the value restored, and it is instrument rule 5 (`pingrid2` could
+  not see wrong values at all) paid a second time in the same week.
+
+* **THE OVERRIDE, TERM BY TERM, AND WHY IT DOES NOT REACH THE BRAND CELL.**
+  `d551w_bool_typar` and `d551wv_bool_typar` go `runs` -> not-runs and are overridden on all
+  four terms: they run by COINCIDENCE (the one-token-different twin is a loud reject and the
+  value printed contradicts the declaration), the loss is LOUD (a positioned message naming
+  the call), and the price is NAMED and REVERSIBLE (`named/`, one predicate).
+  `d551w_brand_typar` fails the first term outright — it prints ten right values by design —
+  which is why it is EXEMPTED rather than overridden, and why `flat-generic-rows-branded.vl`
+  still builds byte-identically instead of being rewritten.
+
+* **A FOURTH CELL CLOSED THAT NOTHING HAD FILED.** `function pass<A>(a: A, m: Meters): A
+  { return m }` at `pass(feet, meters)` RAN, printing `10` — a `Meters` handed back where the
+  call bound `A` to `Feet`, same rep and same value, which is the confusion `new` exists to
+  catch. The exemption does not reach it: `Meters` is not assignable to `i32`, so the
+  unbranded-base test fails and the reject stands. `d551w_xbrand_*`.
+
+* **THE PROPOSED DISTINGUISHER DOES NOT EXIST, AND IT IS TWO THINGS AT ONCE WRONG.** "Refuse
+  when the hole appears in a PARAMETER position, admit the phantom brand" reads well.
+  `rowAt<R, A>(self: Rows<R, A>, i: i32): A` names `A` in a parameter position — the fixture's
+  own header says the brand being a FIELD rather than a phantom is "the whole difference" —
+  so the rule refuses the module it was invented to save. And a parameter that really IS
+  phantom already defers, at `validateRetCstrs` rather than at the gate: a substituted side
+  still carrying a hole is undecided and always was. `d551w_phantom_*` states the second half
+  executably and RUNS under the full widening too.
+
+* **THE REWRITES, MEASURED.** `const r: A = self.base + i * 4; return r` makes the fixture
+  build under the full widening — and it is not a rewrite, it is the same defect one node
+  over: the concrete twin `const r: A1 = …` is a loud `` i32 doesn't fit in A1 … write
+  `x as A1` ``. Filed as D572. The one LEGITIMATE rewrite declares the return `i32` and casts
+  at each call site (`rowAt(st, 2) as TVAddr`), which type-checks with only writable spellings
+  and deletes the property the module exists to demonstrate — a branded accessor. Neither is
+  a reason to refuse the module.
+
+* **WHAT IS STILL OPEN, AND IT IS THE LANGUAGE QUESTION.** The exemption is not confined to
+  phantom-shaped containers: any body value that fits a brand's base may now wear the brand
+  without `as`, inside a generic returning a bare type parameter. That is D571, it RUNS on the
+  base seed and on this landing alike, and closing it needs the spelling the third bullet
+  names rather than a further narrowing here.
+
+---
+
+### D571 — a newtype BRAND can be forged from its own unbranded base inside a generic, because that is the one destination `as` cannot spell
+**runs today and must keep running · the deliberate, measured residue of D561's close · 3 cells
+(`d551w_{brand,forge,phantom}_typar`) of `scripts/silent-sweep/d551/retgrid.py`, kept whole in
+`distilled/named/` as `lists.json:deliberate` · standing gate:
+`tests/cases/generics/declared-return-hole-newtype-brand-keeps.vl`**
+
+Repro (runs today, prints `3`, and its direct twin is a loud reject):
+
+    type TVAddr = new i32
+    function bump<T>(a: T, n: i32): T { return n + 1 }
+    const addr: TVAddr = 0
+    print(bump(addr, 2) as i32)
+    // vl check rc 0, vl run prints `3`. The direct spelling
+    //   function bump(a: TVAddr, n: i32): TVAddr { return n + 1 }
+    // is `return type mismatch: expected TVAddr, got i32` on every seed ever graded.
+
+* **IT IS A REFUTATION PIN, NOT A DEFECT WAITING FOR A FIXER.** D561 closes the family it sits
+  in and STOPS at this line on purpose: `retNomOnlyAtHole` defers a want-side-only constraint
+  whose destination is a newtype brand over a base the body's type already fits. Refusing it
+  instead is `ABL_ADD_R5`, which is built, graded, and costs two corpus modules that run
+  correctly — `flat-generic-rows-branded.vl` (webcraft P1.2, ten right values) and
+  `declared-return-vs-body-at-pin-keeps.vl`. The pin flips the day someone lands that.
+
+* **THE REASON IS A MISSING SPELLING AND IT IS NARROWER THAN `as T`.** `as A1` over the
+  CONCRETE newtype works today and always has — `primNameOf(A1)` is `i32`, so `as`'s numeric
+  ladder admits it. What is missing is `as` over a type PARAMETER, whose target the body
+  cannot resolve and the pin can. So the ask is a sixth deferred table — record the cast,
+  re-ask it under `substTyDeep` — not a new conversion rule. Three options, priced:
+
+      as A            a deferred CAST constraint beside the five that exist (bin / arg / ret /
+                      print / escJoin). Reaches every `as` in a generic body, so it also fixes
+                      `as` over a type parameter bound to a NUMERIC type, which is refused
+                      today for the same reason. Touches `checkAsNode` + one table + the
+                      monomorphizer's per-instance lowering. Existing modules touched: 0 —
+                      every such program is a compile error today, so nothing can change
+                      meaning.
+      brand(x)        an intrinsic that constructs the enclosing type parameter's brand.
+                      Smaller (no cast constraint, one call form), and strictly weaker: it
+                      cannot express the numeric conversions `as A` would. A std export, so
+                      `std-api-reviewer` applies. Existing modules touched: 0.
+      phantom marker  an annotation on the type parameter that WAIVES the check for it. The
+                      cheapest to implement and the only one that does not close D571 — it
+                      moves the forge from implicit to opt-in, which is a real improvement in
+                      legibility and no improvement in soundness. Existing modules touched: 2
+                      (both fixtures would carry the marker).
+
+* **WHAT THE EXEMPTION DOES NOT REACH, measured rather than assumed.** Two brands over one
+  base stay a loud reject — `function pass<A>(a: A, m: Meters): A { return m }` at
+  `pass(feet, meters)` is `expected Feet, got Meters`, because `Meters` is not assignable to
+  `i32` and the unbranded-base test fails. A hole on the BODY side under a CONCRETE newtype
+  stays a loud reject too (`declared-return-newtype-body-hole-rejects.vl`), which is D551 and
+  is a separate ledger entry (`lists.json:refute`) precisely because a candidate re-opened it.
+
+* **THE THIRD CELL IS NOT THE EXEMPTION AT ALL.** `d551w_phantom_typar` — a type parameter
+  named in the signature and absent from the alias body, so no call can bind it — runs because
+  `validateRetCstrs` defers on a substituted side that still carries a hole. It is in the set
+  because it is the executable refutation of "narrow the gate to parameter position": that
+  rule is already here, at the validate site, and it does not separate the brand cell from
+  the defect (the brand cell's `A` IS in a parameter position).
+
+---
+
+### D572 — the DECLARED type of a LOCAL may be a hole its initializer cannot check, and no pin re-asks it
+**check-clean invalid wasm · found 2026-08-29 while pricing D561's rewrites · unmoved by every
+D561 candidate, the full widening included**
+
+Repro:
+
+    function g<T>(self: T, n: i32): T {
+      const r: T = n + 1
+      return r
+    }
+    print(g("s", 2))
     // vl check rc 0. vl run:
     //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found i32
 
-* **IT IS D551's MIRROR IMAGE, one column over.** D551 is a hole on the BODY side under a
-  concrete declaration; this is a concrete body under a hole DECLARATION. The direct spelling
-  `function g(a: string, n: i32): string { return n + 1 }` is the same positioned `return type
-  mismatch: expected string, got i32`, so the pin's answer is known and the mechanism is
-  D551's exactly: widen `noteRetCstr`'s gate from `tyHasHole(got)` to
-  `tyHasHole(got) || tyHasHole(want)`. That candidate is built and graded (`ABL_ADD_R5`); it
-  closes these two cells and nothing else on the grid.
+* **IT IS D561 AT A DIFFERENT NODE, AND D561's LANDING DOES NOT REACH IT.** The `return r` is
+  clean by construction — `r`'s declared type is the hole `T`, which substitutes to `string`
+  at the pin and matches the declared return exactly, so `validateRetCstrs` has nothing to
+  complain about. The i32 entered at `const r: T = n + 1`, where `assignable(i32, T)` is
+  vacuous and NOTHING records the pair. Graded on all four D561 seeds (base, `ABL_ADD_R5`,
+  the newtype-exemption cut, and the landing): `check-clean invalid wasm` on every one.
 
-* **THE OBSTACLE IS A MISSING SPELLING, NOT A MISSING CHECK, and that is the whole row.**
-  Widening the gate refuses `tests/cases/memory/flat-generic-rows-branded.vl`, a module that
-  RUNS and prints all ten of its expected values:
+* **THE DIRECT TWIN IS LOUD AND IT IS A DIFFERENT SENTENCE FROM D561's.**
+  `const r: string = n + 1` is `cannot assign i32 to 'r' of type string` — the local-declaration
+  seam, not the return seam — so the pin this row wants is `checkConstDecl`'s, and a sixth
+  deferred table entry rather than a widening of the fifth.
 
-      type TVAddr = new i32
-      type Rows<R, A> = { base: i32, count: i32, brand: A }
-      function rowAt<R, A>(self: Rows<R, A>, i: i32): A {
-        return self.base + i * R.size
-      }
+* **IT IS ALSO THE REWRITE PEOPLE WILL REACH FOR, WHICH IS WHY IT MATTERS NOW.** Under
+  `ABL_ADD_R5`, `flat-generic-rows-branded.vl` builds again if `rowAt` is rewritten
+  `const r: A = self.base + i * R.size; return r` — measured, ten right values. That reads
+  like a legitimate coercion point and is not one: it launders the value through an
+  unchecked assignment, and the concrete twin `const r: A1 = …` is a loud
+  `` i32 doesn't fit in A1 — the conversion is lossy and must be made explicit with `as` ``.
+  Anyone who "fixes" a D561 reject this way has relocated it, not repaired it.
 
-  The body computes an `i32` address and hands it back as the phantom brand `A`. The pin
-  would be RIGHT — the direct spelling is `return type mismatch: expected TVAddr, got i32` —
-  but the author has no way to say what they mean: `(self.base + i * 4) as A` is
-  `` `as` supports numeric conversions only ``. **A reject is not available here because the
-  program the reject would demand cannot be written.** The day `as T` over a type parameter
-  exists, the gate widens and this row closes with it.
-
-* **REFUSED ON THE BAR'S FIRST TERM.** A corpus module that stops building is a veto outright,
-  and the override needs the lost cells to run by COINCIDENCE — these run deliberately and
-  correctly. `retgrid.py --price` makes it re-runnable: rc 1 against `ADD_R5`, rc 0 against
-  the landing, rc 2 (by md5) if handed the base seed.
-
+* **THE FAMILY IS PROBABLY WIDER THAN TWO SEAMS.** Return and local declaration are the two
+  measured; a field write, an array element write and a re-assignment to an already-declared
+  hole-typed local are the obvious next places to look, and none has been graded. A grid over
+  the DESTINATION seam — the mirror of `retgrid.py`'s BODY seam — is what would say.
 ---
 
 ### D531 — [CLOSED 2026-08-29] `binOpDefinedFor` mirrored `checkBinary`'s dispatch-arm ORDER at ONE arm of three, so eight operator OVERLOADS were refused at the pin
