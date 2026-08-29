@@ -11118,10 +11118,10 @@ printed):
 
 ---
 
-### D352 — the CHECKER's narrowing path key is paren-blind too, and it is a loud check reject
-**loud check reject (`field 'r' is not on every member of Shape`) on `4bdfcc67` and on this branch · found while writing D222's fixture: the emitter half moved and this spelling did not**
+### D352 — [CLOSED 2026-08-28] the CHECKER's narrowing place key is paren-blind too — and the row filed `loud` had a SILENT twin one caller over
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · was a `loud check reject` (`field 'r' is not on every member of Shape`) on `4bdfcc67` and on `777f7848` · **the row's "NOT A SILENT ROW" was true of the two callers it looked at and false of the fifteen `placeKeyOf` has**: a paren-spelled WRITE keyed nowhere, retired nothing, and the next read of the stale narrowing was `vl check` rc 0 and a runtime TRAP · three rungs, one of which moves 0 cells on every population and is the reason the other two can land**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -11130,17 +11130,62 @@ Repro:
     function parenInner(t: Holder) { if t.v is Circle { print((t).v.r) } }
     parenInner({ v: { r: 7 } })
 
-* **IT IS D222 ON THE OTHER SIDE OF THE PIPELINE.** D222 closed six paren-blind reads in the
-  EMITTER — three receiver tests plus `memberPathKeyOf`'s own node — and this program is
-  refused a stage earlier, by the CHECKER, which never reaches them. Delete the parens
-  (`t.v.r`) and it prints `7`; parenthesise the whole receiver instead (`(t.v).r`) and it
-  prints `7` too, on this branch, which is D222. Only the INNER link is still refused.
-* **NOT A SILENT ROW**, and filed anyway for the reason D222 was: it is a capability gap
-  standing beside a family of silent ones, and what makes it worth a row is that the two
-  halves share a key derivation. The fix is the checker's own member-path key, not the
-  emitter's — a different file and a different measurement.
-* Pinned in prose at the head of `tests/cases/unions/paren-narrowed-receiver-read.vl`, where
-  the working spellings sit, so the fixture says why the seventh one is absent.
+* **IT WAS D222 ON THE OTHER SIDE OF THE PIPELINE, AND THE FIX IS ONE ARM.** D222 closed six
+  paren-blind reads in the EMITTER — three receiver tests plus `memberPathKeyOf`'s own node.
+  `placeKeyOf` is that key's CHECKER twin and it read `P.nodes[ix]` raw, so a `Paren`
+  anywhere in a place answered `""`: no key, no overlay, and the read fell back to the
+  DECLARED field type. The arm goes at the HEAD of the function, not at the recursion sites,
+  and that is what makes it arm-for-arm complete — `Member` and `OptMember` reach their
+  receivers through `placeKeyOf` itself, so one peel covers the node, its receiver and every
+  link of a nested path.
+* **THE SILENT TWIN, WHICH IS WHY THE GRID HAD A RETIREMENT BLOCK.** `placeKeyOf` has
+  **fifteen callers** and only two are the member READ; the others set narrowings, retire
+  them on assignment, bar writes and suppress the dead-`??` hint. On `777f7848`:
+
+      function f(t: Holder) {
+        if t.v is Circle {
+          (t).v = { s: 3 }     // keyed "", so it retired nothing
+          print(t.v.r)         // read the STALE narrowing
+        } else { print(0) }
+      }
+      f({ v: { r: 7 } })
+      // vl check rc 0; vl run: wasm trap: cast failure
+      // the same write WITHOUT parens: [ERROR]: cannot assign {s: i32} to Circle
+
+  Four cells of the 184-cell grid, all `trap` on master and all a clean check reject after.
+  Fixture: `tests/cases/unions/error-paren-place-write-retires.vl`.
+* **THREE RUNGS, AND THE THIRD IS A DECLINE.** `placeKeyOf` (K), `placeCurTy` (C) and
+  `placeHasOptionalHop` (H) are each one `Paren` arm.
+  * K alone: 86 of 184 cells check reject → `runs`, all four traps → loud. C alone and H
+    alone move **0 cells on all three of this PR's grids** — neither is reachable until K
+    keys the place.
+  * C is the ELSE-branch half: `placeCurTy`'s lookup is `placeKeyOf`'s, but its TAIL
+    re-derives the type from the node and read `P.nodes[ix]` raw, so `(t).v` keyed `t.v`,
+    found no fact, hit the tail, saw a `Paren` and answered `-1`. `subtractTy(-1, …)`
+    produced no fact and `if (t).v is Sq { … } else { t.v.r }` stayed loud while its THEN
+    twin ran. 28 cells.
+  * **H IS A SAFETY RUNG AND SCORES ZERO ON EVERY DERIVED POPULATION.** It is the decline
+    that stops an else-branch refining a place behind a `?.`. With K and C peeling and H
+    raw, `if (x?.y) is null { … } else { … }` answers FALSE here — the node is a `Paren`,
+    not an `OptMember` — and the else branch narrows a place that may be null because its
+    RECEIVER was. Measured on two witnesses whose unparenthesised controls are clean check
+    rejects: without H both go `vl check` rc 0. *A decline is not neutral when the caller
+    has a default* — teaching two of three arms would have bought 28 cells and sold a
+    soundness rule with them.
+* **THE GRID**: `scripts/silent-sweep/d352/parengrid.py`, 184 cells — 7 read spellings × 3
+  guard spellings × 4 narrowing forms × 2 place depths, plus the 16-cell retirement block.
+  Master `777f7848`: **12 runs · 168 check reject · 4 trap**. The landing: **126 runs · 58
+  check reject · 0 trap**, **0 `runs` lost, 0 → silent**. The 58 that stay refused are the
+  42 `while` cells (a narrowing in a `while` condition does not reach the body — a separate
+  gap, and a control here) and the 16 retirement cells, now correctly refused at every paren
+  spelling.
+* **THE CORPUS CANNOT SEE ANY OF IT**: `cmp` over the 1,938 modules the base can build is
+  **1,937 byte-identical, 0 DIFFER, 1 LOST** — and the one LOST is this row's own new
+  must-reject fixture, which the base BUILT because it was check-clean. The 1,477 derived
+  classes move 0. 38 cells are kept whole at `distilled/named/d352{ret,rd,opt}_*.vl`.
+* Fixtures: `tests/cases/unions/paren-narrowed-receiver-read.vl` gains the seventh and
+  eighth spellings (`(t).v.r`, and `if (t).v is Circle` as the GUARD half of the same key);
+  `tests/cases/unions/error-paren-place-write-retires.vl` pins the write.
 
 ---
 
@@ -12738,51 +12783,101 @@ Repro:
 
 ---
 
-### D362 — an array-spine leaf that is itself a DECLARED ALIAS is a dialect of its own in every position that READS it
-**loud check reject · found 2026-08-28 re-measuring D188's leaf ladder over all seven positions instead of the one D181's census used · the FIFTH and last unclaimed array-spine leaf kind**
+### D362 — [CLOSED 2026-08-28] an array-spine leaf that is itself a DECLARED ALIAS is a `TyUnion`, and that is why four leaf kinds fell through four predicates
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · was a `loud check reject` (`cannot index non-array L`) on `777f7848` · the row's own table recorded ONE silent cell and it needed no twin to reach · the FIFTH and last array-spine leaf kind, and `arrSpineIsObj`'s header claimed one of them by name and the claim was FALSE**
 
-Repro:
+Repro (now `runs`):
 
     type K0 = "a" | "b"
     type L = K0[]
     const c: L = ["a"]
     if c[0] == "a" { print(7) } else { print(0) }
-    // vl check rc 1:
-    //   [ERROR]: cannot index non-array L
+    // was: vl check rc 1 — [ERROR]: cannot index non-array L
 
-* **THE CONTROL IS THE SAME PROGRAM WITHOUT THE ALIAS AND IT PRINTS `7`**: `const c: K0[] =
-  ["a"]`. Three leaf kinds behave this way and D188's filed table recorded all three as
-  `runs`, because it graded them at the ONE position D181's census cell uses — an UNREAD
-  `const _sp1: L = []` binding, where nothing asks `L` to be an array:
+* **THE LEAF IS A `TyUnion`, NOT ITS OWN CONSTRUCTOR.** `parseTypeDecl` encodes every
+  non-struct-bodied `type N = …` as a one-member `UnionDecl`, so a declared alias standing
+  at an array leaf sits in the arena as a `TyUnion` carrying the alias's registered name —
+  never as a `TyObj`, a `TyLit` run, or anything the four existing `arrSpineIs*` predicates
+  test for. A `tErr`-channel probe at `singleAliasMemberTyIx`'s array arm reads the
+  IDENTICAL row for all four kinds:
 
-  | array-spine leaf | alias, 6 reading positions | alias, `unread` | inline control |
-  |---|---|---|---|
-  | litunion alias `K0` | **loud check reject** | runs | runs |
-  | numeric litunion alias `Z` | **loud check reject** | runs | runs |
-  | declared union `U1` | **loud check reject** | loud emit reject | loud emit reject |
-  | intersection alias `AB` (`{a:i32} & {b:i32}`) | **loud check reject** | **check-clean INVALID WASM** | runs |
+      PROBE reach=1 alias=L leaf=TyUnion struct=[] uname=[K0] ans=0   nmem=2
+      PROBE reach=1 alias=L leaf=TyUnion struct=[] uname=[Z]  ans=0   nmem=2
+      PROBE reach=1 alias=L leaf=TyUnion struct=[] uname=[U1] ans=0   nmem=2
+      PROBE reach=1 alias=L leaf=TyUnion struct=[] uname=[AB] ans=0   nmem=1 inner=TyObj innerStruct=[]
 
-  (positions: a binding, a function local, a parameter, a return annotation, a struct field,
-  a union member.)
+  (The probe reports through `tErr`, not `print`: a compiler run under `--compiler` has no
+  `__print_*` imports wired, so a `print` probe build dies with `unknown import:
+  imports::__print_i32__` and reads as **reach=0 at every site** — a probe that silently
+  measures nothing. Two probe builds were thrown away to that before the channel changed.)
 
-* **THE INTERSECTION LEAF HAS A SILENT CELL.** `type AB = {a:i32} & {b:i32}` with
-  `type L = AB[]`, an unread `const _sp1: L = []` and a structurally-spelled twin carrying
-  the reads is `vl check` rc 0 and a module the engine refuses — D181's shape, at the one
-  leaf kind D181's fix and D188's both leave unclaimed.
+* **`arrSpineIsObj`'s HEADER CLAIMED THE INTERSECTION BY NAME AND THE CLAIM WAS FALSE.** It
+  said `type AB = {a:i32} & {b:i32}` *"interns as a NAMED struct (`unionStructAliasShape`),
+  so `structNameOfTy` answers `AB` for it and the exclusion above sends `type L = AB[]` to
+  `arrSpineIsNominal`"*. At an array LEAF neither half holds: `structNameOfTy` answers `""`
+  so `arrSpineIsNominal` declines, and the leaf's inner member is an **anonymous** `TyObj` —
+  had the one-member wrapper been peeled, `arrSpineIsObj` and not `arrSpineIsNominal` would
+  have taken it. That false claim is exactly the gap the silent cell sat in; the header now
+  carries the correction.
 
-* **IT IS THE LEAF `arrSpineIsNominal`'s HEADER DECLINES BY NAME.** *"A UNION-ALIAS leaf
-  (`type L = Shape[]`) is deliberately NOT claimed here… `unionAliasDeclNameOfTy` carries
-  the numeric-litunion exception and the emitter's element tables treat a union element as
-  the BOX kind — a second population with its own grid."* A probe build reads
-  **`reach=1 ans=0`** at `singleAliasMemberTyIx`'s array arm for `type L = AB[]`: the arm
-  sees the array and every leaf test declines, because at that point the leaf is the
-  alias's `TyUnion` placeholder rather than a `TyObj`. So the fifth twin is not
-  `arrSpineIsObj` widened — it is a predicate that has to ask the leaf's DECLARATION, and
-  the numeric-litunion exception says the answer is not uniform across the union kinds.
+* **THE FILED TABLE'S SILENT CELL IS REAL, AND MORE MINIMAL THAN FILED.** The row said the
+  intersection leaf is silent *"with an unread `const _sp1: L = []` and a structurally-spelled
+  twin carrying the reads"*. Measured, the twin is not an ingredient:
 
-* Filed rather than fixed: it is the residue D188's close names, it needs the twin table
-  D188's own header describes for a second population, and the intersection cell means the
-  grid has to be graded on the RUN and not on an exit code.
+      type AB = {a:i32} & {b:i32}
+      type L = AB[]
+      const _sp1: L = []
+      print(7)
+      // 777f7848: vl check rc 0; vl run: type mismatch: expected (ref $type), found (ref $type)
+
+  Off the disassembly, D181's landing exactly: `(global $global$0 (mut (ref $1)) (struct.new
+  $5 …))` — `$1` is the shared `{tag: i32, value: anyref}` union box `collectU` minted for
+  the opaque alias, `$5` the i32-list wrapper the `[]` literal lowered. Neither is the
+  program's own heap type.
+
+* **THE CORRECTED TABLE, ALL SEVEN POSITIONS, EACH BESIDE ITS ALIAS-FREE CONTROL.** The
+  filed table graded the inline control for the declared-union leaf through
+  `if c[0] is Ca`, which is index-place narrowing (inventory-2 D11) and refuses on BOTH
+  spellings; with the element bound first the control runs at all seven and the alias leg is
+  the dialect. On `777f7848`:
+
+  | array-spine leaf | alias, 5 index positions | alias, `unionmem` | alias, `unread` | inline control |
+  |---|---|---|---|---|
+  | litunion alias `K0` | loud check reject | loud check reject | runs | **runs, 7/7** |
+  | numeric litunion `Z` | loud check reject | loud check reject | runs | **runs, 7/7** |
+  | declared union `U1` | loud check reject | runs | runs | **runs, 7/7** |
+  | intersection `AB` | loud check reject | loud emit reject | **check-clean INVALID WASM** | **runs, 7/7** |
+
+* **FIXED BY `arrSpineIsUnionAlias`** (`compiler/typecheck.vl`), the fifth `arrSpineIs*`
+  twin: the leaf's `unionAliasDeclNameOfTy` is non-empty. That is the D-ALIASLU arm's own
+  first gate one array constructor out. **The numeric-litunion exception `arrSpineIsNominal`'s
+  header worried about needs no repeat here** — `tyToNominalNameGo` short-circuits such an
+  alias to its BASE SCALAR (`numLitUnionBaseName`), so `type Z = 0 | 1; type L = Z[]` renders
+  `i32[]`, the direct spelling character for character, and a second copy of the rule would
+  be a second home for it.
+
+* **TWO RUNGS, AND THE SECOND SCORES ZERO ALONE.** On the 322-cell alias-vs-inline grid
+  (`scripts/silent-sweep/d188/aliasgrid.py`), 24 of the 161 alias cells differ from their
+  inline control on `777f7848`:
+
+  | build | md5 | moved | → runs | runs LOST | → silent | alias ≠ inline | silent cells |
+  |---|---|---|---|---|---|---|---|
+  | strip-all | `4249a50f…` (= base, byte-for-byte) | 0 | 0 | 0 | 0 | 24 | 1 |
+  | claim only (A) | `63cf8cfe…` | 24 | 19 | 0 | 0 | 12 | 0 |
+  | render leg only (B) | `112a3ca6…` | **0** | 0 | 0 | 0 | 24 | 1 |
+  | the landing (all seven rungs) | `bc45a91e…` | 24 | 19 | 0 | 0 | **0** | **0** |
+
+  B is unreachable without A (`transparentMemberEmitName` is only consulted for a member the
+  claim admitted), and A without B leaves the six `isect` cells a loud emit reject and the
+  six `declunion` cells running through the STRUCTURAL render rather than the nominal one.
+  **0 of 161 alias cells differ from their control after both** — the array alias stops being
+  a dialect on this grid entirely.
+* **THE CORPUS CANNOT SEE IT**: `cmp` byte-identical on all 1,938 buildable modules, 0 of the
+  1,477 derived classes moved. The 56 cells (four leaf kinds × seven positions × {alias,
+  control}) are kept whole at `distilled/named/d362{al,in}_*.vl`; stripping rung B alone
+  costs 6 of them their `runs`.
+* Fixture: `tests/cases/types/array-alias-union-leaf.vl`, beside `array-alias-map-element.vl`
+  (D181's map leaf) and `array-alias-return-unread.vl` (the scalar one).
 
 ---
 
@@ -12830,13 +12925,89 @@ Repro (now `runs`):
   K's set is a SUBSET of P's, which is the measured sense in which these two are one landing
   and the other rungs are not. **0 runs lost, 0 → silent** on every population; `read_bare`
   and `read_bare_path` run under every ablation with all counters at zero.
-* **THE INNER LINK IS A DIFFERENT DEFECT AND STAYS OPEN.** `(t).v.r` under
-  `if t.v is Circle` is a LOUD CHECK reject — `field 'r' is not on every member of Shape` —
-  on `4bdfcc67` and on this branch alike, because the CHECKER's own path key is paren-blind
-  in the same way the emitter's was. Filed as D352.
-* Fixture: `tests/cases/unions/paren-narrowed-receiver-read.vl`, six spellings each beside
-  its unparenthesized control. `paren-is-narrow.vl` beside it pins the parens in the
-  CONDITION, which is a different set of readers.
+* **THE INNER LINK IS A DIFFERENT DEFECT AND WAS FILED AS D352, NOW CLOSED.** `(t).v.r`
+  under `if t.v is Circle` was a LOUD CHECK reject — `field 'r' is not on every member of
+  Shape` — on `4bdfcc67` and on `777f7848` alike, because the CHECKER's own place key
+  (`placeKeyOf`) was paren-blind in the same way the emitter's was. D352 closed it on
+  2026-08-28 and found, one caller over, the SILENT half neither row had: a paren-spelled
+  WRITE keyed nowhere and retired no narrowing.
+* Fixture: `tests/cases/unions/paren-narrowed-receiver-read.vl`, EIGHT spellings each beside
+  its unparenthesized control since D352 closed. `paren-is-narrow.vl` beside it pins the
+  parens in the CONDITION, which is a different set of readers.
+
+---
+
+### D401 — `print(x[0])` on an UNBOUNDED type parameter whose element is a LIST is check-clean invalid wasm
+**check-clean invalid wasm on `777f7848` and on this branch · found 2026-08-28 by
+inventory-2 D14's own grid, on the side that row called "admitted"**
+
+Repro:
+
+    function g<T>(x: T) { print(x[0]) }
+    function body() {
+      const v = [[7, 8]]
+      g(v)
+    }
+    body()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 281:
+    //   type mismatch: expected i32, found (ref $type)
+
+* **THE CONCRETE TWIN IS A CLEAN CHECK REJECT.** `function g(x: i32[][]) { print(x[0]) }`
+  over the same value is `print of i32[] is type-valid but not yet supported by codegen`.
+  One annotation is the whole difference.
+* **IT IS THE PRICE OF THE ASYMMETRY inventory-2 D14 NAMED.** `checkIndexNode`'s `TyVar` arm
+  admits `x[i]` for EVERY type variable, returning a derived `HD_ELEM` hole; `print` of an
+  unresolved hole is admitted because nothing yet knows it is a list. D14's own sentence —
+  *"note that `x[0][1]` **is** admitted on an unbounded `T`, which is how D3 got through"* —
+  was pointing here, and D14's close measured it: **3 of the 15 argument reps** in
+  `scripts/silent-sweep/d14/lengrid.py` (`arr_nest`, `arr_arr_s`, `arr_rec`), against 3 that
+  run and 9 that are loud.
+* **THE MECHANISM IS OFF THE DISASSEMBLY.** `wasm-dis` of the built module:
+  `(call $fimport$0 (ref.as_non_null (array.get $4 (struct.get $5 0 (local.get $2)) …)))` —
+  `__print_i32__` is handed `(ref $3)`, the inner i32-list wrapper. The element read is
+  correct; the SINK is the i32 print.
+* **WHERE THE FIX GOES, AND WHY IT IS NOT D14's.** The checker cannot know the instance, so
+  the guard belongs where the substitution happens — `monoInstantiate`, which holds the
+  bound `T` and could apply `checkPrintable`'s own rule to the substituted element type.
+  D14's close deliberately did NOT widen the checker to match: the permissive side is the
+  one with silent cells, and copying it would have been the wrong direction.
+* The three cells are kept whole at `distilled/named/d14idx_{arr_nest,arr_arr_s,arr_rec}.vl`.
+
+---
+
+### D402 — a declared INTERSECTION makes the STRUCTURAL spelling of its own shape a loud emit reject at an ARRAY ELEMENT
+**loud emit reject (`emitProgram: only i32[] arrays and struct/union element arrays are
+supported`) on `777f7848` and on this branch · found 2026-08-28 while separating D362's
+residue from D362 itself**
+
+Repro:
+
+    type AB = {a:i32} & {b:i32}
+    const c: {a:i32, b:i32}[] = [{a:1,b:2}]
+    print(c[0].a)
+    // vl check rc 0 (one HINT); vl run:
+    //   emitProgram: only i32[] arrays and struct/union element arrays are supported
+
+* **DELETE THE `type AB` LINE AND IT RUNS**, and so does the same program with the alias
+  declared as a plain struct (`type AB = {a: i32, b: i32}`). The intersection DECLARATION is
+  the ingredient, the array ELEMENT is the position, and the alias is never mentioned by the
+  annotation that fails. Four-cell control table on `777f7848`:
+
+  | declaration | `{a:i32,b:i32}[]` element | bare `{a:i32,b:i32}` |
+  |---|---|---|
+  | none | runs | runs |
+  | `type AB = {a:i32} & {b:i32}` | **loud emit reject** | runs |
+  | `type AB = {a: i32, b: i32}` | runs | runs |
+  | the intersection, also USED | **loud emit reject** | runs |
+
+* **NOT SILENT, AND UNMOVED BY D362.** `unionStructAliasShape` interns the intersection as a
+  named struct shape and the emitter's element tables then hold two rows for one layout;
+  D362's landing touches the alias's TRANSPARENCY and does not merge them. Filed rather than
+  folded in because it is a different table and a different measurement — and because it is
+  the reason D362's own filed spelling of its silent cell (the alias beside a
+  STRUCTURALLY-spelled twin) still reads `emit_reject` after D362 closed, while the same cell
+  with an `AB[]` twin runs.
 
 ---
 

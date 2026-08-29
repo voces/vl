@@ -937,20 +937,10 @@ whole PR, and one that trades a loud reject for a silent class if any part is mi
 
 ---
 
-### D14 — the `garr` / `gbody` generic shapes over container and record reps
-**loud check reject · 14 of this row's original 40 cells — the `x.length` half, re-measured
-2026-08-27 on master `88f21245` and unchanged. The other 26 cells (both `gfirst<T>(xs: T[])`
-shapes and the literal-union `print`) now RUN; see the shape-by-shape table below.**
+### D14 — [CLOSED 2026-08-28] the `garr` / `gbody` generic shapes: the `.length` half was an ASYMMETRY, not a design position
+**closed 2026-08-28 · the row's own witness RUNS and prints `1` · was a `loud check reject` (`member access '.length' on non-object T`) on `88f21245` and on `777f7848` · the row's actionable content was the disagreement with INDEXING, and the disagreement is now measured on both sides: the permissive one costs THREE check-clean invalid-wasm cells, filed forward as D401**
 
-**This row had no program until 2026-08-27, and that is how it got mis-graded.** D14 was filed
-as a four-shape SUMMARY TABLE with no repro, so `check-filed-witnesses.py` reported it
-`not graded (no Repro block)` — then and now. §0a's first grading nevertheless printed
-`D14 | loud emit reject | runs` for it, which no instrument had produced. Measured shape by
-shape it is half right: the emit-reject half is gone, the check-reject half stands. The witness
-below is the half that is still live, written 2026-08-27 to make the row gradeable — it is a
-NEW program, not the row's original evidence, and it is labelled as such.
-
-Repro (the `x.length` half — a loud check reject, as filed):
+Repro (now `runs`, printing `1`):
 
     function gtake<T>(x: T) { print(x.length) }
     function body() {
@@ -959,33 +949,66 @@ Repro (the `x.length` half — a loud check reject, as filed):
       gtake(m)
     }
     body()
-    // vl check rc 1:  [ERROR]: member access '.length' on non-object T
+    // was: vl check rc 1 — [ERROR]: member access '.length' on non-object T
 
-| shape | reps | verdict AS FILED | RE-MEASURED 2026-08-27 |
-|---|---|---|---|
-| `gfirst<T>(xs: T[])` | the nine nested arrays | `emitProgram: nested arrays are not supported` (18) | **runs** (`2`) |
-| `gfirst<T>(xs: T[])` | `flat_rec`, `flat_nest`, `new {x:i32}` | `emitProgram: struct array elements are not supported` (6) | **runs** (`1`) |
-| `function gtake<T>(x: T) { print(x.length) }` | both maps, both sets, both flats, `new {x:i32}` | `[ERROR]: member access '.length' on non-object T` (14) | **unchanged — still that exact check reject** |
-| the same body | `new ("p"\|"q")` | `emitProgram: print of a literal-union atom whose type carries no member texts` (2) | **runs** (`p`) for `print(x)`; `print(x.length)` gives the row-3 check reject instead |
+**This row had no program until 2026-08-27, and that is how it got mis-graded.** D14 was
+filed as a four-shape SUMMARY TABLE with no repro, so `check-filed-witnesses.py` reported it
+`not graded (no Repro block)` — and §0a's first grading nevertheless printed
+`D14 | loud emit reject | runs` for it, which no instrument had produced. The witness above
+was written on 2026-08-27 to make the row gradeable and is what closed here.
 
-The programs behind that last column are `scratch`-only and were run verbatim against master's
-seed; each is the minimal spelling of its table row (`gfirst<T>(xs: T[]): T { return xs[0] }`
-applied to `i32[][]` and to `{a: i32}[]`; `gtake<T>` applied to a `{[string]: i32}` and to
-`type NtK = new ("p" | "q")`). **The bound on that re-measurement, stated rather than left to
-be assumed**: row 1 was checked at **three of its nine** nested-array reps (`i32[][]` → `2`,
-`string[][]` → `b`, `f64[][]` → `2.5`), not all nine; rows 2–4 were checked at one rep each,
-which is all they have. So "26 cells now run" is an inference from 3+1+1 measured spellings,
-not 26 measured cells — enough to retire the row's emit-reject half, not enough to call the
-count exact. The 14 check-reject cells are the half this row still asserts, and the witness
-above is one of them.
+* **THE TWO DECISIONS, LOCATED.** `checkMemberNode`'s `TyVar` arm was gated on
+  `ot.tvName[0] == '?'` — the INFERENCE HOLE only — so a declared type parameter fell
+  through to `member access '.length' on non-object T`. `checkIndexNode`'s `TyVar` arm has
+  **no such gate**: every type variable gets `noteArrayDemand` and a derived `HD_ELEM` hole.
+  One arm asks whether the variable is a hole and the other does not, and nothing wrote down
+  that they should differ.
+* **THE GRID THAT PRICES IT**: `scripts/silent-sweep/d14/lengrid.py`, 45 cells — 15 argument
+  reps × {`.length` through a generic `T`, `.length` on the concrete twin, `x[0]` through a
+  generic `T`}. On `777f7848`:
 
-Controls: the concrete (non-generic) twin of each is correct. `gtake<T>` is arguably by design
-(an unbounded `T` has no members) — but note that `x[0][1]` **is** admitted on an unbounded `T`,
-which is how D3 got through. The two decisions disagree with each other, and that disagreement
-is the actionable part. **D3's fix did not settle it**: D3 now prints the right value, but it
-still runs, so indexing is still admitted while `.length` is still refused. The inconsistency is
-exactly as wide as when it was filed — which is why this row stays open after its emit-reject
-half closed.
+  | leg | runs | loud | check-clean INVALID WASM |
+  |---|---|---|---|
+  | `.length` through `T` | 0 | 15 | 0 |
+  | `.length` concrete twin | 8 | 7 | 0 |
+  | `x[0]` through `T` | 3 | 9 | **3** |
+
+* **ADMITTING `.length` ON EVERY TYPE VARIABLE MOVES 8 CELLS TO `runs`, EACH ON ITS CONCRETE
+  TWIN'S PRINTED VALUE**, with **0 `runs` lost and 0 → silent**: lists (i32, string, nested,
+  struct-element), a string, a map and a set. The PRICE is the other seven — `i32`, `f64`,
+  `boolean`, a record, a function, a nullable, a union — where a positioned CHECK reject
+  becomes a positioned EMIT reject. Both loud; the diagnostic moves later.
+* **A SECOND RUNG PAYS MOST OF THAT PRICE BACK, AND IT IS A MESSAGE SWAP AT THE FLOOR, NOT A
+  GUARD ABOVE IT.** `memFloorMsg` gives `emitMem`'s three field-access floors a `.length`
+  message, so the seven read *"`.length` on a receiver the emitter cannot classify as a
+  list, string, map or set"* instead of `unknown struct field in field access` — a message
+  about a struct field, for a program whose author wrote `.length` and declared no struct.
+  It also improves **360 census cells across three distilled classes** that already read the
+  struct message. **Its FIRST form was refused, and only one instrument saw why**: the same
+  arm at the HEAD of the floor block reads IDENTICALLY on all three of this PR's grids, on
+  the distilled corpus and on every histogram — and takes **33 corpus modules** with it,
+  `std/buffer.vl` first, because `Buf.length` is a real declared field. That is what
+  `scripts/silent-sweep/corpuscmp.py` exists for.
+* **THE OTHER HALF OF THE ASYMMETRY IS A SILENT FAMILY AND IS NOT CLOSED HERE.**
+  `function g<T>(x: T) { print(x[0]) }` at a LIST-of-list argument is `vl check` rc 0 and a
+  module the engine refuses, while the concrete twin `function g(x: i32[][]) { print(x[0]) }`
+  is a clean `print of i32[] … not yet supported by codegen`. Off the disassembly:
+  `(call $fimport$0 (ref.as_non_null (array.get $4 …)))` — `__print_i32__` handed the inner
+  list wrapper. Three of the 15 reps. Filed as **D401** in
+  `docs/internals/silent-class-inventory.md`; the row's own sentence *"which is how D3 got
+  through"* was pointing at it.
+* **THE EMIT-REJECT HALF WAS ALREADY GONE** when the row was re-measured on 2026-08-27, and
+  that half of the table stands as re-measured:
+
+  | shape | reps | verdict AS FILED | RE-MEASURED |
+  |---|---|---|---|
+  | `gfirst<T>(xs: T[])` | the nine nested arrays | `emitProgram: nested arrays are not supported` (18) | **runs** (`2`) — 3 of 9 reps checked |
+  | `gfirst<T>(xs: T[])` | `flat_rec`, `flat_nest`, `new {x:i32}` | `emitProgram: struct array elements are not supported` (6) | **runs** (`1`) |
+  | `gtake<T>(x: T) { print(x.length) }` | both maps, both sets, both flats, `new {x:i32}` | `[ERROR]: member access '.length' on non-object T` (14) | **CLOSED 2026-08-28 — `runs`** |
+  | the same body | `new ("p"\|"q")` | `emitProgram: print of a literal-union atom whose type carries no member texts` (2) | **runs** (`p`) for `print(x)` |
+
+* 45 cells kept whole at `distilled/named/d14{len,con,idx}_*.vl`. Fixture:
+  `tests/cases/generics/generic-length-on-type-param.vl`.
 
 ---
 

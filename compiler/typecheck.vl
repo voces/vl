@@ -3419,8 +3419,23 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
 // index, a literal: not a stable place to narrow). Mirrors the host's
 // `placeKey`; `x?.y` keys the same place as `x.y`, so a guard written with
 // `?.` refines the regular `x.y` reads in the branch body.
+//
+// PARENTHESES ARE NOT PART OF A PLACE (silent-class-inventory D352). `(t).v` is the same
+// storage as `t.v` and must key the same, exactly as `x?.y` keys as `x.y` one line above.
+// Without the peel this answered "" for every parenthesised link and the read fell back to
+// the DECLARED field type: `if t.v is Circle { print((t).v.r) }` was
+// `field 'r' is not on every member of Shape`, while both `t.v.r` and `(t.v).r` printed 7.
+//
+// THE ARM GOES AT THE HEAD, NOT AT THE RECURSION SITES, and that is what makes it
+// arm-for-arm complete: `Member` and `OptMember` reach their receivers through this same
+// function, so one peel covers the node, its receiver, and every link of a nested path.
+// `memberPathKeyOf` is the EMITTER's twin of this key and needed the same fix at #1991
+// (D222) — there it took an `unwrapParen` on the node AND on the receiver because that one
+// recurses on `m.memObj` through `P.nodes` directly. Same defect, same shape, one stage
+// earlier; this is the half that refuses `(t).v.r` before the emitter is ever reached.
 function placeKeyOf(ix: i32) {
   const n = P.nodes[ix]
+  if n is Paren { return placeKeyOf(n.parInner) }
   if n is Ident { return n.identName }
   if n is Member {
     const base = placeKeyOf(n.memObj)
@@ -4548,6 +4563,14 @@ function nonNullTy(ty: i32) {
 // overrides the scope/field lookup — so successive narrowings compose
 // (`o != null && o.y is i32` resolves `o.y` against the non-null `o`).
 // Read-only: collection must never raise a diagnostic.
+//
+// PARENS PEEL HERE TOO (D352), and this arm is the KEY's — not a second copy of it. The
+// lookup above is `placeKeyOf`'s, so once that peels a `Paren` the key resolves; the TAIL
+// below re-derives the type from the node when no fact and no overlay hold, and that tail
+// read `P.nodes[ix]` raw. Without the arm `(t).v` keyed `t.v`, found no fact, fell to the
+// tail, saw a `Paren` and answered -1 — so the ELSE-branch complement (`subtractTy(-1, …)`)
+// produced no fact at all and `if (t).v is Sq { … } else { t.v.r }` stayed loud while its
+// THEN twin ran. 28 of the 184-cell paren grid, all `isnot` with a parenthesised guard.
 function placeCurTy(ix: i32, names: string[], tys: i32[]) {
   const key = placeKeyOf(ix)
   if key != "" {
@@ -4560,6 +4583,7 @@ function placeCurTy(ix: i32, names: string[], tys: i32[]) {
     if ov >= 0 { return ov }
   }
   const n = P.nodes[ix]
+  if n is Paren { return placeCurTy(n.parInner, names, tys) }
   if n is Ident { return lookup(n.identName) }
   if n is Member {
     return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
@@ -5171,8 +5195,18 @@ function pushDiscrimParentFact(
 
 // Whether the place runs through a `?.` hop — its negation is then not a sound
 // else-branch refinement (the chain may be null because a RECEIVER was).
+//
+// THE PAREN ARM HERE IS A SAFETY RUNG, NOT A CAPABILITY ONE (D352), and it is the reason
+// the other two paren peels cannot land alone. This is the DECLINE that keeps an
+// else-branch from refining an optional chain; with `placeKeyOf` and `placeCurTy` peeling
+// and this one still raw, `if (x?.y) is string { … } else { … }` answers FALSE here — the
+// node is a `Paren`, not an `OptMember` — and the else branch narrows a place that may be
+// null because its RECEIVER was. Its unparenthesised control declines. A decline is not
+// neutral when the caller has a default: teaching two of three arms would have bought
+// 28 cells and sold one soundness rule with them.
 function placeHasOptionalHop(ix: i32) {
   const n = P.nodes[ix]
+  if n is Paren { return placeHasOptionalHop(n.parInner) }
   if n is OptMember { return true }
   if n is Member { return placeHasOptionalHop(n.memObj) }
   false
@@ -12173,6 +12207,11 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
         // leaf is for a leaf of plain fields, and under the NOMINAL one for a leaf that
         // names a declared struct — see `transparentMemberEmitName`'s array leg.
         if arrSpineIsObj(m0) { return m0 }
+        // D362: the leaf that is itself a DECLARED ALIAS — the FIFTH twin, and the one
+        // `arrSpineIsNominal`'s header left unclaimed by name. It is the SAME gate the
+        // D-ALIASLU arm below applies to a BARE union member (`unionAliasDeclNameOfTy`
+        // != ""), one array constructor out; see `arrSpineIsUnionAlias`.
+        if arrSpineIsUnionAlias(m0) { return m0 }
       }
       if mt is TyMap { return m0 }
       if mt is TyObj {
@@ -12357,12 +12396,16 @@ function arrSpineLeafTy(ty: i32) {
 // bound (an array's element is a strictly earlier construction, so the spine cannot
 // cycle); only the leaf test differs, which is the whole content of the distinction.
 //
-// A UNION-ALIAS leaf (`type L = Shape[]`) is deliberately NOT claimed here. The nominal
-// renderer would spell it `Shape[]` and that spelling is very likely right, but
-// `unionAliasDeclNameOfTy` carries the numeric-litunion exception and the emitter's
-// element tables treat a union element as the BOX kind — a second population with its own
-// grid. Unclaimed is what it already is; widening this leaf test is the next slice, not
-// this one.
+// A UNION-ALIAS leaf (`type L = Shape[]`) is deliberately NOT claimed here, and is claimed
+// by `arrSpineIsUnionAlias` instead — the FIFTH twin, D362, landed 2026-08-28. The two
+// cautions this header raised were half right: the nominal renderer does spell it
+// `Shape[]`, which is the direct spelling character for character, and the
+// numeric-litunion exception `unionAliasDeclNameOfTy` carries is REAL but already
+// discharged one layer down (`tyToNominalNameGo` softens such an alias to its base
+// scalar), so the fifth predicate needs no copy of it. What the caution got wrong is the
+// cost of waiting: the leaf sits in the arena as a one-member `TyUnion`, so ALL FOUR
+// declared-alias leaf kinds fell through all four predicates at once, and the
+// intersection one was check-clean INVALID WASM.
 function arrSpineIsNominal(ty: i32) {
   const leaf = arrSpineLeafTy(ty)
   if leaf < 0 { return false }
@@ -12431,19 +12474,67 @@ function arrSpineIsMap(ty: i32) {
 // about ONE leaf kind, which is the property the whole family is built on. `structNameOfTy`
 // is the same test `arrSpineIsNominal` makes, read the other way round.
 //
-// THE CANONICALIZED INTERSECTION IS CLAIMED HERE, AND MEASURED RATHER THAN REASONED.
-// `type AB = {a:i32} & {b:i32}` interns as a NAMED struct (`unionStructAliasShape`), so
-// `structNameOfTy` answers `AB` for it and the exclusion above sends `type L = AB[]` to
-// `arrSpineIsNominal` — not here. That is the same hand-off the bare `TyObj` arm's
-// `isPlainAliasRef` gate makes one arm below, reached by a different road: there the gate
-// is syntactic because the arena cannot tell the intersection from a plain reference, here
-// the LEAF's own arena entry answers it directly.
+// THE CANONICALIZED INTERSECTION IS NOT CLAIMED HERE, AND THIS HEADER SAID THE OPPOSITE
+// UNTIL D362 MEASURED IT. It read: *"`type AB = {a:i32} & {b:i32}` interns as a NAMED
+// struct (`unionStructAliasShape`), so `structNameOfTy` answers `AB` for it and the
+// exclusion above sends `type L = AB[]` to `arrSpineIsNominal` — not here."* At an ARRAY
+// LEAF neither half holds. `structNameOfTy(leaf)` answers `""`, so `arrSpineIsNominal`
+// declines too, and the leaf's own arena entry is a one-member `TyUnion` — the alias
+// declaration's wrapper — whose INNER member is an ANONYMOUS `TyObj`. Had that wrapper
+// been peeled, this predicate and not the nominal one would have taken it. Neither did,
+// and `type AB = …; type L = AB[]; const _sp1: L = []` was `vl check` rc 0 and a module
+// the engine refuses. `arrSpineIsUnionAlias` is the arm that claims it: the leaf's
+// `unionAliasDeclNameOfTy`, which is what the arena actually holds.
+//
+// The bare `TyObj` arm's `isPlainAliasRef` gate one arm below is still the syntactic
+// hand-off it always was — there the gate is syntactic because the arena cannot tell an
+// intersection from a plain reference. That much of the old paragraph was about a
+// DIFFERENT arm and remains true.
 function arrSpineIsObj(ty: i32) {
   const leaf = arrSpineLeafTy(ty)
   if leaf < 0 { return false }
   const t = T.tys[leaf]
   if t is TyObj { return structNameOfTy(leaf) == "" }
   false
+}
+
+// True when `ty` is an ARRAY (of arrays, of arrays…) whose LEAF element is ITSELF A
+// DECLARED ALIAS — the FIFTH and last `arrSpineIs*` twin, and the residue
+// `arrSpineIsNominal`'s header named by hand: *"a UNION-ALIAS leaf (`type L = Shape[]`)
+// is deliberately NOT claimed here."* Same walk, same bound; only the leaf test differs.
+//
+// THE LEAF IS A `TyUnion`, NOT A `TyObj`, AND THAT IS WHY FOUR LEAF KINDS FELL THROUGH
+// FOUR PREDICATES. `parseTypeDecl` encodes every non-struct-bodied `type N = …` as a
+// one-member `UnionDecl`, so a declared alias standing at an array leaf is in the arena
+// as a `TyUnion` carrying the alias's registered name — never as the leaf's own
+// constructor. A `reach=1 ans=0` probe at `singleAliasMemberTyIx`'s array arm reads the
+// same row for all four kinds (`leaf=TyUnion struct=[] uname=[<the alias>] ans=0`):
+// a string litunion `K0`, a numeric litunion `Z`, a declared value union `U1`, and a
+// canonicalized INTERSECTION `AB` (`{a:i32} & {b:i32}`).
+//
+// **`arrSpineIsObj`'s HEADER CLAIMED THE INTERSECTION AND THE CLAIM IS FALSE HERE.** It
+// says `type AB = {a:i32} & {b:i32}` "interns as a NAMED struct (`unionStructAliasShape`),
+// so `structNameOfTy` answers `AB` for it and the exclusion above sends `type L = AB[]`
+// to `arrSpineIsNominal`". At an array LEAF neither half holds: `structNameOfTy` answers
+// `""`, so `arrSpineIsNominal` declines, and the leaf's inner member is an ANONYMOUS
+// `TyObj` — had the one-member wrapper been peeled, `arrSpineIsObj` and not
+// `arrSpineIsNominal` would have taken it. That gap is the ONE SILENT cell in the
+// 322-cell alias-vs-inline twin grid: `type AB = …; type L = AB[]; const _sp1: L = []`
+// is `vl check` rc 0 and a module the engine refuses (`type mismatch: expected
+// (ref $type), found (ref $type)`) — D181's landing at the leaf kind D181's fix and
+// D188's both left unclaimed, and it needs NO twin binding to reach.
+//
+// THE GATE IS `unionAliasDeclNameOfTy` UNGATED, WHICH IS THE D-ALIASLU ARM'S OWN FIRST
+// GATE ONE CONSTRUCTOR OUT. The numeric-litunion exception `arrSpineIsNominal`'s header
+// worried about is real and is ALREADY DISCHARGED BY THE RENDERER: `tyToNominalNameGo`
+// short-circuits a declared alias for a numeric literal union to its BASE SCALAR
+// (`numLitUnionBaseName`), so `type Z = 0 | 1; type L = Z[]` renders `i32[]` — the
+// direct spelling canon leaves, character for character — and not `Z[]`. Repeating the
+// exception here would be a second copy of a rule that has one home.
+function arrSpineIsUnionAlias(ty: i32) {
+  const leaf = arrSpineLeafTy(ty)
+  if leaf < 0 { return false }
+  unionAliasDeclNameOfTy(leaf) != ""
 }
 
 // The ARENA TYPE a declared one-member union ALIAS denotes TRANSPARENTLY (`type Id = i32`,
@@ -12657,8 +12748,21 @@ function transparentMemberEmitName(smt: i32, ctx: i32): string {
   // `tyToEmitNameAt` re-renders it to `{p:{n:i32}}[]` while canon leaves the DIRECT
   // spelling `{p:Cat}[]`. The element tables key on the latter. Read `arrSpineIsObj`'s
   // header for the two cells and the messages.
+  //
+  // D362 IS THE FOURTH SHARER, and it is the leg's whole content for that leaf rather than
+  // a two-cell correction. A leaf that is itself a DECLARED ALIAS has a name to drop at
+  // every position: `tyToEmitNameAt` re-renders `type AB = {a:i32} & {b:i32}` structurally
+  // to `{a:i32,b:i32}[]` while canon leaves the DIRECT spelling `AB[]`, so with the claim
+  // in `singleAliasMemberTyIx` and WITHOUT this leg the intersection leaf is
+  // `emitProgram: only i32[] arrays and struct/union element arrays are supported` at six
+  // of its seven positions — a loud reject where the inline control runs. The numeric
+  // litunion needs no exclusion here: `tyToNominalNameGo` softens `Z` to its base scalar
+  // itself, so `type L = Z[]` renders `i32[]` through this leg.
   if mt is TyArray {
-    if arrSpineIsNominal(smt) || arrSpineIsMap(smt) || arrSpineIsObj(smt) {
+    const nomLeaf = arrSpineIsNominal(smt) ||
+      arrSpineIsMap(smt) ||
+      arrSpineIsObj(smt)
+    if nomLeaf || arrSpineIsUnionAlias(smt) {
       const anr = tyToNominalNameAt(smt, ctx)
       if anr != "" {
         // The nominal renderer's own width bank, handed over exactly as the two arms
@@ -30698,13 +30802,16 @@ function checkMemberNode(n: Member, ix: i32) {
   // `Infer<Unknown>` to a growing object shape): record the demanded field
   // and yield its derived hole; the call site pins both (A13).
   if ot is TyVar {
+    // D14-L: `.length` on a DECLARED type parameter, admitted the way the `?`-hole below
+    // already admits it and the way `checkIndexNode`'s `TyVar` arm already admits `x[i]`
+    // for EVERY type variable — see that row for the grid.
+    if n.memProp == "length" { return symMem(ix, TY_I32) }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
         // `.length` is the i32 length an array / string / map exposes — treat it as that
         // (not a struct field) so an un-annotated param used as a collection (`self[i]` +
         // `self.length`) infers without growing a bogus `{length}` shape that an array
         // argument can't satisfy. A NON-length field still grows the hole's struct shape.
-        if n.memProp == "length" { return symMem(ix, TY_I32) }
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
       }
     }
