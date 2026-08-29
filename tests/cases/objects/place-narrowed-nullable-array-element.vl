@@ -1,0 +1,100 @@
+// @run
+// @log 2
+// @log 2
+// @log 3
+// @log NUL
+// @log 1
+// @log 2
+// @hint redundant type annotation: `xs` is inferred as `(i32[][] | null)[]`
+// @hint redundant type annotation: `xs` is inferred as `(i32[][] | null)[]`
+// @hint redundant type annotation: `xs` is inferred as `(FOut | null)[]`
+// @hint redundant type annotation: `xs` is inferred as `(i32[][] | null)[]`
+// @hint redundant type annotation: `xs` is inferred as `(i32[] | null)[]`
+// @hint redundant type annotation: `xs` is inferred as `(i32[] | null)[]`
+// The annotations are DECLARED rather than deleted: the element type is what makes the
+// cell nullable at all, and an inferred `[src()]` would be the same type by a different
+// route — a fixture that tested the inference would stop testing the narrowing.
+// NARROWING AN ARRAY ELEMENT IN PLACE, then using it — `if xs[0] != null { xs[0][0][1] }`
+// with no temp binding in between.
+//
+// WHAT THIS PINS (inventory-2 D11). `placeKeyOf` had arms for Ident, Member and OptMember
+// and answered "" for an Index, so `pushNarrowFact` dropped the fact and no reader existed
+// to consult: 184 of 184 cells of the `elem_place` position were a loud check reject, and
+// the temp-binding control below was correct for every one of them.
+//
+// FOUR CHECKER RUNGS, AND THE FOURTH IS THE WHOLE DIFFERENCE. `placeKeyOf` keys an
+// integer-literal subscript; `placeCurTy` grows an Index arm (`placeElemTy`, the index twin
+// of `placeFieldTy`); `checkIndexNode` consults the overlay the way `checkMemberNode` does;
+// and `isPathKey` — which decides overlay-entry vs scope-shadow, and tested only for `.` —
+// also accepts `[`. The first three alone move NOTHING: a fact keyed `xs[0]` was collected
+// and then installed by `applyNarrows` as a bare-name scope SHADOW that no reader asks for,
+// because every reader of an index place asks the `npKeys` overlay.
+//
+// THE WRITE SIDE IS PART OF THE SAME LANDING, not a follow-up. `writeStorageTy` grew the
+// matching Index arm, and without it `elemWrite` below — which RUNS on master, because no
+// narrowing covers its target — would newly reject `cannot assign null to i32[]`. The
+// retirement rungs are pinned separately under `tests/cases/soundness/`.
+//
+// The emitted read is the temp-binding control's, instruction for instruction:
+// `ref.as_non_null (array.get …)` then the ordinary list index. No box, no re-hash.
+flat type FIn = { p: i32, q: i32 }
+flat type FOut = { a: i32, inner: FIn }
+
+function mkA(): i32[][] | null { return [[1, 2]] }
+function mkF(): FOut | null { return { a: 1, inner: { p: 2, q: 3 } } }
+function nul(): i32[][] | null { return null }
+function mk1(): i32[] | null { return [1, 2] }
+
+// The nested-array reps: the read INDEXES the narrowed element, so the guard is
+// load-bearing rather than tolerated by the use site.
+function elem() {
+  const xs: (i32[][] | null)[] = [mkA()]
+  if xs[0] != null { print(xs[0][0][1]) } else { print("NUL") }
+}
+// A CONTROL for the same rep: bind a temp, narrow the temp. Correct on master and here.
+function elemTemp() {
+  const xs: (i32[][] | null)[] = [mkA()]
+  const t = xs[0]
+  if t != null { print(t[0][1]) } else { print("NUL") }
+}
+// A `flat` payload, whose read is a field hop off the narrowed element.
+function elemFlat() {
+  const xs: (FOut | null)[] = [mkF()]
+  if xs[0] != null { print(xs[0].inner.q) } else { print("NUL") }
+}
+// The `null` half of the same guard, so the else arm is exercised at the same position.
+function elemNull() {
+  const xs: (i32[][] | null)[] = [nul()]
+  if xs[0] != null { print(xs[0][0][1]) } else { print("NUL") }
+}
+// THE WRITE BACK. This program RUNS on master (nothing narrows `xs[0]`, so the element
+// accepts a null at its declared type) and it must keep running: `writeStorageTy`'s Index
+// arm is what answers the storage type instead of the narrowed one.
+function elemWrite() {
+  const xs: (i32[] | null)[] = [mk1()]
+  if xs[0] != null { xs[0] = null } else { print("NUL") }
+  print(xs.length)
+}
+// A NESTED FUNCTION'S OWN `xs` IS NOT THE OUTER ONE. `weScanFree` records a free write's
+// place key and `placeRootOf` splits it back to the root name to ask whether the callee
+// BINDS it; splitting on `.` alone answered `"xs[0]"`, which matches no binding, so the
+// inner function's write to its own local retired the caller's narrowing and this program
+// was a loud reject naming a call that cannot touch `xs`.
+function elemShadow() {
+  const xs: (i32[] | null)[] = [mk1()]
+  function inner() {
+    const xs: (i32[] | null)[] = [null]
+    xs[0] = null
+  }
+  if xs[0] != null {
+    inner()
+    print(xs[0].length)
+  } else { print("NUL") }
+}
+
+elem()
+elemTemp()
+elemFlat()
+elemNull()
+elemWrite()
+elemShadow()
