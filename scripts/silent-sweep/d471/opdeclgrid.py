@@ -462,6 +462,19 @@ def main():
             if v["cell"][1] == v["expect"]:
                 bad_c.append((n, v["cell"][1], v["expect"]))
         npin = sum(1 for n in price if n in PINS)
+        # A CHECK MUST FAIL WHEN ITS POPULATION IS EMPTY. Run with the ledger absent
+        # (a partial checkout, a bad `git apply`, a rebase that dropped the set) this
+        # printed `price cells: 0`, three `0 fail` lines and "override holds", exit 0 --
+        # a green result from a population that does not exist, indistinguishable from
+        # the check having verified something. That is the do-nothing rule one level up:
+        # the rule says a CELL's expected answer must differ from what it would give if
+        # the thing under test did nothing; this says the CHECK's own result must differ
+        # from what it would give if the check did nothing. Both were violated in one
+        # day by authors who had read the other.
+        if not price:
+            print("price: EMPTY POPULATION -- the ledger lists no price cells, so "
+                  "nothing was verified. This is a FAILURE, not an override.")
+            return 1
         print("price cells: %d (%d grid + %d pins)  seed %s"
               % (len(price), len(price) - npin, npin, seed))
         print("  (a) ran                            : %d fail" % len(bad_a))
