@@ -189,3 +189,19 @@ never read back, three times over. They are gone; the census manifests remain th
 Provenance for a curated set lives once in `named/sources.json`, keyed by set name, instead of
 being repeated verbatim on all 529 curated cells. A cell is curated exactly when its `block` is
 not one of the five census blocks `A`–`E`.
+
+## `expected.jsonl` carries only what is READ, because a stale field reads as live
+
+It holds `block` and `represents`. It used to hold `class` and `msg` too, written from the
+last graded snapshot — and nothing refreshed them when a landing moved the baseline. Measured
+2026-08-29: **1,593 of 3,671 cells (43%) disagreed with `baseline.jsonl`**, and an agent
+grading D501 nearly took a verdict off the stale copy.
+
+This is the same failure as the `coords` blob removed in #1988 and it is worse in one respect.
+`coords` was obviously derived data nobody would grade against; `class` and `msg` read as
+authoritative. **A field nothing refreshes will rot, and a rotted field that looks like a
+measurement is more dangerous than no field at all.** Current behaviour lives in
+`baseline.jsonl`, which `--write-baseline` keeps honest.
+
+The general form is the same rule the `--price` guard and the do-nothing rule state at two
+other levels: an artefact must not be able to give a confident answer it did not compute.
