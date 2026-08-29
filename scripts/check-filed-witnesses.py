@@ -100,14 +100,42 @@ DECLARED = [
     ("loud check reject",          "check_reject"),
 ]
 
+# A vocabulary word under a NEGATION means the opposite of what it matches, and the match is
+# a plain substring, so `not closed` contains `closed` and graded as a FIXED row. That is not
+# hypothetical: this file's own docstring recorded a live row reading "deliberately NOT closed
+# by D35" grading itself `runs`, and D425 had to AVOID the word to dodge it — a row censoring
+# its own prose to appease its grader is the instrument failing, not the prose.
+#
+# Refusing to grade is the right answer rather than guessing the negation's scope: `--strict`
+# turns an ungradeable row into a failure that NAMES the row, so the author rewords it and the
+# count stays honest. Silently returning the inverted outcome is what produced a false `as
+# filed`, which is the one result this script exists to make impossible.
+NEGATIONS = (" not ", " never ", " no longer ", " isn't ", " is not ", " nor ", " rather than ")
+
+
+def negated_before(low, pos):
+    """True when a negation governs the vocabulary match starting at `pos`. Only the text in
+    the same clause is considered — a negation on the far side of a sentence boundary or a
+    list separator is about something else."""
+    window = low[:pos]
+    for sep in (".", ";", "·", "—", ","):
+        cut = window.rfind(sep)
+        if cut != -1:
+            window = window[cut + len(sep):]
+    window = " " + window + " "
+    return any(n in window for n in NEGATIONS)
+
+
 def declared_outcome(status_line):
-    """First LIST match wins, not first match by position — so a status line must not use
-    a vocabulary word about some OTHER row. A live row reading "deliberately NOT closed by
-    D35" graded as `closed`/`runs` and reported itself MOVED; the fix is the wording, but
-    the trap is worth naming here because the failure looks like a regression."""
+    """First LIST match wins, not first match by position — so a status line must not use a
+    vocabulary word about some OTHER row. A negated match is refused rather than inverted;
+    see NEGATIONS above."""
     low = status_line.lower()
     for needle, outcome in DECLARED:
-        if needle in low:
+        pos = low.find(needle)
+        if pos != -1:
+            if negated_before(low, pos):
+                return None
             return outcome
     return None
 
