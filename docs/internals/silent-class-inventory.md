@@ -13254,8 +13254,11 @@ Repro (now a loud emit reject):
 
   16 + 8 = 24, and the union is 28: the four `d411_{mapstore,structfield}__ret__*` cells
   move under **neither rung alone**, because each pin site claims them the moment the other
-  declines. Stripping both rungs reproduces the base seed **byte-for-byte**
-  (`3a6b8c9781f30ac5bc535f5dcc545eca`, 1,487,014 bytes).
+  declines. Stripping both rungs reproduces the base seed **byte-for-byte**. Re-taken on EACH of
+  the two masters this branch was rebased through, and identical on both: `f7a0bfba`
+  (`3a6b8c9781f30ac5bc535f5dcc545eca`, 1,487,014 bytes) and `c6eb736c` after #2010
+  (`c6302e543e2ace44a718db6cfad737ee`, 1,487,793 bytes), with the grid graded
+  cell-by-cell across both and 0 of 103 cells changing answer.
 
 * **THE GRID, RE-GRADED WHOLE** (`scripts/silent-sweep/d411/gen411.py`, `--verify` clean:
   40 named cells byte-identical to the generator):
@@ -13272,10 +13275,13 @@ Repro (now a loud emit reject):
   103 cells enter `letRefListDestSlot` with `box+ k1+` and the 7 controls read `box+ k1-` at
   all three call sites, unchanged.
 
-* Corpus `cmp` 2,400 modules · **0 DIFFER · 0 LOST**; distilled corpus **0 `runs` lost, 0
-  into any silent class**, the 28 cells moving `check-clean invalid wasm` -> `loud emit
-  reject`. Census blocks **B (28,590), C (43,200), D (9,000) and E (19,224)** graded
-  cell-matched against both seeds: **0 class movements and 0 message changes** in each.
+* Corpus `cmp` 2,406 modules · **0 DIFFER**, and the one `LOST` is this change's own
+  must-error fixture, which is `LOST` by construction (the base was check-clean — that is
+  the defect — and the candidate refuses it). Distilled corpus **0 `runs` lost, 0 into any
+  silent class**, the 28 cells moving `check-clean invalid wasm` -> `loud emit reject`.
+  Census blocks **A (150,224), B (28,590), C (43,200), D (9,000) and E (19,224)** — the
+  WHOLE census, 250,238 cells — graded cell-matched against both seeds: **0 class
+  movements and 0 message changes** in every block.
   Fixtures `tests/cases/unions/error-list-literal-pinned-two-destinations.vl` (rung 1) and
   `…/error-list-literal-return-pin-two-destinations.vl` (rung 2).
 
@@ -14827,8 +14833,11 @@ Repro (now a loud check reject):
   check reject`. They were already recorded in `distilled/named/` with the DECLARATION's
   answer as their expectation — this row's parent did that on purpose — so the gate never
   scored them as `runs` and the transition is **not** a `runs` -> not-runs veto. Corpus
-  `cmp` 2,400 modules · 0 DIFFER · 0 LOST; distilled **0 `runs` lost, 0 into any silent
-  class**; census blocks B, C, D and E graded cell-matched, **0 movements** in each.
+  `cmp` 2,406 modules · 0 DIFFER and one `LOST` that is this change's own must-error
+  fixture; distilled **0 `runs` lost, 0 into any silent class**; the WHOLE census (blocks
+  A/B/C/D/E, 250,238 cells) graded cell-matched, **0 movements** in every block. The rung
+  moves 0 of the 103 D411 grid cells and D501's two rungs move 0 of the 770 here, so the
+  two rows in this change are disjoint by measurement and not by inspection.
 
 * **THE 20th CELL OF THE `typaram_self` BLOCK IS LOUD FOR A LEXER REASON, and the row's
   claim about it is TRUE.** `d471_lt_typaram_self_tok` spells the declaration
