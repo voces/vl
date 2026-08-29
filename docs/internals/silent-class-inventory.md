@@ -15389,6 +15389,13 @@ Repro (now `runs`):
   graded `runs but wrong value`. `scripts/silent-sweep/d532/opretgrid.py --price` re-checks
   all fourteen price cells against the seed handed in.
 
+* **SINGLE-FILE MODE ONLY, AND THAT BOUND IS OLDER THAN EITHER ROW.** Prepend one unrelated
+  `import` to the repro and it is `operator '^' is not defined for V and V` again, on this
+  landing and on master alike (ROADMAP **A-OPMOD**): the operator DECLARATION does not reach
+  the dispatch in module mode at all, so it gates before anything these two rows touch.
+  Measured both ways — the same file without the import goes `check` -> `runs` here, with
+  the import it is a loud reject on both seeds.
+
 ---
 
 ### D532 — [CLOSED 2026-08-29] an un-annotated generic RETURN through an operator overload was typed as the OPERAND type
