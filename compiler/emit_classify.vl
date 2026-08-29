@@ -8153,6 +8153,34 @@ export function localIndexOf(fnIx: i32, name: string) {
 //   BinExpr { binOp: string, binLeft: i32, binRight: i32 }
 //   Call    { callFn: i32, callArgs: i32[] }
 //   Paren   { parInner: i32 }
+
+// The struct row whose field-NAME set matches `fnames` exactly, or -1. Bounded by
+// `sFieldCount.length` rather than `sNames.length`: the row being built has already had its
+// NAME pushed and has no field data yet, so the name column runs one ahead here.
+//
+// ONE HOME FOR TWO MINT SITES. `collectS`'s `TypeDecl` arm and `internShapeAs` both have to
+// lay a new row out in an existing same-fieldset row's order (see either caller for the
+// ruling: `{a,b}` and `{b,a}` are ONE type, and two rows share a wasm heap type only when
+// their field SEQUENCE matches). It lived next to the first caller and was private there;
+// the second is a layer below, so the shared answer lives here, beside `sFieldIndex`, which
+// is the only thing it reads that `emit_state` does not own.
+export function rowWithFieldNameSet(fnames: string[]): i32 {
+  let si = 0
+  while si < sFieldCount.length {
+    if sFieldCount[si] == fnames.length {
+      let all = true
+      let k = 0
+      while k < fnames.length {
+        if sFieldIndex(si, fnames[k]) < 0 { all = false }
+        k = k + 1
+      }
+      if all { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
 // The wasm struct field index of `name` within struct `si` (declaration order), or
 // -1 if that struct has no such field.
 export function sFieldIndex(si: i32, name: string) {
@@ -16863,15 +16891,36 @@ export function structIdxOfElemName(name: string) {
 // paren-grouped block, which derives that value once. Their rep contracts are
 // recorded arm-by-arm there.)
 
-// The DECLARED-struct index an inline-SHAPE element spelling (`{v:i32}` of a
-// `{v:i32}[]` annotation) resolves to via the structural bridge
-// (`structIndexOfTypeName`), or -1. GATED on a DECLARED twin
-// (`nameIsStructDecl`): an inline spelling matching only an anonymous-literal /
-// interned-shape slot keeps its legacy classification — admitting it would
-// route a shape-armed union (`t is {f: boolean}[]` over an inferred closure-call
-// binding) into the union-arm narrow machinery, whose read side still
-// mis-lowers that flow (the pre-existing nominal `T[]`-arm hole), so the loud
-// REJECT must hold until that path is fixed. A non-`{...}` base fast-rejects.
+// The struct-table index an inline-SHAPE element spelling (`{v:i32}` of a
+// `{v:i32}[]` annotation) resolves to — the arena's canonical-key answer, else the
+// structural bridge (`structIndexOfTypeName`) — or -1 when nothing resolves. A
+// non-`{...}` base fast-rejects.
+//
+// UNGATED SINCE #2004, AND THE GATE IT LOST IS RECORDED BECAUSE THE MEASUREMENT IS THE
+// POINT. It used to require `nameIsStructDecl(sNames[si])` — the resolved row's name must
+// have a `TypeDecl` node — so that an inline spelling matching only an anonymous-literal /
+// interned-shape slot kept its legacy classification. The stated reason was that admitting
+// one would route a shape-armed union (`t is {f: boolean}[]` over an inferred closure-call
+// binding) into the union-arm narrow machinery, whose read side mis-lowers that flow, and
+// `tests/cases/structs/struct-alias-union-inline-elem-array-floor.vl` was the `@emit-error`
+// fixture holding it closed.
+//
+// The cell that reason names is not a reject on either side: it RUNS, correctly, gated and
+// ungated. A poison probe here — resolved row, name not a `TypeDecl` — fires on THREE of
+// the 2,386 corpus modules that predate #2004: that fixture, and two whose row is anonymous
+// (`closures/closure-result-array-of-map-closure-field-structs.vl` at `#anon0`,
+// `closures/closure-result-value-union-field-nested-composite.vl` at `#anon2`). Both of
+// those build BYTE-IDENTICALLY ungated, so the reach is live and the answer does not move;
+// a 10-cell grid of the protected population (the shape-armed union narrowed from an
+// inferred call, from an annotated one, at a param / global / return, both arms taken, plus
+// the same-fieldset NESTED twin) moves 0 cells. What the gate DID do was refuse a
+// struct-alias union's row — `type AB = {a:i32} & {b:i32}` is a one-variant `UnionDecl`, so
+// `{a:i32,b:i32}[]` beside it was a loud emit reject at eight positions (D402).
+//
+// The predicate distinction the old note drew is still true and still worth keeping:
+// `sRowDecl` banks `cUserTypes.has(nm)`, which holds UNION declarations, and is NOT
+// interchangeable with `nameIsStructDecl`, which wants a `TypeDecl` node. Nothing here
+// swapped one for the other — the question stopped being asked.
 function shapeElemDeclaredStructIdx(base: string) {
   if !nameIsShapeOpen(base) { return -1 }
   // NODE-LESS caller (rep-intern P2): `base` is an INLINE SHAPE `{…}` element
@@ -16883,31 +16932,23 @@ function shapeElemDeclaredStructIdx(base: string) {
   // inner `{f: i64 | null}` row) by the FULL nested field type. Falls to the
   // fieldset scan when the arena declines (`repRowOfName` < 0: non-`TyObj`, no
   // dedup-participating row, or an atom-vs-plain collision it must not guess
-  // through). The `nameIsStructDecl` gate is PRESERVED — the anonymous-shape-armed-
-  // union element loud reject must still hold on whatever row resolves.
+  // through). Whatever row resolves is the answer; see the header for the gate that used
+  // to sit on the tail and the three-module probe that retired it.
   let si = repRowOfName(base, sScanLim())
   if si < 0 { si = structIndexOfTypeName(base) }
   if si < 0 { return -1 }
-  // NOT `sRowDecl`, AND THE ATTEMPT IS RECORDED BECAUSE THE MEASUREMENT LOOKED CLEAN.
-  // `sRowDecl` banks `cUserTypes.has(nm)` at the mint, and `cUserTypes` holds UNION
-  // declarations too (`typecheck.vl` `cUserTypes[sd0.udName] = uIx0`), while
-  // `nameIsStructDecl` answers true only for a name with a `TypeDecl` NODE. A
-  // struct-alias union — the canonicalized `type S = {a:i32} & {b:i32}`, interned here by
-  // `internShapeAs(s.udName, …)` — is therefore a row whose name IS in `cUserTypes` and is
-  // NOT a `TypeDecl`, so the column opens this gate where the scan closed it.
-  //
-  // Measured on the swap: `type S = {a:i32} & {b:i32}` beside an inline `{a:i32,b:i32}[]`
-  // goes from master's loud `only i32[] arrays and struct/union element arrays are
-  // supported` to accepted — the exact loud-reject conversion the note above forbids. The
-  // dual-run that licensed the swap read 1,029 agree / 0 disagree, and was simply blind:
-  // no corpus file pairs a struct-alias union with an inline spelling of its shape.
-  //
-  // The two predicates cannot share one column, and that is the point rather than an
-  // inconvenience: `repSlotCacheSync` wants "is this row's name a declared TYPE" (unions
-  // included — measured 602/0 there) and this gate wants "is it a declared STRUCT". One
-  // fact each, and `sRowDecl` is the first.
-  if nameIsStructDecl(sNames[si]) { return si }
-  -1
+  // THE HISTORY OF THE RETIRED GATE, KEPT BECAUSE ITS FIRST REMOVAL WAS WRONG FOR A REASON
+  // THAT STILL APPLIES ELSEWHERE. A destringify slice once replaced `nameIsStructDecl` with
+  // the `sRowDecl` column, which banks `cUserTypes.has(nm)` at the mint. Those are NOT the
+  // same question: `cUserTypes` holds UNION declarations too (`typecheck.vl`
+  // `cUserTypes[sd0.udName] = uIx0`), while `nameIsStructDecl` answers true only for a name
+  // with a `TypeDecl` NODE — so the column opened the gate where the scan closed it, and the
+  // dual-run that licensed the swap read 1,029 agree / 0 disagree while being blind (no
+  // corpus file pairs a struct-alias union with an inline spelling of its shape). The gate is
+  // gone now for a measured reason rather than an accidental one, but `sRowDecl` is still not
+  // the column for "is this a declared STRUCT": `repSlotCacheSync` wants "is this row's name a
+  // declared TYPE" (unions included — measured 602/0 there). One fact each.
+  si
 }
 
 // True if the array type-name `name` is a REF-element list — `S[]` over a declared
@@ -16963,9 +17004,11 @@ export function nameIsRefArray(name: string) {
     // Either union ALONE was correct, because the cut then named nothing (#1814 repro C).
     if unionMemberCount(base) >= 2 { return false }
     if structIndexByName(base) >= 0 { return true }
-    // An INLINE-SHAPE element (`{v:i32}[]`) whose shape deduped onto a DECLARED
-    // struct at intern time (so the spelling has no `sNames` entry): the
-    // structural bridge resolves it — the shape-vs-declared twin of `S[]`.
+    // An INLINE-SHAPE element (`{v:i32}[]`) whose shape deduped onto an interned
+    // row at intern time (so the spelling has no `sNames` entry of its own): the
+    // structural bridge resolves it — the shape-vs-declared twin of `S[]`. The row
+    // it lands on need NOT be a declared struct; see that resolver's header for the
+    // gate that used to require one and the probe that retired it (#2004).
     if shapeElemDeclaredStructIdx(base) >= 0 { return true }
     // A `Cat[]` over a concrete union VARIANT — a ref list of bare variant structs.
     if variantIndexOf(base) >= 0 { return true }
@@ -18749,9 +18792,9 @@ export function refArrElemName(name: string) {
       u = u + 1
     }
     if structIndexByName(base) >= 0 { return base }
-    // An INLINE-SHAPE element (`{v:i32}[]`) resolving to a DECLARED struct by the
+    // An INLINE-SHAPE element (`{v:i32}[]`) resolving to an interned row by the
     // structural bridge — the SPELLING stays the table key (its slot twins with the
-    // declared name's slot at the heap layer, so the pair still dedups). Keyed
+    // resolved row's slot at the heap layer, so the pair still dedups). Keyed
     // exactly like `nameIsRefArray`'s bridge (the two must agree).
     if shapeElemDeclaredStructIdx(base) >= 0 { return base }
     // A `Cat[]` concrete-variant element list — the bare variant name is the table key.
@@ -21042,22 +21085,83 @@ export function internShapeAs(key: string, nm: string) {
   if names.length == 0 {
     return emitFail("emitProgram: empty struct alias shape")
   }
+  // FIELD ORDER IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET —
+  // the SAME rule `collectS`'s `TypeDecl` arm applies, and it has to be applied here for
+  // the same reason. `{a: i32, b: i32}` and `{b: i32, a: i32}` are ONE type to the checker,
+  // while two struct rows collapse to one wasm HEAP TYPE only when their field SEQUENCE
+  // matches — `structFieldCodesEq` compares field CODES positionally and never NAMES, so a
+  // permuted pair that shares a canonical key merges with `a` and `b` in opposite slots.
+  //
+  // THIS ROW COULD NOT MERGE AT ALL BEFORE, WHICH IS WHY THE OMISSION WAS INVISIBLE.
+  // `slotCanonId` banked -1 for a struct-alias union row (the D0 recorder handed it the
+  // ALIAS name, whose arena type is a union, and the `TyObj` gate declined), and
+  // `buildStructTwins` tests that key first — so no permuted alias row was ever compared
+  // against anything. Recording the SHAPE's type at the mint (just below) opens the merge,
+  // and `type AB = {b:i32} & {a:i32}` beside an inline `{a:i32,b:i32}[]` then went from
+  // check-clean INVALID WASM to check-clean WRONG VALUES (the fields read from swapped
+  // slots). Measured on the 151-cell D402 grid: exactly one cell, `interrev__fieldalias`,
+  // and it is the ONLY cell either rung moves to a silent answer.
+  //
+  // Reordering does not change WHICH fields the row has or their types — only the sequence
+  // — and it applies only when a prototype with the identical field-name set already
+  // exists, so an alias shape with no twin lays out exactly as spelled.
+  const ord: i32[] = []
+  let oi = 0
+  while oi < names.length {
+    ord.push(oi)
+    oi = oi + 1
+  }
+  const proto = rowWithFieldNameSet(names)
+  if proto >= 0 {
+    const reord: i32[] = []
+    let rp = 0
+    while rp < sFieldCount[proto] {
+      const want = sFieldNames[sFieldStart[proto] + rp]
+      let rq = 0
+      while rq < names.length {
+        if names[rq] == want { reord.push(rq) }
+        rq = rq + 1
+      }
+      rp = rp + 1
+    }
+    if reord.length == names.length {
+      let rw = 0
+      while rw < reord.length {
+        ord[rw] = reord[rw]
+        rw = rw + 1
+      }
+    }
+  }
   sDeclared = true
   sNames.push(key)
   recordSRowDeclOfName(key)
-  recordSTyIx(sTyIxOfName(key)) // D0
+  // D0, KEYED ON THE SHAPE AND NOT ON THE ALIAS NAME. `key` here is a struct-alias
+  // UNION name (`type AB = {a:i32} & {b:i32}`), so `sTyIxOfName(key)` answers
+  // `cUserTypes[key]` — the arena's *union* type — and `slotCanonId`'s `TyObj` gate then
+  // declines the row, banking -1. `buildStructTwins` tests that key FIRST
+  // (`keys[i] >= 0`), so the row was never compared against ANY other, and two aliases of
+  // one layout each got their own heap type: check-clean INVALID WASM (D441), as did an
+  // alias list assigned into a structurally-spelled field list (D442). This is the SAME
+  // degenerate `sTyIxOfNameTy`'s generic-application arm was added for
+  // (`generics/genapp-instance-twins-declared.vl`) — one arm over.
+  // `nm` is the shape this row's fields were parsed FROM, so its arena type is the type
+  // the ROW denotes, which is `recordSTyIx`'s stated contract; nothing is merged by
+  // recording it, and `buildStructTwins`' second gate (`structFieldCodesEq`, positional)
+  // still has to agree before two rows share a heap type.
+  recordSTyIx(sTyIxOfName(nm)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
   let pi = 0
   while pi < codes.length {
-    sFieldNames.push(names[pi])
-    sFieldTypes.push(codes[pi])
+    const fx = ord[pi]
+    sFieldNames.push(names[fx])
+    sFieldTypes.push(codes[fx])
     sFieldElemName.push("")
     // This recorder banks NO element name for any code (its rows carry "" — the alias
     // shape's fields are re-derived elsewhere), but the KEY half is free and is read
     // straight off the field's own spelling, so a mono i32-keyed map field here names
     // its own map struct instead of the string-keyed twin's.
-    recordSFieldElemRow("", nameIsI32KeyedMap(rawTexts[pi])) // D5
+    recordSFieldElemRow("", nameIsI32KeyedMap(rawTexts[fx])) // D5
     pi = pi + 1
   }
   0
