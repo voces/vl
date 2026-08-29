@@ -738,6 +738,28 @@ let argCstrAt: i32[] = []
 let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
 
+// DEFERRED `print` constraints over un-annotated-param / type-parameter holes — the
+// PRINTABILITY capability, deferred to the pin for exactly the reason the two tables above
+// defer the operator and the argument flow.
+//
+// `print` renders ONE scalar or string rep, and the two floors that say so — `tyPrintsAsRef`
+// and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S TYPE in the body. Inside a generic
+// that type is a hole (`T`, or the `?elem.T` a `x[0]` read derives), and a hole is neither a
+// ref nor a box, so both floors answer FALSE and the call is admitted. The emitter's print
+// ladder is a run of POSITIVE tests ending in an unguarded `call __print_i32__`, so the
+// instance then handed a `(ref $t)` to an `(i32) -> ()` import: `vl check` rc 0 and a module
+// the engine refuses. `tyPrintsAsRef`'s own header used to claim the opposite —
+// *"nor a `TyVar` … the concrete argument is gated there"* — and NOTHING gated it there;
+// `scripts/silent-sweep/d401/printgrid.py` measures 19 such cells, at every argument rep
+// whose CONCRETE twin is a clean check reject. (`silent-class-inventory` D401.)
+//
+// Record the printed type and the argument NODE; the generic call site substitutes the hole
+// to the call's concrete argument type and asks the same two floors, so the generic spelling
+// lands on the direct spelling's own diagnostic rather than one annotation away from it.
+let printCstrTy: i32[] = []
+let printCstrIx: i32[] = []
+let printCstrFn: i32[] = []
+
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
 // its type. A hole is permissively assignable both ways, so a usage that requires a
 // concrete type (`const r: K = u`, `return u` under a declared return, `q(u)` into an
@@ -2921,6 +2943,9 @@ export function initChecker() {
   argCstrAt = []
   argCstrExp = []
   argCstrWho = []
+  printCstrTy = []
+  printCstrIx = []
+  printCstrFn = []
   solvedParamTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -16355,6 +16380,87 @@ function noteArgCstr(at: i32, exp: i32, who: string) {
   0
 }
 
+// Record a deferred `print` constraint when the printed type still carries a hole — the body
+// cannot decide the rep, so the generic call site adjudicates it under substitution. Stamped
+// with the OWNING declaration for the reason `noteBinCstr` states in full: `substTyDeep`
+// matches TyVars by NAME, so an unscoped list makes every `<T>` in the program one namespace.
+//
+// `tyHasHole`, NOT `tyIsHole`, and the difference is measured. The bare-`T` position
+// (`print(x)` in `g<T>(x: T)`) is a hole ITSELF, but `print(x[0])` derives an `?elem.T` whose
+// base is the hole, and a printed `T[]` / `T | null` / `{v: T}` is a CONSTRUCTOR over one —
+// all of them substitute to a concrete rep at the pin and none of them IS a `TyVar`. Same
+// word one layer down that D421's `noteBinCstr` needed.
+function notePrintCstr(pt: i32, argIx: i32) {
+  if pt < 0 { return 0 }
+  if tyHasHole(pt) {
+    const owner = cstrOwnerTop()
+    let k = 0
+    while k < printCstrTy.length {
+      if printCstrTy[k] == pt && printCstrIx[k] == argIx {
+        if printCstrFn[k] == owner { return 0 }
+      }
+      k = k + 1
+    }
+    printCstrTy.push(pt)
+    printCstrIx.push(argIx)
+    printCstrFn.push(owner)
+  }
+  0
+}
+
+// Re-validate every deferred `print` constraint THIS call resolves: substitute the hole to the
+// call's concrete argument type and ask the SAME two floors the direct spelling is held to.
+// A type still touching an unresolved hole (not bound by this call, or a nested generic) is
+// re-recorded under the caller's hole and defers — `validateBinCstrs`' re-deferral rule, for
+// the same two-level chain reason.
+//
+// THE DIAGNOSTIC IS THE DIRECT SPELLING'S, VERBATIM, and that is the whole point of the row:
+// `g<T>(x: T) { print(x[0]) }` and `g(x: i32[][]) { print(x[0]) }` are one annotation apart,
+// so the refusal has to be one sentence apart too — reported AT THE CALL, which is the only
+// position that knows the instance. The attribution goes in FRONT, on `validateBinCstrs`'
+// argument: the reader is standing at `g(v)` and wrote no `print` and no `i32[]`.
+function validatePrintCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigP = printCstrTy.length
+  let ci = 0
+  while ci < nOrigP {
+    if cstrOwnedBy(printCstrFn[ci], calleeFn) {
+      const cpt = substTyDeep(printCstrTy[ci], bNames, bTys)
+      if calleeFn >= 0 {
+        if cpt != printCstrTy[ci] {
+          if tyHasHole(cpt) { notePrintCstr(cpt, printCstrIx[ci]) }
+        }
+      }
+      if !tyHasHole(cpt) {
+        let pMsg = ""
+        if tyPrintsAsUnionBox(cpt) {
+          pMsg = "print of a union value (" +
+            tyToStr(cpt) +
+            ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`"
+        } else if tyPrintsAsRef(cpt, 24) {
+          pMsg = "print of " +
+            tyToStr(cpt) +
+            " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`"
+        }
+        if pMsg != "" {
+          let pWho = "a type parameter is printed here: "
+          if who != "" {
+            pWho = "`" + who + "` prints its type parameter here: "
+          }
+          tErrUnsupported(pWho + pMsg, ix)
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
 // True when `ty` reaches an inference HOLE (a `TyVar`) anywhere in its tree — through an
 // array element, a map key/value, a struct field, a nullable inner, a union member, or a
 // function type's params/return. The FULLY-CONCRETE test the parameter solve needs, and
@@ -16555,6 +16661,7 @@ function solveUnannotParams(fnIx: i32) {
     const savedQuiet = inferQuiet
     const savedBinN = binCstrOp.length
     const savedArgN = argCstrAt.length
+    const savedPrintN = printCstrTy.length
     const savedJoinN = dJoinNode.length
     const nFlow = holeFlowSrc.length
     symEnabled = 0
@@ -16577,6 +16684,11 @@ function solveUnannotParams(fnIx: i32) {
       argCstrAt.pop()
       argCstrExp.pop()
       argCstrWho.pop()
+    }
+    while printCstrTy.length > savedPrintN {
+      printCstrTy.pop()
+      printCstrIx.pop()
+      printCstrFn.pop()
     }
     // The PARKED deferred joins too, and this one is keyed by CALL NODE rather than by
     // hole name — so a probe's row is not the idempotent re-record the name-keyed tables
@@ -17920,6 +18032,16 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        // The PRINT capability rides the same pin, and it rides the UFCS half too for the
+        // reason stated above: `xs.show()` and `show(xs)` are the same call and must answer
+        // the same way. (`silent-class-inventory` D401.)
+        validatePrintCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
       }
     }
     if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
@@ -18764,6 +18886,11 @@ function checkCallNode(n: Call, ix: i32) {
             pargs[pj],
           )
         }
+        // A printed type that still carries a HOLE answers FALSE to both floors above — it
+        // is neither a ref nor a box YET — so the two of them together admit every generic
+        // `print`. Defer it to the pin, the only position that knows the instance.
+        // (`silent-class-inventory` D401; the recorder's header has the measurement.)
+        notePrintCstr(pt, pargs[pj])
         pj = pj + 1
       }
       return TY_VOID
@@ -19149,6 +19276,7 @@ function checkCallNode(n: Call, ix: i32) {
         cstrWho = cfn.identName
       }
       validateBinCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+      validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
       validateArgCstrs(bNames, bTys, ix)
       // The escaped-join reject is the FALLBACK, not an additional voice: when this
       // same site already reported a precise operand/argument-flow diagnostic, that
@@ -22722,8 +22850,18 @@ function tyPrintsAsUnionBox(pt: i32) {
 //
 // `string` is deliberately NOT here: it is a reference too, but the ladder routes it to
 // the string streaming printer. Nor is a LITERAL union (i32/string atoms widened to their
-// member text), nor a `TyVar` (a generic body's `T` — monomorphization decides its rep at
-// the call site, and the concrete argument is gated there).
+// member text).
+//
+// A `TyVar` IS NOT HERE EITHER, AND THE REASON THIS COMMENT USED TO GIVE WAS FALSE. It read
+// *"monomorphization decides its rep at the call site, and the concrete argument is gated
+// there"* — nothing gated it there, and the sentence is why nobody looked for nineteen
+// silent cells that were sitting in front of it (`silent-class-inventory` D401). A hole
+// answers FALSE to this predicate because it has no rep YET, which is the correct answer to
+// the question this function asks and NOT a claim that somebody else asks it later. The
+// gate that does ask it later is `validatePrintCstrs`, at the generic call site, and it
+// calls THIS function on the substituted type — so a `TyVar` reaching here is a DEFERRAL
+// with a named holder, not an exemption. A comment naming another site as the one holding
+// an invariant is a claim with a witness attached; run it before believing it.
 //
 // Depth-bounded like `tyReachesUnion`: a self-referential alias reached through a union or
 // nullable member would otherwise not terminate.
@@ -25474,6 +25612,57 @@ export function nodeTyHasTyVar(ix: i32) {
   if ty < 0 { return false }
   tyHasHole(ty)
 }
+// `nodeTyHasTyVar` MINUS the one position a type variable can sit in without deciding
+// the value's REP — the question the emitter's PARAMETER floor actually asks, and it is
+// narrower than "mentions `T`" by exactly one constructor.
+//
+// A parameter's valtype is chosen from its annotation, and for a shared lifted lambda the
+// annotation is the UNSUBSTITUTED one (`monoCloneBody` leaves it alone, `collectFns` has
+// already lifted it), so a `T` the valtype DEPENDS on is a wrong slot at every instance
+// whose rep is not the i32 default. Under a `=>` it does not: a closure parameter is the
+// fat pointer for every instantiation, so `(x: (T) => T) => …` lowers identically at every
+// pin. MEASURED, not assumed — the wide predicate turned 12 running cells of
+// `scripts/silent-sweep/d426/lamgrid.py` into rejects, and a lambda that CALLS such a
+// parameter is already refused loudly where the default is wrong (`function-value call
+// arity has no interned signature` at `T = string` / `f64`, runs at `T = i32`), so there is
+// no silent class behind the exemption. (`silent-class-inventory` D426.)
+export function nodeTyHasRepTyVar(ix: i32) {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  tyHasRepHoleAt(ty, 0)
+}
+function tyHasRepHoleAt(tyIx: i32, depth: i32) {
+  if tyIx < 0 { return false }
+  if depth > 8 { return false }
+  const t = T.tys[tyIx]
+  if t is TyVar { return true }
+  if t is TyArray { return tyHasRepHoleAt(t.aElem, depth + 1) }
+  if t is TyNullable { return tyHasRepHoleAt(t.nInner, depth + 1) }
+  if t is TyMap {
+    if tyHasRepHoleAt(t.mKey, depth + 1) { return true }
+    return tyHasRepHoleAt(t.mVal, depth + 1)
+  }
+  if t is TyObj {
+    const ofts = t.objFieldTypes
+    let i = 0
+    while i < ofts.length {
+      if tyHasRepHoleAt(ofts[i], depth + 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyUnion {
+    const ums = t.uMembers
+    let u = 0
+    while u < ums.length {
+      if tyHasRepHoleAt(ums[u], depth + 1) { return true }
+      u = u + 1
+    }
+    return false
+  }
+  // A `TyFunc` is deliberately NOT descended into — see the header.
+  false
+}
 // STRUCTURAL: node `ix`'s type is `boolean | null` (the i32 sentinel-2 niche) — a
 // `TyNullable` whose inner is the `boolean` prim. Lets `exprNulBool` recover the niche
 // from the checker's recorded type for an expression whose syntactic form it can't trace
@@ -27952,6 +28141,7 @@ export function monoInferListElem(
   const sHoleMap = holeMapNames.length
   const sHoleAlt = holeAltNames.length
   const sBinC = binCstrOp.length
+  const sPrnC = printCstrTy.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
   const sINulB = inferLetNulBoolIx.length
@@ -28027,6 +28217,11 @@ export function monoInferListElem(
     binCstrRt.pop()
     binCstrFn.pop()
   }
+  while printCstrTy.length > sPrnC {
+    printCstrTy.pop()
+    printCstrIx.pop()
+    printCstrFn.pop()
+  }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }
   while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
@@ -28073,6 +28268,7 @@ export function monoInferLocalScalar(
   const sHoleMap = holeMapNames.length
   const sHoleAlt = holeAltNames.length
   const sBinC = binCstrOp.length
+  const sPrnC = printCstrTy.length
   const sILet = inferLetIx.length
   const sINulS = inferLetNulStrIx.length
   const sINulB = inferLetNulBoolIx.length
@@ -28141,6 +28337,11 @@ export function monoInferLocalScalar(
     binCstrLt.pop()
     binCstrRt.pop()
     binCstrFn.pop()
+  }
+  while printCstrTy.length > sPrnC {
+    printCstrTy.pop()
+    printCstrIx.pop()
+    printCstrFn.pop()
   }
   while inferLetIx.length > sILet { inferLetIx.pop() }
   while inferLetTy.length > sILet { inferLetTy.pop() }

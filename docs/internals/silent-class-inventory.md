@@ -13144,9 +13144,12 @@ Repro (now `runs`):
 
 ---
 
-### D401 — `print(x[0])` on an UNBOUNDED type parameter whose element is a LIST is check-clean invalid wasm
-**check-clean invalid wasm on `777f7848` and on this branch · found 2026-08-28 by
-inventory-2 D14's own grid, on the side that row called "admitted"**
+### D401 — [CLOSED 2026-08-28] `print` through an UNBOUNDED type parameter: the PRINTABILITY capability, lost in the instantiation
+**CLOSED 2026-08-28 — the repro is NOW A LOUD CHECK REJECT, in the direct spelling's own
+words (``g` prints its type parameter here: print of i32[] is type-valid but not yet
+supported by codegen — …`). Was: check-clean invalid wasm on `777f7848`, on `1252cf04` and
+on this branch's base · found 2026-08-28 by inventory-2 D14's own grid, on the side that row
+called "admitted" · THE FILED FAMILY WAS THREE CELLS AND THE MEASURED ONE IS NINETEEN**
 
 Repro:
 
@@ -13162,24 +13165,75 @@ Repro:
 
 * **THE CONCRETE TWIN IS A CLEAN CHECK REJECT.** `function g(x: i32[][]) { print(x[0]) }`
   over the same value is `print of i32[] is type-valid but not yet supported by codegen`.
-  One annotation is the whole difference.
-* **IT IS THE PRICE OF THE ASYMMETRY inventory-2 D14 NAMED.** `checkIndexNode`'s `TyVar` arm
-  admits `x[i]` for EVERY type variable, returning a derived `HD_ELEM` hole; `print` of an
-  unresolved hole is admitted because nothing yet knows it is a list. D14's own sentence —
-  *"note that `x[0][1]` **is** admitted on an unbounded `T`, which is how D3 got through"* —
-  was pointing here, and D14's close measured it: **3 of the 15 argument reps** in
-  `scripts/silent-sweep/d14/lengrid.py` (`arr_nest`, `arr_arr_s`, `arr_rec`), against 3 that
-  run and 9 that are loud.
-* **THE MECHANISM IS OFF THE DISASSEMBLY.** `wasm-dis` of the built module:
+  One annotation is the whole difference — reproduced verbatim on the base.
+* **THE FILED CLAIM THAT THE ROW IS THREE CELLS IS FALSE, and the correction IS the
+  mechanism.** D14's `lengrid.py` varies the OPERATION and holds the print position at the
+  element read, so it can only see the `x[0]` leg. `scripts/silent-sweep/d401/printgrid.py`
+  holds the operation at `print` and varies what is handed to it — the parameter ITSELF, an
+  element read, a field read, and `.length` — over 19 argument reps beside their concrete
+  twins. **19 of its 152 cells are check-clean invalid wasm, and 15 of those are the BARE
+  position** (`function g<T>(x: T) { print(x) }`), which the row never named. Every one of
+  the 19 has a `con/` twin that is already a clean check reject.
+* **`tyPrintsAsRef`'s OWN HEADER STATED THE FALSE CLAIM**, which is why nobody looked:
+  *"Nor is a `TyVar` (a generic body's `T` — monomorphization decides its rep at the call
+  site, **and the concrete argument is gated there**)."* Nothing gated it there. The header
+  now says what the pin does instead.
+* **THE MECHANISM IS OFF THE DISASSEMBLY.** `wasm-dis` of the base's module:
   `(call $fimport$0 (ref.as_non_null (array.get $4 (struct.get $5 0 (local.get $2)) …)))` —
-  `__print_i32__` is handed `(ref $3)`, the inner i32-list wrapper. The element read is
-  correct; the SINK is the i32 print.
-* **WHERE THE FIX GOES, AND WHY IT IS NOT D14's.** The checker cannot know the instance, so
-  the guard belongs where the substitution happens — `monoInstantiate`, which holds the
-  bound `T` and could apply `checkPrintable`'s own rule to the substituted element type.
-  D14's close deliberately did NOT widen the checker to match: the permissive side is the
-  one with silent cells, and copying it would have been the wrong direction.
-* The three cells are kept whole at `distilled/named/d14idx_{arr_nest,arr_arr_s,arr_rec}.vl`.
+  `__print_i32__` is handed the inner i32-list wrapper. The element read is correct; the
+  SINK is the i32 print. (binaryen 130.)
+
+#### The close
+
+**THE FIX IS A DEFERRED CONSTRAINT AT THE PIN, and the site the row prescribed is the wrong
+one.** The row said the guard belongs at `monoInstantiate` "which holds the bound `T`". It
+does hold it, and it is reached — but it is in the EMITTER, so the best diagnostic available
+there is an `emitProgram:` reject, while the row's own criterion is that the generic and the
+concrete spellings are ONE ANNOTATION apart and must therefore be one sentence apart. The
+checker already owns the machinery that makes them so: `noteBinCstr` / `validateBinCstrs`
+defer the OPERATOR capability to the generic call site, `noteArgCstr` / `validateArgCstrs`
+the argument flow, and `escJoinTy` / `validateEscJoins` the inferred join. Printability is
+the fourth capability of exactly that shape, and it is now the fourth table:
+`notePrintCstr` records a `print` whose argument type still carries a hole (`tyHasHole` —
+CONTAINS, not IS: the bare `T` is a hole, the `?elem.T` an `x[0]` derives is one under a
+constructor), stamped with `cstrOwnerTop()`; `validatePrintCstrs` substitutes at the pin,
+re-defers a still-holey result under the caller's hole, and asks the SAME two floors the
+direct spelling is held to — `tyPrintsAsUnionBox` then `tyPrintsAsRef`. Wired at both pins,
+the direct call's and the UFCS one.
+
+**MEASURED, four instruments:**
+
+* **Corpus BYTE-IDENTITY.** `scripts/silent-sweep/corpuscmp.py` over `tests/cases/` + `std/`:
+  **2,382 modules · 1,947 identical · 0 DIFFER · 0 LOST** against the base `1252cf04`
+  (435 not buildable by the base, excluded and never scored). Taken for this rung alone and
+  again for the whole branch.
+* **The grid, cell-matched.** `printgrid.py`: **19 moved, all `check-clean invalid wasm` →
+  `loud check reject`; 0 `runs` lost, 0 → silent, and the grid's silent column is EMPTY.**
+  D14's own `lengrid.py` moves its 3 index cells and nothing else — 60 cells, 0 runs lost.
+* **Counters, reach AND ans.** A probe build over the corpus: `notePrintCstr` **records 67
+  times and changes 0 answers** across the 2,336 checkable modules that are not this
+  branch's own fixtures — which is precisely why the
+  corpus is byte-identical, and precisely why the fixtures are the only thing standing under
+  this row. On its own witness it is **reach 2 / ans 3**, and on the one-character control
+  (`g([7, 8])` instead of `g([[7, 8]])`) **reach 2 / ans 0**.
+* **Real disassembly**, above.
+
+**ABLATED.** Three variants built from the branch by hunk: stripping every rung reproduces
+master byte-for-byte (`md5 74263575…`, 1,473,330 bytes). This rung alone is `6461587a…` / 1,475,242 bytes and moves 19
+printgrid cells and **0** lamgrid cells; D426's rung alone moves 37 lamgrid cells and **0**
+printgrid cells. **The two are two landings, not one**, and the branch's moved set is exactly
+the union.
+
+**BOUND, stated rather than discovered later.** `binCstrsHold` has a pure-boolean twin for
+`genericFnAssignable`; the print table has none, so a generic function VALUE assigned from
+its type does not consult printability. That is an incompleteness, not a false reject, and no
+cell of either grid reaches it.
+
+Fixtures: `tests/cases/generics/error-print-type-param.vl` (18 refusals, each beside its
+direct control) and `tests/cases/generics/print-type-param-runs.vl` (the accept set, read
+back by value at every printable rep). The 23 cells the grid names are kept whole at
+`distilled/named/d401p_*.vl` — the 19 that moved plus the four one-character neighbours that
+run and must not move with them.
 
 ---
 
@@ -13697,8 +13751,12 @@ Repro:
 
 ---
 
-### D426 — a LAMBDA inside a generic body whose parameter type mentions `T` is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-28 by D421's route axis — the one route of six whose `T = i32` cell is silent as well as its `T = Circle` cell · pre-existing and IDENTICAL on master `777f7848` and on all four rungs of this branch · NOT D421: the refusal is not lost, the SIGNATURE is wrong**
+### D426 — [CLOSED 2026-08-28] a LAMBDA inside a generic body whose parameter type mentions `T`: the floor said IS where it meant CONTAINS
+**CLOSED 2026-08-28 as a SILENT class — the repro is NOW A LOUD EMIT REJECT
+(`emitProgram: parameter `T[]` still names an unsubstituted type parameter — …`), and the
+LOWERING it names is priced, not fixed. Was: check-clean invalid wasm · found 2026-08-28 by
+D421's route axis · pre-existing and IDENTICAL on `777f7848`, on `1252cf04` and on all four
+rungs of D421's branch · NOT D421: the refusal is not lost, the SIGNATURE is wrong**
 
 Repro:
 
@@ -13715,37 +13773,140 @@ Repro:
 
     print(cell())
     // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 330: type mismatch: expected i32,
+    //   Invalid input WebAssembly code at offset 326: type mismatch: expected i32,
     //   found (ref $type)
 
-* **IT IS NOT THE COMPARISON.** The same generic without the lambda
-  (`function opT<T>(a: T[], b: T[]) { return a == b }` at `T = i32`) RUNS and prints `true`,
-  and so does a plain non-generic lambda over `i32[]`, and so does a lambda that CAPTURES `a`
-  and `b` instead of taking them. The lambda's PARAMETER TYPE mentioning `T` is the whole of
-  it.
-* **THE LOUD SIBLINGS SHOW THE SAME ROOT.** A lambda with a `T[]` parameter and no operator
-  at all — `const g = (x: T[]) => x.length` — is a loud
-  `emitProgram: field access receiver is not a struct`; `(x: T[]) => x` is the same. So the
-  shape is broken for every body, and `==` is merely the body that gets past the emitter's
-  floor.
+* **IT IS NOT THE COMPARISON.** The same generic without the lambda RUNS and prints `true`,
+  and so does a lambda that CAPTURES `a` and `b` instead of taking them. The lambda's
+  PARAMETER TYPE mentioning `T` is the whole of it. Both controls re-measured on the base.
 * **THE DISASSEMBLY NAMES THE MECHANISM.** The lifted lambda's call site is
-  `call_indirect (type $8)` where `$8` is `(func (param structref i32 i32) (result i32))`,
-  and the two `(ref $4)` list values are pushed into the `i32` slots: the closure's INTERNED
+  `call_indirect (type $7)` where `$7` is `(func (param structref i32 i32) (result i32))`,
+  and the two `(ref $3)` list values are pushed into the `i32` slots: the closure's INTERNED
   SIGNATURE was built at the UNSUBSTITUTED type, so `T[]` was lowered as the i32 default.
-  (`wasm-dis`, binaryen 130.)
-* `T | null` is the same: `(x: T | null, y: T | null) => x == y` at `T = i32` is check-clean
-  invalid wasm too.
-* **THIS IS NOT D58.** D58 is a GENERIC FUNCTION passed as a closure ARGUMENT, closed as a
-  loud emit reject. This is a lambda DECLARED INSIDE a generic body, whose signature is
-  interned before the instance's types are known.
-* **PRICE.** The fix is in monomorphization, not in a refusal predicate: the lifted lambda of
-  a generic body has to be instantiated per pin with the substituted parameter types, so its
-  `$fnsig` key and its functype are the instance's. That is the same seam #1994 worked on
-  (`$fnsig` pool dedup on rendered bytes) approached from the producer side, and it needs its
-  own grid over lambda parameter shape × `T` binding × body before anyone touches it.
-  **The cheap intermediate is a REFUSAL**: a lambda parameter whose type mentions the
-  enclosing generic's `T` is a loud emit reject, which turns 2 measured silent shapes loud
-  and matches what the other bodies already do.
+  (`wasm-dis`, binaryen 130. The rec group carries a correct `(structref, (ref $3),
+  (ref $3)) -> i32` twice over; the lambda is simply not declared at it.)
+* **TWO FILED CLAIMS ARE FALSE, and one of them is the family's size.** The row said the
+  `T = Circle` cell is silent — on `1252cf04` it is a LOUD CHECK REJECT, because #1998's
+  D421 pin refuses `==` over `Circle[]` before the shape is reached. And the row said
+  `(x: T[]) => x` is "the same" loud `emitProgram: field access receiver is not a struct` as
+  the `.length` sibling — it is **SILENT**; the message it was given belongs to a body that
+  has a field access, and an identity lambda has none.
+
+#### The close
+
+**THE FLOOR ALREADY EXISTED AND ASKED THE WRONG QUESTION.** A BARE `T` parameter is refused
+by `checkParams`' ladder at every argument rep — it matches no rung and falls to
+`only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are supported`
+(measured at i32, f64, string, boolean and a struct). `a: T[]` is a `TyArray` OVER one, so
+`nodeTyIsArrayish` claimed it and the parameter was lowered at the i32 default. **Third time
+that one word has been the mechanism** — D421's `noteBinCstr` (`tyIsHole` → `tyHasHole`),
+D422's `nodeTyIsTyVar` → `nodeTyHasTyVar`, and now the emitter's parameter floor.
+
+**WHO REACHES IT.** A monomorphized INSTANCE has had its parameter annotations rewritten to
+the pinned names (`monoInstantiate` → `synthTypeRef`), so nothing of its own mentions `T`.
+What does is a lambda declared inside a generic body: `monoCloneBody` rebuilds the statement
+spine only and states the gap in its own header — *"a lambda that annotates a type param
+(`(x: T) => …`) is left un-substituted — that case is out of scope"* — and `collectFns` has
+already lifted it, so ONE lifted function serves every instance.
+
+**THE PREDICATE IS `nodeTyHasRepTyVar`, NOT `nodeTyHasTyVar`, and the difference is twelve
+running cells.** The wide predicate refuses a `(T) => T` lambda parameter, which is a closure
+FAT POINTER at every instantiation and therefore correct however `T` is bound; the narrow one
+descends `TyArray` / `TyNullable` / `TyMap` / `TyObj` / `TyUnion` and stops at `TyFunc`. The
+exemption hides no silent class: a lambda that CALLS such a parameter is already refused
+loudly where the i32 default is wrong (`function-value call arity has no interned signature`
+at `T = string` and `T = f64`) and runs at `T = i32`.
+
+**AND THIS IS THE SHARPEST EVIDENCE IN THE INVENTORY FOR BUILDING A GRID PER LANDING.** The
+first candidate here used the WIDE predicate. It lost **14 running cells** — the twelve
+`(T) => T` ones and the two `T | null` coincidences below — and **every standing instrument
+said it was clean**: the corpus `cmp` is byte-identical on all 1,947 buildable modules under
+BOTH predicates, `regress.py` reports the same movement for both, and the seed builds and
+self-compiles either way. The only thing that could tell them apart was a 360-cell grid built
+for this family, and it did not exist until this landing built it. A refusal shipped on a
+green ladder alone would have been shipped wide.
+
+**THE REAL FIX IS PER-PIN LIFTING, AND IT IS PRICED RATHER THAN BUILT.**
+`scripts/silent-sweep/d426/lamgrid.py` is the grid the row asked for — 360 cells over lambda
+parameter SHAPE × `T` binding × body, each generic cell beside the CONTROL that spells the
+lambda's annotation at the binding's concrete type. **33 cells were check-clean invalid wasm
+and every one of the 33 has a control that RUNS.** That is a lost LOWERING, so a floor is not
+a close for it: the lambda has to be instantiated per pin with the substituted parameter
+types, so its `$fnsig` key and its functype are the instance's — the producer side of the
+seam #1994 worked on. The 33 are kept whole at `distilled/named/d426lift_*.vl` and are the
+tripwire that says when someone has bought them back.
+
+#### PRICE PAID — four `runs` cells, and the veto that was overridden to pay it
+
+**THIS LANDING LOSES FOUR RUNNING CELLS, which is the condition `CLAUDE.md` makes the standing
+gate exit non-zero on.** `regress.py` does not fire because the four are not in the derived
+corpus, so the override is stated HERE, where the next person reads the row — never inferred
+from a clean gate. The four are
+`d426nul_{bool,lit}_{eq,id}` in `distilled/named/`, materialised from `lamgrid.py`'s
+`gen/nul/{bool,lit}/{eq,id}`.
+
+**WHAT THEY ARE.** A `T | null` lambda parameter inside a generic body runs on master at
+exactly two bindings — `boolean | null` and a string literal union's `K | null` — and at no
+other. The binding axis was WIDENED to hunt for more (`i64`, `f32`, `i32 | null` and a string
+litunion added to the six the grid started with) and these are the only two. All four inputs
+of the niche compare agree with the direct spelling (equal, unequal, null-vs-value,
+null-vs-null), so the ANSWERS are right.
+
+**WHY THE OVERRIDE IS ARGUED RATHER THAN ASSUMED**, in the four terms it has to be argued in:
+
+1. **They run by COINCIDENCE, not by rule.** The lifted lambda's emitted signature is built
+   for the UNSUBSTITUTED `T | null`, which lowers to the plain i32 default — and
+   `boolean | null` (the sentinel-2 niche) and `K | null` (the atom with `-1` for null) are
+   the two instantiations that happen to be bit-compatible with it. The signature is *for the
+   wrong type* in all four cells; nothing in the source says so, and the same source at
+   `T = i64` or `T = Circle` is check-clean invalid wasm. That is a latent defect that
+   currently passes, not a working program.
+2. **The loss is LOUD.** They go to a positioned `emitProgram:` reject naming the mechanism
+   and the two workarounds, not to a silent class. This is a capability regression, not a
+   soundness one — the direction `CLAUDE.md` reserves its veto for is the other one.
+3. **It buys 33 SILENT cells.** Four accidental passes against 33 check-clean invalid-wasm
+   programs is the right trade in a self-hosted compiler, where the wrong answers are the
+   invisible ones.
+4. **It is REVERSIBLE and the reversal is instrumented.** Per-pin lambda lifting restores all
+   four, and `distilled/named/d426lift_*.vl` is the tripwire that says when someone has
+   landed it.
+
+**THE ALTERNATIVE WAS COSTED AND REFUSED.** Keeping the four means the floor's rule reads
+*"reject a type parameter under a constructor, unless the constructor is `| null` and the
+binding is one of two"* — not a rule anyone can hold in their head, state in a message, or
+check at the next site. The narrower floor that keeps them is `nodeTyHasRepTyVar` minus
+`TyNullable`, and it leaves **12 of the 33 silent cells** exactly as they were.
+
+**READ THIS AS AN OVERRIDE, NOT A LICENCE.** `runs → not-runs` remains the veto; what makes it
+overridable here is the conjunction — coincidental pass, loud loss, named price, instrumented
+reversal — and all four have to hold. `DECISIONS.md` carries the general form.
+
+**MEASURED, four instruments:**
+
+* **Corpus BYTE-IDENTITY**: **2,382 modules · 1,947 identical · 0 DIFFER · 0 LOST** against
+  `1252cf04`, for this rung alone and for the whole branch. `LOST` is the column that matters
+  for a new refusal and it is zero.
+* **The grid, cell-matched**: 360 cells, **37 moved — 33 `check-clean invalid wasm` → `loud
+  emit reject`, 4 `runs` → `loud emit reject`; 0 → silent, and the grid's silent column is
+  EMPTY.** The first candidate here used the WIDE predicate and lost **14** `runs`; the grid
+  is what found that, and the distilled corpus could not have — it is byte-identical either
+  way.
+* **Counters, reach AND ans.** A count-only probe build: the floor rung is **reached 10,016
+  times over the corpus's 1,948 buildable modules and answers TRUE 0 times (outside this
+  branch's own fixtures)**. On the witness
+  it is reach 4 / **ans 2** (the lambda's two `T[]` parameters); on the control with the
+  lambda annotated `i32[]`, reach 4 / ans 0; on the EXEMPT `(T) => T` shape, reach 3 / ans 0.
+* **Real disassembly**, above.
+
+**ABLATED.** Stripping every rung of this branch reproduces master byte-for-byte
+(`md5 74263575…`, 1,473,330 bytes). This landing alone is `eb19fc21…` / 1,474,727 bytes and
+moves **0** cells of D401's `printgrid.py`; D401's rung alone moves **0** cells of this grid.
+The predicate and the floor rung ablate together — the floor calls the predicate, and the
+predicate without the floor is a dead export that changes the seed size.
+
+Fixtures: `tests/cases/generics/error-lambda-param-type-param.vl` (the floor) and
+`tests/cases/generics/lambda-in-generic-body-runs.vl` (the four shapes it must not refuse,
+read back by value — including the `(T) => T` parameter the wide predicate ate).
 
 ---
 

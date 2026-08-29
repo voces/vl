@@ -1446,6 +1446,111 @@ top of the constraint widening the same line is a pure win. **Two rungs, one lan
 evidence is that the branch's moved set is a strict SUBSET of the union of the single-rung moved
 sets — 25 against 34** — which is the arithmetic signature of a rung that is unsafe alone.
 
+### PRINTABILITY is the fourth deferred capability, and the row's own prescription named the wrong LAYER (D401)
+
+**`print` is a capability like `==` and `+`, and it was lost at the pin the same way.**
+`tyPrintsAsRef` / `tyPrintsAsUnionBox` are asked of the printed value's type IN THE BODY,
+where inside a generic it is a hole — `T` itself, or the `?elem.T` an `x[0]` read derives —
+and a hole is neither a ref nor a box, so both floors answer FALSE and every generic `print`
+is admitted. The emitter's print ladder is a run of POSITIVE tests ending in an unguarded
+`call __print_i32__`, so the instance hands a `(ref $t)` to an `(i32) -> ()` import. Fixed as
+the fourth table beside `binCstr*`, `argCstr*` and `escJoin*`, and it needed `tyHasHole`
+rather than `tyIsHole` for the same reason D421 did.
+
+**THE ROW SAID `monoInstantiate` AND THE SITE IS REACHABLE — the objection is not that it does
+not work, it is which LAYER may state the rule.** D35's own ruling above already settled it
+(*`vl check` is what an editor runs*), and D401 sharpens it into a criterion anyone can apply:
+**when the whole content of a row is that two spellings ONE ANNOTATION apart disagree, the fix
+has to land where they can be made ONE SENTENCE apart.** `monoInstantiate` can only say
+`emitProgram:`; the concrete twin says `print of i32[] is type-valid but not yet supported by
+codegen`, positioned. A pin constraint says the second with an attribution in front. A fix
+that is loud in a different vocabulary from its own control is a fix that leaves the reader to
+discover the relationship the row exists to state.
+
+**THE GRID THAT FILED IT COULD ONLY SEE A THIRD OF IT, for the reason D421's could not see its
+own shape.** D14's `lengrid.py` varies the OPERATION (`.length` vs `x[0]`) and holds the print
+at the element read; it found 3 cells. Holding the operation at `print` and varying the
+POSITION instead — the parameter itself, an element read, a field read, `.length` — finds 19,
+of which 15 are the bare `print(x)` the row never mentions. **A grid's fixed coordinate is
+where its blind spot is**, and the cheap check is to name the coordinate out loud before
+believing a family's size.
+
+**`tyPrintsAsRef`'s HEADER ASSERTED THE MISSING GATE.** It read *"nor a `TyVar` (a generic
+body's `T` — monomorphization decides its rep at the call site, and the concrete argument is
+gated there)"*. Nothing gated it there. A comment that names another site as the one holding
+an invariant is a claim with a witness attached, and running it costs seconds.
+
+## The `runs → not-runs` veto is overridable, and the override must be ARGUED IN THE ROW
+
+**`CLAUDE.md` makes `runs → not-runs` the one condition the standing gate stops the world for,
+and that is right: a program that worked and now does not is the failure a merge gate exists to
+catch.** It is not, however, a proof that the program was *correct*. D426 is the worked
+instance — four cells that ran only because `boolean | null` and a string litunion's `K | null`
+happen to be bit-compatible with the i32 default an UNSUBSTITUTED `T | null` lowers to. The
+emitted signature was for the wrong type in all four; the same source one binding over is
+check-clean invalid wasm. Refusing them cost four accidental passes and bought 33 silent
+miscompiles.
+
+**THE OVERRIDE IS A CONJUNCTION, and all four terms have to hold:**
+
+1. the lost cells run by **COINCIDENCE rather than by rule** — some accident of representation
+   makes a wrong lowering happen to work, and the shape has instantiations where it does not;
+2. the loss is **LOUD** — a positioned diagnostic, never a silent class. The direction the veto
+   is really guarding is `runs → silently wrong`, and this is not that;
+3. the price is **NAMED** — the exact cells in `distilled/named/`, so the trade is a number the
+   next person can re-grade rather than a sentence they have to take on trust;
+4. the reversal is **INSTRUMENTED** — the thing that would buy them back is identified, and a
+   named set says when someone has landed it.
+
+**AND IT MUST BE WRITTEN IN THE ROW, NOT INFERRED FROM A GREEN GATE.** In D426's case
+`regress.py` does not fire at all, because the four cells were not in the derived corpus until
+this landing put them there — so a reader grading the change by its gate output sees `0 runs
+lost` and learns nothing. That is the failure mode this rule exists to prevent, in both
+directions: **do not read "0 runs lost" as the only shippable outcome, and do not read this
+override as licence.** A row that loses a running cell without arguing these four terms is a
+row that has not finished measuring.
+
+**THE ALTERNATIVE IS ALWAYS COSTED FIRST.** The narrower floor that keeps D426's four cells
+exists and is one constructor smaller — and it leaves 12 of the 33 silent cells exactly as they
+were, in exchange for a rule that reads *"reject a type parameter under a constructor, unless
+the constructor is `| null` and the binding is one of two"*. A rule nobody can state at the next
+site is not cheaper than the price it avoids.
+
+## A parameter FLOOR is a question about the VALTYPE, so `T` under a `=>` is not the same as `T` under `[]` (D426)
+
+**The emitter's parameter floor rejects a bare `T` at every argument rep and accepts `T[]`,
+because every rung of its ladder asks about a CONSTRUCTOR — is this an array, a struct, a map,
+a scalar — and each of them answers YES about a constructor over an unsubstituted type
+parameter.** That is the same IS/CONTAINS confusion as D421's `noteBinCstr` and D422's
+`nodeTyIsTyVar`, now at a third site; the reason it keeps recurring is that the narrow
+predicate reads correctly at every one of them.
+
+**BUT "CONTAINS" IS TOO WIDE HERE, AND THE GRID IS WHAT SAID SO.** The floor's question is
+*does this annotation decide a wasm VALTYPE that the instance might not agree with*. A `T`
+under a `TyFunc` does not: a closure parameter is the fat pointer at every instantiation. The
+wide predicate turned **14 running cells into rejects** and every one of them was a `(T) => T`
+parameter or its `T | null`-at-`boolean` cousin. **The distilled corpus and the corpus byte
+comparison were both blind to it** — the change is byte-identical to master on all 1,942
+buildable modules either way — so the only instrument that could see it was a grid built for
+the family, which is the standing argument for building one before shipping a refusal.
+
+**A REFUSAL WHOSE CELLS HAVE CONTROLS THAT RUN IS A FLOOR, NOT A CLOSE, and the difference has
+to be written down or the next person reads the row as finished.** All 33 of D426's silent
+cells have a control — the identical program with the lambda's annotation spelled at the
+concrete type — that runs and prints the right answer. So what was lost is a LOWERING, and the
+loud reject buys only that the loss is visible. The 33 are kept whole in `named/` precisely so
+that the day per-pin lambda lifting lands they read `runs` and say so.
+
+**A COINCIDENCE IS NOT A RULE, and pricing it is cheaper than protecting it.** `T | null` as a
+lambda parameter runs at exactly two bindings, `boolean | null` and a string litunion's
+`K | null`, because both rep as the plain i32 the unsubstituted default picks. All four inputs
+of the niche compare agree with the direct spelling, so the programs are not wrong — they are
+right for a reason nothing in the source states, and one binding away the identical source is
+invalid wasm. Refusing them with the rest of the shape and NAMING the four cells is the
+position; keeping them would mean the floor's rule is "reject `T` under a constructor unless
+the constructor happens to be `| null` and the binding happens to be one of two", which is not
+a rule anyone can hold in their head or check.
+
 ## Operator dispatch is decided at the REWRITE, so it may only ask questions the CHECKER has answered (D424)
 
 **`drwWalk`'s `a op b` dispatch gated on `structIndexOfExpr(n.binLeft, ctx) >= 0`, which is a

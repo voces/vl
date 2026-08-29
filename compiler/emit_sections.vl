@@ -21,6 +21,7 @@ import {
   nameIsMemLoadIntrinsic,
   nameIsMemStoreIntrinsic,
   nodeScalarBaseIs,
+  nodeTyHasRepTyVar,
   nodeTyIsArrayish,
   nodeTyIsLitUnionAlias,
   nodeTyIsNulLitUnion,
@@ -585,7 +586,40 @@ function checkParams(fnIx: i32) {
           // array (`i32[]`), or `string` (the SAME `array i32` of code points) are
           // allowed; anything else fails.
           // (`collectA` already validated every array annotation is i32[].)
-          if tyIsFuncType(p.parType) {
+          // THE FLOOR SAID "IS" WHERE IT MEANT "CONTAINS", and that one word is the whole
+          // of D426. Every rung below asks about a CONSTRUCTOR — is this an array, a
+          // struct, a map, a scalar — and each of them answers YES about a constructor
+          // over an unsubstituted type parameter. A BARE `T` param is rejected (it matches
+          // no rung and falls to the message below, measured at every argument rep), while
+          // `a: T[]` is a `TyArray` OVER one, so `nodeTyIsArrayish` claimed it and the
+          // param was lowered at the i32 default: `call_indirect (type $N)` with
+          // `(structref i32 i32)` where the values are `(ref $list)`. `vl check` rc 0 and
+          // the engine refuses the module. Same word one layer down that D421's
+          // `noteBinCstr` and D422's `nodeTyIsTyVar` each needed.
+          //
+          // WHO REACHES THIS. A monomorphized INSTANCE has had its parameter annotations
+          // rewritten to the pinned names (`monoInstantiate` → `synthTypeRef`), so its
+          // types mention no `T`. What does not is a LAMBDA declared inside a generic body:
+          // `monoCloneBody` rebuilds the statement spine only and states the gap in its own
+          // header — *"a lambda that annotates a type param is left un-substituted"* —
+          // and `collectFns` has already lifted it, so there is one lifted function for
+          // every instance. Per-pin lifting is the real fix and it is a monomorphizer
+          // feature; this is the FLOOR, which is what the emitter owes a shape it cannot
+          // lower. (`silent-class-inventory` D426.)
+          //
+          // `nodeTyHasRepTyVar`, NOT `nodeTyHasTyVar`, and the difference is 12 running
+          // cells. A `T` under a `=>` does not decide the parameter's valtype — a closure
+          // param is the fat pointer at every instantiation — so the wide predicate refused
+          // `(x: (T) => T) => x` and every sibling of it, all of which run correctly today.
+          // The narrow predicate's own header carries the measurement, including why the
+          // exemption hides no silent class.
+          if nodeTyHasRepTyVar(p.parType) {
+            return emitFail(
+              "emitProgram: parameter `" +
+                ty.tyName +
+                "` still names an unsubstituted type parameter — a lambda declared inside a generic body keeps the enclosing `T`, so its signature is interned at the unsubstituted type; give the lambda a concrete parameter type or take the value from the enclosing scope",
+            )
+          } else if tyIsFuncType(p.parType) {
             // a function-typed (closure fat-pointer) param — kind 14
           } else if nulCloFlag(p.parType) == 1 {
             // a NULLABLE function-value param (`((i32) => i32) | null`, kind 19) — its `=>` is
