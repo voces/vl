@@ -2298,7 +2298,9 @@ integer-only rule only AFTER its operator-dispatch arm, so an object receiver wi
 overload is decided there and never asks this question — and it lowers: a
 `function "^"(self: V, other: V)` at a pinned hole prints its own answer today. A mirror that
 copies the predicate and not the position is a FALSE REJECT for those programs, and the ablation
-priced it at 6 grid cells. This is the second time this exact shape has been recorded in this
+priced it at 2 grid cells — and that number is the NAIVE variant built and graded, not an
+estimate off the table, which matters because the first estimate was 6. This is the second time
+this exact shape has been recorded in this
 one function: the `+` arm carries a comment explaining that it must read the UNSOFTENED types
 because `checkBinary` softens AFTER its string and array arms (D44). **Two arms, same lesson —
 mirroring a decision procedure means mirroring where in it the question is asked.**

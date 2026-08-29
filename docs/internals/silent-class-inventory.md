@@ -14807,7 +14807,10 @@ Repro (now a loud check reject):
   arm, so an object receiver with a `^` overload is decided there and never asks this
   question — and it really does lower. A blanket `is TyObj` reject in the new arm turns
   `function "^"(self: V, other: V)` at a pinned hole from a program that prints 99 into a
-  check reject, and the ablation measured that as **6 grid cells lost**. `objOpDispatchTy` is
+  check reject, and the ablation measured that as **2 grid cells lost** — the NAIVE variant
+  (this arm with no object handling at all) was built and graded rather than estimated, and it
+  loses `d492_xor_objop_bind_typar` and `_bind_fnval` and gains neither of the two cells a
+  dispatching `%` overload buys: 38 `runs` lost against the landing's 36. `objOpDispatchTy` is
   the deferral: `checkBinary`'s two dispatch routes (a free `self`-function, an operator
   FIELD) asked from TYPES ALONE, because `binOpDefinedFor` is a pure predicate and
   `opSelfFnTy` takes a node index and reports diagnostics. It is deliberately the WEAKER
