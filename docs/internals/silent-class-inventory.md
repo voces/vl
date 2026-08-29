@@ -15737,8 +15737,9 @@ Repro:
   destination compares. The direct spelling is a loud `cannot assign i32[] to 'xs' of type
   string[]` — the literal's own element type, because there is no annotation to adopt.
 
-* **THE OBJECT LITERAL IS NOT AFFECTED AND THAT SEPARATES THE TWO.** `const b: Bx = { v:
-  self }` IS a loud reject on D572's landing (`cannot assign {v: i32} to 'b' of type Bx`):
+* **THE OBJECT LITERAL IS NOT SUBJECT TO THIS ROW, AND THAT SEPARATES THE TWO.** It was
+  silent on the base like everything else in D572's family, and D572 CLOSED it: `const b: Bx = { v:
+  self }` is a loud reject there (`cannot assign {v: i32} to 'b' of type Bx`), because
   `assignableExpr`'s field-wise object-literal recursion compares the field and refuses, so
   the mismatch survives as a type and D572's table records it. Routing the array literal
   through an UN-annotated binding first also closes it — `const tmp = [self]  const xs:
