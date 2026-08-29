@@ -1859,6 +1859,87 @@ bare `runs`, and why every cell's body disagrees with the built-in on its own op
 discipline D425's row already recorded costing its grid eight cells, applied one axis further
 in. A grid that cannot fail is not a measurement, and neither of these announced itself.
 
+### Stating that rule did not stop the next grid from breaking it; RUNNING it did
+
+**The rule above was written down, and the very next grid over the same family broke it
+again.** D471/D425's generator (`scripts/silent-sweep/d471/opdeclgrid.py`) ordered its string
+and literal-union operands ASCENDING while its numeric ones descended, so `"ab" < "cd"` is
+natively `true` — and the `<` declarations returned `true`. Thirty-two cells could not have
+distinguished dispatch from inertness. Nobody noticed while writing the table; the run did.
+
+**The fix is to give every cell a DO-NOTHING CONTROL and compare against it, rather than
+against a remembered native answer.** A control is the cell's program with the DECLARATION
+DELETED and nothing else changed, so it IS, by construction, the answer the cell would give
+if the thing under test did nothing. `--verify` then grades every control and FAILS on any
+cell whose control answer equals its declaration answer. That turns the rule from a thing an
+author must hold in mind while writing a table into a thing the instrument refuses to run
+without — and it is what caught the 32.
+
+**It also improves the grade itself.** With both answers in hand a cell reads `dispatch`
+(printed the DECLARATION's answer), `inert` (printed its own CONTROL's answer), or `loud`,
+instead of a `runs:<stdout>` a reader has to interpret. The `inert` verdict in particular is
+no longer an inference: it is an observed equality with the program that has no declaration.
+
+**The one shape the rule does not apply to, and why saying so matters.** Four of the pins in
+that grid have NO operator site at all — they declare and never use — so cell and control
+print the same thing by construction and differ only in whether the program compiles. Their
+measurement is `accepted` vs `loud`, not a value comparison, so there is no answer for the
+control to accidentally supply and `--verify` skips them. A blanket application of the rule
+would have flagged the very cells that carry the most load: `d471_pin_inter` is the only cell
+in 770 that can see the declaration gate by itself, and it is what pins the intersection
+look-through against a future narrowing.
+
+
+## A blocker that survives re-measurement can still be the wrong blocker
+
+**D425 was left open twice on a sentence that was TRUE, and closing it required noticing the
+sentence was about the wrong thing.** The filed blocker was *"`self` must be an object type"
+is FALSE for `self: AB`* where `type AB = {a:i32} & {b:i32}` — because `AB` IS an object and
+the site refuses to dispatch over it anyway. That was re-measured on both sides of #2004,
+found live, and re-measured again on master `2f1f0621`, found live a third time. Every
+re-measurement agreed, and every one of them was answering "does the SITE dispatch over an
+intersection?" when the question the gate needed was "can the DECLARATION tell that `AB` is
+an object?".
+
+Those are different questions and they have different answers. `intersectTy` merges `{a}` and
+`{b}` into a real `TyObj`. `declaredTyOfName` then wraps it: `singleAliasMemberTyIx`'s `TyObj`
+arm is gated on `isPlainAliasRef`, false for an intersection's right-hand side, so the alias
+stays an opaque one-member `TyUnion` — **deliberately, so the emitter can intern `AB` as a
+named struct**, and the comment there says as much. The object is one field access away from
+any code willing to look.
+
+**The asymmetry is what makes the look-through safe at the declaration and unsafe at the
+site.** At the declaration the predicate decides whether to REFUSE, so seeing through the box
+can only accept more; a box it fails to see through costs a missing reject, never a false one.
+At the site the same collapse would diverge from the emitter's `singleMemberAliasTyIx` twin,
+which is the divergence `declaredTyOfName` is written to prevent — that is D402's row and it
+is untouched. **Transferable: when a blocker keeps re-measuring live, check whether the probe
+and the gate are asking the same question before inheriting the conclusion.** Three
+re-measurements of a true sentence bought nothing; one look at what produced it closed the row.
+
+**Runner-up predicate, recorded so nobody re-derives it.** The row's own measurement said the
+silent class is "exactly a `self` type that has a native lowering for the operator", and
+`binOpDefinedFor` is that predicate, already written and already documented as the single home
+for "`checkBinary`'s accepted forms". It is the wrong POLARITY. Its stated default for an
+operator it does not model is `true` ("no false reject"), which is safe when a `true` PERMITS
+and unsafe when a `true` REFUSES: gating the reject on it refuses `function "^"(self: V,
+other: V)` over a struct — which dispatches today — and says something false about `^` over
+`string` besides. A shared predicate is only reusable in the direction its default was chosen
+for.
+
+**And asking what that default ANSWERS, rather than only whether it could be reused, found two
+live defects** — filed as D492 and D493, both D35's sentence at operators D35's own fix does not
+reach. `binOpDefinedFor` is what `validateBinCstrs` adjudicates a deferred hole constraint
+through, so every `true` it returns is an ACCEPTANCE at a generic call site: `^` is unmodelled,
+so `function g<T>(a: T, b: T) { a ^ b }` pinned at `string` is `vl check` rc 0 over a module the
+engine refuses, while the identical body annotated `string` is a loud checker reject; and the
+`%` arm, which does exist, asks only `isNumeric`, so `f64` remainder reaches
+`emitProgram: operator '%' has no f64 form` where the direct spelling is a positioned
+`operator '%' is integer-only`. **The transferable step is the cheap one: when a predicate is
+rejected for reuse because of its default, spend the five minutes finding out what that default
+is currently answering.** The reuse question was a dead end; the same reading of the same six
+lines was not.
+
 
 ## An ACCEPTANCE must ride the pin too, and it does not ride the same channel a refusal does
 
