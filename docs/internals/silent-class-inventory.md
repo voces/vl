@@ -3551,7 +3551,8 @@ operand SHAPE (`T`, `T[]`, `T[][]`, `{v: T}`, `T | null`, `{[string]: T}`) × 13
 `==`/`+`/`<` × direct-vs-generic says:
 
 * the `T` row — this row's own shape — agrees between the direct and generic spellings in
-  **every one of its 156 cells**, at all three operators. Nothing here is reopened.
+  **all 39 of its direct/gen PAIRS — 78 cells — at all three operators, 0 disagreeing**.
+  Nothing here is reopened.
 * the `T[]` row loses the refusal in 12, and the `T | null` row in 3. Filed as **D421** and
   **D422** and closed in the same change as this note; `T[][]` is a FALSE reject, **D423**.
 
@@ -13148,7 +13149,8 @@ Repro:
 * **D35 AND D44 ARE CORRECTLY CLOSED AND THIS IS NOT A REOPENING OF EITHER.** Both filed
   witnesses reproduce verbatim as loud check rejects, and at the shape they measured —
   the operand's type IS `T` — the direct and generic spellings agree in **every one of the
-  156 cells** of this grid's `T` row. What neither grid varied is the SHAPE of the operand
+  39 direct/gen PAIRS (78 cells)** of this grid's `T` row, at all three operators, 0
+  disagreeing. What neither grid varied is the SHAPE of the operand
   type. D35's axes were the needle's delivery, the receiver's delivery, the callee's
   delivery and alias-vs-spelled-out; D44 added the siblings. In all of them the operand was
   `T` itself.
