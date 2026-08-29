@@ -15295,13 +15295,15 @@ Repro (now `runs`, prints `6`):
 
 ---
 
-### D551 — a generic's DECLARED return type is never re-checked against the body's type at the pin
-**check-clean invalid wasm · found 2026-08-29 by the non-dispatching-pin block of
-`scripts/silent-sweep/d532/opretgrid.py` · 6 cells there (`d532x_{add,sub,mul,div,rem,xor}_retobj_i32pin_typar`),
-kept whole in `distilled/named/` · the direct spelling of every one is a positioned
-`return type mismatch`**
+### D551 — [CLOSED 2026-08-29] a generic's DECLARED return type was never re-checked against the body's type at the pin
+**closed 2026-08-29 · the filed repro is now a loud check reject, positioned at the CALL ·
+was `check-clean invalid wasm` · found 2026-08-29 by the
+non-dispatching-pin block of `scripts/silent-sweep/d532/opretgrid.py` · its 6 cells
+(`d532x_{add,sub,mul,div,rem,xor}_retobj_i32pin_typar`) all `invalid` -> `check`, and 604
+cells of the purpose-built `scripts/silent-sweep/d551/retgrid.py` are kept whole in
+`distilled/named/`**
 
-Repro:
+Repro (now a loud check reject):
 
     type V = { x: i32 }
     function g<T>(a: T): V {
@@ -15310,30 +15312,167 @@ Repro:
     const p: i32 = 6
     const z = g(p)
     print(1)
-    // vl check rc 0, no error. vl run:
+    // was: vl check rc 0; vl run:
     //   Invalid input WebAssembly code at offset 164: type mismatch:
     //   expected (ref $type), found i32
+    // now: [ERROR]: return type mismatch: expected V, got i32
+    //      (the return of `g` at the call's argument types)  — at the CALL, rc 1
 
-* **THE CONTROL DIFFERS IN EXACTLY ONE THING — the type parameter.** `function g(a: i32): V`
-  with the same body and the same call is `return type mismatch: expected V, got i32`, a
-  positioned checker error. Nothing else changes.
+* **THE TWO-LAYER DIAGNOSIS HELD, EXACTLY AS FILED.** A probe `tErr` in `checkRetStmtNode`'s
+  passing branch reports `got=T hasHoleGot=1 want=V hasHoleWant=0` on the witness: the body's
+  type IS the type parameter's `TyVar`, `assignable` waves it past the declared `V`, and the
+  eager check passes. `substTyDeep` then substituted the DECLARED return at the call
+  (`typecheck.vl`'s generic pin) and handed it out as the call's type with nothing comparing
+  it against the substituted body type. Both layers reasonable, neither owning the question.
 
-* **IT IS NOT ABOUT OPERATORS**, and the grid that found it says so: the block that surfaced
-  it declares an operator overload, and the witness above declares none and still reproduces.
-  The overload is a red herring — what the six cells share is a generic whose DECLARED return
-  contradicts what its body produces at the pin.
+* **AND THE `wasm-tools print` OF THE MODULE THE BASE BUILT IS THE DEFECT IN ONE FUNCTION:**
 
-* **THE MECHANISM.** In the generic frame the body's type is a `TyVar`, which is permissively
-  `assignable` to the declared return, so the body-level check passes; at the call site
-  `substTyDeep` substitutes the DECLARED return and hands it out as the call's type, and
-  nothing compares it against the substituted BODY type. Both layers are individually
-  reasonable and neither asks the question.
+      (func (;4;) (type 1) (param i32) (result (ref 0))
+        local.get 0
+        return)
 
-* **IT IS THE ROW D532's THIRD RUNG WORKS AROUND.** That rung keeps a deferred binary-op
-  result out of an annotated body precisely because the annotation would go unchecked, and it
-  says so in front. Closing this row is what would let the bound go — and would close the four
-  `d532x_*_retobj_i32pin_typar` cells at the same time, which are this same defect reached
-  through an ordering operator rather than through a bare parameter.
+  The instance's SIGNATURE comes from the declaration (`(result (ref 0))` — the struct) and
+  its BODY from the pin (`local.get 0` — an i32). Nothing reconciled them. The legitimate
+  twin `g({x: 6})` emits `(param (ref $1)) (result (ref $1))` and is byte-identical under
+  both seeds.
+
+* **THE FIX IS A FIFTH DEFERRED-CONSTRAINT TABLE, and the shape was already in the file four
+  times.** `binCstr` defers the operator, `argCstr` the argument flow, `printCstr` the
+  printability, `escJoin` the union re-fold — each recorded in the body where a hole makes the
+  question undecidable and re-asked at the pin under `substTyDeep`. `retCstr` is the declared
+  return, recorded by `noteRetCstr` from `checkRetStmtNode`'s PASSING branch and adjudicated
+  by `validateRetCstrs`, scoped by `cstrOwnedBy` like the rest.
+
+* **THE PIN ASKS `assignableExpr`, NOT `assignable`, AND THAT IS THE WHOLE SOUNDNESS
+  ARGUMENT.** The pin agrees with the direct spelling because it calls the SAME function the
+  body called, on the same expression. A first cut asked the plain predicate and refused
+  `function g<T>(self: T): i32 { return self }` at `g(true)` — while the direct spelling
+  `function g(self: boolean): i32` runs and prints `1`, because the A7 boolean-to-i32
+  coercion lives at the EXPRESSION seam and is deliberately absent from `assignable`. A false
+  reject invented by the fix, in the exact shape this row is about, and only the DIRECT TWIN
+  found it.
+
+* **IT IS NOT ABOUT OPERATORS, and the grid that found it said so** — the witness declares no
+  overload. But the LANDING is inseparable from D532's third rung: see that row. With D532's
+  annotated-body bound still in place, the constraint is handed the no-dispatch answer and
+  two corpus modules false-reject; the bound is removed here and D532's eight filed residue
+  cells RUN as a consequence. "Not about operators" is true of the DEFECT and false of the
+  FIX, and only building the fix said so.
+
+* **THE ONE FALSE CLAIM THIS ROW CARRIED, corrected by measuring it.** It said closing the row
+  "would close the four `d532x_*_retobj_i32pin_typar` cells … reached through an ordering
+  operator". Both halves are wrong, and the row's own header had the right answer two lines
+  up. The **four ordering** cells (`lt le gt ge`) were already LOUD on master — there was
+  nothing silent to close; they are `check` -> `check` and only the MESSAGE moves, from the
+  body's own `return type mismatch: expected V, got boolean` to the pin's, positioned at the
+  call. What actually closes is the **six** arithmetic cells (`add sub mul div rem xor`), the
+  exact set the header named, `invalid` -> `check`. The ordering operators were a red herring
+  twice over: they are what the grid's block was ABOUT, not what was silent in it.
+
+* **FOUR RUNGS, ABLATED ONE AT A TIME** on `d551/retgrid.py` (612 cells; `STRIP_ALL`
+  reproduces the base seed byte-for-byte, md5 `027e4b71…`):
+
+      rung                                       grid cells   also
+      R1  validate at the DIRECT-call pin             144
+      R2  validate at the UFCS pin (the SECOND site)  108
+      R3  re-deferral through a relaying generic       72
+      R4  remove D532's annotated-body bound            0     2 corpus modules
+
+  **R4 scores ZERO on this grid and its witness is real** — `retgrid.py` has no
+  operator-overload axis, so the population that can move under R4 is not in it. Named rather
+  than assumed: `ABL_NO_R4` loses `tests/cases/generics/binop-pin-*` on the corpus, and
+  `d532/opretgrid.py` is where its eight-cell gain shows.
+
+* **THE WANT-SIDE RUNG IS REFUSED, and its price is executable.** Recording the constraint
+  when only the DECLARED return carries a hole (`ABL_ADD_R5`) closes two more silent cells —
+  and takes `tests/cases/memory/flat-generic-rows-branded.vl` with them, a module that RUNS
+  and prints ten correct values. Its direct spelling is a loud `return type mismatch:
+  expected TVAddr, got i32`, so the pin would be RIGHT by the parity rule — but `as` over a
+  type parameter is `` `as` supports numeric conversions only ``, so the author cannot write
+  the cast the direct spelling needs. Those cells are not lost by COINCIDENCE, which is the
+  first of the four terms an override needs. Filed as D561.
+  `retgrid.py --price <seed>` is rc 2 on the base seed (by md5), rc 0 on the landing, rc 1 on
+  `ADD_R5`.
+
+* **A SIXTH RUNG WAS ALSO REFUSED, and it scored zero.** A `retCstrsHold` twin in
+  `genericFnAssignable` (mirroring `argCstrsHold`) cost three corpus modules and bought
+  nothing: a function VALUE names no declaration, so `cstrOwnedBy`'s unknown-callee fallback
+  puts EVERY generic's return constraint in scope, and `mkS(): (string, string) => string
+  { return add }` then refused the unrelated `applyI(add, 3, 4)`. The same cross-generic leak
+  #1946 removed for the named-callee spelling, at the one delivery `cstrOwnedBy` cannot
+  filter.
+
+* **THE PRICE, MEASURED.** Corpus: 2,410 modules, **1,963 identical, 0 DIFFER, 0 LOST**.
+  `distilled/regress.py`: **0 runs lost, 0 -> silent**, 10 cells moved and every one is this
+  row's own (6 `invalid` -> `check`, 4 already-loud cells re-worded to the pin's message).
+  On `retgrid.py`, 216 of 612 cells move, 176 `invalid` -> `check` and 16 `emit` -> `check`,
+  DISAGREE-with-the-direct-twin falls 224 -> 8, and cells that RUN printing a value their
+  declaration contradicts falls 6 -> 0. **24 `runs` cells are lost and every one has a LOUD
+  direct twin** — `function g<T>(self: T): boolean { return self }` at `g(6)` printed `true`
+  where the one-token-different spelling has always been a reject, and four of those twelve
+  printed that wrong value out loud.
+
+* **IT IS NOT SINGLE-FILE-ONLY, and that was measured rather than inherited.** D532's whole
+  landing is bounded to one file because an operator DECLARATION does not reach across a
+  module boundary (ROADMAP **A-OPMOD**), and this row sits beside it — so the same bound was
+  the obvious assumption. It does not hold: with an unrelated `import { startsWith } from
+  "std:str"` prepended, all three rungs fire exactly as they do in a single file (the plain
+  pin, the UFCS pin, and the relay), each landing on its direct control's own answer, and on
+  the base seed all three of those same programs are `check-clean invalid wasm`
+  (`wasm[0]::function[29]::g$m0`). Nothing here rides an operator declaration, which is what
+  A-OPMOD bounds.
+
+* **WHAT THE 8 REMAINING DISAGREEMENTS ARE.** Two are D561's residue; two are the refused
+  rung's price cells, kept deliberately; four are `d551_obj_elem_obj_*` — a generic over a
+  `V[]` returning `V`, which is `emitProgram: monomorph…` on BOTH seeds while its direct twin
+  runs. That one is a monomorphizer gap this landing neither causes nor closes; it is
+  unchanged from the base seed and is not a silent class (it is a loud emit error).
+
+---
+
+### D561 — the DECLARED return may still be a hole the body cannot check, and there is no `as T` to write instead
+**check-clean invalid wasm · found 2026-08-29 as the measured, REFUSED price of D551's
+want-side rung · 2 cells (`d551w_{obj,str}_typar`) of `scripts/silent-sweep/d551/retgrid.py`,
+kept whole in `distilled/named/` with the 2 price cells the close would cost**
+
+Repro:
+
+    function g<T>(a: T, n: i32): T {
+      return n + 1
+    }
+    print(g("s", 2))
+    // vl check rc 0. vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found i32
+
+* **IT IS D551's MIRROR IMAGE, one column over.** D551 is a hole on the BODY side under a
+  concrete declaration; this is a concrete body under a hole DECLARATION. The direct spelling
+  `function g(a: string, n: i32): string { return n + 1 }` is the same positioned `return type
+  mismatch: expected string, got i32`, so the pin's answer is known and the mechanism is
+  D551's exactly: widen `noteRetCstr`'s gate from `tyHasHole(got)` to
+  `tyHasHole(got) || tyHasHole(want)`. That candidate is built and graded (`ABL_ADD_R5`); it
+  closes these two cells and nothing else on the grid.
+
+* **THE OBSTACLE IS A MISSING SPELLING, NOT A MISSING CHECK, and that is the whole row.**
+  Widening the gate refuses `tests/cases/memory/flat-generic-rows-branded.vl`, a module that
+  RUNS and prints all ten of its expected values:
+
+      type TVAddr = new i32
+      type Rows<R, A> = { base: i32, count: i32, brand: A }
+      function rowAt<R, A>(self: Rows<R, A>, i: i32): A {
+        return self.base + i * R.size
+      }
+
+  The body computes an `i32` address and hands it back as the phantom brand `A`. The pin
+  would be RIGHT — the direct spelling is `return type mismatch: expected TVAddr, got i32` —
+  but the author has no way to say what they mean: `(self.base + i * 4) as A` is
+  `` `as` supports numeric conversions only ``. **A reject is not available here because the
+  program the reject would demand cannot be written.** The day `as T` over a type parameter
+  exists, the gate widens and this row closes with it.
+
+* **REFUSED ON THE BAR'S FIRST TERM.** A corpus module that stops building is a veto outright,
+  and the override needs the lost cells to run by COINCIDENCE — these run deliberately and
+  correctly. `retgrid.py --price` makes it re-runnable: rc 1 against `ADD_R5`, rc 0 against
+  the landing, rc 2 (by md5) if handed the base seed.
 
 ---
 
@@ -15452,25 +15591,26 @@ Repro (now `runs`):
   one. Measured: 1,955 of 2,401 `tests/cases` programs build byte-identically under this
   landing (the other 446 fail to build under both seeds), 0 differ, 0 build-moved.
 
-* **AND ONLY INSIDE A BODY WITH NO RETURN ANNOTATION.** A deferred type is a type nothing in
-  the body checks, and an annotated body has exactly one such check. Stripping that bound
-  (`ABL_NO_R3`) sends four cells from a loud `return type mismatch: expected V, got boolean`
-  to check-clean invalid wasm at an `i32` pin, where the answer really is `boolean`:
+* **AND, AT THE TIME, ONLY INSIDE A BODY WITH NO RETURN ANNOTATION — THAT BOUND IS NOW GONE
+  (#2017).** A deferred type is a type nothing in the body checks, and an annotated body had
+  exactly one such check. The bound's own header named what would let it go: *"deciding that
+  per pin needs the annotation re-checked against the RESOLVED body type at the call"*. That
+  is D551, and D551's landing is that check, so the bound was removed rather than loosened.
+  **Restoring it (`ABL_NO_R4`) now costs two corpus modules**, which is the direction the
+  question turned once the pin could answer it: with the bound in place, `vxor<T>(va: T, vb:
+  T): i32 { return va ^ vb }` hands the new return constraint the NO-DISPATCH answer (the
+  left operand's `V`) as the body's type and the pin false-rejects a program that runs —
+  `tests/cases/generics/binop-pin-integer-only-keeps.vl` and `binop-pin-objop-dispatch-
+  unspelled.vl` are the two. The two rungs are mutually load-bearing.
 
-      type V = { x: i32 }
-      function "<"(self: V, other: V): V { return self }
-      function g<T>(a: T, b: T): V { return a < b }
-      print(g(6, 3).x)
-
-  Deciding that per pin needs the annotation re-checked against the RESOLVED body type at the
-  call, which is D551 — the row whose close would let this bound go.
-
-* **THE RESIDUE THIS LEAVES, NAMED.** An ANNOTATED body still gets the body's own answer, so
-  `function g<T>(a: T, b: T): V { return a < b }` at a `V` pin is a loud `return type
-  mismatch` where the direct spelling runs — a false reject, unchanged from master, and the
-  eight `d532_*_retobj_ann_*_typar` cells of `opretgrid.py` are it. The operator-FIELD route
-  at a pin is likewise unchanged (`monoPinBinOps` does not rewrite it), exactly as D511's row
-  filed it.
+* **THE RESIDUE THIS LEFT IS CLOSED (#2017).** An ANNOTATED body used to get the body's own
+  answer, so `function g<T>(a: T, b: T): V { return a < b }` at a `V` pin was a loud `return
+  type mismatch` where the direct spelling runs. All **eight** `d532_*_retobj_ann_*_typar`
+  cells of `opretgrid.py` now RUN and print the declaration's own answers (`1` dropped, `6`
+  through `z.x`), and `opretgrid.py`'s derived residue list is EMPTY. `opretgrid.py --price`
+  still passes on the landing, with ten of its fourteen cells now paid by RUNNING rather than
+  four. The operator-FIELD route at a pin is still unchanged (`monoPinBinOps` does not rewrite
+  it), exactly as D511's row filed it.
 
 ---
 

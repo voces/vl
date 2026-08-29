@@ -775,6 +775,73 @@ let printCstrTy: i32[] = []
 let printCstrIx: i32[] = []
 let printCstrFn: i32[] = []
 
+// DEFERRED RETURN-TYPE constraints — the DECLARED return re-asked at the pin, for exactly
+// the reason the three tables above defer the operator, the argument flow and the print.
+//
+// `function g<T>(a: T): V { return a }` is not decidable in the body: `got` is the type
+// parameter's `TyVar` and `assignable(T, V)` is TRUE for the same permissive reason every
+// other hole gate is vacuous, so `checkRetStmtNode`'s mismatch check passes. At the call
+// site `substTyDeep` substitutes the DECLARED return and hands it out as the call's type —
+// and NOTHING compares it against the substituted BODY type. Both layers are individually
+// reasonable and neither owns the question, which is why the defect survived both.
+//
+// The consequence is one token wide. `g(p)` with `p: i32` is `vl check` rc 0 over a module
+// the engine refuses (`type mismatch: expected (ref $type), found i32`), while the SAME
+// declaration written `function g(a: i32): V` is a positioned `return type mismatch:
+// expected V, got i32`. `scripts/silent-sweep/d551/retgrid.py` measures the family across
+// the return-type / body / argument axes and grades every cell against that direct twin.
+// (`silent-class-inventory` D551.)
+//
+// RECORDED ON THE BODY SIDE ONLY — when the RETURNED type carries a hole, never when only
+// the DECLARED one does. That bound is a REFUSED rung with a measured price, not caution.
+//
+// The mirror image is real: `function g<T>(a: T, n: i32): T { return n + 1 }` at `g("s", 2)`
+// is the same check-clean invalid wasm beside the same loud direct twin, and recording the
+// want side closes it. It also refuses `tests/cases/memory/flat-generic-rows-branded.vl` —
+// a module that RUNS, correctly, printing all ten of its expected values:
+//
+//     type TVAddr = new i32
+//     function rowAt<R, A>(self: Rows<R, A>, i: i32): A { return self.base + i * R.size }
+//
+// The body computes an `i32` address and hands it back as the brand `A`. Its direct spelling
+// is a loud `return type mismatch: expected TVAddr, got i32` — so the pin would be RIGHT by
+// the parity rule this table is built on — but there is no spelling that expresses the
+// intent: `as` over a type parameter is `` `as` supports numeric conversions only ``, so the
+// author cannot write the cast the direct spelling would need. Refusing a program the
+// language offers no way to write is not a fix, and "a corpus module that stops building"
+// is a veto term outright. Those cells are not lost by COINCIDENCE, which is the first of
+// the four terms an override needs.
+//
+// So the want-side rung is refused and its price is NAMED rather than forgotten: the
+// `wanthole` block of `scripts/silent-sweep/d551/retgrid.py`, kept whole in
+// `distilled/named/`, and filed as D561. The day `as T` exists, the bound goes.
+//
+// THE ANSWER IS `assignableExpr` ON THE SUBSTITUTED PAIR — the SAME function the body
+// asked, handed the same expression — and that identity is the whole soundness argument:
+// the pin agrees with the direct spelling by construction rather than by a second rule that
+// can drift apart from it the way `checkBinary` and `binOpDefinedFor` did (D492 / D493).
+//
+// `assignable` ALONE IS NOT THAT FUNCTION, and the difference is not academic. The A7
+// coercion — a boolean-typed VALUE flows into an `i32` slot as 1/0 — lives at the
+// EXPRESSION seam and is deliberately absent from `assignable`, so a pin asking the plain
+// predicate REFUSED `function g<T>(a: T): i32 { return a }` at `g(true)` while the direct
+// spelling `function g(a: boolean): i32` runs and prints `1`. That is a false reject
+// invented by the fix, in the exact shape the row is about, and only measuring the direct
+// twin found it. The same holds for the f32-literal adoption, the literal-type member rule,
+// the nominal-literal brand waiver and the field-wise object-literal recursion: every one
+// is keyed on the source EXPRESSION, which is why the expression is what gets recorded.
+//
+// Its recording side effects are re-applied, not newly applied: the body already ran this
+// seam on this node, and for the dominant case the substituted destination IS the
+// destination it ran with (a DECLARED return type carries no hole to substitute). Corpus
+// byte-identity over the module graph is the instrument that says so.
+let retCstrGot: i32[] = []
+let retCstrWant: i32[] = []
+// The returned EXPRESSION's node — the handle `assignableExpr` needs at the pin, not a
+// position for the diagnostic (that is the CALL, like every other pin report).
+let retCstrIx: i32[] = []
+let retCstrFn: i32[] = []
+
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
 // its type. A hole is permissively assignable both ways, so a usage that requires a
 // concrete type (`const r: K = u`, `return u` under a declared return, `q(u)` into an
@@ -2991,6 +3058,10 @@ export function initChecker() {
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
+  retCstrGot = []
+  retCstrWant = []
+  retCstrIx = []
+  retCstrFn = []
   solvedParamTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -7156,6 +7227,17 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
       // was rather than guessing an owner from a `TyFunc`.
       if !binCstrsHold(bNames, bTys, CSTR_ANYFN) { return false }
       if !argCstrsHold(bNames, bTys) { return false }
+      // NO `retCstrsHold` RUNG HERE, and its absence is measured rather than assumed. A
+      // function VALUE names no declaration, so `cstrOwnedBy`'s unknown-callee fallback puts
+      // EVERY generic's return constraint in scope — and `substTyDeep` matches TyVars by
+      // NAME, so `mkS(): (string, string) => string { return add }` recorded a constraint
+      // that then refused the unrelated instantiation `applyI(add, 3, 4)`. Three corpus
+      // modules said so (`functions/generic-fn-{param-return,struct-field}-boundary.vl`,
+      // `generic-fn-value-explicit-type-param.vl`), and the rung bought ZERO cells in
+      // `d551/retgrid.py` — a function value reaching a typed boundary is decided by the
+      // `assignable` on the next line, which compares the instance's return to the target's.
+      // This is the same cross-generic leak #1946 removed for the named-callee spelling,
+      // arriving at the one delivery `cstrOwnedBy` cannot filter.
       return assignable(substTyDeep(s.fnRet, bNames, bTys), d.fnRet)
     }
   }
@@ -16528,6 +16610,31 @@ function noteBinCstr(lt: i32, op: string, rt: i32) {
   0
 }
 
+// Record a deferred RETURN-TYPE constraint when the RETURNED type carries a hole — the body
+// cannot decide it then (see `retCstrGot`'s header, which also records why the mirror case,
+// a hole on the DECLARED side, is deliberately NOT recorded: D561). The generic call site
+// re-asks it under substitution. Stamped with the OWNING declaration
+// for `noteBinCstr`'s reason: the constraint speaks about THAT body's type parameters, and
+// `substTyDeep` matches TyVars by NAME, so an unowned list would let one generic's declared
+// return adjudicate a sibling's call.
+function noteRetCstr(got: i32, want: i32, ix: i32) {
+  if tyHasHole(got) {
+    const owner = cstrOwnerTop()
+    let k = 0
+    while k < retCstrGot.length {
+      if retCstrGot[k] == got && retCstrWant[k] == want {
+        if retCstrFn[k] == owner { return 0 }
+      }
+      k = k + 1
+    }
+    retCstrGot.push(got)
+    retCstrWant.push(want)
+    retCstrIx.push(ix)
+    retCstrFn.push(owner)
+  }
+  0
+}
+
 // THE INTEGER-ONLY OPERATORS — the bitwise ops, the shifts, and `%`. ONE list, read by
 // `checkBinary`'s reject and by `binOpDefinedFor`'s pin mirror, because those are the two
 // homes that have to agree about it and they drifted apart precisely by holding the list
@@ -17234,6 +17341,67 @@ function validateArgCstrs(bNames: string[], bTys: i32[], ix: i32) {
               " (the call's argument types)",
             ix,
           )
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Re-validate every deferred RETURN-TYPE constraint that THIS call resolves: substitute the
+// call's bindings into both the body's returned type and the DECLARED return type, and ask
+// the mismatch question the body could only answer vacuously. A side still carrying a hole
+// (not bound by this call, or a nested generic) defers — `validateBinCstrs` for the
+// declared return.
+//
+// RE-DEFERRAL, exactly as in `validateArgCstrs`: a constraint whose hole substituted to
+// ANOTHER hole (a generic body relaying into a second generic — `function outer<U>(b: U): V
+// { return inner(b) }`) must be re-recorded under the CALLER's hole, or nothing re-asks it
+// when the OUTER call finally pins that one and the two-level chain type-checks clean.
+//
+// THE MESSAGE KEEPS THE DIRECT SPELLING'S SENTENCE VERBATIM and appends the attribution,
+// which is `validateBinCstrs`' non-equality arm's rule: the reader is standing at `g(p)`
+// having written no `return`, so the suffix names whose return is being discussed and that
+// it is this call's argument types that decided it — while the prefix stays greppable as
+// one rule with the `return type mismatch` the direct spelling emits.
+function validateRetCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigR = retCstrGot.length
+  let ci = 0
+  while ci < nOrigR {
+    if cstrOwnedBy(retCstrFn[ci], calleeFn) {
+      const rg = substTyDeep(retCstrGot[ci], bNames, bTys)
+      const rw = substTyDeep(retCstrWant[ci], bNames, bTys)
+      // RE-RECORD only when the callee is NAMED, for `validateBinCstrs`' reason: a
+      // re-record stamps a NEW owner — the body this call stands in — and a call that
+      // cannot name its callee has no standing to reassign ownership.
+      if calleeFn >= 0 {
+        if rg != retCstrGot[ci] || rw != retCstrWant[ci] {
+          if tyHasHole(rg) { noteRetCstr(rg, rw, retCstrIx[ci]) }
+        }
+      }
+      if !tyHasHole(rg) {
+        if !tyHasHole(rw) {
+          if !assignableExpr(retCstrIx[ci], rg, rw) {
+            let rWho = "the callee's return"
+            if who != "" { rWho = "the return of `" + who + "`" }
+            tErr(
+              "return type mismatch: expected " +
+                tyToStr(rw) +
+                ", got " +
+                tyToStr(rg) +
+                " (" +
+                rWho +
+                " at the call's argument types)",
+              ix,
+            )
+          }
         }
       }
     }
@@ -18546,6 +18714,17 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        // And the DECLARED RETURN, at the UFCS half for the same reason the two above are
+        // here: `p.g()` and `g(p)` are the same call and must answer the same way. Wiring
+        // only the direct-call pin would have left the method spelling of D551's family
+        // silent beside a loud direct one — the asymmetry this site's own header records.
+        validateRetCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
       }
     }
     if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
@@ -19782,6 +19961,10 @@ function checkCallNode(n: Call, ix: i32) {
       validateBinCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
       validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
       validateArgCstrs(bNames, bTys, ix)
+      // The DECLARED RETURN rides the same pin, for the reason its table's header gives:
+      // the body's mismatch check is vacuous under a hole and this is the first position
+      // that knows the instance. (`silent-class-inventory` D551.)
+      validateRetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
       // The escaped-join reject is the FALLBACK, not an additional voice: when this
       // same site already reported a precise operand/argument-flow diagnostic, that
       // one names the actual mismatch and the join report would only repeat it in
@@ -29497,32 +29680,32 @@ function mkBinOpRetTy(n: BinExpr, bTy: i32, lt: i32) {
   if !isBinOpFuncName(op) { return bTy }
   if (fnDeclIx[op] ?? -1) < 0 { return bTy }
   if !tyIsHole(lt) { return bTy }
-  // ONLY INSIDE A BODY WITH NO RETURN ANNOTATION, and this bound is MEASURED, not
-  // cautious. A deferred type is a type nothing in the body checks, and a body with a
-  // declared return has exactly one such check: `return a < b` under `: V` is
-  // `return type mismatch: expected V, got boolean` today, and handing that `return` a hole
+  // AN ANNOTATED BODY IS NO LONGER EXCLUDED, and the bound that excluded it is gone rather
+  // than loosened. It read "ONLY INSIDE A BODY WITH NO RETURN ANNOTATION", for a reason that
+  // was exactly right at the time: a deferred type is a type nothing in the body checks, and
+  // a body with a declared return has precisely one such check — `return a < b` under `: V`
+  // is `return type mismatch: expected V, got boolean`, and handing that `return` a hole
   // makes it permissively assignable to anything. At a `V` pin the deferral is RIGHT (the
-  // overload really does return `V`) and at an `i32` pin it is wrong — and the wrong one is
-  // check-clean INVALID WASM, a new silent cell traded for a false reject.
+  // overload really does return `V`) and at an `i32` pin it is wrong, and the wrong one is
+  // check-clean INVALID WASM — a new silent cell traded for a false reject.
   //
   //     function "<"(self: V, other: V): V { return self }
   //     function g<T>(a: T, b: T): V { return a < b }
   //     print(g(6, 3).x)
   //
-  // Deciding that per pin needs the annotation re-checked against the RESOLVED body type at
-  // the call — strictly more than this rung, and not what either row is about: D532 is an
-  // UN-ANNOTATED return by its own title, and D531's annotated cells never needed the
-  // deferral (an annotated `: i32` decides the instance's result and the pin's alike). So
-  // the annotated form keeps master's answer exactly, false reject and all, and that
-  // remainder is filed as this row's residue rather than left to be discovered.
-  const owner = cstrOwnerTop()
-  if owner < 0 { return bTy }
-  const od = P.nodes[owner]
-  if od is FuncDecl {
-    if od.fnRet >= 0 { return bTy }
-  } else {
-    return bTy
-  }
+  // Its own header named what would let it go: "deciding that per pin needs the annotation
+  // re-checked against the RESOLVED body type at the call — strictly more than this rung".
+  // That is D551, and it now exists: `noteRetCstr` records the annotation against the
+  // deferred body type and `validateRetCstrs` re-asks it at each pin, so the `V` pin runs
+  // and the `i32` pin is a POSITIONED reject instead of invalid wasm. Removing the bound is
+  // therefore not a relaxation — it is the second half of one landing, and it is what closes
+  // D532's filed residue (the eight `d532_*_retobj_ann_*_typar` cells) in the same change.
+  //
+  // THE TWO RUNGS ARE MUTUALLY LOAD-BEARING, which is why the ablation table scores them
+  // together: with the bound still in place, `vxor<T>(va: T, vb: T): i32 { return va ^ vb }`
+  // hands `validateRetCstrs` the NO-DISPATCH answer (the left operand's `V`) as the body's
+  // type, and the pin rejects a program that runs — `tests/cases/generics/binop-pin-*` are
+  // the two corpus modules that said so.
   const d = mkDerivedHole(HD_BINOP, op, bTy, -1, lt)
   if d < 0 { return bTy }
   d
@@ -32475,6 +32658,14 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
       "return type mismatch: expected " + tyToStr(want) + ", got " + tyToStr(got),
       ix,
     )
+  } else if want >= 0 {
+    // THE CHECK ABOVE IS VACUOUS WHENEVER A SIDE IS A HOLE — `assignable` waves a `TyVar`
+    // past any destination, which is right in the body and answers nothing about the
+    // instance. Record the pair; the generic call site re-asks it under substitution
+    // (`validateRetCstrs`). Only on the PASSING side: a `return` that already reported its
+    // own mismatch has a loud diagnostic, and a second one at every call site would repeat
+    // it in vaguer words. (`silent-class-inventory` D551.)
+    noteRetCstr(got, want, n.retArg)
   }
   return TY_VOID
 }

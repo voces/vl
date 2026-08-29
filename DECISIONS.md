@@ -10,8 +10,33 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A PIN THAT RE-ASKS A BODY'S QUESTION MUST CALL THE FUNCTION THE BODY CALLED, NOT AN
+  EQUIVALENT ONE** (2026-08-29, silent-class-inventory D551 / #2017). `validateRetCstrs` asks
+  `assignableExpr` on the substituted pair, not `assignable`. The two differ: the A7
+  boolean-to-`i32` coercion, the f32-literal adoption, the literal-type member rule and the
+  nominal-literal brand waiver all live at the EXPRESSION seam and are deliberately absent
+  from the plain predicate. Asking `assignable` made the generic spelling REFUSE
+  `function g<T>(self: T): i32 { return self }` at `g(true)` while the direct spelling runs —
+  a false reject invented by the fix. **The identity is the soundness argument**: parity with
+  the direct spelling is structural, not a second rule that can drift the way `checkBinary`
+  and `binOpDefinedFor` did (D492/D493). The recorded column is therefore the returned
+  EXPRESSION's node, not a position for the diagnostic.
+
+- **A REJECT IS NOT AVAILABLE WHEN THE PROGRAM IT WOULD DEMAND CANNOT BE WRITTEN**
+  (2026-08-29, silent-class-inventory D561 / #2017). D551's rule generalises one column over
+  — a concrete body under a type-parameter RETURN is the same silent module beside the same
+  loud direct twin — and that widening was still refused. It costs
+  `tests/cases/memory/flat-generic-rows-branded.vl`, where a generic hands back an `i32`
+  address as a phantom `new i32` brand: the direct spelling is a loud `return type mismatch`,
+  so the pin would be RIGHT, but `(self.base + i * 4) as A` is `` `as` supports numeric
+  conversions only ``. **"Make it loud" is only an answer when the author has a spelling for
+  what they meant.** Filed with an executable price rather than argued about, so the day
+  `as T` exists the bound goes.
+
 - **A DEFERRED TYPE IS A TYPE NOTHING IN THE BODY CHECKS, SO THE DEFERRAL HAS TO STOP WHERE
-  A CHECK WOULD HAVE RUN** (2026-08-29, silent-class-inventory D532 / #2016). `HD_BINOP`
+  A CHECK WOULD HAVE RUN — AND THE CHECK IS BUILDABLE** (2026-08-29, silent-class-inventory
+  D532 / #2016; RESOLVED by D551 / #2017: the bound named its own successor and is now gone,
+  and restoring it costs two corpus modules). `HD_BINOP`
   hands a generic body's `a op b` a hole instead of an answer, which is right precisely
   because the body cannot decide it. But an ANNOTATED return is a check the body *can* run,
   and a hole is permissively `assignable` to anything: with the deferral inside one,
