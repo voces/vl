@@ -57,6 +57,35 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   not a repair; the cost of not having it is bounded and local (`const t = xs[0]` before the
   call).
 
+- **A REFUSAL IS A MEASUREMENT WITH A DATE ON IT, AND THE ROW THAT NAMES ITS OWN UNBLOCKER
+  IS THE ONE TO RE-RUN FIRST** (2026-08-28, silent-class-inventory D207). D207 was refused on
+  2026-08-27 for a measured 889-cell loud→silent price and the row wrote down exactly what
+  would retire it: *"Closing D181 is what unblocks this row, and the bound is the one line to
+  delete."* **D181 closed the next day**, and for a further day D207 kept reading as a live
+  refusal because the inventory is not the file the fixer edits. Re-graded unchanged, the same
+  one-line lift now costs **zero** — 6,037 census cells loud→`runs`, no `runs` lost, nothing
+  into silence. The rule this earns: a refusal that cites a *specific open row* as its cause
+  is not a standing decision, it is a subscription, and the cheapest thing to re-run when that
+  row closes is every refusal that named it. Grading a citation is also how D461 was found —
+  D207 said its other half was "filed as D209", and D209 had closed under a *different*
+  witness, so the map spelling had been standing behind another row's ID with no row of its own.
+
+- **A LENIENT MATCH THAT REFUTES ONLY ON FULLY-KNOWN EVIDENCE MUST NOT BE FED IN DEPENDENCY
+  ORDER — THE FIX IS A PRE-PASS, NOT A NEW RULE** (2026-08-28, silent-class-inventory D391;
+  D-ANONORDER). `anonValueFitsField`'s code-15 arm already refuses to merge two same-fieldset
+  literals whose nested field points at different targets, and it was correct and unreachable:
+  it can only refute when BOTH target names are known, a name is
+  `sNames[structIndexOfObj(inner)]`, and the second literal's nested value was skipped by
+  `anonNestNeedsRow` *precisely because* it had no name yet — which is what kept it nameless.
+  A circularity, not a missing discriminator. The row's own parked question asked for a new
+  one (promote `structIndexOfObjCtxGo`'s `strict` to a real discriminator); that was built and
+  refuted — `strict` stays true on both sides here, so promoting it changes nothing. The tell
+  that named the real cause was a CONTROL, not a reading: **delete the union declaration and
+  the same pair already worked on every compiler**, with separate owner rows in the
+  disassembly. The union case differed in one respect only — its arm-claimed nested literals
+  are minted late. So when a resolver looks right and fires wrong, vary what it is allowed to
+  KNOW before adding to what it is allowed to say.
+
 - **A binding's CELL and its initializer's BUILD are ONE landing, so a destination-driven
   element rep has to reach both rungs or it is a new invalid module** (2026-08-28,
   silent-class-inventory D381). An un-annotated `const lv1 = [{ r: 7 }]` types its list from
