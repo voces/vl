@@ -46,7 +46,14 @@ import { mkMatch } from "./ast"
 import { BinExpr, Ident, P, Tok, mkDeclNameTok } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14) — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
-import { OP_INDEX_GET, OP_INDEX_SET, Param, TypeRef, opDeclName } from "./ast"
+import {
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  Param,
+  TypeRef,
+  i32ToStr,
+  opDeclName,
+} from "./ast"
 // The type-SPELLING side arena — the structure `parseTypeName` builds while it
 // recurses, recorded instead of being thrown away with the string it returns.
 import {
@@ -1865,6 +1872,39 @@ function parseFuncTail(
   if name == OP_INDEX_GET || name == OP_INDEX_SET {
     dname = indexOpDeclName(name, params, nameTok)
   }
+  // ARITY of a NON-INDEX operator declaration (silent-class-inventory D444).
+  // Operator dispatch is binary and only binary: `checkBinary` reaches
+  // `opSelfFnTy`, which returns -1 unless the declaration is exactly
+  // `(self, other)`, and `checkUnaryNode` has NO operator lookup at all — it
+  // asks `isNumeric` and stops. So a declaration at any other arity can never
+  // fire at any receiver, and there is no other way to reach it either: `-` is
+  // not an identifier, so no call can be written, and the quoted spelling mints
+  // the identical name. It is exactly "a name no reference could ever be written
+  // for", which this file already refuses for a quoted NON-operator
+  // (`function "shout"`) and the checker already refuses for a mis-arity `"[]"`.
+  // This is the third shape of the same reject, and the only one that was silent.
+  //
+  // REPORTED HERE, not at the checker's hoist where the index operator's twin
+  // lives, because arity is SYNTACTIC — the index rule needs the resolved
+  // receiver TYPE (D445) and this one needs nothing the parser does not hold.
+  // Nothing in the tree, in std, or in the census corpus declares one, so the
+  // reject costs no capability; the price is the 40 `d425c*` cells' arity-2
+  // NEIGHBOURS, which this gate deliberately does not touch — an arity-2
+  // declaration over a built-in receiver is D425 and is still open.
+  if isBinOpFuncName(name) {
+    if params.length != 2 {
+      P.diags.push(
+        {
+          msg: "operator `" +
+            name +
+            "` takes 2 parameters (self, other), got " +
+            i32ToStr(params.length) +
+            " — operator dispatch is binary only, so this declaration could never fire",
+          at: nameTok,
+        },
+      )
+    }
+  }
   let ret = -1
   if accept("COLON") { ret = parseType() }
   parseFuncBodyAndBuild(dname, typarams, params, ret, nameTok, funcPos)
@@ -1964,6 +2004,24 @@ function isOpFuncName(kind: TokKind) {
     kind == "LE" ||
     kind == "EQ" ||
     kind == "NE"
+}
+
+// The operator names whose DISPATCH is binary — `isStrFuncName` minus the two
+// BRACKET operators, whose arity is the index rule's `(self, index[, value])` and
+// is checked at the hoist against the resolved receiver, and minus `==`/`!=`,
+// which `parseFuncHead` already refuses BY NAME (D46). Listing those two here as
+// well would put a second diagnostic on one declaration for one mistake.
+function isBinOpFuncName(name: string) {
+  name == "+" ||
+    name == "-" ||
+    name == "*" ||
+    name == "/" ||
+    name == "%" ||
+    name == "^" ||
+    name == ">" ||
+    name == ">=" ||
+    name == "<" ||
+    name == "<="
 }
 
 // The operator names a QUOTED function name may spell — the symbol-token set
