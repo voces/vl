@@ -10,6 +10,48 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A ROW'S OWN ARITHMETIC IS EVIDENCE, AND IT CONTRADICTED ITS OWN PROSE** (2026-08-28,
+  silent-class-inventory-2 D451 / #2007). The row named "the SIX reps whose nullable is a BOX
+  rather than a niche", then listed **seven** and computed `6 × 4 × 2 = 48 + 8` for a 56-cell
+  family that is `7 × 4 × 2`. Re-grading per rep took one command and found all seven 8/8
+  silent — **and that only four of them are boxes at all**. `new string` is a nullable-STRING
+  niche and the two three-deep arrays are nullable-REF-ARRAY niches; the three families give
+  three different wasm errors and needed three different rungs, so a fix built to the row's
+  stated mechanism would have closed 32 of 56 and left 24 looking like a second defect. **The
+  rule: when a row's count and its list disagree, the list is usually right and the mechanism
+  sentence is usually the thing that was never re-measured.** Re-grade the population by rep
+  before believing a family is one family — a per-rep histogram of a named set costs ~10
+  invocations and is what separated three mechanisms here.
+
+- **A SILENT DEFECT'S OWN GRID CANNOT GRADE ITS SOUNDNESS RUNGS, AND WHICH REP HIDES THEM IS
+  PREDICTABLE** (2026-08-28, D451 / #2007). The candidate that closed all 56 of D451's cells,
+  minus its two write-retirement rungs, scores **0 silent and 150 runs on all 184 grid cells**
+  and loses **three `runs` programs to `wasm trap: null reference`**. The grid is a READ grid:
+  guard, then read. Every rung that lives in the *statement between them* is invisible to it,
+  and no derived corpus can find them either, because on the landed compiler those programs
+  behave exactly like their class-mates. **What is generalisable is which rep exposes them.**
+  A cell whose declared rep the CHECKER refuses to read hides the emit half completely — for a
+  boxed `NtI32 | null` there is no `print` lowering, so a read after a retiring write is a
+  check reject whether or not the emitter retired anything. Only a NICHE cell (`string | null`
+  prints as `null`) is check-clean at the declared rep and so reaches the emitter at all. The
+  checker's own four `index-place-narrowing-*` soundness fixtures are all box-ish and were
+  blind to this. **When adding an emit-side twin of a checker rule, build the soundness
+  witness on the rep whose UN-narrowed read the checker ACCEPTS — that is the only rep where
+  the two sides can disagree out loud.**
+
+- **A REFUSED REFINEMENT'S PRICE CAN BE NEGATIVE FOR A REASON NOBODY FILED, AND ANOTHER ROW'S
+  CLOSE FLIPS IT** (2026-08-28, silent-class-inventory-2 D452 / #2007). D452 was filed as "a
+  refinement, not a defect: the blunt rule is SOUND and the precise one is not yet written" —
+  a cost stated purely as work-not-done. Measured by lifting `callInvalidatesReal`'s blunt `[`
+  leg on both compilers, the box and `arr3` spellings it would newly admit were **check-clean
+  INVALID WASM on the base** and run on the D451 landing. So refining it before D451 would
+  have converted loud rejects into silent cells for exactly the reps D451 covered: **D451 was
+  D452's precondition and neither row said so.** This is the D207 lesson in a second shape —
+  a refusal is a measurement with a timestamp — with the twist that the staleness was not in
+  the number but in a dependency that was never written down. **When filing a refinement,
+  measure what it would ADMIT, not only what it costs to write; and name the rows whose state
+  that measurement depends on.**
+
 - **A REFUSAL IS A CLAIM ABOUT AN ANSWER SET, AND THE SET IS USUALLY "WAYS TO MAKE IT RUN"**
   (2026-08-28, silent-class-inventory D411 / #2008). D411 was filed as "a REFUSAL, not a gap"
   and enumerated three fixes — a checker variance rule, a store-side coercion, a binding
