@@ -10,6 +10,55 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A PIN THAT RE-ASKS A BODY'S QUESTION MUST BE HANDED THE SUBSTITUTED TYPE, NOT ONLY THE
+  SUBSTITUTED PAIR** (2026-08-29, silent-class-inventory D581 / #PR). D551's rule was "call
+  the function the body called"; this is its other half. `validateLetCstrs` handed
+  `assignableExpr` a correctly substituted `(i32[], string[])` and got TRUE, because that
+  function's array-literal recursion re-derives each element's type from the element NODE
+  (`nodeTyIxOf`) — which at the pin still carries the UN-SUBSTITUTED hole. **A predicate that
+  reads anything off the AST is only as substituted as the thing it reads.** Its ObjLit
+  sibling reads the field type off `srcTy` and was correct all along, which is why the object
+  literal was loud and the array literal was not; the fix is to make the array arm read the
+  container the same way, gated on the element's own record being hole-bearing so the
+  per-element adaptation rules are untouched everywhere else.
+
+- **A MUTUAL-ASSIGNABILITY JOIN SILENTLY DELETES A HOLE, SO A GATE THAT ASKS "DOES THIS TYPE
+  CARRY A HOLE" CAN BE ASKING ABOUT A TYPE THE HOLE WAS ALREADY REMOVED FROM** (2026-08-29,
+  silent-class-inventory D581 / #PR). `checkArrayLitNode` joins its element types with
+  `joinTys`; a hole is permissively assignable BOTH ways, so `[true, self]` collapses to
+  `boolean` and the hole is gone before `noteLetCstr` ever sees it. `joinRetTys` carries this
+  exact note for the return accumulator ("a HOLE must not collapse HERE") and nobody had
+  asked it at the element join. **Two repairs are available and they are not equivalent.**
+  Reconstructing the dropped union and recording it as the CONTAINER's type reproduces the
+  direct spelling's sentence VERBATIM — and then the pin hands every element the JOIN of all
+  of them, so `const xs: i32[] = [0, self]` at `g(true)`, which runs and prints `1` through
+  the A7 coercion, becomes a false reject. Asking per SLOT keeps the coercion and pays a
+  vaguer message. **When a reconstruction is coarser than what it reconstructs, prefer the
+  finer ask and accept the weaker sentence**; the refused candidate is kept buildable and its
+  two-cell price is in `named/`.
+
+- **A DEFERRED-CONSTRAINT TABLE IS DEFINED BY WHAT ITS PIN CAN ASK, NOT BY WHAT IT RECORDS —
+  WHICH IS WHY THE BUILTIN ARGUMENTS COULD NOT JOIN `argCstr`** (2026-08-29,
+  silent-class-inventory D582 / #PR). `argCstr` looks like the right home for "an argument
+  the body could not judge", and it is not: it is owned by a callee it can NAME (a builtin
+  has no `FuncDecl`), and its pin asks plain `assignable` with no argument NODE in hand.
+  Three of the fourteen builtin arms ask `assignableExpr`, so that pin would refuse
+  `xs.push(self)` over an `i32[]` at `g(true)` — D551's first cut, one callee kind over — and
+  asking the expression predicate for all fourteen leaks the other way, waving
+  `"abc".charCodeAt(self)` at `g(true)` past a check its direct spelling fails. The seventh
+  table therefore carries the argument node and a FORM, and `bmArgPred` keys the predicate
+  off the form. **Mirror the arm, arm for arm; one predicate for a heterogeneous surface is
+  wrong in both directions at once.**
+
+- **THE ONE INSTRUMENT THAT CAN SEE A COMPILER TRAP IS THE ONE THAT BUILDS REAL MODULES**
+  (2026-08-29, silent-class-inventory D582 / #PR). The slot walk's destination peel read
+  `T.tys[dtix]` before testing the index; `let x = null` binds `mkNullableTy(-1)`, whose inner
+  is not yet a type and which `tyHasHole` answers FALSE for, so one peel reaches `-1` and the
+  second read traps. 33 corpus modules died. **Every grid column stayed flat** — the grid's
+  own cells do not write `null` into an un-annotated binding — and so did every histogram and
+  every `runs`/`not-runs` count. Only `corpuscmp.py`'s LOST column saw it, which is why it is
+  the FIRST instrument a landing runs and not a formality after the grid is green.
+
 - **A PIN THAT RE-ASKS A BODY'S QUESTION MUST CALL THE FUNCTION THE BODY CALLED, NOT AN
   EQUIVALENT ONE** (2026-08-29, silent-class-inventory D551 / #2017). `validateRetCstrs` asks
   `assignableExpr` on the substituted pair, not `assignable`. The two differ: the A7
