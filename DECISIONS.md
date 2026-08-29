@@ -2359,3 +2359,32 @@ answer while `ret` is check-clean invalid wasm. A one-shape grid would have repo
 cell as absent — with `ret` only it never appears, and with `bind` only the residue never does.
 **When two spellings of "the same" program are available and cheap, run both; a grid reports a
 missing axis as a clean column.**
+
+## A check must FAIL when its population is empty
+
+The do-nothing rule says a CELL's expected answer must differ from the answer it would give
+if the thing under test did nothing. This is the same principle one level up: **a CHECK's own
+result must differ from the result it would give if the check did nothing.**
+
+Found 2026-08-29 by running `d492/pingrid.py --price` from a tree without its ledger:
+
+    price cells: 0  seed build/vl-compiler.wasm
+      (a) ran on the base seed            : 0 fail
+      (b) direct twin is LOUD             : 0 fail
+      (c) twin's refusal names the op     : 0 fail
+    price: ... override holds
+
+Zero cells, three zero-fail lines, "override holds", **exit 0**. A green result from a
+population that does not exist, and nothing in the output says so. The realistic causes are
+a partial checkout, a rebase that dropped the set, or a `git apply` that skipped it — none of
+which announce themselves.
+
+Both `--price` grids now exit 1 on an empty list with a message saying nothing was verified.
+The two rules were violated in one day by authors who had each read the other one, which is
+the argument for making both **executable** rather than documented: `d471/opdeclgrid.py
+--verify` refused 32 of its own author's cells for breaking the do-nothing rule minutes after
+they read it.
+
+Related: a `--price` run against the POST-landing seed reports VETO rather than a false pass,
+because term (a) legitimately fails once the cells are loud. That is the safe direction; the
+check takes the BASE seed.
