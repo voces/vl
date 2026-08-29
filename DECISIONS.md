@@ -1375,6 +1375,73 @@ an instruction to define the operator *for the call's argument types*.
   both spellings, and choosing between "implement the dispatch" and "delete the clause" is a
   language-design call rather than a rider on this one.
 
+### The axis a delivery grid cannot have: the SHAPE of the operand's type (D421)
+
+**"Is the operand a hole" and "does the operand's type CONTAIN a hole" are different questions,
+and every gate in the deferred-constraint machinery asked the first.** `tyIsHole` answers about
+the type itself, so `function eqL<T>(a: T[], b: T[]) { return a == b }` — whose operand is a
+`TyArray` OVER a hole — recorded no constraint at all. The pin had nothing to re-ask and the
+whole apparatus above never ran: `eqL(circleList, circleList)` was `vl check` rc 0 over a module
+the engine refuses, while the same comparison written out is loud and always has been.
+
+**THE GRID THAT MISSED IT WAS THE RIGHT GRID FOR ITS QUESTION, and that is the transferable
+part.** D35's 1,712 cells and D44's 741 vary the NEEDLE's delivery, the RECEIVER's delivery, the
+CALLEE's delivery, alias-vs-spelled-out and the siblings — five axes about how the operand
+ARRIVES. None of them is about what the operand's type IS, so all 2,453 cells hold it at `T`.
+A delivery axis is not a shape axis, and a family whose mechanism is a predicate over the TYPE
+is invisible to any number of delivery cells. The check that finds this cheaply is to ask, of
+any rule keyed on a type predicate, "what does this predicate say about `T[]`, `T | null`,
+`{ v: T }`, `(T) => T`" — four spellings, and two of them were defects.
+
+**THE SAME WORD ONE LAYER DOWN.** D42 gave the emitter's `==` channel a `nodeTyIsTyVar` gate
+for exactly this reason — a banked type that is a type VARIABLE is correct about the variable
+and useless about the instance — and wrote it as IS, not CONTAINS. `a: T | null` is banked as
+`T | null` inside the monomorphized instance for precisely the same reason, so the gate declined
+to consult the second channel and the compare fell into the i32 tail. The rule is one sentence:
+**wherever a predicate exists because a banked type may be about a type variable rather than
+about the instance, it must ask CONTAINS.**
+
+**A DEFERRAL IS ONLY SAFE ONCE SOMEBODY RE-ASKS.** `eqCmpKindOfArrayElem`'s array arm answered
+`"none"` for a hole one hop down while the element arm one level up answers `""` for the same
+`TyVar`, which is a false reject over `i32[][]`. Turning that `"none"` into `""` is one line and
+is a LOUD→SILENT change when landed alone: measured, it takes a 468-cell grid's silent column
+from 15 to 22, because the 9 cells whose element genuinely has no core leave their check reject
+for check-clean invalid wasm (7) or a loud emit reject (2) with nothing standing behind them. On
+top of the constraint widening the same line is a pure win. **Two rungs, one landing, and the
+evidence is that the branch's moved set is a strict SUBSET of the union of the single-rung moved
+sets — 25 against 34** — which is the arithmetic signature of a rung that is unsafe alone.
+
+## Operator dispatch is decided at the REWRITE, so it may only ask questions the CHECKER has answered (D424)
+
+**`drwWalk`'s `a op b` dispatch gated on `structIndexOfExpr(n.binLeft, ctx) >= 0`, which is a
+question about the EMITTER'S LOCAL SLOT TABLE — and that table is filled by the emit pass this
+rewrite runs ahead of.** Its `Ident` arm therefore answers for a PARAM, a module-declared
+binding, a GLOBAL and a CAPTURE, and not for a plain function-body local. The consequence is a
+capability that exists at four receiver deliveries and silently does not at the fifth:
+`const a: V = { … }  a < b` inside a function body emitted `i32.lt_s` over two struct refs,
+`vl check` rc 0, while the identical program at module scope runs.
+
+**THE FIX IS A CHANNEL CHOICE, NOT A CLASSIFIER EXTENSION.** The self-fn branch needs one bit —
+"is the left operand an object" — and the CHECKER already asked exactly that before resolving
+the dispatch itself (`opSelfFnTy` runs under `if odsp is TyObj`). So it asks the checker's bank
+(`nodeTyIsObj`) and the two stages agree by construction. The FIELD-closure branch needs the
+struct table ROW to look a field up in and keeps `structIndexOfExpr`: widening it the same way
+would be a claim the emitter cannot cash, and the two branches wanting different things is why
+one gate could not serve both.
+
+**THE GENERAL RULE, because this is the second time this shape has cost something.** A rewrite
+that runs before a table is populated must not read that table as a PREDICATE. If the question
+it needs was answered by an earlier stage, ask that stage; if it was not, the rewrite is in the
+wrong place. `opIdxFnAtNode` — the `[]` operator's banked resolution, sitting eight lines below
+this one in the same function — is the shape to copy when the checker's existing bank is not
+enough.
+
+**AND THE FIXTURE THAT WAS GREEN THROUGHOUT.** `tests/cases/objects/operator-self-method.vl` is
+the tree's only operator-declaration fixture and every binding in it is a module global — one
+of the four deliveries that worked. A single-position fixture over a feature whose lowering is
+position-dependent is not coverage, which is the same finding #1995 records for D188's leaf
+table and #1996 for the anonymous-row rung.
+
 ## An ACCEPTANCE must ride the pin too, and it does not ride the same channel a refusal does
 
 **D35's rule — "a rule enforced at `vl check` and lost at monomorphization is a rule about

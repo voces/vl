@@ -3537,6 +3537,32 @@ and the direct control in one file), `tests/cases/generics/deferred-constraint-s
 and `tests/cases/generics/error-deferred-constraint-true-positives.vl` (the scoping, both
 directions).
 
+#### Re-graded 2026-08-28 — the close is CORRECT and the residue is one axis over
+
+**THE REJECT IS THE RIGHT END STATE, and it was measured rather than re-argued.** VL has no
+`==` over a list of structs at any spelling, so the loud check reject is what the direct
+spelling has always said and the row is done. Re-run verbatim on master `777f7848`: the filed
+program is a loud check reject in the filed sentence.
+
+**RE-CHECKED ACROSS THE SHAPE AXIS NEITHER GRID VARIED, and that is where the residue was.**
+D35's axes are the NEEDLE's delivery, the RECEIVER's delivery, the CALLEE's delivery and
+alias-vs-spelled-out; in all 1,712 cells the operand's TYPE is `T` itself. A 468-cell grid over
+operand SHAPE (`T`, `T[]`, `T[][]`, `{v: T}`, `T | null`, `{[string]: T}`) × 13 `T` bindings ×
+`==`/`+`/`<` × direct-vs-generic says:
+
+* the `T` row — this row's own shape — agrees between the direct and generic spellings in
+  **all 39 of its direct/gen PAIRS — 78 cells — at all three operators, 0 disagreeing**.
+  Nothing here is reopened.
+* the `T[]` row loses the refusal in 12, and the `T | null` row in 3. Filed as **D421** and
+  **D422** and closed in the same change as this note; `T[][]` is a FALSE reject, **D423**.
+
+**THE CAPABILITY GAP THIS ROW IMPLIES IS NAMED AND NOT BUILT**: a `==` over a list whose
+element is a struct needs a per-element compare core the emitter does not have
+(`emitListEqICore` / `emitListEqSCore` / `emitListEqRCore` are the closed set, and D46's close
+records why a user-supplied one is a language-design change to six lowerings rather than a
+rider). The remedy this row already prescribes — project to a value-comparable key and search
+that — does not expire, which is stated above and re-measured here.
+
 ---
 
 ### D36 — [CLOSED 2026-08-26] an ANONYMOUS object literal in a lambda's inferred LIST return resolves onto an arm when a twin also exists
@@ -4628,6 +4654,31 @@ the shape D43 was filed to stop.
 Fixture: `tests/cases/generics/error-list-concat-no-core.vl` (four element reps at both
 spellings, plus the literal-union pair that separates the two roots).
 
+#### Re-graded 2026-08-28 — the close is CORRECT, and the accept set still holds
+
+**THE REJECT IS THE RIGHT END STATE.** There is exactly ONE concat core (`emitListConcatI`,
+hard-wired to the i32 backing), so `+` over a struct list has no lowering at either spelling
+and the loud check reject is the direct spelling's own answer. Re-run verbatim on master
+`777f7848`: the filed program is a loud check reject in the filed sentence.
+
+**THE ACCEPT SET WAS RE-MEASURED, not re-asserted** — `i32`, `boolean`, a string literal union
+and a numeric one all still concatenate through `addT` and directly, and `string[]` still
+compares (the `strlist` core) while NOT concatenating, which is why `==` and `+` keep two
+predicates rather than one.
+
+**AND THE SAME SHAPE AXIS D35 MISSED**: the `+` half of the constructor-over-`T` grid loses the
+refusal in 6 cells at `a: T[], b: T[]` — the same mechanism, filed as **D421** and closed with
+it. Nothing in the `T` row moved.
+
+**THE CAPABILITY GAP, NAMED AND PRICED, NOT BUILT.** Making `f64[] + f64[]` (and its literal
+union) WORK rather than refuse is a new concat core per backing — `emitListConcatI` is one
+function hard-wired to `$lTypeIdx`/`$aTypeIdx`, and an f64/i64/u8 list needs its own wrapper
+and its own copy loop. That is `f64[]`'s capability, not this row's, and `std:array`'s `concat`
+already covers every element type today because it is a `push` loop over `T` and inherits the
+element's own storage (measured in D102's close). So the language question a reader should
+take away is "should `+` grow the cores `concat` already effectively has", and the answer costs
+one core per backing plus the classifier rows to route them.
+
 ---
 
 ### D45 — [CLOSED 2026-08-26] `isEquatable` refuses a LITERAL-UNION element although that element compares correctly
@@ -4870,6 +4921,47 @@ function-typed field, so that spelling is loud at both ends today and rejecting 
 would be over-broad.
 
 Fixture: `tests/cases/objects/error-equality-not-overloadable.vl` (all four spellings).
+
+#### Re-graded 2026-08-28 — the DECISION is correct, and the neighbourhood it did not grade held two more rows
+
+**THE REJECT IS THE RIGHT END STATE FOR `==`/`!=`.** Re-run verbatim on master `777f7848`: the
+filed program is a loud parse-stage reject in the filed sentence, at both spellings, and
+`eqRefusals` no longer prescribes the declaration. The reasoning in the close still holds
+exactly — a container's compare recurses through three cores with no per-element dispatch hook,
+so honouring the top-level struct case alone would move the trap one container deep and create
+a NEW silent class.
+
+**WHAT THIS ROW DID NOT GRADE IS THE REST OF THE ACCEPT SET.** The parser's overloadable set is
+`[] []= + - * / % ^ < <= > >=`, and this row measured `==`/`!=` — the two it removed. An
+80-cell grid over operator × name spelling (quoted / symbol token) × parameter annotation ×
+receiver, reading each cell's ANSWER back, found two families this row's four spellings could
+not see:
+
+* **a function-body LOCAL receiver loses the dispatch entirely** — 16 cells check-clean invalid
+  wasm (the four relational operators, whose `boolean` result lets `i32.lt_s` over two struct
+  refs through) and 24 loud. Filed as **D424** and closed in the same change as this note.
+* **an operator declaration whose `self` can never be an OBJECT is inert and nothing says so** —
+  this row's own shape at the nine other operators, selected by the `self` TYPE rather than by
+  the operator. Filed as **D425**, deliberately NOT closed here: the placement is a real
+  decision (a use-site reject would refuse the body of a legitimate struct `+`, and the
+  declaration-site test needs the annotation's RESOLVED type where D46's twin reject has only
+  its spelling).
+
+**THIS ROW'S OWN PROBE LESSON FIRED AGAIN, one operator over.** "The `true`-returning body is
+load-bearing in the witness" — the D424 grid gave `<` and `<=` at an `i32` receiver a pair
+(`1 < 2`) where the declaration and the built-in agree, so 8 of its 80 cells measured nothing
+and read as `DISPATCHED`. `>` and `>=` on the same pair separate them and say the opposite.
+The lesson generalises past `==`: **a cell whose declared answer coincides with the fallback's
+is not a measurement**, and it is worth stating here because this is the second time the same
+grid shape has produced it.
+
+**THE FEATURE, NAMED AND PRICED FOR THE LANGUAGE OWNER.** "`==` is overloadable" is not a defect
+fix: it is six lowerings (`emitStructEqRec`, `emitListEqICore`, `emitListEqSCore`,
+`emitListEqRCore`, the map key, and `isEquatable`'s soundness rule) each growing a per-element
+dispatch hook, plus a rule for what `std:array`'s four `needle: T` exports do with one, plus a
+decision about whether a partial implementation (top-level struct only) is admissible — it is
+not, per this row's own reasoning. The cheap half is already done: the diagnostic no longer
+prescribes it.
 
 ---
 
@@ -6793,6 +6885,34 @@ shape.
   `tyLitUnionIsI32Backed` and `tyIsI32SentinelNullable`, so the two operators can no longer
   answer differently about the same cell — which is the drift both headers exist to prevent
   and which each of them had reproduced once.
+
+#### Re-graded 2026-08-28 — the close is CORRECT and the element axis is still exhaustive
+
+**THE REJECT IS THE RIGHT END STATE, for the reason this row already gives: `F[]` now says what
+`f64[]` says, and `f64[] + f64[]` has no concat core.** Re-run verbatim on master `777f7848`:
+the filed program is a loud check reject (`` `+` over F[] has no lowering ``).
+
+**THE ELEMENT AXIS WAS RE-MEASURED AT BOTH OPERATORS OVER 28 ELEMENT REPS — this row's own
+table plus every rep it does not name — and there are ZERO silent cells in 56.** `i32`,
+`boolean`, `K`, `N` and the two i32-SENTINEL nullables (`boolean | null`, `K | null`)
+concatenate and read back correctly; `u8`, `f32`, `f64`, `i64`, `string`, `Id = new i32`,
+`NS = new string`, `G = 1.5`, `H = "a"`, `J = 1`, `BIG`, `I`, `M = "a" | 1`, `F`, a struct, a
+map, `i32[]` and the five BOX/ref-niche nullables are refused, each in its own sentence. So
+`concatElemIsI32Backed` neither over- nor under-accepts on a vocabulary twice the width of the
+one the row was closed on, and `eqCmpKindOfArrayElem` agrees with it wherever the two questions
+coincide. Identical on master `8f583820` and on this branch — the direct spelling is untouched
+by D421's rungs, which is why that had to be checked rather than assumed.
+
+**THE ONE THING THAT MOVED IS THE SPELLING, NOT THE ELEMENT**: through
+`addL<T>(a: T[], b: T[])` the same six refused element reps were check-clean invalid wasm,
+because the pin recorded no constraint for a `T`-under-a-constructor operand at all. That is
+**D421**, not a defect in this row's predicate — the predicate was never consulted.
+
+**THE CAPABILITY, NAMED AND NOT BUILT.** Concatenating an f64-backed list is a NEW CONCAT CORE
+(a second `emitListConcatI` per backing, plus its wrapper rows), and `std:array`'s `concat`
+already does it correctly for every element type because it is a `push` loop over `T`. So the
+open language question is `+`'s core set, priced at one core per backing; the capability itself
+is not absent, which this row's own last-but-one bullet established with a ten-line program.
 
 ---
 
@@ -13008,6 +13128,378 @@ Repro:
   the reason D362's own filed spelling of its silent cell (the alias beside a
   STRUCTURALLY-spelled twin) still reads `emit_reject` after D362 closed, while the same cell
   with an `AB[]` twin runs.
+
+---
+
+### D421 — [CLOSED 2026-08-28] D35's and D44's lost refusal ONE CONSTRUCTOR UP: a `T[]` operand records no constraint at all
+**CLOSED 2026-08-28 — the repro is NOW A LOUD CHECK REJECT, in the direct spelling's own words (``eqL` compares its type parameter with `==` here: `==` over Circle[] has no lowering`). Was: check-clean invalid wasm · found 2026-08-28 by the CONSTRUCTOR-OVER-`T` grid built to re-check D35/D44/D46/D102, 12 of its 468 cells · pre-existing and IDENTICAL on master `777f7848` and on every single-rung ablation of this branch · NO union, NO layout twin, NO import**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function eqL<T>(a: T[], b: T[]): boolean { return a == b }
+
+    function cell(): boolean {
+      const a: Circle[] = [{ r: 1 }]
+      const b: Circle[] = [{ r: 2 }]
+      return eqL(a, b)
+    }
+
+    print(cell())
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 269: type mismatch: expected i32,
+    //   found (ref $type)
+
+* **D35 AND D44 ARE CORRECTLY CLOSED AND THIS IS NOT A REOPENING OF EITHER.** Both filed
+  witnesses reproduce verbatim as loud check rejects, and at the shape they measured —
+  the operand's type IS `T` — the direct and generic spellings agree in **every one of the
+  39 direct/gen PAIRS (78 cells)** of this grid's `T` row, at all three operators, 0
+  disagreeing. What neither grid varied is the SHAPE of the operand
+  type. D35's axes were the needle's delivery, the receiver's delivery, the callee's
+  delivery and alias-vs-spelled-out; D44 added the siblings. In all of them the operand was
+  `T` itself.
+* **THE MECHANISM IS ONE PREDICATE.** `noteBinCstr` records a deferred constraint only
+  `if tyIsHole(lt) || tyIsHole(rt)`, and `tyIsHole` answers about the type ITSELF. `a: T[]`
+  is a `TyArray` OVER a hole, so **nothing was recorded**, the call site had nothing to
+  re-ask, and D35's whole apparatus — `eqRefusals` at the pin, `concatRefusal` at the pin,
+  the re-deferral, the owner column — never ran. Inside the body every gate answers OPAQUE
+  about the instance for the same reason D35's did: `eqCmpKindOfArrayElem` of a `TyVar`
+  element is `""`, not `"none"`.
+* **THE CONTROL IS ONE CHARACTER PER CELL** — the same comparison written out:
+  `circleList == circleList` is `` `==` over Circle[] has no lowering ``, loud, and always
+  has been.
+* **12 CELLS, `==` AND `+` AT SIX ELEMENT REPS EACH**, measured at both spellings:
+
+  | element | `a == b` direct | through `eqL<T>(a: T[], b: T[])` | `a + b` direct | through `addL` |
+  |---|---|---|---|---|
+  | `Circle` | loud check | **check-clean INVALID WASM** | loud check | **check-clean INVALID WASM** |
+  | `{[string]: i32}` | loud check | **INVALID WASM** | loud check | **INVALID WASM** |
+  | `Circle[]` | loud check | **INVALID WASM** | loud check | **INVALID WASM** |
+  | `f64` | loud check | **INVALID WASM** | loud check | **INVALID WASM** |
+  | `i64` | loud check | **INVALID WASM** | loud check | **INVALID WASM** |
+  | `F = 1.5 \| 2.5` | loud check | **INVALID WASM** | loud check | **INVALID WASM** |
+  | `i32`, `boolean`, `K = "a"\|"b"`, `N = 1\|2` | runs | runs | runs | runs |
+  | `string` | runs | runs | loud check | loud emit |
+
+* **EVERY DELIVERY LOSES IT, so this is not a route defect.** Re-measured over the route
+  axis at `T = Circle`: by name, through a local alias (`const f = eqL  f(a,b)`), UFCS
+  (`a.eqL(b)`), transitively through a second generic, and inside a lambda in the generic
+  body — **five of five silent on master**; at module scope the same program is a loud
+  `emitProgram: monomorphize: unsupported argument type`, a different floor. All five are
+  the branch's loud check reject.
+* **NO WRONG-VALUE CELL EXISTS IN THIS FAMILY, and that was measured rather than assumed.**
+  A second 286-cell grid printed the OPERATOR'S OWN ANSWER at an equal pair and an unequal
+  pair for every cell: **0 gen/direct disagreements among the cells that run**, and 0 cells
+  where the answer differs from the expected one. The residue is exactly the check-clean
+  invalid-wasm column.
+
+#### The close
+
+**THE FIX IS THE PREDICATE, WIDENED FROM "IS" TO "CONTAINS."** `tyHasHole` walks
+`TyArray` / `TyNullable` / `TyObj` / `TyFunc` / `TyUnion` / `TyMap` under a depth bound, and the
+four deferred-constraint gates ask it instead of `tyIsHole`: `noteBinCstr`'s trigger,
+`binOpDefinedFor`'s early defer, `binCstrsHold`'s guards and `validateBinCstrs`' re-record and
+validation guards. `substTyDeep` already substituted deeply, so once the constraint EXISTS the
+pin answers with the substituted type and D35's messages come out verbatim.
+
+**THE DEPTH BOUND'S DIRECTION IS THE SAFE ONE.** A recursive named type returns FALSE at the
+floor, which is today's behaviour — record nothing, defer nothing — rather than a new refusal.
+`substTyDeep` carries its own seen-stack and is the function that has to be exact.
+
+**MEASURED, four instruments:**
+
+* **The whole `tests/cases` corpus is BYTE-IDENTICAL** across the four rungs of this branch:
+  **1,932 files build under both seeds, 0 differ and 0 lost the ability to build** (re-taken
+  against master `8f583820` after the rebase; 1,930 against `777f7848`, where the family was
+  found). Two files GAIN it, and both are this change's own new fixtures — the base cannot
+  build either, which is the point of them.
+* **Counters, reach AND ans.** A probe build counting each rung's reach and its
+  answers-differently, over the 1,930 buildable modules of `777f7848`: `noteBinCstr`'s new
+  predicate is reached **20,970 times and answers differently 0 times**; the emitter's `==`
+  channel 327/0, the array-element arm 51/0 and the operator-dispatch gate 10,156/0. That is
+  precisely why the corpus is byte-identical, and precisely why the fixtures are the only
+  thing standing under these rows — **a rung scoring 0 on every population can still be
+  load-bearing**. On its own witness each is reach>0 AND ans>0: 2/2, 3/3, 20/8 and 4/1.
+* **Real disassembly.** The master module's `eqL` instance is
+  `(return (i32.eq (local.get $0) (local.get $1)))` over two `(ref null $0)` parameters —
+  `wasm-dis`, binaryen 130.
+* **The 468-cell grid, cell-matched**: `runs` 108 → 113, **0 runs lost, 0 → silent**,
+  15 silent → 14 loud + 1 runs, 6 `loud emit` → `loud check`, 4 false rejects → runs.
+  Re-taken cell for cell against master `8f583820` after the rebase: **every column and all
+  25 transitions are identical**, so nothing here is that merge's.
+
+**ABLATED, AND ONE RUNG IS ONLY SAFE ON TOP OF ANOTHER — see D423.** Stripping all four rungs
+reproduces master byte-for-byte (`md5 4249a50f…`, 1,469,283 bytes).
+
+Fixtures: `tests/cases/generics/error-eq-concat-type-param-under-constructor.vl` (the refusals,
+each beside its direct control) and `tests/cases/generics/eq-concat-type-param-under-constructor-runs.vl`
+(the accept set, read back BY VALUE at an equal and an unequal pair).
+
+---
+
+### D422 — [CLOSED 2026-08-28] the OTHER constructor: a `T | null` operand loses the DISPATCH, not just the refusal
+**CLOSED 2026-08-28 — the repro now RUNS and prints `false`. Was: check-clean invalid wasm · found 2026-08-28 by the same constructor-over-`T` grid as D421, 3 of its 468 cells · pre-existing and IDENTICAL on master `777f7848` · THE ONE CELL IN THE FAMILY WHOSE DIRECT SPELLING ALREADY RAN**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function eqN<T>(a: T | null, b: T | null): boolean { return a == b }
+
+    function cell(): boolean {
+      const a: Circle | null = { r: 1 }
+      const b: Circle | null = { r: 2 }
+      return eqN(a, b)
+    }
+
+    print(cell())
+
+* **THIS IS NOT D421 AND D421's FIX DOES NOT REACH IT, which is why it is its own row.**
+  Two of the three `T | null` cells (`{[string]: i32} | null`, `Circle[] | null`) are a lost
+  REFUSAL and D421 closes them at the pin. The third is a lost **lowering**:
+  `Circle | null == Circle | null` written out picks the `nulstruct` niche and RUNS, so there
+  is no refusal to state at the pin — `eqCmpKindOfNulInner(Circle)` answers `"nulstruct"`,
+  the pin is satisfied, and the emitter still writes the wrong instruction.
+* **THE GATE WAS D42's AND IT SAID "IS", NOT "CONTAINS."** `eqCmpKindOfOperand` consults the
+  emitter's own `fnIx`-scoped rep classifier only when `nodeTyIsTyVar(exprIx)`. Inside the
+  monomorphized instance the operand is banked as `T | null` — `monoCloneBody` rebuilds the
+  statement spine and not the type bank, exactly as D35 records — so `eqCmpKindOfNulInner`
+  reads a `TyVar` inner, answers `""`, the gate declined to ask the second channel, and the
+  compare fell into the i32 tail.
+* **THE DISASSEMBLY IS THE EVIDENCE**: master emits
+  `(return (i32.eq (local.get $0) (local.get $1)))` where `$0`/`$1` are `(ref null $0)`
+  (`wasm-dis`, binaryen 130). The engine refuses the module at offset 269.
+* **ABLATED ALONE**: `nodeTyIsTyVar` → `nodeTyHasTyVar` on its own moves **exactly this one
+  cell** of 468 and takes the grid's silent column 15 → 14. Independent of D421's rungs; no
+  overlap with any other rung's moved set.
+* **FOUR INPUTS, NOT ONE**, because a niche compare has to separate them and a single pair
+  cannot show it: equal non-nulls → `true`, unequal non-nulls → `false`, null-vs-value →
+  `false`, null-vs-null → `true`. All four are in the fixture and all four match the direct
+  spelling.
+
+Fixture: `tests/cases/generics/eq-concat-type-param-under-constructor-runs.vl`, section 2.
+
+---
+
+### D423 — [CLOSED 2026-08-28] `T[][]` is a FALSE REJECT the same ladder produces two levels down, and it is only safe to fix on top of D421
+**CLOSED 2026-08-28 — the repro now RUNS and prints `true`. Was: loud check reject (a false one) · found 2026-08-28 by the constructor-over-`T` grid, 4 of its 468 cells · pre-existing and IDENTICAL on master `777f7848` · NOT SILENT, and filed because the fix for it CREATES a silent class when landed alone**
+
+Repro:
+
+    function eqLL<T>(a: T[][], b: T[][]): boolean { return a == b }
+
+    function cell(): boolean {
+      const a: i32[][] = [[1]]
+      const b: i32[][] = [[1]]
+      return eqLL(a, b)
+    }
+
+    print(cell())
+    // vl check rc 1:
+    //   [ERROR]: `==` over T[][] has no lowering
+
+* **THE CONTROL RUNS AND PRINTS `true`**: `a == b` written out over the same two
+  `i32[][]` bindings. The refusal is about a comparison the compiler performs correctly.
+* **TWO LEVELS OF ONE LADDER DISAGREE ABOUT ONE HOLE.** `eqCmpKindOfArrayElem`'s ELEMENT arm
+  answers `""` for a `TyVar` (unanswered — the existing dispatch keeps it) and its ARRAY arm
+  falls past every test to `return "none"` (no lowering exists — the checker rejects). Same
+  hole, two verdicts, and the second is the one that reaches a `T[][]` operand.
+* **THE DIAGNOSTIC NAMES A TYPE VARIABLE TO A CALLER WHO WROTE NEITHER** — `` `==` over
+  T[][] has no lowering `` at a call site spelling `i32[][]`. That is its own reason to
+  close it: D35's whole close is about a pin sentence being the direct spelling's own.
+* **THE ABLATION IS THE POINT OF THIS ROW.** Landed ALONE, this one-line deferral takes the
+  468-cell grid's silent column from **15 to 22**. It moves 13 cells and only 4 of them are
+  the ones it is for: the other **9 are `T[][]` cells whose element genuinely has no core**
+  (`Circle`, `{[string]: i32}`, `Circle[]`, `F`, `Shape`, `f64`, `i32[]`, `i64`, `string`),
+  and with nothing re-asking at the pin they leave their loud check reject — **7 for
+  check-clean INVALID WASM and 2 for a loud emit reject** (`Circle[]` and `i32[]`, whose
+  ref-list element trips `emitProgram` first). Counted cell by cell, not from the histogram:
+  a summary reading "9 went silent" would be wrong by two and in the safer direction, which
+  is the direction that gets believed.
+* On top of D421 all 9 are loud check rejects again, with the SUBSTITUTED type in the
+  sentence rather than `T[][]`, and these 4 run. **The branch's moved set is a strict SUBSET
+  of the union of the single-rung moved sets — 25 against 34 — and this is the pair that
+  makes it so.**
+* Measured per ablation, 468 cells: base silent 15 · D421-only 1 · D422-only 14 ·
+  **D423-only 22** · D424-only 15 · all four **0**. `runs` lost: 0 under every one.
+
+Fixture: `tests/cases/generics/eq-concat-type-param-under-constructor-runs.vl`, section 3
+(four bindings, each at an equal and an unequal pair).
+
+---
+
+### D424 — [CLOSED 2026-08-28] user OPERATOR DISPATCH is decided by the RECEIVER'S DELIVERY, and a function-body LOCAL loses it
+**CLOSED 2026-08-28 — the repro now RUNS and prints `true`. Was: check-clean invalid wasm · found 2026-08-28 grading D46's neighbourhood — every operator a declaration may name, at every spelling — instead of `==`/`!=` alone · pre-existing and IDENTICAL on master `777f7848` · NO generic, NO import, six lines**
+
+Repro:
+
+    type V = { x: i32, y: i32 }
+
+    function <(self: V, b: V): boolean { return self.x < b.x }
+
+    function cell(): boolean {
+      const a: V = { x: 1, y: 2 }
+      const b: V = { x: 3, y: 4 }
+      return a < b
+    }
+
+    print(cell())
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 190: type mismatch: expected i32,
+    //   found (ref $type)
+
+* **THE SAME PROGRAM AT MODULE SCOPE RUNS.** Move the two bindings out of `cell` and it
+  prints `true`. So does delivering them as PARAMETERS, as GLOBALS, or as object LITERALS.
+  The ONE delivery that loses the dispatch is a plain function-body local — annotated,
+  inferred, `let`, or bound from a call, all four measured.
+* **THAT IS WHY THE TREE'S ONE OPERATOR FIXTURE IS GREEN.**
+  `tests/cases/objects/operator-self-method.vl` declares `function +(self, b)` and every
+  binding in it is a module global. One position, and the fixture sat at the working one —
+  the same shape D188's table had, which is what #1995 records for D362.
+* **THE ROOT IS A PASS-ORDER QUESTION, NOT A CLASSIFIER GAP, and the ordering is checkable
+  rather than inferred.** `drwWalk`'s dispatch arm gates on
+  `structIndexOfExpr(n.binLeft, ctx) >= 0`, and that function's `Ident` arm has four rungs:
+  `paramStructIndex` (AST-backed, answers), `declaredStructIndex` (the EMIT pass's local slot
+  table — `localNames` / `localStructIdx`, which `buildLocals` resets and fills per function
+  during body lowering), `globalStructIndexSid` (a module-scope table built earlier, answers)
+  and `capturedStructIndex` (answers). `dispatchRewrite` is a NAMED PASS whose own recorded
+  ordering constraint is `dispatchRewrite > buildFnMap computeRetInference`, and body lowering
+  is downstream of all of them — so at the moment the rewrite asks, the local slot table is
+  the one thing in that ladder that has not been built. Three rungs answer and the fourth
+  cannot, which is exactly the set of deliveries the grid separates.
+* **THE SEVERITY SPLITS BY RESULT TYPE, which is why half of it was invisible.** Over an
+  80-cell grid (operator × quoted-vs-symbol-token name × annotated-vs-bare parameters ×
+  receiver), a function-body-local receiver gives:
+
+  | operator | what a local receiver does on master |
+  |---|---|
+  | `<` `<=` `>` `>=` | **check-clean INVALID WASM** — 16 cells; the `boolean` result lets `i32.lt_s` over two struct refs through |
+  | `+` `-` `*` `/` `%` `^` | loud `emitProgram: field access receiver is not a struct` — 24 cells; the object result trips the field read |
+
+  All 40 run on the branch, and all 40 print the DECLARATION'S own answer.
+* **THE PROBE HAD TO BE BUILT TO DISAGREE WITH THE FALLBACK**, which is D46's own lesson and
+  it bit here first: `lt`/`le` at an `i32` receiver print `true` whether the declaration
+  dispatches or not, so 8 of the grid's 80 cells measure nothing. `gt`/`ge` at the same
+  receiver separate them, and they say the declaration is ignored — which is **D425**.
+* **THE FIX IS THREE LINES AND ONE OF THEM IS THE ARGUMENT.** The self-fn branch needs only
+  "is the left operand an OBJECT", which is exactly what the CHECKER asked before resolving
+  the dispatch itself (`opSelfFnTy`, under `T.tys[lt] is TyObj`), so it asks the same bank
+  (`nodeTyIsObj`). The FIELD-closure branch needs the struct table ROW to look the field up
+  in and keeps `structIndexOfExpr` — widening it the same way would be a claim the emitter
+  cannot cash.
+* **ABLATED ALONE**: moves 40 of the operator grid's 80 cells, 4 of the position grid's 12
+  and 9 of the local-delivery grid's 10; **0 cells of the 468-cell generic grid**, so it
+  shares no cell with D421/D422/D423. Corpus byte-identity holds: the new gate is reached
+  **10,156 times over 1,930 corpus files and answers differently 0 times**.
+
+Fixture: `tests/cases/objects/operator-self-method-function-local-receiver.vl` (every local
+delivery, a nested function, a lambda, a chain, and two operators whose bodies disagree with
+any built-in lowering).
+
+---
+
+### D425 — an operator declaration whose `self` can never be an OBJECT parses, type-checks, and is SILENTLY IGNORED
+**check-clean silently wrong · found 2026-08-28 by the operator grid built for D424 — the same shape D46 rejected for `==`/`!=`, at the NINE other operators · pre-existing and IDENTICAL on master `777f7848` and on this branch · LEFT OPEN DELIBERATELY: the reject's PLACEMENT is a real decision and this row states its price. (The status line avoids the word this file uses for a fixed row on purpose — `check-filed-witnesses.py` matches its vocabulary as a SUBSTRING and a live row reading "not c-l-o-s-e-d" grades as fixed, which is the trap its own docstring records.)**
+
+Repro:
+
+    function "+"(self: i32, other: i32): i32 {
+      return 99
+    }
+
+    function cell(): i32 {
+      const a: i32 = 1
+      const b: i32 = 2
+      return a + b
+    }
+
+    print(cell())
+    // vl check rc 0, no warning about the declaration. The declared operator returns 99
+    // unconditionally, so a dispatch would print 99.
+    // PRINTS 3
+
+* **IT IS D46's EXACT SHAPE.** D46 rejected `function "=="` because the declaration parsed,
+  type-checked and did nothing, and because a diagnostic was recommending it. This is the
+  same inertness at every OTHER operator, selected not by the operator but by the `self`
+  parameter's TYPE.
+* **THE INERTNESS IS PROVABLE, not merely observed.** `checkBinary` reaches `opSelfFnTy` only
+  under `if odsp is TyObj`, and `opSelfFnTy` then requires `assignable(lt, params[0])`. A
+  `self` annotated with anything that is not an object type — `i32`, `string`, `f64`,
+  `K = "a" | "b"`, `Circle[]` — can therefore never be reached by any program.
+* **32 of 40 grid cells PROVED ignored, and the other 8 are the probe's own blind spot.**
+  At an `i32` receiver the declaration is discarded and the native answer comes back for
+  `+ - * / % ^ > >=` at both name spellings and both annotation forms; `<` and `<=` were
+  given a pair (`1 < 2`) where the declaration and the built-in agree, so those 8 cells
+  measure nothing. Re-running them with a disagreeing pair is ~10 invocations and is the
+  first thing the closer should do.
+* **WHY IT IS NOT CLOSED AS A RIDER, and the reasoning is the placement.** The reject has to
+  be at the DECLARATION: a USE-site reject is over-broad by construction, because the body of
+  a legitimate struct `+` operator adds its fields with the built-in `+` and would refuse
+  itself. And the declaration-site test needs the `self` annotation's RESOLVED type, not its
+  spelling — `self: K` and `self: Circle[]` are inert for exactly the reason `self: i32` is —
+  while D46's twin reject lives in `parseFuncHead`, which has only the spelling. So this is a
+  new gate in the CHECKER beside `opSelfFnTy`, phrased as D46's sentence is, plus a decision
+  about the un-annotated spelling (`function +(self, b)`, which the tree's own fixture uses
+  and which must stay accepted — its `self` is a hole that binds to an object per call).
+  **Price: one checker gate, one diagnostic sentence, one fixture; the tree declares no such
+  operator, so the reject costs no capability — the same zero D46 measured.**
+* Nothing in `compiler/`, `std/`, `tests/`, `bench/`, `playground/` or `reference/` declares
+  an operator function with a non-object `self`; the only operator declarations in the tree
+  are `tests/cases/objects/operator-self-method.vl`'s and D424's new fixture, and both take
+  an object.
+
+---
+
+### D426 — a LAMBDA inside a generic body whose parameter type mentions `T` is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-28 by D421's route axis — the one route of six whose `T = i32` cell is silent as well as its `T = Circle` cell · pre-existing and IDENTICAL on master `777f7848` and on all four rungs of this branch · NOT D421: the refusal is not lost, the SIGNATURE is wrong**
+
+Repro:
+
+    function opT<T>(a: T[], b: T[]): boolean {
+      const g = (x: T[], y: T[]) => x == y
+      return g(a, b)
+    }
+
+    function cell(): boolean {
+      const a: i32[] = [1]
+      const b: i32[] = [1]
+      return opT(a, b)
+    }
+
+    print(cell())
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 330: type mismatch: expected i32,
+    //   found (ref $type)
+
+* **IT IS NOT THE COMPARISON.** The same generic without the lambda
+  (`function opT<T>(a: T[], b: T[]) { return a == b }` at `T = i32`) RUNS and prints `true`,
+  and so does a plain non-generic lambda over `i32[]`, and so does a lambda that CAPTURES `a`
+  and `b` instead of taking them. The lambda's PARAMETER TYPE mentioning `T` is the whole of
+  it.
+* **THE LOUD SIBLINGS SHOW THE SAME ROOT.** A lambda with a `T[]` parameter and no operator
+  at all — `const g = (x: T[]) => x.length` — is a loud
+  `emitProgram: field access receiver is not a struct`; `(x: T[]) => x` is the same. So the
+  shape is broken for every body, and `==` is merely the body that gets past the emitter's
+  floor.
+* **THE DISASSEMBLY NAMES THE MECHANISM.** The lifted lambda's call site is
+  `call_indirect (type $8)` where `$8` is `(func (param structref i32 i32) (result i32))`,
+  and the two `(ref $4)` list values are pushed into the `i32` slots: the closure's INTERNED
+  SIGNATURE was built at the UNSUBSTITUTED type, so `T[]` was lowered as the i32 default.
+  (`wasm-dis`, binaryen 130.)
+* `T | null` is the same: `(x: T | null, y: T | null) => x == y` at `T = i32` is check-clean
+  invalid wasm too.
+* **THIS IS NOT D58.** D58 is a GENERIC FUNCTION passed as a closure ARGUMENT, closed as a
+  loud emit reject. This is a lambda DECLARED INSIDE a generic body, whose signature is
+  interned before the instance's types are known.
+* **PRICE.** The fix is in monomorphization, not in a refusal predicate: the lifted lambda of
+  a generic body has to be instantiated per pin with the substituted parameter types, so its
+  `$fnsig` key and its functype are the instance's. That is the same seam #1994 worked on
+  (`$fnsig` pool dedup on rendered bytes) approached from the producer side, and it needs its
+  own grid over lambda parameter shape × `T` binding × body before anyone touches it.
+  **The cheap intermediate is a REFUSAL**: a lambda parameter whose type mentions the
+  enclosing generic's `T` is a loud emit reject, which turns 2 measured silent shapes loud
+  and matches what the other bodies already do.
 
 ---
 

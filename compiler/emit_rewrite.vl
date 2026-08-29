@@ -28,6 +28,7 @@ import {
   nodeTyExcludesNull,
   nodeTyIsLitUnionAlias,
   nodeTyIsNullable,
+  nodeTyIsObj,
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyName,
@@ -396,15 +397,36 @@ function drwWalk(ix: i32, ctx: i32) {
     }
     if drwDispatchOp(n.binOp) {
       const osi = structIndexOfExpr(n.binLeft, ctx)
-      if osi >= 0 {
-        // A free `self`-function named for the operator wins (host parser
-        // order); else an operator closure FIELD dispatches member-call style.
+      // A free `self`-function named for the operator wins (host parser
+      // order); else an operator closure FIELD dispatches member-call style.
+      //
+      // THE SELF-FN GATE ASKS THE CHECKER AND THE FIELD GATE ASKS THE EMITTER'S STRUCT
+      // TABLE, and until D424 both asked the table. `structIndexOfExpr`'s `Ident` arm knows
+      // a PARAM, a module-declared binding, a GLOBAL and a CAPTURE — and not a plain
+      // function-body LOCAL, whose slot is minted by the emit pass this rewrite runs ahead
+      // of. So `const a: V = { … }` inside a function body did not dispatch: `a < b` fell
+      // into the numeric tail and emitted `i32.lt_s` over two struct refs — `vl check` rc 0,
+      // INVALID WASM — and `a + b` reached its field read as a non-struct, a loud
+      // `field access receiver is not a struct`. The SAME program at module scope, or with
+      // the operands delivered as PARAMETERS or GLOBALS, dispatches and runs, which is why
+      // `tests/cases/objects/operator-self-method.vl` — the tree's ONE operator fixture — is
+      // green: every binding in it is a module global. A single position, and the fixture
+      // sat at the working one.
+      //
+      // The self-fn branch needs only "is the left operand an OBJECT", which is exactly what
+      // the CHECKER asked before resolving the dispatch itself (`opSelfFnTy`, under
+      // `T.tys[lt] is TyObj`), so it asks the same question of the same bank. The FIELD
+      // branch needs the struct table ROW to look the field up in and cannot be widened the
+      // same way. (`silent-class-inventory` D424.)
+      if osi >= 0 || nodeTyIsObj(n.binLeft) {
         if drwSelfFnOf(n.binOp, 2) >= 0 {
           const oargs: i32[] = []
           oargs.push(n.binLeft)
           oargs.push(n.binRight)
           return mkCall(mkIdent(n.binOp, -1), oargs, -1)
         }
+      }
+      if osi >= 0 {
         if drwFieldClosure(osi, n.binOp) {
           const fargs: i32[] = []
           fargs.push(n.binRight)
