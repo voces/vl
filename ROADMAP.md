@@ -652,6 +652,34 @@ in-language GC knobs.
 ## Track A — Type system (`typecheck.vl`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
+- ⬜ **A-OPMOD. A user-defined binary operator dispatches ONLY in a single-file program.**
+  MEASURED 2026-08-29 while closing D491, on master `c6eb736c`. This runs and prints `99`:
+
+      type V = { x: i32 }
+      function "+"(self: V, other: V): i32 { return 99 }
+      function addv(a: V, b: V): i32 { return a + b }
+      const p: V = { x: 1 }   const q: V = { x: 2 }
+      print(addv(p, q))
+
+  Prepend ONE `import { mk } from "./lib"` line — changing nothing else, and never using
+  `mk` in the operator's neighbourhood — and it becomes a LOUD check reject:
+  `operator '+' is not defined for V and V`. Not generic-specific (the plain
+  `function "+"(self: V, other: V)` above is the measured case) and not `self`-dispatch in
+  general (a UFCS `function double(self: V)` called as `p.double()` runs in module mode).
+  So the loss is specific to operator NAMES.
+
+  LIKELY the per-module rename map (`driver.vl`'s `modRenameTo`) mangling the declaration
+  to `+$mN` while a `p + q` SITE has no name to rewrite, leaving `opSelfFnTy`'s `lookup("+")`
+  with nothing — **that attribution is inferred, not instrumented; confirm before
+  scheduling.** The four behaviours above are measured.
+
+  It is LOUD, so it is a capability gap and not a silent class — but it bounds the whole
+  operator-declaration family (D444/D445/D471/D425/D491): today those rules only ever
+  matter in single-file programs. It is also why D491's landing is inert in module mode:
+  `isBinOpFuncName` declines a mangled name, so the imported declaration is neither
+  refused nor dispatched, and the silent cell survives there. Measured as unchanged
+  base -> landing.
+
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
 - 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
   optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call

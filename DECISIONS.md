@@ -10,6 +10,64 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A REACH PROBE ON ONE SITE MEASURES A NUMBER; IT DOES NOT MEASURE A CAUSE — PUT THE
+  SAME PROBE ON THE CALLERS** (2026-08-29, silent-class-inventory D501 / #2012). D411's
+  close probed `letRefListDestSlot`, got `reach=0` on exactly the 28 cells that did not
+  move, and filed a row whose whole content was that partition. The number reproduced
+  EXACTLY on an independent rebuild — and the cause the row inferred from it
+  (*"something upstream claims the literal's element row … `scanArrLitCommit` is the first
+  place to probe"*) was **wrong**. Probing the three CALLERS as well showed all three
+  entered for the binding in all 28 cells, each returning early because the binding already
+  had an ANNOTATION: the arm pin, four passes out, not the row's guess. `reach=0` at a
+  callee is compatible with "nobody asks", "the caller declines" and "the caller's earlier
+  arm answered", and only a probe that spans the call can tell them apart. **Cost of the
+  wider probe: one extra tag per call site in the same build.**
+
+- **A SAFETY PROPERTY IS ONLY AS COMPLETE AS THE THINGS ITS SCAN CAN SEE** (2026-08-29,
+  D501 / #2012). The arm pin's rule is *"every destination must agree"*, and it is right.
+  Its holes are not in the rule: `dstPinMapValue` **skips** a map whose value spelling names
+  no arm instead of pushing the `""` that every other leg pushes, there is no leg for a
+  struct FIELD (measured as a loud floor for an OBJECT literal, which a LIST field is not),
+  and `synthRetPinAnn` has no agreement gate at all and runs after the one that does. So a
+  destination that disagreed was simply never counted. **When a pass's correctness rests on
+  a scan, the audit is over the scan's legs, not over the rule** — and a leg that *gates its
+  push* is a hole, where a leg that *pushes a decline* is not.
+
+- **A REFUSAL THAT NAMES TWO LAYERS HAS NOT NAMED EVERY LAYER** (2026-08-29,
+  silent-class-inventory D491 / #2012). #2007 refuted a declaration-site rule (the same
+  generic operator dispatches at an object receiver) and a call-site rule (an unconstrained
+  `T` is assignable from everything, so the reject spreads to `40 + 2` in another function)
+  and concluded *"no positioned reject is available at either layer today"*. Both
+  refutations hold and the conclusion does not follow: the missing input is the **conjunction
+  of the two ends**, and the checker holds both before `checkProgram` returns. Banking
+  `checkBinary`'s own per-site `if odsp is TyObj` decision by operator NAME, and reading it
+  back once at the end of the pass, refuses a hole-`self` declaration no site dispatched to
+  while at least one took the built-in — positioned at the declaration, at `vl check`.
+  **When two layers are each refuted for lacking half the information, the next question is
+  where the two halves MEET, not whether a third layer has both.**
+
+- **A ROW'S PROPOSED MECHANISM IS THE PART TO RE-MEASURE, EVEN WHEN THE ROW IS RIGHT TO
+  REFUSE** (2026-08-29, D491 / #2012). The row's remaining candidate was the monomorphizer,
+  *"where a `<T>` pinned at `i32` becomes a concrete signature while the struct instantiation
+  still has to dispatch"*. There is no `i32` instantiation: `dispatchRewrite` never rewrites
+  `a + b` into a call, so `monoInstantiate` is not entered and the declaration is replaced by
+  a `() -> void` prune stub — `wasm-dis` shows the empty stub beside the object twin's real
+  `(ref $1),(ref $1) -> i32`. The layer's real discriminator is "instantiated at all", a
+  whole-program fact, not "pinned at i32 versus at V"; and it fires after `vl check` has
+  passed, which is a different silent class. **Two refusals in a row were correct with a
+  false reason attached, and the false reason is what the next person builds against.**
+
+- **NARROW A GATE BY THE POPULATION THAT BLOCKS, AND FILE THE POPULATION** (2026-08-29,
+  D491 / D521 / #2012). D491's first cut keyed on "the `self` type carries a hole", which is
+  true of an UN-annotated `self` too — a parameter with no annotation is a fresh type
+  variable. Measured, that costs 20 `runs` cells (`d425c001`..`d425c039` odd) whose recorded
+  expectation is the BUILT-IN's `10`: the corpus calls them correct programs, so the gate
+  blocks. The 19 cells the row actually names were recorded by its parent with the
+  DECLARATION's answer as their expectation, so they never scored `runs` and cost nothing.
+  **The same transition is a price or a veto depending on which answer the named set wrote
+  down** — which is the strongest argument yet for recording the declaration's answer rather
+  than a quiet `runs`. The wider population is filed as D521 with its 20 cells named.
+
 - **A ROW'S OWN ARITHMETIC IS EVIDENCE, AND IT CONTRADICTED ITS OWN PROSE** (2026-08-28,
   silent-class-inventory-2 D451 / #2007). The row named "the SIX reps whose nullable is a BOX
   rather than a niche", then listed **seven** and computed `6 × 4 × 2 = 48 + 8` for a 56-cell

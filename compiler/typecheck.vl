@@ -1826,6 +1826,35 @@ let opIdxFns: string[] = []
 // operator banks nothing, which is this feature's inertness statement.
 let opIdxSiteNode: i32[] = []
 let opIdxSiteFn: string[] = []
+// ── THE TYPE-PARAMETER `self` OPERATOR, BANKED FROM BOTH ENDS (D491) ─────────────
+//
+// `binOpDeadSelf` refuses a binary operator declaration whose `self` can never be an
+// object (D425) and SUBTRACTS the hole: `function "+"<T>(self: T, other: T)` is silent
+// at an i32 site and DISPATCHES at an object one, so a type variable is whatever the
+// site pins it to and no declaration-site rule can be right for both. That subtraction
+// is correct and it is not the end of the question — the missing input is not in the
+// declaration, it is at the SITES, and the checker visits every one of them before it
+// returns.
+//
+// So: bank the declarations that gate subtracted (`opBinHoleDecl*`), and bank what each
+// `a op b` site DID with the operator (`opBinDispatched` / `opBinDeclined`).
+// `checkProgramEndOpDecls` then answers the whole-program question neither end can:
+// a hole-`self` declaration that NO site dispatched to while at least one site took the
+// language's own is a declaration that never fires, and it is said out loud at the
+// declaration's own line, at `vl check`, where an editor can show it.
+//
+// THE `opBinDeclined` HALF IS WHAT KEEPS `d471_pin_typaram` RUNNING. A declaration with
+// no `a op b` site anywhere is not this class — nothing was silently ignored, there was
+// nothing to ignore — and D471's own boundary set files that spelling as a cell that
+// must keep running. "Never used" is the linter's sentence, not this one's.
+//
+// SPARSE, and both banks are keyed by operator NAME rather than by node: `lookup(op)`
+// is the same name-keyed resolution `opSelfFnTy` makes, so a name is exactly the
+// granularity at which a site and a declaration can be said to be about each other.
+let opBinHoleDeclName: string[] = []
+let opBinHoleDeclNode: i32[] = []
+let opBinDispatched: string[] = []
+let opBinDeclined: string[] = []
 let inferStack: string[] = []
 let inferObserved = -1
 let inferSawErr = false
@@ -2957,6 +2986,10 @@ export function initChecker() {
   opIdxFns = []
   opIdxSiteNode = []
   opIdxSiteFn = []
+  opBinHoleDeclName = []
+  opBinHoleDeclNode = []
+  opBinDispatched = []
+  opBinDeclined = []
   moduleGlobals = Map()
   topUnannotFns = []
   gRootStmts = []
@@ -19818,6 +19851,63 @@ function noteNaturalRet(t: i32) {
   0
 }
 
+// Record what one `a op b` site did with the operator NAME (D491). `dispatched` true
+// means a user declaration fired; false means the language's own lowering took it.
+//
+// GUARDED ON `inferQuiet` for `opIdxBank`'s reason, and it is the same hazard: a quiet
+// inference probe resolves against a hole that may later pin elsewhere, so a probe's
+// answer is not a site's answer. Every real site is checked on the real pass, so the
+// guard costs nothing and a probe cannot invent either half of the verdict.
+function opBinSiteTook(op: string, dispatched: boolean) {
+  if inferQuiet { return 0 }
+  if dispatched {
+    if !listHasStr(opBinDispatched, op) { opBinDispatched.push(op) }
+    return 0
+  }
+  if !listHasStr(opBinDeclined, op) { opBinDeclined.push(op) }
+  0
+}
+
+// THE WHOLE-PROGRAM VERDICT ON A TYPE-PARAMETER `self` (D491), run once, at the end of
+// `checkProgram` — the first point at which every site has been visited.
+//
+// The predicate is exactly the pair of facts neither end holds alone: a banked hole-
+// `self` declaration, NO site that dispatched to its name, and at least one site that
+// took the language's own. Both halves are load-bearing and each has its own witness
+// in `scripts/silent-sweep/d471/`: without the first term `d471_*_typaram_self_*` stay
+// silent, and without the second `d471_pin_typaram` — a declaration with no operator
+// site at all — goes from `runs` to a reject, which is a BOUNDARY cell that must not
+// move.
+//
+// IT IS NOT A DECLARATION-SITE RULE. #2007 refuted one (the same declaration dispatches
+// at an object receiver) and refuted a call-SITE rule too (an unconstrained `T` is
+// assignable from everything, so a site reject also refuses `40 + 2` in another
+// function). This is neither: the reject is positioned at the declaration and licensed
+// by what every site in the program did, so `print(a + b)` beside an object site is
+// untouched — measured, `d471_*_typaram_self_*`'s object twins keep dispatching.
+function checkProgramEndOpDecls() {
+  let i = 0
+  while i < opBinHoleDeclName.length {
+    const nm = opBinHoleDeclName[i]
+    if !listHasStr(opBinDispatched, nm) {
+      if listHasStr(opBinDeclined, nm) {
+        tErr(
+          "operator `" +
+            nm +
+            "` never dispatches: `self` is a TYPE PARAMETER, so whether it fires is " +
+            "decided at each site — and every `" +
+            nm +
+            "` site in this program took the language's own lowering. Annotate `self` " +
+            "with the object type the operator is for, or remove the declaration",
+          opBinHoleDeclNode[i],
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 function listHasStr(xs: string[], v: string) {
   let i = 0
   while i < xs.length {
@@ -22381,9 +22471,13 @@ function checkProgramNode(n: Program) {
       if isBinOpFuncName(s.fnName) {
         if hp.length == 2 {
           let selfNamed = false
+          // Whether `self` carries an ANNOTATION at all (D491) — read inside the `is
+          // Param` narrowing, which is the only place the field exists.
+          let selfAnn = false
           const bp0 = P.nodes[hp[0]]
           if bp0 is Param {
             if bp0.parName == "self" { selfNamed = true }
+            if bp0.parType >= 0 { selfAnn = true }
           }
           if selfNamed {
             if binOpDeadSelf(hpt[0]) {
@@ -22395,6 +22489,28 @@ function checkProgramNode(n: Program) {
                   " is not one",
                 stmts[hi],
               )
+            } else {
+              // THE HOLE THE GATE ABOVE SUBTRACTS (D491) — banked, not judged. Whether
+              // this declaration ever fires is decided at the SITES, so the answer is
+              // `checkProgramEndOpDecls`' and not this pass's.
+              //
+              // THE ANNOTATION IS REQUIRED, AND THE 20 CELLS IT COSTS ARE WHY (D521).
+              // `binOpDeadSelf` subtracts THREE annotations and the un-annotated `self`
+              // is its own subtraction, separate from the hole: `function "+"(self,
+              // other)` types its parameter as a fresh type VARIABLE, so it carries a
+              // hole too and the wider bank claims it. Measured, that costs 20 `runs`
+              // cells (`d425c001`..`d425c039` odd, in `named/` with the built-in's `10`
+              // recorded as their expectation) and it is a different ruling — the
+              // spelling with no annotation at all is filed as D521 with that price,
+              // not smuggled in under this row.
+              if selfAnn {
+                if hpt[0] >= 0 {
+                  if tyHasHole(hpt[0]) {
+                    opBinHoleDeclName.push(s.fnName)
+                    opBinHoleDeclNode.push(stmts[hi])
+                  }
+                }
+              }
             }
           }
         }
@@ -25020,6 +25136,7 @@ export function checkProgram(rootIx: i32) {
     }
     ei = ei + 1
   }
+  checkProgramEndOpDecls()
   T.diags.length
 }
 
@@ -29685,7 +29802,10 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
     const odsp = T.tys[lt]
     if odsp is TyObj {
       const osf = opSelfFnTy(op, lt, rt, n.binRight, ix)
-      if osf >= 0 { return osf }
+      if osf >= 0 {
+        opBinSiteTook(op, true)
+        return osf
+      }
       const ofld = objFieldType(odsp, op)
       if ofld >= 0 {
         const oft = T.tys[ofld]
@@ -29706,6 +29826,13 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
           }
         }
       }
+    } else {
+      // THE SITE'S OWN DECISION, RECORDED (D491). `odsp is TyObj` is the whole of
+      // "could a user operator fire here": a non-object left operand takes the
+      // language's own lowering and no declaration is consulted. That is not a
+      // failure at this site — it is the correct answer — but it is the input the
+      // DECLARATION needs, and nothing else records it.
+      opBinSiteTook(op, false)
     }
   }
   // Ordering comparison: result bool; requires matching numeric types. A
