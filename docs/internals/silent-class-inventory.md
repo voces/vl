@@ -15879,66 +15879,183 @@ Repro (now a loud check reject):
 
 ---
 
-### D591 — a NON-generic array literal joining `boolean` with `i32` is accepted element-wise and then built as the joined union
-**check-clean invalid wasm · found 2026-08-29 by `scripts/silent-sweep/d581/litgrid.py`'s
-`arr2` block, in the DIRECT twin column · unmoved by D581/D582's landing, and reproduces
-identically on the base seed**
+### D591 — [CLOSED 2026-08-29] a NON-generic array literal joining `boolean` with `i32` was accepted element-wise and then built as the joined union
+**closed 2026-08-29 · the filed repro RUNS and prints `1` · was `check-clean invalid wasm` ·
+found 2026-08-29 by `scripts/silent-sweep/d581/litgrid.py`'s `arr2` block, in the DIRECT twin
+column · 74 cells of `scripts/silent-sweep/d591/joingrid.py` block J, kept whole in
+`distilled/named/` · closed in ONE PR with D592, which the ablation shows is a SEPARATE
+landing**
 
-Repro:
+Repro (now `runs`):
 
     const b = true
     const xs: i32[] = [0, b]
     print(xs[1])
-    // vl check rc 0. vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
+    // 1
 
-* **NO GENERIC IS INVOLVED, WHICH IS WHY IT IS ITS OWN ROW.** `checkArrayLitNode` joins the
-  element types to `i32 | boolean`, so `assignable((i32|boolean)[], i32[])` is false — and
-  `assignableExpr`'s ARRAY-LITERAL recursion then accepts the literal element-wise, because
-  each element on its own fits (`0` is an i32; `b` takes the A7 boolean-into-i32 coercion).
-  The literal is accepted with the JOINED element type still recorded on its node, and the
-  emitter builds the union list into an `i32[]` slot.
+* **THE FILED MECHANISM WAS RIGHT ABOUT THE CHECKER AND WRONG ABOUT THE FIX.** The row said
+  the recursion "returns `ok` without re-stamping the literal's node type" and proposed
+  `recordRepTyAdopt` on the accepted path. `recordRepTyAdopt` was ALREADY on that path and
+  already recorded `i32[]`; the sidecar it writes (`nodeRepTyIx`) is simply not what
+  classifies a LIST. `nodeArrayElemName` reads `nodeTyIxOf` — the checker's own column, and
+  its header says so — so the emitter saw the joined `(i32 | boolean)[]`, took its TyUnion
+  arm and claimed the kind-2 BOX list. The rung is one line at the re-stamp two lines below,
+  beside the litunion and niche arms that were already there for the same reason.
 
-* **IT IS WHAT MAKES TWO CELLS OF D581'S GRID DISAGREE IN THE OTHER DIRECTION.**
-  `d581_arr2_i32_bool_*` are generic programs that RUN and print `1` — the right answer —
-  beside a DIRECT twin that is this defect. They are in `named/` as `deliberate`, and the
-  third rung was chosen per-SLOT partly so the generic spelling keeps agreeing with what the
-  direct spelling MEANS rather than with what it currently does.
+* **KEYED ON THE MISMATCH, NOT ON THE DESTINATION.** `arrLitJoinUnionElem` fires only when
+  the literal's own recorded ELEMENT is a `TyUnion` and the destination's is not — the join,
+  and only the join, put a union on a literal whose destination has none. A destination that
+  IS a union is excluded, so the union-arm adoption below it and every `(A | B)[]` annotation
+  keep deciding for themselves. The numeric pair is the measured control and not an
+  assumption: `joinTys(i32, f64)` is `f64`, not a union, so a mixed numeric literal never
+  reaches the predicate and the f32 list-coercion path is provably outside its population.
 
-* **THE FIX IS PROBABLY THE ELEMENT-WISE ACCEPTANCE RECORDING WHAT IT ACCEPTED.** The
-  recursion returns `ok` without re-stamping the literal's node type to the destination array
-  the way the litunion and niche arms do; a `recordRepTyAdopt` on the accepted path is the
-  shape to try. Not attempted here: it is an emitter-rep question on a NON-generic path, and
-  the two rows this PR closes are both about the pin.
+* **THE GENERIC SPELLING IS NOT IN THIS POPULATION, AND THE COUNTER SAYS SO.** Inside a
+  generic body the element join DROPS the hole, so the literal's recorded element is never a
+  union there. `d581_arr2_i32_bool_plain_typar` reads `joinAsk=0` — the predicate is not even
+  asked — beside its DIRECT twin at `joinAsk=1 joinYes=1`. Those two `deliberate` cells of
+  `d581/lists.json` now AGREE with their direct twins, which is this row closing rather than
+  a movement to explain; `distilled/regress.py` reported exactly those two as
+  `check-clean invalid wasm -> runs` and nothing else.
+
+* **EVERY RUNG ABLATED FROM ONE FIXED SEED.** R1 (this row) buys 74 cells, R2 (D592) buys 16,
+  and they are EXACTLY ADDITIVE — 74 + 16 = 90 moved, the pair hitting the sum on the nose,
+  which is the measurement that says the two rows are two landings and not one. `STRIP` — all
+  rungs out — reproduces the base compiler BYTE FOR BYTE (md5 `3c39ab42…`, 1,503,970 bytes)
+  and its source is textually identical to the base's.
+
+* **THE PRICE IS TEN CELLS AND EVERY ONE OF THEM IS D601's COORDINATE.** Each is a `u8[]`
+  binding whose literal's FIRST element is a boolean; each was a module the engine refused
+  and now RUNS printing `true` where the declaration says a byte. It is the same mechanism
+  D601 files with no mixed literal at all (`const c: u8[] = [b]; print(c[0])` prints `true`
+  on the BASE seed), so this landing extends an existing wrongness to programs that
+  previously would not load rather than inventing one — and closing D601 fixes all ten. The
+  other ten `u8` cells this rung buys print CORRECTLY. Measured: `runs LOST = 0`,
+  `-> silent = 0`, `-> WRONG VALUE = 10`, and `joingrid.py --price` re-checks all ten against
+  any seed (rc 2 wrong seed by md5, rc 1 veto, rc 0 held; it FAILS on an empty population,
+  and it FAILS when a price cell becomes CORRECT, so the day D601 closes this ledger is
+  re-derived rather than trusted).
+
+* **CORPUS `cmp`: 1,966 identical, 1 DIFFER, 0 LOST.** The one differing module is
+  `tests/cases/arrays/f32-array-literal-self-classifies.vl`, whose own header names the
+  spelling that moves — `const mi: f32[] = [a, 1]` types `(f32 | i32)[]`, which is precisely
+  this rung's condition. Its 22 asserted lines print IDENTICALLY before and after; what
+  changed is that the list is now classified from the annotation instead of from the join.
 
 ---
 
-### D592 — an UN-ANNOTATED return whose value is read out of a hole-typed local array is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-29 while building D581/D582's control fixture ·
-unmoved by their landing, and reproduces identically on the base seed**
+### D592 — [CLOSED 2026-08-29] an UN-ANNOTATED return whose value is read out of a hole-typed local array was check-clean invalid wasm
+**closed 2026-08-29 · the filed repro RUNS and prints `s` · was `check-clean invalid wasm` ·
+found 2026-08-29 while building D581/D582's control fixture · 16 cells of
+`scripts/silent-sweep/d591/joingrid.py` block R, kept whole in `distilled/named/` · closed in
+ONE PR with D591, which the ablation shows is a SEPARATE landing**
 
-Repro:
+Repro (now `runs`):
 
     function g<T>(self: T) {
       const xs: T[] = [self]
       return xs[0]
     }
     print(g("s"))
-    // vl check rc 0. vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref $type)
+    // s
 
-* **ONE TOKEN SEPARATES IT FROM A PROGRAM THAT RUNS.** Declaring the return —
-  `function g<T>(self: T): T` — makes the identical body run and print `s`. So the defect is
-  in the RETURN INFERENCE off a derived-hole element read (`?elem.T`), not in the local or
-  the literal: the inferred return reaches the emitter as an i32-repped hole while the
-  instance returns a `(ref $type)`.
+* **THE FILED MECHANISM NAMED THE SEAM AND THE FIX IS ONE RUNG BELOW IT.** The row said the
+  defect is in return INFERENCE off a derived-hole element read. It is in the
+  MONOMORPHIZER: `monoMakeInstance` substitutes the type argument into the return only when
+  an ANNOTATION exists (`if fn.fnRet >= 0`), and the un-annotated ladder under it is a
+  hand-written whitelist of return-expression SHAPES — a `Call` through a closure-pinned
+  param, an `Index` whose receiver is a PARAM pinned to `f64[]`, an `Ident` naming a local.
+  `return xs[0]` off a LOCAL matches none of them, `nret` stays -1, and the functype result
+  falls to `retAnnKindChain`'s `"i32"` seed while the body pushes a `(ref $string)`.
+  `criClassify` cannot rescue it and says why in its own comment: a returned local's
+  collected kind does not exist during the global return pass (`buildLocals` runs per
+  function, much later), and the typed-IR is stale because `monoCloneBody` SHARES every leaf
+  expression, so `xs[0]` still carries the pre-mono `T`.
 
-* **IT IS NOT D581's AND NOT D551's.** D581 is the destination seam and this program's
-  destination is correct at every instance (`T[]` fed the hole itself — it is D581's own
-  `okhole` control). D551/D561 are about a DECLARED return, and this row is about the absence
-  of one. `tests/cases/generics/literal-and-builtin-hole-at-pin-keeps.vl` declares the `: T`
-  return on both `okhole` lines FOR THIS REASON, and says so, so the control cannot import
-  this defect and read as a regression of the pin.
+* **ASKED OF THE EXPRESSION, SO THE LADDER STOPS GROWING AN ARM PER SPELLING.** The four
+  shapes the grid found silent are four different node kinds and ONE question: `xs[0]` off a
+  local `T[]`, the same off a `push`-built one, `xs[0][0]`, and `m.get(k) ?? self`.
+  `monoInferRetExprTy` re-checks the body with the parameters pinned and asks the return
+  expression its own type.
+
+* **BINDING THE TYPE PARAMETERS IS WHAT MAKES THE RE-CHECK ANSWER AT ALL, and the first cut
+  did not.** `checkFuncDecl` keeps a generic's type parameters in scope for the whole body
+  bound to an OPAQUE `mkTyVar`, so `const xs: T[]` resolves to a hole and every read off it
+  stays a hole however concretely the VALUE parameters are pinned — the re-check returned ""
+  and the probe read `nret` unchanged. Bound to the instance's concrete rows (the same
+  `bindGenWalk` column the `LetDecl` and RETURN substitutions already take), the annotation
+  resolves to `string[]` and the element read answers `string`.
+
+* **THE OUTPUT IS THE ANNOTATED FORM'S, BYTE FOR BYTE.** `g<T>(self: T) { … }` and
+  `g<T>(self: T): T { … }` now compile to the SAME module (md5 `6e660b37…`), and that module
+  is byte-identical to what the BASE compiler produced for the declared twin. The fix adds no
+  codegen; it makes the un-annotated spelling reach the one that already worked.
+  `tests/cases/generics/literal-and-builtin-hole-at-pin-keeps.vl` declared `: T` on both
+  `okhole` lines FOR THIS ROW and says so — the annotations are dropped here, which turns a
+  workaround into coverage.
+
+* **BOTH PINS, MEASURED.** `g(p)` and `p.g()` each read `ladderAsk=1 ladderSet=1
+  retAsk=1 retYes=1`; the declared twin reads `ladderAsk=0` — the annotated path never
+  reaches the fall-through. `std/str.vl` reads all zeros: the new walk runs over real std
+  code and mints nothing.
+
+* **THE STRUCT ARM WAS REFUSED, AND ONLY THE CORPUS `cmp` COULD SEE WHY.** R3 — the same
+  fall-through for a return whose type is a STRUCT — buys six more cells (`d592_*_obj_*`,
+  which remain the measured residue) and costs FOUR corpus modules that stop building:
+  it mints an annotation naming an inline shape nothing registered, and the emitter answers
+  `emitProgram: ref valtype with no interned shape`
+  (`tests/cases/functions/structural-generic.vl`, `tests/cases/index/generic-trap.vl`,
+  `tests/cases/objects/self-method.vl`, `tests/cases/objects/operator-self-method.vl`). Every
+  grid column stayed flat under it — 22 cells `invalid -> runs`, 0 lost, 0 wrong value — so a
+  corpus module that stops building is a veto term no cell grade could have reported.
+  `joingrid.py --refused <seed>` re-checks all four (rc 1 on the refused candidate, rc 0 on
+  the shipped seed) and the candidate is re-derivable with
+  `scratch-int/d591/mkvariant.py R1R0R2R3`.
+
+* **THE DRY EXTRACTION UNDER IT WAS NOT INERT ON THE FIRST CUT, AND ONLY `cmp` SAW THAT
+  EITHER.** `monoInferListElem` and `monoInferLocalScalar` were two copies of one isolated
+  re-check; the third reader needed it factored. A first cut returned the arena ROW and let
+  each wrapper render it afterwards — with the scope popped and `inferQuiet` restored — and
+  THREE corpus modules stopped building (`inference/unannotated-build-expr.vl`,
+  `generics/nested-generic-call-spine.vl`,
+  `generics/sigkey-pin-infers-callback-result-list.vl`). Every grid column, every histogram
+  and every `runs`/`not-runs` grade stayed flat. Split into `monoRecheckBegin` /
+  `monoRecheckEnd` so each caller's READ happens inside the isolation, it measures
+  1,967 identical · 0 DIFFER · 0 LOST on its own.
+
+---
+
+### D601 — a `u8[]` element read takes its print overload from the initialiser literal, not from the declared byte
+**check-clean silently wrong · found 2026-08-29 by `scripts/silent-sweep/d591/joingrid.py`'s
+twin column while grading D591 · reproduces identically on the base seed, with no mixed
+literal involved · owns the ten cells D591's landing pays for**
+
+Repro:
+
+    const b: boolean = true
+    const c: u8[] = [b]
+    print(c[0])
+    // PRINTS true
+    // `u8` is one byte read back as an i32 in 0..255, so the declaration says `1` —
+    // and the `assign` spelling of the SAME coercion (`let d: u8[] = []; d = [b];
+    // print(d[0])`) does print `1`.
+
+* **THE TWO SPELLINGS DISAGREE, AND THE DECLARATION SAYS WHICH IS WRONG.** A `u8` is one
+  byte read back through `array.get_u` as an i32 in 0..255, so `print` of it must print a
+  number. The `assign` and `ret` spellings do; the `let` and three-element ones print
+  `true`, taking the print overload from the initialiser literal's first element instead of
+  from the annotation. `assignableExpr`'s `u8` arm is not implicated — the STORE is correct
+  either way and the byte in memory is 1.
+
+* **IT IS WHY D591's LANDING HAS A PRICE.** Ten `u8[]` cells whose literal begins with a
+  boolean went from a module the engine refuses to a module that runs and prints `true`; each
+  is this row's coordinate, and closing this row fixes all ten.
+  `joingrid.py --price` FAILS when one of them becomes correct, so the ledger is re-derived
+  the day this closes rather than staying green with a stale exemption; `D601_WRONG` in the
+  same file lists the eight cells that are already wrong on the base and fails the same way.
+
+* **NOT ATTEMPTED HERE.** It is a print-classification question on the READ side, and the two
+  rows this PR closes are both about what the emitter BUILDS.
 
 ---
 

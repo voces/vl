@@ -7925,6 +7925,48 @@ function litElemSrcTy(elemIx: i32, srcTy: i32) {
   nt
 }
 
+// D591 — DID THE ELEMENT JOIN PRODUCE A REP THE DESTINATION DOES NOT HAVE?
+//
+// `checkArrayLitNode` types a literal as the JOIN of its elements, and a join is a UNION
+// wherever the elements do not widen into one another (`[a, b]` over an `i32` and a
+// `boolean` is `(i32 | boolean)[]`; `[a, b]` over an `i32` and an `f64` is `f64[]`, so the
+// numeric pairs never reach here). `assignableExpr`'s array-literal recursion then accepts
+// the literal ELEMENT-WISE against a destination the JOIN is not assignable to, because
+// each element fits that slot on its own — the A7 boolean-into-i32 coercion, the `u8`
+// storage rule, a newtype brand. The BINDING types correctly; the LITERAL NODE keeps the
+// joined type, and `nodeArrayElemName`'s TyUnion arm hands the emitter the kind-2 BOX list
+// for it, so `const xs: i32[] = [0, b]` builds `(ref null $box)[]` into an `i32[]` slot:
+// `vl check` rc 0, `vl run` "type mismatch: expected i32, found (ref $type)".
+//
+// KEYED ON THE MISMATCH, not on the destination. The re-stamp two lines below already fires
+// for a LITERAL-UNION element and for a NICHE-nullable one, both for this same reason — the
+// destination reps differently from the literal's own inference — and both name the
+// destination kind they cover. This arm names the SOURCE instead: the join, and only the
+// join, is what put a union on a literal whose destination has none. A destination that IS
+// a union is excluded, so the union-arm adoption below and every `(A | B)[]` annotation
+// keep deciding for themselves.
+//
+// THE GENERIC SPELLING IS NOT IN THIS POPULATION, and that is measured rather than assumed:
+// inside a generic body the element join DROPS the hole (`joinTys` collapses `boolean` with
+// `T` to `boolean` — the note on `noteLitElemCstrs` is the same fact from the other side),
+// so the literal's recorded element is never a union there and this predicate is false.
+// `d581_arr2_i32_bool_*` is the standing cell for that.
+function arrLitJoinUnionElem(srcExpr: i32, dtix: i32): boolean {
+  if srcExpr < 0 || dtix < 0 { return false }
+  const st = nodeTyIxOf(srcExpr)
+  if st < 0 { return false }
+  const s = T.tys[st]
+  if !(s is TyArray) { return false }
+  if s.aElem < 0 { return false }
+  const se = T.tys[s.aElem]
+  if !(se is TyUnion) { return false }
+  const d = T.tys[dtix]
+  if !(d is TyArray) { return false }
+  if d.aElem < 0 { return false }
+  const de = T.tys[d.aElem]
+  if de is TyUnion { return false }
+  true
+}
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // (A GENERIC function value meeting a CONCRETE function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case — `genericFnAssignable` — so it governs nested positions like an
@@ -8241,7 +8283,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         if (
           ok &&
           !inferQuiet &&
-          (tyIsLitUnion(d.aElem) || tyIsNicheNulScalarElem(d.aElem))
+          (tyIsLitUnion(d.aElem) ||
+            tyIsNicheNulScalarElem(d.aElem) ||
+            arrLitJoinUnionElem(srcExpr, dtix))
         ) {
           if srcExpr < nodeTyIx.length { nodeTyIx[srcExpr] = dtix }
         }
@@ -29615,31 +29659,110 @@ export function monoInferListElem(
   localName: string,
   outTy: i32[],
 ) {
-  if declIx < 0 { return "" }
+  const noTpN: string[] = []
+  const noTpT: i32[] = []
+  const sv: i32[] = []
+  if !monoRecheckBegin(declIx, paramTyIxs, noTpN, noTpT, sv) { return "" }
+  // Read the resolved local: a fully-pinned `T[]` (element no longer a `TyVar`) renders its
+  // list type name; anything else (not a list, or still generic) yields "".
+  let listName = ""
+  const lt = lookup(localName)
+  if lt >= 0 {
+    const ltt = T.tys[lt]
+    if ltt is TyArray {
+      if ltt.aElem >= 0 {
+        const el = T.tys[ltt.aElem]
+        if !(el is TyVar) {
+          listName = tyToStructStr(lt)
+          // HAND THE ARENA ROW OUT beside the render. `lt` IS the list type;
+          // `tyToStructStr` only prints it. Without this the caller runs
+          // `nameToTy` on the print to recover a row — and for a composite
+          // spelling that MINTS A DUPLICATE rather than finding `lt` again.
+          outTy.push(lt)
+        }
+      }
+    }
+  }
+  monoRecheckEnd(sv)
+  listName
+}
+
+// THE PINNED RE-CHECK ITSELF, in ONE home, opened and closed around the caller's READ.
+// `monoInferListElem`, `monoInferLocalScalar` and `monoInferRetExprTy` ask the same question
+// — "what does this body resolve X to when its parameters are bound to THESE concrete
+// types?" — and differ ONLY in which X they read back and how they filter it.
+//
+// SPLIT IN TWO RATHER THAN GIVEN A RESULT SELECTOR, and that shape is not a preference: the
+// read has to happen INSIDE the isolation, with the scope still pushed and `inferQuiet` /
+// `symEnabled` still suppressed. A first cut returned the arena row and let each wrapper
+// render it afterwards; `tyToStructStr` then ran with the scope popped and the flags
+// restored, and three corpus modules stopped building
+// (`inference/unannotated-build-expr.vl`, `generics/nested-generic-call-spine.vl`,
+// `generics/sigkey-pin-infers-callback-result-list.vl` — "type mismatch: expected f64,
+// found i32"). Nothing else moved: every grid column, every histogram and every
+// `runs`/`not-runs` grade stayed flat, and only the corpus `cmp` LOST column saw it.
+//
+// `sv` is the saved state as an ARRAY rather than eighteen out-parameters, because the two
+// halves have to agree on the SET and an index both sides walk in the same order is what
+// makes a forgotten table impossible to write rather than merely unlikely.
+//
+// Returns false when `declIx` is not a checkable `FuncDecl` — nothing was pushed, so the
+// caller must NOT call `monoRecheckEnd`.
+function monoRecheckBegin(
+  declIx: i32,
+  paramTyIxs: i32[],
+  tpNames: string[],
+  tpTys: i32[],
+  sv: i32[],
+): boolean {
+  if declIx < 0 { return false }
   const dn = P.nodes[declIx]
-  if !(dn is FuncDecl) { return "" }
+  if !(dn is FuncDecl) { return false }
   const body = P.nodes[dn.fnBody]
-  if !(body is Block) { return "" }
+  if !(body is Block) { return false }
   // Snapshot the suppression flags and every append-only inference/diagnostic table.
-  const sQuiet = inferQuiet
-  const sSym = symEnabled
-  const sDiag = T.diags.length
-  const sHoleN = holeShapeNames.length
-  const sHoleT = holeShapeTys.length
-  const sHoleArr = holeArrayDemand.length
-  const sHoleMap = holeMapNames.length
-  const sHoleAlt = holeAltNames.length
-  const sBinC = binCstrOp.length
-  const sPrnC = printCstrTy.length
-  const sILet = inferLetIx.length
-  const sINulS = inferLetNulStrIx.length
-  const sINulB = inferLetNulBoolIx.length
-  const sIRet = inferRetFn.length
-  const sStack = inferStack.length
-  const sTent = inferTentative.length
-  const sRedun = redunName.length
+  // THE ORDER IS THE CONTRACT `monoRecheckEnd` reads back; keep the two in step.
+  let q = 0
+  if inferQuiet { q = 1 }
+  sv.push(q)
+  sv.push(symEnabled)
+  sv.push(T.diags.length)
+  sv.push(holeShapeNames.length)
+  sv.push(holeShapeTys.length)
+  sv.push(holeArrayDemand.length)
+  sv.push(holeMapNames.length)
+  sv.push(holeAltNames.length)
+  sv.push(binCstrOp.length)
+  sv.push(printCstrTy.length)
+  sv.push(inferLetIx.length)
+  sv.push(inferLetNulStrIx.length)
+  sv.push(inferLetNulBoolIx.length)
+  sv.push(inferRetFn.length)
+  sv.push(inferStack.length)
+  sv.push(inferTentative.length)
+  sv.push(redunName.length)
+  sv.push(tpEnvNames.length)
   inferQuiet = true
   symEnabled = 0
+  // BIND THE TYPE PARAMETERS TOO, not only the value ones, and that is what separates this
+  // re-check from a re-check that answers `T`. `checkFuncDecl` keeps a generic's type
+  // parameters in scope for the whole body bound to an OPAQUE `mkTyVar`, so a body
+  // annotation that names one — `const xs: T[] = [self]` — resolves to a hole and every
+  // read off it stays a hole no matter how concretely the VALUE parameters are pinned.
+  // Bound to the instance's concrete row instead (the same `bindGenWalk` column the
+  // `LetDecl` and RETURN substitutions take), the annotation resolves to `string[]` and the
+  // element read answers `string`. An EMPTY column changes nothing, which is what keeps the
+  // two callers that pass one byte-identical.
+  let tpb = 0
+  while tpb < tpNames.length {
+    if tpb < tpTys.length {
+      if tpTys[tpb] >= 0 {
+        tpEnvNames.push(tpNames[tpb])
+        tpEnvTys.push(tpTys[tpb])
+      }
+    }
+    tpb = tpb + 1
+  }
   // Bind the parameters concretely in a fresh scope, then check the body STATEMENTS in
   // that scope directly (not `checkNode(dn.fnBody)`, whose Block arm would push+pop its own
   // scope and drop the local before we can read it). The list element hole resolves through
@@ -29664,65 +29787,56 @@ export function monoInferListElem(
     checkNode(stmts[s])
     s = s + 1
   }
-  // Read the resolved local: a fully-pinned `T[]` (element no longer a `TyVar`) renders its
-  // list type name; anything else (not a list, or still generic) yields "".
-  let listName = ""
-  const lt = lookup(localName)
-  if lt >= 0 {
-    const ltt = T.tys[lt]
-    if ltt is TyArray {
-      if ltt.aElem >= 0 {
-        const el = T.tys[ltt.aElem]
-        if !(el is TyVar) {
-          listName = tyToStructStr(lt)
-          // HAND THE ARENA ROW OUT beside the render. `lt` IS the list type;
-          // `tyToStructStr` only prints it. Without this the caller runs
-          // `nameToTy` on the print to recover a row — and for a composite
-          // spelling that MINTS A DUPLICATE rather than finding `lt` again.
-          outTy.push(lt)
-        }
-      }
-    }
-  }
+  true
+}
+
+// The closing half: pop the scope and the type-parameter bindings, truncate every
+// append-only table back to `sv`'s saved length, then restore the flags and the diagnostic
+// stream — so the global checker state the emitter still reads is byte-identical afterwards.
+// Mirrors `inferReturnsPrePass`'s discipline.
+function monoRecheckEnd(sv: i32[]) {
   popScope()
-  // Restore: truncate every table back, then the flags + diagnostic stream.
-  while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
-  while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
-  while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
-  while holeMapNames.length > sHoleMap {
+  while tpEnvNames.length > sv[17] {
+    tpEnvNames.pop()
+    tpEnvTys.pop()
+  }
+  while holeShapeNames.length > sv[3] { holeShapeNames.pop() }
+  while holeShapeTys.length > sv[4] { holeShapeTys.pop() }
+  while holeArrayDemand.length > sv[5] { holeArrayDemand.pop() }
+  while holeMapNames.length > sv[6] {
     holeMapNames.pop()
     holeMapTys.pop()
   }
-  while holeAltNames.length > sHoleAlt {
+  while holeAltNames.length > sv[7] {
     holeAltNames.pop()
     holeAltTys.pop()
     holeAltPreN.pop()
     holeAltTailN.pop()
     holeAltHoleIx.pop()
   }
-  while binCstrOp.length > sBinC {
+  while binCstrOp.length > sv[8] {
     binCstrOp.pop()
     binCstrLt.pop()
     binCstrRt.pop()
     binCstrFn.pop()
   }
-  while printCstrTy.length > sPrnC {
+  while printCstrTy.length > sv[9] {
     printCstrTy.pop()
     printCstrIx.pop()
     printCstrFn.pop()
   }
-  while inferLetIx.length > sILet { inferLetIx.pop() }
-  while inferLetTy.length > sILet { inferLetTy.pop() }
-  while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
-  while inferLetNulBoolIx.length > sINulB { inferLetNulBoolIx.pop() }
-  rollbackInferRet(sIRet)
-  while inferStack.length > sStack { inferStack.pop() }
-  while inferTentative.length > sTent { inferTentative.pop() }
-  redunTruncate(sRedun)
-  while T.diags.length > sDiag { T.diags.pop() }
-  symEnabled = sSym
-  inferQuiet = sQuiet
-  listName
+  while inferLetIx.length > sv[10] { inferLetIx.pop() }
+  while inferLetTy.length > sv[10] { inferLetTy.pop() }
+  while inferLetNulStrIx.length > sv[11] { inferLetNulStrIx.pop() }
+  while inferLetNulBoolIx.length > sv[12] { inferLetNulBoolIx.pop() }
+  rollbackInferRet(sv[13])
+  while inferStack.length > sv[14] { inferStack.pop() }
+  while inferTentative.length > sv[15] { inferTentative.pop() }
+  redunTruncate(sv[16])
+  while T.diags.length > sv[2] { T.diags.pop() }
+  symEnabled = sv[1]
+  inferQuiet = sv[0] == 1
+  0
 }
 
 // The SCALAR sibling of `monoInferListElem`: re-check the body of `declIx` with its params
@@ -29735,58 +29849,17 @@ export function monoInferListElem(
 // locals are collected and the checker's typed-IR is stale for a hole-derived node, so without
 // this the instance's functype result defaults to i32 and clashes with the string/f64 ref the
 // body returns. i32 / boolean (both i32 valtype) and any still-generic local yield "" so the
-// existing inferred-return path is left byte-identical. The save/restore mirrors
-// `monoInferListElem` exactly (every append-only inference/diagnostic table is truncated back).
+// existing inferred-return path is left byte-identical.
 export function monoInferLocalScalar(
   declIx: i32,
   paramTyIxs: i32[],
   localName: string,
   outTy: i32[],
 ) {
-  if declIx < 0 { return "" }
-  const dn = P.nodes[declIx]
-  if !(dn is FuncDecl) { return "" }
-  const body = P.nodes[dn.fnBody]
-  if !(body is Block) { return "" }
-  const sQuiet = inferQuiet
-  const sSym = symEnabled
-  const sDiag = T.diags.length
-  const sHoleN = holeShapeNames.length
-  const sHoleT = holeShapeTys.length
-  const sHoleArr = holeArrayDemand.length
-  const sHoleMap = holeMapNames.length
-  const sHoleAlt = holeAltNames.length
-  const sBinC = binCstrOp.length
-  const sPrnC = printCstrTy.length
-  const sILet = inferLetIx.length
-  const sINulS = inferLetNulStrIx.length
-  const sINulB = inferLetNulBoolIx.length
-  const sIRet = inferRetFn.length
-  const sStack = inferStack.length
-  const sTent = inferTentative.length
-  const sRedun = redunName.length
-  inferQuiet = true
-  symEnabled = 0
-  pushScope(dn.fnBody)
-  const params = dn.fnParams
-  let pi = 0
-  while pi < params.length {
-    const p = P.nodes[params[pi]]
-    if p is Param {
-      let pty = TY_ERR
-      if pi < paramTyIxs.length {
-        if paramTyIxs[pi] >= 0 { pty = paramTyIxs[pi] }
-      }
-      declare(p.parName, pty)
-    }
-    pi = pi + 1
-  }
-  const stmts = body.blkStmts
-  let s = 0
-  while s < stmts.length {
-    checkNode(stmts[s])
-    s = s + 1
-  }
+  const noTpN: string[] = []
+  const noTpT: i32[] = []
+  const sv: i32[] = []
+  if !monoRecheckBegin(declIx, paramTyIxs, noTpN, noTpT, sv) { return "" }
   // Read the resolved local: a concrete NON-i32 scalar prim renders its name; anything else
   // (i32 / boolean / non-scalar / still-generic) yields "" → the inferred-return path is left
   // untouched.
@@ -29796,7 +29869,7 @@ export function monoInferLocalScalar(
     const ltt = T.tys[lt]
     if ltt is TyPrim {
       const pn = ltt.primName
-      if pn == "string" || pn == "f64" || pn == "i64" || pn == "f32" {
+      if monoRetScalarKind(pn) {
         scalarName = pn
         // HAND THE ARENA ROW OUT alongside the name. `lt` IS the resolved type; the
         // name is only its `primName`. Without this the caller has to run
@@ -29806,46 +29879,75 @@ export function monoInferLocalScalar(
       }
     }
   }
-  popScope()
-  while holeShapeNames.length > sHoleN { holeShapeNames.pop() }
-  while holeShapeTys.length > sHoleT { holeShapeTys.pop() }
-  while holeArrayDemand.length > sHoleArr { holeArrayDemand.pop() }
-  while holeMapNames.length > sHoleMap {
-    holeMapNames.pop()
-    holeMapTys.pop()
-  }
-  while holeAltNames.length > sHoleAlt {
-    holeAltNames.pop()
-    holeAltTys.pop()
-    holeAltPreN.pop()
-    holeAltTailN.pop()
-    holeAltHoleIx.pop()
-  }
-  while binCstrOp.length > sBinC {
-    binCstrOp.pop()
-    binCstrLt.pop()
-    binCstrRt.pop()
-    binCstrFn.pop()
-  }
-  while printCstrTy.length > sPrnC {
-    printCstrTy.pop()
-    printCstrIx.pop()
-    printCstrFn.pop()
-  }
-  while inferLetIx.length > sILet { inferLetIx.pop() }
-  while inferLetTy.length > sILet { inferLetTy.pop() }
-  while inferLetNulStrIx.length > sINulS { inferLetNulStrIx.pop() }
-  while inferLetNulBoolIx.length > sINulB { inferLetNulBoolIx.pop() }
-  rollbackInferRet(sIRet)
-  while inferStack.length > sStack { inferStack.pop() }
-  while inferTentative.length > sTent { inferTentative.pop() }
-  redunTruncate(sRedun)
-  while T.diags.length > sDiag { T.diags.pop() }
-  symEnabled = sSym
-  inferQuiet = sQuiet
+  monoRecheckEnd(sv)
   scalarName
 }
 
+// THE PRIM NAMES AN UN-ANNOTATED RETURN CANNOT RIDE THE i32 DEFAULT FOR, in one place
+// because two callers ask it. `i32`, `boolean` and `u8` ARE the i32 valtype the un-annotated
+// functype already defaults to (`retAnnKindChain`'s seed), so naming them here would mint an
+// annotation that changes nothing but the emitted bytes.
+function monoRetScalarKind(pn: string): boolean {
+  pn == "string" || pn == "f64" || pn == "i64" || pn == "f32"
+}
+
+// D592 — THE UN-ANNOTATED RETURN'S OWN TYPE, asked of the EXPRESSION rather than guessed
+// from its shape.
+//
+// `monoMakeInstance` substitutes the type argument into the return only when an ANNOTATION
+// exists; with none, it walks a hand-written whitelist of return-expression SHAPES. That
+// whitelist has an `Index` arm that fires only for a PARAM pinned to `f64[]`, and an `Ident`
+// arm that covers a LOCAL through the two siblings above. Everything else keeps `nret = -1`,
+// the functype result falls to `retAnnKindChain`'s `"i32"` seed, and a body that returns a
+// `(ref $string)` is emitted under `(result i32)`: `vl check` rc 0, `vl run` "type mismatch:
+// expected i32, found (ref $type)". `const xs: T[] = [self]; return xs[0]` at `g("s")` is the
+// filed witness, and ONE TOKEN — declaring `: T` — makes the identical body run.
+//
+// ASKED OF THE EXPRESSION, so the ladder stops growing an arm per spelling. The four shapes
+// the grid found silent (`xs[0]` off a local, off a `push`-built local, `xs[0][0]`, and
+// `m.get(k) ?? self`) are four different node kinds and ONE question, and the next spelling
+// nobody has written down is the same question again. `criClassify`'s own comment says why it
+// cannot answer it there: a returned local's collected kind does not exist during the global
+// return pass (`buildLocals` runs per function, much later), and the typed-IR is stale
+// because `monoCloneBody` SHARES every leaf expression, so `xs[0]` still carries the pre-mono
+// `T`.
+//
+// RE-ASKED, NOT READ BACK. `inferQuiet` is on for the statement walk, so nothing was
+// recorded on `nodeTyIx` — and the node's own pre-mono record is exactly the staleness this
+// exists to route around.
+//
+// FILTERED TO THE REPS THE i32 DEFAULT GETS WRONG. `i32` / `boolean` / `u8` return "" — they
+// ARE the default, so minting an annotation for them would change the emitted bytes without
+// changing the program. A still-generic or error type returns "" too: this runs per INSTANCE
+// with the params and type parameters pinned, so a hole surviving here means the re-check
+// could not decide, and the previous behaviour is the honest answer.
+export function monoInferRetExprTy(
+  declIx: i32,
+  paramTyIxs: i32[],
+  tpNames: string[],
+  tpTys: i32[],
+  retIx: i32,
+  outTy: i32[],
+) {
+  if retIx < 0 { return "" }
+  const sv: i32[] = []
+  if !monoRecheckBegin(declIx, paramTyIxs, tpNames, tpTys, sv) { return "" }
+  let retName = ""
+  const rt = checkNode(retIx)
+  if rt >= 0 {
+    if rt != TY_VOID && rt != TY_ERR && !tyHasHole(rt) {
+      const rtt = T.tys[rt]
+      if rtt is TyPrim {
+        if monoRetScalarKind(rtt.primName) {
+          retName = rtt.primName
+          outTy.push(rt)
+        }
+      }
+    }
+  }
+  monoRecheckEnd(sv)
+  retName
+}
 // Whether the LetDecl at `letIx` was recorded as an inferred `string | null` niche
 // if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
 // consults this so the slot classifies as kind 16 and reuses the annotated lowering.
