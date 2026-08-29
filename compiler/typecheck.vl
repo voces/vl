@@ -6852,8 +6852,8 @@ function binCstrsHold(bNames: string[], bTys: i32[], calleeFn: i32) {
     if cstrOwnedBy(binCstrFn[ci], calleeFn) {
       const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
       const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
-      if !tyIsHole(clt) {
-        if !tyIsHole(crt) {
+      if !tyHasHole(clt) {
+        if !tyHasHole(crt) {
           if !binOpDefinedFor(binCstrOp[ci], clt, crt) { return false }
         }
       }
@@ -14553,6 +14553,16 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
     const ie = e.aElem
     if ie < 0 { return "reflist" }
     const i2 = T.tys[ie]
+    // A HOLE ONE HOP DOWN IS UNANSWERED, NOT REFUSED — and this arm answered "none" while the
+    // element arm one level up answers "" for the same `TyVar`. Two levels of the same ladder
+    // disagreeing about the same hole is a FALSE REJECT: `i32[][] == i32[][]` runs written out
+    // and `function eqT<T>(a: T[][], b: T[][]) { return a == b }` at `T = i32` reported
+    // ``==` over T[][] has no lowering` — a refusal naming a type VARIABLE to a caller who
+    // wrote neither. "" defers to the pin, which is where the substituted type lives.
+    // (`silent-class-inventory` D422; the deferral only became safe once D421's `tyHasHole`
+    // made the pin record a constraint for a `T`-under-a-constructor operand at all.)
+    if i2 is TyVar { return "" }
+    if i2 is TyErr { return "" }
     if i2 is TyPrim {
       if i2.primName == "i32" { return "reflist" }
       if i2.primName == "boolean" { return "reflist" }
@@ -16130,6 +16140,69 @@ function tyIsHole(tyIx: i32) {
   false
 }
 
+// ── "IS a hole" vs "CONTAINS a hole", and the deferred-constraint machinery needs the
+//    SECOND ─────────────────────────────────────────────────────────────────────────────
+//
+// `tyIsHole` answers about the type ITSELF, and every gate in the deferred binary-op pin asked
+// it: `noteBinCstr` recorded a constraint only when an operand's type WAS a `TyVar`. So
+// `function eqT<T>(a: T, b: T) { return a == b }` deferred and `function eqL<T>(a: T[], b: T[])
+// { return a == b }` did not — the second operand type is a `TyArray` OVER a hole, which is not
+// a hole. Nothing was recorded, the call site had nothing to re-ask, and every gate inside the
+// body answered OPAQUE about the instance for the same reason D35's did: `eqCmpKindOfArrayElem`
+// of a `TyVar` element is "" and `eqCmpKindOfNulInner` of a `TyVar` inner is "".
+//
+// The consequence is D35's and D44's, one constructor up and at both operators:
+// `eqL(circleList, circleList)` is `vl check` rc 0 over a module the engine rejects, while
+// `circleList == circleList` written out is a loud check reject in the same sentence.
+// (`silent-class-inventory` D421.)
+//
+// DEPTH-BOUNDED RATHER THAN CYCLE-TRACKED, and the bound's direction is the safe one: a
+// recursive named type returns FALSE at the floor, which is today's behaviour (record nothing,
+// defer nothing) rather than a new refusal. `substTyDeep` — the function that has to do the
+// real work on these types — carries its own seen-stack and is the one that must be exact.
+function tyHasHole(tyIx: i32) { tyHasHoleAt(tyIx, 0) }
+
+function tyHasHoleAt(tyIx: i32, depth: i32) {
+  if tyIx < 0 { return false }
+  if depth > 8 { return false }
+  const t = T.tys[tyIx]
+  if t is TyVar { return true }
+  if t is TyArray { return tyHasHoleAt(t.aElem, depth + 1) }
+  if t is TyNullable { return tyHasHoleAt(t.nInner, depth + 1) }
+  if t is TyMap {
+    if tyHasHoleAt(t.mKey, depth + 1) { return true }
+    return tyHasHoleAt(t.mVal, depth + 1)
+  }
+  if t is TyObj {
+    const ofts = t.objFieldTypes
+    let i = 0
+    while i < ofts.length {
+      if tyHasHoleAt(ofts[i], depth + 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    const pts = t.fnParamTypes
+    let k = 0
+    while k < pts.length {
+      if tyHasHoleAt(pts[k], depth + 1) { return true }
+      k = k + 1
+    }
+    return tyHasHoleAt(t.fnRet, depth + 1)
+  }
+  if t is TyUnion {
+    const ums = t.uMembers
+    let u = 0
+    while u < ums.length {
+      if tyHasHoleAt(ums[u], depth + 1) { return true }
+      u = u + 1
+    }
+    return false
+  }
+  false
+}
+
 // The body whose constraints are being recorded — the innermost TOP-LEVEL declaration on the
 // checking stack, or -1 at module scope.
 function cstrOwnerTop() {
@@ -16173,7 +16246,7 @@ function cstrOwnedBy(owner: i32, calleeFn: i32) {
 // OWNING declaration: the constraint speaks about THAT body's type parameters, and a `T` in some
 // other generic is a different `T` even though `substTyDeep` matches on the name.
 function noteBinCstr(lt: i32, op: string, rt: i32) {
-  if tyIsHole(lt) || tyIsHole(rt) {
+  if tyHasHole(lt) || tyHasHole(rt) {
     const owner = cstrOwnerTop()
     let k = 0
     while k < binCstrOp.length {
@@ -16199,7 +16272,7 @@ function noteBinCstr(lt: i32, op: string, rt: i32) {
 function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   const lt = softenLitTy(lt0)
   const rt = softenLitTy(rt0)
-  if tyIsHole(lt) || tyIsHole(rt) { return true }
+  if tyHasHole(lt) || tyHasHole(rt) { return true }
   if op == "==" || op == "!=" {
     // MUTUAL COMPATIBILITY, the same criterion `checkBinary` applies to two annotated
     // operands: VL has no cross-type equality, and the emitter has no lowering for one
@@ -16712,13 +16785,13 @@ function validateBinCstrs(
       // transfer is withheld.
       if calleeFn >= 0 {
         if clt != binCstrLt[ci] || crt != binCstrRt[ci] {
-          if tyIsHole(clt) || tyIsHole(crt) {
+          if tyHasHole(clt) || tyHasHole(crt) {
             noteBinCstr(clt, binCstrOp[ci], crt)
           }
         }
       }
-      if !tyIsHole(clt) {
-        if !tyIsHole(crt) {
+      if !tyHasHole(clt) {
+        if !tyHasHole(crt) {
           // THE EQUALITY REFUSAL RIDES THE PIN, in the direct spelling's own words. The
           // generic sentence below names the operator and the two types; for `==` the reader
           // needs the REASON, which is the same one they would have got had they written the
@@ -25377,8 +25450,9 @@ export function nodeTyIsNulString(ix: i32) {
   }
   false
 }
-// STRUCTURAL: node `ix`'s recorded type IS A TYPE VARIABLE — an annotated generic parameter
-// (`needle: T`) or the derived hole an un-annotated parameter gets.
+// STRUCTURAL: node `ix`'s recorded type CARRIES A TYPE VARIABLE — it IS one (an annotated
+// generic parameter `needle: T`, or the derived hole an un-annotated parameter gets), or one
+// sits under a constructor (`T[]`, `T | null`, `{ v: T }`).
 //
 // WHY THE EMITTER ASKS THIS. `eqCmpKindOfTy` answers "" for a `TyVar` and for five other
 // reasons (a literal, a value-union box, the error hole, …), and the five mean "this rep does
@@ -25388,12 +25462,17 @@ export function nodeTyIsNulString(ix: i32) {
 // banked type is still `T` and the answer is correct about the type VARIABLE and useless about
 // the instance — D35's sentence, one layer down. This predicate is what lets a consumer tell
 // the two apart and ask its own `fnIx`-scoped channel instead. (`silent-class-inventory` D42.)
-export function nodeTyIsTyVar(ix: i32) {
+//
+// IT READS "CONTAINS", AND IT USED TO READ "IS". D42's gate was exact for a `needle: T` operand
+// and blind to `a: T | null`, which is banked as `T | null` inside the instance for exactly the
+// same reason and is just as unanswered: `eqCmpKindOfNulInner` reads a `TyVar` inner, answers
+// "", the gate declined to consult the second channel, and the compare fell into the i32 tail —
+// `i32.eq` over two `(ref null $0)`, `vl check` rc 0, where the direct spelling picks the
+// `nulstruct` niche and runs. One constructor, one word. (`silent-class-inventory` D421.)
+export function nodeTyHasTyVar(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyVar { return true }
-  false
+  tyHasHole(ty)
 }
 // STRUCTURAL: node `ix`'s type is `boolean | null` (the i32 sentinel-2 niche) — a
 // `TyNullable` whose inner is the `boolean` prim. Lets `exprNulBool` recover the niche
