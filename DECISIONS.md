@@ -10,6 +10,53 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **THE GATE'S CRITERION AND THE SHIPPING CRITERION ARE ONE CRITERION, and letting them drift
+  cost this repo a large net win for a day** (2026-08-28, silent-class-inventory-2 D11 /
+  #1993 → #2003). `scripts/silent-sweep/distilled/regress.py` blocks on `runs → not-runs` and
+  on nothing else, for a reason it states: *a program that did not work before and does not
+  work now has not regressed in the sense a gate should stop the world for*. The shipping bar
+  drifted stricter than that without anyone deciding it should, and #1993 refused a candidate
+  that bought **72 cells `loud check reject` → `runs`** and lost **zero** running programs,
+  because it also moved 48 cells loud→silent. Re-measured and landed at #2003 the same
+  candidate buys 86 and 40 and still loses zero. **The rule now written down: refuse on a
+  `runs` cell lost, on a new COMPILER trap, or on a corpus module that stops building.
+  Loud→silent is a PRICE to measure and to keep whole in `distilled/named/` — that is what
+  `named/` is for — never a veto.** The asymmetry is not a preference, it is what the two
+  outcomes cost a user: a loud reject that becomes a silent one costs a person who was
+  already blocked a worse diagnostic, while a working program that stops working costs a
+  person who was not blocked at all.
+
+- **A CONSTANT-INDEX ELEMENT IS A PLACE, and the retirement side is what makes that true —
+  keying one without it is a check-clean run-time trap** (2026-08-28,
+  silent-class-inventory-2 D11/D341). `writeRetiresNarrowing`'s header used to record the old
+  symmetry as a proof: *"An unkeyable target (`xs[i] = …`) names no place and retires nothing
+  — and no narrowing can key one either, so both sides stay consistent."* That is true and it
+  is not free: the moment `placeKeyOf` keys `xs[0]`, three writes stop retiring anything (a
+  VARIABLE-index write keys `""`, a ROOT rebind matches only `tgtKey + "."`, and an aliasing
+  call has no index sub-path in its write-effect summary) and each becomes a program that
+  type-checks and dies `wasm trap: null reference` — a column the census records as ZERO
+  across 250,238 cells. So the key arm and the three retirement arms are ONE landing, and
+  #1993 was right to refuse the key on its own; what it got wrong was pricing the traps as
+  unavoidable rather than building the three rungs, each of which is a few lines.
+  **The general form, which is the part worth keeping**: a comment that says two sides stay
+  consistent *because* one of them cannot answer is a dependency, not an invariant. Teaching
+  the silent side to answer is what breaks it, and the grep for the next instance is the word
+  "either" in a header.
+
+- **An index cell's aliasing-call retirement is deliberately UNREFINED, and the bluntness is a
+  measured position rather than an omission** (2026-08-28, silent-class-inventory-2 D452).
+  Everywhere else `callInvalidatesReal` refines by write effect — a callee that only READS
+  keeps every narrowing, which is what makes the rule usable rather than merely sound. It
+  cannot refine an index cell, because `fnWriteEffects`' summaries are `,`-terminated FIELD
+  sub-paths and `placeSubPath` answers `""` for `ys[0] = …`: a callee that nulls the cell and
+  a callee that touches nothing record the identical summary, so consulting it would fail
+  OPEN on exactly the construct the rule exists for. Matching `ak + "["` and returning true is
+  the same choice the `key == ak` leg beside it already makes about a write to the argument
+  place itself. The refinement — a distinguished `[]` component in the summary vocabulary that
+  `pathHitsAny` can never match against a field path — is filed as D452 and is a refinement,
+  not a repair; the cost of not having it is bounded and local (`const t = xs[0]` before the
+  call).
+
 - **A binding's CELL and its initializer's BUILD are ONE landing, so a destination-driven
   element rep has to reach both rungs or it is a new invalid module** (2026-08-28,
   silent-class-inventory D381). An un-annotated `const lv1 = [{ r: 7 }]` types its list from

@@ -3439,11 +3439,19 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
 // ── scope chain ──────────────────────────────────────────────────────────────
 
 // ── flow narrowing (condition collectors) ────────────────────────────────────
-// The canonical narrowing key for a "place" — a bare name (`x`) or a property
-// path rooted at one (`o.v`, `o.v.w`) — or "" for anything else (a call, an
-// index, a literal: not a stable place to narrow). Mirrors the host's
+// The canonical narrowing key for a "place" — a bare name (`x`), a property
+// path rooted at one (`o.v`, `o.v.w`), or a CONSTANT-INDEX element of either
+// (`xs[0]`, `o.xs[1].v`) — or "" for anything else (a call, a variable index, a
+// literal: not a stable place to narrow). Mirrors the host's
 // `placeKey`; `x?.y` keys the same place as `x.y`, so a guard written with
 // `?.` refines the regular `x.y` reads in the branch body.
+//
+// A CONSTANT INDEX IS A PLACE (inventory-2 D11). `xs[0]` names one storage cell for as
+// long as nothing writes `xs` or that cell, which is the identical condition the property
+// path already relies on — and the retirement side is what makes both true, not the key.
+// Only an integer LITERAL subscript keys: `xs[i]` names a cell only the runtime knows, so
+// it stays unkeyable, and the write side (`retireNarrowingsForWrite`) reads that "" as
+// "may hit any element" rather than as "hits nothing".
 //
 // PARENTHESES ARE NOT PART OF A PLACE (silent-class-inventory D352). `(t).v` is the same
 // storage as `t.v` and must key the same, exactly as `x?.y` keys as `x.y` one line above.
@@ -3472,6 +3480,47 @@ function placeKeyOf(ix: i32) {
     if base == "" { return "" }
     return base + "." + n.omProp
   }
+  if n is Index {
+    const base = placeKeyOf(n.idxArr)
+    if base == "" { return "" }
+    const lit = intLitTextOf(n.idxIndex)
+    if lit == "" { return "" }
+    return base + "[" + lit + "]"
+  }
+  ""
+}
+
+// The DIGITS of an integer-literal subscript, or `""` when the node is not one. The
+// spelling is the key, so `xs[0]` and `xs[00]` are different keys — over-conservative
+// in the harmless direction (two keys for one cell narrows less, never more), and no
+// program spells the same constant two ways in one guard.
+function intLitTextOf(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Paren { return intLitTextOf(n.parInner) }
+  if n is NumLit {
+    const t = n.numText
+    if t.length < 1 { return "" }
+    let i = 0
+    while i < t.length {
+      if t[i] < '0' || t[i] > '9' { return "" }
+      i = i + 1
+    }
+    return t
+  }
+  ""
+}
+
+// The narrowing key of the RECEIVER an index place is taken from — `"xs"` for `xs[i]`,
+// `"o.xs"` for `o.xs[i]` — or `""` when the node is not an index or the receiver is not
+// itself a place. Answers for a VARIABLE subscript too, which is the whole point: the
+// write side needs to know which array a `xs[i] = …` may have hit even though it cannot
+// say which cell.
+function indexRootKeyOf(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Paren { return indexRootKeyOf(n.parInner) }
+  if n is Index { return placeKeyOf(n.idxArr) }
   ""
 }
 
@@ -3523,8 +3572,15 @@ function keyHasPrefix(s: string, pfx: string) {
 // The sub-path of the place at `ix` below root name `root` — `o.v` under `o` is
 // `"v"`, `o.a.v` under `o` is `"a.v"`. `""` when the place is not rooted at `root`,
 // is `root` itself (rebinding the parameter is not a field write), or is not a
-// keyable place at all (an index target keys nothing, and no narrowing key can name
-// one either, so the two sides stay consistent).
+// keyable place at all.
+//
+// A CELL BELOW A FIELD IS A SUB-PATH (`o.xs[0]` under `o` is `"xs[0]"`) and rides the
+// existing `,`-terminated vocabulary untouched: `pathHitsAny` compares whole components
+// and `.`-prefixes, and a bracket never splits a component, so writing `xs[0]` kills
+// `xs[0].v` and leaves `xs` and `xs[1]` alone. A cell of the ROOT ITSELF (`p[0] = …`
+// where `p` IS the parameter) still answers `""` — the prefix leg tests `root + "."` —
+// and `callInvalidatesReal` handles that case bluntly rather than through a summary;
+// see the note there and inventory-2 D452.
 function placeSubPath(ix: i32, root: string) {
   const k = placeKeyOf(ix)
   if k == "" || k == root { return "" }
@@ -3978,11 +4034,14 @@ function callFreeEffects(callIx: i32) {
   ""
 }
 
-// The ROOT name of a place key (`"o.a.v"` → `"o"`).
+// The ROOT name of a place key (`"o.a.v"` → `"o"`, `"xs[0].v"` → `"xs"`). BOTH
+// separators, because the one caller asks whether the root is BOUND in the callee — and a
+// key whose root split answered `"xs[0]"` matches no binding, so a nested function's own
+// `xs` would not shadow the free one.
 function placeRootOf(key: string) {
   let i = 0
   while i < key.length {
-    if key[i] == '.' {
+    if key[i] == '.' || key[i] == '[' {
       const head = key.slice(0, i)
       return head
     }
@@ -4037,6 +4096,16 @@ function callInvalidatesReal(cn: Call, key: string) {
     const ak = placeKeyOf(args[i])
     if ak != "" {
       if key == ak { return true }
+      // AN INDEX CELL OF AN ARGUMENT DIES TO ANY CALL THAT RECEIVES THE ARRAY, with no
+      // effect refinement — the deliberately blunt half of this rule. The summaries are
+      // `,`-terminated FIELD sub-paths and an index write records nothing in one
+      // (`placeSubPath` answers "" for `ys[0] = …`), so consulting them here would read
+      // "writes nothing" for the exact callee that nulls the cell — which is how
+      // `d341_sound_alias_call` was check-clean and trapped. Teaching the summaries an
+      // index vocabulary is a real refinement and a separate one (inventory-2 D452); until
+      // then this matches the `key == ak` leg directly above, which already refuses to
+      // refine a write to the argument place itself.
+      if keyHasPrefix(key, ak + "[") { return true }
       const pfx = ak + "."
       if keyHasPrefix(key, pfx) {
         if ALIAS_RULE_BROAD { return true }
@@ -4128,7 +4197,7 @@ function writeBarredByLoop(ix: i32) {
     if narDeclaredTy(n.identName, NAR_KIND_GUARD) < 0 { return false }
     return !narInsideBarrier(lookupDepth(n.identName))
   }
-  if n is Member {
+  if n is Member || n is Index {
     const key = placeKeyOf(ix)
     if key == "" { return false }
     const slot = narrowedPathIx(key)
@@ -4211,6 +4280,22 @@ function writeStorageTy(ix: i32) {
     const noTys: i32[] = []
     return placeFieldTy(placeCurTy(n.memObj, noNames, noTys), n.memProp, false)
   }
+  // AN INDEX CELL IS STORAGE TOO, and this arm is not optional once a cell can be
+  // narrowed: `if xs[0] != null { xs[0] = null }` RUNS on master because no narrowing
+  // covers the target, and without this it would newly reject `cannot assign null to
+  // i32[]` — a working program lost to a rule whose whole point is that it never shrinks
+  // what storage holds. Same three guards as the member arm, same reasons.
+  if n is Index {
+    const key = placeKeyOf(ix)
+    if key == "" { return -1 }
+    const slot = narrowedPathIx(key)
+    if slot < 0 { return -1 }
+    if npEpochs[slot] != narFnEpoch { return -1 }
+    if !npInsideBarrier(slot) { return -1 }
+    const noNames: string[] = []
+    const noTys: i32[] = []
+    return placeElemTy(placeCurTy(n.idxArr, noNames, noTys))
+  }
   -1
 }
 
@@ -4222,9 +4307,15 @@ function writeStorageTy(ix: i32) {
 // Three ordered legs:
 //   * PLACE. The write must name the narrowed place or a PREFIX of it. `o.v = …`
 //     retires `o.v` and also `o.v.w` (the sub-object is a different object now),
-//     while `o.w = …` retires neither. An unkeyable target (`xs[i] = …`) names no
-//     place and retires nothing — and no narrowing can key one either, so both sides
-//     stay consistent.
+//     while `o.w = …` retires neither. A CONSTANT-index target is a place like any
+//     other (`xs[0] = …` retires `xs[0]` and `xs[0].v`); an UNKEYABLE one (`xs[i] = …`)
+//     keys "" here and is handled one level up, in `retireNarrowingsForWrite`, where
+//     the receiver is still in hand — it retires EVERY cell of the array it may have
+//     hit. Reading "" as "retires nothing" is what made the candidate for inventory-2
+//     D11 unsound before this rung: see `d341_sound_varidx_write`.
+//   * THE PREFIX LEG SPEAKS BOTH SEPARATORS. `xs = [null]` replaces the whole array, so
+//     it retires `xs[0]` for the same reason `o = null` retires `o.v`; matching only
+//     `tgtKey + "."` missed every index child (`d341_sound_root_write`).
 //   * VALUE, for an EXACT place match: a write the narrowing still admits keeps it.
 //     `if q != null { q = 5   use(q) }` must keep reading `q` as non-null, and
 //     `assignable` is the same relation every other reader of a narrowed type uses.
@@ -4241,7 +4332,8 @@ function writeRetiresNarrowing(
 ) {
   if tgtKey == "" { return false }
   if key == tgtKey { return !assignable(rt, npTy) }
-  keyHasPrefix(key, tgtKey + ".")
+  if keyHasPrefix(key, tgtKey + ".") { return true }
+  keyHasPrefix(key, tgtKey + "[")
 }
 
 // Retire every narrowing the accepted write at `atIx` falsifies, IN PLACE — never by
@@ -4256,7 +4348,23 @@ function writeRetiresNarrowing(
 // GUARD PUSHED. Both then retire for good when that scope pops.
 function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
   const tgtKey = placeKeyOf(tgtIx)
-  if tgtKey == "" { return 0 }
+  // A VARIABLE-INDEX WRITE NAMES NO CELL AND THEREFORE MAY HAVE HIT ANY OF THEM.
+  // `xs[i] = null` keys "" and the loop below would retire nothing at all — which was
+  // consistent while no narrowing could name a cell either, and is a soundness hole the
+  // moment one can (`d341_sound_varidx_write`: check-clean, `wasm trap: null reference`).
+  // Retire every live narrowing under the receiver, and the receiver's own cell keys
+  // (`xs[0].v` as well as `xs[0]`) go with it via the same prefix.
+  if tgtKey == "" {
+    const root = indexRootKeyOf(tgtIx)
+    if root == "" { return 0 }
+    const pfx = root + "["
+    let r = 0
+    while r < npKeys.length {
+      if keyHasPrefix(npKeys[r], pfx) { npInvBy[r] = atIx }
+      r = r + 1
+    }
+    return 0
+  }
   let i = 0
   while i < npKeys.length {
     // THE WRITE'S ATTRIBUTION WINS OVER A CALL'S, and the overwrite is what makes the
@@ -4615,6 +4723,26 @@ function placeCurTy(ix: i32, names: string[], tys: i32[]) {
   }
   if n is OptMember {
     return placeFieldTy(placeCurTy(n.omObj, names, tys), n.omProp, true)
+  }
+  if n is Index { return placeElemTy(placeCurTy(n.idxArr, names, tys)) }
+  -1
+}
+
+// The type of an ELEMENT read off `baseTy` for narrowing purposes (no diagnostics) —
+// `placeFieldTy`'s index twin. -1 when unresolvable, which is how "no fact" is spelled.
+//
+// ARRAYS ONLY, and the omission is chosen. A MAP read is already `V | null` whatever the
+// key, so keying `m[0]` would narrow a nullability the storage never dropped, and the
+// emitter would have to learn a map-cell channel to lower the narrowed read — a different
+// landing on a different rep (inventory-2 D451). A `u8[]`/`string` element is an i32 with
+// no nullable to peel, so answering the element type for those buys nothing and would put
+// the widened-read rule (`checkIndexNode`'s `u8` arm) in a second place.
+function placeElemTy(baseTy: i32) {
+  if baseTy < 0 { return -1 }
+  const bt = T.tys[baseTy]
+  if bt is TyArray {
+    if primNameOf(bt.aElem) == "u8" { return -1 }
+    return bt.aElem
   }
   -1
 }
@@ -5517,12 +5645,23 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
   0
 }
 
-// Whether a narrowing key is a property PATH (`o.v`) rather than a bare name.
+// Whether a narrowing key is a PATH (`o.v`, `xs[0]`, `o.xs[1].v`) rather than a bare
+// name — which is what decides overlay entry vs scope shadow in `applyNarrows`.
+//
+// `[` COUNTS, AND THAT RUNG IS THE WHOLE OF INVENTORY-2 D11's DIFFERENCE between "no
+// effect" and 112 cells moving. With only `.` tested, a fact keyed `xs[0]` was collected
+// and then installed by `applyNarrows` as a bare-name scope SHADOW under the name
+// `"xs[0]"` — a binding no reader ever looks up, because every reader of an index place
+// asks the `npKeys` overlay. The first three rungs measured as zero for exactly that
+// reason, which is why they are one landing and not four.
 function isPathKey(s: string) {
   let i = 0
   while i < s.length {
     if s[i] == 46 {
       return true // '.'
+    }
+    if s[i] == 91 {
+      return true // '['
     }
     i = i + 1
   }
@@ -31138,6 +31277,24 @@ function checkIndexNode(n: Index, ix: i32) {
   const idxTy = checkNode(n.idxIndex)
   // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
   if arrTy < 0 { return TY_ERR }
+  // A flow-narrowed CONSTANT-INDEX place (`if xs[0] != null { … }`) overrides the
+  // element type within the branch — the same overlay `checkMemberNode` reads, one
+  // node kind over (inventory-2 D11).
+  //
+  // ASKED AFTER THE RECEIVER AND THE SUBSCRIPT ARE CHECKED, not before them as the
+  // member arm asks it. A member's receiver is the only sub-expression there is, so
+  // skipping it costs nothing; an index has a SUBSCRIPT whose own type the emitter
+  // reads back off the node, and a narrowed `xs[0]` that never checked its `0` hands
+  // the emitter an unbanked node.
+  const xKey = placeKeyOf(ix)
+  if xKey != "" {
+    const xOv = narrowedPathTy(xKey)
+    if xOv >= 0 { return xOv }
+    const xInv = narrowedPathInvBy(xKey)
+    if xInv >= 0 && !pathRetiredByAssign(xInv) {
+      return pathInvalidatedErr(xKey, xInv, ix)
+    }
+  }
   const at = T.tys[arrTy]
   // A MAP index `m[k]`: the key must match the map's key type; a READ yields the
   // NULLABLE value (`V | null` — the key may be absent; default with `??`), and an
