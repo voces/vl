@@ -11,7 +11,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 ## Types & semantics
 
 - **A PIN THAT RE-ASKS A BODY'S QUESTION MUST BE HANDED THE SUBSTITUTED TYPE, NOT ONLY THE
-  SUBSTITUTED PAIR** (2026-08-29, silent-class-inventory D581 / #PR). D551's rule was "call
+  SUBSTITUTED PAIR** (2026-08-29, silent-class-inventory D581 / #2020). D551's rule was "call
   the function the body called"; this is its other half. `validateLetCstrs` handed
   `assignableExpr` a correctly substituted `(i32[], string[])` and got TRUE, because that
   function's array-literal recursion re-derives each element's type from the element NODE
@@ -24,7 +24,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **A MUTUAL-ASSIGNABILITY JOIN SILENTLY DELETES A HOLE, SO A GATE THAT ASKS "DOES THIS TYPE
   CARRY A HOLE" CAN BE ASKING ABOUT A TYPE THE HOLE WAS ALREADY REMOVED FROM** (2026-08-29,
-  silent-class-inventory D581 / #PR). `checkArrayLitNode` joins its element types with
+  silent-class-inventory D581 / #2020). `checkArrayLitNode` joins its element types with
   `joinTys`; a hole is permissively assignable BOTH ways, so `[true, self]` collapses to
   `boolean` and the hole is gone before `noteLetCstr` ever sees it. `joinRetTys` carries this
   exact note for the return accumulator ("a HOLE must not collapse HERE") and nobody had
@@ -39,7 +39,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **A DEFERRED-CONSTRAINT TABLE IS DEFINED BY WHAT ITS PIN CAN ASK, NOT BY WHAT IT RECORDS —
   WHICH IS WHY THE BUILTIN ARGUMENTS COULD NOT JOIN `argCstr`** (2026-08-29,
-  silent-class-inventory D582 / #PR). `argCstr` looks like the right home for "an argument
+  silent-class-inventory D582 / #2020). `argCstr` looks like the right home for "an argument
   the body could not judge", and it is not: it is owned by a callee it can NAME (a builtin
   has no `FuncDecl`), and its pin asks plain `assignable` with no argument NODE in hand.
   Three of the fourteen builtin arms ask `assignableExpr`, so that pin would refuse
@@ -51,7 +51,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   wrong in both directions at once.**
 
 - **THE ONE INSTRUMENT THAT CAN SEE A COMPILER TRAP IS THE ONE THAT BUILDS REAL MODULES**
-  (2026-08-29, silent-class-inventory D582 / #PR). The slot walk's destination peel read
+  (2026-08-29, silent-class-inventory D582 / #2020). The slot walk's destination peel read
   `T.tys[dtix]` before testing the index; `let x = null` binds `mkNullableTy(-1)`, whose inner
   is not yet a type and which `tyHasHole` answers FALSE for, so one peel reaches `-1` and the
   second read traps. 33 corpus modules died. **Every grid column stayed flat** — the grid's
