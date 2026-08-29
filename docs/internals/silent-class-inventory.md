@@ -13237,105 +13237,99 @@ run and must not move with them.
 
 ---
 
-### D402 — a declared INTERSECTION makes the STRUCTURAL spelling of its own shape a loud emit reject at an ARRAY ELEMENT
-**loud emit reject (`emitProgram: only i32[] arrays and struct/union element arrays are supported`) on `777f7848`, on master `f9275d20` and on this branch · found 2026-08-28 while separating D362's residue from D362 itself · SETTLED 2026-08-28: CORRECTLY LOUD, and it is a PINNED gate rather than an unexamined defect — `tests/cases/structs/struct-alias-union-inline-elem-array-floor.vl` is the `@emit-error` fixture that exists to keep it. The filed mechanism was inverted; two SILENT SIBLINGS behind it are now D441 and D442; the lift candidate is priced below and REFUSED.**
+### D402 — [CLOSED 2026-08-28] a declared INTERSECTION makes the STRUCTURAL spelling of its own shape a loud emit reject at an ARRAY ELEMENT
+**CLOSED 2026-08-28 (#2004) — the filed repro RUNS and prints the right value. Was: an emit-stage refusal (`emitProgram: only i32[] arrays and struct/union element arrays are supported`) on `777f7848`, on `f9275d20`, on `1252cf04` and on `1a43607c` · #2001 settled the mechanism, priced the lift and banked it as the named set `d402-intersection-elem-gate` without landing it · the `@emit-error` fixture that pinned the refusal is RETIRED with its evidence, and ONE landing closes this row together with D441, D442 and D443**
 
 Repro:
 
     type AB = {a:i32} & {b:i32}
     const c: {a:i32, b:i32}[] = [{a:1,b:2}]
     print(c[0].a)
-    // vl check rc 0 (one HINT); vl run:
-    //   emitProgram: only i32[] arrays and struct/union element arrays are supported
+    // vl check rc 0 (one HINT); vl run prints 1
 
-* **THE FILED FOUR-CELL TABLE REPRODUCES VERBATIM** on master `f9275d20`, all four cells.
-  Deleting the `type AB` line runs; declaring it as a plain struct runs; using the
-  intersection as well as declaring it does not change the reject.
+* **#2001's CORRECTED MECHANISM RE-VERIFIED, AND IT IS THE ONE THE FIX ACTS ON.** There is
+  ONE struct row for the layout. `nameIsRefArray`'s `structIndexByName(base)` misses because
+  the row is named `AB`; `shapeElemDeclaredStructIdx`'s bridge FINDS it and its trailing
+  `nameIsStructDecl(sNames[si])` gate closed, because a canonicalized object intersection is
+  a one-variant `UnionDecl` interned by `internShapeAs(s.udName, …)`, not a `TypeDecl`. All
+  four filed cells and every control reproduce verbatim on `1252cf04` and again on the base
+  this landed on, `1a43607c`: deleting `type AB` runs, declaring it plain runs, a plain-struct
+  twin RESCUES it, a different-layout intersection is inert, and a three-arm intersection and
+  a named-arm intersection both reject.
 
-* **THE ROW HAD NOT NAMED ITS OWN PIN, AND THAT IS THE CORRECTION THAT MATTERS.** The reject
-  is not an oversight anybody is free to lift: `tests/cases/structs/struct-alias-union-inline-elem-array-floor.vl`
-  is a `@emit-error` fixture whose header records that a destringify slice already opened this
-  gate once (`sRowDecl` banks `cUserTypes.has(nm)`, which holds UNION declarations, where
-  `nameIsStructDecl` requires a `TypeDecl` node) and that the dual-run licensing that swap read
-  1,029 agree / 0 disagree while being *blind*, because no corpus file paired a struct-alias
-  union with an inline spelling of its own shape. Read as filed the row invited a re-lift; the
-  pin is the first thing a closer has to grade.
+* **THE PIN IS RETIRED, AND #2001's REASON FOR SAYING ITS HARM DID NOT REPRODUCE WAS
+  ITSELF WRONG.** `tests/cases/structs/struct-alias-union-inline-elem-array-floor.vl` was an
+  `@emit-error` fixture holding the gate closed, on the ground that admitting an inline
+  spelling that resolves only to an anonymous / interned-shape row would route a shape-armed
+  union (`t is {f: boolean}[]` over an inferred closure-call binding) into the union-arm
+  narrow machinery. #2001 recorded that cell as "`emit_reject` on both sides, because with no
+  declared twin the gate never fires". **Re-measured, it is an emit reject on neither side:
+  it RUNS, printing the right value, on base and on the lift.** The conclusion survives, the
+  stated reason does not, and the replacement is evidence rather than a sentence:
 
-* **THE MECHANISM IS THE OPPOSITE OF THE ONE FILED.** The row said "the emitter's element
-  tables then hold two rows for one layout". There is **ONE** row for the layout — the dedup
-  is the ingredient, not the symptom — and the reject fires because that one row's NAME fails
-  a declared-STRUCT gate. A `tErr`-channel probe folding the resolution into `checkArrName`'s
-  own message reads, for every rejecting cell:
+  | instrument | result |
+  |---|---|
+  | poison probe at the gate, where the row resolves and is NOT a `TypeDecl` | **4 of 2,391** corpus modules (**3 of the 2,386 that predate this PR**) — `closures/closure-result-array-of-map-closure-field-structs.vl` (`#anon0`), `closures/closure-result-value-union-field-nested-composite.vl` (`#anon2`), the pin, and this PR's own D402 fixture |
+  | those two anonymous-row modules, built both ways | **byte-IDENTICAL** — the reach is live and the answer does not move |
+  | 10-cell grid of the protected population (shape-armed union narrowed from an inferred call, from an annotated one, at a param / global / return, both arms taken, plus the same-fieldset NESTED twin) | **0 moved · 0 runs LOST · 0 → SILENT**, correct on both sides |
 
-      PROBE checkArrName name={a:i32,b:i32}[] base={a:i32,b:i32} row=AB via=bridge NOTDECL
-      PROBE checkArrName name={a:i32,b:i32,c:i32}[] base={a:i32,b:i32,c:i32} row=ABC via=bridge NOTDECL
-      PROBE checkArrName name={a:i32,b:string}[] base={a:i32,b:string} row=AB via=bridge NOTDECL
+  The fixture keeps its path and its program and is now `@run` / `@log 3`; its header carries
+  the measurement. What the original note got RIGHT is kept: `sRowDecl` (which banks
+  `cUserTypes.has(nm)`, unions included) is still the wrong column for "is this a declared
+  STRUCT". The gate did not go away by being swapped for that column — it went away because
+  the question turned out not to be one this caller needs to ask.
 
-  `nameIsRefArray`'s `structIndexByName(base)` misses because the row is named `AB`;
-  `shapeElemDeclaredStructIdx`'s bridge FINDS it (`via=bridge` — the arena rung `repRowOfName`
-  declines every time, so it decides nothing here) and its trailing
-  `nameIsStructDecl(sNames[si])` gate closes, because a canonicalized object intersection is a
-  one-variant `UnionDecl` interned as a struct row by `internShapeAs(s.udName, …)`, not a
-  `TypeDecl`. Five of the nine probed cells never reach the reject at all (`reach=0`).
+* **THE LANDING IS THREE RUNGS AND THIS ROW NEEDS EXACTLY ONE OF THEM.** Ablated over all
+  eight subsets, each seed a self-compilation fixed point, the empty subset reproducing base
+  `1a43607c` byte-for-byte (`638d4fa4f2f26853e3fce5977f2d9d94`, 1,477,933 bytes) and the full
+  subset reproducing the SHIPPED seed byte-for-byte. The last column is the permuted-arm cell
+  D442 prices, which is the only place the third rung is visible at all:
 
-* **THE INGREDIENT IS NARROWER THAN FILED: the intersection's MERGED LAYOUT must equal the
-  structural spelling.** `type XY = {x:i32} & {y:i32}` beside `{a:i32,b:i32}[]` RUNS — an
-  intersection of a different shape is inert. `type ABC = {a:i32} & {b:i32} & {c:i32}` beside
-  `{a:i32,b:i32,c:i32}[]` REJECTS, so arity is not the axis. `type P = {a:i32}` +
-  `type AB = P & {b:i32}` rejects too, so a named arm is not the axis. And a same-layout PLAIN
-  struct twin **RESCUES** it: `type AB = {a:i32} & {b:i32}` + `type CD = {a: i32, b: i32}` +
-  the structural array RUNS, because the bridge then lands on a `TypeDecl` row.
+  | rungs | md5 | bytes | D402 | D441 | D442 | D443 | permuted arm |
+  |---|---|---|---|---|---|---|---|
+  | — | `638d4fa4f2` | 1,477,933 | reject | invalid | invalid | reject | invalid |
+  | R1 | `d26fdd50c6` | 1,477,882 | **runs** | invalid | invalid | reject | invalid |
+  | R2 | `0cfb9bfeb9` | 1,477,933 | reject | **runs** | **runs** | **runs** | **SILENT `2 1`** |
+  | R3 | `b7483c4cf9` | 1,478,633 | reject | invalid | invalid | reject | invalid |
+  | R1+R2 | `74ac6c2fb5` | 1,477,882 | **runs** | **runs** | **runs** | **runs** | **SILENT `2 1`** |
+  | R1+R3 | `45fbcdf4e0` | 1,478,582 | **runs** | invalid | invalid | reject | invalid |
+  | R2+R3 | `175d525117` | 1,478,633 | reject | **runs** | **runs** | **runs** | runs `1 2` |
+  | R1+R2+R3 | `228ea9f800` | 1,478,582 | **runs** | **runs** | **runs** | **runs** | runs `1 2` |
 
-* **THE POSITION IS NARROWER THAN FILED TOO.** Over 16 positions × 5 declarations (80 cells),
-  the reject reaches `const` / `let` / a param / a return / a local / `[][]` / `.length` /
-  `.push`, and does NOT reach two: a struct FIELD of the inline shape's list
-  (`type W = { xs: {a:i32, b:i32}[] }`) and an un-annotated `const c = [{a:1,b:2}]`. Both run
-  and both print the RIGHT values, including under a REVERSED intersection
-  (`type BA = {b:i32} & {a:i32}`) and with mixed field types (`{a:i32} & {b:string}`).
+  **R1** is this row: the `nameIsStructDecl` gate comes off `shapeElemDeclaredStructIdx`.
+  **R2** is D441/D442/D443: `internShapeAs` records the SHAPE's arena type at the row mint
+  instead of the ALIAS name's, so `slotCanonId` stops banking -1 and `buildStructTwins` can
+  see the row. **R3** closes no row and moves no graded population — read as an effect table
+  it is deletable, and read as a soundness table it is mandatory. See D442.
 
-* **NO SILENT CELL IN THE FILED NEIGHBOURHOOD, TWO ONE STEP OUT.** 28 cells crossing the
-  admitted field position with reversed arm order, reversed field order, write-then-read,
-  cross-function flow and mixed field types produce **0 silent wrong values** — every cell
-  either runs with the right answer or is loudly rejected. The two silent siblings need a
-  SECOND declaration or a SECOND spelling in the same program and are filed as **D441** (two
-  intersection aliases of one layout, both as ref lists) and **D442** (an alias ref list
-  assigned into a structurally-spelled field list). Neither is moved by the candidate below.
+* **FOUR INSTRUMENTS ON THE LANDING.** Corpus `cmp` **2,391 modules · 1,948 identical · 0
+  DIFFER · 0 LOST**; distilled corpus **0 runs lost · 0 → silent**, with `a000426` (270
+  cells), `b021090` (129 cells) and three named cells moving loud/invalid → runs; the
+  151-cell D402 neighbourhood grid **54 moved · 54 → runs with the RIGHT answer · 0 runs
+  LOST · 0 → SILENT**; and `wasm-tools print` on D441/D442 before and after (`wasm-dis`
+  cannot parse the BEFORE modules — they are invalid — and parses both AFTER ones).
+  Reach is proved separately from agreement: the R2 site fires on **15 of 2,391** corpus
+  modules — **10 of the 2,386 that predate this PR** — and the recorded index DIFFERS on
+  **15 of 15**, so the corpus's 0 DIFFER is agreement at the site and blindness only to the
+  consequence: no corpus file has two same-layout rows one of which is a struct-alias union.
 
-* **THE REFUSED CANDIDATE, PRICED.** Lifting the `nameIsStructDecl` gate in
-  `shapeElemDeclaredStructIdx` (seed `943a21fe…`, 1,473,279 bytes vs base `742635755f…`,
-  1,473,330, both re-taken after the rebase onto `f9275d20`):
+* **THE SHARED ROOT REACHES FIVE GATES AND THIS LANDING CLOSES TWO OF THEM. THE FILED CLAIM
+  THAT "A FIX AT THE ROOT CLOSES ALL FIVE AT ONCE" IS FALSE**, re-measured over the nine-gate
+  probe against the plain-struct twin on the shipped seed:
 
-  | instrument | base | candidate |
+  | gate | before | after |
   |---|---|---|
-  | corpus `cmp` (2,378 modules) | — | **1,945 identical · 0 DIFFER · 0 LOST** |
-  | distilled corpus | — | **0 runs lost · 0 → silent · +399 census cells** loud emit reject → runs (classes `a000426` 270 cells, `b021090` 129 cells, plus this PR's own `d402_reject_const_arr`) |
-  | 103-cell cell-matched grid | 2 silent | **21 moved · 21 → runs (all with the RIGHT answer) · 0 runs LOST · 0 → SILENT** · 2 silent, unchanged |
-  | nine-gate ladder | green | **6 of 9 green**; `deno task test` 2526 passed / **1 failed** — the PIN itself; `ci-native` the same file; `filed witnesses` reports D402 MOVED |
+  | field read, `AB` param, `AB[]` ref list, bare annotation | runs | runs |
+  | **`{a:i32,b:i32}` param** (D443) | loud emit reject | **runs** |
+  | **`{a:i32,b:i32}[]` element** (this row) | loud emit reject | **runs** |
+  | `if t is AB` narrow | loud emit reject | loud emit reject |
+  | `function "+"(self: AB, …)` | loud check reject | loud check reject |
+  | `function "+"(self: {a:i32,b:i32}, …)` over `AB` operands | loud check reject | loud check reject |
 
-  **The pin's stated harm did not reproduce on any population reachable without a full
-  census.** The fixture header names "a shape-armed union (`t is {f: boolean}[]` over an
-  inferred closure-call binding)"; that cell is `emit_reject` on base AND on the candidate,
-  because with no declared twin `shapeElemDeclaredStructIdx` finds no row at all and the gate
-  never fires. The gate only bites when a row EXISTS whose name is not a `TypeDecl` — which,
-  on everything measured here, is exactly the intersection alias.
-
-  **NOT LANDED, and the reason is the layer, not the number.** This is an emitter accept-set
-  widening over a gate with a fixture and a header; it owes its own rep-fuzz, its own mono
-  grid and a re-derived census, not a rider on a row-settling PR. What is banked instead is
-  the measurement plus the six-cell named set `d402-intersection-elem-gate`
-  (`distilled/named/d402_*.vl`), so the next attempt starts from it rather than re-deriving
-  it — and so the gate carries the boundary (the bite, the plain-twin rescue, the
-  other-layout inert cell, the admitted field position) and both silent siblings.
-
-* **SHARED ROOT WITH D425 AND D443.** `type X = A & B` is a one-variant `UnionDecl`, and
-  every "is this an object / a declared struct" gate in the tree answers NO for it. Measured
-  at nine gates against the plain-struct twin, five diverge: this row's array element, a
-  structurally-spelled struct PARAM (D443), an `is AB` narrow, an operator declaration
-  `self: AB` (D425's bullet), and an operator declared over the structural spelling with
-  `AB` operands. Four agree: a field read, an aliased param, an `AB[]` ref list, a bare
-  struct. **The order is decided by that**: a D425-style declaration-site reject phrased
-  "`self` must be an object type" would freeze a factually false sentence into the compiler
-  for `self: AB`, so this root has to be right first.
+  The three that stay are the `is`-narrow arm rep and the two operator-declaration gates, and
+  they are what D425 is still waiting on. D425's ordering argument survives unchanged: a
+  declaration-site reject phrased "`self` must be an object type" is still a factually false
+  sentence for `self: AB`.
 
 ---
 
@@ -13910,8 +13904,8 @@ read back by value — including the `(T) => T` parameter the wide predicate ate
 
 ---
 
-### D441 — TWO intersection aliases of ONE layout, both as ref LISTS, are check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-28 by D402's neighbourhood grid, one step out of that row's own family · pre-existing and IDENTICAL on master `f9275d20` and on this branch · NOT moved by D402's refused lift candidate · kept whole at `distilled/named/d402_silent_two_inters.vl`**
+### D441 — [CLOSED 2026-08-28] TWO intersection aliases of ONE layout, both as ref LISTS, are check-clean invalid wasm
+**CLOSED 2026-08-28 (#2004) — the filed repro RUNS and prints 1 then 4. Was: check-clean invalid wasm on `f9275d20`, `1252cf04` and `1a43607c` · found 2026-08-28 by D402's neighbourhood grid, one step out of that row's own family · kept whole at `distilled/named/d402_silent_two_inters.vl`, and pinned at `tests/cases/types/intersection-alias-twin-ref-lists.vl`**
 
 Repro:
 
@@ -13921,18 +13915,10 @@ Repro:
     const q: CD[] = [{a:3,b:4}]
     print(p[0].a)
     print(q[0].b)
-    // vl check rc 0 (two HINTs); vl run:
-    //   Invalid input WebAssembly code at offset 329:
-    //   type mismatch: expected (ref null $type), found (ref $type)
+    // vl check rc 0 (two HINTs); vl run prints 1 then 4
 
-* **BOTH INGREDIENTS ARE NECESSARY AND EACH IS ONE TOKEN.** `int + plain`, `plain + int` and
-  `plain + plain` all RUN with the right answers, so BOTH names must be intersections. Either
-  list alone runs (`AB[]` + a bare `CD`, or a bare `AB` + `CD[]`), so BOTH must be ref lists.
-  Two intersections of DIFFERENT layouts run. A third same-layout intersection reproduces it,
-  so it is not an arity effect.
-
-* **THE MECHANISM IS OFF THE DISASSEMBLY** (`wasm-tools print`, the module the emitter does
-  write):
+* **THE FILED MECHANISM REPRODUCES OFF THE DISASSEMBLY, VERBATIM** (`wasm-tools print` on the
+  module the base emitter writes — `wasm-dis` cannot parse it, which is the point):
 
       (rec
         (type (;0;) (struct (field (mut i32)) (field (mut i32))))
@@ -13944,28 +13930,41 @@ Repro:
         ref.as_non_null
         struct.get 1 1
 
-  The STRUCT table mints one row per intersection alias NAME — `type 0` for `AB`, `type 1`
-  for `CD`, identical layouts and, in wasm GC, distinct heap types. The REF-LIST table dedups
-  on LAYOUT and mints only `type 2`, whose element is `(ref null 0)`. So `q[0]` reads a
-  `(ref 0)` out of the shared backing and `.b` applies `struct.get 1 1` to it. Two tables,
-  two different keys, one program.
+  The struct table minted one row per alias NAME; the ref-list table dedups on LAYOUT and
+  minted one array type over `(ref null 0)`. Both globals are built with `struct.new 0`, so
+  every VALUE in the program is a `type 0` — only the READ side believed otherwise. The
+  plain-struct twin of the same program emits ONE struct type and one array type and always
+  ran, which is what made this a defect rather than a limit.
 
-* **NOT D402, AND THE OTHER DIRECTION FROM IT.** D402 is a loud reject that fires because ONE
-  row serves two spellings; this is a silent miscompile that fires because TWO rows serve one
-  layout while their element table holds one. Lifting D402's `nameIsStructDecl` gate does not
-  touch it (measured: unchanged under that candidate).
+* **THE ROOT IS D402's, AT THE TWINNING GATE, AND THE FIX IS ONE LINE.** `buildStructTwins`
+  merges two same-layout rows onto one heap type only when `slotCanonId(i) >= 0`, and it
+  tests that key FIRST. For a struct-alias union row the key was always -1: `internShapeAs`'s
+  D0 recorder banked `sTyIxOfName(key)` — the ALIAS name, whose `cUserTypes` entry is the
+  UNION type — and `slotCanonId`'s `TyObj` gate then declined it. Recording
+  `sTyIxOfName(nm)`, the arena type of the SHAPE the row's fields were parsed from, is the
+  whole change. **This is the same degenerate `sTyIxOfNameTy`'s generic-application arm was
+  added for** — that arm's own header says it in these words: "every application row banked -1
+  and `slotCanonId` returned -1 for it — the 'never merged' degenerate — which
+  `buildStructTwins` tests FIRST … A layout twin of a declared struct therefore got its own
+  heap type and the assignment was check-clean INVALID WASM
+  (`generics/genapp-instance-twins-declared.vl`)." One arm over, same sentence.
 
-* **PRICE, UNBUILT.** The fix is at the intern layer — either the struct table dedups two
-  same-layout struct-alias unions onto one row (which changes what `structNameOfTy` answers
-  for each and is a rep-layer change owing `rep-fuzz-check.sh`), or the ref-list table keys on
-  the ELEMENT ROW rather than the layout, which mints a second array type per alias and costs
-  module size on every same-layout pair. Neither was built here; the cell is in the standing
-  gate so whichever lands is graded against it.
+* **THE FILED "NOT MOVED BY D402's REFUSED LIFT CANDIDATE" IS CORRECT AND WORTH KEEPING.**
+  Re-measured: R1 alone (the `nameIsStructDecl` lift) leaves this cell invalid on both sides;
+  R2 alone closes it without touching D402. Two rungs, two rows, no overlap — see D402's
+  ablation table.
+
+* **THE PRICED ALTERNATIVE WAS NOT NEEDED.** The row proposed either deduping the struct
+  table or keying the ref-list table on the ELEMENT ROW ("which mints a second array type per
+  alias and costs module size on every same-layout pair"). Neither was built: the rows were
+  always eligible to share a heap type and were only ever declined by a stale sidecar, so the
+  corpus is byte-identical (2,391 modules, 1,948 identical, 0 DIFFER, 0 LOST) and no
+  module grew.
 
 ---
 
-### D442 — an intersection alias's ref LIST assigned into a STRUCTURALLY-spelled field list is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-28 by D402's neighbourhood grid · pre-existing and IDENTICAL on master `f9275d20` and on this branch · NOT moved by D402's refused lift candidate · kept whole at `distilled/named/d402_silent_field_from_alias.vl`**
+### D442 — [CLOSED 2026-08-28] an intersection alias's ref LIST assigned into a STRUCTURALLY-spelled field list is check-clean invalid wasm
+**CLOSED 2026-08-28 (#2004) — the filed repro RUNS and prints 5 then 6. Was: check-clean invalid wasm on `f9275d20`, `1252cf04` and `1a43607c` · found 2026-08-28 by D402's neighbourhood grid · kept whole at `distilled/named/d402_silent_field_from_alias.vl`, and pinned at `tests/cases/types/intersection-alias-list-into-shape-field.vl`**
 
 Repro:
 
@@ -13976,30 +13975,53 @@ Repro:
     print(w.xs[0].a)
     print(w.xs[0].b)
     // vl check rc 0 — and one of the HINTs says `w` is inferred as `{xs: AB[]}`, i.e. the
-    // checker considers the two spellings the same type. vl run:
-    //   Invalid input WebAssembly code at offset 223:
-    //   type mismatch: expected (ref $type), found (ref $type)
+    // checker considers the two spellings the same type. vl run prints 5 then 6
 
-* **THREE INGREDIENTS, EACH REMOVABLE ALONE.** With the alias declared as a plain struct it
-  RUNS. With the field spelled `AB[]` instead of `{a:i32, b:i32}[]` it RUNS. With the literal
-  written inline (`const w: W = { xs: [{a:5,b:6}] }`, no intermediate binding) it RUNS. The
-  bare-struct twin of every one of those runs too.
-
-* **THE MECHANISM IS OFF THE DISASSEMBLY.** Two struct rows of one layout (`type 0`, the
-  anonymous inline shape; `type 1`, `AB`) each get their OWN ref-list wrapper —
+* **THE FILED MECHANISM REPRODUCES OFF THE DISASSEMBLY.** Two struct rows of one layout
+  (`type 0`, the anonymous inline shape; `type 1`, `AB`) each got their OWN ref-list wrapper —
   `type 4` over `(array (mut (ref null 0)))` and `type 6` over `(array (mut (ref null 1)))`.
-  `W.xs` is typed `(ref 4)`; the global `q` is a `(ref 6)`; `struct.new 2` is handed the
-  wrong one and there is no coercion between two wrappers the CHECKER calls one type.
+  `W.xs` is typed `(ref 4)`, the global `q` is a `(ref 6)`, and `struct.new 2` was handed the
+  wrong one with no coercion between two wrappers the checker calls one type. Same root as
+  D441: the two rows could not twin, so the wrappers could not collapse.
 
-* **THE POSITION IS D402's ONE ADMITTED POSITION.** The struct FIELD is the one place of
-  seven where D402's `checkArrName` reject does not fire, so it is exactly where a silent cell
-  can live: the loud row's coverage stops one position short of it. That is the general shape
-  worth carrying — **a loud reject's boundary is where its family's silent cells sit.**
+* **THE INGREDIENT IS WIDER THAN FILED, AND THAT IS THE CORRECTION.** The row said the alias
+  had to be an intersection ("with the alias declared as a plain struct it RUNS"). Measured
+  over the declaration axis, the field position is invalid wasm for `{a}&{b}`, a REVERSED
+  `{b}&{a}`, a NAMED-arm `P & {b}`, TWO same-layout intersections, an intersection **with** a
+  plain-struct twin also declared, and a degenerate union alias `{a,b} | {a,b}` — **six of the
+  seven declarations that can name the alias at all**, every one whose row's name is not a
+  `TypeDecl`. Only the plain struct ran. The intersection was never the ingredient; the
+  one-variant `UnionDecl` was.
+
+* **THE POSITION IS STILL THE GENERAL LESSON, WITH THE COUNT MEASURED RATHER THAN INHERITED.**
+  Over sixteen structurally-spelled positions D402's loud `checkArrName` reject reaches TWELVE
+  (`const`, `let`, param, return, local, `[][]`, `.length`, `.push`, `for-in`, a global, a
+  cross-function hand-off, an element write) and misses four: a struct field of the inline
+  shape's list read, the same written, an un-annotated list — all three correct — and this
+  one. The boundary had four cells and exactly ONE of them was silent: **a loud reject's
+  boundary is where its family's silent cells sit.**
+
+* **ONE CELL OF THIS FAMILY IS STILL BROKEN, AND IT IS A DIFFERENT ROOT** — the degenerate
+  union alias, filed as **D446**. Its list is a union-BOX element list, not a struct one.
+
+* **THE PRICE THIS ROW's FIX HAD TO PAY, AND THE RUNG THAT PAYS IT.** Opening the merge made
+  a PERMUTED pair merge with its fields in opposite slots. `type AB = {b:i32} & {a:i32}`
+  beside a `{a:i32,b:i32}[]` field went from check-clean invalid wasm to check-clean **WRONG
+  VALUES** (`2 1` for `1 2`) — one cell of the 151-cell grid, and the only cell any rung of
+  the landing moved to a silent answer. `structFieldCodesEq` compares field CODES positionally
+  and never NAMES, and `collectS`'s `TypeDecl` arm has canonicalised field order against an
+  existing same-fieldset row since `xfail-miscompile-permuted-struct-fields.vl` while
+  `internShapeAs` — the second mint site, one layer down — did not, and could not be caught
+  doing it because its rows had never been eligible to merge. **Rung R3 gives the two sites
+  one `rowWithFieldNameSet`.** On its own R3 closes no row and moves no graded population at
+  all — it is the worked case of a rung that scores zero everywhere derived and is still
+  load-bearing. Witnesses: `tests/cases/types/intersection-elem-permuted-arm-field-alias.vl`
+  and `distilled/named/d402_permuted_arm_field_alias.vl`.
 
 ---
 
-### D443 — a value of an intersection ALIAS handed to a STRUCTURALLY-spelled struct param is a loud emit reject
-**loud emit reject (`emitProgram: ref valtype with no interned shape`) · found 2026-08-28 by the nine-gate object probe built to sequence D402 against D425 · pre-existing and IDENTICAL on master `f9275d20` and on this branch**
+### D443 — [CLOSED 2026-08-28] a value of an intersection ALIAS handed to a STRUCTURALLY-spelled struct param is a loud emit reject
+**CLOSED 2026-08-28 (#2004) — the filed repro RUNS and prints 2. Was: an emit-stage refusal (`emitProgram: ref valtype with no interned shape`) on `f9275d20`, `1252cf04` and `1a43607c` · found 2026-08-28 by the nine-gate object probe built to sequence D402 against D425 · closed by D441's rung, not by its own · kept whole at `distilled/named/d402_reject_shape_param.vl`, pinned at `tests/cases/types/intersection-alias-to-shape-param.vl`**
 
 Repro:
 
@@ -14007,32 +14029,20 @@ Repro:
     function f(v: {a:i32,b:i32}): i32 { return v.b }
     const x: AB = {a:1,b:2}
     print(f(x))
-    // vl check rc 0; vl run:
-    //   emitProgram: ref valtype with no interned shape
+    // vl check rc 0; vl run prints 2
 
-* **THE PLAIN-STRUCT TWIN RUNS**, printing 2, and so does the reverse direction (an
-  `{a:i32,b:i32}`-typed value handed to a `v: AB` param) on BOTH declarations.
+* **THE ASYMMETRY THE ROW FILED IS WHAT NAMED THE ROOT.** The reverse direction — an
+  `{a:i32,b:i32}`-typed value handed to a `v: AB` param — always ran on both declarations.
+  Only one direction had a shape to intern because the alias's row and the inline shape's row
+  were one layout the emitter kept as two heap types. Both directions are pinned in the
+  fixture, because a fix that opens only one has not found the root.
 
-* **IT IS D402's ROOT AT A THIRD GATE.** `type X = A & B` canonicalizes to a one-variant
-  `UnionDecl`, and the "is this an object / a declared struct" gates do not recognise it.
-  Measured at nine gates against the plain-struct twin, five diverge and four agree:
+* **IT CLOSED WITHOUT BEING AIMED AT.** R2 is `internShapeAs`'s D0 recorder and nothing else;
+  this row was measured, not assumed, to fall out of it — R1 alone leaves it rejecting.
 
-  | gate | intersection | plain struct twin |
-  |---|---|---|
-  | field read `x.a` | runs | runs |
-  | param typed `AB` | runs | runs |
-  | `AB[]` ref list | runs | runs |
-  | bare struct annotation | runs | runs |
-  | **param typed `{a:i32,b:i32}`** | **loud emit reject** (this row) | runs |
-  | **`{a:i32,b:i32}[]` element** | **loud emit reject** (D402) | runs |
-  | **`if t is AB` narrow** | **loud emit reject** (`` `is` names a declared union member with no interned arm representation ``) | runs |
-  | **`function "+"(self: AB, …)`** | **loud check reject** (`operator '+' is not defined for AB and AB`) | runs |
-  | **`function "+"(self: {a:i32,b:i32}, …)` over `AB` operands** | **loud check reject** | runs |
-
-* **ALL FIVE ARE LOUD, WHICH IS THE POINT OF FILING THEM TOGETHER.** The root produces a
-  family of refusals, not a family of miscompiles; the two silent cells it does own (D441,
-  D442) need a second declaration or a second spelling on top. A fix at the root closes all
-  five at once, and it is the prerequisite D425's declaration-site reject is waiting on.
+* **THE ROW's LAST CLAIM IS FALSE AND IS CORRECTED IN D402.** "A fix at the root closes all
+  five at once" — measured on the shipped seed, it closes TWO (this row and D402). The `is AB`
+  narrow and both operator gates still refuse, so D425's prerequisite is only two-thirds paid.
 
 ---
 
@@ -14111,6 +14121,40 @@ Repro:
   `checkBinary`'s `if odsp is TyObj`. So the reachability predicate for a `"[]"` declaration
   is its own question and its own measurement — the second of the three D425's corrected
   price counts.
+
+---
+
+### D446 — a DEGENERATE union alias (`{a,b} | {a,b}`) in D442's position is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-28 by the declaration axis of D442's fix grid, as the one of its seven alias-naming declarations that landing does not close · pre-existing and IDENTICAL on master `1a43607c` and after #2004 · kept whole at `distilled/named/d402_uniontwin_field_alias.vl`**
+
+Repro:
+
+    type AB = {a:i32, b:i32} | {a:i32, b:i32}
+    type W = { xs: {a:i32, b:i32}[] }
+    const q: AB[] = [{a:1,b:2}]
+    const w: W = { xs: q }
+    print(w.xs[0].a)
+    print(w.xs[0].b)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset N:
+    //   type mismatch: expected (ref $type), found (ref $type)
+
+* **IT IS NOT D442's ROOT, WHICH IS WHY D442's FIX DOES NOT REACH IT.** Off `wasm-tools
+  print`, `AB[]` here is a UNION-BOX element list — `(type 2 (struct (field i32) (field
+  anyref)))` with the payload struct built underneath it (`struct.new 0` then `struct.new 2`)
+  — while `W.xs` is a plain struct-element list. The two are genuinely different reps, and no
+  amount of struct-row twinning makes them one; the hole is that the CHECKER calls the two
+  spellings the same type and no coercion is emitted.
+
+* **THE DEGENERACY IS LOAD-BEARING.** `{a:i32,b:i32} | {a:i32,b:i32}` has two identical arms.
+  A union of two DIFFERENT shapes in the same position is not assignable to a
+  `{a:i32,b:i32}[]` field at all, so the checker refuses it loudly; this one is accepted
+  because every arm is the field's element type, and then lowered as a box.
+
+* **THE FIX IS A CHECKER QUESTION, NOT AN EMITTER ONE**, and it is unbuilt: either a
+  one-arm-after-dedup union alias canonicalizes to its arm (which would make this row
+  disappear into D442's family) or the assignment is refused. The cell is in the standing gate
+  so whichever lands is graded against it.
 
 ---
 

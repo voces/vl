@@ -1851,6 +1851,67 @@ invalid-wasm cells:
 So: **grade a loud row's neighbourhood at the positions the reject does NOT reach.** That is
 where a silent sibling can exist, and it is the only place it can.
 
+**LANDED 2026-08-28 (#2004) — and this section got two things wrong.** The refusal above was
+right about the *owed work* and wrong about the *reason*, and it is worth recording which is
+which, because the second error would have survived indefinitely.
+
+*One:* "the pin's stated harm does not reproduce, because with no declared twin the gate never
+fires at all" — the cell is not an emit reject on either side. It RUNS, correctly, on base and
+on the lift. The conclusion held and the sentence supporting it did not, which is exactly the
+failure mode a measured close is supposed to prevent. What replaced it: a poison probe at the
+gate fires on **3 of the 2,386** corpus modules that predate this change — the pin plus two
+whose resolved row really is anonymous — and those two build BYTE-IDENTICALLY with the gate
+lifted, so the reach is live and the answer does not move; a 10-cell grid of the protected
+population moves nothing. **A pin
+whose premise is refuted is a pin to retire with its evidence.** The fixture keeps its path and
+its program, becomes `@run`, and carries the measurement in its header.
+
+*Two:* D441 and D442 were filed as "not moved by the candidate" with an unbuilt price ("the
+ref-list table keys on the ELEMENT ROW, which mints a second array type per alias and costs
+module size"). Both were true of THAT candidate and neither was the fix. Their root is D402's
+one gate over: `internShapeAs`'s D0 recorder banked the ALIAS name's arena type — a
+one-variant `UnionDecl` — so `slotCanonId` returned the "never merged" -1, `buildStructTwins`
+tests that key FIRST, and no struct-alias-union row had ever been compared against any other.
+Recording the SHAPE's type instead closes D441, D442 AND D443, costs nothing on the corpus
+(2,391 modules, 1,948 identical, 0 DIFFER, 0 LOST) and is the same degenerate `sTyIxOfNameTy`'s
+generic-application arm was added for. **When a row's price is "unbuilt", the number to
+distrust is the price, not the row.**
+
+---
+
+## A rung can score ZERO on every population you can derive and still be the reason the change is sound (D442)
+
+The D441/D442/D443 fix is one line: record the shape's arena type at the row mint instead of the
+alias name's. It ships with a second rung that closes no inventory row, moves no cell of the
+distilled corpus, changes no corpus module's bytes, and would read as gold-plating in any diff.
+
+It is what stops the one line being a miscompile. Two struct rows collapse to one wasm heap type
+only when their field SEQUENCE matches, and `structFieldCodesEq` compares field CODES
+positionally and never NAMES. `collectS`'s `TypeDecl` arm has canonicalised field order against
+an existing same-fieldset row since `xfail-miscompile-permuted-struct-fields.vl`. `internShapeAs`
+— the SECOND mint site, one layer down — never did, and **could not be caught doing it, because
+its rows had never been eligible to merge in the first place.** The moment they were,
+`type AB = {b:i32} & {a:i32}` beside a `{a:i32,b:i32}[]` field merged with `a` and `b` in
+opposite slots and went from check-clean invalid wasm to check-clean **WRONG VALUES**.
+
+Three things follow, and the third is the one that generalises.
+
+* **A dormant gap is not a small gap.** The omission had zero observable consequence for as
+  long as the guard above it declined, and full consequence the instant it stopped. Opening a
+  merge, a dedup or an accept set means auditing every invariant the *closed* path was
+  vacuously satisfying — the reordering rule was written down, tested and shipped, and still
+  only covered one of two mint sites.
+* **The grid found it and no derived population could have.** One cell of 151 — the permuted-arm
+  crossing, which exists in that grid only because reversed arm order was an axis. The corpus is
+  blind to it (nothing declares a permuted same-layout pair), and the distilled corpus is blind
+  to it (the class did not exist to be collapsed). It is now kept whole at
+  `distilled/named/d402_permuted_arm_field_alias.vl`, which is what `named/` is for.
+* **Ablate for LOAD-BEARING, not for effect.** The eight-subset ablation table shows the rung
+  changing nothing on every row and every graded population; read as an effect table it is
+  deletable. Read as a *soundness* table — R1+R2 has a silent cell, R1+R2+R3 does not — it is
+  mandatory. **A rung's ablation column is evidence about what it BUYS, never about whether it
+  can come out.**
+
 ---
 
 ## An operator reject's PLACEMENT is a language decision, and its price is counted in DISPATCH GATES, not in gates (D425, D443, D444, D445)
