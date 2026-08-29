@@ -12613,10 +12613,10 @@ Repro (TWO lines):
 
 ---
 
-### D223 — a REF-LIST ELEMENT receiver of a declared union ARM's field: one decline, and the "already invalid" reading of it is refuted
-**loud emit reject · live on `4a6c1e52` · THE ROW AS FILED WAS WRONG IN THREE PLACES and the corrected reading is a pure DECLINE: lift `armRecvHoldsBareArm`'s ref-list-element refusal and the witness RUNS and prints `7` · the lift is REFUSED here, and its price is measured and named**
+### D223 — [CLOSED 2026-08-28] a REF-LIST ELEMENT receiver of a declared union ARM's field: the decline is OFF, and its price is zero on every block D219 priced it on
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · the decline `armRecvHoldsBareArm` is deleted, and the "the module is already invalid before the read" reading that justified it is refuted IN THE TYPE SECTION · re-graded cell-matched over census blocks B, C, D and E (100,014 cells): `1,329` cells move, every one of them `loud emit reject` → `runs`, `runs` LOST 0, → silent 0 · the 24 `d223-lift-price` cells the refusal was priced on all RUN**
 
-Repro (census block E cell `e002074`, verbatim):
+Repro (now `runs`, census block E cell `e002074`, verbatim):
 
     type Circle = { r: i32 | null }
     type Sq = { s: i32 }
@@ -12633,105 +12633,69 @@ Repro (census block E cell `e002074`, verbatim):
       } else { print(0) }
     }
     rd()
-    // emitProgram: bare null needs a struct-typed context
+    // was: emitProgram: bare null needs a struct-typed context
 
-* **THE MODULE IS NOT ALREADY INVALID, AND THAT WAS THE ROW'S LOAD-BEARING CLAIM.** Both
-  this row and `armRecvHoldsBareArm`'s own header say *"the module is already invalid before
-  the read"* — the outer `array.new_fixed` wanting a list of `Circle`s and getting the union
-  BOX rep the disagreeing literal minted. Built: with `armRecvHoldsBareArm` returning true
-  for a ref-list element receiver, **the witness above RUNS and prints `7`**, the correct
-  answer. The construction is fine; there was nothing for the floor to be a floor over.
-  Delete the read instead of the decline and master builds it too — replace the `!= null`
-  test with `print(c.length)` and master runs it, printing `1`.
+* **THE "ALREADY INVALID" READING IS REFUTED BY THE BYTES, not only by the outcome.** Both
+  this row and `armRecvHoldsBareArm`'s own header said the outer `array.new_fixed` was
+  already meeting a box list where it wanted `Circle`s. `wasm-dis` on the lifted module says
+  otherwise: the inner list is `array.new_fixed $8` of `$0 = (struct (field (mut (ref $2))))`
+  — the `Circle` STRUCT, whose `r` field holds the `(ref $2)` box because `i32 | null` is a
+  union — and the outer is `array.new_fixed $10 1 (local.get $0)` over `(ref null $9)`, the
+  inner list's own wrapper. The construction was well-typed all along; the decline was
+  stopping emission before anything could disagree.
 
-* **"ONE WORD MOVES IT, IN EITHER DIRECTION" IS FALSE IN BOTH DIRECTIONS.** Measured on
-  `4a6c1e52`, each control one word from the repro:
+* **ALL NINE FILED CONTROLS REPRODUCED VERBATIM on `8939d435`**, and all nine run now
+  (`k5`, the swapped-element control, correctly prints `0` — its element 0 is the null one):
 
-  | control | on master |
-  |---|---|
-  | the repro as filed | loud emit reject |
-  | **annotate the inner list** (`const lv1: Circle[] = …`) | **loud emit reject** (identical message, identical offset) |
-  | **make the two elements AGREE** (`[{ r: 7 }, { r: 8 }]`) | **loud emit reject** (same) |
-  | ONE element, either one | loud emit reject (same) |
-  | the elements swapped | loud emit reject (same) |
-  | at MODULE scope | loud emit reject (same) |
-  | drop the outer list layer (`const c: Circle[] = lv1`) | loud emit reject (same) |
-  | **delete `type Shape`** | **RUNS**, prints 7 |
-  | **remove the READ** (`print(c.length)`) | **RUNS**, prints 1 |
-
-  So the DISAGREEING SHAPES are not the ingredient and neither is the outer annotation. The
-  ingredients are the two D219 already named: `Circle` is a union ARM, and the receiver is a
-  ref-list ELEMENT. The row's title describes a real mechanism that belongs to a different
-  program — see D361.
-
-* **THE DECLINE'S POPULATION HAS MOVED SINCE IT WAS MEASURED.** D219 priced it as "block E
-  moves 96 cells and block B 66 from a loud emit reject INTO check-clean invalid wasm", at
-  `cont=listlist × pval=mixed`. Re-graded cell-matched on `4a6c1e52` over the whole of
-  census block E (**19,224 cells**, generated and graded on both compilers):
-
-  | | |
-  |---|---|
-  | cells the lift moves | **852** |
-  | **loud emit reject → runs** | **828**, `runs` LOST **0** |
-  | **loud emit reject → check-clean invalid wasm** | **24** |
-  | the 96 `cont=listlist × pval=mixed` cells the decline was WRITTEN for | in the **828**, not the 24 |
-
-  The 24 are all `cont=map_of_list × pval=mixed × claim=0`, spread evenly over
-  `twin`/`union`/`order`, and they are a **different defect** — see D361. The decline's
-  benefit shrank 4× and changed coordinate; its cost is 828 cells in this block alone.
-
-* **AND THE 24 ARE ALREADY SILENT ON MASTER, ONE BINDING AWAY.** The same cell with
-  `const e0 = g1[0]` in front of the field read — a binding is not an element read, so the
-  decline does not fire — is **check-clean invalid wasm on master**, with the decline in
-  place. The loudness the decline buys is a property of one SPELLING of a class that is
-  silent at its neighbour.
-
-* **THE LIFT IS REFUSED HERE ANYWAY, AND THE PRICE IS A NAMED SET.** 24 cells loud → silent
-  is a regression in its own right by this programme's own standing rule (`letMapDestShape`
-  states it: *"`runs` LOST is 0 either way; this bound is about the loud→silent direction,
-  which this programme treats as a blocker in its own right"*). The 24 coordinates are
-  committed as `scripts/silent-sweep/census/d223-lift-price.json` and carried by the
-  standing gate as `d223-lift-price`: they must stay LOUD, and the day D361 closes they are
-  what says the lift is now free. **The distilled corpus is blind to the whole trade** —
-  regress.py on the lifted compiler reports 0 moved classes and 0 moved curated cells, which
-  is why the block had to be generated.
-
-* **A NARROWER GATE WAS BUILT AND REFUTED TOO.** Giving an un-annotated list-literal binding
-  the ref-list slot of the declared map value it is stored into — `letRefListDestSlot`, the
-  exact shape of `letMapDestShape` (D203) one container over — does **not** move the 24: the
-  slot the read resolves is already the annotation's, and the disagreement is in the element
-  KIND the literal minted (union box, 2) rather than in which slot names it. That is D361's
-  landing, not a gate here.
-
-* **THE PRICE IS NOW ZERO — D361 CLOSED, AND BOTH LEGS RE-MEASURED ON `1e598e2b`
-  (2026-08-28).** The 24 were the only thing standing in the way, and they are gone: their
-  silence was D361's, not the lift's. THREE compilers built from `1e598e2b`'s own source and
-  graded cell-matched over the whole of census block E (19,224 cells) — the base, the BARE
-  lift, and the lift on top of D361's landing:
-
-  | | the bare lift | the lift with D361 landed |
+  | control | on `8939d435` | now |
   |---|---|---|
-  | cells the lift moves | 852 | **852** |
-  | loud emit reject → runs | 828 | **852** |
-  | loud emit reject → **check-clean invalid wasm** | **24** | **0** |
-  | `runs` LOST | 0 | **0** |
-  | block E's silent total, base 96 → | **120** | **0** |
+  | the repro as filed | loud emit reject | **runs**, 7 |
+  | annotate the inner list (`const lv1: Circle[] = …`) | loud emit reject | **runs**, 7 |
+  | make the two elements AGREE (`[{ r: 7 }, { r: 8 }]`) | loud emit reject | **runs**, 7 |
+  | ONE element | loud emit reject | **runs**, 7 |
+  | the elements swapped | loud emit reject | **runs**, 0 |
+  | at MODULE scope | loud emit reject | **runs**, 7 |
+  | drop the outer list layer (`const c: Circle[] = lv1`) | loud emit reject | **runs**, 7 |
+  | delete `type Shape` | runs, 7 | runs, 7 |
+  | remove the READ (`print(c.length)`) | runs, 1 | runs, 1 |
 
-  The bare-lift column reproduces this row's filed numbers exactly, and **the 24 cells it
-  silences are set-identical to the committed `d223-lift-price` coordinates** — so the
-  refusal was priced on the right cells. Under D361 + the lift all 24 of them `run`. Note the
-  silent totals: the lift ALONE takes block E from 96 silent cells to 120; D361 first takes
-  it to 0 and the lift keeps it there.
+* **THE PRICE, RE-MEASURED ON THE BLOCKS #1995 DID NOT GRADE.** D219 priced the decline as
+  buying loudness on **blocks B and E**, and #1995 re-graded only E. All four blocks the
+  census can generate below block A were graded cell-matched against `8939d435`, on the
+  compiler this PR ships (D381 + the lift):
 
-  The 24 named cells still grade `loud emit reject` on the landed compiler (the decline is
-  still there), so `d361-landed` and `d223-lift-price` are both live and they now say
-  opposite things: the first must RUN, the second is the tripwire that flips to `runs` the
-  day the lift lands.
+  | block | cells | moved | → `runs` | `runs` LOST | → silent | block's silent total, before → after |
+  |---|---|---|---|---|---|---|
+  | **E** | 19,224 | **852** | **852** | **0** | **0** | 0 → 0 |
+  | **B** | 28,590 | **57** | **57** | **0** | **0** | 506 → 506 |
+  | **C** | 43,200 | **420** | **420** | **0** | **0** | 236 → 236 |
+  | **D** | 9,000 | **0** | **0** | **0** | **0** | 0 → 0 |
 
-* Filed rather than fixed **only because the lift's remaining exposure is unmeasured outside
-  block E**: D219 priced it on blocks B and E, and only E has been re-graded since. The
-  decision this row refused is now a measurement away — regrade blocks B and C against the
-  lifted compiler and, if they hold, take the decline off and 852 cells forward with it.
+  D219's filed block-B price — "66 cells from a loud emit reject INTO check-clean invalid
+  wasm" — is **0** on today's compiler, exactly as block E's 24 became 0: both were D361's
+  silence, not the lift's, and D361 landed in #1995. Block A is NOT graded here; D219 never
+  priced a loud→silent move there, and its 150,224 cells are a 30-minute pass on a box shared
+  with two other agents. That is the one gap in this measurement and it is named rather than
+  papered over.
+
+* **THE NAMED SET DID ITS JOB AND IS NOW A LANDED SET.** `d223-lift-price`'s 24 cells graded
+  `loud emit reject` on `8939d435` and **all 24 `runs`** on the lifted compiler — the
+  tripwire the row installed flipped exactly as designed. They stay in `distilled/named/`
+  with their baseline updated to `runs`, so the direction they guard is now "must keep
+  running". `d361-landed`'s 96 cells still run.
+
+* **THE CORPUS FOOTPRINT IS ONE FILE.** `cmp` of every buildable fixture module, D381-only
+  against D381+lift: **1,934 of 1,934 byte-identical, 0 base-only, 1 candidate-only** — the
+  lift's own new fixture `tests/cases/unions/arm-field-read-through-list-element.vl`, which
+  the unlifted compiler emit-rejects. The distilled corpus is blind to the whole trade, which
+  is why the blocks had to be generated: `regress.py` reports the 24 named cells moving and
+  nothing else.
+
+* **WHAT THE DECLINE COST, in one number.** It was written to keep 96 block-E cells loud; it
+  was keeping `1,329` cells across four blocks from running at all. Its own header's
+  narrower gate (`rlElemKindTbl[slot] != 2`) was already refuted, and so was
+  `letRefListDestSlot` as a gate here — that rung is D381's landing and it is in this same
+  PR, where it moves 0 census cells and answers 0 corpus builds.
 
 ---
 
@@ -12847,10 +12811,10 @@ Repro (now `runs`):
   this landing the same lift moves **852 cells, all 852 loud emit reject → runs, `runs` LOST
   0, → silent 0**, and block E's silent total stays at 0. See D223.
 
-### D381 — an un-annotated list literal of ONE arm flowing into a DECLARED UNION-ELEMENT destination is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-28 while ablating D361's rung · D361's MIRROR: there the literal was too WIDE for its destination, here it is too NARROW, and the same landing cannot answer both**
+### D381 — [CLOSED 2026-08-28] an un-annotated list literal of ONE arm flowing into a DECLARED UNION-ELEMENT destination is check-clean invalid wasm
+**closed 2026-08-28 · the filed repro RUNS and prints `7` · `letRefListDestSlot`, the rung the row PRESCRIBED, is the rung that closed it — the first prescription in this inventory's recent run that was right · but it is only HALF the landing, and building that half alone reverts EXACTLY what removing the landing entirely reverts: the local's CELL and the literal's BUILD are one landing, measured · 14 of 18 graded spellings were silent on `8939d435` and 13 of them run now · the census cannot see this row at all (blocks B/C/D/E move 0 cells) and neither can the corpus (1,934 of 1,934 modules byte-identical)**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -12864,42 +12828,165 @@ Repro:
       } else { print(0) }
     }
     f()
-    // vl check rc 0 with NO diagnostics; vl run:
+    // was: vl check rc 0 with NO diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 221: type mismatch: expected (ref $type), found (ref $type)
 
-* **IT IS THE OTHER DIRECTION OF D361's SEAM AND IT IS NOT CLOSED BY IT.** D361's literal
-  minted the union BOX where the destination wanted the arm; this one mints the ARM where
-  the destination wants the box. `[{ r: 7 }]` has one element, so the checker records
-  `{r:i32}[]` and no union at all — `arrLitBoxElemName` returns `""`, the widening site is
-  never reached, and the literal is a kind-1 list of `Circle`. The `Shape[]` binding then
-  reads a box list. All four D361 ablations grade this witness identically, which is how it
-  was found.
+* **THE MECHANISM, READ OFF THE TYPE SECTION.** Before, `wasm-dis` shows two list types and
+  the assignment between them: `(local $0 (ref $5))` over `$4 = (array (mut (ref null $1)))`
+  — a list of the `Circle` struct — and `(local $1 (ref $7))` over
+  `$6 = (array (mut (ref null $3)))`, `$3` being the union box `(struct (field i32) (field
+  anyref))`, joined by `local.set $1 (local.get $0)`. After, both locals are `(ref $7)` and
+  the literal is built `struct.new $7 (array.new_fixed $6 1 (struct.new $3 (i32.const 0)
+  (struct.new $1 (i32.const 7))))` — the element boxed under `Circle`'s tag. That is the
+  same module the ANNOTATED spelling `const lv1: Shape[] = [{ r: 7 }]` already emitted, so
+  the landing makes the two spellings one row rather than inventing a third.
 
-* **FIVE CONTROLS, each one word, measured on the D361 landing and on all four of its ablations:**
+* **THE ROW'S PRESCRIPTION WAS RIGHT, AND HALF OF IT.** `letRefListDestSlot` — an
+  un-annotated list-literal binding taking the ref-list slot of the declared destination it
+  flows into, `letMapDestShape`'s (D203) shape one container over — is exactly the rung, and
+  D361 was indeed the wrong row to test it against (the literal there is wrong standing
+  alone; here `const c: Circle[] = lv1` and the same literal with no `Shape` declared both
+  run, so only the destination can say it is wrong). What the row did not say is that the
+  destination has to reach **two** places. `collectLocals` types the binding's CELL through
+  `letRefListSlot`; `emitLetDeclStmt` seeds the literal's BUILD through
+  `pendingListKind`/`pendingListSlot`. Give the rung to one and not the other and the module
+  is still invalid, just at a new offset — measured twice, once as an ablation (below) and
+  once by accident, when the map arm's first cut read the map's INTERNED shape
+  (`mvRlSlot[mapShapeOfExpr(…)]`) instead of its ANNOTATION: that answer does not exist yet
+  when `collectLocals` runs, so with the literal declared BEFORE the map the CELL half got
+  -1 and the BUILD half got the slot. The shipped arm reads the annotation, which the
+  annotation walk interns ahead of both, and `c11` below is the order control that proves it.
 
-  | control | outcome |
+* **SEVEN DESTINATION FORMS, and the filed row is one of them.** Every one was
+  `check-clean invalid wasm` on `8939d435` and every one runs now; `letAnnDestBoxListSlot` is the
+  shared kind-2 test and the seven arms differ only in where the annotation is found.
+
+  | # | control | on `8939d435` | now |
+  |---|---|---|---|
+  | c1 | **the repro as filed** (`const c: Shape[] = lv1`) | **check-clean invalid wasm** | **runs**, 7 |
+  | c2 | annotate the literal (`const lv1: Shape[] = …`) | runs, 7 | runs, 7 |
+  | c3 | a SECOND element naming the other arm | runs, 7 | runs, 7 |
+  | c4 | a map between them (`{[string]: Shape[]}`, `c["k0"] = lv1`) | **check-clean invalid wasm** | **runs**, 7 |
+  | c5 | delete `type Shape`, destination `Circle[]` | runs, 7 | runs, 7 |
+  | c6 | at MODULE scope | **check-clean invalid wasm** | **runs**, 7 |
+  | c7 | a call ARGUMENT (`take(lv1)` into `take(c: Shape[])`) | **check-clean invalid wasm** | **runs**, 7 |
+  | c8 | a RETURN annotation (`function mk(): Shape[]`) | **check-clean invalid wasm** | **runs**, 7 |
+  | c9 | the literal written AT the annotated binding | runs, 7 | runs, 7 |
+  | c10 | a list-of-lists element (`const c: Shape[][] = [lv1]`) | **check-clean invalid wasm** | **runs**, 7 |
+  | c11 | c4 with the MAP declared FIRST (the order control) | **check-clean invalid wasm** | **runs**, 7 |
+  | x1 | a declared struct FIELD (`const w: W = { f: lv1 }`) | **check-clean invalid wasm** | **runs**, 7 |
+  | x2 | a NESTED map value | **check-clean invalid wasm** | **runs**, 7 |
+  | x3 | an ASSIGNMENT (`let c: Shape[] = []` then `c = lv1`) | **check-clean invalid wasm** | **runs**, 7 |
+  | x4 | an unrelated `Shape[]` GLOBAL beside the binding destination | **check-clean invalid wasm** | **runs**, 7 |
+  | x7 | a NULLABLE destination (`Shape[] \| null`) | **check-clean invalid wasm** | **runs**, 7 |
+  | x5 | TWO destinations of different element kinds | check-clean invalid wasm | **still silent — D411** |
+
+  **#1997 ADDED THE x6 COORDINATE TO THIS ROW WHILE CLOSING D362.** A declared array alias
+  destination (`type SL = Shape[]`) was a loud check reject before that landing — the parser
+  dropped the `[]` — and closing D362 turned it into one more silent cell of THIS class. The
+  two landings compose: x6 is `check-clean invalid wasm` on `8939d435` and runs here.
+  | x6 | a declared array ALIAS destination (`type SL = Shape[]`) | **check-clean invalid wasm** | **runs**, 7 |
+
+  The row's own five controls all reproduced verbatim, with one caveat worth recording: the
+  map control is filed as a FRAGMENT (`c: {[string]: Shape[]}`, `c["k0"] = lv1`) and the
+  obvious completion of it is a **loud check reject**, not the filed outcome — a bare map
+  read is nullable. The census's own spelling `(c)["k0"] ?? []` is the one that reproduces.
+
+* **FOUR INSTRUMENTS.**
+  * Corpus `cmp`, byte-for-byte: **1,934 of 1,934** PRE-EXISTING buildable modules identical,
+    0 base-only. The three movers are this PR's own new fixtures — two the base miscompiles
+    into a different module, one it cannot build at all.
+  * Census, cell-matched over **blocks B, C, D and E (100,014 cells)**: the D381 half moves
+    **0 cells** in every one of them. The row's guess that "the census has no `pval=single ×
+    union-element destination` coordinate" is confirmed as a reading, not an excuse.
+  * Counters, on a probe build that reports `reach`/`ans` through the diagnostic channel
+    (the compiler is instantiated with an EMPTY linker, so it cannot `print`): over the
+    fixture corpus **35 files reach the rung, 292 invocations, `ans` 0** — which is *why* the
+    corpus is byte-identical, rather than an assertion that it is. On the compiler's own
+    30k-line source, `reach=4 ans=0`; three self-compiles are **7.3s user** against
+    master's 7.6s, i.e. within the noise of a shared box.
+  * Disassembly, above.
+
+* **THE ABLATION TABLE, over all 18 graded spellings.** Stripping BOTH landings reproduces
+  master `8939d435`'s seed byte-for-byte (`md5 08b58e1c9d134f45594eb06e155dad75`, 1,470,393
+  bytes) and stripping D381 alone reproduces the D223-lift-only seed byte-for-byte
+  (`c164c202…`, 1,470,267).
+
+  | ablation | spellings that revert |
   |---|---|
-  | the repro as filed | **check-clean invalid wasm** |
-  | annotate the literal (`const lv1: Shape[] = …`) | **runs**, prints 7 |
-  | give it a SECOND element naming the other arm (`[{ r: 7 }, { s: 2 }]`) | **runs**, prints 7 |
-  | put a map between them (`c: {[string]: Shape[]}`, `c["k0"] = lv1`) | check-clean invalid wasm (same) |
-  | delete `type Shape` and make the destination `Circle[]` | **runs**, prints 7 |
+  | strip the whole landing | c1 c4 c6 c7 c8 c10 c11 x1 x2 x3 x4 x6 x7 — **14 of 18 silent** |
+  | strip only the CELL half (`letRefListSlot`) | **the same 14** |
+  | strip only the BUILD half (the three seeds) | **the same 14** |
+  | strip arm (a) binding destination | c1 c6 x4 x6 x7 |
+  | strip arm (b) list-of-lists element | c10 |
+  | strip arm (c) map store | c4 c11 x2 (+ x3 — the slice also takes (g)'s sub-block) |
+  | strip arm (d) call argument | c7 |
+  | strip arm (e) return annotation | c8 |
+  | strip arm (f) struct field | x1 |
+  | strip arm (g) assignment | x3 |
+  | strip the GLOBAL seed sites | c6 |
+  | strip the `uDeclared` pre-gate | **nothing** |
 
-  So the container is NOT an ingredient — unlike D361's filed reading, which named a map its
-  class does not need either. The ingredients are: the destination's element is a declared
-  UNION, the literal is un-annotated, and its elements name exactly one arm.
+  **The two halves are ONE landing** and the table says so in the strongest available form:
+  each half alone reverts exactly what removing the landing entirely reverts — the CELL
+  without the BUILD, and the BUILD without the CELL, both buy zero. Every arm is separated by
+  at least one coordinate no other arm covers. **The corpus separates none of them** — 0
+  pre-existing modules move under every ablation — which is the same blindness the census
+  shows, and it is why the 18-spelling grid had to be hand-built.
 
-* **WHY D361's RUNG IS NOT THE ANSWER.** That rung DECLINES a widening the arena already
-  proposed; there is nothing here to decline — the arena proposes nothing, because a
-  one-element literal of one shape has no join to make. The landing this wants is the
-  reverse lookup D203's `letMapDestShape` does for maps: an un-annotated list-literal
-  binding taking the ref-list slot of the declared destination it flows into, which
-  `letRefListDestSlot` was built for and #1992 measured as not moving D361. **D361 was the
-  wrong row to test it against.** This is the row it was written for.
+* **A GATE WAS BUILT AND REMOVED FOR MEASURING ZERO.** The scan is O(arena) per un-annotated
+  non-empty list-literal binding, so a second pre-gate (scan `rlElemKindTbl` for a kind-2 row
+  before scanning the arena) looked worth having. It grades identically on both populations
+  and three self-compiles are 7.3s user with and without it, so it is gone; the O(1)
+  `uDeclared` — the necessary condition, since a kind-2 row needs a declared union — is what
+  stayed.
 
-* Filed rather than fixed: it wants its own grid (the census has no `pval=single ×
-  union-element destination` coordinate) and `letRefListDestSlot` already exists to be
-  re-graded against it.
+* **WHAT IS LEFT, AND IT IS A REFUSAL RATHER THAN A GAP** — one literal with TWO destinations
+  of different element kinds. Filed as **D411**.
+
+---
+
+### D411 — ONE un-annotated list literal with TWO declared destinations of different element KINDS is check-clean invalid wasm, and no reverse lookup can fix it
+**check-clean invalid wasm · found 2026-08-28 closing D381, as the residue its rung provably cannot reach · a REFUSAL, not a gap: the two destinations demand two element reps of one list value, so the landing moves WHICH binding is wrong and cannot make both right**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const lv1 = [{ r: 7 }]
+      const c: Circle[] = lv1
+      const c2: Shape[] = lv1
+      if c.length > 0 { print(c[0].r) } else { print(0) }
+      if c2.length > 0 { print(1) } else { print(0) }
+    }
+    f()
+    // vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 226: type mismatch: expected (ref $type), found (ref $type)
+
+* **THE BYTES SAY THE SAME THING FROM BOTH SIDES.** On `8939d435` the literal builds
+  `struct.new $5` over `(array (mut (ref null $1)))` — a list of the `Circle` struct — and
+  `const c2: Shape[]` is a `(ref $7)` box-list cell, so the SECOND store is the mismatch.
+  With D381's `letRefListDestSlot` landed the literal builds `struct.new $7` over the box
+  array and it is the FIRST store, `const c: Circle[] = lv1`, that mismatches. Neither
+  answer is available to a rung that reads destinations: a list value has one element rep,
+  and `Circle[]` and `Shape[]` are two.
+
+* **IT IS NOT A REGRESSION AND IT IS NOT NEW.** The cell is `check-clean invalid wasm` on
+  both compilers, the same class with the same shape of message; only the offset moves
+  (224 → 226). D381's landing is graded on it and it stays put.
+
+* **THE THREE PLACES A REAL FIX COULD LIVE, none of them this rung.** (a) the CHECKER:
+  `Circle[]` is not soundly assignable to `Shape[]` under a mutable array anyway, so a
+  variance rule would make this a loud reject — and would also redden `const c: Shape[] =
+  lv1`, which is D381's whole subject and RUNS. (b) a COERCION at the store, which is a
+  per-element rebuild loop the emitter has nowhere today. (c) splitting the binding, which is
+  a rewrite pass. Each is a language decision, not a slot lookup, which is why this is filed
+  rather than attempted.
+
+* Nothing in the census reaches it: blocks B, C, D and E have no cell with two annotated
+  destinations for one un-annotated literal, so the coordinate would have to be built.
 
 ---
 
