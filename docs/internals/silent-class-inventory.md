@@ -19485,12 +19485,12 @@ Repro (now runs, printing `7`):
   literal, a function returning both arms — reach the design refusal or another open row, so
   widening the gate would claim rows that are not this one's.
 
-### D651 — `.length` on a bare `T` inside a generic body: the checker refuses the DIRECT spelling and lets the type-parameter one through to the emitter
-**LOUD EMIT REJECT (`emitProgram: '.length' on a receiver the emitter cannot classify as a
-list, string, map or set`) where the DIRECT spelling is a loud CHECK reject (`member access
-'.length' on non-object i32`) · a lost REFUSAL, not a lost lowering — clause 2 in the
-direction that hides · found 2026-08-30 as the residue of D426's close, by that row's own
-grid · six cells, kept whole at `distilled/named/d651len_*.vl`**
+### D651 — [CLOSED 2026-08-31] `.length` on a bare `T` inside a generic body: the checker refuses the DIRECT spelling and lets the type-parameter one through to the emitter
+**CLOSED 2026-08-31 alongside D691 — the repro is NOW A LOUD CHECK REJECT, in the direct
+spelling's own words. Was: an emit-stage refusal where the DIRECT spelling was already a
+check reject — clause 2 in the direction that hides · found 2026-08-30 as the residue of
+D426's close, by that row's own grid · six cells, kept whole at
+`distilled/named/d651len_*.vl`, and all six moved**
 
 Repro:
 
@@ -19537,6 +19537,11 @@ Repro:
   against the same floor the direct spelling meets, is the fifth table of exactly that
   family. Until it exists the emitter's floor is the only thing standing, and it is a floor:
   it names a rep it cannot classify, not a rule the language has.
+
+* **THE PRESCRIPTION WAS RIGHT AND IT IS BUILT — see D691**, which is the same table one
+  operation wider: `x[i]` on a type parameter is admitted by the same reasoning and lands on
+  the same emitter floor, so one table carries both. All six of this row's cells move with
+  the eleven D14 priced.
 
 ### D711 — [RULED 2026-08-31] `print` of a CONTAINER is a DOMAIN rule, and the message had been conceding a lowering that was never missing
 **CLOSED 2026-08-31 — the repro is NOW A LOUD CHECK REJECT whose sentence is a DOMAIN error
@@ -19788,6 +19793,159 @@ Repro:
   narrowing first. The risk to weigh is that the print ladder is a documented site of silent
   miscompiles (its own comments carry three), so it wants the rep-fuzz gate and a boundary
   fixture per arm rep, not a quick rung.
+
+---
+
+### D691 — [CLOSED 2026-08-31] the RECEIVER-CLASSIFICATION capability, lost in the instantiation: `.length` and `x[i]` on a type parameter were admitted in the body and re-asked nowhere
+**CLOSED 2026-08-31 — the repro is NOW A LOUD CHECK REJECT, in the direct spelling's own
+words. Was: a loud emit reject on `889d60f8` · SEVENTEEN cells (11 from D14's own
+`lengrid.py` plus 6 from D651), kept whole at `distilled/named/d14len_*.vl`,
+`d14idx_*.vl` and `d651len_*.vl` · this is the PRICE D14's close recorded and left unpaid,
+now paid**
+
+Repro:
+
+    function g<T>(x: T) { print(x.length) }
+    function body() {
+      const v = true
+      g(v)
+    }
+    body()
+    // was: vl check rc 0; vl run:
+    //   emitProgram: '.length' on a receiver the emitter cannot classify as a list,
+    //   string, map or set
+    // now: [ERROR]: member access '.length' on non-object boolean (the body of `g` at
+    //   the call's argument types)
+
+* **THE FAMILY IS 17 CELLS, AND IT IS AN ABLATED COUNT RATHER THAN A MESSAGE COUNT.** The
+  three emitter messages this campaign handed over — `'.length' on a receiver the emitter
+  cannot classify as a list, string, map or set` (14 cells), `index receiver is not an array
+  or string` (4), `unsupported for-in iterable` (4) — are 22 cells with TWO roots, and the
+  split is 17/5. The seventeen are this row. The remaining five (`a005050`, `a007809`,
+  `a008457`, `b016590`, `b016591`) are a NESTED ARRAY, filed as **D692**; delta-debugged,
+  their minimal witness prints `emitProgram: nested arrays are not supported` — the headline
+  of a different cluster entirely — and this row's fix moves none of them.
+
+* **THE DIRECT SPELLING WAS ALREADY A POSITIONED REFUSAL AT EVERY ONE OF THE SEVENTEEN, and
+  that is the measurement that decided the answer.** `const v = true  print(v.length)` is
+  `member access '.length' on non-object boolean`; `{n: i32}` is `no field 'length' on Cat`;
+  `Ca | Sq` is ``field 'length' is not on every member of U1 — narrow with `is` first``;
+  `v[0]` on any of them is `cannot index non-array …`. So the DESIGN forbids these programs
+  and the checker owed the diagnosis — answer (b), a lost refusal rather than a missing
+  lowering. Under the standing goal `runs` correctly stays where it was: these seventeen
+  programs are illegal and always were, and what was wrong is which stage said so.
+
+* **THE TWO ADMISSIONS ARE STILL RIGHT.** `checkMemberNode`'s `TyVar` arm (D14-L) and
+  `checkIndexNode`'s admit the operation on every type variable, and D14 measured why:
+  refusing them in the BODY refuses the eight argument reps that work — lists (i32, string,
+  nested, struct-element), a string, a map and a set. What was missing was the second half,
+  the pin. `scripts/silent-sweep/d14/lengrid.py` on this branch: **11 `gen` cells move from
+  `emit_reject` to `check_reject`, every `runs` cell still runs, and each moved cell now
+  carries its own `con` twin's sentence.**
+
+* **THE FIX IS THE EIGHTH DEFERRED TABLE, and D651's row prescribed it in full.**
+  `noteMemCstr` records a member access or an index whose RECEIVER type still carries a hole
+  (`tyHasHole`, not `tyIsHole` — `notePrintCstr`'s measured distinction), stamped with
+  `cstrOwnerTop()`; `validateMemCstrs` substitutes at the pin, re-defers a still-holey result
+  under the caller's hole, and asks the SAME floor the direct spelling meets. Wired at both
+  pins, the direct call's and the UFCS one, like the seven tables before it.
+
+* **ONE TABLE FOR BOTH OPERATIONS, AND ONE HOME FOR THE SENTENCE.** `memberFloorMsg` /
+  `indexFloorMsg` render every wording `checkMemberNode` and `checkIndexNode` raise, and BOTH
+  the arm and the pin call them — `letAssignMsg`'s discipline, for the reason D492/D493
+  earned it. Here the drift would be worse than cosmetic: the whole argument for reporting at
+  the pin is that the generic and the concrete spellings are one annotation apart and must
+  therefore be one sentence apart. The floors mirror their arms ARM FOR ARM, in order, so a
+  rep neither one enumerates (a brand, an intersection) answers identically at both.
+
+* **THE BOUND, STATED RATHER THAN DISCOVERED LATER.** For the INDEX form the pin DEFERS where
+  `holeIsArrayDemanded` + `tyRefusesArrayDemand` already speak in the call's argument loop —
+  a scalar or a map reached through the bare parameter, which reports `argument 1: expected an
+  array, got i32` several lines earlier. Two true sentences for one program is what
+  `validateEscJoins`' fallback rule exists to avoid. What this leaves uncovered is a receiver
+  that is not the bare parameter (`g<T>(x: T[]) { print(x[0][0]) }` at a scalar element): the
+  argument gate cannot see it either, so that cell stays exactly as it is today. No cell of
+  `lengrid.py`, of the distilled corpus or of `tests/cases` reaches it.
+  `error-receiver-classification-at-pin.vl`'s `idxI32Pinned` PINS the deference — if the pin
+  ever stops deferring, that fixture gains a second diagnostic and fails.
+
+* **MEASURED, six instruments.**
+  * **Corpus BYTE-IDENTITY.** `scripts/silent-sweep/corpuscmp.py` over `tests/cases/` +
+    `std/`: **2,439 modules · 1,985 identical · 0 DIFFER · 0 LOST** against the base
+    `889d60f8` (454 not buildable by the base, excluded and never scored).
+  * **`tests/cases` build count: 1,977 → 1,977**, and the build SET is identical file for
+    file (`diff` of the two lists is empty).
+  * **The distilled corpus.** **17 classes moved, all `loud emit reject` → `loud check
+    reject`; `runs → not-runs` ZERO; `→ silent` ZERO.**
+  * **Counters, reach AND ans.** A count-only probe build over the corpus: `noteMemCstr`
+    **records 154 times and changes 0 answers** across the 2,245 reporting modules that are
+    not this branch's own fixture, which is precisely why the corpus is byte-identical (the
+    fixture itself is reach 5 / ans 37). On the row's own witness it is **reach 2 / ans 3**,
+    and on the one-token control (`g([7, 8])` instead of `g(true)`) **reach 2 / ans 0**.
+  * **Real disassembly** (`./node_modules/.bin/wasm-dis`, binaryen 130). The ADMITTED path is
+    untouched: `g([7, 8])` builds to 1,807 bytes byte-identical under both seeds, and its
+    `.length` is still `(struct.get $3 1 (local.get $0))` — the list wrapper's length slot,
+    never a reclassification.
+  * **The scoreboard.** clause 2 `emit rejected after check` **91 → 74**; `refusal concedes
+    type-valid` unchanged at **26** (these are `tErr`, so no concession phrase is added);
+    total against the goal **121 → 104**.
+
+**ABLATED.** Four variants built from the branch by hunk, each self-compiled and graded on
+the 17 cells:
+
+  | variant | seed md5 | bytes | `.length` cells (13) | index cells (4) |
+  |---|---|---|---|---|
+  | strip-all | `c767f825…` = **master, byte-for-byte** | 1,520,987 | 0 | 0 |
+  | R3 — the message HOME only | `45c1f9bf…` | 1,521,694 | 0 | 0 |
+  | R1 — R3 + the table + the MEMBER pin | `a2d75d31…` | 1,523,237 | **13** | 0 |
+  | R2 — R3 + the table + the INDEX pin | `8e8892d9…` | 1,523,234 | 0 | **4** |
+  | all | `d1136d10…` | 1,523,248 | **13** | **4** |
+
+R1 and R2 are DISJOINT and their union is the branch's moved set, so they are two landings
+sharing one table rather than one landing. **R3 scores 0 on every population and is kept
+anyway**: it is the one-home rewiring, and its value is structural — its own corpus
+byte-identity run against master is **2,439 modules · 1,985 identical · 0 DIFFER · 0 LOST**,
+which is the measurement that it changes no answer while making the two sentences impossible
+to drift apart.
+
+Fixtures: `tests/cases/generics/error-receiver-classification-at-pin.vl` (14 refusals, each
+beside its direct control, plus the deference bound) and
+`tests/cases/generics/receiver-classification-at-pin-runs.vl` (the accept set, read back by
+value at every admitted receiver rep).
+
+---
+
+### D692 — `.length` and `for`-in on a value read OUT of a nested array: the receiver's floor speaks and the nesting is what is missing
+**LOUD EMIT REJECT — `emitProgram: unsupported for-in iterable` (4 cells) and `emitProgram:
+'.length' on a receiver the emitter cannot classify as a list, string, map or set` (1 cell) ·
+five cells: `a005050`, `a007809`, `a008457`, `b016590`, `b016591` · filed 2026-08-31 while
+closing D691, which owns the other seventeen of that message group · THE ROOT IS THE NESTED
+ARRAY and D691's fix moves none of these**
+
+Repro:
+
+    const c = [{ r: 7 }]
+    const dd = [c][0]
+    let hit = 0
+    for zz in dd {
+      if zz.r == 7 { hit = 7 }
+    }
+    print(hit)
+    // vl check rc 0; vl run:
+    //   emitProgram: unsupported for-in iterable
+
+* **THE ABLATION IS WHAT SEPARATES IT FROM D691, and it took five programs.** Delete the
+  nesting — `const dd = c` — and the same program RUNS, printing `7`. Hold the nesting and
+  make the element an i32 (`const c = [7]`) and it RUNS. Hold the nesting and the struct
+  element and ask `.length` instead of `for`-in, and the message becomes **`emitProgram:
+  nested arrays are not supported`** — the headline of a DIFFERENT cluster. A triple-nested
+  i32 array (`[[[7]]][0].length`) says the same; a double-nested one runs. So the
+  load-bearing ingredient is a nested array whose inner element the emitter has no rep for,
+  and the three messages these cells print are downstream floors rather than the mechanism.
+
+* **THIS IS THE `nested arrays are not supported` FAMILY WEARING THREE OTHER SENTENCES**, and
+  it is filed rather than absorbed because the fix belongs with that cluster: whoever lands
+  nested-array support should re-grade these five, and until then they have an owner.
 
 ## 6. Coverage gaps — axes not built, and why
 
