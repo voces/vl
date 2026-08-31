@@ -757,10 +757,14 @@ let argCstrWho: string[] = []
 // PRINTABILITY capability, deferred to the pin for exactly the reason the two tables above
 // defer the operator and the argument flow.
 //
-// `print` renders ONE scalar or string rep, and the two floors that say so — `tyPrintsAsRef`
-// and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S TYPE in the body. Inside a generic
-// that type is a hole (`T`, or the `?elem.T` a `x[0]` read derives), and a hole is neither a
-// ref nor a box, so both floors answer FALSE and the call is admitted. The emitter's print
+// `print` takes ONE value of `printDomainStr()`, and the two floors that say so —
+// `tyPrintsAsRef` and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S TYPE in the body.
+// They answer on DIFFERENT channels (a reference is outside the domain, `tErr`/D711; a
+// boxed value union is inside it and awaiting a tag dispatch, `tErrUnsupported`/D712) and
+// `validatePrintCstrs` carries that split to the pin.
+//
+// Inside a generic that type is a hole (`T`, or the `?elem.T` a `x[0]` read derives), and a
+// hole is neither a ref nor a box, so both floors answer FALSE and the call is admitted. The emitter's print
 // ladder is a run of POSITIVE tests ending in an unguarded `call __print_i32__`, so the
 // instance then handed a `(ref $t)` to an `(i32) -> ()` import: `vl check` rc 0 and a module
 // the engine refuses. `tyPrintsAsRef`'s own header used to claim the opposite —
@@ -17570,22 +17574,32 @@ function validatePrintCstrs(
         }
       }
       if !tyHasHole(cpt) {
+        // The two floors answer on DIFFERENT channels, and the pin has to carry that split
+        // or the generic spelling stops being the direct spelling's own sentence. A boxed
+        // value union is an emitter-capability admission (`tErrUnsupported`,
+        // `unsupported-lowering`): every arm is inside `print`'s domain and only the tag
+        // dispatch is missing (D712). A reference is a DOMAIN rejection (`tErr`, no code):
+        // the value is not one of `printDomainStr()`'s reps at all (D711).
         let pMsg = ""
+        let pUnsup = false
         if tyPrintsAsUnionBox(cpt) {
           pMsg = "print of a union value (" +
             tyToStr(cpt) +
             ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`"
+          pUnsup = true
         } else if tyPrintsAsRef(cpt, 24) {
-          pMsg = "print of " +
-            tyToStr(cpt) +
-            " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`"
+          pMsg = printRefRefusal(cpt)
         }
         if pMsg != "" {
           let pWho = "a type parameter is printed here: "
           if who != "" {
             pWho = "`" + who + "` prints its type parameter here: "
           }
-          tErrUnsupported(pWho + pMsg, ix)
+          if pUnsup {
+            tErrUnsupported(pWho + pMsg, ix)
+          } else {
+            tErr(pWho + pMsg, ix)
+          }
         }
       }
     }
@@ -20354,19 +20368,14 @@ function checkCallNode(n: Call, ix: i32) {
             pargs[pj],
           )
         }
-        // The SAME rule for the other reps `print` has no import for: an array, a
-        // struct, a map/set, a function value, and any of those behind `| null`.
-        // The emitter's print ladder ends in an unguarded `call __print_i32__`, so
-        // each of these handed a `(ref $t)` to an `(i32) -> ()` import and the module
-        // failed to VALIDATE — while `vl check` reported the program clean.
-        if tyPrintsAsRef(pt, 24) {
-          tErrUnsupported(
-            "print of " +
-              tyToStr(pt) +
-              " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`",
-            pargs[pj],
-          )
-        }
+        // A DOMAIN rejection, and NOT the capability channel above it. `print` takes one
+        // value of `printDomainStr()`; an array, a struct, a map/set, a function value, or
+        // any of those behind `| null` is not one, and `tErr` (no `unsupported-lowering`
+        // code) is what says so — the same shape as `toString expects an i32 or boolean,
+        // got string`. The language has never defined what `print([1, 2, 3])` OUTPUTS, so
+        // there is no lowering to be missing; `tyPrintsAsRef`'s header carries the
+        // measurement and `silent-class-inventory` D711 the ruling.
+        if tyPrintsAsRef(pt, 24) { tErr(printRefRefusal(pt), pargs[pj]) }
         // A printed type that still carries a HOLE answers FALSE to both floors above — it
         // is neither a ref nor a box YET — so the two of them together admit every generic
         // `print`. Defer it to the pin, the only position that knows the instance.
@@ -24489,16 +24498,55 @@ function tyPrintsAsUnionBox(pt: i32) {
   ok
 }
 
-// Whether `print(x)` would be handed a WasmGC REFERENCE the scalar print imports cannot
-// take. `print` renders ONE scalar/string rep (the union gate above says the same thing
-// about a box); the emitter's print ladder is a run of POSITIVE tests ending in an
-// unguarded `call __print_i32__`, so every value whose rep is a reference — an array, a
-// struct, a map/set, a function value, a union carrying one of those, and any of them
-// behind `| null` — was handed to an `(i32) -> ()` import with a `(ref $t)` on the stack.
-// The module then failed to VALIDATE ("expected i32, found (ref $type)") while `vl check`
-// reported the program clean. `driver.builtinScan` publishes `print`'s accepted set as
-// `(i32 | i64 | f32 | f64 | boolean | string) -> void`; this is the gate that makes that
-// string true.
+// `print`'s DOMAIN, spelled once. `driver.builtinScan` renders the LSP completion detail
+// from this (`(<domain>) => void`) and `tyPrintsAsRef`'s refusal quotes it, so the type the
+// compiler advertises and the type it enforces cannot drift into two answers — which is
+// what the hand-written completion string next to a hand-written message invited.
+export function printDomainStr(): string {
+  "i32 | i64 | f32 | f64 | boolean | string"
+}
+
+// The DOMAIN refusal `tyPrintsAsRef` raises, written once so the direct spelling and the
+// generic pin cannot say it differently. Named type first (the subject the reader wrote),
+// then the domain, then the workaround after an em dash — `tErrUnsupported`'s message
+// convention, kept even though this is no longer that channel.
+function printRefRefusal(pt: i32): string {
+  "print expects one scalar or string value (" +
+    printDomainStr() +
+    "), got " +
+    tyToStr(pt) +
+    " — print the elements or fields individually, e.g. `print(xs[0])`"
+}
+
+// Whether `x` is OUTSIDE `print`'s domain by being a WasmGC REFERENCE: an array, a struct,
+// a map/set, a function value, a union carrying one of those, and any of them behind
+// `| null`. `print` takes ONE value of `printDomainStr()` and renders it through the
+// host's per-rep `__print_*__` sink; a container is not one of those reps.
+//
+// THIS IS A DOMAIN RULE, NOT A LOWERING GAP, and the distinction is measured rather than
+// asserted (`silent-class-inventory` D711). With both refusal sites lifted, all 19 corpus
+// cells become check-clean INVALID WASM and **not one runs**: disassembled, the emitter
+// falls through its ladder of positive rep tests to `call $fimport$0` — `__print_i32__`,
+// an `(i32) -> ()` import — with a `(ref $1)` on the stack. There is no partial lowering
+// to finish. What is missing is not a rep the emitter has yet to learn (a container's rep
+// is a perfectly ordinary `(ref $t)`) but a RENDERING the language has never defined:
+// separators, brackets, how a nested string quotes, a map's key order, what a closure
+// prints as, and — decisively — a guest-side f64 formatter, since a container must render
+// through the `__print_char__` stream while `print(1.5)` renders HOST-side, so `print(x)`
+// and `print([x])` would disagree on the same float unless somebody writes shortest
+// round-trip in emitted wasm. `std:fmt`'s header already declines that work in the other
+// direction ("f64→string … deliberately absent — `print` keeps covering floats").
+//
+// So this refuses on the plain `tErr` channel, in `toString`'s words — `toString expects an
+// i32 or boolean, got string` — and NOT on `tErrUnsupported`. The earlier verdict
+// (`destringify-types-program.md`, reason 4) put it on the capability channel because
+// "`print` has no declared type … so this cannot be an ordinary assignability error"; the
+// tree refutes that one builtin over, and `printDomainStr` is now the declared type.
+//
+// The SIBLING gate `tyPrintsAsUnionBox` is a genuine capability gap and deliberately keeps
+// its concession: every arm of `i32 | string` is INSIDE the domain, so the missing piece is
+// a runtime tag dispatch the emitter already performs for `is`. One landing moves neither
+// of the other's cells (D712).
 //
 // `string` is deliberately NOT here: it is a reference too, but the ladder routes it to
 // the string streaming printer. Nor is a LITERAL union (i32/string atoms widened to their

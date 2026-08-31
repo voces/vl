@@ -1943,6 +1943,47 @@ top of the constraint widening the same line is a pure win. **Two rungs, one lan
 evidence is that the branch's moved set is a strict SUBSET of the union of the single-rung moved
 sets — 25 against 34** — which is the arithmetic signature of a rung that is unsafe alone.
 
+### `print`'s DOMAIN is a design rule; its container refusal was wearing a capability gap's words (D711/D712)
+
+**`print` takes ONE value of `(i32 | i64 | f32 | f64 | boolean | string)` and that is the
+DESIGN, not a codegen stage VL has yet to reach.** The refusal for an array / struct / map /
+set / function value / union-of-those said `is type-valid but not yet supported by codegen`
+on the stable `unsupported-lowering` channel; it is now a plain `tErr` in `toString`'s
+words — `print expects one scalar or string value (…), got i32[] — print the elements or
+fields individually`. `driver.builtinScan` and the message both render one
+`typecheck.printDomainStr()`, so the domain the compiler advertises to LSP completion cannot
+drift from the one it enforces.
+
+**WHY THIS IS A RULING AND NOT A RELABEL, IN ONE MEASUREMENT.** Both refusal sites were
+lifted and the corpus regraded: **19 cells move `loud check reject` → check-clean invalid
+wasm and ZERO run.** Disassembled, the emitter falls through its ladder of positive rep
+tests onto `call __print_i32__` with a `(ref $t)` on the stack — there is no partial
+lowering to finish. What is missing is not a rep (a container's rep is an ordinary
+`(ref $t)` the emitter already builds and reads) but a RENDERING the language has never
+defined: separators, nesting, string quoting, a map's key order, what a closure prints as.
+`print(1.5)` renders HOST-side (both hosts agree: `1e+21`, `Infinity`, `NaN`, shortest
+round-trip) while a container must render guest-side through `__print_char__`, so
+`print(x)` and `print([x])` would disagree on the same f64 unless Ryu is written in emitted
+wasm — which `std:fmt`'s header and `std-design.md` D4 both decline from the other side.
+
+**THE EARLIER VERDICT'S REASON 4 IS REFUTED, AND THAT ONE FALSE PREMISE IS WHY THIS DRIFTED.**
+`destringify-types-program.md` ruled correctly that `print` does not learn to lower arrays,
+but justified the channel with *"`print` has no declared type … so this cannot be an ordinary
+assignability error — it has to be the same UNSUPPORTED-LOWERING admission"*. `toString` has
+no declared type either and refuses out-of-domain arguments with a plain type error
+(`toString expects an i32 or boolean, got string`). A settled design rule therefore spent
+months counting against clause 2 on every scoreboard run, because the sentence conceded what
+the ruling denied.
+
+**THE SIBLING GATE KEEPS ITS CONCESSION, AND THE SPLIT IS THE POINT (D712).** `print` of a
+BOXED VALUE UNION (`i32 | string`) is a real capability gap: every arm is already inside the
+domain and `if v is i32 { print(v) }` runs today, so nothing about the output is undecided —
+only the runtime tag dispatch is missing, and the emitter already performs that dispatch for
+`is`. Grouping the two by their shared `print of …` prefix would have merged a design rule
+with an implementable gap; the ablation separates them 19 / 0. General rule: **ask whether the
+argument's MEMBERS are inside the domain. If they are, the refusal is a capability. If the
+value has no members in the domain at all, the refusal is the domain.**
+
 ### PRINTABILITY is the fourth deferred capability, and the row's own prescription named the wrong LAYER (D401)
 
 **`print` is a capability like `==` and `+`, and it was lost at the pin the same way.**

@@ -19444,6 +19444,257 @@ Repro:
   family. Until it exists the emitter's floor is the only thing standing, and it is a floor:
   it names a rep it cannot classify, not a rule the language has.
 
+### D711 — [RULED 2026-08-31] `print` of a CONTAINER is a DOMAIN rule, and the message had been conceding a lowering that was never missing
+**CLOSED 2026-08-31 — the repro is NOW A LOUD CHECK REJECT whose sentence is a DOMAIN error
+off the `unsupported-lowering` channel (`print expects one scalar or string value (i32 | i64
+| f32 | f64 | boolean | string), got i32[] — …`). Was the same refusal conceding "is
+type-valid but not yet supported by codegen" · THE FAMILY IS 19 CELLS AND IT WAS ABLATED ·
+A DESIGN RULING, NOT A LOWERING — the language question it turns on is in "What would have
+to be decided" below, and re-opening it as a defect means answering that first**
+
+Repro:
+
+    const v = [1, 2, 3]
+    print(v)
+    // vl check rc 1:
+    //   [ERROR]: print expects one scalar or string value
+    //   (i32 | i64 | f32 | f64 | boolean | string), got i32[] —
+    //   print the elements or fields individually, e.g. `print(xs[0])`
+
+#### The measurement that decided it, and it is an ABLATION
+
+The question was live: `print of X is type-valid but not yet supported by codegen — `print`
+renders one scalar or string` says two incompatible things in one sentence, and only one of
+them is legitimate under the standing goal. Both were tested rather than argued.
+
+**LIFT THE GATE AND COUNT WHAT RUNS.** A compiler was built with both refusal sites
+disabled — `tyPrintsAsRef(pt, 0)` at the direct site (`checkNode`'s `print` arm) and at the
+generic pin (`validatePrintCstrs`), the predicate itself untouched:
+
+| | classes | note |
+|---|---|---|
+| `loud check reject` → **check-clean invalid wasm** | **19** | every cell in the family |
+| → `runs` | **0** | *not one program* |
+| `runs` → not-runs | 0 | |
+| other movement | 0 | |
+
+**Zero of 19 run.** If this were a capability half-built, some cell would come out the other
+side. The moved set is `d14idx_arr_{arr_s,nest,rec}`, `d401p_bare_{arr_arr_s, arr_bool,
+arr_f64, arr_i32, arr_nest, arr_nul_i32, arr_rec, arr_str, fn, map_s_i32, rec, set_s,
+union}`, `d401p_index_{arr_arr_s, arr_nest, arr_rec}`.
+
+**THE FIRST ABLATION WAS WRONG AND THE CORRECTION IS WORTH KEEPING.** Neutering the
+PREDICATE `tyPrintsAsRef` (rather than its two print call sites) cost **199 classes `runs` →
+not-runs**. The predicate has a SECOND consumer — `elemStoreClassOf`, the element-store rep
+classifier, asks it "does this type reach a reference rep" for its `TyNullable` and `TyUnion`
+arms. A function named for `print` decides how list elements are stored. Ablate the SITES,
+not the shared predicate.
+
+**REAL DISASSEMBLY (`./node_modules/.bin/wasm-dis`, binaryen 130) of the lifted build.**
+There is no partial lowering to finish — the emitter falls straight through its ladder of
+positive rep tests onto the i32 sink:
+
+    ;; const v: i32[] = [1,2,3]; print(v)
+    (func $0 (type $4)
+     (call $fimport$0            ;; __print_i32__ : (i32) -> ()
+      (global.get $global$0)     ;; (ref $1) — the array
+
+`{n: i32}` and `(i32) => i32` produce the same two instructions with their own `(ref $1)`.
+`f64[]` does not even reach `__print_f64__` (`$fimport$4`); it lands on `$fimport$0` too.
+
+#### The receiver-type table — every refused type, beside its DIRECT spelling
+
+The generic-position cells are D401's siblings and the table is the point: **every one of
+them has a DIRECT spelling that refuses with the identical sentence.** So there is no cell in
+this family where the language is inconsistent with itself; the whole family is one rule,
+stated once, reached two ways.
+
+| receiver | direct spelling `print(v)` | in the family |
+|---|---|---|
+| `i32`, `i64`, `f64`, `boolean`, `string`, `0 \| 1` (literal union) | **runs** | — accept side |
+| `i32[]` | refuses (domain) | yes |
+| `string[]` | refuses (domain) | yes |
+| `boolean[]` | refuses (domain) | yes |
+| `f64[]` | refuses (domain) | yes |
+| `i32[][]` | refuses (domain) | yes |
+| `string[][]` | refuses (domain) | yes |
+| `(i32 \| null)[]` | refuses (domain) | yes |
+| `{n: i32}` | refuses (domain) | yes |
+| `{n: i32}[]` | refuses (domain) | yes |
+| `{[string]: i32}` (map) | refuses (domain) | yes |
+| `{[string]: boolean}` (set) | refuses (domain) | yes |
+| `(i32) => i32` | refuses (domain) | yes |
+| `U1 = {a:i32} \| {b:i32}` | refuses (domain) | yes |
+| `i32[] \| null` | refuses (domain) | yes |
+| `i32 \| null` | refuses (**capability**, D712) | no |
+| `i32 \| string` | refuses (**capability**, D712) | no |
+
+#### The argument, for the language designer
+
+**1. `print` has a declared domain, and it predates the gate.** `driver.builtinScan`
+publishes `print` to LSP completion as `(i32 | i64 | f32 | f64 | boolean | string) => void`,
+with the note that `print` is *"an OVERLOAD SET, not a polymorphic function"*. Under clause 2
+— the compiler rejects only what the DESIGN forbids — an argument outside a callee's declared
+parameter type is the canonical thing a type system forbids. This change makes that literal:
+the message and the completion detail now render one `printDomainStr()`, so the domain the
+compiler advertises cannot drift from the one it enforces.
+
+**2. What is missing is a RENDERING, not a rep.** A container's rep is an ordinary
+`(ref $t)` the emitter already builds, indexes and reads. Nothing about codegen is
+unfinished. What has never existed is a decision about what `print([1, 2, 3])` *outputs* —
+separators, brackets, how a nested string quotes, a map's key order, cycle handling. "Not yet
+supported by codegen" was therefore not merely unhelpful, it was **false**.
+
+**3. The float case makes a container render inconsistent with `print` itself.** Each
+`__print_*__` import emits one whole log LINE, so a container must be assembled through the
+`__print_char__` / `__print_str_flush__` stream — i.e. **guest-side**. Scalars render
+**host-side**: measured on both hosts (Rust `vl-host` and the Deno `runWasm` harness, which
+agree exactly), `print` of a float gives `0.1`, `0.3333333333333333`, `1e+21`,
+`1.0000000000000002e-7`, `Infinity`, `NaN` — JS/Ryu shortest-round-trip with JS's exponent
+thresholds. So `print(x)` and `print([x])` would disagree on the same f64 unless somebody
+writes shortest round-trip in hand-assembled wasm. `std:fmt`'s header already declines that
+work from the other side: *"f64→string (shortest round-trip, Ryu-class) is deliberately
+absent — `print` keeps covering floats"* (and `std-design.md` D4 item 1 defers it explicitly).
+Rendering only the derivable subset would split the container family in two — `i32[]` prints,
+`f64[]` does not — which is a worse rule than either uniform answer.
+
+**4. A function value has nothing to render.** `(i32) => i32` is in this family. At runtime it
+is a table index plus a captured environment; there is no name and no source. Any output is
+an invented token or a lie about identity. This is the cell that shows the family is not one
+mechanism away from working.
+
+**5. The precedent is one builtin over.** `toString` — the other value-rendering builtin, also
+with no VL-spellable type — refuses out-of-domain arguments with a plain type error and no
+concession: `toString expects an i32 or boolean, got string`. That is now `print`'s sentence
+shape too.
+
+**6. The composite renderer belongs in std, where it can be written in VL and reviewed.** It
+already works today:
+
+    import { toStr } from "std:fmt"
+    import { join } from "std:str"
+    const xs = [1, 2, 3]
+    const parts: string[] = []
+    let i = 0
+    while i < xs.length { parts.push(xs[i].toStr()); i = i + 1 }
+    print("[" + parts.join(", ") + "]")
+    // prints: [1, 2, 3]
+
+Putting a format inside the compiler builtin makes it permanent (std has no deprecation
+story, and a builtin has less) and un-overridable, and duplicates a surface `std:fmt` is
+already the documented home for.
+
+**THE EARLIER VERDICT WAS RIGHT AND ITS REASON 4 WAS NOT.**
+`docs/internals/destringify-types-program.md` already ruled *"the checker rejects, and
+`print` does not learn to lower arrays"* in five numbered reasons, and reasons 1, 2, 3 and 5
+stand. Reason 4 — *"`print` has no declared type and `any` is not a VL type, so this cannot
+be an ordinary assignability error — it has to be the same UNSUPPORTED-LOWERING admission"* —
+is refuted by `toString`, which has no declared type either and does exactly that. That one
+false premise is the whole reason a settled design rule spent months wearing a capability
+gap's words, counting against clause 2 on every scoreboard run.
+
+#### What would have to be decided to re-open it
+
+Not "teach the emitter". The language would have to answer, in this order, and each answer is
+permanent once printed output is depended on:
+
+1. What does `print([1, 2, 3])` print — `[1, 2, 3]`, `1 2 3`, one line or many?
+2. How does a nested `string` quote (`["a"]` vs `[a]`), and what escapes?
+3. What is a map's key order — insertion, sorted, unspecified?
+4. What does `print(fn)` print, given a function value has no runtime identity?
+5. Who renders an f64 inside a container, given the host renders it outside one — and is a
+   guest-side shortest-round-trip formatter in the emitter acceptable, or does `std:fmt`
+   grow the renderer first (`std-design.md` D4) and `print` stay scalar for good?
+
+If those are answered, `printDomainStr` widens, `tyPrintsAsRef`'s two call sites go, and this
+row flips. Until they are, the refusal is what the design says and the message now says so.
+
+#### Measured, six instruments
+
+* **Corpus BYTE-IDENTITY.** `scripts/silent-sweep/corpuscmp.py` over `tests/cases/` + `std/`
+  against the base seed `9c67a2d8…`: **2,437 modules · 1,984 identical · 0 DIFFER · 0 LOST**
+  (453 not buildable by the base, excluded and never scored). A diagnostic-only change must
+  move no bytes, and it moves none.
+* **`regress.py`, cell-matched.** **19 classes moved, every one `loud check reject` → `loud
+  check reject` (message only) · `runs → not-runs` 0 · `→ silent` 0 · other 0.** `runs` is
+  **4,122 / 7,128 (57.83%)**, unchanged — as it must be: this row buys no program.
+* **The moved set IS the ablated set**, verified as sets: 19 = 19, symmetric difference
+  empty. The family was ablated, not read off the message.
+* **`tests/cases` build count: 1,984, unchanged, 0 LOST**; `cases_wasm_test.ts` 2,355 passed.
+* **Real disassembly**, above.
+* **`goal-scoreboard.py`.** Conceded cells **45 → 26**; total against the goal **140 → 121**;
+  **capability message literals 14 → 13**, and the one that left is
+  `typecheck.vl:17581 'is type-valid but not yet supported by codegen — `print` ren'`. The 9
+  corpus-unreached literals are unchanged at 9.
+
+**THE CHANNEL MOVED, NOT ONLY THE WORDS**, and that is what makes this a close rather than a
+rewording. The refusal was raised by `tErrUnsupported`, which stamps the stable
+`unsupported-lowering` category code that the LSP and `vl check`'s tooling ABI read — so the
+compiler was telling *machines*, not only readers, "type-valid, cannot build". It is now
+`tErr` with no code. `tests/selfhost_native_diag_code_test.ts` pins both sides: the container
+refusal carries no code and must not contain a concession phrase; the boxed-union refusal
+still carries `unsupported-lowering`.
+
+Fixtures: `types/print-array-rejected.vl`, `types/print-struct-rejected.vl`,
+`maps/print-map-rejected.vl`, `closures/print-closure-rejected.vl`,
+`generics/error-print-type-param.vl` (which now pins the CHANNEL SPLIT — its union lines
+still read "not yet supported by codegen" and no other line does),
+`soundness/hole-renders-as-blank-reject.vl`, `soundness/absence-markers-render-reject.vl`,
+`types/unknown-type-in-map-value.vl`. The accept side is unchanged:
+`types/print-scalar-boundary-controls.vl`.
+
+---
+
+### D712 — the boxed VALUE UNION is the print refusal that IS a capability gap, and it keeps its concession
+**LOUD CHECK REJECT (`print of a union value (i32 | string) is type-valid but not yet
+supported by codegen — narrow it first, …`) · 4 corpus cells · separated from D711 by the
+ablation that sized D711: lifting `tyPrintsAsRef`'s two sites moves 19 cells and moves NONE
+of these, whose gate is the sibling `tyPrintsAsUnionBox` · OPEN deliberately — unlike D711
+this one IS a capability gap, it is implementable, and it keeps its concession**
+
+Repro:
+
+    function pick(c: boolean): i32 | string {
+      if c { return 1 }
+      return "x"
+    }
+    print(pick(true))
+    // vl check rc 1:
+    //   [ERROR]: print of a union value (i32 | string) is type-valid but not yet
+    //   supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`
+
+* **WHY THIS IS THE OPPOSITE VERDICT TO D711, ON ONE TEST.** Ask whether the argument's
+  members are inside `printDomainStr()`. For `i32[]` there is no member — the value is a
+  container and the language has never said what it renders as. For `i32 | string` **every
+  arm is already printable on its own**, and the program `if v is i32 { print(v) } else {
+  print(v) }` compiles and runs today. Nothing about the OUTPUT is undecided: it is whatever
+  the taken arm prints. What is missing is the runtime tag dispatch at the print site — and
+  the emitter already performs exactly that dispatch for `is`. So the concession is honest
+  here and stays.
+
+* **THE MESSAGE GROUP AND THE MECHANISM DISAGREE, WHICH IS WHY THIS IS ITS OWN ROW.** All 23
+  corpus cells matching `print of` read as one family by message. They are two: 19 answer to
+  `tyPrintsAsRef` (D711) and 4 to `tyPrintsAsUnionBox` — `d352opt_union`,
+  `d401p_bare_nul_i32`, `d401p_bare_vunion`, `d401p_index_arr_nul_i32`. The ablation
+  separates them cleanly (19 / 0), and one fix moves neither of the other's cells.
+
+* **IT IS ALSO THE TREE'S CANONICAL `unsupported-lowering` WITNESS.**
+  `tests/selfhost_native_diag_code_test.ts` and `tests/lsp_wasm_checker_test.ts` both use
+  `print(pick(true))` as the example of "type-valid, codegen cannot lower". That is still
+  correct after D711 precisely because this row was NOT collapsed into it.
+
+* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The print arm in `wasmEmit.vl` gains a boxed-
+  union rung ahead of its scalar ladder: read the box tag, `br_table`/`if` chain over the
+  arms, unbox each and call that arm's `__print_*__` sink — the shape `emitPrintNulString`
+  and `emitPrintNulBool` already have for the two NICHE cases (`string | null`,
+  `boolean | null`), generalised from a sentinel to a tag. The floor `tyPrintsAsUnionBox`
+  then narrows to the arms that are themselves out of domain, at which point it delegates to
+  `tyPrintsAsRef` and the two gates become one question asked twice. **Estimated price:
+  4 corpus cells to `runs`**, plus every hand-written program that prints a union without
+  narrowing first. The risk to weigh is that the print ladder is a documented site of silent
+  miscompiles (its own comments carry three), so it wants the rep-fuzz gate and a boundary
+  fixture per arm rep, not a quick rung.
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
