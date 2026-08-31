@@ -18590,6 +18590,17 @@ measured rather than argued:
 5. **Half the owner's report is that `vl check` says the program is clean.** An emitter-side
    `emitFail` would fix the invalid wasm and leave `vl check` lying. Only the checker arm fixes both.
 
+**REASON 4 IS REFUTED (2026-08-31, `silent-class-inventory` D711); THE VERDICT STANDS.** The
+other four reasons hold and the refusal is a design rule. But "`print` has no declared type,
+so this cannot be an ordinary assignability error" is false one builtin over: `toString` has
+no declared type either and answers `toString expects an i32 or boolean, got string` — a
+plain `tErr`, no category code. `print`'s container refusal is now that shape, quoting the
+domain `driver.builtinScan` has published all along. The cost of the wrong channel was not
+cosmetic: the compiler was telling the LSP ABI "type-valid, cannot build" about a program the
+design forbids, and the concession counted against clause 2 on every `goal-scoreboard.py` run
+(19 corpus cells). The BOXED VALUE UNION of reason 2 keeps the `unsupported-lowering` channel
+and is filed as D712 — its arms are inside the domain, so that one really is a lowering.
+
 #### The filed diff — BUILT, GATED AND MEASURED HERE, then reverted (`typecheck.vl` is not this slice's file)
 
 `compiler/typecheck.vl`, two hunks, +49 lines, no new export:

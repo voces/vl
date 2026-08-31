@@ -121,3 +121,43 @@ Deno.test({
     }
   }
 });
+
+// THE TWO PRINT REFUSALS SIT ON DIFFERENT CHANNELS, AND THAT SPLIT IS THE ASSERTION.
+// `print` takes one value of `(i32 | i64 | f32 | f64 | boolean | string)`
+// (`typecheck.printDomainStr`, which `driver.builtinScan` also renders as the LSP
+// completion detail). A CONTAINER is outside that domain, so it is refused the way
+// `toString expects an i32 or boolean, got string` is refused — a plain type error with
+// NO category code. A boxed VALUE UNION is inside the domain (every arm prints on its
+// own) and only the runtime tag dispatch is missing, so it keeps the
+// `unsupported-lowering` admission above. `silent-class-inventory` D711/D712 carry the
+// ruling and its measurement; a change that collapses the two channels reddens here.
+Deno.test({
+  name: "diag-code: print of a CONTAINER is a domain error, carrying no code",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(exp, "const xs = [1, 2, 3]\nprint(xs)\n");
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "") {
+    throw new Error(
+      `expected an empty code (a domain error, not a capability admission), got: ${
+        JSON.stringify(diags[0])
+      }`,
+    );
+  }
+  if (!diags[0].message.includes("print expects one scalar or string value")) {
+    throw new Error(
+      `expected the domain sentence, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  if (/not yet supported by codegen|no lowering/.test(diags[0].message)) {
+    throw new Error(
+      `a domain rejection must not concede the program is buildable: ${
+        JSON.stringify(diags[0])
+      }`,
+    );
+  }
+});
