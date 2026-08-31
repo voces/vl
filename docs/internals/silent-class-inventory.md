@@ -19444,6 +19444,219 @@ Repro:
   family. Until it exists the emitter's floor is the only thing standing, and it is a floor:
   it names a rep it cannot classify, not a rule the language has.
 
+### D701 — [CLOSED 2026-08-31] a MAP parameter had no `$fnsig` token, so every function VALUE taking one was refused
+**closed as `runs` · was `loud emit reject: emitProgram: a function value's signature is not yet supported — a function value may not take a nullable or map parameter (or return one)` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 6 of the 6 cells carrying that message, all one mechanism (a map PARAM on a function value) · +6 corpus cells to `runs`, 0 `runs` lost, 0 into any silent class, no `tests/cases` module stopped building**
+
+Repro (now runs, printing `7`):
+
+    const c: {[string]: i32} = Map()
+    c["k"] = 7
+    const lamc = (x: {[string]: i32}) => x
+    const dd = lamc(c)
+    print(dd["k"] ?? 0)
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: a function value's signature is not yet supported — a function
+    //   value may not take a nullable or map parameter (or return one); annotate and
+    //   call it as a named function instead
+    // Now: prints 7.
+
+* **THE DIRECT SPELLING RAN.** `function lamc(x: {[string]: i32}) { return x }` runs on
+  master — the message itself prescribed it — and so does a map RESULT
+  (`const mk = (n: i32) => c`). Only the PARAM position was unwired, which is what makes this
+  a gap rather than a rule.
+
+* **WHAT MADE IT LOOK UNWIRABLE WAS THE SLOT, NOT THE POSITION.** `cloParamTok` excluded
+  `map` with the note that `repSigTokOfKind("map")` "yields a result token, so exclude it
+  explicitly here — else a map param would key a slot-less `m` and mis-lower". The hazard is
+  real and the ENCODING carries it: `repSigTokHasSlot("map")` has been true since the token
+  was minted, so `m<shape>;` is what every decoder already parses (`emitSynthCloSig`'s
+  `synthSigTokHasIdx` walk, `sigParamCoerceKind`, `sigKeyRetSlot`), and `paramStructIdxOf` →
+  `annValtypeSlotOf` has carried the `map` → `mapAnnShape` pairing all along. The digit is
+  the heap slot the callee's own functype declares.
+
+* **TWO PRODUCERS, BOTH ARMS.** `cloParamTok` (AST) alone fixes the bound-lambda spelling;
+  `annParamKind` (annotation string) is what an annotated higher-order callee or a struct
+  field's arrow keys through, and its RESULT sibling `annRetKind` has carried the map arm
+  since maps entered the result ABI. With only the first arm the two producers DISAGREE and
+  the program gets `function-value call arity has no interned signature` instead.
+
+* **DISASSEMBLY.** The higher-order witness's `call_indirect (type $9)` runs against
+  `(func (param structref (ref $6)) (result (ref $6)))` — the map struct, not the all-i32
+  arity fallback.
+
+* **THE MESSAGE IS NARROWED, because a list of kinds goes stale the day a kind is wired and
+  this one already had.** `string | null` (`N`), `S | null` (`n<slot>;`) and `i32[] | null`
+  (`o`) params have been in the value-call ABI for releases —
+  `closures/closure-value-nullable-niche-param.vl` runs all three — while the sentence claimed
+  otherwise. `cloSigRejectWhat` walks `cloSigKeyExt`'s own ladder in its own order and names
+  the position that actually stopped it, and it is TOTAL so the site stays ONE message
+  literal. What still refuses: the un-tokened kinds (`nulmap`, `nulreflist`, `nulvariant`,
+  `nulbool`, the four distinct-backing nullable scalar lists) and a `nulclosure` param.
+
+* Pinned by `tests/cases/closures/closure-value-map-param.vl` (three positions: the bound
+  lambda, an annotated HOF parameter, a struct field's arrow) and by
+  `closures/error-nullable-niche-param-lambda-floor.vl`, which keeps the floor for `f64[] |
+  null` and now names the position in its directive.
+
+---
+
+### D702 — [CLOSED 2026-08-31] "nested arrays are not supported" refused a SIX-LEAF ALLOW-LIST, not nested arrays
+**closed as `runs` · was `loud emit reject: emitProgram: nested arrays are not supported` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 5 of the 8 cells carrying that message (the other 3 are the residue below, a different mechanism) · +5 corpus cells to `runs` plus 2 that carried `unsupported for-in iterable`, 0 `runs` lost, 0 into any silent class, no `tests/cases` module stopped building**
+
+Repro (now runs, printing `7`):
+
+    function rd() {
+      const lv1 = [{ r: 7 }]
+      const c = [lv1]
+      print(c[0][0].r)
+    }
+    rd()
+    // was: vl check rc 0; vl run -> emitProgram: nested arrays are not supported
+    // Now: prints 7.
+
+* **THE SENTENCE WAS BROADER THAN THE MISS BY A LONG WAY.** `i32[][]`, `string[][]`,
+  `f64[][]` and every ANNOTATED nested list run on master; `const c: Circle[][] = [lv1]`, one
+  annotation over from the repro, runs. What did not was an INFERRED nested array with no
+  declared destination whose inner list's LEAF sat outside a six-entry allow-list — a struct,
+  a map, an f32, or another array.
+
+* **THE ALLOW-LIST WAS STANDING IN FOR A DISAGREEMENT.** `tyNestedArrLeafSupported` existed
+  because `arrLitNestedElemKind` answered the row's kind from a hand-written leaf map while
+  the annotation route resolves BY NAME through `refArrElemKind`, and `rlInternName` banks the
+  FIRST kind against a rep key. The two agreed on exactly six leaves; outside them an `f32[]`
+  leaf was 4 here and 10 there, a nested `i32[][]` leaf 4 and 9, and the outer list's backing
+  was typed as the i32-list wrapper while a different wrapper was stored into it. So the
+  intern declined, the literal fell to the i32-list default, and that path's floor prints the
+  broad sentence. `arrLitNestedElemKind` IS `refArrElemKind` now, over one producer
+  (`refElemArrName`, split out of `ensureRefElemTy`), and the allow-list is deleted.
+
+* **THE TWO PIECES D625's REFUSED WIDE CANDIDATE WAS MISSING.** That candidate paid 4 classes
+  / 22,707 census cells `loud emit reject` → `check-clean invalid wasm`; this one pays ZERO.
+  (i) A kind-9 element interns INNER-FIRST through `ensureRefElemTy`, the annotated path's own
+  core — built flat first, `const c = [[[1, 2]]]` was `vl check` rc 0 and
+  `expected (ref null $type), found (ref $type)` at load, reproduced and then fixed.
+  (ii) The intern declines an element the ref-list layer cannot NAME (`nameIsRefArray`),
+  because `refArrElemKind`'s base arm answers kind 1 for a spelling no shape arm claims — see
+  the residue below for the witness that found it.
+
+* **AND THE FIRST-ELEMENT ARMS NEEDED THE MATCHING RUNG.** `arrLitElemKind` /
+  `arrLitElemName` key a nested literal from its inner literal's LEAF, one level short for a
+  REF inner: they answered 4 / `"i32[]"` for `[[{r: 7}]]` and `[[[1, 2]]]`. Both defer to the
+  arena (kind 9) when the inner literal is itself a ref list.
+
+* **DISASSEMBLY.** `wasm-dis` on the repro: `$0` the struct, `$1` its backing, `$2` the inner
+  wrapper, `$3 (array (mut (ref null $2)))` the outer backing, `$4` the outer wrapper — the
+  inner wrapper at a strictly lower type index, which is the whole ordering requirement.
+
+* **THREE PINNED DECLINES RETIRED.** `arrays/nested-array-inferred-empty-unsupported-leaf.vl`
+  (f32 leaf, kind 10), `…/nested-array-inferred-empty-deep-leaf.vl` (an ARRAY leaf, kind 9)
+  and `arrays/error-inferred-union-element-nested.vl` each pinned this decline and each said
+  in its own header that supporting it "is a real design step". All three are now `@run` with
+  their measured output (`2.5` / `3` / `1`,`a`). New positive fixture:
+  `arrays/nested-array-inferred-ref-leaf-literal.vl`, six spellings.
+
+* **RESIDUE — A DIFFERENT MECHANISM, 3 CELLS, STILL OPEN (needs a row id).** `a000006`,
+  `a001560`, `b001190` keep the message. Ablated: an INLINE-shape element whose declared row
+  cannot be resolved because a same-field-NAME twin with a different field type is declared —
+  `type Circle = {r: i64}` beside a `{r: 7}` literal, or `{r: K}` over a literal union, where
+  `shapeElemDeclaredStructIdx` declines "an atom-vs-plain collision it must not guess
+  through". `nameIsRefArray` is then false for the element and the gate above keeps master's
+  loud reject. Declaring the shape (`type D = {r: i32}`) makes all three run today, so it is
+  `structIndexOfTypeName`'s shape-resolution seam and not the nested-array lowering. Witness:
+
+        import { reverse } from "std:array"
+        type Circle = { r: i64 }
+        function rd() {
+          const c = [{ r: 7 }]
+          const dd = reverse([c])[0]
+          print(dd.length)
+        }
+        rd()
+        // vl check rc 0; vl run -> emitProgram: nested arrays are not supported
+        // Deleting `type Circle` — or declaring `type D = {r: i32}` beside it — makes it
+        // print 1.
+
+---
+
+### D703 — [CLOSED 2026-08-31] the monomorphizer's GLOBAL pin arm was a two-rung subset of its LOCAL one, and off inside a function
+**closed as `runs` · was `loud emit reject: emitProgram: monomorphize: unsupported argument type for `X` in a call to `X`` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 7 cells in three sub-mechanisms (5 the pin ladder, the same 5 plus one the scope switch, 1 the missing struct row) · +7 corpus cells to `runs`, 0 `runs` lost, 0 into any silent class, no `tests/cases` module stopped building**
+
+Repro (now runs, printing `1`):
+
+    type U = i32 | string
+    function idg<T>(x: T): T { return x }
+    const a: U = 6
+    const z = idg(a)
+    print(1)
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: monomorphize: unsupported argument type for `x` in a call to `idg`
+    // Now: prints 1.
+
+* **THE DIRECT SPELLING RAN IN ALL THREE SUB-MECHANISMS.** `function idg(x: U): U`,
+  `function idg(x: {r: i32[]}[]): …`, `function idg(x: i32[][][]): …` and
+  `function idg(x: {r: i32}): {r: i32}` all run on master with the identical surrounding
+  program. So does the same binding declared as a LOCAL rather than a global.
+
+* **THE LADDER.** `monoArgTyName`'s annotated-LOCAL and PARAM arms ask `monoAnnPinName`,
+  whose header says it exists so "a spelling added to one and not the other" cannot happen.
+  The GLOBAL arm asked TWO rungs of it (`monoCompositeListAnnName`, then `monoNulAnnName`),
+  each added for one defect, both resting on the claim that "the struct / union / map /
+  scalar spellings have their own module-scope story through the classifier tables". The
+  UNION spelling does not. The arm delegates to `monoAnnPinName` now.
+
+* **THE SCOPE SWITCH.** `monoGlobalLetOf` declined on `fnIx >= 0` outright, reasoning that "a
+  function-scoped binding of the same name SHADOWS the global". That is right about shadowing
+  and cannot tell it apart from "this name is not a local at all" — so a top-level
+  `const c: {r: i32[]}[]` handed to a generic INSIDE a function reached no annotation channel
+  and took the loud floor, while the identical call at module scope compiled. It declines on
+  the SHADOW TEST itself now, and gained the un-annotated half its local twin has had since it
+  was written (recurse into `letInit`, with that arm's two rules verbatim).
+
+* **NO `sNames` ROW.** `collectS` SKIPS a `type X = {…}` that is a union member, so
+  `type Shape = Circle | Sq` deletes `Circle`'s struct row and an un-annotated
+  `const c = { r: 7 }` whose only layout match was `Circle` resolves to nothing. Ablated: with
+  `Circle` absent the literal mints its own row and RUNS; with `Circle` declared and NOT a
+  union member it RUNS; the field type is scenery. The pin is the checker's recorded shape
+  through `monoAnnPinName`, AT THE FLOOR, so it can only turn a refusal into a pin. **The
+  render has to be `tyToEmitName`, not `nodeTyName`** — built with the spaced `tyToStr` render
+  the pin was rejected by a DIFFERENT floor (`only i32, …, or string parameters are
+  supported`), a relocated loud reject rather than a fix.
+
+* **SHADOWING IS PINNED IN BOTH DIRECTIONS.** A PARAM shadow that must run
+  (`generics/pin-global-binding-both-scopes.vl` leg 5) and a LOCAL shadow that must stay the
+  loud reject (`generics/error-pin-global-shadowed-by-local.vl`). A four-cell shadow grid is
+  byte-identical to master.
+
+* **WHAT IT BUYS A CALLER.** `tests/cases/std/error-array-struct-element.vl` pinned
+  `monomorphize: unsupported argument type for `self` in a call to `sorted`` over a
+  MODULE-SCOPE struct-element list and said in its own header what to do when the refusal
+  lifted. It is now `std/array-struct-element-module-scope.vl`, an `@run` pinning a stable
+  sort, a structural `indexOf` and `reverse`. `std/array.vl`'s ledger loses its last SCOPE
+  carve-out.
+
+* **RESIDUE FOUND WHILE PINNING THE SHADOW TEST — A CLAUSE-1 SOUNDNESS BUG, PRE-EXISTING,
+  STILL OPEN (needs a row id).** A LOCAL that shadows a module-scope binding of a different
+  REP, handed to a generic, is `vl check` rc 0 and INVALID WASM on master and on this branch
+  alike — the rep classifiers (`structIndexOfExpr`, `exprString`) resolve the Ident through
+  the MODULE table because `buildLocals` is post-mono, and answer about the global. Not
+  something a pin arm can fix; the pin arm's own half is pinned by the two fixtures above.
+  Witness:
+
+        type V = { r: i32 }
+        function idg<T>(x: T): T { return x }
+        const sh: V = { r: 99 }
+        function leg5() {
+          const sh = 7
+          print(idg(sh))
+        }
+        leg5()
+        print(sh.r)
+        // vl check rc 0; vl run -> failed to compile: …
+        //   type mismatch: expected (ref $type), found i32
+        // The `string` global twin fails identically. Byte-identical on master.
+
+---
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
