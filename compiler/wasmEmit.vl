@@ -13371,6 +13371,29 @@ function orderedDirectArgs(callIx: i32, target: i32) {
   none
 }
 
+// Is the argument at `argIx` a plain STRUCT whose emitted heap type IS union-arm `vi`'s —
+// i.e. a declared LAYOUT TWIN of the arm, sharing one heap type in the emitted module?
+//
+// The predicate is `sHeapIdx[row] == uVarHeap[vi]`, verbatim the test `emitUnionBoxArg`
+// already runs at the box boundary six thousand lines up ("gated on the heaps DIFFERING so
+// an already-deduped shape keeps the byte-identical raw pass"). It is a question about the
+// EMITTED TYPES, not about names: `sTwin` / `uVarTwin` / `uVarSTwin` are the three columns
+// that can make the two indices coincide, and reading the heaps asks the conjunction of all
+// three rather than re-deriving one of them.
+//
+// -1 for a non-struct argument, an unresolvable row, or a slot outside the variant table,
+// so a caller can treat "true" as "pushing this value raw is exactly what the direct call
+// does with it".
+function cloArgIsArmHeapTwin(argIx: i32, vi: i32, fnIx: i32): boolean {
+  if vi < 0 { return false }
+  if vi >= uVarHeap.length { return false }
+  if !exprStruct(argIx, fnIx) { return false }
+  const si = structIndexOfExpr(argIx, fnIx)
+  if si < 0 { return false }
+  if si >= sHeapIdx.length { return false }
+  sHeapIdx[si] == uVarHeap[vi]
+}
+
 function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -13530,8 +13553,37 @@ function emitCallRef(body: i32[], callIx: i32, fnIx: i32) {
         if sigParamKindAt(ckey, i) == "variant" {
           cvSlot = sigParamSlotAt(ckey, i)
           const cvArg = P.nodes[unwrapParen(args[i])]
+          // THE LAYOUT-TWIN ARGUMENT, and it is the case the floor's own header carved out
+          // and then did not implement (D732). That header refutes an `ObjLit` EXEMPTION
+          // with a witness — `f({ r: 7 })` "with an arm-typed closure parameter AND NO
+          // LAYOUT TWIN" fell from a loud reject into check-clean invalid wasm — and the
+          // clause it turns on is the one this predicate asks. WITH a twin declared the arm
+          // and the struct are ONE heap type in the emitted module (`uVarSTwin`, D280), so
+          // the raw push the direct call already performs is valid by construction:
+          //
+          //     type Circle = { r: i64 }        // an arm of Shape
+          //     type Dot    = { r: i64 }        // its declared layout twin
+          //     type Shape  = Circle | Sq
+          //     const c = { r: 7 }              // un-annotated: reps as the shared heap
+          //     const lamc = (x: Circle) => x
+          //     const dd = lamc(c)              // loud emit reject
+          //
+          // — while `function lamc(x: Circle)` + the identical `lamc(c)` RUNS today, and so
+          // does the same program with `Dot` deleted (no twin, so the literal is claimed by
+          // the arm and `exprVariantIndex` answers). One program, two answers, decided by
+          // which spelling of the callee was written.
+          //
+          // ASKED OF THE HEAPS, not of the tables, which is `emitUnionBoxArg`'s discipline
+          // at the same seam: the emitted type is what the `call_ref` functype declares, so
+          // a predicate reading `sHeapIdx`/`uVarHeap` cannot disagree with the bytes. Where
+          // the heaps DIFFER the floor stands exactly as before — an argument that is
+          // neither the arm, nor a box holding it, nor a literal that can be built as it,
+          // nor a value already of the arm's heap type, is still rejected.
+          const cvTwin = cloArgIsArmHeapTwin(args[i], cvSlot, fnIx)
           const cvBuildable = cvSlot >= 0 &&
-            (exprUnion(args[i], fnIx) || cvArg is ObjLit)
+            (exprUnion(args[i], fnIx) ||
+            cvArg is ObjLit ||
+            cvTwin)
           if exprVariantIndex(args[i], fnIx) < 0 && !cvBuildable {
             return emitFail(
               "emitProgram: value-call union-ARM parameter given a value that is not that arm — a value call does not yet build one (annotate the binding as the arm, or call it as a named function)",

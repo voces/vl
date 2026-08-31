@@ -2781,7 +2781,23 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   }
   if letIsVariant(letIx, fnIx) { return "variant" }
   if letIsUnion(letIx, fnIx) { return "union" }
-  if letIsStruct(letIx, fnIx) { return "struct" }
+  if letIsStruct(letIx, fnIx) {
+    // THE D51 PAIR, mirrored from `collectLocals`' own struct arm (D731). That arm mints
+    // `("variant", lov)` where the struct table has NO row for the literal's field set and
+    // a union ARM is the only claimant; this ladder minted `"struct"` for the same binding,
+    // and `captureValStructIdx`'s companion then had to answer a VARIANT row into a
+    // `"struct"` kind — two index spaces behind one number. The kind is what selects the
+    // table (`fbValtype` reads `sHeapIdx` for "struct" and `uVarHeap` for "variant"), so
+    // the flip has to happen HERE or the slot is read from the wrong one.
+    //
+    // GATED ON THE `-1` exactly as there: wherever the struct table has the row the kind is
+    // unchanged, so this can only move a binding whose pair is `("struct", -1)` today — the
+    // `fbValtype` bounds guard, a loud reject.
+    if structIndexOfLet(letIx, fnIx) < 0 {
+      if letObjLitVariantIdx(letIx) >= 0 { return "variant" }
+    }
+    return "struct"
+  }
   if letIsArray(letIx, fnIx) { return "list" }
   if letIsNulString(letIx, fnIx) { return "nulstr" }
   if letIsString(letIx, fnIx) { return "str" }
@@ -4496,8 +4512,49 @@ export function captureValStructIdx(fe: i32, name: string) {
         return letRefListSlot(b, pf)
       }
       if letIsVariant(b, pf) { return variantIndexOfLet(b, pf) }
-      const iv = P.nodes[bn.letInit]
-      if iv is ObjLit { return structIndexOfExpr(bn.letInit, pf) }
+      // THE STRUCT RUNG, AND IT WAS AN `ObjLit` PEEP-HOLE WHERE EVERY OTHER RUNG ABOVE IT
+      // IS A `letIs*` CLASSIFIER (D731). `letInitCellKind` types this env field "struct"
+      // for EVERY struct-valued initializer — a `: Circle`-returning CALL, a member read,
+      // a narrowed value — and the slot column answered only for a bare object literal, so
+      // the pair `("struct", -1)` reached `fbValtype`'s bounds guard:
+      //
+      //     type Circle = { r: i32 }
+      //     function mkc(): Circle { return { r: 1 } }
+      //     function outer() {
+      //       const c = mkc()                    // un-annotated, struct-valued CALL
+      //       function inner() { print(c.r) }    // captured and READ
+      //       inner()
+      //     }
+      //
+      // — `emitProgram: ref valtype with no interned shape`, `vl check` rc 0, on five lines
+      // with no union, no generic and no nesting past one frame. ANNOTATING the binding
+      // runs, NOT capturing runs, and an object-LITERAL initializer runs; only the
+      // un-annotated call init through a capture had no answer. The lambda spelling of
+      // `inner` fails identically, and a module GLOBAL of the same shape runs, because
+      // `globalCellStructIdx` already asks the full ladder.
+      //
+      // `structIndexOfLet` IS THAT LADDER and it is the one `collectLocals` runs for the
+      // same binding one storage class over (annotation, then `structIndexOfExpr` of the
+      // initializer). Asking it here makes the env field and the local agree by
+      // construction rather than by two hand-written peep-holes; the `ObjLit` case it
+      // replaces is the tail of that same ladder, so a literal init keeps its answer.
+      //
+      // AND THE D51 PAIR COMES WITH IT, for the reason `collectLocals`' own struct arm
+      // states: `const c = { r: n }` beside `type Shape = Circle | Sq` has NO struct row
+      // for its field set (`collectS` skips a union member), `letIsVariant` declines (its
+      // init leg is `exprVariantIndex`, which carries no object-literal field-set arm by
+      // design), and the arm is then the only claimant. GATED ON THE `-1`, so it can only
+      // fire where the answer today is a loud reject, and `letObjLitVariantIdx` re-states
+      // the "no struct claimant" precondition itself. `letInitCellKind` carries the
+      // matching KIND flip, so the slot and the table it indexes come from one fact.
+      if letIsStruct(b, pf) {
+        const csi = structIndexOfLet(b, pf)
+        if csi < 0 {
+          const cov = letObjLitVariantIdx(b)
+          if cov >= 0 { return cov }
+        }
+        return csi
+      }
     }
   }
   -1
@@ -14967,6 +15024,26 @@ function fieldCodeForMatch(ty: i32): i32 {
 // first match wins. This function is that question asked of the TYPE, so it inherits the same
 // first-match behaviour rather than introducing it — the partition is copied, not intended (B193).
 export function variantRowOfObjFieldSet(ty: i32): i32 {
+  variantRowOfObjFieldSetK(ty, false)
+}
+
+// The LENIENCY-LEVELLED form (D733), the VARIANT half of `structRowOfObjFieldSetK`. `widen`
+// applies `objFieldCodeWidens` in place of code equality, for a shape no earlier rung of
+// `shapeNominalOfTy` could name at all.
+//
+// FIRST-MATCH IS KEPT ON THE WIDENED PASS HERE, WHERE THE STRUCT TWIN DEMANDS UNIQUENESS,
+// and the asymmetry is the point rather than an oversight. The struct side has no single
+// function deciding which row a literal builds at that this scan can be checked against, so
+// two widened claimants are two layouts and no evidence. The variant side HAS one:
+// `objVariantName`, which is FIRST MATCH over `uVariants` by field-NAME SET, with map (19)
+// and nested-struct (15) tightening and NO scalar-code tightening at all — and it is
+// literally the function `letObjLitVariantIdx` / `collectLocals`' D51 arm call to decide the
+// binding's arm. So a first-match widened scan here answers the row the VALUE already
+// carries; requiring uniqueness would decline exactly the layout-twin programs the value
+// resolved without difficulty (`type Circle = {r:i64}` beside `type Dot = {r:i64}`, both
+// arms, is `objVariantName`'s ordinary first-match case). Widening is still a strict subset
+// of what `objVariantName` accepts, so this can only agree with it or decline.
+function variantRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
   if t is TyObj {
@@ -14988,7 +15065,20 @@ export function variantRowOfObjFieldSet(ty: i32): i32 {
           } else {
             const want = fieldCodeForMatch(ftys[k])
             if want >= 0 {
-              if want != variantFieldTypeAt(vi, fj) { ok = false }
+              if widen {
+                if (
+                  !variantFieldCodeWidens(
+                    want,
+                    variantFieldTypeAt(vi, fj),
+                    vi,
+                    fj,
+                  )
+                ) {
+                  ok = false
+                }
+              } else if want != variantFieldTypeAt(vi, fj) {
+                ok = false
+              }
             } else {
               // The same leniency-with-one-tightening the struct matcher carries: uncoded fields
               // are lenient (the render path's `shapeFieldTypeCompat` refutes only on PROVEN
@@ -15105,7 +15195,87 @@ function rowElemDeclConflicts(si: i32, fnames: string[], ftys: i32[]): boolean {
   false
 }
 
+// The declared-row WIDENINGS `anonValueFitsField` grants an object LITERAL's field VALUE,
+// asked of a recorded field TYPE instead of a value node — the second, lenient pass of the
+// scan below (D733).
+//
+// WHY THE TWO SIDES HAVE TO AGREE. `structIndexOfObj` decides which row an object literal
+// BUILDS, and it accepts a widening: `{ r: 7 }` beside `type Circle = { r: i64 }` builds
+// `Circle` with an `i64.const 7`, because a bare integer literal reaches the wider slot
+// through the checker's adoption (`anonValueFitsField`'s `sc == 23` leg). The scan below
+// decides which row a recorded SHAPE denotes, and its per-field code tightening refuses the
+// same pair: the checker recorded `{r: i32}` for that literal, `i32` is not `i64`, no row
+// matches, and `shapeNominalOfTy` answers "".
+//
+// A NAME NOBODY CAN PRODUCE IS A CONTAINER NOBODY CAN INTERN. `arrLitNominalElemName` —
+// the ONE rung `arrLitIsRef`, `arrLitElemName` and `arrLitElemKind` all route through — asks
+// exactly this question of the array's recorded element, so `const c = { r: 7 }` +
+// `const xs = [c]` fell to the i32-list default and hit its floor:
+// `emitProgram: struct array elements are not supported`, on a program whose value is
+// ALREADY a `(ref $Circle)`. Delete `Circle` and the same program runs (the literal mints
+// its own `#anon` row and both sides agree on it); change the field to `i32` and it runs
+// (the codes match); annotate the binding and it runs. Only the widened pair had no answer,
+// and the same seam prints "nested arrays are not supported", "unsupported for-in iterable"
+// and "map value type has no interned slot" one container layer out.
+//
+// SECOND PASS, NEVER A LOOSER FIRST ONE — the D461 discipline, verbatim from
+// `structIndexOfTypeName`, which split its own scan the same way for the union-BOX pairing:
+// "run as ONE lenient pass it hands a single-field render the FIRST box row rather than the
+// exact one, which is a corpus module lost." Only a shape that placed NOWHERE reaches this,
+// and the lenient pass additionally requires a UNIQUE claimant — with two rows widening onto
+// the same field set there is no evidence which one `structIndexOfObj` built, so declining
+// leaves the program exactly where master left it.
+function fieldCodeWidensElem(qc: i32, rc: i32, elem: string): boolean {
+  if qc == rc { return true }
+  // A union-BOX field takes any member — `anonValueFitsField`'s own first line, and the
+  // pairing D461 added to the NAME side of this same question.
+  if rc == 16 { return true }
+  if qc == 0 {
+    // An i32 / boolean / literal-union-atom value widens into the wider numeric slots and
+    // fills the `K | null` atom niche. NOT the `boolean | null` niche (21): that one needs
+    // the value to be a boolean LITERAL, a distinction the code has erased and a TYPE
+    // cannot recover, so it stays refused. NOT the map slots (19 / 29) either — those are
+    // `anonValueFitsField`'s answer to a value node whose code it could not read, and there
+    // is no shape whose recorded field type is `i32` that a map row should claim.
+    if rc == 23 { return true }
+    if rc == 24 { return true }
+    if rc == 30 { return true }
+    return false
+  }
+  if qc == 3 {
+    // A STRING value: the `string | null` ref niche, the `K | null` atom niche, and a
+    // literal-union ATOM slot — which records its union name in the row's element column,
+    // and a string literal is exactly how such a field is written (`{ v: "a" }` for
+    // `v: "a"|"b"`).
+    if rc == 20 { return true }
+    if rc == 30 { return true }
+    if rc == 0 { return elem != "" }
+    return false
+  }
+  false
+}
+
+// `fieldCodeWidensElem` against a STRUCT row's field.
+function objFieldCodeWidens(qc: i32, rc: i32, si: i32, fj: i32): boolean {
+  fieldCodeWidensElem(qc, rc, sFieldElemNameAt(si, fj))
+}
+
+// `fieldCodeWidensElem` against a VARIANT row's field — the same relation read out of the
+// other table, so the two field-set scans cannot drift on what a widening is.
+function variantFieldCodeWidens(qc: i32, rc: i32, vi: i32, fj: i32): boolean {
+  fieldCodeWidensElem(qc, rc, variantFieldElemName(vi, fj))
+}
+
 export function structRowOfObjFieldSet(ty: i32): i32 {
+  const strict = structRowOfObjFieldSetK(ty, false)
+  if strict >= 0 { return strict }
+  structRowOfObjFieldSetK(ty, true)
+}
+
+// The row scan `structRowOfObjFieldSet` runs, at one leniency (D733). Split out of that
+// function verbatim so the two passes cannot drift; `widen` is threaded to the per-field
+// code test and adds the unique-claimant requirement, and changes nothing else.
+function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
   if t is TyObj {
@@ -15114,6 +15284,7 @@ export function structRowOfObjFieldSet(ty: i32): i32 {
     const lim = sScanLim()
     let first = -1
     let firstExact = -1
+    let nMatch = 0
     let si = 0
     while si < lim {
       if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
@@ -15130,7 +15301,13 @@ export function structRowOfObjFieldSet(ty: i32): i32 {
           } else {
             const want = fieldCodeForMatch(ftys[k])
             if want >= 0 {
-              if want != sFieldTypeAt(si, fj) { ok = false }
+              if widen {
+                if !objFieldCodeWidens(want, sFieldTypeAt(si, fj), si, fj) {
+                  ok = false
+                }
+              } else if want != sFieldTypeAt(si, fj) {
+                ok = false
+              }
             } else {
               // AN UNCODED FIELD IS LENIENT — the same rule the render path applies, whose
               // `shapeFieldTypeCompat` refutes on PROVEN mismatches only. Failing the row here
@@ -15183,12 +15360,21 @@ export function structRowOfObjFieldSet(ty: i32): i32 {
           // already field-set matched. It can never resolve where it did not, and never
           // decline where it did.
           if first < 0 { first = si }
+          nMatch = nMatch + 1
           if firstExact < 0 {
             if !rowElemDeclConflicts(si, fnames, ftys) { firstExact = si }
           }
         }
       }
       si = si + 1
+    }
+    // THE UNIQUE-CLAIMANT GATE ON THE WIDENED PASS. First-match is safe on the strict pass
+    // because two rows agreeing on field set AND on every field code are layout twins; a
+    // WIDENED match is not that, so two claimants means two different layouts and no
+    // evidence which one `structIndexOfObj` built. Declining leaves the shape unnamed,
+    // which is master's answer.
+    if widen {
+      if nMatch != 1 { return -1 }
     }
     if firstExact >= 0 { return firstExact }
     return first
@@ -15224,21 +15410,39 @@ export function structIndexOfTypeName(name: string) {
     // with no row at all after the adoption suppressed its `#anon`. Ordering the two is the
     // whole safety argument: run as ONE lenient pass it hands a single-field render the
     // FIRST box row rather than the exact one, which is a corpus module lost.
-    const strictSi = shapeRowScanK(fnames, ftypes, false)
+    //
+    // A THIRD PASS SITS BEHIND THOSE TWO (D733), and it is the NAME side of the widening
+    // `structRowOfObjFieldSet` gained on the TYPE side — the LITERAL widenings, `{r: i32}`
+    // against a declared `{r: i64}` / `{r: K}` row, which `structIndexOfObjCtx` accepts
+    // (an integer literal reaches the wider slot, a string literal names the atom) and
+    // both field-set resolvers refused. Where the emitter BUILDS `Circle` and no resolver
+    // will SAY `Circle`, the ref-list layer cannot key the container: `nameIsRefArray` is
+    // false for the render `{r:i32}[]`, so an inferred nested list fell to the i32 default
+    // and printed "nested arrays are not supported" over a program whose element is
+    // already a `(ref $Circle)`.
+    //
+    // ITS OWN PASS, NOT A WIDER `boxLenient`, and the reason is the paragraph above: pass
+    // two is FIRST-MATCH, which is safe for the box pairing (a box row takes any member)
+    // and is not safe for a widening (two rows widening onto one field set have two
+    // LAYOUTS). Pass three therefore requires a UNIQUE claimant and declines otherwise,
+    // which leaves the render exactly where master left it.
+    const strictSi = shapeRowScanK(fnames, ftypes, 0)
     if strictSi >= 0 { return strictSi }
-    return shapeRowScanK(fnames, ftypes, true)
+    const boxSi = shapeRowScanK(fnames, ftypes, 1)
+    if boxSi >= 0 { return boxSi }
+    return shapeRowScanK(fnames, ftypes, 2)
   }
   -1
 }
 
-// The row scan `structIndexOfTypeName` runs, at one leniency (D461). Split out of that
-// function verbatim so the two passes cannot drift; `boxLenient` is threaded to
-// `shapeFieldTypeCompatK` and changes nothing else.
-function shapeRowScanK(
-  fnames: string[],
-  ftypes: string[],
-  boxLenient: boolean,
-): i32 {
+// The row scan `structIndexOfTypeName` runs, at one leniency (D461, widened D733). Split
+// out of that function verbatim so the passes cannot drift; `lenient` is threaded to
+// `shapeFieldTypeCompatK` and changes nothing else. `0` strict (every caller's historical
+// behaviour), `1` the union-BOX leniency, `2` that plus the LITERAL widenings — and level 2
+// alone requires a UNIQUE claimant, because a widened match is not a layout twin.
+function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
+  let uniq = -1
+  let nHit = 0
   let si2 = 0
   const sLimB = sScanLim()
   while si2 < sLimB {
@@ -15268,16 +15472,23 @@ function shapeRowScanK(
             ftypes[k],
             sFieldTypeAt(si2, fj),
             sFieldElemNameAt(si2, fj),
-            boxLenient,
+            lenient,
           )
         ) {
           ok = false
         }
         k = k + 1
       }
-      if ok { return si2 }
+      if ok {
+        if lenient < 2 { return si2 }
+        if uniq < 0 { uniq = si2 }
+        nHit = nHit + 1
+      }
     }
     si2 = si2 + 1
+  }
+  if lenient >= 2 {
+    if nHit == 1 { return uniq }
   }
   -1
 }
@@ -15397,17 +15608,19 @@ function mvValNamesCompat(va: string, ve: string): boolean {
 // (code 19) is additionally tightened by its VALUE rep (`mvValNamesCompat` against the
 // slot's recorded `elem` name) — the code alone is value-blind.
 function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
-  shapeFieldTypeCompatK(t, code, elem, false)
+  shapeFieldTypeCompatK(t, code, elem, 0)
 }
 
-// The `boxLenient` form (D461). `false` is every caller's historical behaviour and the only
-// one `variantIndexOfTypeName` ever asks for; `true` is `structIndexOfTypeName`'s SECOND
-// pass, run only for a render the strict pass could not place at all. See the arm below.
+// The LENIENCY-LEVELLED form (D461, widened D733). `0` is every caller's historical
+// behaviour and the only one `variantIndexOfTypeName` ever asks for; `1` is
+// `structIndexOfTypeName`'s SECOND pass (the union box), `2` its THIRD (the literal
+// widenings), each run only for a render no earlier pass could place at all. See the arm
+// below.
 function shapeFieldTypeCompatK(
   t: string,
   code: i32,
   elem: string,
-  boxLenient: boolean,
+  lenient: i32,
 ): boolean {
   const want = nameFieldCode(t)
   if want < 0 || code < 0 {
@@ -15491,15 +15704,34 @@ function shapeFieldTypeCompatK(
     // pairing as a proven code mismatch (`want` 0 for the spelled `i32`, `code` 16 for the
     // box), and the render `{r: i32}` named NO row at all.
     //
-    // IT IS A SECOND-PASS LENIENCY AND THAT IS NOT A DETAIL — `boxLenient` is false on the
-    // pass every caller has always run, and true only on a re-scan the caller reaches when
+    // IT IS A SECOND-PASS LENIENCY AND THAT IS NOT A DETAIL — `lenient` is 0 on the
+    // pass every caller has always run, and raised only on a re-scan the caller reaches when
     // the strict pass answered -1. Applied in ONE pass it is a REGRESSION, measured:
     // `tests/cases/maps/inferred-map-destination-shape.vl` stops building, because its
     // section 1 declares `type Circle = { r: Shape2 }` (an arm field, code 16) BEFORE
     // section 7's `type CircleG = { r: i32 }`, and first-match-wins then hands every
     // single-field-`r` render the box row instead of the exact one. The leniency is only
     // ever right as a fallback for a render that names nothing at all.
-    if boxLenient && code == 16 { return true }
+    if lenient >= 1 && code == 16 { return true }
+    // THE LITERAL WIDENINGS (D733) — level 2 only, and the NAME side of
+    // `objFieldCodeWidens`, whose header carries the argument for the pair. Same question,
+    // same answer, two vocabularies: a render `{r:i32}` denotes the declared `{r:i64}` /
+    // `{r:K}` row because that is the row `structIndexOfObjCtx` BUILT the literal at, the
+    // integer literal reaching the wider slot and the string literal naming the atom
+    // (`anonValueFitsField`'s `sc == 23 / 24 / 30` and `sc == 0 && elem != ""` legs). The
+    // caller's unique-claimant gate is what makes first-match-wins irrelevant here.
+    if lenient >= 2 {
+      if want == 0 {
+        if code == 23 { return true }
+        if code == 24 { return true }
+        if code == 30 { return true }
+      }
+      if want == 3 {
+        if code == 20 { return true }
+        if code == 30 { return true }
+        if code == 0 { return elem != "" }
+      }
+    }
     // The AMBIGUOUS nullable-closure render: a code-22 field (`f: (() => i64) | null`)
     // RENDERS ungrouped (`()=>i64|null` — the checker drops a union member's grouping
     // parens), which `nameFieldCode` reads as a top-level arrow (code 14) returning a
@@ -18500,6 +18732,56 @@ export function checkArrName(name: string) {
   emitFail(
     "emitProgram: only i32[] arrays and struct/union element arrays are supported",
   )
+}
+
+// THE STRUCT-FIELD REFUSAL, WORDED FROM WHAT THE FIELD IS (D734). The three sites that
+// refuse an unrepresentable field type — `collectS`'s declared loop, `internShapeAs`'s
+// alias loop, and the generic-instance loop, which are worded alike on purpose so the two
+// spellings of one field are not tellable apart — all printed
+//
+//     only i32 / boolean / string / array struct fields are supported
+//
+// and that sentence is FALSE of the compiler it belongs to. An f64 field is code 17, an
+// i64 field 23, an f32 field 24, a MAP field 19, a nested STRUCT field 15, a union-BOX
+// field 16, and the five scalar-list backings 25/26/27/6/4 — every one of them supported,
+// none of them named. It is the same shape of lie D702 removed from "nested arrays are not
+// supported", which had eight cells under it and three mechanisms, and it costs the same
+// thing: a reader who believes it looks for the wrong gap.
+//
+// WHAT ACTUALLY REACHES HERE, ablated: a field whose declared type is a union ARM
+// (`type Shape = Circle | Sq` + `type GW = { g: Circle }`) — on the DECLARATION alone, with
+// no value anywhere in the program — and its `arm | null` niche. `nameIsStructDecl` excludes
+// a variant by name ("their fields ride the variant tables, not the struct table"), so the
+// code-15 rung declines and nothing else claims it. Deleting the union runs; making the
+// field the UNION (`g: Shape`) runs; an arm-element ARRAY field (`g: Circle[]`) runs. The
+// arm-typed field alone has no code, and the honest sentence says so and says what to write
+// instead. Every other refusal keeps a general sentence that no longer claims an allow-list
+// it does not have.
+export function fieldTypeRefusalMsg(name: string): string {
+  const base = nonNulBaseOf(name)
+  if base != "" {
+    if variantIndexOf(base) >= 0 {
+      return "emitProgram: a struct field typed as the union ARM `" +
+        base +
+        "` has no field rep — give the field the UNION's own type, or declare the arm as a plain struct"
+    }
+  }
+  if variantIndexOf(name) >= 0 {
+    return "emitProgram: a struct field typed as the union ARM `" +
+      name +
+      "` has no field rep — give the field the UNION's own type, or declare the arm as a plain struct"
+  }
+  // THE GENERAL SENTENCE, and it NAMES THE TYPE where the allow-list did not. The two `u8[]`
+  // fixtures pin it word for word by design ("one field, two spellings, and the only thing
+  // that may distinguish them is which one a reader typed"), so the name has to be the
+  // SUBSTITUTED spelling on the generic side — which it is: `gaeEnsure` hands `tn`, the
+  // applied field text.
+  if name != "" {
+    return "emitProgram: struct field type `" +
+      name +
+      "` has no struct-field rep"
+  }
+  "emitProgram: struct field type has no struct-field rep"
 }
 
 // True when `name` is `T[]` for some declared type PARAMETER `T`. VL binds a type
@@ -22065,11 +22347,7 @@ export function internShapeAs(key: string, nm: string) {
       return emitFail("emitProgram: malformed struct field")
     }
     const fc = nameFieldCode(rawTexts[fi])
-    if fc < 0 {
-      return emitFail(
-        "emitProgram: only i32 / boolean / string / array struct fields are supported",
-      )
-    }
+    if fc < 0 { return emitFail(fieldTypeRefusalMsg(rawTexts[fi])) }
     names.push(rawNames[fi])
     codes.push(fc)
     fi = fi + 1
@@ -22574,9 +22852,7 @@ export function gaeEnsure(name: string) {
         // `#anon` row from the literal's syntax — an i32-list field over a one-byte
         // backing — and `vl check --codegen` reported invalid wasm on a file `vl check`
         // called clean, while the direct `type W = { v: u8[] }` refused in one line.
-        return emitFail(
-          "emitProgram: only i32 / boolean / string / array struct fields are supported",
-        )
+        return emitFail(fieldTypeRefusalMsg(tn))
       }
     } else if code == 5 {
       // The APPLIED element text, RAW: an instance field's list element is spelled
@@ -35351,10 +35627,24 @@ export function shapeNominalOfTy(ty: i32): string {
   // below already answered that arm (or, with a twin declared, the twin) before this landed.
   const av = variantRowOfTy(ty)
   if av >= 0 { return uVariants[av] }
-  const fs = structRowOfObjFieldSet(ty)
+  const fs = structRowOfObjFieldSetK(ty, false)
   if fs >= 0 { return sNames[fs] }
-  const vr = variantRowOfObjFieldSet(ty)
+  const vr = variantRowOfObjFieldSetK(ty, false)
   if vr >= 0 { return uVariants[vr] }
+  // THE WIDENED PASSES, BOTH TABLES, BELOW BOTH STRICT ONES (D733). The two scans are called
+  // at their LEVELS rather than through the combined wrappers precisely so this order holds:
+  // a widened struct match must not outrank a strict VARIANT one, which is what calling
+  // `structRowOfObjFieldSet` (strict-then-widened) here would have done. Same rule the file
+  // states for the arena rungs above — struct-row identity wins where it EXISTS, and a
+  // widening is not an identity.
+  //
+  // Reached only by a shape all four earlier rungs declined, i.e. one this function used to
+  // answer "" for — which is what left `arrLitNominalElemName` with no key and dropped an
+  // inferred container onto the i32 backing. See `fieldCodeWidensElem`.
+  const fw = structRowOfObjFieldSetK(ty, true)
+  if fw >= 0 { return sNames[fw] }
+  const vw = variantRowOfObjFieldSetK(ty, true)
+  if vw >= 0 { return uVariants[vw] }
   ""
 }
 
