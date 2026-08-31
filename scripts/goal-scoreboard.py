@@ -147,8 +147,9 @@ def main():
     print()
     if blind:
         print("The corpus is generated over fixed axes, so it can only score a gap it has a")
-        print("program for. `runs` can reach 100% with every site below still refusing. Each")
-        print("needs a hand-written probe; none will arrive on its own.")
+        print("program for. `runs` can reach 100% with every site below still refusing.")
+        print("`scripts/capability-probes/` holds a hand-written program per gap; run")
+        print("`python3 scripts/capability-probes/run.py` to grade the ones covered so far.")
         print()
     if a.sites:
         for loc, text, hit in sites:
