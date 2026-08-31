@@ -7710,6 +7710,78 @@ function listOpKindOf(exprIx: i32, fnIx: i32) {
   -1
 }
 
+// ── list `+` CONCAT rep detection — the ONE home ──────────────────────────────────────
+// The list REP an expression concatenates over, as a code in `listBuildKindOfVKind`'s
+// alphabet: `0` the i32 list, `1` a ref list (slot-keyed), `3` a string list, `4` f64,
+// `6` i64, `7` f32, `10` u8 — or -1 when the expression is not a list at all.
+//
+// SAME LADDER ORDER AS `listOpKindOf` above, which is `emitIndex`'s receiver dispatch, so
+// the two cannot classify one expression two ways. What differs is the ACCEPT SET: a
+// concat copies elements it never inspects, so every rep with a `{backing, len, cap}`
+// wrapper has one lowering (`emitListConcatG`), while a compare needs a per-element core
+// and `listOpKindOf` therefore claims only the three it has cores for.
+//
+// THE REF-LIST ROW IS ONE CODE HERE, NOT THREE. `listBuildKindOfVKind` splits it 1/2/5 by
+// ELEMENT kind because the build SEED differs per element; a concat's (wrapper, backing)
+// pair is keyed by the SLOT alone and is identical for all three, so splitting it here
+// would be a distinction with no reader.
+export function catListKindOfExpr(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return -1 }
+  if exprString(exprIx, fnIx) { return -1 }
+  if exprStringArray(exprIx, fnIx) { return 3 }
+  if exprF64Array(exprIx, fnIx) { return 4 }
+  if exprI64Array(exprIx, fnIx) { return 6 }
+  if exprF32Array(exprIx, fnIx) { return 7 }
+  if exprU8Array(exprIx, fnIx) { return 10 }
+  if exprRefArray(exprIx, fnIx) {
+    if refListSlotOfExpr(exprIx, fnIx) >= 0 { return 1 }
+    return -1
+  }
+  if exprArray(exprIx, fnIx) { return 0 }
+  -1
+}
+
+// The concat rep of a `+` BinExpr whose operands are BOTH lists of one rep, or -1.
+//
+// BOTH OPERANDS MUST RESOLVE TO THE SAME REP **AND THE SAME REF-LIST SLOT**, and the slot
+// half is not redundant: two ref lists at different slots have different BACKING heap
+// types, and `array.copy` between them is a validation error, not a coercion. A pairing
+// this declines keeps the refusal it has today rather than writing a module the engine
+// rejects.
+export function catListKindOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "+" {
+      const lk = catListKindOfExpr(e.binLeft, fnIx)
+      if lk < 0 { return -1 }
+      if catListKindOfExpr(e.binRight, fnIx) != lk { return -1 }
+      if lk == 1 {
+        if (
+          refListSlotOfExpr(e.binLeft, fnIx) !=
+          refListSlotOfExpr(e.binRight, fnIx)
+        ) {
+          return -1
+        }
+      }
+      return lk
+    }
+  }
+  -1
+}
+
+// The ref-list SLOT a `+` BinExpr concatenates over, or 0 for a rep that is not slot-keyed
+// (the frame's two ref slots read their heap indices off the rep code alone). Split from
+// `catListKindOfBin` rather than packed into its return value: the callers that need the
+// slot are the two that also need the kind, and an encoded pair is a decode at every site.
+export function catListSlotOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const s = refListSlotOfExpr(e.binLeft, fnIx)
+    if s >= 0 { return s }
+  }
+  0
+}
+
 // The list-op kind of a `==`/`!=`/`+` BinExpr whose operands are BOTH lists of
 // one kind, or -1 (not a list op — the caller keeps its existing dispatch).
 export function listOpKindOfBin(binIx: i32, fnIx: i32) {
@@ -29747,6 +29819,24 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
   if raLhs >= 0 {
     if exprNullableRefArray(raLhs, fnIx) { return true }
   }
+  // A list CONCAT `a + b` yields a NEW list of the OPERANDS' OWN rep — a ref list at the operands' own slot.
+  // `exprArray` has carried this arm for the i32 list since §VL.4; the other six reps
+  // had no concat to classify until `emitListConcatG` existed, so a `.length` (or an
+  // index read, or a `push`) straight off the `+` reached no classifier and failed at
+  // the member floor.
+  //
+  // IT ASKS ITSELF, NOT `catListKindOfBin`, AND THAT IS A MEASURED CONSTRAINT RATHER THAN A
+  // STYLE. The one-home version of this arm ran the SEVEN-classifier ladder on both
+  // operands from inside one of those seven classifiers, so a left-nested chain cost
+  // 14^depth: `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds
+  // to a HANG (180s build timeout), and nothing but a whole-corpus build saw it — the
+  // distilled corpus, the grid and the value probes were all green. Asking itself is what
+  // `exprArray`'s arm has always done and is linear in the chain. (D721.)
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprRefArray(e.binLeft, fnIx) { return exprRefArray(e.binRight, fnIx) }
+    }
+  }
   false
 }
 
@@ -30014,6 +30104,26 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     const rlnIn = nulRefArrayInnerSlot(rlnLhs, fnIx)
     if rlnIn >= 0 && rlnIn < rlElemName.length { return rlElemName[rlnIn] }
     return refListElemNameOfExpr(rlnLhs, fnIx)
+  }
+  // A ref-list CONCAT `a + b` yields a NEW list at the OPERANDS' OWN slot, so its element
+  // name is theirs. WITHOUT THIS ARM THE CONCAT IS A SLOT-0 READ, and slot 0 is a real row
+  // rather than a miss — `refListSlotOfExpr` CLAMPS an unresolved name to 0 — so
+  // `(a + b).length` over a `Circle[][]` read the wrapper of whichever row happened to be
+  // interned first: check-clean INVALID WASM, and it PASSED at `Circle[]` for the single
+  // reason that there slot 0 was the right row by luck. Same clamp hazard as D227/D451,
+  // reached by a third route. (D721.)
+  //
+  // BOTH OPERANDS, not just the left: a pairing whose two sides name different elements has
+  // no single slot, and `catListKindOfBin` declines it for the same reason (their backings
+  // are different heap types). Answering the left's name there would hand the emitter a
+  // wrapper only one operand has.
+  if e is BinExpr {
+    if e.binOp == "+" {
+      const cl = refListElemNameOfExpr(e.binLeft, fnIx)
+      if cl != "" {
+        if cl == refListElemNameOfExpr(e.binRight, fnIx) { return cl }
+      }
+    }
   }
   ""
 }
@@ -31068,6 +31178,26 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   if salLhs >= 0 {
     if exprNulScalarListKind(salLhs, fnIx) == "nulstrlist" { return true }
   }
+  // A list CONCAT `a + b` yields a NEW list of the OPERANDS' OWN rep — a string list.
+  // `exprArray` has carried this arm for the i32 list since §VL.4; the other six reps
+  // had no concat to classify until `emitListConcatG` existed, so a `.length` (or an
+  // index read, or a `push`) straight off the `+` reached no classifier and failed at
+  // the member floor.
+  //
+  // IT ASKS ITSELF, NOT `catListKindOfBin`, AND THAT IS A MEASURED CONSTRAINT RATHER THAN A
+  // STYLE. The one-home version of this arm ran the SEVEN-classifier ladder on both
+  // operands from inside one of those seven classifiers, so a left-nested chain cost
+  // 14^depth: `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds
+  // to a HANG (180s build timeout), and nothing but a whole-corpus build saw it — the
+  // distilled corpus, the grid and the value probes were all green. Asking itself is what
+  // `exprArray`'s arm has always done and is linear in the chain. (D721.)
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprStringArray(e.binLeft, fnIx) {
+        return exprStringArray(e.binRight, fnIx)
+      }
+    }
+  }
   false
 }
 
@@ -31471,6 +31601,24 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
   if e is Index {
     if nestedRefListElemIs(e.idxArr, fnIx, 7) { return true }
   }
+  // A list CONCAT `a + b` yields a NEW list of the OPERANDS' OWN rep — an f64 list.
+  // `exprArray` has carried this arm for the i32 list since §VL.4; the other six reps
+  // had no concat to classify until `emitListConcatG` existed, so a `.length` (or an
+  // index read, or a `push`) straight off the `+` reached no classifier and failed at
+  // the member floor.
+  //
+  // IT ASKS ITSELF, NOT `catListKindOfBin`, AND THAT IS A MEASURED CONSTRAINT RATHER THAN A
+  // STYLE. The one-home version of this arm ran the SEVEN-classifier ladder on both
+  // operands from inside one of those seven classifiers, so a left-nested chain cost
+  // 14^depth: `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds
+  // to a HANG (180s build timeout), and nothing but a whole-corpus build saw it — the
+  // distilled corpus, the grid and the value probes were all green. Asking itself is what
+  // `exprArray`'s arm has always done and is linear in the chain. (D721.)
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprF64Array(e.binLeft, fnIx) { return exprF64Array(e.binRight, fnIx) }
+    }
+  }
   false
 }
 
@@ -31714,6 +31862,24 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
     }
     return false
   }
+  // A list CONCAT `a + b` yields a NEW list of the OPERANDS' OWN rep — a `u8[]`.
+  // `exprArray` has carried this arm for the i32 list since §VL.4; the other six reps
+  // had no concat to classify until `emitListConcatG` existed, so a `.length` (or an
+  // index read, or a `push`) straight off the `+` reached no classifier and failed at
+  // the member floor.
+  //
+  // IT ASKS ITSELF, NOT `catListKindOfBin`, AND THAT IS A MEASURED CONSTRAINT RATHER THAN A
+  // STYLE. The one-home version of this arm ran the SEVEN-classifier ladder on both
+  // operands from inside one of those seven classifiers, so a left-nested chain cost
+  // 14^depth: `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds
+  // to a HANG (180s build timeout), and nothing but a whole-corpus build saw it — the
+  // distilled corpus, the grid and the value probes were all green. Asking itself is what
+  // `exprArray`'s arm has always done and is linear in the chain. (D721.)
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprU8Array(e.binLeft, fnIx) { return exprU8Array(e.binRight, fnIx) }
+    }
+  }
   false
 }
 
@@ -31816,6 +31982,24 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
   // `f32[]`, so `g[i][j]` reads the f32 scalar.
   if e is Index {
     if nestedRefListElemIs(e.idxArr, fnIx, 10) { return true }
+  }
+  // A list CONCAT `a + b` yields a NEW list of the OPERANDS' OWN rep — an f32 list.
+  // `exprArray` has carried this arm for the i32 list since §VL.4; the other six reps
+  // had no concat to classify until `emitListConcatG` existed, so a `.length` (or an
+  // index read, or a `push`) straight off the `+` reached no classifier and failed at
+  // the member floor.
+  //
+  // IT ASKS ITSELF, NOT `catListKindOfBin`, AND THAT IS A MEASURED CONSTRAINT RATHER THAN A
+  // STYLE. The one-home version of this arm ran the SEVEN-classifier ladder on both
+  // operands from inside one of those seven classifiers, so a left-nested chain cost
+  // 14^depth: `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds
+  // to a HANG (180s build timeout), and nothing but a whole-corpus build saw it — the
+  // distilled corpus, the grid and the value probes were all green. Asking itself is what
+  // `exprArray`'s arm has always done and is linear in the chain. (D721.)
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprF32Array(e.binLeft, fnIx) { return exprF32Array(e.binRight, fnIx) }
+    }
   }
   false
 }
@@ -31924,6 +32108,24 @@ export function exprI64Array(exprIx: i32, fnIx: i32) {
   // `i64[]`, so `g[i][j]` reads the i64 scalar.
   if e is Index {
     if nestedRefListElemIs(e.idxArr, fnIx, 8) { return true }
+  }
+  // A list CONCAT `a + b` yields a NEW list of the OPERANDS' OWN rep — an i64 list.
+  // `exprArray` has carried this arm for the i32 list since §VL.4; the other six reps
+  // had no concat to classify until `emitListConcatG` existed, so a `.length` (or an
+  // index read, or a `push`) straight off the `+` reached no classifier and failed at
+  // the member floor.
+  //
+  // IT ASKS ITSELF, NOT `catListKindOfBin`, AND THAT IS A MEASURED CONSTRAINT RATHER THAN A
+  // STYLE. The one-home version of this arm ran the SEVEN-classifier ladder on both
+  // operands from inside one of those seven classifiers, so a left-nested chain cost
+  // 14^depth: `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds
+  // to a HANG (180s build timeout), and nothing but a whole-corpus build saw it — the
+  // distilled corpus, the grid and the value probes were all green. Asking itself is what
+  // `exprArray`'s arm has always done and is linear in the chain. (D721.)
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if exprI64Array(e.binLeft, fnIx) { return exprI64Array(e.binRight, fnIx) }
+    }
   }
   false
 }

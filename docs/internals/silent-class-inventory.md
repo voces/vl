@@ -4509,8 +4509,17 @@ Its nine ungradeable `std:array` grid cells are therefore gradeable now.
 
 ---
 
-### D44 — [CLOSED 2026-08-26] the SAME lost refusal one operator over: a `+` the checker will not lower survives the pin
-**CLOSED 2026-08-26 — the repro is NOW A LOUD CHECK REJECT (`` `addT` concatenates its type parameter with `+` here: `+` over Circle[] has no lowering ``), and so is the direct spelling. Was: check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (6 cells, its `+` control column) · pre-existing, byte-identical on `f2064bec` and on D35's branch · deliberately OUT OF SCOPE for D35, whose gate covers `==`/`!=` only**
+### D44 — [CLOSED 2026-08-26, RE-CLOSED 2026-08-31 by D721] the SAME lost refusal one operator over: a `+` the checker will not lower survives the pin
+**CLOSED — the repro RUNS and prints `2`. It was closed on 2026-08-26 as a loud check reject at BOTH spellings, and D721 closed it again in the other direction on 2026-08-31: the refusal it agreed on was a capability gap, not a rule, and `Circle[] + Circle[]` now concatenates. Was: check-clean invalid wasm · found 2026-08-26 by D35's 1712-cell grid (6 cells, its `+` control column) · pre-existing, byte-identical on `f2064bec` and on D35's branch · deliberately OUT OF SCOPE for D35, whose gate covers `==`/`!=` only**
+
+**THIS ROW CLOSED TWICE, IN OPPOSITE DIRECTIONS, AND THE SECOND TIME IS THE ONE THAT COUNTS.**
+The 2026-08-26 close made the two spellings AGREE, which is all the row asked and was correct
+under the goal of the day. It agreed on a REFUSAL, and the standing goal since counts only
+programs that RUN: a sentence conceding the program is type-valid (`` `+` over Circle[] has no
+lowering ``) is a clause-2 violation whichever spelling prints it. D721 built the lowering, so
+the two spellings now agree on a running program. The paragraph below is kept verbatim because
+it is the reasoning that has to be read to see why it was wrong — the win direction it claims
+is `silent → loud`, and under this goal that direction is worth zero.
 
 **THE DIRECTION THAT COUNTS AS A WIN HERE IS `silent → loud`** — the opposite of D42's, one row up, and the two shipped together. This is a REFUSAL lost, so a running cell would be the failure.
 
@@ -4651,8 +4660,9 @@ THREE live callee deliveries plus the check-stage half of a fourth, not four; an
 is loud at every cell on both compilers is a column of nothing, and reporting it as coverage is
 the shape D43 was filed to stop.
 
-Fixture: `tests/cases/generics/error-list-concat-no-core.vl` (four element reps at both
-spellings, plus the literal-union pair that separates the two roots).
+Fixture: `tests/cases/generics/error-litunion-concat-pin-order.vl` — root ONE only, since
+D721. It was `error-list-concat-no-core.vl` and carried four element reps at both spellings;
+those four run now and are read back BY VALUE in `tests/cases/arrays/list-concat-every-rep.vl`.
 
 #### Re-graded 2026-08-28 — the close is CORRECT, and the accept set still holds
 
@@ -4670,14 +4680,17 @@ predicates rather than one.
 refusal in 6 cells at `a: T[], b: T[]` — the same mechanism, filed as **D421** and closed with
 it. Nothing in the `T` row moved.
 
-**THE CAPABILITY GAP, NAMED AND PRICED, NOT BUILT.** Making `f64[] + f64[]` (and its literal
-union) WORK rather than refuse is a new concat core per backing — `emitListConcatI` is one
-function hard-wired to `$lTypeIdx`/`$aTypeIdx`, and an f64/i64/u8 list needs its own wrapper
-and its own copy loop. That is `f64[]`'s capability, not this row's, and `std:array`'s `concat`
-already covers every element type today because it is a `push` loop over `T` and inherits the
-element's own storage (measured in D102's close). So the language question a reader should
-take away is "should `+` grow the cores `concat` already effectively has", and the answer costs
-one core per backing plus the classifier rows to route them.
+**THE CAPABILITY GAP, NAMED AND PRICED, NOT BUILT — AND THE PRICE WAS OVER-ESTIMATED BY THE
+NUMBER OF CORES.** This paragraph read: making `f64[] + f64[]` (and its literal union) WORK is
+"a new concat core per backing", `emitListConcatI` being one function hard-wired to
+`$lTypeIdx`/`$aTypeIdx` and an f64/i64/u8 list needing "its own wrapper and its own copy loop".
+It needs neither. **A CONCAT INSPECTS NO ELEMENT**: `emitListConcatG` is ONE function that
+takes the wrapper and backing heap indices as arguments and emits the same allocation and the
+same two `array.copy`s for every rep, because `array.copy` moves storage and does not read it.
+The per-backing plural came from reading across from the `==` side, where a core per element
+rep IS the shape — and that reading is the same "these two questions look parallel" mistake
+this row's own `+` home spent two corrections on. What the change actually cost was one
+parameterised emitter, one four-slot frame family, and a concat arm on six classifiers. D721.
 
 ---
 
@@ -6784,8 +6797,15 @@ already written**, the tenth rung closed on it.
 
 ---
 
-### D102 — [CLOSED 2026-08-26] a list `+` over an `f64`-backed LITERAL UNION is check-clean invalid wasm
-**CLOSED 2026-08-26 — now a loud check reject, and the win direction is loud rather than runs because `f64[] + f64[]` is itself a loud check reject: there is exactly ONE concat core (`emitListConcatI`, hard-wired to `$lTypeIdx`/`$aTypeIdx`), so the literal spelling now says what its own BASE type says. THE ROW WAS ONE ARM TOO NARROW — three spellings were check-clean invalid wasm, not one. Was: check-clean invalid wasm · found 2026-08-26 by the `std-api-reviewer` pass over D45's close, checking the `+` home cited as that close's authority · pre-existing and IDENTICAL on master `8bf0f20f` and on D45's branch, same offset and same sentence**
+### D102 — [CLOSED 2026-08-26, RE-CLOSED 2026-08-31 by D721] a list `+` over an `f64`-backed LITERAL UNION is check-clean invalid wasm
+**CLOSED — the repro RUNS and prints `2`. The 2026-08-26 close made it a loud check reject, on the reasoning that `f64[] + f64[]` is itself a loud check reject and the literal spelling should say what its own BASE type says. That reasoning was sound and its premise is gone: D721 gave `f64[] + f64[]` a lowering, so the base type no longer refuses and neither does the union. THE ROW WAS ONE ARM TOO NARROW — three spellings were check-clean invalid wasm, not one. Was: check-clean invalid wasm · found 2026-08-26 by the `std-api-reviewer` pass over D45's close, checking the `+` home cited as that close's authority · pre-existing and IDENTICAL on master `8bf0f20f` and on D45's branch, same offset and same sentence**
+
+**WHAT THIS ROW IS WORTH KEEPING FOR IS THE SHAPE OF ITS TWO ERRORS, NOT ITS ANSWER.** The
+element rule it corrected (`concatElemIsI32Backed`) was wrong too WIDE at three arms and then,
+after the correction, wrong too NARROW at every rep with a `{backing, len, cap}` wrapper.
+Both errors have one cause: the rule's content was an accident of which element types one
+hard-wired core happened to cover, so every re-measurement of that accident produced another
+rule. D721 deleted the rule rather than correcting it a third time.
 
 Repro:
 
@@ -20747,6 +20767,156 @@ Repro (still a loud emit reject):
   question asked through a struct-table bridge. The fix is either a variant field-set bridge
   in `nameIsRefArray` / `refArrElemKind` / `refArrElemName` — which must agree arm for arm —
   or making the arm render NOMINALLY at this producer, which is the canon-spelling seam.
+
+### D721 — [CLOSED 2026-08-31] there is ONE concat core and its element rule was a capability refusal wearing a soundness rule's clothes
+
+**CLOSED 2026-08-31 — the repro RUNS and prints `2`. Was: loud check reject (`` `+` over Circle[] has no lowering ``) at BOTH spellings, which is why D44/D102/D421 each read as correctly closed · 6 conceded corpus cells + 13 further list reps · pre-existing and identical on master `ca5fa21a` · NO type parameter needed — the direct spelling refused too**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function cell(): i32 {
+      const a: Circle[] = [{ r: 1 }]
+      const b: Circle[] = [{ r: 2 }]
+      const c: Circle[] = a + b
+      return c.length
+    }
+
+    print(cell())
+    // was: vl check rc 1 — `+` over Circle[] has no lowering
+    // now: runs, prints 2
+
+* **THE BRIEF THAT FOUND THIS ASKED THE OPPOSITE QUESTION, AND THE MEASUREMENT IS THE ROW'S
+  HEADLINE.** It was scoped as a capability LOST AT THE PIN — the mirror of D35/D44/D421,
+  which each closed a refusal lost in the instantiation — on the evidence that `i32[] == i32[]`
+  runs while the conceded cells refuse. **The full grid says there is no pin defect at all:
+  25 receiver types × `==`/`+` × three spellings (written out, through `g<T>(a: T, b: T)`, and
+  through the constructor shape `g<T>(a: T[], b: T[])`) is 100 direct/pin PAIRS and **ZERO**
+  disagree on outcome class.** Every conceded cell's direct spelling refuses in exactly the
+  same words. The pin machinery — `noteBinCstr`, `binOpDefinedFor`, the eight deferred
+  constraint tables — is faithful, and nothing here touches it.
+* **SO THE FAMILY IS NOT "A REFUSAL THE PIN LOST", IT IS "A LOWERING NOBODY BUILT".** Ablated:
+  the defect needs a list `+` and nothing else. It does not need a type parameter, a closure,
+  an alias, a nullable, or a union; removing every ingredient but the two operands and the
+  operator reproduces it at each of 19 element reps.
+* **A CONCAT INSPECTS NO ELEMENT, AND THAT IS THE WHOLE ARGUMENT.** `emitListConcatI` was one
+  function hard-wired to `$lTypeIdx`/`$aTypeIdx`, so the checker grew an ELEMENT rule
+  (`concatElemIsI32Backed`) to keep every other rep away from it. But a concat allocates one
+  backing of `lenA + lenB` and moves storage with two `array.copy`s: all it needs of a list is
+  its `{backing, len, cap}` wrapper heap type and its backing heap type, and **every list rep
+  in the language has both**. `emitListConcatG` takes those two indices as arguments and emits
+  the identical byte sequence for all of them.
+* **THE ELEMENT RULE WAS WRONG IN BOTH DIRECTIONS, TWICE, AND THAT IS THE TELL.** D102 found it
+  too WIDE at three arms (`tyUnionAllLits` claimed every literal base, the `TyLit` arm every
+  single literal, the `TyNullable` arm every literal-union inner) and the correction left it too
+  NARROW at every rep with a wrapper. Both errors have one cause: the rule's content was an
+  accident of which element types one hard-wired core happened to cover, so each
+  re-measurement of that accident produced another rule. It is deleted rather than corrected a
+  third time.
+* **19 REPS, MEASURED AT BOTH SPELLINGS AND READ BACK BY VALUE.** `i32[]` (unchanged),
+  `boolean[]`, `string[]`, `f64[]`, `i64[]`, `f32[]`, `u8[]`, `K[]`, `N[]`, `F[]`, `Circle[]`,
+  `CM[]`, `Shape[]`, `i32[][]`, `i32[][][]`, `string[][]`, `f64[][]`, `i64[][]`, `Circle[][]`,
+  `Circle[][][]`, `CM[][]`, `K[][]`, `F[][]`. Every element of every concatenation is printed
+  in `tests/cases/arrays/list-concat-every-rep.vl` — a lowering that allocates the right length
+  and copies the wrong storage passes a `.length` assertion exactly as the correct one does,
+  and the packed `u8` backing plus the two wide scalars are the three most likely to be wrong
+  that way.
+* **THE SECOND GAP THE FIRST ONE HID: `.length` STRAIGHT OFF THE `+`.** The six non-i32
+  `expr*Array` classifiers had no concat arm — they never needed one, because no such
+  expression could exist — so a member read on the `+` reached no classifier and failed at the
+  member floor. Giving them the arm exposed a THIRD: `refListElemNameOfExpr` had no `+` arm
+  either, and `refListSlotOfExpr` **CLAMPS an unresolved element name to slot 0**, which is a
+  real row rather than a miss. `(a + b).length` over a `Circle[][]` then read another row's
+  wrapper and wrote **check-clean invalid wasm** — while the same line over `Circle[]` passed,
+  for the single reason that slot 0 happened to be the right row. Same clamp hazard as D227
+  and D451, reached by a third route.
+* **THE ONE THING NO CELL GRADE SAW.** The first cut of those six classifier arms asked the
+  concat rep's one home (`catListKindOfBin`) from inside one of the seven classifiers that home
+  runs, so every `+` node re-ran the whole ladder on both operands: a left-nested chain cost
+  14^depth and `tests/cases/lexer/keyword-lookalike-identifiers.vl` went from milliseconds to a
+  **HANG** (180 s build timeout). The distilled corpus was green, the 25×6 grid was green and
+  all 17 value round-trips were green. **Only a build of every `tests/cases` module found it**
+  — which is the instrument the "a corpus module that stops building is a veto no cell grade
+  reports" rule names, and this is the first time it has caught a hang rather than a reject.
+  Each arm now asks only itself, which is the shape `exprArray`'s concat arm has always had.
+* **WHAT STILL REFUSES, AND IT IS AN EMITTER FACT RATHER THAN A TYPE RULE.**
+  `binConcatRepUnresolved` is the floor: the banked types say list `+` and the emitter cannot
+  resolve the pair to one rep — two operands at different ref-list SLOTS (different backing
+  heap types; `array.copy` between them is a validation error, not a coercion), or an operand
+  that classifies as no rep. Loud `emitProgram:`, never the numeric tail's `i32.add` over two
+  refs.
+* **THE ABLATION, FOUR RUNGS, EACH REBUILT AND RE-GRADED** over 21 receivers × 3 spellings:
+
+  | tree | `c = a + b` | `(a + b).length` | element read-back |
+  |---|---|---|---|
+  | all rungs | 21 runs | 21 runs | 21 runs |
+  | − the element-NAME arm | 21 runs | 17 runs, **4 check-clean INVALID WASM** | 21 runs |
+  | − that and the six classifier arms | 21 runs | 8 runs, 13 loud emit | 21 runs |
+  | − everything (strip-all) | master's refusal at 19 of 21 | | |
+
+  **The element-name arm scores ZERO on two of the three columns and is a clause-1 catastrophe
+  on the third** — the standing "never delete on a zero alone" case, and the cheapest possible
+  demonstration of it. Strip-all rebuilds the seed to `8397c1fa345c5819dcd2310f51110a1a`,
+  1,524,229 bytes: **byte-identical to master's**.
+* **The emitter half and the checker half are ONE landing.** The floor that replaces the
+  deleted refusal is written in the emitter's rep vocabulary, so it cannot exist without the
+  emitter half; and the emitter half alone is unreachable, because the checker refuses before
+  it. Landing only the checker half is the numeric tail over two refs — check-clean invalid
+  wasm, which is exactly what the deleted rule's own header says it was written to prevent.
+* **PRICE: 1,985 `tests/cases` modules build, 0 bytes differ, 0 lost.** The corpus moves 6
+  cells `loud check reject → runs`, 0 `runs → not-runs`, 0 `→ silent`, 0 other movement.
+
+Fixtures: `tests/cases/arrays/list-concat-every-rep.vl` (the accept set, by value) and
+`tests/cases/generics/error-litunion-concat-pin-order.vl` (what is left of D44 — root one, the
+pin's softening order, which is still a live defect and still refused).
+
+---
+
+### D722 — the `==` residue: 14 conceded cells that are NOT the concat question, priced rather than built
+
+**RULED 2026-08-31 as a real, unbuilt capability gap rather than a pin defect. Its witness is a loud check reject today and stays one until a compare core exists · 14 conceded corpus cells (`d421c002/004/006/008/010/013/014`, `d423c001/002/003/005/006/007/008`) · direct and pinned spellings AGREE at every one, measured**
+
+Repro:
+
+    function cell(): boolean {
+      const a: f64[] = [1.5]
+      const b: f64[] = [2.5]
+      return a == b
+    }
+
+    print(cell())
+    // vl check rc 1 — `==` over f64[] has no lowering
+
+* **WHY IT IS NOT D721.** A concat moves storage and never reads an element, so one lowering
+  serves every rep. A COMPARE has to look at each element, so it needs a core per element rep,
+  and the emitter has exactly three: `emitListEqICore` (the i32/boolean backing),
+  `emitListEqSCore` (string elements) and `emitListEqRCore` (a ref list of i32/boolean lists).
+  `eqCmpKindOfArrayElem` is that closed list written down. Reading the two questions as
+  parallel is what put an element rule on the `+` side for a year; they are not parallel, and
+  this row is where the difference is recorded.
+* **THE SAME 100-PAIR GRID SAYS THE PIN IS FAITHFUL HERE TOO** — 0 of 100 direct/pin pairs
+  disagree, `==` included. So none of these 14 is D35/D44/D421's shape, and none is closable by
+  touching the deferred-constraint tables.
+* **THREE SUB-FAMILIES, ABLATED, WITH THEIR PRICES:**
+
+  | sub-family | cells | what it costs |
+  |---|---|---|
+  | a WIDE-SCALAR backing (`f64[]`, `i64[]`, `F[]`; also `f32[]`, `u8[]`, which no corpus cell reaches) | 3 | ONE core parameterised by (wrapper, backing, `ne` opcode) plus a four-slot frame family — the same shape `emitListConcatG` has, and the cheapest of the three |
+  | a REF-LIST element with no core of its own (`Circle[]`, `CM[]`) | 2 | a per-element compare dispatch inside `emitListEqRCore`, which today hard-codes a recursion into `emitListEqICore`. A struct element needs the field-wise compare over a value already on the STACK, and `emitStructEqRec` works off expression NODES — that is the real cost, not the loop |
+  | NESTING (`Circle[][]`, `Circle[][][]`, `F[][]`, `f64[][]`, `i64[][]`, `i32[][][]`, `string[][]`) plus the two nullable niches over them (`CM \| null`, `Circle[] \| null`) | 9 | the dispatch above, made recursive, with one reserved frame per LEVEL — `fnListEqRSlots` notes only the OUTER slot today, so an inner level would be emitted against locals the function never declared |
+
+* **`{[string]: i32}[]` IS A DESIGN QUESTION AND NOT A CAPABILITY ONE**, which is why its cells
+  carry TWO messages. The direct spelling says `{[string]: i32}[] isn't equatable (a field is
+  not value-comparable)` *and* `` `==` over {[string]: i32}[] has no lowering ``. The first is
+  the soundness gate and it is the language's answer: map equality is not defined, so a list of
+  maps has no element compare to build. Only the second is a capability concession, and closing
+  it means deciding what `m1 == m2` MEANS first.
+* **THE ORDER TO BUILD THEM IN IS THE TABLE'S ORDER**, and the first row is separable: the
+  wide-scalar cores need nothing from the other two and reuse D721's frame machinery verbatim.
+  Filed rather than built because a compare core is a different instrument from a copy, and
+  landing it inside a change whose whole argument is "a concat inspects no element" would have
+  buried the one claim this campaign most needs to stay legible.
 
 ---
 

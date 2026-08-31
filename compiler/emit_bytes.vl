@@ -35,6 +35,8 @@ import {
   fbScratchCur,
   fl32TypeIdx,
   fl64TypeIdx,
+  fnListCatKinds,
+  fnListCatSlots,
   fnListEqRSlots,
   fnMvBase,
   fnRefPushSlots,
@@ -65,6 +67,7 @@ import {
   ia64TypeIdx,
   il64TypeIdx,
   lTypeIdx,
+  lcatBases,
   leqIScratchBase,
   leqRBases,
   leqSScratchBase,
@@ -1004,6 +1007,36 @@ export function mvValElemHeapOf(slot: i32) {
 // cannot interleave), so its reservation, its contribution to the locals COUNT and its
 // two valtype runs must all read the same condition — this is where that condition lives.
 function fbUsesSinkPair() { fnUsesUnionSink || fnUsesUnionLetSink }
+// The WRAPPER heap-type index of a concat rep — the `{backing, len, cap}` struct both
+// operands and the result are. Reads the module's interned indices, so it is only
+// meaningful after `mAssignTypeIndices`; every caller runs inside a function body.
+export function catWrapIdxOf(kind: i32, slot: i32) {
+  if kind == 1 {
+    if slot >= 0 && slot < rlWrapIdx.length { return rlWrapIdx[slot] }
+    return lTypeIdx
+  }
+  if kind == 3 { return mkListIdx }
+  if kind == 4 { return fl64TypeIdx }
+  if kind == 6 { return il64TypeIdx }
+  if kind == 7 { return fl32TypeIdx }
+  if kind == 10 { return bl8TypeIdx }
+  lTypeIdx
+}
+
+// The BACKING heap-type index of a concat rep — the raw `(array (mut T))` the two
+// `array.copy`s move elements between. Paired with `catWrapIdxOf` arm for arm.
+export function catBackIdxOf(kind: i32, slot: i32) {
+  if kind == 1 {
+    if slot >= 0 && slot < rlBackIdx.length { return rlBackIdx[slot] }
+    return aTypeIdx
+  }
+  if kind == 3 { return mkArrIdx }
+  if kind == 4 { return fa64TypeIdx }
+  if kind == 6 { return ia64TypeIdx }
+  if kind == 7 { return fa32TypeIdx }
+  if kind == 10 { return ba8TypeIdx }
+  aTypeIdx
+}
 // Reserve `n` wasm locals at the current cursor, returning the frame's base index
 // and advancing the cursor past the frame. The single place the cursor moves.
 export function fbReserve(n: i32) {
@@ -1118,6 +1151,15 @@ export function fbBeginFunc(nParams: i32, nLocals: i32) {
   while lqk < fnListEqRSlots.length {
     leqRBases.push(fbReserve(4))
     lqk = lqk + 1
+  }
+  // One 4-slot CONCAT frame per non-i32 list rep this function concatenates (A/B
+  // wrappers, the out backing, n). Reserved AFTER the compare frames, so a function
+  // that only compares keeps the layout it had.
+  lcatBases = []
+  let lck = 0
+  while lck < fnListCatKinds.length {
+    lcatBases.push(fbReserve(4))
+    lck = lck + 1
   }
   // Closure equality frame (2 `(ref $cloStruct)` slots), appended LAST so every
   // existing layout is untouched.
@@ -1290,6 +1332,7 @@ export function fbLocalsCount(nLocals: i32) {
   if fnUsesListEqI { n = n + 5 }
   if fnUsesListEqS { n = n + 4 }
   n = n + fnListEqRSlots.length * 4
+  n = n + fnListCatKinds.length * 4
   if fnUsesCloEq { n = n + 2 }
   if fnUsesArrNew { n = n + 1 }
   if fnUsesCoalesceCall { n = n + 3 }
@@ -1557,6 +1600,20 @@ export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
     fbI32Run()
     fbI32Run()
     lqv = lqv + 1
+  }
+  // The concat frames, in `fbBeginFunc`'s reservation order: A/B wrapper refs, the
+  // freshly-allocated out BACKING, then n. The two heap indices come off the ONE home
+  // the emitter reads (`catWrapIdxOf`/`catBackIdxOf`), so a slot declared here and a
+  // slot written by `emitListConcatG` cannot be two different types.
+  let lcv = 0
+  while lcv < fnListCatKinds.length {
+    const lck2 = fnListCatKinds[lcv]
+    const lcs = fnListCatSlots[lcv]
+    fbRefRun(catWrapIdxOf(lck2, lcs))
+    fbRefRun(catWrapIdxOf(lck2, lcs))
+    fbRefRun(catBackIdxOf(lck2, lcs))
+    fbI32Run()
+    lcv = lcv + 1
   }
   // Closure equality frame (2 `(ref $cloStruct)` slots, appended LAST).
   if fnUsesCloEq {
