@@ -442,6 +442,7 @@ import {
   pendingListKind,
   pendingListSlot,
   pendingStructIdx,
+  postMonoShapes,
   raUsed,
   refPushBaseBySlot,
   refPushScratchBase,
@@ -22694,6 +22695,98 @@ function shapeFieldsRideTyParam(rawTexts: string[]) {
   false
 }
 
+// D831 — A ROW WHOSE FIELD IS ALREADY A BOX OVER THIS ATOM SERVES THIS ANNOTATION TOO,
+// so an annotation interned AFTER it must not mint a NARROWER twin and split the
+// program's reps in two.
+//
+// `annShapeIndexOf` dedups on EXACT field codes. A `??`-joined pair of same-fieldset
+// object literals mints its merged row (D804) with the disagreeing leaf coded 16 — a BOX
+// over the members' own atoms — and an annotation naming the same field set at one of
+// those atoms (`{r: i32}`) then misses that dedup and mints a SECOND row. The program now
+// holds two reps for one value: the literals build the box row, while the map value slot,
+// the local's cell and every delivery seed name the annotation's. The `??` default's bare
+// `null` is then built at a row whose `r` is a plain i32 —
+// `emitProgram: bare null needs a struct-typed context`, corpus cell `a000093` standing
+// for 1,437 census cells — and the non-null members of the same family (`?? {r: \"s\"}`,
+// `?? {r: 1.5}`) are CHECK-CLEAN INVALID WASM.
+//
+// THE SUBSUMPTION IS NOT A NEW RULE. It is `anonValueFitsField`'s `sc == 16` arm — "a
+// union BOX field accepts every atom by construction" — asked one layer up, of an
+// annotation instead of a value. Every field must be either code-AND-element EQUAL or a
+// box whose recorded member set NAMES this annotation's atom, and at least one must be
+// the wider box (with none, `annShapeIndexOf` already answered and this never runs).
+//
+// ANY ROW, NOT ONLY AN `#anon` ONE, AND THE ANON-ONLY CUT WAS MEASURED FIRST: it closes
+// the hand-written generic cells and **ZERO corpus cells**, because `a000093` reaches the
+// narrow twin past a DECLARED `{r: i32 | null}` rather than past a minted one. The
+// question this asks is about the ROW's field code, not about who wrote the row, so the
+// provenance gate was cutting the answer rather than the risk.
+//
+// THE ORDERING IS WHAT BOUNDS THE BLAST RADIUS. `collectAnnShapes` runs BEFORE
+// `collectAnonShapes` inside `collectS`, and a declared row's code-16 field needs a value
+// union the user spelled — so on the first pass this can only answer for a shape some
+// DECLARATION already widened. It bites mainly on the POST-`monomorphize` re-run, where an
+// instance's pinned annotation is interned after the literals (and the declarations) have
+// settled the row. Measured: corpus `cmp` 0 modules DIFFER, `tests/cases` build set
+// unchanged.
+function annShapeWiderRowOf(names: string[], codes: i32[], texts: string[]) {
+  if !postMonoShapes { return 0 - 1 }
+  const sLimW = sScanLim()
+  let si = 0
+  while si < sLimW {
+    if sFieldCount[si] == names.length {
+      let allIn = true
+      let boxed = false
+      let i = 0
+      while i < names.length {
+        const fi = sFieldIndex(si, names[i])
+        if fi < 0 {
+          allIn = false
+        } else {
+          const rc = sFieldTypeAt(si, fi)
+          if rc == 16 && codes[i] != 16 {
+            boxed = true
+            if !unionSetNamesAtom(sFieldElemNameAt(si, fi), texts[i]) {
+              allIn = false
+            }
+          } else if rc == codes[i] {
+            if (
+              sFieldElemNameAt(si, fi) !=
+              shapeFieldElemName(texts[i], codes[i])
+            ) {
+              allIn = false
+            }
+          } else {
+            allIn = false
+          }
+        }
+        i = i + 1
+      }
+      if allIn && boxed { return si }
+    }
+    si = si + 1
+  }
+  0 - 1
+}
+
+// Does the value-union member set `set` (`"i32|null"`, the spelling `anonLeafPolyUnionSet`
+// mints and `sFieldElemName` records) name `atom` as one of its members? Split with the
+// one home `splitUnionAtoms`, so a grouped or spaced spelling reads the same here as at
+// the mint.
+function unionSetNamesAtom(set: string, atom: string): boolean {
+  if set == "" { return false }
+  const at = normTypeAtom(atom)
+  if at == "" { return false }
+  const parts: string[] = []
+  splitUnionAtoms(set, parts)
+  let i = 0
+  while i < parts.length {
+    if normTypeAtom(parts[i]) == at { return true }
+    i = i + 1
+  }
+  false
+}
+
 export function internInlineShapeTy(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
@@ -22792,6 +22885,9 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   if !ok || names.length == 0 { return -1 }
   const existing = annShapeIndexOf(names, codes, texts)
   if existing >= 0 { return existing }
+  // D831: the WIDER `#anon` row a literal already interned serves this annotation too.
+  const wider = annShapeWiderRowOf(names, codes, texts)
+  if wider >= 0 { return wider }
   sDeclared = true
   // Interned under the ANNOTATION TEXT itself (`{v:i32}`) — a real key, so
   // `structIndexByName` on the annotation (or on a ref-list element name

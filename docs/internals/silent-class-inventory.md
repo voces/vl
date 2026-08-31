@@ -22528,11 +22528,11 @@ Repro (now runs, printing `7`):
 
 ---
 
-### D804b — a map that ROUND-TRIPS THROUGH A GENERIC loses the merged value row, and no row mint can reach it
+### D804b — [CLOSED 2026-08-31 by D831, and the same message's OTHER MECHANISM is D833] a map that ROUND-TRIPS THROUGH A GENERIC loses the merged value row, and no row mint can reach it
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 1 corpus cell (`a000093`), 1 residual ingredient · D735's SECOND cell, and NOT D804's mechanism: the merged row is not what is missing here**
+**closed as `runs` by D831 · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · THE DIAGNOSIS BELOW IS RIGHT ABOUT THE ABLATION AND WRONG ABOUT THE RUNG. "No row mint can reach it" is false: a probe build shows the merged row IS minted (`M L Y S` at the leaf rung's own gates). What happens after it is minted is that the monomorphizer's pinned annotation mints a NARROWER twin, and the local's cell, the map value slot and the delivery seed all name that one — see D831. The "WHERE TO START" bullet is the part to disbelieve; every ablation line above it re-runs exactly as filed · and the message is shared with a SECOND mechanism (a competing row that exists before `collectAnonShapes`), which is D833 and is open**
 
-Repro (a loud emit reject):
+Repro (now runs, printing `0`):
 
     import { reverse } from "std:array"
     function rd() {
@@ -22543,6 +22543,7 @@ Repro (a loud emit reject):
       print(0)
     }
     rd()
+    // was: emitProgram: bare null needs a struct-typed context; now prints 0.
 
 * **THE ABLATION IS ONE LINE, and it separates this from D804 completely.** Delete
   `reverse([c])[0]` and read the map directly and the same program RUNS (D804's rung mints the
@@ -23606,3 +23607,322 @@ Repro (check rc 0, then a loud emit reject — identical on master and after D81
   earlier, so the read never gets a chance to floor. Loud on master, loud after, no cell moved;
   what changed is that the message a user sees for that program is now this one. Filing it is
   what stops the next reader attributing it to the widening.
+
+---
+
+### D831 — [CLOSED 2026-08-31] an instance's PINNED annotation minted a NARROWER twin of the row the literals had already merged, and the ordering is the whole mechanism
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` and `check-clean invalid wasm` · a CLAUSE-2 and CLAUSE-1 close · ABLATED family: the `??`-joined pair through a GENERIC, 4 corpus cells (`a000093`, standing for 1,437 census cells, plus three of `d833_genpin_*`) · 4 cells → `runs` (2 clause-1, 2 clause-2), **0 `runs` lost, 0 into any silent class**, corpus `cmp` **0 DIFFER · 0 LOST** · this was D804b, whose headline was a coincidence of its cell's spelling**
+
+Repro (now runs, printing `0`):
+
+    import { reverse } from "std:array"
+    function rd() {
+      const c = Map()
+      c["k1"] = { r: 7 }
+      const dd = reverse([c])[0]
+      const g1 = (dd)["k0"] ?? { r: null }
+      print(0)
+    }
+    rd()
+    // was: vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // Now: prints 0.
+
+* **`collectAnnShapes` RUNS TWICE AND `collectAnonShapes` RUNS ONCE, and that is the defect.**
+  The pass table has `collectS` (which ends with `collectAnnShapes()` then
+  `collectAnonShapes()`) before `monomorphize`, and then `collectGenAliasShapes` and
+  `collectAnnShapes` AGAIN after it — with no second `collectAnonShapes`. So the `??`-joined
+  pair mints its merged `{r: <box over i32|null>}` row on the first pass (D804's rung, working
+  exactly as filed), the monomorphizer pins `reverse`'s instance at `{[string]: {r: i32}}`, and
+  the SECOND `collectAnnShapes` misses `annShapeIndexOf`'s exact-field-code dedup and mints a
+  narrower `{r: i32}` twin. Two rows for one value: the literals build the box row, the local's
+  cell, the map value slot and the delivery seed all name the narrow one.
+
+* **A PROBE BUILD, BECAUSE THE ROW'S OWN "WHERE TO START" POINTED AT THE WRONG RUNG.** D804b
+  said the mint could not reach the shape ("every rung D804 added is gated on
+  `structIndexOfObj(ow) < 0`, and a shape the monomorphizer pinned is a row that already
+  matches"). Instrumented at each gate the generic cell answers **`M L Y S`** — the first
+  literal MINTS, the leaf rung is reached, **it ANSWERS**, and the second literal then matches
+  the row it minted. The merged row exists. What the probe found instead, printing the row the
+  literal is actually built at: `objsi=1={r:i32}  rows|#anon0|{r:i32}` — seeded through
+  `pendingStructIdx`, from a row minted after `#anon0`. The mint was never the problem.
+
+* **THE FIX IS ONE PREDICATE: A ROW WHOSE FIELD IS ALREADY A BOX OVER THIS ATOM SERVES THIS
+  ANNOTATION TOO** (`annShapeWiderRowOf`, `emit_classify.vl`). That is not a new rule — it is
+  `anonValueFitsField`'s `sc == 16` arm, *"a union BOX field accepts every atom by
+  construction"*, asked one layer up: of an annotation instead of a value. Every field must be
+  code-AND-element equal or a box whose recorded member set NAMES the annotation's atom, and at
+  least one must be the wider box (with none, `annShapeIndexOf` already answered).
+
+* **THE POST-`monomorphize` GATE IS A MEASUREMENT, NOT A SCRUPLE.** Without it,
+  `tests/cases/types/optional-chain.vl` **stops building** — that file declares
+  `{y: string | i32}` and `{y: i32}` as two annotations the author meant to be distinct, and
+  the reuse collapses them. A user-written annotation names a type; an instance's pinned
+  annotation is a RE-SPELLING of a type the program already settled. `postMonoShapes` is the
+  one bit that tells them apart, and it is why the corpus is byte-identical.
+
+* **THE ANON-ONLY CUT WAS TRIED FIRST AND SCORES ZERO.** Restricting the reuse to `#anon` rows
+  is the obvious conservative reading and it closes the hand-written generic cells and **0
+  corpus cells** — `a000093` reaches the narrow twin past a DECLARED `{r: i32 | null}`, not past
+  a minted one. The question the rung asks is about a ROW'S FIELD CODE, not about who wrote the
+  row, and the provenance gate was cutting the answer rather than the risk.
+
+* **THE ABLATION, three rungs, each built and graded cell-matched.** Strip-all is master's own
+  seed, `08e1c66484dfe0f9d58403029ed7ade4`, 1,551,899 bytes, built here from master's
+  `compiler/` rather than quoted (master `96475195`, after #2060).
+
+  | rung | what it is | corpus movement |
+  |---|---|---|
+  | both (shipped) | | 4 cells → `runs`; **0 lost, 0 → silent**; cmp 0 DIFFER 0 LOST |
+  | −the reuse | `annShapeWiderRowOf` deleted | master exactly: `a000093` loud, `genpin_str`/`genpin_f64` invalid wasm |
+  | −the post-mono gate | reuse asked on every pass | same 4 cells, **plus `tests/cases/types/optional-chain.vl` LOST** |
+  | −the anon-only cut | reuse restricted to `#anon` rows | the generic cells run, **0 corpus cells move** |
+
+* **COUNTERS, reach AND ans.** A probe build counting the rung's calls and its answers:
+  `a000093` **3/3**, the minimal generic witness **3/3**, `tests/cases/types/optional-chain.vl`
+  **2/0** (reached twice, declines both — the gate, measured), D804's own control
+  `d833_none_i32_null` **0/0**. Over the whole corpus — every `tests/cases` and `std` module,
+  2,019 of them at `6c0c5225` — the rung is **asked 1,174 times and widens 0 times**, which is
+  the same shape as D791's write scan and is why `cmp` reads 0 DIFFER. (That sweep is quoted at
+  the population it was run on; the rung is unchanged by the rebase onto `96475195`, which adds
+  three modules.)
+
+* **THE FAMILY IS WIDER THAN THE GENERIC AND THE OTHER HALF IS D833.** `scripts/silent-sweep/d833/gen833.py`
+  crosses the carrier of the competing row (nothing / an unused `type` alias / an inline
+  parameter annotation / a map annotation / the monomorphizer's pin) with its field type and the
+  `??` default's value. Only the PIN carrier is this row; the other three put the competing row
+  in place BEFORE `collectAnonShapes`, so both literals match it and D804's merge never runs at
+  all. Twelve cells, open, filed as D833.
+
+* **MEASURED, all six instruments, on master `96475195`.** Corpus `cmp` (master → candidate):
+  **2,467 modules · 2,021 identical · 0 DIFFER · 0 LOST · 446 not buildable by the base.**
+  Distilled corpus: **4 cells → `runs`** (`a000093` loud→runs standing for 1,437 census cells,
+  `d833_genpin_i32_null` loud→runs, `d833_genpin_i32_str` and `d833_genpin_i32_f64`
+  check-clean invalid wasm→runs), **`runs → not-runs` ZERO, `→ silent` ZERO**. `tests/cases`:
+  **2,013 → 2,014 of 2,458 building**, and the set difference is EXACTLY the one fixture this
+  landing adds. `goal-scoreboard.py` on the 7,296-cell corpus: **26 → 22**, clause 1 15 → 13,
+  clause 2 11 → 9, `runs` **4,337 → 4,341 (59.44% → 59.50%)**. Fixture:
+  `tests/cases/maps/coalesce-default-row-through-generic.vl`.
+
+* **ONE RESIDUE ADJACENT TO THIS CLOSE, D804's rather than mine.** Reading the STORED i32 back
+  through an `i32 | f64` merged box is `wasm trap: cast failure`, on master and here alike, with
+  or without the generic:
+
+      function rf() {
+        const c = Map()
+        c["k0"] = { r: 7 }
+        const g0 = (c)["k0"] ?? { r: 7.5 }
+        print(g0.r)
+      }
+      rf()
+
+  The fixture's f64 block reads the MISS for that reason. Not filed as its own row because it
+  has no corpus cell and I did not ablate it.
+
+---
+
+### D832 — `match`'s FINAL ARM IS AN UNTESTED `else`, and hardening it is REFUSED four times over
+
+**check-clean silently wrong · 1 cell (`d832_match_untested_else`), the corpus's FIRST `runs but wrong value` · the DEFECT is real and the four candidate repairs each named a price the gate refuses · `goal-scoreboard.py`'s clause-1 filter did not count this class at all and now does**
+
+Repro (runs, prints the wrong arm's body):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Shape[] = xs
+      const b: Other[] = xs
+      b[0] = { t: 3 }
+      const e = a[0]
+      match e { Circle => print(100), Sq => print(200) }
+    }
+    f()
+    // PRINTS 200
+    // vl check rc 0, module loads, prints 200 and exits 0.
+    // The value is a `Tri`. It is not `Circle` and it is not `Sq`, and `is` says so on
+    // both — the compiler ran the `Sq` arm anyway.
+
+* **THE BYTES NAME THE ARM** (`./node_modules/.bin/wasm-dis`, binaryen 130, D741's `w0_base`,
+  382 bytes). `$3` is the union box `(struct (field i32) (field anyref))`; the literal builds
+  tag **0** and the store through `Other[]` builds tag **5**:
+
+      (if (i32.eq (struct.get $3 0 (local.get $3)) (i32.const 0))
+        (then … (ref.cast (ref $0) (struct.get $3 1 …)))     ;; Circle, tag-tested
+        (else … (ref.cast (ref $1) (struct.get $3 1 …))))    ;; Sq, NO tag test
+
+  With a field read the bare `ref.cast` traps (`d741_w0_base`). WITHOUT one — this row's cell —
+  nothing casts, the `Sq` body just runs, and the program prints 200 and exits 0.
+
+* **IT IS A DESUGAR DECISION, NOT AN EMITTER ONE, AND THE EMITTER NEVER SEES A `match`.**
+  `desugarMatchAt` (typecheck.vl:24282) rewrites the arena slot in place to an if-chain;
+  `matchElseArmOf` (typecheck.vl:24255) picks the bare `else` as *"the `_` WILDCARD arm when
+  there is one, otherwise the LAST arm (the match is exhaustive, so it is the only case left)"*.
+  A `_` else is unconditional **by the author's own instruction**; a last-type-arm else is
+  unconditional only because EXHAUSTIVENESS says so, and array covariance has already broken
+  exhaustiveness (D741). The two controls separate the claim from the covariance question:
+  `if e is Circle {…} else if e is Sq {…} else {…}` prints **999** — `is` is right on the same
+  value — and `match e { Circle => …, _ => … }` prints 200, which is what a wildcard is for.
+
+* **FOUR CANDIDATES, FOUR PRICES, EACH MEASURED RATHER THAN ARGUED.**
+
+  | candidate | what it does | price |
+  |---|---|---|
+  | (1) test every arm, `else { __trap__("no arm matched") }` | | **8 `runs` cells LOST** — `d341_nt_{i32,i64,f64,f32}_match_null_in{0,1}` — AND self-host **generation 2** breaks |
+  | (2) the same, bare `__trap__()` | drops the message | the same 8 cells; gen 2 still breaks |
+  | (3) (2) + skip any match with a `null` arm | | **0 `runs` lost, gen 2 self-hosts** — and **2 corpus modules LOST** |
+  | (4) prepend `if !(scrut is <last>) { __trap__() }` to the last arm | a guard, not a fourth branch | **`runs` cell LOST**, and the guard does not even fire on this row's cell |
+
+  · **(1)/(2)'s 8 cells** are a NICHE union's non-null arm: `is NtI32` over a `NtI32 | null` has
+    no positive lowering, so testing the arm the complement already selected turns `runs` into
+    `loud emit reject`. A capability gap in its own right, and it is the reason candidate (3)
+    has to carry a `null`-arm exclusion at all.
+  · **The self-host break is the one worth reading twice.** `__trap__("…")` streams its message
+    through `__print_char__`/`__print_str_flush__`, and the compiler's OWN module is
+    instantiated with an import set that has neither. **Generation 1 looks completely fine** —
+    it is built by an UNHARDENED seed, so its own matches carry no trap — and generation 2, the
+    hardened compiler compiling the compiler, produces a module the host refuses with
+    `unknown import: imports::__print_i32__`. A one-generation test would have shipped it.
+  · **(3)'s two modules** are `tests/cases/match/binding-arm-in-value-position.vl` and
+    `tests/cases/unions/struct-arms-inline-literal-tag.vl`, both
+    `emitProgram: if-expression arm ends in a void call, which yields no value`: a VALUE-position
+    match's else must yield a value and `__trap__` yields none.
+  · **(4)** avoids that by leaving the arm body as the block's last statement — and the
+    synthesized `mkIsExprNeg` node has no banked spelling tree, which `isTypeTy`'s header states
+    as an invariant every one of the three real call sites maintains (*"no `IsExpr` exists
+    without a spelling tree"*, measured at 0 misses in 228,869 reads). It answers the wrong way
+    in both directions: it traps `binding-arm-in-value-position.vl`, which was correct, and it
+    does not fire on this row's cell, which is wrong.
+
+* **SO THE REPAIR NEEDS THREE OTHER GAPS CLOSED FIRST**, and naming them is the point of filing
+  this rather than half-landing it: a positive `is` over a nullable-niche arm; a message-carrying
+  `__trap__` the compiler's own host can instantiate; and an `unreachable`-tailed arm accepted in
+  if-expression value position. None of them is this row's slice, and each is measurable.
+
+* **AND CLOSING IT WOULD NOT MOVE THE SCOREBOARD ANYWAY.** `d741_w0_base` and `d741_w6_params`
+  stay `trap_loads` under every candidate above — the value has no correct arm, so the honest
+  end state for them is the CHECKER refusing the program (D793), not a better trap. What
+  hardening buys is exactly this row's cell: a silently wrong answer becoming a loud one.
+
+* **THE INSTRUMENT WAS UNDER-COUNTING, for the second time and in the same way.**
+  `goal-scoreboard.py`'s clause-1 tuple listed the DOC vocabulary `check-clean silently wrong`
+  and `check-clean wrong evaluation`, neither of which `gradecensus.py` ever writes — it writes
+  `runs but wrong value`. So the worst class in the taxonomy was scored at zero by construction.
+  This is D742's `trap_loads` miss one class over, it survived that audit, and it is fixed here;
+  `regress.py`'s own tuple has said `runs but wrong value` all along.
+
+---
+
+### D833 — a NARROWER row that exists BEFORE `collectAnonShapes` claims both `??` operands, so D804's merge never runs
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` (6 cells), and 6 more that build a SILENT invalid module (`expected i32, found (ref $type)`) · 12 cells in `distilled/named/d833_*`, OPEN · the OTHER mechanism behind D804b's message, separated from D831's by ABLATION and by a gate probe · the plainest witness is a three-line `type` the program never uses**
+
+Repro (a loud emit reject):
+
+    type R = { r: i32 }
+    function rd() {
+      const c = Map()
+      c["k1"] = { r: 7 }
+      const g1 = (c)["k0"] ?? { r: null }
+      print(0)
+    }
+    rd()
+    // vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // DELETE THE FIRST LINE AND IT PRINTS 0. `R` is never mentioned again.
+
+* **THE MESSAGE IS SHARED AND THE MECHANISM IS NOT.** D831's cell and this one print the
+  identical sentence. A probe build instrumented at each gate of D804's rung separates them in
+  one run: the generic cell answers **`M L Y S`** (mint, leaf rung reached, leaf rung ANSWERS,
+  sibling matches the minted row) and this one answers **`S S`** — both literals matched a row
+  and `anonLeafPolyUnionSet` was never called. One fix moves none of the other's cells, which is
+  why this is a row and not a paragraph in D831.
+
+* **THE GATE THAT DECLINES IS `structIndexOfObj(ow) >= 0`, AND ITS OWN COMMENT STATES THE
+  ASSUMPTION THAT FAILS.** `anonLeafPolyUnionSet`'s sibling scan says *"A sibling a DECLARED row
+  already claims never lands here — and if one did, this literal would have matched that row too
+  and no mint would be running."* Exactly true, and exactly the problem: BOTH literals match `R`,
+  so no mint runs, and `anonValueFitsField`'s `vc < 0` leniency is what lets `{ r: null }` match
+  a row whose `r` is a plain i32.
+
+* **FOUR CARRIERS, ONE BEHAVIOUR — the competing row's SPELLING is scenery.** `type R` declared
+  and never used, `function sink(_x: {r: i32})` declared and never called, and
+  `function sink(_x: {[string]: {r: i32}})` all produce the identical grade at every default
+  value. The MAP is scenery too: the same refusal appears with no `Map()` anywhere, over a
+  function returning `{r:i32} | null`.
+
+* **SIX OF THE TWELVE ARE CHECK-CLEAN INVALID WASM.** With a `string` default,
+  `anonValueFitsField` REFUTES instead of merging, each literal gets its own row, and the `??`
+  then joins two heap types — `expected i32, found (ref $type)`. D804's row predicted three such
+  cells from its own value-pair ablation; over this grid there are six, and they are clause-1
+  cells the corpus had no program for. Adding them takes the scoreboard's clause 1 from 7 to 13
+  on the same seed, and that is the number becoming true rather than getting worse.
+
+* **WHAT A FIX HAS TO SOLVE, AND WHY IT IS NOT D831's ONE-LINER.** Minting the merged row is not
+  enough: it has to CLAIM both literals, and both are seeded through `pendingStructIdx` from the
+  local's cell and the map's value slot, which resolve by TYPE and would still find `R`. And if
+  `R` is genuinely USED elsewhere, `{r: 7}` must be an `R` (plain i32) *and* a member of the
+  joined pair (boxed) — two reps for one literal, which needs either a copy or a real anonymous
+  union of two struct rows. The unused-`R` case is the easy half and "unused" is not a
+  principled line, so this is filed rather than guessed at.
+
+* **THE CONTROLS ARE IN THE SET.** `d833_none_*` (4) is D804's own control — nothing else names
+  `{r}`, all four run at `null`, `"s"`, `1.5` and `9`. `d833_genpin_*` (4) is D831's witness set
+  and must keep running. Regenerate with `scripts/silent-sweep/d833/gen833.py --verify`.
+
+---
+
+### D834 — the two remaining `trap_loads` cells are D793's, and the reason to say so is that a second rule would be a false reject with a different sentence
+
+**loads then traps · `d741_w0_base` and `d741_w6_params` · NOT BUILT HERE, deliberately · re-run verbatim on `6c0c5225` and both reproduce exactly as filed**
+
+Repro (check rc 0, then a runtime trap — D741's `w0_base`, unchanged):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Shape[] = xs
+      const b: Other[] = xs
+      b[0] = { t: 3 }
+      const e = a[0]
+      match e { Circle => print(100 + e.r), Sq => print(200 + e.s) }
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Caused by: wasm trap: cast failure
+    // SHOULD PRINT 107 — `a`'s own annotation says element 0 is a `Shape`
+
+* **THERE IS NO CORRECT VALUE TO PRODUCE, so this is a DIAGNOSIS question.** `a` and `b` alias
+  one list whose element storage is a shared union box; the store through `b` puts a `Tri` where
+  `a`'s annotation promises a `Shape`. Aliasing + covariance + a write is unsound whatever the
+  emitter does, so the end state is the CHECKER refusing the program — which is D793, filed with
+  the predicate (`rlSlotEverWritten`, built by D791) and the requirement attached: it is
+  REP-scoped and whole-program, so a rule reading it as written refuses a program whose write is
+  to an unrelated list of the same element row (`d791_unrelated_write_blocks`), and clause 2
+  forbids exactly that. A `Writable` rule needs a per-VALUE analysis.
+
+* **AND A NARROWER RULE IS NOT AVAILABLE — the write is not local.** `w6_params` puts the two
+  destinations in call ARGUMENTS and the store in a callee's body
+  (`poke(p: Other[]) { p[0] = { t: 3 } }`), so any rule that reaches both cells has to see
+  through a parameter. The three checker-side rules D741 already priced are all still refused on
+  the gate's own criterion — `tySame` on the element reddens the 14 differing-element cells that
+  run, array invariance costs 617 classes, and extending `constrainEmptyD`'s pin costs 10.
+
+* **WHAT WAS DONE INSTEAD.** The SILENT half of the same family — `match`'s untested final arm,
+  which prints the wrong arm's body rather than trapping — was measured, minimised, hardened
+  four different ways and refused four times. That is D832, and its cell is now in the corpus.
+
+* **IF D793's RULE LANDS, THESE TWO MOVE WITH IT** and this row closes as
+  `now a loud check reject`. Nothing here should be built first: two rules refusing one program
+  with two sentences is worse than one, and the sibling cells (`d774_k1k2_store`,
+  `d774_k1k2_param_store`) are the same four-cell set.

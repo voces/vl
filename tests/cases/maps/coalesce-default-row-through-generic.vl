@@ -1,0 +1,76 @@
+// @run
+// @log 7
+// @log -1
+// @log s
+// @log 7.5
+// CONTRACT (must-RUN): D804's merged row survives a GENERIC ROUND-TRIP. The pair of
+// `??`-joined same-field-set literals mints one row (`coalesce-default-leaf-shape-merge.vl`
+// is that contract); this file adds the instance's pinned annotation, which used to mint a
+// NARROWER twin of that row AFTER it and take the program back.
+//
+// THE MECHANISM, and it is an ORDERING one (`silent-class-inventory` D831, corpus cell
+// `a000093` standing for 1,437 census cells). `collectAnnShapes` runs twice: once inside
+// `collectS`, BEFORE `collectAnonShapes`, and once again after `monomorphize`. The literals
+// intern their merged `{r: <box over i32|null>}` row on the first pass. `reverse([c])[0]`
+// then makes the monomorphizer pin an instance whose annotation spells the same field set at
+// ONE of those atoms (`{r: i32}`), the second `collectAnnShapes` misses `annShapeIndexOf`'s
+// exact-code dedup, and a second row is minted. The program now has two reps for one value:
+// the literals build the box row while the local's cell, the map value slot and the delivery
+// seed all name the narrow one. The `??` default's bare `null` is then built at a row whose
+// `r` is a plain i32 — `emitProgram: bare null needs a struct-typed context` — and the
+// non-null members of the same family (`?? {r: "s"}`, `?? {r: 1.5}`) were CHECK-CLEAN
+// INVALID WASM.
+//
+// `annShapeWiderRowOf` is the fix: a row whose field is already a BOX over this
+// annotation's atom serves the annotation too, so no narrower twin is minted. That is
+// `anonValueFitsField`'s `sc == 16` arm ("a union BOX field accepts every atom by
+// construction") asked one layer up, of an annotation instead of a value.
+//
+// TWO GATES, EACH ONE A MEASUREMENT. (1) POST-`monomorphize` only — a user-written
+// annotation names a type the author meant to be distinct, and reusing a wider row for one
+// takes `tests/cases/types/optional-chain.vl` out of the build set (`{y: i32}` would adopt
+// `{y: string | i32}`'s row). (2) at least one field must actually be the wider box —
+// otherwise `annShapeIndexOf` already answered. Measured over 2,019 corpus modules: the rung
+// is ASKED 1,174 times and widens 0 times, which is why the corpus is byte-identical.
+//
+// ONE MORE RESIDUE THE F64 BLOCK STEPS AROUND, and it is D804's rather than this row's:
+// reading the STORED i32 back through an `i32 | f64` merged box is
+// `wasm trap: cast failure`, on master and here alike, WITH OR WITHOUT the generic. So the
+// f64 block below reads the MISS. Filed with D831.
+//
+// WHAT IS STILL OPEN AND IS NOT THIS FILE'S CONTRACT (D833): a competing row that exists
+// BEFORE `collectAnonShapes` — an unused `type R = { r: i32 }`, or an inline `{r: i32}`
+// parameter annotation on a function never called — makes both literals match THAT row, so
+// D804's merge never runs at all. Twelve cells in `distilled/named/d833_*`.
+
+import { reverse } from "std:array"
+
+// ---- i32 beside null, through `reverse`: the filed witness at the HIT and the MISS ----
+function rd(k: string) {
+  const c = Map()
+  c["k0"] = { r: 7 }
+  const dd = reverse([c])[0]
+  const g0 = (dd)[k] ?? { r: null }
+  if g0.r != null { print(g0.r) } else { print(-1) }
+}
+rd("k0") // 7   — the stored literal, boxed as the i32 atom
+rd("miss") // -1  — the default, boxed as the null atom
+
+// ---- i32 beside string, and beside f64: the two corners that were SILENT ----
+function rm() {
+  const c = Map()
+  c["k0"] = { r: 7 }
+  const dd = reverse([c])[0]
+  const g0 = (dd)["miss"] ?? { r: "s" }
+  print(g0.r)
+}
+rm() // s
+
+function rf() {
+  const c = Map()
+  c["k0"] = { r: 7 }
+  const dd = reverse([c])[0]
+  const g0 = (dd)["miss"] ?? { r: 7.5 }
+  print(g0.r)
+}
+rf() // 7.5 — the DEFAULT, boxed as the f64 atom
