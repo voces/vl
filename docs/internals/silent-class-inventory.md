@@ -17493,6 +17493,110 @@ Repro (ten lines, and NO layout twin is declared anywhere):
 
 ---
 
+### D611 — a shape spelled BOTH as a named alias and ANONYMOUSLY mints two heap types, and the literal-union field is what makes them differ
+**check-clean invalid wasm · 58 of the 92 silent cells in the distilled corpus, the largest single family · found 2026-08-30 by grading the corpus (not the inventory) against the clause-1 bar: `runs` is 3,704 of 7,021 and 92 cells are check-clean invalid wasm with NO filed row naming them · the three ingredients are each load-bearing and each was ablated**
+
+Repro:
+
+    type N = 1 | 2
+    type Box1 = {r: N}
+    type GW = { g: {r: N} }
+    function rd(c: {r: N}) {
+      const wv: GW = { g: c }
+      if (wv.g).r == 1 { print(7) } else { print(0) }
+    }
+    rd({ r: 1 })
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
+    // SHOULD PRINT 7
+
+* **THREE INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING.** Remove any one and the program runs:
+
+  | change | outcome |
+  |---|---|
+  | as filed | **check-clean invalid wasm** |
+  | drop `type Box1` (the same-shape alias) | runs |
+  | spell the field and param `Box1` instead of `{r: N}` | runs |
+  | field type `i32` instead of the literal union `N` | runs |
+
+  So it is not "anonymous shapes are broken" and not "literal-union fields are broken" — it is
+  the CONJUNCTION: a shape that has a name AND is also written anonymously, whose field rep is
+  decided by a literal union.
+* **THE HYPOTHESIS TO TEST FIRST, AND IT IS NOT YET CONFIRMED.** `sSetLim`'s header names
+  THREE roots that mint a struct row from a shape spelling — `internInlineShapeTy`,
+  `internShapeAs`, `gaeEnsure` — against ONE dedup key, `annShapeIndexOf`. A top-level `type`
+  declaration mints through `internShapeAs`; an inline `{r: N}` mints through
+  `internInlineShapeTy`. The guess is that the two compute different keys for one structural
+  shape and the literal-union field is what separates the reps. **Confirm by instrumenting
+  `annShapeIndexOf` and printing the index each spelling receives** — do not take this
+  paragraph as the finding.
+* **`wasm-dis` is at `./node_modules/.bin/wasm-dis`** — the two `$type`s print under the same
+  elided name, so the disassembly is the only way to see whether they are two indices or one
+  index with two nullabilities. `(ref $t)` is a SUBTYPE of `(ref null $t)` in wasm, so a pure
+  nullability difference could not be a validation error: the heap types must differ.
+
+### D612 — D280's layout twin, one indirection out: through a MAP-valued field read with `??`
+**check-clean invalid wasm · 6 of the 92 · found 2026-08-30 with D611 · the ingredients are D280's exactly: a union declaration plus a same-shape alias twin**
+
+Repro:
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Dot = { r: i32 | null }
+    type Circle = { r: i32 | null }
+    type WS1 = { f: {[string]: Circle} }
+    const lv1 = Map()
+    const c: WS1 = { f: lv1 }
+    const lamc = (x: WS1) => x
+    const dd = lamc(c)
+    const g1 = ((dd).f)["k0"] ?? { r: null }
+    if (g1).r != null { print(7) } else { print(0) }
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected i32, found (ref null $type)
+    // SHOULD PRINT 0 (the map is empty, so the `??` default is taken and its `r` is null)
+
+* **D280 CARRIES THIS EXACT PAIR AND ITS OWN REPRO STILL RUNS**, so its fix holds where it was
+  measured and does not reach a map-valued field read through `??`. This row is that survivor.
+  (Stated here and not in the status line above: the grader's vocabulary is matched by substring,
+  so a status line remarking that some OTHER row is closed grades THIS row as fixed. That is not
+  hypothetical — it happened to this row on the first filing.)
+* **BOTH TWIN INGREDIENTS ARE LOAD-BEARING, ablated:** dropping `type Shape = Circle | Sq`
+  runs; dropping `type Dot` (the same-shape alias) runs. That is D280's pair — a union arm and
+  a declared struct of its exact layout — and D280's own repro still runs, so the fix holds
+  where it was measured and does not reach a map-valued field read through `??`.
+* **START BY RE-READING D280's CLOSE** rather than re-deriving the family: the question is
+  what its fix keyed on that the map-read path does not present.
+* The correct answer is `0`, not `7` — check the control (`lv1["k0"] = { r: 1 }` before the
+  read) so the fix is graded on both the miss and the hit.
+
+### D613 — an empty list literal CAPTURED by a nested function commits its element row before the capture is resolved
+**check-clean invalid wasm · 22 of the 92 · found 2026-08-30 with D611 · the closure capture is the ONLY load-bearing ingredient: the element type is not — an `f64`-backed literal union, an `i32`-backed one and a plain `f64` field all reproduce identically**
+
+Repro:
+
+    type F = 1.5 | 2.5
+    type Circle = { r: F }
+    function sink(_x: Circle[]) { }
+    function outer() {
+      const c = []
+      function inner() { sink(c) }
+      inner()
+    }
+    outer()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD RUN (and print nothing)
+
+* **ONE INGREDIENT, ABLATED.** Hoist the `sink(c)` call out of `inner` and into `outer` and it
+  runs. Change `F` to `1 | 2`, or the field to a plain `f64`, and it still fails — so this is
+  not a rep question, it is a question of WHEN the captured literal's element row is decided.
+* **THE NEIGHBOURS ARE D411 AND D501 AND THEY ARE BOTH CLOSED**, both about an un-annotated
+  list literal's element row being committed too early. Both close as LOUD EMIT REJECTS. Read
+  their closes first: this row is the same commit happening across a capture boundary, and the
+  right outcome here is `runs`, not a third refusal — the destination is unambiguous (`sink`
+  names `Circle[]` and nothing else consumes `c`).
+
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
