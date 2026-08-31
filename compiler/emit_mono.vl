@@ -335,17 +335,40 @@ function monoStructAnnName(name: string) {
 // function's question — `monoScalarAnnName` is its home, one arm further down
 // `monoAnnPinName`, and the two partition the list spellings between them.
 // The MODULE-scope `LetDecl` for `name`, or -1 — the top-level binding a generic call's
-// argument names when the call itself is at module scope. Declines outright inside a
-// function (`fnIx >= 0`): a function-scoped binding of the same name SHADOWS the global,
-// `parentLetOf` / `paramTypeNode` are the arms that answer there, and a global scan behind
-// them would answer for a name they deliberately declined.
+// argument names. Declines when a function-scoped binding of the same name SHADOWS it.
+//
+// IT USED TO DECLINE ON `fnIx >= 0` OUTRIGHT, and the reason it gave is right about
+// shadowing and wrong about everything else: "a function-scoped binding of the same name
+// SHADOWS the global, `parentLetOf` / `paramTypeNode` are the arms that answer there, and a
+// global scan behind them would answer for a name they deliberately declined". Those two
+// arms decline for TWO different reasons and the test could not tell them apart — "this name
+// is a local, and its annotation is what to read" versus "this name is not a local at all".
+// In the second case nothing answered: a generic call INSIDE a function whose argument is a
+// top-level `const c: {r: i32[]}[]` reached no annotation channel, fell to `exprRefArray`'s
+// non-literal floor and got the loud `monomorphize: unsupported argument type` — while the
+// identical call moved OUT to module scope compiled (D703, and `monoCompositeListAnnName`'s
+// own arm one screen down records the mirror-image asymmetry it was added to fix).
+//
+// So the decline is now the SHADOW TEST ITSELF, asked of the same two tables the arms above
+// read: a `let`/`const` of this name anywhere in the body, or a parameter of it. Both are
+// conservative in the safe direction — a body-wide `parentLetOf` hit declines even for a
+// binding that is not yet in scope at the call — and where either answers, the arm above has
+// already returned or deliberately declined, exactly as before.
 //
 // A flat scan of the top-level statement list, which is what module scope IS — no recursion
 // into a top-level `if`'s block (that binding is a start-function local, a different table),
 // FIRST-wins to match `parentLetOf`'s convention. `monoProgStmts` is set at
 // `monomorphize`'s entry, so it is populated for every caller of this.
 function monoGlobalLetOf(name: string, fnIx: i32) {
-  if fnIx >= 0 { return -1 }
+  if fnIx >= 0 {
+    if paramTypeNode(fnIx, name) >= 0 { return -1 }
+    const shf = P.nodes[fnIx]
+    if shf is FuncDecl {
+      if parentLetOf(shf.fnBody, name) >= 0 { return -1 }
+    } else {
+      return -1
+    }
+  }
   let i = 0
   while i < monoProgStmts.length {
     const s = P.nodes[monoProgStmts[i]]
@@ -893,41 +916,58 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
         }
       }
     }
-    // THE MODULE-SCOPE TWIN, and the SCOPE axis is why it is here rather than assumed.
+    // THE MODULE-SCOPE TWIN of the two arms above, arm for arm — the annotated binding and
+    // the un-annotated one — because the SCOPE axis is not a type axis and the ladder had
+    // been split along it three times.
+    //
     // `parentLetOf` is function-scoped and every arm above sits behind `fnIx >= 0`, so a
-    // generic call whose argument is a top-level `const xs: i32[][]` reached NONE of them
-    // — the identical program moved into a `function main()` body did. It is scoped to the
-    // composite-element list question alone (not the struct / union arms above, which have
-    // their own module-scope story through the classifier tables) so the widening is
-    // exactly the names nothing else answers.
+    // generic call whose argument is a top-level binding reached NONE of them while the
+    // identical program moved into a `function main()` body did. This arm used to close that
+    // for the composite-element list question alone, then for the nullable one; D703 makes it
+    // the whole ladder in both halves, and `monoGlobalLetOf` now declines on the SHADOW test
+    // rather than on `fnIx >= 0`, so a global is readable from inside a function too.
     const gli = monoGlobalLetOf(argN.identName, fnIx)
     if gli >= 0 {
       const gd = P.nodes[gli]
       if gd is LetDecl {
         if gd.letType >= 0 {
-          const rg = monoCompositeListAnnName(tyNameOf(gd.letType))
+          // THE GLOBAL'S ANNOTATION, THROUGH THE ONE PIN MEMBERSHIP LIST — the same call the
+          // annotated-LOCAL and PARAM arms above make, so a generic call pins its instance
+          // identically wherever its argument's binding happens to live.
+          //
+          // THIS WAS TWO RUNGS OF THAT LADDER, ADDED ONE DEFECT AT A TIME, and the third
+          // defect is what retired the pattern. It read `monoCompositeListAnnName` (a
+          // composite-element list) and then `monoNulAnnName` (a nullable), each with a
+          // paragraph explaining why only its own question needed the other scope, and both
+          // resting on the claim that "the struct / union / map / scalar spellings have their
+          // own module-scope story through the classifier tables". The UNION spelling does
+          // not: `type U = i32 | string` + `const a: U = 6` + `g(a, b)` at module scope was
+          // the loud `monomorphize: unsupported argument type` while `monoAnnPinName`'s
+          // `isUName` rung — one line, already written, three arms up — names it `U`, and the
+          // NON-generic twin `function g(a: U, b: U)` runs. The same program with `a` declared
+          // as a LOCAL compiled, because the local arm asks the whole ladder.
+          //
+          // Delegating to `monoAnnPinName` is what makes that class of asymmetry unstateable
+          // rather than fixed once more: any spelling added to the pin list is added to both
+          // scopes at once, which is the property that ladder's own header says it exists for.
+          const rg = monoAnnPinName(tyNameOf(gd.letType))
           if rg != "" { return rg }
-          // THE NULLABLE PIN, at module scope. `monoNulAnnName` is the guard that makes a
-          // nullable argument's `| null` RIDE the pin — its header says why in full: every
-          // other channel answers about the REP, and a nullable's rep is its non-null base,
-          // so the cascade names a `string | null` argument `string`, the instance declares a
-          // NON-NULL parameter, and the caller hands it the nullable ref
-          // (`expected (ref $type), found (ref null $type)` — check-clean INVALID WASM).
-          //
-          // That guard sits on the annotated-LOCAL and PARAM arms, both behind `fnIx >= 0`.
-          // A module-scope `const s: string | null` reached NEITHER, so the identical program
-          // moved into a `function main()` body compiled and the top-level one did not
-          // (`soundness/miscompile-nullable-ref-generic-arg`). Same arm, the other scope —
-          // exactly the widening the composite-list arm above already made for its own
-          // question.
-          //
-          // NARROWED TO THE NULLABLE LADDER rather than to all of `monoAnnPinName`, for the
-          // reason the arm above states: the struct / union / map / scalar spellings have
-          // their own module-scope story through the classifier tables (a global's kind IS
-          // built at this point), and only the nullability is information no other channel
-          // carries.
-          const rn = monoNulAnnName(tyNameOf(gd.letType))
-          if rn != "" { return rn }
+        }
+        // THE UN-ANNOTATED GLOBAL, the other half of the local arm's pair — `const c = [lv1]`
+        // at module scope, whose type only its INITIALIZER knows. The local arm has recursed
+        // into `letInit` since it was written; this one had no such rung, so a top-level
+        // inferred binding handed to a generic reached `exprRefArray`'s non-literal floor and
+        // took the loud reject, while the identical program with the binding ANNOTATED
+        // (`const c: i32[][][] = [lv1]`) or moved INTO a function ran.
+        //
+        // The recursion is the local arm's verbatim, INCLUDING its two rules: an `"i32"`
+        // answer is not adopted (the catch-all would be the pin either way), and `""` is a
+        // REFUSAL that propagates rather than a "nothing known" that falls through — see that
+        // arm's header for the witness, which is the same one at either scope.
+        if gd.letType < 0 && gd.letInit >= 0 {
+          const ginner = monoArgTyName(gd.letInit, fnIx)
+          if ginner != "" && ginner != "i32" { return ginner }
+          if ginner == "" { return "" }
         }
       }
     }
@@ -1174,6 +1214,32 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   if exprStruct(ix, fnIx) {
     const si = structIndexOfExpr(ix, fnIx)
     if si >= 0 { return sNames[si] }
+    // NO `sNames` ROW, BUT A PERFECTLY GOOD SPELLING — the checker's recorded SHAPE, routed
+    // through the one pin membership list, which claims a bare inline object shape
+    // (`nameIsShapeSpanEnds`). D703.
+    //
+    // THE ROW GOES MISSING FOR A REASON THAT HAS NOTHING TO DO WITH THE ARGUMENT.
+    // `collectS` SKIPS a `type X = {…}` that is a union member, so declaring
+    // `type Shape = Circle | Sq` deletes `Circle`'s struct row — and an un-annotated
+    // `const c = { r: 7 }` whose only layout match WAS `Circle` then resolves to nothing.
+    // Ablated: with `Circle` absent the literal mints its own row and the program runs; with
+    // `Circle` declared but NOT a union member it runs; with `Circle` in a union it was the
+    // loud floor. The generic-ness is scenery — `function idg(x: {r: i32}): {r: i32}` with
+    // the same three declarations runs today, which is what makes the pin safe: it is
+    // `monoScalarAnnName`'s exact-name rule, that a pin is an annotation a NON-generic
+    // function already lowers end to end (`paramStructIndex`'s inline-shape rung, D53,
+    // resolves it through `repSlotOfTy`'s structural→declared bridge).
+    //
+    // AT THE FLOOR, so it cannot re-pin anything: every argument that resolves a row above
+    // keeps `sNames[si]` character for character, and this rung only ever sees a value the
+    // ladder was about to refuse outright.
+    // THE CANONICAL RENDER, NOT THE SPACED ONE, and the choice is the same one
+    // `structIndexOfExpr`'s own closure-call fallback documents: `tyToEmitName` is spaceless
+    // and litunion-ALIAS preserving, while `nodeTyName`'s `tyToStr` FLATTENS an alias field
+    // (`{a: K0 | boolean}` spells its members), and a flattened field text classifies as no
+    // field code at all.
+    const shp = monoAnnPinName(tyToEmitName(nodeTyIxOf(unwrapParen(ix))))
+    if shp != "" { return shp }
     return ""
   }
   // f32 BEFORE f64 — the order `exprIsF32`'s own header states ("Checked BEFORE
