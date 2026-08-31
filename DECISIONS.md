@@ -958,6 +958,26 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   is an API-stability argument that only bites once there are cross-module
   consumers, and the annotation is additive, so it waits. (A8, A9)
 
+  **WHICH HALF IS THE WORK, MEASURED 2026-08-31 (silent-class-inventory D773 /
+  D774).** The migration sentence above is right and has been read as though it
+  made `Writable` the half worth building first. It is not. Of the 80 corpus
+  cells `goal-scoreboard.py` attributed to array covariance on `b7d5e593`,
+  **exactly 2 contain a store or a `.push` anywhere in the program**; the other
+  78 are read-only, and adding a store to one of them changes neither the
+  message nor its position (`d774_k1k2_{nostore,store,param_store}` are the
+  identical positioned emit reject). So `Writable` reaches 2 of 80 — both of
+  them clause-1 traps, which is exactly why it is still worth building — and
+  **`Readable` is the other 78.** The Readable half's blocker is unchanged and
+  now has a witness rather than a description: `const a: Circle[] = […]` then
+  `const b: Shape[] = a`, reading only, is `vl check` rc 0 and an invalid
+  module. And the copy this ruling calls unavailable is unavailable only on the
+  WRITABLE side: for a read-only destination an element-converting copy is
+  indistinguishable from the alias, because no write through either handle can
+  observe the difference. D661B's refusal of a converting copy — "gives one
+  destination a private list, which no other list assignment in the language
+  does" — is a statement about a writable destination and does not reach a
+  readable one.
+
 
 ## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
 
