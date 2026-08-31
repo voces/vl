@@ -2204,13 +2204,26 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
 
 // The base struct index of a nullable-struct `LetDecl`: the annotation's base, or
 // the initializer's resolved struct (a nullable-returning call's `fRetStructIdx`).
+//
+// D842 — THE CELL TAKES THE SAME REDIRECT THE MAP'S VALUE SLOT TAKES. `let a: {r:i32} | null =
+// {r:7}` … `a ?? {r: null}` is D833's shape with the map replaced by a LOCAL, and the narrow row
+// its annotation names is minted by `collectAnnShapes` whether or not the program also declares
+// one — which is why an unused `type R = {r: i32}` is scenery here and was load-bearing there.
+// `anonLeafSupersedeOf` answers `si` unchanged for every row outside a `??` merge family, so
+// this is one bounds-checked array read on every other binding in the language.
 export function nulRefStructIdxOfLet(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
       const ri = retNulRefIndex(d.letType)
-      if ri >= 0 { return ri }
+      if ri >= 0 { return anonLeafSupersedeOf(ri) }
     }
+    // THE INIT LEG IS DELIBERATELY NOT REDIRECTED, and it was built and measured out. An
+    // un-annotated nullable-struct binding (`const a = src()` over `src(): {r:i32} | null`)
+    // takes its row from the CALLEE's return, and no `??` family can ever have superseded that
+    // row — the join reader sees `a`'s declaration, whose initializer is a call and not a
+    // literal, so the merge never runs. Zero cells and zero corpus bytes move with the redirect
+    // here; it becomes live only when a reader that sees into a callee's returns exists (D861).
     return structIndexOfExpr(d.letInit, fnIx)
   }
   -1
@@ -18301,7 +18314,7 @@ export function globalCellStructIdx(letIx: i32) {
       // variant rung to close.
       const avi = letAnnVariantIdx(letIx)
       if avi >= 0 { return avi }
-      return structIndexOfLet(letIx, -1)
+      return globalNulRefSupersede(letIx, structIndexOfLet(letIx, -1))
     }
     // A kind-8 VARIANT cell's slot is the VARIANT index, not a struct row — paired with
     // `globalKind`'s variant arm, which decides the kind this slot is read beside.
@@ -18321,9 +18334,24 @@ export function globalCellStructIdx(letIx: i32) {
     // KIND does.
     const gnvi = nulVariantIdxOfExpr(d.letInit, -1)
     if gnvi >= 0 { return gnvi }
+    // NOT REDIRECTED, for `nulRefStructIdxOfLet`'s reason at its own init leg: an un-annotated
+    // nullable-struct GLOBAL takes its row from the callee's return, which no `??` family can
+    // have superseded. Measured: 0 cells, 0 corpus bytes.
     return structIndexOfExpr(d.letInit, -1)
   }
   -1
+}
+
+// D842 — THE MODULE-SCOPE TWIN of `nulRefStructIdxOfLet`'s redirect, and it is gated on the
+// cell KIND because this resolver serves three of them. A `?? ` merge supersedes the row a
+// NULLABLE-STRUCT cell holds — the delivery form D842 names — and must not touch a plain
+// `const x: R = { … }` global, whose literal keeps `R`'s own layout beside the merged row
+// (that separation is what `d842_hazard_declared_dest_*` grades). The variant legs return
+// before this is reached; they index a different table entirely.
+function globalNulRefSupersede(letIx: i32, si: i32): i32 {
+  if si < 0 { return si }
+  if globalCellKind(letIx) != "nulstruct" { return si }
+  anonLeafSupersedeOf(si)
 }
 
 // The ref-list TABLE SLOT for a kind-5 (ref array) global cell: the annotation's
@@ -27496,7 +27524,13 @@ function globalStructIndexSid(sid: i32) {
   // drift.
   const gk = globalCellKind(li)
   if gk != "struct" && gk != "nulstruct" { return -1 }
-  structIndexOfLet(li, -1)
+  // D842 — AND THE SAME REDIRECT `globalCellStructIdx` TAKES, for the reason the paragraph
+  // above gives: this reader and `emitGlobalSection`'s cell must not drift, and the section
+  // writes a superseded nullable-struct cell at the merged row. The two sites resolve the row
+  // separately (this one calls `structIndexOfLet` directly rather than delegating), so the
+  // redirect has to be asked at both or a `??`-merged global reads its own cell at the narrow
+  // layout: `expected (ref null $type), found (ref null $type)`, `vl check` rc 0.
+  globalNulRefSupersede(li, structIndexOfLet(li, -1))
 }
 
 // The struct table index that the expression at `exprIx` produces, or -1 if it is not
