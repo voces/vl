@@ -1,0 +1,60 @@
+// @run
+// @log 1
+// @log x
+// @log 42
+// @log null
+// @log 1
+// @log 1
+// CONTRACT (must-RUN): `print(<value-union>)` dispatches on the box TAG and prints the arm
+// the value actually holds. Was a `unsupported-lowering` check reject
+// (`silent-class-inventory` D712), and before that a SOUNDNESS hole — the checker accepted
+// it and emit produced invalid wasm.
+//
+// WHY THIS IS A LOWERING AND `print([1, 2, 3])` IS A RULE. Ask whether the argument's
+// MEMBERS are inside `print`'s declared domain (`typecheck.printDomainStr`). For `i32[]`
+// there is no member — the value is a container and the language has never said what it
+// renders as, so it is refused on the plain type-error channel (D711,
+// `types/print-container-rejected.vl`). For `i32 | string` every arm is already printable on
+// its own and `if v is i32 { print(v) } else { print(v) }` compiled and ran throughout:
+// nothing about the OUTPUT was undecided, only the runtime tag dispatch was missing — and
+// the emitter already performs exactly that dispatch for `is`.
+//
+// ONE EVALUATION OF THE ARGUMENT. Each arm reads the box twice (the tag test, then the
+// payload), so the value is stashed once in the lazy frame's `(ref null $uBox)` slot.
+// `counted()` below is the pin: a re-emitted receiver would call its function once per arm,
+// which is the bug the literal-union print chain shipped before `emitPrintAtomStr` was
+// shared, so it is pinned here rather than reasoned about.
+function pick(c: boolean): i32 | string {
+  if c { return 1 }
+  return "x"
+}
+function go() {
+  print(pick(true)) // 1  — the i32 arm
+  print(pick(false)) // x  — the string arm, streamed
+}
+go()
+
+// The `| null` member is an arm like any other and prints the word `null`, exactly as the
+// two nullable NICHE prints do (`string | null`, `boolean | null`).
+function pickN(c: boolean): i32 | null {
+  if c { return 42 }
+  return null
+}
+function goN() {
+  print(pickN(true)) // 42
+  print(pickN(false)) // null
+}
+goN()
+
+// THE RECEIVER IS EVALUATED ONCE, and the counter is what says so rather than the comment.
+let calls = 0
+function bump(): i32 | string {
+  calls = calls + 1
+  if calls > 100 { return "never" }
+  return calls
+}
+function counted() {
+  print(bump()) // 1 — the CALL is the receiver, so it must not be re-emitted per arm
+  print(calls) // 1, not 2
+}
+counted()

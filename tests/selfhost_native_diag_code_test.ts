@@ -69,15 +69,24 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // `print(<value-union>)` is type-valid; codegen cannot lower the boxed union.
+  // An INFERRED nullable-struct return is type-valid; codegen cannot lower it un-annotated
+  // (the annotated `: S | null` spelling of the same function builds and runs).
+  //
+  // THE WITNESS MOVED, AND WHY IS THE POINT OF THE TEST. It used to be
+  // `print(pick(true))` over an `i32 | string`, which now RUNS — D712 built the box-tag
+  // dispatch, because every arm of that union is inside `print`'s declared domain. What
+  // this test pins is the CHANNEL (a capability admission carries a stable code), so any
+  // still-open capability gap serves as its witness.
   const { rc, diags } = check(
     exp,
     [
-      "function pick(c: boolean): i32 | string {",
-      "  if c { return 1 }",
-      '  return "x"',
+      "type S = { s: i32 }",
+      "function pick(v: S | null) { return v }",
+      "function go() {",
+      "  const r = pick(null)",
+      "  if r == null { print(0) } else { print(1) }",
       "}",
-      "print(pick(true))",
+      "go()",
       "",
     ].join("\n"),
   );
@@ -122,15 +131,21 @@ Deno.test({
   }
 });
 
-// THE TWO PRINT REFUSALS SIT ON DIFFERENT CHANNELS, AND THAT SPLIT IS THE ASSERTION.
-// `print` takes one value of `(i32 | i64 | f32 | f64 | boolean | string)`
-// (`typecheck.printDomainStr`, which `driver.builtinScan` also renders as the LSP
-// completion detail). A CONTAINER is outside that domain, so it is refused the way
-// `toString expects an i32 or boolean, got string` is refused — a plain type error with
-// NO category code. A boxed VALUE UNION is inside the domain (every arm prints on its
-// own) and only the runtime tag dispatch is missing, so it keeps the
-// `unsupported-lowering` admission above. `silent-class-inventory` D711/D712 carry the
-// ruling and its measurement; a change that collapses the two channels reddens here.
+// THE PRINT DOMAIN IS A RULE, AND THAT IS THE ASSERTION. `print` takes one value of
+// `(i32 | i64 | f32 | f64 | boolean | string)` (`typecheck.printDomainStr`, which
+// `driver.builtinScan` also renders as the LSP completion detail). A CONTAINER is outside
+// that domain, so it is refused the way `toString expects an i32 or boolean, got string` is
+// refused — a plain type error with NO category code, because the language has never said
+// what `print([1, 2, 3])` OUTPUTS (D711).
+//
+// ITS OLD TWIN IS GONE, AND THE ASYMMETRY IS THE LESSON. A boxed VALUE UNION is INSIDE the
+// domain — every arm prints on its own — so it was never a rule and never a rendering
+// question, only a missing tag dispatch, and D712 built it: `print(<i32 | string>)` runs
+// (`tests/cases/types/print-union-runs.vl`). The test to keep is this one, and its point is
+// that the container refusal must NOT drift onto the capability channel. It did, for the
+// container arms of a UNION: `i32 | i32[]` printed "not yet supported by codegen" while
+// `i32 | (() => i32)` printed the domain sentence, one rule wearing two sentences decided
+// by whether the box ABI happened to give the arm a code. Both are the domain sentence now.
 Deno.test({
   name: "diag-code: print of a CONTAINER is a domain error, carrying no code",
   ignore,

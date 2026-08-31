@@ -510,6 +510,7 @@ import {
   mapShapeKeyI32,
   msAtomIdOf,
   msHasValKind,
+  msMemberValKindsOf,
   mvSlotArmMatches,
   mvSlotKeyI32,
   mvSlotOfTyKArm,
@@ -517,6 +518,7 @@ import {
   mvSlotOfValNameTyKArm,
   mvValTyIxOfNameRow,
   nodeMapValTyIx,
+  nullValKind,
   recordMvValTyIx,
   recordSFieldElemRow,
   recordSFieldElemRowTy,
@@ -8435,6 +8437,12 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
           // arms and touches no scratch local, so `print(<boolean-valued map read>)` already
           // ran on master — measured, not assumed.
           if exprNullableString(e.callArgs[0], fnIx) { return true }
+          // `print(<value-union box>)` with a STRING arm streams that arm through the same
+          // `emitPrintStrFromScratch` tail, out of the same frame. Asked through the SHARED
+          // plan (`printUnionHasStrArm` → `printUnionPlan`), which is also what the handler
+          // dispatches on, so the reservation and the lowering cannot disagree about the
+          // arm's presence — the failure mode the `exprNullableString` arm above documents.
+          if printUnionHasStrArm(e.callArgs[0], fnIx) { return true }
         }
       }
       // `__trap__(<string>)` prints its reason through the same string streaming
@@ -29242,6 +29250,169 @@ export function currentStructNarrowSetIdOf(name: string, fnIx: i32): i32 {
   const i = narrowSlotOf(name)
   if i >= 0 { return narrowSets[i] }
   msSetOfText(unionMemberSetOf(unionNameOfIdent(name, fnIx)))
+}
+
+// The per-arm PLAN for `print(<value-union box>)`: the box-tag ABI-ordered value-atom
+// KIND of every arm, appended to `out`, and `true` only when EVERY arm is a value `print`
+// renders on its own. `false` leaves `out` untouched and the caller keeps its old ladder.
+//
+// THE ARMS ARE THE WHOLE QUESTION (D712 vs D711). `print` has a declared domain —
+// `printDomainStr()`, the six scalar/string reps — and kinds 0..5 ARE that domain, code for
+// code, with 6 the `null` member. A union of those has nothing undecided about its OUTPUT:
+// `if v is i32 { print(v) } else { print(v) }` compiles and runs today and prints whatever
+// the taken arm prints, so the only missing piece was the runtime tag dispatch, which the
+// emitter already performs for `is`. Kinds 7..13 are the LIST atoms and 11 the closure —
+// containers, which the language has never said what to render as (D711's ruling), so they
+// decline here and stay a DOMAIN refusal in the checker. -1 is a member the box ABI does
+// not classify at all (a struct arm, a declared literal-union ALIAS arm, an inline shape).
+//
+// ONE PLAN, TWO ENDS — the discipline the nullable-string print arm beside it earned the
+// hard way. The str-op frame RESERVATION (`exprHasStrOp`'s print arm) and the LOWERING
+// (`emitPrintValueUnion`) both read this, so they cannot disagree about whether a string
+// arm is present; where those two ends asked different questions the frame was not
+// reserved and `strScratchBase + 0` was some other local — invalid wasm at `vl check` rc 0.
+// Does `print`'s argument arrive as the union BOX — the `{tag, payload}` struct the
+// dispatch below reads a tag off — rather than as an already-unboxed arm?
+//
+// TWO TESTS, AND `exprUnion` ALONE IS NOT ENOUGH. `unionNameOfExpr` hands back the DECLARED
+// union of a place whether or not an enclosing `is` / `!= null` / `match` has narrowed it,
+// and under a narrow the READ unboxes to the arm. `exprUnion` declines a narrowing whose
+// arm `valueAtomKind` can name, which is most of them — but a BRAND arm (`new i32`) and a
+// literal-union ALIAS arm answer -1 there, so its guards fall through while the read still
+// unboxes (`objects/place-narrowed-array-element-emit.vl`,
+// `unions/litunion-member-narrow-read.vl`). Asking the narrowing TABLE directly covers
+// every arm spelling. Without both, `if u is i32 { print(u) }` stashed an i32 into the
+// `(ref null $uBoxIdx)` slot — 164 `tests/cases` fixtures failed to instantiate on
+// `local.set expected (ref null 0), found i32`.
+//
+// It costs nothing to be strict here: a NARROWED print is exactly the spelling the old
+// refusal told people to write, and it has always lowered through the ordinary ladder.
+export function printUnionRecvIsBox(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  if !exprUnion(exprIx, fnIx) { return false }
+  const pe = P.nodes[unwrapParen(exprIx)]
+  if pe is Ident { return narrowVariantFor(pe.identName) == "" }
+  if pe is Member {
+    return narrowVariantFor(memberPathKeyOf(unwrapParen(exprIx))) == ""
+  }
+  if pe is Index {
+    return narrowVariantFor(indexPathKeyOf(unwrapParen(exprIx))) == ""
+  }
+  true
+}
+
+export function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
+  if !printUnionRecvIsBox(exprIx, fnIx) { return 0 }
+  const nm = unionNameOfExpr(exprIx, fnIx)
+  if nm == "" { return 0 }
+  // The row's recorded members, in box-tag ABI order — the order the dispatch below walks
+  // and the order `emitUnionCoerce` tagged them in. A set the pool does not cover splits
+  // the rendered expansion, exactly as the union `==` arms do.
+  const sid = msSetOfText(nm)
+  const atoms: string[] = []
+  if !msMemberAtomsOfSet(sid, atoms) {
+    splitUnionAtoms(unionMemberSetOf(nm), atoms)
+  }
+  if atoms.length < 2 { return 0 }
+  const kinds: i32[] = []
+  // The BANKED codes when the row has them (`unMemValKind` is index-parallel to the atom
+  // column and is literally `valueAtomKind` per member), else the per-atom derivation.
+  if !msMemberValKindsOf(sid, kinds) || kinds.length != atoms.length {
+    while kinds.length > 0 { kinds.pop() }
+    let d = 0
+    while d < atoms.length {
+      kinds.push(valueAtomKind(atoms[d]))
+      d = d + 1
+    }
+  }
+  let nonNull = 0
+  let hasNull = false
+  let solo = -1
+  let bad = false
+  const seen: i32[] = []
+  let i = 0
+  while i < kinds.length {
+    let k = kinds[i]
+    // A LITERAL-UNION ARM (`K0 | i64`, an inline `("a"|"b") | i64`) is not a value atom —
+    // `valueAtomKind` answers -1 for it — but it BOXES as one: `emitUnionCoerce`'s
+    // `unionTakesAtomAsStr` arm widens the interned id through `emitAtomToStr` and tags the
+    // box kind 2, the string tag, with the member STRING riding the anyref. So its arm here
+    // is the string arm, and it prints the member text. (It may SHARE tag 2 with a real
+    // `string` arm — the ambiguity `unionStrArmCount` exists to refuse for `is`. For print
+    // it is not an ambiguity at all: both arms stream the same payload the same way.)
+    if k < 0 && nameIsLitUnionType(atoms[i]) { k = 2 }
+    // A member the box ABI does not classify at all (a struct arm, an inline shape) means
+    // this is not the boxed VALUE union: decline the SHAPE (0), which leaves the caller's
+    // older ladder in charge, rather than call it a failure.
+    if k < 0 { return 0 }
+    // A CONTAINER arm (kinds 7..13 — the list backings, the closure) IS in a box and the
+    // dispatch cannot render it. Recorded and answered BELOW, after the box test, so the
+    // result tells "not my shape" apart from "my shape, and I cannot do it".
+    if k > 6 { bad = true }
+    if k == nullValKind() {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      solo = k
+    }
+    // One arm per TAG. Two members can share a tag (a litunion arm beside a `string` one),
+    // and a second `if tag == 2` would be dead code the last-arm fall-through never reaches.
+    let dup = false
+    let s = 0
+    while s < seen.length {
+      if seen[s] == k { dup = true }
+      s = s + 1
+    }
+    if !dup { seen.push(k) }
+    i = i + 1
+  }
+  // The BOX test, arm for arm with `valueUnionFromAtomKinds` (the checker's gate) and
+  // `msIsValueUnion` (the emitter's): 2+ non-null atoms box, and one NUMERIC atom beside
+  // `null` boxes. `boolean | null` and `string | null` are NICHES, not boxes — their own
+  // print arms already handle them and they must not be claimed here.
+  let boxed = nonNull >= 2
+  if nonNull == 1 && hasNull {
+    if solo == 0 || solo == 3 || solo == 4 || solo == 5 { boxed = true }
+  }
+  if !boxed { return 0 }
+  if bad { return -1 }
+  let o = 0
+  while o < seen.length {
+    out.push(seen[o])
+    o = o + 1
+  }
+  1
+}
+
+// The boolean face — "will this LOWER" — for the reservation scan and the handler.
+export function printUnionPlan(exprIx: i32, fnIx: i32, out: i32[]): boolean {
+  printUnionPlanCode(exprIx, fnIx, out) == 1
+}
+
+// "The value IS the box and the dispatch cannot render one of its arms" — the emitter's
+// last line of defence, and NOT `printUnionRecvIsBox`, which over-claims (`exprUnion`'s
+// `as!`-to-a-numeric-litunion arm answers yes about a plain i32). Falling through with a
+// real box on the stack ends in `call __print_i32__` against a `(ref $uBox)`: check-clean
+// INVALID WASM. This should be unreachable — the checker asks `tyPrintsAsRef` FIRST, and
+// every kind above 6 is an array or a closure — so it exists to make a disagreement
+// between the two gates LOUD rather than silent.
+export function printUnionArmsUnrenderable(exprIx: i32, fnIx: i32): boolean {
+  const pk: i32[] = []
+  printUnionPlanCode(exprIx, fnIx, pk) < 0
+}
+
+// Does the print-union plan for `exprIx` carry a STRING arm? The reservation scan's half of
+// the pair above — a string arm streams through `emitPrintStrFromScratch`, which lives in
+// the str-op scratch frame.
+export function printUnionHasStrArm(exprIx: i32, fnIx: i32): boolean {
+  const pk: i32[] = []
+  if !printUnionPlan(exprIx, fnIx, pk) { return false }
+  let i = 0
+  while i < pk.length {
+    if pk[i] == 2 { return true }
+    i = i + 1
+  }
+  false
 }
 
 // MEMBERSHIP of `null` in a member set, structurally.
