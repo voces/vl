@@ -22,6 +22,16 @@ compared.
 Not required for: a change that only touches a std function BODY without altering its
 signature, name, or documented behaviour.
 
+## Agent concurrency — the cap was calibrated against a run nobody makes any more
+
+**Up to 6 concurrent worktree agents at `JOBS=6` / `DENO_JOBS=4`.** The old cap of 3 came from an
+`earlyoom` kill measured when three agents each ran a FULL CENSUS sweep (~20 GiB in 64 s on
+`nproc=24`). No agent runs the census now — every brief forbids it and the distilled corpus is
+~7 s — so that measurement no longer describes the workload. Measured 2026-08-28 with agents
+running: **78% of 47 GiB available, largest process 1.4 GB**. `earlyoom` still SIGTERMs at 10%
+available, so check `free` before going wide, and drop back to 3 for anything that does run a
+full census block.
+
 ## Gates
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
@@ -84,6 +94,15 @@ a rebase merged cell boundaries wrongly **without saying so** — twice in one d
 corrupting the baseline. Read and write them through `distilled/cellmap.py`, never `json.load`.
 Do not add a field nothing reads: `coords` was stored three times and read from none of them.
 
+**REFUSE A CANDIDATE ON `runs → not-runs`, NOT ON `loud → silent`.** The gate's criterion and
+the shipping criterion are the same one, and they were allowed to drift apart. `regress.py`
+blocks only on a WORKING program breaking; a program that did not work before and does not work
+now has not regressed. D11's candidate was refused on 2026-08-28 for moving 48 cells
+loud→silent — while buying **72 cells loud→RUNS and losing ZERO runs**. That is a large net win
+declined on a bar the gate does not apply. Loud→silent is worth MEASURING and NAMING every time
+— it is why `named/` exists — but it is a price to record, not a veto. Veto on: a `runs` cell
+lost, a new compiler trap, or a corpus module that stops building.
+
 **WHEN A GRID OR A REFUSED CANDIDATE NAMES A SET, THE SET GOES IN `named/`** — not a collapse
 of it, and not the whole grid. A derived rule provably cannot find these, and there are two
 worked instances from a single day: D272's 72 `runs`-lost cells and D224's 207-cell price were
@@ -102,11 +121,58 @@ loud→silent while its loud-emit column moved −126, so the regression was ari
 invisible. And a named set re-grades against any new seed in ~10 invocations, so use one rather
 than rebuilding its grid.
 
+## "Zero silent rows" is a claim about the INVENTORY, not about VL
+
+The filed inventories hold ~199 hand-written rows. The distilled corpus holds **7,021 cells**.
+On 2026-08-30 the inventory graded `0 silent` and the corpus graded **92 check-clean invalid
+wasm** — live, confirmed cell by cell against the seed, and three of the four families had no
+filed row at all. Both numbers were correct; one of them was reported as though it described
+the compiler.
+
+**Name the population in the sentence.** "0 of 199 filed rows" and "3,704 of 7,021 corpus cells
+run" are different facts, and only the second is about VL. The inventory is a notebook of what
+someone looked at; it is not a measurement of the language.
+
+## The goal is `runs`, and making a failure LOUD does not move it
+
+Standing bar: **every program the language design permits compiles and runs correctly.** Two
+clauses — (1) **soundness**: if `vl check` accepts it, it builds and runs correctly; (2) **no
+capability refusals**: the compiler rejects only what the DESIGN forbids. *"Not yet supported by
+codegen" is never a valid answer.*
+
+Clause 2 is what keeps clause 1 honest. Without it "legal" drifts to mean "whatever the compiler
+accepts" and the goal is vacuous — any refusal can be relabelled a design rule after the fact.
+That is not hypothetical: **25 inventory rows closed in five days, every one by converting
+`check-clean invalid wasm` into a loud refusal.** Under "fix all miscompiles" each of those
+closes is correct and defensible. Under this goal **they are all still open.**
+
+**Count progress in programs that RUN.** `regress.py` already prints it: `runs` was
+**3,704 / 7,021 (52.8%)** on 2026-08-30. Silent→loud is hygiene, belongs in the record, and is
+not a point on this scoreboard. The gate's floor (block on `runs → not-runs`) is unchanged; this
+is the number that is supposed to climb.
+
+**Clause 2 is greppable, so measure it rather than arguing about it.** 40 refusal sites in
+`compiler/*.vl` concede the program is type-valid in their own message — `has no lowering`,
+`not yet supported by codegen`, and one that reads `this program is type-valid but cannot
+build`. **29 of the 40 are in `typecheck.vl`**, which is the direction that hides: a capability
+gap moved into the checker stops looking like a gap, and the program compiles no better than
+before. Every `loud emit reject` is a clause-2 violation by construction, since `check`
+returned 0 to reach it.
+
 **Read a gate by its exit code or its summary line, never by `tail -1`.** `lint-self.sh`
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a
 gate and a commit in the same command — a non-zero exit scrolls past unread.
 
 `vl fmt -w` takes **one path per run**; a multi-path call fails and formats nothing.
+
+## Disassembly — `wasm-dis` is here, it is just not on `PATH`
+
+**`./node_modules/.bin/wasm-dis`** (binaryen 130, pinned in `package.json`). Every agent worktree
+symlinks `node_modules` to the repo's, so it works there too. `which wasm-dis` finds NOTHING and
+that is not evidence of absence — two agents degraded the disassembly instrument to byte-identity
+on 2026-08-28 after exactly that check. `wasm-opt`, `wasm-as`, `wasm-merge` and `wasm2js` are in
+the same directory. Disassembly is one of the four instruments a defect fix is graded on; do not
+substitute for it without first running the real binary by its real path.
 
 ## After editing `compiler/*.vl`
 
