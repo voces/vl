@@ -17493,10 +17493,15 @@ Repro (ten lines, and NO layout twin is declared anywhere):
 
 ---
 
-### D611 — a shape spelled BOTH as a named alias and ANONYMOUSLY mints two heap types, and the literal-union field is what makes them differ
-**check-clean invalid wasm · 58 of the 92 silent cells in the distilled corpus, the largest single family · found 2026-08-30 by grading the corpus (not the inventory) against the clause-1 bar: `runs` is 3,704 of 7,021 and 92 cells are check-clean invalid wasm with NO filed row naming them · the three ingredients are each load-bearing and each was ablated**
+### D611 — [CLOSED 2026-08-30] a shape spelled BOTH as a named alias and ANONYMOUSLY minted two heap types, because canon rewrote only ONE of the two spellings' recorded types
+**closed 2026-08-30 · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` ·
+found 2026-08-30 by grading the corpus (not the inventory) against the clause-1 bar · the three
+filed ingredients were each load-bearing and each re-ablated at the close · 3 distilled classes
+standing for **227 census cells** move `check-clean invalid wasm` → `runs`; `runs` → NOT-RUNS = 0,
+`→ silent` = 0 · **the filed lead was REFUTED** — `annShapeIndexOf` deduped every spelling onto
+ONE row and the split was two rows further on, at `buildStructTwins`**
 
-Repro:
+Repro (now `runs`):
 
     type N = 1 | 2
     type Box1 = {r: N}
@@ -17506,34 +17511,120 @@ Repro:
       if (wv.g).r == 1 { print(7) } else { print(0) }
     }
     rd({ r: 1 })
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
-    // SHOULD PRINT 7
+    // now: 7
 
-* **THREE INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING.** Remove any one and the program runs:
+* **THREE INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING — re-run at the close against both
+  seeds.** The conjunction is what failed; every ablation ran on the base and still runs:
 
-  | change | outcome |
-  |---|---|
-  | as filed | **check-clean invalid wasm** |
-  | drop `type Box1` (the same-shape alias) | runs |
-  | spell the field and param `Box1` instead of `{r: N}` | runs |
-  | field type `i32` instead of the literal union `N` | runs |
+  | change | base (`0407ec5b`) | fix (`9ee0a69f`) |
+  |---|---|---|
+  | as filed | **check-clean invalid wasm** | **runs, prints 7** |
+  | drop `type Box1` (the same-shape alias) | runs | runs |
+  | spell the field and param `Box1` instead of `{r: N}` | runs | runs |
+  | field type `i32` instead of the literal union `N` | runs | runs |
 
-  So it is not "anonymous shapes are broken" and not "literal-union fields are broken" — it is
-  the CONJUNCTION: a shape that has a name AND is also written anonymously, whose field rep is
-  decided by a literal union.
-* **THE HYPOTHESIS TO TEST FIRST, AND IT IS NOT YET CONFIRMED.** `sSetLim`'s header names
-  THREE roots that mint a struct row from a shape spelling — `internInlineShapeTy`,
-  `internShapeAs`, `gaeEnsure` — against ONE dedup key, `annShapeIndexOf`. A top-level `type`
-  declaration mints through `internShapeAs`; an inline `{r: N}` mints through
-  `internInlineShapeTy`. The guess is that the two compute different keys for one structural
-  shape and the literal-union field is what separates the reps. **Confirm by instrumenting
-  `annShapeIndexOf` and printing the index each spelling receives** — do not take this
-  paragraph as the finding.
-* **`wasm-dis` is at `./node_modules/.bin/wasm-dis`** — the two `$type`s print under the same
-  elided name, so the disassembly is the only way to see whether they are two indices or one
-  index with two nullabilities. `(ref $t)` is a SUBTYPE of `(ref null $t)` in wasm, so a pure
-  nullability difference could not be a validation error: the heap types must differ.
+* **THE FILED HYPOTHESIS IS REFUTED, AND THE INSTRUMENT IT ASKED FOR IS WHAT REFUTED IT.** The
+  row said to instrument `annShapeIndexOf` and expect two keys for one shape. Printed, it
+  answers the opposite: for the filed program `internInlineShapeTy` is called FOUR times with
+  `nm={r:i32}` and `annShapeIndexOf` returns `existing=-1` once (minting row 0) and
+  `existing=0` on the other three. **One row serves every anonymous spelling.** `internShapeAs`
+  is never called at all — `Box1` is minted by a FOURTH root the `sSetLim` header does not name,
+  `collectS`'s `TypeDecl` arm (`emit_collect.vl:7326`), which pushes unconditionally with no
+  dedup query. So the struct table holds exactly:
+
+      ROW 0 name={r:i32}  sTyIx=66  field r code=0 elem=[]  canonId=9   twin=0
+      ROW 1 name=Box1     sTyIx=41  field r code=0 elem=[]  canonId=5   twin=1
+      ROW 2 name=GW       sTyIx=42                          canonId=6   twin=2
+      structFieldCodesEq(0, 1) = 1        ← the LAYOUTS are identical
+
+  Two rows, layout-equal, **different canon ids**, so `buildStructTwins` never merged them:
+  `keys[j] == keys[i]` is tested BEFORE `structFieldCodesEq`, so the pair was never even
+  compared. Field `g` of `GW` resolved to row 0 and `rd`'s param to row 1.
+
+* **THE MECHANISM IS THAT CANON REWRITES THE ANNOTATION AND NOT THE ALIAS REGISTRY.**
+  Printing each row's recorded arena type and its `r` field:
+
+      ROW 0  ty={r: i32}   field r = i32   numLitUnionBaseName="" canon=8
+      ROW 1  ty=Box1       field r = N     numLitUnionBaseName=i32 canon=4
+
+  `canonEmitTypeNames` rewrites the `TypeRef` `{r: N}` in place to `{r:i32}` — a numeric
+  literal union canons to its base scalar (`type Z = 0 | 1` → `i32`, the pass's own example) —
+  and banks the REWRITTEN spelling's type in `canonTyIxCol`. That is the type
+  `collectAnnShapes` / `collectNestedFieldShapes` hand to `internInlineShapeTy`, so the inline
+  row's `sTyIx` is post-canon. A DECLARED alias records `cUserTypes["Box1"]`, which was
+  populated during checking and which canon never revisits, so its `sTyIx` is pre-canon. One
+  structural shape, two arena types, two canon ids. Run the same file with the field typed
+  `i32` and both rows record canon id 2 and merge — which is exactly why the literal union was
+  the third load-bearing ingredient.
+
+* **THE FIX IS ONE RULE IN ONE PLACE: `repCanonFieldTy` in `emit_rep.vl`**, applied in the
+  TyObj FIELD descent of BOTH canon walks (`repCanonIdGo` and `repCanonKeyGo`). It softens a
+  numeric literal union to its base scalar through `numLitUnionBaseTy` — the checker's own
+  `softenLitTy` rule, which claims a type only when every member is a literal over the same
+  i32/i64/f64 base, and which excludes the STRING base by construction (a `"a" | "b"` alias
+  name IS its atom identity). It is canon's rule restated on the arena side, not a new
+  equivalence, and layout safety stays double-gated: `structFieldCodesEq` must still agree
+  positionally before two rows share a heap type. This is the same shape of fix
+  `repCanonKeyGo`'s TyUnion mix-widening arm already carries, one position over.
+
+* **THE FIELD POSITION IS THE BOUND, AND IT IS MEASURED RATHER THAN CAUTIOUS.** The wider
+  candidate — softening at the top of `repCanonId`/`repCanonKey`, i.e. at every position — buys
+  the SAME 227 cells and **loses 21 that run today**: the whole `d362*_numlitun_*` named set
+  (`type Z = 0 | 1` under `type L = Z[]`, a map value, a union member) goes `runs` →
+  check-clean invalid wasm, "expected (ref $type), found i32". A numeric literal union is its
+  base scalar in a FIELD slot; in the list / map-value / union-member layers it is not the same
+  interned row as its base, and the key is what keeps those apart. Refused on `runs` lost, and
+  the price it named is already carried — `distilled/named/d362*` is that set.
+
+* **BOTH RUNGS ARE LOAD-BEARING AND NEITHER ALONE IS THE LANDING.** Strip-all reproduces the
+  base seed byte-for-byte (`md5 0407ec5ba9f70e9394739cc5bddc537d`, checked by `md5sum`, not by
+  eye). Id-walk only: the witness runs, but the shadow harness (`VL_REP_SHADOW=1`) reports
+  `merge=4 len=9` on it — the string key still renders `{r:(@43|@44),}` while the id has
+  softened, which is exactly the drift `hcCheckKey` exists to catch. Key-walk only: `merge=0
+  split=4 len=9` and the **witness still fails** — `slotCanonId` consumes the id, not the
+  string. Both together: `merge=0 split=0 len=0` and the witness runs.
+
+* **THE RUNG IS REACHED AND IT CHANGES ITS ANSWER.** Counting both separately
+  (`reach` = called, `ans` = returned a different arena index): `tests/cases` **reach 9,942 ·
+  ans 28 · 7 files**; the distilled corpus **reach 15,059 · ans 62 · 28 files**. So it is live
+  over real code and moves the answer on a small, named population — not a rung that fires
+  everywhere and decides nothing, and not one that never fires.
+
+* **THE DISASSEMBLY IS WHERE THE TWO HEAP TYPES ARE VISIBLE**, and the row was right that
+  nothing else shows them: both print under the elided name `$type`. Base
+  (`./node_modules/.bin/wasm-dis`, binaryen 130):
+
+      (type $1 (struct (field (mut i32))))              ← the inline row
+      (type $2 (struct (field (mut i32))))              ← Box1's row, byte-identical
+      (type $3 (struct (field (mut (ref null $1)))))    ← GW.g points at $1
+      (type $6 (func (param (ref $2))))                 ← rd's param is $2
+
+  and after the fix `$1` and `$2` are ONE type, `GW.g` is `(ref null $1)` and `rd`'s param is
+  `(ref $1)`. `(ref $t)` is a subtype of `(ref null $t)`, so the row was also right that a pure
+  nullability difference could not have been the validation error.
+
+* **THE PRICE IS ELEVEN MODULES OF FEWER HEAP TYPES AND NOTHING ELSE.** Corpus byte-identity
+  (`cmp` of every module built by both seeds): `tests/cases` **1,960 identical · 1 DIFFER · 0
+  lost**, distilled corpus **3,785 identical · 11 DIFFER · 0 lost**. Every DIFFER was read:
+  the 3 D611 cells now run, and the other 9 are unchanged-class programs that lost one
+  duplicate struct type. `tests/cases/unions/struct-arms-numeric-tag.vl` is the readable one —
+  `type C = { kind: 0, r: f64 }` beside `type Cn = { kind: K0, r: f64 }` emitted two
+  byte-identical `(struct (mut i32) (mut f64))` heap types and now emits one, with identical
+  program output.
+
+* **58 OF 92 WAS A GROUPING BY MESSAGE, NOT BY MECHANISM, and only 3 of those cells are this
+  row.** The 58 are the corpus cells whose failure text is `expected (ref null $type), found
+  (ref $type)`; 3 carry D611's ingredients (`type N = 1 | 2` plus a same-shape alias plus an
+  anonymous spelling) and they represent 227 of the group's 395 census cells. After the fix
+  **zero** of the remaining 89 silent cells contain a numeric literal union alias at all; 77 of
+  them carry `type Shape = …` (D612's / D280's union-declaration ingredient) and one is D613's.
+  Both of those rows' filed repros are unchanged by this landing — re-run at the close, still
+  `check-clean invalid wasm` — so there is no overlap to split.
+
+* **THE REGRESSION FIXTURE IS `tests/cases/types/declared-vs-inline-numlitunion-field-twin.vl`**,
+  filed beside `declared-vs-inline-mixed-union-field-twin.vl`, which is the same defect one
+  union arm over. It pins both directions: the anonymous spelling flowing into the declared
+  field, and a `Box1`-annotated read of the same row.
 
 ### D612 — D280's layout twin, one indirection out: through a MAP-valued field read with `??`
 **[CLOSED 2026-08-30 by D621, in a different PR] the repro below RUNS and prints `0`, and its own prescribed control (`lv1["k0"] = { r: 1 }` before the read) prints `7` — both correct. Was: check-clean invalid wasm · 6 of the 92 · found 2026-08-30 with D611 · the ingredients are D280's exactly: a union declaration plus a same-shape alias twin, and that is precisely why D621 reaches it: this row's `Dot` is the DECLARED STRUCT TWIN whose existence made `armLayoutAmbiguousAt` decline the arm's field read**
@@ -17576,10 +17667,10 @@ Repro:
   type; re-asking it through `variantStructHeapTwinAt` lifts the decline and this row's read
   resolves. Both the miss and the hit were graded, as this row asked.
 
-### D613 — an empty list literal CAPTURED by a nested function commits its element row before the capture is resolved
-**check-clean invalid wasm · 22 of the 92 · found 2026-08-30 with D611 · the closure capture is the ONLY load-bearing ingredient: the element type is not — an `f64`-backed literal union, an `i32`-backed one and a plain `f64` field all reproduce identically**
+### D613 — [CLOSED 2026-08-30] an empty list literal CAPTURED by a nested function had its ENV-STRUCT FIELD typed a whole section before anything pinned the element row
+**now RUNS · was `check-clean invalid wasm` · found 2026-08-30 with D611 · closed as `runs`, not as a third refusal: D411's and D501's destination is AMBIGUOUS and this one is not · 17 corpus classes / 310 census cells `check-clean invalid wasm` -> `runs`, 0 `runs` lost, 0 into any silent class, every corpus module that built before builds BYTE-IDENTICAL**
 
-Repro:
+Repro (now runs, printing nothing):
 
     type F = 1.5 | 2.5
     type Circle = { r: F }
@@ -17590,18 +17681,146 @@ Repro:
       inner()
     }
     outer()
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
-    // SHOULD RUN (and print nothing)
+    // was: vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 215:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // Now: runs and prints nothing.
 
-* **ONE INGREDIENT, ABLATED.** Hoist the `sink(c)` call out of `inner` and into `outer` and it
-  runs. Change `F` to `1 | 2`, or the field to a plain `f64`, and it still fails — so this is
-  not a rep question, it is a question of WHEN the captured literal's element row is decided.
-* **THE NEIGHBOURS ARE D411 AND D501 AND THEY ARE BOTH CLOSED**, both about an un-annotated
-  list literal's element row being committed too early. Both close as LOUD EMIT REJECTS. Read
-  their closes first: this row is the same commit happening across a capture boundary, and the
-  right outcome here is `runs`, not a third refusal — the destination is unambiguous (`sink`
-  names `Circle[]` and nothing else consumes `c`).
+* **THE ROW'S OWN ABLATION WAS RIGHT AND IT IS AN ORDERING FACT, NOT A REP FACT.** The
+  element type moves nothing — `1.5 | 2.5`, `1 | 2`, a plain `f64` and a `string` field all
+  reproduced identically and all now run. Removing the CAPTURE is the one ablation that
+  changes the outcome, and the reason is that there is then no env struct to type at all.
+
+* **THE BYTES NAME THE PASS. ONE LINE OF THE MODULE CHANGES AND IT IS A TYPE, NOT AN
+  INSTRUCTION.** Off `./node_modules/.bin/wasm-dis` (binaryen 130 — the two `$type`s print
+  under the same elided name, so nothing short of the disassembly separates them):
+
+      -  (type $12 (struct (field (ref $6))))
+      +  (type $12 (struct (field (ref $8))))
+
+  `$12` is `inner`'s env struct. `$6` is `{(ref (array (mut i32))), i32, i32}` — the DEFAULT
+  i32-list wrapper. `$8` is `{(ref (array (mut (ref null $Circle)))), i32, i32}` — the real
+  one, and it is what `outer`'s own local (`(local $1 (ref $8))`) and `sink`'s param
+  (`(param (ref $8))`) already were on master. Every other byte of the module, in both
+  functions, is unchanged: the producer and the consumer always agreed and only the env
+  field did not.
+
+* **THE MECHANISM, MEASURED ON THE CALL, NOT INFERRED.** A probe on `captureValKind` (the
+  function that TYPES the env field) reads SIX calls for `c` on the base compiler, in this
+  order:
+
+      |TYPESEC c k=list slot=-1 |cvk-INIT c k=list refarr=false holek=1 holeslot=0 rlslot=-1
+      |cvk-ANN c k=reflist  (x5)
+
+  The FIRST call is `emitTypeSection`'s own, and at that moment the binding is
+  UN-ANNOTATED, so `captureValKind` classifies the INITIALIZER — and an empty `[]` has no
+  element to classify (`arrLitIsRef` declines a literal with no elements BY CONSTRUCTION,
+  which its header states as an invariant). The other five calls come from the CODE section
+  and read `reflist`, because by then an annotation exists. **What writes it is
+  `synthEmptyListAnn`, and until this change its only caller was `collectLocals`** — i.e.
+  the code section, one whole section after the type section committed the field. The probe
+  also shows the answer was available the entire time: `holek=1` says the checker had
+  already unified the hole with `Circle[]` and `emptyArrHoleKind` reads `reflist` off it.
+
+* **THE FIX IS `synthGlobalEmptyListAnns`' ARGUMENT, ONE STORAGE CLASS OVER, AND THAT HEADER
+  ALREADY STATES IT.** It reads: *"ordered BEFORE `emitModule` for the obvious reason: the
+  global section reads `globalCellKind`, whose annotated ladder is what the synthesized
+  annotation steers"*. A global never reaches `collectLocals`; **neither does a captured
+  binding, in time** — the section that reads it (there the global section, here the TYPE
+  section's env structs) is emitted before the pass that writes it. `synthCaptureEmptyListAnns`
+  runs the identical synthesis over exactly the bindings the type section types: every
+  capturing frame (`fnStmts`), every capture name (`captureNamesOf`), resolved by
+  `parentBindingOf` — **the very function `captureValKind` and `captureValStructIdx` resolve
+  the field through**, so the pass and the field cannot disagree about which binding is meant.
+  It is idempotent (`s.letType < 0` on entry), so `collectLocals`' own later call declines and
+  the LOCAL's classification is untouched.
+
+* **WHY `runs` IS RIGHT HERE AND THE REFUSAL WAS RIGHT AT D411/D501 — the difference is a
+  COUNT, and it is checkable.** Those two rows refuse because ONE list value is bound to TWO
+  declared destinations whose elements are stored differently (`Circle[]` and `Shape[]`): a
+  list value has one element rep and the two destinations demand two, so whichever slot the
+  emitter picks the OTHER store is a type mismatch — no answer exists, which is why all three
+  of D411's enumerated "ways to make it run" stayed refused. **Here the count is one.** `sink`
+  names `Circle[]`, nothing else consumes `c`, and the compiler had ALREADY committed to that
+  answer in two of the three places it matters — the local and the callee param are both
+  `(ref $8)` on master. The fix does not choose between rivals; it stops one reader answering
+  before the answer is written down. The two rows' own predicate is untouched: this pass never
+  reaches a binding with a second destination, because `synthEmptyListAnn` fires only on an
+  EMPTY `ArrayLit`, and `letRefListDestSlotK` — the predicate both refusals stand on — returns
+  -1 for an empty literal by construction (*"an EMPTY `[]` is already destination-typed through
+  `pendingListKind` / `emptyArrHoleKind`; it has no element inference to correct"*). D411's and
+  D501's grids and fixtures are unmoved.
+
+  **AND THE CONTROL SURVIVES IT.** The filed row's one ablation — hoist `sink(c)` out of
+  `inner` — runs on master and still runs (L6 of the fixture). That is the case where the
+  destination is equally unambiguous and there is no env struct, and it is why "the capture
+  is the ingredient" and "the destination is unambiguous" are consistent statements rather
+  than competing ones.
+
+* **TWO RUNGS, ABLATED, AND THE SECOND SCORES ZERO ON THE CORPUS AND IS LOAD-BEARING ANYWAY.**
+
+  | rung | site | corpus classes moved | out-of-corpus witness |
+  |---|---|---|---|
+  | 1 | `synthEmptyListAnn` on a captured binding | **17** (310 census cells) | the filed repro |
+  | 2 | `synthNullableAnn` on the same binding | **0** | `const v = m["z"]` captured: `check-clean invalid wasm` -> **runs** |
+  | 1+2 | | **17** | both |
+  | strip-all | | 0 | base seed reproduced BYTE-FOR-BYTE, `0407ec5ba9f70e9394739cc5bddc537d` |
+
+  Rung 2 is the exact shape the ablation discipline warns about: zero on a DERIVED
+  population is not zero. `wasm-tools print` (which parses the invalid module `wasm-dis`
+  refuses) shows its own one-line diff — `(type (;13;) (struct (field i32)))` becomes
+  `(struct (field (ref 0)))`, the union box — i.e. the same defect at the same site with a
+  different initializer. It is pinned as L7 of the fixture rather than measured away.
+
+  Two rungs were built, measured and DECLINED. `synthRetPinAnn` on the same walk: 0 corpus
+  classes and 0 on three constructed capture-shaped witnesses (including D39's own program
+  with the binding captured), because its producer is an OBJECT LITERAL — a non-empty
+  producer, which `captureValKind`'s un-annotated arm already classifies correctly, so the
+  env field was never wrong. And placing the pass EARLY (before `collectA#2`, so a
+  synthesized annotation could be interned rather than merely resolved): 0 additional
+  classes and it costs byte-identity — **2 of 2,451 corpus modules DIFFER** where the late
+  placement differs on none.
+
+* **COUNTERS, BOTH RUNGS OF THE LADDER.** Over the 1,996-module fixture corpus the pass is
+  **REACHED 332 times across 100 modules** and **ANSWERS 0 times** — every captured binding
+  in the corpus already carried, or did not need, its annotation. That is the whole
+  explanation of the byte-identity below, and it is why `reach` had to be measured
+  separately: an unreached pass and a reached-but-declining one produce the same 0 DIFFER.
+  On the two witnesses the same counters read `reach=1 ansE=1 ansN=0` (the filed repro) and
+  `reach=1 ansE=0 ansN=1` (the nullable capture); on the hoisted control, `reach=0`.
+
+* **THE MOVEMENT, CELL-MATCHED** (`scripts/silent-sweep/distilled/regress.py`, 7,021 cells):
+
+  | | base | landing |
+  |---|---|---|
+  | check-clean invalid wasm | 92 | **75** |
+  | runs | 3,704 | **3,721** |
+  | loud emit reject | 314 | 314 |
+  | loud check reject | 2,911 | 2,911 |
+  | `runs` -> NOT-RUNS | — | **0** |
+  | -> silent | — | **0** |
+  | other movement | — | **0** |
+
+  The 17 classes stand for **310 census cells**, every one of them
+  `check-clean invalid wasm -> runs`. Of the 92 base-silent cells, 18 carry an un-annotated
+  empty `[]` and **17 of the 18 moved**; the one that does not (`b004880`) has no capture —
+  it is `const cc = []` returned from a `{r: i32 | null}[][]` function — so it is a
+  different row, not a residue of this one.
+
+* A **COMPILER TRAP REMOVED, not added.** `const c = []` captured by a lambda that
+  `.push`es into it traps the compiler on master (`wasm trap: out of bounds array access`,
+  backtrace inside `vl-compiler.wasm`); it is now the same LOUD reject its own hoisted
+  control has always given (`emitProgram: ref .push but ref list type not collected` — a
+  separate, pre-existing gap: nothing in that program spells `Circle[]`, so the ref-list row
+  is never interned).
+
+* Corpus `cmp` **2,452 modules · 1,996 IDENTICAL · 0 DIFFER · 0 LOST** (455 build under
+  neither compiler — the `@check`-only fixtures and module fragments — and fail
+  identically). The one `GAINED` is this change's own fixture, which is GAINED by
+  construction: it did not build on the base, and that is the defect.
+  Pinned as `tests/cases/closures/capture-unannotated-empty-list-element.vl`, whose seven
+  legs are the four element backings, two frames deep, a lambda capture, the hoisted control
+  and rung 2.
 
 ### D621 — an INERT declaration of a struct with the arm's layout refuses the arm's own nullable field read, on a heap D280 already merged
 **[CLOSED 2026-08-30] the repro below RUNS and prints `7`. Was: loud emit reject (`emitProgram: bare null needs a struct-typed context`) · **151 of the distilled corpus's 314 emit-reject cells — the largest cluster by 3.8x**, and no inventory row named it · clause 2 (no capability refusals), decided by the DIRECT spelling: delete the second `type` line and the identical program runs, and the module the fix emits is BYTE-IDENTICAL to the one that twin-free spelling already emitted · the same program with the null test replaced by `const v = c.r` was check-clean invalid wasm on master and runs too**
@@ -17728,6 +17947,143 @@ Repro (five lines; every one of them is load-bearing, see the ablation):
 * Pinned as program 5 of `tests/cases/soundness/arm-and-its-layout-twin-share-one-heap.vl`,
   beside the four programs D280 and D281 left there — it is the same seam, one rung on.
 
+
+### D623 — the carrier D621 unmasked: an UN-ANNOTATED `Map()` reaching an annotated struct field, where the value type has a layout twin
+**check-clean invalid wasm · 130 cells · these are D621's measured PRICE, and the price was a FLOOR over this defect rather than a statement about the program: on master before #2027 all 130 were a loud emit reject, and deleting the one `!= null` line that reached D621's gate made all **130 of 130** produce the byte-identical validator sentence at the identical offset · re-verified cell by cell on 2026-08-30 after the merge**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    type Dot = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type GW = { g: {[string]: Circle} }
+    function mkcall() {
+      const cc = Map()
+      cc["k0"] = { r: null }
+      return cc
+    }
+    function outer() {
+      const wv: GW = { g: mkcall() }
+      print(7)
+    }
+    outer()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD PRINT 7
+
+* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured:
+
+  | change | outcome |
+  |---|---|
+  | as filed | **check-clean invalid wasm** |
+  | `function mkcall(): {[string]: Circle}` | runs, prints 7 |
+  | `const cc: {[string]: Circle} = Map()` | runs, prints 7 |
+  | drop `type Dot` (the layout twin) | runs |
+  | drop `type Shape` (the union) | runs, prints 7 |
+  | field `r: i32` instead of `i32 \| null` | runs, prints 7 |
+  | hoist out of the lambda into `outer` | **still fails** — the lambda is SCENERY |
+
+  So the ingredients are the un-annotated carrier, the same-shape twin, the union membership
+  and the nullable field. The closure is not one, which separates this from D613 even though
+  the two share a validator sentence (`expected (ref $type), found (ref $type)`) — **do not
+  group them by that sentence.**
+* **WHY THERE IS A ROW AT ALL RATHER THAN A LINE IN D621.** D621's close moved these 130 from
+  `loud emit reject` to `check-clean invalid wasm`, which under the standing goal is a clause-1
+  violation where there was a clause-2 one. That trade was right — `runs` went 3,704 -> 3,732
+  and the total against the goal 451 -> 423 — but the 130 then had no owner, and a price
+  recorded in a named set is not a defect anybody is working. This row is the owner.
+* **THE TWIN + UNION + NULLABLE TRIO IS D280's, D612's AND D621's**, which is three closes on
+  one ingredient set and a reason to suspect the carrier is the last of it rather than the
+  next-to-last. Worth asking directly: is there a spelling where the carrier is annotated and
+  the trio still breaks?
+* All 130 are in the `d224-cost` named set, kept whole; `named/sources.json` records the price.
+
+
+### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
+**check-clean invalid wasm · 55 cells, the largest silent family no agent holds · found 2026-08-30 by splitting the silent population by OWNERSHIP rather than by message and minimising what was left · SIX ingredients and every one of them is load-bearing**
+
+Repro:
+
+    function mkI(): {[string]: i32} {
+      const mi: {[string]: i32} = Map()
+      return mi
+    }
+    type Circle = { r: {[string]: i32} }
+    type Dot = { r: {[string]: i32} }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Box1 = {[string]: Circle}[]
+    const _sp1: Box1 = []
+    const lv1 = Map()
+    lv1["k0"] = { r: mkI() }
+    const c = [lv1]
+    const dd = c
+    const g0 = dd
+    if g0.length > 0 {
+    } else { print(0) }
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
+    // SHOULD RUN (the list has one element, so the `else` does not fire and nothing prints)
+
+* **EVERY INGREDIENT IS LOAD-BEARING — six of six, each ablated, each making it run:**
+
+  | removed | outcome |
+  |---|---|
+  | nothing (as filed) | **check-clean invalid wasm** |
+  | `type Dot` (the layout twin) | runs |
+  | `type Shape` (the union) | runs |
+  | `type Box1` + the `_sp1` spacer | runs |
+  | annotate `lv1` as `{[string]: Circle}` | runs |
+  | annotate `c` as `{[string]: Circle}[]` | runs |
+  | field `r: i32` instead of `r: {[string]: i32}` | runs |
+
+  That is a narrower conjunction than any row in this family so far, and it is why the row
+  exists rather than a note on D623.
+* **RE-MEASURE AFTER D623 LANDS, BEFORE WRITING ANY CODE.** D623 is the same shape — an
+  un-annotated carrier, a layout twin, a union — differing in two places: its carrier reaches a
+  STRUCT FIELD where this one reaches a LIST ELEMENT, and its field is nullable where this
+  one's is map-valued. There is a real chance D623's fix moves some or all of these 55, and
+  the honest first step is to grade this witness against D623's merged seed rather than to
+  re-derive a mechanism that may already be gone.
+* **DO NOT GROUP BY THE VALIDATOR SENTENCE.** 55 of the 66 unowned silent cells print
+  `expected (ref null $type), found (ref $type)`, and that number is a MESSAGE count, not a
+  mechanism count — D611 was filed at 58 on exactly that basis and had 3. The 55 here is also
+  a message count until someone ablates the others; say so rather than inheriting it.
+
+### D625 — an empty `[]` returned at a NESTED array of STRUCTS: the element row is committed one dimension too shallow
+**check-clean invalid wasm · 5 cells · found 2026-08-30 in the same split · named by D613's close as its one holdout ("`b004880` has no capture — a different row") and filed here rather than left as a remark · TWO ingredients, and the nullable field is NOT one of them**
+
+Repro:
+
+    function mkc(): {r: i32 | null}[][] {
+      const cc = []
+      return cc
+    }
+    print(mkc().length)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD PRINT 0
+
+* **TWO INGREDIENTS, ABLATED, and the third candidate is scenery:**
+
+  | variant | outcome |
+  |---|---|
+  | as filed, `{r: i32 \| null}[][]` | **check-clean invalid wasm** |
+  | one dimension, `{r: i32 \| null}[]` | runs, prints 0 |
+  | nested but non-nullable, `{r: i32}[][]` | **still fails** — nullability is SCENERY |
+  | nested but scalar element, `i32[][]` | runs, prints 0 |
+
+  So it needs the NESTING and a STRUCT element, and nothing else.
+* **THIS IS D613's MECHANISM AT A RETURN RATHER THAN A CAPTURE**, and D613 is closed: a
+  captured empty `[]` had its closure-env field typed a section before the element row was
+  pinned, fixed by `synthCaptureEmptyListAnns`. The obvious question, and the place to start:
+  does the RETURN path have the same shape of hole — a pass that types the empty literal's
+  element row before the declared return annotation is consulted — and is the fix the same
+  synthesis one storage class over, the way D613's was `synthGlobalEmptyListAnns`' argument one
+  class over? `synthEmptyListAnn` and its existing callers are the map.
+* The right outcome is `runs`. The destination is unambiguous — the function declares its
+  return type and nothing else consumes `cc`.
 
 ### D622 — structural width subtyping: a value with MORE fields flowing into a shape with fewer
 **loud check reject, and the checker concedes type-validity in its own message — a clause-2

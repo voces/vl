@@ -122,6 +122,7 @@ import {
   nodeRepTyIxOf,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
+  numLitUnionBaseTy,
   primNameStr,
   primTyOfName,
   resolveAnnot,
@@ -354,6 +355,42 @@ function repKeyMemoSync() {
   0
 }
 
+// D611: THE NUMERIC-LITERAL-UNION SOFTEN FOR A STRUCT FIELD, applied on both canon-key
+// walks so the id and the string stay one answer. `type N = 1 | 2` and `i32` are ONE
+// emitted field: `numLitUnionBaseTy` is the checker's own `softenLitTy` rule and claims a
+// type only when every member is a literal over the SAME i32 / i64 / f64 base.
+//
+// IT IS CANON'S RULE, NOT A NEW EQUIVALENCE, which is why it belongs in the key rather than
+// at one mint site. `canonEmitTypeNames` rewrites the ANNOTATION `{r: N}` to `{r:i32}` and
+// banks the REWRITTEN spelling's type (`canonTyIxCol`), which is what an inline shape row
+// records; a DECLARED `type Box1 = {r: N}` records the pre-canon `cUserTypes` entry, which
+// canon never revisits. So one structural shape reached `buildStructTwins` under two arena
+// types — `{r: i32}` and `{r: N}` — with different canon ids. `keys[j] == keys[i]` is tested
+// BEFORE `structFieldCodesEq`, so the pair was never even compared: two heap types for one
+// shape, `vl check` rc 0, `vl run` "expected (ref null $type), found (ref $type)" (D611).
+//
+// THE FIELD POSITION ONLY, and that bound is measured rather than cautious. Softening at
+// EVERY position instead (at the top of `repCanonId`/`repCanonKey`) buys the same 227 cells
+// and LOSES 21 that run today — the whole `d362*_numlitun_*` named set, `type Z = 0 | 1`
+// under `type L = Z[]` / a map value / a union member, which went `runs` -> check-clean
+// invalid wasm ("expected (ref $type), found i32"). A numeric literal union is its base
+// SCALAR in a field slot; in the list / map-value / union-member layers it is not the same
+// interned row as its base, and the key is what keeps those apart.
+//
+// THE STRING BASE IS EXCLUDED BY THE HELPER AND MUST BE. `type K = "a" | "b"` reps as an
+// interned i32 atom and its alias NAME *is* that identity (`numLitUnionBaseTy`'s header
+// states the rule); softening it would fuse an atom field onto a `string` field. A numeric
+// literal union has no identity to keep — its members ARE i32s.
+//
+// Layout safety stays DOUBLE-GATED exactly as the TyUnion mix-widening below is:
+// `structFieldCodesEq` still has to agree positionally before two rows share a heap type,
+// so this rung can only ever let a merge be CONSIDERED, never force one.
+function repCanonFieldTy(ty: i32): i32 {
+  const nb = numLitUnionBaseTy(ty)
+  if nb >= 0 { return nb }
+  ty
+}
+
 export function repCanonKey(ty: i32): string {
   if ty < 0 { return "!" }
   let si = repKeyStack.length - 1
@@ -400,7 +437,11 @@ function repCanonKeyGo(ty: i32): string {
       let s = "{"
       let i = 0
       while i < t.objFieldNames.length {
-        s = s + t.objFieldNames[i] + ":" + repCanonKey(t.objFieldTypes[i]) + ","
+        s = s +
+          t.objFieldNames[i] +
+          ":" +
+          repCanonKey(repCanonFieldTy(t.objFieldTypes[i])) +
+          ","
         i = i + 1
       }
       return s + "}"
@@ -1743,7 +1784,7 @@ function repCanonIdGo(ty: i32): i32 {
       let i = 0
       while i < sortedIx.length {
         const fx = sortedIx[i]
-        const c = repCanonId(t.objFieldTypes[fx])
+        const c = repCanonId(repCanonFieldTy(t.objFieldTypes[fx]))
         a.push(sortedSid[i])
         a.push(c)
         len = len + t.objFieldNames[fx].length + 1 + hcLen[c] + 1
