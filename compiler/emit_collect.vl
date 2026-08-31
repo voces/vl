@@ -432,6 +432,7 @@ import {
   genTyParamArr,
   globalLetOf,
   ifExprNliName,
+  internInlineShape,
   internInlineShapeTy,
   internShapeAs,
   internShapeDeep,
@@ -7366,6 +7367,46 @@ export function collectGenAliasShapes() {
 // interned mid-loop — `internInlineShape` shares the flat `sField*` arrays). `internInlineShape` is a
 // no-op for a non-shape name and idempotent (`annShapeIndexOf`), so a program with NO inline-shape
 // fields — like the compiler itself — interns nothing here and its struct layout is unchanged.
+// Intern the OWN canonical render of the union ARM a field type NAMES (`g: Circle`,
+// `g: Circle | null`), so `armFieldStructRow` has a row to answer with. A no-op for every
+// other spelling; see the call site for why it is demand-driven and why it costs no heap type.
+function internArmFieldShape(fdNm: string) { internArmShapeAt(fdNm, 0) }
+
+// The COMPOSITION peel, mirroring `internShapeDeep`'s: grouping parens, a trailing
+// `| null`, trailing `[]` runs and a MAP VALUE, to any depth. An arm reached through a
+// container needs its row for the same reason a bare one does — `{[string]: Circle[]}`
+// is the map-and-list dual of `g: Circle`, and the element render that has to key against
+// it (`{r:null}[]`, the un-annotated carrier's own spelling) resolves through the struct
+// table exactly as the bare field's does. Depth-bounded like every other name peel in this
+// file: a name is finite, but a bug in one of the cuts must not be an unbounded recursion
+// in the compiler.
+function internArmShapeAt(nm: string, depth: i32) {
+  if depth > 8 { return 0 }
+  if nm == "" { return 0 }
+  const base = nonNulBaseOf(nm)
+  if base != nm { return internArmShapeAt(base, depth + 1) }
+  if nameIsArray(nm) { return internArmShapeAt(arrElemNameRaw(nm), depth + 1) }
+  const mv = mapValNameOf(nm)
+  if mv != "" { return internArmShapeAt(mv, depth + 1) }
+  internArmShapeOf(nm)
+}
+
+function internArmShapeOf(nm: string) {
+  const vi = variantIndexOf(nm)
+  if vi < 0 { return 0 }
+  if vi >= uVarTyIx.length { return 0 }
+  const aty = uVarTyIx[vi]
+  if aty < 0 { return 0 }
+  // NO ARENA HINT. `internInlineShapeTy` banks its `tyIx` argument into `sTyIx`, which would
+  // make `structIndexOfTy` answer this row for the ARM'S OWN declaration node — and a
+  // struct-row resolver answering for an arm is the D34 decline ("an ARM value has no
+  // `sNames` row, so this resolver declines and `exprVariantIndex` answers") turned off
+  // module-wide. The row is found structurally instead, by `variantStructHeapTwinAt`'s
+  // `repRowOfTyStruct` rung, which is the same route an inline `{r: i32}` field already takes.
+  internInlineShape(tyToEmitName(aty))
+  0
+}
+
 function collectNestedFieldShapes(stmts: i32[]) {
   let i = 0
   while i < stmts.length {
@@ -7399,6 +7440,19 @@ function collectNestedFieldShapes(stmts: i32[]) {
               }
             }
             internShapeDeepTy(tyNameOf(fnode.fdType), fdRoot)
+            // AND THE ARM-TYPED FIELD'S OWN SHAPE (silent-class-inventory D761). A field
+            // typed as a union ARM stores through the struct row whose heap the arm shares
+            // (`armFieldStructRow` → D280's `uVarSTwin`), and an arm with no DECLARED layout
+            // twin has no such row for the same reason the field has no code: `collectS`
+            // skips a `type X = {…}` that is a union member. Interning the arm's OWN
+            // canonical render mints it, and `variantStructHeapTwinAt`'s anonymous-claimant
+            // rung (D282) then merges the two, so the mint costs the module no heap type —
+            // `mAssignTypeIndices` allocates for the struct row and the arm reuses it.
+            //
+            // DEMAND-DRIVEN: only a field that NAMES an arm interns anything, so every
+            // module without one is byte-identical. Idempotent (`annShapeIndexOf` dedups),
+            // and a no-op where a declared twin already exists.
+            internArmFieldShape(tyNameOf(fnode.fdType))
           }
           fi = fi + 1
         }
