@@ -23852,9 +23852,9 @@ Repro (runs, prints the wrong arm's body):
 
 ---
 
-### D833 — a NARROWER row that exists BEFORE `collectAnonShapes` claims both `??` operands, so D804's merge never runs
+### D833 — [CLOSED 2026-08-31 by D841] a NARROWER row that exists BEFORE `collectAnonShapes` claims both `??` operands, so D804's merge never runs
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` (6 cells), and 6 more that build a SILENT invalid module (`expected i32, found (ref $type)`) · 12 cells in `distilled/named/d833_*`, OPEN · the OTHER mechanism behind D804b's message, separated from D831's by ABLATION and by a gate probe · the plainest witness is a three-line `type` the program never uses**
+**closed as `runs` by D841 — all TWELVE cells · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (6) and `check-clean invalid wasm` (6) · the diagnosis below is right in every particular EXCEPT its last bullet's pessimism: "minting the merged row is not enough" is true, and the second half it could not name is the MAP VALUE SLOT, which resolves its row from a rendered type name that the competing `type R` matches exactly. Redirecting that one slot (`anonLeafSupersede`) is the whole of the `_i32` half. "If `R` is genuinely USED elsewhere … two reps for one literal" turned out not to arise: the redirect moves the CONTAINER's row, not `R`, so `d841_competing_row_used_null` / `_used_str` both run too**
 
 Repro (a loud emit reject):
 
@@ -24199,3 +24199,145 @@ Repro (was check rc 0 then `wasm trap: cast failure`; now a positioned check rej
 * **THE PRICE WAS PAID BY THE TESTS, NOT BY A CELL.** `distilled/named/` gains
   `d853_two_unions_no_elem_read` under this row's own name, because a derived corpus cannot know
   that a running program is what a candidate would have taken.
+
+---
+
+### D841 — [CLOSED 2026-08-31] the merged row has to be MINTED past the competing row *and* the map's VALUE SLOT has to be pointed at it, and the grid splits on the second half
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (6 cells) and `check-clean invalid wasm` (6 cells) · a CLAUSE-2 and CLAUSE-1 close · ABLATED family: 12 of the 12 `d833_{alias,mapann,paramann}_*` cells, one mechanism in two halves · 12 cells → `runs`, **0 `runs` lost, 0 into any silent class**, corpus `cmp` **0 DIFFER · 0 LOST** · `goal-scoreboard.py` 17 → 7**
+
+Repro (now runs, printing `0`):
+
+    type R = { r: i32 }
+    function rd() {
+      const c = Map()
+      c["k1"] = { r: 7 }
+      const g1 = (c)["k0"] ?? { r: null }
+      print(0)
+    }
+    rd()
+    // was: vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // Now: prints 0. Deleting the first line always printed 0; `R` is never mentioned again.
+
+* **D831'S RUNG DOES NOT REACH THIS AND CANNOT BE ASKED EARLIER — measured, twice over.** A
+  probe build counting `annShapeWiderRowOf`'s calls and answers: the `alias` carrier reports
+  **AWRcall 0** (a declared `type` never enters `internInlineShapeTy`, which is the only caller);
+  the `paramann` and `mapann` carriers report **AWRcall 1, AWRpost 0** — called once, on the
+  FIRST pass, where `postMonoShapes` is false. Lifting that gate would not help either: the rung
+  looks for a row that is already a BOX over the annotation's atom, and on the first pass no such
+  row exists — `collectAnnShapes` runs BEFORE `collectAnonShapes`, so the literals have not
+  minted anything yet. D831's ordering is `mint, then annotate`; this one's is `annotate, then
+  mint`, and the fix has to live on the other side. (D831's own ablation also measured that
+  lifting the gate loses `tests/cases/types/optional-chain.vl`.)
+
+* **ONE MECHANISM, TWO HALVES, AND THE GRID SPLITS ON THE SECOND.** The `_str` half of the grid
+  (a competing `{r: string}`) closes on the MINT alone; the `_i32` half closes on nothing but the
+  SUPERSEDE. Both halves are the same defect — a row that exists before `collectAnonShapes`
+  claims what the `??` needs merged — and the ablation below grades them separately.
+  * **the MINT.** `anonLeafPolyUnionSet`'s `structIndexOfObj(ow) >= 0` gate ended the rung, with
+    a comment stating the assumption that fails: *"a sibling a DECLARED row already claims never
+    lands here — and if one did, this literal would have matched that row too and no mint would
+    be running."* Exactly true, exactly the problem. The gate now ends the rung only for a
+    literal the JOIN does not name.
+  * **the SUPERSEDE.** With the row minted, both literals are still delivered through the map's
+    value SLOT, and that slot resolves its struct row by RENDERING the checker's inferred value
+    type (`{r: i32}`) and looking the render up — which names `R` exactly. The vals array is then
+    emitted over `R` and the merged literal cannot be stored into it. `anonLeafSupersede` points
+    that one slot at the merged row. Off `./node_modules/.bin/wasm-dis`, master's module holds
+    `(type $0 (struct (field (mut i32))))` — `R` — and `(type $1 (struct (field (mut (ref $4)))))`
+    — a separate `{r: string}` row — with the map's vals backing `(array (mut (ref null $0)))`;
+    the one that replaces them is `(type $1 (struct (field (mut (ref $2)))))` over
+    `(type $2 (struct (field i32) (field anyref)))`, the union box, with the vals backing moved to
+    `(array (mut (ref null $1)))`. `R` is still there, unchanged, at `$0`.
+
+* **THE FAMILY IS A DATAFLOW QUESTION AND NOT A FIELD-SET ONE, and a running program is what
+  says so.** D804's sibling scan reads "every literal in the program with this field-name set",
+  which is the right population for the merged row's MEMBER SET and the wrong one for deciding
+  which literals must ABANDON a row they matched. Taking the field set as the family takes
+  `d841_hazard_declared_dest` — `const x: R = { r: "a" }` beside an unrelated `??` over
+  `{r: i32}` — from `runs` to invalid wasm. The population is instead the literals a `??` makes
+  ONE value: its default, and the literals stored into the container its left operand reads.
+
+* **AND FAMILIES OVER ONE FIELD SET ARE GROUPED BY THE ROW THEY SUPERSEDE, which is the bound in
+  the other direction.** Two `??`s whose maps share a value NAME key the SAME mv slot and so must
+  land on ONE row — five such families minted eight rows before this grouping existed, and
+  reading a string back through the wrong row's tag layout printed `null`: a check-clean SILENTLY
+  WRONG value, found by this row's own fixture and by nothing else. Two `??`s over one field set
+  claimed by DIFFERENT rows are two values that must stay apart, and
+  `tests/cases/types/atom-vs-plain-field-twin-rows.vl` (a `{f: boolean}` map beside a `{f: K0}`
+  one) is the module whose bytes move if they are merged.
+
+* **THE ABLATION, five rungs, each built and graded cell-matched.** Strip-all is master's own
+  seed, `3c5230be148edaaf8ce567289682fb74`, 1,561,594 bytes, built here from master's `compiler/`
+  rather than quoted (master `c1a32cf8`, after #2061). **Two of the five score ZERO on every cell
+  and are still required — only `cmp` sees them.**
+
+  | rung | what it is | cells | corpus `cmp` |
+  |---|---|---|---|
+  | all five (shipped) | | 12 → `runs` | 0 DIFFER · 0 LOST |
+  | −the join family | the sibling scan stops admitting a claimed literal | `_str_null` + `_str_str` (6) revert; `d841_merged_read_back` reverts | — |
+  | −the gate lift | a claimed literal never asks D804's question again | `_i32_null` + `_i32_str` (6) revert; the fixture reverts | — |
+  | −the supersede | the mv slot stops consulting it | the same 6 `_i32` cells revert; the fixture reverts | — |
+  | −the serving-row search | no row is ever found to already hold the family | **0 cells move** | **`d841_declared_box_serves` bytes DIFFER** (a duplicate row minted beside the declared box) |
+  | −the family-row grouping | every joined sibling contributes, whatever row its join sat on | **0 cells move** | **2 DIFFER** (`coalesce-litunion-field`, `atom-vs-plain-field-twin-rows`) |
+
+* **COUNTERS, reach AND ans, over 2,024 corpus modules.** A probe build counting each rung's
+  calls and answers: the join-family mark is **asked 2,496 times and answers 197** (51 modules);
+  the mint gate is **asked 2,850 times and answers 0**; the serving-row search **11 / 9** (one
+  module); the supersede **8,350 / 0**. Zero answers on the corpus is why `cmp` reads 0 DIFFER.
+  On the cells the same counters are non-zero: `d833_alias_i32_null` reports gate 2/1,
+  serve 3/1, sup 2/2; `d833_alias_str_null` reports gate 1/0 (it closes on the family alone);
+  `d841_hazard_declared_dest` reports gate 2/0 and sup 2/0, and `d833_none_i32_null` — D804's own
+  control — reports 0 everywhere.
+
+* **MEASURED, all six instruments, on master `c1a32cf8`.** Corpus `cmp`: **2,471 modules · 2,024
+  identical · 0 DIFFER · 0 LOST · 447 not buildable by the base.** Distilled corpus: **12 cells →
+  `runs`**, **`runs → not-runs` ZERO, `→ silent` ZERO**. `tests/cases` + `std`: **2,024 → 2,025 of
+  2,471 building** in 6.5 s at `JOBS=6`, and the set difference is EXACTLY the one fixture this
+  landing adds. `goal-scoreboard.py`: **17 → 7**, clause 1 10 → 5, clause 2 7 → 2, `runs`
+  **4,344 / 7,300 (59.51%) → 4,362 / 7,308 (59.69%)**. Fixture:
+  `tests/cases/maps/coalesce-default-row-past-competing-row.vl`.
+
+* **THE SCOREBOARD'S 7 IS 5 + 2, NOT 5.** Twelve cells closed and TWO new ones were added by this
+  landing — `d842_ident_reader_null` and `d842_ident_reader_str`, the delivery form this fix does
+  not reach, which no corpus cell had a program for. That is the number becoming true rather than
+  getting worse; the row is D842.
+
+---
+
+### D842 — the `??` LEFT-OPERAND READER this fix does not reach: a local's own CELL, not a map's value slot
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context`, with a SILENT invalid-module twin one default value over · 2 cells (`distilled/named/d842_ident_reader_*`), OPEN · the same defect as D833 one DELIVERY FORM over, and it is filed rather than built because the reader that would reach it was implemented, measured to close nothing, and removed**
+
+Repro (a loud emit reject):
+
+    type R = { r: i32 }
+    function rd() {
+      let a: {r: i32} | null = { r: 7 }
+      const g1 = a ?? { r: null }
+      print(0)
+    }
+    rd()
+    // vl check rc 0; vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // The `?? { r: "s" }` twin is CHECK-CLEAN INVALID WASM.
+
+* **IT IS D833's SHAPE WITH THE MAP REPLACED BY A LOCAL.** Same competing `type R`, same `??`,
+  same two operands that need one boxed row. What differs is only where the literals are
+  DELIVERED: D841 closes the map form by pointing the map's value SLOT at the merged row, and a
+  local's `{r: i32} | null` cell takes its struct index from the binding's ANNOTATION instead
+  (`letAnnStructIdx` / `localStructIdx`), which the supersede does not touch.
+
+* **THE READER WAS BUILT AND MEASURED OUT, which is why this is a row and not a TODO.** D841's
+  join-family mark originally recognised a bare IDENTIFIER left operand (`a ?? …` — the literal
+  `a` was bound to) beside the map/list INDEX one. With that reader present these two cells grade
+  EXACTLY as they do without it — the merged row is minted and the local's cell still names `R`
+  — so the reader admitted members no rung then used. A wider join population is the risky
+  direction (`d841_hazard_declared_dest` is what punishes it), so it was removed rather than
+  shipped inert.
+
+* **WHERE TO START, and it is not the join family.** The cell, not the mint: whatever answers
+  `localStructIdx` / `letAnnStructIdx` for a `{r: i32} | null` binding has to take the same
+  redirect the mv slot takes. Both cells are in `named/` so the next attempt has the two programs
+  that say whether it worked.
