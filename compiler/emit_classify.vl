@@ -22938,11 +22938,43 @@ export function buildVariantTwins() {
 //
 // THE LAYOUT GUARD IS DELIBERATELY CONSERVATIVE AND THE NARROWNESS IS MEASURED, not
 // assumed: a field whose emitted storage is a `(ref [null] <heap>)` the CODE does not name
-// (5 / 15 / 28 a ref list, a nested struct and the list's niche; 19 / 29 a map) declines
-// the merge outright rather than descending into the referenced layer the way
-// `variantFieldLayoutEq` does. Never-merged is the safe degenerate (the `""`-key
-// discipline `structFieldCodesEq` states), the whole D156/D158/D171 family is
-// fixed-storage arms, and widening it is a separate measurement.
+// (5 / 15 / 28 a ref list, a nested struct and the list's niche) declines the merge
+// outright rather than descending into the referenced layer the way `variantFieldLayoutEq`
+// does. Never-merged is the safe degenerate (the `""`-key discipline `structFieldCodesEq`
+// states) and the whole D156/D158/D171 family is fixed-storage arms.
+//
+// THE MAP CODES (19 / 29) ARE NO LONGER AMONG THEM — that was the "separate measurement"
+// this header priced, and silent-class-inventory **D624** is it. A map-typed field was the
+// single largest decline at this guard: over the distilled corpus the function is asked
+// 11,866 times on 1,784 cells, and of the 525 cells that ask and never get an answer,
+// **112 decline HERE at code 19** (2,836 declines), against 29 at code 15 and none at 5 /
+// 28 / 29. The whole of D623's residue — an un-annotated `Map()` carrier whose value type
+// has a layout twin, reaching a list element or a struct field — lands on that decline.
+//
+// THE DESCENT IS SLOT EQUALITY, NOT THE TWIN RELATION, and that is the point rather than a
+// shortcut. `sFieldMapShape` / `uFieldMapShape` are the ONE HOME of "which map does this
+// field denote" on each table (the pair `sFieldTgtStructIdx` / `uFieldTgtStructIdx` is for
+// code 15), and they speak the same three-valued shape vocabulary: `-1` mono string-keyed,
+// `-4` mono i32-keyed, `>= 0` an mv slot. Two fields resolving the SAME answer emit the
+// SAME map struct, because `mvMapTypeIdx` is a function of the slot. That is the tightest
+// possible evidence and it is an equivalence on its own — the same argument
+// `repMapValSlotsTwin`'s D300 rung makes for `mvRlSlot[a] == mvRlSlot[b]`.
+//
+// AND IT IS WHY THIS RUNG CANNOT RECUR. `variantFieldLayoutEq`'s code-19 arm compares
+// `mvCanonRepOf`, which walks `repMapValSlotsTwin` — and `repMapValSlotsTwin` calls back
+// into THIS function (the cross-table arm D623 gave `mvValsElemStructRow`). Widening this
+// guard through the twin relation would close that loop, on shapes that can be recursive,
+// and would need `structFieldCodesEq`'s coinductive pair stack to be safe. Slot equality
+// asks the mv layer nothing it has to compute, so the loop never forms. `-3` (the
+// "no rep" sentinel `mvSlotOfValNameFindK` can hand back) declines rather than merging two
+// fields on the ground that neither has a representation.
+//
+// TIMING. Both accessors read the mv INTERN tables, which is the same exposure
+// `variantFieldLayoutEq` has already had at this layer — `repVariantSlotRep` renders
+// through it during `collectCloSigs`, before `mAssignTypeIndices` runs — and the same
+// answer for the same reason: each claimant resolves its own field's recorded type/name
+// against those tables without observing the other, so the mint and every pairwise find
+// compute one function of (`vi`, `si`).
 export function variantStructHeapTwinAt(vi: i32): i32 {
   if vi < 0 { return -1 }
   if vi >= uVarTyIx.length { return -1 }
@@ -22974,7 +23006,12 @@ export function variantStructHeapTwinAt(vi: i32): i32 {
   while fi < uFieldCount[vi] {
     const cv = uFieldTypes[uFieldStart[vi] + fi]
     if cv != sFieldTypes[sFieldStart[si] + fi] { return -1 }
-    if cv == 5 || cv == 15 || cv == 28 || cv == 19 || cv == 29 { return -1 }
+    if cv == 5 || cv == 15 || cv == 28 { return -1 }
+    if cv == 19 || cv == 29 {
+      const um = uFieldMapShape(vi, fi)
+      if um == -3 { return -1 }
+      if um != sFieldMapShape(si, fi) { return -1 }
+    }
     fi = fi + 1
   }
   si

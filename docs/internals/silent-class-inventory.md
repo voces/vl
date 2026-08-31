@@ -18051,7 +18051,7 @@ Repro:
   program, and becomes `bare null needs a struct-typed context`).
 
 ### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
-**check-clean invalid wasm · 55 cells, the largest silent family no agent holds · found 2026-08-30 by splitting the silent population by OWNERSHIP rather than by message and minimising what was left · SIX ingredients and every one of them is load-bearing**
+**[CLOSED 2026-08-30] the repro below RUNS and prints nothing, which is correct — the list has one element, so the `else` never fires. Was: check-clean invalid wasm · 55 cells, ALL 55 moved to `runs`, and they were 55 of the 62 silent cells left in the whole corpus · the fix is one rung: `variantStructHeapTwinAt`'s field-storage guard descends into the MAP codes instead of declining them, by SLOT EQUALITY**
 
 Repro:
 
@@ -18148,6 +18148,180 @@ Repro:
   `expected (ref null $type), found (ref $type)`, and that number is a MESSAGE count, not a
   mechanism count — D611 was filed at 58 on exactly that basis and had 3. The 55 here is also
   a message count until someone ablates the others; say so rather than inheriting it.
+
+* **WHAT CLOSED IT: the guard D280's own header priced and declined, widened at the MAP codes
+  and nowhere else.** `variantStructHeapTwinAt` gives a union ARM and a declared STRUCT of its
+  exact layout ONE WasmGC heap type, but its per-field layout guard declined OUTRIGHT on any
+  field whose emitted storage is a `(ref [null] <heap>)` the code does not name — codes 5 / 15 /
+  28 (ref list, nested struct, list niche) and **19 / 29 (a map)**. That header says in as many
+  words that "widening it is a separate measurement". This row is it, and the measurement says
+  the map codes are the whole of the remaining cost: over the distilled corpus the function is
+  asked **11,866 times on 1,784 cells** and declines **2,836 times on 112 cells at code 19**,
+  against 259 on 29 cells at code 15 and **zero** at codes 5, 28 and 29. Of the 525 cells that
+  ask and never get an answer, 112 decline there. (Counted with this row's own probe rather than
+  inherited: D623's row reported 81 of 104 over the narrower population of cells reaching ITS new
+  leg; the two denominators differ and both name the same guard.)
+* **THE DESCENT IS SLOT EQUALITY, AND THAT IS THE POINT RATHER THAN A SHORTCUT.**
+  `uFieldMapShape` / `sFieldMapShape` are each table's ONE HOME for "which map does this field
+  denote", speaking one three-valued vocabulary (`-1` mono string-keyed, `-4` mono i32-keyed,
+  `>= 0` an mv slot). Two fields resolving the SAME answer emit the SAME map struct, because
+  `mvMapTypeIdx` is a function of the slot — the same argument `repMapValSlotsTwin`'s D300 rung
+  makes for `mvRlSlot[a] == mvRlSlot[b]`, and the tightest evidence available. **It is also why
+  the rung cannot recur**: `variantFieldLayoutEq`'s code-19 arm compares `mvCanonRepOf`, which
+  walks `repMapValSlotsTwin`, which calls back into `variantStructHeapTwinAt` (the cross-table
+  arm D623 gave `mvValsElemStructRow`) — closing that loop on shapes that can be recursive would
+  need `structFieldCodesEq`'s coinductive pair stack, and a plain re-entrancy guard is exactly
+  what this timing-independent layer forbids, since the answer would stop being a pure function
+  of (`vi`, `si`). Slot equality asks the mv layer nothing it has to compute, so the loop never
+  forms. `-3` (the "no rep" sentinel) declines rather than merging two fields on the ground that
+  neither has a representation.
+* **THE ABLATION TABLE, RE-MEASURED ON BOTH SEEDS.** The row's original table is above and one
+  of its lines was already corrected once (see the narrow witness); this is every ingredient
+  graded against master and against the fix, plus the three shapes this close opened:
+
+  | ablation | master | with the fix |
+  |---|---|---|
+  | the filed witness | **check-clean invalid wasm** | **runs** (prints nothing, correctly) |
+  | the 14-line narrow witness (no list, no spacer, BOTH ends annotated) | **check-clean invalid wasm** | **runs, 7** |
+  | drop `type Dot` (the layout twin) | runs | runs |
+  | drop `type Shape` (the union) | runs | runs |
+  | drop `Box1` + the `_sp1` spacer | runs | runs |
+  | annotate the carrier to the DESTINATION's name (`{[string]: Circle}`) | runs | runs |
+  | annotate the carrier to the TWIN's name (`{[string]: Dot}`) | **check-clean invalid wasm** | **runs, 7** |
+  | field `r: i32` instead of `r: {[string]: i32}` | runs | runs |
+  | field `r: i32[]` instead of the map | runs | runs |
+  | the map field NULLABLE on both ends (`r: {[string]: i32} \| null`) | **check-clean invalid wasm** | **runs, 7** |
+  | the map NESTED on both ends (`{[string]: {[string]: Circle}}`) | **check-clean invalid wasm** | **runs, 7** |
+  | a second scalar-list field beside the map field (`q: i32[]`) | **check-clean invalid wasm** | **runs, 7** |
+  | the map's VALUE type has a layout twin of its OWN (`{[string]: Leaf}` vs `{[string]: Leaf2}`) | **check-clean invalid wasm** | **still check-clean invalid wasm — see D626** |
+
+  The last four rows are territory this close opened, and the last one is the BOUND: slot
+  equality answers when the two ends' maps are the SAME slot and declines when they are two
+  slots that merely emit the same struct.
+* **REACHED AND ANSWERING, both counted, before and after.** A probe compiler incrementing a
+  counter at every branch of the guard and reporting them at the end of `emitProgram`: the filed
+  witness reads `ask=11 nosi=1 … r19=10 ans=0` on master and `ask=4 nosi=1 … r19=0 ans=3` with
+  the fix; the narrow witness `ask=17 … r19=16 ans=0` becomes `ask=5 … r19=0 ans=4`. Corpus-wide
+  the code-19 declines go **2,836 on 112 cells → 0 on 0 cells** and `ans` goes 6,088 on 1,259
+  cells → **8,362 on 1,371 cells**. **All 55 movers are inside those 112 cells and 0 are
+  outside**; the other 57 were already `runs` or already loud and stay so, one duplicate map
+  struct lighter.
+* **THE TRADE, cell-matched on the distilled corpus: 55 classes move, every one `check-clean
+  invalid wasm` → `runs`. `runs -> not-runs`: 0. `-> silent`: 0. Same-class message moves: 0.**
+  No other transition of any kind, no new compiler trap, no corpus module lost. `runs`
+  **3,886 → 3,941** (55.35% → 56.13%), clause 1 **62 → 7**, total against the goal
+  **269 → 214**. Corpus `cmp`: 2,426 modules built with both seeds, **1,958 byte-identical,
+  14 DIFFER, 0 LOST, 0 GAINED** — every one of the 14 is a map / union-arm fixture on this exact
+  seam.
+* **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS** (`./node_modules/.bin/wasm-dis`, binaryen 130 —
+  both `$type`s print under the same elided name, so nothing else can show which indices are in
+  play). On master the narrow witness's rec group carries THREE 7-field map structs and TWO
+  field-for-field identical `Circle`-shaped rows:
+
+      (type $0  (struct (field (mut (ref $15)))))    ;; Dot, the declared row
+      (type $2  (struct (field (mut (ref $15)))))    ;; Circle, the ARM — identical to $0
+      (type $1  (struct (field (mut (ref $16)))))    ;; GW's `g`
+      (type $16 (struct (field (mut (ref $14))) (field (mut (ref $10))) … ))  ;; vals: (ref null $2)
+      (type $17 (struct (field (mut (ref $14))) (field (mut (ref $12))) … ))  ;; vals: (ref null $0)
+      (func $0 (type $18) (result (ref $17)))                    ;; mkcall
+      (func $1  (local.set $0 (struct.new $1 (call $0))))        ;; (ref $17) into a (ref $16) field
+
+  With the fix `$0` and `$2` are ONE row, so `$16` and `$17` are one map struct: the rec group
+  carries TWO, `mkcall` is `(func (result (ref $13)))`, `GW`'s field is `(mut (ref $13))`, and
+  the IDENTICAL `struct.new $1 (call $0)` is well typed. 2,963 bytes against 3,002 — one struct
+  row and one 7-field map struct, and nothing else in the module moves.
+* **ABLATION — one rung, and STRIP-ALL reproduces the base byte for byte** (md5
+  `e1a140b70abca7c0aa3a56800493e2b4`), so the header contributes nothing and the guard is the
+  whole change. Each sub-rung lifted alone, every variant self-compiled and graded cell-matched
+  against master's baseline:
+
+  | variant | movers | `runs` lost | → silent |
+  |---|---|---|---|
+  | as shipped (19 and 29, slot equality, `-3` declines) | 55 | 0 | 0 |
+  | code **19** only | 55 | 0 | 0 |
+  | code **29** only | **0** | 0 | 0 |
+  | drop the `-3` decline | 55 | 0 | 0 |
+  | `mvCanonRepOf` equality instead of slot equality | 55 | 0 | 0 |
+  | ALSO descend code 15 (`repStructSlotsTwin` over the field targets) | 55 | 0 | 0 |
+
+  Code 29 and the `-3` decline each score **ZERO on this derived population and are KEPT**: the
+  two sides' codes must already be EQUAL before the descent runs, so a code-29 pair is nullable
+  on both sides and one slot means one `(ref null $map)` — sound for exactly the reason 19 is —
+  and a `-3` merge is the one direction the `""`-key discipline forbids. The last two rows are
+  measured NEGATIVES worth not re-deriving: the canon-rep widening buys nothing HERE (it does
+  buy D626 — see there, and why it was still declined), and the code-15 descent buys nothing at
+  all, so the guard's remaining narrowness costs this corpus zero today.
+* Pin: `tests/cases/soundness/map-field-arm-shares-its-layout-twins-heap.vl`, two programs — the
+  narrow witness with the stored value READ BACK (so the merge is graded on a hit and not only
+  on the validator's acceptance) and the filed list witness with its `else` turned into a
+  printed `7`, so a silently skipped branch cannot pass for a pass. Its own file for the reason
+  D623's is: appended to `arm-and-its-layout-twin-share-one-heap.vl` the other programs'
+  declarations change what these literals resolve to, and it becomes a different program.
+
+### D626 — the map's VALUE type has a layout twin of its OWN: what SLOT equality still declines, one indirection past D624
+**check-clean invalid wasm · found 2026-08-30 by asking D624's close, directly, whether it unmasked a fifth defect in the D280 / D621 / D623 / D624 chain · it is NOT unmasked — the witness is check-clean invalid wasm on master as well — but it is the next layer out, and the widening that closes it is already measured and was declined for a named reason**
+
+Repro:
+
+    type Leaf = { n: i32 }
+    type Leaf2 = { n: i32 }
+    type Circle = { r: {[string]: Leaf} }
+    type Dot = { r: {[string]: Leaf2} }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type GW = { g: {[string]: Circle} }
+    function mkcall(): {[string]: Dot} {
+      const cc: {[string]: Dot} = Map()
+      cc["k0"] = { r: Map() }
+      return cc
+    }
+    function outer() {
+      const wv: GW = { g: mkcall() }
+      print(7)
+    }
+    outer()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 646: type mismatch:
+    //   expected (ref null $type), found (ref $type)
+    // SHOULD PRINT 7
+
+* **IT IS D624's NARROW WITNESS WITH ONE THING CHANGED — the map's VALUE type.** D624's `r` is
+  `{[string]: i32}` on both sides, so both ends resolve the SAME mv shape and the slot-equality
+  descent answers. Here the values are `Leaf` and `Leaf2`, themselves `sTwin` layout twins —
+  therefore one heap, therefore one vals wrapper, therefore two mv slots that emit BYTE-IDENTICAL
+  map structs. Slot equality cannot see past two slot indices, so `variantStructHeapTwinAt`
+  declines and the arm keeps a heap of its own. The probe names the site on the shipped seed:
+  `ask=19 nosi=1 … r19=18 ans=0`.
+* **THE FIX IS ALREADY MEASURED AND WAS DELIBERATELY NOT TAKEN.** Replacing the descent's slot
+  equality with `mvCanonRepOf(um) == mvCanonRepOf(sm)` makes this repro print `7`, and on the
+  distilled corpus it costs exactly nothing — the same 55 movers as D624, `runs` lost 0,
+  `→ silent` 0, and the self-compile fixpoint holds. **What stopped it is a hazard the corpus
+  cannot show**: `mvCanonRepOf` walks `repMapValSlotsTwin`, whose cross-table arm calls
+  `variantStructHeapTwinAt` (D623's leg), which would walk `mvCanonRepOf` again. On a mutually
+  recursive map-valued shape that is an unbounded descent, and a new compiler trap is on the veto
+  list. Two adversarial shapes were built (a self-recursive `{r: {[string]: A} \| null}`, and an
+  `A` / `B` mutual pair, each with a layout twin and a union) and BOTH are refused loudly by the
+  emitter before they reach the merge — on master too — so the loop is unwitnessed today. That is
+  precisely the standard `fieldCodeRefsElemHeap`'s header sets, that an unwitnessed widening of a
+  MERGE gate is the direction that cannot be graded, so D624 shipped the tight rung and this row
+  owns the wide one.
+* **WHAT THE NEXT PERSON NEEDS.** Either (a) a witness that actually REACHES the recursion, which
+  turns the hazard into something gradeable, or (b) a bound that keeps the answer a pure function
+  of (`vi`, `si`) — `structFieldCodesEq`'s coinductive pair stack is the shape, and the open
+  question is whether "assume merged on revisit" is safe for a HEAP merge the way it is for a
+  layout comparison. A plain re-entrancy guard is NOT an option: it makes the answer depend on
+  the call stack, so the mint and the pairwise finds disagree, which is the one thing this
+  layer's timing-independence forbids.
+* **ABLATED on the shipped seed, and the ingredients are D624's plus one indirection:** drop
+  `type Leaf2` (the INNER twin, both values `Leaf`) → runs, 7; drop `type Dot` (the outer twin)
+  → runs, 7; drop `type Shape` (the union) → runs, 7; make the field `r: {[string]: i32}` on both
+  sides → runs (that is D624, closed).
+* **NOT REACHED BY THE CORPUS.** After D624 the 7,021-cell distilled corpus grades 7 clause-1
+  cells and none is this shape (six are D592's named set, one is `b004880`), so this row scores
+  nothing on `goal-scoreboard.py` and closing it will not move `runs` there. It needs its own
+  probe, which is what the repro above is — the `--sites` blind spot the scoreboard's own header
+  warns about, in the soundness clause rather than the capability one.
+
 
 ### D625 — an empty `[]` returned at a NESTED array of STRUCTS: the element row is committed one dimension too shallow
 **check-clean invalid wasm · 5 cells · found 2026-08-30 in the same split · named by D613's close as its one holdout ("`b004880` has no capture — a different row") and filed here rather than left as a remark · TWO ingredients, and the nullable field is NOT one of them**
