@@ -151,13 +151,21 @@ closes is correct and defensible. Under this goal **they are all still open.**
 not a point on this scoreboard. The gate's floor (block on `runs → not-runs`) is unchanged; this
 is the number that is supposed to climb.
 
-**Clause 2 is greppable, so measure it rather than arguing about it.** 40 refusal sites in
-`compiler/*.vl` concede the program is type-valid in their own message — `has no lowering`,
-`not yet supported by codegen`, and one that reads `this program is type-valid but cannot
-build`. **29 of the 40 are in `typecheck.vl`**, which is the direction that hides: a capability
-gap moved into the checker stops looking like a gap, and the program compiles no better than
-before. Every `loud emit reject` is a clause-2 violation by construction, since `check`
-returned 0 to reach it.
+**`scripts/goal-scoreboard.py` is the measurement — do not hand-count this.** It reads the
+corpus baseline and prints `runs` plus both clauses' violations, instantly, without compiling.
+On 2026-08-30: **runs 3,704 / 7,021 (52.76%)**, clause 1 **92**, clause 2 **314** emit rejects
+and **45** check rejects that concede type-validity — **451 cells against the goal**. Pass
+`--sites` for the refusal sites in `compiler/*.vl` whose own message concedes the program is
+type-valid (`has no lowering`, `not yet supported by codegen`, one reading `this program is
+type-valid but cannot build`): **26**, of which **18 are in `typecheck.vl`**. That is the
+direction that hides — a capability gap moved into the checker stops looking like a gap, and
+the program compiles no better than before, so the script counts it the same as an emit-side
+one. A first hand-count of these said 40 by grepping lines rather than message sites; the
+script exists so the number is not re-derived by hand each time.
+
+**Every `loud emit reject` is a clause-2 violation by construction**, since `check` returned 0
+to reach the emitter: either the program is legal and should compile, or it is illegal and the
+CHECKER owed the diagnosis.
 
 **Read a gate by its exit code or its summary line, never by `tail -1`.** `lint-self.sh`
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a
