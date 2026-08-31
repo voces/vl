@@ -32,8 +32,16 @@ from cellmap import load_cells  # noqa: E402
 DEFAULT_BASELINE = os.path.join(HERE, "silent-sweep", "distilled", "baseline.jsonl")
 
 # Clause 1: `vl check` said yes and the program did not then run correctly.
+#
+# THESE ARE THE GRADER'S CLASS STRINGS, NOT PROSE. `gradecensus.py` writes the trap-after-load
+# class as `trap_loads`; this tuple spelled it `loads then traps` — the DOC vocabulary
+# `check-filed-witnesses.py` matches in a status line — so the entry had never matched a cell
+# and every trapping cell was invisible to clause 1. It went unnoticed because the corpus held
+# no such cell until D741's witness (`d741_w0_base`, check rc 0 then `wasm trap: cast failure`)
+# added the first two. `regress.py`'s own SILENT tuple has always said `trap_loads`; the two
+# instruments now agree, which is the property that was missing rather than the spelling.
 SILENT = ("check-clean invalid wasm", "check-clean silently wrong",
-          "check-clean wrong evaluation", "loads then traps", "compiler trap")
+          "check-clean wrong evaluation", "trap_loads", "compiler trap")
 
 # A refusal that CONCEDES the program is type-valid. These are the compiler naming its own
 # capability gaps: the type system permits the program and the backend cannot lower it.
