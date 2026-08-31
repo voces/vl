@@ -228,6 +228,8 @@ import {
   fnIndices,
   fnListCatKinds,
   fnListCatSlots,
+  fnListEqGKinds,
+  fnListEqGSlots,
   fnListEqRSlots,
   fnNames,
   fnParent,
@@ -404,6 +406,11 @@ import {
   elemNameIsNominal,
   ensureRefElemTy,
   eqCoreKindOfBin,
+  eqgElemClass,
+  eqgInnerKind,
+  eqgInnerSlot,
+  eqgListKindOfBin,
+  eqgListSlotOfBin,
   exprIsBareFnName,
   exprIsLitAtom,
   exprMap,
@@ -4715,6 +4722,67 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
   0
 }
 
+// Reserve the LEQG frame for compare rep `(kind, slot)` AND for every level below it —
+// the reservation twin of `emitListEqGCore`'s recursion, walked along the same one home
+// (`eqgElemClass` / `eqgInnerKind` / `eqgInnerSlot`).
+//
+// A NESTED COMPARE HAS TWO LIVE LOOPS AT ONCE, which is why this recurses where the concat
+// scan does not. `f64[][] == f64[][]` runs the outer ref-list loop and, inside it, the
+// inner `f64[]` loop; both counters are live simultaneously, so the inner level needs a
+// frame of its own. Reserving only the outer one is exactly the "a compare emitted against
+// locals the function never declared" failure `eqCoreKindOfBin`'s header names.
+//
+// THE OLD THREE CORES RESERVE THROUGH THEIR OWN FLAGS, not through this. A level whose rep
+// is the i32 list, the string list or an `i32[][]` ref list sets `fnUsesListEqI` /
+// `fnUsesListEqS` / `fnListEqRSlots` and stops — `emitListEqAnyRep` routes it to that core,
+// so a LEQG frame for it would be reserved and never written.
+function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
+  if depth > 32 { return 0 }
+  if kind == 0 {
+    fnUsesListEqI = true
+    return 0
+  }
+  if kind == 3 {
+    fnUsesListEqS = true
+    // The per-element string compares stage operands in the string-op frame.
+    fnUsesStrOp = true
+    return 0
+  }
+  if kind == 1 && slot >= 0 && slot < rlElemKindTbl.length {
+    if rlElemKindTbl[slot] == 4 {
+      // The `i32[][]` core, which recurses into the i32 one.
+      fnUsesListEqI = true
+      let ri = 0
+      let rseen = false
+      while ri < fnListEqRSlots.length {
+        if fnListEqRSlots[ri] == slot { rseen = true }
+        ri = ri + 1
+      }
+      if !rseen { fnListEqRSlots.push(slot) }
+      return 0
+    }
+  }
+  let seen = false
+  let i = 0
+  while i < fnListEqGKinds.length {
+    if fnListEqGKinds[i] == kind && fnListEqGSlots[i] == slot { seen = true }
+    i = i + 1
+  }
+  if !seen {
+    fnListEqGKinds.push(kind)
+    fnListEqGSlots.push(slot)
+  }
+  const cls = eqgElemClass(kind, slot)
+  // A STRING leaf rides the shared `__str_eq__` helper, which stages nothing itself — but
+  // an operand may still widen an atom into the string-op frame, the same reason
+  // `leqNoteBin`'s `k == 5` arm sets it.
+  if cls == 2 { fnUsesStrOp = true }
+  if cls == 3 {
+    return leqgNoteRep(eqgInnerKind(slot), eqgInnerSlot(slot), depth + 1)
+  }
+  0
+}
+
 // Note one BinExpr's list-op kind into the per-function frame flags. `listOpKindOfBin` decides
 // `+` (concat has no `eqCoreKindOfBin` answer); a `==`/`!=` it does not claim falls to the ONE
 // compare-core home, which is the same function `emitEqNonNullCore` reads — a core reserved here
@@ -4754,6 +4822,11 @@ function leqNoteBin(binIx: i32, fnIx: i32) {
       }
     }
   }
+  // A `==`/`!=` over a list rep with NO core of its own needs a 4-slot compare frame per
+  // LEVEL. `eqgListKindOfBin` is the same home `emitBinExprNode`'s dispatch reads, so a
+  // frame reserved here and a core emitted there are one decision.
+  const gk = eqgListKindOfBin(binIx, fnIx)
+  if gk >= 0 { leqgNoteRep(gk, eqgListSlotOfBin(binIx, fnIx), 0) }
   // A `+` over a NON-i32 list rep needs its own 4-slot concat frame. The i32 list is
   // excluded because it rides LEQI's `out` slot, which `k == 0` above already reserved —
   // reserving a second frame for it would move every later frame's base and change the

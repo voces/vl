@@ -1,6 +1,7 @@
 import {
   EqCmpKind,
   binPlusIsListByTy,
+  eqCoreKindOfTyToken,
   flattenVariantsInto,
   fsArgIsU8List,
   fsIntrinsicArity,
@@ -226,6 +227,8 @@ import {
   fl64TypeIdx,
   fnListCatKinds,
   fnListCatSlots,
+  fnListEqGKinds,
+  fnListEqGSlots,
   fnListEqRSlots,
   fnStmts,
   fnUsesAtomStage,
@@ -269,6 +272,7 @@ import {
   leqIScratchBase,
   leqRBases,
   leqSScratchBase,
+  leqgBases,
   liBack,
   liKinds,
   liSlots,
@@ -459,6 +463,13 @@ import {
   captureNamesOf,
   captureValKind,
   catListKindOfBin,
+  eqgElemClass,
+  eqgElemEqRow,
+  eqgElemHasEqRow,
+  eqgInnerKind,
+  eqgInnerSlot,
+  eqgListKindOfBin,
+  eqgListSlotOfBin,
   catListSlotOfBin,
   cbRetVariantIdx,
   cloArmTagOfTy,
@@ -8594,6 +8605,18 @@ function emitStrIdxGuardHoisted(row: i32) {
   0
 }
 
+// A FRESH element-VALUE slot of the lazy list frame — `(ref null $rlElemHeap[slot])` for
+// the "ref" kind. The non-deduping twin of `listIdxValSlot` below, for the same reason
+// `listBackStashSlot` does not dedupe: the struct-element compare needs TWO live slots of
+// one type at once (the left element and the right one), and a shared slot would compare a
+// value against itself.
+function listElemStashSlot(kind: MfKind, slot: i32) {
+  liKinds.push(kind)
+  liSlots.push(slot)
+  liBack.push(2)
+  listIdxScratchBase + liKinds.length
+}
+
 function listIdxValSlot(kind: MfKind, slot: i32) {
   let k = 0
   while k < liKinds.length {
@@ -9904,6 +9927,248 @@ function leqRBaseOfSlot(slot: i32) {
   -1
 }
 
+// The two locals a STRUCT-element compare parked its element pair in, or -1 outside one.
+// Read by `emitChainRead` through the root sentinels -2 / -3; see its header for why the
+// value rides here rather than as a parameter.
+let eqStashL = -1
+let eqStashR = -1
+
+// The `i32.ne`-class element opcode for a SCALAR-LEAF list rep — one byte, and the only
+// thing that differs between the four wide backings' element compares.
+//   0 i32 (and every rep that IS one: boolean, an interned atom, an i32-based literal
+//     union) · 4 f64 · 6 i64 · 7 f32 · 10 u8 (packed; `fbArrayGet` zero-extends the byte
+//     into an i32, so its comparison is the i32 one)
+function eqgNeOpcode(kind: i32) {
+  if kind == 4 {
+    return 98 // 0x62 f64.ne
+  }
+  if kind == 6 {
+    return 82 // 0x52 i64.ne
+  }
+  if kind == 7 {
+    return 92 // 0x5c f32.ne
+  }
+  71 // 0x47 i32.ne
+}
+
+// THE ONE ENTRY for a list `==` at rep (kind, slot), with both wrapper refs already ON THE
+// STACK (left below right); leaves the 0/1 answer. Routes to whichever core owns the rep —
+// the three that existed before this row keep every shape they claim, byte for byte, and
+// everything else is `emitListEqGCore`.
+//
+// IT IS A FUNCTION RATHER THAN AN ARM SO THE RECURSION HAS ONE PLACE TO GO. A nested
+// compare (`i32[][][]`, `f64[][]`) reaches its element's core from inside a loop, and the
+// element's rep may be one of the old three — `i32[][][]`'s element IS an `i32[][]`, whose
+// core is `emitListEqRCore`. Without a shared entry the new core would carry a second copy
+// of this dispatch and the two would drift.
+function emitListEqAnyRep(body: i32[], kind: i32, slot: i32, fnIx: i32) {
+  if kind == 0 { return emitListEqICore(body) }
+  if kind == 3 { return emitListEqSCore(body) }
+  if kind == 1 {
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      if rlElemKindTbl[slot] == 4 {
+        const rb = leqRBaseOfSlot(slot)
+        if rb < 0 {
+          return emitFail("emitProgram: ref-list compare frame not reserved")
+        }
+        return emitListEqRCore(body, slot, rb)
+      }
+    }
+  }
+  emitListEqGCore(body, kind, slot, fnIx)
+}
+
+// ONE ELEMENT READ at index `i` of the staged wrapper in frame slot `bA + which`, left on
+// the stack ready for its compare: `backing[i]`, plus the non-null recovery a REF element
+// needs. Split out because the two operands' reads must be INTERLEAVED with their
+// recoveries — a single trailing `ref.as_non_null` would recover the right operand twice
+// and leave the left one nullable, which the core's own slot type then rejects.
+function emitEqGElemRead(
+  bA: i32,
+  which: i32,
+  wrap: i32,
+  back: i32,
+  isRef: boolean,
+) {
+  fbLocalGet(bA + which)
+  fbStructGet(wrap, 0) // the backing
+  fbLocalGet(bA + 3)   // i
+  fbArrayGet(back)
+  if isRef {
+    fbRefAsNonNull() // 0xd4
+  }
+  0
+}
+
+// ONE ELEMENT PAIR of a STRUCT-element list, compared field-wise, leaving the 0/1
+// EQUALITY. Reads `backing[i]` for each side into a fresh lazy-frame slot, then runs the
+// ordinary struct compare with those slots as its two roots.
+//
+// THE ROW COMES OFF THE REF-LIST SLOT, which is the one place that knows what a slot's
+// elements ARE. `eqgElemClass` has already required that row to be field-flat, so every
+// arm `emitStructEqRec` can reach from here is two chain reads and one opcode — no frame
+// this function did not just mint.
+//
+// THE STASH GLOBALS ARE SAVED AND RESTORED rather than cleared, because a nested list of
+// structs (`Circle[][]`) reaches this from inside an OUTER `emitListEqGCore` whose own
+// element rung may be running; restoring is what keeps the two levels from reading each
+// other's element. (Today only one level can be a struct — the outer levels are lists —
+// but a rule that holds only by accident of the current accept set is the shape this file
+// keeps paying for.)
+function emitEqGStructElem(body: i32[], slot: i32, fnIx: i32) {
+  if !eqgElemHasEqRow(slot) {
+    return emitFail(
+      "emitProgram: struct-element compare with no interned shape",
+    )
+  }
+  const row = eqgElemEqRow(slot)
+  const sa = listElemStashSlot("ref", slot)
+  const sb = listElemStashSlot("ref", slot)
+  const bA = leqgBaseOfRep(1, slot)
+  const wrap = catWrapIdxOf(1, slot)
+  const back = catBackIdxOf(1, slot)
+  // A[i] → sa, B[i] → sb. Not `emitEqGElemRead`: these want the RAW nullable element, and
+  // the slot they land in is nullable too, so there is no recovery to make.
+  fbLocalGet(bA + 0)
+  fbStructGet(wrap, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(back)
+  fbLocalSet(sa)
+  fbLocalGet(bA + 1)
+  fbStructGet(wrap, 0)
+  fbLocalGet(bA + 3)
+  fbArrayGet(back)
+  fbLocalSet(sb)
+  const savedL = eqStashL
+  const savedR = eqStashR
+  eqStashL = sa
+  eqStashR = sb
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  const r = emitStructEqRec(body, -2, -3, row, pathSi, pathFi, fnIx)
+  eqStashL = savedL
+  eqStashR = savedR
+  r
+}
+
+// LIST `==` OVER EVERY OTHER LIST REP — the compare twin of `emitListConcatG`, and the
+// place the two operators stop being the same shape.
+//
+// **A CONCAT INSPECTS NO ELEMENT AND A COMPARE DOES**, so where `emitListConcatG` needs
+// only the (wrapper, backing) pair and moves storage with two `array.copy`s, this needs an
+// element loop and an answer to "compare two of THESE". `eqgElemClass` is that answer in
+// three cases — a scalar leaf (one opcode), a string leaf (the shared `__str_eq__`
+// helper), a nested list (recurse into its own core) — and every rep it declines keeps its
+// refusal rather than getting a guessed compare.
+//
+// THE LOOP IS `emitListEqICore`'s, INSTRUCTION FOR INSTRUCTION: length inequality is an
+// early 0, then an index loop that exits 0 at the first differing element and falls out to
+// 1. What is parameterised is the frame base, the two heap indices and the element rung.
+//
+// EACH LEVEL HAS ITS OWN FRAME, WHICH IS WHAT MAKES THE RECURSION SAFE. The frame is keyed
+// on (kind, slot) and a list is never its own element, so an outer level's `A`/`B`/`n`/`i`
+// cannot be an inner level's — the same disjointness `emitListEqRCore` gets from having a
+// frame per ref-list slot, generalised to every rep. `leqgNoteRep` reserves along the same
+// chain this recurses along, off the same one home (`eqgElemClass`).
+function emitListEqGCore(body: i32[], kind: i32, slot: i32, fnIx: i32) {
+  const bA = leqgBaseOfRep(kind, slot)
+  if bA < 0 {
+    // The scan and the emitter read ONE home (`eqgListKindOfBin` / `eqgElemClass`), so a
+    // missing frame is a desync rather than a program property — loud, never a write into
+    // a local the function never declared.
+    return emitFail(
+      "emitProgram: list compare frame was not reserved for this rep",
+    )
+  }
+  const cls = eqgElemClass(kind, slot)
+  if cls == 0 {
+    return emitFail(
+      "emitProgram: list compare over an element rep with no core",
+    )
+  }
+  const wrap = catWrapIdxOf(kind, slot)
+  const back = catBackIdxOf(kind, slot)
+  const isRef = cls != 1
+  fbLocalSet(bA + 1)   // B
+  fbLocalSet(bA + 0)   // A
+  fbBlock(127)         // block i32
+  fbLocalGet(bA + 0)
+  fbStructGet(wrap, 1) // lenA
+  fbLocalSet(bA + 2)   // n = lenA
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 1)
+  fbStructGet(wrap, 1) // lenB
+  fbI32Bin(71)         // 0x47 i32.ne
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1)
+  fbEnd()
+  fbI32Const(0)
+  fbLocalSet(bA + 3)   // i = 0
+  fbLoop(64)
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 2)
+  fbI32Bin(78)         // 0x4e i32.ge_s — i >= n → done
+  fbIf(64)
+  fbElse()
+  if cls != 4 {
+    if emitEqGElemRead(bA, 0, wrap, back, isRef) < 0 { return -1 }
+    if emitEqGElemRead(bA, 1, wrap, back, isRef) < 0 { return -1 }
+  }
+  if cls == 4 {
+    // A STRUCT element, compared FIELD-WISE off two stashed locals. The pair is parked
+    // rather than left on the stack because `emitStructEqRec` re-reads each root once per
+    // field; the slots are `(ref null <elem heap>)` and `struct.get` traps on null, which
+    // it can never see — `eqgElemClass` claims only the non-nullable struct element kind.
+    if emitEqGStructElem(body, slot, fnIx) < 0 { return -1 }
+    fbI32Eqz() // the compare leaves EQUALITY; the branch below tests MISMATCH
+  } else if cls == 1 {
+    // Two scalar leaves: one opcode, and it leaves the MISMATCH the branch below tests.
+    wU8(eqgNeOpcode(kind))
+  } else {
+    // A REF leaf — a string or an inner list — through its own core, which leaves
+    // EQUALITY; the branch below tests mismatch, so negate once.
+    if cls == 2 {
+      if emitStrEqCore(body) < 0 { return -1 }
+    } else {
+      if (
+        emitListEqAnyRep(body, eqgInnerKind(slot), eqgInnerSlot(slot), fnIx) <
+        0
+      ) {
+        return -1
+      }
+    }
+    fbI32Eqz() // 0x45
+  }
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(3)       // mismatch → 0, exit the block
+  fbEnd()
+  fbLocalGet(bA + 3)
+  fbI32Const(1)
+  fbI32Bin(106) // i + 1
+  fbLocalSet(bA + 3)
+  fbBr(1)       // back to the loop header
+  fbEnd()       // end (ge_s if/else)
+  fbEnd()       // end (loop)
+  fbI32Const(1)
+  fbEnd()       // end (block)
+  0
+}
+
+// The reserved LEQG frame base for compare rep `(kind, slot)`, or -1. The lookup twin of
+// `lcatBaseOfRep`, over the pair the reservation scan pushed.
+function leqgBaseOfRep(kind: i32, slot: i32) {
+  let i = 0
+  while i < fnListEqGKinds.length {
+    if fnListEqGKinds[i] == kind && fnListEqGSlots[i] == slot {
+      return leqgBases[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
 // i32-list CONCAT `a + b`: a NEW list sized exactly lenA + lenB (one backing
 // allocation, two bulk `array.copy`s) — the host's §VL.4 lowering. The operands
 // are evaluated once into the LEQI frame; the result wrapper is left on the stack.
@@ -10052,6 +10317,15 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
 // Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
 // expression, then one `struct.get` per (row, field) pair in the path arrays.
 // Every step is a pure re-read (the equality compare re-walks chains per field).
+//
+// TWO ROOT INDICES ARE NOT EXPRESSIONS, AND THAT IS WHAT LETS A STRUCT COMPARE RUN INSIDE
+// A LIST LOOP. `emitStructEqRec`'s whole contract is that both operands are pure RE-READS,
+// because every field compare re-walks the chain from its root — and an element of a list
+// has no expression to re-walk; it is `backing[i]`, whose `i` moves. `EQ_ROOT_STASH_L`
+// (-2) and `EQ_ROOT_STASH_R` (-3) name the two locals `emitListEqGCore` parked the element
+// pair in, so a re-read is a `local.get` and the recursion above is UNCHANGED — the
+// alternative was threading two extra parameters through four functions and about a dozen
+// call sites for a value that is constant across the whole subtree.
 function emitChainRead(
   body: i32[],
   rootIx: i32,
@@ -10059,6 +10333,22 @@ function emitChainRead(
   pathFi: i32[],
   fnIx: i32,
 ) {
+  if rootIx == -2 || rootIx == -3 {
+    let stash = eqStashL
+    if rootIx == -3 { stash = eqStashR }
+    if stash < 0 {
+      return emitFail(
+        "emitProgram: struct-element compare with no stashed root",
+      )
+    }
+    fbLocalGet(stash)
+    let sk = 0
+    while sk < pathSi.length {
+      fbStructGet(eqRowHeapIdx(pathSi[sk]), pathFi[sk])
+      sk = sk + 1
+    }
+    return 0
+  }
   if emitExpr(body, rootIx, fnIx) < 0 { return -1 }
   let k = 0
   while k < pathSi.length {
@@ -10116,6 +10406,14 @@ function emitEqNonNullCore(body: i32[], binIx: i32, fnIx: i32) {
     }
     if coreK == 5 { return emitStrEqCore(body) }
     if coreK == 6 { return emitCloEqCore(body) }
+    if coreK == 7 {
+      return emitListEqAnyRep(
+        body,
+        eqgListKindOfBin(binIx, fnIx),
+        eqgListSlotOfBin(binIx, fnIx),
+        fnIx,
+      )
+    }
     return emitFail(
       "emitProgram: `" +
         e.binOp +
@@ -10318,6 +10616,7 @@ function eqKindIsNulNiche(k: EqCmpKind) {
     k == "nullist" ||
     k == "nulstrlist" ||
     k == "nulreflist" ||
+    k == "nulglist" ||
     k == "nulstruct" ||
     k == "nulclosure"
 }
@@ -10375,6 +10674,56 @@ function binEqHasNoLowering(binIx: i32) {
     if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
     return nodeEqCmpKind(e.binLeft) == "none" ||
       nodeEqCmpKind(e.binRight) == "none"
+  }
+  false
+}
+
+// THE GENERIC LIST COMPARE'S FLOOR, and it is the one this row could not ship without.
+// TRUE when the CHECKER accepted the program on the generic core (`eqCmpKindOfTy` answered
+// `glist`/`nulglist`, i.e. core 7) and the EMITTER cannot name the rep — a ref-list slot
+// that does not resolve, two operands at different slots, or an element the rep tables
+// classify differently from the way the arena does.
+//
+// **WITHOUT IT THE FALL-THROUGH IS THE i32 TAIL, AND THAT IS A MEASURED CELL RATHER THAN A
+// WORRY.** `d421c002` — `Circle[] == Circle[]` with `type Shape = Circle | Sq` declared —
+// was `i32.eq` over two `(ref $type)`, `vl check` rc 0 and a module the engine refuses, in
+// the first build of D752's rung. The two ladders disagreed (the arena says `TyObj`, the
+// rep tables say the element is a union VARIANT), which is the standing hazard of having
+// two; the answer is not to promise they never will but to make the disagreement LOUD.
+// Same shape and same reason as `binConcatRepUnresolved` one function down, which D721
+// added for the `+` side after the identical fall-through.
+function binEqGRepUnresolved(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp != "==" && e.binOp != "!=" { return false }
+    if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
+    if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
+    // THE TYPES SAY "TWO LISTS" AND THE REP SIDE CANNOT NAME THEIR PAIR — the conjunction,
+    // exactly as `binConcatRepUnresolved` takes it, and for the reason that function's own
+    // header gives: `eqgListKindOfBin` answering -1 is not by itself evidence of a list
+    // (`1 == 2` answers -1 too), so dropping either half makes this floor either silent or
+    // a false reject.
+    //
+    // IT READS THE BANKED TYPES, NOT `nodeEqCmpKind`, AND THAT IS D42's LESSON ONE MORE
+    // TIME. The first cut of this floor fired on "the checker's token names core 7", which
+    // is exact for the direct spelling and BLIND inside a monomorphized instance: the
+    // operand nodes are shared with the generic template, so the banked type is `T[]` and
+    // `eqCmpKindOfTy` answers "" for it. `d421c002` through `eqL<T>` was check-clean invalid
+    // wasm with that version of the floor IN PLACE — the ablation table's own row. A `T[]`
+    // is still a `TyArray`, so the shape question answers for the instance where the token
+    // question cannot.
+    if !binPlusIsListByTy(nodeTyIxOf(e.binLeft), nodeTyIxOf(e.binRight)) {
+      const tl = eqCoreKindOfTyToken(nodeEqCmpKind(e.binLeft))
+      const tr = eqCoreKindOfTyToken(nodeEqCmpKind(e.binRight))
+      if tl != 7 && tr != 7 { return false }
+    }
+    // Any core that DOES claim the pair, in either home.
+    if listOpKindOfBin(binIx, fnIx) >= 0 { return false }
+    if eqgListKindOfBin(binIx, fnIx) >= 0 { return false }
+    // A nullable niche runs the rep's own core under a guard, so a niche the guard claims
+    // is a compare that already has one.
+    if binEqNulNiche(binIx, fnIx) != "" { return false }
+    return true
   }
   false
 }
@@ -19756,6 +20105,13 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           "` over this operand rep has no lowering",
       )
     }
+    if binEqGRepUnresolved(exprIx, fnIx) {
+      return emitFail(
+        "emitProgram: the two operands of this list `" +
+          e.binOp +
+          "` do not resolve to one comparable list rep",
+      )
+    }
     const nulNiche = binEqNulNiche(exprIx, fnIx)
     if nulNiche != "" {
       if emitNulNicheEq(body, exprIx, fnIx, nulNiche) < 0 { return -1 }
@@ -19799,6 +20155,25 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
         catK,
         catListSlotOfBin(exprIx, fnIx),
       )
+    }
+  }
+  // THE GENERIC LIST COMPARE — every list rep with no core of its own, above the
+  // `listOpKindOfBin` branch because its own home already declines every shape that branch
+  // claims, and below the `+` concat arm because the two operators never overlap.
+  if e.binOp == "==" || e.binOp == "!=" {
+    const gK = eqgListKindOfBin(exprIx, fnIx)
+    if gK >= 0 {
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
+      if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+      if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+      if emitListEqAnyRep(body, gK, eqgListSlotOfBin(exprIx, fnIx), fnIx) < 0 {
+        return -1
+      }
+      if e.binOp == "!=" {
+        fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
+      }
+      return 0
     }
   }
   const lopK = listOpKindOfBin(exprIx, fnIx)

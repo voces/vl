@@ -395,6 +395,8 @@ export type EqCmpKind = ""
   | "list"
   | "strlist"
   | "reflist"
+  | "glist"
+  | "nulglist"
   | "nulstr"
   | "nulclosure"
   | "nulstruct"
@@ -15239,6 +15241,59 @@ function tyUnionIsOneLitCell(ty: i32) {
 // elements) and `emitListEqRCore` (a ref list of i32/boolean lists) — so this is a CLOSED
 // list and every other element rep is "none". A HOLE element (`-1`, an un-pinned `[]`) takes
 // the i32 core, which is what `exprArray` classifies an empty literal as.
+// A STRUCT ELEMENT the list-compare core can run field-wise WITHOUT reserving a frame:
+// every field is a NATIVE compare — `i32`/`boolean`, `f64`, or a nested struct of the same
+// — recursively.
+//
+// **THIS IS THE CHECKER'S MIRROR OF `eqgStructElemFlat`, AND THE TWO ARE TWO LADDERS OVER
+// ONE QUESTION.** That is the standing hazard on this surface and it is not resolvable by
+// sharing a call: this side reads the arena and the emitter side reads the struct TABLE's
+// field CODES, and only the latter knows which frame an arm stages into. What makes it
+// safe is the DIRECTION of any disagreement — this one is deliberately the TIGHTER of the
+// two (no string field, no `i32[]` field, no i32-sentinel niche, all of which the emitter
+// would in fact compare correctly), so a shape the ladders disagree about is a refusal and
+// never a module the engine rejects. The grid over 21 receivers is what keeps them
+// measured rather than asserted.
+//
+// A STRING or `i32[]` FIELD IS THE PRICE, AND IT IS FILED. `{ name: string }[] == …` stays
+// a loud refusal: the field compares are written and correct, but they stage operands in
+// the string-op frame, which the reservation scan only reaches through `exprIsStructEq` —
+// false here, because this `==`'s operands are LISTS. (`silent-class-inventory` D752.)
+function eqStructElemFlatTy(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth > 8 { return false }
+  const t = T.tys[ty]
+  if t is TyObj {
+    const ftys = t.objFieldTypes
+    // A FIELDLESS struct is not admitted. Its compare is a constant 1, which is correct —
+    // but "no fields" is also what an unresolved shape looks like from here, and the two
+    // are not worth being unable to tell apart for a type nobody writes.
+    if ftys.length == 0 { return false }
+    let i = 0
+    let ok = true
+    while i < ftys.length {
+      if !eqStructFieldFlatTy(ftys[i], depth + 1) { ok = false }
+      i = i + 1
+    }
+    return ok
+  }
+  false
+}
+
+// One field of the above: a native scalar, or a nested struct that is itself flat.
+function eqStructFieldFlatTy(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    if t.primName == "i32" { return true }
+    if t.primName == "boolean" { return true }
+    if t.primName == "f64" { return true }
+    return false
+  }
+  if t is TyObj { return eqStructElemFlatTy(ty, depth) }
+  false
+}
+
 function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   if elem < 0 { return "list" }
   const e = T.tys[elem]
@@ -15248,6 +15303,17 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
     if e.primName == "i32" { return "list" }
     if e.primName == "boolean" { return "list" }
     if e.primName == "string" { return "strlist" }
+    // THE WIDE-SCALAR BACKINGS, AND THE REASON THEY WERE "none" WAS NEVER A TYPE FACT.
+    // `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of one scalar each, exactly
+    // as `i32[]` is; what they lacked was a core, because `emitListEqICore` is hard-wired
+    // to `$lTypeIdx`/`$aTypeIdx` and reads its element with `i32.ne`. `emitListEqGCore`
+    // takes the wrapper, the backing and the compare opcode as arguments, so the element
+    // axis stops deciding whether a list may be compared and decides only WITH WHAT.
+    // (`silent-class-inventory` D751; the `+` side lost the same accidental rule in D721.)
+    if e.primName == "f64" { return "glist" }
+    if e.primName == "i64" { return "glist" }
+    if e.primName == "f32" { return "glist" }
+    if e.primName == "u8" { return "glist" }
     return "none"
   }
   if e is TyArray {
@@ -15285,6 +15351,20 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
     if i2 is TyNullable {
       if tyIsI32SentinelNullable(ie) { return "reflist" }
     }
+    // EVERY OTHER NESTED LIST, BY RECURSION — and the recursion is the point. The five
+    // arms above are the shapes `emitListEqRCore` happens to cover: a ref list whose
+    // element is an i32 LIST. Everything else nested (`f64[][]`, `i64[][]`, `string[][]`,
+    // `F[][]`, `i32[][][]`) was "none" for no reason but that, and the question they were
+    // refused on is the SAME question one hop down — "is a list of `ie` comparable" — which
+    // is what this function answers. `emitListEqGCore` recurses along exactly this chain.
+    //
+    // ASKED OF `ie`, NOT OF `e`. `e` here IS the element `ie[]`, so what decides whether a
+    // list OF `e` can be compared is whether `e` itself can be, and `e` is a list of `ie`.
+    // Getting that argument wrong is an off-by-one-level that answers about the wrong type
+    // and reads as a plausible rule.
+    const inner = eqCmpKindOfArrayElem(ie)
+    if inner == "" { return "" }
+    if inner != "none" { return "glist" }
     return "none"
   }
   // AN I32-SENTINEL NULLABLE ELEMENT RIDES THE SAME i32 LIST its base does, and this arm is
@@ -15299,6 +15379,15 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   // The BOX- and ref-niche nullables stay "none": `(i32 | null)[]` and `(f64 | null)[]` are
   // BOX lists and `(string | null)[]` is the string wrapper — `tyScalarBackedListKind` claims
   // exactly boolean and string in its nullable arm, and this claims exactly its `"list"` half.
+  // A STRUCT ELEMENT, field-wise — the flat subset, for the reason `eqStructElemFlatTy`
+  // gives. `isEquatable` has already had its say about SOUNDNESS (a struct defaults to
+  // field-by-field equality and it refuses one whose components are not value-comparable);
+  // this is the LOWERING half, and until D752 it answered "none" for every struct because
+  // the three cores had no struct arm. (D752.)
+  if e is TyObj {
+    if eqStructElemFlatTy(elem, 0) { return "glist" }
+    return "none"
+  }
   if e is TyNullable {
     if tyIsI32SentinelNullable(elem) { return "list" }
     return "none"
@@ -15322,6 +15411,13 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
     if tyLitUnionIsI32Backed(elem) { return "list" }
     // The EXPANDED `("a" | "b" | null)[]` spelling of the sentinel niche. (D101.)
     if tyIsI32SentinelNullable(elem) { return "list" }
+    // A NUMERIC literal union on a WIDE base reps as that base's list, and now has that
+    // base's core. `type F = 1.5 | 2.5` is one f64 cell per element and `F[]` is the f64
+    // list, which is why the arm above admits only the `i32` base: the other two rode a
+    // wrapper with no compare. That is the half of D45's second sentence this closes, and
+    // the honest half of it stays — a MIXED-base union (`"a" | 1`) is a value-union BOX,
+    // not one cell, and `numLitUnionHasBase` answers "" for it. (D751.)
+    if numLitUnionHasBase(elem) { return "glist" }
     return "none"
   }
   "none"
@@ -15352,6 +15448,13 @@ function eqCmpKindOfNulInner(inner: i32): EqCmpKind {
     if ak == "list" { return "nullist" }
     if ak == "strlist" { return "nulstrlist" }
     if ak == "reflist" { return "nulreflist" }
+    // The GENERIC list core under the same null guard. It has to be named here rather
+    // than fall through as `"glist"`: `eqKindIsNulNiche` reads this token to decide
+    // whether the compare gets a guard AT ALL, and a nullable operand reaching the plain
+    // path recovers itself with `ref.as_non_null` — a TRAP on the very null the compare
+    // is supposed to answer for. The non-null rep and its niche share one core by
+    // construction, which is exactly `emitNulNicheEq`'s contract.
+    if ak == "glist" { return "nulglist" }
     return ak
   }
   ""
@@ -15376,9 +15479,49 @@ export function eqCoreKindOfTyToken(k: EqCmpKind) {
   if k == "list" || k == "nullist" { return 0 }
   if k == "strlist" || k == "nulstrlist" { return 3 }
   if k == "reflist" || k == "nulreflist" { return 4 }
+  if k == "glist" || k == "nulglist" { return 7 }
   if k == "str" || k == "nulstr" { return 5 }
   if k == "closure" || k == "nulclosure" { return 6 }
   -1
+}
+
+// ── IS THIS `==` REFUSAL A MAP, i.e. A DOMAIN RULE RATHER THAN A MISSING LOWERING ──────
+// TRUE when the reason `eqCmpKindOfTy` answered "none" is a MAP — the type IS one, is a
+// nullable/`| null`-union over one, or is a list whose element chain bottoms out at one.
+//
+// **THE LANGUAGE ALREADY ANSWERED THIS, IN THE OTHER POSITION, AND THE TWO POSITIONS
+// DISAGREED.** `{[string]: i32}[] == …` printed the SOUNDNESS sentence — `isn't equatable
+// (a field is not value-comparable)` — because `isEquatable` recurses into an array's
+// element and refuses a map there. The BARE spelling `m1 == m2` printed only
+// `` `==` over {[string]: i32} has no lowering ``, because `eqRefusals`' soundness gate
+// fires on a `TyObj`/`TyArray` operand and a map is neither. One program said "the design
+// forbids this" and its one-constructor neighbour said "the backend has not caught up"
+// about the same value. Exactly one of those can be true.
+//
+// IT IS THE FIRST, AND THE REASON IS THE REP RATHER THAN THE EFFORT. A VL map is an
+// insertion-ORDERED open-addressing table that keeps tombstones (`count` vs `size`), and
+// the order is OBSERVABLE — `for k in m` yields insertion order, and `m.keys()` returns it.
+// So a structural `==` has to CHOOSE: order-sensitive, and two maps built from the same
+// pairs in different orders are unequal; or set-like, and `==` disagrees with the iteration
+// a caller can see for themselves. Neither is a lowering question, both are permanent once
+// programs depend on printed behaviour, and the second is the same "what does it MEAN"
+// class of question D711 ruled for `print` of a container. A compare core would be easy to
+// write; deciding what it should answer is what has never been done.
+//
+// (`silent-class-inventory` D754. The five questions a re-opening has to answer first are
+// in the row, in the order D711's are.)
+function tyEqNoneIsMap(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth > 8 { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return true }
+  if t is TyNullable { return tyEqNoneIsMap(t.nInner, depth + 1) }
+  if t is TyArray { return tyEqNoneIsMap(t.aElem, depth + 1) }
+  if t is TyUnion {
+    const inner = unionSoleNonNullMember(ty)
+    if inner >= 0 { return tyEqNoneIsMap(inner, depth + 1) }
+  }
+  false
 }
 
 // ── THE ONE HOME for "may these two operands be `==`/`!=`, and if not, what do we say" ──
@@ -15412,6 +15555,10 @@ export function eqRefusals(
   msgs: string[],
   unsup: i32[],
 ) {
+  // How many sentences the SOUNDNESS gate produced, so the capability gate below can tell
+  // whether a map operand has already been spoken for. Two sentences about one design rule
+  // read as two separate problems.
+  const msgsBefore = msgs.length
   if structural && lt >= 0 {
     const lT = T.tys[lt]
     let isStruct = false
@@ -15457,8 +15604,21 @@ export function eqRefusals(
     if eqLk == "none" || eqRk == "none" {
       let eqBad = lt
       if eqLk != "none" { eqBad = rt }
-      msgs.push("`" + op + "` over " + tyToStr(eqBad) + " has no lowering")
-      unsup.push(1)
+      if tyEqNoneIsMap(eqBad, 0) {
+        // A MAP: the DOMAIN rule, off the `unsupported-lowering` channel (`unsup` 0), and
+        // said ONCE — the soundness gate above already says it for the container spelling,
+        // and this is the bare one it could not reach.
+        if msgs.length == msgsBefore {
+          msgs.push(
+            tyToStr(eqBad) +
+              " isn't equatable — a map has no defined value equality: its entries are insertion-ORDERED and observable that way (`for k in m`, `m.keys()`), so `==` would have to pick between order-sensitive and set-like and neither is what both callers mean — compare `m.size`, or the values at the keys you name",
+          )
+          unsup.push(0)
+        }
+      } else {
+        msgs.push("`" + op + "` over " + tyToStr(eqBad) + " has no lowering")
+        unsup.push(1)
+      }
     } else {
       // THE PAIR, NOT EACH OPERAND — and until D45 nothing had to ask, which is why the gate
       // above reads one side at a time. Both operands answering a token is not the same as
