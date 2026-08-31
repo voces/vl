@@ -1,6 +1,6 @@
 import {
   EqCmpKind,
-  concatRefusal,
+  binPlusIsListByTy,
   flattenVariantsInto,
   fsArgIsU8List,
   fsIntrinsicArity,
@@ -224,6 +224,8 @@ import {
   fa64Used,
   fl32TypeIdx,
   fl64TypeIdx,
+  fnListCatKinds,
+  fnListCatSlots,
   fnListEqRSlots,
   fnStmts,
   fnUsesAtomStage,
@@ -263,6 +265,7 @@ import {
   il64TypeIdx,
   lTypeIdx,
   lUsed,
+  lcatBases,
   leqIScratchBase,
   leqRBases,
   leqSScratchBase,
@@ -341,6 +344,8 @@ import {
   variantReboxSlot,
 } from "./emit_state"
 import {
+  catBackIdxOf,
+  catWrapIdxOf,
   emitFail,
   emitFailAt,
   fbArrayCopy,
@@ -453,6 +458,8 @@ import {
   capturedIsUnionBox,
   captureNamesOf,
   captureValKind,
+  catListKindOfBin,
+  catListSlotOfBin,
   cbRetVariantIdx,
   cloArmTagOfTy,
   cloCallParamLitUnion,
@@ -9951,6 +9958,97 @@ function emitListConcatI(body: i32[], leftIx: i32, rightIx: i32, fnIx: i32) {
   0
 }
 
+// LIST CONCAT over EVERY OTHER LIST REP — the rep-parameterised twin of
+// `emitListConcatI` one function up, and byte-for-byte the same shape: one backing
+// allocation sized `lenA + lenB`, two bulk `array.copy`s, one result wrapper. What it
+// takes as arguments is the pair of heap-type indices the i32 version hard-wires.
+//
+// WHY IT IS A SECOND FUNCTION RATHER THAN A PARAMETER ON THE FIRST. The i32 list stages
+// its operands in the LEQI frame (slots 0/1, out at 2, n at 3) and every other rep in its
+// own LCAT frame (0/1, out 2, n 3) — the same offsets, a different base and different
+// slot TYPES. Threading a base through `emitListConcatI` would have changed the bytes of
+// every program that concatenates an `i32[]` today for no behaviour, and byte-identity
+// over the corpus is the instrument that proves this change touched only the new reps.
+//
+// A CONCAT INSPECTS NO ELEMENT, which is the whole reason one lowering covers every rep
+// the compare side needs a separate core for: `array.copy` moves storage. That is also
+// why the frame has no `i` — there is no element loop to index.
+function emitListConcatG(
+  body: i32[],
+  leftIx: i32,
+  rightIx: i32,
+  fnIx: i32,
+  kind: i32,
+  slot: i32,
+) {
+  const bA = lcatBaseOfRep(kind, slot)
+  if bA < 0 {
+    // The scan and the emitter read ONE home (`catListKindOfBin`), so a missing frame is
+    // a desync rather than a program property — loud, never a write into a local the
+    // function never declared.
+    return emitFail(
+      "emitProgram: list concat frame was not reserved for this rep",
+    )
+  }
+  const wrap = catWrapIdxOf(kind, slot)
+  const back = catBackIdxOf(kind, slot)
+  if emitExpr(body, leftIx, fnIx) < 0 { return -1 }
+  // A NARROWED nullable operand's cell still holds a `(ref null …)` while the frame slot
+  // is non-null — the same recovery the compare cores make, off the same one home.
+  if emitEqRecoverNarrowed(leftIx, fnIx) < 0 { return -1 }
+  fbLocalSet(bA + 0)   // A
+  if emitExpr(body, rightIx, fnIx) < 0 { return -1 }
+  if emitEqRecoverNarrowed(rightIx, fnIx) < 0 { return -1 }
+  fbLocalSet(bA + 1)   // B
+  fbLocalGet(bA + 0)
+  fbStructGet(wrap, 1) // lenA
+  fbLocalGet(bA + 1)
+  fbStructGet(wrap, 1) // lenB
+  fbI32Bin(106)        // i32.add
+  fbLocalSet(bA + 3)   // n = lenA + lenB
+  fbLocalGet(bA + 3)
+  fbArrayNewDefault(back)
+  fbLocalSet(bA + 2)   // out backing
+  // array.copy out 0 backingA 0 lenA
+  fbLocalGet(bA + 2)
+  fbI32Const(0)
+  fbLocalGet(bA + 0)
+  fbStructGet(wrap, 0)
+  fbI32Const(0)
+  fbLocalGet(bA + 0)
+  fbStructGet(wrap, 1)
+  fbArrayCopy(back, back)
+  // array.copy out lenA backingB 0 lenB
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 0)
+  fbStructGet(wrap, 1)
+  fbLocalGet(bA + 1)
+  fbStructGet(wrap, 0)
+  fbI32Const(0)
+  fbLocalGet(bA + 1)
+  fbStructGet(wrap, 1)
+  fbArrayCopy(back, back)
+  // the result wrapper { out, n, n }
+  fbLocalGet(bA + 2)
+  fbLocalGet(bA + 3)
+  fbLocalGet(bA + 3)
+  fbStructNew(wrap)
+  0
+}
+
+// The reserved LCAT frame base for concat rep `(kind, slot)`, or -1. The lookup twin of
+// `leqRBaseOfSlot`, over the pair the reservation scan pushed.
+function lcatBaseOfRep(kind: i32, slot: i32) {
+  let i = 0
+  while i < fnListCatKinds.length {
+    if fnListCatKinds[i] == kind && fnListCatSlots[i] == slot {
+      return lcatBases[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
 // Re-evaluate the field ACCESS CHAIN `root.f1.f2…` onto `body`: the root
 // expression, then one `struct.get` per (row, field) pair in the path arrays.
 // Every step is a pure re-read (the equality compare re-walks chains per field).
@@ -10281,22 +10379,31 @@ function binEqHasNoLowering(binIx: i32) {
   false
 }
 
-// The `+` twin of `binEqHasNoLowering`: TRUE when a LIST concat's element rep has no concat
-// core. The checker rejects these off the same one home (`concatRefusal`), so this is the
-// FLOOR — unreachable from accepted source, and the difference between a loud `emitProgram:`
-// failure and the numeric tail emitting `i32.add` over two refs, which is what every element
-// rep `listOpKindOfBin` does not claim used to do. (`silent-class-inventory` D44.)
+// The `+` twin of `binEqHasNoLowering`, and after D721 it is the ONLY refusal a list concat
+// has left: TRUE when the checker's banked types say this `+` is a list concat and the
+// emitter cannot resolve the pair to ONE (wrapper, backing) rep.
 //
-// READ OFF THE CHECKER'S BANKED TYPES, and it is right that the type-variable gate D42 needed
-// is absent here: a monomorphized `a + b` has been adjudicated at the CALL SITE by
-// `binOpDefinedFor`, which reads this same home under the SUBSTITUTED types. The floor exists
-// for a spelling that reached emit without passing either, not as a second pin.
-function binConcatHasNoLowering(binIx: i32) {
+// TWO WAYS THAT HAPPENS, and both are emitter facts the checker provably cannot see: the two
+// operands resolve to DIFFERENT ref-list slots (different backing heap types, and
+// `array.copy` between them is a validation error, not a coercion), or one of them
+// classifies as no list rep at all. Everything else now lowers — every list rep has a
+// `{backing, len, cap}` wrapper and `emitListConcatG` needs nothing else.
+//
+// WHY IT READS THE BANKED TYPES AND NOT ONLY THE CLASSIFIERS. `catListKindOfBin` answering
+// -1 is not by itself evidence of a list: `1 + 2` answers -1 too. The type side says "these
+// two are arrays" and the rep side says "and I cannot name their pair"; only the CONJUNCTION
+// is the failure, and dropping either half makes this floor either silent or a false reject.
+// Without the floor the numeric tail below emits `i32.add` over two refs — check-clean
+// INVALID WASM, which is the shape the old element gate was written to prevent and the
+// reason removing that gate needed a replacement rather than nothing.
+function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp != "+" { return false }
-    return concatRefusal("+", nodeTyIxOf(e.binLeft), nodeTyIxOf(e.binRight)) !=
-      ""
+    if !binPlusIsListByTy(nodeTyIxOf(e.binLeft), nodeTyIxOf(e.binRight)) {
+      return false
+    }
+    return catListKindOfBin(binIx, fnIx) < 0
   }
   false
 }
@@ -19610,8 +19717,10 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // string/list dispatch below for the reason its `==` twin is — every classifier there reads
   // an operand by a rep it may not have — and above the NUMERIC tail, which is what a list the
   // classifiers do not claim used to reach.
-  if binConcatHasNoLowering(exprIx) {
-    return emitFail("emitProgram: `+` over this operand rep has no lowering")
+  if binConcatRepUnresolved(exprIx, fnIx) {
+    return emitFail(
+      "emitProgram: the two operands of this list `+` do not resolve to one list rep",
+    )
   }
   // G6 string operators (a string is a `(array i32)` of code points): `+` is a NEW
   // concatenated array; `==`/`!=` are ELEMENT-WISE value-equality, NOT ref identity
@@ -19624,6 +19733,22 @@ function emitBinExprNode(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // List `==`/`!=` (length + element value-compare, recursive through nested
   // lists / string elements) and list `+` (concat) — collections-design
   // §VL.4/§VL.6, the host's `listEqFn`/concat lowerings, inlined.
+  // LIST `+` over a rep that is NOT the i32 list, above the compare dispatch because
+  // `listOpKindOfBin` claims a string list it has no concat for and would refuse one this
+  // does lower. The i32 list keeps its own arm below, unchanged and byte-identical.
+  if e.binOp == "+" {
+    const catK = catListKindOfBin(exprIx, fnIx)
+    if catK > 0 {
+      return emitListConcatG(
+        body,
+        e.binLeft,
+        e.binRight,
+        fnIx,
+        catK,
+        catListSlotOfBin(exprIx, fnIx),
+      )
+    }
+  }
   const lopK = listOpKindOfBin(exprIx, fnIx)
   if lopK >= 0 {
     if e.binOp == "+" {
