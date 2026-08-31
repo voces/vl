@@ -24980,7 +24980,7 @@ Repro (runs under `vl`, printing `0` — this half must keep running):
 
 ### D881 — [CLOSED 2026-08-31] the SECOND `??` family never MINTS, so D873's carrier supersede never runs for it
 
-**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close · D874's 2 cells (`distilled/named/d874_two_fams_two_rows`, `…_declfirst`) plus `d881_two_fams_read_both`, against D874's four one-ingredient-out controls · 2 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class**, corpus `cmp` **2,481 modules · 2,033 identical · 0 DIFFER · 0 LOST***
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close · D874's 2 cells (`distilled/named/d874_two_fams_two_rows`, `…_declfirst`) plus `d881_two_fams_read_both`, against D874's four one-ingredient-out controls · 2 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class**, corpus `cmp` **2,485 modules · 2,033 identical · 0 DIFFER · 0 LOST · 452 not buildable by the base***
 
 Repro (now runs, printing `0` then `s`):
 
@@ -25083,7 +25083,7 @@ Repro (now runs, printing `0`):
   a moved return row is invalid wasm, not a lost member. `d888_ret_param` is the parameter case
   and it is still OPEN.
 
-* **BYTE-INERT ON THE WHOLE CORPUS.** Corpus `cmp` against master: **2,481 modules · 2,033
+* **BYTE-INERT ON THE WHOLE CORPUS.** Corpus `cmp` against master: **2,485 modules · 2,033
   identical · 0 DIFFER · 0 LOST**, with the redirect at a resolver every literal in the language
   goes through. The gate is `anonLeafJoined[objIx] == 1`, and outside a `??` merge family no
   program has one.
