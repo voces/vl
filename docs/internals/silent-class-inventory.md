@@ -17949,7 +17949,7 @@ Repro (five lines; every one of them is load-bearing, see the ablation):
 
 
 ### D623 — the carrier D621 unmasked: an UN-ANNOTATED `Map()` reaching an annotated struct field, where the value type has a layout twin
-**check-clean invalid wasm · 130 cells · these are D621's measured PRICE, and the price was a FLOOR over this defect rather than a statement about the program: on master before #2027 all 130 were a loud emit reject, and deleting the one `!= null` line that reached D621's gate made all **130 of 130** produce the byte-identical validator sentence at the identical offset · re-verified cell by cell on 2026-08-30 after the merge**
+**[CLOSED 2026-08-30] the repro below RUNS and prints `7`. Was: check-clean invalid wasm · 130 cells, ALL 130 moved to `runs`, plus 4 more in block B · the fix is one rung on `mvValsElemStructRow`, the PAIRWISE restatement of `rlSig`'s heap signature, which mirrored only the first of that signature's two legs**
 
 Repro:
 
@@ -17968,11 +17968,12 @@ Repro:
       print(7)
     }
     outer()
-    // vl check rc 0; vl run:
+    // was: vl check rc 0; vl run:
     //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
-    // SHOULD PRINT 7
+    // now: prints 7
 
-* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured:
+* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured on
+  master before the close:
 
   | change | outcome |
   |---|---|
@@ -17988,17 +17989,66 @@ Repro:
   and the nullable field. The closure is not one, which separates this from D613 even though
   the two share a validator sentence (`expected (ref $type), found (ref $type)`) — **do not
   group them by that sentence.**
-* **WHY THERE IS A ROW AT ALL RATHER THAN A LINE IN D621.** D621's close moved these 130 from
-  `loud emit reject` to `check-clean invalid wasm`, which under the standing goal is a clause-1
-  violation where there was a clause-2 one. That trade was right — `runs` went 3,704 -> 3,732
-  and the total against the goal 451 -> 423 — but the 130 then had no owner, and a price
-  recorded in a named set is not a defect anybody is working. This row is the owner.
-* **THE TWIN + UNION + NULLABLE TRIO IS D280's, D612's AND D621's**, which is three closes on
-  one ingredient set and a reason to suspect the carrier is the last of it rather than the
-  next-to-last. Worth asking directly: is there a spelling where the carrier is annotated and
-  the trio still breaks?
-* All 130 are in the `d224-cost` named set, kept whole; `named/sources.json` records the price.
+* **WHAT CLOSED IT: `rlSig`'s heap branch is a LADDER and the pairwise restatement had only its
+  first rung.** `rlSig` keys a ref-list element on `"h:" + sHeapIdx[rlElemStructRow(row)]`, and
+  when that answers -1 — a registered union ARM, which `rlElemStructRow` refuses BY DESIGN
+  (D32's nominal floor) — on the concrete-VARIANT fall-through `rlElemVariantHeap`. Since
+  **D280** an arm whose layout a declared struct also claims takes THAT ROW's heap
+  (`uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`, `collectU`'s cross-table branch), so the two
+  legs can render the IDENTICAL signature and `rlTwin` already merges the rows onto ONE vals
+  wrapper. `mvValsElemStructRow` — the pairwise restatement rung W (D301) asks, which decides
+  whether two map-value slots emit ONE 7-field map struct — mirrored only the struct leg, so it
+  reported two wrappers where the mint had made one. It takes the same hop now, through
+  `variantStructHeapTwinAt` (a pure function of the arm) rather than `rlElemVariantHeap` (a
+  heap INDEX, which would be a timing dependence this layer forbids — `rlSig`'s own map-element
+  arm calls back into `repMapValSlotsTwin` while `rlTwin`/`rlWrapIdx` are being built).
+* **THE CANONICAL-KEY GATE IS WHY IT HAD TO BE HOISTED, AND THIS IS THE THIRD HOIST.** The
+  kind-1 TAIL of `repMapValSlotsTwin` already knows this answer — it calls `rlSlotsLayoutTwin`,
+  whose struct tail already takes the `variantStructHeapTwinAt` hop — but it sits BELOW
+  `mvValTwinCanonId`, and `Circle` and the `{r:null}` shape a `Map()` infers at its first key
+  write are two different `repCanonId`s. D300 hoisted slot EQUALITY above that gate, D301 the
+  struct-row leg; this is the arm leg, and it is the last one that signature has.
+* **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS** (`./node_modules/.bin/wasm-dis`, binaryen 130).
+  On master the rec group carries THREE map structs and two of them are field-for-field equal:
 
+      (type $15 (struct (field (mut (ref $13))) (field (mut (ref $11))) … ))
+      (type $16 (struct (field (mut (ref $13))) (field (mut (ref $11))) … ))   ;; identical
+      (type $1  (struct (field (mut (ref $15)))))          ;; GW's `g`
+      (type $17 (func (result (ref $16))))                 ;; mkcall
+      (func $1  (local.set $0 (struct.new $1 (call $0))))  ;; (ref $16) into a (ref $15) field
+
+  With the fix `$16` the map struct is gone, `mkcall` is `(func (result (ref $15)))`, `$1` and
+  the second `GW`-shaped row both carry `(ref $15)`, and the IDENTICAL `struct.new` is well
+  typed. 2,928 bytes against 2,949 — one 7-field map struct, and nothing else in the module
+  moves.
+* **PROBED AT THE MINT.** `mv0 nm=Circle rl=0 wrap=11 srow=-1 vrow=0 vhtwin=0` beside
+  `mv1 nm={r:null} rl=1 wrap=11 srow=0 vrow=-1` — the SAME vals wrapper on two ref-list rows,
+  and `srow=-1` is the entire refusal: `{r:null}` interned onto `Dot`'s row and `Circle`'s row
+  is the arm's. Read through `vhtwin` both sides answer struct row 0 and the pair merges.
+* **REACHED AND ANSWERING, corpus-wide.** A probe compiler counting the new leg over all 7,021
+  cells: it is consulted 676 times on **389** cells, every one of them with a real variant row,
+  and ANSWERS 544 times on **285** cells. All **134** movers are inside those 285; **0** are
+  outside. 104 cells reach it and get no answer — 81 of them decline at
+  `variantStructHeapTwinAt`'s map-field layout guard, which is **D624**'s site (see that row).
+* **THE TRADE, cell-matched on the distilled corpus:** 134 classes move, every one
+  `check-clean invalid wasm -> runs`. `runs` **3,752 -> 3,886** (53.44% -> 55.35%), clause 1
+  **196 -> 62**, total against the goal **403 -> 269**. **`runs -> not-runs`: 0. `-> silent`:
+  0.** No other transition of any kind, no new compiler trap, no corpus module lost. The
+  `d224-cost` named set — D224's refused 207-cell price, of which D621 paid 77 — is now **207
+  of 207 `runs`**, and `named/sources.json` records that the floor is fully paid off.
+* **ABLATION.** One rung, and it is one landing: the leg is `if sr >= 0 { return sr }` plus the
+  `variantStructHeapTwinAt` hop. Strip it and the seed is md5-identical to master's
+  (`ec559d8e9e12135eeafdc1600669c602`). Its ARM↔ARM reach (both sides through the new leg) is
+  measured at **0** on the whole corpus — kept, not deleted, because a zero on a derived
+  population is not evidence a rung is dead, and it is sound for the same reason the
+  arm↔struct case is: an arm's heap IS its cross-table struct row's heap.
+* **CORPUS BYTE-IDENTITY.** 3,948 corpus modules built with both seeds, 0 lost, 0 gained,
+  **3,804 byte-identical**. Of the 144 that differ, 134 are the movers and 10 were already
+  `runs` and still `runs` with the same output — one duplicate map struct fewer. **0** cells
+  changed class without changing bytes.
+* Pin: `tests/cases/soundness/unannotated-map-carrier-shares-the-arm-heap.vl` (its own file —
+  appended to `arm-and-its-layout-twin-share-one-heap.vl` the same source is a DIFFERENT
+  program, and becomes `bare null needs a struct-typed context`).
 
 ### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
 **check-clean invalid wasm · 55 cells, the largest silent family no agent holds · found 2026-08-30 by splitting the silent population by OWNERSHIP rather than by message and minimising what was left · SIX ingredients and every one of them is load-bearing**
@@ -18046,6 +18096,54 @@ Repro:
   one's is map-valued. There is a real chance D623's fix moves some or all of these 55, and
   the honest first step is to grade this witness against D623's merged seed rather than to
   re-derive a mechanism that may already be gone.
+* **RE-GRADED AGAINST D623's SEED (2026-08-30), AS THIS ROW ASKED — IT DOES NOT MOVE, AND THE
+  MECHANISM IS NOW MEASURED RATHER THAN GUESSED.** The repro above is check-clean invalid wasm
+  on D623's merged seed, unchanged. D623 was the right guess about the SITE and the wrong one
+  about the rung: its fix gives `mvValsElemStructRow` the arm leg of `rlSig`'s heap signature,
+  and on this witness that leg IS reached — a probe counting each decline site reads
+  `ask=1 reach=1 ans=0 || vht mapfield=4`. So the pairwise restatement now asks the merge; it
+  is **`variantStructHeapTwinAt` ITSELF that declines**, at its field-storage guard
+  (`cv == 19 || cv == 29`, a MAP-typed field), four times over. D280's own header flags that
+  guard as deliberately conservative — "a field whose emitted storage is a `(ref [null]
+  <heap>)` the CODE does not name … declines the merge outright rather than descending into
+  the referenced layer the way `variantFieldLayoutEq` does … widening it is a separate
+  measurement". **This row is that measurement.** Corpus-wide the same probe finds 104 cells
+  that reach the leg and get no answer, **81 of them declining at this map-field guard**.
+* **THE LIST AND THE SPACER ARE NOT INGREDIENTS — a strictly narrower witness, 14 lines, no
+  list, no `Box1`, and BOTH ENDS ANNOTATED:**
+
+      type Circle = { r: {[string]: i32} }
+      type Dot = { r: {[string]: i32} }
+      type Sq = { s: i32 }
+      type Shape = Circle | Sq
+      type GW = { g: {[string]: Circle} }
+      function mkcall(): {[string]: Dot} {
+        const cc: {[string]: Dot} = Map()
+        cc["k0"] = { r: Map() }
+        return cc
+      }
+      function outer() {
+        const wv: GW = { g: mkcall() }
+        print(7)
+      }
+      outer()
+      // vl check rc 0; vl run:
+      //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+      // SHOULD PRINT 7
+
+  **AND IT REFUTES ONE LINE OF THE TABLE ABOVE.** "Annotate the carrier and it runs" is not the
+  rule — annotating the carrier to the DESTINATION's name (`{[string]: Circle}`) runs, because
+  then both ends name one row and no cross-table question is asked at all; annotating it to the
+  TWIN's name (`{[string]: Dot}`, above) still fails. The axis is not annotated-vs-inferred, it
+  is **whether the two ends name the same declared row** — and when they do not, the merge is
+  the only thing that can join them. That answers D623's standing question ("is there a
+  spelling where the carrier IS annotated and the trio still breaks?") with a yes, and puts the
+  answer here rather than in a new row, because it is this row's guard that declines it.
+* **ABLATED ON THE NARROW WITNESS:** drop `type Dot` → runs; drop `type Shape` → runs; annotate
+  the carrier `{[string]: Circle}` → runs; field `r: i32[]` (a ref LIST rather than a map) →
+  **runs**, and the probe says why — `ans=2`, the guard's ref-list codes are not tripped in this
+  position. So the guard's MAP arm is the one that matters here, and widening it is not
+  the same question as widening the ref-list arms.
 * **DO NOT GROUP BY THE VALIDATOR SENTENCE.** 55 of the 66 unowned silent cells print
   `expected (ref null $type), found (ref $type)`, and that number is a MESSAGE count, not a
   mechanism count — D611 was filed at 58 on exactly that basis and had 3. The 55 here is also
@@ -18230,6 +18328,205 @@ Repro:
   D625's witness proves the signature was right there all along.
   The right outcome is `runs`: `sink` names `P[]`, nothing else consumes `cc`.
 
+### D622 — structural width subtyping: a value with MORE fields flowing into a shape with fewer
+**loud check reject, and the checker concedes type-validity in its own message — a clause-2
+violation at `typecheck.vl:16150` (`tErrUnsupported`) · ZERO corpus cells, so the corpus scores
+any fix at zero · probe `scripts/capability-probes/width-subtyping.vl` · found 2026-08-30 ·
+WasmGC-SHAPED and the prefix half is FREE, yet unreachable from the checker today because the
+emitted field ORDER is a function of DECLARATION ORDER — the executable refusal is below**
+
+Repro (`scripts/capability-probes/width-subtyping.vl`, verbatim):
+
+    type Wide = { a: i32, b: i32 }
+    type Narrow = { a: i32 }
+    function take(n: Narrow): i32 { return n.a }
+    const w: Wide = { a: 1, b: 2 }
+    print(take(w))
+    // vl check rc 1:
+    //   an object value of shape Wide flowing into Narrow drops the field `b`: type-valid
+    //   (structural width subtyping) but not yet supported by codegen — a struct's wasm type
+    //   is its own field list, so these are unrelated types and no field-dropping conversion
+    //   exists. Construct the value at Narrow (an object literal is built at the shape it
+    //   flows into), or declare the source with exactly Narrow's fields
+    // SHOULD PRINT 1.
+
+* **THE GAP IS THE WHOLE AXIS, not a corner — 33 programs, graded on `33db97de` (seed
+  `ee56abe3`).** Every position `assignable` can reach an object pair through is refused, and
+  the extra field's position, the two shapes' spellings and the dropped field's type change
+  nothing:
+
+  | axis | case | outcome |
+  |---|---|---|
+  | POSITION | call argument (the probe) | loud check reject |
+  | | `const n: Narrow = w` | loud check reject |
+  | | `return w` from a `Narrow`-returning function | loud check reject |
+  | | `n = w` assignment | loud check reject |
+  | | array element (`const xs: Narrow[] = [w]`) | loud check reject (`reached through Wide[] into Narrow[]`) |
+  | | map value | loud check reject (`reached through Wide into Narrow \| null`) |
+  | | object field (`{ n: w }` into `{n: Narrow}`) | loud check reject (`reached through {n: Wide} into Holder`) |
+  | | function VALUE slot (`const f: (Narrow) => i32`) | loud check reject |
+  | | callback parameter (the variance flip) | loud check reject (`reached through (Narrow) => i32 into (Wide) => i32`) |
+  | | through a generic `id<T>(x: T): T` | loud check reject |
+  | | **nested: `{n: Wide}` into `{n: Narrow}`, whole-object binding** | **check-clean INVALID WASM** |
+  | | **nested: the same pair through a parameter** | **check-clean INVALID WASM** |
+  | | **nested: the same pair as an array element** | **check-clean INVALID WASM** |
+  | EXTRA FIELD | extra LAST (`{a,b}` → `{a}`) | loud check reject |
+  | | extra FIRST (`{b,a}` → `{a}`) | loud check reject |
+  | | extra MIDDLE (`{a,x,c}` → `{a,c}`) | loud check reject |
+  | | two extra (`{a,b,c}` → `{a}`) | loud check reject |
+  | | same field SET, REORDERED (`{b,a}` → `{a,b}`) | **runs** — order alone is already fine |
+  | SPELLING | anonymous destination (`take(n: {a: i32})`) | loud check reject |
+  | | anonymous source | loud check reject |
+  | | both anonymous | loud check reject |
+  | | an object LITERAL with the excess field | loud check reject, but the OTHER message (a plain `tErr`, not a capability concession — see below) |
+  | FIELD TYPE | dropped field is `string` | loud check reject |
+  | | dropped field is a struct | loud check reject |
+  | | the SHARED field is a ref | loud check reject |
+  | CONTROL | exact match | runs |
+  | | two named layout twins (`A`/`B`, one field each) | runs |
+
+* **THE NESTED POSITION IS THE FAMILY'S SILENT HALF, AND IT IS DOCUMENTED RATHER THAN
+  ACCIDENTAL.** `objShapeAdapterless`'s TyObj arm returns FALSE on `objFieldNameSetsEq` without
+  recursing into the field TYPES, and its own header states the reason: a shape difference under
+  agreeing field names "is broken for a PINNED source and CORRECT for an un-annotated binding of
+  an object literal … rejecting them would reject working programs. They remain a `vl check`-clean
+  emit hole." So `{n: Wide}` into `{n: Narrow}` passes `check` and emits
+  `type mismatch: expected (ref null $type), found (ref $type)`, in all three positions above.
+  Any fix for the outer pair must reach this one too or the family keeps a silent half. The
+  witness, in full so it can be re-run rather than retyped:
+
+      type Wide = { a: i32, b: i32 }
+      type Narrow = { a: i32 }
+      type WHold = { n: Wide }
+      type NHold = { n: Narrow }
+      function take(h: NHold): i32 { return h.n.a }
+      const wh: WHold = { n: { a: 1, b: 2 } }
+      print(take(wh))
+      // vl check rc 0; vl run:
+      //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+      // SHOULD PRINT 1.
+
+  Replace the call with `const nh: NHold = wh; print(nh.n.a)` and it is
+  `expected (ref null $type), found (ref $type)`; put `wh` into an `NHold[]` and it is the same
+  again. Three positions, one hole.
+
+* **THE MESSAGE'S OWN REMEDIES WORK — this is NOT a D46.** All three prescriptions were built
+  and run, and all three print `1`: `const w: Narrow = { a: 1 }` (construct at the destination),
+  `take({ a: w.a })` (construct at the call site from the wide value), and declaring the source
+  with exactly `Narrow`'s fields. The diagnostic is honest about the way out.
+
+* **A FIELD-DROPPING COPY IS NOT AN ADMISSIBLE LOWERING, and that is measured, not argued.** VL
+  struct values have REFERENCE identity, uniformly — four probes, all printing `5`: two bindings
+  of one shape, a write through a parameter, a write through an array element, and a write
+  across a NAMED LAYOUT TWIN (`type A = {a:i32}` / `type B = {a:i32}`, `const y: B = x`). A copy
+  at the width boundary would make width subtyping the single place in the language where
+  `const y: T = x` stops aliasing. That is a language-semantics change, not a codegen detail,
+  and it must not arrive as one.
+
+* **THE PREFIX HALF IS GENUINELY FREE IN WasmGC, AND THIS HOST ACCEPTS IT.** A struct type whose
+  fields are a PREFIX-EXTENSION of another's can declare it as a supertype, and a mutable field
+  is invariant under that rule — which `{a: i32}` beside `{a: i32, b: f64}` satisfies exactly.
+  Built and validated with the pinned binaryen (`./node_modules/.bin/wasm-as`, binaryen 130):
+
+      (rec
+       (type $Narrow (sub (struct (field (mut i32)))))
+       (type $Wide   (sub $Narrow (struct (field (mut i32)) (field (mut f64)))))
+      )
+      (func $takeN (param $n (ref $Narrow)) (result i32) (struct.get $Narrow 0 (local.get $n)))
+      ;; a (ref $Wide) passed straight into a (ref $Narrow) parameter — no conversion at all
+
+  and the vl host's own wasmtime instantiated it (it got past validation to complain about the
+  seed ABI, which is the next check). The ENCODING path works in this emitter too: a spike that
+  wrote every declared struct as the non-final `0x50 <0 supertypes> 0x5f …` form built the
+  compiler, ran the controls and left reference identity intact — `wasm-dis` shows
+  `(type $1 (sub (struct (field (mut i32)))))` where master shows `(type $1 (struct …))`. So the
+  cost of the prefix half is a supertype column plus a form change in `emitTypeSection`, and it
+  costs nothing at runtime and preserves aliasing. **This is the answer to "is it WasmGC-shaped":
+  yes, and WasmGC already has the shape.**
+
+* **AND IT IS STILL BLOCKED, BY A FACT NEITHER END CAN SEE FROM THE OTHER: THE EMITTED FIELD
+  ORDER IS A FUNCTION OF DECLARATION ORDER.** `internShapeAs` says so in its own header — field
+  order "IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET
+  (`rowWithFieldNameSet`) … an alias shape with no twin lays out exactly as spelled" — and it is
+  measured:
+
+  | module | emitted struct |
+  |---|---|
+  | `type S = { a: i32, b: f64 }` alone | `(struct (field (mut i32)) (field (mut f64)))` |
+  | `type S = { b: f64, a: i32 }` alone | `(struct (field (mut f64)) (field (mut i32)))` |
+  | `AB` declared, then `BA` | ONE struct, **`AB`'s order** |
+  | `BA` declared, then `AB` | ONE struct, **`BA`'s order** |
+
+  So a shape's wasm layout is not a function of the shape. The checker's view is the SOURCE
+  SPELLING — on the witness below it emits ``redundant type annotation: `y` is inferred as
+  `{b: i32, a: i32}` `` — while the emitter lays that very binding out as `[a, b]`.
+
+* **THE EXECUTABLE REFUSAL: a checker-side lift computed on the shape alone is a SILENT WRONG
+  VALUE, not a refusal.** This program runs today and prints `15`:
+
+      type AB = { a: i32, b: i32 }
+      type BA = { b: i32, a: i32 }
+      type JustB = { b: i32 }
+      function takeB(v: JustB): i32 { return v.b }
+      const x: AB = { a: 1, b: 2 }
+      const y: BA = { b: 7, a: 1 }
+      const z: JustB = { b: 7 }
+      print(x.a + y.b + takeB(z))
+
+  `wasm-dis` of it: `AB` and `BA` share heap `$0` with layout `[a, b]`, so `BA`'s literal
+  `{ b: 7, a: 1 }` emits as `struct.new $0 (i32.const 1) (i32.const 7)` — **reordered** — and
+  `y.b` reads `struct.get $0 1`. `JustB` is `$1`, and `takeB`'s `v.b` reads `struct.get $1 0`.
+  Now add `takeB(y)`: the checker sees `BA`'s field list as `[b, a]`, so `JustB = [b]` LOOKS
+  like its prefix and a shape-only lift would declare `$0 <: $1`. That declaration is
+  **well-typed wasm** — field 0 of `$0` is `(mut i32)`, matching `$1` — and `takeB(y)` then
+  reads `struct.get $1 0` = **`a` = 1, not `b` = 7**. A wasm-valid module with a wrong value,
+  produced by a lift that was correct on every input the checker can see. Replace
+  `print(x.a + y.b + takeB(z))` with `print(takeB(y))` and master gives the clean refusal
+  quoted at the top of this row; that refusal is the only thing standing between the shape-only
+  rule and this miscompile.
+
+* **SO THE PREREQUISITE IS A CANONICAL, SHAPE-DETERMINED FIELD ORDER — AND IT IS PRICED, NOT
+  GUESSED.** Sorting each row's fields by name makes the layout a pure function of the shape, so
+  both ends compute the same prefix relation — and it WIDENS the free half rather than merely
+  enabling it: under sorted order `{b,a}` → `{a}` and `{a,x,c}` → `{a,c}` become prefixes, which
+  they are not under declaration order. **Counted at the mint over the 1,961 `tests/cases`
+  modules that reach the emitter** (a probe compiler walking the live struct rows —
+  `sTwin[i] == i` — at the end of `emitProgram`):
+
+  | | count |
+  |---|---:|
+  | live declared struct rows | **1,813** |
+  | rows with more than one field | 475 |
+  | rows NOT already in sorted field order — the ones a canonical order re-lays out | **59, in 49 modules** |
+  | proper-PREFIX row pairs already present (the `sub` edges this would declare) | **34, in 27 modules** |
+
+  So the re-layout is **59 of 1,813 rows (3.3%) in 49 of 1,961 modules (2.5%)**, not the
+  corpus-wide churn the phrase "struct-ABI change" suggests — and the edges are not
+  hypothetical: 27 corpus modules already hold a pair that would get one. What it takes is a
+  shared name-order permutation at the row recorders that push `sFieldNames`/`sFieldTypes`
+  (`emit_collect.vl:6713` and `pushFieldRow`'s callers around `:7252`/`:7319`;
+  `emit_classify.vl:21318`, `:21529`, `:22028`), of which only `internShapeAs` has one today —
+  and it is exactly the permutation that function already writes, hoisted and keyed on the NAME
+  instead of on a prototype row. **Do it as its own PR with its own grade**: bundling a struct
+  layout change with a capability lift is how the two stop being separable, which is the
+  mistake D224 recorded when it priced a bundle and declined the half that worked.
+
+* **WHAT REMAINS AFTER THAT, and it does not go away.** Even with a canonical order, `dst ⊆ src`
+  is a prefix only when `dst`'s fields are the FIRST `|dst|` of `src`'s — `{b}` ⊆ `{a,b}` never
+  is. That residue needs either a copy (refused above, on reference identity) or a per-shape
+  reordering under the module's whole constraint set, which is unsatisfiable in general (`{a,b}`
+  cannot have both `{a}` and `{b}` as prefixes). **So the honest split is: the prefix half is
+  free and should be taken once the order is canonical; the rest is a design question about
+  whether VL wants width subtyping at all in positions where it cannot be free** — and if the
+  answer is no, the message should say so as a DESIGN rule instead of conceding
+  "not yet supported by codegen".
+
+* **THE OBJECT-LITERAL SPELLING IS A DIFFERENT REFUSAL AND SHOULD NOT BE SWEPT IN.**
+  `take({ a: 1, b: 2 })` gets a plain `tErr` — "a literal is built at the shape it flows into,
+  so the extra field would be dropped and its initializer never evaluated — a call there would
+  never run" — which concedes nothing about codegen and is a defensible design rule (it is
+  TypeScript's excess-property check, and the evaluation-count argument is real). It is in the
+  table above only so a future fix does not read the two as one gap.
 
 ## 6. Coverage gaps — axes not built, and why
 
