@@ -21323,6 +21323,14 @@ Repro:
   matters more here than on the concat side: an `i32.ne` over an `f64` backing does not
   validate, but a compare that reads the right storage with a wrong-width opcode answers TRUE
   for two equal lists and is invisible to a `.length` assertion.
+* **THE TWO REPS THIS ROW CALLED "UNREACHED" ARE THE TWO THAT THEN SHIPPED A DEFECT, AND THE
+  BLIND SPOT WAS WRITTEN DOWN BEFORE IT WAS WALKED INTO.** The headline above names `f32[]` and
+  `u8[]` as reps no corpus cell reaches; the first cut of the accept fixture then built every
+  list inside a FUNCTION and never asked them at module scope, where `i64[]` and `f32[]` were
+  check-clean invalid wasm. `regress.py` reported `→ silent 0` and was right — the corpus has
+  no module-scope `i64[]` equality cell. **A rep a row calls unreached is the rep that needs a
+  hand-written probe**, which is the whole argument `scripts/capability-probes/` exists for.
+  D755 is the defect and the both-scopes grid is the instrument that now covers it.
 * **BYTE-IDENTICAL over the corpus**, which is the instrument that says this touched only reps
   that were a refusal before it: `1,997 identical · 0 DIFFER · 0 LOST` against master's seed.
   `eqgListKindOfBin` declines every shape `listOpKindOfBin` claims, so `i32[]`, `string[]` and
@@ -21521,6 +21529,73 @@ now a map-only file — its other seven rows graduated to D751/D752's accept pin
 `tests/cases/generics/error-eq-concat-type-param-under-constructor.vl` and
 `tests/cases/std/error-array-needle-not-equatable.vl`, whose CONTROL is now a map for the same
 reason: the row's argument needs a refusal that cannot graduate out from under it.
+
+---
+
+### D755 — [CLOSED 2026-08-31] the OLD compare ladder was missing three of its twin's arms, and `exprArray` claims a module-scope global its declared-local twin declines
+
+**CLOSED 2026-08-31 — the repro RUNS and prints `true`. Was: check-clean INVALID WASM (`type mismatch: expected (ref $type), found (ref $type)`) on D751's first cut · 2 spellings (`i64[]`, `f32[]`) at MODULE SCOPE only · ZERO corpus cells, at either scope, which is why every gate was green · found by the coordinator's hand-written module-scope probe, not by any instrument in this repo**
+
+Repro:
+
+    const a: i64[] = [5]
+    const b: i64[] = [5]
+    print(a == b)
+    // was: vl check rc 0; vl run:
+    //   failed to compile — Invalid input WebAssembly code:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // now: runs, prints true
+
+* **THE MECHANISM IS THREE MISSING ARMS IN A LADDER DOCUMENTED AS HAVING THE SAME ORDER AS ITS
+  TWIN.** `listOpKindOf` picks among the THREE OLD compare cores and its header says it mirrors
+  `catListKindOfExpr`'s order. It did not: `exprF64Array` had an explicit `-1` and `i64`, `f32`
+  and `u8` had **nothing**, so all three fell through to `exprArray` at the bottom and answered
+  `0` — the i32 core, whose `$lTypeIdx`/`$aTypeIdx` are not their wrapper and backing.
+* **IT WAS INERT UNTIL D751 BECAUSE THE CHECKER REFUSED FIRST**, which is the general shape
+  worth keeping: `f64[] == f64[]` and its three siblings were a loud check reject, so the
+  emitter never ran and the missing arms cost nothing for as long as the capability gap
+  existed. **Closing a capability gap makes every stale classifier behind it load-bearing on
+  the same day.** The three arms had presumably been wrong since the reps were introduced.
+* **IT IS SCOPE-KEYED, AND THAT IS THE PART NO EXISTING INSTRUMENT COULD SEE.** `exprArray`
+  declines an `i64[]` LOCAL — the declared kind names the rep — and CLAIMS a module-scope
+  GLOBAL. So the identical comparison ran correctly one indent in and wrote invalid wasm at
+  module scope:
+
+      function f(): boolean {
+        const a: i64[] = [5]
+        const b: i64[] = [5]
+        return a == b        // always fine
+      }
+
+  `f64[]` was correct at BOTH scopes, which is the control that made this a narrow classifier
+  gap rather than a design question about module scope.
+* **THE FLOOR DID NOT CATCH IT, AND THAT WAS A SECOND DEFECT.** `binEqGRepUnresolved`'s job is
+  to make a ladder disagreement LOUD, and it bailed on `if listOpKindOfBin(...) >= 0 { return
+  false }` — it treated "an old core claims this" as proof, when the claim itself was the bug.
+  It now CORROBORATES that claim against `catListKindOfExpr`, the home that knows every rep
+  rather than only the three with cores; the three pairings (core 0 ↔ kind 0, core 3 ↔ kind 3,
+  core 4 ↔ kind 1) are the entire correspondence between the two alphabets.
+* **THE ABLATION IS THE POINT OF THAT GUARD, AND IT READS ZERO ON THE TREE AS IT STANDS:**
+
+  | tree | module-scope `i64[]` |
+  |---|---|
+  | both rungs | **runs, prints true** |
+  | − the three `listOpKindOf` arms, guard KEPT | **loud emit reject** |
+  | − the three arms AND the guard | **check-clean INVALID WASM (clause 1)** |
+  | master `1e8bf2fb` | loud check reject (the capability gap) |
+
+  The guard buys 0 cells and 0 grid rows today. It exists so the next rep added to one ladder
+  and not the other is an `emitProgram:` sentence rather than a module the engine refuses —
+  the same argument D752's floor is kept on, one ladder over.
+* **THE TRADE THIS ROW UNDOES WAS `loud check reject → check-clean invalid wasm`**, which is
+  loud into SILENT and specifically into clause 1, the tighter clause. Under the standing goal
+  that is worse than what it replaced even at two spellings, and it is the one direction
+  `regress.py`'s own veto list would not have blocked — it blocks on `runs → not-runs`, and
+  these cells never ran.
+
+Fixtures: `tests/cases/arrays/list-eq-every-rep.vl`, which now asks **every rep at BOTH
+SCOPES** — 18 module-scope functions over module-scope globals, plus two compares in the start
+function itself, plus `u8[]` (which has no annotation spelling and is built with `.bytes()`).
 
 ---
 
