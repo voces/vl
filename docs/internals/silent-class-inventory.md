@@ -17949,7 +17949,7 @@ Repro (five lines; every one of them is load-bearing, see the ablation):
 
 
 ### D623 — the carrier D621 unmasked: an UN-ANNOTATED `Map()` reaching an annotated struct field, where the value type has a layout twin
-**check-clean invalid wasm · 130 cells · these are D621's measured PRICE, and the price was a FLOOR over this defect rather than a statement about the program: on master before #2027 all 130 were a loud emit reject, and deleting the one `!= null` line that reached D621's gate made all **130 of 130** produce the byte-identical validator sentence at the identical offset · re-verified cell by cell on 2026-08-30 after the merge**
+**[CLOSED 2026-08-30] the repro below RUNS and prints `7`. Was: check-clean invalid wasm · 130 cells, ALL 130 moved to `runs`, plus 4 more in block B · the fix is one rung on `mvValsElemStructRow`, the PAIRWISE restatement of `rlSig`'s heap signature, which mirrored only the first of that signature's two legs**
 
 Repro:
 
@@ -17968,11 +17968,12 @@ Repro:
       print(7)
     }
     outer()
-    // vl check rc 0; vl run:
+    // was: vl check rc 0; vl run:
     //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
-    // SHOULD PRINT 7
+    // now: prints 7
 
-* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured:
+* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured on
+  master before the close:
 
   | change | outcome |
   |---|---|
@@ -17988,17 +17989,66 @@ Repro:
   and the nullable field. The closure is not one, which separates this from D613 even though
   the two share a validator sentence (`expected (ref $type), found (ref $type)`) — **do not
   group them by that sentence.**
-* **WHY THERE IS A ROW AT ALL RATHER THAN A LINE IN D621.** D621's close moved these 130 from
-  `loud emit reject` to `check-clean invalid wasm`, which under the standing goal is a clause-1
-  violation where there was a clause-2 one. That trade was right — `runs` went 3,704 -> 3,732
-  and the total against the goal 451 -> 423 — but the 130 then had no owner, and a price
-  recorded in a named set is not a defect anybody is working. This row is the owner.
-* **THE TWIN + UNION + NULLABLE TRIO IS D280's, D612's AND D621's**, which is three closes on
-  one ingredient set and a reason to suspect the carrier is the last of it rather than the
-  next-to-last. Worth asking directly: is there a spelling where the carrier is annotated and
-  the trio still breaks?
-* All 130 are in the `d224-cost` named set, kept whole; `named/sources.json` records the price.
+* **WHAT CLOSED IT: `rlSig`'s heap branch is a LADDER and the pairwise restatement had only its
+  first rung.** `rlSig` keys a ref-list element on `"h:" + sHeapIdx[rlElemStructRow(row)]`, and
+  when that answers -1 — a registered union ARM, which `rlElemStructRow` refuses BY DESIGN
+  (D32's nominal floor) — on the concrete-VARIANT fall-through `rlElemVariantHeap`. Since
+  **D280** an arm whose layout a declared struct also claims takes THAT ROW's heap
+  (`uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`, `collectU`'s cross-table branch), so the two
+  legs can render the IDENTICAL signature and `rlTwin` already merges the rows onto ONE vals
+  wrapper. `mvValsElemStructRow` — the pairwise restatement rung W (D301) asks, which decides
+  whether two map-value slots emit ONE 7-field map struct — mirrored only the struct leg, so it
+  reported two wrappers where the mint had made one. It takes the same hop now, through
+  `variantStructHeapTwinAt` (a pure function of the arm) rather than `rlElemVariantHeap` (a
+  heap INDEX, which would be a timing dependence this layer forbids — `rlSig`'s own map-element
+  arm calls back into `repMapValSlotsTwin` while `rlTwin`/`rlWrapIdx` are being built).
+* **THE CANONICAL-KEY GATE IS WHY IT HAD TO BE HOISTED, AND THIS IS THE THIRD HOIST.** The
+  kind-1 TAIL of `repMapValSlotsTwin` already knows this answer — it calls `rlSlotsLayoutTwin`,
+  whose struct tail already takes the `variantStructHeapTwinAt` hop — but it sits BELOW
+  `mvValTwinCanonId`, and `Circle` and the `{r:null}` shape a `Map()` infers at its first key
+  write are two different `repCanonId`s. D300 hoisted slot EQUALITY above that gate, D301 the
+  struct-row leg; this is the arm leg, and it is the last one that signature has.
+* **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS** (`./node_modules/.bin/wasm-dis`, binaryen 130).
+  On master the rec group carries THREE map structs and two of them are field-for-field equal:
 
+      (type $15 (struct (field (mut (ref $13))) (field (mut (ref $11))) … ))
+      (type $16 (struct (field (mut (ref $13))) (field (mut (ref $11))) … ))   ;; identical
+      (type $1  (struct (field (mut (ref $15)))))          ;; GW's `g`
+      (type $17 (func (result (ref $16))))                 ;; mkcall
+      (func $1  (local.set $0 (struct.new $1 (call $0))))  ;; (ref $16) into a (ref $15) field
+
+  With the fix `$16` the map struct is gone, `mkcall` is `(func (result (ref $15)))`, `$1` and
+  the second `GW`-shaped row both carry `(ref $15)`, and the IDENTICAL `struct.new` is well
+  typed. 2,928 bytes against 2,949 — one 7-field map struct, and nothing else in the module
+  moves.
+* **PROBED AT THE MINT.** `mv0 nm=Circle rl=0 wrap=11 srow=-1 vrow=0 vhtwin=0` beside
+  `mv1 nm={r:null} rl=1 wrap=11 srow=0 vrow=-1` — the SAME vals wrapper on two ref-list rows,
+  and `srow=-1` is the entire refusal: `{r:null}` interned onto `Dot`'s row and `Circle`'s row
+  is the arm's. Read through `vhtwin` both sides answer struct row 0 and the pair merges.
+* **REACHED AND ANSWERING, corpus-wide.** A probe compiler counting the new leg over all 7,021
+  cells: it is consulted 676 times on **389** cells, every one of them with a real variant row,
+  and ANSWERS 544 times on **285** cells. All **134** movers are inside those 285; **0** are
+  outside. 104 cells reach it and get no answer — 81 of them decline at
+  `variantStructHeapTwinAt`'s map-field layout guard, which is **D624**'s site (see that row).
+* **THE TRADE, cell-matched on the distilled corpus:** 134 classes move, every one
+  `check-clean invalid wasm -> runs`. `runs` **3,752 -> 3,886** (53.44% -> 55.35%), clause 1
+  **196 -> 62**, total against the goal **403 -> 269**. **`runs -> not-runs`: 0. `-> silent`:
+  0.** No other transition of any kind, no new compiler trap, no corpus module lost. The
+  `d224-cost` named set — D224's refused 207-cell price, of which D621 paid 77 — is now **207
+  of 207 `runs`**, and `named/sources.json` records that the floor is fully paid off.
+* **ABLATION.** One rung, and it is one landing: the leg is `if sr >= 0 { return sr }` plus the
+  `variantStructHeapTwinAt` hop. Strip it and the seed is md5-identical to master's
+  (`ec559d8e9e12135eeafdc1600669c602`). Its ARM↔ARM reach (both sides through the new leg) is
+  measured at **0** on the whole corpus — kept, not deleted, because a zero on a derived
+  population is not evidence a rung is dead, and it is sound for the same reason the
+  arm↔struct case is: an arm's heap IS its cross-table struct row's heap.
+* **CORPUS BYTE-IDENTITY.** 3,948 corpus modules built with both seeds, 0 lost, 0 gained,
+  **3,804 byte-identical**. Of the 144 that differ, 134 are the movers and 10 were already
+  `runs` and still `runs` with the same output — one duplicate map struct fewer. **0** cells
+  changed class without changing bytes.
+* Pin: `tests/cases/soundness/unannotated-map-carrier-shares-the-arm-heap.vl` (its own file —
+  appended to `arm-and-its-layout-twin-share-one-heap.vl` the same source is a DIFFERENT
+  program, and becomes `bare null needs a struct-typed context`).
 
 ### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
 **check-clean invalid wasm · 55 cells, the largest silent family no agent holds · found 2026-08-30 by splitting the silent population by OWNERSHIP rather than by message and minimising what was left · SIX ingredients and every one of them is load-bearing**
@@ -18046,6 +18096,54 @@ Repro:
   one's is map-valued. There is a real chance D623's fix moves some or all of these 55, and
   the honest first step is to grade this witness against D623's merged seed rather than to
   re-derive a mechanism that may already be gone.
+* **RE-GRADED AGAINST D623's SEED (2026-08-30), AS THIS ROW ASKED — IT DOES NOT MOVE, AND THE
+  MECHANISM IS NOW MEASURED RATHER THAN GUESSED.** The repro above is check-clean invalid wasm
+  on D623's merged seed, unchanged. D623 was the right guess about the SITE and the wrong one
+  about the rung: its fix gives `mvValsElemStructRow` the arm leg of `rlSig`'s heap signature,
+  and on this witness that leg IS reached — a probe counting each decline site reads
+  `ask=1 reach=1 ans=0 || vht mapfield=4`. So the pairwise restatement now asks the merge; it
+  is **`variantStructHeapTwinAt` ITSELF that declines**, at its field-storage guard
+  (`cv == 19 || cv == 29`, a MAP-typed field), four times over. D280's own header flags that
+  guard as deliberately conservative — "a field whose emitted storage is a `(ref [null]
+  <heap>)` the CODE does not name … declines the merge outright rather than descending into
+  the referenced layer the way `variantFieldLayoutEq` does … widening it is a separate
+  measurement". **This row is that measurement.** Corpus-wide the same probe finds 104 cells
+  that reach the leg and get no answer, **81 of them declining at this map-field guard**.
+* **THE LIST AND THE SPACER ARE NOT INGREDIENTS — a strictly narrower witness, 14 lines, no
+  list, no `Box1`, and BOTH ENDS ANNOTATED:**
+
+      type Circle = { r: {[string]: i32} }
+      type Dot = { r: {[string]: i32} }
+      type Sq = { s: i32 }
+      type Shape = Circle | Sq
+      type GW = { g: {[string]: Circle} }
+      function mkcall(): {[string]: Dot} {
+        const cc: {[string]: Dot} = Map()
+        cc["k0"] = { r: Map() }
+        return cc
+      }
+      function outer() {
+        const wv: GW = { g: mkcall() }
+        print(7)
+      }
+      outer()
+      // vl check rc 0; vl run:
+      //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+      // SHOULD PRINT 7
+
+  **AND IT REFUTES ONE LINE OF THE TABLE ABOVE.** "Annotate the carrier and it runs" is not the
+  rule — annotating the carrier to the DESTINATION's name (`{[string]: Circle}`) runs, because
+  then both ends name one row and no cross-table question is asked at all; annotating it to the
+  TWIN's name (`{[string]: Dot}`, above) still fails. The axis is not annotated-vs-inferred, it
+  is **whether the two ends name the same declared row** — and when they do not, the merge is
+  the only thing that can join them. That answers D623's standing question ("is there a
+  spelling where the carrier IS annotated and the trio still breaks?") with a yes, and puts the
+  answer here rather than in a new row, because it is this row's guard that declines it.
+* **ABLATED ON THE NARROW WITNESS:** drop `type Dot` → runs; drop `type Shape` → runs; annotate
+  the carrier `{[string]: Circle}` → runs; field `r: i32[]` (a ref LIST rather than a map) →
+  **runs**, and the probe says why — `ans=2`, the guard's ref-list codes are not tripped in this
+  position. So the guard's MAP arm is the one that matters here, and widening it is not
+  the same question as widening the ref-list arms.
 * **DO NOT GROUP BY THE VALIDATOR SENTENCE.** 55 of the 66 unowned silent cells print
   `expected (ref null $type), found (ref $type)`, and that number is a MESSAGE count, not a
   mechanism count — D611 was filed at 58 on exactly that basis and had 3. The 55 here is also
