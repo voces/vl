@@ -52,10 +52,28 @@ def main():
                                            % (out, want) if not ok else "runs"))
         else:
             err = (chk.stdout + chk.stderr + run.stdout + run.stderr)
+            # A HINT is advice on a program that type-checked; it is never the refusal, and
+            # letting it through as the fallback labelled the SILENT probe with a note about
+            # a redundant annotation.
+            lines = [l for l in err.splitlines()
+                     if l.strip() and "[HINT]" not in l and not l.startswith(" ")]
             m = re.search(r"(not yet supported|has no lowering|not supported by codegen)"
                           r"[^\n\"]{0,54}", err)
-            where = "check" if chk.returncode != 0 else "emit"
-            still.append((fn, f"{where} refuses: {m.group(0) if m else err.splitlines()[0][:60]}"))
+            if chk.returncode != 0:
+                where = "check refuses"          # clause 2: the checker owns the diagnosis
+            elif re.search(r"Invalid input WebAssembly|WebAssembly translation error", err):
+                where = "SILENT (check rc 0)"    # clause 1: worse, and easy to misread as emit
+            else:
+                where = "emit refuses"
+            inv = re.search(r"(Invalid input WebAssembly code[^\n]{0,60}|"
+                            r"type mismatch: expected [^\n]{0,48})", err)
+            if where.startswith("SILENT"):
+                # The validator's own sentence, not the clean `vl check` output that
+                # precedes it -- "Checked 1 file, no errors" is the SYMPTOM, not the detail.
+                detail = inv.group(0) if inv else (lines[-1][:70] if lines else err[:70])
+            else:
+                detail = m.group(0) if m else (lines[0][:70] if lines else err[:70])
+            still.append((fn, f"{where}: {detail}"))
 
     for fn, why in now:
         print(f"  RUNS  {fn}")
