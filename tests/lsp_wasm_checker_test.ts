@@ -69,21 +69,28 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower an INFERRED nullable-struct return — raised on the
+  // Type-valid, but codegen cannot lower an INFERRED nullable-MAP return — raised on the
   // distinct channel whose `unsupported-lowering` code rides the
-  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated `: S | null`
-  // spelling of the same function lowers, which is what makes this a capability admission
-  // and not a type error.)
+  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated
+  // `: {[string]: i32} | null` spelling of the same function lowers and runs, which is what
+  // makes this a capability admission and not a type error.)
   //
-  // THE WITNESS USED TO BE `print(pick(true))` OVER AN `i32 | string`, and it moved because
-  // that program now RUNS — D712 built the box-tag dispatch. Any remaining capability gap
-  // serves here; what this test asserts is the CHANNEL, not the gap.
+  // THE WITNESS HAS MOVED TWICE NOW, AND THAT IS THE POINT OF THE TEST. It was
+  // `print(pick(true))` over an `i32 | string` until D712 built the box-tag dispatch; it was
+  // an inferred nullable-STRUCT return until D887 recorded that shape's row and gave the A20
+  // pass and `emitReturnValue` the arms the annotated path already had. Any still-open
+  // capability gap serves; what this asserts is the CHANNEL, not the gap.
+  // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
+  // for this one, so when it closes this witness has to move again.
   const diags = await checker.check(
     [
-      "type S = { s: i32 }",
-      "function pick(v: S | null) { return v }",
+      "function pick(c: boolean) {",
+      "  if c { return null }",
+      "  const m: {[string]: i32} = Map()",
+      "  m",
+      "}",
       "function go() {",
-      "  const r = pick(null)",
+      "  const r = pick(true)",
       "  if r == null { print(0) } else { print(1) }",
       "}",
       "go()",
