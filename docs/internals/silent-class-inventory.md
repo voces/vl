@@ -21599,6 +21599,354 @@ function itself, plus `u8[]` (which has no annotation spelling and is built with
 
 ---
 
+### D771 — [CLOSED 2026-08-31] a `(Circle | null)[]` is a NICHE, and it was read as a union BOX because the arm has no struct row
+**closed as `runs` · was `loud emit reject: emitProgram: a nullable-Circle list element has
+no rep; use a non-null element type` · a CLAUSE-2 capability gap, closed by supplying the
+CLASSIFICATION the arm already had a heap for · ABLATED family: the refusal fires on the
+DECLARATIONS, so the same list with no union declared anywhere RUNS · 6 corpus cells alone,
+8 with D772, and the message it carried is gone from the scoreboard**
+
+Repro (now runs, printing `1`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: (Circle | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: a nullable-Circle list element has no rep; use a non-null element type
+    // Now: prints 1.
+
+* **THE SENTENCE WAS FALSE AT ITS OWN SPELLING, AND ONE LINE PROVES IT.** Delete
+  `type Shape = Circle | Sq` and the identical program RUNS on master. So "a nullable-Circle
+  list element has no rep" is not a statement about `(Circle | null)[]`; it is a statement
+  about `(Circle | null)[]` **in a module where some declared union names `Circle`**. The
+  refusal needs no value, no second destination and no covariance — the two type
+  declarations and the annotation are the whole of it. `CLAUDE.md` had already flagged this
+  message as a sentence broader than its defect; this is the mechanism under it.
+
+* **IT IS D761'S ROOT, ONE CONTAINER OVER.** `collectS` withholds an `sNames` row from a
+  `type X = {…}` that is a union member — "their fields ride the variant tables, not the
+  struct table". `refArrShapeKind`'s paren-nullable ladder opens with
+  `if structIndexByName(nn) >= 0 { return 1 }`, the `(P | null)[]` niche arm, and that lookup
+  answers **-1** for an arm. The ladder then falls through to its kind-2 union-box return,
+  and `collectA`'s kind-2 arm refuses a niche nullable out loud, correctly — a box has no rep
+  for a niche. Every rung behaved as written; the classification was lost two rungs earlier.
+
+* **THE FIX IS ONE RUNG AND IT MINTS NOTHING.** `if variantIndexOf(nn) >= 0 { return 1 }`,
+  placed directly under the struct rung. Since **D280** an arm and its declared layout twin
+  are ONE WasmGC heap (`uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`), and the element NAME this
+  list interns under keeps the `| null` spelling, whose heap `rlElemVariantHeap` already
+  resolves through `nonNulBaseOf` + `variantIndexOf`. So the kind-1 slot machinery needed no
+  new leg: the rung supplies a kind, not a rep.
+
+* **THE BYTES SAY SO** (`./node_modules/.bin/wasm-dis`, binaryen 130; the module is 219
+  bytes). `$1` is `Circle`, `(struct (field (mut i32)))`. `$4` is the union box,
+  `(struct (field i32) (field anyref))` — **present in the module, because `Shape` declares
+  it, and untouched by the list.** `$5` is `(array (mut (ref null $1)))`, the `(ref null
+  $Circle)` niche backing, and the literal is `array.new_fixed $5 1 (struct.new $1 (i32.const
+  7))` — a bare arm value, no box wrap. That is the whole claim: the niche the annotation
+  asks for is a heap type the module already had.
+
+* **MEASURED.** Distilled corpus, this rung ALONE: 6 cells `loud emit reject` -> `runs`, 0
+  `runs` lost, and **2 cells `loud emit reject` -> check-clean invalid wasm** — the empty-`[]`
+  spellings, whose silence is D772's and is pre-existing at three other element types. With
+  D772 beside it: **10 cells -> `runs`, 0 lost, 0 into any silent class.** D411's 103-cell
+  grid: 0 cells moved, all 7 single-destination controls still run. D661's 211-cell grid:
+  211/211 run, unchanged. Corpus `cmp`: 2,457 modules · 2,006 identical · 0 DIFFER · 0 LOST.
+
+* **THE BOUNDARY, MEASURED RATHER THAN ASSUMED.** The rung buys the list's construction, its
+  `.length` and its element read; a NARROWED FIELD READ off the niche element is still a loud
+  reject — `const e = a[0]  if e != null { print(e.r) }` gives `emitProgram: field access but
+  no struct type declared`. That is the SAME missing `sNames` row, one resolver further on,
+  and it is reachable only because the list now builds (master refused the module at the rep).
+  Its two controls separate it cleanly: the identical read with no union declared RUNS, and
+  with a non-null `Circle[]` element beside the union it RUNS too. Loud, on its own axis,
+  and not a `runs` cell lost by anything here.
+
+* **THE 8 CELLS IT DOES NOT CLOSE ARE NOT ITS FAMILY.** `d741_eager_CircleNull__Shape` and
+  its seven siblings pair the nullable element with a union-BOX second destination, so once
+  the nullable side classifies they are the ordinary two-destination conflict and they now
+  carry that sentence instead. The scoreboard's "nullable-Circle" bucket goes 18 -> 0 and its
+  two-destination bucket 51 -> 59: the same programs, described by the arm that actually
+  refuses them.
+
+---
+
+### D772 — [CLOSED 2026-08-31] `nodeArrayElemName` renders exactly ONE nullable element, and an empty `[]` pinned to any other silently built the i32 list
+**closed as `runs` · was `check-clean invalid wasm` · found 2026-08-31 as the price of
+D771's rung, and it is PRE-EXISTING and independent — its plainest witness declares no union
+and no struct · a CLAUSE-1 soundness violation, closed by supplying the render · 4 corpus
+cells, plus a class the corpus had no program for at all**
+
+Repro (now runs, printing `0`):
+
+    function f() {
+      const xs = []
+      const a: (i32 | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run ->
+    //   Invalid input WebAssembly code ... type mismatch
+    // Now: prints 0.
+
+* **NOT A COVARIANCE CELL AND NOT D771's, WHICH IS WHY THE WITNESS IS SPELLED THIS WAY.**
+  The program above has no union declaration, no struct and one destination. The same shape
+  is check-clean invalid wasm on master at `(Dot | null)[]` over a plain declared struct, at
+  `({r: i32} | null)[]` over an inline shape, and at `(Circle | null)[]` over a union arm.
+  What every one of them has is a `| null` in the ELEMENT and an initializer of `[]`.
+
+* **THE ANNOTATED TWIN OF EVERY ONE OF THEM RUNS**, which is what says this is a missing
+  render and not a missing rep: `const xs: (i32 | null)[] = []` and `const xs: (Dot | null)[]
+  = []` both print `0` on master. Only the un-annotated literal, pinned by
+  `constrainEmptyD`, is wrong.
+
+* **THE PROBE, BECAUSE THE FIRST TWO GUESSES WERE WRONG.** A gated `emitFail` inside
+  `synthEmptyListAnn` — the pass that writes the inferred `<elem>[]` annotation back onto an
+  empty-`[]` binding — reads `elem=[] nom=[]` on all four spellings and
+  `elem=[{r: i32}] nom=[Dot]` on the non-nullable control. So the synthesis is REACHED and
+  declines at its own first gate: `nodeArrayElemName` returns `""`. Its `TyNullable` arm
+  covers exactly one inner kind, a closure, through `nullableRetName`; every other nullable
+  element falls off the end of the ladder. With no element name there is no annotation, the
+  binding takes the i32-list default, and its wrapper is stored into the destination's
+  ref-list cell.
+
+* **THE FIX IS A FALL-BACK GATED ON THE ROW EXISTING, NOT ON THE SHAPE.** Where
+  `nodeArrayElemName` declines, take `tyToEmitName` of the literal's recorded element and use
+  it only if `rlSlotByName` answers. That answer IS the proof that the synthesized spelling
+  and the destination's own annotation land on ONE interned row — checked per program rather
+  than argued, which matters because the emit render is spaceless (`{r:i32}|null`) while the
+  source spelling is not. Where it does not answer, master's `""` stands; that residue is
+  D775.
+
+* **MEASURED.** This rung ALONE moves `d772_hole_nul_i32` and `d772_hole_nul_struct` from
+  check-clean invalid wasm to `runs` and moves nothing of D771's; the two rungs TOGETHER are
+  what `d741_hole_CircleNull__none` and `d741_hole_CircleNull__CircleNull` need, and neither
+  alone gets them there. Strip both and the seed reproduces master byte-for-byte
+  (`a4663e788463c141e8bfc70edd073c5a`).
+
+---
+
+### D773 — the READ-ONLY covariant pass is check-clean invalid wasm, and it is the half of A9 the whole family is waiting on
+**check-clean invalid wasm · found 2026-08-31 while pricing an A9-`Writable` candidate · a
+CLAUSE-1 soundness violation on a program that WRITES NOTHING · the corpus had no cell for
+the plain covariant pass at all, so `goal-scoreboard.py` scored it at zero · 3 cells
+committed to `distilled/named/`**
+
+Repro (check rc 0, invalid module):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: Circle[] = [{ r: 7 }]
+      const b: Shape[] = a
+      print(b.length)
+      print(a[0].r)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 217: type mismatch
+    // SHOULD PRINT 1 then 7 — nothing in the program mutates anything
+
+* **THE PARAMETER SPELLING IS THE SAME CELL** (`d773_readonly_param`): `look(xs: Shape[]) {
+  print(xs.length) }` called with a `Circle[]`, check rc 0, invalid module at offset 231.
+  `d773_readonly_same` — the identical program with the source annotated `Shape[]` — RUNS and
+  is the control.
+
+* **`DECISIONS.md` ALREADY SAYS THIS IS LEGAL, AND SAYS WHAT BLOCKS IT.** Under "Variance and
+  exactness: inferred, with no annotation surface in v1": *"its Readable half is blocked on
+  **representation**, not on this ruling: `peek(xs)` reading an `i32[]` as `(i32 | null)[]` is
+  sound, the checker already agrees, and the emitter cannot express it (different WasmGC array
+  types, no conversion)."* This row is that sentence with a witness, at the struct/union
+  element pair rather than the scalar one, and it is CLAUSE 1 rather than a refusal because
+  nothing refuses it.
+
+* **WHY IT IS THE WHOLE FAMILY'S BLOCKER AND NOT A CELL OF ITS OWN.** Of the 80 cells
+  `goal-scoreboard.py` attributed to array covariance on `b7d5e593`, **78 contain no store,
+  no `.push` and no mutation of any kind** — measured cell by cell, not asserted; the two
+  that do are `d741_w0_base` and `d741_w6_params`. Every one of the 78 is a program the
+  design permits and the emitter cannot lower, which is the same fact this witness states in
+  four lines. So the capability that closes the family is the READABLE one.
+
+* **WHAT WOULD CLOSE IT, PRICED.** A read-only destination may take an element-CONVERTING
+  COPY, and for a read-only destination only, a copy is indistinguishable from the alias: no
+  write through either handle can observe the difference. That is exactly the move D661B
+  refused — *"a converting copy gives one destination a private list, which no other list
+  assignment in the language does"* — and the refusal is correct for a WRITABLE destination
+  and does not reach a readable one. It needs two pieces, neither of which exists:
+  (1) a **Readable inference** — does anything write through this binding, parameter, or
+  anything it flows into; (2) an **element-converting copy** in the emitter. D411 measured (2)
+  as genuinely absent: *"Every `fbArrayCopy` in the emitter is same-heap-to-same-heap; the only
+  per-element boxing is `emitArr`'s loop over SYNTACTIC `arrElems` at literal build time. There
+  is no pass that iterates an existing list value."* The residual unsoundness of a copy is a
+  callee that mutates the ORIGINAL through a second handle while holding the view; the
+  Readable inference is what has to exclude it.
+
+* **THE TRIPWIRES ANY CANDIDATE MUST PRICE.** D411's 7 single-destination controls, D661's
+  211 cells (211/211 run), D741's 46 running cells, and `d773_readonly_same`. Invariance was
+  re-measured on `ca5fa21a` at **617 classes / 14,309 census cells `runs` -> not-runs** — see
+  D661B — and none of that price buys this witness, because invariance REJECTS it rather than
+  lowering it.
+
+---
+
+### D774 — A9's `Writable` half is the wrong half, and the write ABLATION over the K1/K2 quadrant is what says so
+**loud emit reject · found 2026-08-31 pricing a `Writable`-inference candidate against the
+covariance family · the candidate is REFUSED on a measurement, not on an argument: it reaches
+2 of the family's 80 cells · 3 cells committed to `distilled/named/`**
+
+Repro (a loud emit reject, and it does not depend on the store):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Circle[] = xs
+      const b: Shape[] = xs
+      b[0] = { s: 3 }
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // vl check rc 0; vl run ->
+    //   emitProgram: one un-annotated list literal is bound to TWO declared destinations
+    //   whose elements are stored differently ...
+    // Delete the store and the message, the position and the offset are IDENTICAL.
+
+* **THE PROPOSAL, STATED AS IT WAS BRIEFED.** `docs/guide/language-todo.md` asks for
+  *"Readable and Writable generics … applied automatically during parameter inference"*, and
+  `DECISIONS.md` rules that they are inferred with no annotation surface (A9). The reading
+  under test was: a parameter whose body WRITES through it is `Writable`, a `Circle[]` is not
+  assignable to a `Writable Shape[]`, and that converts the family's emit rejects into
+  positioned check rejects naming the write.
+
+* **IT CANNOT, AND THE COUNT IS THE PROOF.** Of the 80 cells the scoreboard attributed to
+  this family on `b7d5e593` — 33 from the `d411` grid, 47 from `d741` — exactly **2 contain a
+  list element store or a `.push` anywhere in the program**: `d741_w0_base` (a store through a
+  binding) and `d741_w6_params` (a store through a parameter). The other **78 are read-only**:
+  they print `.length` or a field. A rule conditioned on a write cannot fire on a program that
+  contains none. (The 10 `d411_mapstore__*` cells look like writes to a text search and are
+  not: `mU["k"] = lv1` stores the LIST INTO a map, which is a destination delivery, not a
+  mutation of the list.)
+
+* **AND ADDING A WRITE DOES NOT CHANGE THE REFUSAL EITHER**, which is the half a count cannot
+  settle. `d774_k1k2_nostore`, `d774_k1k2_store` and `d774_k1k2_param_store` are one program
+  with no store, with a store through a binding, and with a store through a parameter; all
+  three are the identical positioned emit reject at the identical site. So the write is not an
+  ingredient of the K1/K2 quadrant's refusal. D741's `w0`/`w2` pair is the same ablation in the
+  K2/K2 quadrant, where the write DOES decide — `runs` without it, `wasm trap: cast failure`
+  with it — and keeping both pairs is what separates the two halves of the family.
+
+* **THE SEPARATION THE BRIEF ASKED ABOUT LANDS THE OTHER WAY ROUND.** A9's two halves do
+  partition the family, cleanly — just not as 78/2 in `Writable`'s favour:
+
+  | half | reaches | what it needs | status |
+  |---|---|---|---|
+  | `Writable` (a write through a covariantly-typed handle is ILLEGAL) | **2 of 80** — `d741_w0_base`, `d741_w6_params`, both clause-1 traps | a written-through analysis + a rejection at the call/binding site | not built; the only rule that closes the traps |
+  | `Readable` (a read-only covariant pass is LEGAL and must lower) | **78 of 80** | a Readable inference + an element-converting copy | not built; D773 |
+
+  `Writable` is worth building — it is the only thing that turns `d741_w0_base`'s
+  `wasm trap: cast failure` into a diagnosis — and it is not what the 80 are made of.
+
+* **WHY D661B's INVARIANCE IS NOT A CHEAPER `Writable`.** Invariance rejects the read-only
+  pass too, which is what makes it cost 617 classes / 14,309 census cells and all 7 of D411's
+  controls. A `Writable`-only rule reddens none of those by construction: every cell it can
+  reach contains a write, and none of D411's controls, D661's 211 or D741's 46 running cells
+  does. That is the one thing the briefed reading gets right, and it is a statement about the
+  price, not about the coverage.
+
+---
+
+### D775 — the `(string | null)[]` empty hole D772 deliberately does not claim
+**check-clean invalid wasm · found 2026-08-31 as the measured boundary of D772's rung · 1
+cell committed to `distilled/named/` · left open rather than guessed at, because the gate
+that bounds D772 is the ROW EXISTING and a string list has no ref-list row**
+
+Repro (check rc 0, invalid module):
+
+    function f() {
+      const xs = []
+      const a: (string | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 259: type mismatch
+    // SHOULD PRINT 0
+
+* **WHY D772's RUNG STOPS HERE ON PURPOSE.** That rung takes the emit render of a nullable
+  element only when `rlSlotByName` answers, and answering is what proves the synthesized
+  spelling and the destination's annotation are one interned row. A `(string | null)[]` rides
+  the **string-list** backing (`nameIsStringArray` is rep-wide over the niche, by design — see
+  `collectA`'s string-array arm), so it has no ref-list row at all and the gate declines.
+  Widening the gate to "any nullable element" would hand `synthEmptyListAnn` a spelling with
+  no row behind it, which is how a loud reject becomes a silent class.
+
+* **THE ANNOTATED TWIN RUNS** — `const xs: (string | null)[] = []` prints `0` — so this is the
+  same missing-render shape as D772 and needs the string-list side of the same synthesis, not
+  a new rep.
+
+---
+
+### D776 — D742's repair is a PIN MARKER plus a CONCEDING sentence, and the second half is what makes it worth doing
+**check-clean invalid wasm · the standing price of NOT taking D742's repair, restated with
+the message requirement that was missing from it · 9 clause-1 cells · deliberately not built
+here, and priced so the next attempt does not pay for the wrong half**
+
+Repro (check rc 0, invalid module):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const xs = []
+      const a: Circle[] = xs
+      const b: Shape[] = xs
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 277: type mismatch
+    // Swap the two bindings and the SAME pair is a clean check reject.
+
+* **THE MECHANISM IS D742's AND IS UNCHANGED**: `constrainEmptyD` fills the `-1` element hole
+  IN PLACE from the first destination that claims it, keeps no record that a pin happened, and
+  the second destination is then an ordinary covariant assignment. Nine corpus cells are this
+  shape — the eight `d741_hole_{Circle,inlineobj}__{Shape,Animal,Other,CircleStr}` plus
+  `d741_o1_hole_k1_first` — and they are the whole of clause 1 apart from D741's two traps.
+
+* **THE REPAIR D742 NAMES IS RIGHT AND ITS MESSAGE IS NOT.** A marker distinguishing "this
+  array type came from a pin" from "this array type was declared", consulted by
+  `assignableGo`'s `TyArray` arm, makes the pinned element invariant thereafter and reddens
+  exactly these nine. But the sentence it produces — `cannot assign Circle[] to 'b' of type
+  Shape[]` — describes a type error, and **these nine programs are read-only and therefore
+  legal** (D773). A plain check reject would also make the cluster invisible to
+  `goal-scoreboard.py`, which counts an emit reject and a CONCEDING check reject and scores a
+  non-conceding one as neither — D741 calls that trade "strictly worse than leaving it at
+  emit", and it is worse here too even though the cells start in the SILENT column.
+
+* **SO THE REPAIR IS TWO PIECES, NOT ONE.** (1) the pin marker; (2) a positioned message that
+  CONCEDES — the element storages differ and the copy that would reconcile them does not
+  exist — so the nine move `check-clean invalid wasm` -> `loud check reject (conceded)`,
+  clause 1 goes 11 -> 2 and the conceded bucket 6 -> 15, with the total against the goal
+  unchanged. That is the honest shape: the silence goes away and the gap stays counted.
+
+* **THE RISK THAT HAS TO BE MEASURED, AND IT IS NOT THE NINE.** Making a pinned hole
+  invariant reaches every empty `[]` in the corpus, not only these; the litunion spellings
+  (`K[]` softened to `string[]` by canon) are where `tySame` is likeliest to disagree with
+  today's acceptance. `regress.py` is the instrument and D741's 46 running cells are the
+  tripwire.
+
+---
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
