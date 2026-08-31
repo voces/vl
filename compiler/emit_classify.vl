@@ -460,6 +460,7 @@ import {
   sFieldTypes,
   sHeapIdx,
   sNames,
+  sTwin,
   sTyIx,
   scopeFrames,
   scopeNames,
@@ -8260,6 +8261,92 @@ export function localIndexOf(fnIx: i32, name: string) {
 // ("offsets are the RUNNING SUM of the declared field widths and the compiler never inserts
 // a byte … Field order IS layout" — `tests/cases/memory/flat-layout-grid.vl`), so its
 // recorders keep the declared sequence and pass this by.
+// ── THE STRUCT EMISSION ORDER (D622) ─────────────────────────────────────────
+// Is row `p`'s field NAME+CODE list a proper prefix of row `c`'s? The CHEAP half of
+// `structRowIsProperPrefix` (emit_sections), which additionally compares the emitted SLOT.
+// This one exists a layer down, where `sFieldRefSlot` is not visible, and it is used only to
+// decide the ORDER — so being WEAKER is safe by construction: it triggers on a superset of
+// the real edges, and an unnecessary reorder is behaviour-neutral.
+function structRowPrefixCheap(p: i32, c: i32): boolean {
+  if p < 0 || c < 0 || p == c { return false }
+  if p >= sFieldCount.length || c >= sFieldCount.length { return false }
+  const pn = sFieldCount[p]
+  if pn == 0 { return false }
+  if pn >= sFieldCount[c] { return false }
+  let k = 0
+  while k < pn {
+    if sFieldNames[sFieldStart[p] + k] != sFieldNames[sFieldStart[c] + k] {
+      return false
+    }
+    if sFieldTypes[sFieldStart[p] + k] != sFieldTypes[sFieldStart[c] + k] {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+// The order the REPRESENTATIVE struct rows are assigned heap indices in, and emitted in —
+// declaration order, except that a row is held back until every row that is a proper prefix
+// of it has gone. `mAssignTypeIndices` and `emitTypeSection` both call this and must agree
+// on it exactly, which is why it is one function of the field tables and nothing else.
+//
+// WHY THE ORDER MATTERS AT ALL (D622). wasm requires a declared SUPERTYPE to have a LOWER
+// type index than its subtype ("supertypes must be defined before subtypes"), and a
+// supertype here is a shorter field list — which, in declaration order, is as likely to come
+// second as first. `type Wide = {a,b}` before `type Narrow = {a}` put the subtype first and
+// the module would not validate.
+//
+// AND IT IS DECLARATION ORDER WHENEVER IT CAN BE. A module with no proper-prefix pair
+// yields exactly `0, 1, 2, …` over its live rows, so its heap indices — and its bytes — do
+// not move. Only a module that actually has a pair is renumbered, and only as far as the
+// pair requires: the scan takes the FIRST eligible row each round, so the order is stable.
+//
+// Twins are not in it. A twin (`sTwin[i] < i`) shares its representative's heap index and
+// the type section skips it, so it has no position of its own to hold.
+export function structEmitOrder(): i32[] {
+  const ord: i32[] = []
+  const done: boolean[] = []
+  let i = 0
+  while i < sNames.length {
+    done.push(sTwin[i] != i)
+    i = i + 1
+  }
+  let placed = true
+  while placed {
+    placed = false
+    let c = 0
+    while c < sNames.length {
+      if !done[c] {
+        let ready = true
+        let p = 0
+        while p < sNames.length {
+          if !done[p] && structRowPrefixCheap(p, c) { ready = false }
+          p = p + 1
+        }
+        if ready {
+          ord.push(c)
+          done[c] = true
+          placed = true
+        }
+      }
+      c = c + 1
+    }
+  }
+  // A CYCLE IS IMPOSSIBLE — a proper prefix is strictly shorter, so the relation is a strict
+  // partial order — but a row left unplaced would silently vanish from the type section, so
+  // any residue is appended in declaration order rather than dropped.
+  let r = 0
+  while r < sNames.length {
+    if !done[r] {
+      ord.push(r)
+      done[r] = true
+    }
+    r = r + 1
+  }
+  ord
+}
+
 export function fieldNameOrder(names: string[]): i32[] {
   const ord: i32[] = []
   let i = 0
