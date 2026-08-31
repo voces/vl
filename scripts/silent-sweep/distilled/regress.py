@@ -113,6 +113,32 @@ def main():
     if lost:
         print(f"\ndistilled: REGRESSION — {len(lost)} behavioural class(es) stopped running")
         return 1
+
+    # ON MASTER THE BASELINE MUST DESCRIBE THE COMMITTED SEED EXACTLY, and nothing else
+    # checks that. A movement is reported and (except runs-lost) not blocked, which is right
+    # for a candidate branch — but it means a merge that forgets `--write-baseline` ships a
+    # baseline that DISAGREES with its own seed, and the disagreement is silent in the one
+    # direction that flatters: a cell recorded `loud check reject` that actually RUNS is a
+    # `not-runs -> runs` movement, so the gate passes and `goal-scoreboard.py`, which reads
+    # the baseline, under-reports `runs`.
+    #
+    # That shipped on 2026-08-31: six `d421c00*` cells closed by D721 were left recorded as
+    # rejects, and master's scoreboard read `runs 4208 / total 113` when the truth was
+    # `4214 / 107`. An agent found it while diffing its own corpus run, not the gate.
+    #
+    # `--verify-fresh` is the post-merge check: ANY disagreement is a failure, in either
+    # direction. Run it on master after merging, never on a candidate branch, where a
+    # disagreement is the whole point.
+    if "--verify-fresh" in sys.argv:
+        n = len(lost) + len(into_silent) + len(other)
+        if n:
+            print(f"\ndistilled: STALE BASELINE — {n} cell(s) disagree with this seed. "
+                  f"The committed baseline does not describe the committed compiler; "
+                  f"re-run with --write-baseline and commit the result.")
+            return 1
+        print("\ndistilled: baseline is fresh for this seed ✅")
+        return 0
+
     print("\ndistilled: no runs lost ✅")
     return 0
 

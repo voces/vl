@@ -133,6 +133,45 @@ the compiler.
 run" are different facts, and only the second is about VL. The inventory is a notebook of what
 someone looked at; it is not a measurement of the language.
 
+## A NORMALISED MESSAGE IS NOT A TYPE, AND A MESSAGE IS NOT A SCOPE
+
+Two ways a refusal's own words misled a brief on 2026-08-31, both costing an agent-task:
+
+* **`goal-scoreboard.py` collapsed `i64` to `iN`.** Its `norm()` ran `re.sub(r"\d+", "N")` so
+  cells differing only in a type name would group — and primitive WIDTHS went with them. The
+  conceded bucket printed `== over iN[] has no lowering`; I read it as `i32[]`, checked
+  `i32[] == i32[]` by hand, found it RUNS, and briefed an agent that the bucket was a
+  capability lost at the pin. **None of those cells is `i32[]`** — the raw list is `i64[]`,
+  `f64[]`, `string[][]`, `Circle[]` and friends, every one of which refuses at its DIRECT
+  spelling too. The agent built a 100-pair direct/pin grid to prove there was no disagreement
+  anywhere. Fixed: a primitive width keeps its digits, every other number still collapses.
+
+* **A refusal's sentence describes the arm that fired, not the feature.** Three in one day were
+  broader than the defect: `nested arrays are not supported` refused only an INFERRED nested
+  array with a ref leaf (annotated `i32[][]` always ran); `only i32 / boolean / string / array
+  struct fields are supported` was false at f64, i64, map and nested-struct; and `a
+  nullable-Circle list element has no rep` is false at every spelling — `(Circle | null)[]`
+  declared, read, and holding a null all work, and the refusal belongs to a two-destination
+  context that the sentence never mentions.
+
+**Before believing a refusal's scope, run the plainest program the sentence forbids.** It costs
+seconds and it has been wrong three times out of three. Narrowing the message is then part of
+the fix, not a substitute for one.
+
+## COUNT A POPULATION BY WHERE ITS CELLS CAME FROM, NOT BY THEIR MESSAGE
+
+`113 cells against the goal` was twelve distinct messages and looked like a long tail. Grouped
+by originating grid it was **80 of 113 in ONE refused language decision** (array covariance and
+aliasing — the `d411` and `d741`/`d742` grids), with only 33 independently actionable. The
+51-cell "two declared destinations", the 18-cell "nullable-Circle list element has no rep" and
+all 11 remaining clause-1 cells are the same question wearing three sentences.
+
+One line gets you this, and it is worth running before scheduling anything:
+
+```python
+collections.Counter(k.split("_")[0] for k in cells)   # cell ids carry their grid
+```
+
 ## A VALIDATOR SENTENCE IS NOT A MECHANISM — do not group silent cells by their message
 
 The engine prints `type mismatch: expected (ref $type), found (ref $type)` for every heap-type
