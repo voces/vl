@@ -45,6 +45,16 @@ run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 run "filed witnesses"          python3 scripts/check-filed-witnesses.py --strict docs/internals/silent-class-inventory.md
 run "distilled corpus"         python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
 
+# ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
+# is SUPPOSED to disagree with it — that disagreement is the change being measured — so this
+# would be nonsense there. On master it is the check that a merge did not forget
+# `--write-baseline`: six cells shipped mis-recorded on 2026-08-31 and the scoreboard, which
+# reads the baseline, under-reported `runs` by six until an agent noticed while diffing its
+# own corpus run.
+if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
+  run "baseline freshness"     python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh
+fi
+
 FAIL=0
 printf '\n%-22s %8s  %s\n' "GATE" "TIME" "RESULT"
 for i in "${!PIDS[@]}"; do
