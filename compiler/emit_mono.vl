@@ -146,6 +146,8 @@ import {
   monoInstName,
   monoInstOrig,
   monoKeys,
+  monoLamPinned,
+  monoLamShared,
   monoOrigNode,
   monoProgStmts,
   reExpName,
@@ -1574,6 +1576,388 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
     }
   }
   -1
+}
+
+// ── D426: a lambda declared inside a generic body is a TEMPLATE ──────────────
+//
+// `collectFns` runs BEFORE `monomorphize` and lifts `const g = (x: T[]) => …` exactly once,
+// with the enclosing function's `T` still written on its parameters. `monoMakeInstance`
+// rewrites the GENERIC's own annotations per pin, but the lifted lambda is a slot of its own
+// that no instance owned, so ONE function served every instance at the unsubstituted type —
+// its `$fnsig` key and its functype were built from `T[]`, which lowers to the i32 default.
+// The three sites below are that gap closed on the producer side: substitute at the pin
+// (`monoCloneLambdaSubst`, driven by `monoPinBodyLambdas`) and stop emitting the template
+// (`monoLamSlotIsTyParamTemplate`, read by the prune at the end of `monomorphize`).
+//
+// D426 shipped the FLOOR for this in `checkParams` — `emitProgram: parameter `T[]` still
+// names an unsubstituted type parameter` — and its own close said the floor was a price, not
+// a fix: 33 of its grid's cells were check-clean invalid wasm and every one had a control
+// that RAN. The floor also cost four `runs` cells (`d426nul_*`), which its price note
+// recorded as reversible "the day someone lands per-pin lifting". This is that day; the
+// floor stays as the honest answer for a shape the substitution cannot reach.
+
+// One annotation node, substituted through this instance's binding: a fresh `TypeRef` when a
+// type parameter substitutes (`T[]` → `f64[]`), or -1 for "nothing to do" — the annotation is
+// absent, is already concrete, or names a type parameter this instance could not bind.
+//
+// The SUBSTITUTED TYPE rides along rather than a re-parse of the substituted NAME, and it is
+// gated the way `monoSubstLetType` and the return site gate theirs: `substTyDeep` rebuilds
+// only what CHANGED, so a parameter it could not bind is left in place and is
+// indistinguishable at the result from a full substitution. `tyHasTyVar` separates the two
+// and fails toward the name path.
+function monoSubstAnnNode(
+  pty: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  if pty < 0 { return -1 }
+  const tn = P.nodes[pty]
+  if tn is TypeRef {
+    // The RAW spelling where a type parameter is shadowed by a declared alias — the same
+    // read every other substitution site in this file takes, for `monoDeclAnnName`'s reason.
+    const ann = monoDeclAnnName(pty, tn.tyName, typarams)
+    if monoAnnHasTyParam(ann, typarams) {
+      const sub = monoSubstAnn(ann, typarams, tvN, tvV)
+      // -2, NOT -1: the annotation DOES name a type parameter and the substitution produced no
+      // new spelling for it (an UNBOUND parameter — `<T, U>` with only `T` bound by the
+      // signature — or an identity). The caller has to tell that apart from "already concrete",
+      // because a template it then leaves in place is one an instance body still refers to by
+      // name, and the prune must not stub that.
+      if sub == "" { return -2 }
+      if sub == tn.tyName { return -2 }
+      let sty = -1
+      const orig = nodeTyIxOf(pty)
+      if orig >= 0 {
+        const s2 = substTyDeep(orig, bN, bT)
+        if s2 >= 0 && s2 != orig {
+          if !tyHasTyVar(s2) { sty = s2 }
+        }
+      }
+      return synthTypeRefTy(sub, tn.pos, sty)
+    }
+  }
+  -1
+}
+
+// Membership in one of the two lambda-template ledgers. Linear, and that is the right shape: a
+// program holds a handful of such templates, and a set would be a hash table for three entries.
+function monoI32ListHas(xs: i32[], v: i32) {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == v { return true }
+    i = i + 1
+  }
+  false
+}
+
+function monoNoteLamNode(xs: i32[], v: i32) {
+  if !monoI32ListHas(xs, v) { xs.push(v) }
+  0
+}
+
+// The lexical frame a lifted function's slot records (`fnParent`), found from its arena node.
+// -1 when the node holds no lifted slot, which is the value `collectFns` itself pushes for a
+// module-scope lift.
+function monoLamParentOf(fnIx: i32) {
+  let i = 0
+  while i < fnStmts.length {
+    if fnStmts[i] == fnIx {
+      if i < fnParent.length { return fnParent[i] }
+      return -1
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
+// annotation SUBSTITUTED through this instance's binding, lift the clone into `fnStmts`, and
+// return its node index — or -1 when nothing substitutes (a concrete lambda is correct at
+// every pin and every instance keeps sharing it, so the all-concrete path stays
+// byte-identical).
+//
+// The BODY is SHARED with the original, exactly as `monoCloneLambdaPinned` shares it: the
+// emitter re-derives every operand type from the (now concrete) parameter per function, so
+// one body lowers correctly under each pin.
+function monoCloneLambdaSubst(
+  fnIx: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  const a = P.nodes[fnIx]
+  if a is FuncDecl {
+    // A NESTED GENERIC declaration carries pins of its own and is instantiated by
+    // `monoInstantiate` at its own call sites; only a lambda that inherited the enclosing
+    // frame's type parameters is this pass's business.
+    if a.fnTyParams.length > 0 { return -1 }
+    // NOT A TEMPLATE AT ALL — every annotation is concrete, so one lifted function is correct
+    // at every pin and every instance keeps sharing it. Returned BEFORE either ledger is
+    // touched: the prune reads them to decide whether a template is still referenced, and a
+    // lambda that was never a template must not appear in either.
+    if !monoLamNodeIsTemplate(fnIx, typarams) { return -1 }
+    const ps: i32[] = []
+    let any = false
+    let i = 0
+    while i < a.fnParams.length {
+      const p = P.nodes[a.fnParams[i]]
+      if p is Param {
+        const nt = monoSubstAnnNode(p.parType, typarams, tvN, tvV, bN, bT)
+        if nt >= 0 {
+          ps.push(mkParam(p.parName, nt, p.parDefault, p.parOpt, p.pos))
+          any = true
+        } else if nt == -2 {
+          // The annotation names a type parameter this instance cannot substitute. The
+          // template stays, this instance keeps calling it, and the `checkParams` floor
+          // refuses the program loudly — which is the honest answer, and the reason the
+          // prune must be told.
+          monoNoteLamNode(monoLamShared, fnIx)
+          return -1
+        } else {
+          // Unchanged — share the original `Param` node, so a lambda with one generic and
+          // one concrete parameter mints exactly one node.
+          ps.push(a.fnParams[i])
+        }
+      } else {
+        monoNoteLamNode(monoLamShared, fnIx)
+        return -1
+      }
+      i = i + 1
+    }
+    let nret = a.fnRet
+    const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
+    if rt >= 0 {
+      nret = rt
+      any = true
+    } else if rt == -2 {
+      monoNoteLamNode(monoLamShared, fnIx)
+      return -1
+    }
+    if !any {
+      monoNoteLamNode(monoLamShared, fnIx)
+      return -1
+    }
+    // AN UN-ANNOTATED RETURN THAT RIDES THE TYPE PARAMETER, annotated at the pin. The checker
+    // records an anonymous lambda's inferred return under its NODE index, and the clone is a
+    // node the checker never saw — but the generic template has NO row either (measured: the
+    // recorder skips a lambda inside a generic body), so there is nothing to carry over and
+    // the classifier is left re-deriving the rep from a body whose every type is a variable.
+    // For `(x: T | null) => x` at `T := i32[]` it settled on the plain list and declared
+    // `(result (ref $list))` over a body handing back `(ref null $list)` — check-clean invalid
+    // wasm, the one shape the substitution alone moved from loud to silent.
+    //
+    // The RETURN EXPRESSION's own recorded type is the fact, substituted through the same
+    // binding as the parameters — D592's fall-through move, one frame down. GATED ON THE
+    // TYPE ACTUALLY CARRYING A VARIABLE, so a lambda whose return is already concrete keeps
+    // today's inference untouched and byte-identical.
+    if nret < 0 {
+      const rex = fnRetExprOf(fnIx)
+      if rex >= 0 {
+        const rty = nodeTyIxOf(rex)
+        if rty >= 0 {
+          if tyHasTyVar(rty) {
+            const rs = substTyDeep(rty, bN, bT)
+            if rs >= 0 && rs != rty {
+              if !tyHasTyVar(rs) {
+                const rnm = tyToEmitName(rs)
+                if rnm != "" { nret = synthTypeRefTy(rnm, -1, rs) }
+              }
+            }
+          }
+        }
+      }
+    }
+    const nm = "__lambda_" + i32ToStr(lambdaCtr)
+    lambdaCtr = lambdaCtr + 1
+    const noTP: string[] = []
+    const clone = mkFunc(nm, noTP, ps, nret, a.fnBody, a.pos)
+    fnStmts.push(clone)
+    // THE ORIGINAL'S FRAME, not module scope. The clone shares the body, so its free names
+    // have to resolve up the SAME scope chain or a lambda that both captures and annotates
+    // `T` would lose its environment. (`monoCloneLambdaPinned` pushes -1 because a
+    // `.map` callback is rebuilt from an ARGUMENT position, not from a lifted slot that has
+    // a frame of its own.)
+    fnParent.push(monoLamParentOf(fnIx))
+    fnDispNames.push("")
+    fnValUsed = true
+    monoNoteLamNode(monoLamPinned, fnIx)
+    return clone
+  }
+  -1
+}
+
+// Per-instance lambda monomorphization for a lambda BOUND IN a generic body — the annotated
+// sibling of `monoPinMapLambdas`. Walks the instance's statement spine and, at a `LetDecl`
+// whose initializer is a lifted lambda whose annotations still mention a type parameter,
+// substitutes at this pin and repoints the binding at the clone. Copy-on-write, so a body
+// with no such lambda is the same node index and every program without this shape emits
+// byte-identical output.
+//
+// BOUND, stated rather than discovered later: only a `LetDecl` INITIALIZER is rewritten. A
+// lambda written at a type parameter in an ARGUMENT position (`apply((x: T[]) => …, a)`) is
+// refused before this by the generic-HOF parameter floor — a different message and a
+// different mechanism — and a lambda RETURNED from a generic body is the closure-result
+// slice this file's `nret` ladder also excludes.
+function monoPinBodyLambdas(
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  if ix < 0 { return ix }
+  if typarams.length == 0 { return ix }
+  const n = P.nodes[ix]
+  if n is Block {
+    const ns: i32[] = []
+    let changed = false
+    let i = 0
+    while i < n.blkStmts.length {
+      const cs = monoPinBodyLambdas(n.blkStmts[i], typarams, tvN, tvV, bN, bT)
+      ns.push(cs)
+      if cs != n.blkStmts[i] { changed = true }
+      i = i + 1
+    }
+    if !changed { return ix }
+    return mkBlock(ns, n.pos)
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 {
+      const iv = P.nodes[n.letInit]
+      if iv is FuncDecl {
+        const cl = monoCloneLambdaSubst(n.letInit, typarams, tvN, tvV, bN, bT)
+        if cl < 0 { return ix }
+        return mkLet(n.letKw, n.letName, n.letType, cl, n.pos)
+      }
+    }
+    const ci = monoPinBodyLambdas(n.letInit, typarams, tvN, tvV, bN, bT)
+    if ci == n.letInit { return ix }
+    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+  }
+  if n is RetStmt {
+    const ca = monoPinBodyLambdas(n.retArg, typarams, tvN, tvV, bN, bT)
+    if ca == n.retArg { return ix }
+    return mkReturn(ca, n.pos)
+  }
+  if n is WhileStmt {
+    const cb = monoPinBodyLambdas(n.whileBody, typarams, tvN, tvV, bN, bT)
+    if cb == n.whileBody { return ix }
+    return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
+  }
+  if n is IfStmt {
+    const ct = monoPinBodyLambdas(n.ifThen, typarams, tvN, tvV, bN, bT)
+    const ce = monoPinBodyLambdas(n.ifElse, typarams, tvN, tvV, bN, bT)
+    if ct == n.ifThen && ce == n.ifElse { return ix }
+    return mkIf(n.ifCond, ct, ce, n.pos)
+  }
+  if n is ForRange {
+    const cb = monoPinBodyLambdas(n.frBody, typarams, tvN, tvV, bN, bT)
+    if cb == n.frBody { return ix }
+    return mkForRange(n.frVar, n.frFrom, n.frTo, n.frStep, cb, n.frLabel, n.pos)
+  }
+  if n is ForIn {
+    const cb = monoPinBodyLambdas(n.fiBody, typarams, tvN, tvV, bN, bT)
+    if cb == n.fiBody { return ix }
+    return mkForIn(n.fiVar, n.fiIter, cb, n.fiLabel, n.pos)
+  }
+  if n is Paren {
+    const ci = monoPinBodyLambdas(n.parInner, typarams, tvN, tvV, bN, bT)
+    if ci == n.parInner { return ix }
+    return mkParen(ci, n.pos)
+  }
+  ix
+}
+
+// The type parameters of every ENCLOSING lifted frame of `fe`, appended to `out`. The chain is
+// `fnParent`; each frame's ORIGINAL declaration is the one that carries the `<T>`, because
+// `fnStmts[p]` may already hold that generic's FIRST instance, whose annotations are concrete
+// by construction. Bounded by the function count, so it terminates even were `fnParent` ever
+// to contain a cycle (the same bound `parentBindingFrameOf` takes).
+function monoEnclosingTyParams(fe: i32, out: string[]) {
+  let p = -1
+  if fe < fnParent.length { p = fnParent[fe] }
+  let guard = 0
+  while p >= 0 && guard <= fnStmts.length {
+    let nd = -1
+    if p < monoOrigNode.length { nd = monoOrigNode[p] }
+    else if p < fnStmts.length { nd = fnStmts[p] }
+    if nd >= 0 {
+      const fn = P.nodes[nd]
+      if fn is FuncDecl {
+        let i = 0
+        while i < fn.fnTyParams.length {
+          out.push(fn.fnTyParams[i])
+          i = i + 1
+        }
+      }
+    }
+    if p < fnParent.length { p = fnParent[p] } else { p = -1 }
+    guard = guard + 1
+  }
+  0
+}
+
+// Is the lifted slot `fe` a lambda TEMPLATE — an annotation still naming a type parameter of
+// an enclosing generic frame? Every instantiation of that frame mints its own copy
+// (`monoCloneLambdaSubst`), so this slot is to the lambda what an un-instantiated `<T>` decl
+// is to a named generic: no concrete signature, and nothing in the module refers to it.
+// The prune at the end of `monomorphize` stubs it for the same reason it stubs those.
+//
+// WITHOUT THIS THE SUBSTITUTION BUYS NOTHING, because the template is emitted whether or not
+// an instance exists: a generic that is never CALLED still has its lambda lifted, and
+// `checkParams` reaches the slot directly. The two rungs are one landing.
+function monoLamNodeIsTemplate(fnIx: i32, typarams: string[]) {
+  if typarams.length == 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnTyParams.length > 0 { return false }
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType >= 0 {
+          const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+          if monoAnnHasTyParam(ann, typarams) { return true }
+        }
+      }
+      i = i + 1
+    }
+    if fn.fnRet >= 0 {
+      const rann = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), typarams)
+      if monoAnnHasTyParam(rann, typarams) { return true }
+    }
+  }
+  false
+}
+
+function monoLamSlotIsTyParamTemplate(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const tps: string[] = []
+  monoEnclosingTyParams(fe, tps)
+  monoLamNodeIsTemplate(fnStmts[fe], tps)
+}
+
+// Was any ENCLOSING frame of lifted slot `fe` instantiated? A template whose generic no call
+// site ever pinned has no live reference: the generic's own slot is stubbed by the arm above in
+// this same loop, and the body that named the lambda goes with it. Bounded by the function
+// count, like every other `fnParent` walk here.
+function monoLamFrameInstantiated(fe: i32) {
+  let p = -1
+  if fe < fnParent.length { p = fnParent[fe] }
+  let guard = 0
+  while p >= 0 && guard <= fnStmts.length {
+    if monoInstantiatedAny(p) { return true }
+    if p < fnParent.length { p = fnParent[p] } else { p = -1 }
+    guard = guard + 1
+  }
+  false
 }
 
 // Per-instance lambda monomorphization for `.map`/`.filter`. The shared definition body of an
@@ -3343,6 +3727,20 @@ function monoMakeInstance(
       letBN,
       letBT,
     )
+    // D426 — substitute a BOUND lambda's own annotations at this pin, and mint the lambda per
+    // instance. `monoCloneBody` above rebuilds the statement spine and shares every leaf
+    // expression including a nested lambda; that sharing is exactly right for a concrete
+    // lambda and exactly wrong for one whose parameters are written at `T`, since `collectFns`
+    // has already lifted it and the one lifted function then served every instance at the
+    // unsubstituted type. Copy-on-write: a body with no such lambda is the same node index.
+    const instBody0L = monoPinBodyLambdas(
+      instBody0,
+      fn.fnTyParams,
+      tvN,
+      tvV,
+      letBN,
+      letBT,
+    )
     // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to a
     // NON-i32 element (`self: f64[]` ⇒ the `(x) => …` callback's `x` is f64): the shared
     // body's un-annotated lambda would otherwise emit as i32. Build the param→element map
@@ -3373,7 +3771,7 @@ function monoMakeInstance(
       pe = pe + 1
     }
     const instBody1 = monoPinMapLambdas(
-      instBody0,
+      instBody0L,
       pElemNames,
       pElemTypes,
       pElemTys,
@@ -4909,6 +5307,8 @@ export function monomorphize(stmts: i32[]) {
   monoInstName = []
   monoInstFe = []
   monoProgStmts = stmts
+  monoLamPinned = []
+  monoLamShared = []
   let any = false
   let fe = 0
   while fe < fnStmts.length {
@@ -5147,6 +5547,32 @@ export function monomorphize(stmts: i32[]) {
           while ci < cndFe.length {
             if cndFe[ci] == gp && cndVal[ci] == 0 { prune = true }
             ci = ci + 1
+          }
+          // D426 — THE LAMBDA TEMPLATE, which is the `<T>` arm above one frame down. A lambda
+          // lifted out of a generic body still spells its parameters at the enclosing `T`, and
+          // `collectFns` lifted it ONCE, before any pin existed. Each instance now mints its own
+          // copy with the pin substituted (`monoCloneLambdaSubst`), so this slot has exactly the
+          // property the arm above prunes on: no concrete signature, and no reference left.
+          //
+          // Gate (1) of that arm — NOT an anonymous lambda — is the one this deliberately
+          // inverts, and the reason it can is that the property is decided by the ANNOTATION
+          // rather than by whether anything instantiated the slot. A lifted `(x) => x * 2` has
+          // no `T` in it and is never claimed here; a lifted `(x: T[]) => …` has no lowering at
+          // all, for the same reason an un-instantiated `<T>` decl has none.
+          if !prune {
+            if criFnIsAnonLambda(gp) && monoLamSlotIsTyParamTemplate(gp) {
+              // TWO LEDGERS, AND BOTH ARE LOAD-BEARING. Stub the template only when a clone
+              // actually replaced it, or when no enclosing frame was instantiated at all.
+              // A template a clone DECLINED (`monoLamShared`) is one an instance body still
+              // calls by name, and a template the walk never reached is in neither list —
+              // stubbing either would leave `const g = <() -> void stub>` and a silently
+              // wrong answer where the `checkParams` floor gives a loud one.
+              const lnd = fnStmts[gp]
+              if !monoI32ListHas(monoLamShared, lnd) {
+                if monoI32ListHas(monoLamPinned, lnd) { prune = true }
+                else if !monoLamFrameInstantiated(gp) { prune = true }
+              }
+            }
           }
         }
         if prune {
