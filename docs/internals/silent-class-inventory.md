@@ -17576,10 +17576,10 @@ Repro:
   type; re-asking it through `variantStructHeapTwinAt` lifts the decline and this row's read
   resolves. Both the miss and the hit were graded, as this row asked.
 
-### D613 — an empty list literal CAPTURED by a nested function commits its element row before the capture is resolved
-**check-clean invalid wasm · 22 of the 92 · found 2026-08-30 with D611 · the closure capture is the ONLY load-bearing ingredient: the element type is not — an `f64`-backed literal union, an `i32`-backed one and a plain `f64` field all reproduce identically**
+### D613 — [CLOSED 2026-08-30] an empty list literal CAPTURED by a nested function had its ENV-STRUCT FIELD typed a whole section before anything pinned the element row
+**now RUNS · was `check-clean invalid wasm` · found 2026-08-30 with D611 · closed as `runs`, not as a third refusal: D411's and D501's destination is AMBIGUOUS and this one is not · 17 corpus classes / 310 census cells `check-clean invalid wasm` -> `runs`, 0 `runs` lost, 0 into any silent class, every corpus module that built before builds BYTE-IDENTICAL**
 
-Repro:
+Repro (now runs, printing nothing):
 
     type F = 1.5 | 2.5
     type Circle = { r: F }
@@ -17590,18 +17590,146 @@ Repro:
       inner()
     }
     outer()
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
-    // SHOULD RUN (and print nothing)
+    // was: vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 215:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // Now: runs and prints nothing.
 
-* **ONE INGREDIENT, ABLATED.** Hoist the `sink(c)` call out of `inner` and into `outer` and it
-  runs. Change `F` to `1 | 2`, or the field to a plain `f64`, and it still fails — so this is
-  not a rep question, it is a question of WHEN the captured literal's element row is decided.
-* **THE NEIGHBOURS ARE D411 AND D501 AND THEY ARE BOTH CLOSED**, both about an un-annotated
-  list literal's element row being committed too early. Both close as LOUD EMIT REJECTS. Read
-  their closes first: this row is the same commit happening across a capture boundary, and the
-  right outcome here is `runs`, not a third refusal — the destination is unambiguous (`sink`
-  names `Circle[]` and nothing else consumes `c`).
+* **THE ROW'S OWN ABLATION WAS RIGHT AND IT IS AN ORDERING FACT, NOT A REP FACT.** The
+  element type moves nothing — `1.5 | 2.5`, `1 | 2`, a plain `f64` and a `string` field all
+  reproduced identically and all now run. Removing the CAPTURE is the one ablation that
+  changes the outcome, and the reason is that there is then no env struct to type at all.
+
+* **THE BYTES NAME THE PASS. ONE LINE OF THE MODULE CHANGES AND IT IS A TYPE, NOT AN
+  INSTRUCTION.** Off `./node_modules/.bin/wasm-dis` (binaryen 130 — the two `$type`s print
+  under the same elided name, so nothing short of the disassembly separates them):
+
+      -  (type $12 (struct (field (ref $6))))
+      +  (type $12 (struct (field (ref $8))))
+
+  `$12` is `inner`'s env struct. `$6` is `{(ref (array (mut i32))), i32, i32}` — the DEFAULT
+  i32-list wrapper. `$8` is `{(ref (array (mut (ref null $Circle)))), i32, i32}` — the real
+  one, and it is what `outer`'s own local (`(local $1 (ref $8))`) and `sink`'s param
+  (`(param (ref $8))`) already were on master. Every other byte of the module, in both
+  functions, is unchanged: the producer and the consumer always agreed and only the env
+  field did not.
+
+* **THE MECHANISM, MEASURED ON THE CALL, NOT INFERRED.** A probe on `captureValKind` (the
+  function that TYPES the env field) reads SIX calls for `c` on the base compiler, in this
+  order:
+
+      |TYPESEC c k=list slot=-1 |cvk-INIT c k=list refarr=false holek=1 holeslot=0 rlslot=-1
+      |cvk-ANN c k=reflist  (x5)
+
+  The FIRST call is `emitTypeSection`'s own, and at that moment the binding is
+  UN-ANNOTATED, so `captureValKind` classifies the INITIALIZER — and an empty `[]` has no
+  element to classify (`arrLitIsRef` declines a literal with no elements BY CONSTRUCTION,
+  which its header states as an invariant). The other five calls come from the CODE section
+  and read `reflist`, because by then an annotation exists. **What writes it is
+  `synthEmptyListAnn`, and until this change its only caller was `collectLocals`** — i.e.
+  the code section, one whole section after the type section committed the field. The probe
+  also shows the answer was available the entire time: `holek=1` says the checker had
+  already unified the hole with `Circle[]` and `emptyArrHoleKind` reads `reflist` off it.
+
+* **THE FIX IS `synthGlobalEmptyListAnns`' ARGUMENT, ONE STORAGE CLASS OVER, AND THAT HEADER
+  ALREADY STATES IT.** It reads: *"ordered BEFORE `emitModule` for the obvious reason: the
+  global section reads `globalCellKind`, whose annotated ladder is what the synthesized
+  annotation steers"*. A global never reaches `collectLocals`; **neither does a captured
+  binding, in time** — the section that reads it (there the global section, here the TYPE
+  section's env structs) is emitted before the pass that writes it. `synthCaptureEmptyListAnns`
+  runs the identical synthesis over exactly the bindings the type section types: every
+  capturing frame (`fnStmts`), every capture name (`captureNamesOf`), resolved by
+  `parentBindingOf` — **the very function `captureValKind` and `captureValStructIdx` resolve
+  the field through**, so the pass and the field cannot disagree about which binding is meant.
+  It is idempotent (`s.letType < 0` on entry), so `collectLocals`' own later call declines and
+  the LOCAL's classification is untouched.
+
+* **WHY `runs` IS RIGHT HERE AND THE REFUSAL WAS RIGHT AT D411/D501 — the difference is a
+  COUNT, and it is checkable.** Those two rows refuse because ONE list value is bound to TWO
+  declared destinations whose elements are stored differently (`Circle[]` and `Shape[]`): a
+  list value has one element rep and the two destinations demand two, so whichever slot the
+  emitter picks the OTHER store is a type mismatch — no answer exists, which is why all three
+  of D411's enumerated "ways to make it run" stayed refused. **Here the count is one.** `sink`
+  names `Circle[]`, nothing else consumes `c`, and the compiler had ALREADY committed to that
+  answer in two of the three places it matters — the local and the callee param are both
+  `(ref $8)` on master. The fix does not choose between rivals; it stops one reader answering
+  before the answer is written down. The two rows' own predicate is untouched: this pass never
+  reaches a binding with a second destination, because `synthEmptyListAnn` fires only on an
+  EMPTY `ArrayLit`, and `letRefListDestSlotK` — the predicate both refusals stand on — returns
+  -1 for an empty literal by construction (*"an EMPTY `[]` is already destination-typed through
+  `pendingListKind` / `emptyArrHoleKind`; it has no element inference to correct"*). D411's and
+  D501's grids and fixtures are unmoved.
+
+  **AND THE CONTROL SURVIVES IT.** The filed row's one ablation — hoist `sink(c)` out of
+  `inner` — runs on master and still runs (L6 of the fixture). That is the case where the
+  destination is equally unambiguous and there is no env struct, and it is why "the capture
+  is the ingredient" and "the destination is unambiguous" are consistent statements rather
+  than competing ones.
+
+* **TWO RUNGS, ABLATED, AND THE SECOND SCORES ZERO ON THE CORPUS AND IS LOAD-BEARING ANYWAY.**
+
+  | rung | site | corpus classes moved | out-of-corpus witness |
+  |---|---|---|---|
+  | 1 | `synthEmptyListAnn` on a captured binding | **17** (310 census cells) | the filed repro |
+  | 2 | `synthNullableAnn` on the same binding | **0** | `const v = m["z"]` captured: `check-clean invalid wasm` -> **runs** |
+  | 1+2 | | **17** | both |
+  | strip-all | | 0 | base seed reproduced BYTE-FOR-BYTE, `0407ec5ba9f70e9394739cc5bddc537d` |
+
+  Rung 2 is the exact shape the ablation discipline warns about: zero on a DERIVED
+  population is not zero. `wasm-tools print` (which parses the invalid module `wasm-dis`
+  refuses) shows its own one-line diff — `(type (;13;) (struct (field i32)))` becomes
+  `(struct (field (ref 0)))`, the union box — i.e. the same defect at the same site with a
+  different initializer. It is pinned as L7 of the fixture rather than measured away.
+
+  Two rungs were built, measured and DECLINED. `synthRetPinAnn` on the same walk: 0 corpus
+  classes and 0 on three constructed capture-shaped witnesses (including D39's own program
+  with the binding captured), because its producer is an OBJECT LITERAL — a non-empty
+  producer, which `captureValKind`'s un-annotated arm already classifies correctly, so the
+  env field was never wrong. And placing the pass EARLY (before `collectA#2`, so a
+  synthesized annotation could be interned rather than merely resolved): 0 additional
+  classes and it costs byte-identity — **2 of 2,451 corpus modules DIFFER** where the late
+  placement differs on none.
+
+* **COUNTERS, BOTH RUNGS OF THE LADDER.** Over the 1,996-module fixture corpus the pass is
+  **REACHED 332 times across 100 modules** and **ANSWERS 0 times** — every captured binding
+  in the corpus already carried, or did not need, its annotation. That is the whole
+  explanation of the byte-identity below, and it is why `reach` had to be measured
+  separately: an unreached pass and a reached-but-declining one produce the same 0 DIFFER.
+  On the two witnesses the same counters read `reach=1 ansE=1 ansN=0` (the filed repro) and
+  `reach=1 ansE=0 ansN=1` (the nullable capture); on the hoisted control, `reach=0`.
+
+* **THE MOVEMENT, CELL-MATCHED** (`scripts/silent-sweep/distilled/regress.py`, 7,021 cells):
+
+  | | base | landing |
+  |---|---|---|
+  | check-clean invalid wasm | 92 | **75** |
+  | runs | 3,704 | **3,721** |
+  | loud emit reject | 314 | 314 |
+  | loud check reject | 2,911 | 2,911 |
+  | `runs` -> NOT-RUNS | — | **0** |
+  | -> silent | — | **0** |
+  | other movement | — | **0** |
+
+  The 17 classes stand for **310 census cells**, every one of them
+  `check-clean invalid wasm -> runs`. Of the 92 base-silent cells, 18 carry an un-annotated
+  empty `[]` and **17 of the 18 moved**; the one that does not (`b004880`) has no capture —
+  it is `const cc = []` returned from a `{r: i32 | null}[][]` function — so it is a
+  different row, not a residue of this one.
+
+* A **COMPILER TRAP REMOVED, not added.** `const c = []` captured by a lambda that
+  `.push`es into it traps the compiler on master (`wasm trap: out of bounds array access`,
+  backtrace inside `vl-compiler.wasm`); it is now the same LOUD reject its own hoisted
+  control has always given (`emitProgram: ref .push but ref list type not collected` — a
+  separate, pre-existing gap: nothing in that program spells `Circle[]`, so the ref-list row
+  is never interned).
+
+* Corpus `cmp` **2,452 modules · 1,996 IDENTICAL · 0 DIFFER · 0 LOST** (455 build under
+  neither compiler — the `@check`-only fixtures and module fragments — and fail
+  identically). The one `GAINED` is this change's own fixture, which is GAINED by
+  construction: it did not build on the base, and that is the defect.
+  Pinned as `tests/cases/closures/capture-unannotated-empty-list-element.vl`, whose seven
+  legs are the four element backings, two frames deep, a lambda capture, the hoisted control
+  and rung 2.
 
 ### D621 — an INERT declaration of a struct with the arm's layout refuses the arm's own nullable field read, on a heap D280 already merged
 **[CLOSED 2026-08-30] the repro below RUNS and prints `7`. Was: loud emit reject (`emitProgram: bare null needs a struct-typed context`) · **151 of the distilled corpus's 314 emit-reject cells — the largest cluster by 3.8x**, and no inventory row named it · clause 2 (no capability refusals), decided by the DIRECT spelling: delete the second `type` line and the identical program runs, and the module the fix emits is BYTE-IDENTICAL to the one that twin-free spelling already emitted · the same program with the null test replaced by `const v = c.r` was check-clean invalid wasm on master and runs too**
