@@ -24306,11 +24306,11 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D842 — the `??` LEFT-OPERAND READER this fix does not reach: a local's own CELL, not a map's value slot
+### D842 — [CLOSED 2026-08-31] the `??` LEFT-OPERAND READER a local's own CELL needs, and the reader D841 measured out was HALF of it
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context`, with a SILENT invalid-module twin one default value over · 2 cells (`distilled/named/d842_ident_reader_*`), OPEN · the same defect as D833 one DELIVERY FORM over, and it is filed rather than built because the reader that would reach it was implemented, measured to close nothing, and removed**
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (1 cell) and `check-clean invalid wasm` (1 cell) · a CLAUSE-2 and CLAUSE-1 close · ABLATED family 40 cells (`distilled/named/d842_*`), four rungs in two halves · 2 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class**, corpus `cmp` **2,478 modules · 2,030 identical · 0 DIFFER · 0 LOST** · `goal-scoreboard.py` clause 1 1 → 0, clause 2 1 → 0, and the corpus reads **ZERO against the goal for the cells it had** — the 13 it now reports are THIRTEEN NEW CELLS this work wrote programs for, filed as D861/D862/D863**
 
-Repro (a loud emit reject):
+Repro (now runs, printing `0`):
 
     type R = { r: i32 }
     function rd() {
@@ -24319,25 +24319,308 @@ Repro (a loud emit reject):
       print(0)
     }
     rd()
-    // vl check rc 0; vl run ->
+    // was: vl check rc 0; vl run ->
     //   emitProgram: bare null needs a struct-typed context
-    // The `?? { r: "s" }` twin is CHECK-CLEAN INVALID WASM.
+    // Now: prints 0. The `?? { r: "s" }` twin was CHECK-CLEAN INVALID WASM and also runs.
 
-* **IT IS D833's SHAPE WITH THE MAP REPLACED BY A LOCAL.** Same competing `type R`, same `??`,
-  same two operands that need one boxed row. What differs is only where the literals are
-  DELIVERED: D841 closes the map form by pointing the map's value SLOT at the merged row, and a
-  local's `{r: i32} | null` cell takes its struct index from the binding's ANNOTATION instead
-  (`letAnnStructIdx` / `localStructIdx`), which the supersede does not touch.
+* **THE PREVIOUSLY-TRIED READER WAS CORRECTLY MEASURED AND WAS EXACTLY HALF THE FIX.** D841's
+  join-family mark originally recognised a bare IDENTIFIER left operand beside the map/list
+  INDEX one, and its report is right: with that reader present and nothing else, these two
+  cells grade EXACTLY as they do without it. Re-measured here, in the disassembly rather than
+  in the grade — with the reader alone master's two rows
+  `(type $0 (struct (field (mut i32))))` and `(type $1 (struct (field (mut (ref $4)))))` become
+  `$0` plus the MERGED `(type $1 (struct (field (mut (ref $2)))))` over the union box
+  `(type $2 (struct (field i32) (field anyref)))` — the row is minted and NOTHING NAMES IT.
+  The local's cell still resolves `$0`. So the reader scored zero for the reason D841 gave and
+  is load-bearing anyway; what it was missing is the cell-side redirect, and neither half moves
+  a single cell alone (the ablation below grades them separately, in both directions).
 
-* **THE READER WAS BUILT AND MEASURED OUT, which is why this is a row and not a TODO.** D841's
-  join-family mark originally recognised a bare IDENTIFIER left operand (`a ?? …` — the literal
-  `a` was bound to) beside the map/list INDEX one. With that reader present these two cells grade
-  EXACTLY as they do without it — the merged row is minted and the local's cell still names `R`
-  — so the reader admitted members no rung then used. A wider join population is the risky
-  direction (`d841_hazard_declared_dest` is what punishes it), so it was removed rather than
-  shipped inert.
+* **THE COMPETING `type R` IS SCENERY HERE, AND THAT IS THE DIFFERENCE FROM D833 — the filed
+  row's own first bullet was the part to disbelieve.** It read "IT IS D833's SHAPE WITH THE MAP
+  REPLACED BY A LOCAL. Same competing `type R`". Ablated over the carrier, master gives the
+  identical grade at every default value with NOTHING declared: `d842_none_null` is the same
+  loud reject and `d842_none_str` the same invalid module. The narrow `{r: i32}` row is minted
+  by the BINDING'S OWN ANNOTATION in `collectAnnShapes`, which runs before `collectAnonShapes`
+  — so this shape supplies its own competing row and needs no help. D833's carrier grid crossed
+  four carriers because there the declaration was the mechanism; here it is decoration, and the
+  `_none_` column is the cell that says so.
 
-* **WHERE TO START, and it is not the join family.** The cell, not the mint: whatever answers
-  `localStructIdx` / `letAnnStructIdx` for a `{r: i32} | null` binding has to take the same
-  redirect the mv slot takes. Both cells are in `named/` so the next attempt has the two programs
-  that say whether it worked.
+* **`_str` AND `_null` ARE ONE MECHANISM HERE, verified rather than inherited.** Both halves
+  close on the same four rungs and neither closes without all four; `_f64` behaves as `_str`
+  does and `_i32` is the control that always ran. That is D804's split unchanged — with `null`
+  the loser has no rep and the reject is loud; with a different scalar rep `anonValueFitsField`
+  refutes, each literal gets its own row, and the `??` joins two heap types.
+
+* **THE FOUR RUNGS, and the grid splits on SCOPE, not on the default value.**
+  * **the READER** (`anonLeafJoinSources`' bare-identifier arm, plus `anonLeafJoinBound`). The
+    literals that reach `a` are the ones bound to it — its declaration's initializer and any
+    later `a = { … }` — read by NAME over the whole program, exactly as the INDEX reader reads
+    its container's stores.
+  * **the LOCAL CELL** (`anonLeafSupersedeOf` at `nulRefStructIdxOfLet`). A kind-9 local takes
+    its struct index from its annotation; this is the one resolver that answers for it.
+  * **the GLOBAL CELL** (`globalNulRefSupersede` at `globalCellStructIdx`'s annotated leg).
+  * **the GLOBAL READER** (`globalNulRefSupersede` at `globalStructIndexSid`). Two sites and
+    not one because `globalStructIndexSid` calls `structIndexOfLet` DIRECTLY rather than
+    delegating, and its own header says the two must not drift — with only the first, the
+    module-scope cell is emitted at the merged row and every reader of it still resolves the
+    narrow one: `expected (ref null $type), found (ref null $type)`, `vl check` rc 0. That is
+    the one movement here that turns a loud reject SILENT, and it is a rung ablation, not a
+    shipped state.
+
+* **TWO RUNGS WERE BUILT AND DROPPED, measured at zero and with no witness.** The INIT legs of
+  `nulRefStructIdxOfLet` and `globalCellStructIdx` (an UN-annotated nullable-struct binding,
+  whose row comes from the callee's return). They move 0 of the 53 cells and 0 corpus bytes,
+  and they cannot fire by construction: the reader finds such a binding's declaration and its
+  initializer is a call, not a literal, so no `??` family ever supersedes that row. They are
+  the first thing to restore if D861 lands. The decline is recorded at both sites.
+
+* **THE ABLATION, four rungs, each built and graded cell-matched over the 52-program carrier ×
+  scope × default grid.** Strip-all is master's own seed,
+  `de5f39ec482c7d2fe666cd17677a3b98`, 1,570,526 bytes, built here from master's `compiler/`
+  rather than quoted (master `ac92fca6`, after #2064).
+
+  | rung | what it is | cells | note |
+  |---|---|---|---|
+  | all four (shipped) | | 40 → `runs` | corpus `cmp` 0 DIFFER · 0 LOST |
+  | −the reader | the join never sees a bare identifier | **every one of the 40 reverts, to master's grade EXACTLY** (`diff` of the 52-cell grid against master: identical) | the merged row is never minted |
+  | −the local cell | the kind-9 local keeps its annotation's row | the 28 FUNCTION-scope cells revert; the 12 module-scope ones still run | |
+  | −the global cell | `globalCellStructIdx` stops consulting it | the 12 module-scope cells revert, and the `_null` column goes LOUD → **check-clean invalid wasm** | |
+  | −the global reader | `globalStructIndexSid` stops consulting it | the same 12 revert; `_str`/`_f64` to invalid wasm, `_null` stays loud | |
+  | −the two init legs | an un-annotated nullable-struct binding takes the redirect too | **0 cells move, 0 corpus bytes** | dropped, not shipped |
+
+* **COUNTERS, reach AND ans, over every `tests/cases` and `std` module.** A probe build
+  counting each rung's calls and its answers, on the 2,030 of 2,478 modules that reach emit:
+  the ident reader is **asked 6 times and answers 1** (5 modules asked, 1 answered); the local
+  redirect **46 / 0** (26 modules); the global redirect **942 / 0** (42 modules). Zero answers
+  on the corpus is why `cmp` reads 0 DIFFER. On the cells the same counters are non-zero:
+  `d842_none_null` reports `ident 1/1 sup 1/1`, `d842_module_none_str` reports
+  `ident 1/1 gsup 4/4`, `d842_hazard_shadow_str` reports `ident 1/1 sup 1/1` and still prints
+  `z` from the other function's own row, and the control `g_none_i32` reports `ident 1/1
+  sup 1/0` — the reader answers, the redirect declines, because one atom mints nothing.
+
+* **THE PRICE-GUARDS ARE CELLS, not prose, because the redirect is PER-BINDING and a row-wide
+  one is the obvious wrong turn.** `d842_hazard_{declared_dest,param_dest,field_dest,list_dest,
+  map_dest,shadow_str,shadow_decl}` are a declared `R` destination, a `{r: i32}` parameter, a
+  nested struct field, a list element, a map value and a same-named binding in ANOTHER function
+  — each beside a merged `??` family over the same field set, each printing its own narrow
+  value. All seven were `check-clean invalid wasm` or a loud reject on master and all seven run
+  and print correctly here. `d842_readback_*` is the other half a grade column cannot see: the
+  merged box has to give the STORED i32 back (`107`), the default's own atom back (`s`), and
+  the post-coalesce write back (`9`).
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
+  `d842_readback_hit_str` — the cell that stores an i32 and reads it back beside a `string`
+  default. Master builds BOTH literals at `(type $0 (struct (field (mut i32))))` and hands the
+  string's `(ref $4)` header to it: `struct.new $0 (global.get $global$0)`, which is the
+  `expected i32, found (ref $type)` the engine refuses. Here the binding's local is
+  `(ref null $1)` over `(type $1 (struct (field (mut (ref $2)))))`, whose field is the union
+  box `(type $2 (struct (field i32) (field anyref)))` — the i32 stored with tag 0 through
+  `(type $3 (struct (field i32)))`, the string with tag 2 — and `$0` is still there,
+  unchanged, for every narrow destination in the program.
+
+* **MEASURED, all six instruments, on master `ac92fca6`.** Corpus `cmp`: **2,478 modules ·
+  2,030 identical · 0 DIFFER · 0 LOST · 448 not buildable by the base.** Distilled corpus:
+  **2 cells → `runs`**, **`runs → not-runs` ZERO, `→ silent` ZERO**. `tests/cases` + `std`:
+  **2,030 → 2,031 of 2,479 building** in 4.4 s at `JOBS=6`, and the set difference is EXACTLY
+  the one fixture this landing adds. `goal-scoreboard.py`: `runs` **4,367 / 7,313 (59.72%) → 4,407 / 7,364
+  (59.85%)**, against the goal **2 → 13** — 2 closed and 13 NEW cells added, which is the
+  number becoming true rather than getting worse. Fixture:
+  `tests/cases/types/coalesce-default-row-past-binding-cell.vl`.
+
+* **FOUR NEW ROWS, and every one of them was found by writing a program rather than by a
+  grid.** D861 (the `??` left operand is a CALL, or a binding of one — the other literal is in
+  the callee's RETURN, 9 cells), D862 (there is no second LITERAL at all; the other atom is
+  only in the ANNOTATION, 3 cells), D863 (two `??` families over one field set landing on
+  DIFFERENT merged sets while a nested-struct row also claims it, 1 cell, found by this
+  landing's own fixture) and D864 (a COMPILER TRAP in `emitGlobalSection`, reachable only on a
+  compiler INSTANCE that already compiled a layout-twin program — the LSP, the playground and
+  `tests/cases_wasm_test.ts` are the exposed consumers, and it is why this landing's fixture
+  carries no module-scope block). All fourteen reproduce identically on master `ac92fca6`;
+  none is a regression.
+
+---
+
+### D861 — the `??` left operand is a CALL, or a binding of one: the other literal is in the CALLEE'S RETURN and no reader reaches it
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context`, with a check-clean invalid-wasm twin at every other default rep · 9 cells (`distilled/named/d861_call_*`, plus 3 `_i32` controls that run), OPEN · the same defect as D842 one DELIVERY FORM further out, filed rather than built because reaching it needs a reader that sees INTO a callee and a redirect on the callee's RETURN row, and neither was measured**
+
+Repro (a loud emit reject):
+
+    function src(): {r: i32} | null { { r: 7 } }
+    function rd() {
+      const g1 = src() ?? { r: null }
+      print(0)
+    }
+    rd()
+    // vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // The `?? { r: "s" }` and `?? { r: 1.5 }` twins are CHECK-CLEAN INVALID WASM;
+    // `?? { r: 9 }` runs and prints 0.
+
+* **THREE DELIVERY FORMS, ONE MECHANISM, ablated.** `src() ?? { … }` directly, `const a =
+  src()` then `a ?? { … }` at function scope, and the same binding at MODULE scope. All three
+  grade identically at every default value, so the binding is not the question — the reader is.
+
+* **WHY D842's READER DOES NOT REACH IT, measured at the counters.** The bare-identifier arm
+  IS asked for the bound forms and reports `ident 1/0`: it finds the declaration named `a` and
+  its initializer is a `Call`, not an `ObjLit`, so nothing is appended. The join family is then
+  the default alone, one atom, and `anonLeafPolyUnionSetOpen`'s `atoms.length < 2` gate ends
+  the rung. For the direct `src() ?? …` form the reader is not even entered.
+
+* **A FIX NEEDS BOTH ENDS, and the second is the reason this is filed.** The reader half is
+  small — scan the callee's `return` statements and its implicit tail expression for object
+  literals. The delivery half is not: the value arrives through the callee's RETURN row
+  (`fRetKind` / `fRetStructIdx`), which is the function's own result valtype, so redirecting it
+  moves a SIGNATURE and every reader of it — `fnRetStructIndexSid`, `calleeReturnsStructIdxSid`,
+  `criClassify`'s stamp, the functype emitter — has to agree or the caller and the callee
+  disagree at the seam. D52's own header records what half a fix of exactly this shape looks
+  like: `mk` validates and the caller does not, with the engine's complaint moving one function
+  over and changing one word.
+
+* **THE TWO RUNGS D842 DROPPED ARE THIS ROW'S, and they are already written in the tree as
+  declines.** `nulRefStructIdxOfLet`'s and `globalCellStructIdx`'s INIT legs — an un-annotated
+  nullable-struct binding whose row comes from the callee's return — were built, measured at 0
+  cells and 0 corpus bytes, and left out with the reason stated at both sites. They become live
+  the day the reader above exists, and they cover the `_localbind` and `_globalbind` columns.
+
+---
+
+### D862 — there is no SECOND LITERAL at all: the other atom lives only in the ANNOTATION, so the merge has one member and declines
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context`, with a check-clean invalid-wasm twin at every other default rep · 3 cells (`distilled/named/d862_ann_only_atom_*`), OPEN · not D842's reader and not D804's merge — closing it means letting an ANNOTATION contribute an atom to a value union, which is wider than anything measured so far**
+
+Repro (a loud emit reject):
+
+    function rd() {
+      let a: {r: i32} | null = null
+      const g1 = a ?? { r: null }
+      print(0)
+    }
+    rd()
+    // vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // The `?? { r: "s" }` and `?? { r: 1.5 }` twins are CHECK-CLEAN INVALID WASM.
+
+* **THE ABLATION IS ONE TOKEN, and it separates this from D842 completely.** Change the
+  initializer from `null` to `{ r: 7 }` and the same program RUNS: that is `d842_none_null`,
+  which this landing closed. With `null` there is no object literal bound to `a` at all, so
+  D842's reader appends nothing and the `??`'s family is its own default —
+  `atoms.length < 2`, no mint, and the default is then written through the annotation's plain
+  `i32` field.
+
+* **THE ATOM IT NEEDS IS IN THE ANNOTATION AND NOWHERE ELSE.** `{r: i32} | null` says `i32`;
+  `anonLeafPolyUnionSetOpen` builds its member set out of same-fieldset LITERALS' atoms
+  (`anonLeafAtomName` over each field's value node), which is deliberately a refutation input.
+  Letting a declared type contribute would make the family a TYPE question rather than a
+  dataflow one, which is the direction `d841_hazard_declared_dest` and
+  `d842_hazard_declared_dest` both punish, so it is not a one-line widening.
+
+* **DECLARING THE MERGED SHAPE ALREADY WORKS**, as it does for D804 — `let a: {r: i32 | null} |
+  null = null` makes the repro print. So this is a capability gap, not a rule.
+
+---
+
+### D863 — two `??` families over one field set landing on DIFFERENT merged sets, with a NESTED-STRUCT row also claiming it
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` · 1 cell (`distilled/named/d863_two_sets_nested_row`), OPEN · found by `tests/cases/types/coalesce-default-row-past-binding-cell.vl` rather than by any grid, and identical on master and after D842 — this is not a regression, it is a shape the fixture happened to write**
+
+Repro (a loud emit reject):
+
+    type Box = { inner: {r: i32} }
+    type R = { r: i32 }
+    function rf() {
+      const b: Box = { inner: { r: 4 } }
+      let a: {r: i32} | null = { r: 7 }
+      const g1 = a ?? { r: "s" }
+      print(b.inner.r)
+    }
+    rf()
+    function rn() {
+      let a: {r: i32} | null = { r: 7 }
+      const g1 = a ?? { r: null }
+      print(1)
+    }
+    rn()
+    // vl check rc 0 (two unused-variable warnings); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // SHOULD PRINT 4 then 1.
+
+* **EACH OF THE THREE INGREDIENTS ALONE RUNS, and that is the whole ablation.** Drop the nested
+  `Box` row and both families run (`d842_none_str` and `d842_none_null` are exactly those two
+  programs). Drop the `_str` family and the `Box` + `_null` pair runs
+  (`d842_hazard_field_dest` is the `_str` half of the same pair, and it runs too). Drop
+  `type R` — declared and never used — and the three-way combination runs. All three plus the
+  unused alias is the cell.
+
+* **IT IS D841's GROUPING RUNG MEETING A ROW IT DID NOT ANTICIPATE.** "Families over one field
+  set are grouped by the row they supersede" keeps two `??`s that must stay apart apart, and it
+  is graded by `d841_two_joins_one_valname`. Here the two families supersede rows that a
+  NESTED-STRUCT field also claims, so the grouping key stops separating them the way it does
+  for the map case.
+
+* **IT IS ONE CELL AND IT WAS PAID FOR ONCE ALREADY.** The fixture had this block, it failed,
+  and the block was moved out rather than the shape being papered over. The next attempt at the
+  leaf-merge family has the program.
+
+---
+
+### D864 — a module-scope `??` over a nullable-struct global reads OUT OF BOUNDS in `emitGlobalSection`, but only on a compiler INSTANCE that already compiled a layout-twin program
+
+**runs today and must keep running — AND THAT IS THE ROW'S OWN LIMITATION, NOT ITS VERDICT. The witness below runs under `vl`, which builds a fresh compiler instance per invocation. The DEFECT is a `RuntimeError: array element access out of bounds` raised by the compiler itself when the SAME instance has already compiled a second program, and no single-program witness can express that — `check-filed-witnesses.py` runs one program per row. Reproduces IDENTICALLY on master `ac92fca6` (seed `de5f39ec482c7d2fe666cd17677a3b98`): it is not this landing's, it is what this landing's fixture FOUND. Every consumer that reuses one instance is exposed — the LSP server, the playground, and `tests/cases_wasm_test.ts`**
+
+Repro (runs under `vl`, printing `0` — this half must keep running):
+
+    const ga: { r: i32 } | null = { r: 7 }
+    const gg = ga ?? { r: "s" }
+    print(0)
+
+* **THE OTHER HALF OF THE WITNESS IS A SECOND PROGRAM, compiled FIRST by the same instance.**
+  Both are needed and neither traps alone:
+
+      type Circle = { r: i32, s: i32 }
+      type Sq = { z: i32 }
+      type Shape = Circle | Sq
+      type Dot = { s: i32, r: i32 }
+      const d: Dot = { s: 1, r: 7 }
+      const c: Circle = d
+      const sh: Shape = c
+      if sh is Circle { print(sh.r) } else { print(0) }
+
+  Compile that, then the witness, through one `WebAssembly.Instance` of
+  `build/vl-compiler.wasm` — `exp.modReset(); exp.srcReset(); push(src); exp.compileSrc()`
+  twice — and the second `compileSrc()` throws. `deno test -A --no-check
+  tests/cases_wasm_test.ts` is that driver: the case above is
+  `tests/cases/types/canonical-field-order.vl`, which is why a `tests/cases` fixture carrying
+  the witness turns the suite red while `vl run` on the same file prints its logs.
+
+* **BOTH INGREDIENTS OF THE FIRST PROGRAM ARE REQUIRED, ablated.** Drop `Dot` (the permuted
+  layout twin) and it does not trap; drop the union `Shape` and the `is` read and it does not
+  trap. It is D280's cross-table struct/variant heap merge that leaves whatever the second
+  compile then misreads. MERGING THE TWO PROGRAMS INTO ONE does not reproduce it either — a
+  single program refuses loudly with `object literal is missing a union-variant field`, and an
+  `import` does not reproduce it because a module graph is ONE compile.
+
+* **THE SITE IS `emitGlobalSection`, bisected rather than guessed.** A probe compiler that
+  `emitFail`s the small program at a chosen point (gated on `stmts.length < 5`, so the first
+  program still compiles in full) puts it exactly there: stop before `emitModule` and the
+  program emit-fails cleanly; stop after `emitTypeSection` — clean; after
+  `emitFunctionSection` — clean; after `emitGlobalSection` — **TRAP**. Two guesses were tried
+  and refuted on the way, and both are worth recording because they look right: a
+  `ty >= T.tys.length` guard on `repSlotOfTy` / `repSlotOfTyDecl` does NOT stop it, and
+  stubbing `synthCaptureEmptyListAnns` (which an earlier, INVALID pass-table bisect had named
+  — the probe build had failed and `refresh-compiler.sh` left the previous seed in place, so
+  the measurement was of the wrong compiler) does not stop it either.
+
+* **WHERE TO START.** `emitGlobalSection`'s own parallel reads over the global tables —
+  `gPromoOk[gi]` / `gCellIdx` against `globalStmts.length`, and the cell-valtype seeds around
+  `globalCellStructIdx` / `globalCellKind` — are the unguarded indexed reads in the frame the
+  bisect names. `computeGlobalPromotion()` rewrites `gPromoOk` / `gCellIdx` at the top of
+  `emitModule`, after every pass has finished mutating the arena, so a length that disagrees
+  with `globalStmts` is the shape to print first.
+
+* **THE COVERAGE IS NOT LOST.** The twelve module-scope cells D842 closed live in
+  `distilled/named/d842_module_*` and are graded by `gradecensus.py`, which runs `vl` in a
+  fresh process per cell — so they carry the module-scope redirect without carrying this trap.
+  What is NOT in `tests/cases` is a module-scope block in
+  `types/coalesce-default-row-past-binding-cell.vl`, and the file says so at the point where
+  it would have been.
