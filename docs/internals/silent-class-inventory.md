@@ -18110,7 +18110,7 @@ Repro:
   program, and becomes `bare null needs a struct-typed context`).
 
 ### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
-**[CLOSED 2026-08-30] the repro below RUNS and prints nothing, which is correct — the list has one element, so the `else` never fires. Was: check-clean invalid wasm · 55 cells, ALL 55 moved to `runs`, and they were 55 of the 62 silent cells left in the whole corpus · the fix is one rung: `variantStructHeapTwinAt`'s field-storage guard descends into the MAP codes instead of declining them, by SLOT EQUALITY**
+**[CLOSED 2026-08-30] the repro below RUNS and prints nothing, which is correct — the list has one element, so the `else` never fires. Was: check-clean invalid wasm · 55 cells, ALL 55 moved to `runs`, and they were 55 of the 61 silent cells left in the whole corpus · the fix is one rung: `variantStructHeapTwinAt`'s field-storage guard descends into the MAP codes instead of declining them, by SLOT EQUALITY**
 
 Repro:
 
@@ -18252,7 +18252,7 @@ Repro:
   | the map field NULLABLE on both ends (`r: {[string]: i32} \| null`) | **check-clean invalid wasm** | **runs, 7** |
   | the map NESTED on both ends (`{[string]: {[string]: Circle}}`) | **check-clean invalid wasm** | **runs, 7** |
   | a second scalar-list field beside the map field (`q: i32[]`) | **check-clean invalid wasm** | **runs, 7** |
-  | the map's VALUE type has a layout twin of its OWN (`{[string]: Leaf}` vs `{[string]: Leaf2}`) | **check-clean invalid wasm** | **still check-clean invalid wasm — see D626** |
+  | the map's VALUE type has a layout twin of its OWN (`{[string]: Leaf}` vs `{[string]: Leaf2}`) | **check-clean invalid wasm** | **still check-clean invalid wasm — see D627** |
 
   The last four rows are territory this close opened, and the last one is the BOUND: slot
   equality answers when the two ends' maps are the SAME slot and declines when they are two
@@ -18268,10 +18268,13 @@ Repro:
 * **THE TRADE, cell-matched on the distilled corpus: 55 classes move, every one `check-clean
   invalid wasm` → `runs`. `runs -> not-runs`: 0. `-> silent`: 0. Same-class message moves: 0.**
   No other transition of any kind, no new compiler trap, no corpus module lost. `runs`
-  **3,886 → 3,941** (55.35% → 56.13%), clause 1 **62 → 7**, total against the goal
-  **269 → 214**. Corpus `cmp`: 2,426 modules built with both seeds, **1,958 byte-identical,
+  **3,888 → 3,943** (55.38% → 56.16%), clause 1 **61 → 6**, total against the goal
+  **267 → 212**. Corpus `cmp`: 2,428 modules built with both seeds, **1,959 byte-identical,
   14 DIFFER, 0 LOST, 0 GAINED** — every one of the 14 is a map / union-arm fixture on this exact
-  seam.
+  seam. (First measured against `0c7aea50` and re-measured against the merge base `1bde4fca`
+  once D625 landed first: the same 55 classes move, D625 having closed one other clause-1 cell
+  — `b004880`, its own — in between. STRIP-ALL reproduces the merge base byte for byte at md5
+  `543ae3f386bc4b0f48f9bf37b36dce59`, so the ablation below re-grades unchanged.)
 * **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS** (`./node_modules/.bin/wasm-dis`, binaryen 130 —
   both `$type`s print under the same elided name, so nothing else can show which indices are in
   play). On master the narrow witness's rec group carries THREE 7-field map structs and TWO
@@ -18290,7 +18293,8 @@ Repro:
   the IDENTICAL `struct.new $1 (call $0)` is well typed. 2,963 bytes against 3,002 — one struct
   row and one 7-field map struct, and nothing else in the module moves.
 * **ABLATION — one rung, and STRIP-ALL reproduces the base byte for byte** (md5
-  `e1a140b70abca7c0aa3a56800493e2b4`), so the header contributes nothing and the guard is the
+  `543ae3f386bc4b0f48f9bf37b36dce59` on the merge base, `e1a140b70abca7c0aa3a56800493e2b4` on
+  the tree it was first measured on), so the header contributes nothing and the guard is the
   whole change. Each sub-rung lifted alone, every variant self-compiled and graded cell-matched
   against master's baseline:
 
@@ -18308,7 +18312,7 @@ Repro:
   on both sides and one slot means one `(ref null $map)` — sound for exactly the reason 19 is —
   and a `-3` merge is the one direction the `""`-key discipline forbids. The last two rows are
   measured NEGATIVES worth not re-deriving: the canon-rep widening buys nothing HERE (it does
-  buy D626 — see there, and why it was still declined), and the code-15 descent buys nothing at
+  buy D627 — see there, and why it was still declined), and the code-15 descent buys nothing at
   all, so the guard's remaining narrowness costs this corpus zero today.
 * Pin: `tests/cases/soundness/map-field-arm-shares-its-layout-twins-heap.vl`, two programs — the
   narrow witness with the stored value READ BACK (so the merge is graded on a hit and not only
@@ -18317,7 +18321,7 @@ Repro:
   D623's is: appended to `arm-and-its-layout-twin-share-one-heap.vl` the other programs'
   declarations change what these literals resolve to, and it becomes a different program.
 
-### D626 — the map's VALUE type has a layout twin of its OWN: what SLOT equality still declines, one indirection past D624
+### D627 — the map's VALUE type has a layout twin of its OWN: what SLOT equality still declines, one indirection past D624
 **check-clean invalid wasm · found 2026-08-30 by asking D624's close, directly, whether it unmasked a fifth defect in the D280 / D621 / D623 / D624 chain · it is NOT unmasked — the witness is check-clean invalid wasm on master as well — but it is the next layer out, and the widening that closes it is already measured and was declined for a named reason**
 
 Repro:
@@ -18375,8 +18379,8 @@ Repro:
   `type Leaf2` (the INNER twin, both values `Leaf`) → runs, 7; drop `type Dot` (the outer twin)
   → runs, 7; drop `type Shape` (the union) → runs, 7; make the field `r: {[string]: i32}` on both
   sides → runs (that is D624, closed).
-* **NOT REACHED BY THE CORPUS.** After D624 the 7,021-cell distilled corpus grades 7 clause-1
-  cells and none is this shape (six are D592's named set, one is `b004880`), so this row scores
+* **NOT REACHED BY THE CORPUS.** After D624 the 7,021-cell distilled corpus grades 6 clause-1
+  cells and none is this shape — all six are D592's named set — so this row scores
   nothing on `goal-scoreboard.py` and closing it will not move `runs` there. It needs its own
   probe, which is what the repro above is — the `--sites` blind spot the scoreboard's own header
   warns about, in the soundness clause rather than the capability one.
@@ -18511,10 +18515,10 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D626 — an INFERRED return of an empty `[]` BOUND to a local: the result valtype is decided from the return EXPRESSION, which is an ident and not the literal
-**check-clean invalid wasm · found 2026-08-30 closing D625, as the third storage class the close went looking for · the mechanism is LOCATED and probed, not guessed · fails at ONE dimension, so it is outside D625's family by that row's own ablation**
+### D626 — [CLOSED 2026-08-30] an INFERRED return of an empty `[]` BOUND to a local: the result valtype was decided from the return EXPRESSION, which is an ident and not the literal
+**closed as `runs` · was `check-clean invalid wasm` · found 2026-08-30 closing D625, as the third storage class that close went looking for · the DERIVED corpus scores this family at ZERO and the fix is graded on a NAMED set of 19 instead · 10 of the 19 move not-runs -> `runs`, 0 `runs` lost, 0 into any silent class, all 1,999 buildable corpus modules byte-IDENTICAL**
 
-Repro:
+Repro (now runs, printing `0`):
 
     type P = { r: i32 }
     function sink(_x: P[]) { }
@@ -18524,11 +18528,23 @@ Repro:
       return cc
     }
     print(mk().length)
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
-    // SHOULD PRINT 0
+    // was: vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 275:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // Now: prints 0.
 
-* **FOUR INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING:**
+* **ONLY THE SIGNATURE WAS WRONG, WHICH IS THE MIRROR OF D625.** Off
+  `./node_modules/.bin/wasm-dis`, three lines change and every one is on the SIGNATURE side:
+
+      -  (type $8 (func (result (ref $4))))   (func $1 (type $8) (result (ref $4)))   struct.get $4 1
+      +  (type $8 (func (result (ref $6))))   (func $1 (type $8) (result (ref $6)))   struct.get $6 1
+
+  `$4` is the i32-list wrapper; `$6` is `{(ref (array (mut (ref null $P)))), i32, i32}`. The
+  body was already correct on master — `(local $0 (ref $6))`, `array.new_fixed $5`,
+  `struct.new $6` — and so was the caller's read, once it is pointed at the right wrapper.
+  D625 had the signature right and the body wrong; this is the same defect from the other side.
+
+* **THE FAMILY IS THE ABLATION, NOT THE MESSAGE.** Six ingredients, each removed alone:
 
   | variant | outcome |
   |---|---|
@@ -18537,28 +18553,113 @@ Repro:
   | annotate the LOCAL (`const cc: P[] = []`) | runs |
   | a SCALAR element (`sink(_x: string[])`) | runs — the element must be a REF |
   | drop the `return` (print inside `mk`) | runs — the RETURN is the position |
-  | return the LITERAL directly (`return []`, no binding) | runs — the BINDING indirection is the defect |
+  | return the LITERAL directly (`return []`) | runs — the BINDING indirection is the defect |
 
-* **THE BYTES NAME THE SIDE, AND IT IS THE OPPOSITE ONE FROM D625.** `mk`'s SIGNATURE is
-  `(func (result (ref $4)))` — the i32-list wrapper — while the local is `(ref $6)` and the body
-  builds `array.new_fixed $5`, the correct `P[]` backing. D625 had the signature right and the
-  body wrong; here the body is right and the signature wrong.
+  It fails at ONE dimension, which is what puts it outside D625's family by that row's own
+  ablation.
 
-* **THE SITE IS `criClassify`'s EMPTY-`[]` ARM AND ITS INPUT IS THE PROBLEM.** That arm reads
-  `emptyArrHoleKind(rx)` where `rx` is the RETURN EXPRESSION node, and `emptyArrLitIxOf` unwraps
-  only PARENS — a bare ident naming the binding is not an `ArrayLit`, so the arm returns `null`
-  and `fRetKind` keeps the i32-list default. Its own header says the two halves "read THIS pair
-  — `criClassify` for the result valtype, `emitReturnValue` for the `struct.new` — so the two
-  cannot drift the way they did"; they drift again as soon as a BINDING stands between the
-  literal and the `return`.
+* **RUNG 1 — THE NODE, AND THE PROBE FOUND THE ANSWER ONE NODE AWAY.** `criClassify`'s empty-`[]`
+  arm reads `emptyArrHoleKind(rx)` off the RETURN EXPRESSION, and `emptyArrLitIxOf` unwraps only
+  PARENS, so a bare ident is not an `ArrayLit` and the arm returns `null`. A probe on the rung
+  reads, for the filed witness:
 
-* **THIS IS THE THIRD STORAGE CLASS OF THE SAME SHAPE, WHICH IS WHY IT IS FILED HERE.**
-  `synthGlobalEmptyListAnns` covers the module GLOBAL (the global section reads
-  `globalCellKind`); D613's `synthCaptureEmptyListAnns` covers the CAPTURE (the type section
-  reads `captureValKind`); this is the INFERRED RETURN (the type section reads `fRetKind`
-  through `criClassify`). The ANNOTATED return is not a fourth — it reads its own annotation, and
-  D625's witness proves the signature was right there all along.
-  The right outcome is `runs`: `sink` names `P[]`, nothing else consumes `cc`.
+      |RLL rx=12 rll=8 retKind=i32 letIsRefArr=false elemName=[]
+           holeAtRx=0  holeAtInit=1 holeInitSlot=0 holeInitName=[{r: i32}]
+
+  `rll=8` says the returned-LOCAL lookup already finds the binding; `holeAtRx=0` against
+  `holeAtInit=1` says the hole answers correctly the moment it is asked about the right node.
+  `criRetHoleNode` resolves it through `retLocalLetOfBlock` — the SAME lookup `criRetLocalLet`
+  and `synthRetPinAnn` already share.
+
+* **QUESTION ANSWERED: IS THE PAREN-ONLY UNWRAP THE WHOLE OF IT? NO, AND WIDENING IT WOULD HAVE
+  BEEN THE WRONG SHAPE — its callers were grepped before touching it.** `emptyArrLitIxOf` is
+  reached from `emptyArrHoleElemName`, `emptyArrHoleKind`, and `arrLitElemName`'s nested-literal
+  arm. **The obvious objection — that widening would reclassify `[xs]` as `[[]]` — is WRONG, and
+  it is worth writing down that it was checked**: that third caller sits inside `if e0 is
+  ArrayLit`, so it is inert under any ident-following widening. The real reasons are three:
+
+  * the predicate takes ONE argument and resolving an ident needs a FRAME
+    (`parentLetOf(bodyIx, name)`), so widening means threading a block index through four call
+    sites, three of which have no use for it;
+  * the hop that is missing is not "unwrap idents" but "which binding supplies this function's
+    returned value" — and that lookup exists, with two behaviours a naive unwrap lacks: it HOPS
+    un-annotated alias chains (bounded at 8) and STOPS at an annotated binding. Both are
+    measured, not assumed: `d626_alias1` / `d626_alias2` were LOUD on master and run now, and
+    `d626_ctl_localann` must keep reading its own annotation;
+  * the widening would also reach the BUILD consumer — `emitReturnValue`'s un-annotated seed —
+    where `return cc` would arm the one-shot `pendingListKind` / `pendingListSlot` before
+    emitting a `local.get` that builds nothing. **Built and measured as variant W**: the 19-cell
+    grid and the distilled corpus are identical either way and the corpus `cmp` is
+    byte-identical, so this is a hazard avoided rather than a bug fixed. Recorded because "it
+    would be inert" is the kind of claim that should carry a number.
+
+* **RUNG 2 — THE NAME, AND IT IS THE TYPE-TAKING TWIN THAT WAS ALREADY WRITTEN.** A NESTED
+  element renders STRUCTURALLY (`{r:i32}[]`) while the row the `P[][]` annotation interned is
+  keyed `P[]`. Probed at the slot lookup: **`byName=-1 byTy=1`.** `rlSlotOfTy` is the layer's own
+  arena entry point and its header prescribes exactly this shape — it *"answers `rlSlotByName`'s
+  first two rungs directly from the type"* and *"a caller keeps its name path for the -1
+  answer"*. So the arena picks the ROW and the row's own `rlElemName` is returned, because every
+  consumer of this answer resolves it BY NAME (`fRetRArrElem`, read back through `rlSlotByName`
+  at two sites): returning the structural render would fix the kind and leave the payload column
+  at -1.
+
+* **TWO RUNGS, ABLATED, AND THE ABLATION IS NOT ADDITIVE.**
+
+  | rung | cells moved (of 19) | note |
+  |---|---|---|
+  | 1 — `criRetHoleNode` | **9** | the filed repro, both alias hops, paren, push, union, map, closure, read-element |
+  | 2 — `rlSlotOfTy` at the hole's element | **0 alone** | |
+  | 1 + 2 | **10** | `d626_elem_nested` needs BOTH: rung 1 to reach the binding, rung 2 because `{r:i32}[]` is not the key `P[]` was filed under |
+  | strip-all | 0 | base seed reproduced **byte-for-byte**, `543ae3f386bc4b0f48f9bf37b36dce59` |
+
+* **THE DERIVED CORPUS SCORES THIS AT ZERO, AND THAT IS A COVERAGE FACT ABOUT THE CENSUS, NOT A
+  SIZE FACT ABOUT THE DEFECT.** Every `mkc` shape the census generates ANNOTATES its return, so
+  no coordinate sits at this one: `regress.py` reports **0 classes moved** for rung 1, for rung 2
+  and for both, and `goal-scoreboard.py` on master's own 7,021-cell population is IDENTICAL
+  before and after — `runs` 3,888, clause 1 **61**, clause 2 161 + 45, total against the goal
+  **267**. The corpus as it now stands reads `runs 3,907 / 7,040 (55.50%)`, and the +19 is the
+  curated set being ADDED, all running; it is not a scoreboard gain from the fix. Both numbers
+  are true and only the first is about what this change did.
+
+* **SO THE SET GOES IN `named/` WHOLE** — `distilled/named/d626_*.vl`, 19 cells, with
+  `sources.json`. **Ten** move not-runs -> `runs`: seven were `check-clean invalid wasm` (the
+  filed repro, a paren-wrapped return, a `.push`-pinned element, and the union / map / closure /
+  nested-declared-struct elements) and three were LOUD (both alias chains, `'.length' on a
+  receiver the emitter cannot classify`, and the read-element leg, `field access receiver is not
+  a struct`). **Nine do not move and are why the set is kept whole**: three element reps that
+  already ran (`string`, `f64`, `f32`), and six DECLINES that must stay declines — a returned
+  PARAM, a returned local whose init is a CALL, a local with its OWN annotation, an ANNOTATED
+  return, the literal returned DIRECTLY (D16's own case), and an `i32` element. Nothing derived
+  from current behaviour separates a correct decline from a missing arm.
+
+  **The set is not circular**: master's own seed graded against the rewritten baseline reports
+  **10 classes `runs` -> NOT-RUNS and exits 1**, which is the set doing its job.
+
+* **QUESTION ANSWERED: IS THE FAMILY OF STORAGE CLASSES CLOSED? THREE ARE FIXED AND I CHECKED
+  FIVE.** The shape is "a section reads a binding's rep before the pass that decides it", and the
+  classes are the places a binding's rep is read from:
+
+  | storage class | reader | state |
+  |---|---|---|
+  | module GLOBAL | the global section, via `globalCellKind` | `synthGlobalEmptyListAnns` |
+  | closure CAPTURE env field | the type section, via `captureValKind` | D613 |
+  | INFERRED return | the type section, via `fRetKind` / `criClassify` | **this row** |
+  | ANNOTATED return | its own annotation | not a fourth — D625's witness has the signature right on master |
+  | function-scope LOCAL | the code section, via `collectLocals` | not a fourth — `collectLocals` runs the synthesis itself, in time |
+
+  **What I did NOT check, stated rather than left as a silent zero:** a PARAM has no initializer
+  to synthesize from, so it is outside the shape by construction — but I did not probe an
+  un-annotated param under monomorphization, where `synthParamAnnots` fills the annotation from
+  a recorded type and could in principle run after a reader. A struct FIELD is not a binding and
+  was not probed either; `seedFieldListBuild` is the reader that would matter. Neither has a
+  witness, so neither is filed — but "three of three" would be a stronger claim than the
+  evidence supports, and the honest one is **three fixed, two argued closed, two unprobed.**
+
+* Corpus `cmp` **2,455 modules · 1,999 IDENTICAL · 0 DIFFER · 0 LOST** (455 build under neither
+  compiler and fail identically; the one `GAINED` is this change's own fixture). Pinned as
+  `tests/cases/arrays/inferred-return-empty-through-binding.vl` — 19 legs, the same grid, with
+  L12 the one that needs both rungs and L16–L18 the declines.
+
 
 ### D622 — structural width subtyping: a value with MORE fields flowing into a shape with fewer
 **loud check reject, and the checker concedes type-validity in its own message — a clause-2

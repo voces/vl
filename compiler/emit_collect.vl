@@ -403,6 +403,7 @@ import {
   exprIsBareFnName,
   exprIsLitAtom,
   exprMap,
+  fieldNameOrder,
   fieldRefElemName,
   fieldTypeCode,
   fieldValueFeOf,
@@ -528,7 +529,6 @@ import {
   rlInternName,
   rlInternNameTy,
   rlSlotByName,
-  rowWithFieldNameSet,
   sFieldElemTyIxRow,
   sFieldRowKeyI32,
   scopeBind,
@@ -6759,8 +6759,14 @@ function anonMintRowFor(objIx: i32) {
       recordSTyIx(anonRowTyIx(ai))
       sFieldStart.push(sFieldNames.length)
       sFieldCount.push(codes.length)
-      let pi = 0
-      while pi < codes.length {
+      // THE CANONICAL FIELD ORDER (D622) — see `fieldNameOrder`. An `#anon` row's own
+      // dedup (`anonRowMatches`/`anonValueFitsField`) is field-NAME keyed, so only the
+      // emitted SEQUENCE moves; and an anon row that shares a declared row's shape now
+      // shares its sequence too, which is the merge this ordering exists to make possible.
+      const aOrd = fieldNameOrder(names)
+      let pj = 0
+      while pj < codes.length {
+        const pi = aOrd[pj]
         sFieldNames.push(names[pi])
         sFieldTypes.push(codes[pi])
         sFieldElemName.push(elemNames[pi])
@@ -6775,7 +6781,7 @@ function anonMintRowFor(objIx: i32) {
         if codes[pi] == 14 { fnValUsed = true }
         // (A code-4 i32-list field always rides an ArrayLit value, which the
         // later `collectA` arena scan classifies — `lUsed`/`aUsed` set there.)
-        pi = pi + 1
+        pj = pj + 1
       }
     }
   }
@@ -7365,7 +7371,7 @@ export function collectS(stmts: i32[]) {
         recordSTyIx(sTyIxOfName(s.tdName)) // D0
         sFieldStart.push(sFieldNames.length)
         const fields = s.tdFields
-        // FIELD ORDER IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET.
+        // FIELD ORDER IS CANONICAL: ascending by field NAME (`fieldNameOrder`, D622).
         // The 2026-08 ruling is that `{a: i32, b: string}` and `{b: string, a: i32}` are the
         // SAME TYPE, and the checker agrees — `assignable` takes one where the other is
         // asked for. The emitter did not: two named declarations always mint two ROWS, and
@@ -7373,12 +7379,15 @@ export function collectS(stmts: i32[]) {
         // the permuted pair emitted two struct types and the assignment was check-clean
         // INVALID WASM (`xfail-miscompile-permuted-struct-fields.vl`).
         //
-        // Laying the second declaration out in the first's order makes the sequences match,
-        // and the heap-type merge that already unifies same-order aliases does the rest —
-        // no new dedup, no alias table, no change to `sNames`. The INLINE spelling has
-        // always resolved this way (`annShapeIndexOf` buckets on a SORTED field-set id and
-        // matches BY FIELD NAME), so this is the named path reaching the answer the inline
-        // path already gives; `types/permuted-inline-shape-shares-row.vl` is that control.
+        // THIS USED TO BE `rowWithFieldNameSet` — lay the second declaration out in the
+        // FIRST one's order. That matched the sequences and it made a shape's layout a
+        // function of the whole module: `AB` then `BA` emitted one order, `BA` then `AB` the
+        // other. A canonical order matches them the same way and is a pure function of the
+        // shape, which is what lets the CHECKER reason about field position at all — see
+        // `fieldNameOrder`'s header for the D622 refusal that turns on exactly this.
+        // The INLINE spelling already bucketed on a SORTED field-set id and matched BY FIELD
+        // NAME (`annShapeIndexOf`), so this is still the named path reaching the answer the
+        // inline path gives; `types/permuted-inline-shape-shares-row.vl` is that control.
         //
         // `tdFlat` IS THE RULING'S OWN EXCEPTION and the reason this is one condition rather
         // than a judgement: a `flat type`'s field order IS its layout (`memory/
@@ -7386,8 +7395,7 @@ export function collectS(stmts: i32[]) {
         // so a flat record is never reordered.
         //
         // Reordering does not change WHICH fields a row has or their types — only the
-        // sequence — and it is applied only when a prototype with the identical field-name
-        // set already exists, so a shape with no twin lays out exactly as declared.
+        // sequence.
         const fOrder: i32[] = []
         let fq = 0
         while fq < fields.length {
@@ -7403,29 +7411,11 @@ export function collectS(stmts: i32[]) {
             fp = fp + 1
           }
           if fnames.length == fields.length {
-            const proto = rowWithFieldNameSet(fnames)
-            if proto >= 0 {
-              const reord: i32[] = []
-              let rp = 0
-              while rp < sFieldCount[proto] {
-                const want = sFieldNames[sFieldStart[proto] + rp]
-                let rq = 0
-                while rq < fields.length {
-                  const rqn = P.nodes[fields[rq]]
-                  if rqn is FieldDef {
-                    if rqn.fdName == want { reord.push(fields[rq]) }
-                  }
-                  rq = rq + 1
-                }
-                rp = rp + 1
-              }
-              if reord.length == fields.length {
-                let rw = 0
-                while rw < reord.length {
-                  fOrder[rw] = reord[rw]
-                  rw = rw + 1
-                }
-              }
+            const bOrd = fieldNameOrder(fnames)
+            let rw = 0
+            while rw < bOrd.length {
+              fOrder[rw] = fields[bOrd[rw]]
+              rw = rw + 1
             }
           }
         }
@@ -7496,9 +7486,16 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
   // CALLER's — `collectVariantFields` gates on `nameIsShapeSpanEnds`.
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
   uFieldStart.push(uFieldNames.length)
+  // THE CANONICAL FIELD ORDER (D622) — the VARIANT table takes it too, and it has to:
+  // `variantStructHeapTwinAt` (D280's cross-table merge) and `variantFieldLayoutEq` both
+  // compare field CODES POSITIONALLY, so an arm laid out in declaration order beside a
+  // declared struct twin laid out canonically is either a merge missed or — when the codes
+  // line up while the NAMES do not — a merge taken with the fields in opposite slots.
+  const cOrd = fieldNameOrder(fnames)
   let cnt = 0
-  let fi = 0
-  while fi < fnames.length {
+  let fx = 0
+  while fx < fnames.length {
+    const fi = cOrd[fx]
     if fnames[fi] == "" {
       return emitFail("emitProgram: malformed inline union-variant shape")
     }
@@ -7554,7 +7551,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       -1,
     )
     cnt = cnt + 1
-    fi = fi + 1
+    fx = fx + 1
   }
   uFieldCount.push(cnt)
   0
@@ -7577,7 +7574,33 @@ function collectVariantFields(stmts: i32[], name: string) {
     if s is TypeDecl {
       if s.tdName == name {
         uFieldStart.push(uFieldNames.length)
-        const fields = s.tdFields
+        const fields0 = s.tdFields
+        // THE CANONICAL FIELD ORDER (D622) — the variant table takes it for the reason
+        // `collectShapeVariantFields` states: the cross-table twin tests compare field codes
+        // POSITIONALLY, so an arm and its declared struct twin must agree on the sequence.
+        // A `flat` declaration keeps its declared order, exactly as the struct recorder does.
+        const fields: i32[] = []
+        const vnames: string[] = []
+        let vp = 0
+        while vp < fields0.length {
+          const vpn = P.nodes[fields0[vp]]
+          if vpn is FieldDef { vnames.push(vpn.fdName) }
+          vp = vp + 1
+        }
+        if s.tdFlat == 0 && vnames.length == fields0.length {
+          const vOrd = fieldNameOrder(vnames)
+          let vq = 0
+          while vq < vOrd.length {
+            fields.push(fields0[vOrd[vq]])
+            vq = vq + 1
+          }
+        } else {
+          let vr = 0
+          while vr < fields0.length {
+            fields.push(fields0[vr])
+            vr = vr + 1
+          }
+        }
         let cnt = 0
         let fi = 0
         while fi < fields.length {

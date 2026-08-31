@@ -2456,6 +2456,66 @@ function criRetLocalLet(rx: i32, i: i32) {
   -1
 }
 
+// THE NODE AN EMPTY-`[]` HOLE MUST BE READ OFF for return `rx` of function `i` — the return
+// expression itself when that IS the literal, else the INITIALIZER of the local it names
+// (D626).
+//
+// THE DEFECT. `function mk() { const cc = []  sink(cc)  return cc }` over `sink(_x: P[])` is
+// `vl check` rc 0 and a module the engine refuses. Disassembled, ONLY the signature is wrong:
+// `(func (result (ref $4)))` — the i32-list wrapper — over a body whose local is `(ref $6)`
+// and whose build is `array.new_fixed $5` / `struct.new $6`, both correct. That is the mirror
+// of D625, where the signature was right and the body wrong.
+//
+// `criClassify`'s hole arm reads `emptyArrHoleKind(rx)`, and `emptyArrLitIxOf` unwraps only
+// PARENS — a bare ident naming the binding is not an `ArrayLit`, so the arm returns `null` and
+// `fRetKind` keeps the i32-list default. Probed on the witness: `holeAtRx=0` (the return
+// expression answers the default) against `holeAtInit=1 holeInitName=[{r: i32}]` (the
+// binding's initializer answers `reflist` with the right element). The answer was one node
+// away the whole time.
+//
+// THE UNWRAP IS NOT WHAT WAS TOO NARROW, AND ITS THREE CALLERS WERE CHECKED BEFORE
+// CONCLUDING THAT. `emptyArrLitIxOf` is reached from `emptyArrHoleElemName`,
+// `emptyArrHoleKind`, and `arrLitElemName`'s nested-literal arm. The third is INERT under any
+// ident-following widening — it sits inside `if e0 is ArrayLit`, so the node it hands over is
+// already a literal — which is worth stating because the obvious objection to widening is
+// that it would reclassify `[xs]` as `[[]]`, and the guard means it would not.
+//
+// THE REASONS ARE THE OTHER TWO CALLERS AND THE MISSING LOOKUP.
+//   · The predicate takes ONE argument and resolving an ident to its binding needs a FRAME
+//     (`parentLetOf(bodyIx, name)`), so widening means threading a block index through four
+//     call sites, three of which have no use for it.
+//   · The hop that is actually missing is not "unwrap idents". It is "which binding supplies
+//     this function's returned value", and that lookup already exists as
+//     `retLocalLetOfBlock`, shared by `criRetLocalLet` and `synthRetPinAnn`, with two
+//     behaviours a naive unwrap does not have: it HOPS un-annotated alias chains (bounded at
+//     8) and it STOPS at an annotated binding. Both are measured — `const dd = cc  return dd`
+//     and its two-hop twin were LOUD on master and run now, and `const cc: P[] = []` must keep
+//     reading its own annotation. So this is a third caller of one home, not a fourth unwrap
+//     rule.
+//   · And the widening would reach the BUILD consumer too: `emitReturnValue`'s un-annotated
+//     seed reads `emptyArrHoleBuildKind(retArg)`, and for `return cc` that would arm
+//     `pendingListKind` / `pendingListSlot` — a one-shot global — before emitting a
+//     `local.get` that builds nothing. Measured as variant W: the grid and the distilled
+//     corpus are identical either way and the seed is inert today, so this is a hazard
+//     avoided rather than a bug fixed; the resolution belongs at the consumer that wants it.
+//
+// AN ANNOTATED LOCAL IS NOT FOLLOWED. `retLocalLetOfBlock` returns the binding even when it
+// carries an annotation, and an annotation PINS the cell's rep — every `letIs*` reads it
+// first — so reading the initializer past one would answer about the init where the
+// declaration already decided. That is the same rule the lookup's own header states for the
+// alias hop, applied at its last step.
+function criRetHoleNode(rx: i32, i: i32) {
+  if emptyArrLitIxOf(rx) >= 0 { return rx }
+  const rll = criRetLocalLet(rx, i)
+  if rll < 0 { return rx }
+  const d = P.nodes[rll]
+  if d is LetDecl {
+    if d.letType >= 0 { return rx }
+    return d.letInit
+  }
+  rx
+}
+
 // The IDENT NAME that function `fe`'s IMPLICIT RETURN assigns to, or "". That is: `fe` is
 // un-annotated, and its body's LAST statement is `<name> = <rhs>` — the shape
 // `emitBinExprNode` lowers as an assignment-as-expression and the trailing-expression rule
@@ -3200,14 +3260,20 @@ export function criClassify(rx0: i32, i: i32) {
   // this arm on a later fixed-point round must not re-decide a `u8[]` hole the arm above
   // already answered.
   if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
-    const hk = emptyArrHoleKind(rx)
+    // THE HOLE'S NODE, NOT THE RETURN'S (D626). `return []` reads the literal, as it always
+    // has; `return cc` over `const cc = []` reads `cc`'s initializer, because that is where
+    // the checker recorded the element it unified the hole with. `criRetHoleNode` is `rx`
+    // itself in every other case, so this line is the identity for every return that is not
+    // a bare ident naming an un-annotated local.
+    const hn = criRetHoleNode(rx, i)
+    const hk = emptyArrHoleKind(hn)
     if hk != null {
       if criSetRetKind(i, hk) {
         // The ref-list payload column the result valtype needs beside the kind — the same
         // `fRetRArrElem` slot the `exprRefArray` arm above fills, from the same renderer.
         if hk == "reflist" {
           if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-            fRetRArrElem[i] = emptyArrHoleElemName(rx)
+            fRetRArrElem[i] = emptyArrHoleElemName(hn)
           }
         }
       }
@@ -8165,31 +8231,54 @@ export function localIndexOf(fnIx: i32, name: string) {
 //   Call    { callFn: i32, callArgs: i32[] }
 //   Paren   { parInner: i32 }
 
-// The struct row whose field-NAME set matches `fnames` exactly, or -1. Bounded by
-// `sFieldCount.length` rather than `sNames.length`: the row being built has already had its
-// NAME pushed and has no field data yet, so the name column runs one ahead here.
+// ── THE CANONICAL FIELD ORDER (D622) ─────────────────────────────────────────
+// A struct/variant row's emitted field sequence, as a PERMUTATION of the spelled one:
+// ascending by field NAME. Every non-`flat` row recorder lays its row out through this, so
+// a shape's wasm layout is a pure function OF THE SHAPE.
 //
-// ONE HOME FOR TWO MINT SITES. `collectS`'s `TypeDecl` arm and `internShapeAs` both have to
-// lay a new row out in an existing same-fieldset row's order (see either caller for the
-// ruling: `{a,b}` and `{b,a}` are ONE type, and two rows share a wasm heap type only when
-// their field SEQUENCE matches). It lived next to the first caller and was private there;
-// the second is a layer below, so the shared answer lives here, beside `sFieldIndex`, which
-// is the only thing it reads that `emit_state` does not own.
-export function rowWithFieldNameSet(fnames: string[]): i32 {
-  let si = 0
-  while si < sFieldCount.length {
-    if sFieldCount[si] == fnames.length {
-      let all = true
-      let k = 0
-      while k < fnames.length {
-        if sFieldIndex(si, fnames[k]) < 0 { all = false }
-        k = k + 1
-      }
-      if all { return si }
-    }
-    si = si + 1
+// WHY IT HAD TO STOP BEING DECLARATION ORDER. The 2026-08 ruling is that `{a: i32, b: f64}`
+// and `{b: f64, a: i32}` are ONE type — `assignable` takes either where the other is asked
+// for — while two rows share one wasm heap type only when their field SEQUENCE matches. The
+// answer used to be `rowWithFieldNameSet`: lay a new row out in the order of the FIRST
+// existing row with the same field-name set. That makes the sequences match, and it makes a
+// shape's layout depend on the whole module: measured, `AB` then `BA` emits
+// `(struct (mut i32) (mut f64))` and `BA` then `AB` emits `(struct (mut f64) (mut i32))` —
+// the SAME two declarations, two layouts, decided by which came first.
+//
+// THAT DEPENDENCE IS WHAT MAKES THE CHECKER UNABLE TO REASON ABOUT LAYOUT, and D622 is where
+// it bites: the checker's view of a shape is its SOURCE SPELLING (it says `y` is inferred as
+// `{b: i32, a: i32}` for a binding the emitter lays out as `[a, b]`), so any checker rule
+// about field POSITION — "is `Narrow`'s field list a prefix of `Wide`'s", the question
+// structural width subtyping turns on — computes an answer the emitter does not honour. With
+// the order canonical the two ends compute the same sequence from the same shape.
+//
+// STABLE INSERTION SORT, so a duplicate field name (which the checker rejects, but which a
+// synthetic row could carry) keeps its spelled relative order rather than reordering
+// unpredictably. Field NAMES are the key and nothing else: the codes follow the names.
+//
+// NOT APPLIED TO A `flat` RECORD. `flat type T = { … }`'s field order IS its byte layout
+// ("offsets are the RUNNING SUM of the declared field widths and the compiler never inserts
+// a byte … Field order IS layout" — `tests/cases/memory/flat-layout-grid.vl`), so its
+// recorders keep the declared sequence and pass this by.
+export function fieldNameOrder(names: string[]): i32[] {
+  const ord: i32[] = []
+  let i = 0
+  while i < names.length {
+    ord.push(i)
+    i = i + 1
   }
-  -1
+  let a = 1
+  while a < ord.length {
+    let b = a
+    while b > 0 && names[ord[b - 1]] > names[ord[b]] {
+      const t = ord[b - 1]
+      ord[b - 1] = ord[b]
+      ord[b] = t
+      b = b - 1
+    }
+    a = a + 1
+  }
+  ord
 }
 
 // The wasm struct field index of `name` within struct `si` (declaration order), or
@@ -21376,8 +21465,13 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   recordSTyIx(sTyIxOfNameTy(nm, tyIx)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
-  let pi = 0
-  while pi < codes.length {
+  // THE CANONICAL FIELD ORDER (D622) — see `fieldNameOrder`. `annShapeIndexOf` above
+  // already matches BY FIELD NAME off a sorted field-set id, so the dedup this recorder
+  // depends on is unaffected; only the emitted SEQUENCE moves.
+  const dOrd = fieldNameOrder(names)
+  let pj = 0
+  while pj < codes.length {
+    const pi = dOrd[pj]
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     forceScalarListField(codes[pi])
@@ -21489,7 +21583,7 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
       // type-index math).
       if codes[pi] == 16 { registerValueUnionName(en) }
     }
-    pi = pi + 1
+    pj = pj + 1
   }
   sNames.length - 1
 }
@@ -21521,12 +21615,17 @@ export function internShapeAs(key: string, nm: string) {
   if names.length == 0 {
     return emitFail("emitProgram: empty struct alias shape")
   }
-  // FIELD ORDER IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET —
-  // the SAME rule `collectS`'s `TypeDecl` arm applies, and it has to be applied here for
-  // the same reason. `{a: i32, b: i32}` and `{b: i32, a: i32}` are ONE type to the checker,
-  // while two struct rows collapse to one wasm HEAP TYPE only when their field SEQUENCE
-  // matches — `structFieldCodesEq` compares field CODES positionally and never NAMES, so a
-  // permuted pair that shares a canonical key merges with `a` and `b` in opposite slots.
+  // FIELD ORDER IS CANONICAL (`fieldNameOrder`, D622) — the SAME rule `collectS`'s
+  // `TypeDecl` arm applies, and it has to be applied here for the same reason.
+  // `{a: i32, b: i32}` and `{b: i32, a: i32}` are ONE type to the checker, while two struct
+  // rows collapse to one wasm HEAP TYPE only when their field SEQUENCE matches —
+  // `structFieldCodesEq` compares field CODES positionally and never NAMES, so a permuted
+  // pair that shares a canonical key merges with `a` and `b` in opposite slots.
+  //
+  // IT USED TO BE `rowWithFieldNameSet` — the order of the first existing row with this
+  // field-name set — which matched the sequences and made the layout depend on DECLARATION
+  // ORDER. `fieldNameOrder` matches them the same way and is a pure function of the shape;
+  // `fieldNameOrder`'s own header carries why that difference is load-bearing (D622).
   //
   // THIS ROW COULD NOT MERGE AT ALL BEFORE, WHICH IS WHY THE OMISSION WAS INVISIBLE.
   // `slotCanonId` banked -1 for a struct-alias union row (the D0 recorder handed it the
@@ -21541,33 +21640,7 @@ export function internShapeAs(key: string, nm: string) {
   // Reordering does not change WHICH fields the row has or their types — only the sequence
   // — and it applies only when a prototype with the identical field-name set already
   // exists, so an alias shape with no twin lays out exactly as spelled.
-  const ord: i32[] = []
-  let oi = 0
-  while oi < names.length {
-    ord.push(oi)
-    oi = oi + 1
-  }
-  const proto = rowWithFieldNameSet(names)
-  if proto >= 0 {
-    const reord: i32[] = []
-    let rp = 0
-    while rp < sFieldCount[proto] {
-      const want = sFieldNames[sFieldStart[proto] + rp]
-      let rq = 0
-      while rq < names.length {
-        if names[rq] == want { reord.push(rq) }
-        rq = rq + 1
-      }
-      rp = rp + 1
-    }
-    if reord.length == names.length {
-      let rw = 0
-      while rw < reord.length {
-        ord[rw] = reord[rw]
-        rw = rw + 1
-      }
-    }
-  }
+  const ord = fieldNameOrder(names)
   sDeclared = true
   sNames.push(key)
   recordSRowDeclOfName(key)
@@ -22086,13 +22159,16 @@ export function gaeEnsure(name: string) {
   recordSTyIx(sTyIxOfName(name)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
-  let pi = 0
-  while pi < codes.length {
+  // THE CANONICAL FIELD ORDER (D622) — see `fieldNameOrder`.
+  const fOrd = fieldNameOrder(names)
+  let pj = 0
+  while pj < codes.length {
+    const pi = fOrd[pj]
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldElemName.push(elems[pi])
     recordSFieldElemRow(elems[pi], ekeys[pi] == 1) // D5
-    pi = pi + 1
+    pj = pj + 1
   }
   0
 }
@@ -29302,6 +29378,28 @@ function emptyArrLitIxOf(exprIx: i32) {
 function emptyArrHoleElemName(exprIx: i32) {
   const ax = emptyArrLitIxOf(exprIx)
   if ax < 0 { return "" }
+  // THE ARENA FIRST, AND IT ANSWERS WITH THE ROW'S OWN STORED SPELLING (D626 rung 2).
+  // `nodeArrayElemName` renders a nested element STRUCTURALLY — the element of `P[][]`
+  // renders `{r:i32}[]` — while the row the `P[][]` annotation interned is keyed `P[]`.
+  // Probed on `function mk() { const cc = []  sinkPP(cc)  return cc }` over
+  // `sinkPP(_x: P[][])`: `byName=-1 byTy=1`. The render is not wrong, it is not the KEY.
+  //
+  // `rlSlotOfTy` is the layer's own arena entry point and its header prescribes exactly
+  // this shape — it "answers `rlSlotByName`'s first two rungs directly from the type", and
+  // "a caller keeps its name path for the -1 answer". So the arena decides WHICH ROW and
+  // the row's own `rlElemName` is what is returned, because every consumer of this answer
+  // (`fRetRArrElem`, read back through `rlSlotByName` at two sites) resolves it BY NAME.
+  // Returning the row's stored key makes those lookups hit by construction; returning the
+  // structural render would fix the kind and leave the payload column at -1.
+  //
+  // WHAT IS MEASURED, AND WHAT IS NOT. The arena is asked FIRST, so where the two disagree
+  // the arena wins — and the evidence that they do not disagree anywhere the corpus reaches
+  // is the byte-identity: 2,000 of 2,000 buildable modules are `cmp`-identical across this
+  // change, which they could not be if this line had re-keyed a row anything else resolves.
+  // That is a corpus-reach argument, not a proof: the ONE place the two are known to differ
+  // is the nested element above, where the name is a spelling no row was ever filed under.
+  const aslot = rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(ax)))
+  if aslot >= 0 && aslot < rlElemName.length { return rlElemName[aslot] }
   nodeArrayElemName(ax)
 }
 
