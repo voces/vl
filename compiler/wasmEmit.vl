@@ -235,6 +235,7 @@ import {
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
+  fnUsesStrOp,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
@@ -256,6 +257,9 @@ import {
   gHelpUtf8Enc,
   gImports,
   gMemLogIdx,
+  gNeedsF32Print,
+  gNeedsF64Print,
+  gNeedsI64Print,
   gPromoInStart,
   gPromoOk,
   gPromoSlot,
@@ -666,6 +670,8 @@ import {
   optChainStructIdxOf,
   paramStructIdxOf,
   pendingLitUnion,
+  printUnionArmsUnrenderable,
+  printUnionPlan,
   pushPostGuardNarrow,
   refArrSlotTag,
   refListSlotOfExpr,
@@ -5198,6 +5204,43 @@ function sharedFieldCodeDispatchable(code: i32): boolean {
     return aUsed // string — the `(ref $sTypeIdx)` blocktype form
   }
   false
+}
+
+// The field-rep codes a `?.` … `??` may carry — `sharedFieldCodeDispatchable` MINUS the
+// STRING one, and the minus is measured rather than cautious. Both arms of the `if` have to
+// leave the field's rep on the stack; a WIDE NUMERIC default coerces (`emitOptChainDefault`
+// below), but a string default in this value position built a module the engine refuses
+// ("Invalid input WebAssembly code") — the literal's own scratch reservation is decided by
+// a scan that has no arm for this site. So the string field keeps its refusal, and keeps it
+// LOUD, rather than being widened into check-clean invalid wasm.
+function optChainFieldCodeOk(code: i32): boolean {
+  if code == 3 { return false }
+  // A VALUE-UNION field (code 16) is REFUSED, and the refusal is measured rather than
+  // assumed. Its blocktype is spellable (`fbIfRef(uBoxIdx)`) and its default boxes through
+  // `emitUnionCoerce` — both were built — and the result is still check-clean INVALID WASM
+  // (`type mismatch: expected i32, found (ref $type)`) at the BINDING, not at the `if`:
+  // `const v = (x?.y) ?? 5` classifies its cell from a `??` whose LHS is an optional chain,
+  // and nothing on that path calls the value a box. It is a whole rep decision away, so the
+  // arm stays a loud reject. (`silent-class-inventory` D783 carries the witness.)
+  if code == 16 { return false }
+  sharedFieldCodeDispatchable(code)
+}
+
+// The DEFAULT arm of a `?.` … `??`, at the field's rep. A wide numeric field needs the
+// default WIDENED to it — `?? 1` against an `i64` field is an `i32.const` unless somebody
+// says otherwise, and the `if`'s blocktype is `i64`: invalid wasm. Same three coercions
+// `emitUnionCoerce`'s ladder performs for the same reason, and for the same three codes.
+function emitOptChainDefault(body: i32[], dIx: i32, code: i32, fnIx: i32) {
+  if code == 17 { return emitExprAsF64(body, dIx, fnIx) }
+  if code == 23 { return emitExprAsI64(body, dIx, fnIx) }
+  if code == 24 {
+    const savedF32 = pendingF32
+    pendingF32 = true
+    const rc = emitExprAsF32(body, dIx, fnIx)
+    pendingF32 = savedF32
+    return rc
+  }
+  emitExpr(body, dIx, fnIx)
 }
 
 // Emit the `if` whose result is the shared field's rep. Only called for a code
@@ -13396,6 +13439,28 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if exprNulBool(c.callArgs[0], fnIx) {
           return emitPrintNulBool(body, c.callArgs[0], fnIx)
         }
+        // `print(<value-union box>)` — every arm inside `print`'s domain, so dispatch on
+        // the box TAG and print the arm the value holds (D712). Asked AFTER the two niche
+        // arms above, which is not a preference: `string | null` and `boolean | null` are
+        // niches and not boxes, and `printUnionPlan` declines both, so the order only
+        // states which question is the cheaper one to settle first. Asked BEFORE
+        // `exprString`, on the same ordering argument the litunion-atom arm at the top of
+        // this handler spells out — a rendering can claim a value whose REP is a box.
+        const puKinds: i32[] = []
+        if printUnionPlan(c.callArgs[0], fnIx, puKinds) {
+          return emitPrintValueUnion(body, c.callArgs[0], puKinds, fnIx)
+        }
+        // A UNION-valued argument the plan declined must not fall through: the ladder below
+        // ends in `call __print_i32__` with a `(ref $uBox)` on the stack, which is
+        // check-clean INVALID WASM — the exact shape D711's ablation measured for the
+        // container family. The checker gates on the TYPE and this gates on the
+        // EXPRESSION, so the residue is whatever the expression-side resolvers cannot name;
+        // it is a loud reject, and a reject that names what it could not do.
+        if printUnionArmsUnrenderable(c.callArgs[0], fnIx) {
+          return emitFail(
+            "emitProgram: print of a union value whose arms the tag dispatch cannot classify",
+          )
+        }
         if exprString(c.callArgs[0], fnIx) {
           return emitPrintStrExpr(body, c.callArgs[0], fnIx)
         }
@@ -18861,6 +18926,119 @@ function emitPrintNulLitUnion(
   0
 }
 
+// ONE ARM of the value-union print: the box is already stashed in `slot`, so recover this
+// arm's payload and hand it to that rep's own `__print_*__` sink — the SAME sink the
+// narrowed spelling `if v is i32 { print(v) }` reaches, which is the whole argument for
+// this being a lowering rather than a rule (D712).
+//
+// `emitUnionUnboxTail` is the shared recovery — the identical ladder a narrowed READ and
+// the union `as` cast run, so the payload's rep cannot be decided twice and differently.
+// The `null` arm has no payload at all and prints the word, exactly as the two nullable
+// NICHE prints beside it do.
+function emitPrintUnionArm(body: i32[], slot: i32, k: i32) {
+  if k == nullValKind() { return emitPrintNullWord() }
+  fbLocalGet(slot)
+  if emitUnionUnboxTail(k) < 0 { return -1 }
+  if k == 2 {
+    // The string arm streams out of the str-op scratch frame — reserved because
+    // `exprHasStrOp`'s print arm asked `printUnionHasStrArm`, the SAME plan this dispatch
+    // walked. A guard rather than an assumption: without the frame `strScratchBase + 0` is
+    // some other local and the module fails to parse.
+    if !fnUsesStrOp {
+      return emitFail(
+        "emitProgram: print of a union with a string arm but no string scratch frame",
+      )
+    }
+    fbLocalSet(strScratchBase + 0)
+    return emitPrintStrFromScratch(body)
+  }
+  if k == 0 {
+    fbCall(0) // __print_i32__ (import 0)
+    return 0
+  }
+  if k == 1 {
+    fbCall(1) // __print_bool__ (import 1)
+    return 0
+  }
+  // The three WIDE scalars route to imports whose presence is decided by the module-level
+  // annotation scan (`gNeeds*Print`). The scan walks every recorded annotation type
+  // transitively, so a `f64 | i32` union spells its f64 and the import is there — checked
+  // anyway, because a missed flag names an import index that does not exist, which is
+  // invalid wasm rather than a message.
+  if k == 3 {
+    if !gNeedsI64Print {
+      return emitFail(
+        "emitProgram: print of a union with an i64 arm but no __print_i64__ import",
+      )
+    }
+    fbCall(4) // __print_i64__ (import index 4)
+    return 0
+  }
+  if k == 4 {
+    if !gNeedsF64Print {
+      return emitFail(
+        "emitProgram: print of a union with an f64 arm but no __print_f64__ import",
+      )
+    }
+    fbCall(gF64PrintIdx)
+    return 0
+  }
+  if k == 5 {
+    if !gNeedsF32Print {
+      return emitFail(
+        "emitProgram: print of a union with an f32 arm but no __print_f32__ import",
+      )
+    }
+    fbCall(gF32PrintIdx)
+    return 0
+  }
+  emitFail("emitProgram: print of a union arm with no scalar sink")
+}
+
+// `print(<value-union box>)` — read the box TAG and print the arm the value actually holds.
+//
+// WHY THIS IS A LOWERING WHERE `print([1, 2, 3])` IS A RULE (D712 against D711). Every arm
+// here is already inside `printDomainStr()`, so nothing about the OUTPUT was ever undecided
+// — it is whatever the taken arm prints, and `if v is i32 { print(v) } else { print(v) }`
+// compiled and ran throughout. What was missing was the runtime tag dispatch, and the
+// emitter already performs exactly that dispatch for `is`. A CONTAINER arm is the other
+// question (there is no defined rendering for a list, a map or a closure) and
+// `printUnionPlan` declines it, leaving the DOMAIN refusal in the checker untouched.
+//
+// ONE EVALUATION OF THE ARGUMENT. Each arm reads the box twice (the tag test, then the
+// payload), so it is stashed once in the lazy frame's `(ref null $uBoxIdx)` slot — the same
+// slot the shared-union-field dispatch takes, for the same measured reason: a re-emitted
+// receiver called `print(f())`'s `f` once per arm.
+//
+// The chain is `if tag == t0 {…} else if tag == t1 {…} else {<last arm>}` in the row's
+// recorded box-tag order, so the LAST arm is the unconditional fall-through — the tags
+// partition the box exactly as the shared-field member chain's do.
+function emitPrintValueUnion(body: i32[], argIx: i32, kinds: i32[], fnIx: i32) {
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(body, argIx, fnIx) < 0 { return -1 }
+  fbLocalSet(slot)
+  let i = 0
+  while i < kinds.length - 1 {
+    fbLocalGet(slot)
+    fbStructGet(uBoxIdx, 0) // field 0: tag
+    fbI32Const(scalarTagOfKind(kinds[i]))
+    fbI32Bin(70)            // 0x46 i32.eq
+    fbIf(64)                // if (void)
+    ctrlEnter()
+    if emitPrintUnionArm(body, slot, kinds[i]) < 0 { return -1 }
+    fbElse()
+    i = i + 1
+  }
+  if emitPrintUnionArm(body, slot, kinds[kinds.length - 1]) < 0 { return -1 }
+  let e = 0
+  while e < kinds.length - 1 {
+    fbEnd()
+    ctrlLeave()
+    e = e + 1
+  }
+  0
+}
+
 // The streaming loop over the string already stashed in `strScrA` — `emitPrintStrExpr`'s
 // tail, split out so the nullable arm above can reach it with the ref it recovered from
 // `br_on_null` instead of re-evaluating the expression.
@@ -21893,20 +22071,32 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           if nfi < 0 {
             return emitFail("emitProgram: `?.` field is not on the struct")
           }
-          if sFieldTypeAt(nsi, nfi) != 0 {
+          // THE BLOCKTYPE IS THE WHOLE RESTRICTION, and it is not one rep wide. Both arms
+          // of this `if` yield the FIELD's rep, so the `if` needs a blocktype spelling it —
+          // which `fbIfForSharedField` already owns, over the same `sFieldTypeAt` codes, for
+          // the shared-union-field dispatch. Hard-coding `fbIf(127)` is what made the
+          // sentence say "only i32/boolean fields", and the sentence was accurate: `f64`,
+          // `i64`, `f32` and `string` fields all refused here while the NARROWED spelling
+          // (`if x != null { print(x.y) }`) ran at every one of them. One predicate + one
+          // emitter, shared with the dispatch, so the two cannot drift about which reps a
+          // value-typed `if` can carry.
+          const nfCode = sFieldTypeAt(nsi, nfi)
+          if !optChainFieldCodeOk(nfCode) {
             return emitFail(
-              "emitProgram: `?.` over a nullable struct supports only i32/boolean fields",
+              "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
             )
           }
           if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-          wU8(209)  // 0xd1 ref.is_null
-          fbIf(127) // 0x04 if, 0x7f i32 blocktype — null → default
+          wU8(209) // 0xd1 ref.is_null
+          fbIfForSharedField(nfCode) // if (result <the field's own rep>)
           ctrlEnter()
-          if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-          fbElse()  // 0x05 else — present → the field
+          if emitOptChainDefault(body, e.binRight, nfCode, fnIx) < 0 {
+            return -1
+          }
+          fbElse() // 0x05 else — present → the field
           if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
           fbStructGet(sHeapIdx[nsi], nfi)
-          fbEnd()   // 0x0b end
+          fbEnd()  // 0x0b end
           ctrlLeave()
           return 0
         }

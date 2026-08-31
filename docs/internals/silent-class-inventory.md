@@ -19808,55 +19808,105 @@ still read "not yet supported by codegen" and no other line does),
 
 ---
 
-### D712 — the boxed VALUE UNION is the print refusal that IS a capability gap, and it keeps its concession
-**LOUD CHECK REJECT (`print of a union value (i32 | string) is type-valid but not yet
-supported by codegen — narrow it first, …`) · 4 corpus cells · separated from D711 by the
-ablation that sized D711: lifting `tyPrintsAsRef`'s two sites moves 19 cells and moves NONE
-of these, whose gate is the sibling `tyPrintsAsUnionBox` · OPEN deliberately — unlike D711
-this one IS a capability gap, it is implementable, and it keeps its concession**
+### D712 — [CLOSED 2026-08-31] the boxed VALUE UNION was the print refusal that IS a capability gap, and the dispatch it wanted was one the emitter already performs
 
-Repro:
+**closed as `runs` · was `loud check reject: print of a union value (i32 | string) is type-valid but not yet supported by codegen — narrow it first, …` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 3 of its 4 filed corpus cells (`d401p_bare_nul_i32`, `d401p_bare_vunion`, `d401p_index_arr_nul_i32`), and 19 hand-written spellings beyond them; the 4th (`d352opt_union`) is a DIFFERENT mechanism and is now D783 · 3 cells `loud check reject` → `runs`, 0 `runs` lost, 0 into any silent class · the sentence ALSO refused container-arm unions, which are D711's rule and now say so**
+
+Repro (now runs, printing `1` then `x`):
 
     function pick(c: boolean): i32 | string {
       if c { return 1 }
       return "x"
     }
     print(pick(true))
-    // vl check rc 1:
-    //   [ERROR]: print of a union value (i32 | string) is type-valid but not yet
-    //   supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`
+    print(pick(false))
 
-* **WHY THIS IS THE OPPOSITE VERDICT TO D711, ON ONE TEST.** Ask whether the argument's
-  members are inside `printDomainStr()`. For `i32[]` there is no member — the value is a
-  container and the language has never said what it renders as. For `i32 | string` **every
-  arm is already printable on its own**, and the program `if v is i32 { print(v) } else {
-  print(v) }` compiles and runs today. Nothing about the OUTPUT is undecided: it is whatever
-  the taken arm prints. What is missing is the runtime tag dispatch at the print site — and
-  the emitter already performs exactly that dispatch for `is`. So the concession is honest
-  here and stays.
+* **THE VERDICT WAS THE OPPOSITE OF D711's ON ONE TEST, AND THAT TEST HELD.** Ask whether the
+  argument's MEMBERS are inside `printDomainStr()`. For `i32[]` there is no member — the value
+  is a container and the language has never said what it renders as, which is a rule (D711).
+  For `i32 | string` **every arm is already printable on its own**, and `if v is i32 {
+  print(v) } else { print(v) }` compiled and ran throughout. Nothing about the OUTPUT was
+  undecided: it is whatever the taken arm prints. What was missing was the runtime tag
+  dispatch at the print site — and the emitter already performs exactly that dispatch for
+  `is`.
 
-* **THE MESSAGE GROUP AND THE MECHANISM DISAGREE, WHICH IS WHY THIS IS ITS OWN ROW.** All 23
-  corpus cells matching `print of` read as one family by message. They are two: 19 answer to
-  `tyPrintsAsRef` (D711) and 4 to `tyPrintsAsUnionBox` — `d352opt_union`,
-  `d401p_bare_nul_i32`, `d401p_bare_vunion`, `d401p_index_arr_nul_i32`. The ablation
-  separates them cleanly (19 / 0), and one fix moves neither of the other's cells.
+* **THE LOWERING.** `printUnionPlan` reads the box row's recorded member ATOMS in box-tag ABI
+  order and answers with one value-atom KIND per arm; `emitPrintValueUnion` stashes the box
+  once and emits `if tag == t0 { … } else if tag == t1 { … } else { <last arm> }`, each arm
+  recovering its payload through `emitUnionUnboxTail` — the SAME ladder a narrowed read and
+  the union `as` cast run — and calling that rep's own `__print_*__` sink. The `null` arm has
+  no payload and prints the word, exactly as `emitPrintNulString` / `emitPrintNulBool` do for
+  the two niches beside it.
 
-* **IT IS ALSO THE TREE'S CANONICAL `unsupported-lowering` WITNESS.**
-  `tests/selfhost_native_diag_code_test.ts` and `tests/lsp_wasm_checker_test.ts` both use
-  `print(pick(true))` as the example of "type-valid, codegen cannot lower". That is still
-  correct after D711 precisely because this row was NOT collapsed into it.
+* **ONE EVALUATION OF THE ARGUMENT, and it is pinned rather than reasoned about.** Each arm
+  reads the box twice (tag, then payload), so the value is stashed in the lazy frame's
+  `(ref null $uBoxIdx)` slot — the slot the shared-union-field dispatch already takes, for the
+  same measured reason: a re-emitted CALL receiver would call its function once per arm, which
+  is the bug the literal-union print chain shipped before `emitPrintAtomStr` was shared.
+  `tests/cases/types/print-union-runs.vl` counts the calls.
 
-* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The print arm in `wasmEmit.vl` gains a boxed-
-  union rung ahead of its scalar ladder: read the box tag, `br_table`/`if` chain over the
-  arms, unbox each and call that arm's `__print_*__` sink — the shape `emitPrintNulString`
-  and `emitPrintNulBool` already have for the two NICHE cases (`string | null`,
-  `boolean | null`), generalised from a sentinel to a tag. The floor `tyPrintsAsUnionBox`
-  then narrows to the arms that are themselves out of domain, at which point it delegates to
-  `tyPrintsAsRef` and the two gates become one question asked twice. **Estimated price:
-  4 corpus cells to `runs`**, plus every hand-written program that prints a union without
-  narrowing first. The risk to weigh is that the print ladder is a documented site of silent
-  miscompiles (its own comments carry three), so it wants the rep-fuzz gate and a boundary
-  fixture per arm rep, not a quick rung.
+* **THE SCOPE WAS WRONG IN ONE DIRECTION, AND THE FIX INCLUDES NARROWING IT.** `i32 | i32[]`
+  and `i32 | string[]` reached the CAPABILITY channel and conceded "not yet supported by
+  codegen", while `i32 | (() => i32)`, `i32 | {n: i32}` and `i32 | {[string]: i32}` printed
+  D711's DOMAIN sentence. One rule, two sentences, and the split was an accident of whether
+  the box ABI happens to give the container arm an atom code (`retAtomKindOf` answers 7 for
+  `i32[]` and -1 for a `TyFunc`). The domain question is now asked FIRST at both sites, so a
+  container arm anywhere in a union reads the same way as a bare container.
+
+* **THE LITERAL-UNION ARM IS THE STRING ARM, and that is a fact about the BOX.** `K0 | i64`
+  over `type K0 = "a" | "b"` refuses `valueAtomKind` (-1, deliberately: the emit name keeps
+  the alias un-softened because `valueUnionRetName` needs the alias atom) — but
+  `emitUnionCoerce`'s `unionTakesAtomAsStr` arm widens the interned id to its member STRING
+  and tags the box kind 2. So the plan maps that arm to 2 and the dispatch prints `a`. It may
+  SHARE tag 2 with a real `string` arm, which is the ambiguity `unionStrArmCount` refuses for
+  `is`; for print it is not an ambiguity at all, because both arms stream the same payload the
+  same way, and the plan dedups them into one.
+
+* **THE FLOOR THAT REMAINS IS UNREACHED, and saying so is part of the row.**
+  `printUnionRefusal` fires only for a box whose arms the dispatch cannot classify — and after
+  the reorder every such arm is an array or a closure, which `tyPrintsAsRef` has already
+  claimed. **No corpus cell and no hand-written probe reaches it**; it survives as the
+  residue diagnostic for a type too deep for the two depth-bounded walks to agree on, and
+  `goal-scoreboard.py --sites` now lists its literal as ZERO-reached.
+
+* **THE 4TH FILED CELL IS NOT THIS ROW.** `d352opt_union` carried this message on master and
+  the corpus grouped it here. Ablated, its print refusal is gone and what remains is
+  `emitProgram: \`?.\` over a nullable struct …` — filed as **D783**. That is the message-group
+  trap this file warns about, caught by the ablation and not by the count.
+
+* **IT WAS THE TREE'S CANONICAL `unsupported-lowering` WITNESS, and the witness moved.**
+  `tests/selfhost_native_diag_code_test.ts` and `tests/lsp_wasm_checker_test.ts` now use an
+  INFERRED nullable-struct return, which still concedes. What those tests pin is the CHANNEL,
+  not the gap, so any still-open capability gap serves.
+
+* **MEASURED, six instruments.**
+  * **Corpus BYTE-IDENTITY** (`corpuscmp.py` over `tests/cases/` + `std/`, base seed
+    `a4663e78`): **2,459 modules · 2,006 identical · 0 DIFFER · 0 LOST** (453 not buildable by
+    the base, excluded and never scored).
+  * **`tests/cases` + `std` build count 2,006 → 2,011**, and the five added are exactly this
+    landing's own fixtures; the build SET is otherwise identical file for file.
+  * **The distilled corpus, this rung ALONE** (seed `d796240e`): 3 classes `loud check reject`
+    → `runs`, 1 `loud check reject` → `loud emit reject` (D783's cell); **`runs → not-runs`
+    ZERO, `→ silent` ZERO.**
+  * **Counters, reach AND ans**, as two count-only probe builds over the 2,011-module corpus.
+    `printUnionRecvIsBox` answering TRUE — the argument really is the box — is reached in
+    **9 modules**: the 4 the dispatch claims, plus 5 it must DECLINE (a narrowed brand arm, a
+    narrowed litunion member, an `as!` to a numeric litunion) and does. The dispatch itself
+    (`ans`) fires in **4 modules, all four this landing's own fixtures, and 0 of the 2,006
+    pre-existing ones** — which is precisely why the corpus is byte-identical.
+  * **Real disassembly** (`./node_modules/.bin/wasm-dis`, binaryen 130): one `call $0` into a
+    `(ref null $0)` local, then `(if (i32.eq (struct.get $0 0 (local.get $12)) (i32.const 0))
+    (then (call $fimport$0 (struct.get $1 0 (ref.cast (ref $1) (struct.get $0 1 …))))) (else
+    <string stream>))`. One evaluation, one tag read per arm, the arm's own sink.
+  * **The scoreboard.** `runs` **4,232 → 4,237**; clause 2 `refusal concedes type-valid`
+    **6 → 0**; total against the goal **88 → 83**.
+
+**THE PRICE, RECORDED.** `d352opt_union` went `loud check reject` → `loud emit reject`: both
+loud, both clause 2, and the emit message now names the real mechanism instead of a print
+refusal that was standing in front of it. Three `named/` expectations moved off the
+`<no rendering>` sentinel to `7` — that sentinel is the recorded expectation of a program the
+ruling REFUSED, and `print(<i32 | null>)` now has an output to compare against. The sixteen
+container/struct/closure cells beside them keep the sentinel, because D711's rule is unchanged.
 
 ---
 
@@ -20697,7 +20747,7 @@ Repro (now runs, printing nothing — the program has an empty body; the point i
 ---
 
 ### D735 — a `??` DEFAULT whose join shape has no declared row: `bare null needs a struct-typed context`
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus · MECHANISM CORRECTED 2026-08-31 and a candidate REFUSED at a measured price of 16 behavioural classes**
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus, but NOT the whole of the SENTENCE, which also covers `x ?? null` at a nullable scalar and a nullable string (a different mechanism, filed 2026-08-31 as D784) · MECHANISM CORRECTED 2026-08-31 and a candidate REFUSED at a measured price of 16 behavioural classes**
 
 Repro (still a loud emit reject):
 
@@ -20755,6 +20805,34 @@ Repro (still a loud emit reject):
   unreached capability literal. Declaring the merged shape (`type Circle = { r: i32 | null }`)
   makes the program print today, which is the whole of the gap: the row exists, and the
   literal and the read both reach it.
+
+* **THE SENTENCE IS BROADER THAN THIS ROW, RE-MEASURED 2026-08-31.** Run the plainest
+  program it forbids and there is no struct in it at all: `const c: i32 | null = 7; c ?? null`
+  prints the identical message, and so does the `string | null` spelling. Neither has a join,
+  a merged row or an object literal — the `??` DEFAULT position simply seeds none of
+  `emitNullLitNode`'s seven null reps. That is **D784**, and it is a seed, not a row mint. The
+  same edit closes neither this row's cells (whose default is an object LITERAL) nor D784's
+  (whose default is the bare keyword), so the two must not be counted together. The struct
+  spelling `const c: S | null = { n: 1 }; c ?? null` RUNS, because a `pendingStructIdx` seed
+  from the binding happens to still be live — same expression, same position, one rep over.
+
+* **DECLARING THE JOIN IS THE ONLY WORKAROUND, and the grid says which half does the work.**
+  Eleven spellings re-graded on `a4663e78`: `type J = { r: i32 | null }` anywhere in the file
+  runs (even with no binding of that type), and so does annotating the BINDING
+  (`const g0: {r: i32 | null} = (c)["k0"] ?? { r: null }`). Registering the union alone
+  (`function _u(): i32 | null { 7 }`) does NOT, and neither does declaring the map's value
+  shape (`type R = { r: i32 }`). So the missing artefact is specifically the merged struct ROW
+  `{r: i32|null}`, not the union `i32|null`.
+
+* **AND THE ROW CANNOT BE WIDENED IN PLACE TODAY.** `sFieldTypes` is pushed once, at row mint
+  (`collectAnonShapes`), and nothing anywhere writes it afterwards — grep is one line. The
+  pinned fixture's "the differing field is widened in place" is really "the DECLARED union
+  `Shape2` gave the field code 16 AT MINT". So closing this needs either an in-place field
+  widening (new machinery in the anon-shape interner, a documented site of silent miscompiles)
+  or the checker recording the field-wise merged type on the `??` node AND `collectS`
+  interning it — which risks a second row with the same field-name set, the same-fieldset TWIN
+  hazard three separate comments in `emit_collect.vl` record. Neither is a rung; both are a
+  slice.
 
 * **A CHECKER-SIDE HALF WAS ALSO TRIED AND REVERTED as inert.** Making the `??` join merge two
   same-field-name-set shapes field-wise (so the checker reports `{r: i32 | null}` — the type
@@ -21596,6 +21674,187 @@ Repro:
 Fixtures: `tests/cases/arrays/list-eq-every-rep.vl`, which now asks **every rep at BOTH
 SCOPES** — 18 module-scope functions over module-scope globals, plus two compares in the start
 function itself, plus `u8[]` (which has no annotation spelling and is built with `.bytes()`).
+
+---
+
+### D781 — [CLOSED 2026-08-31] a NUMERIC literal union has no union rep at all, and the inferred-return floor was refusing the absence of one
+
+**closed as `runs` · was `loud check reject: 'g' infers the union return type NK — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type` · a CLAUSE-2 capability gap, closed by banking the rep the value already has · ABLATED family 2 corpus cells (`d511_coal_numunion_match_ret_none_direct`, `d511_coal_numunion_nomatch_ret_none_direct`), and THREE shapes wider than that: the alias, the INLINE spelling and the `f64` base · 2 cells `loud check reject` → `runs`, 0 `runs` lost, 0 into any silent class**
+
+Repro (now runs, printing `2`, `2.5` and `9`):
+
+    type NK = 0 | 1 | 2
+    type NF = 1.5 | 2.5
+    function gi(a: NK) { return a }
+    function gf(a: NF) { return a }
+    function gil(a: 7 | 9) { return a }
+    print(gi(2))
+    print(gf(2.5))
+    print(gil(9))
+
+* **THE `??` IN THE CORPUS CELLS IS SCENERY, and the ablation says so in one edit.** Both
+  cells are `function g(a: NK, b: NK) { return a ?? b }`, and the row could have been read as
+  a coalesce defect. Delete the coalesce — `function g(a: NK, b: NK) { return a }` — and the
+  identical refusal stands. What the cells need is nothing but an un-annotated numeric
+  literal-union return.
+
+* **THE DIRECT SPELLING RUNS, and it is the measurement that decided (a) over (b).**
+  `function g(a: NK): NK { return a }` builds and runs. Disassembled
+  (`./node_modules/.bin/wasm-dis`, binaryen 130) it is `(func $0 (param i32) (result i32)
+  (return (local.get $0)))` — there is no box, no tag and no second type. **A numeric literal
+  union has no union REP to lower**: every member softens to one base scalar, which is what
+  `softenLitTy` says everywhere else in the compiler. So there was never a lowering to build;
+  the A20 recorder simply banked no name for the shape and the floor refused rather than let
+  the emitter fall back.
+
+* **AND THE FALLBACK WAS NOT SAFE, which is why the floor was not simply deleted.** With no
+  recorded row the emitter keeps `fRetKind`'s `"i32"` default. That is accidentally right at
+  the `i32` base and WRONG at `f64` and `i64` — so lifting the floor alone would have moved
+  `type NF = 1.5 | 2.5` from a loud reject to a wrong-typed return. The recorder rung is the
+  half that makes the floor liftable, exactly as D-LITPRINT's conversion was for the string
+  litunion two arms up.
+
+* **THE FIX IS THE ERASURE ONE ARM OVER.** `checkProgram`'s A20 loop already erases a BRANDED
+  newtype to its base before asking `isClassifiableRetName`, on the argument that a brand has
+  no runtime witness so the rep of an `NS` return IS the rep of a `string` return. A numeric
+  literal union is the same statement: the rep of an `NK` return IS the rep of an `i32`
+  return. `numLitUnionBaseTy` is that rule's existing home, so the recorder takes the base row
+  and the floor accepts EXACTLY what the recorder banks — one new arm on each side.
+
+* **SCOPED TO THE TOP-LEVEL UNION.** An `NK[]` return is a `TyArray`, which
+  `numLitUnionBaseTy` declines, so the element case is untouched. The LAMBDA spelling
+  (`const gi = (a: NK) => a`) already ran — the floor is gated on `n.fnName != ""` — and still
+  does.
+
+* **MEASURED.**
+  * **Corpus BYTE-IDENTITY** (`scripts/silent-sweep/corpuscmp.py` over `tests/cases/` + `std/`,
+    against the base seed `a4663e78`): **2,459 modules · 2,006 identical · 0 DIFFER · 0
+    LOST** (453 not buildable by the base, excluded and never scored) — measured for the whole
+    landing, of which this is one rung.
+  * **The distilled corpus, this rung ALONE** (seed `aa49a3bf`, 1,538,211 bytes): 2 classes
+    moved, both `loud check reject` → `runs`; **`runs → not-runs` ZERO; `→ silent` ZERO.**
+  * **Real disassembly.** `print(gf(2.5))` emits `(func $1 (param f64) (result f64))` and
+    routes to `__print_f64__`, not to the `"i32"` default the un-recorded path would have kept.
+
+---
+
+### D782 — [CLOSED 2026-08-31] `?.` … `??` hard-coded ONE blocktype byte, and the sentence said so accurately
+
+**closed as `runs` · was `loud emit reject: emitProgram: \`?.\` over a nullable struct supports only i32/boolean fields` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 3 field reps (`f64`, `i64`, `f32`), ZERO corpus cells — the corpus has no program for it, which is why the row carries a hand-written fixture · 0 cells moved, 0 `runs` lost**
+
+Repro (now runs, printing `2`, `1.5`, `3`, `9000000000`):
+
+    type Bf = { y: f64 }
+    type Bi = { y: i64 }
+    function ff(x: Bf | null) { print((x?.y) ?? 2) }
+    function fi(x: Bi | null) { print((x?.y) ?? 3) }
+    ff(null)
+    ff({ y: 1.5 })
+    fi(null)
+    fi({ y: 9000000000 })
+
+* **THE SENTENCE WAS ACCURATE, WHICH IS THE UNUSUAL PART.** Four refusals this campaign were
+  broader than their defect, so the first move is always to run the plainest program the
+  sentence forbids. Here it forbids exactly what it said: `i32` and `boolean` fields ran, and
+  `f64`, `i64`, `f32` and `string` fields all refused — while the NARROWED spelling of the
+  same read (`if x != null { print(x.y) }`) ran at **every one of them**. That gap between the
+  two spellings is what makes it a capability rather than a rule.
+
+* **THE MECHANISM IS ONE BYTE.** Both arms of the lowering's `if` leave the FIELD's rep on the
+  stack, so the `if` needs a blocktype spelling that rep — and the site wrote `fbIf(127)`, the
+  i32 valtype byte. `fbIfForSharedField` is that decision's existing home, written over the
+  same `sFieldTypeAt` codes for the shared-union-field dispatch, so the fix is to ask it
+  instead of hard-coding. One predicate and one emitter, shared, so the two sites cannot drift
+  about which reps a value-typed `if` can carry.
+
+* **THE DEFAULT HAS TO COERCE, and that half is not optional.** `?? 2` against an `f64` field
+  is an `i32.const` unless somebody widens it, and the `if`'s blocktype is `f64` — which is
+  check-clean INVALID WASM, measured before the coercion landed (`i64` and `string` both). The
+  three coercions are `emitUnionCoerce`'s own, for the same three codes and the same reason.
+  The fixture spells every literal default at the WRONG width on purpose.
+
+* **MEASURED.**
+  * **The distilled corpus, this rung ALONE** (seed `f9a965a7`): **0 classes moved.** The
+    corpus has no cell for it — this is a `--sites`-shaped gap, invisible to a derived
+    population — so the evidence is the hand-written fixture
+    `tests/cases/structs/optional-chain-wide-scalar-fields.vl` and the 7-row direct/narrowed
+    grid above.
+  * **Real disassembly.** `(if (result f64) (ref.is_null (local.get $0)) (then (f64.const 2))
+    (else (struct.get $1 0 (local.get $0))))` — the blocktype is the field's, and the `2` the
+    author wrote as an integer arrives as `f64.const 2`.
+  * **Corpus byte-identity: 0 DIFFER, 0 LOST**, and the `tests/cases` build SET gains exactly
+    this row's fixture.
+
+---
+
+### D783 — the `?.` … `??` residue: a STRING field and a value-UNION field, both BUILT and both reverted
+
+**loud emit reject · `emitProgram: \`?.\` over a nullable struct has no \`if\` blocktype for this field's rep` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 field reps (`string`, a value union), 1 corpus cell (`d352opt_union`) · this is the price D782 recorded and did not pay**
+
+Repro (a loud emit reject):
+
+    type Bs = { y: string }
+    function fs(x: Bs | null) { print((x?.y) ?? "z") }
+    fs(null)
+
+* **BOTH ARMS WERE WRITTEN, and reverting them is the finding.** The blocktype is spellable
+  for each (`fbIfRef(sTypeIdx)` and `fbIfRef(uBoxIdx)`) and the union default boxes through
+  `emitUnionCoerce`; both were built and measured, and both produce **check-clean invalid
+  wasm**, which is a strictly worse trade than the loud reject they replace:
+  * the STRING default in this value position gives `Invalid input WebAssembly code` — the
+    literal's own scratch reservation is decided by a scan that has no arm for this site,
+    the same reservation/handler split `maps/bare-read-string-value-print.vl` documents;
+  * the value-UNION field gives `type mismatch: expected i32, found (ref $type)` and **not at
+    the `if`** — `const v = (x?.y) ?? 5` classifies its BINDING cell from a `??` whose left
+    side is an optional chain, and nothing on that path calls the value a box. Removing the
+    print from the witness reproduces it, so the print dispatch is not involved.
+
+* **THE NARROWED SPELLING RUNS AT BOTH**, which is what keeps this a capability gap:
+  `if x != null { print(x.y) }` prints `a` for a string field and dispatches correctly for a
+  union one.
+
+* **`d352opt_union` IS THIS ROW, NOT D712's, AND THE MESSAGE IS WHY IT LOOKED OTHERWISE.**
+  That cell carried `print of a union value (i32 | string) …` on master, so the corpus grouped
+  it with the print family. Ablated, its print refusal is gone and what remains is this: a
+  `?.` over a nullable struct whose field is a value union. One fix moves neither the other's
+  cells. Its recorded expectation (`0`) has also never been validated — the cell has never
+  run, and the `?.`-free equivalent of the program prints `5` — so whoever closes this must
+  re-derive the expectation rather than trust it.
+
+Fixture: `tests/cases/structs/error-optional-chain-ref-field-blocktype.vl`.
+
+---
+
+### D784 — `x ?? null` seeds NO null rep, and it shares D735's sentence without sharing its mechanism
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 shapes (a nullable SCALAR, a nullable STRING), ZERO corpus cells · filed separately from D735 because the ablation separates them: D735's default is an object LITERAL whose merged row does not exist, and this one's default is the bare keyword**
+
+Repro (a loud emit reject):
+
+    function rd() {
+      const c: i32 | null = 7
+      const g0 = c ?? null
+      print(g0 != null)
+    }
+    rd()
+
+* **THE PLAINEST PROGRAM THE SENTENCE FORBIDS, and it has nothing to do with a struct.** D735
+  files this message as "a `??` DEFAULT whose join shape has no declared row", and its two
+  corpus cells are that. But `const c: i32 | null = 7; c ?? null` carries the identical
+  sentence, and so does the `string | null` spelling — neither has a join, a row or a struct
+  anywhere in it. The `??` DEFAULT position simply seeds none of `emitNullLitNode`'s seven
+  null reps, so a bare `null` there falls to the bottom of that table.
+
+* **THE STRUCT SPELLING RUNS, which is what says the seed is the missing thing rather than the
+  rep.** `type S = { n: i32 }; const c: S | null = { n: 1 }; c ?? null` runs — there a
+  `pendingStructIdx` seed happens to still be live from the binding. Same expression, same
+  position, one rep over.
+
+* **WHAT IT NEEDS.** The `??` default is a boundary like the seven `emitNullLitNode` lists, so
+  it should seed from the coalesce's own RESULT type: the union-box null tag (`nullBoxTag()`)
+  for `i32 | null`, `pendingNulString` for `string | null`, `pendingNulBool` for
+  `boolean | null`. Estimated price: 0 corpus cells (the corpus has no program for it) and
+  every hand-written `x ?? null`.
 
 ---
 

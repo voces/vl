@@ -69,16 +69,24 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
 
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  // Type-valid, but codegen cannot lower the boxed value-union print — raised
-  // on the distinct channel whose `unsupported-lowering` code rides the
-  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`.
+  // Type-valid, but codegen cannot lower an INFERRED nullable-struct return — raised on the
+  // distinct channel whose `unsupported-lowering` code rides the
+  // `diagCodeLen`/`diagCodeByte` ABI into `VLDiagnostic.code`. (The annotated `: S | null`
+  // spelling of the same function lowers, which is what makes this a capability admission
+  // and not a type error.)
+  //
+  // THE WITNESS USED TO BE `print(pick(true))` OVER AN `i32 | string`, and it moved because
+  // that program now RUNS — D712 built the box-tag dispatch. Any remaining capability gap
+  // serves here; what this test asserts is the CHANNEL, not the gap.
   const diags = await checker.check(
     [
-      "function pick(c: boolean): i32 | string {",
-      "  if c { return 1 }",
-      '  return "x"',
+      "type S = { s: i32 }",
+      "function pick(v: S | null) { return v }",
+      "function go() {",
+      "  const r = pick(null)",
+      "  if r == null { print(0) } else { print(1) }",
       "}",
-      "print(pick(true))",
+      "go()",
       "",
     ].join("\n"),
     "/tmp/x.vl",

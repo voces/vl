@@ -17830,20 +17830,19 @@ function validatePrintCstrs(
       }
       if !tyHasHole(cpt) {
         // The two floors answer on DIFFERENT channels, and the pin has to carry that split
-        // or the generic spelling stops being the direct spelling's own sentence. A boxed
-        // value union is an emitter-capability admission (`tErrUnsupported`,
-        // `unsupported-lowering`): every arm is inside `print`'s domain and only the tag
-        // dispatch is missing (D712). A reference is a DOMAIN rejection (`tErr`, no code):
-        // the value is not one of `printDomainStr()`'s reps at all (D711).
+        // or the generic spelling stops being the direct spelling's own sentence. A
+        // reference is a DOMAIN rejection (`tErr`, no code): the value is not one of
+        // `printDomainStr()`'s reps at all (D711), and it is asked FIRST here exactly as at
+        // the direct site. What is left on the capability channel is a boxed value union
+        // whose arms the emitter's tag dispatch cannot classify — a union of printable arms
+        // now LOWERS (D712), so it reaches neither branch.
         let pMsg = ""
         let pUnsup = false
-        if tyPrintsAsUnionBox(cpt) {
-          pMsg = "print of a union value (" +
-            tyToStr(cpt) +
-            ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`"
-          pUnsup = true
-        } else if tyPrintsAsRef(cpt, 24) {
+        if tyPrintsAsRef(cpt, 24) {
           pMsg = printRefRefusal(cpt)
+        } else {
+          pMsg = printUnionRefusal(cpt)
+          if pMsg != "" { pUnsup = true }
         }
         if pMsg != "" {
           let pWho = "a type parameter is printed here: "
@@ -20661,32 +20660,29 @@ function checkCallNode(n: Call, ix: i32) {
         // `print` demands a value to render, and a `void` call has none — the emitter's
         // print ladder ends in `call __print_i32__` with nothing on the stack.
         voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
-        // `print` renders ONE scalar/string rep at runtime; a BOXED value-union (`i32 |
-        // string` — `≥2` distinct value atoms) has no fixed rep, so emit cannot lower
-        // `print(<union>)` (it produced invalid wasm). An emitter-capability rejection,
-        // not a type error — the union must be narrowed with `is` first.
-        // `tyPrintsAsUnionBox` is the exact boxing gate: it stays false for a same-rep
-        // literal union (`0 | 1` is plain i32, `"a" | "b"` plain string) and for `never`
-        // (empty), so those still print. It reads the leaves with the same literal
-        // SOFTENING the emit name gets — without it `const v: "ab" | i32 = 3; print(v)`
-        // walked past this gate and emitted invalid wasm while `string | i32` (the same
-        // type, already softened by the author) was rejected here.
-        if tyPrintsAsUnionBox(pt) {
-          tErrUnsupported(
-            "print of a union value (" +
-              tyToStr(pt) +
-              ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`",
-            pargs[pj],
-          )
+        // A DOMAIN rejection, and it is asked FIRST — the order is the ruling. `print`
+        // takes one value of `printDomainStr()`; an array, a struct, a map/set, a function
+        // value, or any of those behind `| null` (or inside a union) is not one, and `tErr`
+        // (no `unsupported-lowering` code) is what says so — the same shape as `toString
+        // expects an i32 or boolean, got string`. The language has never defined what
+        // `print([1, 2, 3])` OUTPUTS, so there is no lowering to be missing;
+        // `tyPrintsAsRef`'s header carries the measurement and D711 the ruling.
+        //
+        // IT USED TO BE ASKED SECOND, AND THAT MIS-FILED A WHOLE COLUMN. `i32 | i32[]`
+        // reached the capability channel below and printed "not yet supported by codegen"
+        // — while `i32 | (() => i32)` and `i32 | {n: i32}`, which differ only in whether
+        // the box ABI happens to give the container arm a code, printed the domain
+        // sentence. One rule, two sentences, decided by an accident of the atom table.
+        if tyPrintsAsRef(pt, 24) {
+          tErr(printRefRefusal(pt), pargs[pj])
+        } else {
+          // The BOXED value-union residue. `print(<i32 | string>)` now LOWERS — every arm
+          // is inside the domain and the emitter dispatches on the box tag, the same
+          // dispatch it performs for `is` (D712) — so what is left here is a box whose
+          // arms that dispatch cannot classify, and only that keeps the concession.
+          const puMsg = printUnionRefusal(pt)
+          if puMsg != "" { tErrUnsupported(puMsg, pargs[pj]) }
         }
-        // A DOMAIN rejection, and NOT the capability channel above it. `print` takes one
-        // value of `printDomainStr()`; an array, a struct, a map/set, a function value, or
-        // any of those behind `| null` is not one, and `tErr` (no `unsupported-lowering`
-        // code) is what says so — the same shape as `toString expects an i32 or boolean,
-        // got string`. The language has never defined what `print([1, 2, 3])` OUTPUTS, so
-        // there is no lowering to be missing; `tyPrintsAsRef`'s header carries the
-        // measurement and `silent-class-inventory` D711 the ruling.
-        if tyPrintsAsRef(pt, 24) { tErr(printRefRefusal(pt), pargs[pj]) }
         // A printed type that still carries a HOLE answers FALSE to both floors above — it
         // is neither a ref nor a box YET — so the two of them together admit every generic
         // `print`. Defer it to the pin, the only position that knows the instance.
@@ -22686,6 +22682,18 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // or an interned atom, and nothing was converting. What makes the floor liftable is
         // the conversion landing with it, in both passes — the signature's result kind and
         // the returned value's widen are decided separately and each had to learn the shape.
+      } else if numLitUnionHasBase(inferred) {
+        // A NUMERIC literal union (`type NK = 0 | 1 | 2`, an inline `0 | 1 | 2`,
+        // `1.5 | 2.5`) has NO union rep at all: every member softens to one base scalar,
+        // so the value is a plain `i32` / `i64` / `f64` and the annotated `: NK` spelling
+        // emits `(result i32)` with a bare `local.get` return — disassembled, there is no
+        // box, no tag and no second type. So there was never a lowering to build here; the
+        // A20 recorder simply banked no name and the emitter kept its `"i32"` default,
+        // which is right at `i32` and silently wrong at `f64`. The recorder now banks the
+        // BASE (`numLitUnionBaseTy`, the same rule `softenLitTy` states everywhere else),
+        // and this arm accepts EXACTLY what it banks — the string litunion two arms up is
+        // the shape that DOES keep an identity (the interned atom), which is why it is a
+        // separate question and not a widening of this one.
       } else if itt is TyUnion {
         // A pure STRUCT-union whose every member maps to a NAMED type (`Cat | Dog`) lowers
         // un-annotated via the variant-boxed rep, exactly like the annotated form — so it
@@ -24814,6 +24822,49 @@ function tyPrintsAsUnionBox(pt: i32) {
   ok
 }
 
+// Is every ARM of the boxed value union `pt` a value `print` renders on its own — i.e. will
+// the emitter's per-arm tag dispatch (`printUnionPlan` / `emitPrintValueUnion`) claim it?
+//
+// THE TWO ENDS OF ONE DECISION, one more time. The emitter reads the box row's recorded
+// member ATOMS and takes `valueAtomKind` of each; this reads the same leaves off the arena
+// with `printAtomKindOf`, whose codes are that function's arm for arm. Kinds 0..5 are
+// `printDomainStr()`'s six reps and 6 is `null`; anything else is a container, a closure or
+// a member the box ABI does not classify — and those keep the DOMAIN refusal, which is
+// asked FIRST at both sites so this predicate never sees one.
+//
+// A DECLARED LITERAL-UNION ALIAS ARM (`K0 | i64`) is walked into like any other member and
+// its literals answer 2, the string code — which is exactly what the box does with it:
+// `emitUnionCoerce`'s `unionTakesAtomAsStr` arm widens the interned id to its member STRING
+// and tags kind 2, so the arm prints the member text through the string sink.
+//
+// Depth-bounded like `tyPrintsAsRef`, for the same self-referential-alias reason.
+function tyPrintUnionArmsInDomain(pt: i32, depth: i32): boolean {
+  if pt < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[pt]
+  if t is TyNullable { return tyPrintUnionArmsInDomain(t.nInner, depth - 1) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if !tyPrintUnionArmsInDomain(t.uMembers[i], depth - 1) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  const k = printAtomKindOf(pt)
+  k >= 0 && k <= 6
+}
+
+// The BOXED-value-union refusal that survives the dispatch: a union the emitter boxes whose
+// arms it cannot all print. Empty when the program is fine.
+function printUnionRefusal(pt: i32): string {
+  if !tyPrintsAsUnionBox(pt) { return "" }
+  if tyPrintUnionArmsInDomain(pt, 24) { return "" }
+  "print of a union value (" +
+    tyToStr(pt) +
+    ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`"
+}
+
 // `print`'s DOMAIN, spelled once. `driver.builtinScan` renders the LSP completion detail
 // from this (`(<domain>) => void`) and `tyPrintsAsRef`'s refusal quotes it, so the type the
 // compiler advertises and the type it enforces cannot drift into two answers — which is
@@ -26554,6 +26605,24 @@ export function checkProgram(rootIx: i32) {
                 if isClassifiableRetName(ernm) {
                   recNm = ernm
                   recTy = erased
+                }
+              }
+            }
+            // A NUMERIC literal union erases to its BASE SCALAR for exactly the reason a
+            // brand erases to its base one arm up: the rep of an `NK = 0 | 1 | 2` return IS
+            // the rep of an `i32` return (`softenLitTy` is the rule, and the annotated `: NK`
+            // spelling disassembles to `(result i32)` with no box). Without this row the
+            // emitter kept `fRetKind`'s `"i32"` default un-recorded, which the checker floored
+            // rather than trusted — and the default is WRONG for the `f64` / `i64` bases.
+            // Scoped to the TOP-LEVEL union: an `NK[]` return is a `TyArray`, which
+            // `numLitUnionBaseTy` declines, so the element case is untouched.
+            if !isClassifiableRetName(recNm) {
+              const nlb = numLitUnionBaseTy(er)
+              if nlb >= 0 {
+                const nlnm = tyToStructStr(nlb)
+                if isClassifiableRetName(nlnm) {
+                  recNm = nlnm
+                  recTy = nlb
                 }
               }
             }
