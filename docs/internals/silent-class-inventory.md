@@ -18000,6 +18000,92 @@ Repro:
 * All 130 are in the `d224-cost` named set, kept whole; `named/sources.json` records the price.
 
 
+### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
+**check-clean invalid wasm · 55 cells, the largest silent family no agent holds · found 2026-08-30 by splitting the silent population by OWNERSHIP rather than by message and minimising what was left · SIX ingredients and every one of them is load-bearing**
+
+Repro:
+
+    function mkI(): {[string]: i32} {
+      const mi: {[string]: i32} = Map()
+      return mi
+    }
+    type Circle = { r: {[string]: i32} }
+    type Dot = { r: {[string]: i32} }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Box1 = {[string]: Circle}[]
+    const _sp1: Box1 = []
+    const lv1 = Map()
+    lv1["k0"] = { r: mkI() }
+    const c = [lv1]
+    const dd = c
+    const g0 = dd
+    if g0.length > 0 {
+    } else { print(0) }
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
+    // SHOULD RUN (the list has one element, so the `else` does not fire and nothing prints)
+
+* **EVERY INGREDIENT IS LOAD-BEARING — six of six, each ablated, each making it run:**
+
+  | removed | outcome |
+  |---|---|
+  | nothing (as filed) | **check-clean invalid wasm** |
+  | `type Dot` (the layout twin) | runs |
+  | `type Shape` (the union) | runs |
+  | `type Box1` + the `_sp1` spacer | runs |
+  | annotate `lv1` as `{[string]: Circle}` | runs |
+  | annotate `c` as `{[string]: Circle}[]` | runs |
+  | field `r: i32` instead of `r: {[string]: i32}` | runs |
+
+  That is a narrower conjunction than any row in this family so far, and it is why the row
+  exists rather than a note on D623.
+* **RE-MEASURE AFTER D623 LANDS, BEFORE WRITING ANY CODE.** D623 is the same shape — an
+  un-annotated carrier, a layout twin, a union — differing in two places: its carrier reaches a
+  STRUCT FIELD where this one reaches a LIST ELEMENT, and its field is nullable where this
+  one's is map-valued. There is a real chance D623's fix moves some or all of these 55, and
+  the honest first step is to grade this witness against D623's merged seed rather than to
+  re-derive a mechanism that may already be gone.
+* **DO NOT GROUP BY THE VALIDATOR SENTENCE.** 55 of the 66 unowned silent cells print
+  `expected (ref null $type), found (ref $type)`, and that number is a MESSAGE count, not a
+  mechanism count — D611 was filed at 58 on exactly that basis and had 3. The 55 here is also
+  a message count until someone ablates the others; say so rather than inheriting it.
+
+### D625 — an empty `[]` returned at a NESTED array of STRUCTS: the element row is committed one dimension too shallow
+**check-clean invalid wasm · 5 cells · found 2026-08-30 in the same split · named by D613's close as its one holdout ("`b004880` has no capture — a different row") and filed here rather than left as a remark · TWO ingredients, and the nullable field is NOT one of them**
+
+Repro:
+
+    function mkc(): {r: i32 | null}[][] {
+      const cc = []
+      return cc
+    }
+    print(mkc().length)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD PRINT 0
+
+* **TWO INGREDIENTS, ABLATED, and the third candidate is scenery:**
+
+  | variant | outcome |
+  |---|---|
+  | as filed, `{r: i32 \| null}[][]` | **check-clean invalid wasm** |
+  | one dimension, `{r: i32 \| null}[]` | runs, prints 0 |
+  | nested but non-nullable, `{r: i32}[][]` | **still fails** — nullability is SCENERY |
+  | nested but scalar element, `i32[][]` | runs, prints 0 |
+
+  So it needs the NESTING and a STRUCT element, and nothing else.
+* **THIS IS D613's MECHANISM AT A RETURN RATHER THAN A CAPTURE**, and D613 is closed: a
+  captured empty `[]` had its closure-env field typed a section before the element row was
+  pinned, fixed by `synthCaptureEmptyListAnns`. The obvious question, and the place to start:
+  does the RETURN path have the same shape of hole — a pass that types the empty literal's
+  element row before the declared return annotation is consulted — and is the fix the same
+  synthesis one storage class over, the way D613's was `synthGlobalEmptyListAnns`' argument one
+  class over? `synthEmptyListAnn` and its existing callers are the map.
+* The right outcome is `runs`. The destination is unambiguous — the function declares its
+  return type and nothing else consumes `cc`.
+
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
