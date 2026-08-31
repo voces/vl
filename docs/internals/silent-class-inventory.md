@@ -13110,10 +13110,10 @@ Repro (now `runs`):
 
 ---
 
-### D411 — [CLOSED 2026-08-28 as a SILENT class] ONE un-annotated list literal with TWO declared destinations of different element KINDS — the refusal SURVIVED, and the row had enumerated only the answers that make it run
-**now a loud emit reject · was `check-clean invalid wasm` · found 2026-08-28 closing D381, as the residue its rung provably cannot reach · the filed REFUSAL is UPHELD on all three of its own grounds and is not the whole question: a program the compiler cannot lower is a LOUD REJECT**
+### D411 — [CLOSED 2026-08-28 as a SILENT class; RE-CLOSED 2026-08-31 as `runs`] ONE un-annotated list literal with TWO declared destinations of different element KINDS — the refusal SURVIVED, and the row had enumerated only the answers that make it run
+**closed as `runs` · was `check-clean invalid wasm`, then a loud emit reject · found 2026-08-28 closing D381 · **THE 2026-08-28 REFUSAL IS OVERTURNED BY D791, AND ONLY ITS SECOND GROUND WAS LOAD-BEARING.** Ground (b) — *"a store-side coercion: still nowhere. Every `fbArrayCopy` in the emitter is same-heap-to-same-heap"* — was a statement about what the emitter HAD, and D791 built the pass it named. With an element-converting copy the refusal's premise (*"whichever slot is returned, the OTHER store is a type mismatch"*) is false. All 33 of this grid's remaining cells RUN; the refusal survives only where a WRITE makes the copy observable, which is `error-list-literal-two-destinations-written.vl`**
 
-Repro (now a loud emit reject):
+Repro (now runs, printing `7` then `1`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -13128,10 +13128,21 @@ Repro (now a loud emit reject):
     f()
     // was: vl check rc 0 with NO diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 226: type mismatch: expected (ref $type), found (ref $type)
-    // Now: emitProgram: one un-annotated list literal is bound to TWO declared destinations
-    //   whose elements are stored differently …
+    // then (2026-08-28): emitProgram: one un-annotated list literal is bound to TWO
+    //   declared destinations whose elements are stored differently …
+    // Now (D791): prints 7 then 1.
 
-* **THE BYTES SAY THE SAME THING FROM BOTH SIDES (unchanged, and re-confirmed on
+* **WHAT D791 CHANGED, AND WHICH OF THIS ROW'S THREE GROUNDS IT ANSWERS.** The literal is
+  now built at the PLAIN-STRUCT row (`letRefListDestSlot` returns its kind-1 answer instead
+  of failing) and the union-box destination takes an element-converting COPY. Ground (a) —
+  a variance rule reddening `const c: Shape[] = lv1` — is untouched and still refused;
+  ground (c) — splitting the binding — is still a rewrite pass and still not done. Ground
+  (b) is the one that fell: the copy exists now, and the row's own sentence *"there is no
+  pass that iterates an existing list value"* was a description of the emitter, not a
+  design rule. The whole grid's 33 remaining cells move `loud emit reject` -> `runs`, all 7
+  single-destination controls keep running, 0 cells lost.
+
+* **THE BYTES SAY THE SAME THING FROM BOTH SIDES (as filed 2026-08-28, and re-confirmed on
   `2f1f0621`).** The literal builds `struct.new $6` over the box array and it is the FIRST
   store, `const c: Circle[] = lv1`, that mismatches; before D381 it was the second. Neither
   answer is available to a rung that reads destinations: a list value has one element rep, and
@@ -13196,14 +13207,17 @@ Repro (now a loud emit reject):
 
 * Corpus `cmp` 2,393 modules · 0 DIFFER · 0 LOST; distilled corpus 0 `runs` lost and 0 cells
   into any silent class, this rung alone moving nothing there at all (the class is not in the
-  census). Pinned as `tests/cases/unions/error-list-literal-two-destination-kinds.vl`.
+  census). Pinned as `tests/cases/unions/list-literal-two-destination-kinds-widen.vl` (the
+  same file, renamed and flipped to `@run` by D791; its `@emit-error` twin is
+  `error-list-literal-two-destinations-written.vl`, which is the identical program plus one
+  store).
 
 ---
 
-### D501 — [CLOSED 2026-08-29] the ARM PIN commits an un-annotated list literal's element row several passes before the two-destination conflict can be asked
-**now a loud emit reject · was `check-clean invalid wasm` · found 2026-08-28 closing D411 · the filed REACH partition reproduced EXACTLY (28 / 75) and the filed guess about which pass claims the row was WRONG · all 28 cells move, 0 `runs` lost, 0 into any silent class**
+### D501 — [CLOSED 2026-08-29 as a loud reject; RE-CLOSED 2026-08-31 as `runs`] the ARM PIN commits an un-annotated list literal's element row several passes before the two-destination conflict can be asked
+**closed as `runs` · was `check-clean invalid wasm`, then a loud emit reject · found 2026-08-28 closing D411 · the filed REACH partition reproduced EXACTLY (28 / 75) and the filed guess about which pass claims the row was WRONG · **THE TWO PIN GATES ARE UNCHANGED BY D791 AND ARE STILL LOAD-BEARING** — a declined pin is what routes the binding to `letRefListDestSlot`, which now widens rather than refusing, so this row's rungs are the reason its witness reaches the copy at all**
 
-Repro (now a loud emit reject):
+Repro (now runs, printing `1` then `7`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -13221,8 +13235,9 @@ Repro (now a loud emit reject):
     // was: vl check rc 0 with NO diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 520: type mismatch:
     //   expected (ref null $type), found (ref $type)
-    // Now: emitProgram: one un-annotated list literal is bound to TWO declared
-    //   destinations whose elements are stored differently …
+    // then (2026-08-29): emitProgram: one un-annotated list literal is bound to TWO
+    //   declared destinations whose elements are stored differently …
+    // Now (D791): prints 1 then 7.
 
 * **THE FILED REACH PARTITION REPRODUCED, AND A SECOND PROBE SITE SAYS WHAT IT MEANS.** The
   row claimed `reach=0` at `letRefListDestSlot` on exactly the 28 unmoved cells and
@@ -13315,8 +13330,12 @@ Repro (now a loud emit reject):
   Census blocks **A (150,224), B (28,590), C (43,200), D (9,000) and E (19,224)** — the
   WHOLE census, 250,238 cells — graded cell-matched against both seeds: **0 class
   movements and 0 message changes** in every block.
-  Fixtures `tests/cases/unions/error-list-literal-pinned-two-destinations.vl` (rung 1) and
-  `…/error-list-literal-return-pin-two-destinations.vl` (rung 2).
+  Fixtures `tests/cases/unions/list-literal-pinned-two-destinations-widen.vl` (rung 1) and
+  `…/list-literal-return-pin-two-destinations-widen.vl` (rung 2) — renamed and flipped to
+  `@run` by D791. **BOTH PIN GATES ARE UNCHANGED BY THAT LANDING and both are still what
+  routes these programs anywhere at all:** a declined pin is what sends the binding to
+  `letRefListDestSlot`, which now returns the plain-struct row and widens at the delivery
+  instead of refusing. Ablating either gate still costs its own cells.
 
 ---
 
@@ -20435,13 +20454,15 @@ Repro (check rc 0, then a runtime trap):
 
 ---
 
-### D742 — the EMPTY literal's element pin is first-destination-wins, so one destination pair gets two answers and one of the two orders is check-clean invalid wasm
-**check-clean invalid wasm · found 2026-08-31 beside D741 · 8 cells in the `d741_hole_*` block
-plus the ordered pair · the mechanism is the SAME pin D661B asked to be built, which turns out
-to exist already for `[]` and to be UNSOUND in one direction · the non-empty twin of the very
-same program is LOUD in both orders**
+### D742 — [CLOSED 2026-08-31 by D791] the EMPTY literal's element pin is first-destination-wins, so one destination pair gets two answers and one of the two orders is check-clean invalid wasm
+**closed as `runs` by D791 · 8 cells in the `d741_hole_*` block plus the ordered pair · THE PIN
+IS STILL FIRST-DESTINATION-WINS AND IS NOT WHAT WAS FIXED — this row's diagnosis is exact and
+unchanged, and what changed is that a covariant assignment now LOWERS (D791's element-converting
+copy), so the order-dependence no longer produces an invalid module · the asymmetry the
+four-cell table records is intact and now reads `runs` / `loud check reject` in the empty row
+rather than silent / loud**
 
-Repro (check rc 0, invalid module):
+Repro (now runs, printing `0` twice):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -20457,11 +20478,13 @@ Repro (check rc 0, invalid module):
       print(b.length)
     }
     f()
-    // vl check rc 0, no diagnostics; vl run:
+    // was: vl check rc 0, no diagnostics; vl run:
     //   Error: failed to compile: … WebAssembly translation error:
     //   Invalid input WebAssembly code … type mismatch: expected (ref $type), found (ref $type)
-    // Swap the two bindings and the SAME pair is a clean check reject:
+    // Now: prints 0 then 0.
+    // Swap the two bindings and the SAME pair is STILL a clean check reject:
     //   [ERROR]: cannot assign Shape[] to 'a' of type Circle[]
+    // The order-dependence is unchanged; only the silent half of it is gone.
 
 * **THE PIN, AND WHY IT IS ORDER-DEPENDENT.** An empty `[]` mints `mkArrayTy(-1)`
   (`checkArrayLitNode`, typecheck.vl:33191) and `constrainEmptyD` fills that `-1` IN PLACE from
@@ -21818,13 +21841,14 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D773 — the READ-ONLY covariant pass is check-clean invalid wasm, and it is the half of A9 the whole family is waiting on
-**check-clean invalid wasm · found 2026-08-31 while pricing an A9-`Writable` candidate · a
-CLAUSE-1 soundness violation on a program that WRITES NOTHING · the corpus had no cell for
-the plain covariant pass at all, so `goal-scoreboard.py` scored it at zero · 3 cells
-committed to `distilled/named/`**
+### D773 — [CLOSED 2026-08-31 by D791] the READ-ONLY covariant pass is check-clean invalid wasm, and it is the half of A9 the whole family is waiting on
+**closed as `runs` · was `check-clean invalid wasm` · found 2026-08-31 while pricing an
+A9-`Writable` candidate · a CLAUSE-1 soundness violation on a program that WRITES NOTHING ·
+the corpus had no cell for the plain covariant pass at all, so `goal-scoreboard.py` scored it
+at zero · this row's PRICING was the build order D791 followed, and both pieces it named —
+a Readable inference and an element-converting copy — are what landed**
 
-Repro (check rc 0, invalid module):
+Repro (now runs, printing `1` then `7`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -21836,9 +21860,9 @@ Repro (check rc 0, invalid module):
       print(a[0].r)
     }
     f()
-    // vl check rc 0, no diagnostics; vl run:
+    // was: vl check rc 0, no diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 217: type mismatch
-    // SHOULD PRINT 1 then 7 — nothing in the program mutates anything
+    // Now: prints 1 then 7 — nothing in the program mutates anything.
 
 * **THE PARAMETER SPELLING IS THE SAME CELL** (`d773_readonly_param`): `look(xs: Shape[]) {
   print(xs.length) }` called with a `Circle[]`, check rc 0, invalid module at offset 231.
@@ -21935,8 +21959,18 @@ Repro (a loud emit reject, and it does not depend on the store):
 
   | half | reaches | what it needs | status |
   |---|---|---|---|
-  | `Writable` (a write through a covariantly-typed handle is ILLEGAL) | **2 of 80** — `d741_w0_base`, `d741_w6_params`, both clause-1 traps | a written-through analysis + a rejection at the call/binding site | not built; the only rule that closes the traps |
-  | `Readable` (a read-only covariant pass is LEGAL and must lower) | **78 of 80** | a Readable inference + an element-converting copy | not built; D773 |
+  | `Writable` (a write through a covariantly-typed handle is ILLEGAL) | **2 of 80** — `d741_w0_base`, `d741_w6_params`, both clause-1 traps | a written-through analysis + a rejection at the call/binding site | STILL not built; D793, which now carries the predicate D791 built |
+  | `Readable` (a read-only covariant pass is LEGAL and must lower) | **78 of 80** | a Readable inference + an element-converting copy | **BUILT 2026-08-31 — D791**, both pieces; 63 of the 76 remaining cells run |
+
+  **THIS ROW'S COUNT IS UPHELD AND ITS THIRD BULLET IS OVERTURNED.** The 2-of-80 measurement
+  stands and is why `Writable` was not the half to build first. What did not survive is
+  *"adding a write does not change the refusal either"* as a claim about the FAMILY: it is
+  true of the K1/K2 quadrant on the compiler this row measured, and false on the one D791
+  landed. `d774_k1k2_nostore` now RUNS while `d774_k1k2_store` and `d774_k1k2_param_store`
+  keep the identical positioned emit reject — the write is now the ONLY difference between
+  them, which is exactly the separation this row said the quadrant did not have. The three
+  cells stay in `named/` and are more useful than before, because they are now a 1/2 split
+  rather than a 3/0 one.
 
   `Writable` is worth building — it is the only thing that turns `d741_w0_base`'s
   `wasm trap: cast failure` into a diagnosis — and it is not what the 80 are made of.
@@ -21981,12 +22015,17 @@ Repro (check rc 0, invalid module):
 
 ---
 
-### D776 — D742's repair is a PIN MARKER plus a CONCEDING sentence, and the second half is what makes it worth doing
-**check-clean invalid wasm · the standing price of NOT taking D742's repair, restated with
-the message requirement that was missing from it · 9 clause-1 cells · deliberately not built
-here, and priced so the next attempt does not pay for the wrong half**
+### D776 — [CLOSED 2026-08-31 by D791, AND ITS REPAIR IS NOW REFUSED] D742's repair is a PIN MARKER plus a CONCEDING sentence, and the second half is what makes it worth doing
+**closed as `runs` · was `check-clean invalid wasm` · the standing price of NOT taking D742's
+repair, restated with the message requirement that was missing from it · 9 clause-1 cells ·
+**THE REPAIR THIS ROW PRICES MUST NOT NOW BE BUILT.** It proposed moving these nine cells
+`check-clean invalid wasm` -> `loud check reject (conceded)`; D791 moved them to **`runs`**
+instead, which is strictly better on the goal's own scoreboard, and the pin marker it asks for
+would take them straight back off it. The row's own third bullet already said why: *"these nine
+programs are read-only and therefore legal (D773)"*. Keep the row as the record of a repair
+that was correctly not taken**
 
-Repro (check rc 0, invalid module):
+Repro (now runs, printing `0` twice):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -21999,9 +22038,10 @@ Repro (check rc 0, invalid module):
       print(b.length)
     }
     f()
-    // vl check rc 0, no diagnostics; vl run:
+    // was: vl check rc 0, no diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 277: type mismatch
-    // Swap the two bindings and the SAME pair is a clean check reject.
+    // Now: prints 0 then 0.
+    // Swap the two bindings and the SAME pair is STILL a clean check reject.
 
 * **THE MECHANISM IS D742's AND IS UNCHANGED**: `constrainEmptyD` fills the `-1` element hole
   IN PLACE from the first destination that claims it, keeps no record that a pin happened, and
@@ -22560,3 +22600,409 @@ cells** that no ladder scan would reach:
 
 Both are arguments for keeping the program-population sweep alongside the ladder audit
 rather than in place of it.
+
+---
+
+### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
+
+**closed as `runs` · was `check-clean invalid wasm` (D773, D742, D776) and `loud emit reject`
+(D411, D501, D741's eager block) · **63 of the covariance family's 76 cells move, 0 `runs`
+LOST, 0 into any silent class** · `goal-scoreboard.py` **79 -> 16** against the goal on the
+corpus as it stood, `runs` **4,250 / 7,262 (58.52%) -> 4,313 / 7,262 (59.39%)** · a CLAUSE-1
+close for 11 cells and a CLAUSE-2 close for 52**
+
+Repro (now runs, printing `1` then `7`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: Circle[] = [{ r: 7 }]
+      const b: Shape[] = a
+      print(b.length)
+      print(a[0].r)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 217: type mismatch
+    // Now: prints 1 then 7.
+
+* **WASMGC SUBTYPING DOES NOT REACH THIS PAIR, AND THAT WAS CHECKED FIRST.** #2040 built a real
+  `(sub …)` edge for structural WIDTH subtyping and #2035 made struct field order canonical, so
+  "is the copy needed at all" is a live question. Off `./node_modules/.bin/wasm-dis` (binaryen
+  130) the repro's heap types are `$0` = `Circle` `(struct (field (mut i32)))`, `$2` = the union
+  box `(struct (field i32) (field anyref))`, `$3` = `(array (mut (ref null $0)))` and `$5` =
+  `(array (mut (ref null $2)))`. Two facts kill the free answer and neither is about VL: a union
+  BOX is not a width supertype of its arm — it is a different shape, two fields against one —
+  and a **MUTABLE array is INVARIANT in WasmGC**, so even a subtype element would not relate
+  `$3` to `$5`. No `(sub …)` edge exists or can be built for a covariant element pair in a
+  mutable list. The copy is the only lowering.
+
+* **THE COPY IS `emitMapFilter`'s LOOP ONE TRANSFORM IN** (`emitRefListWidenTop`): read the
+  source wrapper's `len`, `array.new_default` the destination backing at that length, walk it
+  boxing each element, `struct.new` the wrapper. Off `wasm-dis` on the repro:
+
+      (local.set $3 (local.get $0))                      ;; src = a, evaluated once
+      (local.set $6 (struct.get $4 1 (local.get $3)))    ;; n = src.len
+      (local.set $4 (array.new_default $5 (local.get $6)))
+      (local.set $5 (i32.const 0))
+      (block $block (loop $label
+        (br_if $block (i32.ge_s (local.get $5) (local.get $6)))
+        (array.set $5 (local.get $4) (local.get $5)
+          (struct.new $2 (i32.const 0)                   ;; the arm's program-global TAG
+            (array.get $3 (struct.get $4 0 (local.get $3)) (local.get $5))))
+        (local.set $5 (i32.add (local.get $5) (i32.const 1)))
+        (br $label)))
+      (local.set $1 (struct.new $6 (ref.as_non_null (local.get $4))
+                                   (local.get $6) (local.get $6)))
+
+  The tag is a CONSTANT because `assignTags` ranks arms program-globally by structural
+  signature, so one arm has one tag wherever it appears. The box payload is `anyref`, so the
+  `(ref null $0)` element rides it with no recover — which is why there is no `ref.cast` in the
+  loop and no way for it to trap. The four locals ride the LAZY list frame (`widenSrcWrapSlot` /
+  `widenDstBackSlot` / `widenTmpSlot`, `liBack` codes 8/9/10), for `sharedFieldRecvSlot`'s
+  reason one step stronger: no pre-pass can answer "does this delivery widen", because the
+  answer depends on a row that is not interned yet AND on a whole-program scan.
+
+* **THE LICENCE IS A WHOLE-PROGRAM, REP-SCOPED WRITE SCAN, and it is what makes D661B's refusal
+  not apply here.** That row refused a converting copy because *"it gives one destination a
+  private list, which no other list assignment in the language does"* — true, and observable
+  only if something WRITES through one handle and READS through the other. `rlSlotEverWritten`
+  answers "does any list-element store or mutating list method anywhere in this program reach a
+  list whose element rep is this ref-list row", by one flat walk of the node arena, memoised per
+  row. The widening is taken only when BOTH the source row and the destination row answer no.
+  Where either answers yes, master's behaviour stands unchanged — which is
+  `tests/cases/unions/error-list-literal-two-destinations-written.vl`, the same program as the
+  running fixture beside it plus one store.
+
+  A FLAT ARENA WALK RATHER THAN A PER-FUNCTION ONE, deliberately: aliasing means the write that
+  observes the copy can be in any function, and `d791_store_callee` is that cell —
+  `poison(xs: Shape[]) { xs[0] = … }` called with the widened list. The receiver's type comes
+  from the CHECKER's record (`nodeTyIxOf`), so the walk needs no `fnIx` and no scope stack. The
+  DECLINE DISCIPLINE is `containerElemClassDiffers`': an unrecorded type, or a ref-ish element
+  naming no interned row, answers TRUE (block); a scalar element and a NON-array receiver answer
+  FALSE, which is what lets `mU["k"] = lv1` through — a map store is a destination delivery, not
+  a mutation of either list.
+
+  **IT IS NOT A FLOW-SENSITIVE `Readable` INFERENCE AND MUST NOT BE READ AS ONE.** It is
+  rep-scoped and whole-program, so it declines a legal program whose write is to an unrelated
+  list of the same element row. `d791_unrelated_write_blocks` is that cell, kept in `named/` as
+  the standing price.
+
+* **SEVEN DELIVERY FORMS, BECAUSE `letRefListDestSlot`'s OWN LIST IS SEVEN.** The hooks are the
+  binding (`emitLetDeclStmt`), the assignment, the call ARGUMENT, the RETURN, a nested-list
+  ELEMENT, the map VALUE and the struct FIELD. No one of them subsumes the others and each is a
+  measured cell of this class — ablation −C below prices exactly that.
+
+* **THE SOURCE ROW IS READ FROM THE CELL, NEVER FROM THE SPELLING** (`exprEmittedRefListSlot`),
+  and both halves of that were measured as `runs` cells LOST by earlier builds of this rung. An
+  ARRAY LITERAL is built at the row the DESTINATION seeded, so `const a: Shape[] = [{r:7}]` —
+  `d773_readonly_same`, the read-only control — is already at the destination row and widening
+  it is `expected (ref null $type), found (ref $type)`. A module GLOBAL's cell is
+  `globalRefListSlot`, which for an un-annotated global is a DESTINATION's answer and not the
+  literal's own: `d661_shadow_callarg__bind__s_first` and fifteen siblings are that cell, and
+  the spelling-based first build lost all sixteen. The answer set is now deliberately narrow — a
+  declared LOCAL, a module GLOBAL, a PARAMETER — and a call result / field read / indexed read
+  source is NOT widened. That residue is D794.
+
+* **THE ABLATION, five rungs, each built from scratch and graded cell-matched.** Strip-all
+  reproduces the base seed byte-for-byte: `bba9f7d2d8d9dc6c57918c5b10a2e2f1`, 1,542,450 bytes —
+  built from master's own `compiler/` BY THE CANDIDATE SEED, so it also witnesses that the new
+  compiler emits master's compiler identically.
+
+  | rung | what it is | `runs` | movement vs the base |
+  |---|---|---|---|
+  | all five (shipped) | | **4,313** | 52 emit reject -> runs, 11 silent -> runs, **0 lost, 0 -> silent** |
+  | −A | the copy emitter and every hook | 4,250 | **52 `loud emit reject` -> check-clean invalid wasm** |
+  | −B | the `k1` rung in `letRefListDestSlot` | 4,261 | only the 11; the two-destination family stays loud |
+  | −C | the six non-BIND delivery hooks | 4,282 | 32 -> runs, **30 `loud emit reject` -> silent** |
+  | −D | the WRITE SCAN | **4,315** | 54 emit -> runs, 11 silent -> runs — **two cells MORE than shipped** |
+  | −E | the cell-based source row | 4,208 | **105 `runs` LOST** |
+
+  A and B must land together: B without A is 52 invalid modules, A without B buys only the 11
+  cells that never route through `letRefListDestSlot`.
+
+* **−D SCORES HIGHER THAN THE SHIPPED COMPILER AND IS STILL WRONG, WHICH IS D751'S SHAPE ONE
+  STEP WORSE.** The write scan costs two corpus cells (`d774_k1k2_store`,
+  `d774_k1k2_param_store`) because those two print only the LENGTHS of the lists they write, and
+  a copy and an alias agree about a length. The program that separates them is
+  `d791_push_alias`, committed to `distilled/named/`:
+
+      const a: Circle[] = [{ r: 7 }]
+      const b: Shape[] = a
+      b.push({ s: 3 })
+      print(a.length)   // VL lists ALIAS: 2
+      print(b.length)   // 2
+
+  With the write scan ablated this compiles and prints **1 then 2**. Master and the shipped
+  compiler both refuse the module. An invalid module traded for a check-clean silently wrong
+  one, bought by a rung whose corpus score is **−2**. Five cells are in `named/` for it — four
+  must-NOT-run routes plus `d791_narrow_widened_elem`, which RUNS and is what says the converted
+  elements are readable through a narrow rather than merely countable.
+
+* **THE COST, STATED RATHER THAN HIDDEN — see D795.** The copy is O(n) and allocating where the
+  author wrote what looks like a pointer assignment. No warning is emitted, and the reason is
+  measurable rather than a judgement call: **every site it fires at is a program that does not
+  compile at all without it** — the site is asked only where the two rows DIFFER, and a same-row
+  delivery is a plain pointer store — so no working O(1) line anywhere becomes O(n). Measured on
+  the compiler's own 149k-line source: asked **4,875 times, widens 0 times**.
+
+* **MEASURED, all six instruments.** Corpus `cmp` (`corpuscmp.py`, master seed vs candidate):
+  **2,462 modules · 2,012 identical · 0 DIFFER · 0 LOST · 450 not buildable by the base**.
+  Distilled corpus: **63 cells -> `runs` (52 from `loud emit reject`, 11 from `check-clean
+  invalid wasm`), 0 `runs` -> not-runs, 0 -> silent.** D411's FULL 103-cell grid, re-generated
+  and graded against both seeds: **96 `loud emit reject` -> runs, all 7 single-destination
+  controls still running, 103/103 run, 0 lost, 0 -> silent.** D661's FULL 211-cell grid:
+  **211/211 run on both seeds, unchanged.** D741's 123 corpus cells: 27 moved, **0 lost**, its
+  56 running cells intact. `d773_readonly_same` runs. `tests/cases`: **2,004 -> 2,007 of 2,451
+  building**, 0 timeouts, 3.8s wall at `JOBS=6`, and the set difference is EXACTLY the three
+  fixtures this landing converts. Counters (a probe build, removed before merge) — reach/ans per
+  cell: `d773_readonly_bind` 2/1, `d773_readonly_param` 2/1, `d773_readonly_same` **2/0**,
+  `d411_mapstore__bind__u_first` 4/1, and the four write witnesses 2/0, 2/0, 3/0, 2/0.
+
+* **WHAT IS LEFT OF THE 76, EXACTLY: 13 cells in three families with three different answers** —
+  the `(Circle | null)[]` NICHE pairs (8, D792), the WRITTEN-THROUGH pairs (4:
+  `d774_k1k2_{store,param_store}` and D741's two traps, which are A9's `Writable` half, D793),
+  and `d775_hole_nul_string` (1, the string-list synthesis on its own axis, D775). The other
+  three cells against the goal (`a000093`, `d003280`, `d352opt_union`) were never covariance.
+
+* **NAME THE POPULATION.** `79 -> 16` is measured on the 7,262-cell corpus as it stood. This
+  landing also ADDS five cells that no corpus cell reached before — four must-NOT-run and one
+  that runs — so the corpus is now 7,267 and the scoreboard reads **20** (clause 1 **7**,
+  clause 2 **13**), `runs` **4,314 / 7,267 (59.36%)**. Both numbers are correct and they are
+  about different populations; the four new must-not-run cells were check-clean invalid wasm on
+  master too, and naming them is what makes clause 1 describe VL rather than the corpus.
+
+---
+
+### D792 — the `(Circle | null)[]` NICHE is the one element pair the widening declines, and boxing it would need the narrow the niche exists to avoid
+
+**loud emit reject · found 2026-08-31 as the measured boundary of D791's rung · 8 corpus cells,
+all in `d741`'s eager block · left refused rather than guessed at, and the reason is a TAG, not
+a plumbing gap**
+
+Repro (a loud emit reject):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: (Circle | null)[] = xs
+      const b: (Shape)[] = xs
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // vl check rc 0; vl run ->
+    //   emitProgram: one un-annotated list literal is bound to TWO declared destinations
+    //   whose elements are stored differently …
+
+* **THE EIGHT CELLS ARE EXACTLY THE `CircleNull` ROW AND COLUMN of D741's eager block** —
+  `d741_eager_{Animal,CircleStr,Other,Shape}__CircleNull` and
+  `d741_eager_CircleNull__{Animal,CircleStr,Other,Shape}`. Every other pair in that block runs
+  after D791. So the residue is not "some of the family"; it is ONE ELEMENT, on both sides.
+
+* **WHY `rlWidenVariantOf` DECLINES IT, and it is a soundness reason.** A `(Circle | null)[]` is
+  a NICHE (D771): its slot is kind 1 with `rlElemNullable == 1`, and its backing is
+  `(array (mut (ref null $Circle)))` where the null is a legal ELEMENT VALUE. Boxing that
+  element under `Circle`'s tag produces a box whose tag says Circle and whose payload is null,
+  and the narrow the box exists for (`match e { Circle => … }`) compiles a
+  `ref.cast (ref $Circle)` that TRAPS on it. Widening the pair needs a null ARM in the
+  destination union and a per-element test to pick between two tags — a second lowering, not a
+  wider gate on this one.
+
+* **THE OPPOSITE DIRECTION IS NOT CHEAPER.** With the literal built at the BOX row the niche
+  destination needs an UNBOXING copy, a per-element `ref.cast` that can fail — the hazard
+  D791's boxing direction was chosen to avoid.
+
+* **THE CONTROL SEPARATES IT FROM D771's CLOSE.** `(Circle | null)[]` as the SOLE destination of
+  the same literal RUNS (D771 closed that); only the PAIRING with a box destination refuses. So
+  this is D791's boundary, not a regression of D771's.
+
+---
+
+### D793 — A9's `Writable` half is the only thing left for the covariance family's four WRITTEN cells, and D791's write scan already computes its predicate
+
+**loads then traps · `d741_w0_base` and `d741_w6_params` trap; `d774_k1k2_store` and
+`d774_k1k2_param_store` are loud emit rejects · 4 cells · deliberately NOT built here, and the
+reason is that D791 changed which INSTRUMENT is missing rather than which rule is wanted**
+
+Repro (check rc 0, then a runtime trap — D741's `w0_base`, unchanged by D791):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Shape[] = xs
+      const b: Other[] = xs
+      b[0] = { t: 3 }
+      const e = a[0]
+      match e { Circle => print(100 + e.r), Sq => print(200 + e.s) }
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Caused by: wasm trap: cast failure
+    // SHOULD PRINT 107 — `a`'s own annotation says element 0 is a `Shape`
+
+* **UNCHANGED BY D791 AND CORRECTLY SO.** Both destinations here are union BOXES, so the two
+  rows agree and nothing widens; the unsoundness is the one D741 diagnosed — two DIFFERENT
+  declared unions sharing one box, and a store through one putting a value outside the other's
+  arms. D791's write scan sees the store and would decline a widening anyway.
+
+* **WHAT D791 CHANGES IS THE PRICE OF BUILDING IT.** D774 refused a `Writable`-only reading on a
+  COVERAGE measurement (2 of 80 cells), and that measurement stands. What it did not have was
+  the ANALYSIS: `rlSlotEverWritten` now computes, per ref-list row, "does anything in this
+  program write through a list of this rep" — precisely the predicate a `Writable` rule needs,
+  one granularity coarser than a per-binding one. A checker rule refusing a covariant assignment
+  whose destination row is written through reaches all four of these cells and, by construction,
+  none of D411's 7 controls, none of D661's 211 and none of D741's 56 running cells: every cell
+  it can reach contains a write and none of those does.
+
+* **THE PRICE THAT STILL HAS TO BE PAID, and it is why this is filed rather than built.** The
+  predicate is REP-scoped and whole-program, so a checker rule reading it would REFUSE a program
+  whose write is to an unrelated list of the same element row — the shape
+  `d791_unrelated_write_blocks` pins. Declining a LOWERING on that basis costs nothing (the
+  program was already invalid); refusing a PROGRAM on it is a false reject, and clause 2 forbids
+  exactly that. A `Writable` rule therefore needs a per-VALUE analysis D791 did not build, and
+  filing it with that requirement attached is the point of this row.
+
+---
+
+### D794 — the widening reads its SOURCE row from the cell, so a call result / field read / indexed read source is not widened
+
+**check-clean invalid wasm · found 2026-08-31 as the deliberate bound of D791's
+`exprEmittedRefListSlot` · no corpus cell reaches it · a CLAUSE-1 residue named rather than
+guessed at, because the guess is what cost 105 `runs` cells during the build**
+
+Repro (check rc 0, invalid module):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function mk(): Circle[] { return [{ r: 7 }] }
+    function f() {
+      const b: Shape[] = mk()
+      print(b.length)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code: type mismatch
+    // SHOULD PRINT 1 — nothing in the program writes anything
+
+* **WHY THE ANSWER SET IS NARROW ON PURPOSE.** `exprEmittedRefListSlot` answers the row the
+  emitter PUT THE VALUE IN, and it can only do that where it reads the same table the value's
+  CELL was typed from: a declared local's `localStructIdx`, a global's `globalRefListSlot`, a
+  parameter's annotation. For a CALL result the row comes from the callee's own classification
+  (`fnRetRefArrayNameSid`, `criClassify`'s `fRetStructIdx`, or a `$fnsig` result slot depending
+  on the callee's shape), for a FIELD read from `sFieldRefSlot`, for an INDEXED read from the
+  outer list's element slot. Each is reachable; none of them is the SPELLING.
+
+* **THE SPELLING IS THE WRONG ANSWER AND IT WAS MEASURED.** A build of this rung that used
+  `refListSlotOfExprStrict` (the element NAME's row) lost **105 `runs` cells** in the distilled
+  corpus — 16 of them the `d661_shadow_*` set, whose global's cell is a DESTINATION's row rather
+  than the literal's own, and `d773_readonly_same`, whose literal is already built at the
+  destination row. Widening a value that is not where the spelling says produces `expected (ref
+  null $type), found (ref $type)`: an invalid module from a rung whose whole purpose is to
+  remove one.
+
+* **CLOSING IT IS ONE ARM PER SOURCE SHAPE, NOT A WIDER GATE.** Each shape needs its own read of
+  its own table, and each needs its own witness before it is added — the discipline that made
+  the three shipped shapes safe.
+
+---
+
+### D795 — the converting copy is O(n) and allocating, and the reason it needs no warning is that every site it fires at is a program that did not compile
+
+**runs today and must keep running · a COST row, not a defect · the measurement that says the
+copy never turns a working O(1) line into an O(n) one**
+
+Repro (runs today and must keep running, printing `1`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: Shape[] = [{ r: 7 }]
+      const b: Shape[] = a
+      print(b.length)
+    }
+    f()
+    // 1 — the SAME row on both sides, so this is a plain pointer store and stays one.
+    // `emitRefListWidenSite` is asked here and answers no.
+
+* **THE COST IS REAL AND IT IS STATED.** `const b: Shape[] = a` over a `Circle[]` allocates a
+  fresh backing array of `a.length` plus one union box per element, and walks the list. Where
+  the author wrote what reads as a pointer assignment, the emitted code is a loop; inside a hot
+  loop that is a per-iteration allocation.
+
+* **AND IT IS NEVER A REGRESSION, WHICH IS WHY NO WARNING WAS ADDED.** The widening is asked
+  only where the source row and the destination row DIFFER, and it fires only where the pair is
+  widenable and write-free. Every such site is, on master, either an invalid module or a loud
+  emit reject — there is no program whose O(1) store becomes an O(n) copy, because there is no
+  program that had a working O(1) store at these rows. Measured: over the compiler's own
+  149k-line source the site is asked **4,875 times and answers YES 0 times**, and corpus `cmp`
+  over 2,012 modules is byte-identical.
+
+* **A SIZE THRESHOLD WAS CONSIDERED AND REFUSED.** A threshold makes the same program compile or
+  not depending on a length the compiler cannot know, and the fallback below the threshold is
+  the invalid module. There is nothing to fall back TO.
+
+* **WHAT WOULD CHANGE THE ANSWER, so the next person does not re-derive it.** If a future rung
+  ever widens a pair the emitter can ALSO alias — a same-backing pair reached through two
+  spellings, say — then a copy there really would replace a working pointer store, and a warning
+  (or a refusal) becomes the right call. The test is `rlWidenVariantOf`: it answers only for a
+  kind-1 -> kind-2 pair, and those two rows are two distinct WasmGC array types by construction.
+  A rung that widens WITHIN one row is the thing to be suspicious of.
+
+---
+
+### D796 — an indexed STORE of an object literal into a list whose element is a union ARM has no lowering, with no covariance anywhere in the program
+
+**check-clean invalid wasm · found 2026-08-31 while building D791's write witnesses, as an
+obstacle that turned out not to be covariance at all · a CLAUSE-1 soundness violation · no
+corpus cell reaches it · filed rather than fixed: it is one container over from D761/D771 and
+shares nothing with the covariance family but its type declarations**
+
+Repro (check rc 0, invalid module):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: Circle[] = [{ r: 7 }]
+      a[0] = { r: 9 }
+      print(a[0].r)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 216: type mismatch:
+    //   expected (ref null $type), found (ref $type)
+    // SHOULD PRINT 9
+
+* **IT IS NOT COVARIANCE AND THE ABLATION SAYS SO IN ONE LINE.** There is one destination, one
+  element type, and no assignment between two list types anywhere. What the program has is a
+  `Circle` that is a union ARM — so `collectS` withholds its `sNames` row, D761's mechanism —
+  and an object LITERAL stored into an element slot typed `(ref null $uVarHeap[Circle])`. Delete
+  `type Shape = Circle | Sq` and the identical program RUNS, printing `9`.
+
+* **THE FAMILY, ABLATED, and the `.push` leg is NOT the escape.** Dropping the store
+  (`print(a[0].r)` alone) runs, printing `7`; dropping the union declaration runs; replacing the
+  store with `a.push({ r: 9 })` **also fails**, at `expected (ref $type), found (ref $type)`;
+  and `other.pop()` on the same list is a different loud reject again (*"a ref-element list op
+  needs its receiver's element type known before the body is lowered"*). So the family is the
+  MUTATING ops over an arm-element list as a set, not the indexed store alone, and only the
+  build and the read lower.
+
+* **WHY IT IS FILED HERE.** It is what made D791's first divergence witness unusable: a witness
+  that writes through the source with `a[0] = { r: 9 }` fails on master, on the candidate AND on
+  the write-scan ablation, for THIS reason and not for the one it was written to show. The
+  usable witness pushes through the union-box destination instead. Recording that costs a
+  paragraph and saves the next person the same hour.

@@ -509,6 +509,7 @@ import {
   eqRowOfVariant,
   eqRowTgtStructIdx,
   exprArray,
+  exprEmittedRefListSlot,
   exprF32Array,
   exprF64Array,
   exprI64Array,
@@ -695,6 +696,8 @@ import {
   rlSlotByName,
   rlSlotByNameTy,
   rlSlotOfTy,
+  rlWidenAllowed,
+  rlWidenVariantOf,
   scalarListElemKind,
   scopeBind,
   scopePop,
@@ -759,6 +762,9 @@ import {
   variantIndexOf,
   vtKindOfParam,
   vtKindOfType,
+  widenDstBackSlot,
+  widenSrcWrapSlot,
+  widenTmpSlot,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
 import {
@@ -1398,6 +1404,16 @@ function emitObj(body: i32[], objIx: i32, fnIx: i32) {
         if emitExprExpect(body, valIx, fnIx, flaCtx) < 0 { return -1 }
       } else {
         if emitExpr(body, valIx, fnIx) < 0 { return -1 }
+      }
+      // READ-ONLY COVARIANCE at the STRUCT-FIELD boundary (D791) — `{ xs: lv1 }` over a
+      // `type WU = { xs: Shape[] }`. `pendingListSlot` still holds the field's own row
+      // (`fslot`), which the code-5 arm resolved above.
+      if scode == 5 {
+        emitRefListWidenSite(
+          body,
+          exprEmittedRefListSlot(valIx, fnIx),
+          pendingListSlot,
+        )
       }
       if scode == 15 { pendingStructIdx = savedPSI }
       if scode == 19 {
@@ -6312,6 +6328,15 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
             }
           }
           if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
+          // READ-ONLY COVARIANCE at a NESTED-LIST ELEMENT (D791) — `[lv1]` of a
+          // `Shape[][]`, where the element's own row is the inner ref list.
+          if elemNest == 9 && nestInnerSlot >= 0 {
+            emitRefListWidenSite(
+              body,
+              exprEmittedRefListSlot(elems[i], fnIx),
+              nestInnerSlot,
+            )
+          }
         }
         pendingVariantIdx = -1
         i = i + 1
@@ -8014,7 +8039,17 @@ function emitMapSetValExpr(
   if !atomVal {
     if exprIsLitAtom(valIx, fnIx) { return emitStrValue(body, valIx, fnIx) }
   }
-  emitExprExpect(body, valIx, fnIx, svCtx)
+  if emitExprExpect(body, valIx, fnIx, svCtx) < 0 { return -1 }
+  // READ-ONLY COVARIANCE at the MAP-VALUE boundary (D791) — `mU["k"] = lv1` over a
+  // `{[string]: Shape[]}`. The destination row is the same `mvValInnerRlSlot` the build
+  // seed above reads; it declines for every non-ref-list value type without parsing.
+  if mslot >= 0 {
+    const mvWiden = mvValInnerRlSlot(mslot)
+    if mvWiden >= 0 {
+      emitRefListWidenSite(body, exprEmittedRefListSlot(valIx, fnIx), mvWiden)
+    }
+  }
+  0
 }
 
 // `local.set` / `local.get` of the SET value stash: the mv slot's typed valStash,
@@ -14590,6 +14625,13 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       pendingMapSlot = -1
       pendingListKind = savedAsLK
       pendingListSlot = savedAsLS
+      // READ-ONLY COVARIANCE at the ASSIGNMENT boundary (D791) — `aU = lv1` over a
+      // `let aU: Shape[]` and a `Circle[]`-repped `lv1`.
+      emitRefListWidenSite(
+        body,
+        exprEmittedRefListSlot(a.binRight, fnIx),
+        exprEmittedRefListSlot(a.binLeft, fnIx),
+      )
       fbLocalSet(idx) // 0x21 local.set
       return 0
     }
@@ -16106,6 +16148,131 @@ function emitMapFilter(body: i32[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a .map/.filter call")
 }
 
+// ── the ELEMENT-CONVERTING COPY (read-only covariance, D791) ──────────────────
+//
+// Consume a `(ref $rlWrapIdx[srcSlot])` on the stack and leave a
+// `(ref $rlWrapIdx[dstSlot])` holding the same elements BOXED into the program-global
+// `{tag, payload}` union box. This is the pass D411 recorded as absent — *"Every
+// `fbArrayCopy` in the emitter is same-heap-to-same-heap; the only per-element boxing is
+// `emitArr`'s loop over SYNTACTIC `arrElems` at literal build time. There is no pass that
+// iterates an existing list value."* — and it is the ONLY lowering the pair has: a mutable
+// WasmGC array is INVARIANT, so no `(sub …)` edge relates `(array (mut (ref null
+// $Circle)))` to `(array (mut (ref null $uBox)))` and #2040's width subtyping does not
+// reach the element pair either.
+//
+// IT COSTS O(n) AND ONE ALLOCATION where the author wrote what reads as a pointer
+// assignment. That is not free and it is not hidden: `emitRefListWidenSite` is asked only
+// where the alternative is a program that does not compile at all, so the copy never
+// replaces a working O(1) store — every site it fires at is an invalid module or a loud
+// reject on master. See D791 for the measured shape and for why a warning was NOT added.
+//
+// THE LOOP IS `emitMapFilter`'s, one transform in: read the source's `len`, allocate a
+// default-filled destination backing, walk it boxing each element, and `struct.new` the
+// wrapper. The tag is a CONSTANT — `rlWidenVariantOf` resolved the source element's heap
+// to a union arm, and `assignTags` ranks arms program-globally by structural signature,
+// so one arm has one tag wherever it appears.
+//
+// CALLERS MUST HAVE ASKED `rlWidenAllowed` FIRST. This function re-asks only the REP half
+// (`rlWidenVariantOf`) and refuses loudly rather than emitting a wrong tag; the WRITE half
+// is the caller's licence to take, because the caller is the one that knows it is about
+// to change an alias into a copy.
+function emitRefListWidenTop(_body: i32[], srcSlot: i32, dstSlot: i32) {
+  const vi = rlWidenVariantOf(srcSlot, dstSlot)
+  if vi < 0 || vi >= uTags.length {
+    return emitFail(
+      "emitProgram: ref-list widening asked for an element pair with no union arm",
+    )
+  }
+  // The `fbValtype` discipline: never index a parallel `rl*` table on a slot that only
+  // one of them covers. `rlWidenVariantOf` bounded `rlElemKindTbl`; these are the two
+  // columns the loop's heap-type immediates come from.
+  if srcSlot >= rlWrapIdx.length || dstSlot >= rlWrapIdx.length {
+    return emitFail(
+      "emitProgram: ref-list widening slot has no interned wrapper",
+    )
+  }
+  if srcSlot >= rlBackIdx.length || dstSlot >= rlBackIdx.length {
+    return emitFail(
+      "emitProgram: ref-list widening slot has no interned backing",
+    )
+  }
+  const srcWrap = rlWrapIdx[srcSlot]
+  const srcBack = rlBackIdx[srcSlot]
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  const sL = widenSrcWrapSlot(srcSlot)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  // src = <stack>, evaluated ONCE by the caller.
+  fbLocalSet(sL)
+  // n = src.len  (`struct.get` accepts a nullable ref and traps on null, so the
+  // nullable frame slot needs no recover here).
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 1)
+  fbLocalSet(nL)
+  // back = array.new_default <dstBack> n
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block { loop { if i >= n br 1; back[i] = {tag, src.back[i]}; i++; br 0 } }
+  fbBlock(64)
+  ctrlEnter()
+  fbLoop(64)
+  ctrlEnter()
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbI32Const(uTags[vi]) // the arm's program-global tag
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0) // the source backing, `(ref $srcBack)`
+  fbLocalGet(iL)
+  fbArrayGet(srcBack) // `(ref null $elem)` — the box payload is `anyref`, so no recover
+  fbStructNew(uBoxIdx)
+  fbArraySet(dstBack)
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  ctrlLeave()
+  fbEnd()
+  ctrlLeave()
+  // { backing, len, cap } — the wrapper's field 0 is a NON-null `(ref $dstBack)`, so the
+  // nullable frame slot recovers here and only here.
+  fbLocalGet(dL)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbLocalGet(nL)
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  0
+}
+
+// The DELIVERY-SITE half: a value just emitted at ref-list slot `srcSlot` is being
+// delivered into a `dstSlot` destination. Widen it in place when the pair is widenable
+// AND the whole-program write scan licenses it; otherwise leave the stack untouched and
+// let the site keep master's behaviour (an invalid module, or a loud reject one rung on).
+//
+// ONE PREDICATE, ONE EMITTER, ASKED AT EVERY DELIVERY. The seven ways VL spells "this list
+// flows there" are `letRefListDestSlot`'s own list, and the reason they are seven calls
+// rather than one is the reason that function enumerates them: no one of them subsumes the
+// others, and each is a measured cell of this class.
+export function emitRefListWidenSite(
+  body: i32[],
+  srcSlot: i32,
+  dstSlot: i32,
+): boolean {
+  if !rlWidenAllowed(srcSlot, dstSlot) { return false }
+  if emitRefListWidenTop(body, srcSlot, dstSlot) < 0 { return false }
+  true
+}
+
 // `emitClampIdx`'s dual over plain wasm i32 LOCALS (not the string-op frame): emit
 // `clamp(idx, len)` reading `idx` from local `idxL`, `len` from `lenL`, leaving the
 // clamped value on the stack. Same JS slice semantics (`idx < 0 ? max(len+idx, 0) :
@@ -16563,6 +16730,23 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
       }
     }
   }
+  // The RESULT's ref-list row, for the read-only-covariance widening (D791). Both halves
+  // of the same pair `emitOneFuncType` writes the result valtype from: the ANNOTATION's
+  // row, and — for an un-annotated function — `criClassify`'s recorded `("reflist", slot)`.
+  // Reading the functype's own source is what keeps the widened value and the declared
+  // result in agreement by construction.
+  let retRlSlot = -1
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      if vtKindOfType(fn.fnRet) == "reflist" {
+        retRlSlot = tyAnnRefListSlot(fn.fnRet)
+      }
+    } else if fnPos >= 0 && fnPos < fRetKind.length {
+      if fRetKind[fnPos] == "reflist" && fnPos < fRetStructIdx.length {
+        retRlSlot = fRetStructIdx[fnPos]
+      }
+    }
+  }
   let retF32 = false
   let retF64 = false
   let retI64 = false
@@ -16923,6 +17107,10 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     if retNonNullRefResult(fnIx, fnPos) {
       if exprNullableRefNiche(retArg, fnIx) { fbRefAsNonNull() }
     }
+  }
+  // READ-ONLY COVARIANCE at the RETURN boundary (D791) — `return lv1` from a `(): Shape[]`.
+  if retRlSlot >= 0 {
+    emitRefListWidenSite(body, exprEmittedRefListSlot(retArg, fnIx), retRlSlot)
   }
   pendingStructIdx = -1
   pendingVariantIdx = -1
@@ -17720,6 +17908,17 @@ function emitLetDeclStmt(body: i32[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   pendingListSlot = 0
   pendingMapSlot = -1
   pendingNulRefHeap = -1
+  // READ-ONLY COVARIANCE at the BINDING boundary (D791): the value on the stack is a
+  // ref list at one row and this binding's cell is another. `const b: Shape[] = a` over
+  // a `Circle[]` — D773's witness — is `vl check` rc 0 and INVALID WASM on master, and
+  // `emitRefListWidenSite` converts it where the copy is unobservable.
+  if localIsRef[slot] == "reflist" {
+    emitRefListWidenSite(
+      body,
+      exprEmittedRefListSlot(s.letInit, fnIx),
+      localStructIdx[slot],
+    )
+  }
   fbLocalSet(idx) // 0x21 local.set
   // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
   // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -20762,6 +20961,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // A `string` param position (kind 3): a literal-union atom ARGUMENT widens to its member
     // string at the boundary (the atom-as-string-subtype edge).
     let cParamStr = false
+    // A ref-array param position's interned element ROW, for the read-only-covariance
+    // widening (D791) — the same `tyAnnRefListSlot` the build seed below reads, kept
+    // because the seed is cleared before the argument's widening can be asked.
+    let cParamRlSlot = -1
     if cFn is FuncDecl {
       const cParams = cFn.fnParams
       if i < cParams.length {
@@ -20840,6 +21043,9 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         if cp is Param {
           pendingListKind = tyAnnRefListKind(cp.parType)
           pendingListSlot = tyAnnRefListSlot(cp.parType)
+          if vtKindOfParam(cParams[i]) == "reflist" {
+            cParamRlSlot = tyAnnRefListSlot(cp.parType)
+          }
         }
         // An i64 param position lowers an integer-literal argument as `i64.const`.
         if vtKindOfParam(cParams[i]) == "i64" { pendingI64 = true }
@@ -20961,6 +21167,15 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         // argument ignores the hint (the union-unbox cast below handles a boxed value).
         if cVi >= 0 { argCtx.variantIdx = cVi }
         if emitExprExpect(body, args[i], fnIx, argCtx) < 0 { return -1 }
+        // READ-ONLY COVARIANCE at the ARGUMENT boundary (D791) — `d773_readonly_param`:
+        // `look(xs: Shape[])` called with a `Circle[]`.
+        if cParamRlSlot >= 0 {
+          emitRefListWidenSite(
+            body,
+            exprEmittedRefListSlot(args[i], fnIx),
+            cParamRlSlot,
+          )
+        }
         pendingVariantIdx = -1
         // A nullable-REP value (a null-narrowed `S | null` param/local, or a
         // recursive `S | null` field read whose wasm slot stays `(ref null $S)`)
