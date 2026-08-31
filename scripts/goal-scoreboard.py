@@ -52,37 +52,43 @@ def norm(msg):
     return m.strip()[:118]
 
 
-def capability_sites(root, corpus_text):
-    """Refusal sites in the compiler whose own message concedes type-validity, each marked
-    by whether the CORPUS actually reaches it.
+def capability_literals(root, corpus_text):
+    """Every distinct MESSAGE LITERAL in `compiler/*.vl` that concedes the program is
+    type-valid, each marked by whether the corpus reaches it.
 
-    Greppable on purpose. Clause 2 is otherwise the kind of bar that gets argued rather
-    than measured — and the argument always resolves in favour of whoever is tired.
+    THE UNIT IS THE LITERAL, NOT THE "SITE", AND THAT WAS LEARNED THE HARD WAY. Two earlier
+    versions of this function counted grep-matching LINES and tried to fingerprint each one
+    against the corpus by slicing text off the source line. Both were wrong and each was
+    wrong differently — 40 sites, then 26, then 23 with a 13-invisible split, and one of
+    them reported `+` over an f64 list as a corpus blind spot when the corpus holds two
+    cells for it. A line is not a message: interpolated messages are built from several
+    literals and the slice picked up `+ tyToStr(eqBad) +`, which of course appears in no
+    program's output. The literal that CARRIES the concession phrase is well defined, is
+    what actually reaches a user, and is stable under how the call happens to be wrapped.
 
-    THE `ZERO` ROWS ARE THE POINT. The corpus is generated over a fixed set of axes, so it
-    can only score a gap it has a program for. Measured 2026-08-30: **13 of 23 sites are
-    reached by no corpus cell at all** — `+` over an f64 list among them, which refuses
-    today and costs the scoreboard nothing. `runs` could therefore reach 100% with thirteen
-    capability refusals still standing. Every ZERO row needs a hand-written probe before
-    this goal can be called met; none of them will arrive on their own.
+    Comment lines are skipped: a comment quoting a message is not a refusal.
+
+    THE `ZERO` ROWS ARE THE POINT. The corpus is generated over fixed axes, so it can only
+    score a gap it has a program for. Measured 2026-08-30: **9 of 14 literals are reached by
+    no corpus cell** — the element-widening container copy among them, which refuses by hand
+    and costs the scoreboard nothing. `runs` can therefore climb while those nine stand.
+    Each needs a hand-written probe; none will arrive on its own.
     """
-    out = []
+    lit_re = re.compile(r'"((?:[^"\\]|\\.)*)"')
+    found = {}
     src = os.path.join(root, "compiler")
     for fn in sorted(os.listdir(src)):
         if not fn.endswith(".vl"):
             continue
-        for ln, line in enumerate(open(os.path.join(src, fn), encoding="utf-8"), 1):
-            if not (CONCEDES.search(line) and '"' in line):
-                continue
-            quoted = re.findall(r'"([^"]{12,})"', line)
-            if not quoted:
-                continue
-            frag = max(quoted, key=len).strip()
-            # The longest interpolation-free slice, as a fingerprint to look for in the
-            # corpus's recorded messages.
-            probe = max(re.split(r"\s{2,}|`", frag), key=len).strip()[:44]
-            out.append((fn, ln, probe, bool(probe) and probe in corpus_text))
-    return out
+        with open(os.path.join(src, fn), encoding="utf-8") as fh:
+            for ln, line in enumerate(fh, 1):
+                if line.lstrip().startswith("//"):
+                    continue
+                for m in lit_re.finditer(line):
+                    t = m.group(1).strip()
+                    if len(t) >= 12 and CONCEDES.search(t):
+                        found.setdefault(t, f"{fn}:{ln}")
+    return [(loc, t, t[:60] in corpus_text) for t, loc in sorted(found.items())]
 
 
 def main():
@@ -133,9 +139,9 @@ def main():
 
     root = os.path.dirname(HERE)
     corpus_text = " \n".join(v.get("msg", "") for v in cells.values())
-    sites = capability_sites(root, corpus_text)
-    blind = [s for s in sites if not s[3]]
-    print(f"  capability refusal sites in compiler/*.vl   {len(sites):5d}")
+    sites = capability_literals(root, corpus_text)
+    blind = [r for r in sites if not r[2]]
+    print(f"  capability message literals in compiler/*.vl{len(sites):5d}")
     print(f"    of those, reached by NO corpus cell       {len(blind):5d}  "
           f"<- invisible to the scoreboard above")
     print()
@@ -145,8 +151,8 @@ def main():
         print("needs a hand-written probe; none will arrive on its own.")
         print()
     if a.sites:
-        for fn, ln, probe, hit in sites:
-            print(f"  {'HIT ' if hit else 'ZERO'}  compiler/{fn}:{ln}  {probe!r}")
+        for loc, text, hit in sites:
+            print(f"  {'HIT ' if hit else 'ZERO'}  compiler/{loc:<22} {text[:60]!r}")
         print()
         print("  (a gap moved into typecheck.vl stops looking like a gap — the program")
         print("   compiles no better than before, so these count the same as emit-side ones)")
@@ -158,8 +164,8 @@ def main():
                        "clause1_silent": len(silent),
                        "clause2_emit_reject": len(emit),
                        "clause2_conceded": len(conceded),
-                       "capability_sites": len(sites),
-                       "capability_sites_uncovered": len(blind),
+                       "capability_literals": len(sites),
+                       "capability_literals_uncovered": len(blind),
                        "by_class": dict(by)}, fh, indent=2, sort_keys=True)
         print(f"wrote {a.json}")
 
