@@ -10,6 +10,35 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A SHAPE→ROW RESOLVER AND THE LITERAL→ROW MATCHER ARE ONE QUESTION, SO A WIDENING ONE
+  SIDE ACCEPTS THE OTHER HAS TO NAME** (2026-08-31, silent-class-inventory D733 / D702's filed
+  residue). `structIndexOfObjCtx` builds `{ r: 7 }` at a declared `type Circle = { r: i64 }` —
+  an integer literal reaches the wider slot (`anonValueFitsField`) — while both field-set
+  resolvers refused the same pair on the field CODE, so `shapeNominalOfTy` answered "" for a
+  value that is already a `(ref $Circle)` and every container keyed on the recorded shape fell
+  to its scalar default. Widening is added as a SECOND PASS behind the strict one, never as a
+  looser first pass (D461's own measurement: one lenient pass hands a single-field render the
+  first box row instead of the exact one and loses a corpus module), and `shapeNominalOfTy`
+  orders strict-struct → strict-variant → widened-struct → widened-variant so a widening can
+  never outrank a row identity.
+- **THE WIDENED STRUCT PASS DEMANDS A UNIQUE CLAIMANT AND THE WIDENED VARIANT PASS KEEPS FIRST
+  MATCH, AND THE ASYMMETRY IS THE POINT** (2026-08-31, D733). Two widened matches are two
+  LAYOUTS, so on the struct side — where no single function decides which row a literal builds
+  that the scan can be checked against — the scan has no evidence and declines. The variant
+  side HAS that function: `objVariantName`, first match over `uVariants` by field-NAME set with
+  no scalar tightening, is what `letObjLitVariantIdx` calls to decide the binding's arm. A
+  first-match widened scan there answers the row the value already carries, and the widening is
+  a strict subset of what `objVariantName` accepts, so it can only agree or decline. Demanding
+  uniqueness there would refuse exactly the layout-twin programs the value resolved without
+  difficulty.
+- **A CAPABILITY FLOOR IS A CLAIM ABOUT THE EMITTED HEAP TYPE, SO ASK THE HEAPS AND NOT THE
+  TWIN COLUMNS** (2026-08-31, D732). The value-call arm-parameter floor refused any argument
+  that was not the arm, a box holding it, or a literal — and a declared LAYOUT TWIN of the arm
+  is none of those while being, in the emitted module, the very same heap type (`uVarSTwin`,
+  D280). `sHeapIdx[row] == uVarHeap[vi]` is the predicate, verbatim the one `emitUnionBoxArg`
+  already applies at the box boundary: it asks the conjunction of `sTwin`, `uVarTwin` and
+  `uVarSTwin` at once, and it is the type the `call_ref` functype actually declares, so the
+  guard cannot disagree with the bytes.
 - **CANON IS A ONE-WAY REWRITE OVER ANNOTATION NODES, SO ANY EMIT-TIME KEY BUILT FROM AN
   ARENA TYPE HAS TO CARRY CANON'S OWN EQUIVALENCES** (2026-08-30, silent-class-inventory
   D611 / #2024). `canonEmitTypeNames` rewrites `TypeRef` nodes in place and banks the
