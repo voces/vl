@@ -16018,6 +16018,65 @@ Repro (now `runs`):
   the shipped seed) and the candidate is re-derivable with
   `scratch-int/d591/mkvariant.py R1R0R2R3`.
 
+* **[CLOSED 2026-08-30] AND THE REFUSAL WAS OF THE NAME, NOT OF THE ARM — THE SIX ARE PAID.**
+  The naive R3 above still reproduces exactly as filed: rebuilt on `abcad3d5`, `--refused`
+  answers `VETO (4 modules do not build)` with the recorded message on three of them. A probe
+  reporting the MINTED SPELLING through the emit error channel is what separated the mechanism
+  from the sentence, and it is two mechanisms wearing one message:
+
+  * **`{x: <error>, y: <error>}` — the re-check could not decide, and no gate asked.**
+    `monoRecheckBegin` binds an un-pinnable parameter to `TY_ERR`, so a fully inferred
+    `function add(self, b) { x: self.x + b.x, y: self.y + b.y }` answers a `TyObj` whose FIELDS
+    are errors. `rt != TY_ERR` is top-level only and `tyHasHole` recurses looking for a
+    `TyVar`, so both wave it through — and until the struct arm existed that was sound, because
+    `monoRetScalarKind` admits only a `TyPrim` and a primitive has no inside. `self-method.vl`
+    (`objAsk=1`), `operator-self-method.vl` (`1`) and `structural-generic.vl` (`3`).
+  * **`{[]: (i32) => i32}` — fully decided, and the spelling SPLITS an interned row.**
+    `generic-trap.vl` interns the trap-maker literal once as `#anon0` and instantiates
+    `wrap<T>` twice; the naive arm names the two instances by two printed spellings, neither of
+    which any row claims (`objAsk=2`).
+
+  **The fix is one rung and it is a NAME, not a gate.** `monoRetRowName` asks the emitter's own
+  table which ROW this arena type is (`repSlotOfTy` — nominal identity, then the
+  unique-declared-twin bridge) and mints THAT row's name: `V`, not `{x: i32}`. A shape no row
+  claims mints nothing, which is the same question the emitter is about to ask, asked before
+  the annotation exists instead of after. Measured: 6 of 6 cells `check-clean invalid wasm ->
+  runs`; **`runs -> not-runs` 0, `-> silent` 0**; corpus `cmp` **2,428 modules · 1,974
+  identical · 0 DIFFER · 0 LOST**; `tests/cases` **2,419 modules, 1,966 build under both seeds,
+  0 lost / 0 gained**, all four named modules rc 0; `--refused` **held**. `wasm-dis`: the
+  witness's module is BYTE-IDENTICAL to its declared-`: T` twin's (md5 `e3a2212f…`), the base's
+  differing only in `(type $7 (func (param (ref $0)) (result i32)))` where the body pushes a
+  `(ref $0)`. Counters, both pins: `objAsk=1 objName=1 row=1 mint=1` on all four spellings, the
+  declared twin `objAsk=0`, and `std/str.vl`, `std/utf8.vl` and the whole compiler graph all
+  zeros. `goal-scoreboard.py` clause 1 **6 -> 0**; `runs` 3,943 -> 3,949 / 7,021.
+
+* **TWO CANDIDATES WERE ABLATED AWAY, AND BOTH WOULD HAVE READ AS OBVIOUSLY RIGHT.** Neither is
+  in the shipped rung, and each was removed on a measurement rather than on taste.
+
+  * **R3a, a recursive `tyHasErr` gate for the `{x: <error>}` half.** It fires on exactly the
+    three modules that need it (`objErr=1/1/3`) — and deleting it breaks NONE of them, because
+    the row lookup declines all three anyway (0 of 4 refused modules broken without it, and
+    three hand-built witnesses that DECLARE a same-field-name struct beside the inferred
+    generic stay correct: an error-typed field does not canonicalise onto an i32 one). What it
+    does do is COST a cell: `type Node = { v: i32, next: Node | null }` returned from this
+    fall-through hits `tyHasHoleAt`'s depth-8 floor, which a mint gate must read as "do not
+    mint", and the program the row lookup runs is refused. Deleted, and the recursive struct is
+    a line of `generics/unannotated-return-off-a-hole-typed-element.vl` so it stays deleted.
+  * **R3c, widening the resolver to anonymous rows** (`structIndexOfTypeName`, so `g({ x: 7 })`
+    could name its `#anon0`). **Refused, and it is worse than the naive R3 was.** It does not
+    fix the anonymous case at all, and it moves `functions/structural-generic.vl` from `runs`
+    to `check-clean invalid wasm` — `addx` instantiates at i32 and f64, the `{x: <error>}`
+    spelling matches the i32 row for BOTH, and the module validates as `expected i32, found
+    f64`. That is a `runs` cell lost, i.e. the one veto the gate does apply, and it arrives
+    SILENT where the naive R3's was loud. It is also where R3a's justification returns: under a
+    resolver that matches an error-typed field, the concreteness gate stops being redundant.
+    **The anonymous shape therefore remains the measured residue of this row** — `function
+    g<T>(self: T) { const xs: T[] = [self]; return xs[0] }` at `g({ x: 7 })` is still
+    `check-clean invalid wasm`, its counter reads `objAsk=1 objName=1 row=0 decline=1`, and
+    lifting it needs a resolver that keys an anonymous row on the ARENA type rather than on a
+    printed spelling (`repSlotCacheSync` indexes `sRowDecl == 1` rows only, which is exactly
+    the line that would have to change).
+
 * **THE DRY EXTRACTION UNDER IT WAS NOT INERT ON THE FIRST CUT, AND ONLY `cmp` SAW THAT
   EITHER.** `monoInferListElem` and `monoInferLocalScalar` were two copies of one isolated
   re-check; the third reader needed it factored. A first cut returned the arena ROW and let
@@ -18801,6 +18860,62 @@ Repro (`scripts/capability-probes/width-subtyping.vl`, verbatim):
   never run" — which concedes nothing about codegen and is a defensible design rule (it is
   TypeScript's excess-property check, and the evaluation-count argument is real). It is in the
   table above only so a future fix does not read the two as one gap.
+
+---
+
+### D641 — an un-annotated generic STRUCT return whose shape is ANONYMOUS: the row is interned, and the resolver that names it indexes DECLARED rows only
+**check-clean invalid wasm · found 2026-08-30 while closing D592's struct arm, as the exact
+residue that arm's `no row, no mint` decline leaves · it is D592's witness with the argument's
+`type V` deleted, and the DECLARED spelling of the same program runs · the widening that would
+close it was built, measured and REFUSED, and the refusal is priced below**
+
+Repro:
+
+    function g<T>(self: T) {
+      const xs: T[] = [self]
+      return xs[0]
+    }
+    const z = g({ x: 7 })
+    print(z.x)
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 309: type mismatch:
+    //   expected i32, found (ref $type)
+    // SHOULD PRINT 7
+
+* **ONE TOKEN SEPARATES IT FROM A PROGRAM THAT RUNS, AND IT IS NOT THE RETURN ANNOTATION.**
+  Declare the ARGUMENT (`type V = { x: i32 }` + `const p: V = { x: 7 }`) and this is
+  `d592_elem_obj_plain_infer`, which runs since #2038. Declare the RETURN (`g<T>(self: T): T`)
+  and the anonymous spelling runs too. So neither the body nor the shape is the obstacle: what
+  is missing is a NAME the emitter's shape table answers to.
+
+* **THE ROW EXISTS — IT IS THE RESOLVER THAT DOES NOT REACH IT.** `collectAnonShapes` interns
+  `{x: 7}`'s field set as `#anon0`, so the module already holds the struct this return needs.
+  D592's struct arm mints the name of the row `repSlotOfTy` resolves, and `repSlotCacheSync`
+  builds that index over rows with `sRowDecl[si] == 1` — DECLARED rows only. An anonymous row
+  is therefore invisible to it, the arm declines, and `nret` stays -1 exactly as before.
+  Counter probe on this witness: `objAsk=1 objName=1 row=0 mint=0 decline=1` — the arm is
+  asked, it decides the type, and the lookup is the rung that says no.
+
+* **THE OBVIOUS WIDENING IS REFUSED, AND ITS PRICE IS A `runs` CELL — the veto the gate does
+  apply.** Falling back to `structIndexOfTypeName` (the name-keyed field-set matcher, which
+  DOES reach `#anonN`) was built and graded: it does **not** fix this witness, and it moves
+  `tests/cases/functions/structural-generic.vl` from `runs` to **check-clean invalid wasm**.
+  That module's `addx` instantiates at i32 and at f64; both instances re-check to
+  `{x: <error>}` (an un-pinnable parameter binds to `TY_ERR`), the printed spelling matches the
+  i32 row for BOTH, and the module validates as `expected i32, found f64`. A matcher keyed on a
+  printed spelling cannot tell two instances of one generic apart, which is the same
+  "structural identity is not layout identity" its own header warns about — defeated here by
+  the error-typed field its type guard cannot compare.
+
+* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** An anonymous-row resolver keyed on the ARENA type
+  rather than on a printed spelling — the same nominal `sTyIx[si] == ty` identity
+  `repSlotOfTyDecl` already uses, with the `sRowDecl` gate dropped and the `#anonN` rows'
+  `sTyIx` shown to be populated and distinct per instance. Two things must be measured before
+  it ships, because the refused candidate failed both: `functions/structural-generic.vl`,
+  `index/generic-trap.vl`, `objects/self-method.vl` and `objects/operator-self-method.vl` must
+  keep building (`joingrid.py --refused`), and a `TyErr`-carrying shape must not resolve onto a
+  declared row — under a resolver that admits one, D592's deleted `tyHasErr` concreteness gate
+  stops being redundant and comes back with it.
 
 ## 6. Coverage gaps — axes not built, and why
 
