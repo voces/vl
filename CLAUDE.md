@@ -151,13 +151,35 @@ closes is correct and defensible. Under this goal **they are all still open.**
 not a point on this scoreboard. The gate's floor (block on `runs → not-runs`) is unchanged; this
 is the number that is supposed to climb.
 
-**Clause 2 is greppable, so measure it rather than arguing about it.** 40 refusal sites in
-`compiler/*.vl` concede the program is type-valid in their own message — `has no lowering`,
-`not yet supported by codegen`, and one that reads `this program is type-valid but cannot
-build`. **29 of the 40 are in `typecheck.vl`**, which is the direction that hides: a capability
-gap moved into the checker stops looking like a gap, and the program compiles no better than
-before. Every `loud emit reject` is a clause-2 violation by construction, since `check`
-returned 0 to reach it.
+**`scripts/goal-scoreboard.py` is the measurement — do not hand-count this.** It reads the
+corpus baseline and prints `runs` plus both clauses' violations, instantly, without compiling.
+On 2026-08-30: **runs 3,704 / 7,021 (52.76%)**, clause 1 **92**, clause 2 **314** emit rejects
+and **45** check rejects that concede type-validity — **451 cells against the goal**. It also
+counts the distinct MESSAGE LITERALS in `compiler/*.vl` that concede the program is type-valid
+(`has no lowering`, `not yet supported by codegen`, one reading `this program is type-valid but
+cannot build`) — **14**, most in `typecheck.vl`. That is the direction that hides: a capability
+gap moved into the checker stops looking like a gap, the program compiles no better than
+before, and the script counts it the same as an emit-side one.
+
+**AND `runs` CAN REACH 100% WITH THE GOAL UNMET — the script says by how much.** The corpus is
+generated over fixed axes, so it scores only the gaps it has a program for. **9 of the 14
+literals are reached by NO corpus cell** — the element-widening container copy among them,
+which refuses by hand and costs the scoreboard nothing. Each ZERO row in `--sites` needs a
+hand-written probe, and none will arrive on its own. Do not read a rising `runs` as the whole
+answer.
+
+**COUNT MESSAGE LITERALS, NEVER GREP-MATCHING LINES.** This number was hand-derived three times
+and was wrong all three: 40 (grepped lines, comments included), 26 (lines carrying a quote),
+then 23 with a 13-invisible split from fingerprinting each source line against the corpus. That
+last one reported `+` over an f64 list as a blind spot when the corpus holds **two** cells for
+it — an interpolated message is built from several literals, and the fingerprint slice had
+picked up `+ tyToStr(eqBad) +`, which naturally appears in no program's output. A line is not a
+message. The literal carrying the concession phrase is what reaches a user, is stable under how
+the call is wrapped, and is what the script now counts.
+
+**Every `loud emit reject` is a clause-2 violation by construction**, since `check` returned 0
+to reach the emitter: either the program is legal and should compile, or it is illegal and the
+CHECKER owed the diagnosis.
 
 **Read a gate by its exit code or its summary line, never by `tail -1`.** `lint-self.sh`
 interleaves two halves; only `self-lint + fmt-check clean` means both passed. Never put a

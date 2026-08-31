@@ -17536,7 +17536,7 @@ Repro:
   nullability difference could not be a validation error: the heap types must differ.
 
 ### D612 — D280's layout twin, one indirection out: through a MAP-valued field read with `??`
-**check-clean invalid wasm · 6 of the 92 · found 2026-08-30 with D611 · the ingredients are D280's exactly: a union declaration plus a same-shape alias twin**
+**[CLOSED 2026-08-30 by D621, in a different PR] the repro below RUNS and prints `0`, and its own prescribed control (`lv1["k0"] = { r: 1 }` before the read) prints `7` — both correct. Was: check-clean invalid wasm · 6 of the 92 · found 2026-08-30 with D611 · the ingredients are D280's exactly: a union declaration plus a same-shape alias twin, and that is precisely why D621 reaches it: this row's `Dot` is the DECLARED STRUCT TWIN whose existence made `armLayoutAmbiguousAt` decline the arm's field read**
 
 Repro:
 
@@ -17568,6 +17568,13 @@ Repro:
   what its fix keyed on that the map-read path does not present.
 * The correct answer is `0`, not `7` — check the control (`lv1["k0"] = { r: 1 }` before the
   read) so the fix is graded on both the miss and the hit.
+* **WHAT CLOSED IT (2026-08-30).** Not a map-read rung: **D621**, one conjunct in
+  `armLayoutAmbiguousAt`. This row's lead was right that the answer is in D280's close — the
+  merge held, and what did not was the GATE that was still asking the pre-merge question.
+  `armLayoutContestedAt` declines the arm's value-union field read whenever a declared struct
+  of the arm's exact layout exists (`Dot`), which since D280 no longer implies a second heap
+  type; re-asking it through `variantStructHeapTwinAt` lifts the decline and this row's read
+  resolves. Both the miss and the hit were graded, as this row asked.
 
 ### D613 — [CLOSED 2026-08-30] an empty list literal CAPTURED by a nested function had its ENV-STRUCT FIELD typed a whole section before anything pinned the element row
 **now RUNS · was `check-clean invalid wasm` · found 2026-08-30 with D611 · closed as `runs`, not as a third refusal: D411's and D501's destination is AMBIGUOUS and this one is not · 17 corpus classes / 310 census cells `check-clean invalid wasm` -> `runs`, 0 `runs` lost, 0 into any silent class, every corpus module that built before builds BYTE-IDENTICAL**
@@ -17723,6 +17730,183 @@ Repro (now runs, printing nothing):
   Pinned as `tests/cases/closures/capture-unannotated-empty-list-element.vl`, whose seven
   legs are the four element backings, two frames deep, a lambda capture, the hoisted control
   and rung 2.
+
+### D621 — an INERT declaration of a struct with the arm's layout refuses the arm's own nullable field read, on a heap D280 already merged
+**[CLOSED 2026-08-30] the repro below RUNS and prints `7`. Was: loud emit reject (`emitProgram: bare null needs a struct-typed context`) · **151 of the distilled corpus's 314 emit-reject cells — the largest cluster by 3.8x**, and no inventory row named it · clause 2 (no capability refusals), decided by the DIRECT spelling: delete the second `type` line and the identical program runs, and the module the fix emits is BYTE-IDENTICAL to the one that twin-free spelling already emitted · the same program with the null test replaced by `const v = c.r` was check-clean invalid wasm on master and runs too**
+
+Repro (five lines; every one of them is load-bearing, see the ablation):
+
+    type Circle = { r: i32 | null }
+    type Dot = { r: i32 | null }
+    type Shape = Circle | i32
+    const c: Circle = { r: 7 }
+    if c.r != null { print(7) } else { print(0) }
+    // master: vl check rc 0, no diagnostics; vl build:
+    //   emitProgram: bare null needs a struct-typed context
+
+* **WHY IT IS (a) A CAPABILITY GAP AND NOT (b) A MISSING DESIGN RULE, argued rather than
+  asserted.** `Dot` is declared and never mentioned again. Delete that ONE line and the same
+  five-line program runs and prints `7`; delete `type Shape` instead and it runs; annotate the
+  binding `Dot` rather than `Circle` and it runs; make `Dot` an ARM of a second union and it
+  runs. A declaration the program never uses cannot change what `c.r != null` means, so there
+  is no design rule here to enforce — under (b) the checker would have to reject a program
+  whose meaning is fixed and obvious, on the ground that a *different* type with the same
+  fields is spelled elsewhere in the file. The message itself names an emitter seed
+  (`pendingStructIdx`), not a language rule. **The decisive control is the emitted module:**
+  the fix's output for the twin-BEARING program is byte-identical (203 bytes, sha equal) to
+  what master already emits for the twin-FREE one, so nothing about the program was ever
+  ambiguous — the emitter was declining to look.
+* **THE ROOT IS ONE GATE THAT ASKS A QUESTION D280 ANSWERED.** `armFieldUnionName` (D219) is
+  the rung that lets the three read classifiers see a value-union FIELD of a declared union
+  ARM. It is gated on `armLayoutAmbiguousAt`, whose STRUCT rung is `armLayoutContestedAt` —
+  "is there a declared STRUCT row of this arm's exact layout". That rung was written when a
+  contested pair meant TWO WasmGC heap types. Since **D280** it does not: `variantStructHeapTwinAt`
+  merges the arm and its declared layout twin onto ONE heap. So the gate declines on a pair
+  that can no longer disagree, `memberUnionFieldNameRead` answers `""`, `exprUnion` says the
+  read is not a union value, `emitNulIsNullTest` finds no arm for it, and the `!= null` falls
+  through to the scalar compare — which emits a bare `null` with nothing to type it.
+* **THE FIX IS THE SENTENCE D224 ALREADY WROTE ONE TABLE OVER**, and it is one conjunct:
+  `armLayoutContestedAt(vi) && variantStructHeapTwinAt(vi) < 0`. D224 replaced the ARM rung's
+  canon-key test with `repVariantSlotsTwin` for exactly this reason ("the rung was written when
+  that implied a second HEAP TYPE; it has not since D48"). The struct rung was left asking the
+  old question, and the old comment says so — it priced re-asking it at "521 block-B cells, 387
+  into `runs` and 134 into check-clean invalid wasm" and declined, on a bar the gate does not
+  apply (`REFUSE ON runs → not-runs, NOT ON loud → silent`).
+* **EVERY INGREDIENT ABLATED. Five lines, five load-bearing, and the twin must be STRUCTURALLY
+  EXACT and NOT itself an arm:**
+
+  | ablation | master | with the fix |
+  |---|---|---|
+  | the witness as filed | **loud emit reject** | **runs, 7** |
+  | drop the layout twin `Dot` | runs, 7 | runs, 7 |
+  | drop the union `Shape` | runs, 7 | runs, 7 |
+  | annotate the binding `Dot` (the non-arm twin) | runs, 7 | runs, 7 |
+  | make the twin the ARM instead (`Shape = Dot \| i32`) | runs, 7 | runs, 7 |
+  | make BOTH twins arms (`S1 = Circle\|i32`, `S2 = Dot\|string`) | runs, 7 | runs, 7 |
+  | twin is an ALIAS of the arm (`type Dot = Circle`) | runs, 7 | runs, 7 |
+  | twin's field NAME differs (`{ q: i32\|null }`) | runs, 7 | runs, 7 |
+  | twin's field is not nullable (`{ r: i32 }`) | runs, 7 | runs, 7 |
+  | field is `string \| null` (a ref NICHE, not the box) | runs, 7 | runs, 7 |
+  | `Dot` declared AFTER the union | loud emit reject | runs, 7 |
+  | a THIRD identical alias added | loud emit reject | runs, 7 |
+  | `{ r: null }` instead of `{ r: 7 }` | loud emit reject | runs, 0 |
+  | a second field on both | loud emit reject | runs, 7 |
+  | `==` instead of `!=` | loud emit reject | runs, 7 |
+  | **null test replaced by `const v = c.r`** | **check-clean invalid wasm** | **runs, 1** |
+  | no annotation on the binding | loud check reject | loud check reject |
+
+  Scenery: declaration ORDER, the arity of the struct, which comparison spelling, and the
+  second arm of the union (`Sq` in the census cells, `i32` here). Load-bearing: the field's
+  rep must be the value-union BOX (`i32 | null`; a `string | null` niche never reaches this
+  ladder), the binding must be annotated at the ARM, and the twin must be a SEPARATE
+  structurally-exact declaration that is NOT itself a union member. The `const v = c.r` row is
+  the one that shows the loud reject was hiding a second outcome, not preventing one.
+* **REACHED AND ANSWERING, counted rather than argued.** A probe compiler raising a distinct
+  `emitFail` on each branch of the rung fires on **476 of the corpus's 7,021 cells**: 376 where
+  D280's merge answers and the gate lifts (`ans`), 100 where the pair is genuinely unmerged and
+  the gate still stands. **All 158 cells the fix moves are among the 376, and 0 are outside
+  them.** 149 of the 151 target cells are `lift`; the two that are not (`a000093`, `d003280`)
+  declare no union at all and are a different root — see below.
+* **THE TRADE, cell-matched on the distilled corpus (7,021 cells / 255,334 census cells):
+  158 move, `runs` LOST 0, no new compiler trap, no corpus module lost.** 22 classes
+  `loud emit reject → runs` (5,533 census cells), 6 `check-clean invalid wasm → runs` (70),
+  130 `loud emit reject → check-clean invalid wasm` (130). `runs` goes **3,704 → 3,732** cells
+  and **152,187 → 157,790** census cells (59.6% → 61.8%). The `bare null needs a struct-typed
+  context` cluster goes **151 → 2** and the corpus's total loud emit rejects **314 → 162**.
+* **THE PRICE IS 130 CELLS AND ALL 130 ARE A DEFECT MASTER ALREADY HAS SILENTLY — 130 of 130,
+  measured, not argued.** Every price cell is in the existing `d224-cost` named set. Take each
+  one's own program, delete the single `!= null` line that reaches this gate, and grade it on
+  MASTER: **130 of 130 are check-clean invalid wasm, with the byte-identical validator sentence
+  at the identical offset** (`type mismatch: expected (ref $type), found (ref $type)`, the D156
+  nested-map / un-annotated-carrier family, D300's shape). So the reject was a FLOOR over an
+  older defect rather than a diagnosis of the program, which is the same finding D223 and D224
+  each made one rung over. Minimal instance:
+
+      type Circle = { r: i32 | null }
+      type Dot = { r: i32 | null }
+      type Sq = { s: i32 }
+      type Shape = Circle | Sq
+      function rd() {
+        const lv1 = Map()
+        lv1["k0"] = { r: null }
+        const c: {[string]: {[string]: Circle}} = Map()
+        c["k0"] = lv1
+        const g0 = (c)["k0"] ?? Map()
+        const g1 = (g0)["k0"] ?? { r: null }
+        print(1)                       // ← the null test DELETED
+      }
+      rd()
+      // master, with no null test anywhere: check-clean invalid wasm, offset 543
+
+* **TWO OF THE 151 ARE A DIFFERENT ROOT AND STAY LOUD**, and neither declares a union, so no
+  arm rung could reach them: `a000093` (a nested map read through `reverse([c])[0]`) and
+  `d003280` (`const c = Map(); c["k0"] = { r: 7 }; const g0 = c["k0"] ?? { r: null };
+  g0.r != null` — an ANONYMOUS row whose `??` default widens the field to `i32 | null` that the
+  store never boxed, D291's asymmetry one container out). Filed here rather than split off
+  because they are the residue of this cluster, and they are the population a follow-up owns.
+* **INSTRUMENTS.** Corpus byte-identity: 2,414 `tests/cases` modules built with both seeds —
+  **0 byte-DIFF, 0 lost, 0 gained** (1,961 build under both, 453 are `@check`-only under both).
+  Native fixpoint holds at the one-compile rung (1,506,877 bytes). Disassembly: the fixed
+  witness emits `struct.get $2 0` on the box's TAG field compared against `nullBoxTag()` — the
+  `exprUnion` arm of `emitNulIsNullTest` — inside a rec group with THREE struct types, not four,
+  because `Circle` and `Dot` are one heap (D280); `cmp` against the twin-free spelling built by
+  master: identical. Ablation: strip the one conjunct and the seed is `md5` identical to
+  master's (`0407ec5b…`), so the comment block contributes nothing and the rung is the whole
+  change.
+* Pinned as program 5 of `tests/cases/soundness/arm-and-its-layout-twin-share-one-heap.vl`,
+  beside the four programs D280 and D281 left there — it is the same seam, one rung on.
+
+
+### D623 — the carrier D621 unmasked: an UN-ANNOTATED `Map()` reaching an annotated struct field, where the value type has a layout twin
+**check-clean invalid wasm · 130 cells · these are D621's measured PRICE, and the price was a FLOOR over this defect rather than a statement about the program: on master before #2027 all 130 were a loud emit reject, and deleting the one `!= null` line that reached D621's gate made all **130 of 130** produce the byte-identical validator sentence at the identical offset · re-verified cell by cell on 2026-08-30 after the merge**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    type Dot = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type GW = { g: {[string]: Circle} }
+    function mkcall() {
+      const cc = Map()
+      cc["k0"] = { r: null }
+      return cc
+    }
+    function outer() {
+      const wv: GW = { g: mkcall() }
+      print(7)
+    }
+    outer()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD PRINT 7
+
+* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured:
+
+  | change | outcome |
+  |---|---|
+  | as filed | **check-clean invalid wasm** |
+  | `function mkcall(): {[string]: Circle}` | runs, prints 7 |
+  | `const cc: {[string]: Circle} = Map()` | runs, prints 7 |
+  | drop `type Dot` (the layout twin) | runs |
+  | drop `type Shape` (the union) | runs, prints 7 |
+  | field `r: i32` instead of `i32 \| null` | runs, prints 7 |
+  | hoist out of the lambda into `outer` | **still fails** — the lambda is SCENERY |
+
+  So the ingredients are the un-annotated carrier, the same-shape twin, the union membership
+  and the nullable field. The closure is not one, which separates this from D613 even though
+  the two share a validator sentence (`expected (ref $type), found (ref $type)`) — **do not
+  group them by that sentence.**
+* **WHY THERE IS A ROW AT ALL RATHER THAN A LINE IN D621.** D621's close moved these 130 from
+  `loud emit reject` to `check-clean invalid wasm`, which under the standing goal is a clause-1
+  violation where there was a clause-2 one. That trade was right — `runs` went 3,704 -> 3,732
+  and the total against the goal 451 -> 423 — but the 130 then had no owner, and a price
+  recorded in a named set is not a defect anybody is working. This row is the owner.
+* **THE TWIN + UNION + NULLABLE TRIO IS D280's, D612's AND D621's**, which is three closes on
+  one ingredient set and a reason to suspect the carrier is the last of it rather than the
+  next-to-last. Worth asking directly: is there a spelling where the carrier is annotated and
+  the trio still breaks?
+* All 130 are in the `d224-cost` named set, kept whole; `named/sources.json` records the price.
 
 
 ## 6. Coverage gaps — axes not built, and why
