@@ -47,9 +47,26 @@ DEFAULT_BASELINE = os.path.join(HERE, "silent-sweep", "distilled", "baseline.jso
 # `runs but wrong value` all along. The corpus held no such cell until D832's witness
 # (`d832_match_untested_else`: a `match` whose untested final arm runs the `Sq` body for a
 # `Tri` and prints 200), which is why it survived the D742 audit that fixed `trap_loads`.
-SILENT = ("check-clean invalid wasm", "runs but wrong value",
-          "check-clean silently wrong", "check-clean wrong evaluation",
-          "trap_loads", "compiler trap")
+# Clause 1 is defined by EXCLUSION, and it has to be, because listing the silent classes by
+# name has now failed twice in the same way. Both times I wrote the phrases from
+# `check-filed-witnesses.py`'s DECLARED *status vocabulary* (what a ROW's status line may say)
+# instead of the outcome CLASSES the corpus grader writes into the baseline:
+#
+#   * `"loads then traps"` where the grader writes `trap_loads` — fixed in #2055 after two
+#     agents found six mis-recorded cells the gate could not see.
+#   * `"check-clean silently wrong"` / `"check-clean wrong evaluation"` where the grader
+#     writes `runs but wrong value` — found when an agent added the corpus's FIRST
+#     wrong-value cell and the scoreboard scored it at zero.
+#
+# Four of my five entries were dead strings at one point or another. A whitelist of an open
+# set is the wrong shape: every future class defaults to UNCOUNTED, and uncounted reads as
+# "clause 1 is clean".
+#
+# So: a cell is a clause-1 violation when it neither RUNS nor was loudly refused. A new
+# outcome class now defaults to COUNTED, which is the safe direction — a spurious violation
+# gets investigated, a missing one does not.
+RUNS_OK = ("runs",)
+LOUD = ("loud check reject", "loud emit reject")
 
 # A refusal that CONCEDES the program is type-valid. These are the compiler naming its own
 # capability gaps: the type system permits the program and the backend cannot lower it.
@@ -131,7 +148,8 @@ def main():
     by = collections.Counter(v["class"] for v in cells.values())
     runs = by.get("runs", 0)
 
-    silent = {k: v for k, v in cells.items() if v["class"] in SILENT}
+    silent = {k: v for k, v in cells.items()
+              if v["class"] not in RUNS_OK and v["class"] not in LOUD}
     # Every emit reject reached the emitter, so `check` returned 0: the checker accepted a
     # program the backend then refused. Either it is legal and should compile, or it is
     # illegal and the CHECKER owed the diagnosis. Both are defects under clause 2.
