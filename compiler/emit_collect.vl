@@ -198,8 +198,10 @@ import {
   aUsed,
   annRlNul,
   annRlSlot,
+  anonLeafAnnTy,
   anonLeafFamRow,
   anonLeafJoined,
+  anonLeafRetMoved,
   anonLeafSupersede,
   armPreludeBlocks,
   ba8TypeIdx,
@@ -539,6 +541,7 @@ import {
   restoreNarrow,
   retAnnKindChain,
   retLocalLetOfBlock,
+  retNulRefIndex,
   retRefArrElemName,
   retRefArrFlag,
   retStructIndex,
@@ -6899,8 +6902,20 @@ function collectAnonShapes() {
         (narrowSi < 0 || mf != "") &&
         (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
       ) {
+        const rowsBefore = sNames.length
         anonMintRowFor(ai)
         if mf != "" { anonLeafRecordSupersede(narrowSi, sNames.length - 1) }
+        // D872/D873 — AND THE ROW THE `??`'s LEFT OPERAND'S OWN CARRIER NAMES. With ONE row per
+        // field set that is `narrowSi` again and this records nothing new; with a second
+        // same-fieldset row it is the OTHER one, and it is the row the binding's cell
+        // (`nulRefStructIdxOfLet`) and the callee's return actually resolve. Asked only where
+        // the mint really appended a MERGED row — `anonMintRowFor` can decline, and a row it
+        // did not add is not this family's.
+        if sNames.length > rowsBefore {
+          if anonLeafMergedFieldOf(ai) != "" {
+            anonLeafRecordSupersede(anonLeafCarrierRowOf(ai), sNames.length - 1)
+          }
+        }
       }
     }
     ai = ai + 1
@@ -6928,6 +6943,7 @@ function anonLeafJoinedMark() {
   while anonLeafJoined.length < P.nodes.length {
     anonLeafJoined.push(0)
     anonLeafFamRow.push(0 - 1)
+    anonLeafAnnTy.push(0 - 1)
   }
   let qi = 0
   while qi < P.nodes.length {
@@ -6950,12 +6966,16 @@ function anonLeafJoinedMark() {
               if famRow < 0 { famRow = structIndexOfObj(mem[mi]) }
               mi = mi + 1
             }
+            // D872 — AND THE LEFT OPERAND'S OWN DECLARED TYPE, the half of the family that
+            // is not a literal. First `??` to claim a member wins, exactly as `famRow` does.
+            const annTy = anonLeafJoinAnnTy(unwrapParen(qn.binLeft))
             let mj = 0
             while mj < mem.length {
               const m = mem[mj]
               if m >= 0 && m < anonLeafJoined.length {
                 anonLeafJoined[m] = 1
                 if anonLeafFamRow[m] < 0 { anonLeafFamRow[m] = famRow }
+                if anonLeafAnnTy[m] < 0 { anonLeafAnnTy[m] = annTy }
               }
               mj = mj + 1
             }
@@ -6997,12 +7017,22 @@ function anonLeafJoinSources(lhs: i32, mem: i32[]) {
   // the two are the same question about two delivery forms, and a same-named binding in
   // another function can only ADD a member, which the atom gates then accept or refute on its
   // own spelling.
+  // D871 — A CALL left operand (`src() ?? { … }`): the literals that reach the `??` are the
+  // ones the CALLEE RETURNS. The same question the INDEX arm asks of a container's stores and
+  // the IDENT arm of a binding's initializers, one delivery form further out.
+  if ln is Call { anonLeafJoinCallee(ln.callFn, mem) }
   if ln is Ident {
     let li = 0
     while li < P.nodes.length {
       const lnn = P.nodes[li]
       if lnn is LetDecl {
-        if lnn.letName == ln.identName { anonLeafJoinBound(lnn.letInit, mem) }
+        if lnn.letName == ln.identName {
+          anonLeafJoinBound(lnn.letInit, mem)
+          // D871 — AND WHERE THAT INITIALIZER IS A CALL, the callee's returns. ONE hop: a
+          // callee whose own return is another call is a path `anonLeafJoinCallee` cannot
+          // name, and it declines the whole callee rather than half-reading it.
+          anonLeafJoinInitCall(lnn.letInit, mem)
+        }
       }
       if lnn is BinExpr {
         if lnn.binOp == "=" {
@@ -7012,6 +7042,11 @@ function anonLeafJoinSources(lhs: i32, mem: i32[]) {
             if tn is Ident {
               if tn.identName == ln.identName {
                 anonLeafJoinBound(lnn.binRight, mem)
+                // D871 — and the same one hop the DECLARATION leg above takes. The two legs
+                // are one question about two spellings of the same binding, and a call read
+                // on one and not the other is the asymmetry that makes `a = src()` behave
+                // unlike `const a = src()`.
+                anonLeafJoinInitCall(lnn.binRight, mem)
               }
             }
           }
@@ -7039,6 +7074,253 @@ function anonLeafJoinBound(rhs: i32, mem: i32[]) {
     mem.push(rv)
   }
   0
+}
+
+// D872 — THE `??` LEFT OPERAND'S OWN DECLARED TYPE NODE, or -1. ONE form answers: a bare
+// IDENTIFIER, whose annotated declaration says what its non-null value is.
+//
+// A CALL LEFT OPERAND IS DELIBERATELY NOT ONE, and the reason is a measured `loud -> silent`
+// rather than caution. `src(): {r: i32} | null { const v = { r: 7 }; v }` has a declared return
+// that names the atom perfectly — and its returned value is a BINDING, which
+// `anonLeafJoinCallee` cannot name and so refuses to move. Taking the atom from the annotation
+// there mints the merged row and redirects the callee's return to it while the literal `v`
+// holds stays at the narrow one: `emitProgram: bare null needs a struct-typed context` became
+// CHECK-CLEAN INVALID WASM. The reader is what licences a call's atom, and where the reader
+// answers (`anonLeafJoinCallee` appended the callee's literals) the atom is already in the set
+// from the literal itself — so this arm would buy nothing even when it is safe. Measured:
+// removing the reader alone leaves the three `_direct` cells running off this arm, and every
+// one of them runs off the reader with this arm gone.
+//
+// A container INDEX is not one either — D833/D841 read that operand through the map's value
+// slot, which already carries the row.
+//
+// REFUSES ON DISAGREEMENT rather than taking the first. Two same-named bindings with the SAME
+// annotation spelling name one row and one atom, so they answer together (which is what
+// `d863_two_sets_nested_row`'s two `a`s are); with different spellings there is no single
+// declared type for this operand and the rung declines, leaving the family to its literals.
+function anonLeafJoinAnnTy(lhs: i32): i32 {
+  if lhs < 0 { return 0 - 1 }
+  const ln = P.nodes[lhs]
+  if ln is Ident {
+    let hit = 0 - 1
+    let li = 0
+    while li < P.nodes.length {
+      const lnn = P.nodes[li]
+      if lnn is LetDecl {
+        if lnn.letName == ln.identName {
+          if lnn.letType < 0 { return 0 - 1 }
+          if hit >= 0 {
+            if tyNameOf(hit) != tyNameOf(lnn.letType) { return 0 - 1 }
+          } else {
+            hit = lnn.letType
+          }
+        }
+      }
+      li = li + 1
+    }
+    return hit
+  }
+  0 - 1
+}
+
+// D872 — THE DECLARED TYPE NODE stamped on `n`'s `??` family, or -1. See `anonLeafAnnTy`.
+function anonLeafAnnTyOf(n: i32): i32 {
+  if n < 0 { return 0 - 1 }
+  if n >= anonLeafAnnTy.length { return 0 - 1 }
+  anonLeafAnnTy[n]
+}
+
+// D872 — THE ATOM the `??` left operand's declared type spells at field `fname`, or "".
+//
+// READ OFF THE SPELLING AND NOT OFF THE ROW'S FIELD CODE, because the code cannot say it: a
+// row's `{r: i32}` and `{r: boolean}` fields are BOTH code 0 (`fieldCodeOfSpelling`), as is a
+// literal-union field, and a merged set built out of the wrong one names a union the box
+// cannot hold. The six spellings admitted here are exactly `anonLeafAtomName`'s six, so a set
+// this contributes to is one `nameFieldCode` can code; anything else answers "" and the rung
+// declines, which is today's behaviour.
+function anonLeafAnnAtomOf(tyIx: i32, fname: string): string {
+  if tyIx < 0 { return "" }
+  const arms: string[] = []
+  splitUnionAtoms(tyNameOf(tyIx), arms)
+  let shape = ""
+  let k = 0
+  while k < arms.length {
+    if arms[k] != "null" {
+      // More than one non-null arm: the operand's non-null value is not ONE shape.
+      if shape != "" { return "" }
+      shape = arms[k]
+    }
+    k = k + 1
+  }
+  if !nameIsShapeSpanEnds(shape) { return "" }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(groupInnerOf(shape), fnames, ftexts)
+  let i = 0
+  while i < fnames.length {
+    if fnames[i] == fname { return anonLeafAtomOfText(ftexts[i]) }
+    i = i + 1
+  }
+  ""
+}
+
+// The atom NAME a field's annotation TEXT spells, or "" for everything else — the type-side
+// twin of `anonLeafAtomName`, and deliberately the same six atoms and no more.
+function anonLeafAtomOfText(t: string): string {
+  if t == "i32" { return "i32" }
+  if t == "boolean" { return "boolean" }
+  if t == "string" { return "string" }
+  if t == "f64" { return "f64" }
+  if t == "i64" { return "i64" }
+  if t == "f32" { return "f32" }
+  ""
+}
+
+// D873 — THE ROW `n`'s `??` LEFT OPERAND'S OWN CARRIER RESOLVES TO, or -1.
+//
+// IT IS NOT ALWAYS `structIndexOfObj`'s ANSWER, and that is the whole of D873. Both resolvers
+// match a field-name SET, so with ONE row per set they agree and the supersede recorded against
+// the literal's row is the one the cell reads. Add a second same-fieldset row — a nested-struct
+// field's inline shape beside a declared `type R`, say — and they part: the literals land on
+// one, the binding's annotation on the other, and the merged row is minted with nothing naming
+// it. Recording the supersede against BOTH is what makes the cell follow.
+function anonLeafCarrierRowOf(n: i32): i32 {
+  retNulRefIndex(anonLeafAnnTyOf(n))
+}
+
+// D871 — `rhs` is a binding's initializer: when it is a CALL, the callee's returned literals.
+// Split from `anonLeafJoinBound` rather than folded into it so the recursion cannot chain — a
+// returned value is read as a literal or not at all, never followed through a second call.
+function anonLeafJoinInitCall(rhs: i32, mem: i32[]) {
+  const rv = unwrapParen(rhs)
+  if rv < 0 { return 0 }
+  const rn = P.nodes[rv]
+  if rn is Call { return anonLeafJoinCallee(rn.callFn, mem) }
+  0
+}
+
+// D871 — THE OBJECT LITERALS A CALLEE RETURNS, appended to `mem`, or NOTHING AT ALL when any
+// return path is one this cannot name.
+//
+// REFUTING AS A WHOLE, and that is what separates it from the other two readers. A container's
+// stores and a binding's initializers are appended ONE AT A TIME: a store this cannot name is
+// simply not a member and the atom gates decide the rest. Here the merged row also redirects
+// the callee's RETURN ROW (`anonLeafSupersedeOf` at the three return-row resolvers), so a
+// returned value the reader did NOT move would be built at the narrow row and handed back at
+// the merged one — invalid wasm where today there is a loud reject. One unnameable path
+// therefore declines the whole callee, the family is the default alone, `atoms.length < 2`
+// ends the rung and the program compiles exactly as it does now.
+//
+// `null` is not an unnameable path: `ref.null` is valid at every row, so a `S | null` callee
+// returning `null` on one branch and a literal on another stays readable.
+//
+// The callee is found by NAME over the whole arena, exactly as the IDENT arm finds a binding's
+// declarations — `fnStmts` is not populated when `collectAnonShapes` runs (see
+// `anonMintRowFor`), so the function map is not available here and a name scan is the only
+// resolver there is. Two same-named functions therefore both contribute, and either one being
+// unreadable declines both.
+function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
+  const c = unwrapParen(callFn)
+  if c < 0 { return 0 }
+  const cn = P.nodes[c]
+  if cn is Ident {
+    const rets: i32[] = []
+    let seen = false
+    let fi = 0
+    while fi < P.nodes.length {
+      const fd = P.nodes[fi]
+      if fd is FuncDecl {
+        if fd.fnName == cn.identName {
+          seen = true
+          if !anonLeafCalleeRets(fd.fnBody, rets, true) { return 0 }
+        }
+      }
+      fi = fi + 1
+    }
+    if !seen { return 0 }
+    let ri = 0
+    while ri < rets.length {
+      anonLeafJoinBound(rets[ri], mem)
+      ri = ri + 1
+    }
+    // D871 — AND MARK THE CALLEES, so the four return-row resolvers redirect exactly the
+    // functions whose literals this just made family members. See `anonLeafRetMoved`.
+    let mi = 0
+    while mi < P.nodes.length {
+      const md = P.nodes[mi]
+      if md is FuncDecl {
+        if md.fnName == cn.identName {
+          while anonLeafRetMoved.length <= mi { anonLeafRetMoved.push(0) }
+          anonLeafRetMoved[mi] = 1
+        }
+      }
+      mi = mi + 1
+    }
+  }
+  0
+}
+
+// Every value a function body hands back: each `return e` and the body block's implicit TAIL
+// expression. False the moment one of them is a path `anonLeafRetPathOk` cannot name. A NESTED
+// function declaration is skipped — its returns are its own.
+function anonLeafCalleeRets(ix: i32, out: i32[], tail: boolean): boolean {
+  if ix < 0 { return true }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return true }
+  if n is RetStmt {
+    if !anonLeafRetPathOk(n.retArg, out) { return false }
+  }
+  if n is Block {
+    if tail {
+      if n.blkStmts.length > 0 {
+        if !anonLeafTailPathOk(n.blkStmts[n.blkStmts.length - 1], out) {
+          return false
+        }
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if !anonLeafCalleeRets(kids[i], out, false) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// ONE returned expression. An object literal is a member; a `null` (or a bare `return`) is not
+// a member and not a refutation, because `ref.null` is valid at every row. Everything else
+// refutes — see `anonLeafJoinCallee` for why this arm is strict where the other readers are
+// lenient.
+function anonLeafRetPathOk(argIx: i32, out: i32[]): boolean {
+  if argIx < 0 { return true }
+  const a = unwrapParen(argIx)
+  if a < 0 { return true }
+  const an = P.nodes[a]
+  if an is NullLit { return true }
+  if an is ObjLit {
+    out.push(a)
+    return true
+  }
+  false
+}
+
+// The body block's LAST statement, which carries the implicit return. A statement in that
+// position is not a value at all (the function's returns are then its `return`s alone), so it
+// is skipped rather than refuted; anything that IS an expression goes through
+// `anonLeafRetPathOk`.
+function anonLeafTailPathOk(ix: i32, out: i32[]): boolean {
+  if ix < 0 { return true }
+  const n = P.nodes[ix]
+  if n is LetDecl { return true }
+  if n is RetStmt { return true }
+  if n is IfStmt { return true }
+  if n is WhileStmt { return true }
+  if n is ForRange { return true }
+  if n is ForIn { return true }
+  if n is Block { return true }
+  if n is FuncDecl { return true }
+  anonLeafRetPathOk(ix, out)
 }
 
 // One `lhs = rhs` statement: append `rhs` to `mem` when it is an object literal stored into
@@ -7115,6 +7397,34 @@ function anonLeafMergeField(ow: i32, narrowSi: i32): string {
               anonLeafRecordSupersede(narrowSi, serv)
               return ""
             }
+            return f.fiName
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// D872 — THE FIELD at which `ow`'s OWN mint carries a merged box, or "".
+//
+// `anonLeafMergeField` asks a narrower question — the field at which a row ALREADY CLAIMING
+// this literal is narrower than its join needs — and so starts from `narrowSi >= 0`. A default
+// whose atom no row can hold (`{r: "s"}` beside a `{r: i32}` row) is claimed by nothing, mints
+// on the gate's FIRST disjunct, and still comes out carrying the box. That mint owes the
+// carrier's row a supersede exactly as a claimed one does, and this is the predicate that says
+// so without the precondition.
+function anonLeafMergedFieldOf(ow: i32): string {
+  if !anonLeafInJoin(ow) { return "" }
+  const o = P.nodes[ow]
+  if o is ObjLit {
+    let i = 0
+    while i < o.objFields.length {
+      const f = P.nodes[o.objFields[i]]
+      if f is FieldInit {
+        if anonNestPolyUnionName(ow, f.fiName, unwrapParen(f.fiValue)) == "" {
+          if anonLeafPolyUnionSetOpen(ow, f.fiName, f.fiValue) != "" {
             return f.fiName
           }
         }
@@ -7540,6 +7850,21 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
       }
     }
     qi = qi + 1
+  }
+  // D872 — AND THE ATOM THE `??`'s LEFT OPERAND IS DECLARED TO HAVE, which for
+  // `let a: {r: i32} | null = null` … `a ?? {r: null}` is the ONLY other atom there is: no
+  // second literal exists, so without this the family is one member and the rung ends here.
+  // Appended last and deduped like any other, so a family whose literals already spell it is
+  // byte-identical.
+  const annAtom = anonLeafAnnAtomOf(anonLeafAnnTyOf(ow), fname)
+  if annAtom != "" {
+    let seenA = false
+    let ak = 0
+    while ak < atoms.length {
+      if atoms[ak] == annAtom { seenA = true }
+      ak = ak + 1
+    }
+    if !seenA { atoms.push(annAtom) }
   }
   if atoms.length < 2 { return "" }
   if !anonLeafOwnersJoined(ow, fname, owAtom) { return "" }
@@ -8170,6 +8495,8 @@ export function collectS(stmts: i32[]) {
   // for the same reason and at the same moment.
   anonLeafJoined = []
   anonLeafFamRow = []
+  anonLeafAnnTy = []
+  anonLeafRetMoved = []
   anonLeafSupersede = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or
   // the next program's rows answer with this one's names (see its header). MEASURED, not

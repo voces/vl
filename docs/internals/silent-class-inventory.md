@@ -24440,11 +24440,11 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D861 — the `??` left operand is a CALL, or a binding of one: the other literal is in the CALLEE'S RETURN and no reader reaches it
+### D861 — [CLOSED 2026-08-31 by D871] the `??` left operand is a CALL, or a binding of one: the other literal is in the CALLEE'S RETURN and no reader reaches it
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context`, with a check-clean invalid-wasm twin at every other default rep · 9 cells (`distilled/named/d861_call_*`, plus 3 `_i32` controls that run), OPEN · the same defect as D842 one DELIVERY FORM further out, filed rather than built because reaching it needs a reader that sees INTO a callee and a redirect on the callee's RETURN row, and neither was measured**
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (3 cells) and `check-clean invalid wasm` (6 cells) · 9 cells (`distilled/named/d861_call_*`, plus 3 `_i32` controls that always ran) · the fix is D871 — the reader that sees into a callee AND the four return-row resolvers, exactly the two halves this row said were unmeasured**
 
-Repro (a loud emit reject):
+Repro (now runs, printing `0`):
 
     function src(): {r: i32} | null { { r: 7 } }
     function rd() {
@@ -24485,11 +24485,11 @@ Repro (a loud emit reject):
 
 ---
 
-### D862 — there is no SECOND LITERAL at all: the other atom lives only in the ANNOTATION, so the merge has one member and declines
+### D862 — [CLOSED 2026-08-31 by D872] there is no SECOND LITERAL at all: the other atom lives only in the ANNOTATION, so the merge has one member and declines
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context`, with a check-clean invalid-wasm twin at every other default rep · 3 cells (`distilled/named/d862_ann_only_atom_*`), OPEN · not D842's reader and not D804's merge — closing it means letting an ANNOTATION contribute an atom to a value union, which is wider than anything measured so far**
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (1 cell) and `check-clean invalid wasm` (2 cells) · 3 cells (`distilled/named/d862_ann_only_atom_*`) plus 4 module-scope twins this row had no cell for (`d872_module_ann_only_*`) · the fix is D872: the annotation contributes an atom, and the row's worry that this makes the family a TYPE question is answered by scoping it to the `??`'s OWN LEFT OPERAND**
 
-Repro (a loud emit reject):
+Repro (now runs, printing `0`):
 
     function rd() {
       let a: {r: i32} | null = null
@@ -24520,11 +24520,11 @@ Repro (a loud emit reject):
 
 ---
 
-### D863 — two `??` families over one field set landing on DIFFERENT merged sets, with a NESTED-STRUCT row also claiming it
+### D863 — [CLOSED 2026-08-31 by D873, and its filed ABLATION was wrong in two directions] two `??` families over one field set landing on DIFFERENT merged sets, with a NESTED-STRUCT row also claiming it
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` · 1 cell (`distilled/named/d863_two_sets_nested_row`), OPEN · found by `tests/cases/types/coalesce-default-row-past-binding-cell.vl` rather than by any grid, and identical on master and after D842 — this is not a regression, it is a shape the fixture happened to write**
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · 1 cell (`distilled/named/d863_two_sets_nested_row`) plus the 6-cell carrier grid the re-ablation named (`d873_*`) · THE SECOND `??` FAMILY IS SCENERY and the nested row must be INSTANTIATED, not merely declared — see D873 for the graded table**
 
-Repro (a loud emit reject):
+Repro (now runs, printing `4` then `1`):
 
     type Box = { inner: {r: i32} }
     type R = { r: i32 }
@@ -24561,6 +24561,347 @@ Repro (a loud emit reject):
 * **IT IS ONE CELL AND IT WAS PAID FOR ONCE ALREADY.** The fixture had this block, it failed,
   and the block was moved out rather than the shape being papered over. The next attempt at the
   leaf-merge family has the program.
+
+---
+
+### D871 — [CLOSED 2026-08-31] the `??` left operand is a CALL: the reader has to see into the CALLEE, and FOUR resolvers own the return row it moves
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (3 cells) and `check-clean invalid wasm` (6 cells) · a CLAUSE-2 and CLAUSE-1 close · ABLATED family 9 cells + 3 `_i32` controls (`distilled/named/d861_call_*`), five rungs · 9 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class**, corpus `cmp` **2,479 modules · 2,031 identical · 0 DIFFER · 0 LOST***
+
+Repro (now runs, printing `0`):
+
+    function src(): {r: i32} | null { { r: 7 } }
+    function rd() {
+      const g1 = src() ?? { r: null }
+      print(0)
+    }
+    rd()
+    // was: vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // Now: prints 0. The `?? { r: "s" }` and `?? { r: 1.5 }` twins were CHECK-CLEAN
+    // INVALID WASM and also run, at all three delivery forms.
+
+* **D861 NAMED BOTH HALVES AND BOTH ARE REAL.** The reader half (`anonLeafJoinCallee`) scans
+  the callee's `return` statements and its body block's implicit TAIL for object literals and
+  appends them to the `??`'s join, so D804's leaf merge has two disagreeing atoms. The delivery
+  half is the callee's RETURN ROW — and it is owned by FOUR resolvers, not one:
+  `fnRetStructIndexSid` (the call-result reader), the ANNOTATED and INFERRED arms of
+  `emitOneFuncType` (the signature), and `emitReturnValue`'s `pendingStructIdx` seed (the value
+  the callee builds). Each resolves the row separately; the ablation below moves 9 cells on any
+  one of the first, second or fourth being absent.
+
+* **THE READER IS REFUTING AS A WHOLE, AND THAT IS A `runs`-LOSING WITNESS, NOT CAUTION.** The
+  other two readers append sources ONE AT A TIME — an unnameable store is simply not a member.
+  Here the merge also moves the callee's return row, and the row is a FIELD-SET row, so EVERY
+  function returning that shape resolves to it. `function srcv(): {r: i32} | null { const v =
+  { r: 7 }; v }` beside an unrelated `??` over `{r: i32}` RUNS on master; with the redirect
+  ungated it became CHECK-CLEAN INVALID WASM — its result valtype followed the merge while the
+  literal `v` holds stayed narrow. `anonLeafRetMoved` marks the callees the reader actually
+  read, and removing that gate alone loses exactly `d875_unread_callee_keeps_row` and
+  `d875_unread_callee_declared`. That is the one `runs → not-runs` this work found, and neither
+  the distilled corpus nor the 2,031-module `cmp` had a program for it.
+
+* **`null` IS NOT AN UNNAMEABLE RETURN PATH** — `ref.null` is valid at every row — so a
+  `S | null` callee that returns `null` on one branch and a literal on another stays readable.
+  A returned BINDING, a returned CALL and a returned parameter all refute; `d876_call_ret_is_binding`
+  and `d876_call_ret_is_call` pin that they go back to master's loud reject rather than silent.
+
+* **THE TWO INIT LEGS D842 DROPPED ARE STILL NOT NEEDED, and this row is where that was to be
+  re-measured.** D842's header says they "become live the day the reader above exists". They do
+  not: `const a = src()` takes its row from `nulRefStructIdxOfLet`'s INIT leg, which resolves
+  through `structIndexOfExpr` → `fnRetStructIndexSid` → the redirect this row adds, so the leg
+  inherits the merged row without asking for it. All three `_localbind` and all three
+  `_globalbind` cells close with both legs untouched. The decline stands, with its reason
+  updated at both sites.
+
+* **THE INFERRED FUNCTYPE ARM MEASURES ZERO AND SHIPS ANYWAY.** `emitOneFuncType`'s
+  un-annotated arm reads the same `fRetStructIdx` slot `fnRetStructIndexSid` does, and
+  `fRetKind` carries the INFERRED `nulstruct` in it — so with the arm absent the call-result
+  reader and the signature disagree by construction. No cell reaches it today because the
+  CHECKER refuses an inferred nullable-struct return outright: `function src(f: boolean) { if f
+  { return null } { r: 7 } }` gives `'src' infers the nullable return type {r: i32} | null —
+  type-valid, but an inferred return of this shape …`, which is itself a clause-2 violation
+  reached by no corpus cell and by no capability probe. The arm is the drift-free state for the
+  day that refusal lifts; the zero is recorded, not hidden.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
+  `d861_call_direct_str`. Master: `src` is `(result (ref null $0))` over
+  `(type $0 (struct (field (mut i32))))` and `rd`'s default branch is
+  `struct.new $0 (global.get $global$0)` — a string header into an i32 field, which is the
+  `expected i32, found (ref $type)` the engine refuses. Here `src` is `(result (ref null $1))`
+  over `(type $1 (struct (field (mut (ref $2)))))` whose field is the union box
+  `(type $2 (struct (field i32) (field anyref)))`; the callee builds
+  `struct.new $1 (struct.new $2 (i32.const 0) (struct.new $3 (i32.const 7)))` — tag 0, the i32
+  through `(type $3 (struct (field i32)))` — and the default builds tag 2 with the string. `$0`
+  is still there, unchanged, for every narrow destination in the program.
+
+* **THE ABLATION, over 43 graded cells (the 16 `d86*` + the 27 this landing adds).** Strip-all
+  is master's own seed, `ff024139603c607c6765b0a9288ef939`, 1,571,242 bytes, built here from
+  master's `compiler/` rather than quoted (master `120f8b6c`, after #2065).
+
+  | rung | what it is | runs/43 | what moves |
+  |---|---|---|---|
+  | all eight (shipped) | | 38 | corpus `cmp` 0 DIFFER · 0 LOST |
+  | strip-all (master) | | 13 | all 25 revert |
+  | −the callee reader | the join never sees a call | 25 | 13 revert, incl. all 9 D861 |
+  | −the assignment leg's hop | `a = src()` is read unlike `const a = src()` | 37 | 1 (`d875_assign_call`) |
+  | −the call-result reader | `fnRetStructIndexSid` | 26 | 11 revert, 1 loud→silent |
+  | −the annotated functype arm | | 25 | 10 revert, 3 loud→silent |
+  | −the inferred functype arm | | **38** | **0 cells move** — see above |
+  | −`emitReturnValue`'s seed | | 25 | 10 revert, 3 loud→silent |
+  | −the annotation atom (D872) | | 30 | 8 revert |
+  | −the carrier supersede (D873) | | 28 | 10 revert |
+  | −the `anonLeafRetMoved` GATE | every same-row callee follows the merge | 36 | **2 `runs` LOST** |
+
+* **MEASURED, all six instruments, on master `120f8b6c`.** Corpus `cmp`: **2,479 modules ·
+  2,031 identical · 0 DIFFER · 0 LOST · 448 not buildable by the base.** Distilled corpus:
+  **13 classes → `runs`**, **`runs → not-runs` ZERO, `→ silent` ZERO**. `tests/cases` + `std`:
+  **2,031 → 2,031 of 2,479 building** in 4.3 s at `JOBS=6`, set difference EMPTY. D411's
+  103-cell grid 103 → 103 `runs`, 0 movement; D661's 211-cell grid 211 → 211 `runs`;
+  `d791_push_alias` still REFUSES. `goal-scoreboard.py`: `runs` **4,407 / 7,364 (59.85%) →
+  4,442 / 7,391 (60.10%)**, against the goal **13 → 5** — thirteen closed and FIVE NEW cells
+  added by the programs this work wrote, filed as D874 and D876. Fixtures:
+  `tests/cases/types/coalesce-default-row-past-callee-return.vl` and
+  `tests/cases/types/coalesce-default-row-two-competing-rows.vl`.
+
+---
+
+### D872 — [CLOSED 2026-08-31] the atom that exists only in the ANNOTATION, and why it answers for an IDENTIFIER operand and not for a CALL
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (1 cell) and `check-clean invalid wasm` (2 cells), plus 3 module-scope twins D862 had no cell for · a CLAUSE-2 and CLAUSE-1 close · ABLATED family 7 cells (`distilled/named/d862_ann_only_atom_*` + `d872_module_ann_only_*`) with 6 bounding pins (`d876_*`) · 6 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class***
+
+Repro (now runs, printing `0`):
+
+    function rd() {
+      let a: {r: i32} | null = null
+      const g1 = a ?? { r: null }
+      print(0)
+    }
+    rd()
+    // was: vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // Now: prints 0. The `?? { r: "s" }` and `?? { r: 1.5 }` twins were CHECK-CLEAN
+    // INVALID WASM and also run, at function scope and at module scope alike.
+
+* **D862'S WORRY WAS THE RIGHT ONE AND IT IS ANSWERED BY SCOPE.** The row said letting a
+  declared type contribute "would make the family a TYPE question rather than a dataflow one,
+  which is the direction `d841_hazard_declared_dest` and `d842_hazard_declared_dest` both
+  punish". Those two hazards are a declared DESTINATION for some *other* literal. This atom is
+  the declared type of the `??`'s OWN LEFT OPERAND — one of the two things the coalesce joins —
+  so a row holding one must hold both, which is D804's own argument unchanged.
+  `d876_declared_dest_beside_ann_fam` is the hazard re-run for this family and it prints its
+  own narrow value.
+
+* **READ OFF THE SPELLING, NOT OFF THE ROW'S FIELD CODE, and the code is why.** A row's
+  `{r: i32}` and `{r: boolean}` fields are BOTH code 0 (`fieldCodeOfSpelling`), and so is a
+  literal-union field — a merged set built from the code would name a union the box cannot
+  hold. `anonLeafAnnAtomOf` splits the annotation's own text and admits exactly
+  `anonLeafAtomName`'s six scalar names. `d876_litunion_ann` (`{r: K}` over `type K = "a"|"b"`)
+  and `d876_nested_ann` (`{r: {q: i32}}`) are the two declines that pin it.
+
+* **IT ANSWERS FOR AN IDENTIFIER OPERAND ONLY, and the CALL arm was built, measured and
+  REMOVED on a `loud → silent`.** `src(): {r: i32} | null { const v = { r: 7 }; v }` has a
+  declared return that names the atom perfectly, and a returned BINDING the reader cannot move
+  — so the atom mints the merged row and redirects the callee's return while `v`'s literal
+  stays narrow: `emitProgram: bare null needs a struct-typed context` became CHECK-CLEAN
+  INVALID WASM. The reader is what licences a call's atom, and where the reader answers the
+  atom is already in the set from the literal itself, so the arm buys nothing even when safe.
+  Measured both ways: removing the READER alone leaves the three `_direct` cells running off
+  the CALL arm, and all three still run off the reader with the arm gone.
+  `d876_call_ret_is_binding` and `d876_call_ret_is_call` are the pins.
+
+* **TWO SAME-NAMED BINDINGS WITH DIFFERENT ANNOTATIONS DECLINE, rather than the first winning.**
+  Same spelling names one row and one atom, which is what `d863_two_sets_nested_row`'s two `a`s
+  are; different spellings mean there is no single declared type for this operand.
+  `d876_two_anns_disagree` prints `z` and `5` from two unrelated `{r}` bindings.
+
+* **REAL DISASSEMBLY**, on `d862_ann_only_atom_str`. Master's local is `(ref null $0)` over the
+  narrow `(type $0 (struct (field (mut i32))))` and the default writes
+  `struct.new $0 (global.get $global$0)`. Here the local is `(ref null $1)` over
+  `(type $1 (struct (field (mut (ref $2)))))` with the box
+  `(type $2 (struct (field i32) (field anyref)))`, written `struct.new $2 (i32.const 2)
+  (global.get $global$0)` — tag 2, the string. `$0`, the row the annotation minted in
+  `collectAnnShapes`, is untouched.
+
+---
+
+### D873 — [CLOSED 2026-08-31] the supersede has to name the row the CARRIER resolves to, and D863's filed ablation was wrong in two directions
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (2 cells) and `check-clean invalid wasm` (4 cells) · a CLAUSE-2 and CLAUSE-1 close · ABLATED family 6 cells (`distilled/named/d863_two_sets_nested_row` + `d873_*`) over a 5×4 carrier × default grid · 4 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class***
+
+Repro (now runs, printing `4` then `1`):
+
+    type Box = { inner: {r: i32} }
+    type R = { r: i32 }
+    function ub() {
+      const b: Box = { inner: { r: 4 } }
+      print(b.inner.r)
+    }
+    ub()
+    function rn() {
+      let a: {r: i32} | null = { r: 7 }
+      const g1 = a ?? { r: null }
+      print(1)
+    }
+    rn()
+
+* **THE MECHANISM, at the counters.** A probe build logging `anonLeafRecordSupersede` and
+  `nulRefStructIdxOfLet`'s annotated leg, over the carrier grid: with `Box` INSTANTIATED alone
+  the mint reports `nar=0 mer=2` and the cell reports `ri=0 sup=2` — the same row, redirected.
+  Add `type R` and the mint still reports `nar=0 mer=3` while the cell reports `ri=2 sup=2`:
+  `structIndexOfObj` names row 0 and `structIndexOfLet` names row 2, the supersede is recorded
+  against row 0 only, and the merged row 3 is minted with nothing naming it.
+  `anonLeafCarrierRowOf` records it against the carrier's row as well.
+
+* **D863's FILED ABLATION WAS WRONG IN TWO DIRECTIONS AND THE GRID IS THE CORRECTION.** The row
+  read "Drop the `_str` family and the Box + `_null` pair runs" and "Drop the nested `Box` row
+  and both families run", and named two `??` families as an ingredient. Graded over
+  carrier × default (carrier ∈ {none, `Box` declared, `Box` instantiated, `R`, both}, default ∈
+  {i32, null, string, f64}):
+
+        none              runs at every default
+        Box DECLARED      runs at every default   <- a declaration mints no competing row
+        Box INSTANTIATED  runs at every default
+        R                 runs at every default
+        Box + R           null: LOUD · string/f64: CHECK-CLEAN INVALID WASM · i32: runs
+
+  **One `??` family is enough** — the second is scenery — and the nested row has to be BUILT,
+  not merely declared. `d873_carrier_R_only` and `d873_carrier_box_only` are the one-row
+  controls that ran on master and must keep running.
+
+* **REAL DISASSEMBLY**, on the `_str` corner. Master emits the merged row and the box
+  (`(type $2 (struct (field (mut (ref $3)))))` over
+  `(type $3 (struct (field i32) (field anyref)))`) and then uses NEITHER: both literals build
+  at `(type $0 (struct (field (mut i32))))`, and the default is
+  `struct.new $0 (global.get $global$0)`. The row was always minted; nothing named it.
+
+---
+
+### D874 — TWO `??` families over one field set beside TWO competing rows: the merged row serves one and the other family is left on the narrow one
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 2 cells (`distilled/named/d874_two_fams_two_rows`, `…_declfirst`), OPEN · identical on master `120f8b6c` and after D871/D872/D873, so it is NOT a regression — it is the next delivery form out, found by this landing's own fixture and pinned with its four one-ingredient-out controls**
+
+Repro (check-clean invalid wasm):
+
+    function src(): {r: i32} | null { { r: 7 } }
+    function rd() {
+      const g1 = src() ?? { r: "s" }
+      print(0)
+    }
+    rd()
+    function ra() {
+      let a: {r: i32} | null = null
+      const g1 = a ?? { r: "s" }
+      print(g1.r)
+    }
+    ra()
+    type Box = { inner: {r: i32} }
+    type R = { r: i32 }
+    // vl check rc 0; vl run ->
+    //   failed to compile: wasm[0]::function[6]::ra … type mismatch: expected i32,
+    //   found (ref $type)
+    // SHOULD PRINT 0 then s.
+
+* **FOUR INGREDIENTS, and every one-out control RUNS after D871–D873.** A CALL-carried family
+  (`src() ?? …`), an ANNOTATION-ONLY family (`a ?? …` over `= null`), `type R`, and `Box`'s
+  inline `{r: i32}`. `d874_ctl_no_box`, `d874_ctl_no_R`, `d874_ctl_no_annfam` and
+  `d874_ctl_no_callfam` are all check-clean invalid wasm on master and all four run here; only
+  the full set survives. `_declfirst` pins that declaration ORDER does not move it.
+
+* **IT IS D873's QUESTION WITH TWO CARRIERS.** `anonLeafSupersede` is ONE slot per narrow row,
+  so where two families over one field set mint through different carriers the second write
+  wins and the first family's carrier is left pointing at a row nobody merged. D873's fix
+  covers one carrier per family; this needs the slot to be a per-family map, which is a
+  different shape of change and is why it is filed rather than built.
+
+* **FOUND BY WRITING A PROGRAM, not by a grid** — the first draft of
+  `tests/cases/types/coalesce-default-row-past-callee-return.vl` held all four blocks, and
+  splitting the fixture in two is what isolated it.
+
+---
+
+### D875 — the callee whose returns the reader CANNOT name keeps its narrow row, and the merged row must not drag it along
+
+**runs today and must keep running · 5 cells (`distilled/named/d875_*`) · a REFUTATION PIN: the witness is the program an ungated return-row redirect took from `runs` to check-clean invalid wasm, which is the one `runs → not-runs` D871's work found**
+
+Repro (runs today, printing `7` then `2`):
+
+    function srcv(): {r: i32} | null {
+      const v = { r: 7 }
+      v
+    }
+    function use() {
+      const b = srcv()
+      if b != null { print((b).r) }
+    }
+    use()
+    function fam() {
+      let a: {r: i32} | null = { r: 1 }
+      const g1 = a ?? { r: "s" }
+      print(2)
+    }
+    fam()
+
+* **WHY IT IS A PIN AND NOT A DEFECT.** The row a `??` merge supersedes is a FIELD-SET row, so
+  every function whose return annotation resolves to it — including `srcv`, whose returned
+  BINDING `anonLeafJoinCallee` refuses to name and therefore does not move — resolves to it
+  too. Redirecting on the row alone made `srcv`'s result valtype the merged row while its body
+  still built `struct.new` at the narrow one. `anonLeafRetMoved` marks the callees the reader
+  actually read; removing that gate alone reddens exactly this cell and
+  `d875_unread_callee_declared`.
+
+* **THE READABLE TWIN MUST KEEP RUNNING TOO.** `d875_read_callee_beside_fam` is the same
+  program with `srcv` returning its literal directly — the reader names it, the mark is set,
+  and the redirect is correct. A fix that widens the gate has to keep both columns.
+
+* **AND THE ASSIGNMENT LEG IS THE THIRD.** `d875_assign_call` (`a = src()` rather than
+  `const a = src()`) was check-clean invalid wasm on master and runs here, because the
+  declaration leg and the assignment leg take the same one-hop call read. A change that removes
+  the hop from one and not the other makes two spellings of one binding behave differently.
+
+---
+
+### D876 — the six programs that BOUND the annotation atom, and the two return paths it must refuse
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` (3 cells: `d876_call_ret_is_binding`, `d876_call_ret_is_call`, `d876_litunion_ann`) with 3 `runs` pins beside them (`d876_nested_ann`, `d876_two_anns_disagree`, `d876_declared_dest_beside_ann_fam`), OPEN · every one identical on master `120f8b6c` and after D871/D872/D873 — this row is the DECLINE LIST made measurable, not a regression**
+
+Repro (a loud emit reject):
+
+    function src(): {r: i32} | null {
+      const v = { r: 7 }
+      v
+    }
+    function rd() {
+      const g1 = src() ?? { r: null }
+      print(0)
+    }
+    rd()
+    // vl check rc 0 (one unused-variable warning); vl run ->
+    //   emitProgram: bare null needs a struct-typed context
+    // SHOULD PRINT 0.
+
+* **THE THREE THAT STILL REFUSE, each for a different reason.**
+  * `d876_call_ret_is_binding` — the callee returns a BINDING. `anonLeafJoinCallee` declines
+    the whole callee (D871's refutation), so the family is the default alone. Closing it needs
+    the reader to follow a binding inside the callee, which is the IDENT reader one frame in.
+  * `d876_call_ret_is_call` — the callee returns another CALL. Same decline, one hop further;
+    `anonLeafJoinCallee` is deliberately ONE hop.
+  * `d876_litunion_ann` — `{r: K} | null` over `type K = "a" | "b"`. The annotation's field
+    text is a literal-union alias, which `anonLeafAtomOfText` does not admit, and the merged
+    set could not be spelled by `nameFieldCode` if it did. It is D804's own `boolean|null`
+    (code 21) decline wearing a second spelling: the row mints, and an `#anon` row carrying
+    such a field interns no map-value slot.
+
+* **THE THREE THAT RUN ARE THE OTHER HALF OF THE BOUND, and each one is a fix that would be
+  wrong.** `d876_nested_ann` (`{r: {q: i32}}`) — a nested-struct field is not a scalar atom.
+  `d876_two_anns_disagree` — two same-named bindings with different annotations, where taking
+  the first would widen a family with the wrong atom. `d876_declared_dest_beside_ann_fam` — a
+  narrow `R` destination beside the annotation-only family, which a row-wide redirect would
+  take from `runs` to invalid wasm.
+
+* **A DECLINE LIST IS MEASURABLE, which is why they are cells and not prose.** Each entry here
+  was lifted ALONE and graded; four of the six changed nothing when lifted and two produced the
+  `loud → silent` movements recorded in D871 and D872.
 
 ---
 
