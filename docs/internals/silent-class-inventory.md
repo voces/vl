@@ -20746,10 +20746,18 @@ Repro (now runs, printing nothing — the program has an empty body; the point i
 
 ---
 
-### D735 — a `??` DEFAULT whose join shape has no declared row: `bare null needs a struct-typed context`
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus, but NOT the whole of the SENTENCE, which also covers `x ?? null` at a nullable scalar and a nullable string (a different mechanism, filed 2026-08-31 as D784) · MECHANISM CORRECTED 2026-08-31 and a candidate REFUSED at a measured price of 16 behavioural classes**
+### D735 — [CLOSED 2026-08-31 by D804] a `??` DEFAULT whose join shape has no declared row: `bare null needs a struct-typed context`
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, closed by minting the merged anonymous ROW (D804) · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus, but NOT the whole of the SENTENCE, which also covered `x ?? null` at a nullable scalar and a nullable string (a different mechanism, D784, closed by D801) · MECHANISM CORRECTED 2026-08-31 and a candidate REFUSED at a measured price of 16 behavioural classes**
 
-Repro (still a loud emit reject):
+**WHAT CLOSED IT, AND WHAT DID NOT.** The row's own analysis was right — the missing artefact
+is the merged struct ROW — and D804 mints it: two `??`-joined same-fieldset anonymous literals
+that disagree at a leaf field now get one row whose field is the MERGED type. `d003280` runs.
+**`a000093` does NOT, and it is a different mechanism**: its map round-trips through a generic
+(`reverse([c])[0]`), which loses the value row no matter how the row is created — a DECLARED
+`type Circle = { r: i32 | null }` does not rescue it either, on master or now. That residue is
+filed as **D804b** and is still open. The ablation below stands as filed.
+
+Repro (now runs, printing `7`):
 
     function rd() {
       const c = Map()
@@ -22133,11 +22141,21 @@ Repro (now runs, printing `2`, `1.5`, `3`, `9000000000`):
 
 ---
 
-### D783 — the `?.` … `??` residue: a STRING field and a value-UNION field, both BUILT and both reverted
+### D783 — [CLOSED 2026-08-31 by D802 + D803] the `?.` … `??` residue: a STRING field and a value-UNION field, both BUILT and both reverted
 
-**loud emit reject · `emitProgram: \`?.\` over a nullable struct has no \`if\` blocktype for this field's rep` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 field reps (`string`, a value union), 1 corpus cell (`d352opt_union`) · this is the price D782 recorded and did not pay**
+**closed as `runs` · was `loud emit reject: emitProgram: \`?.\` over a nullable struct has no \`if\` blocktype for this field's rep` · a CLAUSE-2 capability gap, closed by building both lowerings · ABLATED family 2 field reps (`string`, a value union), 1 corpus cell (`d352opt_union`) · this was the price D782 recorded and did not pay**
 
-Repro (a loud emit reject):
+**THE TWO HALVES ARE TWO ROWS AND NEITHER IS A BLOCKTYPE.** The string half is **D802**: the
+`if` was always correct and the CONSUMER was not — `print` dispatched `__print_i32__` over a
+string ref — so the fix is `exprNullableString` calling a `?.` over a string field
+`string | null`, which also moves the spelling onto the `br_on_non_null` core and closes the
+standalone `?.` at a string leaf. The value-union half is **D803**: the blocktype and the
+default's boxing were both already written, and the missing piece was the three classifier
+arms this row's own note describes ("nothing on that path calls the value a box"). The
+recorded expectation of `d352opt_union` was also wrong (`0`) and is corrected to `5` — see
+D803.
+
+Repro (now runs, printing `z`):
 
     type Bs = { y: string }
     function fs(x: Bs | null) { print((x?.y) ?? "z") }
@@ -22171,11 +22189,17 @@ Fixture: `tests/cases/structs/error-optional-chain-ref-field-blocktype.vl`.
 
 ---
 
-### D784 — `x ?? null` seeds NO null rep, and it shares D735's sentence without sharing its mechanism
+### D784 — [CLOSED 2026-08-31 by D801] `x ?? null` seeds NO null rep, and it shares D735's sentence without sharing its mechanism
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 shapes (a nullable SCALAR, a nullable STRING), ZERO corpus cells · filed separately from D735 because the ablation separates them: D735's default is an object LITERAL whose merged row does not exist, and this one's default is the bare keyword**
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, closed by giving the `??` DEFAULT position its seed · ABLATED family 2 shapes as filed, **5 spellings over 4 `??` arms** when re-ablated (see D801), ZERO corpus cells · filed separately from D735 because the ablation separates them: D735's default is an object LITERAL whose merged row does not exist, and this one's default is the bare keyword**
 
-Repro (a loud emit reject):
+**THE ROW'S OWN "WHAT IT NEEDS" IS WHAT LANDED.** The three boxed value-union arms take the
+default through `emitUnionCoerce` (whose `NullLit` arm is the null-tagged box) and the
+`string | null` niche asks `coalesceDefaultNullable` instead of a narrower nullable-STRING
+test. Re-ablated the family is 5, not 2: the CALL and value-union-FIELD LHS spellings refuse
+as well, and `f64 | null` alongside `i32 | null`. See **D801**.
+
+Repro (now runs, printing `true`):
 
     function rd() {
       const c: i32 | null = 7
@@ -22201,6 +22225,283 @@ Repro (a loud emit reject):
   for `i32 | null`, `pendingNulString` for `string | null`, `pendingNulBool` for
   `boolean | null`. Estimated price: 0 corpus cells (the corpus has no program for it) and
   every hand-written `x ?? null`.
+
+---
+
+### D801 — [CLOSED 2026-08-31] the `??` DEFAULT position seeded NO null rep, so `x ?? null` fell off the bottom of the null table
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, closed by giving the position its seed · ABLATED family 5 spellings over 4 `??` arms, ZERO corpus cells — the corpus has no program for it, which is why the row carries a hand-written fixture · 0 cells moved, 0 `runs` lost, 0 into any silent class · filed as D784**
+
+Repro (now runs, printing `true`):
+
+    function rd() {
+      const c: i32 | null = 7
+      const g0 = c ?? null
+      print(g0 != null)
+    }
+    rd()
+
+* **THE ABLATION IS OVER THE LHS REP, and it is 5 of 8 — wider than the row that filed it.**
+  Every spelling below is `const g = <c> ?? null` with `c` of the named type. On master:
+
+        i32 | null       (ident)   loud emit reject
+        f64 | null       (ident)   loud emit reject
+        string | null    (ident)   loud emit reject
+        i32 | null       (call)    loud emit reject
+        i32 | null       (field)   loud emit reject
+        boolean | null   (ident)   RUNS   — the i32 sentinel-2 niche
+        S | null         (ident)   RUNS   — a live `pendingStructIdx` from the binding
+        i32[] | null     (ident)   RUNS   — the nullable-list wrapper
+
+  The three that ran are what says this is a SEED gap and not a missing rep: same expression,
+  same position, one rep over, and `emitNullLitNode` already had a seed set for each of them.
+
+* **TWO SEEDS CLOSE ALL FIVE, and each is the decision its own family already makes.**
+  * The three BOXED value-union arms (ident LHS, CALL LHS, value-union FIELD LHS) emit the
+    nullable default through **`emitUnionCoerce`**, whose `NullLit` arm IS the null-tagged box
+    the `(ref $uBox)` block type wants. A non-null default is passed through unchanged
+    (`exprUnion` → `emitExpr`), so the arm is inert outside the bare keyword.
+  * The `string | null` NICHE arm asks **`coalesceDefaultNullable`** — THE nullability
+    decision the boxed, nullable-struct and nullable-collection arms all take — where it had
+    been asking the narrower "is the default itself a nullable STRING". That answered "no" for
+    `s ?? null`, so the lowering declared a `(ref $aTypeIdx)` non-null block and emitted the
+    default with `pendingNulString` clear.
+
+* **MEASURED.** Corpus byte-identity (`corpuscmp.py`, master `a7b7798d` → candidate): **2,462
+  modules · 2,012 identical · 0 DIFFER · 0 LOST.** Distilled corpus: 0 classes moved.
+  `tests/cases` build set: 0 lost. Fixture: `tests/cases/unions/coalesce-bare-null-default.vl`.
+
+---
+
+### D802 — [CLOSED 2026-08-31] a `?.` over a STRING field is `string | null`, and saying so is the whole fix
+
+**closed as `runs` · was `loud emit reject: emitProgram: \`?.\` over a nullable struct has no \`if\` blocktype for this field's rep` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 2 leaf codes (`string` 3 and `string | null` 20) plus the STANDALONE `?.` spelling of the same leaf, ZERO corpus cells · 0 cells moved, 0 `runs` lost · one half of D783**
+
+Repro (now runs, printing `z`):
+
+    type Bs = { y: string }
+    function fs(x: Bs | null) { print((x?.y) ?? "z") }
+    fs(null)
+
+* **THE FILED DIAGNOSIS WAS OF A DIFFERENT PROGRAM.** D783 recorded the string arm as having
+  been BUILT and reverted because the default "builds a module the engine refuses, `Invalid
+  input WebAssembly code` — the literal's scratch reservation is decided by a scan that has no
+  arm for this site". Lifting the emit-side refusal again and re-measuring gives
+  `type mismatch: expected i32, found (ref $type)`, and the disassembly says where: the `if`
+  is correct — `(if (result (ref $3)) (ref.is_null …) (then (global.get $global$0)) (else
+  (struct.get …)))` — and the CONSUMER is wrong, `call $fimport$0` being `__print_i32__` over
+  a string ref. It was never a blocktype or a reservation.
+
+* **SO THE FIX IS A CLASSIFIER ARM, and it moves the whole spelling onto a better lowering.**
+  `x?.y` over a nullable struct with a string leaf IS `string | null`, so `exprNullableString`
+  says so; `emitCoalesce`'s string-niche arm then claims the spelling BEFORE the `?.` arm
+  reaches its blocktype table, and the result is the `br_on_non_null` core — one evaluation of
+  the place, no re-read — rather than the two-arm `if`. The same arm is what routes `print`
+  and an un-annotated binding (`const t = (x?.y) ?? "z"`) to the string rep, which is the half
+  the earlier attempt was missing.
+
+* **AND IT NEEDED THE STANDALONE `?.` TO EXIST, which closes a second refusal.** That core
+  evaluates its LHS once, so `emitOptMemberValue` has to lower a bare `x?.y` at a string leaf —
+  it refused with ``a standalone `?.` supports only i32/boolean leaf fields``. The niche is
+  `(ref null $sTypeIdx)`, so the null arm is a `ref.null` and nothing had to be invented.
+  `optRecvReReadable` also grew its `OptMember` arm, so a nested chain `o?.inner?.y` is
+  re-readable to the gate exactly as it already was to `emitOptChainIsNull` and
+  `emitOptChainValue`, which are both written as recursions over that shape.
+
+* **THE `string | null` LEAF (code 20) COMES WITH IT.** `x?.y` where `y: string | null` lands
+  on the same niche while the checker's type is a nullable OF a nullable, which
+  `repOfNullable` does not cover — so the field's own CODE is the authority for that spelling.
+
+* **RUNG ABLATION.** `optRecvReReadable`'s new `OptMember` arm scores ZERO on the corpus and
+  is load-bearing: remove it alone and `o?.inner?.y ?? "z"` becomes
+  ``emitProgram: `?.` needs a re-readable receiver`` — the string-niche core evaluates its LHS
+  through `emitOptMemberValue`, whose gate did not admit the shape its own two recursive
+  helpers already walk.
+
+* **MEASURED.** Corpus byte-identity **0 DIFFER · 0 LOST**; distilled corpus 0 classes moved;
+  `tests/cases` build set 0 lost. Fixture:
+  `tests/cases/structs/optional-chain-ref-field-blocktype.vl` (replacing the `@emit-error` pin).
+
+---
+
+### D803 — [CLOSED 2026-08-31] the value-UNION `?.` leaf was a CONSUMER gap, and the earlier measurement said so without naming it
+
+**closed as `runs` · was `loud emit reject: emitProgram: \`?.\` over a nullable struct has no \`if\` blocktype for this field's rep` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 1 leaf code (16, a value-union field), 1 corpus cell (`d352opt_union`) · 1 cell `loud emit reject` → `runs`, 0 `runs` lost · the other half of D783**
+
+Repro (now runs, printing `5`):
+
+    type B = { y: i32 | string }
+    function f(x: B | null) {
+      if (x?.y) is string { print(0) } else { print((x?.y) ?? 5) }
+    }
+    f(null)
+
+* **THE EARLIER REFUSAL RECORDED THE RIGHT MEASUREMENT AND STOPPED ONE STEP SHORT.** D783:
+  "the blocktype is spellable (`fbIfRef(uBoxIdx)`) and the default boxes through
+  `emitUnionCoerce` — both were built — and the result is still check-clean INVALID WASM …
+  `const v = (x?.y) ?? 5` classifies its BINDING cell from a `??` whose left side is an
+  optional chain, and nothing on that path calls the value a box." That is a complete
+  description of the remaining work, filed as a reason not to do it.
+
+* **THREE CLASSIFIER ARMS ARE "SOMETHING ON THAT PATH".**
+  * `optChainLeafFieldCode` — ONE home for "what rep does a `?.` deliver", the consumer-side
+    twin of the resolution `emitOptMemberValue` and its `?? d` arm already perform.
+  * `exprUnion` — a code-16 leaf is already a box and the chain only ADDS `null` to its member
+    set, so the whole `?.` is a box value. (`nodeTyIsNulScalarBox`, the arm that was there,
+    requires a NUMERIC prim inner and structurally cannot answer for a union one.)
+  * `unionNameOfExpr` — the member SET, for both `x?.y` and `(x?.y) ?? d`, taken from the
+    CHECKER's own type for the node (`nodeUnionName`) rather than assembled here: the chain is
+    `i32 | string | null` and the coalesce is `i32 | string`, and rendering is what keeps the
+    `null` member and the arm order right. Reached only for a `?.`, never the hot path.
+
+* **AND ONE EMIT ARM EACH SIDE.** `emitOptMemberValue` reads a code-16 leaf THROUGH (the field
+  already holds a `(ref $uBox)`; only the null-link arm builds one), and `emitOptChainDefault`
+  coerces the `??` default into the field's union. `fbIfForSharedField` gained the
+  `(ref $uBox)` spelling — inert for the shared-union-field dispatch, which still declines
+  code 16 through `sharedFieldCodeDispatchable`.
+
+* **THE CELL'S RECORDED EXPECTATION WAS WRONG AND IS CORRECTED HERE.** `d352opt_union` has
+  never run, so its manifest expectation (`0`) had never been validated — D783 says as much.
+  Re-derived from the `?.`-free equivalent (`if x != null { … } else { print(5) }`), which
+  prints **5** on master's seed and on this one, and the manifest now reads `5`.
+
+* **A NOTE ON SCOPE, since the sentence is broader than this row.** The DIRECT spelling of the
+  same join — `function f(c: i32 | string | null) { const v = c ?? 5 }` — is a different
+  refusal (``emitProgram: `??` over this nullable value is not supported yet``) and a different
+  mechanism: `emitCoalesce`'s boxed-union arms peel `null` only when the RESIDUAL is a single
+  atom (`unionResidualSoloKindOfSet`), and a two-atom residual falls out of the arm entirely.
+  That is not closed here and is not this row.
+
+* **RUNG ABLATION, AND IT REPRODUCES D783's OWN MEASUREMENT EXACTLY.** Remove the
+  `unionNameOfExpr` `??`-over-a-`?.` arm alone, keeping every emit arm, and `d352opt_union`
+  and the plain `print((x?.y) ?? 5)` both become check-clean invalid wasm with
+  `type mismatch: expected i32, found (ref $type)` — the sentence D783 recorded, at the
+  binding and not at the `if`. That rung IS the "something on that path".
+
+* **MEASURED.** Corpus byte-identity **0 DIFFER · 0 LOST**; distilled corpus: 1 class
+  `loud emit reject` → `runs`, `runs → not-runs` **ZERO**, `→ silent` **ZERO**.
+
+---
+
+### D804 — [CLOSED 2026-08-31] two `??`-joined literals that disagree at a LEAF field need the merged ROW, and the null corner was the only loud one
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, closed by minting the row · ABLATED family 8 field VALUE PAIRS, of which 4 were loud and 3 were CHECK-CLEAN INVALID WASM · 1 corpus cell (`d003280`, standing for 16 census cells) `loud emit reject` → `runs`, 0 `runs` lost, 0 into any silent class · filed as D735, whose second cell `a000093` is a different mechanism and is D804b**
+
+Repro (now runs, printing `7`):
+
+    function rd() {
+      const c = Map()
+      c["k0"] = { r: 7 }
+      const g0 = (c)["k0"] ?? { r: null }
+      if (g0).r != null { print(7) } else { print(0) }
+    }
+    rd()
+
+* **THE FILED SENTENCE WAS THE NULL CORNER OF A WIDER FAMILY.** Ablated over the field VALUE
+  PAIR of `c["k0"] = {r: A}` / `?? {r: B}`, with a neutral consumer so the emit question is
+  isolated, master gives:
+
+        A=i32       B=null     loud  `bare null needs a struct-typed context`
+        A=string    B=null     loud  (same)
+        A=boolean   B=null     loud  (same)
+        A=f64       B=null     loud  (same)
+        A=null      B=i32      loud  (same)
+        A=i32       B=string   CHECK-CLEAN INVALID WASM  `expected i32, found (ref $type)`
+        A=i32       B=f64      CHECK-CLEAN INVALID WASM  `expected i32, found f64`
+        A=string    B=i32      CHECK-CLEAN INVALID WASM  `expected (ref $type), found i32`
+        A=i32       B=i32      runs (the control)
+
+  One mechanism, two outcomes. `structIndexOfObj` matches a literal to a row by field-NAME
+  set: with `null` the loser's value code is -1, `anonValueFitsField`'s `vc < 0` leniency
+  merges the pair, and the null is written through an i32 field — LOUD. With a different
+  scalar rep that same predicate REFUTES, each literal gets its own row, and the `??` then has
+  to join two heap types — SILENT. Three of those eight are clause-1 cells the corpus has no
+  program for.
+
+* **IT IS D672's RUNG ONE LAYER DOWN.** `anonNestPolyUnionName` already mints a code-16 field
+  where two `??`-joined same-fieldset literals disagree at a NESTED field, and its header
+  states the argument this row reuses word for word: a `??` makes its two operands ONE value,
+  so the pair cannot keep two rows and the box is the only rep they share. `anonLeafPolyUnionSet`
+  is the scalar twin — same four gates (an anonymous owner, every value NAMEABLE as an atom, at
+  least two DISTINCT atoms, the family JOINED by a `??`), with the union built from the values'
+  own atoms rather than taken from a declaration.
+
+* **THE MERGED CODE IS THE DECLARED ONE, and that is where the first cut went wrong.** Minting
+  code 16 for every merged set put a `{tag, value}` box behind consumers reading the
+  `string | null` NICHE, and the `string`/`null` pair traded its loud reject for CHECK-CLEAN
+  INVALID WASM — the one movement worth vetoing. The code now comes from `nameFieldCode(set)`,
+  the same speller a declaration asks, and only the two codes whose companion column this mint
+  can fill are admitted: 16 (records the set) and 20 (a bare niche, records ""). `boolean|null`
+  (code 21) is spellable and still DECLINED — the row mints, the declared twin of the same
+  program runs, but an `#anon` row carrying a code-21 field interns no map-value slot and the
+  pair would trade `bare null needs a struct-typed context` for the less informative
+  `unsupported map value type`. That mv-slot rep is a separate rung.
+
+* **DECLARING THE MERGED SHAPE ALWAYS WORKED** — `type Circle = { r: i32 | null }` makes the
+  repro print on master — which is what makes this a capability gap and not a rule. This mints
+  the row the user would otherwise have to write.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130). The repro's module holds
+  ONE shape for `{r}` and its field is the box:
+  `(type $0 (struct (field (mut (ref $1)))))` over `(type $1 (struct (field i32) (field anyref)))`.
+  No second row for the default's spelling.
+
+* **RUNG ABLATION.** `anonMintRowFor`'s `registerValueUnionName` loop is the D751-shaped rung
+  here — it looks like parity bookkeeping and it is load-bearing. Remove it alone and the
+  code-16 cells go straight back to a loud reject (`d003280`, and the `i32`/`string` pair)
+  while the code-20 `string`/`null` pair is untouched, because that one has no union to
+  register. `anonMintRowFor` does not route through `pushFieldRow`, which is where the three
+  DECLARED recorders get the same call.
+
+* **MEASURED.** Corpus byte-identity (master `a7b7798d` → candidate): **2,462 modules · 2,012
+  identical · 0 DIFFER · 0 LOST.** Distilled corpus: 1 class `loud emit reject` → `runs` (16
+  census cells), `runs → not-runs` **ZERO**, `→ silent` **ZERO**. `tests/cases` build set:
+  2,004 → 2,007, 0 lost. Fixture:
+  `tests/cases/maps/coalesce-default-leaf-shape-merge.vl`.
+
+---
+
+### D804b — a map that ROUND-TRIPS THROUGH A GENERIC loses the merged value row, and no row mint can reach it
+
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 1 corpus cell (`a000093`), 1 residual ingredient · D735's SECOND cell, and NOT D804's mechanism: the merged row is not what is missing here**
+
+Repro (a loud emit reject):
+
+    import { reverse } from "std:array"
+    function rd() {
+      const c = Map()
+      c["k1"] = { r: 7 }
+      const dd = reverse([c])[0]
+      const g1 = (dd)["k0"] ?? { r: null }
+      print(0)
+    }
+    rd()
+
+* **THE ABLATION IS ONE LINE, and it separates this from D804 completely.** Delete
+  `reverse([c])[0]` and read the map directly and the same program RUNS (D804's rung mints the
+  merged row). Replace `reverse` with `[c][0]` — a list literal, no generic — and it RUNS.
+  Replace it with a hand-written `function idg<T>(x: T): T { return x }` and it REFUSES again,
+  so this is genericity and not std.
+
+* **AND THE MERGED ROW IS NOT THE MISSING THING, which is the measurement that says it needs
+  its own row.** Give the program the row by hand — a declared `type Circle = { r: i32 | null }`,
+  or a `sink(_x: {[string]: {r: i32 | null}})` the map flows into — and it STILL refuses, on
+  master and on the current seed alike. Without `reverse` the sink version runs. So the map's
+  VALUE row is being resolved somewhere the merged shape does not reach.
+
+* **IT DOES NOT EVEN NEED THE READ TO GO THROUGH THE GENERIC.** Keep `const dd = reverse([c])[0]`
+  and read `c` directly (`(c)["k0"] ?? { r: null }`) and it refuses; the mere presence of the
+  generic round-trip is the ingredient. A non-null default (`?? { r: 0 }`) runs through
+  `reverse`, so the value row IS resolved — as `{r: i32}`, the shape the `??` default's
+  contribution never reached.
+
+* **AN ANNOTATED `dd` IS A CLAUSE-1 CELL AND IT IS PRE-EXISTING.**
+  `const dd: {[string]: {r: i32 | null}} = reverse([c])[0]` is check-clean invalid wasm
+  (`type mismatch: expected (ref $type), found (ref $type)`) on master and unchanged here.
+
+* **WHERE TO START.** The mono instance's pinned shape, not `collectAnonShapes`: every rung
+  D804 added is gated on `structIndexOfObj(ow) < 0`, and a shape the monomorphizer pinned is a
+  row that already matches.
 
 ---
 

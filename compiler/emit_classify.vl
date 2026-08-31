@@ -2130,6 +2130,17 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   }
   // A `string | null` struct FIELD read (`a.v`, code 20) yields a nullable string ref.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 20 }
+  // A `?.` OVER A NULLABLE STRUCT whose leaf field is a STRING — plain (code 3) or already
+  // nullable (code 20) — is `string | null`, the same `(ref null $sTypeIdx)` niche
+  // `emitOptMemberValue`'s `nulstr` arm builds. D802: saying so here is what routes
+  // `(x?.y) ?? "z"` through the string-niche `??` core (one evaluation, `br_on_non_null`)
+  // and gives `print` / an un-annotated binding the string rep — without it the whole
+  // spelling was a loud reject, and lifting only the emit-side refusal produced a valid
+  // `(ref $type)` block under an i32 print dispatch.
+  if e is OptMember {
+    const occ = optChainLeafFieldCode(exprIx, fnIx)
+    return occ == 3 || occ == 20
+  }
   // A BARE `m[k]` over a STRING-valued map is `string | null` (kind 16) — `emitMapGet` yields the
   // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
   if e is Index {
@@ -2157,7 +2168,16 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
         }
       }
       if exprNullableString(e.binLeft, fnIx) {
-        return exprNullableString(e.binRight, fnIx)
+        if exprNullableString(e.binRight, fnIx) { return true }
+        // A BARE `null` DEFAULT IS NULLABLE TOO — D801. `exprNullableString` alone answers
+        // only for a default that is itself a nullable STRING, so `s ?? null` read as
+        // NON-null: the lowering then declared a `(ref $aTypeIdx)` block and emitted the
+        // default with `pendingNulString` clear, which is `emitNullLitNode` with none of its
+        // seven seeds — the loud `bare null needs a struct-typed context` reject.
+        // `coalesceDefaultNullable` is THE nullability decision the boxed-union, nullable-
+        // struct and nullable-collection `??` arms all take; asking it here is what makes
+        // the string niche agree with them instead of carrying a narrower copy.
+        return coalesceDefaultNullable(e.binRight, fnIx)
       }
     }
   }
@@ -10588,6 +10608,24 @@ export function fnHasUnannotatedParam(fe: i32) {
     }
   }
   false
+}
+
+// The LEAF field's wasm type CODE of an optional chain (`x?.y`, `o?.inner?.y`) — the
+// `sFieldTypeAt` of the last link — or -1 when `exprIx` is not a resolvable chain. THE ONE
+// HOME for "what rep does a `?.` deliver", asked by `exprNullableString` (code 3 / 20 → the
+// `string | null` niche) and `exprUnion` (code 16 → the value-union box); the emitter's
+// `emitOptMemberValue` and its `?? d` arm resolve the same pair by hand for the struct index
+// they also need, so this is the consumer-side twin of that resolution and not a second one.
+export function optChainLeafFieldCode(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is OptMember {
+    const si = optChainStructIdxOf(e.omObj, fnIx)
+    if si >= 0 {
+      const fi = sFieldIndex(si, e.omProp)
+      if fi >= 0 { return sFieldTypeAt(si, fi) }
+    }
+  }
+  -1
 }
 
 export function optChainStructIdxOf(exprIx: i32, fnIx: i32) {
@@ -27790,7 +27828,14 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // `(ref $uBox)`, `vl check` rc 0 and "expected i32, found (ref $type)"). The niche
   // nullables a `?.` can also produce (`S | null`, `string | null`, `boolean | null`) are
   // structurally excluded by the predicate, which is the whole reason it is the gate.
-  if e is OptMember { return nodeTyIsNulScalarBox(exprIx) }
+  if e is OptMember {
+    if nodeTyIsNulScalarBox(exprIx) { return true }
+    // A value-UNION LEAF (code 16) is already the box, and the chain only adds `null` to
+    // its member set — so the whole `?.` is a box value too. D803: without this arm
+    // `(x?.y) is string` and `const v = x?.y` classified the chain as a scalar while
+    // `emitOptMemberValue` built `(ref $uBox)`.
+    return optChainLeafFieldCode(exprIx, fnIx) == 16
+  }
   // `x as Shape` over a wider union yields the BOX at a narrower type — the sub-union cast
   // does not unbox, so its result is a union value like any other. Answered from the cast's
   // own recorded type: a SINGLE-arm target is not a union and correctly answers false here,
@@ -28304,6 +28349,17 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     return nodeUnionName(exprIx)
   }
   if e is Ident { return unionNameOfIdent(e.identName, fnIx) }
+  // A `?.` whose LEAF is a value-union field (code 16): the chain is that union plus `null`,
+  // and the CHECKER's own type for the node is exactly that set — so it is rendered rather
+  // than assembled here, which is what keeps the `null` member and the arm order right.
+  // Reached only for a `?.` (never the hot path), the same discipline the Call fallback below
+  // states for `nodeUnionName`. D803.
+  if e is OptMember {
+    if optChainLeafFieldCode(exprIx, fnIx) == 16 {
+      return nodeUnionName(unwrapParen(exprIx))
+    }
+    return ""
+  }
   // `m[k] ?? d` over a UNION-valued map yields the value union's box — resolve its name (the
   // mv slot's value name) so an un-annotated `const v = m[k] ?? d` narrows/unboxes.
   if e is BinExpr {
@@ -28330,6 +28386,16 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       if cln != "" && coalesceDefaultNullable(e.binRight, fnIx) {
         const crn = unionNameOfExpr(e.binRight, fnIx)
         if crn == "" || crn == cln { return cln }
+      }
+      // A `?.` LHS over a value-union LEAF stays a BOX past the `??` even with a NON-null
+      // default: peeling `null` off `i32 | string | null` leaves TWO atoms, which have no
+      // shared unboxed rep. The result set is the checker's type for the `??` NODE — the
+      // union minus `null` — rendered rather than assembled, as the `?.` arm above. D803.
+      const olh = P.nodes[unwrapParen(e.binLeft)]
+      if olh is OptMember {
+        if optChainLeafFieldCode(e.binLeft, fnIx) == 16 {
+          return nodeUnionName(unwrapParen(exprIx))
+        }
       }
     }
   }
