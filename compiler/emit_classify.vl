@@ -19834,10 +19834,46 @@ function mvValTwinCanonId(slot: i32): i32 {
 // sHeapIdx[rlElemStructRow(row)]` — so two mv slots whose answers here are `sTwin` twins
 // resolve ONE vals wrapper, which is the half of a map struct's identity `mvSlotKeyI32`
 // does not decide.
+//
+// ── AND THAT SIGNATURE HAS A SECOND HEAP LEG (silent-class-inventory D623) ──
+// `rlSig`'s struct branch is a LADDER, not one line: `rlElemStructRow` first, and when it
+// answers -1 the CONCRETE-VARIANT fall-through `rlElemVariantHeap`. This function mirrored
+// only the first rung, so a vals element that is a registered union ARM read -1 here and
+// rung W declined — while the two rows had already twinned at the ref-list layer and were
+// sharing one wrapper. Since **D280** an arm and a declared struct of its exact layout are
+// ONE heap (`uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`, `collectU`'s cross-table branch),
+// which is precisely what makes the two legs able to agree — and what nothing above the
+// canonical-key gate could see.
+//
+// ASKED THE WAY THE KIND-1 TAIL AND `rlSlotsLayoutTwin` BOTH ALREADY ASK IT:
+// `variantStructHeapTwinAt` over the element's variant row, per claimant, so the mint and
+// every pairwise find compute the same function of one side without observing the other.
+// TIMING-INDEPENDENT, which this layer requires — no heap index is consulted (that is the
+// reason it is `variantStructHeapTwinAt` and not `rlElemVariantHeap`, which reads
+// `uVarHeap` and is therefore unavailable while `rlTwin` is being built).
+//
+// MEASURED AT THE MINT on the D623 witness — an un-annotated `Map()` whose first key write
+// infers `{r: null}`, flowing into a `{[string]: Circle}` field where `Circle` is an ARM
+// of `Shape` and `Dot` is its declared layout twin:
+//
+//   mv0 name=Circle    kind=1 rl=0 sidx=-1 rep=0
+//   mv1 name={r:null}  kind=1 rl=1 sidx=0  rep=1
+//   rl0 nm=Circle k=1 wrap=11 srow=-1 vrow=0  vhtwin=0
+//   rl1 nm=Dot    k=1 wrap=11 srow=0  vrow=-1 vhtwin=-1
+//
+// The SAME wrapper (11) on two rl rows, two map structs, and `srow=-1` is the whole
+// refusal: `{r: null}` interned onto `Dot`'s row and `Circle`'s row is the arm's. Read
+// through `vhtwin` both sides answer struct row 0 and the pair merges.
+//
+// The rendered names differ and their `repCanonId`s differ, so the canonical-key gate
+// below never lets this pair reach the kind-1 tail that already knows the answer — the
+// same reason D300 and D301 hoisted the other two legs of this question above it.
 function mvValsElemStructRow(slot: i32): i32 {
   const rs = mvRlSlot[slot]
   if rs < 0 || rs >= rlElemName.length { return -1 }
-  rlElemStructRow(rs)
+  const sr = rlElemStructRow(rs)
+  if sr >= 0 { return sr }
+  variantStructHeapTwinAt(rlElemVariantRow(rs))
 }
 
 export function repMapValSlotsTwin(a: i32, b: i32): i32 {
@@ -22912,11 +22948,43 @@ export function buildVariantTwins() {
 //
 // THE LAYOUT GUARD IS DELIBERATELY CONSERVATIVE AND THE NARROWNESS IS MEASURED, not
 // assumed: a field whose emitted storage is a `(ref [null] <heap>)` the CODE does not name
-// (5 / 15 / 28 a ref list, a nested struct and the list's niche; 19 / 29 a map) declines
-// the merge outright rather than descending into the referenced layer the way
-// `variantFieldLayoutEq` does. Never-merged is the safe degenerate (the `""`-key
-// discipline `structFieldCodesEq` states), the whole D156/D158/D171 family is
-// fixed-storage arms, and widening it is a separate measurement.
+// (5 / 15 / 28 a ref list, a nested struct and the list's niche) declines the merge
+// outright rather than descending into the referenced layer the way `variantFieldLayoutEq`
+// does. Never-merged is the safe degenerate (the `""`-key discipline `structFieldCodesEq`
+// states) and the whole D156/D158/D171 family is fixed-storage arms.
+//
+// THE MAP CODES (19 / 29) ARE NO LONGER AMONG THEM — that was the "separate measurement"
+// this header priced, and silent-class-inventory **D624** is it. A map-typed field was the
+// single largest decline at this guard: over the distilled corpus the function is asked
+// 11,866 times on 1,784 cells, and of the 525 cells that ask and never get an answer,
+// **112 decline HERE at code 19** (2,836 declines), against 29 at code 15 and none at 5 /
+// 28 / 29. The whole of D623's residue — an un-annotated `Map()` carrier whose value type
+// has a layout twin, reaching a list element or a struct field — lands on that decline.
+//
+// THE DESCENT IS SLOT EQUALITY, NOT THE TWIN RELATION, and that is the point rather than a
+// shortcut. `sFieldMapShape` / `uFieldMapShape` are the ONE HOME of "which map does this
+// field denote" on each table (the pair `sFieldTgtStructIdx` / `uFieldTgtStructIdx` is for
+// code 15), and they speak the same three-valued shape vocabulary: `-1` mono string-keyed,
+// `-4` mono i32-keyed, `>= 0` an mv slot. Two fields resolving the SAME answer emit the
+// SAME map struct, because `mvMapTypeIdx` is a function of the slot. That is the tightest
+// possible evidence and it is an equivalence on its own — the same argument
+// `repMapValSlotsTwin`'s D300 rung makes for `mvRlSlot[a] == mvRlSlot[b]`.
+//
+// AND IT IS WHY THIS RUNG CANNOT RECUR. `variantFieldLayoutEq`'s code-19 arm compares
+// `mvCanonRepOf`, which walks `repMapValSlotsTwin` — and `repMapValSlotsTwin` calls back
+// into THIS function (the cross-table arm D623 gave `mvValsElemStructRow`). Widening this
+// guard through the twin relation would close that loop, on shapes that can be recursive,
+// and would need `structFieldCodesEq`'s coinductive pair stack to be safe. Slot equality
+// asks the mv layer nothing it has to compute, so the loop never forms. `-3` (the
+// "no rep" sentinel `mvSlotOfValNameFindK` can hand back) declines rather than merging two
+// fields on the ground that neither has a representation.
+//
+// TIMING. Both accessors read the mv INTERN tables, which is the same exposure
+// `variantFieldLayoutEq` has already had at this layer — `repVariantSlotRep` renders
+// through it during `collectCloSigs`, before `mAssignTypeIndices` runs — and the same
+// answer for the same reason: each claimant resolves its own field's recorded type/name
+// against those tables without observing the other, so the mint and every pairwise find
+// compute one function of (`vi`, `si`).
 export function variantStructHeapTwinAt(vi: i32): i32 {
   if vi < 0 { return -1 }
   if vi >= uVarTyIx.length { return -1 }
@@ -22948,7 +23016,12 @@ export function variantStructHeapTwinAt(vi: i32): i32 {
   while fi < uFieldCount[vi] {
     const cv = uFieldTypes[uFieldStart[vi] + fi]
     if cv != sFieldTypes[sFieldStart[si] + fi] { return -1 }
-    if cv == 5 || cv == 15 || cv == 28 || cv == 19 || cv == 29 { return -1 }
+    if cv == 5 || cv == 15 || cv == 28 { return -1 }
+    if cv == 19 || cv == 29 {
+      const um = uFieldMapShape(vi, fi)
+      if um == -3 { return -1 }
+      if um != sFieldMapShape(si, fi) { return -1 }
+    }
     fi = fi + 1
   }
   si
