@@ -19102,6 +19102,139 @@ Repro:
   family at zero. It is a hand-written probe's worth of work to change that and none will
   arrive on its own.
 
+---
+
+### D671 — [CLOSED 2026-08-30] the map value's RENDER names no row, because the NODE side already adopted its literal onto one
+**closed as `runs` · was `loud emit reject: emitProgram: unsupported map value type` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 18 of the 18 cells carrying that message, in two halves (14 arm-adopted, 4 struct-adopted) · +20 corpus cells to `runs` (the 18 minus one, plus 3 that carried `map values must be i32 / boolean`), 0 `runs` lost, 0 into any silent class, 1,967 of 1,970 buildable `tests/cases` modules byte-IDENTICAL**
+
+Repro (now runs, printing `7`):
+
+    type Ca = {n: i32}
+    type Sq = {s: i32}
+    type U1 = Ca | Sq
+    function mk1() {
+      const m2 = Map()
+      m2["k"] = { n: 7 }
+      const g = m2["k"] ?? { n: 0 }
+      print(g.n)
+    }
+    mk1()
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: unsupported map value type (no rep for a union-member
+    //   struct, a nullable list over an unnamed element rep, ...)
+    // Now: prints 7.
+
+* **THE DIRECT SPELLING RAN, WHICH IS WHAT MADE IT A CAPABILITY GAP AND NOT A DESIGN RULE.**
+  Annotate the map (`const m2: {[string]: Ca} = Map()`, or `{[string]: U1}`) and it runs on
+  master. Delete `type U1` and it runs on master. So neither the value shape nor the map is
+  refused — only the un-annotated spelling of a shape a union arm happens to share.
+
+* **ONE CHOKEPOINT, TWO ADOPTERS.** Every one of the 18 fails at
+  `mvValKindOfName(<render>) == -3`, with the render being the checker's own anonymous row
+  (`{n:i32}` / `{r:i32}` / `{r:f64}`) and BOTH name-keyed resolvers declining it. They decline
+  because `collectAnonShapes` never minted an `#anonN` row for the literal — its gate is
+  "unless a node-side resolver already gave it one":
+  * **14 cells, ARM-adopted.** `objVariantName` matched the literal to `Ca`, a member of
+    `U1`. `collectS` skips a union member, so there is no `sNames` row, and `variantIndexOf`
+    is a NOMINAL `uVariants` lookup that the ROW spelling misses.
+  * **4 cells, STRUCT-adopted.** `structIndexOfObj` matched `{r: 7}` to a declared
+    `type Circle = { r: i64 }` — different field TYPE, same field-name set — and the emitter
+    is right to: the disassembly of `type Circle = {r: i64}` + `const p = {r: 7}` is
+    `(struct.new $1 (i64.const 7))` over `(struct (field (mut i64)))`. The name-side
+    `structIndexOfTypeName` then refutes that same pairing as a proven code mismatch. This is
+    D461's residue: same disagreement, adopted through a numeric widening instead of a union
+    box.
+
+* **THE FIX IS THE MV LAYER READING THE ADOPTION INSTEAD OF CONTRADICTING IT.** Two resolvers
+  in `emit_classify.vl` (`mvValArmOfShape`, `mvValRowOfShape`), each gated on the strict
+  name-keyed lookup having declined, read by the kind rung, the `vsi` mint, the variant column
+  and the ref-list key so all four name one row. `mvValRowOfShape`'s per-field test is
+  `anonValueFitsField`'s DECLARED-row tier applied to a render: against a non-anon row only
+  the two pairs no adoption can bridge refute (an integer into a string slot, a string into a
+  plain i32 one), because a declared row's codes are evidence of its ANNOTATION and not of
+  what its literals look like.
+
+* **THE COUNTERS SAY THE RUNG IS ON A LIVE PATH, WHICH IS WHY IT IS GATED AND NOT WIDENED.**
+  Over the 7,041-cell corpus: **reach 657** cells (619 of them `runs` on master), **ans 230**
+  (arm half 196, row half 34). Only 20 of the 230 change class — the other 210 answer the slot
+  the module already had, which is what the 1,967 byte-identical modules say from the other
+  side. #1942's ruling that a nominal question must not be settled structurally still governs
+  every state but the one where the adoption ALREADY settled it.
+
+* **BOTH HALVES ARE LOAD-BEARING AND EXACTLY ADDITIVE.** Strip-all: 0 corpus cells move and
+  all 1,970 buildable `tests/cases` modules are byte-IDENTICAL to master. Arm half alone: +14
+  (the `d362*_declunion_*` set). Row half alone: +6. Both: +20. A first cut without the
+  `armNm` rung in the kind-1 mint TRAPPED the compiler on all 14 arm cells (`sNames[-1]`).
+
+* **THE ONE CELL IT DOES NOT CLOSE.** `a000014` moves to a different, pre-existing refusal
+  (`a function value's signature is not yet supported — a function value may not take a
+  nullable or map parameter`), which its lambda `(x: {[string]: …}) => x` was always going to
+  hit once the map value lowered.
+
+---
+
+### D672 — [CLOSED 2026-08-30] two owner literals joined by `??` need ONE row with a BOXED field, and nobody had declared it
+**closed as `runs` · was `loud emit reject: emitProgram: object literal is missing a struct field` · a CLAUSE-2 capability gap, closed by building the lowering — the (b) reading was tried and REFUTED by D210 · ABLATED family 16 of the 16 cells carrying that message, all one mechanism (`si=#anon0 want=c2` on every one) · +16 corpus cells to `runs`, 0 `runs` lost, 0 into any silent class, all 1,970 buildable `tests/cases` modules still building**
+
+Repro (now runs, printing `7`):
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    const c = Map()
+    c["k0"] = { r: { c2: 1 } }
+    const g0 = (c)["k0"] ?? { r: { s2: 1 } }
+    if (g0).r is Cir2 { print(7) } else { print(0) }
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: object literal is missing a struct field
+    // Now: prints 7.
+
+* **IT IS D210'S WITNESS WITH ONE DECLARATION DELETED, AND D210 RUNS.** Add
+  `type Circle = { r: Shape2 }` and this program has run on every recent compiler — that row
+  is silent-class-inventory D210, filed as a REFUTATION PIN. With `Circle` declared,
+  `structIndexOfObj` adopts BOTH literals onto its row, whose `r` is a union box (code 16), and
+  `emitObj` boxes each nested literal as its arm. So the program is legal and the only thing
+  missing is a row nobody wrote.
+
+* **THE (b) READING WAS TRIED AND D210 REFUTED IT.** The cluster reads like an illegal
+  program: the `??` joins `{r: {c2: i32}}` with `{r: {s2: i32}}`, and the compiler ALREADY
+  refuses that union by a design rule — `assignTags`' `union … cannot be discriminated`, which
+  the inferred-return spelling of the same join reaches. A checker diagnostic at the `??` was
+  built and it closes all 16 cells with a positioned design message. It also takes **D210 from
+  `runs` to a check reject**, caught by `check-filed-witnesses.py --strict` in the gate and by
+  nothing else in the ladder. The checker cannot decide this: whether the union is
+  representable depends on whether a row with a boxed field exists, which is an EMITTER fact.
+
+* **WHAT THE EMITTER DID INSTEAD.** `collectAnonShapes` gives each owner literal its own row
+  with a MONOMORPHIC `r` (D391's `anonNestPolyPremint`), the map's value slot picks the first,
+  and the `??` default is then lowered against a row whose `r` targets `{c2:i32}` — so
+  `emitObj` reported the field `c2`, which the user never wrote. All 16 cells report exactly
+  `si=#anon0 want=c2 scode=0`.
+
+* **THE FIX MINTS THE ROW `Circle` WOULD HAVE BEEN.** `anonNestPolyUnionName` codes the
+  owner's field 16 over the declared union and suppresses D391's premint for it. Off
+  `./node_modules/.bin/wasm-dis`, the module is D210's shape:
+  `(type $0 (struct (field (mut (ref $3)))))` — ONE owner row — with
+  `(type $3 (struct (field i32) (field anyref)))` the union box, and the map's vals backing
+  `(array (mut (ref null $0)))` over that single row.
+
+* **THE JOIN GATE IS THE PRICE, AND ONLY ONE INSTRUMENT SEES IT.** Without
+  `anonPolyOwnersJoined` the same +36 lands, the distilled corpus reports `no runs lost`, and
+  `tests/cases/unions/anon-nested-arm-layout-polymorphic.vl` — D391's own landing test —
+  **stops building** (`emitProgram: field access receiver is not a struct` at `p.r.c2`):
+  1,970 buildable modules become 1,969. Two SEPARATE owners read monomorphically need their
+  own rows; a boxed field costs that read its receiver. A `??` is what makes the pair one
+  value, and that is the gate.
+
+* **THE TWO RUNGS ARE ONE LANDING AND EITHER ALONE MOVES ZERO.** Box coding with the premint
+  still firing: 0 cells move at all (the nested rows are minted and claim the literals).
+  Premint suppression without the box coding: 0 to `runs`, 16 cells merely swap one emit
+  reject for another. Both: +16.
+
+* **DELIBERATELY THE `??` AND NOT A GENERAL JOIN.** The other joiners — a two-destination list
+  literal, a function returning both arms — reach the design refusal or another open row, so
+  widening the gate would claim rows that are not this one's.
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
