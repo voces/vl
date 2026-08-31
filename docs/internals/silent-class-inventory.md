@@ -19915,12 +19915,21 @@ value at every admitted receiver rep).
 
 ---
 
-### D692 — `.length` and `for`-in on a value read OUT of a nested array: the receiver's floor speaks and the nesting is what is missing
-**LOUD EMIT REJECT — `emitProgram: unsupported for-in iterable` (4 cells) and `emitProgram:
-'.length' on a receiver the emitter cannot classify as a list, string, map or set` (1 cell) ·
-five cells: `a005050`, `a007809`, `a008457`, `b016590`, `b016591` · filed 2026-08-31 while
-closing D691, which owns the other seventeen of that message group · THE ROOT IS THE NESTED
-ARRAY and D691's fix moves none of these**
+### D692 — [CLOSED 2026-08-31] `.length` and `for`-in on a value read OUT of a nested array: the receiver's floor speaks and the nesting is what is missing
+**now RUNS, closed 2026-08-31 by D702 · was a loud emit reject — `emitProgram: unsupported
+for-in iterable` (4 cells) and `emitProgram: '.length' on a receiver the emitter cannot
+classify as a list, string, map or set` (1 cell) · five cells: `a005050`, `a007809`,
+`a008457`, `b016590`, `b016591` · filed 2026-08-31 while closing D691, which owns the other
+seventeen of that message group, and the filing's own diagnosis — THE ROOT IS THE NESTED
+ARRAY, D691's fix moves none of these — is what routed it correctly**
+
+**FILED BY ONE AGENT AND CLOSED BY ANOTHER, IN PARALLEL, AND THE GATE IS WHAT NOTICED.**
+D691's author measured that these five were not its family and said so rather than absorbing
+them; D702's author independently found the same five and said their cluster was really 8 + 5.
+Neither PR could see the other's tree, so both were correct in isolation and the row was stale
+the moment the second one landed. `check-filed-witnesses.py --strict` caught it on the merge
+(`D692 filed emit_reject, now runs`) — the behavioural half of the row discipline earning its
+place, since nothing else in the ladder grades a filed row against the tree.
 
 Repro:
 
