@@ -757,10 +757,14 @@ let argCstrWho: string[] = []
 // PRINTABILITY capability, deferred to the pin for exactly the reason the two tables above
 // defer the operator and the argument flow.
 //
-// `print` renders ONE scalar or string rep, and the two floors that say so — `tyPrintsAsRef`
-// and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S TYPE in the body. Inside a generic
-// that type is a hole (`T`, or the `?elem.T` a `x[0]` read derives), and a hole is neither a
-// ref nor a box, so both floors answer FALSE and the call is admitted. The emitter's print
+// `print` takes ONE value of `printDomainStr()`, and the two floors that say so —
+// `tyPrintsAsRef` and `tyPrintsAsUnionBox` — are asked of the ARGUMENT'S TYPE in the body.
+// They answer on DIFFERENT channels (a reference is outside the domain, `tErr`/D711; a
+// boxed value union is inside it and awaiting a tag dispatch, `tErrUnsupported`/D712) and
+// `validatePrintCstrs` carries that split to the pin.
+//
+// Inside a generic that type is a hole (`T`, or the `?elem.T` a `x[0]` read derives), and a
+// hole is neither a ref nor a box, so both floors answer FALSE and the call is admitted. The emitter's print
 // ladder is a run of POSITIVE tests ending in an unguarded `call __print_i32__`, so the
 // instance then handed a `(ref $t)` to an `(i32) -> ()` import: `vl check` rc 0 and a module
 // the engine refuses. `tyPrintsAsRef`'s own header used to claim the opposite —
@@ -980,6 +984,36 @@ const BM_IDXPHRASE = 8
 const BM_BYTEOFF = 9
 const BM_BOUNDS0 = 10
 const BM_BOUNDS1 = 11
+
+// DEFERRED RECEIVER-CLASSIFICATION constraints — the EIGHTH deferred table, and the one
+// D14's own close created. `checkMemberNode`'s `TyVar` arm admits `.length` on every type
+// variable and `checkIndexNode`'s admits `x[i]` on every type variable, both deliberately:
+// a `T` pinned to a list / string / map / set has both, and refusing them in the BODY
+// refuses the eight reps that work. What neither arm does is re-ask the question at the PIN,
+// where `T` is known — so `g<T>(x: T) { print(x.length) }` at `g(true)` is `vl check` rc 0
+// and the EMITTER is left holding it (`'.length' on a receiver the emitter cannot classify
+// as a list, string, map or set`), while the one-annotation-different direct spelling
+// `const v = true  print(v.length)` is a positioned `member access '.length' on non-object
+// boolean`. Clause 2 in the direction that hides: a lost REFUSAL, not a lost lowering.
+// (`silent-class-inventory` D651 prescribed exactly this table; D691 builds it and D14's
+// own `lengrid.py` prices it.)
+//
+// ONE TABLE FOR BOTH OPERATIONS, because they are one question — "can this receiver be
+// classified?" — asked at two spellings, and their two emit-side floors were two thirds of
+// one 22-cell cluster. `memCstrProp` carries the member name, or `OP_INDEX_GET` for the
+// index form, which is the language's own name for that operation and can never collide
+// with a property name (`.[]` does not parse).
+//
+// THE MESSAGE IS THE DIRECT SPELLING'S, IN ONE HOME. `memberFloorMsg` / `indexFloorMsg`
+// render every sentence the two arms raise and BOTH the arm and this pin call them, for
+// `letAssignMsg`'s reason: a second copy of a diagnostic is exactly the drift `checkBinary`
+// and `binOpDefinedFor` had (D492 / D493). Here the drift would be worse than cosmetic —
+// the whole argument for reporting at the pin is that the generic and the concrete
+// spellings are one annotation apart and must therefore be one sentence apart.
+let memCstrTy: i32[] = []
+let memCstrProp: string[] = []
+let memCstrIx: i32[] = []
+let memCstrFn: i32[] = []
 
 // SOLVED un-annotated parameter types — the parameter's own body USAGE, read back as
 // its type. A hole is permissively assignable both ways, so a usage that requires a
@@ -3214,6 +3248,10 @@ export function initChecker() {
   bmCstrFn = []
   bmCstrForm = []
   bmCstrLabel = []
+  memCstrTy = []
+  memCstrProp = []
+  memCstrIx = []
+  memCstrFn = []
   solvedParamTys = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -17265,6 +17303,122 @@ function bmArgOk(
   bmArgPred(form, got, want, argIx)
 }
 
+// THE MEMBER ARM'S OWN SENTENCE, for a receiver type that is not a hole: "" when `recv.prop`
+// is a legal read (or is deferred), otherwise the exact words `checkMemberNode` raises.
+//
+// MIRRORS THAT ARM ARM-FOR-ARM, in its order, and that is load-bearing rather than tidy: the
+// pin's whole soundness argument is that it can only refuse what the one-annotation-different
+// direct spelling already refuses, and the cheapest proof of that is that the two ask the
+// same `is` tests in the same sequence. A rep this function has never heard of — a brand, an
+// intersection, a literal — answers here exactly as it answers there, because neither one
+// enumerates it.
+//
+// The arms it does NOT mirror are the three `checkMemberNode` answers BEFORE the receiver's
+// type is known: the flat-layout fold, the narrowed-path overlay, and the `?`-hole shape
+// growth. All three are syntactic, all three return early, and a constraint is only recorded
+// on the path where none of them fired.
+function memberFloorMsg(objTy: i32, prop: string) {
+  if objTy < 0 { return "" }
+  const ot = T.tys[objTy]
+  if ot is TyObj {
+    if objFieldType(ot, prop) >= 0 { return "" }
+    return "no field '" + prop + "' on " + tyToStr(objTy)
+  }
+  if ot is TyErr { return "" }
+  if ot is TyUnion {
+    if sharedUnionFieldTy(ot, prop) >= 0 { return "" }
+    return "field '" +
+      prop +
+      "' is not on every member of " +
+      tyToStr(objTy) +
+      " — narrow with `is` first" +
+      unionFieldGapNote(ot, prop)
+  }
+  if ot is TyArray {
+    if prop == "length" { return "" }
+    return "no field '" + prop + "' on array " + tyToStr(objTy)
+  }
+  if ot is TyMap {
+    if prop == "length" { return "" }
+    if prop == "size" { return "" }
+    return "no field '" + prop + "' on map " + tyToStr(objTy)
+  }
+  if ot is TyPrim {
+    if ot.primName == "string" {
+      if prop == "length" { return "" }
+      return "no field '" + prop + "' on string"
+    }
+  }
+  if ot is TyVar { return "" }
+  "member access '." + prop + "' on non-object " + tyToStr(objTy)
+}
+
+// THE INDEX ARM'S OWN SENTENCE, on the same terms — "" when `recv[i]` resolves or defers,
+// otherwise `checkIndexNode`'s `cannot index non-array …`.
+//
+// The WRITE-ONLY operator case answers "" rather than borrowing that arm's sentence: its
+// diagnostic is about a missing DECLARATION, not about this receiver, and repeating it at a
+// call site the reader did not write it at would name the wrong file. Nothing is lost — the
+// body's own spelling of the same index still raises it.
+function indexFloorMsg(arrTy: i32) {
+  if arrTy < 0 { return "" }
+  if tyBuiltinIndexable(arrTy) { return "" }
+  if opIdxDeclared() {
+    if opIdxFnFor(OP_INDEX_GET, arrTy) != "" { return "" }
+    if opIdxFnFor(OP_INDEX_SET, arrTy) != "" { return "" }
+  }
+  const at = T.tys[arrTy]
+  if at is TyObj {
+    // The index TRAP, gated exactly as the arm gates it — a `"[]"` field that is a
+    // one-parameter function. A `"[]"` field of any other shape falls through there and
+    // must fall through here.
+    const trap = objFieldType(at, OP_INDEX_GET)
+    if trap >= 0 {
+      const tt = T.tys[trap]
+      if tt is TyFunc {
+        if tt.fnParamTypes.length == 1 { return "" }
+      }
+    }
+  }
+  "cannot index non-array " + tyToStr(arrTy)
+}
+
+// `memberFloorMsg` / `indexFloorMsg` in one call, keyed the way the table stores the
+// operation: `OP_INDEX_GET` is the index form, anything else is that member name.
+function memCstrMsg(recv: i32, prop: string) {
+  if prop == OP_INDEX_GET { return indexFloorMsg(recv) }
+  memberFloorMsg(recv, prop)
+}
+
+// Record a deferred RECEIVER-CLASSIFICATION constraint when the receiver still carries a
+// hole — the body cannot decide whether `T` is a collection, so the generic call site re-asks
+// it under substitution. Stamped with the OWNING declaration for `noteBinCstr`'s reason:
+// `substTyDeep` matches TyVars by NAME, so an unowned list would let one generic's `.length`
+// adjudicate a sibling's call.
+//
+// `tyHasHole`, NOT `tyIsHole`, for `notePrintCstr`'s measured reason: the bare-`T` receiver
+// IS a hole, but `x[0].length` inside `g<T>(x: T[])` reads through an `?elem.T` whose base is
+// one, and a `T | null` / `{v: T}` receiver is a CONSTRUCTOR over one. All of them substitute
+// to a concrete rep at the pin and none of them IS a `TyVar`.
+function noteMemCstr(recv: i32, prop: string, ix: i32) {
+  if recv < 0 { return 0 }
+  if tyHasHole(recv) {
+    const owner = cstrOwnerTop()
+    let k = 0
+    while k < memCstrTy.length {
+      if memCstrTy[k] == recv && memCstrProp[k] == prop {
+        if memCstrFn[k] == owner { return 0 }
+      }
+      k = k + 1
+    }
+    memCstrTy.push(recv)
+    memCstrProp.push(prop)
+    memCstrIx.push(ix)
+    memCstrFn.push(owner)
+  }
+  0
+}
+
 // THE INTEGER-ONLY OPERATORS — the bitwise ops, the shifts, and `%`. ONE list, read by
 // `checkBinary`'s reject and by `binOpDefinedFor`'s pin mirror, because those are the two
 // homes that have to agree about it and they drifted apart precisely by holding the list
@@ -17570,22 +17724,32 @@ function validatePrintCstrs(
         }
       }
       if !tyHasHole(cpt) {
+        // The two floors answer on DIFFERENT channels, and the pin has to carry that split
+        // or the generic spelling stops being the direct spelling's own sentence. A boxed
+        // value union is an emitter-capability admission (`tErrUnsupported`,
+        // `unsupported-lowering`): every arm is inside `print`'s domain and only the tag
+        // dispatch is missing (D712). A reference is a DOMAIN rejection (`tErr`, no code):
+        // the value is not one of `printDomainStr()`'s reps at all (D711).
         let pMsg = ""
+        let pUnsup = false
         if tyPrintsAsUnionBox(cpt) {
           pMsg = "print of a union value (" +
             tyToStr(cpt) +
             ") is type-valid but not yet supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`"
+          pUnsup = true
         } else if tyPrintsAsRef(cpt, 24) {
-          pMsg = "print of " +
-            tyToStr(cpt) +
-            " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`"
+          pMsg = printRefRefusal(cpt)
         }
         if pMsg != "" {
           let pWho = "a type parameter is printed here: "
           if who != "" {
             pWho = "`" + who + "` prints its type parameter here: "
           }
-          tErrUnsupported(pWho + pMsg, ix)
+          if pUnsup {
+            tErrUnsupported(pWho + pMsg, ix)
+          } else {
+            tErr(pWho + pMsg, ix)
+          }
         }
       }
     }
@@ -18196,6 +18360,62 @@ function validateBmCstrs(
                 " at the call's argument types)",
               ix,
             )
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Do the deferred RECEIVER-CLASSIFICATION constraints this binding resolves hold? The eighth
+// table's pin — see `memCstrTy`'s header for why the two arms cannot decide it in the body.
+// (`silent-class-inventory` D651 / D691.)
+//
+// RE-DEFERRAL, exactly as in `validateBmCstrs`: a receiver whose hole substituted to ANOTHER
+// hole (a generic body relaying into a second generic) is re-recorded under the CALLER's hole,
+// or nothing re-asks it when the OUTER call finally pins that one. Re-recorded only when the
+// callee is NAMED, for `validateBinCstrs`' reason: a re-record stamps a new owner and a call
+// that cannot name its callee has no standing to reassign ownership.
+//
+// THE INDEX FORM DEFERS TO THE ARGUMENT-FLOW GATE where that gate already speaks, and the
+// predicate is its own: `holeIsArrayDemanded` + `tyRefusesArrayDemand` in the call's argument
+// loop reports `argument 1: expected an array, got i32` for a scalar and the i32-key ambiguity
+// sentence for a map, several lines before this runs. Both messages are true and only one
+// should be printed — `validateEscJoins`' fallback rule, at a different seam. What this leaves
+// UNCOVERED is a receiver that is not the bare parameter (`g<T>(x: T[]) { print(x[0][0]) }` at
+// a scalar element): the argument gate cannot see it either, so that cell stays exactly as it
+// is today. BOUND, stated rather than discovered later; no cell of `lengrid.py`, of the
+// distilled corpus or of `tests/cases` reaches it.
+function validateMemCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigM = memCstrTy.length
+  let ci = 0
+  while ci < nOrigM {
+    if cstrOwnedBy(memCstrFn[ci], calleeFn) {
+      const mr = substTyDeep(memCstrTy[ci], bNames, bTys)
+      if calleeFn >= 0 {
+        if mr != memCstrTy[ci] {
+          if tyHasHole(mr) { noteMemCstr(mr, memCstrProp[ci], memCstrIx[ci]) }
+        }
+      }
+      if !tyHasHole(mr) {
+        let skip = false
+        if memCstrProp[ci] == OP_INDEX_GET {
+          if tyRefusesArrayDemand(mr) { skip = true }
+        }
+        if !skip {
+          const mMsg = memCstrMsg(mr, memCstrProp[ci])
+          if mMsg != "" {
+            let mWho = "the callee's body"
+            if who != "" { mWho = "the body of `" + who + "`" }
+            tErr(mMsg + " (" + mWho + " at the call's argument types)", ix)
           }
         }
       }
@@ -19541,6 +19761,16 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        // And the RECEIVER CLASSIFICATION of a `.length` / `x[i]` inside the body, at the
+        // UFCS half for the reason the five above are here: `p.g()` and `g(p)` are the same
+        // call and must answer the same way. (`silent-class-inventory` D651 / D691.)
+        validateMemCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
       }
     }
     if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
@@ -20354,19 +20584,14 @@ function checkCallNode(n: Call, ix: i32) {
             pargs[pj],
           )
         }
-        // The SAME rule for the other reps `print` has no import for: an array, a
-        // struct, a map/set, a function value, and any of those behind `| null`.
-        // The emitter's print ladder ends in an unguarded `call __print_i32__`, so
-        // each of these handed a `(ref $t)` to an `(i32) -> ()` import and the module
-        // failed to VALIDATE — while `vl check` reported the program clean.
-        if tyPrintsAsRef(pt, 24) {
-          tErrUnsupported(
-            "print of " +
-              tyToStr(pt) +
-              " is type-valid but not yet supported by codegen — `print` renders one scalar or string; print the elements/fields individually, e.g. `print(xs[0])`",
-            pargs[pj],
-          )
-        }
+        // A DOMAIN rejection, and NOT the capability channel above it. `print` takes one
+        // value of `printDomainStr()`; an array, a struct, a map/set, a function value, or
+        // any of those behind `| null` is not one, and `tErr` (no `unsupported-lowering`
+        // code) is what says so — the same shape as `toString expects an i32 or boolean,
+        // got string`. The language has never defined what `print([1, 2, 3])` OUTPUTS, so
+        // there is no lowering to be missing; `tyPrintsAsRef`'s header carries the
+        // measurement and `silent-class-inventory` D711 the ruling.
+        if tyPrintsAsRef(pt, 24) { tErr(printRefRefusal(pt), pargs[pj]) }
         // A printed type that still carries a HOLE answers FALSE to both floors above — it
         // is neither a ref nor a box YET — so the two of them together admit every generic
         // `print`. Defer it to the pin, the only position that knows the instance.
@@ -20772,6 +20997,11 @@ function checkCallNode(n: Call, ix: i32) {
       // `FuncDecl`, so its own arm is the whole check and under a hole that arm is vacuous.
       // (`silent-class-inventory` D582.)
       validateBmCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+      // And the RECEIVER CLASSIFICATION of a `.length` / `x[i]` inside the body, for the
+      // reason `memCstrTy`'s header gives: both arms ADMIT the operation on a type variable
+      // — correctly, since a `T` pinned to a collection has it — and this is the first
+      // position that knows which rep `T` became. (`silent-class-inventory` D651 / D691.)
+      validateMemCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
       // The escaped-join reject is the FALLBACK, not an additional voice: when this
       // same site already reported a precise operand/argument-flow diagnostic, that
       // one names the actual mismatch and the join report would only repeat it in
@@ -24489,16 +24719,55 @@ function tyPrintsAsUnionBox(pt: i32) {
   ok
 }
 
-// Whether `print(x)` would be handed a WasmGC REFERENCE the scalar print imports cannot
-// take. `print` renders ONE scalar/string rep (the union gate above says the same thing
-// about a box); the emitter's print ladder is a run of POSITIVE tests ending in an
-// unguarded `call __print_i32__`, so every value whose rep is a reference — an array, a
-// struct, a map/set, a function value, a union carrying one of those, and any of them
-// behind `| null` — was handed to an `(i32) -> ()` import with a `(ref $t)` on the stack.
-// The module then failed to VALIDATE ("expected i32, found (ref $type)") while `vl check`
-// reported the program clean. `driver.builtinScan` publishes `print`'s accepted set as
-// `(i32 | i64 | f32 | f64 | boolean | string) -> void`; this is the gate that makes that
-// string true.
+// `print`'s DOMAIN, spelled once. `driver.builtinScan` renders the LSP completion detail
+// from this (`(<domain>) => void`) and `tyPrintsAsRef`'s refusal quotes it, so the type the
+// compiler advertises and the type it enforces cannot drift into two answers — which is
+// what the hand-written completion string next to a hand-written message invited.
+export function printDomainStr(): string {
+  "i32 | i64 | f32 | f64 | boolean | string"
+}
+
+// The DOMAIN refusal `tyPrintsAsRef` raises, written once so the direct spelling and the
+// generic pin cannot say it differently. Named type first (the subject the reader wrote),
+// then the domain, then the workaround after an em dash — `tErrUnsupported`'s message
+// convention, kept even though this is no longer that channel.
+function printRefRefusal(pt: i32): string {
+  "print expects one scalar or string value (" +
+    printDomainStr() +
+    "), got " +
+    tyToStr(pt) +
+    " — print the elements or fields individually, e.g. `print(xs[0])`"
+}
+
+// Whether `x` is OUTSIDE `print`'s domain by being a WasmGC REFERENCE: an array, a struct,
+// a map/set, a function value, a union carrying one of those, and any of them behind
+// `| null`. `print` takes ONE value of `printDomainStr()` and renders it through the
+// host's per-rep `__print_*__` sink; a container is not one of those reps.
+//
+// THIS IS A DOMAIN RULE, NOT A LOWERING GAP, and the distinction is measured rather than
+// asserted (`silent-class-inventory` D711). With both refusal sites lifted, all 19 corpus
+// cells become check-clean INVALID WASM and **not one runs**: disassembled, the emitter
+// falls through its ladder of positive rep tests to `call $fimport$0` — `__print_i32__`,
+// an `(i32) -> ()` import — with a `(ref $1)` on the stack. There is no partial lowering
+// to finish. What is missing is not a rep the emitter has yet to learn (a container's rep
+// is a perfectly ordinary `(ref $t)`) but a RENDERING the language has never defined:
+// separators, brackets, how a nested string quotes, a map's key order, what a closure
+// prints as, and — decisively — a guest-side f64 formatter, since a container must render
+// through the `__print_char__` stream while `print(1.5)` renders HOST-side, so `print(x)`
+// and `print([x])` would disagree on the same float unless somebody writes shortest
+// round-trip in emitted wasm. `std:fmt`'s header already declines that work in the other
+// direction ("f64→string … deliberately absent — `print` keeps covering floats").
+//
+// So this refuses on the plain `tErr` channel, in `toString`'s words — `toString expects an
+// i32 or boolean, got string` — and NOT on `tErrUnsupported`. The earlier verdict
+// (`destringify-types-program.md`, reason 4) put it on the capability channel because
+// "`print` has no declared type … so this cannot be an ordinary assignability error"; the
+// tree refutes that one builtin over, and `printDomainStr` is now the declared type.
+//
+// The SIBLING gate `tyPrintsAsUnionBox` is a genuine capability gap and deliberately keeps
+// its concession: every arm of `i32 | string` is INSIDE the domain, so the missing piece is
+// a runtime tag dispatch the emitter already performs for `is`. One landing moves neither
+// of the other's cells (D712).
 //
 // `string` is deliberately NOT here: it is a reference too, but the ladder routes it to
 // the string streaming printer. Nor is a LITERAL union (i32/string atoms widened to their
@@ -32833,7 +33102,7 @@ function checkMemberNode(n: Member, ix: i32) {
   if ot is TyObj {
     const ft = objFieldType(ot, n.memProp)
     if ft < 0 {
-      tErr("no field '" + n.memProp + "' on " + tyToStr(objTy), ix)
+      tErr(memberFloorMsg(objTy, n.memProp), ix)
       return TY_ERR
     }
     return symMem(ix, ft)
@@ -32854,21 +33123,13 @@ function checkMemberNode(n: Member, ix: i32) {
     // inline shapes that is the whole work of the diagnostic. The offending member is a
     // per-member fact this seam already has; the JOIN failure (every member HAS the field,
     // at reps that do not join) is NOT, and it correctly appends nothing.
-    tErr(
-      "field '" +
-        n.memProp +
-        "' is not on every member of " +
-        tyToStr(objTy) +
-        " — narrow with `is` first" +
-        unionFieldGapNote(ot, n.memProp),
-      ix,
-    )
+    tErr(memberFloorMsg(objTy, n.memProp), ix)
     return TY_ERR
   }
   // `.length` on an array, a map, or a string is an i32.
   if ot is TyArray {
     if n.memProp == "length" { return symMem(ix, TY_I32) }
-    tErr("no field '" + n.memProp + "' on array " + tyToStr(objTy), ix)
+    tErr(memberFloorMsg(objTy, n.memProp), ix)
     return TY_ERR
   }
   if ot is TyMap {
@@ -32876,13 +33137,13 @@ function checkMemberNode(n: Member, ix: i32) {
     // JS Map/Set name, `.length` the list-consistent alias; both read the same field.
     if n.memProp == "length" { return symMem(ix, TY_I32) }
     if n.memProp == "size" { return symMem(ix, TY_I32) }
-    tErr("no field '" + n.memProp + "' on map " + tyToStr(objTy), ix)
+    tErr(memberFloorMsg(objTy, n.memProp), ix)
     return TY_ERR
   }
   if ot is TyPrim {
     if ot.primName == "string" {
       if n.memProp == "length" { return symMem(ix, TY_I32) }
-      tErr("no field '" + n.memProp + "' on string", ix)
+      tErr(memberFloorMsg(objTy, n.memProp), ix)
       return TY_ERR
     }
   }
@@ -32894,7 +33155,16 @@ function checkMemberNode(n: Member, ix: i32) {
     // D14-L: `.length` on a DECLARED type parameter, admitted the way the `?`-hole below
     // already admits it and the way `checkIndexNode`'s `TyVar` arm already admits `x[i]`
     // for EVERY type variable — see that row for the grid.
-    if n.memProp == "length" { return symMem(ix, TY_I32) }
+    //
+    // ADMITTED HERE AND RE-ASKED AT THE PIN (D691). The admission is right — eight of the
+    // fifteen reps D14 priced have a `.length` and refusing them in the body refuses the
+    // programs that work — but it is only half an answer: the other seven have none, and
+    // without the constraint they reach the emitter, whose floor can name a rep it cannot
+    // classify and not a rule the language has. `memCstrTy`'s header has the whole shape.
+    if n.memProp == "length" {
+      noteMemCstr(objTy, n.memProp, ix)
+      return symMem(ix, TY_I32)
+    }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
         // `.length` is the i32 length an array / string / map exposes — treat it as that
@@ -32905,7 +33175,7 @@ function checkMemberNode(n: Member, ix: i32) {
       }
     }
   }
-  tErr("member access '." + n.memProp + "' on non-object " + tyToStr(objTy), ix)
+  tErr(memberFloorMsg(objTy, n.memProp), ix)
   return TY_ERR
 }
 // ── array literal ───────────────────────────────────────────────────────────
@@ -33004,6 +33274,12 @@ function checkIndexNode(n: Index, ix: i32) {
       tErr("array index must be i32, got " + tyToStr(idxTy), ix)
     }
     noteArrayDemand(at.tvName)
+    // ADMITTED HERE AND RE-ASKED AT THE PIN (D691), for the reason `checkMemberNode`'s
+    // `TyVar` arm states: `noteArrayDemand` only reaches a receiver that IS a bound
+    // parameter, and only refuses the scalars and maps `tyRefusesArrayDemand` names — a
+    // record, a nullable, a function or a union pinned into `T` reaches the emitter's
+    // `index receiver is not an array or string` with no rule behind it.
+    noteMemCstr(arrTy, OP_INDEX_GET, ix)
     return mkDerivedHole(HD_ELEM, "", -1, -1, arrTy)
   }
   // FREE INDEX OPERATOR (B14): `x[i]` on a receiver the LANGUAGE does not index
@@ -33076,7 +33352,7 @@ function checkIndexNode(n: Index, ix: i32) {
         }
       }
     }
-    tErr("cannot index non-array " + tyToStr(arrTy), ix)
+    tErr(indexFloorMsg(arrTy), ix)
     return TY_ERR
   }
   if !assignable(idxTy, TY_I32) {
@@ -33096,7 +33372,7 @@ function checkIndexNode(n: Index, ix: i32) {
   if at is TyPrim {
     if at.primName == "string" { return TY_I32 }
   }
-  tErr("cannot index non-array " + tyToStr(arrTy), ix)
+  tErr(indexFloorMsg(arrTy), ix)
   return TY_ERR
 }
 // ── object literal ──────────────────────────────────────────────────────────

@@ -18947,13 +18947,15 @@ Repro (`scripts/capability-probes/width-subtyping.vl`, verbatim — now `runs`):
 
 ---
 
-### D641 — an un-annotated generic STRUCT return whose shape is ANONYMOUS: the row is interned, and the resolver that names it indexes DECLARED rows only
-**check-clean invalid wasm · found 2026-08-30 while closing D592's struct arm, as the exact
-residue that arm's `no row, no mint` decline leaves · it is D592's witness with the argument's
-`type V` deleted, and the DECLARED spelling of the same program runs · the widening that would
-close it was built, measured and REFUSED, and the refusal is priced below**
+### D641 — [CLOSED 2026-08-31] an un-annotated generic STRUCT return whose shape is ANONYMOUS: the pin re-checked as `{}`, and the resolver that names the row indexed DECLARED rows only
+**now RUNS and prints `7`, closed 2026-08-31 by #2046 (D681) · was `check-clean invalid wasm` ·
+found 2026-08-30 while closing D592's struct arm, as the exact residue that arm's
+`no row, no mint` decline leaves · TWO rungs, and **either alone moves ZERO cells** ·
+the filed mechanism was HALF the defect and the filed "what would have to be true" is
+REFUTED by measurement · the refused spelling-match widening was re-measured on today's
+master and STILL HOLDS, pinned as `distilled/named/d681_refused_spelling_pin.vl`**
 
-Repro:
+Repro (now `runs`):
 
     function g<T>(self: T) {
       const xs: T[] = [self]
@@ -18961,45 +18963,86 @@ Repro:
     }
     const z = g({ x: 7 })
     print(z.x)
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 309: type mismatch:
-    //   expected i32, found (ref $type)
-    // SHOULD PRINT 7
+    // 7
 
-* **ONE TOKEN SEPARATES IT FROM A PROGRAM THAT RUNS, AND IT IS NOT THE RETURN ANNOTATION.**
-  Declare the ARGUMENT (`type V = { x: i32 }` + `const p: V = { x: 7 }`) and this is
-  `d592_elem_obj_plain_infer`, which runs since #2038. Declare the RETURN (`g<T>(self: T): T`)
-  and the anonymous spelling runs too. So neither the body nor the shape is the obstacle: what
-  is missing is a NAME the emitter's shape table answers to.
+* **THE FILED MECHANISM NAMED THE SECOND RUNG AND MISSED THE FIRST, AND THE PROBE SAYS SO IN
+  TWO NUMBERS.** The row said `repSlotOfTy` indexes `sRowDecl == 1` rows only, so the
+  `#anon0` row the emitter interned is unnameable. That is true and it is not sufficient.
+  Instrumenting `monoRetRowName` on this witness prints
+  `ty=57 slotOfTy=-1 canon=3 str={} [0:#anon0 tyIx=52 decl=0 canon=5 str={x: i32}]` —
+  the arena type the monomorphizer asks about is **57, rendering `{}`**, while `#anon0`'s own
+  row is **52, rendering `{x: i32}`**. They are not the same type and not even the same
+  SHAPE, so **no resolver keyed on a row could ever have matched**, declared-gate or not.
+  That is why the row's own "what would have to be true" — an anonymous-row resolver keyed on
+  the ARENA type — was necessary and would have changed nothing on its own: measured, R2
+  alone moves 0 cells.
 
-* **THE ROW EXISTS — IT IS THE RESOLVER THAT DOES NOT REACH IT.** `collectAnonShapes` interns
-  `{x: 7}`'s field set as `#anon0`, so the module already holds the struct this return needs.
-  D592's struct arm mints the name of the row `repSlotOfTy` resolves, and `repSlotCacheSync`
-  builds that index over rows with `sRowDecl[si] == 1` — DECLARED rows only. An anonymous row
-  is therefore invisible to it, the arm declines, and `nret` stays -1 exactly as before.
-  Counter probe on this witness: `objAsk=1 objName=1 row=0 mint=0 decline=1` — the arm is
-  asked, it decides the type, and the lookup is the rung that says no.
+* **WHERE THE `{}` COMES FROM, WHICH IS ONE PASS EARLIER AND IN THE PIN.** `monoMakeInstance`
+  banks each parameter's pin as an arena index in `pinnedTyIx`, resolved from the pin's NAME.
+  The pin name here is `#anon0`, an emitter handle the checker's annotation grammar cannot
+  parse: `nameToTy("#anon0")` is -1 and `recordClonedNodeTyFb` records the coarse
+  `objPinTyIx()` placeholder — a field-less `TyObj`. `monoInferRetExprTy` then `declare`s
+  `self: {}` and binds `T := {}`, so `const xs: T[]; return xs[0]` re-checks to `{}`,
+  `monoRetRowName` is handed `{}`, and D592's arm declines. `nret` stays -1, the functype
+  result falls to `retAnnKindChain`'s `"i32"` seed, and the body pushes a `(ref $type)`.
 
-* **THE OBVIOUS WIDENING IS REFUSED, AND ITS PRICE IS A `runs` CELL — the veto the gate does
-  apply.** Falling back to `structIndexOfTypeName` (the name-keyed field-set matcher, which
-  DOES reach `#anonN`) was built and graded: it does **not** fix this witness, and it moves
-  `tests/cases/functions/structural-generic.vl` from `runs` to **check-clean invalid wasm**.
-  That module's `addx` instantiates at i32 and at f64; both instances re-check to
-  `{x: <error>}` (an un-pinnable parameter binds to `TY_ERR`), the printed spelling matches the
-  i32 row for BOTH, and the module validates as `expected i32, found f64`. A matcher keyed on a
-  printed spelling cannot tell two instances of one generic apart, which is the same
-  "structural identity is not layout identity" its own header warns about — defeated here by
-  the error-typed field its type guard cannot compare.
+* **THE FIX IS TWO RUNGS AND EITHER ALONE MOVES NOTHING** — the shape `CLAUDE.md` warns about
+  under "two rungs can be one landing".
+  · **R1** (`anonHandleTyIx`, consumed in `monoMakeInstance`'s clone loop): an ANON pin's
+    entry in `pinnedTyIx` is its ROW's arena type, not the placeholder's. Keyed on the NAME
+    (`#anonN` → its struct-table row → that row's D0 `sTyIx`), because the instance registry
+    is keyed on `pinned` alone and a pin type sourced from anywhere the key cannot see makes
+    the instance a function of something two call sites can disagree about.
+  · **R2** (`sAnonRowByTy`, consumed in `monoRetRowName`): the anonymous row whose `sTyIx`
+    IS the queried arena type. NOMINAL — the same exact-index identity `repSlotOfTyDecl`
+    uses — with the `sRowDecl` gate replaced by its complement, and layered on top of
+    `repSlotOfTy` rather than inside it, so the declared-twin BRIDGE's buckets are untouched.
+  · Measured: R1 alone **0 cells**, R2 alone **0 cells**, R1+R2 **the cell runs**. Corpus
+    byte-identity is `0 DIFFER · 0 LOST` at every rung and at the pair.
 
-* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** An anonymous-row resolver keyed on the ARENA type
-  rather than on a printed spelling — the same nominal `sTyIx[si] == ty` identity
-  `repSlotOfTyDecl` already uses, with the `sRowDecl` gate dropped and the `#anonN` rows'
-  `sTyIx` shown to be populated and distinct per instance. Two things must be measured before
-  it ships, because the refused candidate failed both: `functions/structural-generic.vl`,
-  `index/generic-trap.vl`, `objects/self-method.vl` and `objects/operator-self-method.vl` must
-  keep building (`joingrid.py --refused`), and a `TyErr`-carrying shape must not resolve onto a
-  declared row — under a resolver that admits one, D592's deleted `tyHasErr` concreteness gate
-  stops being redundant and comes back with it.
+* **R1 IS NOT `recordClonedNodeTyFb`'s REFUSED ANON ARM, AND THE COUNTER SAYS WHICH ONE IS
+  WHICH.** That function's header records a measured refusal: recording the handed arena type
+  for a `PIN_ANON` node turned five `tests/cases/inference/hole-*` chains from running into
+  `struct.get expected (ref null 0)`. That refusal is about the annotation NODE's `nodeTyIx`
+  sidecar, which the hole-rebase machinery reads and deliberately leaves open. R1 writes
+  `pinnedTyIx` — a local column of the monomorphizer — and never touches `nodeTyIx`. The
+  counter probe over `tests/cases` + `std`: R1 is **reached 1,418 times over 219 modules and
+  ANSWERS 68 times over 14**, and those 14 include all five `hole-*` chains plus
+  `structural-generic.vl`, `self-method.vl` and `operator-self-method.vl` — every one still
+  building, still running, byte-identical.
+
+* **THE REFUSED SPELLING-MATCH WIDENING WAS RE-BUILT AND RE-MEASURED ON TODAY'S MASTER, AND
+  IT STILL FAILS THE SAME WAY.** Falling back to `structIndexOfTypeName` (the name-keyed
+  field-set matcher, which does reach `#anonN`) does NOT fix this witness and moves
+  `tests/cases/functions/structural-generic.vl` from `runs` to check-clean invalid wasm at
+  `addx$1`, `expected i32, found f64` — the exact filed price. D622 part 1's canonical field
+  order did not cheapen it, and D592's row's guess that it might is answered: no. The reason
+  is unchanged — `addx` instantiates at i32 and at f64, both instances re-check to
+  `{x: <error>}`, both print the same text, both match the i32 row. **R2 is not that
+  candidate**: an exact arena index cannot collide two instances that mint two rows. The
+  module is carried as a REFUTATION PIN in `distilled/named/d681_refused_spelling_pin.vl` so
+  the seven-second gate holds the price, not only `deno task test`.
+
+* **THE FAMILY IS TWO WITNESSES, ABLATED, NOT ONE MESSAGE.** One ingredient at a time,
+  measured on both seeds — `{ x: 7 }` anonymous is the ONLY ingredient the defect needs that
+  the corpus cell already had:
+
+  | ingredient changed | master | after |
+  |---|---|---|
+  | — (the filed witness) | check-clean invalid wasm | **runs** |
+  | argument DECLARED (`type V`) | runs | runs |
+  | return annotated `: T` | runs | runs |
+  | no `T[]` local (`return self`) | runs | runs |
+  | scalar argument (`g("s")`) | runs | runs |
+  | **two-field anonymous shape** | **check-clean invalid wasm** | **runs** |
+
+  The last row is a second member the derived corpus has no axis to have generated; it is
+  filed as `distilled/named/d681_anon_two_field.vl`.
+
+* Disassembly (`wasm-dis` 130) is one line of the module: `(type $7 (func (param (ref $0))
+  (result i32)))` becomes `(result (ref $0))`.
+
+---
 
 ### D661 — [CLOSED 2026-08-30] the destination scan matched a NAME over the whole arena, so two bindings that only share a name read as one binding with two destinations
 **now RUNS, closed 2026-08-30 · the witness was a positioned emit reject carrying D411's
@@ -19132,12 +19175,13 @@ Repro (now runs, printing `1` then `7`):
 
 ---
 
-### D661A — a captured binding's destination lives in the NESTED frame, and the three destination forms that resolve through `fnIx` cannot see it there
-**check-clean invalid wasm · found 2026-08-30 closing D661, as the exact residue its scoped
-walk enters but cannot answer · 3 of the 7 destination spellings, and the 3 are exactly the 3
-that read `fnIx` · unmoved by D661 in either direction, and identical on both seeds**
+### D661A — [CLOSED 2026-08-31] a captured binding's destination lives in the NESTED frame, and the three destination forms that resolve through `fnIx` could not see it there
+**all three now RUN and print `1`, closed 2026-08-31 by #2046 (D681) · was `check-clean invalid
+wasm` · found 2026-08-30 closing D661, as the exact residue its scoped walk enters but could
+not answer · 3 of the 7 destination spellings, and the 3 are exactly the 3 that read `fnIx` ·
+ONE rung, and the four forms that already ran are BYTE-IDENTICAL**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -19151,40 +19195,51 @@ Repro:
       print(rrU.length)
     }
     outer()
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 308: type mismatch:
-    //   expected (ref $type), found (ref $type)
-    // SHOULD PRINT 1
+    // 1
 
-* **THE ABLATION IS THE FORM AXIS, AND IT IS THREE OF SEVEN.** D661's walk enters `inner` (that
-  is rung 5, and without it four MORE cells break), so the destination node IS visited. What
-  fails is resolving it. Over the seven spellings, with the destination moved into a nested
-  frame: `bind`, `listlist`, `callarg` and `structfield` **run**; `ret`, `assign` and
-  `mapstore` are check-clean invalid wasm. The four that work read their answer off the
-  destination NODE — an annotation, a callee's parameter, a struct field. The three that fail
-  route through `fnIx`: `ret` reads `P.nodes[fnIx].fnRet`, `assign` calls
+* **THE ABLATION IS THE FORM AXIS, AND IT WAS THREE OF SEVEN.** D661's walk enters `inner`
+  (that is rung 5, and without it four MORE cells break), so the destination node WAS
+  visited. What failed was resolving it. Over the seven spellings, with the destination moved
+  into a nested frame: `bind`, `listlist`, `callarg` and `structfield` ran; `ret`, `assign`
+  and `mapstore` were check-clean invalid wasm. The four that work read their answer off the
+  destination NODE — an annotation, a callee's parameter, a struct field. The three that
+  failed route through `fnIx`: `ret` reads `P.nodes[fnIx].fnRet`, `assign` calls
   `destLetOf(name, fnIx)`, `mapstore` calls `mapValKindListSlot(name, fnIx, want)`. `fnIx` is
-  the binding's OWN frame (`outer`), and the destination is in `inner`, so all three ask the
-  wrong function and answer -1.
+  the binding's OWN frame (`outer`), the destination is in `inner`, so all three asked the
+  wrong function and answered -1.
 
-* **NOT A MESSAGE FAMILY.** All three print `type mismatch: expected (ref $type), found (ref
-  $type)`, which is the sentence `CLAUDE.md` names as meaning nothing on its own. What groups
-  them is the ablation above — the same three forms, moved one frame in, and the four others
-  moved the same way keep running.
+* **NOT A MESSAGE FAMILY.** All three printed `type mismatch: expected (ref $type), found
+  (ref $type)`, which is the sentence `CLAUDE.md` names as meaning nothing on its own. What
+  groups them is the ablation above — the same three forms, moved one frame in, and the four
+  others moved the same way kept running. The greedy minimiser reduces each to the same
+  three ingredients: the union declaration, the un-annotated capture in `outer`, and the one
+  destination spelling in `inner`; the call and the `print` fall away, because the defect is
+  in the DECLARATION's emission.
 
-* **HOISTING THE DESTINATION IS THE CONTROL AND IT RUNS.** `d661_ctl_ret__u` is this program
-  with `inner` deleted and the `return` in `outer`; it runs on both seeds. So neither the
-  spelling nor the capture alone is the defect — it is the pair.
+* **THE FIX IS THE FRAME THE WALK ALREADY HELD.** `dsScopeWalk` takes one extra local:
+  descending into a nested `FuncDecl` sets `frame = ix`, and `frame` — not `fnIx` — is what
+  `dsDestSlotAt` and the recursion receive. The nested `FuncDecl` is the node the walk just
+  ran `dsRebindsName` on, so nothing new is computed. The whole-arena fallback (a binding
+  whose scope `dsScopeRootOf` cannot name) is deliberately unchanged: it never descended in
+  the first place.
 
-* Its three cells are in `distilled/named/` as `d661_cap_{ret,assign,mapstore}` and are three
-  of the four clause-1 cells the scoreboard now shows. **They are pre-existing and were silent
-  on master too**; what changed is that the corpus has a program for them.
+* **NOTHING ELSE IN THE TREE ASKS THE QUESTION.** Counter probe over `tests/cases` + `std`:
+  the frame moves **54,815 times across 20 modules**, and a destination is resolved under a
+  moved frame **0 times** — so the rung is a pure widening on that population, and corpus
+  byte-identity is `2,437 modules · 1,984 identical · 0 DIFFER · 0 LOST`. On each of the
+  seven `d661_cap_*` cells the moved frame answers 4 times.
 
-* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The three forms need the frame the DESTINATION
-  lives in, not the frame the binding lives in. `dsScopeWalk` already knows it — it is the
-  nested `FuncDecl` it just descended through — so the fix is to thread that frame down to
-  `dsDestSlotAt` instead of passing `fnIx` unchanged, and to prove on the grid that the four
-  working forms are untouched by it.
+* **HOISTING THE DESTINATION WAS THE CONTROL AND IT STILL RUNS.** `d661_ctl_ret__u` is this
+  program with `inner` deleted and the `return` in `outer`; it ran on both seeds and runs now.
+
+* Disassembly (`wasm-dis` 130) shows the element row correcting: the captured literal was
+  built as a plain-struct element list (`struct.new $5` over `array.new_fixed $4` of
+  `struct.new $1`) against `inner`'s union-box return `(ref $7)`, and is now built as
+  `struct.new $7` over `array.new_fixed $6` of the boxed arm `struct.new $3 (i32.const 0) …`.
+
+* Its three cells are `distilled/named/d661_cap_{ret,assign,mapstore}` and were three of the
+  four clause-1 cells the scoreboard showed. With D641 they were the whole of clause 1's
+  corpus remainder: `goal-scoreboard.py` reads **clause 1 = 0** since this landing.
 
 ---
 
@@ -19257,6 +19312,45 @@ Repro:
   The census has no two-annotated-container-types cell, so `goal-scoreboard.py` scores this
   family at zero. It is a hand-written probe's worth of work to change that and none will
   arrive on its own.
+
+---
+
+### D681 — [CLOSED 2026-08-31 on landing] the residue register for clause 1's last four cells, and what is still open beneath them
+**runs today and must keep running · no live defect of its own · filed as the owner of the
+two named cells D681's landing produced and of the one clause-1 witness it did NOT close ·
+the row exists so the next person does not re-pay a price this one measured**
+
+Repro (runs today and must keep running):
+
+    function g<T>(self: T) {
+      const xs: T[] = [self]
+      return xs[0]
+    }
+    const z = g({ x: 7, y: "a" })
+    print(z.y)
+    // a
+
+* **WHAT LANDED.** Three rungs closing D661A (one rung) and D641 (two rungs, either alone
+  moving zero cells). Corpus: 4 cells `check-clean invalid wasm → runs`, **0 `runs →
+  not-runs`**, **0 `→ silent`**, `2,437 modules · 1,984 identical · 0 DIFFER · 0 LOST`.
+  `goal-scoreboard.py` clause 1: **4 → 0**, `runs` 4,122 / 7,128 → 4,128 / 7,130 (57.83% →
+  57.90%), total against the goal **121 → 117** (measured against master `889d60f8`, i.e.
+  after D711's ruling took the conceded column 45 → 26).
+
+* **THE TWO NAMED CELLS.** `d681_anon_two_field` is D641's family one ingredient wider than
+  the corpus cell (a TWO-field anonymous argument shape; check-clean invalid wasm on master,
+  runs now) — the derived corpus has no anonymous-shape axis to have generated it.
+  `d681_refused_spelling_pin` is a byte copy of `tests/cases/functions/structural-generic.vl`
+  carried as a REFUTATION PIN: D641's refused spelling-match widening
+  (`structIndexOfTypeName`) reddens it, was re-built and re-measured on today's master, and
+  still does. It must keep RUNNING.
+
+* **WHAT IS STILL OPEN, AND IT IS NOT A CORPUS CELL.** D661B is a live clause-1 witness that
+  **no corpus cell reaches**, so `goal-scoreboard.py`'s `clause 1 = 0` is a statement about
+  the 7,130-cell corpus and not about VL. Its repro is `vl check` rc 0 and invalid wasm on
+  this tree as it was on master, unmoved by this landing in either direction — correctly, it
+  is the array-covariance design question, and the checker-side answer was priced at 14,105
+  census cells and REFUSED. Name the population in the sentence.
 
 ---
 
@@ -19391,12 +19485,12 @@ Repro (now runs, printing `7`):
   literal, a function returning both arms — reach the design refusal or another open row, so
   widening the gate would claim rows that are not this one's.
 
-### D651 — `.length` on a bare `T` inside a generic body: the checker refuses the DIRECT spelling and lets the type-parameter one through to the emitter
-**LOUD EMIT REJECT (`emitProgram: '.length' on a receiver the emitter cannot classify as a
-list, string, map or set`) where the DIRECT spelling is a loud CHECK reject (`member access
-'.length' on non-object i32`) · a lost REFUSAL, not a lost lowering — clause 2 in the
-direction that hides · found 2026-08-30 as the residue of D426's close, by that row's own
-grid · six cells, kept whole at `distilled/named/d651len_*.vl`**
+### D651 — [CLOSED 2026-08-31] `.length` on a bare `T` inside a generic body: the checker refuses the DIRECT spelling and lets the type-parameter one through to the emitter
+**CLOSED 2026-08-31 alongside D691 — the repro is NOW A LOUD CHECK REJECT, in the direct
+spelling's own words. Was: an emit-stage refusal where the DIRECT spelling was already a
+check reject — clause 2 in the direction that hides · found 2026-08-30 as the residue of
+D426's close, by that row's own grid · six cells, kept whole at
+`distilled/named/d651len_*.vl`, and all six moved**
 
 Repro:
 
@@ -19443,6 +19537,415 @@ Repro:
   against the same floor the direct spelling meets, is the fifth table of exactly that
   family. Until it exists the emitter's floor is the only thing standing, and it is a floor:
   it names a rep it cannot classify, not a rule the language has.
+
+* **THE PRESCRIPTION WAS RIGHT AND IT IS BUILT — see D691**, which is the same table one
+  operation wider: `x[i]` on a type parameter is admitted by the same reasoning and lands on
+  the same emitter floor, so one table carries both. All six of this row's cells move with
+  the eleven D14 priced.
+
+### D711 — [RULED 2026-08-31] `print` of a CONTAINER is a DOMAIN rule, and the message had been conceding a lowering that was never missing
+**CLOSED 2026-08-31 — the repro is NOW A LOUD CHECK REJECT whose sentence is a DOMAIN error
+off the `unsupported-lowering` channel (`print expects one scalar or string value (i32 | i64
+| f32 | f64 | boolean | string), got i32[] — …`). Was the same refusal conceding "is
+type-valid but not yet supported by codegen" · THE FAMILY IS 19 CELLS AND IT WAS ABLATED ·
+A DESIGN RULING, NOT A LOWERING — the language question it turns on is in "What would have
+to be decided" below, and re-opening it as a defect means answering that first**
+
+Repro:
+
+    const v = [1, 2, 3]
+    print(v)
+    // vl check rc 1:
+    //   [ERROR]: print expects one scalar or string value
+    //   (i32 | i64 | f32 | f64 | boolean | string), got i32[] —
+    //   print the elements or fields individually, e.g. `print(xs[0])`
+
+#### The measurement that decided it, and it is an ABLATION
+
+The question was live: `print of X is type-valid but not yet supported by codegen — `print`
+renders one scalar or string` says two incompatible things in one sentence, and only one of
+them is legitimate under the standing goal. Both were tested rather than argued.
+
+**LIFT THE GATE AND COUNT WHAT RUNS.** A compiler was built with both refusal sites
+disabled — `tyPrintsAsRef(pt, 0)` at the direct site (`checkNode`'s `print` arm) and at the
+generic pin (`validatePrintCstrs`), the predicate itself untouched:
+
+| | classes | note |
+|---|---|---|
+| `loud check reject` → **check-clean invalid wasm** | **19** | every cell in the family |
+| → `runs` | **0** | *not one program* |
+| `runs` → not-runs | 0 | |
+| other movement | 0 | |
+
+**Zero of 19 run.** If this were a capability half-built, some cell would come out the other
+side. The moved set is `d14idx_arr_{arr_s,nest,rec}`, `d401p_bare_{arr_arr_s, arr_bool,
+arr_f64, arr_i32, arr_nest, arr_nul_i32, arr_rec, arr_str, fn, map_s_i32, rec, set_s,
+union}`, `d401p_index_{arr_arr_s, arr_nest, arr_rec}`.
+
+**THE FIRST ABLATION WAS WRONG AND THE CORRECTION IS WORTH KEEPING.** Neutering the
+PREDICATE `tyPrintsAsRef` (rather than its two print call sites) cost **199 classes `runs` →
+not-runs**. The predicate has a SECOND consumer — `elemStoreClassOf`, the element-store rep
+classifier, asks it "does this type reach a reference rep" for its `TyNullable` and `TyUnion`
+arms. A function named for `print` decides how list elements are stored. Ablate the SITES,
+not the shared predicate.
+
+**REAL DISASSEMBLY (`./node_modules/.bin/wasm-dis`, binaryen 130) of the lifted build.**
+There is no partial lowering to finish — the emitter falls straight through its ladder of
+positive rep tests onto the i32 sink:
+
+    ;; const v: i32[] = [1,2,3]; print(v)
+    (func $0 (type $4)
+     (call $fimport$0            ;; __print_i32__ : (i32) -> ()
+      (global.get $global$0)     ;; (ref $1) — the array
+
+`{n: i32}` and `(i32) => i32` produce the same two instructions with their own `(ref $1)`.
+`f64[]` does not even reach `__print_f64__` (`$fimport$4`); it lands on `$fimport$0` too.
+
+#### The receiver-type table — every refused type, beside its DIRECT spelling
+
+The generic-position cells are D401's siblings and the table is the point: **every one of
+them has a DIRECT spelling that refuses with the identical sentence.** So there is no cell in
+this family where the language is inconsistent with itself; the whole family is one rule,
+stated once, reached two ways.
+
+| receiver | direct spelling `print(v)` | in the family |
+|---|---|---|
+| `i32`, `i64`, `f64`, `boolean`, `string`, `0 \| 1` (literal union) | **runs** | — accept side |
+| `i32[]` | refuses (domain) | yes |
+| `string[]` | refuses (domain) | yes |
+| `boolean[]` | refuses (domain) | yes |
+| `f64[]` | refuses (domain) | yes |
+| `i32[][]` | refuses (domain) | yes |
+| `string[][]` | refuses (domain) | yes |
+| `(i32 \| null)[]` | refuses (domain) | yes |
+| `{n: i32}` | refuses (domain) | yes |
+| `{n: i32}[]` | refuses (domain) | yes |
+| `{[string]: i32}` (map) | refuses (domain) | yes |
+| `{[string]: boolean}` (set) | refuses (domain) | yes |
+| `(i32) => i32` | refuses (domain) | yes |
+| `U1 = {a:i32} \| {b:i32}` | refuses (domain) | yes |
+| `i32[] \| null` | refuses (domain) | yes |
+| `i32 \| null` | refuses (**capability**, D712) | no |
+| `i32 \| string` | refuses (**capability**, D712) | no |
+
+#### The argument, for the language designer
+
+**1. `print` has a declared domain, and it predates the gate.** `driver.builtinScan`
+publishes `print` to LSP completion as `(i32 | i64 | f32 | f64 | boolean | string) => void`,
+with the note that `print` is *"an OVERLOAD SET, not a polymorphic function"*. Under clause 2
+— the compiler rejects only what the DESIGN forbids — an argument outside a callee's declared
+parameter type is the canonical thing a type system forbids. This change makes that literal:
+the message and the completion detail now render one `printDomainStr()`, so the domain the
+compiler advertises cannot drift from the one it enforces.
+
+**2. What is missing is a RENDERING, not a rep.** A container's rep is an ordinary
+`(ref $t)` the emitter already builds, indexes and reads. Nothing about codegen is
+unfinished. What has never existed is a decision about what `print([1, 2, 3])` *outputs* —
+separators, brackets, how a nested string quotes, a map's key order, cycle handling. "Not yet
+supported by codegen" was therefore not merely unhelpful, it was **false**.
+
+**3. The float case makes a container render inconsistent with `print` itself.** Each
+`__print_*__` import emits one whole log LINE, so a container must be assembled through the
+`__print_char__` / `__print_str_flush__` stream — i.e. **guest-side**. Scalars render
+**host-side**: measured on both hosts (Rust `vl-host` and the Deno `runWasm` harness, which
+agree exactly), `print` of a float gives `0.1`, `0.3333333333333333`, `1e+21`,
+`1.0000000000000002e-7`, `Infinity`, `NaN` — JS/Ryu shortest-round-trip with JS's exponent
+thresholds. So `print(x)` and `print([x])` would disagree on the same f64 unless somebody
+writes shortest round-trip in hand-assembled wasm. `std:fmt`'s header already declines that
+work from the other side: *"f64→string (shortest round-trip, Ryu-class) is deliberately
+absent — `print` keeps covering floats"* (and `std-design.md` D4 item 1 defers it explicitly).
+Rendering only the derivable subset would split the container family in two — `i32[]` prints,
+`f64[]` does not — which is a worse rule than either uniform answer.
+
+**4. A function value has nothing to render.** `(i32) => i32` is in this family. At runtime it
+is a table index plus a captured environment; there is no name and no source. Any output is
+an invented token or a lie about identity. This is the cell that shows the family is not one
+mechanism away from working.
+
+**5. The precedent is one builtin over.** `toString` — the other value-rendering builtin, also
+with no VL-spellable type — refuses out-of-domain arguments with a plain type error and no
+concession: `toString expects an i32 or boolean, got string`. That is now `print`'s sentence
+shape too.
+
+**6. The composite renderer belongs in std, where it can be written in VL and reviewed.** It
+already works today:
+
+    import { toStr } from "std:fmt"
+    import { join } from "std:str"
+    const xs = [1, 2, 3]
+    const parts: string[] = []
+    let i = 0
+    while i < xs.length { parts.push(xs[i].toStr()); i = i + 1 }
+    print("[" + parts.join(", ") + "]")
+    // prints: [1, 2, 3]
+
+Putting a format inside the compiler builtin makes it permanent (std has no deprecation
+story, and a builtin has less) and un-overridable, and duplicates a surface `std:fmt` is
+already the documented home for.
+
+**THE EARLIER VERDICT WAS RIGHT AND ITS REASON 4 WAS NOT.**
+`docs/internals/destringify-types-program.md` already ruled *"the checker rejects, and
+`print` does not learn to lower arrays"* in five numbered reasons, and reasons 1, 2, 3 and 5
+stand. Reason 4 — *"`print` has no declared type and `any` is not a VL type, so this cannot
+be an ordinary assignability error — it has to be the same UNSUPPORTED-LOWERING admission"* —
+is refuted by `toString`, which has no declared type either and does exactly that. That one
+false premise is the whole reason a settled design rule spent months wearing a capability
+gap's words, counting against clause 2 on every scoreboard run.
+
+#### What would have to be decided to re-open it
+
+Not "teach the emitter". The language would have to answer, in this order, and each answer is
+permanent once printed output is depended on:
+
+1. What does `print([1, 2, 3])` print — `[1, 2, 3]`, `1 2 3`, one line or many?
+2. How does a nested `string` quote (`["a"]` vs `[a]`), and what escapes?
+3. What is a map's key order — insertion, sorted, unspecified?
+4. What does `print(fn)` print, given a function value has no runtime identity?
+5. Who renders an f64 inside a container, given the host renders it outside one — and is a
+   guest-side shortest-round-trip formatter in the emitter acceptable, or does `std:fmt`
+   grow the renderer first (`std-design.md` D4) and `print` stay scalar for good?
+
+If those are answered, `printDomainStr` widens, `tyPrintsAsRef`'s two call sites go, and this
+row flips. Until they are, the refusal is what the design says and the message now says so.
+
+#### Measured, six instruments
+
+* **Corpus BYTE-IDENTITY.** `scripts/silent-sweep/corpuscmp.py` over `tests/cases/` + `std/`
+  against the base seed `9c67a2d8…`: **2,437 modules · 1,984 identical · 0 DIFFER · 0 LOST**
+  (453 not buildable by the base, excluded and never scored). A diagnostic-only change must
+  move no bytes, and it moves none.
+* **`regress.py`, cell-matched.** **19 classes moved, every one `loud check reject` → `loud
+  check reject` (message only) · `runs → not-runs` 0 · `→ silent` 0 · other 0.** `runs` is
+  **4,122 / 7,128 (57.83%)**, unchanged — as it must be: this row buys no program.
+* **The moved set IS the ablated set**, verified as sets: 19 = 19, symmetric difference
+  empty. The family was ablated, not read off the message.
+* **`tests/cases` build count: 1,984, unchanged, 0 LOST**; `cases_wasm_test.ts` 2,355 passed.
+* **Real disassembly**, above.
+* **`goal-scoreboard.py`.** Conceded cells **45 → 26**; total against the goal **140 → 121**;
+  **capability message literals 14 → 13**, and the one that left is
+  `typecheck.vl:17581 'is type-valid but not yet supported by codegen — `print` ren'`. The 9
+  corpus-unreached literals are unchanged at 9.
+
+**THE CHANNEL MOVED, NOT ONLY THE WORDS**, and that is what makes this a close rather than a
+rewording. The refusal was raised by `tErrUnsupported`, which stamps the stable
+`unsupported-lowering` category code that the LSP and `vl check`'s tooling ABI read — so the
+compiler was telling *machines*, not only readers, "type-valid, cannot build". It is now
+`tErr` with no code. `tests/selfhost_native_diag_code_test.ts` pins both sides: the container
+refusal carries no code and must not contain a concession phrase; the boxed-union refusal
+still carries `unsupported-lowering`.
+
+Fixtures: `types/print-array-rejected.vl`, `types/print-struct-rejected.vl`,
+`maps/print-map-rejected.vl`, `closures/print-closure-rejected.vl`,
+`generics/error-print-type-param.vl` (which now pins the CHANNEL SPLIT — its union lines
+still read "not yet supported by codegen" and no other line does),
+`soundness/hole-renders-as-blank-reject.vl`, `soundness/absence-markers-render-reject.vl`,
+`types/unknown-type-in-map-value.vl`. The accept side is unchanged:
+`types/print-scalar-boundary-controls.vl`.
+
+---
+
+### D712 — the boxed VALUE UNION is the print refusal that IS a capability gap, and it keeps its concession
+**LOUD CHECK REJECT (`print of a union value (i32 | string) is type-valid but not yet
+supported by codegen — narrow it first, …`) · 4 corpus cells · separated from D711 by the
+ablation that sized D711: lifting `tyPrintsAsRef`'s two sites moves 19 cells and moves NONE
+of these, whose gate is the sibling `tyPrintsAsUnionBox` · OPEN deliberately — unlike D711
+this one IS a capability gap, it is implementable, and it keeps its concession**
+
+Repro:
+
+    function pick(c: boolean): i32 | string {
+      if c { return 1 }
+      return "x"
+    }
+    print(pick(true))
+    // vl check rc 1:
+    //   [ERROR]: print of a union value (i32 | string) is type-valid but not yet
+    //   supported by codegen — narrow it first, e.g. `if v is i32 { print(v) }`
+
+* **WHY THIS IS THE OPPOSITE VERDICT TO D711, ON ONE TEST.** Ask whether the argument's
+  members are inside `printDomainStr()`. For `i32[]` there is no member — the value is a
+  container and the language has never said what it renders as. For `i32 | string` **every
+  arm is already printable on its own**, and the program `if v is i32 { print(v) } else {
+  print(v) }` compiles and runs today. Nothing about the OUTPUT is undecided: it is whatever
+  the taken arm prints. What is missing is the runtime tag dispatch at the print site — and
+  the emitter already performs exactly that dispatch for `is`. So the concession is honest
+  here and stays.
+
+* **THE MESSAGE GROUP AND THE MECHANISM DISAGREE, WHICH IS WHY THIS IS ITS OWN ROW.** All 23
+  corpus cells matching `print of` read as one family by message. They are two: 19 answer to
+  `tyPrintsAsRef` (D711) and 4 to `tyPrintsAsUnionBox` — `d352opt_union`,
+  `d401p_bare_nul_i32`, `d401p_bare_vunion`, `d401p_index_arr_nul_i32`. The ablation
+  separates them cleanly (19 / 0), and one fix moves neither of the other's cells.
+
+* **IT IS ALSO THE TREE'S CANONICAL `unsupported-lowering` WITNESS.**
+  `tests/selfhost_native_diag_code_test.ts` and `tests/lsp_wasm_checker_test.ts` both use
+  `print(pick(true))` as the example of "type-valid, codegen cannot lower". That is still
+  correct after D711 precisely because this row was NOT collapsed into it.
+
+* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The print arm in `wasmEmit.vl` gains a boxed-
+  union rung ahead of its scalar ladder: read the box tag, `br_table`/`if` chain over the
+  arms, unbox each and call that arm's `__print_*__` sink — the shape `emitPrintNulString`
+  and `emitPrintNulBool` already have for the two NICHE cases (`string | null`,
+  `boolean | null`), generalised from a sentinel to a tag. The floor `tyPrintsAsUnionBox`
+  then narrows to the arms that are themselves out of domain, at which point it delegates to
+  `tyPrintsAsRef` and the two gates become one question asked twice. **Estimated price:
+  4 corpus cells to `runs`**, plus every hand-written program that prints a union without
+  narrowing first. The risk to weigh is that the print ladder is a documented site of silent
+  miscompiles (its own comments carry three), so it wants the rep-fuzz gate and a boundary
+  fixture per arm rep, not a quick rung.
+
+---
+
+### D691 — [CLOSED 2026-08-31] the RECEIVER-CLASSIFICATION capability, lost in the instantiation: `.length` and `x[i]` on a type parameter were admitted in the body and re-asked nowhere
+**CLOSED 2026-08-31 — the repro is NOW A LOUD CHECK REJECT, in the direct spelling's own
+words. Was: a loud emit reject on `889d60f8` · SEVENTEEN cells (11 from D14's own
+`lengrid.py` plus 6 from D651), kept whole at `distilled/named/d14len_*.vl`,
+`d14idx_*.vl` and `d651len_*.vl` · this is the PRICE D14's close recorded and left unpaid,
+now paid**
+
+Repro:
+
+    function g<T>(x: T) { print(x.length) }
+    function body() {
+      const v = true
+      g(v)
+    }
+    body()
+    // was: vl check rc 0; vl run:
+    //   emitProgram: '.length' on a receiver the emitter cannot classify as a list,
+    //   string, map or set
+    // now: [ERROR]: member access '.length' on non-object boolean (the body of `g` at
+    //   the call's argument types)
+
+* **THE FAMILY IS 17 CELLS, AND IT IS AN ABLATED COUNT RATHER THAN A MESSAGE COUNT.** The
+  three emitter messages this campaign handed over — `'.length' on a receiver the emitter
+  cannot classify as a list, string, map or set` (14 cells), `index receiver is not an array
+  or string` (4), `unsupported for-in iterable` (4) — are 22 cells with TWO roots, and the
+  split is 17/5. The seventeen are this row. The remaining five (`a005050`, `a007809`,
+  `a008457`, `b016590`, `b016591`) are a NESTED ARRAY, filed as **D692**; delta-debugged,
+  their minimal witness prints `emitProgram: nested arrays are not supported` — the headline
+  of a different cluster entirely — and this row's fix moves none of them.
+
+* **THE DIRECT SPELLING WAS ALREADY A POSITIONED REFUSAL AT EVERY ONE OF THE SEVENTEEN, and
+  that is the measurement that decided the answer.** `const v = true  print(v.length)` is
+  `member access '.length' on non-object boolean`; `{n: i32}` is `no field 'length' on Cat`;
+  `Ca | Sq` is ``field 'length' is not on every member of U1 — narrow with `is` first``;
+  `v[0]` on any of them is `cannot index non-array …`. So the DESIGN forbids these programs
+  and the checker owed the diagnosis — answer (b), a lost refusal rather than a missing
+  lowering. Under the standing goal `runs` correctly stays where it was: these seventeen
+  programs are illegal and always were, and what was wrong is which stage said so.
+
+* **THE TWO ADMISSIONS ARE STILL RIGHT.** `checkMemberNode`'s `TyVar` arm (D14-L) and
+  `checkIndexNode`'s admit the operation on every type variable, and D14 measured why:
+  refusing them in the BODY refuses the eight argument reps that work — lists (i32, string,
+  nested, struct-element), a string, a map and a set. What was missing was the second half,
+  the pin. `scripts/silent-sweep/d14/lengrid.py` on this branch: **11 `gen` cells move from
+  `emit_reject` to `check_reject`, every `runs` cell still runs, and each moved cell now
+  carries its own `con` twin's sentence.**
+
+* **THE FIX IS THE EIGHTH DEFERRED TABLE, and D651's row prescribed it in full.**
+  `noteMemCstr` records a member access or an index whose RECEIVER type still carries a hole
+  (`tyHasHole`, not `tyIsHole` — `notePrintCstr`'s measured distinction), stamped with
+  `cstrOwnerTop()`; `validateMemCstrs` substitutes at the pin, re-defers a still-holey result
+  under the caller's hole, and asks the SAME floor the direct spelling meets. Wired at both
+  pins, the direct call's and the UFCS one, like the seven tables before it.
+
+* **ONE TABLE FOR BOTH OPERATIONS, AND ONE HOME FOR THE SENTENCE.** `memberFloorMsg` /
+  `indexFloorMsg` render every wording `checkMemberNode` and `checkIndexNode` raise, and BOTH
+  the arm and the pin call them — `letAssignMsg`'s discipline, for the reason D492/D493
+  earned it. Here the drift would be worse than cosmetic: the whole argument for reporting at
+  the pin is that the generic and the concrete spellings are one annotation apart and must
+  therefore be one sentence apart. The floors mirror their arms ARM FOR ARM, in order, so a
+  rep neither one enumerates (a brand, an intersection) answers identically at both.
+
+* **THE BOUND, STATED RATHER THAN DISCOVERED LATER.** For the INDEX form the pin DEFERS where
+  `holeIsArrayDemanded` + `tyRefusesArrayDemand` already speak in the call's argument loop —
+  a scalar or a map reached through the bare parameter, which reports `argument 1: expected an
+  array, got i32` several lines earlier. Two true sentences for one program is what
+  `validateEscJoins`' fallback rule exists to avoid. What this leaves uncovered is a receiver
+  that is not the bare parameter (`g<T>(x: T[]) { print(x[0][0]) }` at a scalar element): the
+  argument gate cannot see it either, so that cell stays exactly as it is today. No cell of
+  `lengrid.py`, of the distilled corpus or of `tests/cases` reaches it.
+  `error-receiver-classification-at-pin.vl`'s `idxI32Pinned` PINS the deference — if the pin
+  ever stops deferring, that fixture gains a second diagnostic and fails.
+
+* **MEASURED, six instruments.**
+  * **Corpus BYTE-IDENTITY.** `scripts/silent-sweep/corpuscmp.py` over `tests/cases/` +
+    `std/`: **2,439 modules · 1,985 identical · 0 DIFFER · 0 LOST** against the base
+    `889d60f8` (454 not buildable by the base, excluded and never scored).
+  * **`tests/cases` build count: 1,977 → 1,977**, and the build SET is identical file for
+    file (`diff` of the two lists is empty).
+  * **The distilled corpus.** **17 classes moved, all `loud emit reject` → `loud check
+    reject`; `runs → not-runs` ZERO; `→ silent` ZERO.**
+  * **Counters, reach AND ans.** A count-only probe build over the corpus: `noteMemCstr`
+    **records 154 times and changes 0 answers** across the 2,245 reporting modules that are
+    not this branch's own fixture, which is precisely why the corpus is byte-identical (the
+    fixture itself is reach 5 / ans 37). On the row's own witness it is **reach 2 / ans 3**,
+    and on the one-token control (`g([7, 8])` instead of `g(true)`) **reach 2 / ans 0**.
+  * **Real disassembly** (`./node_modules/.bin/wasm-dis`, binaryen 130). The ADMITTED path is
+    untouched: `g([7, 8])` builds to 1,807 bytes byte-identical under both seeds, and its
+    `.length` is still `(struct.get $3 1 (local.get $0))` — the list wrapper's length slot,
+    never a reclassification.
+  * **The scoreboard.** clause 2 `emit rejected after check` **91 → 74**; `refusal concedes
+    type-valid` unchanged at **26** (these are `tErr`, so no concession phrase is added);
+    total against the goal **121 → 104**.
+
+**ABLATED.** Four variants built from the branch by hunk, each self-compiled and graded on
+the 17 cells:
+
+  | variant | seed md5 | bytes | `.length` cells (13) | index cells (4) |
+  |---|---|---|---|---|
+  | strip-all | `c767f825…` = **master, byte-for-byte** | 1,520,987 | 0 | 0 |
+  | R3 — the message HOME only | `45c1f9bf…` | 1,521,694 | 0 | 0 |
+  | R1 — R3 + the table + the MEMBER pin | `a2d75d31…` | 1,523,237 | **13** | 0 |
+  | R2 — R3 + the table + the INDEX pin | `8e8892d9…` | 1,523,234 | 0 | **4** |
+  | all | `d1136d10…` | 1,523,248 | **13** | **4** |
+
+R1 and R2 are DISJOINT and their union is the branch's moved set, so they are two landings
+sharing one table rather than one landing. **R3 scores 0 on every population and is kept
+anyway**: it is the one-home rewiring, and its value is structural — its own corpus
+byte-identity run against master is **2,439 modules · 1,985 identical · 0 DIFFER · 0 LOST**,
+which is the measurement that it changes no answer while making the two sentences impossible
+to drift apart.
+
+Fixtures: `tests/cases/generics/error-receiver-classification-at-pin.vl` (14 refusals, each
+beside its direct control, plus the deference bound) and
+`tests/cases/generics/receiver-classification-at-pin-runs.vl` (the accept set, read back by
+value at every admitted receiver rep).
+
+---
+
+### D692 — `.length` and `for`-in on a value read OUT of a nested array: the receiver's floor speaks and the nesting is what is missing
+**LOUD EMIT REJECT — `emitProgram: unsupported for-in iterable` (4 cells) and `emitProgram:
+'.length' on a receiver the emitter cannot classify as a list, string, map or set` (1 cell) ·
+five cells: `a005050`, `a007809`, `a008457`, `b016590`, `b016591` · filed 2026-08-31 while
+closing D691, which owns the other seventeen of that message group · THE ROOT IS THE NESTED
+ARRAY and D691's fix moves none of these**
+
+Repro:
+
+    const c = [{ r: 7 }]
+    const dd = [c][0]
+    let hit = 0
+    for zz in dd {
+      if zz.r == 7 { hit = 7 }
+    }
+    print(hit)
+    // vl check rc 0; vl run:
+    //   emitProgram: unsupported for-in iterable
+
+* **THE ABLATION IS WHAT SEPARATES IT FROM D691, and it took five programs.** Delete the
+  nesting — `const dd = c` — and the same program RUNS, printing `7`. Hold the nesting and
+  make the element an i32 (`const c = [7]`) and it RUNS. Hold the nesting and the struct
+  element and ask `.length` instead of `for`-in, and the message becomes **`emitProgram:
+  nested arrays are not supported`** — the headline of a DIFFERENT cluster. A triple-nested
+  i32 array (`[[[7]]][0].length`) says the same; a double-nested one runs. So the
+  load-bearing ingredient is a nested array whose inner element the emitter has no rep for,
+  and the three messages these cells print are downstream floors rather than the mechanism.
+
+* **THIS IS THE `nested arrays are not supported` FAMILY WEARING THREE OTHER SENTENCES**, and
+  it is filed rather than absorbed because the fix belongs with that cluster: whoever lands
+  nested-array support should re-grade these five, and until then they have an owner.
 
 ### D701 — [CLOSED 2026-08-31] a MAP parameter had no `$fnsig` token, so every function VALUE taking one was refused
 **closed as `runs` · was `loud emit reject: emitProgram: a function value's signature is not yet supported — a function value may not take a nullable or map parameter (or return one)` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 6 of the 6 cells carrying that message, all one mechanism (a map PARAM on a function value) · +6 corpus cells to `runs`, 0 `runs` lost, 0 into any silent class, no `tests/cases` module stopped building**

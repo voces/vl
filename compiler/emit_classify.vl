@@ -9851,6 +9851,30 @@ function sIsAnonRow(si: i32) {
   nm.length >= 5 && nm.slice(0, 5) == "#anon"
 }
 
+// D681/R1 — THE ARENA ROW AN INTERNED ANONYMOUS SHAPE HANDLE NAMES, or -1.
+//
+// `#anonN` is a name the emitter minted for itself and the checker's annotation grammar
+// cannot parse back: `nameToTy("#anon0")` is -1, and `recordClonedNodeTyFb` records the
+// COARSE PLACEHOLDER `objPinTyIx()` — a field-less `TyObj` that renders `{}`. That
+// placeholder is the right answer for the node's own sidecar (see that function's measured
+// refusal of the ANON arm, five `hole-*` chains), and it is the wrong answer for a pin the
+// monomorphizer is about to RE-CHECK a body under, because the body then resolves `T` to a
+// struct with no fields.
+//
+// KEYED ON THE NAME, WHICH IS WHAT MAKES IT SAFE HERE. The instance registry is keyed on
+// `pinned` — the pin NAMES — alone, so a pin type sourced from anywhere the key cannot see
+// makes the instance a function of something two call sites can disagree about (the header
+// at `letTyCol` records that failure and the program that measured it). `#anonN` IS a row
+// identity: the name selects one struct-table row and that row's D0 `sTyIx` sidecar is its
+// arena type, so this is a pure function of the key.
+export function anonHandleTyIx(nm: string): i32 {
+  const si = structIndexByName(nm)
+  if si < 0 { return -1 }
+  if !sIsAnonRow(si) { return -1 }
+  if si >= sTyIx.length { return -1 }
+  sTyIx[si]
+}
+
 // PERF MEMO (the deep-composite compile wall, `resolveAnnot`-memo's emitter sibling):
 // `structIndexOfObjCtx` re-enters per candidate row × per parent literal query
 // (`anonFieldCode`'s nested-object arm recurses into child literals), so a deeply
@@ -16267,7 +16291,43 @@ export function monoRetRowName(ty: i32) {
   if si >= 0 {
     if si < sNames.length { return sNames[si] }
   }
+  // D681/R2 — THE ANONYMOUS ROW, BY ARENA IDENTITY AND NOTHING ELSE (inventory D641).
+  //
+  // `repSlotOfTy`'s index is DECLARED rows only (`repSlotCacheSync` gates on `sRowDecl`),
+  // so a shape that only ever appeared as an object LITERAL answers -1 here and the caller
+  // declines to mint — even though `collectAnonShapes` interned exactly the row the return
+  // needs, under an `#anonN` handle every name-keyed consumer resolves.
+  //
+  // NOMINAL, NOT STRUCTURAL, and that is the whole difference between this and the widening
+  // D641 recorded as REFUSED. That candidate fell back to `structIndexOfTypeName` — a match
+  // on the shape's PRINTED SPELLING — and a printed spelling cannot tell two instances of
+  // one generic apart: `functions/structural-generic.vl` instantiates `addx` at i32 and at
+  // f64, both re-check to `{x: <error>}` (an un-pinnable parameter binds to `TY_ERR`), both
+  // print the same text, both matched the i32 row, and the module went from `runs` to
+  // check-clean invalid wasm (`expected i32, found f64`). Re-measured on 2026-08-31: it
+  // still does, so the refusal stands and this is not it. `sTyIx[si] == ty` is the same
+  // EXACT-arena-index identity `repSlotOfTyDecl` uses one leg up; two instances that mint
+  // two arena rows cannot collide on it, and a shape no row was interned for still answers
+  // -1 rather than guessing at a structural neighbour.
+  const ai = sAnonRowByTy(ty)
+  if ai >= 0 { return sNames[ai] }
   ""
+}
+
+// The ANONYMOUS struct-table row whose D0 `sTyIx` sidecar entry IS the arena type `ty`, or
+// -1 — `repSlotOfTyDecl`'s nominal leg with the `sRowDecl` gate replaced by its complement.
+// First match wins, as in every other row scan; the sidecar holds -1 for a row it does not
+// cover, which never matches a real type.
+function sAnonRowByTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let i = 0
+  while i < sTyIx.length {
+    if sTyIx[i] == ty {
+      if sIsAnonRow(i) { return i }
+    }
+    i = i + 1
+  }
+  -1
 }
 
 // The `pendingListKind` a type-annotation node at `tyIx` names (1 = struct/MAP ref list,
@@ -30337,6 +30397,23 @@ function dsRebindsName(fIx: i32, nm: string): boolean {
 // it — `function outer() { const lv1 = [{r:7}]; function inner() { const c: Shape[] = lv1 }`
 // delivers `lv1` to a declared destination and refusing to look would lose it. The gate is
 // the scope rule itself: descend only where the nested function does not REBIND the name.
+//
+// THE FRAME IS THE DESTINATION'S, NOT THE BINDING'S (D661A). `fnIx` is the function the
+// BINDING lives in, and three of `dsDestSlotAt`'s seven destination forms need the function
+// the DESTINATION lives in instead: `ret` reads `P.nodes[fnIx].fnRet`, `assign` calls
+// `destLetOf(name, fnIx)`, `mapstore` calls `mapValKindListSlot(name, fnIx, want)`. The
+// other four read their answer off the destination NODE — an annotation, a callee's
+// parameter, a struct field — and never ask which frame they are in.
+//
+// So a capture (`function outer() { const lv1 = […]; function inner(): Shape[] { return
+// lv1 } }`) split the seven exactly three/four: the walk DESCENDS into `inner`, the `return`
+// node IS visited, and then the three fnIx forms asked `outer` for a return annotation that
+// is on `inner` and answered -1. `bind`, `listlist`, `callarg` and `structfield` moved the
+// same way and kept running. That is inventory D661A, and its three cells are the three
+// forms — the shared validator sentence is not what groups them.
+//
+// The walk already knows the answer: the nested `FuncDecl` is the node it just descended
+// through, and `dsRebindsName` is checked on it one line above. Threading it down is the fix.
 function dsScopeWalk(
   ix: i32,
   scopeIx: i32,
@@ -30346,17 +30423,19 @@ function dsScopeWalk(
 ): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
+  let frame = fnIx
   if ix != scopeIx {
     if n is FuncDecl {
       if dsRebindsName(ix, nm) { return -1 }
+      frame = ix
     }
   }
-  const here = dsDestSlotAt(ix, nm, fnIx, want)
+  const here = dsDestSlotAt(ix, nm, frame, want)
   if here >= 0 { return here }
   const kids = nodeChildren(ix)
   let k = 0
   while k < kids.length {
-    const rs = dsScopeWalk(kids[k], scopeIx, nm, fnIx, want)
+    const rs = dsScopeWalk(kids[k], scopeIx, nm, frame, want)
     if rs >= 0 { return rs }
     k = k + 1
   }
