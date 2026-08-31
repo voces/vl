@@ -133,6 +133,29 @@ the compiler.
 run" are different facts, and only the second is about VL. The inventory is a notebook of what
 someone looked at; it is not a measurement of the language.
 
+## A VALIDATOR SENTENCE IS NOT A MECHANISM — do not group silent cells by their message
+
+The engine prints `type mismatch: expected (ref $type), found (ref $type)` for every heap-type
+disagreement in the module, with both type names elided. Cells carrying it have nothing else in
+common. Grouping by it was wrong twice on 2026-08-30, in opposite directions:
+
+* **Overstated 19x.** D611 was filed as "58 of the 92 silent cells, the largest single family"
+  — that was the `expected (ref null $type)` message group. Exactly **3** carried D611's
+  mechanism. The row's own headline was a message count wearing a mechanism's clothes.
+* **Nearly merged two defects.** D613 and D623 both print `expected (ref $type), found (ref
+  $type)`. D613 is a captured empty list literal (the closure is load-bearing); D623 is an
+  un-annotated `Map()` carrier (the closure is SCENERY, and annotating either end fixes it).
+  One fix moves neither of the other's cells.
+
+**Let the ABLATION define the family, never the message.** Delta-debug the cell to a minimal
+witness by line removal — keep a line removed only while outcome *and* message hold — then
+remove one ingredient at a time and record which ones the defect needs. That table is the
+family. It costs seconds per cell: the minimiser is a thirty-line greedy loop, and the three
+2026-08-30 families each fell out of one in under a minute.
+
+Corollary for a row's headline: **cite the number you ABLATED, not the number that shares a
+sentence.** If the mechanism count is not yet known, say the message count is a message count.
+
 ## The goal is `runs`, and making a failure LOUD does not move it
 
 Standing bar: **every program the language design permits compiles and runs correctly.** Two
