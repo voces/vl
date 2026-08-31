@@ -18947,13 +18947,15 @@ Repro (`scripts/capability-probes/width-subtyping.vl`, verbatim — now `runs`):
 
 ---
 
-### D641 — an un-annotated generic STRUCT return whose shape is ANONYMOUS: the row is interned, and the resolver that names it indexes DECLARED rows only
-**check-clean invalid wasm · found 2026-08-30 while closing D592's struct arm, as the exact
-residue that arm's `no row, no mint` decline leaves · it is D592's witness with the argument's
-`type V` deleted, and the DECLARED spelling of the same program runs · the widening that would
-close it was built, measured and REFUSED, and the refusal is priced below**
+### D641 — [CLOSED 2026-08-31] an un-annotated generic STRUCT return whose shape is ANONYMOUS: the pin re-checked as `{}`, and the resolver that names the row indexed DECLARED rows only
+**now RUNS and prints `7`, closed 2026-08-31 by #2046 (D681) · was `check-clean invalid wasm` ·
+found 2026-08-30 while closing D592's struct arm, as the exact residue that arm's
+`no row, no mint` decline leaves · TWO rungs, and **either alone moves ZERO cells** ·
+the filed mechanism was HALF the defect and the filed "what would have to be true" is
+REFUTED by measurement · the refused spelling-match widening was re-measured on today's
+master and STILL HOLDS, pinned as `distilled/named/d681_refused_spelling_pin.vl`**
 
-Repro:
+Repro (now `runs`):
 
     function g<T>(self: T) {
       const xs: T[] = [self]
@@ -18961,45 +18963,86 @@ Repro:
     }
     const z = g({ x: 7 })
     print(z.x)
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 309: type mismatch:
-    //   expected i32, found (ref $type)
-    // SHOULD PRINT 7
+    // 7
 
-* **ONE TOKEN SEPARATES IT FROM A PROGRAM THAT RUNS, AND IT IS NOT THE RETURN ANNOTATION.**
-  Declare the ARGUMENT (`type V = { x: i32 }` + `const p: V = { x: 7 }`) and this is
-  `d592_elem_obj_plain_infer`, which runs since #2038. Declare the RETURN (`g<T>(self: T): T`)
-  and the anonymous spelling runs too. So neither the body nor the shape is the obstacle: what
-  is missing is a NAME the emitter's shape table answers to.
+* **THE FILED MECHANISM NAMED THE SECOND RUNG AND MISSED THE FIRST, AND THE PROBE SAYS SO IN
+  TWO NUMBERS.** The row said `repSlotOfTy` indexes `sRowDecl == 1` rows only, so the
+  `#anon0` row the emitter interned is unnameable. That is true and it is not sufficient.
+  Instrumenting `monoRetRowName` on this witness prints
+  `ty=57 slotOfTy=-1 canon=3 str={} [0:#anon0 tyIx=52 decl=0 canon=5 str={x: i32}]` —
+  the arena type the monomorphizer asks about is **57, rendering `{}`**, while `#anon0`'s own
+  row is **52, rendering `{x: i32}`**. They are not the same type and not even the same
+  SHAPE, so **no resolver keyed on a row could ever have matched**, declared-gate or not.
+  That is why the row's own "what would have to be true" — an anonymous-row resolver keyed on
+  the ARENA type — was necessary and would have changed nothing on its own: measured, R2
+  alone moves 0 cells.
 
-* **THE ROW EXISTS — IT IS THE RESOLVER THAT DOES NOT REACH IT.** `collectAnonShapes` interns
-  `{x: 7}`'s field set as `#anon0`, so the module already holds the struct this return needs.
-  D592's struct arm mints the name of the row `repSlotOfTy` resolves, and `repSlotCacheSync`
-  builds that index over rows with `sRowDecl[si] == 1` — DECLARED rows only. An anonymous row
-  is therefore invisible to it, the arm declines, and `nret` stays -1 exactly as before.
-  Counter probe on this witness: `objAsk=1 objName=1 row=0 mint=0 decline=1` — the arm is
-  asked, it decides the type, and the lookup is the rung that says no.
+* **WHERE THE `{}` COMES FROM, WHICH IS ONE PASS EARLIER AND IN THE PIN.** `monoMakeInstance`
+  banks each parameter's pin as an arena index in `pinnedTyIx`, resolved from the pin's NAME.
+  The pin name here is `#anon0`, an emitter handle the checker's annotation grammar cannot
+  parse: `nameToTy("#anon0")` is -1 and `recordClonedNodeTyFb` records the coarse
+  `objPinTyIx()` placeholder — a field-less `TyObj`. `monoInferRetExprTy` then `declare`s
+  `self: {}` and binds `T := {}`, so `const xs: T[]; return xs[0]` re-checks to `{}`,
+  `monoRetRowName` is handed `{}`, and D592's arm declines. `nret` stays -1, the functype
+  result falls to `retAnnKindChain`'s `"i32"` seed, and the body pushes a `(ref $type)`.
 
-* **THE OBVIOUS WIDENING IS REFUSED, AND ITS PRICE IS A `runs` CELL — the veto the gate does
-  apply.** Falling back to `structIndexOfTypeName` (the name-keyed field-set matcher, which
-  DOES reach `#anonN`) was built and graded: it does **not** fix this witness, and it moves
-  `tests/cases/functions/structural-generic.vl` from `runs` to **check-clean invalid wasm**.
-  That module's `addx` instantiates at i32 and at f64; both instances re-check to
-  `{x: <error>}` (an un-pinnable parameter binds to `TY_ERR`), the printed spelling matches the
-  i32 row for BOTH, and the module validates as `expected i32, found f64`. A matcher keyed on a
-  printed spelling cannot tell two instances of one generic apart, which is the same
-  "structural identity is not layout identity" its own header warns about — defeated here by
-  the error-typed field its type guard cannot compare.
+* **THE FIX IS TWO RUNGS AND EITHER ALONE MOVES NOTHING** — the shape `CLAUDE.md` warns about
+  under "two rungs can be one landing".
+  · **R1** (`anonHandleTyIx`, consumed in `monoMakeInstance`'s clone loop): an ANON pin's
+    entry in `pinnedTyIx` is its ROW's arena type, not the placeholder's. Keyed on the NAME
+    (`#anonN` → its struct-table row → that row's D0 `sTyIx`), because the instance registry
+    is keyed on `pinned` alone and a pin type sourced from anywhere the key cannot see makes
+    the instance a function of something two call sites can disagree about.
+  · **R2** (`sAnonRowByTy`, consumed in `monoRetRowName`): the anonymous row whose `sTyIx`
+    IS the queried arena type. NOMINAL — the same exact-index identity `repSlotOfTyDecl`
+    uses — with the `sRowDecl` gate replaced by its complement, and layered on top of
+    `repSlotOfTy` rather than inside it, so the declared-twin BRIDGE's buckets are untouched.
+  · Measured: R1 alone **0 cells**, R2 alone **0 cells**, R1+R2 **the cell runs**. Corpus
+    byte-identity is `0 DIFFER · 0 LOST` at every rung and at the pair.
 
-* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** An anonymous-row resolver keyed on the ARENA type
-  rather than on a printed spelling — the same nominal `sTyIx[si] == ty` identity
-  `repSlotOfTyDecl` already uses, with the `sRowDecl` gate dropped and the `#anonN` rows'
-  `sTyIx` shown to be populated and distinct per instance. Two things must be measured before
-  it ships, because the refused candidate failed both: `functions/structural-generic.vl`,
-  `index/generic-trap.vl`, `objects/self-method.vl` and `objects/operator-self-method.vl` must
-  keep building (`joingrid.py --refused`), and a `TyErr`-carrying shape must not resolve onto a
-  declared row — under a resolver that admits one, D592's deleted `tyHasErr` concreteness gate
-  stops being redundant and comes back with it.
+* **R1 IS NOT `recordClonedNodeTyFb`'s REFUSED ANON ARM, AND THE COUNTER SAYS WHICH ONE IS
+  WHICH.** That function's header records a measured refusal: recording the handed arena type
+  for a `PIN_ANON` node turned five `tests/cases/inference/hole-*` chains from running into
+  `struct.get expected (ref null 0)`. That refusal is about the annotation NODE's `nodeTyIx`
+  sidecar, which the hole-rebase machinery reads and deliberately leaves open. R1 writes
+  `pinnedTyIx` — a local column of the monomorphizer — and never touches `nodeTyIx`. The
+  counter probe over `tests/cases` + `std`: R1 is **reached 1,418 times over 219 modules and
+  ANSWERS 68 times over 14**, and those 14 include all five `hole-*` chains plus
+  `structural-generic.vl`, `self-method.vl` and `operator-self-method.vl` — every one still
+  building, still running, byte-identical.
+
+* **THE REFUSED SPELLING-MATCH WIDENING WAS RE-BUILT AND RE-MEASURED ON TODAY'S MASTER, AND
+  IT STILL FAILS THE SAME WAY.** Falling back to `structIndexOfTypeName` (the name-keyed
+  field-set matcher, which does reach `#anonN`) does NOT fix this witness and moves
+  `tests/cases/functions/structural-generic.vl` from `runs` to check-clean invalid wasm at
+  `addx$1`, `expected i32, found f64` — the exact filed price. D622 part 1's canonical field
+  order did not cheapen it, and D592's row's guess that it might is answered: no. The reason
+  is unchanged — `addx` instantiates at i32 and at f64, both instances re-check to
+  `{x: <error>}`, both print the same text, both match the i32 row. **R2 is not that
+  candidate**: an exact arena index cannot collide two instances that mint two rows. The
+  module is carried as a REFUTATION PIN in `distilled/named/d681_refused_spelling_pin.vl` so
+  the seven-second gate holds the price, not only `deno task test`.
+
+* **THE FAMILY IS TWO WITNESSES, ABLATED, NOT ONE MESSAGE.** One ingredient at a time,
+  measured on both seeds — `{ x: 7 }` anonymous is the ONLY ingredient the defect needs that
+  the corpus cell already had:
+
+  | ingredient changed | master | after |
+  |---|---|---|
+  | — (the filed witness) | check-clean invalid wasm | **runs** |
+  | argument DECLARED (`type V`) | runs | runs |
+  | return annotated `: T` | runs | runs |
+  | no `T[]` local (`return self`) | runs | runs |
+  | scalar argument (`g("s")`) | runs | runs |
+  | **two-field anonymous shape** | **check-clean invalid wasm** | **runs** |
+
+  The last row is a second member the derived corpus has no axis to have generated; it is
+  filed as `distilled/named/d681_anon_two_field.vl`.
+
+* Disassembly (`wasm-dis` 130) is one line of the module: `(type $7 (func (param (ref $0))
+  (result i32)))` becomes `(result (ref $0))`.
+
+---
 
 ### D661 — [CLOSED 2026-08-30] the destination scan matched a NAME over the whole arena, so two bindings that only share a name read as one binding with two destinations
 **now RUNS, closed 2026-08-30 · the witness was a positioned emit reject carrying D411's
@@ -19132,12 +19175,13 @@ Repro (now runs, printing `1` then `7`):
 
 ---
 
-### D661A — a captured binding's destination lives in the NESTED frame, and the three destination forms that resolve through `fnIx` cannot see it there
-**check-clean invalid wasm · found 2026-08-30 closing D661, as the exact residue its scoped
-walk enters but cannot answer · 3 of the 7 destination spellings, and the 3 are exactly the 3
-that read `fnIx` · unmoved by D661 in either direction, and identical on both seeds**
+### D661A — [CLOSED 2026-08-31] a captured binding's destination lives in the NESTED frame, and the three destination forms that resolve through `fnIx` could not see it there
+**all three now RUN and print `1`, closed 2026-08-31 by #2046 (D681) · was `check-clean invalid
+wasm` · found 2026-08-30 closing D661, as the exact residue its scoped walk enters but could
+not answer · 3 of the 7 destination spellings, and the 3 are exactly the 3 that read `fnIx` ·
+ONE rung, and the four forms that already ran are BYTE-IDENTICAL**
 
-Repro:
+Repro (now `runs`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -19151,40 +19195,51 @@ Repro:
       print(rrU.length)
     }
     outer()
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 308: type mismatch:
-    //   expected (ref $type), found (ref $type)
-    // SHOULD PRINT 1
+    // 1
 
-* **THE ABLATION IS THE FORM AXIS, AND IT IS THREE OF SEVEN.** D661's walk enters `inner` (that
-  is rung 5, and without it four MORE cells break), so the destination node IS visited. What
-  fails is resolving it. Over the seven spellings, with the destination moved into a nested
-  frame: `bind`, `listlist`, `callarg` and `structfield` **run**; `ret`, `assign` and
-  `mapstore` are check-clean invalid wasm. The four that work read their answer off the
-  destination NODE — an annotation, a callee's parameter, a struct field. The three that fail
-  route through `fnIx`: `ret` reads `P.nodes[fnIx].fnRet`, `assign` calls
+* **THE ABLATION IS THE FORM AXIS, AND IT WAS THREE OF SEVEN.** D661's walk enters `inner`
+  (that is rung 5, and without it four MORE cells break), so the destination node WAS
+  visited. What failed was resolving it. Over the seven spellings, with the destination moved
+  into a nested frame: `bind`, `listlist`, `callarg` and `structfield` ran; `ret`, `assign`
+  and `mapstore` were check-clean invalid wasm. The four that work read their answer off the
+  destination NODE — an annotation, a callee's parameter, a struct field. The three that
+  failed route through `fnIx`: `ret` reads `P.nodes[fnIx].fnRet`, `assign` calls
   `destLetOf(name, fnIx)`, `mapstore` calls `mapValKindListSlot(name, fnIx, want)`. `fnIx` is
-  the binding's OWN frame (`outer`), and the destination is in `inner`, so all three ask the
-  wrong function and answer -1.
+  the binding's OWN frame (`outer`), the destination is in `inner`, so all three asked the
+  wrong function and answered -1.
 
-* **NOT A MESSAGE FAMILY.** All three print `type mismatch: expected (ref $type), found (ref
-  $type)`, which is the sentence `CLAUDE.md` names as meaning nothing on its own. What groups
-  them is the ablation above — the same three forms, moved one frame in, and the four others
-  moved the same way keep running.
+* **NOT A MESSAGE FAMILY.** All three printed `type mismatch: expected (ref $type), found
+  (ref $type)`, which is the sentence `CLAUDE.md` names as meaning nothing on its own. What
+  groups them is the ablation above — the same three forms, moved one frame in, and the four
+  others moved the same way kept running. The greedy minimiser reduces each to the same
+  three ingredients: the union declaration, the un-annotated capture in `outer`, and the one
+  destination spelling in `inner`; the call and the `print` fall away, because the defect is
+  in the DECLARATION's emission.
 
-* **HOISTING THE DESTINATION IS THE CONTROL AND IT RUNS.** `d661_ctl_ret__u` is this program
-  with `inner` deleted and the `return` in `outer`; it runs on both seeds. So neither the
-  spelling nor the capture alone is the defect — it is the pair.
+* **THE FIX IS THE FRAME THE WALK ALREADY HELD.** `dsScopeWalk` takes one extra local:
+  descending into a nested `FuncDecl` sets `frame = ix`, and `frame` — not `fnIx` — is what
+  `dsDestSlotAt` and the recursion receive. The nested `FuncDecl` is the node the walk just
+  ran `dsRebindsName` on, so nothing new is computed. The whole-arena fallback (a binding
+  whose scope `dsScopeRootOf` cannot name) is deliberately unchanged: it never descended in
+  the first place.
 
-* Its three cells are in `distilled/named/` as `d661_cap_{ret,assign,mapstore}` and are three
-  of the four clause-1 cells the scoreboard now shows. **They are pre-existing and were silent
-  on master too**; what changed is that the corpus has a program for them.
+* **NOTHING ELSE IN THE TREE ASKS THE QUESTION.** Counter probe over `tests/cases` + `std`:
+  the frame moves **54,815 times across 20 modules**, and a destination is resolved under a
+  moved frame **0 times** — so the rung is a pure widening on that population, and corpus
+  byte-identity is `2,437 modules · 1,984 identical · 0 DIFFER · 0 LOST`. On each of the
+  seven `d661_cap_*` cells the moved frame answers 4 times.
 
-* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The three forms need the frame the DESTINATION
-  lives in, not the frame the binding lives in. `dsScopeWalk` already knows it — it is the
-  nested `FuncDecl` it just descended through — so the fix is to thread that frame down to
-  `dsDestSlotAt` instead of passing `fnIx` unchanged, and to prove on the grid that the four
-  working forms are untouched by it.
+* **HOISTING THE DESTINATION WAS THE CONTROL AND IT STILL RUNS.** `d661_ctl_ret__u` is this
+  program with `inner` deleted and the `return` in `outer`; it ran on both seeds and runs now.
+
+* Disassembly (`wasm-dis` 130) shows the element row correcting: the captured literal was
+  built as a plain-struct element list (`struct.new $5` over `array.new_fixed $4` of
+  `struct.new $1`) against `inner`'s union-box return `(ref $7)`, and is now built as
+  `struct.new $7` over `array.new_fixed $6` of the boxed arm `struct.new $3 (i32.const 0) …`.
+
+* Its three cells are `distilled/named/d661_cap_{ret,assign,mapstore}` and were three of the
+  four clause-1 cells the scoreboard showed. With D641 they were the whole of clause 1's
+  corpus remainder: `goal-scoreboard.py` reads **clause 1 = 0** since this landing.
 
 ---
 
@@ -19257,6 +19312,45 @@ Repro:
   The census has no two-annotated-container-types cell, so `goal-scoreboard.py` scores this
   family at zero. It is a hand-written probe's worth of work to change that and none will
   arrive on its own.
+
+---
+
+### D681 — [CLOSED 2026-08-31 on landing] the residue register for clause 1's last four cells, and what is still open beneath them
+**runs today and must keep running · no live defect of its own · filed as the owner of the
+two named cells D681's landing produced and of the one clause-1 witness it did NOT close ·
+the row exists so the next person does not re-pay a price this one measured**
+
+Repro (runs today and must keep running):
+
+    function g<T>(self: T) {
+      const xs: T[] = [self]
+      return xs[0]
+    }
+    const z = g({ x: 7, y: "a" })
+    print(z.y)
+    // a
+
+* **WHAT LANDED.** Three rungs closing D661A (one rung) and D641 (two rungs, either alone
+  moving zero cells). Corpus: 4 cells `check-clean invalid wasm → runs`, **0 `runs →
+  not-runs`**, **0 `→ silent`**, `2,437 modules · 1,984 identical · 0 DIFFER · 0 LOST`.
+  `goal-scoreboard.py` clause 1: **4 → 0**, `runs` 4,122 / 7,128 → 4,128 / 7,130 (57.83% →
+  57.90%), total against the goal **121 → 117** (measured against master `889d60f8`, i.e.
+  after D711's ruling took the conceded column 45 → 26).
+
+* **THE TWO NAMED CELLS.** `d681_anon_two_field` is D641's family one ingredient wider than
+  the corpus cell (a TWO-field anonymous argument shape; check-clean invalid wasm on master,
+  runs now) — the derived corpus has no anonymous-shape axis to have generated it.
+  `d681_refused_spelling_pin` is a byte copy of `tests/cases/functions/structural-generic.vl`
+  carried as a REFUTATION PIN: D641's refused spelling-match widening
+  (`structIndexOfTypeName`) reddens it, was re-built and re-measured on today's master, and
+  still does. It must keep RUNNING.
+
+* **WHAT IS STILL OPEN, AND IT IS NOT A CORPUS CELL.** D661B is a live clause-1 witness that
+  **no corpus cell reaches**, so `goal-scoreboard.py`'s `clause 1 = 0` is a statement about
+  the 7,130-cell corpus and not about VL. Its repro is `vl check` rc 0 and invalid wasm on
+  this tree as it was on master, unmoved by this landing in either direction — correctly, it
+  is the array-covariance design question, and the checker-side answer was priced at 14,105
+  census cells and REFUSED. Name the population in the sentence.
 
 ---
 
