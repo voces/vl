@@ -1015,8 +1015,8 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   STILL NONE.** Both halves of A9 are now real. A covariant list assignment whose value
   is WRITTEN THROUGH is a positioned CHECK reject naming the write; a read-only one takes
   the converting copy. Nothing an author writes changed: no syntax, no migration, no
-  annotation. `goal-scoreboard.py` **22 -> 13** against the goal on the 7,271-cell corpus
-  (clause 1 **11 -> 4**), `runs` 4,316 -> 4,319, **0 `runs` lost, 0 cells into any silent
+  annotation. `goal-scoreboard.py` **14 -> 5** against the goal on the 7,279-cell corpus
+  (clause 1 **10 -> 3**), `runs` 4,332 -> 4,335, **0 `runs` lost, 0 cells into any silent
   class**. Four things this half earns:
 
   * **The per-value analysis the bullet above asked for is a NAME-BASED ALIAS CLOSURE

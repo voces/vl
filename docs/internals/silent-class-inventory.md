@@ -22008,12 +22008,15 @@ Repro (was a loud emit reject; now a loud check reject at `const b: Shape[] = xs
 
 ---
 
-### D775 — the `(string | null)[]` empty hole D772 deliberately does not claim
-**check-clean invalid wasm · found 2026-08-31 as the measured boundary of D772's rung · 1
-cell committed to `distilled/named/` · left open rather than guessed at, because the gate
-that bounds D772 is the ROW EXISTING and a string list has no ref-list row**
+### D775 — [CLOSED 2026-08-31 by D812] the `(string | null)[]` empty hole D772 deliberately does not claim
+**closed as `runs` · was `check-clean invalid wasm` · found 2026-08-31 as the measured
+boundary of D772's rung · 1 cell committed to `distilled/named/` · **THE BOUNDARY WAS DRAWN
+ONE STEP TOO FAR IN.** Both halves of this row's reasoning are true — the gate is the ROW
+EXISTING and a string list has no ref-list row — and the conclusion does not follow: the row
+test is one BACKING's way of proving the synthesized spelling is the one the machinery reads,
+and the string list has its own (`nameIsNulString`). See D812**
 
-Repro (check rc 0, invalid module):
+Repro (now runs, printing `0`):
 
     function f() {
       const xs = []
@@ -22021,9 +22024,9 @@ Repro (check rc 0, invalid module):
       print(a.length)
     }
     f()
-    // vl check rc 0, no diagnostics; vl run:
+    // was: vl check rc 0, no diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 259: type mismatch
-    // SHOULD PRINT 0
+    // Now: prints 0.
 
 * **WHY D772's RUNG STOPS HERE ON PURPOSE.** That rung takes the emit render of a nullable
   element only when `rlSlotByName` answers, and answering is what proves the synthesized
@@ -22809,13 +22812,19 @@ Repro (now runs, printing `1` then `7`):
 
 ---
 
-### D792 — the `(Circle | null)[]` NICHE is the one element pair the widening declines, and boxing it would need the narrow the niche exists to avoid
+### D792 — [CLOSED 2026-08-31 by D811] the `(Circle | null)[]` NICHE is the one element pair the widening declines, and boxing it would need the narrow the niche exists to avoid
 
-**loud emit reject · found 2026-08-31 as the measured boundary of D791's rung · 8 corpus cells,
-all in `d741`'s eager block · left refused rather than guessed at, and the reason is a TAG, not
-a plumbing gap**
+**closed as `runs` · was a `loud emit reject` · 8 corpus cells, all in `d741`'s eager block ·
+**THE REFUSAL IS EXACTLY RIGHT ABOUT THE ONE-TAG LOOP AND WAS READ AS BEING ABOUT THE PAIR** —
+see D811**
 
-Repro (a loud emit reject):
+Its own second bullet named what would close it — *"a null ARM in the destination union and a
+per-element test to pick between two tags"* — and priced that as "a second lowering". It is
+eight lines inside the existing one, because the destination union ALREADY has a null arm with
+a program-global tag (`nullBoxTag()`), which `(Shape | null)[]` builds at a literal today. The
+reason really is a TAG, and the tag was already there.
+
+Repro (was a loud emit reject, now runs printing `1` then `1`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -22831,9 +22840,10 @@ Repro (a loud emit reject):
       print(b.length)
     }
     f()
-    // vl check rc 0; vl run ->
+    // was: vl check rc 0; vl run ->
     //   emitProgram: one un-annotated list literal is bound to TWO declared destinations
     //   whose elements are stored differently …
+    // Now: prints 1 then 1.
 
 * **THE EIGHT CELLS ARE EXACTLY THE `CircleNull` ROW AND COLUMN of D741's eager block** —
   `d741_eager_{Animal,CircleStr,Other,Shape}__CircleNull` and
@@ -23060,9 +23070,10 @@ Repro (check rc 0, invalid module):
 ### D821 — [CLOSED 2026-08-31, now a loud check reject] the WRITTEN-THROUGH half of covariance, and D791's write scan was the right question at the wrong granularity
 
 **now a loud check reject · was `check-clean invalid wasm` (D791's four write witnesses,
-D661B) and a `loud emit reject` (D774's K1/K2 pair) · **6 cells move, 1 of them to `runs`, 0
-`runs` LOST, 0 into any silent class** · `goal-scoreboard.py` **22 -> 13** against the goal,
-clause 1 **11 -> 4** · this is A9's `Writable`, inferred, with no annotation surface**
+D661B) and a `loud emit reject` (D774's K1/K2 pair) · 9 cells move with D822, 3 of them to
+`runs`, **0 `runs` LOST, 0 into any silent class** · `goal-scoreboard.py` **14 -> 5** against
+the goal, clause 1 **10 -> 3**, `runs` **4,332 -> 4,335 / 7,279** · this is A9's `Writable`,
+inferred, with no annotation surface**
 
 Repro (was `vl check` rc 0 and an invalid module; now a positioned check reject):
 
@@ -23113,16 +23124,19 @@ Repro (was `vl check` rc 0 and an invalid module; now a positioned check reject)
   IT.** The sharpened predicate is consulted ONLY where `rlSlotEverWritten` already said
   "written" — a fast path that answers for every program with no list write at all — so every
   delivery master widened still widens, and the only thing the rung can do is widen MORE.
-  Measured over all 2,467 corpus modules: the sharpened branch is entered **once** and
+  Measured over all 2,469 corpus modules: the sharpened branch is entered **once** and
   overrides **once**, on the fixture that documents it.
 
 * **THE CHECKER SIDE IS THE HALF THAT CAN REDDEN A PROGRAM, AND IT IS GATED THREE WAYS.** It
   fires at `assignableExpr` — the seam every binding / argument / return / field / element /
   store flows through, and `objShapeAdapterless`'s own placement — when all of:
   1. the pair is a plain struct ROW element flowing into a value-UNION element with two or
-     more non-null arms (the pair `rlWidenVariantOf` lowers, said in the type system's words);
-     a NICHE destination is out, because the widening declines it write or no write (D792) and
-     refusing only its written half would be arbitrary;
+     more non-null arms (the pair `rlWidenVariantOf` lowers, said in the type system's words).
+     A NICHE destination (`(Circle | null)[]`) is deliberately OUT: it is D792's axis, closed
+     as `runs` by D811 on the read-only side, and its written-through half is a residue of
+     that row rather than of this one. The EMITTER still guards it — `rlWidenAllowed` asks the
+     write question for every pair — so a written-through niche keeps master's behaviour and
+     is never silently wrong; it is simply not refused loudly yet;
   2. the source is a NAMED handle, not a literal — `const b: Shape[] = [{r: 7}]` has no second
      handle at all and `d773_readonly_same` runs today with a store through it;
   3. the value's alias set demands **TWO** element storages, one boxed and one a plain row.
@@ -23135,31 +23149,33 @@ Repro (was `vl check` rc 0 and an invalid module; now a positioned check reject)
   all of them and no copy is taken. The checker cannot see reps, but it can see that no
   declared handle on the value asks for a plain row — and that is co-extensive with "no copy
   is needed". Ablating this gate is **2 `runs` cells LOST** (below), which is the refused
-  candidate's shape at 1/300th the size.
+  candidate's shape at 1/300th the size — and it buys exactly the two clause-1 traps D824
+  declines to pay for.
 
 * **THE ABLATION, five rungs. Strip-all reproduces master's seed byte-for-byte**
-  (`929d892e1e11b66d1e073803cc77764a`, 1,551,730 bytes — master's own `compiler/` built BY the
-  candidate seed, so it also witnesses that the new compiler emits master's compiler
-  identically).
+  (`08e1c66484dfe0f9d58403029ed7ade4`, 1,551,899 bytes — master's own `compiler/` built BY the
+  candidate seed, and separately proven a self-compilation fixpoint, so it also witnesses that
+  the new compiler emits master's compiler identically).
 
   | rung | what it is | `runs` | movement vs master |
   |---|---|---|---|
-  | all five (shipped) | | **4,319** | 5 -> loud check reject, 3 -> runs, **0 lost, 0 -> silent** |
-  | −A | the CHECKER's `Writable` rule | 4,319 | only `d791_unrelated_write_blocks`; **the five stay clause-1 / clause-2** |
-  | −B | the SHARPENED per-value licence | 4,316 | the five refuse, `d791_unrelated_write_blocks` stays an invalid module |
-  | −C | the TWO-STORAGE gate | 4,315 | **2 `runs` LOST** — `d741_w4_same_union`, `d741_w5_no_narrow` |
-  | −D | the CLAIM pass | **4,319** | **nothing** on the corpus — see below |
-  | −E | the module-GLOBAL delivery form (D822) | 4,319 | nothing on the corpus; its witness is `d822_global_widen` |
+  | all five (shipped) | | **4,335** | 6 -> loud check reject, 3 -> runs, **0 lost, 0 -> silent** |
+  | −A | the CHECKER's `Writable` rule | 4,335 | only the three -> runs; **the six stay clause-1 / clause-2** |
+  | −B | the SHARPENED per-value licence | 4,333 | the six refuse; `d791_unrelated_write_blocks` and `d822_global_unrelated_write` stay invalid modules |
+  | −C | the TWO-STORAGE gate | 4,333 | **2 `runs` LOST** — `d741_w4_same_union`, `d741_w5_no_narrow` (and `d741_w0_base` / `d741_w6_params` bought, which is D824's trade) |
+  | −D | the CLAIM pass | **4,335** | `d821_escape_push_alias` `check-clean invalid wasm` -> **`runs but wrong value`** — see below |
+  | −E | the module-GLOBAL delivery form (D822) | 4,333 | `d822_global_widen` and `d822_global_unrelated_write` stay invalid modules |
 
 * **−A SCORES EXACTLY WHAT SHIPPING IT SCORES AND IS STILL THE POINT OF THE ROW.** `runs` is
-  4,319 either way, because moving five cells out of `check-clean invalid wasm` and `loud emit
+  4,335 either way, because moving six cells out of `check-clean invalid wasm` and `loud emit
   reject` into a positioned check reject moves no program into running. That is the standing
   rule stated as an ablation row rather than as prose: silent -> loud is hygiene and is not a
-  point on this scoreboard. What −A costs is the whole of clause 1 and clause 2 for those five
-  — 22 -> 13 becomes 22 -> 18.
+  point on this scoreboard. What −A costs is the whole of clause 1 and clause 2 for those six
+  — 14 -> 5 becomes 14 -> 11.
 
-* **−D SCORES THE SAME AND IS A SILENT MISCOMPILE, WHICH IS D791's −D ONE CONTAINER DEEPER.**
-  The claim pass moves ZERO corpus cells, and the corpus is not what says it is needed.
+* **−D SCORES THE SAME `runs` AND IS A SILENT MISCOMPILE, WHICH IS D791's −D ONE CONTAINER
+  DEEPER.** The claim pass buys ZERO `runs` and the cell it protects is the one this row
+  files, so the corpus can see the price only because the cell is in it.
   `d821_escape_push_alias`, committed to `distilled/named/`, is:
 
       const a: Circle[] = [{ r: 7 }]
@@ -23171,25 +23187,29 @@ Repro (was `vl check` rc 0 and an invalid module; now a positioned check reject)
       print(b.length)               // 2
 
   Master and the shipped compiler both refuse the module. **With −D it compiles CHECK-CLEAN
-  and prints 1 then 2.** An invalid module traded for a silently wrong one, by a rung whose
-  corpus score is zero — grade on correctness, not on the number.
+  and prints 1 then 2**, which the grader reads as `runs but wrong value` — an invalid module
+  traded for a silently wrong one, by a rung whose `runs` score is zero. Grade on correctness,
+  not on the number; and file the cell, so the next person's gate says it out loud instead of
+  their having to read this paragraph.
 
-* **MEASURED, all six instruments.** Corpus `cmp` (master seed vs candidate): **2,464 modules ·
-  2,019 identical · 0 DIFFER · 0 LOST · 445 not buildable by the base**. Distilled corpus:
-  **9 cells move — 5 to `loud check reject`, 3 to `runs`, 1 (`d821_escape_push_alias`) newly
+* **MEASURED, all six instruments.** Corpus `cmp` (master seed vs candidate): **2,469 modules ·
+  2,021 identical · 0 DIFFER · 0 LOST · 448 not buildable by the base**. Distilled corpus:
+  **9 cells move — 6 to `loud check reject`, 3 to `runs`, and `d821_escape_push_alias` newly
   filed and unmoved — 0 `runs` -> not-runs, 0 -> silent.** D411's FULL 103-cell grid: **103/103
   run on both seeds, all 7 single-destination controls running, 0 moved.** D661's FULL 211-cell
-  grid: **211/211 on both seeds.** D741's 123-cell grid: **0 moved, 0 lost, its 54 running
-  cells intact.** `tests/cases`: **2,011 of 2,455 build on both seeds, 0 timeouts, 5.7 s at
-  `JOBS=6`, and the built SET is identical.** Counters (a probe build, removed before merge),
-  reach AND ans: over all 2,467 corpus modules the checker rule REACHES **11 times on 8
-  modules** and ANSWERS **0 times** — every corpus program is legal — while the sharpened
-  licence is consulted **1 time** and sharpens **1 time**. Per cell:
+  grid: **211/211 on both seeds.** D741's 123-cell grid: **0 moved, 0 lost, its 62 running
+  cells intact.** `tests/cases`: **2,013 -> 2,015 of 2,460 build, 0 timeouts, 4.4 s at
+  `JOBS=6`, and the set difference is EXACTLY the two `@run` fixtures this adds.** Counters (a
+  probe build, removed before merge), reach AND ans: over all 2,469 corpus modules the checker
+  rule REACHES **11 times on 8 modules** and ANSWERS **0 times** — every corpus program is
+  legal — while the sharpened licence is consulted **1 time** and sharpens **1 time**. Per
+  cell:
   `d791_store_dst`/`push_alias`/`store_callee` and `d774_k1k2_{store,param_store}` are
   reach 1 / ans 1; `d774_k1k2_nostore`, `d773_readonly_{bind,param}` and
   `d791_narrow_widened_elem` are reach 1 / ans 0; `d773_readonly_same` is reach **0** (a
   literal source never asks); `d741_w0/w4/w5/w6` are reach **2** / ans **0** — the rule sees
-  all four and gate 3 declines all four.
+  all four and gate 3 declines all four; `d821_mod_store_dst` is reach 1 / ans 1 and
+  `d822_global_unrelated_write` reach 1 / ans 0, which is the same pair one scope up.
 
 * **BOTH SCOPES, and the module-scope twin was NOT free — see D822.** All five refusing cells
   refuse identically as top-level `const`s, because the checker rule reads no frame. The
@@ -23253,7 +23273,7 @@ Repro (now runs, printing `1` then `7`):
 
 * **D795's COST MEASUREMENT, RE-RUN FOR THIS FORM.** The hook is asked at every non-constexpr
   ref-list global and widens only where the two rows DIFFER, so no working pointer store
-  becomes a copy. Over `tests/cases` + `std`: **asked 98 times on 53 modules, widens 1 time**
+  becomes a copy. Over `tests/cases` + `std`: **asked 99 times on 54 modules, widens 1 time**
   — the fixture that needs it.
 
 * **NO CORPUS CELL REACHED THIS AND THAT IS THE POINT OF FILING IT.** The derived corpus has no
@@ -23349,8 +23369,8 @@ Repro (runs today and must keep running, printing `203`):
   gate — refusing every written-through covariant assignment on the types alone — converts
   `d741_w0_base` and `d741_w6_params` from `trap_loads` into positioned check rejects, which is
   a clause-1 close for two cells. It also takes **`d741_w4_same_union` and `d741_w5_no_narrow`
-  from `runs` to a loud check reject**, measured on the distilled corpus (`runs` 4,319 ->
-  4,315). Two clause-1 traps bought for two running programs is the trade the gate declines, on
+  from `runs` to a loud check reject**, measured on the distilled corpus (`runs` 4,335 ->
+  4,333). Two clause-1 traps bought for two running programs is the trade the gate declines, on
   the standing criterion: veto on a `runs` cell lost.
 
 * **THE PROGRAM ABOVE IS THE ONE THAT MAKES THAT TRADE VISIBLE, AND IT IS SOUND.** `a` and `b`
@@ -23358,3 +23378,231 @@ Repro (runs today and must keep running, printing `203`):
   rule that refuses it is stating a real property of VL. What separates it from `w0` is that
   `w0`'s two unions differ — a statement about the ARMS, not about variance — so the answer
   D741/D793 still owes is about a shared box, not about a copy.
+
+---
+
+### D811 — a NICHE source's null becomes the destination union's NULL-TAGGED BOX, and the per-element test is what makes D792's pair widenable
+
+**closed as `runs` · was `loud emit reject` (D792) · **8 corpus cells — the whole `CircleNull`
+row and column of D741's eager block, 0 `runs` LOST, 0 into any silent class** · 3 cells
+committed to `distilled/named/`, and they are the ONLY thing that prices the lowering: that
+rung scores **zero** on all 7,275 corpus cells and ablating it buys a `wasm trap: cast
+failure`**
+
+Repro (now runs, printing `1` then `1`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: (Shape)[] = xs
+      const b: (Circle | null)[] = xs
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: one un-annotated list literal is bound to TWO declared destinations
+    //   whose elements are stored differently …
+    // Now: prints 1 then 1.
+
+* **WHAT A NULL ELEMENT BECOMES, WHICH IS THE WHOLE QUESTION D792 LEFT OPEN.** It becomes a box
+  carrying `nullBoxTag()` with a `ref.null none` payload — the destination union's OWN rep for
+  a null element, not a new one. That was checked before it was built rather than argued:
+  `const b: (Shape | null)[] = [{ r: 7 }, null]` builds its null element as
+  `(struct.new $2 (i32.const 10) (ref.null none))` off `./node_modules/.bin/wasm-dis` (binaryen
+  130), with `10` = `scalarTagOfKind(nullValKind())` and `0` = `Circle`'s arm tag. So the
+  converting copy has a tag to write and the two spellings agree byte for byte. Off `wasm-dis`
+  on the widened program the loop body is:
+
+      (array.set $6 (local.get $5) (local.get $6)
+        (if (result (ref $3))
+         (ref.is_null
+          (array.get $4 (struct.get $5 0 (local.get $4)) (local.get $6)))
+         (then (struct.new $3 (i32.const 10) (ref.null none)))
+         (else (struct.new $3 (i32.const 0)
+                (array.get $4 (struct.get $5 0 (local.get $4)) (local.get $6))))))
+
+  D792's refusal — *"boxing that element under `Circle`'s tag produces a box whose tag says
+  Circle and whose payload is null, and the narrow … `ref.cast (ref $Circle)` TRAPS on it"* —
+  is exactly right about the ONE-TAG loop and says nothing about the pair. Its own next
+  sentence named the answer (*"a null ARM in the destination union and a per-element test to
+  pick between two tags"*) and priced it as *"a second lowering"*; it is eight lines inside the
+  existing one, because the null arm was already there.
+
+* **THE OPPOSITE DIRECTION IS STILL OUT, AND STILL FOR D792's REASON.** `rlWidenVariantOf`
+  keeps `rlElemNullable[dstSlot] == 1` as a decline. It is vacuous as a column read —
+  `rlElemNicheNullable` never sets the bit for kind 2 — and it is kept because what it states
+  is the rule: a niche DESTINATION needs an UNBOXING copy, a per-element `ref.cast` that can
+  fail, which is the hazard the boxing direction was chosen to avoid.
+
+* **THE CHECKER IS WHY THE NON-NULL DESTINATION NEEDS NO ARGUMENT.** Array assignability is
+  ELEMENT assignability, so `const b: Shape[] = xs` over `const xs = [{ r: 7 }, null]` is a
+  positioned CHECK error (`cannot assign ({r: i32} | null)[] to 'b' of type Shape[]`) and no
+  null can reach a destination whose union has no null arm. The branch is emitted anyway: it
+  costs one `ref.is_null` per element, it is the same lowering either way, and a lowering that
+  is correct without a reachability argument is the one to ship.
+
+* **THE PAIR THE 8 CELLS CANNOT SEE, AND IT IS WHY THREE CELLS ARE IN `named/`.** Every one of
+  the eight is `[{ r: 7 }]` — no null anywhere — so a copy that boxed the null under the arm's
+  tag grades identically on all eight and on the whole corpus. `d811_widen_nul_elem` and
+  `d811_widen_nul_narrow` put an actual `null` in the literal with a `(Shape | null)[]`
+  destination; both are a loud emit reject on master, both RUN now, and with the loop-body rung
+  ablated the first prints `2 2 2` where `2 1 2` is right (a null element reading back as
+  NON-null, check-clean) and the second **traps**: `wasm trap: cast failure`. That is a corpus
+  score of zero and a veto either way round.
+
+* **`d811_widen_nul_dst_narrow` IS THE READABILITY CONTROL**, `d791_narrow_widened_elem`'s twin
+  one element over: the eight cells print only `.length`, and a `.length` grade cannot tell a
+  correctly-tagged box from a wrongly-tagged one. It narrows the box destination's element back
+  to `Circle` and reads its field.
+
+* **THE ABLATION, four rungs, each built from scratch with MASTER's seed and graded
+  cell-matched.** Strip-all — master's own `compiler/` compiled BY THE CANDIDATE SEED —
+  reproduces master's seed byte-for-byte: `929d892e1e11b66d1e073803cc77764a`, 1,551,730 bytes.
+
+  | rung | what it is | corpus `runs` | what its removal costs |
+  |---|---|---|---|
+  | all four (shipped) | | **4,325** | 8 emit reject -> runs, 1 silent -> runs, **0 lost, 0 -> silent** |
+  | −A | the `rlElemNullable[srcSlot]` decline, lifted | 4,317 | the 8 stay `loud emit reject` |
+  | −B | the two-tag loop body | **4,325** | **nothing on the corpus** — and `d811_widen_nul_elem` goes silently wrong, `d811_widen_nul_narrow` TRAPS |
+  | −C | `unionSetHasNull` for `nullablePartOf` (D813) | 4,325 | `d813_hole_nul_union3` and its module twin, neither in the corpus |
+  | −D | the `nameIsNulString` rung (D812) | 4,324 | `d775_hole_nul_string` and its module twin |
+
+  A and B must land together: A without B is the trap above, B without A never fires.
+
+* **MEASURED, all six instruments.** Corpus `cmp` (`corpuscmp.py`, master seed vs candidate):
+  **2,464 modules · 2,019 identical · 0 DIFFER · 0 LOST · 445 not buildable by the base**.
+  Distilled corpus: **9 cells -> `runs`, 0 `runs` -> not-runs, 0 -> silent.** D411's FULL
+  103-cell grid: **103/103 run on both seeds, all 7 single-destination controls intact, 0
+  moved.** D661's FULL 211-cell grid: **211/211 run.** All four `d791_*` write pins still
+  DECLINE and `d791_narrow_widened_elem` still runs. `tests/cases`: **2,011 of 2,455 building
+  on both seeds, the set difference EMPTY**, 0 timeouts, 4-5s at `JOBS=6`.
+  `goal-scoreboard.py` **18 -> 10**.
+
+---
+
+### D812 — the `(string | null)[]` hole closes on the STRING backing's own predicate, because "no ref-list row" was never "no rep"
+
+**closed as `runs` · was `check-clean invalid wasm` · D775's whole residue · 1 corpus cell
+(`d775_hole_nul_string`) plus its MODULE-scope twin, which the corpus did not have**
+
+Repro (now runs, printing `0`):
+
+    function f() {
+      const xs = []
+      const a: (string | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 259: type mismatch
+    // Now: prints 0.
+
+* **D775 STATED THE MECHANISM EXACTLY AND DREW THE WRONG BOUNDARY FROM IT.** Its gate is
+  `rlSlotByName` answering, and its reasoning was *"a `(string | null)[]` rides the string-list
+  backing … so it has no ref-list row at all and the gate declines"*. Both halves are true. What
+  does not follow is that the synthesis must therefore stop: the row test is not the point, it
+  is one BACKING's way of proving *"the spelling I am about to write is the spelling the
+  machinery will read"*. The string list has its own way of proving that — `nameIsNulString`,
+  the predicate `nameIsStringArray` already routes the whole niche through — and it is the same
+  kind of positive proof, not a widening to "any nullable element". That widening is still
+  refused, for D775's own reason.
+
+* **THE PROBE, VERBATIM.** A gated `emitFail` inside `synthEmptyListAnn` reads
+  `nulEl=[string|null] nulPart=[string] rlSlot=-1` on this witness and `rlSlot=0` on every
+  other spelling of the same shape. So the element renders, the membership test passes, and the
+  row lookup is the only thing that says no.
+
+* **THE MODULE SCOPE IS A SECOND CELL AND THE CORPUS HAD ONLY THE FIRST.**
+  `synthEmptyListAnn` has ONE home for both storage classes precisely so the two cannot drift,
+  and the corpus carried the function-scope cell alone — so the module-scope half of every rung
+  in that function was ungraded. `d812_hole_nul_string_module` is committed to
+  `distilled/named/`. Measured on the full 12-spelling by 3-scope hole grid: master runs 32 of
+  36 and the 4 it does not are exactly `{hole,ghole}_{string,shape}`.
+
+---
+
+### D813 — `nullablePartOf` is a TWO-MEMBER test, so the empty-`[]` synthesis declined every THREE-member nullable element even where its row answered
+
+**closed as `runs` · was `check-clean invalid wasm` · **0 corpus cells — this class had no
+program at all** · 2 cells committed to `distilled/named/`, one per scope**
+
+Repro (now runs, printing `0`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const xs = []
+      const a: (Shape | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 273: type mismatch
+    // Now: prints 0.
+
+* **IT IS THE MEMBERSHIP TEST, NOT THE ROW TEST, AND THE PROBE SEPARATES THEM.** The gated
+  `emitFail` reads `nulEl=[{r:i32}|{s:i32}|null] nulPart=[] rlSlot=0`: the element renders, its
+  ref-list ROW EXISTS and answers, and `nullablePartOf` is what returns "". That function splits
+  at the FIRST depth-0 bar and requires one of the two halves to be exactly `null`, so it is a
+  predicate about `T | null` and not about "carries a null member". `unionSetHasNull` is the
+  latter, decided structurally, and swapping it in is the whole change.
+
+* **`nullablePartOf` ITSELF IS UNTOUCHED.** It has nine other call sites in `emit_collect.vl`
+  alone and its two-member reading is correct at every one of them — a `T | null` niche is a
+  two-member question. What was wrong was using it where the question was membership.
+
+* **NO CORPUS CELL REACHES THIS AND NONE WOULD HAVE.** D772's grid stopped at two-member
+  elements, so ablating the rung costs **zero** on all 7,275 cells while losing
+  `d813_hole_nul_union3` and its module twin outright. Both are in `named/` for exactly that
+  reason. It was found by generating the hole's ELEMENT axis and reading the four cells master
+  fails, rather than the one cell the corpus filed.
+
+---
+
+### D814 — an UN-ANNOTATED local bound to a NULVARIANT list element floors on the struct message, and the ANNOTATED twin runs
+
+**loud emit reject · found 2026-08-31 as the next defect behind D811, PRE-EXISTING on master
+and independent of it · 2 cells committed to `distilled/named/` (the defect and its control) ·
+left open rather than guessed at, because the gap is the LOCAL's inferred rep and not the
+niche**
+
+Repro (check rc 0, then a loud emit reject — identical on master and after D811):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: (Circle | null)[] = [{ r: 7 }]
+      const e0 = a[0]
+      if e0 != null { print(e0.r) }
+    }
+    f()
+    // vl check rc 0; vl run ->
+    //   emitProgram: field access but no struct type declared
+    // SHOULD PRINT 7
+
+* **THE ABLATION, and it needs all three ingredients.** Delete `type Shape = Circle | Sq` and
+  the program RUNS (`Circle` is then a plain declared struct and `sDeclared` is true). Drop the
+  `| null` — `const a: Circle[]` — and it RUNS. Annotate the local — `const e0: Circle | null =
+  a[0]` — and it RUNS, which is the control and the diagnosis: `emitMem`'s nullable-variant arm
+  (`nulVariantIdxOfExpr` + `exprNullableVariant`) is present and correct, and an un-annotated
+  local bound to the indexed read does not reach it. So the family is a LIST element of a
+  nulvariant read through an INFERRED local, not the niche and not the field.
+
+* **THE SAME LOCAL WITHOUT THE FIELD READ IS A DIFFERENT LOUD REJECT**, which is what says the
+  gap is the local's rep rather than the member lowering: replace `print(e0.r)` with `print(1)`
+  and the program refuses with *"ref valtype with no interned shape"* at the `const e0` line.
+  Two messages, one missing answer.
+
+* **WHY IT IS FILED NOW.** D811 makes it REACHABLE in the two-destination spelling — on master
+  `const xs = [{r: 7}]` with a `(Circle | null)[]` and a `Shape[]` destination refuses one rung
+  earlier, so the read never gets a chance to floor. Loud on master, loud after, no cell moved;
+  what changed is that the message a user sees for that program is now this one. Filing it is
+  what stops the next reader attributing it to the widening.
