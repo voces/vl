@@ -430,6 +430,19 @@ D601_WRONG = [
 #
 # Re-derive the candidate with `python3 scratch-int/d591/mkvariant.py R1R0R2R3`; `--refused`
 # below re-checks the standing half — these four must keep building on the seed under test.
+#
+# 2026-08-30 — THE STRUCT ARM SHIPPED AND THIS LIST DID NOT CHANGE, which is the whole
+# point of keeping it. The naive candidate was re-derived and re-measured first: it still
+# kills all four, exactly as filed. What was wrong with it was the NAME it minted, not the
+# arm — `monoRetRowName` now mints the name of the ROW the emitter's shape table already
+# holds (`V`, never `{x: i32}`) and mints nothing where no row claims the shape. So these
+# four keep building, the six cells run, and this mode goes on asserting the price for the
+# next candidate rather than being retired with the one that paid it. TWO further candidates
+# were refused BY this list and by `regress.py` — a recursive `TyErr` gate (redundant here,
+# and it cost a recursive-struct return the row lookup wins) and a resolver widened to
+# anonymous rows via `structIndexOfTypeName` (which moves `functions/structural-generic.vl`
+# from `runs` to check-clean INVALID WASM: two instances of one generic collapse onto the
+# same i32 row). See the D592 row.
 REFUSED_MODULES = [
     "tests/cases/functions/structural-generic.vl",
     "tests/cases/index/generic-trap.vl",
