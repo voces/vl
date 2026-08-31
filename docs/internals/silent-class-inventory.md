@@ -14106,12 +14106,13 @@ inferred from a clean gate.
 
 ---
 
-### D426 — [CLOSED 2026-08-28] a LAMBDA inside a generic body whose parameter type mentions `T`: the floor said IS where it meant CONTAINS
-**CLOSED 2026-08-28 as a SILENT class — the repro is NOW A LOUD EMIT REJECT
-(`emitProgram: parameter `T[]` still names an unsubstituted type parameter — …`), and the
-LOWERING it names is priced, not fixed. Was: check-clean invalid wasm · found 2026-08-28 by
-D421's route axis · pre-existing and IDENTICAL on `777f7848`, on `1252cf04` and on all four
-rungs of D421's branch · NOT D421: the refusal is not lost, the SIGNATURE is wrong**
+### D426 — [CLOSED 2026-08-30] a LAMBDA inside a generic body whose parameter type mentions `T`: the lambda is a TEMPLATE and is now lifted PER PIN
+**CLOSED 2026-08-30 — the filed repro RUNS and prints `true`. TWO closes, and only the
+second one moved the goal: 2026-08-28 turned a check-clean invalid-wasm cell into a floor and
+said in its own words that the lowering was PRICED, not fixed, which under the standing goal
+left it open and the LARGEST clause-2 cluster in the corpus at 40 cells. This close is the
+per-pin lambda lifting that row priced · found 2026-08-28 by D421's route axis — see the two
+CLOSE sections below for what each landing did**
 
 Repro:
 
@@ -14127,9 +14128,7 @@ Repro:
     }
 
     print(cell())
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code at offset 326: type mismatch: expected i32,
-    //   found (ref $type)
+    // vl check rc 0; vl run prints `true`
 
 * **IT IS NOT THE COMPARISON.** The same generic without the lambda RUNS and prints `true`,
   and so does a lambda that CAPTURES `a` and `b` instead of taking them. The lambda's
@@ -14147,7 +14146,161 @@ Repro:
   the `.length` sibling — it is **SILENT**; the message it was given belongs to a body that
   has a field access, and an identity lambda has none.
 
-#### The close
+#### The close (2026-08-30) — per-pin lambda lifting, which is what the 2026-08-28 row priced
+
+**THE LAMBDA IS A TEMPLATE IN EXACTLY THE SENSE THE ENCLOSING GENERIC IS, and it is now
+instantiated the same way.** `collectFns` runs BEFORE `monomorphize` and lifts
+`const g = (x: T[]) => …` once, so one lifted function served every instance with `T` still
+written on its parameters. Three rungs, one landing:
+
+* **R1 — `monoCloneLambdaSubst` / `monoPinBodyLambdas` (`emit_mono.vl`).** A new rung in the
+  instance-body chain, right after `monoCloneBody`: at a `LetDecl` whose initializer is a
+  lifted lambda naming a type parameter, clone the lambda with its parameter and return
+  annotations SUBSTITUTED through this instance's binding, push the clone into `fnStmts`, and
+  repoint the binding. The clone SHARES the body, exactly as `monoCloneLambdaPinned` (the
+  `.map`/`.filter` sibling this is modelled on) shares it. Copy-on-write, so a body with no
+  such lambda is the same node index.
+* **R2 — the TEMPLATE PRUNE.** R1 alone buys nothing: the un-substituted lambda is a slot of
+  its own and `checkParams` reaches it whether or not an instance exists — a generic that is
+  never CALLED still had its lambda lifted and still refused the whole module (measured: the
+  `a08` ablation below). `monomorphize`'s prune stubs the template, the same treatment an
+  un-instantiated `<T>` decl already gets, one frame down. **The two rungs are one landing**:
+  R1 alone leaves every cell exactly where the floor left it, and R2 alone would stub a
+  function a live binding still calls.
+* **R3 — `cloLamParamUnionName` (`emit_classify.vl`), the LAST-RESORT rung.** A UNION-BOX
+  parameter (`T | null` at `i32`, `f64`, `i32 | null`) needs the union's NAME at the call, and
+  `cloCallParamUnionName` read it off `nodeTyIxOf(c.callFn)` — which inside a mono instance is
+  the leaf node SHARED with the generic and still answers `(T | null, T | null) => boolean`.
+  That is the seam `cloCallCalleeFnTy`'s own header names. Ask the LIFTED LAMBDA's `Param`
+  node instead, which is what the DIRECT twin does (`emitCall`'s `cUNm = tyNameOf(parType)`).
+  Placed LAST, after the three registry candidates, so it can only turn an `emitFail` into a
+  name — which is the byte-identity argument, and it is measured (reach **0** over the whole
+  corpus).
+* **R4 — the substituted INFERRED RETURN.** The checker records an anonymous lambda's inferred
+  return under its NODE index and records NOTHING for a lambda inside a generic body
+  (measured: `inferRetNameByNode` is `""` on the template), so the clone's return was
+  re-derived from a body whose every type is a variable. At `T | null` bound to `i32[]` it
+  settled on the plain list and declared `(result (ref $list))` over a body handing back
+  `(ref null $list)` — **the one cell the substitution alone moved from LOUD to SILENT**.
+  Fixed by annotating the clone's return from the return EXPRESSION's own recorded type,
+  substituted through the same binding (D592's fall-through move, one frame down), gated on
+  `tyHasTyVar` so a concrete return keeps today's inference.
+
+**THE ABLATION, and it is what defines the family — not the message.** The minimised witness
+is the filed repro; each row removes one ingredient and is graded on the 2026-08-30 base:
+
+| # | ingredient removed / changed | base outcome | verdict |
+|---|---|---|---|
+| a00 | — (the witness) | `emitProgram: parameter `T[]` …` | — |
+| a01 | the generic (same lambda in a concrete fn) | RUNS `true` | the generic enclosure is REQUIRED |
+| a02 | `T` in the LAMBDA's annotation only (`x: i32[]`) | RUNS `true` | the lost substitution is the whole of it |
+| a03 | the lambda (generic body does `a == b`) | RUNS `true` | the lambda is REQUIRED |
+| a04 | parameters → CAPTURE (`() => a == b`) | RUNS `true` | it is the PARAMETER, not the body |
+| a05 | `T[]` → bare `T` | same message | same family — **contra the filed row**, which said a bare `T` falls to the "only i32, …" rung |
+| a06 | `T[]` → `(T) => T` | RUNS `6` | the `nodeTyHasRepTyVar` exemption holds |
+| a07 | the lambda is never CALLED | same message | the call is NOT an ingredient |
+| a08 | the generic is never INSTANTIATED | same message | the instance is NOT an ingredient — the template alone refuses |
+| a09 | body `==` → `.length` | same message | the body is not an ingredient |
+| a10 | body `==` → identity | same message | the body is not an ingredient |
+| a11 | `T[]` → `T \| null` | `parameter `T\|null` …` | the constructor is not an ingredient |
+| a12 | bound lambda → INLINE ARGUMENT | `only i32, i64, … are supported` | **NOT this family** — the generic-HOF parameter floor |
+| a13 | lambda at top level, concrete | RUNS `true` | — |
+| a14 | TWO pins of the one generic | same message | one lifted function served every instance |
+| a15 | concrete annotation inside a generic | RUNS `true` | it is the `T`, not the enclosure |
+
+**THE ABLATED FAMILY IS 68 GRID CELLS AND 40 CORPUS CELLS**, and both numbers are the
+mechanism's, not a message's. On `lamgrid.py`'s 360 cells the base has **68 `gen` cells that
+refuse while their CONTROL runs** — shapes `bare` 18, `arr` 19, `arr2` 15, `nul` 16 — and the
+distilled corpus holds 40 (`d426c000..002`, 33 `d426lift_*`, 4 `d426nul_*`).
+
+**MEASURED, five instruments:**
+
+* **The grid, cell-matched.** `lamgrid.py`: **68 moved, ALL of them to `runs`. 0 `runs` lost,
+  0 → silent, 0 answers changed.** The `gen` column now EQUALS the `con` column cell for cell
+  (68 check_reject / 18 emit_reject / 88 runs on both sides), which is this row's own
+  criterion: the generic spelling and the direct spelling are one annotation apart and must
+  be one outcome apart.
+* **The distilled corpus, cell-matched.** `regress.py` against MASTER's baseline: **40 classes
+  moved, every one `loud emit reject → runs`; `runs → not-runs` 0; `→ silent` 0.**
+* **Corpus BYTE-IDENTITY.** `corpuscmp.py` over `tests/cases/` + `std/` against `fb5bc2a6`:
+  **2,434 modules · 1,979 identical · 1 DIFFER · 0 LOST.** The one DIFFER is this row's own
+  fixture. `tests/cases` modules that build: **1,972 → 1,973** (the new accept set), none lost.
+* **Counters, reach AND ans**, from a count-only probe build over the 1,981 corpus modules
+  that reach `emitProgram`: R1 **reach 13 / ans 10**, R2 **reach 806 / ans 9**, R3 **reach 2 /
+  ans 2**, R4 **reach 2 / ans 2** — and **every `ans` in all four columns lands in this row's
+  own two `runs` fixtures**, so outside them all four answer ZERO. That is the byte-identity
+  result explained rather than restated. Discriminating pairs, one program each: on the
+  WITNESS R1 1/**1** and R2 1/**1**; on the one-annotation CONTROL (`a02`, the lambda spelled
+  `i32[]`) R1 1/**0** and R2 1/**0**; on `a08` (the uninstantiated generic) R1 0/0 and
+  R2 1/**1**, which is the rung that makes it legal; on the `T | null` cell R3 2/**2**; on the
+  `i32[] | null` cell R4 1/**1**.
+* **Real disassembly** (`./node_modules/.bin/wasm-dis`, binaryen 130), on the two-pin cell
+  `a14`. Master emitted ONE lambda called through
+  `(func (param structref i32 i32) (result i32))` with two `(ref $list)` values pushed into
+  the i32 slots. The landing emits THREE functions: the pruned template `(func (param
+  structref))`, and one instance per pin —
+  `(func (param structref (ref $i32List) (ref $i32List)) (result i32))` and
+  `(func (param structref (ref $strList) (ref $strList)) (result i32))` — each reached by its
+  own `call_indirect`. **The i32 slots are gone.**
+
+**ABLATED, RUNG BY RUNG, ON THE 42 CELLS OF `distilled/named/d426*`** (the 40-cell cluster
+plus the two neighbours that always ran). Each variant is the branch's source with the other
+rungs and their dead helpers REMOVED — a non-exported helper nothing calls is still a
+top-level function the emitter writes, so leaving one behind would measure the leftovers —
+and every one is compiled by the SAME master seed:
+
+| variant | md5 | bytes | runs | loud | silent |
+|---|---|---|---|---|---|
+| strip-all | `7f136f04…` | 1,513,534 | 2 | 40 | 0 |
+| R1 alone | `f79736c0…` | 1,518,159 | **2** | **40** | 0 |
+| R1+R2 | `a07fc544…` | 1,518,553 | 34 | 7 | 1 |
+| R1+R2+R3 | `a8e77878…` | 1,519,040 | 41 | 0 | 1 |
+| R1+R2+R4 | `961c7cb0…` | 1,518,680 | 35 | 7 | 0 |
+| shipped (R1–R4) | `2befacda…` | 1,519,167 | **42** | 0 | 0 |
+
+**STRIP-ALL REPRODUCES MASTER BYTE-FOR-BYTE** — `md5 7f136f04912fa277b8b6504e404a20d1`,
+1,513,534 bytes, the same md5 the master seed has as its own fixpoint — and the four touched
+`emit_*` files are textually identical to `fb5bc2a6`'s after the strip.
+
+**R1 ALONE MOVES NOTHING, and that is the whole argument for calling this one landing.** The
+substitution is correct and complete on its own and buys exactly zero cells, because the
+un-substituted TEMPLATE is still a slot `checkParams` reaches. **R2 alone is not a separable
+variant** and the ablation says so rather than fabricating one: the prune's predicate
+(`monoLamNodeIsTemplate`, `monoEnclosingTyParams`) lives in R1's block, and a prune with no
+clone to point the binding at is the silently-wrong outcome the two ledgers exist to prevent.
+R3 buys the six union-box cells and nothing else; R4 buys the single `i32[] | null` cell —
+and it is the rung that keeps this landing's `→ silent` count at ZERO.
+
+**THE PRICE THE 2026-08-28 CLOSE PAID IS REFUNDED.** That row overrode the `runs → not-runs`
+veto to lose four cells (`d426nul_{bool,lit}_{eq,id}`) and recorded the reversal as
+instrumented — *"per-pin lambda lifting restores all four, and `distilled/named/d426lift_*` is
+the tripwire that says when someone has landed it."* All four RUN again, and no longer by
+coincidence: the signature is built at the pin. Both named sets keep their place and their
+`sources.json` entries now say what they are tripwires FOR.
+
+**WHAT THE FLOOR STILL OWNS, stated rather than left to be rediscovered.** `checkParams`'
+rung is unchanged and still reachable, on the case the substitution cannot serve: a type
+parameter NO call site binds (`function opT<T, U>(a: T[])` with a `(x: U[]) => …` lambda).
+`monoSubstAnn` has no spelling for `U`, the clone declines, and the template must NOT be
+pruned — stubbing it would leave `const g = <() -> void stub>` and a silently wrong answer
+where the floor gives a loud one. That is why the prune keeps two ledgers (`monoLamPinned` /
+`monoLamShared`) and why `tests/cases/generics/error-lambda-param-unbound-typaram.vl` exists:
+delete the `monoNoteLamNode` call in the `-2` arm and that fixture stops refusing.
+
+**RESIDUE, filed rather than absorbed: D651.** Six grid cells (`bare/<bind>/len`) are a lost
+REFUSAL, not a lost lowering — `(x: T) => x.length` reaches the emitter where the direct
+`(x: i32) => x.length` is a loud CHECK reject. Their outcome CLASS did not move across this
+landing (only the message did), so no derived rule can find them; they are kept whole at
+`distilled/named/d651len_*.vl`.
+
+Fixtures: `tests/cases/generics/lambda-param-type-param-runs.vl` (the accept set — `T[]`,
+bare `T`, `T | null`, `T[][]`, two pins of one generic, an uninstantiated template, every
+value read back), `tests/cases/generics/error-lambda-param-unbound-typaram.vl` (the floor's
+remaining domain), and `tests/cases/generics/lambda-in-generic-body-runs.vl` (the four shapes
+that always ran and must keep running). The 2026-08-28 `@emit-error` fixture
+`error-lambda-param-type-param.vl` is RETIRED with its evidence: the program it refuses runs.
+
+#### The close (2026-08-28) — the floor, kept below as the record of what was priced
 
 **THE FLOOR ALREADY EXISTED AND ASKED THE WRONG QUESTION.** A BARE `T` parameter is refused
 by `checkParams`' ladder at every argument rep — it matches no rung and falls to
@@ -14259,9 +14412,12 @@ moves **0** cells of D401's `printgrid.py`; D401's rung alone moves **0** cells 
 The predicate and the floor rung ablate together — the floor calls the predicate, and the
 predicate without the floor is a dead export that changes the seed size.
 
-Fixtures: `tests/cases/generics/error-lambda-param-type-param.vl` (the floor) and
-`tests/cases/generics/lambda-in-generic-body-runs.vl` (the four shapes it must not refuse,
-read back by value — including the `(T) => T` parameter the wide predicate ate).
+Fixtures (as of 2026-08-28): `tests/cases/generics/error-lambda-param-type-param.vl` (the
+floor) and `tests/cases/generics/lambda-in-generic-body-runs.vl` (the four shapes it must not
+refuse, read back by value — including the `(T) => T` parameter the wide predicate ate). The
+first of those is RETIRED by the 2026-08-30 close above: the program it pinned as a refusal
+now runs, and the floor's remaining domain is pinned by
+`error-lambda-param-unbound-typaram.vl` instead.
 
 ---
 
@@ -19234,6 +19390,59 @@ Repro (now runs, printing `7`):
 * **DELIBERATELY THE `??` AND NOT A GENERAL JOIN.** The other joiners — a two-destination list
   literal, a function returning both arms — reach the design refusal or another open row, so
   widening the gate would claim rows that are not this one's.
+
+### D651 — `.length` on a bare `T` inside a generic body: the checker refuses the DIRECT spelling and lets the type-parameter one through to the emitter
+**LOUD EMIT REJECT (`emitProgram: '.length' on a receiver the emitter cannot classify as a
+list, string, map or set`) where the DIRECT spelling is a loud CHECK reject (`member access
+'.length' on non-object i32`) · a lost REFUSAL, not a lost lowering — clause 2 in the
+direction that hides · found 2026-08-30 as the residue of D426's close, by that row's own
+grid · six cells, kept whole at `distilled/named/d651len_*.vl`**
+
+Repro:
+
+    function opT<T>(a: T): i32 {
+      const g = (x: T) => x.length
+      return g(a)
+    }
+    function cell(): i32 {
+      const a: i32 = 1
+      return opT(a)
+    }
+    print(cell())
+    // vl check rc 0; vl run:
+    //   emitProgram: '.length' on a receiver the emitter cannot classify as a list,
+    //   string, map or set
+
+* **THE CONTROL IS ONE ANNOTATION AWAY AND IT IS A CHECK REJECT.** Written concretely —
+  `function opT(a: i32) { const g = (x: i32) => x.length … }` — `vl check` refuses it at the
+  member access: `[ERROR]: member access '.length' on non-object i32`. Behind a type
+  parameter the same body checks clean and the EMITTER is left holding it. Under the standing
+  goal that is a clause-2 violation by construction: `check` returned 0, so either the program
+  is legal and must compile, or the checker owed the diagnosis. Here the checker owed it.
+
+* **IT IS NOT D426's MECHANISM AND PER-PIN LIFTING DOES NOT MOVE IT.** D426's family is a lost
+  LOWERING — the lambda's signature was interned at the unsubstituted type — and its close
+  moves all 68 of the grid's `gen`-refuses-while-`con`-runs cells to `runs`. These six are the
+  complement: their control does not run either, it REJECTS, and what is missing is the
+  rejection. Measured on `scripts/silent-sweep/d426/lamgrid.py`, which grades every generic
+  cell beside its concrete control: `gen=emit_reject / con=check_reject`, six cells, at
+  `bind ∈ {bool, f64, i32, lit, nuli, rec}` and body `len` only.
+
+* **NOTHING DERIVED CAN FIND THEM, WHICH IS WHY THEY ARE A NAMED SET.** Their outcome CLASS
+  did not move across D426's landing — `loud emit reject` before and after — so every grade
+  column, every histogram and the whole distilled `cells/` half is flat over them. Only the
+  MESSAGE changed (from D426's `parameter `T` still names an unsubstituted type parameter` to
+  the `.length` one), and a message is not a class. `distilled/named/d651len_*.vl` is what
+  keeps them visible.
+
+* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The checker has to re-ask a lambda body's member
+  access at the PIN, the way `validateBinCstrs` / `validateArgCstrs` / `validatePrintCstrs`
+  re-ask the operator, the argument flow and printability there (D401 built the fourth of
+  those and its header names the shape). A `noteMemberCstr` recording a member access whose
+  receiver type still carries a hole, stamped with `cstrOwnerTop()` and validated at the pin
+  against the same floor the direct spelling meets, is the fifth table of exactly that
+  family. Until it exists the emitter's floor is the only thing standing, and it is a floor:
+  it names a rep it cannot classify, not a rule the language has.
 
 ## 6. Coverage gaps — axes not built, and why
 
