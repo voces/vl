@@ -18845,6 +18845,263 @@ Repro:
   declared row — under a resolver that admits one, D592's deleted `tyHasErr` concreteness gate
   stops being redundant and comes back with it.
 
+### D661 — [CLOSED 2026-08-30] the destination scan matched a NAME over the whole arena, so two bindings that only share a name read as one binding with two destinations
+**now RUNS, closed 2026-08-30 · the witness was a positioned emit reject carrying D411's
+two-destination message · found working the 33-cell D411 cluster, whose own question — how many
+of the 33 are genuinely two-destination — answers 33 of 33, while the number that matters is
+the one the corpus has no cell for: 164 of 182 two-binding programs outside it were
+single-destination and refused anyway · 172 of 211 grid cells to `runs`, 0 `runs` lost, 0 into
+any silent class, D411's 103-cell grid UNMOVED, 2,433 corpus modules BYTE-IDENTICAL**
+
+Repro (now runs, printing `1` then `7`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function fu() {
+      const lv1 = [{ r: 7 }]
+      const cU: Shape[] = lv1
+      print(cU.length)
+    }
+    function fs() {
+      const lv1 = [{ r: 7 }]
+      const cS: Circle[] = lv1
+      print(cS[0].r)
+    }
+    fu()
+    fs()
+    // was: Error: emit error — emitProgram: one un-annotated list literal is bound to TWO
+    //   declared destinations whose elements are stored differently …
+    // Now: runs and prints 1 then 7.
+
+* **THE SPLIT THE CLUSTER WAS OPENED TO MEASURE, AND WHERE THE ANSWER ACTUALLY LIVES.** All
+  **33** corpus cells carrying the two-destination message are `d411_*` — the named set of
+  `scripts/silent-sweep/d411/gen411.py` — and every one is genuinely two-destination BY
+  CONSTRUCTION: the grid varies the SPELLING of two destinations and holds one thing fixed in
+  all 103 of its cells, that both bind the same `lv1`. So the split inside the corpus is 33/0,
+  and that number says nothing about VL. It says the census has no program in which two
+  bindings share a name — blocks A–E carry at most one annotated destination per binding, which
+  is why D411's cells had to be committed whole in the first place. **The corpus scores only the
+  gaps it has a program for, and this was one it did not have.**
+
+* **THE PROGRAM THE SCAN CANNOT TELL FROM A CONFLICT, AND THE ONE-TOKEN CONTROL.** Rename
+  `fs`'s `lv1` to `lv2` above and the identical program RUNS on master. Nothing else changes:
+  not a type, not a destination, not an order. `letRefListDestSlotK`'s destination scan was
+  `while i < P.nodes.length` over the WHOLE arena matched on the binding's NAME — its own
+  header said so, on `letMapDestShape`'s and `letInfStrListByUse`'s precedent — so it found
+  `fs`'s `Circle[]` while answering for `fu`'s `lv1`, D411's conflict fired, and BOTH
+  single-destination programs were refused.
+
+* **AND IT IS NOT ONLY THE REFUSAL — THE SLOT PICK LEAKED THE SAME WAY.** With no second
+  destination to conflict with, a cross-scope match silently re-slots the other binding:
+
+      function f() { const lv1 = [{ r: 7 }]; print(lv1[0].r) }
+      function g() { const lv1 = [{ r: 7 }]; const cU: Shape[] = lv1; print(cU.length) }
+
+  master: `emitProgram: field access but no struct type declared` at `lv1[0].r` — `f`'s list
+  was minted at `g`'s union-box slot. Now it runs and prints `7` then `1`.
+
+* **THE BYTES, AND THE CONTROL LANDS ON THEM EXACTLY.** Off `./node_modules/.bin/wasm-dis`
+  (binaryen 130), on the variant of that program whose module master DOES build validly
+  (`print(lv1.length)` instead of `lv1[0].r`), the type section is byte-identical between the
+  two seeds and one function changes — `f`, the one with no destination of its own:
+
+      -  (local $0 (ref $7))
+      -   (struct.new $7 (array.new_fixed $6 1 (struct.new $3 (i32.const 0) (struct.new $1 …
+      +  (local $0 (ref $5))
+      +   (struct.new $5 (array.new_fixed $4 1 (struct.new $1 …
+
+  `$3` is the union box `(struct (field i32) (field anyref))`, `$6` its array, `$7` the wrapper;
+  `$1` is `Circle`, `$4` its array, `$5` the wrapper. Master wraps `f`'s element in a box it has
+  no destination for, one allocation per element. **And the renamed control compiled by the
+  MASTER seed emits `$5`/`$4`/`$1` too** — the landing makes the shared-name program compile to
+  what the renamed program already compiled to, which is the alias ceasing to be a dialect
+  rather than acquiring one.
+
+* **THE SCOPE, AND THE DECLINE THAT KEEPS IT SAFE.** `dsScopeRootOf` answers three ways.
+  `fnIx`'s body once `parentLetOf` CONFIRMS this binding is what the name denotes there — the
+  confirmation matters because `fnIx` is the function the classifier is working in, not a
+  recorded owner of `letIx`. The module root (`emitProgram`'s own `rootIx`, banked as
+  `emitRootIx` beside the other per-program arena resets) when `globalLetOf` confirms a global.
+  And **-1 otherwise, which keeps today's whole-arena scan**: a binding whose scope cannot be
+  named is one whose destinations a scoped walk could silently MISS, and a missed destination is
+  D381 un-landing into a check-clean invalid module. The walk itself is `alcWalk`'s
+  (`emit_collect`'s `scanArrLitCommit`) over `nodeChildren`, and the seven form tests were
+  lifted into `dsDestSlotAt` so the scoped walk and the fallback put the identical question.
+
+* **IT DESCENDS INTO A NESTED FUNCTION, unlike `alcWalk`, and the gate is the scope rule
+  itself.** `function outer() { const lv1 = [{r:7}]; function inner() { const c: Shape[] = lv1 } }`
+  delivers the binding to a declared destination and refusing to look would lose it; a nested
+  frame that REBINDS the name never denotes it. Both binding forms count, because either alone
+  leaks: a local (`parentLetOf`) and a PARAMETER.
+
+* **FIVE RUNGS, ABLATED, AND THE ONE THAT SCORES ZERO IS A `runs` LOST ON ITS OWN.** One
+  compiler per strip, each rebuilt from the base seed, graded over the 211-cell grid.
+
+  | rung | site | cells needing it |
+  |---|---|---|
+  | 1 | `dsScopeRootOf`'s LOCAL arm | **172** — every cell the change moves |
+  | 2 | `dsScopeRootOf`'s GLOBAL arm | **48**, all 48 also needing rung 1 |
+  | 3 | `dsRebindsName`'s local-shadow arm | **52** (48 `shadow` + 4 `capsh`) |
+  | 4 | `dsRebindsName`'s PARAMETER arm | **1** (`d661_capp_bind`) |
+  | 5 | `dsScopeWalk` descending a nested function | **0** — and stripping it takes `d661_cap_{bind,callarg,listlist,structfield}` from `runs` to `loud emit reject`, a **4-cell `runs` LOST** |
+  | strip-all | | grid reproduced **cell for cell, 211 of 211**, and the corpus emits byte-identically (2,431 modules, 0 DIFFER) |
+
+  Rung 2 is worth 48 and rung 1 is worth 172 and their union is 172: **every cell rung 2 buys
+  also needs rung 1**, because a `shadow` cell has a module binding and a local one and is only
+  correct once BOTH are scoped. Rung 5 is the shape the ablation discipline warns about — zero
+  on the moved population, catastrophic alone. Strip-all is not byte-identical as a SEED
+  (1,513,534 vs 1,512,652 bytes: the change also carries the `dsDestSlotAt` extraction and one
+  new state slot), so the equivalence is stated where it is checkable — the grid cell for cell,
+  and the corpus byte for byte.
+
+* **THE TWO-DESTINATION REFUSAL IS UNTOUCHED, AND THAT IS MEASURED, NOT ASSERTED.** D411's own
+  103-cell grid grades **loud emit reject 96 / runs 7 on both seeds, 0 cells moved in any
+  direction**. This rung changes which bindings count as ONE binding; it does not change what
+  happens to one binding with two destinations. See D661B for why that refusal is right.
+
+* Corpus `cmp` **2,433 modules · 0 DIFFER · 0 LOST**; `tests/cases` native sweep
+  **PASS=1862 CHECKFAIL=0 RUNFAIL=0 LOGDIFF=0**; distilled corpus **0 `runs` lost, 0 → silent,
+  0 other movement** against master's baseline as well as this branch's. The 81-cell boundary of
+  `scripts/silent-sweep/d661/gen661.py` is committed to `distilled/named/` (`--verify` clean),
+  and the master seed now grades **54 classes `runs` → not-runs** against it, which is what says
+  the gate carries this. Fixtures
+  `tests/cases/unions/list-literal-destination-scope.vl` and
+  `…-shadow.vl`.
+
+* **THE SAME WHOLE-ARENA NAME SCAN IS WRITTEN TWICE MORE and is NOT fixed here.**
+  `letMapDestShape` and `letInfStrListByUse` carry the identical `while i < P.nodes.length`
+  name match, and `letRefListDestSlotK`'s header cited them as its precedent. Neither is graded
+  by this grid and neither is claimed. They are the obvious next two.
+
+---
+
+### D661A — a captured binding's destination lives in the NESTED frame, and the three destination forms that resolve through `fnIx` cannot see it there
+**check-clean invalid wasm · found 2026-08-30 closing D661, as the exact residue its scoped
+walk enters but cannot answer · 3 of the 7 destination spellings, and the 3 are exactly the 3
+that read `fnIx` · unmoved by D661 in either direction, and identical on both seeds**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function outer() {
+      const lv1 = [{ r: 7 }]
+      function inner(): Shape[] {
+        return lv1
+      }
+      const rrU = inner()
+      print(rrU.length)
+    }
+    outer()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code at offset 308: type mismatch:
+    //   expected (ref $type), found (ref $type)
+    // SHOULD PRINT 1
+
+* **THE ABLATION IS THE FORM AXIS, AND IT IS THREE OF SEVEN.** D661's walk enters `inner` (that
+  is rung 5, and without it four MORE cells break), so the destination node IS visited. What
+  fails is resolving it. Over the seven spellings, with the destination moved into a nested
+  frame: `bind`, `listlist`, `callarg` and `structfield` **run**; `ret`, `assign` and
+  `mapstore` are check-clean invalid wasm. The four that work read their answer off the
+  destination NODE — an annotation, a callee's parameter, a struct field. The three that fail
+  route through `fnIx`: `ret` reads `P.nodes[fnIx].fnRet`, `assign` calls
+  `destLetOf(name, fnIx)`, `mapstore` calls `mapValKindListSlot(name, fnIx, want)`. `fnIx` is
+  the binding's OWN frame (`outer`), and the destination is in `inner`, so all three ask the
+  wrong function and answer -1.
+
+* **NOT A MESSAGE FAMILY.** All three print `type mismatch: expected (ref $type), found (ref
+  $type)`, which is the sentence `CLAUDE.md` names as meaning nothing on its own. What groups
+  them is the ablation above — the same three forms, moved one frame in, and the four others
+  moved the same way keep running.
+
+* **HOISTING THE DESTINATION IS THE CONTROL AND IT RUNS.** `d661_ctl_ret__u` is this program
+  with `inner` deleted and the `return` in `outer`; it runs on both seeds. So neither the
+  spelling nor the capture alone is the defect — it is the pair.
+
+* Its three cells are in `distilled/named/` as `d661_cap_{ret,assign,mapstore}` and are three
+  of the four clause-1 cells the scoreboard now shows. **They are pre-existing and were silent
+  on master too**; what changed is that the corpus has a program for them.
+
+* **WHAT WOULD HAVE TO BE TRUE TO LIFT IT.** The three forms need the frame the DESTINATION
+  lives in, not the frame the binding lives in. `dsScopeWalk` already knows it — it is the
+  nested `FuncDecl` it just descended through — so the fix is to thread that frame down to
+  `dsDestSlotAt` instead of passing `fnIx` unchanged, and to prove on the grid that the four
+  working forms are untouched by it.
+
+---
+
+### D661B — array assignment is COVARIANT in the checker and lowered nowhere, so the two-destination refusal is a design rule the checker cannot yet state
+**check-clean invalid wasm · found 2026-08-30 answering D411/D501's design question · no
+corpus cell reaches it · the CHECKER-side answer was built and REFUSED: array invariance costs
+14,105 census cells and all 7 of D411's single-destination controls**
+
+Repro:
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function poison(xs: Shape[]) { xs[0] = { s: 3 } }
+    function f() {
+      const a: Circle[] = [{ r: 7 }]
+      poison(a)
+      print(a[0].r)
+    }
+    f()
+    // vl check rc 0 (a redundant-annotation HINT and nothing else); vl run:
+    //   Invalid input WebAssembly code at offset 277: type mismatch:
+    //   expected (ref $type), found (ref $type)
+    // SHOULD PRINT 7 — and it cannot, which is the point
+
+* **WHY D411 AND D501 ARE RIGHT TO REFUSE, ARGUED FROM TWO MEASUREMENTS RATHER THAN FROM THE
+  EMITTER'S CAPABILITIES.** (1) **VL lists are REFERENCES.** `const b: i32[] = a; b[0] = 99`
+  prints `99` through `a`, and so does the same store made by a callee through its parameter.
+  (2) **The checker admits covariant array assignment.** `assignableGo`'s `TyArray` arm is
+  `assignable(sTail.aElem, d.aElem)` with no mutability qualification, and the repro above is
+  `vl check` rc 0. Those two facts together are the classic unsound pair: the program above,
+  IF it were lowered, reads a `Sq` through a `Circle`-typed handle. So for one list value bound
+  to two destinations whose elements are stored differently, **no lowering is correct** —
+  aliasing admits exactly the type-confused read `vl check` accepted, and a converting copy
+  gives one destination a private list, which no other list assignment in the language does.
+  That is a DESIGN answer, not "the emitter can't do it", and D411's third enumerated option
+  ("splitting the binding … changes aliasing for programs that run today") is the same
+  observation from the other side.
+
+* **THE CHECKER IS WHERE THAT RULE BELONGS AND IT IS PRICED, NOT ARGUED.** A compiler with
+  `assignableGo`'s array arm made INVARIANT (`tySame` on the element, holes exempt) was built
+  and graded. Distilled corpus: **518 behavioural classes / 14,105 census cells `runs` →
+  NOT-RUNS**. D411's own grid: **all 7 single-destination controls `runs` → loud check reject,
+  0 cells gained**, exactly the price D411's row predicted and now measured. **REFUSED** on the
+  gate's own criterion.
+
+* **AND THE CHEAP VERSION IS NOT AVAILABLE EITHER.** The reason invariance is that expensive is
+  that the checker infers an un-annotated `const lv1 = [{r:7}]` EAGERLY as `{r: i32}[]` (its own
+  redundant-annotation hint says so) and then admits every destination by covariance. The
+  emitter is what treats the element row as a HOLE to be filled from the destination — that is
+  D381's rung, and D613's. So the checker-side statement of "a list value has one element type"
+  needs an element-type hole unified across destinations, which is a language feature and not a
+  message move. **Re-wording the emitter's refusal into the checker without it would move a
+  scoreboard number without changing a single program**, and that is the thing this file is not
+  for.
+
+* **THE ELEMENT-WIDENING COPY IS THE SAME QUESTION AND GETS THE SAME ANSWER.**
+  `scripts/capability-probes/element-widening-copy.vl` — `take_i(e) + take_f(e)` over one
+  `const e = []` — refuses at check with *"type-valid (the element type widens) but not yet
+  supported by codegen … no element-converting copy exists"*. The concession phrase is what the
+  goal scoreboard counts, and the sentence after it is already the design rule. A converting
+  copy is not merely unbuilt: `const e = []; take_i(e); e.push(1); take_f(e)` would diverge,
+  because a `const` list is mutable. The probe is left as it is deliberately — flipping its
+  wording is the relabelling this row exists to refuse until VL actually decides between
+  invariance, checked stores, and value semantics. **This row is what makes that decision
+  priced rather than open-ended.**
+
+* **THE ROW ITSELF IS A LIVE CLAUSE-1 CELL AND NO CORPUS CELL REACHES IT.** Both spellings —
+  the call above and the plain `const b: Shape[] = a` — are `vl check` rc 0 and invalid wasm.
+  The census has no two-annotated-container-types cell, so `goal-scoreboard.py` scores this
+  family at zero. It is a hand-written probe's worth of work to change that and none will
+  arrive on its own.
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
