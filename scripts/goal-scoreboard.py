@@ -40,8 +40,33 @@ DEFAULT_BASELINE = os.path.join(HERE, "silent-sweep", "distilled", "baseline.jso
 # no such cell until D741's witness (`d741_w0_base`, check rc 0 then `wasm trap: cast failure`)
 # added the first two. `regress.py`'s own SILENT tuple has always said `trap_loads`; the two
 # instruments now agree, which is the property that was missing rather than the spelling.
-SILENT = ("check-clean invalid wasm", "check-clean silently wrong",
-          "check-clean wrong evaluation", "trap_loads", "compiler trap")
+# AND THE SAME MISS AGAIN, ONE CLASS OVER. `gradecensus.py` writes a check-clean module that
+# LOADS AND PRINTS THE WRONG ANSWER as `runs but wrong value` — the worst outcome in the whole
+# taxonomy, and the two prose spellings above (`check-clean silently wrong`, `check-clean wrong
+# evaluation`) are DOC vocabulary that the grader never emits. `regress.py`'s tuple has said
+# `runs but wrong value` all along. The corpus held no such cell until D832's witness
+# (`d832_match_untested_else`: a `match` whose untested final arm runs the `Sq` body for a
+# `Tri` and prints 200), which is why it survived the D742 audit that fixed `trap_loads`.
+# Clause 1 is defined by EXCLUSION, and it has to be, because listing the silent classes by
+# name has now failed twice in the same way. Both times I wrote the phrases from
+# `check-filed-witnesses.py`'s DECLARED *status vocabulary* (what a ROW's status line may say)
+# instead of the outcome CLASSES the corpus grader writes into the baseline:
+#
+#   * `"loads then traps"` where the grader writes `trap_loads` — fixed in #2055 after two
+#     agents found six mis-recorded cells the gate could not see.
+#   * `"check-clean silently wrong"` / `"check-clean wrong evaluation"` where the grader
+#     writes `runs but wrong value` — found when an agent added the corpus's FIRST
+#     wrong-value cell and the scoreboard scored it at zero.
+#
+# Four of my five entries were dead strings at one point or another. A whitelist of an open
+# set is the wrong shape: every future class defaults to UNCOUNTED, and uncounted reads as
+# "clause 1 is clean".
+#
+# So: a cell is a clause-1 violation when it neither RUNS nor was loudly refused. A new
+# outcome class now defaults to COUNTED, which is the safe direction — a spurious violation
+# gets investigated, a missing one does not.
+RUNS_OK = ("runs",)
+LOUD = ("loud check reject", "loud emit reject")
 
 # A refusal that CONCEDES the program is type-valid. These are the compiler naming its own
 # capability gaps: the type system permits the program and the backend cannot lower it.
@@ -123,7 +148,8 @@ def main():
     by = collections.Counter(v["class"] for v in cells.values())
     runs = by.get("runs", 0)
 
-    silent = {k: v for k, v in cells.items() if v["class"] in SILENT}
+    silent = {k: v for k, v in cells.items()
+              if v["class"] not in RUNS_OK and v["class"] not in LOUD}
     # Every emit reject reached the emitter, so `check` returned 0: the checker accepted a
     # program the backend then refused. Either it is legal and should compile, or it is
     # illegal and the CHECKER owed the diagnosis. Both are defects under clause 2.
