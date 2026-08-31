@@ -3163,6 +3163,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
 export function initChecker() {
   redunReset()
   rcoalReset()
+  covarWriteReset()
   cbExpNode = []
   cbExpOff = []
   cbExpLen = []
@@ -8049,6 +8050,20 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // "cannot assign" from the caller would contradict this one. The error already
     // recorded is what fails the check.
     if !inferQuiet && srcExpr >= 0 {
+      // THE `Writable` FLOOR (A9, D793). A covariant list assignment whose value is
+      // WRITTEN THROUGH cannot be lowered by either answer the language has — an alias
+      // admits the type-confused read D661B names, and D791's converting copy gives one
+      // handle a private list. The assignment itself is what is illegal, and it is
+      // reported at THIS seam for `objShapeAdapterless`'s reason: it is the one every
+      // binding / argument / return / field / element / store flows through.
+      //
+      // Reported here and answered TRUE, the same discipline the two rungs below follow:
+      // the program IS type-valid, so a second "cannot assign" from the caller would
+      // contradict this message.
+      if covarWriteThrough(srcExpr, srcTy, dstTy) {
+        covarWriteThroughErr(srcExpr, srcTy, dstTy)
+        return true
+      }
       if objShapeAdapterless(srcExpr, srcTy, dstTy, 12, true) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       }
@@ -15949,6 +15964,614 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
   const dc = elemStoreClassOf(de, 8)
   if dc == ESC_UNKNOWN { return false }
   sc != dc
+}
+
+// ── WRITTEN-THROUGH COVARIANCE: the PER-VALUE half of D791's write scan (D821) ──
+//
+// D791 lowered a read-only covariant list assignment as an element-CONVERTING COPY and
+// licensed it with `rlSlotEverWritten` — "does any list store or mutating list method in
+// this program reach a list whose element REP is this row". That predicate answers the
+// right question at the wrong granularity, and its own row (D791) says so: it is
+// REP-SCOPED, so a write to an UNRELATED list that happens to share an element rep
+// declines the copy for a program nothing writes through. `d791_unrelated_write_blocks`
+// is that cell.
+//
+// Declining a LOWERING on a rep-scoped answer costs nothing — the program did not compile
+// either way. REFUSING a program on one is a false reject, and clause 2 forbids exactly
+// that. So a `Writable` rule (`DECISIONS.md` A9, D793) cannot be built on the rep answer;
+// it needs a per-VALUE one, and this is it.
+//
+// WHAT IT ANSWERS, and the three-valued result is the whole discipline:
+//   0 — no write in this program can reach this value. The copy is unobservable, and a
+//       covariant assignment of it is legal.
+//   1 — a write DOES reach it. The copy would be observable, so the assignment is
+//       `Writable` and the CHECKER refuses it (`covarWriteThroughErr`).
+//   2 — unknown. The value escapes through a form this analysis does not model, so
+//       neither answer is earned: the emitter falls back to the rep-scoped scan (master's
+//       behaviour) and the checker refuses NOTHING. A false reject is the one outcome
+//       clause 2 rules out, so `2` is never a refusal.
+//
+// NAME-BASED, AND THAT IS A SOUND OVER-APPROXIMATION RATHER THAN D661's BUG. D661 fixed a
+// name-matched arena scan that read two same-named bindings as ONE binding with two
+// destinations — there, merging two bindings produced a WRONG ANSWER. Here merging them
+// only ever ENLARGES the alias set, which can turn a `0` into a `1` or a `2` and never the
+// other way. So this needs no scope stack and no `fnIx`, exactly as `rlSlotWrittenScan`
+// needs none, and a shadowed name costs a decline rather than a miscompile.
+//
+// IT IS ONLY EVER CONSULTED WHERE THE REP-SCOPED SCAN ALREADY SAID "WRITTEN", which makes
+// the emitter side MONOTONE by construction: every delivery master widens still widens,
+// so no `runs` cell can be lost to this rung. The checker side is the half that can redden
+// a program, and it is gated on `1` — a definite write through the value.
+
+// The alias-closure memo, keyed by the ROOT NAME the analysis was seeded from. The arena
+// does not change between `check` and `emit`, so the checker's answer and the emitter's
+// are literally the same row and cannot disagree — `cwArenaLen` drops the memo if the
+// monomorphizer has since cloned nodes into the arena.
+let cwRootNames: string[] = []
+let cwAnswers: i32[] = []
+// Parallel to `cwAnswers`: 1 where the alias set demands TWO element storages (see
+// `cwSplitStorage`), 0 otherwise. Meaningful only where the closure actually ran.
+let cwSplits: i32[] = []
+let cwArenaLen = -1
+// -1 = not computed, 0 = this program contains no list write at all, 1 = it contains one.
+let cwAnyWrite = -1
+// The function-name -> declaration index table the argument->parameter edge reads. Built
+// once per program, because the edge is asked inside a fixpoint over the whole arena.
+let cwFnNames: string[] = []
+let cwFnDecls: i32[] = []
+let cwFnBuilt = false
+
+export function covarWriteReset() {
+  cwRootNames = []
+  cwAnswers = []
+  cwSplits = []
+  cwArenaLen = -1
+  cwAnyWrite = -1
+  cwFnNames = []
+  cwFnDecls = []
+  cwFnBuilt = false
+}
+
+// `unwrapParen`'s twin — that one lives in `emit_base`, which is downstream of this file.
+function cwPeel(ix: i32): i32 {
+  let cur = ix
+  let done = false
+  while !done {
+    if cur < 0 || cur >= P.nodes.length { return cur }
+    const n = P.nodes[cur]
+    if n is Paren { cur = n.parInner } else { done = true }
+  }
+  cur
+}
+
+// The NAME an expression roots at — a bare (possibly parenthesised) identifier — or "".
+// A member read, an index, a call result or a literal roots at NOTHING on purpose: those
+// are the forms whose provenance this analysis does not follow, and "" is what routes
+// them to the `2` answer rather than to a guess.
+export function covarRootName(ix: i32): string {
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length { return "" }
+  const n = P.nodes[p]
+  if n is Ident { return n.identName }
+  ""
+}
+
+function cwHas(set: string[], nm: string): boolean {
+  let i = 0
+  while i < set.length {
+    if set[i] == nm { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The mutating LIST methods, `rlSlotWrittenScan`'s own set. `set` / `add` / `delete` are
+// map and Set operations; naming them costs a decline on a map with a member name in the
+// alias set and keeps the list honest if a list ever grows one.
+function cwMutatesList(p: string): boolean {
+  if p == "push" { return true }
+  if p == "pop" { return true }
+  if p == "clear" { return true }
+  if p == "set" { return true }
+  if p == "add" { return true }
+  if p == "delete" { return true }
+  false
+}
+
+function cwBuildFnTable() {
+  if cwFnBuilt { return 0 }
+  cwFnBuilt = true
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is FuncDecl {
+      if n.fnName != "" {
+        cwFnNames.push(n.fnName)
+        cwFnDecls.push(i)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The parameter name at position `argIx` of the top-level function `fnName`, or "" when
+// the callee names no declared function (a builtin, an import, a lambda-valued binding)
+// or the position is past its parameter list. "" is a DECLINE, not "no parameter": the
+// caller turns it into the `2` answer.
+function cwParamName(fnName: string, argIx: i32): string {
+  cwBuildFnTable()
+  let i = 0
+  while i < cwFnNames.length {
+    if cwFnNames[i] == fnName {
+      const d = P.nodes[cwFnDecls[i]]
+      if d is FuncDecl {
+        if argIx < d.fnParams.length {
+          const p = P.nodes[d.fnParams[argIx]]
+          if p is Param { return p.parName }
+        }
+      }
+      return ""
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// A call with NAMED arguments binds by name, not by position, so the positional
+// argument->parameter edge below would be reading the wrong parameter. Decline instead.
+function cwCallNamed(names: string[]): boolean {
+  let i = 0
+  while i < names.length {
+    if names[i] != "" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// THE ALIAS CLOSURE. Grows `set` until no new name joins, over the three edges that carry
+// a list value from one name to another WITHOUT putting it inside anything:
+//   · `const c = b`      — a passthrough binding
+//   · `c = b`            — an assignment to a plain identifier
+//   · `f(b)`             — a call argument reaching a declared function's parameter
+// Everything else is either caught here (an assignment whose LEFT side is not a plain
+// identifier is a store INTO a container) or by `cwClaimed` below.
+//
+// Returns 0 when the closure completed and 2 when it hit a form it does not model.
+function cwGrow(set: string[]): i32 {
+  let changed = true
+  let rounds = 0
+  while changed {
+    changed = false
+    rounds = rounds + 1
+    // The set grows by at least one name per round or the loop ends, so the bound is the
+    // number of names in the program; a fixed ceiling is cheaper than proving that here
+    // and turns any surprise into a DECLINE rather than a hang.
+    if rounds > 256 { return 2 }
+    let i = 0
+    while i < P.nodes.length {
+      const n = P.nodes[i]
+      if n is LetDecl {
+        if n.letInit >= 0 {
+          const rn = covarRootName(n.letInit)
+          if rn != "" {
+            if cwHas(set, rn) {
+              if !cwHas(set, n.letName) {
+                set.push(n.letName)
+                changed = true
+              }
+            }
+          }
+        }
+      }
+      if n is BinExpr {
+        if n.binOp == "=" {
+          const rn = covarRootName(n.binRight)
+          if rn != "" {
+            if cwHas(set, rn) {
+              const ln = covarRootName(n.binLeft)
+              // `m[k] = b` / `o.f = b` — the value goes INSIDE something, and a later
+              // read out of that container is a handle this analysis cannot name.
+              if ln == "" { return 2 }
+              if !cwHas(set, ln) {
+                set.push(ln)
+                changed = true
+              }
+            }
+          }
+        }
+      }
+      if n is Call {
+        let anyMember = false
+        let k = 0
+        while k < n.callArgs.length {
+          const an = covarRootName(n.callArgs[k])
+          if an != "" {
+            if cwHas(set, an) { anyMember = true }
+          }
+          k = k + 1
+        }
+        if anyMember {
+          if cwCallNamed(n.callArgNames) { return 2 }
+          const cn = covarRootName(n.callFn)
+          // A METHOD or a lambda-valued callee (`xs.push(b)`, `fp(b)`): the body that
+          // receives the value is not a declared parameter list this can read.
+          if cn == "" { return 2 }
+          let k2 = 0
+          while k2 < n.callArgs.length {
+            const a2 = covarRootName(n.callArgs[k2])
+            if a2 != "" {
+              if cwHas(set, a2) {
+                const pn = cwParamName(cn, k2)
+                if pn == "" { return 2 }
+                if !cwHas(set, pn) {
+                  set.push(pn)
+                  changed = true
+                }
+              }
+            }
+            k2 = k2 + 1
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Mark `ix` (paren-peeled) as a use this analysis accounts for.
+function cwMark(idents: i32[], flags: i32[], ix: i32) {
+  const p = cwPeel(ix)
+  let i = 0
+  while i < idents.length {
+    if idents[i] == p { flags[i] = 1 }
+    i = i + 1
+  }
+  0
+}
+
+// THE ACCOUNTING PASS, and it is a WHITELIST rather than a list of escapes — which is the
+// only shape of this test that is sound. Enumerating the ways a value can escape means a
+// form nobody thought of is silently treated as safe; enumerating the SAFE parents means
+// a form nobody thought of is a decline. Every occurrence of a member name has to be one
+// of a handful of uses that provably create no new handle:
+//   · the initializer of a binding      (`const c = b`   — modelled by `cwGrow`)
+//   · either side of an assignment      (`c = b`, `b = c`— modelled by `cwGrow`)
+//   · an argument of a call             (`f(b)`          — modelled by `cwGrow`)
+//   · the OBJECT of a member access     (`b.length`, `b.push(…)`)
+//   · the ARRAY of an index             (`b[0]`, and `b[0] = v` through its `Index`)
+// A member name inside an object literal, an array literal, a `return`, an `as`, a `match`
+// arm or any operator other than `=` is left UNCLAIMED, and an unclaimed occurrence is the
+// `2` answer.
+function cwClaimed(set: string[]): boolean {
+  const idents: i32[] = []
+  const flags: i32[] = []
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is Ident {
+      if cwHas(set, n.identName) {
+        idents.push(i)
+        flags.push(0)
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is LetDecl {
+      if n.letInit >= 0 { cwMark(idents, flags, n.letInit) }
+    }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        cwMark(idents, flags, n.binLeft)
+        cwMark(idents, flags, n.binRight)
+      }
+    }
+    if n is Call {
+      let k = 0
+      while k < n.callArgs.length {
+        cwMark(idents, flags, n.callArgs[k])
+        k = k + 1
+      }
+    }
+    if n is Member { cwMark(idents, flags, n.memObj) }
+    if n is OptMember { cwMark(idents, flags, n.omObj) }
+    if n is Index { cwMark(idents, flags, n.idxArr) }
+    i = i + 1
+  }
+  i = 0
+  while i < flags.length {
+    if flags[i] == 0 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Does this program contain ANY list write? The O(1) gate that keeps the closure off every
+// program that has nothing to separate — and the reason the emitter's answer is unchanged
+// for every delivery master already widened.
+function cwProgramHasWrite(): boolean {
+  if cwAnyWrite >= 0 { return cwAnyWrite == 1 }
+  let found = false
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const l = cwPeel(n.binLeft)
+        if l >= 0 && l < P.nodes.length {
+          const ln = P.nodes[l]
+          if ln is Index { found = true }
+        }
+      }
+    }
+    if n is Call {
+      const cf = cwPeel(n.callFn)
+      if cf >= 0 && cf < P.nodes.length {
+        const cn = P.nodes[cf]
+        if cn is Member {
+          if cwMutatesList(cn.memProp) { found = true }
+        }
+        if cn is Ident {
+          if cn.identName == "__array_copy__" { found = true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if found { cwAnyWrite = 1 } else { cwAnyWrite = 0 }
+  found
+}
+
+// The write pass over a completed alias set. A write whose receiver roots at a member is a
+// definite hit (1); a write whose receiver roots at NOTHING (`m["k"][0] = v`,
+// `f()[0] = v`) could be any list and is a decline (2).
+function cwWrites(set: string[]): i32 {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const l = cwPeel(n.binLeft)
+        if l >= 0 && l < P.nodes.length {
+          const ln = P.nodes[l]
+          if ln is Index {
+            const rn = covarRootName(ln.idxArr)
+            if rn == "" { return 2 }
+            if cwHas(set, rn) { return 1 }
+          }
+        }
+      }
+    }
+    if n is Call {
+      const cf = cwPeel(n.callFn)
+      if cf >= 0 && cf < P.nodes.length {
+        const cn = P.nodes[cf]
+        if cn is Member {
+          if cwMutatesList(cn.memProp) {
+            const rn = covarRootName(cn.memObj)
+            if rn == "" { return 2 }
+            if cwHas(set, rn) { return 1 }
+          }
+        }
+        // `__array_copy__` writes into a destination array through an intrinsic whose
+        // receiver this walk does not read, so it declines rather than being reasoned
+        // about — `rlSlotWrittenScan`'s own treatment of it.
+        if cn is Ident {
+          if cn.identName == "__array_copy__" { return 2 }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The element storage a DECLARED list annotation fixes: 1 = a value union's `{tag,
+// payload}` BOX, 2 = a plain struct ROW, 0 = neither, or an annotation whose type the
+// checker has not recorded yet.
+function cwElemKindOfAnn(annIx: i32): i32 {
+  if annIx < 0 { return 0 }
+  const ty = nodeTyIxOf(annIx)
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = T.tys[ty]
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 || e >= T.tys.length { return 0 }
+    const et = T.tys[e]
+    if et is TyUnion {
+      if covarNonNullArms(et.uMembers) >= 2 { return 1 }
+      return 0
+    }
+    if et is TyObj { return 2 }
+  }
+  0
+}
+
+// DOES THIS VALUE HAVE TO BE STORED TWO WAYS? A converting copy — and therefore the
+// divergence a write would expose — exists only where one list value is demanded at BOTH
+// a union-BOX element row and a plain struct ROW. Where every declared handle on the value
+// is a union (`d741_w4_same_union`, `d741_w5_no_narrow`), the value is built at the box
+// and every handle ALIASES it: the store is visible through all of them, no copy is taken,
+// and those programs run today and must keep running. That pair is the reason this test
+// exists and is not `assignable`'s covariance alone — the checker types an un-annotated
+// `const xs = [{r: 7}]` eagerly as `{r: i32}[]`, so the WIDENING is visible at every
+// destination while the two STORAGES it would need are visible only across them.
+//
+// Un-annotated members contribute nothing: their element row is the hole the destinations
+// fill (D381), which is what makes this a question about the DECLARED handles.
+function cwSplitStorage(set: string[]): boolean {
+  let sawBox = false
+  let sawRow = false
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is LetDecl {
+      if n.letType >= 0 {
+        if cwHas(set, n.letName) {
+          const k = cwElemKindOfAnn(n.letType)
+          if k == 1 { sawBox = true }
+          if k == 2 { sawRow = true }
+        }
+      }
+    }
+    if n is Param {
+      if n.parType >= 0 {
+        if cwHas(set, n.parName) {
+          const k = cwElemKindOfAnn(n.parType)
+          if k == 1 { sawBox = true }
+          if k == 2 { sawRow = true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if sawBox { return sawRow }
+  false
+}
+
+// Does the alias set of `root` demand two element storages? Only meaningful once
+// `covarValueWriteState` has run the closure for it (state 0 or 1).
+export function covarValueSplitStorage(root: string): boolean {
+  let m = 0
+  while m < cwRootNames.length {
+    if cwRootNames[m] == root { return cwSplits[m] == 1 }
+    m = m + 1
+  }
+  false
+}
+
+// THE PREDICATE. 0 = nothing writes this value, 1 = something does, 2 = unknown.
+export function covarValueWriteState(root: string): i32 {
+  if root == "" { return 2 }
+  if P.nodes.length != cwArenaLen {
+    // The monomorphizer clones nodes into the arena after `check`, so an answer computed
+    // over the smaller arena describes a program that no longer exists. Drop and recompute
+    // rather than carry it — a cloned body holds copies of the same writes, but this
+    // analysis reads every Ident in the arena and a clone adds Idents.
+    cwRootNames = []
+    cwAnswers = []
+    cwSplits = []
+    cwAnyWrite = -1
+    cwFnNames = []
+    cwFnDecls = []
+    cwFnBuilt = false
+    cwArenaLen = P.nodes.length
+  }
+  let m = 0
+  while m < cwRootNames.length {
+    if cwRootNames[m] == root { return cwAnswers[m] }
+    m = m + 1
+  }
+  let ans = 0
+  let split = 0
+  if cwProgramHasWrite() {
+    const set: string[] = []
+    set.push(root)
+    ans = cwGrow(set)
+    if ans == 0 {
+      if !cwClaimed(set) { ans = 2 }
+    }
+    if ans == 0 { ans = cwWrites(set) }
+    if ans != 2 {
+      if cwSplitStorage(set) { split = 1 }
+    }
+  }
+  cwRootNames.push(root)
+  cwAnswers.push(ans)
+  cwSplits.push(split)
+  ans
+}
+
+// ── THE CHECKER'S `Writable` RULE (A9, D793) ──
+//
+// A covariant list assignment is legal exactly where it is READ-ONLY. Where the value is
+// written through, the two element storages cannot both be honoured: an alias would let a
+// `Sq` be read back through a `Circle[]` handle (D661B's unsoundness) and the converting
+// copy D791 ships would give one handle a private list (D661B's objection). VL's answer is
+// that the assignment itself is illegal, which is A9's `Writable` half — inferred, with no
+// annotation surface.
+//
+// THE PAIR IS THE ONE `rlWidenVariantOf` LOWERS, stated in the type system's own words: a
+// REF element (a struct row) flowing into a BOX element (a value union's `{tag, payload}`).
+// `elemStoreClassOf` is the checker's existing name for that difference and is what
+// `containerElemClassDiffers` already asks of an array element pair, so this adds no new
+// vocabulary. A NICHE destination (`(Circle | null)[]`) is deliberately out: the widening
+// declines it write or no write (D792), so refusing only the written half would be
+// arbitrary. A literal-union or scalar element pair is out for the same reason — it is not
+// a REF into a BOX.
+//
+// THE SOURCE MUST BE A NAMED HANDLE. `const b: Shape[] = [{r: 7}]` has no second handle at
+// all: the literal is BUILT at the destination row, so a store through `b` is a store into
+// the only list there is and `d773_readonly_same` runs today with one. Aliasing is what
+// this rule is about, and a fresh literal creates none.
+function covarWriteThrough(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if srcExpr < 0 { return false }
+  if srcTy < 0 || dstTy < 0 { return false }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
+  const s = T.tys[srcTy]
+  if s is TyArray {
+    const d = T.tys[dstTy]
+    if d is TyArray {
+      const se = s.aElem
+      const de = d.aElem
+      if se < 0 || de < 0 { return false }
+      if se >= T.tys.length || de >= T.tys.length { return false }
+      const st = T.tys[se]
+      // A PLAIN STRUCT ROW on the source side — `rlElemKindTbl == 1`, the only element
+      // kind the widening reads from.
+      if st is TyObj {
+        const dt = T.tys[de]
+        if dt is TyUnion {
+          // A UNION THE EMITTER BOXES, not a nullable NICHE. One non-null member beside
+          // `null` reps as its base with a null slot (D771), so it is not a `{tag,
+          // payload}` destination and the widening declines it write or no write (D792);
+          // refusing only its written half would be arbitrary.
+          if covarNonNullArms(dt.uMembers) < 2 { return false }
+          const root = covarRootName(srcExpr)
+          if root == "" { return false }
+          if covarValueWriteState(root) != 1 { return false }
+          return covarValueSplitStorage(root)
+        }
+      }
+    }
+  }
+  false
+}
+
+// How many members of a union are not `null`.
+function covarNonNullArms(ms: i32[]): i32 {
+  let n = 0
+  let i = 0
+  while i < ms.length {
+    if !isNullTy(ms[i]) { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+// Reported at the ASSIGNMENT rather than at the write, because the assignment is what the
+// author can change and the write is what makes it illegal — the message names both roles.
+// NOT a capability concession: no phrase here claims the backend is behind the type system,
+// because it is not. The copy exists (D791); this program is the one shape where it is not
+// allowed to run.
+function covarWriteThroughErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  tErr(
+    "a " +
+      tyToStr(srcTy) +
+      " cannot be assigned to " +
+      tyToStr(dstTy) +
+      " here: the list is WRITTEN THROUGH somewhere in this program, and a covariant list " +
+      "assignment is read-only. The two element storages differ, so the destination would " +
+      "have to hold a converted copy, and a store through either handle would not be seen " +
+      "through the other. Declare the source as " +
+      tyToStr(dstTy) +
+      " so both handles share one element storage, or drop the write",
+    srcExpr,
+  )
 }
 
 // Does reaching `dst` from `src` need an object-shape ADAPTER that codegen does not
