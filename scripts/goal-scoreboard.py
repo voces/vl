@@ -52,10 +52,20 @@ CONCEDES = re.compile(
     re.I)
 
 
+# Primitive type names carry digits that are NOT noise. Collapsing them cost a real hour:
+# the conceded bucket printed `iN[]`, which was read as `i32[]` and led to a brief asserting
+# a lost capability at the pin. The cells were `i64[]`, whose DIRECT spelling refuses exactly
+# as the pinned one does — there was no lost capability, and an agent had to build a 100-pair
+# grid to say so. A normalized message is not a type.
+_PRIM = re.compile(r"[iuf](8|16|32|64)")
+_NUM = re.compile(r"[iuf]?\d+")
+
+
 def norm(msg):
     """Collapse a message to its shape so cells differing only in a type name group."""
     m = re.sub(r"`[^`]*`", "`X`", msg or "")
-    m = re.sub(r"\d+", "N", m)
+    # ONE pass: a primitive width keeps its digits, every other number collapses to N.
+    m = _NUM.sub(lambda x: x.group(0) if _PRIM.fullmatch(x.group(0)) else "N", m)
     m = re.sub(r"^(Error: )?(emit error\s*)?", "", m)
     return m.strip()[:118]
 
