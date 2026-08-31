@@ -18051,39 +18051,184 @@ Repro:
   mechanism count — D611 was filed at 58 on exactly that basis and had 3. The 55 here is also
   a message count until someone ablates the others; say so rather than inheriting it.
 
-### D625 — an empty `[]` returned at a NESTED array of STRUCTS: the element row is committed one dimension too shallow
-**check-clean invalid wasm · 5 cells · found 2026-08-30 in the same split · named by D613's close as its one holdout ("`b004880` has no capture — a different row") and filed here rather than left as a remark · TWO ingredients, and the nullable field is NOT one of them**
+### D625 — [CLOSED 2026-08-30] an empty `[]` at a NESTED array of a REF leaf: an ALLOW-LIST of six leaves decided whether the annotation was synthesized at all
+**closed as `runs` · was `check-clean invalid wasm` · found 2026-08-30, named by D613 as its one holdout · NOT D613's mechanism: the hole is COVERAGE rather than section ordering, and the filed hypothesis was refuted at the first probe · 2 corpus classes / 152 census cells -> `runs`, 0 `runs` lost, 0 into any silent class**
 
-Repro:
+Repro (now runs, printing `0`):
 
     function mkc(): {r: i32 | null}[][] {
       const cc = []
       return cc
     }
     print(mkc().length)
+    // was: vl check rc 0 with NO diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 287:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // Now: prints 0.
+
+* **THE FILED LEAD WAS "D613's MECHANISM AT A RETURN" AND IT IS NOT.** D613's env field was
+  typed a section too early — the annotation existed, just later. Here **no annotation is ever
+  synthesized, at any time**. A probe on `synthEmptyListAnn`'s own selection reads
+  `elem=[] nested=[] holek=0` for the filed witness: `nodeArrayElemName` returns "", so the
+  synthesis declines, `collectLocals` types the local from the i32-list default, and every later
+  pass agrees with the default. Ordering is not involved.
+
+* **THE BYTES SAY WHICH SIDE WAS WRONG, AND IT IS THE MIRROR OF D613's.** Off
+  `./node_modules/.bin/wasm-dis`, three lines change and all three are in the BODY:
+
+      -  (local (ref $6))    (array.new_fixed $3 0)    (struct.new $6)
+      +  (local (ref $10))   (array.new_fixed $9 0)    (struct.new $10)
+
+  `$6` is the i32-list wrapper; `$10` is `{(ref (array (mut (ref null $8)))), i32, i32}` with
+  `$8` the inner `{r: i32|null}[]` wrapper. The SIGNATURE was right on master — `(func (result
+  (ref $10)))`, read off the declared return — and the body built the default into it. D613 was
+  the other way round: signature wrong, body right.
+
+* **THE CAUSE IS AN ALLOW-LIST OF SIX LEAVES.** `tyNestedArrLeafSupported` admitted a nested
+  element whose LEAF is a litunion / `i32` / `boolean` / `string` / `f64` / `i64`, and its header
+  gave the reason: the ROW's kind came from `arrLitNestedElemKind`, a HAND-MAP whose authority is
+  `refArrElemKind(<elem> + "[]")`, and the two agree on exactly that set (an `f32[]` leaf is 4
+  here and 10 there; a nested `i32[][]` leaf is 4 and 9). The gate was asked by BOTH halves —
+  `arrLitNestedElemName`, which decides whether the ROW is interned, AND `nodeArrayElemName`,
+  which decides whether an ANNOTATION is synthesized at all.
+
+* **THE HEADER'S SAFETY CLAIM WAS FALSE AT NINE LEAVES, AND THAT IS THE WHOLE DEFECT.** It read:
+  *"Declining keeps the LOUD reject master gives (`index receiver is not an array or string`);
+  the alternative is trading a loud reject for a silent miscompile."* Measured over a
+  SIXTEEN-LEAF grid of `function mkc(): <leaf>[][] { const cc = []  return cc }`, each against
+  its own ANNOTATED control:
+
+  | leaf | annotated | inferred (master) | inferred (landing) |
+  |---|---|---|---|
+  | `i32` / `boolean` / `string` / `f64` / `i64` | runs | runs | runs |
+  | `f32` | runs | **check-clean invalid wasm** | **runs** |
+  | litunion `K` | runs | **check-clean invalid wasm** | **runs** |
+  | `{r: i32}` | runs | **check-clean invalid wasm** | **runs** |
+  | `{r: i32 \| null}` (filed) | runs | **check-clean invalid wasm** | **runs** |
+  | declared `P` | runs | **check-clean invalid wasm** | **runs** |
+  | union `U` | runs | **check-clean invalid wasm** | **runs** |
+  | `{[string]: i32}` | runs | **check-clean invalid wasm** | **runs** |
+  | `((i32) => i32)` | runs | **check-clean invalid wasm** | **runs** |
+  | `i32[]` (a third dimension) | runs | **check-clean invalid wasm** | **runs** |
+  | `u8` | loud emit reject | loud emit reject | unchanged |
+  | `P \| null` | loud check reject | loud check reject | unchanged |
+
+  Nine silent, not one loud. Declining was not avoiding a silent miscompile; it WAS the silent
+  miscompile. **And the litunion row is the sharpest of the nine: the allow-list explicitly
+  ADMITS a litunion leaf and lost it anyway**, because the element the array carries does not
+  answer `tyIsLitUnion` — the gate was not even self-consistent.
+
+* **THE FIX SPLITS THE TWO HALVES, WHICH THE HEADER SAID MUST MOVE TOGETHER — measured, not
+  argued.** Only the ANNOTATION half widens: `nodeArrayElemName`'s nested arm now asks
+  `tyNestedArrLeafRenders` — *the element has a render* — which is the decline protocol its own
+  `TyFunc` arm already uses (`tyToEmitName` is "" for a `TyVar` or unpinned element). The INTERN
+  half keeps `tyNestedArrLeafSupported` unchanged, so **no row is minted that was not minted
+  before and no slot order moves**.
+
+  It is sufficient because the row a synthesized annotation resolves was ALREADY interned by the
+  DECLARED DESTINATION's own walk — probed: `rlSlotByName` answers >= 0 at six of the leaves
+  before the change. The header's prediction that "declining in only one reaches the same invalid
+  module by the other route" was tested on the program that pins it,
+  `tests/cases/arrays/nested-array-inferred-empty-unsupported-leaf.vl`: its `f32` leaf has no
+  declared destination anywhere in the module, so nothing interned the row, and its loud reject
+  fires at the same position with the same message, byte for byte.
+
+* **THE WIDE CANDIDATE WAS BUILT, MEASURED AND REFUSED, AND ITS PRICE IS THE INTERESTING
+  NUMBER.** Widening BOTH halves (and replacing the hand-map with `ensureRefElemTy`, the
+  annotated path's own DRY core) buys four more `.push`-shape spellings and one more corpus
+  class — and moves **4 classes / 22,707 census cells `loud emit reject` -> `check-clean invalid
+  wasm`**, all of them `emitProgram: nested arrays are not supported`. In census cells that reads
+  as a 19x better trade; **in the scoreboard's own unit it is +1 `runs` for +4 clause-1
+  soundness violations**:
+
+  | | master | landing (annotation half) | wide candidate |
+  |---|---|---|---|
+  | `runs` | 3,752 | **3,754** | 3,755 |
+  | clause 1 (soundness) | 196 | **195** | **199** |
+  | clause 2 (emit reject) | 162 | **161** | 156 |
+  | total against the goal | 403 | **401** | 400 |
+
+  The cause is ORDER, not the predicate: `collectA` walks `P.nodes` by index, so the widened
+  intern arm fires on an ANNOTATED empty literal before that annotation's own TypeRef branch
+  reaches it, and the kind-9 element heap resolution depends on the inner wrapper landing at a
+  strictly lower type index. The four classes are `a000006`, `a001560`, `c000675`, `e003827` —
+  all already carried WHOLE by the derived corpus, so no `named/` set is needed to keep the price
+  visible; the next candidate that widens the intern half will see them move.
+
+* **COUNTERS, BOTH RUNGS.** Over the 1,998-module fixture corpus the widened predicate is
+  **ASKED 22,032 times across 103 modules** and **CHANGES the answer 3,645 times across 52** —
+  so this is not a rung that merely fires, it is one that decides differently at scale, and the
+  emitted bytes still move in exactly ONE module. On the witnesses: `reach=4 ans=4` (filed
+  repro), `reach=6 ans=0` (`i32[][]`, which ran before and is byte-identical), `reach=0`
+  (`{r: i32|null}[]`, one dimension — the nested arm is never entered).
+
+* **THE MOVEMENT, CELL-MATCHED** (`regress.py`, 7,021 cells): **2 classes / 152 census cells**,
+  both to `runs` — `b004880` (this row's own cell, 146 cells, `check-clean invalid wasm ->
+  runs`) and `b004415` (6 cells, `loud emit reject -> runs`). **`runs` -> NOT-RUNS: 0. ->
+  silent: 0. Other movement: 0.**
+
+* Corpus `cmp` **2,454 modules · 1,997 IDENTICAL · 1 DIFFER · 0 LOST** (455 build under neither
+  compiler and fail identically; the one `GAINED` is this change's own fixture, GAINED by
+  construction — it did not build on the base, and that is the defect). The one DIFFER,
+  `tests/cases/closures/nested-closure-array-union-arm-call.vl`, is a strict IMPROVEMENT and its
+  output is unchanged: the rec group goes from 24 heap types to 21 and the module from 2,613 to
+  2,591 bytes, because a duplicate ref-list wrapper pair that the un-rendered element used to
+  force is no longer minted. Pinned as
+  `tests/cases/arrays/nested-array-inferred-empty-nested-ref-leaf.vl` (seventeen legs: nine
+  recovered leaves, three allow-list controls, and the same leaf at five other storage classes —
+  a module global, a closure capture, a struct field, a call argument and a list-of-lists
+  element, every one of which was silent on master for this same reason).
+
+---
+
+### D626 — an INFERRED return of an empty `[]` BOUND to a local: the result valtype is decided from the return EXPRESSION, which is an ident and not the literal
+**check-clean invalid wasm · found 2026-08-30 closing D625, as the third storage class the close went looking for · the mechanism is LOCATED and probed, not guessed · fails at ONE dimension, so it is outside D625's family by that row's own ablation**
+
+Repro:
+
+    type P = { r: i32 }
+    function sink(_x: P[]) { }
+    function mk() {
+      const cc = []
+      sink(cc)
+      return cc
+    }
+    print(mk().length)
     // vl check rc 0; vl run:
     //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
     // SHOULD PRINT 0
 
-* **TWO INGREDIENTS, ABLATED, and the third candidate is scenery:**
+* **FOUR INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING:**
 
   | variant | outcome |
   |---|---|
-  | as filed, `{r: i32 \| null}[][]` | **check-clean invalid wasm** |
-  | one dimension, `{r: i32 \| null}[]` | runs, prints 0 |
-  | nested but non-nullable, `{r: i32}[][]` | **still fails** — nullability is SCENERY |
-  | nested but scalar element, `i32[][]` | runs, prints 0 |
+  | as filed | **check-clean invalid wasm** |
+  | annotate the RETURN (`function mk(): P[]`) | runs |
+  | annotate the LOCAL (`const cc: P[] = []`) | runs |
+  | a SCALAR element (`sink(_x: string[])`) | runs — the element must be a REF |
+  | drop the `return` (print inside `mk`) | runs — the RETURN is the position |
+  | return the LITERAL directly (`return []`, no binding) | runs — the BINDING indirection is the defect |
 
-  So it needs the NESTING and a STRUCT element, and nothing else.
-* **THIS IS D613's MECHANISM AT A RETURN RATHER THAN A CAPTURE**, and D613 is closed: a
-  captured empty `[]` had its closure-env field typed a section before the element row was
-  pinned, fixed by `synthCaptureEmptyListAnns`. The obvious question, and the place to start:
-  does the RETURN path have the same shape of hole — a pass that types the empty literal's
-  element row before the declared return annotation is consulted — and is the fix the same
-  synthesis one storage class over, the way D613's was `synthGlobalEmptyListAnns`' argument one
-  class over? `synthEmptyListAnn` and its existing callers are the map.
-* The right outcome is `runs`. The destination is unambiguous — the function declares its
-  return type and nothing else consumes `cc`.
+* **THE BYTES NAME THE SIDE, AND IT IS THE OPPOSITE ONE FROM D625.** `mk`'s SIGNATURE is
+  `(func (result (ref $4)))` — the i32-list wrapper — while the local is `(ref $6)` and the body
+  builds `array.new_fixed $5`, the correct `P[]` backing. D625 had the signature right and the
+  body wrong; here the body is right and the signature wrong.
+
+* **THE SITE IS `criClassify`'s EMPTY-`[]` ARM AND ITS INPUT IS THE PROBLEM.** That arm reads
+  `emptyArrHoleKind(rx)` where `rx` is the RETURN EXPRESSION node, and `emptyArrLitIxOf` unwraps
+  only PARENS — a bare ident naming the binding is not an `ArrayLit`, so the arm returns `null`
+  and `fRetKind` keeps the i32-list default. Its own header says the two halves "read THIS pair
+  — `criClassify` for the result valtype, `emitReturnValue` for the `struct.new` — so the two
+  cannot drift the way they did"; they drift again as soon as a BINDING stands between the
+  literal and the `return`.
+
+* **THIS IS THE THIRD STORAGE CLASS OF THE SAME SHAPE, WHICH IS WHY IT IS FILED HERE.**
+  `synthGlobalEmptyListAnns` covers the module GLOBAL (the global section reads
+  `globalCellKind`); D613's `synthCaptureEmptyListAnns` covers the CAPTURE (the type section
+  reads `captureValKind`); this is the INFERRED RETURN (the type section reads `fRetKind`
+  through `criClassify`). The ANNOTATED return is not a fourth — it reads its own annotation, and
+  D625's witness proves the signature was right there all along.
+  The right outcome is `runs`: `sink` names `P[]`, nothing else consumes `cc`.
 
 
 ## 6. Coverage gaps — axes not built, and why
