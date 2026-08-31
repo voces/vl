@@ -571,6 +571,7 @@ import {
   structEmitOrder,
   structIndexOfLet,
   structIndexOfObj,
+  structIndexOfTypeName,
   structNameIxReset,
   structTyIxReset,
   synthTypeRefTy,
@@ -3587,6 +3588,23 @@ export function buildFnMap(_stmts: i32[]) {
           // `typecheck.vl`, and all of them mint `<part> + "|null"` — the non-null part is
           // always FIRST, so the reversed order is not a producible spelling of this column.
           fRetKind[li] = "nulstr"
+        } else if inferNulStructRow(inm) >= 0 {
+          // D887 — A NULLABLE-STRUCT inferred return (`{r: i32} | null`, `P | null`), the arm
+          // the niche comment above ends by excluding. It is the SAME pair the ANNOTATED
+          // `: {r: i32} | null` path stores (`retNulRefFlag` -> `"nulstruct"` +
+          // `retStructIndex`), read off the name the checker recorded instead of the
+          // annotation node there is none of — so `emitOneFuncType`'s inferred arm mints
+          // `(ref null $S)`, `fnRetStructIndexSid` answers the call site with the same row, and
+          // `emitReturnValue` seeds a bare `return null` as `ref.null $S`. All four owners of a
+          // return row (D871) therefore read one answer, which is the property that column
+          // exists to keep.
+          //
+          // AHEAD of the two union arms below, because the row is a NULLABLE and neither of
+          // them should see it: a `{r:i32}|null` name is not a value union (no second value
+          // atom) and not a registered struct union, so both decline anyway — the order is
+          // stated rather than relied on.
+          fRetKind[li] = "nulstruct"
+          fRetStructIdx[li] = inferNulStructRow(inm)
         } else if inferRetIsValueUnionAt(inRow, inm) {
           fRetKind[li] = "union"
         } else if (
@@ -3811,6 +3829,19 @@ export function computeVoidFns() {
     }
   }
   0
+}
+
+// D887 — THE STRUCT ROW an inferred-return NAME's nullable part occupies, or -1.
+//
+// The name is the checker's own render (`nullableRetName`), so a DECLARED inner arrives as its
+// nominal name and an INLINE shape as the emitter-format text — and `structIndexOfTypeName`
+// resolves both, the second by FIELD SET, onto exactly the row the annotated spelling keys.
+// Answers -1 for every non-nullable name, for a nullable whose part names no row, and for the
+// niches above (`string|null` and friends are claimed before this arm is reached).
+function inferNulStructRow(inm: string): i32 {
+  const part = nullablePartOf(inm)
+  if part == "" { return -1 }
+  structIndexOfTypeName(part)
 }
 
 export function computeRetInference() {
@@ -7164,6 +7195,33 @@ function anonLeafAnnAtomOf(tyIx: i32, fname: string): string {
   ""
 }
 
+// D884 — MAY `atom` JOIN THE ATOMS ALREADY IN THE SET?
+//
+// THE SIX SCALARS ALWAYS MAY, and the seventh — a LITERAL-UNION alias — may join `null` and
+// nothing else. `K | null` is the code-30 niche `nameFieldCode` spells for the declared twin;
+// `K | string | null` is a spelling it has no code for, and a set the mint cannot code takes
+// the field all the way back to `anonFieldCode`'s answer rather than merely declining to widen.
+//
+// THAT DIFFERENCE IS A `runs` CELL, MEASURED, NOT A CAUTION. `let a: {r: K} | null = {r: "b"}`
+// beside `?? {r: null}` RUNS on master: the literal's atom is `string` (a value's atom is read
+// off the VALUE), the set is `string|null`, and code 20 carries it. Letting the annotation's `K`
+// in ungated made that set `K|string|null`, the mint declined, and the program went from `runs`
+// to `emitProgram: bare null needs a struct-typed context`. `d884_litunion_beside_str` is that
+// witness and `d884_litunion_ann_reads` is the other side of the bound.
+//
+// A wider rule — normalising `K` and `string` onto one atom — is a different question: they are
+// different REPS (an interned i32 id against a string ref), so a set holding both would need a
+// box the niche codes cannot give.
+function anonLeafAtomAdmits(atom: string, atoms: string[]): boolean {
+  if !nameIsLitUnionType(atom) { return true }
+  let i = 0
+  while i < atoms.length {
+    if atoms[i] != "null" { return false }
+    i = i + 1
+  }
+  true
+}
+
 // The atom NAME a field's annotation TEXT spells, or "" for everything else — the type-side
 // twin of `anonLeafAtomName`, and deliberately the same six atoms and no more.
 function anonLeafAtomOfText(t: string): string {
@@ -7173,6 +7231,12 @@ function anonLeafAtomOfText(t: string): string {
   if t == "f64" { return "f64" }
   if t == "i64" { return "i64" }
   if t == "f32" { return "f32" }
+  // D884 — AND A LITERAL-UNION ALIAS (`type K = "a" | "b"`), whose merged set `K|null` is the
+  // code-30 NICHE `nameFieldCode` already spells for the declared twin. It is the seventh atom
+  // and not one of the six because it is not a valtype: the six name a rep directly, this one
+  // names a REGISTERED type whose rep is the interned i32 atom. `anonLeafPolyFieldCode` is what
+  // decides whether the set it joins is spellable, and it admits exactly `K|null`.
+  if nameIsLitUnionType(t) { return t }
   ""
 }
 
@@ -7220,11 +7284,59 @@ function anonLeafJoinInitCall(rhs: i32, mem: i32[]) {
 // resolver there is. Two same-named functions therefore both contribute, and either one being
 // unreadable declines both.
 function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
+  // D882/D883 — READ INTO A SCRATCH PAIR AND COMMIT ONLY ON SUCCESS. With one frame the old
+  // shape could refute before appending anything; a returned BINDING and a returned CALL both
+  // read a second frame, so a nested success followed by an outer refutation would leave the
+  // inner frame's literals in `mem` (a family member whose row never moves) and its callee
+  // MARKED (a return row that moves with no member behind it). That is exactly the
+  // `runs`-losing shape `anonLeafRetMoved` exists to prevent, so nothing is published until
+  // the whole read succeeds.
+  const lits: i32[] = []
+  const fns: string[] = []
+  if !anonLeafCalleeRead(callFn, lits, fns, 0) { return 0 }
+  let ri = 0
+  while ri < lits.length {
+    anonLeafJoinBound(lits[ri], mem)
+    ri = ri + 1
+  }
+  // D871 — AND MARK THE CALLEES, so the four return-row resolvers redirect exactly the
+  // functions whose literals this just made family members. See `anonLeafRetMoved`.
+  let fj = 0
+  while fj < fns.length {
+    anonLeafMarkRetMoved(fns[fj])
+    fj = fj + 1
+  }
+  0
+}
+
+// ONE frame of the callee read: the literals `callFn`'s callee hands back, appended to `lits`,
+// with every function name whose return row must follow appended to `fns`. False — and nothing
+// published — the moment one return path is unnameable.
+//
+// `fns` DOUBLES AS THE VISITED SET, which is what keeps `f(): S|null { f() }` from recursing
+// for ever. A name already on the path ANSWERS rather than refuting, and that is not laxity: the
+// frame that pushed it is being read, so its return row is in `fns` and will be marked — a
+// self-call hands back that same row, contributes no literal nobody has seen, and refuting it
+// cost `src(n): S|null { if n <= 0 { return {r: 0} }; src(n - 1) }` its merge
+// (`d885_self_recursive_ret`). The depth cap is the second, independent bound and the only one
+// a fresh name meets.
+function anonLeafCalleeRead(
+  callFn: i32,
+  lits: i32[],
+  fns: string[],
+  depth: i32,
+): boolean {
+  if depth > 1 { return false }
   const c = unwrapParen(callFn)
-  if c < 0 { return 0 }
+  if c < 0 { return false }
   const cn = P.nodes[c]
   if cn is Ident {
-    const rets: i32[] = []
+    let k = 0
+    while k < fns.length {
+      if fns[k] == cn.identName { return true }
+      k = k + 1
+    }
+    fns.push(cn.identName)
     let seen = false
     let fi = 0
     while fi < P.nodes.length {
@@ -7232,30 +7344,31 @@ function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
       if fd is FuncDecl {
         if fd.fnName == cn.identName {
           seen = true
-          if !anonLeafCalleeRets(fd.fnBody, rets, true) { return 0 }
+          if !anonLeafCalleeRets(fd.fnBody, lits, true, fd.fnBody, fns, depth) {
+            return false
+          }
         }
       }
       fi = fi + 1
     }
-    if !seen { return 0 }
-    let ri = 0
-    while ri < rets.length {
-      anonLeafJoinBound(rets[ri], mem)
-      ri = ri + 1
-    }
-    // D871 — AND MARK THE CALLEES, so the four return-row resolvers redirect exactly the
-    // functions whose literals this just made family members. See `anonLeafRetMoved`.
-    let mi = 0
-    while mi < P.nodes.length {
-      const md = P.nodes[mi]
-      if md is FuncDecl {
-        if md.fnName == cn.identName {
-          while anonLeafRetMoved.length <= mi { anonLeafRetMoved.push(0) }
-          anonLeafRetMoved[mi] = 1
-        }
+    return seen
+  }
+  false
+}
+
+// D871 — every `FuncDecl` named `nm` has its return row follow the merge. Split out of
+// `anonLeafJoinCallee` because a nested read names more than one function.
+function anonLeafMarkRetMoved(nm: string) {
+  let mi = 0
+  while mi < P.nodes.length {
+    const md = P.nodes[mi]
+    if md is FuncDecl {
+      if md.fnName == nm {
+        while anonLeafRetMoved.length <= mi { anonLeafRetMoved.push(0) }
+        anonLeafRetMoved[mi] = 1
       }
-      mi = mi + 1
     }
+    mi = mi + 1
   }
   0
 }
@@ -7263,17 +7376,36 @@ function anonLeafJoinCallee(callFn: i32, mem: i32[]) {
 // Every value a function body hands back: each `return e` and the body block's implicit TAIL
 // expression. False the moment one of them is a path `anonLeafRetPathOk` cannot name. A NESTED
 // function declaration is skipped — its returns are its own.
-function anonLeafCalleeRets(ix: i32, out: i32[], tail: boolean): boolean {
+//
+// `body` is the FRAME's own body block, carried unchanged through the recursion so the
+// returned-binding arm can resolve an identifier against the bindings of the function that
+// returned it (D882); `fns`/`depth` are the callee-read path (D883).
+function anonLeafCalleeRets(
+  ix: i32,
+  out: i32[],
+  tail: boolean,
+  body: i32,
+  fns: string[],
+  depth: i32,
+): boolean {
   if ix < 0 { return true }
   const n = P.nodes[ix]
   if n is FuncDecl { return true }
   if n is RetStmt {
-    if !anonLeafRetPathOk(n.retArg, out) { return false }
+    if !anonLeafRetPathOk(n.retArg, out, body, fns, depth) { return false }
   }
   if n is Block {
     if tail {
       if n.blkStmts.length > 0 {
-        if !anonLeafTailPathOk(n.blkStmts[n.blkStmts.length - 1], out) {
+        if (
+          !anonLeafTailPathOk(
+            n.blkStmts[n.blkStmts.length - 1],
+            out,
+            body,
+            fns,
+            depth,
+          )
+        ) {
           return false
         }
       }
@@ -7282,7 +7414,9 @@ function anonLeafCalleeRets(ix: i32, out: i32[], tail: boolean): boolean {
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    if !anonLeafCalleeRets(kids[i], out, false) { return false }
+    if !anonLeafCalleeRets(kids[i], out, false, body, fns, depth) {
+      return false
+    }
     i = i + 1
   }
   true
@@ -7292,7 +7426,23 @@ function anonLeafCalleeRets(ix: i32, out: i32[], tail: boolean): boolean {
 // a member and not a refutation, because `ref.null` is valid at every row. Everything else
 // refutes — see `anonLeafJoinCallee` for why this arm is strict where the other readers are
 // lenient.
-function anonLeafRetPathOk(argIx: i32, out: i32[]): boolean {
+//
+// D882 — A RETURNED BINDING is the IDENT reader one frame in: `{ const v = { r: 7 }; v }` hands
+// back a literal the caller can see, and refusing it left `d876_call_ret_is_binding` a loud
+// reject. Resolved against THIS function's own bindings only, and every one of them has to be
+// nameable — a binding written from a parameter or a field read refutes the whole callee,
+// exactly as an unnameable `return` does.
+//
+// D883 — A RETURNED CALL is one more frame of the same read. `anonLeafCalleeRead` carries the
+// visited set and the depth cap, so `src(): S|null { inner() }` reaches `inner`'s literals and
+// marks BOTH return rows.
+function anonLeafRetPathOk(
+  argIx: i32,
+  out: i32[],
+  body: i32,
+  fns: string[],
+  depth: i32,
+): boolean {
   if argIx < 0 { return true }
   const a = unwrapParen(argIx)
   if a < 0 { return true }
@@ -7302,6 +7452,105 @@ function anonLeafRetPathOk(argIx: i32, out: i32[]): boolean {
     out.push(a)
     return true
   }
+  if an is Ident {
+    return anonLeafRetIdentOk(an.identName, body, out, fns, depth)
+  }
+  if an is Call { return anonLeafCalleeRead(an.callFn, out, fns, depth + 1) }
+  false
+}
+
+// D882 — THE LITERALS BOUND TO `nm` INSIDE THE FRAME THAT RETURNED IT, or a refutation.
+//
+// The IDENT reader `anonLeafJoinSources` asks this of the whole program for a `??`'s own left
+// operand; here it is asked of ONE function body, because that is the scope a returned name
+// resolves in. It is STRICT where that one is lenient, for `anonLeafJoinCallee`'s reason: an
+// unmoved store handed back through a moved return row is invalid wasm, not a lost member.
+//
+// A name with NO binding in this body is a parameter, a capture or a global — none of them a
+// path this can name — so an empty scan refutes rather than answering "no members".
+function anonLeafRetIdentOk(
+  nm: string,
+  body: i32,
+  out: i32[],
+  fns: string[],
+  depth: i32,
+): boolean {
+  const hits: i32[] = []
+  if !anonLeafBindScan(body, nm, out, hits, fns, depth) { return false }
+  hits.length > 0
+}
+
+// The subtree scan behind `anonLeafRetIdentOk`: every `const nm = …` and every `nm = …` in this
+// frame. A NESTED function declaration is skipped — its `nm` is a different binding.
+function anonLeafBindScan(
+  ix: i32,
+  nm: string,
+  out: i32[],
+  hits: i32[],
+  fns: string[],
+  depth: i32,
+): boolean {
+  if ix < 0 { return true }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return true }
+  if n is LetDecl {
+    if n.letName == nm {
+      if !anonLeafBoundValOk(n.letInit, out, hits, fns, depth) { return false }
+    }
+  }
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const tgt = unwrapParen(n.binLeft)
+      if tgt >= 0 {
+        const tn = P.nodes[tgt]
+        if tn is Ident {
+          if tn.identName == nm {
+            if !anonLeafBoundValOk(n.binRight, out, hits, fns, depth) {
+              return false
+            }
+          }
+        }
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if !anonLeafBindScan(kids[i], nm, out, hits, fns, depth) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// ONE value written to a returned binding. The same three-way split `anonLeafRetPathOk` makes of
+// a returned expression: a literal is a member, a `null` is neither, a CALL is the next frame,
+// anything else refutes. The call arm is D882 and D883 composed — `{ const v = mid(); v }` is a
+// binding whose value is a callee's return, and reading one without the other left
+// `d886_ret_binding_of_call` check-clean invalid wasm.
+function anonLeafBoundValOk(
+  rhs: i32,
+  out: i32[],
+  hits: i32[],
+  fns: string[],
+  depth: i32,
+): boolean {
+  const v = unwrapParen(rhs)
+  if v < 0 { return false }
+  const vn = P.nodes[v]
+  if vn is NullLit {
+    hits.push(v)
+    return true
+  }
+  if vn is ObjLit {
+    out.push(v)
+    hits.push(v)
+    return true
+  }
+  if vn is Call {
+    if !anonLeafCalleeRead(vn.callFn, out, fns, depth + 1) { return false }
+    hits.push(v)
+    return true
+  }
   false
 }
 
@@ -7309,7 +7558,13 @@ function anonLeafRetPathOk(argIx: i32, out: i32[]): boolean {
 // position is not a value at all (the function's returns are then its `return`s alone), so it
 // is skipped rather than refuted; anything that IS an expression goes through
 // `anonLeafRetPathOk`.
-function anonLeafTailPathOk(ix: i32, out: i32[]): boolean {
+function anonLeafTailPathOk(
+  ix: i32,
+  out: i32[],
+  body: i32,
+  fns: string[],
+  depth: i32,
+): boolean {
   if ix < 0 { return true }
   const n = P.nodes[ix]
   if n is LetDecl { return true }
@@ -7320,7 +7575,7 @@ function anonLeafTailPathOk(ix: i32, out: i32[]): boolean {
   if n is ForIn { return true }
   if n is Block { return true }
   if n is FuncDecl { return true }
-  anonLeafRetPathOk(ix, out)
+  anonLeafRetPathOk(ix, out, body, fns, depth)
 }
 
 // One `lhs = rhs` statement: append `rhs` to `mem` when it is an object literal stored into
@@ -7395,6 +7650,14 @@ function anonLeafMergeField(ow: i32, narrowSi: i32): string {
             const serv = anonLeafServingRow(ow, f.fiName, set)
             if serv >= 0 {
               anonLeafRecordSupersede(narrowSi, serv)
+              // D881 — AND THE CARRIER'S ROW, which the post-mint rung below can no longer
+              // reach because THIS family does not mint. `collectAnonShapes` records the
+              // carrier supersede (D873) only where the mint really appended a row; a SECOND
+              // `??` family over the same field set finds the merged row already standing,
+              // takes this branch, and its carrier is left pointing at a row nobody merged.
+              // Two competing same-fieldset rows are what make that visible: with one row the
+              // carrier IS `narrowSi` and the line above already covered it. See D881.
+              anonLeafRecordSupersede(anonLeafCarrierRowOf(ow), serv)
               return ""
             }
             return f.fiName
@@ -7519,6 +7782,12 @@ function anonMintRowFor(objIx: i32) {
           elemNames.push(boxU)
         } else if leafCode == 16 {
           elemNames.push(leafSet) // the box's member set
+        } else if leafCode == 30 {
+          // D884 — the `K | null` niche records the NON-NULL alias, the same companion
+          // `fieldRecElemName`'s code-30 arm gives the declared twin: `sFieldIsLitUnion`
+          // recovers the atom rep and the membership off this column, and a `""` here
+          // would leave the field an i32 slot with no atom table behind it.
+          elemNames.push(nulLitUnionInnerName(leafSet))
         } else if leafCode >= 0 {
           elemNames.push("") // a bare niche (code 20) records no companion
         } else {
@@ -7858,13 +8127,15 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
   // byte-identical.
   const annAtom = anonLeafAnnAtomOf(anonLeafAnnTyOf(ow), fname)
   if annAtom != "" {
-    let seenA = false
-    let ak = 0
-    while ak < atoms.length {
-      if atoms[ak] == annAtom { seenA = true }
-      ak = ak + 1
+    if anonLeafAtomAdmits(annAtom, atoms) {
+      let seenA = false
+      let ak = 0
+      while ak < atoms.length {
+        if atoms[ak] == annAtom { seenA = true }
+        ak = ak + 1
+      }
+      if !seenA { atoms.push(annAtom) }
     }
-    if !seenA { atoms.push(annAtom) }
   }
   if atoms.length < 2 { return "" }
   if !anonLeafOwnersJoined(ow, fname, owAtom) { return "" }
@@ -7910,6 +8181,13 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
 function anonLeafPolyFieldCode(set: string): i32 {
   const c = nameFieldCode(set)
   if c == 16 || c == 20 { return c }
+  // D884 — AND 30, the `K | null` niche, whose COMPANION column this mint can fill: the
+  // non-null alias name, exactly the recording `pushFieldRow`'s declared path makes
+  // (`fieldRecElemName`'s code-30 arm). It joins 16 and 20 on the same test the header
+  // states — admitted because the column can be filled, not because the code is nullable.
+  // The `boolean|null` sentinel (21) still declines: it records no companion and an `#anon`
+  // row carrying it interns no map-value slot, which is the measured trade below.
+  if c == 30 { return c }
   -1
 }
 

@@ -16897,9 +16897,12 @@ Repro:
   - 189 of the check rejects are `cannot compare X with null` on the grid's `bare`
     (non-nullable) control rows — the checker correctly refusing a `null` in a
     non-nullable list, i.e. the grid's own assertion that it still does.
-  - 108 are `'mk' infers the nullable return type {r: i32} | null`, the checker's own
-    documented decline for an inferred nullable inline-shape return, and the reason
-    `ann2` x `ret` never reaches the emitter at all.
+  - 108 are `'mk' infers the nullable return type {r: i32} | null`, filed here as the
+    checker's own documented decline for an inferred nullable inline-shape return, and the
+    reason `ann2` x `ret` never reaches the emitter at all. **IT WAS NOT A DECLINE.** Its own
+    sentence conceded the program is type-valid, and the annotated twin always ran; it is
+    D887 and it was lifted 2026-08-31. The 108 is the frozen measurement of the grid that
+    produced it, kept as the record of that run, not a claim about today's compiler.
   - The `loud check reject` set is **513 on all six ablation compilers, cell for cell**,
     so none of it moved either.
 * Reachable neighbourhood: this is D51/D52's family read at a FIELD source — `fRetKind`'s
@@ -24614,15 +24617,17 @@ Repro (now runs, printing `0`):
   `_globalbind` cells close with both legs untouched. The decline stands, with its reason
   updated at both sites.
 
-* **THE INFERRED FUNCTYPE ARM MEASURES ZERO AND SHIPS ANYWAY.** `emitOneFuncType`'s
-  un-annotated arm reads the same `fRetStructIdx` slot `fnRetStructIndexSid` does, and
-  `fRetKind` carries the INFERRED `nulstruct` in it — so with the arm absent the call-result
-  reader and the signature disagree by construction. No cell reaches it today because the
-  CHECKER refuses an inferred nullable-struct return outright: `function src(f: boolean) { if f
-  { return null } { r: 7 } }` gives `'src' infers the nullable return type {r: i32} | null —
-  type-valid, but an inferred return of this shape …`, which is itself a clause-2 violation
-  reached by no corpus cell and by no capability probe. The arm is the drift-free state for the
-  day that refusal lifts; the zero is recorded, not hidden.
+* **THE INFERRED FUNCTYPE ARM MEASURES ZERO AND SHIPS ANYWAY — AND IT IS LIVE AS OF
+  2026-08-31.** `emitOneFuncType`'s un-annotated arm reads the same `fRetStructIdx` slot
+  `fnRetStructIndexSid` does, and `fRetKind` carries the INFERRED `nulstruct` in it — so with
+  the arm absent the call-result reader and the signature disagree by construction. No cell
+  reached it when this row was written because the CHECKER refused an inferred nullable-struct
+  return outright: `function src(f: boolean) { if f { return null } { r: 7 } }` gave `'src'
+  infers the nullable return type {r: i32} | null — type-valid, but an inferred return of this
+  shape …`, itself a clause-2 violation reached by no corpus cell and by no capability probe.
+  **That refusal is D887 and it is lifted**; `distilled/named/d887_inferred_ret_beside_fam` is
+  the cell that now reaches this arm, and it prints `7` then `s`. Shipping the arm against a
+  measured zero was the right call, and this is the receipt.
 
 * **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
   `d861_call_direct_str`. Master: `src` is `(result (ref null $0))` over
@@ -24777,9 +24782,9 @@ Repro (now runs, printing `4` then `1`):
 
 ---
 
-### D874 — TWO `??` families over one field set beside TWO competing rows: the merged row serves one and the other family is left on the narrow one
+### D874 — [CLOSED 2026-08-31 by D881] TWO `??` families over one field set beside TWO competing rows: the merged row serves one and the other family is left on the narrow one
 
-**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 2 cells (`distilled/named/d874_two_fams_two_rows`, `…_declfirst`), OPEN · identical on master `120f8b6c` and after D871/D872/D873, so it is NOT a regression — it is the next delivery form out, found by this landing's own fixture and pinned with its four one-ingredient-out controls**
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 2 cells (`distilled/named/d874_two_fams_two_rows`, `…_declfirst`) · the filed ablation below is CORRECT — all four ingredients are needed — and the filed MECHANISM was half right: it is `anonLeafSupersede`'s one-slot-per-row shape, but what loses the second family is not a second WRITE winning, it is that the second family never MINTS (D881)**
 
 Repro (check-clean invalid wasm):
 
@@ -24797,10 +24802,10 @@ Repro (check-clean invalid wasm):
     ra()
     type Box = { inner: {r: i32} }
     type R = { r: i32 }
-    // vl check rc 0; vl run ->
+    // was: vl check rc 0; vl run ->
     //   failed to compile: wasm[0]::function[6]::ra … type mismatch: expected i32,
     //   found (ref $type)
-    // SHOULD PRINT 0 then s.
+    // Now: prints 0 then s.
 
 * **FOUR INGREDIENTS, and every one-out control RUNS after D871–D873.** A CALL-carried family
   (`src() ?? …`), an ANNOTATION-ONLY family (`a ?? …` over `= null`), `type R`, and `Box`'s
@@ -24808,11 +24813,14 @@ Repro (check-clean invalid wasm):
   `d874_ctl_no_callfam` are all check-clean invalid wasm on master and all four run here; only
   the full set survives. `_declfirst` pins that declaration ORDER does not move it.
 
-* **IT IS D873's QUESTION WITH TWO CARRIERS.** `anonLeafSupersede` is ONE slot per narrow row,
-  so where two families over one field set mint through different carriers the second write
-  wins and the first family's carrier is left pointing at a row nobody merged. D873's fix
-  covers one carrier per family; this needs the slot to be a per-family map, which is a
-  different shape of change and is why it is filed rather than built.
+* **IT IS D873's QUESTION WITH TWO CARRIERS, AND THE FILED MECHANISM WAS HALF RIGHT.**
+  `anonLeafSupersede` is ONE slot per narrow row, which is what the row said; what it got wrong
+  is "the second write wins". There is no second write. The second family never MINTS — the
+  merged row is already standing from the first family's mint, so `anonLeafMergeField` takes its
+  serving-row branch, `sNames.length > rowsBefore` is false, and D873's post-mint carrier rung
+  never runs at all. At the counters: `LIT n=26 nar=3 mf=[] car=2` against `ROW 2 R sup=2` —
+  merged row 3 minted, row 2 never told. The slot did NOT need to become a per-family map; the
+  serving-row branch needed the one line the mint path already had. See D881.
 
 * **FOUND BY WRITING A PROGRAM, not by a grid** — the first draft of
   `tests/cases/types/coalesce-default-row-past-callee-return.vl` held all four blocks, and
@@ -24861,11 +24869,11 @@ Repro (runs today, printing `7` then `2`):
 
 ---
 
-### D876 — the six programs that BOUND the annotation atom, and the two return paths it must refuse
+### D876 — [CLOSED 2026-08-31 by D882/D883/D884 — THREE mechanisms, not one] the six programs that BOUND the annotation atom, and the two return paths it must refuse
 
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` (3 cells: `d876_call_ret_is_binding`, `d876_call_ret_is_call`, `d876_litunion_ann`) with 3 `runs` pins beside them (`d876_nested_ann`, `d876_two_anns_disagree`, `d876_declared_dest_beside_ann_fam`), OPEN · every one identical on master `120f8b6c` and after D871/D872/D873 — this row is the DECLINE LIST made measurable, not a regression**
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (3 cells: `d876_call_ret_is_binding`, `d876_call_ret_is_call`, `d876_litunion_ann`) · the 3 `runs` pins beside them (`d876_nested_ann`, `d876_two_anns_disagree`, `d876_declared_dest_beside_ann_fam`) all still run · THE ROW WAS ONE SENTENCE OVER THREE MECHANISMS and the decline list was right about all three: a returned BINDING (D882), a returned CALL (D883) and a litunion annotation field (D884). None of them is D874's, and no one fix moves another's cell**
 
-Repro (a loud emit reject):
+Repro (now runs, printing `0`):
 
     function src(): {r: i32} | null {
       const v = { r: 7 }
@@ -24876,21 +24884,26 @@ Repro (a loud emit reject):
       print(0)
     }
     rd()
-    // vl check rc 0 (one unused-variable warning); vl run ->
+    // was: vl check rc 0 (one unused-variable warning); vl run ->
     //   emitProgram: bare null needs a struct-typed context
-    // SHOULD PRINT 0.
+    // Now: prints 0.
 
-* **THE THREE THAT STILL REFUSE, each for a different reason.**
-  * `d876_call_ret_is_binding` — the callee returns a BINDING. `anonLeafJoinCallee` declines
-    the whole callee (D871's refutation), so the family is the default alone. Closing it needs
-    the reader to follow a binding inside the callee, which is the IDENT reader one frame in.
-  * `d876_call_ret_is_call` — the callee returns another CALL. Same decline, one hop further;
-    `anonLeafJoinCallee` is deliberately ONE hop.
+* **THE THREE THAT REFUSED, each for a different reason, and each closed by its own row.**
+  * `d876_call_ret_is_binding` — the callee returns a BINDING. `anonLeafJoinCallee` declined
+    the whole callee (D871's refutation), so the family was the default alone. The row's own
+    prescription — "the IDENT reader one frame in" — was right and was HALF of it: reading the
+    binding without moving the LITERAL's row turned this cell from a loud reject into
+    check-clean invalid wasm. **D882.**
+  * `d876_call_ret_is_call` — the callee returns another CALL. Same decline, one hop further.
+    **D883.**
   * `d876_litunion_ann` — `{r: K} | null` over `type K = "a" | "b"`. The annotation's field
-    text is a literal-union alias, which `anonLeafAtomOfText` does not admit, and the merged
-    set could not be spelled by `nameFieldCode` if it did. It is D804's own `boolean|null`
-    (code 21) decline wearing a second spelling: the row mints, and an `#anon` row carrying
-    such a field interns no map-value slot.
+    text is a literal-union alias, which `anonLeafAtomOfText` did not admit. **The row's second
+    clause was wrong**: the merged set CAN be spelled — `nameFieldCode("K|null")` is the code-30
+    niche, which is exactly what the declared twin `type R = { r: K | null }` gets, and that
+    program runs on master. It is not D804's `boolean|null` (21) decline in a second spelling:
+    21 records no companion column and 30 records the non-null alias, which is the whole
+    difference and the reason one is admissible and the other is not. **D884**, whose own price
+    is that the atom may only join a set of `null`s.
 
 * **THE THREE THAT RUN ARE THE OTHER HALF OF THE BOUND, and each one is a fix that would be
   wrong.** `d876_nested_ann` (`{r: {q: i32}}`) — a nested-struct field is not a scalar atom.
@@ -24965,3 +24978,369 @@ Repro (runs under `vl`, printing `0` — this half must keep running):
   What is NOT in `tests/cases` is a module-scope block in
   `types/coalesce-default-row-past-binding-cell.vl`, and the file says so at the point where
   it would have been.
+
+---
+
+### D881 — [CLOSED 2026-08-31] the SECOND `??` family never MINTS, so D873's carrier supersede never runs for it
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close · D874's 2 cells (`distilled/named/d874_two_fams_two_rows`, `…_declfirst`) plus `d881_two_fams_read_both`, against D874's four one-ingredient-out controls · 2 corpus cells → `runs`, **0 `runs` lost, 0 into any silent class**, corpus `cmp` **2,485 modules · 2,033 identical · 0 DIFFER · 0 LOST · 452 not buildable by the base***
+
+Repro (now runs, printing `0` then `s`):
+
+    function src(): {r: i32} | null { { r: 7 } }
+    function rd() {
+      const g1 = src() ?? { r: "s" }
+      print(0)
+    }
+    rd()
+    function ra() {
+      let a: {r: i32} | null = null
+      const g1 = a ?? { r: "s" }
+      print(g1.r)
+    }
+    ra()
+    type Box = { inner: {r: i32} }
+    type R = { r: i32 }
+
+* **ONE LINE, AND THE COUNTERS SAY WHY IT IS THAT LINE.** `collectAnonShapes` records the
+  CARRIER supersede (D873) inside `if sNames.length > rowsBefore` — only where the literal's own
+  mint really appended a row. A SECOND family over the same field set finds the merged row
+  already standing, so `anonLeafMergeField` returns through its `serv >= 0` branch, nothing
+  mints, and that guard is false. A probe build logging every `anonLeafRecordSupersede` and every
+  mint decision over D874's witness prints:
+
+        LIT n=3  nar=0 mf=[r] car=-1 mgf=[r] join=1 fam=0 rows=3   SUP 0 -> 3
+        LIT n=10 nar=3 mf=[]  car=-1 mgf=[r] join=1 fam=0 rows=4   SUP 3 -> 3
+        LIT n=26 nar=3 mf=[]  car=2  mgf=[r] join=1 fam=-1 rows=4
+        ROW 0 {r:i32} sup=3 · ROW 1 Box sup=1 · ROW 2 R sup=2 · ROW 3 #anon3 sup=3
+
+  `n=26` is the annotation family's default. Its carrier is row **2** (`R`), the merged row is
+  **3**, and no `SUP 2 -> 3` is ever written. The serving-row branch now records it, which is the
+  same line the mint path has had since D873.
+
+* **D874's FILED MECHANISM SAID "THE SECOND WRITE WINS" AND THERE IS NO SECOND WRITE.** The row
+  concluded the slot had to become a per-family map — "a different shape of change and why it is
+  filed rather than built". `anonLeafSupersede` really is one slot per narrow row, and that is
+  not what loses the family: the two families' carriers are DIFFERENT rows (2 and -1 here), so
+  they never contend for one slot. Reading the counters is what separated those two stories.
+
+* **TWO COMPETING ROWS ARE THE VISIBILITY CONDITION, not an extra defect.** With one row per
+  field set the carrier IS `narrowSi` and the branch's pre-existing line already covered it. That
+  is why D874's four one-out controls all ran and only the conjunction failed — the filed
+  ablation was correct.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
+  `d874_two_fams_two_rows`. Master: `ra`'s local is `(ref null $0)` over the narrow
+  `(type $0 (struct (field (mut i32))))` and the default is `struct.new $0 (global.get $global$0)`
+  — a string header into an i32 field — while `src`/`rd` already use the merged
+  `(type $2 (struct (field (mut (ref $3)))))` over the box
+  `(type $3 (struct (field i32) (field anyref)))`. Here BOTH families build at `$2`: `ra`'s
+  default is `struct.new $2 (struct.new $3 (i32.const 2) (global.get $global$0))` — tag 2, the
+  string. `$0` is unchanged and still serves `R` and `Box`'s inline shape.
+
+---
+
+### D882 — [CLOSED 2026-08-31] a returned BINDING is the IDENT reader one frame in, and the LITERAL is the SIXTH owner of the merged row
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (`d876_call_ret_is_binding`) · a CLAUSE-2 close · 5 cells (`d876_call_ret_is_binding` + `distilled/named/d882_*`) · 1 corpus cell → `runs`, **0 `runs` lost, 0 into any silent class***
+
+Repro (now runs, printing `0`):
+
+    function src(): {r: i32} | null {
+      const v = { r: 7 }
+      v
+    }
+    function rd() {
+      const g1 = src() ?? { r: null }
+      print(0)
+    }
+    rd()
+
+* **READING THE BINDING ALONE TRADES A LOUD REJECT FOR SILENCE, MEASURED.** With
+  `anonLeafRetIdentOk` in and nothing else, this cell went from the loud reject above to
+  CHECK-CLEAN INVALID WASM — `expected (ref null $type), found (ref $type)`. The disassembly says
+  it in one line: `src`'s local was `(ref $1)` over the narrow row with
+  `struct.new $1 (i32.const 7)`, while the function's result was `(ref null $2)`, the merged row.
+  The return row moved and the literal did not.
+
+* **FIVE READERS OF THE MERGED ROW HAD BEEN NAMED ONE AT A TIME; THIS IS THE SIXTH AND IT IS THE
+  LITERAL ITSELF.** The map's value slot (D841), the binding's cell (D842) and three return-row
+  resolvers (D871) each got their own `anonLeafSupersedeOf`. A plain local's row — and the row a
+  `struct.new` builds at — comes from `structIndexOfObjCtx`, and nothing redirected it. Rather
+  than a seventh named site, the redirect goes at that resolver (`anonLeafJoinRowOf`), keyed on
+  the literal being a JOIN MEMBER. It is a mark and not a row, so a same-fieldset literal with a
+  destination of its own is untouched — the separation `d841_hazard_declared_dest`,
+  `d842_hazard_declared_dest` and `d876_declared_dest_beside_ann_fam` each grade, and all three
+  still run.
+
+* **THE PHASE FLAG IS LOAD-BEARING, not an optimisation.** `collectAnonShapes`' own mint loop
+  calls `structIndexOfObj` to decide what to mint and which row to record the supersede against,
+  and it needs the PRE-merge answer. `anonLeafEmitPhase` arms the redirect after the last pass
+  row and before the first section, and it is applied OUTSIDE `structIndexOfObjCtx`'s memo —
+  the cached value is keyed by row count, and the flag can flip with the row count unchanged.
+
+* **THE READ REFUTES AS A WHOLE, and the binding scan is strict where the `??`'s own IDENT reader
+  is lenient.** Every store to the returned name must be an object literal or `null`; a name with
+  NO binding in the frame (a parameter, a capture, a global) refutes rather than answering "no
+  members". That is `anonLeafJoinCallee`'s rule, unchanged: an unmoved value handed back through
+  a moved return row is invalid wasm, not a lost member. `d888_ret_param` is the parameter case
+  and it is still OPEN.
+
+* **BYTE-INERT ON THE WHOLE CORPUS.** Corpus `cmp` against master: **2,485 modules · 2,033
+  identical · 0 DIFFER · 0 LOST**, with the redirect at a resolver every literal in the language
+  goes through. The gate is `anonLeafJoined[objIx] == 1`, and outside a `??` merge family no
+  program has one.
+
+---
+
+### D883 — [CLOSED 2026-08-31] a returned CALL is one more frame of the same read, and nothing is published until the whole read succeeds
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (`d876_call_ret_is_call`) · a CLAUSE-2 close · 2 cells (`d876_call_ret_is_call`, `distilled/named/d883_ret_call_reads`) · 1 corpus cell → `runs`, **0 `runs` lost, 0 into any silent class***
+
+Repro (now runs, printing `0`):
+
+    function inner(): {r: i32} | null { { r: 7 } }
+    function src(): {r: i32} | null { inner() }
+    function rd() {
+      const g1 = src() ?? { r: null }
+      print(0)
+    }
+    rd()
+
+* **THE COMMIT DISCIPLINE IS THE WHOLE OF THE CHANGE'S RISK.** With one frame,
+  `anonLeafJoinCallee` could refute before appending anything. With two, a nested SUCCESS under an
+  outer REFUTATION would leave the inner frame's literals in the family (members whose row never
+  moves) and the inner callee MARKED in `anonLeafRetMoved` (a return row that follows a merge with
+  nothing behind it). That is exactly the `runs`-losing shape `anonLeafRetMoved` exists to prevent
+  — D875's pin. The read now fills a scratch pair and publishes both only on overall success.
+
+* **TWO INDEPENDENT BOUNDS, and they answer different questions.** A depth cap (`> 1`) bounds a
+  chain of distinct callees. The visited set bounds a cycle — and it ANSWERS rather than refuting,
+  which is D885.
+
+* **REAL DISASSEMBLY**, on `d883_ret_call_reads`. Master: `inner` and `src` both `(result (ref
+  null $0))` over `(type $0 (struct (field (mut i32))))`, and `rd`'s default
+  `struct.new $0 (global.get $global$0)`. Here both are `(result (ref null $1))` over
+  `(type $1 (struct (field (mut (ref $2)))))` with the box
+  `(type $2 (struct (field i32) (field anyref)))`; `inner` builds tag 0 around
+  `(type $3 (struct (field i32)))`, `src` passes it through, and the default builds tag 2 with the
+  string. Both frames' rows moved together, which is what the commit discipline buys.
+
+---
+
+### D884 — [CLOSED 2026-08-31] a LITERAL-UNION alias is the seventh atom, and it may join a set of `null`s and nothing else
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` (`d876_litunion_ann`) · a CLAUSE-2 close · 4 cells (`d876_litunion_ann` + `distilled/named/d884_*`) · 1 corpus cell → `runs`, **0 `runs` lost, 0 into any silent class**; the admission guard is what keeps it at zero***
+
+Repro (now runs, printing `0`):
+
+    type K = "a" | "b"
+    function rd() {
+      let a: {r: K} | null = null
+      const g1 = a ?? { r: null }
+      print(0)
+    }
+    rd()
+
+* **D876's SECOND CLAUSE WAS WRONG AND THE DECLARED TWIN IS THE PROOF.** The row read "the merged
+  set could not be spelled by `nameFieldCode` if it did … D804's own `boolean|null` (code 21)
+  decline wearing a second spelling". `nameFieldCode("K|null")` is **30**, the nullable-litunion
+  niche, and `type R = { r: K | null }` with the same `??` RUNS on master. 21 and 30 are not the
+  same decline: 21 records no companion column, 30 records the non-null alias name — the column
+  `sFieldIsLitUnion` recovers the atom rep and the membership from. `anonLeafPolyFieldCode` admits
+  a code exactly when this mint can fill its companion, which is now three codes (16, 20, 30) on
+  one test rather than two by enumeration. 21 still declines, for its own recorded reason.
+
+* **THE ADMISSION GUARD IS A `runs → not-runs` I CAUSED AND CAUGHT, and it is a cell.** A VALUE's
+  atom is read off the value, so `{r: "b"}` contributes `string`. `let a: {r: K} | null = {r:
+  "b"}` beside `?? {r: null}` therefore has the set `string|null`, code 20 carries it, and the
+  program RUNS on master. Letting `K` in unconditionally made the set `K|string|null` — nothing
+  `nameFieldCode` can spell — so the mint declined, the field fell back to `anonFieldCode`'s
+  answer, and a RUNNING program became `emitProgram: bare null needs a struct-typed context`. No
+  corpus cell and no named set had it; it exists because a program was written to read the value
+  back. `d884_litunion_beside_str` is the pin, `d884_litunion_two_fams` is both families in one
+  program, and the atom is now admitted only where every other atom is `null`.
+
+* **NORMALISING `K` AND `string` ONTO ONE ATOM IS A DIFFERENT QUESTION AND IS NOT DONE.** They are
+  different REPS — an interned i32 id against a string ref — so a set holding both needs a box the
+  niche codes cannot give. The guard declines rather than inventing one.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), on
+  `d884_litunion_ann_reads`. Master writes no module at all — `vl build` stops at
+  `emitProgram: bare null needs a struct-typed context`. Here there are TWO rows of the SAME
+  layout, `(type $0 (struct (field (mut i32))))` for the annotation's own `{r: K}` and
+  `(type $1 (struct (field (mut i32))))` for the merged `{r: K|null}`: code 30 is an i32 atom
+  SLOT, not a box, so the merge changes which row the binding names and not the layout it has.
+  The local is `(ref null $1)` and the default is `struct.new $1 (i32.const -1)` — the niche's
+  spare value, which the `== null` read compares against. The value box `(type $2 (struct
+  (field i32) (field anyref)))` is in the module for the program's other machinery and this
+  field does not use it, which is exactly the difference from the code-16 families above.
+
+---
+
+### D885 — [CLOSED 2026-08-31] a returned SELF-CALL is not an unnameable path
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close · 1 cell (`distilled/named/d885_self_recursive_ret`) · found by writing the program; reached by no corpus cell and no named set**
+
+Repro (now runs, printing `5`):
+
+    function src(n: i32): {r: i32} | null {
+      if n <= 0 { return { r: 5 } }
+      src(n - 1)
+    }
+    function rd() {
+      const g1 = src(2) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+
+* **THE VISITED SET WAS REFUTING WHERE IT SHOULD ANSWER.** `anonLeafCalleeRead` uses its mark list
+  as the cycle guard, and a name already on the path returned false — declining the whole callee
+  and leaving the family the default alone. It is sound to ANSWER instead: the frame that pushed
+  the name is being read, so its return row is in the mark list and will follow the merge, and a
+  self-call hands back exactly that row. Mutual recursion two frames out still refutes, on the
+  depth cap.
+
+* **ONE CHARACTER OF BEHAVIOUR, AND IT IS WHY THE ROW IS SEPARATE.** D883 built the visited set;
+  this is a claim about what a HIT means, and it is separately ablatable — reverting it alone
+  reddens exactly this cell and nothing else.
+
+---
+
+### D886 — [CLOSED 2026-08-31] a returned binding whose value is a CALL is D882 and D883 composed
+
+**closed as `runs` · was check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · a CLAUSE-1 close · 1 cell (`distilled/named/d886_ret_binding_of_call`) · found by writing the program; reached by no corpus cell and no named set**
+
+Repro (now runs, printing `3` then `3`):
+
+    function mid(): {r: i32} | null {
+      const w = { r: 3 }
+      w
+    }
+    function src(): {r: i32} | null {
+      const v = mid()
+      v
+    }
+    function rd() {
+      const g1 = src() ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    function alt() {
+      const g2 = mid() ?? { r: "t" }
+      print(g2.r)
+    }
+    alt()
+
+* **NEITHER HALF ALONE REACHES IT.** `anonLeafBoundValOk` split a returned binding's value two
+  ways — a literal is a member, a `null` is neither — and refuted a CALL. With D883 shipped and
+  this arm absent the cell stays check-clean invalid wasm; with this arm and D882's reader absent
+  there is no binding scan to reach it from.
+
+* **THE CELL READS BACK THROUGH BOTH `??`s**, `src()`'s and `mid()`'s own, so the two frames'
+  rows are asserted to agree rather than merely to compile. `mid` is read directly by `alt` and
+  transitively by `rd`; a change that moved one and not the other prints `3` once and something
+  else after it.
+
+---
+
+### D887 — [CLOSED 2026-08-31] an inferred NULLABLE-STRUCT return was a check refusal conceding type-validity, and lifting the floor alone only MOVES the gap
+
+**closed as `runs` · was `loud check reject: 'src' infers the nullable return type {r: i32} | null — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type` · a CLAUSE-2 close · 3 cells (`distilled/named/d887_*`) · reached by NO corpus cell and no capability probe, which is why it had no id until now — D871's row named it and had none left**
+
+Repro (now runs, printing `7` then `0`):
+
+    function src(f: boolean) {
+      if f { return null }
+      { r: 7 }
+    }
+    const a = src(false)
+    if a != null { print((a).r) } else { print(0) }
+    const b = src(true)
+    if b != null { print((b).r) } else { print(0) }
+
+* **THE ANNOTATED TWIN ALWAYS RAN AND PRINTS THE SAME TWO LINES.** `: {r: i32} | null` spelled
+  out lowers to `(result (ref null $S))` with `ref.null $S` on the null branch. So the rep was
+  never missing and the sentence conceded as much in its own words — a capability refusal, not a
+  design rule.
+
+* **THREE SITES, AND STOPPING AT ONE IS THE TRAP.** Lifting the checker's floor alone left
+  `emitProgram: bare null needs a struct-typed context` — a clause-2 violation moved from the
+  checker to the emitter, which `goal-scoreboard.py` counts the same and a reader would have read
+  as progress. A probe build printing the A20 row says why: `PROBE fn=src row=-1 inm=[] kind=i32
+  si=-1`. Nothing was recorded, so nothing downstream could act. (1) The checker's named-function
+  cascade now records `nullableRetName`'s render for the shape, beside the three niches it
+  already recorded. (2) `computeRetInference` maps that name to `("nulstruct", structIndexOfTypeName
+  of the non-null part)` — the same pair the ANNOTATED path stores. (3) `emitReturnValue` grows
+  the inferred twin of the annotated `retNulRefFlag` seed, with the `??`-merge redirect beside it
+  so the four return-row owners cannot drift.
+
+* **`nullableRetName` IS THE RENDERER, NOT A NEW ONE.** It is what the LAMBDA ladder already
+  records for the identical shape. Its TyObj arm renders a DECLARED inner by its nominal name and
+  an inline shape as emitter-format text, and `structIndexOfTypeName` resolves both — the second
+  by FIELD SET — onto the row the annotation side keys. `d887_inferred_nulstruct_decl_inner` is
+  the declared half of that bound.
+
+* **IT MAKES D871's ZERO-SCORING RUNG LIVE.** `emitOneFuncType`'s inferred functype arm shipped
+  against a measured zero, and D871's row said explicitly that the zero was this refusal's doing.
+  `d887_inferred_ret_beside_fam` — an inferred nullable-struct return as a `??` left operand —
+  reaches it and prints `7` then `s`.
+
+* **THE RESIDUE IS NAMED AND HAS A PROBE.** `nullableRetName` has no map arm and no
+  distinct-backing scalar-list arm, so `{[string]: i32} | null` and `i64[] | null` still floor
+  with the same literal while their annotated twins run (printing `7` and `2`).
+  `scripts/capability-probes/inferred-nullable-container-return.vl` is that gap, and it is
+  reached by no corpus cell either — which is the whole reason the probe directory exists.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130), and the strongest form
+  of it: the inferred spelling's module is **BYTE-IDENTICAL** to the annotated twin's — both
+  240 bytes, `cmp` clean. `src` is `(result (ref null $0))` over
+  `(type $0 (struct (field (mut i32))))` with `ref.null none` on the null branch and
+  `struct.new $0 (i32.const 7)` on the other. Master writes no module for the inferred one at
+  all: `vl check` stops it.
+
+* **TWO `tests/cases` FIXTURES ASSERTED THE REFUSAL AND NOW ASSERT THE RUN.**
+  `functions/unsupported-inferred-nullable-return.vl` (inline shape) and
+  `functions/return-nullable-struct-local.vl` (declared inner) were the only two modules in the
+  2,481-module corpus that master could not build and this can — `corpuscmp` reports them as
+  GAINED, never as DIFFER or LOST. Both keep their names so the history reads straight.
+
+---
+
+### D888 — a returned PARAMETER: the literals are at the CALL SITES, and the parameter's slot is a SEVENTH owner
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d888_ret_param`, `tests/cases/types/xfail-coalesce-default-row-past-returned-param.vl`), OPEN · IDENTICAL on master, so it is not a regression — it is the delivery form D882/D883/D885/D886's reader still declines, and it is the ONE cell `goal-scoreboard.py` scores against the goal**
+
+Repro (check-clean invalid wasm):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function rd() {
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(0)
+    }
+    rd()
+    // vl check rc 0 (one unused-variable warning); vl run ->
+    //   failed to compile: wasm[0]::function[5]::rd … type mismatch: expected i32,
+    //   found (ref $type)
+    // SHOULD PRINT 0.
+
+* **FOUND BY WRITING THE PROGRAM, not by a grid or a corpus cell.** It is the fourth thing a
+  callee can hand back — after a literal, a binding and a call — and it was the only one left
+  when the other three closed.
+
+* **IT IS NOT THE IDENT READER ONE FRAME FURTHER.** `anonLeafRetIdentOk` resolves a returned name
+  against the bindings of the frame that returned it; a parameter has none, the scan finds
+  nothing, and the read refutes as a whole. The literals that reach a parameter are the ARGUMENTS
+  at every call site — reachable, since the reader already scans the whole arena for a callee by
+  name — but the parameter's own slot row comes from its ANNOTATION, not from
+  `structIndexOfObjCtx`, so moving the argument literal onto the merged row without moving the
+  parameter's slot is the same disagreement one position over. Closing it needs a SEVENTH OWNER of
+  the merged row (the param's slot), not an eighth reader.
+
+* **THE FAMILY'S RECURRING SHAPE, one more time.** Every close in this line — D804, D831,
+  D833/D841, D842, D871/D872/D873, D881, D882 — has been the same sentence: the row gets minted,
+  and the thing that READS it resolves the wrong one. D882 answered it for the literal by moving
+  the redirect to the resolver every literal goes through. A parameter's slot does not go through
+  that resolver, which is exactly why it is left.

@@ -69,21 +69,28 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // An INFERRED nullable-struct return is type-valid; codegen cannot lower it un-annotated
-  // (the annotated `: S | null` spelling of the same function builds and runs).
+  // An INFERRED nullable-MAP return is type-valid; codegen cannot lower it un-annotated
+  // (the annotated `: {[string]: i32} | null` spelling of the same function builds and runs).
   //
-  // THE WITNESS MOVED, AND WHY IS THE POINT OF THE TEST. It used to be
+  // THE WITNESS HAS MOVED TWICE, AND WHY IS THE POINT OF THE TEST. It was
   // `print(pick(true))` over an `i32 | string`, which now RUNS — D712 built the box-tag
-  // dispatch, because every arm of that union is inside `print`'s declared domain. What
-  // this test pins is the CHANNEL (a capability admission carries a stable code), so any
-  // still-open capability gap serves as its witness.
+  // dispatch, because every arm of that union is inside `print`'s declared domain. It was
+  // then an inferred nullable-STRUCT return, which now runs too — D887 recorded that shape's
+  // inferred-return row so the A20 pass and `emitReturnValue` could take the arms the
+  // annotated path already had. What this test pins is the CHANNEL (a capability admission
+  // carries a stable code), so any still-open capability gap serves as its witness.
+  // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
+  // for this one; when it closes, this moves again.
   const { rc, diags } = check(
     exp,
     [
-      "type S = { s: i32 }",
-      "function pick(v: S | null) { return v }",
+      "function pick(c: boolean) {",
+      "  if c { return null }",
+      "  const m: {[string]: i32} = Map()",
+      "  m",
+      "}",
       "function go() {",
-      "  const r = pick(null)",
+      "  const r = pick(true)",
       "  if r == null { print(0) } else { print(1) }",
       "}",
       "go()",
