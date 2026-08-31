@@ -154,14 +154,22 @@ is the number that is supposed to climb.
 **`scripts/goal-scoreboard.py` is the measurement — do not hand-count this.** It reads the
 corpus baseline and prints `runs` plus both clauses' violations, instantly, without compiling.
 On 2026-08-30: **runs 3,704 / 7,021 (52.76%)**, clause 1 **92**, clause 2 **314** emit rejects
-and **45** check rejects that concede type-validity — **451 cells against the goal**. Pass
-`--sites` for the refusal sites in `compiler/*.vl` whose own message concedes the program is
+and **45** check rejects that concede type-validity — **451 cells against the goal**. It also
+counts the refusal sites in `compiler/*.vl` whose own message concedes the program is
 type-valid (`has no lowering`, `not yet supported by codegen`, one reading `this program is
-type-valid but cannot build`): **26**, of which **18 are in `typecheck.vl`**. That is the
-direction that hides — a capability gap moved into the checker stops looking like a gap, and
-the program compiles no better than before, so the script counts it the same as an emit-side
-one. A first hand-count of these said 40 by grepping lines rather than message sites; the
-script exists so the number is not re-derived by hand each time.
+type-valid but cannot build`) — **23**, most of them in `typecheck.vl`. That is the direction
+that hides: a capability gap moved into the checker stops looking like a gap, and the program
+compiles no better than before, so the script counts it the same as an emit-side one.
+
+**AND `runs` CAN REACH 100% WITH THE GOAL UNMET — the script says by how much.** The corpus is
+generated over fixed axes, so it scores only the gaps it has a program for. **13 of the 23
+sites are reached by NO corpus cell**, `+` over an f64 list among them: `f64[] + f64[]` refuses
+today and costs the scoreboard nothing. Each ZERO row in `--sites` needs a hand-written probe,
+and none will arrive on its own. Do not read a rising `runs` as the whole answer.
+
+A first hand-count of these sites said 40 by grepping lines rather than message sites. The
+script exists so this is not re-derived by hand, and it has now been re-derived by hand twice
+with two different wrong answers.
 
 **Every `loud emit reject` is a clause-2 violation by construction**, since `check` returned 0
 to reach the emitter: either the program is legal and should compile, or it is illegal and the

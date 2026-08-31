@@ -52,20 +52,36 @@ def norm(msg):
     return m.strip()[:118]
 
 
-def capability_sites(root):
-    """Refusal sites in the compiler whose own message concedes type-validity.
+def capability_sites(root, corpus_text):
+    """Refusal sites in the compiler whose own message concedes type-validity, each marked
+    by whether the CORPUS actually reaches it.
 
     Greppable on purpose. Clause 2 is otherwise the kind of bar that gets argued rather
     than measured — and the argument always resolves in favour of whoever is tired.
+
+    THE `ZERO` ROWS ARE THE POINT. The corpus is generated over a fixed set of axes, so it
+    can only score a gap it has a program for. Measured 2026-08-30: **13 of 23 sites are
+    reached by no corpus cell at all** — `+` over an f64 list among them, which refuses
+    today and costs the scoreboard nothing. `runs` could therefore reach 100% with thirteen
+    capability refusals still standing. Every ZERO row needs a hand-written probe before
+    this goal can be called met; none of them will arrive on their own.
     """
-    out = collections.Counter()
+    out = []
     src = os.path.join(root, "compiler")
     for fn in sorted(os.listdir(src)):
         if not fn.endswith(".vl"):
             continue
-        for line in open(os.path.join(src, fn), encoding="utf-8"):
-            if CONCEDES.search(line) and '"' in line:
-                out[fn] += 1
+        for ln, line in enumerate(open(os.path.join(src, fn), encoding="utf-8"), 1):
+            if not (CONCEDES.search(line) and '"' in line):
+                continue
+            quoted = re.findall(r'"([^"]{12,})"', line)
+            if not quoted:
+                continue
+            frag = max(quoted, key=len).strip()
+            # The longest interpolation-free slice, as a fingerprint to look for in the
+            # corpus's recorded messages.
+            probe = max(re.split(r"\s{2,}|`", frag), key=len).strip()[:44]
+            out.append((fn, ln, probe, bool(probe) and probe in corpus_text))
     return out
 
 
@@ -115,12 +131,23 @@ def main():
             print(f"  {n:5d}  {m}")
         print()
 
+    root = os.path.dirname(HERE)
+    corpus_text = " \n".join(v.get("msg", "") for v in cells.values())
+    sites = capability_sites(root, corpus_text)
+    blind = [s for s in sites if not s[3]]
+    print(f"  capability refusal sites in compiler/*.vl   {len(sites):5d}")
+    print(f"    of those, reached by NO corpus cell       {len(blind):5d}  "
+          f"<- invisible to the scoreboard above")
+    print()
+    if blind:
+        print("The corpus is generated over fixed axes, so it can only score a gap it has a")
+        print("program for. `runs` can reach 100% with every site below still refusing. Each")
+        print("needs a hand-written probe; none will arrive on its own.")
+        print()
     if a.sites:
-        root = os.path.dirname(HERE)
-        sites = capability_sites(root)
-        print(f"compiler refusal sites conceding type-validity: {sum(sites.values())}")
-        for fn, n in sites.most_common():
-            print(f"  {n:5d}  compiler/{fn}")
+        for fn, ln, probe, hit in sites:
+            print(f"  {'HIT ' if hit else 'ZERO'}  compiler/{fn}:{ln}  {probe!r}")
+        print()
         print("  (a gap moved into typecheck.vl stops looking like a gap — the program")
         print("   compiles no better than before, so these count the same as emit-side ones)")
         print()
@@ -131,6 +158,8 @@ def main():
                        "clause1_silent": len(silent),
                        "clause2_emit_reject": len(emit),
                        "clause2_conceded": len(conceded),
+                       "capability_sites": len(sites),
+                       "capability_sites_uncovered": len(blind),
                        "by_class": dict(by)}, fh, indent=2, sort_keys=True)
         print(f"wrote {a.json}")
 
