@@ -18051,7 +18051,7 @@ Repro:
   program, and becomes `bare null needs a struct-typed context`).
 
 ### D624 — D623's un-annotated carrier with a MAP-VALUED field, reached through a LIST rather than a struct field
-**[CLOSED 2026-08-30] the repro below RUNS and prints nothing, which is correct — the list has one element, so the `else` never fires. Was: check-clean invalid wasm · 55 cells, ALL 55 moved to `runs`, and they were 55 of the 62 silent cells left in the whole corpus · the fix is one rung: `variantStructHeapTwinAt`'s field-storage guard descends into the MAP codes instead of declining them, by SLOT EQUALITY**
+**[CLOSED 2026-08-30] the repro below RUNS and prints nothing, which is correct — the list has one element, so the `else` never fires. Was: check-clean invalid wasm · 55 cells, ALL 55 moved to `runs`, and they were 55 of the 61 silent cells left in the whole corpus · the fix is one rung: `variantStructHeapTwinAt`'s field-storage guard descends into the MAP codes instead of declining them, by SLOT EQUALITY**
 
 Repro:
 
@@ -18193,7 +18193,7 @@ Repro:
   | the map field NULLABLE on both ends (`r: {[string]: i32} \| null`) | **check-clean invalid wasm** | **runs, 7** |
   | the map NESTED on both ends (`{[string]: {[string]: Circle}}`) | **check-clean invalid wasm** | **runs, 7** |
   | a second scalar-list field beside the map field (`q: i32[]`) | **check-clean invalid wasm** | **runs, 7** |
-  | the map's VALUE type has a layout twin of its OWN (`{[string]: Leaf}` vs `{[string]: Leaf2}`) | **check-clean invalid wasm** | **still check-clean invalid wasm — see D626** |
+  | the map's VALUE type has a layout twin of its OWN (`{[string]: Leaf}` vs `{[string]: Leaf2}`) | **check-clean invalid wasm** | **still check-clean invalid wasm — see D627** |
 
   The last four rows are territory this close opened, and the last one is the BOUND: slot
   equality answers when the two ends' maps are the SAME slot and declines when they are two
@@ -18209,10 +18209,13 @@ Repro:
 * **THE TRADE, cell-matched on the distilled corpus: 55 classes move, every one `check-clean
   invalid wasm` → `runs`. `runs -> not-runs`: 0. `-> silent`: 0. Same-class message moves: 0.**
   No other transition of any kind, no new compiler trap, no corpus module lost. `runs`
-  **3,886 → 3,941** (55.35% → 56.13%), clause 1 **62 → 7**, total against the goal
-  **269 → 214**. Corpus `cmp`: 2,426 modules built with both seeds, **1,958 byte-identical,
+  **3,888 → 3,943** (55.38% → 56.16%), clause 1 **61 → 6**, total against the goal
+  **267 → 212**. Corpus `cmp`: 2,428 modules built with both seeds, **1,959 byte-identical,
   14 DIFFER, 0 LOST, 0 GAINED** — every one of the 14 is a map / union-arm fixture on this exact
-  seam.
+  seam. (First measured against `0c7aea50` and re-measured against the merge base `1bde4fca`
+  once D625 landed first: the same 55 classes move, D625 having closed one other clause-1 cell
+  — `b004880`, its own — in between. STRIP-ALL reproduces the merge base byte for byte at md5
+  `543ae3f386bc4b0f48f9bf37b36dce59`, so the ablation below re-grades unchanged.)
 * **THE DISASSEMBLY IS THE WHOLE DIAGNOSIS** (`./node_modules/.bin/wasm-dis`, binaryen 130 —
   both `$type`s print under the same elided name, so nothing else can show which indices are in
   play). On master the narrow witness's rec group carries THREE 7-field map structs and TWO
@@ -18231,7 +18234,8 @@ Repro:
   the IDENTICAL `struct.new $1 (call $0)` is well typed. 2,963 bytes against 3,002 — one struct
   row and one 7-field map struct, and nothing else in the module moves.
 * **ABLATION — one rung, and STRIP-ALL reproduces the base byte for byte** (md5
-  `e1a140b70abca7c0aa3a56800493e2b4`), so the header contributes nothing and the guard is the
+  `543ae3f386bc4b0f48f9bf37b36dce59` on the merge base, `e1a140b70abca7c0aa3a56800493e2b4` on
+  the tree it was first measured on), so the header contributes nothing and the guard is the
   whole change. Each sub-rung lifted alone, every variant self-compiled and graded cell-matched
   against master's baseline:
 
@@ -18249,7 +18253,7 @@ Repro:
   on both sides and one slot means one `(ref null $map)` — sound for exactly the reason 19 is —
   and a `-3` merge is the one direction the `""`-key discipline forbids. The last two rows are
   measured NEGATIVES worth not re-deriving: the canon-rep widening buys nothing HERE (it does
-  buy D626 — see there, and why it was still declined), and the code-15 descent buys nothing at
+  buy D627 — see there, and why it was still declined), and the code-15 descent buys nothing at
   all, so the guard's remaining narrowness costs this corpus zero today.
 * Pin: `tests/cases/soundness/map-field-arm-shares-its-layout-twins-heap.vl`, two programs — the
   narrow witness with the stored value READ BACK (so the merge is graded on a hit and not only
@@ -18258,7 +18262,7 @@ Repro:
   D623's is: appended to `arm-and-its-layout-twin-share-one-heap.vl` the other programs'
   declarations change what these literals resolve to, and it becomes a different program.
 
-### D626 — the map's VALUE type has a layout twin of its OWN: what SLOT equality still declines, one indirection past D624
+### D627 — the map's VALUE type has a layout twin of its OWN: what SLOT equality still declines, one indirection past D624
 **check-clean invalid wasm · found 2026-08-30 by asking D624's close, directly, whether it unmasked a fifth defect in the D280 / D621 / D623 / D624 chain · it is NOT unmasked — the witness is check-clean invalid wasm on master as well — but it is the next layer out, and the widening that closes it is already measured and was declined for a named reason**
 
 Repro:
@@ -18316,8 +18320,8 @@ Repro:
   `type Leaf2` (the INNER twin, both values `Leaf`) → runs, 7; drop `type Dot` (the outer twin)
   → runs, 7; drop `type Shape` (the union) → runs, 7; make the field `r: {[string]: i32}` on both
   sides → runs (that is D624, closed).
-* **NOT REACHED BY THE CORPUS.** After D624 the 7,021-cell distilled corpus grades 7 clause-1
-  cells and none is this shape (six are D592's named set, one is `b004880`), so this row scores
+* **NOT REACHED BY THE CORPUS.** After D624 the 7,021-cell distilled corpus grades 6 clause-1
+  cells and none is this shape — all six are D592's named set — so this row scores
   nothing on `goal-scoreboard.py` and closing it will not move `runs` there. It needs its own
   probe, which is what the repro above is — the `--sites` blind spot the scoreboard's own header
   warns about, in the soundness clause rather than the capability one.
