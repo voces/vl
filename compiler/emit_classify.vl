@@ -196,6 +196,7 @@ import {
   PIN_SIGKEY,
   Param,
   Paren,
+  Program,
   RetStmt,
   StrLit,
   TS_FUNC,
@@ -206,6 +207,7 @@ import {
   WhileStmt,
   annTsOf,
   mkTypeRef,
+  nodeChildren,
   tsHasKind,
   tsKind,
 } from "./ast"
@@ -348,6 +350,7 @@ import {
   ctrlDepth,
   emitCurFnIx,
   emitCurFnPos,
+  emitRootIx,
   fRetBool,
   fRetKind,
   fRetLitAtom,
@@ -29934,130 +29937,241 @@ export function letRefListDestSlotK(letIx: i32, fnIx: i32, want: i32): i32 {
       return -1
     }
     const nm = d.letName
+    // THE BINDING'S OWN SCOPE (D661) — see `dsScopeRootOf`. A name-matched arena scan reads
+    // two same-named bindings in different scopes as ONE binding with two destinations, and
+    // the conflict above then refuses both. Where the scope is known the walk stays inside
+    // it; where it is not, the whole-arena scan below is kept unchanged.
+    const scopeIx = dsScopeRootOf(letIx, nm, fnIx)
+    if scopeIx >= 0 { return dsScopeWalk(scopeIx, scopeIx, nm, fnIx, want) }
     let i = 0
     while i < P.nodes.length {
-      const nd = P.nodes[i]
-      if nd is LetDecl {
-        if nd.letType >= 0 && nd.letInit >= 0 {
-          const dini = P.nodes[unwrapParen(nd.letInit)]
-          // (a) `const c: Shape[] = nm`
-          if dini is Ident {
-            if dini.identName == nm {
-              const rs = letAnnDestKindListSlot(i, want)
-              if rs >= 0 { return rs }
-            }
-          }
-          // (b) `const c: Shape[][] = [nm]` — the annotation's ref-list element is
-          // itself a ref list (kind 9); its INNER slot is the one this binding must be.
-          if dini is ArrayLit {
-            let ei = 0
-            while ei < dini.arrElems.length {
-              const el = P.nodes[unwrapParen(dini.arrElems[ei])]
-              if el is Ident {
-                if el.identName == nm {
-                  const iv = rlInnerKindListSlot(letAnnRefListSlot(i), want)
-                  if iv >= 0 { return iv }
-                }
-              }
-              ei = ei + 1
-            }
-          }
-          // (f) `const w: W = { f: nm }` — the declared struct FIELD, the third of
-          // `letMapDestShape`'s own three destination forms.
-          if dini is ObjLit {
-            const dsi = letAnnStructIdx(i)
-            if dsi >= 0 {
-              let fj = 0
-              while fj < dini.objFields.length {
-                const ff = P.nodes[dini.objFields[fj]]
-                if ff is FieldInit {
-                  const fv = P.nodes[unwrapParen(ff.fiValue)]
-                  if fv is Ident {
-                    if fv.identName == nm {
-                      const fi2 = sFieldIndex(dsi, ff.fiName)
-                      if fi2 >= 0 {
-                        const rs = rlSlotByName(sFieldElemNameAt(dsi, fi2))
-                        if rlSlotIsKindList(rs, want) { return rs }
-                      }
-                    }
-                  }
-                }
-                fj = fj + 1
-              }
-            }
-          }
+      const rs = dsDestSlotAt(i, nm, fnIx, want)
+      if rs >= 0 { return rs }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// THE SEVEN DESTINATION FORMS, asked of ONE arena node — `letRefListDestSlotK`'s loop body,
+// lifted so the scoped walk and the whole-arena fallback put the identical question. They
+// were one inlined block until D661 added the second traversal; keeping two copies is how
+// a form gets fixed in one traversal and not the other.
+function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
+  const nd = P.nodes[i]
+  if nd is LetDecl {
+    if nd.letType >= 0 && nd.letInit >= 0 {
+      const dini = P.nodes[unwrapParen(nd.letInit)]
+      // (a) `const c: Shape[] = nm`
+      if dini is Ident {
+        if dini.identName == nm {
+          const rs = letAnnDestKindListSlot(i, want)
+          if rs >= 0 { return rs }
         }
       }
-      // (c) `c[k] = nm` over a declared `{[string]: Shape[]}` — the map value's own
-      // ref-list slot, read off the destination map's shape exactly as `letMapDestShape`
-      // reads its nested-map value.
-      if nd is BinExpr {
-        if nd.binOp == "=" {
-          const rhs = P.nodes[unwrapParen(nd.binRight)]
-          if rhs is Ident {
-            if rhs.identName == nm {
-              const lhs = P.nodes[unwrapParen(nd.binLeft)]
-              if lhs is Index {
-                const mapN = P.nodes[unwrapParen(lhs.idxArr)]
-                if mapN is Ident {
-                  const iv = mapValKindListSlot(mapN.identName, fnIx, want)
-                  if iv >= 0 { return iv }
-                }
-              }
-              // (g) `c = nm` — the ASSIGNMENT into an already-declared binding, which
-              // form (a) cannot see: the destination's annotation is on a LetDecl whose
-              // OWN initializer is some other list.
-              if lhs is Ident {
-                const li = destLetOf(lhs.identName, fnIx)
-                if li >= 0 {
-                  const rs = letAnnDestKindListSlot(li, want)
-                  if rs >= 0 { return rs }
-                }
-              }
+      // (b) `const c: Shape[][] = [nm]` — the annotation's ref-list element is
+      // itself a ref list (kind 9); its INNER slot is the one this binding must be.
+      if dini is ArrayLit {
+        let ei = 0
+        while ei < dini.arrElems.length {
+          const el = P.nodes[unwrapParen(dini.arrElems[ei])]
+          if el is Ident {
+            if el.identName == nm {
+              const iv = rlInnerKindListSlot(letAnnRefListSlot(i), want)
+              if iv >= 0 { return iv }
             }
           }
+          ei = ei + 1
         }
       }
-      // (d) `take(nm)` into a `take(c: Shape[])` parameter.
-      if nd is Call {
-        const callee = P.nodes[nd.callFn]
-        if callee is Ident {
-          let ai = 0
-          while ai < nd.callArgs.length {
-            const arg = P.nodes[unwrapParen(nd.callArgs[ai])]
-            if arg is Ident {
-              if arg.identName == nm {
-                const rs = fnParamKindListSlot(callee.identName, ai, want)
-                if rs >= 0 { return rs }
-              }
-            }
-            ai = ai + 1
-          }
-        }
-      }
-      // (e) `return nm` from a function whose RETURN annotation is a box list. The
-      // annotation comes from the ENCLOSING function this binding lives in (`fnIx`), not
-      // from the arena scan — the scan only supplies the fact that the name is returned.
-      if nd is RetStmt {
-        if nd.retArg >= 0 {
-          const rv = P.nodes[unwrapParen(nd.retArg)]
-          if rv is Ident {
-            if rv.identName == nm {
-              if fnIx >= 0 {
-                const fnd = P.nodes[fnIx]
-                if fnd is FuncDecl {
-                  if tyAnnRefListKind(fnd.fnRet) == want {
-                    const rs = tyAnnRefListSlot(fnd.fnRet)
+      // (f) `const w: W = { f: nm }` — the declared struct FIELD, the third of
+      // `letMapDestShape`'s own three destination forms.
+      if dini is ObjLit {
+        const dsi = letAnnStructIdx(i)
+        if dsi >= 0 {
+          let fj = 0
+          while fj < dini.objFields.length {
+            const ff = P.nodes[dini.objFields[fj]]
+            if ff is FieldInit {
+              const fv = P.nodes[unwrapParen(ff.fiValue)]
+              if fv is Ident {
+                if fv.identName == nm {
+                  const fi2 = sFieldIndex(dsi, ff.fiName)
+                  if fi2 >= 0 {
+                    const rs = rlSlotByName(sFieldElemNameAt(dsi, fi2))
                     if rlSlotIsKindList(rs, want) { return rs }
                   }
                 }
               }
             }
+            fj = fj + 1
           }
         }
       }
+    }
+  }
+  // (c) `c[k] = nm` over a declared `{[string]: Shape[]}` — the map value's own
+  // ref-list slot, read off the destination map's shape exactly as `letMapDestShape`
+  // reads its nested-map value.
+  if nd is BinExpr {
+    if nd.binOp == "=" {
+      const rhs = P.nodes[unwrapParen(nd.binRight)]
+      if rhs is Ident {
+        if rhs.identName == nm {
+          const lhs = P.nodes[unwrapParen(nd.binLeft)]
+          if lhs is Index {
+            const mapN = P.nodes[unwrapParen(lhs.idxArr)]
+            if mapN is Ident {
+              const iv = mapValKindListSlot(mapN.identName, fnIx, want)
+              if iv >= 0 { return iv }
+            }
+          }
+          // (g) `c = nm` — the ASSIGNMENT into an already-declared binding, which
+          // form (a) cannot see: the destination's annotation is on a LetDecl whose
+          // OWN initializer is some other list.
+          if lhs is Ident {
+            const li = destLetOf(lhs.identName, fnIx)
+            if li >= 0 {
+              const rs = letAnnDestKindListSlot(li, want)
+              if rs >= 0 { return rs }
+            }
+          }
+        }
+      }
+    }
+  }
+  // (d) `take(nm)` into a `take(c: Shape[])` parameter.
+  if nd is Call {
+    const callee = P.nodes[nd.callFn]
+    if callee is Ident {
+      let ai = 0
+      while ai < nd.callArgs.length {
+        const arg = P.nodes[unwrapParen(nd.callArgs[ai])]
+        if arg is Ident {
+          if arg.identName == nm {
+            const rs = fnParamKindListSlot(callee.identName, ai, want)
+            if rs >= 0 { return rs }
+          }
+        }
+        ai = ai + 1
+      }
+    }
+  }
+  // (e) `return nm` from a function whose RETURN annotation is a box list. The
+  // annotation comes from the ENCLOSING function this binding lives in (`fnIx`), not
+  // from the scan — the scan only supplies the fact that the name is returned.
+  if nd is RetStmt {
+    if nd.retArg >= 0 {
+      const rv = P.nodes[unwrapParen(nd.retArg)]
+      if rv is Ident {
+        if rv.identName == nm {
+          if fnIx >= 0 {
+            const fnd = P.nodes[fnIx]
+            if fnd is FuncDecl {
+              if tyAnnRefListKind(fnd.fnRet) == want {
+                const rs = tyAnnRefListSlot(fnd.fnRet)
+                if rlSlotIsKindList(rs, want) { return rs }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// THE SCOPE A NAME-MATCHED DESTINATION SCAN HAS TO STAY INSIDE (D661), as an arena index to
+// start the walk at, or -1 when this binding's scope is not knowable here.
+//
+// `letRefListDestSlotK`'s scan was `while i < P.nodes.length` over the WHOLE arena, matched
+// on the binding's NAME — the header two functions up says so, on `letMapDestShape`'s and
+// `letInfStrListByUse`'s precedent. So two bindings that merely SHARE A NAME in different
+// scopes read as ONE binding with two destinations, and D411's conflict refuses both even
+// though each has exactly one. Measured on `scripts/silent-sweep/d661/`: **164 of 182
+// two-binding cells**, every one single-destination per binding, and renaming one `lv1` is
+// the only edit that turns the program from a positioned emit reject into a running one.
+//
+// TWO SCOPES AND A DECLINE, because a wrong scope is worse than no scope:
+//   · a LOCAL — `fnIx`'s body, but only once `parentLetOf` CONFIRMS that this binding is
+//     what the name denotes there. `fnIx` is the function the classifier is working in, not
+//     a recorded owner of `letIx`, so the confirmation is what makes it one.
+//   · a GLOBAL — the module scope, `emitProgram`'s own root, confirmed the same way through
+//     `globalLetOf`.
+//   · NEITHER — keep the whole-arena scan. A binding whose scope this cannot name is a
+//     binding whose destinations a scoped walk could silently MISS, and a missed destination
+//     is D381 un-landing into a check-clean invalid module. The decline keeps today's answer
+//     for it exactly.
+function dsScopeRootOf(letIx: i32, nm: string, fnIx: i32): i32 {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if parentLetOf(fn.fnBody, nm) == letIx { return fn.fnBody }
+    }
+  }
+  if globalLetOf(nm) == letIx {
+    if emitRootIx >= 0 {
+      const r = P.nodes[emitRootIx]
+      if r is Program { return emitRootIx }
+    }
+  }
+  -1
+}
+
+// Does the nested function at `fIx` REBIND `nm`? Then its body's uses of the name denote
+// its own binding and never the one being classified, so the walk must not enter it.
+//
+// Both binding forms a function introduces, because either alone leaks: a `const nm = …`
+// anywhere in the body (`parentLetOf`, which descends if/loop bodies for the same reason —
+// wasm locals are function-scoped) and a PARAMETER named `nm`.
+function dsRebindsName(fIx: i32, nm: string): boolean {
+  const fn = P.nodes[fIx]
+  if fn is FuncDecl {
+    if parentLetOf(fn.fnBody, nm) >= 0 { return true }
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parName == nm { return true }
+      }
       i = i + 1
     }
+  }
+  false
+}
+
+// The scoped destination walk (D661) — `alcWalk`'s shape (`emit_collect`'s
+// `scanArrLitCommit`), and its child set: `nodeChildren` is the generic enumeration both
+// passes need, so neither carries a per-node-kind traversal of its own.
+//
+// IT DESCENDS INTO A NESTED FUNCTION, unlike `alcWalk`, and the difference is what each is
+// walking FOR. `alcWalk` visits every scope in turn and must not double-visit; this walk
+// starts at ONE binding's scope and a nested function that captures the binding is part of
+// it — `function outer() { const lv1 = [{r:7}]; function inner() { const c: Shape[] = lv1 }`
+// delivers `lv1` to a declared destination and refusing to look would lose it. The gate is
+// the scope rule itself: descend only where the nested function does not REBIND the name.
+function dsScopeWalk(
+  ix: i32,
+  scopeIx: i32,
+  nm: string,
+  fnIx: i32,
+  want: i32,
+): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if ix != scopeIx {
+    if n is FuncDecl {
+      if dsRebindsName(ix, nm) { return -1 }
+    }
+  }
+  const here = dsDestSlotAt(ix, nm, fnIx, want)
+  if here >= 0 { return here }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    const rs = dsScopeWalk(kids[k], scopeIx, nm, fnIx, want)
+    if rs >= 0 { return rs }
+    k = k + 1
   }
   -1
 }
