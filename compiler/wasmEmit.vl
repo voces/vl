@@ -3500,6 +3500,11 @@ function optRecvReReadable(exprIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Ident { return true }
   if e is Member { return optRecvReReadable(e.memObj) }
+  // A `?.` LINK is a place too — `emitOptChainIsNull` and `emitOptChainValue` are both
+  // written as recursions over exactly this shape, so a chain of them bottoming out in a
+  // name is the same effect-free `local.get`/`struct.get` sequence a `.` chain is. Without
+  // this arm `o?.inner?.y` was re-readable to those two emitters and not to their own gate.
+  if e is OptMember { return optRecvReReadable(e.omObj) }
   false
 }
 
@@ -3616,9 +3621,14 @@ function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
     if ofi < 0 {
       return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
     }
-    if sFieldTypeAt(osi, ofi) != 0 {
+    const oCode = sFieldTypeAt(osi, ofi)
+    // The leaf reps a standalone `?.` has a null encoding for: i32/boolean (code 0), and a
+    // STRING leaf — plain (code 3) or already-nullable (code 20) — whose `string | null`
+    // niche IS `(ref null $sTypeIdx)`, so the null arm is a `ref.null` and nothing has to be
+    // invented. Every other code keeps the loud reject below.
+    if oCode != 0 && oCode != 3 && oCode != 20 && oCode != 16 {
       return emitFailAt(
-        "emitProgram: a standalone `?.` supports only i32/boolean leaf fields — read it through `?? d` or a `!= null` guard",
+        "emitProgram: a standalone `?.` supports only i32/boolean and string leaf fields — read it through `?? d` or a `!= null` guard",
         exprIx,
       )
     }
@@ -3641,9 +3651,15 @@ function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
     // tag over an unread payload. Both heap types are usage-gated (`uDeclared` mints
     // the box, `vbI32Used` its i32 value box), so a program whose collect walk never
     // registered the union fails loudly instead of emitting `struct.new` on index 0.
-    if ord.rdKind == "union" && ord.rdNul == 4 {
+    // A value-UNION LEAF (code 16) lands on the SAME box, and it is the leaf's own: the
+    // field already holds a `(ref $uBox)`, so the present arm reads it through instead of
+    // wrapping a scalar. The chain only ADDS `null` to the field's member set, and the null
+    // tag is how the box spells that — D803. (Keyed on the field CODE because the chain's
+    // checked type is a flat `TyUnion` with a `null` member, which `repOfTyFlat` gives
+    // `rdNul` 0, not the `TyNullable`-of-a-scalar's 4.)
+    if oCode == 16 || (ord.rdKind == "union" && ord.rdNul == 4) {
       const ovb = vbHeapIdxOfKind(0)
-      if !uDeclared || ovb < 0 {
+      if !uDeclared || (oCode != 16 && ovb < 0) {
         return emitFailAt(
           "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
           exprIx,
@@ -3657,12 +3673,44 @@ function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
       fbRefNullNone()        // the payload slot is unread under the null tag
       fbStructNew(uBoxIdx)
       fbElse()               // 0x05 else — every link present, the boxed field value
+      if oCode == 16 {
+        if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+        fbStructGet(sHeapIdx[osi], ofi) // the field's own box, read through
+        fbEnd()
+        ctrlLeave()
+        return 0
+      }
       fbI32Const(scalarTagOfKind(0))
       if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
-      fbStructNew(ovb)       // wrap the scalar payload
+      fbStructNew(ovb) // wrap the scalar payload
       fbStructNew(uBoxIdx)
-      fbEnd()                // 0x0b end
+      fbEnd()          // 0x0b end
+      ctrlLeave()
+      return 0
+    }
+    // `string | null` — the nullable raw-array ref niche (`repOfNullable`'s `nulstr`), so a
+    // null link is `ref.null $sTypeIdx` and a present one the field's own string. D802: the
+    // string leaf refused here AND at `?. … ??`, while `if x != null { print(x.y) }` ran, so
+    // it was a capability gap at both spellings and not a rep the language lacks.
+    // A code-20 LEAF (`y: string | null`) lands on the same niche while the checker's type
+    // for the chain is a nullable OF a nullable, which `repOfNullable` does not cover — so
+    // the field's own code is the authority for that spelling.
+    if oCode == 20 || (ord.rdKind == "nulstr" && ord.rdNul == 1) {
+      if !aUsed {
+        return emitFailAt(
+          "emitProgram: `?.` yields a nullable string but the string array type was not collected",
+          exprIx,
+        )
+      }
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      fbIfRefNul(sTypeIdx, true) // 0x04 if, (ref null $sTypeIdx) blocktype
+      ctrlEnter()
+      fbRefNull(sTypeIdx)        // a null link → the niche's own null
+      fbElse()                   // 0x05 else — every link present, the field's string
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbEnd()                    // 0x0b end
       ctrlLeave()
       return 0
     }
@@ -5214,15 +5262,17 @@ function sharedFieldCodeDispatchable(code: i32): boolean {
 // a scan that has no arm for this site. So the string field keeps its refusal, and keeps it
 // LOUD, rather than being widened into check-clean invalid wasm.
 function optChainFieldCodeOk(code: i32): boolean {
-  if code == 3 { return false }
-  // A VALUE-UNION field (code 16) is REFUSED, and the refusal is measured rather than
-  // assumed. Its blocktype is spellable (`fbIfRef(uBoxIdx)`) and its default boxes through
-  // `emitUnionCoerce` — both were built — and the result is still check-clean INVALID WASM
-  // (`type mismatch: expected i32, found (ref $type)`) at the BINDING, not at the `if`:
-  // `const v = (x?.y) ?? 5` classifies its cell from a `??` whose LHS is an optional chain,
-  // and nothing on that path calls the value a box. It is a whole rep decision away, so the
-  // arm stays a loud reject. (`silent-class-inventory` D783 carries the witness.)
-  if code == 16 { return false }
+  // A STRING leaf (code 3 / 20) never reaches here any more: `exprNullableString` calls a
+  // `?.` over a string field `string | null`, so `emitCoalesce`'s string-niche arm claims
+  // the spelling before this one (D802).
+  //
+  // A VALUE-UNION field (code 16) is ADMITTED — D803. The earlier refusal was measured and
+  // recorded honestly ("check-clean invalid wasm at the BINDING, not at the `if`"), and the
+  // measurement was of the blocktype alone: `const v = (x?.y) ?? 5` classified its cell from
+  // a `??` whose LHS is an optional chain, and nothing on that path called the value a box.
+  // That is the CONSUMER half, and it is now written — `exprUnion` / `unionNameOfExpr` both
+  // answer for a code-16 chain leaf — so the blocktype and the cell agree.
+  if code == 16 { return true }
   sharedFieldCodeDispatchable(code)
 }
 
@@ -5230,7 +5280,17 @@ function optChainFieldCodeOk(code: i32): boolean {
 // default WIDENED to it — `?? 1` against an `i64` field is an `i32.const` unless somebody
 // says otherwise, and the `if`'s blocktype is `i64`: invalid wasm. Same three coercions
 // `emitUnionCoerce`'s ladder performs for the same reason, and for the same three codes.
-function emitOptChainDefault(body: i32[], dIx: i32, code: i32, fnIx: i32) {
+function emitOptChainDefault(
+  body: i32[],
+  dIx: i32,
+  code: i32,
+  unionName: string,
+  fnIx: i32,
+) {
+  // A value-union field: the block type is the BOX, so the default has to arrive as one —
+  // `emitUnionCoerce` is the same ladder every other `??`-into-a-box arm uses, and it passes
+  // a value that already IS the box through unchanged. D803.
+  if code == 16 { return emitUnionCoerce(body, unionName, dIx, fnIx) }
   if code == 17 { return emitExprAsF64(body, dIx, fnIx) }
   if code == 23 { return emitExprAsI64(body, dIx, fnIx) }
   if code == 24 {
@@ -5246,6 +5306,13 @@ function emitOptChainDefault(body: i32[], dIx: i32, code: i32, fnIx: i32) {
 // Emit the `if` whose result is the shared field's rep. Only called for a code
 // `sharedFieldCodeDispatchable` admitted, so it has no failure arm of its own.
 function fbIfForSharedField(code: i32) {
+  // The value-union BOX. `sharedFieldCodeDispatchable` still declines code 16, so the
+  // shared-union-field dispatch never asks for this spelling; the `?.` … `??` arm does
+  // (`optChainFieldCodeOk` admits it), and putting the blocktype here rather than at that
+  // site keeps ONE speller for "the `if` result is this field's rep".
+  if code == 16 {
+    return fbIfRef(uBoxIdx) // (ref $uBox)
+  }
   if code == 17 {
     return fbIf(124) // f64
   }
@@ -21727,7 +21794,13 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             fbI32Bin(70)            // 0x46 i32.eq → null?
             fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
             ctrlEnter()
-            if emitExpr(body, e.binRight, fnIx) < 0 {
+            // THROUGH `emitUnionCoerce`, NOT `emitExpr` — D801. The block type is the BOX,
+            // so the default has to arrive as one, and a bare `null` has no rep of its own:
+            // it reached `emitNullLitNode` with none of that table's seven seeds set and
+            // took the loud `bare null needs a struct-typed context` reject. The coerce's
+            // own `NullLit` arm is the null-tagged box this position wants, and every
+            // non-null default it passes through unchanged (`exprUnion` → `emitExpr`).
+            if emitUnionCoerce(body, cunm, e.binRight, fnIx) < 0 {
               return -1 // d, its own box
             }
             fbElse() // 0x05 else — present → the LHS box, re-read
@@ -21805,7 +21878,11 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             fbI32Bin(70)            // 0x46 i32.eq → null?
             fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
             ctrlEnter()
-            if emitExpr(body, e.binRight, fnIx) < 0 {
+            // THROUGH `emitUnionCoerce` — the same D801 seed the ident arm above takes,
+            // and taken here for the reason this arm and that one share every other
+            // decision: one lowering over one rep, so a bare `null` default must box
+            // identically at both spellings.
+            if emitUnionCoerce(body, kunm, e.binRight, fnIx) < 0 {
               return -1 // d, its own box
             }
             fbElse() // 0x05 else — present → the stashed box
@@ -21939,7 +22016,9 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
                 fbI32Bin(70)                    // 0x46 i32.eq → null?
                 fbIfRef(uBoxIdx)                // 0x04 if, (ref $uBoxIdx) blocktype
                 ctrlEnter()
-                if emitExpr(body, e.binRight, fnIx) < 0 {
+                // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
+                // boxed-union `??` spellings that share this lowering.
+                if emitUnionCoerce(body, munm, e.binRight, fnIx) < 0 {
                   return -1 // d, its own box
                 }
                 fbElse() // 0x05 else — present → re-read the field
@@ -22090,7 +22169,16 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           wU8(209) // 0xd1 ref.is_null
           fbIfForSharedField(nfCode) // if (result <the field's own rep>)
           ctrlEnter()
-          if emitOptChainDefault(body, e.binRight, nfCode, fnIx) < 0 {
+          if (
+            emitOptChainDefault(
+              body,
+              e.binRight,
+              nfCode,
+              sFieldElemNameAt(nsi, nfi),
+              fnIx,
+            ) <
+            0
+          ) {
             return -1
           }
           fbElse() // 0x05 else — present → the field

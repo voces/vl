@@ -59,6 +59,7 @@ import {
   inferRetRungIsValueUnion,
   inferRetTyAt,
   inferRetTyIxAt,
+  isBoolLitExpr,
   isTransparentAlias,
   isValueUnionName,
   nameIsLitUnionArmValueUnion,
@@ -505,6 +506,7 @@ import {
   mvShapeOfMapNodeTy,
   mvShapeOfValNameRowTy,
   mvSlotByValNameK,
+  nameFieldCode,
   nameFieldCodeTy,
   nameIsNulRefList,
   nameIsRefArray,
@@ -6912,6 +6914,19 @@ function anonMintRowFor(objIx: i32) {
         // every other literal, so this is inert outside the shape it names.
         const boxU = anonNestPolyUnionName(ai, f.fiName, unwrapParen(f.fiValue))
         if boxU != "" { code = 16 }
+        // THE LEAF TWIN (D804): the same join, one layer down — two `??`-joined
+        // same-fieldset literals disagreeing at a SCALAR field need the merged row too, and
+        // there the union is the two values' own atoms rather than a declared one, so the
+        // CODE comes from the merged spelling instead of being 16 by construction.
+        let leafSet = ""
+        let leafCode = -1
+        if boxU == "" {
+          leafSet = anonLeafPolyUnionSet(ai, f.fiName, f.fiValue)
+          if leafSet != "" {
+            leafCode = anonLeafPolyFieldCode(leafSet)
+            if leafCode >= 0 { code = leafCode }
+          }
+        }
         if code < 0 && hasFnField {
           const iv = P.nodes[f.fiValue]
           if iv is Ident {
@@ -6923,6 +6938,10 @@ function anonMintRowFor(objIx: i32) {
         names.push(f.fiName)
         if boxU != "" {
           elemNames.push(boxU)
+        } else if leafCode == 16 {
+          elemNames.push(leafSet) // the box's member set
+        } else if leafCode >= 0 {
+          elemNames.push("") // a bare niche (code 20) records no companion
         } else {
           elemNames.push(anonFieldElemName(f.fiValue, code))
         }
@@ -6970,6 +6989,18 @@ function anonMintRowFor(objIx: i32) {
         // (A code-4 i32-list field always rides an ArrayLit value, which the
         // later `collectA` arena scan classifies — `lUsed`/`aUsed` set there.)
         pj = pj + 1
+      }
+      // A value-union field interns its box reps — the same parity rule `pushFieldRow`
+      // states for the three DECLARED recorders, which this mint does not route through.
+      // D672's `boxU` is a declared union `collectU` already registered; D804's LEAF set
+      // (`i32|null`) is named nowhere else in the program, so without this the field's
+      // per-rep value boxes are never interned and the construct `struct.new`s a raw scalar
+      // where the box `(ref)` is required. AFTER the row loop, because registration can push
+      // rows of its own into the union tables.
+      let rj = 0
+      while rj < codes.length {
+        if codes[rj] == 16 { registerValueUnionName(elemNames[rj]) }
+        rj = rj + 1
       }
     }
   }
@@ -7092,6 +7123,171 @@ function anonNestPolyUnionName(ow: i32, fname: string, inner: i32): string {
     ui = ui + 1
   }
   ""
+}
+
+// ── the LEAF twin of the nested polymorphic rung (D804) ──────────────────────
+// The ATOM SPELLING of an anonymous literal's LEAF field value — the member name it would
+// carry inside a value union — or "" for a value this rung cannot name (a nested literal, a
+// list, a map, a closure, an ident, a call). Deliberately narrow: it is a REFUTATION input,
+// so anything unnameable declines the whole rung and keeps today's behaviour.
+function anonLeafAtomName(valIx: i32): string {
+  if valIx < 0 { return "" }
+  const vi = unwrapParen(valIx)
+  const v = P.nodes[vi]
+  if v is NullLit { return "null" }
+  const c = anonFieldCode(valIx)
+  if c == 0 {
+    // Code 0 folds booleans and integers together; the union needs them apart.
+    if isBoolLitExpr(vi) { return "boolean" }
+    return "i32"
+  }
+  if c == 3 { return "string" }
+  if c == 17 { return "f64" }
+  if c == 23 { return "i64" }
+  if c == 24 { return "f32" }
+  ""
+}
+
+// ARE THE LEAF OWNERS JOINED INTO ONE VALUE (D804)? The scalar twin of
+// `anonPolyOwnersJoined`, and the same test for the same reason: a `??` makes its two
+// operands ONE value, so a pair that disagrees at a field cannot keep two rows and the box
+// is the only rep they share. Two literals that merely both exist are D391's shape — each
+// read monomorphically, two rows the right answer — which is why the gate is on the JOIN.
+function anonLeafOwnersJoined(ow: i32, fname: string, owAtom: string): boolean {
+  let qi = 0
+  while qi < P.nodes.length {
+    const qn = P.nodes[qi]
+    if qn is BinExpr {
+      if qn.binOp == "??" {
+        const d = unwrapParen(qn.binRight)
+        // This literal IS the `??` default: whatever the other operand's shape came from
+        // (a map value, a binding, a call), the coalesce has to deliver one row.
+        if d == ow { return true }
+        if d >= 0 {
+          const dn = P.nodes[d]
+          if dn is ObjLit {
+            if anonObjFieldSetEq(d, ow) {
+              if anonLeafAtomName(objFieldVal(d, fname)) != owAtom {
+                return true
+              }
+            }
+          }
+        }
+      }
+    }
+    qi = qi + 1
+  }
+  false
+}
+
+// THE VALUE-UNION MEMBER SET a `??`-JOINED family of same-field-set anonymous literals needs
+// at the LEAF field `fname` (D804), or "" when this literal is not that shape. When it
+// answers, the field is coded 16 over that set — the row `type Circle = { r: i32 | null }`
+// would have declared, minted because nobody declared it.
+//
+// THE SAME DEFECT AS D672, ONE LAYER DOWN, AND ITS NULL CORNER IS THE ONLY LOUD ONE.
+// `structIndexOfObj` matches a literal to a row by field-NAME set, so two same-fieldset
+// literals merge and the loser's value is written through the WINNER's valtype. Ablated over
+// the field VALUE PAIR of `c["k0"] = {r: A}` / `?? {r: B}`, master gives:
+//
+//     A=i32  B=null                      loud `bare null needs a struct-typed context`
+//     A=string / boolean / f64  B=null    the same loud reject
+//     A=null B=i32                       the same loud reject
+//     A=i32  B=string   CHECK-CLEAN INVALID WASM  `expected i32, found (ref $type)`
+//     A=i32  B=f64      CHECK-CLEAN INVALID WASM  `expected i32, found f64`
+//     A=string B=i32    CHECK-CLEAN INVALID WASM  `expected (ref $type), found i32`
+//     A=i32  B=i32      runs (the control)
+//
+// So the filed sentence was the NULL corner of a wider family: with `null` the loser has no
+// rep at all and the reject is loud (`anonValueFitsField`'s `vc < 0` leniency merges the
+// pair), while with a DIFFERENT scalar rep `anonValueFitsField` refutes, each literal gets
+// its own row, and the `??` then joins two heap types — silent. One merged row closes both
+// halves, which is why the set is built from EVERY same-fieldset sibling's atom rather than
+// only the null one.
+//
+// EVERY SIBLING'S ATOM, not just the joined pair's, because a code-16 field accepts every
+// atom by construction (`anonValueFitsField`'s `sc == 16` arm) — so once the field is a box
+// each same-fieldset literal lands on this row and must be a member of its union.
+//
+// FOUR GATES, matching the nested rung's: an anonymous owner (no declared row, no variant
+// claim), every field value NAMEABLE as an atom, at least two DISTINCT atoms, and the family
+// JOINED by a `??`. Where any fails this answers "" and the mint is byte-identical.
+function anonLeafPolyUnionSet(ow: i32, fname: string, val: i32): string {
+  const owAtom = anonLeafAtomName(val)
+  if owAtom == "" { return "" }
+  if objVariantName(ow) != "" { return "" }
+  if structIndexOfObj(ow) >= 0 { return "" }
+  const atoms: string[] = []
+  atoms.push(owAtom)
+  let qi = 0
+  while qi < P.nodes.length {
+    if qi != ow {
+      const qn = P.nodes[qi]
+      if qn is ObjLit {
+        if anonObjFieldSetEq(qi, ow) {
+          // A sibling a DECLARED row already claims never lands here — and if one did, this
+          // literal would have matched that row too and no mint would be running.
+          if structIndexOfObj(qi) < 0 && objVariantName(qi) == "" {
+            const qa = anonLeafAtomName(objFieldVal(qi, fname))
+            if qa == "" { return "" }
+            let seen = false
+            let ai2 = 0
+            while ai2 < atoms.length {
+              if atoms[ai2] == qa { seen = true }
+              ai2 = ai2 + 1
+            }
+            if !seen { atoms.push(qa) }
+          }
+        }
+      }
+    }
+    qi = qi + 1
+  }
+  if atoms.length < 2 { return "" }
+  if !anonLeafOwnersJoined(ow, fname, owAtom) { return "" }
+  // `null` LAST, so the set reads the way the declared spelling of the same shape does
+  // (`{ r: i32 | null }`) and two literals minting in either order key ONE set.
+  let out = ""
+  let hasNull = false
+  let k = 0
+  while k < atoms.length {
+    if atoms[k] == "null" {
+      hasNull = true
+    } else {
+      if out != "" { out = out + "|" }
+      out = out + atoms[k]
+    }
+    k = k + 1
+  }
+  if hasNull {
+    if out != "" { out = out + "|" }
+    out = out + "null"
+  }
+  out
+}
+
+// THE FIELD CODE a merged leaf set gets, asked of the SAME speller a declaration asks
+// (`nameFieldCode`) — because a minted row must be indistinguishable from the row the user
+// could have written, and "a union of atoms" is NOT the same rep question as "code 16".
+// Measured: minting 16 for `string|null` put a `{tag, value}` box behind consumers reading
+// the code-20 NICHE and turned that pair's loud reject into CHECK-CLEAN INVALID WASM — the
+// one trade worth vetoing. `boolean|null` is the code-21 sentinel for the same reason.
+//
+// Only the two codes whose COMPANION column this mint can fill are admitted: 16 records the
+// set in `sFieldElemName`, 20 is a bare niche that records "". Anything else — a litunion
+// niche (30), a nullable list, a shape this rung has no atom vocabulary for — answers -1 and
+// the field keeps the code `anonFieldCode` gave it.
+//
+// `boolean|null` (code 21) IS SPELLABLE HERE AND IS STILL DECLINED, measured. The row mints
+// fine and the DECLARED twin of the same program runs (`type R = { r: boolean | null }`), but
+// an `#anon` row carrying a code-21 field interns no map-value slot — the pair then trades
+// its `bare null needs a struct-typed context` for `unsupported map value type`, one loud
+// reject for another and a less informative one. The mv-slot rep is a separate rung; until
+// it exists this arm keeps master's message exactly.
+function anonLeafPolyFieldCode(set: string): i32 {
+  const c = nameFieldCode(set)
+  if c == 16 || c == 20 { return c }
+  -1
 }
 
 // ARE THE TWO OWNERS JOINED INTO ONE VALUE (D672)? True when this owner, or a
