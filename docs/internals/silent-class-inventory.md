@@ -18505,205 +18505,133 @@ Repro:
   D625's witness proves the signature was right there all along.
   The right outcome is `runs`: `sink` names `P[]`, nothing else consumes `cc`.
 
-### D622 — structural width subtyping: a value with MORE fields flowing into a shape with fewer
-**loud check reject, and the checker concedes type-validity in its own message — a clause-2
-violation at `typecheck.vl:16150` (`tErrUnsupported`) · ZERO corpus cells, so the corpus scores
-any fix at zero · probe `scripts/capability-probes/width-subtyping.vl` · found 2026-08-30 ·
-WasmGC-SHAPED and the prefix half is FREE, yet unreachable from the checker today because the
-emitted field ORDER is a function of DECLARATION ORDER — the executable refusal is below**
+### D622 — [CLOSED 2026-08-30 for the direct value flow] structural width subtyping: a value with MORE fields flowing into a shape with fewer
+**closed 2026-08-30 for the DIRECT value flow — the probe below runs and prints `1`, and so
+does every direct position · was a refusal conceding type-validity · ZERO corpus cells, so the
+probe is the measurement, not the corpus · the fix is WasmGC's own `(type $Wide (sub $Narrow
+…))`, free at runtime with reference identity intact · TWO POSITIONS STAY REFUSED AND ONE
+STAYS SILENT — see WHAT REMAINS at the foot of this row**
 
-Repro (`scripts/capability-probes/width-subtyping.vl`, verbatim):
+Repro (`scripts/capability-probes/width-subtyping.vl`, verbatim — now `runs`):
 
     type Wide = { a: i32, b: i32 }
     type Narrow = { a: i32 }
     function take(n: Narrow): i32 { return n.a }
     const w: Wide = { a: 1, b: 2 }
     print(take(w))
-    // vl check rc 1:
-    //   an object value of shape Wide flowing into Narrow drops the field `b`: type-valid
-    //   (structural width subtyping) but not yet supported by codegen — a struct's wasm type
-    //   is its own field list, so these are unrelated types and no field-dropping conversion
-    //   exists. Construct the value at Narrow (an object literal is built at the shape it
-    //   flows into), or declare the source with exactly Narrow's fields
-    // SHOULD PRINT 1.
+    // now: 1
 
-* **THE GAP IS THE WHOLE AXIS, not a corner — 33 programs, graded on `33db97de` (seed
-  `ee56abe3`).** Every position `assignable` can reach an object pair through is refused, and
-  the extra field's position, the two shapes' spellings and the dropped field's type change
-  nothing:
+* **WHAT IT WAS.** `assignable`'s object arm is structural WIDTH subtyping — it walks the
+  DESTINATION's field names only — while the emitter interned a struct's wasm heap type from
+  its own field list, so the two shapes were unrelated wasm types with no field-dropping
+  conversion between them. `objShapeAdapterless` was the floor and it refused, in the
+  checker, with a message that conceded the program was type-valid.
 
-  | axis | case | outcome |
-  |---|---|---|
-  | POSITION | call argument (the probe) | loud check reject |
-  | | `const n: Narrow = w` | loud check reject |
-  | | `return w` from a `Narrow`-returning function | loud check reject |
-  | | `n = w` assignment | loud check reject |
-  | | array element (`const xs: Narrow[] = [w]`) | loud check reject (`reached through Wide[] into Narrow[]`) |
-  | | map value | loud check reject (`reached through Wide into Narrow \| null`) |
-  | | object field (`{ n: w }` into `{n: Narrow}`) | loud check reject (`reached through {n: Wide} into Holder`) |
-  | | function VALUE slot (`const f: (Narrow) => i32`) | loud check reject |
-  | | callback parameter (the variance flip) | loud check reject (`reached through (Narrow) => i32 into (Wide) => i32`) |
-  | | through a generic `id<T>(x: T): T` | loud check reject |
-  | | **nested: `{n: Wide}` into `{n: Narrow}`, whole-object binding** | **check-clean INVALID WASM** |
-  | | **nested: the same pair through a parameter** | **check-clean INVALID WASM** |
-  | | **nested: the same pair as an array element** | **check-clean INVALID WASM** |
-  | EXTRA FIELD | extra LAST (`{a,b}` → `{a}`) | loud check reject |
-  | | extra FIRST (`{b,a}` → `{a}`) | loud check reject |
-  | | extra MIDDLE (`{a,x,c}` → `{a,c}`) | loud check reject |
-  | | two extra (`{a,b,c}` → `{a}`) | loud check reject |
-  | | same field SET, REORDERED (`{b,a}` → `{a,b}`) | **runs** — order alone is already fine |
-  | SPELLING | anonymous destination (`take(n: {a: i32})`) | loud check reject |
-  | | anonymous source | loud check reject |
-  | | both anonymous | loud check reject |
-  | | an object LITERAL with the excess field | loud check reject, but the OTHER message (a plain `tErr`, not a capability concession — see below) |
-  | FIELD TYPE | dropped field is `string` | loud check reject |
-  | | dropped field is a struct | loud check reject |
-  | | the SHARED field is a ref | loud check reject |
-  | CONTROL | exact match | runs |
-  | | two named layout twins (`A`/`B`, one field each) | runs |
+* **IT LANDED IN TWO PARTS, GRADED SEPARATELY, AND THE FIRST IS THE WHOLE REASON THE SECOND
+  IS POSSIBLE.** Part 1 made the emitted field order a function of the SHAPE (name-sorted,
+  `fieldNameOrder`) instead of a function of DECLARATION ORDER; part 2 declared the subtype
+  edge and lifted the refusal. The row's original refusal is what part 1 answers: the
+  checker's view of a shape is its source spelling — it says `y` is inferred as
+  `{b: i32, a: i32}` for a binding the emitter laid out as `[a, b]` — so a shape-only rule
+  about field POSITION computed an answer the emitter did not honour, and the witness was a
+  program where a naive lift emits WELL-TYPED wasm that reads the wrong field. With the order
+  canonical both ends compute the same sequence. **It also WIDENED the free half**: the extra
+  field first (`{b,a}` → `{a}`) and in the middle (`{a,x,c}` → `{a,c}`) are prefixes under the
+  canonical order and were not under declaration order. Both run.
 
-* **THE NESTED POSITION IS THE FAMILY'S SILENT HALF, AND IT IS DOCUMENTED RATHER THAN
-  ACCIDENTAL.** `objShapeAdapterless`'s TyObj arm returns FALSE on `objFieldNameSetsEq` without
-  recursing into the field TYPES, and its own header states the reason: a shape difference under
-  agreeing field names "is broken for a PINNED source and CORRECT for an un-annotated binding of
-  an object literal … rejecting them would reject working programs. They remain a `vl check`-clean
-  emit hole." So `{n: Wide}` into `{n: Narrow}` passes `check` and emits
-  `type mismatch: expected (ref null $type), found (ref $type)`, in all three positions above.
-  Any fix for the outer pair must reach this one too or the family keeps a silent half. The
-  witness, in full so it can be re-run rather than retyped:
+* **THE MECHANISM, THREE RUNGS AND ONE LANDING.** `buildStructSupers` gives each
+  representative struct row the LONGEST proper-prefix row as its declared supertype (names,
+  emitted field CODES and emitted field SLOTS all compared); `structEmitOrder` assigns heap
+  indices with parents first, because wasm requires a supertype's type index to be LOWER than
+  its subtype's; `emitTypeSection` writes the `0x50 sub` header for a row that has a parent or
+  IS one (a type written without `sub` is FINAL and cannot be extended, so the parent needs
+  the form too). The checker lifts at `direct` positions only. Disassembled, the probe's rec
+  group is now
 
-      type Wide = { a: i32, b: i32 }
-      type Narrow = { a: i32 }
-      type WHold = { n: Wide }
-      type NHold = { n: Narrow }
-      function take(h: NHold): i32 { return h.n.a }
-      const wh: WHold = { n: { a: 1, b: 2 } }
-      print(take(wh))
-      // vl check rc 0; vl run:
-      //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
-      // SHOULD PRINT 1.
+      (type $1 (sub (struct (field (mut i32)))))
+      (type $2 (sub $1 (struct (field (mut i32)) (field (mut f64)))))
 
-  Replace the call with `const nh: NHold = wh; print(nh.n.a)` and it is
-  `expected (ref null $type), found (ref $type)`; put `wh` into an `NHold[]` and it is the same
-  again. Three positions, one hole.
+  — `Narrow` moved AHEAD of `Wide` despite being declared second, and a `(ref $2)` is passed
+  into a `(ref $1)` parameter with no instruction between them.
 
-* **THE MESSAGE'S OWN REMEDIES WORK — this is NOT a D46.** All three prescriptions were built
-  and run, and all three print `1`: `const w: Narrow = { a: 1 }` (construct at the destination),
-  `take({ a: w.a })` (construct at the call site from the wide value), and declaring the source
-  with exactly `Narrow`'s fields. The diagnostic is honest about the way out.
+* **A SINGLE PARENT IS ENOUGH, and that is a property of prefixes rather than luck.** wasm
+  allows one declared supertype. A row's required parents are all prefixes of its own
+  canonical field list, and prefixes of one list are totally ordered by length, so taking the
+  longest and letting IT take its own longest chains the rest. `S1 = {a}` ⊂ `S2 = {a,b}` ⊂
+  `S3 = {a,b,c}` links up on its own and runs (program 6 of the pin).
 
-* **A FIELD-DROPPING COPY IS NOT AN ADMISSIBLE LOWERING, and that is measured, not argued.** VL
-  struct values have REFERENCE identity, uniformly — four probes, all printing `5`: two bindings
-  of one shape, a write through a parameter, a write through an array element, and a write
-  across a NAMED LAYOUT TWIN (`type A = {a:i32}` / `type B = {a:i32}`, `const y: B = x`). A copy
-  at the width boundary would make width subtyping the single place in the language where
-  `const y: T = x` stops aliasing. That is a language-semantics change, not a codegen detail,
-  and it must not arrive as one.
+* **A COPY WAS THE OBVIOUS ALTERNATIVE AND IT IS THE WRONG ONE, measured.** VL struct values
+  have REFERENCE identity uniformly — two bindings of one shape, a write through a parameter,
+  a write through an array element, and a write across a named layout TWIN all print `5`. A
+  field-dropping copy would make width subtyping the single place in the language where
+  `const y: T = x` stops aliasing. The subtype edge keeps it: a write through the NARROW view
+  reaches the wide original and leaves the invisible field untouched (`w5.a + w5.b` = 7).
 
-* **THE PREFIX HALF IS GENUINELY FREE IN WasmGC, AND THIS HOST ACCEPTS IT.** A struct type whose
-  fields are a PREFIX-EXTENSION of another's can declare it as a supertype, and a mutable field
-  is invariant under that rule — which `{a: i32}` beside `{a: i32, b: f64}` satisfies exactly.
-  Built and validated with the pinned binaryen (`./node_modules/.bin/wasm-as`, binaryen 130):
+* **THE TRADE, cell-matched.** **0 classes moved, `runs -> NOT-RUNS` 0, `-> silent` 0** on the
+  distilled corpus for BOTH parts — the corpus has no cell on this axis, which is the whole
+  reason the probe exists. Corpus byte-identity: part 1 **0 LOST / 0 GAINED / 55 byte-DIFF**
+  of 1,963 buildable modules (the re-layout, predicted at 49 by a mint-time counter over
+  struct rows alone; the extra 6 are the variant table, which takes the same order); part 2
+  **0 LOST / 2 GAINED / 28 byte-DIFF**, and one of the two gains is an existing corpus case
+  (`objects/object-width-value-source-forms.vl`) that now BUILDS. `goal-scoreboard.py` is
+  unchanged at `runs 3752 / 7021` — as it must be, since it reads the corpus.
 
-      (rec
-       (type $Narrow (sub (struct (field (mut i32)))))
-       (type $Wide   (sub $Narrow (struct (field (mut i32)) (field (mut f64)))))
-      )
-      (func $takeN (param $n (ref $Narrow)) (result i32) (struct.get $Narrow 0 (local.get $n)))
-      ;; a (ref $Wide) passed straight into a (ref $Narrow) parameter — no conversion at all
+* **EVERY RUNG ABLATED, and two of the three single-rung compilers are worse than the base:**
 
-  and the vl host's own wasmtime instantiated it (it got past validation to complain about the
-  seed ABI, which is the next check). The ENCODING path works in this emitter too: a spike that
-  wrote every declared struct as the non-final `0x50 <0 supertypes> 0x5f …` form built the
-  compiler, ran the controls and left reference identity intact — `wasm-dis` shows
-  `(type $1 (sub (struct (field (mut i32)))))` where master shows `(type $1 (struct …))`. So the
-  cost of the prefix half is a supertype column plus a form change in `emitTypeSection`, and it
-  costs nothing at runtime and preserves aliasing. **This is the answer to "is it WasmGC-shaped":
-  yes, and WasmGC already has the shape.**
+  | compiler | md5 | the probe | runs lost |
+  |---|---|---|---|
+  | base (part 1) | `73c98bf4` | loud check reject | — |
+  | **strip all three (the pristine part-1 sources)** | **`73c98bf4`** | loud check reject | 0 |
+  | without the `sub` FORM | `fac9281c` | **check-clean INVALID WASM** | 0 |
+  | without the emission ORDER | `0061ccce` | **the module will not PARSE** — `supertypes must be defined before subtypes` | 0 |
+  | without the checker LIFT | `ee4faf7d` | loud check reject (inert) | 0 |
+  | **all three (shipped)** | `ceff407e` | **runs, `1`** | **0** |
 
-* **AND IT IS STILL BLOCKED, BY A FACT NEITHER END CAN SEE FROM THE OTHER: THE EMITTED FIELD
-  ORDER IS A FUNCTION OF DECLARATION ORDER.** `internShapeAs` says so in its own header — field
-  order "IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET
-  (`rowWithFieldNameSet`) … an alias shape with no twin lays out exactly as spelled" — and it is
-  measured:
+  Part 1's own ablation is the same shape one layer down: sorting the STRUCT rows alone moves
+  **12** behavioural classes `runs -> runs but wrong value` and sorting the VARIANT rows alone
+  moves **13**, because `variantStructHeapTwinAt` and `variantFieldLayoutEq` compare field
+  codes POSITIONALLY. Together, zero.
 
-  | module | emitted struct |
-  |---|---|
-  | `type S = { a: i32, b: f64 }` alone | `(struct (field (mut i32)) (field (mut f64)))` |
-  | `type S = { b: f64, a: i32 }` alone | `(struct (field (mut f64)) (field (mut i32)))` |
-  | `AB` declared, then `BA` | ONE struct, **`AB`'s order** |
-  | `BA` declared, then `AB` | ONE struct, **`BA`'s order** |
+* **WHAT REMAINS, and none of it is "not yet".**
+  * **A MUTABLE CONTAINER — an array element, a map VALUE type, a function SIGNATURE.**
+    `Cat[]` into `Animal[]` needs the two ARRAY types to relate, and their element field is
+    mutable, which wasm makes INVARIANT for the reason every language with mutable containers
+    meets: were `Cat[]` a subtype of `Animal[]`, a plain `Animal` could be stored through the
+    wider view. Kept refused, and `objects/object-width-value-no-lowering.vl` is now exactly
+    that residue. The refusal is sound; its MESSAGE still says "not yet supported by codegen",
+    which now overstates the case.
+  * **A NARROWING THAT IS NOT A PREFIX.** `{a,b}` cannot be a subtype of both `{a}` and `{b}`
+    — under single inheritance only one of two incomparable narrowings can be an edge, and
+    the other needs a copy, which is refused above. `d2_fork` in the D622 grid.
+  * **AN OBJECT LITERAL WITH AN EXCESS FIELD is deliberately NOT lifted**, and that is a
+    design rule rather than a gap: a literal is not a reference waiting to be passed —
+    `emitObj` builds it at the DESTINATION's field list, so the excess field is never visited
+    and its initializer never runs. `objects/object-literal-excess-field-reject.vl` and
+    `soundness/struct-width-subtyping-reject.vl` pin that verdict, unchanged.
+  * **THE NESTED PAIR IS STILL SILENT, and it is UNSOUND rather than unsupported.**
+    `{n: Wide}` into `{n: Narrow}` passes `check` and emits invalid wasm, in all three of a
+    binding, a parameter and an array element (`capability-probes/width-subtyping-nested.vl`).
+    A struct field is mutable, so viewing the outer object at the narrower shape lets a write
+    through the view leave the original's `n` holding a value that is no longer a `Wide` —
+    `vl check` accepts exactly that program:
 
-  So a shape's wasm layout is not a function of the shape. The checker's view is the SOURCE
-  SPELLING — on the witness below it emits ``redundant type annotation: `y` is inferred as
-  `{b: i32, a: i32}` `` — while the emitter lays that very binding out as `[a, b]`.
+        type Wide = { a: i32, b: i32 }
+        type Narrow = { a: i32 }
+        type OW = { n: Wide }
+        type ON = { n: Narrow }
+        const w: OW = { n: { a: 1, b: 2 } }
+        const o: ON = w
+        o.n = { a: 9 }
+        print(w.n.b)
 
-* **THE EXECUTABLE REFUSAL: a checker-side lift computed on the shape alone is a SILENT WRONG
-  VALUE, not a refusal.** This program runs today and prints `15`:
-
-      type AB = { a: i32, b: i32 }
-      type BA = { b: i32, a: i32 }
-      type JustB = { b: i32 }
-      function takeB(v: JustB): i32 { return v.b }
-      const x: AB = { a: 1, b: 2 }
-      const y: BA = { b: 7, a: 1 }
-      const z: JustB = { b: 7 }
-      print(x.a + y.b + takeB(z))
-
-  `wasm-dis` of it: `AB` and `BA` share heap `$0` with layout `[a, b]`, so `BA`'s literal
-  `{ b: 7, a: 1 }` emits as `struct.new $0 (i32.const 1) (i32.const 7)` — **reordered** — and
-  `y.b` reads `struct.get $0 1`. `JustB` is `$1`, and `takeB`'s `v.b` reads `struct.get $1 0`.
-  Now add `takeB(y)`: the checker sees `BA`'s field list as `[b, a]`, so `JustB = [b]` LOOKS
-  like its prefix and a shape-only lift would declare `$0 <: $1`. That declaration is
-  **well-typed wasm** — field 0 of `$0` is `(mut i32)`, matching `$1` — and `takeB(y)` then
-  reads `struct.get $1 0` = **`a` = 1, not `b` = 7**. A wasm-valid module with a wrong value,
-  produced by a lift that was correct on every input the checker can see. Replace
-  `print(x.a + y.b + takeB(z))` with `print(takeB(y))` and master gives the clean refusal
-  quoted at the top of this row; that refusal is the only thing standing between the shape-only
-  rule and this miscompile.
-
-* **SO THE PREREQUISITE IS A CANONICAL, SHAPE-DETERMINED FIELD ORDER — AND IT IS PRICED, NOT
-  GUESSED.** Sorting each row's fields by name makes the layout a pure function of the shape, so
-  both ends compute the same prefix relation — and it WIDENS the free half rather than merely
-  enabling it: under sorted order `{b,a}` → `{a}` and `{a,x,c}` → `{a,c}` become prefixes, which
-  they are not under declaration order. **Counted at the mint over the 1,961 `tests/cases`
-  modules that reach the emitter** (a probe compiler walking the live struct rows —
-  `sTwin[i] == i` — at the end of `emitProgram`):
-
-  | | count |
-  |---|---:|
-  | live declared struct rows | **1,813** |
-  | rows with more than one field | 475 |
-  | rows NOT already in sorted field order — the ones a canonical order re-lays out | **59, in 49 modules** |
-  | proper-PREFIX row pairs already present (the `sub` edges this would declare) | **34, in 27 modules** |
-
-  So the re-layout is **59 of 1,813 rows (3.3%) in 49 of 1,961 modules (2.5%)**, not the
-  corpus-wide churn the phrase "struct-ABI change" suggests — and the edges are not
-  hypothetical: 27 corpus modules already hold a pair that would get one. What it takes is a
-  shared name-order permutation at the row recorders that push `sFieldNames`/`sFieldTypes`
-  (`emit_collect.vl:6713` and `pushFieldRow`'s callers around `:7252`/`:7319`;
-  `emit_classify.vl:21318`, `:21529`, `:22028`), of which only `internShapeAs` has one today —
-  and it is exactly the permutation that function already writes, hoisted and keyed on the NAME
-  instead of on a prototype row. **Do it as its own PR with its own grade**: bundling a struct
-  layout change with a capability lift is how the two stop being separable, which is the
-  mistake D224 recorded when it priced a bundle and declined the half that worked.
-
-* **WHAT REMAINS AFTER THAT, and it does not go away.** Even with a canonical order, `dst ⊆ src`
-  is a prefix only when `dst`'s fields are the FIRST `|dst|` of `src`'s — `{b}` ⊆ `{a,b}` never
-  is. That residue needs either a copy (refused above, on reference identity) or a per-shape
-  reordering under the module's whole constraint set, which is unsatisfiable in general (`{a,b}`
-  cannot have both `{a}` and `{b}` as prefixes). **So the honest split is: the prefix half is
-  free and should be taken once the order is canonical; the rest is a design question about
-  whether VL wants width subtyping at all in positions where it cannot be free** — and if the
-  answer is no, the message should say so as a DESIGN rule instead of conceding
-  "not yet supported by codegen".
-
-* **THE OBJECT-LITERAL SPELLING IS A DIFFERENT REFUSAL AND SHOULD NOT BE SWEPT IN.**
-  `take({ a: 1, b: 2 })` gets a plain `tErr` — "a literal is built at the shape it flows into,
-  so the extra field would be dropped and its initializer never evaluated — a call there would
-  never run" — which concedes nothing about codegen and is a defensible design rule (it is
-  TypeScript's excess-property check, and the evaluation-count argument is real). It is in the
-  table above only so a future fix does not read the two as one gap.
+    **AND IT CANNOT BE WITHDRAWN BY A RULE OVER THE TWO TYPES — that was built and measured.**
+    A refusal keyed on the type pair reddens
+    `objects/object-shape-unannotated-literal-rebuilt.vl`'s `nestedDrop`, where the identical
+    pair is CORRECT: the source is an un-annotated binding of a literal, which the emitter
+    rebuilds AT the destination shape, so no second view of the object exists. The verdict
+    therefore turns on the source's PROVENANCE — the axis `objShapeAdapterless`'s own header
+    names — and the checker does not model it at this seam. Closing it means giving that seam
+    the provenance question, and it is its own change.
 
 ## 6. Coverage gaps — axes not built, and why
 

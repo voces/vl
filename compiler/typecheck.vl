@@ -8009,7 +8009,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // "cannot assign" from the caller would contradict this one. The error already
     // recorded is what fails the check.
     if !inferQuiet && srcExpr >= 0 {
-      if objShapeAdapterless(srcExpr, srcTy, dstTy, 12) {
+      if objShapeAdapterless(srcExpr, srcTy, dstTy, 12, true) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       }
     }
@@ -15857,11 +15857,91 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
 //
 // Answers only for pairs `assignable` already ACCEPTED; a rejected pair keeps its own
 // diagnostic and never reaches here.
+// ── STRUCTURAL WIDTH SUBTYPING, THE HALF WasmGC GIVES FOR FREE (D622) ────────
+// Is `dst` a WIDTH SUPERTYPE of `src` that the emitter can express as a declared WasmGC
+// supertype — that is, are `dst`'s fields exactly the FIRST `|dst|` of `src`'s in the
+// CANONICAL (name-sorted) layout order, with pairwise IDENTICAL field types?
+//
+// WHY THE CANONICAL ORDER IS WHAT MAKES THIS ASKABLE. The emitter lays every non-`flat`
+// row out ascending by field name (`fieldNameOrder`), so a shape's wasm field sequence is a
+// pure function of the shape and the checker can compute it from the type alone. Until
+// 2026-08-30 it was the order of the first same-fieldset row DECLARED, and this predicate
+// would have been a silent wrong-field read rather than a lift — the executable refusal is
+// in D622's row.
+//
+// TYPES ARE COMPARED WITH `tyEq`, NOT `assignable`, and that is the soundness condition
+// rather than conservatism. A struct field is emitted MUTABLE, and wasm makes a mutable
+// field INVARIANT under subtyping for the usual reason: if `{n: Wide}` could be viewed as
+// `{n: Narrow}` you could store a plain `Narrow` through the view and the original's `n`
+// would no longer be a `Wide`. So a pair that agrees on names but merely ASSIGNS on a field
+// is not a subtype pair, here or in wasm.
+//
+// The `| null` peel is the caller's (`objShapeAdapterlessGo`'s nullable arm reaches this
+// with the inner types), exactly as it is for every other pair this file judges.
+function objWidthPrefix(src: i32, dst: i32): boolean {
+  if src < 0 || dst < 0 || src == dst { return false }
+  const s = T.tys[src]
+  if s is TyObj {
+    const d = T.tys[dst]
+    if d is TyObj {
+      const sn = s.objFieldNames
+      const dn = d.objFieldNames
+      if dn.length == 0 { return false }
+      if dn.length >= sn.length { return false }
+      const so = objFieldNameOrder(sn)
+      const dord = objFieldNameOrder(dn)
+      let k = 0
+      while k < dn.length {
+        if sn[so[k]] != dn[dord[k]] { return false }
+        if !tyEq(s.objFieldTypes[so[k]], d.objFieldTypes[dord[k]]) {
+          return false
+        }
+        k = k + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// The emitter's `fieldNameOrder`, restated for the checker's own field lists. TWO SPELLINGS
+// OF ONE RULE, and they must not drift: the emitter lays the row out in this order and the
+// predicate above reads the row as if it had. Both are a stable insertion sort on the field
+// NAME and nothing else.
+function objFieldNameOrder(names: string[]): i32[] {
+  const ord: i32[] = []
+  let i = 0
+  while i < names.length {
+    ord.push(i)
+    i = i + 1
+  }
+  let a = 1
+  while a < ord.length {
+    let b = a
+    while b > 0 && names[ord[b - 1]] > names[ord[b]] {
+      const t = ord[b - 1]
+      ord[b - 1] = ord[b]
+      ord[b] = t
+      b = b - 1
+    }
+    a = a + 1
+  }
+  ord
+}
+
+// `direct` — is the destination a slot a `(ref $src)` can be WRITTEN INTO as it stands?
+// True at a value flow (a binding, an argument, a return, a store into a field or element
+// whose declared type IS `dst`), where a declared WasmGC supertype makes the reference fit.
+// FALSE wherever the pair sits under something whose own wasm type has to relate — an array
+// or map whose element/value type differs, a function SIGNATURE — because those are matched
+// by type identity and a struct-level `sub` edge does not reach them. Only a `direct` pair
+// is eligible for the width lift; every other position keeps the refusal it had.
 function objShapeAdapterless(
   srcExpr: i32,
   src: i32,
   dst: i32,
   depth: i32,
+  direct: boolean,
 ): boolean {
   if src < 0 || dst < 0 || depth <= 0 { return false }
   if src == dst { return false }
@@ -15870,9 +15950,9 @@ function objShapeAdapterless(
   // Nullable pairs peel exactly as `assignableGo`'s nullable arm does, and in its order.
   if d is TyNullable {
     if s is TyNullable {
-      return objShapeAdapterless(-1, s.nInner, d.nInner, depth - 1)
+      return objShapeAdapterless(-1, s.nInner, d.nInner, depth - 1, direct)
     }
-    return objShapeAdapterless(srcExpr, src, d.nInner, depth - 1)
+    return objShapeAdapterless(srcExpr, src, d.nInner, depth - 1, direct)
   }
   // A union SOURCE is assignable when EVERY member is, so any member needing an adapter
   // makes the whole flow one.
@@ -15880,7 +15960,7 @@ function objShapeAdapterless(
     const sms = s.uMembers
     let si = 0
     while si < sms.length {
-      if objShapeAdapterless(-1, sms[si], dst, depth - 1) { return true }
+      if objShapeAdapterless(-1, sms[si], dst, depth - 1, false) { return true }
       si = si + 1
     }
     return false
@@ -15894,7 +15974,7 @@ function objShapeAdapterless(
     let anyAdapts = false
     while di < dms.length {
       if assignable(src, dms[di]) {
-        if objShapeAdapterless(srcExpr, src, dms[di], depth - 1) {
+        if objShapeAdapterless(srcExpr, src, dms[di], depth - 1, false) {
           anyAdapts = true
         } else {
           anyClean = true
@@ -15941,7 +16021,7 @@ function objShapeAdapterless(
                 }
                 fi = fi + 1
               }
-              if objShapeAdapterless(fexpr, sft, dtys[li], depth - 1) {
+              if objShapeAdapterless(fexpr, sft, dtys[li], depth - 1, true) {
                 return true
               }
             }
@@ -15962,7 +16042,36 @@ function objShapeAdapterless(
           // already did.
         }
       }
+      // AGREEING FIELD NAMES, DIFFERING THROUGH A FIELD — still adapterless, and one
+      // case in that set is worse than a hole: a field whose own types are a WIDTH pair
+      // (`{n: Wide}` into `{n: Narrow}`) is UNSOUND rather than unsupported, because a
+      // struct field is MUTABLE and a write through the narrower view would leave the
+      // original holding a value of the wrong type. `vl check` accepts it and the engine
+      // refuses the module — a validator catching a type-system hole by accident.
+      //
+      // IT IS NOT WITHDRAWN HERE, AND THE REASON IS MEASURED. The identical type pair is
+      // CORRECT for an un-annotated literal source, which the emitter rebuilds AT the
+      // destination shape so no second view of the object exists — pinned by
+      // `objects/object-shape-unannotated-literal-rebuilt.vl`'s `nestedDrop`, which a
+      // types-only refusal reddens. So the verdict turns on the source's PROVENANCE, the
+      // axis this function's header already names, and not on the two types. Filed with
+      // its witness as its own row (D622).
       if objFieldNameSetsEq(src, dst) { return false }
+      // THE WIDTH LIFT (D622). A `Wide` flowing into a `Narrow` whose fields are the first
+      // of `Wide`'s, in the canonical layout order and with identical types, needs no
+      // conversion at all: `emitTypeSection` declares `(type $Wide (sub $Narrow …))` and
+      // the reference fits the slot as it stands, with reference identity intact. Only at
+      // a `direct` position — under an array, a map or a function signature the two wasm
+      // types themselves would have to relate, which a struct-level edge does not do.
+      // AN OBJECT LITERAL IS NOT LIFTED, and that is not conservatism. A literal never
+      // becomes a `(ref $Wide)` to be passed: `emitObj` walks the DESTINATION's field list
+      // and builds the value at that shape, so an excess field is never visited and its
+      // initializer never runs — a silently wrong EVALUATION COUNT, which is the verdict
+      // the literal wording below exists to deliver. The lift is about passing a reference
+      // that already exists; a literal has none yet.
+      if direct && !litShapeDropSrcExpr(cx) && objWidthPrefix(src, dst) {
+        return false
+      }
       shapeAdaptSrcTy = src
       shapeAdaptDstTy = dst
       shapeAdaptSrcExpr = cx
@@ -15985,6 +16094,7 @@ function objShapeAdapterless(
                 nodeTyIxOf(els[ei]),
                 d.aElem,
                 depth - 1,
+                true,
               )
             ) {
               return true
@@ -15998,7 +16108,9 @@ function objShapeAdapterless(
       // object wording; only then the element's own storage class. A nested container
       // resolves through this same arm one level in, which is what makes
       // `i32[][]` -> `(i32 | null)[][]` report the INNER array pair rather than the outer.
-      if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1) { return true }
+      if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1, false) {
+        return true
+      }
       if containerElemClassDiffers(s.aElem, d.aElem) {
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
@@ -16012,8 +16124,12 @@ function objShapeAdapterless(
   }
   if s is TyMap {
     if d is TyMap {
-      if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1) { return true }
-      if objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1) { return true }
+      if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1, false) {
+        return true
+      }
+      if objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1, false) {
+        return true
+      }
       if containerElemClassDiffers(s.mKey, d.mKey) {
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
@@ -16037,12 +16153,16 @@ function objShapeAdapterless(
       const sp = s.fnParamTypes
       const dp = d.fnParamTypes
       if sp.length != dp.length { return false }
-      if objShapeAdapterless(-1, s.fnRet, d.fnRet, depth - 1) { return true }
+      if objShapeAdapterless(-1, s.fnRet, d.fnRet, depth - 1, false) {
+        return true
+      }
       let pi = 0
       while pi < sp.length {
         // Parameters compare contravariantly in `assignable`'s `TyFunc` arm; keep the
         // same operand order so the pair examined is the pair it accepted.
-        if objShapeAdapterless(-1, dp[pi], sp[pi], depth - 1) { return true }
+        if objShapeAdapterless(-1, dp[pi], sp[pi], depth - 1, false) {
+          return true
+        }
         pi = pi + 1
       }
       return false

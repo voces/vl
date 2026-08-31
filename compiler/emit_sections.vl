@@ -266,8 +266,15 @@ import {
   sFieldCount,
   sFieldElemKeyI32,
   sFieldElemTyIx,
+  sFieldNames,
+  sFieldStart,
+  sHeapIdx,
   sNames,
   sRowDecl,
+  sSubbed,
+  sSubbedAt,
+  sSuper,
+  sSuperAt,
   sTwin,
   sTyIx,
   sTypeIdx,
@@ -439,6 +446,7 @@ import {
   sidResetStartBlockLet,
   stmtIsPushKind,
   stmtPushBits,
+  structEmitOrder,
   tyAnnRefListSlot,
   uFieldMapShape,
   uFieldTgtStructIdx,
@@ -4712,6 +4720,95 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
   }
 }
 
+// ── THE DECLARED-SUPERTYPE GRAPH (D622) ──────────────────────────────────────
+// The EMITTED storage of struct `si`'s field `fi`, as the (code, slot) pair
+// `emitTypeSection` hands to `pushFieldStorage`. Two fields emit the same wasm field type
+// exactly when both halves agree, so this is the comparison the prefix test has to make —
+// the CODE alone is not the storage (a code-15 nested struct, a code-5 ref list and a
+// code-19 map each carry a slot that decides which heap the field points at).
+function sFieldStoreCode(si: i32, fi: i32): i32 { sFieldTypeAt(si, fi) }
+function sFieldStoreSlot(si: i32, fi: i32): i32 {
+  const c = sFieldTypeAt(si, fi)
+  if c == 15 { return sFieldTgtStructIdx(si, fi) }
+  if c == 19 || c == 29 { return sFieldMapShape(si, fi) }
+  sFieldRefSlot(si, fi)
+}
+
+// Is struct row `p`'s emitted field list a PROPER PREFIX of row `c`'s — same names, same
+// emitted storage, in the same positions, and strictly shorter?
+//
+// NAMES ARE PART OF IT even though wasm only reads the storage. The edge exists to carry
+// the CHECKER's structural width rule ("`Narrow`'s fields are the first of `Wide`'s"), and
+// that rule is about named fields; an edge between two rows that merely agree on storage
+// would make a `(ref $Wide)` acceptable at a `(ref $Narrow)` slot the checker never meant
+// to relate, which is permissiveness nothing asked for.
+function structRowIsProperPrefix(p: i32, c: i32): boolean {
+  if p < 0 || c < 0 || p == c { return false }
+  if p >= sFieldCount.length || c >= sFieldCount.length { return false }
+  const pn = sFieldCount[p]
+  if pn == 0 { return false }
+  if pn >= sFieldCount[c] { return false }
+  let k = 0
+  while k < pn {
+    if sFieldNames[sFieldStart[p] + k] != sFieldNames[sFieldStart[c] + k] {
+      return false
+    }
+    if sFieldStoreCode(p, k) != sFieldStoreCode(c, k) { return false }
+    if sFieldStoreSlot(p, k) != sFieldStoreSlot(c, k) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Build `sSuper` / `sSubbed`: every REPRESENTATIVE struct row takes as its declared
+// supertype the LONGEST proper-prefix representative row in the module, or -1.
+//
+// REPRESENTATIVES ONLY, on both ends. A twin (`sTwin[i] < i`) shares an earlier row's heap
+// index and is SKIPPED by the type section, so it has no form of its own to carry a `sub`
+// and must not be named as a parent either — its representative is.
+//
+// LONGEST, so the chain is transitively closed: a row's other required prefixes are
+// prefixes of its longest one, and that row takes them in turn.
+//
+// PATTERN 4 — A KEY THAT NEED NOT SEE THE PAIR. Both ends of every edge derive from the
+// rows' own canonical field lists; nothing consults a heap INDEX, so this runs before or
+// after any other mint without changing its answer.
+export function buildStructSupers() {
+  sSuper = []
+  sSubbed = []
+  let i = 0
+  while i < sNames.length {
+    sSuper.push(-1)
+    sSubbed.push(false)
+    i = i + 1
+  }
+  let c = 0
+  while c < sNames.length {
+    if sTwin[c] == c {
+      let best = -1
+      let bestLen = 0
+      let p = 0
+      while p < sNames.length {
+        if sTwin[p] == p {
+          if structRowIsProperPrefix(p, c) {
+            if sFieldCount[p] > bestLen {
+              best = p
+              bestLen = sFieldCount[p]
+            }
+          }
+        }
+        p = p + 1
+      }
+      if best >= 0 {
+        sSuper[c] = best
+        sSubbed[best] = true
+      }
+    }
+    c = c + 1
+  }
+  0
+}
+
 function emitTypeSection(
   n: i32,
   typeOffset: i32,
@@ -4734,17 +4831,38 @@ function emitTypeSection(
   // which was already emitted — so skip it, in lock-step with the
   // `mAssignTypeIndices` allocation that reused that earlier index. Emitting it
   // anyway would desync every heap-type index from here on.
+  buildStructSupers()
   if sDeclared {
-    // One `0x5f` struct per declared type (declaration order = heap-type index),
-    // each a struct of its fields in declaration order. A field is `0x7f` i32
-    // (`sFieldTypes == 0`) or, for a string field (`== 3`), a non-null `(ref
-    // $sTypeIdx)` (`0x64 <sTypeIdx>` — the raw `(array i32)` string rep); both mutable.
-    let si = 0
-    while si < sNames.length {
-      // twin skip
-      if sTwin[si] < si {
-        si = si + 1
-      } else {
+    // One struct per declared type, in `structEmitOrder` — the SAME order
+    // `mAssignTypeIndices` assigned heap indices in, which is declaration order except
+    // that a row waits for every proper prefix of it (D622: wasm needs a supertype's index
+    // to be lower than its subtype's). Twins are not in the order at all, which is the
+    // TWIN SKIP this loop used to spell out. A field is `0x7f` i32 (`sFieldTypes == 0`)
+    // or, for a string field (`== 3`), a non-null `(ref $sTypeIdx)` (`0x64 <sTypeIdx>` —
+    // the raw `(array i32)` string rep); both mutable.
+    const eOrd = structEmitOrder()
+    let eoi = 0
+    while eoi < eOrd.length {
+      const si = eOrd[eoi]
+      if si >= 0 {
+        // THE DECLARED-SUPERTYPE FORM (D622). A row that has a parent, or that IS one,
+        // is written with WasmGC's `0x50 sub` header instead of a bare `0x5f`: a type
+        // written without `sub` is FINAL and cannot be extended, so the PARENT needs the
+        // form as much as the child does. `(type $Wide (sub $Narrow …))` is what makes a
+        // `(ref $Wide)` acceptable at a `(ref $Narrow)` slot — structural width
+        // subtyping, free at runtime and with reference identity intact.
+        //
+        // Neither branch changes the heap-type INDEX or the field list, so a module with
+        // no proper-prefix pair emits byte-for-byte what it emitted before.
+        const sup = sSuperAt(si)
+        if sup >= 0 {
+          wU8(80)  // 0x50 sub
+          wULEB(1) // one supertype
+          wULEB(sHeapIdx[sup])
+        } else if sSubbedAt(si) {
+          wU8(80)  // 0x50 sub
+          wULEB(0) // no supertype, but NOT final — something declares this its parent
+        }
         wU8(95) // 0x5f struct
         const cnt = sFieldCount[si]
         wULEB(cnt)
@@ -4765,8 +4883,8 @@ function emitTypeSection(
           wU8(1) // mutable
           fj = fj + 1
         }
-        si = si + 1
       }
+      eoi = eoi + 1
     }
   }
   if uDeclared {
