@@ -3356,34 +3356,45 @@ Repro:
 
 **THIS IS THE ONE ROW IN THIS FILE WHOSE CLOSE IS A REFUSAL RATHER THAN A RUNNING PROGRAM**, and the witness grader had to learn to say so — `closed` mapped to `runs` unconditionally, which would have graded the fix as a failure. `scripts/check-filed-witnesses.py` now reads `now a loud check reject`.
 
+**WITNESS RE-POINTED 2026-08-31 (D751/D752/D754), AND THE ROW'S CLAIM IS UNCHANGED.** The
+original witness used a `Circle[]` needle, whose `==` had no compare core; it has one now and
+that program RUNS. **This row was never about the lowering** — it is about a refusal LOST IN
+THE INSTANTIATION, and what it needs is a `T` the checker will not `==` at all. A MAP is that
+`T` permanently: `m1 == m2` is refused by a DESIGN rule (D754), not by a missing core, so the
+witness cannot graduate out from under the row a second time. The `Circle[]` spelling is now
+pinned as an ACCEPT in `tests/cases/std/array-struct-list-needle.vl`, all four exports, by
+value.
+
 Repro:
 
     import { indexOf } from "std:array"
 
-    type Circle = { r: i32 }
+    type CM = {[string]: i32}
 
-    function mkX(i: i32): Circle[] {
-      const c: Circle = { r: i }
-      const o: Circle[] = [c]
-      return o
+    function mkX(i: i32): CM {
+      const m: CM = Map()
+      m["k"] = i
+      return m
     }
 
     function cell(): i32 {
       const n = mkX(7)
-      const xs: Circle[][] = [n]
+      const xs: CM[] = [n]
       return xs.indexOf(n) + 7
     }
 
     print(cell())
-    // vl check rc 0; vl run:
+    // was (with a `Circle[]` needle): vl check rc 0; vl run:
     //   failed to compile: …::indexOf$m1 — type mismatch: expected i32, found (ref $type)
+    // now: vl check rc 1 — `indexOf` compares its type parameter with `==` here:
+    //   {[string]: i32} isn't equatable — a map has no defined value equality …
 
 * **THE CONTROL IS WHAT MAKES IT SHARP, and it is one line.** The same comparison written
   DIRECTLY is a LOUD CHECKER ERROR:
 
-      const a: Circle[] = [{ r: 7 }]
-      const b: Circle[] = [{ r: 7 }]
-      if a == b { … }        // type error: `==` over Circle[] has no lowering
+      const a: CM = mkX(7)
+      const b: CM = mkX(7)
+      if a == b { … }        // type error: {[string]: i32} isn't equatable — a map has …
 
   So the compiler is not missing a lowering it never had — it HAS the refusal, and the
   refusal does not survive the trip through a type parameter. One decision, two severities,
@@ -13655,22 +13666,32 @@ Repro:
 ### D421 — [CLOSED 2026-08-28] D35's and D44's lost refusal ONE CONSTRUCTOR UP: a `T[]` operand records no constraint at all
 **CLOSED 2026-08-28 — the repro is NOW A LOUD CHECK REJECT, in the direct spelling's own words (``eqL` compares its type parameter with `==` here: `==` over Circle[] has no lowering`). Was: check-clean invalid wasm · found 2026-08-28 by the CONSTRUCTOR-OVER-`T` grid built to re-check D35/D44/D46/D102, 12 of its 468 cells · pre-existing and IDENTICAL on master `777f7848` and on every single-rung ablation of this branch · NO union, NO layout twin, NO import**
 
+**WITNESS RE-POINTED 2026-08-31 (D751/D752/D754), FOR THE REASON D35's WAS.** The filed
+witness used a `Circle[]` operand, which now has a compare core and RUNS. The row is about a
+`T[]` operand recording NO CONSTRAINT AT ALL, so what it needs is an element type the checker
+refuses at both spellings; a MAP is that permanently (D754's design ruling), where every rep
+with a core is one graduation away from unpinning this row. The `Circle[]` pair — direct and
+pinned, both running, read back by value — is in
+`tests/cases/generics/eq-concat-type-param-under-constructor-runs.vl`.
+
 Repro:
 
-    type Circle = { r: i32 }
+    type CM = {[string]: i32}
 
     function eqL<T>(a: T[], b: T[]): boolean { return a == b }
 
     function cell(): boolean {
-      const a: Circle[] = [{ r: 1 }]
-      const b: Circle[] = [{ r: 2 }]
+      const a: CM[] = [Map()]
+      const b: CM[] = [Map()]
       return eqL(a, b)
     }
 
     print(cell())
-    // vl check rc 0; vl run:
+    // was (with a `Circle[]` operand): vl check rc 0; vl run:
     //   Invalid input WebAssembly code at offset 269: type mismatch: expected i32,
     //   found (ref $type)
+    // now: vl check rc 1 — `eqL` compares its type parameter with `==` here:
+    //   {[string]: i32}[] isn't equatable (a field is not value-comparable) …
 
 * **D35 AND D44 ARE CORRECTLY CLOSED AND THIS IS NOT A REOPENING OF EITHER.** Both filed
   witnesses reproduce verbatim as loud check rejects, and at the shape they measured —
@@ -21177,9 +21198,18 @@ pin's softening order, which is still a live defect and still refused).
 
 ---
 
-### D722 — the `==` residue: 14 conceded cells that are NOT the concat question, priced rather than built
+### D722 — [CLOSED 2026-08-31] the `==` residue: 14 conceded cells that are NOT the concat question, priced rather than built
 
-**RULED 2026-08-31 as a real, unbuilt capability gap rather than a pin defect. Its witness is a loud check reject today and stays one until a compare core exists · 14 conceded corpus cells (`d421c002/004/006/008/010/013/014`, `d423c001/002/003/005/006/007/008`) · direct and pinned spellings AGREE at every one, measured**
+**CLOSED 2026-08-31 — the repro RUNS and prints `false`. Was: a loud check reject (`` `==` over f64[] has no lowering ``) at BOTH spellings · 14 conceded corpus cells (`d421c002/004/006/008/010/013/014`, `d423c001/002/003/005/006/007/008`) · **13 of the 14 BUILT** (D751 wide scalars, D752 nesting and struct elements) and **the 14th RULED a design refusal** (D754, the map) · the row's own three-sub-family scoping and its build ORDER both held, and the price it quoted for sub-family 3 was wrong in the CHEAP direction**
+
+**THIS ROW'S SCOPING WAS RIGHT AND ITS PRICE FOR THE THIRD SUB-FAMILY WAS TOO HIGH.** It said
+a nested compare needs "one reserved frame per LEVEL", which is exactly what
+`emit_state.fnListEqGKinds`/`fnListEqGSlots` provide, and it said a struct element needs "the
+field-wise compare over a value already on the STACK, and `emitStructEqRec` works off
+expression NODES — that is the real cost". That is the right diagnosis and the cost was two
+sentinel root indices: `emitChainRead` learns `-2`/`-3` as "read the stashed local", the
+recursion above it is untouched, and the alternative it was priced against (threading two
+parameters through four functions and a dozen call sites) was never paid.
 
 Repro:
 
@@ -21190,7 +21220,8 @@ Repro:
     }
 
     print(cell())
-    // vl check rc 1 — `==` over f64[] has no lowering
+    // was: vl check rc 1 — `==` over f64[] has no lowering
+    // now: runs, prints false
 
 * **WHY IT IS NOT D721.** A concat moves storage and never reads an element, so one lowering
   serves every rep. A COMPARE has to look at each element, so it needs a core per element rep,
@@ -21221,6 +21252,350 @@ Repro:
   Filed rather than built because a compare core is a different instrument from a copy, and
   landing it inside a change whose whole argument is "a concat inspects no element" would have
   buried the one claim this campaign most needs to stay legible.
+
+#### The close, sub-family by sub-family
+
+| sub-family | cells | verdict | what it cost |
+|---|---|---|---|
+| WIDE-SCALAR backing (`f64[]`, `i64[]`, `F[]`; plus `f32[]`, `u8[]`, which no corpus cell reaches) | 3 | **BUILT** (D751) | `emitListEqGCore` + a 4-slot LEQG frame family keyed on (kind, slot). One opcode per backing (`f64.ne` / `i64.ne` / `f32.ne`; `u8` zero-extends and takes the i32 one) |
+| NESTING (`Circle[][]`, `Circle[][][]`, `F[][]`, `f64[][]`, `i64[][]`, `i32[][][]`, `string[][]`) | 8 | **BUILT** (D752) | the core recursing along `eqgElemClass`'s chain, with the reservation scan walking the SAME chain — a level's rep is a different (kind, slot) from its parent's, so each gets its own frame for free |
+| a REF-LIST element with no core (`Circle[]`, and the `Circle[] \| null` niche) | 2 | **BUILT** (D752) | two stashed lazy-frame slots and two root SENTINELS in `emitChainRead`; the accept set is the FLAT structs (`eqgStructElemFlat`), and a string / `i32[]` / closure field keeps its refusal because the reservation scan cannot see it |
+| the MAP niche (`CM \| null`) | 1 | **RULED a design refusal** (D754) | a predicate and a sentence. Map equality is undefined by the LANGUAGE, not unbuilt by the backend |
+
+**THE ROW'S OWN FRAMING SURVIVED THE BUILD, AND THAT IS WORTH SAYING BECAUSE THE PREVIOUS ROW'S
+DID NOT.** D721 was scoped as a lost capability at the pin and the measurement refuted that
+outright. This one was scoped as three genuinely different amounts of work behind one message,
+and each sub-family did need its own rung: stripping any one of them refuses exactly its own
+cells and none of the others' (the ablation table in D752).
+
+**THE ONE THING THE ROW COULD NOT HAVE SEEN.** Its three sub-families are the whole of the
+`==` question, but two of the fourteen cells needed rungs that are not about `==` at all —
+`d423c006` needed a MONOMORPHIZER fix (a `T[][]` pattern against a 3-deep argument, D753,
+reachable with no `==` in the program) and `d421c014` needed the `nulglist` arm on the
+emitter's SECOND channel, which no corpus cell reaches. A price quoted from the cells is a
+price for the cells' own mechanism; the walls behind them are only visible once the first one
+falls.
+
+---
+
+### D751 — [CLOSED 2026-08-31] the `==` element rule was a CLOSED LIST OF CORES written down as a type rule, and three of them were one opcode apart
+
+**CLOSED 2026-08-31 — the repro RUNS and prints `false`. Was: a loud check reject (`` `==` over f64[] has no lowering ``) at BOTH spellings · 3 conceded corpus cells (`d421c006` `F[]`, `d421c008` `f64[]`, `d421c010` `i64[]`) plus `f32[]` and `u8[]`, which no corpus cell reaches · pre-existing and identical on master `dc85d1f3`**
+
+Repro:
+
+    function cell(): boolean {
+      const a: f64[] = [1.5, 2.5]
+      const b: f64[] = [1.5, 3.5]
+      return a == b
+    }
+
+    print(cell())
+    // was: vl check rc 1 — `==` over f64[] has no lowering
+    // now: runs, prints false
+
+* **`==` IS NOT `+`, AND THIS ROW IS WHERE THE ASYMMETRY IS PAID.** D721 gave every list rep
+  ONE concat lowering on the argument that a concat inspects no element — `array.copy` moves
+  opaque storage, so a wrapper and a backing are all it needs. A compare has to LOOK at each
+  element, so it needs to know the element. `emitListEqGCore` is `emitListEqICore`'s loop with
+  the frame base, the two heap indices and the element rung as arguments; what it is NOT is one
+  lowering for every rep, and reading the two operators as parallel is what put an element rule
+  on the `+` side for a year.
+* **THE THREE WIDE BACKINGS ARE ONE OPCODE APART FROM THE i32 ONE.** `f64[]` is one wasm array
+  of one scalar each, exactly as `i32[]` is; `eqCmpKindOfArrayElem` answered `"none"` for it
+  because `emitListEqICore` is hard-wired to `$lTypeIdx`/`$aTypeIdx` and reads its element with
+  `i32.ne`. The whole per-rep difference is `eqgNeOpcode`: `0x62 f64.ne`, `0x52 i64.ne`,
+  `0x5c f32.ne`, and `u8` takes the i32 one because `fbArrayGet` zero-extends the packed byte.
+  **Real disassembly** (`./node_modules/.bin/wasm-dis`, binaryen 130) of `f64[] == f64[]`:
+  `struct.get $1 1` on both wrappers → `i32.ne` on the lengths → an index loop → `(f64.ne
+  (array.get $0 (struct.get $1 0 …)) (array.get $0 (struct.get $1 0 …)))`. Four frame slots,
+  two wrappers and two counters.
+* **`F[]` IS THE HALF OF D45'S SECOND SENTENCE THIS CLOSES, AND THE OTHER HALF STAYS.** That row
+  admitted an i32-BASED numeric literal union (`type N = 1 | 2`) as the i32 list and left the
+  i64/f64 bases out, with the honest note that their wrapper had no compare at all. It does now,
+  so `numLitUnionHasBase` is the arm. A MIXED-base union (`type M = "a" | 1`) is still refused
+  and still should be — it is a value-union BOX, not one cell, and `numLitUnionHasBase` answers
+  "" for it.
+* **THE ACCEPT SET IS READ BACK BY VALUE, THREE QUESTIONS PER REP.**
+  `tests/cases/arrays/list-eq-every-rep.vl` asks every rep for an equal pair (true), an unequal
+  pair (false) and the same unequal pair through `!=` (true), with the difference always in the
+  LAST element — so a length-only compare and a first-element-only compare both fail it. That
+  matters more here than on the concat side: an `i32.ne` over an `f64` backing does not
+  validate, but a compare that reads the right storage with a wrong-width opcode answers TRUE
+  for two equal lists and is invisible to a `.length` assertion.
+* **THE TWO REPS THIS ROW CALLED "UNREACHED" ARE THE TWO THAT THEN SHIPPED A DEFECT, AND THE
+  BLIND SPOT WAS WRITTEN DOWN BEFORE IT WAS WALKED INTO.** The headline above names `f32[]` and
+  `u8[]` as reps no corpus cell reaches; the first cut of the accept fixture then built every
+  list inside a FUNCTION and never asked them at module scope, where `i64[]` and `f32[]` were
+  check-clean invalid wasm. `regress.py` reported `→ silent 0` and was right — the corpus has
+  no module-scope `i64[]` equality cell. **A rep a row calls unreached is the rep that needs a
+  hand-written probe**, which is the whole argument `scripts/capability-probes/` exists for.
+  D755 is the defect and the both-scopes grid is the instrument that now covers it.
+* **BYTE-IDENTICAL over the corpus**, which is the instrument that says this touched only reps
+  that were a refusal before it: `1,997 identical · 0 DIFFER · 0 LOST` against master's seed.
+  `eqgListKindOfBin` declines every shape `listOpKindOfBin` claims, so `i32[]`, `string[]` and
+  `i32[][]` keep their exact bytes.
+* **COUNTERS, reach AND ans.** A POISON build (`emitListEqAnyRep` replaced by
+  `emitFail("PROBE-EQG-REACH")`) builds **1,998 of 2,452** corpus + `std` modules — the same
+  1,998 master builds, so **reach 0 / ans 0 on the corpus**. On the witness it is **reach 1,
+  ans 1** (`PROBE-EQG-REACH` at the compare), and on the one-token control `i32[] == i32[]`
+  **reach 0 / ans 0** (still prints `true`). Byte-identity alone cannot tell "never reached"
+  from "reached and inert"; this is what separates them.
+
+Fixtures: `tests/cases/arrays/list-eq-every-rep.vl` (the accept set, by value) and
+`tests/cases/soundness/equality-no-lowering-reject.vl`, which is where these shapes USED to be
+pinned as refusals and whose own contract required them to graduate with a value pin.
+
+---
+
+### D752 — [CLOSED 2026-08-31] a compare over a NESTED or STRUCT element, and the FLOOR that has to exist because two ladders answer one question
+
+**CLOSED 2026-08-31 — the repro RUNS and prints `false`. Was: a loud check reject (`` `==` over Circle[] has no lowering ``) at BOTH spellings · 10 conceded corpus cells (`d421c002/004/014`, `d423c001/002/003/005/006/007/008`) · pre-existing and identical on master `dc85d1f3`**
+
+Repro:
+
+    type Circle = { r: i32 }
+
+    function cell(): boolean {
+      const a: Circle[] = [{ r: 1 }]
+      const b: Circle[] = [{ r: 2 }]
+      return a == b
+    }
+
+    print(cell())
+    // was: vl check rc 1 — `==` over Circle[] has no lowering
+    // now: runs, prints false
+
+* **NESTING NEEDS A FRAME PER LEVEL, WHICH IS WHY THE FRAME KEY IS THE REP AND NOT A FLAG.**
+  `f64[][] == f64[][]` runs an outer loop over the ref list and an inner loop over each `f64[]`
+  element, so two counters are live at once. Keying the LEQG frame on `(kind, slot)` gives each
+  level its own for free: a list is never its own element, so a level's rep is a different pair
+  from its parent's by construction. `leqgNoteRep` reserves along exactly the chain
+  `emitListEqGCore` recurses along, off the one home both read (`eqgElemClass`).
+* **A STRUCT ELEMENT IS THE PART D722 PRICED CORRECTLY AND THE PRICE WAS TWO SENTINELS.**
+  `emitStructEqRec`'s contract is that both operands are pure RE-READS, because every field
+  compare re-walks the chain from its root — and a list element has no expression to re-walk;
+  it is `backing[i]` with a moving `i`. The pair is parked in two fresh lazy-frame slots and
+  `emitChainRead` learns two root indices that are not expressions (`-2`, `-3`). The recursion
+  above it is untouched. **Real disassembly**: `(local.set $7 (array.get $1 (struct.get $2 0
+  (local.get $2)) (local.get $5)))`, the same for `$8`, then `(i32.eq (struct.get $0 0
+  (local.get $7)) (struct.get $0 0 (local.get $8)))`.
+* **THE ACCEPT SET IS DRAWN AROUND THE FRAMES, NOT AROUND SOUNDNESS, AND THAT IS THE PRICE THIS
+  ROW RECORDS.** `eqgStructElemFlat` admits only fields that compare with two chain reads and
+  one opcode — codes 0 (i32/boolean), 17 (f64), 21 (`boolean | null`), 30 (`K | null`) and 15
+  (a nested struct of the same). A `string` field and an `i32[]` field compare CORRECTLY
+  through `emitStructEqRec`; what they also do is stage operands in the string-op frame and mint
+  lazy list slots, and the scan that reserves those reads `exprIsStructEq` — FALSE here, because
+  this `==`'s operands are lists and no struct rung claims them. `{ name: string }[] == …` is
+  therefore still refused. Widening it means teaching the reservation scan about a struct compare
+  reached through a list element, which is a scan change and not a core change.
+* **THE FLOOR SCORES ZERO EVERYWHERE AND IS THE ROW'S MOST IMPORTANT RUNG.** The checker reads
+  the ARENA (`eqCmpKindOfArrayElem`) and the emitter reads the REP TABLES (`eqgElemClass`); they
+  are two ladders over one question and the standing hazard is that they disagree. They did:
+  with `type Shape = Circle | Sq` declared and no use site, `Circle` leaves the struct table
+  (`collectS` skips an arm) and the element resolves a VARIANT row — the arena still says
+  `TyObj`. `binEqGRepUnresolved` makes that disagreement LOUD instead of letting it fall to the
+  i32 tail. **Measured, and the pair is the whole argument:**
+
+  | tree | `f64[]` | `f64[][]` | `Circle[]` | `Circle[]` with `Shape` declared, via the pin |
+  |---|---|---|---|---|
+  | all rungs | runs | runs | runs | runs |
+  | − the variant-row half, FLOOR KEPT | runs | runs | runs | **loud emit reject** |
+  | − the variant-row half AND the floor | runs | runs | runs | **check-clean INVALID WASM** |
+  | − the struct rung (D752) | runs | runs | check reject | check reject |
+  | − the nesting rung | runs | **check reject** | runs | runs |
+  | − everything (strip-all) | check reject | check reject | check reject | check reject |
+
+  The floor moves **0 corpus cells and 0 of the 21 grid receivers on the full tree**. It is the
+  difference between a clause-2 sentence and a clause-1 defect, which is the standing "never
+  delete on a zero alone" case and the second worked instance of it in two rows (D721's
+  element-NAME arm was the first).
+* **THE FLOOR'S FIRST CUT WAS ALSO WRONG, IN D42's EXACT WAY.** It fired on "the CHECKER's token
+  names core 7", which is exact for the direct spelling and blind inside a monomorphized
+  instance — `monoCloneBody` shares leaf expressions, so the banked type on the operand node is
+  `T[]` and `eqCmpKindOfTy` answers "" for it. `d421c002` through `eqL<T>` was check-clean
+  invalid wasm **with that floor in place**. It reads the banked types' SHAPE now
+  (`binPlusIsListByTy`), which answers for the instance where the token cannot.
+* **AND THE SIXTH NICHE HAD THE SAME HOLE.** `eqCmpKindOfNulInner` names `nulglist` on the first
+  channel, so `f64[] | null == null` written out takes the guard and answers correctly; inside an
+  instance that channel answers "" and `exprNulNicheKind` — the emitter's own `fnIx`-scoped
+  second channel — had no `nulglist` arm. `eqN(xs, null)` at `T = Circle[]` was `vl check` rc 0
+  and a runtime **TRAP** (`ref.as_non_null` on the very null the compare answers for).
+  **NO CORPUS CELL REACHES IT**: `d421c014` compares two NON-NULL `Circle[] | null` values
+  through the same `eqN<T>`, so it runs either way. The mixed pairing is the input that separates
+  them and it took a hand-written accept fixture to produce.
+
+Fixtures: `tests/cases/arrays/list-eq-every-rep.vl`,
+`tests/cases/generics/eq-concat-type-param-under-constructor-runs.vl` (the pinned spelling,
+including the mixed-null pair) and `tests/cases/std/array-struct-list-needle.vl` (all four
+`needle: T` exports over a struct-element list, by index).
+
+---
+
+### D753 — [CLOSED 2026-08-31] a `T[][]` PARAMETER PATTERN bound nothing against a 3-deep argument, and `==` is not involved
+
+**CLOSED 2026-08-31 — the repro RUNS and prints `1`. Was: a loud emit reject (`emitProgram: monomorphize: unsupported argument type for `a` in a call to `idLL``) on master `dc85d1f3` · 1 conceded corpus cell (`d423c006`), found only because D751 stopped `==` refusing first · reproduces with NO comparison in the program**
+
+Repro:
+
+    function idLL<T>(a: T[][]): i32 { return a.length }
+
+    function cell(): i32 {
+      const q: i32[][][] = [[[1]]]
+      return idLL(q)
+    }
+
+    print(cell())
+    // was: vl check rc 0; vl run:
+    //   emitProgram: monomorphize: unsupported argument type for `a` in a call to `idLL`
+    // now: runs, prints 1
+
+* **THE `==` WAS SCENERY AND THE WITNESS PROVES IT.** `d423c006` is `eqLL<T>(a: T[][], b: T[][])`
+  at `T = i32[]`, and it looked like the last of D722's nesting cells. It is not: `idLL<T>(a:
+  T[][])` with a `.length` body and no comparison anywhere fails identically on master. What
+  `==` did was refuse first, so the program never reached the monomorphizer.
+* **THE BUG IS ONE MISSING ARM AND THE SIGN OF THE CUT.** `monoBindFromAnn` has a `T[]` special
+  case inside its `monoTyParamOf` branch that peels exactly ONE `[]`; `monoTyParamOf` answers ""
+  for `T[][]`, so a multi-dimensional pattern matched no arm at all, bound nothing, and
+  `monoSubstAnn` then answered "" for a type parameter nobody had put in the table.
+  `monoSubstAnn` has had the `[]`-RUN arm all along (`arrLeafNameOf` + re-attach); this is the
+  same arm on the binding side. **The dimensions come off the PATTERN, not off the actual**:
+  `T[][]` against `i32[][][]` binds `T` to `i32[]`, and taking the argument's own leaf `i32`
+  instead is the off-by-one-level that binds a parameter to something no substitution can rebuild.
+* **`T` AND `T[]` PATTERNS ALREADY TOOK THE SAME ARGUMENT**, which is what says this is a hole
+  and not a rule: `id1<T>(a: T)` and `id2<T>(a: T[])` both run at `i32[][][]` on master.
+* **BYTE-IDENTICAL and reach 0 on the corpus** — every program that binds a multi-dimensional
+  pattern today is one this arm could not previously build.
+
+---
+
+### D754 — [RULED 2026-08-31] `==` over a MAP is a DOMAIN rule, and the two spellings of it had been giving opposite verdicts
+
+**RULED 2026-08-31 — the repro is NOW A LOUD CHECK REJECT whose sentence is a DOMAIN error off the `unsupported-lowering` channel. Was the same refusal conceding "has no lowering" · 1 conceded corpus cell (`d421c013`) plus the bare and container spellings · A DESIGN RULING, NOT A LOWERING — the five questions a re-opening has to answer are below**
+
+Repro:
+
+    type CM = {[string]: i32}
+
+    function cell(): boolean {
+      const a: CM = Map()
+      const b: CM = Map()
+      return a == b
+    }
+
+    print(cell())
+    // vl check rc 1:
+    //   [ERROR]: {[string]: i32} isn't equatable — a map has no defined value equality: its
+    //   entries are insertion-ORDERED and observable that way (`for k in m`, `m.keys()`), so
+    //   `==` would have to pick between order-sensitive and set-like and neither is what both
+    //   callers mean — compare `m.size`, or the values at the keys you name
+
+* **THE MEASUREMENT THAT DECIDED IT IS THAT THE LANGUAGE ALREADY DISAGREED WITH ITSELF.**
+  `{[string]: i32}[] == …` printed the SOUNDNESS sentence — `isn't equatable (a field is not
+  value-comparable)` — because `isEquatable` recurses into an array's element and refuses a map
+  there. The BARE spelling `m1 == m2` printed only `` `==` over {[string]: i32} has no
+  lowering ``, because `eqRefusals`' structural gate fires on a `TyObj`/`TyArray` operand and a
+  map is neither. One program said the design forbids this and its one-constructor neighbour
+  said the backend had not caught up, **about the same value**. Exactly one of them could be
+  true, and this is a ruling about which.
+* **IT IS THE FIRST, AND THE REASON IS THE REP RATHER THAN THE EFFORT.** A VL map is an
+  insertion-ORDERED open-addressing table that keeps tombstones (`count` vs `size`), and the
+  order is OBSERVABLE — `for k in m` yields insertion order and `m.keys()` returns it. A
+  structural `==` therefore has to CHOOSE: order-sensitive, and two maps built from the same
+  pairs in a different order are unequal; or set-like, and `==` contradicts an iteration the
+  caller can see for themselves. Writing the core is easy — it is one loop, and the concat side
+  proves the frame machinery is there (`{[string]: i32}[] + …` RUNS, D721). Deciding what it
+  should ANSWER has never been done.
+* **THE CHANNEL MOVED, NOT ONLY THE WORDS**, which is what makes this a ruling rather than a
+  reword — the same distinction D711 drew for `print`. The refusal was raised through the
+  `has no lowering` sentence that `goal-scoreboard.py` counts as a capability concession and
+  that the LSP's tooling ABI reads as `unsupported-lowering`; it is a plain type error now.
+  `tests/selfhost_native_diag_code_test.ts` pins both sides.
+* **WHAT WOULD HAVE TO BE DECIDED TO RE-OPEN IT.** Not "teach the emitter". In this order, and
+  each answer is permanent once programs depend on it:
+  1. Is `==` order-sensitive, or does it compare the live key→value SET?
+  2. If set-like, does it contradict `for k in m` / `m.keys()`, and is that acceptable?
+  3. Do tombstones participate — is a map that had a key deleted equal to one that never had it?
+     (`count` differs, `size` does not.)
+  4. What about two maps with the same entries at different CAPACITIES, i.e. is any part of the
+     answer allowed to depend on the table's physical layout?
+  5. Does a SET (`{[string]: boolean}`) get the same answer, given it shares the rep?
+* **THE CONTAINER SPELLING KEEPS ITS EXISTING SENTENCE** and is not duplicated: the soundness
+  gate speaks first for `CM[]`, and the new arm is suppressed when it has (`msgsBefore`). Two
+  sentences about one design rule read as two separate problems.
+
+Fixtures: `tests/cases/soundness/equality-no-lowering-reject.vl` (both map spellings, and it is
+now a map-only file — its other seven rows graduated to D751/D752's accept pins),
+`tests/cases/generics/error-eq-concat-type-param-under-constructor.vl` and
+`tests/cases/std/error-array-needle-not-equatable.vl`, whose CONTROL is now a map for the same
+reason: the row's argument needs a refusal that cannot graduate out from under it.
+
+---
+
+### D755 — [CLOSED 2026-08-31] the OLD compare ladder was missing three of its twin's arms, and `exprArray` claims a module-scope global its declared-local twin declines
+
+**CLOSED 2026-08-31 — the repro RUNS and prints `true`. Was: check-clean INVALID WASM (`type mismatch: expected (ref $type), found (ref $type)`) on D751's first cut · 2 spellings (`i64[]`, `f32[]`) at MODULE SCOPE only · ZERO corpus cells, at either scope, which is why every gate was green · found by the coordinator's hand-written module-scope probe, not by any instrument in this repo**
+
+Repro:
+
+    const a: i64[] = [5]
+    const b: i64[] = [5]
+    print(a == b)
+    // was: vl check rc 0; vl run:
+    //   failed to compile — Invalid input WebAssembly code:
+    //   type mismatch: expected (ref $type), found (ref $type)
+    // now: runs, prints true
+
+* **THE MECHANISM IS THREE MISSING ARMS IN A LADDER DOCUMENTED AS HAVING THE SAME ORDER AS ITS
+  TWIN.** `listOpKindOf` picks among the THREE OLD compare cores and its header says it mirrors
+  `catListKindOfExpr`'s order. It did not: `exprF64Array` had an explicit `-1` and `i64`, `f32`
+  and `u8` had **nothing**, so all three fell through to `exprArray` at the bottom and answered
+  `0` — the i32 core, whose `$lTypeIdx`/`$aTypeIdx` are not their wrapper and backing.
+* **IT WAS INERT UNTIL D751 BECAUSE THE CHECKER REFUSED FIRST**, which is the general shape
+  worth keeping: `f64[] == f64[]` and its three siblings were a loud check reject, so the
+  emitter never ran and the missing arms cost nothing for as long as the capability gap
+  existed. **Closing a capability gap makes every stale classifier behind it load-bearing on
+  the same day.** The three arms had presumably been wrong since the reps were introduced.
+* **IT IS SCOPE-KEYED, AND THAT IS THE PART NO EXISTING INSTRUMENT COULD SEE.** `exprArray`
+  declines an `i64[]` LOCAL — the declared kind names the rep — and CLAIMS a module-scope
+  GLOBAL. So the identical comparison ran correctly one indent in and wrote invalid wasm at
+  module scope:
+
+      function f(): boolean {
+        const a: i64[] = [5]
+        const b: i64[] = [5]
+        return a == b        // always fine
+      }
+
+  `f64[]` was correct at BOTH scopes, which is the control that made this a narrow classifier
+  gap rather than a design question about module scope.
+* **THE FLOOR DID NOT CATCH IT, AND THAT WAS A SECOND DEFECT.** `binEqGRepUnresolved`'s job is
+  to make a ladder disagreement LOUD, and it bailed on `if listOpKindOfBin(...) >= 0 { return
+  false }` — it treated "an old core claims this" as proof, when the claim itself was the bug.
+  It now CORROBORATES that claim against `catListKindOfExpr`, the home that knows every rep
+  rather than only the three with cores; the three pairings (core 0 ↔ kind 0, core 3 ↔ kind 3,
+  core 4 ↔ kind 1) are the entire correspondence between the two alphabets.
+* **THE ABLATION IS THE POINT OF THAT GUARD, AND IT READS ZERO ON THE TREE AS IT STANDS:**
+
+  | tree | module-scope `i64[]` |
+  |---|---|
+  | both rungs | **runs, prints true** |
+  | − the three `listOpKindOf` arms, guard KEPT | **loud emit reject** |
+  | − the three arms AND the guard | **check-clean INVALID WASM (clause 1)** |
+  | master `1e8bf2fb` | loud check reject (the capability gap) |
+
+  The guard buys 0 cells and 0 grid rows today. It exists so the next rep added to one ladder
+  and not the other is an `emitProgram:` sentence rather than a module the engine refuses —
+  the same argument D752's floor is kept on, one ladder over.
+* **THE TRADE THIS ROW UNDOES WAS `loud check reject → check-clean invalid wasm`**, which is
+  loud into SILENT and specifically into clause 1, the tighter clause. Under the standing goal
+  that is worse than what it replaced even at two spellings, and it is the one direction
+  `regress.py`'s own veto list would not have blocked — it blocks on `runs → not-runs`, and
+  these cells never ran.
+
+Fixtures: `tests/cases/arrays/list-eq-every-rep.vl`, which now asks **every rep at BOTH
+SCOPES** — 18 module-scope functions over module-scope globals, plus two compares in the start
+function itself, plus `u8[]` (which has no annotation spelling and is built with `.bytes()`).
 
 ---
 

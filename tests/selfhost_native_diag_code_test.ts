@@ -161,3 +161,44 @@ Deno.test({
     );
   }
 });
+
+// MAP EQUALITY IS THE SAME SPLIT, ONE OPERATOR OVER. `m1 == m2` used to carry the
+// `unsupported-lowering` code while its one-constructor neighbour `{[string]: i32}[] == …`
+// carried the SOUNDNESS sentence with no code — two channels, two verdicts, one value. A
+// map's entries are insertion-ORDERED and observable that way, so `==` would have to choose
+// between order-sensitive and set-like; that is a language decision, not a missing core.
+// `silent-class-inventory` D754 carries the ruling. A change that puts map `==` back on the
+// capability channel reddens here.
+Deno.test({
+  name: "diag-code: `==` over a MAP is a domain error, carrying no code",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = check(
+    exp,
+    "const a: {[string]: i32} = Map()\nconst b: {[string]: i32} = Map()\nprint(a == b)\n",
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "") {
+    throw new Error(
+      `expected an empty code (a domain error, not a capability admission), got: ${
+        JSON.stringify(diags[0])
+      }`,
+    );
+  }
+  if (!diags[0].message.includes("a map has no defined value equality")) {
+    throw new Error(
+      `expected the domain sentence, got: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  if (/not yet supported by codegen|no lowering/.test(diags[0].message)) {
+    throw new Error(
+      `a domain rejection must not concede the program is buildable: ${
+        JSON.stringify(diags[0])
+      }`,
+    );
+  }
+});

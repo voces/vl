@@ -7698,7 +7698,29 @@ function listOpKindOf(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   if exprString(exprIx, fnIx) { return -1 }
   if exprStringArray(exprIx, fnIx) { return 3 }
+  // THE FOUR DISTINCT-BACKING SCALAR LISTS DECLINE HERE, AND ONLY ONE OF THEM USED TO.
+  // This ladder is documented as `catListKindOfExpr`'s order and it was missing three of
+  // its arms: `exprF64Array` had an explicit `-1` and `i64` / `f32` / `u8` had NOTHING, so
+  // they fell through to `exprArray` at the bottom — which claims them — and
+  // `listOpKindOfBin` answered `0`, the i32 core, whose `$lTypeIdx`/`$aTypeIdx` are not
+  // their wrapper and backing.
+  //
+  // **IT WAS INVISIBLE UNTIL D751 BECAUSE THE CHECKER REFUSED FIRST.** `f64[] == f64[]`
+  // and its three siblings were a loud check reject, so the emitter never ran and the
+  // missing arms cost nothing; giving them a core (`emitListEqGCore`) made this ladder's
+  // answer load-bearing for the first time. **AND IT IS SCOPE-KEYED**, which is why the
+  // f64 arm alone looked sufficient: `exprArray` declines an `i64[]` LOCAL (the declared
+  // kind names the rep) and claims a module-scope GLOBAL, so `const a: i64[] = [5]` at
+  // module scope read an i64 list wrapper through the i32 one — `vl check` rc 0,
+  // `expected (ref $type), found (ref $type)`. (`silent-class-inventory` D755.)
+  //
+  // THE `-1` IS THE RIGHT ANSWER RATHER THAN A NEW CODE: this home means "which of the
+  // THREE OLD cores", and none of them reads these backings. `eqgListKindOfBin` claims
+  // them one ladder over, which is exactly the split its own header describes.
   if exprF64Array(exprIx, fnIx) { return -1 }
+  if exprI64Array(exprIx, fnIx) { return -1 }
+  if exprF32Array(exprIx, fnIx) { return -1 }
+  if exprU8Array(exprIx, fnIx) { return -1 }
   if exprRefArray(exprIx, fnIx) {
     const slot = refListSlotOfExpr(exprIx, fnIx)
     if slot >= 0 && slot < rlElemKindTbl.length {
@@ -7769,6 +7791,261 @@ export function catListKindOfBin(binIx: i32, fnIx: i32) {
   -1
 }
 
+// ── list `==` over a rep with NO CORE OF ITS OWN — the ONE home ───────────────────────
+// The `==` twin of `catListKindOfBin` two functions up, and the asymmetry between them is
+// the whole reason it is a separate home rather than a widened one.
+//
+// **A CONCAT INSPECTS NO ELEMENT; A COMPARE DOES.** D721 could give every list rep one
+// concat lowering because `array.copy` moves opaque storage — a wrapper and a backing are
+// all it needs. A compare has to look at each element, so it needs to KNOW the element:
+// one opcode for a scalar leaf, the string helper for a string leaf, and a recursion into
+// the element's own core for a nested list. `eqgElemClass` is that knowledge, and the
+// accept set is therefore narrower than the concat side's — a struct, a map, a union box
+// and a closure element are declined here and stay declined until each grows a compare.
+//
+// THE THREE EXISTING CORES KEEP EVERY SHAPE THEY CLAIM. `listOpKindOfBin` runs first and
+// this home returns -1 the moment it answers, so `i32[]`, `string[]` and `i32[][]` lower
+// through `emitListEqICore` / `emitListEqSCore` / `emitListEqRCore` byte for byte. That is
+// not politeness: corpus byte-identity is the instrument that proves this change touched
+// only reps that were a loud refusal before it.
+
+// What `emitListEqGCore` must do with ONE ELEMENT of list rep (kind, slot):
+// `1` compare two scalar leaves with `eqgNeOpcode(kind)`, `2` compare two string leaves
+// through the string-eq helper, `3` recurse into the element's own list core (its rep is
+// `eqgInnerKind`/`eqgInnerSlot`), `0` no answer — the rep has no element compare.
+//
+// KEYED ON THE REP, NOT ON THE ARENA TYPE, because the emitter's frames and heap indices
+// are keyed that way; the checker asks the same question of the arena
+// (`eqCmpKindOfArrayElem`) and the two must agree or a program passes `vl check` and
+// reaches a floor. They are two ladders over one question, which is the standing hazard on
+// this surface — what keeps them honest is the grid, not a shared call.
+export function eqgElemClass(kind: i32, slot: i32) {
+  // The scalar-leaf list reps: i32 (and everything that reps as one), f64, i64, f32, u8.
+  if kind == 0 || kind == 4 || kind == 6 || kind == 7 || kind == 10 { return 1 }
+  if kind == 3 { return 2 }
+  if kind == 1 {
+    if slot < 0 || slot >= rlElemKindTbl.length { return 0 }
+    const ek = rlElemKindTbl[slot]
+    // 4 i32-list · 6 string-list · 7 f64-list · 8 i64-list · 10 f32-list · 9 a ref list.
+    if ek == 4 || ek == 6 || ek == 7 || ek == 8 || ek == 9 || ek == 10 {
+      return 3
+    }
+    // A STRUCT element, field-wise — but only over the fields whose compare needs NO
+    // frame of its own (`eqgStructElemFlat`). A union BOX (2), a MAP (3) and a CLOSURE (5)
+    // element keep their refusal.
+    //
+    // A NULLABLE element is excluded HERE rather than by the row lookup, and the two are
+    // not the same test: `(Circle | null)[]` resolves the SAME struct row a `Circle[]`
+    // does, so a row-based gate would admit it and the field compare would `struct.get`
+    // through a null — a TRAP, on a program the checker said was fine.
+    if slot < rlElemNullable.length {
+      if rlElemNullable[slot] == 1 { return 0 }
+    }
+    if eqgElemHasEqRow(slot) {
+      if eqgStructElemFlat(eqgElemEqRow(slot), 0) { return 4 }
+    }
+    return 0
+  }
+  0
+}
+
+// ── the ref-list element's EQ ROW, IN BOTH NAMESPACES ────────────────────────────────
+// TWO TABLES, ASKED IN THE ORDER THE `==` DISPATCH ALREADY ASKS THEM, and the reason is
+// D57's: declaring `type Shape = Circle | Sq` moves `Circle` out of the struct table
+// entirely (`collectS` skips an arm), so a `Circle[]` element that resolved a struct row
+// with no union declared resolves a VARIANT row with one. A gate that knew only the struct
+// table therefore accepted `Circle[] == Circle[]` in one module and declined it in the
+// same module plus one union declaration with no use site — which is exactly the shape
+// D57 named, reached through the list element instead of the operand.
+//
+// THE FOUND FLAG IS NOT DECORATION, for the reason `emitNulStructEq`'s is: an eq row is
+// `>= 0` struct / `< 0` variant, so -1 IS variant row 0 and cannot double as "no answer".
+export function eqgElemHasEqRow(slot: i32): boolean {
+  if rlElemStructRow(slot) >= 0 { return true }
+  rlElemVariantRow(slot) >= 0
+}
+
+export function eqgElemEqRow(slot: i32): i32 {
+  const sr = rlElemStructRow(slot)
+  if sr >= 0 { return sr }
+  eqRowOfVariant(rlElemVariantRow(slot))
+}
+
+// Is this struct row's field-wise compare emittable INSIDE A LIST LOOP with no frame the
+// reservation scan did not reserve? Every field must be a NATIVE-compare scalar — codes 0
+// (i32/boolean), 17 (f64), 21 (`boolean | null`) and 30 (`K | null`), the four arms of
+// `emitStructEqFieldInner` that emit two chain reads and one opcode — or a nested struct
+// (15) whose own row satisfies the same rule.
+//
+// **THE ACCEPT SET IS DRAWN AROUND THE FRAMES, NOT AROUND SOUNDNESS.** A `string` field
+// (code 3) and an `i32[]` field (code 4) compare correctly through `emitStructEqRec`; what
+// they also do is stage operands in the string-op frame and mint lazy list slots, and the
+// scan that reserves those reads `exprIsStructEq` — which is FALSE here, because the
+// operands of this `==` are LISTS and no struct rung claims them. Admitting them would be
+// the exact failure `eqCoreKindOfBin`'s header names: a compare emitted against locals the
+// function never declared, `vl check` clean and the module refused at load. A field code
+// this declines keeps the refusal it has today, which is a sentence rather than a defect.
+// (`silent-class-inventory` D752, which prices the widening.)
+//
+// A CLOSURE field (14) is declined for a second reason on top of that one: `emitCloEqCore`
+// reads `cloEqScratchBase` AND `cloStructIdx`, and a module whose only closure is inside a
+// compared list element may never have minted the closure struct at all.
+// **`row` IS AN EQ ROW, NOT A STRUCT INDEX, AND THE SIGN IS THE NAMESPACE.**
+// `eqRowOfVariant` encodes a union ARM as `-1 - vi`, so a `row < 0` guard here — which is
+// what a struct-index-shaped rung would carry, and what the first build of this did carry
+// — rejects every variant arm on its ENCODING. The cell that caught it is `d421c002`:
+// `Circle[] == Circle[]` runs, and adding `type Shape = Circle | Sq` with no use site
+// moves `Circle` out of the struct table and made the same program refuse. That is D57's
+// shape once more, and the third time this file has paid for reading an eq row as an
+// index. The caller (`eqgElemClass`) has already established the row EXISTS through
+// `eqgElemHasEqRow`, which is where the "no answer" question belongs.
+export function eqgStructElemFlat(row: i32, depth: i32): boolean {
+  if depth > 8 { return false }
+  const cnt = eqRowFieldCount(row)
+  // A FIELDLESS struct compares as `i32.const 1`, which is correct and needs nothing —
+  // but it is also the answer a row the tables do not cover gives, so it is not admitted
+  // on a count alone.
+  if cnt == 0 { return false }
+  let fi = 0
+  while fi < cnt {
+    const code = eqRowFieldTypeAt(row, fi)
+    if code == 15 {
+      // A NESTED-struct field target is a STRUCT row in either namespace or -1 for "no
+      // interned shape" (`eqRowTgtStructIdx`'s own contract), so here — unlike the row
+      // above — a negative IS the absence and must be refused.
+      const tgt = eqRowTgtStructIdx(row, fi)
+      if tgt < 0 { return false }
+      if !eqgStructElemFlat(tgt, depth + 1) { return false }
+    } else if code != 0 && code != 17 && code != 21 && code != 30 {
+      return false
+    }
+    fi = fi + 1
+  }
+  true
+}
+
+// The nested element's own list-rep KIND, in `catListKindOfExpr`'s alphabet. Only a
+// ref-list slot (kind 1) has one; `eqgElemClass` answering 3 is the precondition.
+export function eqgInnerKind(slot: i32) {
+  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
+  const ek = rlElemKindTbl[slot]
+  if ek == 4 { return 0 }
+  if ek == 6 { return 3 }
+  if ek == 7 { return 4 }
+  if ek == 8 { return 6 }
+  if ek == 10 { return 7 }
+  if ek == 9 { return 1 }
+  -1
+}
+
+// The nested element's ref-list SLOT, or 0 for an element rep that is not slot-keyed —
+// the same convention `catListSlotOfBin` uses, and for the same reason.
+export function eqgInnerSlot(slot: i32) {
+  if slot < 0 || slot >= rlElemKindTbl.length { return 0 }
+  if rlElemKindTbl[slot] == 9 { return rlElemInnerSlot(slot) }
+  0
+}
+
+// Can `emitListEqGCore` compare two values of list rep (kind, slot)? Walks the element
+// chain the emitter will recurse along, so the reservation scan, the emitter and this
+// predicate cannot disagree about how deep the recursion goes.
+//
+// DEPTH-BOUNDED, AND THE BOUND IS NOT DECORATION. Every honest chain shortens by one list
+// constructor per level, so 32 is far past any spellable type; the bound is here because
+// this walks a TABLE (`rlElemKindTbl` / `rlElemInnerSlot`) rather than the arena, and a
+// table whose inner-slot column ever pointed at its own row would hang the compiler
+// instead of refusing a program. A compiler that does not terminate is a worse failure
+// than one that declines a 33-deep list nobody can write.
+export function eqgRepComparable(kind: i32, slot: i32, depth: i32): boolean {
+  if depth > 32 { return false }
+  const c = eqgElemClass(kind, slot)
+  if c == 1 || c == 2 || c == 4 { return true }
+  if c == 3 {
+    return eqgRepComparable(eqgInnerKind(slot), eqgInnerSlot(slot), depth + 1)
+  }
+  false
+}
+
+// ONE `==` OPERAND'S list rep, in `catListKindOfExpr`'s alphabet, THROUGH A `| null`.
+//
+// WHY THE NULLABLE FALL-THROUGH IS NOT OPTIONAL. `emitNulNicheEq` guards the compare and
+// then runs the rep's OWN core on the unwrapped refs, so a niche and its base share one
+// core BY CONSTRUCTION — that is the contract, and it is what stops the nullable half of a
+// rep drifting out of the non-null half's capability. `catListKindOfExpr`'s classifiers are
+// non-null ones, so without this the guard was emitted and the core underneath it found no
+// frame: `emitProgram: list compare frame was not reserved for this rep`, measured on
+// `f64[] | null == f64[] | null`. Loud rather than silent, but a loud EMIT reject where the
+// tree had a loud CHECK reject is a worse sentence, not a better one.
+function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
+  const k = catListKindOfExpr(exprIx, fnIx)
+  if k >= 0 { return k }
+  // The four DISTINCT-BACKING nullable scalar lists (`f64[] | null` & co.), off the same
+  // one home the build side reads them through.
+  const nk = exprNulScalarListKind(exprIx, fnIx)
+  if isNulScalarListKind(nk) { return nulScalarListBuildKind(nk) }
+  if exprNullableRefArray(exprIx, fnIx) {
+    if refListSlotOfExpr(exprIx, fnIx) >= 0 { return 1 }
+  }
+  -1
+}
+
+// The generic-compare rep of a `==`/`!=` BinExpr whose operands are BOTH lists of one rep
+// that has no core of its own, or -1.
+//
+// BOTH OPERANDS MUST RESOLVE TO THE SAME REP **AND THE SAME REF-LIST SLOT**, exactly as
+// `catListKindOfBin` requires and for the same reason: two ref lists at different slots
+// have different wrapper AND backing heap types, and one core cannot read both. A pairing
+// this declines keeps the refusal it has today rather than writing a module the engine
+// rejects.
+export function eqgListKindOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      // A bare `null` operand is a null TEST, not a value compare.
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return -1 }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
+      // The three existing cores decide every shape they claim.
+      if listOpKindOfBin(binIx, fnIx) >= 0 { return -1 }
+      // AND SO DOES THE CHECKER'S OWN TOKEN, WHICH IS THE STRONGER OF THE TWO GATES.
+      // `eqCmpKindOfOperand` names the core the checker accepted this program for; a token
+      // that names one of the old three is that core's shape however the classifiers below
+      // read it, and claiming it here would move bytes for a compare that already works.
+      // A token of -1 is the OPAQUE case — a monomorphized instance, whose banked type is
+      // the type VARIABLE — and there the classifiers are the only channel that can answer,
+      // which is why -1 passes rather than refuses. (The same two-channel split
+      // `eqCmpKindOfOperand`'s own header sets out.)
+      const tl = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binLeft, fnIx))
+      if tl >= 0 && tl != 7 { return -1 }
+      const tr = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binRight, fnIx))
+      if tr >= 0 && tr != 7 { return -1 }
+      const lk = eqgListKindOfExpr(e.binLeft, fnIx)
+      if lk < 0 { return -1 }
+      if eqgListKindOfExpr(e.binRight, fnIx) != lk { return -1 }
+      let sl = 0
+      if lk == 1 {
+        const ls = refListSlotOfExpr(e.binLeft, fnIx)
+        if ls < 0 { return -1 }
+        if refListSlotOfExpr(e.binRight, fnIx) != ls { return -1 }
+        sl = ls
+      }
+      if !eqgRepComparable(lk, sl, 0) { return -1 }
+      return lk
+    }
+  }
+  -1
+}
+
+// The ref-list SLOT a generic-compare `==` runs over, or 0 for a rep that is not
+// slot-keyed. The `==` twin of `catListSlotOfBin`, split from the kind for the same reason.
+export function eqgListSlotOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const s = refListSlotOfExpr(e.binLeft, fnIx)
+    if s >= 0 { return s }
+  }
+  0
+}
+
 // The ref-list SLOT a `+` BinExpr concatenates over, or 0 for a rep that is not slot-keyed
 // (the frame's two ref slots read their heap indices off the rep code alone). Split from
 // `catListKindOfBin` rather than packed into its return value: the callers that need the
@@ -7825,6 +8102,11 @@ export function eqCoreKindOfBin(binIx: i32, fnIx: i32) {
       if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
       const lk = listOpKindOfBin(binIx, fnIx)
       if lk >= 0 { return lk }
+      // THE GENERIC LIST COMPARE, above the string/closure rungs for the same reason the
+      // three cores above it are: a list operand must be claimed by a list answer before a
+      // scalar ladder reads it. Its own home declines every shape `listOpKindOfBin` claims,
+      // so this rung can only ever add a rep that had no core at all.
+      if eqgListKindOfBin(binIx, fnIx) >= 0 { return 7 }
       if exprIsStrEq(binIx, fnIx) { return 5 }
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
         return 6
@@ -7869,10 +8151,30 @@ export function exprNulNicheKind(exprIx: i32, fnIx: i32): EqCmpKind {
   if exprNulClosure(exprIx, fnIx) { return "nulclosure" }
   if exprNullableList(exprIx, fnIx) { return "nullist" }
   if exprNulScalarListKind(exprIx, fnIx) == "nulstrlist" { return "nulstrlist" }
+  // THE GENERIC CORE'S NICHE, ON THE SECOND CHANNEL — and it is the arm whose absence is
+  // this file's own header written out as a defect. `eqCmpKindOfNulInner` names `nulglist`
+  // on the FIRST channel, so `f64[] | null == null` written out takes the guard and answers
+  // correctly. Inside a MONOMORPHIZED instance the banked type is `T | null` and that
+  // channel answers "" — so without this arm the compare fell to the plain path,
+  // `emitEqRecoverNarrowed` emitted `ref.as_non_null` on a genuinely null operand, and
+  // `eqN(xs, null)` at `T = Circle[]` was `vl check` rc 0 and a runtime TRAP.
+  //
+  // **NO CORPUS CELL REACHES IT**, which is the part worth recording: `d421c014` compares
+  // two NON-NULL `Circle[] | null` values through the same `eqN<T>`, so it runs correctly
+  // either way. The mixed pairing — one side null — is the input that separates them, and it
+  // took a hand-written accept fixture to produce. The same "a rep answered in only one of
+  // two ladders" failure D42 names, on the sixth niche.
+  const nsk = exprNulScalarListKind(exprIx, fnIx)
+  if isNulScalarListKind(nsk) {
+    // `nulstrlist` is claimed one line up (it has the string-list core); the other three
+    // distinct-backing niches are exactly the generic core's.
+    if nsk != "nulstrlist" { return "nulglist" }
+  }
   if exprNullableRefArray(exprIx, fnIx) {
     const slot = refListSlotOfExpr(exprIx, fnIx)
     if slot >= 0 && slot < rlElemKindTbl.length {
       if rlElemKindTbl[slot] == 4 { return "nulreflist" }
+      if eqgRepComparable(1, slot, 0) { return "nulglist" }
     }
   }
   ""
