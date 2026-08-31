@@ -40,8 +40,16 @@ DEFAULT_BASELINE = os.path.join(HERE, "silent-sweep", "distilled", "baseline.jso
 # no such cell until D741's witness (`d741_w0_base`, check rc 0 then `wasm trap: cast failure`)
 # added the first two. `regress.py`'s own SILENT tuple has always said `trap_loads`; the two
 # instruments now agree, which is the property that was missing rather than the spelling.
-SILENT = ("check-clean invalid wasm", "check-clean silently wrong",
-          "check-clean wrong evaluation", "trap_loads", "compiler trap")
+# AND THE SAME MISS AGAIN, ONE CLASS OVER. `gradecensus.py` writes a check-clean module that
+# LOADS AND PRINTS THE WRONG ANSWER as `runs but wrong value` — the worst outcome in the whole
+# taxonomy, and the two prose spellings above (`check-clean silently wrong`, `check-clean wrong
+# evaluation`) are DOC vocabulary that the grader never emits. `regress.py`'s tuple has said
+# `runs but wrong value` all along. The corpus held no such cell until D832's witness
+# (`d832_match_untested_else`: a `match` whose untested final arm runs the `Sq` body for a
+# `Tri` and prints 200), which is why it survived the D742 audit that fixed `trap_loads`.
+SILENT = ("check-clean invalid wasm", "runs but wrong value",
+          "check-clean silently wrong", "check-clean wrong evaluation",
+          "trap_loads", "compiler trap")
 
 # A refusal that CONCEDES the program is type-valid. These are the compiler naming its own
 # capability gaps: the type system permits the program and the backend cannot lower it.
