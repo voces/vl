@@ -16897,9 +16897,12 @@ Repro:
   - 189 of the check rejects are `cannot compare X with null` on the grid's `bare`
     (non-nullable) control rows — the checker correctly refusing a `null` in a
     non-nullable list, i.e. the grid's own assertion that it still does.
-  - 108 are `'mk' infers the nullable return type {r: i32} | null`, the checker's own
-    documented decline for an inferred nullable inline-shape return, and the reason
-    `ann2` x `ret` never reaches the emitter at all.
+  - 108 are `'mk' infers the nullable return type {r: i32} | null`, filed here as the
+    checker's own documented decline for an inferred nullable inline-shape return, and the
+    reason `ann2` x `ret` never reaches the emitter at all. **IT WAS NOT A DECLINE.** Its own
+    sentence conceded the program is type-valid, and the annotated twin always ran; it is
+    D887 and it was lifted 2026-08-31. The 108 is the frozen measurement of the grid that
+    produced it, kept as the record of that run, not a claim about today's compiler.
   - The `loud check reject` set is **513 on all six ablation compilers, cell for cell**,
     so none of it moved either.
 * Reachable neighbourhood: this is D51/D52's family read at a FIELD source — `fRetKind`'s

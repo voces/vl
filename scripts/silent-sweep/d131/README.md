@@ -88,8 +88,12 @@ row's own two running controls still holding. `claim=c0` moves 24 cells under A,
   376 on all four compilers, cell for cell, message for message.
 - **DOCUMENTED DECLINES / GRID CONTROLS — all 304 `loud_check_reject`**: 208 are
   `'mk' infers the nullable return type … — type-valid, but an inferred return of this shape
-  is not yet supported by codegen; annotate the return type`, the checker's own documented
-  decline (the same one D111's residue lists); 96 are `return type mismatch: expected Circle,
+  is not yet supported by codegen; annotate the return type`, filed here as the checker's own
+  documented decline (the same one D111's residue lists) — **and it was not a decline, it was
+  a capability refusal conceding type-validity in its own sentence. Lifted 2026-08-31 as D887**
+  for a nullable STRUCT inner, which is what these 208 are; the count above is the frozen
+  measurement of the grid that produced it, not a claim about today's compiler. A nullable MAP
+  or distinct-backing-list inner still floors — `scripts/capability-probes/inferred-nullable-container-return.vl`; 96 are `return type mismatch: expected Circle,
   got Circle | null`, the checker correctly refusing a nullable field read into a non-null
   annotated result — the grid's own assertion that it still does. 304 on all four compilers,
   cell for cell.
