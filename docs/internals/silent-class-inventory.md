@@ -19307,6 +19307,29 @@ Repro:
   invariance, checked stores, and value semantics. **This row is what makes that decision
   priced rather than open-ended.**
 
+* **RE-MEASURED 2026-08-31 ON `ca5fa21a`, AND THE PRICE REPRODUCES LARGER.** The invariance
+  compiler was rebuilt from scratch on today's master — after D661, D671/D672, D691, D701/D702/
+  D703, D426 and D622 — by the same edit the row describes (`assignableGo`'s `TyArray` arm,
+  holes exempt, `tySame` on the element) and re-graded. Distilled corpus: **617 behavioural
+  classes / 14,309 census cells `runs` -> NOT-RUNS** (was 518 / 14,105), 0 -> silent, and 102
+  further classes / 4,845 cells moving `loud emit reject` -> `loud check reject`. D411's grid:
+  **all 7 single-destination controls `runs` -> loud check reject, 0 cells gained** — unchanged.
+  D661's 211-cell grid, which did not exist when this row was written: **203 of 211 `runs` ->
+  loud check reject**. The refusal stands and is firmer than filed.
+
+* **AND THE CHEAP VERSION WAS SCOPED AND IS ALSO REFUSED — see D741.** The row asks for "an
+  element-type hole unified across destinations". Two things were established by building the
+  grid that asks where the line is. First, today's line is EXACTLY the K1/K2 storage partition
+  with 0 of 36 cells deviating, so `Shape[]` + `Other[]` over one literal RUNS while `tySame`
+  is false for the pair — no rule in the type system's vocabulary is co-extensive with it.
+  Second, the unification this row asks for ALREADY EXISTS for the empty literal
+  (`constrainEmptyD`, typecheck.vl:1537) and extending it to a non-empty one costs exactly 10
+  running cells, measured against its own block rather than estimated. The instrument that
+  would have to be built is not a ninth deferred constraint table either: all eight key on
+  `tyHasHole` -> `TyVar`, an un-annotated list element is the unrelated `-1` open slot for which
+  `tyHasHole` is FALSE and `substTyDeep` a no-op, and their pin is the generic call site, which
+  a two-destination binding in a non-generic function never reaches.
+
 * **THE ROW ITSELF IS A LIVE CLAUSE-1 CELL AND NO CORPUS CELL REACHES IT.** Both spellings —
   the call above and the plain `const b: Shape[] = a` — are `vl check` rc 0 and invalid wasm.
   The census has no two-annotated-container-types cell, so `goal-scoreboard.py` scores this
@@ -20168,6 +20191,237 @@ Repro (now runs, printing `1`):
         // The `string` global twin fails identically. Byte-identical on master.
 
 ---
+
+### D741 — the line the two-destination refusal draws is a REPRESENTATION line, not a type line, and the quadrant it ADMITS is not sound
+**check-clean, then loads then traps (`wasm trap: cast failure`) · found 2026-08-31 answering
+D661B's design question — "unify the element hole across destinations at check time" · the
+checker-side rule was scoped against a purpose-built grid and is REFUSED: the outcome today is
+EXACTLY the storage partition, 0 of 36 cells deviating, so every statement in the TYPE system's
+vocabulary reddens cells that RUN · 123-cell grid committed to `distilled/named/`**
+
+Repro (check rc 0, then a runtime trap):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Shape[] = xs
+      const b: Other[] = xs
+      b[0] = { t: 3 }
+      const e = a[0]
+      match e { Circle => print(100 + e.r), Sq => print(200 + e.s) }
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Error: error while executing at wasm backtrace: … vl!float
+    //   Caused by: wasm trap: cast failure
+    //   note: a value was not an instance of the type it was narrowed to.
+    // SHOULD PRINT 107 — `a`'s own annotation says element 0 is a `Shape`
+
+* **THE GRID THAT HAD TO BE BUILT, AND WHY D411'S COULD NOT ANSWER THIS.** D411's 103 cells
+  vary the two destinations' SPELLING (`bind`, `mapstore`, `callarg`, `ret`, `listlist`,
+  `assign`, `structfield`) and hold the element pair FIXED at `(Circle, Shape)` in every one
+  of them. So that grid says which syntactic deliveries the refusal reaches and it cannot say
+  ANYTHING about where the line is. `scripts/silent-sweep/d741/gen741.py` is the transpose:
+  the spelling is fixed at `const a: E[] = xs` and the ELEMENT PAIR varies over seven types —
+  `Circle`, an inline `{r: i32}`, `Circle | null`, `Shape = Circle | Sq`, `Animal` (a SECOND
+  declaration of the same members), `Other = Circle | Tri`, and `Circle | string`. `Animal`
+  and `Other` are the load-bearing pair: they separate "same type" from "same storage", which
+  is exactly what a type-level rule and a rep-level rule disagree about.
+
+* **THE ANSWER IS THE K1/K2 STORAGE PARTITION, EXACTLY, WITH ZERO DEVIATIONS.** Over the 36
+  cells whose two elements are both non-nullable, the outcome is a function of one bit — is
+  the element a plain struct row (`Circle`, `{r: i32}`) or a union box (`Shape`, `Animal`,
+  `Other`, `Circle | string`) — and nothing else:
+
+  | first \ second | Circle | inlineobj | Shape | Animal | Other | CircleStr |
+  |---|---|---|---|---|---|---|
+  | **Circle**    | runs | runs | EMIT | EMIT | EMIT | EMIT |
+  | **inlineobj** | runs | runs | EMIT | EMIT | EMIT | EMIT |
+  | **Shape**     | EMIT | EMIT | runs | runs | runs | runs |
+  | **Animal**    | EMIT | EMIT | runs | runs | runs | runs |
+  | **Other**     | EMIT | EMIT | runs | runs | runs | runs |
+  | **CircleStr** | EMIT | EMIT | runs | runs | runs | runs |
+
+  **`Shape[]` and `Other[]` bound to one literal RUNS**, and `Shape` and `Other` are different
+  types by every predicate the checker owns — different declarations, different member sets,
+  `tySame` false. **14 cells run with a differing element type.** So "a list literal has one
+  element type" is not the rule the compiler implements, and stating it would redden those 14.
+  `Circle | null` is the one element that refuses even as a SOLE destination (18 cells, its own
+  message — see the note at the end); it is excluded from the table above rather than smuggled
+  into either class.
+
+* **AND THE ADMITTED QUADRANT IS NOT SOUND — the repro above is in it.** Two DIFFERENT declared
+  unions over one un-annotated literal share a box, so the module validates and `vl check`
+  returns 0. A store through `Other[]` then puts a `Tri` — a value of no `Shape` arm — into the
+  list, and reading it back through `a` traps. The box TAG is faithful (`e is Sq` correctly
+  answers false, measured), so the failure is not a mis-read; it is that `match` over a union
+  compiles its final arm as the fall-through an exhaustive scrutinee justifies, and the value
+  is outside the union. Without the field read the same program takes the `Sq` arm for a `Tri`
+  and prints `200`, silently.
+
+* **THE BYTES, OFF `./node_modules/.bin/wasm-dis` (binaryen 130), AND THEY NAME THE ARM.** The
+  module is 382 bytes and every claim above is in it. `$3` is the union box, `(struct (field
+  i32) (field anyref))`; `$0`/`$1`/`$2` are Circle/Sq/Tri as three distinct struct types. The
+  literal builds `(struct.new $3 (i32.const 0) (struct.new $0 (i32.const 7)))` — box tag **0**
+  — and the store through `Other[]` builds `(struct.new $3 (i32.const 5) (struct.new $2
+  (i32.const 3)))` — box tag **5**. The tags are allocated per ARM TYPE across the module, not
+  per position within a union, which is exactly why `e is Sq` answers correctly and there is no
+  mis-read. The trap is in the read-back:
+
+      (if (i32.eq (struct.get $3 0 (local.get $3)) (i32.const 0))
+        (then … (ref.cast (ref $0) (struct.get $3 1 …)))     ;; Circle, tag-tested
+        (else … (ref.cast (ref $1) (struct.get $3 1 …))))    ;; Sq, NO tag test
+
+  `match`'s FINAL arm is compiled as the unconditional `else` with a bare `ref.cast`, because
+  exhaustiveness over `Shape` says a box that is not tag 0 must be an `Sq`. The value's tag is
+  5 and its payload is a `$2`, so the cast fails. The exhaustiveness the emitter is entitled to
+  assume is precisely what covariance has already broken.
+
+* **SEVEN ABLATIONS, AND THE UN-ANNOTATED LITERAL IS THE LAUNDERING DEVICE.** One ingredient
+  removed per cell, all committed as `d741_w*`:
+
+  | cell | ablation | outcome |
+  |---|---|---|
+  | `w0_base` | — | **trap** |
+  | `w1_annotated_src` | annotate the literal `Shape[]` | **loud check reject** — `cannot assign Shape[] to 'b' of type Other[]` |
+  | `w2_no_store` | drop the store | runs `107` |
+  | `w3_one_dest` | drop the second destination | runs `107` |
+  | `w4_same_union` | make both destinations `Shape[]` | runs `203`, correctly |
+  | `w5_no_narrow` | read `.length` instead of narrowing | runs `1` |
+  | `w6_params` | destinations are PARAMETERS, not bindings | **trap** |
+
+  `w1` is the whole mechanism in one line. Annotated, the two destinations are compared with
+  EACH OTHER and `Shape[] -> Other[]` fails. Un-annotated, each destination is compared only
+  with the literal's own eagerly-inferred `{r: i32}[]` — which is assignable to all seven
+  element types — so the destinations never meet. `w6` says the binding FORM is scenery.
+
+* **WHY A CHECKER-SIDE HOLE UNIFICATION IS REFUSED, PRICED THREE WAYS RATHER THAN ARGUED.**
+  D661B asked for "an element-type hole unified across destinations". Three candidate rules,
+  each measured on this grid:
+
+  1. **`tySame` on the element** (exact identity, holes exempt) — reddens the 14 differing-element
+     cells that run.
+  2. **Array INVARIANCE** (D661B's own build, RE-MEASURED on `ca5fa21a`, see D661B) — **617
+     behavioural classes / 14,309 census cells `runs` -> not-runs**, all 7 of D411's
+     single-destination controls, and 203 of D661's 211.
+  3. **The unification that already exists.** `constrainEmptyD` (typecheck.vl:1537,
+     `s.aElem = d.aElem`) pins an EMPTY literal's element from its first destination, and the
+     second destination is then checked against it — destination-driven unification, already
+     built, already positioned at the second destination, already worded in the language's own
+     terms. The `d741_hole_*` block is this grid run with `[]` in place of `[{r: 7}]`, so the
+     price of extending it to a non-empty literal is not an estimate: **exactly 10 cells that
+     run today stop running**, cell by cell —
+     `{Shape,Animal,Other,CircleStr}` crossed with each other minus the `tySame` pairs.
+
+  All three are refused on the gate's own criterion: a `runs` cell lost.
+
+* **THE THING THAT IS NOT AVAILABLE, STATED PLAINLY.** A rule co-extensive with today's
+  behaviour has to separate `Shape`+`Other` (runs) from `Circle`+`Shape` (refused), and the
+  only predicate that does is "is the element boxed" — `containerElemClassDiffers`' own
+  question, which is a REPRESENTATION fact. Moving it into the checker does not make the
+  refusal a design rule; it makes a codegen sentence harder to find, and it would also make the
+  cluster invisible to `goal-scoreboard.py`, which counts an emit reject but scores a
+  non-conceding check message as neither. **That is strictly worse than leaving it at emit**,
+  and it is the relabelling D661B exists to refuse. The real question is which of invariance, a
+  read-only view, value semantics or checked stores VL wants; D661B prices it and this row says
+  the cheap version does not exist.
+
+* **THE 46 CELLS THAT RUN ARE THE TRIPWIRE.** They are in `distilled/named/` whole, so the next
+  invariance, unification or copy-on-assign candidate has to say which of them it costs instead
+  of discovering it after the fact. Corpus `cmp` and the gate table for this change are in the
+  PR; no compiler source is touched by it.
+
+* **ONE MORE THING THE GRID FOUND, NOT CLAIMED HERE.** `Circle | null` as the SOLE destination
+  of an un-annotated struct-literal list is `emitProgram: a nullable-Circle list element has no
+  rep; use a non-null element type` — 18 cells — and the identical program with no other union
+  declared in the module RUNS. That is a clause-2 emit reject on its own axis, adjacent to the
+  emit-reject long tail rather than to this row, and it is left un-named deliberately.
+
+---
+
+### D742 — the EMPTY literal's element pin is first-destination-wins, so one destination pair gets two answers and one of the two orders is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-31 beside D741 · 8 cells in the `d741_hole_*` block
+plus the ordered pair · the mechanism is the SAME pin D661B asked to be built, which turns out
+to exist already for `[]` and to be UNSOUND in one direction · the non-empty twin of the very
+same program is LOUD in both orders**
+
+Repro (check rc 0, invalid module):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = []
+      const a: Circle[] = xs
+      const b: Shape[] = xs
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Error: failed to compile: … WebAssembly translation error:
+    //   Invalid input WebAssembly code … type mismatch: expected (ref $type), found (ref $type)
+    // Swap the two bindings and the SAME pair is a clean check reject:
+    //   [ERROR]: cannot assign Shape[] to 'a' of type Circle[]
+
+* **THE PIN, AND WHY IT IS ORDER-DEPENDENT.** An empty `[]` mints `mkArrayTy(-1)`
+  (`checkArrayLitNode`, typecheck.vl:33191) and `constrainEmptyD` fills that `-1` IN PLACE from
+  the first destination that claims it (typecheck.vl:1537, `s.aElem = d.aElem`, bumping
+  `tyMutEpoch`). There is no record that a pin happened and no second opinion: the binding now
+  simply IS a `Circle[]`, and the next destination is an ordinary covariant assignment, which
+  `Shape[]` passes. Reverse the order and the hole pins to `Shape`, `Circle[]` fails plain
+  assignability, and the program is refused with the sentence the row wants. **Same two
+  destinations, same types, one edit that moves no token except which line comes first.**
+
+* **THE FOUR-CELL TABLE THAT IS THE WHOLE ROW** — `d741_o1..o4`, one axis (empty vs non-empty)
+  crossed with one axis (which destination is written first):
+
+  | | `Circle[]` first | `Shape[]` first |
+  |---|---|---|
+  | `const xs = []` | **check-clean invalid wasm** | loud check reject |
+  | `const xs = [{ r: 7 }]` | loud emit reject | loud emit reject |
+
+  The non-empty row is D411's refusal and is order-INSENSITIVE, which D411 measured and said so
+  rather than asserting. The empty row is this defect. The two rows disagree in both columns,
+  which is the fact worth keeping: the compiler holds two different rules for one question and
+  neither knows about the other.
+
+* **EIGHT CELLS, NOT ONE, AND THE PARTITION IS THE SAME ONE D741 FOUND.** Every
+  `d741_hole_{Circle,inlineobj}__{Shape,Animal,Other,CircleStr}` cell is check-clean invalid
+  wasm: a K1 pin followed by a K2 destination. The mirror image
+  (`hole_{K2}__{K1}`) is a clean check reject, and `hole_{K2}__{K2}` is a check reject wherever
+  the two unions are not `tySame` — which is the over-strict half of the same first-wins pin,
+  and the 10 cells D741 prices as the cost of extending this rule to non-empty literals.
+
+* **THIS IS THE CLAUSE-1 RESIDUE THAT `runs` DOES NOT SEE.** Before this set the corpus graded
+  clause 1 at **0**; it has no two-annotated-destination cell, which is why D411's grid had to
+  be committed whole in the first place. With the set installed the scoreboard reads **clause 1
+  = 11** — these 8, D741's 2 traps, and the ordered pair's own cell. Both numbers were correct
+  about their population and only one of them was about VL.
+
+* **AND THE INSTRUMENT WAS UNDER-COUNTING.** `goal-scoreboard.py`'s clause-1 filter spelled the
+  trap-after-load class `"loads then traps"` — the DOC vocabulary
+  `check-filed-witnesses.py` matches in a status line — while `gradecensus.py` writes it as
+  `trap_loads`. The entry had therefore never matched a cell, and every trapping cell was
+  invisible to clause 1. No corpus cell had that class until D741's witness, so nothing could
+  have caught it earlier. Fixed here; `regress.py`'s own tuple has always said `trap_loads`, and
+  the two now agree.
+
+* **NOT FIXED HERE, AND WHAT FIXING IT WOULD COST.** The obvious repair — a pinned hole is
+  INVARIANT thereafter — needs a marker distinguishing "this array type came from a pin" from
+  "this array type was declared", which `constrainEmptyD` deliberately does not keep (the pin
+  erases its own trigger; see its header at typecheck.vl:1503). Without the marker the rule is
+  global array invariance, whose price is D661B's. The 8 cells do not run today and would not
+  run after, so this is a `check-clean invalid wasm -> loud check reject` close worth doing on
+  its own axis, and it does not move D741's 33.
 
 ### D731 — [CLOSED 2026-08-31] the CAPTURE's struct slot was an `ObjLit` peep-hole where every rung above it is a `letIs*` classifier
 **closed as `runs` · was `loud emit reject: emitProgram: ref valtype with no interned shape` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 2 corpus classes standing for 902 census cells (`a001365`, `b000009`) plus a five-line witness the corpus does not carry · 0 `runs` lost, 0 into any silent class, `tests/cases` 1985/2435 building — the IDENTICAL SET, and 2435/2435 emitted modules byte-identical to master**
