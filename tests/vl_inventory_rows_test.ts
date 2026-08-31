@@ -148,9 +148,11 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
   const bad: string[] = [];
   let total = 0;
 
+  const ids: Array<[string, string, string]> = [];
   for (const doc of DOCS) {
     for (const r of parseRows(await Deno.readTextFile(doc))) {
       total++;
+      ids.push([doc, r.id, `${doc}:${r.line}`]);
       const status = (r.status ?? "").toLowerCase();
       if (!phrases.some((p) => status.includes(p))) {
         bad.push(
@@ -166,6 +168,33 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
             `      got:  neither`,
         );
       }
+    }
+  }
+
+  // A DUPLICATE ROW ID IS INVISIBLE TO EVERY OTHER INSTRUMENT, and it reached master on
+  // 2026-08-30. Two agents working concurrently each filed a `D626`; both landed, and
+  // `check-filed-witnesses.py --strict` reported `192 graded · 192 as filed · 0 MOVED ·
+  // 0 not graded` — because a duplicate id is not an ungradeable row. Both rows graded
+  // fine INDIVIDUALLY. What breaks is everything that refers to a row BY ITS NUMBER:
+  // a brief, a CHANGELOG entry, a `named/` set, the next agent told to "read D626".
+  //
+  // PER DOCUMENT, not across both: the two inventories number independently and each has
+  // its own D1, D2, D3. A global check reds 14 rows that are correct, which is how this
+  // check was first written and what running it caught.
+  //
+  // Cheap and structural, so it belongs here rather than in the python.
+  const seen = new Map<string, string>();
+  for (const [doc, id, where] of ids) {
+    const prior = seen.get(`${doc}\u0000${id}`);
+    if (prior !== undefined) {
+      bad.push(
+        `${where}  ${id} — DUPLICATE row id, already filed at ${prior}\n` +
+          `      want: every \`### <ID>\` unique across both inventories\n` +
+          `      got:  ${id} twice. Renumber the later one; do NOT renumber the earlier, ` +
+          `other files cite it.`,
+      );
+    } else {
+      seen.set(`${doc}\u0000${id}`, where);
     }
   }
 
