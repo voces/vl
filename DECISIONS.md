@@ -1011,6 +1011,47 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
     but REFUSING a program on one is a false reject, so the `Writable` rule needs a
     per-value analysis this landing did not build.
 
+  **`Writable` BUILT 2026-08-31 (silent-class-inventory D821/D822), AND THE SURFACE IS
+  STILL NONE.** Both halves of A9 are now real. A covariant list assignment whose value
+  is WRITTEN THROUGH is a positioned CHECK reject naming the write; a read-only one takes
+  the converting copy. Nothing an author writes changed: no syntax, no migration, no
+  annotation. `goal-scoreboard.py` **22 -> 13** against the goal on the 7,271-cell corpus
+  (clause 1 **11 -> 4**), `runs` 4,316 -> 4,319, **0 `runs` lost, 0 cells into any silent
+  class**. Four things this half earns:
+
+  * **The per-value analysis the bullet above asked for is a NAME-BASED ALIAS CLOSURE
+    with a WHITELIST accounting pass, and it is three-valued.** 0 = nothing writes this
+    value, 1 = something does, 2 = it escapes through a form the closure does not model.
+    Only 1 refuses; 2 keeps the rep-scoped decline, i.e. master's behaviour. **A false
+    reject is the one outcome clause 2 rules out, so an unknown is never a refusal.**
+    Name-based is a sound over-approximation here — merging two same-named bindings only
+    ENLARGES the set — which is why it needs no scope stack, unlike D661's destination
+    scan where merging produced a wrong answer.
+
+  * **THE RULE IS NOT `assignable`'s COVARIANCE, AND THE GRID SAYS WHY.** A written-through
+    covariant assignment whose every declared handle demands the SAME element storage is
+    SOUND and runs today: the literal is built at the box and all the handles alias it, so
+    the store is visible through every one. `d741_w4_same_union` and `d741_w5_no_narrow`
+    are those programs. `Writable` therefore fires only where the value has to be stored
+    TWO ways — a boxed union element and a plain struct row — which is co-extensive with
+    "a converting copy is needed". Dropping that gate is array invariance in miniature: it
+    buys two clause-1 traps and costs those two running cells, measured, and is refused
+    (D824).
+
+  * **`Readable`'s SEVEN delivery forms were seven `let`s.** A module GLOBAL is an eighth:
+    its cell is `globalRefListSlot` and its initializer is lowered by the synthetic start
+    function, so D773's own read-only witness at MODULE scope was `vl check` rc 0 and an
+    invalid module while the function-scope original ran (D822). A const global's init is
+    a wasm constexpr and cannot carry the copy loop, but a global whose init reads another
+    global is non-constexpr by construction and always runs in the start function.
+
+  * **THE CLAUSE-1 WITNESS D661B FILED IS CLOSED BY THIS HALF.** That row's `poison(a)` —
+    a `Circle[]` passed to a `Shape[]` parameter whose body stores — was the live soundness
+    violation no corpus cell reached, and it is now refused at the call. The row's own
+    conclusion stands unchanged: for a written-through pair no lowering is correct, and the
+    rule belongs in the checker. What it could not price was a rule that says so without
+    also rejecting the read-only pass.
+
 
 ## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
 

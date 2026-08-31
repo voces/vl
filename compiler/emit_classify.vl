@@ -71,6 +71,7 @@ import {
   anyLitUnionUsed,
   canonRewroteNode,
   canonTyIxOf,
+  covarValueWriteState,
   eqCoreKindOfTyToken,
   fusedMapReadRecvIx,
   inferRetBearsNull,
@@ -31367,11 +31368,29 @@ export function rlSlotEverWritten(slot: i32): boolean {
 // into a `dstSlot` destination by an element-converting COPY? Widenable by rep, and
 // write-free on BOTH sides — a write through EITHER handle after the copy is what would
 // make the copy observable, so both are asked.
-export function rlWidenAllowed(srcSlot: i32, dstSlot: i32): boolean {
+//
+// `rootName` is the NAME the delivered value roots at (a binding, a parameter, a global),
+// or "" where it roots at no name. It is what lets the rep-scoped answer below be
+// SHARPENED to a per-value one (D821): `rlSlotEverWritten` is a statement about a REP, so
+// a write to an unrelated list of the same element row declines a program nothing writes
+// through (`d791_unrelated_write_blocks`). `covarValueWriteState` answers the same
+// question about the VALUE, and is consulted ONLY where the rep answer already said
+// "written" — so this rung is monotone: every delivery master widened still widens.
+export function rlWidenAllowed(
+  rootName: string,
+  srcSlot: i32,
+  dstSlot: i32,
+): boolean {
   if rlWidenVariantOf(srcSlot, dstSlot) < 0 { return false }
-  if rlSlotEverWritten(srcSlot) { return false }
-  if rlSlotEverWritten(dstSlot) { return false }
-  true
+  if !rlSlotEverWritten(srcSlot) {
+    if !rlSlotEverWritten(dstSlot) { return true }
+  }
+  // The rep says a list of one of these two rows is written somewhere. Only a DEFINITE
+  // "nothing writes this value" (0) overrides it — an unknown (2) keeps master's decline,
+  // because a copy taken on a guess is a silently wrong program and not merely an invalid
+  // one (D791's −D ablation: `d791_push_alias` prints 1 then 2 where aliasing requires
+  // 2 then 2).
+  covarValueWriteState(rootName) == 0
 }
 
 // The ref-list TABLE SLOT a ref-list `LetDecl` binds (stored in `localStructIdx` for a
@@ -31441,6 +31460,16 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
 //
 // NAME-SCOPED OVER THE WHOLE ARENA, on `letMapDestShape`'s and `letInfStrListByUse`'s
 // precedent. First match wins.
+// The NAME a `LetDecl` binds, or "" — the root the per-value write analysis (D821) is
+// seeded from at the two-destination site, where the delivered VALUE is the binding's own
+// un-annotated list literal and every declared destination is a passthrough from it.
+function letBoundName(letIx: i32): string {
+  if letIx < 0 || letIx >= P.nodes.length { return "" }
+  const d = P.nodes[letIx]
+  if d is LetDecl { return d.letName }
+  ""
+}
+
 export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
   const box = letRefListDestSlotK(letIx, fnIx, 2)
   // TWO DESTINATIONS OF DIFFERENT ELEMENT KINDS ARE A LOUD REJECT, NOT A SLOT PICK (D411).
@@ -31480,7 +31509,7 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
       // pinned binding takes its `letAnn*` early return at all three classify sites and
       // never reaches this rung at all, so leaving the pin declined is what routes the
       // program here — where it now widens instead of refusing.
-      if rlWidenAllowed(k1, box) { return k1 }
+      if rlWidenAllowed(letBoundName(letIx), k1, box) { return k1 }
       emitFailAt(
         "emitProgram: one un-annotated list literal is bound to TWO declared destinations " +
           "whose elements are stored differently (a union-box element list and a " +
