@@ -586,11 +586,29 @@ function cloParamTok(paramIx: i32) {
   // here (like map) — else a nulclosure param would key a slot-less `C` and mis-lower.
   // The soundness floor rejects a nulclosure-param value with a clear message.
   if k == "nulclosure" { return "" }
-  // A MAP param stays OUTSIDE the value-call ABI (only map RESULTS are wired — the closure
-  // result carries the map shape). `repSigTokOfKind("map")` yields a result token, so
-  // exclude it explicitly here — else a map param would key a slot-less `m` and mis-lower.
-  // The soundness floor rejects a map-param value with a clear message.
-  if k == "map" { return "" }
+  // A MAP param, keyed by its map SHAPE exactly as the map RESULT already is — the arm this
+  // ladder was missing, and the one `emitClosureValueCore`'s soundness floor was reporting as
+  // a capability gap ("a function value may not take a nullable or map parameter"). D701.
+  //
+  // WHAT MADE IT LOOK UNWIRED was the SLOT, not the token. The paragraph that stood here read
+  // `repSigTokOfKind("map")` as "a result token" and excluded the param position so a map
+  // param could not "key a slot-less `m` and mis-lower" — and that hazard is real, but it is
+  // the slot-less encoding that carries it, not the position: `repSigTokHasSlot("map")` has
+  // been true since the token was minted, so `m<shape>;` is what BOTH the encoders and every
+  // decoder (`emitSynthCloSig`'s `synthSigTokHasIdx` walk, `sigParamCoerceKind`,
+  // `sigKeyRetSlot`) already agree on. Slot-carrying is exactly what `struct`/`reflist`/
+  // `nulstruct` two arms up do, through the same `repSigSlotTokOfKind` home.
+  //
+  // AND THE BYTES ALREADY MATCHED. The `$fnsig` functype streams every param through
+  // `fbValtype(vtKindOfParam, paramStructIdxOf)`, and `paramStructIdxOf` → `annValtypeSlotOf`
+  // has carried the `map` → `mapAnnShape` pairing all along (its own header lists it beside
+  // the ref-list one). So the digit this mints IS the heap slot the callee's own functype
+  // declares, which is the interlock a `call_ref` through the interned sig has to pass.
+  //
+  // The direct spelling was the measurement: `function lamc(x: {[string]: i32}) { return x }`
+  // runs today, and `const lamc = (x: {[string]: i32}) => x` — the same lowering, one
+  // spelling over — was the reject. A map RESULT (`(n: i32) => c` over a map `c`) already ran.
+  if k == "map" { return repSigSlotTokOfKind(k, paramStructIdxOf(paramIx)) }
   // Every slot-free kind reads the shared canonical token table (emit_rep) — "" for the
   // kinds with no token character at all (`nulreflist`, `nulmap`, and the four
   // distinct-backing scalar-list niches), which keeps their signature un-interned so the
@@ -1047,6 +1065,54 @@ export function cloSigKeyExt(fe: i32) {
     const suf = cloRetKeySuffix(fe)
     if suf == "" { return "" }
     return key + suf
+  }
+  ""
+}
+
+// WHICH POSITION of `fe`'s signature has no `$fnsig` token — `"parameter \`k\` of type
+// \`f64[] | null\`"` or `"its result type"`, else "". The sentence
+// `emitClosureValueCore`'s floor needs so the reject NAMES what it refuses.
+//
+// A LIST OF KINDS IN A MESSAGE GOES STALE THE DAY A KIND IS WIRED, and this one had:
+// the floor read "a function value may not take a nullable or map parameter (or return
+// one)" while a `string | null` (`N`), an `S | null` (`n<slot>;`) and an `i32[] | null`
+// (`o`) param have all been in the ABI for releases — `closure-value-nullable-niche-param.vl`
+// runs all three — and D701 has now put a MAP param in too. The message was refusing three
+// things it had no quarrel with and one it no longer refuses at all.
+//
+// IT WALKS `cloSigKeyExt`'S OWN LADDER, in its order, so the two cannot disagree about
+// which position is the offender: params first (first-fail wins, as the key build's early
+// return does), then the result, and a void result is never the offender (`>v` is a key).
+// Anything that changes that ladder has to change this walk with it — the alternative is a
+// message that names a position the floor did not actually stop on.
+export function cloSigRejectWhat(fe: i32): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  if fe >= fRetVoid.length { return "" }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      if cloParamTok(params[pi]) == "" {
+        const p = P.nodes[params[pi]]
+        if p is Param {
+          // The DECLARED spelling, which for a lambda whose param the pin synthesized
+          // (`synthParamAnnots`) is the pinned nullable rather than the source's bare name —
+          // exactly the type the token table declined. "" only for a parameter with no
+          // annotation node at all, which `cloParamTok` reads as the i32 default and so
+          // never refuses; the guard is belt-and-braces.
+          const pn = tyNameOf(p.parType)
+          if pn != "" {
+            return "parameter `" + p.parName + "` of type `" + pn + "`"
+          }
+          return "parameter `" + p.parName + "`"
+        }
+      }
+      pi = pi + 1
+    }
+    if fRetVoid[fe] != 1 {
+      if cloRetKeySuffix(fe) == "" { return "its result type" }
+    }
   }
   ""
 }
@@ -33080,6 +33146,21 @@ function annParamKind(t: string) {
     const rs = rlSlotOfArrName(t)
     if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
   }
+  // A MAP param — `{[string]: V}`, the annotation-string twin of the `cloParamTok` map arm
+  // this producer's RESULT sibling (`annRetKind`) has carried since maps entered the result
+  // ABI. D701 wired the AST side; without this one the two producers DISAGREE the moment a
+  // map-param lambda is passed to an annotated higher-order callee — the lambda interns
+  // `m<shape>;` and the call site keys "" — which is the `function-value call arity has no
+  // interned signature` reject, not a mis-lowering (the floor sees an un-interned key).
+  //
+  // Same slot pair as the result arm, deliberately: `mvSlotOfMapName` here and `mapAnnShape`
+  // on the AST side are the pairing `annRetKind`/`cloRetKeySuffix` already agree through, so
+  // the digit — hence the interned functype — byte-matches whichever side minted it.
+  //
+  // `nameIsBareMap` for the reason the result arm states in full: a map-member UNION
+  // (`{[string]: f32} | {w: i32}`) also starts `{[` but is a union BOX, and must keep falling
+  // to the `isUName` arm above.
+  if nameIsBareMap(t) { return repSigSlotTokOfKind("map", mvSlotOfMapName(t)) }
   // A FUNCTION-type param (`(i32) => i32`) is the shared closure fat-pointer, matching
   // `cloParamTok`. Without this a higher-order closure param (a callback that itself takes
   // a callback) left the value's `$fnsig` un-interned: the call fell back to the all-i32
