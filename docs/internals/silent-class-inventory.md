@@ -20624,10 +20624,10 @@ Repro (now runs, printing `7`):
 
 ---
 
-### D734 — a struct FIELD typed as a union ARM has no field code, and the sentence saying so was an allow-list
-**loud emit reject · `emitProgram: a struct field typed as the union ARM `Circle` has no field rep — give the field the UNION's own type, or declare the arm as a plain struct` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`a007807`, `b000095`) · the MESSAGE is fixed in this change, the CAPABILITY is not**
+### D734 — [CLOSED 2026-08-31 by D761] a struct FIELD typed as a union ARM has no field code, and the sentence saying so was an allow-list
+**closed as `runs` — the capability half is D761 below · was `loud emit reject: emitProgram: a struct field typed as the union ARM `Circle` has no field rep …` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 2 corpus cells (`a007807`, `b000095`), 530 census cells · the MESSAGE was fixed when this row was filed; the CAPABILITY is closed now**
 
-Repro (still a loud emit reject):
+Repro (now runs, printing nothing — the program has an empty body; the point is that it BUILDS):
 
     type Sq = { s: i32 }
     type Circle = { r: i32 }
@@ -20635,9 +20635,11 @@ Repro (still a loud emit reject):
     type GW = { g: Circle }
     function rd() { }
     rd()
-    // vl check rc 0; vl run -> emitProgram: a struct field typed as the union ARM `Circle`
-    //   has no field rep — give the field the UNION's own type, or declare the arm as a
-    //   plain struct
+    // was: vl check rc 0; vl run -> emitProgram: a struct field typed as the union ARM
+    //   `Circle` has no field rep — give the field the UNION's own type, or declare the
+    //   arm as a plain struct
+    // Now: builds and runs. See D761 for what the field is coded as and why that row is
+    // the arm's own heap.
 
 * **IT FIRES ON THE DECLARATIONS ALONE.** There is no value anywhere in that program — the
   function body is empty. `collectS` codes every declared struct's fields before anything is
@@ -20651,11 +20653,14 @@ Repro (still a loud emit reject):
   `variantIndexOf`); or declare a plain-struct twin. The `arm | null` niche (`g: Circle | null`)
   refuses identically.
 
-* **WHAT IT WOULD TAKE.** The field wants `(ref null $uVarHeap[vi])`. Code 15's chokepoint
-  `sFieldTgtStructIdx` returns a STRUCT-table row and every consumer turns it into
-  `sHeapIdx[row]`, so this needs a code of its own plus a variant arm at the type section, the
-  construct, the read, struct equality and the optional chain — five ladders, each of whose
-  failure mode is invalid wasm. Not attempted here; filed rather than half-built.
+* **"WHAT IT WOULD TAKE" WAS WRONG, AND THE ERROR IS WORTH KEEPING.** This row said the field
+  wants `(ref null $uVarHeap[vi])`, that code 15's chokepoint `sFieldTgtStructIdx` answers in
+  the STRUCT namespace, and that closing it therefore needs "a code of its own plus a variant
+  arm at the type section, the construct, the read, struct equality and the optional chain —
+  five ladders". **Since D280 those two namespaces are not disjoint**: an arm and a declared
+  struct of its layout are ONE heap (`uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`). So the field
+  needs no code of its own — it needs the row whose heap the arm already shares, and where no
+  such row exists, one interned from the arm's own render. **Zero new ladders.** See D761.
 
 * **THE SENTENCE IS FIXED IN THIS CHANGE, and that half is not a substitute for the other.**
   All three sites that refuse an unrepresentable field type printed
@@ -20671,7 +20676,7 @@ Repro (still a loud emit reject):
 ---
 
 ### D735 — a `??` DEFAULT whose join shape has no declared row: `bare null needs a struct-typed context`
-**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus**
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus · MECHANISM CORRECTED 2026-08-31 and a candidate REFUSED at a measured price of 16 behavioural classes**
 
 Repro (still a loud emit reject):
 
@@ -20696,13 +20701,48 @@ Repro (still a loud emit reject):
   The join `{r: i32 | null}` is a THIRD shape with no row minted for it, and both sides of the
   `??` would have to build it.
 
-* **WHICH OF (a)/(b) IS OPEN.** Under clause 2 this is either a legal program the emitter owes
-  a lowering (mint the join shape's row and build both arms into it) or an illegal one the
-  CHECKER owed the diagnosis (`{r: null}` is not assignable to a `{r: i32}`-valued map, so the
-  join is the thing to refuse). That is a DESIGN ruling about what `??` joins, and it is not
-  one to take inside a defect fix.
+* **IT IS (a), AND THE (b) READING WAS TRIED AND REFUTED (2026-08-31).** This row filed the
+  choice as a design ruling. It is not one, and the measurement that settles it is two lines
+  of `vl check`:
 
-* **A THIRD `??` CELL IS A DIFFERENT MECHANISM AND NEEDS ITS OWN ROW ID.** `b022835` prints
+  * **The join is not `{r: i32 | null}`.** `const g0: i32 = (c)["k0"] ?? { r: null }` reports
+    ``cannot assign {r: i32} | {r: null} to 'g0' of type i32`` — the checker's answer is the
+    UNION of the two shapes, not a field-wise merge. (`a000093`'s fuller program, with
+    `type Circle = { r: i32 | null }` and its `sink` in place, reports the identical type: the
+    map's value comes from the `{r: 7}` literal, not from `Circle`.)
+  * **A union of two same-field-name-set shapes is not forbidden — the compiler BUILDS one.**
+    `{r: {c2:i32}} ?? {r: {s2:i32}}` types as `{r: {c2: i32}} | {r: {s2: i32}}` and RUNS
+    (corpus `d004020`; pinned as `tests/cases/maps/coalesce-join-same-fieldset-shapes.vl`).
+    Disassembled, the module holds exactly ONE shape — `(type $0 (struct (field (mut (ref
+    $3)))))` over the union box `$3` — and no second row for the default's spelling:
+    `structIndexOfObj` matches a literal by field-name SET, so both land on one row and the
+    differing field is widened in place.
+
+  **THE REFUSED CANDIDATE AND ITS PRICE.** A checker rule refusing a `??` join whose two
+  shapes share a field-name set with different field types — the anonymous twin of
+  `assignTags`' `union `U` cannot be discriminated`, which refuses exactly that shape for a
+  DECLARED union — was implemented, and `regress.py` refused it: **16 behavioural classes
+  `runs` → `loud check reject`** (`d004020`, `d004021`, `d004023`, `d004024`, `d004770`,
+  `d004771`, `d004773`, `d004774` and 8 more, all already carried whole in
+  `distilled/named/`, so the standing gate holds the price without a new set). A rule that
+  forbids a shape the compiler builds correctly is not the design speaking.
+
+* **SO WHAT IS ACTUALLY MISSING** is the merged ROW where the widened field has no registered
+  union to box into. `{r:i32}` and `{r:null}` want one row `{r: i32|null}`, and BOTH sides of
+  the `??` have to build into it — including the map's value, which is the
+  element-widening container copy `scripts/goal-scoreboard.py --sites` already counts as an
+  unreached capability literal. Declaring the merged shape (`type Circle = { r: i32 | null }`)
+  makes the program print today, which is the whole of the gap: the row exists, and the
+  literal and the read both reach it.
+
+* **A CHECKER-SIDE HALF WAS ALSO TRIED AND REVERTED as inert.** Making the `??` join merge two
+  same-field-name-set shapes field-wise (so the checker reports `{r: i32 | null}` — the type
+  the emitter's ONE-row rep actually has) is a correct improvement to the reported type and
+  closes NOTHING: the emitter reads the LITERAL's shape, not the join type, so both cells keep
+  the identical reject. Recorded so the next attempt starts at the row mint.
+
+* **A THIRD `??` CELL IS A DIFFERENT MECHANISM AND NEEDS ITS OWN ROW ID — it is D764, CLOSED.**
+  `b022835` prints
   ``emitProgram: `??` over this nullable value is not supported yet`` and is a generic identity
   over an empty list whose element type comes from a `sink` call — annotating the binding, or
   dropping the generic, makes it run. Grouping it here would be grouping by message. Witness:
@@ -20725,10 +20765,10 @@ Repro (still a loud emit reject):
 
 ---
 
-### D736 — a union ARM whose field is a value UNION renders STRUCTURALLY, and the ref-list layer cannot key the render
-**loud emit reject · `emitProgram: only i32[] arrays and struct/union element arrays are supported` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`a007743`, `a009962`) across two message spellings**
+### D736 — [CLOSED 2026-08-31 by D762 + D763] a union ARM whose field is a value UNION renders STRUCTURALLY, and the ref-list layer cannot key the render
+**closed as `runs` · was `loud emit reject: emitProgram: only i32[] arrays and struct/union element arrays are supported` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 2 corpus cells (`a007743`, `a009962`), 360 census cells · THE TWO CELLS ARE TWO MECHANISMS, not one: the list half is D762 and the map half D763, and neither fix moves the other's cell**
 
-Repro (still a loud emit reject):
+Repro (now runs, printing `0`):
 
     type Cir2 = { c2: i32 }
     type Sq2 = { s2: i32 }
@@ -20743,8 +20783,9 @@ Repro (still a loud emit reject):
       print(dd.length)
     }
     rd()
-    // vl check rc 0; vl run -> emitProgram: only i32[] arrays and struct/union element
-    //   arrays are supported
+    // was: vl check rc 0; vl run -> emitProgram: only i32[] arrays and struct/union
+    //   element arrays are supported
+    // Now: prints 0.
 
 * **THE NAME `checkArrName` REFUSES IS NOT `Circle[]`.** Instrumented at the reject, it is
   `{r:{c2:i32}|{s2:i32}}[]` — the fully structural render of the element, with the union field
@@ -20758,15 +20799,278 @@ Repro (still a loud emit reject):
   takes the arm-ness AND the value-union field AND the value call together. `for zz in dd` is
   SCENERY — the reject stands without it.
 
-* **`a009962` IS THE MAP DUAL, one message over.** `{[string]: Circle[]}` where `Circle` is an
+* **`a009962` IS NOT THE MAP DUAL — it is D763.** `{[string]: Circle[]}` where `Circle` is an
   arm with an `i32 | null` field prints `map value type has no interned slot`; with `r: i32`
-  it runs, and without the union it runs.
+  it runs, and without the union it runs. Also, and decisively: **declaring a plain-struct
+  twin of the arm makes it run while leaving D762's cell refusing**, and D762's own rung moved
+  it to CHECK-CLEAN INVALID WASM rather than to `runs` when it was first written leniently.
 
 * **WHY IT IS NOT D733.** D733 widened the two field-set resolvers so a recorded SHAPE can
   name a declared row. This render names no row under ANY leniency: it is a variant-table
   question asked through a struct-table bridge. The fix is either a variant field-set bridge
   in `nameIsRefArray` / `refArrElemKind` / `refArrElemName` — which must agree arm for arm —
   or making the arm render NOMINALLY at this producer, which is the canon-spelling seam.
+
+* **BOTH HALVES OF THAT SENTENCE SHIPPED, and they are the two mechanisms.** The bridge is
+  `nameIsRefArray` + `refArrElemName` (two sites, agreeing by construction) and the key it
+  answers is the arm's NOMINAL name, so the render and the annotated `Circle[]` spelling
+  intern ONE slot — D762. `a009962` is untouched by that and closes at a different seam
+  entirely: the arm needs a struct ROW to exist at all, and nothing minted one — D763.
+  **`a009962` was NOT "the map dual, one message over"; sharing a family here was the
+  message-grouping error this file's own header warns about**, one rung finer than usual —
+  the two cells are not even grouped by message (they carry two), they were grouped by the
+  *ingredient list* reading alike.
+
+### D761 — [CLOSED 2026-08-31] a union ARM has no struct row, and a field typed as one needs the row whose HEAP the arm already shares
+**closed as `runs` · was `loud emit reject: emitProgram: a struct field typed as the union ARM `Circle` has no field rep — give the field the UNION's own type, or declare the arm as a plain struct` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 2 corpus cells (`a007807`, `b000095`) standing for 530 census cells · +530 census cells to `runs`, 0 `runs` lost, 0 into any silent class, `tests/cases` unmoved at 1,880 PASS · closes D734**
+
+Repro (now runs, printing `7`):
+
+    type Sq = { s: i32 }
+    type Circle = { r: i32 }
+    type Shape = Circle | Sq
+    type GW = { g: Circle }
+    function rd() {
+      const c: Circle = { r: 7 }
+      const wv: GW = { g: c }
+      print((wv.g).r)
+    }
+    rd()
+    // was: vl check rc 0; vl run -> emitProgram: a struct field typed as the union ARM
+    //   `Circle` has no field rep …  (it fired on the DECLARATIONS alone — the same
+    //   program with an EMPTY body refused too)
+    // Now: prints 7.
+
+* **THE DIRECT SPELLING RAN, AND THAT IS THE WHOLE DIAGNOSIS.** With the arm's layout also
+  declared as a plain struct, `g: Dot` holding a `Circle` value builds, runs and reads back —
+  and so does the inline `g: {r: i32}`. Only the ARM'S OWN NAME refused. A lost
+  classification, not a missing rep.
+
+* **D734 SAID IT WOULD TAKE FIVE LADDERS. IT TOOK ZERO.** That row reasoned that the field
+  wants `(ref null $uVarHeap[vi])` while code 15's chokepoint `sFieldTgtStructIdx` answers in
+  the STRUCT namespace, so the fix needed "a code of its own plus a variant arm at the type
+  section, the construct, the read, struct equality and the optional chain". **Since D280 the
+  two namespaces are not disjoint**: `mAssignTypeIndices` writes
+  `uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`, so an arm with a layout twin IS a struct row's
+  heap. `armFieldStructRow` is `variantStructHeapTwinAt` — the exact function the mint reads,
+  and nothing else may be substituted for it, because any other same-layout row is a second
+  heap type and `expected (ref $type), found (ref $type)`.
+
+* **AND WHERE NO TWIN EXISTS, ONE IS INTERNED — DEMAND-DRIVEN.**
+  `collectNestedFieldShapes` interns the arm's OWN canonical render (`tyToEmitName` of
+  `uVarTyIx[vi]`) when, and only when, a declared field NAMES the arm. D282's
+  anonymous-claimant rung then merges the arm onto it, so the mint costs the module no heap
+  type: the struct row takes the counter position and the arm reuses it. A module with no
+  arm-typed field interns nothing and is byte-identical.
+
+* **NO ARENA HINT ON THAT INTERN, deliberately.** `internInlineShapeTy` banks its `tyIx` into
+  `sTyIx`, which would make `structIndexOfTy` answer this row for the ARM'S OWN declaration
+  node — i.e. turn off D34's decline ("an ARM value has no `sNames` row, so this struct-row
+  resolver declines and `exprVariantIndex` answers") module-wide. `internInlineShape` (hint
+  -1) is used instead and the row is found structurally, the same route an inline `{r: i32}`
+  field already takes.
+
+* **ONE FIELD-CODE SITE, THREE SPELLINGS.** The rung sits on `fieldCodeOfSpelling`'s tail
+  beside `nameIsStructDecl`, which is the one ladder `fieldTypeCode` (the node entry point),
+  `nameFieldCode` (the alias and generic-instance loops) and `internInlineShapeTy` all reach —
+  so the declared, inline-shape and generic-instance spellings of one field cannot answer
+  differently. The recorded element NAME is the twin row's, at both recorders
+  (`fieldRefElemName` and `internInlineShapeTy`), because every code-15 consumer resolves that
+  column through `structIndexByName`.
+
+* **DISASSEMBLY.** `wasm-dis` on the repro: `(type $1 (struct (field (mut i32))))` is BOTH
+  `Circle` and the field's target, `(type $2 (struct (field (mut (ref null $1)))))` is `GW`,
+  and the body is `struct.new $1 (i32.const 7)` / `struct.new $2 (local.get $0)` /
+  `struct.get $1 0 (ref.as_non_null (struct.get $2 0 …))`. One heap type for the arm and the
+  slot, and no second struct row minted.
+
+* **THE RESIDUE IS NAMED.** `variantStructHeapTwinAt`'s layout guard declines an arm with a
+  code 5 / 15 / 28 field (a ref list, a nested struct, the list's niche) rather than descending
+  into the referenced layer, so an arm with one of those fields keeps the loud reject. That is
+  narrower than the sentence it replaces and the sentence still says what to write instead.
+  Fixture: `tests/cases/unions/arm-typed-struct-field.vl`, four spellings (bare arm, the
+  `arm | null` niche, an arm with a LIST field, an arm with a nullable field).
+
+---
+
+### D762 — [CLOSED 2026-08-31] the ref-list element bridge reached an ARM only by EXACT NAME, and a value call's parameter type is a canon RENDER
+**closed as `runs` · was `loud emit reject: emitProgram: only i32[] arrays and struct/union element arrays are supported` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 1 corpus cell (`a007743`) standing for 288 census cells · +288 census cells to `runs`, 0 `runs` lost, 0 into any silent class · closes half of D736**
+
+Repro (now runs, printing `0`):
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Circle = { r: Shape2 }
+    function rd() {
+      const c: Circle[] = []
+      const lamc = (x: Circle[]) => x
+      const dd = lamc(c)
+      print(dd.length)
+    }
+    rd()
+    // was: vl check rc 0; vl run -> emitProgram: only i32[] arrays and struct/union
+    //   element arrays are supported
+    // Now: prints 0.
+
+* **THE NAME THE GATE REFUSED, INSTRUMENTED AT THE REJECT, IS `{r:{c2:i32}|{s2:i32}}[]`** —
+  the fully structural render of the element, the arm's value-union field expanded. It is
+  produced by canon at the value call's parameter type. `nameIsRefArray` bridges a SHAPE
+  spelling to the struct table but reaches the variant table only by EXACT NAME
+  (`variantIndexOf`), and an arm has no `sNames` row for the struct bridge, so nothing claimed
+  it and the literal fell to the i32-list default.
+
+* **THE KEY IS THE ARM'S NOMINAL NAME, NOT THE RENDER**, and that is the difference from the
+  inline-shape bridge one line above it. That one keys the SPELLING because its row is a
+  struct row and the two slots dedup at the heap layer; an arm has no struct row, and every
+  consumer that turns an element name back into a heap (`rlElemVariantHeap`, the construct's
+  `variantIndexOf`, the read) is nominal. Answering `Circle` interns the SAME slot the
+  annotated `Circle[]` spelling does.
+
+* **THE RUNG IS `variantIndexOfOwnRender`, NOT `variantIndexOfTypeName`, AND THE CORPUS PICKED
+  BETWEEN THEM.** The existing resolver is a FIELD-SET match under `shapeFieldTypeCompat`,
+  deliberately lenient because it exists so an ADOPTED literal's render can reach the arm the
+  adoption already chose. Wired here, it moved `a009962` from a loud reject to CHECK-CLEAN
+  INVALID WASM: `{r:null}` is field-set compatible with `Circle = {r: i32|null}` but is not
+  its render, so the backing was typed `(ref null $uVarHeap[Circle])` while the literal still
+  built its own anonymous row — `expected (ref null $type), found (ref $type)` in `mkcall`.
+  **A rung that can name a row the LITERAL will not build is the wrong rung for a container's
+  element type.** The exact render cannot do that: the only producer that spells an arm this
+  way is canon rendering the arm.
+
+* **TWO SITES, AGREEING BY CONSTRUCTION.** `nameIsRefArray` (the guard) and `refArrElemName`
+  (the key) both grow the rung, in the same position in their shared ladder — the guard must
+  not admit a name the key cannot resolve. `refArrElemKind` needs nothing: its base arm already
+  answers kind 1 for anything no union-name arm claims.
+
+* **DISASSEMBLY.** `wasm-dis` on the second fixture leg: `(type $2 …)` is `Circle` (its `r`
+  field a `(ref $4)` union box) and `(type $9 (array (mut (ref null $2))))` is the ref-list
+  backing — keyed on the ARM, which is exactly what the annotated spelling produces.
+  Fixture: `tests/cases/unions/arm-structural-render-list-element.vl`.
+
+---
+
+### D763 — [CLOSED 2026-08-31] an ARM reached only THROUGH A CONTAINER in a field's type still has no struct row, so the un-annotated carrier's render keys nothing
+**closed as `runs` · was `loud emit reject: emitProgram: map value type has no interned slot` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 1 corpus cell (`a009962`) standing for 72 census cells · +72 census cells to `runs`, 0 `runs` lost, 0 into any silent class · closes the other half of D736**
+
+Repro (now runs, printing `0`):
+
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Circle = { r: i32 | null }
+    type GW = { g: {[string]: Circle[]} }
+    function mkcall() {
+      const lv1 = [{ r: null }]
+      const cc = Map()
+      cc["k0"] = lv1
+      return cc
+    }
+    const wv: GW = { g: mkcall() }
+    const g0 = (wv.g)["k0"] ?? []
+    if g0.length > 0 {
+      const gp: Circle = g0[0]
+      if gp.r != null { print(7) } else { print(0) }
+    } else { print(0) }
+    // was: vl check rc 0; vl run -> emitProgram: map value type has no interned slot
+    // Now: prints 0.
+
+* **THE REFUSED NAME, INSTRUMENTED AT THE REJECT, IS `{r:null}[]`** — the un-annotated
+  carrier's own render, while the DECLARED side had interned `Circle[]`. The two never met.
+
+* **THE ABLATION IS THE FIX, AND IT IS NOT D762's.** Declaring a plain-struct twin of the arm
+  (`type Dot = { r: i32 | null }`) makes the program run on master, and so does deleting the
+  union — both because they give the arm's layout a struct ROW for the render to field-set
+  match. D762's rung is untouched by either and does not move this cell (measured: with D762
+  alone the cell still prints `map value type has no interned slot`). **Two cells, two
+  mechanisms, filed as one family in D736 because their ingredient lists read alike.**
+
+* **SO THE SHAPE INTERN PEELS THE FIELD TYPE'S COMPOSITION WRAPPERS** — grouping, a trailing
+  `| null`, `[]` runs and a MAP VALUE, to any depth — mirroring `internShapeDeep`'s own peel,
+  and mints the arm's render at the leaf. An arm reached through a container needs its row for
+  the same reason a bare one does; `{[string]: Circle[]}` is the map-and-list dual of
+  `g: Circle`. Depth-bounded (8), because a bug in one of the cuts must not be an unbounded
+  recursion in the compiler.
+
+* **IT COSTS NO HEAP TYPE**, by D761's argument: `variantStructHeapTwinAt`'s
+  anonymous-claimant rung merges the arm onto the row, so `mAssignTypeIndices` allocates once.
+  Fixture: `tests/cases/unions/arm-through-container-field-shape-row.vl`, hit and miss legs.
+
+---
+
+### D764 — [CLOSED 2026-08-31] an EMPTY list literal has no element for the mono pin to read, and the catch-all answered anyway
+**closed as `runs` · was `loud emit reject: emitProgram: `??` over this nullable value is not supported yet — narrow it first` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 1 corpus cell (`b022835`) standing for 6 census cells, plus TWO further messages no corpus cell carries · +6 census cells to `runs`, 0 `runs` lost, 0 into any silent class · this is the third `??` cell D735's row said needed its own id**
+
+Repro (now runs, printing `0`):
+
+    function idg<T>(x: T): T { return x }
+    function sink(_x: {[string]: {r: string}}[]) { }
+    function rd() {
+      const c = []
+      sink(c)
+      const dd = idg(c)
+      if dd.length > 0 {
+        const g1 = (dd[0])["k0"] ?? { r: "" }
+        print(g1.r)
+      } else { print(0) }
+    }
+    rd()
+    // was: vl check rc 0; vl run -> emitProgram: `??` over this nullable value is not
+    //   supported yet — narrow it first, e.g. `if v != null { … }`
+    // Now: prints 0.
+
+* **ONE WRONG PIN, THREE MESSAGES, AND THE MESSAGE WAS NEVER THE FAMILY.**
+  `monoArgTyName`'s un-annotated-local arm recurses into the binding's INIT, and an EMPTY `[]`
+  has no element for any arm there to read — so `exprArray`'s catch-all answers `i32[]`, which
+  is not `"i32"` and is therefore adopted, and `idg<T>(x: T): T` is cloned with an i32-LIST
+  parameter and result. Every read off the RESULT binding then refuses in its own words:
+  `dd[0].r` is `emitProgram: field access receiver is not a struct`, `dd[0].size` the same,
+  and only `dd[0][k] ?? d` produces the `??` sentence the corpus cell carries. Instrumented at
+  the reject, that sentence's own inputs were `exprNullableStruct = false` and
+  `structIndexOfExpr = -1` — a receiver that is not a map, one layer up from where the message
+  points.
+
+* **THE TYPE IS NOT MISSING, ONLY UNREADABLE FROM THE LITERAL.** The checker has already
+  pinned the binding from `sink(c)` and says so: `const bad: i32 = c` reports
+  ``cannot assign {[string]: {r: string}}[] to 'bad' of type i32``, and the identical probe on
+  `idg(c)`'s RESULT reports the identical type. The rung reads the ARGUMENT REFERENCE'S
+  recorded type — the one node carrying the destination pin at this point in the pass —
+  through `monoAnnPinName`, the same pin membership list the ANNOTATED arm three lines up
+  uses, so it claims no spelling an annotation could not claim.
+
+* **GATED ON THE EMPTY LITERAL, AND THE GATE IS THE ABLATION.** A NON-empty `[lv1]` runs on
+  master (its first element names the row); an annotated `const c: … = []` runs; dropping the
+  generic runs. The defect needs all three of un-annotated, EMPTY, and a generic between the
+  pin and the use. Anything wider would re-key working instances off a render instead of off
+  the syntax they are pinned by today.
+
+* **BOTH SCOPES AT ONCE**, which is D703's rule about this exact pair: the module-scope twin
+  gets the identical rung in the same position, so a spelling added to one is added to both.
+
+* **A CLAUSE-1 RESIDUE FOUND WHILE ABLATING, PRE-EXISTING AND IDENTICAL ON MASTER, STILL OPEN
+  (needs a row id).** Annotating the generic's RESULT rather than its argument is `vl check`
+  rc 0 and INVALID WASM, on master `dc85d1f3` and on this branch alike:
+
+        function idg<T>(x: T): T { return x }
+        function sink(_x: {[string]: {r: string}}[]) { }
+        function rd() {
+          const c = []
+          sink(c)
+          const dd: {[string]: {r: string}}[] = idg(c)
+          if dd.length > 0 {
+            const g1 = (dd[0])["k0"] ?? { r: "" }
+            print(g1.r)
+          } else { print(0) }
+        }
+        rd()
+        // vl check rc 0; vl run -> failed to compile: … type mismatch: expected
+        //   (ref $type), found (ref $type)   (at offset 515, in `rd`)
+
+  Fixture for the closed half: `tests/cases/generics/empty-list-literal-pin-through-generic.vl`,
+  three legs (the `??` spelling, the field-read spelling, and a filled list as the control).
+
+---
 
 ### D721 — [CLOSED 2026-08-31] there is ONE concat core and its element rule was a capability refusal wearing a soundness rule's clothes
 

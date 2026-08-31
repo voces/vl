@@ -15864,6 +15864,33 @@ function nestedStructNamesCompat(ta: string, elem: string): boolean {
   ka == ke
 }
 
+// THE ARM WHOSE OWN CANONICAL RENDER IS `name` (silent-class-inventory D762) — a strictly
+// tighter question than `variantIndexOfTypeName` below, and the two are not
+// interchangeable. That one is a FIELD-SET match under `shapeFieldTypeCompat`, which is
+// deliberately lenient (it exists so an ADOPTED literal's render can reach the arm the
+// adoption already chose); this one asks whether canon, rendering the arm itself, would
+// have produced exactly this string.
+//
+// THE DIFFERENCE IS MEASURED, NOT STYLISTIC. Wired into the ref-list element bridge, the
+// lenient resolver moved `a009962` from a loud emit reject to CHECK-CLEAN INVALID WASM:
+// its `{r:null}` literal render is field-set compatible with the arm `Circle = {r:i32|null}`
+// but is not the arm's render, so the backing was typed `(ref null $uVarHeap[Circle])` while
+// the literal still built its own anonymous row — `expected (ref null $type), found (ref
+// $type)` in `mkcall`. A rung that can name a row the LITERAL will not build is the wrong
+// rung for a container's element type; the exact render cannot do that, because the only
+// producer that spells an arm this way is canon rendering the arm.
+export function variantIndexOfOwnRender(name: string): i32 {
+  if !nameIsShapeOpen(name) { return -1 }
+  let vi = 0
+  while vi < uVariants.length {
+    if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
+      if tyToEmitName(uVarTyIx[vi]) == name { return vi }
+    }
+    vi = vi + 1
+  }
+  -1
+}
+
 function variantIndexOfTypeName(name: string) {
   const direct = variantIndexOf(name)
   if direct >= 0 { return direct }
@@ -18196,6 +18223,23 @@ export function nameIsRefArray(name: string) {
     if shapeElemDeclaredStructIdx(base) >= 0 { return true }
     // A `Cat[]` over a concrete union VARIANT — a ref list of bare variant structs.
     if variantIndexOf(base) >= 0 { return true }
+    // THE SAME ARM, REACHED BY ITS STRUCTURAL RENDER (silent-class-inventory D762). The
+    // rung above is a NOMINAL `uVariants` lookup, and the producers that hand this layer
+    // an element name do not all spell an arm nominally: a value-CALL's parameter type is
+    // rendered by canon, which expands the arm's own field types, so the arm
+    // `Circle = {r: Shape2}` arrives as `{r:{c2:i32}|{s2:i32}}` and neither the struct
+    // bridge above (an arm has no `sNames` row) nor the nominal rung claims it. The
+    // literal then falls to the i32-list default and `checkArrName` prints
+    // "only i32[] arrays and struct/union element arrays are supported" over a program
+    // whose element is already a `(ref $uVarHeap[Circle])`.
+    //
+    // `variantIndexOfTypeName` is the SAME two-rung resolver (`variantIndexOf`, then a
+    // field-set match under `shapeFieldTypeCompat`) that `objVariantName` and
+    // `mvValArmOfShape` already use to reach an arm from a render, so this opens no new
+    // vocabulary. `refArrElemName` answers the arm's NOMINAL name for the same base, which
+    // is what keeps every downstream nominal consumer (`rlElemVariantHeap`,
+    // `variantIndexOf` at the construct and the read) resolving it unchanged.
+    if variantIndexOfOwnRender(base) >= 0 { return true }
     let u = 0
     while u < unNames.length {
       if base == unNames[u] { return true }
@@ -18612,6 +18656,11 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // mutually-recursive reference ties in the shared rec group.
   const base = nonNulBaseOf(t)
   if nameIsStructDecl(base) { return 15 }
+  // A field typed as a union ARM (`g: Circle` / `g: Circle | null`) — the same code-15
+  // `(ref null $S)` slot, over the struct row whose heap the arm shares (D761). Placed on the
+  // ONE spelling ladder all three refusal sites reach, so the declared, the inline-shape and
+  // the generic-instance spellings of one field cannot answer differently.
+  if armFieldStructRow(base) >= 0 { return 15 }
   -1
 }
 
@@ -18768,6 +18817,12 @@ export function fieldRefElemName(tyIx: i32) {
       const base = nonNulBaseOf(ty.tyName)
       const idx = structIndexOfTypeName(base)
       if idx >= 0 { return sNames[idx] }
+      // AN ARM-TYPED FIELD RECORDS ITS CROSS-TABLE TWIN'S NAME, NOT THE ARM'S (D761). Every
+      // code-15 consumer resolves this column through `structIndexByName` / `sFieldTgtStructIdx`,
+      // which are struct-table lookups; `Circle` has no row there and would resolve to -1 (an
+      // `sHeapIdx[-1]` read). The twin row's name resolves, and its heap IS the arm's.
+      const arm = armFieldStructRow(base)
+      if arm >= 0 { return sNames[arm] }
       return base
     }
     // A NULLABLE REF-LIST field (code 28, `S[] | null`): its element is the ref-array element of the
@@ -18792,6 +18847,34 @@ export function fieldRefElemName(tyIx: i32) {
     return shapeFieldElemName(ty.tyName, code)
   }
   ""
+}
+
+// THE STRUCT-TABLE ROW A FIELD TYPED AS A UNION ARM STORES THROUGH
+// (silent-class-inventory D761), or -1 when the arm has none.
+//
+// A union ARM has no `sNames` row — `collectS` SKIPS a `type X = {…}` that is a union
+// member, "their fields ride the variant tables, not the struct table" — so `nameIsStructDecl`
+// declines an arm-typed field, the code-15 rung declines with it, and nothing else claims the
+// field. That refusal fires on the DECLARATIONS ALONE: `type Shape = Circle | Sq` beside
+// `type GW = { g: Circle }` is a loud emit reject with no value anywhere in the program.
+//
+// IT IS A LOST CLASSIFICATION, NOT A MISSING REP, AND THE DIRECT SPELLING PROVES IT. With the
+// arm's layout ALSO declared as a plain struct (`type Dot = { r: i32 }`), `g: Dot` holding a
+// `Circle` value builds, runs and reads back — and so does the inline `g: {r: i32}`. The field
+// wants `(ref null $uVarHeap[vi])`, and since **D280** that IS a struct row's heap whenever the
+// arm has a layout twin: `mAssignTypeIndices` writes `uVarHeap[vi] = sHeapIdx[uVarSTwinAt(vi)]`.
+// So the field needs no code of its own — it needs the row whose heap the arm already shares.
+//
+// `variantStructHeapTwinAt` IS THAT ROW AND NOTHING ELSE MAY BE SUBSTITUTED FOR IT. It is the
+// exact function the type-index mint reads, so a field coded 15 against it stores through the
+// heap the arm's own values are built at; any other same-layout row would be a second heap
+// type and `expected (ref $type), found (ref $type)`. Where it declines (an arm with a code
+// 5 / 15 / 28 field, which its layout guard refuses to descend into) this declines too and
+// master's loud reject stands — narrower than the sentence it replaces, and honest about it.
+export function armFieldStructRow(base: string): i32 {
+  const vi = variantIndexOf(base)
+  if vi < 0 { return -1 }
+  variantStructHeapTwinAt(vi)
 }
 
 // Validate an array type-name as a supported element type: `i32[]` (the value list),
@@ -20104,6 +20187,16 @@ export function refArrElemName(name: string) {
     if shapeElemDeclaredStructIdx(base) >= 0 { return base }
     // A `Cat[]` concrete-variant element list — the bare variant name is the table key.
     if variantIndexOf(base) >= 0 { return base }
+    // THE ARM REACHED BY ITS STRUCTURAL RENDER (D762) — `nameIsRefArray`'s new rung, and
+    // the two must agree or the guard admits a name this cannot key. The key is the arm's
+    // NOMINAL name, NOT the render: unlike the inline-shape bridge above (whose row is a
+    // struct row that dedups with the spelling's own slot at the heap layer), an arm has
+    // no struct row at all, and every consumer that turns an element name back into a heap
+    // (`rlElemVariantHeap`, `variantStructHeapTwinAt`, the construct's `variantIndexOf`) is
+    // nominal. Answering the render would intern a slot no consumer could resolve; answering
+    // `Circle` interns the SAME slot the annotated `Circle[]` spelling does.
+    const rvi = variantIndexOfOwnRender(base)
+    if rvi >= 0 { return uVariants[rvi] }
     // A NESTED ref array (`Cell[]` as the element of `Cell[][]`): the base is itself a ref array
     // — the inner list's name keys its slot. Recurses to the leaf struct/union/closure array.
     if nameIsRefArray(base) { return base }
@@ -22261,6 +22354,15 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
           fc = 15
           ftxt = sNames[iidx]
         }
+      }
+      // THE ARM-TYPED FIELD'S ELEMENT NAME, the interner's copy of `fieldRefElemName`'s rung
+      // (D761). `nameFieldCodeTy` already answered 15 for `{g: Circle}`, so the nested-shape
+      // arm above never runs and `ftxt` would stay the ARM's name — a spelling
+      // `structIndexByName` cannot resolve. Recorded as the cross-table twin's name, exactly
+      // as the declared-struct recorder does, so the two spellings of one field agree.
+      if fc == 15 {
+        const armRow = armFieldStructRow(nonNulBaseOf(ftxt))
+        if armRow >= 0 { ftxt = sNames[armRow] }
       }
       if fc < 0 { ok = false }
       names.push(rawNames[fi])
