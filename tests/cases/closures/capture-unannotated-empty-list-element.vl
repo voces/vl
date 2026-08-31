@@ -1,0 +1,140 @@
+// @run
+// @log 0
+// @log 0
+// @log 0
+// @log 0
+// @log 0
+// @log 0
+// @log 0
+// @log 7
+// @log 0
+// D613: an un-annotated EMPTY `[]` local CAPTURED by a nested function had its env-struct
+// FIELD typed before anything pinned the literal's element row, so the field took the
+// i32-list default while the enclosing frame's own local took the real ref-list wrapper.
+// `vl check` rc 0 and the engine refused the module:
+// `type mismatch: expected (ref $type), found (ref $type)` — the two wrappers print under
+// the same elided name, and `wasm-dis` says which they are: the env struct's field moved
+// from `(ref $i32ListWrapper)` to `(ref $CircleListWrapper)` and NOTHING else in the module
+// changed.
+//
+// IT IS AN ORDERING FACT, NOT A REP FACT. The element type is irrelevant — an f64-backed
+// literal union (L1), an i32-backed one (L2) and a plain `f64` field (L3) all failed
+// identically, and so did `string` (L4). What decides is WHEN: `emitTypeSection` mints one
+// env struct per capturing lifted function and types each field through `captureValKind`,
+// which classifies an un-annotated binding from its INITIALIZER — and an empty literal has
+// no element to classify (`arrLitIsRef` declines a literal with no elements BY
+// CONSTRUCTION). The annotation that would have answered is synthesized by
+// `synthEmptyListAnn`, which until this change ran only from `collectLocals`, i.e. during
+// the CODE section — after the type section had already committed the field.
+//
+// THE FIX IS `synthGlobalEmptyListAnns`' ARGUMENT ONE STORAGE CLASS OVER, and that header
+// states it for the global case in the same words: the section that READS the annotation is
+// emitted before the pass that WRITES it, so the write has to move ahead of the section.
+// `synthCaptureEmptyListAnns` runs the identical synthesis over exactly the bindings the
+// type section types — every capturing frame, every capture name, resolved through the very
+// function (`parentBindingOf`) the env field is typed through. It is idempotent, so
+// `collectLocals`' own later call declines and the LOCAL's classification is untouched:
+// all 1,996 corpus modules that build at all build byte-IDENTICAL across the change.
+//
+// L6 IS THE CONTROL AND IT RAN BEFORE THIS CHANGE. Hoist the `sink` call out of the nested
+// function and there is no env struct at all, so nothing was ever typed early. That is the
+// ONE ablation of the filed row — remove the capture and the defect goes.
+//
+// L7 IS THE SECOND RUNG AND IT IS NOT AN EMPTY LIST. `synthNullableAnn` is
+// `synthEmptyListAnn`'s sibling for a binding whose initializer is already nullable
+// (`const v = m["z"]`), and it was late for the identical reason: the env field for that
+// capture was typed `i32` where the value is the union box. It scores ZERO on the distilled
+// corpus — the corpus has no cell at this coordinate — and it is load-bearing anyway, which
+// is why it is pinned here rather than measured away.
+//
+// Nested function names are distinct across the file on purpose: capture analysis is
+// name-keyed module-wide.
+
+type F = 1.5 | 2.5
+type Circle = { r: F }
+type K = 1 | 2
+type Kb = { k: K }
+type Pt = { x: f64 }
+type Named = { s: string }
+
+function sinkCircle(x: Circle[]) { print(x.length) }
+function sinkKb(x: Kb[]) { print(x.length) }
+function sinkPt(x: Pt[]) { print(x.length) }
+function sinkNamed(x: Named[]) { print(x.length) }
+
+// L1 — the filed repro's element: an f64-backed literal union field.
+function outer1() {
+  const c = []
+  function inner1() { sinkCircle(c) }
+  inner1()
+}
+outer1()
+
+// L2 — an i32-backed literal union field. Same failure, same fix.
+function outer2() {
+  const c2 = []
+  function inner2() { sinkKb(c2) }
+  inner2()
+}
+outer2()
+
+// L3 — a plain `f64` field, no literal union anywhere.
+function outer3() {
+  const c3 = []
+  function inner3() { sinkPt(c3) }
+  inner3()
+}
+outer3()
+
+// L4 — a `string` field, a different element backing again.
+function outer4() {
+  const c4 = []
+  function inner4() { sinkNamed(c4) }
+  inner4()
+}
+outer4()
+
+// L5 — TWO frames deep: the capture is transitive, and the env field of each intermediate
+// frame is typed from the same enclosing binding.
+function outer5() {
+  const c5 = []
+  function mid5() {
+    function inner5() { sinkCircle(c5) }
+    inner5()
+  }
+  mid5()
+}
+outer5()
+
+// L5b — a LAMBDA capture rather than a named nested function.
+function outer5b() {
+  const c5b = []
+  const lam5b = () => {
+    sinkCircle(c5b)
+  }
+  lam5b()
+}
+outer5b()
+
+// L6 — THE CONTROL: the same binding with the call hoisted out of the closure. No capture,
+// no env struct, and this ran before the change. It must keep running.
+function outer6() {
+  const c6 = []
+  sinkCircle(c6)
+}
+outer6()
+
+// L7 — the second rung: an un-annotated NULLABLE capture, whose env field was typed `i32`
+// where the value is the union box.
+function outer7() {
+  const m7: {[string]: i64} = Map()
+  m7["k"] = 7
+  const hit = m7["k"]
+  const miss = m7["z"]
+  function inner7() {
+    if hit is i64 { print(hit) } else { print(0) }
+    if miss is i64 { print(miss) } else { print(0) }
+  }
+  inner7()
+}
+outer7()
