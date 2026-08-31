@@ -198,6 +198,9 @@ import {
   aUsed,
   annRlNul,
   annRlSlot,
+  anonLeafFamRow,
+  anonLeafJoined,
+  anonLeafSupersede,
   armPreludeBlocks,
   ba8TypeIdx,
   ba8Used,
@@ -373,6 +376,7 @@ import {
   anonFieldCode,
   anonFieldElemKeyI32,
   anonFieldElemName,
+  anonLeafServingRow,
   armLayoutContested,
   arrElemIsClosureTy,
   arrElemNominalOfTy,
@@ -6874,19 +6878,212 @@ function collectAnonShapes() {
   // RUNG N (D391) — the POLYMORPHIC nested rows are minted FIRST, before any owner row
   // exists, so the owner scan below can tell the owners apart. See `anonNestPolyPremint`.
   anonNestPolyPremint(nestOwner)
+  // D833 — WHICH LITERALS A `??` JOINS INTO ONE VALUE, and which ROW each such join was already
+  // claimed by. Marked here: after the premint (whose owners are variant-claimed nested literals
+  // this shape never reaches, so leaving the rung inert there keeps it byte-identical) and
+  // before the mint loop, so the row column is a snapshot the loop's own appends cannot move.
+  anonLeafJoinedMark()
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
     if an is ObjLit {
+      // D833 — A ROW THAT CLAIMS THIS LITERAL BUT IS NARROWER THAN ITS `??` JOIN NEEDS is not a
+      // reason to skip the mint, and where the merged row ALREADY EXISTS the map delivering the
+      // literal has to be redirected onto it. `anonLeafMergeField` is the whole of both and
+      // answers "" for every literal outside that shape, so the second disjunct is inert
+      // everywhere else. The claiming row is read BEFORE the mint, because the mint appends a
+      // row and the scan's answer moves with it.
+      const narrowSi = structIndexOfObj(ai)
+      const mf = anonLeafMergeField(ai, narrowSi)
       if (
-        structIndexOfObj(ai) < 0 &&
+        (narrowSi < 0 || mf != "") &&
         (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
       ) {
         anonMintRowFor(ai)
+        if mf != "" { anonLeafRecordSupersede(narrowSi, sNames.length - 1) }
       }
     }
     ai = ai + 1
   }
+  0
+}
+
+// D833 — MARK EVERY OBJECT LITERAL A `??` JOINS INTO ONE VALUE, and record the row its join was
+// already claimed by.
+//
+// `L ?? D`: `D` is one such literal, and so is every literal that flows into whatever `L` reads.
+// ONE READER is recognised and the others were BUILT AND MEASURED OUT rather than skipped: a MAP
+// or list INDEX over an identifier (`(c)["k0"]` — the literals stored at `c[…] = { … }`). A left
+// operand this cannot read yields the DEFAULT alone; the rungs below then need two disagreeing
+// atoms among literals no row claims, which is D804's own population, so an unrecognised reader
+// costs nothing and claims nothing.
+//
+// A BARE IDENTIFIER (`let a: {r:i32} | null = {r:7}` … `a ?? {r: null}`) was implemented here
+// first and closes NOTHING: that literal is delivered through the local's own CELL, whose struct
+// index comes from the binding's annotation and not through the map value slot this fix
+// supersedes, so it grades identically with the reader present or absent. It was removed rather
+// than left in — a wider join population is the risky direction, and a member no rung then uses
+// is exactly the widening `d841_hazard_declared_dest` punishes.
+function anonLeafJoinedMark() {
+  while anonLeafJoined.length < P.nodes.length {
+    anonLeafJoined.push(0)
+    anonLeafFamRow.push(0 - 1)
+  }
+  let qi = 0
+  while qi < P.nodes.length {
+    const qn = P.nodes[qi]
+    if qn is BinExpr {
+      if qn.binOp == "??" {
+        const d = unwrapParen(qn.binRight)
+        if d >= 0 {
+          const dn = P.nodes[d]
+          if dn is ObjLit {
+            const mem: i32[] = []
+            mem.push(d)
+            anonLeafJoinSources(unwrapParen(qn.binLeft), mem)
+            // THE FAMILY'S ROW is the one its members already matched — the row this join will
+            // have to supersede. Taken from the first member that has one, because a `??`'s
+            // operands are ONE value and cannot be sitting on two.
+            let famRow = 0 - 1
+            let mi = 0
+            while mi < mem.length {
+              if famRow < 0 { famRow = structIndexOfObj(mem[mi]) }
+              mi = mi + 1
+            }
+            let mj = 0
+            while mj < mem.length {
+              const m = mem[mj]
+              if m >= 0 && m < anonLeafJoined.length {
+                anonLeafJoined[m] = 1
+                if anonLeafFamRow[m] < 0 { anonLeafFamRow[m] = famRow }
+              }
+              mj = mj + 1
+            }
+          }
+        }
+      }
+    }
+    qi = qi + 1
+  }
+  0
+}
+
+// The object literals that reach a `??`'s LEFT operand — the other half of the one value.
+// Appended to `mem`; a reader this does not recognise appends nothing.
+function anonLeafJoinSources(lhs: i32, mem: i32[]) {
+  if lhs < 0 { return 0 }
+  const ln = P.nodes[lhs]
+  if ln is Index {
+    const base = unwrapParen(ln.idxArr)
+    if base >= 0 {
+      const bn = P.nodes[base]
+      if bn is Ident {
+        let ai = 0
+        while ai < P.nodes.length {
+          const an = P.nodes[ai]
+          if an is BinExpr {
+            if an.binOp == "=" {
+              anonLeafJoinStore(an.binLeft, an.binRight, bn.identName, mem)
+            }
+          }
+          ai = ai + 1
+        }
+      }
+    }
+  }
+  0
+}
+
+// One `lhs = rhs` statement: append `rhs` to `mem` when it is an object literal stored into
+// `name[…]`. Split out so the container scan above reads as one question.
+function anonLeafJoinStore(lhs: i32, rhs: i32, name: string, mem: i32[]) {
+  const tgt = unwrapParen(lhs)
+  if tgt < 0 { return 0 }
+  const tn = P.nodes[tgt]
+  if tn is Index {
+    const tb = unwrapParen(tn.idxArr)
+    if tb >= 0 {
+      const tbn = P.nodes[tb]
+      if tbn is Ident {
+        if tbn.identName == name {
+          const rv = unwrapParen(rhs)
+          if rv >= 0 {
+            const rn = P.nodes[rv]
+            if rn is ObjLit {
+              let seen = false
+              let i = 0
+              while i < mem.length {
+                if mem[i] == rv { seen = true }
+                i = i + 1
+              }
+              if !seen { mem.push(rv) }
+            }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// D833 — IS LITERAL `n` ONE OF A `??`'s JOINED VALUES? The O(1) read of the mark pass's answer.
+function anonLeafInJoin(n: i32): boolean {
+  if n < 0 { return false }
+  if n >= anonLeafJoined.length { return false }
+  anonLeafJoined[n] == 1
+}
+
+// D833 — THE ROW `n`'s `??` FAMILY was already claimed by, or -1. See `anonLeafFamRow`.
+function anonLeafFamRowOf(n: i32): i32 {
+  if n < 0 { return 0 - 1 }
+  if n >= anonLeafFamRow.length { return 0 - 1 }
+  anonLeafFamRow[n]
+}
+
+// D833 — THE FIELD at which the row `narrowSi` already claiming `ow` is NARROWER than the `??`
+// join `ow` belongs to, or "" when there is no such field. This is the whole of the new mint
+// gate AND of the supersede's trigger: the literal matched a row, that row's leaf is not a box
+// over the join's atoms, and D804's rung therefore has a merged row to reach that the
+// `structIndexOfObj(ow) >= 0` skip was hiding.
+//
+// ASKED ONLY OF A CLAIMED LITERAL. An unclaimed one reaches `anonMintRowFor` on the gate's first
+// disjunct exactly as it always did, so nothing here can change what that literal mints.
+function anonLeafMergeField(ow: i32, narrowSi: i32): string {
+  if narrowSi < 0 { return "" }
+  if !anonLeafInJoin(ow) { return "" }
+  const o = P.nodes[ow]
+  if o is ObjLit {
+    let i = 0
+    while i < o.objFields.length {
+      const f = P.nodes[o.objFields[i]]
+      if f is FieldInit {
+        if anonNestPolyUnionName(ow, f.fiName, unwrapParen(f.fiValue)) == "" {
+          const set = anonLeafPolyUnionSetOpen(ow, f.fiName, f.fiValue)
+          if set != "" {
+            // THE MERGED ROW MAY ALREADY EXIST — a second `??` family over the same field set,
+            // or the DECLARED spelling of the shape. Then there is nothing to mint and the only
+            // thing owed is the redirect.
+            const serv = anonLeafServingRow(ow, f.fiName, set)
+            if serv >= 0 {
+              anonLeafRecordSupersede(narrowSi, serv)
+              return ""
+            }
+            return f.fiName
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// D833 — ROW `mergedSi` SUPERSEDES `narrowSi` AS A MAP'S VALUE. See `anonLeafSupersede`.
+function anonLeafRecordSupersede(narrowSi: i32, mergedSi: i32) {
+  if narrowSi < 0 || mergedSi < 0 { return 0 }
+  if narrowSi == mergedSi { return 0 }
+  while anonLeafSupersede.length <= narrowSi { anonLeafSupersede.push(0 - 1) }
+  anonLeafSupersede[narrowSi] = mergedSi
   0
 }
 
@@ -7238,10 +7435,29 @@ function anonLeafOwnersJoined(ow: i32, fname: string, owAtom: string): boolean {
 // claim), every field value NAMEABLE as an atom, at least two DISTINCT atoms, and the family
 // JOINED by a `??`. Where any fails this answers "" and the mint is byte-identical.
 function anonLeafPolyUnionSet(ow: i32, fname: string, val: i32): string {
+  // D833 — A LITERAL A ROW ALREADY CLAIMS ASKS THE QUESTION TOO, when a `??` names it. Before
+  // D833 this rung ended here: "a sibling a DECLARED row already claims never lands here — and
+  // if one did, this literal would have matched that row too and no mint would be running."
+  // Exactly true, and exactly the defect — an unused three-line `type R = {r: i32}` makes BOTH
+  // operands match it, so nothing mints. The gate still ends the rung for a literal the JOIN
+  // does not name: a same-fieldset literal with a destination of its own keeps its row.
+  if structIndexOfObj(ow) >= 0 && !anonLeafInJoin(ow) { return "" }
+  const set = anonLeafPolyUnionSetOpen(ow, fname, val)
+  if set == "" { return "" }
+  // A row that ALREADY holds this family — the declared spelling of the shape, or the row a
+  // sibling family minted. Nothing to mint; `anonLeafMergeField` records the redirect.
+  if anonLeafServingRow(ow, fname, set) >= 0 { return "" }
+  set
+}
+
+// The MERGED MEMBER SET itself, with no question asked about who already holds it — the half
+// `anonLeafMergeField` needs before it can look for a holder, and the half the caller above
+// needs after. See `anonLeafPolyUnionSet` for the gates.
+function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
   const owAtom = anonLeafAtomName(val)
   if owAtom == "" { return "" }
   if objVariantName(ow) != "" { return "" }
-  if structIndexOfObj(ow) >= 0 { return "" }
+  const owFam = anonLeafFamRowOf(ow)
   const atoms: string[] = []
   atoms.push(owAtom)
   let qi = 0
@@ -7250,18 +7466,28 @@ function anonLeafPolyUnionSet(ow: i32, fname: string, val: i32): string {
       const qn = P.nodes[qi]
       if qn is ObjLit {
         if anonObjFieldSetEq(qi, ow) {
-          // A sibling a DECLARED row already claims never lands here — and if one did, this
-          // literal would have matched that row too and no mint would be running.
-          if structIndexOfObj(qi) < 0 && objVariantName(qi) == "" {
-            const qa = anonLeafAtomName(objFieldVal(qi, fname))
-            if qa == "" { return "" }
-            let seen = false
-            let ai2 = 0
-            while ai2 < atoms.length {
-              if atoms[ai2] == qa { seen = true }
-              ai2 = ai2 + 1
+          // A sibling a row already claims contributes its atom ONLY when a `??` names it AND
+          // its join was claimed by the SAME row as this one's. Two operands of a `??` are one
+          // value, so a row holding one must hold both — and two `??` families over one field
+          // set share a row exactly when they share the row they are superseding, which is what
+          // keeps `{f: boolean}`'s map and `{f: K0}`'s map from being merged into each other.
+          // Read as a mark and not as "is it claimed NOW", so the set cannot drift while this
+          // loop's own mints append rows.
+          if (
+            structIndexOfObj(qi) < 0 ||
+            (anonLeafInJoin(qi) && owFam >= 0 && anonLeafFamRowOf(qi) == owFam)
+          ) {
+            if objVariantName(qi) == "" {
+              const qa = anonLeafAtomName(objFieldVal(qi, fname))
+              if qa == "" { return "" }
+              let seen = false
+              let ai2 = 0
+              while ai2 < atoms.length {
+                if atoms[ai2] == qa { seen = true }
+                ai2 = ai2 + 1
+              }
+              if !seen { atoms.push(qa) }
             }
-            if !seen { atoms.push(qa) }
           }
         }
       }
@@ -7892,6 +8118,12 @@ export function collectS(stmts: i32[]) {
   // The per-program literal-resolution memo keys node indices against THIS table —
   // both are program-scoped, so it resets with the table.
   sioMemoReset()
+  // D833's three columns are keyed against THIS program's tree and THIS program's row table, so
+  // a stale entry would hand the next program's map a row from this one. Reset beside the memo,
+  // for the same reason and at the same moment.
+  anonLeafJoined = []
+  anonLeafFamRow = []
+  anonLeafSupersede = []
   // The struct-row NAME index keys THIS table's spellings — reset it with the table, or
   // the next program's rows answer with this one's names (see its header). MEASURED, not
   // defensive: without this line the shared-instance wasm harness fails 438 of 1,939.
