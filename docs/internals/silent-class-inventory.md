@@ -17729,6 +17729,58 @@ Repro (five lines; every one of them is load-bearing, see the ablation):
   beside the four programs D280 and D281 left there — it is the same seam, one rung on.
 
 
+### D623 — the carrier D621 unmasked: an UN-ANNOTATED `Map()` reaching an annotated struct field, where the value type has a layout twin
+**check-clean invalid wasm · 130 cells · these are D621's measured PRICE, and the price was a FLOOR over this defect rather than a statement about the program: on master before #2027 all 130 were a loud emit reject, and deleting the one `!= null` line that reached D621's gate made all **130 of 130** produce the byte-identical validator sentence at the identical offset · re-verified cell by cell on 2026-08-30 after the merge**
+
+Repro:
+
+    type Circle = { r: i32 | null }
+    type Dot = { r: i32 | null }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type GW = { g: {[string]: Circle} }
+    function mkcall() {
+      const cc = Map()
+      cc["k0"] = { r: null }
+      return cc
+    }
+    function outer() {
+      const wv: GW = { g: mkcall() }
+      print(7)
+    }
+    outer()
+    // vl check rc 0; vl run:
+    //   Invalid input WebAssembly code: type mismatch: expected (ref $type), found (ref $type)
+    // SHOULD PRINT 7
+
+* **THE ROOT IS THE UN-ANNOTATED CARRIER, and annotating EITHER END fixes it** — measured:
+
+  | change | outcome |
+  |---|---|
+  | as filed | **check-clean invalid wasm** |
+  | `function mkcall(): {[string]: Circle}` | runs, prints 7 |
+  | `const cc: {[string]: Circle} = Map()` | runs, prints 7 |
+  | drop `type Dot` (the layout twin) | runs |
+  | drop `type Shape` (the union) | runs, prints 7 |
+  | field `r: i32` instead of `i32 \| null` | runs, prints 7 |
+  | hoist out of the lambda into `outer` | **still fails** — the lambda is SCENERY |
+
+  So the ingredients are the un-annotated carrier, the same-shape twin, the union membership
+  and the nullable field. The closure is not one, which separates this from D613 even though
+  the two share a validator sentence (`expected (ref $type), found (ref $type)`) — **do not
+  group them by that sentence.**
+* **WHY THERE IS A ROW AT ALL RATHER THAN A LINE IN D621.** D621's close moved these 130 from
+  `loud emit reject` to `check-clean invalid wasm`, which under the standing goal is a clause-1
+  violation where there was a clause-2 one. That trade was right — `runs` went 3,704 -> 3,732
+  and the total against the goal 451 -> 423 — but the 130 then had no owner, and a price
+  recorded in a named set is not a defect anybody is working. This row is the owner.
+* **THE TWIN + UNION + NULLABLE TRIO IS D280's, D612's AND D621's**, which is three closes on
+  one ingredient set and a reason to suspect the carrier is the last of it rather than the
+  next-to-last. Worth asking directly: is there a spelling where the carrier is annotated and
+  the trio still breaks?
+* All 130 are in the `d224-cost` named set, kept whole; `named/sources.json` records the price.
+
+
 ## 6. Coverage gaps — axes not built, and why
 
 Stated plainly rather than reported as a silent zero.
