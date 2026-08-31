@@ -160,7 +160,7 @@ import {
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
   tyLitUnionAliasIx,
-  tyNestedArrLeafSupported,
+  tyNestedArrLeafRenders,
   tySame,
   tyScalarBaseIs,
   tyToEmitName,
@@ -17860,6 +17860,35 @@ export function ensureRefElem(elemName: string) {
 // construction or it re-keys a row; this one is not, so it stays a name.
 export function ensureRefElemTy(elemName: string, ty: i32) {
   if elemName == "" { return -1 }
+  const k = refArrElemKind(refElemArrName(elemName))
+  if k == 9 {
+    // THE NESTED RECURSION CARRIES THE ROW DOWN. This function already holds `ty`, the
+    // row for `elemName`; when that element is itself a ref ARRAY (kind 9) its inner
+    // element is `ty`'s own `aElem`, so the inner intern needs no re-resolution of the
+    // spelling this line cuts. Measured: 406 firings hinted, 0 disagreements, 32
+    // declined by `elemNameIsNominal`, and 222 still unhinted because their OUTER call
+    // had no row to pass — that residue shrinks as callers above gain hints.
+    const inm = refArrElemName(elemName)
+    let inner = -1
+    if ty >= 0 {
+      const it = T.tys[ty]
+      if it is TyArray { inner = it.aElem }
+    }
+    if elemNameIsNominal(inm) { inner = -1 }
+    ensureRefElemTy(inm, inner)
+  }
+  ensureRefElemKindTail(elemName, k, ty)
+}
+
+// THE ELEMENT NAME RE-FORMED AS ITS ARRAY NAME — `<elem>[]`, with the grouping parens a
+// composite element needs put back. Split out of `ensureRefElemTy` (D702) because the
+// LITERAL side has to ask `refArrElemKind` the identical question of the identical string:
+// `arrLitNestedElemKind` used to answer a nested literal's element kind from a hand-written
+// four-leaf map, and the two ONLY agreed on the leaves that map listed. Outside them they
+// diverged — an `f32[]` leaf was 4 here and 10 there, a nested `i32[][]` leaf 4 here and 9
+// there — which is why the intern half had to be bounded by an allow-list
+// (`tyNestedArrLeafSupported`) instead of simply answering. One producer, no allow-list.
+export function refElemArrName(elemName: string): string {
   // Re-form the element's ARRAY name to read its kind. A nullable-LIST element (`i32[] | null`) needs its
   // grouping parens back (`(elem)[]`) — without them `refArrElemKind` mis-reads `i32[] | null[]` as a
   // plain struct element (kind 1) instead of the kind-4 nullable-i32-list element. Scoped to a nullable
@@ -17896,23 +17925,14 @@ export function ensureRefElemTy(elemName: string, ty: i32) {
 
     arrName = "(" + elemName + ")[]"
   }
-  const k = refArrElemKind(arrName)
-  if k == 9 {
-    // THE NESTED RECURSION CARRIES THE ROW DOWN. This function already holds `ty`, the
-    // row for `elemName`; when that element is itself a ref ARRAY (kind 9) its inner
-    // element is `ty`'s own `aElem`, so the inner intern needs no re-resolution of the
-    // spelling this line cuts. Measured: 406 firings hinted, 0 disagreements, 32
-    // declined by `elemNameIsNominal`, and 222 still unhinted because their OUTER call
-    // had no row to pass — that residue shrinks as callers above gain hints.
-    const inm = refArrElemName(elemName)
-    let inner = -1
-    if ty >= 0 {
-      const it = T.tys[ty]
-      if it is TyArray { inner = it.aElem }
-    }
-    if elemNameIsNominal(inm) { inner = -1 }
-    ensureRefElemTy(inm, inner)
-  }
+  arrName
+}
+
+// The FLAG BLOCK + intern of `ensureRefElemTy`, after its kind is known and its kind-9
+// recursion has run — split out so the LITERAL side (`collectA`) can reach it with the kind
+// its own classifier chose, rather than re-deriving one. See `refElemArrName` for why the
+// two sides must ask one producer.
+function ensureRefElemKindTail(elemName: string, k: i32, ty: i32) {
   // A MAP element (`{[string]: V}[]`, kind 3): force the map heap types + intern the element
   // map's VALUE mv slot, so a TYPED-value map in a COMPOSITION position (a list element, a
   // struct field, a nested-map value) resolves the SAME per-value map struct a standalone
@@ -18807,43 +18827,67 @@ export function arrLitNestedElemName(arrIx: i32): string {
     if t.aElem >= 0 {
       const el = T.tys[t.aElem]
       if el is TyArray {
-        // The SAME decline as `nodeArrayElemName`'s arm, asked here too rather than inherited.
-        // The two halves must move together: that one decides whether an annotation is
-        // synthesized, this one decides whether the ROW is interned, and a leaf covered by only
-        // one of them reaches the invalid module by the other route.
-        if !tyNestedArrLeafSupported(t.aElem) { return "" }
-        return nodeArrayElemName(arrIx)
+        // THE SAME GATE AS `nodeArrayElemName`'S ARM, which is now literally the same
+        // function (D702). This asked `tyNestedArrLeafSupported` — an allow-list of six
+        // LEAVES — and that list existed for one reason: `arrLitNestedElemKind` answered a
+        // nested element's kind from a hand-written leaf map, and the six were where that map
+        // and `refArrElemKind` (the authority, since the synthesized annotation is resolved BY
+        // NAME) happened to agree. Outside them they diverged, so the intern had to decline.
+        //
+        // The kind below now IS `refArrElemKind`, off the one producer (`refElemArrName`), so
+        // there is nothing left to disagree about and the leaf set is no longer a parameter of
+        // the design. What survives is the gate that was always the real question — "does this
+        // element RENDER" — which is what the ANNOTATION half already asked after D625, and a
+        // spelling with no render is one no row can be keyed under.
+        if !tyNestedArrLeafRenders(t.aElem) { return "" }
+        const nen = nodeArrayElemName(arrIx)
+        if nen == "" { return "" }
+        // …AND THE REF-LIST LAYER MUST BE ABLE TO NAME IT, which is the second half of what
+        // the allow-list was doing and the half that is NOT redundant once the kind agrees.
+        // `refArrElemKind` answers a kind for EVERY name — its base arm falls to 1 (a struct
+        // element) for a spelling no shape arm claims — so a render alone is not enough to
+        // key a nested row.
+        //
+        // WITH A WITNESS, and it is the one this gate was found by: `{r: K}` over a literal
+        // union has no resolvable struct row (`shapeElemDeclaredStructIdx` declines an
+        // atom-vs-plain collision it must not guess through), so `nameIsRefArray` is false for
+        // `{r: K}[]` and the whole ref-list layer declines that spelling — the ANNOTATION walk
+        // included. Without this line the inferred arm interned `{r: K}[]` as a kind-1 STRUCT
+        // element, `rlInternName` banks the FIRST kind against a rep key, and the neighbouring
+        // `const lv1 = [lv2]` over `{r: i32}[]` then resolved to that row and lost its
+        // wrapper. Declining leaves the whole program exactly where master left it.
+        if !nameIsRefArray(refElemArrName(nen)) { return "" }
+        return nen
       }
     }
   }
   ""
 }
 
-// The element KIND for `arrLitNestedElemName`'s literal, keyed on the inner array's LEAF —
-// string 6 / f64 7 / i64 8, else the i32-list wrapper 4. This is `arrLitElemKind`'s nested
-// arm answered from the arena instead of from the first element's literal node, because the
-// literal this serves is empty and has no first element. The two must agree per slot, so the
-// leaf order here is that arm's order.
+// The element KIND for `arrLitNestedElemName`'s literal — asked of the ONE producer the
+// annotation route asks, `refArrElemKind` over `refElemArrName(<elem>)`. D702.
+//
+// WHAT STOOD HERE WAS A HAND-WRITTEN LEAF MAP (string 6 / f64 7 / i64 8, else the i32-list
+// wrapper 4), and the whole allow-list this file used to carry existed to bound it: the
+// annotation `collectLocals` synthesizes is resolved BY NAME, `rlInternName` banks the FIRST
+// kind against a rep key, so a kind derived here that differs from the kind derived there
+// types the outer list's backing as one wrapper while a different wrapper is stored into it —
+// `vl check` rc 0 and a module that does not instantiate. The two agreed on exactly six
+// leaves. Outside them they diverged (an `f32[]` leaf was 4 here and 10 there; a nested
+// `i32[][]` leaf 4 here and 9 there), so `tyNestedArrLeafSupported` declined everything else
+// and the literal fell to the i32-list default, whose floor prints "nested arrays are not
+// supported" — a broad sentence for a narrow miss, since `i32[][]`, `string[][]` and every
+// ANNOTATED nested list ran fine.
+//
+// Answering from the authority removes the disagreement rather than bounding it, so the leaf
+// set stops being part of the design: a STRUCT leaf is kind 9 here and 9 there, an f32 leaf
+// 10 and 10, a MAP-element inner list 9 and 9. The old six answer exactly as before —
+// `refArrElemKind` gives `string[][]` 6, `f64[][]` 7, `i64[][]` 8 and `i32[][]` /
+// `boolean[][]` / `K[][]` 4, arm for arm with the map that was here.
 export function arrLitNestedElemKind(arrIx: i32): i32 {
-  const ty = nodeTyIxOf(arrIx)
-  if ty < 0 { return 4 }
-  const t = T.tys[ty]
-  if t is TyArray {
-    if t.aElem >= 0 {
-      const el = T.tys[t.aElem]
-      if el is TyArray {
-        if el.aElem >= 0 {
-          const leaf = T.tys[el.aElem]
-          if leaf is TyPrim {
-            if leaf.primName == "string" { return 6 }
-            if leaf.primName == "f64" { return 7 }
-            if leaf.primName == "i64" { return 8 }
-          }
-        }
-      }
-    }
-  }
-  4
+  const en = nodeArrayElemName(arrIx)
+  if en == "" { return 4 }
+  refArrElemKind(refElemArrName(en))
 }
 
 // True if the array literal at `arrIx` has ref ELEMENTS — its first element is a
@@ -18877,8 +18921,13 @@ export function arrLitIsRef(arrIx: i32) {
     // a lambda result — build the SAME rep its leaves need: an i64-magnitude leaf
     // (`[[62321678167]]`) previously still keyed the `i32[]` element while its
     // inner literal built the i64 wrapper — a wrapper-heap mismatch, INVALID WASM
-    // (the `() => i64[][]` global). A REF inner literal (`[[{v: 1}]]`) stays
-    // annotation-driven (the threaded `pendingListKind`/slot path).
+    // (the `() => i64[][]` global). A REF inner literal (`[[{v: 1}]]`, `[[[1, 2]]]`) falls
+    // THROUGH to the arena rung at the bottom, which is what D702 changed: it used to be
+    // "annotation-driven" only in the sense that nothing else claimed it, and an
+    // un-annotated one took the i32-list default and the "nested arrays are not supported"
+    // floor. The two name/kind arms below carry the matching rung so the element is named
+    // from the ARENA (kind 9) rather than by the leaf probes, which are one level short for
+    // a ref inner and would key `i32[]` over a `(ref $rlWrap)` backing.
     if e0 is ArrayLit {
       if !arrLitIsRef(a.arrElems[0]) { return true }
     }
@@ -19188,6 +19237,17 @@ export function arrLitElemKind(arrIx: i32) {
       // string 6 / f64 7 / i64 8, else the i32-list wrapper (4). Mirrors
       // `arrLitElemName`'s leaf keying (the two must agree per slot).
       if e0 is ArrayLit {
+        // A REF inner literal (`[[{v: 1}]]`, `[[[1, 2]]]`) is kind 9, and only the ARENA
+        // can say so: the three leaf probes below all decline an object / nested-list
+        // inner and the arm fell to 4, keying the i32-list wrapper over a backing holding
+        // a `(ref $rlWrap)`. D702 — ARM FOR ARM with `arrLitElemName`'s rung of the same
+        // shape and with `arrLitIsRef`'s own fall-through, which is what admits the
+        // literal here in the first place.
+        if arrLitIsRef(a.arrElems[0]) {
+          if arrLitNestedElemName(arrIx) != "" {
+            return arrLitNestedElemKind(arrIx)
+          }
+        }
         if arrLitIsStr(a.arrElems[0], -1) { return 6 }
         if arrLitIsF64(a.arrElems[0], -1) { return 7 }
         if arrLitIsI64(a.arrElems[0], -1) { return 8 }
@@ -19485,6 +19545,17 @@ export function arrLitElemName(arrIx: i32) {
         // non-empty inner literal keeps classifying from its own elements.
         if emptyArrLitIxOf(a.arrElems[0]) >= 0 {
           if cen != "" { return cen }
+        }
+        // A REF inner literal (`[[{v: 1}]]`, `[[[1, 2]]]`): the element is the INNER ref
+        // list, and its name is one the leaf probes below cannot render — they answer
+        // `"i32[]"` for a `{v: i32}[]` or an `i32[][]` element, a level short, so the row
+        // keyed here and the row the element actually builds were different rows. The
+        // arena renders it (`arrLitNestedElemName` IS `nodeArrayElemName`), which is the
+        // same string the annotated spelling interns. D702 — ARM FOR ARM with
+        // `arrLitElemKind`'s kind-9 rung.
+        if arrLitIsRef(a.arrElems[0]) {
+          const rin = arrLitNestedElemName(arrIx)
+          if rin != "" { return rin }
         }
         if arrLitIsStr(a.arrElems[0], -1) { return "string[]" }
         if arrLitIsF64(a.arrElems[0], -1) { return "f64[]" }
@@ -31064,10 +31135,13 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 //     under the f32-list atom tag: `wasm trap: cast failure` at the narrowed read
 //     (`tests/cases/unions/f32-list-union-member.vl`).
 //   * an `Index`. An element read's rep comes from the CONTAINER's interned row, not from the
-//     checker's element type, and the inferred-empty nested-array synthesis DECLINES an `f32[]`
-//     leaf on purpose (`tyNestedArrLeafSupported`). Claiming `outer[0]` here turns that decline
-//     into check-clean invalid wasm
-//     (`tests/cases/arrays/nested-array-inferred-empty-unsupported-leaf.vl`).
+//     checker's element type. When this was measured, the inferred-empty nested-array synthesis
+//     DECLINED an `f32[]` leaf (`tyNestedArrLeafSupported`) and claiming `outer[0]` here turned
+//     that loud decline into check-clean invalid wasm. D702 retired the allow-list and
+//     `tests/cases/arrays/nested-array-inferred-empty-unsupported-leaf.vl` now RUNS, so the
+//     witness reads differently — but the RULE is unchanged and is the one that matters: the
+//     container's row is the authority at an element read, and an element type the row does not
+//     agree with is exactly how that file went silent.
 //
 // Both were measured, in that order, by enabling this test at the TOP of `exprF32Array`.
 function tyIsF32ArrayShape(tyIx: i32) {
