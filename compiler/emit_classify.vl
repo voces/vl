@@ -5194,9 +5194,112 @@ export function mvValKindOfName(valName: string): i32 {
     // with the interner about whether a map lowers. Nominal, not structural: an exact
     // `uVariants` name lookup, never a shape scan.
     if kind < 0 && variantIndexOf(valName) >= 0 { kind = 1 }
+    // …AND THE SHAPE RUNG THE ADOPTER ALREADY TOOK (D671). Reached only when BOTH lookups
+    // above declined, which is the one state in which the render names no row at all — and
+    // it is a state the NODE side put it in. `mvValRowOfShape` is the name-keyed reading of
+    // `collectAnonShapes`' own gate: a literal whose `#anon` row was suppressed because a
+    // declared row or a union ARM adopted it. Where the shape has its own row (the
+    // genuinely-anonymous map value #1942's ruling protects) `structIndexByValName` answers
+    // first and this rung never runs, so the nominal question is still not being settled
+    // structurally — the adoption already settled it, and this is the mv layer reading the
+    // answer instead of contradicting it.
+    if kind < 0 && mvValArmOfShape(valName) >= 0 { kind = 1 }
+    if kind < 0 && mvValRowOfShape(valName) >= 0 { kind = 1 }
   }
   if kind < 0 { return -3 }
   kind
+}
+
+// THE ROW AN ADOPTED SHAPE NAMES — the name-keyed twin of `collectAnonShapes`' suppression
+// gate. Two halves (`mvValArmOfShape` here, `mvValRowOfShape` below), and the mv layer's
+// kind rung, its `vsi` mint, its variant column and its ref-list key all read exactly these
+// two so the four cannot name different rows (D671).
+//
+// `collectAnonShapes` mints an `#anonN` row for an object literal UNLESS the node-side
+// resolvers already gave it one: `structIndexOfObj` matched a declared row, or
+// `objVariantName` matched a union ARM. Both are structural field-set matches, and both
+// SUPPRESS the anonymous row — so after them the shape the checker named (`{r:i32}`) has
+// exactly one row in this module and it is the adopter's.
+//
+// The mv layer is the only consumer that asks for that row BY THE RENDER, and its two
+// name-keyed resolvers each refused the adoption their node-side twin had made:
+//   · `structIndexByValName` refutes a PROVEN field-code mismatch, but a DECLARED row's
+//     codes are not evidence of what its literals look like — the checker adopts `{r: 7}`
+//     into an `r: i64` field and the store re-encodes (`(struct.new $Circle (i64.const 7))`
+//     in the disassembly). `anonValueFitsField` states exactly that tier — against a
+//     non-anon row it refutes only the two pairs no adoption can bridge — and
+//     `adoptedFieldCompat` is that tier applied to a render instead of to a literal;
+//   · `variantIndexOf` is a nominal `uVariants` lookup, so an ARM reached by its own row
+//     spelling (`{n:i32}` for `type Ca = {n: i32}` under `type U1 = Ca | Sq`) declines.
+//     `variantIndexOfTypeName`'s field-set arm is the same match `objVariantName` made.
+//
+// THE ARM HALF. Gated on the struct half declining, exactly as the nominal rung it follows
+// is: a shape with its own row is not an adopted one, and #1942's ruling that a nominal
+// question must not be settled structurally still governs every state but this one — the
+// state where the adoption ALREADY settled it and the render is the only thing left holding
+// a different answer.
+export function mvValArmOfShape(name: string): i32 {
+  if !nameIsWholeSpanShape(name) { return -1 }
+  if structIndexByValName(name) >= 0 { return -1 }
+  variantIndexOfTypeName(name)
+}
+
+// THE STRUCT HALF: the declared row `structIndexOfObj` adopted the literal onto. -1 for a
+// name that is not a whole-span shape, or one no adopter would have claimed.
+export function mvValRowOfShape(name: string): i32 {
+  if !nameIsWholeSpanShape(name) { return -1 }
+  const fnames: string[] = []
+  const ftypes: string[] = []
+  shapeFieldParse(name, fnames, ftypes)
+  let si = 0
+  while si < sScanLim() {
+    // The half-built-row guard `shapeRowScanK` carries, for the same reason: a code-5
+    // element-name computation re-enters this scanner mid-field-loop.
+    if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
+      si = si + 1
+      continue
+    }
+    // An ANONYMOUS row's codes were READ OFF a literal, so they ARE exact and the strict
+    // scan above already had its chance at them; only a DECLARED row adopts.
+    if sFieldCount[si] == fnames.length && !sIsAnonRow(si) {
+      let ok = true
+      let k = 0
+      while k < fnames.length {
+        const fj = sFieldIndex(si, fnames[k])
+        if fj < 0 { ok = false }
+        else if !adoptedFieldCompat(ftypes[k], si, fj) { ok = false }
+        k = k + 1
+      }
+      if ok { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
+// Could a value of the field type spelled `t` be ADOPTED into row `si`'s field `fj`?
+// `anonValueFitsField`'s declared-row tier, read off a SPELLING rather than off a value
+// node: the two scalar pairs no adoption can bridge refute, and a nested-struct field keeps
+// the canonical-rep tightening `shapeRowScanK` applies (two arms sharing a field-name set
+// must not collide onto the first arm's nested layout — the code-19 lesson applied to 15).
+function adoptedFieldCompat(t: string, si: i32, fj: i32): boolean {
+  const want = fieldCodeForMatch(fieldElemTyIxOfName(t))
+  const code = sFieldTypeAt(si, fj)
+  if want == code {
+    if code == 15 {
+      return nestedStructNamesCompat(t, sFieldElemNameAt(si, fj))
+    }
+    return true
+  }
+  // An integer/boolean value into a STRING slot, or a string into a plain i32 one — the
+  // two pairs `anonValueFitsField` refutes against EVERY row. A code-0 slot recording a
+  // literal-union name is the atom slot a string literal legitimately writes.
+  if want == 0 && code == 3 { return false }
+  if want == 3 && code == 0 { return sFieldElemNameAt(si, fj) != "" }
+  // A nested-struct or closure slot takes neither a scalar nor a string.
+  if code == 15 || code == 14 { return false }
+  if want == 15 || want == 14 { return false }
+  true
 }
 
 // Classify + intern a map VALUE type-name, returning the binding's map SHAPE code:
@@ -5833,6 +5936,14 @@ export function mvShapeOfValNameArmTy(
   if nin != "" { bare = nin }
   let vsi = -1
   if kind == 1 { vsi = structIndexByValName(bare) }
+  // THE ADOPTED ROW (D671), read through the SAME resolver the kind rung above used. Without
+  // it a shape the kind rung admitted mints a slot whose struct column is -1 — a vals element
+  // over no heap, which is strictly worse than the reject it replaced. Reached only where the
+  // strict lookup declined and the shape is not an arm (the arm half is the variant column
+  // below, and the two are never both set — `mvValStructIdxOf`'s header states that pairing).
+  if kind == 1 && vsi < 0 && mvValArmOfShape(bare) < 0 {
+    vsi = mvValRowOfShape(bare)
+  }
   // A VALUE union also interns its scalar value-box reps; a struct/heterogeneous
   // union just rides the box payload, so no value boxes are needed. A MAP arm's mv
   // value slot is interned (`markMapUnionArms` — idempotent) so the store-coerce tag
@@ -5942,6 +6053,10 @@ export function mvShapeOfValNameArmTy(
   // two cannot disagree: when `armTy` resolves an arm, the key IS that arm's name.
   let mvVarRow = variantRowOfTy(armTy)
   if mvVarRow < 0 { mvVarRow = variantIndexOf(valName) }
+  // …AND THE ADOPTED ARM (D671), the third source, on the same gate the kind rung used: only
+  // where NEITHER name-keyed lookup placed the render, which is where `objVariantName` had
+  // already claimed the literal for this arm.
+  if mvVarRow < 0 && vsi < 0 { mvVarRow = mvValArmOfShape(valName) }
   mvValVariantIdx.push(mvVarRow)
   // THE ARM-SIGNATURE HALF (D93), pushed in the same breath so the row stays one row.
   // Same two sources as the column above and in the same order — the caller's recorded
@@ -5988,6 +6103,16 @@ export function mvShapeOfValNameArmTy(
     // falling back to the struct row.
     let armNm = mvValArmName(armTy)
     if armNm == "" && variantIndexOf(valName) >= 0 { armNm = valName }
+    // …AND FROM THE ADOPTED RENDER (D671). The arm reached by its own ROW spelling has
+    // neither an `sNames` row nor a `uVariants` NAME match, so both rungs above decline and
+    // `sNames[-1]` is the same out-of-bounds compiler read the rung above this one exists to
+    // stop — measured, the 14 `d362*_declunion_*` cells TRAPPED the compiler on the first
+    // cut of this change. `mvValArmOfShape` is the resolver the kind rung and the variant
+    // column already used, so all three name the same arm.
+    if armNm == "" {
+      const armSh = mvValArmOfShape(valName)
+      if armSh >= 0 { armNm = uVariants[armSh] }
+    }
     if armNm != "" {
       mvRlSlot.push(rlInternName(armNm, 1))
     } else {

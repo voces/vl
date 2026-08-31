@@ -6745,6 +6745,14 @@ function anonMintRowFor(objIx: i32) {
       const f = P.nodes[fields[fi]]
       if f is FieldInit {
         let code = anonFieldCode(f.fiValue)
+        // THE JOINED OWNER'S FIELD IS A UNION BOX, NOT A NESTED REF (D672). Where two
+        // owner literals disagree at a nested field AND something joins them into one
+        // value, the field's code is 16 and its companion name is the declared union — the
+        // row `type Circle = { r: Shape2 }` would have declared, minted because nobody
+        // declared it. `anonNestPolyUnionName` carries the whole gate and answers "" for
+        // every other literal, so this is inert outside the shape it names.
+        const boxU = anonNestPolyUnionName(ai, f.fiName, unwrapParen(f.fiValue))
+        if boxU != "" { code = 16 }
         if code < 0 && hasFnField {
           const iv = P.nodes[f.fiValue]
           if iv is Ident {
@@ -6754,7 +6762,11 @@ function anonMintRowFor(objIx: i32) {
         if code < 0 { ok = false }
         codes.push(code)
         names.push(f.fiName)
-        elemNames.push(anonFieldElemName(f.fiValue, code))
+        if boxU != "" {
+          elemNames.push(boxU)
+        } else {
+          elemNames.push(anonFieldElemName(f.fiValue, code))
+        }
         elemKeys.push(anonFieldElemKeyI32(f.fiValue, code))
       } else {
         ok = false
@@ -6852,7 +6864,18 @@ function anonNestPolyPremint(nestOwner: i32[]) {
           // The POLYMORPHIC trigger, asked as the exact negation of the condition that
           // declines today: a sibling owner shares the field-name set and disagrees about
           // the nested layout. Both literals then need a row, and neither can borrow one.
-          if fname != "" && !anonNestFieldMono(ow, fname, xi) {
+          // …EXCEPT WHERE THE OWNERS ARE JOINED AND THE FIELD IS NOW A BOX (D672). Two
+          // rows are the right answer for two SEPARATE owners; they are the wrong one for
+          // a pair that has to be ONE value, and this rung's own header says so ("one mv
+          // slot cannot hold two owner reps"). With the field coded 16 the nested literal
+          // must NOT get an anonymous row — this rung's mint is what `emitObjLitNode`'s
+          // `structIndexOfObj` arm would then claim, building a bare struct where a
+          // `{tag, value}` box is expected.
+          if (
+            fname != "" &&
+            !anonNestFieldMono(ow, fname, xi) &&
+            anonNestPolyUnionName(ow, fname, xi) == ""
+          ) {
             anonMintRowFor(xi)
           }
         }
@@ -6861,6 +6884,99 @@ function anonNestPolyPremint(nestOwner: i32[]) {
     xi = xi + 1
   }
   0
+}
+
+// THE DECLARED UNION AN OWNER FIELD'S POLYMORPHIC NESTED VALUES ARE ARMS OF (D672), or ""
+// when this literal is not that shape. When it answers, the owner's field is coded 16 (the
+// union box) over that union.
+//
+// THE PROGRAM IS LEGAL AND ITS ROW ALREADY EXISTS — SOMEONE JUST HAS TO DECLARE IT. Add one
+// line to the 16 census cells this closes and they run on master:
+//
+//     type Cir2 = { c2: i32 }        const c = Map()
+//     type Sq2  = { s2: i32 }        c["k0"] = { r: { c2: 1 } }
+//     type Shape2 = Cir2 | Sq2       const g = c["k0"] ?? { r: { s2: 1 } }
+//     type Circle = { r: Shape2 }    if g.r is Cir2 { print(7) } else { print(0) }
+//         ^ delete this line and it was `object literal is missing a struct field`
+//
+// That is silent-class-inventory D210, filed as a REFUTATION PIN and still running. With
+// `Circle` declared, `structIndexOfObj` adopts BOTH literals onto its row, whose `r` is a
+// box, and `emitObj` boxes each nested literal as its arm. Without it, `collectAnonShapes`
+// gives each owner its own row with a MONOMORPHIC `r`, the map's value slot picks the
+// first, and the `??` default is then lowered against a row whose `r` targets `{c2:i32}` —
+// so `emitObj` reported a field the user never wrote. This mints the row `Circle` would
+// have been.
+//
+// FOUR GATES, AND THE LAST ONE IS THE ONE THAT COSTS SOMETHING. Arm-claimed nested literal,
+// no row of its own, the owner field POLYMORPHIC (`anonNestFieldMono` false — the exact
+// condition D391's premint fires on), and the owners JOINED. Without the join gate this
+// takes D391's `anon-nested-arm-layout-polymorphic.vl` from `runs` to
+// `emitProgram: field access receiver is not a struct` — measured, a corpus module lost —
+// because two SEPARATE owners read monomorphically (`p.r.c2`) need their own rows and a
+// boxed field costs that read its receiver.
+function anonNestPolyUnionName(ow: i32, fname: string, inner: i32): string {
+  if inner < 0 { return "" }
+  const iv = P.nodes[inner]
+  if !(iv is ObjLit) { return "" }
+  if structIndexOfObj(inner) >= 0 { return "" }
+  const armNm = objVariantName(inner)
+  if armNm == "" { return "" }
+  if anonNestFieldMono(ow, fname, inner) { return "" }
+  if !anonPolyOwnersJoined(ow, fname, inner) { return "" }
+  const vi = variantIndexOf(armNm)
+  if vi < 0 { return "" }
+  let ui = 0
+  while ui < unNames.length {
+    if vi >= unVarStart[ui] && vi < unVarStart[ui] + unVarCount[ui] {
+      return unNames[ui]
+    }
+    ui = ui + 1
+  }
+  ""
+}
+
+// ARE THE TWO OWNERS JOINED INTO ONE VALUE (D672)? True when this owner, or a
+// DISAGREEING same-field-set sibling, is the DEFAULT of a `??`.
+//
+// A `??` is the join: its two operands become one binding, so the pair CANNOT keep two
+// rows and the box is the only rep they share. Two owners that are merely both present in
+// the program are not joined — `const p = …` beside `const q = …` is D391's shape, each
+// read monomorphically, and there two rows is the right answer. That is the whole
+// difference between the shape this closes and the shape D391 closed, and it is why the
+// gate is on the JOIN rather than on the disagreement (which both shapes have).
+//
+// DELIBERATELY THE `??` AND NOT A GENERAL JOIN. The other joiners — a two-destination list
+// literal, a function returning both arms — reach the emitter's own design refusal
+// (`emitProgram: union … cannot be discriminated`) or another cluster's row, so widening
+// this gate would claim rows that are not this one's to claim. The 16 cells this closes
+// are all `??` defaults; when a second joiner is measured it gets its own rung here.
+function anonPolyOwnersJoined(ow: i32, fname: string, inner: i32): boolean {
+  let qi = 0
+  while qi < P.nodes.length {
+    const qn = P.nodes[qi]
+    if qn is BinExpr {
+      if qn.binOp == "??" {
+        const d = unwrapParen(qn.binRight)
+        if d == ow { return true }
+        if d >= 0 {
+          const dn = P.nodes[d]
+          if dn is ObjLit {
+            if anonObjFieldSetEq(d, ow) {
+              const dv = unwrapParen(objFieldVal(d, fname))
+              if dv >= 0 {
+                const dvn = P.nodes[dv]
+                if dvn is ObjLit {
+                  if !anonObjFieldSetEq(dv, inner) { return true }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    qi = qi + 1
+  }
+  false
 }
 
 // The literal that owns `objIx` as one of its FIELD VALUES, read out of the owner map
