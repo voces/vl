@@ -8165,31 +8165,54 @@ export function localIndexOf(fnIx: i32, name: string) {
 //   Call    { callFn: i32, callArgs: i32[] }
 //   Paren   { parInner: i32 }
 
-// The struct row whose field-NAME set matches `fnames` exactly, or -1. Bounded by
-// `sFieldCount.length` rather than `sNames.length`: the row being built has already had its
-// NAME pushed and has no field data yet, so the name column runs one ahead here.
+// ── THE CANONICAL FIELD ORDER (D622) ─────────────────────────────────────────
+// A struct/variant row's emitted field sequence, as a PERMUTATION of the spelled one:
+// ascending by field NAME. Every non-`flat` row recorder lays its row out through this, so
+// a shape's wasm layout is a pure function OF THE SHAPE.
 //
-// ONE HOME FOR TWO MINT SITES. `collectS`'s `TypeDecl` arm and `internShapeAs` both have to
-// lay a new row out in an existing same-fieldset row's order (see either caller for the
-// ruling: `{a,b}` and `{b,a}` are ONE type, and two rows share a wasm heap type only when
-// their field SEQUENCE matches). It lived next to the first caller and was private there;
-// the second is a layer below, so the shared answer lives here, beside `sFieldIndex`, which
-// is the only thing it reads that `emit_state` does not own.
-export function rowWithFieldNameSet(fnames: string[]): i32 {
-  let si = 0
-  while si < sFieldCount.length {
-    if sFieldCount[si] == fnames.length {
-      let all = true
-      let k = 0
-      while k < fnames.length {
-        if sFieldIndex(si, fnames[k]) < 0 { all = false }
-        k = k + 1
-      }
-      if all { return si }
-    }
-    si = si + 1
+// WHY IT HAD TO STOP BEING DECLARATION ORDER. The 2026-08 ruling is that `{a: i32, b: f64}`
+// and `{b: f64, a: i32}` are ONE type — `assignable` takes either where the other is asked
+// for — while two rows share one wasm heap type only when their field SEQUENCE matches. The
+// answer used to be `rowWithFieldNameSet`: lay a new row out in the order of the FIRST
+// existing row with the same field-name set. That makes the sequences match, and it makes a
+// shape's layout depend on the whole module: measured, `AB` then `BA` emits
+// `(struct (mut i32) (mut f64))` and `BA` then `AB` emits `(struct (mut f64) (mut i32))` —
+// the SAME two declarations, two layouts, decided by which came first.
+//
+// THAT DEPENDENCE IS WHAT MAKES THE CHECKER UNABLE TO REASON ABOUT LAYOUT, and D622 is where
+// it bites: the checker's view of a shape is its SOURCE SPELLING (it says `y` is inferred as
+// `{b: i32, a: i32}` for a binding the emitter lays out as `[a, b]`), so any checker rule
+// about field POSITION — "is `Narrow`'s field list a prefix of `Wide`'s", the question
+// structural width subtyping turns on — computes an answer the emitter does not honour. With
+// the order canonical the two ends compute the same sequence from the same shape.
+//
+// STABLE INSERTION SORT, so a duplicate field name (which the checker rejects, but which a
+// synthetic row could carry) keeps its spelled relative order rather than reordering
+// unpredictably. Field NAMES are the key and nothing else: the codes follow the names.
+//
+// NOT APPLIED TO A `flat` RECORD. `flat type T = { … }`'s field order IS its byte layout
+// ("offsets are the RUNNING SUM of the declared field widths and the compiler never inserts
+// a byte … Field order IS layout" — `tests/cases/memory/flat-layout-grid.vl`), so its
+// recorders keep the declared sequence and pass this by.
+export function fieldNameOrder(names: string[]): i32[] {
+  const ord: i32[] = []
+  let i = 0
+  while i < names.length {
+    ord.push(i)
+    i = i + 1
   }
-  -1
+  let a = 1
+  while a < ord.length {
+    let b = a
+    while b > 0 && names[ord[b - 1]] > names[ord[b]] {
+      const t = ord[b - 1]
+      ord[b - 1] = ord[b]
+      ord[b] = t
+      b = b - 1
+    }
+    a = a + 1
+  }
+  ord
 }
 
 // The wasm struct field index of `name` within struct `si` (declaration order), or
@@ -21317,8 +21340,13 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
   recordSTyIx(sTyIxOfNameTy(nm, tyIx)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
-  let pi = 0
-  while pi < codes.length {
+  // THE CANONICAL FIELD ORDER (D622) — see `fieldNameOrder`. `annShapeIndexOf` above
+  // already matches BY FIELD NAME off a sorted field-set id, so the dedup this recorder
+  // depends on is unaffected; only the emitted SEQUENCE moves.
+  const dOrd = fieldNameOrder(names)
+  let pj = 0
+  while pj < codes.length {
+    const pi = dOrd[pj]
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     forceScalarListField(codes[pi])
@@ -21430,7 +21458,7 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
       // type-index math).
       if codes[pi] == 16 { registerValueUnionName(en) }
     }
-    pi = pi + 1
+    pj = pj + 1
   }
   sNames.length - 1
 }
@@ -21462,12 +21490,17 @@ export function internShapeAs(key: string, nm: string) {
   if names.length == 0 {
     return emitFail("emitProgram: empty struct alias shape")
   }
-  // FIELD ORDER IS CANONICALISED AGAINST AN EXISTING ROW WITH THE SAME FIELD-NAME SET —
-  // the SAME rule `collectS`'s `TypeDecl` arm applies, and it has to be applied here for
-  // the same reason. `{a: i32, b: i32}` and `{b: i32, a: i32}` are ONE type to the checker,
-  // while two struct rows collapse to one wasm HEAP TYPE only when their field SEQUENCE
-  // matches — `structFieldCodesEq` compares field CODES positionally and never NAMES, so a
-  // permuted pair that shares a canonical key merges with `a` and `b` in opposite slots.
+  // FIELD ORDER IS CANONICAL (`fieldNameOrder`, D622) — the SAME rule `collectS`'s
+  // `TypeDecl` arm applies, and it has to be applied here for the same reason.
+  // `{a: i32, b: i32}` and `{b: i32, a: i32}` are ONE type to the checker, while two struct
+  // rows collapse to one wasm HEAP TYPE only when their field SEQUENCE matches —
+  // `structFieldCodesEq` compares field CODES positionally and never NAMES, so a permuted
+  // pair that shares a canonical key merges with `a` and `b` in opposite slots.
+  //
+  // IT USED TO BE `rowWithFieldNameSet` — the order of the first existing row with this
+  // field-name set — which matched the sequences and made the layout depend on DECLARATION
+  // ORDER. `fieldNameOrder` matches them the same way and is a pure function of the shape;
+  // `fieldNameOrder`'s own header carries why that difference is load-bearing (D622).
   //
   // THIS ROW COULD NOT MERGE AT ALL BEFORE, WHICH IS WHY THE OMISSION WAS INVISIBLE.
   // `slotCanonId` banked -1 for a struct-alias union row (the D0 recorder handed it the
@@ -21482,33 +21515,7 @@ export function internShapeAs(key: string, nm: string) {
   // Reordering does not change WHICH fields the row has or their types — only the sequence
   // — and it applies only when a prototype with the identical field-name set already
   // exists, so an alias shape with no twin lays out exactly as spelled.
-  const ord: i32[] = []
-  let oi = 0
-  while oi < names.length {
-    ord.push(oi)
-    oi = oi + 1
-  }
-  const proto = rowWithFieldNameSet(names)
-  if proto >= 0 {
-    const reord: i32[] = []
-    let rp = 0
-    while rp < sFieldCount[proto] {
-      const want = sFieldNames[sFieldStart[proto] + rp]
-      let rq = 0
-      while rq < names.length {
-        if names[rq] == want { reord.push(rq) }
-        rq = rq + 1
-      }
-      rp = rp + 1
-    }
-    if reord.length == names.length {
-      let rw = 0
-      while rw < reord.length {
-        ord[rw] = reord[rw]
-        rw = rw + 1
-      }
-    }
-  }
+  const ord = fieldNameOrder(names)
   sDeclared = true
   sNames.push(key)
   recordSRowDeclOfName(key)
@@ -22027,13 +22034,16 @@ export function gaeEnsure(name: string) {
   recordSTyIx(sTyIxOfName(name)) // D0
   sFieldStart.push(sFieldNames.length)
   sFieldCount.push(codes.length)
-  let pi = 0
-  while pi < codes.length {
+  // THE CANONICAL FIELD ORDER (D622) — see `fieldNameOrder`.
+  const fOrd = fieldNameOrder(names)
+  let pj = 0
+  while pj < codes.length {
+    const pi = fOrd[pj]
     sFieldNames.push(names[pi])
     sFieldTypes.push(codes[pi])
     sFieldElemName.push(elems[pi])
     recordSFieldElemRow(elems[pi], ekeys[pi] == 1) // D5
-    pi = pi + 1
+    pj = pj + 1
   }
   0
 }
