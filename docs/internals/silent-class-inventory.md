@@ -20315,12 +20315,13 @@ Repro (now runs, printing `1`):
 
 ---
 
-### D741 — the line the two-destination refusal draws is a REPRESENTATION line, not a type line, and the quadrant it ADMITS is not sound
-**check-clean, then loads then traps (`wasm trap: cast failure`) · found 2026-08-31 answering
-D661B's design question — "unify the element hole across destinations at check time" · the
-checker-side rule was scoped against a purpose-built grid and is REFUSED: the outcome today is
-EXACTLY the storage partition, 0 of 36 cells deviating, so every statement in the TYPE system's
-vocabulary reddens cells that RUN · 123-cell grid committed to `distilled/named/`**
+### D741 — [CLOSED 2026-08-31 by D853, now a loud check reject] the line the two-destination refusal draws is a REPRESENTATION line, not a type line, and the quadrant it ADMITS is not sound
+**now a loud check reject · was check-clean, then loads then traps (`wasm trap: cast failure`)
+· found 2026-08-31 answering D661B's design question · the checker-side rule this row scoped was
+REFUSED, and what closed it says something else entirely: that TWO DECLARED UNIONS over one
+written-through list disagree about the ARMS (D853), which is a statement about aliasing rather
+than about variance · 123-cell grid in `distilled/named/`, 91 running cells intact, 0 moved
+besides `w0_base` and `w6_params`**
 
 Repro (check rc 0, then a runtime trap):
 
@@ -22870,13 +22871,14 @@ Repro (was a loud emit reject, now runs printing `1` then `1`):
 
 ---
 
-### D793 — [HALF ANSWERED 2026-08-31 by D821] A9's `Writable` half is the only thing left for the covariance family's four WRITTEN cells, and D791's write scan already computes its predicate
+### D793 — [CLOSED 2026-08-31, now a loud check reject] A9's `Writable` half is the only thing left for the covariance family's four WRITTEN cells, and D791's write scan already computes its predicate
 
-**loads then traps · two of this row's four cells are gone: `d774_k1k2_store` and
-`d774_k1k2_param_store` are now positioned CHECK rejects (D821). `d741_w0_base` and
-`d741_w6_params` — the repro below — still trap, and they are NOT this row's family after all;
-see D824 · the requirement this row attached to the filing was right and is what D821 built: a
-per-VALUE analysis, because the rep-scoped answer is a false reject**
+**now a loud check reject · was loads then traps · all four of this row's cells are answered,
+by TWO rules whose split is D824's finding standing up: `d774_k1k2_store` and
+`d774_k1k2_param_store` are positioned CHECK rejects on the TWO-STORAGE rule (D821), and
+`d741_w0_base` / `d741_w6_params` — the repro below — on the TWO-DIFFERENT-UNIONS one (D853),
+about a shared box rather than a copy · the requirement this row attached to the filing is what
+both are built on: a per-VALUE analysis, because the rep-scoped answer is a false reject**
 
 **THE LAST BULLET OF THIS ROW IS THE ONE THAT MATTERED.** *"A `Writable` rule therefore needs a
 per-VALUE analysis D791 did not build"* — built, as a name-based alias closure with a
@@ -23286,9 +23288,12 @@ Repro (now runs, printing `1` then `7`):
 
 ### D823 — the alias closure's DECLINE surface: five shapes that answer `2`, and the one that is a filed cell
 
-**check-clean invalid wasm · found 2026-08-31 as the measured boundary of D821's per-value
-analysis · 1 cell committed to `distilled/named/` (`d821_escape_push_alias`) · a residue named
-rather than guessed at, because guessing here is a SILENT miscompile and not an invalid module**
+**[CLOSED 2026-08-31 by D852, now a loud check reject] · was check-clean invalid wasm · found
+2026-08-31 as the measured boundary of D821's per-value analysis · 1 cell committed to
+`distilled/named/` (`d821_escape_push_alias`) · a residue named rather than guessed at, because
+guessing here is a SILENT miscompile and not an invalid module — and naming it is what made the
+next attempt gradeable, which is what D852 then did to decline shape (1) alone. The other four
+shapes are still `2`s and still master's behaviour**
 
 Repro (check rc 0, invalid module — and it must stay refused until this row is closed):
 
@@ -23373,6 +23378,19 @@ Repro (runs today and must keep running, printing `203`):
   from `runs` to a loud check reject**, measured on the distilled corpus (`runs` 4,335 ->
   4,333). Two clause-1 traps bought for two running programs is the trade the gate declines, on
   the standing criterion: veto on a `runs` cell lost.
+
+* **[CORRECTED 2026-08-31 by D853] THAT PRICE IS THIS RULE'S, NOT THE QUESTION'S, and both
+  halves of it were avoidable.** The measurement above is of ONE candidate — "refuse on the
+  types alone" — and reading it as the cost of reaching `w0`/`w6` is the same mistake as reading
+  a message count for a mechanism count. Asking whether the two unions **DIFFER** spares
+  `d741_w4_same_union` outright (both its handles are `Shape[]`, and the program above is that
+  program), which halves the price to one cell. Asking whether an **ELEMENT IS READ** spares
+  `d741_w5_no_narrow`, which is the remaining one: its two unions genuinely disagree and it runs
+  only because `print(a.length)` never looks inside. Both gates are measured by ablation, and
+  with both the trade is **three clause-1 cells for zero running programs** — `w0`, `w6` and
+  D832's silently-wrong cell. **This row's REFUTATION PIN is untouched and still runs**, which
+  is what says the narrowing is real rather than a relabelling: the rule that reddened it is the
+  rule this row refused, and it is still refused.
 
 * **THE PROGRAM ABOVE IS THE ONE THAT MAKES THAT TRADE VISIBLE, AND IT IS SOUND.** `a` and `b`
   are both `Shape[]`, they alias, the store puts a `Sq` in and the narrow reads a `Sq` out. No
@@ -23567,12 +23585,13 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D814 — an UN-ANNOTATED local bound to a NULVARIANT list element floors on the struct message, and the ANNOTATED twin runs
+### D814 — [CLOSED 2026-08-31 by D851] an UN-ANNOTATED local bound to a NULVARIANT list element floors on the struct message, and the ANNOTATED twin runs
 
-**loud emit reject · found 2026-08-31 as the next defect behind D811, PRE-EXISTING on master
-and independent of it · 2 cells committed to `distilled/named/` (the defect and its control) ·
-left open rather than guessed at, because the gap is the LOCAL's inferred rep and not the
-niche**
+**closed as `runs` · was a loud emit reject · found 2026-08-31 as the next defect behind D811,
+PRE-EXISTING on master and independent of it · 2 cells committed to `distilled/named/` (the
+defect and its control), plus the module-scope twin D851 adds · left open rather than guessed
+at, because the gap is the LOCAL's inferred rep and not the niche — and that diagnosis was
+exactly right: D851 gives the VARIANT twin the `Index` arm the STRUCT twin already had**
 
 Repro (check rc 0, then a loud emit reject — identical on master and after D811):
 
@@ -23722,9 +23741,24 @@ Repro (now runs, printing `0`):
 
 ---
 
-### D832 — `match`'s FINAL ARM IS AN UNTESTED `else`, and hardening it is REFUSED four times over
+### D832 — [CLOSED 2026-08-31 by D853, now a loud check reject] `match`'s FINAL ARM IS AN UNTESTED `else`, and hardening it is REFUSED four times over
 
-**check-clean silently wrong · 1 cell (`d832_match_untested_else`), the corpus's FIRST `runs but wrong value` · the DEFECT is real and the four candidate repairs each named a price the gate refuses · `goal-scoreboard.py`'s clause-1 filter did not count this class at all and now does**
+**now a loud check reject · was check-clean silently wrong · 1 cell (`d832_match_untested_else`), the corpus's FIRST and ONLY `runs but wrong value` · the four candidate repairs below each named a price the gate refuses, AND THEY WERE ALL AIMED AT THE WRONG LAYER: what closed the cell is the CHECKER refusing the program (D853), and `desugarMatchAt` is untouched · `goal-scoreboard.py`'s clause-1 filter did not count this class at all and now does**
+
+* **THE DESUGAR IS STILL EXACTLY AS FILED, AND THAT IS THE POINT.** Every word below about the
+  untested `else` remains true of today's compiler: a `match` with no `_` still compiles its
+  last arm unconditionally, and a program that reaches it with a value of no arm's type still
+  runs the wrong body. What changed is that THIS cell can no longer be written — the two
+  declared unions over one written-through list that manufacture such a value are now a check
+  reject. **The desugar hazard is unfixed and is now unreachable by the only route the corpus
+  had to it**; if a second route is found, this row's four prices are still the map.
+
+* **AND THE ROW'S OWN LAST BULLET WAS THE CLUE.** It says `d741_w0_base` and `d741_w6_params`
+  "stay `trap_loads` under every candidate above — the value has no correct arm, so the honest
+  end state for them is the CHECKER refusing the program (D793), not a better trap". That is
+  the same sentence for this cell, and nobody read it as one: hardening a trap is not a close
+  under the standing goal, because a trap is a clause-1 outcome too. The checker refusal is
+  neither clause, which is why it moves the scoreboard and the four candidates would not have.
 
 Repro (runs, prints the wrong arm's body):
 
@@ -23877,9 +23911,9 @@ Repro (a loud emit reject):
 
 ---
 
-### D834 — the two remaining `trap_loads` cells are D793's, and the reason to say so is that a second rule would be a false reject with a different sentence
+### D834 — [CLOSED 2026-08-31 by D853, now a loud check reject] the two remaining `trap_loads` cells are D793's, and the reason to say so is that a second rule would be a false reject with a different sentence
 
-**loads then traps · `d741_w0_base` and `d741_w6_params` · NOT BUILT HERE, deliberately · re-run verbatim on `6c0c5225` and both reproduce exactly as filed**
+**now a loud check reject · was loads then traps · `d741_w0_base` and `d741_w6_params` · NOT BUILT HERE, deliberately — and the row's own prediction is what happened: D793's rule landed as D853 and BOTH cells moved with it, with a SECOND SENTENCE that is not D821's, because "the two element storages differ" is false when both destinations are boxes**
 
 Repro (check rc 0, then a runtime trap — D741's `w0_base`, unchanged):
 
@@ -23926,6 +23960,245 @@ Repro (check rc 0, then a runtime trap — D741's `w0_base`, unchanged):
   `now a loud check reject`. Nothing here should be built first: two rules refusing one program
   with two sentences is worse than one, and the sibling cells (`d774_k1k2_store`,
   `d774_k1k2_param_store`) are the same four-cell set.
+
+
+---
+
+### D851 — [CLOSED 2026-08-31] a nulvariant LIST ELEMENT read had no `Index` arm in either niche classifier, so the STRUCT twin claimed it and named a row that does not exist
+
+**closed as `runs` · was a `loud emit reject` (D814) · a CLAUSE-2 close · ABLATED family: an
+un-annotated local bound to `a[0]` where `a` is a `(Circle | null)[]` and `Circle` is a declared
+union's ARM — 1 corpus cell (`d814_nulvariant_elem_field`) plus the module-scope twin this row
+commits (`d851_nulvariant_elem_field_module`) · **0 `runs` lost, 0 into any silent class**,
+corpus `cmp` **0 DIFFER · 0 LOST****
+
+Repro (now runs, printing `7`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: (Circle | null)[] = [{ r: 7 }]
+      const e0 = a[0]
+      if e0 != null { print(e0.r) }
+    }
+    f()
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: field access but no struct type declared
+    // Now: prints 7.
+
+* **THE SLOT WAS ALWAYS RIGHT AND BOTH CLASSIFIERS READ IT — ONE OF THEM JUST HAD NO ARM.**
+  `refArrShapeKind` interns `(Circle | null)[]` as kind **1** whether `Circle` is a plain struct
+  or a union member; that is D771's rung, and it is correct, because since D280 an arm and its
+  declared layout twin are ONE heap. `exprNullableStruct`'s `Index` arm reads exactly that slot
+  (`rlElemKindTbl[slot] == 1 && rlElemIsNulNiche(slot)`) and claims it. `exprNullableVariant`'s
+  `Index` arm handled only MAP reads. So the binding was classified kind-9 `nulstruct`, and
+  `nulRefStructIdxOfLet` then asked `structIndexByName("Circle")` — which is -1, because
+  `collectS` withholds an `sNames` row from a `type X = {…}` that a union names.
+
+* **TWO MESSAGES, ONE MISSING ANSWER, AND THE SECOND ONE IS THE DIAGNOSIS.** With the field read
+  the program floors on `field access but no struct type declared`; replace `print(e0.r)` with
+  `print(1)` and the SAME program refuses one rung earlier with `ref valtype with no interned
+  shape` at the binding. A missing struct row, said twice.
+
+* **THE FIX IS THE PREDICATE THE OTHER DIRECTION ALREADY HAD.** `rlElemStructRow`'s nominal floor
+  says *"a registered variant that is not a registered plain struct has NO struct-table row"*,
+  and `rlElemVariantRow` says which row it does have — the two are documented as one predicate
+  read in two directions. This adds the variant direction to the two niche classifiers, ARM FOR
+  ARM: `exprNullableVariant` gains the `Index` arm, `nulVariantIdxOfExpr` gains its index twin,
+  and `exprNullableStruct` gains the complement so the two stay DISJOINT, which is the invariant
+  `letIsNulVariant`'s own header states (*"disjoint from its struct twin, so the `declareLocals`
+  ladder can test either order"*).
+
+* **DISASSEMBLED** (`./node_modules/.bin/wasm-dis`, binaryen 130). `$1` is
+  `(struct (field (mut i32)))` — `uVarHeap[Circle]`, not `sHeapIdx` — the backing is
+  `(array (mut (ref null $1)))`, the local is `(ref null $1)`, and the narrowed read is
+
+      (if (i32.eqz (ref.is_null (local.get $1)))
+        (then (call $fimport$0 (struct.get $1 0 (ref.as_non_null (local.get $1))))))
+
+  which is `emitMem`'s nulvariant arm verbatim — the arm D814 said was present and unreachable.
+  Master emits no module at all for this program.
+
+* **COUNTERS, reach AND ans, from a probe build (removed before merge).** The new
+  `exprNullableVariant` arm is REACHED **247 times on 34 corpus modules** and ANSWERS **44 times
+  on 2** — the two fixtures this adds, which is why the corpus `cmp` is byte-identical
+  everywhere else. The `exprNullableStruct` complement is reached **564 times on 198 modules**
+  and changes the answer **once**, on the module-scope fixture.
+
+* **AND THAT COMPLEMENT SCORES ZERO, WHICH IS RECORDED RATHER THAN ARGUED AWAY.** Ablating it
+  alone leaves the distilled corpus IDENTICAL to the shipped candidate, and three hand-written
+  shapes hunting for a witness (the global read through `globalIsNulRefSid`, a nullable-variant
+  PARAMETER, a passthrough rebind) all still run. It is kept for the disjointness invariant
+  above — with both twins claiming one expression the `declareLocals` ladder's ORDER becomes
+  load-bearing, and the ladders disagree about which table owns the row. Measured dead is not
+  proven dead, and it costs one compare; this is `refArrShapeKind`'s own precedent for a rung of
+  this shape.
+
+* **BOTH SCOPES.** The module-scope twin runs and is committed to `distilled/named/`. It is not
+  a formality: D822 is the day a covariance rung that read no frame still needed an eighth
+  delivery form to reach a module global, and it is also the only cell the complement fires on.
+
+---
+
+### D852 — [CLOSED 2026-08-31, now a loud check reject] the alias closure's container-FIELD edge, and the write pass was running AFTER the pass that threw its answer away
+
+**now a loud check reject · was `check-clean invalid wasm` (D823's filed boundary cell
+`d821_escape_push_alias`) · a CLAUSE-1 close · 3 cells committed to `distilled/named/` — the
+defect one binding shorter, its unwritten twin, and the FALSE REJECT the first key bought ·
+**0 `runs` lost, 0 into any silent class**, corpus `cmp` **0 DIFFER · 0 LOST****
+
+Repro (was `vl check` rc 0 and an invalid module; now a positioned check reject at 7:21):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    type Box = { xs: Shape[] }
+    function f() {
+      const a: Circle[] = [{ r: 7 }]
+      const b: Shape[] = a
+      const bx: Box = { xs: b }
+      const c = bx.xs
+      c.push({ s: 3 })
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run ->
+    //   Invalid input WebAssembly code: type mismatch
+    // Now: vl check rc 1 —
+    //   a Circle[] cannot be assigned to Shape[] here: the list is WRITTEN THROUGH …
+
+* **TWO RUNGS, AND NEITHER ALONE MOVES THE CELL** (both ablations leave it an invalid module).
+  The first is a fourth EDGE for `cwGrow`: a list that reaches a struct field can come back out
+  of a read of that field, so `const c = bx.xs` joins `c` to the alias set. The second is an
+  ORDER change: `cwWrites` now runs BEFORE `cwClaimed`. A write whose receiver is a member of
+  the closed set is a POSITIVE fact about this value, and the claim pass — which answers a
+  different question, *"is every occurrence accounted for"* — was overwriting it with `2`.
+
+* **THE REORDER CANNOT COST A RUNNING PROGRAM, and the argument is the emitter's fallback.** It
+  can only move a `2` to a `1`, and only where a DEFINITE write to this very list exists. Such a
+  write is by construction a write to a list of this element rep, so `rlSlotEverWritten` is true
+  for the slot, so the emitter's fast path cannot fire, so the widening was already declined and
+  the module was already invalid. Measured: the reorder changes the answer on **1** of 2,429
+  corpus modules.
+
+* **THE KEY IS THE CONTAINER'S BINDING NAME PAIRED WITH THE FIELD NAME, AND BOTH HALVES ARE READ
+  FROM THE ARENA.** Two narrower keys were tried first and each failed for its own reason, both
+  measured rather than reasoned about:
+  · **A TYPE key matched NOTHING.** Keyed on `nodeTyIxOf` of the object literal and of the
+    member read, the edge never fired at all — this analysis runs from `assignableExpr` while
+    the check is still walking, and `const bx: Box = { xs: b }` is checked AFTER the
+    `const b: Shape[] = a` that asks the question, so its node types are still -1. Every other
+    rung of this closure reads syntax, for the same reason.
+  · **A FIELD-NAME-ONLY key was a FALSE REJECT.** `type Other = { xs: i32[] }` with
+    `oz.xs.push(2)` in it reddened a program that runs — measured `1 1 2` on master against a
+    `WRITTEN THROUGH` check reject. That program is `d852_escape_unrelated_field` in
+    `distilled/named/`, and it is the kind of cell nothing derived from current behaviour can
+    find: on today's compiler it simply runs, like thousands of its neighbours.
+
+* **UNDER-APPROXIMATING ON PURPOSE, and the asymmetry is the same one D823 named.** A container
+  delivered anywhere else (`sink(bx)`, then `p.xs.push(…)` in the callee) is not matched, and the
+  answer stays the `2` it is today — master's behaviour, never a refusal. The container name must
+  be bound exactly once and never assigned, so it cannot stand for two containers. And putting a
+  value into a field is STILL an unclaimed occurrence: a program that escapes and is never
+  written keeps answering `2`, which is `d852_escape_field_readonly` and it keeps running.
+
+* **D823's OTHER FOUR DECLINE SHAPES ARE UNCHANGED** — an array literal, a `return`, an `as`, a
+  `match` arm, a store into a map or through a non-name receiver, a named-argument call,
+  `__array_copy__`. This row closes shape (1) and only for a struct field.
+
+* **COUNTERS, reach AND ans.** Over 2,429 corpus modules the escaped-handle test is REACHED
+  **23 times on 2 modules** and ANSWERS **2 times on 1** — the module it refuses. On the
+  false-reject guard it is reached 9 times and answers **0**.
+
+* **BOTH SCOPES.** The module-scope spelling of the same program refuses identically (6:19).
+
+---
+
+### D853 — [CLOSED 2026-08-31, now a loud check reject] TWO DIFFERENT UNIONS over one written-through list is not a variance question, and the element READ is what makes the refusal true
+
+**now a loud check reject · was `trap_loads` (`d741_w0_base`, `d741_w6_params` — D741/D793/D834)
+and `runs but wrong value` (`d832_match_untested_else`, the corpus's only cell of that class) ·
+THREE clause-1 cells · **0 `runs` lost, 0 into any silent class**, corpus `cmp` **0 DIFFER ·
+0 LOST** · `goal-scoreboard.py` clause 1 **10 -> 6**, total against the goal **17 -> 12****
+
+Repro (was check rc 0 then `wasm trap: cast failure`; now a positioned check reject at 10:21):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Shape[] = xs
+      const b: Other[] = xs
+      b[0] = { t: 3 }
+      const e = a[0]
+      match e { Circle => print(100 + e.r), Sq => print(200 + e.s) }
+    }
+    f()
+    // was: vl check rc 0; vl run -> wasm trap: cast failure
+    // Now: vl check rc 1 —
+    //   a {r: i32}[] cannot be assigned to Other[] here: this list is ALSO declared with a
+    //   DIFFERENT element union elsewhere in this program, and it is written through. …
+
+* **IT IS NOT D821's RULE AND IT MUST NOT BORROW D821's SENTENCE.** D821 refuses a covariant
+  assignment whose value needs TWO ELEMENT STORAGES — a plain row and a box — because the
+  destination would have to hold a converted copy. Here both destinations are BOXES: one box
+  type, program-global arm tags, nothing copied, every handle aliasing one list. *"The two
+  element storages differ"* is simply false, and so is the advice that follows from it. What is
+  wrong is that the two declared views disagree about which ARMS the elements may be, which is
+  D741's unsoundness and D824's separation of the two families, stated as a rule.
+
+* **AND IT CLOSES D832 WITHOUT TOUCHING `desugarMatchAt`.** D832 measured four hardenings of
+  `match`'s untested final arm and refused all four (8 `runs` cells, a generation-2 self-host
+  break, 2 corpus modules, a `runs` cell). None of them was the fix, and the row's own last
+  bullet says why in a sentence about its siblings: hardening turns a silently wrong answer into
+  a TRAP, and a trap is a clause-1 outcome too. The scoreboard moves only when the program stops
+  being accepted. The self-host trap that row names is real and was re-measured here from the
+  other side: a `print` added to `compiler/*.vl` for a probe build dies with `unknown import:
+  imports::__print_i32__`, because `load_compiler` instantiates the compiler with a BARE linker.
+
+* **THE ELEMENT-READ CONJUNCT IS THE RULE, NOT A DODGE OF THE GATE.** The confusion two unions
+  create lives entirely in the ELEMENT: the list's identity, its length and every handle on it
+  stay correct. `d741_w5_no_narrow` is the same disagreeing pair with the same store of a `Tri`
+  and then only `print(a.length)` — it prints `1`, which is RIGHT, and refusing it would be
+  refusing a program the compiler runs correctly. Ablating the conjunct is exactly **one `runs`
+  cell lost**, measured, and it is that one.
+
+* **THE TWO GATES BETWEEN THEM HALVE AND THEN ERASE D824's PRICE.** D824 measured the rule that
+  drops D821's two-storage gate at TWO running cells. Asking whether the unions DIFFER spares
+  `d741_w4_same_union` — both its handles are `Shape[]`, they agree, and that program is D824's
+  own refutation pin, which still prints `203`. Asking whether an element is read spares
+  `d741_w5_no_narrow`. Three clause-1 cells for nothing.
+
+* **`tySame` ON THE ELEMENT, so two ALIASES of one member set are ONE union.** `type Shape =
+  Circle | Sq` and `type Animal = Circle | Sq` box identically and a store through either is
+  admitted by both, so treating them as different would be a refusal with no unsoundness behind
+  it. D741's grid varies exactly that axis and its 91 running cells are unmoved.
+
+* **RECOMPUTED, NOT MEMOISED, AND THAT IS LOAD-BEARING.** Cached beside `cwSplits`, the answer
+  computed at the FIRST assignment that asks cannot see a later handle's annotation. Measured:
+  `d741_w6_params` (handles are PARAMETERS, resolved before any body) refused while
+  `d741_w0_base` (handles are consecutive LOCALS) did not — the same defect, two verdicts,
+  decided by check order.
+
+* **FLOW-INSENSITIVE, like the sibling rule and like `rlSlotEverWritten` before it.** A read
+  that provably precedes the write is refused with the rest, and the message says so
+  ("written through SOMEWHERE in this program"). No corpus cell distinguishes them.
+
+* **COUNTERS, reach AND ans.** Over 2,429 corpus modules the rule is REACHED **4 times on 2
+  modules**, sees two differing unions **twice**, and ANSWERS **once** — the module it refuses.
+  `d741_w4_same_union` reaches it twice and the DIFFER test declines both;
+  `d853_two_unions_no_elem_read` reaches it twice, sees the two unions, and the ELEMENT-READ
+  test declines.
+
+* **THE PRICE WAS PAID BY THE TESTS, NOT BY A CELL.** `distilled/named/` gains
+  `d853_two_unions_no_elem_read` under this row's own name, because a derived corpus cannot know
+  that a running program is what a candidate would have taken.
 
 ---
 
