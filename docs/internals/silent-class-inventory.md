@@ -21984,12 +21984,15 @@ Repro (a loud emit reject, and it does not depend on the store):
 
 ---
 
-### D775 — the `(string | null)[]` empty hole D772 deliberately does not claim
-**check-clean invalid wasm · found 2026-08-31 as the measured boundary of D772's rung · 1
-cell committed to `distilled/named/` · left open rather than guessed at, because the gate
-that bounds D772 is the ROW EXISTING and a string list has no ref-list row**
+### D775 — [CLOSED 2026-08-31 by D812] the `(string | null)[]` empty hole D772 deliberately does not claim
+**closed as `runs` · was `check-clean invalid wasm` · found 2026-08-31 as the measured
+boundary of D772's rung · 1 cell committed to `distilled/named/` · **THE BOUNDARY WAS DRAWN
+ONE STEP TOO FAR IN.** Both halves of this row's reasoning are true — the gate is the ROW
+EXISTING and a string list has no ref-list row — and the conclusion does not follow: the row
+test is one BACKING's way of proving the synthesized spelling is the one the machinery reads,
+and the string list has its own (`nameIsNulString`). See D812**
 
-Repro (check rc 0, invalid module):
+Repro (now runs, printing `0`):
 
     function f() {
       const xs = []
@@ -21997,9 +22000,9 @@ Repro (check rc 0, invalid module):
       print(a.length)
     }
     f()
-    // vl check rc 0, no diagnostics; vl run:
+    // was: vl check rc 0, no diagnostics; vl run:
     //   Invalid input WebAssembly code at offset 259: type mismatch
-    // SHOULD PRINT 0
+    // Now: prints 0.
 
 * **WHY D772's RUNG STOPS HERE ON PURPOSE.** That rung takes the emit render of a nullable
   element only when `rlSlotByName` answers, and answering is what proves the synthesized
@@ -22775,13 +22778,19 @@ Repro (now runs, printing `1` then `7`):
 
 ---
 
-### D792 — the `(Circle | null)[]` NICHE is the one element pair the widening declines, and boxing it would need the narrow the niche exists to avoid
+### D792 — [CLOSED 2026-08-31 by D811] the `(Circle | null)[]` NICHE is the one element pair the widening declines, and boxing it would need the narrow the niche exists to avoid
 
-**loud emit reject · found 2026-08-31 as the measured boundary of D791's rung · 8 corpus cells,
-all in `d741`'s eager block · left refused rather than guessed at, and the reason is a TAG, not
-a plumbing gap**
+**closed as `runs` · was a `loud emit reject` · 8 corpus cells, all in `d741`'s eager block ·
+**THE REFUSAL IS EXACTLY RIGHT ABOUT THE ONE-TAG LOOP AND WAS READ AS BEING ABOUT THE PAIR** —
+see D811**
 
-Repro (a loud emit reject):
+Its own second bullet named what would close it — *"a null ARM in the destination union and a
+per-element test to pick between two tags"* — and priced that as "a second lowering". It is
+eight lines inside the existing one, because the destination union ALREADY has a null arm with
+a program-global tag (`nullBoxTag()`), which `(Shape | null)[]` builds at a literal today. The
+reason really is a TAG, and the tag was already there.
+
+Repro (was a loud emit reject, now runs printing `1` then `1`):
 
     type Circle = { r: i32 }
     type Sq = { s: i32 }
@@ -22797,9 +22806,10 @@ Repro (a loud emit reject):
       print(b.length)
     }
     f()
-    // vl check rc 0; vl run ->
+    // was: vl check rc 0; vl run ->
     //   emitProgram: one un-annotated list literal is bound to TWO declared destinations
     //   whose elements are stored differently …
+    // Now: prints 1 then 1.
 
 * **THE EIGHT CELLS ARE EXACTLY THE `CircleNull` ROW AND COLUMN of D741's eager block** —
   `d741_eager_{Animal,CircleStr,Other,Shape}__CircleNull` and
@@ -23006,3 +23016,231 @@ Repro (check rc 0, invalid module):
   the write-scan ablation, for THIS reason and not for the one it was written to show. The
   usable witness pushes through the union-box destination instead. Recording that costs a
   paragraph and saves the next person the same hour.
+
+---
+
+### D811 — a NICHE source's null becomes the destination union's NULL-TAGGED BOX, and the per-element test is what makes D792's pair widenable
+
+**closed as `runs` · was `loud emit reject` (D792) · **8 corpus cells — the whole `CircleNull`
+row and column of D741's eager block, 0 `runs` LOST, 0 into any silent class** · 3 cells
+committed to `distilled/named/`, and they are the ONLY thing that prices the lowering: that
+rung scores **zero** on all 7,275 corpus cells and ablating it buys a `wasm trap: cast
+failure`**
+
+Repro (now runs, printing `1` then `1`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: (Shape)[] = xs
+      const b: (Circle | null)[] = xs
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // was: vl check rc 0; vl run ->
+    //   emitProgram: one un-annotated list literal is bound to TWO declared destinations
+    //   whose elements are stored differently …
+    // Now: prints 1 then 1.
+
+* **WHAT A NULL ELEMENT BECOMES, WHICH IS THE WHOLE QUESTION D792 LEFT OPEN.** It becomes a box
+  carrying `nullBoxTag()` with a `ref.null none` payload — the destination union's OWN rep for
+  a null element, not a new one. That was checked before it was built rather than argued:
+  `const b: (Shape | null)[] = [{ r: 7 }, null]` builds its null element as
+  `(struct.new $2 (i32.const 10) (ref.null none))` off `./node_modules/.bin/wasm-dis` (binaryen
+  130), with `10` = `scalarTagOfKind(nullValKind())` and `0` = `Circle`'s arm tag. So the
+  converting copy has a tag to write and the two spellings agree byte for byte. Off `wasm-dis`
+  on the widened program the loop body is:
+
+      (array.set $6 (local.get $5) (local.get $6)
+        (if (result (ref $3))
+         (ref.is_null
+          (array.get $4 (struct.get $5 0 (local.get $4)) (local.get $6)))
+         (then (struct.new $3 (i32.const 10) (ref.null none)))
+         (else (struct.new $3 (i32.const 0)
+                (array.get $4 (struct.get $5 0 (local.get $4)) (local.get $6))))))
+
+  D792's refusal — *"boxing that element under `Circle`'s tag produces a box whose tag says
+  Circle and whose payload is null, and the narrow … `ref.cast (ref $Circle)` TRAPS on it"* —
+  is exactly right about the ONE-TAG loop and says nothing about the pair. Its own next
+  sentence named the answer (*"a null ARM in the destination union and a per-element test to
+  pick between two tags"*) and priced it as *"a second lowering"*; it is eight lines inside the
+  existing one, because the null arm was already there.
+
+* **THE OPPOSITE DIRECTION IS STILL OUT, AND STILL FOR D792's REASON.** `rlWidenVariantOf`
+  keeps `rlElemNullable[dstSlot] == 1` as a decline. It is vacuous as a column read —
+  `rlElemNicheNullable` never sets the bit for kind 2 — and it is kept because what it states
+  is the rule: a niche DESTINATION needs an UNBOXING copy, a per-element `ref.cast` that can
+  fail, which is the hazard the boxing direction was chosen to avoid.
+
+* **THE CHECKER IS WHY THE NON-NULL DESTINATION NEEDS NO ARGUMENT.** Array assignability is
+  ELEMENT assignability, so `const b: Shape[] = xs` over `const xs = [{ r: 7 }, null]` is a
+  positioned CHECK error (`cannot assign ({r: i32} | null)[] to 'b' of type Shape[]`) and no
+  null can reach a destination whose union has no null arm. The branch is emitted anyway: it
+  costs one `ref.is_null` per element, it is the same lowering either way, and a lowering that
+  is correct without a reachability argument is the one to ship.
+
+* **THE PAIR THE 8 CELLS CANNOT SEE, AND IT IS WHY THREE CELLS ARE IN `named/`.** Every one of
+  the eight is `[{ r: 7 }]` — no null anywhere — so a copy that boxed the null under the arm's
+  tag grades identically on all eight and on the whole corpus. `d811_widen_nul_elem` and
+  `d811_widen_nul_narrow` put an actual `null` in the literal with a `(Shape | null)[]`
+  destination; both are a loud emit reject on master, both RUN now, and with the loop-body rung
+  ablated the first prints `2 2 2` where `2 1 2` is right (a null element reading back as
+  NON-null, check-clean) and the second **traps**: `wasm trap: cast failure`. That is a corpus
+  score of zero and a veto either way round.
+
+* **`d811_widen_nul_dst_narrow` IS THE READABILITY CONTROL**, `d791_narrow_widened_elem`'s twin
+  one element over: the eight cells print only `.length`, and a `.length` grade cannot tell a
+  correctly-tagged box from a wrongly-tagged one. It narrows the box destination's element back
+  to `Circle` and reads its field.
+
+* **THE ABLATION, four rungs, each built from scratch with MASTER's seed and graded
+  cell-matched.** Strip-all — master's own `compiler/` compiled BY THE CANDIDATE SEED —
+  reproduces master's seed byte-for-byte: `929d892e1e11b66d1e073803cc77764a`, 1,551,730 bytes.
+
+  | rung | what it is | corpus `runs` | what its removal costs |
+  |---|---|---|---|
+  | all four (shipped) | | **4,325** | 8 emit reject -> runs, 1 silent -> runs, **0 lost, 0 -> silent** |
+  | −A | the `rlElemNullable[srcSlot]` decline, lifted | 4,317 | the 8 stay `loud emit reject` |
+  | −B | the two-tag loop body | **4,325** | **nothing on the corpus** — and `d811_widen_nul_elem` goes silently wrong, `d811_widen_nul_narrow` TRAPS |
+  | −C | `unionSetHasNull` for `nullablePartOf` (D813) | 4,325 | `d813_hole_nul_union3` and its module twin, neither in the corpus |
+  | −D | the `nameIsNulString` rung (D812) | 4,324 | `d775_hole_nul_string` and its module twin |
+
+  A and B must land together: A without B is the trap above, B without A never fires.
+
+* **MEASURED, all six instruments.** Corpus `cmp` (`corpuscmp.py`, master seed vs candidate):
+  **2,464 modules · 2,019 identical · 0 DIFFER · 0 LOST · 445 not buildable by the base**.
+  Distilled corpus: **9 cells -> `runs`, 0 `runs` -> not-runs, 0 -> silent.** D411's FULL
+  103-cell grid: **103/103 run on both seeds, all 7 single-destination controls intact, 0
+  moved.** D661's FULL 211-cell grid: **211/211 run.** All four `d791_*` write pins still
+  DECLINE and `d791_narrow_widened_elem` still runs. `tests/cases`: **2,011 of 2,455 building
+  on both seeds, the set difference EMPTY**, 0 timeouts, 4-5s at `JOBS=6`.
+  `goal-scoreboard.py` **18 -> 10**.
+
+---
+
+### D812 — the `(string | null)[]` hole closes on the STRING backing's own predicate, because "no ref-list row" was never "no rep"
+
+**closed as `runs` · was `check-clean invalid wasm` · D775's whole residue · 1 corpus cell
+(`d775_hole_nul_string`) plus its MODULE-scope twin, which the corpus did not have**
+
+Repro (now runs, printing `0`):
+
+    function f() {
+      const xs = []
+      const a: (string | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 259: type mismatch
+    // Now: prints 0.
+
+* **D775 STATED THE MECHANISM EXACTLY AND DREW THE WRONG BOUNDARY FROM IT.** Its gate is
+  `rlSlotByName` answering, and its reasoning was *"a `(string | null)[]` rides the string-list
+  backing … so it has no ref-list row at all and the gate declines"*. Both halves are true. What
+  does not follow is that the synthesis must therefore stop: the row test is not the point, it
+  is one BACKING's way of proving *"the spelling I am about to write is the spelling the
+  machinery will read"*. The string list has its own way of proving that — `nameIsNulString`,
+  the predicate `nameIsStringArray` already routes the whole niche through — and it is the same
+  kind of positive proof, not a widening to "any nullable element". That widening is still
+  refused, for D775's own reason.
+
+* **THE PROBE, VERBATIM.** A gated `emitFail` inside `synthEmptyListAnn` reads
+  `nulEl=[string|null] nulPart=[string] rlSlot=-1` on this witness and `rlSlot=0` on every
+  other spelling of the same shape. So the element renders, the membership test passes, and the
+  row lookup is the only thing that says no.
+
+* **THE MODULE SCOPE IS A SECOND CELL AND THE CORPUS HAD ONLY THE FIRST.**
+  `synthEmptyListAnn` has ONE home for both storage classes precisely so the two cannot drift,
+  and the corpus carried the function-scope cell alone — so the module-scope half of every rung
+  in that function was ungraded. `d812_hole_nul_string_module` is committed to
+  `distilled/named/`. Measured on the full 12-spelling by 3-scope hole grid: master runs 32 of
+  36 and the 4 it does not are exactly `{hole,ghole}_{string,shape}`.
+
+---
+
+### D813 — `nullablePartOf` is a TWO-MEMBER test, so the empty-`[]` synthesis declined every THREE-member nullable element even where its row answered
+
+**closed as `runs` · was `check-clean invalid wasm` · **0 corpus cells — this class had no
+program at all** · 2 cells committed to `distilled/named/`, one per scope**
+
+Repro (now runs, printing `0`):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const xs = []
+      const a: (Shape | null)[] = xs
+      print(a.length)
+    }
+    f()
+    // was: vl check rc 0, no diagnostics; vl run:
+    //   Invalid input WebAssembly code at offset 273: type mismatch
+    // Now: prints 0.
+
+* **IT IS THE MEMBERSHIP TEST, NOT THE ROW TEST, AND THE PROBE SEPARATES THEM.** The gated
+  `emitFail` reads `nulEl=[{r:i32}|{s:i32}|null] nulPart=[] rlSlot=0`: the element renders, its
+  ref-list ROW EXISTS and answers, and `nullablePartOf` is what returns "". That function splits
+  at the FIRST depth-0 bar and requires one of the two halves to be exactly `null`, so it is a
+  predicate about `T | null` and not about "carries a null member". `unionSetHasNull` is the
+  latter, decided structurally, and swapping it in is the whole change.
+
+* **`nullablePartOf` ITSELF IS UNTOUCHED.** It has nine other call sites in `emit_collect.vl`
+  alone and its two-member reading is correct at every one of them — a `T | null` niche is a
+  two-member question. What was wrong was using it where the question was membership.
+
+* **NO CORPUS CELL REACHES THIS AND NONE WOULD HAVE.** D772's grid stopped at two-member
+  elements, so ablating the rung costs **zero** on all 7,275 cells while losing
+  `d813_hole_nul_union3` and its module twin outright. Both are in `named/` for exactly that
+  reason. It was found by generating the hole's ELEMENT axis and reading the four cells master
+  fails, rather than the one cell the corpus filed.
+
+---
+
+### D814 — an UN-ANNOTATED local bound to a NULVARIANT list element floors on the struct message, and the ANNOTATED twin runs
+
+**loud emit reject · found 2026-08-31 as the next defect behind D811, PRE-EXISTING on master
+and independent of it · 2 cells committed to `distilled/named/` (the defect and its control) ·
+left open rather than guessed at, because the gap is the LOCAL's inferred rep and not the
+niche**
+
+Repro (check rc 0, then a loud emit reject — identical on master and after D811):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function f() {
+      const a: (Circle | null)[] = [{ r: 7 }]
+      const e0 = a[0]
+      if e0 != null { print(e0.r) }
+    }
+    f()
+    // vl check rc 0; vl run ->
+    //   emitProgram: field access but no struct type declared
+    // SHOULD PRINT 7
+
+* **THE ABLATION, and it needs all three ingredients.** Delete `type Shape = Circle | Sq` and
+  the program RUNS (`Circle` is then a plain declared struct and `sDeclared` is true). Drop the
+  `| null` — `const a: Circle[]` — and it RUNS. Annotate the local — `const e0: Circle | null =
+  a[0]` — and it RUNS, which is the control and the diagnosis: `emitMem`'s nullable-variant arm
+  (`nulVariantIdxOfExpr` + `exprNullableVariant`) is present and correct, and an un-annotated
+  local bound to the indexed read does not reach it. So the family is a LIST element of a
+  nulvariant read through an INFERRED local, not the niche and not the field.
+
+* **THE SAME LOCAL WITHOUT THE FIELD READ IS A DIFFERENT LOUD REJECT**, which is what says the
+  gap is the local's rep rather than the member lowering: replace `print(e0.r)` with `print(1)`
+  and the program refuses with *"ref valtype with no interned shape"* at the `const e0` line.
+  Two messages, one missing answer.
+
+* **WHY IT IS FILED NOW.** D811 makes it REACHABLE in the two-destination spelling — on master
+  `const xs = [{r: 7}]` with a `(Circle | null)[]` and a `Shape[]` destination refuses one rung
+  earlier, so the read never gets a chance to floor. Loud on master, loud after, no cell moved;
+  what changed is that the message a user sees for that program is now this one. Filing it is
+  what stops the next reader attributing it to the widening.

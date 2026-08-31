@@ -16204,6 +16204,10 @@ function emitRefListWidenTop(_body: i32[], srcSlot: i32, dstSlot: i32) {
   const dL = widenDstBackSlot(dstSlot)
   const iL = widenTmpSlot(0)
   const nL = widenTmpSlot(1)
+  // Does the SOURCE row's element carry the `| null` niche (D811)? This is the one bit
+  // that picks the loop body below, and it is read from the same column
+  // `rlWidenVariantOf` bounded.
+  const srcNul = srcSlot < rlElemNullable.length && rlElemNullable[srcSlot] == 1
   // src = <stack>, evaluated ONCE by the caller.
   fbLocalSet(sL)
   // n = src.len  (`struct.get` accepts a nullable ref and traps on null, so the
@@ -16228,12 +16232,50 @@ function emitRefListWidenTop(_body: i32[], srcSlot: i32, dstSlot: i32) {
   fbBrIf(1)
   fbLocalGet(dL)
   fbLocalGet(iL)
-  fbI32Const(uTags[vi]) // the arm's program-global tag
-  fbLocalGet(sL)
-  fbStructGet(srcWrap, 0) // the source backing, `(ref $srcBack)`
-  fbLocalGet(iL)
-  fbArrayGet(srcBack) // `(ref null $elem)` — the box payload is `anyref`, so no recover
-  fbStructNew(uBoxIdx)
+  if srcNul {
+    // THE NICHE SOURCE'S TWO-TAG LOOP BODY (D811). The source element is a
+    // `(ref null $elem)` whose NULL is a legal value (`(Circle | null)[]` is a niche —
+    // the absent reference IS the null), and the destination box has a rep for that:
+    // a box carrying `nullBoxTag()`, which is what `(Shape | null)[]` builds for a
+    // `null` literal element and what every null TEST over a boxed union reads
+    // (`emitNulIsNullTest`'s tag arm). Boxing it under the ARM's tag instead is D792's
+    // trap — the narrow's `ref.cast (ref $Circle)` would fail on the null payload — so
+    // the two tags are picked per element rather than per row.
+    //
+    // WHERE THE DESTINATION UNION HAS NO NULL ARM THE NULL BRANCH IS UNREACHABLE, and
+    // the checker is what says so rather than this emitter: array assignability is
+    // element assignability, so a `(Circle | null)[]` value only ever reaches a
+    // destination whose element admits null (`const b: Shape[] = xs` over
+    // `xs = [{r: 7}, null]` is a positioned CHECK error). The branch is still emitted:
+    // it costs one `ref.is_null` per element, it is the same lowering in both cases, and
+    // a lowering that is correct without a reachability argument is the one to ship.
+    fbLocalGet(sL)
+    fbStructGet(srcWrap, 0)
+    fbLocalGet(iL)
+    fbArrayGet(srcBack)
+    wU8(209) // 0xd1 ref.is_null
+    fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
+    ctrlEnter()
+    fbI32Const(nullBoxTag())
+    fbRefNullNone() // the payload slot is unread under the null tag
+    fbStructNew(uBoxIdx)
+    fbElse()
+    fbI32Const(uTags[vi]) // the arm's program-global tag
+    fbLocalGet(sL)
+    fbStructGet(srcWrap, 0)
+    fbLocalGet(iL)
+    fbArrayGet(srcBack)
+    fbStructNew(uBoxIdx)
+    fbEnd()
+    ctrlLeave()
+  } else {
+    fbI32Const(uTags[vi]) // the arm's program-global tag
+    fbLocalGet(sL)
+    fbStructGet(srcWrap, 0) // the source backing, `(ref $srcBack)`
+    fbLocalGet(iL)
+    fbArrayGet(srcBack) // `(ref null $elem)` — the box payload is `anyref`, so no recover
+    fbStructNew(uBoxIdx)
+  }
   fbArraySet(dstBack)
   fbLocalGet(iL)
   fbI32Const(1)
