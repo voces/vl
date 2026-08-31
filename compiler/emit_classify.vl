@@ -452,6 +452,8 @@ import {
   rlElemNullable,
   rlElemTyIx,
   rlUsed,
+  rlWrAns,
+  rlWrSlots,
   rlWrapIdx,
   sDeclared,
   sFieldCount,
@@ -11613,6 +11615,62 @@ export function sharedFieldRecvSlot() {
   liKinds.push("i32")
   liSlots.push(0)
   liBack.push(7)
+  listIdxScratchBase + liKinds.length
+}
+
+// ── the element-CONVERTING COPY's frame slots (D791) ──────────────────────────
+// The widening loop needs four locals: the source WRAPPER (evaluated once), the fresh
+// destination BACKING, and two i32 temporaries (`i`, `n`). They ride the LAZY list frame
+// for `sharedFieldRecvSlot`'s reason, one step stronger: a pre-pass cannot answer "does
+// this delivery widen" at all, because the answer depends on the ref-list slot the
+// DESTINATION resolved and on the whole-program write scan, neither of which exists
+// before the tables are interned. A slot handed out during lowering asks once, where the
+// answer is used.
+//
+// SHARING IS SAFE FOR THE SAME REASON `.map`'s frame is shared: the source expression is
+// fully emitted (any nested widening inside it complete, wrapper and all) BEFORE the
+// stash, and no user code runs between the stash and the `struct.new` that ends the loop.
+// Codes: 8 the source wrapper (per src slot), 9 the destination backing (per dst slot),
+// 10 the two i32 temps (keyed by `liSlots` 0 = `i`, 1 = `n`).
+export function widenSrcWrapSlot(slot: i32) {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == 8 && liSlots[k] == slot {
+      return listIdxScratchBase + 1 + k
+    }
+    k = k + 1
+  }
+  liKinds.push("ref")
+  liSlots.push(slot)
+  liBack.push(8)
+  listIdxScratchBase + liKinds.length
+}
+
+export function widenDstBackSlot(slot: i32) {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == 9 && liSlots[k] == slot {
+      return listIdxScratchBase + 1 + k
+    }
+    k = k + 1
+  }
+  liKinds.push("ref")
+  liSlots.push(slot)
+  liBack.push(9)
+  listIdxScratchBase + liKinds.length
+}
+
+export function widenTmpSlot(which: i32) {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == 10 && liSlots[k] == which {
+      return listIdxScratchBase + 1 + k
+    }
+    k = k + 1
+  }
+  liKinds.push("i32")
+  liSlots.push(which)
+  liBack.push(10)
   listIdxScratchBase + liKinds.length
 }
 
@@ -30724,6 +30782,68 @@ export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   s
 }
 
+// `refListSlotOfExpr` WITHOUT the clamp — -1 where the element name does not resolve
+// (D791). The clamp to 0 is right for a consumer that must name SOME wrapper and would
+// otherwise have nothing; it is exactly wrong for a consumer deciding whether two rows
+// DIFFER, because slot 0 is a real row and "unresolved" would read as "the first one
+// interned". That is the D227/D451/D721 hazard this file names three times, and a
+// widening that took it would box an element pair no annotation asked about.
+export function refListSlotOfExprStrict(exprIx: i32, fnIx: i32): i32 {
+  const nm = refListElemNameOfExpr(exprIx, fnIx)
+  if nm == "" { return -1 }
+  rlSlotByName(nm)
+}
+
+// The ref-list row the value of `exprIx` is ACTUALLY EMITTED at, or -1 (D791). ONLY an
+// IDENTIFIER answers; every other shape is -1.
+//
+// NOT `refListSlotOfExprStrict`, and the difference is the whole reason this exists. That
+// one answers the row the expression's element SPELLING names; this answers the row the
+// emitter put the value in, read from the very table the value's CELL was typed from. A
+// widening driven by the spelling converts a value that is not where the spelling says,
+// which is `expected (ref null $type), found (ref $type)` — invalid wasm, from a rung
+// whose whole purpose is to remove one. BOTH divergences below were measured as `runs`
+// cells LOST by earlier builds of this rung, not reasoned about in advance:
+//
+//   · an ARRAY LITERAL is built at the row the DESTINATION seeded (`pendingListSlot`), so
+//     its own element name is not where the value ends up. `const a: Shape[] = [{ r: 7 }]`
+//     RUNS on master for exactly that reason — `d773_readonly_same`, the read-only control
+//     this whole landing must not touch.
+//   · a module GLOBAL's cell is `globalRefListSlot`, which for an un-annotated global is
+//     `letRefListSlot`'s DESTINATION answer and not the literal's own row.
+//     `d661_shadow_callarg__bind__s_first` and fifteen siblings are that cell, and they
+//     are in `named/` precisely because a name-scoped scan reads them wrong.
+//
+// SO THE ANSWER SET IS DELIBERATELY NARROW: a declared LOCAL (its `localStructIdx` row), a
+// module GLOBAL (`globalRefListSlot`), and a PARAMETER (whose annotation IS its cell, so
+// the spelling and the rep cannot disagree). A call result, a field read, an indexed read
+// and a `.map` each have a row the emitter picks somewhere this function does not read,
+// and answering for them on the spelling would be the same class of error one shape over.
+// They stay un-widened; that is a residual capability gap and it is named in D791 rather
+// than guessed at.
+export function exprEmittedRefListSlot(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const inner = unwrapParen(exprIx)
+  if inner < 0 || inner >= P.nodes.length { return -1 }
+  const e = P.nodes[inner]
+  if e is Ident {
+    const sl = declaredSlotOf(e.identName)
+    if sl >= 0 {
+      if declaredKind(e.identName) != "reflist" { return -1 }
+      if sl >= localStructIdx.length { return -1 }
+      return localStructIdx[sl]
+    }
+    const pn = paramRefArrayName(fnIx, e.identName)
+    if pn != "" { return rlSlotByName(pn) }
+    const g = globalLetOf(e.identName)
+    if g >= 0 {
+      if globalCellKind(g) != "reflist" { return -1 }
+      return globalRefListSlot(g)
+    }
+  }
+  -1
+}
+
 // The `pendingListKind` an EXPRESSION's list CELL demands — the same 0/1/2/3/4/5/6/7
 // vocabulary `tyAnnRefListKind` produces from an ANNOTATION node, for the positions that
 // have no annotation node left to read. A declared LOCAL's annotation is compiled away by
@@ -30996,6 +31116,198 @@ function letRefListElemName(letIx: i32, fnIx: i32) {
   ""
 }
 
+// ── READ-ONLY COVARIANCE: the two questions an element-converting copy needs ──
+//
+// D773's witness — `const a: Circle[] = [{r:7}]` then `const b: Shape[] = a`, reading
+// only — is `vl check` rc 0 and an INVALID MODULE, because `Circle[]` and `Shape[]` are
+// two WasmGC array types (`(array (mut (ref null $Circle)))` and `(array (mut (ref null
+// $uBox)))`) and a mutable array is INVARIANT in wasm: no `(sub …)` edge exists or can
+// be built for the pair, so #2040's structural width subtyping does not reach it. The
+// only lowering is an element-CONVERTING COPY.
+//
+// D661B refused that copy — *"a converting copy gives one destination a private list,
+// which no other list assignment in the language does"* — and the refusal is a statement
+// about a WRITABLE destination. For a destination nothing writes through, and a source
+// nothing writes through, a copy is INDISTINGUISHABLE from the alias: no observation can
+// tell them apart. That is the whole soundness argument, and `rlSlotEverWritten` below is
+// what enforces its premise.
+//
+// The two halves fit together exactly as `DECISIONS.md`'s A9 ruling says: `Writable` is
+// where the alias must be kept (and the program refused), `Readable` is where the copy is
+// free to run. D774 measured which half is the work — 78 of the family's 80 cells contain
+// no write at all.
+
+// The VARIANT INDEX a ref-list slot's element boxes as when it is widened into the
+// union-box list at `dstSlot`, or -1 when the pair cannot be widened.
+//
+// WIDENABLE means: a kind-1 element (a PLAIN STRUCT row) into a kind-2 element (the
+// program-global `{tag, payload}` union box), where the source element's interned HEAP
+// TYPE is some union ARM's heap. That last test is the one that makes the tag sound and
+// it is a HEAP comparison rather than a name one, for D771's reason: since D280 an arm
+// and its declared layout twin are ONE WasmGC heap (`uVarHeap[vi] =
+// sHeapIdx[uVarSTwinAt(vi)]`), so an INLINE shape element (`({r: i32})[]`) and its
+// declared twin (`Circle[]`) both answer, and a source shape that is merely WIDTH-
+// assignable to an arm (`{r: i32, x: i32}`) answers -1 rather than boxing a struct the
+// narrow would then `ref.cast` and TRAP on.
+//
+// TAGS ARE PROGRAM-GLOBAL AND KEYED BY STRUCTURAL SIGNATURE (`assignTags`), so the first
+// matching variant's tag is every matching variant's tag — a `Circle` declared in two
+// unions ranks once. That is why the scan may stop at the first hit.
+//
+// NICHE ELEMENTS ARE OUT on both sides. A `(Circle | null)[]` is a niche, not a box
+// (D771), so its slot is kind 1 with `rlElemNullable == 1`; boxing it would need the
+// narrow the niche exists to avoid. Left for its own axis rather than guessed at.
+export function rlWidenVariantOf(srcSlot: i32, dstSlot: i32): i32 {
+  if srcSlot < 0 || dstSlot < 0 { return -1 }
+  if srcSlot == dstSlot { return -1 }
+  if srcSlot >= rlElemKindTbl.length { return -1 }
+  if dstSlot >= rlElemKindTbl.length { return -1 }
+  if rlElemKindTbl[srcSlot] != 1 { return -1 }
+  if rlElemKindTbl[dstSlot] != 2 { return -1 }
+  if srcSlot >= rlElemNullable.length { return -1 }
+  if dstSlot >= rlElemNullable.length { return -1 }
+  if rlElemNullable[srcSlot] == 1 { return -1 }
+  if rlElemNullable[dstSlot] == 1 { return -1 }
+  if srcSlot >= rlElemName.length { return -1 }
+  // LEG 1 — the element NAMES an arm (`Circle[]`). This is `rlElemVariantHeap`'s own
+  // lookup, which is where the slot's element heap came from in the first place.
+  const evi = variantIndexOf(nonNulBaseOf(rlElemName[srcSlot]))
+  if evi >= 0 { return evi }
+  // LEG 2 — the element is an INLINE shape or a declared twin whose interned struct heap
+  // IS an arm's heap (D280: an arm and its declared layout twin are one WasmGC heap). The
+  // comparison is on the resolved ROW rather than on `rlElemHeap`, because that column is
+  // pushed as 0 at intern time and 0 is a legal heap INDEX — reading it directly would
+  // make an unresolved element look like variant 0 and box it with variant 0's tag.
+  const esi = rlElemStructRow(srcSlot)
+  if esi < 0 { return -1 }
+  if esi >= sHeapIdx.length { return -1 }
+  const eh = sHeapIdx[esi]
+  let vi = 0
+  while vi < uVarHeap.length {
+    if uVarHeap[vi] == eh { return vi }
+    vi = vi + 1
+  }
+  -1
+}
+
+// Could a store through the receiver at `recvIx` reach a list whose element rep is the
+// ref-list slot `slot`? The receiver's type comes from the CHECKER's own record
+// (`nodeTyIxOf`), so this needs no `fnIx` and no scope walk — which is what lets the
+// scan below be a flat arena walk.
+//
+// THE DECLINE DISCIPLINE IS `containerElemClassDiffers`': an unclassified side must never
+// be claimed. An unrecorded type, or a ref-ish element that names no interned row,
+// answers TRUE — the widening then declines and the program keeps today's behaviour.
+// A SCALAR element (`i32[]`, `f64[]`, a literal-union `K[]`) and a NON-array receiver
+// (a map store `m["k"] = xs`, a string) answer FALSE: neither can be the same wasm value
+// as a ref list, so neither can observe the copy.
+function listWriteReaches(recvIx: i32, slot: i32): boolean {
+  if recvIx < 0 { return true }
+  if recvIx >= P.nodes.length { return true }
+  const rty = nodeTyIxOf(recvIx)
+  if rty < 0 || rty >= T.tys.length { return true }
+  const ety = tyRefArrElemOf(rty)
+  if ety < 0 || ety >= T.tys.length { return false }
+  const et = T.tys[ety]
+  let refish = false
+  if et is TyObj { refish = true }
+  if et is TyUnion { refish = true }
+  if et is TyArray { refish = true }
+  if et is TyMap { refish = true }
+  if et is TyFunc { refish = true }
+  if et is TyNullable { refish = true }
+  if !refish { return false }
+  const s = rlSlotOfTy(ety)
+  if s < 0 { return true }
+  s == slot
+}
+
+// The mutating LIST methods. `set` / `add` / `delete` are map/Set operations and are
+// listed anyway: their receiver is a `TyMap`, which `listWriteReaches` answers FALSE for,
+// so naming them costs nothing and keeps the set honest if a list ever grows one.
+function memPropMutatesList(p: string): boolean {
+  if p == "push" { return true }
+  if p == "pop" { return true }
+  if p == "clear" { return true }
+  if p == "set" { return true }
+  if p == "add" { return true }
+  if p == "delete" { return true }
+  false
+}
+
+// The un-memoised body of `rlSlotEverWritten` — ONE flat walk of the node arena.
+//
+// A FLAT ARENA WALK RATHER THAN A PER-FUNCTION ONE, and that is the point: the licence
+// the copy needs is a WHOLE-PROGRAM property ("nothing writes through either handle"),
+// and aliasing means a write anywhere can be the write that observes the copy. Walking
+// the arena reaches every statement of every function, every nested lambda and every
+// top-level statement, with no traversal to keep in sync with the language's shapes.
+//
+// What it looks for is exactly two things: an ASSIGNMENT whose target is an `Index`
+// (`xs[i] = v`), and a CALL of a mutating list method (`xs.push(v)`). `__array_copy__`
+// writes into a destination array through an intrinsic the type of whose receiver this
+// walk does not read, so it blocks every slot rather than being reasoned about.
+function rlSlotWrittenScan(slot: i32): boolean {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const lhsIx = unwrapParen(n.binLeft)
+        if lhsIx >= 0 && lhsIx < P.nodes.length {
+          const lhs = P.nodes[lhsIx]
+          if lhs is Index {
+            if listWriteReaches(lhs.idxArr, slot) { return true }
+          }
+        }
+      }
+    }
+    if n is Call {
+      if n.callFn >= 0 && n.callFn < P.nodes.length {
+        const callee = P.nodes[n.callFn]
+        if callee is Member {
+          if memPropMutatesList(callee.memProp) {
+            if listWriteReaches(callee.memObj, slot) { return true }
+          }
+        }
+        if callee is Ident {
+          if callee.identName == "__array_copy__" { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Does ANY list-element store or mutating list method in this program reach a list whose
+// element rep is ref-list slot `slot`? Memoised per slot (`rlWrSlots`/`rlWrAns`, cleared
+// with the ref-list tables in `collectA`) because the scan is O(arena) and the widening
+// sites ask the same two slots at every delivery.
+export function rlSlotEverWritten(slot: i32): boolean {
+  if slot < 0 { return true }
+  let m = 0
+  while m < rlWrSlots.length {
+    if rlWrSlots[m] == slot { return rlWrAns[m] == 1 }
+    m = m + 1
+  }
+  const ans = rlSlotWrittenScan(slot)
+  rlWrSlots.push(slot)
+  if ans { rlWrAns.push(1) } else { rlWrAns.push(0) }
+  ans
+}
+
+// THE WHOLE LICENCE IN ONE PREDICATE: may a value at ref-list slot `srcSlot` be delivered
+// into a `dstSlot` destination by an element-converting COPY? Widenable by rep, and
+// write-free on BOTH sides — a write through EITHER handle after the copy is what would
+// make the copy observable, so both are asked.
+export function rlWidenAllowed(srcSlot: i32, dstSlot: i32): boolean {
+  if rlWidenVariantOf(srcSlot, dstSlot) < 0 { return false }
+  if rlSlotEverWritten(srcSlot) { return false }
+  if rlSlotEverWritten(dstSlot) { return false }
+  true
+}
+
 // The ref-list TABLE SLOT a ref-list `LetDecl` binds (stored in `localStructIdx` for a
 // code-5 local so `declaredRefArrayName` can recover its element type), or -1.
 export function letRefListSlot(letIx: i32, fnIx: i32) {
@@ -31084,7 +31396,25 @@ export function letRefListDestSlot(letIx: i32, fnIx: i32): i32 {
   // ASKED ONLY WHEN THE BOX ANSWER EXISTS, so the kind-1 scan runs on the programs this
   // rung already scanned the arena for and on no others.
   if box >= 0 {
-    if letRefListDestSlotK(letIx, fnIx, 1) >= 0 {
+    const k1 = letRefListDestSlotK(letIx, fnIx, 1)
+    if k1 >= 0 {
+      // READ-ONLY COVARIANCE (D791) — THE FOURTH ANSWER THE ROW ABOVE SAYS IS NOT ON THE
+      // LIST, and it is available now that the emitter has an element-CONVERTING COPY.
+      // Build the literal at the PLAIN-STRUCT row (`k1`, what its own elements name and
+      // what the kind-1 destination stores) and let each union-box destination take a
+      // copy. The refusal's premise — *"whichever slot is returned, the OTHER store is a
+      // type mismatch"* — held only while no conversion existed between the two rows.
+      //
+      // GATED ON THE WRITE SCAN, not merely on the reps. A copy gives the union-box
+      // destination a PRIVATE list, which is D661B's objection and is correct wherever a
+      // write through either handle could observe the divergence; `rlWidenAllowed` is
+      // exactly that question, and where it answers no the loud reject below still fires.
+      //
+      // THE PIN DECLINER BELOW (`letListDestKindConflict`) IS DELIBERATELY UNCHANGED. A
+      // pinned binding takes its `letAnn*` early return at all three classify sites and
+      // never reaches this rung at all, so leaving the pin declined is what routes the
+      // program here — where it now widens instead of refusing.
+      if rlWidenAllowed(k1, box) { return k1 }
       emitFailAt(
         "emitProgram: one un-annotated list literal is bound to TWO declared destinations " +
           "whose elements are stored differently (a union-box element list and a " +

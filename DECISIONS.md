@@ -978,6 +978,39 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   does" — is a statement about a writable destination and does not reach a
   readable one.
 
+  **BUILT 2026-08-31 (silent-class-inventory D791), AND THE SURFACE IS STILL NONE.**
+  The `Readable` half above is no longer blocked: an element-CONVERTING COPY landed
+  in the emitter and a whole-program write scan licenses it, closing **63 of the
+  family's 76 corpus cells** — `runs` 4,250 -> 4,313 of 7,262, `goal-scoreboard.py`
+  79 -> 16 against the goal, 0 `runs` lost, 0 cells into any silent class. Nothing
+  an author writes changed: there is no new syntax, no migration, and no annotation,
+  exactly as this ruling requires. Three corrections it earns:
+
+  * **The blocker was REPRESENTATION and it was not WasmGC's to remove.** The
+    sentence above says the emitter "cannot express it (different WasmGC array
+    types, no conversion)", and the reason no `(sub …)` edge can be built is worth
+    stating rather than leaving as a fact about today's emitter: a **mutable array
+    is INVARIANT in WasmGC**, so #2040's structural width subtyping cannot relate a
+    `Circle[]` backing to a `Shape[]` one no matter how the element types are
+    declared — and a union BOX is not a width supertype of its arm in any case. A
+    copy is not one lowering among several; it is the only one.
+
+  * **The LICENCE is what a copy needs, and it is a whole-program property.** The
+    copy is sound exactly where nothing writes through either handle, so the
+    inference is not per-binding: a write in ANY function, through ANY alias, is the
+    write that observes the divergence. What shipped is rep-scoped and whole-program
+    ("does anything in this program store into, push to, or clear a list whose
+    element rep is this row"), which is conservative — it declines a legal program
+    whose write is to an unrelated list of the same element rep. That is a residual
+    clause-2 gap, filed as D791/D793 rather than described as the ruling's intent.
+
+  * **`Writable` is still unbuilt, and it now has a predicate rather than only a
+    name.** The four cells it would reach are D793. What that row adds to the
+    migration argument above: the write scan computes the right question at the
+    wrong granularity — declining a LOWERING on a rep-scoped answer costs nothing,
+    but REFUSING a program on one is a false reject, so the `Writable` rule needs a
+    per-value analysis this landing did not build.
+
 
 ## An object literal a union arm's field-name set MATCHES is not thereby a union BOX — and the row it gets is gated on the OWNER, not on the literal
 
