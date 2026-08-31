@@ -19327,6 +19327,29 @@ Repro:
   invariance, checked stores, and value semantics. **This row is what makes that decision
   priced rather than open-ended.**
 
+* **RE-MEASURED 2026-08-31 ON `ca5fa21a`, AND THE PRICE REPRODUCES LARGER.** The invariance
+  compiler was rebuilt from scratch on today's master — after D661, D671/D672, D691, D701/D702/
+  D703, D426 and D622 — by the same edit the row describes (`assignableGo`'s `TyArray` arm,
+  holes exempt, `tySame` on the element) and re-graded. Distilled corpus: **617 behavioural
+  classes / 14,309 census cells `runs` -> NOT-RUNS** (was 518 / 14,105), 0 -> silent, and 102
+  further classes / 4,845 cells moving `loud emit reject` -> `loud check reject`. D411's grid:
+  **all 7 single-destination controls `runs` -> loud check reject, 0 cells gained** — unchanged.
+  D661's 211-cell grid, which did not exist when this row was written: **203 of 211 `runs` ->
+  loud check reject**. The refusal stands and is firmer than filed.
+
+* **AND THE CHEAP VERSION WAS SCOPED AND IS ALSO REFUSED — see D741.** The row asks for "an
+  element-type hole unified across destinations". Two things were established by building the
+  grid that asks where the line is. First, today's line is EXACTLY the K1/K2 storage partition
+  with 0 of 36 cells deviating, so `Shape[]` + `Other[]` over one literal RUNS while `tySame`
+  is false for the pair — no rule in the type system's vocabulary is co-extensive with it.
+  Second, the unification this row asks for ALREADY EXISTS for the empty literal
+  (`constrainEmptyD`, typecheck.vl:1537) and extending it to a non-empty one costs exactly 10
+  running cells, measured against its own block rather than estimated. The instrument that
+  would have to be built is not a ninth deferred constraint table either: all eight key on
+  `tyHasHole` -> `TyVar`, an un-annotated list element is the unrelated `-1` open slot for which
+  `tyHasHole` is FALSE and `substTyDeep` a no-op, and their pin is the generic call site, which
+  a two-destination binding in a non-generic function never reaches.
+
 * **THE ROW ITSELF IS A LIVE CLAUSE-1 CELL AND NO CORPUS CELL REACHES IT.** Both spellings —
   the call above and the plain `const b: Shape[] = a` — are `vl check` rc 0 and invalid wasm.
   The census has no two-annotated-container-types cell, so `goal-scoreboard.py` scores this
@@ -20188,6 +20211,562 @@ Repro (now runs, printing `1`):
         // The `string` global twin fails identically. Byte-identical on master.
 
 ---
+
+### D741 — the line the two-destination refusal draws is a REPRESENTATION line, not a type line, and the quadrant it ADMITS is not sound
+**check-clean, then loads then traps (`wasm trap: cast failure`) · found 2026-08-31 answering
+D661B's design question — "unify the element hole across destinations at check time" · the
+checker-side rule was scoped against a purpose-built grid and is REFUSED: the outcome today is
+EXACTLY the storage partition, 0 of 36 cells deviating, so every statement in the TYPE system's
+vocabulary reddens cells that RUN · 123-cell grid committed to `distilled/named/`**
+
+Repro (check rc 0, then a runtime trap):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = [{ r: 7 }]
+      const a: Shape[] = xs
+      const b: Other[] = xs
+      b[0] = { t: 3 }
+      const e = a[0]
+      match e { Circle => print(100 + e.r), Sq => print(200 + e.s) }
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Error: error while executing at wasm backtrace: … vl!float
+    //   Caused by: wasm trap: cast failure
+    //   note: a value was not an instance of the type it was narrowed to.
+    // SHOULD PRINT 107 — `a`'s own annotation says element 0 is a `Shape`
+
+* **THE GRID THAT HAD TO BE BUILT, AND WHY D411'S COULD NOT ANSWER THIS.** D411's 103 cells
+  vary the two destinations' SPELLING (`bind`, `mapstore`, `callarg`, `ret`, `listlist`,
+  `assign`, `structfield`) and hold the element pair FIXED at `(Circle, Shape)` in every one
+  of them. So that grid says which syntactic deliveries the refusal reaches and it cannot say
+  ANYTHING about where the line is. `scripts/silent-sweep/d741/gen741.py` is the transpose:
+  the spelling is fixed at `const a: E[] = xs` and the ELEMENT PAIR varies over seven types —
+  `Circle`, an inline `{r: i32}`, `Circle | null`, `Shape = Circle | Sq`, `Animal` (a SECOND
+  declaration of the same members), `Other = Circle | Tri`, and `Circle | string`. `Animal`
+  and `Other` are the load-bearing pair: they separate "same type" from "same storage", which
+  is exactly what a type-level rule and a rep-level rule disagree about.
+
+* **THE ANSWER IS THE K1/K2 STORAGE PARTITION, EXACTLY, WITH ZERO DEVIATIONS.** Over the 36
+  cells whose two elements are both non-nullable, the outcome is a function of one bit — is
+  the element a plain struct row (`Circle`, `{r: i32}`) or a union box (`Shape`, `Animal`,
+  `Other`, `Circle | string`) — and nothing else:
+
+  | first \ second | Circle | inlineobj | Shape | Animal | Other | CircleStr |
+  |---|---|---|---|---|---|---|
+  | **Circle**    | runs | runs | EMIT | EMIT | EMIT | EMIT |
+  | **inlineobj** | runs | runs | EMIT | EMIT | EMIT | EMIT |
+  | **Shape**     | EMIT | EMIT | runs | runs | runs | runs |
+  | **Animal**    | EMIT | EMIT | runs | runs | runs | runs |
+  | **Other**     | EMIT | EMIT | runs | runs | runs | runs |
+  | **CircleStr** | EMIT | EMIT | runs | runs | runs | runs |
+
+  **`Shape[]` and `Other[]` bound to one literal RUNS**, and `Shape` and `Other` are different
+  types by every predicate the checker owns — different declarations, different member sets,
+  `tySame` false. **14 cells run with a differing element type.** So "a list literal has one
+  element type" is not the rule the compiler implements, and stating it would redden those 14.
+  `Circle | null` is the one element that refuses even as a SOLE destination (18 cells, its own
+  message — see the note at the end); it is excluded from the table above rather than smuggled
+  into either class.
+
+* **AND THE ADMITTED QUADRANT IS NOT SOUND — the repro above is in it.** Two DIFFERENT declared
+  unions over one un-annotated literal share a box, so the module validates and `vl check`
+  returns 0. A store through `Other[]` then puts a `Tri` — a value of no `Shape` arm — into the
+  list, and reading it back through `a` traps. The box TAG is faithful (`e is Sq` correctly
+  answers false, measured), so the failure is not a mis-read; it is that `match` over a union
+  compiles its final arm as the fall-through an exhaustive scrutinee justifies, and the value
+  is outside the union. Without the field read the same program takes the `Sq` arm for a `Tri`
+  and prints `200`, silently.
+
+* **THE BYTES, OFF `./node_modules/.bin/wasm-dis` (binaryen 130), AND THEY NAME THE ARM.** The
+  module is 382 bytes and every claim above is in it. `$3` is the union box, `(struct (field
+  i32) (field anyref))`; `$0`/`$1`/`$2` are Circle/Sq/Tri as three distinct struct types. The
+  literal builds `(struct.new $3 (i32.const 0) (struct.new $0 (i32.const 7)))` — box tag **0**
+  — and the store through `Other[]` builds `(struct.new $3 (i32.const 5) (struct.new $2
+  (i32.const 3)))` — box tag **5**. The tags are allocated per ARM TYPE across the module, not
+  per position within a union, which is exactly why `e is Sq` answers correctly and there is no
+  mis-read. The trap is in the read-back:
+
+      (if (i32.eq (struct.get $3 0 (local.get $3)) (i32.const 0))
+        (then … (ref.cast (ref $0) (struct.get $3 1 …)))     ;; Circle, tag-tested
+        (else … (ref.cast (ref $1) (struct.get $3 1 …))))    ;; Sq, NO tag test
+
+  `match`'s FINAL arm is compiled as the unconditional `else` with a bare `ref.cast`, because
+  exhaustiveness over `Shape` says a box that is not tag 0 must be an `Sq`. The value's tag is
+  5 and its payload is a `$2`, so the cast fails. The exhaustiveness the emitter is entitled to
+  assume is precisely what covariance has already broken.
+
+* **SEVEN ABLATIONS, AND THE UN-ANNOTATED LITERAL IS THE LAUNDERING DEVICE.** One ingredient
+  removed per cell, all committed as `d741_w*`:
+
+  | cell | ablation | outcome |
+  |---|---|---|
+  | `w0_base` | — | **trap** |
+  | `w1_annotated_src` | annotate the literal `Shape[]` | **loud check reject** — `cannot assign Shape[] to 'b' of type Other[]` |
+  | `w2_no_store` | drop the store | runs `107` |
+  | `w3_one_dest` | drop the second destination | runs `107` |
+  | `w4_same_union` | make both destinations `Shape[]` | runs `203`, correctly |
+  | `w5_no_narrow` | read `.length` instead of narrowing | runs `1` |
+  | `w6_params` | destinations are PARAMETERS, not bindings | **trap** |
+
+  `w1` is the whole mechanism in one line. Annotated, the two destinations are compared with
+  EACH OTHER and `Shape[] -> Other[]` fails. Un-annotated, each destination is compared only
+  with the literal's own eagerly-inferred `{r: i32}[]` — which is assignable to all seven
+  element types — so the destinations never meet. `w6` says the binding FORM is scenery.
+
+* **WHY A CHECKER-SIDE HOLE UNIFICATION IS REFUSED, PRICED THREE WAYS RATHER THAN ARGUED.**
+  D661B asked for "an element-type hole unified across destinations". Three candidate rules,
+  each measured on this grid:
+
+  1. **`tySame` on the element** (exact identity, holes exempt) — reddens the 14 differing-element
+     cells that run.
+  2. **Array INVARIANCE** (D661B's own build, RE-MEASURED on `ca5fa21a`, see D661B) — **617
+     behavioural classes / 14,309 census cells `runs` -> not-runs**, all 7 of D411's
+     single-destination controls, and 203 of D661's 211.
+  3. **The unification that already exists.** `constrainEmptyD` (typecheck.vl:1537,
+     `s.aElem = d.aElem`) pins an EMPTY literal's element from its first destination, and the
+     second destination is then checked against it — destination-driven unification, already
+     built, already positioned at the second destination, already worded in the language's own
+     terms. The `d741_hole_*` block is this grid run with `[]` in place of `[{r: 7}]`, so the
+     price of extending it to a non-empty literal is not an estimate: **exactly 10 cells that
+     run today stop running**, cell by cell —
+     `{Shape,Animal,Other,CircleStr}` crossed with each other minus the `tySame` pairs.
+
+  All three are refused on the gate's own criterion: a `runs` cell lost.
+
+* **THE THING THAT IS NOT AVAILABLE, STATED PLAINLY.** A rule co-extensive with today's
+  behaviour has to separate `Shape`+`Other` (runs) from `Circle`+`Shape` (refused), and the
+  only predicate that does is "is the element boxed" — `containerElemClassDiffers`' own
+  question, which is a REPRESENTATION fact. Moving it into the checker does not make the
+  refusal a design rule; it makes a codegen sentence harder to find, and it would also make the
+  cluster invisible to `goal-scoreboard.py`, which counts an emit reject but scores a
+  non-conceding check message as neither. **That is strictly worse than leaving it at emit**,
+  and it is the relabelling D661B exists to refuse. The real question is which of invariance, a
+  read-only view, value semantics or checked stores VL wants; D661B prices it and this row says
+  the cheap version does not exist.
+
+* **THE 46 CELLS THAT RUN ARE THE TRIPWIRE.** They are in `distilled/named/` whole, so the next
+  invariance, unification or copy-on-assign candidate has to say which of them it costs instead
+  of discovering it after the fact. Corpus `cmp` and the gate table for this change are in the
+  PR; no compiler source is touched by it.
+
+* **ONE MORE THING THE GRID FOUND, NOT CLAIMED HERE.** `Circle | null` as the SOLE destination
+  of an un-annotated struct-literal list is `emitProgram: a nullable-Circle list element has no
+  rep; use a non-null element type` — 18 cells — and the identical program with no other union
+  declared in the module RUNS. That is a clause-2 emit reject on its own axis, adjacent to the
+  emit-reject long tail rather than to this row, and it is left un-named deliberately.
+
+---
+
+### D742 — the EMPTY literal's element pin is first-destination-wins, so one destination pair gets two answers and one of the two orders is check-clean invalid wasm
+**check-clean invalid wasm · found 2026-08-31 beside D741 · 8 cells in the `d741_hole_*` block
+plus the ordered pair · the mechanism is the SAME pin D661B asked to be built, which turns out
+to exist already for `[]` and to be UNSOUND in one direction · the non-empty twin of the very
+same program is LOUD in both orders**
+
+Repro (check rc 0, invalid module):
+
+    type Circle = { r: i32 }
+    type Sq = { s: i32 }
+    type Tri = { t: i32 }
+    type Shape = Circle | Sq
+    type Animal = Circle | Sq
+    type Other = Circle | Tri
+    function f() {
+      const xs = []
+      const a: Circle[] = xs
+      const b: Shape[] = xs
+      print(a.length)
+      print(b.length)
+    }
+    f()
+    // vl check rc 0, no diagnostics; vl run:
+    //   Error: failed to compile: … WebAssembly translation error:
+    //   Invalid input WebAssembly code … type mismatch: expected (ref $type), found (ref $type)
+    // Swap the two bindings and the SAME pair is a clean check reject:
+    //   [ERROR]: cannot assign Shape[] to 'a' of type Circle[]
+
+* **THE PIN, AND WHY IT IS ORDER-DEPENDENT.** An empty `[]` mints `mkArrayTy(-1)`
+  (`checkArrayLitNode`, typecheck.vl:33191) and `constrainEmptyD` fills that `-1` IN PLACE from
+  the first destination that claims it (typecheck.vl:1537, `s.aElem = d.aElem`, bumping
+  `tyMutEpoch`). There is no record that a pin happened and no second opinion: the binding now
+  simply IS a `Circle[]`, and the next destination is an ordinary covariant assignment, which
+  `Shape[]` passes. Reverse the order and the hole pins to `Shape`, `Circle[]` fails plain
+  assignability, and the program is refused with the sentence the row wants. **Same two
+  destinations, same types, one edit that moves no token except which line comes first.**
+
+* **THE FOUR-CELL TABLE THAT IS THE WHOLE ROW** — `d741_o1..o4`, one axis (empty vs non-empty)
+  crossed with one axis (which destination is written first):
+
+  | | `Circle[]` first | `Shape[]` first |
+  |---|---|---|
+  | `const xs = []` | **check-clean invalid wasm** | loud check reject |
+  | `const xs = [{ r: 7 }]` | loud emit reject | loud emit reject |
+
+  The non-empty row is D411's refusal and is order-INSENSITIVE, which D411 measured and said so
+  rather than asserting. The empty row is this defect. The two rows disagree in both columns,
+  which is the fact worth keeping: the compiler holds two different rules for one question and
+  neither knows about the other.
+
+* **EIGHT CELLS, NOT ONE, AND THE PARTITION IS THE SAME ONE D741 FOUND.** Every
+  `d741_hole_{Circle,inlineobj}__{Shape,Animal,Other,CircleStr}` cell is check-clean invalid
+  wasm: a K1 pin followed by a K2 destination. The mirror image
+  (`hole_{K2}__{K1}`) is a clean check reject, and `hole_{K2}__{K2}` is a check reject wherever
+  the two unions are not `tySame` — which is the over-strict half of the same first-wins pin,
+  and the 10 cells D741 prices as the cost of extending this rule to non-empty literals.
+
+* **THIS IS THE CLAUSE-1 RESIDUE THAT `runs` DOES NOT SEE.** Before this set the corpus graded
+  clause 1 at **0**; it has no two-annotated-destination cell, which is why D411's grid had to
+  be committed whole in the first place. With the set installed the scoreboard reads **clause 1
+  = 11** — these 8, D741's 2 traps, and the ordered pair's own cell. Both numbers were correct
+  about their population and only one of them was about VL.
+
+* **AND THE INSTRUMENT WAS UNDER-COUNTING.** `goal-scoreboard.py`'s clause-1 filter spelled the
+  trap-after-load class `"loads then traps"` — the DOC vocabulary
+  `check-filed-witnesses.py` matches in a status line — while `gradecensus.py` writes it as
+  `trap_loads`. The entry had therefore never matched a cell, and every trapping cell was
+  invisible to clause 1. No corpus cell had that class until D741's witness, so nothing could
+  have caught it earlier. Fixed here; `regress.py`'s own tuple has always said `trap_loads`, and
+  the two now agree.
+
+* **NOT FIXED HERE, AND WHAT FIXING IT WOULD COST.** The obvious repair — a pinned hole is
+  INVARIANT thereafter — needs a marker distinguishing "this array type came from a pin" from
+  "this array type was declared", which `constrainEmptyD` deliberately does not keep (the pin
+  erases its own trigger; see its header at typecheck.vl:1503). Without the marker the rule is
+  global array invariance, whose price is D661B's. The 8 cells do not run today and would not
+  run after, so this is a `check-clean invalid wasm -> loud check reject` close worth doing on
+  its own axis, and it does not move D741's 33.
+
+### D731 — [CLOSED 2026-08-31] the CAPTURE's struct slot was an `ObjLit` peep-hole where every rung above it is a `letIs*` classifier
+**closed as `runs` · was `loud emit reject: emitProgram: ref valtype with no interned shape` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 2 corpus classes standing for 902 census cells (`a001365`, `b000009`) plus a five-line witness the corpus does not carry · 0 `runs` lost, 0 into any silent class, `tests/cases` 1985/2435 building — the IDENTICAL SET, and 2435/2435 emitted modules byte-identical to master**
+
+Repro (now runs, printing `1`):
+
+    type Circle = { r: i32 }
+    function mkc(): Circle { return { r: 1 } }
+    function outer() {
+      const c = mkc()
+      function inner() { print(c.r) }
+      inner()
+    }
+    outer()
+    // was: vl check rc 0; vl run -> emitProgram: ref valtype with no interned shape
+    // Now: prints 1.
+
+* **FIVE LINES, NO UNION, NO GENERIC, ONE FRAME OF NESTING — and it was a loud reject.** The
+  ablation is four one-line edits and every one of them RUNS on master: annotate the binding
+  (`const c: Circle = mkc()`), do not capture it, use an object-LITERAL initializer instead of
+  a call, or move the binding to module scope. Only the un-annotated CALL init read through a
+  capture had no answer. The lambda spelling of `inner` fails identically.
+
+* **THE LADDER HAD ONE RUNG WHERE `collectLocals` HAS A CLASSIFIER.** `captureValStructIdx`
+  ends its un-annotated leg with `if iv is ObjLit { return structIndexOfExpr(...) }`, while
+  the eight rungs above it are `letIsNulMap` / `letIsMap` / `letIsNulVariant` / `letIsNulRef` /
+  `letIsNulRefArray` / `letIsRefArray` / `letIsVariant`. Its KIND twin `letInitCellKind` types
+  the env field `"struct"` for EVERY struct-valued initializer, so a call init minted the pair
+  `("struct", -1)` and `fbValtype`'s bounds guard printed the message. The rung is now
+  `letIsStruct` + `structIndexOfLet` — the same ladder `collectLocals` runs for the same
+  binding one storage class over — so the env field and the local agree by construction.
+
+* **AND D51's PAIR CAME WITH IT, which is `b000009`.** `const c = { r: 7.5 }` beside
+  `type Shape = Circle | Sq` has no struct row for its field set (`collectS` skips a union
+  member), `letIsVariant` declines by design (`exprVariantIndex` carries no object-literal
+  field-set leg), and the arm is the only claimant. `collectLocals` has minted `("variant",
+  lov)` for that pair since D51 and this ladder did not; `letInitCellKind` now carries the
+  matching KIND flip, gated on `structIndexOfLet < 0` exactly as there, so it can only move a
+  binding whose pair is a loud reject today.
+
+* **DISASSEMBLY.** `wasm-dis` on the repro: the env struct is
+  `(type $5 (struct (field (ref $1))))` over `$1 (struct (field (mut i32)))` — the capture's
+  field now carries `Circle`'s own heap type, where master had no valtype to write at all.
+
+* **THE ARM HALF IS THE SAME PROGRAM ONE DECLARATION OVER** and also runs now:
+
+        type Sq = { s: i32 }
+        type Circle = { r: f64 }
+        type Shape = Circle | Sq
+        function outer() {
+          const c = { r: 7.5 }
+          function inner() { print(c.r > 7.0) }
+          inner()
+        }
+        outer()
+        // was: emitProgram: ref valtype with no interned shape. Now: prints true.
+
+---
+
+### D732 — [CLOSED 2026-08-31] the value-call ARM-parameter floor refused a value whose heap type IS the arm's
+**closed as `runs` · was `loud emit reject: emitProgram: value-call union-ARM parameter given a value that is not that arm — a value call does not yet build one` · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 4 corpus cells (`b000055`, `b000056`, `b000058`, `b000059`) — the whole of that message · 0 `runs` lost, 0 into any silent class, `tests/cases` build set identical, corpus byte-identical**
+
+Repro (now runs, printing `7`):
+
+    type Circle = { r: i64 }
+    type Dot = { r: i64 }
+    type Sq = { s: i32 }
+    type Shape = Circle | Sq
+    function rd() {
+      const c = { r: 7 }
+      const lamc = (x: Circle) => x
+      const dd = lamc(c)
+      if (dd).r == 7 { print(7) } else { print(0) }
+    }
+    rd()
+    // was: vl check rc 0; vl run -> emitProgram: value-call union-ARM parameter given a
+    //   value that is not that arm …
+    // Now: prints 7.
+
+* **THE DIRECT SPELLING RAN THE WHOLE TIME.** Replace the lambda with
+  `function lamc(x: Circle): Circle { return x }` and the identical `lamc(c)` runs today —
+  `emitCall` has no floor here at all, it seeds `argCtx.variantIdx` and pushes the value.
+  So does deleting `Dot` (with no twin the literal is claimed by the arm and
+  `exprVariantIndex` answers), and so does annotating `c`. What decided the outcome was which
+  spelling of the callee was written.
+
+* **THE FLOOR'S OWN HEADER CARVED OUT THIS CASE AND THEN DID NOT IMPLEMENT IT.** It refutes an
+  `ObjLit` EXEMPTION with a witness — `f({ r: 7 })` "with an arm-typed closure parameter AND
+  NO LAYOUT TWIN" fell from a loud reject into check-clean invalid wasm — and the clause it
+  turns on is exactly the predicate that was missing. WITH a declared twin the arm and the
+  struct are ONE heap type in the emitted module (`uVarSTwin`, D280), so the raw push is valid
+  by construction.
+
+* **ASKED OF THE HEAPS, NOT OF THE TABLES.** `cloArgIsArmHeapTwin` is
+  `sHeapIdx[structIndexOfExpr(arg)] == uVarHeap[vi]`, verbatim the test `emitUnionBoxArg`
+  already runs at the box boundary ("gated on the heaps DIFFERING so an already-deduped shape
+  keeps the byte-identical raw pass"). Reading the heaps asks the conjunction of `sTwin`,
+  `uVarTwin` and `uVarSTwin` rather than re-deriving one of them, and it is the type the
+  `call_ref` functype actually declares. Where the heaps DIFFER the floor is unchanged.
+
+* **NO NEW EMIT PATH.** The guard is the only edit: the ladder below it already emits the
+  argument through `emitExprExpect` with `variantIdx` seeded (consumed by `emitObj` alone, so
+  an Ident ignores it) and unboxes only `exprUnion` values.
+
+* **DISASSEMBLY.** `wasm-dis` on the repro: `(type $6 (func (param structref (ref $1))
+  (result (ref $1))))` with `$1 (struct (field (mut i64)))` — the lambda's parameter and the
+  argument are the one heap type, which is what the guard now asks.
+
+---
+
+### D733 — [CLOSED 2026-08-31] the emitter BUILDS `Circle` and no resolver would SAY `Circle`, so no container could key it
+**closed as `runs` · was `loud emit reject` under FIVE message spellings (`struct array elements are not supported`, `nested arrays are not supported`, `unsupported for-in iterable`, `union-arm array elements are not supported in this position`, `map value type has no interned slot`) · a CLAUSE-2 capability gap, closed by building the lowering · ABLATED family 8 corpus classes standing for 20,885 census cells (`a000006`, `a001560`, `b000850`, `b000860`, `b001190`, `b016590`, `b016591`, `b018843`) · 0 `runs` lost, 0 into any silent class, `tests/cases` build set identical, 2435/2435 emitted modules byte-identical to master**
+
+Repro (now runs, printing `7`):
+
+    type Circle = { r: i64 }
+    function rd() {
+      const c = { r: 7 }
+      const xs = [c]
+      print(xs[0].r)
+    }
+    rd()
+    // was: vl check rc 0; vl run -> emitProgram: struct array elements are not supported
+    // Now: prints 7.
+
+* **THIS IS D702's FILED RESIDUE, AND IT IS NOT ABOUT NESTED ARRAYS.** That row named
+  `a000006`/`a001560`/`b001190` as "`structIndexOfTypeName`'s shape-resolution seam", and the
+  ablation confirms it: `type Circle = {r: i64}` is a struct row nothing about the program
+  otherwise uses, `Circle = {r: i32}` runs, DELETING `Circle` runs, declaring a matching
+  `type D = {r: i32}` beside it runs, and annotating the binding runs.
+
+* **THE TWO SIDES OF ONE QUESTION HAD DIFFERENT ANSWERS.** `structIndexOfObjCtx` decides which
+  row an object literal BUILDS and accepts a widening — `{ r: 7 }` builds `Circle` with an
+  `i64.const 7`, because a bare integer literal reaches the wider slot
+  (`anonValueFitsField`'s `sc == 23` leg). The field-set resolvers decide which row a recorded
+  SHAPE denotes, and their per-field CODE tightening refuses the same pair: the checker
+  recorded `{r: i32}`, `i32` is not `i64`, no row matched, `shapeNominalOfTy` answered `""`.
+  So the value was a `(ref $Circle)` that nothing would call `Circle`.
+
+* **WHAT THAT COSTS IS THE WHOLE REF-LIST LAYER.** `arrLitNominalElemName` is the one rung
+  `arrLitIsRef`, `arrLitElemName` and `arrLitElemKind` all route through, and with no name the
+  literal falls to the i32 backing, whose floor prints whichever of the four sentences fits
+  the element. One layer out the same `""` makes `nameIsRefArray` false for the render
+  `{r:i32}[]` (the nested-list spelling) and leaves a map's `Circle[]` value with no interned
+  slot. FIVE message spellings, ONE mechanism — the D611 lesson in the other direction.
+
+* **A SECOND PASS, NEVER A LOOSER FIRST ONE**, which is D461's discipline at the same seam:
+  `structIndexOfTypeName` split its own scan exactly this way for the union-BOX pairing, and
+  its note records why ("run as ONE lenient pass it hands a single-field render the FIRST box
+  row rather than the exact one, which is a corpus module lost"). Both field-set resolvers now
+  run strict first; only a shape that placed NOWHERE reaches the widened pass, and
+  `shapeNominalOfTy` orders the four rungs strict-struct → strict-variant → widened-struct →
+  widened-variant so a widening can never outrank an identity.
+
+* **UNIQUE CLAIMANT ON THE STRUCT SIDE, FIRST MATCH ON THE VARIANT SIDE, AND THE ASYMMETRY IS
+  THE POINT.** The struct table has no single function deciding which row a literal builds
+  that the scan can be checked against, so two widened claimants are two LAYOUTS and no
+  evidence — it declines. The variant table has one: `objVariantName`, first match over
+  `uVariants` by field-NAME set with no scalar tightening at all, and it is literally the
+  function `letObjLitVariantIdx` calls to decide the binding's arm. Widening is a strict
+  subset of what it accepts, so the variant pass can only agree with it or decline. That
+  asymmetry is what moves `b000860`, whose two claimants (`Circle` and `Dot`) are both arms.
+
+* **THE WIDENINGS ARE `anonValueFitsField`'s DECLARED-ROW LEGS, read at the type level**
+  (`fieldCodeWidensElem`): a union-BOX row field takes any member; an i32/boolean/atom query
+  fits `i64` (23), `f32` (24) and the `K | null` niche (30); a string query fits
+  `string | null` (20), `K | null` (30), and a code-0 slot that records a union name. NOT the
+  `boolean | null` niche (21) — that leg needs the value to be a boolean LITERAL and a type
+  cannot recover it — and NOT the map slots.
+
+* **DISASSEMBLY.** `wasm-dis` on the repro: `(type $1 (array (mut (ref null $0))))` with
+  `$0 (struct (field (mut i64)))`, and `array.new_fixed $1 1 (local.get $0)` — a REF backing
+  keyed on `Circle`, where master built the i32 backing and hit its floor.
+
+* **THE FOUR OTHER SPELLINGS, each now running:** `const c = [{r: 7}]` + `[c]`
+  (`nested arrays`), the same with `for zz in [c][0]` (`unsupported for-in iterable`),
+  `reverse([c])[0]` with a `Dot` arm twin (`union-arm array elements`), and a `Map()` whose
+  value is `[{r: 7}]` under a `{[string]: Circle[]}` field (`map value type has no interned
+  slot`). `reverse` is SCENERY in all of them — removing it keeps the message.
+
+---
+
+### D734 — a struct FIELD typed as a union ARM has no field code, and the sentence saying so was an allow-list
+**loud emit reject · `emitProgram: a struct field typed as the union ARM `Circle` has no field rep — give the field the UNION's own type, or declare the arm as a plain struct` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`a007807`, `b000095`) · the MESSAGE is fixed in this change, the CAPABILITY is not**
+
+Repro (still a loud emit reject):
+
+    type Sq = { s: i32 }
+    type Circle = { r: i32 }
+    type Shape = Circle | Sq
+    type GW = { g: Circle }
+    function rd() { }
+    rd()
+    // vl check rc 0; vl run -> emitProgram: a struct field typed as the union ARM `Circle`
+    //   has no field rep — give the field the UNION's own type, or declare the arm as a
+    //   plain struct
+
+* **IT FIRES ON THE DECLARATIONS ALONE.** There is no value anywhere in that program — the
+  function body is empty. `collectS` codes every declared struct's fields before anything is
+  emitted, and a field whose type names a union ARM has no code: `nameIsStructDecl` excludes a
+  variant by name ("their fields ride the variant tables, not the struct table"), so the
+  code-15 rung declines and nothing else claims it.
+
+* **THE ABLATION, one edit each and all four RUN:** delete the union (`Circle` becomes an
+  ordinary struct, code 15); give the field the union (`g: Shape`, code 16, the box); make it
+  an arm-element ARRAY (`g: Circle[]`, code 5, which resolves the arm through
+  `variantIndexOf`); or declare a plain-struct twin. The `arm | null` niche (`g: Circle | null`)
+  refuses identically.
+
+* **WHAT IT WOULD TAKE.** The field wants `(ref null $uVarHeap[vi])`. Code 15's chokepoint
+  `sFieldTgtStructIdx` returns a STRUCT-table row and every consumer turns it into
+  `sHeapIdx[row]`, so this needs a code of its own plus a variant arm at the type section, the
+  construct, the read, struct equality and the optional chain — five ladders, each of whose
+  failure mode is invalid wasm. Not attempted here; filed rather than half-built.
+
+* **THE SENTENCE IS FIXED IN THIS CHANGE, and that half is not a substitute for the other.**
+  All three sites that refuse an unrepresentable field type printed
+  `only i32 / boolean / string / array struct fields are supported`, and that is FALSE of the
+  compiler it belongs to: an f64 field is code 17, i64 23, f32 24, a MAP field 19, a nested
+  STRUCT field 15, a union-BOX field 16, and the five scalar-list backings 25/26/27/6/4 — every
+  one supported, none named. Same shape of lie D702 removed from "nested arrays are not
+  supported". The general sentence now NAMES the type
+  (`struct field type `u8[]` has no struct-field rep`, still word-for-word identical across the
+  direct and generic-alias spellings, which their two fixtures pin on purpose) and the arm case
+  gets the sentence above.
+
+---
+
+### D735 — a `??` DEFAULT whose join shape has no declared row: `bare null needs a struct-typed context`
+**loud emit reject · `emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`d003280`, `a000093`) — the whole of that message on the corpus**
+
+Repro (still a loud emit reject):
+
+    function rd() {
+      const c = Map()
+      c["k0"] = { r: 7 }
+      const g0 = (c)["k0"] ?? { r: null }
+      print(g0.r != null)
+    }
+    rd()
+    // vl check rc 0; vl run -> emitProgram: bare null needs a struct-typed context
+
+* **THE ABLATION.** Declaring the join shape runs — add `type Circle = { r: i32 | null }` and
+  the same program prints `true`, as does binding the default first
+  (`const d: {r: i32 | null} = { r: null }`) or defaulting to `{ r: 0 }`. Removing the MAP does
+  not: `const c: {r: i32} | null = { r: 7 }` + `c ?? { r: null }` refuses identically, so the
+  map is scenery and the mechanism is the `??` default itself.
+
+* **WHY IT IS NOT D733's WIDENING.** The default's shape `{r: null}` and the left side's
+  `{r: i32}` are not one row under any leniency — an i32 field and a nullable-i32 field have
+  different LAYOUTS, so naming either from the other is the wrong answer, not a missing one.
+  The join `{r: i32 | null}` is a THIRD shape with no row minted for it, and both sides of the
+  `??` would have to build it.
+
+* **WHICH OF (a)/(b) IS OPEN.** Under clause 2 this is either a legal program the emitter owes
+  a lowering (mint the join shape's row and build both arms into it) or an illegal one the
+  CHECKER owed the diagnosis (`{r: null}` is not assignable to a `{r: i32}`-valued map, so the
+  join is the thing to refuse). That is a DESIGN ruling about what `??` joins, and it is not
+  one to take inside a defect fix.
+
+* **A THIRD `??` CELL IS A DIFFERENT MECHANISM AND NEEDS ITS OWN ROW ID.** `b022835` prints
+  ``emitProgram: `??` over this nullable value is not supported yet`` and is a generic identity
+  over an empty list whose element type comes from a `sink` call — annotating the binding, or
+  dropping the generic, makes it run. Grouping it here would be grouping by message. Witness:
+
+        function idg<T>(x: T): T { return x }
+        function sink(_x: {[string]: {r: string}}[]) { }
+        function rd() {
+          const c = []
+          sink(c)
+          const dd = idg(c)
+          if dd.length > 0 {
+            const g1 = (dd[0])["k0"] ?? { r: "" }
+            print(g1.r)
+          } else { print(0) }
+        }
+        rd()
+        // vl check rc 0; vl run -> emitProgram: `??` over this nullable value is not
+        //   supported yet — narrow it first
+        // `const c: {[string]: {r: string}}[] = []` runs; so does deleting `idg`.
+
+---
+
+### D736 — a union ARM whose field is a value UNION renders STRUCTURALLY, and the ref-list layer cannot key the render
+**loud emit reject · `emitProgram: only i32[] arrays and struct/union element arrays are supported` · a CLAUSE-2 capability gap, OPEN · ABLATED family 2 corpus cells (`a007743`, `a009962`) across two message spellings**
+
+Repro (still a loud emit reject):
+
+    type Cir2 = { c2: i32 }
+    type Sq2 = { s2: i32 }
+    type Shape2 = Cir2 | Sq2
+    type Shape = Circle | Sq
+    type Sq = { s: i32 }
+    type Circle = { r: Shape2 }
+    function rd() {
+      const c: Circle[] = []
+      const lamc = (x: Circle[]) => x
+      const dd = lamc(c)
+      print(dd.length)
+    }
+    rd()
+    // vl check rc 0; vl run -> emitProgram: only i32[] arrays and struct/union element
+    //   arrays are supported
+
+* **THE NAME `checkArrName` REFUSES IS NOT `Circle[]`.** Instrumented at the reject, it is
+  `{r:{c2:i32}|{s2:i32}}[]` — the fully structural render of the element, with the union field
+  expanded. `nameIsRefArray` bridges a SHAPE spelling to the struct table
+  (`shapeElemDeclaredStructIdx`) but reaches the variant table only by EXACT NAME
+  (`variantIndexOf`), so an arm rendered structurally resolves to nothing.
+
+* **THE ABLATION, three edits and all three RUN:** make `Circle` not an arm (delete
+  `type Shape = Circle | Sq`); give it a plain field (`r: i32`), a nested-STRUCT field
+  (`r: Cir2`) or a string field; or call a named function instead of the lambda value. It
+  takes the arm-ness AND the value-union field AND the value call together. `for zz in dd` is
+  SCENERY — the reject stands without it.
+
+* **`a009962` IS THE MAP DUAL, one message over.** `{[string]: Circle[]}` where `Circle` is an
+  arm with an `i32 | null` field prints `map value type has no interned slot`; with `r: i32`
+  it runs, and without the union it runs.
+
+* **WHY IT IS NOT D733.** D733 widened the two field-set resolvers so a recorded SHAPE can
+  name a declared row. This render names no row under ANY leniency: it is a variant-table
+  question asked through a struct-table bridge. The fix is either a variant field-set bridge
+  in `nameIsRefArray` / `refArrElemKind` / `refArrElemName` — which must agree arm for arm —
+  or making the arm render NOMINALLY at this producer, which is the canon-spelling seam.
 
 ### D721 — [CLOSED 2026-08-31] there is ONE concat core and its element rule was a capability refusal wearing a soundness rule's clothes
 

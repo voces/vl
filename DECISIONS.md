@@ -10,6 +10,35 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **A SHAPE→ROW RESOLVER AND THE LITERAL→ROW MATCHER ARE ONE QUESTION, SO A WIDENING ONE
+  SIDE ACCEPTS THE OTHER HAS TO NAME** (2026-08-31, silent-class-inventory D733 / D702's filed
+  residue). `structIndexOfObjCtx` builds `{ r: 7 }` at a declared `type Circle = { r: i64 }` —
+  an integer literal reaches the wider slot (`anonValueFitsField`) — while both field-set
+  resolvers refused the same pair on the field CODE, so `shapeNominalOfTy` answered "" for a
+  value that is already a `(ref $Circle)` and every container keyed on the recorded shape fell
+  to its scalar default. Widening is added as a SECOND PASS behind the strict one, never as a
+  looser first pass (D461's own measurement: one lenient pass hands a single-field render the
+  first box row instead of the exact one and loses a corpus module), and `shapeNominalOfTy`
+  orders strict-struct → strict-variant → widened-struct → widened-variant so a widening can
+  never outrank a row identity.
+- **THE WIDENED STRUCT PASS DEMANDS A UNIQUE CLAIMANT AND THE WIDENED VARIANT PASS KEEPS FIRST
+  MATCH, AND THE ASYMMETRY IS THE POINT** (2026-08-31, D733). Two widened matches are two
+  LAYOUTS, so on the struct side — where no single function decides which row a literal builds
+  that the scan can be checked against — the scan has no evidence and declines. The variant
+  side HAS that function: `objVariantName`, first match over `uVariants` by field-NAME set with
+  no scalar tightening, is what `letObjLitVariantIdx` calls to decide the binding's arm. A
+  first-match widened scan there answers the row the value already carries, and the widening is
+  a strict subset of what `objVariantName` accepts, so it can only agree or decline. Demanding
+  uniqueness there would refuse exactly the layout-twin programs the value resolved without
+  difficulty.
+- **A CAPABILITY FLOOR IS A CLAIM ABOUT THE EMITTED HEAP TYPE, SO ASK THE HEAPS AND NOT THE
+  TWIN COLUMNS** (2026-08-31, D732). The value-call arm-parameter floor refused any argument
+  that was not the arm, a box holding it, or a literal — and a declared LAYOUT TWIN of the arm
+  is none of those while being, in the emitted module, the very same heap type (`uVarSTwin`,
+  D280). `sHeapIdx[row] == uVarHeap[vi]` is the predicate, verbatim the one `emitUnionBoxArg`
+  already applies at the box boundary: it asks the conjunction of `sTwin`, `uVarTwin` and
+  `uVarSTwin` at once, and it is the type the `call_ref` functype actually declares, so the
+  guard cannot disagree with the bytes.
 - **CANON IS A ONE-WAY REWRITE OVER ANNOTATION NODES, SO ANY EMIT-TIME KEY BUILT FROM AN
   ARENA TYPE HAS TO CARRY CANON'S OWN EQUIVALENCES** (2026-08-30, silent-class-inventory
   D611 / #2024). `canonEmitTypeNames` rewrites `TypeRef` nodes in place and banks the
@@ -2820,3 +2849,86 @@ they read it.
 Related: a `--price` run against the POST-landing seed reports VETO rather than a false pass,
 because term (a) legitimately fails once the cells are loud. That is the safe direction; the
 check takes the BASE seed.
+## Array covariance over ALIASING lists: what VL actually owes, priced (D411, D501, D661B, D741, D742)
+
+**This is a language-design decision the compiler cannot make for itself, and it is the root of
+the largest clause-2 cluster in the corpus.** The section exists so the decision can be taken
+from the numbers rather than re-derived; every figure here was measured on `ca5fa21a`.
+
+### The unsound pair
+
+Two facts, each independently correct, and together the classic hole:
+
+1. **VL lists ALIAS.** `const b: i32[] = a; b[0] = 99` prints `99` through `a`, and so does the
+   same store made by a callee through its parameter.
+2. **The checker admits COVARIANT array assignment.** `assignableGo`'s `TyArray` arm is
+   `assignable(sTail.aElem, d.aElem)` (typecheck.vl:16480), with no mutability qualification.
+
+So a `Circle[]` flows into a `Shape[]`, a store through the second handle puts a non-`Circle`
+into the list, and a read through the first sees it. `vl check` returns 0 for all of it.
+
+### Three faces of one hole, and only one of them is currently loud
+
+| face | witness | today |
+|---|---|---|
+| the two destinations need different element STORAGE | D411/D501 | **loud emit reject** — 33 corpus cells, the largest clause-2 cluster |
+| the two destinations are different unions sharing a BOX | D741 (`d741_w0_base`) | **check rc 0, then `wasm trap: cast failure`** |
+| the source is ANNOTATED, so covariance applies directly | D661B | **check rc 0, invalid wasm** |
+| the literal is EMPTY, so the element is pinned first-wins | D742 (`d741_o1_hole_k1_first`) | **check rc 0, invalid wasm** — and the OTHER order is a clean check reject |
+
+The first row is loud only because the wasm validator happens to notice. It is not a design
+rule the checker could state narrowly and correctly, and **D741 measured why**: over a
+36-cell grid varying the two destinations' element types, the outcome is EXACTLY the storage
+partition with zero deviations — `Shape[]` + `Other[]` (two unrelated declared unions,
+`tySame` false) RUNS, `Circle[]` + `Shape[]` is refused. The separating predicate is "is the
+element boxed", which is a representation fact. **Fourteen cells run with a differing element
+type**, so no rule in the type system's vocabulary is co-extensive with today's behaviour.
+
+### The four real answers, and what each costs
+
+**(a) Array INVARIANCE.** Built twice — once for D661B, rebuilt from scratch on `ca5fa21a`.
+Distilled corpus **617 behavioural classes / 14,309 census cells `runs` -> NOT-RUNS**; all 7 of
+D411's single-destination controls lost; **203 of D661's 211** grid cells lost. Sound, and by a
+wide margin the most expensive thing in this file.
+
+**(b) Element-hole unification for un-annotated literals only.** This is the cheap-looking
+option and it is not available. It already EXISTS for the empty literal — `constrainEmptyD`
+(typecheck.vl:1537) pins `s.aElem = d.aElem` from the first destination and the second is then
+checked against it — so the price of extending it to a non-empty literal is measured rather
+than estimated: **exactly 10 running cells**, the differing-union pairs above. It is also
+order-dependent and unsound in one direction today (D742), so extending it would propagate a
+defect rather than a rule. And it is not a ninth deferred constraint table: all eight key on
+`tyHasHole` -> `TyVar`, while an un-annotated list element is the unrelated `-1` open slot for
+which `tyHasHole` is FALSE and `substTyDeep` a no-op, and their pin is the generic call site,
+which a two-destination binding in a non-generic function never reaches.
+
+**(c) A read-only view** (`readonly T[]`, or covariance permitted only where no store can
+reach). This is the answer that keeps both facts and costs no running program, because every
+cell that runs today stores through at most one handle. It is a real language feature: a second
+array type, a variance rule that reads it, and a decision about what `.push` does to it.
+Nothing has been built or priced.
+
+**(d) Value semantics for list assignment** (copy on assign). Changes aliasing for programs
+that run today, which is fact (1) above; D411's third enumerated option is the same observation
+from the other side. It also has no answer for `const e = []; take_i(e); e.push(1); take_f(e)`,
+which is why the element-widening copy probe refuses by hand.
+
+### What the compiler should NOT do, and this is the trap
+
+**Re-word the emit refusal into the checker.** It looks like a clause-2 close: the 33 cells
+stop being `loud emit reject`. It is not one. The rule it would state is the storage partition
+wearing type-shaped clothes; it closes only the face the validator can see, leaving D741's trap
+and D661B's invalid module untouched; and because `goal-scoreboard.py` counts an emit reject
+but scores a non-conceding CHECK message as neither, the cluster would leave the scoreboard
+without a single program compiling any better. **That is strictly worse than leaving it at
+emit**, where at least it is counted.
+
+The standing instruction it violates is already in CLAUDE.md — "making a failure LOUD does not
+move the goal", and clause 2's purpose of keeping "legal" from drifting to mean "whatever the
+compiler accepts". A refusal relabelled as a design rule is exactly the drift.
+
+### The tripwire
+
+`scripts/silent-sweep/d741/gen741.py`'s 123 cells are in `distilled/named/`, 46 of them
+running. Any future candidate for (a)–(d) re-grades against them in one command and has to say
+which of the 46 it costs.
