@@ -10,6 +10,33 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 ## Types & semantics
 
+- **CANON IS A ONE-WAY REWRITE OVER ANNOTATION NODES, SO ANY EMIT-TIME KEY BUILT FROM AN
+  ARENA TYPE HAS TO CARRY CANON'S OWN EQUIVALENCES** (2026-08-30, silent-class-inventory
+  D611 / #2024). `canonEmitTypeNames` rewrites `TypeRef` nodes in place and banks the
+  rewritten spelling's type in `canonTyIxCol`; `cUserTypes` is populated during checking and
+  canon never revisits it. So an INLINE shape row records a post-canon type and a DECLARED
+  alias row records a pre-canon one, and `type Box1 = {r: N}` beside `{r: N}` reached
+  `buildStructTwins` as two layout-identical rows with two `repCanonId`s — two heap types for
+  one shape, check-clean invalid wasm. The fix is to restate canon's rule on the arena side
+  (`repCanonFieldTy`: a numeric literal union is its base scalar), not to chase the mint
+  sites; there are four of them and only three are named anywhere.
+- **A REP-KEY SOFTENING IS SCOPED BY THE POSITION WHERE THE REP IS ACTUALLY THE SAME, AND
+  THAT SCOPE IS MEASURED** (2026-08-30, D611 / #2024). A numeric literal union is its base
+  scalar in a struct FIELD slot; in the list / map-value / union-member layers it is not the
+  same interned row as its base. Softening at the top of `repCanonId`/`repCanonKey` — every
+  position — buys the same 227 census cells as the field-only rung and LOSES 21 that run
+  today (`d362*_numlitun_*`: `type Z = 0 | 1` under `type L = Z[]`, a map value, a union
+  member, all going `runs` → "expected (ref $type), found i32"). Refused on `runs` lost. The
+  softening also stays out of the STRING base by construction: a `"a" | "b"` alias NAME is
+  its interned-atom identity, so fusing it onto `string` would store an atom id in a
+  `(ref $array)` cell.
+- **A KEY AND ITS SHADOW ARE ONE CHANGE** (2026-08-30, D611 / #2024). `repCanonId` and
+  `repCanonKey` are two recursions over one partition and `hcCheckKey` asserts one key per
+  id. Softening only the id fixes the defect and makes the oracle report every merge it buys
+  as drift (`merge=4 len=9` under `VL_REP_SHADOW=1`); softening only the string fixes nothing
+  (`slotCanonId` consumes the id) and reports `split=4`. Either alone is a worse tree than
+  the base.
+
 - **A RUNG THAT CLAIMS "THE SOLE DESTINATION" MUST BE CHECKED AGAINST THE COERCION, NOT
   AGAINST THE ONE DESTINATION SOMEBODY HAD IN HAND** (2026-08-29, silent-class-inventory
   D601 / #2022). `listElemIsBool` lets a DECLARED element name outvote the answer derived

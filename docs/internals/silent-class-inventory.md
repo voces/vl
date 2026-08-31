@@ -17493,10 +17493,15 @@ Repro (ten lines, and NO layout twin is declared anywhere):
 
 ---
 
-### D611 — a shape spelled BOTH as a named alias and ANONYMOUSLY mints two heap types, and the literal-union field is what makes them differ
-**check-clean invalid wasm · 58 of the 92 silent cells in the distilled corpus, the largest single family · found 2026-08-30 by grading the corpus (not the inventory) against the clause-1 bar: `runs` is 3,704 of 7,021 and 92 cells are check-clean invalid wasm with NO filed row naming them · the three ingredients are each load-bearing and each was ablated**
+### D611 — [CLOSED 2026-08-30] a shape spelled BOTH as a named alias and ANONYMOUSLY minted two heap types, because canon rewrote only ONE of the two spellings' recorded types
+**closed 2026-08-30 · the filed repro RUNS and prints `7` · was `check-clean invalid wasm` ·
+found 2026-08-30 by grading the corpus (not the inventory) against the clause-1 bar · the three
+filed ingredients were each load-bearing and each re-ablated at the close · 3 distilled classes
+standing for **227 census cells** move `check-clean invalid wasm` → `runs`; `runs` → NOT-RUNS = 0,
+`→ silent` = 0 · **the filed lead was REFUTED** — `annShapeIndexOf` deduped every spelling onto
+ONE row and the split was two rows further on, at `buildStructTwins`**
 
-Repro:
+Repro (now `runs`):
 
     type N = 1 | 2
     type Box1 = {r: N}
@@ -17506,34 +17511,120 @@ Repro:
       if (wv.g).r == 1 { print(7) } else { print(0) }
     }
     rd({ r: 1 })
-    // vl check rc 0; vl run:
-    //   Invalid input WebAssembly code: type mismatch: expected (ref null $type), found (ref $type)
-    // SHOULD PRINT 7
+    // now: 7
 
-* **THREE INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING.** Remove any one and the program runs:
+* **THREE INGREDIENTS, EACH ABLATED, EACH LOAD-BEARING — re-run at the close against both
+  seeds.** The conjunction is what failed; every ablation ran on the base and still runs:
 
-  | change | outcome |
-  |---|---|
-  | as filed | **check-clean invalid wasm** |
-  | drop `type Box1` (the same-shape alias) | runs |
-  | spell the field and param `Box1` instead of `{r: N}` | runs |
-  | field type `i32` instead of the literal union `N` | runs |
+  | change | base (`0407ec5b`) | fix (`9ee0a69f`) |
+  |---|---|---|
+  | as filed | **check-clean invalid wasm** | **runs, prints 7** |
+  | drop `type Box1` (the same-shape alias) | runs | runs |
+  | spell the field and param `Box1` instead of `{r: N}` | runs | runs |
+  | field type `i32` instead of the literal union `N` | runs | runs |
 
-  So it is not "anonymous shapes are broken" and not "literal-union fields are broken" — it is
-  the CONJUNCTION: a shape that has a name AND is also written anonymously, whose field rep is
-  decided by a literal union.
-* **THE HYPOTHESIS TO TEST FIRST, AND IT IS NOT YET CONFIRMED.** `sSetLim`'s header names
-  THREE roots that mint a struct row from a shape spelling — `internInlineShapeTy`,
-  `internShapeAs`, `gaeEnsure` — against ONE dedup key, `annShapeIndexOf`. A top-level `type`
-  declaration mints through `internShapeAs`; an inline `{r: N}` mints through
-  `internInlineShapeTy`. The guess is that the two compute different keys for one structural
-  shape and the literal-union field is what separates the reps. **Confirm by instrumenting
-  `annShapeIndexOf` and printing the index each spelling receives** — do not take this
-  paragraph as the finding.
-* **`wasm-dis` is at `./node_modules/.bin/wasm-dis`** — the two `$type`s print under the same
-  elided name, so the disassembly is the only way to see whether they are two indices or one
-  index with two nullabilities. `(ref $t)` is a SUBTYPE of `(ref null $t)` in wasm, so a pure
-  nullability difference could not be a validation error: the heap types must differ.
+* **THE FILED HYPOTHESIS IS REFUTED, AND THE INSTRUMENT IT ASKED FOR IS WHAT REFUTED IT.** The
+  row said to instrument `annShapeIndexOf` and expect two keys for one shape. Printed, it
+  answers the opposite: for the filed program `internInlineShapeTy` is called FOUR times with
+  `nm={r:i32}` and `annShapeIndexOf` returns `existing=-1` once (minting row 0) and
+  `existing=0` on the other three. **One row serves every anonymous spelling.** `internShapeAs`
+  is never called at all — `Box1` is minted by a FOURTH root the `sSetLim` header does not name,
+  `collectS`'s `TypeDecl` arm (`emit_collect.vl:7326`), which pushes unconditionally with no
+  dedup query. So the struct table holds exactly:
+
+      ROW 0 name={r:i32}  sTyIx=66  field r code=0 elem=[]  canonId=9   twin=0
+      ROW 1 name=Box1     sTyIx=41  field r code=0 elem=[]  canonId=5   twin=1
+      ROW 2 name=GW       sTyIx=42                          canonId=6   twin=2
+      structFieldCodesEq(0, 1) = 1        ← the LAYOUTS are identical
+
+  Two rows, layout-equal, **different canon ids**, so `buildStructTwins` never merged them:
+  `keys[j] == keys[i]` is tested BEFORE `structFieldCodesEq`, so the pair was never even
+  compared. Field `g` of `GW` resolved to row 0 and `rd`'s param to row 1.
+
+* **THE MECHANISM IS THAT CANON REWRITES THE ANNOTATION AND NOT THE ALIAS REGISTRY.**
+  Printing each row's recorded arena type and its `r` field:
+
+      ROW 0  ty={r: i32}   field r = i32   numLitUnionBaseName="" canon=8
+      ROW 1  ty=Box1       field r = N     numLitUnionBaseName=i32 canon=4
+
+  `canonEmitTypeNames` rewrites the `TypeRef` `{r: N}` in place to `{r:i32}` — a numeric
+  literal union canons to its base scalar (`type Z = 0 | 1` → `i32`, the pass's own example) —
+  and banks the REWRITTEN spelling's type in `canonTyIxCol`. That is the type
+  `collectAnnShapes` / `collectNestedFieldShapes` hand to `internInlineShapeTy`, so the inline
+  row's `sTyIx` is post-canon. A DECLARED alias records `cUserTypes["Box1"]`, which was
+  populated during checking and which canon never revisits, so its `sTyIx` is pre-canon. One
+  structural shape, two arena types, two canon ids. Run the same file with the field typed
+  `i32` and both rows record canon id 2 and merge — which is exactly why the literal union was
+  the third load-bearing ingredient.
+
+* **THE FIX IS ONE RULE IN ONE PLACE: `repCanonFieldTy` in `emit_rep.vl`**, applied in the
+  TyObj FIELD descent of BOTH canon walks (`repCanonIdGo` and `repCanonKeyGo`). It softens a
+  numeric literal union to its base scalar through `numLitUnionBaseTy` — the checker's own
+  `softenLitTy` rule, which claims a type only when every member is a literal over the same
+  i32/i64/f64 base, and which excludes the STRING base by construction (a `"a" | "b"` alias
+  name IS its atom identity). It is canon's rule restated on the arena side, not a new
+  equivalence, and layout safety stays double-gated: `structFieldCodesEq` must still agree
+  positionally before two rows share a heap type. This is the same shape of fix
+  `repCanonKeyGo`'s TyUnion mix-widening arm already carries, one position over.
+
+* **THE FIELD POSITION IS THE BOUND, AND IT IS MEASURED RATHER THAN CAUTIOUS.** The wider
+  candidate — softening at the top of `repCanonId`/`repCanonKey`, i.e. at every position — buys
+  the SAME 227 cells and **loses 21 that run today**: the whole `d362*_numlitun_*` named set
+  (`type Z = 0 | 1` under `type L = Z[]`, a map value, a union member) goes `runs` →
+  check-clean invalid wasm, "expected (ref $type), found i32". A numeric literal union is its
+  base scalar in a FIELD slot; in the list / map-value / union-member layers it is not the same
+  interned row as its base, and the key is what keeps those apart. Refused on `runs` lost, and
+  the price it named is already carried — `distilled/named/d362*` is that set.
+
+* **BOTH RUNGS ARE LOAD-BEARING AND NEITHER ALONE IS THE LANDING.** Strip-all reproduces the
+  base seed byte-for-byte (`md5 0407ec5ba9f70e9394739cc5bddc537d`, checked by `md5sum`, not by
+  eye). Id-walk only: the witness runs, but the shadow harness (`VL_REP_SHADOW=1`) reports
+  `merge=4 len=9` on it — the string key still renders `{r:(@43|@44),}` while the id has
+  softened, which is exactly the drift `hcCheckKey` exists to catch. Key-walk only: `merge=0
+  split=4 len=9` and the **witness still fails** — `slotCanonId` consumes the id, not the
+  string. Both together: `merge=0 split=0 len=0` and the witness runs.
+
+* **THE RUNG IS REACHED AND IT CHANGES ITS ANSWER.** Counting both separately
+  (`reach` = called, `ans` = returned a different arena index): `tests/cases` **reach 9,942 ·
+  ans 28 · 7 files**; the distilled corpus **reach 15,059 · ans 62 · 28 files**. So it is live
+  over real code and moves the answer on a small, named population — not a rung that fires
+  everywhere and decides nothing, and not one that never fires.
+
+* **THE DISASSEMBLY IS WHERE THE TWO HEAP TYPES ARE VISIBLE**, and the row was right that
+  nothing else shows them: both print under the elided name `$type`. Base
+  (`./node_modules/.bin/wasm-dis`, binaryen 130):
+
+      (type $1 (struct (field (mut i32))))              ← the inline row
+      (type $2 (struct (field (mut i32))))              ← Box1's row, byte-identical
+      (type $3 (struct (field (mut (ref null $1)))))    ← GW.g points at $1
+      (type $6 (func (param (ref $2))))                 ← rd's param is $2
+
+  and after the fix `$1` and `$2` are ONE type, `GW.g` is `(ref null $1)` and `rd`'s param is
+  `(ref $1)`. `(ref $t)` is a subtype of `(ref null $t)`, so the row was also right that a pure
+  nullability difference could not have been the validation error.
+
+* **THE PRICE IS ELEVEN MODULES OF FEWER HEAP TYPES AND NOTHING ELSE.** Corpus byte-identity
+  (`cmp` of every module built by both seeds): `tests/cases` **1,960 identical · 1 DIFFER · 0
+  lost**, distilled corpus **3,785 identical · 11 DIFFER · 0 lost**. Every DIFFER was read:
+  the 3 D611 cells now run, and the other 9 are unchanged-class programs that lost one
+  duplicate struct type. `tests/cases/unions/struct-arms-numeric-tag.vl` is the readable one —
+  `type C = { kind: 0, r: f64 }` beside `type Cn = { kind: K0, r: f64 }` emitted two
+  byte-identical `(struct (mut i32) (mut f64))` heap types and now emits one, with identical
+  program output.
+
+* **58 OF 92 WAS A GROUPING BY MESSAGE, NOT BY MECHANISM, and only 3 of those cells are this
+  row.** The 58 are the corpus cells whose failure text is `expected (ref null $type), found
+  (ref $type)`; 3 carry D611's ingredients (`type N = 1 | 2` plus a same-shape alias plus an
+  anonymous spelling) and they represent 227 of the group's 395 census cells. After the fix
+  **zero** of the remaining 89 silent cells contain a numeric literal union alias at all; 77 of
+  them carry `type Shape = …` (D612's / D280's union-declaration ingredient) and one is D613's.
+  Both of those rows' filed repros are unchanged by this landing — re-run at the close, still
+  `check-clean invalid wasm` — so there is no overlap to split.
+
+* **THE REGRESSION FIXTURE IS `tests/cases/types/declared-vs-inline-numlitunion-field-twin.vl`**,
+  filed beside `declared-vs-inline-mixed-union-field-twin.vl`, which is the same defect one
+  union arm over. It pins both directions: the anonymous spelling flowing into the declared
+  field, and a `Box1`-annotated read of the same row.
 
 ### D612 — D280's layout twin, one indirection out: through a MAP-valued field read with `??`
 **[CLOSED 2026-08-30 by D621, in a different PR] the repro below RUNS and prints `0`, and its own prescribed control (`lv1["k0"] = { r: 1 }` before the read) prints `7` — both correct. Was: check-clean invalid wasm · 6 of the 92 · found 2026-08-30 with D611 · the ingredients are D280's exactly: a union declaration plus a same-shape alias twin, and that is precisely why D621 reaches it: this row's `Dot` is the DECLARED STRUCT TWIN whose existence made `armLayoutAmbiguousAt` decline the arm's field read**
