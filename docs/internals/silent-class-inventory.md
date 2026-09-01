@@ -24239,9 +24239,31 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   chasing the wrong axis; what survives from it is the disassembly (the call lowers correctly
   and `print` picks `__print_i32__`) and the fact that the annotated spelling works.
 
-  **The next probe should ask what the ANNOTATED path pins that the hole path does not**, on
-  the named-type pair above — two programs differing in one annotation, both with a named type,
-  which is a far tighter A/B than anything this row has used so far.
+  **THE ONE-ANNOTATION A/B, and it settles what the difference IS.** Two named-type programs
+  differing only in `function p(x)` vs `function p(x: S)`. Under `wasm-dis` the hole spelling
+  emits `call $fimport$0(call_indirect (type $6) …)` — the call's result handed straight to
+  `__print_i32__` — while the annotated one lands the same `call_indirect` in a `(ref $3)`
+  local and runs a string-print routine with its own length and buffer locals. **The call is
+  identical in both; only the print DISPATCH differs.**
+
+  **AND A THIRD RETRACTION: "the checker's answer does not survive into emit" was true only
+  for the ANONYMOUS spelling.** Publishing the argument's type onto the param node — captured
+  at the argument site, keyed by callee name and index, written after the statement loop —
+  DOES reach emit for a named type. Verified by poisoning `recordedParamPinName` to return a
+  non-empty marker: with the publish in place the previously-working named+plain-field cell
+  breaks, which it cannot do unless `nodeTyName(paramNode)` is now non-empty. The earlier
+  "lost across the phase boundary" reading came from testing only the anonymous shape, whose
+  name renders `""` for reasons that have nothing to do with phases.
+
+  **So the pin is necessary and NOT sufficient.** With `tn` non-empty and the pin firing, the
+  emitted module is byte-for-byte what it was: still `__print_i32__`. Whatever declines is
+  DOWNSTREAM of `paramStructIndex`, and the publish alone is not worth shipping — it changes
+  behaviour and fixes nothing, which is the bar this file keeps failing to hold to.
+
+  **A probe cannot use `emitFail` on this cell.** The emit SUCCEEDS — it produces an invalid
+  module rather than refusing — so recorded failures are dropped and the probe reads as never
+  fired. Use a behavioural A/B (poison a return value and watch a working cell break), which
+  is what established every fact above.
 
 * **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
   last expression) traps with or WITHOUT the annotation and is closed separately; this row's
