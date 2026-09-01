@@ -43,7 +43,12 @@ that pushes it over a couple of minutes, the gate is what needs rethinking, not 
 The parts, and what each is for:
 
 1. `deno task test`
-2. `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts` — the `ci-native` job, **not** part of the above
+2. `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts` — the `ci-native` job, **not** part of the above. The ci-native
+   job ALSO runs an explicit list of seed-backed lsp/playground suites that match neither
+   glob (ci.yml's "Editor features on the wasm compiler" step); gate.sh runs those as its
+   own gate, extracting the list FROM ci.yml at run time so the two files cannot drift
+   (`tests/ci_seed_coverage_test.ts` guards the anchor). Nine green local gates on a branch
+   that broke exactly those files is how #2105 merged red — hence the tenth gate.
 3. `scripts/native-fixpoint.sh` and `scripts/lint-self.sh`, plus **`deno lint`** if the
    change touches a `.ts` file — CI runs it as its own step, `lint-self.sh` does NOT cover it
    (that one lints the VL module graph and runs `vl fmt --check`), so a `.ts` edit can pass
