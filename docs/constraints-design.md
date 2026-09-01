@@ -205,7 +205,8 @@ what VL needs, and the WasmGC note above marks the only revisit trigger.
   generic whose operator demand should be documentation-stable.
 * **OQ-3 — accept Phase 2's scope-relative satisfaction?** The alternative (fields only)
   keeps bounds scope-independent but excludes UFCS, which is how std itself is written.
-* **OQ-4 — bound spelling**: `<T: Showable>` (proposed) vs `x: T & Showable`.
+* **OQ-4 — bound spelling**: RULED (owner, 2026-09-01, "OQ-4 seems reasonable") —
+  `<T: Showable>`.
 * **OQ-5 — declaration-checking strictness**: may a bounded body use ONLY what bounds
   grant (proposed — it is what makes the errors good), or do bounds merely add to
   inference?
