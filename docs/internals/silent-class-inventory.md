@@ -24208,43 +24208,40 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   function type when the receiver is a hole. So the checker's answer is not parked on either
   the call node or the callee node.
 
-  **THE CHECKER'S ANSWER DOES NOT SURVIVE INTO EMIT — that is the defect, and it is now
-  measured rather than inferred.** A full fix was built and it does not work, which is the
-  useful part: it rules out the two readings that looked most likely.
+  **TWO CLAIMS FILED HERE ARE RETRACTED, AND THE AXIS WAS WRONG.**
 
-  What the chain needs is `paramStructIndex` -> `paramStructIndexRaw` -> `fieldClosureFeOf`,
-  fed by `synthParamAnnots` pinning `p.parType` from `recordedParamPinName`. Measured, each
-  by A/B against a rebuilt compiler:
+  * **The "positive control" never compiled.** This row said the pin machinery was proven to
+    work by poisoning `recordedParamPinName` and watching a nominal-struct hole param break.
+    That witness was written `struct S { n: i32 }` — and **VL has no `struct` keyword**; types
+    are `type S = { n: i32 }`. The program failed with `undeclared identifier 'struct'` and I
+    read the parse error as the poison firing. A control that fails for its own reasons is not
+    a control.
+  * **The pin fires for NO hole param, so it is not the mechanism.** Re-run with the real
+    syntax: poisoning `recordedParamPinName` to a non-empty value changes nothing for a named
+    type either — `tn` is `""` in every hole-param case measured, and a working named-type
+    hole param reaches its answer by some other route entirely.
+  * **The axis is not anonymous-vs-named.** A NAMED type carrying a closure field fails
+    exactly as the anonymous shape does.
 
-  1. **The pin machinery works.** Forcing `recordedParamPinName` to return a resolvable-but-
-     wrong `"i32"` breaks a nominal-struct hole param outright (`type error`). Positive
-     control.
-  2. **It returns `""` for an anonymous shape**, and the same poison leaves both shape cells
-     byte-identical. The plain-field cell runs by another route and is not evidence of a pin.
-  3. **`solveUnannotParams` runs but solves nothing here.** A `tErr` probe fires during
-     `vl check`; the entry for `?p.0` is `-1`. The body constrains the param only to a
-     DEMANDED SHAPE, which the code deliberately refuses to adopt (it is a lower bound —
-     adopting one previously broke a working relay program).
-  4. **The only place the real type appears is the ARGUMENT site**, and it is already
-     substituted there: at `noteArgCstr` the expected type prints `{f: () => string}`, not a
-     `TyVar`. `assignableExpr`'s flow hook never fires for it, because a hole DESTINATION
-     accepts anything so no assignability check is made.
-  5. **Publishing it onto the param node does not reach the emitter.** Capturing the argument
-     type keyed by callee name and index, then writing `nodeTyIx[paramNode]` after the
-     statement loop, demonstrably lands (`hn=?p.0 sv=51`). At emit the same node still renders
-     EMPTY — with a `tyToEmitName(nodeTyIxOf(pIx))` fallback added and poisoned to fire on any
-     non-empty render, the output is byte-identical. A counter global incremented in
-     `solveUnannotParams` also reads zero when consulted from `synthParamAnnots`.
+  **THE CORRECTED MATRIX**, `vl check` clean on every row:
 
-  So the write is LOST between the phases, not merely unrenderable — the discriminator that
-  separates those two was run, and it says lost. **The next step is to find which channel
-  DOES carry a node type from check into emit** (nominal params arrive intact, so one exists)
-  and publish onto that, rather than to look for another type source or another reader.
+  | receiver | outcome |
+  | --- | --- |
+  | named type, plain `i32` field, hole param | runs |
+  | named type, closure field, hole param | **check-clean invalid wasm** |
+  | named type, closure field, ANNOTATED param | runs |
+  | anonymous shape, closure field, hole param | **check-clean invalid wasm** |
+  | named type, `i32`-returning closure, hole param | runs — i32 is the cell DEFAULT, so this passes by luck |
 
-  Field sweep, un-annotated receiver: plain `i32` runs, plain `string` runs, closure returning
-  **i32** runs (i32 is the cell DEFAULT, so it passes by luck), closure returning **string** is
-  the defect, closure field READ is a separate loud reject. Disassembly shows the result local
-  typed `i32` un-annotated against `(ref $3)` annotated.
+  So the defect is **a closure field whose result is a REF, reached through a param with no
+  annotation** — the shape's nominality is irrelevant, and annotating the param is what fixes
+  it. Everything above about anonymous shapes, `solvedParamTys` and cross-phase survival was
+  chasing the wrong axis; what survives from it is the disassembly (the call lowers correctly
+  and `print` picks `__print_i32__`) and the fact that the annotated spelling works.
+
+  **The next probe should ask what the ANNOTATED path pins that the hole path does not**, on
+  the named-type pair above — two programs differing in one annotation, both with a named type,
+  which is a far tighter A/B than anything this row has used so far.
 
 * **AND D980 IS ITS NEIGHBOUR, NOT ITS TWIN.** The tail-position cell (`x.f()` as a function's
   last expression) traps with or WITHOUT the annotation and is closed separately; this row's
