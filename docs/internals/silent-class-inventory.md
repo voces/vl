@@ -24242,6 +24242,14 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   nothing either. So the field is not reaching those sites as code 14 — establish what code it
   actually carries before trying a third variation on this theme.
 
+* **AND SHAPE-ROW MATCHING IS NOT THE MECHANISM AT ALL — the strongest form of the fix does
+  nothing.** Forcing `adoptedFieldCompat` to return FALSE for every closure-typed field, so no
+  two shapes carrying one can ever match into a row, leaves the witness unchanged. Whatever
+  gives the two object literals the same struct index does not go through that predicate, so
+  the whole `adoptedFieldCompat` / `shapeFieldElemName` line of attack is closed. Look at how
+  `structIndexOfObjCtx` interns a literal — a field-NAME-set match would explain every
+  measurement here.
+
 * The real fix is per-CALL resolution: monomorphise the hole function per receiver shape, or
   give the two shapes distinct struct rows so they cannot share a `call_indirect` type. The
   row-splitting route is the one the code is shaped for, but only once the code question above
