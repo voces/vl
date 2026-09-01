@@ -23674,6 +23674,63 @@ Repro (check rc 0; the EMITTER refuses):
     // SHOULD PRINT d. The hand-written if/else over the same value prints d today.
 
 ---
+### D962 — [CLOSED 2026-09-01 for a re-readable operand] `??` over a nullable VALUE-UNION box, closed as a REWRITE after two emit arms proved it could not be one
+
+**closed as `runs` for a RE-READABLE left operand · was a loud emit reject conceding capability after `vl check` rc 0 · D960 stays OPEN for a CALL operand, which the correctness bound below excludes · ZERO corpus cells; the probe and the fixture are the measurement · distilled corpus 0 movement, `runs → not-runs` ZERO, stdout dual-run over all 4,620 running cells 0 DIFFER · fixture `tests/cases/expressions/coalesce-nullable-union-box.vl`**
+
+D960 recorded that every piece already worked — `v == null` lowers over this rep, `if v != null`
+narrows, the default boxes — and only the `??` dispatch did not reach them. This closes it, and
+the route is the one the two failed emit arms pointed at rather than the one they attempted.
+
+* **IT IS A REWRITE BECAUSE THE EMIT ARMS PROVED IT HAD TO BE.** The second arm emitted a
+  perfectly correct `(if (result (ref $box)) …)` — both branches right, disassembled — and the
+  RETURN PATH wrapped it in a SECOND `struct.new $box`. That is `emit_rewrite`'s own `??`
+  header speaking: *"every consumer classifier … dispatches on the `??` NODE"*. Desugaring to
+  `if x != null { x } else { d }` leaves no node to classify, so the question cannot arise —
+  the same reasoning the non-nullable fold in that file already rests on.
+
+* **RE-READABLE OPERANDS ONLY, and here that is a CORRECTNESS bound rather than a cost one.**
+  The desugaring names the operand twice, and `exprReReadable` is exactly the predicate for
+  "evaluating this again is the same value with no second effect". A CALL operand keeps the
+  refusal; D960 remains its row.
+
+* **THE PREDICATE'S FIRST CUT WAS TOO BROAD, and the fixture that caught it says which axis.**
+  `K | null` over a literal union is a `TyNullable` over a 2-member `TyUnion` BY SHAPE, and its
+  rep is the interned i32 ATOM with `-1` for null — a niche, not a box. Admitting it broke
+  `literal-unions/nullable-litunion-coalesce.vl` with `bare null needs a struct-typed context`,
+  which is what a niche looks like when something treats it as a box. `tyIsLitUnion` is the
+  exclusion.
+
+* **AND THE SHAPE ARRIVES TWO WAYS.** `string | i32 | null` reaches the predicate as a union
+  carrying a `null` member OR as a `TyNullable` over the two-member union, depending on
+  spelling. The first cut handled only the former and the desugaring silently never fired —
+  which looked exactly like the arm not working.
+
+* **THREE CELLS IN THE FIXTURE, and the third is the one that matters.** Null takes the
+  default; the non-null branch keeps a STRING arm; the non-null branch keeps an I32 arm. A fix
+  that returned the box's payload at one fixed rep would pass the first two.
+
+Repro (now RUNS, printing `d`, `s`, `7`):
+
+    function mk(b: boolean, n: boolean): string | i32 | null {
+      if !b { return null }
+      if n { return 7 }
+      "s"
+    }
+    function pick(b: boolean, n: boolean): string | i32 {
+      const v = mk(b, n)
+      v ?? "d"
+    }
+    function show(b: boolean, n: boolean) {
+      const r = pick(b, n)
+      if r is string { print(r) } else { print(r) }
+    }
+    show(false, false)
+    show(true, false)
+    show(true, true)
+    // vl check rc 0; runs, prints d then s then 7.
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 

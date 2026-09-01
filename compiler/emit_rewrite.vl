@@ -39,6 +39,7 @@ import {
   opIdxFnAtNode,
   recordNodeTyFrom,
   tyIsLitUnion,
+  tyIsNulValueUnionBox,
   tyToEmitName,
   voidCoerceValAt,
   voidCoerceValCount,
@@ -75,12 +76,15 @@ import {
   fillArgDefaults,
   hasNamedArgs,
   mkArrayLit,
+  mkBinary,
   mkBlock,
   mkCall,
   mkFunc,
   mkIdent,
+  mkIf,
   mkIndex,
   mkMember,
+  mkNull,
   mkNum,
   mkParam,
   orderArgsByParamNames,
@@ -95,6 +99,7 @@ import {
   nameIsStructWithUnionField,
   nodeIsTypeDecl,
   nullablePartOf,
+  unwrapParen,
 } from "./emit_base"
 import { fnIndexOfInScopeChain } from "./emit_collect"
 import {
@@ -110,6 +115,7 @@ import {
 import {
   drwFieldClosure,
   exprIsClosure,
+  exprReReadable,
   fnIndexOf,
   nameIsWholeSpanShape,
   resolveShapeToNominal,
@@ -410,6 +416,33 @@ function drwWalk(ix: i32, ctx: i32) {
     // emitter's own loud reject.
     if n.binOp == "??" {
       if nodeTyExcludesNull(n.binLeft) { return n.binLeft }
+      // D962 — `x ?? d` OVER A NULLABLE VALUE-UNION BOX DESUGARS HERE, for the same reason
+      // the fold above lives here rather than in `emitCoalesce`: the header's argument is
+      // that "every consumer classifier dispatches on the `??` NODE", so a lowering the
+      // consumers do not know about is correct bytes in the wrong envelope. Two emit arms
+      // for this rep were built and both proved that exactly (D960): the second emitted a
+      // correct `(if (result (ref $box)) …)` and the return path wrapped it in a SECOND
+      // `struct.new $box`. Rewriting leaves no `??` node to classify, so the question
+      // cannot arise.
+      //
+      // RE-READABLE LEFT OPERANDS ONLY, and here that is a CORRECTNESS bound rather than a
+      // cost one: the desugaring names the operand twice, and `exprReReadable` is precisely
+      // the predicate for "evaluating this again is the same value with no second effect". A
+      // CALL operand keeps the `??` and the emitter's refusal, which is why D960 stays open.
+      if exprReReadable(unwrapParen(n.binLeft)) {
+        if tyIsNulValueUnionBox(nodeTyIxOf(n.binLeft)) {
+          const dsThen: i32[] = []
+          dsThen.push(n.binLeft)
+          const dsElse: i32[] = []
+          dsElse.push(n.binRight)
+          return mkIf(
+            mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
+            mkBlock(dsThen, n.pos),
+            mkBlock(dsElse, n.pos),
+            n.pos,
+          )
+        }
+      }
     }
     if drwDispatchOp(n.binOp) {
       const osi = structIndexOfExpr(n.binLeft, ctx)
