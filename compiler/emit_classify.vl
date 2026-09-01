@@ -587,9 +587,19 @@ function cloParamTok(paramIx: i32) {
   // `paramStructIdxOf` resolves a `S | null` annotation to S's row.
   // A VARIANT slot renders its layout-twin REPRESENTATIVE (`repSigVariantTok` — D199),
   // because that is the row whose `uVarHeap` index the functype BYTES carry.
-  if k == "variant" { return repSigVariantTok(paramStructIdxOf(paramIx)) }
+  //
+  // D925 — AND IT READS THE ROW *AFTER* THE MERGE, IN BOTH PHASES, which `paramStructIdxOf`
+  // does not. That resolver applies `anonLeafParamRowOf` behind `anonLeafEmitPhase`, because
+  // `collectAnonShapes` needs the PRE-merge answer to decide what to mint — but the `$fnsig`
+  // pool is interned by `collectCloSigs`, which runs long after the mint and long before the
+  // flag flips, while the `call_indirect` that LOOKS UP the key runs after it. One key written
+  // at the narrow row and read at the merged one is `emitProgram: function-value call arity has
+  // no interned signature` on a program that was silently invalid the moment before. The RESULT
+  // side already had this shape — `cloRetValSlot` goes through `anonLeafRetRowOf`, which has no
+  // phase gate (D915) — so this makes the two halves of one key agree.
+  if k == "variant" { return repSigVariantTok(paramStructIdxFinal(paramIx)) }
   if k == "struct" || k == "reflist" || k == "nulstruct" {
-    return repSigSlotTokOfKind(k, paramStructIdxOf(paramIx))
+    return repSigSlotTokOfKind(k, paramStructIdxFinal(paramIx))
   }
   // A NULLABLE-closure param (`((i32) => i32) | null`) stays OUTSIDE the value-call ABI
   // (only nullable-closure RESULTS are wired — the closure result carries the niche).
@@ -619,7 +629,7 @@ function cloParamTok(paramIx: i32) {
   // The direct spelling was the measurement: `function lamc(x: {[string]: i32}) { return x }`
   // runs today, and `const lamc = (x: {[string]: i32}) => x` — the same lowering, one
   // spelling over — was the reject. A map RESULT (`(n: i32) => c` over a map `c`) already ran.
-  if k == "map" { return repSigSlotTokOfKind(k, paramStructIdxOf(paramIx)) }
+  if k == "map" { return repSigSlotTokOfKind(k, paramStructIdxFinal(paramIx)) }
   // Every slot-free kind reads the shared canonical token table (emit_rep) — "" for the
   // kinds with no token character at all (`nulreflist`, `nulmap`, and the four
   // distinct-backing scalar-list niches), which keeps their signature un-interned so the
@@ -11202,6 +11212,47 @@ export function memReadBoxedAtomKind(memIx: i32, fnIx: i32): i32 {
   -1
 }
 
+// D927 — EVERY VALUE ATOM THE BOX AT THIS READ CAN HOLD, appended to `out` deduped, or FALSE.
+//
+// `memReadBoxedAtomKind` above answers the ONE atom the store's promotion ladder would have
+// put there, which is the right answer for an adoption (D209) and for a widened store (D291)
+// and the wrong one for a `??`-MERGED row: D804's mint boxes each family member at its own
+// atom, so the payload's kind is a run-time fact and not a static one. This is the set the
+// read has to dispatch over.
+//
+// FALSE — and the caller keeps today's single cast — for a union holding a member that is not
+// a scalar value atom, because then the tag chain would not partition the box and the
+// fall-through arm would cast the wrong payload. `null` is skipped rather than refusing: it is
+// never a payload this narrow read reaches, since the checker types such a read nullable and
+// the channel above declines a nullable atom.
+export function memReadBoxedAtomKinds(
+  memIx: i32,
+  fnIx: i32,
+  out: i32[],
+): boolean {
+  const un0 = memberUnionFieldNameRead(memIx, fnIx)
+  if un0 == "" { return false }
+  if narrowedValueAtomOf(memberPathKeyOf(memIx)) != "" { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(un0, atoms)
+  let i = 0
+  while i < atoms.length {
+    const k = valueAtomKind(atoms[i])
+    if k < 0 { return false }
+    if k != 6 {
+      let seen = false
+      let j = 0
+      while j < out.length {
+        if out[j] == k { seen = true }
+        j = j + 1
+      }
+      if !seen { out.push(k) }
+    }
+    i = i + 1
+  }
+  out.length > 0
+}
+
 // MEMBERSHIP of a scalar value atom in the union `nm`, answered from the banked KIND
 // column where the pool covers the set and from the member-NAME path where it does not.
 // Lifted out of `wasmEmit.vl` (where it was private) so the STORE ladder below and the
@@ -18072,6 +18123,24 @@ export function paramStructIdxOf(paramIx: i32) {
   const p = P.nodes[paramIx]
   if p is Param {
     return anonLeafParamRowOf(paramIx, annValtypeSlotOf(p.parType))
+  }
+  -1
+}
+
+// D925 — THE SAME ANSWER WITH THE `??` REDIRECT TAKEN IN EVERY PHASE, for the ONE caller whose
+// question is not "what row is this now" but "what row will the BYTES say": the `$fnsig`
+// interning key (`cloParamTok`). The mint is over the moment `collectAnonShapes` returns —
+// `anonLeafEmitPhase` flips much later only because that pass reads its own pre-merge answers —
+// and every pass that interns a closure signature runs in between. See `cloParamTok`.
+export function paramStructIdxFinal(paramIx: i32) {
+  const p = P.nodes[paramIx]
+  if p is Param {
+    const si = annValtypeSlotOf(p.parType)
+    if si < 0 { return si }
+    if paramIx < 0 { return si }
+    if paramIx >= anonLeafParamMoved.length { return si }
+    if anonLeafParamMoved[paramIx] != 1 { return si }
+    return anonLeafSupersedeOf(si)
   }
   -1
 }

@@ -25755,9 +25755,9 @@ Repro (now runs, printing `true`):
 
 ---
 
-### D903 — the MAP carrier of the merged box read still traps, and no cell had ever read the field back
+### D903 — [CLOSED 2026-08-31 by D927] the MAP carrier of the merged box read still traps, and no cell had ever read the field back
 
-**loads then traps · `wasm trap: cast failure` · 1 cell (`distilled/named/d903_map_join_read_i32_f64`), OPEN · PRE-EXISTING: master and the D901/D902 landing produce the identical trap at the identical offset, so this is NOT that landing's doing — it is the one carrier D901's fold deliberately does not reach**
+**closed as `runs` · was a `wasm trap: cast failure` · 1 cell (`distilled/named/d903_map_join_read_i32_f64`) · THE PRICE THIS ROW QUOTED WAS THE PRICE OF THE ROUTE IT CHOSE, and it overstates it: the `br_on_cast` encoder really is absent and was never one of the two options, because the box discriminates on a TAG FIELD and not on a type test, and the "reserved scratch local" is a zero-argument call. The fix is in the READ, exactly as this row said. See D927 · PRE-EXISTING: master and the D901/D902 landing produced the identical trap at the identical offset, so this is NOT that landing's doing — it is the one carrier D901's fold deliberately does not reach**
 
 Repro (loads then traps, on master and here alike):
 
@@ -26026,8 +26026,21 @@ Repro (now runs, printing `7`):
   the caller's own parameter), `d911_generic_callee` (the monomorphizer clones the annotation
   per instance), `d911_nested_arg_two_frames` (the depth cap is one frame),
   `d912_ann_named_ret` (a return spelled through a type ALIAS) and `d913_ret_binding_of_field`
-  (a binding written from a field read). All seven reproduce outcome-for-outcome on master
-  except `d911_arg_ident_narrow_use`, whose message moves.
+  (a binding written from a field read). All seven reproduced outcome-for-outcome on master
+  except `d911_arg_ident_narrow_use`, whose message moved.
+
+* **SIX OF THE SEVEN CLOSED THE SAME DAY (D921–D927), AND NOT ONE OF THEM NEEDED A NEW
+  READER.** Two were carriers this row's own machinery already reached and a NUMBER
+  refused (`d911_nested_arg_two_frames`, `d911_arg_ident_unnameable` — D921); one was a
+  spelling the atom reader declined (`d912_ann_named_ret` — D922); one was an OWNER this
+  line had never asked about, the member's second destination (`d911_arg_ident_narrow_use`
+  — D924, and D916's own diagnosis of it as a coercion was wrong); one was this row's
+  narrowed name-as-value guard stopping one binding hop short (`d911_fn_value_called` —
+  D925); and one was a mark the MONOMORPHIZER drops when it clones the node the mark is
+  keyed by (`d911_generic_callee` — D926, whose refusal was neither necessary nor
+  sufficient for its own stated reason). `d913_ret_binding_of_field` is the one that
+  remains, and D923 records why: its reader is written and measured and DELETED, because
+  the owner is a nested-struct field slot one layer out.
 
 ---
 
@@ -26206,9 +26219,9 @@ Repro (now runs, printing `13` then `0`):
 
 ---
 
-### D916 — a family member with a NARROW consumer: moving the literal moves it out from under the other destination
+### D916 — [CLOSED 2026-08-31 by D924] a family member with a NARROW consumer: moving the literal moves it out from under the other destination
 
-**check-clean invalid wasm · `type mismatch: expected (ref $type), found (ref $type)` · 1 cell (`distilled/named/d911_arg_ident_narrow_use`), OPEN · check-clean invalid wasm on master too (with a DIFFERENT message, `expected i32, found (ref $type)`), so it is not a regression · found by writing the control for D911's argument-ident reader**
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) · 1 cell (`distilled/named/d911_arg_ident_narrow_use`) · THIS ROW'S DIAGNOSIS OF THE ANSWER WAS WRONG in one word: the destination is not a COERCION, it is a SLOT, and D891 had already built the machinery for moving one. Everything else in it holds, including that the exposure is the whole `??`-merge line's and not this reader's. See D924 · was check-clean invalid wasm on master too (with a DIFFERENT message, `expected i32, found (ref $type)`), so it is not a regression · found by writing the control for D911's argument-ident reader**
 
 Repro (check-clean invalid wasm):
 
@@ -26309,3 +26322,396 @@ Repro (now runs, printing `7` — check-clean invalid wasm on master `3f2ebc40`)
   against its OWN baseline cannot see this by construction — the four cells did not exist on
   `5c0224de`. Grading against MASTER's baseline after a rebase is what caught it, and this is
   the first cross-PR interaction of the campaign.
+
+---
+
+### D921 — [CLOSED 2026-08-31] TWO carriers, and neither needed a reader: a depth CAP that was a refusal with a number in it, and a frame that was there all along
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · a CLAUSE-1 close, 2 filed cells (`distilled/named/d911_nested_arg_two_frames`, `d911_arg_ident_unnameable`) + 7 new · ABLATED: two rungs, reverting 3 probes each, 0 `runs` lost either way · measured against master `05965ff1`**
+
+Repro (now runs, printing `7` — check-clean invalid wasm on master):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function inner(): {r: i32} {
+      { r: 7 }
+    }
+    function mk(): {r: i32} {
+      inner()
+    }
+    function rd() {
+      const g1 = src(mk()) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D921: now RUNS and prints 7.
+
+* **`depth > 1` WAS NOT A BOUND, IT WAS A REFUSAL WITH A NUMBER IN IT.** `anonLeafCalleeRead`'s
+  header read "the depth cap is the second, independent bound and the only one a fresh name
+  meets". It is not a bound at all: every recursive entry to that reader goes through the `fns`
+  gate at its top — `anonLeafRetPathOk`'s Call arm, `anonLeafBoundValOk`'s Call arm and
+  `anonLeafParamArgsOk`'s call-valued-argument arm all call THAT function — a name already on
+  the path answers without re-reading, and each fresh name is pushed exactly once. So the
+  frames one read can open are bounded by the count of DISTINCT function names in the program,
+  whatever `depth` says. What the cap actually did was decline `src(mk())` where `mk`'s own body
+  hands back another call: two frames, one more than the number allowed.
+
+* **AND THE VISITED SET IS WHAT TERMINATES IT, WHICH IS A CELL AND NOT AN ARGUMENT.**
+  `d921_nested_arg_cycle` is mutual recursion (`a` calls `b` calls `a`) behind a nested
+  argument; it runs here and is check-clean invalid wasm on master. `depth` is kept only
+  because it is what a future COST bound would count.
+
+* **`body = -1` WAS NOT THE ONLY FRAME THERE IS.** `anonLeafArgIdentOk` reads an argument's
+  binding by name over the whole program and then handed the bound VALUE no frame, on the
+  stated ground that "a bound value that is itself an identifier has no frame to resolve
+  against here, so it refutes rather than half-reading a chain". There is a frame and it is
+  neither the call site's nor the callee's: a value written to a name resolves in the frame
+  holding THAT WRITE. `anonLeafFrameBodyOf` of the binding node is it, and with it
+  `const q = z; src(q)` inside `rd(z: {r:i32})` composes D842's reader with D891's parameter arm
+  rather than adding a third.
+
+* **THE BOUND IS MODULE SCOPE, AND IT IS REAL RATHER THAN AN OVERSIGHT.**
+  `d921_arg_ident_module_chain` binds the chain at module scope, where `anonLeafRetIdentOk` has
+  neither a body block to scan nor a parameter list to fall back on; it answers -1 and refutes
+  exactly as before.
+
+* **THE ABLATION.** Strip-all is master's own `compiler/` at `05965ff1`, rebuilt here rather
+  than quoted: **`af194c6d0a8afc1a0c16c5d667b9bbe9`, 1,585,201 bytes**, byte-identical to the
+  seed `agent-setup.sh` produces from master. Over the 30-probe battery: all nine rungs **25**,
+  strip-all **6**. Removing the depth cap alone reverts `d921_nested_arg_cycle`,
+  `d921_nested_arg_three_frames` and `d921_ret_call_two_frames`; removing the caller frame alone
+  reverts `d921_arg_ident_from_param`, `d921_arg_ident_two_hops` and
+  `d921_arg_ident_param_unread`. Neither loses a `runs` cell.
+
+* **COUNTERS, reach AND ans.** Over `tests/cases` + `std` (2,045 modules reporting) the depth
+  rung is reached **0** times and the frame rung **8 / 6** — no program there opens a third
+  frame, which is why the corpus alone could not have found this. Over the probe battery:
+  depth **10 / 8**, frame **16 / 14**.
+
+Fixture: `tests/cases/types/coalesce-merged-row-carrier-frames.vl`.
+
+---
+
+### D922 — [CLOSED 2026-08-31] a DECLARED return name is the same operand written down once, and the atom reader read the spelling
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · a CLAUSE-1 close, 1 filed cell (`distilled/named/d912_ann_named_ret`) + 3 new, one of which master ALSO gets wrong · ABLATED: one rung, 3 probes revert, 0 `runs` lost**
+
+Repro (now runs, printing `s` — check-clean invalid wasm on master):
+
+    type R = { r: i32 }
+    function src(): R | null {
+    }
+    function rd() {
+      const g1 = src() ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D922: now RUNS and prints s.
+
+* **THE ATOM READER READ THE ANNOTATION'S TEXT.** `anonLeafAnnAtomOf` splits the operand's
+  union, keeps the one non-null arm, and then requires `nameIsShapeSpanEnds(shape)` before it
+  can split the shape's fields out of the spelling. A declared name has no spelling to split, so
+  the rung declined — while the identical operand written inline answered. The fields now come
+  off the DECLARATION's own `FieldDef` nodes, and the atom is still `anonLeafAtomOfText`'s
+  six-plus-one vocabulary, so a set this contributes to is still one `nameFieldCode` can code.
+
+* **REFUSES ON DISAGREEMENT AND NEVER MATCHES A GENERIC DECLARATION**, for
+  `anonLeafJoinAnnTy`'s reason: two declarations of one name give the operand no single declared
+  type. A `type Box<T>` carries its parameter span in `tdName`, so the plain-name compare never
+  fires on one.
+
+* **AND IT CLOSES A SECOND CELL MASTER GETS WRONG, at a DIFFERENT message.**
+  `d922_ann_alias_f64_narrower` (`type R = {r: i32}` … `let a: R | null = null` … `?? {r: 1.5}`)
+  is `type mismatch: expected i32, found f64` on master — D918's annotation-WIDTH question asked
+  through an alias, which no inline cell reaches because inline the same shape already runs.
+  `d922_ann_alias_absent` is the inline control and runs on master and here alike.
+
+* **COUNTERS.** Over `tests/cases` + `std`: asked **3**, answered **2**. Over the probe battery:
+  **6 / 6**. Corpus `cmp` **0 DIFFER** outside this landing's own fixtures.
+
+Fixture: `tests/cases/types/coalesce-merged-row-carrier-frames.vl`.
+
+---
+
+### D923 — a returned binding whose value is a FIELD READ: the reader was built and MEASURED and is REVERTED, because its owner is one layer out
+
+**check-clean invalid wasm · `type mismatch: expected i32, found (ref $type)` · 1 cell (`distilled/named/d913_ret_binding_of_field`), OPEN · reproduces identically on master `05965ff1`, so it is not a regression · the reader half is written, graded and DELETED rather than shipped**
+
+Repro (check-clean invalid wasm, on master and here alike):
+
+    function src(p: {r: {r: i32}}): {r: i32} | null {
+      const v = p.r
+      v
+    }
+    function rd() {
+      const g1 = src({ r: { r: 7 } }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // vl check rc 0; vl run -> type mismatch: expected i32, found (ref $type)
+    // SHOULD PRINT 7.
+
+* **THE READER IS THE EASY HALF AND IT WORKS.** A `Member` arm on `anonLeafBoundValOk` that
+  reads the BASE into a scratch (`out`/`fns`/`pars` all fresh, because the base's own row does
+  NOT move and publishing its owners would move a slot with no member behind it) and then
+  projects each base literal's field. Built, it moves this cell from
+  `expected i32, found (ref $type)` to `expected (ref null $type), found (ref null $type)` —
+  silent to silent, ZERO cells bought.
+
+* **THE OWNER IS THE NESTED-STRUCT FIELD SLOT, AND AN UNGATED REDIRECT THERE IS WRONG.** The
+  disassembly says it exactly: `$1 = (struct (field (mut (ref null $0))))` is the OUTER row and
+  `$0` the narrow inner one, so the call site emits `struct.new $1 (struct.new $0 (i32.const 7))`
+  while `src`'s result valtype has already moved to the merged row. `sFieldTgtStructIdx` is the
+  one home for "which row does this nested-struct field target", and applying
+  `anonLeafSupersedeOf` there would move EVERY `{r: i32}`-typed nested field in the program —
+  `anonLeafRetMoved`'s own witness one layer down, and reachable by hand: a second
+  `{r: {r: 3}}` literal whose inner value is not a family member would then mint narrow into a
+  merged field.
+
+* **SO IT IS D804'S MECHANISM ONE LAYER UP THE NESTING, not a reader gap.** The owner literal
+  needs its OWN row (a variant of the outer row whose field is the merged one), which is three
+  or four more rungs: the mint gate has to admit an owner whose nested field holds a member,
+  without making that owner a family MEMBER (which would put its atom in the set), and the
+  parameter slot delivering it has to follow.
+
+* **THE READER IS DELETED RATHER THAN LEFT IN.** A reader without its owner is exactly what
+  `anonLeafJoinCallee` refuses for — "a returned value the reader did NOT move would be built at
+  the narrow row and handed back at the merged one" — and D891's precedent is that the reader
+  half ships WITH its owner. This row records that it was written and what it measured, so the
+  next attempt starts from the owner.
+
+---
+
+### D924 — [CLOSED 2026-08-31] the family member's OTHER destination is an EIGHTH owner, and D916 called it a coercion
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) · a CLAUSE-1 close, 1 filed cell (`distilled/named/d911_arg_ident_narrow_use`, filed as D916) + 3 new · ABLATED: one rung, 2 probes revert, 0 `runs` lost · the control `d911_narrow_sibling_param` still runs**
+
+Repro (now runs, printing `7` then `7` — check-clean invalid wasm on master):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function keep(q: {r: i32}): i32 {
+      q.r
+    }
+    function rd() {
+      const q = { r: 7 }
+      const g1 = src(q) ?? { r: "s" }
+      print(g1.r)
+      print(keep(q))
+    }
+    rd()
+    // D924: now RUNS and prints 7, 7.
+
+* **EVERY READER SINCE D804 MAKES A LITERAL A MEMBER, AND NOTHING ASKED WHERE ELSE IT GOES.**
+  D916's row was right that this is "the whole `??`-merge line's standing price, not this
+  reader's" — D842's own IDENT reader has had the exposure since it shipped. It was wrong about
+  the shape of the answer: it called it "a per-DESTINATION coercion at the narrow use, which is
+  a rung of its own". A coercion would be a struct COPY, which changes aliasing. The destination
+  is a SLOT, and D891 already built the machinery for moving one (`anonLeafParamMoved` →
+  `anonLeafParamRowOf`). `anonLeafNarrowUseMark` marks the slots that receive a member and the
+  seventh owner's own redirect does the rest.
+
+* **THE POSITION HAS TO BE *ALL* MEMBERS, WHICH IS WHAT KEEPS THE CONTROL RUNNING.** A slot fed
+  by a member at one call site and by an ordinary literal at another cannot be at both rows.
+  `d911_narrow_sibling_param` runs on master and here; `d924_narrow_use_mixed_sites` feeds ONE
+  callee both and is the standing bound.
+
+* **AND IT EARLY-OUTS ON "IS THERE A FAMILY AT ALL", which is not tidiness.** Every rung of the
+  pass is a whole-arena scan and they nest. The compiler's own source has no live `?? { … }`, so
+  the mark array is all zeros — and the ungated first cut took the seed's self-compile from 12
+  seconds to past 23 MINUTES on a pinned core, which no corpus cell could show because every
+  cell there is small. One O(n) read of the marks buys it back: self-compile is **9.3 s** here
+  against **11.8 s** for master's seed on the same source, byte-identical output.
+
+* **COUNTERS.** Over `tests/cases` + `std`: **174** slot positions asked, **14** marked, every
+  one inside D911's own fixture — which is the single module corpus `cmp` reports as DIFFER.
+  Over the probe battery: **27 / 13**.
+
+Fixture: `tests/cases/types/coalesce-merged-row-narrow-use.vl`.
+
+---
+
+### D925 — [CLOSED 2026-08-31] a call through a binding this can RESOLVE is not an indirect one, and D911's narrowed guard stopped one hop short
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · a CLAUSE-1 close, 1 filed cell (`distilled/named/d911_fn_value_called`) + 3 new · ABLATED: TWO rungs — the guard reverts the filed cell, the call-site half reverts `d925_fn_value_binding_arg` and NOTHING ELSE, which is why that cell exists**
+
+Repro (now runs, printing `7` — check-clean invalid wasm on master):
+
+    function src(p: {r: i32}): {r: i32} | null {
+      p
+    }
+    function rd() {
+      const f = src
+      const h = f({ r: 9 })
+      const g1 = src({ r: 7 }) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D925: now RUNS and prints 7.
+
+* **D911 NARROWED THE GUARD TO ITS OWN STATED REASON AND LEFT THE CALL UNREAD.** That reason is
+  "the arguments a `call_ref` passes are not at any call site this can read", and
+  `anonLeafAnyIndirectCall` implemented it as "is the callee's name bound to a value". But
+  `const f = src; f({r: 9})` puts its argument at a call site as plainly as `src({r: 9})` does —
+  the callee is spelled with one binding hop, and the hop is a `LetDecl` the same scan already
+  reads. `anonLeafCalleeFnName` resolves that hop; a name bound to a `Param`, to two different
+  functions, or to anything that is not one function's name still answers "" and still counts.
+
+* **THE TWO HALVES ARE ORDERED AND BOTH ARE LOAD-BEARING.** The guard half alone lets the family
+  move; the call-site half is what makes the move HONEST, because without it `f(…)`'s arguments
+  are never read and a value reaches the moved slot unmoved. The 29-probe battery scored the
+  call-site half at ZERO, and that was the battery's fault: `d925_fn_value_binding_arg` passes a
+  BINDING through the value rather than a literal written in place, and it reverts to
+  check-clean invalid wasm with that half removed. **Cite the number you ablated** — this one
+  needed a probe written to find it.
+
+* **AND IT EXPOSED A PHASE SPLIT IN THE `$fnsig` KEY.** With the family moving, the first cut
+  swapped one silent failure for `emitProgram: function-value call arity has no interned
+  signature`. `cloParamTok` resolved its slot through `paramStructIdxOf`, which applies
+  `anonLeafParamRowOf` behind `anonLeafEmitPhase` — but `collectCloSigs` interns the pool long
+  after the mint and long before that flag flips, while the `call_indirect` that LOOKS UP the
+  key runs after it. One key written at the narrow row and read at the merged one.
+  `paramStructIdxFinal` takes the redirect in both phases, which is the shape the RESULT side
+  has had since D915 (`cloRetValSlot` → `anonLeafRetRowOf`, no phase gate).
+
+* **THE BOUNDS.** `d925_fn_value_two_targets` (a binding written from two different functions)
+  and `d925_fn_value_param_callback` (a callback PARAMETER, whose value is whatever the caller
+  passed) both still refute, on master and here alike.
+
+* **COUNTERS.** Over `tests/cases` + `std`: the resolver is asked **2,742** times and answers
+  through the binding hop **0** — which is why `cmp` is 0 DIFFER outside this landing's fixtures.
+  Over the probe battery: **289 / 12**.
+
+Fixture: `tests/cases/types/coalesce-merged-row-narrow-use.vl`.
+
+---
+
+### D926 — [CLOSED 2026-08-31] the monomorphizer CLONES the node a `??` owner mark is keyed by, and the two marks had drifted to opposite wrong answers about it
+
+**closed as `runs` · was check-clean invalid wasm (`type mismatch: expected i32, found (ref $type)`) · a CLAUSE-1 close, 1 filed cell (`distilled/named/d911_generic_callee`) + 4 new, TWO of which are defects master has and nothing had filed · ABLATED: two rungs, the carry reverts 4 probes and the refusal 3**
+
+Repro (now runs, printing `7` — check-clean invalid wasm on master):
+
+    function src(p: {r: i32}, t): {r: i32} | null {
+      p
+    }
+    function rd() {
+      const g1 = src({ r: 7 }, 1) ?? { r: "s" }
+      print(g1.r)
+    }
+    rd()
+    // D926: now RUNS and prints 7. NOTE there is no `<T>` in this program.
+
+* **BOTH MARKS ARE ARENA-NODE KEYED AND `monoMakeInstance` MINTS NEW NODES.**
+  `anonLeafParamMoved` is indexed by `Param` node and `anonLeafRetMoved` by `FuncDecl` node;
+  the monomorphizer calls `mkParam` and `mkFunc` for every instance (the BODY is copy-on-write
+  and shared, the wrappers never are), and every reader — `emitOneFuncType`, `emitFuncCode`,
+  `paramStructIdxOf`, `anonLeafRetRowOf` — resolves through the POST-mono declaration.
+  `collectAnonShapes` is pass 3 and `monomorphize` is pass 16, so the marks are final at clone
+  time and were then silently dropped. There is no node-level clone→origin map to recover them
+  from afterwards; `monoOrigNode` is `fnStmts`-slot granular.
+
+* **THE TWO SITES HAD DRIFTED TO OPPOSITE WRONG ANSWERS.** `anonLeafParamArgsOk` refused a callee
+  with `fnTyParams` OUTRIGHT; `anonLeafMarkRetMoved` had no guard at all. **The refusal was
+  neither necessary nor sufficient for its own stated reason.** `monoIsGenericDecl` — the actual
+  cloning predicate — is `fnTyParams.length > 0` OR any un-annotated parameter, so
+  `function src(p: {r: i32}, t)` has an empty `fnTyParams`, is marked, is cloned, and is
+  check-clean invalid wasm on master (`d926_hole_param_clone`, the repro above). So is a GENERIC
+  callee returning a literal, which no guard covered at all (`d926_generic_ret_clone`). Neither
+  had a filed row before this one.
+
+* **CARRYING THE MARK NEEDS NO GUARD, and that is what makes deleting the refusal safe rather
+  than merely narrower.** `anonLeafSupersedeOf` is a bounds-checked identity outside the family,
+  so an instance whose parameter annotation was RE-SYNTHESISED per pin (`synthTypeRefFb` — the
+  `p: T` case the old comment was right about) resolves to a row the merge never touched and the
+  redirect is a no-op. Only a parameter whose pinned row IS the family's narrow row moves, and
+  for a concrete annotation the arena type node is literally shared with the original.
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130) on
+  `d926_generic_callee_read`. Master: the instance is
+  `(func (param (ref $0) i32) (result (ref null $0)))` over the narrow
+  `(type $0 (struct (field (mut i32))))`, and no merged row is minted at all. Here it is
+  `(func (param (ref $1) i32) (result (ref null $1)))` over
+  `(type $1 (struct (field (mut (ref $2)))))` with `$2` the `{tag, anyref}` box — the param and
+  the result moved together, which is the pair the carry covers.
+
+* **THE CONTROL IS `d926_generic_unrelated`**: a generic function ELSEWHERE in a module with a
+  merged family runs on master and here alike, so it is the callee being cloned and not the
+  monomorphizer's presence.
+
+* **COUNTERS.** Over `tests/cases` + `std` the carry is asked **2,589** times and carries **0** —
+  no module there monomorphizes a `??` family's callee. Over the probe battery: **21 / 11**.
+
+Fixture: `tests/cases/types/coalesce-merged-row-mono-clone.vl`.
+
+---
+
+### D927 — [CLOSED 2026-08-31] the merged box holds TWO atoms and the read cast to one, and the price D903 quoted was for a route it did not have to take
+
+**closed as `runs` · was `trap_loads` (`wasm trap: cast failure`) · a CLAUSE-1 close and the campaign's LAST TRAP, 1 filed cell (`distilled/named/d903_map_join_read_i32_f64`) + 4 new, one of which master also traps on · ABLATED: one rung, 2 probes revert, 0 `runs` lost · the mint-side alternative was BUILT, GRADED and REFUSED**
+
+Repro (now runs, printing `7` — `wasm trap: cast failure` on master):
+
+    function rd() {
+      const c = Map()
+      c["k1"] = { m: 7 }
+      const g5 = (c)["k1"] ?? { m: 1.5 }
+      print(g5.m)
+    }
+    rd()
+    // D927: now RUNS and prints 7.
+
+* **`memReadBoxedAtomKind` ANSWERS ONE ATOM AND A MERGED BOX HOLDS TWO.** That one answer is
+  right for an ADOPTION (D209 — the box is the adoption's rep and the checker never widened the
+  value) and for a WIDENED store (D291 — the field's declared member is `i64`, the store widened,
+  the checker still types the read `i32`). It is wrong for D804's merged row, which boxes each
+  family member at its OWN atom: the map store puts an `i32` in at one site and the `??` default
+  an `f64` at the other, `unionStoreAtomKind` answers `f64` for both, and the read emitted an
+  unconditional `ref.cast (ref $vbF64)` over an `i32` payload.
+
+* **THE PRICE D903's ROW QUOTED IS THE PRICE OF THE ROUTE IT CHOSE, AND IT OVERSTATES THAT
+  ROUTE.** The row said the fix "needs either a reserved `(ref null $uBox)` scratch local or a
+  `br_on_cast` on the payload, which this emitter has no encoder for yet". The second half is
+  TRUE — `emit_bytes.vl`'s GC table has twelve sub-opcodes and carries neither `br_on_cast`
+  (`0xfb 0x18/0x19`) nor `ref.test` — and it was never one of the two options, because the box
+  discriminates on a TAG FIELD and not on a type test. `emitPrintValueUnion` and the
+  shared-union-field dispatch already write exactly that chain. And the "reserved scratch local"
+  is `sharedFieldRecvSlot()`: a zero-argument call whose lazy-frame slot is already typed
+  `(ref null $uBox)`, already imported by `wasmEmit.vl`, with two existing users. The shipped
+  change is **one `if`/`else` chain and a widening companion to `emitNarrowStoredAtomKind`** —
+  no new opcode, no new encoder.
+
+* **ONLY WHERE EVERY ARM REACHES THE CHECKER'S ATOM, which is what leaves the running families
+  alone.** An `i32|string` box read as `i32` has no conversion for its string arm — that is
+  D804's own population, `d927_map_join_read_i32_string`, and it takes today's single cast
+  unchanged. `i32|f64` and `i32|i64` convert both, and `d927_map_join_read_i32_i64` is a SECOND
+  cell master traps on that nothing had filed.
+
+* **THE MINT-SIDE ALTERNATIVE WAS BUILT AND MEASURED AND IS REFUSED — the price is the thing
+  worth keeping.** Folding the container-indexed join is two lines: drop
+  `anonLeafJoinLhsIndexed`'s conjunct in `anonLeafPolyUnionSetOpen`, and admit `code == 17`
+  in `shapeFieldTypeCompatK`'s `lenient >= 2` ladder, where its two lattice siblings 23 (`i64`)
+  and 24 (`f32`) already sit. It closes this exact cell, and the distilled corpus grades it
+  **1 class `runs` → NOT-RUNS: `d833_genpin_i32_f64`** (`expected i32, found f64` — two
+  same-fieldset rows survive the generic pin, the map's vals array is over the i32 one, and the
+  default's literal resolves to it rather than to the folded row). A `runs` cell lost is the veto
+  term. Both `d833` cells run on the shipped change.
+
+* **NOTHING FOUND THIS FOR A WHOLE FAMILY BECAUSE NOTHING READ THE FIELD BACK.**
+  `d927_map_join_no_read` is that cell kept whole: it is `d833_none_i32_f64`'s shape ending in
+  `print(0)`, and it runs on master. **A `??`-merge cell that does not read its merged field
+  back is not evidence about the merged field.**
+
+* **REAL DISASSEMBLY** (`./node_modules/.bin/wasm-dis`, binaryen 130). Master:
+  `(struct.get $3 0 (ref.cast (ref $3) (struct.get $1 1 (struct.get $0 0 (local.get $1)))))` —
+  one unconditional cast to the f64 value box. Here the box is stashed in a local and the read is
+  `(if (result f64) (i32.eq (struct.get $1 0 (local.get $21)) (i32.const 0)) (then
+  (f64.convert_i32_s (struct.get $2 0 (ref.cast (ref $2) …)))) (else (struct.get $3 0 (ref.cast
+  (ref $3) …))))` — the tag decides, and the i32 arm widens.
+
+* **COUNTERS.** Over `tests/cases` + `std` the arm is asked **35** times and dispatches **0** —
+  every un-narrowed code-16 read there holds one atom. Over the probe battery: **6 / 3**.
+
+Fixture: `tests/cases/types/coalesce-merged-row-tag-dispatch.vl`.

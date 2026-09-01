@@ -140,24 +140,17 @@ const registerRunCommand = (context: ExtensionContext) => {
       return;
     }
     const doc = editor.document;
-    // Resolve the terminal's cwd from the document's real location *before* any
+    // Resolve the project root from the document's real location *before* any
     // temp mirroring (a temp file under os.tmpdir() has no deno.json above it).
-    // A `deno.json` ancestor (the compiler repo's own dev loop, where `vl`
-    // defaults its seed to <cwd>/build/) wins; every other project runs from
-    // its WORKSPACE FOLDER, then from the file's own directory, then $HOME.
-    // NEVER the extension install path: the old last rung was
-    // `dirname(context.extensionPath)`, written for an in-tree dev-host install
-    // — under a symlinked install it opened the terminal in
-    // `~/.vscode-server/extensions`, a directory that means nothing to the user.
+    // Prefer walking up from the file; fall back to its workspace folder, then
+    // to the extension's parent dir for an in-tree (dev-host) install.
     const docDir = doc.uri.scheme === "file"
       ? path.dirname(doc.uri.fsPath)
       : undefined;
     const folder = Workspace.getWorkspaceFolder(doc.uri)?.uri.fsPath;
     const cwd = (docDir && findProjectRoot(docDir)) ??
       (folder && findProjectRoot(folder)) ??
-      folder ??
-      docDir ??
-      os.homedir();
+      path.dirname(context.extensionPath);
     // If the resolved root changed, the existing terminal is anchored to the
     // wrong directory — dispose it so the recreate branch below runs with the
     // correct cwd.
@@ -166,19 +159,13 @@ const registerRunCommand = (context: ExtensionContext) => {
       terminal = undefined;
       terminalCwd = undefined;
     }
-    // A `*.test.vl` file goes through the TEST RUNNER (`vl test <file>`) —
-    // `vl run` on a test module executes only its registration pass, which
-    // "succeeds" without running a single test. Decided on the DOCUMENT's own
-    // name (an untitled buffer can't be a test file).
-    const isTest = !doc.isUntitled && doc.uri.path.endsWith(".test.vl");
     // Run the buffer as-is, with no save side effect: an untitled or unsaved
     // (dirty) document has no usable on-disk path, so mirror its current text to
-    // a reused temp file — keeping the `.test.vl` suffix when the source is a
-    // test file, since the runner discovers by that suffix. A clean, saved file
-    // runs by its real path (accurate error paths, no temp clutter).
+    // a reused temp file. A clean, saved file runs by its real path (accurate
+    // error paths, no temp clutter).
     let file: string;
     if (doc.isUntitled || doc.isDirty) {
-      file = path.join(os.tmpdir(), isTest ? "vital-run.test.vl" : "vital-run.vl");
+      file = path.join(os.tmpdir(), "vital-run.vl");
       await writeFile(file, doc.getText());
     } else {
       file = doc.uri.fsPath;
@@ -217,7 +204,7 @@ const registerRunCommand = (context: ExtensionContext) => {
       terminalCwd = cwd;
     }
     terminal.show(true);
-    terminal.sendText(`${binToken} ${isTest ? "test" : "run"} "${file}"${compilerArg}`);
+    terminal.sendText(`${binToken} run "${file}"${compilerArg}`);
   };
 
   context.subscriptions.push(Commands.registerCommand("vital.runFile", run));
