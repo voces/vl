@@ -80,13 +80,17 @@ Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its st
   // an inferred nullable-STRUCT return until D887 recorded that shape's row and gave the A20
   // pass and `emitReturnValue` the arms the annotated path already had. Any still-open
   // capability gap serves; what this asserts is the CHANNEL, not the gap.
+  // D937 CLOSED the i32-valued spelling, so the witness has moved a THIRD time — by one word,
+  // to a `string`-valued map. The five sites D937 wired are restricted to the i32-valued mono
+  // shape (that is the shape whose slot is the mono default), so every other value type still
+  // floors on this exact channel with the message unchanged.
   // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
-  // for this one, so when it closes this witness has to move again.
+  // for the closed half; when the rest closes, this witness moves again.
   const diags = await checker.check(
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: {[string]: i32} = Map()",
+      "  const m: {[string]: string} = Map()",
       "  m",
       "}",
       "function go() {",

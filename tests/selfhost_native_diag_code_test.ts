@@ -70,7 +70,7 @@ Deno.test({
 }, () => {
   const exp = instantiate();
   // An INFERRED nullable-MAP return is type-valid; codegen cannot lower it un-annotated
-  // (the annotated `: {[string]: i32} | null` spelling of the same function builds and runs).
+  // (the annotated `: {[string]: string} | null` spelling of the same function builds and runs).
   //
   // THE WITNESS HAS MOVED TWICE, AND WHY IS THE POINT OF THE TEST. It was
   // `print(pick(true))` over an `i32 | string`, which now RUNS — D712 built the box-tag
@@ -79,14 +79,17 @@ Deno.test({
   // inferred-return row so the A20 pass and `emitReturnValue` could take the arms the
   // annotated path already had. What this test pins is the CHANNEL (a capability admission
   // carries a stable code), so any still-open capability gap serves as its witness.
+  // D937 closed the i32-valued spelling, so it has now moved a THIRD time — by one word, to a
+  // `string`-valued map, which still floors on this channel with the message unchanged (D937's
+  // five sites are restricted to the i32-valued mono shape).
   // `scripts/capability-probes/inferred-nullable-container-return.vl` is the standing probe
-  // for this one; when it closes, this moves again.
+  // for the closed half; when the rest closes, this moves again.
   const { rc, diags } = check(
     exp,
     [
       "function pick(c: boolean) {",
       "  if c { return null }",
-      "  const m: {[string]: i32} = Map()",
+      "  const m: {[string]: string} = Map()",
       "  m",
       "}",
       "function go() {",
