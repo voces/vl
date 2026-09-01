@@ -24161,9 +24161,36 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   its own row once this one is closed; do not fold them together on the strength of both
   involving `J[]`.
 
+### D987 — a module carrying BOTH a string-returning and a non-string closure field of the same layout
+
+**loads then traps · clause 1 · split out of [D976](#d976); it was check-clean invalid wasm before that fix and is broken on both sides of it**
+
+    const s = { f: () => "ok" }
+    const b = { f: () => 7 }
+    function hole(z) {
+      print(z.f())
+    }
+    print(s.f())
+    hole(b)
+
+* **THE TWIN-LAYOUT HAZARD, and it is real.** `{f: () => string}` and `{f: () => i32}`
+  collapse to the SAME layout heap type, so `fieldClosureFeOf` — which scans object literals
+  for one with a matching struct index — can resolve the WRONG lambda's `fe`. The guard in
+  `exprString`'s Member arm that defers to the checker's recorded result type exists exactly
+  to catch this, and it is untouched by D976's fix: a RESOLVED disagreement still wins.
+
+* **NOT A REGRESSION FROM D976 — measured against a compiler built before it.** Every mixed
+  spelling tried fails on both sides: `hole` alone, `hole` beside an ANNOTATED string consumer,
+  and `hole` beside a directly-called string closure. Before the fix the module does not build
+  at all; after it, the string call runs and the non-string one traps. Both are clause-1, and
+  no spelling that ran before stopped running.
+
+* **EITHER SHAPE ALONE IS FINE.** `{f: () => 7}` through a hole param prints `7`, and
+  `{f: () => "ok"}` prints `ok`. It takes both in one module.
+
 ### D976 — a closure-valued FIELD called on a HOLE-typed parameter: the call lowers correctly and `print` picks the wrong import
 
-**check-clean invalid wasm · reported by the owner, minimized by vl-b7, verified here · `scripts/capability-probes/hole-param-closure-field-call.vl` is the standing measurement**
+**closed · was check-clean invalid wasm · reported by the owner, minimized by vl-b7, fixed here · `tests/cases/closures/closure-field-call-hole-param.vl`**
 
     const a = { f: () => "ok" }
     function p2(x) { print(x.f()) }
