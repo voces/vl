@@ -24020,10 +24020,22 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   repeating it. A nesting bound of 64 on `collectTyReachRegister` also changes nothing, which
   does rule that one out as the looping frame.
 
-* **THE NEXT INSTRUMENT SHOULD BE THE FUNCTION INDEX, not another guess.** The backtrace names
-  a three-frame cycle by wasm function index; mapping those indices through the import count
-  to the disassembly is the one step that has not been tried, and reading candidate source has
-  now failed seven times.
+* **TWELVE CANDIDATES ELIMINATED WITH A SOUND INSTRUMENT — nesting counters, on builds
+  verified to have installed.** Wrapped as `f(...) { if n > 40 { fail }; n = n + 1; const r =
+  fGo(...); n = n - 1; r }`, which measures DEPTH rather than call frequency:
+  `registerInlineUnion`, `collectTyMembersReach`, `collectTyReachRegister`, `internArmShapeAt`,
+  `internShapeDeepTy`, `mvArmSigOfName`, `mvDeepArmOfTy`, `mvDeepDeclOfTy`,
+  `rlCanonLitUnionAtoms`, `tyMentionsFunc`, `tyReachesFuncD`, `collectTyReachCloSigs`. None
+  nests past 40. `rtGo`/`rtOfMap` and `tyToStrAt` are out on structure (memoise-before-recurse
+  and an existing depth cap).
+
+* **THE MASS-WRAP SHORTCUT DOES NOT WORK, and the reason is worth knowing before trying it.**
+  Wrapping every function in a module mechanically requires each one's RETURN TYPE, and VL
+  infers most of them — defaulting the annotation-less ones to `i32` makes 189 wrappers return
+  `i32 | string` and the module stops type-checking. A wrapper needs the real type, so a
+  whole-module sweep needs the checker's answer, not a regex's guess.
+
+* **THE NEXT INSTRUMENT SHOULD BE THE FUNCTION INDEX
 
 ### D983 — a `u8[] | null` destination fed by an ARRAY LITERAL: the cell was the packed wrapper, the value the shared i32 backing
 
