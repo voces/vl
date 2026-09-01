@@ -115,12 +115,23 @@ monaco.languages.register({
 // semantic-token provider does the accurate identifier/member colouring, but
 // Monarch runs first and synchronously, so strings and comments are coloured
 // even before semantic tokens resolve (and inside an erroring document).
+//
+// `keywords` is one of FIVE keyword vocabularies in the tree, and it was the
+// worst of them: it carried `fn` and `elseif`, neither of which is VL syntax at
+// all (the parser's own comment: "there is no fused `elseif` keyword"), and it
+// lacked `match`. `tests/keyword_vocabulary_test.ts` derives the hard set from
+// `compiler/lexer.vl`'s `keywordKind` and the soft set from `parser.vl`'s
+// contextual guards, and requires this array to be EXACTLY their union — so an
+// invented word fails as loudly as a missing one. Soft keywords are painted for
+// the same reason as in the TextMate grammar: they are real syntax where they
+// appear, and a same-spelled identifier is re-coloured by the semantic-token
+// provider, which keys off the lexer's actual token kind.
 monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
   defaultToken: "",
   keywords: [
-    "fn", "function", "if", "else", "elseif", "while", "for", "to",
-    "step", "in", "const", "let", "return", "is", "await", "break", "continue",
-    "from", "type", "import", "export", "as", "true", "false", "null",
+    "as", "await", "break", "const", "continue", "else", "export", "false",
+    "flat", "for", "from", "function", "if", "import", "in", "is", "let",
+    "match", "new", "null", "return", "step", "to", "true", "type", "while",
   ],
   tokenizer: {
     root: [

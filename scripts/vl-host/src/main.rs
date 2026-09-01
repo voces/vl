@@ -1501,12 +1501,23 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
     // A re-export (`export { … } from "…"`) is a module dependency too, so it must
     // also arm the fetch loop — gate on a leading `import {` OR `export {`.
     // A TEMPLATE LITERAL WITH A HOLE also arms it: the hole desugars to a call
-    // into `std:fmt`, which the compiler can only reach through this loop. The
-    // same predicate lives in `compiler/cli_util.vl` (`cliHasTplHole`),
-    // `lsp/src/wasmChecker.ts` and `tests/cases_wasm_test.ts`, and its header
-    // there records why it is a real scan rather than `contains('`')`: a backtick
-    // in a `//` comment is ordinary (2,409 corpus files carry one) and must not
-    // move a program off the single-source path.
+    // into `std:fmt`, which the compiler can only reach through this loop. Its
+    // scan is real rather than `contains('`')` because a backtick in a `//`
+    // comment is ordinary (2,409 corpus files carry one) and must not move a
+    // program off the single-source path.
+    //
+    // FOUR IMPLEMENTATIONS, THREE LANGUAGES, and they must agree — a host that
+    // does not arm the loop leaves the guest asking for a module nobody fetches,
+    // and the symptom is SILENCE rather than an error:
+    //   1. `compiler/cli_util.vl`        `cliLineIsImport` / `cliHasTplHole` / `cliNeedsModules`
+    //   2. HERE (`stage_program`)        this gate + `has_template_hole`
+    //   3. `compiler/moduleGate.ts`      the shared TS copy, imported by …
+    //   4. … `lsp/src/wasmChecker.ts` (VS Code LSP + browser playground) and
+    //      `tests/cases_wasm_test.ts` (the corpus oracle)
+    // 3 and 4 were two hand-maintained copies until they lost the `export {` arm
+    // #2182 added here; they are one module now. 1 and 2 cannot import it, so
+    // they stay MIRRORED — `tests/module_gate_agreement_test.ts` is the guard:
+    // it extracts this gate's arm set from THIS SOURCE and fails when it drifts.
     let has_imports = source.lines().any(|l| {
         let t = l.trim_start();
         let imp = t
