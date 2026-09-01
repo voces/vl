@@ -141,9 +141,12 @@ Two ways a refusal's own words misled a brief on 2026-08-31, both costing an age
   cells differing only in a type name would group — and primitive WIDTHS went with them. The
   conceded bucket printed `== over iN[] has no lowering`; I read it as `i32[]`, checked
   `i32[] == i32[]` by hand, found it RUNS, and briefed an agent that the bucket was a
-  capability lost at the pin. **None of those cells is `i32[]`** — the raw list is `i64[]`,
-  `f64[]`, `string[][]`, `Circle[]` and friends, every one of which refuses at its DIRECT
-  spelling too. The agent built a 100-pair direct/pin grid to prove there was no disagreement
+  capability lost at the pin. **None of those cells was `i32[]`** — the raw list was
+  `i64[]`, `f64[]`, `string[][]`, `Circle[]` and friends, every one of which refused at its
+  DIRECT spelling too. (D751/D752 have since BUILT those compare cores, so `Circle[] ==
+  Circle[]` now prints `true` at both spellings. The lesson is the normalisation, not the
+  list — and this paragraph going stale inside one campaign is the second-order version of
+  the same mistake: a citation is a measurement with a date on it.) The agent built a 100-pair direct/pin grid to prove there was no disagreement
   anywhere. Fixed: a primitive width keeps its digits, every other number still collapses.
 
 * **A refusal's sentence describes the arm that fired, not the feature.** Three in one day were
