@@ -22503,10 +22503,15 @@ Repro (now runs, printing `7`):
   INVALID WASM — the one movement worth vetoing. The code now comes from `nameFieldCode(set)`,
   the same speller a declaration asks, and only the two codes whose companion column this mint
   can fill are admitted: 16 (records the set) and 20 (a bare niche, records ""). `boolean|null`
-  (code 21) is spellable and still DECLINED — the row mints, the declared twin of the same
-  program runs, but an `#anon` row carrying a code-21 field interns no map-value slot and the
-  pair would trade `bare null needs a struct-typed context` for the less informative
-  `unsupported map value type`. That mv-slot rep is a separate rung.
+  (code 21) is spellable and was DECLINED here — the row mints, but an `#anon` row carrying a
+  code-21 field interned no map-value slot and the pair would trade `bare null needs a
+  struct-typed context` for the less informative `unsupported map value type`. **D902 (CLOSED
+  2026-08-31) admits it**: the mv-slot rung this called separate is ONE line in the NAME row
+  resolver, which unlike `fieldCodeWidensElem` is handed the field's TEXT and so can make the
+  boolean/i32 distinction code 0 erased. The map witness at the boolean atom now RUNS. Note
+  also that "the declared twin of the same program runs" is true of `const v: R = { r: null }`
+  and FALSE at the `??` shape — `type R = { r: boolean | null }` beside `?? { r: null }` took
+  the same loud reject on master; see D902.
 
 * **DECLARING THE MERGED SHAPE ALWAYS WORKED** — `type Circle = { r: i32 | null }` makes the
   repro print on master — which is what makes this a capability gap and not a rule. This mints
@@ -25149,7 +25154,8 @@ Repro (now runs, printing `0`):
   same decline: 21 records no companion column, 30 records the non-null alias name — the column
   `sFieldIsLitUnion` recovers the atom rep and the membership from. `anonLeafPolyFieldCode` admits
   a code exactly when this mint can fill its companion, which is now three codes (16, 20, 30) on
-  one test rather than two by enumeration. 21 still declines, for its own recorded reason.
+  one test rather than two by enumeration. 21 declined here for its own recorded reason and is
+  admitted by D902 (CLOSED 2026-08-31), which paid that reason off.
 
 * **THE ADMISSION GUARD IS A `runs → not-runs` I CAUSED AND CAUGHT, and it is a cell.** A VALUE's
   atom is read off the value, so `{r: "b"}` contributes `string`. `let a: {r: K} | null = {r:
@@ -25475,11 +25481,11 @@ Repro (now runs, printing `7`):
 
 ---
 
-### D892 — a `??`-merged BOX read at the `i32` / `f64` atom pair loads then traps, at EVERY carrier
+### D892 — [CLOSED 2026-08-31 by D901/D902] a `??`-merged BOX read at the `i32` / `f64` atom pair loads then traps, at EVERY carrier
 
-**loads then traps · `wasm trap: cast failure` · 3 cells (`distilled/named/d892_box_direct_i32_f64`, `_binding_i32_f64`, `_param_i32_f64`) of a 48-cell grid, OPEN · PRE-EXISTING: the first two reproduce on master `a57d6390`'s own seed, so this is NOT D891's doing — D891 adds the third carrier's instance of the same defect (`_param_i32_f64` was check-clean invalid wasm on master and is the ONE cell in the whole landing that moved silent → trap), which is why the grid is kept whole in `named/`**
+**closed as `runs` · was `loads then traps` / `wasm trap: cast failure` · a CLAUSE-1 close, and the whole 48-cell grid now grades **48 of 48 `runs`** (master: 42 runs, 3 loud emit reject, 3 loads-then-traps) · the `i32`/`f64` half is D901 and the `boolean`/`null` half is D902 · corpus `cmp` **2,485 modules · 2,039 identical · 0 DIFFER · 0 LOST** · distilled corpus 6 classes → `runs`, **`runs → not-runs` ZERO, `→ silent` ZERO***
 
-Repro (loads then traps, on master and here alike):
+Repro (now runs, printing `7`):
 
     function src(): {r: i32} | null {
       { r: 7 }
@@ -25490,26 +25496,171 @@ Repro (loads then traps, on master and here alike):
     }
     rd()
 
-* **THE GRID IS CARRIER × ATOM PAIR AND IT SPLITS ON THE PAIR, NOT ON THE CARRIER.** 48 cells:
+* **THE GRID SPLIT ON THE PAIR AND NOT ON THE CARRIER, AND SO DOES THE FIX.** 48 cells:
   carrier ∈ {the literal directly, a returned binding, a returned parameter} × A ∈ {i32, string,
   f64, boolean} × B ∈ {i32, string, f64, boolean, null}, A ≠ B, each READING the field back.
-  Master: `runs` 32, check-clean invalid wasm 8, loud emit reject 6, **loads-then-traps 2**. Here:
-  `runs` 42, loud emit reject 3, loads-then-traps 3. Every one of master's 8 silent and 6 loud
-  cells is a `param` carrier and closes; the pair that traps is `A=i32, B=f64` and it traps at
-  all three carriers.
+  All three carriers of `A=i32, B=f64` trapped and all three of `A=boolean, B=null` were loud;
+  no carrier ever separated anything. Both halves are one line each in the SET builder and the
+  CODE speller, and neither is carrier-aware.
 
-* **DROPPING THE READ HIDES IT.** `print(0)` instead of `print(g1.r)` and the same program RUNS
-  on master — which is why D871's row recorded the `?? { r: 1.5 }` twin as running: it was
-  measured at the no-read shape. The defect is in the box READ, not in the mint.
+* **NOTHING IN THE GRID IS SILENTLY WRONG TODAY.** The re-grade found `runs but wrong value`
+  at ZERO cells: `d892_box_param_boolean_i32` prints `true` (#2069's fix, re-verified) and its
+  `direct`/`binding` twins agree. The `f64`/`i32` cells that "run by luck" were checked for a
+  LATENT trap and there is none — the shapes that would take the default branch
+  (`src(): {r: f64} | null { null }`, and a conditional `src` in another function) do not build
+  a merged family at all, so the box they would have to cast through is never minted.
 
-* **AND MASTER IS SILENTLY WRONG ONE CELL OVER.** `d892_box_param_boolean_i32` RUNS on master and
-  prints **`1`** for a boolean field, while master's own `d892_box_direct_boolean_i32` prints
-  `true`. D891 makes the parameter carrier agree with the other two. A `runs but wrong value` that
-  no filed row had, found by reading the grid rather than the headline.
+* **DROPPING THE READ STILL HIDES IT** — the mechanism is the read, exactly as filed, and D871's
+  no-read measurement of the same twin is still the explanation for why the row was late.
 
-* **THE 3 LOUD EMIT REJECTS LEFT ARE THE `boolean|null` DECLINE**, recorded in D804's own header:
-  code 21 records no companion column and an `#anon` row carrying it interns no map-value slot.
-  That is a separate rung and it is not this row.
+---
+
+### D901 — [CLOSED 2026-08-31] the merged mint boxed a pair the CHECKER'S JOIN FOLDS TO ONE TYPE, and a box nothing agrees is a box TRAPS
+
+**closed as `runs` · was `loads then traps` / `wasm trap: cast failure` · a CLAUSE-1 close · ABLATED family 4 cells over 2 atom pairs (`i32`/`f64` × 3 carriers + the new `i32`/`i64` axis), mechanism-minimal witness 6 lines / 96 bytes · four rungs, EVERY ONE load-bearing, counters `reach=8 ans=2` of 8 probes · corpus `cmp` **2,485 · 2,039 identical · 0 DIFFER · 0 LOST** · `runs → not-runs` ZERO, `→ silent` ZERO**
+
+Repro (now runs, printing `7`):
+
+    function src(): {r: i32} | null {
+      { r: 7 }
+    }
+    function rd() {
+      const g1 = src() ?? { r: 1.5 }
+      print(g1.r)
+    }
+    rd()
+
+* **THE CHECKER AND THE MINT DISAGREED ABOUT WHETHER THERE WAS A UNION AT ALL, AND THE
+  DISASSEMBLY SHOWS IT.** `joinTys` is `assignable`-driven and `numWidensName` makes i32→f64 and
+  i32→i64 LOSSLESS, so the `??`'s merged field type is `f64` — measured, not assumed: a
+  deliberate type error reports ``cannot assign f64 to 'x' of type string``. The mint built the
+  atom set off the literal VALUES, got `{i32, f64}`, and coded the field 16. Master's module:
+
+      (type $3 (struct (field i32) (field anyref)))     ;; the box
+      (struct.new $3 (i32.const 0) (struct.new $4 (i32.const 7)))   ;; src: tag 0, i32 payload
+      (struct.new $3 (i32.const 4) (struct.new $5 (f64.const 1.5))) ;; default: tag 4, f64
+      (call $fimport$4 (struct.get $5 0 (ref.cast (ref $5) (struct.get $3 1 …))))
+
+  **No tag test.** The read follows the checker, so it unboxes the f64 arm unconditionally, and
+  the value that arrives is the i32 one. On the close the box is gone entirely — the row is
+  `(struct (field (mut f64)))`, both operands build `f64.const`, and the read is one
+  `struct.get`. **Where the checker DOES keep a union the tag test survives untouched**:
+  `d892_box_direct_i32_string` still emits `(struct (field i32) (field anyref))`, `i32.eq` on
+  the tag and a `ref.cast` per arm, byte-identical to master.
+
+* **FOUR RUNGS AND EVERY ONE COSTS A `runs` CELL WHEN REMOVED.** Ablated one at a time against
+  the shipped baseline:
+
+        rung                                            removed →
+        anonLeafFoldedAtom (+ codes 17/23 admitted)     4 runs LOST (the 3 i32/f64 carriers, d901_direct_i32_i64)
+        anonLeafFoldBlocked (the f32-destination bound) 1 runs LOST (d901_fold_f32_dest)
+        anonLeafJoinLhsIndexed (the container bound)    1 runs LOST (d833_genpin_i32_f64)
+        anonRowServesLeafSet's folded-set arm           1 runs LOST (d861_call_globalbind_f64)
+
+  A FIFTH rung was written, measured at **0 of 7,487 cells**, and REMOVED — the missing
+  `i32 → f64` edge in `fieldCodeWidensElem` / `shapeFieldTypeCompatK`'s widening list (which
+  carries i32→i64 and even the LOSSY i32→f32, but not f64). It was load-bearing before the
+  container bound existed and became dead the moment that bound landed. Strip-all reproduces
+  master's seed byte-for-byte (`md5 d4396c4e963741f1d4b310f028ac71b4`).
+
+* **THE FOLD IS BOUNDED AT `i32` AND AT TWO ATOMS, AND BOTH BOUNDS ARE PAID-FOR CELLS.**
+  `d901_fold_f32_dest` — `function src(): {r: f32} | null { { r: 2.5 } }` beside `?? { r: 7 }` —
+  RUNS on master and the unbounded first cut lost it: the atom column reads a bare float literal
+  as `f64` with no destination to consult, so an f32 carrier presents `{i32, f64}` while the
+  checker's join is `f32`, and folding gave `Invalid input WebAssembly code … expected f32,
+  found f64`. `d833_none_i32_f64` and `d833_genpin_i32_f64` are the other bound: a merged row
+  that ALSO serves a map value slot has two consumers at two field types — the map's values stay
+  `{r: i32}` while the `??` result is `{r: f64}` — and the box is the only rep that serves both,
+  which is D804/D833's own argument. Both sets are in `named/`.
+
+* **A NEW AXIS THE 48-CELL GRID NEVER HAD.** The grid's atoms are {i32, string, f64, boolean,
+  null}; `i64` is a sixth the mint can name and the same defect reaches it. `d901_direct_i32_i64`
+  traps on master (`wasm trap: cast failure`) and runs here. `f64`/`i64` is NOT folded and must
+  not be — the checker unions those (`f64 | i64`, measured) and the box is right.
+
+---
+
+### D902 — [CLOSED 2026-08-31] D804's declined `boolean|null` code, and the mv-slot rung it called separate was ONE line in the NAME resolver
+
+**closed as `runs` · was `loud emit reject: emitProgram: bare null needs a struct-typed context` · a CLAUSE-2 capability gap · ABLATED family 5 cells (3 grid carriers + the DECLARED twin + D804's own map witness), and the DECLARED spelling refuses on master too, so it was never a mint-only gap · counters `reach=8 ans=2` of 8 probes · corpus `cmp` 0 DIFFER · 0 LOST · `runs → not-runs` ZERO, `→ silent` ZERO**
+
+Repro (now runs, printing `true`):
+
+    function src(): {r: boolean} | null {
+      { r: true }
+    }
+    function rd() {
+      const g1 = src() ?? { r: null }
+      print(g1.r)
+    }
+    rd()
+
+* **D804's HEADER PREDICTED THE PRICE EXACTLY, AND THE PRICE IS NOW ZERO.** That row admits only
+  the codes "whose COMPANION column this mint can fill" and declines 21 with a measured reason:
+  an `#anon` row carrying `boolean|null` interns no map-value slot, so the pair would trade
+  `bare null needs a struct-typed context` for `unsupported map value type`. Admitting 21 alone
+  reproduces that trade exactly — `d902_map_bool_null` is D804's own repro at the boolean atom
+  and it takes the mv message. **The mv gap is one line.** `structIndexOfTypeName`'s third pass
+  is handed the field's TEXT, not just its code, so the boolean/i32 distinction code 0 erased is
+  sitting in `t`: `if code == 21 { return t == "boolean" }`. `fieldCodeWidensElem`'s twin still
+  refuses 21 and is still right to — it is handed two codes and cannot make that distinction.
+  With both rungs the map witness RUNS (prints `7`), which is better than the loud reject master
+  had.
+
+* **THE GAP WAS NEVER MINT-ONLY, and the declared twin proves it.** D804's header says "the
+  DECLARED twin of the same program runs (`type R = { r: boolean | null }`)" — true of
+  `const v: R = { r: null }`, and FALSE of the `??` shape: `d902_decl_bool_null_join` declares
+  `R` and still took the loud reject on master, as did the annotated-binding
+  (`const g1: R = …`) and parameter-typed (`use(src() ?? { r: null })`) spellings. What runs on
+  master is the `??` default given its OWN declared binding (`const d: R = { r: null }` then
+  `src() ?? d`) — the literal in default position is the whole of it.
+
+* **THE CLOSE IS THE NICHE, NOT A BOX.** Disassembly: `(struct (field (mut i32)))` with
+  `i32.const 1` for `true` and the sentinel `i32.const 2` for `null` — `emitNullLitNode`'s
+  `pendingNulBool` arm, which `emitObj`'s code-21 leg has always seeded and which the mint's
+  declined code was starving. No `{tag, payload}` struct is emitted for this pair at all.
+
+* **BOTH RUNGS ARE LOAD-BEARING.** Removing the code-21 admit loses 5 `runs` cells (the three
+  grid carriers, the declared twin and the map witness); removing the name-side boolean arm
+  loses 1 (the map witness) and leaves the other four running.
+
+---
+
+### D903 — the MAP carrier of the merged box read still traps, and no cell had ever read the field back
+
+**loads then traps · `wasm trap: cast failure` · 1 cell (`distilled/named/d903_map_join_read_i32_f64`), OPEN · PRE-EXISTING: master and the D901/D902 landing produce the identical trap at the identical offset, so this is NOT that landing's doing — it is the one carrier D901's fold deliberately does not reach**
+
+Repro (loads then traps, on master and here alike):
+
+    function rd() {
+      const c = Map()
+      c["k1"] = { m: 7 }
+      const g5 = (c)["k1"] ?? { m: 1.5 }
+      print(g5.m)
+    }
+    rd()
+
+* **IT IS D901's MECHANISM AT A CARRIER D901 CANNOT FOLD.** The checker's join of the map's
+  value type and the default literal is `f64`; the mint boxes `{i32, f64}`; the read follows the
+  checker and unboxes the f64 arm with an unconditional `ref.cast`. D901 fixes that everywhere
+  the fold is sound, and here it is NOT: the merged row also serves the map's value slot, whose
+  identity is keyed by the CHECKER's value type `{m: i32}`, so one row would have to carry one
+  field at two codes. D804/D833's box is the only rep that serves both, and `d833_none_i32_f64`
+  / `d833_genpin_i32_f64` are the two `runs` cells that measured what happens when it is folded
+  away anyway. The fold stands down for a container-indexed join and this cell is what is left.
+
+* **NOTHING FOUND IT BECAUSE NOTHING READ THE FIELD.** Both `d833` cells build this exact family
+  and end in `print(0)`. D871 recorded the same blind spot one row over — "dropping the read
+  hides it" — and it cost this family a second discovery. **A `??`-merge cell that does not read
+  its merged field back is not evidence about the merged field.**
+
+* **THE FIX IS IN THE READ, NOT THE MINT.** `emitUnionFieldNarrowUnbox`'s `mAtom == ""` arm is
+  D209/D291's channel: it asks `memReadBoxedAtomKind` for the ONE kind the payload was stored
+  as and narrows it to the checker's atom. A `??`-merged box genuinely holds two, so no single
+  `bk` is right and the read has to DISPATCH on the tag, converting each arm to the checker's
+  atom. That needs either a reserved `(ref null $uBox)` scratch local (the shape
+  `emitPrintValueUnion` already has) or a `br_on_cast` on the payload, which this emitter has no
+  encoder for yet. Neither belongs in the mint.
 
 ---
 

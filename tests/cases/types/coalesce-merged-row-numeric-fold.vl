@@ -1,0 +1,67 @@
+// @run
+// @log 7
+// @log 7
+// @log 1.5
+// @log 2.5
+// CONTRACT (must-RUN): D901. A `??` joins two same-fieldset object literals whose leaf atoms
+// are on the CHECKER'S LOSSLESS WIDENING LATTICE (`typecheck.numWidensName`: i32->i64,
+// i32->f64). `joinTys` is `assignable`-driven, so the merged field type is the WIDER atom and
+// not a union at all — `g1.r` type-checks as `f64` here, provably: annotate it `string` and
+// the checker says `cannot assign f64 to 'x' of type string`.
+//
+// D804's mint built the atom set off the literal VALUES, saw `{i32, f64}` and coded the field
+// 16 — a `{tag, payload}` box. Nothing else in the program agreed it was a box: the READ
+// follows the checker, unboxes the f64 arm with an UNCONDITIONAL `ref.cast (ref $vbF64)`, and
+// the payload that arrives on the `src()` path is the i32 one. `vl check` rc 0, module loads,
+// `wasm trap: cast failure`. `anonLeafFoldedAtom` drops the absorbed atom so the field is a
+// plain f64 (code 17) that `emitObj`'s own widening arm fills, and the box is not emitted at
+// all — no tag test and no cast, because there is no union.
+//
+// THE FOLD IS BOUNDED AT `i32` AND AT TWO ATOMS, and both bounds are paid-for `runs` cells.
+// `fold_f32` below is the first one: a bare float literal reads as the atom `f64` with no
+// destination to consult, so in an f32-annotated carrier the set is `{i32, f64}` while the
+// checker's join is `f32` (the literals CONFORM to the annotation, nothing widens). Folding
+// there emitted `expected f32, found f64`. `anonLeafFoldBlocked` declines when a row over the
+// same field-name set already spells the field as a scalar outside the pair.
+//
+// The second bound is the CONTAINER: a merged row that also serves a map's value slot has two
+// consumers at two field types — the map's values stay `{r: i32}` while the `??` result is
+// `{r: f64}` — and D804/D833's box is the only rep that serves both, so
+// `anonLeafJoinLhsIndexed` stands the fold down for a container-indexed join.
+// `distilled/named/d833_none_i32_f64` and `_genpin_i32_f64` are the cells that measured it,
+// and they do not READ the field back. The map carrier that DOES read it still traps, on
+// master and here alike — that is D903, filed OPEN, pinned as
+// `distilled/named/d903_map_join_read_i32_f64` and deliberately NOT in this must-run file.
+//
+// `f64 | i64` is NOT folded and must not be: neither widens into the other, the checker unions
+// them, and `bignum` below reads the box back through the tag dispatch that is still there.
+
+function srcI(): {r: i32} | null { { r: 7 } }
+function rd() {
+  const g1 = srcI() ?? { r: 1.5 }
+  print(g1.r)
+}
+rd()
+
+function srcJ(): {s: i32} | null { { s: 7 } }
+function rdJ() {
+  const g2 = srcJ() ?? { s: 9223372036854775807 }
+  print(g2.s)
+}
+rdJ()
+
+// f64 beside i64: no lattice edge either way, so the box and its tag test stay.
+function bignumSrc(): {b: f64} | null { { b: 1.5 } }
+function bignum() {
+  const g3 = bignumSrc() ?? { b: 9223372036854775807 }
+  print(g3.b)
+}
+bignum()
+
+// THE BOUND: an f32 destination, where the checker folds the other way.
+function foldF32Src(): {q: f32} | null { { q: 2.5 } }
+function foldF32() {
+  const g4 = foldF32Src() ?? { q: 7 }
+  print(g4.q)
+}
+foldF32()
