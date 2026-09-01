@@ -110,6 +110,10 @@ import {
 } from "./ast"
 // The free INDEX-OPERATOR declaration-name encoding (B14).
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
+// A node's START offset and the token sitting at it — the `argument N`
+// mismatch anchor for a function-literal argument (`tErrAtNodeStart`), whose
+// `nodeToks` last-token anchor is its closing brace.
+import { nodePos, tokIndexAt } from "./fmt_util"
 import { isBinOpFuncName } from "./ast"
 // The parser's SPELLING TREE (D-PARSETY, #1117) — what `parseTypeName` saw,
 // before it concatenated it into a name. `tsToTy` resolves from this instead of
@@ -6808,6 +6812,29 @@ function tErrCoded(msg: string, at: i32, code: string) {
       co = t.col
     }
   }
+  tErrPush(msg, at, ln, co, code)
+}
+
+// `tErr`, positioned at node `at`'s START token instead of its `nodeToks`
+// last-token anchor — for a multiline construct (a function literal argument)
+// whose last token is a closing brace a whole body away from what the message
+// names. `tat` still records the node, so the repeat-dedupe key is unchanged;
+// `diagEndCol` still resolves the last-token anchor, and BOTH consumers clamp
+// an end that lands before this start (the CLI caret to one char, the LSP
+// range to zero width), so the position degrades to a point at the start.
+// Falls back to the plain anchor when the node has no source start.
+function tErrAtNodeStart(msg: string, at: i32) {
+  const sp = nodePos(at)
+  if sp >= 0 {
+    const tk = tokIndexAt(sp)
+    if tk >= 0 && tk < P.toks.length {
+      return tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, "")
+    }
+  }
+  tErr(msg, at)
+}
+
+function tErrPush(msg: string, at: i32, ln: i32, co: i32, code: string) {
   // An EXACT repeat (same message, same anchor) is noise, not information — two
   // passes can resolve the same annotation (the pass-1.5 hoist and the real pass
   // both report a generic-alias arity/bare-use error, identically positioned).
@@ -18013,6 +18040,108 @@ function holeArgArrayErr(argN: i32, at: i32, ix: i32) {
   0
 }
 
+// The FIRST value-bearing return site in a function-literal body, in source
+// order — the RETURNED EXPRESSION node of a `return expr`, walking blocks,
+// if-arms and loop bodies but never descending into a NESTED function literal
+// (its returns are its own). `-1` when every return is bare — the value then
+// came from the body's TAIL expression, which the caller anchors instead.
+function firstValueRetIn(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is RetStmt {
+    if n.retArg >= 0 { return n.retArg }
+    return -1
+  }
+  if n is Block {
+    let i = 0
+    while i < n.blkStmts.length {
+      const hit = firstValueRetIn(n.blkStmts[i])
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    return -1
+  }
+  if n is IfStmt {
+    const hit = firstValueRetIn(n.ifThen)
+    if hit >= 0 { return hit }
+    return firstValueRetIn(n.ifElse)
+  }
+  if n is WhileStmt { return firstValueRetIn(n.whileBody) }
+  if n is ForRange { return firstValueRetIn(n.frBody) }
+  if n is ForIn { return firstValueRetIn(n.fiBody) }
+  -1
+}
+
+// Report an `argument N: expected …, got …` mismatch — ONE home for the wording
+// AND the anchor policy, shared by the general call path and the UFCS one.
+//
+// The anchor is the ARGUMENT node, not the call (whose `nodeToks` last-token
+// anchor is the closing paren, a whole call away on a multiline call). A
+// FUNCTION-LITERAL argument needs two refinements, because ITS last-token
+// anchor is its own closing brace, a body away from anything:
+//   - when the parameter's params agree and only the RETURN type offends —
+//     provably at every value-bearing site (a void return is demanded, or the
+//     inferred return is one plain type every site agreed on) — anchor at the
+//     FIRST such site: the returned expression, or the body's tail expression
+//     the return type was inferred from;
+//   - otherwise anchor at the literal's START token (`tErrAtNodeStart`).
+function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
+  const msg = "argument " +
+    i32ToStr(argN) +
+    ": expected " +
+    tyToStr(expected) +
+    ", got " +
+    tyToStr(at)
+  if argIx >= 0 && argIx < P.nodes.length {
+    const n = P.nodes[argIx]
+    if n is FuncDecl {
+      const site = fnLitRetMismatchSite(n, expected, at)
+      if site >= 0 { return tErr(msg, site) }
+      return tErrAtNodeStart(msg, argIx)
+    }
+  }
+  tErr(msg, argIx)
+}
+
+// The offending RETURN SITE of function-literal `fn` for an `expected` vs `at`
+// function-type mismatch, or -1 when no site is provably the offender (a param
+// type also disagrees, or the inferred return is a join whose sites may
+// disagree — a union, a deferred join, a hole).
+function fnLitRetMismatchSite(fn: FuncDecl, expected: i32, at: i32) {
+  if expected < 0 || at < 0 { return -1 }
+  const et = T.tys[expected]
+  if !(et is TyFunc) { return -1 }
+  const gt = T.tys[at]
+  if !(gt is TyFunc) { return -1 }
+  if et.fnParamTypes.length != gt.fnParamTypes.length { return -1 }
+  let i = 0
+  while i < et.fnParamTypes.length {
+    if !tyEq(et.fnParamTypes[i], gt.fnParamTypes[i]) { return -1 }
+    i = i + 1
+  }
+  if tyEq(et.fnRet, gt.fnRet) { return -1 }
+  if !isVoidTy(et.fnRet) {
+    // Not the void demand (where ANY value-bearing site offends): the first
+    // site is the offender only when every site agreed on one plain type.
+    if gt.fnRet < 0 { return -1 }
+    const gr = T.tys[gt.fnRet]
+    if gr is TyUnion { return -1 }
+    if tyIsDeferredJoin(gt.fnRet) { return -1 }
+    if tyIsHole(gt.fnRet) { return -1 }
+  }
+  const site = firstValueRetIn(fn.fnBody)
+  if site >= 0 { return site }
+  // No explicit value-bearing `return`: the type came from the body's TAIL
+  // expression — its last statement.
+  if fn.fnBody >= 0 && fn.fnBody < P.nodes.length {
+    const b = P.nodes[fn.fnBody]
+    if b is Block {
+      if b.blkStmts.length > 0 { return b.blkStmts[b.blkStmts.length - 1] }
+    }
+  }
+  -1
+}
+
 function holeMapDemandTy(name: string, isSet: boolean) {
   const have = holeMapOf(name)
   if have >= 0 { return have }
@@ -20766,18 +20895,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
       }
       constrainEmptyExpr(args[i], at, expected)
       if !assignableExpr(args[i], at, expected) {
-        // Anchor at the OFFENDING ARGUMENT's node, not the call's — the call
-        // node's anchor token is its LAST token (see `nodeToks`), which put the
-        // caret on the closing paren, a whole call body away on a multiline call.
-        tErr(
-          "argument " +
-            i32ToStr(i + 1) +
-            ": expected " +
-            tyToStr(expected) +
-            ", got " +
-            tyToStr(at),
-          args[i],
-        )
+        // Anchored at the OFFENDING ARGUMENT (or its offending return site),
+        // never at the call node — see `argMismatchErr`.
+        argMismatchErr(i + 1, expected, at, args[i])
       }
       i = i + 1
     }
@@ -22020,18 +22140,9 @@ function checkCallNode(n: Call, ix: i32) {
       // clearing its uninferred floor — pure downstream-usage inference, no push.
       constrainEmptyExpr(args[i], at, expected)
       if !assignableExpr(args[i], at, expected) {
-        // Anchor at the OFFENDING ARGUMENT's node, not the call's — the call
-        // node's anchor token is its LAST token (see `nodeToks`), which put the
-        // caret on the closing paren, a whole call body away on a multiline call.
-        tErr(
-          "argument " +
-            i32ToStr(i + 1) +
-            ": expected " +
-            tyToStr(expected) +
-            ", got " +
-            tyToStr(at),
-          args[i],
-        )
+        // Anchored at the OFFENDING ARGUMENT (or its offending return site),
+        // never at the call node — see `argMismatchErr`.
+        argMismatchErr(i + 1, expected, at, args[i])
       }
       i = i + 1
     }
