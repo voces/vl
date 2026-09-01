@@ -23975,9 +23975,38 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   does.
 
 * **THE OUTCOME CLASS DIFFERS BY SEED VINTAGE**, so grade on the trap, not its text: here it
-  surfaces as `0: <unknown>!<wasm function 4121>`; on vl-b7's seed as `wasm trap: call stack
-  exhausted` with the backtrace looping compiler frames 1823/1799/2400. Both are unbounded
-  recursion in the emitter.
+  surfaces as a wasm backtrace, on a neighbouring seed as `call stack exhausted` with the
+  backtrace looping three compiler frames. Both are unbounded recursion in the emitter. The
+  probe runner now classes this as `COMPILER TRAP` rather than folding it into `emit refuses`.
+
+* **IT IS EMIT-SIDE, AND THE TRIGGER SURFACE IS SHARPLY BOUNDED.** `vl check` returns 0 and
+  `vl fmt` is clean; only `vl build` traps. One line each, all measured:
+
+  | spelling | outcome |
+  | --- | --- |
+  | `string \| {[string]: T}` | **traps** |
+  | `i32 \| {[string]: T}` | **traps** — the sibling arm's type is irrelevant |
+  | `{[string]: T} \| string` | **traps** — order is irrelevant |
+  | `A = string \| {[string]: B}` / `B = string \| {[string]: A}` | **traps** — MUTUAL recursion through two maps does it too |
+  | `string \| {[string]: T[]}` | **runs** — one array between the map and the self-reference breaks it |
+  | `S \| {[string]: T}` with a declared struct `S` | a type error, not a trap |
+
+  So the shape is a union reached from a map VALUE with no array in between. The
+  array-interposition row is the most useful of these: whatever recurses descends map values
+  and does NOT descend array elements.
+
+* **SEVEN CANDIDATES ELIMINATED BY MEASUREMENT, so nobody re-walks them.** `registerInlineUnion`
+  (depth-capped: no effect — and the cap revealed that a NAME re-entry guard never fires,
+  because each step EXPANDS the spelling rather than repeating it), `rtGo` / `rtOfMap` (both
+  memoise with `rtByTyPut` BEFORE recursing, which is exactly the cycle-breaking the array
+  arm relies on), and five counter-instrumented at once — `rlCanonLitUnionAtoms`,
+  `internShapeDeepTy`, `mvArmSigOfName`, `internArmShapeAt`, `collectTyReachRegister` — none
+  of which reached 300 frames. `tyToStrAt` is also out: it already carries a depth cap.
+
+* **THE NEXT INSTRUMENT SHOULD BE THE FUNCTION INDEX, not another guess.** The backtrace names
+  a three-frame cycle by wasm function index; mapping those indices through the import count
+  to the disassembly is the one step that has not been tried, and reading candidate source has
+  now failed seven times.
 
 ### D983 — a `u8[] | null` destination fed by an ARRAY LITERAL: the cell was the packed wrapper, the value the shared i32 backing
 
