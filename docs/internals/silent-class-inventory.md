@@ -23825,6 +23825,51 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D986 — the emitter's `*Used` type-minting flags were never reset, so ONE instance compiling two programs emits a module built on the previous one's type indices
+
+**closed · was check-clean invalid wasm (V8 only) · clause 1 · found while fixing [D983](#d983) · `tests/cases/arrays/u8-nullable-list-literal-dest.vl`**
+
+    // Any program whose emitted module mints a packed-byte or wide-scalar heap type,
+    // compiled by an instance that has already compiled a different program.
+    const g: u8[] | null = [7, 8]
+
+    if g is u8[] { print(g[1]) }
+
+* **`ba8Used` / `fa32Used` / `fa64Used` / `ia64Used` say "this module mints these heap
+  types". The INDICES they guard (`ba8TypeIdx`, `bl8TypeIdx`, …) are recomputed on every
+  compile; the flags were `export let … = false` at module scope and reset NOWHERE.** In a
+  process that compiles once the two can never disagree, which is why nothing reset them. The
+  LSP server and `tests/cases_wasm_test.ts` both drive many compiles through **one**
+  `WebAssembly.Instance` — the test file constructs exactly one — and there a flag survives
+  from an earlier program while the indices do not. The module then believes types exist at
+  indices that now mean something else.
+
+* **THE FAILURE IS V8-ONLY, WHICH IS WHY IT SURVIVED.** `WebAssembly.instantiate()` rejects
+  with `local.set[0] expected type (ref null 5), found ref.as_non_null of type (ref 9)`. The
+  native host runs the same module without complaint, `vl check --codegen` reports it clean,
+  and every position of the witness passes `vl run`. **Three instruments agreed it was fine
+  and the fourth was right.**
+
+* **THE BISECT THAT NAMED IT, because the obvious ones all came back clean.** The witness
+  passes alone; passes run twice in one instance; passes with every other `u8-` fixture in one
+  instance; and fails only in the full parallel suite. Each position of the matrix passes in
+  isolation, and both halves pass as halves. That pattern — *no single predecessor and no
+  single position, only the whole* — is the signature of accumulated instance state rather
+  than of a bad lowering. Resetting `ba8Used` alone did NOT fix it; the three wide-scalar
+  siblings had to be reset too.
+
+* **WHY IT SURFACED NOW.** [D983](#d983) made a common spelling (`u8[] | null` fed by a
+  literal) reach the packed-byte minting path for the first time. The leak was already there
+  and reachable — a `vl check` on two files in one LSP session is the same shape — but no
+  fixture had ever compiled two programs whose type-minting differed in the right way.
+
+* **THE FIX IS FOUR ASSIGNMENTS AT THE TOP OF `emitProgram`**, beside the arena-index sidecar
+  reset that was already doing this job for every other per-compile column. The remaining
+  siblings (`aUsed`, `lUsed`, `raUsed`, `rlUsed`, `mUsed`, `mI32Used`, `slUsed`, `fnValUsed`)
+  are declared the same way and are still not reset — **left alone deliberately, because none
+  of them has a witness.** A speculative reset of a flag whose collection pass might legitimately
+  run before `emitProgram` is how this file gets a new row, not one fewer.
+
 ### D985 — `is string` against a self-referential container union with `null`: check-clean invalid wasm
 
 **check-clean invalid wasm · clause 1 · the SILENT member of the D982/D984 family, and the one that matters most**
@@ -23899,9 +23944,9 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   exhausted` with the backtrace looping compiler frames 1823/1799/2400. Both are unbounded
   recursion in the emitter.
 
-### D983 — `return [1, 2, 3]` from a function annotated `u8[] | null` is check-clean invalid wasm
+### D983 — a `u8[] | null` destination fed by an ARRAY LITERAL: the cell was the packed wrapper, the value the shared i32 backing
 
-**check-clean invalid wasm · found by vl-b7's serde grid, reproduced here · clause 1**
+**closed · was check-clean invalid wasm · found by vl-b7's serde grid, reproduced and fixed here · clause 1 · `tests/cases/arrays/u8-nullable-list-literal-dest.vl`**
 
     function g(): u8[] | null {
       return [1, 2, 3]
@@ -23926,27 +23971,45 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   `array.new_fixed $0`, the shared i32 list. **Two heap types for one value.** The cell's type
   is right and the CONSTRUCTION is wrong, so this is a literal-lowering gap, not a rep gap.
 
-* **SEVEN MISSING `nulu8list` ARMS EXIST AND ARE NOT THE CAUSE — both halves matter.** A
-  survey found `isNulScalarListFieldCode` reading `c == 31 || 32 || 33 || 34` while both
-  siblings directly above it mint and decode **35**; six more sites take the same shape
-  (`emit_collect.vl` two predicate ladders and two `ba8Used` flag ladders, `wasmEmit.vl` an
-  element-kind pick and one predicate ladder). All seven are real omissions from when the
-  kind was added. **Adding all seven changes none of the three witnesses**, and the rebuilt
-  compiler is byte-identical — the compiler's own source contains no `u8[] | null`, so
-  nothing exercises them. They are worth fixing on their own evidence, with a counter ladder
-  to prove liveness; they are not this row.
+* **THE CAUSE WAS THE BUILD KIND, AND IT IS ONE MISSING ARM PLUS ITS COLLECTOR.**
+  `nulScalarListBuildKind` maps `nulu8list` to **13**, and the literal emitter's packed-byte
+  path tested only `pendingListKind == 10`. The three siblings each have an arm that flips the
+  literal's element flag (4 -> f64, 6 -> i64, 7 -> f32); **13 never got one**, so the literal
+  fell through to the default i32 backing while the cell was typed from `nulu8list` as the
+  packed wrapper. `coerceListKind` had already normalised 13 to 10 elsewhere for exactly this
+  reason — the precedent was in the tree.
 
-* **THE ORDERING TRAP THAT LOOKS LIKE THE ANSWER AND ISN'T.** `letIsNulList` ->
-  `retNulListFlag` -> `nodeTyIsNulI32List` returns TRUE for `u8[] | null`, because `u8`'s
-  elements read as `i32`, and it sits ABOVE the `nulScalarListKindOfNode` arm in both global
-  ladders. That is a genuine latent collision — the other four nullable scalar lists have
-  distinct element prims and never hit it. **Reordering both ladders also changes none of the
-  three witnesses.** So the binding's KIND was never the problem; consistent with the
-  disassembly, which shows the cell already correctly typed.
+  **The `ba8Used` collector arms are the second half and are not optional.** With the literal
+  path reached but the backing uncollected, all four witnesses traded silent invalid wasm for
+  a loud `u8 array literal but u8 list type not collected`. Both halves, or the fix converts
+  one clause into the other.
 
-  **Look at the literal's destination, not the binding's kind.** Something decides an
-  `ArrayLit` builds the shared i32 wrapper, and the non-null spelling (`const g: u8[] = [5, 6]`,
-  which RUNS) is the control that shows the same decision made correctly one annotation away.
+* **POSITION MATRIX, NINE POSITIONS, RUN NOT READ.** Module global, local binding, return,
+  argument, assignment, empty literal, `.length`, nested element, struct field. **Seven run.**
+  Two do not, and neither is this row:
+
+  * **struct field** (`struct S { xs: u8[] | null }`) is a PARSE error — and it is a parse
+    error for `f64[] | null` too, so it is a pre-existing parser limit, not a u8 gap.
+  * **nested element** (`(u8[] | null)[]`) is a distinct LOUD refusal, `a nullable-u8[] list
+    element has no rep`, byte-identical before and after this fix. `(f64[] | null)[]` runs, so
+    this one IS u8-specific and wants its own row — the `rlElemKindTbl` ladders carry
+    `nulf32list` arms with no `nulu8list` sibling.
+
+* **AND THE FIX EXPOSED A SECOND DEFECT THAT HAD TO BE CLOSED WITH IT.** With the literal
+  path and the collector arms in, the witness ran under `vl run` and the full suite went RED
+  under V8: the emitter's `*Used` type-minting flags were never reset per compile, so one
+  instance compiling two programs emitted a module built on the previous one's type indices.
+  Filed and fixed as [D986](#d986). D983 alone would have shipped that.
+
+* **TWO CANDIDATES RULED OUT BY MEASUREMENT, KEPT BECAUSE THEY LOOK RIGHT.** Seven missing
+  `nulu8list` arms exist elsewhere (`isNulScalarListFieldCode` reads `c == 31 || 32 || 33 ||
+  34` while both siblings above it mint and decode 35; six more take the same shape). Adding
+  all seven changed none of the witnesses and left the compiler byte-identical — its own
+  source has no `u8[] | null`. And `letIsNulList` -> `nodeTyIsNulI32List` answers TRUE for
+  `u8[] | null` (u8 elements read as i32) while sitting ABOVE the scalar-list arm in both
+  global ladders — a real latent collision the other four kinds never hit. Reordering both
+  ladders also changed nothing. The disassembly was right that the cell's type was already
+  correct; only the construction was wrong.
 
 ### D982 — a JSON value tree: `is` against a SELF-REFERENTIAL array arm is refused, and only when the union also has a `null` arm
 
