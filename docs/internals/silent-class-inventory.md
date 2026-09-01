@@ -29171,3 +29171,82 @@ Repro (check rc 0, then invalid wasm):
     print(describeU({ r: 1.0 }))
     print(describeU({ s: 2.0 }))
     // vl check -> rc 0; vl run -> Invalid input WebAssembly code, type mismatch
+
+---
+### D1006 — `startFnDetectScratch` never clears `fnUsesU8Push`, so a `u8[]` push leaves the NEXT program's start function reserving a scratch quad it does not use
+
+**runs today and must keep running · the WITNESS is a two-program sequence, not this program · emitted bytes depend on what the instance compiled before · 3 of 1,922 gradeable corpus programs leak this way · gated by `tests/vl_instance_state_leak_test.ts`**
+
+`emitFuncCode` and `startFnDetectScratch` are the two frame builders — one for a declared
+function, one for the START function (top-level statements plus the global initializers that
+run there). Both read the same 24 `fnUses*` flags, and each must WRITE all 24, because a flag
+one writes and the other does not survives: into the rest of this compile, and into the next
+program on the same `WebAssembly.Instance`. Twenty of the twenty-four agree.
+`fnUsesU8Push` does not.
+
+* **THE DUPLICATED LINE IS THE TELL.** `emit_sections.vl` lines **872 and 873** are both
+  `fnUsesU8Push = false`. The second copy was written for `startFnDetectScratch` and landed
+  in `emitFuncCode` beside the first. `fnUsesMapVals` has the identical pair at 904/905
+  (D1007), and `fnUsesUnionSink`/`fnUsesUnionLetSink` are missing from
+  `startFnDetectScratch` too, with no witness yet.
+
+* **WHAT IT COSTS.** `fbBeginFunc` lays the frame out as `u8PushScratchBase = fbScratchCur;
+  if fnUsesU8Push { fbReserve(4) }`. A leaked `true` reserves a quad the start function never
+  reads: FOUR DEAD LOCALS, **+10 bytes**, and their two ref slots are typed from indices that
+  in the next program mean something else (in `print(1)` they land on the two import
+  signatures — `(local $2 (ref $1)) (local $3 (ref $0))`, both funcref). The module stays
+  VALID and the program still behaves, which is why nothing caught it; that the indices land
+  somewhere harmless is luck, and it is exactly D986's mechanism.
+
+* **THE CLI IS STRUCTURALLY BLIND** — one compile per process, so the flag is always false
+  when a `vl` run starts. `tests/cases_wasm_test.ts` and the LSP server both drive many
+  compiles through one instance. Measured over `tests/cases`: **23 of 1,922** gradeable
+  programs shift a following `print(1)`, 3 of them here (`arrays/u8-packed-list.vl`,
+  `arrays/u8-union-struct-arm.vl`, `strings/bytes-view.vl`) and 20 in D1007.
+
+* **THE FIX IS ONE LINE IN THE OTHER BUILDER** — `fnUsesU8Push = false` beside the other
+  push flags in `startFnDetectScratch` — plus deleting the duplicate at 873. Do it with
+  D1007; they are one mistake made twice.
+
+Repro (runs today and must keep running — the DEFECT is what it does to the next program on
+a shared instance, which a single CLI run cannot express;
+`tests/vl_instance_state_leak_test.ts`'s `OPEN_LEAKS` is the gradeable half and reds when
+this is fixed):
+
+    const g: u8[] = []
+    g.push(7)
+    print(g.length)
+    // PRINTS 1 — and leaves `fnUsesU8Push` true, so the next `print(1)` compiled on this
+    // instance is 157 bytes instead of 147.
+
+---
+### D1007 — `startFnDetectScratch` never clears `fnUsesMapVals`, so `m.values()` leaves the NEXT program's start function reserving the value-list frame
+
+**runs today and must keep running · the WITNESS is a two-program sequence, not this program · emitted bytes depend on what the instance compiled before · 20 of 1,922 gradeable corpus programs leak this way · gated by `tests/vl_instance_state_leak_test.ts`**
+
+D1006's mechanism, second instance, same duplicated-line tell: `emit_sections.vl` lines
+**904 and 905** are both `fnUsesMapVals = false`, inside `emitFuncCode`, and
+`startFnDetectScratch` writes it nowhere. A program that reads `m.values()` leaves the flag
+set; the next program's start function then takes the `mapValsBase = fbScratchCur; if
+fnUsesMapVals { fbReserve(6) }` arm and reserves SIX dead locals, **+15 bytes**.
+
+* **IT IS THE LARGER HALF.** 20 of the 23 leaking corpus programs are this flag — every
+  `maps/*` case that iterates values, plus `loops/forin-same-named-loop-vars-union-box.vl`.
+  D1006 is 3. Filed separately because the two flags are independent one-line fixes and a
+  reader grading one should not be told the other's number.
+
+* **SAME BLINDNESS, SAME GATE.** See D1006. Both were found on the first run of
+  `tests/vl_instance_state_leak_test.ts`'s minting sandwich, and by neither its listed nor
+  its reversed order — a sequence that never puts a minter immediately before a program of
+  another family cannot see this class.
+
+Repro (runs today and must keep running — as D1006, the defect is in the NEXT compile):
+
+    const m: {[string]: i32} = Map()
+    m["a"] = 1
+    m["b"] = 2
+    let t = 0
+    for v in m.values() { t = t + v }
+    print(t)
+    // PRINTS 3 — and leaves `fnUsesMapVals` true, so the next `print(1)` compiled on this
+    // instance is 162 bytes instead of 147.
