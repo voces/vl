@@ -726,15 +726,19 @@ const toCompletionItem = (
     item.insertText = c.insertText;
     item.insertTextFormat = InsertTextFormat.Snippet;
   }
-  // Auto-import items: the providing module on the label row, the import
-  // rewrite on accept, and a sortText demotion so in-scope names rank first
-  // (`~` collates after every identifier start char).
+  // Auto-import items: the providing module on the label row and the import
+  // rewrite on accept. NO sortText demotion: an auto-import name is by
+  // construction not in scope, so its only same-label competitor is the
+  // editor's word-based suggestion — and a demoted item loses that race, so
+  // Tab accepted the word (no edits) whenever the name already appeared
+  // anywhere in the buffer. Measured live 2026-08-31: merge-into-existing-
+  // import "never worked" while fresh-module imports did, purely because the
+  // tested buffer already contained the word.
   if (c.description !== undefined) {
     item.labelDetails = { ...item.labelDetails, description: c.description };
   }
   if (c.extraEdits !== undefined) {
     item.additionalTextEdits = c.extraEdits.map((e) => TextEdit.replace(e.range, e.newText));
-    item.sortText = `~${c.name}`;
   }
   return item;
 };
