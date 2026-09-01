@@ -1869,6 +1869,50 @@ reports. `then` remains a perfectly good identifier (the lexer soft-keyword
 fixtures now double as that regression's coverage), and the contextual soft-keyword set is
 five: `as` `from` `in` `step` `to`.
 
+## An unbraced body is RECOVERED, not cascaded — and the gate is `startsStmt`
+
+**One mistake, one diagnostic, and the parse continues with a usable AST.** (owner directive,
+2026-09-01)
+
+`if` / `while` / `for` bodies require braces. An unbraced one used to cost TWO diagnostics and
+sometimes three, because `expect("LBRACE")` diagnoses and deliberately does NOT consume a
+non-sync token: `parseBlock` then read the rest of the file as the body and its `expectClose`
+reported `expected `}` but found end of input` on a line nobody wrote. The second message is
+pure cascade — it names a position derived from the first mistake — and in the `if c x = 1`
+shape a third appeared, `expected an expression but found EQUAL`, because the mis-parse had
+already consumed `x` as the body's first token. `parseBracedBody` takes the one statement as
+the arm instead, and the arm is `mkBlock([stmt], -1)`, the same synthesized wrapper the `then`
+refusal above and the `else <stmt>` sugar already build — so the checker, the printer and the
+LSP see exactly the braced shape and nothing past the parser learns a body was recovered.
+
+**Three things this deliberately does NOT do.**
+
+*It does not recover a body that was never written.* The gate is `startsStmt`, so `if c }` and a
+truncated `if c` keep the plain `expected `{``. Recovering there would mean inventing an arm out
+of a closer: the parser would be guessing at intent rather than reading a mistake, and the arm
+it invented would then be the thing later diagnostics were anchored against. Three members of
+`startsStmt` (`(`, `[`, `-`) are unreachable from a body position — measured, one probe per
+member — because the CONDITION's expression parse consumes them as a call, an index and a
+subtraction. They stay listed: the predicate answers about statements, not about one caller's
+precedence accident.
+
+*It does not touch `else`.* An unbraced `else` branch is LEGAL syntax (`if c { 1 } else 2`
+parses, runs, and `vl fmt` normalizes it to braced) and goes through the same
+one-statement wrapper WITHOUT a diagnostic. Whether braces should be required there is a
+language question, not a recovery question, and it is the owner's to rule on.
+
+*It does not make a later TYPE error appear.* `checkSrc`/`compileSrc`/`lintSrc` in
+`compiler/driver.vl` all return at `P.diags.length > 0` — the checker never runs on a file that
+had any parse diagnostic. So `if c print(1)` followed by `const n: i32 = "hi"` still reports
+only the parse diagnostic. That gate predates this change and is well motivated in general (a
+mis-parse produces phantom type errors), but note that it is now MORE conservative than it needs
+to be for this class: a recovered unbraced body yields an AST with no `ErrExpr` in it, so its
+type errors would be real. Lifting the gate for a parse that recovered COMPLETELY is a separate,
+larger question — it would change the output of every parse-error program in the corpus — and is
+not decided here. Later PARSE errors do surface, which is what makes the recovery worth having:
+the arm is exactly one statement, never a scan, so the cursor lands back on the statement
+boundary.
+
 ## Which channel owns a NARROWED argument's type at a monomorphization pin
 
 **The pin's own NAME owns it, and the checker's recorded type on the argument node is
