@@ -23814,6 +23814,65 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
+### D970 — an inferred value-union return whose param is un-annotated: LOUD alone, check-clean invalid wasm the moment any other union mints the same box
+
+**check-clean invalid wasm · found 2026-09-01 while attempting D964's probe · a second clause-1 violation the scoreboard reads as 0, because no corpus cell carries the shape**
+
+`function pick(b) { if b { return 1 }; "s" }` refuses loudly on its own
+(`narrowed union atom has no value box`, D964's probe). Add ANY other value union to the module
+and the refusal turns into a miscompile:
+
+    const by: i32 | string = 7
+    function pick(b) {
+      if b { return 1 }
+      "s"
+    }
+    print(pick(true))
+    print(by)
+    // vl check rc 0; vl run -> Invalid input WebAssembly code: expected (ref $type), found i32
+
+* **THE BYSTANDER ONLY HAS TO MINT THE SAME BOX.** `i32 | boolean` does it too — the registry
+  is module-wide (D947), so any union carrying the i32 atom makes the narrowed read validate
+  and exposes what was behind the refusal.
+
+* **FOUR INGREDIENTS, and removing any one makes it run or refuse loudly:** the bystander
+  union, the UN-ANNOTATED param, the returns JOINING to a union, and the return being INFERRED.
+  Annotate the param — runs. Annotate the return — runs. Make both returns `i32` — runs. Drop
+  the bystander — back to the loud refusal.
+
+* **THE BYTES NAME IT EXACTLY.** `(func $0 (param $0 i32) (result (ref $4)))` with
+  `(return (i32.const 1))` and `(return (global.get $global$0))` — **the functype committed to
+  the box and NEITHER return coerces.** `criClassify` had already classified the result as the
+  box while A20's `!generic` gate skipped recording the return NAME, so `emitReturnValue`'s
+  `retUNm` stayed `""`. One half of the pair knows, the other does not — D969's shape again.
+
+* **AND BOTH HALVES OF THE GATE'S PARAM TEST ARE LOAD-BEARING, measured, both reverted.** The
+  natural fix is to let a merely UN-ANNOTATED param through while still skipping a genuine
+  deferred join, on the theory that `pick`'s join is over its own body's literals. Relaxing the
+  `TyVar` test alone turns the gate's own witness — `relay(x) { return pick(x, "s", true) }` —
+  from a loud refusal into invalid wasm; relaxing the `tyIsDeferredJoin` test does the same. So
+  `relay` has a `TyVar` param too, and **"the return is a concrete union" does NOT separate the
+  two cases.** The split has to distinguish a join over the body's OWN literals from a join
+  over a CALLEE's per-call-site result, and nothing tried here does that.
+
+* **THE EMITTER HALF IS SEPARATELY UNFINISHED.** With the name recorded, the returns STILL did
+  not box — the functype and body were unchanged in the disassembly. So `retUNm` never took the
+  recorded name, and the next attempt should check which of the two is true before touching the
+  gate again: `isValueUnionName` rejecting the recorded spelling (`valueUnionRetName` joins
+  atoms with a bare `|`, while the canonical spelling elsewhere carries spaces), or
+  `inferRetNameOf` not being keyed the way the read assumes.
+
+Repro (check rc 0, invalid wasm):
+
+    const by: i32 | string = 7
+    function pick(b) {
+      if b { return 1 }
+      "s"
+    }
+    print(pick(true))
+    print(by)
+    // vl check rc 0; vl run -> Invalid input WebAssembly code: expected (ref $type), found i32
+
 ### D969 — D962 traded a LOUD refusal for a SILENT miscompile on the UN-ANNOTATED destination; closed, and the two questions were FIGHTING
 
 **closed — an un-annotated `??` binding now boxes and the desugared `if` carries the box blocktype · the regression was found by hand off the `coalesce-over-nullable-union` probe and was INVISIBLE TO THE SCOREBOARD, which read clause 1 = 0 throughout because no corpus cell has the shape**
