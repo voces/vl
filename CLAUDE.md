@@ -352,6 +352,17 @@ correctly; the same marker at the top of `emitReturnExit` reads zero even for a 
 provably calls it. Where the marker reads zero for a case you know fires, the instrument is
 wrong, not the code — use a counter global or a distinctive `emitFail`.
 
+## `vl` resolves `std:` from the EXE's checkout — a worktree probe measures the WRONG std
+
+The host walks ancestors of the BINARY, and every agent worktree symlinks
+`scripts/vl-host/target` to the main repo's — so a hand probe from a worktree reads
+`/home/verit/vl/std`, not the worktree's `std/`. Measured twice on 2026-09-01: a byte-ladder
+probe printed the pre-change rung, and a template-hole probe hid a just-landed `toStr`
+widening. The Deno gates are NOT affected (their reader maps `std:` relative to the test
+file), which is what makes it dangerous: the gates stay honest while the hand probes lie.
+`VL_STD=<worktree>/std` pins it; pass it on every native CLI probe that touches std from a
+worktree, and on BOTH arms of any A/B.
+
 ## After editing `compiler/*.vl`
 
 Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL program at
