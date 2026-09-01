@@ -23,14 +23,29 @@
 //   1. `vital.compilerWasm`          explicit; a stated path is honoured or fails
 //   2. `$VL_COMPILER_WASM`           same variable the CLI reads
 //   3. <workspace>/build/…           the compiler repo's own dev loop
-//   4. `vl seed`                     an installed CLI's seed — VERSION-MATCHED
-//   5. the extension's bundled copy  always works, zero configuration
+//   4. the extension's bundled copy  built from the SAME tree as this server
+//   5. `vl seed`                     an installed CLI's seed — the fallback for
+//                                    a bundle shipped without one
 //
-// Rung 4 is the one worth the most and the reason `vl seed` exists: the seed and
-// the language are ONE artifact, so a project's own `vl` has the right one, while
-// a bundled copy is only as current as the extension. A mismatched pair is worse
-// than a missing one — the checker's `speaksAbi` refuses it, correctly, but only
-// after every message would have been mis-decoded.
+// Rungs 4 and 5 swapped on 2026-08-31, from a live failure: an installed CLI's
+// embedded seed was ABI-compatible but BEHAVIORALLY stale (pre-scopeAt-filter),
+// `speaksAbi` rightly accepted it — it answers "can I decode you", not "are you
+// current" — and completion silently regressed in every non-checkout workspace.
+// What decides the order is that the two failure modes are ASYMMETRIC IN
+// VISIBILITY: `vl seed` first fails SILENTLY (new server, old compiler — a
+// feature just doesn't happen, nothing reports), while bundled-first fails
+// VISIBLY (old compiler against a newer project toolchain — diagnostics
+// disagree with the user's own `vl`, odd enough to get reported). With no
+// stamp to compare, prefer the seed PAIRED with this server binary: that
+// pairing is the one the code actually assumes, and the build step is the only
+// thing that guarantees it. Rung 5 is consequently RARE rather than routine —
+// `bundle-seed.ts` writes a seed on every build that can reach one, so the CLI
+// rung fires only for a bundle built where neither a checkout seed nor `vl`
+// existed. The real resolution is a BUILD-IDENTITY stamp the seed exports and
+// the server compares to its own baked-in value (equal → use; different → say
+// which is newer) — an ABI version is too coarse, pre- and post-filter seeds
+// share one. Until that exists, rung order stops standing in for freshness
+// only by keeping the paired artifact first.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
