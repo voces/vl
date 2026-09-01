@@ -1,5 +1,16 @@
 # VL constraints design — nameable bounds for what inference already enforces
 
+> **RULED (owner, 2026-09-01): "Accept expression semantics from day one."** The shipped
+> package is therefore: method-member bounds spelled `{ toString(): string }` (call-shape,
+> no `self` — OQ-1), meaning "the call type-checks under the resolution rules every call
+> already uses" (field first, then UFCS in scope); satisfaction judged at the INSTANTIATION
+> SITE's scope with WHOLE-PROGRAM COHERENCE (one witness per (generic, T) across the merged
+> program, both sites named on disagreement — OQ-3); bounds attach as `<T: Showable>`
+> (OQ-4, ruled earlier); bounded bodies use ONLY what bounds grant (OQ-5, strict). OQ-2
+> (operator bounds) stays deferred: the owner's instinct that operator members ride the
+> same call shape (`{ "+"(other: self): self }`) is recorded as the direction, with the
+> self-type reference as its one open spelling question — reopen when a real API needs it.
+
 Owner questions (2026-09-01, verbatim in intent): *should VL have a trait-like mechanism as
 part of a type contract — something like `{toString(self): string}`, satisfied by UFCS? We
 had the concept planned of implicitly typing `(a) => a + a` as needing `+` with itself;
