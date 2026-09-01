@@ -331,6 +331,20 @@ on 2026-08-28 after exactly that check. `wasm-opt`, `wasm-as`, `wasm-merge` and 
 the same directory. Disassembly is one of the four instruments a defect fix is graded on; do not
 substitute for it without first running the real binary by its real path.
 
+## AN `emitFail` PROBE IS SILENT ON A PROGRAM THAT COMPILES — validate against a FAILING control
+
+`emitFail` RECORDS a failure and keeps emitting (that is the `emitFail does not halt`
+discipline). So a probe built on it reports nothing whenever the program goes on to compile,
+and "the probe did not fire" then means nothing at all. **A control that must make it fire has
+to be a program that already fails**; on a working one the instrument cannot speak.
+
+The wider rule this is the third instance of: **never trust a probe until a control you KNOW
+should trigger it does.** The other two, both live: a byte marker measures the writer's current
+target buffer rather than reachability (a `wU8` at one function's top lands, at another's reads
+zero for a case that provably fires); and `tErr` is the CHECKER's channel and never surfaces
+during the emit phase, so an emit-pass probe written with it is measuring nothing. Each of
+these produced a confidently filed conclusion that later measurement refuted (D969, D970).
+
 ## AN INSTRUMENTED COMPILER POISONS THE SEED, and it looks exactly like a real regression
 
 Adding a probe byte to the emitter (`wU8(0)` at the top of a function, to count whether it
