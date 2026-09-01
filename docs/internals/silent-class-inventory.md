@@ -24179,6 +24179,36 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   its own row once this one is closed; do not fold them together on the strength of both
   involving `J[]`.
 
+### D1009-N — `J | null` is refused where `J` is expected and `null` is already an arm of `J`
+
+**loud check reject · clause 2 · reported by vl-b7 as D1009; reproduced and DIAGNOSED here, not fixed. Numbered in this session's block to avoid a cross-session collision — see vl-b7's row for the serde context**
+
+    type J = null | f64 | J[]
+    function f(v: J): f64 {
+      if v is f64 { return v }
+      return 0.0
+    }
+    const m: {[string]: J} = Map()
+    m["a"] = 2.0
+    print(f(m["a"]))
+
+* `argument 1: expected J, got J | null`. The map read yields the ordinary `V | null`
+  sentinel, and `J` already contains `null`, so the two name the SAME SET.
+
+* **THE CHECK-SIDE CAUSE IS TWO THINGS, both measured.** `assignableGo` bails on
+  `if s is TyNullable { return false }` ABOVE the `d is TyUnion` arm, so a nullable source is
+  never offered the destination's members. And when it is offered them, no single arm of `J`
+  accepts a nullable — the right question is whether the DESTINATION admits null, which
+  `tyAdmitsNull` answers only for a DIRECT `null` member. `J` folds its null into a niche and
+  carries a `TyNullable` member instead, so it answers false.
+
+* **AND LIFTING THE CHECK IS MEASURED TO PRODUCE INVALID WASM, so it is not shipped.** With
+  both halves fixed the witness passes `vl check` and fails to build: the map read's `V | null`
+  sentinel has no lowering into `J`'s rep. That is a clause-2 refusal traded for a clause-1
+  miscompile, and the capability-matrix rule applies — build the lowering, then narrow the
+  gate. The sibling row (`[1.0, null]` reaching `J`) moves to `emitProgram: bare null` under
+  the same change, which is the same story one step earlier.
+
 ### D988 — ONE hole-param function called with two different receiver shapes resolves per-FUNCTION, not per-call
 
 **loads then traps · clause 1 · the residue [D987](#d987)'s fix does not reach**
