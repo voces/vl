@@ -23790,38 +23790,40 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   invalid wasm.
 
 ---
-### D972 — two clause-2 gaps the `--sites` ZERO rows were hiding, now each with a probe
+### D972 — probing the `--sites` ZERO rows: seven false alarms, and `==` over a non-binding union closed
 
-**loud emit rejects conceding capability · found 2026-09-01 by hand-probing the `--sites` list after all nine existing capability probes passed · `scripts/capability-probes/union-eq-non-binding-operand.vl` and `struct-union-equality.vl` are the measurements**
+**closed for the non-binding operand — teed at its first read instead of refused · the struct-union half stays open with a probe · seven other ZERO rows turned out unreachable at the plainest spelling their sentence forbids**
 
-With the nine filed probes all green, the only remaining clause-2 evidence was the raw literal
-count, which the scoreboard itself calls a lower bound. Writing a program per ZERO row turns
-that assertion back into a measurement. Of the rows probed, most are **unreachable at the
-plainest spelling their sentence forbids** — struct `==`, `?? over a string|null call result`,
-`?? over a string|null union field`, `literal is` over a non-binding union, an array-of-map
-union arm, width subtyping and the captured-variable message all RUN. Two are real:
+With all nine filed capability probes green, the only remaining clause-2 evidence was the raw
+literal count, which the scoreboard itself calls a lower bound. Writing a program per ZERO row
+turns that assertion back into a measurement.
 
-* **`==` OVER A NON-BINDING UNION VALUE — the lowering exists and only the second READ is in
-  the way.** `const u = mk(true); u == 1` runs and prints `true`; `mk(true) == 1` refuses.
-  `emitUnionConcreteEq` calls `emitExpr(body, boxIx, fnIx)` TWICE — the tag, then the payload —
-  and `unionEqOperandOk` (Ident / NumLit / StrLit / Member / Index) exists to require an
-  operand that survives that. **This is D960's shape exactly**, closed there by evaluating once
-  into a slot.
+* **SEVEN OF THE ROWS PROBED ARE FALSE ALARMS.** Struct `==`, `?? over a string|null call
+  result`, `?? over a string|null union field`, `literal is` over a non-binding union, an
+  array-of-map union arm, width subtyping and the captured-variable message all RUN at the
+  plainest program their sentence forbids. That is this repo's own standing warning about
+  refusal wording, and it is why a literal count is not a population.
 
-  **A STASH WAS ATTEMPTED AND REVERTED, and its first failure is the useful part:**
-  `sharedFieldRecvSlot()` is ALREADY CLAIMED by the operand's own emission, so the stash
-  compiled to `(local.set $1 (local.get $1))` — the operand assigning itself. Giving it a
-  private `liBack` code (13, typed `(ref null $uBoxIdx)`) fixed that and it still traps, so
-  there is a second holder of state across those two reads that the disassembly has not yet
-  named. Start by finding what else the compare leaves live between the tag read and the
-  payload read.
+* **`==` OVER A NON-BINDING UNION VALUE IS CLOSED.** The compare reads the box up to three
+  times — the no-arm fold, the TAG, and the PAYLOAD inside the tag-matched arm — and
+  `unionEqOperandOk` (Ident / NumLit / StrLit / Member / Index) existed to require an operand
+  that survives that. `const u = mk(true); u == 1` ran and printed the right answer while
+  `mk(true) == 1` refused: the lowering was there and only the extra reads were in the way.
 
-* **`==` OVER A STRUCT UNION — genuinely a missing lowering, not an unreached one.** `A | B` of
-  two shapes refuses at BOTH spellings (bound and not), while struct `==` over a single
-  declared shape runs and value-union `==` runs. It needs a tag dispatch over the variant arms
-  with a per-arm struct compare underneath; nothing in the tree does that today.
+* **TEED AT THE FIRST READ, and the two failures before that are the reason to say so.** The
+  first attempt reused `sharedFieldRecvSlot` — already held by the operand's own emission — and
+  compiled to `(local.set $1 (local.get $1))`, the operand assigning itself. The second gave it
+  a private `liBack` code (13) and still trapped, because it evaluated the operand at the TOP
+  of the function, ahead of the gates, where the surrounding lowering's context is not yet in
+  force. **Evaluate where the original code evaluated, then tee.**
 
-Repro (loud emit reject):
+* **THE STRUCT-UNION HALF IS A DIFFERENT ANIMAL and stays open.** `A | B` of two shapes refuses
+  at BOTH spellings, while struct `==` over one declared shape runs and value-union `==` runs.
+  It needs a tag dispatch over the variant arms with a per-arm struct compare underneath;
+  nothing in the tree does that today. `scripts/capability-probes/struct-union-equality.vl` is
+  the standing measurement.
+
+Repro (runs, prints `true`):
 
     function mk(c: boolean): i32 | string {
       if c { return 1 }
@@ -23829,8 +23831,7 @@ Repro (loud emit reject):
     }
 
     print(mk(true) == 1)
-    // vl check rc 0; vl run -> emit error:
-    // emitProgram: union `==` over a non-binding union value is not supported yet
+    // PRINTS true
 
 ### D971 — a CAPTURING lambda at two types: the refusal described a calling convention the emitter does not use
 
