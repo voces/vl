@@ -23831,10 +23831,21 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   (`if b { return 1 } b`). It is specifically the un-annotated parameter WITH a value-union
   return whose row goes missing.
 
-  So the site is: record an inferred-return row for a function whose parameter is a hole. Every
-  stage downstream — the collector's registration, the signature, the return boxing — already
-  reads that row correctly once it exists, which is why three fixes aimed at those stages all
-  failed.
+  6. **RECORDING THE ROW IS NECESSARY AND NOT SUFFICIENT — built, measured, reverted.**
+     `elaborateInferRets` skips a function whose PARAMETER is a `TyVar`, under a `!generic`
+     gate whose own paragraph justifies it by the RETURN being per-call-site. Those two
+     reasons are already checked directly (`ert0 is TyVar`, `tyIsDeferredJoin(er)`), and the
+     param loop adds every function whose return is concrete and whose parameter merely
+     happens to be a hole — `pick(b)` returns `i32 | string` whatever `b` is, because `b` is
+     only a condition. Dropping the loop DOES record the row and DOES mint the boxes: the
+     error changes class, from `narrowed union atom has no value box` to invalid wasm. Adding
+     the node-keyed `retUNm` fallback on top does not finish it either. **So a THIRD site
+     remains**, and dropping the gate alone is a REGRESSION — a loud reject becomes silent
+     invalid wasm, which is exactly what that paragraph's `relay` witness warns about.
+
+  So: the gate is over-broad, the row is the first of at least three sites, and the honest
+  order is to find the third BEFORE touching the gate — because the gate is the only thing
+  currently keeping this shape loud.
 
 ---
 
