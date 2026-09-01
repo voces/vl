@@ -23622,9 +23622,17 @@ Repro (now RUNS, printing `true` then `false`):
 * **SO THE SHAPE OF THE FIX IS NAMED: an emit arm with a TEMP LOCAL.** Evaluate the left
   operand once into a local, `i32.eq` its tag against the null tag, and select — the block's
   type being the box, so the default arm has to box through `emitUnionCoerce` exactly as the
-  hand-written `return "d"` already does. That is new emit bytes rather than a redirect, which
-  is why it is filed rather than attempted at the end of a long session: this area has already
-  produced three measured regressions today (D955's 15 lost classes, D957's two).
+  hand-written `return "d"` already does.
+
+* **AND THE TEMP LOCAL IS NOT FREE, which makes it TWO sites rather than one.** This emitter
+  does not mint locals on demand: a scratch slot is RESERVED ahead of emission by
+  `emit_classify`'s scan (the `setStrScrI` family, and
+  `tests/cases/expressions/scratch-frame-reservation-positions.vl` pins the positions). So the
+  fix is a reservation arm plus a lowering arm that agree about the slot — the same two-site
+  discipline `emitFail`'s "rebox scratch slot unreserved" message exists to catch when they do
+  not. That is new emit bytes rather than a redirect, which is why it is filed rather than
+  attempted at the end of a long session: this area produced three measured regressions today
+  (D955's 15 lost classes, D957's two).
 
 Repro (check rc 0; the EMITTER refuses):
 
