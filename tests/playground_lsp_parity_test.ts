@@ -163,6 +163,43 @@ const FEATURES: Parity[] = [
     mainMarker: "registerReferenceProvider", // ← missing in main.ts
     knownGap: "no references adapter export and no registerReferenceProvider",
   },
+  {
+    // TODO parity (D9.1): same-file occurrence highlights ship in the LSP
+    // (`referencesAt` + `definitionAt` → read/write kinds); Monaco has a
+    // matching `DocumentHighlightProvider`. Add the adapter binding + provider,
+    // then move this row up and drop `knownGap`.
+    feature: "document highlights",
+    serverMarker: "connection.onDocumentHighlight",
+    adapterExport: "documentHighlights", // ← missing in lspAdapter.ts
+    mainMarker: "registerDocumentHighlightProvider", // ← missing in main.ts
+    knownGap:
+      "no documentHighlights adapter export and no registerDocumentHighlightProvider",
+  },
+  {
+    // TODO parity (D9.3): the flat outline ships in the LSP
+    // (`flatDocumentSymbols` over `tokensAt` + `moduleSurface`); Monaco has a
+    // matching `DocumentSymbolProvider` (outline + breadcrumbs). Add the
+    // adapter binding + provider, then move this row up and drop `knownGap`.
+    feature: "document symbols (outline)",
+    serverMarker: "connection.onDocumentSymbol",
+    adapterExport: "documentSymbols", // ← missing in lspAdapter.ts
+    mainMarker: "registerDocumentSymbolProvider", // ← missing in main.ts
+    knownGap:
+      "no documentSymbols adapter export and no registerDocumentSymbolProvider",
+  },
+  {
+    // Parity gap by DESIGN, not just backlog (D9.4): the export
+    // reference-count lens reads the workspace-wide use-map the unused-export
+    // save pass maintains, and the single-file playground has no workspace to
+    // crawl — a playground lens would always read "0 refs". Revisit only if
+    // the playground ever grows a multi-file model.
+    feature: "code lens (export reference counts)",
+    serverMarker: "connection.onCodeLens",
+    adapterExport: "codeLenses", // ← missing in lspAdapter.ts
+    mainMarker: "registerCodeLensProvider", // ← missing in main.ts
+    knownGap:
+      "workspace-scoped (lastUseMap); the single-file playground has no use-map",
+  },
 ];
 
 // --- 0. the table self-validates against server.ts --------------------------
@@ -196,6 +233,8 @@ Deno.test("every server.ts handler has a parity-table row", () => {
   // bookkeeping), intentionally excluded from playground parity.
   const NON_FEATURE = new Set([
     "connection.onInitialize",
+    "connection.onInitialized", // lifecycle: flushes the cached seed-origin notification
+    "connection.onCodeLensResolve", // the resolve half of the code-lens row above
     "documents.onDidSave", // save-triggered workspace pass; not a Monaco provider
   ]);
   for (const handler of found) {
