@@ -13436,7 +13436,29 @@ function unionAliasMembersFaithful(ty: i32) {
 function nulAliasMemberFaithful(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyNullable { return true }
+  if t is TyNullable {
+    // GATED IN THE INNER, which the D-ALIASNUL note above records as the one thing this arm
+    // was not. `type J = null | string | J[]` interns as a one-member wrapper over
+    // `TyNullable(string | J[])`; calling that transparent made the emitter's collection
+    // loop `continue` past the declaration, so `J` never entered `unNames`, got no variant
+    // rows, and every use of it lost its union-ness — the root of D982 and D985.
+    //
+    // NARROWED TWICE BY MEASUREMENT. A LITERAL union inner stays transparent (eleven
+    // literal-union fixtures said so), and a NON-RECURSIVE value union inner stays
+    // transparent too — `type U = i32 | (string | null)` was working, and declining it broke
+    // `totality-gate-nested-null` and `nullable-alias-unparenthesized-structural-inner`. The
+    // defect condition is SELF-REFERENCE: an arm referring back to the union being declared
+    // has no other declaration to carry its variant rows.
+    const it = T.tys[t.nInner]
+    if it is TyUnion {
+      if it.uMembers.length > 1 {
+        if !tyIsLitUnion(t.nInner) {
+          if tyReachesSelf(ty) { return false }
+        }
+      }
+    }
+    return true
+  }
   // The UN-NORMALIZED shape — a `TyUnion` of literal members beside `null`, which is what
   // a `type A = B` wrapper sees when `B`'s own `| null` declaration kept the raw survivor
   // list instead of the niche. The declaration fold is ungated, so the only route left to
@@ -36428,6 +36450,34 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
 // with `g is i32` on a `Id | null` is a check reject on master and after), so the compare
 // is a belt with nothing yet to hold — kept because the rule it states is the lattice's
 // own and costs one comparison.
+// The member scan `isWidenNotVariant` runs, but seeing THROUGH a member that is itself a
+// nullable or a union. The flat scan compared only the member row and its own prim name, so
+// a union whose single member is `TyNullable(string | J[])` — how a self-referential union
+// with a `null` arm interns — reported that `string` was reachable only by widening. It is a
+// variant, one wrapper down. Depth-bounded because an arm can refer back to the union.
+function widenScanFinds(
+  cn: PrimName,
+  chkTy: i32,
+  ty: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 { return false }
+  if ty < 0 { return false }
+  if chkTy == ty { return true }
+  if cn == primNameOf(ty) { return true }
+  const t = T.tys[ty]
+  if t is TyNullable { return widenScanFinds(cn, chkTy, t.nInner, depth - 1) }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if widenScanFinds(cn, chkTy, ms[i], depth - 1) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 function isWidenNotVariant(chkTy: i32, baseTy: i32) {
   const cn = primNameOf(chkTy)
   if cn == null { return false }
@@ -36437,8 +36487,7 @@ function isWidenNotVariant(chkTy: i32, baseTy: i32) {
     const ms = b.uMembers
     let i = 0
     while i < ms.length {
-      if chkTy == ms[i] { return false }
-      if cn == primNameOf(ms[i]) { return false }
+      if widenScanFinds(cn, chkTy, ms[i], 8) { return false }
       i = i + 1
     }
     // `assignable` said yes and no member is this primitive, so the route it found was a

@@ -23870,9 +23870,9 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   of them has a witness.** A speculative reset of a flag whose collection pass might legitimately
   run before `emitProgram` is how this file gets a new row, not one fewer.
 
-### D985 — `is string` against a self-referential container union with `null`: check-clean invalid wasm
+### D985 — `is string` against a self-referential container union with `null`
 
-**check-clean invalid wasm · clause 1 · the SILENT member of the D982/D984 family, and the one that matters most**
+**loud emit reject · clause 2 · was a silent miscompile until the root was found; the soundness half is fixed and the capability half is not · `scripts/capability-probes/json-tree-is-plain-arm.vl`**
 
     type J = null | string | J[]
     function f(j: J) {
@@ -23891,6 +23891,41 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
   self-referential container merely has to be PRESENT in the union. That is what makes this
   the family's worst member: [D982](#d982) refuses loudly and [D984](#d984) traps the
   compiler, but this one compiles clean and hands back a broken module.
+
+* **THE ROOT IS ONE SKIPPED DECLARATION, AND IT IS SHARED WITH [D982](#d982).**
+  `type J = null | string | J[]` interns as a ONE-MEMBER union wrapping
+  `TyNullable(string | J[])` — the `null` arm is normalised into the niche rather than kept
+  as a sibling variant. `isTransparentAlias` then called that a transparent alias and the
+  emitter's collection loop `continue`d past the declaration, so **`J` never entered
+  `unNames`**, got no variant rows, and every use of it lost its union-ness.
+
+  The discriminating measurement: probing `unionNameOfIdentSid` gives `un=[J]` for
+  `boolean | string | J[]` and `un=[]` for `null | string | J[]`, with the narrowed atom
+  correctly `string` in BOTH. Narrowing was never broken — the union simply was not a union.
+  The predicate's own comment had already named the flaw: `nulAliasMemberFaithful` is
+  `if t is TyNullable { return true }`, under a note reading "**UNGATED IN THE INNER**".
+
+* **THE CLAUSE-1 HALF IS CLOSED; SAY WHICH HALF WHEN QUOTING THIS ROW.** Gating that
+  predicate registers the union, and both witnesses now pass `vl check` and stop at ONE loud
+  emit refusal (`only i32 … or string parameters are supported`). No silent module is
+  produced any more. **That is a soundness fix and NOT progress on the goal** — the standing
+  bar counts programs that RUN, and converting a miscompile into a refusal is the exact
+  pattern the goal doc warns closes rows without moving the number.
+
+* **FOUR LAYERS WERE REAL, EACH FOUND BY ITS OWN MEASUREMENT.** (1) the transparency skip
+  above; (2) `isWidenNotVariant`'s member scan compared only the member row and its own prim
+  name, so a member that is itself a nullable hid `string` one wrapper down — fixed with a
+  depth-bounded scan; (3) `nodeTyIsUnionish` tests `uMembers.length > 1` and answers false for
+  the one-member wrapper, which is what the parameter ladder now refuses on; (4) behind that,
+  the param still lowers as `i32` — the union REP for this shape does not exist. Layer 3 was
+  built and REVERTED: admitting the param without layer 4 produced check-clean invalid wasm,
+  the capability-matrix trap in its pure form.
+
+* **THE TRANSPARENCY GATE WAS NARROWED TWICE, BY BREAKAGE.** Declining every multi-arm inner
+  broke eleven literal-union fixtures; declining every non-literal multi-arm inner broke
+  `totality-gate-nested-null` and `nullable-alias-unparenthesized-structural-inner`. The
+  condition that holds is multi-arm AND non-literal AND **self-referential** — an arm
+  referring back to the union being declared has no other declaration to carry its rows.
 
 * **A RETRACTED ROOT CAUSE, KEPT HERE BECAUSE THE MISTAKE IS REUSABLE.** This row first said
   the emit-side variant table is EMPTY for this union and that `null` plus a self-referential
@@ -24013,7 +24048,7 @@ Annotate the parameter — `function pick(b: boolean)` — and the identical bod
 
 ### D982 — a JSON value tree: `is` against a SELF-REFERENTIAL array arm is refused, and only when the union also has a `null` arm
 
-**loud check reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2**
+**loud emit reject · was a loud check reject · owner-scheduled (a JSON value tree is the shape serde Stage 1 hangs on) · clause 2 · `scripts/capability-probes/json-tree-is-container-arm.vl`**
 
     type J = null | string | J[]
     function f(j: J) {
