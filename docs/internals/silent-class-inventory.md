@@ -22928,6 +22928,58 @@ Repro (now RUNS, printing `7` then `0`):
     // vl check rc 0; runs, prints 7 then 0.
 
 ---
+### D938 — [CLOSED 2026-09-01] the NESTED width pair was check-clean invalid wasm, and it is UNSOUND rather than unsupported — so the close is a refusal, with its own wording
+
+**now a loud check reject (that is the CLOSE, not a residue) · was check-clean invalid wasm (`type mismatch: expected (ref $type), found (ref $type)`) · ZERO corpus cells — the probe was the measurement · a clause-1 SOUNDNESS violation that cannot be closed by making it run · distilled corpus 0 movement, stdout dual-run over all 4,614 running cells vs a master-built control 0 DIFFER · fixture `tests/cases/objects/error-nested-width-pair-mutable-field.vl`**
+
+D622 closed the DIRECT width flow (`Wide` into `Narrow` runs and prints `1`; the WasmGC `(sub)`
+edge is free and keeps reference identity). Nest the pair one level and `objShapeAdapterless`
+returned adapterless as soon as `objFieldNameSetsEq` answered — the checker accepted a pair the
+engine then refused, a validator catching a type-system hole by accident.
+
+* **IT CANNOT BE CLOSED BY MAKING IT RUN, and that is the difference from D622.** A struct's
+  mutable field is INVARIANT in WasmGC, so there is no `(sub)` edge between `{n: Wide}` and
+  `{n: Narrow}` to declare, and a write through the narrower view would leave the original
+  holding a value of the wrong type. There is no sound lowering to build, only a refusal owed.
+  This is the case where "the goal is `runs`" does NOT apply, because the design genuinely
+  forbids it — clause 2's own words.
+
+* **THE AXIS IS THE SOURCE'S ANNOTATION, and D622's paragraph named the axis without reaching
+  the spelling.** It said the verdict "turns on the source's PROVENANCE" and used
+  `litShapeDropSrcExpr`, which asks whether the CLAIMED expression is an object literal.
+  That answers false for a NAME bound to one, which is the accepting witness's own spelling —
+  so a types-only refusal reddened `object-shape-unannotated-literal-rebuilt.vl` and the arm
+  was left in place. Measured, not reasoned: on master the un-annotated spelling
+  (`const sv = {…}`) RUNS and the annotated one (`const w: OW = {…}`) is the silent cell. An
+  un-annotated binding has no pinned wasm type, so the emitter lays it out at the shape it
+  flows into and there is no second view to write through; `srcIsUnannotatedObjBinding` is that
+  test.
+
+* **THE WORDING IS HALF THE FIX.** Every neighbouring message in `objShapeAdapterlessErr`
+  concedes the program is type-valid and blames codegen — the clause-2 sentence
+  `goal-scoreboard.py` counts. Reusing one would have closed a soundness hole by opening a
+  capability one, on a scoreboard that would have scored it as progress. This case gets the
+  plain `tErr` channel and says what is actually wrong; clause 2 stayed at 0 across the change,
+  which is the check that the swap was real.
+
+* **THE PROBE IS GONE, DELIBERATELY.** `scripts/capability-probes/` holds one program per
+  CAPABILITY gap, and this stopped being one — leaving it there would have it graded forever as
+  an open gap that must never close. It is now a fixture pinning the rule, and the runner reads
+  `2 of 5` rather than `2 of 6`.
+
+Repro (now a LOUD check reject, was check-clean invalid wasm):
+
+    type Wide = { a: i32, b: i32 }
+    type Narrow = { a: i32 }
+    type OW = { n: Wide }
+    type ON = { n: Narrow }
+    function take(o: ON): i32 { (o.n).a }
+    const w: OW = { n: { a: 1, b: 2 } }
+    print(take(w))
+    // vl check: an object of type OW cannot flow into ON: they agree on field names but
+    // differ INSIDE a field, and a struct field is mutable — …
+
+---
 
 ### D791 — [CLOSED 2026-08-31] READ-ONLY COVARIANCE is lowered by an element-CONVERTING COPY, licensed by a whole-program write scan — D661B's refusal was about the WRITABLE side only
 
